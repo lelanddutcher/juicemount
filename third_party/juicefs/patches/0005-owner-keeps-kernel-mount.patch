@@ -1,0 +1,143 @@
+--- a/cmd/mount_unix.go
++++ b/cmd/mount_unix.go
+@@ -48,6 +48,7 @@
+ 	"github.com/urfave/cli/v2"
+ 
+ 	"github.com/juicedata/juicefs/pkg/fuse"
++	"github.com/juicedata/juicefs/pkg/jmsignal"
+ 	"github.com/juicedata/juicefs/pkg/meta"
+ 	"github.com/juicedata/juicefs/pkg/object"
+ 	"github.com/juicedata/juicefs/pkg/utils"
+@@ -836,38 +837,18 @@
+ 	signal.Ignore(syscall.SIGPIPE)
+ 	signalChan := make(chan os.Signal, 10)
+ 	signal.Notify(signalChan, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
+-	go func() {
+-		for {
+-			sig := <-signalChan
+-			logger.Infof("Received signal %s, exiting...", sig.String())
+-			if sig == syscall.SIGHUP {
+-				path := fmt.Sprintf("/tmp/state%d.json", os.Getppid())
+-				if err := v.FlushAll(""); err == nil {
+-					fuse.Shutdown()
+-					err = v.FlushAll(path)
+-					if err != nil {
+-						logger.Fatalf("flush buffered data failed: %s", err)
+-					}
+-					m.FlushSession()
+-					object.Shutdown(blob)
+-					logger.Warnf("exit with code 1")
+-					os.Exit(1)
+-				} else {
+-					logger.Warnf("flush buffered data failed: %s, don't restart", err)
+-					continue
+-				}
+-			}
+-			go func() {
+-				time.Sleep(time.Second * 30)
+-				if err := v.FlushAll(""); err != nil {
+-					logger.Errorf("flush all: %s", err)
+-				}
+-				logger.Errorf("exit after receiving signal %s, but umount does not finish in 30 seconds, force exit", sig)
+-				os.Exit(meta.UmountCode)
+-			}()
+-			go func() { _ = doUmount(mp, true) }()
+-		}
+-	}()
++	// JuiceMount: the kernel mount belongs to the process that started this
++	// one. Never unmount by path; stop taking FUSE requests (go-fuse
++	// Server.Shutdown does not unmount), flush, close the session and exit
++	// within a deadline. See pkg/jmsignal.
++	go jmsignal.Handle(signalChan, jmsignal.Actions{
++		Stop:         fuse.Shutdown,
++		Flush:        func() error { return v.FlushAll("") },
++		CloseSession: m.CloseSession,
++		Shutdown:     func() { object.Shutdown(blob) },
++		Exit:         os.Exit,
++		Logf:         logger.Warnf,
++	})
+ }
+ func launchMount(c *cli.Context, mp string, conf *vfs.Config) error {
+ 	increaseRlimit()
+--- a/cmd/umount.go
++++ b/cmd/umount.go
+@@ -21,10 +21,8 @@
+ 	"fmt"
+ 	"io/fs"
+ 	"os"
+-	"os/exec"
+ 	"path"
+ 	"path/filepath"
+-	"runtime"
+ 	"time"
+ 
+ 	"github.com/dustin/go-humanize"
+@@ -57,44 +55,14 @@
+ 	}
+ }
+ 
++// doUmount never unmounts. JuiceMount: this binary leaves the kernel mount to
++// the process that started it, which removes it by exact identity. A path can
++// name a newer, different mount by the time any caller runs, so every upstream
++// caller (signal handler, supervisor restart, broken-mountpoint repair and the
++// umount command) reaches this refusal instead of umount, diskutil or
++// fusermount.
+ func doUmount(mp string, force bool) error {
+-	var cmd *exec.Cmd
+-	switch runtime.GOOS {
+-	case "darwin":
+-		if force {
+-			cmd = exec.Command("umount", "-f", mp)
+-		} else {
+-			cmd = exec.Command("umount", mp)
+-		}
+-	case "linux":
+-		if _, err := exec.LookPath("fusermount"); err == nil {
+-			if force {
+-				cmd = exec.Command("fusermount", "-uz", mp)
+-			} else {
+-				cmd = exec.Command("fusermount", "-u", mp)
+-			}
+-		} else {
+-			if force {
+-				cmd = exec.Command("umount", "-l", mp)
+-			} else {
+-				cmd = exec.Command("umount", mp)
+-			}
+-		}
+-	case "windows":
+-		if !force {
+-			_ = os.Mkdir(filepath.Join(mp, ".UMOUNTIT"), 0777)
+-			return nil
+-		} else {
+-			cmd = exec.Command("taskkill", "/IM", "juicefs.exe", "/F")
+-		}
+-	default:
+-		return fmt.Errorf("OS %s is not supported", runtime.GOOS)
+-	}
+-	out, err := cmd.CombinedOutput()
+-	if err != nil && len(out) != 0 {
+-		err = errors.New(string(out))
+-	}
+-	return err
++	return fmt.Errorf("refusing to unmount %s by path: this JuiceFS build leaves the kernel mount to its owner", mp)
+ }
+ 
+ func umount(ctx *cli.Context) error {
+--- a/pkg/fuse/fuse.go
++++ b/pkg/fuse/fuse.go
+@@ -522,11 +522,9 @@
+ 		}
+ 		return fmt.Errorf("fuse: %s", err)
+ 	}
+-	defer func() {
+-		if runtime.GOOS == "darwin" {
+-			_ = fssrv.Unmount()
+-		}
+-	}()
++	// JuiceMount: no deferred unmount by path when Serve returns. Serve only
++	// returns after the kernel connection closed, and by then the path may name
++	// a newer mount; the mount's owner removes it by exact identity.
+ 
+ 	if runtime.GOOS == "linux" {
+ 		v.InvalidateEntry = func(parent Ino, name string) syscall.Errno {

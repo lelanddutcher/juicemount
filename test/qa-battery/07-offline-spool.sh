@@ -15,13 +15,14 @@
 #   * Control plane http://127.0.0.1:11050:
 #       GET /offline?on=1   -> force offline (writes buffer to spool, NO drain)
 #       GET /offline?on=0   -> back online   (drainer resumes)
-#       GET /spool          -> pending_files, in_progress, succeeded, failed,
+#       GET /spool          -> pending_files, in_progress, succeeded,
+#                              failed (cumulative), failed_files (actionable),
 #                              quarantined, pending_bytes, capacity_used,
 #                              capacity_total, stall_waiters, offline,
 #                              offline_buffer_full, entries[].drain_state/last_error
 #   * Chain of custody (nfs/drainer.go): Finder write -> NFS handler CREATE/WRITE
-#     -> write spool -> drainer.drainOne io.CopyBuffer to FUSE -> SHA re-read
-#     at-rest verify (mismatch => quarantine) -> JuiceFS backend -> DrainDone.
+#     -> write spool -> drainer.drainOne durable checkpoints to FUSE -> SHA
+#     verify -> JuiceFS backend -> DrainDone.
 #     Drained  <=>  pending_files==0 AND in_progress==0.
 #   * GRACEFUL STALL (nfs/spool_status.go StallWaiters/OfflineBufferFull): when
 #     the spool hits capacity the write PARKS (blocks for headroom) — it does
@@ -64,7 +65,7 @@ source "$(dirname "$0")/lib.sh"
 # Tunables (env-overridable so the orchestrator can scale up/down).
 : "${OFFLINE_DIRS:=3}"            # case A: subdirs in the staged tree
 : "${OFFLINE_FPD:=100}"           # case A: files per dir (=> ~300 files)
-: "${OFFLINE_SIZE:=131072}"       # case A: per-file bytes (128 KiB)
+: "${OFFLINE_SIZE:=524288}"       # case A: per-file bytes (512 KiB; keeps Finder active through the toggle)
 : "${STALL_FILE_SIZE:=33554432}"  # case C: per-file bytes (32 MiB) to grow spool fast
 : "${STALL_MAX_FILES:=400}"       # case C: hard cap so we never run unbounded
 : "${STALL_OBSERVE_S:=45}"        # case C: seconds to watch for a stall signal
@@ -102,7 +103,11 @@ cleanup_07() {
     qa_cleanup
     return $rc
 }
-trap cleanup_07 EXIT INT TERM
+trap cleanup_07 EXIT
+# A signal trap that merely returns lets the interrupted test continue creating
+# files. Exit explicitly; the EXIT trap above performs the connectivity cleanup.
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # ---------------------------------------------------------------------------
 # Helpers local to this category (not in lib.sh — see RETURN notes).
@@ -112,7 +117,10 @@ _spool_offline_flag() {
     local body
     body="$(qa_timeout 5 curl -s "$CP_BASE/spool" 2>/dev/null)"
     [ -z "$body" ] && { echo 0; return; }
-    if printf '%s' "$body" | tr ',{}' '\n\n\n' | grep -qE '"offline"[[:space:]]*:[[:space:]]*true'; then
+    # Do not use grep -q at the end of a pipe under pipefail: once grep finds
+    # the field it exits early, tr receives SIGPIPE, and the whole pipeline is
+    # reported false even though the JSON flag was present.
+    if printf '%s' "$body" | tr ',{}' '\n\n\n' | grep -E '"offline"[[:space:]]*:[[:space:]]*true' >/dev/null; then
         echo 1
     else
         echo 0
@@ -124,7 +132,7 @@ _spool_buffer_full_flag() {
     local body
     body="$(qa_timeout 5 curl -s "$CP_BASE/spool" 2>/dev/null)"
     [ -z "$body" ] && { echo 0; return; }
-    if printf '%s' "$body" | tr ',{}' '\n\n\n' | grep -qE '"offline_buffer_full"[[:space:]]*:[[:space:]]*true'; then
+    if printf '%s' "$body" | tr ',{}' '\n\n\n' | grep -E '"offline_buffer_full"[[:space:]]*:[[:space:]]*true' >/dev/null; then
         echo 1
     else
         echo 0
@@ -220,15 +228,25 @@ qa_info "A: offline body: $A_OFF_BODY"
 # While offline, the copy must KEEP WRITING into the spool. Observe pending rise
 # and confirm no backend writes are failing.
 A_OFFLINE_CONFIRMED=0
+# Confirm the state transition independently of the Finder driver's lifetime.
+# A small local-to-NFS copy can finish between the toggle and the first process
+# poll; tying this proof to kill -0 made a real offline transition false-red.
+for _offline_probe in $(seq 1 20); do
+    if [ "$(_spool_offline_flag)" = "1" ]; then
+        A_OFFLINE_CONFIRMED=1
+        break
+    fi
+    perl -e 'select undef,undef,undef,0.25'
+done
 i=0
 A_MAX_PENDING=0
 while [ "$i" -lt 30 ]; do
     [ "$(_spool_offline_flag)" = "1" ] && A_OFFLINE_CONFIRMED=1
     p="$(qa_spool_pending)"
     [ "$p" -gt "$A_MAX_PENDING" ] 2>/dev/null && A_MAX_PENDING="$p"
-    f="$(qa_spool_field failed)"; q="$(qa_spool_field quarantined)"
+    f="$(qa_spool_actionable_failed)"; q="$(qa_spool_field quarantined)"
     if [ "$f" != "0" ] && [ "$f" != "-1" ]; then
-        qa_fail "A: spool reported failed=$f while buffering offline (dest $A_DEST)"
+        qa_fail "A: spool reported failed_files=$f while buffering offline (dest $A_DEST)"
         break
     fi
     if [ "$q" != "0" ] && [ "$q" != "-1" ]; then
@@ -280,8 +298,8 @@ else
 fi
 
 # Post-drain failed/quarantined MUST be zero (SHA mismatch => quarantine = FAIL).
-af="$(qa_spool_field failed)"; aq="$(qa_spool_field quarantined)"
-[ "$af" = "0" ] || [ "$af" = "-1" ] || qa_fail "A: post-drain failed=$af (dest $A_DEST)"
+af="$(qa_spool_actionable_failed)"; aq="$(qa_spool_field quarantined)"
+[ "$af" = "0" ] || [ "$af" = "-1" ] || qa_fail "A: post-drain failed_files=$af (dest $A_DEST)"
 [ "$aq" = "0" ] || [ "$aq" = "-1" ] || qa_fail "A: post-drain quarantined=$aq — SHA mismatch at rest (dest $A_DEST)"
 
 qa_info "A: verifying full chain of custody (md5 readback vs source manifest)"
@@ -373,9 +391,9 @@ WARN
             B_OUTAGE_CLEAN=1
             j=0
             while [ "$j" -lt 25 ]; do
-                f="$(qa_spool_field failed)"; q="$(qa_spool_field quarantined)"
+                f="$(qa_spool_actionable_failed)"; q="$(qa_spool_field quarantined)"
                 if { [ "$f" != "0" ] && [ "$f" != "-1" ]; } || { [ "$q" != "0" ] && [ "$q" != "-1" ]; }; then
-                    qa_fail "B: spool failed=$f quarantined=$q during real outage (dest $B_DEST)"
+                    qa_fail "B: spool failed_files=$f quarantined=$q during real outage (dest $B_DEST)"
                     B_OUTAGE_CLEAN=0; break
                 fi
                 if [ "$j" = "4" ]; then
@@ -451,8 +469,21 @@ C_PARKED_PID=""
 C_COPIED=0
 C_MANIFEST="$QA_CAT_DIR/offline_C.manifest"
 : > "$C_MANIFEST"
+C_FILE_LIMIT="$STALL_MAX_FILES"
+C_CAP_REACHABLE=1
+_c_cap_total="$(qa_spool_field capacity_total)"
+_c_cap_used="$(qa_spool_field capacity_used)"
+if [ "$_c_cap_total" -gt 0 ] 2>/dev/null && [ "$_c_cap_used" -ge 0 ] 2>/dev/null; then
+    _c_remaining=$((_c_cap_total - _c_cap_used))
+    _c_max_stage=$((STALL_MAX_FILES * STALL_FILE_SIZE))
+    if [ "$_c_max_stage" -le "$_c_remaining" ] 2>/dev/null; then
+        C_CAP_REACHABLE=0
+        C_FILE_LIMIT=3
+        qa_warn "C: live spool headroom is ${_c_remaining}B, but this bounded fixture can stage only ${_c_max_stage}B; a cap stall is impossible in this run. Running three offline custody samples instead of writing all $STALL_MAX_FILES files."
+    fi
+fi
 n=1
-while [ "$n" -le "$STALL_MAX_FILES" ]; do
+while [ "$n" -le "$C_FILE_LIMIT" ]; do
     cf="$C_SRC/stall_$n.dat"
     cmd5="$(qa_stage_file "$cf" "$STALL_FILE_SIZE")"
     pid="$(_kick_finder_bg "$cf" "$C_DEST")"
@@ -469,9 +500,9 @@ while [ "$n" -le "$STALL_MAX_FILES" ]; do
             break
         fi
         # Hard gate: a spool-full condition must NEVER surface as failed/quarantined.
-        f="$(qa_spool_field failed)"; q="$(qa_spool_field quarantined)"
+        f="$(qa_spool_actionable_failed)"; q="$(qa_spool_field quarantined)"
         if { [ "$f" != "0" ] && [ "$f" != "-1" ]; } || { [ "$q" != "0" ] && [ "$q" != "-1" ]; }; then
-            qa_fail "C: spool-full produced failed=$f quarantined=$q (must STALL, not fail; dest $C_DEST)"
+            qa_fail "C: spool-full produced failed_files=$f quarantined=$q (must STALL, not fail; dest $C_DEST)"
             C_STALL_SEEN=2  # sentinel: errored, stop
             break
         fi
@@ -490,7 +521,11 @@ if [ "$C_STALL_SEEN" = "1" ]; then
 elif [ "$C_STALL_SEEN" = "2" ]; then
     : # already qa_fail'd above
 else
-    qa_warn "C: never reached the spool cap within $STALL_MAX_FILES x ${STALL_FILE_SIZE}B; cap likely larger than the staged volume. Increase STALL_FILE_SIZE/STALL_MAX_FILES to exercise the stall. (No error observed, which is itself acceptable.)"
+    if [ "$C_CAP_REACHABLE" = "0" ]; then
+        qa_warn "C: spool-full stall not exercised because the preflight proved the bounded fixture cannot reach the live cap; this remains an explicit acceptance item."
+    else
+        qa_warn "C: never reached the spool cap within $STALL_MAX_FILES x ${STALL_FILE_SIZE}B; cap likely larger than the staged volume. Increase STALL_FILE_SIZE/STALL_MAX_FILES to exercise the stall. (No error observed, which is itself acceptable.)"
+    fi
 fi
 
 # Confirm we never saw a Finder/NFS error signature DURING the over-fill, even
@@ -517,8 +552,8 @@ if qa_wait_drain; then
 else
     qa_fail "C: spool did NOT drain after relieving the stall (dest $C_DEST)"
 fi
-cf2="$(qa_spool_field failed)"; cq2="$(qa_spool_field quarantined)"
-[ "$cf2" = "0" ] || [ "$cf2" = "-1" ] || qa_fail "C: post-stall failed=$cf2 (dest $C_DEST)"
+cf2="$(qa_spool_actionable_failed)"; cq2="$(qa_spool_field quarantined)"
+[ "$cf2" = "0" ] || [ "$cf2" = "-1" ] || qa_fail "C: post-stall failed_files=$cf2 (dest $C_DEST)"
 [ "$cq2" = "0" ] || [ "$cq2" = "-1" ] || qa_fail "C: post-stall quarantined=$cq2 — corruption at rest (dest $C_DEST)"
 
 # Custody: only assert files that actually landed (a parked-then-cancelled write

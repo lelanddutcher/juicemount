@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/lelanddutcher/juicemount/internal/cache/pin"
+	"github.com/lelanddutcher/juicemount/internal/jmlog"
 	"github.com/lelanddutcher/juicemount/internal/netprofile"
 	"github.com/lelanddutcher/juicemount/metadata"
 )
@@ -48,27 +49,72 @@ type Drainer struct {
 	maxAttempts  int
 	backoffBase  time.Duration
 	pollFallback time.Duration
+	// syncIntervalBytes overrides the adaptive durable-checkpoint interval when
+	// positive. Zero selects the live link-class policy for every drain.
+	syncIntervalBytes int64
 
 	sem chan struct{}
-	// slowGate serializes drains on slow/metered links (cap 1). [cellular
-	// drain saturation 2026-07-10] 4 concurrent whole-file copies + blocking
+
+	// smallSem is a SEPARATE admission lane for tiny rows (<= smallBytes).
+	//
+	// WHY A SECOND LANE RATHER THAN A BIGGER FIRST ONE. `sem` counts FILES, but
+	// the incident it exists to prevent is about BYTES: on 2026-06-14 sixteen
+	// concurrent ~66 MB Finder copies piled that many in-flight whole-file
+	// writes into juicefs's --buffer-size, the mount went readdir-unresponsive,
+	// and the watchdog SIGKILLed and remounted it. Counting files gets that
+	// wrong in one specific, measured way: a 4 KiB `._` AppleDouble sidecar
+	// takes a whole slot and blocks on a real MinIO PUT exactly like a camera
+	// master. Sidecars are 50% of all write operations (CREATE/WRITE/COMMIT are
+	// 2.00 per real file, measured 2026-08-16) and 0.0054% of the bytes beside a
+	// 72 MiB master — so half the media lane serves a rounding error.
+	//
+	// The obvious alternative — just raise Workers — is MEASURED HARMFUL and was
+	// tried: 4 -> 16 took small-file throughput from 46.0 to 40.4 files/s and p99
+	// from 328-364 ms to 372-715 ms. Widening the media lane is not the fix; it
+	// re-exposes the 2026-06-14 byte envelope for no gain.
+	//
+	// So the media lane keeps its width of 4 and its byte envelope untouched,
+	// and tiny rows stop competing for it. This is a fairness fix, not a
+	// throughput fix — F2 established that the ~50 files/s ceiling is serialized
+	// per-file work in the WRITE path, not drain width, so do not expect a large
+	// files/sec change from this.
+	smallSem   chan struct{}
+	smallBytes int64
+	// slowGate serializes MEDIA-LANE drains on slow/metered links (cap 1).
+	// [cellular drain saturation 2026-07-10] 4 concurrent whole-file copies + blocking
 	// Sync saturated a cellular tunnel's uplink: FUSE fsyncs stretched past
 	// 120s, the macFUSE session degraded (EBADF), and the mount died while
 	// "draining normally" — on every boot, killing both a new deploy AND its
 	// rollback. One in-flight drain keeps FUSE responsive; the spool absorbs
 	// the backlog. Class is read per-dispatch (a LAN↔cellular flip adapts
 	// live, no restart). JM_DRAIN_CLASS_GATE=0 disables.
-	slowGate chan struct{}
-	notify   chan struct{}
-	stop     chan struct{}
-	done     chan struct{}
+	slowGate     chan struct{}
+	notify       chan struct{}
+	stop         chan struct{}
+	done         chan struct{}
+	shutdownDone chan struct{}
 
-	// started gates Stop's wait on d.done: set true by Start (which launches
-	// the dispatcher that closes d.done). Without it, Stop on a never-started
-	// drainer would block forever on <-d.done.
-	started atomic.Bool
+	// Every Stop waits on the same completion, including after a timeout.
+	lifecycleMu sync.Mutex
+	started     bool
+	stopping    bool
+	// Dormant bound predecessor-FD phases share Stop's lifecycle barrier.
+	boundPhases *boundFDPhaseRegistry
 
-	inFlight sync.WaitGroup
+	inFlight            sync.WaitGroup
+	replacementWorkers  replacementWorkers
+	replacementDispatch *replacementDispatch
+
+	// H-8 publication state (drainer_publish.go).
+	instanceOnce      sync.Once
+	instance          string
+	instancePersisted bool
+	installedMu       sync.Mutex
+	installed         map[int64]installedIdentity
+
+	// H-8B project leases (drain_refusal.go). nil = no lease client. Atomic:
+	// the spool's base probe reads it from NFS RPC goroutines.
+	leasesPtr atomic.Pointer[ProjectLeaseClient]
 
 	metrics DrainerMetrics
 
@@ -77,7 +123,7 @@ type Drainer struct {
 	// Start; the handler uses it to sync the drained file's real size into
 	// the metadata cache. Worker goroutines read it after Start, so
 	// set-before-Start provides the happens-before (no lock needed).
-	onDrainComplete func(nfsPath string, size int64)
+	onDrainComplete func(nfsPath string, size int64, mtime time.Time)
 
 	// lastDrainSuccessNanos is the wall-clock UnixNano of the most recent
 	// COMPLETED drain — a real MinIO PUT that landed and was marked done (the
@@ -93,14 +139,25 @@ type Drainer struct {
 	// goroutines, read by the probe-loop goroutine.
 	lastDrainSuccessNanos atomic.Int64
 
-	// onSizeReady, if set, publishes the drained file's authoritative size into
-	// the metadata store BEFORE MarkDrainComplete evicts the spool shadow, so a
-	// fresh read can never observe a post-eviction-but-pre-size (0/partial)
-	// Entry.Size (task #65 read-during-active-drain). Set once via SetOnSizeReady
-	// BEFORE Start (same set-before-Start happens-before as onDrainComplete).
-	// row.Size is authoritative at the call site: the copy is rejected unless
-	// n == row.Size.
-	onSizeReady func(nfsPath string, size int64)
+	// onSizeReady is a legacy post-commit hook. It never runs for rejected or
+	// uncertain rows. Production size publication belongs to onDrainCommit;
+	// legacy successful callbacks still require a separate ownership audit.
+	onSizeReady func(nfsPath string, size int64, mtime time.Time)
+
+	// onDrainCommit qualifies the exact spool row and commits its size and
+	// done state atomically. Missing wiring fails closed. Set before Start.
+	onDrainCommit func(metadata.DrainCommitItem) (metadata.DrainCommitResult, error)
+	// Production-only exact-generation effects. Admission is acquired before
+	// completion SQL and retained until descriptor effects and cleanup settle.
+	onDrainAdmission          func(string) *namespaceOperation
+	onDrainEffects            func(metadata.DrainCommitItem, metadata.DrainCommitResult, *os.File, []byte) error
+	onDrainSucceeded          func(string)
+	onBatchDrainCompleteExact func([]metadata.DrainCommitItem) ([]metadata.DrainCommitResult, error)
+
+	// onDrainMetadataReady captures a bounded Finder-metadata spool image after
+	// its authoritative size and backend mtime are published but before spool
+	// cleanup removes the local file. It is set once before Start.
+	onDrainMetadataReady func(nfsPath string, size int64, mtime time.Time)
 
 	// onSymlinkMaterialized, if set, is invoked after a deferred offline
 	// symlink is os.Symlink'd onto FUSE at reconnect. Set once via
@@ -109,6 +166,14 @@ type Drainer struct {
 	// backend, no longer local-only). The dispatcher goroutine reads it on
 	// the reconnect edge, so set-before-Start provides the happens-before.
 	onSymlinkMaterialized func(linkPath string)
+
+	// onSidecarSkip is retained for compatibility with diagnostic fixtures.
+	// Completion never invokes the former unqualified elision hook.
+	onSidecarSkip func(nfsPath string) bool
+
+	// skipEmptySidecars retains the legacy diagnostic setting; no drain
+	// bypass is enabled by it.
+	skipEmptySidecars bool
 
 	// atRestVerify gates the post-copy at-rest SHA re-read (re-opening the
 	// just-written file through JuiceFS and re-hashing it). Default OFF: with
@@ -146,14 +211,32 @@ type Drainer struct {
 	// happens-before. nil ⇒ the batcher falls back to per-file completion
 	// (defensive; production always wires it when the flag is on).
 	onBatchDrainComplete func([]metadata.DrainCommitItem) ([]metadata.DrainCommitResult, error)
+
+	// streamer holds live streaming-copy sessions. Nil unless StartStreamer ran,
+	// which only happens when JM_SPOOL_STREAM_DRAIN=1 — a disabled feature
+	// allocates nothing and starts no goroutine.
+	streamer *streamer
 }
 
 // DrainerConfig controls drainer behavior. Zero values fall back to
 // production-sensible defaults documented per field.
 type DrainerConfig struct {
+	// ReplacementRecovery opts into the reviewed queue path. Default false.
+	ReplacementRecovery bool
+
 	// FuseRoot is the absolute path to the JuiceFS FUSE mount root.
 	// Drained files land at FuseRoot/<nfs_path>.
 	FuseRoot string
+
+	// SmallWorkers caps the SEPARATE small-row lane (see Drainer.smallSem).
+	// 0 → the default of 4; NEGATIVE disables the lane so every row uses the
+	// media semaphore, which is byte-for-byte the pre-lane behaviour.
+	//
+	// Total concurrent drains is therefore Workers + SmallWorkers, bounded in
+	// BYTES by (Workers x whatever media sizes) + (SmallWorkers x smallBytes) —
+	// the second term is at most 4 MiB by default and is why the lane does not
+	// re-open the 2026-06-14 buffer-saturation envelope.
+	SmallWorkers int
 
 	// Workers caps concurrent in-flight drains. 0 → 4.
 	Workers int
@@ -169,6 +252,13 @@ type DrainerConfig struct {
 	// re-scans even without a wake signal. Protects against missed
 	// signals after process restart. 0 → 30 seconds.
 	PollFallback time.Duration
+
+	// SyncIntervalBytes bounds how many destination bytes may remain dirty
+	// between durable JuiceFS flushes. Zero selects the adaptive production
+	// policy (1 MiB metered, 2 MiB slow, 4 MiB medium/fast). A positive value is
+	// a field override clamped to 256 KiB..4 MiB so it cannot recreate the
+	// whole-file Fsync. JM_DRAIN_SYNC_BYTES takes precedence.
+	SyncIntervalBytes int64
 }
 
 // DrainerMetrics exposes counters useful for the manager UI + tests.
@@ -181,6 +271,10 @@ type DrainerMetrics struct {
 	Quarantined     atomic.Int64
 	BytesDrained    atomic.Int64
 	InFlight        atomic.Int64
+	// SidecarsSkipped counts `._` rows completed WITHOUT a backend file
+	// because their AppleDouble body carried no metadata. See
+	// appleDoubleIsDefaultEmpty in sidecar.go.
+	SidecarsSkipped atomic.Int64
 }
 
 // NewDrainer constructs but does not start the drainer. Call Start to
@@ -210,6 +304,38 @@ func NewDrainer(spool *SpoolStore, cfg DrainerConfig) (*Drainer, error) {
 			}
 		}
 	}
+	// Small-file lane. 8 concurrent tiny rows adds negligible byte pressure
+	// (8 x 1 MiB worst case = 8 MiB, against a media lane of 4 x 66 MB = 264 MB
+	// that the 2026-06-14 envelope already tolerated) while keeping ._ sidecars
+	// out of the media lane entirely. JM_DRAIN_SMALL_WORKERS=0 disables the lane
+	// and routes everything back through `sem` — byte-for-byte the old behaviour.
+	// Width 4, the SAME as the media lane, not wider. F2 measured that widening
+	// drain concurrency hurts: 4 -> 16 took small-file throughput from 46.0 to
+	// 40.4 files/s and p99 from 328-364 ms to 372-715 ms. So the small lane is
+	// not a speed-up, and sizing it above the width already proven good would be
+	// re-running an experiment that already failed. It exists so that a workload
+	// of media + sidecars stops spending half the media lane on 4 KiB files; a
+	// PURE small-file workload sees the same width of 4 it always had.
+	//
+	// cfg.SmallWorkers overrides: 0 means "use this default", negative disables
+	// the lane entirely (everything back through sem, byte-for-byte the old
+	// behaviour). JM_DRAIN_SMALL_WORKERS=0 also disables, for the field.
+	smallWorkers := 4
+	if cfg.SmallWorkers != 0 {
+		smallWorkers = cfg.SmallWorkers
+	}
+	if v := os.Getenv("JM_DRAIN_SMALL_WORKERS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			smallWorkers = n
+		}
+	}
+	smallBytes := int64(1 << 20)
+	if v := os.Getenv("JM_DRAIN_SMALL_BYTES"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+			smallBytes = n
+		}
+	}
+
 	if cfg.MaxAttempts <= 0 {
 		cfg.MaxAttempts = 5
 	}
@@ -219,23 +345,50 @@ func NewDrainer(spool *SpoolStore, cfg DrainerConfig) (*Drainer, error) {
 	if cfg.PollFallback <= 0 {
 		cfg.PollFallback = 30 * time.Second
 	}
+	syncIntervalBytes := cfg.SyncIntervalBytes
+	if v := os.Getenv("JM_DRAIN_SYNC_BYTES"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+			syncIntervalBytes = n
+		}
+	}
 	d := &Drainer{
-		spool:        spool,
-		fuseRoot:     cfg.FuseRoot,
-		workers:      cfg.Workers,
-		maxAttempts:  cfg.MaxAttempts,
-		backoffBase:  cfg.BackoffBase,
-		pollFallback: cfg.PollFallback,
-		atRestVerify: os.Getenv("JM_DRAIN_ATREST_VERIFY") == "1",
-		batchInsert:  os.Getenv("JM_DRAIN_BATCH_INSERT") == "1",
-		sem:          make(chan struct{}, cfg.Workers),
+		spool:               spool,
+		replacementDispatch: &replacementDispatch{enabled: cfg.ReplacementRecovery, notify: make(chan struct{}, 1), localNotify: make(chan struct{}, 1)},
+		fuseRoot:            cfg.FuseRoot,
+		workers:             cfg.Workers,
+		maxAttempts:         cfg.MaxAttempts,
+		backoffBase:         cfg.BackoffBase,
+		pollFallback:        cfg.PollFallback,
+		syncIntervalBytes:   syncIntervalBytes,
+		atRestVerify:        os.Getenv("JM_DRAIN_ATREST_VERIFY") == "1",
+		batchInsert:         os.Getenv("JM_DRAIN_BATCH_INSERT") == "1",
+		skipEmptySidecars:   drainSkipEmptySidecarsEnabled(),
+		sem:                 make(chan struct{}, cfg.Workers),
+		smallSem: func() chan struct{} {
+			if smallWorkers <= 0 {
+				return nil // lane disabled; everything uses sem
+			}
+			return make(chan struct{}, smallWorkers)
+		}(),
+		smallBytes:   smallBytes,
 		slowGate:     make(chan struct{}, 1),
 		notify:       make(chan struct{}, 1),
 		stop:         make(chan struct{}),
 		done:         make(chan struct{}),
+		shutdownDone: make(chan struct{}),
+		boundPhases:  newBoundFDPhaseRegistry(),
 	}
 	if d.batchInsert {
 		d.batch = newDrainBatcher(d, drainBatchMaxOps, drainBatchMaxDelay)
+	}
+	// H-8B: every new spool row records the base identity of the file it
+	// replaces. The drainer owns the FUSE root, so it supplies the probe.
+	probe := spoolBaseProbe(d.probeBase)
+	spool.baseProbe.Store(&probe)
+	// Bind the spool instance to this Mac before boot recovery; a spool
+	// copied from another Mac has its rows held first (drainer_publish.go).
+	if err := d.bindSpoolInstance(); err != nil {
+		return nil, err
 	}
 	return d, nil
 }
@@ -249,8 +402,32 @@ func NewDrainer(spool *SpoolStore, cfg DrainerConfig) (*Drainer, error) {
 // Drainer.Start) are picked up immediately rather than waiting for
 // the first pollFallback tick.
 func (d *Drainer) Start() {
-	d.started.Store(true)
+	d.lifecycleMu.Lock()
+	defer d.lifecycleMu.Unlock()
+	if d.started || d.stopping {
+		return
+	}
+	d.started = true
 	d.spool.SetDrainerWake(d.wakeNonBlocking)
+	// H-8B: without a lease client nothing would ever release a row parked in
+	// waiting_project (a previous run had a client; this one does not). Clear
+	// the waits so those changes drain the pre-lease way.
+	d.releaseHoldsWithoutLeases()
+	// H-8: remove drain stages a crash left behind. Only stages created before
+	// this instant can be swept, so a drain this process starts is never
+	// touched. Runs beside dispatch so a slow readdir cannot delay draining;
+	// counted in inFlight (before the dispatcher exists) so Stop joins it.
+	sweepCutoff := time.Now()
+	d.inFlight.Add(1)
+	go func() {
+		defer d.inFlight.Done()
+		if n, err := d.SweepDrainStages(sweepCutoff); err != nil {
+			log.Printf("drainer: %v", err)
+		} else if n > 0 {
+			log.Printf("drainer: removed %d orphan drain stage(s) left by a crash", n)
+		}
+	}()
+	d.startReplacementDispatch()
 	d.wakeNonBlocking()
 	go d.dispatchLoop()
 }
@@ -260,46 +437,71 @@ func (d *Drainer) Start() {
 // false if the deadline was hit (some drains will resume on next boot
 // via the slice-F scrubber).
 //
-// Idempotent — second call returns immediately with true.
+// Repeated calls wait on the same shutdown and report its actual state.
 func (d *Drainer) Stop(deadline time.Duration) bool {
-	// Never started: there's no dispatcher to wait on (d.done is never closed
-	// without Start), so closing d.stop and blocking on <-d.done would deadlock.
-	// A constructed-but-unstarted drainer has nothing in flight — return clean.
-	// (SetSpool wires a drainer that the binary always Starts; this guards the
-	// degenerate path and keeps Stop safe for tests/short-lived instances.)
-	if !d.started.Load() {
-		select {
-		case <-d.stop:
-		default:
-			close(d.stop)
+	d.lifecycleMu.Lock()
+	if !d.stopping {
+		d.stopping = true
+		if q := d.replacementDispatch; q != nil && q.cancel != nil {
+			q.cancel()
 		}
-		return true
+		if d.boundPhases != nil {
+			d.boundPhases.stopAccepting()
+		}
+		close(d.stop)
+		if d.started {
+			go d.awaitShutdown()
+		} else {
+			if d.replacementWorkers.isEmpty() && (d.boundPhases == nil || d.boundPhases.isEmpty()) {
+				close(d.shutdownDone)
+			} else {
+				go func() {
+					d.inFlight.Wait()
+					if d.boundPhases != nil {
+						d.boundPhases.waitAll()
+					}
+					close(d.shutdownDone)
+				}()
+			}
+		}
 	}
+	d.lifecycleMu.Unlock()
+
 	select {
-	case <-d.stop:
+	case <-d.shutdownDone:
 		return true
 	default:
-		close(d.stop)
 	}
-	// Wait for dispatcher to exit.
-	<-d.done
-	// Wait for in-flight workers with deadline.
-	doneCh := make(chan struct{})
-	go func() {
-		d.inFlight.Wait()
-		// Lever 1: once every worker has finished enqueueing, flush the final
-		// partial batch so no drained file's metadata commit is stranded at
-		// shutdown. Runs inside the wait goroutine so it completes within the
-		// same deadline the caller granted for in-flight work.
-		d.flushBatch()
-		close(doneCh)
-	}()
-	select {
-	case <-doneCh:
-		return true
-	case <-time.After(deadline):
+	if deadline <= 0 {
 		return false
 	}
+	timer := time.NewTimer(deadline)
+	defer timer.Stop()
+	select {
+	case <-d.shutdownDone:
+		return true
+	case <-timer.C:
+		return false
+	}
+}
+
+func (d *Drainer) awaitShutdown() {
+	// Stop seals replacement admission under lifecycleMu. The dispatcher
+	// owns ordinary worker additions; join it before waiting so no claimed
+	// worker can start after Wait observes zero.
+	<-d.done
+	if q := d.replacementDispatch; q != nil && q.done != nil {
+		<-q.done
+		<-q.localDone
+	}
+	d.inFlight.Wait()
+	// Workers can enqueue into the coalescer until Wait completes. Final flush
+	// is part of shutdown, and may itself be blocked on a storage operation.
+	d.flushBatch()
+	if d.boundPhases != nil {
+		d.boundPhases.waitAll()
+	}
+	close(d.shutdownDone)
 }
 
 // Metrics returns the live counter struct. Caller may read fields
@@ -323,14 +525,40 @@ func (d *Drainer) LastDrainSuccess() time.Time {
 
 // SetOnDrainComplete registers a callback invoked once per successful drain,
 // after the row is marked done. Must be called BEFORE Start.
-func (d *Drainer) SetOnDrainComplete(fn func(nfsPath string, size int64)) {
+func (d *Drainer) SetOnDrainComplete(fn func(nfsPath string, size int64, mtime time.Time)) {
 	d.onDrainComplete = fn
 }
 
-// SetOnSizeReady registers the pre-eviction size-publish hook (task #65). Call
-// once before Start.
-func (d *Drainer) SetOnSizeReady(fn func(nfsPath string, size int64)) {
+// SetOnSizeReady registers a legacy post-commit, pre-eviction hook.
+// Production metadata publication must use SetOnDrainCommit. Call before Start.
+func (d *Drainer) SetOnSizeReady(fn func(nfsPath string, size int64, mtime time.Time)) {
 	d.onSizeReady = fn
+}
+
+// SetOnDrainCommit registers the exact-size one-item transaction. It must
+// qualify the spool tuple before publishing metadata; call before Start.
+func (d *Drainer) SetOnDrainCommit(fn func(metadata.DrainCommitItem) (metadata.DrainCommitResult, error)) {
+	d.onDrainCommit = fn
+}
+
+func (d *Drainer) SetOnDrainAdmission(fn func(string) *namespaceOperation) {
+	d.onDrainAdmission = fn
+}
+
+func (d *Drainer) SetOnDrainEffects(fn func(metadata.DrainCommitItem, metadata.DrainCommitResult, *os.File, []byte) error) {
+	d.onDrainEffects = fn
+}
+
+func (d *Drainer) SetOnDrainSucceeded(fn func(string)) { d.onDrainSucceeded = fn }
+
+func (d *Drainer) SetOnBatchDrainCompleteExact(fn func([]metadata.DrainCommitItem) ([]metadata.DrainCommitResult, error)) {
+	d.onBatchDrainCompleteExact = fn
+}
+
+// SetOnDrainMetadataReady registers the pre-cleanup Finder-metadata snapshot
+// hook with the authoritative backend mtime. Call once before Start.
+func (d *Drainer) SetOnDrainMetadataReady(fn func(nfsPath string, size int64, mtime time.Time)) {
+	d.onDrainMetadataReady = fn
 }
 
 // SetOnBatchDrainComplete registers the batched metadata-commit hook used when
@@ -351,6 +579,11 @@ func (d *Drainer) SetOnSymlinkMaterialized(fn func(linkPath string)) {
 	d.onSymlinkMaterialized = fn
 }
 
+// SetOnSidecarSkip retains the legacy hook for compatibility. It is not invoked.
+func (d *Drainer) SetOnSidecarSkip(fn func(nfsPath string) bool) {
+	d.onSidecarSkip = fn
+}
+
 // flushBatch flushes any pending coalesced drains (Lever 1). No-op when the
 // batcher is disabled. Called on the drain-idle edge (ListReady empty), before
 // the dispatcher parks (offline / FUSE-identity loss), and on Stop — so a
@@ -366,6 +599,16 @@ func (d *Drainer) flushBatch() {
 // already pending a wake, the signal is collapsed (we only need to know
 // "there's something to do", not how many things).
 func (d *Drainer) wakeNonBlocking() {
+	if q := d.replacementDispatch; q != nil {
+		select {
+		case q.notify <- struct{}{}:
+		default:
+		}
+		select {
+		case q.localNotify <- struct{}{}:
+		default:
+		}
+	}
 	select {
 	case d.notify <- struct{}{}:
 	default:
@@ -379,13 +622,15 @@ func (d *Drainer) dispatchLoop() {
 	defer close(d.done)
 	wasOffline := false
 	identityParked := false
+	symlinkCheckNeeded := true
+	var nextSymlinkAttempt time.Time
 	for {
 		// When offline, poll at a tighter cadence than pollFallback so we
 		// notice reconnection (manual toggle or auto-recovery) within a few
 		// seconds and resume draining promptly. Online, the wake signal drives
 		// us and pollFallback is just a missed-signal backstop.
 		wait := d.pollFallback
-		if pin.IsOffline() || !pin.FUSEIdentityOK() {
+		if pin.IsOffline() || !pin.FUSEIdentityOK() || symlinkCheckNeeded {
 			wait = drainOfflineRecheck
 		}
 		select {
@@ -410,6 +655,7 @@ func (d *Drainer) dispatchLoop() {
 			// (In-flight stragglers are still backstopped by the batch timer.)
 			d.flushBatch()
 			wasOffline = true
+			symlinkCheckNeeded = true
 			continue
 		}
 		// PAUSE while the FUSE identity gate fails (V2.3 G0). When the
@@ -427,6 +673,7 @@ func (d *Drainer) dispatchLoop() {
 				identityParked = true
 			}
 			wasOffline = true
+			symlinkCheckNeeded = true
 			continue
 		}
 		if identityParked {
@@ -439,16 +686,19 @@ func (d *Drainer) dispatchLoop() {
 		// RetryFailed is a no-op (returns 0) when nothing is failed.
 		if wasOffline {
 			wasOffline = false
-			if n, err := d.spool.RetryFailed(); err != nil {
+			symlinkCheckNeeded = true
+			if n, err := d.spool.RetryFailedAutomatic(); err != nil {
 				log.Printf("drainer: reconnect RetryFailed: %v", err)
 			} else if n > 0 {
 				log.Printf("drainer: reconnect requeued %d failed spool row(s)", n)
 			}
-			// Symlinks created offline were deferred (juiceFS.Symlink does NOT
-			// os.Symlink while offline); materialize them on FUSE now that the
-			// backend is reachable. This is the symlink analogue of the file
-			// drain — same reconnect path, same offline→online recovery.
-			d.materializePendingSymlinks()
+		}
+		// The initial online wake must also recover symlinks persisted by a
+		// prior process. Only retry while unresolved; busy file-drain wakes
+		// must not issue an unbounded SQLite query for an empty link queue.
+		if symlinkCheckNeeded && !time.Now().Before(nextSymlinkAttempt) {
+			symlinkCheckNeeded = d.materializePendingSymlinks()
+			nextSymlinkAttempt = time.Now().Add(drainOfflineRecheck)
 		}
 
 		// Drain all currently-ready rows before going back to sleep.
@@ -466,7 +716,7 @@ func (d *Drainer) dispatchLoop() {
 			if pin.IsOffline() || !pin.FUSEIdentityOK() {
 				break
 			}
-			rows, err := d.spool.Meta().ListReady(d.workers * 2)
+			rows, err := d.listDispatchable(d.workers * 2)
 			if err != nil {
 				log.Printf("drainer: list ready: %v", err)
 				break
@@ -494,8 +744,8 @@ func (d *Drainer) dispatchLoop() {
 
 // materializePendingSymlinks creates, on the FUSE mount, every symlink that was
 // deferred while offline (juiceFS.Symlink persists (link, target) instead of
-// os.Symlink'ing when the backend is unreachable). Called on the reconnect edge,
-// alongside RetryFailed — the symlink half of offline→online recovery.
+// os.Symlink'ing when the backend is unreachable). Called on every verified
+// online dispatch, including the initial startup wake.
 //
 // For each persisted link: os.Symlink(target, fuseRoot/link), then clear the
 // link's LocalOnly flag (via onSymlinkMaterialized → store.ClearLocalOnly) and
@@ -511,23 +761,26 @@ func (d *Drainer) dispatchLoop() {
 //     so a crash mid-loop re-materializes the rest next reconnect; a genuine
 //     error leaves the row for the next attempt and is logged, never fatal
 //     (one bad link must not strand the others or the file drain).
-func (d *Drainer) materializePendingSymlinks() {
+//
+// Returns true while a query or link still needs another online attempt.
+func (d *Drainer) materializePendingSymlinks() bool {
 	// V2.3 G0: os.Symlink into a plain-dir mountpoint would strand the links
 	// on the local disk exactly like a misdirected file drain. Rows persist,
 	// so skipping here just defers to the next reconnect edge.
 	if ok, reason := pin.FUSEIdentityState(); !ok {
 		log.Printf("drainer: skipping symlink materialization — FUSE identity gate failed (%s)", reason)
-		return
+		return true
 	}
 	pend, err := d.spool.Meta().ListPendingSymlinks()
 	if err != nil {
 		log.Printf("drainer: reconnect list pending symlinks: %v", err)
-		return
+		return true
 	}
 	if len(pend) == 0 {
-		return
+		return false
 	}
 	materialized := 0
+	remaining := false
 	for _, p := range pend {
 		// Review fix: re-check the gate PER LINK — an unmount mid-loop would
 		// otherwise land the remaining links on the plain dir. Cached (2s
@@ -536,7 +789,7 @@ func (d *Drainer) materializePendingSymlinks() {
 		if ok, reason := pin.FUSEIdentityState(); !ok {
 			log.Printf("drainer: symlink materialization aborted — FUSE identity gate failed (%s); %d row(s) retry next reconnect",
 				reason, len(pend)-materialized)
-			return
+			return true
 		}
 		fusePath := filepath.Join(d.fuseRoot, p.LinkPath)
 		serr := os.Symlink(p.Target, fusePath)
@@ -550,6 +803,7 @@ func (d *Drainer) materializePendingSymlinks() {
 			// Transient (e.g. backend flapped back offline mid-materialize):
 			// leave the row for the next reconnect, log, keep going.
 			log.Printf("drainer: materialize symlink %q -> %q: %v", p.LinkPath, p.Target, serr)
+			remaining = true
 			continue
 		}
 		// Review fix: close the write-then-delete gap — if the mount vanished
@@ -558,7 +812,14 @@ func (d *Drainer) materializePendingSymlinks() {
 		if ok, reason := pin.FUSEIdentityState(); !ok {
 			log.Printf("drainer: symlink materialization aborted post-create — FUSE identity gate failed (%s); row %q retries next reconnect",
 				reason, p.LinkPath)
-			return
+			return true
+		}
+		actualTarget, readErr := os.Readlink(fusePath)
+		if readErr != nil || actualTarget != p.Target {
+			log.Printf("drainer: pending symlink %q does not match on-FUSE target (got %q, want %q, read error %v); retaining row",
+				p.LinkPath, actualTarget, p.Target, readErr)
+			remaining = true
+			continue
 		}
 		// On-FUSE now (created, or already existed). Clear LocalOnly so the
 		// reconcile prune treats it as a normal backend entry, then drop the
@@ -568,12 +829,14 @@ func (d *Drainer) materializePendingSymlinks() {
 		}
 		if dErr := d.spool.Meta().DeletePendingSymlink(p.LinkPath); dErr != nil {
 			log.Printf("drainer: delete pending symlink %q: %v", p.LinkPath, dErr)
+			remaining = true
 		}
 		materialized++
 	}
 	if materialized > 0 {
 		log.Printf("drainer: reconnect materialized %d deferred symlink(s)", materialized)
 	}
+	return remaining
 }
 
 // dispatchRow claims a single ready row and hands it to a worker.
@@ -587,7 +850,17 @@ func (d *Drainer) materializePendingSymlinks() {
 // send unblocking and the goroutine actually executing Add. Stop would
 // then return prematurely with workers still mid-drain.
 func (d *Drainer) dispatchRow(row *metadata.SpoolRow) bool {
-	claimed, err := d.spool.Meta().MarkDraining(row.ID)
+	// The inclusive list is valid only while no lease client is wired. Sample
+	// the current client again at claim time; a newly installed client keeps
+	// the ordinary wait guard. The worker checks the live lease gate again
+	// after its lane wait and before the first backend mutation.
+	var claimed bool
+	var err error
+	if d.ProjectLeases() == nil {
+		claimed, err = d.spool.Meta().MarkDrainingWithoutProjectLease(row.ID)
+	} else {
+		claimed, err = d.spool.Meta().MarkDraining(row.ID)
+	}
 	if err != nil {
 		log.Printf("drainer: claim %d: %v", row.ID, err)
 		return true
@@ -629,24 +902,37 @@ func (d *Drainer) dispatchRow(row *metadata.SpoolRow) bool {
 	// for the UI, not "claimed but slot-blocked" count.
 	d.inFlight.Add(1)
 
+	// Lane selection. Tiny rows (._ sidecars, .prproj saves, LUTs) take the
+	// small lane so they never occupy a media slot; everything else keeps the
+	// media lane and its measured byte envelope. Chosen from the POST-CLAIM
+	// re-read row, so a rename/resize in the dispatch window cannot put a large
+	// file in the small lane.
+	lane := d.laneFor(row.Size)
+
+	// How long this row waits for a lane slot. Part of its wall clock but not
+	// part of drainOne, and untimed until 2026-08-18.
+	laneWaitStart := time.Now()
 	select {
 	case <-d.stop:
 		d.inFlight.Done()
 		_ = d.spool.Meta().ResetToReady(row.ID)
 		return false
-	case d.sem <- struct{}{}:
+	case lane <- struct{}{}:
 	}
+	laneWait := time.Since(laneWaitStart)
 
 	go func(r *metadata.SpoolRow) {
 		defer func() {
-			<-d.sem
+			<-lane
 			d.inFlight.Done()
 		}()
-		// Slow/metered link: serialize (see slowGate doc). Acquired BEFORE
-		// the InFlight metric so the UI shows the one truly-active drain,
-		// not N workers parked on the gate. On stop, the parked row resets
-		// to Ready — same contract as the dispatch-side stop case.
-		if drainClassGateEnabled() && drainLinkIsSlow() {
+		// Slow/metered link: serialize media rows (see slowGate doc). Tiny
+		// rows already have their own byte-bounded lane (4 MiB worst case);
+		// serializing them here defeated that lane and turned a 5,000-entry
+		// directory's AppleDouble drain into a many-minute backlog. Acquired
+		// BEFORE the InFlight metric so the UI shows truly-active drains, not
+		// workers parked on the gate. On stop, the parked row resets to Ready.
+		if drainClassGateEnabled() && drainLinkIsSlow() && d.slowGateAppliesTo(lane) {
 			select {
 			case d.slowGate <- struct{}{}:
 				defer func() { <-d.slowGate }()
@@ -657,10 +943,29 @@ func (d *Drainer) dispatchRow(row *metadata.SpoolRow) bool {
 		}
 		d.metrics.InFlight.Add(1)
 		defer d.metrics.InFlight.Add(-1)
-		d.drainOne(r)
+		d.drainOneWithWait(r, laneWait)
 	}(row)
 	return true
 }
+
+// laneFor picks the admission semaphore for a row of `size` bytes.
+//
+// A row of size 0 or unknown takes the MEDIA lane. That is deliberate: the
+// small lane's whole safety argument is that its members contribute negligible
+// bytes, and a row whose size we do not trust cannot make that promise. Erring
+// toward the media lane costs a slot; erring the other way would let an
+// unbounded file into a lane sized on the assumption that nothing in it is big.
+func (d *Drainer) laneFor(size int64) chan struct{} {
+	if d.smallSem != nil && size > 0 && size <= d.smallBytes {
+		return d.smallSem
+	}
+	return d.sem
+}
+
+// slowGateAppliesTo reports whether a row's selected lane carries media-sized
+// work. Small-lane concurrency is already bounded separately by both worker
+// count and bytes, so cellular safety does not require serializing it again.
+func (d *Drainer) slowGateAppliesTo(lane chan struct{}) bool { return lane == d.sem }
 
 // drainClassGateEnabled: JM_DRAIN_CLASS_GATE=0 disables the slow-link
 // serialization (restores unconditional Workers-wide concurrency).
@@ -669,18 +974,163 @@ func drainClassGateEnabled() bool { return os.Getenv("JM_DRAIN_CLASS_GATE") != "
 // drainLinkIsSlow reports whether the measured link class is slow or metered —
 // the classes where concurrent whole-file drains saturate the uplink and
 // starve FUSE (see slowGate). Read per-dispatch: class flips apply live.
+// drainPhaseLog reports where a drain's wall time actually goes, gated on
+// JM_DRAIN_PHASE_LOG=1.
+//
+// WHY THIS EXISTS. On 2026-08-18 a controlled drain of 120 x 64 KiB files took
+// 96.2s — 802 ms of wall per file at concurrency 4, so 3.1 SECONDS of latency
+// per 64 KiB file, while the object store answered PUTs in 29 ms. Three
+// successive explanations were proposed from reading the code and ALL THREE
+// were wrong: the file-count semaphore (a PUT is a juicefs block, not a file),
+// the batch coalescer (the worker returns immediately after enqueue and does
+// not wait), and the at-rest re-read (JM_DRAIN_ATREST_VERIFY defaults OFF, so
+// it never runs). Reading this function is evidently not sufficient to predict
+// its cost. Measure it instead.
+var drainPhaseLogEnabled = os.Getenv("JM_DRAIN_PHASE_LOG") == "1"
+
+type drainPhases struct {
+	t0                                      time.Time
+	openSrc, create, identity, copy, sync_  time.Duration
+	close_, spoolSHA, atRest, chtimes, mark time.Duration
+	// dispatchWait is time the row spent BETWEEN being claimed by the
+	// dispatcher and its lane slot being granted. It is not part of drainOne
+	// at all, but it is part of the row's wall clock, and leaving it untimed
+	// is what left ~495 ms/row unattributed on 2026-08-18.
+	dispatchWait time.Duration
+}
+
+func (p *drainPhases) mark_(d *time.Duration) {
+	if !drainPhaseLogEnabled {
+		return
+	}
+	now := time.Now()
+	*d = now.Sub(p.t0)
+	p.t0 = now
+}
+
+func (p *drainPhases) report(path string, size int64) {
+	if !drainPhaseLogEnabled {
+		return
+	}
+	ms := func(d time.Duration) float64 { return float64(d.Microseconds()) / 1000.0 }
+	// jmlog, NOT the standard library's log. This report went to log.Printf,
+	// which writes to the process's stderr — and a GUI app launched by macOS has
+	// no stderr to speak of: the lines reached neither the app's own log file
+	// (which only receives jmlog) nor the unified log. So JM_DRAIN_PHASE_LOG=1
+	// ran the timing code and threw every measurement away, which is how the
+	// drain's phase breakdown stayed unmeasurable in a shipped build while the
+	// knob looked available. Same shape as the mutex profiler that was routed
+	// but never enabled, and RegenerateFresh that was read but never set.
+	jmlog.Info("drain-phase",
+		"size", size,
+		"dispatchwait_ms", ms(p.dispatchWait),
+		"open_ms", ms(p.openSrc),
+		"create_ms", ms(p.create),
+		"ident_ms", ms(p.identity),
+		"copy_ms", ms(p.copy),
+		"sync_ms", ms(p.sync_),
+		"close_ms", ms(p.close_),
+		"spoolsha_ms", ms(p.spoolSHA),
+		"atrest_ms", ms(p.atRest),
+		"chtimes_ms", ms(p.chtimes),
+		"mark_ms", ms(p.mark),
+		"path", path)
+}
+
 func drainLinkIsSlow() bool {
 	c := netprofile.Default().Class()
 	return c == netprofile.ClassSlow || c == netprofile.ClassMetered
 }
 
+const (
+	drainSyncMinBytes     = int64(256 << 10)
+	drainSyncMeteredBytes = int64(1 << 20)
+	drainSyncSlowBytes    = int64(2 << 20)
+	drainSyncDefaultBytes = int64(4 << 20)
+)
+
+// durableSyncInterval reads the live class for every row so a LAN↔cellular
+// handoff changes the maximum dirty window without an app restart. Keeping the
+// interval at or below JuiceFS's normal 4 MiB object block also prevents the
+// single whole-file Fsync that wedged macFUSE on the 1.18 GB Finder copy.
+func (d *Drainer) durableSyncInterval() int64 {
+	if d.syncIntervalBytes > 0 {
+		if d.syncIntervalBytes < drainSyncMinBytes {
+			return drainSyncMinBytes
+		}
+		if d.syncIntervalBytes > drainSyncDefaultBytes {
+			return drainSyncDefaultBytes
+		}
+		return d.syncIntervalBytes
+	}
+	switch netprofile.Default().Class() {
+	case netprofile.ClassMetered:
+		return drainSyncMeteredBytes
+	case netprofile.ClassSlow:
+		return drainSyncSlowBytes
+	default:
+		return drainSyncDefaultBytes
+	}
+}
+
+// acquireDrainFUSESlot registers a drain as background FUSE data work. It
+// waits without occupying the gate so cached foreground reads retain the
+// reserve enforced by backgroundFUSEDataWidth. Stop aborts the wait cleanly.
+func (d *Drainer) acquireDrainFUSESlot() (release func(), ok bool) {
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if release, ok := tryAcquireFUSEDataBackground(); ok {
+			return release, true
+		}
+		// An operator may deliberately set JM_FUSE_DATA_GATE=1. The normal
+		// background policy reserves that sole slot, which is correct for
+		// optional warming but would stop required spool durability forever.
+		// In that degenerate configuration, contend through the foreground
+		// admission path instead; it remains bounded and observable.
+		if fuseDataGateEnabled && backgroundFUSEDataWidth() == 0 {
+			if release, ok := acquireFUSEData(); ok {
+				return release, true
+			}
+		}
+		select {
+		case <-d.stop:
+			return func() {}, false
+		case <-ticker.C:
+		}
+	}
+}
+
 // drainOne copies a single spool file into the FUSE mount, SHA-verifies
 // the copy, and dispositions the row.
+// drainOneWithWait is drainOne plus the lane-wait it should attribute. Split
+// rather than changing drainOne's signature because drainOne is called directly
+// from tests and from the recovery path, where there is no lane wait.
+func (d *Drainer) drainOneWithWait(row *metadata.SpoolRow, laneWait time.Duration) {
+	pendingLaneWait.Store(row.ID, laneWait)
+	defer pendingLaneWait.Delete(row.ID)
+	d.drainOne(row)
+}
+
+// pendingLaneWait carries the lane wait from dispatchRow to drainOne for the
+// phase log only. Keyed by row ID, deleted on return.
+var pendingLaneWait sync.Map
+
 func (d *Drainer) drainOne(row *metadata.SpoolRow) {
+	if d.onDrainCommit == nil && (d.batch == nil || d.onBatchDrainComplete == nil) {
+		d.holdCompletion(row, errors.New("exact-size completion hook not wired"))
+		return
+	}
+	ph := &drainPhases{t0: time.Now()}
+	if v, ok := pendingLaneWait.Load(row.ID); ok {
+		ph.dispatchWait, _ = v.(time.Duration)
+	}
 	d.metrics.DrainsAttempted.Add(1)
 
-	if row.DrainAttempts >= d.maxAttempts {
-		// Exhausted before we even started this attempt.
+	if row.DrainAttempts >= d.maxAttempts && row.PauseSince.IsZero() {
+		// Exhausted before we even started this attempt. A paused row (it
+		// already changed the server copy) is bounded by time instead; see
+		// pauseIfServerCopyAtRisk.
 		d.failPermanent(row, fmt.Sprintf("retry budget exhausted (%d attempts)", row.DrainAttempts))
 		return
 	}
@@ -694,6 +1144,17 @@ func (d *Drainer) drainOne(row *metadata.SpoolRow) {
 		d.failTransient(row, fmt.Errorf("%s: %w", reason, pin.ErrFUSEIdentityGate))
 		return
 	}
+
+	// H-8B: hold the project's lease before any backend write (the parent
+	// MkdirAll included), so a large ingest into a project another Mac holds
+	// stays on this Mac instead of being uploaded and refused.
+	lease, leaseOK := d.leaseGate(row)
+	if !leaseOK {
+		return
+	}
+
+	// Every sidecar uses acknowledged completion; the former opt-in skip
+	// could mutate its mirror before completion was durably qualified.
 
 	dest := filepath.Join(d.fuseRoot, row.NFSPath)
 	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
@@ -714,9 +1175,19 @@ func (d *Drainer) drainOne(row *metadata.SpoolRow) {
 	}
 	defer src.Close()
 
+	// Draining is background work on the same FUSE daemon Finder reads through.
+	// Count it against the background half of the global data gate for the whole
+	// destination lifecycle; foreground reads always retain their reservation.
+	releaseFUSE, admitted := d.acquireDrainFUSESlot()
+	if !admitted {
+		_ = d.spool.Meta().ResetToReady(row.ID)
+		return
+	}
+	defer releaseFUSE()
+
 	// #103: capture the spool file's on-disk mtime — the client's last-write
 	// time, which is exactly what the in-flight spool served as ModTime while
-	// this file was pending. os.Create below would otherwise stamp the backend
+	// this file was pending. The open/create below would otherwise stamp the backend
 	// (JuiceFS) inode with the DRAIN time; once reconcileDir later refreshes
 	// this entry from the backend, the served mtime jumps forward and trips
 	// "modified since last save" in Premiere (and misleads any mtime-sensitive
@@ -726,11 +1197,33 @@ func (d *Drainer) drainOne(row *metadata.SpoolRow) {
 		spoolMtime = si.ModTime()
 	}
 
-	dst, err := os.Create(dest)
-	if err != nil {
-		d.failTransient(row, fmt.Errorf("create dest: %w", err))
+	// Never let a contribution silently replace another producer's derivative.
+	// This sits before the copy so a refused write costs no transfer. See
+	// deriv_clobber_guard.go —
+	// on 2026-08-11 this was 14 uploads that would each have replaced a
+	// full-resolution farm waveform with a 2,000-pixel preview.
+	if cerr := checkDerivClobber(row.NFSPath, dest, row.SpoolFile, row.Size); cerr != nil {
+		d.failPermanent(row, cerr.Error())
 		return
 	}
+
+	// The guard approved this write. If the blob being replaced belongs to the
+	// other producer we must UNLINK it first: an in-place O_TRUNC open needs
+	// write permission on the file, which we do not have on a root-owned 0644
+	// blob even though we own the directory. The drain then takes the new-name
+	// path below.
+	if err := prepareDerivOverwrite(row.NFSPath, dest); err != nil {
+		d.failTransient(row, err)
+		return
+	}
+	// H-8: an existing destination is rewritten in place (inode kept); a new
+	// name is copied to a private O_EXCL stage. The decision, the claim
+	// recheck and the in-place open run under the namespace lease.
+	tgt, ok := d.openDrainTarget(row, dest, lease)
+	if !ok {
+		return
+	}
+	dst := tgt.f
 	// Review fix (phase-1 adversarial review, HIGH — the TOCTOU that would
 	// have reopened the 174GB incident): the path-based identity gate above
 	// reads a ≤2s-stale cache, so a mount torn down moments before Create
@@ -741,64 +1234,106 @@ func (d *Drainer) drainOne(row *metadata.SpoolRow) {
 	// mounts or unmounts afterwards.
 	if err := pin.FUSEIdentityCheckFD(dst.Fd()); err != nil {
 		dst.Close()
-		_ = os.Remove(dest)
+		tgt.abandon()
 		d.failTransient(row, err)
 		return
 	}
 	// Capture where dest actually lives for the pre-completion device check.
-	destDev := int32(-1)
+	// syscall.Stat_t.Dev is int32 on Darwin and uint64 on Linux. Normalize it
+	// here so the same source builds on both the desktop and server targets.
+	var destDev uint64
+	destDevValid := false
+	var destIdentity string
 	if fi, err := dst.Stat(); err == nil {
 		if sys, ok := fi.Sys().(*syscall.Stat_t); ok {
-			destDev = sys.Dev
+			destDev = uint64(sys.Dev)
+			destDevValid = true
+			destIdentity = fmt.Sprintf("%d:%d", uint64(sys.Dev), sys.Ino)
 		}
 	}
 
-	h := sha256.New()
-	mw := io.MultiWriter(dst, h)
+	ph.mark_(&ph.identity)
 	buf := make([]byte, 1<<20)
-	n, copyErr := io.CopyBuffer(mw, src, buf)
-	// fsync the FUSE destination before closing so JuiceFS --writeback stages
-	// the bytes coherently. Without it, the at-rest re-read below is a
-	// read-after-close against the writeback cache and can momentarily return
-	// inconsistent bytes under a many-file burst — which the SHA check then
-	// mis-diagnoses as a permanent bit flip and quarantines an intact file
-	// (observed ~0.3% under a 2000-file storm). In writeback mode fsync
-	// flushes to the local cache (it does NOT wait for the MinIO upload), so
-	// it is cheap relative to the full readback that follows.
-	var syncErr error
-	if copyErr == nil {
-		syncErr = dst.Sync()
+	syncInterval := d.durableSyncInterval()
+	// On macOS, os.File.Sync issues fcntl(F_FULLFSYNC). That operation is for
+	// forcing a LOCAL physical disk's volatile cache to stable media; it is not
+	// the FUSE fsync operation. JuiceFS/macFUSE accepts it but can leave the Go
+	// thread in an uninterruptible kernel wait for its full daemon timeout
+	// (15-17 minutes observed live), which also starves the embedded control
+	// plane. Wrap the destination so Darwin uses fsync(2), which crosses the
+	// actual FUSE fsync boundary. With JuiceFS --writeback disabled, successful
+	// fsync still means the checkpoint reached the backend; the spool copy is
+	// retained until all checkpoints, verification, close, and row commit pass.
+	copyResult, copyErr := copyWithDurableCheckpoints(fuseDurableFile{File: dst}, src, syncInterval, buf)
+	n := copyResult.Bytes
+	ph.mark_(&ph.copy)
+	// copyWithDurableCheckpoints includes every destination Sync. With JuiceFS
+	// writeback disabled, each call waits for the corresponding backend PUT;
+	// the local spool remains the safety copy until every checkpoint and the
+	// final row commit succeed.
+	if ph.copy >= copyResult.SyncDuration {
+		ph.copy -= copyResult.SyncDuration
+	}
+	ph.sync_ = copyResult.SyncDuration
+	if copyResult.MaxSync >= 10*time.Second {
+		jmlog.Warn("drain: durable checkpoint was slow",
+			"path", row.NFSPath,
+			"max_sync_ms", copyResult.MaxSync.Milliseconds(),
+			"sync_calls", copyResult.SyncCalls,
+			"interval_bytes", syncInterval,
+			"link_class", netprofile.Default().Class().String())
+	}
+	// Keep a capability for the original destination across Close and both
+	// completion modes. The original Close remains a separate qualification.
+	dupFD, dupErr := syscall.Dup(int(dst.Fd()))
+	if dupErr == nil {
+		syscall.CloseOnExec(dupFD)
 	}
 	closeErr := dst.Close()
+	var retainedDst *os.File
+	if dupErr == nil {
+		retainedDst = os.NewFile(uintptr(dupFD), dest)
+		defer func() {
+			if retainedDst != nil {
+				_ = retainedDst.Close()
+			}
+		}()
+	}
+	ph.mark_(&ph.close_)
 	if copyErr != nil {
-		_ = os.Remove(dest) // best-effort cleanup of partial write
+		tgt.abandon() // never removes dest
 		d.failTransient(row, fmt.Errorf("copy to fuse: %w", copyErr))
 		return
 	}
-	if syncErr != nil {
-		_ = os.Remove(dest)
-		d.failTransient(row, fmt.Errorf("sync fuse dest: %w", syncErr))
-		return
-	}
 	if closeErr != nil {
-		_ = os.Remove(dest)
+		tgt.abandon()
 		d.failTransient(row, fmt.Errorf("close fuse fd: %w", closeErr))
 		return
 	}
+	if dupErr != nil {
+		tgt.abandon()
+		d.failTransient(row, fmt.Errorf("retain fuse fd: %w", dupErr))
+		return
+	}
+	if destIdentity == "" {
+		tgt.abandon()
+		d.failTransient(row, metadata.ErrMirrorConflict)
+		return
+	}
 	if n != row.Size {
-		_ = os.Remove(dest)
+		tgt.abandon()
 		d.failTransient(row, fmt.Errorf("size mismatch: expected %d, got %d", row.Size, n))
 		return
 	}
 
-	copyStreamSHA := h.Sum(nil)
+	copyStreamSHA := copyResult.SHA256[:]
 	if len(row.SHA256) > 0 && !bytes.Equal(copyStreamSHA, row.SHA256) {
 		// The bytes we read out of the spool file disagree with the
 		// streaming SHA recorded at spool-write time → bit flip on the
 		// spool SSD between write and re-read. Quarantine; retry would
 		// just re-detect.
 		d.quarantine(row, fmt.Sprintf("sha mismatch (spool): streamed=%x diskread=%x", row.SHA256, copyStreamSHA))
-		_ = os.Remove(dest)
+		tgt.abandon()
 		return
 	}
 
@@ -817,9 +1352,10 @@ func (d *Drainer) drainOne(row *metadata.SpoolRow) {
 	// file). The len>0 guard remains only as defense for a finalize-time disk
 	// hash that failed to compute.
 	if d.atRestVerify && len(row.SHA256) > 0 {
-		atRestSHA, _, hashErr := hashSpoolFile(dest)
+		atRestSHA, _, hashErr := hashSpoolFile(tgt.path)
 		if hashErr != nil {
 			// Could not re-read what we just wrote. Treat as transient.
+			tgt.abandon()
 			d.failTransient(row, fmt.Errorf("post-copy reread for SHA verify: %w", hashErr))
 			return
 		}
@@ -836,7 +1372,7 @@ func (d *Drainer) drainOne(row *metadata.SpoolRow) {
 			// photo. (The spool-side mismatch above DOES quarantine — that one
 			// is genuine spool-SSD corruption with no good copy.)
 			reason := fmt.Sprintf("sha mismatch (fuse at-rest): fuse=%x want=%x — spool good, re-draining", atRestSHA, row.SHA256)
-			_ = os.Remove(dest)
+			tgt.abandon()
 			d.failTransient(row, fmt.Errorf("%s", reason))
 			return
 		}
@@ -851,10 +1387,10 @@ func (d *Drainer) drainOne(row *metadata.SpoolRow) {
 	// mount does not have them: requeue instead of completing. os.Stat on a
 	// healthy mount is cheap; on a wedged one it can block — same hazard
 	// class as the at-rest re-read above (drainer worker, not the hot path).
-	if destDev != -1 {
+	if destDevValid {
 		if fi, statErr := os.Stat(d.fuseRoot); statErr == nil {
-			if sys, ok := fi.Sys().(*syscall.Stat_t); ok && sys.Dev != destDev {
-				_ = os.Remove(dest)
+			if sys, ok := fi.Sys().(*syscall.Stat_t); ok && uint64(sys.Dev) != destDev {
+				tgt.abandon()
 				d.failTransient(row, fmt.Errorf("dest device %d != current mount device %d (remount raced the copy): %w",
 					destDev, sys.Dev, pin.ErrFUSEIdentityGate))
 				return
@@ -862,18 +1398,68 @@ func (d *Drainer) drainOne(row *metadata.SpoolRow) {
 		}
 	}
 
-	// #103: preserve the client's mtime on the backend inode. os.Create stamped
-	// it with the drain time; restore the spool file's mtime (what the client
+	// #103: preserve the client's mtime on the backend inode. The open/create
+	// stamped it with the drain time; restore the spool file's mtime (what the client
 	// wrote / what the in-flight spool served) so the served mtime stays STABLE
 	// across the spool→backend→reconcile lifecycle instead of jumping forward at
 	// the next reconcileDir refresh. Best-effort: the bytes are already SHA-
 	// verified at rest here, so a Chtimes failure leaves the (wrong) drain-time
 	// mtime but never loses data. Placed before BOTH the batch and inline
 	// completion paths so every drained file is covered.
+	// Publish the timestamp the backend actually accepted, not a new drain-time
+	// value. Reconcile reads this exact mtime back from FUSE; if the mirror used
+	// time.Now instead, a complete cached AppleDouble body would immediately fail
+	// validation and Finder's next offline range write would surface ACCES.
+	drainedMtime := time.Now()
+	mtimeApplied := false
 	if !spoolMtime.IsZero() {
-		if err := os.Chtimes(dest, spoolMtime, spoolMtime); err != nil {
+		if err := os.Chtimes(tgt.path, spoolMtime, spoolMtime); err != nil {
 			log.Printf("drain: preserve client mtime failed (non-fatal) path=%s: %v", row.NFSPath, err)
+		} else {
+			// Metadata and Redis events store whole Unix seconds, so this is the
+			// exact validation value reconcile will later read from JuiceFS.
+			drainedMtime = time.Unix(spoolMtime.Unix(), 0)
+			mtimeApplied = true
 		}
+	}
+	if !mtimeApplied {
+		// Rare fallback only: avoid adding a FUSE GETATTR to every successful
+		// drain. If Chtimes failed (or no source timestamp existed), sample the
+		// backend inode so the mirror still agrees with the next reconcile.
+		if fi, statErr := os.Stat(tgt.path); statErr == nil {
+			drainedMtime = time.Unix(fi.ModTime().Unix(), 0)
+		}
+	}
+	ph.mark_(&ph.chtimes)
+	// Read a bounded complete metadata body from the exact source FD while it
+	// is still owned by this worker. Never rediscover it by public pathname.
+	var sidecarBody []byte
+	if row.Size > 0 && row.Size <= sidecarMaxFile && cacheableMetaName(filepath.Base(row.NFSPath)) {
+		body := make([]byte, int(row.Size))
+		if _, err := io.ReadFull(io.NewSectionReader(src, 0, row.Size), body); err != nil {
+			tgt.abandon()
+			d.holdCompletion(row, fmt.Errorf("stage exact sidecar body: %w", err))
+			return
+		}
+		hash := sha256.Sum256(body)
+		if len(row.SHA256) == 0 || !bytes.Equal(hash[:], row.SHA256) {
+			tgt.abandon()
+			d.holdCompletion(row, metadata.ErrMirrorConflict)
+			return
+		}
+		sidecarBody = body
+	}
+
+	// H-8B: the destination holds a file this save did not expect. Publish
+	// the verified bytes beside it; the original is never touched.
+	if tgt.stage != nil && tgt.conflict != "" {
+		d.publishConflictCopy(row, tgt.stage, dest, tgt.conflict)
+		return
+	}
+	// H-8: a new name is published by one no-replace rename under the
+	// namespace lease, after rechecking that the row was not canceled.
+	if tgt.stage != nil && !d.installNewName(row, tgt.stage, dest) {
+		return
 	}
 
 	// Lever 1 (JM_DRAIN_BATCH_INSERT): hand the fully-copied+verified drain to
@@ -885,59 +1471,17 @@ func (d *Drainer) drainOne(row *metadata.SpoolRow) {
 	// only after that tx commits — so this file's size is durable before its
 	// spool shadow is evicted, exactly as the per-file path guarantees below.
 	if d.batch != nil {
-		d.batch.enqueue(pendingDrain{row: row, dest: dest, n: n})
+		d.batch.enqueue(pendingDrain{row: row, dest: dest, n: n, mtime: drainedMtime, fd: retainedDst, sidecarBody: sidecarBody, backingIdentity: destIdentity})
+		retainedDst = nil
+		ph.mark_(&ph.mark)
+		ph.report(row.NFSPath, row.Size)
 		return
 	}
 
-	// task #65: publish the real size into the metadata store BEFORE eviction.
-	// The backend file is whole + SHA-verified here and row.Size is authoritative
-	// (n == row.Size enforced above), so this closes the eviction-before-publish
-	// gap: once MarkDrainComplete evicts the spool shadow, fresh reads resolve
-	// Entry.Size — now correct — instead of a stale 0/partial value. Safe during
-	// the brief shadow overlap: for a sequential file ContiguousEnd == row.Size,
-	// so the shadow and the store agree. It is on the drain's critical path (not
-	// a queued callback), so it stays correct under a burst.
-	if d.onSizeReady != nil {
-		d.onSizeReady(row.NFSPath, row.Size)
-	}
-
-	done, err := d.spool.MarkDrainComplete(row.ID, row.NFSPath, row.SpoolFile, row.Size)
-	if err != nil {
-		// Reviewer fix (slice B follow-on): MarkDrainComplete promises
-		// the caller will retry on SQL failure. Doing so here means a
-		// transient SQLite error (busy, WAL checkpoint) doesn't strand
-		// the row in `draining` state with no path to recovery — the
-		// dispatcher re-picks it after backoff.
-		//
-		// Note we ALSO have to remove the destination FUSE write we
-		// just made: the row will be retried, which will copy to dest
-		// again. Without removal, the retry's os.Create will truncate
-		// the existing file (correct outcome), but a sibling
-		// concurrent reader could briefly see the not-yet-retried
-		// version. Best-effort removal here closes that window.
-		_ = os.Remove(dest)
-		d.failTransient(row, fmt.Errorf("mark drain complete: %w", err))
-		return
-	}
-	if !done {
-		// The NFS layer deleted this path while we were draining (QA-37):
-		// the spool row was cancelled out from under us. Undo the FUSE write
-		// so the delete sticks instead of resurrecting the file.
-		_ = os.Remove(dest)
-		log.Printf("drainer: row %d (%s) cancelled mid-drain (deleted) — undid FUSE write", row.ID, row.NFSPath)
-		return
-	}
-	d.metrics.DrainsSucceeded.Add(1)
-	d.metrics.BytesDrained.Add(n)
-	// Stamp drain liveness: a real MinIO PUT just landed, so the backend is
-	// provably reachable over the current (possibly congested) link. The
-	// reachability monitor consults this via LastDrainSuccess() to suppress a
-	// probe-dial false-failure caused by the drainer's own uplink saturation.
-	// Done ONLY here, on a COMPLETED success — never on an attempt/in-flight.
-	d.lastDrainSuccessNanos.Store(time.Now().UnixNano())
-	if d.onDrainComplete != nil {
-		d.onDrainComplete(row.NFSPath, row.Size)
-	}
+	d.completeInline(pendingDrain{row: row, dest: dest, n: n, mtime: drainedMtime, fd: retainedDst, sidecarBody: sidecarBody, backingIdentity: destIdentity})
+	retainedDst = nil
+	ph.mark_(&ph.mark)
+	ph.report(row.NFSPath, row.Size)
 }
 
 // failTransient: retryable failure path. Bumps attempts, schedules a
@@ -952,6 +1496,12 @@ func (d *Drainer) drainOne(row *metadata.SpoolRow) {
 // that fires wakeNonBlocking after the delay; the worker returns
 // immediately, freeing its sem slot.
 func (d *Drainer) failTransient(row *metadata.SpoolRow, err error) {
+	// H-8B: the proxy refused the write (another Mac holds the project).
+	// Keep the change on this Mac until the project is free; it is not a
+	// failure of this file.
+	if d.holdIfRefused(row, err) {
+		return
+	}
 	// Infrastructure-unavailable (the destination filesystem is gone, not the
 	// file): a JuiceFS FUSE mount that vanished mid-drain returns ENXIO
 	// ("device not configured"), ENODEV, or ENOTCONN for every op against it.
@@ -971,11 +1521,16 @@ func (d *Drainer) failTransient(row *metadata.SpoolRow, err error) {
 	// dispatcher is already parked offline, so this just resets the in-flight
 	// row to `ready`; it drains on reconnect.
 	if isInfraUnavailable(err) || pin.IsOffline() || errors.Is(err, pin.ErrFUSEIdentityGate) {
-		if rErr := d.spool.Meta().ResetToReady(row.ID); rErr != nil {
+		if rErr := d.spool.Meta().DeferReady(row.ID, time.Now().Add(infraUnavailableBackoff)); rErr != nil {
 			log.Printf("drainer: infra-pause reset %d: %v", row.ID, rErr)
 		}
 		d.metrics.DrainsRetried.Add(1)
 		d.scheduleDelayedWake(infraUnavailableBackoff)
+		return
+	}
+	// F2: a row that already changed the server copy must not run out its
+	// attempt budget and leave that copy damaged with nothing retrying it.
+	if d.pauseIfServerCopyAtRisk(row, err) {
 		return
 	}
 	nextAttempts := row.DrainAttempts + 1
@@ -983,11 +1538,12 @@ func (d *Drainer) failTransient(row *metadata.SpoolRow, err error) {
 		d.failPermanent(row, err.Error())
 		return
 	}
-	if rErr := d.spool.MarkDrainRetry(row.ID, err.Error()); rErr != nil {
+	delay := d.backoffDuration(nextAttempts)
+	if rErr := d.spool.MarkDrainRetry(row.ID, err.Error(), time.Time{}, time.Now().Add(delay)); rErr != nil {
 		log.Printf("drainer: mark retry %d: %v", row.ID, rErr)
 	}
 	d.metrics.DrainsRetried.Add(1)
-	d.scheduleDelayedWake(d.backoffDuration(nextAttempts))
+	d.scheduleDelayedWake(delay)
 }
 
 // infraUnavailableBackoff is the fixed delay before re-driving a row that
@@ -1056,29 +1612,33 @@ func (d *Drainer) scheduleDelayedWake(delay time.Duration) {
 // file-already-missing case (reservation never held) cannot drive the
 // counter negative.
 func (d *Drainer) failPermanent(row *metadata.SpoolRow, reason string) {
-	transitioned, err := d.spool.Meta().MarkFailed(row.ID, reason)
+	var liveInode uint64
+	if isConflictCopyFailure(reason) {
+		if entry, ok := d.spool.LookupActive(row.NFSPath); ok && entry.ID() == row.ID {
+			liveInode = entry.Inode()
+		}
+	}
+	transitioned, err := d.spool.Meta().FailClaimedDrain(row.ID, row.NFSPath, row.SpoolFile, reason, false, func() error {
+		d.spool.afterClaimedFailure(row.ID, row.NFSPath, row.Size)
+		return nil
+	})
 	if err != nil {
 		log.Printf("drainer: mark failed %d: %v", row.ID, err)
+		return
 	}
-	// Release ONLY when this call actually moved the row to failed
-	// (adversarial-review BUG 1). If the row is gone — deleted by
-	// CancelForDelete mid-drain, or replaced by a rename-requeue's
-	// DELETE+INSERT — its reservation was already released (or transferred
-	// to the requeued row) by that path; releasing here again would
-	// double-release and let the spool over-admit past its cap.
-	if transitioned {
-		d.spool.releaseCapacity(row.Size)
-	}
-	// Review FIX 3: evict the in-memory index entry, identity-checked on the
-	// row id (mirroring QuarantineDrain). A permanently-failed drain is one of
-	// the entry's eviction points — without this, HasPending(nfsPath) would
-	// keep returning true for the process lifetime (the boot scrubber does not
-	// repopulate the index for failed rows), so QA-30 Layer D would treat the
-	// path as perpetually spool-pending and refuse to ever prune it — even
-	// after the user deletes it. The identity check makes a no-op safe if a
-	// newer writer (rename-requeue / re-open) already rotated in a fresh entry.
-	d.spool.EvictIndex(row.NFSPath, row.ID)
+	if !transitioned {
+		return
+	} // rename/cancel owns the old row and source
+	// The callback completed RAM, capacity and index changes under the same
+	// metadata write lock as the exact draining-row CAS.
 	d.metrics.DrainsFailed.Add(1)
+	if isConflictCopyFailure(reason) {
+		if failed, err := d.spool.Meta().Get(row.ID); err == nil {
+			// Hash and SQL qualification happen after FailClaimedDrain releases
+			// its write lock. A failed proof leaves the normal EIO fault in place.
+			d.spool.qualifyConflictRead(failed, liveInode)
+		}
+	}
 }
 
 // quarantine: SHA-mismatch path. Moves the spool file aside, marks the
@@ -1109,7 +1669,7 @@ func (d *Drainer) quarantine(row *metadata.SpoolRow, reason string) {
 //
 // Returns the number of rows processed (claimed + handed to workers).
 func (d *Drainer) DrainOnceForTest(ctx context.Context) int {
-	rows, _ := d.spool.Meta().ListReady(d.workers * 2)
+	rows, _ := d.listDispatchable(d.workers * 2)
 	count := 0
 	for _, row := range rows {
 		if !d.dispatchRow(row) {

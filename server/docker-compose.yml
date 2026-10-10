@@ -2,8 +2,15 @@
 #
 # This is the production-tested compose for the JuiceMount NAS app:
 #
-#   redis                — JuiceFS metadata authority (AOF persistence)
+#   redis                — JuiceFS metadata authority (AOF persistence).
+#                          Internal only: no published port, `default off`.
+#   respproxy            — H-8B RESP proxy on host port 30179. Every volume
+#                          client (Mac, farm, Manager, server mounts) logs in
+#                          to it as a named principal; it is the only
+#                          path to Redis.
 #   minio                — S3 object store for JuiceFS chunks
+#   minio-keys           — one-shot: MinIO users jm-client (no delete) and
+#                          jm-gc (delete), server/minio/provision-object-keys.sh
 #   juicefs-init         — one-shot pre-flight + first-time volume format
 #   juicefs              — live FUSE mount + WebDAV (browse / smoke test)
 #   juicemount-manager   — control-plane web UI (migrations, trash, backups, maintenance, settings) on port 30190
@@ -22,46 +29,108 @@
 services:
 
   # ── Redis: JuiceFS metadata authority ────────────────────────────
+  # H-8B: Redis publishes NO host port. Mac clients and every in-stack
+  # client reach it only through `respproxy` below, which authenticates
+  # each connection as a named principal. Redis itself refuses
+  # unauthenticated clients (`user default off`) and knows two users,
+  # rendered at start from server/redis.acl:
+  #   jm-proxy  the proxy's upstream login (JM_REDIS_PROXY_PASSWORD)
+  #   jm-admin  loopback only: its secret is minted at every start inside
+  #             this container (/run/jm-redis/admin.pass) and never leaves
+  #             it. Use: docker exec -it <redis> sh -c
+  #             'REDISCLI_AUTH="$(cat /run/jm-redis/admin.pass)" redis-cli --user jm-admin'
+  # The rollback override (server/respproxy/docker-compose.rollback.yml)
+  # re-publishes 30179 and appends every principal as a plain ACL user.
   redis:
-    image: redis:7.4-alpine
+    image: redis:7.4-alpine@sha256:ff02b58f971e7d7d156a1267e283fcbbeee91773b6aa36c49dac28ecfe28eadf
     restart: unless-stopped
-    ports:
-      - "30179:6379"                # Mac client connects here
+    # SIGTERM makes Redis write its RDB before exiting; the default 10 s
+    # grace would SIGKILL that save on a large keyspace.
+    stop_grace_period: 120s
+    environment:
+      JM_REDIS_PROXY_PASSWORD: "${JM_REDIS_PROXY_PASSWORD:?set JM_REDIS_PROXY_PASSWORD (openssl rand -hex 32) in server/.env}"
+      JM_REDIS_ACL_MODE: "proxy"
+    entrypoint: ["/bin/sh", "-ec"]
     command:
-      - "redis-server"
-      - "--appendonly"
-      - "yes"
-      - "--appendfsync"
-      - "everysec"
-      - "--maxmemory-policy"
-      - "noeviction"
-      - "--save"
-      - "900"
-      - "1"
-      # Keyspace notifications power the client's instant metadata push
-      # (PSUBSCRIBE __keyspace@1__:d*). Without this the client can only
-      # fall back to a periodic full SCAN — on a slow/remote link that is
-      # the "index rebuild takes 10 minutes" failure mode. The client also
-      # self-heals this at runtime (CONFIG SET on connect), but baking it
-      # in here makes every fresh deploy + restart correct from boot.
-      - "--notify-keyspace-events"
-      - "KEA"
+      - |
+        umask 077
+        sha() { printf '%s' "$$1" | sha256sum | cut -d' ' -f1; }
+        case "$$JM_REDIS_PROXY_PASSWORD" in
+          ''|*[!A-Za-z0-9._~-]*) echo '[redis] JM_REDIS_PROXY_PASSWORD must be URL-safe (openssl rand -hex 32)' >&2; exit 2 ;;
+        esac
+        [ "$${#JM_REDIS_PROXY_PASSWORD}" -ge 32 ] || { echo '[redis] JM_REDIS_PROXY_PASSWORD is shorter than 32 characters' >&2; exit 2; }
+        mkdir -p /run/jm-redis
+        head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > /run/jm-redis/admin.pass
+        sed -e '/^[[:space:]]*#/d' -e '/^[[:space:]]*$$/d' \
+            -e "s/#@JM_REDIS_PROXY_PASSWORD_SHA256@/#$$(sha "$$JM_REDIS_PROXY_PASSWORD")/" \
+            -e "s/#@JM_ADMIN_LOOPBACK_SHA256@/#$$(sha "$$(cat /run/jm-redis/admin.pass)")/" \
+            /usr/local/etc/redis/redis.acl > /run/jm-redis/users.acl
+        if [ "$$JM_REDIS_ACL_MODE" = rollback ]; then
+          # Plan §3 rollback step 3: every principal as a plain ACL user,
+          # written by rollout-compose.sh --proxy-rollback.
+          [ -s /data/jm-rollback-users.acl ] || { echo '[redis] rollback ACL /data/jm-rollback-users.acl missing' >&2; exit 2; }
+          if grep -Ev '^user [a-z][a-z0-9-]* on #[0-9a-f]{64} ~\* &\* \+@all$$' /data/jm-rollback-users.acl | grep -q .; then
+            echo '[redis] rollback ACL has a line that is not a sha256-authenticated user' >&2; exit 2
+          fi
+          cat /data/jm-rollback-users.acl >> /run/jm-redis/users.acl
+        fi
+        grep -q '#@' /run/jm-redis/users.acl && { echo '[redis] unrendered ACL placeholder' >&2; exit 2; }
+        chown -R redis:redis /run/jm-redis
+        unset JM_REDIS_PROXY_PASSWORD
+        exec docker-entrypoint.sh redis-server /usr/local/etc/redis/redis.conf --aclfile /run/jm-redis/users.acl
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD-SHELL", "REDISCLI_AUTH=\"$$(cat /run/jm-redis/admin.pass)\" redis-cli --no-auth-warning --user jm-admin ping | grep -qx PONG"]
       interval: 10s
       timeout: 5s
       retries: 5
     volumes:
       - /mnt/zSSD/juicemount/redis:/data    # EDIT — your Redis dataset path
+      # AOF, keyspace notifications (KEA) and the rest of the server config.
+      - ./redis.conf:/usr/local/etc/redis/redis.conf:ro
+      # ACL template; secrets are substituted as sha256 at start.
+      - ./redis.acl:/usr/local/etc/redis/redis.acl:ro
+
+  # ── respproxy: H-8B RESP proxy, the only path to Redis ───────────
+  # Authenticates every client as a principal (Macs enrolled through the
+  # Manager; farm, manager, bg, webdav and admin from server/.env), then
+  # applies the lease mode from jmlease:v1:cfg (passthrough → observe →
+  # enforce, switched in the Manager). Unauthenticated connections are
+  # refused. Principals file and reload handshake live in the shared
+  # directory below (the Manager writes Mac principals there, 0600).
+  respproxy:
+    image: ghcr.io/lelanddutcher/jm-respproxy@${JM_RESPPROXY_DIGEST:?set JM_RESPPROXY_DIGEST to the release sha256 digest}
+    pull_policy: always
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+    ports:
+      - "30179:6379"                # Mac clients connect here (as before)
+    environment:
+      JM_RESPPROXY_UPSTREAM: "redis:6379"
+      JM_RESPPROXY_UPSTREAM_PASSWORD: "${JM_REDIS_PROXY_PASSWORD:?set JM_REDIS_PROXY_PASSWORD in server/.env}"
+      # Initial mode only. The Manager's mode switch writes jmlease:v1:cfg,
+      # which overrides this while set.
+      JM_RESPPROXY_MODE: "${JM_RESPPROXY_MODE:-passthrough}"
+      # Stage births require initial enforce mode. A later effective mode
+      # override away from enforce makes stage operations HOLD; default off.
+      JM_RESPPROXY_STAGE_BIRTH: "${JM_RESPPROXY_STAGE_BIRTH:-false}"
+      JM_PROXY_FARM_PASSWORD: "${JM_PROXY_FARM_PASSWORD:?set JM_PROXY_FARM_PASSWORD in server/.env}"
+      JM_PROXY_MANAGER_PASSWORD: "${JM_PROXY_MANAGER_PASSWORD:?set JM_PROXY_MANAGER_PASSWORD in server/.env}"
+      JM_PROXY_BG_PASSWORD: "${JM_PROXY_BG_PASSWORD:?set JM_PROXY_BG_PASSWORD in server/.env}"
+      JM_PROXY_WEBDAV_PASSWORD: "${JM_PROXY_WEBDAV_PASSWORD:?set JM_PROXY_WEBDAV_PASSWORD in server/.env}"
+      JM_PROXY_ADMIN_PASSWORD: "${JM_PROXY_ADMIN_PASSWORD:?set JM_PROXY_ADMIN_PASSWORD in server/.env}"
+    volumes:
+      - /mnt/zSSD/juicemount/respproxy:/etc/jm-respproxy   # EDIT — shared with Manager
 
   # ── MinIO: S3 object store for chunks ────────────────────────────
   minio:
-    image: minio/minio:RELEASE.2025-01-20T14-49-07Z
+    image: minio/minio:RELEASE.2025-01-20T14-49-07Z@sha256:ed9be66eb5f2636c18289c34c3b725ddf57815f2777c77b5938543b78a44f144
     restart: unless-stopped
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: juicemount
-      MINIO_ROOT_PASSWORD: CHANGEME_MINIO_PASSWORD    # EDIT — strong, no whitespace
+      MINIO_ROOT_PASSWORD: "${MINIO_ROOT_PASSWORD:?set a strong existing MinIO root password before deploying}"
       MINIO_API_REQUESTS_DEADLINE: 10m
     ports:
       - "30151:9000"                # Mac client connects here
@@ -75,20 +144,98 @@ services:
     volumes:
       - /mnt/zSSD/juicemount/bucket:/data   # EDIT — MinIO bucket dataset path
 
-  # ── juicefs-init: pre-flight checks + idempotent format ──────────
-  juicefs-init:
-    image: juicedata/mount:ce-v1.3.1
+  # ── minio-keys: object-store users (H-8B §2.1) ──────────────────
+  # The volume `setting` key holds NO object key: anything in it is readable
+  # by every client. Each juicefs client brings its own key in its
+  # environment instead (MINIO_ACCESS_KEY / MINIO_SECRET_KEY, which stock
+  # juicefs reads when `setting` has none):
+  #   jm-client  Get/Put/List, no delete   Macs (via enrollment), farm, webdav
+  #   jm-gc      adds DeleteObject          the bg mount and Manager gc/compact
+  # Idempotent; runs at every `up`. Secrets reach mc via env and stdin only.
+  minio-keys:
+    image: minio/minio:RELEASE.2025-01-20T14-49-07Z@sha256:ed9be66eb5f2636c18289c34c3b725ddf57815f2777c77b5938543b78a44f144
     restart: "no"
     depends_on:
       minio:
         condition: service_healthy
-      redis:
-        condition: service_healthy
     environment:
       MINIO_ROOT_USER: juicemount
-      MINIO_ROOT_PASSWORD: CHANGEME_MINIO_PASSWORD    # EDIT — same as MinIO above
+      MINIO_ROOT_PASSWORD: "${MINIO_ROOT_PASSWORD:?set the same existing MinIO root password before deploying}"
+      JM_MINIO_ENDPOINT: "http://minio:9000"
+      JM_MINIO_POLICY_DIR: "/jm-minio"
+      JM_OBJ_CLIENT_ACCESS_KEY: "${JM_OBJ_CLIENT_ACCESS_KEY:-jm-client}"
+      JM_OBJ_CLIENT_SECRET_KEY: "${JM_OBJ_CLIENT_SECRET_KEY:?set JM_OBJ_CLIENT_SECRET_KEY (openssl rand -hex 20) in server/.env}"
+      JM_OBJ_GC_ACCESS_KEY: "${JM_OBJ_GC_ACCESS_KEY:-jm-gc}"
+      JM_OBJ_GC_SECRET_KEY: "${JM_OBJ_GC_SECRET_KEY:?set JM_OBJ_GC_SECRET_KEY (openssl rand -hex 20) in server/.env}"
+      # Per-Mac object keys (not yet enabled), rollout step M1. With
+      # JM_OBJ_PER_MAC_SERVER=1 this also creates jm-macs (parent of every
+      # Mac key, policy jm-client) and jm-keyadmin (service accounts only,
+      # held by minio-keyd). Unset = no change. A per-Mac failure is logged
+      # and does not fail this service (juicefs-init waits for it).
+      JM_OBJ_PER_MAC_SERVER: "${JM_OBJ_PER_MAC_SERVER:-0}"
+      JM_OBJ_KEYADMIN_ACCESS_KEY: "${JM_OBJ_KEYADMIN_ACCESS_KEY:-jm-keyadmin}"
+      JM_OBJ_KEYADMIN_SECRET_KEY: "${JM_OBJ_KEYADMIN_SECRET_KEY:-}"
+    entrypoint: ["/bin/bash", "/jm-minio/provision-object-keys.sh"]
+    volumes:
+      - ./minio:/jm-minio:ro
+
+  # ── minio-keyd: per-Mac object keys (not yet enabled) ────────────
+  # Creates one MinIO service account per approved Mac (mac-<12hex>-<gen>,
+  # parent jm-macs) and removes it when the Mac is revoked. The Manager
+  # writes objkeys/desired.json; keyd answers with results/<name>.json and a
+  # verified applied.json (server/minio/keyd.sh). keyd holds jm-keyadmin
+  # only: no root password, no jm-gc, no jm-client. Same pinned image as
+  # minio, so mc matches the server. Profile `per-mac`: never started by a
+  # plain `up`; start it with
+  #   $C -f server/docker-compose.yml up -d --no-deps minio-keyd
+  # (naming the service enables its profile) after JM_OBJ_PER_MAC_SERVER=1
+  # (step M1). The Manager's own switch, JM_OBJ_PER_MAC, is step M2.
+  minio-keyd:
+    image: minio/minio:RELEASE.2025-01-20T14-49-07Z@sha256:ed9be66eb5f2636c18289c34c3b725ddf57815f2777c77b5938543b78a44f144
+    profiles: ["per-mac"]
+    restart: unless-stopped
+    # A stop during a key create waits for MinIO's reply so the new secret
+    # reaches results/ (keyd gives up at 50 s, plus 5 s to remove the key).
+    # docker's default 10 s would SIGKILL keyd and strand a live key.
+    stop_grace_period: 60s
+    depends_on:
+      minio:
+        condition: service_healthy
+      minio-keys:
+        condition: service_completed_successfully
+    environment:
+      JM_OBJ_PER_MAC_SERVER: "${JM_OBJ_PER_MAC_SERVER:-0}"
+      JM_MINIO_ENDPOINT: "http://minio:9000"
+      JM_OBJ_KEYADMIN_ACCESS_KEY: "${JM_OBJ_KEYADMIN_ACCESS_KEY:-jm-keyadmin}"
+      JM_OBJ_KEYADMIN_SECRET_KEY: "${JM_OBJ_KEYADMIN_SECRET_KEY:-}"
+      JM_OBJKEYS_DIR: "/var/lib/jm-objkeys"
+    entrypoint: ["/bin/bash", "/jm-minio/keyd.sh"]
+    volumes:
+      - ./minio:/jm-minio:ro
+      - /mnt/zSSD/juicemount/objkeys:/var/lib/jm-objkeys   # EDIT — shared with Manager only
+
+  # ── juicefs-init: pre-flight checks + idempotent format ──────────
+  juicefs-init:
+    image: juicedata/mount:ce-v1.3.1@sha256:ddba2917edee5af0e0dc367c79aae55f91de4666f8c13795d238b937d44e3b3c
+    restart: "no"
+    depends_on:
+      minio:
+        condition: service_healthy
+      minio-keys:
+        condition: service_completed_successfully
+      respproxy:
+        condition: service_healthy
+    environment:
+      # A new volume is formatted with NO key in `setting`; format's storage
+      # test uses jm-gc from the environment. The MinIO root credential is
+      # not given to this container.
+      MINIO_ACCESS_KEY: "${JM_OBJ_GC_ACCESS_KEY:-jm-gc}"
+      MINIO_SECRET_KEY: "${JM_OBJ_GC_SECRET_KEY:?set JM_OBJ_GC_SECRET_KEY in server/.env}"
       JM_BUCKET_URL: "http://minio:9000/zpool"
-      JM_META_URL: "redis://redis:6379/1"
+      # `juicefs format` writes the volume settings: admin principal. The
+      # password reaches juicefs through META_PASSWORD, never argv.
+      JM_META_URL: "redis://admin@respproxy:6379/1"
+      META_PASSWORD: "${JM_PROXY_ADMIN_PASSWORD:?set JM_PROXY_ADMIN_PASSWORD in server/.env}"
       JM_VOL_NAME: "zpool"
     entrypoint: ["/bin/sh", "-c"]
     command:
@@ -98,11 +245,11 @@ services:
         if ! curl -fsS -m 5 http://minio:9000/minio/health/live >/dev/null; then
           echo "[precheck-1] minio unreachable" >&2; exit 2
         fi
-        if [ -z "$$MINIO_ROOT_USER" ] || [ -z "$$MINIO_ROOT_PASSWORD" ]; then
-          echo "[precheck-3] empty MinIO credentials" >&2; exit 4
+        if [ -z "$$MINIO_ACCESS_KEY" ] || [ -z "$$MINIO_SECRET_KEY" ]; then
+          echo "[precheck-3] empty object key (JM_OBJ_GC_*)" >&2; exit 4
         fi
-        case "$$MINIO_ROOT_PASSWORD" in CHANGEME*|CHANGE*|REPLACE*|replaceme*)
-          echo "[precheck-3] placeholder MinIO password — edit the YAML" >&2; exit 4 ;;
+        case "$$MINIO_SECRET_KEY" in CHANGEME*|CHANGE*|REPLACE*|replaceme*)
+          echo "[precheck-3] placeholder object key — edit server/.env" >&2; exit 4 ;;
         esac
         case "$$JM_BUCKET_URL" in http://*|https://*) ;; *)
           echo "[precheck-4] bucket URL must start with http:// or https://" >&2; exit 5 ;;
@@ -119,13 +266,13 @@ services:
         # in server/INSTALL-TrueNAS.md (the format command is
         # idempotent-skipped on subsequent boots, so flipping this
         # value here does NOT auto-migrate old volumes).
+        # No --access-key/--secret-key: `setting` stays keyless (H-8B).
         juicefs format --storage minio --bucket "$$JM_BUCKET_URL" \
-          --access-key "$$MINIO_ROOT_USER" --secret-key "$$MINIO_ROOT_PASSWORD" \
           --trash-days 7 "$$JM_META_URL" "$$JM_VOL_NAME" || { echo "[format] FAIL" >&2; exit 6; }
 
   # ── juicefs: live FUSE mount + WebDAV ────────────────────────────
   juicefs:
-    image: juicedata/mount:ce-v1.3.1
+    image: juicedata/mount:ce-v1.3.1@sha256:ddba2917edee5af0e0dc367c79aae55f91de4666f8c13795d238b937d44e3b3c
     restart: unless-stopped
     depends_on:
       juicefs-init:
@@ -137,61 +284,139 @@ services:
     security_opt:
       - apparmor:unconfined
     ports:
-      - "30180:80"                  # WebDAV — Finder Cmd+K
+      - "127.0.0.1:30180:80"        # WebDAV — loopback-only: NO auth in juicefs 1.3.
+                                    # To use from Finder Cmd+K, re-expose deliberately
+                                    # ("30180:80") behind a reverse proxy with auth.
     healthcheck:
       test: ["CMD", "sh", "-c", "mountpoint -q /jfs && curl -sf http://localhost:80/ || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 60s
+    environment:
+      # This mount is the volume's background-job owner (`bg`: trash and
+      # deleted-file cleanup, session cleanup, metadata backup). WebDAV logs
+      # in as `webdav`, which the proxy gives no write rights.
+      JM_META_BG: "redis://bg@respproxy:6379/1"
+      JM_META_WEBDAV: "redis://webdav@respproxy:6379/1"
+      JM_PROXY_BG_PASSWORD: "${JM_PROXY_BG_PASSWORD:?set JM_PROXY_BG_PASSWORD in server/.env}"
+      JM_PROXY_WEBDAV_PASSWORD: "${JM_PROXY_WEBDAV_PASSWORD:?set JM_PROXY_WEBDAV_PASSWORD in server/.env}"
+      # Object keys (H-8B §2.1), handed to each juicefs process as
+      # MINIO_ACCESS_KEY/MINIO_SECRET_KEY in the command below: the bg
+      # mount deletes (trash and slice cleanup) and gets jm-gc; WebDAV
+      # gets jm-client.
+      JM_OBJ_GC_ACCESS_KEY: "${JM_OBJ_GC_ACCESS_KEY:-jm-gc}"
+      JM_OBJ_GC_SECRET_KEY: "${JM_OBJ_GC_SECRET_KEY:?set JM_OBJ_GC_SECRET_KEY in server/.env}"
+      JM_OBJ_CLIENT_ACCESS_KEY: "${JM_OBJ_CLIENT_ACCESS_KEY:-jm-client}"
+      JM_OBJ_CLIENT_SECRET_KEY: "${JM_OBJ_CLIENT_SECRET_KEY:?set JM_OBJ_CLIENT_SECRET_KEY in server/.env}"
     volumes:
       - /mnt/zSSD/juicemount/cache:/jfs-cache    # EDIT — fast-SSD cache path
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
         set -e
-        juicefs mount \
+        META_PASSWORD="$$JM_PROXY_BG_PASSWORD" \
+        MINIO_ACCESS_KEY="$$JM_OBJ_GC_ACCESS_KEY" MINIO_SECRET_KEY="$$JM_OBJ_GC_SECRET_KEY" juicefs mount \
           --cache-dir /jfs-cache --cache-size 100000 --buffer-size 4096 --prefetch 3 \
           --backup-meta 3600 \
-          redis://redis:6379/1 /jfs &
+          "$$JM_META_BG" /jfs &
         sleep 5
         until mountpoint -q /jfs; do sleep 1; done
-        mkdir -p /jfs/data /jfs/shared
-        chmod 777 /jfs/data /jfs/shared
-        juicefs webdav --cache-dir /jfs-cache --cache-size 100000 \
-          redis://redis:6379/1 0.0.0.0:80 &
+        # Create the shared roots only when missing: under enforce, a bg
+        # SETATTR on an existing project root is refused.
+        for d in /jfs/data /jfs/shared; do
+          [ -d "$$d" ] || { mkdir -p "$$d" && chmod 777 "$$d"; }
+        done
+        # WebDAV has NO built-in auth in JuiceFS 1.3 — anyone who can reach
+        # this port can read the entire volume. Since H-8B it logs in to the
+        # proxy as `webdav`, which has no write rights, so WebDAV writes are
+        # refused. Published on the
+        # NAS host loopback only by default; to expose it deliberately,
+        # change the ports mapping below (e.g. "30180:80") AND put auth in
+        # front of it (reverse proxy). Do not re-expose it raw to the LAN.
+        META_PASSWORD="$$JM_PROXY_WEBDAV_PASSWORD" \
+        MINIO_ACCESS_KEY="$$JM_OBJ_CLIENT_ACCESS_KEY" MINIO_SECRET_KEY="$$JM_OBJ_CLIENT_SECRET_KEY" juicefs webdav --no-bgjob --cache-dir /jfs-cache --cache-size 100000 \
+          "$$JM_META_WEBDAV" 0.0.0.0:80 &
         wait
 
   # ── juicemount-manager: control-plane web UI for the JuiceFS volume ─
-  # Renamed from juicemount-migrator in SLICE 0. Today this tab is
-  # Migrations only — Overview, Trash, Destinations, Backups,
-  # Maintenance, Settings tabs ship across slices 1–8.
+  # Renamed from juicemount-migrator in SLICE 0. Overview, Trash,
+  # Destinations, Backups, Maintenance, Settings, Farm, and Link are live.
   #
   # Browse host paths under /sources, pick a destination under /jfs,
   # watch live progress via SSE. Set JM_ADMIN_KEY for HTTP auth (the
   # manager owns write access to your data — don't leave it open on
-  # the public internet). Empty admin key = LAN-only / no auth.
+  # the public internet). The production compose contract requires the key at
+  # render time so `docker compose up` cannot replace a healthy Manager with a
+  # container whose persisted YAML silently dropped its runtime credential.
+  # Supply it through the deployment environment; never commit the value.
   juicemount-manager:
-    image: ghcr.io/lelanddutcher/juicemount-manager:latest
+    # A manifest-list digest is mandatory. This prevents a saved TrueNAS YAML
+    # from silently pulling a newer `latest` image with a different commit.
+    image: ghcr.io/lelanddutcher/juicemount-manager@${JM_MANAGER_DIGEST:?set JM_MANAGER_DIGEST to the release sha256 digest}
     pull_policy: always
     restart: unless-stopped
     depends_on:
       juicefs-init:
         condition: service_completed_successfully
     environment:
-      JM_META: "redis://redis:6379/1"
+      # H-8B: the Manager logs in to the proxy as principal `manager`. The
+      # URL is user@host only (it reaches --meta argv); the secret is env.
+      JM_META: "redis://manager@respproxy:6379/1"
+      JM_META_PASSWORD: "${JM_PROXY_MANAGER_PASSWORD:?set JM_PROXY_MANAGER_PASSWORD in server/.env}"
+      # gc / compact / fsck run as `bg` (delSlices and sliceRef are bg-only).
+      JM_META_BG_PASSWORD: "${JM_PROXY_BG_PASSWORD:?set JM_PROXY_BG_PASSWORD in server/.env}"
+      # `admin` only for lease break, the mode switch and `juicefs config`.
+      JM_META_ADMIN_PASSWORD: "${JM_PROXY_ADMIN_PASSWORD:?set JM_PROXY_ADMIN_PASSWORD in server/.env}"
+      # Object keys (H-8B §2.1). jm-gc reaches every juicefs subprocess the
+      # Manager starts (gc, compact, fsck, sync into /jfs, config) as
+      # MINIO_ACCESS_KEY/MINIO_SECRET_KEY. jm-client is handed to each
+      # approved Mac in its enrollment poll response.
+      JM_OBJ_GC_ACCESS_KEY: "${JM_OBJ_GC_ACCESS_KEY:-jm-gc}"
+      JM_OBJ_GC_SECRET_KEY: "${JM_OBJ_GC_SECRET_KEY:?set JM_OBJ_GC_SECRET_KEY in server/.env}"
+      JM_OBJ_CLIENT_ACCESS_KEY: "${JM_OBJ_CLIENT_ACCESS_KEY:-jm-client}"
+      JM_OBJ_CLIENT_SECRET_KEY: "${JM_OBJ_CLIENT_SECRET_KEY:?set JM_OBJ_CLIENT_SECRET_KEY in server/.env}"
+      # Per-Mac object keys (not yet enabled), rollout step M2: the Manager
+      # asks minio-keyd for keys through JM_OBJKEYS_DIR and holds no MinIO
+      # admin credential. Separate from JM_OBJ_PER_MAC_SERVER (M1), so
+      # enabling the server side never switches the Manager on.
+      JM_OBJ_PER_MAC: "${JM_OBJ_PER_MAC:-0}"
+      JM_OBJKEYS_DIR: "/var/lib/jm-objkeys"
+      # Shared with respproxy: Mac enrollment writes principals.json here.
+      JM_RESPPROXY_DIR: "/var/lib/jm-respproxy"
       JM_VOL_NAME: "zpool"
       JM_SOURCE_ROOTS: "/sources"
-      JM_ADMIN_KEY: ""               # EDIT — set to a 32+ char random string for prod
+      JM_ADMIN_KEY: "${JM_ADMIN_KEY:?set JM_ADMIN_KEY to a 32+ character value before deploying Manager}"
       JM_STATE_FILE: "/var/lib/manager/state.json"   # persists job history + future control-plane state across container restart
       JM_MINIO_URL: "http://minio:9000"              # SLICE 2: Overview MinIO liveness probe target (internal docker DNS)
-      JM_FARM_STATUS: "/farmstate/farm-status.json"  # Farm tab: the juicefarm rollup (juicefarm-state mounted read-only below)
+      # Farm tab rollup. Its parent mount also provides a read-only StatFS view
+      # of the zSSD pool for the farm storage safety interlock.
+      JM_FARM_STATUS: "/farmstate/farm-status.json"
+      # Optional explicit override; zero keeps max(64 GiB, 1% of filesystem).
+      JM_FARM_MIN_FREE_BYTES: "0"
+      # ZFS statfs is dataset-scoped and cannot report the parent zpool total.
+      # Set this to `zpool list -Hp -o size <pool>` for exact total-capacity
+      # reporting and a correctly scaled default 1% reserve.
+      JM_FARM_STORAGE_CAPACITY_BYTES: "${JM_FARM_STORAGE_CAPACITY_BYTES:?set to the integer output of zpool list -Hp -o size <pool>}"
+      # Processing-node enrollment fails closed until this is set to the Redis
+      # endpoint a node can actually reach. Never use the docker-only `redis`
+      # hostname here. The optional image overrides are useful with a registry;
+      # when blank, Manager derives the exact rc-0.5-<commit> local image tag.
+      JM_FARM_NODE_META_URL: "${JM_FARM_NODE_META_URL:-}"
+      JM_FARM_SERVER_IMAGE: "ghcr.io/lelanddutcher/juicefarm@${JM_FARM_DIGEST:?set JM_FARM_DIGEST to the release sha256 digest}"
+      JM_FARM_RENDER_IMAGE: "ghcr.io/lelanddutcher/juicefarm-gpu@${JM_FARM_RENDER_DIGEST:?set JM_FARM_RENDER_DIGEST to the release sha256 digest}"
+      # 0.5 uses a user-owned system private route for remote clients. The
+      # embedded Headscale service remains an explicit advanced deployment.
+      JM_NET_HEADSCALE: "off"
+      JM_NET_ALLOW_INSECURE: "0"
+      JM_NET_ALLOW_LAN_ONLY: "0"
+      JM_NET_NAS_NODE: "off"
       # EMBEDDED MODE ONLY (command: ["--fuse-mount=/jfs"] + JM_META unset):
       # uncomment so Overview, Trash retention, and GC/FSCK read the volume.
       # Standalone mode (the default above, with JM_META set) leaves it empty.
-      # JM_OVERVIEW_META: "redis://redis:6379/1"
+      # JM_OVERVIEW_META: "redis://manager@respproxy:6379/1"
     ports:
-      - "30190:8080"                 # web UI
+      - "30190:8080"                              # manager UI
     volumes:
       # Mount your existing-data datasets here, read-only. Each gets
       # browsed as /sources/<name> in the UI. Add as many lines as you
@@ -205,9 +430,18 @@ services:
       # you want to keep that history, additionally bind-mount the
       # OLD migrator-state dataset at /var/lib/migrator (read-only is fine).
       - /mnt/zSSD/juicemount/manager-state:/var/lib/manager
+      # Persistent Headscale keys, database, and NAS-node identity. Do not
+      # remove this after pairing Macs: doing so invalidates the tailnet.
+      - /mnt/zSSD/juicemount/headscale:/data/headscale
       # Read-only view of the juicefarm's state so the Farm tab can read
-      # farm-status.json. Additive; safe if juicefarm hasn't run yet.
+      # farm-status.json and reject new work/resume below the physical-pool
+      # reserve. Additive; safe if juicefarm hasn't run yet.
       - /mnt/zSSD/juicemount/juicefarm-state:/farmstate:ro
+      # H-8B principals directory, shared with respproxy (same host path).
+      - /mnt/zSSD/juicemount/respproxy:/var/lib/jm-respproxy
+      # Per-Mac object keys, shared with minio-keyd only (same host path).
+      # Holds per-Mac secrets in results/; never mount it into respproxy.
+      - /mnt/zSSD/juicemount/objkeys:/var/lib/jm-objkeys
 
   # ── juicefarm: server-side derivative + AI generation farm ───────
   # Generates the PORTABLE derivatives (tech/poster/filmstrip/waveform) and
@@ -217,9 +451,8 @@ services:
   # local gen only when a derivative is absent. Apple-only AI (embeddings,
   # aesthetics) stays on-device and pushes back via POST /derivatives/register.
   #
-  # Built ON the host (native x86_64 — bundles ffmpeg + whisper.cpp + the
-  # ggml-base.en model + the CGO jmfarm binary):
-  #   docker build -f server/juicefarm/Dockerfile -t juicefarm:local .
+  # Published as an immutable multi-architecture release image. The digest is
+  # the same value supplied to Manager above for node enrollment.
   #
   # SAFE LIVE DEPLOY (no full-stack churn): the juicefs container runs its OWN
   # FUSE mount, so juicefarm can be started ADDITIVELY on the existing
@@ -227,15 +460,15 @@ services:
   # would restart redis/minio and disrupt the Mac client. One-shot example:
   #   docker run -d --name juicefarm --network ix-juicemount_default \
   #     --cap-add SYS_ADMIN --device /dev/fuse --security-opt apparmor:unconfined \
-  #     -e JM_META=redis://redis:6379/1 -e JM_FARM_TARGET=/jfs/<project> \
+  #     -e JM_META=redis://farm@respproxy:6379/1 -e JM_META_PASSWORD=<farm secret> -e JM_FARM_TARGET=/jfs/<project> \
   #     -e JM_FARM_MODE=all -e JM_FARM_ONCE=1 \
+  #     -e JM_FARM_ENCODE_SCRATCH=/tmp \
   #     -v /mnt/zSSD/juicemount/cache:/jfs-cache \
-  #     -v /mnt/zSSD/juicemount/juicefarm-state:/state juicefarm:local
+  #     -v /mnt/zSSD/juicemount/juicefarm-state:/state \
+  #     ghcr.io/lelanddutcher/juicefarm@sha256:<release-manifest-digest>
   juicefarm:
-    build:
-      context: ../..
-      dockerfile: server/juicefarm/Dockerfile
-    image: juicefarm:local
+    image: ghcr.io/lelanddutcher/juicefarm@${JM_FARM_DIGEST:?set JM_FARM_DIGEST to the release sha256 digest}
+    pull_policy: always
     restart: unless-stopped
     depends_on:
       juicefs-init:
@@ -247,20 +480,43 @@ services:
     security_opt:
       - apparmor:unconfined
     environment:
-      JM_META: "redis://redis:6379/1"
+      # H-8B: principal `farm` through the proxy; the secret is env only
+      # (the entrypoint hands it to juicefs and jmfarm as META_PASSWORD).
+      JM_META: "redis://farm@respproxy:6379/1"
+      JM_META_PASSWORD: "${JM_PROXY_FARM_PASSWORD:?set JM_PROXY_FARM_PASSWORD in server/.env}"
+      # Object key (H-8B §2.1): jm-client, no delete. The farm only writes
+      # derivatives; its unlinks go through the mount, and the slices they
+      # free are deleted later by the bg mount or Manager gc (jm-gc).
+      MINIO_ACCESS_KEY: "${JM_OBJ_CLIENT_ACCESS_KEY:-jm-client}"
+      MINIO_SECRET_KEY: "${JM_OBJ_CLIENT_SECRET_KEY:?set JM_OBJ_CLIENT_SECRET_KEY in server/.env}"
       JM_FARM_TARGET: "/jfs"          # EDIT — a subpath to limit each sweep
       JM_FARM_MODE: "all"             # all | derivatives | transcript
       JM_FARM_PRODUCER: "linux-farm"
+      # Producer generation is derived from the exact commit embedded in jmfarm.
+      # Do not pin -version/JM_FARM_PRODUCER_VERSION here: each new build must
+      # retry failures negatively cached by an older codec/runtime.
       JM_FARM_DB: "/state/derivatives.db"
+      # ffmpeg must finish seek-heavy MP4/faststart work on node-local storage;
+      # the worker then copies the immutable result into JuiceFS once. Never set
+      # this to /jfs or any descendant of the shared mount.
+      JM_FARM_ENCODE_SCRATCH: "/tmp"
       # JM-16: run the STANDING queue-drain worker (heartbeat + BRPOP the shared
       # juicefarm: queue on JM_META) so Manager `POST /api/farm/sweep` enqueues are
       # picked up in near-real-time — what OpenLoupe expects. With this set the
       # entrypoint exec's `jmfarm -queue` and JM_FARM_INTERVAL below is NOT used.
       JM_FARM_QUEUE: "1"
+      # The stock CPU node is the generic fallback: it drains each dedicated
+      # queue as well as the legacy catch-all so Manager's default job cannot
+      # strand waiting for a specialized worker.
+      JM_WORKER_NAME: "nas-cpu"
+      JM_FARM_KINDS: "all"
       # Fallback only: if JM_FARM_QUEUE is unset/0 the worker reverts to a periodic
       # -root sweep every JM_FARM_INTERVAL seconds (the pre-JM-16 behavior).
       JM_FARM_INTERVAL: "900"
       JM_FARM_WORKERS: "4"
+      # Same physical-pool total used by Manager's capacity proof. The worker
+      # continues to take AVAILABLE bytes from statfs on /state.
+      JM_FARM_STORAGE_CAPACITY_BYTES: "${JM_FARM_STORAGE_CAPACITY_BYTES:?set to the integer output of zpool list -Hp -o size <pool>}"
     volumes:
       - /mnt/zSSD/juicemount/cache:/jfs-cache         # shares the SSD cache dataset
       - /mnt/zSSD/juicemount/juicefarm-state:/state   # server-side derivatives index

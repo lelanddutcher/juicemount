@@ -1,0 +1,84 @@
+--- a/pkg/meta/redis.go
++++ b/pkg/meta/redis.go
+@@ -1239,6 +1239,10 @@
+ 
+ func (m *redisMeta) doSetAttr(ctx Context, inode Ino, set uint16, sugidclearmode uint8, attr *Attr) syscall.Errno {
+ 	return errno(m.txn(ctx, func(tx *redis.Tx) error {
++		birth, err := m.prepareBirthMutation(ctx, tx, inode)
++		if err != nil {
++			return err
++		}
+ 		var cur Attr
+ 		a, err := tx.Get(ctx, m.inodeKey(inode)).Bytes()
+ 		if err != nil {
+@@ -1247,6 +1251,13 @@
+ 		m.parseAttr(a, &cur)
+ 		if cur.Parent > TrashInode {
+ 			return syscall.EPERM
++		}
++		if birth != nil {
++			const allowed = SetAttrMode | SetAttrMtime | SetAttrCtime | SetAttrMtimeNow | SetAttrCtimeNow
++			if set&^allowed != 0 || cur.AccessACL != 0 || cur.DefaultACL != 0 ||
++				set&SetAttrMode != 0 && attr.Mode != cur.Mode {
++				return syscall.EPERM
++			}
+ 		}
+ 		now := time.Now()
+ 
+@@ -1262,6 +1273,13 @@
+ 		}
+ 		if dirtyAttr == nil {
+ 			return nil
++		}
++		if birth != nil && (dirtyAttr.Typ != cur.Typ || dirtyAttr.Nlink != cur.Nlink ||
++			dirtyAttr.Parent != cur.Parent || dirtyAttr.Length != cur.Length ||
++			dirtyAttr.Uid != cur.Uid || dirtyAttr.Gid != cur.Gid ||
++			dirtyAttr.Mode != cur.Mode || dirtyAttr.Flags != cur.Flags ||
++			dirtyAttr.Rdev != cur.Rdev || dirtyAttr.AccessACL != 0 || dirtyAttr.DefaultACL != 0) {
++			return syscall.EPERM
+ 		}
+ 
+ 		dirtyAttr.AccessACL, err = m.insertACL(ctx, tx, rule)
+@@ -2689,6 +2707,18 @@
+ 
+ func (m *redisMeta) doWrite(ctx Context, inode Ino, indx uint32, off uint32, slice Slice, mtime time.Time, numSlices *int, delta *dirStat, attr *Attr) syscall.Errno {
+ 	return errno(m.txn(ctx, func(tx *redis.Tx) error {
++		birth, err := m.prepareBirthMutation(ctx, tx, inode)
++		if err != nil {
++			return err
++		}
++		if birth != nil {
++			if err := tx.Watch(ctx, m.chunkKey(inode, indx), m.usedSpaceKey()).Err(); err != nil {
++				return err
++			}
++			if err := guardedType(tx, ctx, m.chunkKey(inode, indx), "list", "none"); err != nil {
++				return syscall.EIO
++			}
++		}
+ 		*delta = dirStat{}
+ 		*attr = Attr{}
+ 		a, err := tx.Get(ctx, m.inodeKey(inode)).Bytes()
+@@ -2700,10 +2730,23 @@
+ 			return syscall.EPERM
+ 		}
+ 		newleng := uint64(indx)*ChunkSize + uint64(off) + uint64(slice.Len)
++		if birth != nil && newleng > math.MaxInt64 {
++			return syscall.EIO
++		}
+ 		if newleng > attr.Length {
+ 			delta.length = int64(newleng - attr.Length)
+ 			delta.space = align4K(newleng) - align4K(attr.Length)
+ 			attr.Length = newleng
++		}
++		if birth != nil {
++			raw, err := tx.Get(ctx, m.usedSpaceKey()).Result()
++			if err != nil {
++				return syscall.EIO
++			}
++			used, ok := guardedDecimal(raw, false)
++			if !ok || delta.space < 0 || used > math.MaxInt64-uint64(delta.space) {
++				return syscall.EIO
++			}
+ 		}
+ 		if err := m.checkQuota(ctx, delta.space, 0, m.getParents(ctx, tx, inode, attr.Parent)...); err != 0 {
+ 			return err

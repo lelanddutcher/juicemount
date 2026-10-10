@@ -4,11 +4,11 @@ JuiceMount sits in front of people's primary storage, so security reports are ta
 
 ## Supported versions
 
-JuiceMount is pre-1.0 (currently the `v0.1.x` beta line). Security fixes land on `main` and ship in the next tagged release. There is no long-term-support branch yet; please test against the latest release before reporting.
+JuiceMount is pre-1.0, with 0.5.0 as the current general release. Security fixes land on `main` and ship in the next tagged release. There is no long-term-support branch yet; please test against the latest release before reporting.
 
 | Version | Supported |
 |---|---|
-| latest `v0.1.x` release / `main` | yes |
+| latest release / `main` | yes |
 | anything older | no — please update first |
 
 ## Reporting a vulnerability
@@ -33,10 +33,10 @@ In scope: the macOS app, the server stack in [`server/`](server/), the control p
 
 Out of scope, and worth knowing before you deploy:
 
-- **The stack is built for a LAN you trust.** By default the server's Redis and MinIO ports are reachable on the local network with no per-client authentication; that is a deliberate design point, not a vulnerability. Firewall those ports, or front the deployment with a VPN such as [Tailscale](https://tailscale.com), if untrusted clients share the network. See [`server/README.md`](server/README.md#security-notes).
-- **You own your keys.** MinIO root credentials and any S3 keys live in your own deployment and the JuiceFS volume's format metadata. Choose strong values and keep them off public networks.
+- **Keep the server on a trusted network.** The canonical 0.5 compose does not publish Redis directly. An authenticated RESP proxy listens on port 30179 and requires named client principals; it starts in passthrough lease mode with stage births off. MinIO listens on port 30151 and requires an object key. The default client key is shared by approved Macs and can read, write, and list objects without delete rights; separate per-Mac object keys are not enabled by default. RESP authentication and Manager enrollment use plaintext on the wire unless you provide a trusted private route or a separate TLS layer. Do not expose the proxy, MinIO, or Manager to the public Internet. See [`server/README.md`](server/README.md#security-notes).
+- **You own your keys.** Keep MinIO root, client, GC, proxy, and Manager credentials in your private deployment state. The current volume format metadata does not hold the client object key; each JuiceFS client supplies its key. Preserve and rotate credentials deliberately, and keep both object data and Redis metadata backed up.
 
 ## What JuiceMount does not do
 
-- **No telemetry.** The app talks only to the Redis and S3 endpoints you configure plus a loopback control plane on `127.0.0.1`; JuiceFS's own usage reporting is disabled with `--no-usage-report`. No analytics, crash reporting, or update checks. ("No telemetry without opt-in" is a stated project non-negotiable.)
+- **No silent telemetry or update checks.** Automatic app traffic is limited to the Redis and S3 endpoints you configure plus a loopback control plane on `127.0.0.1`; JuiceFS usage reporting is disabled with `--no-usage-report`. There is no analytics or crash reporting. The app contacts its signed GitHub release feed only when the user explicitly chooses **Check for Updates…**.
 - **No data leaves your hardware** unless you point the object store at a cloud bucket yourself.

@@ -9,10 +9,10 @@
 // Compatibility rules (locked by §3.1 of docs/ROADMAP/juicemount-manager.md):
 //
 //   - v1: no schema_version field. The legacy persistedState shape
-//         (jobs + order only) is still valid; loader treats it as v1
-//         and upgrades to v2 on the next save.
+//     (jobs + order only) is still valid; loader treats it as v1
+//     and upgrades to v2 on the next save.
 //   - v2: schema_version == 2; destinations array added; other sections
-//         reserved as empty arrays/objects.
+//     reserved as empty arrays/objects.
 //
 // We deliberately use a single JSON shape for BOTH v1 and v2 — when a
 // v1 file is loaded, the missing fields default to their zero values

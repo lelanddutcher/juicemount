@@ -2,23 +2,38 @@ package metadata
 
 import (
 	"context"
+	"os"
 	"testing"
 	"time"
+
+	"github.com/lelanddutcher/juicemount/internal/redisurl"
 )
 
-const testRedisURL = "redis://127.0.0.1:6379/1"
+func requireLiveTestVolume(t *testing.T) {
+	t.Helper()
+	if os.Getenv("JM_TEST_VOLUME_REDIS") == "" {
+		t.Skip("requires JM_TEST_VOLUME_REDIS pointing at a populated JuiceFS metadata database")
+	}
+}
 
 func newTestRedisClient(t *testing.T) *RedisClient {
 	t.Helper()
+	url := os.Getenv("JM_TEST_VOLUME_REDIS")
+	if url == "" {
+		t.Skip("requires JM_TEST_VOLUME_REDIS pointing at a populated JuiceFS metadata database")
+	}
+	if _, err := redisurl.Parse(url); err != nil {
+		t.Fatalf("invalid JM_TEST_VOLUME_REDIS: %v", err)
+	}
 	store, err := Open(":memory:")
 	if err != nil {
 		t.Fatalf("Open store: %v", err)
 	}
 	t.Cleanup(func() { store.Close() })
 
-	rc, err := NewRedisClient(testRedisURL, store)
+	rc, err := NewRedisClient(url, store)
 	if err != nil {
-		t.Skipf("Redis not reachable, skipping: %v", err)
+		t.Fatalf("configured JM_TEST_VOLUME_REDIS unreachable: %v", err)
 	}
 	t.Cleanup(func() { rc.Stop() })
 	return rc
@@ -56,6 +71,7 @@ func TestRedisConnect(t *testing.T) {
 }
 
 func TestRedisSyncMetadata(t *testing.T) {
+	requireLiveTestVolume(t)
 	rc := newTestRedisClient(t)
 
 	if err := rc.SyncOnce(); err != nil {
@@ -111,7 +127,11 @@ func TestRedisSubscribePublish(t *testing.T) {
 
 	// Start the SUBSCRIBE listener
 	rc.Start()
-	time.Sleep(500 * time.Millisecond) // let subscriber connect
+	readyCtx, cancelReady := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelReady()
+	if err := rc.waitSubscribeReady(readyCtx); err != nil {
+		t.Fatalf("SUBSCRIBE readiness: %v", err)
+	}
 
 	// Publish a test event
 	ctx := context.Background()
@@ -156,10 +176,15 @@ func TestRedisSubscribePublish(t *testing.T) {
 		Path: "__test__/subscribe_test_file.txt",
 	}
 	rc.PublishEvent(ctx, deleteEvt)
-	time.Sleep(500 * time.Millisecond)
-
-	if e := rc.store.LookupByPath("__test__/subscribe_test_file.txt"); e != nil {
-		t.Fatal("entry should have been deleted via SUBSCRIBE")
+	deleteDeadline := time.Now().Add(5 * time.Second)
+	for {
+		if e := rc.store.LookupByPath("__test__/subscribe_test_file.txt"); e == nil {
+			break
+		}
+		if time.Now().After(deleteDeadline) {
+			t.Fatal("entry should have been deleted via SUBSCRIBE")
+		}
+		time.Sleep(25 * time.Millisecond)
 	}
 
 	t.Log("SUBSCRIBE publish/receive/delete cycle passed")
@@ -191,7 +216,11 @@ func TestRedisReconciliationPreservesLocalOnly(t *testing.T) {
 func TestRedisSubscribeRename(t *testing.T) {
 	rc := newTestRedisClient(t)
 	rc.Start()
-	time.Sleep(500 * time.Millisecond)
+	readyCtx, cancelReady := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelReady()
+	if err := rc.waitSubscribeReady(readyCtx); err != nil {
+		t.Fatalf("SUBSCRIBE readiness: %v", err)
+	}
 
 	ctx := context.Background()
 
@@ -200,15 +229,32 @@ func TestRedisSubscribeRename(t *testing.T) {
 		Op: "create", Path: "__test__/before_rename.txt",
 		Size: 100, Mtime: time.Now().Unix(), Inode: 777777,
 	})
-	time.Sleep(300 * time.Millisecond)
+	createDeadline := time.Now().Add(5 * time.Second)
+	for rc.store.LookupByPath("__test__/before_rename.txt") == nil {
+		if time.Now().After(createDeadline) {
+			t.Fatal("create event not applied before rename")
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
 
 	// Rename it
 	rc.PublishEvent(ctx, MetadataEvent{
 		Op: "rename", Path: "__test__/after_rename.txt",
 		OldPath: "__test__/before_rename.txt",
-		Size: 100, Mtime: time.Now().Unix(), Inode: 777777,
+		Size:    100, Mtime: time.Now().Unix(), Inode: 777777,
 	})
-	time.Sleep(300 * time.Millisecond)
+	renameDeadline := time.Now().Add(5 * time.Second)
+	for {
+		old := rc.store.LookupByPath("__test__/before_rename.txt")
+		newEntry := rc.store.LookupByPath("__test__/after_rename.txt")
+		if old == nil && newEntry != nil {
+			break
+		}
+		if time.Now().After(renameDeadline) {
+			t.Fatal("rename event not applied within 5s")
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
 
 	// Old path should be gone
 	if e := rc.store.LookupByPath("__test__/before_rename.txt"); e != nil {
@@ -230,6 +276,10 @@ func TestRedisSubscribeRename(t *testing.T) {
 // one reconciliation cycle are NOT deleted, and are only deleted after
 // PruneThreshold consecutive absences.
 func TestPruneThresholdSafeguard(t *testing.T) {
+	// Keep this test independent of the host's current network class. Layer A's
+	// tunnel budget deliberately defers destructive pruning; this test is about
+	// the counter threshold itself, so use the documented unbounded test mode.
+	t.Setenv("JM_LAYERA_BUDGET", "0")
 	rc := newTestRedisClient(t)
 
 	// Seed store with a "ghost" entry — exists in SQLite but not in Redis.
@@ -250,10 +300,28 @@ func TestPruneThresholdSafeguard(t *testing.T) {
 		t.Fatalf("expected pruneAbsent count=1 after first cycle, got %d", count1)
 	}
 
-	// Second sync: ghost has been absent PruneThreshold times — should now be deleted.
-	rc.SyncOnce()
+	// The entry must survive every cycle below PruneThreshold. This test used to
+	// assume PruneThreshold==2; QA-30 raised it to 10, so spelling out only a
+	// "second sync" silently stopped exercising the deletion boundary.
+	for cycle := 2; cycle < PruneThreshold; cycle++ {
+		if err := rc.SyncOnce(); err != nil {
+			t.Fatalf("SyncOnce cycle %d: %v", cycle, err)
+		}
+		if rc.store.LookupByPath(ghost.Path) == nil {
+			t.Fatalf("ghost was deleted after %d cycles, below threshold %d", cycle, PruneThreshold)
+		}
+		if got := rc.pruneAbsent[ghost.Path]; got != cycle {
+			t.Fatalf("pruneAbsent after cycle %d = %d, want %d", cycle, got, cycle)
+		}
+	}
+
+	// Exactly the threshold-th stable absence qualifies the entry for the
+	// destructive layer, where the explicit Layer-A mode confirms it absent.
+	if err := rc.SyncOnce(); err != nil {
+		t.Fatalf("SyncOnce threshold cycle: %v", err)
+	}
 	if rc.store.LookupByPath(ghost.Path) != nil {
-		t.Fatal("ghost should have been pruned after PruneThreshold cycles, but still exists")
+		t.Fatalf("ghost should have been pruned after %d cycles, but still exists", PruneThreshold)
 	}
 	rc.mu.RLock()
 	count2 := rc.pruneAbsent[ghost.Path]

@@ -115,8 +115,7 @@ func TestInterruptedWriteNeverVisible(t *testing.T) {
 	dir := t.TempDir()
 	final := filepath.Join(dir, "poster.jpg")
 
-	// ffmpeg lane: encode target created via atomicTempPath, never committed.
-	tmp := atomicTempPath(final)
+	tmp := filepath.Join(filepath.Dir(final), "."+filepath.Base(final)+".tmp-test")
 	if err := os.WriteFile(tmp, []byte("partial-jpeg-bytes"), 0o644); err != nil {
 		t.Fatalf("write temp: %v", err)
 	}
@@ -180,99 +179,10 @@ func TestAtomicWriteFileCleansTempOnError(t *testing.T) {
 	}
 }
 
-// TestAtomicCommitFile covers the ffmpeg lane's commit half: a fully-written
-// temp lands byte-complete at the final path (including replacing a previous
-// version), the temp is consumed by the rename, and a failed commit leaves the
-// temp for the caller's deferred cleanup (the production pattern in
-// Thumbnail/Proxy/Filmstrip) rather than half-publishing anything.
-func TestAtomicCommitFile(t *testing.T) {
-	dir := t.TempDir()
-	final := filepath.Join(dir, "strip.jpg")
-
-	// Previous complete version exists (regeneration case).
-	if err := os.WriteFile(final, []byte("old-strip"), 0o644); err != nil {
-		t.Fatalf("seed old blob: %v", err)
-	}
-
-	payload := bytes.Repeat([]byte("frame"), 4096)
-	tmp := atomicTempPath(final)
-	if err := os.WriteFile(tmp, payload, 0o644); err != nil {
-		t.Fatalf("write temp: %v", err)
-	}
-	if err := atomicCommitFile(tmp, final); err != nil {
-		t.Fatalf("commit: %v", err)
-	}
-	got, err := os.ReadFile(final)
-	if err != nil {
-		t.Fatalf("read final: %v", err)
-	}
-	if !bytes.Equal(got, payload) {
-		t.Fatalf("final content mismatch after commit: %d bytes, want %d", len(got), len(payload))
-	}
-	if _, err := os.Stat(tmp); !os.IsNotExist(err) {
-		t.Fatalf("temp survived the commit rename: stat err = %v", err)
-	}
-
-	// Failed commit: destination occupied by a directory → error, final content
-	// untouched, and the temp remains for the caller's `defer os.Remove(tmp)`.
-	blockedFinal := filepath.Join(dir, "blocked.mp4")
-	if err := os.MkdirAll(filepath.Join(blockedFinal, "occupied"), 0o755); err != nil {
-		t.Fatalf("mkdir: %v", err)
-	}
-	tmp2 := atomicTempPath(blockedFinal)
-	if err := os.WriteFile(tmp2, []byte("encoded"), 0o644); err != nil {
-		t.Fatalf("write temp2: %v", err)
-	}
-	if err := atomicCommitFile(tmp2, blockedFinal); err == nil {
-		t.Fatalf("commit onto a directory path unexpectedly succeeded")
-	}
-	// Caller's cleanup pattern erases the temp.
-	if err := os.Remove(tmp2); err != nil {
-		t.Fatalf("caller cleanup failed (temp missing?): %v", err)
-	}
-
-	// A missing temp is a clean error, not a panic (and never publishes).
-	if err := atomicCommitFile(filepath.Join(dir, ".ghost.tmp-1"), filepath.Join(dir, "ghost.mp4")); err == nil {
-		t.Fatalf("commit of a nonexistent temp unexpectedly succeeded")
-	}
-	if _, err := os.Stat(filepath.Join(dir, "ghost.mp4")); !os.IsNotExist(err) {
-		t.Fatalf("ghost final path materialized: stat err = %v", err)
-	}
-}
-
-// TestAtomicTempPathUniqueAndHidden pins the two properties every ffmpeg encode
-// target relies on: temp names are dot-prefixed siblings IN the destination
-// directory (same filesystem → rename is atomic; hidden from consumers), and
-// concurrent producers targeting the SAME blob never collide on a temp name.
-func TestAtomicTempPathUniqueAndHidden(t *testing.T) {
-	dir := t.TempDir()
-	final := filepath.Join(dir, "proxy.mp4")
-
-	const n = 64
-	paths := make([]string, n)
-	var wg sync.WaitGroup
-	for i := 0; i < n; i++ {
-		i := i
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			paths[i] = atomicTempPath(final)
-		}()
-	}
-	wg.Wait()
-
-	seen := make(map[string]bool, n)
-	for _, p := range paths {
-		if filepath.Dir(p) != dir {
-			t.Errorf("temp %q not a sibling of the final path", p)
-		}
-		base := filepath.Base(p)
-		if !strings.HasPrefix(base, ".proxy.mp4.tmp-") {
-			t.Errorf("temp basename %q lacks the hidden .<name>.tmp- shape", base)
-		}
-		if seen[p] {
-			t.Errorf("temp path collision: %q", p)
-		}
-		seen[p] = true
-	}
-}
+// TestAtomicCommitFile and TestAtomicTempPathUniqueAndHidden were deleted with
+// the helpers they covered. The property they protected — ffmpeg output becomes
+// visible under its real name atomically and never half-written — did not go
+// away; it moved to internal/derivatives.CommitStagedAt, which publishes with
+// renameat through a held directory descriptor and is covered by
+// TestStageAndCommitThroughDescriptor and TestCommitStagedRefusesEmptyPlaceholder.
+// Recorded here so the coverage is traceable rather than looking dropped.

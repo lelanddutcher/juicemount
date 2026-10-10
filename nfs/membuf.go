@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -53,6 +54,9 @@ type MemoryBuffer struct {
 	totalSize int64
 	threshold int64 // max file size to buffer
 	budget    int64 // max total heap usage
+	// Acceptance-only: existing RAM entries may serve, but a miss may not
+	// start a whole-file FUSE loader under the zero-byte remote-content guard.
+	refuseFUSEContentReads bool
 
 	stopCh chan struct{}
 
@@ -77,7 +81,7 @@ type memBufEntry struct {
 	data       []byte
 	size       int64
 	lastAccess time.Time
-	loading    bool // true while async load is in progress
+	loading    bool          // true while async load is in progress
 	ready      chan struct{} // closed when loading is complete
 }
 
@@ -114,6 +118,16 @@ func (mb *MemoryBuffer) Get(path string, fileSize int64, fusePath string) []byte
 	}
 
 	mb.mu.Lock()
+	// Stop() deliberately clears entries while already-dispatched NFS RPCs may
+	// still be unwinding. A late Get used to continue through the miss path and
+	// assign mb.entries[path] below, panicking with "assignment to entry in nil
+	// map" during every busy shutdown. Treat the nil map as the terminal state.
+	// Checking under the same lock as Stop closes the race between an earlier
+	// stopCh probe and the map clear.
+	if mb.entries == nil {
+		mb.mu.Unlock()
+		return nil
+	}
 	entry, exists := mb.entries[path]
 
 	if exists {
@@ -153,6 +167,17 @@ func (mb *MemoryBuffer) Get(path string, fileSize int64, fusePath string) []byte
 		mb.statsMu.Unlock()
 
 		return data
+	}
+
+	// A miss would spawn loadFile, which reads the complete file through FUSE.
+	// Existing RAM hits above remain available during acceptance testing.
+	if mb.refuseFUSEContentReads {
+		mb.mu.Unlock()
+		mb.statsMu.Lock()
+		mb.misses++
+		mb.loadSkipped++
+		mb.statsMu.Unlock()
+		return nil
 	}
 
 	// Not buffered yet — check if we have budget
@@ -246,7 +271,25 @@ func (mb *MemoryBuffer) loadFile(path, fusePath string, fileSize int64, entry *m
 		default:
 		}
 
+		// FUSE data ceiling (2026-08-05 double kernel panic). This loop pulls a
+		// WHOLE file through FUSE in the background, so it is exactly the kind
+		// of bulk work that must yield to a user's read. Non-blocking acquire
+		// for the same reason as readahead: speculative work never waits in the
+		// admission window ahead of foreground.
+		//
+		// On refusal ABANDON the load rather than skipping the block. This loop
+		// cannot tolerate a gap — the torn-read guard below rejects any short
+		// load precisely because publishing data[:totalRead] would serve a
+		// partial file as complete (the 2026-06-15 black-frame bug). Failing the
+		// whole load is the safe outcome: membuf is a cache, and a miss costs a
+		// re-read, while a hole costs corrupt bytes.
+		gateRelease, gateOK := tryAcquireFUSEDataBackground()
+		if !gateOK {
+			mb.removeStaleEntry(path, entry)
+			return
+		}
 		n, err := fd.ReadAt(data[totalRead:], int64(totalRead))
+		gateRelease()
 		totalRead += n
 		if err == io.EOF {
 			break
@@ -304,6 +347,53 @@ func (mb *MemoryBuffer) Invalidate(path string) {
 		mb.totalSize -= entry.size
 		delete(mb.entries, path)
 	}
+}
+
+// captureEntry and invalidateIfEntry let a delayed predecessor effect remove
+// only the RAM object it observed, never a newer same-path publication.
+func (mb *MemoryBuffer) captureEntry(path string) *memBufEntry {
+	if mb == nil {
+		return nil
+	}
+	mb.mu.Lock()
+	defer mb.mu.Unlock()
+	return mb.entries[path]
+}
+
+func (mb *MemoryBuffer) invalidateIfEntry(path string, observed *memBufEntry) bool {
+	if mb == nil || observed == nil {
+		return false
+	}
+	mb.mu.Lock()
+	defer mb.mu.Unlock()
+	if mb.entries[path] != observed {
+		return false
+	}
+	mb.totalSize -= observed.size
+	delete(mb.entries, path)
+	return true
+}
+
+// InvalidateTree removes a directory and every buffered descendant without
+// matching sibling prefixes ("reel" does not invalidate "reel-old").
+func (mb *MemoryBuffer) InvalidateTree(path string) {
+	mb.mu.Lock()
+	defer mb.mu.Unlock()
+	prefix := strings.TrimSuffix(path, "/") + "/"
+	for cachedPath, entry := range mb.entries {
+		if cachedPath == path || strings.HasPrefix(cachedPath, prefix) {
+			mb.totalSize -= entry.size
+			delete(mb.entries, cachedPath)
+		}
+	}
+}
+
+// InvalidateAll drops all buffered contents after a full metadata repair.
+func (mb *MemoryBuffer) InvalidateAll() {
+	mb.mu.Lock()
+	clear(mb.entries)
+	mb.totalSize = 0
+	mb.mu.Unlock()
 }
 
 // Stats returns buffer statistics.

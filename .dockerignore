@@ -53,3 +53,4 @@ build/
 
 # --- Server-side data dirs that may exist from local quickstart ---
 server/data/
+compose*.yml

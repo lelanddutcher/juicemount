@@ -76,9 +76,13 @@ final class FinderService: NSObject {
         userData: String?,
         error errorPtr: AutoreleasingUnsafeMutablePointer<NSString?>
     ) {
-        let now = NFSBridge.isOffline
-        NFSBridge.setOffline(!now)
-        deliverOfflineNotification(now: !now)
+        do {
+            let now = try NFSBridge.confirmedOfflineState()
+            let effective = try NFSBridge.setOffline(!now)
+            deliverOfflineNotification(now: effective)
+        } catch {
+            errorPtr.pointee = error.localizedDescription as NSString
+        }
     }
 
     private func deliverPinNotification(totalFiles: Int, failures: [String]) {

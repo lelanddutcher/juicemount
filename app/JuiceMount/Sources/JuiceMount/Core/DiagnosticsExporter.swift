@@ -54,7 +54,9 @@ public final class DiagnosticsExporter {
 
         // 1. Create staging dir
         let stageName = "JuiceMount-diagnostics-\(Self.timestamp())"
-        let stageRoot = fm.temporaryDirectory.appendingPathComponent(stageName)
+        let scratch = AppIsolation.active.map { URL(fileURLWithPath: $0.child("tmp"), isDirectory: true) }
+            ?? fm.temporaryDirectory
+        let stageRoot = scratch.appendingPathComponent(stageName)
         do {
             try fm.createDirectory(at: stageRoot,
                                    withIntermediateDirectories: true)
@@ -98,13 +100,13 @@ public final class DiagnosticsExporter {
         if !errors.isEmpty {
             let errorsURL = stageRoot.appendingPathComponent("errors.txt")
             let body = errors.joined(separator: "\n")
-            try? body.write(to: errorsURL, atomically: true, encoding: .utf8)
+            try? writeRedacted(body, to: errorsURL, maxBytes: 64 * 1024)
         }
 
         // 3. Zip via ditto. -c create, -k keep PKZip format,
         //    --keepParent preserves the top-level folder inside the zip
         //    so unzipping yields one tidy directory.
-        let tmpZip = fm.temporaryDirectory
+        let tmpZip = scratch
             .appendingPathComponent("\(stageName).zip")
         try? fm.removeItem(at: tmpZip)
 
@@ -131,35 +133,31 @@ public final class DiagnosticsExporter {
             try? fm.removeItem(at: tmpZip)
         }
 
-        log.info("Diagnostics exported to \(destination.path, privacy: .public)")
+        log.info("Diagnostics exported to \(destination.path, privacy: .private)")
     }
 
     // MARK: - Collectors
 
     private func collectAppLog(into stage: URL, errors: inout [String]) {
-        let logDir = FileManager.default
-            .homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Logs/JuiceMount")
+        let logDir = AppIsolation.active.map { URL(fileURLWithPath: $0.child("logs")) }
+            ?? FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent("Library/Logs/JuiceMount")
         let logURL = logDir.appendingPathComponent("juicemount.log")
         let dest = stage.appendingPathComponent("juicemount.log")
         do {
-            // Capture a FULL rotation segment (jmlog rotates juicemount.log at
-            // 16 MiB), not a 5 MiB slice — otherwise the new-dev spool / NFS-node
-            // signal (spool: COMMIT, in-flight read JUKEBOX-held, reopen, drain
-            // lines) gets sliced out of a busy session's tail.
-            try copyLastBytes(of: logURL, to: dest, maxBytes: 16 * 1024 * 1024)
+            try copyRedactedLog(of: logURL, to: dest, maxBytes: 4 * 1024 * 1024)
         } catch {
             errors.append("juicemount.log: \(error.localizedDescription)")
         }
-        // Also bundle the rotated backups (juicemount.log.1 … .5 — up to ~96 MiB
-        // of history) so an export covers the whole session window, not just the
-        // live tail. Missing backups are silently skipped (not an error).
+        // Keep bounded complete segments. A partial tail can lose the label
+        // belonging to a multiline credential value, so oversized logs omit.
         for i in 1...5 {
             let backup = logDir.appendingPathComponent("juicemount.log.\(i)")
             guard FileManager.default.fileExists(atPath: backup.path) else { continue }
             let backupDest = stage.appendingPathComponent("juicemount.log.\(i)")
             do {
-                try FileManager.default.copyItem(at: backup, to: backupDest)
+                try copyRedactedLog(of: backup, to: backupDest,
+                                     maxBytes: 1 * 1024 * 1024)
             } catch {
                 errors.append("juicemount.log.\(i): \(error.localizedDescription)")
             }
@@ -167,9 +165,9 @@ public final class DiagnosticsExporter {
     }
 
     private func collectJuiceFSLog(into stage: URL, errors: inout [String]) {
-        let logURL = FileManager.default
-            .homeDirectoryForCurrentUser
-            .appendingPathComponent(".juicefs/juicefs.log")
+        let logURL = AppIsolation.active.map { URL(fileURLWithPath: $0.child(".juicefs/juicefs.log")) }
+            ?? FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent(".juicefs/juicefs.log")
         let dest = stage.appendingPathComponent("juicefs.log")
         guard FileManager.default.fileExists(atPath: logURL.path) else {
             // Not an error — JuiceFS log just doesn't exist on this host
@@ -179,7 +177,7 @@ public final class DiagnosticsExporter {
             return
         }
         do {
-            try copyLastBytes(of: logURL, to: dest, maxBytes: 1 * 1024 * 1024)
+            try copyRedactedLog(of: logURL, to: dest, maxBytes: 1 * 1024 * 1024)
         } catch {
             errors.append("juicefs.log: \(error.localizedDescription)")
         }
@@ -196,31 +194,45 @@ public final class DiagnosticsExporter {
         }
         var req = URLRequest(url: url)
         req.timeoutInterval = 5
+        let capture = RequestCapture()
         let sem = DispatchSemaphore(value: 0)
-        var data: Data?
-        var err: Error?
-        URLSession.shared.dataTask(with: req) { d, _, e in
-            data = d
-            err = e
+        let task = URLSession.shared.dataTask(with: req) { d, _, e in
+            capture.set(data: d, error: e)
             sem.signal()
-        }.resume()
+        }
+        task.resume()
         // Wait up to 6s for the request to complete (URLSession honors the
         // 5s timeout above; this is a safety net for the semaphore wait).
-        _ = sem.wait(timeout: .now() + 6)
-        if let err {
-            errors.append("\(file): \(err.localizedDescription)")
-            try? "(metrics endpoint unreachable: \(err.localizedDescription))\n"
-                .write(to: dest, atomically: true, encoding: .utf8)
-            return
-        }
-        guard let data else {
-            errors.append("\(file): no data and no error (timeout?)")
+        let completed = sem.wait(timeout: .now() + 6) == .success
+        if !completed { task.cancel() }
+        guard completed else {
+            errors.append("\(file): timed out")
             try? "(no response within 6s)\n"
                 .write(to: dest, atomically: true, encoding: .utf8)
             return
         }
+        let (data, err) = capture.snapshot()
+        if let err {
+            errors.append("\(file): \(err.localizedDescription)")
+            try? writeRedacted("(metrics endpoint unreachable: \(err.localizedDescription))\n",
+                               to: dest, maxBytes: 1 * 1024 * 1024)
+            return
+        }
+        guard let data else {
+            errors.append("\(file): no data and no error")
+            try? "(no response within 6s)\n"
+                .write(to: dest, atomically: true, encoding: .utf8)
+            return
+        }
+        guard data.count <= 1 * 1024 * 1024 else {
+            errors.append("\(file): response exceeded 1 MiB limit")
+            try? "(response omitted: exceeded 1 MiB limit)\n"
+                .write(to: dest, atomically: true, encoding: .utf8)
+            return
+        }
         do {
-            try data.write(to: dest)
+            let body = String(decoding: data, as: UTF8.self)
+            try writeRedacted(body, to: dest, maxBytes: 1 * 1024 * 1024)
         } catch {
             errors.append("\(file): write failed: \(error.localizedDescription)")
         }
@@ -240,7 +252,7 @@ public final class DiagnosticsExporter {
         let lines = result.stdout.split(separator: "\n",
                                         omittingEmptySubsequences: false)
         let head = lines.prefix(200).joined(separator: "\n")
-        try? head.write(to: dest, atomically: true, encoding: .utf8)
+        try? writeRedacted(head, to: dest, maxBytes: 1 * 1024 * 1024)
     }
 
     private func collectMount(into stage: URL, errors: inout [String]) {
@@ -263,7 +275,7 @@ public final class DiagnosticsExporter {
         let body = filtered.isEmpty
             ? "(no juicemount/juicefs/zpool mounts found)\n"
             : filtered + "\n"
-        try? body.write(to: dest, atomically: true, encoding: .utf8)
+        try? writeRedacted(body, to: dest, maxBytes: 1 * 1024 * 1024)
     }
 
     private func collectCommand(_ argv: [String],
@@ -278,7 +290,7 @@ public final class DiagnosticsExporter {
         if result.exitCode != 0 && result.stdout.isEmpty {
             errors.append("\(file): exit=\(result.exitCode) \(result.stderr)")
         }
-        try? result.stdout.write(to: dest, atomically: true, encoding: .utf8)
+        try? writeRedacted(result.stdout, to: dest, maxBytes: 1 * 1024 * 1024)
     }
 
     private func collectSystemInfo(into stage: URL, errors: inout [String]) {
@@ -335,7 +347,7 @@ public final class DiagnosticsExporter {
 
         let body = lines.joined(separator: "\n") + "\n"
         do {
-            try body.write(to: dest, atomically: true, encoding: .utf8)
+            try writeRedacted(body, to: dest, maxBytes: 1 * 1024 * 1024)
         } catch {
             errors.append("system.txt: \(error.localizedDescription)")
         }
@@ -352,12 +364,11 @@ public final class DiagnosticsExporter {
             .map { String($0) }
     }
 
-    /// Copies the last `maxBytes` of `src` to `dest`. If the source is
-    /// smaller than the cap, the whole file is copied. Throws if the file
-    /// is missing or unreadable.
-    private func copyLastBytes(of src: URL,
-                               to dest: URL,
-                               maxBytes: UInt64) throws {
+    /// Redact a bounded complete log before staging. Omit oversized logs:
+    /// a credential label can occur arbitrarily far before a multiline value.
+    func copyRedactedLog(of src: URL,
+                                  to dest: URL,
+                                  maxBytes: UInt64) throws {
         let fm = FileManager.default
         guard fm.fileExists(atPath: src.path) else {
             throw NSError(domain: "DiagnosticsExporter",
@@ -368,25 +379,100 @@ public final class DiagnosticsExporter {
         let handle = try FileHandle(forReadingFrom: src)
         defer { try? handle.close() }
 
-        let size = (try? handle.seekToEnd()) ?? 0
-        let start: UInt64 = size > maxBytes ? size - maxBytes : 0
-        try handle.seek(toOffset: start)
-        let data = handle.readDataToEndOfFile()
-        try data.write(to: dest)
+        let size = try handle.seekToEnd()
+        guard size <= maxBytes else {
+            try writeRedacted("(content omitted: oversized log)\n", to: dest, maxBytes: Int(maxBytes))
+            return
+        }
+        try handle.seek(toOffset: 0)
+        // One extra byte detects a file that grew past the cap after seek.
+        let data = handle.readData(ofLength: Int(maxBytes) + 1)
+        guard data.count <= Int(maxBytes) else {
+            try writeRedacted("(content omitted: oversized log)\n", to: dest, maxBytes: Int(maxBytes))
+            return
+        }
+        try writeRedacted(String(decoding: data, as: UTF8.self),
+                          to: dest, maxBytes: Int(maxBytes))
     }
 
-    private struct ProcessResult {
+    func writeRedacted(_ text: String, to destination: URL,
+                       maxBytes: Int) throws {
+        let redacted = Self.redact(text)
+        let output = String(decoding: redacted.utf8.prefix(maxBytes), as: UTF8.self)
+        try output.write(to: destination, atomically: true, encoding: .utf8)
+    }
+
+    // Omit the entire artifact when a marker appears: values in JSON or logs
+    // can be on later lines and cannot be safely redacted line by line.
+    // "fingerprint": the enrollment fingerprint is a function of this Mac's
+    // secret, and the Mac accepts it as proof that a server knows that
+    // secret, so it must not reach a diagnostics zip attached to an issue.
+    private static let credentialMarkers =
+        ["password", "passwd", "secret", "token", "credential",
+         "authorization", "cookie", "api_key", "apikey",
+         "access_key", "private_key", "signature", "bearer",
+         "x-amz", "redis_url", "fingerprint", "://"]
+
+    private static func hasCredentialMarker(_ text: String) -> Bool {
+        let lowered = text.lowercased()
+        return credentialMarkers.contains(where: lowered.contains)
+    }
+
+    static func redact(_ text: String) -> String {
+        return hasCredentialMarker(text)
+            ? "(content omitted: credential-bearing content)\n" : text
+    }
+
+    private final class RequestCapture {
+        private let lock = NSLock()
+        private var data: Data?
+        private var error: Error?
+
+        func set(data: Data?, error: Error?) {
+            lock.lock()
+            self.data = data
+            self.error = error
+            lock.unlock()
+        }
+
+        func snapshot() -> (Data?, Error?) {
+            lock.lock()
+            defer { lock.unlock() }
+            return (data, error)
+        }
+    }
+
+    private final class BoundedPipeCapture {
+        private let lock = NSLock()
+        private var data = Data()
+
+        func append(_ chunk: Data) {
+            lock.lock()
+            let remaining = max(0, 1 * 1024 * 1024 - data.count)
+            data.append(chunk.prefix(remaining))
+            lock.unlock()
+        }
+
+        func snapshot() -> Data {
+            lock.lock()
+            defer { lock.unlock() }
+            return data
+        }
+    }
+
+    struct ProcessResult {
         let stdout: String
         let stderr: String
         let exitCode: Int32
     }
 
-    /// Runs a child process and returns its stdout/stderr/exit. Bounded
-    /// by `timeout` seconds — on overrun the process is killed and the
-    /// partial output is returned with exitCode = -1.
-    private func runProcess(launchPath: String,
-                            args: [String],
-                            timeout: TimeInterval) -> ProcessResult {
+    /// Runs a child process and returns its stdout/stderr/exit. On timeout
+    /// the process is killed and bounded partial output is returned with
+    /// exitCode = -1; pipe readers get a further two seconds each to finish.
+    func runProcess(launchPath: String,
+                    args: [String],
+                    timeout: TimeInterval,
+                    captureCompletion: DispatchGroup? = nil) -> ProcessResult {
         guard FileManager.default.isExecutableFile(atPath: launchPath) else {
             return ProcessResult(stdout: "",
                                  stderr: "executable not found: \(launchPath)",
@@ -413,16 +499,30 @@ public final class DiagnosticsExporter {
         // concurrently below.
         let outQueue = DispatchQueue(label: "diag.out.\(launchPath)")
         let errQueue = DispatchQueue(label: "diag.err.\(launchPath)")
-        var outData = Data()
-        var errData = Data()
+        let outData = BoundedPipeCapture()
+        let errData = BoundedPipeCapture()
         let outDone = DispatchSemaphore(value: 0)
         let errDone = DispatchSemaphore(value: 0)
+        // Optional observation lets a canary join late reader completion after
+        // the bounded result has returned; it does not extend production waits.
+        captureCompletion?.enter()
+        captureCompletion?.enter()
         outQueue.async {
-            outData = outPipe.fileHandleForReading.readDataToEndOfFile()
+            defer { captureCompletion?.leave() }
+            while true {
+                let chunk = outPipe.fileHandleForReading.readData(ofLength: 64 * 1024)
+                if chunk.isEmpty { break }
+                outData.append(chunk)
+            }
             outDone.signal()
         }
         errQueue.async {
-            errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+            defer { captureCompletion?.leave() }
+            while true {
+                let chunk = errPipe.fileHandleForReading.readData(ofLength: 64 * 1024)
+                if chunk.isEmpty { break }
+                errData.append(chunk)
+            }
             errDone.signal()
         }
 
@@ -433,22 +533,27 @@ public final class DiagnosticsExporter {
             proc.waitUntilExit()
             waitSem.signal()
         }
-        if waitSem.wait(timeout: deadline) == .timedOut {
+        var exited = waitSem.wait(timeout: deadline) == .success
+        let timedOut = !exited
+        if !exited {
             if proc.isRunning { proc.terminate() }
-            _ = waitSem.wait(timeout: .now() + 1)
-            if proc.isRunning {
+            exited = waitSem.wait(timeout: .now() + 1) == .success
+            if !exited && proc.isRunning {
                 // Last resort: SIGKILL
                 kill(proc.processIdentifier, SIGKILL)
+            }
+            if !exited {
+                exited = waitSem.wait(timeout: .now() + 1) == .success
             }
         }
         _ = outDone.wait(timeout: .now() + 2)
         _ = errDone.wait(timeout: .now() + 2)
 
-        let stdout = String(data: outData, encoding: .utf8) ?? ""
-        let stderr = String(data: errData, encoding: .utf8) ?? ""
+        let stdout = String(decoding: outData.snapshot(), as: UTF8.self)
+        let stderr = String(decoding: errData.snapshot(), as: UTF8.self)
         return ProcessResult(stdout: stdout,
                              stderr: stderr,
-                             exitCode: proc.terminationStatus)
+                             exitCode: exited && !timedOut ? proc.terminationStatus : -1)
     }
 
     private static func timestamp() -> String {

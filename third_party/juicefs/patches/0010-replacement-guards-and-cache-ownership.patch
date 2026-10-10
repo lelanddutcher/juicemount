@@ -1,0 +1,154 @@
+--- a/pkg/chunk/cached_store.go
++++ b/pkg/chunk/cached_store.go
+@@ -388,15 +388,18 @@
+ 	sync := s != nil
+ 	blen := len(block.Data)
+ 	bufSize := store.compressor.CompressBound(blen)
++	cacheable := sync && (blen < store.conf.BlockSize || store.conf.CacheLargeWrite)
+ 	var buf *Page
+-	if bufSize > blen {
++	// The asynchronous cache writer owns the original Page after publication.
++	// Compression must not change its bytes or even reslice its shared header.
++	if bufSize > blen || cacheable {
+ 		buf = NewOffPage(bufSize)
+ 	} else {
+ 		buf = block
+ 		buf.Acquire()
+ 	}
+ 	defer buf.Release()
+-	if sync && (blen < store.conf.BlockSize || store.conf.CacheLargeWrite) {
++	if cacheable {
+ 		// block will be freed after written into disk
+ 		store.bcache.cache(key, block, false, false)
+ 	}
+--- a/pkg/chunk/disk_cache.go
++++ b/pkg/chunk/disk_cache.go
+@@ -93,8 +93,8 @@
+ 	used      int64
+ 	keys      map[cacheKey]cacheItem
+ 	scanned   bool
+-	stageFull bool
+-	rawFull   bool
++	stageFull atomic.Bool
++	rawFull   atomic.Bool
+ 	eviction  string
+ 	checksum  string // checksum level
+ 	uploader  func(key, path string, force bool) bool
+@@ -331,17 +331,17 @@
+ func (cache *cacheStore) checkFreeSpace() {
+ 	for cache.available() {
+ 		usage := cache.curFreeRatio()
+-		cache.stageFull = usage.br < cache.freeRatio/2 || usage.fr < cache.freeRatio/2
+-		cache.rawFull = usage.br < cache.freeRatio || usage.fr < cache.freeRatio
+-		if cache.rawFull && cache.eviction != "none" {
++		cache.stageFull.Store(usage.br < cache.freeRatio/2 || usage.fr < cache.freeRatio/2)
++		cache.rawFull.Store(usage.br < cache.freeRatio || usage.fr < cache.freeRatio)
++		if cache.rawFull.Load() && cache.eviction != "none" {
+ 			logger.Tracef("Cleanup cache when check free space (%s): free ratio (%d%%), space usage (%d%%), inodes usage (%d%%)", cache.dir, int(cache.freeRatio*100), int(usage.br*100), int(usage.fr*100))
+ 			cache.Lock()
+ 			cache.cleanupFull()
+ 			cache.Unlock()
+ 			usage = cache.curFreeRatio()
+-			cache.rawFull = usage.br < cache.freeRatio || usage.fr < cache.freeRatio
+-		}
+-		if cache.rawFull {
++			cache.rawFull.Store(usage.br < cache.freeRatio || usage.fr < cache.freeRatio)
++		}
++		if cache.rawFull.Load() {
+ 			cache.uploadStaging()
+ 		}
+ 		time.Sleep(time.Second)
+@@ -422,7 +422,7 @@
+ 	if !cache.enabled() {
+ 		return
+ 	}
+-	if cache.rawFull && cache.eviction == "none" {
++	if cache.rawFull.Load() && cache.eviction == "none" {
+ 		logger.Debugf("Caching directory is full (%s), drop %s (%d bytes)", cache.dir, key, len(p.Data))
+ 		cache.m.cacheDrops.Add(1)
+ 		return
+@@ -752,7 +752,7 @@
+ 
+ func (cache *cacheStore) stage(key string, data []byte) (string, error) {
+ 	stagingPath := cache.stagePath(key)
+-	if cache.stageFull {
++	if cache.stageFull.Load() {
+ 		return stagingPath, errStageFull
+ 	}
+ 	if cache.maxStageWrite != 0 && stagingBlocks.Load() > int64(cache.maxStageWrite) {
+--- a/pkg/meta/redis.go
++++ b/pkg/meta/redis.go
+@@ -48,6 +48,7 @@
+ 	"github.com/dustin/go-humanize"
+ 
+ 	aclAPI "github.com/juicedata/juicefs/pkg/acl"
++	"github.com/juicedata/juicefs/pkg/replaceguard"
+ 	"github.com/juicedata/juicefs/pkg/utils"
+ 	"github.com/pkg/errors"
+ 	"github.com/redis/go-redis/v9"
+@@ -1759,7 +1760,43 @@
+ 			return err
+ 		}
+ 		typ, ino := m.parseEntry(buf)
++		var protected *replaceguard.Record
++		if m.prefix == "" {
++			// Cluster metadata keys use a hash-tag prefix, while proxy records
++			// are standalone Redis keys. Preserve ordinary cluster renames;
++			// protected enrollment is supported only on the standalone backend.
++			// Watch the candidate before reading it so concurrent ARM aborts.
++			guardKey := replaceguard.Key(uint64(ino))
++			if err := tx.Watch(ctx, guardKey).Err(); err != nil {
++				return err
++			}
++			guardBytes, guardErr := tx.Get(ctx, guardKey).Bytes()
++			if guardErr != nil && guardErr != redis.Nil {
++				return syscall.EIO
++			}
++			if guardErr == nil {
++				r, err := replaceguard.Decode(guardBytes)
++				if err != nil {
++					return syscall.EIO
++				}
++				if r.Phase == "committed" {
++					// The receipt remains keyed by the inode after publication.
++					// Refuse private stage replay, allow ordinary later moves.
++					if uint64(parentSrc) == r.Stage.Parent && nameSrc == r.Stage.Name {
++						return syscall.EIO
++					}
++				} else {
++					protected = &r
++					if err := tx.Watch(ctx, replaceguard.RequiredKeys(r)...).Err(); err != nil {
++						return err
++					}
++				}
++			}
++		}
+ 		if parentSrc == parentDst && nameSrc == nameDst {
++			if protected != nil {
++				return syscall.EIO
++			}
+ 			if inode != nil {
+ 				*inode = ino
+ 			}
+@@ -1800,6 +1837,9 @@
+ 		}
+ 		if dino > 0 {
+ 			if ino == dino {
++				if protected != nil {
++					return syscall.EIO
++				}
+ 				return errno(nil)
+ 			}
+ 			if exchange {
+@@ -1844,6 +1884,11 @@
+ 			return syscall.EPERM
+ 		}
+ 		m.parseAttr([]byte(rs[2].(string)), &iattr)
++		if protected != nil {
++			if err := m.checkProtectedRename(ctx, tx, *protected, parentSrc, nameSrc, parentDst, nameDst, flags, ino, dino, trash); err != nil {
++				return err
++			}
++		}
+ 		if (sattr.Flags&FlagAppend) != 0 || (sattr.Flags&FlagImmutable) != 0 || (dattr.Flags&FlagImmutable) != 0 || (iattr.Flags&FlagAppend) != 0 || (iattr.Flags&FlagImmutable) != 0 {
+ 			return syscall.EPERM
+ 		}

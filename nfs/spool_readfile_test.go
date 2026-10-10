@@ -236,7 +236,7 @@ func TestSpoolEntryInodeRaceFree(t *testing.T) {
 func BenchmarkOpenFileReadEmptySpool(b *testing.B) {
 	s := newTestSpoolStoreForBench(b, 0)
 	h := minimalHandlerForTest()
-	h.spool = s
+	h.spool.Store(s)
 	jfs := &juiceFS{handler: h}
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -244,7 +244,7 @@ func BenchmarkOpenFileReadEmptySpool(b *testing.B) {
 		// return nil immediately (the call returns ErrNotExist via
 		// downstream lookups but the bench is measuring only the
 		// spool tier's cost since the handler is otherwise un-wired).
-		jfs.handler.spool.LookupActive("/not/in/spool/long-ish/path.mov")
+		jfs.handler.spool.Load().LookupActive("/not/in/spool/long-ish/path.mov")
 	}
 }
 

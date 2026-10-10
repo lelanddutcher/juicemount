@@ -288,7 +288,7 @@ func classifyFUSE(ok bool, reason string) diagnoseCheck {
 	c.Status = diagStatusFail
 	c.Detail = reason
 	if strings.Contains(reason, "wedged") || strings.Contains(reason, "timed out") {
-		c.Remedy = "The FUSE mount is wedged. Use \"Force Eject Mount\" in the menu, then Stop everything and Start. In-flight writes are parked safely until the mount is real again."
+		c.Remedy = "The FUSE mount is wedged. Use \"Stop mount and finish sync\", then Start. If it is still stuck, quit JuiceMount and restart the Mac: JuiceMount cannot safely eject a stuck volume until its unmount helper is installed. In-flight writes are parked safely until the mount is real again."
 	} else {
 		c.Remedy = "The mountpoint has no filesystem (macFUSE not loaded or the mount is gone). Approve macFUSE under System Settings > Privacy & Security if prompted, then Stop everything and Start. Writes are parked — nothing is uploading to the wrong place."
 	}
@@ -510,11 +510,39 @@ func diagnoseLinkRTTCheck(ctx context.Context, backendAddr string) diagnoseCheck
 			Detail: "backend address unknown — cannot measure",
 		}
 	}
+	// JuiceMount Link rewrites Redis to an adaptive loopback proxy. Timing a
+	// TCP handshake to that listener measures only this process (typically
+	// ~0.2 ms), not the encrypted path to the NAS. Use the end-to-end sample
+	// already collected by the authenticated Redis probe instead; when cold
+	// bootstrap never reached the control plane there is intentionally no
+	// sample, so say that instead of falsely claiming a LAN-class link.
+	if backendAddrIsLoopback(backendAddr) {
+		return classifyAdaptiveProxyRTT(netprofile.Default().Snapshot())
+	}
 	rtt, err := diagnoseDial(ctx, backendAddr, diagnoseDialTimeout)
 	if err == nil {
 		netprofile.Default().ObserveRTT(rtt)
 	}
 	return classifyLinkRTT(rtt, err, netprofile.Default().Snapshot())
+}
+
+func classifyAdaptiveProxyRTT(snap netprofile.Snapshot) diagnoseCheck {
+	if !snap.HaveRTT {
+		return diagnoseCheck{
+			ID:     diagIDLinkRTT,
+			Title:  "Link latency",
+			Status: diagStatusWarn,
+			Detail: "adaptive Link proxy is local, but no end-to-end NAS latency sample is available — Link may still be starting or its remote control URL may be unreachable",
+			Remedy: "Check Link status and confirm its public HTTPS server URL is reachable from this network.",
+		}
+	}
+	return classifyLinkRTT(snap.RTT, nil, snap)
+}
+
+func backendAddrIsLoopback(addr string) bool {
+	host := diagnoseHostOnly(addr)
+	ip := net.ParseIP(strings.Trim(host, "[]"))
+	return ip != nil && ip.IsLoopback()
 }
 
 // backendAddrFromRedisURL resolves the configured Redis URL to the backend

@@ -23,6 +23,7 @@ package health
 
 import (
 	"context"
+	"io"
 	"net"
 	"os"
 	"strconv"
@@ -35,10 +36,16 @@ import (
 
 // ReachabilityCallback is invoked whenever the monitor's reachable
 // state transitions. `reachable` is the new state; `reason` is a
-// human-readable explanation suitable for logging or UI. Callbacks
-// fire from the monitor's polling goroutine; they MUST NOT block —
-// dispatch to your own goroutine if needed.
+// human-readable explanation suitable for logging or UI. Callbacks fire in
+// transition order from a dedicated dispatcher (never the probe loop); they
+// still MUST NOT block, because one callback delays later state delivery.
 type ReachabilityCallback func(reachable bool, reason string)
+
+type reachabilityTransition struct {
+	reachable bool
+	reason    string
+	callbacks []ReachabilityCallback
+}
 
 // dialer is the interface segment of net.Dialer that we need. Pulled
 // out so tests can inject a fake without touching real sockets.
@@ -46,10 +53,21 @@ type dialer interface {
 	DialContext(ctx context.Context, network, address string) (net.Conn, error)
 }
 
+// DialContextFunc adapts a function to the reachability dialer contract. Link
+// uses this to make probes traverse its userspace encrypted route instead of
+// probing the loopback proxy listener (which is reachable even when the far
+// side is not).
+type DialContextFunc func(context.Context, string, string) (net.Conn, error)
+
+func (f DialContextFunc) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	return f(ctx, network, address)
+}
+
 // Reachability monitors whether a backend host:port is reachable from
 // this machine. Concurrent-safe; one instance per app process.
 type Reachability struct {
 	target         string
+	remoteProbe    func(context.Context) (time.Duration, error)
 	dialTimeout    time.Duration // FLOOR for the per-probe TCP dial timeout
 	baseInterval   time.Duration // FLOOR for the probe cadence
 	maxDialTimeout time.Duration // ceiling for the adaptive dial timeout
@@ -116,9 +134,16 @@ type Reachability struct {
 	callbacks   []ReachabilityCallback
 
 	triggerCh chan struct{}
-	stopCh    chan struct{}
-	stopOnce  sync.Once
-	running   atomic.Bool
+	// transitionCh keeps state notifications ordered without letting a slow
+	// callback park the probe loop. The old "go cb" fan-out could deliver a
+	// later online transition before an earlier offline transition, leaving UI
+	// and auto-offline consumers in a stale state even though Reachable() was
+	// correct. Transitions are rare; a modest buffer absorbs normal callback
+	// latency, and overflow coalesces toward the newest truthful state.
+	transitionCh chan reachabilityTransition
+	stopCh       chan struct{}
+	stopOnce     sync.Once
+	running      atomic.Bool
 }
 
 // ReachabilityOption customizes monitor behavior. Defaults are tuned
@@ -155,11 +180,42 @@ func withDialer(d dialer) ReachabilityOption {
 	return func(r *Reachability) { r.dialer = d }
 }
 
+// WithDialContext routes probes through fn. A successful result must still
+// answer the Redis protocol-level PING performed by probe(), so a connected
+// local listener alone can never be mistaken for backend readiness.
+func WithDialContext(fn func(context.Context, string, string) (net.Conn, error)) ReachabilityOption {
+	return func(r *Reachability) {
+		if fn != nil {
+			r.dialer = DialContextFunc(fn)
+		}
+	}
+}
+
+// WithProbe keeps the regular adaptive reachability state machine while a
+// surviving owner performs the actual backend RESP PING. A successful return
+// must be protocol-level proof, never a local proxy TCP connect.
+func WithProbe(fn func(context.Context) (time.Duration, error)) ReachabilityOption {
+	return func(r *Reachability) { r.remoteProbe = fn }
+}
+
 // WithRTTObserver registers a callback invoked with the dial latency of every
 // SUCCESSFUL probe. Used to feed the network-profile link estimator. The
 // callback runs on the probe-loop goroutine and MUST NOT block.
 func WithRTTObserver(fn func(time.Duration)) ReachabilityOption {
 	return func(r *Reachability) { r.rttObserver = fn }
+}
+
+// WithInitialRTT seeds the adaptive timeout from a bounded startup probe. The
+// reachability probe performs a TCP handshake plus a Redis protocol PING, so a
+// fixed 1s cold budget cannot obtain its first successful sample on an 800ms
+// path. Reusing the already-measured handshake RTT avoids that bootstrap loop;
+// normal LAN starts still clamp to the unchanged 1s floor.
+func WithInitialRTT(sample time.Duration) ReachabilityOption {
+	return func(r *Reachability) {
+		if sample > 0 {
+			r.observeRTT(sample)
+		}
+	}
 }
 
 // WithLivenessHook registers a hook returning the elapsed time since the
@@ -197,6 +253,7 @@ func NewReachability(target string, opts ...ReachabilityOption) *Reachability {
 		livenessOverride: true, // drain-liveness false-flap suppression (kill: JM_REACH_DRAIN_LIVENESS=0)
 		dialer:           &net.Dialer{},
 		triggerCh:        make(chan struct{}, 1),
+		transitionCh:     make(chan reachabilityTransition, 16),
 		stopCh:           make(chan struct{}),
 	}
 	for _, opt := range opts {
@@ -285,6 +342,7 @@ func (r *Reachability) Start() {
 	if !r.running.CompareAndSwap(false, true) {
 		return
 	}
+	go r.dispatchTransitions()
 	go r.loop()
 }
 
@@ -364,6 +422,44 @@ func (r *Reachability) loop() {
 	}
 }
 
+// dispatchTransitions invokes callbacks serially in transition order. It is a
+// separate goroutine so callbacks cannot delay probes. A callback that violates
+// its non-blocking contract can still park only this dispatcher, never network
+// detection itself; enqueue overflow is coalesced to the newest state below.
+func (r *Reachability) dispatchTransitions() {
+	for {
+		select {
+		case <-r.stopCh:
+			return
+		case evt := <-r.transitionCh:
+			for _, cb := range evt.callbacks {
+				cb(evt.reachable, evt.reason)
+			}
+		}
+	}
+}
+
+func (r *Reachability) enqueueTransition(evt reachabilityTransition) {
+	select {
+	case r.transitionCh <- evt:
+		return
+	default:
+	}
+
+	// A callback has violated the non-blocking contract long enough to fill the
+	// queue. Drop one stale transition and retain the newest state; consumers
+	// may miss an intermediate flap but cannot be left permanently behind the
+	// monitor's current truth.
+	select {
+	case <-r.transitionCh:
+	default:
+	}
+	select {
+	case r.transitionCh <- evt:
+	default:
+	}
+}
+
 // probeAndUpdate runs one probe and applies the result to the state
 // machine. Fires callbacks on transition.
 func (r *Reachability) probeAndUpdate() {
@@ -377,17 +473,81 @@ func (r *Reachability) probeAndUpdate() {
 func (r *Reachability) probe() bool {
 	ctx, cancel := context.WithTimeout(context.Background(), r.effectiveDialTimeout())
 	defer cancel()
+	if r.remoteProbe != nil {
+		rtt, err := r.remoteProbe(ctx)
+		if err != nil || ctx.Err() != nil || rtt <= 0 {
+			return false
+		}
+		r.observeRTT(rtt)
+		if r.rttObserver != nil {
+			r.rttObserver(rtt)
+		}
+		return true
+	}
 	start := time.Now()
 	conn, err := r.dialer.DialContext(ctx, "tcp", r.target)
 	if err != nil {
 		return false
 	}
+	defer conn.Close()
 	rtt := time.Since(start)
+
+	// A COMPLETED TCP HANDSHAKE IS NOT PROOF THE BACKEND IS THERE.
+	//
+	// This probe used to return true right here, and that produced the single
+	// worst state this app can be in. Observed live on 2026-07-29 from an
+	// iPhone hotspot, where the NAS (a 192.168.0.x LAN address) is genuinely
+	// unroutable:
+	//
+	//	05:27:03  backend unreachable for sustained window — engaging offline mode
+	//	08:43:15  network path lost … i/o timeout
+	//	08:44:50  reachability transition → REACHABLE "probe succeeded"   <-- FALSE
+	//	08:44:50  network path to backend recovered → SetAutoOffline(false)
+	//
+	// while a real Redis PING to that same address timed out and ping(8) showed
+	// 100% packet loss. Carrier NAT, captive portals and other middleboxes
+	// routinely answer the SYN for an address they cannot actually route to, so
+	// the dial "succeeds" against the middlebox rather than the backend.
+	//
+	// Lifting auto-offline on that false signal leaves the app ONLINE WITH A
+	// DEAD BACKEND — strictly worse than either honest state. Navigation still
+	// feels fine because the mirror serves it (measured 25ms), but the FIRST
+	// open of each file walks the full timeout stack before falling back to
+	// locally cached blocks: measured 1,527ms / 6,250ms / 28,150ms for 32 KB,
+	// against 24-36ms for every subsequent read of the same file. That is
+	// exactly the reported symptom — "offline mode is amazing, but with offline
+	// mode disabled performance is absolute trash and even my pinned files
+	// struggle" — because the bytes ARE local and we pay the network anyway.
+	//
+	// So require a PROTOCOL-LEVEL answer. Any RESP reply proves a real Redis is
+	// on the other end: "+PONG" normally, and "-NOAUTH ..." when the server
+	// wants AUTH — an error reply is still proof of life, and this probe is a
+	// liveness check, not an auth check. A middlebox that accepted the
+	// connection will send nothing and hit the deadline.
+	if dl, ok := ctx.Deadline(); ok {
+		_ = conn.SetDeadline(dl)
+	}
+	if _, err := conn.Write([]byte("PING\r\n")); err != nil {
+		return false
+	}
+	var buf [1]byte
+	if _, err := io.ReadFull(conn, buf[:]); err != nil {
+		return false
+	}
+	switch buf[0] {
+	case '+', '-', ':', '$', '*': // any RESP type == a real server answered
+	default:
+		return false
+	}
+
+	// RTT is measured across dial+PING now, which is the more honest number:
+	// it is what an actual metadata round trip costs, and it feeds the adaptive
+	// dial timeout and the netprofile RTT estimate.
+	rtt = time.Since(start)
 	r.observeRTT(rtt)
 	if r.rttObserver != nil {
 		r.rttObserver(rtt)
 	}
-	_ = conn.Close()
 	return true
 }
 
@@ -476,14 +636,18 @@ func (r *Reachability) applyResult(ok bool) {
 		// this probe loop indefinitely and prevent recovery transitions
 		// from ever firing. That is exactly the failure mode QA-15
 		// documented: 15 min stuck unreachable while external probes to
-		// the same target succeed. Wrapping each callback in `go` ensures
-		// a hung callback is at most a leaked goroutine — the probe loop
-		// itself stays alive and keeps observing real state.
+		// the same target succeed. The separate dispatcher contains a hung
+		// callback away from the probe loop, which stays alive and keeps
+		// observing real state.
 		//
-		// Transitions are infrequent (only on actual state change, not on
-		// every probe), so unbounded `go` is bounded in practice.
-		for _, cb := range callbacks {
-			go cb(newState, reason)
-		}
+		// The dedicated dispatcher preserves transition order. The earlier
+		// per-callback goroutines allowed recovery=true to run before the prior
+		// offline=false callback, which could leave auto-offline re-engaged while
+		// Reachable() already reported healthy.
+		r.enqueueTransition(reachabilityTransition{
+			reachable: newState,
+			reason:    reason,
+			callbacks: callbacks,
+		})
 	}
 }

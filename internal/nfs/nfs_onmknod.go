@@ -88,10 +88,10 @@ func onMknod(ctx context.Context, w *response, userHandle Handler) error {
 
 		err = cu.Mknod(newFilePath, uint32(attrs.Mode(parent.Mode())), specData1, specData2)
 		if err != nil {
-			return &NFSStatusError{NFSStatusAccess, err}
+			return writeRefusalStatus(err, NFSStatusAccess)
 		}
 		if err = attrs.Apply(cu, fs, newFilePath); err != nil {
-			return &NFSStatusError{NFSStatusServerFault, err}
+			return writeRefusalStatus(err, NFSStatusServerFault)
 		}
 
 	case FTYPE_NF3SOCK:
@@ -101,10 +101,10 @@ func onMknod(ctx context.Context, w *response, userHandle Handler) error {
 			return &NFSStatusError{NFSStatusInval, err}
 		}
 		if err := cu.Socket(newFilePath); err != nil {
-			return &NFSStatusError{NFSStatusAccess, err}
+			return writeRefusalStatus(err, NFSStatusAccess)
 		}
 		if err = attrs.Apply(cu, fs, newFilePath); err != nil {
-			return &NFSStatusError{NFSStatusServerFault, err}
+			return writeRefusalStatus(err, NFSStatusServerFault)
 		}
 
 	case FTYPE_NF3FIFO:
@@ -115,10 +115,10 @@ func onMknod(ctx context.Context, w *response, userHandle Handler) error {
 		}
 		err = cu.Mkfifo(newFilePath, uint32(attrs.Mode(parent.Mode())))
 		if err != nil {
-			return &NFSStatusError{NFSStatusAccess, err}
+			return writeRefusalStatus(err, NFSStatusAccess)
 		}
 		if err = attrs.Apply(cu, fs, newFilePath); err != nil {
-			return &NFSStatusError{NFSStatusServerFault, err}
+			return writeRefusalStatus(err, NFSStatusServerFault)
 		}
 
 	default:

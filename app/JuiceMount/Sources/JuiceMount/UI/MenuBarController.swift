@@ -13,17 +13,13 @@ final class MenuBarController: NSObject {
     private let statusItem: NSStatusItem
     private let popover: NSPopover
 
-    /// Sparkle auto-updater. #87: constructed with `startingUpdater: false`
-    /// so nothing touches the network during the launch critical path — a
-    /// cold Sparkle feed fetch at launch competed with the core start and
-    /// worsened the first-launch hang. `startUpdater()` is called ~12 s after
-    /// launch (once the core is up) to kick off the background check loop
-    /// (SUEnableAutomaticChecks / SUScheduledCheckInterval in Info.plist drive
-    /// the cadence). Feed URL + EdDSA public key also come from Info.plist, so
-    /// no programmatic configuration is needed here. Retained for the process
-    /// lifetime via this controller (which the AppDelegate owns) so the
-    /// scheduled checks keep running.
-    private let updaterController: SPUStandardUpdaterController
+    /// Sparkle updater. It is deliberately not started at launch: JuiceMount's
+    /// privacy contract forbids silent update checks. The explicit "Check for
+    /// Updates…" action starts it immediately before the user-requested check.
+    /// Feed URL + EdDSA public key come from Info.plist. Retained for the
+    /// process lifetime via this controller (which the AppDelegate owns).
+    private let updaterController: SPUStandardUpdaterController?
+    private var updaterStarted = false
 
     private var searchWindow: NSWindow?
     private var preferencesWindow: NSWindow?
@@ -41,14 +37,14 @@ final class MenuBarController: NSObject {
 
         // Construct the Sparkle updater before super.init so it's a fully
         // initialized stored property. No custom delegate/driver — Info.plist
-        // carries the feed URL, public key, and check schedule.
-        // #87: startingUpdater:false keeps Sparkle off the launch critical
-        // path; startUpdater() is invoked below, deferred past the core start.
-        self.updaterController = SPUStandardUpdaterController(
+        // carries the feed URL and public key. startingUpdater:false is both a
+        // launch-performance guard and the enforcement point for manual-only
+        // update checks.
+        self.updaterController = AppIsolation.active == nil ? SPUStandardUpdaterController(
             startingUpdater: false,
             updaterDelegate: nil,
             userDriverDelegate: nil
-        )
+        ) : nil
 
         super.init()
 
@@ -58,13 +54,6 @@ final class MenuBarController: NSObject {
         // Re-render the icon whenever server state changes
         startStateObservation()
 
-        // #87: kick off Sparkle's background update loop only AFTER the core
-        // is up (~12 s), so no Sparkle feed fetch happens in the launch window.
-        // startUpdater() invokes -[SPUUpdater startUpdater:]; the scheduled
-        // checks then run on the Info.plist cadence.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 12) { [weak self] in
-            self?.updaterController.startUpdater()
-        }
     }
 
     deinit {
@@ -102,10 +91,15 @@ final class MenuBarController: NSObject {
     /// drive the check so the progress/no-update/update sheets are visible
     /// and key.
     func checkForUpdates() {
+        guard let updaterController else { return }
         if popover.isShown {
             popover.performClose(nil)
         }
         NSApp.activate(ignoringOtherApps: true)
+        if !updaterStarted {
+            updaterController.startUpdater()
+            updaterStarted = true
+        }
         updaterController.checkForUpdates(nil)
     }
 
@@ -164,6 +158,9 @@ final class MenuBarController: NSObject {
             )
             image?.accessibilityDescription = accessibilityLabel(for: glance, uploads: uploads)
             button.image = image
+            // F2: the tooltip must tell the truth in BOTH rendering paths —
+            // the legacy SF-Symbol fallback previously had no tooltip at all.
+            button.toolTip = accessibilityLabel(for: glance, uploads: uploads)
         }
     }
 
@@ -194,12 +191,21 @@ final class MenuBarController: NSObject {
         var label: String
         if glance == .degraded, case .degraded(let reason) = server.state {
             label = "JuiceMount: Degraded — \(reason)"
+        } else if case .starting = server.state {
+            // F2 honest tooltip: while starting we have NOT yet confirmed
+            // bridge health — say exactly that instead of implying readiness.
+            label = "JuiceMount: Starting — waiting for first health check"
         } else {
             label = "JuiceMount: \(server.glanceLabel)"
         }
-        if uploads, let sp = server.spoolStatus {
+        if let sp = server.spoolStatus {
             let n = sp.pendingFiles + Int(sp.inProgress)
-            label += " · uploading \(n) file\(n == 1 ? "" : "s")"
+            if uploads {
+                label += " · uploading \(n) file\(n == 1 ? "" : "s")"
+            }
+            if sp.pendingSymlinks > 0 {
+                label += " · \(sp.pendingSymlinks) link\(sp.pendingSymlinks == 1 ? "" : "s") pending"
+            }
         }
         return label
     }
@@ -431,10 +437,27 @@ final class MenuBarController: NSObject {
                 break // already starting/running — nothing to do
             }
         }
-        let hosting = NSHostingController(rootView: view)
-        let window = NSWindow(contentViewController: hosting)
+        // Same shape as the Preferences window, for the same reason: a window
+        // whose size is derived from an NSHostingController re-enters SwiftUI's
+        // preferredContentSize getter during AppKit's constraint pass, and any
+        // content whose ideal height moves can then trip the 141-iteration
+        // display-cycle limit and abort the process. This window's height DOES
+        // move -- the preflight rows change as each check resolves. Converted
+        // pre-emptively on 2026-08-18 alongside the Preferences fix rather than
+        // waiting for it to crash in front of a first-run user, which is the
+        // worst possible audience for it.
+        let hosting = NSHostingView(rootView: view)
+        let contentRect = NSRect(x: 0, y: 0, width: 620, height: 600)
+        hosting.frame = contentRect
+        let window = NSWindow(
+            contentRect: contentRect,
+            styleMask: [.titled, .closable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        window.contentView = hosting
         window.title = "JuiceMount Setup"
-        window.styleMask = [.titled, .closable]
+        window.minSize = NSSize(width: 560, height: 420)
         window.center()
         window.isReleasedWhenClosed = false
         window.delegate = self
@@ -451,15 +474,57 @@ final class MenuBarController: NSObject {
             return
         }
         let view = PreferencesWindowView(preferences: server.preferences, server: server)
-        let hosting = NSHostingController(rootView: view)
-        // Phase 3b: track the SwiftUI ideal size so the window hugs each
-        // tab's content (the view declares a fixed 600 pt width and a
-        // per-tab height). No manual setContentSize — that fought the
-        // content and left either clipped controls or dead space.
-        hosting.sizingOptions = .preferredContentSize
-        let window = NSWindow(contentViewController: hosting)
+
+        // NSHostingView, NOT NSHostingController — and the window is built
+        // from a contentRect rather than from a view controller. That is the
+        // whole fix; it is not a style preference.
+        //
+        // AppKit's own -[NSViewController updateViewConstraints] reads the
+        // controller's preferredContentSize while it is updating constraints.
+        // On NSHostingController that getter is not a passive read: it runs
+        // SwiftUI's sizeThatFits, which calls ViewGraph.setProposedSize, which
+        // calls graphDidChange, which calls setNeedsUpdateConstraints: on the
+        // hosting view -- back into the pass that is already running:
+        //
+        //   -[NSViewController updateViewConstraints]
+        //     -> NSHostingController.preferredContentSize.getter
+        //       -> ViewGraph.setProposedSize -> graphDidChange
+        //         -> NSHostingView.setNeedsUpdateConstraints:
+        //           -> -[NSWindow _postWindowNeedsUpdateConstraints] -> throw
+        //
+        // AppKit allows 141 of those per display cycle and then raises, which
+        // +[NSApplication _crashOnException:] turns into SIGTRAP. It killed the
+        // app again on 2026-08-18 at 10:36:56 in a build that ALREADY had the
+        // earlier fix (ea1c473) -- because that fix removed one DRIVER (a
+        // hand-maintained height that changed with the disclosure carets) while
+        // leaving the reentrant path itself in place. Anything that still moves
+        // the content's ideal height re-arms it, and two things do: the
+        // "Advanced addresses" and "Use a custom location instead" disclosure
+        // groups, and the polled spool counters whose footer text reflows.
+        //
+        // Dropping sizingOptions is NOT sufficient, because the getter is
+        // called by AppKit whether or not we opted into content sizing. With no
+        // view controller in the window there is no updateViewConstraints to
+        // call it from, so the cycle cannot start. The window owns its size;
+        // the content fills it. One authority, no feedback edge.
+        //
+        // Each tab is a .formStyle(.grouped) Form, which scrolls on macOS, so a
+        // tab taller than the window scrolls instead of clipping -- which is
+        // what made a fixed size unacceptable before.
+        let hosting = NSHostingView(rootView: view)
+        let contentRect = NSRect(x: 0, y: 0, width: 620, height: 640)
+        hosting.frame = contentRect
+        let window = NSWindow(
+            contentRect: contentRect,
+            styleMask: [.titled, .closable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        window.contentView = hosting
         window.title = "JuiceMount Preferences"
-        window.styleMask = [.titled, .closable]
+        // A floor, so the grouped forms never get squeezed to the point their
+        // labels truncate; the ceiling is the screen.
+        window.minSize = NSSize(width: 560, height: 420)
         window.center()
         window.isReleasedWhenClosed = false
         window.delegate = self

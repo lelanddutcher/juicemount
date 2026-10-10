@@ -5,7 +5,6 @@ import (
 	"io/fs"
 	"os"
 	"sync"
-	"time"
 )
 
 // SQLite-direct serve path (serving-layer-decision.md §Item 1 + §Item 2).
@@ -54,7 +53,7 @@ func readdirPaginatedEnabled() bool {
 // row scanned here is byte-for-byte the Entry that rebuildCaches builds from the
 // same row — this is what makes the SQLite path a true parity substitute for the
 // RAM maps (LocalOnly, high-bit inode reinterpret, ModeDir OR-in, mtime).
-const serveColumns = `path, name, parent_path, is_dir, size, mtime, inode, mode, local_only`
+const serveColumns = `path, name, parent_path, is_dir, size, mtime, inode, mode, local_only, incarnation, revision, mtime_nsec`
 
 type serveStmts struct {
 	once        sync.Once
@@ -114,6 +113,7 @@ func (s *Store) initServeStmts() error {
 type scanScratch struct {
 	isDir     int
 	mtimeUnix int64
+	mtimeNsec sql.NullInt64
 	inodeRaw  int64
 	mode      uint32
 	localOnly int
@@ -133,17 +133,20 @@ func scanEntryPooled(rows *sql.Rows) (*Entry, error) {
 	if err := rows.Scan(
 		&e.Path, &e.Name, &e.ParentPath,
 		&sc.isDir, &e.Size, &sc.mtimeUnix, &sc.inodeRaw, &sc.mode, &sc.localOnly,
+		&e.Version.Incarnation, &e.Version.Revision, &sc.mtimeNsec,
 	); err != nil {
 		return nil, err
 	}
 	e.Inode = uint64(sc.inodeRaw) // reinterpret bits — negative int64 → high-bit uint64
 	e.IsDir = sc.isDir != 0
-	e.Mtime = time.Unix(sc.mtimeUnix, 0)
+	e.restoreMtime(sc.mtimeUnix, sc.mtimeNsec)
 	e.Mode = fs.FileMode(sc.mode)
 	if e.IsDir {
 		e.Mode |= fs.ModeDir
 	}
 	e.LocalOnly = sc.localOnly != 0
+	e.Version.Path = e.Path
+	e.prepareGetAttrCache()
 	return e, nil
 }
 
@@ -252,5 +255,23 @@ func (s *Store) ListChildrenForReadDir(parentPath string) ([]*Entry, error) {
 		// lookup substrate.
 		return s.listChildrenSQLite(parentPath)
 	}
-	return s.listChildrenRAM(parentPath)
+	if s.cacheEvicted.Load() && durableServeFallbackEnabled() {
+		// RAM eviction removes file rows from childrenIdx as well as the point
+		// lookup maps. SQLite is the complete local metadata mirror, so use it
+		// for READDIR after the first eviction instead of exposing a plausible
+		// but incomplete directory. This reads metadata only; it never opens or
+		// downloads file content.
+		return s.listChildrenSQLite(parentPath)
+	}
+	if s.readDirAfterCacheCheckHook != nil {
+		s.readDirAfterCacheCheckHook()
+	}
+	children, err := s.listChildrenRAM(parentPath)
+	// Eviction may have started after the first flag load but before the RAM
+	// snapshot acquired mu. The flag is monotonic and is set before any removal,
+	// so this second check covers that window without holding mu across SQL.
+	if s.cacheEvicted.Load() && durableServeFallbackEnabled() {
+		return s.listChildrenSQLite(parentPath)
+	}
+	return children, err
 }

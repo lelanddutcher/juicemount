@@ -3,10 +3,18 @@
 # under .juicemount/derivatives), then run the generators over a target path.
 #
 # Env:
-#   JM_META           redis URL for the volume metadata   (required)
+#   JM_META           redis URL for the volume metadata   (required). Since
+#                      H-8B: redis://farm@respproxy:6379/1, the farm
+#                      principal on the RESP proxy, user@host only.
+#   JM_META_PASSWORD  that principal's secret. Both juicefs and jmfarm get it
+#                      through META_PASSWORD, never argv, never a log line. A
+#                      password inline in JM_META still works (it is split out).
 #   JM_FARM_TARGET     path UNDER the volume to process    (default: whole volume)
 #   JM_FARM_DB         server-side derivatives index path  (default: /state/derivatives.db)
 #   JM_FARM_PRODUCER   producer tag stamped on rows        (default: linux-farm)
+#                      The producer generation is compiled from the exact release
+#                      commit. Do not pin -version in deployment configuration:
+#                      a new build must retry failures cached by an older build.
 #   JM_FARM_MODEL      ggml whisper model: a PATH (baked default) or a bare model
 #                      NAME (e.g. "large-v3") fetched into /state/models on first
 #                      use — so the manager can switch models without a rebuild.
@@ -24,9 +32,27 @@
 #                      it heartbeats + BRPOPs jobs forever (exit on SIGTERM). All the
 #                      one-shot env above still supplies the per-job run defaults a
 #                      job's options override (CRF/preset/model/vcodec/workers).
+#   JM_FARM_CACHE_DIR  persistent local JuiceFS cache path (default: /jfs-cache)
+#   JM_FARM_CACHE_SIZE cache budget in MiB (default: 20000)
+#   JM_FARM_ENCODE_SCRATCH node-local MP4 encode/faststart scratch (default: /tmp).
+#                      NEVER place this under /jfs: completed MP4 bytes cross the
+#                      JuiceFS mount exactly once after ffmpeg closes the file.
+#   JM_FARM_FREE_SPACE_RATIO minimum host-disk reserve before cache writes stop
+#                      (default: 0.05; JuiceFS default 0.10 disabled the GPU
+#                      cache on the RC node while 12 GiB was still available)
 set -eu
 
-: "${JM_META:?JM_META (redis://redis:6379/1) is required}"
+: "${JM_META:?JM_META (redis://farm@respproxy:6379/1) is required}"
+# meta_redacted prints JM_META with any password replaced by ***.
+meta_redacted() { printf '%s' "$1" | sed -E 's#^(rediss?://[^:@/]*):[^@/]*@#\1:***@#'; }
+# The juicefs mount gets the URL without its password and the password via
+# META_PASSWORD (juicefs reads it when the URL has none), so the secret is
+# not in the mount process's argv for its whole lifetime.
+META_PW="$(printf '%s' "$JM_META" | sed -nE 's#^rediss?://[^:@/]*:([^@/]*)@.*#\1#p')"
+[ -n "$META_PW" ] || META_PW="${JM_META_PASSWORD:-}"
+unset JM_META_PASSWORD
+META_NOPW="$(printf '%s' "$JM_META" | sed -E 's#^(rediss?://[^:@/]*):[^@/]*@#\1@#')"
+META_LOG="$(meta_redacted "$JM_META")"
 MNT=/jfs
 TARGET="${JM_FARM_TARGET:-$MNT}"
 DB="${JM_FARM_DB:-/state/derivatives.db}"
@@ -51,6 +77,10 @@ PRESET="${JM_FARM_PRESET:-slow}"
 # the cheap passes so a full sweep can't saturate the NAS (manager governor sets it).
 PROXY_WORKERS="${JM_FARM_PROXY_WORKERS:-2}"
 STATUS="${JM_FARM_STATUS:-/state/farm-status.json}"
+CACHE_DIR="${JM_FARM_CACHE_DIR:-/jfs-cache}"
+CACHE_SIZE="${JM_FARM_CACHE_SIZE:-20000}"
+ENCODE_SCRATCH="${JM_FARM_ENCODE_SCRATCH:-/tmp}"
+CACHE_FREE_RATIO="${JM_FARM_FREE_SPACE_RATIO:-0.05}"
 # Yield CPU + IO to interactive load so a sweep never starves the live mount.
 # JM_FARM_NICE: niceness 0-19 (higher = nicer). JM_FARM_IONICE: best-effort IO
 # class 3=idle; set empty to disable. Both are guarded by command -v.
@@ -81,8 +111,16 @@ MODEL=$(resolve_model)
 
 # Own FUSE mount of the same volume — JuiceFS supports many concurrent mounts,
 # so this does NOT disturb the Mac client or the server's juicefs container.
-echo "[juicefarm] mounting $JM_META → $MNT"
-juicefs mount --cache-dir /jfs-cache --cache-size 20000 --backup-meta 0 "$JM_META" "$MNT" &
+echo "[juicefarm] mounting $META_LOG → $MNT"
+mkdir -p "$CACHE_DIR"
+# --no-bgjob: the farm principal is not the volume's background-job owner
+# (the server's `bg` mount is); the H-8B proxy refuses the cleanup jobs'
+# writes from any other principal.
+if [ -n "$META_PW" ]; then
+  META_PASSWORD="$META_PW" juicefs mount --no-bgjob --cache-dir "$CACHE_DIR" --cache-size "$CACHE_SIZE" --free-space-ratio "$CACHE_FREE_RATIO" --backup-meta 0 "$META_NOPW" "$MNT" &
+else
+  juicefs mount --no-bgjob --cache-dir "$CACHE_DIR" --cache-size "$CACHE_SIZE" --free-space-ratio "$CACHE_FREE_RATIO" --backup-meta 0 "$JM_META" "$MNT" &
+fi
 i=0; until mountpoint -q "$MNT"; do i=$((i+1)); [ "$i" -gt 60 ] && { echo "[juicefarm] mount timeout" >&2; exit 1; }; sleep 1; done
 echo "[juicefarm] mounted; target=$TARGET mode=$MODE producer=$PRODUCER"
 
@@ -101,7 +139,7 @@ do_pass() {
   ion="${IONICE:-0}"
   # shellcheck disable=SC2086
   $wrap jmfarm -mount "$MNT" -db "$DB" -producer "$PRODUCER" -concurrency "$WORKERS" -ffmpeg-threads "$FFMPEG_THREADS" -status "$STATUS" \
-    -nice "$NICE" -ionice "$ion" -interval "$INTERVAL" "$@" -root "$TARGET" || true
+    -nice "$NICE" -ionice "$ion" -interval "$INTERVAL" -encode-scratch "$ENCODE_SCRATCH" "$@" -root "$TARGET" || true
 }
 
 run_sweep() {
@@ -127,12 +165,19 @@ if [ "${JM_FARM_QUEUE:-0}" = "1" ] || [ "$MODE" = "queue" ]; then
   wrap=""
   command -v nice >/dev/null 2>&1 && wrap="nice -n $NICE"
   if [ -n "$IONICE" ] && command -v ionice >/dev/null 2>&1; then wrap="ionice -c $IONICE $wrap"; fi
-  echo "[juicefarm] queue mode: draining $JM_META (nice=$NICE ionice=${IONICE:-off})"
+  # FARM-NODE-CONFIG: -name gives the node a stable identity for per-node
+  # overrides from the manager; -kinds declares which dedicated queue(s) this
+  # worker drains (empty/all = every shipped kind + catch-all); -transcript-device selects whisper's
+  # compute backend (cpu|vulkan|cuda|sycl — vulkan on Intel Arc).
+  echo "[juicefarm] queue mode: draining $META_LOG (nice=$NICE ionice=${IONICE:-off} name=${JM_WORKER_NAME:-unset} kinds=${JM_FARM_KINDS:-all} device=${JM_FARM_TRANSCRIPT_DEVICE:-cpu})"
   # shellcheck disable=SC2086
-  exec $wrap jmfarm -queue -meta "$JM_META" -mount "$MNT" -db "$DB" -producer "$PRODUCER" \
+  # The secret reaches jmfarm as META_PASSWORD (cmd/jmfarm), not in -meta.
+  [ -n "$META_PW" ] && export META_PASSWORD="$META_PW"
+  exec $wrap jmfarm -queue -meta "$META_NOPW" -mount "$MNT" -db "$DB" -producer "$PRODUCER" \
     -status "$STATUS" -nice "$NICE" -ionice "$ion" \
+    -name "${JM_WORKER_NAME:-}" -kinds "${JM_FARM_KINDS:-}" -transcript-device "${JM_FARM_TRANSCRIPT_DEVICE:-cpu}" \
     -concurrency "$WORKERS" -ffmpeg-threads "$FFMPEG_THREADS" -proxy-concurrency "$PROXY_WORKERS" \
-    -vcodec "$VCODEC" -crf "$CRF" -preset "$PRESET" -whisper-model "$MODEL"
+    -vcodec "$VCODEC" -crf "$CRF" -preset "$PRESET" -encode-scratch "$ENCODE_SCRATCH" -whisper-model "$MODEL"
 fi
 
 if [ "${JM_FARM_ONCE:-0}" = "1" ]; then

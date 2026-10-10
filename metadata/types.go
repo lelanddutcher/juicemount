@@ -3,6 +3,7 @@ package metadata
 import (
 	"io/fs"
 	"os"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -23,40 +24,122 @@ func init() {
 
 // Entry represents a single file or directory in the metadata store.
 type Entry struct {
-	Path       string
-	Name       string
-	ParentPath string
-	IsDir      bool
-	Size       int64
-	Mtime      time.Time
-	Inode      uint64
-	Mode       fs.FileMode
-	LocalOnly  bool // true = created locally, not yet confirmed in Redis
+	// cacheIdentity changes on every RAM publication, including reusing the same
+	// pointer with identical values. It is not persisted or part of the wire ABI.
+	cacheIdentity uint64
+	Path          string
+	Name          string
+	ParentPath    string
+	IsDir         bool
+	Size          int64
+	Mtime         time.Time
+	// MtimeNsecKnown is true only for a full filesystem/Redis attr observation.
+	// A legacy seconds-only timestamp is not an exact zero-nanosecond value.
+	MtimeNsecKnown bool
+	Inode          uint64
+	Mode           fs.FileMode
+	LocalOnly      bool // true = created locally, not yet confirmed in Redis
+	// Version identifies the durable mirror observation carried by this entry.
+	// Zero means an unversioned legacy producer, not a newly captured observation.
+	Version MirrorToken
 
-	// [JM5] Pre-serialized XDR bytes for the NFS GETATTR response body
-	// (NFSStatusOk + fattr3). Cached here so that repeated GETATTRs for
-	// the same file skip XDR marshaling entirely — just copy 88 bytes.
-	// nil means not yet computed; set lazily on first GETATTR.
-	PreSerializedGetAttr []byte
+	// getAttrCache is shared by immutable read snapshots of this entry. The
+	// payload is published atomically because GETATTR is a hot concurrent path.
+	// Store mutations replace the cache pointer before publishing the new
+	// scalar values, so an older snapshot can never repopulate stale XDR bytes
+	// for a newer size/mode/mtime generation.
+	getAttrCache *entryGetAttrCache
+}
+
+type entryGetAttrBody struct {
+	body []byte
+}
+
+type entryGetAttrCache struct {
+	body atomic.Pointer[entryGetAttrBody]
+}
+
+// prepareGetAttrCache initializes the cache before an Entry is published in
+// Store's RAM indexes. Caller must own the Entry or hold Store.mu for writing.
+func (e *Entry) prepareGetAttrCache() {
+	if e != nil && e.getAttrCache == nil {
+		e.getAttrCache = &entryGetAttrCache{}
+	}
+}
+
+// ResetGetAttrCache detaches this Entry from any previously serialized
+// attributes. Use whenever a clone changes a field encoded by NFS GETATTR.
+func (e *Entry) ResetGetAttrCache() {
+	if e != nil {
+		e.getAttrCache = &entryGetAttrCache{}
+	}
+}
+
+// CachedGetAttr returns immutable pre-serialized NFS GETATTR bytes, if any.
+func (e *Entry) CachedGetAttr() []byte {
+	if e == nil || e.getAttrCache == nil {
+		return nil
+	}
+	if cached := e.getAttrCache.body.Load(); cached != nil {
+		return cached.body
+	}
+	return nil
+}
+
+// CacheGetAttr atomically publishes immutable pre-serialized NFS GETATTR
+// bytes. The caller hands ownership of body to Entry and must not mutate it.
+func (e *Entry) CacheGetAttr(body []byte) {
+	if e == nil || e.getAttrCache == nil || len(body) == 0 {
+		return
+	}
+	e.getAttrCache.body.Store(&entryGetAttrBody{body: body})
+}
+
+// snapshot returns a stable scalar view for callers outside Store's lock.
+// The concurrency-safe GETATTR cache remains shared until a mutation replaces
+// the cached Entry's cache pointer.
+func (e *Entry) snapshot() *Entry {
+	if e == nil {
+		return nil
+	}
+	clone := *e
+	if clone.getAttrCache == nil {
+		clone.getAttrCache = &entryGetAttrCache{}
+	}
+	return &clone
 }
 
 // FileInfo implements fs.FileInfo for an Entry.
 type FileInfo struct {
-	entry *Entry
+	entry         *Entry
+	mtimeOverride time.Time
 }
 
 func (e *Entry) FileInfo() *FileInfo {
 	return &FileInfo{entry: e}
 }
 
+// FileInfoWithModTime preserves the concrete *metadata.FileInfo type (and its
+// pre-serialized GETATTR cache) while allowing the NFS adapter to expose a
+// push-driven directory visibility generation. The override is never persisted
+// and is ignored for zero values.
+func (e *Entry) FileInfoWithModTime(mtime time.Time) *FileInfo {
+	return &FileInfo{entry: e, mtimeOverride: mtime}
+}
+
 // Entry returns the underlying metadata Entry.
-func (fi *FileInfo) Entry() *Entry     { return fi.entry }
+func (fi *FileInfo) Entry() *Entry { return fi.entry }
 
 func (fi *FileInfo) Name() string      { return fi.entry.Name }
 func (fi *FileInfo) Size() int64       { return fi.entry.Size }
 func (fi *FileInfo) Mode() fs.FileMode { return fi.entry.Mode }
-func (fi *FileInfo) ModTime() time.Time { return fi.entry.Mtime }
-func (fi *FileInfo) IsDir() bool       { return fi.entry.IsDir }
+func (fi *FileInfo) ModTime() time.Time {
+	if !fi.mtimeOverride.IsZero() {
+		return fi.mtimeOverride
+	}
+	return fi.entry.Mtime
+}
+func (fi *FileInfo) IsDir() bool { return fi.entry.IsDir }
 
 // Sys returns a *syscall.Stat_t with the correct UID, GID, and Ino so that
 // the NFS file attribute builder (internal/nfs/file) reports the current

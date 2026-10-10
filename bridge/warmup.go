@@ -24,7 +24,7 @@ import (
 //	starting: NFS not serving yet (mount sequence in flight)
 //	indexing: the full metadata SCAN is running (progress = scanned/~total,
 //	          capped at 99% because the total is the PREVIOUS sync's count)
-//	warming:  serving, index quiet, but folder-metadata warm activity was
+//	warming:  serving, index quiet, but folder-metadata optimization activity was
 //	          seen within warmupActivityWindow AND uptime < warmupMaxWindow —
 //	          first visits are still populating caches
 //	steady:   everything above settled; repeat navigation is cache-served
@@ -79,6 +79,21 @@ func warmupSampler() {
 	}
 }
 
+// warmupServingState returns the process-local serving marker, repairing it
+// from the health monitor's last kernel-verified NFS result when a recovery
+// path restored the volume without passing through the original boot mount
+// branch. The health monitor's NFS verdict is deliberately the only recovery
+// signal accepted here: globalMountPath and a mount-table entry alone can both
+// survive a dead loopback NFS session and must not make the UI claim readiness.
+func warmupServingState(running, nfsHealthy bool) (since int64, serving bool) {
+	since = warmupServingSince.Load()
+	if since == 0 && running && nfsHealthy {
+		warmupMarkServing()
+		since = warmupServingSince.Load()
+	}
+	return since, since > 0
+}
+
 type warmupResponse struct {
 	Phase      string `json:"phase"` // starting | indexing | warming | steady
 	Progress   int    `json:"progress_pct"`
@@ -94,9 +109,16 @@ type warmupResponse struct {
 
 // handleWarmupHTTP serves GET /warmup — the popover's warm-up card source.
 func handleWarmupHTTP(w http.ResponseWriter, r *http.Request) {
+	// This endpoint is polled as live process state. An initial "starting"
+	// response must never survive in a client/proxy cache after the mount has
+	// become healthy; that presents exactly as a progress bar stuck at 5%
+	// while Finder is already usable.
+	w.Header().Set("Cache-Control", "no-store")
+
 	globalMu.Lock()
 	rc := globalRC
 	running := globalServer != nil
+	monitor := globalMonitor
 	globalMu.Unlock()
 
 	m := metrics.Default().Snapshot()
@@ -106,9 +128,10 @@ func handleWarmupHTTP(w http.ResponseWriter, r *http.Request) {
 		IndexPct:   100,
 	}
 
-	since := warmupServingSince.Load()
+	nfsHealthy := monitor != nil && monitor.Status().NFS.Healthy
+	since, serving := warmupServingState(running, nfsHealthy)
 	now := time.Now().Unix()
-	if since > 0 {
+	if serving {
 		resp.UptimeSec = now - since
 		resp.Serving = true
 	}
@@ -158,10 +181,15 @@ func handleWarmupHTTP(w http.ResponseWriter, r *http.Request) {
 			p = 99
 		}
 		resp.Progress = p
-		resp.Hint = "Warming folder metadata — first visits to a folder may be slower; repeat visits are instant."
+		// This is explicitly a READY state. Cloud-drive clients do not hold
+		// their global startup indicator open while every folder becomes hot;
+		// they publish the namespace and hydrate working-set metadata lazily.
+		// JuiceMount already does the same. Describe the background work without
+		// implying that the user is still waiting for the mount to start.
+		resp.Hint = "Mount ready — optimizing recently visited folders in the background."
 	default:
 		resp.Phase, resp.Progress = "steady", 100
-		resp.Hint = "Fully warmed — navigation is served from local caches."
+		resp.Hint = "Navigation metadata is ready locally. File contents are instant when pinned or already cached."
 	}
 
 	w.Header().Set("Content-Type", "application/json")

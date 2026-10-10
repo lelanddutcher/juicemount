@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/lelanddutcher/juicemount/internal/netprofile"
 )
 
 func TestRegistryObserve(t *testing.T) {
@@ -49,6 +51,30 @@ func TestRegistryObserve(t *testing.T) {
 	}
 }
 
+func TestNetworkSnapshotSerializesAcceptanceContentGuard(t *testing.T) {
+	blob, err := json.Marshal(NetworkSnapshot{
+		FUSEContentReadGuard: true,
+		BackendRouteTunneled: true,
+		RouteCeilingApplied:  true,
+		RouteCeilingClass:    netprofile.ClassSlow.String(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(blob), `"fuse_content_read_guard":true`) {
+		t.Fatalf("network snapshot missing content guard proof: %s", blob)
+	}
+	for _, proof := range []string{
+		`"backend_route_tunneled":true`,
+		`"route_ceiling_applied":true`,
+		`"route_ceiling_class":"slow"`,
+	} {
+		if !strings.Contains(string(blob), proof) {
+			t.Fatalf("network snapshot missing sanitized route proof %s: %s", proof, blob)
+		}
+	}
+}
+
 func TestNavLatencyCounters(t *testing.T) {
 	r := NewRegistry()
 
@@ -68,6 +94,9 @@ func TestNavLatencyCounters(t *testing.T) {
 	r.IncReadColdSubread()
 	r.IncReadColdSubread()
 	r.IncReadWarmSubread()
+	r.ObserveDirectSSDCacheHit(4096)
+	r.ObserveDirectSSDCacheHit(1024)
+	r.IncDirectSSDCacheMiss()
 	r.IncReadaheadTriggered()
 	r.AddReadaheadPrefetchedBlocks(7)
 	r.AddReadaheadPrefetchedBlocks(0)  // no-op guard
@@ -118,6 +147,9 @@ func TestNavLatencyCounters(t *testing.T) {
 		{"lookup_noent", snap.LookupNoent, 1},
 		{"read_cold_subread", snap.ReadColdSubread, 2},
 		{"read_warm_subread", snap.ReadWarmSubread, 1},
+		{"direct_ssd_cache_hit", snap.DirectSSDCacheHit, 2},
+		{"direct_ssd_cache_hit_bytes", snap.DirectSSDCacheHitBytes, 5120},
+		{"direct_ssd_cache_miss", snap.DirectSSDCacheMiss, 1},
 		{"readahead_triggered", snap.ReadaheadTriggered, 1},
 		{"readahead_prefetched_blocks", snap.ReadaheadPrefetchedBlocks, 7},
 		{"recover_lstat_total", snap.RecoverLstat, 5},
@@ -150,6 +182,9 @@ func TestNavLatencyCounters(t *testing.T) {
 		`"lookup_noent":1`,
 		`"read_cold_subread":2`,
 		`"read_warm_subread":1`,
+		`"direct_ssd_cache_hit":2`,
+		`"direct_ssd_cache_hit_bytes":5120`,
+		`"direct_ssd_cache_miss":1`,
 		`"readahead_triggered":1`,
 		`"readahead_prefetched_blocks":7`,
 		`"recover_lstat_total":5`,
@@ -226,6 +261,37 @@ func TestRegistryStableShape(t *testing.T) {
 	for _, want := range trackedTypes {
 		if _, ok := snap.RPCs[string(want)]; !ok {
 			t.Errorf("missing canonical rpc %q in empty snapshot", want)
+		}
+	}
+}
+
+func TestNetworkSimulationProvenanceSerialized(t *testing.T) {
+	r := NewRegistry()
+	r.SetNetworkProvider(func() *NetworkSnapshot {
+		return &NetworkSnapshot{
+			Class:                   "metered",
+			Simulated:               true,
+			FakeProfile:             "rtt_ms=300,bw_down_bps=2000000,bw_up_bps=1000000,loss_pct=0.5,class=metered",
+			HostNetworkCostObserved: true,
+			HostNetworkExpensive:    true,
+			HostNetworkConstrained:  false,
+		}
+	})
+
+	blob, err := json.Marshal(r.Snapshot())
+	if err != nil {
+		t.Fatalf("marshal snapshot: %v", err)
+	}
+	js := string(blob)
+	for _, want := range []string{
+		`"simulated":true`,
+		`"fake_profile":"rtt_ms=300,bw_down_bps=2000000,bw_up_bps=1000000,loss_pct=0.5,class=metered"`,
+		`"host_network_cost_observed":true`,
+		`"host_network_expensive":true`,
+		`"host_network_constrained":false`,
+	} {
+		if !strings.Contains(js, want) {
+			t.Errorf("serialized /metrics JSON missing %q\nfull: %s", want, js)
 		}
 	}
 }

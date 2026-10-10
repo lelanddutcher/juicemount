@@ -1,0 +1,138 @@
+--- a/pkg/object/file.go
++++ b/pkg/object/file.go
+@@ -196,6 +196,64 @@
+ 		err = os.Rename(tmp, p)
+ 	}
+ 	return err
++}
++
++// PutIfAbsent publishes a completely written private inode with a no-replace
++// hard link. Configured storage directories must be trusted and must not be
++// concurrently renamed. A failure after linking retains the uncertain target.
++func (d *filestore) PutIfAbsent(key string, in io.Reader, getters ...AttrGetter) error {
++	if key == "" || key == "." || key == ".." || path.IsAbs(key) || filepath.IsAbs(key) ||
++		path.Clean(key) != key || strings.HasPrefix(key, "../") {
++		return fmt.Errorf("invalid create-only object key")
++	}
++	p := d.path(key)
++	parent := filepath.Dir(p)
++	if err := os.MkdirAll(parent, 0777); err != nil {
++		return err
++	}
++	// Sync the complete chain, including directories left by an interrupted
++	// earlier attempt. Syncing only the leaf would not establish its parents.
++	for dir := parent; ; dir = filepath.Dir(dir) {
++		if err := syncObjectDirectory(dir); err != nil {
++			return err
++		}
++		if filepath.Dir(dir) == dir {
++			break
++		}
++	}
++	f, err := os.CreateTemp(parent, ".juicemount-create-*")
++	if err != nil {
++		return err
++	}
++	defer os.Remove(f.Name()) // Only this attempt's private name, never p.
++	if _, err := io.Copy(f, in); err != nil {
++		_ = f.Close()
++		return err
++	}
++	if err := f.Sync(); err != nil {
++		_ = f.Close()
++		return err
++	}
++	if err := f.Close(); err != nil {
++		return err
++	}
++	if err := os.Link(f.Name(), p); err != nil {
++		return err
++	}
++	return syncObjectDirectory(parent)
++}
++
++func syncObjectDirectory(name string) error {
++	dir, err := os.Open(name)
++	if err != nil {
++		return err
++	}
++	syncErr := dir.Sync()
++	closeErr := dir.Close()
++	if syncErr != nil {
++		return syncErr
++	}
++	return closeErr
+ }
+ 
+ func (d *filestore) Copy(dst, src string) error {
+--- a/pkg/object/interface.go
++++ b/pkg/object/interface.go
+@@ -110,6 +110,13 @@
+ 	ListUploads(marker string) ([]*PendingPart, string, error)
+ }
+ 
++// SupportCreateOnly creates a key atomically only while it is absent. An
++// existing key returns an error matching os.ErrExist, never success. Callers
++// must qualify provider semantics; implementing this interface is not proof.
++type SupportCreateOnly interface {
++	PutIfAbsent(key string, in io.Reader, getters ...AttrGetter) error
++}
++
+ type Shutdownable interface {
+ 	Shutdown()
+ }
+--- a/pkg/object/s3.go
++++ b/pkg/object/s3.go
+@@ -151,6 +151,14 @@
+ }
+ 
+ func (s *s3client) Put(key string, in io.Reader, getters ...AttrGetter) error {
++	return s.put(key, in, false, getters...)
++}
++
++func (s *s3client) PutIfAbsent(key string, in io.Reader, getters ...AttrGetter) error {
++	return s.put(key, in, true, getters...)
++}
++
++func (s *s3client) put(key string, in io.Reader, createOnly bool, getters ...AttrGetter) error {
+ 	var body io.ReadSeeker
+ 	if b, ok := in.(io.ReadSeeker); ok {
+ 		body = b
+@@ -170,6 +178,9 @@
+ 		StorageClass:      types.StorageClass(s.sc),
+ 		ChecksumAlgorithm: "", // X-Amz-Content-Sha256: UNSIGNED-PAYLOAD
+ 	}
++	if createOnly {
++		params.IfNoneMatch = aws.String("*")
++	}
+ 	if !s.disableChecksum {
+ 		checksum := generateChecksum(body)
+ 		params.Metadata = map[string]string{checksumAlgr: checksum}
+@@ -181,6 +192,10 @@
+ 		var re s3.ResponseError
+ 		if errors.As(err, &re) {
+ 			attrs.SetRequestID(re.ServiceRequestID())
++		}
++		var status interface{ HTTPStatusCode() int }
++		if createOnly && errors.As(err, &status) && status.HTTPStatusCode() == 412 {
++			return os.ErrExist
+ 		}
+ 		return err
+ 	}
+--- a/pkg/object/sharding.go
++++ b/pkg/object/sharding.go
+@@ -67,6 +67,14 @@
+ 
+ func (s *sharded) Put(key string, body io.Reader, getters ...AttrGetter) error {
+ 	return s.pick(key).Put(key, body, getters...)
++}
++
++func (s *sharded) PutIfAbsent(key string, body io.Reader, getters ...AttrGetter) error {
++	store, ok := s.pick(key).(SupportCreateOnly)
++	if !ok {
++		return notSupported
++	}
++	return store.PutIfAbsent(key, body, getters...)
+ }
+ 
+ func (s *sharded) Copy(dst, src string) error {

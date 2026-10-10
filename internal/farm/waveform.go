@@ -1,14 +1,14 @@
 package farm
 
 import (
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"github.com/lelanddutcher/juicemount/internal/derivatives"
 	"io"
 	"math"
 	"os"
-	"os/exec"
-	"path/filepath"
 )
 
 // WaveformJSON is the de-facto-standard BBC audiowaveform / waveform-data.js
@@ -30,7 +30,11 @@ const waveformSampleRate = 48000
 // Waveform decodes the first audio track to mono PCM and writes an 8-bit peak
 // overview (min,max per pixel-bucket) as a BBC-format JSON blob. Streams the PCM
 // so a feature-length file doesn't buffer in memory. Returns the pixel length.
-func Waveform(ffmpegBin, srcPath, outPath string, samplesPerPixel int) (int, error) {
+func Waveform(ffmpegBin, srcPath string, dir *os.File, outName string, samplesPerPixel int) (int, error) {
+	return WaveformContext(context.Background(), ffmpegBin, srcPath, dir, outName, samplesPerPixel)
+}
+
+func WaveformContext(ctx context.Context, ffmpegBin, srcPath string, dir *os.File, outName string, samplesPerPixel int) (int, error) {
 	if ffmpegBin == "" {
 		ffmpegBin = "ffmpeg"
 	}
@@ -40,7 +44,7 @@ func Waveform(ffmpegBin, srcPath, outPath string, samplesPerPixel int) (int, err
 	// Fold ALL audio streams + channels to mono (the silent-data-loss fix —
 	// audioFoldArgs). -v error (not quiet) so a real decode failure surfaces in
 	// stderr + trips the cmd.Wait() error path instead of a silent flatline.
-	foldArgs, hasAudio, ferr := audioFoldArgs(ffmpegBin, srcPath, waveformSampleRate)
+	foldArgs, hasAudio, ferr := audioFoldArgsContext(ctx, ffmpegBin, srcPath, waveformSampleRate)
 	if ferr != nil {
 		return 0, fmt.Errorf("waveform: probe audio %q: %w", srcPath, ferr)
 	}
@@ -54,7 +58,7 @@ func Waveform(ffmpegBin, srcPath, outPath string, samplesPerPixel int) (int, err
 	cmdArgs = append(cmdArgs, "-vn", "-i", srcPath)
 	cmdArgs = append(cmdArgs, foldArgs...)
 	cmdArgs = append(cmdArgs, "-f", "s16le", "-")
-	cmd := exec.Command(ffmpegBin, cmdArgs...)
+	cmd := commandContext(ctx, ffmpegBin, cmdArgs...)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return 0, err
@@ -128,10 +132,17 @@ func Waveform(ffmpegBin, srcPath, outPath string, samplesPerPixel int) (int, err
 	if err != nil {
 		return 0, err
 	}
-	if err := os.MkdirAll(filepath.Dir(outPath), 0o755); err != nil {
-		return 0, err
+	// Written through the DIRECTORY DESCRIPTOR, not the path.
+	//
+	// The staging design's stated limitation is that a SUBPROCESS takes a path
+	// and not a descriptor. That excuse does not cover this write: Waveform's
+	// ffmpeg streams to stdout, and the file write is our own Go code — so it
+	// was path-addressed for no reason, and os.MkdirAll + a path-addressed
+	// atomic write followed a symlinked component straight out of the volume.
+	if dir == nil {
+		return 0, fmt.Errorf("waveform: no safe derivative directory")
 	}
-	if err := atomicWriteFile(outPath, payload, 0o644); err != nil {
+	if err := derivatives.WriteFileAt(dir, outName, payload, 0o644); err != nil {
 		return 0, err
 	}
 	return wf.Length, nil

@@ -65,7 +65,8 @@ func setLastSync(t *testing.T, store *Store, at time.Time) {
 }
 
 // TestShouldSkipBootSync exercises the C1 truth table: push on+fresh → skip;
-// push off → no-skip; stale → no-skip; env override (max-age + kill switch);
+// push explicitly off → no-skip; unset/default-on+fresh → skip; stale → no-skip;
+// env override (max-age + kill switch);
 // first-run/no-lastSyncTime → no-skip; corrupt/future timestamps → no-skip.
 func TestShouldSkipBootSync(t *testing.T) {
 	const pushEnv = "JM_METADATA_KEYSPACE_PUSH"
@@ -92,13 +93,13 @@ func TestShouldSkipBootSync(t *testing.T) {
 		}
 	})
 
-	t.Run("push unset -> no skip", func(t *testing.T) {
+	t.Run("push unset defaults on -> skip", func(t *testing.T) {
 		store := newMetaTestStore(t)
 		setLastSync(t, store, time.Now().Add(-1*time.Hour))
 		rc := &RedisClient{store: store}
 		t.Setenv(pushEnv, "")
-		if rc.ShouldSkipBootSync() {
-			t.Error("push unset must always run the boot SCAN")
+		if !rc.ShouldSkipBootSync() {
+			t.Error("push unset defaults on, so a fresh mirror should skip the boot SCAN")
 		}
 	})
 

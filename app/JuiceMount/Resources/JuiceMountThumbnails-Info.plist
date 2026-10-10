@@ -29,7 +29,7 @@
 	<key>CFBundleVersion</key>
 	<string>3</string>
 	<key>LSMinimumSystemVersion</key>
-	<string>14.0</string>
+	<string>26.0</string>
 	<key>NSExtension</key>
 	<dict>
 		<key>NSExtensionPointIdentifier</key>
@@ -38,11 +38,11 @@
 		<string>JuiceMountThumbnails.ThumbnailProvider</string>
 		<key>NSExtensionAttributes</key>
 		<dict>
-			<!-- Broad declaration ladder for the empirical routing-precedence
-			     test: video UTIs the farm renders posters for, plus stills.
-			     If macOS never routes some public types to third-party
-			     providers, declaring them is harmless — the orchestrator
-			     measures actual routing via log stream. -->
+			<!-- These declarations do not establish routing precedence over
+			     Apple's built-in movie/image generators. Thumbnail extensions
+			     are documented for custom file types. Public MP4/JPEG Finder
+			     navigation must not depend on this provider being invoked;
+			     registration alone is not evidence of source-read suppression. -->
 			<key>QLSupportedContentTypes</key>
 			<array>
 				<string>com.apple.quicktime-movie</string>

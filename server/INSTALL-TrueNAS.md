@@ -1,12 +1,25 @@
 # Install JuiceMount on TrueNAS Scale via "Install via YAML"
 
-This is the **current shippable install path** for TrueNAS Scale
+This is the 0.5 release install path for TrueNAS Scale
 24.10+ (Electric Eel, Fangtooth, Goldeye). The "Add Catalog" feature
 was removed in 24.10; you can't sideload third-party catalogs. The
 replacement is **Apps → Discover → ⋮ menu → Install via YAML**, which
 takes a Docker Compose YAML and runs it as a native TrueNAS app.
 
 ## Before you start
+
+If this installation uses ZFS periodic snapshots, exclude the MinIO bucket dataset
+from recursive snapshots of the parent pool (for the default layout,
+`zSSD/juicemount/bucket`). JuiceFS already owns file/trash history in metadata; ZFS
+snapshots of the object bucket retain deleted slice blocks after GC and can consume
+the pool without increasing visible JuiceFS usage. Back up JuiceFS using a coordinated
+metadata-and-object procedure instead of treating an isolated bucket snapshot as a
+filesystem rollback.
+
+Set `JM_FARM_STORAGE_CAPACITY_BYTES` to the numeric result of
+`zpool list -Hp -o size <pool>` for exact Farm total-capacity reporting. ZFS `statfs`
+is dataset-scoped, although its available-byte value still reflects shared pool
+headroom.
 
 Create three datasets in TrueNAS (Datasets → Add Dataset):
 
@@ -25,212 +38,152 @@ The manager service exposes it read-only inside the container so the
 copy can't damage the source. You can add multiple.
 
 Also create one small dataset for manager state (job history JSON
-plus future control-plane state):
+plus future control-plane state), and one for the RESP proxy's principals:
 
 | Dataset | What it holds | Sized for |
 |---|---|---|
-| `manager-state` | JSON file of job history, settings, destinations, schedules | <1 MB; any pool fine |
+| `manager-state` | JSON file of job history, settings, destinations, schedules, Mac enrollments | <1 MB; any pool fine |
+| `respproxy` | Proxy principals file (password hashes, mode 0600), rollback fragment, reload handshake. Shared by `respproxy` and the Manager | <1 MB; any pool fine |
 
 Generate a strong MinIO password and JuiceMount admin key:
 
 ```
 openssl rand -base64 24   # for MINIO_ROOT_PASSWORD
 openssl rand -hex 32      # for JM_ADMIN_KEY (used to gate /manager UI)
+openssl rand -hex 20      # for JM_OBJ_CLIENT_SECRET_KEY (MinIO user jm-client)
+openssl rand -hex 20      # for JM_OBJ_GC_SECRET_KEY (MinIO user jm-gc)
 ```
+
+The MinIO root password stays in the `minio` and `minio-keys` services. The
+volume is formatted with no object key in its Redis `setting`; each JuiceFS
+client brings its own key instead. Macs and the farm get `jm-client`, which
+cannot delete objects. Only the server's `bg` mount and the Manager get
+`jm-gc`. See COMPOSE-ROLLOUT.md, "Object keys".
 
 Note your TrueNAS LAN IP — your Mac will need to reach this address
 on the published ports below.
 
-## Paste this YAML
+Treat the Manager key as durable deployment state. Reuse the same value on
+every upgrade. Before applying an edited or rendered compose, verify that its
+`JM_ADMIN_KEY` is neither empty nor a `CHANGEME_*` placeholder. A live
+container may have received a key at runtime even when the persisted TrueNAS
+custom-app YAML is empty; recreating from that drifted YAML drops the key and
+the Link-enabled Manager correctly refuses to start. Do not use the live
+container's healthy state as proof that the stored app configuration is
+complete.
 
-Apps → Discover → kebab menu → **Install via YAML** → paste this and
-edit the four `CHANGEME_*` placeholders before submitting.
+## Render the exact release YAML
 
-```yaml
-services:
+The 0.5 install input is the repository's canonical
+`server/docker-compose.yml` rendered with values from
+`server/release.env.example`. It digest-pins every image and refuses to render
+without the existing Manager key, MinIO password, four release image digests,
+proxy and object credentials, and the physical zpool capacity. Obtain the
+digests from the published release manifest. This render step prevents an
+edited TrueNAS form from silently dropping a credential or reverting to a
+mutable image.
 
-  # ─── Redis: JuiceFS metadata authority ─────────────────────────
-  redis:
-    image: redis:7.4-alpine
-    restart: unless-stopped
-    ports:
-      - "30179:6379"                  # Mac client connects here
-    command:
-      - "redis-server"
-      - "--appendonly"
-      - "yes"
-      - "--appendfsync"
-      - "everysec"
-      - "--maxmemory-policy"
-      - "noeviction"
-      - "--save"
-      - "900"
-      - "1"
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-    volumes:
-      - CHANGEME_REDIS_PATH:/data     # !!! EDIT — your Redis dataset path
+1. Copy `server/release.env.example` outside the repository and replace every
+   placeholder. Obtain `JM_FARM_STORAGE_CAPACITY_BYTES` from
+   `zpool list -Hp -o size <pool>`.
+2. For remote use, establish a trusted system private route from the Mac to
+   the NAS. The 0.5 client uses the Mac's normal route to its configured Redis
+   and MinIO endpoints. Verify both endpoints from the remote network before
+   testing JuiceMount. A Tailscale subnet router or an existing WireGuard,
+   QNAP, or UniFi route can supply this path. Keep Redis, MinIO, WebDAV, and
+   Manager off the public Internet.
+3. Edit only the host bind paths in the canonical compose for the target NAS.
+   Confirm the MinIO bucket dataset is
+   excluded from recursive ZFS snapshots before starting the farm.
+4. Render without touching the live app:
 
-  # ─── MinIO: S3 object store for chunks ─────────────────────────
-  minio:
-    image: minio/minio:RELEASE.2025-01-20T14-49-07Z
-    restart: unless-stopped
-    command: server /data --console-address ":9001"
-    environment:
-      MINIO_ROOT_USER: juicemount
-      MINIO_ROOT_PASSWORD: CHANGEME_MINIO_PASSWORD    # !!! EDIT — strong, no whitespace
-      MINIO_API_REQUESTS_DEADLINE: 10m
-    ports:
-      - "30151:9000"                  # Mac client connects here
-      - "30152:9001"                  # MinIO console — web UI
-    healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost:9000/minio/health/live"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 10s
-    volumes:
-      - CHANGEME_BUCKET_PATH:/data    # !!! EDIT — your MinIO bucket dataset path
+   ```sh
+   docker compose --env-file /secure/path/juicemount-release.env \
+     -f server/docker-compose.yml config > /secure/path/juicemount-rendered.yml
+   ```
 
-  # ─── juicefs-init: one-shot with pre-flight checks ─────────────
-  juicefs-init:
-    image: juicedata/mount:ce-v1.3.1
-    restart: "no"
-    depends_on:
-      minio:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-    environment:
-      MINIO_ROOT_USER: juicemount
-      MINIO_ROOT_PASSWORD: CHANGEME_MINIO_PASSWORD    # !!! EDIT — same as above
-      JM_BUCKET_URL: "http://minio:9000/zpool"
-      JM_META_URL: "redis://redis:6379/1"
-      JM_VOL_NAME: "zpool"
-    entrypoint: ["/bin/sh", "-c"]
-    command:
-      - |
-        set -e
-        echo "[precheck-0] sleeping 2s for minio admin api warmup..."
-        sleep 2
-        echo "[precheck-1] minio reachable at $$JM_BUCKET_URL"
-        if ! curl -fsS -m 5 http://minio:9000/minio/health/live >/dev/null; then
-          echo "[precheck-1] FAIL: minio not reachable. Check MinIO container logs." >&2; exit 2
-        fi
-        echo "[precheck-2] redis ping"
-        if ! redis-cli -h redis ping 2>/dev/null | grep -q PONG; then
-          echo "[precheck-2] FAIL: redis not reachable. Check Redis container logs." >&2; exit 3
-        fi
-        echo "[precheck-3] credentials non-empty + no placeholder + no whitespace"
-        if [ -z "$$MINIO_ROOT_USER" ] || [ -z "$$MINIO_ROOT_PASSWORD" ]; then
-          echo "[precheck-3] FAIL: MINIO_ROOT_USER/PASSWORD must be non-empty" >&2; exit 4
-        fi
-        case "$$MINIO_ROOT_PASSWORD" in CHANGEME*|CHANGE*|REPLACE*|replaceme*)
-          echo "[precheck-3] FAIL: MinIO password looks like a placeholder. Edit the YAML." >&2; exit 4 ;;
-        esac
-        case "$$MINIO_ROOT_USER" in *' '*) echo "[precheck-3] FAIL: MINIO_ROOT_USER contains whitespace" >&2; exit 4 ;; esac
-        case "$$MINIO_ROOT_PASSWORD" in *' '*) echo "[precheck-3] FAIL: MINIO_ROOT_PASSWORD contains whitespace" >&2; exit 4 ;; esac
-        echo "[precheck-4] bucket URL well-formed"
-        case "$$JM_BUCKET_URL" in http://*|https://*) ;; *)
-          echo "[precheck-4] FAIL: bucket URL must start with http:// or https://" >&2; exit 5 ;;
-        esac
-        echo "[precheck-5] juicefs already formatted?"
-        if juicefs status "$$JM_META_URL" >/dev/null 2>&1; then
-          echo "[precheck-5] OK: volume already formatted; skipping format."
-          exit 0
-        fi
-        echo "[format] running juicefs format with bucket=$$JM_BUCKET_URL"
-        # SLICE 3 default: --trash-days 7. New installs format with
-        # JuiceFS's built-in trash retention enabled so the Manager
-        # UI's Trash tab has a useful default window. The "Upgrading
-        # from --trash-days 0" section below covers existing installs.
-        juicefs format --storage minio --bucket "$$JM_BUCKET_URL" \
-          --access-key "$$MINIO_ROOT_USER" --secret-key "$$MINIO_ROOT_PASSWORD" \
-          --trash-days 7 "$$JM_META_URL" "$$JM_VOL_NAME" || { echo "[format] FAIL: juicefs format errored" >&2; exit 6; }
-        echo "[format] complete"
+5. Inspect the rendered file: first-party images must use `@sha256:…`, WebDAV
+   must remain bound to `127.0.0.1`, credentials must be non-placeholder, and
+   both Manager and the NAS worker must carry the same numeric physical capacity.
+   Embedded Link must be `off`, and neither `JM_NET_ALLOW_INSECURE` nor
+   `JM_NET_ALLOW_LAN_ONLY` may be enabled. The release's remote acceptance run
+   must prove the client reaches storage over its system private route.
+6. Copy `server/redis.conf`, `server/redis.acl`, and the `server/minio`
+   directory to stable NAS paths, then replace their relative mount sources
+   in the rendered YAML with those exact paths. Paste the result into
+   **Apps → Discover → ⋮ → Install via YAML**.
 
-  # ─── juicefs: live FUSE mount + WebDAV (for browse / smoke test) ─
-  juicefs:
-    image: juicedata/mount:ce-v1.3.1
-    restart: unless-stopped
-    depends_on:
-      juicefs-init:
-        condition: service_completed_successfully
-    cap_add:
-      - SYS_ADMIN
-    devices:
-      - /dev/fuse
-    security_opt:
-      - apparmor:unconfined
-    ports:
-      - "30180:80"                    # WebDAV — Finder Cmd+K
-    healthcheck:
-      test: ["CMD", "sh", "-c", "mountpoint -q /jfs && curl -sf http://localhost:80/ || exit 1"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 60s
-    volumes:
-      - CHANGEME_CACHE_PATH:/jfs-cache    # !!! EDIT — your fast-SSD cache dataset
-    entrypoint: ["/bin/sh", "-c"]
-    command:
-      - |
-        set -e
-        echo "Mounting JuiceFS at /jfs..."
-        juicefs mount \
-          --cache-dir /jfs-cache \
-          --cache-size 100000 \
-          --buffer-size 4096 \
-          --prefetch 3 \
-          --backup-meta 3600 \
-          redis://redis:6379/1 \
-          /jfs &
-        sleep 5
-        until mountpoint -q /jfs; do sleep 1; done
-        echo "Mount ready. Starting WebDAV on :80..."
-        mkdir -p /jfs/data /jfs/shared
-        chmod 777 /jfs/data /jfs/shared
-        juicefs webdav --cache-dir /jfs-cache --cache-size 100000 \
-          redis://redis:6379/1 0.0.0.0:80 &
-        wait
+The Mac runs the NFS gateway locally. The standalone `juicemount-server`
+container is a legacy/optional deployment and is not part of this 0.5
+installation. The NAS CPU farm worker is in the compose above. A GPU render
+worker requires a separate host and deployment procedure; GPU admission and
+deployed queue recovery have not passed 0.5 acceptance, so do not count that
+lane as ready.
 
-  # ─── juicemount-manager: control-plane web UI for the JuiceFS volume ─
-  # (Renamed from juicemount-migrator in SLICE 0 of the manager
-  # roadmap. The legacy juicemount-migrator image tag is still
-  # published for one release as a compat alias — but new installs
-  # should use juicemount-manager.)
-  #
-  # Browse host paths under /sources, pick a destination under /jfs,
-  # watch live progress with real % bar (driven by juicefs's Prometheus
-  # metrics). Bind-mount as many existing datasets read-only as you
-  # want. Omit this service entirely if you have no existing data.
-  juicemount-manager:
-    image: ghcr.io/lelanddutcher/juicemount-manager:latest
-    pull_policy: always
-    restart: unless-stopped
-    depends_on:
-      juicefs-init:
-        condition: service_completed_successfully
-    environment:
-      JM_META: "redis://redis:6379/1"
-      JM_VOL_NAME: "zpool"
-      JM_SOURCE_ROOTS: "/sources"
-      JM_ADMIN_KEY: CHANGEME_ADMIN_KEY        # !!! EDIT — 32+ random chars; empty = LAN-only
-      JM_STATE_FILE: "/var/lib/manager/state.json"   # state persists across restart
-    ports:
-      - "30190:8080"                          # web UI
-    volumes:
-      # One bind-mount per existing dataset you want to migrate from.
-      # Each becomes a browsable source root in the UI.
-      - CHANGEME_SOURCE_PATH:/sources/<your-source-name>:ro
-      # Small writable mount for the JSON state file. Without this,
-      # state vanishes on container restart (no Resume button
-      # available for canceled jobs after a redeploy).
-      - CHANGEME_STATE_PATH:/var/lib/manager
-```
+Embedded Headscale remains an advanced, explicit option for operators who run
+its public HTTPS control plane. Preserve any existing Headscale state directory
+when moving to the system private route; disabling the embedded service does
+not require deleting paired identities. The default 0.5 release manifest does
+not publish a Headscale listener or require a Headscale URL. Do not enable
+`JM_NET_ALLOW_INSECURE` or `JM_NET_ALLOW_LAN_ONLY` in a release deployment.
+
+### The RESP proxy (H-8B)
+
+Redis has no published port. `respproxy` owns host port 30179, and every
+client of the volume logs in to it as a named principal. Connections without
+a valid principal are refused.
+
+- **Server principals** come from the render env: `JM_REDIS_PROXY_PASSWORD`
+  (the proxy's own Redis login) and `JM_PROXY_FARM_PASSWORD`,
+  `JM_PROXY_MANAGER_PASSWORD`, `JM_PROXY_BG_PASSWORD`,
+  `JM_PROXY_WEBDAV_PASSWORD`, `JM_PROXY_ADMIN_PASSWORD`. Generate each one
+  separately with `openssl rand -hex 32`. Render refuses to start without
+  them. Treat them like `JM_ADMIN_KEY`: reuse the same values on every
+  upgrade.
+- **No secret on any command line.** Every volume URL in the compose is
+  `user@host` only. The Manager and the farm read their secrets from
+  `JM_META_PASSWORD` (and the Manager from `JM_META_BG_PASSWORD` for
+  gc/compact/fsck and `JM_META_ADMIN_PASSWORD` for lease break, the mode
+  switch and `juicefs config`); juicefs and jmfarm receive them as
+  `META_PASSWORD`. The Manager image refuses to start with a password inline
+  in `JM_META`.
+- **Macs** are not in the env file. The 0.5 app enrolls with the Manager
+  (`POST /api/principals/enroll`, using its instance ID). The secret is sent
+  once; the reply carries a poll token the app uses afterwards. An admin
+  approves the Mac on the Manager's Principals page
+  (`http://<nas>:30190/principals.html`), which the Manager allows only once
+  the proxy is live (it has acknowledged the current principals file). The
+  optional cutover auto-approve
+  window is capped (default 20 Macs, at most 2 per address) and everything it
+  approves stays on a review list; see `server/COMPOSE-ROLLOUT.md` for when it
+  may be opened.
+- **Transport security.** The proxy speaks plain RESP: `AUTH` crosses the
+  network in cleartext on every connection, and enrollment is plain HTTP.
+  Keep port 30179 and the Manager on a trusted path: the LAN, or for remote
+  Macs the 0.5 system private route (Tailscale subnet router, WireGuard).
+  Never publish them to the Internet. If you need encryption on the LAN,
+  terminate TLS in front of the proxy (for example a stunnel or Caddy layer-4
+  listener forwarding to `respproxy:6379`) and point Macs at
+  `rediss://<host>:<tls-port>/1`. jm-respproxy itself has no TLS listener.
+- **Redis administration** uses the `jm-admin` user, whose password is minted
+  inside the Redis container at every start and never leaves it:
+  `docker exec -it <redis> sh -c 'REDISCLI_AUTH="$(cat /run/jm-redis/admin.pass)" redis-cli --user jm-admin'`.
+- The proxy starts in `passthrough`. Switch to `observe` and then `enforce`
+  on the Principals page. The full runbook and the rollback commands are in
+  `server/COMPOSE-ROLLOUT.md`.
+- Remote render nodes (`JM_FARM_NODE_META_URL`) use the `farm` principal,
+  user@host only: `redis://farm@<host>:30179/1`. The Manager refuses a
+  password in it. The enrollment command passes `-e JM_META_PASSWORD` by
+  name; set it in the node's shell first with
+  `read -rs JM_META_PASSWORD && export JM_META_PASSWORD`.
+- The compose mounts `./redis.conf` and `./redis.acl`. Rendering from the
+  repository checkout keeps them; if you paste the YAML into TrueNAS,
+  replace those two relative paths with absolute paths to the same files on
+  the NAS.
+
+An existing pre-proxy installation is moved with
+`server/scripts/rollout-compose.sh --cutover-proxy`, not by re-applying the
+YAML. See `server/COMPOSE-ROLLOUT.md`.
 
 ## Upgrading from --trash-days 0 (SLICE 3 trash retention)
 
@@ -240,27 +193,10 @@ entirely (deletes were immediate, permanent, and unrecoverable). SLICE
 3 ships with `--trash-days 7` for new installs and introduces the
 **Trash tab** in the Manager UI for browse/restore/delete operations.
 
-`juicefs format` is idempotent-skipped on every boot after the first
-(the `precheck-5` step in `juicefs-init` short-circuits when the
-metadata store already exists), so flipping the YAML value above does
-**NOT** auto-migrate existing volumes. To turn on 7-day retention on
-an already-formatted volume, exec into the running init container
-once:
-
-```sh
-docker exec ix-juicemount-juicefs-1 juicefs config <metaURL> --trash-days 7
-```
-
-Replace `<metaURL>` with the same Redis URL the compose YAML sets in
-`JM_META_URL` (typically `redis://redis:6379/1`). Verify the change:
-
-```sh
-docker exec ix-juicemount-juicefs-1 juicefs config <metaURL> | grep TrashDays
-```
-
-Once the value is set, the Manager UI's Trash tab → Retention drop-
-down shows the current value live and can update it from there
-without further `docker exec` calls.
+`juicefs format` skips an existing volume, so changing the compose value does
+not change an existing volume's retention. Use the Manager **Trash → Retention**
+control to set and verify the value. The Manager performs the authenticated
+admin operation; avoid putting the admin secret in a URL or shell command.
 
 **What this does NOT recover:** files deleted before the retention
 knob was turned on are already gone. The change applies forward only.
@@ -278,10 +214,9 @@ image tag, SLICE 0 of the manager roadmap renamed the binary, image,
 HTTP prefix, and state-file path. The transition is one-release
 backward-compatible:
 
-- Both `juicemount-manager:latest` and the legacy
-  `juicemount-migrator:latest` image tags publish from CI (alongside the
-  pinned `:X.Y.Z` / `:X.Y` version tags cut from each `vX.Y.Z` git tag).
-  Existing apps with `pull_policy: always` on the migrator tag keep working.
+- Older installs may still use mutable `juicemount-migrator` image tags.
+  Move to the accepted digest-pinned Manager image for 0.5 after following
+  the service-scoped [Compose rollout procedure](COMPOSE-ROLLOUT.md).
 - HTTP requests to `/migrator/*` are 301-redirected to `/manager/*`.
 - The container reads `/var/lib/migrator/jobs.json` as a fallback if
   `/var/lib/manager/state.json` doesn't exist yet, then writes going
@@ -289,8 +224,6 @@ backward-compatible:
   migration. To carry job history forward, additionally bind-mount the
   old `migrator-state` dataset at `/var/lib/migrator` (read-only is
   fine).
-
-The migrator alias is dropped two releases after slice-0 ships.
 
 ## After install
 
@@ -301,12 +234,16 @@ Redis URL:            redis://<your-truenas-ip>:30179/1
 S3 Endpoint Override: http://<your-truenas-ip>:30151/zpool
 ```
 
-Then click Save. The Mac NFS volume mounts at `/Volumes/zpool`.
+Then click Save and use **Request access** in Settings → Server access. The
+plain Redis URL supplies the proxy host; it is not an authenticated login by
+itself. An admin approves this Mac on Manager's Principals page, after which
+the app stores its own principal and object key in Keychain. Confirm access
+before starting the mount at `/Volumes/zpool`.
 
 ## Diagnostic endpoints
 
 - MinIO Console: `http://<truenas-ip>:30152`
-- WebDAV (Finder Cmd+K): `http://<truenas-ip>:30180`
+- WebDAV: `http://127.0.0.1:30180` on the NAS host only (loopback-published by default)
 - Manager web UI: `http://<truenas-ip>:30190` (if you included the service)
 
 ## Migrating existing data
@@ -344,3 +281,8 @@ Each exit code names the failure:
 
 Each precheck logs `[precheck-N]` prefix lines you can grep for in
 the TrueNAS UI Apps → Logs view.
+
+If Manager refuses to start with an admin-key error, the persisted
+`JM_ADMIN_KEY` is empty, shorter than 32 characters, or still a placeholder.
+Restore the same durable key used by the prior deployment before recreating the
+service.

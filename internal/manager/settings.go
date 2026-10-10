@@ -10,32 +10,32 @@
 //
 // Admin-key rotation is the high-risk feature in this slice. Discipline:
 //
-//   1. The CURRENT key (old_key) is verified BEFORE any state-mutating
-//      work happens. If there are saved destinations, verification means
-//      "decrypt at least one destination's encrypted_config under the
-//      old key". If there are no destinations, we fall back to deriving
-//      the cred-key from old_key via HKDF and constant-time-comparing it
-//      to the in-memory cred-key the store derived at startup.
+//  1. The CURRENT key (old_key) is verified BEFORE any state-mutating
+//     work happens. If there are saved destinations, verification means
+//     "decrypt at least one destination's encrypted_config under the
+//     old key". If there are no destinations, we fall back to deriving
+//     the cred-key from old_key via HKDF and constant-time-comparing it
+//     to the in-memory cred-key the store derived at startup.
 //
-//   2. On verify failure: the handler returns 401 WITHOUT touching the
-//      destinations store, WITHOUT writing the state file, and WITHOUT
-//      altering the in-memory cred-key. The state file on disk before
-//      and after a failed rotation MUST be byte-identical.
+//  2. On verify failure: the handler returns 401 WITHOUT touching the
+//     destinations store, WITHOUT writing the state file, and WITHOUT
+//     altering the in-memory cred-key. The state file on disk before
+//     and after a failed rotation MUST be byte-identical.
 //
-//   3. On verify success: every destination's blob is decrypted under
-//      the old key and re-encrypted under the new key in a single pass
-//      over the rows slice (the writeLock-held swap). After the swap,
-//      onChange fires OUTSIDE the lock so saveState() can flush the new
-//      ciphertext to disk atomically (state.go's writer is rename-based).
+//  3. On verify success: every destination's blob is decrypted under
+//     the old key and re-encrypted under the new key in a single pass
+//     over the rows slice (the writeLock-held swap). After the swap,
+//     onChange fires OUTSIDE the lock so saveState() can flush the new
+//     ciphertext to disk atomically (state.go's writer is rename-based).
 //
-//   4. The in-memory cred-key STAYS on the OLD value after success.
-//      Intentional: the operator now needs to update JM_ADMIN_KEY on
-//      the container and restart. Leaving the store on the old key
-//      keeps subsequent reads-before-restart consistent — every blob on
-//      disk is fresh-new-key-encrypted, but the live process still has
-//      the old key, so a stray destination GET would fail to decrypt.
-//      The success response surfaces this contract clearly in its
-//      message field.
+//  4. The in-memory cred-key STAYS on the OLD value after success.
+//     Intentional: the operator now needs to update JM_ADMIN_KEY on
+//     the container and restart. Leaving the store on the old key
+//     keeps subsequent reads-before-restart consistent — every blob on
+//     disk is fresh-new-key-encrypted, but the live process still has
+//     the old key, so a stray destination GET would fail to decrypt.
+//     The success response surfaces this contract clearly in its
+//     message field.
 package manager
 
 import (

@@ -144,17 +144,25 @@ End users configure everything through the app's Preferences window
   `/pin`, `/offline`, `/spool`, `/spool-recover`, `/reclaim`, `/mount-now`)
 - **SSD cache:** the configured size is respected; it grows only as far
   as needed to keep the pinned set fully cached, and is clamped so the
-  boot disk always keeps ≥10 GiB free (`--free-space-ratio` is raised to
-  enforce the floor dynamically).
+  boot disk always keeps ≥10 GiB free. Normally `--free-space-ratio` keeps
+  JuiceFS eviction 10 GiB above the write spool's preferred 20 GiB admission
+  floor. When the host is already below that preferred floor, the spool exposes
+  only a 512 MiB working window and never crosses its 10 GiB hard OS floor.
+  On an already-constrained disk it may reduce only that extra cushion while
+  preserving both a 512 MiB ordering margin and a 512 MiB usable cache window;
+  if both cannot fit, caching suspends rather than starving writes. The effective
+  floor is exposed as `capacity.cache_free_floor_bytes` in `/cache-status`.
 - **Memory buffer:** 2 GiB budget, files <128 MiB (tunable in
   Preferences since Phase 3b).
-- **Write spool:** enabled via Preferences → Cache & Storage in the app.
+- **Write spool:** on by default for safe contiguous-prefix reads; an explicit
+  user choice is persisted and can disable it in Preferences → Cache & Storage.
   The `JM_SPOOL_ENABLE=1` env var works **only for the `jm5` CLI** — the
   embedded c-archive snapshots its environment before Swift could set
   it, so the app passes the flag through its config JSON instead.
   Spool knobs (CLI: env; app: Preferences/config): `JM_SPOOL_DIR`
   (default `~/Library/Application Support/JuiceMount/spool/`),
-  `JM_SPOOL_SIZE_GB` (default 50). Live status: `127.0.0.1:11050/spool`.
+  `JM_SPOOL_SIZE_GB` (app default `0`, meaning automatic capacity with the
+  safety floors above). Live status: `127.0.0.1:11050/spool`.
 - **WAN tuning (env, read by the JuiceFS mount layer at start):**
   `JM_WAN_MODE=1` raises JuiceFS `--max-uploads` 20 → 64;
   `JM_MAX_UPLOADS=<n>` overrides directly.

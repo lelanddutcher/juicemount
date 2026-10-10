@@ -162,3 +162,29 @@ func scrapeBlockCache(client *http.Client, addr string) (int64, bool) {
 	}
 	return parseBlockCacheBytes(body)
 }
+
+// scrapeBody performs one bounded GET of http://addr/metrics and returns the
+// raw body. Shared with backendstats.go so the backend/cache counters come out
+// of the SAME endpoint without a second HTTP request. Nil/err-safe: any
+// transport error, non-200, or read failure returns (nil, false).
+func scrapeBody(client *http.Client, addr string) ([]byte, bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+addr+"/metrics", nil)
+	if err != nil {
+		return nil, false
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, false
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	if err != nil {
+		return nil, false
+	}
+	return body, true
+}

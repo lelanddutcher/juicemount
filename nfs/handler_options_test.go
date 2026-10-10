@@ -26,7 +26,7 @@ func newOptionsTestStore(t *testing.T) *metadata.Store {
 func TestNewHandlerDefaultMemBufLimits(t *testing.T) {
 	store := newOptionsTestStore(t)
 	h := NewHandler(store, t.TempDir())
-	t.Cleanup(h.StopHandler)
+	t.Cleanup(func() { h.StopHandler() })
 
 	if h.memBuf.threshold != DefaultMemBufThreshold {
 		t.Fatalf("threshold = %d, want default %d", h.memBuf.threshold, DefaultMemBufThreshold)
@@ -41,7 +41,7 @@ func TestNewHandlerWithMemBufLimits(t *testing.T) {
 	wantThreshold := int64(256) << 20 // 256 MB
 	wantBudget := int64(4096) << 20   // 4 GiB
 	h := NewHandler(store, t.TempDir(), WithMemBufLimits(wantThreshold, wantBudget))
-	t.Cleanup(h.StopHandler)
+	t.Cleanup(func() { h.StopHandler() })
 
 	if h.memBuf.threshold != wantThreshold {
 		t.Fatalf("threshold = %d, want %d", h.memBuf.threshold, wantThreshold)
@@ -57,10 +57,28 @@ func TestNewHandlerZeroMemBufLimitsKeepDefaults(t *testing.T) {
 	// not "buffer nothing".
 	store := newOptionsTestStore(t)
 	h := NewHandler(store, t.TempDir(), WithMemBufLimits(0, 0))
-	t.Cleanup(h.StopHandler)
+	t.Cleanup(func() { h.StopHandler() })
 
 	if h.memBuf.threshold != DefaultMemBufThreshold || h.memBuf.budget != DefaultMemBufBudget {
 		t.Fatalf("zero limits resolved to (%d, %d), want defaults (%d, %d)",
 			h.memBuf.threshold, h.memBuf.budget, DefaultMemBufThreshold, DefaultMemBufBudget)
+	}
+}
+
+func TestNewServerCopiesNativePreviewWarmConfig(t *testing.T) {
+	t.Setenv("JM_NATIVE_PREVIEW_WARM", "0")
+	store := newOptionsTestStore(t)
+	on := true
+	server := NewServer(Config{FUSEPath: t.TempDir(), NativePreviewWarm: &on}, store)
+	t.Cleanup(func() { server.Handler().StopHandler() })
+	on = false
+	if !server.Handler().readahead.previewOptIn() {
+		t.Fatal("server lost explicit on after caller pointer changed")
+	}
+
+	legacy := NewServer(Config{FUSEPath: t.TempDir()}, store)
+	t.Cleanup(func() { legacy.Handler().StopHandler() })
+	if legacy.Handler().readahead.previewOptIn() {
+		t.Fatal("nil direct config ignored legacy off environment")
 	}
 }

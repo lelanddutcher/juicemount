@@ -39,9 +39,8 @@ func onMount(ctx context.Context, w *response, userHandle Handler) error {
 		return err
 	}
 
-	rootHndl := userHandle.ToHandle(handle, []string{})
-
 	if status == MountStatusOk {
+		rootHndl := userHandle.ToHandle(handle, []string{})
 		_ = xdr.Write(writer, rootHndl)
 		_ = xdr.Write(writer, flavors)
 	}

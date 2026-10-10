@@ -30,8 +30,10 @@
 #      stale binaries by sending GET /stop and expecting 405 (Method
 #      Not Allowed). 200 means stale binary — abort, do not stop.
 #
-#   2. Passwordless sudo for /sbin/umount (covered by the same
-#      sudoers entry as the offline-resilience harness).
+#   2. Nothing privileged. H-3 (2026-10-06): this harness no longer
+#      falls back to a path-based force-unmount. Kernel mount-table
+#      residue is reported, and is cleared by Stop Mount, the JuiceMount
+#      unmount helper, or a restart — never by this script.
 #
 #   3. A probe file >= 1 GB on the mount that takes >2× PRE_READ_DELAY
 #      to fully stream (default: auto-discovered).
@@ -208,7 +210,7 @@ log "  ✓ cat streaming (PID $CAT_PID)"
 # tears down. So the response should be fast, then the server
 # starts dying about 100ms later.
 log "  POSTing /stop..."
-stop_response=$(curl -fsS -X POST "$METRICS/stop" --max-time 3 2>&1 || echo "ERROR: curl failed")
+stop_response=$(curl -fsS -X POST -H 'X-JM-Control: 1' "$METRICS/stop" --max-time 3 2>&1 || echo "ERROR: curl failed")
 stop_engaged_ms=$(ts_ms)
 log "  ✓ /stop response: $stop_response"
 if [[ "$stop_response" != *'"stopping":true'* ]]; then
@@ -287,21 +289,14 @@ if [[ "$SKIP_FORCE_EJECT" == "false" ]]; then
     # tore down the metrics server. We expect this to fail with
     # connection refused. That's actually correct behavior — soft-stop
     # tears down everything including the listener.
-    fe_code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$METRICS/force-eject" --max-time 3 2>/dev/null || echo "000")
+    fe_code=$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'X-JM-Control: 1' "$METRICS/force-eject" --max-time 3 2>/dev/null || echo "000")
     log "  /force-eject HTTP status: $fe_code"
     if [[ "$fe_code" == "000" ]]; then
-        log "  metrics listener is down (expected after /stop). Falling back to direct umount."
-        # The mount is still in the kernel table. Use the same
-        # passwordless-sudo umount path that /force-eject would have used.
-        if sudo -n /sbin/umount -f -t nfs "$MOUNT" 2>/dev/null; then
-            ejected=true
-            log "  ✓ direct umount succeeded"
-        elif sudo -n /sbin/umount -f "$MOUNT" 2>/dev/null; then
-            ejected=true
-            log "  ✓ direct umount (unscoped -f) succeeded"
-        else
-            log "  direct umount failed — mount may need manual cleanup"
-        fi
+        log "  metrics listener is down (expected after /stop)."
+        # H-3: no path-based fallback. A pathname cannot prove which
+        # kernel mount it reaches, so any residue is reported below and
+        # left for Stop Mount, the unmount helper, or a restart.
+        log "  no path-based unmount fallback (H-3); residue, if any, needs Stop Mount or a restart"
     elif [[ "$fe_code" == "200" ]]; then
         ejected=true
     fi

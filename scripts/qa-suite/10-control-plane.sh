@@ -66,13 +66,12 @@ done
 section "pin/unpin cycle for a transient file"
 PINTEST="$MOUNT/.jmqa-pin-$$"
 pool_slice "$PINTEST" 5
-PIN_REL="/.jmqa-pin-$$"
 # /pin and /unpin take ?path= query param (verified cbridge.go:1570)
-PIN_URL="http://${JM_METRICS_ADDR}/pin?path=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$PIN_REL'))")"
-UNPIN_URL="http://${JM_METRICS_ADDR}/unpin?path=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$PIN_REL'))")"
-PIN_RESP=$(curl -s --max-time 10 "$PIN_URL" 2>/dev/null)
-if [[ -n "$PIN_RESP" ]] && echo "$PIN_RESP" | python3 -c "import sys,json; json.load(sys.stdin)" 2>/dev/null; then
-    pass "/pin?path= returned valid JSON: $(echo "$PIN_RESP" | head -c 100)"
+PIN_URL="http://${JM_METRICS_ADDR}/pin?path=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$PINTEST'))")"
+UNPIN_URL="http://${JM_METRICS_ADDR}/unpin?path=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$PINTEST'))")"
+PIN_RESP=$(curl -fsS --max-time 10 -X POST -H 'X-JM-Control: 1' "$PIN_URL" 2>/dev/null)
+if [[ -n "$PIN_RESP" ]] && printf '%s' "$PIN_RESP" | python3 -c 'import sys,json; sys.exit(json.load(sys.stdin).get("ok") is not True)' 2>/dev/null; then
+    pass "/pin?path= admitted the asynchronous pin walk: $(echo "$PIN_RESP" | head -c 100)"
 else
     fail "/pin?path= returned non-JSON/empty: $(echo "$PIN_RESP" | head -c 200)"
 fi
@@ -84,9 +83,9 @@ if [[ -n "$CACHE_NOW" ]] && echo "$CACHE_NOW" | python3 -c "import sys,json; jso
 else
     warn "/cache-status non-JSON: $(echo "$CACHE_NOW" | head -c 200)"
 fi
-UNPIN_RESP=$(curl -s --max-time 10 "$UNPIN_URL" 2>/dev/null)
-if [[ -n "$UNPIN_RESP" ]] && echo "$UNPIN_RESP" | python3 -c "import sys,json; json.load(sys.stdin)" 2>/dev/null; then
-    pass "/unpin?path= returned valid JSON"
+UNPIN_RESP=$(curl -fsS --max-time 10 -X POST -H 'X-JM-Control: 1' "$UNPIN_URL" 2>/dev/null)
+if [[ -n "$UNPIN_RESP" ]] && printf '%s' "$UNPIN_RESP" | python3 -c 'import sys,json; sys.exit(json.load(sys.stdin).get("ok") is not True)' 2>/dev/null; then
+    pass "/unpin?path= acknowledged success"
 else
     fail "/unpin?path= returned non-JSON/empty"
 fi
@@ -102,7 +101,7 @@ else
     warn "/self-test GET non-JSON: $(echo "$ST_GET" | head -c 200)"
 fi
 # Force rerun via POST
-ST_POST=$(curl -s --max-time 30 -X POST "http://${JM_METRICS_ADDR}/self-test" 2>/dev/null)
+ST_POST=$(curl -fsS --max-time 30 -X POST -H 'X-JM-Control: 1' "http://${JM_METRICS_ADDR}/self-test" 2>/dev/null)
 if [[ -n "$ST_POST" ]] && echo "$ST_POST" | python3 -c "import sys,json; json.load(sys.stdin)" 2>/dev/null; then
     if echo "$ST_POST" | grep -q '"write_ok"\|"status"'; then
         pass "/self-test POST (rerun) returned with expected fields"

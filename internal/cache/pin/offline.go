@@ -3,9 +3,12 @@ package pin
 import (
 	"errors"
 	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/lelanddutcher/juicemount/internal/appisolation"
 )
 
 // ErrOfflineNotAvailable signals that an NFS operation was refused
@@ -106,7 +109,15 @@ func PersistedOfflineIntent() bool {
 	if p == "" {
 		return false
 	}
-	_, err := os.Stat(p)
+	paths, isolated, err := appisolation.ResolvePaths()
+	if err != nil || isolated && p != paths.OfflineIntent {
+		return false
+	}
+	if isolated {
+		st, err := os.Lstat(p)
+		return err == nil && st.Mode().IsRegular() && st.Mode().Perm() == 0600
+	}
+	_, err = os.Stat(p)
 	return err == nil
 }
 
@@ -119,8 +130,52 @@ func persistOfflineIntent(on bool) {
 	if p == "" {
 		return
 	}
+	paths, isolated, err := appisolation.ResolvePaths()
+	if err != nil || isolated && p != paths.OfflineIntent {
+		return
+	}
+	if isolated {
+		dir := filepath.Dir(p)
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			return
+		}
+		if _, _, err := appisolation.ResolvePaths(); err != nil {
+			return
+		}
+		if on {
+			file, err := os.CreateTemp(dir, ".offline-intent-")
+			if err != nil {
+				return
+			}
+			name := file.Name()
+			defer os.Remove(name)
+			if _, err := file.Write([]byte("user-offline\n")); err != nil {
+				_ = file.Close()
+				return
+			}
+			if err := file.Sync(); err != nil {
+				_ = file.Close()
+				return
+			}
+			if err := file.Close(); err != nil {
+				return
+			}
+			if err := os.Rename(name, p); err != nil {
+				return
+			} // never follows a link
+			if parent, err := os.Open(dir); err == nil {
+				_ = parent.Sync()
+				_ = parent.Close()
+			}
+		} else {
+			_ = os.Remove(p) // removes only this validated private leaf
+		}
+		return
+	}
 	if on {
-		_ = os.WriteFile(p, []byte("user-offline\n"), 0o644)
+		if os.MkdirAll(filepath.Dir(p), 0o700) == nil {
+			_ = os.WriteFile(p, []byte("user-offline\n"), 0o644)
+		}
 	} else {
 		_ = os.Remove(p)
 	}

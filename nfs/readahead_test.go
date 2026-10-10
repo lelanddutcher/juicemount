@@ -11,7 +11,7 @@ import (
 )
 
 func TestReadaheadSequentialDetection(t *testing.T) {
-	rm := NewReadaheadManager(testFUSEPath, nil, nil)
+	rm := NewReadaheadManager(t.TempDir(), nil, nil)
 	defer rm.Stop()
 
 	inode := uint64(42)
@@ -31,7 +31,7 @@ func TestReadaheadSequentialDetection(t *testing.T) {
 }
 
 func TestReadaheadRandomNoTrigger(t *testing.T) {
-	rm := NewReadaheadManager(testFUSEPath, nil, nil)
+	rm := NewReadaheadManager(t.TempDir(), nil, nil)
 	defer rm.Stop()
 
 	inode := uint64(42)
@@ -50,7 +50,7 @@ func TestReadaheadRandomNoTrigger(t *testing.T) {
 
 func TestReadaheadThroughNFS(t *testing.T) {
 	srv, store := setupReadTestServer(t)
-	mountPoint := mountNFS(t, srv.Addr())
+	mountPoint := mountNFS(t, srv)
 
 	// Find a file with enough blocks to trigger readahead (need >3 sequential reads)
 	var testFile string
@@ -120,7 +120,7 @@ func slowProfile(t *testing.T) *netprofile.Profile {
 // prefetch scheduling — even a long sequential run never trips.
 func TestReadaheadServerKillSwitch(t *testing.T) {
 	t.Setenv("JM_SERVER_READAHEAD", "0")
-	rm := NewReadaheadManager(testFUSEPath, nil, nil)
+	rm := NewReadaheadManager(t.TempDir(), nil, nil)
 	defer rm.Stop()
 
 	inode := uint64(77)
@@ -147,7 +147,7 @@ func TestReadaheadShortRunGuard(t *testing.T) {
 
 	// Short run: 5 sequential blocks. SeqThreshold(slow)=4 trips at hit 4, but
 	// the guard (6) suppresses hits 4 and 5 as preview probes.
-	shortRM := NewReadaheadManager(testFUSEPath, nil, slowProfile(t))
+	shortRM := NewReadaheadManager(t.TempDir(), nil, slowProfile(t))
 	defer shortRM.Stop()
 
 	before := metrics.Default().Snapshot().ReadaheadSuppressed
@@ -164,7 +164,7 @@ func TestReadaheadShortRunGuard(t *testing.T) {
 
 	// Long run: 12 sequential blocks. Once the run passes the guard (6) the
 	// trip escalates.
-	longRM := NewReadaheadManager(testFUSEPath, nil, slowProfile(t))
+	longRM := NewReadaheadManager(t.TempDir(), nil, slowProfile(t))
 	defer longRM.Stop()
 	inode2 := uint64(202)
 	for i := 0; i < 12; i++ {
@@ -172,6 +172,60 @@ func TestReadaheadShortRunGuard(t *testing.T) {
 	}
 	if triggered, _ := longRM.Stats(); triggered == 0 {
 		t.Fatal("long sequential run on slow link never escalated past the guard")
+	}
+}
+
+// A metered link must not turn a preview-sized run into speculative traffic,
+// but a real sequential read must retain one bounded request in flight. This
+// guards the cellular failure where disabling readahead serialized foreground
+// subreads and used only a fraction of the available pipe.
+func TestMeteredReadaheadStartsOnlyAfterStrongSequentialSignal(t *testing.T) {
+	t.Setenv("JM_SERVER_READAHEAD", "")
+	p := netprofile.New()
+	c := netprofile.ClassMetered
+	p.ForceClass(&c)
+	rm := NewReadaheadManager(t.TempDir(), nil, p)
+	defer rm.Stop()
+
+	inode := uint64(252)
+	for i := 0; i < 6; i++ { // five sequential hits: still below threshold six
+		rm.OnRead(inode, int64(i)*readaheadBlockSize, readaheadBlockSize, "test/preview.mov")
+	}
+	if triggered, _ := rm.Stats(); triggered != 0 {
+		t.Fatalf("metered preview run triggered %d prefetches, want 0", triggered)
+	}
+
+	rm.OnRead(inode, 6*readaheadBlockSize, readaheadBlockSize, "test/reel.mov")
+	if triggered, _ := rm.Stats(); triggered != 1 {
+		t.Fatalf("metered sequential run triggered %d prefetches, want exactly 1", triggered)
+	}
+}
+
+// Production NFS reads reach ReadaheadManager as 256 KiB subreads, not as the
+// 4 MiB synthetic blocks used by the original tests. A real 1 MiB sequential
+// demand must start one bounded WAN prefetch even though the historical six-hit
+// guard has not fired; a smaller Finder-style probe must remain speculative-
+// traffic-free.
+func TestMeteredReadaheadRecognizesSubdividedOneMiBRun(t *testing.T) {
+	t.Setenv("JM_SERVER_READAHEAD", "")
+	p := netprofile.New()
+	c := netprofile.ClassMetered
+	p.ForceClass(&c)
+	rm := NewReadaheadManager(t.TempDir(), nil, p)
+	defer rm.Stop()
+
+	const chunk = 256 << 10
+	inode := uint64(253)
+	for i := 0; i < 3; i++ {
+		rm.OnRead(inode, int64(i)*chunk, chunk, "test/preview.mov")
+	}
+	if triggered, _ := rm.Stats(); triggered != 0 {
+		t.Fatalf("sub-1MiB preview triggered %d prefetches, want 0", triggered)
+	}
+
+	rm.OnRead(inode, 3*chunk, chunk, "test/reel.mov")
+	if triggered, _ := rm.Stats(); triggered != 1 {
+		t.Fatalf("1MiB sequential WAN run triggered %d prefetches, want exactly 1", triggered)
 	}
 }
 
@@ -184,7 +238,7 @@ func TestReadaheadGuardOffOnFastLink(t *testing.T) {
 	c := netprofile.ClassFast
 	p.ForceClass(&c)
 
-	rm := NewReadaheadManager(testFUSEPath, nil, p)
+	rm := NewReadaheadManager(t.TempDir(), nil, p)
 	defer rm.Stop()
 
 	inode := uint64(303)
@@ -198,7 +252,7 @@ func TestReadaheadGuardOffOnFastLink(t *testing.T) {
 }
 
 func TestReadaheadCleanup(t *testing.T) {
-	rm := NewReadaheadManager(testFUSEPath, nil, nil)
+	rm := NewReadaheadManager(t.TempDir(), nil, nil)
 	defer rm.Stop()
 
 	// Add some trackers

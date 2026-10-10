@@ -114,6 +114,73 @@ func TestSpoolStoreMarkReadyRefusesNonWriting(t *testing.T) {
 	}
 }
 
+func TestSpoolStoreReopenReadyCAS(t *testing.T) {
+	db := openTestDB(t)
+	s := NewSpoolStore(db)
+
+	id, _ := s.Insert("/late-write", "/spool/files/late")
+	if ok, err := s.ReopenReady(id); err != nil || ok {
+		t.Fatalf("writing row reopened: ok=%v err=%v, want false nil", ok, err)
+	}
+	if err := s.MarkReady(id, 123, []byte("old-sha")); err != nil {
+		t.Fatalf("mark ready: %v", err)
+	}
+	if ok, err := s.ReopenReady(id); err != nil || !ok {
+		t.Fatalf("ready row reopen: ok=%v err=%v, want true nil", ok, err)
+	}
+	row, _ := s.Get(id)
+	if row.DrainState != DrainWriting || row.Size != 123 || string(row.SHA256) != "old-sha" {
+		t.Fatalf("reopen changed durable payload metadata: %+v", row)
+	}
+	if ok, err := s.ReopenReady(id); err != nil || ok {
+		t.Fatalf("second reopen was not a CAS miss: ok=%v err=%v", ok, err)
+	}
+
+	// A punched/streamed row is not self-contained and must never reopen.
+	if err := s.MarkReady(id, 123, []byte("old-sha")); err != nil {
+		t.Fatalf("mark ready after reopen: %v", err)
+	}
+	if err := s.SetPunchedEnd(id, 64); err != nil {
+		t.Fatalf("set punched end: %v", err)
+	}
+	if ok, err := s.ReopenReady(id); err != nil || ok {
+		t.Fatalf("punched row reopened: ok=%v err=%v, want false nil", ok, err)
+	}
+}
+
+func TestSetPunchedEndRequiresPersistedBoundary(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		fault string
+	}{
+		{name: "deleted", fault: `DELETE FROM spool_entries WHERE id=1`},
+		{name: "ignored", fault: `CREATE TRIGGER ignore_punched_end BEFORE UPDATE ON spool_entries BEGIN SELECT RAISE(IGNORE); END`},
+		{name: "rewritten", fault: `CREATE TRIGGER reset_punched_end AFTER UPDATE ON spool_entries BEGIN UPDATE spool_entries SET punched_end=0 WHERE id=NEW.id; END`},
+		{name: "failed", fault: `CREATE TRIGGER fail_punched_end BEFORE UPDATE ON spool_entries BEGIN SELECT RAISE(FAIL, 'fault'); END`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db := openTestDB(t)
+			s := NewSpoolStore(db)
+			id, err := s.Insert("/clip.mov", "/spool/clip")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.Exec(tc.fault); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.SetPunchedEnd(id, 4096); err == nil {
+				t.Fatal("SetPunchedEnd succeeded without a persisted boundary")
+			}
+			if tc.name != "deleted" {
+				got, err := s.PunchedEnd(id)
+				if err != nil || got != 0 {
+					t.Fatalf("punched_end after failed update = %d, err=%v; want 0", got, err)
+				}
+			}
+		})
+	}
+}
+
 func TestSpoolStoreLookupByPathReturnsLatest(t *testing.T) {
 	db := openTestDB(t)
 	s := NewSpoolStore(db)
@@ -140,6 +207,44 @@ func TestSpoolStoreLookupByPathMiss(t *testing.T) {
 
 	if _, err := s.LookupByPath("/nope"); err != sql.ErrNoRows {
 		t.Fatalf("expected sql.ErrNoRows, got %v", err)
+	}
+}
+
+func TestSpoolStoreLookupUndrainedByPath(t *testing.T) {
+	s := NewSpoolStore(openTestDB(t))
+	failedID, err := s.Insert("/asset.mov", "/spool/files/failed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.MarkFailed(failedID, "upload exhausted"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.LookupByPath("/asset.mov"); err != sql.ErrNoRows {
+		t.Fatalf("NFS active lookup returned failed row: %v", err)
+	}
+	row, err := s.LookupUndrainedByPath("/asset.mov")
+	if err != nil || row.ID != failedID || row.DrainState != DrainFailed {
+		t.Fatalf("failed upload lookup: row=%+v err=%v", row, err)
+	}
+
+	newID, err := s.Insert("/asset.mov", "/spool/files/new")
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, err = s.LookupUndrainedByPath("/asset.mov")
+	if err != nil || row.ID != newID || row.DrainState != DrainWriting {
+		t.Fatalf("newer upload lookup: row=%+v err=%v", row, err)
+	}
+
+	doneID, err := s.Insert("/drained.mov", "/spool/files/done")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.MarkDone(doneID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.LookupUndrainedByPath("/drained.mov"); err != sql.ErrNoRows {
+		t.Fatalf("drained upload lookup should miss: %v", err)
 	}
 }
 

@@ -1,0 +1,274 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>JuiceMount Manager: Principals and leases</title>
+<style>
+  :root { --bg: #fff; --fg: #1d1d1f; --muted: #6e6e73; --line: #e5e5ea; --accent: #0a84ff; --warn: #b25000; --bad: #c62828; --ok: #1b7f3b; }
+  @media (prefers-color-scheme: dark) { :root { --bg: #1c1c1e; --fg: #f2f2f7; --muted: #a1a1a6; --line: #3a3a3c; --accent: #64a8ff; --warn: #ffb340; --bad: #ff6961; --ok: #5cd67a; } }
+  body { margin: 0; padding: 24px; background: var(--bg); color: var(--fg); font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  h1 { font-size: 20px; margin: 0 0 4px; } h2 { font-size: 16px; margin: 28px 0 8px; }
+  p.note { color: var(--muted); margin: 4px 0 12px; max-width: 70ch; }
+  table { border-collapse: collapse; width: 100%; } th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; font-size: 12px; }
+  button { font: inherit; padding: 4px 10px; border-radius: 6px; border: 1px solid var(--line); background: transparent; color: var(--fg); cursor: pointer; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; } button.danger { color: var(--bad); border-color: var(--bad); }
+  button[aria-pressed="true"] { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .note-warn { color: var(--warn); font-size: 12px; } .note-bad { color: var(--bad); font-size: 12px; }
+  .status-pending { color: var(--warn); } .status-approved { color: var(--ok); } .status-revoked { color: var(--bad); }
+  .badge { display: inline-block; font-size: 12px; padding: 1px 6px; border-radius: 4px; border: 1px solid currentColor; }
+  .badge-ok { color: var(--ok); } .badge-warn { color: var(--warn); } .badge-bad { color: var(--bad); font-weight: 600; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; } code { font-size: 12px; }
+  #err { color: var(--bad); white-space: pre-wrap; } a { color: var(--accent); }
+</style>
+</head>
+<body>
+<p><a href="./">&larr; Manager</a></p>
+<h1>Principals and leases</h1>
+<p class="note">Every client of the volume logs in to the RESP proxy as a named principal. Macs enroll here and stay
+pending until you approve them. Approving or revoking rewrites the proxy's principals file and asks the proxy to reload it.</p>
+<div id="err" role="alert"></div>
+
+<h2>Enforcement mode</h2>
+<p class="note">Passthrough: authenticate only. Observe: decide every write, refuse nothing, log what would be refused.
+Enforce: refuse writes into a project another principal holds. Step back to observe or passthrough at any time.</p>
+<div class="row" id="modes"></div>
+<p class="note" id="modeSource"></p>
+
+<h2>Mac enrollment</h2>
+<div class="row">
+  <span id="window"></span>
+  <button id="openWindow">Open auto-approve for 7 days</button>
+  <button id="closeWindow">Close auto-approve</button>
+</div>
+<p class="note" id="reload"></p>
+<p class="note-bad" id="keyd"></p>
+<div id="orphans" style="display:none">
+  <h2>Orphan storage keys</h2>
+  <p class="note-bad">minio-keyd reports these per-Mac storage keys, but this Manager's records do not know them (the Manager's
+  store was lost or restored from an older copy, or a key was made by hand). Each one still works at the object store. They
+  are kept until you remove them. Remove them only when no Mac still needs one: a Mac that uses one loses object-store
+  access until it has its own key.</p>
+  <table>
+    <thead><tr><th>Storage key</th><th>Mac</th><th>State</th></tr></thead>
+    <tbody id="orphanRows"></tbody>
+  </table>
+  <p class="row"><button class="danger" id="removeOrphans">Remove orphan keys</button></p>
+</div>
+<table>
+  <thead><tr><th>Principal</th><th>Host</th><th>Fingerprint</th><th>Status</th><th class="keycol">Storage key</th><th>Requested</th><th>From</th><th></th></tr></thead>
+  <tbody id="principals"></tbody>
+</table>
+
+<h2>Project leases</h2>
+<p class="note">Breaking a lease lets another principal write the project. The holder's unsynced edits are kept on that
+Mac and published as conflict copies.</p>
+<table>
+  <thead><tr><th>Project</th><th>Holder</th><th>Mode</th><th>Last write</th><th>Pending spool</th><th></th></tr></thead>
+  <tbody id="leases"></tbody>
+</table>
+
+<script>
+(function () {
+  'use strict';
+  var key = '';
+  try { key = localStorage.getItem('jm-admin-key') || ''; } catch (_) {}
+  var errBox = document.getElementById('err');
+  function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) { return '&#' + c.charCodeAt(0) + ';'; }); }
+  function when(ms) { return ms ? new Date(ms).toLocaleString() : ''; }
+  function api(method, path, body) {
+    var h = { 'Content-Type': 'application/json' };
+    if (key) h['X-JuiceMount-Admin-Key'] = key;
+    return fetch('api/' + path, { method: method, headers: h, body: body ? JSON.stringify(body) : undefined })
+      .then(function (r) {
+        if (r.status === 401) {
+          var k = window.prompt('Manager admin key');
+          if (k) { key = k; try { localStorage.setItem('jm-admin-key', k); } catch (_) {} return api(method, path, body); }
+        }
+        return r.text().then(function (t) {
+          if (!r.ok) throw new Error(path + ': ' + r.status + ' ' + t.trim());
+          return t ? JSON.parse(t) : {};
+        });
+      });
+  }
+  function fail(e) { errBox.textContent = e.message; }
+
+  function loadMode() {
+    api('GET', 'leases/mode').then(function (m) {
+      var box = document.getElementById('modes'); box.innerHTML = '';
+      ['passthrough', 'observe', 'enforce'].forEach(function (mode) {
+        var b = document.createElement('button');
+        b.textContent = mode; b.setAttribute('aria-pressed', String(m.mode === mode));
+        b.onclick = function () {
+          var body = { mode: mode };
+          if (mode === 'enforce') {
+            if (window.prompt('Type enforce to refuse conflicting writes for every principal') !== 'enforce') return;
+            body.confirm = 'enforce';
+          }
+          api('POST', 'leases/mode', body).then(loadMode, fail);
+        };
+        box.appendChild(b);
+      });
+      document.getElementById('modeSource').textContent = m.source === 'cfg'
+        ? 'Set in jmlease:v1:cfg.' : 'Not set: the proxy runs the mode it started with (passthrough in the canonical compose).';
+    }, function (e) { document.getElementById('modeSource').textContent = e.message; });
+  }
+
+  // Read-only identity notes. previous_instance_id is SELF-REPORTED by the
+  // Mac and unproven (nothing checks it ever held that ID); it is a hint for
+  // the admin, never evidence. device_mismatch means a later request for this
+  // principal came from a different device digest.
+  function identityNotes(p) {
+    var out = '';
+    if (p.previous_instance_id) {
+      out += '<br><span class="note-warn">Says it was migrated or cloned from instance <code>' + esc(p.previous_instance_id) +
+        '</code> (reported by the Mac, not verified).</span>';
+    }
+    if (p.device_mismatch) {
+      out += '<br><span class="note-bad">Device mismatch: this principal was used from a second Mac' +
+        (p.mismatched_device_digest ? ' (device <code>' + esc(p.mismatched_device_digest) + '</code>)' : '') +
+        '. Revoke and forget it unless you expected this.</span>';
+    }
+    return out;
+  }
+
+  // Per-Mac object keys (JM_OBJ_PER_MAC=1): each Mac's own MinIO key.
+  // "removing" is red until minio-keyd confirms the key is gone: until
+  // then a revoked Mac's stored key may still work at the object store.
+  function keyCell(p) {
+    var st = p.obj_key_status || '';
+    var removing = (p.obj_key_removing || []).map(function (r) { return '<code>' + esc(r.name) + '</code>'; }).join(' ');
+    var out = '';
+    if (st === 'active') out = '<span class="badge badge-ok">own key</span> <code>' + esc(p.obj_key_name) + '</code>';
+    else if (st === 'minting') out = '<span class="badge badge-warn">waiting for storage key</span> <code>' + esc(p.obj_key_name) + '</code>';
+    else if (st === 'recreating') out = '<span class="badge badge-warn">re-creating storage key</span> <code>' + esc(p.obj_key_name) + '</code>';
+    else if (st === 'shared') out = '<span class="badge badge-warn">shared key</span> (own key not yet created)';
+    if (removing && st !== 'removing') out += '<br><span class="badge badge-bad">Old storage key NOT yet removed</span> ' + removing;
+    if (st === 'removing') out = '<span class="badge badge-bad">Storage key NOT yet removed</span> ' + removing;
+    var orphans = (p.obj_key_orphans || []).map(function (n) { return '<code>' + esc(n) + '</code>'; }).join(' ');
+    if (orphans) out += (out ? '<br>' : '') + '<span class="badge badge-bad">Unknown storage key still live</span> ' + orphans +
+      ' (see Orphan storage keys)';
+    if (p.obj_key_in_use) {
+      out += (out ? '<br>' : '') + '<span class="note-' + (p.obj_key_in_use === p.obj_key_name ? 'warn' : 'bad') + '">Mac reports using <code>' +
+        esc(p.obj_key_in_use) + '</code>' + (p.obj_key_in_use === p.obj_key_name ? '' : ' (not its current key)') + '</span>';
+    }
+    return out;
+  }
+
+  // Orphan storage keys: listed with an explicit, admin-confirmed removal.
+  var orphanNames = [];
+  function renderOrphans(s) {
+    var list = s.orphan_keys || [];
+    document.getElementById('orphans').style.display = list.length ? '' : 'none';
+    var tb = document.getElementById('orphanRows'); tb.innerHTML = '';
+    orphanNames = [];
+    list.forEach(function (o) {
+      if (!o.removing) orphanNames.push(o.name);
+      var tr = document.createElement('tr');
+      tr.innerHTML = '<td><code>' + esc(o.name) + '</code></td><td><code>' + esc(o.principal) + '</code>' +
+        (o.known ? '' : ' (no record in this Manager)') + (o.in_use ? ' <span class="badge badge-bad">Mac reports it uses this key</span>' : '') +
+        '</td><td>' + (o.removing ? '<span class="badge badge-bad">Removal requested, NOT yet confirmed</span>'
+          : '<span class="badge badge-bad">Live</span>') + '</td>';
+      tb.appendChild(tr);
+    });
+    document.getElementById('removeOrphans').disabled = !orphanNames.length;
+  }
+
+  function loadPrincipals() {
+    api('GET', 'principals').then(function (s) {
+      var until = s.auto_approve_until_ms;
+      document.getElementById('window').textContent = (until
+        ? 'Auto-approve is OPEN until ' + when(until) + ' (' + s.auto_approve_used + ' of ' + s.auto_approve_max + ' approvals used, at most 2 per address).'
+        : 'Auto-approve is closed: new Macs wait for approval.') +
+        (s.needs_review ? ' ' + s.needs_review + ' auto-approved Mac(s) need review: confirm or revoke each.' : '');
+      var rel = s.proxy_configured
+        ? (s.proxy_live
+          ? (s.reload_applied
+            ? 'Proxy is running. Current credential changes are applied.'
+            : 'Proxy is running. Credential changes are waiting to be applied.')
+          : (s.proxy_problem ? 'Proxy not live: ' + s.proxy_problem + '.' : ''))
+        : 'Proxy directory not configured (JM_RESPPROXY_DIR): approvals are recorded but not yet published to a proxy.';
+      document.getElementById('reload').textContent = rel;
+      document.getElementById('keyd').textContent = s.per_mac_keys && s.keyd_problem
+        ? 'Per-Mac storage keys: ' + s.keyd_problem + '. Approvals wait for minio-keyd; revoked keys are not removed until it answers.'
+        : (!s.per_mac_keys && s.per_mac_keys_left
+          ? s.per_mac_keys_left + ' per-Mac storage key(s) still exist at the object store, but per-Mac keys are off (JM_OBJ_PER_MAC is not 1). ' +
+            'The Manager does not remove them while they are off, so a revoked Mac\'s storage key keeps working. ' +
+            'To remove them, set JM_OBJ_PER_MAC=1 again and restart the Manager.'
+          : '');
+      renderOrphans(s);
+      var showKeys = !!s.per_mac_keys || !!s.per_mac_keys_left || (s.principals || []).some(function (p) { return !!p.obj_key_status; });
+      Array.prototype.forEach.call(document.querySelectorAll('.keycol'), function (el) { el.style.display = showKeys ? '' : 'none'; });
+      var tb = document.getElementById('principals'); tb.innerHTML = '';
+      (s.principals || []).forEach(function (p) {
+        var tr = document.createElement('tr');
+        tr.innerHTML = '<td><code>' + esc(p.name) + '</code><br>' + esc(p.label) + '</td><td>' + esc(p.host) + '</td><td><code>' +
+          esc(p.fingerprint) + '</code></td><td class="status-' + esc(p.status) + '">' + esc(p.status) +
+          (p.auto_approved ? ' (auto, needs review)' : '') + (p.auto_approve_pending ? ' (auto-approved when its storage key is ready)' : '')
+          + identityNotes(p) + '</td><td class="keycol"' + (showKeys ? '' : ' style="display:none"') + '>' + keyCell(p) + '</td><td>' +
+          esc(when(p.requested_at_ms)) + '</td><td>' + esc(p.source_ip) + '</td><td class="row"></td>';
+        var actions = tr.lastChild;
+        function add(label, op, cls, confirmText) {
+          var b = document.createElement('button'); b.textContent = label; if (cls) b.className = cls;
+          b.onclick = function () {
+            if (confirmText && !window.confirm(confirmText)) return;
+            api('POST', 'principals/' + op, { name: p.name }).then(loadPrincipals, fail);
+          };
+          actions.appendChild(b);
+        }
+        if (p.status === 'approved' && p.auto_approved) add('Confirm', 'approve', 'primary', 'Confirm ' + p.host + ' (fingerprint ' + p.fingerprint + ', from ' + p.source_ip + ')?');
+        if (p.status !== 'approved') add('Approve', 'approve', 'primary', p.status === 'pending' ? 'Approve ' + p.host + '? Check that the Mac shows fingerprint ' + p.fingerprint + '.' : null);
+        if (p.status !== 'revoked') add(p.status === 'pending' ? 'Reject' : 'Revoke', 'revoke', 'danger', 'Revoke ' + p.name + '? Its connections are refused after the proxy reloads.');
+        if (p.status === 'revoked') add('Forget', 'forget', '', p.obj_key_status === 'removing'
+          ? 'Forget ' + p.name + '? Its storage key is not yet confirmed removed, so the Manager will refuse until minio-keyd confirms it.'
+          : 'Forget ' + p.name + '? The Mac can then enroll again.');
+        tb.appendChild(tr);
+      });
+      if (!(s.principals || []).length) tb.innerHTML = '<tr><td colspan="8">No Mac has enrolled yet.</td></tr>';
+    }, fail);
+  }
+
+  function loadLeases() {
+    api('GET', 'leases').then(function (s) {
+      var tb = document.getElementById('leases'); tb.innerHTML = '';
+      if (!s.available) { tb.innerHTML = '<tr><td colspan="6">' + esc(s.error || 'No lease service.') + '</td></tr>'; return; }
+      var held = (s.leases || []).filter(function (l) { return l.state === 'held'; });
+      held.forEach(function (l) {
+        var tr = document.createElement('tr');
+        tr.innerHTML = '<td>' + esc(l.label || ('inode ' + l.proj)) + '</td><td>' + esc(l.holder) + '@' + esc(l.host) + ' (' + esc(l.kind) + ')</td><td>' +
+          esc(l.mode) + '</td><td>' + esc(when(l.last_write_ms)) + '</td><td>' + (l.pending ? 'yes' : 'no') + '</td><td></td>';
+        var b = document.createElement('button'); b.textContent = 'Break'; b.className = 'danger';
+        b.onclick = function () {
+          var proj = 'ino:' + l.proj;
+          if (!window.confirm('Break ' + (l.label || proj) + ' held by ' + l.holder + '?')) return;
+          api('POST', 'leases/break', { project: proj, confirm: proj }).then(loadLeases, fail);
+        };
+        tr.lastChild.appendChild(b);
+        tb.appendChild(tr);
+      });
+      if (!held.length) tb.innerHTML = '<tr><td colspan="6">No project is leased.</td></tr>';
+    }, function (e) { document.getElementById('leases').innerHTML = '<tr><td colspan="6">' + esc(e.message) + '</td></tr>'; });
+  }
+
+  document.getElementById('openWindow').onclick = function () {
+    var n = window.prompt('Open auto-approve for 7 days. Only after the proxy refuses admin-only commands in every mode. ' +
+      'Maximum number of Macs to approve (at most 2 per address):', '20');
+    if (!n) return;
+    api('POST', 'principals/auto-approve', { hours: 168, max_approvals: parseInt(n, 10) || 20 }).then(loadPrincipals, fail);
+  };
+  document.getElementById('removeOrphans').onclick = function () {
+    if (!orphanNames.length) return;
+    if (!window.confirm('Remove ' + orphanNames.length + ' orphan storage key(s) at the object store?\n\n' + orphanNames.join('\n') +
+      '\n\nA Mac that still uses one of them loses object-store access until it has its own key. This cannot be undone.')) return;
+    api('POST', 'principals/orphan-keys/remove', { names: orphanNames }).then(loadPrincipals, fail);
+  };
+  document.getElementById('closeWindow').onclick = function () {
+    api('POST', 'principals/auto-approve', { hours: 0 }).then(loadPrincipals, fail);
+  };
+  loadMode(); loadPrincipals(); loadLeases();
+  setInterval(function () { loadPrincipals(); loadLeases(); }, 15000);
+})();
+</script>
+</body>
+</html>

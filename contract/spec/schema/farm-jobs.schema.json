@@ -1,10 +1,10 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "https://github.com/lelanddutcher/juicemount-contract/spec/schema/farm-jobs.schema.json",
-  "title": "GET /farm/jobs — farm worker presence + recent jobs (response)",
-  "description": "The producer's read-back view. `available` = ≥1 active worker draining (so the UI can say 'the farm is generating' vs 'queued, waiting for a worker'). Counts are serialized as typed JSON ints even though the worker keeps a stringified Redis HASH internally.",
+  "title": "GET /api/farm/jobs — farm worker presence + recent jobs (response)",
+  "description": "The producer's read-back view. `available` = at least one heartbeating worker, including a deliberately paused farm. Counts are typed JSON ints even though the worker keeps a stringified Redis HASH internally. Capability, benchmark, routing, and control properties are additive RC fields.",
   "type": "object",
-  "required": ["available", "workers", "queue_depth", "jobs"],
+  "required": ["available", "workers", "queue_depth", "queue_depths", "jobs"],
   "properties": {
     "available": { "type": "boolean" },
     "queue_depth": { "type": "integer" },
@@ -17,7 +17,54 @@
           "id": { "type": "string" },
           "started_at": { "type": "string" },
           "last_seen": { "type": "string" },
-          "current_job": { "type": ["string", "null"] }
+          "current_job": { "type": ["string", "null"] },
+          "current_activity": {
+            "type": "object",
+            "required": ["id"],
+            "properties": {
+              "id": { "type": "string" },
+              "kind": { "type": "string" },
+              "path": { "type": "string" },
+              "started_at": { "type": "string" },
+              "stage": { "type": "string" },
+              "pct": { "type": "integer", "minimum": 0, "maximum": 100 }
+            }
+          },
+          "build_version": { "type": "string" },
+          "build_commit": { "type": "string" },
+          "name": { "type": "string" },
+          "role": { "type": "string", "enum": ["server", "render"] },
+          "state": { "type": "string", "enum": ["idle", "working", "paused", "draining", "disabled", "probing-accelerator", "waiting-storage-permit"] },
+          "admission_blocked": { "type": "boolean", "description": "Render worker heartbeat whose live accelerator probe has not admitted it; it cannot claim render work." },
+          "kinds": { "type": "array", "items": { "type": "string" } },
+          "capabilities": { "type": "array", "items": { "type": "string" } },
+          "encoders": { "type": "array", "items": { "type": "string" } },
+          "decoders": { "type": "array", "items": { "type": "string" } },
+          "decode_limits": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "object",
+              "required": ["max_width", "max_height"],
+              "properties": {
+                "max_width": { "type": "integer", "minimum": 1 },
+                "max_height": { "type": "integer", "minimum": 1 }
+              }
+            }
+          },
+          "transcript_backends": { "type": "array", "items": { "type": "string" } },
+          "benchmarks": {
+            "type": "object",
+            "properties": {
+              "encode_fps": { "type": "number" },
+              "decode_fps": { "type": "number" },
+              "transcript_x_realtime": { "type": "number" },
+              "access_mbps": { "type": "number" },
+              "last_job_seconds": { "type": "number" },
+              "jobs_completed": { "type": "integer" },
+              "probed_at": { "type": "string" },
+              "probe_error": { "type": "string" }
+            }
+          }
         }
       }
     },
@@ -29,17 +76,81 @@
         "required": ["id", "status", "path", "kinds", "producer"],
         "properties": {
           "id": { "type": "string" },
-          "status": { "type": "string", "enum": ["queued", "running", "done", "failed"] },
+          "status": { "type": "string", "enum": ["queued", "running", "dispatched", "done", "failed", "canceled"] },
           "path": { "type": "string" },
           "kinds": { "type": "string", "description": "Comma-joined request set." },
-          "producer": { "type": "string", "enum": ["openloupe", "manager"] },
+          "producer": { "type": "string", "enum": ["openloupe", "manager", "farm-watch", "farm-watch-backstop"] },
           "enqueued_at": { "type": "string" },
           "started_at": { "type": "string" },
           "finished_at": { "type": "string" },
           "processed": { "type": "integer" },
           "failed": { "type": "integer" },
-          "error": { "type": "string" }
+          "error": { "type": "string" },
+          "worker": { "type": "string" },
+          "target_worker": { "type": "string" },
+          "backend": { "type": "string" },
+          "queue_class": { "type": "string", "enum": ["server", "render", "cpu"] },
+          "attempts": { "type": "integer" },
+          "hardware_failures": { "type": "integer" },
+          "parent_id": { "type": "string" },
+          "derivative_pass": { "type": "string" },
+          "requeue_of": { "type": "string" },
+          "requeued_as": { "type": "string" },
+          "cancel_requested_at": { "type": "string" }
         }
+      }
+    },
+    "queue_depths": {
+      "type": "object",
+      "additionalProperties": { "type": "integer", "minimum": 0 }
+    },
+    "control": {
+      "type": "object",
+      "required": ["revision", "paused", "watch_enabled"],
+      "properties": {
+        "revision": { "type": "integer" },
+        "paused": { "type": "boolean" },
+        "watch_enabled": { "type": "boolean" },
+        "auto_paused": { "type": "boolean" },
+        "pause_code": { "type": "string" },
+        "pause_reason": { "type": "string" },
+        "updated_at": { "type": "string" },
+        "updated_by": { "type": "string" },
+        "known": { "type": "boolean", "description": "False when the Manager could not read the control document; the other fields are then zero values, not a real 'watch off'. Consumers must check this first." },
+        "node_holds": {
+          "type": "object",
+          "required": ["known", "default_paused", "default_drain", "nodes"],
+          "properties": {
+            "known": { "type": "boolean" },
+            "config_revision": { "type": "integer" },
+            "default_paused": { "type": "boolean" },
+            "default_drain": { "type": "boolean" },
+            "nodes": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["name", "paused", "drain"],
+                "properties": {
+                  "name": { "type": "string" },
+                  "paused": { "type": "boolean" },
+                  "drain": { "type": "boolean" }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "storage": {
+      "type": "object",
+      "required": ["configured", "safe"],
+      "properties": {
+        "configured": { "type": "boolean" },
+        "safe": { "type": "boolean" },
+        "total_bytes": { "type": "integer", "minimum": 0 },
+        "available_bytes": { "type": "integer", "minimum": 0 },
+        "required_bytes": { "type": "integer", "minimum": 0 },
+        "reason": { "type": "string" }
       }
     }
   }

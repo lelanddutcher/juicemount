@@ -1,10 +1,12 @@
 package nfs
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash"
 	"log"
@@ -50,6 +52,11 @@ var ErrSpoolFull = fmt.Errorf("spool: capacity full: %w", syscall.ENOSPC)
 // in-package callers/tests.
 var ErrSpoolBusy = fmt.Errorf("spool: path busy (prior entry still draining): %w", pin.ErrSpoolBusy)
 
+// ErrSpoolOrphanBytes means an unindexed entry may hold the last copy of
+// acknowledged writes, even if it appears empty during the scan. The entry
+// remains on disk for manual recovery.
+var ErrSpoolOrphanBytes = errors.New("unindexed spool entry requires manual recovery")
+
 // DefaultStuckEscalationWindow is how long an entry may sit QUIESCENT (no
 // writes) with refcount>0 before the sweeper treats the handles as leaked
 // and force-finalizes the entry. Far above any legitimate gap between two
@@ -69,11 +76,66 @@ const DefaultStuckEscalationWindow = 10 * time.Minute
 // guarded by the entry's own mutex.
 type SpoolStore struct {
 	root     string
-	capacity int64 // 0 means unlimited
+	capacity int64 // 0 means unlimited — the CONFIGURED cap; see effectiveCapacity
 	used     atomic.Int64
 	meta     *metadata.SpoolStore
 	index    *SpoolIndex
-	closed   atomic.Bool
+	// Per-store accounting only: a historical cleaned receipt never creates a
+	// refund. Boot reconstructs this alongside used, before serving.
+	replacementCleanupCharges sync.Map // row ID -> replacementCleanupCharge
+	// Test-only interruption seam, assigned before use.
+	replacementCleanupFault func(string) error
+	// Test-only boundary after a canonical replacement phase completes.
+	replacementResumePhase func(string) error
+	// A terminal or unverified latest local save must not fall through to an
+	// older backend version. Read/namespace paths consult this RAM-only map;
+	// RecoverOnBoot rebuilds it from durable failed rows before serving.
+	readFaults sync.Map // nfs path -> newest failed row ID
+	// Qualified conflict saves own a read-only local view, outside HasPending.
+	conflictMu       sync.RWMutex
+	conflictHandler  *JuiceMountHandler // assigned before NFS serving
+	conflictByPath   map[string]*conflictReadView
+	conflictByInode  map[uint64]*conflictReadView
+	revokedConflicts map[uint64]bool
+	closed           atomic.Bool
+	// Prepared births retain their reservation even after their FDs close.
+	// Startup discovers the durable intent before any capacity reset.
+	birthMu       sync.Mutex
+	pendingBirths map[string]*PrivateBirthCustody
+	// A lost READY COMMIT retains the exact opened image FD until explicit
+	// reconciliation. It must not be released on a generic SQL error path.
+	pendingContinuationMu    sync.Mutex
+	pendingContinuations     map[int64]pendingBoundContinuation
+	pendingContinuationPaths map[string]int64
+	boundReadyTransition     func(metadata.SpoolContinuationSnapshot, func()) (bool, error)
+	// Test-only fault seam, assigned before concurrent use.
+	birthSyncFailure func(string) error
+	// Recovery publishes an immutable boot cohort for the asynchronous stage
+	// sweep. New writes after listener admission must not enter that sweep.
+	bootSweep atomic.Pointer[bootSweepInventory]
+	// Recovery runs before serving; tests inject read failure on one store.
+	hashFileOnRecovery func(string) ([]byte, int64, error)
+	shutdownFault      func(string) error // test-only, installed before shutdown
+	// baseProbe returns the H-8B base identity of the backend file a new
+	// spool row replaces, and the lease epoch it is accepted under. Installed
+	// by NewDrainer (which knows the FUSE root); nil records UNKNOWN.
+	baseProbe atomic.Pointer[spoolBaseProbe]
+
+	// Live free-disk sample backing effectiveCapacity. The configured capacity
+	// is clamped to free disk ONCE, in NewSpoolStore — a snapshot that goes
+	// stale the moment anything else consumes the volume (the JuiceFS cache
+	// growing, another app, the user's own downloads). These two make the clamp
+	// continuous. Sampled at most once per diskAvailTTL so the per-write
+	// admission path stays cheap; Statfs here is on the LOCAL spool disk, never
+	// through FUSE.
+	// capCeiling is the absolute byte ceiling derived at sample time:
+	// usedAtSample + max(0, avail - SpoolFreeFloorBytes). It must be computed
+	// from a `used` SNAPSHOT taken together with the avail reading, and must NOT
+	// be re-derived from the live `used` on each check — see effectiveCapacity.
+	// -1 = never successfully sampled.
+	capCeiling  atomic.Int64
+	diskAvailAt atomic.Int64 // UnixNano of that sample
+	ceilingMu   sync.Mutex   // single-flights the refresh; fast path is lock-free
 
 	// lastReleaseNanos is the wall-clock (UnixNano) of the most recent
 	// capacity release — i.e. the last time the drainer (or a write
@@ -160,12 +222,30 @@ func (s *SpoolStore) unlockAllShards() {
 	}
 }
 
-// SpoolFreeFloorBytes is the disk space the spool leaves free when
-// auto-sizing or clamping its capacity, so the OS and the JuiceFS cache that
-// shares the same SSD always have headroom. Mirrors the 10 GiB cache floor in
-// health/fuse.go but is larger because the spool can hold an entire un-drained
-// SD-card burst.
-const SpoolFreeFloorBytes = int64(20) << 30 // 20 GiB
+const (
+	// SpoolFreeFloorBytes is the PREFERRED disk space the spool leaves free when
+	// auto-sizing or clamping its capacity, so the OS and the JuiceFS cache that
+	// shares the same SSD have headroom. It is larger than the OS hard floor
+	// because the spool can hold an entire un-drained SD-card burst.
+	SpoolFreeFloorBytes = int64(20) << 30 // 20 GiB
+
+	// SpoolHardFreeFloorBytes is the floor the write path never crosses, even on
+	// a machine that was already below the preferred 20 GiB floor when the app
+	// started. It mirrors health/cacheFreeFloorBytesConst. Keeping the two at
+	// 10 GiB prevents the mount from consuming the operating system's last free
+	// space while still leaving a bounded working window for ordinary writes.
+	// TestSpoolHardFloorMirrorHasNotDrifted guards the mirror.
+	SpoolHardFreeFloorBytes = int64(10) << 30 // 10 GiB
+
+	// spoolLowDiskWorkingSetBytes is the maximum instantaneous admission window
+	// below the preferred floor. Without it, 19.9 GiB free becomes the 1-byte
+	// sentinel and a 58-byte Finder write parks for the full capacity backstop.
+	// A 512 MiB window lets metadata and ordinary documents close and drain; it
+	// is small enough that a low-disk machine remains protected. Re-sampling may
+	// move this window as completed entries drain, but admission still stops at
+	// SpoolHardFreeFloorBytes.
+	spoolLowDiskWorkingSetBytes = int64(512) << 20 // 512 MiB
+)
 
 // spoolDiskAvail returns the bytes available to this user on the filesystem
 // backing dir. dir may not exist yet (NewSpoolStore creates it after the
@@ -185,21 +265,39 @@ func spoolDiskAvail(dir string) (int64, error) {
 	}
 }
 
-// AutoSpoolCapacity is the default spool capacity when JM_SPOOL_SIZE_GB is
-// unset: free disk minus the floor, so the spool sizes to the machine instead
-// of a fixed 50 GiB that a large SD-card offload (e.g. an 87 GB RAW shoot)
-// would overflow mid-copy. Falls back to 50 GiB if Statfs fails, and never
-// returns below 8 GiB. Callers pass the result as NewSpoolStore's capacity.
+// AutoSpoolCapacityBudget is the LOGICAL budget used when the user has not set
+// an explicit spool size. It is deliberately far larger than any disk: in Auto
+// mode the real bound is the LIVE ceiling (effectiveCapacity → cachedCeiling →
+// spoolHeadroomBytes), which tracks free disk plus reclaimable JuiceFS cache and
+// moves in BOTH directions.
+const AutoSpoolCapacityBudget = int64(1) << 50 // 1 PiB
+
+// failOpenMaxBytes bounds the fail-open path. `effectiveCapacity` deliberately
+// fails OPEN when free disk is unreadable — an unreadable statfs is not a full
+// disk — but with an Auto budget of 1 PiB, "open" would mean unlimited. When we
+// cannot see the disk we admit a conservative amount instead of everything.
+const failOpenMaxBytes = int64(8) << 30 // 8 GiB
+
+// AutoSpoolCapacity is the default spool capacity when JM_SPOOL_SIZE_GB and the
+// preference are unset.
+//
+// IT IS NO LONGER A DISK SNAPSHOT (2026-08-04). It used to return
+// max(8 GiB, avail - SpoolFreeFloorBytes) sampled once at boot, and that value
+// became s.capacity for the process lifetime. Because effectiveCapacity is
+// min(capacity, ceiling), a boot on a low-disk machine pinned the budget at the
+// 8 GiB floor — so the reclaimable-cache headroom (spool_headroom.go) could
+// raise the live ceiling to ~100 GiB and a 40 GB camera file would STILL be
+// refused, bounded by a number sampled when the app happened to start.
+//
+// That is the same one-way ratchet removed from NewSpoolStore in b77df6c, one
+// level up: a startup snapshot cannot recover, and Auto mode has no business
+// carrying a disk-derived number at all. In Auto the live ceiling IS the policy,
+// so the configured value gets out of its way.
+//
+// An EXPLICIT user budget is still honoured exactly as before — it is a ceiling
+// the user chose, and effectiveCapacity clamps it live on top.
 func AutoSpoolCapacity(dir string) int64 {
-	avail, err := spoolDiskAvail(dir)
-	if err != nil || avail <= 0 {
-		return int64(50) << 30
-	}
-	c := avail - SpoolFreeFloorBytes
-	if c < int64(8)<<30 {
-		c = int64(8) << 30
-	}
-	return c
+	return AutoSpoolCapacityBudget
 }
 
 // NewSpoolStore creates the spool root if it doesn't exist and returns an
@@ -222,23 +320,47 @@ func NewSpoolStore(root string, capacity int64, meta *metadata.SpoolStore) (*Spo
 	if err := os.MkdirAll(filesDir, 0o755); err != nil {
 		return nil, fmt.Errorf("spool: mkdir %s: %w", filesDir, err)
 	}
+	// THE CONFIGURED CAPACITY IS NOT CLAMPED HERE. It used to be, and that made
+	// the clamp a ONE-WAY RATCHET.
+	//
+	// Found live (2026-08-04): the app started with 21 GiB free, so this baked
+	// 1.49 GiB into s.capacity permanently. Disk later recovered to 25.5 GiB —
+	// and the spool was still stuck at 1.49 GiB, because effectiveCapacity only
+	// ever takes min(configured, live ceiling) and can never rise above a
+	// configured value that was itself a startup snapshot. A copy of 2 GiB would
+	// stall with ~5.4 GiB of real headroom sitting there. That is the same
+	// startup-snapshot bug the live clamp was added to fix, just in the other
+	// direction.
+	//
+	// effectiveCapacity already enforces exactly this bound (used + avail -
+	// floor) on every admission and re-samples it once per second, so clamping
+	// here bought nothing except the inability to recover. Logged, not applied.
 	if capacity > 0 {
 		if avail, err := spoolDiskAvail(root); err == nil && avail > 0 {
 			if maxCap := avail - SpoolFreeFloorBytes; maxCap > 0 && capacity > maxCap {
-				jmlog.Warn("spool: capacity clamped to free disk",
-					"requested_gb", capacity>>30, "clamped_gb", maxCap>>30,
+				jmlog.Info("spool: free disk is currently below the configured capacity — "+
+					"admission is clamped live and will recover as disk frees",
+					"configured_gb", capacity>>30, "effective_now_gb", maxCap>>30,
 					"free_gb", avail>>30)
-				capacity = maxCap
 			}
 		}
 	}
 	s := &SpoolStore{
-		root:          root,
-		capacity:      capacity,
-		meta:          meta,
-		index:         NewSpoolIndex(),
-		escalateAfter: DefaultStuckEscalationWindow,
+		root:               root,
+		capacity:           capacity,
+		meta:               meta,
+		index:              NewSpoolIndex(),
+		hashFileOnRecovery: hashSpoolFile,
+		escalateAfter:      DefaultStuckEscalationWindow,
 	}
+	// Seed the live ceiling synchronously, before anyone can admit a byte.
+	// cachedCeiling's single-flight is non-blocking, so a caller that loses the
+	// TryLock race falls through to whatever capCeiling holds — and the zero
+	// value would read as the "0 == unlimited" sentinel. -1 means "unknown",
+	// which fails OPEN to the configured cap; this first real sample replaces it.
+	s.capCeiling.Store(-1)
+	s.refreshCeiling()
+
 	if mw, err := newManifestWriter(root); err != nil {
 		// Non-fatal — manifest is audit-only. Log and proceed.
 		log.Printf("spool: manifest writer disabled: %v", err)
@@ -262,16 +384,242 @@ func (s *SpoolStore) SetDrainerWake(fn func()) {
 // Root returns the spool root directory.
 func (s *SpoolStore) Root() string { return s.root }
 
-// Capacity returns (used, total) bytes. total=0 means unlimited.
-func (s *SpoolStore) Capacity() (used, total int64) {
-	return s.used.Load(), s.capacity
+// diskAvailTTL bounds how often the disk ceiling is re-sampled. Short enough
+// that a filling volume is noticed within a couple of writes, long enough that a
+// burst of small writes doesn't Statfs per write.
+const diskAvailTTL = 1 * time.Second
+
+// minClampedCeiling is returned instead of 0 whenever the disk clamp is active
+// and computes a ceiling of zero.
+//
+// WHY (2026-08-03 review, CRITICAL): every admission gate spells "unlimited" as
+// `ec <= 0`. A legitimately-computed ceiling of exactly 0 — which happens when
+// the spool is EMPTY and free disk is at or under the floor, the normal resting
+// state of a chronically low-disk machine between copies — would collide with
+// that sentinel and silently re-open admission with no cap at all, at precisely
+// the moment the disk is most constrained. A ceiling of 1 byte rejects every
+// real reservation while staying safely positive.
+const minClampedCeiling = int64(1)
+
+// staleCeilingMax is how old a free-disk sample may get before we stop trusting
+// it entirely. Generous relative to diskAvailTTL so ordinary scheduling jitter
+// never trips it; short enough that a wedged statfs cannot leave admission
+// running on a frozen snapshot indefinitely.
+const staleCeilingMax = 30 * diskAvailTTL
+
+// refreshCeiling re-samples free disk and recomputes capCeiling.
+//
+// The headroom it derives is NOT free disk alone: the JuiceFS block cache shares
+// this SSD and is mostly reclaimable copies of objects already durable in MinIO,
+// so it counts as space the spool may use. See nfs/spool_headroom.go for the
+// formula, the three safety gates (writeback off, never below the pinned set,
+// never any I/O on this path), and why a missing figure degrades to the smaller,
+// historical number. cacheReclaimSnapshot() is a lock-free snapshot read — this
+// function is still just one statfs, exactly as before.
+//
+// The `used` snapshot MUST be taken here, alongside avail, and the resulting
+// ceiling treated as absolute for the whole TTL window. Deriving the ceiling
+// from the live `used` on every check was the CRITICAL bug found in review:
+// `cur+delta > used+headroom` reduces algebraically to `delta > headroom` PER
+// CALL, so the ceiling chased `used` upward and cumulative admission inside one
+// window was unbounded — six 9 GiB reservations all cleared a 10 GiB headroom.
+// Pinning it to the snapshot makes the window admit at most `headroom` in total,
+// which is the entire point of the clamp.
+func (s *SpoolStore) refreshCeiling() {
+	avail, err := spoolDiskAvail(s.root)
+	// Stamp AFTER the syscall returns, from our own clock. Taking `now` before
+	// the call (and before any lock) meant a slow statfs stored a timestamp that
+	// was already expired, so the very next caller re-refreshed immediately and
+	// the single-flight did nothing (2026-08-04 review, MEDIUM).
+	now := time.Now().UnixNano()
+	if err != nil || avail < 0 {
+		// Silent fail-open was flagged in review as unobservable; log once per
+		// sample so a machine where statfs reliably fails is diagnosable rather
+		// than quietly running unclamped.
+		jmlog.Warn("spool: free-disk sample failed — capacity clamp inactive this window",
+			"root", s.root, "error", fmt.Sprint(err))
+		s.capCeiling.Store(-1)
+		s.diskAvailAt.Store(now)
+		return
+	}
+	headroom := spoolHeadroomBytes(avail, cacheReclaimSnapshot())
+	ceiling := s.used.Load() + headroom // snapshot, NOT re-read per check
+	if ceiling < minClampedCeiling {
+		ceiling = minClampedCeiling
+	}
+	s.capCeiling.Store(ceiling)
+	s.diskAvailAt.Store(now)
 }
+
+// cachedCeiling returns the sampled absolute ceiling, resampling at most once
+// per diskAvailTTL PER STORE. ok=false means free disk is unreadable.
+//
+// The refresh is single-flighted under ceilingMu. Without it the TTL check was
+// per-goroutine, not per-store: N waiters parked in waitForCapacity — a parallel
+// Finder copy with several files blocked, i.e. precisely the scenario this
+// feature exists for — would all observe the same expiry and each issue its own
+// statfs, and on failure each emit its own unrate-limited log line
+// (2026-08-04 review, MEDIUM). The fast path stays lock-free; only the expiry
+// path takes the mutex, and the re-check inside it means just one of the N
+// actually samples.
+func (s *SpoolStore) cachedCeiling() (int64, bool) {
+	if at := s.diskAvailAt.Load(); at == 0 || time.Now().UnixNano()-at >= int64(diskAvailTTL) {
+		// NON-BLOCKING single-flight. TryLock, never Lock: whoever wins does the
+		// statfs, everyone else keeps the current value and moves on.
+		//
+		// A blocking Lock here was a HIGH defect (2026-08-04 review). statfs has
+		// no timeout and can hang on a wedged volume, and this function is
+		// reached from tryReserveCapacity/effectiveCapacity — which callers
+		// invoke while HOLDING a path shard (OpenWrite) or the per-entry e.mu
+		// (WriteAt, Truncate). One stuck refresh would therefore serialize every
+		// OpenWrite hashing to that shard AND block concurrent readers of a file
+		// still being written (the in-flight read-shadow path), which is exactly
+		// the class of stall the shard split exists to prevent. It also violated
+		// this file's own rule that try() be "cheap and lock-free".
+		//
+		// A loser using a slightly stale ceiling is normally harmless — one poll
+		// of staleness, absorbed by the floor. But it is NOT bounded to one TTL:
+		// if the WINNER's statfs is the thing that hangs, it holds the slot for
+		// the whole hang and every loser keeps reading the same frozen value.
+		// staleCeilingMax below is the backstop for exactly that.
+		if s.ceilingMu.TryLock() {
+			if at := s.diskAvailAt.Load(); at == 0 || time.Now().UnixNano()-at >= int64(diskAvailTTL) {
+				s.refreshCeiling()
+			}
+			s.ceilingMu.Unlock()
+		}
+	}
+	// Hard staleness backstop. If the sample is far older than the TTL — which
+	// happens when the refresh slot is held by a statfs stuck on a wedged volume
+	// — we can no longer see the disk, so we stop pretending the last reading is
+	// still true. Freeze admission at what is already used rather than keep
+	// filling a volume we cannot measure: admitting blind against a stale-roomy
+	// ceiling is precisely the founder incident this whole change exists to fix.
+	// The resulting stall is bounded by the wedge backstop in waitForCapacity,
+	// so this degrades to an honest ErrSpoolFull rather than a hang.
+	if at := s.diskAvailAt.Load(); at != 0 && time.Now().UnixNano()-at >= int64(staleCeilingMax) {
+		frozen := s.used.Load()
+		if frozen < minClampedCeiling {
+			frozen = minClampedCeiling // never collide with the 0 == unlimited sentinel
+		}
+		return frozen, true
+	}
+	c := s.capCeiling.Load()
+	if c < 0 {
+		return 0, false
+	}
+	return c, true
+}
+
+// DiskConstrained reports whether the live free-disk clamp — not the configured
+// budget — is what is currently blocking admission. True means more spool bytes
+// cannot be accepted because the VOLUME is at its floor.
+//
+// Used by the capacity stall to decide whether waiting can ever help: while
+// offline, a stall normally waits forever on the assumption that reconnecting
+// lets the drain free space. That assumption is false when the blocker is local
+// disk consumed by something other than the spool, and waiting forever there is
+// an unbounded Finder hang with no error. See waitForCapacity.
+func (s *SpoolStore) DiskConstrained() bool {
+	if s.capacity <= 0 {
+		return false
+	}
+	ceiling, ok := s.cachedCeiling()
+	if !ok {
+		return false
+	}
+	// The DISK is the blocker only when the clamp is below the configured budget
+	// AND there is effectively no headroom left under it. Compare REMAINING
+	// headroom rather than `used >= ceiling`: at the floor with an empty spool
+	// the ceiling is the 1-byte sentinel, so `0 >= 1` would read as unconstrained
+	// exactly when the volume is fullest.
+	remaining := ceiling - s.used.Load()
+	if remaining < 0 {
+		remaining = 0
+	}
+	return ceiling < s.capacity && remaining <= minClampedCeiling
+}
+
+// effectiveCapacity is the cap to enforce RIGHT NOW: the configured capacity,
+// further clamped so the spool can never grow into the free-disk floor.
+//
+// WHY THIS EXISTS (2026-08-03, founder incident: "copying to a JuiceMount volume
+// when local disk is low stalls"). NewSpoolStore clamps the configured capacity
+// to free disk exactly once, at construction. That snapshot is wrong the moment
+// anything else eats the volume — and the thing most likely to eat it is us: the
+// JuiceFS cache grows alongside the spool. Live evidence from the incident: a
+// configured capacity of ~37 GB while only 50 GiB was free, i.e. capacity plus
+// the 20 GiB floor already exceeded the disk.
+//
+// The failure that produces is not a clean ENOSPC. Admission keeps saying yes
+// until `used >= capacity`, but the DISK runs out first, so the write fails
+// underneath the spool and the drainer has nowhere to drain — and because a full
+// spool is designed to STALL (backpressure, so Finder paces itself instead of
+// aborting the copy), the user gets an unbounded hang rather than an error.
+//
+// SCOPE LIMIT, deliberate: a configured capacity of 0 stays truly unlimited and
+// is NOT disk-clamped. "total=0 means unlimited" is the documented /spool
+// contract that consumers branch on, and production never runs unlimited —
+// AutoSpoolCapacity always yields a positive cap, and both call sites reject a
+// sub-1 GiB configuration. Bounding it here would change a public contract to fix
+// an incident that cannot occur with it.
+func (s *SpoolStore) effectiveCapacity() int64 {
+	if s.capacity <= 0 {
+		return s.capacity // unlimited stays unlimited (see SCOPE LIMIT above)
+	}
+	ceiling, ok := s.cachedCeiling()
+	if !ok {
+		// Fail OPEN — an unreadable statfs is not a full disk. An EXPLICIT user
+		// budget is returned in full, unchanged: the user chose that number and
+		// losing sight of the disk is not a reason to override them.
+		//
+		// The AUTO budget is the exception, and only because it is a sentinel
+		// rather than a real limit: at 1 PiB an unbounded fail-open would mean
+		// "unlimited" at exactly the moment we cannot see the disk. In Auto the
+		// live ceiling IS the policy, so with no ceiling there is no policy —
+		// admit a conservative amount instead of everything.
+		if s.capacity == AutoSpoolCapacityBudget {
+			return failOpenMaxBytes
+		}
+		return s.capacity
+	}
+	if s.capacity < ceiling {
+		return s.capacity
+	}
+	return ceiling
+}
+
+// Capacity returns (used, total) bytes. total=0 means unlimited.
+//
+// total is the EFFECTIVE capacity — the configured cap clamped to current free
+// disk — so /spool and the menu bar show the budget actually being enforced
+// rather than a startup snapshot that may be far larger than the disk allows.
+func (s *SpoolStore) Capacity() (used, total int64) {
+	return s.used.Load(), s.effectiveCapacity()
+}
+
+// ConfiguredCapacity returns the capacity as configured at construction, before
+// the live free-disk clamp. Diagnostics only — admission must use
+// effectiveCapacity.
+func (s *SpoolStore) ConfiguredCapacity() int64 { return s.capacity }
 
 // StallWaiters returns the number of writes currently parked in the capacity
 // stall (spool full, blocking for the drainer to free headroom). Surfaced via
 // /spool so the app can show "offline buffer full — N copies waiting".
 func (s *SpoolStore) StallWaiters() int64 {
 	return s.stallWaiters.Load()
+}
+
+// spoolBaseProbe is the drainer-installed base-identity probe.
+type spoolBaseProbe func(nfsPath string) (metadata.SpoolBase, uint64)
+
+// probeBase returns what this Mac knows about the file a new row for nfsPath
+// replaces. Called once per NEW row (never per WRITE RPC).
+func (s *SpoolStore) probeBase(nfsPath string) (metadata.SpoolBase, uint64) {
+	if p := s.baseProbe.Load(); p != nil {
+		return (*p)(nfsPath)
+	}
+	return metadata.SpoolBase{}, 0
 }
 
 // Index returns the in-memory lookup table. Exposed so the NFS handler
@@ -286,7 +634,9 @@ func (s *SpoolStore) Index() *SpoolIndex { return s.index }
 // the index already has an entry for this path, that entry is returned
 // directly (same-path-reopen). This matches the FDPool same-path-dedupe
 // semantics so a single Finder copy's multi-RPC write lifecycle reuses
-// one spool file.
+// one spool file. A finalized but still-unclaimed, non-streaming entry is
+// atomically reopened in place; a row the drainer already claimed is never
+// reopened and keeps the bounded wait/defer path below.
 func (s *SpoolStore) OpenWrite(nfsPath string) (*SpoolEntry, error) {
 	// reopenPoll/reopenMaxWait bound the rare wait for the case where a
 	// PREVIOUS entry for this exact path was finalized but the drainer
@@ -304,6 +654,14 @@ func (s *SpoolStore) OpenWrite(nfsPath string) (*SpoolEntry, error) {
 	// entry (its drain would os.Create-truncate the just-drained backend file and
 	// clobber it); the write is bounced to the in-place fdPool path instead.
 	var sawClosed bool
+	// H-8B base identity for a fresh row. Probed OUTSIDE the shard lock: the
+	// probe may make a bounded backend Lstat (up to drainBaseProbeTimeout), and
+	// holding the shard across it would stall every other open that hashes to
+	// the same shard (the cachedCeiling HIGH of 2026-08-04). The loop re-checks
+	// the index after relocking, so a racing open is still deduplicated.
+	var probed bool
+	var probedBase metadata.SpoolBase
+	var probedEpoch uint64
 
 	// Same path always maps to the same shard, so the check-then-create
 	// dedup below is serialized exactly as the old global openMu did; opens
@@ -315,23 +673,127 @@ func (s *SpoolStore) OpenWrite(nfsPath string) (*SpoolEntry, error) {
 			return nil, fmt.Errorf("spool: store is closed")
 		}
 		shard.Lock()
+		if s.closed.Load() {
+			shard.Unlock()
+			return nil, fmt.Errorf("spool: store is closed")
+		}
+		if s.hasPendingBoundContinuationPath(nfsPath) {
+			shard.Unlock()
+			return nil, &metadata.PendingSpoolContinuation{Cause: metadata.ErrSpoolContinuationConflict}
+		}
 
 		if existing, ok := s.index.Lookup(nfsPath); ok {
 			existing.mu.Lock()
+			if existing.replacement != nil {
+				existing.mu.Unlock()
+				shard.Unlock()
+				return nil, fmt.Errorf("accepted replacement requires a fresh temp save: %w", metadata.ErrMirrorConflict)
+			}
+			if s.hasPendingBoundContinuation(existing.id) {
+				existing.mu.Unlock()
+				shard.Unlock()
+				return nil, &metadata.PendingSpoolContinuation{Cause: metadata.ErrSpoolContinuationConflict}
+			}
+			continuation, inspectErr := s.meta.InspectSpoolContinuation(existing.id, existing.nfsPath, existing.spoolFile)
+			if inspectErr != nil {
+				existing.mu.Unlock()
+				shard.Unlock()
+				return nil, inspectErr
+			}
 			if !existing.closed {
 				// Active writing entry: a per-RPC reopen during the same
 				// write session, or the create→first-write transition.
 				// Reuse it; bump the handle count and touch lastWrite so
 				// the sweeper won't finalize it out from under this open.
-				existing.refcount++
-				existing.lastWrite.Store(time.Now().UnixNano())
+				admit := func() {
+					existing.refcount++
+					existing.lastWrite.Store(time.Now().UnixNano())
+				}
+				var admitErr error
+				if continuation.Legacy {
+					admitErr = s.meta.AdmitLegacyActive(continuation, admit)
+				} else {
+					if _, admitErr = s.qualifyBoundContinuation(continuation, existing.file); admitErr == nil {
+						admitErr = s.meta.AdmitBoundActive(continuation, admit)
+					}
+				}
 				existing.mu.Unlock()
 				shard.Unlock()
+				if admitErr != nil {
+					return nil, admitErr
+				}
 				return existing, nil
 			}
+
+			// Finder and copyfile can revisit a small file tens of seconds after a
+			// COMMIT (notably a directory's `._` sidecar). The five-second small-
+			// file idle finalizer used to put that continuation behind the entire
+			// ready queue: OpenWrite waited 30s for drain eviction and returned
+			// JUKEBOX repeatedly. If the row is still READY, it has not been
+			// claimed and its unpunched spool file is still the authoritative whole
+			// image. Reopen that SAME file and row in place. ReopenReady is the CAS
+			// against a concurrent drainer; if the drainer won, it returns false and
+			// we retain the corruption-safe wait/defer behavior.
+			//
+			// Keep streamed entries out even before the durable CAS. A streaming
+			// row can have bytes only in streamDest after punching, so an ordinary
+			// reopen of its sparse spool image is never safe. The metadata CAS also
+			// requires punched_end=0 so this in-memory check is not the safety gate.
+			canReopenReady := existing.punchedEnd == 0 && existing.streamDest == "" && existing.writtenEnd < spoolStreamMinSize
+			if canReopenReady {
+				var f *os.File
+				var openErr error
+				if continuation.Legacy {
+					f, openErr = os.OpenFile(existing.spoolFile, os.O_RDWR, 0)
+				} else {
+					f, openErr = s.qualifyBoundContinuation(continuation, nil)
+				}
+				if openErr != nil && !continuation.Legacy {
+					existing.mu.Unlock()
+					shard.Unlock()
+					return nil, openErr
+				}
+				if openErr == nil {
+					var reopened bool
+					var reopenErr error
+					if continuation.Legacy {
+						reopened, reopenErr = s.meta.ReopenReady(existing.id)
+					} else {
+						transition := s.boundReadyTransition
+						if transition == nil {
+							transition = s.meta.ReopenBoundReady
+						}
+						reopened, reopenErr = transition(continuation, func() { existing.resumeReadyLocked(f) })
+					}
+					if reopenErr != nil {
+						var pending *metadata.PendingSpoolContinuation
+						if !continuation.Legacy && errors.As(reopenErr, &pending) {
+							s.retainPendingBoundContinuation(existing.id, nfsPath, continuation.File, f)
+						} else {
+							_ = f.Close()
+						}
+						existing.mu.Unlock()
+						shard.Unlock()
+						return nil, reopenErr
+					}
+					if reopened {
+						if continuation.Legacy {
+							existing.resumeReadyLocked(f)
+						}
+						id := existing.id
+						existing.mu.Unlock()
+						shard.Unlock()
+						jmlog.Info("spool: reopened finalized ready entry for continuation write",
+							"path", nfsPath, "entry_id", id)
+						return existing, nil
+					}
+					_ = f.Close()
+				}
+			}
 			// Finalized-but-not-yet-drained entry holds this path. Don't
-			// reuse (writes would fail) and don't create a competing entry
-			// (dup drain). Wait for the drainer to evict it.
+			// reuse after the drainer has claimed it (writes would race the
+			// copy) and don't create a competing entry (dup drain). Wait for
+			// the drainer to evict it.
 			sawClosed = true
 			busyID := existing.id
 			existing.mu.Unlock()
@@ -370,7 +832,13 @@ func (s *SpoolStore) OpenWrite(nfsPath string) (*SpoolEntry, error) {
 		}
 
 		// No entry for this path — create a fresh one under the path shard.
-		if s.capacity > 0 && s.used.Load() >= s.capacity {
+		if !probed {
+			shard.Unlock()
+			probedBase, probedEpoch = s.probeBase(nfsPath)
+			probed = true
+			continue
+		}
+		if ec := s.effectiveCapacity(); ec > 0 && s.used.Load() >= ec {
 			// Spool full. Release the shard and STALL — block (per
 			// waitForCapacity) for the drainer to free headroom rather than
 			// hard-fail the create, so a large copy paces itself to drain
@@ -395,7 +863,9 @@ func (s *SpoolStore) OpenWrite(nfsPath string) (*SpoolEntry, error) {
 		basename := hex.EncodeToString(h[:8]) + fmt.Sprintf("-%d", time.Now().UnixMicro())
 		spoolFile := filepath.Join(s.root, SpoolFilesSubdir, basename)
 
-		id, err := s.meta.Insert(nfsPath, spoolFile)
+		// H-8B: record what this write replaces (or "absent"), so the drain
+		// can tell the user's save from a file another writer put there.
+		id, err := s.meta.InsertWithBase(nfsPath, spoolFile, probedBase, probedEpoch)
 		if err != nil {
 			shard.Unlock()
 			return nil, err
@@ -423,8 +893,173 @@ func (s *SpoolStore) OpenWrite(nfsPath string) (*SpoolEntry, error) {
 			store:     s,
 			refcount:  1,
 		}
+		entry.initialIdentity, _ = liveSpoolIdentity(f)
+		entry.cohortID.Store(id)
+		entry.writing.Store(true)
 		entry.lastWrite.Store(time.Now().UnixNano())
 		s.index.Insert(nfsPath, entry)
+		s.revokeConflictRead(nfsPath)
+		shard.Unlock()
+		return entry, nil
+	}
+}
+
+// OpenWriteExpected admits only the active row resolved by the original NFS
+// handle. It deliberately cannot create/reopen a row or fall back by pathname.
+func (s *SpoolStore) OpenWriteExpected(nfsPath string, expected *SpoolEntry, expectedID int64) (*SpoolEntry, error) {
+	if expected == nil || expectedID <= 0 || s.closed.Load() {
+		return nil, ErrSpoolBusy
+	}
+	shard := s.pathShard(nfsPath)
+	shard.Lock()
+	defer shard.Unlock()
+	if s.closed.Load() || s.hasPendingBoundContinuationPath(nfsPath) {
+		return nil, ErrSpoolBusy
+	}
+	current, ok := s.index.Lookup(nfsPath)
+	if !ok || current != expected || current.cohortID.Load() != expectedID {
+		return nil, ErrSpoolBusy
+	}
+	current.mu.Lock()
+	defer current.mu.Unlock()
+	if current.id != expectedID || current.nfsPath != nfsPath || current.closed || current.file == nil || s.hasPendingBoundContinuation(expectedID) {
+		return nil, ErrSpoolBusy
+	}
+	continuation, err := s.meta.InspectSpoolContinuation(current.id, current.nfsPath, current.spoolFile)
+	if err != nil {
+		return nil, err
+	}
+	admit := func() {
+		current.refcount++
+		current.lastWrite.Store(time.Now().UnixNano())
+	}
+	if continuation.Legacy {
+		err = s.meta.AdmitLegacyActive(continuation, admit)
+	} else {
+		if _, err = s.qualifyBoundContinuation(continuation, current.file); err == nil {
+			err = s.meta.AdmitBoundActive(continuation, admit)
+		}
+	}
+	if err != nil {
+		return nil, err
+	}
+	return current, nil
+}
+
+// OpenWriteSeeded creates a new writing entry whose initial whole-file image is
+// seed. The path shard is held until the seed is durable and the entry is
+// published in the index, so a concurrent NFS WRITE can never race ahead of the
+// initializer and then be overwritten by it.
+//
+// This is intentionally narrower than a generic backend-file copy-up. Its
+// caller uses it only for small Finder metadata files whose complete previous
+// body was verified in the sidecar cache before the machine went offline. Real
+// media and any metadata file without a complete cached image continue to fail
+// closed rather than manufacture zero-filled untouched ranges.
+func (s *SpoolStore) OpenWriteSeeded(nfsPath string, seed []byte) (*SpoolEntry, error) {
+	if len(seed) == 0 {
+		return s.OpenWrite(nfsPath)
+	}
+
+	shard := s.pathShard(nfsPath)
+	reserved := false
+	// H-8B: probed outside the shard lock (see OpenWrite).
+	probedBase, probedEpoch := s.probeBase(nfsPath)
+	for {
+		if s.closed.Load() {
+			if reserved {
+				s.releaseCapacity(int64(len(seed)))
+			}
+			return nil, fmt.Errorf("spool: store is closed")
+		}
+
+		shard.Lock()
+		if s.closed.Load() {
+			shard.Unlock()
+			if reserved {
+				s.releaseCapacity(int64(len(seed)))
+			}
+			return nil, fmt.Errorf("spool: store is closed")
+		}
+		if s.hasPendingBoundContinuationPath(nfsPath) {
+			shard.Unlock()
+			if reserved {
+				s.releaseCapacity(int64(len(seed)))
+			}
+			return nil, &metadata.PendingSpoolContinuation{Cause: metadata.ErrSpoolContinuationConflict}
+		}
+		if _, exists := s.index.Lookup(nfsPath); exists {
+			shard.Unlock()
+			if reserved {
+				s.releaseCapacity(int64(len(seed)))
+			}
+			// The winner published only after its seed was durable. Reuse that
+			// authoritative entry through the normal refcount/reopen path.
+			return s.OpenWrite(nfsPath)
+		}
+
+		if !reserved {
+			if !s.tryReserveCapacity(int64(len(seed))) {
+				shard.Unlock()
+				if !s.reserveCapacityOrWait(int64(len(seed)), nil) {
+					return nil, ErrSpoolFull
+				}
+				reserved = true
+				continue
+			}
+			reserved = true
+		}
+
+		h := sha256.Sum256([]byte(nfsPath))
+		basename := hex.EncodeToString(h[:8]) + fmt.Sprintf("-%d", time.Now().UnixMicro())
+		spoolFile := filepath.Join(s.root, SpoolFilesSubdir, basename)
+
+		id, err := s.meta.InsertWithBase(nfsPath, spoolFile, probedBase, probedEpoch)
+		if err != nil {
+			shard.Unlock()
+			s.releaseCapacity(int64(len(seed)))
+			return nil, err
+		}
+		f, err := os.OpenFile(spoolFile, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
+		if err != nil {
+			_ = s.meta.Delete(id)
+			shard.Unlock()
+			s.releaseCapacity(int64(len(seed)))
+			return nil, fmt.Errorf("spool: open seeded file: %w", err)
+		}
+		n, writeErr := f.WriteAt(seed, 0)
+		if writeErr != nil || n != len(seed) {
+			_ = f.Close()
+			_ = os.Remove(spoolFile)
+			_ = s.meta.Delete(id)
+			shard.Unlock()
+			s.releaseCapacity(int64(len(seed)))
+			if writeErr == nil {
+				writeErr = fmt.Errorf("short write: %d of %d", n, len(seed))
+			}
+			return nil, fmt.Errorf("spool: seed whole-file image: %w", writeErr)
+		}
+
+		hasher := sha256.New()
+		_, _ = hasher.Write(seed)
+		entry := &SpoolEntry{
+			id:            id,
+			nfsPath:       nfsPath,
+			spoolFile:     spoolFile,
+			file:          f,
+			writtenEnd:    int64(len(seed)),
+			contiguousEnd: int64(len(seed)),
+			hasher:        hasher,
+			hashValid:     true,
+			store:         s,
+			refcount:      1,
+		}
+		entry.initialIdentity, _ = liveSpoolIdentity(f)
+		entry.cohortID.Store(id)
+		entry.writing.Store(true)
+		entry.lastWrite.Store(time.Now().UnixNano())
+		s.index.Insert(nfsPath, entry)
+		s.revokeConflictRead(nfsPath)
 		shard.Unlock()
 		return entry, nil
 	}
@@ -459,10 +1094,9 @@ func (s *SpoolStore) sweepOnce(idle time.Duration) int {
 	// (Finder mislabels it "name too long/invalid"). Holding entries in
 	// `writing` across the offline window lets a resumed WRITE reuse them via
 	// OpenWrite's !closed branch; on reconnect the next sweep finalizes any
-	// genuinely-idle entry → drains. Durability is safe across an offline
-	// restart: RecoverOnBoot's DrainWriting case hashes the on-disk file (not
-	// the DB Size, which stays 0 until finalize) and resumes a `writing` row
-	// with real bytes to `ready`, so an offline-ingested file is never lost.
+	// genuinely-idle entry → drains. Orderly shutdown separately proves complete
+	// received images after quiescence. Boot holds unproved writing rows; a
+	// pathname hash alone cannot establish that every byte was received.
 	if pin.IsOffline() {
 		return 0
 	}
@@ -492,7 +1126,9 @@ func (s *SpoolStore) StartSweeper(idle, tick time.Duration) (stop func()) {
 		tick = 1 * time.Second
 	}
 	done := make(chan struct{})
+	exited := make(chan struct{})
 	go func() {
+		defer close(exited)
 		t := time.NewTicker(tick)
 		defer t.Stop()
 		// QA-38: garbage-collect finished `done` spool rows. DeleteDone was
@@ -527,7 +1163,10 @@ func (s *SpoolStore) StartSweeper(idle, tick time.Duration) (stop func()) {
 		}
 	}()
 	var once sync.Once
-	return func() { once.Do(func() { close(done) }) }
+	return func() {
+		once.Do(func() { close(done) })
+		<-exited
+	}
 }
 
 // SetStuckEscalationWindow overrides the quiescence window after which a
@@ -541,6 +1180,58 @@ func (s *SpoolStore) SetStuckEscalationWindow(d time.Duration) {
 // exists. O(1). Used by the read path in slice D.
 func (s *SpoolStore) LookupActive(nfsPath string) (*SpoolEntry, bool) {
 	return s.index.Lookup(nfsPath)
+}
+
+// ReadFault is a local O(1) guard. It deliberately does no SQLite or FUSE I/O.
+func (s *SpoolStore) ReadFault(path string) bool {
+	v, ok := s.readFaults.Load(path)
+	if !ok {
+		return false
+	}
+	if e, active := s.index.Lookup(path); active && e.ID() > v.(int64) {
+		return false
+	}
+	return true
+}
+
+// ReadFaultUnder is for namespace mutations only. A directory rename/delete
+// must not strand an unresolved saved child by moving its parent away.
+func (s *SpoolStore) ReadFaultUnder(path string) bool {
+	if s.ReadFault(path) {
+		return true
+	}
+	prefix := strings.TrimSuffix(path, "/") + "/"
+	found := false
+	s.readFaults.Range(func(k, _ any) bool {
+		name := k.(string)
+		if strings.HasPrefix(name, prefix) && s.ReadFault(name) {
+			found = true
+			return false
+		}
+		return true
+	})
+	return found
+}
+
+func (s *SpoolStore) blockRead(path string, id int64) {
+	for {
+		v, ok := s.readFaults.Load(path)
+		if !ok {
+			if _, loaded := s.readFaults.LoadOrStore(path, id); !loaded {
+				return
+			}
+			continue
+		}
+		if v.(int64) >= id || s.readFaults.CompareAndSwap(path, v, id) {
+			return
+		}
+	}
+}
+
+func (s *SpoolStore) clearReadFault(path string, id int64) {
+	if v, ok := s.readFaults.Load(path); ok && v.(int64) <= id {
+		s.readFaults.CompareAndDelete(path, v)
+	}
 }
 
 // HasPending reports whether volRelPath has a live spool entry that has not
@@ -598,6 +1289,9 @@ func (s *SpoolStore) EvictIndex(nfsPath string, id int64) bool {
 	if s == nil || s.index == nil {
 		return false
 	}
+	if s.hasPendingBoundContinuation(id) || s.hasPendingBoundContinuationPath(nfsPath) {
+		return false
+	}
 	if e, ok := s.index.Lookup(nfsPath); ok && e.ID() == id {
 		return s.index.DeleteIfMatches(nfsPath, e)
 	}
@@ -624,9 +1318,8 @@ func (s *SpoolStore) Manifest() *manifestWriter { return s.manifest }
 // RecoveryReport summarizes what the boot scrubber did. Returned by
 // RecoverOnBoot for log aggregation + admin UX.
 type RecoveryReport struct {
-	// OrphanFilesDeleted: files in the spool dir with no SQL row →
-	// removed. Cleans up half-created files from a crash between
-	// metadata.Insert and the first WriteAt.
+	// OrphanFilesDeleted is retained for report compatibility. Recovery no
+	// longer deletes unindexed entries, so this remains zero.
 	OrphanFilesDeleted int
 
 	// OrphanRowsFailed: SQL rows in `ready` or `draining` state whose
@@ -675,28 +1368,28 @@ type RecoveryReport struct {
 //
 // State transition rules:
 //
-//	file orphan (no SQL row)        → delete file
-//	row.writing  → mark failed + delete (best-effort) the partial file
+//	file orphan (no SQL row)        → preserve and refuse startup
+//	row.writing  → file with bytes: hash and resume as ready
+//	             → missing/empty: mark failed; remove empty file
 //	row.ready    → file present  : add bytes to capacity counter, leave state
 //	             → file missing  : mark failed
 //	row.draining → file present  : reset to ready (drainer retries)
 //	             → file missing  : mark failed
 //	row.done     → file present  : reclaim stale leftover (already in MinIO)
 //	row.failed   → intact copy (size==row.Size>0): reset to ready + re-drive
-//	             → writing-crash partial (row.Size==0): reclaim
+//	             → nonempty size-zero: preserve and refuse automatic recovery
+//	             → empty size-zero: reclaim
 //	             → size mismatch / missing: preserve (never delete >0 bytes)
 //
 // Files inside spool_root/quarantine/ are forensic state preserved by
 // the drainer's SHA-mismatch path; they are NOT touched here.
 //
-// The in-memory index (s.index) is NOT repopulated. `writing`-state
-// entries are gone (we marked them failed); reads of those paths will
-// fall through to FUSE. `ready`/`draining` paths haven't reached FUSE
-// yet either, so reads briefly return ENOENT until the drainer copies
-// them in. Same window as slice C's known limitation.
+// Qualified latest ready sources repopulate the in-memory read index before
+// serving. Retired histories remain on disk for evidence and are never
+// requeued or installed as a read shadow.
 //
-// Errors from ListAll or ReadDir are returned; per-row state-transition
-// errors are logged but do not abort the reconciliation.
+// A directory or SQL reconciliation error leaves recovery incomplete and
+// must prevent the bridge from publishing an NFS listener.
 func (s *SpoolStore) RecoverOnBoot(ctx context.Context) (RecoveryReport, error) {
 	var report RecoveryReport
 
@@ -712,16 +1405,41 @@ func (s *SpoolStore) RecoverOnBoot(ctx context.Context) (RecoveryReport, error) 
 	if wakeSet {
 		panic("nfs/spool: RecoverOnBoot called after drainer.Start — must run before SetSpool/Start")
 	}
-
-	// Reset the capacity counter before re-accounting. Idempotent
-	// recovery: a second call must produce the same `used` value as
-	// the first, not a doubled one. Safe because the guard above
-	// proves no drainer / writer is mutating s.used concurrently.
-	s.used.Store(0)
+	if err := s.meta.CheckBoundEffectsRecovery(); err != nil {
+		return report, fmt.Errorf("recover: %w", err)
+	}
+	if err := s.checkPrivateBirthIntentRecovery(); err != nil {
+		return report, fmt.Errorf("recover: %w", err)
+	}
+	if err := s.meta.CheckSpoolBirthRecovery(); err != nil {
+		return report, fmt.Errorf("recover: %w", err)
+	}
+	if err := s.meta.CheckPunchedSpoolRecovery(); err != nil {
+		return report, fmt.Errorf("recover: %w", err)
+	}
+	if err := s.meta.CheckDrainCompletionRecovery(); err != nil {
+		return report, fmt.Errorf("recover: %w", err)
+	}
 
 	rows, err := s.meta.ListAll()
 	if err != nil {
 		return report, fmt.Errorf("recover: list rows: %w", err)
+	}
+
+	if err := s.checkReplacementRecovery(ctx, rows); err != nil {
+		return report, err
+	}
+
+	// Only the highest row ID owns a pathname after restart. Include terminal
+	// rows: a newer failed/done successor must never resurrect an older source.
+	latest := make(map[string]int64, len(rows))
+	for _, r := range rows {
+		if r.RetiredBy != 0 {
+			continue
+		}
+		if r.ID > latest[r.NFSPath] {
+			latest[r.NFSPath] = r.ID
+		}
 	}
 
 	// Build the set of file paths SQL knows about so we can detect
@@ -738,35 +1456,90 @@ func (s *SpoolStore) RecoverOnBoot(ctx context.Context) (RecoveryReport, error) 
 	actualFiles := make(map[string]bool)
 	if dirents, err := os.ReadDir(filesDir); err == nil {
 		for _, d := range dirents {
-			if d.IsDir() {
-				continue
+			if err := ctx.Err(); err != nil {
+				return report, err
 			}
 			full := filepath.Join(filesDir, d.Name())
-			actualFiles[full] = true
 			if _, ok := expectedFiles[full]; !ok {
-				if rmErr := os.Remove(full); rmErr == nil {
-					report.OrphanFilesDeleted++
-					log.Printf("spool recover: orphan file deleted: %s", full)
-				} else {
-					log.Printf("spool recover: orphan file remove failed: %s: %v", full, rmErr)
-				}
+				// An observed zero length proves nothing about a later unlink:
+				// another process may append or replace the entry meanwhile.
+				return report, fmt.Errorf("recover: unindexed spool entry %s preserved for manual recovery: %w", full, ErrSpoolOrphanBytes)
 			}
+			// DirEntry.Info uses lstat semantics for symlinks. Never follow an
+			// indexed link or descend into an indexed directory.
+			info, infoErr := d.Info()
+			if infoErr != nil {
+				return report, fmt.Errorf("recover: inspect spool entry %s: %w", full, infoErr)
+			}
+			if !info.Mode().IsRegular() {
+				return report, fmt.Errorf("recover: nonregular spool entry %s (%s) requires manual recovery", full, info.Mode().Type())
+			}
+			actualFiles[full] = true
 		}
-	} else if !os.IsNotExist(err) {
-		// Note: missing files dir is fine on fresh install. Other
-		// errors (permission etc) are unusual; log + continue with
-		// SQL reconciliation only.
-		log.Printf("spool recover: readdir %s: %v", filesDir, err)
+	} else if os.IsNotExist(err) {
+		if len(rows) != 0 {
+			return report, fmt.Errorf("recover: spool files dir %s is missing with %d recorded rows: %w", filesDir, len(rows), err)
+		}
+	} else {
+		return report, fmt.Errorf("recover: read spool files dir %s: %w", filesDir, err)
 	}
+
+	// Reset only after every unindexed private file has been ruled out.
+	// A failed preparation may have created a file before its intent, and
+	// orphan refusal must preserve the in-memory reservation too.
+	s.used.Store(0)
+	s.replacementCleanupCharges.Clear()
 
 	// Reconcile per-row.
 	for _, r := range rows {
 		if ctx.Err() != nil {
 			return report, ctx.Err()
 		}
+		if r.RetiredBy != 0 {
+			continue // evidence has no retry, read or namespace authority
+		}
 		fileExists := actualFiles[r.SpoolFile]
+		if witness, err := s.meta.ReplacementWitness(r); err != nil {
+			return report, err
+		} else if witness != nil && r.DrainState == metadata.DrainDone {
+			journal, err := s.meta.ReplacementPublication(r)
+			if err != nil || journal == nil {
+				return report, metadata.ErrMirrorConflict
+			}
+			switch journal.Phase {
+			case metadata.ReplacementPublicationSettled:
+				// checkReplacementRecovery verified exact private custody/hash
+				// before reset. Retain capacity; normal cache reads own serving.
+				s.used.Add(r.Size)
+				s.replacementCleanupCharges.Store(r.ID, replacementCleanupCharge{size: r.Size})
+			case metadata.ReplacementPublicationCleaned:
+				// Historical receipt: preserve any unexpected file at this name.
+			default:
+				return report, metadata.ErrMirrorConflict
+			}
+			continue // never run generic DONE pathname cleanup
+		}
+		if r.ID != latest[r.NFSPath] && r.DrainState != metadata.DrainDone {
+			// A successor owns this name. Keep the older bytes as operator
+			// evidence, but never queue them to resurrect an earlier save.
+			if r.DrainState != metadata.DrainFailed {
+				if _, err := s.meta.MarkFailed(r.ID, "boot recovery: superseded by a newer save"); err != nil {
+					return report, fmt.Errorf("recover superseded row %d: %w", r.ID, err)
+				}
+			}
+			continue
+		}
 		switch r.DrainState {
 		case metadata.DrainWriting:
+			if s.meta.Owner() != nil {
+				// The row never finalized a digest or durable written extents.
+				// A size-matching sparse file can still contain fabricated zeros.
+				if _, err := s.meta.HoldUnqualified(r.ID, r.NFSPath, r.SpoolFile, "boot recovery: interrupted write lacks a complete saved-byte proof"); err != nil {
+					return report, fmt.Errorf("recover interrupted row %d: %w", r.ID, err)
+				}
+				report.WritingFailedRows++
+				continue
+			}
 			// RESUME the written data instead of discarding it. A crash / power
 			// loss after the client COMMITted (onCommit now fsyncs the spool
 			// file) must not lose acknowledged bytes — so finalize the on-disk
@@ -780,12 +1553,16 @@ func (s *SpoolStore) RecoverOnBoot(ctx context.Context) (RecoveryReport, error) 
 			var sz int64
 			var hErr error
 			if fileExists {
-				sha, sz, hErr = hashSpoolFile(r.SpoolFile)
+				sha, sz, hErr = s.hashFileOnRecovery(r.SpoolFile)
 			}
-			if !fileExists || hErr != nil || sz == 0 {
-				if _, mErr := s.meta.MarkFailed(r.ID, "writing-state row recovered after crash (no recoverable data)"); mErr != nil {
-					log.Printf("spool recover: mark writing→failed %d: %v", r.ID, mErr)
-					continue
+			if hErr != nil {
+				return report, fmt.Errorf("recover: hash writing row %d spool file %s: %w", r.ID, r.SpoolFile, hErr)
+			}
+			if !fileExists || sz == 0 {
+				if changed, mErr := s.meta.MarkFailed(r.ID, "writing-state row recovered after crash (no recoverable data)"); mErr != nil {
+					return report, fmt.Errorf("recover: mark writing row %d failed: %w", r.ID, mErr)
+				} else if !changed {
+					return report, fmt.Errorf("recover: writing row %d disappeared before failure transition", r.ID)
 				}
 				if fileExists {
 					if rmErr := os.Remove(r.SpoolFile); rmErr != nil && !os.IsNotExist(rmErr) {
@@ -794,8 +1571,7 @@ func (s *SpoolStore) RecoverOnBoot(ctx context.Context) (RecoveryReport, error) 
 				}
 				report.WritingFailedRows++
 			} else if mErr := s.meta.MarkReady(r.ID, sz, sha); mErr != nil {
-				log.Printf("spool recover: resume writing→ready %d: %v", r.ID, mErr)
-				continue
+				return report, fmt.Errorf("recover: resume writing row %d: %w", r.ID, mErr)
 			} else {
 				s.used.Add(sz)
 				report.WritingResumed++
@@ -803,9 +1579,10 @@ func (s *SpoolStore) RecoverOnBoot(ctx context.Context) (RecoveryReport, error) 
 
 		case metadata.DrainReady:
 			if !fileExists {
-				if _, mErr := s.meta.MarkFailed(r.ID, "ready-state row missing spool file after crash"); mErr != nil {
-					log.Printf("spool recover: mark ready→failed %d: %v", r.ID, mErr)
-					continue
+				if changed, mErr := s.meta.MarkFailed(r.ID, "ready-state row missing spool file after crash"); mErr != nil {
+					return report, fmt.Errorf("recover: mark ready row %d failed: %w", r.ID, mErr)
+				} else if !changed {
+					return report, fmt.Errorf("recover: ready row %d disappeared before failure transition", r.ID)
 				}
 				report.OrphanRowsFailed++
 			} else {
@@ -816,15 +1593,15 @@ func (s *SpoolStore) RecoverOnBoot(ctx context.Context) (RecoveryReport, error) 
 
 		case metadata.DrainDraining:
 			if !fileExists {
-				if _, mErr := s.meta.MarkFailed(r.ID, "draining-state row missing spool file after crash"); mErr != nil {
-					log.Printf("spool recover: mark draining→failed %d: %v", r.ID, mErr)
-					continue
+				if changed, mErr := s.meta.MarkFailed(r.ID, "draining-state row missing spool file after crash"); mErr != nil {
+					return report, fmt.Errorf("recover: mark draining row %d failed: %w", r.ID, mErr)
+				} else if !changed {
+					return report, fmt.Errorf("recover: draining row %d disappeared before failure transition", r.ID)
 				}
 				report.OrphanRowsFailed++
 			} else {
 				if rErr := s.meta.ResetToReady(r.ID); rErr != nil {
-					log.Printf("spool recover: reset draining→ready %d: %v", r.ID, rErr)
-					continue
+					return report, fmt.Errorf("recover: reset draining row %d: %w", r.ID, rErr)
 				}
 				s.used.Add(r.Size)
 				report.DrainingReset++
@@ -857,27 +1634,78 @@ func (s *SpoolStore) RecoverOnBoot(ctx context.Context) (RecoveryReport, error) 
 			//   • intact (row.Size > 0 && on-disk size == row.Size): the
 			//     full copy survived. Reset to `ready` (fresh attempt budget)
 			//     so THIS boot re-drives it now that the destination is back.
-			//   • writing-crash leftover (row.Size == 0): never finalized,
-			//     the user already re-copied — reclaim the partial (slice-F).
+			//   • row.Size == 0 with bytes on disk: ambiguous. COMMIT can
+			//     acknowledge a writing file before its close publishes size,
+			//     so preserve the bytes and refuse automatic recovery.
+			//   • truly empty file: reclaim it.
 			//   • ambiguous (row.Size > 0 but size mismatch): PRESERVE, leave
 			//     failed for the operator. We do not delete >0 finalized bytes.
 			if !fileExists {
 				break // already lost upstream; nothing on disk to recover
 			}
 			fi, statErr := os.Stat(r.SpoolFile)
-			diskSize := int64(-1)
-			if statErr == nil {
-				diskSize = fi.Size()
+			if statErr != nil {
+				return report, fmt.Errorf("recover: stat failed row %d spool file %s: %w", r.ID, r.SpoolFile, statErr)
 			}
+			diskSize := fi.Size()
+			// A SIZE MATCH NO LONGER PROVES THE FILE IS INTACT.
+			//
+			// The streaming drain punches drained prefixes out of the spool file,
+			// and F_PUNCHHOLE leaves the LOGICAL size unchanged — so a half-punched
+			// file passes `diskSize == r.Size` exactly while its first punchedEnd
+			// bytes read as zeros. Resuming it would copy the WHOLE file to the
+			// backend and overwrite real, already-durable bytes with those zeros:
+			// silent, total loss of the streamed prefix.
+			//
+			// The preflight above refuses unresolved punched rows before any
+			// recovery mutation. Published rows may reach here; never resume
+			// their hole-punched source as a whole file.
+			punchedEnd, peErr := s.meta.PunchedEnd(r.ID)
+			if peErr != nil {
+				return report, fmt.Errorf("recover: read punched_end for failed row %d: %w", r.ID, peErr)
+			}
+
 			switch {
-			case r.Size > 0 && diskSize == r.Size:
-				if ok, rErr := s.meta.ResetForRetry(r.ID); rErr != nil {
-					log.Printf("spool recover: failed→ready reset %d: %v", r.ID, rErr)
+			case punchedEnd > 0:
+				// Streamed and partly reclaimed. The backend already holds
+				// [0,punchedEnd) durably; the spool file cannot reconstruct it.
+				// Preserve for the operator rather than destroy or re-drain.
+				log.Printf("spool recover: row %d was streamed (punched_end=%d) — "+
+					"NOT resuming from the spool file, whose first %d bytes are holes. "+
+					"The backend holds that prefix; preserving %s",
+					r.ID, punchedEnd, punchedEnd, r.SpoolFile)
+			case r.QualificationHold != "" || r.ID != latest[r.NFSPath] || isConflictCopyFailure(r.LastError) ||
+				(!r.PauseSince.IsZero() && drainPauseNow().Sub(r.PauseSince) >= drainPauseCap):
+				// Terminal and superseded failures remain operator evidence.
+			case diskSize == r.Size && (r.Size > 0 || len(r.SHA256) == sha256.Size):
+				if s.meta.Owner() != nil {
+					if len(r.SHA256) != sha256.Size {
+						break
+					}
+					sha, size, hashErr := s.hashFileOnRecovery(r.SpoolFile)
+					if hashErr != nil || size != r.Size || !bytes.Equal(sha, r.SHA256) {
+						log.Printf("spool recover: failed row %d has unverified local bytes; preserving", r.ID)
+						break
+					}
+				}
+				reset := s.meta.ResetForRetry
+				if !r.PauseSince.IsZero() {
+					reset = s.meta.ResumeFailedPaused
+				}
+				if ok, rErr := reset(r.ID); rErr != nil {
+					return report, fmt.Errorf("recover: reset failed row %d: %w", r.ID, rErr)
 				} else if ok {
 					s.used.Add(r.Size)
 					report.FailedResumed++
+				} else {
+					return report, fmt.Errorf("recover: failed row %d disappeared before retry transition", r.ID)
 				}
+			case r.Size == 0 && diskSize > 0:
+				return report, fmt.Errorf("recover: failed row %d has %d unclassified local bytes at %s", r.ID, diskSize, r.SpoolFile)
 			case r.Size == 0:
+				if r.ID == latest[r.NFSPath] {
+					break
+				} // ambiguous latest empty write
 				if rmErr := os.Remove(r.SpoolFile); rmErr != nil {
 					log.Printf("spool recover: failed-row partial file remove %s: %v", r.SpoolFile, rmErr)
 				}
@@ -887,9 +1715,115 @@ func (s *SpoolStore) RecoverOnBoot(ctx context.Context) (RecoveryReport, error) 
 			}
 		}
 	}
+	if err := s.restoreReadAuthority(ctx, latest); err != nil {
+		return report, err
+	}
 
 	log.Printf("spool recover: %+v", report)
+	s.bootSweep.Store(&bootSweepInventory{rows: rows})
 	return report, nil
+}
+
+// restoreReadAuthority runs before SetSpool publishes this store to NFS. It
+// validates the latest durable source once, then installs an O(1) RAM shadow;
+// no read request ever needs SQLite or a backend probe to find saved bytes.
+func (s *SpoolStore) restoreReadAuthority(ctx context.Context, latest map[string]int64) error {
+	if s.meta.Owner() == nil {
+		return nil
+	} // standalone scrubber has no NFS listener
+	rows, err := s.meta.ListAll() // see reconciled states, not the pre-recovery snapshot
+	if err != nil {
+		return fmt.Errorf("recover read authority: %w", err)
+	}
+	held, err := s.meta.ListCloneHeld()
+	if err != nil {
+		return fmt.Errorf("recover clone holds: %w", err)
+	}
+	cloneHeld := make(map[int64]bool, len(held))
+	for _, r := range held {
+		cloneHeld[r.ID] = true
+	}
+	owner := s.meta.Owner()
+	for _, r := range rows {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if r.RetiredBy != 0 || r.ID != latest[r.NFSPath] || r.DrainState == metadata.DrainDone {
+			continue
+		}
+		if cloneHeld[r.ID] {
+			s.blockRead(r.NFSPath, r.ID)
+			continue // a copied save has no local read authority on this Mac
+		}
+		if r.DrainState == metadata.DrainFailed {
+			qualified := false
+			if r.QualificationHold == "" {
+				if isConflictCopyFailure(r.LastError) {
+					qualified = s.qualifyConflictRead(r, 0)
+				} else if len(r.SHA256) == sha256.Size {
+					sha, size, err := s.hashFileOnRecovery(r.SpoolFile)
+					qualified = r.PunchedEnd == 0 && err == nil && size == r.Size && bytes.Equal(sha, r.SHA256)
+				}
+				if !qualified {
+					if _, err := s.meta.HoldUnqualified(r.ID, r.NFSPath, r.SpoolFile, "boot recovery: failed source lacks a complete saved-byte proof"); err != nil {
+						return fmt.Errorf("hold failed row %d: %w", r.ID, err)
+					}
+				}
+			}
+			s.blockRead(r.NFSPath, r.ID)
+			continue
+		}
+		if r.DrainState != metadata.DrainReady {
+			return fmt.Errorf("recover row %d: unexpected state %s", r.ID, r.DrainState)
+		}
+		if len(r.SHA256) != sha256.Size {
+			s.blockRead(r.NFSPath, r.ID)
+			if _, err := s.meta.HoldUnqualified(r.ID, r.NFSPath, r.SpoolFile, "boot recovery: missing finalized digest"); err != nil {
+				return fmt.Errorf("hold row %d: %w", r.ID, err)
+			}
+			s.releaseCapacity(r.Size)
+			continue
+		}
+		sha, size, err := s.hashFileOnRecovery(r.SpoolFile)
+		if err != nil || size != r.Size || !bytes.Equal(sha, r.SHA256) {
+			// Preserve every byte for the operator; refuse the stale backend
+			// image even if marking failed itself encounters a database error.
+			s.blockRead(r.NFSPath, r.ID)
+			if _, markErr := s.meta.HoldUnqualified(r.ID, r.NFSPath, r.SpoolFile, "boot recovery: local saved bytes failed integrity verification"); markErr != nil {
+				return fmt.Errorf("recover row %d integrity transition: %w", r.ID, markErr)
+			}
+			s.releaseCapacity(r.Size)
+			continue
+		}
+		if cloneHeld[r.ID] || r.PunchedEnd != 0 || r.QualificationHold != "" {
+			s.blockRead(r.NFSPath, r.ID)
+			continue
+		}
+		if owner == nil {
+			continue
+		} // standalone spool recovery has no NFS listener
+		if _, err := s.meta.InspectSpoolContinuation(r.ID, r.NFSPath, r.SpoolFile); err != nil {
+			return fmt.Errorf("recover row %d continuation custody: %w", r.ID, err)
+		}
+		mirror := owner.LookupByPath(r.NFSPath)
+		if mirror == nil && strings.HasPrefix(r.NFSPath, "/") {
+			mirror = owner.LookupByPath(strings.TrimPrefix(r.NFSPath, "/"))
+		}
+		if mirror == nil || mirror.Inode == 0 || mirror.IsDir {
+			return fmt.Errorf("recover row %d: saved bytes have no qualified mirror inode", r.ID)
+		}
+		witness, err := s.meta.ReplacementWitness(r)
+		if err != nil {
+			return err
+		}
+		e := &SpoolEntry{id: r.ID, nfsPath: r.NFSPath, spoolFile: r.SpoolFile,
+			writtenEnd: r.Size, contiguousEnd: r.Size, closed: true, store: s, replacement: witness}
+		e.cohortID.Store(r.ID)
+		e.SetInode(mirror.Inode)
+		e.lastWrite.Store(r.UpdatedAt.UnixNano())
+		s.index.Insert(r.NFSPath, e)
+	}
+	return nil
 }
 
 // MarkDrainComplete is the success path for the drainer (slice B). It
@@ -911,6 +1845,9 @@ func (s *SpoolStore) RecoverOnBoot(ctx context.Context) (RecoveryReport, error) 
 // between SQL success and the post-SQL cleanup (in that narrow window
 // the file exists on disk + capacity stays counted, harmless).
 func (s *SpoolStore) MarkDrainComplete(id int64, nfsPath, spoolFile string, size int64) (bool, error) {
+	if s.hasPendingBoundContinuation(id) || s.hasPendingBoundContinuationPath(nfsPath) {
+		return false, &metadata.PendingSpoolContinuation{Cause: metadata.ErrSpoolContinuationConflict}
+	}
 	done, err := s.meta.MarkDone(id)
 	if err != nil {
 		return false, err
@@ -946,8 +1883,10 @@ func (s *SpoolStore) completeDrainCleanup(id int64, nfsPath, spoolFile string, s
 	// holding an fd are unaffected by the unlink (open-then-unlink Unix
 	// semantics).
 	if e, ok := s.index.Lookup(nfsPath); ok && e.ID() == id {
+		e.retired.Store(true)
 		s.index.DeleteIfMatches(nfsPath, e)
 	}
+	s.clearReadFault(nfsPath, id)
 	s.releaseCapacity(size)
 	// Drain-tail keep-awake: a file genuinely reached the backend, so the Mac
 	// should stay awake to finish the rest of a post-copy / post-reconnect drain
@@ -957,6 +1896,10 @@ func (s *SpoolStore) completeDrainCleanup(id int64, nfsPath, spoolFile string, s
 	if rmErr := os.Remove(spoolFile); rmErr != nil && !os.IsNotExist(rmErr) {
 		log.Printf("spool: drain complete %d: remove %s: %v", id, spoolFile, rmErr)
 	}
+	s.recordDrainDone(id, nfsPath, spoolFile, size)
+}
+
+func (s *SpoolStore) recordDrainDone(id int64, nfsPath, spoolFile string, size int64) {
 	if s.manifest != nil {
 		var (
 			shaHex     string
@@ -984,15 +1927,31 @@ func (s *SpoolStore) completeDrainCleanup(id int64, nfsPath, spoolFile string, s
 	}
 }
 
-// BatchCompleteDrainCleanup runs completeDrainCleanup for one already-committed
-// batched drain (JM_DRAIN_BATCH_INSERT). The size publish + mark-done for this
-// id were committed in metadata.Store.BatchDrainComplete's single transaction;
-// this performs the identical post-commit cleanup the per-file
-// MarkDrainComplete does after its own MarkDone. Exported so the drainer's
-// batch flusher (a different package method surface than MarkDrainComplete) can
-// reuse it verbatim.
-func (s *SpoolStore) BatchCompleteDrainCleanup(id int64, nfsPath, spoolFile string, size int64) {
-	s.completeDrainCleanup(id, nfsPath, spoolFile, size)
+// CompleteAcknowledgedDrain disposes only the source named by an acknowledged
+// completion token. Path-shard -> spool SQL lock matches OpenWrite/rename.
+func (s *SpoolStore) CompleteAcknowledgedDrain(item metadata.DrainCommitItem, result metadata.DrainCommitResult) error {
+	shard := s.pathShard(item.NFSPath)
+	shard.Lock()
+	defer shard.Unlock()
+	if s.hasPendingBoundContinuation(item.SpoolID) || s.hasPendingBoundContinuationPath(item.NFSPath) {
+		return &metadata.PendingSpoolContinuation{Cause: metadata.ErrSpoolContinuationConflict}
+	}
+	return s.meta.CleanupDrainCompletion(item, result, func() error {
+		e, ok := s.index.Lookup(item.NFSPath)
+		evicted := ok && e.ID() == item.SpoolID && s.index.DeleteIfMatches(item.NFSPath, e)
+		if err := os.Remove(item.SpoolFile); err != nil {
+			// No OpenWrite can replace this slot while its shard is held;
+			// cancellation/rename are excluded by the completion marker.
+			if evicted {
+				s.index.Insert(item.NFSPath, e)
+			}
+			return fmt.Errorf("retain completion after source cleanup failure: %w", err)
+		}
+		s.releaseCapacity(item.Size)
+		nfslib.NoteDrainProgress()
+		s.recordDrainDone(item.SpoolID, item.NFSPath, item.SpoolFile, item.Size)
+		return nil
+	})
 }
 
 // CancelForDelete cancels any in-flight spool entry for nfsPath so a pending
@@ -1007,10 +1966,38 @@ func (s *SpoolStore) BatchCompleteDrainCleanup(id int64, nfsPath, spoolFile stri
 // the drainer's MarkDone are serialized by SpoolStore.writeMu, so exactly one
 // of {complete, cancel} wins and the loser observes the resolved state.
 func (s *SpoolStore) CancelForDelete(nfsPath string) {
+	_, _ = s.cancelForDelete(nfsPath)
+}
+
+// cancelForDelete reports actual or uncertain mutation to the namespace
+// coordinator. Merely having a spool attached does not make a failed backing
+// syscall an unresolved mutation.
+func (s *SpoolStore) cancelForDelete(nfsPath string) (bool, error) {
+	shard := s.pathShard(nfsPath)
+	shard.Lock()
+	defer shard.Unlock()
+	if s.hasPendingBoundContinuationPath(nfsPath) {
+		return false, &metadata.PendingSpoolContinuation{Cause: metadata.ErrSpoolContinuationConflict}
+	}
+	if err := s.meta.CheckReplacementUnder(nfsPath); err != nil {
+		return false, err
+	}
+	rows, err := s.meta.DeleteActiveByPath(nfsPath)
+	if err != nil {
+		log.Printf("spool: cancel-for-delete %q: %v", nfsPath, err)
+		// Rows may still own their bytes. Never unlink the blobs on a failed
+		// durable cancellation; preserve them for recovery.
+		var held *metadata.PendingDrainCompletion
+		if errors.As(err, &held) {
+			return false, err
+		}
+		return true, err
+	}
 	// Evict the index entry first so concurrent reads/opens miss the spool
 	// and fall through to FUSE.
 	e, indexed := s.index.Lookup(nfsPath)
 	if indexed {
+		e.retired.Store(true)
 		s.index.DeleteIfMatches(nfsPath, e)
 		// Close the live entry BEFORE its spool file is unlinked below, so a
 		// concurrent WriteAt to this path (a delete racing an active write
@@ -1018,10 +2005,8 @@ func (s *SpoolStore) CancelForDelete(nfsPath string) {
 		// writing into an unlinked fd, which would silently discard the bytes.
 		e.cancelClose()
 	}
-	rows, err := s.meta.DeleteActiveByPath(nfsPath)
-	if err != nil {
-		log.Printf("spool: cancel-for-delete %q: %v", nfsPath, err)
-	}
+
+	var cleanupErr error
 	for _, r := range rows {
 		sz := r.Size
 		if indexed && e.ID() == r.ID && e.WrittenEnd() > sz {
@@ -1032,8 +2017,20 @@ func (s *SpoolStore) CancelForDelete(nfsPath string) {
 		s.releaseCapacity(sz)
 		if rmErr := os.Remove(r.SpoolFile); rmErr != nil && !os.IsNotExist(rmErr) {
 			log.Printf("spool: cancel-for-delete remove %s: %v", r.SpoolFile, rmErr)
+			cleanupErr = rmErr
 		}
 	}
+	var canceledMax int64
+	for _, r := range rows {
+		if r.ID > canceledMax {
+			canceledMax = r.ID
+		}
+	}
+	if canceledMax != 0 {
+		s.clearReadFault(nfsPath, canceledMax)
+		s.revokeConflictRead(nfsPath)
+	}
+	return indexed || len(rows) > 0, cleanupErr
 }
 
 // MigrateForRename re-keys every active spool entry under oldPath (the
@@ -1062,16 +2059,56 @@ func (s *SpoolStore) CancelForDelete(nfsPath string) {
 // shard is insufficient). Lock order: openShards → meta.writeMu (released) →
 // e.mu → index.mu — same direction as OpenWrite, no cycles. Renames are rare
 // relative to the per-RPC write path, so the full-barrier cost is acceptable.
-func (s *SpoolStore) MigrateForRename(oldPath, newPath string) (int, error) {
+func (s *SpoolStore) MigrateForRename(oldPath, newPath string) (int, bool, error) {
+	// H-8B: re-derive each moved row's base for its new name. Probe BEFORE
+	// taking every shard: the probe may make one bounded backend lookup. Only
+	// a pending FILE at oldPath uses the destination's base, so a rename with
+	// nothing pending (the common case) costs no probe.
+	var destBase metadata.SpoolBase
+	var destEpoch uint64
+	_, pending := s.index.Lookup(oldPath)
+	if !pending {
+		if r, err := s.meta.LookupByPath(oldPath); err == nil && r != nil {
+			pending = true
+		}
+	}
+	if pending {
+		destBase, destEpoch = s.probeBase(newPath)
+	}
+	resolve := func(newRowPath string, old metadata.SpoolBase, oldEpoch uint64) (metadata.SpoolBase, uint64) {
+		exact := newRowPath == newPath
+		base := renamedSpoolBase(exact, old, destBase)
+		// Epoch counters belong to projects, not to this Mac. Compare each
+		// row's paths: a project-root rename itself is outside projectOf's
+		// scope, while its children cross project authorities.
+		oldRowPath := oldPath + strings.TrimPrefix(newRowPath, newPath)
+		if projectOf(oldRowPath) == projectOf(newRowPath) {
+			// Never refresh an old same-project row past a foreign tenure.
+			return base, oldEpoch
+		}
+		if exact && old.Kind == metadata.SpoolBaseAbsent && base.Kind == metadata.SpoolBaseReplace {
+			// This is the first observation of the destination the temp save
+			// replaces. Bind its epoch together with its newly captured base.
+			return base, destEpoch
+		}
+		// An existing/moved/weak row has no destination-project history.
+		// Zero keeps it older than any known foreign destination tenure.
+		return base, 0
+	}
 	s.lockAllShards()
 	defer s.unlockAllShards()
+	if s.hasPendingBoundContinuationUnder(oldPath, newPath) {
+		return 0, false, &metadata.PendingSpoolContinuation{Cause: metadata.ErrSpoolContinuationConflict}
+	}
 
-	migs, err := s.meta.MigrateActivePaths(oldPath, newPath)
+	migs, err := s.meta.MigrateActivePathsWithBase(oldPath, newPath, resolve)
 	if err != nil {
-		return 0, err
+		return 0, false, err
 	}
 	requeued := false
 	for _, m := range migs {
+		s.clearReadFault(m.OldPath, m.OldID)
+		s.clearReadFault(m.NewPath, m.NewID)
 		if m.Requeued {
 			requeued = true
 		}
@@ -1097,21 +2134,74 @@ func (s *SpoolStore) MigrateForRename(oldPath, newPath string) (int, error) {
 			s.index.DeleteIfMatches(m.NewPath, e)
 		}
 	}
-	if requeued {
-		// A fresh `ready` row exists; wake the drainer for it.
-		s.signalReady()
-	}
-	return len(migs), nil
+	// NOTE (2026-08-03): we deliberately do NOT wake the drainer here, and
+	// return the need-to-signal to the caller instead.
+	//
+	// Waking it inside this call raced the very rename that called us. The
+	// drainer materializes an entry by os.MkdirAll'ing its parent
+	// (drainer.go:699), so a drain of a just-migrated entry CREATES the
+	// destination directory on FUSE — and the caller's os.Rename(old, new)
+	// then fails EEXIST because we created `new` ourselves microseconds
+	// earlier. JuiceFS does not implement the POSIX "rename replaces an
+	// empty target directory" case, so an empty dir is fatal to the rename.
+	//
+	// Symptom: moving a folder in Finder that had just been written failed
+	// ~50% of the time (300-file folder, measured); the folder was left split
+	// across source and destination. Settled folders never failed because
+	// nothing was in the spool to migrate or drain. See JuiceMount task #2.
+	//
+	// The caller signals after its rename completes — see juiceFS.Rename.
+	return len(migs), requeued, nil
 }
 
-// MarkDrainRetry is the transient-failure path: bumps drain_attempts +
-// last_error and resets the row to ready so the dispatcher picks it up
-// again after backoff. Caller is responsible for the backoff delay.
-func (s *SpoolStore) MarkDrainRetry(id int64, reason string) error {
-	if err := s.meta.IncrementAttempts(id, reason); err != nil {
-		return err
+// renamedSpoolBase is the base a pending row carries after a rename.
+//
+//   - present/moved: the row replaces a backend inode, and a rename moves
+//     that inode with it (the FUSE rename runs after the migration). JuiceFS
+//     sets the moved inode's ctime to the rename time (doRename), so ctime
+//     cannot be carried; inode, mtime (ns) and length still are ("moved").
+//   - claimed: this row already wrote that inode; the inode is what matters.
+//   - weak, unknown and replace: unchanged (a rename keeps length and mtime;
+//     a replace row renamed again moves the file it replaces with it).
+//   - absent: the source exists only in the spool, so the FUSE rename finds
+//     no source and the handler's rename branch decides what happens to the
+//     destination. For the renamed file itself (Premiere's temp-then-rename
+//     save) the row takes the destination's base:
+//   - an exact present base becomes "replace". The handler then KEEPS the
+//     destination (juiceFS.rename asks pendingReplaceAt), and the drain
+//     installs the new bytes over it with one replacing rename, so other
+//     Macs see old -> new and never a missing name.
+//   - anything weaker cannot authorize an in-place rewrite. Carry absent so
+//     an existing destination is preserved and publication becomes a conflict.
+//     Children of a directory rename stay absent.
+func renamedSpoolBase(exact bool, old, dest metadata.SpoolBase) metadata.SpoolBase {
+	switch old.Kind {
+	case metadata.SpoolBasePresent:
+		return metadata.SpoolBase{Kind: metadata.SpoolBaseMoved, Ino: old.Ino, MtimeNs: old.MtimeNs, Len: old.Len}
+	case metadata.SpoolBaseAbsent:
+		if exact {
+			if dest.Kind == metadata.SpoolBasePresent {
+				return metadata.SpoolBase{Kind: metadata.SpoolBaseReplace, Ino: dest.Ino, MtimeNs: dest.MtimeNs, Len: dest.Len}
+			}
+			return metadata.SpoolBase{Kind: metadata.SpoolBaseAtomicConflict}
+		}
+	case metadata.SpoolBaseUnknown, metadata.SpoolBaseWeak:
+		if exact {
+			return metadata.SpoolBase{Kind: metadata.SpoolBaseAtomicConflict}
+		}
 	}
-	return s.meta.ResetToReady(id)
+	return old
+}
+
+// SignalReady wakes the drainer. Exported so a caller that deferred the wake
+// (see MigrateForRename) can perform it once its own FUSE work is done.
+func (s *SpoolStore) SignalReady() { s.signalReady() }
+
+// MarkDrainRetry persists the whole retry transition before another wake can
+// scan ready rows. pauseSince is the first time this row endangered or retained
+// an older server copy; it is not derived from mutable diagnostic text.
+func (s *SpoolStore) MarkDrainRetry(id int64, reason string, pauseSince, retryAfter time.Time) error {
+	return s.meta.RequeueAfter(id, reason, pauseSince, retryAfter)
 }
 
 // QuarantineDrain is the SHA-mismatch path: marks the SQL row failed
@@ -1132,29 +2222,27 @@ func (s *SpoolStore) MarkDrainRetry(id int64, reason string) error {
 // The quarantined file is left on disk. Operators can inspect/recover/
 // delete it manually.
 func (s *SpoolStore) QuarantineDrain(id int64, nfsPath, spoolFile string, size int64, reason string) error {
-	transitioned, err := s.meta.MarkFailed(id, reason)
-	if err != nil {
-		return err
+	if s.hasPendingBoundContinuation(id) || s.hasPendingBoundContinuationPath(nfsPath) {
+		return &metadata.PendingSpoolContinuation{Cause: metadata.ErrSpoolContinuationConflict}
 	}
 	quarantineDir := filepath.Join(s.root, "quarantine")
-	if err := os.MkdirAll(quarantineDir, 0o755); err != nil {
-		log.Printf("spool: quarantine mkdir: %v", err)
-		// Continue — the SQL row is already failed; best-effort the
-		// file move and the cleanup below.
-	}
 	dest := filepath.Join(quarantineDir, filepath.Base(spoolFile))
-	if err := os.Rename(spoolFile, dest); err != nil && !os.IsNotExist(err) {
-		log.Printf("spool: quarantine move %s→%s: %v", spoolFile, dest, err)
+	transitioned, moveErr := s.meta.FailClaimedDrain(id, nfsPath, spoolFile, reason, true, func() error {
+		var err error
+		if err = os.MkdirAll(quarantineDir, 0o755); err == nil {
+			err = os.Rename(spoolFile, dest)
+		}
+		s.afterClaimedFailure(id, nfsPath, size)
+		return err
+	})
+	if !transitioned {
+		return moveErr // stale worker never touches a successor's shared source
 	}
-	// Same ownership rule as failPermanent (adversarial-review BUG 1): a
-	// row deleted/requeued out from under this drain already had its
-	// reservation handled by that path — release only on a real transition.
-	if transitioned {
-		s.releaseCapacity(size)
+	if moveErr != nil {
+		log.Printf("spool: quarantine local move %s→%s: %v", spoolFile, dest, moveErr)
+		dest = spoolFile // forensic source stayed in place; record its actual path
 	}
-	if e, ok := s.index.Lookup(nfsPath); ok && e.ID() == id {
-		s.index.DeleteIfMatches(nfsPath, e)
-	}
+	// RAM/capacity cleanup occurred inside the exact SQL owner transition.
 	if s.manifest != nil {
 		var (
 			shaHex     string
@@ -1182,7 +2270,24 @@ func (s *SpoolStore) QuarantineDrain(id int64, nfsPath, spoolFile string, size i
 				id, nfsPath, reason, appendErr)
 		}
 	}
-	return nil
+	return moveErr
+}
+
+// Caller holds metadata.writeMu through FailClaimedDrain's callback. Retry,
+// cancel and migration cannot interleave between SQL failure and RAM refusal.
+func (s *SpoolStore) afterClaimedFailure(id int64, path string, size int64) {
+	s.releaseCapacity(size)
+	if newer, err := s.meta.HasNewerRowForPath(path, id); err != nil || !newer {
+		s.blockRead(path, id)
+	}
+	// OpenWrite can hold e.mu while waiting for metadata.writeMu. Reading the
+	// atomic cohort avoids reversing that lock order inside this callback.
+	if e, ok := s.index.Lookup(path); ok && e.cohortID.Load() == id {
+		e.readBlocked.Store(true)
+		if !s.hasPendingBoundContinuation(id) && !s.hasPendingBoundContinuationPath(path) {
+			s.index.DeleteIfMatches(path, e)
+		}
+	}
 }
 
 // signalReady notifies the drainer that a new ready entry exists.
@@ -1213,7 +2318,7 @@ func (s *SpoolStore) tryReserveCapacity(delta int64) bool {
 	}
 	for {
 		cur := s.used.Load()
-		if s.capacity > 0 && cur+delta > s.capacity {
+		if ec := s.effectiveCapacity(); ec > 0 && cur+delta > ec {
 			return false
 		}
 		if s.used.CompareAndSwap(cur, cur+delta) {
@@ -1306,22 +2411,48 @@ func (s *SpoolStore) waitForCapacity(try func() bool, touch func()) bool {
 		if try() {
 			return true
 		}
+		// TWO INDEPENDENT FACTS, never collapsed into one variable.
+		//
+		// `offline` is REAL connectivity and nothing else — the offline→online
+		// edge below is the only correct consumer of it. An earlier version
+		// overwrote this var to force the backstop on, which silently poisoned
+		// `wasOffline`: once disk-pressure had flipped it, a genuine reconnect
+		// was invisible to the edge check and the reconnected drain never got
+		// its fresh window (2026-08-04 review, HIGH — measured: reconnecting
+		// mid-stall changed the give-up time by 3ms, i.e. not at all).
 		offline := pin.IsOffline()
-		// Reset the wedge backstop when the drain freed space (alive & making
-		// progress — lets a slow link stall indefinitely), OR we are offline, OR
-		// we JUST transitioned offline→online (give the reconnected drain a fresh
-		// full window instead of failing on a stale offline-poll timestamp if the
-		// goroutine was descheduled across the edge). So the backstop only ever
-		// measures contiguous ONLINE-and-frozen time.
-		if rel := s.lastReleaseNanos.Load(); rel != lastSeen || offline || (wasOffline && !offline) {
+		// `backstopApplies` answers a different question: can waiting EVER help?
+		// Online, yes — the drain may free space. Offline, only if the blocker is
+		// the link; if the blocker is the local disk (JuiceFS cache, Spotlight,
+		// Time Machine, the user's own files) then reconnecting frees nothing and
+		// waiting forever is an unbounded Finder hang on a hard mount.
+		backstopApplies := !offline || s.DiskConstrained()
+
+		// Reset the wedge window ONLY on real progress, or on a real reconnect.
+		//
+		// Deliberately NOT reset merely because we are offline, and NOT on a
+		// backstopApplies rising edge. Both were resets driven by STATE rather
+		// than PROGRESS, and a state that flaps then means the window never
+		// closes: DiskConstrained() is driven by a ~1s statfs sampled right at
+		// the floor boundary — the resting state of a chronically low-disk
+		// machine — so it flaps in normal operation. With a state-driven reset
+		// that flapping made the backstop never fire and restored the exact
+		// unbounded hang this was meant to remove (2026-08-04 review, CRITICAL —
+		// measured: no return within 500ms at 12.5x the deadline).
+		//
+		// Consequence, accepted knowingly: a long purely-offline stall that later
+		// becomes disk-constrained inherits a stale frozenSince and may give up
+		// almost at once. That is the right answer — nothing has drained for the
+		// whole window AND the volume is now full, so a prompt honest ENOSPC
+		// beats another hour of silence.
+		if rel := s.lastReleaseNanos.Load(); rel != lastSeen || (wasOffline && !offline) {
 			lastSeen = rel
 			frozenSince = time.Now()
 		}
-		wasOffline = offline
-		// Online ⇒ give up only if the drain is genuinely wedged (no capacity
-		// freed for the whole backstop window). capacityWaitDeadline <= 0 means
-		// "infinite stall" even online.
-		if !offline && capacityWaitDeadline > 0 && time.Since(frozenSince) >= capacityWaitDeadline {
+		wasOffline = offline // pure connectivity — edge detection stays intact
+		// Give up only where waiting cannot help and nothing has freed capacity
+		// for the whole window. capacityWaitDeadline <= 0 means "stall forever".
+		if backstopApplies && capacityWaitDeadline > 0 && time.Since(frozenSince) >= capacityWaitDeadline {
 			return false
 		}
 	}
@@ -1341,7 +2472,10 @@ func (s *SpoolStore) reserveCapacityOrWait(delta int64, touch func()) bool {
 // the copy. Returns true once there is headroom, false only on a wedged online
 // drain / store close. Must not be called with a shard held.
 func (s *SpoolStore) waitForHeadroom() bool {
-	return s.waitForCapacity(func() bool { return s.capacity <= 0 || s.used.Load() < s.capacity }, nil)
+	return s.waitForCapacity(func() bool {
+		ec := s.effectiveCapacity()
+		return ec <= 0 || s.used.Load() < ec
+	}, nil)
 }
 
 // releaseCapacity returns reserved bytes to the budget. Used when a
@@ -1392,6 +2526,16 @@ func (s *SpoolStore) releaseCapacity(delta int64) {
 // not fail on the advisory cap; transient over-cap drains away as the
 // requeued rows complete.
 func (s *SpoolStore) RetryFailed() (int, error) {
+	return s.retryFailed(false)
+}
+
+// RetryFailedAutomatic is the reconnect path. It never resets a terminal
+// pause deadline; only an explicit operator retry may do that.
+func (s *SpoolStore) RetryFailedAutomatic() (int, error) {
+	return s.retryFailed(true)
+}
+
+func (s *SpoolStore) retryFailed(automatic bool) (int, error) {
 	rows, err := s.meta.ListAll()
 	if err != nil {
 		return 0, err
@@ -1399,10 +2543,18 @@ func (s *SpoolStore) RetryFailed() (int, error) {
 	n := 0
 	skippedStale := 0
 	for _, r := range rows {
-		if r.DrainState != metadata.DrainFailed || r.SpoolFile == "" {
+		if r.DrainState != metadata.DrainFailed || r.SpoolFile == "" || r.QualificationHold != "" || r.RetiredBy != 0 {
 			continue
 		}
 		if _, statErr := os.Stat(r.SpoolFile); statErr != nil {
+			continue
+		}
+		// H-8: a row whose bytes were already published as a conflict copy is
+		// finished. Requeueing it would publish a second, duplicate copy.
+		if isConflictCopyFailure(r.LastError) {
+			continue
+		}
+		if automatic && !r.PauseSince.IsZero() && drainPauseNow().Sub(r.PauseSince) >= drainPauseCap {
 			continue
 		}
 		// Staleness guard (adversarial-review BUG 3): a NEWER row for the
@@ -1427,7 +2579,11 @@ func (s *SpoolStore) RetryFailed() (int, error) {
 		if r.Size > 0 {
 			s.used.Add(r.Size)
 		}
-		ok, resetErr := s.meta.ResetForRetry(r.ID)
+		reset := s.meta.ResetForRetry
+		if automatic && !r.PauseSince.IsZero() {
+			reset = s.meta.ResumeFailedPaused
+		}
+		ok, resetErr := reset(r.ID)
 		if resetErr != nil || !ok {
 			if r.Size > 0 {
 				s.releaseCapacity(r.Size)
@@ -1490,6 +2646,8 @@ func (s *SpoolStore) ClearFailed(confirm bool) (items []ClearFailedItem, cleared
 		if !confirm {
 			continue
 		}
+		shard := s.pathShard(r.NFSPath)
+		shard.Lock()
 		// Delete the un-drained local spool file first. A leaked file is a
 		// far better failure mode than a dangling DB row, so we proceed to
 		// delete the row even if the unlink fails (ENOENT is expected for
@@ -1501,8 +2659,12 @@ func (s *SpoolStore) ClearFailed(confirm bool) (items []ClearFailedItem, cleared
 		}
 		if delErr := s.meta.Delete(r.ID); delErr != nil {
 			log.Printf("spool: clear-failed delete row %d (%s): %v", r.ID, r.NFSPath, delErr)
+			shard.Unlock()
 			continue
 		}
+		s.revokeConflictReadIf(r.NFSPath, r.ID)
+		s.clearReadFault(r.NFSPath, r.ID)
+		shard.Unlock()
 		cleared++
 		bytes += r.Size
 		jmlog.Info("spool: clear-failed discarded a permanently-failed entry",
@@ -1554,9 +2716,20 @@ func (s *SpoolStore) RecoverStalled() int {
 //	                                                    ↓
 //	                                        SpoolStore.MarkDone (slice B) deletes file
 type SpoolEntry struct {
-	id        int64
-	nfsPath   string
-	spoolFile string
+	// Serializes stream admission with local replacement; replacement only TryLocks.
+	streamAdmission sync.Mutex
+	id              int64
+	// Mirrors id for bounded handle-resolution snapshots. Rename changes both
+	// while holding the all-shards barrier; admission rechecks id under mu.
+	cohortID atomic.Int64
+	// Prequeue eligibility is memory-only. The exact admission path rechecks
+	// closed/file under mu after it owns the namespace and path shard.
+	writing         atomic.Bool
+	nfsPath         string
+	spoolFile       string
+	initialIdentity string      // immutable O_EXCL descriptor identity; never filled by recovery
+	retired         atomic.Bool // successful drain or explicit delete permits reopen
+	readBlocked     atomic.Bool // terminal integrity failure refuses open reads
 
 	// Inode assigned at OpenFile time by the handler so Stat/Lstat
 	// during the writing/ready/draining lifetime return a stable value.
@@ -1582,9 +2755,10 @@ type SpoolEntry struct {
 	// Atomic — read/written from the read path without holding mu.
 	lastJukeboxLogNs atomic.Int64
 
-	mu         sync.RWMutex
-	file       *os.File // nil after Close
-	writtenEnd int64
+	mu          sync.RWMutex
+	replacement *metadata.SpoolReplacementWitness // immutable accepted local image; guarded by mu
+	file        *os.File                          // nil after Close
+	writtenEnd  int64
 	// contiguousEnd is the end of the contiguously-written prefix from offset
 	// 0 — i.e. the largest N such that bytes [0,N) all actually contain written
 	// data. Distinct from writtenEnd, which is the high-water/allocated size:
@@ -1594,6 +2768,29 @@ type SpoolEntry struct {
 	// NLE reading a still-copying clip would get black frames / corrupt RAW),
 	// so the read shadow clamps to contiguousEnd. Monotonic; guarded by mu.
 	contiguousEnd int64
+	// streamDest is the path the streaming drain is writing this entry's backend
+	// copy to — the hidden sibling from streamTempPath, before the rename into
+	// place. Empty unless streaming is active.
+	//
+	// The read shadow needs it: everything below punchedEnd has been punched out
+	// of the spool file and must be served from here instead (planDest). Guarded
+	// by mu and read on the read path, so it is taken in the same snapshot as the
+	// boundaries it goes with.
+	streamDest string
+
+	// punchedEnd is the end of the prefix the streaming drain has copied to the
+	// backend AND punched out of this spool file. Monotonic; guarded by mu.
+	//
+	// Zero unless streaming is active, which keeps every read path byte-identical
+	// to the pre-streaming behaviour until the copier actually runs.
+	//
+	// ORDERING CONTRACT, and it is not negotiable: this value is PUBLISHED before
+	// the punch, never after. Readers route on it, so publishing first sends them
+	// to the destination while the spool bytes are still intact (harmless);
+	// publishing second would leave a window where a reader is routed at a hole
+	// and served zeros with no error.
+	punchedEnd int64
+
 	// writtenExtents tracks already-written regions that lie ABOVE
 	// contiguousEnd — the out-of-order writes macOS's parallel WRITE dispatch
 	// produces (each WRITE RPC runs on its own goroutine over one TCP conn, so
@@ -1616,8 +2813,11 @@ type SpoolEntry struct {
 	// hash diverge from the file's at-rest hash. The drainer (slice B)
 	// re-hashes from disk regardless; this flag tells it whether the
 	// streaming SHA is a usable optimization or just noise.
-	hashValid bool
-	closed    bool
+	hashValid      bool
+	closed         bool
+	shutdownSealed bool        // no further writes after shutdown proof begins
+	coverageLost   bool        // legacy finalization once advanced across unwritten gaps
+	writeFailed    atomic.Bool // sticky: known incomplete WRITE/SETATTR is never shutdown-qualified
 	// committed records that the client issued an NFS COMMIT for this path — an
 	// explicit durability request. It lets the sweeper finalize the entry on the
 	// SHORT idle even when large (#105), so a Premiere save/export finalizes ~a
@@ -1668,6 +2868,7 @@ func (e *SpoolEntry) adoptRename(newPath string, newID int64) {
 	e.mu.Lock()
 	e.nfsPath = newPath
 	e.id = newID
+	e.cohortID.Store(newID)
 	e.mu.Unlock()
 }
 
@@ -1694,6 +2895,156 @@ func (e *SpoolEntry) ContiguousEnd() int64 {
 	return n
 }
 
+// PunchedEnd returns the end of the prefix that has been drained to the backend
+// AND punched out of the spool file. Everything below it reads as ZEROS from the
+// spool (measured; punch_darwin.go) and must be served from the destination.
+// Monotonic — punching cannot be undone.
+func (e *SpoolEntry) PunchedEnd() int64 {
+	e.mu.RLock()
+	n := e.punchedEnd
+	e.mu.RUnlock()
+	return n
+}
+
+// SetStreamDest records where the streaming drain is writing this entry's
+// backend copy. Must be set BEFORE the first punch, or the read shadow will have
+// nowhere to route a punched read.
+func (e *SpoolEntry) SetStreamDest(path string) {
+	e.mu.Lock()
+	e.streamDest = path
+	e.mu.Unlock()
+}
+
+// StreamDestPath returns the in-flight backend copy's path, empty if this entry
+// is not being streamed.
+func (e *SpoolEntry) StreamDestPath() string {
+	e.mu.RLock()
+	p := e.streamDest
+	e.mu.RUnlock()
+	return p
+}
+
+// writeBelowPunchedLocked routes a write that lands in (or straddles) the
+// punched prefix. Caller holds e.mu.
+//
+// The part below punchedEnd goes to the destination, which is the only place
+// those bytes exist. Any part at or above it falls through to the normal spool
+// path, so a straddling write is split rather than rejected — a writer has no
+// idea where our punch boundary is and must not be penalised for crossing it.
+//
+// Refuses when there is no destination: that combination (punched bytes, nowhere
+// to write them) means the stream was abandoned, and silently writing into a
+// hole would be worse than an error the client can retry.
+func (e *SpoolEntry) writeBelowPunchedLocked(p []byte, off int64) (int, error) {
+	if e.streamDest == "" {
+		return 0, fmt.Errorf("spool: write at %d is below punchedEnd %d but the entry "+
+			"has no stream destination: refusing to write into a punched hole",
+			off, e.punchedEnd)
+	}
+	// A BELOW-PUNCH WRITE IS AN OUT-OF-ORDER WRITE, and the normal path's
+	// bookkeeping must not be skipped just because the bytes go elsewhere.
+	//
+	// hashValid: the streaming SHA hashes bytes in write order. A seek-back
+	// invalidates it — the normal path sets this on `off < writtenEnd`, and this
+	// branch returns before reaching that. Leaving it true would hand the drainer
+	// a hash that no longer describes the file, and the spool-side SHA check
+	// would then QUARANTINE an intact file on the mismatch. (Bug introduced with
+	// the redirect itself, caught by auditing the design doc against the code.)
+	//
+	// lastWrite: the idle sweeper finalizes entries that have gone quiet. A
+	// writer that is actively rewriting below the punch is NOT quiet, and
+	// finalizing under it would end the file mid-rewrite.
+	//
+	// writtenEnd / contiguousEnd are deliberately NOT touched: they describe the
+	// SPOOL file's extent, and these bytes are not going there.
+	e.hashValid = false
+	e.lastWrite.Store(time.Now().UnixNano())
+
+	end := off + int64(len(p))
+	belowLen := e.punchedEnd - off
+	if belowLen > int64(len(p)) {
+		belowLen = int64(len(p))
+	}
+
+	f, err := os.OpenFile(e.streamDest, os.O_WRONLY, 0o644)
+	if err != nil {
+		return 0, fmt.Errorf("spool: open stream destination for a below-punch write: %w", err)
+	}
+	defer f.Close()
+	if _, err := f.WriteAt(p[:belowLen], off); err != nil {
+		return 0, fmt.Errorf("spool: write [%d,%d) to stream destination: %w",
+			off, off+belowLen, err)
+	}
+	// Durable before returning. The spool no longer holds these bytes, so an
+	// unsynced write here is the only copy sitting in a page cache.
+	if err := f.Sync(); err != nil {
+		return 0, fmt.Errorf("spool: sync stream destination after a below-punch write: %w", err)
+	}
+
+	if belowLen == int64(len(p)) {
+		return len(p), nil
+	}
+	// Straddling: the remainder is above the punch and belongs in the spool.
+	// Released and re-acquired deliberately — writeAtLocked is not re-entrant and
+	// the recursion below re-takes the lock.
+	rest := p[belowLen:]
+	restOff := off + belowLen
+	e.mu.Unlock()
+	n, err := e.WriteAt(rest, restOff)
+	e.mu.Lock()
+	if err != nil {
+		return int(belowLen), err
+	}
+	_ = end
+	return int(belowLen) + n, nil
+}
+
+// IsClosed reports whether the entry has been finalized — no further writes will
+// arrive. The streaming session uses it to decide that a copy is FINISHED rather
+// than merely paused between WRITE RPCs, which matters because NFS does
+// OpenFile->WriteAt->Close on every RPC and refcount therefore says nothing
+// about completion.
+func (e *SpoolEntry) IsClosed() bool {
+	e.mu.RLock()
+	c := e.closed
+	e.mu.RUnlock()
+	return c
+}
+
+// publishPunchedEnd advances the punched boundary. Monotonic — a lower value is
+// ignored rather than applied, because punching cannot be undone and readers are
+// already routed at the destination for everything below the current value.
+//
+// MUST be called BEFORE the corresponding punchRange. Local readers retain
+// mu.RLock from routing through pread, so publication also waits for readers
+// admitted to the old spool range. Readers admitted after publication use the
+// destination. Publishing first without this reader barrier is insufficient.
+func (e *SpoolEntry) publishPunchedEnd(end int64) {
+	e.mu.Lock()
+	if end > e.punchedEnd {
+		e.punchedEnd = end
+	}
+	e.mu.Unlock()
+}
+
+// readableBoundsWithPunched returns all three read-routing boundaries under ONE
+// lock.
+//
+// Same reason ReadableBounds takes cend and wend together (task #65): a decision
+// assembled from two separate snapshots can classify an offset against a state
+// that never existed. Adding punchedEnd as a third independently-read value would
+// reintroduce exactly that hazard, and here the consequence is worse than a
+// mis-classified hole — it is a read routed at punched bytes, which returns zeros
+// with no error.
+func (e *SpoolEntry) readableBoundsWithPunched() (cend, wend, punched int64) {
+	e.mu.RLock()
+	cend = e.contiguousEnd
+	wend = e.writtenEnd
+	punched = e.punchedEnd
+	e.mu.RUnlock()
+	return
+}
+
 // ReadableBounds returns the contiguous-written prefix end (cend — the readable
 // boundary) and the high-water written end (wend — the highest offset any WRITE
 // has reached) in a SINGLE RLock, so a read past cend is classified against a
@@ -1708,6 +3059,104 @@ func (e *SpoolEntry) ReadableBounds() (cend, wend int64) {
 	wend = e.writtenEnd
 	e.mu.RUnlock()
 	return
+}
+
+// ── STREAMING DRAIN: the sealed prefix (S1) ─────────────────────────────────
+//
+// WHY THIS EXISTS. A single file copied into JuiceMount is hard-capped at local
+// free disk, because peak spool usage is 100% of the file: the drainer only
+// takes FINALIZED rows (drainer.go ListReady) and capacity is released only at
+// MarkDrainComplete. spool_headroom.go states the consequence outright — "a
+// camera file is 20-100 GB and CANNOT free headroom for itself — a spool entry
+// only drains at close — so a single such file could never be copied at all".
+// For object-backed storage that is backwards.
+//
+// NEGATIVE RESULT worth keeping: releasing capacity as the DRAINER copies is a
+// no-op. Peak usage is reached before the drain starts. The cap only moves if
+// bytes are drained and freed WHILE the file is still being written, which is
+// what the sealed prefix is for.
+//
+// sealedEnd is the boundary below which bytes may be copied to the backend and
+// then punched out of the spool file (F_PUNCHHOLE returns real blocks on APFS —
+// measured, 256 MiB punched = 256 MiB physical freed, logical size unchanged).
+//
+// CORRECTNESS DOES NOT DEPEND ON THIS PREDICTION. There is no way to know that a
+// writer will not seek back and rewrite below the seal — NLEs rewrite headers
+// and moov atoms at close. So the streaming path REDIRECTS a write landing below
+// sealedEnd to the destination fd rather than the spool. That makes the margins
+// below a PERFORMANCE heuristic (keep the common rewrite off the slow FUSE path),
+// not a safety boundary. Read that again before "optimising" either constant to
+// zero: doing so is legal, merely slower.
+const ()
+
+// spoolSealMargin holds back bytes just under contiguousEnd. A writer that seeks
+// back a little (chunk retry, small fixup) then stays on the fast spool path
+// instead of being redirected through FUSE.
+//
+// TOGETHER WITH spoolSealHeadReserve THIS SETS THE REAL FLOOR for streaming: a
+// file must exceed head-reserve + margin before a single byte is sealable, which
+// is a much higher bar than spoolStreamMinSize alone. The gate test caught that
+// the hard way — lowering only the threshold left the margins larger than the
+// whole fixture, nothing ever sealed, and peak spool occupancy was 100% of the
+// file while every unit test still passed.
+//
+// Var (not const) so tests can scale it alongside the threshold.
+var spoolSealMargin int64 = 64 << 20 // 64 MiB
+
+// spoolSealHeadReserve keeps the head of the file unsealed until the entry
+// closes. Header/index rewrite-at-close is overwhelmingly at offset 0 (Premiere,
+// Resolve, QuickTime moov), so reserving it converts the single most likely
+// rewrite from a FUSE redirect into a plain spool write.
+var spoolSealHeadReserve int64 = 64 << 20 // 64 MiB
+
+// spoolStreamMinSize is the size below which streaming is not worth its
+// complexity: such a file cannot exhaust the disk on its own, and the whole-file
+// drain already verifies it with an at-rest SHA re-read.
+//
+// Var (not const) so a test can lower it and exercise real multi-chunk streaming
+// without a multi-gigabyte fixture — the same idiom as cacheMutationChunk in
+// metadata/store.go. Production never changes it.
+var spoolStreamMinSize int64 = 1 << 30 // 1 GiB
+
+// sealedEndLocked computes the sealed prefix. Caller holds e.mu (R or W).
+//
+// Returns 0 when nothing is sealable, which is the correct answer for every
+// small or early file — callers treat 0 as "nothing to stream yet", never as an
+// error.
+func (e *SpoolEntry) sealedEndLocked() int64 {
+	// Only stream files large enough to be the problem.
+	if e.writtenEnd < spoolStreamMinSize {
+		return 0
+	}
+	// Never seal past real data. contiguousEnd already guarantees [0,cend) holds
+	// written bytes and never spans a hole; anchoring here inherits that
+	// invariant rather than re-deriving it.
+	sealed := e.contiguousEnd - spoolSealMargin
+	if sealed > e.writtenEnd-spoolSealMargin {
+		sealed = e.writtenEnd - spoolSealMargin
+	}
+	// Hold back the head until close.
+	if sealed <= spoolSealHeadReserve {
+		return 0
+	}
+	if sealed < 0 {
+		return 0
+	}
+	return sealed
+}
+
+// SealedEnd returns the end of the prefix that may be drained and punched while
+// the writer is still active. See sealedEndLocked.
+//
+// NOT monotonic by construction — contiguousEnd is monotonic, so this only
+// retreats if writtenEnd does, which Truncate can cause. Callers must therefore
+// track what they have ALREADY punched separately and never re-punch or
+// un-punch from this value alone.
+func (e *SpoolEntry) SealedEnd() int64 {
+	e.mu.RLock()
+	n := e.sealedEndLocked()
+	e.mu.RUnlock()
+	return n
 }
 
 // Sync fsyncs the spool file to stable storage WITHOUT finalizing the entry —
@@ -1734,6 +3183,7 @@ func (e *SpoolEntry) cancelClose() {
 	e.mu.Lock()
 	if !e.closed {
 		e.closed = true
+		e.writing.Store(false)
 		if e.file != nil {
 			_ = e.file.Close()
 			e.file = nil
@@ -1808,30 +3258,12 @@ type spoolExtent struct{ start, end int64 }
 // that were actually written (this range, or a previously-recorded extent),
 // never across a still-unwritten gap.
 func (e *SpoolEntry) advanceContiguousLocked(off, end int64) {
-	if end <= e.contiguousEnd {
-		// Entirely within the readable prefix — an in-place overwrite of
-		// already-contiguous bytes. Nothing to advance.
-		return
-	}
-	if off <= e.contiguousEnd {
-		// Touches/extends the prefix. Absorb it, then pull in every recorded
-		// extent now contiguous with the grown prefix.
-		e.contiguousEnd = end
-		for len(e.writtenExtents) > 0 && e.writtenExtents[0].start <= e.contiguousEnd {
-			if e.writtenExtents[0].end > e.contiguousEnd {
-				e.contiguousEnd = e.writtenExtents[0].end
-			}
-			e.writtenExtents = e.writtenExtents[1:]
-		}
-		if len(e.writtenExtents) == 0 {
-			e.writtenExtents = nil // reclaim the backing array
-		}
-		return
-	}
-	// Starts strictly above the prefix: an out-of-order write leaving a hole
-	// below it. Remember it (coalesced); it advances contiguousEnd once the gap
-	// below fills.
-	e.writtenExtents = insertExtent(e.writtenExtents, off, end)
+	// Delegates to the shared implementation so the spool path and the in-place
+	// FUSE path can never disagree about what is readable. See advanceContig in
+	// inplace_contig.go — the last time this logic was wrong (contiguousEnd not
+	// coalescing out-of-order writes) it produced the #107 end-of-export
+	// interrupt, and a second copy is how that comes back.
+	e.contiguousEnd, e.writtenExtents = advanceContig(e.contiguousEnd, e.writtenExtents, off, end)
 }
 
 // insertExtent inserts [s,e) into a start-sorted, coalesced extent slice,
@@ -1968,14 +3400,39 @@ func (e *SpoolEntry) logInflightJukebox(name string, off, cend, wend int64) {
 		"since_last_write_ms", time.Since(time.Unix(0, e.lastWrite.Load())).Milliseconds())
 }
 
-func (e *SpoolEntry) WriteAt(p []byte, off int64) (int, error) {
+func (e *SpoolEntry) WriteAt(p []byte, off int64) (n int, err error) {
+	defer func() {
+		if err != nil || n != len(p) {
+			e.writeFailed.Store(true)
+		}
+	}()
 	if len(p) == 0 {
 		return 0, nil
 	}
 	e.mu.Lock()
-	if e.closed || e.file == nil {
+	if e.closed || e.shutdownSealed || e.file == nil {
 		e.mu.Unlock()
 		return 0, fmt.Errorf("spool: write to closed entry")
+	}
+	// A WRITE BELOW punchedEnd MUST NOT GO TO THE SPOOL FILE.
+	//
+	// Those bytes were drained to the backend and punched away, and reads of that
+	// range are routed to the DESTINATION. Writing them here would put the new
+	// data in a hole in the spool file that nothing ever reads, while every
+	// reader keeps getting the OLD bytes from the destination — a silently lost
+	// write, and a final file with stale content in that range. It would also
+	// re-allocate blocks we just reclaimed.
+	//
+	// This was named in the streaming design from the start ("writes landing
+	// below sealedEnd are redirected to the destination") and was missing from
+	// the implementation until 2026-08-06. spoolSealHeadReserve keeps the first
+	// 64 MiB unpunched, which covers the COMMON rewrite (an NLE rewriting a
+	// header/moov at offset 0) — but correctness must not depend on predicting
+	// where a writer seeks, so the general case is handled here.
+	if e.punchedEnd > 0 && off < e.punchedEnd {
+		n, err := e.writeBelowPunchedLocked(p, off)
+		e.mu.Unlock()
+		return n, err
 	}
 	newEnd := off + int64(len(p))
 	var reserved int64
@@ -2003,7 +3460,7 @@ func (e *SpoolEntry) WriteAt(p []byte, off int64) (int, error) {
 				return 0, ErrSpoolFull
 			}
 			e.mu.Lock()
-			if e.closed || e.file == nil {
+			if e.closed || e.shutdownSealed || e.file == nil {
 				e.store.releaseCapacity(reserved)
 				e.mu.Unlock()
 				return 0, fmt.Errorf("spool: write to closed entry")
@@ -2012,7 +3469,7 @@ func (e *SpoolEntry) WriteAt(p []byte, off int64) (int, error) {
 	}
 	outOfOrder := off < e.writtenEnd
 
-	n, err := e.file.WriteAt(p, off)
+	n, err = e.file.WriteAt(p, off)
 	if n > 0 {
 		end := off + int64(n)
 		if end > e.writtenEnd {
@@ -2065,13 +3522,18 @@ func (e *SpoolEntry) WriteAt(p []byte, off int64) (int, error) {
 // Any actual resize invalidates the streaming hash (the hasher saw the
 // write stream, not the post-truncate at-rest bytes); the drainer re-hashes
 // from disk in that case, same as out-of-order writes.
-func (e *SpoolEntry) Truncate(size int64) error {
+func (e *SpoolEntry) Truncate(size int64) (retErr error) {
+	defer func() {
+		if retErr != nil {
+			e.writeFailed.Store(true)
+		}
+	}()
 	if size < 0 {
 		return fmt.Errorf("spool: truncate to negative size %d", size)
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if e.closed || e.file == nil {
+	if e.closed || e.shutdownSealed || e.file == nil {
 		return fmt.Errorf("spool: truncate on closed entry")
 	}
 	if size == e.writtenEnd {
@@ -2122,7 +3584,23 @@ func (e *SpoolEntry) Truncate(size int64) error {
 func (e *SpoolEntry) OpenForRead() (*os.File, error) {
 	e.mu.RLock()
 	path := e.spoolFile
+	witness := e.replacement
 	e.mu.RUnlock()
+	if witness != nil {
+		image, err := e.store.openReplacementImage(path, nil)
+		if err != nil {
+			return nil, err
+		}
+		defer image.Close()
+		if image.identity != witness.SourceIdentity {
+			return nil, metadata.ErrMirrorConflict
+		}
+		if err := image.VerifyImage(witness.Image); err != nil {
+			return nil, err
+		}
+		image.ownedFile = false
+		return image.file, nil
+	}
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, fmt.Errorf("spool: open read: %w", err)
@@ -2271,7 +3749,12 @@ func (e *SpoolEntry) finalizeLocked() error {
 		e.mu.Unlock()
 		return nil
 	}
+	if e.shutdownSealed {
+		e.mu.Unlock()
+		return fmt.Errorf("spool: shutdown image is sealed")
+	}
 	e.closed = true
+	e.writing.Store(false)
 
 	var firstErr error
 	if e.file != nil {
@@ -2323,6 +3806,9 @@ func (e *SpoolEntry) finalizeLocked() error {
 	// client never even issued a tail READ). A finalized file has no more writes
 	// coming, so its readable prefix IS its full written extent — advance it.
 	if e.contiguousEnd < e.writtenEnd {
+		// Reopening READY must not turn the readable sparse extent into evidence
+		// that every byte was received. This survives every same-entry reopen.
+		e.coverageLost = true
 		e.contiguousEnd = e.writtenEnd
 	}
 	finalSha := e.sha256 // nil if streaming hash was invalidated (out-of-order)
@@ -2388,6 +3874,14 @@ func (e *SpoolEntry) finalizeLocked() error {
 // re-inserted at the same path after A was closed.
 func (e *SpoolEntry) CloseAndDelete(reason string) error {
 	e.mu.Lock()
+	if e.replacement != nil {
+		e.mu.Unlock()
+		return metadata.ErrMirrorConflict
+	}
+	if e.store.hasPendingBoundContinuation(e.id) || e.store.hasPendingBoundContinuationPath(e.nfsPath) {
+		e.mu.Unlock()
+		return &metadata.PendingSpoolContinuation{Cause: metadata.ErrSpoolContinuationConflict}
+	}
 	if e.closed {
 		nfsPath := e.nfsPath
 		e.mu.Unlock()
@@ -2407,6 +3901,7 @@ func (e *SpoolEntry) CloseAndDelete(reason string) error {
 	id := e.id
 	nfsPath := e.nfsPath
 	e.closed = true
+	e.writing.Store(false)
 	e.mu.Unlock()
 
 	var firstErr error

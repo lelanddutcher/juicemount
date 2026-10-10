@@ -1,8 +1,7 @@
 package health
 
 import (
-	"os"
-	"path/filepath"
+	"net"
 	"testing"
 	"time"
 )
@@ -21,7 +20,35 @@ func TestMonitorStartStop(t *testing.T) {
 	// Reaching here without hanging means start/stop works.
 }
 
+// requireLocalBackends skips a test that needs a LOCAL redis+minio dev stack.
+//
+// These three tests asserted `Healthy == true` against 127.0.0.1:6379 and
+// :9000 unconditionally, so they failed on every machine whose backends live
+// somewhere else — which is the normal case here (ours run on the TrueNAS box).
+// A suite that is red for environmental reasons trains you to skim past red,
+// which is the actual cost. metadata/redis_test.go and keyspace_test.go already
+// skip-if-absent; this brings health/ in line with that convention rather than
+// inventing a new one.
+//
+// Deliberately NOT a mock: the point of these tests is that the real probe
+// reaches a real backend. Skipping when there is none preserves that meaning;
+// mocking would delete it.
+func requireLocalBackends(t *testing.T) {
+	t.Helper()
+	c, err := net.DialTimeout("tcp", "127.0.0.1:6379", 500*time.Millisecond)
+	if err != nil {
+		t.Skipf("local Redis not reachable, skipping live health test: %v", err)
+	}
+	c.Close()
+	c, err = net.DialTimeout("tcp", "127.0.0.1:9000", 500*time.Millisecond)
+	if err != nil {
+		t.Skipf("local MinIO not reachable, skipping live health test: %v", err)
+	}
+	c.Close()
+}
+
 func TestRedisHealthCheck(t *testing.T) {
+	requireLocalBackends(t)
 	cfg := Config{
 		RedisURL: "127.0.0.1:6379",
 		MinIOURL: "http://127.0.0.1:9000",
@@ -42,6 +69,7 @@ func TestRedisHealthCheck(t *testing.T) {
 }
 
 func TestMinIOHealthCheck(t *testing.T) {
+	requireLocalBackends(t)
 	cfg := Config{
 		RedisURL: "127.0.0.1:6379",
 		MinIOURL: "http://127.0.0.1:9000",
@@ -58,7 +86,8 @@ func TestMinIOHealthCheck(t *testing.T) {
 	}
 }
 
-func TestFUSEMountCheck(t *testing.T) {
+func TestOwnedFUSEMountCheck(t *testing.T) {
+	pretendJuiceFSServiceIsAlive(t)
 	fp := fusePath(t)
 
 	cfg := Config{
@@ -67,13 +96,18 @@ func TestFUSEMountCheck(t *testing.T) {
 		FUSEPath: fp,
 	}
 	m := New(cfg)
+	// An APFS root is not a macFUSE mount. Supply explicit retained owner
+	// evidence; the unowned native observer is covered by mount_observation_test.
+	m.SetOwnedFUSEProbe(func() FUSESteadyEvidence {
+		return FUSESteadyEvidence{Ready: true, ChildAlive: true, ChildProven: true}
+	})
 	m.Start()
 	time.Sleep(200 * time.Millisecond)
 	defer m.Stop()
 
 	s := m.Status()
 	if !s.FUSE.Healthy {
-		t.Fatalf("expected FUSE healthy (path %s exists), got unhealthy: %s", fp, s.FUSE.Message)
+		t.Fatalf("expected owned FUSE evidence healthy (path %s), got unhealthy: %s", fp, s.FUSE.Message)
 	}
 }
 
@@ -155,12 +189,17 @@ func TestFUSEDebounceAlternatingNeverDegrades(t *testing.T) {
 }
 
 func TestStatusReturnsCorrectState(t *testing.T) {
+	requireLocalBackends(t)
+	pretendJuiceFSServiceIsAlive(t)
 	cfg := Config{
 		RedisURL: "127.0.0.1:6379",
 		MinIOURL: "http://127.0.0.1:9000",
 		FUSEPath: fusePath(t),
 	}
 	m := New(cfg)
+	m.SetOwnedFUSEProbe(func() FUSESteadyEvidence {
+		return FUSESteadyEvidence{Ready: true, ChildAlive: true, ChildProven: true}
+	})
 	m.Start()
 	time.Sleep(200 * time.Millisecond)
 	defer m.Stop()
@@ -186,18 +225,19 @@ func TestStatusReturnsCorrectState(t *testing.T) {
 	}
 }
 
-// fusePath returns the expanded ~/.juicemount/fuse-internal path,
-// creating the directory if it doesn't already exist so the FUSE
-// check can succeed.
+// fusePath returns a stable mounted local filesystem so a unit test can never
+// probe the user's live ~/.juicemount/fuse-internal mount. A test stat issued
+// during a real macFUSE teardown can enter an uninterruptible kernel wait and
+// pin the entire package until the device recovers. The monitor behavior under
+// test only requires a path that is present in the mount table and readable.
 func fusePath(t *testing.T) string {
 	t.Helper()
-	home, err := os.UserHomeDir()
-	if err != nil {
-		t.Fatalf("cannot determine home dir: %v", err)
-	}
-	fp := filepath.Join(home, ".juicemount", "fuse-internal")
-	if err := os.MkdirAll(fp, 0o755); err != nil {
-		t.Fatalf("cannot create fuse path %s: %v", fp, err)
-	}
-	return fp
+	return "/"
+}
+
+func pretendJuiceFSServiceIsAlive(t *testing.T) {
+	t.Helper()
+	previous := isJuiceFSProcessAliveFn
+	isJuiceFSProcessAliveFn = func(string) bool { return true }
+	t.Cleanup(func() { isJuiceFSProcessAliveFn = previous })
 }

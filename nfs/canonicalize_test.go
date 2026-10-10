@@ -59,7 +59,8 @@ func TestCanonicalize(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			h := &JuiceMountHandler{mountPoint: tc.mount}
+			h := &JuiceMountHandler{}
+			h.SetPinStore(nil, tc.mount)
 			got := h.canonicalize(tc.filename)
 			if got != tc.want {
 				t.Errorf("canonicalize(mount=%q, file=%q) = %q, want %q",

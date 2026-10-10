@@ -3,10 +3,13 @@ package manager
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/lelanddutcher/juicemount/internal/farmqueue"
@@ -22,8 +25,12 @@ type farmQueue interface {
 	Enqueue(ctx context.Context, j farmqueue.Job) error
 	ActiveWorkers(ctx context.Context) ([]farmqueue.Worker, error)
 	QueueDepth(ctx context.Context) (int64, error)
+	QueueDepths(ctx context.Context) (map[string]int64, error)
 	ListJobs(ctx context.Context, n int) ([]farmqueue.JobStatus, error)
+	PruneExpiredJobIndex(ctx context.Context, limit int) (int, error)
 	ClearFinished(ctx context.Context) (int, error)
+	GetControl(ctx context.Context) (farmqueue.FarmControl, error)
+	StoreControl(ctx context.Context, ctl farmqueue.FarmControl, forceRevision int64) (int64, error)
 }
 
 // Compile-time proof the real client implements the manager's queue slice.
@@ -35,6 +42,14 @@ var _ farmQueue = (*farmqueue.Client)(nil)
 // discipline (overviewBackendTimeout) — the GET is polled, so it must stay
 // snappy even when the backend is sick.
 const farmQueueProbeTimeout = 3 * time.Second
+
+// farmProgressStaleAfter is deliberately much larger than jmfarm's three-second
+// progress-write cadence. If an in_progress record has not been refreshed for
+// this long, the producing process is no longer a trustworthy source of live
+// activity (hard stop, container restart, lost mount, etc.). Last-sweep and
+// coverage data remain useful indefinitely; only the live-progress assertion is
+// time-sensitive.
+const farmProgressStaleAfter = 30 * time.Second
 
 // farmRecentJobsLimit caps how many recent job-status records GET /api/farm/jobs
 // returns. Matches the contract's documented default (ListJobs(50)).
@@ -52,10 +67,12 @@ var validFarmKinds = map[string]bool{
 
 // handleFarm serves GET /api/farm — the juicefarm operator rollup. The farm
 // pre-aggregates its index into farm-status.json (coverage per kind + last
-// sweep), so the manager (CGO-free, no sqlite, standalone) just relays the file
-// verbatim. Read-only, no backend probe. Returns {available:false} when the path
-// isn't configured or no sweep has produced the file yet — the Farm tab renders an
-// empty-state hint rather than erroring.
+// sweep), so the manager (CGO-free, no sqlite, standalone) relays that JSON.
+// The one exception is live progress: a hard-killed worker cannot perform its
+// final write that removes in_progress. We therefore suppress an in_progress
+// record older than farmProgressStaleAfter and return it as stale_progress for
+// truthful interrupted-work UI. Read-only, no backend probe. Returns
+// {available:false} when the path isn't configured, absent, or unreadable.
 func (a *API) handleFarm(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	enc := json.NewEncoder(w)
@@ -75,12 +92,76 @@ func (a *API) handleFarm(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	// Relay the farm's JSON verbatim under `status` so the schema stays owned by
-	// the producer (internal/farm FarmStatus) — the manager doesn't re-model it.
-	_ = enc.Encode(map[string]any{
+	status, staleProgress, err := prepareFarmStatus(raw, time.Now())
+	if err != nil {
+		_ = enc.Encode(map[string]any{
+			"available": false,
+			"reason":    "farm status is unreadable",
+		})
+		return
+	}
+	response := map[string]any{
 		"available": true,
-		"status":    json.RawMessage(raw),
-	})
+		// farm-status.json is written beside this Manager by the server/NAS
+		// worker. Remote workers keep their own derivative indexes and publish
+		// portable sidecar manifests, so this rollup must never be presented as
+		// a farm-wide aggregate until the Manager actually reconciles those
+		// indexes. Keep the scope explicit in the wire contract.
+		"scope":  "server_local",
+		"status": status,
+	}
+	if staleProgress != nil {
+		response["stale_progress"] = staleProgress
+	}
+	_ = enc.Encode(response)
+}
+
+// staleFarmProgress preserves the producer's last live-progress record without
+// presenting it as current. The age is useful to operators and makes the
+// Manager's inference explicit rather than silently rewriting history.
+type staleFarmProgress struct {
+	Progress   json.RawMessage `json:"progress"`
+	LastSeenAt int64           `json:"last_seen_at,omitempty"`
+	AgeSeconds int64           `json:"age_seconds,omitempty"`
+	Reason     string          `json:"reason"`
+}
+
+// prepareFarmStatus keeps the producer-owned schema as raw JSON fields. This
+// avoids importing internal/farm (and its sqlite dependency) into the CGO-free
+// Manager while still allowing the time-sensitive in_progress field to be
+// validated. Stable coverage and last-sweep fields are preserved byte-for-byte
+// at the field-value level.
+func prepareFarmStatus(raw []byte, now time.Time) (map[string]json.RawMessage, *staleFarmProgress, error) {
+	var status map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &status); err != nil {
+		return nil, nil, err
+	}
+	progress, ok := status["in_progress"]
+	if !ok || len(progress) == 0 || string(progress) == "null" {
+		return status, nil, nil
+	}
+
+	var writtenAt int64
+	if rawWrittenAt, ok := status["written_at"]; ok {
+		_ = json.Unmarshal(rawWrittenAt, &writtenAt)
+	}
+	age := int64(0)
+	if writtenAt > 0 && now.Unix() > writtenAt {
+		age = now.Unix() - writtenAt
+	}
+	// A missing/invalid timestamp cannot substantiate a live assertion. Future
+	// timestamps are allowed for bounded clock skew and will age normally.
+	if writtenAt > 0 && now.Sub(time.Unix(writtenAt, 0)) <= farmProgressStaleAfter {
+		return status, nil, nil
+	}
+
+	delete(status, "in_progress")
+	return status, &staleFarmProgress{
+		Progress:   progress,
+		LastSeenAt: writtenAt,
+		AgeSeconds: age,
+		Reason:     "worker stopped refreshing live progress",
+	}, nil
 }
 
 // farmSweepOptions are the optional per-job overrides a producer may set. Every
@@ -97,8 +178,8 @@ type farmSweepOptions struct {
 	ProxyWorkers *int    `json:"proxy_workers,omitempty"`
 }
 
-// farmSweepRequest is the body of POST /api/farm/sweep. `path` is a path UNDER
-// the volume mount (a directory → recursive, or a single file); `kinds` is a
+// farmSweepRequest is the body of POST /api/farm/sweep. `path` is an absolute
+// worker-facing path under DestMount (a directory → recursive, or a file); `kinds` is a
 // subset of {derivatives,proxy,transcript} or ["all"].
 type farmSweepRequest struct {
 	Path    string            `json:"path"`
@@ -128,6 +209,14 @@ func (a *API) handleFarmSweep(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "path is required", http.StatusBadRequest)
 		return
 	}
+	// The Manager can prove the user-facing worker mount prefix without
+	// blocking on remote FUSE metadata. The worker checks physical symlinks
+	// against its own configured mount before walking any queued job.
+	cleanPath, err := a.farmSweepPath(req.Path)
+	if err != nil {
+		http.Error(w, "invalid farm path: "+err.Error(), http.StatusBadRequest)
+		return
+	}
 	if len(req.Kinds) == 0 {
 		http.Error(w, "kinds is required (one or more of: derivatives, proxy, transcript, all)", http.StatusBadRequest)
 		return
@@ -149,24 +238,68 @@ func (a *API) handleFarmSweep(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	job := farmqueue.NewJob(req.Path, req.Kinds, "manager")
-	applyFarmSweepOptions(&job, req.Options)
-
 	ctx, cancel := context.WithTimeout(r.Context(), farmQueueProbeTimeout)
 	defer cancel()
-	if err := a.farmQ.Enqueue(ctx, job); err != nil {
-		// Contract (FARM_QUEUE_PROTOCOL.md, Manager HTTP surface): "503 if
-		// Redis/meta unavailable" — an enqueue that can't reach Redis is the
-		// unavailable case, not a manager bug, so 503 (retryable) not 500.
-		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
-			"error": "enqueue failed (Redis/meta unreachable): " + err.Error(),
+	storage := a.enforceFarmStorageGuard(ctx)
+	if storage.Configured && !storage.Safe {
+		writeJSON(w, http.StatusInsufficientStorage, map[string]any{
+			"error":   storage.Reason,
+			"storage": storage,
 		})
 		return
 	}
+	kinds := req.Kinds
+	for _, kind := range req.Kinds {
+		if kind == farmqueue.KindAll {
+			kinds = farmqueue.AllKinds()
+			break
+		}
+	}
+	var firstID string
+	for _, kind := range kinds {
+		job := farmqueue.NewJob(cleanPath, []string{kind}, "manager")
+		applyFarmSweepOptions(&job, req.Options)
+		if err := a.farmQ.Enqueue(ctx, job); err != nil {
+			// Contract (FARM_QUEUE_PROTOCOL.md, Manager HTTP surface): "503 if
+			// Redis/meta unavailable" — an enqueue that can't reach Redis is the
+			// unavailable case, not a manager bug, so 503 (retryable) not 500.
+			writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+				"error": "enqueue failed (Redis/meta unreachable): " + err.Error(),
+			})
+			return
+		}
+		if firstID == "" {
+			firstID = job.ID
+		}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"id":     job.ID,
+		"id":     firstID,
 		"status": "queued",
 	})
+}
+
+// farmSweepPath admits only a bounded absolute path within the configured
+// worker-facing mount. The Manager can run in a separate mount namespace, so
+// physical path checks belong to the worker, whose configured mount is final.
+func (a *API) farmSweepPath(path string) (string, error) {
+	if a.destMount == "" || !filepath.IsAbs(a.destMount) {
+		return "", fmt.Errorf("destination mount is not configured")
+	}
+	if !filepath.IsAbs(path) || len(path) > 4096 || len(strings.Split(path, string(filepath.Separator))) > 128 {
+		return "", fmt.Errorf("path must be a bounded absolute mount path")
+	}
+	for _, part := range strings.Split(path, string(filepath.Separator)) {
+		if part == ".." {
+			return "", fmt.Errorf("parent traversal is not allowed")
+		}
+	}
+	root := filepath.Clean(a.destMount)
+	clean := filepath.Clean(path)
+	rel, err := filepath.Rel(root, clean)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("path is outside destination mount")
+	}
+	return clean, nil
 }
 
 // applyFarmSweepOptions copies the set (non-nil) option overrides onto the job.
@@ -220,9 +353,18 @@ func (a *API) handleFarmJobs(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), farmQueueProbeTimeout)
 	defer cancel()
+	storage := a.enforceFarmStorageGuard(ctx)
 	workers, _ := a.farmQ.ActiveWorkers(ctx)
 	depth, _ := a.farmQ.QueueDepth(ctx)
+	depths, _ := a.farmQ.QueueDepths(ctx)
+	// Repair old leaked index members opportunistically without deleting
+	// terminal history. The bounded oldest slice makes this safe on every UI
+	// refresh, even when a historical deployment left thousands of expired
+	// hashes behind.
+	_, _ = a.farmQ.PruneExpiredJobIndex(ctx, 100)
 	jobs, _ := a.farmQ.ListJobs(ctx, farmRecentJobsLimit)
+	control, controlErr := a.farmQ.GetControl(ctx)
+	controlStatus := a.farmControlStatus(ctx, control, controlErr == nil)
 	// Normalize nil slices to non-nil so the JSON shape is stable
 	// (`[]` not `null`) — a hard rule in this codebase (Go↔Swift null
 	// discipline) and friendlier for the JS consumer.
@@ -232,16 +374,46 @@ func (a *API) handleFarmJobs(w http.ResponseWriter, r *http.Request) {
 	if jobs == nil {
 		jobs = []farmqueue.JobStatus{}
 	}
+	if depths == nil {
+		depths = map[string]int64{}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"available":   len(workers) > 0,
-		"workers":     workers,
-		"queue_depth": depth,
-		"jobs":        jobs,
+		"available":    len(workers) > 0,
+		"workers":      workers,
+		"queue_depth":  depth,
+		"queue_depths": depths,
+		"jobs":         jobs,
+		"control":      controlStatus,
+		"storage":      storage,
 	})
 }
 
+// handleFarmQueues exposes per-lane backlog instead of forcing operators to
+// infer routing from one aggregate count.
+func (a *API) handleFarmQueues(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "GET only", http.StatusMethodNotAllowed)
+		return
+	}
+	if a.farmQ == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"available": false, "error": "farm queue unavailable"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), farmQueueProbeTimeout)
+	defer cancel()
+	depths, err := a.farmQ.QueueDepths(ctx)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]any{"available": false, "error": err.Error()})
+		return
+	}
+	if depths == nil {
+		depths = map[string]int64{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"available": true, "queues": depths})
+}
+
 // handleFarmJobsClear is POST /api/farm/jobs/clear. Clears terminal
-// (done/failed) records from the Recent-jobs list — and prunes any
+// (done/failed/canceled) records from the Recent-jobs list — and prunes any
 // leaked index entries — via farmqueue.ClearFinished. queued/running
 // jobs are preserved so an in-flight sweep is never orphaned. Returns
 // {"cleared": N}. 503 when the queue is unconfigured (no meta/redis URL).

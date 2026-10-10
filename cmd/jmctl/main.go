@@ -156,6 +156,9 @@ func (c *client) do(method, path, body string) ([]byte, int, error) {
 	if err != nil {
 		return nil, 0, err
 	}
+	if method == http.MethodPost {
+		req.Header.Set("X-JM-Control", "1")
+	}
 	resp, err := hc.Do(req)
 	if err != nil {
 		return nil, 0, err

@@ -1,0 +1,67 @@
+--- a/pkg/meta/base.go
++++ b/pkg/meta/base.go
+@@ -2341,9 +2341,24 @@
+ 		origin = append(origin, marshalSlice(s.pos, s.id, s.size, s.off, s.len)...)
+ 	}
+ 	st = m.en.doCompactChunk(inode, indx, origin, compacted, skipped, pos, id, size, dsbuf)
+-	if st == syscall.EINVAL {
++	if st == syscall.EINVAL || st == syscall.EROFS {
+ 		logger.Infof("compaction for %d:%d is wasted, delete slice %d (%d bytes)", inode, indx, id, size)
+-		m.deleteSlice(id, size)
++		if m.conf.MaxDeletes == 0 {
++			// JuiceMount: the compaction did not commit, so nothing references
++			// slice id; delete its uploaded object here. deleteSlice would do
++			// nothing under --max-deletes 0 (the Mac mount). A commit the Redis
++			// proxy refused (JMDENY, a project another Mac holds) reaches this
++			// point as EINVAL (redis doCompactChunk's double-check finds no
++			// slice reference) or as EROFS (that double-check read was refused
++			// too). Each refused attempt would otherwise leak up to a full
++			// 64 MiB chunk that no gc pass on this Mac frees. With deletes
++			// enabled, deleteSlice removes the object itself.
++			if err := m.newMsg(DeleteSlice, id, size); err != nil {
++				logger.Warnf("delete uncommitted compaction slice %d (%d bytes): %s", id, size, err)
++			}
++		} else {
++			m.deleteSlice(id, size)
++		}
+ 	} else if st == 0 {
+ 		m.of.InvalidateChunk(inode, indx)
+ 	} else {
+--- a/pkg/meta/utils.go
++++ b/pkg/meta/utils.go
+@@ -123,6 +123,19 @@
+ 	}
+ 	if strings.HasPrefix(err.Error(), "OOM") {
+ 		return syscall.ENOSPC
++	}
++	// JuiceMount: the per-project Redis proxy answers a write it refuses with
++	// "-JMDENY <REASON> proj=<ino> holder=<principal>@<host> epoch=<n>".
++	// PROXY INVARIANT: JMDENY never follows a committed EXEC. The proxy decides
++	// before forwarding EXEC and, on refusal, sends DISCARD instead, so a
++	// JMDENY in an EXEC slot means the transaction did not commit. The VFS
++	// writer (pkg/vfs/writer.go) and compaction (compactChunk in base.go) rely
++	// on this to delete the slice they uploaded for a refused commit.
++	// The refusal is a decision, not a fault: report it as a read-only file
++	// system, once. shouldRetry never retries it (its first token is not a
++	// retry token).
++	if strings.HasPrefix(err.Error(), "JMDENY") {
++		return syscall.EROFS
+ 	}
+ 	logger.Errorf("error: %s\n%s", err, debug.Stack())
+ 	return syscall.EIO
+--- a/pkg/vfs/writer.go
++++ b/pkg/vfs/writer.go
+@@ -213,7 +213,12 @@
+ 
+ 		f.Lock()
+ 		if err != 0 {
+-			if err == syscall.ENOENT || err == syscall.ENOSPC || err == syscall.EDQUOT {
++			// JuiceMount: EROFS is a refusal made before any commit (the
++			// Redis proxy DISCARDs the MULTI and answers JMDENY; a read-only
++			// meta refuses before WATCH), so no metadata references s.id.
++			// Like the refusals below it reaches the caller unchanged and
++			// the slice's uploaded blocks are deleted here.
++			if err == syscall.ENOENT || err == syscall.ENOSPC || err == syscall.EDQUOT || err == syscall.EROFS {
+ 				go func(id uint64, length int) {
+ 					_ = f.w.store.Remove(id, length)
+ 				}(s.id, int(s.length))

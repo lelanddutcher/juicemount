@@ -4,6 +4,8 @@ import (
 	"database/sql"
 	"fmt"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
 	"unicode/utf8"
 )
@@ -23,14 +25,18 @@ const (
 // spool_entries table. The NFS handler layer wraps this with file-handle
 // state in nfs.SpoolEntry.
 type SpoolRow struct {
-	ID            int64
-	NFSPath       string
-	SpoolFile     string
-	Size          int64
-	SHA256        []byte
-	DrainState    DrainState
-	DrainAttempts int
-	LastError     string
+	ID                int64
+	NFSPath           string
+	SpoolFile         string
+	Size              int64
+	SHA256            []byte
+	DrainState        DrainState
+	DrainAttempts     int
+	LastError         string
+	PauseSince        time.Time // durable first failed publish of this row
+	RetryAfter        time.Time // next eligible claim; zero means immediately due
+	QualificationHold string    // unverified saved image; no automatic or operator replay
+	RetiredBy         int64     // a later accepted save permanently superseded this history
 	// SuspectZeroTail is the #104 zero-tail-detection marker. Empty = clean.
 	// Non-empty = compact JSON detail {detected_at,size,contiguous,holes}
 	// written by MarkSuspectZeroTail when the entry finalized with unwritten
@@ -38,8 +44,19 @@ type SpoolRow struct {
 	// download signature — the file drains FULL-SIZE with a zero tail).
 	// Surfacing only: nothing gates a drain on this field.
 	SuspectZeroTail string
-	CreatedAt       time.Time
-	UpdatedAt       time.Time
+	// PunchedEnd is the end of the prefix the streaming drain has copied to the
+	// backend AND punched out of the spool file. Zero on every row a
+	// non-streaming build ever wrote, which is the correct default: nothing
+	// punched.
+	//
+	// A NON-ZERO VALUE MEANS THE SPOOL FILE IS NOT SELF-SUFFICIENT. Its first
+	// PunchedEnd bytes read as zeros, and because F_PUNCHHOLE leaves the logical
+	// size untouched, nothing about the file on disk reveals that. Recovery MUST
+	// consult this before treating a size match as proof the copy survived — see
+	// SetPunchedEnd and nfs/spool.go's failed→ready branch.
+	PunchedEnd int64
+	CreatedAt  time.Time
+	UpdatedAt  time.Time
 }
 
 // SpoolStore is the SQLite-backed CRUD layer for spool_entries.
@@ -50,12 +67,78 @@ type SpoolRow struct {
 type SpoolStore struct {
 	db      *sql.DB
 	writeMu sync.Mutex
+	owner   atomic.Pointer[Store]
+	// Test-only reply-loss seam after a real READY COMMIT, before admission.
+	continuationPostCommit  func() error
+	shutdownReadyPostCommit func() error // test-only reply loss after durable finalization
 }
 
 // NewSpoolStore returns a SpoolStore backed by db. The caller is responsible
 // for having already called InitSpoolSchema.
 func NewSpoolStore(db *sql.DB) *SpoolStore {
 	return &SpoolStore{db: db}
+}
+
+// CheckReplacementUnder refuses generic namespace mutations that would cancel
+// or move a locally accepted replacement carrier. The caller must check this
+// before any physical destination cancellation; the mutation methods below
+// repeat the check while holding writeMu for their own SQL changes.
+func (s *SpoolStore) CheckReplacementUnder(paths ...string) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	return s.checkReplacementLocked(0, paths...)
+}
+
+// checkReplacementLocked is shared by the path and row-ID guards. A non-NULL
+// witness is fenced even if malformed: generic paths may not discard evidence
+// whose canonicality they have not proved. Caller holds writeMu.
+func (s *SpoolStore) checkReplacementLocked(id int64, paths ...string) error {
+	if id > 0 {
+		var blocked bool
+		if err := s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM spool_entries
+ WHERE id=? AND retired_by=0 AND replacement_witness IS NOT NULL)`, id).Scan(&blocked); err != nil {
+			return err
+		}
+		if blocked {
+			return fmt.Errorf("accepted replacement row %d: %w", id, ErrMirrorConflict)
+		}
+	}
+	for _, name := range paths {
+		var rows *sql.Rows
+		var err error
+		if name == "" || name == "." {
+			rows, err = s.db.Query(`SELECT id FROM spool_entries WHERE retired_by=0 AND replacement_witness IS NOT NULL`)
+		} else {
+			prefix := name + "/"
+			rows, err = s.db.Query(`SELECT id FROM spool_entries WHERE retired_by=0 AND replacement_witness IS NOT NULL AND (nfs_path=? OR substr(nfs_path,1,?)=?)`, name, utf8.RuneCountInString(prefix), prefix)
+		}
+		if err != nil {
+			return err
+		}
+		var ids []int64
+		for rows.Next() {
+			var candidate int64
+			if err := rows.Scan(&candidate); err != nil {
+				_ = rows.Close()
+				return err
+			}
+			ids = append(ids, candidate)
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		if err := rows.Close(); err != nil {
+			return err
+		}
+		for _, candidate := range ids {
+			p, _, _, err := readReplacementPublication(s.db, candidate)
+			if err != nil || p == nil || p.Phase != ReplacementPublicationCleaned {
+				return fmt.Errorf("accepted replacement under %q: %w", name, ErrMirrorConflict)
+			}
+		}
+	}
+	return nil
 }
 
 // deleteActiveByPathSelectHook, when non-nil, is called by DeleteActiveByPath
@@ -68,14 +151,38 @@ var deleteActiveByPathSelectHook func(nfsPath string)
 // Insert creates a new spool_entries row in `writing` state and returns
 // the assigned id. Caller is expected to track id alongside the local
 // file-handle state.
+//
+// Insert records an UNKNOWN base identity. Production shadow-opens use
+// InsertWithBase so the drainer can tell a save of the file the user saw from
+// a file another writer put there (H-8B).
 func (s *SpoolStore) Insert(nfsPath, spoolFile string) (int64, error) {
+	return s.InsertWithBase(nfsPath, spoolFile, SpoolBase{}, 0)
+}
+
+// InsertWithBase is Insert plus the base identity of the backend file this
+// write replaces (or SpoolBaseAbsent for a new name) and the project-lease
+// epoch the write was accepted under (0 = no lease held).
+func (s *SpoolStore) InsertWithBase(nfsPath, spoolFile string, base SpoolBase, acceptedEpoch uint64) (int64, error) {
 	now := time.Now().Unix()
+	ino, mt, ct, ln := base.columns()
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+	if err := rejectCompletionPath(s.db, nfsPath, false); err != nil {
+		return 0, err
+	}
+	var active bool
+	if err := s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM spool_entries WHERE nfs_path=?
+	 AND drain_state IN ('writing','ready','draining') AND retired_by=0)`, nfsPath).Scan(&active); err != nil {
+		return 0, err
+	}
+	if active {
+		return 0, ErrMirrorConflict
+	}
 	res, err := s.db.Exec(
-		`INSERT INTO spool_entries (nfs_path, spool_file, size, drain_state, drain_attempts, created_at, updated_at)
-		 VALUES (?, ?, 0, ?, 0, ?, ?)`,
-		nfsPath, spoolFile, DrainWriting, now, now,
+		`INSERT INTO spool_entries (nfs_path, spool_file, size, drain_state, drain_attempts, created_at, updated_at,
+		 base_ino, base_mtime_ns, base_ctime_ns, base_len, accepted_epoch)
+		 VALUES (?, ?, 0, ?, 0, ?, ?, ?, ?, ?, ?, ?)`,
+		nfsPath, spoolFile, DrainWriting, now, now, ino, mt, ct, ln, int64(acceptedEpoch),
 	)
 	if err != nil {
 		return 0, fmt.Errorf("spool insert %q: %w", nfsPath, err)
@@ -94,6 +201,12 @@ func (s *SpoolStore) MarkReady(id int64, size int64, sha []byte) error {
 	now := time.Now().Unix()
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+	if err := s.checkReplacementLocked(id); err != nil {
+		return err
+	}
+	if err := rejectCompletionHold(s.db, id); err != nil {
+		return err
+	}
 	res, err := s.db.Exec(
 		`UPDATE spool_entries SET drain_state=?, size=?, sha256=?, updated_at=?
 		 WHERE id=? AND drain_state=?`,
@@ -109,17 +222,76 @@ func (s *SpoolStore) MarkReady(id int64, size int64, sha []byte) error {
 	return nil
 }
 
-// MarkDraining transitions ready→draining. Used by the drainer to claim
-// an entry. Returns false if the row was not in ready state (e.g. another
-// drainer worker already claimed it).
-func (s *SpoolStore) MarkDraining(id int64) (bool, error) {
+// ReopenReady transitions an unclaimed, self-contained row from ready back to
+// writing. It is the inverse of MarkReady for a continuation WRITE that arrives
+// after the idle sweeper finalized a file but before the drainer claimed it.
+//
+// The punched_end predicate is part of the CAS, not a caller-side check. A row
+// with a streamed/punched prefix is no longer self-contained in its spool file;
+// reopening that file as an ordinary writer could replace already-drained bytes
+// with holes. Such rows keep the normal ready->draining path and return false.
+// A concurrent drainer wins by changing ready->draining first, in which case
+// this CAS also returns false and the caller waits/defers to the backend path.
+func (s *SpoolStore) ReopenReady(id int64) (bool, error) {
 	now := time.Now().Unix()
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+	if err := s.checkReplacementLocked(id); err != nil {
+		return false, err
+	}
+	if err := rejectCompletionHold(s.db, id); err != nil {
+		return false, err
+	}
 	res, err := s.db.Exec(
 		`UPDATE spool_entries SET drain_state=?, updated_at=?
-		 WHERE id=? AND drain_state=?`,
-		DrainDraining, now, id, DrainReady,
+		 WHERE id=? AND drain_state=? AND punched_end=0
+		 AND retired_by=0 AND NOT EXISTS (SELECT 1 FROM spool_bindings WHERE spool_id=?)`,
+		DrainWriting, now, id, DrainReady, id,
+	)
+	if err != nil {
+		return false, fmt.Errorf("spool reopen ready %d: %w", id, err)
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
+}
+
+// MarkDraining transitions a self-contained ready row to draining. A punched
+// source needs its operation-owned stage and ClaimPunchedSpool instead. A row
+// held as copied from another Mac (clone_hold) is never claimed.
+func (s *SpoolStore) MarkDraining(id int64) (bool, error) {
+	return s.markDraining(id, false)
+}
+
+// MarkDrainingWithoutProjectLease atomically clears a stale project wait while
+// claiming a ready row. Only a dispatcher that freshly observed no lease
+// client may call it; the worker still checks the live lease gate before any
+// backend write. All other ordinary claim guards are shared with MarkDraining.
+func (s *SpoolStore) MarkDrainingWithoutProjectLease(id int64) (bool, error) {
+	return s.markDraining(id, true)
+}
+
+func (s *SpoolStore) markDraining(id int64, noProjectLease bool) (bool, error) {
+	now := time.Now().Unix()
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if err := s.checkReplacementLocked(id); err != nil {
+		return false, err
+	}
+	if err := rejectCompletionHold(s.db, id); err != nil {
+		return false, err
+	}
+	setClause := "drain_state=?, updated_at=?"
+	waitGuard := " AND wait_project=''"
+	if noProjectLease {
+		setClause = "drain_state=?, wait_project='', updated_at=?"
+		waitGuard = ""
+	}
+	res, err := s.db.Exec(
+		`UPDATE spool_entries SET `+setClause+`
+		 WHERE id=? AND drain_state=? AND punched_end=0 AND clone_hold='' AND qualification_hold=''`+waitGuard+`
+		 AND retired_by=0 AND retry_after_ns<=?
+		 AND NOT EXISTS (SELECT 1 FROM spool_entries newer WHERE newer.nfs_path=spool_entries.nfs_path AND newer.id>spool_entries.id AND newer.retired_by=0)`,
+		DrainDraining, now, id, DrainReady, time.Now().UnixNano(),
 	)
 	if err != nil {
 		return false, fmt.Errorf("spool mark draining %d: %w", id, err)
@@ -135,12 +307,96 @@ func (s *SpoolStore) MarkDraining(id int64) (bool, error) {
 // cancels in-flight spool entries (QA-37, DeleteActiveByPath), and the drainer
 // uses a false return to know it must UNDO its FUSE write rather than
 // resurrect a file the user already deleted.
+// SetPunchedEnd durably records how much of a spool file has been drained to the
+// backend and punched away.
+//
+// THIS MUST COMMIT BEFORE THE CORRESPONDING PUNCH. F_PUNCHHOLE leaves the file's
+// logical size unchanged, so a half-punched spool file is indistinguishable on
+// disk from a complete one — and boot recovery decides intactness by comparing
+// sizes. Punch first and crash, and the next boot re-drains the holey file,
+// uploading its zero prefix over real bytes already durable at the backend:
+// silent, total loss of that prefix.
+//
+// The two failure directions are deliberately asymmetric. Persisted-but-not-
+// punched costs a redundant re-copy on the next boot and is completely safe;
+// punched-but-not-persisted is unrecoverable. So this is ordered first, and its
+// failure aborts the advance.
+//
+// MONOTONIC via MAX: punching cannot be undone, so a lower value must never
+// overwrite a higher one. A retry that recomputes a smaller boundary (or an
+// out-of-order write under concurrency) would otherwise re-expose a range that
+// is already a hole. Same reasoning as UpdateSize's MAX, and unlike that case
+// there is no legitimate shrink at all.
+func (s *SpoolStore) SetPunchedEnd(id int64, end int64) error {
+	if end < 0 {
+		return fmt.Errorf("spool set punched_end %d: negative end %d", id, end)
+	}
+	now := time.Now().Unix()
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if err := s.checkReplacementLocked(id); err != nil {
+		return err
+	}
+	if err := rejectCompletionHold(s.db, id); err != nil {
+		return err
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("spool set punched_end %d=%d begin: %w", id, end, err)
+	}
+	defer tx.Rollback()
+	res, err := tx.Exec(
+		`UPDATE spool_entries SET punched_end=MAX(punched_end, ?), updated_at=? WHERE id=?`,
+		end, now, id,
+	)
+	if err != nil {
+		return fmt.Errorf("spool set punched_end %d=%d: %w", id, end, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("spool set punched_end %d=%d rows affected: %w", id, end, err)
+	}
+	if n != 1 {
+		return fmt.Errorf("spool set punched_end %d=%d: updated %d rows, want 1", id, end, n)
+	}
+	var persisted int64
+	if err := tx.QueryRow(`SELECT punched_end FROM spool_entries WHERE id=?`, id).Scan(&persisted); err != nil {
+		return fmt.Errorf("spool set punched_end %d=%d verify: %w", id, end, err)
+	}
+	if persisted < end {
+		return fmt.Errorf("spool set punched_end %d=%d: persisted boundary %d is too low", id, end, persisted)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("spool set punched_end %d=%d commit: %w", id, end, err)
+	}
+	return nil
+}
+
+// PunchedEnd reads the persisted punched boundary for one row.
+func (s *SpoolStore) PunchedEnd(id int64) (int64, error) {
+	var end int64
+	err := s.db.QueryRow(`SELECT punched_end FROM spool_entries WHERE id=?`, id).Scan(&end)
+	if err != nil {
+		return 0, fmt.Errorf("spool get punched_end %d: %w", id, err)
+	}
+	return end, nil
+}
+
 func (s *SpoolStore) MarkDone(id int64) (bool, error) {
 	now := time.Now().Unix()
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+	if err := s.checkReplacementLocked(id); err != nil {
+		return false, err
+	}
+	if err := rejectCompletionHold(s.db, id); err != nil {
+		return false, err
+	}
+	if err := rejectBoundSpool(s.db, id); err != nil {
+		return false, err
+	}
 	res, err := s.db.Exec(
-		`UPDATE spool_entries SET drain_state=?, updated_at=? WHERE id=?`,
+		`UPDATE spool_entries SET drain_state=?, updated_at=? WHERE id=? AND retired_by=0`,
 		DrainDone, now, id,
 	)
 	if err != nil {
@@ -150,42 +406,25 @@ func (s *SpoolStore) MarkDone(id int64) (bool, error) {
 	return n > 0, nil
 }
 
-// batchMarkDoneTx marks each spool id done inside the caller's transaction and
-// reports, per id (aligned by index), whether a row was actually updated —
-// the batched analogue of MarkDone. It is the QA-37 fix for the batch-insert
-// lever: the mark-done SQL that used to live inline in Store.BatchDrainComplete
-// (running under Store.writeMu, a DIFFERENT mutex than the one MarkDone /
-// DeleteActiveByPath serialize on) is moved here so it executes UNDER
-// SpoolStore.writeMu, restoring the exact mutual exclusion the per-file path
-// relies on.
-//
-// LOCK CONTRACT: the caller MUST already hold s.writeMu (this method does NOT
-// take it) and MUST have opened tx AFTER acquiring s.writeMu. This is what
-// closes the race: DeleteActiveByPath's SELECT+DELETE also runs under
-// s.writeMu, so a cancel and this mark-done can no longer interleave — one runs
-// entirely before the other. If the cancel's DELETE committed first, the
-// UPDATE below affects 0 rows → Done=false → the drainer undoes its FUSE write
-// (no resurrection). If this mark-done ran first, the cancel's DELETE (filtered
-// to writing/ready/draining) skips the now-done row and the drainer completes
-// it normally. Passing the caller's *sql.Tx keeps the entries.size publish and
-// this mark-done in ONE transaction (task #65 atomicity).
-//
-// The UPDATE is by id only (mirroring MarkDone): any row still present is
-// marked done; a row already DELETEd by a cancel yields RowsAffected==0 →
-// Done=false. items[i] carries the id and the per-row updated_at (unix), and
-// results[i] corresponds to items[i] — byte-for-byte the same UPDATE the inline
-// code ran, only relocated under s.writeMu.
+// batchMarkDoneTx conditionally completes the current unpunched draining row.
+// The caller holds s.writeMu and opened tx after acquiring that lock, so cancel
+// and requeue cannot interleave with qualification or metadata publication.
+// Results are provisional until the caller commits the cross-table transaction.
 func (s *SpoolStore) batchMarkDoneTx(tx *sql.Tx, items []DrainCommitItem) ([]DrainCommitResult, error) {
 	results := make([]DrainCommitResult, len(items))
 	for i, it := range items {
 		res, err := tx.Exec(
-			`UPDATE spool_entries SET drain_state=?, updated_at=? WHERE id=?`,
-			DrainDone, it.Mtime.Unix(), it.SpoolID,
+			`UPDATE spool_entries SET drain_state=?, updated_at=?
+			 WHERE id=? AND nfs_path=? AND spool_file=? AND size=? AND drain_state=? AND punched_end=0 AND retired_by=0`,
+			DrainDone, it.Mtime.Unix(), it.SpoolID, it.NFSPath, it.SpoolFile, it.Size, DrainDraining,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("batch mark done %d: %w", it.SpoolID, err)
 		}
-		n, _ := res.RowsAffected()
+		n, err := res.RowsAffected()
+		if err != nil {
+			return nil, fmt.Errorf("batch mark done rows affected %d: %w", it.SpoolID, err)
+		}
 		results[i] = DrainCommitResult{SpoolID: it.SpoolID, Done: n > 0}
 	}
 	return results, nil
@@ -207,8 +446,17 @@ func (s *SpoolStore) batchMarkDoneTx(tx *sql.Tx, items []DrainCommitItem) ([]Dra
 func (s *SpoolStore) DeleteActiveByPath(nfsPath string) ([]*SpoolRow, error) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+	if err := s.checkReplacementLocked(0, nfsPath); err != nil {
+		return nil, err
+	}
+	if err := s.refuseLatestFailedUnder(nfsPath, true); err != nil {
+		return nil, err
+	}
+	if err := rejectCompletionPath(s.db, nfsPath, false); err != nil {
+		return nil, err
+	}
 	rows, err := s.db.Query(
-		`SELECT id, nfs_path, spool_file, size, sha256, drain_state, drain_attempts, last_error, suspect_zero_tail, created_at, updated_at
+		`SELECT id, nfs_path, spool_file, size, sha256, drain_state, drain_attempts, last_error, suspect_zero_tail, punched_end, created_at, updated_at, pause_since_ns, retry_after_ns, qualification_hold, retired_by
 		 FROM spool_entries WHERE nfs_path=? AND drain_state IN ('writing','ready','draining')`,
 		nfsPath,
 	)
@@ -239,11 +487,26 @@ func (s *SpoolStore) DeleteActiveByPath(nfsPath string) ([]*SpoolRow, error) {
 	if hook := deleteActiveByPathSelectHook; hook != nil {
 		hook(nfsPath)
 	}
-	if _, err := s.db.Exec(
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	// A canceled accepted save cannot make an older failed image current.
+	if _, err := tx.Exec(`UPDATE spool_entries SET retired_by=(SELECT MAX(id) FROM spool_entries
+	 WHERE nfs_path=? AND drain_state IN ('writing','ready','draining'))
+	 WHERE nfs_path=? AND retired_by=0 AND id<(SELECT MAX(id) FROM spool_entries
+	 WHERE nfs_path=? AND drain_state IN ('writing','ready','draining'))`, nfsPath, nfsPath, nfsPath); err != nil {
+		return nil, fmt.Errorf("spool delete-active retire history %q: %w", nfsPath, err)
+	}
+	if _, err := tx.Exec(
 		`DELETE FROM spool_entries WHERE nfs_path=? AND drain_state IN ('writing','ready','draining')`,
 		nfsPath,
 	); err != nil {
 		return out, fmt.Errorf("spool delete-active-by-path delete %q: %w", nfsPath, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
 	}
 	return out, nil
 }
@@ -280,6 +543,17 @@ type SpoolPathMigration struct {
 // Prefix matching uses substr(), not LIKE, so paths containing '%' or '_'
 // can't over-match.
 func (s *SpoolStore) MigrateActivePaths(oldPath, newPath string) ([]SpoolPathMigration, error) {
+	return s.MigrateActivePathsWithBase(oldPath, newPath, nil)
+}
+
+// MigrateActivePathsWithBase is MigrateActivePaths that also re-derives each
+// migrated row's base identity for its NEW path (H-8B). resolve receives the
+// row's new path and its current base and accepted epoch, and returns the
+// values to store. It runs under the spool write lock and must not block
+// (callers pass precomputed values). A nil resolve keeps the row's base.
+// Every migrated row also leaves any project wait: its project may have
+// changed with its path.
+func (s *SpoolStore) MigrateActivePathsWithBase(oldPath, newPath string, resolve func(newRowPath string, old SpoolBase, oldEpoch uint64) (SpoolBase, uint64)) ([]SpoolPathMigration, error) {
 	if oldPath == "" || oldPath == newPath {
 		return nil, nil
 	}
@@ -288,6 +562,21 @@ func (s *SpoolStore) MigrateActivePaths(oldPath, newPath string) ([]SpoolPathMig
 
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+	if err := s.checkReplacementLocked(0, oldPath, newPath); err != nil {
+		return nil, err
+	}
+	if err := s.refuseLatestFailedUnder(oldPath, true); err != nil {
+		return nil, err
+	}
+	if err := s.refuseLatestFailedUnder(newPath, true); err != nil {
+		return nil, err
+	}
+	if err := rejectCompletionPath(s.db, oldPath, true); err != nil {
+		return nil, err
+	}
+	if err := rejectCompletionPath(s.db, newPath, true); err != nil {
+		return nil, err
+	}
 
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -296,9 +585,9 @@ func (s *SpoolStore) MigrateActivePaths(oldPath, newPath string) ([]SpoolPathMig
 	defer func() { _ = tx.Rollback() }() // no-op after Commit
 
 	rows, err := tx.Query(
-		`SELECT id, nfs_path, spool_file, size, sha256, drain_state, drain_attempts, last_error, suspect_zero_tail, created_at, updated_at
+		`SELECT id, nfs_path, spool_file, size, sha256, drain_state, drain_attempts, last_error, suspect_zero_tail, punched_end, created_at, updated_at, pause_since_ns, retry_after_ns, qualification_hold, retired_by
 		 FROM spool_entries
-		 WHERE drain_state IN ('writing','ready','draining')
+			 WHERE drain_state IN ('writing','ready','draining') AND retired_by=0
 		   AND (nfs_path = ? OR substr(nfs_path, 1, ?) = ?)`,
 		// substr counts CHARACTERS, len() counts BYTES (adversarial-review
 		// BUG B): a multi-byte dir name ("vidéos/") made the byte length
@@ -326,30 +615,96 @@ func (s *SpoolStore) MigrateActivePaths(oldPath, newPath string) ([]SpoolPathMig
 	if len(active) == 0 {
 		return nil, nil
 	}
+	// Birth paths and files are immutable custody. A rename of any member of
+	// this cohort would either detach the row from its birth tuple or requeue
+	// a draining row with an empty tuple. Refuse the whole transaction first.
+	for _, r := range active {
+		var birthMarked int
+		if err := tx.QueryRow(`SELECT count(*) FROM spool_bindings WHERE spool_id=?
+		 AND (birth_id<>'' OR birth_path<>'' OR birth_file<>'' OR birth_identity<>'')`, r.ID).Scan(&birthMarked); err != nil {
+			return nil, err
+		}
+		if birthMarked != 0 {
+			return nil, ErrMirrorConflict
+		}
+	}
 
 	out := make([]SpoolPathMigration, 0, len(active))
 	for _, r := range active {
+		var phase string
+		bindingErr := tx.QueryRow(`SELECT phase FROM spool_bindings WHERE spool_id=?`, r.ID).Scan(&phase)
+		if bindingErr != nil && bindingErr != sql.ErrNoRows {
+			return nil, bindingErr
+		}
+		if bindingErr == nil && phase != "bound" {
+			return nil, ErrMirrorConflict
+		}
 		newRowPath := newPath + r.NFSPath[len(oldPath):]
+		var destinationActive bool
+		if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM spool_entries WHERE nfs_path=?
+		 AND retired_by=0 AND drain_state IN ('writing','ready','draining'))`, newRowPath).Scan(&destinationActive); err != nil {
+			return nil, err
+		}
+		if destinationActive {
+			return nil, ErrMirrorConflict
+		}
+		// The rename is a namespace event. Retire retained source and target
+		// histories before moving the winner, in this same transaction.
+		if _, err := tx.Exec(`UPDATE spool_entries SET retired_by=? WHERE retired_by=0
+		 AND ((nfs_path=? AND id<?) OR nfs_path=?)`,
+			r.ID, r.NFSPath, r.ID, newRowPath); err != nil {
+			return nil, err
+		}
 		m := SpoolPathMigration{OldID: r.ID, NewID: r.ID, OldPath: r.NFSPath, NewPath: newRowPath}
+		var oIno, oMt, oCt, oLen, oEpoch int64
+		var oHold string
+		if err := tx.QueryRow(`SELECT base_ino, base_mtime_ns, base_ctime_ns, base_len, accepted_epoch, clone_hold
+		 FROM spool_entries WHERE id=?`, r.ID).Scan(&oIno, &oMt, &oCt, &oLen, &oEpoch, &oHold); err != nil {
+			return nil, fmt.Errorf("spool migrate-paths base %d: %w", r.ID, err)
+		}
+		if oEpoch < 0 {
+			oEpoch = 0
+		}
+		newBase, newEpoch := spoolBaseFromColumns(oIno, oMt, oCt, oLen), uint64(oEpoch)
+		if resolve != nil {
+			newBase, newEpoch = resolve(newRowPath, newBase, newEpoch)
+		}
+		bIno, bMt, bCt, bLen := newBase.columns()
 
 		switch r.DrainState {
 		case DrainDraining:
-			if _, err := tx.Exec(`DELETE FROM spool_entries WHERE id=?`, r.ID); err != nil {
+			var pauseNS, retryNS int64
+			if !r.PauseSince.IsZero() {
+				pauseNS = r.PauseSince.UnixNano()
+			}
+			if !r.RetryAfter.IsZero() {
+				retryNS = r.RetryAfter.UnixNano()
+			}
+			deleted, err := tx.Exec(`DELETE FROM spool_entries WHERE id=?`, r.ID)
+			if err != nil {
 				return nil, fmt.Errorf("spool migrate-paths cancel draining %d: %w", r.ID, err)
+			}
+			if err := exactlyOneRow(deleted); err != nil {
+				return nil, err
 			}
 			// created_at preserved so the requeued row keeps its FIFO
 			// position in ListReady; attempts carried (the cancelled
 			// attempt wasn't a data failure, but the budget shouldn't
-			// reset on rename either). suspect_zero_tail carried too —
-			// the requeued row shares the SAME spool file (same bytes,
-			// same holes), so the #104 marker follows the data.
+			// reset on rename either). Both suspect_zero_tail and punched_end
+			// follow the SAME spool file. Dropping punched_end would make its
+			// holes look like a complete local copy after requeue.
 			res, err := tx.Exec(
-				`INSERT INTO spool_entries (nfs_path, spool_file, size, sha256, drain_state, drain_attempts, last_error, suspect_zero_tail, created_at, updated_at)
-				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-				newRowPath, r.SpoolFile, r.Size, r.SHA256, DrainReady, r.DrainAttempts, r.LastError, r.SuspectZeroTail, r.CreatedAt.Unix(), now,
+				`INSERT INTO spool_entries (nfs_path, spool_file, size, sha256, drain_state, drain_attempts, last_error, suspect_zero_tail, punched_end, created_at, updated_at,
+				 base_ino, base_mtime_ns, base_ctime_ns, base_len, accepted_epoch, clone_hold, pause_since_ns, retry_after_ns, qualification_hold, retired_by)
+				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				newRowPath, r.SpoolFile, r.Size, r.SHA256, DrainReady, r.DrainAttempts, r.LastError, r.SuspectZeroTail, r.PunchedEnd, r.CreatedAt.Unix(), now,
+				bIno, bMt, bCt, bLen, int64(newEpoch), oHold, pauseNS, retryNS, r.QualificationHold, r.RetiredBy,
 			)
 			if err != nil {
 				return nil, fmt.Errorf("spool migrate-paths requeue %d: %w", r.ID, err)
+			}
+			if err := exactlyOneRow(res); err != nil {
+				return nil, err
 			}
 			newID, err := res.LastInsertId()
 			if err != nil {
@@ -357,13 +712,37 @@ func (s *SpoolStore) MigrateActivePaths(oldPath, newPath string) ([]SpoolPathMig
 			}
 			m.NewID = newID
 			m.Requeued = true
+			if bindingErr == nil {
+				// Preserve the old ID as a tombstone: a stale worker must never
+				// become eligible for path-only legacy completion after rename.
+				res, err := tx.Exec(`INSERT INTO spool_bindings(spool_id,incarnation)
+ SELECT ?,incarnation FROM spool_bindings WHERE spool_id=? AND phase='bound'`, newID, r.ID)
+				if err != nil {
+					return nil, err
+				}
+				if err := exactlyOneRow(res); err != nil {
+					return nil, err
+				}
+				res, err = tx.Exec(`UPDATE spool_bindings SET phase='retired' WHERE spool_id=? AND phase='bound'`, r.ID)
+				if err != nil {
+					return nil, err
+				}
+				if err := exactlyOneRow(res); err != nil {
+					return nil, err
+				}
+			}
 
 		default: // writing, ready
-			if _, err := tx.Exec(
-				`UPDATE spool_entries SET nfs_path=?, updated_at=? WHERE id=?`,
-				newRowPath, now, r.ID,
-			); err != nil {
+			res, err := tx.Exec(
+				`UPDATE spool_entries SET nfs_path=?, updated_at=?, base_ino=?, base_mtime_ns=?, base_ctime_ns=?,
+				 base_len=?, accepted_epoch=?, wait_project='' WHERE id=?`,
+				newRowPath, now, bIno, bMt, bCt, bLen, int64(newEpoch), r.ID,
+			)
+			if err != nil {
 				return nil, fmt.Errorf("spool migrate-paths update %d: %w", r.ID, err)
+			}
+			if err := exactlyOneRow(res); err != nil {
+				return nil, err
 			}
 		}
 		out = append(out, m)
@@ -372,6 +751,29 @@ func (s *SpoolStore) MigrateActivePaths(oldPath, newPath string) ([]SpoolPathMig
 		return nil, fmt.Errorf("spool migrate-paths commit: %w", err)
 	}
 	return out, nil
+}
+
+// Called with writeMu. A terminal save owns its pathname until an explicit
+// recovery decision; checking here closes the RAM-check/SQL-mutation race.
+func (s *SpoolStore) refuseLatestFailedUnder(path string, subtree bool) error {
+	prefix := path + "/"
+	var blocked bool
+	query := `SELECT EXISTS(SELECT 1 FROM spool_entries f WHERE f.drain_state='failed' AND f.retired_by=0
+	 AND f.nfs_path=? AND f.id=(SELECT MAX(x.id) FROM spool_entries x WHERE x.nfs_path=f.nfs_path AND x.retired_by=0))`
+	args := []any{path}
+	if subtree {
+		query = `SELECT EXISTS(SELECT 1 FROM spool_entries f WHERE f.drain_state='failed' AND f.retired_by=0
+	 AND (f.nfs_path=? OR substr(f.nfs_path,1,?)=?)
+	 AND f.id=(SELECT MAX(x.id) FROM spool_entries x WHERE x.nfs_path=f.nfs_path AND x.retired_by=0))`
+		args = []any{path, utf8.RuneCountInString(prefix), prefix}
+	}
+	if err := s.db.QueryRow(query, args...).Scan(&blocked); err != nil {
+		return err
+	}
+	if blocked {
+		return fmt.Errorf("unresolved failed local save under %q: %w", path, syscall.EIO)
+	}
+	return nil
 }
 
 // MarkFailed transitions any state → failed with an attempt-counter bump
@@ -388,6 +790,12 @@ func (s *SpoolStore) MarkFailed(id int64, errMsg string) (bool, error) {
 	now := time.Now().Unix()
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+	if err := s.checkReplacementLocked(id); err != nil {
+		return false, err
+	}
+	if err := rejectCompletionHold(s.db, id); err != nil {
+		return false, err
+	}
 	res, err := s.db.Exec(
 		`UPDATE spool_entries SET drain_state=?, drain_attempts=drain_attempts+1, last_error=?, updated_at=?
 		 WHERE id=?`,
@@ -398,6 +806,91 @@ func (s *SpoolStore) MarkFailed(id int64, errMsg string) (bool, error) {
 	}
 	n, _ := res.RowsAffected()
 	return n > 0, nil
+}
+
+// FailClaimedDrain changes only the exact draining source the worker claimed.
+// Local quarantine movement may run while writeMu is held, so a retry, delete
+// or rename cannot take the same spool file between the CAS and its move.
+func (s *SpoolStore) FailClaimedDrain(id int64, path, file, reason string, integrityFailure bool, moveLocal func() error) (bool, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if err := s.checkReplacementLocked(id); err != nil {
+		return false, err
+	}
+	if err := rejectCompletionHold(s.db, id); err != nil {
+		return false, err
+	}
+	hold := ""
+	if integrityFailure {
+		hold = reason
+	}
+	res, err := s.db.Exec(`UPDATE spool_entries SET drain_state=?, drain_attempts=drain_attempts+1,
+	 last_error=?, qualification_hold=?, updated_at=? WHERE id=? AND nfs_path=? AND spool_file=? AND drain_state=? AND retired_by=0`,
+		DrainFailed, reason, hold, time.Now().Unix(), id, path, file, DrainDraining)
+	if err != nil {
+		return false, fmt.Errorf("fail claimed drain %d: %w", id, err)
+	}
+	n, _ := res.RowsAffected()
+	if n != 1 {
+		return false, nil
+	}
+	if moveLocal != nil {
+		return true, moveLocal()
+	}
+	return true, nil
+}
+
+// HoldUnqualified preserves a source whose complete saved-byte image cannot
+// be proved. Neither ordinary dispatch nor RetryFailed may release this hold.
+func (s *SpoolStore) HoldUnqualified(id int64, path, file, reason string) (bool, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if err := s.checkReplacementLocked(id); err != nil {
+		return false, err
+	}
+	if err := rejectCompletionHold(s.db, id); err != nil {
+		return false, err
+	}
+	res, err := s.db.Exec(`UPDATE spool_entries SET drain_state=?, qualification_hold=?, last_error=?, updated_at=?
+	 WHERE id=? AND nfs_path=? AND spool_file=? AND drain_state IN ('writing','ready','failed')`,
+		DrainFailed, reason, reason, time.Now().Unix(), id, path, file)
+	if err != nil {
+		return false, fmt.Errorf("spool hold unqualified %d: %w", id, err)
+	}
+	n, _ := res.RowsAffected()
+	return n == 1, nil
+}
+
+// RequeueAfter records the failure, pause authority and retry eligibility in
+// one durable transition. A wake from another row cannot claim this row early.
+func (s *SpoolStore) RequeueAfter(id int64, reason string, pauseSince, retryAfter time.Time) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if err := s.checkReplacementLocked(id); err != nil {
+		return err
+	}
+	if err := rejectCompletionHold(s.db, id); err != nil {
+		return err
+	}
+	var since, due int64
+	if !pauseSince.IsZero() {
+		since = pauseSince.UnixNano()
+	}
+	if !retryAfter.IsZero() {
+		due = retryAfter.UnixNano()
+	}
+	res, err := s.db.Exec(`UPDATE spool_entries SET drain_state=?, drain_attempts=drain_attempts+1,
+	 last_error=?, pause_since_ns=CASE WHEN pause_since_ns=0 THEN ? ELSE pause_since_ns END,
+	 retry_after_ns=?, updated_at=? WHERE id=? AND drain_state=?`,
+		DrainReady, reason, since, due, time.Now().Unix(), id, DrainDraining)
+	if err != nil {
+		return fmt.Errorf("spool requeue after %d: %w", id, err)
+	}
+	n, _ := res.RowsAffected()
+	if n != 1 {
+		return fmt.Errorf("spool requeue after %d: row no longer draining", id)
+	}
+	return nil
 }
 
 // MarkSuspectZeroTail records the #104 zero-tail-detection marker on a row.
@@ -432,7 +925,7 @@ func (s *SpoolStore) MarkSuspectZeroTail(id int64, detail string) error {
 func (s *SpoolStore) HasNewerRowForPath(nfsPath string, afterID int64) (bool, error) {
 	var exists bool
 	err := s.db.QueryRow(
-		`SELECT EXISTS(SELECT 1 FROM spool_entries WHERE nfs_path=? AND id>?)`,
+		`SELECT EXISTS(SELECT 1 FROM spool_entries WHERE nfs_path=? AND id>? AND retired_by=0)`,
 		nfsPath, afterID,
 	).Scan(&exists)
 	if err != nil {
@@ -448,6 +941,12 @@ func (s *SpoolStore) IncrementAttempts(id int64, errMsg string) error {
 	now := time.Now().Unix()
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+	if err := s.checkReplacementLocked(id); err != nil {
+		return err
+	}
+	if err := rejectCompletionHold(s.db, id); err != nil {
+		return err
+	}
 	_, err := s.db.Exec(
 		`UPDATE spool_entries SET drain_attempts=drain_attempts+1, last_error=?, updated_at=?
 		 WHERE id=?`,
@@ -465,6 +964,12 @@ func (s *SpoolStore) ResetToReady(id int64) error {
 	now := time.Now().Unix()
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+	if err := s.checkReplacementLocked(id); err != nil {
+		return err
+	}
+	if err := rejectCompletionHold(s.db, id); err != nil {
+		return err
+	}
 	_, err := s.db.Exec(
 		`UPDATE spool_entries SET drain_state=?, updated_at=? WHERE id=?`,
 		DrainReady, now, id,
@@ -473,6 +978,39 @@ func (s *SpoolStore) ResetToReady(id int64) error {
 		return fmt.Errorf("spool reset ready %d: %w", id, err)
 	}
 	return nil
+}
+
+// DeferReady parks a claimed row until the durable per-row due time. It does
+// not consume an attempt for an unavailable mount or offline project.
+func (s *SpoolStore) DeferReady(id int64, due time.Time) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if err := rejectCompletionHold(s.db, id); err != nil {
+		return err
+	}
+	_, err := s.db.Exec(`UPDATE spool_entries SET drain_state=?, retry_after_ns=?, updated_at=?
+	 WHERE id=? AND drain_state=?`, DrainReady, due.UnixNano(), time.Now().Unix(), id, DrainDraining)
+	if err != nil {
+		return fmt.Errorf("spool defer ready %d: %w", id, err)
+	}
+	return nil
+}
+
+// RequeueUnadmittedDrain is only for a path lease refused before completion
+// SQL. It cannot move a held, bound, replaced, or no-longer-draining row.
+func (s *SpoolStore) RequeueUnadmittedDrain(item DrainCommitItem) (bool, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	res, err := s.db.Exec(`UPDATE spool_entries SET drain_state='ready',updated_at=?
+ WHERE id=? AND nfs_path=? AND spool_file=? AND size=? AND drain_state='draining' AND punched_end=0
+ AND NOT EXISTS (SELECT 1 FROM spool_completion_holds h WHERE h.spool_id=spool_entries.id)
+ AND NOT EXISTS (SELECT 1 FROM spool_bindings b WHERE b.spool_id=spool_entries.id)`,
+		time.Now().Unix(), item.SpoolID, item.NFSPath, item.SpoolFile, item.Size)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n == 1, err
 }
 
 // ResetForRetry transitions a FAILED row back to ready with a fresh
@@ -488,9 +1026,16 @@ func (s *SpoolStore) ResetForRetry(id int64) (bool, error) {
 	now := time.Now().Unix()
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+	if err := s.checkReplacementLocked(id); err != nil {
+		return false, err
+	}
+	if err := rejectCompletionHold(s.db, id); err != nil {
+		return false, err
+	}
 	res, err := s.db.Exec(
-		`UPDATE spool_entries SET drain_state=?, drain_attempts=0, updated_at=?
-		 WHERE id=? AND drain_state=?`,
+		`UPDATE spool_entries SET drain_state=?, drain_attempts=0, pause_since_ns=0, retry_after_ns=0, updated_at=?
+		 WHERE id=? AND drain_state=? AND qualification_hold='' AND retired_by=0
+		 AND NOT EXISTS (SELECT 1 FROM spool_entries newer WHERE newer.nfs_path=spool_entries.nfs_path AND newer.id>spool_entries.id AND newer.retired_by=0)`,
 		DrainReady, now, id, DrainFailed,
 	)
 	if err != nil {
@@ -500,37 +1045,95 @@ func (s *SpoolStore) ResetForRetry(id int64) (bool, error) {
 	return n > 0, nil
 }
 
+// ResumeFailedPaused preserves the original risk deadline and attempt count.
+// Boot recovery may re-drive a paused row before its cap, but may not grant a
+// new 24-hour window merely because the process restarted.
+func (s *SpoolStore) ResumeFailedPaused(id int64) (bool, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if err := s.checkReplacementLocked(id); err != nil {
+		return false, err
+	}
+	if err := rejectCompletionHold(s.db, id); err != nil {
+		return false, err
+	}
+	res, err := s.db.Exec(`UPDATE spool_entries SET drain_state=?, updated_at=?
+	 WHERE id=? AND drain_state=? AND pause_since_ns>0 AND qualification_hold='' AND retired_by=0
+	 AND NOT EXISTS (SELECT 1 FROM spool_entries newer WHERE newer.nfs_path=spool_entries.nfs_path AND newer.id>spool_entries.id AND newer.retired_by=0)`,
+		DrainReady, time.Now().Unix(), id, DrainFailed)
+	if err != nil {
+		return false, fmt.Errorf("spool resume paused %d: %w", id, err)
+	}
+	n, _ := res.RowsAffected()
+	return n == 1, nil
+}
+
 // Get returns the row for id, or sql.ErrNoRows if it doesn't exist.
 func (s *SpoolStore) Get(id int64) (*SpoolRow, error) {
 	row := s.db.QueryRow(
-		`SELECT id, nfs_path, spool_file, size, sha256, drain_state, drain_attempts, last_error, suspect_zero_tail, created_at, updated_at
+		`SELECT id, nfs_path, spool_file, size, sha256, drain_state, drain_attempts, last_error, suspect_zero_tail, punched_end, created_at, updated_at, pause_since_ns, retry_after_ns, qualification_hold, retired_by
 		 FROM spool_entries WHERE id=?`,
 		id,
 	)
 	return scanSpoolRow(row.Scan)
 }
 
-// LookupByPath returns the most recent (highest id) row for nfsPath that
-// is in writing or ready state, or sql.ErrNoRows if none exists.
+// LookupByPath returns the most recent (highest id) active row for nfsPath,
+// or sql.ErrNoRows if none exists.
 // Reads of in-progress writes consult this to serve from spool.
 func (s *SpoolStore) LookupByPath(nfsPath string) (*SpoolRow, error) {
 	row := s.db.QueryRow(
-		`SELECT id, nfs_path, spool_file, size, sha256, drain_state, drain_attempts, last_error, suspect_zero_tail, created_at, updated_at
+		`SELECT id, nfs_path, spool_file, size, sha256, drain_state, drain_attempts, last_error, suspect_zero_tail, punched_end, created_at, updated_at, pause_since_ns, retry_after_ns, qualification_hold, retired_by
 		 FROM spool_entries
-		 WHERE nfs_path=? AND drain_state IN ('writing','ready','draining')
+			 WHERE nfs_path=? AND drain_state IN ('writing','ready','draining') AND retired_by=0
 		 ORDER BY id DESC LIMIT 1`,
 		nfsPath,
 	)
 	return scanSpoolRow(row.Scan)
 }
 
-// ListReady returns up to limit rows in ready state ordered by created_at.
-// Used by the drainer to fetch its next batch.
+// LookupUndrainedByPath includes failed rows, whose bytes may still be only
+// in the spool. Residency uses this while NFS reads use LookupByPath.
+func (s *SpoolStore) LookupUndrainedByPath(nfsPath string) (*SpoolRow, error) {
+	row := s.db.QueryRow(
+		`SELECT id, nfs_path, spool_file, size, sha256, drain_state, drain_attempts, last_error, suspect_zero_tail, punched_end, created_at, updated_at, pause_since_ns, retry_after_ns, qualification_hold, retired_by
+		 FROM spool_entries
+		 WHERE nfs_path=? AND drain_state IN ('writing','ready','draining','failed')
+		 ORDER BY id DESC LIMIT 1`,
+		nfsPath,
+	)
+	return scanSpoolRow(row.Scan)
+}
+
+// ListReady returns self-contained ready rows ordered by created_at. Punched
+// sources are excluded because ordinary whole-file drain would copy holes.
+// Rows waiting for a project lease (non-empty wait_project) are excluded: they stay
+// ready (so reads, deletes and renames treat them as live) but are not
+// dispatched until ReleaseProjectHold clears the wait.
 func (s *SpoolStore) ListReady(limit int) ([]*SpoolRow, error) {
+	return s.listReady(limit, false)
+}
+
+// ListReadyIncludingWaiting is ListReady that also returns rows waiting for a
+// project lease. The drainer uses it whenever no lease client is wired, so a
+// wait can never strand a row.
+func (s *SpoolStore) ListReadyIncludingWaiting(limit int) ([]*SpoolRow, error) {
+	return s.listReady(limit, true)
+}
+
+// Rows held as copied from another Mac are excluded from both, always: unlike
+// a project wait, nothing releases them but an explicit decision
+// (ReleaseCloneHeld / DeleteCloneHeld).
+func (s *SpoolStore) listReady(limit int, includeWaiting bool) ([]*SpoolRow, error) {
+	waitClause := " AND wait_project=''"
+	if includeWaiting {
+		waitClause = ""
+	}
 	rows, err := s.db.Query(
-		`SELECT id, nfs_path, spool_file, size, sha256, drain_state, drain_attempts, last_error, suspect_zero_tail, created_at, updated_at
-		 FROM spool_entries WHERE drain_state=? ORDER BY created_at ASC LIMIT ?`,
-		DrainReady, limit,
+		`SELECT id, nfs_path, spool_file, size, sha256, drain_state, drain_attempts, last_error, suspect_zero_tail, punched_end, created_at, updated_at, pause_since_ns, retry_after_ns, qualification_hold, retired_by
+			 FROM spool_entries WHERE drain_state=? AND punched_end=0 AND clone_hold='' AND qualification_hold='' AND retired_by=0 AND replacement_witness IS NULL AND retry_after_ns<=?
+			 AND NOT EXISTS (SELECT 1 FROM spool_entries newer WHERE newer.nfs_path=spool_entries.nfs_path AND newer.id>spool_entries.id AND newer.retired_by=0)`+waitClause+` ORDER BY created_at ASC LIMIT ?`,
+		DrainReady, time.Now().UnixNano(), limit,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("spool list ready: %w", err)
@@ -551,7 +1154,7 @@ func (s *SpoolStore) ListReady(limit int) ([]*SpoolRow, error) {
 // disk state against the index. Intentionally unfiltered.
 func (s *SpoolStore) ListAll() ([]*SpoolRow, error) {
 	rows, err := s.db.Query(
-		`SELECT id, nfs_path, spool_file, size, sha256, drain_state, drain_attempts, last_error, suspect_zero_tail, created_at, updated_at
+		`SELECT id, nfs_path, spool_file, size, sha256, drain_state, drain_attempts, last_error, suspect_zero_tail, punched_end, created_at, updated_at, pause_since_ns, retry_after_ns, qualification_hold, retired_by
 		 FROM spool_entries`,
 	)
 	if err != nil {
@@ -584,7 +1187,7 @@ func (s *SpoolStore) ListAll() ([]*SpoolRow, error) {
 // to Finder as "operation can't be completed (error 100060)" mid-copy.
 func (s *SpoolStore) ListForStatus(doneSince time.Time) ([]*SpoolRow, error) {
 	rows, err := s.db.Query(
-		`SELECT id, nfs_path, spool_file, size, sha256, drain_state, drain_attempts, last_error, suspect_zero_tail, created_at, updated_at
+		`SELECT id, nfs_path, spool_file, size, sha256, drain_state, drain_attempts, last_error, suspect_zero_tail, punched_end, created_at, updated_at, pause_since_ns, retry_after_ns, qualification_hold, retired_by
 		 FROM spool_entries
 		 WHERE drain_state != ? OR updated_at >= ?
 		 ORDER BY id`,
@@ -626,6 +1229,12 @@ func (s *SpoolStore) PendingStats() (pendingFiles int, pendingBytes int64, err e
 func (s *SpoolStore) Delete(id int64) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+	if err := s.checkReplacementLocked(id); err != nil {
+		return err
+	}
+	if err := rejectCompletionHold(s.db, id); err != nil {
+		return err
+	}
 	if _, err := s.db.Exec(`DELETE FROM spool_entries WHERE id=?`, id); err != nil {
 		return fmt.Errorf("spool delete %d: %w", id, err)
 	}
@@ -638,7 +1247,9 @@ func (s *SpoolStore) DeleteDone(cutoff time.Time) (int64, error) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	res, err := s.db.Exec(
-		`DELETE FROM spool_entries WHERE drain_state=? AND updated_at < ?`,
+		`DELETE FROM spool_entries WHERE drain_state=? AND updated_at < ?
+ AND replacement_witness IS NULL
+ AND NOT EXISTS (SELECT 1 FROM spool_completion_holds h WHERE h.spool_id=spool_entries.id)`,
 		DrainDone, cutoff.Unix(),
 	)
 	if err != nil {
@@ -719,6 +1330,16 @@ func (s *SpoolStore) ListPendingSymlinks() ([]PendingSymlink, error) {
 	return out, rows.Err()
 }
 
+// CountPendingSymlinks is the cheap status-poll counterpart to the ordered
+// materialization listing. An unreadable table is not an empty queue.
+func (s *SpoolStore) CountPendingSymlinks() (int, error) {
+	var count int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM pending_symlinks`).Scan(&count); err != nil {
+		return 0, fmt.Errorf("count pending symlinks: %w", err)
+	}
+	return count, nil
+}
+
 // DeletePendingSymlink removes the row for linkPath once it has been
 // materialized on FUSE (or is otherwise no longer pending — e.g. the link's
 // path was deleted before reconnect). Idempotent: deleting an absent row is a
@@ -738,8 +1359,8 @@ func scanSpoolRow(scan func(...any) error) (*SpoolRow, error) {
 	var r SpoolRow
 	var state string
 	var lastErr, suspect sql.NullString
-	var createdAt, updatedAt int64
-	if err := scan(&r.ID, &r.NFSPath, &r.SpoolFile, &r.Size, &r.SHA256, &state, &r.DrainAttempts, &lastErr, &suspect, &createdAt, &updatedAt); err != nil {
+	var createdAt, updatedAt, pauseSince, retryAfter int64
+	if err := scan(&r.ID, &r.NFSPath, &r.SpoolFile, &r.Size, &r.SHA256, &state, &r.DrainAttempts, &lastErr, &suspect, &r.PunchedEnd, &createdAt, &updatedAt, &pauseSince, &retryAfter, &r.QualificationHold, &r.RetiredBy); err != nil {
 		return nil, err
 	}
 	r.DrainState = DrainState(state)
@@ -751,5 +1372,401 @@ func scanSpoolRow(scan func(...any) error) (*SpoolRow, error) {
 	}
 	r.CreatedAt = time.Unix(createdAt, 0)
 	r.UpdatedAt = time.Unix(updatedAt, 0)
+	if pauseSince > 0 {
+		r.PauseSince = time.Unix(0, pauseSince)
+	}
+	if retryAfter > 0 {
+		r.RetryAfter = time.Unix(0, retryAfter)
+	}
 	return &r, nil
+}
+
+// ---------------------------------------------------------------------------
+// H-8B: base identity and project-lease state per spool row.
+// ---------------------------------------------------------------------------
+
+// SpoolBaseKind says what a row knew about the backend file at its name when
+// the write opened.
+type SpoolBaseKind uint8
+
+const (
+	// SpoolBaseUnknown: the row predates H-8B (or was created by a path that
+	// records nothing). The drain keeps the pre-0.5 behaviour for it.
+	SpoolBaseUnknown SpoolBaseKind = iota
+	// SpoolBaseAbsent: the name did not exist from this Mac's view when the
+	// write opened. A file found there at drain time belongs to someone else.
+	SpoolBaseAbsent
+	// SpoolBasePresent: the exact backend identity (inode, mtime, ctime and
+	// length, nanoseconds) of the file this write replaces.
+	SpoolBasePresent
+	// SpoolBaseWeak: only the mirror's length and whole-second mtime were
+	// known (the Mac was offline, or the backend lookup timed out).
+	SpoolBaseWeak
+	// SpoolBaseClaimed: a drain attempt of THIS row already wrote inode Ino
+	// (in place, or by installing a new name). A retry must recognise its own
+	// partial or installed file instead of treating it as another writer's.
+	SpoolBaseClaimed
+	// SpoolBaseMoved: a present base whose inode was then renamed with the
+	// pending row. JuiceFS sets the moved inode's ctime to the rename time
+	// (doRename: iattr.Ctime = now), so ctime cannot be carried; inode,
+	// mtime (ns) and length are unchanged by a rename and are still compared.
+	SpoolBaseMoved
+	// SpoolBaseReplace: a spool-only file was renamed over an existing
+	// backend file (an atomic save: write a temp, rename it over the
+	// original). Ino, mtime (ns) and length identify the file it replaces.
+	// The drain does not truncate that file: it stages the new bytes and
+	// installs them with one replacing rename, only while the destination is
+	// still that file, so other Macs see old -> new and never a missing name.
+	// ctime is not compared (as for moved): a metadata-only change to the
+	// old file (xattr, chmod) must not turn every such save into a conflict.
+	SpoolBaseReplace
+	// SpoolBaseAtomicConflict marks a temp-file rename whose destination
+	// identity could not be proved. It must stage and keep any old destination;
+	// a collision publishes a conflict copy. This intent survives restart.
+	SpoolBaseAtomicConflict
+)
+
+func (k SpoolBaseKind) String() string {
+	switch k {
+	case SpoolBaseAbsent:
+		return "absent"
+	case SpoolBasePresent:
+		return "present"
+	case SpoolBaseWeak:
+		return "weak"
+	case SpoolBaseClaimed:
+		return "claimed"
+	case SpoolBaseMoved:
+		return "moved"
+	case SpoolBaseReplace:
+		return "replace"
+	case SpoolBaseAtomicConflict:
+		return "atomic-conflict"
+	}
+	return "unknown"
+}
+
+// SpoolBase is the base identity recorded per spool row.
+//
+// Column encoding (all INTEGER NOT NULL DEFAULT 0, so a migrated legacy row
+// is UNKNOWN by construction):
+//
+//	unknown  base_ino = 0
+//	absent   base_ino = -1
+//	weak     base_ino = -2, base_mtime_ns, base_len
+//	present  base_ino > 0, base_ctime_ns >= 0, all four fields
+//	claimed  base_ino > 0, base_ctime_ns = -1
+//	moved    base_ino > 0, base_ctime_ns = -2, base_mtime_ns, base_len
+//	replace  base_ino > 0, base_ctime_ns = -3, base_mtime_ns, base_len
+//
+// A build that predates "replace" reads it as present with ctime -3, which
+// never matches a real file: it publishes a conflict copy (the safe side).
+type SpoolBase struct {
+	Kind    SpoolBaseKind
+	Ino     uint64
+	MtimeNs int64
+	CtimeNs int64
+	Len     int64
+}
+
+const (
+	spoolBaseInoAbsent           = -1
+	spoolBaseInoWeak             = -2
+	spoolBaseCtimeAtomicConflict = -4
+	spoolBaseCtimeClaim          = -1
+	spoolBaseCtimeMoved          = -2
+	spoolBaseCtimeRepl           = -3
+)
+
+func (b SpoolBase) columns() (ino, mtimeNs, ctimeNs, length int64) {
+	switch b.Kind {
+	case SpoolBaseAbsent:
+		return spoolBaseInoAbsent, 0, 0, 0
+	case SpoolBaseAtomicConflict:
+		return spoolBaseInoAbsent, 0, spoolBaseCtimeAtomicConflict, 0
+	case SpoolBaseWeak:
+		return spoolBaseInoWeak, b.MtimeNs, 0, b.Len
+	case SpoolBasePresent:
+		if b.Ino == 0 || b.Ino > 1<<62 || b.CtimeNs < 0 {
+			return 0, 0, 0, 0
+		}
+		return int64(b.Ino), b.MtimeNs, b.CtimeNs, b.Len
+	case SpoolBaseClaimed:
+		if b.Ino == 0 || b.Ino > 1<<62 {
+			return 0, 0, 0, 0
+		}
+		return int64(b.Ino), 0, spoolBaseCtimeClaim, 0
+	case SpoolBaseMoved:
+		if b.Ino == 0 || b.Ino > 1<<62 {
+			return 0, 0, 0, 0
+		}
+		return int64(b.Ino), b.MtimeNs, spoolBaseCtimeMoved, b.Len
+	case SpoolBaseReplace:
+		if b.Ino == 0 || b.Ino > 1<<62 {
+			return 0, 0, 0, 0
+		}
+		return int64(b.Ino), b.MtimeNs, spoolBaseCtimeRepl, b.Len
+	}
+	return 0, 0, 0, 0
+}
+
+func spoolBaseFromColumns(ino, mtimeNs, ctimeNs, length int64) SpoolBase {
+	switch {
+	case ino == spoolBaseInoAbsent && ctimeNs == spoolBaseCtimeAtomicConflict:
+		return SpoolBase{Kind: SpoolBaseAtomicConflict}
+	case ino == spoolBaseInoAbsent:
+		return SpoolBase{Kind: SpoolBaseAbsent}
+	case ino == spoolBaseInoWeak:
+		return SpoolBase{Kind: SpoolBaseWeak, MtimeNs: mtimeNs, Len: length}
+	case ino > 0 && ctimeNs == spoolBaseCtimeClaim:
+		return SpoolBase{Kind: SpoolBaseClaimed, Ino: uint64(ino)}
+	case ino > 0 && ctimeNs == spoolBaseCtimeMoved:
+		return SpoolBase{Kind: SpoolBaseMoved, Ino: uint64(ino), MtimeNs: mtimeNs, Len: length}
+	case ino > 0 && ctimeNs == spoolBaseCtimeRepl:
+		return SpoolBase{Kind: SpoolBaseReplace, Ino: uint64(ino), MtimeNs: mtimeNs, Len: length}
+	case ino > 0:
+		return SpoolBase{Kind: SpoolBasePresent, Ino: uint64(ino), MtimeNs: mtimeNs, CtimeNs: ctimeNs, Len: length}
+	}
+	return SpoolBase{}
+}
+
+// Owner returns the metadata Store this spool store is wired to (nil before
+// Store.SetSpoolStore). The drainer reads the mirror through it to learn
+// what this Mac saw at a name when a write opened.
+func (s *SpoolStore) Owner() *Store { return s.owner.Load() }
+
+// DrainBase returns the row's base identity and accepted lease epoch.
+func (s *SpoolStore) DrainBase(id int64) (SpoolBase, uint64, error) {
+	var ino, mt, ct, ln, epoch int64
+	err := s.db.QueryRow(`SELECT base_ino, base_mtime_ns, base_ctime_ns, base_len, accepted_epoch
+	 FROM spool_entries WHERE id=?`, id).Scan(&ino, &mt, &ct, &ln, &epoch)
+	if err != nil {
+		return SpoolBase{}, 0, err
+	}
+	if epoch < 0 {
+		epoch = 0
+	}
+	return spoolBaseFromColumns(ino, mt, ct, ln), uint64(epoch), nil
+}
+
+// ClaimDrainBase records that a drain of row id is about to write inode ino
+// at the row's name. It only touches a row that is still draining.
+func (s *SpoolStore) ClaimDrainBase(id int64, ino uint64) error {
+	cIno, _, cCt, _ := SpoolBase{Kind: SpoolBaseClaimed, Ino: ino}.columns()
+	if cIno <= 0 {
+		return fmt.Errorf("spool claim base %d: invalid inode %d", id, ino)
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	_, err := s.db.Exec(`UPDATE spool_entries SET base_ino=?, base_mtime_ns=0, base_ctime_ns=?, base_len=0
+	 WHERE id=? AND drain_state=?`, cIno, cCt, id, DrainDraining)
+	if err != nil {
+		return fmt.Errorf("spool claim base %d: %w", id, err)
+	}
+	return nil
+}
+
+// HoldForProject returns a draining row to ready and parks it until the
+// project lease frees (state "waiting_project"). The attempt budget is not
+// touched: a refused write is not a failure of the file. Returns false when
+// the row is no longer draining (canceled, renamed or already finished).
+func (s *SpoolStore) HoldForProject(id int64, project, reason string) (bool, error) {
+	if project == "" {
+		return false, fmt.Errorf("spool hold %d: empty project", id)
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if err := rejectCompletionHold(s.db, id); err != nil {
+		return false, err
+	}
+	res, err := s.db.Exec(`UPDATE spool_entries SET drain_state=?, wait_project=?, last_error=?, updated_at=?
+	 WHERE id=? AND drain_state=?`, DrainReady, project, reason, time.Now().Unix(), id, DrainDraining)
+	if err != nil {
+		return false, fmt.Errorf("spool hold %d: %w", id, err)
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
+}
+
+// ReleaseProjectHold makes every row waiting on project dispatchable again.
+func (s *SpoolStore) ReleaseProjectHold(project string) (int64, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	res, err := s.db.Exec(`UPDATE spool_entries SET wait_project='', updated_at=? WHERE wait_project=?`,
+		time.Now().Unix(), project)
+	if err != nil {
+		return 0, fmt.Errorf("spool release hold %q: %w", project, err)
+	}
+	return res.RowsAffected()
+}
+
+// ReleaseAllProjectHolds clears every project wait. The drainer calls it when
+// it runs without a lease client: nothing else would ever release them.
+func (s *SpoolStore) ReleaseAllProjectHolds() (int64, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	res, err := s.db.Exec(`UPDATE spool_entries SET wait_project='', updated_at=? WHERE wait_project<>''`,
+		time.Now().Unix())
+	if err != nil {
+		return 0, fmt.Errorf("spool release all holds: %w", err)
+	}
+	return res.RowsAffected()
+}
+
+// WaitingProjects counts active rows waiting per project.
+func (s *SpoolStore) WaitingProjects() (map[string]int, error) {
+	rows, err := s.db.Query(`SELECT wait_project, count(*) FROM spool_entries
+	 WHERE wait_project<>'' AND drain_state IN ('writing','ready','draining') GROUP BY wait_project`)
+	if err != nil {
+		return nil, fmt.Errorf("spool waiting projects: %w", err)
+	}
+	defer rows.Close()
+	out := map[string]int{}
+	for rows.Next() {
+		var p string
+		var n int
+		if err := rows.Scan(&p, &n); err != nil {
+			return nil, err
+		}
+		out[p] = n
+	}
+	return out, rows.Err()
+}
+
+// WaitProject returns the project row id waits on ("" = not waiting).
+func (s *SpoolStore) WaitProject(id int64) (string, error) {
+	var p string
+	err := s.db.QueryRow(`SELECT wait_project FROM spool_entries WHERE id=?`, id).Scan(&p)
+	return p, err
+}
+
+// ActivePaths returns the distinct paths of every active (writing, ready or
+// draining) row. The lease heartbeat derives "projects with pending spool"
+// from it.
+func (s *SpoolStore) ActivePaths() ([]string, error) {
+	rows, err := s.db.Query(`SELECT DISTINCT nfs_path FROM spool_entries
+	 WHERE drain_state IN ('writing','ready','draining')`)
+	if err != nil {
+		return nil, fmt.Errorf("spool active paths: %w", err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+// ---------------------------------------------------------------------------
+// Clone hold: rows copied from another Mac.
+// ---------------------------------------------------------------------------
+
+// SpoolCloneHoldReason marks rows found in a spool that was copied from
+// another Mac (Migration Assistant, Time Machine restore, cloned disk).
+const SpoolCloneHoldReason = "copied_from_other_mac"
+
+// HoldRowsCopiedFromOtherMac marks every row that is not done as held with
+// SpoolCloneHoldReason. It runs when the spool instance rotates because the
+// spool was created on another Mac, BEFORE the new instance ID is persisted.
+//
+// Why: those rows are the other Mac's pending writes. That Mac may still
+// drain them itself, or may have edited the same files since. Draining the
+// copy here would upload stale bytes over its later edits (a row whose base is
+// unknown and whose project has no foreign holder is rewritten in place). So
+// a held row is never claimed (MarkDraining, ListReady) and never deleted by
+// any automatic path; it keeps its drain_state, so it still counts as pending
+// (PendingStats, ListForStatus, the Quit guard) until the user decides.
+func (s *SpoolStore) HoldRowsCopiedFromOtherMac() (int64, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	res, err := s.db.Exec(`UPDATE spool_entries SET clone_hold=?, updated_at=?
+	 WHERE drain_state<>? AND clone_hold=''`, SpoolCloneHoldReason, time.Now().Unix(), DrainDone)
+	if err != nil {
+		return 0, fmt.Errorf("spool clone hold: %w", err)
+	}
+	return res.RowsAffected()
+}
+
+// ListCloneHeld returns the rows held as copied from another Mac.
+func (s *SpoolStore) ListCloneHeld() ([]*SpoolRow, error) {
+	rows, err := s.db.Query(
+		`SELECT id, nfs_path, spool_file, size, sha256, drain_state, drain_attempts, last_error, suspect_zero_tail, punched_end, created_at, updated_at, pause_since_ns, retry_after_ns, qualification_hold, retired_by
+		 FROM spool_entries WHERE clone_hold<>'' ORDER BY id`)
+	if err != nil {
+		return nil, fmt.Errorf("spool list clone-held: %w", err)
+	}
+	defer rows.Close()
+	var out []*SpoolRow
+	for rows.Next() {
+		r, err := scanSpoolRow(rows.Scan)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// CloneHold returns the row's clone-hold reason ("" = not held).
+func (s *SpoolStore) CloneHold(id int64) (string, error) {
+	var h string
+	err := s.db.QueryRow(`SELECT clone_hold FROM spool_entries WHERE id=?`, id).Scan(&h)
+	return h, err
+}
+
+// ReleaseCloneHeld is the user's "upload them" decision: every held row
+// becomes dispatchable again under this Mac's identity.
+func (s *SpoolStore) ReleaseCloneHeld() (int64, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	res, err := s.db.Exec(`UPDATE spool_entries SET clone_hold='', updated_at=? WHERE clone_hold<>''`, time.Now().Unix())
+	if err != nil {
+		return 0, fmt.Errorf("spool release clone holds: %w", err)
+	}
+	return res.RowsAffected()
+}
+
+// DeleteCloneHeld is the user's "discard them" decision: it deletes every
+// held row except those under a completion hold, and returns the deleted
+// rows so the caller removes their spool files and releases capacity.
+func (s *SpoolStore) DeleteCloneHeld() ([]*SpoolRow, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, fmt.Errorf("spool discard clone-held begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	rows, err := tx.Query(
+		`SELECT id, nfs_path, spool_file, size, sha256, drain_state, drain_attempts, last_error, suspect_zero_tail, punched_end, created_at, updated_at, pause_since_ns, retry_after_ns, qualification_hold, retired_by
+		 FROM spool_entries WHERE clone_hold<>''
+		 AND NOT EXISTS (SELECT 1 FROM spool_completion_holds h WHERE h.spool_id=spool_entries.id) ORDER BY id`)
+	if err != nil {
+		return nil, fmt.Errorf("spool discard clone-held list: %w", err)
+	}
+	var out []*SpoolRow
+	for rows.Next() {
+		r, err := scanSpoolRow(rows.Scan)
+		if err != nil {
+			rows.Close()
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	for _, r := range out {
+		if _, err := tx.Exec(`DELETE FROM spool_entries WHERE id=? AND clone_hold<>''`, r.ID); err != nil {
+			return nil, fmt.Errorf("spool discard clone-held %d: %w", r.ID, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("spool discard clone-held commit: %w", err)
+	}
+	return out, nil
 }

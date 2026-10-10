@@ -125,12 +125,12 @@ func (rc *RedisClient) loadDurablePruneLadder() {
 // table lags at most one cycle behind and the next completed cycle's diff
 // catches up (upserts are idempotent, deletes of missing rows are no-ops).
 //
-// Best-effort: a persist error is logged and swallowed — it must never fail
-// the sync. ladderPersisted is NOT updated on error, so the next diff
-// re-emits whatever didn't land.
-func (rc *RedisClient) persistPruneLadderDiff() {
+// A persist error leaves ladderPersisted unchanged so the next diff re-emits
+// whatever did not land. A caller certifying a complete baseline must treat
+// that error as incomplete.
+func (rc *RedisClient) persistPruneLadderDiff() error {
 	if !pruneLadderDurableEnabled() || rc.store == nil {
-		return
+		return nil
 	}
 	if rc.ladderPersisted == nil {
 		rc.ladderPersisted = make(map[string]int)
@@ -151,7 +151,7 @@ func (rc *RedisClient) persistPruneLadderDiff() {
 		}
 	}
 	if len(upserts) == 0 && len(deletes) == 0 {
-		return // no-op diff — never open a tx (degraded/steady-state cycles)
+		return nil // no-op diff — never open a tx (degraded/steady-state cycles)
 	}
 	if err := rc.store.PersistPruneLadderDelta(upserts, deletes); err != nil {
 		jmlog.Warn("prune ladder: durable persist failed — will re-diff next cycle",
@@ -159,7 +159,7 @@ func (rc *RedisClient) persistPruneLadderDiff() {
 			"deletes", len(deletes),
 			"error", err.Error(),
 		)
-		return
+		return err
 	}
 	for p, c := range upserts {
 		rc.ladderPersisted[p] = c
@@ -167,4 +167,5 @@ func (rc *RedisClient) persistPruneLadderDiff() {
 	for _, p := range deletes {
 		delete(rc.ladderPersisted, p)
 	}
+	return nil
 }

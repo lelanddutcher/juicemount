@@ -27,7 +27,6 @@ public enum RemediationCategory {
     case unpinFailed
     case reclaimFailed
     case clearCacheFailed
-    case forceEjectFailed
     case diagnosticsExportFailed
     case syncNowFailed
     case startFailed
@@ -46,7 +45,6 @@ public enum RemediationCategory {
         case .unpinFailed: return "Un-pin failed"
         case .reclaimFailed: return "Reclaim failed"
         case .clearCacheFailed: return "Clear cache failed"
-        case .forceEjectFailed: return "Force eject failed"
         case .diagnosticsExportFailed: return "Diagnostics export failed"
         case .syncNowFailed: return "Sync Now failed"
         case .startFailed: return "Start failed"
@@ -76,8 +74,9 @@ public enum RemediationCategory {
                    "may be stopped or restarting."
         }
         if lower.contains("permission denied") || lower.contains("eacces") {
-            return "Permission denied. Some operations need admin " +
-                   "rights (mount, unmount) or specific sudoers entries."
+            return "Permission denied. Creating the mount folder needs " +
+                   "your administrator approval, and macOS separately " +
+                   "asks JuiceMount for access to network volumes."
         }
 
         // Category-specific.
@@ -104,10 +103,6 @@ public enum RemediationCategory {
             return "Some chunk files couldn't be removed. The cache " +
                    "directory may have permission issues, or the " +
                    "JuiceFS daemon has file descriptors holding them."
-        case .forceEjectFailed:
-            return "The kernel didn't release the mount table " +
-                   "entry. Another process may still hold an open " +
-                   "file on the volume."
         case .diagnosticsExportFailed:
             return "Couldn't write the diagnostic zip. Check that " +
                    "the destination has write permission and free space."
@@ -152,10 +147,6 @@ public enum RemediationCategory {
             return "Stop mount and finish sync, then run from terminal:\n" +
                    "  rm -rf ~/.juicefs/cache/*/raw/chunks/*\n" +
                    "Then Start again."
-        case .forceEjectFailed:
-            return "From terminal:\n" +
-                   "  sudo umount -f -t nfs /Volumes/<your-mount>\n" +
-                   "If that fails too, reboot the Mac."
         case .diagnosticsExportFailed:
             return "Try a different destination (Desktop usually " +
                    "works). Confirm at least 100 MB free disk space."
@@ -176,9 +167,10 @@ public enum RemediationCategory {
                    "any you find."
         case .mountFailed:
             return "Click Mount Now again and approve the password " +
-                   "prompt. If it still fails, use Force Eject Mount " +
-                   "to clear a stuck entry, then retry — or restart " +
-                   "via Stop everything → Start."
+                   "prompt. If a stuck volume still occupies the mount " +
+                   "point, quit JuiceMount and restart the Mac. " +
+                   "JuiceMount never ejects a volume by its folder path, " +
+                   "because that could eject a different volume."
         case .generic:
             return "Try Stop everything → Start. If the error " +
                    "repeats, file an issue with the diagnostic " +
@@ -197,6 +189,13 @@ public func presentRemediation(
     rawError: String,
     extraContext: String? = nil
 ) {
+    // Founder Q1 gate: Start was refused because the privileged eject
+    // helper is not approved or not answering. That is not a configuration
+    // error, so it gets its own alert with the one fix that works.
+    if UnmountHelperDecision.isStartGateRefusal(rawError) {
+        presentHelperApproval(category, message: rawError, extraContext: extraContext)
+        return
+    }
     let work = {
         let alert = NSAlert()
         alert.messageText = category.title
@@ -225,6 +224,37 @@ public func presentRemediation(
             let pb = NSPasteboard.general
             pb.clearContents()
             pb.setString(snippet, forType: .string)
+        }
+    }
+    if Thread.isMainThread {
+        work()
+    } else {
+        DispatchQueue.main.async(execute: work)
+    }
+}
+
+/// Start refused by the helper gate: say why, offer the Login Items pane.
+/// Nothing was mounted or changed. Safe to call from any queue.
+private func presentHelperApproval(_ category: RemediationCategory, message: String, extraContext: String?) {
+    let work = {
+        let alert = NSAlert()
+        alert.messageText = "Turn on JuiceMount's background helper"
+        alert.informativeText = message
+        alert.alertStyle = .warning
+        let open = alert.addButton(withTitle: "Open Login Items…")
+        open.keyEquivalent = "\r"
+        alert.addButton(withTitle: "Not Now")
+        let copy = alert.addButton(withTitle: "Copy diagnostic")
+        copy.keyEquivalent = ""
+        switch alert.runModal() {
+        case .alertFirstButtonReturn:
+            UnmountHelperService.openLoginItems()
+        case .alertThirdButtonReturn:
+            let pb = NSPasteboard.general
+            pb.clearContents()
+            pb.setString(buildDiagnostic(category: category, rawError: message, extraContext: extraContext), forType: .string)
+        default:
+            break
         }
     }
     if Thread.isMainThread {

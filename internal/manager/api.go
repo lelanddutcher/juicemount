@@ -23,14 +23,23 @@ var staticFS embed.FS
 
 // API holds the HTTP handlers and their shared state.
 type API struct {
-	jobs           *JobManager
-	sourceRoots    []string // allowable host paths under /browse
-	destMount      string   // user-facing prefix used in destination paths (e.g. /jfs)
-	adminKey       string   // empty = no auth
-	prefix         string   // route-mount prefix (e.g. "/manager"); empty for standalone
-	fuseMount      string   // for ModeEmbedded dest-traversal check; empty in standalone
-	volName        string   // for ModeStandalone dest-validation
-	farmStatusPath string   // juicefarm rollup JSON path (farm-status.json); empty = Farm tab shows "not configured"
+	jobs                *JobManager
+	sourceRoots         []string // allowable host paths under /browse
+	destMount           string   // user-facing prefix used in destination paths (e.g. /jfs)
+	adminKey            string   // empty = no auth
+	prefix              string   // route-mount prefix (e.g. "/manager"); empty for standalone
+	fuseMount           string   // for ModeEmbedded dest-traversal check; empty in standalone
+	volName             string   // for ModeStandalone dest-validation
+	farmStatusPath      string   // juicefarm rollup JSON path (farm-status.json); empty = Farm tab shows "not configured"
+	farmStoragePath     string   // local path on the farm backend pool used for free-space safety admission
+	farmMinFree         uint64   // explicit reserve; 0 derives max(64 GiB, 1% of filesystem)
+	farmStorageCapacity uint64   // optional physical-pool capacity; ZFS statfs is dataset-scoped
+	farmStorageStat     func(string) (farmStorageSnapshot, error)
+	linkMetaURL         string // backend endpoint used for Link readiness (never returned to clients)
+	linkMinIOURL        string // object-store endpoint used for Link readiness (never returned to clients)
+	farmNodeMetaURL     string // explicit worker-bootstrap endpoint; returned only by authenticated no-store enrollment
+	farmServerImage     string // worker image advertised by enrollment
+	farmRenderImage     string // accelerated worker image advertised by enrollment
 
 	// farmChangesPath is the farm's pre-aggregated /derivatives/changes feed
 	// (JM-15 #56): the contract changes-array the farm writes next to
@@ -111,6 +120,20 @@ type Config struct {
 	AdminKey       string   // empty = no auth (LAN-only)
 	StateFile      string   // optional JSON path for job-history persistence (empty = ephemeral)
 	FarmStatusPath string   // optional path to the juicefarm rollup (farm-status.json) for the Farm tab
+	// FarmStoragePath is a local directory on the same physical pool as JuiceFS
+	// object/metadata storage. Empty derives the parent of FarmStatusPath. The
+	// Manager uses it to auto-pause the shared farm before proxy writes exhaust
+	// the backend; remote workers cannot infer backend headroom from local cache.
+	FarmStoragePath string
+	// FarmMinFreeBytes overrides the safety reserve. Zero derives the larger of
+	// 64 GiB and 1% of FarmStorageCapacityBytes (or the probed filesystem when
+	// capacity is unset).
+	FarmMinFreeBytes uint64
+	// FarmStorageCapacityBytes supplies the physical pool capacity when the
+	// probed filesystem is dataset-scoped. ZFS statfs reports only the current
+	// dataset's referenced bytes plus shared pool availability, so its f_blocks
+	// is not the zpool total when child datasets or snapshots hold most blocks.
+	FarmStorageCapacityBytes uint64
 	// FarmChangesPath optionally overrides where the farm's pre-aggregated
 	// derivatives-changes.json feed is read from (JM-15 #56). Normally left
 	// empty: it falls back to the JM_FARM_CHANGES env var, then to the
@@ -148,6 +171,9 @@ type Config struct {
 // Static UI is served from <prefix>/, JSON API from <prefix>/api/...
 func Register(mux *http.ServeMux, prefix string, cfg Config) *JobManager {
 	prefix = strings.TrimSuffix(prefix, "/")
+	// H-8B: --meta carries user@host only; in-process clients get the
+	// password from JM_META_PASSWORD (principals.go, volume credentials).
+	cfg.MetaURL, cfg.OverviewMetaURL = withEnvMetaPassword(cfg.MetaURL), withEnvMetaPassword(cfg.OverviewMetaURL)
 	// Derive the RunSync spec from the Config's destination-mode fields.
 	// Embedded (FUSEMount) takes precedence; falls back to standalone
 	// (MetaURL+VolName) if FUSEMount is unset.
@@ -166,11 +192,16 @@ func Register(mux *http.ServeMux, prefix string, cfg Config) *JobManager {
 		jobs:           mgr,
 		sourceRoots:    cfg.SourceRoots,
 		farmStatusPath: cfg.FarmStatusPath,
-		destMount:      cfg.DestMount,
-		adminKey:       cfg.AdminKey,
-		prefix:         prefix,
-		fuseMount:      cfg.FUSEMount,
-		volName:        cfg.VolName,
+		farmStoragePath: deriveFarmStoragePath(
+			cfg.FarmStoragePath, cfg.FarmStatusPath),
+		farmMinFree:         cfg.FarmMinFreeBytes,
+		farmStorageCapacity: cfg.FarmStorageCapacityBytes,
+		farmStorageStat:     readFarmStorageSnapshot,
+		destMount:           cfg.DestMount,
+		adminKey:            cfg.AdminKey,
+		prefix:              prefix,
+		fuseMount:           cfg.FUSEMount,
+		volName:             cfg.VolName,
 		farmChangesPath: deriveFarmChangesPath(
 			cfg.FarmChangesPath, os.Getenv("JM_FARM_CHANGES"), cfg.FarmStatusPath),
 	}
@@ -184,6 +215,11 @@ func Register(mux *http.ServeMux, prefix string, cfg Config) *JobManager {
 	if overviewMeta == "" {
 		overviewMeta = cfg.MetaURL
 	}
+	a.linkMetaURL = overviewMeta
+	a.linkMinIOURL = cfg.MinIOURL
+	a.farmNodeMetaURL = strings.TrimSpace(os.Getenv("JM_FARM_NODE_META_URL"))
+	a.farmServerImage = strings.TrimSpace(os.Getenv("JM_FARM_SERVER_IMAGE"))
+	a.farmRenderImage = strings.TrimSpace(os.Getenv("JM_FARM_RENDER_IMAGE"))
 	a.overview = newOverviewSource(mgr, cfg.JuiceFSBin, overviewMeta, cfg.MinIOURL)
 	// JM-16: dial the shared juicefarm: job queue on the volume's Redis so
 	// the Farm tab can enqueue server-side generation work + read job
@@ -202,6 +238,9 @@ func Register(mux *http.ServeMux, prefix string, cfg Config) *JobManager {
 		} else {
 			a.farmQ = fq
 		}
+	}
+	if a.farmQ != nil && a.farmStoragePath != "" {
+		go a.runFarmStorageGuard()
 	}
 	mux.HandleFunc(prefix+"/api/sources", a.auth(a.handleSources))
 	mux.HandleFunc(prefix+"/api/browse", a.auth(a.handleBrowse))
@@ -234,6 +273,15 @@ func Register(mux *http.ServeMux, prefix string, cfg Config) *JobManager {
 	// Exact path (registered before any subtree) — POST clears terminal
 	// job records from the Recent-jobs list + prunes the leaked index.
 	mux.HandleFunc(prefix+"/api/farm/jobs/clear", a.auth(a.handleFarmJobsClear))
+	mux.HandleFunc(prefix+"/api/farm/queues", a.auth(a.handleFarmQueues))
+	mux.HandleFunc(prefix+"/api/farm/job/", a.auth(a.handleFarmJobAction))
+	mux.HandleFunc(prefix+"/api/farm/node/", a.auth(a.handleFarmNodeAction))
+	mux.HandleFunc(prefix+"/api/farm/control", a.auth(a.handleFarmControl))
+	// Farm node config (FARM-NODE-CONFIG spec): manager-owned worker settings.
+	mux.HandleFunc(prefix+"/api/farm/config", a.auth(a.handleFarmConfig))
+	mux.HandleFunc(prefix+"/api/farm/workers", a.auth(a.handleFarmWorkers))
+	mux.HandleFunc(prefix+"/api/farm/workers/control", a.auth(a.handleFarmWorkerControl))
+	mux.HandleFunc(prefix+"/api/farm/enrollment", a.auth(a.handleFarmEnrollment))
 	// JM-15 #56 (server half): relay the farm's pre-aggregated
 	// /derivatives/changes feed (contract derivatives-changes.schema.json,
 	// filtered by ?since=&limit=) so the Mac client learns farm-generated
@@ -349,6 +397,25 @@ func Register(mux *http.ServeMux, prefix string, cfg Config) *JobManager {
 	mgr.SetSettings(settingsStore)
 	mux.HandleFunc(prefix+"/api/settings", a.auth(a.handleSettings))
 	mux.HandleFunc(prefix+"/api/settings/rotate-admin-key", a.auth(a.handleRotateAdminKey))
+
+	// JuiceMount Link (Tier-2): pairing + node management
+	mux.HandleFunc(prefix+"/api/net/link", a.auth(a.handleLinkStatus))
+	mux.HandleFunc(prefix+"/api/net/pair", a.auth(a.handlePair))
+	mux.HandleFunc(prefix+"/api/net/paired", a.auth(a.handlePairedNodes))
+	mux.HandleFunc(prefix+"/api/net/revoke", a.auth(a.handleRevokeNode))
+	// T2.2: subnet-route approval for the embedded NAS node (advertise →
+	// approve is headscale's two-step; this surfaces the approve step so
+	// operators can verify/repair routing without shelling into the box).
+	mux.HandleFunc(prefix+"/api/net/routes/approve", a.auth(a.handleNetRouteApprove))
+	// Teams and seats deliberately are not registered for this release
+	// candidate. The previous scaffold presented account/session screens but
+	// did not authorize manager operations or JuiceFS data access, making the
+	// roles misleading. Keep the implementation isolated until an end-to-end
+	// authorization model (identity, role enforcement, revocation, and storage
+	// policy) is ready to ship as one feature.
+	// H-8B: Mac principal enrollment, leases admin, mode switch, and the
+	// project checkout for sync/trash restore (principals.go).
+	a.registerH8B(mux, prefix, cfg)
 	// Static UI: serve <prefix>/ and <prefix>/<file>. Strip prefix so
 	// the existing handleStatic logic still works.
 	staticHandler := http.StripPrefix(prefix, http.HandlerFunc(a.handleStatic))
@@ -1356,6 +1423,11 @@ func (a *API) handleStatic(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
 	}
+	// Manager assets are embedded into the release binary and can change at
+	// every candidate commit. Require revalidation so a browser cannot keep a
+	// previous RC's CSS or client logic after the container is replaced.
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
 	switch filepath.Ext(path) {
 	case ".html":
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -1363,6 +1435,10 @@ func (a *API) handleStatic(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/javascript")
 	case ".css":
 		w.Header().Set("Content-Type", "text/css")
+	case ".svg":
+		w.Header().Set("Content-Type", "image/svg+xml")
+	case ".woff2":
+		w.Header().Set("Content-Type", "font/woff2")
 	}
 	_, _ = w.Write(data)
 }

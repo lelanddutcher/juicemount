@@ -2,14 +2,14 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://juicemount.contract/v1/assertions-sidecar.schema.json",
   "title": "AssertionSidecar",
-  "description": "The portable `<media>.loupe.json` assertion sidecar — the SOURCE OF TRUTH for human metadata about a media file (ratings, person names, a deliberate log-profile pick). ASSERTIONS_SIDECAR.md. It is an ordinary JSON file next to the media (same directory, name = media filename + `.loupe.json`), so the truth travels with the bytes on any cross-volume / SMB / USB copy and is readable by a second client with no JuiceMount in the path. JuiceMount's Tier-B `assertions` table is a REBUILDABLE INDEX over these sidecars, never the silo that owns them. Join key = the portable content-hash `asset_key` (xxh3 of size‖head‖tail, the same source_hash already on the wire), with a path/name fallback until bytes are hashed; the JuiceFS inode is a Tier-B accelerator column ONLY, never written here and never identity. An asset with no assertions has NO sidecar (an empty one is never written).",
+  "description": "The portable `<media>.logger.json` assertion sidecar — the SOURCE OF TRUTH for human metadata about a media file (ratings, person names, a deliberate log-profile pick). ASSERTIONS_SIDECAR.md. It is an ordinary JSON file next to the media (same directory, name = media filename + `.logger.json` (legacy `.loupe.json` is still READ)), so the truth travels with the bytes on any cross-volume / SMB / USB copy and is readable by a second client with no JuiceMount in the path. JuiceMount's Tier-B `assertions` table is a REBUILDABLE INDEX over these sidecars, never the silo that owns them. Join key = the portable content-hash `asset_key` (xxh3 of size‖head‖tail, the same source_hash already on the wire), with a path/name fallback until bytes are hashed; the JuiceFS inode is a Tier-B accelerator column ONLY, never written here and never identity. An asset with no assertions has NO sidecar (an empty one is never written).",
   "type": "object",
   "additionalProperties": true,
   "required": ["schema", "asset_key", "media_filename", "assertions"],
   "properties": {
     "schema": {
-      "const": "loupe.assertions/1",
-      "description": "Versioned shape tag; bumped only on a breaking change. Forward-compat readers ignore unknown namespaces + unknown top-level keys (hence additionalProperties:true)."
+      "enum": ["logger.assertions/1", "loupe.assertions/1"],
+      "description": "Versioned shape tag; bumped only on a breaking change. Forward-compat readers ignore unknown namespaces + unknown top-level keys (hence additionalProperties:true). WIDENED from const \"loupe.assertions/1\" for the loupe->logger unification shipped with contract_version 2 (2026-08-03): both spellings are ACCEPTED indefinitely and the legacy one is NOT scheduled for removal. WRITE RULE: a freshly-created sidecar carries \"logger.assertions/1\"; an EXISTING sidecar keeps whatever tag it already has. Rewriting the tag inside a file a shipped reader already parses is a silent break, not a migration — so producers must not upgrade the tag in place."
     },
     "asset_key": {
       "type": "string",

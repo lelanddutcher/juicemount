@@ -14,7 +14,10 @@
 package pin
 
 import (
+	"bytes"
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"fmt"
 	"sync"
 	"time"
@@ -54,6 +57,7 @@ func (s Status) String() string {
 // Entry is a single pinned file's record.
 type Entry struct {
 	Path           string
+	Generation     string // durable random incarnation; never inherited by a repin
 	Size           int64
 	Status         Status
 	BytesCached    int64
@@ -61,6 +65,7 @@ type Entry struct {
 	LastError      string
 	PinnedAt       time.Time
 	PinRoot        string // the directory the user pinned (so Unpin can find siblings)
+	Authority      []byte // opaque durable producer witness; never inferred from Status alone
 }
 
 const schema = `
@@ -72,7 +77,9 @@ CREATE TABLE IF NOT EXISTS pinned_files (
     last_prefetched  INTEGER NOT NULL DEFAULT 0,
     last_error       TEXT NOT NULL DEFAULT '',
     pinned_at        INTEGER NOT NULL,
-    pin_root         TEXT NOT NULL DEFAULT ''
+    pin_root         TEXT NOT NULL DEFAULT '',
+    pin_generation   TEXT NOT NULL DEFAULT '',
+    authority        BLOB NOT NULL DEFAULT X''
 );
 CREATE INDEX IF NOT EXISTS idx_pinned_status ON pinned_files(status);
 CREATE INDEX IF NOT EXISTS idx_pinned_root ON pinned_files(pin_root);
@@ -83,31 +90,14 @@ type Store struct {
 	db *sql.DB
 	mu sync.RWMutex
 
-	// QA-35 (2026-05-26): in-memory cache for IsPinnedReady. The
-	// pre-cache implementation ran a SQLite SELECT on every call.
-	// IsPinnedReady is hit by juiceFS.OpenFile on every NFS READ RPC
-	// (`nfs/handler.go:1044`), making it a per-RPC tax of one SQLite
-	// round-trip — at hundreds of RPCs/sec during sustained reads
-	// the dominant cost.
-	//
-	// Cache contains the set of paths currently in StatusReady OR
-	// (StatusPrefetching AND bytes_cached >= size). Invalidated on
-	// any pin/unpin/UpdateStatus mutation; auto-expires after readyTTL
-	// as a defensive belt against missed invalidations. Refreshed
-	// lazily on first read after invalidation.
-	//
-	// Negative results (path not in map) ARE cacheable — pin counts
-	// are small (<1000 typically), so storing the full ready-set is
-	// cheap. A read for a non-pinned path == map-miss == false.
-	readyMu         sync.RWMutex
-	ready           map[string]struct{}
-	readyValidUntil time.Time
+	// Only producer-finalized or locally restored witnesses enter this RAM
+	// index. SQLite StatusReady alone and old Prefetching byte counts cannot
+	// authorize an NFS open. IsPinnedReady performs no SQL or remote I/O.
+	readyMu        sync.RWMutex
+	ready          map[string]Entry     // admitted generation and witness, never a raw SQL Ready row
+	readyValidator func(Entry) bool     // immutable once installed; RAM-only and no Redis/SQL
+	readyRevoker   func(string, string) // exact-generation provider cleanup, after readyMu unlock
 }
-
-// readyTTL is the maximum staleness of the IsPinnedReady cache. Short
-// enough that a "I just pinned this file" delay is imperceptible;
-// long enough that the cache absorbs steady-state read traffic.
-const readyTTL = 1 * time.Second
 
 // Open creates or opens the pin store at the given path. Use ":memory:" for
 // tests. The DB file can be the same one as the metadata store or a separate
@@ -134,7 +124,105 @@ func Open(dbPath string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("create schema: %w", err)
 	}
+	if err := migratePinGenerations(db); err != nil {
+		db.Close()
+		return nil, err
+	}
 	return &Store{db: db}, nil
+}
+
+func newPinGeneration() (string, error) {
+	var raw [16]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(raw[:]), nil
+}
+
+// Existing pre-incarnation rows cannot authorize a still-running old worker.
+// Give each a new durable token and conservatively queue it for recheck.
+func migratePinGenerations(db *sql.DB) error {
+	rows, err := db.Query(`PRAGMA table_info(pinned_files)`)
+	if err != nil {
+		return err
+	}
+	hasGeneration := false
+	hasAuthority := false
+	for rows.Next() {
+		var id, notNull, pk int
+		var name, kind string
+		var defaultValue any
+		if err := rows.Scan(&id, &name, &kind, &notNull, &defaultValue, &pk); err != nil {
+			rows.Close()
+			return err
+		}
+		if name == "pin_generation" {
+			hasGeneration = true
+		}
+		if name == "authority" {
+			hasAuthority = true
+		}
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return err
+	}
+	if !hasGeneration {
+		if _, err := db.Exec(`ALTER TABLE pinned_files ADD COLUMN pin_generation TEXT NOT NULL DEFAULT ''`); err != nil {
+			return err
+		}
+	}
+	if !hasAuthority {
+		if _, err := db.Exec(`ALTER TABLE pinned_files ADD COLUMN authority BLOB NOT NULL DEFAULT X''`); err != nil {
+			return err
+		}
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	rows, err = tx.Query(`SELECT path FROM pinned_files WHERE pin_generation = ''`)
+	if err != nil {
+		return err
+	}
+	var paths []string
+	for rows.Next() {
+		var path string
+		if err := rows.Scan(&path); err != nil {
+			rows.Close()
+			return err
+		}
+		paths = append(paths, path)
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return err
+	}
+	for _, path := range paths {
+		generation, err := newPinGeneration()
+		if err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`UPDATE pinned_files SET pin_generation=?,status=?,bytes_cached=0,last_prefetched=0,last_error='',authority=X'' WHERE path=? AND pin_generation=''`, generation, int(StatusPending), path); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	// Earlier builds used StatusReady for bytes-only FUSE hydration. Those
+	// rows have no authority witness and must be reacquired, not stranded.
+	if _, err := db.Exec(`UPDATE pinned_files SET status=?,bytes_cached=0,last_prefetched=0,last_error='' WHERE status=? AND length(authority)=0`, int(StatusPending), int(StatusReady)); err != nil {
+		return err
+	}
+	if _, err := db.Exec(`UPDATE pinned_files SET status=?,bytes_cached=0,last_error='',authority=X'' WHERE status=?`, int(StatusPending), int(StatusPrefetching)); err != nil {
+		return err
+	}
+	_, err = db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_pinned_generation ON pinned_files(pin_generation) WHERE pin_generation != ''`)
+	return err
 }
 
 func (s *Store) Close() error { return s.db.Close() }
@@ -142,23 +230,30 @@ func (s *Store) Close() error { return s.db.Close() }
 // Pin adds a single file to the registry. Idempotent; existing entries with
 // the same path are updated to Pending status (re-queue them for prefetch).
 func (s *Store) Pin(path string, size int64, root string) error {
+	generation, err := newPinGeneration()
+	if err != nil {
+		return err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := time.Now().UnixMilli()
-	_, err := s.db.Exec(`
-		INSERT INTO pinned_files (path, size, status, pinned_at, pin_root)
-		VALUES (?, ?, ?, ?, ?)
+	_, err = s.db.Exec(`
+		INSERT INTO pinned_files (path, size, status, pinned_at, pin_root, pin_generation)
+		VALUES (?, ?, ?, ?, ?, ?)
 		ON CONFLICT(path) DO UPDATE SET
 		    size = excluded.size,
 		    status = ?,
-		    pin_root = excluded.pin_root`,
-		path, size, int(StatusPending), now, root,
+		    pinned_at = excluded.pinned_at,
+		    pin_root = excluded.pin_root,
+		    pin_generation = excluded.pin_generation,
+		    bytes_cached = 0, last_prefetched = 0, last_error = '', authority = X''`,
+		path, size, int(StatusPending), now, root, generation,
 		int(StatusPending),
 	)
 	if err != nil {
 		return fmt.Errorf("pin %q: %w", path, err)
 	}
-	s.invalidateReady() // QA-35
+	s.RevokeReady(path)
 	return nil
 }
 
@@ -175,12 +270,15 @@ func (s *Store) PinMany(entries []Entry) error {
 		return err
 	}
 	stmt, err := tx.Prepare(`
-		INSERT INTO pinned_files (path, size, status, pinned_at, pin_root)
-		VALUES (?, ?, ?, ?, ?)
+		INSERT INTO pinned_files (path, size, status, pinned_at, pin_root, pin_generation)
+		VALUES (?, ?, ?, ?, ?, ?)
 		ON CONFLICT(path) DO UPDATE SET
 		    size = excluded.size,
 		    status = ?,
-		    pin_root = excluded.pin_root`)
+		    pinned_at = excluded.pinned_at,
+		    pin_root = excluded.pin_root,
+		    pin_generation = excluded.pin_generation,
+		    bytes_cached = 0, last_prefetched = 0, last_error = '', authority = X''`)
 	if err != nil {
 		tx.Rollback()
 		return err
@@ -188,8 +286,13 @@ func (s *Store) PinMany(entries []Entry) error {
 	defer stmt.Close()
 	now := time.Now().UnixMilli()
 	for _, e := range entries {
+		generation, genErr := newPinGeneration()
+		if genErr != nil {
+			tx.Rollback()
+			return genErr
+		}
 		_, err := stmt.Exec(
-			e.Path, e.Size, int(StatusPending), now, e.PinRoot,
+			e.Path, e.Size, int(StatusPending), now, e.PinRoot, generation,
 			int(StatusPending),
 		)
 		if err != nil {
@@ -200,7 +303,9 @@ func (s *Store) PinMany(entries []Entry) error {
 	if err := tx.Commit(); err != nil {
 		return err
 	}
-	s.invalidateReady() // QA-35
+	for _, e := range entries {
+		s.RevokeReady(e.Path)
+	}
 	return nil
 }
 
@@ -215,7 +320,21 @@ func (s *Store) Unpin(root string) (int, error) {
 		return 0, err
 	}
 	n, _ := res.RowsAffected()
-	s.invalidateReady() // QA-35
+	s.readyMu.Lock()
+	var removed []Entry
+	for path, entry := range s.ready {
+		if path == root || entry.PinRoot == root {
+			removed = append(removed, entry)
+			delete(s.ready, path)
+		}
+	}
+	revoke := s.readyRevoker
+	s.readyMu.Unlock()
+	if revoke != nil {
+		for _, entry := range removed {
+			revoke(entry.Path, entry.Generation)
+		}
+	}
 	return int(n), nil
 }
 
@@ -225,105 +344,254 @@ func (s *Store) UnpinPath(path string) error {
 	defer s.mu.Unlock()
 	_, err := s.db.Exec(`DELETE FROM pinned_files WHERE path = ?`, path)
 	if err == nil {
-		s.invalidateReady() // QA-35
+		s.RevokeReady(path)
 	}
 	return err
 }
 
-// UpdateStatus is called by the prefetcher to record progress.
+// UpdateStatus is retained for synchronous legacy callers. Asynchronous
+// prefetch work must use UpdateStatusForEntry to fence superseded attempts.
 func (s *Store) UpdateStatus(path string, status Status, bytesCached int64, errMsg string) error {
+	if status == StatusReady {
+		return fmt.Errorf("pin Ready requires durable authority witness")
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := time.Now().UnixMilli()
 	_, err := s.db.Exec(`
 		UPDATE pinned_files
-		SET status = ?, bytes_cached = ?, last_prefetched = ?, last_error = ?
+		SET status = ?, bytes_cached = ?, last_prefetched = ?, last_error = ?, authority = X''
 		WHERE path = ?`,
 		int(status), bytesCached, now, errMsg, path)
 	if err == nil {
-		s.invalidateReady() // QA-35
+		s.RevokeReady(path)
 	}
 	return err
 }
 
-// IsPinnedReady checks whether a single path is "good enough" to be
-// served while offline mode is on. A path qualifies if either:
-//
-//  1. status = Ready, OR
-//  2. status = Prefetching AND bytes_cached >= size — i.e. the prefetcher
-//     has finished pulling bytes but hasn't flipped the status row yet.
-//     This eliminates a small (~1s) window where a fully-cached file
-//     would otherwise be refused after the user toggles offline ON.
-//
-// Hot-path-friendly — uses the path primary key. Called on every NFS
-// OpenFile when offline mode is on.
-//
-// Note: Pending files are intentionally refused — the user explicitly
-// asked for fail-fast, and Pending means we know we don't have the bytes.
-// Promoting Pending here would re-introduce the very freeze (FUSE →
-// backend → timeout) the offline gate exists to prevent.
-func (s *Store) IsPinnedReady(path string) bool {
-	// QA-35 (2026-05-26): fast path through in-memory ready-set
-	// cache. See type Store readyMu/ready/readyValidUntil docstring
-	// for the rationale.
-	s.readyMu.RLock()
-	if time.Now().Before(s.readyValidUntil) {
-		_, ok := s.ready[path]
-		s.readyMu.RUnlock()
-		return ok
+// UpdateStatusForEntry is the only status publication path for an asynchronous
+// prefetch job. A deleted/recreated or repinned path has a different generation.
+func (s *Store) UpdateStatusForEntry(e Entry, status Status, bytesCached int64, errMsg string) (bool, error) {
+	if status == StatusReady {
+		return false, fmt.Errorf("pin Ready requires durable authority witness")
 	}
-	s.readyMu.RUnlock()
+	if e.Generation == "" {
+		return false, nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	result, err := s.db.Exec(`UPDATE pinned_files SET status=?,bytes_cached=?,last_prefetched=?,last_error=?,authority=X'' WHERE path=? AND pin_generation=?`,
+		int(status), bytesCached, time.Now().UnixMilli(), errMsg, e.Path, e.Generation)
+	if err != nil {
+		return false, err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if changed != 0 {
+		s.RevokeReady(e.Path)
+	}
+	return changed == 1, nil
+}
 
-	// Slow path: refresh the cache atomically, then re-read.
-	s.refreshReadyCache()
+// CompleteReady commits the opaque, already-verified producer witness last.
+// Publication remains unavailable until AdmitReady validates local state.
+func (s *Store) CompleteReady(e Entry, authority []byte) (bool, error) {
+	if e.Generation == "" || len(authority) == 0 || e.Size < 0 {
+		return false, nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	result, err := s.db.Exec(`UPDATE pinned_files SET status=?,bytes_cached=size,last_prefetched=?,last_error='',authority=? WHERE path=? AND pin_generation=? AND status=?`,
+		int(StatusReady), time.Now().UnixMilli(), authority, e.Path, e.Generation, int(StatusPrefetching))
+	if err != nil {
+		return false, err
+	}
+	n, err := result.RowsAffected()
+	return n == 1, err
+}
 
+// ClaimPrefetch atomically gives one queued attempt its own durable generation.
+// A duplicate queue item or a later repair cannot inherit this worker's token.
+func (s *Store) ClaimPrefetch(e Entry) (Entry, bool, error) {
+	if e.Generation == "" || e.Status == StatusUnknown {
+		return Entry{}, false, nil
+	}
+	generation, err := newPinGeneration()
+	if err != nil {
+		return Entry{}, false, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	status := StatusPrefetching
+	bytesCached := int64(0)
+	result, err := s.db.Exec(`UPDATE pinned_files SET pin_generation=?,status=?,bytes_cached=?,last_prefetched=?,authority=X'' WHERE path=? AND pin_generation=? AND status=?`,
+		generation, int(status), bytesCached, time.Now().UnixMilli(), e.Path, e.Generation, int(e.Status))
+	if err != nil {
+		return Entry{}, false, err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return Entry{}, false, err
+	}
+	if changed != 1 {
+		return Entry{}, false, nil
+	}
+	s.RevokeReady(e.Path)
+	e.Generation, e.Status, e.BytesCached, e.Authority = generation, status, bytesCached, nil
+	return e, true, nil
+}
+
+// RequeueForRepair revokes any earlier worker before Pending becomes visible.
+func (s *Store) RequeueForRepair(e Entry) (bool, error) {
+	if e.Generation == "" {
+		return false, nil
+	}
+	generation, err := newPinGeneration()
+	if err != nil {
+		return false, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	result, err := s.db.Exec(`UPDATE pinned_files SET pin_generation=?,status=?,bytes_cached=0,last_prefetched=0,last_error='',authority=X'' WHERE path=? AND pin_generation=?`,
+		generation, int(StatusPending), e.Path, e.Generation)
+	if err != nil {
+		return false, err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if changed != 0 {
+		s.RevokeReady(e.Path)
+	}
+	return changed == 1, nil
+}
+
+// SetReadyValidator installs the immutable, RAM-only local authority check.
+// Production wires it before any Ready admission or NFS listener publication.
+func (s *Store) SetReadyValidator(validate func(Entry) bool) error {
+	if validate == nil {
+		return fmt.Errorf("pin ready validator is nil")
+	}
+	s.readyMu.Lock()
+	defer s.readyMu.Unlock()
+	if s.readyValidator != nil {
+		return fmt.Errorf("pin ready validator is already configured")
+	}
+	s.readyValidator = validate
+	s.ready = make(map[string]Entry)
+	return nil
+}
+
+// SetReadyRevoker installs a local-only cleanup hook before workers start.
+// The hook must not call back into Store; mutations can hold s.mu.
+func (s *Store) SetReadyRevoker(revoke func(string, string)) error {
+	if revoke == nil {
+		return fmt.Errorf("nil pin ready revoker")
+	}
+	s.readyMu.Lock()
+	defer s.readyMu.Unlock()
+	if s.readyRevoker != nil {
+		return fmt.Errorf("pin ready revoker already configured")
+	}
+	s.readyRevoker = revoke
+	return nil
+}
+
+// ReadyAdmission is a pure RAM check. StatusReady in SQLite alone never
+// authorizes a read, including a legacy row or a crash before Finalize.
+func (s *Store) ReadyAdmission(path string) (Entry, bool) {
 	s.readyMu.RLock()
-	defer s.readyMu.RUnlock()
-	_, ok := s.ready[path]
+	entry, ok := s.ready[path]
+	validate := s.readyValidator
+	s.readyMu.RUnlock()
+	if !ok || validate == nil || !validate(entry) {
+		return Entry{}, false
+	}
+	s.readyMu.RLock()
+	current, still := s.ready[path]
+	s.readyMu.RUnlock()
+	return entry, still && current.Generation == entry.Generation
+}
+
+func (s *Store) IsPinnedReady(path string) bool {
+	_, ok := s.ReadyAdmission(path)
 	return ok
 }
 
-// refreshReadyCache rebuilds the in-memory ready-set from SQLite under
-// readyMu.Lock. Cheap: one indexed SELECT, ~1000 rows max for typical
-// pin counts. Called on demand from IsPinnedReady when the TTL expires
-// or after explicit invalidation.
-func (s *Store) refreshReadyCache() {
-	// Build the new set OUTSIDE the readyMu so other readers aren't
-	// blocked across the SQL call.
-	s.mu.RLock()
-	rows, err := s.db.Query(
-		`SELECT path FROM pinned_files WHERE status = ? OR (status = ? AND bytes_cached >= size AND size > 0)`,
-		int(StatusReady), int(StatusPrefetching),
-	)
+// AdmitReady is called only after producer Finalize or locally verified boot
+// restore. The SQL check and RAM install are serialized with pin mutations.
+func (s *Store) AdmitReady(e Entry) (bool, error) {
+	if e.Generation == "" || len(e.Authority) == 0 {
+		return false, nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var status int
+	var authority []byte
+	err := s.db.QueryRow(`SELECT status,authority FROM pinned_files WHERE path=? AND pin_generation=?`, e.Path, e.Generation).Scan(&status, &authority)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
 	if err != nil {
-		s.mu.RUnlock()
-		// Cache build failed; leave the existing cache as-is.
-		// readyValidUntil stays past, so next call retries.
-		return
+		return false, err
 	}
-	newSet := make(map[string]struct{}, 256)
-	for rows.Next() {
-		var p string
-		if err := rows.Scan(&p); err == nil {
-			newSet[p] = struct{}{}
-		}
+	if Status(status) != StatusReady || !bytes.Equal(authority, e.Authority) {
+		return false, nil
 	}
-	rows.Close()
-	s.mu.RUnlock()
-
 	s.readyMu.Lock()
-	s.ready = newSet
-	s.readyValidUntil = time.Now().Add(readyTTL)
+	if s.ready == nil {
+		s.ready = make(map[string]Entry)
+	}
+	s.ready[e.Path] = e
 	s.readyMu.Unlock()
+	return true, nil
 }
 
-// invalidateReady marks the in-memory ready-set as stale. Called by
-// every mutation method (Pin/PinMany/Unpin/UnpinPath/UpdateStatus) so
-// state changes are reflected before the next IsPinnedReady call.
-func (s *Store) invalidateReady() {
+// TouchReady records a completed local revalidation without rotating its
+// generation or revoking a still-valid witness. A superseding pin/repair
+// cannot inherit the refresh timestamp.
+func (s *Store) TouchReady(e Entry) (bool, error) {
+	if e.Generation == "" || len(e.Authority) == 0 {
+		return false, nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	result, err := s.db.Exec(`UPDATE pinned_files SET last_prefetched=? WHERE path=? AND pin_generation=? AND status=? AND authority=?`,
+		time.Now().UnixMilli(), e.Path, e.Generation, int(StatusReady), e.Authority)
+	if err != nil {
+		return false, err
+	}
+	changed, err := result.RowsAffected()
+	return changed == 1, err
+}
+
+// RevokeReady removes one admission immediately after a local mutation.
+func (s *Store) RevokeReady(path string) {
 	s.readyMu.Lock()
-	s.readyValidUntil = time.Time{} // zero time = always expired
+	old, existed := s.ready[path]
+	delete(s.ready, path)
+	revoke := s.readyRevoker
 	s.readyMu.Unlock()
+	if existed && revoke != nil {
+		revoke(path, old.Generation)
+	}
+}
+
+func (s *Store) RevokeReadyIfGeneration(path, generation string) {
+	s.readyMu.Lock()
+	revoked := false
+	if current, ok := s.ready[path]; ok && current.Generation == generation {
+		delete(s.ready, path)
+		revoked = true
+	}
+	revoke := s.readyRevoker
+	s.readyMu.Unlock()
+	if revoked && revoke != nil {
+		revoke(path, generation)
+	}
 }
 
 // PinnedPaths returns the set of all paths in the pin store, regardless of
@@ -373,7 +641,7 @@ func (s *Store) Stale(ttl time.Duration, limit int) ([]Entry, error) {
 	defer s.mu.RUnlock()
 	cutoff := time.Now().Add(-ttl).UnixMilli()
 	rows, err := s.db.Query(`
-		SELECT path, size, status, bytes_cached, last_prefetched, last_error, pinned_at, pin_root
+		SELECT path, size, status, bytes_cached, last_prefetched, last_error, pinned_at, pin_root, pin_generation, authority
 		FROM pinned_files
 		WHERE status = ? AND last_prefetched < ?
 		ORDER BY last_prefetched ASC
@@ -397,7 +665,7 @@ func (s *Store) AllPinnedForRepair(limit int) ([]Entry, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	rows, err := s.db.Query(`
-		SELECT path, size, status, bytes_cached, last_prefetched, last_error, pinned_at, pin_root
+		SELECT path, size, status, bytes_cached, last_prefetched, last_error, pinned_at, pin_root, pin_generation, authority
 		FROM pinned_files
 		WHERE status IN (?, ?, ?)
 		ORDER BY last_prefetched ASC
@@ -414,7 +682,7 @@ func (s *Store) queryStatus(status Status, limit int) ([]Entry, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	rows, err := s.db.Query(`
-		SELECT path, size, status, bytes_cached, last_prefetched, last_error, pinned_at, pin_root
+		SELECT path, size, status, bytes_cached, last_prefetched, last_error, pinned_at, pin_root, pin_generation, authority
 		FROM pinned_files
 		WHERE status = ?
 		ORDER BY pinned_at ASC
@@ -432,7 +700,7 @@ func (s *Store) All() ([]Entry, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	rows, err := s.db.Query(`
-		SELECT path, size, status, bytes_cached, last_prefetched, last_error, pinned_at, pin_root
+		SELECT path, size, status, bytes_cached, last_prefetched, last_error, pinned_at, pin_root, pin_generation, authority
 		FROM pinned_files
 		ORDER BY pin_root, path`)
 	if err != nil {
@@ -444,14 +712,14 @@ func (s *Store) All() ([]Entry, error) {
 
 // Get returns the pin row for exactly this path, or (nil, false) when the path
 // has no pinned_files row. Unlike IsPinnedReady (a boolean offline-gate check),
-// Get exposes the per-file bytes_cached/size/status — the per-path residency
-// truth the control-plane /residency endpoint (contract JM-2) depends on.
+// Get exposes the raw durable scheduler row. Its Ready status and byte counter
+// are not current residency until ReadyAdmission validates this generation.
 // Not a hot path; one indexed lookup on the path primary key.
 func (s *Store) Get(path string) (*Entry, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	rows, err := s.db.Query(`
-		SELECT path, size, status, bytes_cached, last_prefetched, last_error, pinned_at, pin_root
+		SELECT path, size, status, bytes_cached, last_prefetched, last_error, pinned_at, pin_root, pin_generation, authority
 		FROM pinned_files
 		WHERE path = ?
 		LIMIT 1`, path)
@@ -479,42 +747,35 @@ type RootSummary struct {
 }
 
 func (s *Store) PinRoots() ([]RootSummary, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	rows, err := s.db.Query(`
-		SELECT pin_root,
-		    COUNT(*) AS total,
-		    SUM(CASE WHEN status = ? THEN 1 ELSE 0 END) AS ready,
-		    SUM(CASE WHEN status = ? THEN 1 ELSE 0 END) AS pending,
-		    SUM(CASE WHEN status = ? THEN 1 ELSE 0 END) AS failed,
-		    SUM(size) AS total_bytes,
-		    SUM(bytes_cached) AS cached_bytes
-		FROM pinned_files
-		WHERE pin_root != ''
-		GROUP BY pin_root
-		ORDER BY pin_root`,
-		int(StatusReady), int(StatusPending), int(StatusFailed))
+	// All closes SQL rows and releases Store.mu before the per-use validator is
+	// called. Reporting cannot turn a durable witness into RAM admission.
+	entries, err := s.All()
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 	var out []RootSummary
-	for rows.Next() {
-		var r RootSummary
-		var total, ready, pending, failed sql.NullInt64
-		var totalBytes, cachedBytes sql.NullInt64
-		if err := rows.Scan(&r.Root, &total, &ready, &pending, &failed, &totalBytes, &cachedBytes); err != nil {
-			return nil, err
+	for _, e := range entries {
+		if e.PinRoot == "" {
+			continue
 		}
-		r.TotalFiles = int(total.Int64)
-		r.ReadyFiles = int(ready.Int64)
-		r.PendingFiles = int(pending.Int64)
-		r.FailedFiles = int(failed.Int64)
-		r.TotalBytes = totalBytes.Int64
-		r.CachedBytes = cachedBytes.Int64
-		out = append(out, r)
+		if len(out) == 0 || out[len(out)-1].Root != e.PinRoot {
+			out = append(out, RootSummary{Root: e.PinRoot})
+		}
+		r := &out[len(out)-1]
+		r.TotalFiles++
+		r.TotalBytes += e.Size
+		status, cached := s.reportedStatus(e)
+		r.CachedBytes += cached
+		switch status {
+		case StatusReady:
+			r.ReadyFiles++
+		case StatusPending:
+			r.PendingFiles++
+		case StatusFailed:
+			r.FailedFiles++
+		}
 	}
-	return out, rows.Err()
+	return out, nil
 }
 
 // AggregateStats returns whole-database counters.
@@ -528,22 +789,43 @@ type AggregateStats struct {
 }
 
 func (s *Store) AggregateStats() (AggregateStats, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 	var a AggregateStats
-	row := s.db.QueryRow(`
-		SELECT COUNT(*),
-		    COALESCE(SUM(CASE WHEN status = ? THEN 1 ELSE 0 END), 0),
-		    COALESCE(SUM(CASE WHEN status = ? THEN 1 ELSE 0 END), 0),
-		    COALESCE(SUM(CASE WHEN status = ? THEN 1 ELSE 0 END), 0),
-		    COALESCE(SUM(size), 0),
-		    COALESCE(SUM(bytes_cached), 0)
-		FROM pinned_files`,
-		int(StatusReady), int(StatusPending), int(StatusFailed))
-	if err := row.Scan(&a.TotalFiles, &a.ReadyFiles, &a.PendingFiles, &a.FailedFiles, &a.TotalBytes, &a.CachedBytes); err != nil {
+	entries, err := s.All()
+	if err != nil {
 		return a, err
 	}
+	for _, e := range entries {
+		a.TotalFiles++
+		a.TotalBytes += e.Size
+		status, cached := s.reportedStatus(e)
+		a.CachedBytes += cached
+		switch status {
+		case StatusReady:
+			a.ReadyFiles++
+		case StatusPending:
+			a.PendingFiles++
+		case StatusFailed:
+			a.FailedFiles++
+		}
+	}
 	return a, nil
+}
+
+// reportedStatus projects durable scheduler state through this process's
+// exact-generation local admission. It never changes the row or its witness.
+func (s *Store) reportedStatus(e Entry) (Status, int64) {
+	if e.Status == StatusFailed {
+		return StatusFailed, 0
+	}
+	if e.Status != StatusReady {
+		return e.Status, e.BytesCached // Preserve active prefetch progress.
+	}
+	admitted, ok := s.ReadyAdmission(e.Path)
+	if !ok || admitted.Generation != e.Generation || admitted.Size != e.Size ||
+		!bytes.Equal(admitted.Authority, e.Authority) {
+		return StatusPending, 0
+	}
+	return StatusReady, e.BytesCached
 }
 
 func scanEntries(rows *sql.Rows) ([]Entry, error) {
@@ -553,7 +835,7 @@ func scanEntries(rows *sql.Rows) ([]Entry, error) {
 		var statusInt int
 		var lastPre int64
 		var pinnedAt int64
-		if err := rows.Scan(&e.Path, &e.Size, &statusInt, &e.BytesCached, &lastPre, &e.LastError, &pinnedAt, &e.PinRoot); err != nil {
+		if err := rows.Scan(&e.Path, &e.Size, &statusInt, &e.BytesCached, &lastPre, &e.LastError, &pinnedAt, &e.PinRoot, &e.Generation, &e.Authority); err != nil {
 			return nil, err
 		}
 		e.Status = Status(statusInt)

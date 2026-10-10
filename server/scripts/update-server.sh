@@ -7,20 +7,28 @@
 #      (CONTENTS sync: "<repo>/ → <host>:<dest>/" — note the trailing slash on
 #      the SOURCE; without it rsync nests the repo a directory deeper and the
 #      remote docker build context breaks)
-#   2. docker-build the farm image  (server/juicefarm/Dockerfile   → juicefarm:local)
+#   2. docker-build the farm image  (server/juicefarm/Dockerfile   →
+#      juicefarm:rc-<series>-<commit>)
 #      and the manager image        (server/juicemount-manager/Dockerfile
-#                                                    → juicemount-manager:local)
+#                                      → juicemount-manager:rc-<series>-<commit>)
 #      ON the host (native x86_64 — no cross-compile, no registry)
 #   3. recreate ONLY the farm worker + manager containers, re-running each with
 #      the run-args it ALREADY has (introspected live via `docker inspect` —
 #      env/mounts/network/ports/restart/caps/devices are reconstructed, never
 #      hardcoded), pointed at the freshly-built :local images
-#   4. verify: farm worker container is up + manager answers /api/farm with 200
+#   4. verify: farm worker container is up + manager answers /api/farm with 200;
+#      retain the old containers until verification and restore both on failure
+#
+# Supports only standalone containers whose runtime topology passes preflight.
+# Compose-managed services must use a Compose-aware rollout.
 #
 # ############################################################################
-# ##  NEVER TOUCHES redis / minio / juicefs CONTAINERS.                     ##
-# ##  Those hold the volume's metadata, objects, and the gateway mount —    ##
-# ##  restarting ANY of them breaks the live Mac client mid-session.        ##
+# ##  NEVER TOUCHES redis / minio / juicefs / respproxy CONTAINERS.         ##
+# ##  Those hold the volume's metadata, objects, the gateway mount, and    ##
+# ##  (H-8B) the RESP proxy that owns host port 30179 — restarting ANY of  ##
+# ##  them breaks the live Mac client mid-session. The proxy port swap    ##
+# ##  and its rollback are rollout-compose.sh --cutover-proxy /          ##
+# ##  --proxy-rollback, never this script.                               ##
 # ##  A hard guard below refuses to run if a target container name even     ##
 # ##  looks like one of them.                                               ##
 # ############################################################################
@@ -33,7 +41,7 @@
 # complete remote script — and executes NOTHING (no ssh, no rsync, no docker).
 #
 # Usage:
-#   server/scripts/update-server.sh [--repo <path>] [--host root@192.168.0.197]
+#   server/scripts/update-server.sh [--repo <path>] --host <user@server>
 #       [--dest /root/juicefarm-build] [--farm-container juicefarm-worker]
 #       [--manager-container juicemount-manager] [--dry-run]
 #
@@ -42,13 +50,13 @@
 set -euo pipefail
 
 # ---- defaults --------------------------------------------------------------
-HOST="root@192.168.0.197"
+HOST=""
 DEST="/root/juicefarm-build"
 FARM_CONTAINER="juicefarm-worker"
 MANAGER_CONTAINER="juicemount-manager"
 SKIP_MANAGER=0
-FARM_IMAGE="juicefarm:local"
-MANAGER_IMAGE="juicemount-manager:local"
+FARM_IMAGE=""
+MANAGER_IMAGE=""
 DRY_RUN=0
 REPO=""
 
@@ -67,29 +75,74 @@ while [ $# -gt 0 ]; do
     *) echo "update-server: unknown arg: $1" >&2; usage 1 ;;
   esac
 done
+if [ -z "$HOST" ]; then
+  echo "update-server: --host <user@server> is required" >&2
+  exit 2
+fi
 
 # ---- locate + sanity-check the repo root -----------------------------------
 if [ -z "$REPO" ]; then
   # script lives at <repo>/server/scripts/update-server.sh
   REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 fi
-for f in go.mod server/juicefarm/Dockerfile server/juicemount-manager/Dockerfile; do
+for f in go.mod internal/version/version.go server/juicefarm/Dockerfile server/juicemount-manager/Dockerfile; do
   if [ ! -f "$REPO/$f" ]; then
     echo "update-server: $REPO does not look like the JuiceMount repo (missing $f)" >&2
     exit 1
   fi
 done
 
+# A deployment must identify the exact clean commit whose contents are synced.
+# Otherwise an uncommitted worktree can be stamped with HEAD and later appear
+# reproducible even though no corresponding source revision exists.
+if ! git -C "$REPO" rev-parse --verify HEAD >/dev/null 2>&1; then
+  echo "update-server: $REPO has no verifiable git HEAD" >&2
+  exit 1
+fi
+if ! git -C "$REPO" diff --quiet --ignore-submodules -- \
+   || ! git -C "$REPO" diff --cached --quiet --ignore-submodules --; then
+  echo "update-server: refusing to deploy a dirty tracked source tree" >&2
+  exit 1
+fi
+# rsync sends ignored files too. Any untracked file outside an excluded local
+# output directory could change the built image without changing the SHA.
+if ! git -C "$REPO" ls-files --others -z | while IFS= read -r -d '' path; do
+  case "$path" in
+    .git/*|.claude/*|.codex/*|build/*|app/JuiceMount/.build/*) ;;
+    *) printf 'update-server: refusing untracked deployable source: %q\n' "$path" >&2; exit 1 ;;
+  esac
+done; then
+  exit 1
+fi
+SOURCE_COMMIT="$(git -C "$REPO" rev-parse HEAD)"
+if [[ ! "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+  echo "update-server: git HEAD is not a full lowercase commit SHA" >&2
+  exit 1
+fi
+SOURCE_VERSION="$(awk -F'"' '/^var Version = / { print $2; exit }' "$REPO/internal/version/version.go")"
+if [[ ! "$SOURCE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+  echo "update-server: invalid or missing source version" >&2
+  exit 1
+fi
+SOURCE_SERIES="${SOURCE_VERSION%.*}"
+SOURCE_SHORT="${SOURCE_COMMIT:0:7}"
+FARM_IMAGE="juicefarm:rc-${SOURCE_SERIES}-${SOURCE_SHORT}"
+MANAGER_IMAGE="juicemount-manager:rc-${SOURCE_SERIES}-${SOURCE_SHORT}"
+
 # ---- guard: the two target names must never be infra containers ------------
 # (defense in depth: the remote script re-checks on the host too)
 for name in "$FARM_CONTAINER" "$MANAGER_CONTAINER"; do
   case "$name" in
-    *redis*|*minio*|*juicefs*)
-      echo "update-server: REFUSING — target container '$name' matches a protected infra name (redis/minio/juicefs)." >&2
+    *redis*|*minio*|*juicefs*|*respproxy*)
+      echo "update-server: REFUSING — target container '$name' matches a protected infra name (redis/minio/juicefs/respproxy)." >&2
       echo "Restarting those breaks the live Mac client. Pick the farm-worker/manager container names." >&2
       exit 1 ;;
   esac
 done
+if [ "$FARM_CONTAINER" = "$MANAGER_CONTAINER" ]; then
+  echo "update-server: farm and manager container names must differ" >&2
+  exit 1
+fi
 
 # ---- the remote program -----------------------------------------------------
 # Generated locally, executed on the host via `ssh ... bash -s`. Variables are
@@ -97,34 +150,139 @@ done
 # expands locally. All container introspection happens ON THE HOST at runtime.
 build_remote_script() {
   printf 'DEST=%q\n'              "$DEST"
+  printf 'LOCK_TOKEN=%q\n'        "$LOCK_TOKEN"
   printf 'FARM_CONTAINER=%q\n'    "$FARM_CONTAINER"
   printf 'MANAGER_CONTAINER=%q\n' "$MANAGER_CONTAINER"
   printf 'SKIP_MANAGER=%q\n' "$SKIP_MANAGER"
   printf 'FARM_IMAGE=%q\n'        "$FARM_IMAGE"
   printf 'MANAGER_IMAGE=%q\n'     "$MANAGER_IMAGE"
+  printf 'SOURCE_VERSION=%q\n'    "$SOURCE_VERSION"
+  printf 'SOURCE_COMMIT=%q\n'     "$SOURCE_COMMIT"
   cat <<'REMOTE_EOF'
 set -euo pipefail
 
 log() { printf '[update-server:remote] %s\n' "$*"; }
 
 # ############################################################################
-# ## HARD GUARD — NEVER touch redis / minio / juicefs containers.           ##
+# ## HARD GUARD — NEVER touch redis / minio / juicefs / respproxy.          ##
 # ## They carry live volume state; restarting them breaks the Mac client.  ##
 # ############################################################################
 for name in "$FARM_CONTAINER" "$MANAGER_CONTAINER"; do
   case "$name" in
-    *redis*|*minio*|*juicefs*)
+    *redis*|*minio*|*juicefs*|*respproxy*)
       log "REFUSING: '$name' matches a protected infra container name"; exit 1 ;;
   esac
 done
+if [ "$FARM_CONTAINER" = "$MANAGER_CONTAINER" ]; then
+  log "REFUSING: farm and manager names are identical"
+  exit 1
+fi
 
 cd "$DEST"
+if [ ! -f .update-lock/token ] || [ "$(cat .update-lock/token)" != "$LOCK_TOKEN" ]; then
+  log "ERROR: deployment lock is missing or belongs to another updater"
+  exit 1
+fi
+
+# A compose/app recreation can silently discard a credential that exists only
+# in the live container's runtime environment. Refuse the entire update before
+# touching either workload unless the Manager we are about to preserve has a
+# non-placeholder 32+ character key. The value stays in shell memory only: it
+# is never logged, written to a backup helper file, or placed in argv.
+preflight_manager_auth() {
+  [ "$SKIP_MANAGER" = "1" ] && return 0
+  if ! docker inspect "$MANAGER_CONTAINER" >/dev/null 2>&1; then
+    log "ERROR: manager '$MANAGER_CONTAINER' not found — cannot preserve its runtime authentication"
+    exit 1
+  fi
+  local key
+  key="$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$MANAGER_CONTAINER" |
+    sed -n 's/^JM_ADMIN_KEY=//p' | head -1)"
+  case "$key" in
+    CHANGEME*|CHANGE*|REPLACE*|replaceme*)
+      log "ERROR: manager runtime JM_ADMIN_KEY is still a placeholder; refusing recreation"
+      exit 1 ;;
+  esac
+  if [ "${#key}" -lt 32 ]; then
+    log "ERROR: manager runtime JM_ADMIN_KEY is missing or shorter than 32 characters; refusing recreation"
+    exit 1
+  fi
+  unset key
+  log "manager authentication preflight passed"
+}
+
+preflight_manager_auth
+
+# docker run cannot safely recreate Compose ownership or all custom network
+# topology from a plain inspect snapshot. Refuse it before stopping either
+# workload. Compose-managed services need their own Compose-aware rollout.
+preflight_topology() {
+  local name="$1" labels aliases custom old_image runtime_labels image_labels runtime_entrypoint image_entrypoint
+  labels="$(docker inspect -f '{{range $k, $_ := .Config.Labels}}{{println $k}}{{end}}' "$name")"
+  if printf '%s\n' "$labels" | grep -q '^com\.docker\.compose\.'; then
+    log "ERROR: $name is Compose-managed; use a Compose-aware rollout"
+    exit 1
+  fi
+  custom="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{if .IPAMConfig}}{{println "static IP"}}{{end}}{{end}}{{range .HostConfig.Links}}{{println "link"}}{{end}}{{range .HostConfig.Dns}}{{println "DNS"}}{{end}}{{range .HostConfig.DnsOptions}}{{println "DNS option"}}{{end}}{{range .HostConfig.DnsSearch}}{{println "DNS search"}}{{end}}' "$name")"
+  if [ -n "$custom" ]; then
+    log "ERROR: $name has unsupported custom network topology; refusing recreation"
+    exit 1
+  fi
+  aliases="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{range .Aliases}}{{println .}}{{end}}{{end}}' "$name")"
+  if [ -n "$aliases" ]; then
+    log "ERROR: $name has network aliases; refusing recreation without alias preservation"
+    exit 1
+  fi
+  old_image="$(docker inspect -f '{{.Image}}' "$name")"
+  runtime_labels="$(docker inspect "$name" | jq -Sc '.[0].Config.Labels // {}')"
+  image_labels="$(docker image inspect "$old_image" | jq -Sc '.[0].Config.Labels // {}')"
+  if [ "$runtime_labels" != "$image_labels" ]; then
+    log "ERROR: $name has runtime labels that docker run would drop; refusing recreation"
+    exit 1
+  fi
+  runtime_entrypoint="$(docker inspect -f '{{json .Config.Entrypoint}}' "$name")"
+  image_entrypoint="$(docker image inspect -f '{{json .Config.Entrypoint}}' "$old_image")"
+  if [ "$runtime_entrypoint" != "$image_entrypoint" ]; then
+    log "ERROR: $name has an explicit entrypoint override; refusing recreation"
+    exit 1
+  fi
+}
+preflight_topology "$FARM_CONTAINER"
+if [ "$SKIP_MANAGER" != "1" ]; then preflight_topology "$MANAGER_CONTAINER"; fi
+
+# A rollback can only restore an existing, running service. Refuse a partial
+# deployment before building or stopping anything.
+for name in "$FARM_CONTAINER" "$MANAGER_CONTAINER"; do
+  [ "$SKIP_MANAGER" = "1" ] && [ "$name" = "$MANAGER_CONTAINER" ] && continue
+  if [ "$(docker inspect -f '{{.State.Running}}' "$name" 2>/dev/null)" != "true" ]; then
+    log "ERROR: $name is not running; refusing an update without a working rollback target"
+    exit 1
+  fi
+done
 
 # ---- build both images on the host (BuildKit for the cache mounts) --------
 log "building $FARM_IMAGE"
-DOCKER_BUILDKIT=1 docker build -f server/juicefarm/Dockerfile -t "$FARM_IMAGE" .
+DOCKER_BUILDKIT=1 docker build \
+  --build-arg "JM_VERSION=$SOURCE_VERSION" \
+  --build-arg "JM_COMMIT=$SOURCE_COMMIT" \
+  -f server/juicefarm/Dockerfile -t "$FARM_IMAGE" .
 log "building $MANAGER_IMAGE"
-DOCKER_BUILDKIT=1 docker build -f server/juicemount-manager/Dockerfile -t "$MANAGER_IMAGE" .
+DOCKER_BUILDKIT=1 docker build \
+  --build-arg "JM_VERSION=$SOURCE_VERSION" \
+  --build-arg "JM_COMMIT=$SOURCE_COMMIT" \
+  -f server/juicemount-manager/Dockerfile -t "$MANAGER_IMAGE" .
+
+for spec in "$FARM_IMAGE|jmfarm" "$MANAGER_IMAGE|juicemount-manager"; do
+  image="${spec%%|*}"
+  binary="${spec#*|}"
+  actual="$(docker run --rm --entrypoint "/usr/local/bin/$binary" "$image" --build-info)"
+  expected="$binary $SOURCE_VERSION ($SOURCE_COMMIT)"
+  if [ "$actual" != "$expected" ]; then
+    log "ERROR: $image identity mismatch: got '$actual', expected '$expected'"
+    exit 1
+  fi
+done
+log "both images carry exact release identity $SOURCE_VERSION ($SOURCE_COMMIT)"
 
 # ---- helpers: reconstruct `docker run` args from a live container ----------
 
@@ -151,10 +309,54 @@ runtime_cmd() { # $1=container
   fi
 }
 
-# recreate <container> <new-image>: capture config → backup → stop/rm → run.
+# Preserve the old containers themselves until the entire update is verified.
+# Redacted JSON backups remain for incident analysis, but are not a substitute
+# for the runtime environment and topology retained in a stopped container.
+ROLLBACK_ARMED=0
+FARM_TOUCHED=0
+MANAGER_TOUCHED=0
+FARM_BACKUP=""
+MANAGER_BACKUP=""
+
+rollback_target() {
+  local name="$1" backup="$2" failed=0
+  if docker inspect "$backup" >/dev/null 2>&1; then
+    if docker inspect "$name" >/dev/null 2>&1; then
+      docker stop "$name" >/dev/null 2>&1 || failed=1
+      docker rm "$name" >/dev/null 2>&1 || failed=1
+    fi
+    docker rename "$backup" "$name" >/dev/null 2>&1 || failed=1
+  fi
+  if docker inspect "$name" >/dev/null 2>&1; then
+    docker start "$name" >/dev/null 2>&1 || failed=1
+  else
+    failed=1
+  fi
+  if [ "$failed" = "0" ]; then log "restored prior $name"; else log "CRITICAL: automatic restore failed for $name; old container may remain as $backup"; fi
+  return "$failed"
+}
+
+on_exit() {
+  local status="$1" failed=0
+  trap - EXIT
+  if [ "$status" -ne 0 ] && [ "$ROLLBACK_ARMED" = "1" ]; then
+    log "deployment failed; restoring previous workloads"
+    set +e
+    if [ "$MANAGER_TOUCHED" = "1" ]; then rollback_target "$MANAGER_CONTAINER" "$MANAGER_BACKUP" || failed=1; fi
+    if [ "$FARM_TOUCHED" = "1" ]; then rollback_target "$FARM_CONTAINER" "$FARM_BACKUP" || failed=1; fi
+    [ "$failed" = "0" ] || log "CRITICAL: manual recovery is required; retained containers were not deleted"
+  fi
+  exit "$status"
+}
+trap 'on_exit $?' EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# recreate <container> <new-image>: capture config → stop/rename → run.
 recreate() {
   local name="$1" image="$2"
-  case "$name" in *redis*|*minio*|*juicefs*)
+  case "$name" in *redis*|*minio*|*juicefs*|*respproxy*)
     log "REFUSING recreate of protected container '$name'"; exit 1 ;; esac
 
   if ! docker inspect "$name" >/dev/null 2>&1; then
@@ -165,11 +367,21 @@ recreate() {
 
   mkdir -p "$DEST/.update-backups"
   local backup="$DEST/.update-backups/${name}-$(date +%Y%m%d-%H%M%S).json"
-  docker inspect "$name" > "$backup"
-  log "captured $name config → $backup"
+  if ! command -v jq >/dev/null 2>&1; then
+    log "ERROR: jq is required to create a credential-redacted config backup"
+    exit 1
+  fi
+  # Preserve container topology for incident recovery, but retain only
+  # environment variable names. Raw docker-inspect backups persist admin keys,
+  # object-store credentials, and authenticated URLs in plaintext.
+  docker inspect "$name" |
+    jq 'map(.Config.Env = ((.Config.Env // []) | map((split("=")[0]) + "=<redacted>")))' > "$backup"
+  chmod 600 "$backup"
+  log "captured credential-redacted $name config → $backup"
 
   # -------- reconstruct run args (never hardcoded) --------
   local -a args=(-d --name "$name")
+  local -a env_assignments=()
 
   # restart policy
   local rp rc
@@ -185,8 +397,25 @@ recreate() {
   netmode="$(docker inspect -f '{{.HostConfig.NetworkMode}}' "$name")"
   [ -n "$netmode" ] && [ "$netmode" != "default" ] && args+=(--network "$netmode")
 
-  # env (runtime-provided only)
-  while IFS= read -r e; do [ -n "$e" ] && args+=(-e "$e"); done < <(runtime_env "$name")
+  # env (runtime-provided only). Pass only each variable NAME in docker's
+  # argv; export its captured value inside the short-lived launch subshell so
+  # credentials never appear in `ps`, shell history, or deployment logs.
+  local e key
+  while IFS= read -r e; do
+    [ -z "$e" ] && continue
+    key="${e%%=*}"
+    if [[ ! "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+      log "ERROR: refusing malformed runtime environment name while recreating $name"
+      exit 1
+    fi
+    case "$key" in
+      HOME|PATH|SHELL|USER|LOGNAME)
+        log "ERROR: refusing to repurpose host process variable '$key' while recreating $name"
+        exit 1 ;;
+    esac
+    env_assignments+=("$e")
+    args+=(-e "$key")
+  done < <(runtime_env "$name")
 
   # mounts: named volumes + binds, preserving ro
   while IFS='|' read -r mtype msrc mdst mrw; do
@@ -235,17 +464,39 @@ recreate() {
     [ -n "$n" ] && [ "$n" != "$netmode" ] && extra_nets+=("$n")
   done < <(docker inspect -f '{{range $n, $_ := .NetworkSettings.Networks}}{{println $n}}{{end}}' "$name" | sed '/^$/d')
 
-  # -------- stop/rm/run --------
+  # -------- stop/rename/run --------
+  local backup_name="${name}-pre-update-${SOURCE_COMMIT:0:7}-$$"
+  if docker inspect "$backup_name" >/dev/null 2>&1; then
+    log "ERROR: rollback container name $backup_name already exists"
+    exit 1
+  fi
+  if [ "$name" = "$FARM_CONTAINER" ]; then
+    FARM_BACKUP="$backup_name"
+    FARM_TOUCHED=1
+  else
+    MANAGER_BACKUP="$backup_name"
+    MANAGER_TOUCHED=1
+  fi
+  ROLLBACK_ARMED=1
   log "recreating $name → $image"
   docker stop "$name" >/dev/null
-  docker rm "$name" >/dev/null
-  docker run "${args[@]}" "$image" "${cmd[@]}"
-  for n in "${extra_nets[@]}"; do docker network connect "$n" "$name" || true; done
+  docker rename "$name" "$backup_name" >/dev/null
+  (
+    for e in "${env_assignments[@]+"${env_assignments[@]}"}"; do export "$e"; done
+    if [ "${#cmd[@]}" -gt 0 ]; then
+      docker run "${args[@]}" "$image" "${cmd[@]}"
+    else
+      docker run "${args[@]}" "$image"
+    fi
+  )
+  if [ "${#extra_nets[@]}" -gt 0 ]; then
+    for n in "${extra_nets[@]}"; do docker network connect "$n" "$name"; done
+  fi
 }
 
 recreate "$FARM_CONTAINER" "$FARM_IMAGE"
 if [ "$SKIP_MANAGER" = "1" ]; then
-  log "skipping manager recreate (--skip-manager: compose-managed manager — retag its compose image + docker compose up -d instead; introspective recreate DROPS compose-set entrypoint overrides, live-proven 2026-07-13)"
+  log "skipping manager recreate (--skip-manager). Before any separate compose/app recreation, supply the existing JM_ADMIN_KEY through the deployment environment and require 'docker compose config --quiet' to pass; never recreate from persisted YAML with an empty key."
 else
   recreate "$MANAGER_CONTAINER" "$MANAGER_IMAGE"
 fi
@@ -259,20 +510,24 @@ if [ "$(docker inspect -f '{{.State.Running}}' "$FARM_CONTAINER")" != "true" ]; 
   exit 1
 fi
 log "farm worker up"
+farm_identity="$(docker exec "$FARM_CONTAINER" /usr/local/bin/jmfarm --build-info)"
+if [ "$farm_identity" != "jmfarm $SOURCE_VERSION ($SOURCE_COMMIT)" ]; then
+  log "FAIL: running farm identity mismatch: $farm_identity"
+  exit 1
+fi
 
 if [ "$SKIP_MANAGER" = "1" ]; then
   log "manager verify skipped (--skip-manager)"
 else
   log "verifying manager /api/farm returns 200"
-  ADMIN_KEY="$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$MANAGER_CONTAINER" | sed -n 's/^JM_ADMIN_KEY=//p' | head -1)"
-  MGR_PORT="$(docker inspect -f '{{range $port, $binds := .HostConfig.PortBindings}}{{range $binds}}{{.HostPort}}{{println}}{{end}}{{end}}' "$MANAGER_CONTAINER" | sed '/^$/d' | head -1)"
   verify_mgr() {
-    if [ -n "$MGR_PORT" ]; then
-      curl -fsS -o /dev/null -w '%{http_code}' ${ADMIN_KEY:+-H "X-JuiceMount-Admin-Key: $ADMIN_KEY"} "http://127.0.0.1:${MGR_PORT}/api/farm"
-    else
-      # no published port → probe from inside the container (image ships curl)
-      docker exec "$MANAGER_CONTAINER" curl -fsS -o /dev/null -w '%{http_code}' ${ADMIN_KEY:+-H "X-JuiceMount-Admin-Key: $ADMIN_KEY"} "http://127.0.0.1:8080/api/farm"
-    fi
+    # Expand JM_ADMIN_KEY only inside the container and stream curl's header
+    # config over stdin. The credential is absent from host/container argv.
+    docker exec "$MANAGER_CONTAINER" sh -ec '
+      [ "${#JM_ADMIN_KEY}" -ge 32 ] || exit 22
+      printf '\''header = "X-JuiceMount-Admin-Key: %s"\n'\'' "$JM_ADMIN_KEY" |
+        curl --config - -fsS -o /dev/null -w '\''%{http_code}'\'' http://127.0.0.1:8080/api/farm
+    '
   }
   ok=0
   for i in $(seq 1 12); do
@@ -286,16 +541,69 @@ else
     exit 1
   fi
   log "manager /api/farm → 200"
+  manager_identity="$(docker exec "$MANAGER_CONTAINER" /usr/local/bin/juicemount-manager --build-info)"
+  if [ "$manager_identity" != "juicemount-manager $SOURCE_VERSION ($SOURCE_COMMIT)" ]; then
+    log "FAIL: running manager identity mismatch: $manager_identity"
+    exit 1
+  fi
 fi
-log "DONE: farm updated. redis/minio/juicefs untouched."
+# New workloads are accepted only after every identity and health check passes.
+# From this point failures to prune stopped predecessors are non-fatal: the
+# deployed services remain healthy and the retained containers aid recovery.
+ROLLBACK_ARMED=0
+for backup in "$FARM_BACKUP" "$MANAGER_BACKUP"; do
+  [ -n "$backup" ] || continue
+  docker rm "$backup" >/dev/null || log "WARN: retained stopped predecessor $backup (manual cleanup needed)"
+done
+log "DONE: farm updated. redis/minio/juicefs/respproxy untouched."
 REMOTE_EOF
 }
 
 # ---- plan -------------------------------------------------------------------
-RSYNC_CMD=(rsync -a --delete --exclude .git --exclude .claude "$REPO/" "$HOST:$DEST/")
+RSYNC_CMD=(rsync -a --delete \
+  --exclude .git --exclude .claude --exclude .codex \
+  --exclude build --exclude app/JuiceMount/.build \
+  --exclude /.update-backups/ --exclude /.update-lock/ \
+  "$REPO/" "$HOST:$DEST/")
+
+# The lock is remote so separate Macs cannot race. It is acquired before
+# rsync, not merely before the remote build; a hard crash leaves it in place
+# and makes the next attempt fail closed pending manual inspection.
+LOCK_TOKEN="$(date +%s)-$$-$RANDOM-$RANDOM"
+build_lock_script() { # acquire|release
+  printf 'DEST=%q\nLOCK_TOKEN=%q\n' "$DEST" "$LOCK_TOKEN"
+  if [ "$1" = acquire ]; then
+    cat <<'LOCK_ACQUIRE'
+set -euo pipefail
+cd "$DEST"
+if ! mkdir .update-lock 2>/dev/null; then
+  echo "update-server: remote deployment is locked; inspect .update-lock before retrying" >&2
+  exit 1
+fi
+if ! printf '%s\n' "$LOCK_TOKEN" > .update-lock/token; then
+  rmdir .update-lock 2>/dev/null || true
+  exit 1
+fi
+LOCK_ACQUIRE
+  else
+    cat <<'LOCK_RELEASE'
+set -euo pipefail
+cd "$DEST"
+if [ ! -f .update-lock/token ] || [ "$(cat .update-lock/token)" != "$LOCK_TOKEN" ]; then
+  echo "update-server: refusing to release a lock owned by another updater" >&2
+  exit 1
+fi
+rm .update-lock/token
+rmdir .update-lock
+LOCK_RELEASE
+  fi
+}
 
 if [ "$DRY_RUN" = "1" ]; then
   echo "== update-server DRY RUN — nothing will be executed =="
+  echo
+  echo "-- step 0: acquire remote deployment lock (via: ssh $HOST bash -s) --"
+  build_lock_script acquire | sed 's/^/  | /'
   echo
   echo "-- step 1: sync worktree CONTENTS (note the trailing slash on the source) --"
   printf '  %q' "${RSYNC_CMD[@]}"; echo
@@ -303,9 +611,33 @@ if [ "$DRY_RUN" = "1" ]; then
   echo "-- step 2+3+4: remote build/recreate/verify script (via: ssh $HOST bash -s) --"
   build_remote_script | sed 's/^/  | /'
   echo
-  echo "== END DRY RUN — redis/minio/juicefs are never touched =="
+  echo "-- step 5: release remote deployment lock (via: ssh $HOST bash -s) --"
+  build_lock_script release | sed 's/^/  | /'
+  echo
+  echo "== END DRY RUN — redis/minio/juicefs/respproxy are never touched =="
   exit 0
 fi
+
+LOCK_HELD=0
+release_on_exit() {
+  local status="$?"
+  trap - EXIT
+  if [ "$LOCK_HELD" = "1" ]; then
+    if ! build_lock_script release | ssh "$HOST" bash -s; then
+      echo "update-server: CRITICAL: could not release remote lock at $HOST:$DEST/.update-lock; inspect it before retrying" >&2
+      status=1
+    fi
+  fi
+  exit "$status"
+}
+trap release_on_exit EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+echo "[update-server] acquiring remote deployment lock on $HOST"
+build_lock_script acquire | ssh "$HOST" bash -s
+LOCK_HELD=1
 
 echo "[update-server] syncing $REPO/ → $HOST:$DEST/"
 "${RSYNC_CMD[@]}"

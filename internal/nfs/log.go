@@ -4,11 +4,16 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"sync/atomic"
 )
 
-var (
-	Log Logger = &DefaultLogger{}
-)
+// Log is a stable proxy. Servers may install a process-wide bridge while
+// long-lived goroutines (notably keep-awake) are still logging; replacing an
+// interface variable directly races with those readers. SetLogger swaps only
+// the proxy's atomically stored delegate, so every existing Log reference sees
+// the new logger without an unsynchronised interface read/write.
+var globalLog = newAtomicLogger(&DefaultLogger{})
+var Log Logger = globalLog
 
 type LogLevel int
 
@@ -54,12 +59,68 @@ type Logger interface {
 	Printf(format string, args ...interface{})
 }
 
+type loggerValue struct{ Logger }
+
+type atomicLogger struct{ value atomic.Value }
+
+func newAtomicLogger(logger Logger) *atomicLogger {
+	l := &atomicLogger{}
+	l.value.Store(loggerValue{Logger: logger})
+	return l
+}
+
+func (l *atomicLogger) current() Logger {
+	return l.value.Load().(loggerValue).Logger
+}
+
+func (l *atomicLogger) store(logger Logger) {
+	if logger == nil {
+		logger = &DefaultLogger{}
+		logger.SetLevel(InfoLevel)
+	}
+	l.value.Store(loggerValue{Logger: logger})
+}
+
+func (l *atomicLogger) SetLevel(level LogLevel) { l.current().SetLevel(level) }
+func (l *atomicLogger) GetLevel() LogLevel      { return l.current().GetLevel() }
+func (l *atomicLogger) ParseLevel(level string) (LogLevel, error) {
+	return l.current().ParseLevel(level)
+}
+func (l *atomicLogger) Panic(args ...interface{}) { l.current().Panic(args...) }
+func (l *atomicLogger) Fatal(args ...interface{}) { l.current().Fatal(args...) }
+func (l *atomicLogger) Error(args ...interface{}) { l.current().Error(args...) }
+func (l *atomicLogger) Warn(args ...interface{})  { l.current().Warn(args...) }
+func (l *atomicLogger) Info(args ...interface{})  { l.current().Info(args...) }
+func (l *atomicLogger) Debug(args ...interface{}) { l.current().Debug(args...) }
+func (l *atomicLogger) Trace(args ...interface{}) { l.current().Trace(args...) }
+func (l *atomicLogger) Print(args ...interface{}) { l.current().Print(args...) }
+func (l *atomicLogger) Panicf(format string, args ...interface{}) {
+	l.current().Panicf(format, args...)
+}
+func (l *atomicLogger) Fatalf(format string, args ...interface{}) {
+	l.current().Fatalf(format, args...)
+}
+func (l *atomicLogger) Errorf(format string, args ...interface{}) {
+	l.current().Errorf(format, args...)
+}
+func (l *atomicLogger) Warnf(format string, args ...interface{}) { l.current().Warnf(format, args...) }
+func (l *atomicLogger) Infof(format string, args ...interface{}) { l.current().Infof(format, args...) }
+func (l *atomicLogger) Debugf(format string, args ...interface{}) {
+	l.current().Debugf(format, args...)
+}
+func (l *atomicLogger) Tracef(format string, args ...interface{}) {
+	l.current().Tracef(format, args...)
+}
+func (l *atomicLogger) Printf(format string, args ...interface{}) {
+	l.current().Printf(format, args...)
+}
+
 type DefaultLogger struct {
 	Level LogLevel
 }
 
 func SetLogger(logger Logger) {
-	Log = logger
+	globalLog.store(logger)
 }
 
 func init() {

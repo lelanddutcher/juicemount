@@ -2,13 +2,18 @@ package farm
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
+	"syscall"
 	"time"
 
 	"github.com/lelanddutcher/juicemount/internal/derivatives"
+	"github.com/lelanddutcher/juicemount/internal/jmlog"
+	"golang.org/x/sys/unix"
 )
 
 // ManifestSidecar is the self-describing index the farm writes to the volume next
@@ -54,8 +59,17 @@ type ReconcileResult struct {
 // appear in /derivatives immediately, with no app restart. Idempotent (upserts).
 func ReconcileSidecars(store *derivatives.Store, mount string) (ReconcileResult, error) {
 	var res ReconcileResult
-	base := filepath.Join(mount, ".juicemount", "derivatives")
-	entries, err := os.ReadDir(base)
+	// Enumerated through the anchored walk. Every READ below was already
+	// anchored, so a redirected listing could not smuggle content in — but it
+	// could still send the sweep off to enumerate somebody else's directory and
+	// do a pile of pointless work, and it was the last unanchored access left
+	// under the derivative tree.
+	baseDir, err := derivatives.OpenDirUnder(mount, filepath.Join(".juicemount", "derivatives"))
+	if err != nil {
+		return res, err
+	}
+	entries, err := baseDir.ReadDir(-1)
+	baseDir.Close()
 	if err != nil {
 		return res, err
 	}
@@ -67,11 +81,19 @@ func ReconcileSidecars(store *derivatives.Store, mount string) (ReconcileResult,
 		if perr != nil {
 			continue // not an inode-named dir
 		}
-		r := reconcileOneSidecarInto(store, mount, inode)
+		r, fatalErr := reconcileOneSidecarInto(store, mount, inode)
 		res.Sidecars += r.Sidecars
 		res.Assets += r.Assets
 		res.Rows += r.Rows
 		res.Errs += r.Errs
+		if fatalErr != nil {
+			// The mount disappeared after the directory enumeration. Continuing
+			// would issue one doomed FUSE open and one warning per derivative
+			// inode (hundreds of requests and log lines in the live failure).
+			// Stop on the first mount-wide error; the next scheduled reconcile
+			// retries the whole pass after mount recovery.
+			return res, fatalErr
+		}
 	}
 	return res, nil
 }
@@ -84,7 +106,10 @@ func ReconcileSidecars(store *derivatives.Store, mount string) (ReconcileResult,
 // present and ingested; an absent sidecar is (false, nil) — not an error.
 // Idempotent (upserts), safe to call under the WAL the running app reads from.
 func ReconcileOneSidecar(store *derivatives.Store, mount string, inode uint64) (found bool, err error) {
-	r := reconcileOneSidecarInto(store, mount, inode)
+	r, fatalErr := reconcileOneSidecarInto(store, mount, inode)
+	if fatalErr != nil {
+		return false, fatalErr
+	}
 	if r.Sidecars == 0 {
 		return false, nil // no sidecar on the volume for this inode
 	}
@@ -94,15 +119,568 @@ func ReconcileOneSidecar(store *derivatives.Store, mount string, inode uint64) (
 	return true, nil
 }
 
+// blobMediaTypes pins the Content-Type served for each blob kind. It is the
+// SINGLE authority: a media type must never come from a file on the volume,
+// because /blob sets its response Content-Type from the row and the derivative
+// tree is writable by any consumer with mount access.
+var blobMediaTypes = map[string]string{
+	"ai":          "application/json",
+	"proxy":       "video/mp4",
+	"audio_proxy": "audio/mp4",
+	"thumbnail":   "image/jpeg",
+	"filmstrip":   "image/jpeg",
+	"waveform":    "application/json",
+	// T1.1/F4 Quick Look preview proxy (qlpreview.go): short H.264 MP4 a QL
+	// appex hands to AVPlayer without touching the camera-native source.
+	QLPreviewKind: qlPreviewMedia,
+}
+
+// sanitizeSidecarRow re-derives every trust-bearing field of a manifest row read
+// off the volume, and reports whether the row may be ingested at all.
+//
+// SECURITY (2026-08-04 review, CRITICAL). reconcileOneSidecarInto used to hand
+// `sc.Derivatives` straight to PutDeriv with NO validation of kind, producer,
+// media_type or blob_rel_path — and the derivatives table has no CHECK
+// constraints either. Since manifest.json lives on a volume any consumer can
+// write, that was a complete bypass of every guard on POST /derivatives/register:
+// write a manifest declaring media_type "text/html" plus an HTML blob, touch
+// /derivatives?inode=N to trigger the on-miss reconcile, and /blob then served
+// attacker HTML with that Content-Type from the control-plane origin.
+//
+// The file may carry DATA (which kinds exist, their hashes and sizes). It may
+// not carry POLICY (what a kind is called, what type it is served as, where its
+// bytes live).
+// sanitizeSidecarRow constrains one row read out of a manifest.json.
+//
+// There is deliberately NO "trusted" mode. manifest.json lives on the volume,
+// and the volume is writable by every client — including the consumer that
+// contribute-back exists to serve. WHICH BINARY READS THE FILE CONFERS NO TRUST
+// ON IT: `jmfarm reconcile` running on the server reads exactly the same
+// attacker-reachable bytes the Mac app does. Trust here would have been a lie,
+// so the row is always treated as untrusted input and the unforgeable
+// Provenance stamp (set by the caller, never by the file) carries the security.
+//
+// RULE: a file on the volume supplies DATA (which kinds exist, hashes, sizes),
+// never POLICY (what a kind is called, how it is served, where its bytes live).
+func sanitizeSidecarRow(row derivatives.DerivRow) (derivatives.DerivRow, bool) {
+	// Producer is enum-checked but NOT trusted: it is echoed back out of
+	// /metadata, so free-form text here would be attacker-chosen output, while a
+	// forged "linux-farm" must not confer farm authority. Authority now comes
+	// from Provenance (see store.go), so the string may stay as written —
+	// which keeps disaster recovery honest when a GENUINE farm row is rebuilt
+	// from its sidecar after a DB loss.
+	if row.Producer != "linux-farm" && row.Producer != "on-device" && row.Producer != "macos-node" {
+		return row, false
+	}
+
+	// "failed" is a negative result from a producer generation. "absent" is the
+	// tombstone a newer probe writes when it proves that kind is not applicable;
+	// carrying it through the cross-worker union prevents stale failures from
+	// being resurrected. `pending` remains local/transient and is not mirrored.
+	if row.Status != "ready" && row.Status != "failed" && row.Status != "absent" {
+		return row, false
+	}
+	if row.Status == "absent" && row.BlobRelPath != nil {
+		return row, false
+	}
+
+	// KIND-SCOPED FIELDS ARE CLEARED OFF-KIND (round 7).
+	//
+	// `extra`-backed fields are PERSISTED for any kind but only re-HYDRATED for
+	// the kind they belong to (store.decodeExtra), so a row carrying, say,
+	// blob_size on a thumbnail can never round-trip: the reconcile's
+	// unchanged-row skip compares a stored row that lost the field against a
+	// file row that still has it, decides "changed" every single time, and
+	// re-publishes on every sweep with a fresh updated_at — the exact permanent
+	// changes-feed churn that skip exists to prevent. Clearing them here is also
+	// just the sanitizer's own rule applied properly: the file supplies DATA for
+	// the kind it declares, and geometry on a waveform is not data, it is noise.
+	if row.Kind != "filmstrip" {
+		row.Filmstrip = nil
+	}
+	if row.Kind != "proxy" && row.Kind != "audio_proxy" {
+		row.Codec, row.CodecString, row.BlobSize, row.BitrateBPS = nil, nil, nil, nil
+	}
+	// Pixel dimensions are meaningful only where decodeExtra re-hydrates them.
+	// Persisting a field for a kind that never reads it back is precisely the
+	// never-round-trips bug that made the reconcile re-publish a row forever.
+	if row.Kind != "thumbnail" && row.Kind != "proxy" && row.Kind != "audio_proxy" && row.Kind != "filmstrip" {
+		row.Width, row.Height = nil, nil
+	}
+	// Bounds: these come off a consumer-writable file and a reader may allocate
+	// or divide by them.
+	if row.Width != nil && (*row.Width < 1 || *row.Width > 65535) {
+		row.Width = nil
+	}
+	if row.Height != nil && (*row.Height < 1 || *row.Height > 65535) {
+		row.Height = nil
+	}
+	if row.BitrateBPS != nil && (*row.BitrateBPS < 1 || *row.BitrateBPS > int64(10)<<30) {
+		row.BitrateBPS = nil
+	}
+
+	// FIELDS THAT WERE PASSING THROUGH UNTOUCHED (2026-08-04 round 3).
+	//
+	// Policy, because the first cut of this got it wrong by rejecting whole rows:
+	// a field that is DANGEROUS is neutralised, a field that is merely
+	// INFORMATIONAL is clamped or nulled — dropping the row would discard a real
+	// artifact over a cosmetic value, which is its own kind of data loss.
+	//
+	// `hash` is the dangerous one: it is never re-verified against the blob's
+	// actual bytes on any serve path, and the consumer's documented freshness
+	// check is `hash == source_hash` — both supplied by this same file. Nulling a
+	// malformed hash removes the forgery while keeping the artifact usable; the
+	// shape is the provider's real output format (farm/hash.go emits %016x).
+	if row.Hash != nil && !isHashHex(*row.Hash) {
+		row.Hash = nil
+	}
+	// updated_at is NOT informational — it is the cursor of
+	// GET /derivatives/changes?since= and of the farm's published
+	// derivatives-changes.json. A forged MaxInt64 pins every consumer's cursor
+	// past the end of time, so every genuine derivative from then on is
+	// invisible to them, permanently, from one small JSON file with no blob
+	// bytes at all. This is the field the "clamp the informational" sweep
+	// missed. PutDeriv already treats 0 as "stamp now", so 0 is safe to pass.
+	if row.UpdatedAt < 0 || row.UpdatedAt > nowUnix()+updatedAtSkewSlack {
+		// Clamp to NOW, not to SourceMtime.
+		//
+		// Falling back to SourceMtime looked better because it is stable across
+		// sweeps — but stable is exactly the problem: a farm host whose clock is
+		// ahead by more than the slack got its rows stamped with the asset's OLD
+		// mtime, landing BEFORE every consumer's cursor. Those derivatives were
+		// then permanently invisible on the changes feed and could never
+		// self-heal. One fast clock was enough; no attacker required.
+		//
+		// `now` is always after a consumer's cursor, so the row is seen. The
+		// churn this was originally dodging is not solved by picking a different
+		// timestamp — it is solved where it belongs, by not REWRITING a row whose
+		// content has not changed (rowContentEqual, at the ingest loop). Choosing
+		// a timestamp to avoid churn was treating the symptom.
+		row.UpdatedAt = nowUnix()
+	}
+	if row.Version < 1 {
+		row.Version = 1
+	} else if row.Version > maxSidecarVersion {
+		row.Version = maxSidecarVersion
+	}
+	if row.Model != nil && len(*row.Model) > maxModelLen {
+		row.Model = nil
+	}
+	if row.Dim != nil && (*row.Dim < 1 || *row.Dim > 1<<16) {
+		row.Dim = nil
+	}
+	if row.CodecString != nil && len(*row.CodecString) > maxCodecStringLen {
+		row.CodecString = nil
+	}
+	if row.BlobSize != nil && (*row.BlobSize < 0 || *row.BlobSize > 1<<42) {
+		row.BlobSize = nil
+	}
+	// Codec is the exception that DOES reject: absent codec is defined to mean
+	// h264, so nulling an unrecognised value would silently relabel an
+	// undecodable proxy as the guaranteed-decodable floor — the round-1 MEDIUM,
+	// reintroduced through this path. There is no safe default, so refuse.
+	if row.Codec != nil && !knownCodecs[*row.Codec] {
+		return row, false
+	}
+
+	mt, isBlobKind := blobMediaTypes[row.Kind]
+	if !isBlobKind {
+		// Non-blob kinds (tech/embedding/transcript/ocr/faces) are /metadata
+		// rows: they serve no bytes, so they carry no Content-Type risk — but
+		// they must not smuggle a blob path either.
+		if !nonBlobKinds[row.Kind] {
+			return row, false // unknown kind entirely
+		}
+		row.BlobRelPath, row.MediaType = nil, nil
+		return row, true
+	}
+
+	// The media type is OURS, always — /blob pins its response Content-Type from
+	// this field, so a sidecar-supplied one is a sidecar-supplied Content-Type
+	// served from the control-plane origin.
+	row.MediaType = &mt
+
+	// The blob path must be the reserved flat filename for the kind: never a
+	// path, never another kind's artifact, never an arbitrary name. A `failed`
+	// row legitimately has no blob at all.
+	if row.BlobRelPath != nil {
+		want, ok := reservedBlobName(row.Kind)
+		if !ok {
+			return row, false
+		}
+		if *row.BlobRelPath != want {
+			// `ai` has two accepted spellings across the logger/loupe cutover.
+			if !(row.Kind == "ai" && *row.BlobRelPath == derivatives.AIBlobNameLegacy) {
+				return row, false
+			}
+		}
+	}
+
+	// FRESHNESS IS PASSED THROUGH, NOT DROPPED.
+	//
+	// An earlier version nulled these on the theory that a forged pair pins a
+	// stale derivative "fresh" forever, and that dropping them would self-heal
+	// via re-verification. **That was wrong and it disabled a data-integrity
+	// gate.** Nothing on the Mac ever re-stamps a reconciled row (the only
+	// writers are the server-side farm and the register route), and reconcile
+	// runs only when the inode is not already known — so the nil was permanent,
+	// and bridge/thumbs.go treats a nil vouch as "unvouched, therefore serve".
+	// The result was the C5 stale-derivative gate disabled for every farm-derived
+	// asset: a recycled or overwritten inode served the OLD poster or proxy
+	// indefinitely. That is precisely the bug C5 exists to prevent.
+	//
+	// Pass-through is still the right call, but NOT because it is free: it trades
+	// one failure mode for a lesser one, and the earlier comment here claiming it
+	// was "no worse against a forger" was wrong in the DENY direction.
+	//
+	//   nulled      → the row reads as unvouched, and unvouched means SERVE. A
+	//                 wrong or stale derivative is handed out forever, silently.
+	//   passed thru → a forged size/mtime makes a GENUINE derivative look stale,
+	//                 and rejectStaleDeriv does not merely 404 — it evicts the
+	//                 cached blob. One attacker-written JSON file, zero blob
+	//                 bytes, denies a real thumbnail and forces the full-source
+	//                 read the thumbnail plane exists to avoid.
+	//
+	// Serving wrong bytes silently is worse than denying right ones loudly, so
+	// pass-through wins — but the deny lever is real and should be closed by
+	// authenticating the sidecar, not by re-nulling the vouch.
+	// Geometry is free-form in the file, and readers divide by it: cols==0 is a
+	// divide-by-zero in any `i % cols`, and absurd counts over-allocate in a
+	// scrubber. The schema's minimums are enforced nowhere in Go. VALIDATE
+	// rather than drop — a filmstrip row without geometry is unusable, so
+	// dropping it would break the farm's own DR for that kind.
+	if row.Filmstrip != nil {
+		g := row.Filmstrip
+		if g.Cols < 1 || g.Rows < 1 || g.FrameCount < 1 || g.CellW < 1 || g.CellH < 1 ||
+			g.IntervalMS < 0 || g.DurationMS < 0 ||
+			g.Cols > maxStripDim || g.Rows > maxStripDim ||
+			g.CellW > maxStripCell || g.CellH > maxStripCell ||
+			g.FrameCount > g.Cols*g.Rows {
+			return row, false
+		}
+	}
+	return row, true
+}
+
+// rowContentEqual compares everything that MEANS something to a reader, and
+// deliberately ignores UpdatedAt (it is the thing being decided) and Provenance
+// (set by us, identical for any two sidecar-sourced rows).
+func rowContentEqual(a, b derivatives.DerivRow) bool {
+	eqs := func(x, y *string) bool {
+		if x == nil || y == nil {
+			return x == y
+		}
+		return *x == *y
+	}
+	eqi := func(x, y *int64) bool {
+		if x == nil || y == nil {
+			return x == y
+		}
+		return *x == *y
+	}
+	eqn := func(x, y *int) bool {
+		if x == nil || y == nil {
+			return x == y
+		}
+		return *x == *y
+	}
+	if a.Kind != b.Kind || a.Status != b.Status || a.Producer != b.Producer || a.Version != b.Version {
+		return false
+	}
+	if !eqs(a.Hash, b.Hash) || !eqs(a.BlobRelPath, b.BlobRelPath) || !eqs(a.MediaType, b.MediaType) ||
+		!eqs(a.Model, b.Model) || !eqs(a.Codec, b.Codec) || !eqs(a.CodecString, b.CodecString) {
+		return false
+	}
+	if !eqi(a.SourceSize, b.SourceSize) || !eqi(a.SourceMtime, b.SourceMtime) || !eqi(a.BlobSize, b.BlobSize) {
+		return false
+	}
+	if !eqi(a.BitrateBPS, b.BitrateBPS) {
+		return false
+	}
+	if !eqn(a.Dim, b.Dim) || !eqn(a.Width, b.Width) || !eqn(a.Height, b.Height) {
+		return false
+	}
+	if (a.Filmstrip == nil) != (b.Filmstrip == nil) {
+		return false
+	}
+	if a.Filmstrip != nil && *a.Filmstrip != *b.Filmstrip {
+		return false
+	}
+	return true
+}
+
+// isHashHex reports whether s looks like a provider-emitted xxh3-64 digest.
+func isHashHex(s string) bool {
+	if len(s) != 16 {
+		return false
+	}
+	for _, c := range s {
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// sanitizeTechSidecar applies to the `tech` block the same rule the rows get:
+// the file supplies DATA, never POLICY or identity.
+func sanitizeTechSidecar(t *TechSidecar) (*TechSidecar, bool) {
+	if t.Producer != "linux-farm" && t.Producer != "on-device" && t.Producer != "macos-node" {
+		return nil, false
+	}
+	// Clamped, NOT rejected — matching DerivRow's policy. These were opposite
+	// for no stated reason, and rejecting here silently discards the whole tech
+	// block (and with it /metadata?kind=tech) over a cosmetic integer.
+	if t.Version < 1 {
+		t.Version = 1
+	} else if t.Version > maxSidecarVersion {
+		t.Version = maxSidecarVersion
+	}
+	if t.Hash != nil && !isHashHex(*t.Hash) {
+		return nil, false
+	}
+	if len(t.Payload) > maxTechPayloadBytes {
+		return nil, false
+	}
+	// The payload is stored and handed back out of /metadata, so it must at
+	// least be a well-formed JSON OBJECT — not a bare string, not a scalar, and
+	// not the truncated fragment an interrupted writer leaves behind.
+	var probe map[string]any
+	if err := json.Unmarshal(t.Payload, &probe); err != nil {
+		return nil, false
+	}
+	// VALIDATE THE VALUE THIS BLOCK IS CITED FOR, not just its envelope.
+	// The reason the tech block matters is that readers fall back to
+	// tech.size_bytes for freshness when a row carries no source_size — so
+	// checking producer/version/hash/shape and then storing the payload verbatim
+	// leaves precisely the field that does the damage unchecked. A negative or
+	// absurd size makes a stale derivative compare "fresh" against any source.
+	if v, present := probe["size_bytes"]; present {
+		n, isNum := v.(float64)
+		if !isNum || n < 0 || n > maxPlausibleSourceBytes {
+			delete(probe, "size_bytes")
+			cleaned, err := json.Marshal(probe)
+			if err != nil {
+				return nil, false
+			}
+			t.Payload = cleaned
+		}
+	}
+	if v, present := probe["duration_ms"]; present {
+		// BOTH bounds. The first cut checked only n < 0 while size_bytes got a
+		// range — so 1e300 sailed through the field readers use for scrubber
+		// geometry. maxPlausibleDurationMS is ~1000 years.
+		if n, isNum := v.(float64); !isNum || n < 0 || n > maxPlausibleDurationMS {
+			delete(probe, "duration_ms")
+			cleaned, err := json.Marshal(probe)
+			if err != nil {
+				return nil, false
+			}
+			t.Payload = cleaned
+		}
+	}
+	return t, true
+}
+
+// knownCodecs mirrors derivatives.schema.json's codec enum. It is asserted
+// against the vendored contract by TestSidecarCodecsMatchContract — the first
+// cut of this list omitted "opus" and would have DROPPED a legitimate farm row,
+// which is the third time a hand-copied vocabulary here has been narrower than
+// what the code on the other side actually emits.
+var knownCodecs = map[string]bool{
+	"h264": true, "hevc": true, "av1": true, "aac": true, "opus": true,
+}
+
+// sidecarReadGate serializes the small open/read/close sequence for manifests.
+//
+// Live macOS 26 + macFUSE 5.3.3 + the bundled JuiceFS 1.3.1 reproduced a
+// transport failure under speculative manifest fan-out: two readers walking
+// 128 manifests produced intermittent ENOSYS/EIO responses and an opcode-60
+// storm, while the same files read cleanly one at a time. This lock is scoped
+// only to tiny manifest JSON (never source or derivative blobs), so it removes
+// the daemon-hostile metadata burst without serializing media throughput. A
+// channel rather than a mutex makes admission timeout-capable: a kernel open
+// stuck behind a dead FUSE daemon must not wedge every /derivatives request.
+var sidecarReadGate = make(chan struct{}, 1)
+
+const sidecarReadAttempts = 3
+const sidecarReadTimeout = 2 * time.Second
+
+var errSidecarReadTimeout = errors.New("sidecar read timed out")
+
+type openRegularFunc func(root, rel string) (*os.File, error)
+
+// readSidecarBounded reads one manifest.json through the anchored, symlink-
+// checking open and refuses anything larger than a manifest could plausibly be.
+// The cap is enforced while READING, not after, so a file that lies about its
+// size (or reports none) still cannot outrun it. Transient macFUSE response
+// failures get a tiny bounded retry; a later successful read is authoritative.
+func readSidecarBounded(mount, rel string) ([]byte, error) {
+	return readSidecarBoundedWithin(mount, rel, sidecarReadTimeout, sidecarReadGate, derivatives.OpenRegularUnder)
+}
+
+type sidecarReadResult struct {
+	raw []byte
+	err error
+}
+
+// readSidecarBoundedWithin bounds BOTH admission and the FUSE operation. A
+// macOS syscall cannot be canceled once the kernel has entered a wedged FUSE
+// session, so the worker may remain until the mount recovers; the one-slot gate
+// caps that leak at one and makes every caller fail fast instead of joining an
+// unbounded queue behind it.
+func readSidecarBoundedWithin(mount, rel string, timeout time.Duration, gate chan struct{}, openRegular openRegularFunc) ([]byte, error) {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	select {
+	case gate <- struct{}{}:
+	case <-timer.C:
+		return nil, fmt.Errorf("%w waiting to read %q", errSidecarReadTimeout, rel)
+	}
+
+	result := make(chan sidecarReadResult, 1)
+	go func() {
+		raw, err := readSidecarBoundedWith(mount, rel, openRegular)
+		<-gate
+		result <- sidecarReadResult{raw: raw, err: err}
+	}()
+
+	select {
+	case got := <-result:
+		return got.raw, got.err
+	case <-timer.C:
+		return nil, fmt.Errorf("%w reading %q", errSidecarReadTimeout, rel)
+	}
+}
+
+func readSidecarBoundedWith(mount, rel string, openRegular openRegularFunc) ([]byte, error) {
+	var lastErr error
+	for attempt := 0; attempt < sidecarReadAttempts; attempt++ {
+		f, err := openRegular(mount, rel)
+		if err == nil {
+			raw, readErr := io.ReadAll(io.LimitReader(f, maxSidecarBytes+1))
+			_ = f.Close()
+			if readErr == nil {
+				if int64(len(raw)) > maxSidecarBytes {
+					return nil, fmt.Errorf("sidecar %q exceeds %d bytes", rel, maxSidecarBytes)
+				}
+				return raw, nil
+			}
+			err = readErr
+		}
+		lastErr = err
+		if !sidecarTransportRetryable(err) || attempt == sidecarReadAttempts-1 {
+			return nil, err
+		}
+		// A few milliseconds is enough for macFUSE's response queue to drain;
+		// increase gently across the bounded attempts without adding a human-
+		// visible delay to the on-demand Quick Look path.
+		time.Sleep(time.Duration(attempt+1) * 15 * time.Millisecond)
+	}
+	return nil, lastErr
+}
+
+func sidecarTransportRetryable(err error) bool {
+	return errors.Is(err, syscall.ENOSYS) || errors.Is(err, syscall.EIO)
+}
+
+// maxSidecarBytes: a manifest lists a handful of rows plus one ffprobe payload.
+// 8 MiB is orders of magnitude more than any real one and still bounded.
+const maxSidecarBytes = int64(8) << 20
+
+// nowUnix is a var so the clamp is testable without waiting on the wall clock.
+var nowUnix = func() int64 { return time.Now().Unix() }
+
+// updatedAtSkewSlack tolerates ordinary clock skew between the farm host and
+// this Mac without letting a forged far-future stamp through.
+// 5 minutes. 24 h was chosen for "ordinary clock skew" and left a rolling,
+// indefinitely renewable blind spot: now+86400 passed verbatim, so one JSON file
+// with no blob bytes still hid a consumer's changes feed for a full day, and
+// every newly-created inode gets a fresh reconcile to renew it. NTP-synced hosts
+// are within seconds; five minutes is generous for the real condition and
+// useless as an attack window.
+const updatedAtSkewSlack = int64(5 * 60)
+
+// maxPlausibleSourceBytes: 1 PiB. Larger is not a media file, it is a forgery.
+const maxPlausibleSourceBytes = float64(int64(1) << 50)
+
+// maxPlausibleDurationMS: ~1000 years. Longer is not a clip.
+const maxPlausibleDurationMS = float64(1000 * 365 * 24 * 60 * 60 * 1000)
+
+const (
+	maxSidecarVersion   = 1 << 16
+	maxTechPayloadBytes = 4 << 20
+	maxModelLen         = 128
+	maxCodecStringLen   = 256
+)
+
+// Bounds for sidecar-declared filmstrip geometry. Generous enough that no real
+// strip the farm produces trips them, tight enough that a reader allocating
+// cols*rows cells cannot be walked into an absurd allocation.
+const (
+	maxStripDim  = 4096
+	maxStripCell = 8192
+)
+
+// nonBlobKinds are manifest kinds that carry no bytes — they are fetched via
+// /metadata, never /blob, so they need no media type or reserved filename.
+var nonBlobKinds = map[string]bool{
+	"tech": true, "embedding": true, "transcript": true, "ocr": true, "faces": true,
+}
+
+// reservedBlobName is the on-disk filename for a blob kind (spec/WRITE_PLACEMENT
+// §2). ai is special: it has two accepted spellings across the logger/loupe
+// cutover, so the caller compares against whichever is present.
+func reservedBlobName(kind string) (string, bool) {
+	switch kind {
+	case "proxy":
+		return "proxy.mp4", true
+	case "audio_proxy":
+		return "audio_proxy.mp4", true
+	case "thumbnail":
+		return "poster.jpg", true
+	case "filmstrip":
+		return "strip.jpg", true
+	case "waveform":
+		return "waveform.json", true
+	case QLPreviewKind:
+		return qlPreviewBlobName, true
+	case "ai":
+		return derivatives.AIBlobName, true
+	}
+	return "", false
+}
+
 // reconcileOneSidecarInto reads + ingests <mount>/.juicemount/derivatives/<inode>/
 // manifest.json into the store, returning per-call counts. The shared core of
 // both the full walk (ReconcileSidecars) and the on-miss path (ReconcileOneSidecar).
-func reconcileOneSidecarInto(store *derivatives.Store, mount string, inode uint64) ReconcileResult {
+func reconcileOneSidecarInto(store *derivatives.Store, mount string, inode uint64) (ReconcileResult, error) {
 	var res ReconcileResult
-	scPath := filepath.Join(DerivBlobDir(mount, inode), "manifest.json")
-	raw, err := os.ReadFile(scPath)
+	// THE FILE EVERY SANITIZER BELOW RUNS ON, read with the same guard as any
+	// other derivative — it was the one thing still opened by bare name.
+	// os.ReadFile followed both the final component and every ancestor, and had
+	// no size cap at all: a symlink to a huge file (or to /dev/zero, which has
+	// no size to check) allocated until the process died, amplified 5x by the
+	// retry loop below. The attacker picked the number.
+	scRel := derivatives.DerivBlobRel(inode, "manifest.json")
+	raw, err := readSidecarBounded(mount, scRel)
 	if err != nil {
-		return res // no sidecar for this inode (blob-only dir / absent)
+		if sidecarMountUnavailable(err) {
+			return res, fmt.Errorf("sidecar reconcile: mount unavailable: %w", err)
+		}
+		// ABSENT is normal and silent — most inode dirs are blob-only, and the
+		// full walk hits this constantly. REFUSED is not: a manifest rejected for
+		// being a symlink, a non-regular file, or over the size cap means an
+		// asset's derivatives are invisible, and reporting that identically to
+		// "there is no sidecar here" is exactly the silent truncation that makes
+		// a cap read as "covered everything".
+		if !errors.Is(err, os.ErrNotExist) {
+			jmlog.Warn("sidecar reconcile: manifest refused — this asset's derivatives are NOT indexed",
+				"inode", inode, "rel", scRel, "error", err)
+			res.Errs++
+		}
+		return res, nil
 	}
 	res.Sidecars++
 	// A sidecar freshly (re)written server-side can read back torn/partial on
@@ -116,31 +694,117 @@ func reconcileOneSidecarInto(store *derivatives.Store, mount string, inode uint6
 			break
 		}
 		time.Sleep(150 * time.Millisecond)
-		if r, e := os.ReadFile(scPath); e == nil {
+		if r, e := readSidecarBounded(mount, scRel); e == nil {
 			raw = r
 		}
 	}
 	if !parsed {
 		res.Errs++
-		return res
+		return res, nil
+	}
+	// CONFUSED-DEPUTY GUARD (2026-08-04). The DIRECTORY is the authority for
+	// which asset we are reconciling — we found this file at
+	// derivatives/<inode>/manifest.json. The body's `inode` is untrusted input
+	// and must never redirect the write: a manifest sitting in dir 123 that
+	// declares "inode": 456 would otherwise rewrite 456's rows, from a file any
+	// client with mount write access can author. That access is not
+	// hypothetical — it is the premise of Tier 1 contribute-back, and this path
+	// runs on any /derivatives or /blob miss.
+	//
+	// A mismatch means the directory was copied/moved or the file was tampered
+	// with; both make the row set wrong, so refuse rather than guess which half
+	// to believe.
+	if sc.Inode != inode {
+		jmlog.Warn("sidecar reconcile: manifest inode disagrees with its directory — refusing",
+			"dir_inode", inode, "manifest_inode", sc.Inode, "rel", scRel)
+		res.Errs++
+		return res, nil
+	}
+	// source_hash is the value a consumer's documented `hash == source_hash`
+	// freshness check compares against, and it is never re-derived from bytes on
+	// any serve path — so an arbitrary string here is a freshness forgery. Pin
+	// it to the shape the provider actually emits (xxh3-64 hex) or drop it.
+	if sc.SourceHash != nil && !isHashHex(*sc.SourceHash) {
+		sc.SourceHash = nil
 	}
 	if err := store.PutSource(sc.Inode, sc.SourceHash); err != nil {
 		res.Errs++
-		return res
+		return res, nil
 	}
 	// Repopulate /metadata?kind=tech (D1 consume + AI size-guard fallback).
 	if sc.Tech != nil && len(sc.Tech.Payload) > 0 {
-		_ = store.PutMetadata(sc.Inode, "tech", sc.Tech.Producer, sc.Tech.Version, sc.Tech.Hash, sc.Tech.Payload)
+		// The `tech` block comes out of the SAME attacker-writable file as the
+		// rows above and was going straight to PutMetadata with no checks at all
+		// — while sanitizeSidecarRow's own rationale says producer must be
+		// enum-checked because it is echoed back out of /metadata. That check
+		// existed only for DerivRow. It matters more here, not less: thumbs.go
+		// documents consumers falling back to tech.size_bytes for freshness when
+		// a row's source_size is absent, so an unchecked payload can become the
+		// freshness signal itself.
+		if tech, ok := sanitizeTechSidecar(sc.Tech); ok {
+			_ = store.PutMetadata(sc.Inode, "tech", tech.Producer, tech.Version, tech.Hash, tech.Payload)
+		} else {
+			jmlog.Warn("sidecar reconcile: dropping tech block that violates the contract",
+				"inode", sc.Inode, "producer", sc.Tech.Producer)
+			res.Errs++
+		}
+	}
+	// One read of what is already indexed, so an unchanged manifest re-ingests
+	// as a no-op instead of re-emitting every row on the changes feed.
+	existing := map[string]derivatives.DerivRow{}
+	if prior, perr := store.Manifest(sc.Inode); perr == nil {
+		for _, pr := range prior {
+			existing[pr.Kind] = pr
+		}
 	}
 	for _, row := range sc.Derivatives {
-		if err := store.PutDeriv(sc.Inode, row); err != nil {
+		// A manifest on the volume supplies DATA, never POLICY — re-derive the
+		// trust-bearing fields and drop anything that does not fit the contract.
+		clean, ok := sanitizeSidecarRow(row)
+		// The stamp is applied HERE, by the ingesting code path — it is not read
+		// from the file and cannot be set by anything on the volume. This is what
+		// makes the precedence guard in cbridge.go unforgeable.
+		clean.Provenance = derivatives.ProvenanceSidecar
+		if !ok {
+			jmlog.Warn("sidecar reconcile: dropping row that violates the blob contract",
+				"inode", sc.Inode, "kind", row.Kind, "status", row.Status,
+				"blob_rel_path", derefStr(row.BlobRelPath))
 			res.Errs++
-			return res
+			continue
+		}
+		// Skip a row that is materially identical to the one already indexed.
+		// Every upsert bumps updated_at, and updated_at is the changes-feed
+		// cursor — so re-ingesting an UNCHANGED manifest on every sweep made the
+		// same derivatives re-emit forever. This is the honest place to fix that:
+		// nothing changed, so nothing should be published as changed.
+		if prior, ok := existing[clean.Kind]; ok && rowContentEqual(prior, clean) {
+			continue
+		}
+		if err := store.PutDeriv(sc.Inode, clean); err != nil {
+			res.Errs++
+			return res, nil
 		}
 		res.Rows++
 	}
 	res.Assets++
-	return res
+	return res, nil
+}
+
+// sidecarMountUnavailable identifies errors that apply to the entire mounted
+// filesystem, rather than one malformed/missing manifest. macFUSE reports a
+// torn-down daemon session as ENXIO ("device not configured"); remote mounts
+// can also surface ESTALE or ENOTCONN. These must abort a full reconcile pass
+// immediately instead of multiplying one outage by every inode in the tree.
+func sidecarMountUnavailable(err error) bool {
+	return errors.Is(err, syscall.ENXIO) ||
+		errors.Is(err, syscall.ESTALE) ||
+		errors.Is(err, syscall.ENOTCONN) ||
+		// These are intermittent under macFUSE load, so readSidecarBounded first
+		// retries them. If all attempts still fail, continuing a full walk only
+		// multiplies a transport failure by every inode in the derivative tree.
+		errors.Is(err, syscall.ENOSYS) ||
+		errors.Is(err, syscall.EIO) ||
+		errors.Is(err, errSidecarReadTimeout)
 }
 
 // WriteManifestSidecar serializes the asset's current manifest (source hash + all
@@ -150,6 +814,14 @@ func reconcileOneSidecarInto(store *derivatives.Store, mount string, inode uint6
 // sidecar error (the row is already in the local/server db; the sidecar is the
 // cross-host mirror, recoverable on the next pass).
 func WriteManifestSidecar(store *derivatives.Store, mount string, inode uint64) error {
+	return writeManifestSidecarWithPostMerge(store, mount, inode, nil)
+}
+
+// postMerge runs under the existing per-inode manifest lock. Proxy publication
+// uses it to correct only byte-derived codec fields after the ordinary union
+// has chosen a row; other writers retain the ordinary merge policy.
+func writeManifestSidecarWithPostMerge(store *derivatives.Store, mount string, inode uint64,
+	postMerge func(*ManifestSidecar, *os.File) error) error {
 	known, srcHash := store.Known(inode)
 	if !known {
 		return nil
@@ -171,13 +843,206 @@ func WriteManifestSidecar(store *derivatives.Store, mount string, inode uint64) 
 	if tm, err := store.Metadata(inode, "tech"); err == nil && tm != nil {
 		sc.Tech = &TechSidecar{Producer: tm.Producer, Version: tm.Version, Hash: tm.Hash, Payload: tm.Payload}
 	}
+	// Written THROUGH the directory descriptor. This runs from all three farm
+	// entry points, and os.MkdirAll + a path-addressed atomic write followed a
+	// symlinked <inode> component straight out of the volume — clobbering
+	// whatever sat at the target, as root.
+	dir, err := derivDirFor(mount, inode)
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+
+	// The manifest is a cross-worker UNION, not the private contents of whichever
+	// SQLite cache happened to write last. Proxy, transcript, and metadata passes
+	// may run on different hosts, each with its own /state database. The previous
+	// last-writer-wins write let a NAS transcript pass erase a GPU's HEVC row from
+	// the shared sidecar. A later CPU recovery could then see the HEVC bytes but no
+	// authoritative current row and overwrite them with H.264.
+	//
+	// Serialize cooperative writers with a per-inode flock, re-read the sidecar
+	// while holding it, sanitize that untrusted volume data, and merge rows by
+	// kind. The fixed lock file is opened relative to the already validated inode
+	// directory with O_NOFOLLOW, so neither the lock nor the manifest write can be
+	// redirected through a planted symlink.
+	lock, err := lockManifestDir(dir)
+	if err != nil {
+		return err
+	}
+	defer unlockManifestDir(lock)
+	if raw, rerr := readManifestAt(dir); rerr == nil {
+		var prior ManifestSidecar
+		if json.Unmarshal(raw, &prior) == nil {
+			sc = mergeManifestSidecar(sc, prior, dir)
+		}
+	} else if !errors.Is(rerr, os.ErrNotExist) {
+		return rerr
+	}
+	if postMerge != nil {
+		if err := postMerge(&sc, dir); err != nil {
+			return err
+		}
+	}
+
 	b, err := json.MarshalIndent(sc, "", "  ")
 	if err != nil {
 		return err
 	}
-	path := filepath.Join(DerivBlobDir(mount, inode), "manifest.json")
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
+	return derivatives.WriteFileAt(dir, "manifest.json", b, 0o644)
+}
+
+const manifestLockName = ".manifest.lock"
+
+// lockManifestDir obtains a bounded cross-process/cross-host advisory lock for
+// one inode's manifest. A wedged or malicious holder must not stall a worker
+// indefinitely, so acquisition fails after the same small human-invisible
+// window used by bounded sidecar reads.
+func lockManifestDir(dir *os.File) (*os.File, error) {
+	dfd := int(dir.Fd())
+	fd, err := unix.Openat(dfd, manifestLockName,
+		unix.O_RDWR|unix.O_CREAT|unix.O_NOFOLLOW|unix.O_CLOEXEC|unix.O_NONBLOCK, 0o666)
+	if err != nil {
+		return nil, fmt.Errorf("sidecar lock: open: %w", err)
 	}
-	return atomicWriteFile(path, b, 0o644)
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil {
+		unix.Close(fd)
+		return nil, fmt.Errorf("sidecar lock: stat: %w", err)
+	}
+	if st.Mode&unix.S_IFMT != unix.S_IFREG {
+		unix.Close(fd)
+		return nil, fmt.Errorf("sidecar lock: %q is not a regular file", manifestLockName)
+	}
+	// Match the directory's read/write permission bits so a root farm worker and
+	// a logged-in Mac client can both participate in the lock on shared media.
+	// Ownership inheritance is best-effort for the same reason as derivative-dir
+	// creation: an unprivileged client may not be allowed to chown.
+	var dst unix.Stat_t
+	if unix.Fstat(dfd, &dst) == nil {
+		_ = unix.Fchmod(fd, uint32(dst.Mode&0o666))
+		_ = unix.Fchown(fd, int(dst.Uid), int(dst.Gid))
+	}
+
+	deadline := time.Now().Add(sidecarReadTimeout)
+	for {
+		if err := unix.Flock(fd, unix.LOCK_EX|unix.LOCK_NB); err == nil {
+			return os.NewFile(uintptr(fd), manifestLockName), nil
+		} else if err != unix.EWOULDBLOCK && err != unix.EAGAIN {
+			unix.Close(fd)
+			return nil, fmt.Errorf("sidecar lock: acquire: %w", err)
+		}
+		if time.Now().After(deadline) {
+			unix.Close(fd)
+			return nil, fmt.Errorf("sidecar lock: timed out acquiring %q", manifestLockName)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func unlockManifestDir(lock *os.File) {
+	if lock == nil {
+		return
+	}
+	_ = unix.Flock(int(lock.Fd()), unix.LOCK_UN)
+	_ = lock.Close()
+}
+
+// readManifestAt reads manifest.json relative to a held, validated inode
+// directory. It enforces the same regular-file and size invariants as the
+// public reconcile path without re-resolving any ancestor by name.
+func readManifestAt(dir *os.File) ([]byte, error) {
+	fd, err := unix.Openat(int(dir.Fd()), "manifest.json",
+		unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC|unix.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, err
+	}
+	f := os.NewFile(uintptr(fd), "manifest.json")
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !fi.Mode().IsRegular() {
+		return nil, fmt.Errorf("sidecar manifest is not a regular file")
+	}
+	raw, err := io.ReadAll(io.LimitReader(f, maxSidecarBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(raw)) > maxSidecarBytes {
+		return nil, fmt.Errorf("sidecar manifest exceeds %d bytes", maxSidecarBytes)
+	}
+	return raw, nil
+}
+
+// mergeManifestSidecar retains current rows published by another worker when
+// both sidecars describe the same source bytes. Existing volume data is always
+// sanitized before it is carried forward; the file supplies data, never policy.
+func mergeManifestSidecar(current, prior ManifestSidecar, dir *os.File) ManifestSidecar {
+	if prior.Inode != current.Inode || prior.SourceHash == nil || current.SourceHash == nil ||
+		*prior.SourceHash != *current.SourceHash {
+		return current
+	}
+
+	byKind := make(map[string]int, len(current.Derivatives))
+	for i, row := range current.Derivatives {
+		byKind[row.Kind] = i
+	}
+	for _, row := range prior.Derivatives {
+		clean, ok := sanitizeSidecarRow(row)
+		if !ok || clean.Hash == nil || *clean.Hash != *current.SourceHash {
+			continue
+		}
+		i, exists := byKind[clean.Kind]
+		if !exists {
+			byKind[clean.Kind] = len(current.Derivatives)
+			current.Derivatives = append(current.Derivatives, clean)
+			continue
+		}
+		cur := current.Derivatives[i]
+		// A stale local cache row must never beat a shared row that matches the
+		// source hash this writer just recorded. Otherwise a metadata-only NAS
+		// pass can resurrect its pre-GPU H.264 row over a newer HEVC result.
+		curMatches := cur.Hash != nil && *cur.Hash == *current.SourceHash
+		curMatchesBlob := manifestRowMatchesBlobAt(dir, cur)
+		priorMatchesBlob := manifestRowMatchesBlobAt(dir, clean)
+		if !curMatches || (priorMatchesBlob && !curMatchesBlob) ||
+			(priorMatchesBlob == curMatchesBlob && clean.UpdatedAt > cur.UpdatedAt) {
+			current.Derivatives[i] = clean
+		}
+	}
+	if current.Tech == nil && prior.Tech != nil && prior.Tech.Hash != nil &&
+		*prior.Tech.Hash == *current.SourceHash {
+		if clean, ok := sanitizeTechSidecar(prior.Tech); ok {
+			current.Tech = clean
+		}
+	}
+	return current
+}
+
+// manifestRowMatchesBlobAt breaks cross-host timestamp ties using the shared
+// bytes themselves. Proxy rows carry blob_size; whichever row matches the file
+// that is actually present wins even if one host's wall clock is a few seconds
+// ahead. Rows without a size vouch fall back to the sanitized timestamp rule.
+func manifestRowMatchesBlobAt(dir *os.File, row derivatives.DerivRow) bool {
+	if dir == nil || row.Status != "ready" || row.BlobRelPath == nil || row.BlobSize == nil {
+		return false
+	}
+	name := *row.BlobRelPath
+	if name == "" || filepath.IsAbs(name) || filepath.Base(name) != name {
+		return false
+	}
+	var st unix.Stat_t
+	if err := unix.Fstatat(int(dir.Fd()), name, &st, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		return false
+	}
+	return st.Mode&unix.S_IFMT == unix.S_IFREG && st.Size == *row.BlobSize
+}
+
+// derefStr is a nil-safe *string for log lines.
+func derefStr(p *string) string {
+	if p == nil {
+		return ""
+	}
+	return *p
 }

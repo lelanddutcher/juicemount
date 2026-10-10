@@ -29,7 +29,7 @@ import (
 func TestHandleFarmSweepValidation(t *testing.T) {
 	// a.farmQ is left nil — Register isn't run, so the handler exercises the
 	// validation path and the unavailable-queue guard only.
-	a := &API{}
+	a := &API{destMount: "/jfs"}
 
 	cases := []struct {
 		name     string
@@ -120,6 +120,34 @@ func TestHandleFarmJobsNoQueue(t *testing.T) {
 	}
 }
 
+func TestFarmControlMergePatchPreservesDiscovery(t *testing.T) {
+	fake := &fakeFarmQueue{control: farmqueue.FarmControl{Revision: 4, WatchEnabled: true}}
+	a := &API{farmQ: fake}
+	req := httptest.NewRequest(http.MethodPut, "/api/farm/control", strings.NewReader(`{"paused":true}`))
+	rec := httptest.NewRecorder()
+	a.handleFarmControl(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+	}
+	if !fake.control.Paused || !fake.control.WatchEnabled || fake.control.Revision != 5 {
+		t.Fatalf("stored control = %+v", fake.control)
+	}
+	var first farmqueue.FarmControl
+	if err := json.Unmarshal(rec.Body.Bytes(), &first); err != nil {
+		t.Fatalf("decode first control response: %v", err)
+	}
+	if first.UpdatedAt != "stored-at" {
+		t.Fatalf("response updated_at = %q, want stored value", first.UpdatedAt)
+	}
+
+	req = httptest.NewRequest(http.MethodPut, "/api/farm/control", strings.NewReader(`{"watch_enabled":false}`))
+	rec = httptest.NewRecorder()
+	a.handleFarmControl(rec, req)
+	if rec.Code != http.StatusOK || !fake.control.Paused || fake.control.WatchEnabled {
+		t.Fatalf("second patch status=%d control=%+v", rec.Code, fake.control)
+	}
+}
+
 // ---- success-path + contract conformance (fake queue, no Redis) ------------
 
 // fakeFarmQueue is an in-memory farmQueue so the handlers' SUCCESS paths are
@@ -130,8 +158,10 @@ type fakeFarmQueue struct {
 	enqueued   []farmqueue.Job
 	workers    []farmqueue.Worker
 	depth      int64
+	depths     map[string]int64
 	jobs       []farmqueue.JobStatus
 	clearErr   error
+	control    farmqueue.FarmControl
 }
 
 func (f *fakeFarmQueue) Enqueue(_ context.Context, j farmqueue.Job) error {
@@ -145,8 +175,17 @@ func (f *fakeFarmQueue) ActiveWorkers(context.Context) ([]farmqueue.Worker, erro
 	return f.workers, nil
 }
 func (f *fakeFarmQueue) QueueDepth(context.Context) (int64, error) { return f.depth, nil }
+func (f *fakeFarmQueue) QueueDepths(context.Context) (map[string]int64, error) {
+	if f.depths != nil {
+		return f.depths, nil
+	}
+	return map[string]int64{"catch_all": f.depth}, nil
+}
 func (f *fakeFarmQueue) ListJobs(context.Context, int) ([]farmqueue.JobStatus, error) {
 	return f.jobs, nil
+}
+func (f *fakeFarmQueue) PruneExpiredJobIndex(context.Context, int) (int, error) {
+	return 0, nil
 }
 func (f *fakeFarmQueue) ClearFinished(context.Context) (int, error) {
 	if f.clearErr != nil {
@@ -155,7 +194,7 @@ func (f *fakeFarmQueue) ClearFinished(context.Context) (int, error) {
 	kept := f.jobs[:0]
 	removed := 0
 	for _, j := range f.jobs {
-		if j.Status == farmqueue.StatusDone || j.Status == farmqueue.StatusFailed {
+		if j.Status == farmqueue.StatusDone || j.Status == farmqueue.StatusFailed || j.Status == farmqueue.StatusCanceled {
 			removed++
 			continue
 		}
@@ -163,6 +202,22 @@ func (f *fakeFarmQueue) ClearFinished(context.Context) (int, error) {
 	}
 	f.jobs = kept
 	return removed, nil
+}
+func (f *fakeFarmQueue) GetControl(context.Context) (farmqueue.FarmControl, error) {
+	if f.control.Revision == 0 && !f.control.WatchEnabled {
+		return farmqueue.DefaultFarmControl(), nil
+	}
+	return f.control, nil
+}
+func (f *fakeFarmQueue) StoreControl(_ context.Context, ctl farmqueue.FarmControl, force int64) (int64, error) {
+	if force > 0 {
+		ctl.Revision = force
+	} else {
+		ctl.Revision = f.control.Revision + 1
+	}
+	ctl.UpdatedAt = "stored-at"
+	f.control = ctl
+	return ctl.Revision, nil
 }
 
 // compileContractSchema loads + compiles one vendored contract schema. loc may
@@ -281,7 +336,7 @@ func TestHandleFarmSweepEnqueueConformance(t *testing.T) {
 	}
 
 	fake := &fakeFarmQueue{}
-	a := &API{farmQ: fake}
+	a := &API{farmQ: fake, destMount: "/jfs"}
 	req := httptest.NewRequest(http.MethodPost, "/api/farm/sweep", strings.NewReader(body))
 	rec := httptest.NewRecorder()
 	a.handleFarmSweep(rec, req)
@@ -319,9 +374,10 @@ func TestHandleFarmSweepEnqueueConformance(t *testing.T) {
 		t.Errorf("id = %q, want 16-hex per contract", id)
 	}
 
-	// The enqueued Job is stamped + carries the overrides.
-	if len(fake.enqueued) != 1 {
-		t.Fatalf("enqueued %d jobs, want 1", len(fake.enqueued))
+	// Each pass is independently schedulable so metadata cannot be trapped
+	// behind a long GPU transcode.
+	if len(fake.enqueued) != 2 {
+		t.Fatalf("enqueued %d jobs, want 2", len(fake.enqueued))
 	}
 	j := fake.enqueued[0]
 	if j.Producer != "manager" {
@@ -330,7 +386,7 @@ func TestHandleFarmSweepEnqueueConformance(t *testing.T) {
 	if j.Path != "/jfs/Film Projects/SPARQ" {
 		t.Errorf("path = %q", j.Path)
 	}
-	if len(j.Kinds) != 2 || j.Kinds[0] != "derivatives" || j.Kinds[1] != "proxy" {
+	if len(j.Kinds) != 1 || j.Kinds[0] != "derivatives" {
 		t.Errorf("kinds = %v", j.Kinds)
 	}
 	if j.CRF != 18 || j.Preset != "medium" || j.Model != "medium.en" ||
@@ -340,6 +396,9 @@ func TestHandleFarmSweepEnqueueConformance(t *testing.T) {
 	if _, err := time.Parse(time.RFC3339, j.EnqueuedAt); err != nil {
 		t.Errorf("enqueued_at %q is not RFC3339: %v", j.EnqueuedAt, err)
 	}
+	if got := fake.enqueued[1].Kinds; len(got) != 1 || got[0] != "proxy" {
+		t.Errorf("second job kinds = %v, want [proxy]", got)
+	}
 }
 
 // TestHandleFarmSweepRedisUnreachable pins the contract's failure semantics:
@@ -347,7 +406,7 @@ func TestHandleFarmSweepEnqueueConformance(t *testing.T) {
 // at enqueue time must be a 503 (retryable, with a JSON error body), not a 500.
 func TestHandleFarmSweepRedisUnreachable(t *testing.T) {
 	fake := &fakeFarmQueue{enqueueErr: errors.New("dial tcp 192.168.0.197:30179: connect: connection refused")}
-	a := &API{farmQ: fake}
+	a := &API{farmQ: fake, destMount: "/jfs"}
 	req := httptest.NewRequest(http.MethodPost, "/api/farm/sweep",
 		strings.NewReader(`{"path":"/jfs/SPARQ","kinds":["all"]}`))
 	rec := httptest.NewRecorder()
@@ -374,16 +433,17 @@ func TestHandleFarmJobsFixtureConformance(t *testing.T) {
 	// The fixture parses through the SAME wire structs the worker maintains —
 	// field-name drift in farmqueue would fail here, not in production.
 	var fx struct {
-		Available  bool                  `json:"available"`
-		Workers    []farmqueue.Worker    `json:"workers"`
-		QueueDepth int64                 `json:"queue_depth"`
-		Jobs       []farmqueue.JobStatus `json:"jobs"`
+		Available   bool                  `json:"available"`
+		Workers     []farmqueue.Worker    `json:"workers"`
+		QueueDepth  int64                 `json:"queue_depth"`
+		QueueDepths map[string]int64      `json:"queue_depths"`
+		Jobs        []farmqueue.JobStatus `json:"jobs"`
 	}
 	if err := json.Unmarshal(raw, &fx); err != nil {
 		t.Fatalf("fixture does not fit the farmqueue wire structs: %v", err)
 	}
 
-	fake := &fakeFarmQueue{workers: fx.Workers, depth: fx.QueueDepth, jobs: fx.Jobs}
+	fake := &fakeFarmQueue{workers: fx.Workers, depth: fx.QueueDepth, depths: fx.QueueDepths, jobs: fx.Jobs}
 	a := &API{farmQ: fake}
 	req := httptest.NewRequest(http.MethodGet, "/api/farm/jobs", nil)
 	rec := httptest.NewRecorder()
@@ -435,7 +495,7 @@ func TestHandleFarmJobsEmptyNeverNull(t *testing.T) {
 }
 
 // TestHandleFarmJobsClear verifies POST /api/farm/jobs/clear removes ONLY
-// terminal (done/failed) records and returns the count — queued/running
+// terminal (done/failed/canceled) records and returns the count — queued/running
 // jobs must survive so an in-flight sweep is never orphaned. 503 when the
 // queue is unconfigured.
 func TestHandleFarmJobsClear(t *testing.T) {
@@ -444,6 +504,7 @@ func TestHandleFarmJobsClear(t *testing.T) {
 		{ID: "b", Status: farmqueue.StatusDone},
 		{ID: "c", Status: farmqueue.StatusQueued},
 		{ID: "d", Status: farmqueue.StatusFailed},
+		{ID: "e", Status: farmqueue.StatusCanceled},
 	}}
 	a := &API{farmQ: fake}
 	rec := httptest.NewRecorder()
@@ -457,14 +518,14 @@ func TestHandleFarmJobsClear(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 		t.Fatalf("bad JSON: %v", err)
 	}
-	if body.Cleared != 2 {
-		t.Fatalf("cleared = %d, want 2 (done+failed)", body.Cleared)
+	if body.Cleared != 3 {
+		t.Fatalf("cleared = %d, want 3 (done+failed+canceled)", body.Cleared)
 	}
 	if len(fake.jobs) != 2 {
 		t.Fatalf("remaining jobs = %d, want 2 (running+queued kept)", len(fake.jobs))
 	}
 	for _, j := range fake.jobs {
-		if j.Status == farmqueue.StatusDone || j.Status == farmqueue.StatusFailed {
+		if j.Status == farmqueue.StatusDone || j.Status == farmqueue.StatusFailed || j.Status == farmqueue.StatusCanceled {
 			t.Fatalf("terminal job %q survived clear", j.ID)
 		}
 	}

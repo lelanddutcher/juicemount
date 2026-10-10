@@ -33,6 +33,21 @@ type Handler interface {
 	HandleLimit() int
 }
 
+// ParentRenameObservation is the original export handle and the scalar file ID
+// obtained from a successful parent Stat before the rename interleaving window.
+// Proven is false when ToFileAttribute had to synthesize a pathname hash.
+type ParentRenameObservation struct {
+	Handle []byte
+	Fileid uint64
+	Proven bool
+}
+
+// ParentObservedRenamer optionally rechecks both parent identities inside the
+// filesystem's namespace admission. Generic billy filesystems use Rename.
+type ParentObservedRenamer interface {
+	RenameWithParentObservations(oldpath, newpath string, from, to ParentRenameObservation) error
+}
+
 // UnixChange extends the billy `Change` interface with support for special files.
 type UnixChange interface {
 	billy.Change

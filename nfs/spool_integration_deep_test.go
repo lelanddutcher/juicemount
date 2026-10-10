@@ -142,6 +142,12 @@ func TestSpoolMultiFileCopiesAllDrain(t *testing.T) {
 
 // (b) Boot scrubber reconciles every drain_state correctly + is idempotent.
 func TestSpoolRecoverOnBootDispositions(t *testing.T) {
+	for _, uncertain := range []bool{false, true} {
+		t.Run(map[bool]string{false: "ordinary", true: "uncertain"}[uncertain], func(t *testing.T) { testSpoolRecoverOnBootDispositions(t, uncertain) })
+	}
+}
+
+func testSpoolRecoverOnBootDispositions(t *testing.T, uncertain bool) {
 	root := t.TempDir()
 	db := openTestDB(t, filepath.Join(t.TempDir(), "m.db"))
 	if err := metadata.InitSpoolSchema(db); err != nil {
@@ -162,8 +168,10 @@ func TestSpoolRecoverOnBootDispositions(t *testing.T) {
 	eDrain, _ := s1.OpenWrite("/draining.bin")
 	_, _ = eDrain.WriteAt([]byte("draining-data"), 0) // 13 bytes
 	_ = eDrain.Close()
-	if ok, err := meta.MarkDraining(eDrain.ID()); err != nil || !ok {
-		t.Fatalf("mark draining: ok=%v err=%v", ok, err)
+	if uncertain {
+		if ok, err := meta.MarkDraining(eDrain.ID()); err != nil || !ok {
+			t.Fatalf("mark draining: ok=%v err=%v", ok, err)
+		}
 	}
 	// (3) writing + partial file (never closed)
 	eWriting, _ := s1.OpenWrite("/writing.bin")
@@ -175,9 +183,9 @@ func TestSpoolRecoverOnBootDispositions(t *testing.T) {
 	if err := os.Remove(eMissing.SpoolFilePath()); err != nil {
 		t.Fatalf("remove missing file: %v", err)
 	}
-	// (5) orphan file with no SQL row
+	// (5) empty orphan file with no SQL row (requires explicit resolution)
 	orphan := filepath.Join(root, SpoolFilesSubdir, "orphan-file")
-	if err := os.WriteFile(orphan, []byte("orphan"), 0o600); err != nil {
+	if err := os.WriteFile(orphan, nil, 0o600); err != nil {
 		t.Fatalf("write orphan: %v", err)
 	}
 
@@ -187,16 +195,58 @@ func TestSpoolRecoverOnBootDispositions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("s2: %v", err)
 	}
+	if uncertain {
+		rep, err := s2.RecoverOnBoot(context.Background())
+		var pending *metadata.PendingDrainCompletion
+		if !errors.As(err, &pending) || rep != (RecoveryReport{}) {
+			t.Fatalf("uncertain recovery=(%+v,%v)", rep, err)
+		}
+		for _, item := range []struct {
+			entry *SpoolEntry
+			state metadata.DrainState
+			body  string
+		}{
+			{eReady, metadata.DrainReady, "ready-data!!"}, {eDrain, metadata.DrainDraining, "draining-data"}, {eWriting, metadata.DrainWriting, "partial"},
+		} {
+			row, err := meta.Get(item.entry.ID())
+			if err != nil || row.DrainState != item.state {
+				t.Errorf("row changed: %+v err=%v", row, err)
+			}
+			got, err := os.ReadFile(item.entry.SpoolFilePath())
+			if err != nil || string(got) != item.body {
+				t.Errorf("source changed: %q err=%v", got, err)
+			}
+		}
+		if row, err := meta.Get(eMissing.ID()); err != nil || row.DrainState != metadata.DrainReady {
+			t.Errorf("missing row mutated: %+v err=%v", row, err)
+		}
+		if _, err := os.Lstat(orphan); err != nil {
+			t.Errorf("orphan changed: %v", err)
+		}
+		if used, _ := s2.Capacity(); used != 0 {
+			t.Errorf("capacity changed=%d", used)
+		}
+		return
+	}
+	if rep, err := s2.RecoverOnBoot(context.Background()); !errors.Is(err, ErrSpoolOrphanBytes) || rep != (RecoveryReport{}) {
+		t.Fatalf("RecoverOnBoot with empty orphan = (%+v, %v), want refusal", rep, err)
+	}
+	if _, err := os.Lstat(orphan); err != nil {
+		t.Fatalf("empty orphan removed before disposition: %v", err)
+	}
+	if err := os.Remove(orphan); err != nil {
+		t.Fatalf("resolve orphan: %v", err)
+	}
 	rep, err := s2.RecoverOnBoot(context.Background())
 	if err != nil {
 		t.Fatalf("RecoverOnBoot: %v", err)
 	}
 
-	if rep.ReadyResumed != 1 {
-		t.Errorf("ReadyResumed=%d, want 1", rep.ReadyResumed)
+	if rep.ReadyResumed != 2 {
+		t.Errorf("ReadyResumed=%d, want 2", rep.ReadyResumed)
 	}
-	if rep.DrainingReset != 1 {
-		t.Errorf("DrainingReset=%d, want 1", rep.DrainingReset)
+	if rep.DrainingReset != 0 {
+		t.Errorf("DrainingReset=%d, want 0", rep.DrainingReset)
 	}
 	if rep.WritingResumed != 1 || rep.WritingFailedRows != 0 {
 		t.Errorf("WritingResumed=%d WritingFailedRows=%d, want 1 and 0 (non-empty writing partial is preserved)", rep.WritingResumed, rep.WritingFailedRows)
@@ -204,11 +254,11 @@ func TestSpoolRecoverOnBootDispositions(t *testing.T) {
 	if rep.OrphanRowsFailed != 1 {
 		t.Errorf("OrphanRowsFailed=%d, want 1", rep.OrphanRowsFailed)
 	}
-	if rep.OrphanFilesDeleted != 1 {
-		t.Errorf("OrphanFilesDeleted=%d, want 1", rep.OrphanFilesDeleted)
+	if rep.OrphanFilesDeleted != 0 {
+		t.Errorf("OrphanFilesDeleted=%d, want 0", rep.OrphanFilesDeleted)
 	}
 
-	// Capacity re-accounted from the surviving ready + reset-to-ready rows,
+	// Capacity re-accounted from the surviving two unclaimed ready rows,
 	// PLUS the resumed writing row (7 bytes "partial") whose data we preserve.
 	const wantUsed = 12 + 13 + 7
 	if used, _ := s2.Capacity(); used != wantUsed {
@@ -222,12 +272,8 @@ func TestSpoolRecoverOnBootDispositions(t *testing.T) {
 		t.Errorf("missing-file row not failed: %+v", row)
 	}
 	if row, _ := meta.Get(eDrain.ID()); row == nil || row.DrainState != metadata.DrainReady {
-		t.Errorf("draining row not reset to ready: %+v", row)
+		t.Errorf("unclaimed ready row changed: %+v", row)
 	}
-	if _, err := os.Stat(orphan); !os.IsNotExist(err) {
-		t.Errorf("orphan file not deleted (err=%v)", err)
-	}
-
 	// Idempotency: a second scrub must produce the SAME used, not a doubling.
 	if _, err := s2.RecoverOnBoot(context.Background()); err != nil {
 		t.Fatalf("second RecoverOnBoot: %v", err)
@@ -274,6 +320,10 @@ func TestSpoolReopenWhileDrainingBlocksThenDefers(t *testing.T) {
 	e1, _ := s.OpenWrite("/reopen.bin")
 	_, _ = e1.WriteAt([]byte("first"), 0)
 	_ = e1.Close() // finalized → ready, still in the index (no drainer running)
+	claimed, err := s.Meta().MarkDraining(e1.ID())
+	if err != nil || !claimed {
+		t.Fatalf("claim prior row for drain: claimed=%v err=%v", claimed, err)
+	}
 
 	type res struct {
 		e   *SpoolEntry
@@ -304,6 +354,65 @@ func TestSpoolReopenWhileDrainingBlocksThenDefers(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatalf("blocked OpenWrite did not return after the prior entry drained")
+	}
+}
+
+// A finalized READY row has not been claimed by the drainer and still owns a
+// complete, unpunched spool image. A late continuation must reopen that exact
+// row immediately, merge the bytes, and drain one complete file. This is the
+// real Finder directory-sidecar pattern that previously parked every WRITE for
+// 30s behind a thousands-row ready queue and surfaced as error 100060.
+func TestSpoolReopenReadyMergesLateContinuation(t *testing.T) {
+	spool, d := newTestDrainer(t, DrainerConfig{})
+	first := []byte("first-burst-")
+	second := []byte("late-continuation")
+
+	e1, err := spool.OpenWrite("/late.bin")
+	if err != nil {
+		t.Fatalf("OpenWrite first: %v", err)
+	}
+	if _, err := e1.WriteAt(first, 0); err != nil {
+		t.Fatalf("write first: %v", err)
+	}
+	if err := e1.Close(); err != nil {
+		t.Fatalf("finalize first: %v", err)
+	}
+
+	t0 := time.Now()
+	e2, err := spool.OpenWrite("/late.bin")
+	if err != nil {
+		t.Fatalf("reopen ready: %v", err)
+	}
+	if elapsed := time.Since(t0); elapsed > time.Second {
+		t.Fatalf("ready reopen blocked for %v; must be immediate", elapsed)
+	}
+	if e2 != e1 || e2.ID() != e1.ID() {
+		t.Fatalf("ready reopen created a competing entry: same_ptr=%v ids=%d/%d", e2 == e1, e1.ID(), e2.ID())
+	}
+	if _, err := e2.WriteAt(second, int64(len(first))); err != nil {
+		t.Fatalf("write continuation: %v", err)
+	}
+	if err := e2.Close(); err != nil {
+		t.Fatalf("finalize continuation: %v", err)
+	}
+
+	want := append(append([]byte(nil), first...), second...)
+	if got, err := os.ReadFile(e2.SpoolFilePath()); err != nil || !bytes.Equal(got, want) {
+		t.Fatalf("merged spool image mismatch: len=%d err=%v want=%d", len(got), err, len(want))
+	}
+	row, err := spool.Meta().Get(e2.ID())
+	if err != nil || row.DrainState != metadata.DrainReady || row.Size != int64(len(want)) {
+		t.Fatalf("refinalized row incorrect: row=%+v err=%v", row, err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if n := d.DrainOnceForTest(ctx); n != 1 {
+		t.Fatalf("drained rows=%d, want 1", n)
+	}
+	got, err := os.ReadFile(filepath.Join(d.fuseRoot, "late.bin"))
+	if err != nil || !bytes.Equal(got, want) {
+		t.Fatalf("drained merged image mismatch: len=%d err=%v want=%d", len(got), err, len(want))
 	}
 }
 
@@ -366,6 +475,10 @@ func TestSpoolDrainRetriesThenFailsPermanently(t *testing.T) {
 	if err != nil {
 		t.Fatalf("drainer: %v", err)
 	}
+	d.SetOnDrainCommit(func(metadata.DrainCommitItem) (metadata.DrainCommitResult, error) {
+		t.Error("unwritable destination unexpectedly reached completion")
+		return metadata.DrainCommitResult{}, errors.New("unexpected completion")
+	})
 	e := writeSpoolEntry(t, spool, "/willfail.bin", []byte("data"))
 	d.Start()
 	t.Cleanup(func() { d.Stop(2 * time.Second) })
@@ -473,7 +586,7 @@ func TestSpoolHandleRoundTripCreateWriteRead(t *testing.T) {
 	}
 	_ = cf.Close()
 	handle := h.ToHandle(jfs, []string{"Movies", "clip.mov"})
-	if len(handle) != 8 {
+	if len(handle) != exportHandleSize {
 		t.Fatalf("ToHandle returned bad handle len=%d", len(handle))
 	}
 

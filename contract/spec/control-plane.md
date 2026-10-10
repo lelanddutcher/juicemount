@@ -58,8 +58,8 @@ Fixture: [`../fixtures/whoami/gui.json`](../fixtures/whoami/gui.json),
 ```json
 {
   "app": "JuiceMount",
-  "version": "0.1.0",
-  "contract_version": 1,
+  "version": "0.5.0",
+  "contract_version": 3,
   "instance_id": "5C7E0E2A-…",
   "volume_name": "zpool",
   "mount_point": "/Volumes/zpool",
@@ -67,6 +67,7 @@ Fixture: [`../fixtures/whoami/gui.json`](../fixtures/whoami/gui.json),
   "control_plane": "http://127.0.0.1:11050",
   "metadata_db_path": "/Users/leland/Library/Application Support/JuiceMount/metadata.db",
   "deployment": "gui",
+  "wire_terms": "logger/1",
   "capabilities": ["health","whoami","residency","lookup","cache-status","offline","spool","pin","unpin","self-test","verify-pins","metrics"]
 }
 ```
@@ -74,9 +75,14 @@ Fixture: [`../fixtures/whoami/gui.json`](../fixtures/whoami/gui.json),
 - `instance_id`: a **stable per-install UUID** JuiceMount mints once and persists (e.g. in Preferences).
   It is the `jm_instance` half of OpenLoupe's durable `(instance, inode)` identity — so an asset survives a
   remount and is shareable across machines that mount the same volume. See [`identity.md`](identity.md).
-- `version`: the **public release version** string (currently `0.1.0` — the notarized release + only git
-  tag). Source it from a single version-of-record (a Go const set by the release process); reconcile the
-  stale Info.plist marketing string (`2.0.0`) down to match. Distinct from `contract_version`.
+  An install copied to another Mac (Migration Assistant, Time Machine restore, cloned disk) mints a NEW
+  `instance_id` on that Mac, so the copy never shares the original's identity.
+- `device_digest` (optional, additive): a 32-hex-character digest of the serving Mac's hardware UUID (never
+  the UUID). Absent when unavailable. One `instance_id` seen with two `device_digest` values means a copied
+  install. Runtime-volatile: conformance compares it by presence and type, not value.
+- `version`: the **target public release version** string (`0.5.0` for this release candidate; not yet
+  tagged or notarized). Source it from the release build's version-of-record; Info.plist must match.
+  Distinct from `contract_version`.
 - `contract_version`: integer from this repo's `VERSION`.
 - `nas_root`: today equal to `mount_point` (paths are mount-anchored); a distinct field so it can diverge.
 - `capabilities`: the **only** correct way to feature-detect. **Derived, never hardcoded** (see
@@ -175,13 +181,16 @@ Read (no `?on`) → `OfflineState { offline, user_offline, auto_offline, reason?
 
 ### `GET /spool`
 
-`SpoolStatusResponse { enabled, error?, pending_files, pending_bytes, in_progress, succeeded, failed,
-quarantined, capacity_used, capacity_total, stalled_files, failed_files, oldest_pending_age_sec,
-stall_waiters, offline, offline_buffer_full, entries[] }` where each
-`SpoolEntryView { path, size, drain_state, drain_attempts, last_error?, updated_at_unix, age_sec, stalled }`
+`SpoolStatusResponse { enabled, error?, pending_files, pending_symlinks, pending_bytes, in_progress,
+succeeded, failed, quarantined, sidecars_skipped, capacity_used, capacity_total, stalled_files,
+failed_files, declined_files, oldest_pending_age_sec, suspect_zero_tail, stall_waiters, offline,
+offline_buffer_full, entries[] }` where each
+`SpoolEntryView { path, size, drain_state, drain_attempts, last_error?, updated_at_unix, age_sec,
+stalled, suspect_zero_tail, suspect_zero_tail_detail? }`
 (`nfs/spool_status.go:17`). HTTP **503** with `enabled:false` when the spool is not enabled
 (`JM_SPOOL_ENABLE=1`). `entries` is capped at 200, newest-first active rows + a short recently-done tail.
-`drain_state ∈ {writing, ready, draining, done, failed}`. Backs the "uploading to NAS" badge. Schema:
+`drain_state ∈ {writing, ready, draining, done, failed}`. `pending_symlinks` counts accepted offline
+link work that must finish before ordinary quit. Backs the "uploading to NAS" badge. Schema:
 [`spool-status.schema.json`](schema/spool-status.schema.json).
 
 ### `GET /activity`
@@ -239,9 +248,8 @@ clean choice and is filed as JM-3 high.)
   so nobody greps the wrong file. Served by **both** the GUI and `jm5`.
 - **The cbridge control-plane route table is at `bridge/cbridge.go:733-789`** on main (the new `/whoami`,
   `/residency`, `/lookup` handlers register there).
-- **No version field exists** in any response and there is no Go version constant — exactly why JM-1
-  `/whoami` matters. (Info.plist marketing version is `2.0.0`; the public/notarized release tag is `v0.1.0`
-  — see [`../HANDOFF_JUICEMOUNT.md`](../HANDOFF_JUICEMOUNT.md) for the version-of-record decision.)
+- **`/whoami` is the public version surface.** The release candidate reports `0.5.0`;
+  release artifacts also embed the immutable source commit outside this strict wire schema.
 - **No `nas_rel_path` column exists.** Paths are mount-anchored; `nas_rel_path` is *defined* by this contract
   as `path − mount_point` and must be computed.
 - Detection signature `isOurNFSMount` (`bridge/cbridge.go:1803`) is source prefix `127.0.0.1` / `localhost`

@@ -10,8 +10,9 @@
 #     (2) the cross-cutting error tally across the whole run is 0
 #         (FromHandle STALE / purging phantom / 100070 / 100060 / -48 / -36 /
 #          -5000 / permission), AND
-#     (3) the snappiness thresholds held (no listing exceeded $QA_SNAPPY_MS,
-#         derived from category 09's latency table + any [FAIL] snappiness rows).
+#     (3) every category-specific snappiness contract held (category 09 gates
+#         every listing; distribution-based categories gate p99 plus their
+#         catastrophic-stall ceiling), derived from artifacts and [FAIL] rows.
 #
 # WHY A SINGLE ORCHESTRATOR (read before "simplifying"):
 #   The per-category errscan windows overlap and each script only scans its OWN
@@ -67,6 +68,7 @@ ALL_CATEGORIES="
 08-chain-of-custody
 09-finder-snappiness
 10-index-stability
+11-drain-latency
 "
 
 # ---------------------------------------------------------------------------
@@ -245,8 +247,9 @@ $cat|$status|$metric"
 }
 
 # ---------------------------------------------------------------------------
-# Snappiness gate across the run: any [FAIL] snappiness row in any category, or
-# any latency-table MS >= budget, fails the snappiness gate independently.
+# Snappiness gate across the run: any category-emitted [FAIL] latency row fails
+# independently. Category 09 additionally has a strict every-sample contract, so
+# its latency table is cross-checked directly against the budget.
 
 snappiness_held() {
     local bad=0 f
@@ -280,7 +283,7 @@ qa_log "=========================================================="
 # Mark the JuiceMount log ONCE so the end-of-run cross-cutting scan covers the
 # ENTIRE battery window (the authoritative zero-error gate).
 RUN_MARK="$(qa_log_mark)"
-qa_info "JuiceMount log marked at line $RUN_MARK ($JM_LOG)"
+qa_info "JuiceMount log marked at inode:line $RUN_MARK ($JM_LOG)"
 
 if ! precheck; then
     qa_fail "PRECHECK failed — refusing to run the battery (fix the environment first)"
@@ -310,7 +313,7 @@ XSCAN="$(qa_error_scan "$RUN_MARK" "run-aggregate")"
 qa_log "$XSCAN"
 
 # Parse each signature out of the tally line. Format (lib.sh qa_error_scan):
-#   errscan STALE=N PHANTOM=N E100070=N E100060=N E48=N E36=N E5000=N PERM=N
+#   errscan STALE=N PHANTOM=N E100070=N E100060=N E48=N E36=N E5000=N PERM=N LOGLOSS=N
 _xfield() { printf '%s' "$XSCAN" | tr ' ' '\n' | awk -F= -v k="$1" '$1==k{print $2}'; }
 X_STALE="$(_xfield STALE)";    X_STALE="${X_STALE:-0}"
 X_PHANTOM="$(_xfield PHANTOM)"; X_PHANTOM="${X_PHANTOM:-0}"
@@ -320,8 +323,9 @@ X_E48="$(_xfield E48)";        X_E48="${X_E48:-0}"
 X_E36="$(_xfield E36)";        X_E36="${X_E36:-0}"
 X_E5000="$(_xfield E5000)";    X_E5000="${X_E5000:-0}"
 X_PERM="$(_xfield PERM)";      X_PERM="${X_PERM:-0}"
+X_LOGLOSS="$(_xfield LOGLOSS)"; X_LOGLOSS="${X_LOGLOSS:-0}"
 
-XTOTAL=$(( X_STALE + X_PHANTOM + X_E70 + X_E60 + X_E48 + X_E36 + X_E5000 + X_PERM ))
+XTOTAL=$(( X_STALE + X_PHANTOM + X_E70 + X_E60 + X_E48 + X_E36 + X_E5000 + X_PERM + X_LOGLOSS ))
 
 # ---------------------------------------------------------------------------
 # Snappiness gate.
@@ -355,13 +359,13 @@ MISSING_SELECTED=0
     echo ""
     echo "CROSS-CUTTING USER-VISIBLE ERROR TALLY (whole run window):"
     printf '  FromHandle STALE=%s  purging-phantom=%s  100070=%s  100060=%s\n' "$X_STALE" "$X_PHANTOM" "$X_E70" "$X_E60"
-    printf '  -48(already-item)=%s  -36(ioErr)=%s  -5000=%s  permission=%s\n' "$X_E48" "$X_E36" "$X_E5000" "$X_PERM"
+    printf '  -48(already-item)=%s  -36(ioErr)=%s  -5000=%s  permission=%s  log-window-loss=%s\n' "$X_E48" "$X_E36" "$X_E5000" "$X_PERM" "$X_LOGLOSS"
     printf '  TOTAL gated errors = %s   (gate requires 0)\n' "$XTOTAL"
     echo ""
     if [ "$SNAPPY_OK" -eq 1 ]; then
-        echo "SNAPPINESS: held (no listing >= ${QA_SNAPPY_MS}ms)"
+        echo "SNAPPINESS: held (all category-specific latency contracts passed)"
     else
-        echo "SNAPPINESS: VIOLATED (a listing met/exceeded ${QA_SNAPPY_MS}ms — see 09 latency table / [FAIL] rows)"
+        echo "SNAPPINESS: VIOLATED (a category-specific latency gate failed — see latency artifacts / [FAIL] rows)"
     fi
     if [ "$MISSING_SELECTED" -eq 1 ]; then
         echo "COVERAGE:   INCOMPLETE — missing selected script(s):$SKIPPED"

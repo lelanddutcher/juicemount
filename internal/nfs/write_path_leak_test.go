@@ -56,6 +56,7 @@ type trackFile struct {
 	closeCalls int
 	truncErr   error
 	writeAtErr error
+	closeErr   error
 }
 
 func (f *trackFile) Name() string { return f.name }
@@ -68,7 +69,7 @@ func (f *trackFile) Write(p []byte) (int, error) {
 func (f *trackFile) Read(p []byte) (int, error)                { return 0, nil }
 func (f *trackFile) ReadAt(p []byte, off int64) (int, error)   { return 0, nil }
 func (f *trackFile) Seek(off int64, whence int) (int64, error) { return 0, nil }
-func (f *trackFile) Close() error                              { f.closeCalls++; return nil }
+func (f *trackFile) Close() error                              { f.closeCalls++; return f.closeErr }
 func (f *trackFile) Lock() error                               { return nil }
 func (f *trackFile) Unlock() error                             { return nil }
 func (f *trackFile) Truncate(size int64) error                 { return f.truncErr }
@@ -295,4 +296,23 @@ func TestOnWriteClosesHandleWhenWriteAtFails(t *testing.T) {
 	if !errors.As(err, &statusErr) {
 		t.Fatalf("onWrite error %T is not an NFSStatusError — reply would be RPC-level garbage", err)
 	}
+}
+
+func TestOnWriteReturnsIOWhenSizePublicationFailsOnClose(t *testing.T) {
+	injected := errors.New("publish written size: injected SQLite failure")
+	file := &trackFile{name: "f.bin", closeErr: injected}
+	handler := &mockHandler{fs: &mockFS{file: file, lstatInfo: &mockFileInfo{name: "f.bin", mode: 0o644}}}
+	var body bytes.Buffer
+	if err := xdr.Write(&body, writeArgs{Handle: []byte{1}, Count: 4, Data: []byte("data")}); err != nil {
+		t.Fatal(err)
+	}
+	err := onWrite(context.Background(), &response{req: &request{Body: bytes.NewReader(body.Bytes())}}, handler)
+	var statusErr *NFSStatusError
+	if !errors.As(err, &statusErr) || statusErr.NFSStatus != NFSStatusIO {
+		t.Fatalf("WRITE result = %v, want NFSStatusIO", err)
+	}
+	if !errors.Is(err, injected) || file.closeCalls != 1 {
+		t.Fatalf("WRITE lost close error or closed wrong number of times: error %v, closes %d", err, file.closeCalls)
+	}
+	assertWellFormedSetattrError(t, err) // WRITE errors use the same wcc_data body.
 }

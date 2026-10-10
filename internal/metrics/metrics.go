@@ -14,7 +14,11 @@ import (
 	"math"
 	"net"
 	"net/http"
+	"net/netip"
+	"net/url"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -171,6 +175,9 @@ type Registry struct {
 	histsMu sync.RWMutex
 	hists   map[RPCType]*histogram
 
+	// Fixed refusal counters; see write_admission.go.
+	admissionRefusals admissionCounters
+
 	// Global counters
 	rpcTotal   atomic.Uint64
 	rpcErrors  atomic.Uint64
@@ -221,6 +228,13 @@ type Registry struct {
 	// READs hit MinIO or the local SSD cache.
 	readColdSubread atomic.Uint64
 	readWarmSubread atomic.Uint64
+
+	// directSSDCache* grades the repaired Priority-2 serving path. A hit means
+	// bytes were read from a JuiceFS cache file and CRC32C-verified without a
+	// FUSE/Redis round trip; a miss fell through to coherent FUSE.
+	directSSDCacheHit      atomic.Uint64
+	directSSDCacheHitBytes atomic.Uint64
+	directSSDCacheMiss     atomic.Uint64
 
 	// readQoS* — grades #4 (INSTANT-NAV read-QoS, slow/metered links only).
 	// queued = a read hit a full lane and waited; failOpen = a wait crossed
@@ -310,6 +324,13 @@ type Registry struct {
 	// finalize), QA-35-safe.
 	zeroTailSuspect atomic.Uint64
 
+	// FUSE metadata attribution (per-source, per-op counters + gate
+	// saturation). Fixed preallocated arrays of atomics — see fuse_attrib.go
+	// for the rationale and the hot-path cost contract. Embedded rather than
+	// spelled out here so the arrays and their provider hook live next to the
+	// enums that index them.
+	fuseAttribState
+
 	// Health hook — set by main.go so /health can answer accurately.
 	healthMu sync.RWMutex
 	healthFn func() HealthSnapshot
@@ -319,6 +340,105 @@ type Registry struct {
 	// via a provider so this package needn't import netprofile.
 	netMu sync.RWMutex
 	netFn func() *NetworkSnapshot
+
+	// FUSE data-gate hook — set by package nfs so /metrics can report the
+	// concurrency ceiling added after the 2026-08-05 double kernel panic.
+	// A provider (not counters pushed from the gate) because occupancy is a
+	// GAUGE read once per scrape: pushing it would add an atomic store to
+	// every admit/release on the FUSE data hot path, which the gate exists to
+	// keep cheap. Decoupled this way so metrics needn't import nfs (nfs
+	// already imports metrics — the reverse would be a cycle).
+	dataGateMu sync.RWMutex
+	dataGateFn func() *FUSEDataGateSnapshot
+
+	// Stall hook — set by package internal/nfs so /metrics can report live
+	// in-flight RPCs and per-op JUKEBOX totals. Same provider rationale as the
+	// data gate: the state is package-private to internal/nfs, and metrics
+	// cannot import it (internal/nfs already imports metrics).
+	stallMu sync.RWMutex
+	stallFn func() *StallSnapshot
+
+	// Backend hook — set by the bridge so /metrics can report backend-vs-cache
+	// bytes from the JuiceFS daemon's own endpoint. Scrape is lazy and
+	// throttled inside the provider; never called per-RPC.
+	backendMu sync.RWMutex
+	backendFn func() *BackendSnapshot
+
+	// Redis round-trip hook — set by package metadata.
+	redisMu sync.RWMutex
+	redisFn func() *RedisSnapshot
+
+	// FD-pool hook — set by package nfs so /metrics can report descriptor and
+	// memory-buffer occupancy. Same provider rationale as the data gate: the
+	// pool is per-handler, so it cannot be a package-level counter, and reading
+	// it once per scrape costs nothing on the serving path.
+	fdPoolMu sync.RWMutex
+	fdPoolFn func() *FDPoolSnapshot
+
+	// Keyspace-push hook — set by package metadata so /metrics can answer "is
+	// push actually delivering". Provider rather than pushed counters because
+	// the verdict is computed, and because metadata must not depend on when a
+	// scrape happens.
+	keyspaceMu sync.RWMutex
+	keyspaceFn func() *KeyspaceSnapshot
+}
+
+// KeyspaceSnapshot reports whether Redis keyspace push is delivering.
+//
+// WHY THIS IS HERE AT ALL: the question was unanswerable from the running
+// process. rc.engaged recorded the state the code INTENDED to be in; nothing
+// counted whether a single event ever arrived, so the 2026-07-10 incident
+// (notify-keyspace-events unset on the NAS, push unable to engage, a permanent
+// 30s SCAN over the tunnel) had to be diagnosed from logs.
+//
+// VERDICT CARRIES A REFUSAL. "unknown" is neither pass nor fail — it means
+// nothing was published and nothing arrived, so there was nothing to observe.
+// Reporting "working" there would be a verdict from no measurement, which is the
+// harness failure this project has been burned by repeatedly.
+type KeyspaceSnapshot struct {
+	// Verdict is working | broken | unknown | unreachable.
+	Verdict string `json:"verdict"`
+	Reason  string `json:"reason"`
+	// EventsApplied counts notifications from the REAL keyspace push feed
+	// (PSUBSCRIBE __keyspace@N__:d*). This is what the verdict keys on.
+	EventsApplied int64 `json:"events_applied"`
+	// SelfWriteEvents counts messages on the separate juicemount:metadata
+	// pub/sub channel, which replays THIS client's own writes. Reported
+	// alongside because the verdict used to key on it by mistake, and it works
+	// whether or not notify-keyspace-events is set — so events_applied == 0
+	// with self_write_events > 0 is the exact fingerprint of dead push.
+	SelfWriteEvents int64 `json:"self_write_events"`
+	// PublishedMutations is the validity DENOMINATOR: our own writes are
+	// replayed back to us, so published>0 with events==0 is conclusive.
+	PublishedMutations int64 `json:"published_mutations"`
+	// ScanPromotions counts push batches abandoned for one full-tree SCAN
+	// because the batch exceeded the burst ceiling. Non-zero on a metered link
+	// means the cheap path stopped being used at the worst possible moment.
+	ScanPromotions int64 `json:"scan_promotions"`
+}
+
+// FDPoolSnapshot reports file-descriptor and memory-buffer occupancy.
+//
+// WHY: FDPool.Stats() and MemoryBuffer.Stats() both existed and were never
+// called, and health.MemoryStats was built to carry these numbers but its
+// SetStatsProvider had no caller — so the process ran with zero fd visibility.
+// The 2026-07-28 audit measured ~1 orphaned fd per invalidation under a rename
+// storm, and there is no Setrlimit in the repo, so an fd leak would surface as
+// an unexplained abort with nothing to point at.
+//
+// Absent (nil) when no mount is up, so "not running" is never misread as
+// "running with an empty pool".
+type FDPoolSnapshot struct {
+	// Open is every pooled descriptor; Active is the subset with refCount > 0.
+	// Open climbing while Active stays flat is the orphan-leak signature.
+	Open   int `json:"open"`
+	Active int `json:"active"`
+
+	MemBufEntries int     `json:"membuf_entries"`
+	MemBufMB      float64 `json:"membuf_mb"`
+	MemBufHits    int64   `json:"membuf_hits"`
+	MemBufMisses  int64   `json:"membuf_misses"`
+	MemBufEvicts  int64   `json:"membuf_evicts"`
 }
 
 // NetworkSnapshot mirrors the netprofile link estimate for /metrics.
@@ -330,11 +450,157 @@ type NetworkSnapshot struct {
 	HaveBandwidth   bool    `json:"have_bandwidth"`
 	ThroughputN     int64   `json:"throughput_samples"`
 	BootstrappedRTT bool    `json:"bootstrapped_from_rtt"`
+	// Simulated is true when JM_NET_FAKE_LINK replaced observations. FakeProfile
+	// is a canonical whitelist of parsed numeric/class fields, never the raw
+	// environment value. Performance harnesses use these fields to refuse to
+	// compare decision-level policy simulation with real-link measurements.
+	Simulated   bool   `json:"simulated"`
+	FakeProfile string `json:"fake_profile,omitempty"`
+	// FUSEContentReadGuard proves the acceptance-only zero-source-download
+	// switch reached the running Go bridge. It is false in every ordinary
+	// launch and contains no configuration value or private topology.
+	FUSEContentReadGuard bool `json:"fuse_content_read_guard"`
+	// BackendRouteTunneled is sanitized proof that the kernel route to the
+	// configured backend (before any local acceptance/Link proxy rewrite)
+	// traverses a tunnel. It deliberately exposes neither the interface name nor
+	// the backend address.
+	BackendRouteTunneled bool `json:"backend_route_tunneled"`
+	// RouteCeilingApplied reports whether that route installed an automatic
+	// class ceiling. RouteCeilingClass is the public policy name, never a route
+	// or interface identifier; it is omitted while no ceiling is active.
+	RouteCeilingApplied bool   `json:"route_ceiling_applied"`
+	RouteCeilingClass   string `json:"route_ceiling_class,omitempty"`
+	// HostNetworkCost* is a sanitized copy of Network.framework's physical-path
+	// billing/constrained signal. The real-cellular acceptance gate uses it to
+	// distinguish an actual phone/cellular path from ordinary Wi-Fi carrying a
+	// coincidental VPN route; no interface, SSID, address, or carrier is exposed.
+	HostNetworkCostObserved bool `json:"host_network_cost_observed"`
+	HostNetworkExpensive    bool `json:"host_network_expensive"`
+	HostNetworkConstrained  bool `json:"host_network_constrained"`
+	// HighLatency is the HYSTERETIC far-link flag, which is NOT derivable from
+	// Class or RTTMs above: it latches on at a higher RTT than it releases at,
+	// so a link oscillating around the boundary reports one stable answer. It
+	// is what actually selects warmOpTimeout, so a cellular run that behaves
+	// differently from its measured RTT is explained by this field and by
+	// nothing else in this struct.
+	HighLatency bool `json:"high_latency"`
 	// Live readahead policy derived from the class.
 	ReadaheadEnabled bool `json:"readahead_enabled"`
 	ReadaheadSeq     int  `json:"readahead_seq_threshold"`
 	ReadaheadBlocks  int  `json:"readahead_blocks_ahead"`
 	ReadaheadWorkers int  `json:"readahead_workers"`
+	// BackendTransport is the actual most-recent backend proxy selection, not
+	// merely the tailnet peer's control-plane state. direct-lan is admitted only
+	// after encrypted peer/address verification; encrypted-link is the fail-
+	// closed remote path. system-direct means Link is not configured.
+	BackendTransport     string `json:"backend_transport"`
+	DirectLANConnections uint64 `json:"direct_lan_connections"`
+	EncryptedConnections uint64 `json:"encrypted_link_connections"`
+}
+
+// BackendSnapshot reports how much of a session actually crossed the link,
+// scraped from the JuiceFS mount daemon's own Prometheus endpoint.
+//
+// Our bytes_read counts bytes SERVED TO THE NFS CLIENT and cannot tell a byte
+// off the local SSD from a byte dragged over a cellular uplink. These counters
+// can. All are cumulative since the juicefs daemon started, so a measurement is
+// a DIFFERENCE across the window under test.
+//
+// The field is ABSENT (nil) when the daemon has not been scraped successfully.
+// It never reports zeros from a failed scrape: "0 bytes from the backend"
+// reads as a perfect cache-hit session, which is the most flattering possible
+// way to be wrong.
+type BackendSnapshot struct {
+	CacheHits      int64 `json:"cache_hits"`
+	CacheMiss      int64 `json:"cache_miss"`
+	CacheHitBytes  int64 `json:"cache_hit_bytes"`
+	CacheMissBytes int64 `json:"cache_miss_bytes"`
+	// ObjectGetBytes vs CacheMissBytes: the excess is read amplification.
+	ObjectGetBytes int64 `json:"object_get_bytes"`
+	ObjectPutBytes int64 `json:"object_put_bytes"`
+	// MetaOps counts Redis round trips — the per-FILE cost that dominates a
+	// high-RTT link, and what --open-cache exists to avoid.
+	MetaOps int64 `json:"meta_ops"`
+}
+
+// RedisSnapshot reports metadata ROUND TRIPS — the cellular cost unit.
+//
+// Not bytes: go-redis hooks see commands rather than the wire, so any byte
+// figure would be an estimate presented as a measurement. Round trips are
+// exact and are what actually costs on a high-RTT link — a 2026-07-29 session
+// at ~500ms RTT spent 67 minutes of cumulative metadata wait against only 77
+// object GETs, all of it round trips.
+type RedisSnapshot struct {
+	Commands          int64 `json:"commands"`
+	Pipelines         int64 `json:"pipelines"`
+	PipelinedCommands int64 `json:"pipelined_commands"`
+	Dials             int64 `json:"dials"`
+	Errors            int64 `json:"errors"`
+	// RoundTrips = commands + pipelines + dials. Pipelined commands are NOT
+	// added: N commands in one pipeline cost ONE trip, and counting them
+	// individually would make pipelining look expensive when it is the fix.
+	RoundTrips int64 `json:"round_trips"`
+}
+
+// StallSnapshot reports live head-of-line blocking: how many NFS RPCs are in
+// flight right now, how old the oldest is, and how many JUKEBOX replies each op
+// has sent.
+//
+// WHY THIS IS REPORTED AT ALL: both numbers were already collected and neither
+// could be read. InflightStats' own doc comment claimed it was "exposed for the
+// metrics endpoint" — it was not; its only caller was the watchdog, which
+// speaks at >=22s. snapshotJukebox had exactly one caller too, a ~15s watchdog
+// log line, and this mount runs `mutejukebox`, so a JUKEBOX storm was invisible
+// to the user AND to /metrics.
+//
+// That is precisely backwards for the case it matters in. A JUKEBOX storm is
+// the mechanism behind Finder "error 100060": the client retries one logical op
+// until its ~40s soft-mount timeout. On a fast link the storm is over before a
+// 22s watchdog looks. On cellular the operator needs to see OldestAgeMs
+// climbing toward the client timeout WHILE it climbs, not in a log after the
+// user has already given up.
+//
+// Cost is one map copy plus one mutex acquisition per /metrics scrape. Nothing
+// is added to the RPC hot path.
+type StallSnapshot struct {
+	// Inflight is the number of NFS RPCs currently being served.
+	Inflight int `json:"inflight"`
+	// OldestOp / OldestAgeMs describe the longest-running one. An age that
+	// climbs monotonically past ~10s is the signature of the 2026-08-05
+	// watchdog panic (three reads hung ~10 min while WindowServer starved).
+	OldestOp    string `json:"oldest_op,omitempty"`
+	OldestAgeMs int64  `json:"oldest_age_ms"`
+	// JukeboxByOp counts JUKEBOX replies per op since start. The completed-RPC
+	// metrics count JUKEBOX as a SUCCESS (it is a valid NFS status, not an
+	// rpc_error), so these counters are the only place a storm is visible.
+	JukeboxByOp  map[string]int64 `json:"jukebox_by_op,omitempty"`
+	JukeboxTotal int64            `json:"jukebox_total"`
+}
+
+// FUSEDataGateSnapshot mirrors the FUSE data-syscall concurrency ceiling for
+// /metrics (nfs/fusedatagate.go).
+//
+// WHY THIS IS REPORTED AT ALL: the ceiling shipped in response to two kernel
+// panics on 2026-08-05, and until this hook existed it had ZERO readers — the
+// protection was unobservable in the field, so "is it engaging?", "is it
+// shedding real work?" and "is the kill switch set?" were all unanswerable
+// after an incident. A guard nobody can measure is a guard nobody can trust.
+//
+// Width is the CURRENT ceiling, not the configured one: the gate lowers itself
+// on slow/metered links, so width moving is expected and is itself the signal
+// that class-based narrowing engaged.
+type FUSEDataGateSnapshot struct {
+	// Enabled is false when JM_FUSE_DATA_GATE=0 disabled the ceiling. Reported
+	// explicitly so a zero InUse/Width is never mistaken for an idle gate.
+	Enabled bool `json:"enabled"`
+	// InUse is the number of FUSE data syscalls admitted and not yet released.
+	InUse int `json:"in_use"`
+	// Width is the ceiling in force right now (class-dependent).
+	Width int `json:"width"`
+	// Refusals counts admissions denied since boot. A rising count means the
+	// session is saturated and work is being shed — the intended behaviour,
+	// but also the number that should correlate with any user-visible stall.
+	Refusals int64 `json:"refusals"`
 }
 
 // HealthSnapshot is the JSON-friendly payload returned by /health.
@@ -376,6 +642,60 @@ func (r *Registry) SetNetworkProvider(fn func() *NetworkSnapshot) {
 	r.netMu.Lock()
 	defer r.netMu.Unlock()
 	r.netFn = fn
+}
+
+// SetFUSEDataGateProvider registers a callback used by /metrics to report the
+// FUSE data-syscall ceiling. Safe to leave unset (the field is then omitted).
+// package nfs registers this from an init() deliberately: the defect being
+// fixed here is an accessor that existed with no callers, and an init() cannot
+// be forgotten at a wiring site the way an explicit Set* call can.
+func (r *Registry) SetFUSEDataGateProvider(fn func() *FUSEDataGateSnapshot) {
+	r.dataGateMu.Lock()
+	defer r.dataGateMu.Unlock()
+	r.dataGateFn = fn
+}
+
+// SetRedisProvider registers a callback used by /metrics to report Redis
+// round trips. Safe to leave unset (the field is then omitted).
+func (r *Registry) SetRedisProvider(fn func() *RedisSnapshot) {
+	r.redisMu.Lock()
+	defer r.redisMu.Unlock()
+	r.redisFn = fn
+}
+
+// SetBackendProvider registers a callback used by /metrics to report
+// backend-vs-cache byte accounting. Safe to leave unset (the field is omitted).
+func (r *Registry) SetBackendProvider(fn func() *BackendSnapshot) {
+	r.backendMu.Lock()
+	defer r.backendMu.Unlock()
+	r.backendFn = fn
+}
+
+// SetStallProvider registers a callback used by /metrics to report live
+// in-flight RPCs and JUKEBOX totals. Safe to leave unset (the field is then
+// omitted). package internal/nfs registers this from an init() for the same
+// reason the data gate does: the defect being fixed is an accessor that existed
+// with no callers, and an init() cannot be forgotten at a wiring site.
+func (r *Registry) SetStallProvider(fn func() *StallSnapshot) {
+	r.stallMu.Lock()
+	defer r.stallMu.Unlock()
+	r.stallFn = fn
+}
+
+// SetKeyspaceProvider registers a callback used by /metrics to report keyspace
+// push health. Safe to leave unset (the field is then omitted).
+func (r *Registry) SetKeyspaceProvider(fn func() *KeyspaceSnapshot) {
+	r.keyspaceMu.Lock()
+	defer r.keyspaceMu.Unlock()
+	r.keyspaceFn = fn
+}
+
+// SetFDPoolProvider registers a callback used by /metrics to report descriptor
+// and memory-buffer occupancy. Safe to leave unset (the field is then omitted).
+func (r *Registry) SetFDPoolProvider(fn func() *FDPoolSnapshot) {
+	r.fdPoolMu.Lock()
+	defer r.fdPoolMu.Unlock()
+	r.fdPoolFn = fn
 }
 
 // histFor returns (and lazily creates) the histogram for an RPC type.
@@ -450,6 +770,17 @@ func (r *Registry) IncReadColdSubread() { r.readColdSubread.Add(1) }
 
 // IncReadWarmSubread records a FUSE subread served warm (local SSD block cache).
 func (r *Registry) IncReadWarmSubread() { r.readWarmSubread.Add(1) }
+
+// ObserveDirectSSDCacheHit records a complete, checksum-verified direct read.
+func (r *Registry) ObserveDirectSSDCacheHit(n int64) {
+	r.directSSDCacheHit.Add(1)
+	if n > 0 {
+		r.directSSDCacheHitBytes.Add(uint64(n))
+	}
+}
+
+// IncDirectSSDCacheMiss records a direct-cache attempt that safely fell back.
+func (r *Registry) IncDirectSSDCacheMiss() { r.directSSDCacheMiss.Add(1) }
 
 // IncReadQoSQueued records a read that found its QoS lane full and waited.
 func (r *Registry) IncReadQoSQueued() { r.readQoSQueued.Add(1) }
@@ -564,13 +895,14 @@ func (r *Registry) IncZeroTailSuspect() { r.zeroTailSuspect.Add(1) }
 
 // Snapshot is the JSON shape returned by /metrics.
 type Snapshot struct {
-	UptimeSec    int64  `json:"uptime_sec"`
-	RPCTotal     uint64 `json:"rpc_total"`
-	RPCErrors    uint64 `json:"rpc_errors"`
-	BytesRead    uint64 `json:"bytes_read"`
-	BytesWritten uint64 `json:"bytes_written"`
-	ReadRetries  uint64 `json:"read_retries"`
-	ReadFails    uint64 `json:"read_fails"`
+	UptimeSec         int64             `json:"uptime_sec"`
+	RPCTotal          uint64            `json:"rpc_total"`
+	RPCErrors         uint64            `json:"rpc_errors"`
+	BytesRead         uint64            `json:"bytes_read"`
+	BytesWritten      uint64            `json:"bytes_written"`
+	ReadRetries       uint64            `json:"read_retries"`
+	ReadFails         uint64            `json:"read_fails"`
+	AdmissionRefusals AdmissionSnapshot `json:"admission_refusals"`
 
 	// Nav-latency observability counters (WAVE 0). See NAV_LATENCY_DOSSIER §5.
 	ReaddirMirrorHit          uint64 `json:"readdir_mirror_hit"`
@@ -580,6 +912,9 @@ type Snapshot struct {
 	LookupNoent               uint64 `json:"lookup_noent"`
 	ReadColdSubread           uint64 `json:"read_cold_subread"`
 	ReadWarmSubread           uint64 `json:"read_warm_subread"`
+	DirectSSDCacheHit         uint64 `json:"direct_ssd_cache_hit"`
+	DirectSSDCacheHitBytes    uint64 `json:"direct_ssd_cache_hit_bytes"`
+	DirectSSDCacheMiss        uint64 `json:"direct_ssd_cache_miss"`
 	ReadQoSQueued             uint64 `json:"read_qos_queued"`
 	ReadQoSFailOpen           uint64 `json:"read_qos_fail_open"`
 	ReadQoSPrefetchShed       uint64 `json:"read_qos_prefetch_shed"`
@@ -612,8 +947,37 @@ type Snapshot struct {
 	// hole(s) below their written size (drained full-size with zero tails).
 	ZeroTailSuspect uint64 `json:"zero_tail_suspect_total"`
 
-	RPCs    map[string]RPCSnapshot `json:"rpcs"`
-	Network *NetworkSnapshot       `json:"network,omitempty"`
+	// FUSE metadata attribution: WHO issued each bounded FUSE metadata
+	// syscall, what it cost, how much of that was queueing for a gate, and
+	// how saturated the three gates got. See fuse_attrib.go.
+	FUSEAttrib FUSEAttribSnapshot `json:"fuse_attrib"`
+
+	RPCs map[string]RPCSnapshot `json:"rpcs"`
+	// RPCBucketBoundsUs are the upper bounds, in microseconds, of every
+	// RPCSnapshot.Buckets array. Emitted once, not per RPC type.
+	RPCBucketBoundsUs []float64        `json:"rpc_bucket_bounds_us,omitempty"`
+	Network           *NetworkSnapshot `json:"network,omitempty"`
+
+	// FUSEDataGate reports the post-panic concurrency ceiling. See
+	// FUSEDataGateSnapshot.
+	FUSEDataGate *FUSEDataGateSnapshot `json:"fuse_data_gate,omitempty"`
+
+	// FDPool reports descriptor + memory-buffer occupancy. See FDPoolSnapshot.
+	FDPool *FDPoolSnapshot `json:"fd_pool,omitempty"`
+
+	// Keyspace reports whether Redis keyspace push is delivering. See
+	// KeyspaceSnapshot.
+	Keyspace *KeyspaceSnapshot `json:"keyspace,omitempty"`
+
+	// Stall reports live head-of-line blocking. See StallSnapshot.
+	Stall *StallSnapshot `json:"stall,omitempty"`
+
+	// Backend reports bytes that actually crossed to the object store, versus
+	// bytes served from the local block cache. See BackendSnapshot.
+	Backend *BackendSnapshot `json:"backend,omitempty"`
+
+	// Redis reports metadata round trips. See RedisSnapshot.
+	Redis *RedisSnapshot `json:"redis,omitempty"`
 }
 
 // RPCSnapshot is the per-RPC JSON shape.
@@ -624,18 +988,34 @@ type RPCSnapshot struct {
 	P50Us  float64 `json:"p50_us"`
 	P95Us  float64 `json:"p95_us"`
 	P99Us  float64 `json:"p99_us"`
+
+	// Buckets is the raw latency histogram, counts per bucket, with bounds in
+	// the snapshot's RPCBucketBoundsUs. It is here so a caller can SUBTRACT two
+	// snapshots and get percentiles over just the interval between them.
+	//
+	// Every other field here is cumulative over process lifetime, which makes
+	// them unusable for measuring a change: once a process has served tens of
+	// thousands of RPCs a lifetime mean or percentile barely moves, and that
+	// inertia reads as stability. On 2026-08-19 a comparison of candidate
+	// instruments scored lifetime p95 as the steadiest of all, 1.03x spread
+	// across eight runs — which was not stability. Nearly every sample sat
+	// inside the single 20ms–50ms bucket, so p95 was reporting an interpolated
+	// bucket boundary that could not move. Deltas of these counts have no such
+	// inertia, and are exact rather than interpolated.
+	Buckets []uint64 `json:"buckets,omitempty"`
 }
 
 // Snapshot builds a self-contained metrics view.
 func (r *Registry) Snapshot() Snapshot {
 	out := Snapshot{
-		UptimeSec:    int64(time.Since(r.startedAt).Seconds()),
-		RPCTotal:     r.rpcTotal.Load(),
-		RPCErrors:    r.rpcErrors.Load(),
-		BytesRead:    r.bytesRead.Load(),
-		BytesWritten: r.bytesWrite.Load(),
-		ReadRetries:  r.readRetries.Load(),
-		ReadFails:    r.readFails.Load(),
+		UptimeSec:         int64(time.Since(r.startedAt).Seconds()),
+		RPCTotal:          r.rpcTotal.Load(),
+		RPCErrors:         r.rpcErrors.Load(),
+		BytesRead:         r.bytesRead.Load(),
+		BytesWritten:      r.bytesWrite.Load(),
+		ReadRetries:       r.readRetries.Load(),
+		ReadFails:         r.readFails.Load(),
+		AdmissionRefusals: r.snapshotAdmissionRefusals(),
 
 		ReaddirMirrorHit:          r.readdirMirrorHit.Load(),
 		ReaddirEmptyRefill:        r.readdirEmptyRefill.Load(),
@@ -644,6 +1024,9 @@ func (r *Registry) Snapshot() Snapshot {
 		LookupNoent:               r.lookupNoent.Load(),
 		ReadColdSubread:           r.readColdSubread.Load(),
 		ReadWarmSubread:           r.readWarmSubread.Load(),
+		DirectSSDCacheHit:         r.directSSDCacheHit.Load(),
+		DirectSSDCacheHitBytes:    r.directSSDCacheHitBytes.Load(),
+		DirectSSDCacheMiss:        r.directSSDCacheMiss.Load(),
 		ReadQoSQueued:             r.readQoSQueued.Load(),
 		ReadQoSFailOpen:           r.readQoSFailOpen.Load(),
 		ReadQoSPrefetchShed:       r.readQoSPrefetchShed.Load(),
@@ -670,7 +1053,10 @@ func (r *Registry) Snapshot() Snapshot {
 
 		ZeroTailSuspect: r.zeroTailSuspect.Load(),
 
-		RPCs: make(map[string]RPCSnapshot, len(trackedTypes)),
+		FUSEAttrib: r.snapshotFUSEAttrib(),
+
+		RPCs:              make(map[string]RPCSnapshot, len(trackedTypes)),
+		RPCBucketBoundsUs: append([]float64(nil), histBuckets[:]...),
 	}
 
 	r.netMu.RLock()
@@ -678,6 +1064,48 @@ func (r *Registry) Snapshot() Snapshot {
 	r.netMu.RUnlock()
 	if netFn != nil {
 		out.Network = netFn()
+	}
+
+	r.dataGateMu.RLock()
+	dataGateFn := r.dataGateFn
+	r.dataGateMu.RUnlock()
+	if dataGateFn != nil {
+		out.FUSEDataGate = dataGateFn()
+	}
+
+	r.redisMu.RLock()
+	redisFn := r.redisFn
+	r.redisMu.RUnlock()
+	if redisFn != nil {
+		out.Redis = redisFn()
+	}
+
+	r.backendMu.RLock()
+	backendFn := r.backendFn
+	r.backendMu.RUnlock()
+	if backendFn != nil {
+		out.Backend = backendFn()
+	}
+
+	r.stallMu.RLock()
+	stallFn := r.stallFn
+	r.stallMu.RUnlock()
+	if stallFn != nil {
+		out.Stall = stallFn()
+	}
+
+	r.fdPoolMu.RLock()
+	fdPoolFn := r.fdPoolFn
+	r.fdPoolMu.RUnlock()
+	if fdPoolFn != nil {
+		out.FDPool = fdPoolFn()
+	}
+
+	r.keyspaceMu.RLock()
+	keyspaceFn := r.keyspaceFn
+	r.keyspaceMu.RUnlock()
+	if keyspaceFn != nil {
+		out.Keyspace = keyspaceFn()
 	}
 
 	r.histsMu.RLock()
@@ -712,12 +1140,13 @@ func makeRPCSnapshot(s histogramSnapshot) RPCSnapshot {
 	}
 	mean := float64(s.SumUs) / float64(s.Count)
 	return RPCSnapshot{
-		Count:  s.Count,
-		MeanUs: mean,
-		MaxUs:  s.MaxUs,
-		P50Us:  s.percentileUs(0.50),
-		P95Us:  s.percentileUs(0.95),
-		P99Us:  s.percentileUs(0.99),
+		Count:   s.Count,
+		MeanUs:  mean,
+		MaxUs:   s.MaxUs,
+		P50Us:   s.percentileUs(0.50),
+		P95Us:   s.percentileUs(0.95),
+		P99Us:   s.percentileUs(0.99),
+		Buckets: append([]uint64(nil), s.Buckets[:]...),
 	}
 }
 
@@ -726,12 +1155,20 @@ type Server struct {
 	registry *Registry
 	addr     string
 	listener net.Listener
-	httpSrv  *http.Server
+	// listener6 is the companion ::1 listener. See Start: a client resolving
+	// "localhost" gets ::1 FIRST on macOS, so an IPv4-only bind is refused for
+	// any client that does not fall back.
+	listener6 net.Listener
+	httpSrv   *http.Server
 
 	// ExtraRoutes lets callers (e.g. cbridge) register additional handlers
 	// on the same listener — Pin/Unpin/CacheStatus/Offline endpoints live
 	// here. Set BEFORE calling Start().
 	ExtraRoutes map[string]http.HandlerFunc
+	// mux is set once Start() builds the serve mux; RegisterRoutes adds
+	// handlers to a LIVE listener safely (Go 1.22+ ServeMux is concurrency-safe).
+	mux *http.ServeMux
+	ru  sync.Mutex
 }
 
 // NewServer creates a metrics HTTP server bound to addr (e.g. 127.0.0.1:11050).
@@ -753,8 +1190,8 @@ func (s *Server) Addr() string {
 
 // Start binds the listener and serves on a background goroutine.
 func (s *Server) Start() error {
-	if s.addr == "" {
-		return fmt.Errorf("metrics: empty address")
+	if err := validateLoopbackListenAddr(s.addr); err != nil {
+		return err
 	}
 	l, err := net.Listen("tcp", s.addr)
 	if err != nil {
@@ -762,28 +1199,126 @@ func (s *Server) Start() error {
 	}
 	s.listener = l
 
-	mux := http.NewServeMux()
+	s.ru.Lock()
+	s.mux = http.NewServeMux()
+	mux := s.mux
 	mux.HandleFunc("/metrics", s.handleMetrics)
 	mux.HandleFunc("/health", s.handleHealth)
 	for path, h := range s.ExtraRoutes {
 		mux.HandleFunc(path, h)
 	}
 	mux.HandleFunc("/", s.handleIndex) // catch-all last
+	s.ru.Unlock()
 
 	s.httpSrv = &http.Server{
-		Handler:           mux,
+		Handler:           controlRequestGuard(strconv.Itoa(l.Addr().(*net.TCPAddr).Port), mux),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	go func() {
 		_ = s.httpSrv.Serve(l)
 	}()
+
+	// ALSO BIND IPv6 LOOPBACK.
+	//
+	// macOS resolves "localhost" to ::1 BEFORE 127.0.0.1. This server bound
+	// IPv4 only, so a client that connects to the first resolved address and
+	// does not fall back gets ECONNREFUSED and concludes the control plane is
+	// down — while curl, which does fall back, reports it perfectly healthy.
+	// Measured 2026-08-04: http://[::1]:11050 refused, http://127.0.0.1:11050
+	// 200, and that is the shape of a consumer reporting "no success" against a
+	// control plane that answers fine from a shell.
+	//
+	// Loopback ONLY, deliberately: this is a second loopback family, NOT a
+	// widening of exposure. The control plane is unauthenticated and must never
+	// be reachable off-box.
+	//
+	// Best-effort: a machine with IPv6 disabled must still start. The IPv4
+	// listener above remains the one whose failure is fatal.
+	// Port comes from the BOUND listener, not from s.addr: with an ephemeral
+	// ":0" the configured port is 0, so deriving from s.addr would put the ::1
+	// listener on a DIFFERENT random port than the IPv4 one — the companion
+	// would exist and still not answer where the client is looking.
+	if host, _, perr := net.SplitHostPort(s.addr); perr == nil && isLoopbackHost(host) {
+		boundPort := strconv.Itoa(l.Addr().(*net.TCPAddr).Port)
+		if l6, e6 := net.Listen("tcp6", net.JoinHostPort("::1", boundPort)); e6 == nil {
+			s.listener6 = l6
+			go func() {
+				_ = s.httpSrv.Serve(l6)
+			}()
+		}
+	}
 	return nil
+}
+
+// validateLoopbackListenAddr rejects remote or ambiguous binds before net.Listen.
+// The same unauthenticated listener carries both metrics and control routes.
+func validateLoopbackListenAddr(addr string) error {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil || !isLoopbackHost(host) {
+		return fmt.Errorf("metrics: listen address must use an explicit loopback IP and numeric port: %q", addr)
+	}
+	if _, err := strconv.ParseUint(port, 10, 16); err != nil {
+		return fmt.Errorf("metrics: listen address must use an explicit loopback IP and numeric port: %q", addr)
+	}
+	return nil
+}
+
+// isLoopbackHost accepts only literal loopback addresses without zones or
+// IPv4-mapped IPv6 aliases.
+func isLoopbackHost(host string) bool {
+	ip, err := netip.ParseAddr(host)
+	return err == nil && ip.Zone() == "" && !ip.Is4In6() && ip.IsLoopback()
+}
+
+// controlRequestGuard protects every route, including ones registered after
+// Start. Loopback binding alone does not prevent browser CSRF or DNS rebinding.
+func controlRequestGuard(boundPort string, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		host, port, err := net.SplitHostPort(r.Host)
+		if err != nil || !(isLoopbackHost(host) || strings.EqualFold(host, "localhost")) || port != boundPort {
+			http.Error(w, "forbidden host", http.StatusForbidden)
+			return
+		}
+
+		fetchSite := r.Header.Values("Sec-Fetch-Site")
+		if len(fetchSite) > 1 {
+			http.Error(w, "forbidden request site", http.StatusForbidden)
+			return
+		}
+		if len(fetchSite) == 1 {
+			switch strings.ToLower(strings.TrimSpace(fetchSite[0])) {
+			case "none", "same-origin":
+			default:
+				http.Error(w, "forbidden request site", http.StatusForbidden)
+				return
+			}
+		}
+
+		origins := r.Header.Values("Origin")
+		if len(origins) > 1 || (len(origins) == 1 && !sameControlOrigin(origins[0], host, port)) {
+			http.Error(w, "forbidden origin", http.StatusForbidden)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func sameControlOrigin(raw, host, port string) bool {
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme != "http" || u.User != nil || u.Opaque != "" ||
+		u.Path != "" || u.RawQuery != "" || u.Fragment != "" || u.ForceQuery {
+		return false
+	}
+	return strings.EqualFold(u.Hostname(), host) && u.Port() == port
 }
 
 // Stop closes the HTTP server and listener.
 func (s *Server) Stop() {
 	if s.httpSrv != nil {
-		_ = s.httpSrv.Close()
+		_ = s.httpSrv.Close() // closes every listener it is serving, incl. ::1
+	}
+	if s.listener6 != nil {
+		_ = s.listener6.Close()
 	}
 }
 
@@ -803,8 +1338,10 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	if fn != nil {
 		snap = fn()
 	} else {
-		// No provider yet — assume healthy if the server is up.
-		snap = HealthSnapshot{Healthy: true}
+		// No provider yet — we're still starting up. Report unhealthy so
+		// consumers (menu bar) show "starting" instead of prematurely
+		// claiming healthy before any subsystem has been checked.
+		snap = HealthSnapshot{Healthy: false, Reason: "starting"}
 	}
 	// Never emit a null or absent `components`: a nil Go map marshals to JSON
 	// null, which makes the Swift HealthProbe decoder throw valueNotFound and
@@ -841,4 +1378,25 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "text/plain")
 	_, _ = fmt.Fprint(w, "JuiceMount metrics\n  /metrics\n  /health\n")
+}
+
+// RegisterRoutes attaches additional handlers. Safe BEFORE Start (routes are
+// picked up when the mux is built) and AFTER (Go 1.22+ ServeMux allows
+// concurrent registration on a serving mux). Exists so the control plane can
+// start FIRST at boot — before slow subsystems it reports on — and still gain
+// its full route table once those subsystems finish wiring.
+func (s *Server) RegisterRoutes(routes map[string]http.HandlerFunc) {
+	s.ru.Lock()
+	defer s.ru.Unlock()
+	if s.ExtraRoutes == nil {
+		s.ExtraRoutes = make(map[string]http.HandlerFunc, len(routes))
+	}
+	for path, h := range routes {
+		s.ExtraRoutes[path] = h
+	}
+	if s.mux != nil {
+		for path, h := range routes {
+			s.mux.HandleFunc(path, h)
+		}
+	}
 }

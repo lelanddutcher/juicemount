@@ -13,7 +13,33 @@ func newTestStore(t *testing.T) *Store {
 		t.Fatalf("Open: %v", err)
 	}
 	t.Cleanup(func() { s.Close() })
+	if err := s.SetReadyValidator(func(e Entry) bool { return len(e.Authority) != 0 }); err != nil {
+		t.Fatal(err)
+	}
 	return s
+}
+
+func markTestPinReady(t *testing.T, s *Store, path string) Entry {
+	t.Helper()
+	e, ok := s.Get(path)
+	if !ok {
+		t.Fatalf("missing pin %q", path)
+	}
+	claimed, ok, err := s.ClaimPrefetch(*e)
+	if err != nil || !ok {
+		t.Fatalf("claim %q: %v %v", path, ok, err)
+	}
+	authority := []byte("unit-owned-witness")
+	changed, err := s.CompleteReady(claimed, authority)
+	if err != nil || !changed {
+		t.Fatalf("complete %q: %v %v", path, changed, err)
+	}
+	claimed.Authority = authority
+	admitted, err := s.AdmitReady(claimed)
+	if err != nil || !admitted {
+		t.Fatalf("admit %q: %v %v", path, admitted, err)
+	}
+	return claimed
 }
 
 func TestPinAndQuery(t *testing.T) {
@@ -92,9 +118,10 @@ func TestUnpinByRoot(t *testing.T) {
 func TestUpdateStatus(t *testing.T) {
 	s := newTestStore(t)
 	s.Pin("/x", 100, "/")
-	if err := s.UpdateStatus("/x", StatusReady, 100, ""); err != nil {
-		t.Fatal(err)
+	if err := s.UpdateStatus("/x", StatusReady, 100, ""); err == nil {
+		t.Fatal("path-only Ready unexpectedly accepted")
 	}
+	markTestPinReady(t, s, "/x")
 	all, _ := s.All()
 	if all[0].Status != StatusReady {
 		t.Errorf("status = %v", all[0].Status)
@@ -109,9 +136,9 @@ func TestStaleQuery(t *testing.T) {
 	s.Pin("/old", 1, "/")
 	s.Pin("/new", 1, "/")
 	// Mark both as ready, but old's last_prefetched is now-stale
-	s.UpdateStatus("/old", StatusReady, 1, "")
+	markTestPinReady(t, s, "/old")
 	time.Sleep(50 * time.Millisecond)
-	s.UpdateStatus("/new", StatusReady, 1, "")
+	markTestPinReady(t, s, "/new")
 
 	stale, err := s.Stale(25*time.Millisecond, 10)
 	if err != nil {
@@ -130,7 +157,7 @@ func TestPinRoots(t *testing.T) {
 	s.Pin("/a/1", 100, "/a")
 	s.Pin("/a/2", 200, "/a")
 	s.Pin("/b/1", 300, "/b")
-	s.UpdateStatus("/a/1", StatusReady, 100, "")
+	markTestPinReady(t, s, "/a/1")
 	roots, err := s.PinRoots()
 	if err != nil {
 		t.Fatal(err)
@@ -161,7 +188,7 @@ func TestAggregateStats(t *testing.T) {
 	s.Pin("/a", 100, "/")
 	s.Pin("/b", 200, "/")
 	s.Pin("/c", 300, "/")
-	s.UpdateStatus("/a", StatusReady, 100, "")
+	markTestPinReady(t, s, "/a")
 	s.UpdateStatus("/b", StatusFailed, 0, "boom")
 
 	a, err := s.AggregateStats()
@@ -197,13 +224,7 @@ func TestStatusString(t *testing.T) {
 	}
 }
 
-// TestIsPinnedReadyWindow exercises the four states the offline-mode open
-// gate has to handle:
-//   - Pending: known-not-cached → must refuse (otherwise we re-introduce
-//     the FUSE-to-backend stall the gate exists to prevent)
-//   - Prefetching with bytes_cached < size: in flight → refuse
-//   - Prefetching with bytes_cached >= size: late-Ready window → allow
-//   - Ready: full hit → allow
+// Ready is admitted only after a durable producer witness and local validator.
 func TestIsPinnedReadyWindow(t *testing.T) {
 	s := newTestStore(t)
 
@@ -222,17 +243,19 @@ func TestIsPinnedReadyWindow(t *testing.T) {
 		t.Error("half-cached Prefetching should not be considered ready")
 	}
 
-	// Late-Ready: 100% cached but status row not yet updated.
-	// This is the race the offline-toggle would otherwise hit.
+	// A full byte count cannot make an in-flight job authoritative.
 	_ = s.UpdateStatus("/Volumes/zpool/a.mov", StatusPrefetching, 1000, "")
-	if !s.IsPinnedReady("/Volumes/zpool/a.mov") {
-		t.Error("fully-cached Prefetching should be allowed (late-Ready window)")
+	if s.IsPinnedReady("/Volumes/zpool/a.mov") {
+		t.Error("bytes-only Prefetching admitted")
 	}
 
-	// Final state.
-	_ = s.UpdateStatus("/Volumes/zpool/a.mov", StatusReady, 1000, "")
+	if err := s.UpdateStatus("/Volumes/zpool/a.mov", StatusReady, 1000, ""); err == nil {
+		t.Error("generic Ready publication accepted")
+	}
+	// The test producer publishes a witness and admits this exact generation.
+	markTestPinReady(t, s, "/Volumes/zpool/a.mov")
 	if !s.IsPinnedReady("/Volumes/zpool/a.mov") {
-		t.Error("Ready file should always be allowed")
+		t.Error("verified witness was not admitted")
 	}
 
 	// Failed → refuse.
@@ -278,7 +301,7 @@ func TestStripMountPrefix(t *testing.T) {
 		{"/Volumes/zpool/", "/Volumes/zpool/foo", "foo"}, // trailing slash tolerated
 		{"/Volumes/storage", "/Volumes/storage/clip.mov", "clip.mov"},
 		{"/Volumes/storage", "/Volumes/zpool/foo", "/Volumes/zpool/foo"}, // mismatch passthrough
-		{"", "/Volumes/zpool/foo", "foo"}, // empty falls back to legacy default
+		{"", "/Volumes/zpool/foo", "foo"},                                // empty falls back to legacy default
 	}
 	for _, tc := range cases {
 		p := &Prefetcher{mountPoint: tc.mount}

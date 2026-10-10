@@ -3,7 +3,34 @@ package main
 import (
 	"testing"
 	"time"
+
+	"github.com/lelanddutcher/juicemount/internal/cache/pin"
 )
+
+func TestDefaultEvictionWatchJoinsPrefetcherStop(t *testing.T) {
+	t.Setenv("JM_EVICTION_WATCH", "1")
+	store, err := pin.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := pin.NewPrefetcher(store, t.TempDir(), "/Volumes/zpool", 1)
+	t.Cleanup(func() {
+		if !p.StopWithin(time.Second) {
+			t.Error("eviction watch did not join before store cleanup")
+		}
+		_ = store.Close()
+	})
+	entered := make(chan struct{})
+	// This is the default-enabled production Go registration and context.
+	p.Go(func() {
+		close(entered)
+		evictionWatchLoop(p.Context(), p)
+	})
+	<-entered
+	if !p.StopWithin(time.Second) {
+		t.Fatal("default eviction watcher outlived prefetcher stop")
+	}
+}
 
 // TestEvictionRepairDecision pins the trigger contract: a large usage drop on
 // a fast link, in-capacity, past cooldown → repair; every guard suppresses.

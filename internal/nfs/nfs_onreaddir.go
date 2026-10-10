@@ -10,6 +10,7 @@ import (
 	"os"
 	"path"
 	"sort"
+	"strings"
 
 	"github.com/willscott/go-nfs-client/nfs/xdr"
 
@@ -58,8 +59,7 @@ func onReadDir(ctx context.Context, w *response, userHandle Handler) error {
 	entities := make([]readDirEntity, 0)
 	maxBytes := uint32(100) // conservative overhead measure
 
-	started := obj.Cookie == 0
-	if started {
+	if obj.Cookie == 0 {
 		// add '.' and '..' to entities
 		dotdotFileID := uint64(0)
 		if len(p) > 0 {
@@ -81,26 +81,23 @@ func onReadDir(ctx context.Context, w *response, userHandle Handler) error {
 
 	eof := true
 	maxEntities := userHandle.HandleLimit() / 2
-	for i, c := range contents {
+	for i := readDirStartIndex(obj.Cookie, len(contents)); i < len(contents); i++ {
+		c := contents[i]
 		// cookie equates to index within contents + 2 (for '.' and '..')
 		cookie := uint64(i + 2)
-		if started {
-			maxBytes += readDirEntryMaxBytes(c.Name())
-			if maxBytes > obj.Count || len(entities) > maxEntities {
-				eof = false
-				break
-			}
-
-			attrs := ToFileAttribute(c, path.Join(append(p, c.Name())...))
-			entities = append(entities, readDirEntity{
-				FileID: attrs.Fileid,
-				Name:   []byte(c.Name()),
-				Cookie: cookie,
-				Next:   true,
-			})
-		} else if cookie == obj.Cookie {
-			started = true
+		maxBytes += readDirEntryMaxBytes(c.Name())
+		if maxBytes > obj.Count || len(entities) > maxEntities {
+			eof = false
+			break
 		}
+
+		attrs := ToFileAttribute(c, path.Join(append(p, c.Name())...))
+		entities = append(entities, readDirEntity{
+			FileID: attrs.Fileid,
+			Name:   []byte(c.Name()),
+			Cookie: cookie,
+			Next:   true,
+		})
 	}
 
 	writer := bytes.NewBuffer([]byte{})
@@ -171,9 +168,7 @@ func getDirListingWithVerifier(userHandle Handler, fsHandle []byte, verifier uin
 		return nil, 0, &NFSStatusError{NFSStatusNotDir, err}
 	}
 
-	sort.Slice(contents, func(i, j int) bool {
-		return contents[i].Name() < contents[j].Name()
-	})
+	orderReadDirEntries(contents)
 
 	if vh, ok := userHandle.(CachingHandler); ok {
 		// let the user handler make a verifier if it can.
@@ -185,13 +180,121 @@ func getDirListingWithVerifier(userHandle Handler, fsHandle []byte, verifier uin
 	return contents, id, nil
 }
 
+// readdirEntryLess keeps each macOS AppleDouble sidecar immediately after its
+// principal entry ("clip.mov", then "._clip.mov") instead of grouping every
+// sidecar at the front of a large directory. Real Finder enumeration of 5,000
+// principal+sidecar pairs otherwise issued ~5,000 redundant LOOKUPs plus ~1,700
+// GETATTRs after a fast READDIRPLUS, pushing a cached listing above 400ms even
+// though the server's READDIRPLUS itself stayed below 50ms. Pairing is applied
+// here, at the protocol layer's final authoritative sort; sorting in a backing
+// Handler is insufficient because this function sorts the result again.
+//
+// Default-on with an explicit rollback switch. The set of names and stable
+// lexical ordering of unrelated groups are unchanged; only a principal and its
+// own `._` companion become adjacent.
+func readdirEntryLess(a, b string) bool {
+	if os.Getenv("JM_READDIR_PAIR_APPLEDOUBLE") == "0" {
+		return a < b
+	}
+	ka, sa := appleDoubleSortKey(a)
+	kb, sb := appleDoubleSortKey(b)
+	if ka != kb {
+		return ka < kb
+	}
+	if sa != sb {
+		return !sa // principal before its sidecar
+	}
+	return a < b
+}
+
+func appleDoubleSortKey(name string) (key string, sidecar bool) {
+	if strings.HasPrefix(name, "._") && len(name) > 2 {
+		return name[2:], true
+	}
+	return name, false
+}
+
+// orderReadDirEntries applies the AppleDouble pairing order in linear time.
+// billy.Filesystem.ReadDir's contract already requires lexical filename order;
+// JuiceMount's RAM and SQLite paths both honor it. The previous protocol layer
+// sorted the full listing a second time with readdirEntryLess, adding another
+// O(n log n) pass to every first READDIR page (10,000 entries for the 5,000-file
+// Finder fixture). Split the already-lexical input into two already-sorted runs
+// and merge them by principal key instead. The defensive IsSorted check keeps
+// third-party/test handlers correct without charging the normal path more than
+// one O(n) scan.
+func orderReadDirEntries(contents []fs.FileInfo) {
+	if len(contents) < 2 {
+		return
+	}
+	lexical := func(i, j int) bool { return contents[i].Name() < contents[j].Name() }
+	if !sort.SliceIsSorted(contents, lexical) {
+		sort.Slice(contents, lexical)
+	}
+	if os.Getenv("JM_READDIR_PAIR_APPLEDOUBLE") == "0" {
+		return
+	}
+
+	principals := make([]fs.FileInfo, 0, len(contents))
+	sidecars := make([]fs.FileInfo, 0, len(contents)/2)
+	for _, entry := range contents {
+		if _, sidecar := appleDoubleSortKey(entry.Name()); sidecar {
+			sidecars = append(sidecars, entry)
+		} else {
+			principals = append(principals, entry)
+		}
+	}
+
+	ordered := make([]fs.FileInfo, 0, len(contents))
+	for pi, si := 0, 0; pi < len(principals) || si < len(sidecars); {
+		if pi == len(principals) {
+			ordered = append(ordered, sidecars[si:]...)
+			break
+		}
+		if si == len(sidecars) {
+			ordered = append(ordered, principals[pi:]...)
+			break
+		}
+		principalKey := principals[pi].Name()
+		sidecarKey, _ := appleDoubleSortKey(sidecars[si].Name())
+		switch {
+		case principalKey < sidecarKey:
+			ordered = append(ordered, principals[pi])
+			pi++
+		case sidecarKey < principalKey:
+			ordered = append(ordered, sidecars[si])
+			si++
+		default:
+			ordered = append(ordered, principals[pi], sidecars[si])
+			pi++
+			si++
+		}
+	}
+	copy(contents, ordered)
+}
+
+// readDirStartIndex converts the last cookie acknowledged by the client into
+// the first content index to emit on the continuation page. Cookies 0 and 1
+// name the synthetic dot entries; content index i has cookie i+2. Jumping here
+// is load-bearing for large directories: rescanning from index zero for every
+// page made a 5,000-entry warm/offline listing quadratic (~520 ms locally).
+func readDirStartIndex(cookie uint64, contentLen int) int {
+	if cookie <= 1 {
+		return 0
+	}
+	next := cookie - 1
+	if next >= uint64(contentLen) {
+		return contentLen
+	}
+	return int(next)
+}
+
 // readDirAccurateSizing gates C11: accurate per-entry READDIR size estimation.
-// OFF (default) preserves the historical flat 512-byte/entry over-estimate,
-// which breaks the READDIR page after ~15 entries regardless of the client's
-// Count and forces many small round-trips — marginal on a µs-RTT LAN, real on a
-// high-RTT cellular link. Enable with JM_READDIR_ACCURATE_SIZING=1 after the
-// live big-dir completeness check passes.
-func readDirAccurateSizing() bool { return os.Getenv("JM_READDIR_ACCURATE_SIZING") == "1" }
+// ON by default after the live 5,000-entry completeness/custody gate. The old
+// flat 512-byte estimate broke pages after only a handful of short names and
+// multiplied high-RTT cellular round trips. JM_READDIR_ACCURATE_SIZING=0 is the
+// rollback switch.
+func readDirAccurateSizing() bool { return os.Getenv("JM_READDIR_ACCURATE_SIZING") != "0" }
 
 // readDirEntryMaxBytes returns a CONSERVATIVE upper bound on the XDR-encoded
 // size of one readDirEntity — FileID(8) + Name(4+padded) + Cookie(8) + Next(4)
@@ -207,8 +310,8 @@ func readDirEntryMaxBytes(name string) uint32 {
 		return 512
 	}
 	nameLen := uint32(len(name))
-	namePadded := (nameLen + 3) &^ 3          // XDR pads names to a 4-byte boundary
-	return 8 + 4 + namePadded + 8 + 4 + 8     // FileID + NameLen + name + Cookie + Next + margin
+	namePadded := (nameLen + 3) &^ 3      // XDR pads names to a 4-byte boundary
+	return 8 + 4 + namePadded + 8 + 4 + 8 // FileID + NameLen + name + Cookie + Next + margin
 }
 
 func hashPathAndContents(path string, contents []fs.FileInfo) uint64 {

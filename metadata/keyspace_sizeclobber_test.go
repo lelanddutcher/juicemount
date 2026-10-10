@@ -24,6 +24,7 @@ func TestReconcileChildSizeClobberFix(t *testing.T) {
 		"proj/clip.mp4":  {Path: "proj/clip.mp4", Inode: 11, Size: 444416879, Mtime: now},
 		"proj/empty.txt": {Path: "proj/empty.txt", Inode: 12, Size: 4096, Mtime: now},
 		"proj/grown.mov": {Path: "proj/grown.mov", Inode: 13, Size: 100, Mtime: now},
+		"proj/replaced.wav": {Path: "proj/replaced.wav", Inode: 16, Size: 8192, Mtime: now},
 	}
 	lookup := func(p string) *Entry { return known[p] }
 
@@ -33,11 +34,14 @@ func TestReconcileChildSizeClobberFix(t *testing.T) {
 		{inode: 13, childPath: "proj/grown.mov"},        // attr OK, size changed
 		{inode: 14, childPath: "proj/new.wav"},          // NEW child, attr failed
 		{inode: 15, childPath: "proj/sub", isDir: true}, // NEW dir
+		{inode: 17, childPath: "proj/replaced.wav"},    // REPLACED child, attr failed
+		{inode: 18, childPath: "proj/short.mov"},       // NEW child, short attr
 	}
 	attrs := map[uint64][]byte{
 		12: encodeTestAttr(now.Unix(), 0),
 		13: encodeTestAttr(now.Unix(), 999),
 		15: encodeTestAttr(now.Unix(), 0),
+		18: []byte{1, 2, 3},
 	}
 
 	toUpsert, newDirs := buildReconcileChildEntries(children, attrs, lookup)
@@ -58,9 +62,12 @@ func TestReconcileChildSizeClobberFix(t *testing.T) {
 	if e := byPath["proj/grown.mov"]; e == nil || e.Size != 999 {
 		t.Fatalf("size change lost: %+v", e)
 	}
-	// A new child with a failed attr still inserts (size 0, heals later).
-	if e := byPath["proj/new.wav"]; e == nil || e.Size != 0 {
-		t.Fatalf("new failed-attr child not inserted: %+v", e)
+	// An unreadable new or replaced file has no trustworthy size. Neither
+	// may publish a fabricated zero or pair a new inode with the old size.
+	for _, p := range []string{"proj/new.wav", "proj/replaced.wav", "proj/short.mov"} {
+		if e := byPath[p]; e != nil {
+			t.Errorf("failed-attr file %s was upserted: %+v", p, e)
+		}
 	}
 	// New dir collected for the B4' requeue.
 	if len(newDirs) != 1 || newDirs[0] != 15 {

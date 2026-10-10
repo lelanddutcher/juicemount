@@ -6,6 +6,7 @@ import ServiceManagement
 enum LoginItemManager {
 
     static func setEnabled(_ enabled: Bool) {
+        guard AppIsolation.active == nil else { return }
         let service = SMAppService.mainApp
         do {
             if enabled {
@@ -21,6 +22,7 @@ enum LoginItemManager {
     }
 
     static var isEnabled: Bool {
-        SMAppService.mainApp.status == .enabled
+        if AppIsolation.active != nil { return false }
+        return SMAppService.mainApp.status == .enabled
     }
 }

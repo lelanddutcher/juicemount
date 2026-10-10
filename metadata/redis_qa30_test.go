@@ -19,7 +19,7 @@ func TestInternalFromMounted(t *testing.T) {
 	cases := []struct{ in, want string }{
 		{"/Volumes/zpool/Film Projects/X.MP4", "Film Projects/X.MP4"},
 		{"/Volumes/zpool", ""},
-		{"/Volumes/zpool/", ""},                       // trailing slash on mp; arrives as just mp
+		{"/Volumes/zpool/", ""}, // trailing slash on mp; arrives as just mp
 		{"/Volumes/something-else/y", "/Volumes/something-else/y"}, // no prefix → unchanged
 		{"already-internal/x", "already-internal/x"},
 	}

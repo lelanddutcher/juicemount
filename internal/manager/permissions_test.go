@@ -25,10 +25,10 @@ func (f fakeFI) Sys() any           { return nil }
 // uid-501 client — exactly the failure we're repairing.
 func TestWritableByClient(t *testing.T) {
 	cases := []struct {
-		name                             string
-		mode                             os.FileMode
-		uid, gid, ownerUID, ownerGID     int
-		want                             bool
+		name                         string
+		mode                         os.FileMode
+		uid, gid, ownerUID, ownerGID int
+		want                         bool
 	}{
 		{"client is owner, owner has write", 0644, 501, 20, 501, 20, true},
 		{"client in owning group, group has write", 0664, 0, 20, 501, 20, true},

@@ -9,35 +9,47 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
+	"database/sql"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
 	"net"
 	"net/http"
 	"net/http/pprof"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 	"unsafe"
 
 	"github.com/redis/go-redis/v9"
 
-	"github.com/lelanddutcher/juicemount/cache"
 	"github.com/lelanddutcher/juicemount/health"
+	"github.com/lelanddutcher/juicemount/internal/appisolation"
 	"github.com/lelanddutcher/juicemount/internal/cache/pin"
 	"github.com/lelanddutcher/juicemount/internal/cplane"
 	"github.com/lelanddutcher/juicemount/internal/derivatives"
 	"github.com/lelanddutcher/juicemount/internal/farm"
 	"github.com/lelanddutcher/juicemount/internal/jmlog"
 	"github.com/lelanddutcher/juicemount/internal/metrics"
+	"github.com/lelanddutcher/juicemount/internal/mountbroker"
+	"github.com/lelanddutcher/juicemount/internal/mounttable"
 	"github.com/lelanddutcher/juicemount/internal/netprofile"
 	jmlibnfs "github.com/lelanddutcher/juicemount/internal/nfs"
+	"github.com/lelanddutcher/juicemount/internal/redisurl"
+	"github.com/lelanddutcher/juicemount/internal/testguard"
 	"github.com/lelanddutcher/juicemount/internal/thumbcache"
 	"github.com/lelanddutcher/juicemount/internal/version"
 	"github.com/lelanddutcher/juicemount/metadata"
@@ -59,23 +71,54 @@ import (
 // Full teardown (unmount everything) only happens via NFSServerShutdown,
 // which the Swift app calls from applicationWillTerminate.
 var (
-	globalMu        sync.Mutex
-	globalServer    *jmnfs.Server
-	globalRC        *metadata.RedisClient
-	globalStore     *metadata.Store
-	globalCache     *cache.Reader
-	globalMonitor   *health.HealthMonitor
-	globalRDB       *redis.Client
-	globalMetrics   *metrics.Server
-	globalFUSE      *health.FUSEManager
-	globalFUSEPath  string // remembered across Stop/Start so we can detect existing mount
-	globalMountPath string
+	// globalLifecycleMu serializes whole Start/Stop/StopMount/Shutdown
+	// transitions without making ordinary status readers wait behind slow
+	// unmounts. globalMu still protects the published component pointers.
+	globalLifecycleMu  sync.Mutex
+	globalMu           sync.Mutex
+	globalStopPending  bool
+	globalServer       *jmnfs.Server
+	globalRC           *metadata.RedisClient
+	globalStore        *metadata.Store
+	globalCacheOwner   *bridgeCacheOwner
+	globalMonitor      *health.HealthMonitor
+	globalMetrics      *metrics.Server
+	globalFUSE         *health.FUSEManager
+	globalOwner        *ownerFacade // isolated serving engine only; original manager and Link stay in owner
+	globalOwnerLoop    *ownerCallbackLoop
+	globalOwnerStopID  string
+	globalFUSEBinary   string        // exact executable selected for the retained FUSE generation
+	globalFUSEConfig   *ServerConfig // original inputs retained with the manager; never logged
+	globalFUSEPath     string        // remembered across Stop/Start so we can detect existing mount
+	globalMountPath    string
+	globalMountFlights *nfsMountFlights
 	// globalWantMountPoint is the CONFIGURED mount point from the last
 	// Start — unlike globalMountPath it is set even when the mount attempt
 	// failed, so /mount-now (LB-2) knows what to mount. Never cleared on
 	// stop: retrying against the last-configured path is exactly the
 	// recovery /mount-now exists for.
 	globalWantMountPoint string
+	// The ordinary health monitor proves mount-table presence and a bounded
+	// stat. That is necessary but not sufficient: a cold-start race once left
+	// those reads green while every NFS mutation wedged. Publish NFS readiness
+	// only after a real create/write/fsync/delete succeeds through the
+	// user-visible mount. The generation prevents a late probe from a stopped
+	// server from blessing a later Start.
+	globalNFSWriteReadiness  atomic.Pointer[nfsWriteReadiness]
+	globalNFSWriteGeneration atomic.Uint64
+	// Exactly one self-healing write verifier owns a generation. A newer Start
+	// replaces the owner atomically; the old loop observes the change and exits.
+	globalNFSWriteVerifyGeneration atomic.Uint64
+	// Shutdown clears this before it begins unmounting. Generation invalidation
+	// stops an existing verifier at its next cancellation point; this gate also
+	// prevents a late mount/recovery callback from arming a replacement verifier
+	// during the unmount window.
+	globalNFSWriteVerifyArmed atomic.Bool
+	// Tracks the actual dd/rm helpers, not just their owning Go verifier. A
+	// killed process can remain stuck inside a kernel NFS open until a force
+	// unmount releases it, so teardown must retain visibility until Wait reaps
+	// the child or the bounded drain deadline expires.
+	globalNFSWriteProbeProcesses = newNFSWriteProbeProcessTracker()
 
 	// Pin / offline / prefetch globals
 	globalPinStore   *pin.Store
@@ -100,19 +143,11 @@ var (
 	// resilience plan consume its state and OnChange callback.
 	globalReach *health.Reachability
 
-	// Auto-offline debounce (2026-06-01). A brief network blip (a few seconds
-	// of cold-dial failures) must NOT flip the app to "offline" — that
-	// contradicts the still-healthy Redis/MinIO/FUSE components (which ride
-	// through the same blip on warm pooled connections) and jars the user. We
-	// wait for offlineEngageDelay of CONTINUOUS unreachability before engaging
-	// offline mode; recovery is instant. Guarded by offlineEngageMu.
-	offlineEngageMu    sync.Mutex
-	offlineEngageTimer *time.Timer
-
 	// globalKeyspaceNetWatcher provides the active-interface NAME signal used
 	// to class-gate the metadata keyspace-push backstop cadence + coalescer
-	// (LAN/WiFi/tunnel). Only instantiated when JM_METADATA_KEYSPACE_PUSH=1;
-	// nil otherwise (class-gating then falls back to JM_WAN_MODE-only).
+	// (LAN/WiFi/tunnel). Instantiated while keyspace push is enabled (default);
+	// nil only under its rollback switch (class-gating then falls back to
+	// JM_WAN_MODE-only).
 	globalKeyspaceNetWatcher *health.NetWatcher
 
 	// Spool architecture (Option 2 / slices A-E). Set when
@@ -121,8 +156,15 @@ var (
 	// unchanged. Stop tears the drainer down with a 30 s deadline
 	// before closing the spool store, then nils both globals so
 	// /spool returns 503 between Stop and the next Start.
-	globalSpool   *jmnfs.SpoolStore
-	globalDrainer *jmnfs.Drainer
+	globalPresence       *jmnfs.PresenceTracker
+	globalSpool          *jmnfs.SpoolStore
+	globalSpoolSweepDone chan struct{}
+	globalDrainer        *jmnfs.Drainer
+	// globalProjectLeases is the H-8B project-lease client (nil when the
+	// spool is off). Owned by the spool lifecycle.
+	// Atomic: the spool sweep goroutine publishes it without globalMu, which
+	// the startup path may still hold.
+	globalProjectLeases atomic.Pointer[jmnfs.ProjectLeaseClient]
 
 	// globalDrainerAtomic mirrors globalDrainer for lock-free readers that
 	// must never contend on globalMu (review fix: the reachability liveness
@@ -155,28 +197,119 @@ var (
 	globalRedisURL string
 )
 
-// offlineEngageDelay is how long the backend must be CONTINUOUSLY unreachable
-// (on top of globalReach's ~4s detection) before auto-offline engages. Sized
-// to ride out the brief LAN/Tailscale blips that trip a cold-dial probe but
-// not the warm-connection health checks — keeping the menu bar from flapping
-// to "offline" on a 2-6s hiccup. Total engage latency ≈ 22s end-to-end.
-//
-// Recovery is NOT debounced: the moment reachability returns, the pending
-// engage is cancelled and any active auto-offline is lifted immediately.
-var offlineEngageDelay = 18 * time.Second
+// Test seam: production local/CLI startup uses the original Link constructor.
+// A selected isolated owner must never enter this branch.
+var startServingLink = startLinkIfConfigured
+
+type nfsMountFlights struct {
+	mu      sync.Mutex
+	active  int
+	retired bool
+	idle    chan struct{}
+}
+
+func newNFSMountFlights() *nfsMountFlights {
+	idle := make(chan struct{})
+	close(idle)
+	return &nfsMountFlights{idle: idle}
+}
+
+func (f *nfsMountFlights) begin() bool {
+	if f == nil {
+		return false
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.retired {
+		return false
+	}
+	if f.active == 0 {
+		f.idle = make(chan struct{})
+	}
+	f.active++
+	return true
+}
+
+func (f *nfsMountFlights) end() {
+	f.mu.Lock()
+	f.active--
+	if f.active == 0 {
+		close(f.idle)
+	}
+	f.mu.Unlock()
+}
+
+func (f *nfsMountFlights) retire(deadline time.Duration) bool {
+	if f == nil {
+		return true
+	}
+	f.mu.Lock()
+	f.retired = true
+	idle := f.idle
+	f.mu.Unlock()
+	select {
+	case <-idle:
+		return true
+	case <-time.After(deadline):
+		return false
+	}
+}
+
+func (f *nfsMountFlights) isRetired() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.retired
+}
+
+func retireNFSMountFlights(deadline time.Duration) bool {
+	globalMu.Lock()
+	flights := globalMountFlights
+	globalMu.Unlock()
+	return flights.retire(deadline)
+}
+
+// backendRoutePolicyState is the sanitized route-policy proof exported through
+// /metrics. The raw interface and target never leave the route resolver/logs.
+// Atomics keep the metrics callback lock-free while NetWatcher updates policy.
+var backendRoutePolicyState struct {
+	tunneled       atomic.Bool
+	ceilingApplied atomic.Bool
+}
+
+// backendFailuresToOffline deliberately admits one failed PROTOCOL-level probe.
+// Reachability does more than connect: it sends Redis PING and requires a RESP
+// reply, while its recent-drain liveness override suppresses congestion-induced
+// false failures. Adding another threshold or timer here previously left Finder
+// on the blocking FUSE path for about 22 seconds after a real route loss. A
+// single bounded failure makes the durable local cache/spool policy effective
+// within roughly one probe timeout; the first successful probe recovers online.
+const backendFailuresToOffline = 1
 
 // ServerConfig is the JSON configuration passed from Swift.
 type ServerConfig struct {
-	RedisURL       string `json:"redis_url"`
-	FUSEPath       string `json:"fuse_path"`
-	MountPoint     string `json:"mount_point"`
-	ListenAddr     string `json:"listen_addr"`
-	DBPath         string `json:"db_path"`
-	CacheSize      string `json:"cache_size"`
-	MetricsAddr    string `json:"metrics_addr"`
-	LogFile        string `json:"log_file"`
-	LogLevel       string `json:"log_level"`
-	BucketOverride string `json:"bucket_override"`
+	RedisURL        string `json:"redis_url"`
+	FUSEPath        string `json:"fuse_path"`
+	MountPoint      string `json:"mount_point"`
+	ListenAddr      string `json:"listen_addr"`
+	DBPath          string `json:"db_path"`
+	CacheSize       string `json:"cache_size"`
+	MetricsAddr     string `json:"metrics_addr"`
+	LogFile         string `json:"log_file"`
+	LogLevel        string `json:"log_level"`
+	BucketOverride  string `json:"bucket_override"`
+	JuiceFSBin      string `json:"juicefs_bin,omitempty"`
+	SpoolDir        string `json:"spool_dir,omitempty"`
+	FUSEMetricsAddr string `json:"fuse_metrics_addr,omitempty"`
+
+	// JuiceMount Link (Tier-2 T2.2): embedded tailnet node for remote use.
+	NetControlURL string `json:"net_control_url"` // Headscale coordination URL
+	NetAuthKey    string `json:"net_authkey"`     // preauth key from pairing
+	NetHostname   string `json:"net_hostname"`    // this Mac's node name
+	// NetNASAddr is retained for config compatibility with early Link builds.
+	// Link now keeps the original LAN endpoint and reaches it through the NAS
+	// subnet route, so a tailnet IP is neither required nor used.
+	NetNASAddr string `json:"net_nas_addr"`
+
 	// Spool (Option 2). Passed from the Swift app via this config JSON —
 	// the env var (JM_SPOOL_ENABLE) does NOT work for the embedded
 	// c-archive because Go snapshots os.Environ at runtime init, so a
@@ -185,6 +318,28 @@ type ServerConfig struct {
 	// it's in the startup snapshot. SpoolSizeGB < 1 means "use default".
 	SpoolEnable bool `json:"spool_enable"`
 	SpoolSizeGB int  `json:"spool_size_gb"`
+	// Explicit opt-in for accepted replacement recovery; absent config stays off.
+	ReplacementRecovery bool `json:"replacement_recovery,omitempty"`
+	// The app config always supplies a value; absent or null old-app JSON
+	// decodes false. Keep this comparable for retained-FUSE config equality.
+	NativePreviewWarm bool `json:"native_preview_warm"`
+	// OpenCacheTTL is the juicefs --open-cache duration, e.g. "5s". Empty = OFF
+	// (today's behaviour: every open re-validates against Redis).
+	//
+	// It rides the config for the same reason SpoolEnable does — os.Getenv
+	// cannot see a Swift setenv() after c-archive init — but the stakes are
+	// higher here. Every other cellular lever in health/fuse.go defaults to the
+	// behaviour we want, so being env-only merely made them untunable. This one
+	// defaults OFF, so being env-only made the largest measured win on a real
+	// cellular link (66x: first open 1226-5660ms, second 24-36ms, 2026-07-29)
+	// impossible to switch on in the build under test.
+	//
+	// Deliberately NOT surfaced in the Settings UI: the exposure is a stale
+	// slice map — WRONG BYTES from an existing file — which is the family behind
+	// #18 torn reads, #104 black frames and the membuf stale-partial image.
+	// Set it for a measured test with:
+	//     defaults write com.juicemount.app openCacheTTL -string 5s
+	OpenCacheTTL string `json:"open_cache_ttl"`
 	// LB-4 (Phase 3b): tuning knobs that previously existed in the app's
 	// preferences UI but were consumed by nothing. All three are optional —
 	// 0 (or absent, for config JSON written by older app builds) preserves
@@ -195,6 +350,28 @@ type ServerConfig struct {
 	MemoryBufferMB    int `json:"memory_buffer_mb"`
 	MemBufFileLimitMB int `json:"membuf_file_limit_mb"`
 	ReconcileSeconds  int `json:"reconcile_seconds"`
+
+	// H-8B object key: this Mac's no-delete object-store key from Manager
+	// enrollment, for the juicefs child as MINIO_ACCESS_KEY /
+	// MINIO_SECRET_KEY. Secrets like the Redis password: in memory only,
+	// stripped by persistableServerConfig, restored from the credential
+	// store by hydrateServingConfig. Empty = today's behavior (juicefs uses
+	// the key in the volume `setting`).
+	ObjectAccessKey string `json:"object_access_key,omitempty"`
+	ObjectSecretKey string `json:"object_secret_key,omitempty"`
+}
+
+// Resolve the legacy spool environment at admission, once, so validation and
+// later spool construction use the same effective setting.
+func (c ServerConfig) spoolConfigured(legacyEnv bool) bool {
+	return c.SpoolEnable || legacyEnv
+}
+
+func (c ServerConfig) validateReplacementRecoveryConfig(spoolConfigured bool) error {
+	if c.ReplacementRecovery && !spoolConfigured {
+		return errors.New("replacement recovery requires an enabled spool")
+	}
+	return nil
 }
 
 // reconcileInterval resolves the config's reconcile cadence; 0 means
@@ -205,11 +382,737 @@ func (c ServerConfig) reconcileInterval() time.Duration {
 	return time.Duration(c.ReconcileSeconds) * time.Second
 }
 
+var (
+	linkMu         sync.Mutex
+	linkTestMu     sync.Mutex
+	linkStateMu    sync.Mutex
+	globalLinkNode *jmnfs.LinkNode
+	globalLinkID   linkNodeIdentity
+)
+
+type linkNodeIdentity struct {
+	ControlURL  string
+	Hostname    string
+	StateDir    string
+	AuthKeyHash [sha256.Size]byte
+}
+
+func identityForLink(cfg ServerConfig) linkNodeIdentity {
+	return linkNodeIdentity{
+		ControlURL:  strings.TrimRight(strings.TrimSpace(cfg.NetControlURL), "/"),
+		Hostname:    strings.TrimSpace(cfg.NetHostname),
+		StateDir:    linkStateDir(cfg),
+		AuthKeyHash: sha256.Sum256([]byte(strings.TrimSpace(cfg.NetAuthKey))),
+	}
+}
+
+// reusableLinkNode returns the warm node only when it represents the exact
+// pairing inputs currently saved by the app. A changed identity must never
+// stop this node here: its loopback endpoints may still be owned by a warm
+// JuiceFS mount. The caller must perform a full teardown (FUSE first, Link
+// second) before applying different pairing inputs.
+func reusableLinkNode(cfg ServerConfig) (*jmnfs.LinkNode, error) {
+	want := identityForLink(cfg)
+	linkMu.Lock()
+	defer linkMu.Unlock()
+	node := globalLinkNode
+	if node != nil && globalLinkID == want {
+		return node, nil
+	}
+	if node != nil {
+		return nil, fmt.Errorf("JuiceMount Link pairing changed while its data plane is active; stop everything before applying or testing the new pairing")
+	}
+	return nil, nil
+}
+
+func publishLinkNode(cfg ServerConfig, node *jmnfs.LinkNode) (*jmnfs.LinkNode, error) {
+	want := identityForLink(cfg)
+	linkMu.Lock()
+	if globalLinkNode == nil {
+		globalLinkNode = node
+		globalLinkID = want
+		linkMu.Unlock()
+		return node, nil
+	}
+	existing := globalLinkNode
+	sameIdentity := globalLinkID == want
+	linkMu.Unlock()
+	node.Stop()
+	if !sameIdentity {
+		return nil, fmt.Errorf("JuiceMount Link pairing changed while its data plane is active; stop everything before publishing the replacement")
+	}
+	return existing, nil
+}
+
+type linkTestResult struct {
+	OK                   bool     `json:"ok"`
+	Authorized           bool     `json:"authorized"`
+	Online               bool     `json:"online"`
+	BackendReachable     bool     `json:"backend_reachable"`
+	RedisReachable       bool     `json:"redis_reachable"`
+	ObjectStoreReachable bool     `json:"object_store_reachable"`
+	Hostname             string   `json:"hostname,omitempty"`
+	Addresses            []string `json:"addresses"`
+	RTTMS                int64    `json:"rtt_ms,omitempty"`
+	TransportMode        string   `json:"transport_mode,omitempty"`
+	UploadMbps           float64  `json:"upload_mbps,omitempty"`
+	DownloadMbps         float64  `json:"download_mbps,omitempty"`
+	Error                string   `json:"error,omitempty"`
+}
+
+func linkStateRoot(cfg ServerConfig) string {
+	if cfg.DBPath != "" {
+		if parent := filepath.Dir(cfg.DBPath); parent != "." && parent != "" {
+			return filepath.Join(parent, "link")
+		}
+	}
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		return filepath.Join(home, "Library", "Application Support", "JuiceMount", "link")
+	}
+	return ""
+}
+
+// linkStateDir isolates each one-time pairing authorization. Keeping every
+// pairing code in the old shared directory made tsnet prefer the previous
+// durable profile and silently ignore a newly entered code after revocation.
+// The hash is non-secret, stable for identical settings, and lets a new code
+// enroll cleanly while preserving restart identity for the active code.
+func linkStateDir(cfg ServerConfig) string {
+	root := linkStateRoot(cfg)
+	if root == "" {
+		return ""
+	}
+	// Hostname is intentionally excluded: it is mutable profile metadata and
+	// setHostname applies it after reconnect. Requiring another one-time code
+	// just to rename the same Mac would make hostname assignment unreliable.
+	sum := sha256.Sum256([]byte(strings.TrimRight(strings.TrimSpace(cfg.NetControlURL), "/") + "\x00" +
+		strings.TrimSpace(cfg.NetAuthKey)))
+	return filepath.Join(root, "identities", hex.EncodeToString(sum[:12]))
+}
+
+// prepareLinkStateDir performs a one-time, recoverable migration from the
+// pre-RC shared state directory into the current pairing-specific directory.
+// Old pairing directories are retained so a failed re-pair never destroys the
+// last known machine identity.
+func prepareLinkStateDir(cfg ServerConfig) error {
+	root, desired := linkStateRoot(cfg), linkStateDir(cfg)
+	if scope, isolated, err := appisolation.CurrentControl(); err != nil {
+		return err
+	} else if isolated {
+		for _, item := range []struct {
+			path string
+			dir  bool
+		}{
+			{desired, true}, {filepath.Join(desired, "tailscaled.state"), false}, {filepath.Join(root, "tailscaled.state"), false},
+		} {
+			if err := scope.RequirePrivateChild(item.path, item.dir); err != nil {
+				return err
+			}
+		}
+	}
+	if root == "" || desired == "" {
+		return nil
+	}
+	linkStateMu.Lock()
+	defer linkStateMu.Unlock()
+
+	if _, err := os.Stat(filepath.Join(desired, "tailscaled.state")); err == nil {
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("link: inspect pairing state: %w", err)
+	}
+	legacyState := filepath.Join(root, "tailscaled.state")
+	if _, err := os.Stat(legacyState); errors.Is(err, os.ErrNotExist) {
+		return os.MkdirAll(desired, 0o700)
+	} else if err != nil {
+		return fmt.Errorf("link: inspect legacy pairing state: %w", err)
+	}
+
+	identitiesRoot := filepath.Join(root, "identities")
+	identities, err := os.ReadDir(identitiesRoot)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("link: inspect pairing identities: %w", err)
+	}
+	// If a prior launch created only this desired directory and stopped before
+	// moving the legacy files, resume the migration. Any different identity is
+	// proof that pairing-specific state is already established and the legacy
+	// profile must not be adopted by a newer code.
+	if len(identities) > 1 || (len(identities) == 1 && identities[0].Name() != filepath.Base(desired)) {
+		return os.MkdirAll(desired, 0o700)
+	}
+	if err := os.MkdirAll(desired, 0o700); err != nil {
+		return fmt.Errorf("link: create pairing state: %w", err)
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return fmt.Errorf("link: read legacy pairing state: %w", err)
+	}
+	for _, entry := range entries {
+		if entry.Name() == "identities" {
+			continue
+		}
+		if err := os.Rename(filepath.Join(root, entry.Name()), filepath.Join(desired, entry.Name())); err != nil {
+			return fmt.Errorf("link: migrate legacy pairing state %q: %w", entry.Name(), err)
+		}
+	}
+	return nil
+}
+
+// startLinkIfConfigured brings up the embedded tailnet node and rewrites
+// backend URLs to stable adaptive loopback proxies. Each outbound connection
+// authenticates through Link first, then uses direct LAN only when the paired
+// NAS's fresh private peer endpoint exactly matches that backend. It returns
+// the live node so startup can prove the encrypted route rather than treating
+// a local listener as proof that the NAS is reachable.
+func startLinkIfConfigured(cfg *ServerConfig) (*jmnfs.LinkNode, bool, error) {
+	configured, err := validateLinkConfig(*cfg)
+	if err != nil {
+		return nil, false, err
+	}
+	if !configured {
+		return nil, false, nil
+	}
+	if err := prepareLinkStateDir(*cfg); err != nil {
+		return nil, false, err
+	}
+	node, err := reusableLinkNode(*cfg)
+	if err != nil {
+		return nil, false, err
+	}
+	owned := false
+	if node == nil {
+		var err error
+		node, err = jmnfs.StartLinkNodeDeferred(cfg.NetControlURL, cfg.NetAuthKey, cfg.NetHostname, linkStateDir(*cfg))
+		if err != nil {
+			return nil, false, fmt.Errorf("JuiceMount Link node failed to start: %w", err)
+		}
+		owned = true
+	}
+	redisURL, err := node.AdaptiveProxyEndpoint(cfg.RedisURL, "6379")
+	if err != nil {
+		if owned {
+			node.Stop()
+		}
+		return nil, false, fmt.Errorf("JuiceMount Link Redis proxy failed: %w", err)
+	}
+	bucketURL := cfg.BucketOverride
+	bucketURL, err = node.AdaptiveProxyEndpoint(bucketURL, "")
+	if err != nil {
+		if owned {
+			node.Stop()
+		}
+		return nil, false, fmt.Errorf("JuiceMount Link object-store proxy failed: %w", err)
+	}
+	cfg.RedisURL = redisURL
+	cfg.BucketOverride = bucketURL
+	if owned {
+		node, err = publishLinkNode(*cfg, node)
+		if err != nil {
+			return nil, false, err
+		}
+	}
+	if addrs := node.Addresses(); len(addrs) > 0 {
+		jmlog.Info("JuiceMount Link: node up", "addrs", fmt.Sprint(addrs))
+	} else {
+		jmlog.Info("JuiceMount Link: node started; registration and route acceptance continuing in background")
+	}
+	jmlog.Info("JuiceMount Link: backend endpoints now use authenticated adaptive loopback proxies")
+	return node, owned, nil
+}
+
+func validateLinkConfig(cfg ServerConfig) (bool, error) {
+	configured := strings.TrimSpace(cfg.NetControlURL) != "" || strings.TrimSpace(cfg.NetAuthKey) != ""
+	if !configured {
+		return false, nil
+	}
+	if strings.TrimSpace(cfg.NetControlURL) == "" || strings.TrimSpace(cfg.NetAuthKey) == "" {
+		return true, fmt.Errorf("JuiceMount Link requires both the server URL and pairing code")
+	}
+	if strings.TrimSpace(cfg.RedisURL) == "" {
+		return true, fmt.Errorf("JuiceMount Link requires a Redis endpoint")
+	}
+	if strings.TrimSpace(cfg.BucketOverride) == "" {
+		return true, fmt.Errorf("JuiceMount Link requires an object-store endpoint override; refusing to leave JuiceFS data traffic outside the tunnel")
+	}
+	return true, nil
+}
+
+func linkBackendReachableRTT(node *jmnfs.LinkNode, redisURL string, timeout time.Duration) (bool, time.Duration) {
+	rtt, err := linkRedisPingRTT(node, redisURL, timeout)
+	if err != nil {
+		jmlog.Warn("JuiceMount Link: Redis unavailable at startup", "error", err.Error())
+		return false, 0
+	}
+	netprofile.Default().ObserveRTT(rtt)
+	statusCtx, statusCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	if transport, statusErr := node.TransportStatus(statusCtx); statusErr == nil {
+		jmlog.Info("JuiceMount Link: active NAS transport",
+			"mode", transport.Mode, "peer", transport.Peer,
+			"endpoint", transport.Endpoint, "relay", transport.Relay)
+	}
+	statusCancel()
+	return true, rtt
+}
+
+// waitForLinkStartupReady gives a newly-created deferred Link node a small,
+// bounded registration grace before the one-shot backend probe. The live cold
+// boot race was only 35 ms: the 1.5 s Redis probe expired immediately before
+// Link announced ready, incorrectly selecting the offline/deferred-FUSE path.
+// A truly offline node still returns within this bound and then takes the
+// existing fast-fail probe path.
+func waitForLinkStartupReady(node *jmnfs.LinkNode, timeout time.Duration) {
+	if node == nil || timeout <= 0 {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	if _, err := node.WaitReady(ctx); err != nil {
+		jmlog.Info("JuiceMount Link: startup readiness still pending; continuing with bounded backend probe",
+			"grace_ms", timeout.Milliseconds(), "error", err.Error())
+	}
+}
+
+// objectStoreHealthBase strips the bucket path while retaining the scheme and
+// authority. HealthMonitor appends /minio/health/live itself.
+func objectStoreHealthBase(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return ""
+	}
+	u.Path = ""
+	u.RawPath = ""
+	u.RawQuery = ""
+	u.Fragment = ""
+	return strings.TrimRight(u.String(), "/")
+}
+
+// cacheRedisOptions keeps the cache probe's caller-supplied context deadline
+// authoritative. go-redis otherwise ignores context deadlines once a local
+// Link proxy has accepted the TCP connection and waits for ReadTimeout instead;
+// a promised 200 ms offline cache probe then stalls an NFS READ for 10 seconds.
+func cacheRedisOptions(addr string, db int) *redis.Options {
+	return cacheRedisTimeouts(&redis.Options{Addr: addr, DB: db})
+}
+
+func cacheRedisTimeouts(opts *redis.Options) *redis.Options {
+	opts.ReadTimeout = 10 * time.Second
+	opts.WriteTimeout = 5 * time.Second
+	opts.DialTimeout = 5 * time.Second
+	opts.ContextTimeoutEnabled = true
+	return opts
+}
+
+func linkRedisPingRTT(node *jmnfs.LinkNode, redisURL string, timeout time.Duration) (time.Duration, error) {
+	opts, err := redisurl.Parse(redisURL)
+	if err != nil {
+		return 0, fmt.Errorf("parse Redis endpoint: %w", err)
+	}
+	if opts.TLSConfig != nil {
+		return 0, fmt.Errorf("embedded Link Redis probe does not support TLS")
+	}
+	opts.DialTimeout = timeout
+	opts.ReadTimeout = timeout
+	opts.WriteTimeout = timeout
+	opts.ContextTimeoutEnabled = true
+	opts.Dialer = node.DialContext
+	client := redis.NewClient(opts)
+	defer client.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	started := time.Now()
+	if err := client.Ping(ctx).Err(); err != nil {
+		return 0, err
+	}
+	return time.Since(started), nil
+}
+
+// Keep the startup proof large enough to clear netprofile's 256 KiB wire-sample
+// floor, but small enough to finish on a genuinely usable 1 Mbps cellular
+// uplink. The previous 4 MiB payload needed at least 33.5 seconds at 1 Mbps,
+// while each direction had a 15-second deadline, so it deterministically called
+// a healthy cellular Link "offline" before the mount policy was selected.
+const linkDataPlaneBenchmarkBytes = 512 << 10
+
+// linkRedisDataPlaneBenchmark proves that the encrypted subnet route carries
+// a verified payload in both directions. Tiny PING and MinIO liveness
+// checks passed on the live RC while a DERP-only path took ~30 seconds per S3
+// chunk and repeatedly killed JuiceFS. A short-lived Redis value exercises the
+// same routed peer without touching volume metadata or requiring S3 secrets.
+func linkRedisDataPlaneBenchmark(node *jmnfs.LinkNode, redisURL string, size int, timeout time.Duration) (uploadMbps, downloadMbps float64, err error) {
+	if node == nil {
+		return 0, 0, fmt.Errorf("link node is nil")
+	}
+	return linkRedisDataPlaneBenchmarkWithDial(redisURL, size, timeout, node.DialContext)
+}
+
+func linkRedisDataPlaneBenchmarkWithDial(redisURL string, size int, timeout time.Duration, dial func(context.Context, string, string) (net.Conn, error)) (uploadMbps, downloadMbps float64, err error) {
+	if size <= 0 {
+		return 0, 0, fmt.Errorf("benchmark size must be positive")
+	}
+	if dial == nil {
+		return 0, 0, fmt.Errorf("benchmark dialer is nil")
+	}
+	opts, err := redisurl.Parse(redisURL)
+	if err != nil {
+		return 0, 0, fmt.Errorf("parse Redis endpoint: %w", err)
+	}
+	if opts.TLSConfig != nil {
+		return 0, 0, fmt.Errorf("embedded Link Redis benchmark does not support TLS")
+	}
+	opts.DialTimeout = timeout
+	opts.ReadTimeout = timeout
+	opts.WriteTimeout = timeout
+	opts.ContextTimeoutEnabled = true
+	opts.PoolSize = 1
+	opts.Dialer = dial
+	client := redis.NewClient(opts)
+	defer client.Close()
+
+	payload := make([]byte, size)
+	for i := range payload {
+		payload[i] = byte(i*31 + 17)
+	}
+	var nonce [8]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return 0, 0, fmt.Errorf("benchmark key: %w", err)
+	}
+	key := fmt.Sprintf("jm:link-bench:%x", nonce[:])
+	cleanup := func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = client.Del(ctx, key).Err()
+	}
+	defer cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	started := time.Now()
+	if err := client.Set(ctx, key, payload, time.Minute).Err(); err != nil {
+		cancel()
+		return 0, 0, fmt.Errorf("upload: %w", err)
+	}
+	uploadElapsed := time.Since(started)
+	cancel()
+
+	ctx, cancel = context.WithTimeout(context.Background(), timeout)
+	started = time.Now()
+	got, err := client.Get(ctx, key).Bytes()
+	downloadElapsed := time.Since(started)
+	cancel()
+	if err != nil {
+		return 0, 0, fmt.Errorf("download: %w", err)
+	}
+	if !bytes.Equal(got, payload) {
+		return 0, 0, fmt.Errorf("download verification failed (got %d bytes, want %d)", len(got), len(payload))
+	}
+	bits := float64(size * 8)
+	return bits / uploadElapsed.Seconds() / 1_000_000,
+		bits / downloadElapsed.Seconds() / 1_000_000, nil
+}
+
+// observeLinkDataPlaneDownload seeds the same process-wide adaptive profile
+// consumed by JuiceFS mount policy and the live NFS read-ahead controller. The
+// benchmark returns Mbps rather than elapsed time, so reconstruct the measured
+// duration exactly. Only download is folded in: Profile throughput describes
+// cold-read capacity, while upload remains separately reported to the user.
+func observeLinkDataPlaneDownload(p *netprofile.Profile, size int, downloadMbps float64) {
+	if p == nil || size <= 0 || downloadMbps <= 0 || math.IsNaN(downloadMbps) || math.IsInf(downloadMbps, 0) {
+		return
+	}
+	seconds := float64(size*8) / (downloadMbps * 1_000_000)
+	if seconds <= 0 {
+		return
+	}
+	p.ObserveThroughput(int64(size), time.Duration(seconds*float64(time.Second)))
+}
+
+func takeGlobalLinkNode() *jmnfs.LinkNode {
+	linkMu.Lock()
+	node := globalLinkNode
+	globalLinkNode = nil
+	globalLinkID = linkNodeIdentity{}
+	linkMu.Unlock()
+	return node
+}
+
+func stopLinkNode(node *jmnfs.LinkNode) {
+	if node == nil {
+		return
+	}
+	linkMu.Lock()
+	if globalLinkNode == node {
+		globalLinkNode = nil
+		globalLinkID = linkNodeIdentity{}
+	}
+	linkMu.Unlock()
+	node.Stop()
+}
+
+// proveLinkRedisReadiness is the first point where a Link test may claim that
+// the saved identity is authorized and online. WaitReady only proves that the
+// local tsnet backend once reached Running and has addresses; those values can
+// remain cached after an operator expires the node. A successful Redis PING
+// through Link proves a current encrypted route to the far side.
+func proveLinkRedisReadiness(result *linkTestResult, probe func() (time.Duration, error)) (time.Duration, error) {
+	if result == nil {
+		return 0, fmt.Errorf("Link test result is nil")
+	}
+	if probe == nil {
+		return 0, fmt.Errorf("Link Redis readiness probe is nil")
+	}
+	rtt, err := probe()
+	if err != nil {
+		return 0, err
+	}
+	result.Authorized = true
+	result.Online = true
+	result.RedisReachable = true
+	return rtt, nil
+}
+
+func linkTestMountPathsClear(cfg ServerConfig, snapshot mounttable.Snapshot) error {
+	for _, path := range []string{cfg.FUSEPath, cfg.MountPoint} {
+		if path == "" || path == "/" || !filepath.IsAbs(path) || filepath.Clean(path) != path {
+			return errors.New("FUSE or NFS mount path cannot be verified")
+		}
+	}
+	if snapshot.Version != 1 || snapshot.BootID == "" || snapshot.Entries == nil {
+		return errors.New("mount absence cannot be verified from an incomplete snapshot")
+	}
+	for _, entry := range snapshot.Entries {
+		if entry.Path == "" || entry.Source == "" || entry.Type == "" || !filepath.IsAbs(entry.Path) || filepath.Clean(entry.Path) != entry.Path {
+			return errors.New("mount absence cannot be verified from an incomplete entry")
+		}
+		path := strings.ToLower(entry.Path)
+		for _, target := range []string{cfg.FUSEPath, cfg.MountPoint} {
+			name := strings.ToLower(target)
+			if path == name || strings.HasPrefix(path, name+string(os.PathSeparator)) {
+				return errors.New("a mount occupies the configured FUSE or NFS path; Link settings remain saved and pending")
+			}
+		}
+	}
+	return nil
+}
+
+// linkTestNoMount refuses any retained serving owner or kernel occupant before
+// a pairing test can replace Link's process-wide identity. The lifecycle lock
+// stays held through the test so Start cannot acquire FUSE after this proof.
+func linkTestNoMount(cfg ServerConfig) error {
+	globalMu.Lock()
+	retained := globalStopPending || globalServer != nil || globalFUSE != nil || globalOwner != nil ||
+		globalFUSEConfig != nil || globalFUSEPath != "" || globalMountPath != "" || globalNFSController != nil || globalMountFlights != nil
+	globalMu.Unlock()
+	if retained || globalNFSWriteProbeProcesses.activeCount() != 0 {
+		return errors.New("volume resources are still in use; Link settings are saved and pending until the volume can be safely restarted")
+	}
+	if cfg.FUSEPath == "" || cfg.MountPoint == "" {
+		return errors.New("FUSE or NFS mount path cannot be verified")
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("mount absence cannot be verified: %w", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	snapshot, err := mounttable.SnapshotFromHelper(ctx, filepath.Join(filepath.Dir(executable), "juicemount-mount-probe"))
+	if err != nil {
+		return fmt.Errorf("mount absence cannot be verified: %w", err)
+	}
+	return linkTestMountPathsClear(cfg, snapshot)
+}
+
+//export NFSServerLinkTest
+func NFSServerLinkTest(configJSON *C.char) *C.char {
+	if serviceClientBuild {
+		return forwardServiceText("link-test", []string{C.GoString(configJSON)}, nil)
+	}
+	result := linkTestResult{Addresses: []string{}}
+	encode := func() *C.char {
+		raw, _ := json.Marshal(result)
+		return C.CString(string(raw))
+	}
+	if configJSON == nil {
+		result.Error = "missing configuration"
+		return encode()
+	}
+	var cfg ServerConfig
+	if err := json.Unmarshal([]byte(C.GoString(configJSON)), &cfg); err != nil {
+		result.Error = "invalid configuration: " + err.Error()
+		return encode()
+	}
+	result.Hostname = cfg.NetHostname
+	if cfg.NetControlURL == "" || cfg.NetAuthKey == "" {
+		result.Error = "server URL and pairing code are required"
+		return encode()
+	}
+	if cfg.RedisURL == "" {
+		result.Error = "Redis endpoint is required to test the remote route"
+		return encode()
+	}
+	if cfg.BucketOverride == "" {
+		result.Error = "Object storage endpoint is required to prove all mount traffic uses JuiceMount Link"
+		return encode()
+	}
+	globalLifecycleMu.Lock()
+	defer globalLifecycleMu.Unlock()
+	globalMu.Lock()
+	selectedLinkOwner := globalOwner != nil
+	globalMu.Unlock()
+	if selectedLinkOwner {
+		result.Error = "selected volume owner retains the original Link; pairing test cannot create another listener"
+		return encode()
+	}
+	// A first setup may test without stopping anything. A retained or unknown
+	// mount must not be torn down just to test newly saved pairing fields.
+	if err := linkTestNoMount(cfg); err != nil {
+		result.Error = err.Error()
+		return encode()
+	}
+	linkTestMu.Lock()
+	defer linkTestMu.Unlock()
+	// Without FUSE, an earlier test node owns no mounted data plane. Retire it
+	// before testing a changed pairing identity; never do this on a mount.
+	if _, err := reusableLinkNode(cfg); err != nil {
+		if old := takeGlobalLinkNode(); old != nil {
+			old.Stop()
+		}
+	}
+	if err := prepareLinkStateDir(cfg); err != nil {
+		result.Error = err.Error()
+		return encode()
+	}
+
+	// A pairing test is serialized because tsnet owns a persistent machine
+	// identity directory. Concurrent Up calls against it corrupt the very state
+	// this operation is meant to validate.
+	node, err := reusableLinkNode(cfg)
+	if err != nil {
+		result.Error = err.Error()
+		return encode()
+	}
+	if node == nil {
+		node, result.Addresses, err = jmnfs.StartLinkNode(cfg.NetControlURL, cfg.NetAuthKey, cfg.NetHostname, linkStateDir(cfg))
+		if err != nil {
+			result.Error = err.Error()
+			return encode()
+		}
+		node, err = publishLinkNode(cfg, node)
+		if err != nil {
+			result.Error = err.Error()
+			return encode()
+		}
+		result.Addresses = node.Addresses()
+	} else {
+		result.Addresses = node.Addresses()
+	}
+	readyCtx, readyCancel := context.WithTimeout(context.Background(), 45*time.Second)
+	readyAddrs, readyErr := node.WaitReady(readyCtx)
+	readyCancel()
+	if readyErr != nil {
+		result.Error = "paired identity is saved, but JuiceMount Link is not online yet: " + readyErr.Error()
+		return encode()
+	}
+	result.Addresses = readyAddrs
+
+	rtt, err := proveLinkRedisReadiness(&result, func() (time.Duration, error) {
+		return linkRedisPingRTT(node, cfg.RedisURL, 12*time.Second)
+	})
+	if err != nil {
+		result.Error = "Link identity is saved, but current authorization/online status could not be verified through Redis on the NAS route: " + err.Error()
+		return encode()
+	}
+	objectRTT, err := node.ProbeHTTP(cfg.BucketOverride, "/minio/health/live", 12*time.Second)
+	if err != nil {
+		result.RTTMS = rtt.Milliseconds()
+		result.Error = "paired and Redis is ready, but object storage failed through the NAS route: " + err.Error()
+		return encode()
+	}
+	result.ObjectStoreReachable = true
+	statusCtx, statusCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	if transport, statusErr := node.TransportStatus(statusCtx); statusErr == nil {
+		result.TransportMode = transport.Mode
+	}
+	statusCancel()
+	uploadMbps, downloadMbps, err := linkRedisDataPlaneBenchmark(node, cfg.RedisURL, linkDataPlaneBenchmarkBytes, 15*time.Second)
+	if err != nil {
+		result.RTTMS = rtt.Milliseconds()
+		result.Error = "paired and endpoints are reachable, but the encrypted data-plane benchmark failed: " + err.Error()
+		return encode()
+	}
+	result.UploadMbps = uploadMbps
+	result.DownloadMbps = downloadMbps
+	observeLinkDataPlaneDownload(netprofile.Default(), linkDataPlaneBenchmarkBytes, downloadMbps)
+	result.BackendReachable = true
+	if objectRTT > rtt {
+		rtt = objectRTT
+	}
+	result.RTTMS = rtt.Milliseconds()
+	result.OK = true
+	netprofile.Default().ObserveRTT(rtt)
+	return encode()
+}
+
+func startupUnfinishedSpoolRows(db *sql.DB) (int, error) {
+	if err := metadata.InitSpoolSchema(db); err != nil {
+		return 0, err
+	}
+	var files, symlinks int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM spool_entries WHERE drain_state != ?`, metadata.DrainDone).Scan(&files); err != nil {
+		return 0, err
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM pending_symlinks`).Scan(&symlinks); err != nil {
+		return 0, err
+	}
+	return files + symlinks, nil
+}
+
+// The acceptance build supplies a temp drainer root without configuring FUSE.
+// Production uses the configured path unchanged.
+var startupDrainerFuseRoot = func(path string) string { return path }
+var startupNFSListener = func(server *jmnfs.Server) error { return server.Start() }
+
 //export NFSServerStart
 func NFSServerStart(configJSON *C.char) *C.char {
+	if serviceClientBuild {
+		return forwardServiceText("start", []string{C.GoString(configJSON)}, nil)
+	}
+	globalLifecycleMu.Lock()
+	defer globalLifecycleMu.Unlock()
+	return nfsServerStartSerialized(configJSON, nil)
+}
+
+//export NFSServerStartAutomatic
+func NFSServerStartAutomatic(configJSON *C.char) *C.char {
+	if serviceClientBuild {
+		return forwardServiceText("start-automatic", []string{C.GoString(configJSON)}, nil)
+	}
+	globalLifecycleMu.Lock()
+	defer globalLifecycleMu.Unlock()
+	servingDesiredMu.Lock()
+	_, err := readServingDesired()
+	servingDesiredMu.Unlock()
+	if !errors.Is(err, os.ErrNotExist) {
+		return C.CString("automatic_start_superseded")
+	}
+	return nfsServerStartSerialized(configJSON, nil)
+}
+
+// The listener's recovery worker may call this once after it has rechecked
+// its revision under globalLifecycleMu. It must not recursively take that lock.
+func nfsServerStartSerialized(configJSON *C.char, recovery *servingDesiredRecord) *C.char {
 	globalMu.Lock()
 	defer globalMu.Unlock()
+	var linkNode *jmnfs.LinkNode
+	linkOwned := false
+	linkSucceeded := false
+	defer func() {
+		if !linkSucceeded && linkOwned && globalFUSE == nil && globalMountPath == "" && globalNFSController == nil {
+			stopLinkNode(linkNode)
+		}
+	}()
 
+	if globalStopPending || globalNFSController != nil {
+		return C.CString("error: previous shutdown is incomplete; retry Stop before starting again")
+	}
 	if globalServer != nil {
 		return C.CString("error: server already running")
 	}
@@ -224,9 +1127,51 @@ func NFSServerStart(configJSON *C.char) *C.char {
 	if err := json.Unmarshal([]byte(rawJSON), &cfg); err != nil {
 		return C.CString(fmt.Sprintf("error: parse config: %v", err))
 	}
+	spoolConfigured := cfg.spoolConfigured(os.Getenv("JM_SPOOL_ENABLE") == "1")
+	if err := cfg.validateReplacementRecoveryConfig(spoolConfigured); err != nil {
+		return C.CString("error: " + err.Error())
+	}
+	cfg = canonicalServerConfig(cfg)
+	if err := validateIsolatedServerConfig(cfg); err != nil {
+		return C.CString("error: " + err.Error())
+	}
+	privatePaths, privateMode, privateErr := appisolation.ResolvePaths()
+	if privateErr != nil {
+		return C.CString("error: " + privateErr.Error())
+	}
+	// A retained manager still owns the old mount and its recovery work. A
+	// new configuration cannot redirect that ownership to another path.
+	requestedConfig := cfg
+	ownerMode, scopeErr := selectedOwnerMode()
+	if scopeErr != nil {
+		return C.CString("error: " + scopeErr.Error())
+	}
+	var selectedOwner *ownerFacade
+	var ownerReceipt volumeOwnerReceipt
+	logicalRedisURL := cfg.RedisURL // immutable selector before debug/Link proxy rewrites
+	if globalFUSE != nil {
+		if globalFUSEConfig == nil || *globalFUSEConfig != requestedConfig {
+			return C.CString("error: volume resources are still in use; saved settings remain pending until the volume can be safely restarted")
+		}
+		if !globalFUSE.CanReuse(globalFUSEPath, globalRedisURL) {
+			return C.CString("error: the current volume is not ready to restart; saved settings remain pending")
+		}
+	}
+	var desiredRevision uint64
+	if recovery != nil {
+		if recovery.Config != persistableServerConfig(requestedConfig) {
+			return C.CString("error: recovery requested configuration changed")
+		}
+		desiredRevision = recovery.Revision
+	} else {
+		var desiredErr error
+		desiredRevision, desiredErr = beginServingDesired(requestedConfig)
+		if desiredErr != nil {
+			return C.CString("error: desired serving state unavailable: " + desiredErr.Error())
+		}
+	}
 	// Debug: show what we received from Swift
 	jmlog.Info("cbridge received config",
-		"redis_url", cfg.RedisURL,
 		"fuse_path", cfg.FUSEPath,
 		"mount_point", cfg.MountPoint,
 		"listen_addr", cfg.ListenAddr,
@@ -239,6 +1184,12 @@ func NFSServerStart(configJSON *C.char) *C.char {
 	if cfg.MetricsAddr == "" {
 		cfg.MetricsAddr = "127.0.0.1:11050"
 	}
+	helpersReady := globalNFSWriteProbeProcesses.enable(cfg.MountPoint != "")
+	globalNFSWriteVerifyArmed.Store(cfg.MountPoint != "" && helpersReady)
+	resetNFSWriteReadiness(cfg.MountPoint != "", "waiting for a verified NFS mount")
+	if cfg.MountPoint != "" && !helpersReady {
+		return C.CString("error: previous NFS write-probe helper is still exiting; retry Start after the stale mount finishes releasing")
+	}
 
 	// Capture control-plane identity for /whoami (JM-1). These config values
 	// are local to this function; the handler reads them later under globalMu.
@@ -247,6 +1198,20 @@ func NFSServerStart(configJSON *C.char) *C.char {
 	globalMetricsAddr = cfg.MetricsAddr
 	globalVolumeName = filepath.Base(cfg.MountPoint)
 	globalInstanceID = cplane.LoadOrMintInstanceID(cfg.DBPath)
+	// Preserve the configured backend solely for route-policy classification.
+	// JM_DEBUG_META_ADDR and JuiceMount Link both replace the runtime endpoint
+	// with a loopback proxy; classifying that proxy would report lo0 and erase
+	// the tunnel ceiling even though every forwarded byte still traverses utun.
+	// This value is never used for a dial or a reachability probe.
+	// JM_DEBUG_META_ADDR (dev): rewrite the metadata endpoint ONCE, here at config
+	// ingest, so every consumer agrees — the Go metadata client, the reachability
+	// probes, AND the juicefs mount args (which are built from this same value).
+	// Rewriting only the juicefs URL left the Go client dialling the real LAN
+	// address: it was blocked by macOS Local Network Privacy, the backend read as
+	// unreachable, and the app took start-while-offline and never mounted FUSE at
+	// all — so the proxy saw zero connections. Unset, this is a pure passthrough.
+	runtimeRedisURL, routePolicyURL := startRedisURLs(logicalRedisURL)
+	cfg.RedisURL = runtimeRedisURL
 	globalRedisURL = cfg.RedisURL
 
 	// Initialize structured logging early so all subsequent log lines
@@ -256,6 +1221,30 @@ func NFSServerStart(configJSON *C.char) *C.char {
 		Level:   jmlog.ParseLevel(cfg.LogLevel),
 	}); err != nil {
 		return C.CString(fmt.Sprintf("error: init logger: %v", err))
+	}
+	jmlog.Info("JuiceMount build", "version", version.Version, "commit", version.Commit)
+
+	// F1 (cellular): the control plane starts FIRST — before FUSE, Redis,
+	// sync, pin store, spool, or mount. The menu bar's truth and the pprof
+	// endpoints must exist during slow-link startup stalls, not after them.
+	// Routes are attached later via RegisterRoutes as subsystems wire up.
+	var ms *metrics.Server
+	if cfg.MetricsAddr != "" {
+		ms = metrics.NewServer(cfg.MetricsAddr, metrics.Default())
+		if err := ms.Start(); err != nil {
+			jmlog.Warn("metrics server failed to start",
+				"addr", cfg.MetricsAddr, "error", err.Error())
+			ms = nil
+		} else {
+			globalMetrics = ms
+			jmlog.Info("metrics server listening", "addr", ms.Addr())
+		}
+	}
+	stopEarlyMetrics := func() {
+		if globalMetrics != nil {
+			globalMetrics.Stop()
+			globalMetrics = nil
+		}
 	}
 
 	// A1 — Pre-mount conflict probe. Inspect the kernel mount table for any
@@ -267,8 +1256,54 @@ func NFSServerStart(configJSON *C.char) *C.char {
 	// blow up later with confusing errors. Refuse early with a clear hint
 	// the user can act on. (Mounts we placed are passed through; the existing
 	// reuse logic below handles them.)
-	if errMsg := preMountConflictCheck(cfg.FUSEPath, cfg.MountPoint); errMsg != "" {
+	if ownerMode {
+		// The setup-only Link test can retain a local node without a FUSE
+		// generation. Retire that exact test node before the selected owner
+		// acquires its state directory and persistent proxy listeners.
+		if globalFUSE == nil {
+			if setupNode := takeGlobalLinkNode(); setupNode != nil {
+				setupNode.Stop()
+			}
+		}
+		var ownerErr error
+		if recovery != nil {
+			selectedOwner, ownerErr = claimServingOwner(requestedConfig, recovery.Owner)
+		} else {
+			selectedOwner, ownerErr = selectServingOwner(requestedConfig)
+		}
+		// An ambiguous claim still belongs to the selected original. Retain the
+		// client identity for the next exact-ID query; never start local Link.
+		if selectedOwner != nil {
+			globalOwner = selectedOwner
+		}
+		if ownerErr != nil {
+			stopEarlyMetrics()
+			return C.CString("error: " + ownerErr.Error())
+		}
+		ownerReceipt = selectedOwner.claimed
+		if desiredRevision != 0 && recovery == nil {
+			if err := updateServingDesired(desiredRevision, func(r *servingDesiredRecord) error {
+				r.Owner = selectedOwner.intent
+				return nil
+			}); err != nil {
+				stopEarlyMetrics()
+				return C.CString("error: selected owner could not be bound to desired state: " + err.Error())
+			}
+		}
+		if known, expensive, constrained := hostNetworkCostSnapshot(); known {
+			if err := selectedOwner.setCost(expensive, constrained); err != nil {
+				stopEarlyMetrics()
+				return C.CString("error: selected owner network policy unknown: " + err.Error())
+			}
+		}
+	}
+	conflictFUSEPath := cfg.FUSEPath
+	if ownerMode {
+		conflictFUSEPath = ""
+	} // owner selected the physical generation; NFS ownership is still checked
+	if errMsg := preMountConflictCheck(conflictFUSEPath, cfg.MountPoint); errMsg != "" {
 		jmlog.Error("pre-mount conflict refused", "detail", errMsg)
+		stopEarlyMetrics()
 		return C.CString("error: " + errMsg)
 	}
 
@@ -276,7 +1311,7 @@ func NFSServerStart(configJSON *C.char) *C.char {
 	// a cheap short TCP dial. When it's unreachable (laptop opened on a plane,
 	// NAS asleep, router down) startup takes the offline path: skip the
 	// synchronous boot-time FUSE mount (which would otherwise stall ~30s on a
-	// dead Redis before failing), don't burn ~31s on connect retries, build a
+	// dead Redis before failing), don't burn ~65s on connect retries, build a
 	// deferred Redis client, and pre-engage auto-offline so directory navigation
 	// serves from the SQLite mirror while reads fail-fast. The watchdog +
 	// reconcile loop recover everything automatically when the backend returns.
@@ -297,16 +1332,15 @@ func NFSServerStart(configJSON *C.char) *C.char {
 	// offline session — and the U4 watchdog stand-down (correctly) never
 	// remounts while the USER flag is held, so nothing recovered it. The
 	// original "touches no network at all" goal was WRONG for the same
-	// reason: juicefs needs its Redis metadata engine to mount, so a
-	// user-offline session was never a zero-network session (this also
-	// subsumes/rejects the companion suggestion to skip the boot Redis
-	// connect while user-offline). The split that actually holds:
-	//   - FUSE mount + Redis connect budget key on backendUp (TRUE probed
-	//     reachability, exactly like every other boot);
+	// reason: JuiceFS may need its Redis metadata engine for a fresh mount.
+	// The bridge metadata client is separate from that physical handshake:
+	//   - FUSE activation keys on backendUp (TRUE probed reachability);
+	//   - the bridge Redis constructor defers on persisted user-offline intent
+	//     even if TCP is reachable, avoiding a blocking protocol PING;
 	//   - boot sync/SCAN suppression, the offline read/readdir gates, and
 	//     the started_offline banner key on startedOffline (forced below).
 	// On a metered link the only added traffic is the 1.5s TCP probe + the
-	// juicefs mount metadata handshake — no data reads (the offline gates
+	// possible JuiceFS mount metadata handshake — no data reads (the offline gates
 	// refuse un-pinned opens from the first RPC). On a dead link the probe
 	// fails fast and boot degenerates to the existing R-4 path.
 	//
@@ -315,7 +1349,9 @@ func NFSServerStart(configJSON *C.char) *C.char {
 	// when HOME was unset (arbitrary in a launchd/daemon context), silently
 	// losing the user's offline choice. Unconfigured persistence is the pin
 	// package's designed inert mode: degrade loudly and safely.
-	if home, homeErr := os.UserHomeDir(); homeErr == nil && home != "" {
+	if privateMode {
+		pin.SetOfflinePersistPath(privatePaths.OfflineIntent)
+	} else if home, homeErr := os.UserHomeDir(); homeErr == nil && home != "" {
 		pin.SetOfflinePersistPath(filepath.Join(home, ".juicemount", "offline-intent"))
 	} else {
 		jmlog.Warn("cannot resolve home directory — offline-intent persistence disabled (the offline toggle will not stick across launches)",
@@ -336,7 +1372,81 @@ func NFSServerStart(configJSON *C.char) *C.char {
 	if bootUserOffline {
 		jmlog.Info("persisted user-offline intent found — starting offline (U3); still probing + mounting FUSE so pinned files stay readable")
 	}
-	backendUp, bootRTT := backendReachableRTT(cfg.RedisURL, 1500*time.Millisecond)
+	// Bring Link up before the boot probe. tsnet is a userspace network stack,
+	// so ordinary TCP dials cannot use its subnet routes; startLink rewrites the
+	// Redis and object-store URLs to loopback proxies, while this probe dials the
+	// original backend through tsnet to verify the far side is genuinely alive.
+	linkProbeURL := cfg.RedisURL
+	var linkErr error
+	if ownerMode {
+		cfg.RedisURL, cfg.BucketOverride = ownerReceipt.RedisURL, ownerReceipt.BucketURL
+		cfg.JuiceFSBin = ownerReceipt.JuiceFSBin
+		globalFUSEPath = ownerReceipt.MountPath
+		globalFUSEMetricsAddr = ownerReceipt.MetricsAddr
+		pin.SetFUSEIdentityPath(globalFUSEPath)
+		pin.SetBlockCacheMetricsAddr(globalFUSEMetricsAddr)
+		cachePolicyFromOwner(ownerReceipt)
+	} else {
+		linkNode, linkOwned, linkErr = startServingLink(&cfg)
+	}
+	if linkErr != nil {
+		stopEarlyMetrics()
+		return C.CString("error: " + linkErr.Error())
+	}
+	globalRedisURL = cfg.RedisURL
+	// The same resolved executable must drive the actual FUSE generation and
+	// the cache-layout compatibility probe. A saved reader without it remains
+	// locally detached rather than verifying an unrelated Homebrew binary.
+	if bin, err := engineLaunchJuiceFS(globalFUSE != nil, globalFUSEBinary, cfg.JuiceFSBin); err != nil {
+		stopEarlyMetrics()
+		return C.CString("error: " + err.Error())
+	} else {
+		cfg.JuiceFSBin = bin
+	}
+	// Resolve the route to the ORIGINAL backend before mount policy is chosen.
+	// A system Tailscale route can hide a cellular underlay behind a 2 ms local
+	// tunnel endpoint, and Network.framework does not reliably propagate
+	// isExpensive through every VPN. Cap automatic policy at Slow whenever the
+	// backend itself traverses utun. The lookup is a kernel routing decision and
+	// sends no traffic.
+	if backendAddr := backendRouteTarget(routePolicyURL); backendAddr != "" {
+		if routeErr := resolveAndApplyBackendRouteCeiling(backendAddr, health.ResolveRouteInterface); routeErr != nil {
+			jmlog.Warn("could not resolve backend route for startup link ceiling; retaining prior conservative policy",
+				"error", routeErr.Error())
+		}
+	}
+	var backendUp bool
+	var bootRTT time.Duration
+	if ownerMode && ownerReceipt.LinkEnabled {
+		proof, proofErr := selectedOwner.startupProbe()
+		if proofErr != nil {
+			jmlog.Warn("selected owner startup Link proof unavailable", "error", proofErr.Error())
+		} else {
+			backendUp, bootRTT = proof.BackendUp, time.Duration(proof.ProbeRTTNanos)
+			netprofile.Default().ObserveRTT(bootRTT)
+			if proof.DownloadMbps > 0 {
+				observeLinkDataPlaneDownload(netprofile.Default(), linkDataPlaneBenchmarkBytes, proof.DownloadMbps)
+			}
+		}
+	} else if linkNode == nil {
+		backendUp, bootRTT = backendReachableRTT(cfg.RedisURL, 1500*time.Millisecond)
+	} else {
+		waitForLinkStartupReady(linkNode, 2500*time.Millisecond)
+		backendUp, bootRTT = linkBackendReachableRTT(linkNode, linkProbeURL, 1500*time.Millisecond)
+		if backendUp {
+			uploadMbps, downloadMbps, benchErr := linkRedisDataPlaneBenchmark(linkNode, linkProbeURL, linkDataPlaneBenchmarkBytes, 15*time.Second)
+			if benchErr != nil {
+				backendUp = false
+				jmlog.Warn("JuiceMount Link: encrypted data-plane benchmark failed at startup — taking offline path",
+					"error", benchErr.Error())
+			} else {
+				observeLinkDataPlaneDownload(netprofile.Default(), linkDataPlaneBenchmarkBytes, downloadMbps)
+				jmlog.Info("JuiceMount Link: encrypted data-plane benchmark verified at startup",
+					"bytes", linkDataPlaneBenchmarkBytes,
+					"upload_mbps", uploadMbps, "download_mbps", downloadMbps)
+			}
+		}
+	}
 	// V2.3 U2/K2: a link can be reachable-but-useless — the TCP handshake
 	// completes inside 1.5s but the RTT is so high that the synchronous
 	// online boot (juicefs mount + first syncs) would churn for minutes.
@@ -380,7 +1490,7 @@ func NFSServerStart(configJSON *C.char) *C.char {
 	}
 	if !backendUp {
 		jmlog.Warn("metadata backend unreachable at startup — taking the start-while-offline path (serving cached navigation; reads resume when the backend returns)",
-			"redis_url", cfg.RedisURL)
+			"backend", "redis")
 	}
 
 	// Mount JuiceFS FUSE if not already mounted. This is what the standalone
@@ -406,48 +1516,31 @@ func NFSServerStart(configJSON *C.char) *C.char {
 	// globalFUSEPath / globalFUSEMetricsAddr) is disjoint from the store lane's
 	// globalStore, and the parent blocks on the join before any other code
 	// reads them, so there is no added race.
+	bootFUSEReady := false
+	var generationErr error
 	mountFUSE := func() {
 		if cfg.FUSEPath == "" {
 			return
 		}
-		// Make sure the mount-point directory exists
-		_ = os.MkdirAll(cfg.FUSEPath, 0o755)
-		globalFUSEPath = cfg.FUSEPath
-		// V2.3 G0: arm the FUSE identity gate. Drains, phantom purges, and
-		// reconcile prunes all refuse to act while this path has no real
-		// filesystem mounted on it (kext-approval loss / mount absent /
-		// wedge) instead of silently operating against a plain local dir.
-		pin.SetFUSEIdentityPath(cfg.FUSEPath)
-
-		if globalFUSE != nil && fuseLooksHealthy(cfg.FUSEPath) {
-			jmlog.Info("juicefs FUSE already mounted, reusing", "path", cfg.FUSEPath)
+		if ownerMode {
+			r, mountErr := selectedOwner.activate(backendUp)
+			if mountErr != nil {
+				generationErr = fmt.Errorf("selected original FUSE activation: %w", mountErr)
+				return
+			}
+			globalFUSEPath, globalFUSEMetricsAddr = r.MountPath, r.MetricsAddr
+			pin.SetFUSEIdentityPath(r.MountPath)
+			pin.SetBlockCacheMetricsAddr(r.MetricsAddr)
+			cachePolicyFromOwner(r)
+			bootFUSEReady = fuseLooksHealthy(r.MountPath)
 			return
 		}
-		// Forward the user's configured cache size to JuiceFS. Without this,
-		// JuiceFS uses an unspecified default and (worse) the user's
-		// preferred cap is silently ignored — see the regression in the
-		// CLI→GUI port where the menu-bar app was passing cache_size in
-		// the JSON config but cbridge never forwarded it.
-		//
-		// FreeSpaceRatio = 0.01 (1%) instead of JuiceFS's default 0.1.
-		// Video editors fill their disks; the default makes the cache
-		// silently disable below 10% free, sending every read straight
-		// to S3 with no warning. 1% is the sweet spot for our use case
-		// — the disk is the cache.
-		// QA-7 followup: if we're entering this branch with a still-
-		// live globalFUSE (e.g. fuseLooksHealthy misfired after
-		// NFSServerStopMount which intentionally preserved it), stop
-		// the old manager FIRST so we don't leak its monitor
-		// goroutine. The old FUSEManager's monitor would otherwise
-		// keep ticking against the now-replaced mount and could
-		// race with the new one. Idempotent — Stop on an already-
-		// stopped manager is a no-op.
+		// A same-manager restart can reuse its exact child and configuration.
+		// Failed health is not authority to discard that manager or force a
+		// replacement mount; its existing recovery loop retains responsibility.
 		if globalFUSE != nil {
-			jmlog.Warn("Start: replacing existing globalFUSE that fuseLooksHealthy rejected — stopping the old one first to prevent monitor leak",
-				"path", cfg.FUSEPath)
-			oldFM := globalFUSE
-			globalFUSE = nil
-			oldFM.Stop()
+			bootFUSEReady = fuseLooksHealthy(globalFUSEPath)
+			return
 		}
 		// Pre-read total pinned bytes so the cache-size policy can grow the
 		// cache just enough to keep the pinned set resident. The pin store
@@ -461,15 +1554,31 @@ func NFSServerStart(configJSON *C.char) *C.char {
 			}
 			ps.Close()
 		}
-		fm := health.NewFUSEManager(health.FUSEConfig{
-			RedisURL:        cfg.RedisURL,
-			MountPoint:      cfg.FUSEPath,
-			CacheSize:       cfg.CacheSize,
-			FreeSpaceRatio:  "0.01",
-			BucketOverride:  cfg.BucketOverride,
-			PinnedBytes:     pinnedBytes,
-			FUSEMetricsAddr: health.DefaultFUSEMetricsAddr,
+		fm, err := health.NewGenerationFUSEManager(health.FUSEConfig{
+			JuiceFSBin:     cfg.JuiceFSBin,
+			RedisURL:       cfg.RedisURL,
+			MountPoint:     cfg.FUSEPath,
+			CacheSize:      cfg.CacheSize,
+			CacheDir:       privatePaths.CacheBase,
+			FreeSpaceRatio: "0.01",
+			BucketOverride: cfg.BucketOverride,
+			PinnedBytes:    pinnedBytes,
+			FUSEMetricsAddr: func() string {
+				if cfg.FUSEMetricsAddr != "" {
+					return cfg.FUSEMetricsAddr
+				}
+				return health.DefaultFUSEMetricsAddr
+			}(),
+			OpenCacheTTL: cfg.OpenCacheTTL,
+			ObjectKey:    health.ObjectKey{AccessKey: cfg.ObjectAccessKey, SecretKey: cfg.ObjectSecretKey},
 		})
+		if err != nil {
+			generationErr = fmt.Errorf("reserve FUSE generation: %w", err)
+			return
+		}
+		physicalFUSEPath := fm.MountPoint()
+		globalFUSEPath = physicalFUSEPath
+		pin.SetFUSEIdentityPath(physicalFUSEPath)
 		// Pin-capacity baseline (audit fix v2, 2026-07-14): record the
 		// CONFIGURED budget before any mount attempt so the capacity
 		// verdict caps correctly on EVERY mount path (inline success,
@@ -507,29 +1616,30 @@ func NFSServerStart(configJSON *C.char) *C.char {
 		}
 		fm.StartMonitor()
 		globalFUSE = fm
+		globalFUSEBinary = cfg.JuiceFSBin
+		globalFUSEConfig = &requestedConfig
 		if !backendUp {
 			jmlog.Warn("deferred FUSE mount — backend unreachable at startup; the watchdog will mount it once the backend returns",
-				"path", cfg.FUSEPath)
+				"path", physicalFUSEPath)
 		} else if mountErr != nil {
-			// Launch-time mount failed — almost always a transient backend
-			// blip during startup. Do NOT abort startup: the watchdog
-			// (started above) brings FUSE up once the backend is reachable.
-			// Returning here used to leave the app HALF-STARTED — juicefs
-			// recovering in the background but NFS, the metrics/control
-			// server, and the spool never started, so /Volumes/zpool never
-			// mounted and the app looked dead (observed 2026-06-01 under a
-			// blippy link). Continue instead: the app comes up fully,
-			// un-pinned reads fail-fast until FUSE is ready, and the mount
-			// self-heals.
-			jmlog.Error("juicefs FUSE mount failed at launch — continuing startup; watchdog will mount it once the backend is reachable",
-				"error", mountErr.Error())
+			// Keep the startup control plane available for diagnostics. A
+			// consumed generation cannot be reused by the watchdog; a failure
+			// before launch may still be retried at this reserved path.
+			if fm.GenerationAttempted() {
+				jmlog.Error("juicefs FUSE launch failed after generation was consumed — automatic replacement blocked pending safe settlement",
+					"error", mountErr.Error(), "path", physicalFUSEPath)
+			} else {
+				jmlog.Error("juicefs FUSE mount failed before child launch — watchdog may retry the reserved generation",
+					"error", mountErr.Error(), "path", physicalFUSEPath)
+			}
 		} else {
+			bootFUSEReady = true
 			// Note: FUSEManager.Mount may have auto-expanded CacheSize. Log
 			// the *effective* config from the mount, not the user input —
 			// otherwise the user reads "100 GiB" and is confused why the
 			// daemon was actually launched with 800 GiB.
 			jmlog.Info("juicefs FUSE mounted",
-				"path", cfg.FUSEPath,
+				"path", physicalFUSEPath,
 				"effective_cache_size_mb", fm.EffectiveCacheSize(),
 				"free_space_ratio", "0.01")
 			// Pin-capacity audit (2026-07-14): the user's cache budget is a
@@ -545,76 +1655,121 @@ func NFSServerStart(configJSON *C.char) *C.char {
 	// openStore opens the metadata store. Fatal on error (as before): a caller
 	// with no store cannot serve nav. The connect lane runs AFTER this (it
 	// needs the opened store), so store→connect stays serial; only the mount
-	// overlaps them.
+	// overlaps them. (Link node startup moved above the probe — T2.2.)
+	var unfinishedSpoolRows int
 	openStore := func() (*metadata.Store, error) {
 		// Open metadata store. If this fails, leave FUSE mounted — the next
 		// Start can pick it up. Tearing FUSE down here would force an admin
 		// password prompt on the next attempt, which is hostile.
-		return metadata.Open(cfg.DBPath)
+		store, err := metadata.Open(cfg.DBPath)
+		if err != nil {
+			return nil, err
+		}
+		unfinishedSpoolRows, err = startupUnfinishedSpoolRows(store.DB())
+		if err != nil {
+			_ = store.Close()
+			return nil, fmt.Errorf("inspect local write spool before serving: %w", err)
+		}
+		if err := store.CheckSpoolRecovery(); err != nil {
+			_ = store.Close()
+			return nil, fmt.Errorf("inspect spool publication before serving: %w", err)
+		}
+		return store, nil
 	}
 
-	// Retry schedule: 1s, 2s, 4s, 8s, 16s = 5 attempts, ~31s total worst case.
-	// R-4: when the up-front probe already found the backend down, don't burn
-	// those ~31s — one quick attempt, then take the offline-start path.
+	// Retry schedule for an ONLINE boot: 5 attempts, with 1s, 2s, 4s,
+	// and 8s sleeps plus up to 10s per protocol PING (~65s nominal total).
+	// A user-OFFLINE or slow-link boot does not call the
+	// connected constructor at all. The up-front probe has already made the
+	// policy decision, and metadata.NewRedisClient performs a second PING with
+	// a 10s deadline. On an 800ms shaped link that redundant PING added 9.1s
+	// before the cached namespace could be published. Build the lazy deferred
+	// client instead; rc.Start owns background reconnection as before.
 	connectAttempts := 5
-	if !backendUp {
-		connectAttempts = 1
-	}
 
-	// S1: run mount ‖ (open → connect). The mount lane never returns from the
-	// function (mount failure is non-fatal, handled inline in mountFUSE); the
-	// store/connect lane can early-return (fatal open error / malformed URL),
-	// so it stays in the main flow where the C-string returns are clean. The
-	// only concurrency is the backgrounded mount; we JOIN it before any code
-	// below reads globalFUSE or reaches srv.Start(). Kill switch
-	// JM_BOOT_PARALLEL=0 runs the original strictly-serial order (mount, then
-	// open, then connect) for a bisect if the orchestration is ever suspected.
-	var store *metadata.Store
+	// Refuse a different saved selector and initialize the path admission
+	// index before either parallel mount effect. Connection still overlaps the
+	// mount; only the local Store open moves ahead of both lanes.
+	store, openErr := openStore()
+	if openErr != nil {
+		stopEarlyMetrics()
+		return C.CString(fmt.Sprintf("error: open store: %v", openErr))
+	}
+	globalStore = store
+	cachePaths, pathErr := metadata.OpenCachePathEligibility(store)
+	if pathErr != nil {
+		_ = store.Close()
+		globalStore = nil
+		stopEarlyMetrics()
+		return C.CString(fmt.Sprintf("error: cache path eligibility: %v", pathErr))
+	}
+	cacheOpts, optsErr := redisurl.Parse(cfg.RedisURL)
+	if optsErr != nil {
+		_ = store.Close()
+		globalStore = nil
+		stopEarlyMetrics()
+		return C.CString(fmt.Sprintf("error: cache Redis endpoint: %v", optsErr))
+	}
+	cacheStateDir, stateErr := cacheSessionStateDir(cfg.DBPath)
+	if stateErr != nil {
+		_ = store.Close()
+		globalStore = nil
+		stopEarlyMetrics()
+		return C.CString(fmt.Sprintf("error: cache state directory: %v", stateErr))
+	}
+	selection := []string{requestedConfig.BucketOverride, requestedConfig.NetControlURL, requestedConfig.NetNASAddr}
+	cacheOwner, cacheErr := newBridgeCacheOwner(store, logicalRedisURL, selection, cacheOpts, cacheStateDir, cfg.JuiceFSBin)
+	if cacheErr != nil {
+		_ = store.Close()
+		globalStore = nil
+		stopEarlyMetrics()
+		return C.CString(fmt.Sprintf("error: bind selected cache volume: %v", cacheErr))
+	}
+	globalCacheOwner = cacheOwner
 	var rc *metadata.RedisClient
 	var connectErr error
+	connectBootRedis := func() {
+		rc, connectErr = redisClientForBoot(cfg.RedisURL, store, backendUp, bootUserOffline, connectAttempts)
+	}
 	if os.Getenv("JM_BOOT_PARALLEL") == "0" {
 		mountFUSE()
-		var openErr error
-		store, openErr = openStore()
-		if openErr != nil {
-			return C.CString(fmt.Sprintf("error: open store: %v", openErr))
-		}
-		globalStore = store
-		// Connect to Redis with bounded retry. Network can be flaky — wifi/cell
-		// handoffs, sleeping NAS, brief router restart. Without this, a 1s blip
-		// at launch leaves the user staring at "redis: connect: no route to host"
-		// even though the NAS comes back 3 seconds later.
-		rc, connectErr = connectRedisWithRetry(cfg.RedisURL, store, connectAttempts)
+		connectBootRedis()
 	} else {
 		var mountWG sync.WaitGroup
 		mountWG.Add(1)
-		go func() {
-			defer mountWG.Done()
-			mountFUSE()
-		}()
-		// Main flow: open the store, then (if it opened) connect — serial
-		// because connect needs the store — while the mount runs concurrently.
-		var openErr error
-		store, openErr = openStore()
-		if openErr != nil {
-			// The mount goroutine writes only its own globals and never returns
-			// from the function; join it so we don't abandon an in-flight mount
-			// goroutine writing globalFUSE after we've released globalMu.
-			mountWG.Wait()
-			return C.CString(fmt.Sprintf("error: open store: %v", openErr))
-		}
-		globalStore = store
-		// Connect to Redis with bounded retry (see the schedule note above).
-		rc, connectErr = connectRedisWithRetry(cfg.RedisURL, store, connectAttempts)
-		// JOIN the mount before srv.Start() (preserves pinned-files-instant —
-		// NFS must not serve before the mount lane has registered globalFUSE +
-		// armed the identity gate). Done here, before we touch rc/globalFUSE
-		// below, so every downstream invariant sees the same post-join state as
-		// the serial path.
+		go func() { defer mountWG.Done(); mountFUSE() }()
+		connectBootRedis()
 		mountWG.Wait()
 	}
 
-	startedOffline := false
+	if generationErr != nil {
+		cacheOwner.stop()
+		globalCacheOwner = nil
+		if rc != nil {
+			rc.Stop()
+		}
+		if store != nil {
+			_ = store.Close()
+			globalStore = nil
+		}
+		stopEarlyMetrics()
+		return C.CString("error: " + generationErr.Error())
+	}
+	// Every FUSE consumer below this join receives the physical path. The
+	// requested configuration above remains unchanged for equality/reuse.
+	if globalFUSE != nil || selectedOwner != nil {
+		cfg.FUSEPath = globalFUSEPath
+	}
+	if rc == nil {
+		cacheOwner.stop()
+		globalCacheOwner = nil
+		store.Close()
+		globalStore = nil
+		stopEarlyMetrics()
+		return C.CString(fmt.Sprintf("error: redis: %v", connectErr))
+	}
+
+	startedOffline := !backendUp
 	// Batch-3 adversarial review #8: carry a per-cause reason for the
 	// "started_offline:" status instead of always reusing the R-4 constant —
 	// a deliberate user-offline relaunch was reported to Swift (and os_log'd)
@@ -622,47 +1777,28 @@ func NFSServerStart(configJSON *C.char) *C.char {
 	// slow-backend defer claimed "unreachable" while its own SetAutoOffline
 	// reason said "responding slowly".
 	startOfflineReason := offlineStartReason
-	if err := connectErr; err != nil {
-		// R-4: do NOT abort. Start offline. A DEFERRED Redis client
-		// (connected=false) keeps every downstream rc.* call site working
-		// unchanged and self-heals via the reconcile loop (which flips
-		// connected=true on its first successful sync once the backend returns).
-		// Directory navigation serves from the SQLite mirror; file reads
-		// fail-fast with NXIO until the watchdog remounts FUSE.
-		drc, derr := metadata.NewRedisClientDeferred(cfg.RedisURL, store)
-		if derr != nil {
-			// Only a malformed Redis URL reaches here (ParseRedisURL) — a real
-			// config error the user must fix, not a transient outage.
-			store.Close()
-			return C.CString(fmt.Sprintf("error: redis: %v", derr))
-		}
-		jmlog.Warn("started offline — metadata backend unreachable; serving cached navigation, will recover automatically",
-			"reason", err.Error())
-		rc = drc
-		startedOffline = true
-		// Engage offline mode NOW (don't wait the ~22s reachability debounce) so
-		// the open/read gates AND the readdir empty-fast path are live from the
-		// first RPC. LOAD-BEARING (not cosmetic): without it, navigating into an
-		// un-synced subtree falls through to a FUSE timeout instead of returning
-		// fast. connected=false on the deferred client also makes RecentlyDegraded
-		// true, which suppresses the phantom-purge so the offline session can't
-		// delete real entries from the mirror.
-		pin.SetAutoOffline(true, offlineStartReason)
-	}
-	// V2.3 U2 review fix (HIGH): the RTT defer must yield the SAME offline-
-	// start semantics as a dead backend even when the connect above
-	// SUCCEEDED (a reachable-but-slow backend usually answers within the
-	// 10s dial). With startedOffline forced true: the boot skips the
-	// synchronous fm.Mount() and the U1 blocking-sync branch (no full SCAN
-	// over the terrible link, fresh installs included), the offline
-	// read/readdir gates are live from the first RPC, and Swift gets the
-	// started_offline banner. Recovery is the standard R-4 machinery — the
-	// reachability monitor + watchdog bring the mount and sync up in the
-	// background (with a LIVE rc here, the first reconcile tick syncs
-	// without waiting for a reconnect).
-	if bootRTTDeferred && !startedOffline {
-		startedOffline = true
+	if bootRTTDeferred {
 		startOfflineReason = "backend responding slowly — started offline; recovering in background"
+	}
+	if err := connectErr; err != nil {
+		// redisClientForBoot has already replaced a failed connected client with
+		// a lazy deferred one. This error is retained only as the diagnostic that
+		// explains why an otherwise-online boot changed modes.
+		startedOffline = true
+	}
+	if startedOffline {
+		detail := "boot reachability probe classified the backend unavailable"
+		if connectErr != nil {
+			detail = connectErr.Error()
+		} else if bootRTTDeferred {
+			detail = fmt.Sprintf("measured RTT %dms exceeded the boot threshold", bootRTT.Milliseconds())
+		}
+		jmlog.Warn("started offline — serving cached navigation; backend recovery continues in background",
+			"reason", detail)
+		// Engage offline mode NOW (don't wait the reachability debounce) so the
+		// open/read gates AND the readdir empty-fast path are live from the first
+		// RPC. connected=false on the deferred client also suppresses phantom
+		// pruning while the backend is absent.
 		pin.SetAutoOffline(true, startOfflineReason)
 	}
 	// V2.3 U3: persisted USER intent — engage the user flag (not auto), so
@@ -676,7 +1812,32 @@ func NFSServerStart(configJSON *C.char) *C.char {
 		startOfflineReason = "offline mode is on (your setting from last session)"
 		pin.SetOffline(true)
 	}
+	if selectedOwner != nil {
+		if err := selectedOwner.syncOffline(); err != nil {
+			cacheOwner.stop()
+			globalCacheOwner = nil
+			rc.Stop()
+			_ = store.Close()
+			globalStore = nil
+			stopEarlyMetrics()
+			return C.CString("error: selected owner offline state unknown: " + err.Error())
+		}
+	}
 	globalRC = rc
+	// Capture bounded post-commit metadata hints even if boot SyncOnce runs
+	// before the NFS handler exists. Work starts only after spool recovery.
+	rc.SetCacheCandidateSink(cacheOwner.offerCandidate)
+	rc.SetBackendQualified(false)
+	cacheOwner.rc.Store(rc)
+	cacheOwner.session.SetOnline(!startedOffline)
+	if !startedOffline {
+		qualifyCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		if err := cacheOwner.session.Qualify(qualifyCtx); err != nil {
+			jmlog.Warn("cache backend qualification unavailable; serving local mirror", "error", err.Error())
+		}
+		cancel()
+	}
+
 	// QA-30 (2026-05-25): give the reconcile loop the path config it needs
 	// for pin-filter normalization (mountpoint-prefixed pin paths vs
 	// internal metadata paths) and per-path FUSE Lstat verification of
@@ -697,12 +1858,22 @@ func NFSServerStart(configJSON *C.char) *C.char {
 	// offline mode, refuse un-pinned reads fast, and surface state
 	// in the UI. For now this is purely observational — it logs
 	// transitions but does not yet affect any other state.
-	if reachAddr, _, _ := metadata.ParseRedisURL(cfg.RedisURL); reachAddr != "" {
+	reachURL := cfg.RedisURL
+	if linkNode != nil || (ownerMode && ownerReceipt.LinkEnabled) {
+		// The proxy listener is local and therefore reachable even while Link's
+		// far-side route is down. Probe the original NAS endpoint through the
+		// Link dialer so recovery/offline transitions describe the real encrypted
+		// data plane and never clear offline merely because 127.0.0.1 accepted.
+		reachURL = linkProbeURL
+	}
+	if reachAddr, _, _ := metadata.ParseRedisURL(reachURL); reachAddr != "" {
 		// Feed successful-probe RTT into the network-profile link estimator so
 		// adaptive readahead can bootstrap link class (fast LAN vs slow WAN)
 		// before any throughput sample arrives (internal/netprofile).
-		globalReach = health.NewReachability(reachAddr,
+		reachOpts := []health.ReachabilityOption{
+			health.WithFailureThreshold(backendFailuresToOffline),
 			health.WithRTTObserver(netprofile.Default().ObserveRTT),
+			health.WithInitialRTT(bootRTT),
 			// Drain-liveness false-flap override (task #66 salvage, NFSv3
 			// sprint): a completed drain (a MinIO PUT that landed) is positive
 			// proof the backend is reachable over the SAME link the probe
@@ -731,56 +1902,21 @@ func NFSServerStart(configJSON *C.char) *C.char {
 					return time.Duration(math.MaxInt64)
 				}
 				return time.Since(last)
+			}),
+		}
+		if linkNode != nil {
+			reachOpts = append(reachOpts, health.WithDialContext(linkNode.DialContext))
+		} else if ownerMode && ownerReceipt.LinkEnabled {
+			reachOpts = append(reachOpts, health.WithProbe(func(ctx context.Context) (time.Duration, error) {
+				proof, err := selectedOwner.client.probe(ctx)
+				if err != nil {
+					return 0, err
+				}
+				return time.Duration(proof.ProbeRTTNanos), nil
 			}))
-		globalReach.OnChange(func(reachable bool, reason string) {
-			offlineEngageMu.Lock()
-			defer offlineEngageMu.Unlock()
-			if reachable {
-				// Cancel any pending offline-engage and lift auto-offline at
-				// once. Recovery is intentionally NOT debounced — the moment
-				// the route is back we want un-pinned reads flowing again. The
-				// user-intent flag (SetOffline) is untouched.
-				if offlineEngageTimer != nil {
-					offlineEngageTimer.Stop()
-					offlineEngageTimer = nil
-				}
-				jmlog.Info("network path to backend recovered",
-					"target", reachAddr, "reason", reason)
-				pin.SetAutoOffline(false, "")
-				// Kick reconciliation immediately. Shutdown-safe: `rc` is the
-				// captured RedisClient pointer; a late callback after rc.Stop()
-				// does a non-blocking send to an undrained channel. Benign.
-				rc.TriggerSync()
-			} else {
-				// DEBOUNCE: do NOT engage offline on a brief blip. Arm a timer;
-				// only engage if the backend is STILL unreachable after
-				// offlineEngageDelay of continuous failure. A 2-6s blip (which
-				// the warm-connection health checks ride straight through)
-				// recovers long before this fires, so the app never shows a
-				// spurious "offline" while Redis/MinIO/FUSE all read OK.
-				if offlineEngageTimer != nil {
-					offlineEngageTimer.Stop()
-				}
-				jmlog.Warn("network path to backend lost — deferring offline engage",
-					"target", reachAddr, "reason", reason,
-					"engage_after", offlineEngageDelay.String())
-				capturedReason := reason
-				offlineEngageTimer = time.AfterFunc(offlineEngageDelay, func() {
-					offlineEngageMu.Lock()
-					defer offlineEngageMu.Unlock()
-					if globalReach.Reachable() {
-						return // recovered during the debounce window — no-op
-					}
-					jmlog.Warn("backend unreachable for sustained window — engaging offline mode",
-						"target", reachAddr, "reason", capturedReason,
-						"sustained", offlineEngageDelay.String())
-					// NFS handler reads pin.IsOffline() in the read path to
-					// fail-fast un-pinned reads instead of stalling on
-					// kernel-NFS timeouts.
-					pin.SetAutoOffline(true, capturedReason)
-				})
-			}
-		})
+		}
+		globalReach = health.NewReachability(reachAddr, reachOpts...)
+		globalReach.OnChange(cacheOwner.reachChanged)
 		// R-4: if we started offline, seed the monitor "unreachable" so the FIRST
 		// successful probe is a real unreachable→reachable transition that fires
 		// the OnChange(true) branch above → pin.SetAutoOffline(false) + TriggerSync.
@@ -790,11 +1926,10 @@ func NFSServerStart(configJSON *C.char) *C.char {
 		if startedOffline {
 			globalReach.SeedUnreachable()
 		}
-		globalReach.Start()
 	}
 
 	// [metadata keyspace push] Wire the class-gating signals BEFORE rc.Start so
-	// the keyspace loop (started inside Start when JM_METADATA_KEYSPACE_PUSH=1)
+	// the keyspace loop (started inside Start unless JM_METADATA_KEYSPACE_PUSH=0)
 	// can class-gate its rare-backstop cadence + coalescer from launch.
 	// Review fix (phase-1 adversarial review): the reachability signal is
 	// wired UNCONDITIONALLY — RecentlyDegraded's reachableNow() gate (the G2
@@ -808,7 +1943,7 @@ func NFSServerStart(configJSON *C.char) *C.char {
 		reachFn = globalReach.Reachable
 	}
 	var ifaceFn func() string
-	if os.Getenv("JM_METADATA_KEYSPACE_PUSH") == "1" {
+	if metadata.KeyspacePushEnabled() {
 		// G8 (task #81): classify by the route to the BACKEND, not the default
 		// route. Proven live 2026-07-02 (hotspot + Tailscale): the NAS route was
 		// utun6 but the default-route heuristic reported en0, so currentLinkClass
@@ -822,11 +1957,15 @@ func NFSServerStart(configJSON *C.char) *C.char {
 		// JM_NET_FORCE_CLASS override precedence is untouched: those are consulted
 		// in metadata.currentLinkClass / netprofile BEFORE this signal.
 		var opts []health.NetWatcherOption
-		if backendAddr, _, _ := metadata.ParseRedisURL(cfg.RedisURL); backendAddr != "" {
+		if backendAddr := backendRouteTarget(routePolicyURL); backendAddr != "" {
 			opts = append(opts, health.WithBackendTarget(backendAddr))
 		}
 		globalKeyspaceNetWatcher = health.NewNetWatcher(1*time.Second, opts...)
+		globalKeyspaceNetWatcher.OnChange(func(_, current string) {
+			applyBackendRouteCeiling(current)
+		})
 		globalKeyspaceNetWatcher.Start()
+		applyBackendRouteCeiling(globalKeyspaceNetWatcher.ActiveInterface())
 		ifaceFn = globalKeyspaceNetWatcher.ActiveInterface
 	}
 	metadata.SetClassSignals(ifaceFn, reachFn)
@@ -901,28 +2040,8 @@ func NFSServerStart(configJSON *C.char) *C.char {
 	}
 	rc.Start()
 
-	// Cache reader
-	cacheDir := cache.DetectCacheDir()
-	if cacheDir != "" {
-		addr, db, _ := metadata.ParseRedisURL(cfg.RedisURL)
-		// Explicit timeouts so a Redis hiccup can't park cache.Reader.getSlices
-		// on a default-timeout LRange — that call happens on every cache-miss
-		// read and a 30s stall there cascades through every concurrent NFS
-		// RPC under the current per-connection sequential dispatch. Matches
-		// the timeouts on the metadata client.
-		rdb := redis.NewClient(&redis.Options{
-			Addr:         addr,
-			DB:           db,
-			ReadTimeout:  10 * time.Second,
-			WriteTimeout: 5 * time.Second,
-			DialTimeout:  5 * time.Second,
-		})
-		globalRDB = rdb
-		cr := cache.NewReader(cacheDir, cache.DefaultBlockSize, rdb)
-		if err := cr.Verify(); err == nil {
-			globalCache = cr
-		}
-	}
+	// Cache admission, saved Reader and handler attach below are completed
+	// before either Session or Reachability starts background callbacks.
 
 	// NFS server
 	srv := jmnfs.NewServer(jmnfs.Config{
@@ -933,34 +2052,95 @@ func NFSServerStart(configJSON *C.char) *C.char {
 		// <= 0 fallback, so old config JSON behaves identically.
 		MemBufBudgetMB:    cfg.MemoryBufferMB,
 		MemBufFileLimitMB: cfg.MemBufFileLimitMB,
+		NativePreviewWarm: &cfg.NativePreviewWarm,
 	}, store)
 
-	if err := srv.Start(); err != nil {
-		rc.Stop()
-		store.Close()
-		return C.CString(fmt.Sprintf("error: start: %v", err))
+	// NewServer prepares the handler without opening the listener. Wire every
+	// dependency before Start so the first accepted RPC cannot race partially
+	// initialized cache/Redis/presence state.
+	h := srv.Handler()
+	cacheOwner.attach(rc, h, cachePaths)
+	jmlog.Info("STARTUP-TRACE: B-post-cacheReader")
+	h.SetRedisClient(rc)
+	// Persistence belongs to the selected cache session and is available
+	// independently of thumbnail hydration. Load before listener publication.
+	if cfg.DBPath != "" && cfg.DBPath != ":memory:" {
+		h.SidecarPersistEnable(filepath.Join(cacheStateDir, "sidecars.gob"))
 	}
+	jmlog.Info("STARTUP-TRACE: C-post-redisClient")
+	pt := jmnfs.NewPresenceTracker(rc.RawDB())
+	jmlog.Info("STARTUP-TRACE: D-post-presenceTracker")
+	h.SetPresence(pt)
+	jmlog.Info("STARTUP-TRACE: E-post-globalMu")
 
-	if globalCache != nil {
-		srv.Handler().SetCacheReader(globalCache)
-	}
-	srv.Handler().SetRedisClient(rc)
-
-	// #12: after a watchdog FUSE remount, every pooled fd references the
-	// DEAD mount — Get kept re-serving them ("stale fd → 0-byte reads").
-	// Flush the pool the moment a remount succeeds.
-	if globalFUSE != nil {
-		h := srv.Handler()
-		globalFUSE.SetOnRemount(func() {
+	// This local atomic lets the FUSE watchdog notify the health monitor after
+	// a verified remount without taking globalMu. Taking globalMu here can
+	// deadlock shutdown: Stop holds it while waiting for the watchdog to exit.
+	// The closure owns this pointer for the lifetime of the FUSE manager.
+	var fuseRecoveryMonitor atomic.Pointer[health.HealthMonitor]
+	var spoolStartupReady atomic.Bool
+	if globalFUSE != nil || selectedOwner != nil {
+		reachability := globalReach
+		applyOwnerRemount := func() bool {
 			closed, marked := h.FlushStaleFDs()
 			jmlog.Info("fd pool flushed after FUSE remount (#12)",
 				"closed_idle", closed, "marked_stale_held", marked)
-		})
+			if !spoolStartupReady.Load() {
+				return false
+			}
+			// A deferred/failed boot mount deliberately leaves the NFS listener
+			// closed. Start it only after the watchdog has verified FUSE, then
+			// give absent-mount recovery the actual bound address. Start is
+			// idempotent, so ordinary remounts keep the existing listener.
+			if err := startupNFSListener(srv); err != nil {
+				jmlog.Error("nfs listener failed to start after FUSE recovery",
+					"error", err.Error())
+				return false
+			}
+			// A verified FUSE remount is the second half of recovery. Lift only
+			// the automatic cached-only gate (never the user's explicit Offline
+			// choice) once the metadata path is also known reachable.
+			cacheOwner.recoverIfSafe(func() bool {
+				return reachability == nil || reachability.Reachable()
+			}, cfg.FUSEPath)
+			if mon := fuseRecoveryMonitor.Load(); mon != nil {
+				mon.SetNFSServerAddr(srv.Addr())
+				mon.RecoverAbsentNFSNow()
+			}
+			return true
+		}
+		if selectedOwner != nil {
+			globalOwnerLoop = startOwnerCallbackLoop(selectedOwner, applyOwnerRemount, func(mode string) {
+				cacheOwner.transportChanged(mode, func() bool { return reachability == nil || reachability.Reachable() })
+			})
+		} else {
+			globalFUSE.SetOnRemount(func() { applyOwnerRemount() })
+		}
 	}
+	// Never accept NFS requests against a path whose JuiceFS identity has not
+	// been verified. The recovery callback above starts the listener after a
+	// deferred FUSE mount succeeds. NFS-only/server deployments have no FUSE
+	// dependency and continue to start immediately.
+	listenerBackingReady := bootFUSEReady
+	if !listenerBackingReady && cfg.FUSEPath != "" && fuseLooksHealthy(cfg.FUSEPath) {
+		// The watchdog can recover during the metadata/bootstrap work before
+		// SetOnRemount is installed. Re-probe once here so that narrow window
+		// cannot leave a healthy FUSE mount with a listener that never starts.
+		listenerBackingReady = true
+		jmlog.Info("JuiceFS backing mount recovered during startup; opening NFS listener")
+	}
+	// Listener publication follows spool recovery below. A remount callback
+	// cannot open it while the local write queue is still being inspected.
+	globalPresence = pt // already holding globalMu from function entry
 	globalServer = srv
+	globalMountFlights = newNFSMountFlights()
+	linkSucceeded = true
+	jmlog.Info("STARTUP-TRACE: F-post-globalServer")
 
 	// Pin store + prefetcher. The pin store lives in its own SQLite file so
 	// it doesn't compete with the metadata store's WAL.
+	var startPinWorkers func()
+	jmlog.Info("BOOT-TRACE: step-2 pre-pin-store")
 	pinDBPath := pinStorePath(cfg.DBPath)
 	if ps, err := pin.Open(pinDBPath); err == nil {
 		globalPinStore = ps
@@ -972,57 +2152,69 @@ func NFSServerStart(configJSON *C.char) *C.char {
 		// Redis SCAN gaps trigger ESTALE on still-cached files mid-edit
 		// (observed: DaVinci treating fully-cached media as offline).
 		store.SetPinChecker(ps)
-		globalPrefetcher = pin.NewPrefetcher(ps, cfg.FUSEPath, cfg.MountPoint, 4)
-		// Long-running daemons that drain the queue and re-warm pinned
-		// files. Launched via Prefetcher.Go so they're tracked by the
-		// prefetcher's wg — Stop()'s wg.Wait then actually waits for
-		// them to exit before the caller proceeds to pinStore.Close.
-		// QA-7a fix: previously these were `go globalPrefetcher.X(...)`
-		// directly, leaving them outside wg tracking, so Stop returned
-		// while they still had pin.db connections out → SQLite file-
-		// descriptor leak on every Stop cycle.
-		//
-		// Capture the prefetcher into a local before closing over it so
-		// a future Stop-then-Start cycle's new globalPrefetcher doesn't
-		// silently inherit these still-running closures (review MEDIUM).
-		pf := globalPrefetcher
-		pinCtx := globalPinCtx()
-		pf.Go(func() { pf.PullPending(pinCtx, 100) })
-		pf.Go(func() { pf.ReWarmupLoop(pinCtx, 6*time.Hour, 50) })
-		// R-1: keep the pinned-set-vs-disk-capacity verdict fresh. Gates the
-		// re-warm loop above (no futile thrash when the pinned set can't fit)
-		// and feeds the over-capacity banner in /cache-status. Empty cacheBaseDir
-		// uses the default ~/.juicefs/cache.
-		pf.Go(func() { pf.CapacityLoop(pinCtx, 60*time.Second, "") })
-		// Eviction watch (pin-integrity guarantee, 2026-07-14): juicefs
-		// eviction has no pin awareness, so transient traffic pushing the
-		// cache past its budget can evict pinned blocks even when the
-		// pinned set itself fits. CapacityLoop refreshes CacheUsageBytes
-		// every 60s; a large drop with a stable pinned set means eviction
-		// churn ran — schedule ONE VerifyAndRepair (re-read: present
-		// blocks local-speed, missing blocks re-pulled) so pinned content
-		// converges back to fully-resident within minutes instead of the
-		// 6h re-warm TTL. Gated: never over-capacity (R-1 thrash guard),
-		// never on Metered/Slow links (the re-pull belongs on LAN), and
-		// single-flight with a cooldown.
-		pf.Go(func() { evictionWatchLoop(pinCtx) })
-		// Wire the pin store into the NFS handler so the offline-mode
-		// open gate can fail-fast on un-pinned reads. The mount point is
-		// the prefix the gate uses to canonicalize in-mount filenames into
-		// the absolute paths the pin store keys on.
 		srv.Handler().SetPinStore(ps, cfg.MountPoint)
-		jmlog.Info("pin store ready", "path", pinDBPath, "workers", 4)
+		provider := jmnfs.NewOwnedPinProvider(srv.Handler(), ps)
+		if err := ps.SetReadyValidator(provider.Current); err != nil {
+			jmlog.Error("pin authority validator unavailable", "error", err.Error())
+		} else if err := ps.SetReadyRevoker(provider.Revoke); err != nil {
+			jmlog.Error("pin authority revoker unavailable", "error", err.Error())
+		} else {
+			globalPrefetcher = pin.NewPrefetcher(ps, cfg.FUSEPath, cfg.MountPoint, 4, provider)
+		}
+		if globalPrefetcher != nil {
+			// Long-running daemons that drain the queue and re-warm pinned
+			// files. Launched via Prefetcher.Go so they're tracked by the
+			// prefetcher's wg — Stop()'s wg.Wait then actually waits for
+			// them to exit before the caller proceeds to pinStore.Close.
+			// QA-7a fix: previously these were `go globalPrefetcher.X(...)`
+			// directly, leaving them outside wg tracking, so Stop returned
+			// while they still had pin.db connections out → SQLite file-
+			// descriptor leak on every Stop cycle.
+			//
+			// Capture the prefetcher into a local before closing over it so
+			// a future Stop-then-Start cycle's new globalPrefetcher doesn't
+			// silently inherit these still-running closures (review MEDIUM).
+			pf := globalPrefetcher
+			pinCtx := pf.Context()
+			startPinWorkers = func() {
+				pf.Go(func() { _, _ = pf.RestoreReady(pinCtx) })
+				pf.Go(func() { pf.PullPending(pinCtx, 100) })
+				pf.Go(func() { pf.ReWarmupLoop(pinCtx, 6*time.Hour, 50) })
+				// R-1: keep the pinned-set-vs-disk-capacity verdict fresh. Gates the
+				// re-warm loop above (no futile thrash when the pinned set can't fit)
+				// and feeds the over-capacity banner in /cache-status. Empty cacheBaseDir
+				// uses the default ~/.juicefs/cache.
+				pf.Go(func() { pf.CapacityLoop(pinCtx, 60*time.Second, "") })
+				// Eviction watch (pin-integrity guarantee, 2026-07-14): juicefs
+				// eviction has no pin awareness, so transient traffic pushing the
+				// cache past its budget can evict pinned blocks even when the
+				// pinned set itself fits. CapacityLoop refreshes CacheUsageBytes
+				// every 60s; a large drop with a stable pinned set means eviction
+				// churn ran — schedule ONE VerifyAndRepair (re-read: present
+				// blocks local-speed, missing blocks re-pulled) so pinned content
+				// converges back to fully-resident within minutes instead of the
+				// 6h re-warm TTL. Gated: never over-capacity (R-1 thrash guard),
+				// never on Metered/Slow links (the re-pull belongs on LAN), and
+				// single-flight with a cooldown.
+				pf.Go(func() { evictionWatchLoop(pinCtx, pf) })
+				// Wire the pin store into the NFS handler so the offline-mode
+				// open gate can fail-fast on un-pinned reads. The mount point is
+				// the prefix the gate uses to canonicalize in-mount filenames into
+				// the absolute paths the pin store keys on.
+				jmlog.Info("BOOT-TRACE: step-3 pin-store-ready", "path", pinDBPath, "workers", 4)
 
-		// Item 0: heal dirs pinned in a PRIOR session. On boot the pin store
-		// remembers the pinned roots but the metadata mirror may not have their
-		// subtree rows (older build, or the warm never completed) — so those
-		// dirs would list empty offline. Enumerate PinRoots() and warm each
-		// root's ancestor chain + subtree. Runs in the background so it never
-		// blocks boot; self-gates on JM_PIN_WARM_METADATA and pin.IsOffline()
-		// (offline reconcileDir burns a 30s Redis timeout per dir — the metadata
-		// warm resumes when online; blocks are already cached).
-		warmMount := cfg.MountPoint
-		go warmPinnedRootsAtBoot(ps, rc, warmMount)
+				// Item 0: heal dirs pinned in a PRIOR session. On boot the pin store
+				// remembers the pinned roots but the metadata mirror may not have their
+				// subtree rows (older build, or the warm never completed) — so those
+				// dirs would list empty offline. Enumerate PinRoots() and warm each
+				// root's ancestor chain + subtree. Runs in the background so it never
+				// blocks boot; self-gates on JM_PIN_WARM_METADATA and pin.IsOffline()
+				// (offline reconcileDir burns a 30s Redis timeout per dir — the metadata
+				// warm resumes when online; blocks are already cached).
+				warmMount := cfg.MountPoint
+				scheduleBootPinWarm(pf, ps, rc, warmMount)
+			}
+		}
 	} else {
 		jmlog.Warn("pin store open failed (offline-pin disabled)", "error", err.Error())
 	}
@@ -1056,7 +2248,7 @@ func NFSServerStart(configJSON *C.char) *C.char {
 		thumbDir := derivDBPath[:len(derivDBPath)-len("/derivatives.db")] + "/thumbs"
 		if tc, terr := thumbcache.Open(thumbDir, maxBytes); terr == nil {
 			globalThumbCache = tc
-			warmer := jmnfs.NewThumbWarmer(tc, resolveThumbBlobPath, func(dir string) []jmnfs.ThumbChildRef {
+			warmer := jmnfs.NewThumbWarmer(tc, resolveWarmThumbBlobPath, func(dir string) []jmnfs.ThumbChildRef {
 				entries, lerr := store.ListChildren(dir)
 				if lerr != nil {
 					return nil
@@ -1074,7 +2266,6 @@ func NFSServerStart(configJSON *C.char) *C.char {
 			// every folder (the tunnel first-visit tax was ~2min/dir).
 			// Same parent dir as the thumb cache; per-serve mirror
 			// validation makes loading stale entries harmless.
-			srv.Handler().SidecarPersistEnable(thumbDir + "/../sidecars.gob")
 			st := tc.Stats()
 			jmlog.Info("thumb cache ready", "path", thumbDir,
 				"resident_mb", st.Bytes>>20, "files", st.Files, "max_mb", maxBytes>>20)
@@ -1083,6 +2274,13 @@ func NFSServerStart(configJSON *C.char) *C.char {
 		}
 	}
 
+	// QLPROXY (F5): arm the hot-project prewarm engine — polls the measured
+	// link class and hydrates posters + QL previews for the hottest project
+	// when on a LAN-class link; /prewarm is its manual/manager trigger.
+	// Re-reads globals per tick, so it no-ops across Stop/Start; JM_QL_PREWARM=0
+	// disables the poller. See bridge/qlproxy.go.
+	startQLPrewarm()
+
 	// Spool wiring (Option 2). Env-gated by JM_SPOOL_ENABLE so the
 	// pre-spool behavior is preserved by default until the rollout
 	// completes (docs/ROADMAP/option-2-spool.md section 9). When
@@ -1090,23 +2288,25 @@ func NFSServerStart(configJSON *C.char) *C.char {
 	// reads consult the spool index before metadata/FUSE (slice D);
 	// when disabled, the handler's spool field stays nil and the
 	// pre-spool writeFile / cachedFile paths run unchanged.
-	spoolConfigured := cfg.SpoolEnable || os.Getenv("JM_SPOOL_ENABLE") == "1"
+	// Resolved before startup effects; the same value passed the recovery gate.
 	// Even if the spool is toggled OFF, a previous spool-enabled run may have
 	// left writing/ready/draining rows whose bytes are on the local SSD but NOT
 	// yet on the NAS — while Finder already told the user "copied". Losing those
 	// is unacceptable, so force the spool wiring on to recover + drain the
 	// backlog (boot recovery runs inside the block); the user can re-disable
-	// once it clears. PendingStats errors (no spool schema) mean "no history".
-	spoolHasPending := false
-	if !spoolConfigured {
-		if pf, _, statErr := metadata.NewSpoolStore(store.DB()).PendingStats(); statErr == nil && pf > 0 {
-			spoolHasPending = true
-			jmlog.Warn("spool disabled but PENDING ENTRIES exist — enabling the spool to drain them to the NAS so the user does not lose data they already saw copied (re-disable once it clears)",
-				"pending_files", pf)
-		}
+	// once it clears. Store opening initializes the schema and refuses any
+	// unreadable status, so a failed row or a SQLite error cannot look empty.
+	spoolHasPending := !spoolConfigured && unfinishedSpoolRows > 0
+	if spoolHasPending {
+		jmlog.Warn("spool disabled but UNFINISHED ENTRIES exist — enabling the spool for recovery before serving",
+			"unfinished_files", unfinishedSpoolRows)
 	}
+	var spoolStartErr error
 	if spoolConfigured || spoolHasPending {
-		spoolDir := os.Getenv("JM_SPOOL_DIR")
+		spoolDir := cfg.SpoolDir
+		if spoolDir == "" {
+			spoolDir = os.Getenv("JM_SPOOL_DIR")
+		}
 		if spoolDir == "" {
 			home, err := os.UserHomeDir()
 			if err != nil || home == "" {
@@ -1143,18 +2343,21 @@ func NFSServerStart(configJSON *C.char) *C.char {
 			}
 		}
 		if err := metadata.InitSpoolSchema(store.DB()); err != nil {
-			jmlog.Warn("spool schema init failed (spool disabled)", "error", err.Error())
+			spoolStartErr = fmt.Errorf("spool schema init: %w", err)
 		} else {
 			meta := metadata.NewSpoolStore(store.DB())
+			// Recovery qualifies local read shadows against the persisted mirror
+			// before SetSpool publishes them to the NFS handler.
+			store.SetSpoolStore(meta)
 			if spool, err := jmnfs.NewSpoolStore(spoolDir, spoolCapacity, meta); err != nil {
-				jmlog.Warn("spool store open failed (spool disabled)",
-					"dir", spoolDir, "error", err.Error())
+				spoolStartErr = fmt.Errorf("open spool store %q: %w", spoolDir, err)
 			} else {
 				drainer, err := jmnfs.NewDrainer(spool, jmnfs.DrainerConfig{
-					FuseRoot: cfg.FUSEPath,
+					FuseRoot:            startupDrainerFuseRoot(cfg.FUSEPath),
+					ReplacementRecovery: cfg.ReplacementRecovery,
 				})
 				if err != nil {
-					jmlog.Warn("drainer construct failed (spool disabled)", "error", err.Error())
+					spoolStartErr = fmt.Errorf("construct spool drainer: %w", err)
 					spool.Stop()
 				} else {
 					// Slice F: boot-time scrubber. MUST run BEFORE
@@ -1173,39 +2376,89 @@ func NFSServerStart(configJSON *C.char) *C.char {
 					recReport, recErr := spool.RecoverOnBoot(recCtx)
 					recCancel()
 					if recErr != nil {
-						jmlog.Warn("spool boot scrubber failed (proceeding anyway)",
-							"error", recErr.Error())
-					} else if recReport.OrphanFilesDeleted > 0 || recReport.OrphanRowsFailed > 0 ||
-						recReport.WritingFailedRows > 0 || recReport.WritingResumed > 0 ||
-						recReport.DrainingReset > 0 || recReport.ReadyResumed > 0 {
-						jmlog.Info("spool boot recovery",
-							"orphan_files_deleted", recReport.OrphanFilesDeleted,
-							"orphan_rows_failed", recReport.OrphanRowsFailed,
-							"writing_failed", recReport.WritingFailedRows,
-							"writing_resumed", recReport.WritingResumed,
-							"draining_reset", recReport.DrainingReset,
-							"ready_resumed", recReport.ReadyResumed)
-					}
+						spoolStartErr = fmt.Errorf("recover local spool before serving: %w", recErr)
+						spool.Stop()
+					} else {
+						if recReport.OrphanFilesDeleted > 0 || recReport.OrphanRowsFailed > 0 ||
+							recReport.WritingFailedRows > 0 || recReport.WritingResumed > 0 ||
+							recReport.DrainingReset > 0 || recReport.ReadyResumed > 0 {
+							jmlog.Info("spool boot recovery",
+								"orphan_files_deleted", recReport.OrphanFilesDeleted,
+								"orphan_rows_failed", recReport.OrphanRowsFailed,
+								"writing_failed", recReport.WritingFailedRows,
+								"writing_resumed", recReport.WritingResumed,
+								"draining_reset", recReport.DrainingReset,
+								"ready_resumed", recReport.ReadyResumed)
+						}
 
-					globalSpool = spool
-					globalDrainer = drainer
-					globalDrainerAtomic.Store(drainer)
-					srv.Handler().SetSpool(spool, drainer)
-					// QA-30 Layer D: let the reconcile's scopedPrune spare any
-					// path with a live, not-yet-drained spool entry so a
-					// spool-pending file (absent from Redis AND FUSE) is never
-					// pruned mid-copy — which would Forget its Track-B NFS handle
-					// and surface ESTALE (build-438 error 100070). Must precede
-					// rc.Start's reconcile goroutine, which already launched
-					// above; safe because no prune can fire before the first
-					// keyspace/SCAN reconcile and the spool index is live now.
-					rc.SetSpoolGuard(spool.HasPending)
-					drainer.Start()
-					used, total := spool.Capacity()
-					jmlog.Info("spool ready",
-						"dir", spoolDir,
-						"capacity_gb", float64(total)/(1<<30),
-						"used_bytes", used)
+						globalSpool = spool
+						globalDrainer = drainer
+						globalDrainerAtomic.Store(drainer)
+						srv.Handler().SetSpool(spool, drainer)
+						// QA-30 Layer D: spare live spool paths from reconcile prune.
+						// The reconciler has already started, but cannot reach its first
+						// keyspace/SCAN prune before this live spool index is registered.
+						// Register all callbacks before the sweep can start the drainer.
+						rc.SetSpoolGuard(spool.HasPending)
+
+						// Check cold-start custody after recovery and before draining. Orphan stage
+						// deletion is deferred until backend writer ownership is fenced.
+						// OFF THE STARTUP CRITICAL PATH (2026-08-19, live incident).
+						// The old sweep statted EVERY not-done spool row against the
+						// FUSE mount, serialized. That was O(pending rows) metadata
+						// round trips on the system's slowest resource. It ran inline here —
+						// which is ~180 lines BEFORE the control plane binds — so a
+						// 16,150-row backlog from an ordinary Finder copy stopped
+						// JuiceMount from finishing startup at all: juicefs mounted,
+						// NFS listened on :11049, and :11050 never opened. The app
+						// looked hung; it was counting.
+						//
+						// Keep the check before the drainer, while allowing the
+						// control plane to bind independently.
+						//
+						// drainer.Start() therefore moves INTO this goroutine. Stop()
+						// is safe against a drainer that was never started — its
+						// `started` flag gates the wait on d.done — so a shutdown
+						// racing a long sweep cannot hang.
+						sweepDone := make(chan struct{})
+						globalSpoolSweepDone = sweepDone
+						go func() {
+							defer close(sweepDone)
+							checkComplete := true
+							if err := drainer.SweepStreamPartials(); err != nil {
+								var pending *metadata.PendingPunchedSpool
+								if errors.As(err, &pending) {
+									jmlog.Error("stream custody check refused unresolved punched spool; drainer stopped",
+										"error", err.Error())
+									return
+								}
+								var deferred *jmnfs.DeferredStreamCleanup
+								if errors.As(err, &deferred) {
+									jmlog.Warn("stream cleanup deferred; possible orphan stages preserved",
+										"candidate_rows", deferred.Candidates)
+								} else {
+									checkComplete = false
+									jmlog.Warn("stream custody check failed (proceeding anyway)",
+										"error", err.Error())
+								}
+							}
+							// H-8B: wire the project-lease client before the first
+							// drain, so the drainer acquires (or parks) per project
+							// from its very first row.
+							if leases := startBridgeProjectLeases(cfg.RedisURL, spool); leases != nil {
+								drainer.SetProjectLeases(leases)
+								globalProjectLeases.Store(leases)
+							}
+							drainer.Start()
+							jmlog.Info("drainer started", "stream_custody_check_complete", checkComplete)
+						}()
+
+						used, total := spool.Capacity()
+						jmlog.Info("spool ready",
+							"dir", spoolDir,
+							"capacity_gb", float64(total)/(1<<30),
+							"used_bytes", used)
+					}
 				}
 			}
 		}
@@ -1214,6 +2467,52 @@ func NFSServerStart(configJSON *C.char) *C.char {
 	// force-enabling the spool to drain the backlog, so there is no stranded-
 	// data path left here. A clean disabled start with zero pending rows needs
 	// no action.)
+	if spoolStartErr != nil {
+		jmlog.Error("NFS startup refused: local spool is not ready", "error", spoolStartErr.Error())
+		globalMu.Unlock()
+		stopped := stopServerSerialized()
+		globalMu.Lock()
+		linkSucceeded = false
+		if !stopped {
+			return C.CString("error: spool startup failed and cleanup is incomplete; retry Stop before Start")
+		}
+		return C.CString("error: " + spoolStartErr.Error())
+	}
+	// All handler, spool, metadata and FUSE gates are initialized. Give an
+	// already-qualified boot one fenced recovery attempt before a remount
+	// callback may open the listener or pin workers issue their first read.
+	// The ticker still retries deferred startup. The selected owner mirrors
+	// the local offline state through its existing identity-fenced loop.
+	cacheOwner.startBeforeListener(reachFn, cfg.FUSEPath, &spoolStartupReady)
+	if startPinWorkers != nil {
+		startPinWorkers()
+	}
+	cacheOwner.startRecovery(reachFn, cfg.FUSEPath)
+	if globalReach != nil {
+		globalReach.Start()
+	}
+	if linkNode != nil {
+		linkNode.SetOnProxyTransportChanged(func(mode string) { cacheOwner.transportChanged(mode, reachFn) })
+	}
+	if !listenerBackingReady && cfg.FUSEPath != "" && fuseLooksHealthy(cfg.FUSEPath) {
+		listenerBackingReady = true
+	}
+	if nfsListenerMayStart(cfg.FUSEPath, listenerBackingReady, startedOffline) {
+		if err := startupNFSListener(srv); err != nil {
+			globalMu.Unlock()
+			stopped := stopServerSerialized()
+			globalMu.Lock()
+			linkSucceeded = false
+			if !stopped {
+				return C.CString("error: NFS listener failed and cleanup is incomplete; retry Stop before Start")
+			}
+			return C.CString(fmt.Sprintf("error: start: %v", err))
+		}
+		jmlog.Info("STARTUP-TRACE: A-post-srvStart")
+	} else {
+		jmlog.Warn("deferring NFS listener — JuiceFS backing mount is not verified; FUSE recovery will start it",
+			"listen_addr", cfg.ListenAddr, "fuse_path", cfg.FUSEPath)
+	}
 
 	// [#6 metrics-server-first] Record the intended mount point NOW, but do
 	// the actual NFS mount AFTER the metrics server is up (below). The mount
@@ -1223,148 +2522,28 @@ func NFSServerStart(configJSON *C.char) *C.char {
 	// HEADLESS: no /health, /offline, /diagnose, /spool — undebuggable and
 	// uncontrollable unattended. The control plane must never be gated on
 	// the mount.
-	if cfg.MountPoint != "" {
-		globalWantMountPoint = cfg.MountPoint
-	}
+	globalWantMountPoint = cfg.MountPoint
 
 	// Wire NFS RPC observation into the metrics package.
 	jmlibnfs.SetObserver(metrics.ObserveRPC)
+	enableContentionProfilers()
 
-	// Start metrics HTTP server (if address configured).
-	if cfg.MetricsAddr != "" {
-		ms := metrics.NewServer(cfg.MetricsAddr, metrics.Default())
+	jmlog.Info("BOOT-TRACE: step-6 pre-metrics-routes")
+	// Attach control-plane routes to the already-running metrics server
+	// (started early per F1). Safe on a live listener: Go 1.22+ ServeMux.
+	if cfg.MetricsAddr != "" && ms != nil {
 		// Register pin/offline control endpoints on the same listener so the
 		// CLI doesn't need a separate port.
-		ms.ExtraRoutes = map[string]http.HandlerFunc{
-			"/pin":          handlePinHTTP,
-			"/unpin":        handleUnpinHTTP,
-			"/cache-status": handleCacheStatusHTTP,
-			"/offline":      handleOfflineHTTP,
-			// Contract endpoints (juicemount-contract v1). /whoami: identity +
-			// version + capabilities handshake (JM-1). /residency: honest
-			// per-path cache residency for OpenLoupe's green badge (JM-2).
-			// /lookup: stable (inode, nas_rel_path) identity (JM-4).
-			"/whoami":    handleWhoamiHTTP,
-			"/residency": handleResidencyHTTP,
-			"/lookup":    handleLookupHTTP,
-			// JM-14 Tier-B shared-derivative reads. /derivatives?inode=N: the
-			// per-asset derivative manifest (what machine-derived artifacts
-			// exist + their integrity hash). /metadata?inode=N&kind=tech:
-			// structured ffprobe tech/EXIF. Keyed by durable inode (from
-			// /lookup); read-only + fail-closed.
-			"/derivatives":         handleDerivativesHTTP,
-			"/derivatives/changes": handleDerivativesChangesHTTP,
-			"/metadata":            handleMetadataHTTP,
-			// PROXY-CODEC (#50) byte-range blob delivery. GET /blob?inode=N&kind=proxy
-			// streams a derivative blob (proxy.mp4 etc.) with Accept-Ranges: bytes,
-			// answers Range with 206 + Content-Range/Content-Length, serves the
-			// Content-Type from the manifest media_type, and 200 + Content-Length
-			// unranged — what a browser <video> / remote AVPlayer need to seek over
-			// HTTP. Capability token `blob` (route path == token).
-			"/blob": handleBlobHTTP,
-			// #1 hydration pack observability: local thumb-cache stats
-			// (bytes/files/hits/misses/puts/evictions). Read-only.
-			"/thumbs": handleThumbsHTTP,
-			// Wave-3 QuickLook appex fetch: GET /thumb-local?path=<abs>&size=N
-			// serves the farm poster from the LOCAL cache (hit <5ms), does a
-			// bounded read-through populate on miss, or 404s fast so the appex
-			// errors and macOS falls back to its own generator.
-			"/thumb-local": handleThumbLocalHTTP,
-			// Release UX: the popover's warm-up card — one consolidated phase
-			// machine (starting/indexing/warming/steady) with a progress pct.
-			"/warmup": handleWarmupHTTP,
-			// JM-ASSERT (#51) portable-human-metadata channel. POST /assertions writes
-			// the <media>.loupe.json sidecar (source of truth — atomic, LWW,
-			// merge-not-clobber) + upserts the asset_key-keyed Tier-B index; GET
-			// reads the resolved set by asset_key (or inode/path → asset_key).
-			// Capability token `assertions` (route path == token).
-			"/assertions": handleAssertionsHTTP,
-			// OL-1 on-device AI contribute-back (write). POST: a consumer that
-			// wrote ai.loupe.json through the mount registers it so the server
-			// indexes it for every client + the web UI. Capability token =
-			// `contribute` (route-aliased in cplane.DeriveCapabilities).
-			"/derivatives/register": handleDerivativesRegisterHTTP,
-			"/reclaim":              handleReclaimHTTP,
-			// Clears the on-disk JuiceFS chunk cache. POST-only.
-			// Optional ?keep-pinned=true reissues a verify-pins after
-			// the clear so pinned content immediately starts re-caching.
-			// Returns bytes_freed + files_removed. Destructive but safe
-			// — chunks are immutable, in-flight reads via open fds keep
-			// working, next access just misses and refetches.
-			"/cache-clear": handleCacheClearHTTP,
-			"/verify-pins": handleVerifyPinsHTTP,
-			// In-app rescue when the kernel mount table is wedged. Runs the
-			// privileged `umount -f -t nfs` via AppleScript; user enters
-			// their admin password once. Returns JSON with the result.
-			"/force-eject": handleForceEjectHTTP,
-			// Soft stop: tears down NFS server + metadata + caches without
-			// unmounting (Stop/Start cycle stays fast, no admin password
-			// re-prompt). Use /force-eject afterward for a full teardown.
-			// Returns immediately; teardown runs async so the response
-			// flushes before the metrics server closes its own socket.
-			"/stop": handleStopHTTP,
-			// A2 — post-mount self-test. GET returns cached result; POST reruns.
-			"/self-test": handleSelfTestHTTP,
-			// Spool status (Option 2 / slice E). Returns pending-files
-			// count, pending bytes, in-flight drains, capacity used,
-			// and per-entry details. 503 when the spool is disabled
-			// (JM_SPOOL_ENABLE != 1) or hasn't been wired yet.
-			"/spool": handleSpoolHTTP,
-			// Background-operation activity surface (roadmap 4.10): plain-language
-			// view of reconcile / drain / prefetch so the UI can explain why
-			// Finder is momentarily slow ("Uploading 412 files", "Rebuilding
-			// index…", "Warming pinned project"). GET, loopback.
-			"/activity": handleActivityHTTP,
-			// "Why is it slow?" self-diagnosis (INSTANT-NAV #14): runs the six
-			// known silent-failure probes (Local Network permission, tunnel
-			// route, FUSE identity, backend components, spool backlog, link
-			// RTT) concurrently and time-bounded, on demand only. GET, loopback.
-			// Not in the contract capability vocabulary — operational/UI route,
-			// excluded from /whoami automatically like reclaim/mount-now.
-			"/diagnose": handleDiagnoseHTTP,
-			// Instant recursive folder size (INSTANT-NAV #2): GET /du?path=…
-			// answers "total bytes + file count under this folder" in O(1)
-			// from the mirror's incrementally-maintained subtree aggregates
-			// (JM_SUBTREE_SIZES, default on) — the app/OpenLoupe surface that
-			// replaces du-walking. GET, loopback. Operational/UI route,
-			// excluded from /whoami automatically like reclaim/mount-now.
-			"/du": handleDuHTTP,
-			// Spool recovery actions (LB-5): ?action=retry-failed
-			// requeues failed rows whose spool file survives;
-			// ?action=clear-stalled force-finalizes leaked-handle
-			// writing entries (bytes preserved). Loopback-only GET,
-			// same mutation convention as /offline?on=….
-			"/spool-recover": handleSpoolRecoverHTTP,
-			// LB-2 "Mount Now": re-runs the user-visible NFS mount for
-			// the configured mount point. No-op success when already
-			// mounted. Loopback-only GET, same mutation convention as
-			// /spool-recover. May block on the macOS admin prompt.
-			"/mount-now": handleMountNowHTTP,
-			// Phase B observability: net/http/pprof routes for live
-			// goroutine/heap/cpu/trace dumps. pprof.Index serves
-			// /debug/pprof/goroutine, /debug/pprof/heap, etc. via the
-			// trailing-slash handler plus ?debug=1 query.
-			"/debug/pprof/":        pprof.Index,
-			"/debug/pprof/cmdline": pprof.Cmdline,
-			"/debug/pprof/profile": pprof.Profile,
-			"/debug/pprof/symbol":  pprof.Symbol,
-			"/debug/pprof/trace":   pprof.Trace,
-		}
+		routes := controlPlaneRoutes()
 		// Derive the contract capability list (JM-1) from the routes this binary
 		// actually serves plus the metrics-server built-ins (/health, /metrics),
 		// so /whoami can never advertise a route that isn't registered.
 		served := []string{"/health", "/metrics"}
+		ms.RegisterRoutes(routes)
 		for route := range ms.ExtraRoutes {
 			served = append(served, route)
 		}
 		globalCapabilities = cplane.DeriveCapabilities(served)
-		if err := ms.Start(); err != nil {
-			jmlog.Warn("metrics server failed to start",
-				"addr", cfg.MetricsAddr, "error", err.Error())
-		} else {
-			globalMetrics = ms
-			jmlog.Info("metrics server listening", "addr", ms.Addr())
-		}
 	}
 
 	// Mount NFS at the user-visible mount point (e.g. /Volumes/zpool) so
@@ -1387,45 +2566,146 @@ func NFSServerStart(configJSON *C.char) *C.char {
 	// their own goroutine AFTER the boot wiring, taking globalMu only for
 	// the globalMountPath publish; the prompt itself is bounded (180s) in
 	// mountNFSWithPrompt. Boot never waits on a human again.
-	if cfg.MountPoint != "" {
-		if isMounted(cfg.MountPoint) {
+	bootMounted := recordExistingBootNFSMount(cfg.MountPoint, inspectConfiguredNFSMount)
+	if cfg.MountPoint != "" && !bootNFSMountAllowed(cfg.FUSEPath, bootFUSEReady, startedOffline) {
+		// Never publish an ONLINE loopback NFS volume over an unverified/partial
+		// FUSE mount. A live RC reproduced that state and Finder entered
+		// uninterruptible kernel waits. Cached-only startup is the explicit safe
+		// exception: pin.IsOffline remains engaged, so handlers serve the SQLite
+		// namespace, verified SSD mappings, and spool while every FUSE fallthrough
+		// fails closed. Once the watchdog verifies FUSE, recovery lifts only the
+		// automatic offline gate.
+		jmlog.Warn("deferring user-visible NFS mount — JuiceFS backing mount is not verified; absent-mount recovery will publish it after FUSE recovers",
+			"mount_point", cfg.MountPoint, "fuse_path", cfg.FUSEPath)
+	} else if cfg.MountPoint != "" {
+		jmlog.Info("BOOT-TRACE: step-4 pre-mount-check")
+		mounted := bootMounted
+		if mounted && nfsMountResponsive(cfg.MountPoint, 2*time.Second) {
 			jmlog.Info("nfs already mounted, reusing", "mount_point", cfg.MountPoint)
 			warmupMarkServing()
 			globalMountPath = cfg.MountPoint
 		} else {
-			mountAddr, mountPoint := srv.Addr(), cfg.MountPoint
+			mountAddr, mountExportPath, mountPoint := srv.Addr(), srv.ExportPath(), cfg.MountPoint
+			flights := globalMountFlights
 			go func() {
-				if err := mountNFSWithPrompt(mountAddr, mountPoint); err != nil {
-					jmlog.Warn("nfs mount failed (server still running)",
-						"mount_point", mountPoint, "error", err.Error())
-					// Non-fatal — the server is up, user can mount manually.
+				// Share the same process-wide mount flight as /mount-now and
+				// absent-mount recovery. With immediate recovery enabled, the
+				// first health observation can otherwise race this boot mount and
+				// stack two administrator prompts or two mount_nfs processes.
+				if !mountNowInFlight.CompareAndSwap(false, true) {
+					jmlog.Info("nfs boot mount deferred — another mount is already in flight",
+						"mount_point", mountPoint)
 					return
 				}
-				jmlog.Info("nfs mounted", "mount_point", mountPoint)
-				warmupMarkServing()
-				globalMu.Lock()
-				globalMountPath = mountPoint
-				globalMu.Unlock()
+				defer mountNowInFlight.Store(false)
+				if !flights.begin() {
+					return
+				}
+				defer flights.end()
+				if mounted {
+					// A prior process can leave a syntactically valid loopback NFS
+					// mount whose kernel session is still bound to the dead server.
+					// Reusing it makes Finder hang and can briefly publish healthy
+					// state from cached attributes. Prove a fresh LOOKUP reaches this
+					// process. Unknown ownership must retain the old mount for recovery.
+					jmlog.Warn("existing nfs mount is unresponsive — remounting",
+						"mount_point", mountPoint)
+					if !unmountNFS(mountPoint) {
+						jmlog.Error("stale nfs mount recovery failed",
+							"mount_point", mountPoint,
+							"hint", "old mount ownership is unresolved; serving resources retained")
+						return
+					}
+					globalMu.Lock()
+					if globalMountPath == mountPoint {
+						globalMountPath = ""
+					}
+					globalMu.Unlock()
+				}
+				if flights.isRetired() {
+					return
+				}
+				if err := mountNFSWithPrompt(mountAddr, mountExportPath, mountPoint); err != nil {
+					jmlog.Error("nfs mount incomplete; original operation retained", "mount_point", mountPoint, "error", err)
+					return
+				}
+				recordAndConfirmNFSMount(mountPoint)
 			}()
 		}
 	}
 
-	// Health monitor. Brief settle delay first so the initial synchronous
-	// check inside Start() reflects the *settled* state of the mounts —
-	// without this, a juicefs mount that hasn't shown up in the kernel
-	// mount table yet would record a transient "FUSE down" that would
-	// take the next 10-second tick to clear, causing the popover to flash
-	// red right after a Start.
-	if cfg.FUSEPath != "" {
-		waitForFUSEResponsive(cfg.FUSEPath, 3*time.Second)
+	// Health monitor. A failed/deferred boot mount still gets a brief settle
+	// window so its first synchronous health sample does not race a late mount
+	// publication. A successful mount or reuse has already passed
+	// FUSEManager.Mount/fuseLooksHealthy's two-consecutive data-plane proof;
+	// repeating the same remote root probe here added several seconds to every
+	// slow-link launch without increasing confidence.
+	if needsFUSEMonitorSettle(cfg.FUSEPath, bootFUSEReady) &&
+		!waitForFUSEResponsive(cfg.FUSEPath, 3*time.Second) {
+		jmlog.Warn("FUSE data plane was not stable before health-monitor startup",
+			"fuse_path", cfg.FUSEPath)
 	}
 
 	redisAddr, _, _ := metadata.ParseRedisURL(cfg.RedisURL)
+	jmlog.Info("BOOT-TRACE: step-7 pre-monitor")
 	globalMonitor = health.New(health.Config{
 		RedisURL:      redisAddr,
-		MinIOURL:      "", // TODO: make configurable
+		RedisOptions:  rc.RawDB().Options(),
+		MinIOURL:      objectStoreHealthBase(cfg.BucketOverride),
 		FUSEPath:      cfg.FUSEPath,
 		NFSMountPoint: cfg.MountPoint,
+	})
+	if selectedOwner != nil {
+		// The serving process has no child or Link node. Query only its
+		// selected owner for the original Wait and complete mount identity.
+		globalMonitor.SetOwnedFUSEProbe(selectedOwner.fuseEvidence)
+	} else if globalFUSE != nil {
+		manager := globalFUSE
+		globalMonitor.SetOwnedFUSEProbe(manager.SteadyEvidence)
+	}
+	// L1 (2026-08-06): the network-change grace period had NEVER FIRED in the
+	// shipping app.
+	//
+	// health/monitor.go:369 suppresses a transient FUSE failure while the
+	// network is re-establishing, gated on InGracePeriod(). That returns false
+	// unconditionally when netWatcher is nil (monitor.go:347) — and the ONLY
+	// caller of SetNetWatcher anywhere was cmd/jm5 (the dev CLI). Both objects
+	// have existed in this file all along and were simply never connected, so
+	// every WiFi<->cellular flip reported FUSE unhealthy immediately instead of
+	// riding out the reconnect.
+	//
+	// Reuse the watcher the keyspace consumer already runs rather than starting
+	// a second one: it is created above (globalKeyspaceNetWatcher) and polls the
+	// active interface every 1s, which is exactly the signal the grace period
+	// needs. Nil-guarded because that watcher is created conditionally — a nil
+	// here would merely restore the old behaviour, but being explicit keeps the
+	// dependency visible to the next reader.
+	if globalKeyspaceNetWatcher != nil {
+		globalMonitor.SetNetWatcher(globalKeyspaceNetWatcher)
+	}
+	// L5b (2026-08-06): SetStatsProvider had no caller either, so /health
+	// reported PathCacheSize/FDPoolOpen/MemBuf* as hard zeros while the fields,
+	// the struct and the copy at health/monitor.go:425 all existed. Found by the
+	// dead-wiring sweep AFTER the /metrics half was fixed — the two halves of
+	// this chain were separately dead, which is exactly why a sweep beats
+	// finding them one at a time.
+	//
+	// Zeros are reported when no mount is up (LiveFDStats ok=false). That is
+	// honest here: /health describes a running server, and its consumer is a
+	// status indicator rather than an fd investigation. The absent-vs-empty
+	// distinction that matters for leak-hunting is preserved in /metrics, which
+	// omits the section entirely.
+	globalMonitor.SetStatsProvider(func() health.MemoryStats {
+		open, active, mbEntries, mbMB, ok := jmnfs.LiveFDStats()
+		if !ok {
+			return health.MemoryStats{}
+		}
+		return health.MemoryStats{
+			FDPoolOpen:    open,
+			FDPoolActive:  active,
+			MemBufEntries: mbEntries,
+			MemBufSizeMB:  mbMB,
+		}
 	})
 	// #89 online busy-suppression: give the health monitor a lock-free view of
 	// the drainer's live ingest state so a stat/readdir TIMEOUT during a
@@ -1449,47 +2729,75 @@ func NFSServerStart(configJSON *C.char) *C.char {
 		}
 		return inFlight, since
 	})
-	// LB-2: auto-remount for a stale/unmounted NFS volume — the same hook
-	// the jm5 CLI has always wired. STRICTLY the non-interactive tier
-	// (passwordless sudo): an unattended health tick must never pop an
-	// admin-password dialog. Machines without the scoped sudoers entry get
-	// a logged failure here, and the user-facing recovery is the popover's
-	// "Mount Now" button (→ /mount-now → interactive prompt path).
+	// Recovery uses the same retained user-owned controller. An unsettled
+	// prior operation refuses a new birth until Stop Mount retires it.
 	// Deliberate Stop paths tear the monitor down, so auto-remount can't
 	// fight an intentional unmount.
 	if cfg.MountPoint != "" {
-		remountAddr := srv.Addr()
 		remountPoint := cfg.MountPoint
+		flights := globalMountFlights
+		// Stale-but-present NFS is retired by the unmount helper (by fsid and
+		// receipt), never by path, and only when the exact JuiceFS child is
+		// proven dead; then the remount below runs a new birth.
+		wireStaleNFSRecovery(globalMonitor)
 		globalMonitor.EnableNFSRemount(func() error {
-			if err := mountNFSNonInteractive(remountAddr, remountPoint); err != nil {
+			if !flights.begin() {
+				return fmt.Errorf("NFS mount is stopping")
+			}
+			defer flights.end()
+			remountAddr, remountExportPath := srv.Addr(), srv.ExportPath()
+			if remountAddr == "" {
+				return fmt.Errorf("nfs listener is not ready")
+			}
+			if err := mountNFSNonInteractive(remountAddr, remountExportPath, remountPoint); err != nil {
 				return err
 			}
-			globalMu.Lock()
-			globalMountPath = remountPoint
-			globalMu.Unlock()
+			recordAndConfirmNFSMount(remountPoint)
 			return nil
 		})
 		// #93 NFS-layer absent-mount recovery: when the volume is genuinely
 		// GONE from the mount table while juicefs is alive and this listener
-		// is up, the monitor re-runs the SAME two-tier mount boot uses
-		// (passwordless sudo → bounded 180s prompt). Shares /mount-now's
-		// single-flight CAS so it can never stack a prompt on a user click.
-		globalMonitor.SetNFSServerAddr(remountAddr)
+		// is up, the monitor uses the same controller path as boot. Shares
+		// /mount-now's single-flight CAS; retained custody refuses a new birth.
+		globalMonitor.SetNFSServerAddr(srv.Addr())
 		globalMonitor.EnableNFSAbsentRemount(func() error {
 			if !mountNowInFlight.CompareAndSwap(false, true) {
 				return fmt.Errorf("mount already in flight")
 			}
 			defer mountNowInFlight.Store(false)
-			if err := mountNFSWithPrompt(remountAddr, remountPoint); err != nil {
+			if !flights.begin() {
+				return fmt.Errorf("NFS mount is stopping")
+			}
+			defer flights.end()
+			remountAddr, remountExportPath := srv.Addr(), srv.ExportPath()
+			if remountAddr == "" {
+				return fmt.Errorf("nfs listener is not ready")
+			}
+			if err := mountNFSNonInteractive(remountAddr, remountExportPath, remountPoint); err != nil {
 				return err
 			}
-			globalMu.Lock()
-			globalMountPath = remountPoint
-			globalMu.Unlock()
+			recordAndConfirmNFSMount(remountPoint)
 			return nil
 		})
 	}
+	// Publish only after the server address and remount callback are both
+	// configured. A subsequent verified FUSE recovery can now engage NFS
+	// recovery immediately instead of waiting up to three 10-second ticks.
+	fuseRecoveryMonitor.Store(globalMonitor)
 	globalMonitor.Start()
+	jmlog.Info("BOOT-TRACE: step-8 monitor-started")
+	// The mount runs concurrently so startup never blocks on an admin prompt.
+	// Always arm the fail-closed read/write verifier when a user-visible mount
+	// is configured, even if FUSE was not ready during the boot mount check.
+	// On a high-latency cold start FUSE can recover later while an existing NFS
+	// mount remains present; gating this verifier on the boot-time reuse branch
+	// left /health permanently degraded despite a fully working data plane.
+	// The verifier already retries until the mount is real and responsive, and
+	// its generation/single-flight guards safely coalesce later mount callbacks.
+	if cfg.MountPoint != "" {
+		generation := globalNFSWriteGeneration.Load()
+		go confirmNFSMountReady(globalMonitor, cfg.MountPoint, generation)
+	}
 
 	// Expose health to /health endpoint. Capture the monitor in the
 	// closure rather than reading the package var: that way a Stop that
@@ -1501,20 +2809,50 @@ func NFSServerStart(configJSON *C.char) *C.char {
 			return metrics.HealthSnapshot{Healthy: false, Reason: "stopped"}
 		}
 		st := mon.Status()
+		writeReady := nfsWriteReadinessSnapshot()
+		nfsHealthy := st.NFS.Healthy && writeReady.Ready
+		nfsMessage := st.NFS.Message
+		if st.NFS.Healthy && !writeReady.Ready {
+			nfsMessage = writeReady.Reason
+		}
 		comps := map[string]string{
 			"redis": labelFor(st.Redis.Healthy, st.Redis.Message),
 			"minio": labelFor(st.MinIO.Healthy, st.MinIO.Message),
 			"fuse":  labelFor(st.FUSE.Healthy, st.FUSE.Message),
-			"nfs":   labelFor(st.NFS.Healthy, st.NFS.Message),
+			"nfs":   labelFor(nfsHealthy, nfsMessage),
+			// Informational; not part of overall health.
+			"unmount_helper": unmountHelperHealthLabel(),
 		}
 		reason := ""
-		if !st.Overall {
+		overall := st.Overall && writeReady.Ready
+		if !overall {
 			reason = "degraded"
 		}
 		return metrics.HealthSnapshot{
-			Healthy:    st.Overall,
+			Healthy:    overall,
 			Components: comps,
 			Reason:     reason,
+		}
+	})
+
+	// Expose backend-vs-cache byte accounting on /metrics. This is the only
+	// place a cellular run can learn whether an open was served from the local
+	// SSD or pulled over the link — our own bytes_read cannot distinguish them.
+	// Returns nil (field omitted) until the juicefs daemon has been scraped
+	// successfully, so a failed scrape never reports as a zero-backend session.
+	metrics.Default().SetBackendProvider(func() *metrics.BackendSnapshot {
+		bs, ok := pin.BackendStatsSnapshot()
+		if !ok {
+			return nil
+		}
+		return &metrics.BackendSnapshot{
+			CacheHits:      bs.CacheHits,
+			CacheMiss:      bs.CacheMiss,
+			CacheHitBytes:  bs.CacheHitBytes,
+			CacheMissBytes: bs.CacheMissBytes,
+			ObjectGetBytes: bs.ObjectGetBytes,
+			ObjectPutBytes: bs.ObjectPutBytes,
+			MetaOps:        bs.MetaOps,
 		}
 	})
 
@@ -1522,18 +2860,52 @@ func NFSServerStart(configJSON *C.char) *C.char {
 	metrics.Default().SetNetworkProvider(func() *metrics.NetworkSnapshot {
 		s := netprofile.Default().Snapshot()
 		ra := netprofile.Default().Readahead()
+		costObserved, costExpensive, costConstrained := hostNetworkCostSnapshot()
+		fakeLink := netprofile.FakeLinkSpec()
+		fakeProfile := ""
+		if fakeLink != nil {
+			fakeProfile = fakeLink.CanonicalProfile()
+		}
+		backendTransport := "system-direct"
+		var directLANConnections, encryptedConnections uint64
+		if linkNode != nil {
+			proxyStatus := linkNode.ProxyTransportStatus()
+			backendTransport = proxyStatus.Mode
+			directLANConnections = proxyStatus.DirectLANConns
+			encryptedConnections = proxyStatus.LinkConns
+		} else if selectedOwner != nil {
+			backendTransport, directLANConnections, encryptedConnections = selectedOwner.transportStatus()
+		}
 		return &metrics.NetworkSnapshot{
-			Class:            s.Class.String(),
-			RTTMs:            float64(s.RTT.Microseconds()) / 1000.0,
-			BandwidthMBps:    s.BytesPerSec / (1024 * 1024),
-			HaveRTT:          s.HaveRTT,
-			HaveBandwidth:    s.HaveBW,
-			ThroughputN:      s.ThroughputN,
-			BootstrappedRTT:  s.BootstrappedRTT,
-			ReadaheadEnabled: ra.Enabled,
-			ReadaheadSeq:     ra.SeqThreshold,
-			ReadaheadBlocks:  ra.Blocks,
-			ReadaheadWorkers: ra.Workers,
+			Class:                s.Class.String(),
+			RTTMs:                float64(s.RTT.Microseconds()) / 1000.0,
+			BandwidthMBps:        s.BytesPerSec / (1024 * 1024),
+			HaveRTT:              s.HaveRTT,
+			HaveBandwidth:        s.HaveBW,
+			ThroughputN:          s.ThroughputN,
+			BootstrappedRTT:      s.BootstrappedRTT,
+			Simulated:            fakeLink != nil,
+			FakeProfile:          fakeProfile,
+			FUSEContentReadGuard: testguard.RefuseFUSEContentReads(),
+			BackendRouteTunneled: backendRoutePolicyState.tunneled.Load(),
+			RouteCeilingApplied:  backendRoutePolicyState.ceilingApplied.Load(),
+			RouteCeilingClass: func() string {
+				if backendRoutePolicyState.ceilingApplied.Load() {
+					return netprofile.ClassSlow.String()
+				}
+				return ""
+			}(),
+			HostNetworkCostObserved: costObserved,
+			HostNetworkExpensive:    costExpensive,
+			HostNetworkConstrained:  costConstrained,
+			HighLatency:             netprofile.Default().HighLatency(),
+			ReadaheadEnabled:        ra.Enabled,
+			ReadaheadSeq:            ra.SeqThreshold,
+			ReadaheadBlocks:         ra.Blocks,
+			ReadaheadWorkers:        ra.Workers,
+			BackendTransport:        backendTransport,
+			DirectLANConnections:    directLANConnections,
+			EncryptedConnections:    encryptedConnections,
 		}
 	})
 
@@ -1550,7 +2922,7 @@ func NFSServerStart(configJSON *C.char) *C.char {
 	// is most likely to click the menu bar.
 	go func() {
 		time.Sleep(10 * time.Second)
-		runAndStoreSelfTest()
+		runAndStoreSelfTest(false)
 	}()
 
 	// R-4: when started offline, hand Swift a "started_offline:" status so it
@@ -1561,9 +2933,36 @@ func NFSServerStart(configJSON *C.char) *C.char {
 	if startedOffline {
 		// Batch-3 review #8: per-cause reason (R-4 unreachable / U2 slow
 		// backend / U3 persisted user intent), not the R-4 constant for all.
+		if err := confirmServingDesired(desiredRevision); err != nil {
+			return C.CString("error: serving state confirmation unavailable: " + err.Error())
+		}
 		return C.CString("started_offline: " + startOfflineReason)
 	}
+	if err := confirmServingDesired(desiredRevision); err != nil {
+		return C.CString("error: serving state confirmation unavailable: " + err.Error())
+	}
 	return C.CString(srv.Addr())
+}
+
+func startServingRecoverySerialized(record servingDesiredRecord) error {
+	// The saved record carries no secrets; put them back from the store the
+	// app wrote them to, so launchd can recover the volume with no app.
+	data, err := json.Marshal(hydrateServingConfig(record.Config))
+	if err != nil {
+		return err
+	}
+	input := C.CString(string(data))
+	defer C.free(unsafe.Pointer(input))
+	output := nfsServerStartSerialized(input, &record)
+	if output == nil {
+		return errors.New("recovery Start returned no status")
+	}
+	defer C.free(unsafe.Pointer(output))
+	status := C.GoString(output)
+	if strings.HasPrefix(status, "error:") {
+		return errors.New(status)
+	}
+	return nil
 }
 
 func labelFor(healthy bool, msg string) string {
@@ -1576,24 +2975,302 @@ func labelFor(healthy bool, msg string) string {
 	return msg
 }
 
-// NFSServerStop is a *soft* stop: it tears down the NFS server, the
-// metadata sync loop, the cache reader, the health monitor, and the
-// metrics HTTP server. It deliberately does NOT unmount FUSE or NFS.
-//
-// Why: both unmounts require an admin password prompt. A typical user
-// flow from the menu bar is Stop -> Start a few seconds later. Tearing
-// the mounts down would prompt twice (once on Stop, once on Start) with
-// no benefit, and the kernel mount table races during that window are
-// the source of the stale "FUSE: down" bug.
-//
-// For a true full teardown (e.g. on app Quit) call NFSServerShutdown.
-//
-//export NFSServerStop
-func NFSServerStop() {
-	stopServerLocked()
+type nfsWriteReadiness struct {
+	Ready     bool
+	Required  bool
+	Reason    string
+	CheckedAt string
 }
 
-// stopServerLocked tears down everything except the FUSE/NFS mounts.
+func resetNFSWriteReadiness(required bool, reason string) uint64 {
+	generation := globalNFSWriteGeneration.Add(1)
+	state := &nfsWriteReadiness{Required: required, Reason: reason}
+	if !required {
+		state.Ready = true
+		state.Reason = "not required (no user-visible NFS mount configured)"
+	}
+	globalNFSWriteReadiness.Store(state)
+	return generation
+}
+
+func publishNFSWriteReadiness(generation uint64, ready bool, reason string) {
+	if globalNFSWriteGeneration.Load() != generation {
+		return
+	}
+	globalNFSWriteReadiness.Store(&nfsWriteReadiness{
+		Ready:     ready,
+		Required:  true,
+		Reason:    reason,
+		CheckedAt: time.Now().UTC().Format(time.RFC3339),
+	})
+}
+
+func nfsWriteReadinessSnapshot() nfsWriteReadiness {
+	if state := globalNFSWriteReadiness.Load(); state != nil {
+		return *state
+	}
+	return nfsWriteReadiness{Reason: "NFS write path has not been verified"}
+}
+
+// refreshNFSHealthAfterMount closes the short race between mount_nfs returning
+// and the new mount becoming visible through macOS's mount table. It never
+// publishes optimistic success: HealthMonitor.RefreshNFS runs the same bounded
+// checks as the periodic monitor. The one-second retry window covers normal
+// kernel publication latency; genuinely absent/wedged mounts stay unhealthy
+// and remain subject to the ordinary recovery loop.
+type nfsHealthRefresher interface {
+	RefreshNFS() health.ComponentStatus
+}
+
+func refreshNFSHealthAfterMount(mon nfsHealthRefresher, mountPoint string, generation uint64) bool {
+	if mon == nil || mountPoint == "" {
+		return false
+	}
+	for attempt := 1; attempt <= 10; attempt++ {
+		if !nfsWriteVerifierCurrent(generation) {
+			return false
+		}
+		st := mon.RefreshNFS()
+		if !nfsWriteVerifierCurrent(generation) {
+			return false
+		}
+		if st.Healthy {
+			jmlog.Info("nfs health refreshed after mount", "mount_point", mountPoint, "attempt", attempt)
+			return true
+		}
+		if attempt < 10 {
+			if !waitForNFSWriteVerifier(generation, 100*time.Millisecond) {
+				return false
+			}
+		}
+	}
+	jmlog.Warn("nfs mount completed but health confirmation is still pending",
+		"mount_point", mountPoint, "hint", "periodic health checks will continue")
+	return false
+}
+
+// confirmNFSMountReady advances the mount to user-visible ready only after both
+// the bounded read/stat check and a real mutation through the NFS client path.
+// This is deliberately separate from the optional throughput self-test: write
+// readiness is a correctness gate and costs only 4 KiB.
+func confirmNFSMountReady(mon nfsHealthRefresher, mountPoint string, generation uint64) {
+	if mon == nil || mountPoint == "" || generation == 0 {
+		publishNFSWriteReadiness(generation, false, "NFS write verifier is not configured")
+		return
+	}
+	if !globalNFSWriteVerifyArmed.Load() || globalNFSWriteGeneration.Load() != generation {
+		return
+	}
+	// Claim this generation without allowing duplicate mount/recovery callbacks
+	// to stack probes. A new Start supersedes an older verifier immediately.
+	for {
+		active := globalNFSWriteVerifyGeneration.Load()
+		if active == generation {
+			return
+		}
+		if globalNFSWriteVerifyGeneration.CompareAndSwap(active, generation) {
+			break
+		}
+	}
+	go verifyNFSMountReadyLoop(mon, mountPoint, generation, runWriteProbe)
+}
+
+func verifyNFSMountReadyLoop(
+	mon nfsHealthRefresher,
+	mountPoint string,
+	generation uint64,
+	probe func(string, time.Duration) (bool, int64, string),
+) {
+	verifyNFSMountReadyLoopWithAdmission(mon, mountPoint, generation, probe,
+		productionNFSWriteProbeAdmissionDeps(), nfsWriteVerificationWait)
+}
+
+func verifyNFSMountReadyLoopWithAdmission(
+	mon nfsHealthRefresher,
+	mountPoint string,
+	generation uint64,
+	probe func(string, time.Duration) (bool, int64, string),
+	admission nfsWriteProbeAdmissionDeps,
+	wait func(int, uint64) bool,
+) {
+	defer globalNFSWriteVerifyGeneration.CompareAndSwap(generation, 0)
+	for attempt := 1; nfsWriteVerifierCurrent(generation); attempt++ {
+		if !refreshNFSHealthAfterMount(mon, mountPoint, generation) {
+			if !nfsWriteVerifierCurrent(generation) {
+				return
+			}
+			publishNFSWriteReadiness(generation, false, "NFS mount is not read-responsive; retrying verification")
+		} else {
+			if !nfsWriteVerifierCurrent(generation) {
+				return
+			}
+			original, admitted := admission.capture(generation)
+			if !admitted {
+				publishNFSWriteReadiness(generation, false, "write verification deferred: offline or backend unqualified")
+				if !wait(attempt, generation) {
+					return
+				}
+				continue
+			}
+			publishNFSWriteReadiness(generation, false, "verifying NFS write path")
+			ok, elapsedMs, hint := probe(mountPoint, 5*time.Second)
+			if !nfsWriteVerifierCurrent(generation) {
+				return
+			}
+			if !admission.stillCurrent(generation, original) {
+				publishNFSWriteReadiness(generation, false, "write verification deferred: offline or backend unqualified")
+				if !wait(attempt, generation) {
+					return
+				}
+				continue
+			}
+			if ok {
+				publishNFSWriteReadiness(generation, true, "verified")
+				warmupMarkServing()
+				jmlog.Info("nfs mount write path verified",
+					"mount_point", mountPoint, "elapsed_ms", elapsedMs, "attempt", attempt)
+				return
+			}
+			reason := "NFS write verification failed: " + hint + "; retrying"
+			publishNFSWriteReadiness(generation, false, reason)
+			if attempt == 1 || attempt%5 == 0 {
+				jmlog.Warn("nfs mount write-readiness verification failed; retrying",
+					"mount_point", mountPoint, "attempt", attempt,
+					"elapsed_ms", elapsedMs, "error", hint)
+			}
+		}
+
+		if !wait(attempt, generation) {
+			return
+		}
+	}
+}
+
+var nfsWriteVerificationWait = func(attempt int, generation uint64) bool {
+	return waitForNFSWriteVerifier(generation, nfsWriteVerificationRetryDelay(attempt))
+}
+
+func nfsWriteVerifierCurrent(generation uint64) bool {
+	return generation != 0 &&
+		globalNFSWriteVerifyArmed.Load() &&
+		globalNFSWriteGeneration.Load() == generation &&
+		globalNFSWriteVerifyGeneration.Load() == generation
+}
+
+// waitForNFSWriteVerifier sleeps without making shutdown wait behind the
+// verifier's exponential retry backoff. Generation invalidation is polled at a
+// short interval because this is process-local lifecycle state, not a hot path.
+func waitForNFSWriteVerifier(generation uint64, delay time.Duration) bool {
+	if delay <= 0 {
+		return nfsWriteVerifierCurrent(generation)
+	}
+	deadline := time.Now().Add(delay)
+	for nfsWriteVerifierCurrent(generation) {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return true
+		}
+		if remaining > 25*time.Millisecond {
+			remaining = 25 * time.Millisecond
+		}
+		time.Sleep(remaining)
+	}
+	return false
+}
+
+// disarmNFSWriteVerifier must run before an NFS unmount. The verifier performs
+// a real create/write/fsync/delete through that same hard mount. Leaving its
+// retry loop armed during unmount can keep a dd helper blocked in open(2), make
+// the mount busy, and let the next app process inherit a readable-but-
+// unwritable kernel NFS session. The ordinary probe has a five-second process
+// budget, so six seconds lets an in-flight helper be killed and the owning
+// verifier goroutine retire. A timeout retains the mount and serving stack;
+// no replacement probe can start.
+func disarmNFSWriteVerifier(reason string, timeout time.Duration) bool {
+	globalNFSWriteVerifyArmed.Store(false)
+	resetNFSWriteReadiness(true, reason)
+	deadline := time.Now().Add(timeout)
+	processesClean, activeProcesses := globalNFSWriteProbeProcesses.stopAndWait(deadline)
+	if !processesClean {
+		jmlog.Warn("nfs write probe helpers did not reap before unmount",
+			"timeout_ms", timeout.Milliseconds(), "active_helpers", activeProcesses)
+	}
+	for globalNFSWriteVerifyGeneration.Load() != 0 {
+		if !time.Now().Before(deadline) {
+			jmlog.Warn("nfs write verifier did not quiesce before unmount",
+				"timeout_ms", timeout.Milliseconds())
+			return false
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	return processesClean
+}
+
+func nfsWriteVerificationRetryDelay(attempt int) time.Duration {
+	if attempt < 1 {
+		attempt = 1
+	}
+	delay := time.Second << min(attempt-1, 5) // 1s, 2s, 4s, 8s, 16s, then 30s
+	if delay > 30*time.Second {
+		return 30 * time.Second
+	}
+	return delay
+}
+
+// recordAndConfirmNFSMount is the single success path for asynchronous boot,
+// watchdog, absent-mount, and user-triggered mount recovery. It publishes the
+// recovered path immediately, then advances warm-up only if the health
+// monitor's bounded mount-table + stat probe confirms the kernel can actually
+// use it. If confirmation is temporarily late, /warmup self-heals from the
+// monitor's next healthy sample rather than remaining stuck at 5%.
+func recordAndConfirmNFSMount(mountPoint string) {
+	if mountPoint == "" {
+		return
+	}
+	globalMu.Lock()
+	globalMountPath = mountPoint
+	mon := globalMonitor
+	globalMu.Unlock()
+	generation := globalNFSWriteGeneration.Load()
+	if mon != nil {
+		confirmNFSMountReady(mon, mountPoint, generation)
+		return
+	}
+	// A fast passwordless boot mount can complete before the monitor is
+	// published. Join it asynchronously rather than losing the correctness
+	// probe for the entire session.
+	go func() {
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) && globalNFSWriteGeneration.Load() == generation {
+			globalMu.Lock()
+			candidate := globalMonitor
+			globalMu.Unlock()
+			if candidate != nil {
+				confirmNFSMountReady(candidate, mountPoint, generation)
+				return
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+		publishNFSWriteReadiness(generation, false, "NFS health monitor was not available for write verification")
+	}()
+}
+
+// NFSServerStop is a soft stop for server-only deployments. A live NFS mount
+// must be unmounted by StopMount or Shutdown before its handler stores close.
+//
+//export NFSServerStop
+func NFSServerStop() C.int {
+	if serviceClientBuild {
+		return forwardServiceInt("stop", nil, nil)
+	}
+	if stopServerLocked() {
+		return 1
+	}
+	return 0
+}
+
+// stopServerLocked serializes a soft stop against every Start and hard-stop
+// lifecycle, then tears down everything except the FUSE/NFS mounts.
 //
 // Locking: this function takes globalMu BRIEFLY to swap globals into
 // locals (atomically nil-ing the publicly-observable state), then
@@ -1603,13 +3280,124 @@ func NFSServerStop() {
 // context and joins probe goroutines); holding globalMu across them
 // would make every concurrent Stats / IsRunning / CacheStatus call from
 // the menu-bar poller park behind the teardown.
-//
-// The name is historical — it used to require the caller to hold the
-// lock. Both call sites (NFSServerStop, NFSServerShutdown) have been
-// adjusted accordingly.
-func stopServerLocked() {
-	// Detach the /health closure first so a probe arriving during
-	// tear-down doesn't see partially-released state.
+func stopServerLocked() bool {
+	globalLifecycleMu.Lock()
+	defer globalLifecycleMu.Unlock()
+	if _, err := stopServingDesired(); err != nil {
+		jmlog.Error("soft stop desired state unavailable", "error", err)
+		return false
+	}
+	return stopServerSerialized()
+}
+
+// stopServerSerialized implements the teardown after the caller has acquired
+// globalLifecycleMu. StopMount and Shutdown keep that mutex across their NFS
+// unmount and call this directly, preventing a concurrent Start from rearming
+// the verifier between disarm and component teardown.
+func stopServerSerialized() bool {
+	return stopServerSerializedWithDeadline(30 * time.Second)
+}
+
+func stopServerSerializedWithDeadline(deadline time.Duration) bool {
+	if !quiesceServerSerialized(deadline) {
+		return false
+	}
+	closeServerResourcesSerialized()
+	return true
+}
+
+// Quiesce accepted work while keeping every dependency published and open.
+// A hard shutdown must also settle FUSE before final resource closure.
+// The caller holds globalLifecycleMu throughout both phases.
+func quiesceServerSerialized(deadline time.Duration) bool {
+	globalMu.Lock()
+	mounted := globalMountPath != "" || globalNFSController != nil
+	globalMu.Unlock()
+	if mounted {
+		jmlog.Error("shutdown incomplete: NFS mount must be unmounted before handler teardown")
+		return false
+	}
+	if !retireNFSMountFlights(deadline) {
+		jmlog.Error("shutdown incomplete: NFS mount attempt still in flight")
+		return false
+	}
+	globalMu.Lock()
+	mounted = globalMountPath != "" || globalNFSController != nil
+	globalMu.Unlock()
+	if mounted {
+		jmlog.Error("shutdown incomplete: NFS mount must be unmounted before handler teardown")
+		return false
+	}
+	if !disarmNFSWriteVerifier("server stopped", 6*time.Second) {
+		jmlog.Error("shutdown incomplete: NFS write verifier still owns mount")
+		return false
+	}
+
+	globalMu.Lock()
+	preStopServer := globalServer
+	preStopDrainer := globalDrainer
+	preStopPrefetcher := globalPrefetcher
+	preStopFUSE := globalFUSE
+	preStopOwnerLoop := globalOwnerLoop
+	sweepDone := globalSpoolSweepDone
+	globalStopPending = true
+	globalMu.Unlock()
+	if preStopOwnerLoop != nil && !preStopOwnerLoop.stopWithin(deadline) {
+		jmlog.Error("shutdown incomplete: selected owner recovery callback still owns handler stores")
+		return false
+	}
+	if preStopFUSE != nil && !preStopFUSE.QuiesceRemountCallbacks(deadline) {
+		jmlog.Error("shutdown incomplete: FUSE recovery callback still owns handler stores")
+		return false
+	}
+	if preStopServer != nil {
+		jmlog.Info("shutdown step", "component", "server.Stop")
+		_ = preStopServer.DisableStart()
+		if !preStopServer.QuiesceClients(deadline) {
+			jmlog.Error("shutdown incomplete: accepted NFS connections or RPCs still own handler stores")
+			return false
+		}
+	}
+	// Stop the dispatcher before waiting for boot's streamed-partial sweep.
+	// A Stop before Start prevents the sweep goroutine from starting a late
+	// dispatcher; the sweep itself must finish before its spool can be closed.
+	if preStopDrainer != nil {
+		preStopDrainer.Stop(0)
+	}
+	if sweepDone != nil {
+		timer := time.NewTimer(deadline)
+		select {
+		case <-sweepDone:
+			timer.Stop()
+		case <-timer.C:
+			jmlog.Error("shutdown incomplete: stream-partial sweep still owns the spool")
+			return false
+		}
+	}
+	// Owned pin work retains a bound-cache ticket. Cancel and join it before
+	// StopHandler waits for those tickets, while spool/FUSE remain published.
+	if preStopPrefetcher != nil && !preStopPrefetcher.StopWithin(deadline) {
+		jmlog.Error("shutdown incomplete: prefetch work still owns pin store and FUSE")
+		return false
+	}
+	if preStopServer != nil {
+		if !preStopServer.Handler().StopHandler() {
+			jmlog.Error("shutdown incomplete: drainer still owns spool and metadata")
+			return false
+		}
+	} else if preStopDrainer != nil && !preStopDrainer.Stop(deadline) {
+		jmlog.Error("shutdown incomplete: drainer still owns spool and metadata")
+		return false
+	}
+	return true
+}
+
+// Called only after all users of the published resources have relinquished
+// custody. Soft Stop deliberately keeps the FUSE manager and Link alive;
+// hard Shutdown first requires its typed FUSE stop to complete as well.
+func closeServerResourcesSerialized() {
+	// Keep health/status attached while shutdown is incomplete so the UI can
+	// still inspect the retained spool. Detach only before resource closure.
 	metrics.Default().SetHealthProvider(nil)
 
 	// Snapshot + nil under the lock. Includes globalPinStore and
@@ -1622,32 +3410,36 @@ func stopServerLocked() {
 	metricsSrv := globalMetrics
 	monitor := globalMonitor
 	server := globalServer
-	cache := globalCache
+	cacheOwner := globalCacheOwner
+	linkNode := globalLinkNode
 	rc := globalRC
 	store := globalStore
-	rdb := globalRDB
 	pinStore := globalPinStore
 	prefetcher := globalPrefetcher
 	reach := globalReach
 	keyspaceNW := globalKeyspaceNetWatcher
 	spool := globalSpool
 	drainer := globalDrainer
+	projectLeases := globalProjectLeases.Swap(nil)
 	globalDrainerAtomic.Store(nil)
 	derivStore := globalDerivStore
 	globalMetrics = nil
+	globalOwnerLoop = nil
 	globalMonitor = nil
 	globalServer = nil
-	globalCache = nil
+	globalMountFlights = nil
+	globalCacheOwner = nil
 	globalRC = nil
 	globalStore = nil
-	globalRDB = nil
 	globalPinStore = nil
 	globalPrefetcher = nil
 	globalReach = nil
 	globalKeyspaceNetWatcher = nil
 	globalSpool = nil
+	globalSpoolSweepDone = nil
 	globalDrainer = nil
 	globalDerivStore = nil
+	globalStopPending = false
 	thumbWarmer := globalThumbWarmer
 	globalThumbWarmer = nil
 	globalThumbCache = nil
@@ -1680,46 +3472,48 @@ func stopServerLocked() {
 		jmlog.Info("shutdown step", "component", "monitor.Stop")
 		monitor.Stop()
 	}
-	if server != nil {
-		// StopHandler tears down drainer + spool internally (slice C
-		// integration), but we re-snapshot the globals above and
-		// fall through to redundant Stop calls below as belt-and-
-		// suspenders for the case where SetSpool was bypassed for
-		// some reason — the global is the durable handle.
-		jmlog.Info("shutdown step", "component", "StopHandler")
-		server.Handler().StopHandler()
-		jmlog.Info("shutdown step", "component", "server.Stop")
-		server.Stop()
-	}
+	// The listener and handler stopped while their dependencies were still
+	// published. Only a completed drainer may reach these resource closes.
 	if drainer != nil {
 		// Belt-and-suspenders: handler StopHandler already drained
 		// this 30 s above. Calling Stop again is idempotent.
 		jmlog.Info("shutdown step", "component", "drainer.Stop")
 		drainer.Stop(5 * time.Second)
 	}
+	// After the drainer: no drain may still need a lease. Stop does NOT
+	// release leases (pending spool must keep its project; the proxy frees an
+	// idle lease itself).
+	if projectLeases != nil {
+		jmlog.Info("shutdown step", "component", "projectLeases.Stop")
+		projectLeases.Stop()
+	}
 	if spool != nil {
 		jmlog.Info("shutdown step", "component", "spool.Stop")
 		spool.Stop()
 	}
-	if cache != nil {
-		jmlog.Info("shutdown step", "component", "cache.Stop")
-		cache.Stop()
+	if reach != nil {
+		jmlog.Info("shutdown step", "component", "reach.Stop")
+		reach.Stop()
+	}
+	if linkNode != nil {
+		linkNode.SetOnProxyTransportChanged(nil)
+	}
+	if cacheOwner != nil {
+		jmlog.Info("shutdown step", "component", "cacheSession.Stop")
+		cacheOwner.stop()
 	}
 	if rc != nil {
 		jmlog.Info("shutdown step", "component", "rc.Stop")
 		rc.Stop()
-	}
-	if reach != nil {
-		jmlog.Info("shutdown step", "component", "reach.Stop")
-		reach.Stop()
 	}
 	if keyspaceNW != nil {
 		jmlog.Info("shutdown step", "component", "keyspaceNW.Stop")
 		keyspaceNW.Stop()
 	}
 	if prefetcher != nil {
-		jmlog.Info("shutdown step", "component", "prefetcher.Stop")
-		prefetcher.Stop()
+		// Quiesce completed this retained join before globals were detached.
+		jmlog.Info("shutdown step", "component", "prefetcher.StopWithin")
+		prefetcher.StopWithin(0)
 	}
 	if pinStore != nil {
 		jmlog.Info("shutdown step", "component", "pinStore.Close")
@@ -1732,10 +3526,6 @@ func stopServerLocked() {
 	if store != nil {
 		jmlog.Info("shutdown step", "component", "store.Close")
 		store.Close()
-	}
-	if rdb != nil {
-		jmlog.Info("shutdown step", "component", "rdb.Close")
-		rdb.Close()
 	}
 	jmlog.Info("shutdown step", "component", "stopServerLocked-complete")
 
@@ -1762,13 +3552,11 @@ func stopServerLocked() {
 //     returning EIO. Finder, doing /Volumes/ enumeration on launch, would
 //     visibly hang on each orphan.
 //
-//  2. Only after the unmount is *confirmed* gone, kill the NFS server.
+//  2. If unmount fails, retain the mounted server and its dependencies for
+//     an explicit retry. Never orphan a live kernel mount.
 //
-//  3. If the unmount fails, we still kill the server (the user clicked
-//     Stop, they want it gone) — but we log a loud ERROR so the user
-//     knows the mount entry is wedged and a reboot may be needed. With
-//     timeo=10,retrans=2 the wedge is annoying-not-catastrophic; with
-//     the old timeo=300,retrans=5 settings, a wedge required reboot.
+//  3. After confirmed unmount, retire accepted NFS clients and in-flight
+//     RPCs before closing the handler's spool and metadata stores.
 //
 // NFSServerStopMount is the middle-ground Stop semantic (QA-7,
 // 2026-05-17): unmount NFS so /Volumes/<name> disappears from the
@@ -1781,34 +3569,56 @@ func stopServerLocked() {
 // NFSServerShutdown — wired to the "Stop everything" button.
 //
 //export NFSServerStopMount
-func NFSServerStopMount() {
+func NFSServerStopMount() C.int {
+	if serviceClientBuild {
+		return forwardServiceInt("stop-mount", nil, nil)
+	}
+	globalLifecycleMu.Lock()
+	defer globalLifecycleMu.Unlock()
+	if _, err := stopServingDesired(); err != nil {
+		jmlog.Error("StopMount desired state unavailable", "error", err)
+		return 0
+	}
+	if !retireNFSMountFlights(30 * time.Second) {
+		jmlog.Error("StopMount incomplete: NFS mount attempt still in flight")
+		return 0
+	}
 	globalMu.Lock()
-	mountPath := globalMountPath
+	mountPath := retainedNFSPathLocked()
 	mon := globalMonitor
-	// Mark mount-gone publicly so concurrent Stats / IsRunning read
-	// honest state during the slow unmount.
-	globalMountPath = ""
+	server := globalServer
 	globalMu.Unlock()
+	if server != nil {
+		server.DisableRestart()
+	}
 
 	// Disarm NFS auto-remount BEFORE unmounting (review P1-B): the
 	// monitor's 10s tick can land mid-unmount, see its stale-streak hit
 	// the threshold, and REMOUNT the volume this deliberate stop is
 	// tearing down — once the server then dies, that's an orphaned kernel
 	// NFS mount (the QA-27 60s-EIO Finder-hang class). The monitor itself
-	// is stopped later in stopServerLocked; only the remount callback must
+	// is stopped later in stopServerSerialized; only the remount callback must
 	// be neutered before the unmount window opens.
 	if mon != nil {
 		mon.EnableNFSRemount(nil)
 		mon.EnableNFSAbsentRemount(nil) // #93 path too — same rationale
 	}
+	// The write-readiness verifier owns short-lived dd helpers that mutate the
+	// same hard mount. Retire it before unmount so it cannot hold the volume busy
+	// or race a replacement probe into the teardown window.
+	if !disarmNFSWriteVerifier("server stopping", 6*time.Second) {
+		jmlog.Error("shutdown incomplete: NFS write verifier still owns mount")
+		return 0
+	}
 
 	// Step 1: unmount NFS while server is still alive so the kernel
 	// gets clean flush/getattr responses during the unmount handshake.
 	if mountPath != "" {
-		if !unmountNFS(mountPath) {
+		if !unmountAndClearNFS(mountPath, unmountNFS) {
 			jmlog.Error("nfs unmount FAILED during StopMount",
 				"mount_point", mountPath,
-				"hint", "killing server anyway; user can run sudo umount -f -t nfs")
+				"hint", "server and mount retained for retry")
+			return 0
 		}
 	}
 
@@ -1816,39 +3626,183 @@ func NFSServerStopMount() {
 	// the same drain that NFSServerStop does (which is what gives the
 	// "finish sync" semantic — the metadata sync goroutine and the
 	// in-flight RPC queue both drain cleanly here).
-	stopServerLocked()
+	if !stopServerSerialized() {
+		return 0
+	}
 
 	// Step 3: deliberately DO NOT touch globalFUSE — leaving
 	// FUSE/JuiceFS alive is the whole point of this entry point.
 	// The next Start will reuse the existing FUSE mount.
+	return 1
 }
 
 //export NFSServerShutdown
-func NFSServerShutdown() {
-	// CRITICAL: do NOT hold globalMu across the slow unmount paths. Each
-	// can take seconds-to-minutes (osascript admin prompt, kernel umount
-	// retries). Menu-bar pollers calling Stats / IsRunning every 2 s would
-	// stack up behind a held globalMu and freeze the UI for the full
-	// duration of shutdown.
-	//
-	// Pattern:
-	//   1. Lock briefly, snapshot pointers, mark globals as "shutting down"
-	//      (by setting them to nil), release lock.
-	//   2. Stats / IsRunning called concurrently from this point see
-	//      "Running: false" — correct (we're shutting down).
-	//   3. Run slow unmount work WITHOUT the lock.
-	//   4. Re-acquire briefly to call stopServerLocked which expects the
-	//      lock held; it operates on the snapshotted pointers.
+func NFSServerShutdown() C.int {
+	if serviceClientBuild {
+		return forwardServiceInt("shutdown", nil, nil)
+	}
+	return shutdownServer(false)
+}
+
+//export NFSServerShutdownForced
+func NFSServerShutdownForced() C.int {
+	if serviceClientBuild {
+		return forwardServiceInt("shutdown-forced", nil, nil)
+	}
+	return shutdownServer(true)
+}
+
+func spoolClearAfterUnmount(spool *jmnfs.SpoolStore) bool {
+	if spool == nil {
+		return true
+	}
+	// ListForStatus includes every non-done row, including historical failed
+	// rows that the UI intentionally hides after its relevance window.
+	rows, err := spool.Meta().ListForStatus(time.Now())
+	if err != nil {
+		jmlog.Warn("shutdown cannot verify spool after unmount", "error", err)
+		return false
+	}
+	for _, row := range rows {
+		if row.DrainState != metadata.DrainDone {
+			jmlog.Warn("shutdown found unfinished upload after unmount",
+				"path", row.NFSPath, "state", row.DrainState)
+			return false
+		}
+	}
+	return true
+}
+
+func pendingSymlinksClearAfterUnmount(store *metadata.Store) bool {
+	if store == nil {
+		return true
+	}
+	links, err := metadata.NewSpoolStore(store.DB()).ListPendingSymlinks()
+	if err != nil {
+		jmlog.Warn("shutdown cannot verify pending symlinks after unmount", "error", err)
+		return false
+	}
+	if len(links) > 0 {
+		jmlog.Warn("shutdown found offline symlinks awaiting materialization after unmount", "count", len(links))
+		return false
+	}
+	return true
+}
+
+func unmountAndClearNFS(mountPath string, unmount func(string) bool) bool {
+	if !unmount(mountPath) {
+		return false
+	}
 	globalMu.Lock()
-	mountPath := globalMountPath
-	fuse := globalFUSE
-	mon := globalMonitor
-	// Mark "shutting down" by nil-ing the publicly-observable fields. The
-	// snapshotted pointers stay valid for the unmount work below.
-	globalMountPath = ""
-	globalFUSE = nil
-	globalFUSEPath = ""
+	if globalMountPath == mountPath {
+		globalMountPath = ""
+	}
 	globalMu.Unlock()
+	return true
+}
+
+// Test seam for lifecycle outcomes; production always uses the manager's
+// complete observation and exact-child settlement, never a pathname unmount.
+var stopManagedFUSE = (*health.FUSEManager).Stop
+var recoverShutdownOwner = recoverServingShutdownOwner
+var stopSelectedOwner = (*ownerFacade).stop
+
+// Typed reasons behind shutdown's Boolean C result. The C ABI stays 1 = done,
+// 0 = not done (Swift tests `!= 0`, so any new nonzero code would read as
+// success). The reason is kept here for the GUI to fetch and explain.
+const (
+	shutdownReasonComplete                 = "complete"
+	shutdownReasonIncomplete               = "incomplete"
+	shutdownReasonFUSERetained             = "fuse_or_link_retained"
+	shutdownReasonFUSEAdmissionPending     = "fuse_admission_pending"
+	shutdownReasonNetworkVolumesNotGranted = "network_volumes_permission_denied"
+)
+
+type shutdownOutcome struct {
+	Complete bool   `json:"complete"`
+	Reason   string `json:"reason"`
+	Detail   string `json:"detail,omitempty"`
+}
+
+var lastShutdown struct {
+	sync.Mutex
+	outcome shutdownOutcome
+}
+
+func recordShutdownOutcome(o shutdownOutcome) {
+	lastShutdown.Lock()
+	lastShutdown.outcome = o
+	lastShutdown.Unlock()
+}
+
+// lastShutdownOutcome is the typed result of the most recent shutdown in this
+// engine process. A service method must forward it for the GUI to read it.
+func lastShutdownOutcome() shutdownOutcome {
+	lastShutdown.Lock()
+	defer lastShutdown.Unlock()
+	return lastShutdown.outcome
+}
+
+// fuseRetainedOutcome types a retained-FUSE result. It accepts the owner's
+// receipt string ("state: detail") or the in-process FUSEStopResult text.
+func fuseRetainedOutcome(stopResult, fallback string) shutdownOutcome {
+	state, _, _ := strings.Cut(stopResult, ":")
+	reason := shutdownReasonFUSERetained
+	switch health.FUSEStopState(state) {
+	case health.FUSEPermissionDenied:
+		reason = shutdownReasonNetworkVolumesNotGranted
+	case health.FUSEAdmissionPending:
+		// Neutral: a pending prompt and a hung daemon look identical here.
+		reason = shutdownReasonFUSEAdmissionPending
+	}
+	detail := stopResult
+	if detail == "" {
+		detail = fallback
+	}
+	return shutdownOutcome{Reason: reason, Detail: detail}
+}
+
+func shutdownServer(allowPending bool) C.int {
+	globalLifecycleMu.Lock()
+	defer globalLifecycleMu.Unlock()
+	recordShutdownOutcome(shutdownOutcome{Reason: shutdownReasonIncomplete})
+	if _, err := stopServingDesired(); err != nil {
+		jmlog.Error("shutdown desired state unavailable", "error", err)
+		return 0
+	}
+	if !retireNFSMountFlights(30 * time.Second) {
+		jmlog.Error("shutdown incomplete: NFS mount attempt still in flight")
+		return 0
+	}
+	// Snapshot briefly, then keep dependencies published while bounded
+	// lifecycle work runs. An incomplete result must remain inspectable and
+	// must never discard the manager or its stores to make shutdown look done.
+	globalMu.Lock()
+	mountPath := retainedNFSPathLocked()
+	fuse := globalFUSE
+	owner := globalOwner
+	mon := globalMonitor
+	server := globalServer
+	globalMu.Unlock()
+	if servingProcessMode.Load() && fuse == nil && owner == nil {
+		// A restarted idle engine can have no local facade while the original
+		// owner still holds FUSE. Reconstruct only its control identity before
+		// any NFS or physical-owner teardown; uncertainty retains authority.
+		recovered, err := recoverShutdownOwner()
+		if err != nil {
+			jmlog.Error("shutdown original owner custody unavailable", "error", err)
+			return 0
+		}
+		if recovered != nil {
+			globalMu.Lock()
+			globalOwner = recovered
+			globalMu.Unlock()
+			owner = recovered
+		}
+	}
+	if server != nil {
+		server.DisableRestart()
+	}
 
 	// Disarm NFS auto-remount BEFORE the unmount window (review P1-B —
 	// see NFSServerStopMount for the full rationale): a monitor tick
@@ -1857,49 +3811,291 @@ func NFSServerShutdown() {
 		mon.EnableNFSRemount(nil)
 		mon.EnableNFSAbsentRemount(nil) // #93 path too — same rationale
 	}
+	// See NFSServerStopMount: verifier helpers must be gone before the first
+	// unmount syscall, while the NFS server is still alive to finish their RPCs.
+	if !disarmNFSWriteVerifier("server shutting down", 6*time.Second) {
+		jmlog.Error("shutdown incomplete: NFS write verifier still owns mount")
+		return 0
+	}
 
-	// Step 1: unmount NFS while the server is still alive (handler can
-	// satisfy any kernel flush/getattr during the unmount handshake). No
-	// lock held — Stats during this window correctly reports "shutting
-	// down" via Running:false.
-	nfsCleaned := true
+	// Prove NFS absence while its server is still available. Present or
+	// unknown occupancy keeps the serving stack alive for recovery.
 	if mountPath != "" {
-		nfsCleaned = unmountNFS(mountPath)
-		if !nfsCleaned {
+		if !unmountAndClearNFS(mountPath, unmountNFS) {
 			jmlog.Error("nfs unmount FAILED during shutdown",
 				"mount_point", mountPath,
-				"hint", "killing server anyway; kernel may have a wedged mount entry until reboot or `sudo umount -f -t nfs`")
+				"hint", "server and mount retained for retry")
+			return 0
+		}
+	}
+	if server != nil {
+		if err := server.DisableStart(); err != nil {
+			jmlog.Error("shutdown could not retire NFS listener", "error", err)
+			return 0
+		}
+		if !server.QuiesceClients(30 * time.Second) {
+			jmlog.Error("shutdown incomplete: accepted NFS RPCs still active")
+			return 0
+		}
+	}
+	if !allowPending {
+		globalMu.Lock()
+		spool := globalSpool
+		store := globalStore
+		sweepDone := globalSpoolSweepDone
+		globalMu.Unlock()
+		if sweepDone != nil {
+			select {
+			case <-sweepDone:
+			default:
+				jmlog.Warn("shutdown cannot verify spool while boot sweep is active")
+				return 0
+			}
+		}
+		if !spoolClearAfterUnmount(spool) || !pendingSymlinksClearAfterUnmount(store) {
+			return 0
 		}
 	}
 
-	// Step 2: tear down server + cache + monitor + metrics + Redis sub.
-	// stopServerLocked takes globalMu briefly to nil the globals, then
-	// runs the slow .Stop() calls without the lock held.
-	stopServerLocked()
-
-	// Step 3: unmount FUSE. Health.FUSEManager.Stop() now bounded (see
-	// iteration 2 commits). No lock held.
+	// Settle handler/drainer/callback work, but keep stores, Link and the
+	// actual manager published until the FUSE lifecycle also completes.
+	if !quiesceServerSerialized(30 * time.Second) {
+		return 0
+	}
 	if fuse != nil {
-		fuse.Stop()
+		result := stopManagedFUSE(fuse)
+		if !result.Complete() {
+			outcome := fuseRetainedOutcome(result.String(), "")
+			recordShutdownOutcome(outcome)
+			jmlog.Warn("shutdown incomplete: FUSE dependencies retained", "result", result.String(), "reason", outcome.Reason)
+			return 0
+		}
+	} else if owner != nil {
+		globalMu.Lock()
+		if globalOwnerStopID == "" {
+			id, err := randomOwnerID()
+			if err != nil {
+				globalMu.Unlock()
+				jmlog.Error("owner stop ID unavailable", "error", err)
+				return 0
+			}
+			globalOwnerStopID = id
+		}
+		id := globalOwnerStopID
+		globalMu.Unlock()
+		var result volumeOwnerReceipt
+		var err error
+		if confirmOwnerRetired(owner.intent) != nil {
+			result, err = stopSelectedOwner(owner, id)
+		}
+		if err != nil {
+			if result.OperationState == "error" {
+				globalMu.Lock()
+				if globalOwnerStopID == id {
+					globalOwnerStopID = ""
+				}
+				globalMu.Unlock()
+			}
+			outcome := fuseRetainedOutcome(result.StopResult, err.Error())
+			recordShutdownOutcome(outcome)
+			jmlog.Warn("shutdown incomplete: selected owner retains FUSE or Link", "error", err,
+				"stop_result", result.StopResult, "reason", outcome.Reason)
+			return 0
+		}
+		if err := owner.retire(); err != nil {
+			recordShutdownOutcome(shutdownOutcome{Reason: shutdownReasonFUSERetained, Detail: err.Error()})
+			jmlog.Warn("shutdown incomplete: selected owner terminal settlement pending", "error", err)
+			return 0
+		}
+	}
+	closeServerResourcesSerialized()
+	globalMu.Lock()
+	globalFUSE = nil
+	globalOwner = nil
+	globalOwnerStopID = ""
+	globalFUSEBinary = ""
+	globalFUSEConfig = nil
+	globalFUSEPath = ""
+	globalMu.Unlock()
+	// Link owns the loopback endpoints used by the FUSE daemon, so it must
+	// outlive soft stops (which intentionally leave FUSE mounted). A hard
+	// shutdown is the matching lifecycle boundary: FUSE is gone and all tsnet
+	// state/proxies can be released.
+	if node := takeGlobalLinkNode(); node != nil {
+		jmlog.Info("shutdown step", "component", "LinkNode.Stop")
+		node.Stop()
 	}
 
-	_ = nfsCleaned // currently observable only via logs
+	recordShutdownOutcome(shutdownOutcome{Complete: true, Reason: shutdownReasonComplete})
 	jmlog.Close()
+	return 1
 }
 
 //export NFSServerIsRunning
 func NFSServerIsRunning() C.int {
+	if serviceClientBuild {
+		return forwardServiceInt("is-running", nil, nil)
+	}
 	// Snapshot-then-release. Holding globalMu across the read meant any
 	// in-flight Shutdown (which holds globalMu for up to ~70 s during the
 	// osascript admin prompt for unmount) would park IsRunning calls from
 	// the menu-bar poller — blocking the UI's idle render loop.
 	globalMu.Lock()
-	running := globalServer != nil
+	server := globalServer
 	globalMu.Unlock()
+	running := server != nil && server.IsRunning()
 	if running {
 		return 1
 	}
 	return 0
+}
+
+// networkCostClass converts the host OS's path-cost signal into the automatic
+// policy's cost override. Explicit operator force remains authoritative. The
+// bool return is false when automatic passive classification should resume.
+func networkCostClass(expensive, constrained bool) (netprofile.LinkClass, bool) {
+	if expensive || constrained {
+		return netprofile.ClassMetered, true
+	}
+	return 0, false
+}
+
+// startRedisURLs is Start's ingest of the configured metadata endpoint. It
+// records the logical URL (before Link or debug rewrites) as the only
+// endpoint "enroll-verify" checks (noteServingRedisURL: without it every
+// desktop enroll-verify is refused, review 4 N16), and returns the runtime
+// and route-policy URLs (redisURLsAtConfigIngest). One function, so Start
+// cannot take the URLs without recording the endpoint.
+func startRedisURLs(logical string) (runtimeURL, routePolicyURL string) {
+	noteServingRedisURL(logical)
+	return redisURLsAtConfigIngest(logical)
+}
+
+// redisURLsAtConfigIngest separates the endpoint used by all runtime traffic
+// from the endpoint used only for route policy. In production with no debug
+// override they are byte-identical. Acceptance can route runtime traffic
+// through its bounded loopback accounting proxy without making NetWatcher
+// classify lo0 instead of the real backend route.
+func redisURLsAtConfigIngest(configured string) (runtimeURL, routePolicyURL string) {
+	return health.MetaURLForMount(configured), configured
+}
+
+// backendRouteTarget extracts the probe-free routing target from the original
+// configured Redis URL. Empty/malformed values fail closed to default-route
+// classification; credentials and database indexes are never returned.
+func backendRouteTarget(redisURL string) string {
+	addr, _, err := metadata.ParseRedisURL(strings.TrimSpace(redisURL))
+	if err != nil || strings.TrimSpace(addr) == "" {
+		return ""
+	}
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil || strings.TrimSpace(host) == "" {
+		return ""
+	}
+	portNumber, err := strconv.Atoi(port)
+	if err != nil || portNumber < 1 || portNumber > 65535 {
+		return ""
+	}
+	return addr
+}
+
+// resolveAndApplyBackendRouteCeiling is split out so tests can prove that the
+// original target reaches policy application without opening a socket. The
+// production resolver is health.ResolveRouteInterface (UDP connect routing
+// lookup only; no packet is transmitted).
+func resolveAndApplyBackendRouteCeiling(target string, resolver func(string) (string, error)) error {
+	if target == "" || resolver == nil {
+		return fmt.Errorf("backend route target unavailable")
+	}
+	iface, err := resolver(target)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(iface) == "" {
+		return fmt.Errorf("backend route interface unavailable")
+	}
+	applyBackendRouteCeiling(iface)
+	return nil
+}
+
+func applyBackendRouteCeiling(iface string) {
+	p := netprofile.Default()
+	tunneled := strings.HasPrefix(iface, "utun") || iface == "tailscale0"
+	if tunneled {
+		ceiling := netprofile.ClassSlow
+		p.CeilingClass(&ceiling)
+	} else {
+		p.CeilingClass(nil)
+	}
+	backendRoutePolicyState.tunneled.Store(tunneled)
+	backendRoutePolicyState.ceilingApplied.Store(tunneled)
+	jmlog.Info("backend route link ceiling updated",
+		"interface", iface,
+		"effective_class", p.Class().String())
+}
+
+var hostNetworkCost = struct {
+	sync.Mutex
+	initialized bool
+	expensive   bool
+	constrained bool
+}{}
+
+func hostNetworkCostSnapshot() (observed, expensive, constrained bool) {
+	hostNetworkCost.Lock()
+	defer hostNetworkCost.Unlock()
+	return hostNetworkCost.initialized, hostNetworkCost.expensive, hostNetworkCost.constrained
+}
+
+// NFSServerSetNetworkCost receives Network.framework's live path-cost signal
+// from the macOS host. Passive RTT alone cannot identify a phone hotspot behind
+// a low-latency Tailscale hop: that exact combination was classified Medium at
+// startup and enabled source-thumbnail fallback, speculative warmers, and
+// unrestricted background reads over cellular. The OS signal is authoritative
+// for data-cost policy; when it clears, passive classification resumes.
+//
+//export NFSServerSetNetworkCost
+func NFSServerSetNetworkCost(expensive C.int, constrained C.int) {
+	if serviceClientBuild {
+		forwardNetworkCost(int(expensive), int(constrained))
+		return
+	}
+	exp := expensive != 0
+	con := constrained != 0
+
+	hostNetworkCost.Lock()
+	if hostNetworkCost.initialized && hostNetworkCost.expensive == exp && hostNetworkCost.constrained == con {
+		hostNetworkCost.Unlock()
+		return
+	}
+	hostNetworkCost.initialized = true
+	hostNetworkCost.expensive = exp
+	hostNetworkCost.constrained = con
+	hostNetworkCost.Unlock()
+
+	p := netprofile.Default()
+	// Keep OS cost separate from JM_NET_FORCE_CLASS/JM_NET_ADAPTIVE so a later
+	// non-expensive callback cannot erase an explicit operator override.
+	if class, costly := networkCostClass(exp, con); costly {
+		p.SetNetworkCostClass(&class)
+	} else {
+		p.SetNetworkCostClass(nil)
+	}
+	// Drop measurements learned on the previous physical path. This preserves
+	// both the explicit force and OS-cost class (Profile's documented contract).
+	p.ResetForTransportChange()
+	globalMu.Lock()
+	selected := globalOwner
+	globalMu.Unlock()
+	if selected != nil {
+		if err := selected.setCost(exp, con); err != nil {
+			jmlog.Warn("selected owner network cost delivery uncertain", "error", err.Error())
+		}
+	}
+	jmlog.Info("host network cost changed",
+		"expensive", exp,
+		"constrained", con,
+		"effective_class", p.Class().String())
 }
 
 // StatsResult is the JSON stats returned to Swift.
@@ -1916,6 +4112,9 @@ type StatsResult struct {
 
 //export NFSServerStats
 func NFSServerStats() *C.char {
+	if serviceClientBuild {
+		return forwardServiceText("stats", nil, nil)
+	}
 	// Snapshot all globals under the lock, release IMMEDIATELY, then call
 	// methods on the snapshots without holding globalMu. Each method we
 	// call (RC.LastSyncDuration, server.Addr, monitor.Status) has its own
@@ -1937,7 +4136,7 @@ func NFSServerStats() *C.char {
 	monitor := globalMonitor
 	globalMu.Unlock()
 
-	stats := StatsResult{Running: server != nil}
+	stats := StatsResult{Running: server != nil && server.IsRunning()}
 	if rc != nil {
 		stats.LastSyncMs = rc.LastSyncDuration().Milliseconds()
 		stats.LastSyncTime = rc.LastSyncTime().Format(time.RFC3339)
@@ -1968,6 +4167,9 @@ func NFSServerFreeString(s *C.char) {
 //
 //export NFSServerMetrics
 func NFSServerMetrics() *C.char {
+	if serviceClientBuild {
+		return forwardServiceText("metrics", nil, nil)
+	}
 	snap := metrics.Default().Snapshot()
 	data, _ := json.Marshal(snap)
 	return C.CString(string(data))
@@ -1977,6 +4179,9 @@ func NFSServerMetrics() *C.char {
 //
 //export NFSServerSyncNow
 func NFSServerSyncNow() *C.char {
+	if serviceClientBuild {
+		return forwardServiceText("sync", nil, nil)
+	}
 	// Snapshot RC under the lock, release, then run the (slow) SyncOnce
 	// without holding globalMu. SyncOnce does a Redis Lua EVAL bounded by
 	// 120 s — holding globalMu across that window would freeze every other
@@ -2014,6 +4219,9 @@ type SearchResult struct {
 //
 //export NFSServerSearch
 func NFSServerSearch(query *C.char, limit C.int, parentPath *C.char) *C.char {
+	if serviceClientBuild {
+		return forwardServiceText("search", []string{C.GoString(query), C.GoString(parentPath)}, []int{int(limit)})
+	}
 	// Snapshot store under the lock; release; run the FTS query without
 	// the lock. Search reads the SQLite FTS5 index which can take tens of
 	// milliseconds on a 100K+ entry corpus — holding globalMu for that
@@ -2051,160 +4259,70 @@ func NFSServerSearch(query *C.char, limit C.int, parentPath *C.char) *C.char {
 	return C.CString(string(data))
 }
 
-// mountNFSWithPrompt runs `mount_nfs` via osascript with admin privileges,
-// which triggers the standard macOS authentication prompt. The user enters
-// their password once; macOS caches the auth for the session.
-// runMountViaSudo attempts to mount via passwordless `sudo`. Probes
-// `sudo -n -- true` first to detect whether sudo is configured to run
-// without a password for this user (e.g. via /etc/sudoers.d). If the
-// probe fails, returns an error so the caller falls back to the
-// AppleScript admin-prompt path.
-//
-// The mount commands themselves stay scoped to /bin/mkdir + /sbin/mount_nfs,
-// and the privileged unmount path (see unmountNFS) to /sbin/umount, so a
-// minimal sudoers entry suffices:
-//
-//	%admin ALL=(ALL) NOPASSWD: /sbin/mount_nfs, /sbin/umount, /bin/mkdir
-//
-// Two separate sudo invocations (mkdir then mount_nfs) so each is a
-// single recognized command — wrapping in `sh -c "..."` would require
-// granting NOPASSWD on /bin/sh, which is the entire shell. Refuse to
-// expand the privileged blast radius.
-func runMountViaSudo(mountPoint, opts, host string) error {
-	// Probe with one of the actually-allowed binaries — not a generic
-	// command. The recommended sudoers entry scopes NOPASSWD to
-	// /sbin/mount_nfs + /sbin/umount + /bin/mkdir, so a probe like
-	// `sudo -n -- true` would FAIL (requiring a password) even when
-	// the real mount call WOULD succeed. Use mount_nfs with no args —
-	// sudo either gates with a password (return error) or lets it
-	// through to mount_nfs which prints usage and exits non-zero.
-	// We don't care about mount_nfs's exit code here, only about
-	// sudo's: differentiate via stderr containing "password is required".
-	probe := exec.Command("sudo", "-n", "/sbin/mount_nfs")
-	probeOut, _ := probe.CombinedOutput()
-	if strings.Contains(string(probeOut), "password is required") {
-		return fmt.Errorf("passwordless sudo unavailable for /sbin/mount_nfs")
-	}
-
-	// 1. mkdir the mount point. Allowed by the same NOPASSWD rule.
-	if out, err := exec.Command("sudo", "-n", "/bin/mkdir", "-p", mountPoint).CombinedOutput(); err != nil {
-		return fmt.Errorf("sudo mkdir failed: %v\n%s", err, string(out))
-	}
-
-	// 2. mount_nfs. The -o args are the same string we'd otherwise
-	// shell-interpolate through osascript.
-	out, err := exec.Command("sudo", "-n",
-		"/sbin/mount_nfs", "-o", opts,
-		host+":/", mountPoint).CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("sudo mount_nfs failed: %v\n%s", err, string(out))
-	}
-	jmlog.Info("nfs mounted via passwordless sudo", "mount_point", mountPoint)
-	return nil
-}
-
-// nfsMountArgs derives the mount_nfs host + options string from the NFS
-// server's listen address. Shared by the interactive (mountNFSWithPrompt)
+// nfsMountArgs derives the mount_nfs source + options string from the NFS
+// server's listen address and its enforced export path. Shared by the
+// interactive (mountNFSWithPrompt)
 // and non-interactive (mountNFSNonInteractive) paths so the heavily-tuned
-// option string below can never fork between them.
-func nfsMountArgs(serverAddr string) (host, opts string) {
-	host = "127.0.0.1"
-	port := "11049"
-	if i := strings.LastIndex(serverAddr, ":"); i > 0 {
-		host = serverAddr[:i]
-		port = serverAddr[i+1:]
+// option string below can never fork between them. The export path must come
+// from the server that will answer MOUNT; a legacy host:/ source is refused.
+func nfsMountArgs(serverAddr, exportPath string) (source, opts string, err error) {
+	if !validNFSExportPath(exportPath) {
+		return "", "", fmt.Errorf("invalid NFS export path %q", exportPath)
+	}
+	host, port, err := net.SplitHostPort(serverAddr)
+	if err != nil || host == "" {
+		return "", "", fmt.Errorf("invalid NFS listener address %q", serverAddr)
+	}
+	portNumber, err := strconv.Atoi(port)
+	if err != nil || portNumber < 1 || portNumber > 65535 {
+		return "", "", fmt.Errorf("invalid NFS listener port %q", port)
+	}
+	if strings.Contains(host, ":") {
+		host = "[" + host + "]"
 	}
 	opts = nfsMountOpts(port)
-	return host, opts
+	return host + ":" + exportPath, opts, nil
 }
 
-// mountNFSNonInteractive re-runs the NFS mount via the passwordless-sudo
-// tier ONLY — it can never pop a dialog, so it's safe to call from
-// unattended contexts (the health monitor's auto-remount). No-op success
-// when already mounted. Machines without the scoped sudoers entry get an
-// error (logged by the caller); the user-facing recovery there is the
-// interactive "Mount Now" button → /mount-now → mountNFSWithPrompt.
-func mountNFSNonInteractive(serverAddr, mountPoint string) error {
-	if isMounted(mountPoint) {
-		return nil
+func validNFSExportPath(path string) bool {
+	if len(path) != 36 || !strings.HasPrefix(path, "/jm-") {
+		return false
 	}
-	host, opts := nfsMountArgs(serverAddr)
-	return runMountViaSudo(mountPoint, opts, host)
+	nonzero := false
+	for i := 4; i < len(path); i++ {
+		b := path[i]
+		if (b < '0' || b > '9') && (b < 'a' || b > 'f') {
+			return false
+		}
+		nonzero = nonzero || b != '0'
+	}
+	return nonzero
 }
 
-func mountNFSWithPrompt(serverAddr, mountPoint string) error {
-	host, opts := nfsMountArgs(serverAddr)
+// Both callers use the retained user-owned mount controller. Only an explicit
+// user path may authorize exact directory setup; unattended recovery never
+// prompts or transfers directory ownership. mount_nfs itself is never elevated.
+func mountNFSNonInteractive(serverAddr, exportPath, mountPoint string) error {
+	return startOwnedNFSMount(serverAddr, exportPath, mountPoint, false)
+}
 
-	// If something else is already mounted at the mount point, refuse —
-	// don't trample over the user's data. They need to unmount first.
-	if isMounted(mountPoint) {
-		return fmt.Errorf("%s is already mounted (umount it first)", mountPoint)
-	}
-
-	// [JM6] Two-tier mount strategy.
-	//
-	//   Tier 1: passwordless sudo. If the user has set up a sudoers
-	//     entry allowing their account to run `mount_nfs` without a
-	//     password (typical dev workflow — one-time config), use that.
-	//     Detected by `sudo -n` returning success on a no-op probe.
-	//
-	//   Tier 2: AppleScript with administrator privileges. The
-	//     fallback — prompts the user for their admin password via
-	//     the standard macOS dialog. This is the path that bit
-	//     automated testing: every restart-cycle pops up a prompt
-	//     that blocks startup until the user acknowledges.
-	//
-	// Setup instructions for tier 1 (one-time, must be run with
-	// admin rights):
-	//
-	//     sudo visudo -f /etc/sudoers.d/juicemount-mount
-	//     # add this single line (umount included so the privileged
-	//     # unmount path is covered too — see docs/dev-setup.md):
-	//     %admin ALL=(ALL) NOPASSWD: /sbin/mount_nfs, /sbin/umount, /bin/mkdir
-	//     # or scope to a specific user:
-	//     # username ALL=(ALL) NOPASSWD: /sbin/mount_nfs, /sbin/umount, /bin/mkdir
-	//
-	// With that in place, every subsequent JuiceMount launch mounts
-	// the NFS volume non-interactively. The same applies to the
-	// privileged unmount path (see unmountNFS).
-	if err := runMountViaSudo(mountPoint, opts, host); err == nil {
-		return nil
-	}
-
-	// Tier 2 fallback: AppleScript-with-admin prompt.
-	// Build the shell command: mkdir + mount_nfs
-	shellCmd := fmt.Sprintf(
-		"mkdir -p %q && mount_nfs -o %s %s:/ %q",
-		mountPoint, opts, host, mountPoint,
-	)
-
-	osaScript := fmt.Sprintf(
-		`do shell script %q with administrator privileges with prompt "JuiceMount needs to mount the NFS volume at %s"`,
-		shellCmd, mountPoint,
-	)
-
-	// Bounded: an unanswered admin prompt must never hang forever (see the
-	// NFSServerStart deadlock-fix note). 180s is generous for an attended
-	// user; unattended it self-clears and the next app start re-prompts.
-	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
-	defer cancel()
-	out, err := exec.CommandContext(ctx, "osascript", "-e", osaScript).CombinedOutput()
-	if ctx.Err() == context.DeadlineExceeded {
-		return fmt.Errorf("mount prompt timed out after 180s (unanswered)")
-	}
-	if err != nil {
-		return fmt.Errorf("osascript: %v\n%s", err, string(out))
-	}
-	return nil
+func mountNFSWithPrompt(serverAddr, exportPath, mountPoint string) error {
+	return startOwnedNFSMount(serverAddr, exportPath, mountPoint, true)
 }
 
 // nfsMountOpts builds the mount_nfs -o option string for our loopback
 // NFS server listening on `port`.
 //
 // Timeout policy. Tuned for a localhost NFS server (us). The kernel
-// client's timeo is in 0.1-second units, so timeo=200 means 20 s
-// initial timeout; retrans=2 means at most 2 retries before returning
-// EIO to the calling syscall. Worst-case dead-server detection: ~60 s.
+// client's timeo is in 0.1-second units. CURRENT VALUE IS timeo=400
+// (40 s initial timeout, ~120 s worst-case dead-server detection) — set
+// by QA-36 below. retrans=2 means at most 2 retries before returning EIO
+// to the calling syscall.
+//
+// The historical notes below are kept for the reasoning, but they quote
+// the values that were current when written (timeo=100, then 200). Read
+// the format string at the bottom for what is actually passed; that
+// drift cost a re-read on 2026-08-06.
 //
 // QA-29 (2026-05-21): bumped from timeo=100 (10 s) to timeo=200 (20 s).
 // Under heavy folder-copy load (Editor Resource Vault with thousands
@@ -2263,6 +4381,14 @@ func mountNFSWithPrompt(serverAddr, mountPoint string) error {
 //
 // Write size stays at 1 MiB — writes are sequential and the
 // failure mode there is different.
+// [RC-0.5 2026-08-27] dsize=1048576. macOS otherwise keeps its TCP default
+// directory-read size of 32 KiB even though rsize is 1 MiB. A real 5,000-entry
+// Finder fixture then takes dozens of sequential READDIRPLUS round trips and
+// repeatedly missed the 200 ms local/offline listing gate (380-535 ms), while
+// the server spent only ~1 ms in each RPC. mount_nfs documents dsize as bounded
+// by rsize; using the same 1 MiB ceiling lets this loopback-only NFS hop return
+// the listing in one or a few replies without increasing the protocol's
+// existing maximum record size.
 // QA-36 (2026-06-13): bumped timeo=200 -> timeo=400 (~120 s budget). During a
 // heavy OpenLoupe + native-Finder ingest, a CREATE/first-WRITE RPC stalled past
 // the ~60 s budget and Finder aborted with "operation can't be completed
@@ -2299,176 +4425,321 @@ func nfsMountOpts(port string) string {
 	ra := netprofile.Default().NFSReadahead()
 	// [B4' Fix B] actimeo=3600 → split attribute caching: acreg stays 3600
 	// (file attrs — unchanged behavior for the read/write paths), but acdir
-	// drops to 3-15s. With actimeo=3600 the client cached DIRECTORY attributes
+	// drops hard. With actimeo=3600 the client cached DIRECTORY attributes
 	// — and therefore its name cache, including NEGATIVE entries — for up to
 	// AN HOUR: one NoEnt answered during the ~3s keyspace-push window and
 	// server-created content (farm output, another machine's import, a
 	// folder move) stayed invisible until a manual readdir flushed it.
 	// Measured live on cellular: content never appeared (>120s, sprint B4').
-	// With the metadata mirror serving GETATTR in µs over loopback, client
-	// dir-attr caching is obsolete — re-validating every 3-15s costs nothing
-	// and bounds new-content visibility at ~(push 3s + acdirmax 15s).
-	// JM_NFS_LEGACY_ACTIMEO=1 restores the old single actimeo=3600.
-	acOpts := "acregmin=3600,acregmax=3600,acdirmin=3,acdirmax=15"
+	//
+	// [T6v2 2026-08-21] acdirmin/max 3/15 → 1/2. The negative-entry window is
+	// now the LAST-MILE bound on external-write visibility, and it is pure
+	// loss: live proof — keyspace push mirrors a server-side WebDAV write in
+	// ~220ms (reconcileDir upsert log), a mount created after the upsert sees
+	// the file instantly, yet mounts whose kernel cached the earlier ENOENT
+	// stayed blind 15-24s (negative dentries live to acdirmax). With the
+	// metadata mirror serving GETATTR/LOOKUP from RAM in µs over loopback,
+	// re-validating directory attrs every 1-2s costs nothing measurable and
+	// bounds new-content visibility at ~(push ≤3s + acdirmax 2s) ≈ ≤5s worst
+	// case, ~2s typical. nonegnamecache is equally load-bearing: the default
+	// negative-name cache can retain an ENOENT after keyspace push has already
+	// inserted the child into our local mirror. Disabling it adds only a
+	// loopback, RAM-served LOOKUP and prevents a pre-push miss from masking the
+	// now-present file. JM_NFS_LEGACY_ACTIMEO=1 restores actimeo=3600;
+	// JM_NFS_ACDIR="min,max" overrides the split values.
+	acOpts := "acregmin=3600,acregmax=3600,acdirmin=1,acdirmax=2"
+	if v := os.Getenv("JM_NFS_ACDIR"); v != "" {
+		if parts := strings.SplitN(v, ",", 2); len(parts) == 2 {
+			acOpts = "acregmin=3600,acregmax=3600,acdirmin=" + strings.TrimSpace(parts[0]) + ",acdirmax=" + strings.TrimSpace(parts[1])
+		}
+	}
 	if os.Getenv("JM_NFS_LEGACY_ACTIMEO") == "1" {
 		acOpts = "actimeo=3600"
 	}
+	// mutejukebox (L3, 2026-08-06). NFS3ERR_JUKEBOX is the documented trigger for
+	// macOS declaring a volume unresponsive — `man mount_nfs`: mutejukebox
+	// suppresses the "server is not responding" alert for jukebox replies. We
+	// RETURN JUKEBOX BY DESIGN on several paths: the FUSE stat budget
+	// (errFUSETimeout), the FUSE data ceiling shedding at its ceiling, and the
+	// spool in-flight hole hold (spoolReadFile.ReadAt) all surface as a jukebox
+	// retry rather than an error, because retrying is correct and failing is not.
+	//
+	// So every one of those deliberate holds also pops "connection interrupted"
+	// at the user — the symptom chased in [[project_lookup_flicker_rootcause]]
+	// and [[project_slow_copy_fsetxattr]]. The retry semantics are what we want;
+	// only the alert is wrong. This mutes the alert and changes nothing else.
 	return fmt.Sprintf(
-		"port=%s,mountport=%s,hard,intr,timeo=400,retrans=2,nolocks,locallocks,rsize=1048576,wsize=1048576,readahead=%d,%s,vers=3,tcp",
+		"port=%s,mountport=%s,hard,intr,timeo=400,retrans=2,mutejukebox,nonegnamecache,nolocks,locallocks,rsize=1048576,wsize=1048576,dsize=1048576,readahead=%d,%s,vers=3,tcp",
 		port, port, ra, acOpts)
 }
 
-// unmountNFS removes the NFS mount.
-//
-// Each strategy is bounded by a context timeout so a hung NFS operation
-// (kernel stuck talking to a dead server) doesn't wedge our shutdown path
-// for minutes. If every strategy fails, we log loudly and return false —
-// the caller (NFSServerShutdown) decides whether to kill the server
-// anyway.
-//
-// Strategy (cheapest first):
-//  1. `diskutil unmount` — works without sudo, doesn't pop a password
-//     prompt. Succeeds in the common case.
-//  2. `diskutil unmount force` — non-interactive force; still no sudo.
-//  3. `umount -f -t nfs` via AppleScript with administrator privileges —
-//     the only thing that can dislodge a truly wedged kernel mount entry.
-//     Prompts for password.
-//
-// Returns true iff the mount is gone by the time we return.
+// runProcessBounded starts a cleanup process and returns at the deadline even
+// when the child is stuck in an uninterruptible kernel syscall. Go's
+// CommandContext(...).Run() is not sufficient here: after its context fires it
+// kills the child and then waits to reap it, and that Wait can remain blocked
+// behind a wedged diskutil/umount indefinitely.
+func runProcessBounded(timeout time.Duration, name string, args ...string) error {
+	cmd := exec.Command(name, args...)
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case err := <-done:
+		return err
+	case <-timer.C:
+		_ = cmd.Process.Kill()
+		// The waiter remains responsible for reaping the child if and when the
+		// kernel releases it. Shutdown must not wait for that event.
+		return fmt.Errorf("%s timed out after %s: %w", name, timeout, context.DeadlineExceeded)
+	}
+}
+
+var errNFSWriteProbeDisarmed = errors.New("NFS write probe helpers are disarmed")
+var errNFSWriteProbeHelperActive = errors.New("a previous NFS write probe helper is still exiting")
+
+// nfsWriteProbeProcessTracker owns the real child-process lifetime behind the
+// write-readiness verifier. Tracking only the Go verifier is insufficient on
+// macOS: after SIGKILL, a dd blocked in an NFS open can remain in the kernel
+// until force-unmount releases it. The active entry is therefore removed only
+// after cmd.Wait returns.
+type nfsWriteProbeProcessTracker struct {
+	mu        sync.Mutex
+	accepting bool
+	active    map[*exec.Cmd]struct{}
+}
+
+func newNFSWriteProbeProcessTracker() *nfsWriteProbeProcessTracker {
+	return &nfsWriteProbeProcessTracker{active: make(map[*exec.Cmd]struct{})}
+}
+
+func (p *nfsWriteProbeProcessTracker) enable(on bool) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if on && len(p.active) != 0 {
+		p.accepting = false
+		return false
+	}
+	p.accepting = on
+	return true
+}
+
+func (p *nfsWriteProbeProcessTracker) run(timeout time.Duration, name string, args ...string) error {
+	err, _ := p.runTracked(timeout, name, args...)
+	return err
+}
+
+// runTracked also returns a channel closed only after cmd.Wait completes. A
+// timed-out caller can use it to defer safe sentinel cleanup until the killed
+// process no longer holds the NFS mount.
+func (p *nfsWriteProbeProcessTracker) runTracked(timeout time.Duration, name string, args ...string) (error, <-chan struct{}) {
+	cmd := exec.Command(name, args...)
+	reaped := make(chan struct{})
+	reject := func(err error) (error, <-chan struct{}) {
+		close(reaped)
+		return err, reaped
+	}
+	// Start and register under the same lock used by stopAndWait. Shutdown can
+	// therefore either observe+kill this exact child or reject it before start;
+	// there is no untracked gap between the accepting check and cmd.Start.
+	p.mu.Lock()
+	if !p.accepting {
+		p.mu.Unlock()
+		return reject(errNFSWriteProbeDisarmed)
+	}
+	// A timed-out SIGKILLed helper can remain in an uninterruptible kernel NFS
+	// open. Never stack a second dd/rm beside it; retries stay fail-closed until
+	// Wait proves the previous process is really gone.
+	if len(p.active) != 0 {
+		p.mu.Unlock()
+		return reject(errNFSWriteProbeHelperActive)
+	}
+	if err := cmd.Start(); err != nil {
+		p.mu.Unlock()
+		return reject(err)
+	}
+	p.active[cmd] = struct{}{}
+	p.mu.Unlock()
+
+	done := make(chan error, 1)
+	go func() {
+		err := cmd.Wait()
+		p.mu.Lock()
+		delete(p.active, cmd)
+		p.mu.Unlock()
+		close(reaped)
+		done <- err
+	}()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case err := <-done:
+		return err, reaped
+	case <-timer.C:
+		_ = cmd.Process.Kill()
+		// Do not remove the active entry here. Wait owns that transition, so a
+		// kernel-blocked child remains visible to shutdown's bounded drain.
+		return fmt.Errorf("%s timed out after %s: %w", name, timeout, context.DeadlineExceeded), reaped
+	}
+}
+
+func (p *nfsWriteProbeProcessTracker) activeCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.active)
+}
+
+// stopAndWait closes the start gate, kills every registered helper, and waits
+// until Wait has actually reaped each one or the shared shutdown deadline
+// expires. The force-unmount ladder proceeds on timeout; the important
+// guarantees are that no new helper can start and every survivor is SIGKILLed.
+func (p *nfsWriteProbeProcessTracker) stopAndWait(deadline time.Time) (bool, int) {
+	p.mu.Lock()
+	p.accepting = false
+	children := make([]*exec.Cmd, 0, len(p.active))
+	for cmd := range p.active {
+		children = append(children, cmd)
+	}
+	p.mu.Unlock()
+	for _, cmd := range children {
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+	}
+	for {
+		active := p.activeCount()
+		if active == 0 {
+			return true, 0
+		}
+		if !time.Now().Before(deadline) {
+			return false, active
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+}
+
+// unmountNFS joins the live controller and requires fresh absence before
+// releasing custody. Unknown or foreign mounts retain the serving stack.
 func unmountNFS(mountPoint string) bool {
-	if mountPoint == "" || !isMounted(mountPoint) {
-		return true
-	}
-	tryUnmount := func(name string, timeout time.Duration, argv ...string) bool {
-		ctx, cancel := context.WithTimeout(context.Background(), timeout)
-		defer cancel()
-		err := exec.CommandContext(ctx, argv[0], argv[1:]...).Run()
-		if err != nil {
-			jmlog.Debug("nfs unmount attempt failed",
-				"method", name, "mount_point", mountPoint, "error", err.Error())
-			return false
-		}
-		if !isMounted(mountPoint) {
-			jmlog.Info("nfs unmounted", "method", name, "mount_point", mountPoint)
-			return true
-		}
-		return false
-	}
+	return stopOwnedNFSMount(mountPoint)
+}
 
-	if tryUnmount("diskutil", 5*time.Second, "diskutil", "unmount", mountPoint) {
+// The runner seam is retained so the foreign/replaced-mount regression tests
+// can prove that no destructive command is dispatched. It must not be used
+// again without an instance-safe broker contract.
+func unmountNFSWith(mountPoint string, inspect func(string) nfsMountOwnership, _ func(time.Duration, string, ...string) error) bool {
+	if mountPoint == "" || inspect(mountPoint) == nfsMountAbsent {
 		return true
 	}
-	if tryUnmount("diskutil-force", 5*time.Second, "diskutil", "unmount", "force", mountPoint) {
-		return true
-	}
-	// [JM6] Two-tier escalation, matching the mount path. Tier 1:
-	// passwordless sudo if the user has the sudoers entry configured.
-	// Tier 2: AppleScript admin prompt (below). Skipping the prompt
-	// in dev workflows keeps automated test-cycles friction-free.
-	//
-	// Probe via a binary that's actually in the NOPASSWD list (sudoers
-	// usually scopes to specific binaries, so `sudo -n -- true` would
-	// fail even when the real umount would succeed).
-	umountProbe := exec.Command("sudo", "-n", "/sbin/umount")
-	umountProbeOut, _ := umountProbe.CombinedOutput()
-	if !strings.Contains(string(umountProbeOut), "password is required") {
-		if tryUnmount("sudo-umount-f-nfs", 15*time.Second,
-			"sudo", "-n", "/sbin/umount", "-f", "-t", "nfs", mountPoint) {
-			return true
-		}
-		if tryUnmount("sudo-umount-f", 15*time.Second,
-			"sudo", "-n", "/sbin/umount", "-f", mountPoint) {
-			return true
-		}
-		// Sudo paths failed — fall through to osascript-with-admin
-		// since maybe the sudoers rule doesn't cover unmount.
-	}
-	// Last resort: AppleScript-prompted privileged umount, escalating.
-	// `-f` forces unmount of unresponsive mounts. We try -t nfs first
-	// (scoped) and fall back to unscoped -f if the kernel still hasn't
-	// released after a beat.
-	//
-	// 2026-05-16 incident: overnight Redis flakes left the kernel NFS
-	// state wedged. At shutdown the first privileged attempt completed
-	// (osascript exit 0) but isMounted() still returned true a few ms
-	// later — the kernel lazy-releases mount table entries and we
-	// checked too eagerly. Adding a short post-umount sleep and a
-	// second attempt with broader scope recovers the case where the
-	// first call succeeded "modally" but hadn't propagated yet.
-	//
-	// We also raise the osascript timeout to 120s. The default 60s
-	// could expire before the user notices the password prompt when
-	// the app is in the middle of shutting down (dock activity is
-	// unusual, the menu bar icon may be removing itself). 120s is the
-	// macOS default for sudo-style admin prompts.
-	tryAdminUmount := func(label, command string, promptSuffix string) bool {
-		jmlog.Warn("nfs unmount falling back to admin-privileged umount",
-			"mount_point", mountPoint,
-			"method", label,
-			"command", command)
-		osaScript := fmt.Sprintf(
-			`do shell script %q with administrator privileges with prompt "JuiceMount needs to force-unmount %s%s"`,
-			command,
-			mountPoint,
-			promptSuffix,
-		)
-		osaCtx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
-		defer cancel()
-		if err := exec.CommandContext(osaCtx, "osascript", "-e", osaScript).Run(); err != nil {
-			jmlog.Debug("admin osascript failed", "method", label, "error", err.Error())
-			return false
-		}
-		// Kernel sometimes needs a beat to actually release the mount
-		// table entry after umount returns. Poll a few times before
-		// giving up.
-		for i := 0; i < 5; i++ {
-			if !isMounted(mountPoint) {
-				jmlog.Info("nfs unmounted", "method", label, "mount_point", mountPoint, "settle_polls", i)
-				return true
-			}
-			time.Sleep(200 * time.Millisecond)
-		}
-		return false
-	}
-
-	if tryAdminUmount("admin-umount-f-nfs",
-		fmt.Sprintf("umount -f -t nfs %q", mountPoint),
-		"") {
-		return true
-	}
-	// Pre-flight before the second admin attempt: maybe the first one
-	// succeeded but the kernel took longer than our 1 s settle window
-	// to release the mount-table entry. Recheck before re-prompting
-	// the user — prevents the "second password prompt" anti-UX when
-	// the unmount has actually already happened.
-	time.Sleep(500 * time.Millisecond)
-	if !isMounted(mountPoint) {
-		jmlog.Info("nfs unmounted (post-settle recheck)",
-			"method", "admin-umount-f-nfs", "mount_point", mountPoint)
-		return true
-	}
-	// Second admin attempt: drop the -t nfs filter. Some wedged states
-	// don't dispatch on the type predicate the same way and the
-	// unscoped -f variant releases them. The mount path is still
-	// specific enough that we can't unmount the wrong thing.
-	if tryAdminUmount("admin-umount-f",
-		fmt.Sprintf("umount -f %q", mountPoint),
-		" (retry without type filter)") {
-		return true
-	}
-
-	jmlog.Error("nfs unmount FAILED — mount is wedged",
-		"mount_point", mountPoint,
-		"hint", "the kernel mount table still references this mount; a reboot or `sudo umount -f -t nfs` from a fresh terminal may be required")
+	jmlog.Error("NFS detach incomplete: kernel mount ownership is unproved", "mount_point", mountPoint)
 	return false
 }
 
 func isMounted(path string) bool {
-	out, err := exec.Command("mount").Output()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	out, err := mounttable.Output(ctx)
 	if err != nil {
-		return false
+		// A fresh lookup that also times out distinguishes a likely stale
+		// mount from a normal local directory when getfsstat itself is wedged.
+		// Treat the former as mounted so the configured-path recovery flow
+		// attempts a scoped force-unmount instead of mounting on top of it.
+		stale := !nfsMountResponsive(path, 300*time.Millisecond)
+		jmlog.Warn("mount table unavailable during ownership check",
+			"path", path, "treating_as_stale_mount", stale, "error", err.Error())
+		return stale
 	}
 	return strings.Contains(string(out), " "+path+" ")
+}
+
+type nfsMountOwnership uint8
+
+const (
+	nfsMountAbsent nfsMountOwnership = iota
+	nfsMountOurs
+	nfsMountForeignOrUnknown
+)
+
+// A mount-table entry is observation, not an ownership receipt. Even a matching
+// generation can have been mounted by another process. Until broker-backed
+// adoption exists, present entries are foreign/unknown and only absence is
+// authoritative. In particular a legacy loopback root export is never ours.
+func classifyConfiguredNFSMount(path string, out []byte, lookupErr error) nfsMountOwnership {
+	if path == "" || lookupErr != nil {
+		return nfsMountForeignOrUnknown
+	}
+	needle := " on " + path
+	found := false
+	state := nfsMountAbsent
+	for _, line := range strings.Split(string(out), "\n") {
+		idx := strings.Index(line, needle)
+		if idx < 0 {
+			continue
+		}
+		tail := line[idx+len(needle):]
+		if tail != "" && !strings.HasPrefix(tail, " ") {
+			continue // A different mount point with this path as a prefix.
+		}
+		if !strings.HasPrefix(tail, " (") {
+			return nfsMountForeignOrUnknown
+		}
+		if found {
+			return nfsMountForeignOrUnknown
+		}
+		found = true
+		state = nfsMountForeignOrUnknown
+	}
+	return state
+}
+
+func inspectConfiguredNFSMount(path string) nfsMountOwnership {
+	if path == "" {
+		return nfsMountForeignOrUnknown
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	snapshot, err := observeOwnedNFS(ctx)
+	if err != nil {
+		jmlog.Warn("mount table unavailable during NFS ownership check", "path", path, "error", err.Error())
+		return nfsMountForeignOrUnknown
+	}
+	// An empty mount table cannot establish absence on a running system.
+	if len(snapshot.Entries) == 0 || !mountbroker.ObservedAbsent(snapshot, path) {
+		return nfsMountForeignOrUnknown
+	}
+	return nfsMountAbsent
+}
+
+// nfsMountResponsive proves that an existing kernel NFS mount can exchange a
+// fresh RPC with the currently-running loopback server. A stat of the mount
+// root is insufficient: macOS can satisfy it from its attribute cache after
+// the previous app process has died. Looking up a process-unique missing name
+// forces an uncached NFS LOOKUP while remaining read-only. Both ENOENT and an
+// improbable existing file are successful server responses; a timeout or I/O
+// error means the mount must not be reused.
+func nfsMountResponsive(path string, timeout time.Duration) bool {
+	return nfsMountResponsiveWith(path, timeout, os.Lstat)
+}
+
+func nfsMountResponsiveWith(path string, timeout time.Duration, lstat func(string) (os.FileInfo, error)) bool {
+	if path == "" || timeout <= 0 || lstat == nil {
+		return false
+	}
+	probe := filepath.Join(path, fmt.Sprintf(".jm-live-probe-%d-%d", os.Getpid(), time.Now().UnixNano()))
+	done := make(chan error, 1)
+	go func() {
+		_, err := lstat(probe)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		return err == nil || errors.Is(err, os.ErrNotExist)
+	case <-time.After(timeout):
+		return false
+	}
 }
 
 // mountAt parses `mount` output and returns the current owner of the given
@@ -2482,8 +4753,11 @@ func isMounted(path string) bool {
 //
 // On parse failure, found is false.
 func mountAt(path string) (source string, kind string, found bool) {
-	out, err := exec.Command("mount").Output()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	out, err := mounttable.Output(ctx)
 	if err != nil {
+		jmlog.Warn("mount table unavailable during conflict check", "path", path, "error", err.Error())
 		return "", "", false
 	}
 	// Walk every line; match on " on <path> (" so partial-prefix paths
@@ -2526,19 +4800,6 @@ func isOurFUSEMount(source, kind string) bool {
 	return strings.Contains(kind, "fuse") || strings.Contains(kind, "macfuse")
 }
 
-// isOurNFSMount reports whether the existing mount at `path` looks like an
-// NFS mount whose server is the loopback address we serve on.
-func isOurNFSMount(source, kind string) bool {
-	if !strings.HasPrefix(source, "127.0.0.1") && !strings.HasPrefix(source, "localhost") {
-		return false
-	}
-	// kind should be "nfs"; tolerate empty/unknown.
-	if kind != "" && !strings.Contains(kind, "nfs") {
-		return false
-	}
-	return true
-}
-
 // preMountConflictCheck inspects the kernel mount table for any foreign mount
 // at the FUSE path or the NFS mount point. If a foreign mount is found, returns
 // a JSON-encoded error string that includes which path, who owns it, and a
@@ -2549,16 +4810,13 @@ func preMountConflictCheck(fusePath, mountPoint string) string {
 		if src, kind, found := mountAt(fusePath); found {
 			if !isOurFUSEMount(src, kind) {
 				return formatMountConflictError(fusePath, src, kind,
-					"Unmount it manually (`diskutil unmount "+fusePath+"` or `umount "+fusePath+"`), then start JuiceMount again.")
+					"Another volume is using this path. JuiceMount detaches only the mounts it created, so eject that volume in Finder, then start JuiceMount again.")
 			}
 		}
 	}
 	if mountPoint != "" {
-		if src, kind, found := mountAt(mountPoint); found {
-			if !isOurNFSMount(src, kind) {
-				return formatMountConflictError(mountPoint, src, kind,
-					"Unmount the other volume (`diskutil unmount "+mountPoint+"`) or pick a different mount point in Preferences, then try again.")
-			}
+		if inspectConfiguredNFSMount(mountPoint) == nfsMountForeignOrUnknown {
+			return fmt.Sprintf("mount conflict at %s: existing mount ownership is unverified; recovery is incomplete", mountPoint)
 		}
 	}
 	return ""
@@ -2575,43 +4833,119 @@ func formatMountConflictError(path, source, kind, hint string) string {
 		path, source, kind, hint)
 }
 
-// fuseLooksHealthy returns true if the given path appears in the kernel
-// mount table AND a directory listing returns within a short timeout.
-// This is a cheap probe to decide whether a fresh juicefs invocation is
-// needed on Start.
+// fuseLooksHealthy checks reuse/data-plane readiness, not mount ownership.
+// A complete snapshot must match exactly. If observation fails, retain the
+// previous bounded data-plane fallback; mount creation still separately needs
+// a fresh complete snapshot and owner/generation custody.
 func fuseLooksHealthy(path string) bool {
-	out, err := exec.Command("mount").Output()
+	if runtime.GOOS != "darwin" {
+		// The bundled native helper is Darwin-only. Preserve the prior
+		// cross-platform reuse probe and its observation-error fallback.
+		if path == "" {
+			return false
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		out, err := mounttable.Output(ctx)
+		if err == nil && !strings.Contains(string(out), path) {
+			return false
+		}
+		return health.WaitForFUSEDataPlaneStable(path, 2*time.Second)
+	}
+	observe := func(ctx context.Context) (mounttable.Snapshot, error) {
+		executable, err := os.Executable()
+		if err != nil {
+			return mounttable.Snapshot{}, err
+		}
+		return mounttable.SnapshotFromHelper(ctx, filepath.Join(filepath.Dir(executable), "juicemount-mount-probe"))
+	}
+	return fuseLooksHealthyWith(path, observe, health.WaitForFUSEDataPlaneStable)
+}
+
+func fuseLooksHealthyWith(path string, observe func(context.Context) (mounttable.Snapshot, error),
+	stable func(string, time.Duration) bool) bool {
+	if path == "" {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	snapshot, err := observe(ctx)
 	if err != nil {
+		jmlog.Warn("FUSE reuse mount observation unavailable; checking data plane only", "error", err)
+		return stable(path, 2*time.Second)
+	}
+	if !fuseSnapshotMatchesPath(snapshot, path) {
 		return false
 	}
-	if !strings.Contains(string(out), path) {
+	return stable(path, 2*time.Second)
+}
+
+func fuseSnapshotMatchesPath(snapshot mounttable.Snapshot, path string) bool {
+	if snapshot.Version != 1 || snapshot.BootID == "" || path == "" {
 		return false
 	}
-	done := make(chan error, 1)
-	go func() {
-		_, err := os.ReadDir(path)
-		done <- err
-	}()
-	select {
-	case err := <-done:
-		return err == nil
-	case <-time.After(2 * time.Second):
+	folded, found := strings.ToLower(path), false
+	for _, entry := range snapshot.Entries {
+		if strings.EqualFold(entry.Path, path) {
+			if found || entry.Path != path || entry.Type != "macfuse" ||
+				!strings.HasPrefix(entry.Source, "JuiceFS:") || len(entry.Source) <= len("JuiceFS:") ||
+				entry.FSID == [2]int32{} {
+				return false
+			}
+			found = true
+		} else if strings.HasPrefix(strings.ToLower(entry.Path), folded+string(os.PathSeparator)) {
+			return false
+		}
+	}
+	return found
+}
+
+// recordExistingBootNFSMount runs while NFSServerStart holds globalMu. Even
+// when FUSE readiness defers a new mount, an old kernel NFS mount must remain
+// visible to StopMount/Shutdown so it cannot be orphaned with closed stores.
+func recordExistingBootNFSMount(mountPoint string, probe func(string) nfsMountOwnership) bool {
+	if mountPoint == "" {
 		return false
 	}
+	mounted := probe(mountPoint) == nfsMountOurs
+	if mounted {
+		globalMountPath = mountPoint
+	}
+	return mounted
+}
+
+// bootNFSMountAllowed is the startup publication gate for the user-visible
+// loopback NFS volume. An empty FUSE path preserves the explicit NFS-only
+// configuration used by focused/dev setups. A normal online desktop boot must
+// prove that JuiceFS is ready. cachedOnly is the deliberate local-first
+// exception: offline handler gates prevent any request from falling through to
+// the unverified backing directory while the cached namespace remains useful.
+func bootNFSMountAllowed(fusePath string, fuseReady, cachedOnly bool) bool {
+	return fusePath == "" || fuseReady || cachedOnly
+}
+
+// nfsListenerMayStart applies the same backing-store gate one layer earlier.
+// Keeping the listener closed for an ONLINE partial mount prevents clients from
+// entering a handler backed by a plain directory; cached-only mode is safe
+// because the handler's offline gates remain engaged until FUSE recovery.
+func nfsListenerMayStart(fusePath string, fuseReady, cachedOnly bool) bool {
+	return bootNFSMountAllowed(fusePath, fuseReady, cachedOnly)
 }
 
 // waitForFUSEResponsive polls fuseLooksHealthy until it succeeds or the
 // timeout expires. We use this right before starting the health monitor
 // so the monitor's initial synchronous check doesn't see a transient
 // in-flight mount.
-func waitForFUSEResponsive(path string, timeout time.Duration) {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if fuseLooksHealthy(path) {
-			return
-		}
-		time.Sleep(150 * time.Millisecond)
-	}
+func waitForFUSEResponsive(path string, timeout time.Duration) bool {
+	return health.WaitForFUSEDataPlaneStable(path, timeout)
+}
+
+// needsFUSEMonitorSettle keeps the late-recovery safety net without paying for
+// a duplicate remote data-plane proof on the common successful boot path.
+// bootFUSEReady is set only after FUSEManager.Mount or fuseLooksHealthy has
+// already completed the same two-consecutive readiness check.
+func needsFUSEMonitorSettle(fusePath string, bootFUSEReady bool) bool {
+	return fusePath != "" && !bootFUSEReady
 }
 
 // ----------------------------------------------------------------------------
@@ -2649,39 +4983,6 @@ func derivStorePath(metadataDBPath string) string {
 	return dir + "/derivatives.db"
 }
 
-// globalPinCtx returns a long-lived context whose lifecycle is tied to
-// the cbridge process. Workers running against this context die only on
-// process exit.
-//
-// (We don't tie this to the server start/stop cycle on purpose — pinning
-// state is a process-wide registry, and recreating workers on every Stop/
-// Start would lose in-flight prefetches.)
-var globalPinCtxOnce sync.Once
-var globalPinCtxBox struct {
-	ctx interface{ Done() <-chan struct{} }
-} // lazy init
-
-// globalPinCtx returns the context. Use a closure to avoid pulling in
-// context globally where it isn't needed.
-// globalPinCtx returns the process-lifetime context that backs
-// long-running pin/prefetcher daemons. Returning context.Context
-// directly (rather than the historical structural-interface alias)
-// lets callers pass the result through to context.WithTimeout /
-// context.WithCancel without a type assertion. The concrete bgCtx{}
-// implements every Context method so the interface conversion is
-// trivial.
-func globalPinCtx() context.Context {
-	// Background context lives for the whole process. Good enough for v1.
-	return bgCtx{}
-}
-
-type bgCtx struct{}
-
-func (bgCtx) Done() <-chan struct{}       { return nil }
-func (bgCtx) Err() error                  { return nil }
-func (bgCtx) Value(key any) any           { return nil }
-func (bgCtx) Deadline() (time.Time, bool) { return time.Time{}, false }
-
 // PinResult is the JSON returned to Swift after a Pin call.
 type PinResult struct {
 	OK          bool   `json:"ok"`
@@ -2714,6 +5015,9 @@ type PinResult struct {
 //
 //export NFSServerPin
 func NFSServerPin(rootPath *C.char) *C.char {
+	if serviceClientBuild {
+		return forwardServiceText("pin", []string{C.GoString(rootPath)}, nil)
+	}
 	globalMu.Lock()
 	pinStore := globalPinStore
 	mountPath := globalMountPath
@@ -2722,36 +5026,63 @@ func NFSServerPin(rootPath *C.char) *C.char {
 	rc := globalRC
 	globalMu.Unlock()
 
+	return jsonStr(pinRootResult(C.GoString(rootPath), pinStore, prefetcher, rc, mountPath, fusePath))
+}
+
+func pinRootResult(root string, pinStore *pin.Store, prefetcher *pin.Prefetcher,
+	rc *metadata.RedisClient, mountPath, fusePath string) PinResult {
 	if pinStore == nil {
-		return jsonStr(PinResult{Error: "pin store not initialized"})
+		return PinResult{Error: "pin store not initialized"}
 	}
-	root := C.GoString(rootPath)
 	walkPath := translateMountToFUSE(root, mountPath, fusePath)
 
-	// Item 0 GUARD: a pin root inside a scan-filtered internal namespace
-	// (.trash/.juicemount) can never be metadata-warmed — reconcileDir #78-
-	// filters it — so pinning it is nonsensical. Reject with a clear error
-	// rather than warming blocks for a dir that will never list offline.
+	// Internal namespaces cannot be mirrored offline.
 	if rel := metaRelPath(root, mountPath); metadata.ScanFilteredPath(rel) {
 		jmlog.Warn("pin rejected: cannot pin internal namespace", "root", root, "rel", rel)
-		return jsonStr(PinResult{Error: "cannot pin internal namespace (.trash/.juicemount)"})
+		return PinResult{Error: "cannot pin internal namespace (.trash/.juicemount)"}
 	}
+	if prefetcher == nil {
+		return PinResult{Error: "prefetcher not running"}
+	}
+	if !schedulePinWalk(prefetcher, pinStore, rc, root, walkPath, mountPath, fusePath) {
+		return PinResult{Error: "prefetcher stopping"}
+	}
+	return PinResult{OK: true, Scanning: true}
+}
 
-	// Surface the spinner before the (slow) walk starts; return immediately.
-	pin.MarkScanning(root)
-	go func() {
-		// Detached: a panic here must never take down the process, and the
-		// scanning marker must always be cleared even on an early error.
+// schedulePinWalk admits the complete scan, SQL insert and metadata warm under
+// the captured prefetcher's stop join. The marker is cleared on every exit.
+func schedulePinWalk(pf *pin.Prefetcher, ps *pin.Store, rc *metadata.RedisClient, root, walkPath, mountPath, fusePath string) bool {
+	return schedulePinWalkWith(pf, root, walkPath, mountPath, fusePath, pin.CountFilesUnder, ps.PinMany,
+		func(ctx context.Context) { warmPinnedMetadata(ctx, rc, root, mountPath) })
+}
+
+// The injected operations let lifecycle tests hold the real scheduling path at
+// the walk, SQL insert and final metadata stages without timing assumptions.
+func schedulePinWalkWith(pf *pin.Prefetcher, root, walkPath, mountPath, fusePath string,
+	countFiles func(string) ([]pin.Entry, error), pinMany func([]pin.Entry) error, warm func(context.Context)) bool {
+	if pf == nil {
+		return false
+	}
+	ctx := pf.Context()
+	ready := make(chan struct{})
+	if !pf.TryGo(func() {
+		<-ready // Admission is complete before the marker becomes visible.
 		defer func() {
 			if rec := recover(); rec != nil {
 				jmlog.Warn("pin walk panicked (recovered)", "root", root, "panic", fmt.Sprint(rec))
 			}
 			pin.ClearScanning(root)
 		}()
-
-		entries, err := pin.CountFilesUnder(walkPath)
+		if ctx.Err() != nil {
+			return
+		}
+		entries, err := countFiles(walkPath)
 		if err != nil {
 			jmlog.Warn("pin walk failed", "root", root, "error", err.Error())
+			return
+		}
+		if ctx.Err() != nil {
 			return
 		}
 		var totalBytes int64
@@ -2760,37 +5091,36 @@ func NFSServerPin(rootPath *C.char) *C.char {
 			entries[i].PinRoot = root
 			totalBytes += entries[i].Size
 		}
-		// Brief "found N files" beat before the rows exist, so a long insert
-		// still reads as progress rather than a stall.
 		pin.UpdateScanProgress(root, len(entries), totalBytes)
-		if err := pinStore.PinMany(entries); err != nil {
+		if ctx.Err() != nil {
+			return
+		}
+		// PinMany may be inside a noncancelable SQLite transaction when stop
+		// arrives. Its returned effect remains joined before resource closure.
+		if err := pinMany(entries); err != nil {
 			jmlog.Warn("pin insert failed", "root", root, "files", len(entries), "error", err.Error())
 			return
 		}
 		jmlog.Info("pinned folder", "root", root, "files", len(entries), "gb", totalBytes>>30)
-		// Drain now rather than on the prefetcher's next 2s tick.
-		if prefetcher != nil {
-			prefetcher.Wake()
+		pf.Wake()
+		if ctx.Err() == nil {
+			warm(ctx)
 		}
-
-		// Item 0: warm the pinned SUBTREE's metadata into the mirror so the dir
-		// (and its whole tree) LIST OFFLINE. PinMany above cached the file
-		// BLOCKS but wrote no subtree rows; without this, an offline ListChildren
-		// of the pinned dir returns empty. Reuses reconcileDir (durable SQLite
-		// `entries` write). Gated on !pin.IsOffline() and JM_PIN_WARM_METADATA
-		// inside the metadata calls. Best-effort; a failure leaves today's
-		// behavior (blocks cached, metadata warmed by the next full SCAN).
-		warmPinnedMetadata(rc, root, mountPath)
-	}()
-
-	// FilesPinned/BytesTotal are filled in via /cache-status as the walk lands.
-	return jsonStr(PinResult{OK: true, Scanning: true})
+	}) {
+		return false
+	}
+	pin.MarkScanning(root)
+	close(ready)
+	return true
 }
 
 // NFSServerUnpin removes a pin root and all its files from the registry.
 //
 //export NFSServerUnpin
 func NFSServerUnpin(rootPath *C.char) *C.char {
+	if serviceClientBuild {
+		return forwardServiceText("unpin", []string{C.GoString(rootPath)}, nil)
+	}
 	globalMu.Lock()
 	pinStore := globalPinStore
 	globalMu.Unlock()
@@ -2832,6 +5162,17 @@ type CacheStatus struct {
 
 //export NFSServerCacheStatus
 func NFSServerCacheStatus() *C.char {
+	if serviceClientBuild {
+		return forwardServiceText("cache-status", nil, nil)
+	}
+	return jsonStr(engineCacheStatus())
+}
+
+// engineCacheStatus is the serving engine's cache snapshot. Only the serving
+// process (built without the serviceclient tag) produces it; the desktop
+// archive forwards to that process instead. It is separate from the C export
+// so the contract test can check the engine document in both builds.
+func engineCacheStatus() CacheStatus {
 	// Snapshot-then-release (see NFSServerStats comment for rationale).
 	// CacheStatus is called every 2 s by the popover; cannot park behind
 	// other long-held globalMu callers.
@@ -2841,7 +5182,7 @@ func NFSServerCacheStatus() *C.char {
 	globalMu.Unlock()
 
 	if pinStore == nil {
-		return jsonStr(CacheStatus{OfflineMode: pin.IsOffline(), Roots: []pin.RootSummary{}, Scanning: []pin.ScanningRoot{}})
+		return CacheStatus{OfflineMode: pin.IsOffline(), Roots: []pin.RootSummary{}, Scanning: []pin.ScanningRoot{}}
 	}
 	cs := CacheStatus{OfflineMode: pin.IsOffline(), Capacity: pin.Capacity(), Scanning: pin.ScanningRoots()}
 	// cache_used_bytes = the TRUE on-disk JuiceFS block-cache size. PREFER the
@@ -2881,18 +5222,32 @@ func NFSServerCacheStatus() *C.char {
 	if cs.Roots == nil {
 		cs.Roots = []pin.RootSummary{}
 	}
-	return jsonStr(cs)
+	return cs
 }
 
 //export NFSServerSetOffline
 func NFSServerSetOffline(on C.int) *C.char {
+	if serviceClientBuild {
+		return forwardServiceText("set-offline", nil, []int{int(on)})
+	}
 	pin.SetOffline(on != 0)
+	globalMu.Lock()
+	selected := globalOwner
+	globalMu.Unlock()
+	if selected != nil {
+		if err := selected.syncOffline(); err != nil {
+			return C.CString("error: selected owner offline state unknown: " + err.Error())
+		}
+	}
 	jmlog.Info("offline mode toggled", "on", pin.IsOffline())
 	return jsonStr(map[string]any{"ok": true, "offline_mode": pin.IsOffline()})
 }
 
 //export NFSServerIsOffline
 func NFSServerIsOffline() C.int {
+	if serviceClientBuild {
+		return forwardServiceInt("is-offline", nil, nil)
+	}
 	if pin.IsOffline() {
 		return 1
 	}
@@ -2908,6 +5263,10 @@ func NFSServerIsOffline() C.int {
 //
 //export NFSServerLog
 func NFSServerLog(msg *C.char) {
+	if serviceClientBuild {
+		_ = forwardServiceCall("log", []string{C.GoString(msg)}, nil)
+		return
+	}
 	jmlog.Info("[swift] " + C.GoString(msg))
 }
 
@@ -2959,7 +5318,264 @@ func jsonStr(v any) *C.char {
 // HTTP handlers for the CLI (registered on the metrics server's mux)
 // ----------------------------------------------------------------------------
 
+// controlPlaneRoutes is the production route inventory, shared by startup and
+// isolated HTTP acceptance without starting storage or mounting a volume.
+func controlPlaneRoutes() map[string]http.HandlerFunc {
+	return map[string]http.HandlerFunc{
+		"/pin":          handlePinHTTP,
+		"/unpin":        handleUnpinHTTP,
+		"/cache-status": handleCacheStatusHTTP,
+		"/offline":      handleOfflineHTTP,
+		"/sync":         handleSyncHTTP,
+		// Contract endpoints (juicemount-contract v1). /whoami: identity +
+		// version + capabilities handshake (JM-1). /residency: honest
+		// per-path cache residency for OpenLoupe's green badge (JM-2).
+		// /lookup: stable (inode, nas_rel_path) identity (JM-4).
+		"/whoami":    handleWhoamiHTTP,
+		"/residency": handleResidencyHTTP,
+		"/lookup":    handleLookupHTTP,
+		// JM-14 Tier-B shared-derivative reads. /derivatives?inode=N: the
+		// per-asset derivative manifest (what machine-derived artifacts
+		// exist + their integrity hash). /metadata?inode=N&kind=tech:
+		// structured ffprobe tech/EXIF. Keyed by durable inode (from
+		// /lookup); read-only + fail-closed.
+		"/derivatives":         countingManifestHandler(handleDerivativesHTTP),
+		"/derivatives/changes": handleDerivativesChangesHTTP,
+		// JM-22 bulk manifest query: POST /derivatives/batch answers
+		// "which of these inodes do you have?" for up to 1000 inodes in one
+		// round trip. NO on-miss reconcile (unlike /derivatives) — that is
+		// what makes it cheap.
+		"/derivatives/batch": handleDerivativesBatchHTTP,
+		"/metadata":          handleMetadataHTTP,
+		// PROXY-CODEC (#50) byte-range blob delivery. GET /blob?inode=N&kind=proxy
+		// streams a derivative blob (proxy.mp4 etc.) with Accept-Ranges: bytes,
+		// answers Range with 206 + Content-Range/Content-Length, serves the
+		// Content-Type from the manifest media_type, and 200 + Content-Length
+		// unranged — what a browser <video> / remote AVPlayer need to seek over
+		// HTTP. Capability token `blob` (route path == token).
+		"/blob":        countingBlobHandler(handleBlobHTTP),
+		"/deriv-reads": handleDerivReadsHTTP,
+		// #1 hydration pack observability: local thumb-cache stats
+		// (bytes/files/hits/misses/puts/evictions). Read-only.
+		"/thumbs": handleThumbsHTTP,
+		// Wave-3 QuickLook appex fetch: GET /thumb-local?path=<abs>&size=N
+		// serves the farm poster from the LOCAL cache (hit <5ms), does a
+		// bounded read-through populate on miss, or 404s fast so the appex
+		// errors and macOS falls back to its own generator.
+		"/thumb-local": handleThumbLocalHTTP,
+		// QLPROXY (T1.1/F4/F5): GET /ql-preview?path=<abs> serves a clip's
+		// kind="qlpreview" sidecar asset (short faststart H.264 MP4) from
+		// the local cache / bounded FUSE read-through — the bytes a Quick
+		// Look preview extension plays for camera-native RAW so spacebar
+		// never touches the source. GET /prewarm reads status; POST
+		// /prewarm?run=1[&path=<dir>] triggers a hot-project pass.
+		"/ql-preview": handleQLPreviewHTTP,
+		"/prewarm":    handlePrewarmHTTP,
+		// Release UX: the popover's warm-up card — one consolidated phase
+		// machine (starting/indexing/warming/steady) with a progress pct.
+		"/warmup": handleWarmupHTTP,
+		// JM-ASSERT (#51) portable-human-metadata channel. POST /assertions writes
+		// the <media>.loupe.json sidecar (source of truth — atomic, LWW,
+		// merge-not-clobber) + upserts the asset_key-keyed Tier-B index; GET
+		// reads the resolved set by asset_key (or inode/path → asset_key).
+		// Capability token `assertions` (route path == token).
+		"/assertions": handleAssertionsHTTP,
+		// OL-1 on-device AI contribute-back (write). POST: a consumer that
+		// wrote ai.loupe.json through the mount registers it so the server
+		// indexes it for every client + the web UI. Capability token =
+		// `contribute` (route-aliased in cplane.DeriveCapabilities).
+		"/derivatives/register": handleDerivativesRegisterHTTP,
+		"/reclaim":              handleReclaimHTTP,
+		// Clears the on-disk JuiceFS chunk cache. POST-only.
+		// Optional ?keep-pinned=true reissues a verify-pins after
+		// the clear so pinned content immediately starts re-caching.
+		// Returns bytes_freed + files_removed. Destructive but safe
+		// — chunks are immutable, in-flight reads via open fds keep
+		// working, next access just misses and refetches.
+		"/cache-clear": handleCacheClearHTTP,
+		"/verify-pins": handleVerifyPinsHTTP,
+		// Legacy rescue route, kept only so old clients get an honest
+		// refusal (409). JuiceMount never detaches a mount by path; a
+		// stuck volume waits for the privileged unmount helper (H-3).
+		"/force-eject": handleForceEjectHTTP,
+		// H-3 busy-Quit force-eject through the privileged unmount helper
+		// (identity-bound by fsid + receipt, never by path). GET reports
+		// availability; POST needs X-JM-Control. See eject_now.go.
+		"/eject-now": handleEjectNowHTTP,
+		// Soft stop: tears down NFS server + metadata + caches without
+		// unmounting (Stop/Start cycle stays fast, no admin password
+		// re-prompt). Use Stop Mount for a full teardown.
+		// Returns immediately; teardown runs async so the response
+		// flushes before the metrics server closes its own socket.
+		"/stop": handleStopHTTP,
+		// A2 — post-mount self-test. GET returns cached result; POST reruns.
+		"/self-test": handleSelfTestHTTP,
+		// Spool status (Option 2 / slice E). Returns pending-files
+		// count, pending bytes, in-flight drains, capacity used,
+		// and per-entry details. 503 when the spool is disabled
+		// (JM_SPOOL_ENABLE != 1) or hasn't been wired yet.
+		"/spool": handleSpoolHTTP,
+		// Tier-1 #3: cross-Mac who-has-this-open. GET /presence → this
+		// Mac's open write-handles; GET /presence?all=1 → every host.
+		"/presence": handlePresenceHTTP,
+		// Background-operation activity surface (roadmap 4.10): plain-language
+		// view of reconcile / drain / prefetch so the UI can explain why
+		// Finder is momentarily slow ("Uploading 412 files", "Rebuilding
+		// index…", "Warming pinned project"). GET, loopback.
+		"/activity": handleActivityHTTP,
+		// "Why is it slow?" self-diagnosis (INSTANT-NAV #14): runs the six
+		// known silent-failure probes (Local Network permission, tunnel
+		// route, FUSE identity, backend components, spool backlog, link
+		// RTT) concurrently and time-bounded, on demand only. GET, loopback.
+		// Not in the contract capability vocabulary — operational/UI route,
+		// excluded from /whoami automatically like reclaim/mount-now.
+		"/diagnose": handleDiagnoseHTTP,
+		// Instant recursive folder size (INSTANT-NAV #2): GET /du?path=…
+		// answers "total bytes + file count under this folder" in O(1)
+		// from the mirror's incrementally-maintained subtree aggregates
+		// (JM_SUBTREE_SIZES, default on) — the app/OpenLoupe surface that
+		// replaces du-walking. GET, loopback. Operational/UI route,
+		// excluded from /whoami automatically like reclaim/mount-now.
+		"/du": handleDuHTTP,
+		// Spool recovery actions (LB-5): ?action=retry-failed
+		// requeues failed rows whose spool file survives;
+		// ?action=clear-stalled force-finalizes leaked-handle
+		// writing entries (bytes preserved). Actions require POST and
+		// X-JM-Control; clear-failed preview is a safe GET.
+		"/spool-recover": handleSpoolRecoverHTTP,
+		// H-8B project leases (menu bar): GET /project-leases lists projects
+		// this Mac edits and projects another Mac holds (changes waiting);
+		// POST /project-leases/release?project=A/B ("Done editing") needs
+		// X-JM-Control (checked here, before the client is consulted). 503 when
+		// the spool or the lease client is off.
+		"/project-leases":         handleProjectLeasesHTTP,
+		"/project-leases/release": handleProjectLeasesHTTP,
+		// LB-2 "Mount Now": re-runs the user-visible NFS mount for
+		// the configured mount point. No-op success when already
+		// mounted. POST with X-JM-Control; may block on the macOS
+		// admin prompt.
+		"/mount-now": handleMountNowHTTP,
+		// Phase B observability: net/http/pprof routes for live
+		// goroutine/heap/cpu/trace dumps. pprof.Index serves
+		// /debug/pprof/goroutine, /debug/pprof/heap, etc. via the
+		// trailing-slash handler plus ?debug=1 query.
+		// /debug/pprof/mutex and /debug/pprof/block are served by
+		// pprof.Index's trailing-slash handler, but they are USELESS
+		// until the runtime is told to sample: both profilers default
+		// to off, so those two endpoints returned "sampling period=0"
+		// and an empty profile for every one of them.
+		//
+		// That is the one instrument this codebase most needed and never
+		// had. A CPU profile CANNOT see blocking by construction — it
+		// samples running goroutines — so the 2026-08-19 finding that
+		// "our RPC handling is only 12.73% of the profile" said nothing
+		// about a read path whose ceiling (~1,650 MB/s, flat from 16 to
+		// 88 in-flight RPCs) sits ~10x below the FUSE layer beneath it
+		// (17,108 MB/s at 4 readers) and below the loopback transport
+		// above it (6,949 MB/s). Contention is exactly what a mutex or
+		// block profile shows and a CPU profile hides.
+		//
+		// Both stay OFF by default: they add cost to every lock and every
+		// blocking operation, which is not something to carry in a
+		// shipped mount daemon. Set the env var to sample.
+		"/debug/pprof/":        pprof.Index,
+		"/debug/pprof/cmdline": pprof.Cmdline,
+		"/debug/pprof/profile": pprof.Profile,
+		"/debug/pprof/symbol":  pprof.Symbol,
+		"/debug/pprof/trace":   pprof.Trace,
+	}
+}
+
+// A non-formable header keeps browser forms and headerless loopback requests
+// from invoking local operator controls. It is an intent marker, not a secret.
+const localControlHeader = "X-JM-Control"
+
+// projectLeaseCredentials supplies the metadata password for the lease
+// client's own Redis connection. Until the H-8B L3 credential store merges,
+// the default returns "" and the client uses the credentials in the mount's
+// Redis URL. The secret is never logged.
+type projectLeaseCredentials interface {
+	MetaPassword() (string, error)
+}
+
+type urlOnlyLeaseCredentials struct{}
+
+func (urlOnlyLeaseCredentials) MetaPassword() (string, error) { return "", nil }
+
+var bridgeLeaseCredentials projectLeaseCredentials = urlOnlyLeaseCredentials{}
+
+// startBridgeProjectLeases builds and starts the project-lease client on the
+// same metadata endpoint and credentials as the mount. Against a Redis with
+// no lease proxy it reports "unsupported" and drains run exactly as before,
+// which is why there is no kill switch: an env knob would not reach the
+// launchd-started serving process anyway. Returns nil when unbuildable.
+func startBridgeProjectLeases(redisURL string, spool *jmnfs.SpoolStore) *jmnfs.ProjectLeaseClient {
+	if strings.TrimSpace(redisURL) == "" || spool == nil {
+		return nil
+	}
+	password, err := bridgeLeaseCredentials.MetaPassword()
+	if err != nil {
+		jmlog.Warn("project leases disabled: credential lookup failed", "error", err.Error())
+		return nil
+	}
+	c, err := jmnfs.NewProjectLeaseClient(jmnfs.ProjectLeaseConfig{RedisURL: redisURL, Password: password, Spool: spool})
+	if err != nil {
+		// redisurl errors never contain the URL or its credentials.
+		jmlog.Warn("project leases disabled: client not built", "error", err.Error())
+		return nil
+	}
+	c.Start()
+	return c
+}
+
+// handleProjectLeasesHTTP serves /project-leases and /project-leases/release
+// from the live lease client.
+func handleProjectLeasesHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/project-leases/release" && !requireLocalControlMutation(w, r) {
+		return
+	}
+	leases := globalProjectLeases.Load()
+	if leases == nil {
+		http.Error(w, "project leases unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	leases.HTTPHandler().ServeHTTP(w, r)
+}
+
+func requireLocalControlMutation(w http.ResponseWriter, r *http.Request) bool {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", "POST")
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return false
+	}
+	if r.Header.Get(localControlHeader) != "1" {
+		http.Error(w, "missing local control header", http.StatusForbidden)
+		return false
+	}
+	return true
+}
+
+func handleSyncHTTP(w http.ResponseWriter, r *http.Request) {
+	if !requireLocalControlMutation(w, r) {
+		return
+	}
+	globalMu.Lock()
+	rc := globalRC
+	globalMu.Unlock()
+	if rc == nil {
+		http.Error(w, "metadata sync unavailable: server not running", http.StatusServiceUnavailable)
+		return
+	}
+	rc.TriggerSync()
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusAccepted)
+	_, _ = w.Write([]byte(`{"ok":true}`))
+}
+
 func handlePinHTTP(w http.ResponseWriter, r *http.Request) {
+	if !requireLocalControlMutation(w, r) {
+		return
+	}
 	path := r.URL.Query().Get("path")
 	if path == "" {
 		http.Error(w, "missing ?path", 400)
@@ -2972,6 +5588,9 @@ func handlePinHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleUnpinHTTP(w http.ResponseWriter, r *http.Request) {
+	if !requireLocalControlMutation(w, r) {
+		return
+	}
 	path := r.URL.Query().Get("path")
 	if path == "" {
 		http.Error(w, "missing ?path", 400)
@@ -3009,8 +5628,8 @@ func metaRelPath(path, mountPoint string) string {
 // before the metadata layer wired, or a CLI build) simply skips warming. A
 // failure never breaks pinning — the blocks are already cached and the next
 // full SCAN eventually mirrors the subtree.
-func warmPinnedMetadata(rc *metadata.RedisClient, root, mountPath string) {
-	if rc == nil {
+func warmPinnedMetadata(ctx context.Context, rc *metadata.RedisClient, root, mountPath string) {
+	if rc == nil || ctx.Err() != nil {
 		return
 	}
 	if !metadata.PinWarmMetadataEnabled() {
@@ -3029,35 +5648,56 @@ func warmPinnedMetadata(rc *metadata.RedisClient, root, mountPath string) {
 
 	// Warm the ancestor chain first so the pinned dir is reachable from root,
 	// then warm the subtree. ReconcileAncestors also reconciles root inode 1.
+	if ctx.Err() != nil {
+		return
+	}
 	if err := rc.ReconcileAncestors(rel); err != nil {
 		jmlog.Warn("pin warm: ReconcileAncestors failed", "root", root, "rel", rel, "error", err.Error())
 	}
 
+	if ctx.Err() != nil {
+		return
+	}
 	ent := rc.Store().LookupByPath(rel)
 	if ent == nil {
 		jmlog.Warn("pin warm: pinned path not yet in mirror after ancestor warm — subtree left to SCAN",
 			"root", root, "rel", rel)
 		return
 	}
-	if ent.IsDir {
+	if ent.IsDir && ctx.Err() == nil {
 		if err := rc.ReconcileSubtree(ent.Inode, 0); err != nil {
 			jmlog.Warn("pin warm: ReconcileSubtree failed", "root", root, "inode", ent.Inode, "error", err.Error())
 		}
 	}
 }
 
-// warmPinnedRootsAtBoot re-warms the metadata mirror for every pin root that
+// scheduleBootPinWarm captures the startup generation and joins even a
+// noncancelable metadata reconcile already in progress when Stop begins.
+func scheduleBootPinWarm(pf *pin.Prefetcher, ps *pin.Store, rc *metadata.RedisClient, mountPath string) bool {
+	return scheduleBootPinWarmWith(pf, ps, rc, mountPath, warmPinnedMetadata)
+}
+
+func scheduleBootPinWarmWith(pf *pin.Prefetcher, ps *pin.Store, rc *metadata.RedisClient, mountPath string,
+	warm func(context.Context, *metadata.RedisClient, string, string)) bool {
+	if pf == nil {
+		return false
+	}
+	return pf.TryGo(func() { warmPinnedRootsAtBootWith(pf.Context(), ps, rc, mountPath, warm) })
+}
+
+// warmPinnedRootsAtBootWith re-warms the metadata mirror for every pin root that
 // survived from a prior session (Item 0). Runs on a background goroutine at
 // boot. Self-gates: no-op when warming is disabled or offline; a nil
 // RedisClient (e.g. metadata layer not wired yet) skips silently. Each root is
 // warmed via the same warmPinnedMetadata path used at pin time.
-func warmPinnedRootsAtBoot(ps *pin.Store, rc *metadata.RedisClient, mountPath string) {
+func warmPinnedRootsAtBootWith(ctx context.Context, ps *pin.Store, rc *metadata.RedisClient, mountPath string,
+	warm func(context.Context, *metadata.RedisClient, string, string)) {
 	defer func() {
 		if r := recover(); r != nil {
 			jmlog.Warn("pin warm (boot) panicked (recovered)", "panic", fmt.Sprint(r))
 		}
 	}()
-	if ps == nil || rc == nil {
+	if ps == nil || rc == nil || ctx.Err() != nil {
 		return
 	}
 	if !metadata.PinWarmMetadataEnabled() {
@@ -3065,6 +5705,9 @@ func warmPinnedRootsAtBoot(ps *pin.Store, rc *metadata.RedisClient, mountPath st
 	}
 	if pin.IsOffline() {
 		jmlog.Info("pin warm (boot): skipped (offline) — resumes when online")
+		return
+	}
+	if ctx.Err() != nil {
 		return
 	}
 	roots, err := ps.PinRoots()
@@ -3077,6 +5720,9 @@ func warmPinnedRootsAtBoot(ps *pin.Store, rc *metadata.RedisClient, mountPath st
 	}
 	jmlog.Info("pin warm (boot): warming pinned roots from prior session", "roots", len(roots))
 	for _, r := range roots {
+		if ctx.Err() != nil {
+			return
+		}
 		if r.Root == "" {
 			continue
 		}
@@ -3087,7 +5733,7 @@ func warmPinnedRootsAtBoot(ps *pin.Store, rc *metadata.RedisClient, mountPath st
 			jmlog.Info("pin warm (boot): offline mid-pass — stopping", "remaining_hint", r.Root)
 			return
 		}
-		warmPinnedMetadata(rc, r.Root, mountPath)
+		warm(ctx, rc, r.Root, mountPath)
 	}
 	jmlog.Info("pin warm (boot): pinned-root warm pass complete", "roots", len(roots))
 }
@@ -3111,12 +5757,14 @@ func handleWhoamiHTTP(w http.ResponseWriter, r *http.Request) {
 		Version:         version.Version,
 		ContractVersion: cplane.ContractVersion,
 		InstanceID:      globalInstanceID,
+		DeviceDigest:    cplane.DeviceDigest(), // shared with jm5
 		VolumeName:      globalVolumeName,
 		MountPoint:      mp,
 		NASRoot:         mp,
 		ControlPlane:    "http://" + addr,
 		MetadataDBPath:  globalDBPath,
 		Deployment:      "gui",
+		WireTerms:       cplane.WireTerms,
 		Capabilities:    append([]string(nil), globalCapabilities...),
 	}
 	globalMu.Unlock()
@@ -3135,18 +5783,17 @@ type residencyResponse struct {
 	BytesCached int64   `json:"bytes_cached"`
 	Total       int64   `json:"total"`
 	Streaming   bool    `json:"streaming"`
-	UploadState *string `json:"upload_state"` // null when no active spool row
+	UploadState *string `json:"upload_state"` // null when no undrained spool row
 	CheckedAt   int64   `json:"checked_at"`
 }
 
 // handleResidencyHTTP serves GET /residency?path=<abs> (contract JM-2): the
 // honest per-path residency that OpenLoupe's green "resident" badge depends on.
 //
-// The hard rule: per-byte cache accounting exists ONLY for files with a
-// pinned_files row. resident=true is emitted only when that row shows
-// bytes_cached >= size; any path with no pin row reports resident=false,
-// streaming=true, bytes_cached=0 — the honest under-claim. Never invent cached
-// bytes for an unpinned file.
+// Per-byte reporting exists only for pinned files. A complete durable counter
+// becomes resident=true only with current exact-generation local admission and
+// matching metadata size. Unpinned, unadmitted and failed rows under-claim
+// availability; active prefetch progress remains visible without Ready.
 func handleResidencyHTTP(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Query().Get("path")
 	if path == "" {
@@ -3170,7 +5817,12 @@ func handleResidencyHTTP(w http.ResponseWriter, r *http.Request) {
 	resp := residencyResponse{Path: path, CheckedAt: time.Now().Unix()}
 
 	var entry *metadata.Entry
+	var initialIdentity metadata.CachedFileIdentity
+	var identityAvailable bool
 	if store != nil {
+		// Capture publication identity before the response entry. A same-size
+		// replacement during admission must not inherit the older response.
+		initialIdentity, identityAvailable = store.LookupCachedFileIdentity(rel)
 		entry = store.LookupByPath(rel)
 	}
 	if entry == nil {
@@ -3186,19 +5838,33 @@ func handleResidencyHTTP(w http.ResponseWriter, r *http.Request) {
 	if pinStore != nil {
 		if pe, ok := pinStore.Get(path); ok {
 			resp.Pinned = true
-			resp.BytesCached = pe.BytesCached
-			if pe.BytesCached >= entry.Size && entry.Size > 0 {
-				resp.Resident = true
+			// Durable Ready and its byte counter are not current availability.
+			// The admission validator is RAM-only; Get has already released SQL.
+			if pe.Status == pin.StatusReady && pe.Size == entry.Size && entry.Size > 0 &&
+				pe.BytesCached >= entry.Size {
+				if admitted, current := pinStore.ReadyAdmission(path); current &&
+					admitted.Generation == pe.Generation && admitted.Size == pe.Size &&
+					bytes.Equal(admitted.Authority, pe.Authority) && identityAvailable &&
+					initialIdentity.Path == entry.Path && initialIdentity.Inode == entry.Inode &&
+					initialIdentity.Size == entry.Size && initialIdentity.MtimeNS == entry.Mtime.UnixNano() &&
+					initialIdentity.Version == entry.Version {
+					if now, ok := store.LookupCachedFileIdentity(rel); ok && now == initialIdentity {
+						resp.BytesCached = pe.BytesCached
+						resp.Resident = true
+					}
+				}
+			} else if pe.Status == pin.StatusPrefetching && pe.Size == entry.Size {
+				// Retain visible progress while a producer is actively filling it.
+				resp.BytesCached = pe.BytesCached
 			}
 		}
 	}
 	resp.Streaming = resp.Exists && !resp.Resident
 
-	// upload_state mirrors an ACTIVE spool row's drain_state, else null. The
-	// spool store only retains writing/ready/draining rows, so a fully-drained
-	// file reports null (not "done").
+	// A failed row may still hold the only copy of the file. Report it until
+	// resolved; a fully drained file has no undrained row and reports null.
 	if spool != nil {
-		if row, err := spool.Meta().LookupByPath(rel); err == nil && row != nil {
+		if row, err := spool.Meta().LookupUndrainedByPath(rel); err == nil && row != nil {
 			s := string(row.DrainState)
 			resp.UploadState = &s
 		}
@@ -3391,8 +6057,27 @@ func handleDerivativesHTTP(w http.ResponseWriter, r *http.Request) {
 		// inode's sidecar on the fly so navigating to a farm-derived asset surfaces
 		// it without a manual `jmfarm -reconcile`. Best-effort + bounded (one inode,
 		// only on a miss; ingested rows are cached, so the next query hits the DB).
+		//
+		// READ VIA FUSE, NOT VIA THE NFS MOUNT. The sidecars live under
+		// .juicemount/derivatives, an INTERNAL namespace that is scan-filtered
+		// out of the metadata mirror — and the NFS server serves from that
+		// mirror. So over /Volumes/zpool the directory is empty while the same
+		// path under the FUSE mount has every manifest. Measured 2026-08-17
+		// after backfilling 26,447 sidecars: 0 derivative dirs visible via NFS,
+		// 37,255 via FUSE.
+		//
+		// This handler was the ONLY one of the three ReconcileOneSidecar call
+		// sites reading globalMountPath; bridge/thumbs.go and the manifest
+		// handler below already prefer globalFUSEPath. The failure was silent
+		// in the worst way: a sidecar that cannot be seen returns
+		// (found=false, err=nil), so there was no error to log and no warning
+		// to find — /derivatives simply answered exists:false forever and the
+		// consumer concluded the farm had produced nothing.
 		globalMu.Lock()
-		mount := globalMountPath
+		mount := globalFUSEPath
+		if mount == "" {
+			mount = globalMountPath
+		}
 		globalMu.Unlock()
 		if mount != "" {
 			if found, ferr := farm.ReconcileOneSidecar(ds, mount, inode); ferr != nil {
@@ -3422,6 +6107,109 @@ func handleDerivativesHTTP(w http.ResponseWriter, r *http.Request) {
 		resp.Derivatives = rows
 	}
 	writeContractJSON(w, resp)
+}
+
+// derivativesBatchMaxInodes caps one POST /derivatives/batch request. The
+// consumer reconciles tens of thousands of assets; 1000 keeps a single request
+// bounded (one indexed point query per inode against a local SQLite DB, no
+// filesystem work at all) while cutting the round trips by three orders of
+// magnitude.
+const derivativesBatchMaxInodes = 1000
+
+// derivativesBatchRequest is the POST /derivatives/batch body (contract JM-22).
+type derivativesBatchRequest struct {
+	Inodes []uint64 `json:"inodes"`
+}
+
+// derivativesBatchEntry is one value in the batch response map, keyed by the
+// decimal inode. ready_kinds is ALWAYS a non-nil slice (serializes as [] not
+// null) so a consumer can range over it without a nil check; source_hash is
+// null for an unknown asset and for a known one whose hash the farm has not
+// computed yet.
+//
+// ready_kinds answers "do we have a READY ROW", NOT "are the bytes on the
+// volume" — measured 2026-08-18, 214 of 400 sampled ready rows had no blob.
+// The consumer still fails open on X-JM-Blob-Miss: blob-absent at fetch time.
+// Contract (AO) Q3 option (a), chosen as the default; the ?verify=1 stat-each-
+// blob variant (option (b)) is NOT implemented.
+type derivativesBatchEntry struct {
+	ReadyKinds []string `json:"ready_kinds"`
+	SourceHash *string  `json:"source_hash"`
+}
+
+// handleDerivativesBatchHTTP serves POST /derivatives/batch (contract JM-22):
+// the bulk form of GET /derivatives?inode=N, for a consumer reconciling
+// thousands of inodes at once ("which of these does the farm already have?").
+//
+//	POST {"inodes":[48899,48908]}
+//	200  {"48899":{"ready_kinds":["poster","proxy"],"source_hash":"7f3197..."},
+//	      "48908":{"ready_kinds":[],"source_hash":null}}
+//
+// An inode the index has never heard of is reported as ready_kinds:[] — absence
+// is an answer, not an error, so one unknown asset never fails the whole batch.
+//
+// THIS ROUTE DOES NO ON-MISS RECONCILE. DO NOT ADD ONE. The single-inode route
+// deliberately runs farm.ReconcileOneSidecar on a miss (an on-the-fly read of
+// <mount>/.juicemount/derivatives/<inode>/manifest.json through FUSE) so that
+// navigating to a farm-derived asset surfaces it without a manual sweep. That
+// is right for ONE interactive lookup and catastrophic 1000 times: it would
+// turn a single indexed query into 1000 filesystem reads through the mount,
+// which is the exact cost this route exists to remove. A consumer that needs
+// the reconciling behaviour for a specific inode uses GET /derivatives?inode=N
+// for that one. Agreed with the consumer in PROVIDER_STATUS (AO) Q3.
+func handleDerivativesBatchHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	var req derivativesBatchRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad json body", 400)
+		return
+	}
+	// REJECT, never truncate. A silently dropped tail comes back as an ABSENT
+	// key, which a reconciling consumer reads as "the farm has nothing for
+	// these" — it would then regenerate thousands of derivatives that already
+	// exist, and nothing anywhere would report an error.
+	if len(req.Inodes) > derivativesBatchMaxInodes {
+		http.Error(w, fmt.Sprintf("too many inodes: %d (max %d per request) — page the "+
+			"reconcile. Truncating silently would answer the dropped tail as absent, "+
+			"which is indistinguishable from \"no derivatives exist\".",
+			len(req.Inodes), derivativesBatchMaxInodes), 400)
+		return
+	}
+
+	globalMu.Lock()
+	ds := globalDerivStore
+	globalMu.Unlock()
+
+	out := make(map[string]derivativesBatchEntry, len(req.Inodes))
+	for _, inode := range req.Inodes {
+		key := strconv.FormatUint(inode, 10)
+		if _, dup := out[key]; dup {
+			continue // a repeated inode costs one query, not two
+		}
+		entry := derivativesBatchEntry{ReadyKinds: []string{}}
+		// ds == nil is pre-Start / post-Stop / open-failed ⇒ fail closed with
+		// the same empty shape an unknown inode gets, never a guess or a 500.
+		if ds != nil {
+			if known, srcHash := ds.Known(inode); known {
+				entry.SourceHash = srcHash
+				rows, err := ds.Manifest(inode)
+				if err != nil {
+					jmlog.Warn("derivatives batch manifest query failed",
+						"inode", inode, "error", err.Error())
+				}
+				for _, row := range rows {
+					if row.Status == "ready" {
+						entry.ReadyKinds = append(entry.ReadyKinds, row.Kind)
+					}
+				}
+			}
+		}
+		out[key] = entry
+	}
+	writeContractJSON(w, out)
 }
 
 // handleDerivativesChangesHTTP serves GET /derivatives/changes?since=<unix> — the
@@ -3576,9 +6364,157 @@ func overlayLogProfile(ds *derivatives.Store, inode uint64, tech json.RawMessage
 	return out
 }
 
+// contributableKind describes one derivative kind a CONSUMER may register.
+//
+// REGISTER-ROUTE (2026-08-04, founder-prioritized). Before this, the route was
+// pinned to kind=="ai", so Tier 1 contribute-back had no commit path for ANY
+// other kind — a consumer could write proxy.mp4 through the mount and then had
+// no way to make it real, and spec/WRITE_PLACEMENT.md §4 forbids deleting the
+// orphan it just made. This table is the widening, and it is deliberately a
+// TABLE rather than a permissive check:
+//
+//   - `file` pins the reserved filename from WRITE_PLACEMENT §2. A consumer
+//     cannot choose the path, so it cannot write outside the per-key directory
+//     or shadow another kind's artifact.
+//   - `mediaType` is assigned SERVER-SIDE from the kind, never echoed from the
+//     request. /blob pins its response Content-Type from this row field, so a
+//     contributor-supplied media_type would be a contributor-controlled
+//     Content-Type served from the control-plane origin.
+//
+// `filmstrip` is deliberately ABSENT: its reader contract (minimum canvas,
+// zero-gutter cell origin, upright-as-displayed, undefined trailing cells) is
+// still unspecified, so an edge-written strip is not yet safely renderable by
+// another client. See PROVIDER_STATUS 2026-08-04 D.
+type contributableKind struct {
+	file      string
+	mediaType string
+}
+
+var contributableKinds = map[string]contributableKind{
+	"ai":    {file: "", mediaType: "application/json"}, // "" => resolved dual-name (logger/loupe)
+	"proxy": {file: "proxy.mp4", mediaType: "video/mp4"},
+	// NOTE the kind is "thumbnail", not "poster" — `poster.jpg` is the FILE.
+	// Using the filename as the kind was caught by TestContributableKindsAreValidManifestKinds:
+	// the manifest enum has no "poster", so the row would have failed the
+	// consumer's own validation of /derivatives.
+	"thumbnail": {file: "poster.jpg", mediaType: "image/jpeg"},
+	"waveform":  {file: "waveform.json", mediaType: "application/json"},
+	// audio_proxy (A8): a small streamable stereo MP4 for audio-only assets, so
+	// a remote resolver can prefer it over a 2 GB original. Distinct from proxy
+	// because the PK is (inode, kind) and an asset may carry both.
+	"audio_proxy": {file: "audio_proxy.mp4", mediaType: "audio/mp4"},
+	// filmstrip: OPENED 2026-08-05. It was withheld because its reader contract
+	// was unspecified — an edge-written strip was not safely renderable by
+	// another client. That was a real gap and the answer is to SPECIFY it, not
+	// to keep the kind shut: see filmstripGeometryContract below, now enforced
+	// here and written into derivatives.schema.json.
+	"filmstrip": {file: "strip.jpg", mediaType: "image/jpeg"},
+}
+
+// filmstripGeometryContract is what a contributed strip must satisfy for any
+// other client to render it. Enforced at register, so a strip that reaches the
+// index is renderable by definition rather than by convention.
+//
+//	LAYOUT     row-major, origin TOP-LEFT, ZERO gutter. Cell (r,c) occupies
+//	           x=[c*cell_w,(c+1)*cell_w), y=[r*cell_h,(r+1)*cell_h).
+//	CANVAS     the image is EXACTLY cols*cell_w by rows*cell_h. No padding, no
+//	           border — a reader computes a cell rect by multiplication alone.
+//	ORIENTATION frames are stored UPRIGHT AS DISPLAYED. Rotation metadata on the
+//	           source has already been applied; a reader must not re-apply it.
+//	FRAME i    is at row i/cols, col i%cols, for i in [0, frame_count).
+//	TRAILING   cols*rows MAY exceed frame_count. Cells at index >= frame_count
+//	           are UNDEFINED and must not be rendered — this is the one that
+//	           silently produces a duplicated or black last frame if ignored.
+//	TIME       frame i covers [i*interval_ms, (i+1)*interval_ms) of a
+//	           duration_ms source. interval_ms > 0.
+//
+// registerConflict is the JSON body for a 409 from /derivatives/register.
+//
+// WHY IT EXISTS: the route returns 409 for six distinct conditions whose
+// remedies CONTRADICT each other — "blob not yet visible" means keep retrying
+// with this inode, "synthetic inode" means STOP using this inode, "source
+// stale" means recompute the derivative, "farm row wins" is permanent. Every
+// one was a bare prose string, so a consumer could only apply one uniform
+// retry, which silently masks the stale-source case (the safety-relevant one)
+// and burns its whole budget on the permanent ones.
+//
+// Additive and backward-compatible: the status code is unchanged and a consumer
+// that only reads the code and logs the body is unaffected.
+type registerConflict struct {
+	Code      string `json:"code"`
+	Retryable bool   `json:"retryable"`
+	Message   string `json:"message"`
+	Inode     uint64 `json:"inode,omitempty"`
+	// RealInode is the resolved backend inode when the server could determine
+	// it, so the consumer can place the blob correctly on the next attempt
+	// rather than re-registering into an empty derivative directory.
+	RealInode uint64 `json:"real_inode"`
+	Path      string `json:"path,omitempty"`
+}
+
+// statErrRetryable partitions a source-stat failure into transient vs permanent.
+//
+// Calling EVERY stat failure permanent discards contributions that would have
+// succeeded moments later. entry.Path comes from the RAM mirror with no liveness
+// check, so an out-of-band rename (another client, the web UI, the farm) leaves
+// it stale until reconcile lands — that ENOENT clears itself. EIO/ENOTCONN/ENXIO
+// are transient mount trouble of the same character. A permission or shape error
+// is what genuinely cannot improve on retry.
+func statErrRetryable(err error) bool {
+	switch {
+	case errors.Is(err, os.ErrPermission), errors.Is(err, syscall.ENOTDIR),
+		errors.Is(err, syscall.ENAMETOOLONG), errors.Is(err, syscall.ELOOP):
+		return false
+	default:
+		return true
+	}
+}
+
+func writeRegisterConflict(w http.ResponseWriter, c registerConflict) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusConflict)
+	_ = json.NewEncoder(w).Encode(c)
+}
+
+func validateFilmstripGeometry(g *derivatives.FilmstripGeo) error {
+	if g == nil {
+		return fmt.Errorf(`kind "filmstrip" requires a "filmstrip" geometry object — ` +
+			`without it a strip is an image no other client can index into`)
+	}
+	switch {
+	case g.Cols < 1 || g.Rows < 1:
+		return fmt.Errorf("filmstrip cols/rows must both be >= 1 (got %dx%d) — cols==0 is a "+
+			"divide-by-zero in any reader's i%%cols", g.Cols, g.Rows)
+	case g.CellW < 1 || g.CellH < 1:
+		return fmt.Errorf("filmstrip cell_w/cell_h must both be >= 1 (got %dx%d)", g.CellW, g.CellH)
+	case g.FrameCount < 1:
+		return fmt.Errorf("filmstrip frame_count must be >= 1 (got %d)", g.FrameCount)
+	case g.FrameCount > g.Cols*g.Rows:
+		return fmt.Errorf("filmstrip frame_count %d exceeds the %dx%d grid (%d cells) — "+
+			"the frames do not fit the canvas the geometry describes",
+			g.FrameCount, g.Cols, g.Rows, g.Cols*g.Rows)
+	case g.Cols > maxStripGridDim || g.Rows > maxStripGridDim:
+		return fmt.Errorf("filmstrip grid %dx%d exceeds %d", g.Cols, g.Rows, maxStripGridDim)
+	case g.CellW > maxStripCellDim || g.CellH > maxStripCellDim:
+		return fmt.Errorf("filmstrip cell %dx%d exceeds %d", g.CellW, g.CellH, maxStripCellDim)
+	case g.IntervalMS < 1:
+		return fmt.Errorf("filmstrip interval_ms must be >= 1 (got %d) — a reader maps time to "+
+			"a cell by dividing by it", g.IntervalMS)
+	case g.DurationMS < 0:
+		return fmt.Errorf("filmstrip duration_ms must be >= 0 (got %d)", g.DurationMS)
+	}
+	return nil
+}
+
+const (
+	maxStripGridDim = 4096
+	maxStripCellDim = 8192
+)
+
 // registerRequest is the POST /derivatives/register body (OL-1 on-device AI
-// contribute-back). The consumer wrote ai.loupe.json through the mount, then
-// vouches with source_size+source_mtime (it cannot compute the contract xxh3).
+// contribute-back, widened by REGISTER-ROUTE). The consumer wrote the blob
+// through the mount, then vouches with source_size+source_mtime (it cannot
+// compute the contract xxh3).
 type registerRequest struct {
 	Inode       uint64 `json:"inode"`
 	Kind        string `json:"kind"`
@@ -3588,6 +6524,60 @@ type registerRequest struct {
 	SourceSize  int64  `json:"source_size"`
 	SourceMtime int64  `json:"source_mtime"`
 	BlobRelPath string `json:"blob_rel_path"`
+	// BlobSize is OPTIONAL and closes the truncated-blob hole (contract (AO)
+	// Q1.2). register never reads the consumer's blob bytes — deliberately, on
+	// the reasoning that a phantom row degrades gracefully because a failed blob
+	// read makes the reader regenerate. That reasoning does not cover a blob
+	// truncated at a plausible NON-ZERO length: it passes the exists/regular/
+	// non-empty checks and mints a `ready` row over partial data, and nothing
+	// downstream detects it. We stat the blob anyway, so comparing the size the
+	// consumer vouched is free. A pointer, not an int64: absent must behave
+	// EXACTLY as it did before (no check), and 0 is a value a caller could
+	// legitimately send by accident — it must not read as "not supplied".
+	BlobSize *int64 `json:"blob_size,omitempty"`
+	// Codec is REQUIRED for a proxy kind and DECLARATIVE, not gated on a floor
+	// (founder decision 2026-08-04). derivatives.schema.json reads an ABSENT
+	// codec as h264, so silence would mislabel a richer codec rather than
+	// describe it — which is why it stays required even though no value is
+	// rejected on quality grounds.
+	Codec       string `json:"codec,omitempty"`
+	CodecString string `json:"codec_string,omitempty"`
+	// Width/Height/BitrateBPS let the server rank a contributed artifact WITHOUT
+	// decoding it, so a cheap one can be earmarked for upgrade. A 320px and a
+	// 720px poster are otherwise distinguishable on the wire only by blob_size,
+	// which is a bad quality proxy (a flat LOG-graded 720 frame can encode
+	// smaller than a busy 320).
+	Width      int   `json:"width,omitempty"`
+	Height     int   `json:"height,omitempty"`
+	BitrateBPS int64 `json:"bitrate_bps,omitempty"`
+	// Filmstrip is REQUIRED for kind=="filmstrip". A sprite sheet without its
+	// geometry is an image no other client can index into — which is exactly why
+	// the kind was withheld until the contract below was written down.
+	Filmstrip *derivatives.FilmstripGeo `json:"filmstrip,omitempty"`
+}
+
+// Bounds for artifact descriptors. Generous enough for 8K-plus, tight enough
+// that a forged value cannot walk a reader into an absurd allocation.
+const (
+	maxArtifactDim     = 65535
+	maxArtifactBitrate = int64(10) << 30 // 10 Gbps
+)
+
+// knownProxyCodecs mirrors derivatives.schema.json's codec enum. Asserted
+// against the vendored contract by a conformance test — a vocabulary narrower
+// than the contract rejects legitimate contributions, and one wider writes rows
+// that fail the consumer's own validation.
+var knownProxyCodecs = map[string]bool{
+	"h264": true, "hevc": true, "av1": true, "aac": true, "opus": true,
+}
+
+func knownProxyCodecList() []string {
+	out := make([]string, 0, len(knownProxyCodecs))
+	for c := range knownProxyCodecs {
+		out = append(out, c)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // registerResponse is the 200 body. Schema: contract/spec/schema/register.schema.json.
@@ -3623,8 +6613,15 @@ func handleDerivativesRegisterHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "missing inode", 400)
 		return
 	}
-	if req.Kind != "ai" {
-		http.Error(w, `OL-1 register is AI-only (kind must be "ai")`, 400)
+	spec, kindOK := contributableKinds[req.Kind]
+	if !kindOK {
+		allowed := make([]string, 0, len(contributableKinds))
+		for k := range contributableKinds {
+			allowed = append(allowed, k)
+		}
+		sort.Strings(allowed)
+		http.Error(w, fmt.Sprintf("kind %q is not consumer-registrable; allowed: %s",
+			req.Kind, strings.Join(allowed, ", ")), 400)
 		return
 	}
 	if req.Producer != "on-device" && req.Producer != "macos-node" {
@@ -3632,9 +6629,6 @@ func handleDerivativesRegisterHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	rel := req.BlobRelPath
-	if rel == "" {
-		rel = "ai.loupe.json"
-	}
 
 	globalMu.Lock()
 	store := globalStore
@@ -3642,13 +6636,173 @@ func handleDerivativesRegisterHTTP(w http.ResponseWriter, r *http.Request) {
 	fusePath := globalFUSEPath
 	globalMu.Unlock()
 
+	// Wire-term cutover (2026-08-03): when the consumer omits blob_rel_path we
+	// resolve it against what is actually on disk — the post-cutover
+	// `ai.logger.json` if present, else the legacy `ai.loupe.json`. Defaulting
+	// to a fixed name would 404 a blob an older consumer had already written
+	// under the other one. An explicit blob_rel_path is honoured as-is; the
+	// register schema accepts both names.
+	if spec.file != "" {
+		// The reserved name is authoritative. A supplied blob_rel_path is only
+		// accepted when it MATCHES it — the consumer does not get to choose a
+		// path inside our namespace (WRITE_PLACEMENT §2).
+		if rel != "" && rel != spec.file {
+			http.Error(w, fmt.Sprintf("blob_rel_path %q is not the reserved name for kind %q (expected %q)",
+				rel, req.Kind, spec.file), 400)
+			return
+		}
+		rel = spec.file
+	} else if rel == "" {
+		// kind=="ai" keeps its dual-name resolution (wire-term cutover): the
+		// post-cutover `ai.logger.json` if present, else the legacy name.
+		// Resolved through a DESCRIPTOR, not a joined path: the path form stat'ed
+		// through a consumer-swappable <inode> component, so an ancestor symlink
+		// steered the very choice of filename from outside the volume.
+		if dir, derr := derivatives.OpenDirUnder(fusePath, derivatives.DerivDirRel(req.Inode)); derr == nil {
+			rel = derivatives.AIBlobWriteNameAt(dir)
+			dir.Close()
+		} else {
+			rel = derivatives.AIBlobName
+		}
+	}
+
 	if store == nil || ds == nil {
 		http.Error(w, "control plane not ready", 503)
 		return
 	}
+	// SYNTHETIC INODES ARE REFUSED BEFORE THE LOOKUP, NOT AFTER IT.
+	//
+	// This check MUST precede LookupByInode. A synthetic inode is not merely an
+	// inode that fails to resolve — juiceFS.Create mints one via
+	// nextSyntheticInode() and then InsertToCache's it (nfs/handler.go:3247),
+	// so it is a LIVE CACHE KEY and the lookup SUCCEEDS. Placing the guard in
+	// the `entry == nil` branch therefore left the actual failure wide open: the
+	// register returned 200 and committed a manifest row keyed to an identifier
+	// that ceases to exist once Redis reconcile assigns the real inode. The blob
+	// then lives forever at .juicemount/derivatives/<vanished>/ with nothing
+	// pointing at it, and no GC exists for derivative rows. Silent data loss,
+	// with a success code — caught by adversarial review, which reproduced it by
+	// seeding through the production InsertToCache path.
+	//
+	// Exposure is widest for files created OFFLINE, which hold a synthetic inode
+	// indefinitely rather than for the drain window.
+	if req.Inode&(1<<63) != 0 {
+		// Resolve to the real inode when we can, so the consumer gets an
+		// actionable answer in ONE round trip. It cannot be resolved from the
+		// inode alone: the derivative BLOB is addressed by inode too
+		// (DerivBlobRel), so a consumer told merely to "retry with the right
+		// inode" would re-register against an empty derivative dir and get a
+		// second, indistinguishable 409. Handing back real_inode lets it place
+		// the blob correctly the first time.
+		srcPath, _ := store.SyntheticHandlePath(req.Inode)
+		if srcPath == "" {
+			if e := store.LookupByInode(req.Inode); e != nil {
+				srcPath = e.Path
+			}
+		}
+		var realInode uint64
+		if srcPath != "" {
+			if e := store.LookupByPath(srcPath); e != nil && e.Inode&(1<<63) == 0 {
+				realInode = e.Inode
+			}
+		}
+		writeRegisterConflict(w, registerConflict{
+			Code:      "synthetic_inode",
+			Retryable: false,
+			Inode:     req.Inode,
+			RealInode: realInode,
+			Path:      srcPath,
+			Message: "inode is a transient pre-drain identifier, not a backend inode " +
+				"(high bit set). Registering under it would key the derivative to an " +
+				"identifier that ceases to exist. If real_inode is set, rewrite the blob " +
+				"under that inode's derivative directory and register with it. If it is " +
+				"absent the source has not reconciled yet: re-list the parent directory " +
+				"to force a fresh READDIR — a cached stat can hold a stale identifier " +
+				"indefinitely — then take the inode again.",
+		})
+		return
+	}
+
 	entry := store.LookupByInode(req.Inode)
 	if entry == nil {
 		http.Error(w, "inode not found", 404)
+		return
+	}
+
+	// The manifest row is the commit point (WRITE_PLACEMENT §4), so refuse to
+	// mint a row for a blob that is not on disk — that would be a phantom row
+	// pointing at nothing, and readers fail closed on it rather than
+	// regenerating. Cheap: one stat, and it catches a consumer that registered
+	// before its own atomic rename landed.
+	//
+	// ORDER MATTERS: this runs AFTER the inode lookup. Placed before it, an
+	// unknown inode reported 409 "blob missing" instead of 404 "inode not
+	// found" — a real regression caught by TestDerivativesRegisterOL1.
+	// ANCHORED. Lstat on a joined path guards only the LEAF, so an ancestor
+	// symlink let an out-of-tree file satisfy this "write it BEFORE registering"
+	// gate — minting a `ready` row that the (correctly anchored) serve path then
+	// permanently 404s, with the slot occupied. Same walk the serve path uses,
+	// so the two cannot disagree about what exists.
+	bfi, statErr := derivatives.StatRegularUnder(fusePath, derivatives.DerivBlobRel(req.Inode, rel))
+	if statErr != nil {
+		// A non-regular file at a reserved blob name is PERMANENT — retrying cannot
+		// change it; the consumer must remove it and rewrite. Reporting it as
+		// "still draining" made the consumer retry against its own symlink until
+		// the budget ran out.
+		if errors.Is(statErr, derivatives.ErrNotRegular) {
+			writeRegisterConflict(w, registerConflict{
+				Code: "blob_not_regular", Retryable: false, Inode: req.Inode,
+				Message: fmt.Sprintf("blob %q exists but is not a regular file (%v) — remove it and "+
+					"write a regular file; retrying cannot change this", rel, statErr),
+			})
+			return
+		}
+		writeRegisterConflict(w, registerConflict{
+			Code: "blob_not_visible", Retryable: true, Inode: req.Inode,
+			Message: fmt.Sprintf("blob %q not present as a regular file under the derivative dir — "+
+				"write it (atomically) BEFORE registering. RETRYABLE with THIS inode: the write may "+
+				"still be draining through the spool (~6s). %v", rel, statErr),
+		})
+		return
+	}
+	// NON-EMPTY, for the same reason CommitStagedAt refuses to publish an empty
+	// staged file: a MISSING blob 404s and the reader regenerates locally, while
+	// a 0-byte blob is served with 200 and looks like a real answer. The farm
+	// side already enforces this; leaving it off the contribute path made the
+	// rule asymmetric, and the consumer is the LESS trusted writer of the two.
+	//
+	// It also catches the honest mistake this was found by: registering straight
+	// after writing, before the bytes are actually visible through the mount.
+	if bfi.Size() == 0 {
+		writeRegisterConflict(w, registerConflict{
+			Code: "blob_empty", Retryable: true, Inode: req.Inode,
+			Message: fmt.Sprintf("blob %q is 0 bytes — an empty blob would be served as a real answer "+
+				"instead of 404ing so the reader can regenerate. RETRYABLE with THIS inode: the "+
+				"drainer creates the destination at its final name and then copies into it, so a blob "+
+				"is legitimately 0 bytes for part of the drain window. Let the write land, then "+
+				"register.", rel),
+		})
+		return
+	}
+
+	// OPTIONAL blob-size vouch (contract (AO) Q1.2). Only when the consumer
+	// supplied one: omitting blob_size behaves exactly as before this existed.
+	//
+	// NOT RETRYABLE. A size mismatch means the bytes on the volume are not the
+	// bytes the consumer thinks it wrote — a short write, an interrupted copy,
+	// or a register that raced its own non-atomic write. Retrying the SAME
+	// request cannot change either number; the consumer must rewrite the blob
+	// (atomically: temp name + rename) and register again. Marking it retryable
+	// would burn the whole retry budget and then publish nothing.
+	if req.BlobSize != nil && *req.BlobSize != bfi.Size() {
+		writeRegisterConflict(w, registerConflict{
+			Code: "blob_truncated", Retryable: false, Inode: req.Inode,
+			Message: fmt.Sprintf("blob %q is %d bytes on disk but you vouched %d — the row would "+
+				"be published over partial data, which no reader can detect. NOT retryable: "+
+				"rewrite the blob (write to a temp name and rename() into the reserved name so "+
+				"a partial file never appears at a name we stat), then register again.",
+				rel, bfi.Size(), *req.BlobSize),
+		})
 		return
 	}
 
@@ -3658,12 +6812,21 @@ func handleDerivativesRegisterHTTP(w http.ResponseWriter, r *http.Request) {
 	src := filepath.Join(fusePath, entry.Path)
 	fi, err := os.Stat(src)
 	if err != nil {
-		http.Error(w, "source unreadable: "+err.Error(), http.StatusConflict)
+		writeRegisterConflict(w, registerConflict{
+			Code: "source_unreadable", Retryable: statErrRetryable(err), Inode: req.Inode,
+			Path:    entry.Path,
+			Message: "source unreadable through the mount: " + err.Error(),
+		})
 		return
 	}
 	if fi.Size() != req.SourceSize || fi.ModTime().Unix() != req.SourceMtime {
-		http.Error(w, fmt.Sprintf("stale: live size/mtime (%d/%d) != vouched (%d/%d) — AI computed against old bytes",
-			fi.Size(), fi.ModTime().Unix(), req.SourceSize, req.SourceMtime), http.StatusConflict)
+		writeRegisterConflict(w, registerConflict{
+			Code: "source_stale", Retryable: false, Inode: req.Inode, Path: entry.Path,
+			Message: fmt.Sprintf("live size/mtime (%d/%d) != vouched (%d/%d) — the derivative was "+
+				"computed against OLD bytes. NOT retryable: recompute it against the current source, "+
+				"then register. Retrying unchanged would publish a derivative that does not describe "+
+				"the file.", fi.Size(), fi.ModTime().Unix(), req.SourceSize, req.SourceMtime),
+		})
 		return
 	}
 
@@ -3677,11 +6840,157 @@ func handleDerivativesRegisterHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	mt := "application/json"
+	mt := spec.mediaType // SERVER-assigned from the kind, never from the request
 	var modelP *string
 	if req.Model != "" {
 		modelP = &req.Model
 	}
+	// PRODUCER PRECEDENCE (2026-08-04 review, HIGH). PutDeriv is a blind upsert
+	// on (inode,kind), so before this an on-device register silently replaced a
+	// farm-produced row — flipping producer "linux-farm" -> "on-device" and
+	// repointing the row at different bytes, with no admin visibility and no
+	// self-healing resync. The farm is the higher-trust producer (it hashes the
+	// source itself and runs the locked recipe), so a consumer may ADD a kind the
+	// farm has not produced, and may replace its OWN earlier contribution, but may
+	// not overwrite the farm's.
+	if existing, mErr := ds.Manifest(req.Inode); mErr == nil {
+		for _, er := range existing {
+			if er.Kind != req.Kind {
+				continue
+			}
+			// COORDINATION, NOT AUTHENTICATION. Read this before "hardening" it.
+			//
+			// On the Mac, EVERY farm row arrives through farm.ReconcileOneSidecar
+			// reading manifest.json off the volume — farm generation itself only
+			// ever runs server-side in cmd/jmfarm. There is no authentication on
+			// that file, so "produced by the farm" is simply NOT an authenticated
+			// property here, and any guard built on it is advisory by nature.
+			//
+			// A previous attempt keyed this on an unforgeable provenance stamp to
+			// stop a forged manifest impersonating the farm. That stamp is applied
+			// to every reconciled row — including genuine farm rows, since they
+			// take the same path — so the predicate was never true in production
+			// and this guard silently became a dead branch, re-opening the very
+			// clobber it exists to prevent. The test that "proved" it seeded the
+			// row with a direct PutDeriv, a state production cannot reach.
+			//
+			// So: back to the producer string, which is right for the case that
+			// actually happens — a well-behaved consumer must not silently replace
+			// the farm's work.
+			//
+			// The forged-row DoS is NOT excused by "they could write the blob bytes
+			// anyway". That comparison is access-equivalent but outcome-inequivalent,
+			// and the earlier version of this comment had it wrong:
+			//   forged BLOB  → the legitimate producer still registers (200), owns
+			//                  the row, and can re-register later. Recoverable.
+			//   forged ROW   → producer:"linux-farm", status:"failed", NO blob at
+			//                  all. Every register for that (inode,kind) 409s
+			//                  forever, and "failed" is deliberately accepted
+			//                  because it means "this artifact will never appear".
+			//                  There is no API path back; recovery is out-of-band.
+			// So the forgery is strictly MORE durable than the write it is compared
+			// to. Tracked, not dismissed: the fix is an authenticated sidecar, and
+			// until then this guard is coordination rather than a trust boundary.
+			if er.Producer == "linux-farm" && req.Producer != "linux-farm" {
+				writeRegisterConflict(w, registerConflict{
+					Code: "producer_conflict", Retryable: false, Inode: req.Inode,
+					Message: fmt.Sprintf("kind %q for inode %d already has a farm-produced row; a %q "+
+						"contribution may not replace it. PERMANENT — do not retry; the farm row wins "+
+						"by precedence, not by timing.", req.Kind, req.Inode, req.Producer),
+				})
+				return
+			}
+		}
+	}
+
+	// CODEC IS DECLARED, NOT MANDATED (founder decision, 2026-08-04, superseding
+	// the H.264 floor this route shipped with hours earlier).
+	//
+	// The floor made the LEAST capable node set the ceiling for every node. The
+	// ruling inverts it: a node that cannot do a thing contributes the things it
+	// CAN do, and the fleet's output is the UNION, not the intersection. An older
+	// iMac with no HEVC encoder is not a reason to make every Mac emit H.264 — it
+	// is a node that contributes posters, filmstrips and waveforms while a
+	// capable machine contributes the HEVC proxy.
+	//
+	// So the codec is still REQUIRED — silence is read as h264 by every
+	// downstream reader, and inferring a codec from silence is how an HEVC blob
+	// gets mislabelled — but any codec in the closed vocabulary is accepted, and
+	// the reader checks the row before fetching.
+	var codecP, codecStrP *string
+	if req.Kind == "proxy" || req.Kind == "audio_proxy" {
+		c := strings.ToLower(strings.TrimSpace(req.Codec))
+		if c == "" {
+			http.Error(w, fmt.Sprintf(
+				`kind %q requires an explicit "codec" — an absent codec is read as h264 by every downstream reader, so silence would mislabel a richer codec rather than describe it`, req.Kind), 400)
+			return
+		}
+		if !knownProxyCodecs[c] {
+			http.Error(w, fmt.Sprintf(
+				`codec %q is not in the manifest vocabulary %v — a codec a reader cannot recognise is worse than one it cannot decode, because it cannot even choose`, c, knownProxyCodecList()), 400)
+			return
+		}
+		codecP = &c
+		if cs := strings.TrimSpace(req.CodecString); cs != "" {
+			if len(cs) > 256 {
+				http.Error(w, `"codec_string" exceeds 256 bytes`, 400)
+				return
+			}
+			codecStrP = &cs
+		}
+	}
+
+	// FILMSTRIP GEOMETRY — required and validated, so a strip that reaches the
+	// index is renderable by any client by definition (see
+	// validateFilmstripGeometry for the contract this enforces).
+	var stripGeo *derivatives.FilmstripGeo
+	if req.Kind == "filmstrip" {
+		if err := validateFilmstripGeometry(req.Filmstrip); err != nil {
+			http.Error(w, err.Error(), 400)
+			return
+		}
+		g := *req.Filmstrip
+		stripGeo = &g
+	} else if req.Filmstrip != nil {
+		http.Error(w, fmt.Sprintf("filmstrip geometry is not meaningful for kind %q", req.Kind), 400)
+		return
+	}
+
+	// ARTIFACT DESCRIPTORS (consumer ask, founder-endorsed 2026-08-04).
+	//
+	// If a node's contribution is a FLOOR rather than a finished artifact, the
+	// server has to be able to tell a cheap artifact from a good one WITHOUT
+	// decoding it, so it can earmark the cheap one for upgrade. Today it cannot:
+	// a 320px poster and a 720px poster differ on the wire only by blob_size,
+	// which is a bad proxy for quality — a flat LOG-graded 720 frame can encode
+	// smaller than a busy 320. `dim` is embedding dimensionality, not image size.
+	var widthP, heightP *int
+	if req.Width != 0 || req.Height != 0 {
+		if req.Kind != "thumbnail" && req.Kind != "proxy" && req.Kind != "audio_proxy" && req.Kind != "filmstrip" {
+			http.Error(w, fmt.Sprintf(`width/height are pixel dimensions and are not meaningful for kind %q`, req.Kind), 400)
+			return
+		}
+		if req.Width <= 0 || req.Height <= 0 || req.Width > maxArtifactDim || req.Height > maxArtifactDim {
+			http.Error(w, fmt.Sprintf(`width/height must both be in 1..%d (got %dx%d)`, maxArtifactDim, req.Width, req.Height), 400)
+			return
+		}
+		w2, h2 := req.Width, req.Height
+		widthP, heightP = &w2, &h2
+	}
+	var bitrateP *int64
+	if req.BitrateBPS != 0 {
+		if req.Kind != "proxy" && req.Kind != "audio_proxy" {
+			http.Error(w, `bitrate_bps is only meaningful for a proxy`, 400)
+			return
+		}
+		if req.BitrateBPS < 0 || req.BitrateBPS > maxArtifactBitrate {
+			http.Error(w, fmt.Sprintf(`bitrate_bps must be in 1..%d`, maxArtifactBitrate), 400)
+			return
+		}
+		b := req.BitrateBPS
+		bitrateP = &b
+	}
+
 	var dimP *int
 	if req.Dim > 0 {
 		dimP = &req.Dim
@@ -3691,11 +7000,17 @@ func handleDerivativesRegisterHTTP(w http.ResponseWriter, r *http.Request) {
 	srcSize := fi.Size()
 	srcMtime := fi.ModTime().Unix()
 	row := derivatives.DerivRow{
-		Kind: "ai", Status: "ready", Producer: req.Producer, Version: 1,
+		Kind: req.Kind, Status: "ready", Producer: req.Producer, Version: 1,
 		Hash: &hash, BlobRelPath: &rel, MediaType: &mt, Model: modelP, Dim: dimP,
 		UpdatedAt:   time.Now().Unix(),
 		SourceSize:  &srcSize,
 		SourceMtime: &srcMtime,
+		Codec:       codecP,
+		CodecString: codecStrP,
+		Width:       widthP,
+		Height:      heightP,
+		BitrateBPS:  bitrateP,
+		Filmstrip:   stripGeo,
 	}
 	if err := ds.PutSource(req.Inode, &hash); err != nil {
 		http.Error(w, "put source: "+err.Error(), 500)
@@ -3705,8 +7020,9 @@ func handleDerivativesRegisterHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "put deriv: "+err.Error(), 500)
 		return
 	}
-	jmlog.Info("OL-1 AI contribute-back registered",
-		"inode", req.Inode, "producer", req.Producer, "model", req.Model, "hash", hash)
+	jmlog.Info("contribute-back registered",
+		"inode", req.Inode, "kind", req.Kind, "blob", rel,
+		"producer", req.Producer, "model", req.Model, "hash", hash)
 	writeContractJSON(w, registerResponse{Inode: req.Inode, Registered: true, Derivative: row})
 }
 
@@ -3719,6 +7035,27 @@ func handleDerivativesRegisterHTTP(w http.ResponseWriter, r *http.Request) {
 // an unranged GET gets 200 + Content-Length, both with Accept-Ranges: bytes.
 // That is exactly what a browser <video> and a remote AVPlayer need to seek over
 // HTTP, identical for h264/hevc/av1.
+
+// blobVouchHeaders publishes the row's own vouch on a successful /blob response.
+//
+// The consumer's D3 trust gate compares the manifest's source_size against a
+// live stat before applying identity-bearing state (embeddings, transcripts).
+// Without these it must fetch /derivatives as well as /blob for every asset —
+// two round trips to answer one question, on a link where round trips are the
+// cost model. Same values the manifest carries; no new source of truth.
+func blobVouchHeaders(w http.ResponseWriter, kind string, row derivatives.DerivRow) {
+	w.Header().Set("X-JM-Kind", kind)
+	if row.Hash != nil {
+		w.Header().Set("X-JM-Hash", *row.Hash)
+	}
+	if row.SourceSize != nil {
+		w.Header().Set("X-JM-Source-Size", strconv.FormatInt(*row.SourceSize, 10))
+	}
+	if row.SourceMtime != nil {
+		w.Header().Set("X-JM-Source-Mtime", strconv.FormatInt(*row.SourceMtime, 10))
+	}
+}
+
 func handleBlobHTTP(w http.ResponseWriter, r *http.Request) {
 	inode, ok := parseInodeQuery(w, r)
 	if !ok {
@@ -3730,6 +7067,7 @@ func handleBlobHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	globalMu.Lock()
 	ds := globalDerivStore
+	tc := globalThumbCache
 	mount := globalFUSEPath
 	if mount == "" {
 		mount = globalMountPath
@@ -3753,10 +7091,12 @@ func handleBlobHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var blobRel, mediaType string
+	var row derivatives.DerivRow
 	for _, d := range rows {
 		if d.Kind != kind || d.Status != "ready" || d.BlobRelPath == nil || *d.BlobRelPath == "" {
 			continue
 		}
+		row = d
 		blobRel = *d.BlobRelPath
 		if d.MediaType != nil {
 			mediaType = *d.MediaType
@@ -3764,6 +7104,36 @@ func handleBlobHTTP(w http.ResponseWriter, r *http.Request) {
 		break
 	}
 	if blobRel == "" {
+		// WHY A REASON HEADER. Every miss here is a 404 with a prose body, and a
+		// consumer cannot tell "you do not serve this kind" from "the row exists
+		// but its bytes are gone" — which are opposite problems: the first is an
+		// integration bug on their side, the second is a data gap on ours.
+		// Measured 2026-08-18: 214 of 400 sampled ready rows point at a
+		// blob_rel_path with no file on the volume, so the second case is the
+		// COMMON one and was indistinguishable. The status stays 404; only the
+		// diagnosis is added.
+		w.Header().Set("X-JM-Blob-Miss", "no-ready-row")
+		http.Error(w, "no ready "+kind+" blob for this inode", http.StatusNotFound)
+		return
+	}
+	// C5 (data integrity): the row is READY, but derivatives are keyed by INODE
+	// and an inode is not a content identity — overwrite this file in place
+	// (re-export, re-transcode) or let JuiceFS recycle a deleted inode, and this
+	// row (and any blob cached under it) now depicts bytes that are gone. Gate on
+	// the row's own vouch, source_size/source_mtime, against the live size/mtime
+	// the in-RAM mirror already holds. This is the SAME comparison the AI
+	// contribute-back POST path enforces above (409 "computed against old bytes")
+	// — it simply was never applied on the way out.
+	//
+	// liveSourceFor is a mirror map read, deliberately NOT a stat of the source:
+	// a stat here would add a full ~500ms cellular round-trip to every thumbnail
+	// and to every byte-range request a player makes while scrubbing a proxy.
+	// A mismatch is treated as a MISS — same 404 an absent derivative gets, so
+	// the caller regenerates — and the persistent thumb-cache copy is dropped so
+	// the stale bytes are not served from local disk after a restart either.
+	if live := liveSourceFor(inode); derivRowStale(row, live) {
+		rejectStaleDeriv(tc, inode, kind, row, live)
+		w.Header().Set("X-JM-Blob-Miss", "stale-source")
 		http.Error(w, "no ready "+kind+" blob for this inode", http.StatusNotFound)
 		return
 	}
@@ -3774,22 +7144,24 @@ func handleBlobHTTP(w http.ResponseWriter, r *http.Request) {
 	// Resolve the blob under the Tier-A per-inode dir and open it through the FUSE
 	// mount (direct JuiceFS — no NFS self-loop). filepath.Clean on the rel path
 	// keeps it inside the inode dir (the farm only ever writes flat names there).
-	blobPath := filepath.Join(farm.DerivBlobDir(mount, inode), filepath.Clean("/"+blobRel))
 
 	// #1 hydration pack: SMALL kinds (everything but proxy) serve LOCAL-FIRST
 	// from the thumb cache, populated by the folder-open warmer or a prior
-	// read-through here. The manifest row above still authorized the kind and
-	// supplied the media type, so the fail-closed 404 semantics are identical
-	// — only the byte source swaps (local SSD instead of a FUSE round-trip).
-	globalMu.Lock()
-	tc := globalThumbCache
-	globalMu.Unlock()
+	// read-through here. The manifest row above still authorized the kind,
+	// supplied the media type, AND passed the C5 freshness gate, so the
+	// fail-closed 404 semantics are identical and the cached bytes are known to
+	// match the live source — only the byte source swaps (local SSD instead of
+	// a FUSE round-trip). tc was captured with ds above.
 	smallKind := kind != "proxy"
 	if tc != nil && smallKind {
-		if lp, ok := tc.Path(inode, kind); ok {
-			if lf, lerr := os.Open(lp); lerr == nil {
+		if croot, crel, ok := tc.PathParts(inode, kind); ok {
+			// Anchored, like the FUSE read below. This branch serves BEFORE the
+			// guarded open further down, so leaving it unguarded made that guard
+			// bypassable through the very cache a poisoned read populates.
+			if lf, lerr := derivatives.OpenRegularUnder(croot, crel); lerr == nil {
 				defer lf.Close()
 				if lfi, serr := lf.Stat(); serr == nil {
+					blobVouchHeaders(w, kind, row)
 					w.Header().Set("Content-Type", mediaType)
 					http.ServeContent(w, r, "", lfi.ModTime(), lf)
 					return
@@ -3797,9 +7169,21 @@ func handleBlobHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	if testguard.RefuseFUSEContentReads() {
+		w.Header().Set("X-JM-Blob-Miss", "test-content-guard")
+		http.Error(w, "blob unavailable during bounded cellular acceptance", http.StatusServiceUnavailable)
+		return
+	}
 
-	f, err := os.Open(blobPath)
+	// Anchored at the MOUNT, not at the per-inode directory: O_NOFOLLOW binds
+	// only the final component, so guarding just the blob name left the <inode>
+	// directory itself swappable for a symlink to anywhere (round-3 HIGH).
+	f, err := derivatives.OpenRegularUnder(mount, derivatives.DerivBlobRel(inode, blobRel))
 	if err != nil {
+		// The row promised this file and it is not there. Distinct from
+		// no-ready-row: the manifest ADVERTISED it, so a consumer that gated on
+		// isReadyAndFresh did everything right and still got nothing.
+		w.Header().Set("X-JM-Blob-Miss", "blob-absent")
 		http.Error(w, "blob unreadable", http.StatusNotFound)
 		return
 	}
@@ -3818,6 +7202,7 @@ func handleBlobHTTP(w http.ResponseWriter, r *http.Request) {
 			if _, perr := tc.Put(inode, kind, bytes.NewReader(data)); perr != nil {
 				jmlog.Debug("thumb read-through populate failed", "inode", inode, "kind", kind, "error", perr.Error())
 			}
+			blobVouchHeaders(w, kind, row)
 			w.Header().Set("Content-Type", mediaType)
 			http.ServeContent(w, r, fi.Name(), fi.ModTime(), bytes.NewReader(data))
 			return
@@ -3831,6 +7216,7 @@ func handleBlobHTTP(w http.ResponseWriter, r *http.Request) {
 	// http.ServeContent sets Content-Type (we pin it from the manifest media_type),
 	// Accept-Ranges: bytes, and the full 200/206 + Content-Range/Content-Length
 	// Range machinery. modtime drives caching validators; the blob's mtime is fine.
+	blobVouchHeaders(w, kind, row)
 	w.Header().Set("Content-Type", mediaType)
 	http.ServeContent(w, r, fi.Name(), fi.ModTime(), f)
 }
@@ -4124,6 +7510,29 @@ func handleCacheStatusHTTP(w http.ResponseWriter, r *http.Request) {
 // recently-done tail — not all-time history. Capped at 200 rows to
 // keep menu-bar payloads responsive on a 1 Hz poll. Older rows live
 // in SQLite for audit but are not returned here.
+// handlePresenceHTTP serves the live presence snapshot (Tier-1 #3).
+func handlePresenceHTTP(w http.ResponseWriter, r *http.Request) {
+	globalMu.Lock()
+	pt := globalPresence
+	globalMu.Unlock()
+	w.Header().Set("Content-Type", "application/json")
+	if pt == nil {
+		w.Write([]byte(`{"enabled":false}`))
+		return
+	}
+	out := map[string]any{"enabled": true, "host": pt.Host()}
+	if r.URL.Query().Get("all") == "1" {
+		ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+		defer cancel()
+		out["hosts"] = pt.AllSnapshots(ctx)
+	} else {
+		local := pt.LocalSnapshot()
+		out["files"] = local
+		out["open_count"] = len(local)
+	}
+	_ = json.NewEncoder(w).Encode(out)
+}
+
 func handleSpoolHTTP(w http.ResponseWriter, r *http.Request) {
 	globalMu.Lock()
 	spool := globalSpool
@@ -4267,15 +7676,14 @@ func handleActivityHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleSpoolRecoverHTTP is the operator-facing recovery action behind the
-// LB-5 stuck-spool UI affordance. Loopback-only GET with query params —
-// the same mutation convention as /offline?on=true.
+// LB-5 stuck-spool UI affordance. Mutations require POST with X-JM-Control.
 //
-//	GET /spool-recover?action=retry-failed
+//	POST /spool-recover?action=retry-failed
 //	    ResetForRetry every `failed` row whose spool file still exists on
 //	    disk (state→ready, fresh attempt budget) and wake the drainer.
 //	    Rows with no surviving data are skipped — never deletes user bytes.
 //
-//	GET /spool-recover?action=clear-stalled
+//	POST /spool-recover?action=clear-stalled
 //	    Force-finalize stalled `writing` entries NOW via the Phase-1
 //	    escalation helper (leaked handles zeroed, fsync + SHA +
 //	    mark-ready) so their bytes drain like any normal finalize.
@@ -4287,6 +7695,15 @@ func handleActivityHTTP(w http.ResponseWriter, r *http.Request) {
 //	500 {"ok":false,"error":"…"}   — SQL failure during retry
 //	503 {"ok":false,"error":"…"}   — spool not enabled / not wired
 func handleSpoolRecoverHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Query().Get("action") == "clear-failed" && r.URL.Query().Get("confirm") != "true" {
+		if r.Method != http.MethodGet && r.Method != http.MethodPost {
+			w.Header().Set("Allow", "GET, POST")
+			http.Error(w, "GET or POST only", http.StatusMethodNotAllowed)
+			return
+		}
+	} else if !requireLocalControlMutation(w, r) {
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	globalMu.Lock()
 	spool := globalSpool
@@ -4358,6 +7775,9 @@ func handleSpoolRecoverHTTP(w http.ResponseWriter, r *http.Request) {
 // when --cache-size < total pinned bytes). Idempotent — running it on a
 // fully-cached set is fast (kernel-cache reads, no S3).
 func handleVerifyPinsHTTP(w http.ResponseWriter, r *http.Request) {
+	if !requireLocalControlMutation(w, r) {
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	if globalPrefetcher == nil {
 		w.WriteHeader(503)
@@ -4388,47 +7808,16 @@ func handleVerifyPinsHTTP(w http.ResponseWriter, r *http.Request) {
 
 // handleReclaimHTTP triggers tmutil thinlocalsnapshots / 0 4 — frees Time
 // Machine local snapshots and other purgeable space so JuiceFS can use it
-// for cache. POST or GET; no body. Returns JSON with bytes freed.
-// handleForceEjectHTTP runs the privileged force-unmount path on demand.
-// In-app rescue for the case where Stop failed (or never ran) and the
-// kernel mount table has a wedged `/Volumes/zpool` entry that's making
-// Finder hang. Pops the macOS admin password prompt once.
-//
-// Returns JSON: {"ok": bool, "mount_point": "...", "error": "..."}
-//
-// Idempotent: safe to call even when nothing is mounted.
+// for cache. POST with X-JM-Control; no body. Returns JSON with bytes freed.
+// The legacy rescue endpoint cannot bypass the controller's lifecycle and
+// verifier barriers. Stop Mount is the supported retained-operation path.
 func handleForceEjectHTTP(w http.ResponseWriter, r *http.Request) {
+	if !requireLocalControlMutation(w, r) {
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
-	mp := r.URL.Query().Get("path")
-	if mp == "" {
-		// Default to the configured mount; survives soft-stop because
-		// globalMountPath is retained across Stop/Start cycles for exactly
-		// this kind of recovery.
-		globalMu.Lock()
-		mp = globalMountPath
-		globalMu.Unlock()
-		if mp == "" {
-			mp = "/Volumes/zpool"
-		}
-	}
-	if !isMounted(mp) {
-		fmt.Fprintf(w, `{"ok":true,"mount_point":%q,"already_clean":true}`, mp)
-		return
-	}
-	ok := unmountNFS(mp)
-	if ok {
-		// Clear the remembered mount path so future Start doesn't try to
-		// "reuse" a path that's no longer mounted.
-		globalMu.Lock()
-		if globalMountPath == mp {
-			globalMountPath = ""
-		}
-		globalMu.Unlock()
-		fmt.Fprintf(w, `{"ok":true,"mount_point":%q}`, mp)
-		return
-	}
-	w.WriteHeader(500)
-	fmt.Fprintf(w, `{"ok":false,"mount_point":%q,"error":"unmount failed; mount may be wedged in kernel — reboot or 'sudo umount -f -t nfs %s' from a fresh terminal"}`, mp, mp)
+	w.WriteHeader(http.StatusConflict)
+	fmt.Fprint(w, `{"ok":false,"error":"Use Stop Mount to retire the owned mount safely; force eject is unavailable"}`)
 }
 
 // mountNowDeps are the side-effecting pieces of handleMountNowHTTP,
@@ -4436,30 +7825,29 @@ func handleForceEjectHTTP(w http.ResponseWriter, r *http.Request) {
 // live server or exec'ing mount(8) (same extract-the-handler discipline
 // as nfs.WriteSpoolStatusJSON). Production values are the real functions.
 var mountNowDeps = struct {
-	isMounted  func(string) bool
-	mount      func(serverAddr, mountPoint string) error
-	serverAddr func() (addr string, running bool)
+	isMounted func(string) bool
+	mount     func(serverAddr, exportPath, mountPoint string) error
+	server    func() (addr, exportPath string, running bool)
 }{
-	isMounted: isMounted,
+	isMounted: currentOwnedNFSMount,
 	mount:     mountNFSWithPrompt,
-	serverAddr: func() (string, bool) {
+	server: func() (string, string, bool) {
 		globalMu.Lock()
 		srv := globalServer
 		globalMu.Unlock()
 		if srv == nil {
-			return "", false
+			return "", "", false
 		}
-		return srv.Addr(), true
+		return srv.Addr(), srv.ExportPath(), true
 	},
 }
 
 // handleMountNowHTTP re-runs the user-visible NFS mount (LB-2 "Mount
-// Now"). Loopback-only GET — the same mutation convention as
-// /spool-recover and /offline?on=…. Idempotent: when the volume is
+// Now"). POST with X-JM-Control. Idempotent: when the volume is
 // already mounted it reports success without touching anything.
 //
-//	GET /mount-now                   → mount the configured mount point
-//	GET /mount-now?path=/Volumes/x   → explicit override
+//	POST /mount-now                   → mount the configured mount point
+//	POST /mount-now?path=/Volumes/x   → must match configured mount point
 //
 // Responses:
 //
@@ -4481,6 +7869,9 @@ var mountNowDeps = struct {
 var mountNowInFlight atomic.Bool
 
 func handleMountNowHTTP(w http.ResponseWriter, r *http.Request) {
+	if !requireLocalControlMutation(w, r) {
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	if !mountNowInFlight.CompareAndSwap(false, true) {
 		w.WriteHeader(http.StatusConflict)
@@ -4489,19 +7880,37 @@ func handleMountNowHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	defer mountNowInFlight.Store(false)
 	globalMu.Lock()
+	flights := globalMountFlights
 	mp := r.URL.Query().Get("path")
+	configured := globalWantMountPoint
 	if mp == "" {
-		mp = globalWantMountPoint
+		mp = configured
 	}
 	if mp == "" {
 		mp = globalMountPath
 	}
 	globalMu.Unlock()
+	if mp != configured {
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprint(w, `{"ok":false,"error":"mount path differs from configured volume"}`)
+		return
+	}
+	if !flights.begin() {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		fmt.Fprint(w, `{"ok":false,"error":"NFS mount is stopping"}`)
+		return
+	}
+	defer flights.end()
 
-	addr, running := mountNowDeps.serverAddr()
+	addr, exportPath, running := mountNowDeps.server()
 	if !running {
 		w.WriteHeader(http.StatusServiceUnavailable)
 		fmt.Fprint(w, `{"ok":false,"error":"server not running"}`)
+		return
+	}
+	if !validNFSExportPath(exportPath) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		fmt.Fprint(w, `{"ok":false,"error":"server export path unavailable"}`)
 		return
 	}
 	if mp == "" {
@@ -4510,14 +7919,16 @@ func handleMountNowHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if mountNowDeps.isMounted(mp) {
+		recordAndConfirmNFSMount(mp)
 		fmt.Fprintf(w, `{"ok":true,"mount_point":%q,"already_mounted":true}`, mp)
 		return
 	}
 	jmlog.Info("mount-now: mounting", "mount_point", mp)
-	if err := mountNowDeps.mount(addr, mp); err != nil {
+	if err := mountNowDeps.mount(addr, exportPath, mp); err != nil {
 		// Lost a race with a concurrent mount (auto-remount, a second
 		// click): if the volume IS mounted now, that's still success.
 		if mountNowDeps.isMounted(mp) {
+			recordAndConfirmNFSMount(mp)
 			fmt.Fprintf(w, `{"ok":true,"mount_point":%q,"already_mounted":true}`, mp)
 			return
 		}
@@ -4526,9 +7937,7 @@ func handleMountNowHTTP(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, `{"ok":false,"mount_point":%q,"error":%q}`, mp, err.Error())
 		return
 	}
-	globalMu.Lock()
-	globalMountPath = mp
-	globalMu.Unlock()
+	recordAndConfirmNFSMount(mp)
 	jmlog.Info("mount-now: mounted", "mount_point", mp)
 	fmt.Fprintf(w, `{"ok":true,"mount_point":%q,"already_mounted":false}`, mp)
 }
@@ -4536,8 +7945,7 @@ func handleMountNowHTTP(w http.ResponseWriter, r *http.Request) {
 // stopInProgress gates the /stop handler's teardown goroutine.
 // Concurrent /stop POSTs within the 100 ms flush-grace would otherwise
 // each spawn their own teardown goroutine. stopServerLocked is already
-// serialized by globalMu (snapshot AND nil happen under one lock pair,
-// so the second goroutine sees nil and no-ops), but spawning an extra
+// serialized by globalLifecycleMu, but spawning an extra
 // goroutine just to nil-then-no-op is wasteful and pollutes the
 // goroutine count the iter-11 watchdog watches. CAS gates the spawn
 // at the handler level.
@@ -4546,6 +7954,7 @@ func handleMountNowHTTP(w http.ResponseWriter, r *http.Request) {
 // process-wide sync.Once would be permanently "spent" after the first
 // /stop and silently break subsequent /stops after a Start.
 var stopInProgress atomic.Bool
+var stopHTTPFlights sync.WaitGroup
 
 // handleStopHTTP triggers the soft-stop sequence (stopServerLocked).
 // Returns immediately with {"ok": true, "stopping": true} so the
@@ -4557,9 +7966,9 @@ var stopInProgress atomic.Bool
 // is localhost-only but HTTP convention is to use POST for state-
 // changing requests. GET callers get 405 with an Allow: POST header.
 //
-// Idempotent: stopOnce ensures only the first call triggers
-// stopServerLocked; subsequent calls still return ok:true,stopping:
-// true so callers can poll until the server actually stops responding.
+// The response acknowledges a stop request, not completed teardown. Only
+// one attempt runs at a time; if a drainer deadline leaves the metrics
+// listener alive, a later POST can retry after the blocked work finishes.
 //
 // Does NOT unmount FUSE/NFS — Stop/Start should not require admin
 // re-prompt. For a full teardown use /force-eject after /stop, or
@@ -4573,11 +7982,32 @@ var stopInProgress atomic.Bool
 // Hijack() the connection and write+close before sleeping — overkill
 // for v1; revisit if the wedge harness sees flaky empty-body results.
 func handleStopHTTP(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		w.Header().Set("Allow", "POST")
-		w.WriteHeader(http.StatusMethodNotAllowed)
+	if !requireLocalControlMutation(w, r) {
 		return
 	}
+	var stopRevision uint64
+	globalLifecycleMu.Lock()
+	admitted := stopInProgress.CompareAndSwap(false, true)
+	if admitted {
+		var err error
+		stopRevision, err = stopServingDesired()
+		if err != nil {
+			stopInProgress.Store(false)
+			globalLifecycleMu.Unlock()
+			http.Error(w, "desired stop unavailable", http.StatusServiceUnavailable)
+			return
+		}
+	} else if servingProcessMode.Load() {
+		servingDesiredMu.Lock()
+		state, err := readServingDesired()
+		servingDesiredMu.Unlock()
+		if err != nil || state.Desired != "stopped" {
+			globalLifecycleMu.Unlock()
+			http.Error(w, "desired stop unavailable", http.StatusServiceUnavailable)
+			return
+		}
+	}
+	globalLifecycleMu.Unlock()
 	w.Header().Set("Content-Type", "application/json")
 	fmt.Fprint(w, `{"ok":true,"stopping":true}`)
 	// Flush the response onto the socket before triggering teardown.
@@ -4585,19 +8015,32 @@ func handleStopHTTP(w http.ResponseWriter, r *http.Request) {
 		f.Flush()
 	}
 	jmlog.Info("handleStopHTTP: soft-stop requested via HTTP", "remote", r.RemoteAddr)
-	if stopInProgress.CompareAndSwap(false, true) {
+	if admitted {
+		stopHTTPFlights.Add(1)
 		go func() {
+			defer stopHTTPFlights.Done()
 			// Tiny grace so the kernel actually writes the queued bytes
 			// to the client before we yank the listener out from under
 			// it. See KNOWN LIMITATION in the doc comment.
 			time.Sleep(100 * time.Millisecond)
-			stopServerLocked()
+			globalLifecycleMu.Lock()
+			if !servingProcessMode.Load() || stoppedServingRevision(stopRevision) {
+				if !stopServerSerialized() {
+					stopInProgress.Store(false)
+				}
+			} else {
+				stopInProgress.Store(false)
+			}
+			globalLifecycleMu.Unlock()
 		}()
 	}
 }
 
 func handleReclaimHTTP(w http.ResponseWriter, r *http.Request) {
-	freed, snapshots, source, err := health.ReclaimPurgeableSpace("/", 0)
+	if !requireLocalControlMutation(w, r) {
+		return
+	}
+	freed, snapshots, source, err := health.ReclaimPurgeableSpace(health.ReclaimExplicitUserAction, "/", 0)
 	w.Header().Set("Content-Type", "application/json")
 	if err != nil {
 		w.WriteHeader(500)
@@ -4633,9 +8076,7 @@ var cacheClearInProgress atomic.Bool
 // everything else — defeating the pinned-for-offline contract until
 // the next user action.
 func handleCacheClearHTTP(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		w.Header().Set("Allow", "POST")
-		w.WriteHeader(http.StatusMethodNotAllowed)
+	if !requireLocalControlMutation(w, r) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -4649,13 +8090,37 @@ func handleCacheClearHTTP(w http.ResponseWriter, r *http.Request) {
 
 	keepPinned := r.URL.Query().Get("keep-pinned") == "true"
 
-	home, err := os.UserHomeDir()
+	privatePaths, isolated, err := appisolation.ResolvePaths()
 	if err != nil {
 		w.WriteHeader(500)
 		fmt.Fprintf(w, `{"ok":false,"error":%q}`, err.Error())
 		return
 	}
-	cacheBase := filepath.Join(home, ".juicefs", "cache")
+	cacheBase := privatePaths.CacheBase
+	if !isolated {
+		home, homeErr := os.UserHomeDir()
+		if homeErr != nil {
+			w.WriteHeader(500)
+			fmt.Fprintf(w, `{"ok":false,"error":%q}`, homeErr.Error())
+			return
+		}
+		cacheBase = filepath.Join(home, ".juicefs", "cache")
+	}
+	if isolated {
+		if err := filepath.WalkDir(cacheBase, func(_ string, entry os.DirEntry, walkErr error) error {
+			if walkErr != nil {
+				return walkErr
+			}
+			if entry.Type()&os.ModeSymlink != 0 {
+				return errors.New("private cache contains a symlink")
+			}
+			return nil
+		}); err != nil {
+			w.WriteHeader(500)
+			fmt.Fprintf(w, `{"ok":false,"error":%q}`, err.Error())
+			return
+		}
+	}
 
 	// Walk every UUID's chunks dir under cacheBase. There's usually one
 	// UUID per JuiceFS volume; supporting many is robust against future
@@ -4709,29 +8174,46 @@ func handleCacheClearHTTP(w http.ResponseWriter, r *http.Request) {
 		"keep_pinned", keepPinned,
 		"remote", r.RemoteAddr)
 
-	// Optionally re-trigger pin coverage verification so pinned content
-	// starts re-caching immediately. Fire-and-forget on the prefetcher
-	// since the actual re-download happens later in the worker loop
-	// (driven by PullPending). VerifyAndRepair itself just marks rows
-	// Pending; that part completes in milliseconds. We bound it at 30s
-	// as a safety belt and tie cancellation to globalPinCtx so it
-	// dies cleanly on server shutdown rather than orphaning the
-	// goroutine.
+	// Capture the owner once. Admission and the final store update are joined
+	// with that owner even if a new server generation is published later.
 	reverify := false
-	if keepPinned && globalPrefetcher != nil {
-		go func() {
-			pinCtx := globalPinCtx()
-			ctx, cancel := context.WithTimeout(pinCtx.(context.Context), 30*time.Second)
-			defer cancel()
-			if _, err := globalPrefetcher.VerifyAndRepair(ctx); err != nil {
-				jmlog.Warn("cache-clear keep-pinned: verify-pins failed", "error", err.Error())
-			}
-		}()
-		reverify = true
+	if keepPinned {
+		globalMu.Lock()
+		pf := globalPrefetcher
+		globalMu.Unlock()
+		reverify = schedulePinReverify(pf)
 	}
 
 	fmt.Fprintf(w, `{"ok":true,"files_removed":%d,"bytes_freed":%d,"bytes_freed_gb":%.2f,"keep_pinned":%t,"pin_reverify_triggered":%t}`,
 		filesRemoved, bytesFreed, float64(bytesFreed)/(1<<30), keepPinned, reverify)
+}
+
+// schedulePinReverify owns the captured prefetcher through its final store
+// update. The returned verdict describes admission, not eventual repair.
+func schedulePinReverify(pf *pin.Prefetcher) bool {
+	if pf == nil {
+		return false
+	}
+	return schedulePinReverifyWith(pf, func(ctx context.Context) error {
+		_, err := pf.VerifyAndRepair(ctx)
+		return err
+	})
+}
+
+func schedulePinReverifyWith(pf *pin.Prefetcher, verify func(context.Context) error) bool {
+	if pf == nil {
+		return false
+	}
+	return pf.TryGo(func() {
+		ctx, cancel := context.WithTimeout(pf.Context(), 30*time.Second)
+		defer cancel()
+		if ctx.Err() != nil {
+			return
+		}
+		if err := verify(ctx); err != nil {
+			jmlog.Warn("cache-clear keep-pinned: verify-pins failed", "error", err.Error())
+		}
+	})
 }
 
 func handleOfflineHTTP(w http.ResponseWriter, r *http.Request) {
@@ -4742,6 +8224,9 @@ func handleOfflineHTTP(w http.ResponseWriter, r *http.Request) {
 	// the data it needs to render auto-vs-user distinction and the
 	// human-readable reason without a second round trip.
 	if on := r.URL.Query().Get("on"); on != "" {
+		if !requireLocalControlMutation(w, r) {
+			return
+		}
 		var v C.int
 		if on == "on" || on == "true" || on == "1" {
 			v = 1
@@ -4835,6 +8320,48 @@ func connectRedisWithRetry(redisURL string, store *metadata.Store, maxAttempts i
 	return nil, fmt.Errorf("after %d attempts: %w", maxAttempts, lastErr)
 }
 
+type bootRedisConnectFunc func(string, *metadata.Store, int) (*metadata.RedisClient, error)
+type bootRedisDeferredFunc func(string, *metadata.Store) (*metadata.RedisClient, error)
+
+// redisClientForBoot enforces the serve-local-first boot decision. Once the
+// bounded reachability probe has classified a backend as unavailable or too
+// slow, or persisted user-offline intent is valid, startup must not repeat
+// network work through the connected Redis constructor. This policy is
+// independent of backendUp used by physical FUSE activation. A deferred client
+// has the same background recovery path but performs no constructor I/O while
+// the local mirror and control plane are published.
+//
+// For an online boot, preserve the established retry
+// budget. If those protocol-level attempts still fail, return a deferred client
+// plus the original connect error so the caller can explain the mode change.
+func redisClientForBoot(redisURL string, store *metadata.Store, backendUp, userOffline bool, maxAttempts int) (*metadata.RedisClient, error) {
+	return redisClientForBootWith(redisURL, store, backendUp, userOffline, maxAttempts,
+		connectRedisWithRetry, metadata.NewRedisClientDeferred)
+}
+
+func redisClientForBootWith(
+	redisURL string,
+	store *metadata.Store,
+	backendUp bool,
+	userOffline bool,
+	maxAttempts int,
+	connect bootRedisConnectFunc,
+	deferred bootRedisDeferredFunc,
+) (*metadata.RedisClient, error) {
+	if !backendUp || userOffline {
+		return deferred(redisURL, store)
+	}
+	rc, connectErr := connect(redisURL, store, maxAttempts)
+	if connectErr == nil {
+		return rc, nil
+	}
+	drc, deferredErr := deferred(redisURL, store)
+	if deferredErr != nil {
+		return nil, fmt.Errorf("connect failed: %v; deferred client: %w", connectErr, deferredErr)
+	}
+	return drc, connectErr
+}
+
 // ----------------------------------------------------------------------------
 // A2 — Post-mount self-test
 // ----------------------------------------------------------------------------
@@ -4851,7 +8378,7 @@ type SelfTestResult struct {
 	ElapsedMs int64   `json:"elapsed_ms"`
 	BytesRead int64   `json:"bytes_read"`
 	MBPerSec  float64 `json:"mb_per_sec"`
-	Status    string  `json:"status"` // "green" | "yellow" | "red" | "error"
+	Status    string  `json:"status"` // green|yellow|red|error|deferred|constrained
 	Hint      string  `json:"hint"`
 	RanAt     string  `json:"ran_at"` // RFC3339; empty until first run
 	Target    string  `json:"target"` // path that was read; "" on error
@@ -4882,19 +8409,35 @@ var (
 	selfTestLast SelfTestResult
 )
 
-// selfTestSize is the read size for the probe — 10 MB matches the planning
-// doc. Big enough to traverse multiple JuiceFS cache blocks and exercise
-// readahead; small enough that even a 50 MB/s "red" mount still finishes
-// in 0.2 s.
-const selfTestSize = 10 * 1024 * 1024
+const (
+	// LAN-sized probe: large enough to traverse multiple JuiceFS blocks and
+	// exercise sustained read throughput.
+	selfTestLANSize = 10 * 1024 * 1024
+	// Manual constrained-link probes must remain small enough not to monopolize
+	// the very connection they are measuring. Automatic probes are deferred
+	// entirely on these classes; these sizes apply only after an explicit POST.
+	selfTestSlowSize    = 2 * 1024 * 1024
+	selfTestMeteredSize = 512 * 1024
+)
 
-// runSelfTest performs one 10 MB read self-test against the live NFS mount.
-// Picks a target file from the SQLite metadata store if one exists that is
-// >= 10 MB, otherwise writes a temp file in the mount, reads it back, and
-// cleans up. The read happens via the user-visible mount path (i.e. the NFS
-// loopback mount), not the FUSE path — that's what the user's apps see, so
-// that's what we measure.
-// runSelfTest performs the 10 MiB read probe. Routes the read through the
+func selfTestSizeForClass(class netprofile.LinkClass) int64 {
+	switch class {
+	case netprofile.ClassMetered:
+		return selfTestMeteredSize
+	case netprofile.ClassSlow:
+		return selfTestSlowSize
+	default:
+		return selfTestLANSize
+	}
+}
+
+// runSelfTest performs an adaptive read probe when force is true. Automatic
+// startup calls always return a zero-I/O deferred result: the link classifier
+// is passive and may not have a sample ten seconds after launch, so using its
+// bootstrap class to authorize synthetic traffic would be unsafe on cellular.
+// Explicit runs pick a target file from the SQLite metadata store if one is
+// large enough, otherwise write a class-sized temp file, read it back, and
+// clean up. The probe routes the read through the
 // FUSE mount path (`~/.juicemount/fuse-internal/...`) rather than the NFS
 // loopback (`/Volumes/zpool/...`) to avoid an in-process deadlock:
 //
@@ -4910,7 +8453,7 @@ const selfTestSize = 10 * 1024 * 1024
 //
 // Also bounded with a wall-clock deadline so a slow FUSE / dead JuiceFS
 // daemon can't wedge the probe goroutine indefinitely.
-func runSelfTest() SelfTestResult {
+func runSelfTest(force bool) SelfTestResult {
 	globalMu.Lock()
 	mountPath := globalMountPath
 	fusePath := globalFUSEPath
@@ -4918,6 +8461,23 @@ func runSelfTest() SelfTestResult {
 	globalMu.Unlock()
 
 	now := time.Now().UTC().Format(time.RFC3339)
+	class := netprofile.Default().Class()
+	if !force {
+		return SelfTestResult{
+			Status: "deferred",
+			Hint: fmt.Sprintf(
+				"Automatic throughput probe deferred to protect navigation. Click rerun for a bounded %d KiB test (current link: %s).",
+				selfTestSizeForClass(class)/1024, class),
+			RanAt: now,
+		}
+	}
+	if testguard.RefuseFUSEContentReads() {
+		return SelfTestResult{
+			Status: "deferred",
+			Hint:   "Throughput probe disabled by the bounded cellular acceptance guard.",
+			RanAt:  now,
+		}
+	}
 	if fusePath == "" {
 		return SelfTestResult{
 			Status: "error",
@@ -4930,8 +8490,9 @@ func runSelfTest() SelfTestResult {
 	// FUSE read inside this window; if not, the mount is unhealthy and the
 	// probe correctly reports an error rather than hanging forever.
 	probeDeadline := time.Now().Add(30 * time.Second)
+	probeSize := selfTestSizeForClass(class)
 
-	target, cleanup, err := pickSelfTestTarget(store, mountPath, fusePath, probeDeadline)
+	target, cleanup, err := pickSelfTestTarget(store, mountPath, fusePath, probeSize, probeDeadline)
 	if err != nil {
 		return SelfTestResult{
 			Status: "error",
@@ -5006,7 +8567,7 @@ func runSelfTest() SelfTestResult {
 	// AND io.EOF in one call), don't re-enter the loop — it would
 	// spin returning (0, EOF) every iteration until probeDeadline,
 	// turning a tiny file into a 30s false-timeout.
-	for firstErr != io.EOF && total < selfTestSize {
+	for firstErr != io.EOF && total < probeSize {
 		if time.Now().After(probeDeadline) {
 			return SelfTestResult{
 				ElapsedMs:   time.Since(start).Milliseconds(),
@@ -5042,7 +8603,7 @@ func runSelfTest() SelfTestResult {
 	if elapsed > 0 {
 		mbps = (float64(total) / (1024 * 1024)) / elapsed.Seconds()
 	}
-	status, hint := classifySelfTest(mbps)
+	status, hint := classifySelfTestForClass(mbps, class)
 
 	// Write probe: exercise the user-facing write path (NFS → handler →
 	// FUSE → JuiceFS → MinIO/Redis). Failures here are the 2026-05-16
@@ -5073,11 +8634,14 @@ func runSelfTest() SelfTestResult {
 	}
 }
 
-// runWriteProbe creates a 4 KiB sentinel under the user-visible mount
-// path, writes random bytes, fsyncs, and deletes it. Each step is
-// individually bounded by the per-step budget; the whole probe is
-// bounded by overall to detect either a single step stalling or the
-// aggregate dragging on. Returns (ok, elapsed_ms, hint).
+// runWriteProbe creates a 4 KiB sentinel under the user-visible mount path,
+// writes it, fsyncs, and deletes it. The mutation runs in short-lived helper
+// processes rather than a Go goroutine: a macOS NFS open can park in the
+// kernel until macFUSE's daemon timeout, and an in-process timeout used to
+// strand an application goroutine/thread for that entire window. The helper
+// is killed at the wall-clock deadline and reaped whenever the kernel releases
+// it, leaving the app able to retry and self-heal. Returns
+// (ok, elapsed_ms, hint).
 //
 // We deliberately go through `mountPath` (the NFS-loopback path, e.g.
 // /Volumes/zpool-dev) rather than the FUSE-internal path, because the
@@ -5095,70 +8659,61 @@ func runWriteProbe(mountPath string, overallBudget time.Duration) (ok bool, elap
 	}
 	start := time.Now()
 	deadline := start.Add(overallBudget)
-	sentinelPath := filepath.Join(mountPath, ".juicemount-writetest.tmp")
-	const sentinelSize = 4096
+	// One stable hidden sentinel per process bounds residue even if permissions
+	// or an unhealthy mount make cleanup fail repeatedly. The process tracker
+	// never permits another helper while a timed-out one is still alive, so
+	// reusing this path cannot collide with an older kernel-blocked dd.
+	sentinelPath := filepath.Join(mountPath, fmt.Sprintf(
+		".juicemount-writetest.%d.tmp", os.Getpid()))
 
-	// Run the write probe in a goroutine so a stuck syscall (kernel NFS
-	// retry storm on a wedged mount, FUSE daemon hung) can be bounded
-	// without leaking the syscall on us — the goroutine continues until
-	// the kernel returns, but the probe returns to the caller.
-	type result struct {
-		ok   bool
-		hint string
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		return false, time.Since(start).Milliseconds(), "write probe budget expired before create"
 	}
-	resCh := make(chan result, 1)
-	go func() {
-		// 1. Create + write.
-		buf := make([]byte, sentinelSize)
-		for i := range buf {
-			buf[i] = byte(i)
+	// BSD and GNU dd both provide conv=fsync. Keeping create+write+fsync in one
+	// helper gives the whole operation one hard process deadline.
+	ddErr, ddReaped := globalNFSWriteProbeProcesses.runTracked(remaining, "/bin/dd",
+		"if=/dev/zero", "of="+sentinelPath, "bs=4096", "count=1", "conv=fsync")
+	if ddErr != nil {
+		// If dd timed out, cleanup waits for its actual Wait/reap transition; it
+		// can never race a still-kernel-blocked process or teardown. Rejected
+		// starts did not create anything and need no cleanup attempt.
+		if !errors.Is(ddErr, errNFSWriteProbeDisarmed) &&
+			!errors.Is(ddErr, errNFSWriteProbeHelperActive) {
+			cleanupNFSWriteSentinelAfterReap(sentinelPath, ddReaped)
 		}
-		f, err := os.OpenFile(sentinelPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
-		if err != nil {
-			resCh <- result{false, "create: " + err.Error()}
-			return
-		}
-		if _, err := f.Write(buf); err != nil {
-			_ = f.Close()
-			_ = os.Remove(sentinelPath)
-			resCh <- result{false, "write: " + err.Error()}
-			return
-		}
-		// 2. Fsync — verifies the bytes actually committed, not just
-		//    landed in client write cache. If the backend (MinIO or
-		//    Redis) is wedged, this is where it surfaces.
-		if err := f.Sync(); err != nil {
-			_ = f.Close()
-			_ = os.Remove(sentinelPath)
-			resCh <- result{false, "fsync: " + err.Error()}
-			return
-		}
-		if err := f.Close(); err != nil {
-			_ = os.Remove(sentinelPath)
-			resCh <- result{false, "close: " + err.Error()}
-			return
-		}
-		// 3. Delete — exercises a different path (REMOVE → handler →
-		//    metadata.Store.Delete + JuiceFS unlink + Redis prune).
-		if err := os.Remove(sentinelPath); err != nil {
-			resCh <- result{false, "remove: " + err.Error()}
-			return
-		}
-		resCh <- result{true, ""}
-	}()
+		return false, time.Since(start).Milliseconds(), "create/write/fsync: " + ddErr.Error()
+	}
 
-	select {
-	case r := <-resCh:
-		elapsedMs = time.Since(start).Milliseconds()
-		return r.ok, elapsedMs, r.hint
-	case <-time.After(time.Until(deadline)):
-		// Probe goroutine leaked — it'll finish whenever the kernel
-		// returns. Acceptable cost.
-		return false, overallBudget.Milliseconds(), "write probe exceeded " + overallBudget.String() + " budget"
+	remaining = time.Until(deadline)
+	if remaining <= 0 {
+		cleanupNFSWriteSentinelAfterReap(sentinelPath, ddReaped)
+		return false, time.Since(start).Milliseconds(), "write probe exceeded " + overallBudget.String() + " budget before remove"
 	}
+	// Delete exercises a different path (REMOVE → handler → metadata.Store.Delete
+	// + JuiceFS unlink + Redis prune) and shares the same overall deadline.
+	if err := globalNFSWriteProbeProcesses.run(remaining, "/bin/rm", sentinelPath); err != nil {
+		return false, time.Since(start).Milliseconds(), "remove: " + err.Error()
+	}
+	return true, time.Since(start).Milliseconds(), ""
 }
 
-// pickSelfTestTarget finds a file >= selfTestSize via the metadata store. If
+// cleanupNFSWriteSentinelAfterReap is deliberately asynchronous only with
+// respect to the owning verifier, never with respect to the child process. It
+// waits until dd is fully reaped, then submits rm through the same tracked,
+// shutdown-aware single-helper gate. If teardown has begun, rm is rejected and
+// the stable per-process sentinel bounds residue to one tiny file.
+func cleanupNFSWriteSentinelAfterReap(sentinelPath string, reaped <-chan struct{}) {
+	go func() {
+		<-reaped
+		if !globalNFSWriteVerifyArmed.Load() {
+			return
+		}
+		_ = globalNFSWriteProbeProcesses.run(2*time.Second, "/bin/rm", sentinelPath)
+	}()
+}
+
+// pickSelfTestTarget finds a file at least probeSize bytes long via the metadata store. If
 // none exists yet (fresh mount, empty bucket), it writes a temp file in the
 // mount and returns a cleanup callback that removes it.
 //
@@ -5171,17 +8726,18 @@ func runWriteProbe(mountPath string, overallBudget time.Duration) (ok bool, elap
 // per-mount probe logic. `deadline` bounds the BFS by wall-clock so a
 // concurrent BulkInsert (holding writeMu, blocking ListChildren) can't
 // wedge the probe.
-func pickSelfTestTarget(store *metadata.Store, mountPath, fusePath string, deadline time.Time) (string, func(), error) {
+func pickSelfTestTarget(store *metadata.Store, mountPath, fusePath string, probeSize int64, deadline time.Time) (string, func(), error) {
 	_ = mountPath // intentionally unused
 	if store != nil {
-		if p := largeFileFromStore(store, fusePath, selfTestSize, deadline); p != "" {
+		if p := largeFileFromStore(store, fusePath, probeSize, deadline); p != "" {
 			return p, nil, nil
 		}
 	}
-	// Fallback: create a 10 MB temp file via the FUSE path. Hidden name so
-	// a crashed run doesn't pollute Finder listings.
+	// Fallback: create a class-sized temp file via the FUSE path. This path is
+	// unreachable for every automatic probe (they defer above), so an upload
+	// occurs only after an explicit user rerun.
 	tmpPath := filepath.Join(fusePath, ".juicemount-selftest.tmp")
-	if err := writeRandomFile(tmpPath, selfTestSize); err != nil {
+	if err := writeRandomFile(tmpPath, probeSize); err != nil {
 		return "", nil, fmt.Errorf("write probe file: %w", err)
 	}
 	cleanup := func() { _ = os.Remove(tmpPath) }
@@ -5274,10 +8830,18 @@ func classifySelfTest(mbps float64) (status, hint string) {
 	}
 }
 
+func classifySelfTestForClass(mbps float64, class netprofile.LinkClass) (status, hint string) {
+	if class <= netprofile.ClassSlow {
+		return "constrained", fmt.Sprintf(
+			"Constrained-link probe: %.2f MB/s. Cellular/WAN navigation safeguards are active.", mbps)
+	}
+	return classifySelfTest(mbps)
+}
+
 // runAndStoreSelfTest is the thread-safe wrapper that updates the cached
 // result for the /self-test endpoint.
-func runAndStoreSelfTest() SelfTestResult {
-	r := runSelfTest()
+func runAndStoreSelfTest(force bool) SelfTestResult {
+	r := runSelfTest(force)
 	selfTestMu.Lock()
 	selfTestLast = r
 	selfTestMu.Unlock()
@@ -5294,14 +8858,23 @@ func runAndStoreSelfTest() SelfTestResult {
 // GET is intentionally non-blocking: if no run has happened yet, return a
 // "pending" placeholder rather than running synchronously. Synchronous runs
 // inside HTTP handlers serialize with other operations on the localhost NFS
-// mount and make the entire mount appear unresponsive while the 10 MB read
-// is in flight. POST still runs synchronously — the user explicitly asked
-// for a rerun by POSTing.
+// mount and make the entire mount appear unresponsive while a read is in
+// flight. POST still runs synchronously with a class-sized bound — the user
+// explicitly asked for a rerun by POSTing.
 func handleSelfTestHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodPost {
+		if !requireLocalControlMutation(w, r) {
+			return
+		}
+	} else if r.Method != http.MethodGet {
+		w.Header().Set("Allow", "GET, POST")
+		http.Error(w, "GET or POST only", http.StatusMethodNotAllowed)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	var out SelfTestResult
 	if r.Method == http.MethodPost {
-		out = runAndStoreSelfTest()
+		out = runAndStoreSelfTest(true)
 	} else {
 		selfTestMu.Lock()
 		out = selfTestLast
@@ -5315,5 +8888,3 @@ func handleSelfTestHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = json.NewEncoder(w).Encode(out)
 }
-
-func main() {} // required for c-archive build

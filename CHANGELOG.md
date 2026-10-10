@@ -1,4 +1,95 @@
-# JuiceMount6 Changelog
+# JuiceMount Changelog
+
+## 0.5.0 — general release (build 37)
+
+Update checks remain manual through **Check for Updates…** in the app.
+Bounded packaged Finder copy and directory checks passed, along with focused
+offline write and recovery checks. Full Finder, offline, Link, two-Mac, and
+consumer acceptance remains open. See the [0.5 release notes](docs/release-0.5.md)
+for installation and limits.
+
+### App and Link
+
+- The write spool is on by default, persists an explicit opt-out, protects
+  acknowledged writes with local durability and SHA-256-verified drain, and
+  exposes recovery controls for stalled or failed uploads.
+- A late Finder continuation write now atomically reopens the same unclaimed
+  spool image instead of waiting behind the drain queue and surfacing repeated
+  retry errors. Rows already claimed by the drainer or partially streamed stay
+  on the corruption-safe defer path.
+- A verified bounded Finder-metadata image is retained across spool drain so an
+  already-drained `._` sidecar or `.DS_Store` can be rewritten safely after an
+  offline transition; ordinary partial file edits still fail closed.
+- Large Finder directories keep each AppleDouble sidecar beside its principal
+  at the final NFS protocol ordering layer with a linear merge, eliminating the
+  redundant lookup storm and second full sort seen with 5,000-file folders.
+  Bounded metadata mutations no longer share navigation's RPC admission pool,
+  so a burst of slow sidecar removes cannot block READDIR/GETATTR. Late metadata
+  updates on an already-unlinked sidecar retain handle semantics without
+  resurrecting the deleted name or returning a stale-handle error. A directory
+  removed while macOS still holds its NFS handle now does the same for late
+  metadata requests, preventing a successful Finder tree deletion from ending
+  in a stale-handle warning. Renames of new spool-only files no longer issue a
+  remote FUSE rename solely to discover that the source is absent. The NFS
+  response writer also flushes continuously refilled Finder traffic in bounded
+  batches, preventing a ready navigation reply from waiting indefinitely for
+  the response queue to become empty.
+- JuiceMount Link includes persistent pairing authorization and fail-closed
+  route checks. Its full route, reconnect, and revoke workflow still needs
+  acceptance.
+- Update checks are manual-only. JuiceMount makes no background Sparkle network
+  request; choosing **Check for Updates…** starts the signed updater and contacts
+  the documented GitHub appcast.
+
+### JuiceFarm and Manager
+
+- Automatic recursive discovery has a durable catch-up cursor, bounded server
+  planning shards, renewable processing claims, GPU admission controls,
+  HEVC-first proxy routing, explicit hardware H.264 and CPU H.264 fallback, and
+  per-file incompatible-source isolation.
+- Durable proxy commit receipts and codec-agnostic automatic freshness prevent
+  retries or a returning HEVC worker from replacing valid proxies and amplifying
+  JuiceFS trash. Storage permits and an atomic safety pause stop new render
+  claims below physical-pool headroom.
+- Proxy and Quick Look MP4 muxing now completes on node-local scratch before a
+  single sequential publish into JuiceFS. This prevents FFmpeg append/seek and
+  `+faststart` rewrites from creating tens of gigabytes of retained object slices
+  for only a few gigabytes of visible output.
+- Embedded audio cover artwork is excluded from motion-video classification, so
+  audio-only assets cannot be routed into the MP4 proxy encoder.
+- Farm mission control now shows every queue lane and each node's current
+  `{job, kind, path, stage, percent}`; supports per-node pause, drain, resume and
+  verified restart; returns a bounded 200-line runtime log; cooperatively
+  cancels queued/running work; and requeues a failed job exactly once from its
+  stored immutable payload while preserving the original terminal record.
+- The TrueNAS release compose requires digest-pinned first-party artifacts, the
+  existing Manager and MinIO credentials, and exact physical zpool capacity at
+  render time. Installation guidance explicitly excludes the MinIO object
+  dataset from recursive ZFS snapshots.
+
+The actual GPU worker and deployed derivative queue recovery remain under
+test; the consumer pin workflow is also unfinished.
+
+### Release integrity
+
+- Go dependency and reachable-vulnerability gates include the `go-billy` path.
+  Linux CI runs Redis-backed Farm durability tests; macOS CI builds and verifies
+  a signed-equivalent app and rejects stale source identity.
+- The Finder release battery scales drain deadlines by both bytes and object
+  count and avoids `pipefail`/early-exit false negatives when reading live
+  offline and keyspace-push status. Its directory and Stat latency probes now
+  start their clocks inside the process performing the syscall, so process
+  launch scheduling under a hot copy cannot masquerade as filesystem latency.
+- Container builds embed and execute exact version/commit identity, publish SBOM
+  and provenance, and production deployment references accepted manifest
+  digests rather than mutable tags. Distribution Mac builds fail closed unless
+  Developer ID signing, notarization, stapling, Sparkle signing, and a matching
+  appcast all succeed.
+
+### Explicitly gated from 0.5
+
+- The incomplete Teams/seats authorization surface remains fully feature-gated.
+  Camera catalog and public website work are outside this release.
 
 ## 0.4.0 — 2026-07-15 — Resilience & recovery, faster navigation on slow links
 

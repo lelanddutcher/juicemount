@@ -166,3 +166,77 @@ diagnostics consistent.
   across several SHAs, wire `12-perf-regression.sh` into a pre-merge
   CI gate. The numbers stop drifting only when they're checked
   automatically.
+
+## Reproducible acceptance runs
+
+Assign one build owner per checkout and one owner for mount and UI operations.
+Other contributors review source while that owner executes the gate. Resolve
+the checkout once to an absolute path; record the build, test-list and execution
+directories with the exact commands. Build Go tests at the repository root and
+run compiled binaries from their package directory unless the test explicitly
+supports arbitrary working directories. Source assertions must use the bytes
+from the test build, not whichever checkout happens to be the current directory.
+
+Freeze the complete input manifest, including uncommitted and untracked source,
+before building. Retain binary digests and compare the input manifest again
+after execution, including added and removed files. Reconcile declared test
+names against executed results; report skips and missing cases explicitly.
+A dirty-tree result qualifies those exact bytes, not the commit alone. Integrate
+reviewed changes with their dependencies using explicit paths before claiming
+a reproducible release candidate; keep private notes and generated output out
+of source commits.
+
+For held-SQL tests, disable deferred FTS and stop and join background cleanup
+before reserving the sole connection and taking the wait-counter baseline.
+Start only the target operation before observing that counter: `WaitCount`
+cannot identify which caller is waiting. Require cached navigation to finish
+while the target remains blocked, then verify its result after release.
+Preserve a failed run and classify its cause independently before changing
+source or retrying. A corrected run gets a new receipt; it never erases the
+original failure or supplies missing cases to an earlier run.
+
+## Isolated macOS kernel navigation under a held read
+
+`scripts/test-kernel-navigation-latency.py` exercises the macOS NFS client
+against a dedicated local handler and disk metadata store. It creates its own
+private evidence directory, nonce export, ephemeral loopback listener and
+read-only mount. It does not require the application, NAS or Redis. Run from
+the repository with an absolute, fresh evidence path whose parent exists.
+Keep mounted fixtures outside open workspaces: background scans can populate
+kernel directory caches and contaminate the measured RPC windows.
+
+```sh
+python3 scripts/test-kernel-navigation-latency.py "$HOME/jm-kernel-control" --control-only
+python3 scripts/test-kernel-navigation-latency.py "$HOME/jm-kernel-mounted" \
+  --binary "$HOME/jm-kernel-control/kernel-fixture.test"
+```
+
+The first command builds the Darwin `latency_acceptance` fixture and checks
+nonce rejection, watchdog release and complete shutdown without mounting.
+`CONTROL_ONLY_PASS` is lifecycle evidence only. Binary reuse requires the
+recorded digest and all Go/module input hashes to match. The mounted run needs
+noninteractive permission for `/sbin/mount_nfs` and `/sbin/umount` through sudo.
+It retains the exact commands and options, including `deadtimeout=0` to disable
+Darwin's automatic forced-unmount timeout for soft read-only mounts.
+
+Each mounted phase measures 12 probes: four attribute checks, four fresh-name
+lookups, and four complete 100-child directory enumerations, with known sizes,
+types and exact seeded per-path inodes. During the second phase a real backend `ReadAt`
+must remain held until every probe completes. Successful GETATTR, LOOKUP and
+READDIRPLUS RPC counters must all advance during that window. The empirical
+p99 must be at most 100 ms and the maximum at most 250 ms; with 12 samples,
+p99 is the sample maximum. The slow read must return its exact bytes after
+release. The receipt records individual timings and connection counts.
+
+Cleanup releases the read, joins probe processes, verifies the recorded mount
+tuple, normally unmounts, confirms disappearance, then stops the server and
+closes metadata. It never force-unmounts or deletes fixture data. `INCOMPLETE`
+retains the serving process and recovery details in `state.json` and
+`receipt.json`; inspect that state before taking further action. A full-tuple
+check followed by pathname unmount has a check/action race and does not prove
+production recovery can atomically detach an exact mount instance.
+
+This gate proves one kernel path under a held backend read. Finder UI,
+packaged lifecycle, real WAN throughput, supported-OS coverage and production
+write/recovery safety require their separate acceptance gates. It does not
+replace the same-connection READ-saturation or held-SQL protocol tests.

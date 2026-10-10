@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"io"
+	"math"
 	"os"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/willscott/go-nfs-client/nfs/xdr"
@@ -97,6 +99,15 @@ func offlineReadRefusal(offset uint64, w *response, err error) *NFSStatusError {
 }
 
 func onRead(ctx context.Context, w *response, userHandle Handler) error {
+	if nfsTrace {
+		return onReadWithOpenTrace(ctx, w, userHandle, true, Log.Infof)
+	}
+	return onReadWithOpenTrace(ctx, w, userHandle, false, nil)
+}
+
+// onReadWithOpenTrace keeps the optional READ-open diagnostic per call. Tests
+// inject a sink without changing the process-wide trace flag or logger.
+func onReadWithOpenTrace(ctx context.Context, w *response, userHandle Handler, traceOpen bool, logf func(string, ...interface{})) error {
 	w.errorFmt = opAttrErrorFormatter
 	var obj nfsReadArgs
 	err := xdr.Read(w.req.Body, &obj)
@@ -108,7 +119,20 @@ func onRead(ctx context.Context, w *response, userHandle Handler) error {
 		return &NFSStatusError{NFSStatusStale, err}
 	}
 
-	fh, err := fs.Open(fs.Join(path...))
+	name := fs.Join(path...)
+	var openStart time.Time
+	if traceOpen {
+		openStart = time.Now()
+	}
+	fh, err := fs.Open(name)
+	if traceOpen {
+		result := "ok"
+		if err != nil {
+			result = "error"
+		}
+		logf("TRACE read open xid=%d path=%q offset=%d count=%d elapsed_ms=%d result=%s err=%v",
+			w.req.xid, name, obj.Offset, obj.Count, time.Since(openStart).Milliseconds(), result, err)
+	}
 	if err != nil {
 		if os.IsNotExist(err) {
 			return &NFSStatusError{NFSStatusNoEnt, err}
@@ -120,11 +144,59 @@ func onRead(ctx context.Context, w *response, userHandle Handler) error {
 		if pin.IsOfflineNotAvailable(err) {
 			return offlineReadRefusal(obj.Offset, w, err)
 		}
-		return &NFSStatusError{NFSStatusAccess, err}
+		return readTransientStatusError(w, err)
 	}
 	defer fh.Close()
+	var checkReadAdmission func() error
+	if provider, ok := fh.(readAdmissionProvider); ok {
+		check, release, err := provider.BeginReadAdmission()
+		if err != nil {
+			return readTransientStatusError(w, err)
+		}
+		if release != nil {
+			defer release()
+		}
+		checkReadAdmission = check
+	}
 
 	resp := nfsReadResponse{}
+	// A qualified resident range can establish the local snapshot boundary
+	// before the wide-read size clamp asks the backing descriptor for its size.
+	// Preparation is all-or-nothing; a miss preserves the ordinary fallback.
+	var prepared *ResidentRead
+	if provider, ok := fh.(residentReadPreparer); ok && obj.Count > 0 && obj.Offset <= math.MaxInt64 {
+		prepared, err = provider.PrepareResidentRead(obj.Offset, obj.Count)
+		if err != nil {
+			return readAdmissionStatusError(w, err)
+		}
+		if prepared != nil {
+			limit := uint64(obj.Count)
+			if limit > MaxRead {
+				limit = MaxRead
+			}
+			if prepared.Size < 0 || prepared.Check == nil || uint64(len(prepared.Data)) > limit ||
+				(obj.Offset >= uint64(prepared.Size) && len(prepared.Data) != 0) ||
+				(obj.Offset < uint64(prepared.Size) &&
+					(len(prepared.Data) == 0 || uint64(len(prepared.Data)) != uint64(prepared.Size)-obj.Offset)) {
+				return &NFSStatusError{NFSStatusIO, syscall.EIO}
+			}
+		}
+	}
+	// A complete body is terminal evidence even for a small or zero-count
+	// request. CachedInfo and fs.Stat may instead describe a stale mirror or
+	// an active spool's high-water, so keep their allocation size separate.
+	var terminalSize int64
+	var haveTerminal bool
+	if cached, ok := fh.(completeCachedSizer); ok {
+		terminalSize, haveTerminal, err = cached.CompleteCachedSize()
+		if err != nil {
+			return readAdmissionStatusError(w, err)
+		}
+	}
+	if prepared != nil {
+		terminalSize, haveTerminal = prepared.Size, true
+		obj.Count = uint32(len(prepared.Data))
+	}
 
 	// QA-31 (2026-05-25): fast-path the size-clamp via the handle's cached
 	// info when available. The legacy fs.Stat path went through JM's
@@ -133,10 +205,8 @@ func onRead(ctx context.Context, w *response, userHandle Handler) error {
 	// throughput on cached files. Cached size is a snapshot from Open
 	// time; a stale HIGH-or-equal value only causes a benign short read
 	// (clients reissue). A stale ZERO is NOT benign — see the size>0 guard.
-	if obj.Count > CheckRead {
-		var size int64
-		var haveSize bool
-		reqEnd := int64(obj.Offset) + int64(obj.Count)
+	if prepared == nil && obj.Count > CheckRead {
+		size, haveSize := terminalSize, haveTerminal
 		if cp, ok := fh.(CachedInfoProvider); ok {
 			// Trust the open-time snapshot ONLY when it fully satisfies this
 			// request (cs >= end-of-request) — then it cannot truncate, and the
@@ -147,10 +217,24 @@ func onRead(ctx context.Context, w *response, userHandle Handler) error {
 			// SILENTLY truncate the read. A stale-HIGH snapshot is fine — a benign
 			// short read, the client reissues.
 			if info := cp.CachedInfo(); info != nil {
-				if cs := info.Size(); cs > 0 && cs >= reqEnd {
+				if cs := info.Size(); !haveSize && cs > 0 && obj.Offset <= uint64(cs) && uint64(cs)-obj.Offset >= uint64(obj.Count) {
 					size = cs
 					haveSize = true
 				}
+			}
+		}
+		if !haveSize {
+			if actual, ok := fh.(authoritativeSizer); ok {
+				var err error
+				size, err = actual.AuthoritativeSize()
+				if err != nil {
+					if pin.IsOfflineNotAvailable(err) {
+						return offlineReadRefusal(obj.Offset, w, err)
+					}
+					return readTransientStatusError(w, err)
+				}
+				haveSize = true
+				terminalSize, haveTerminal = size, true
 			}
 		}
 		if !haveSize {
@@ -160,9 +244,10 @@ func onRead(ctx context.Context, w *response, userHandle Handler) error {
 			// reached on the short-snapshot slow path, so steady-state cached reads
 			// keep the QA-31 fast path. Bounded against a FUSE wedge inside LiveSize.
 			if ls, ok := fh.(liveSizer); ok {
-				if lv, ok2 := ls.LiveSize(); ok2 && lv > 0 {
+				if lv, ok2 := ls.LiveSize(); ok2 && lv >= 0 {
 					size = lv
 					haveSize = true
+					terminalSize, haveTerminal = lv, true
 				}
 			}
 		}
@@ -172,7 +257,7 @@ func onRead(ctx context.Context, w *response, userHandle Handler) error {
 				if pin.IsOfflineNotAvailable(err) {
 					return offlineReadRefusal(obj.Offset, w, err)
 				}
-				return &NFSStatusError{NFSStatusAccess, err}
+				return readTransientStatusError(w, err)
 			}
 			size = info.Size()
 		}
@@ -182,7 +267,7 @@ func onRead(ctx context.Context, w *response, userHandle Handler) error {
 		// MaxRead and wastes a 16 MiB allocation per such RPC. RFC 1813
 		// §3.3.6: server should return zero-length result when reading
 		// at or past EOF.
-		if int64(obj.Offset) >= size {
+		if size >= 0 && obj.Offset >= uint64(size) {
 			// EOF-at-or-past-end. Post-#85 `size` is the spool's WRITTEN high-water
 			// (writtenEnd), DECOUPLED from the contiguous readable prefix. So a
 			// not-yet-filled in-flight hole (off in [cend,wend), writer active) has
@@ -193,14 +278,27 @@ func onRead(ctx context.Context, w *response, userHandle Handler) error {
 			// still-arriving file IncompleteAt returns false there (off>=wend), so
 			// it no longer fires for spool holes — kept lest a future size source
 			// regress `size` back to the contiguous prefix (task #65).
-			if ir, ok := fh.(incompleteReader); ok && ir.IncompleteAt(int64(obj.Offset)) {
+			if ir, ok := fh.(incompleteReader); ok && obj.Offset <= math.MaxInt64 && ir.IncompleteAt(int64(obj.Offset)) {
 				recordJukebox(inflightOpName(w.req))
 				return &NFSStatusError{NFSStatusJukebox, pin.ErrSpoolIncomplete}
 			}
-			obj.Count = 0
-		} else if size-int64(obj.Offset) < int64(obj.Count) {
+			// A fallback Stat may be a stale SQL mirror. It cannot suppress
+			// a positive read: ReadAt must establish EOF or return actual bytes.
+			// Otherwise an exact-end client can loop on zero bytes with EOF=0.
+			if haveSize {
+				obj.Count = 0
+			}
+		} else if haveSize && size >= 0 && obj.Offset <= math.MaxInt64 && size-int64(obj.Offset) < int64(obj.Count) {
 			obj.Count = uint32(size - int64(obj.Offset))
 		}
+	}
+	// The NFS offset is unsigned; a trusted at/past-end request must not
+	// wrap into a negative ReaderAt offset, including small/zero-count reads.
+	if haveTerminal && terminalSize >= 0 && obj.Offset >= uint64(terminalSize) {
+		obj.Count = 0
+	}
+	if obj.Count > 0 && obj.Offset > math.MaxInt64 {
+		return &NFSStatusError{NFSStatusInval, os.ErrInvalid}
 	}
 	if obj.Count > MaxRead {
 		obj.Count = MaxRead
@@ -238,6 +336,10 @@ func onRead(ctx context.Context, w *response, userHandle Handler) error {
 	//     resp.EOF stays 0 so the client knows more bytes remain.
 	cnt := 0
 	want := int(obj.Count)
+	if prepared != nil {
+		copy(resp.Data, prepared.Data)
+		cnt = want
+	}
 	start := time.Now()
 	var ioErr error
 	hitEOF := false
@@ -294,19 +396,38 @@ func onRead(ctx context.Context, w *response, userHandle Handler) error {
 		if pin.IsSpoolDrained(ioErr) {
 			return &NFSStatusError{NFSStatusNoEnt, ioErr}
 		}
+		if errors.Is(ioErr, syscall.EAGAIN) {
+			return readAdmissionStatusError(w, ioErr)
+		}
 		return &NFSStatusError{NFSStatusIO, ioErr}
 	}
 	resp.Count = uint32(cnt)
 	resp.Data = resp.Data[:resp.Count]
+	// A cold complete-body read can establish a proof during ReadAt. Recheck
+	// an existing proof as well: a mutation must refuse the response, never
+	// combine bytes from one identity with the terminal size of its successor.
+	if cached, ok := fh.(completeCachedSizer); ok && prepared == nil {
+		size, available, err := cached.CompleteCachedSize()
+		if err != nil {
+			return readAdmissionStatusError(w, err)
+		}
+		if available {
+			terminalSize, haveTerminal = size, true
+		}
+	}
+	if haveTerminal && terminalSize >= 0 {
+		end := uint64(terminalSize)
+		reached := obj.Offset >= end || uint64(cnt) >= end-obj.Offset
+		if hitEOF && !reached && cnt == 0 {
+			return readAdmissionStatusError(w, pin.ErrSpoolIncomplete)
+		}
+		// A premature backend EOF must not truncate a body whose verified
+		// boundary is farther away. Keep valid partial bytes; retry a zero read.
+		hitEOF = reached
+	}
 	if hitEOF {
 		resp.EOF = 1
 	}
-	if cnt > 0 {
-		// [JM6] Mark data-transfer activity so the keep-awake assertion
-		// holds during a read-back copy. Metadata RPCs never reach here.
-		dataXferCount.Add(1)
-	}
-
 	// [JM5] Use pooled response buffer instead of allocating.
 	writer := getResponseBuffer()
 	if err := xdr.Write(writer, uint32(NFSStatusOk)); err != nil {
@@ -330,6 +451,20 @@ func onRead(ctx context.Context, w *response, userHandle Handler) error {
 		putResponseBuffer(writer)
 		return &NFSStatusError{NFSStatusServerFault, err}
 	}
+	if checkReadAdmission != nil {
+		if err := checkReadAdmission(); err != nil {
+			clear(resp.Data)
+			putResponseBuffer(writer)
+			return readAdmissionStatusError(w, err)
+		}
+	}
+	if prepared != nil && prepared.Check != nil {
+		if err := prepared.Check(); err != nil {
+			clear(resp.Data)
+			putResponseBuffer(writer)
+			return readAdmissionStatusError(w, err)
+		}
+	}
 
 	bodyBytes := writer.Bytes()
 	writeErr := w.Write(bodyBytes)
@@ -337,5 +472,28 @@ func onRead(ctx context.Context, w *response, userHandle Handler) error {
 	if writeErr != nil {
 		return &NFSStatusError{NFSStatusServerFault, writeErr}
 	}
+	if cnt > 0 {
+		dataXferCount.Add(1)
+	}
 	return nil
+}
+
+// A complete-cache proof may be revoked before sizing or after the body has
+// been read. Both boundaries need the same retry semantics as a held subread.
+func readAdmissionStatusError(w *response, err error) error {
+	if pin.IsSpoolIncomplete(err) {
+		recordJukebox(inflightOpName(w.req))
+		return &NFSStatusError{NFSStatusJukebox, err}
+	}
+	return readTransientStatusError(w, err)
+}
+
+// A metadata timeout is retryable for READ alone. Other procedures retain the
+// generic errno conversion, and non-transient READ errors keep their status.
+func readTransientStatusError(w *response, err error) error {
+	if errors.Is(err, syscall.EAGAIN) {
+		recordJukebox(inflightOpName(w.req))
+		return &NFSStatusError{NFSStatusJukebox, err}
+	}
+	return nfsStatusErrorFrom(err)
 }

@@ -186,21 +186,12 @@ func newSymlinkSpoolTestFS(t *testing.T) (*juiceFS, string, *SpoolStore, *Draine
 		t.Fatalf("metadata.Open: %v", err)
 	}
 
-	// Spool with its own SQLite DB (entries store and spool are independent in
-	// the handler; only the production binary co-locates them in one file).
-	dbPath := filepath.Join(t.TempDir(), "spool.db")
-	db, err := sql.Open("sqlite", dbPath)
-	if err != nil {
-		t.Fatalf("open spool db: %v", err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
-	if _, err := db.Exec(`PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;`); err != nil {
-		t.Fatalf("pragma: %v", err)
-	}
-	if err := metadata.InitSpoolSchema(db); err != nil {
+	// Match production ownership: the mirror and spool share one SQLite
+	// connection pool so completion metadata can commit atomically.
+	if err := metadata.InitSpoolSchema(store.DB()); err != nil {
 		t.Fatalf("init spool schema: %v", err)
 	}
-	meta := metadata.NewSpoolStore(db)
+	meta := metadata.NewSpoolStore(store.DB())
 	spool, err := NewSpoolStore(t.TempDir(), 0, meta)
 	if err != nil {
 		t.Fatalf("new spool store: %v", err)

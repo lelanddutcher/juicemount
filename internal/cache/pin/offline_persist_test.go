@@ -2,9 +2,68 @@ package pin
 
 import (
 	"os"
+	"os/user"
 	"path/filepath"
 	"testing"
+
+	"github.com/lelanddutcher/juicemount/internal/appisolation"
 )
+
+func TestIsolatedOfflineIntentPrivateAndLinkRefusal(t *testing.T) {
+	account, err := user.Current()
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := filepath.Join(account.HomeDir, "Developer", ".state")
+	if st, err := os.Stat(base); err != nil || !st.IsDir() {
+		t.Skip("private fixture base unavailable")
+	}
+	root, err := os.MkdirTemp(base, "jm-offline-i-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	if err := os.Mkdir(filepath.Join(root, "tmp"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, appisolation.Marker), []byte("JuiceMount isolated state v1\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("JM_APP_ISOLATION", "1")
+	t.Setenv("JM_APP_ISOLATION_ROOT", root)
+	t.Setenv("TMPDIR", filepath.Join(root, "tmp"))
+	marker := filepath.Join(root, ".juicemount", "offline-intent")
+	outside := filepath.Join(root, "outside-sentinel")
+	if err := os.WriteFile(outside, []byte("keep"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	SetOfflinePersistPath(marker)
+	t.Cleanup(func() { SetOffline(false); SetOfflinePersistPath("") })
+	SetOffline(true)
+	if !PersistedOfflineIntent() {
+		t.Fatal("private offline marker not persisted")
+	}
+	if st, err := os.Lstat(marker); err != nil || !st.Mode().IsRegular() || st.Mode().Perm() != 0600 {
+		t.Fatalf("private marker type/mode: %v, %v", st, err)
+	}
+	SetOffline(false)
+	if _, err := os.Lstat(marker); !os.IsNotExist(err) {
+		t.Fatalf("private marker survived toggle off: %v", err)
+	}
+	if err := os.Symlink(outside, marker); err != nil {
+		t.Fatal(err)
+	}
+	SetOffline(true)
+	if PersistedOfflineIntent() {
+		t.Fatal("linked offline marker accepted")
+	}
+	if st, err := os.Lstat(marker); err != nil || st.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("linked marker was followed or replaced: %v, %v", st, err)
+	}
+	if got, err := os.ReadFile(outside); err != nil || string(got) != "keep" {
+		t.Fatalf("outside sentinel changed: %q, %v", got, err)
+	}
+}
 
 // V2.3 U3: user-intent offline must persist across launches via the marker
 // file — toggle-on writes it, toggle-off removes it, boot reads it. The
@@ -31,6 +90,36 @@ func TestOfflineIntentPersistence(t *testing.T) {
 	SetOffline(false)
 	if PersistedOfflineIntent() {
 		t.Fatal("toggle-off must remove the intent marker")
+	}
+}
+
+func TestOfflineIntentCreatesMissingParentAndClears(t *testing.T) {
+	parent := filepath.Join(t.TempDir(), "new", ".juicemount")
+	marker := filepath.Join(parent, "offline-intent")
+	SetOfflinePersistPath(marker)
+	t.Cleanup(func() {
+		SetOffline(false)
+		SetOfflinePersistPath("")
+	})
+	if _, err := os.Stat(parent); !os.IsNotExist(err) {
+		t.Fatalf("parent should start absent, stat error = %v", err)
+	}
+	SetOffline(true)
+	if !IsUserOffline() || !PersistedOfflineIntent() {
+		t.Fatal("toggle-on did not engage and persist offline intent")
+	}
+	if got, err := os.ReadFile(marker); err != nil || string(got) != "user-offline\n" {
+		t.Fatalf("persisted marker = %q, %v", got, err)
+	}
+	if info, err := os.Stat(parent); err != nil || info.Mode().Perm() != 0o700 {
+		t.Fatalf("new marker parent mode = %v, %v", info, err)
+	}
+	SetOffline(false)
+	if IsUserOffline() || PersistedOfflineIntent() {
+		t.Fatal("toggle-off did not clear offline intent")
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("marker should be removed, stat error = %v", err)
 	}
 }
 

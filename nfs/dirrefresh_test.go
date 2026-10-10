@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/lelanddutcher/juicemount/internal/cache/pin"
+	"github.com/lelanddutcher/juicemount/internal/metrics"
 	"github.com/lelanddutcher/juicemount/internal/netprofile"
 	"github.com/lelanddutcher/juicemount/metadata"
 )
@@ -365,7 +366,7 @@ func TestInfoWithTimeoutWedgedStat(t *testing.T) {
 	gate := make(chan struct{}, 1)
 	de := &blockingDirEntry{name: "wedged.mov", release: make(chan struct{})}
 
-	_, _, ok := infoWithTimeout(de, 50*time.Millisecond, gate)
+	_, _, ok := infoWithTimeout(metrics.FUSESrcDirRefresh, de, 50*time.Millisecond, gate)
 	if ok {
 		t.Fatal("wedged Info() must report ok=false")
 	}
@@ -402,7 +403,7 @@ func TestInfoWithTimeoutCompletes(t *testing.T) {
 		t.Fatalf("ReadDir: %v (%d entries)", err, len(ents))
 	}
 	gate := make(chan struct{}, 1)
-	fi, ierr, ok := infoWithTimeout(ents[0], 2*time.Second, gate)
+	fi, ierr, ok := infoWithTimeout(metrics.FUSESrcDirRefresh, ents[0], 2*time.Second, gate)
 	if !ok || ierr != nil || fi == nil || fi.Name() != "a.txt" {
 		t.Fatalf("infoWithTimeout = (%v, %v, ok=%v), want a.txt info", fi, ierr, ok)
 	}
@@ -435,7 +436,7 @@ func TestColdDirListingBreaksOnWedgedStat(t *testing.T) {
 	entries := []os.DirEntry{real[0], wedged, real[1]}
 
 	gate := make(chan struct{}, 4)
-	infos, toInsert := jfs.coldDirListing("d", entries, gate)
+	infos, toInsert := jfs.coldDirListing(metrics.FUSESrcDirRefresh, "d", entries, gate)
 	if len(infos) != 1 || infos[0].Name() != "a.txt" {
 		t.Fatalf("infos = %d entries, want only a.txt (break on wedge — no stats issued past it)", len(infos))
 	}
@@ -471,7 +472,7 @@ func TestColdDirListingParallelWedgeCompletes(t *testing.T) {
 
 	gate := make(chan struct{}, 8)
 	start := time.Now()
-	infos, toInsert := jfs.coldDirListing("d", entries, gate)
+	infos, toInsert := jfs.coldDirListing(metrics.FUSESrcDirRefresh, "d", entries, gate)
 	elapsed := time.Since(start)
 
 	// Must not hang: bounded by ~fuseStatTimeout (50ms) plus scheduling slack.
@@ -585,6 +586,73 @@ func TestSyncColdPopulateFastLink(t *testing.T) {
 			t.Fatalf("slow-link ReadDir = %d entries, want 0 (stays async on a non-fast link)", len(infos))
 		}
 	})
+}
+
+// Fast-link waits must share the existing background budget, even when the
+// backend cannot start. Excess requests shed without creating parked jobs.
+func TestFastColdDirectoryRefreshUsesBoundedBackgroundWorkers(t *testing.T) {
+	class := netprofile.ClassFast
+	netprofile.Default().ForceClass(&class)
+	t.Cleanup(func() { netprofile.Default().ForceClass(nil) })
+	jfs, store, root := newDirRefreshHarness(t)
+	t.Setenv("JM_SYNC_COLD_POPULATE", "1")
+	if len(prefetchGate) != 0 || len(nfsLstatGate) != 0 {
+		t.Fatal("fixture backend gates are not quiescent")
+	}
+	for i := 0; i < cap(prefetchGate); i++ {
+		prefetchGate <- struct{}{}
+	}
+	released := false
+	release := func() {
+		if !released {
+			for i := 0; i < cap(prefetchGate); i++ {
+				<-prefetchGate
+			}
+			released = true
+		}
+	}
+	defer func() {
+		release()
+		if !pollUntil(t, 3*time.Second, inFlightEmpty(jfs.handler)) {
+			t.Error("background refreshes did not join")
+		}
+	}()
+	names := []string{"one", "two", "three", "four", "shed"}
+	for _, name := range names {
+		mkFUSEDir(t, root, name, "a.txt")
+	}
+	for _, name := range names {
+		start := time.Now()
+		infos, err := jfs.ReadDir(name)
+		if err != nil || len(infos) != 0 {
+			t.Fatalf("blocked backend result: %d, %v", len(infos), err)
+		}
+		if elapsed := time.Since(start); elapsed > 100*time.Millisecond {
+			t.Errorf("backend budget exceeded for %s: %s", name, elapsed)
+		}
+	}
+	jfs.handler.dirRefreshMu.Lock()
+	active, keys := jfs.handler.dirRefreshActive, len(jfs.handler.dirRefreshInFlight)
+	_, shedPresent := jfs.handler.dirRefreshInFlight["shed"]
+	jfs.handler.dirRefreshMu.Unlock()
+	if active != 4 || keys != 4 || shedPresent || len(jfs.handler.dirRefreshSem) != 4 {
+		t.Fatalf("refresh bound: active=%d keys=%d shed=%v", active, keys, shedPresent)
+	}
+	if len(nfsLstatGate) != 0 {
+		t.Fatal("cold background work occupied foreground FUSE admission")
+	}
+	release()
+	if !pollUntil(t, 3*time.Second, inFlightEmpty(jfs.handler)) {
+		t.Fatal("released refreshes did not finish")
+	}
+	for _, name := range names[:4] {
+		if kids, _ := store.ListChildren(name); len(kids) != 1 {
+			t.Errorf("%s children=%d", name, len(kids))
+		}
+	}
+	if kids, _ := store.ListChildren("shed"); len(kids) != 0 {
+		t.Fatal("shed request ran backend work")
+	}
 }
 
 // TestReadDirScanFilteredShortCircuit (#2/#4): a zero-row ONLINE readdir of

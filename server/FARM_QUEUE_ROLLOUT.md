@@ -29,11 +29,18 @@ flip to queue mode for those enqueues to drain in real time.
 > the host (Claude preview can't reach the LAN). Do NOT `rsync` a directory with a
 > trailing slash — it flattens the tree and rebuilds a stale image.
 
-Host: `root@192.168.0.197` · key: `codex_truenas_tmp` · app: `ix-juicemount`.
+Set the test-environment connection explicitly; never commit a host, account, or
+private-key path:
+
+```sh
+export JM_TEST_NAS_HOST=<test-nas-address>
+export JM_TEST_NAS_SSH_TARGET=<test-account>@<test-nas-address>
+export JM_TEST_SSH_KEY=</absolute/path/to/temporary-private-key>
+```
 
 1. SSH in:
    ```
-   ssh -i ~/.ssh/codex_truenas_tmp root@192.168.0.197
+   ssh -i "$JM_TEST_SSH_KEY" "$JM_TEST_NAS_SSH_TARGET"
    ```
 
 2. Locate the rendered compose for the deployed app (the ix-applications
@@ -63,7 +70,8 @@ Host: `root@192.168.0.197` · key: `codex_truenas_tmp` · app: `ix-juicemount`.
 
 ## Verify (curl from the TrueNAS host — preview can't reach the LAN)
 
-Run on `192.168.0.197` (admin-key gated; substitute the manager admin key):
+Run on `$JM_TEST_NAS_HOST` (admin-key gated; supply the manager admin key only
+through the environment):
 
 1. Worker liveness + queue depth — `available:true` once the worker heartbeats:
    ```

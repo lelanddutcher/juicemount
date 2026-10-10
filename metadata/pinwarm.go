@@ -89,6 +89,10 @@ func (rc *RedisClient) ReconcileAncestors(internalPath string) error {
 		jmlog.Info("pin warm: ReconcileAncestors skipped (offline)", "path", internalPath)
 		return nil
 	}
+	backendGeneration, _, admitted := rc.backendAdmission()
+	if !admitted {
+		return ErrBackendUnqualified
+	}
 	// A pin root inside a scan-filtered namespace cannot be warmed (reconcileDir
 	// #78-filters it). Reject clearly.
 	if scanFilteredPath(internalPath) {
@@ -108,14 +112,20 @@ func (rc *RedisClient) ReconcileAncestors(internalPath string) error {
 	// Always reconcile the tree root so top-level entries (incl. the first
 	// element of the chain, or internalPath itself when it is top-level) exist.
 	// Route through keyspaceReconcileDir so the existing test seam observes it.
-	if err := rc.keyspaceReconcileDir(1); err != nil {
+	if err := rc.keyspaceReconcileDirWithBackend(1, backendGeneration); err != nil {
 		jmlog.Warn("pin warm: ReconcileAncestors root reconcile failed", "error", err.Error())
 		// keep going — a per-dir failure must not abort the whole chain
+	}
+	if !rc.backendAdmitted(backendGeneration) {
+		return ErrBackendUnqualified
 	}
 
 	// Walk root-first (reverse of the bottom-up collection) so each parent's
 	// rows exist before we resolve the next child's inode from the store.
 	for i := len(chain) - 1; i >= 0; i-- {
+		if !rc.backendAdmitted(backendGeneration) {
+			return ErrBackendUnqualified
+		}
 		anc := chain[i]
 		ent := rc.store.LookupByPath(anc)
 		if ent == nil || !ent.IsDir {
@@ -124,7 +134,7 @@ func (rc *RedisClient) ReconcileAncestors(internalPath string) error {
 			// authoritative SCAN will. Nothing more we can do without its inode.
 			continue
 		}
-		if err := rc.keyspaceReconcileDir(ent.Inode); err != nil {
+		if err := rc.keyspaceReconcileDirWithBackend(ent.Inode, backendGeneration); err != nil {
 			jmlog.Warn("pin warm: ReconcileAncestors reconcile failed",
 				"ancestor", anc, "inode", ent.Inode, "error", err.Error())
 		}
@@ -151,6 +161,10 @@ func (rc *RedisClient) ReconcileSubtree(rootInode uint64, maxDirs int) error {
 	if !PinWarmMetadataEnabled() {
 		return nil
 	}
+	backendGeneration, _, admitted := rc.backendAdmission()
+	if !admitted {
+		return ErrBackendUnqualified
+	}
 	if pin.IsOffline() {
 		jmlog.Info("pin warm: ReconcileSubtree skipped (offline)", "root_inode", rootInode)
 		return nil
@@ -175,6 +189,9 @@ func (rc *RedisClient) ReconcileSubtree(rootInode uint64, maxDirs int) error {
 	truncated := false
 
 	for len(queue) > 0 {
+		if !rc.backendAdmitted(backendGeneration) {
+			return ErrBackendUnqualified
+		}
 		// Review fix (MED): re-check the offline/kill-switch gate per dir. A
 		// mid-walk link degradation would otherwise make every remaining
 		// reconcileDir burn a ~30s Redis timeout (keyspace.go), hanging the
@@ -201,12 +218,15 @@ func (rc *RedisClient) ReconcileSubtree(rootInode uint64, maxDirs int) error {
 		// SQLite via Insert/BulkInsert). Route through keyspaceReconcileDir so
 		// the existing test seam observes it. Errors are logged and skipped so
 		// one unreachable dir doesn't abort the subtree.
-		if err := rc.keyspaceReconcileDir(dirInode); err != nil {
+		if err := rc.keyspaceReconcileDirWithBackend(dirInode, backendGeneration); err != nil {
 			jmlog.Warn("pin warm: ReconcileSubtree reconcileDir failed",
 				"inode", dirInode, "error", err.Error())
 			// Still attempt to discover children below — HGETALL may succeed
 			// even if a downstream attr GET in reconcileDir failed. But if the
 			// HGETALL itself fails we simply won't enqueue anything.
+		}
+		if !rc.backendAdmitted(backendGeneration) {
+			return ErrBackendUnqualified
 		}
 		dirsDone++
 

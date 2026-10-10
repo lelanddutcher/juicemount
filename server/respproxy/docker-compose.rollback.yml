@@ -1,0 +1,43 @@
+# H-8B severity-3 rollback override (plan section 3, rollback step 3).
+#
+# Takes the proxy out of the path: respproxy is disabled, Redis publishes
+# host port 30179 again, and every principal (server principals from
+# server/.env plus the Macs the Manager enrolled) becomes a plain Redis ACL
+# user with the same name and secret, so enrolled Macs keep working
+# unchanged. There is NO lease enforcement in this state.
+#
+# Apply and leave it ONLY through the rollout script, which writes the
+# rollback ACL into the Redis data directory and orders the port handover:
+#   server/scripts/rollout-compose.sh --project <name> --proxy-rollback --ack-worker-quiesced
+#   server/scripts/rollout-compose.sh --project <name> --proxy-restore  --ack-worker-quiesced
+# A plain `docker compose up` with this file is unsupported.
+services:
+  redis:
+    ports:
+      - "30179:6379"
+    environment:
+      JM_REDIS_ACL_MODE: "rollback"
+
+  respproxy:
+    profiles: ["h8b-proxy-rolled-back"]
+
+  juicefs-init:
+    depends_on:
+      respproxy:
+        condition: service_healthy
+        required: false
+    environment:
+      JM_META_URL: "redis://admin@redis:6379/1"
+
+  juicefs:
+    environment:
+      JM_META_BG: "redis://bg@redis:6379/1"
+      JM_META_WEBDAV: "redis://webdav@redis:6379/1"
+
+  juicemount-manager:
+    environment:
+      JM_META: "redis://manager@redis:6379/1"
+
+  juicefarm:
+    environment:
+      JM_META: "redis://farm@redis:6379/1"

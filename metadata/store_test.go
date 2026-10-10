@@ -81,6 +81,47 @@ func TestInsertDir(t *testing.T) {
 	}
 }
 
+func TestDirectoryVisibilityMtimeIsMonotonicAndMemoryOnly(t *testing.T) {
+	s := newTestStore(t)
+	canonical := time.Unix(1_700_000_000, 0)
+	dir := MakeEntry("project", true, 0, canonical, 50)
+	if err := s.Insert(dir); err != nil {
+		t.Fatal(err)
+	}
+
+	// Exercise the GETATTR invalidation half, not only the timestamp map.
+	cached := s.LookupByPath("project")
+	cached.CacheGetAttr([]byte("old-directory-attrs"))
+
+	s.NoteDirectoryChanged("project")
+	first := s.DirectoryVisibilityMtime("project", canonical)
+	if !first.After(canonical) {
+		t.Fatalf("visibility mtime = %v, must be newer than canonical %v", first, canonical)
+	}
+	if got := s.LookupByPath("project").Mtime; !got.Equal(canonical) {
+		t.Fatalf("canonical mtime changed to %v; visibility generation must stay memory-only", got)
+	}
+	if got := s.LookupByPath("project").CachedGetAttr(); got != nil {
+		t.Fatalf("stale GETATTR body survived directory change: %q", got)
+	}
+
+	s.NoteDirectoryChanged("project")
+	second := s.DirectoryVisibilityMtime("project", canonical)
+	if !second.After(first) {
+		t.Fatalf("second visibility mtime %v must advance past %v", second, first)
+	}
+	if got := s.LookupByPath("project").FileInfoWithModTime(second).ModTime(); !got.Equal(second) {
+		t.Fatalf("NFS FileInfo override = %v, want %v", got, second)
+	}
+
+	rootBefore := s.DirectoryVisibilityMtime(".", time.Time{})
+	s.NoteDirectoryChanged("")
+	rootAfter := s.DirectoryVisibilityMtime(".", time.Time{})
+	if !rootAfter.After(rootBefore) {
+		t.Fatalf("root visibility mtime %v must advance past %v", rootAfter, rootBefore)
+	}
+}
+
 func TestUpdate(t *testing.T) {
 	s := newTestStore(t)
 	now := time.Now().Truncate(time.Second)
@@ -101,6 +142,57 @@ func TestUpdate(t *testing.T) {
 	}
 	if !got.Mtime.Equal(later) {
 		t.Fatalf("mtime = %v, want %v", got.Mtime, later)
+	}
+}
+
+// The NFS create path publishes an Entry to the serving cache immediately and
+// persists that same logical entry on a goroutine. A WRITE close may publish a
+// larger size before either phase finishes. Insert and UpdateSize must have one
+// total order: no data race, and neither SQLite nor the serving cache may end
+// at the stale CREATE size.
+func TestAsyncInsertAndUpdateSizeConverge(t *testing.T) {
+	s := newTestStore(t)
+	now := time.Now().Truncate(time.Second)
+
+	for i := 0; i < 64; i++ {
+		entryPath := fmt.Sprintf("concurrent/create-%d.mov", i)
+		e := MakeEntry(entryPath, false, 0, now, uint64(10_000+i))
+		s.InsertToCache(e)
+
+		start := make(chan struct{})
+		errCh := make(chan error, 2)
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			<-start
+			errCh <- s.Insert(e)
+		}()
+		go func() {
+			defer wg.Done()
+			<-start
+			errCh <- s.UpdateSize(entryPath, 1<<20, now.Add(time.Second))
+		}()
+		close(start)
+		wg.Wait()
+		close(errCh)
+		for err := range errCh {
+			if err != nil {
+				t.Fatalf("concurrent persist %q: %v", entryPath, err)
+			}
+		}
+
+		got := s.LookupByPath(entryPath)
+		if got == nil || got.Size != 1<<20 {
+			t.Fatalf("cache %q = %#v, want size %d", entryPath, got, 1<<20)
+		}
+		var dbSize int64
+		if err := s.DB().QueryRow(`SELECT size FROM entries WHERE path = ?`, entryPath).Scan(&dbSize); err != nil {
+			t.Fatalf("sqlite read %q: %v", entryPath, err)
+		}
+		if dbSize != 1<<20 {
+			t.Fatalf("sqlite size %q = %d, want %d", entryPath, dbSize, 1<<20)
+		}
 	}
 }
 

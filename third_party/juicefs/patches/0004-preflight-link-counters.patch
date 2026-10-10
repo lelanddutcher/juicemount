@@ -1,0 +1,316 @@
+--- a/pkg/meta/redis.go
++++ b/pkg/meta/redis.go
+@@ -30,6 +30,7 @@
+ 	"fmt"
+ 	"hash/fnv"
+ 	"io"
++	"math"
+ 	"math/rand"
+ 	"net"
+ 	"net/url"
+@@ -2068,20 +2069,44 @@
+ 		if (iattr.Flags&FlagAppend) != 0 || (iattr.Flags&FlagImmutable) != 0 {
+ 			return syscall.EPERM
+ 		}
++		err = tx.HGet(ctx, m.entryKey(parent), name).Err()
++		if err != nil && err != redis.Nil {
++			return err
++		} else if err == nil {
++			return syscall.EEXIST
++		} else if err == redis.Nil && m.conf.CaseInsensi && m.resolveCase(ctx, parent, name) != nil {
++			return syscall.EEXIST
++		}
++
++		// Redis does not roll back earlier EXEC commands when HINCRBY fails.
++		// Validate every increment under the same WATCH before creating a name
++		// or changing an inode. A first link within the same directory adds two
++		// references to the same field, so validate their combined increment.
++		if iattr.Nlink == math.MaxUint32 {
++			return syscall.EMLINK
++		}
+ 		oldParent := iattr.Parent
++		increments := map[Ino]int64{parent: 1}
++		if oldParent > 0 {
++			increments[oldParent]++
++		}
++		for p, increment := range increments {
++			raw, err := tx.HGet(ctx, m.parentKey(inode), p.String()).Result()
++			if err == redis.Nil {
++				continue // absent hash or field starts at zero
++			}
++			if err != nil {
++				return err // includes a non-hash parent key
++			}
++			count, err := strconv.ParseInt(raw, 10, 64)
++			if err != nil || count < 0 || strconv.FormatInt(count, 10) != raw || count > math.MaxInt64-increment {
++				return syscall.EIO
++			}
++		}
+ 		iattr.Parent = 0
+ 		iattr.Ctime = now.Unix()
+ 		iattr.Ctimensec = uint32(now.Nanosecond())
+ 		iattr.Nlink++
+-
+-		err = tx.HGet(ctx, m.entryKey(parent), name).Err()
+-		if err != nil && err != redis.Nil {
+-			return err
+-		} else if err == nil {
+-			return syscall.EEXIST
+-		} else if err == redis.Nil && m.conf.CaseInsensi && m.resolveCase(ctx, parent, name) != nil {
+-			return syscall.EEXIST
+-		}
+ 
+ 		_, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+ 			pipe.HSet(ctx, m.entryKey(parent), name, m.packEntry(iattr.Typ, inode))
+@@ -2099,7 +2124,250 @@
+ 			*attr = iattr
+ 		}
+ 		return err
+-	}, m.inodeKey(parent), m.entryKey(parent), m.inodeKey(inode)))
++	}, m.inodeKey(parent), m.entryKey(parent), m.inodeKey(inode), m.parentKey(inode)))
++}
++
++// NewNameParent is one original root-to-parent component, not a path to
++// resolve again against potentially replaced directories.
++type NewNameParent struct {
++	Name  string
++	Inode Ino
++}
++
++// NewNameLink binds a closed private stage to one absent public destination.
++// The caller must journal this expectation before PublishNewName and retain
++// exclusive writer authority. Recovery is only valid after fencing old writers.
++type NewNameLink struct {
++	Parents                 []NewNameParent
++	Name, StageName, Marker string
++	Inode                   Ino
++	Length                  uint64
++}
++
++func (m *redisMeta) PublishNewName(ctx Context, e NewNameLink) syscall.Errno {
++	_, st := m.guardedNewName(ctx, e, false)
++	return st
++}
++
++// RecoverNewName classifies a retained private stage or an exact public link.
++// For the latter it repairs derivative target-directory totals by replacement,
++// never by replaying the relative link increment. New writes must be closed.
++func (m *redisMeta) RecoverNewName(ctx Context, e NewNameLink) (bool, syscall.Errno) {
++	return m.guardedNewName(ctx, e, true)
++}
++
++func (m *redisMeta) guardedNewName(ctx Context, e NewNameLink, recovering bool) (bool, syscall.Errno) {
++	if m.conf.ReadOnly || m.checkRoot(RootInode) != RootInode || !m.getFormat().DirStats {
++		return false, syscall.ENOTSUP
++	}
++	if len(e.Parents) == 0 || len(e.Parents) > 256 || e.Parents[0] != (NewNameParent{Inode: RootInode}) || e.Inode <= RootInode || e.Length > 1<<40 || len(e.Marker) != 64 ||
++		!strings.HasPrefix(e.StageName, ".juicemount-stage-") || checkInodeName(e.StageName) != 0 || checkInodeName(e.Name) != 0 || e.Name == "." || e.Name == ".." || e.Name == TrashName || strings.HasPrefix(e.Name, ".juicemount-stage-") {
++		return false, syscall.EINVAL
++	}
++	seen := map[Ino]bool{RootInode: true}
++	for _, p := range e.Parents[1:] {
++		if p.Inode <= RootInode || p.Inode > Ino(math.MaxInt64) || seen[p.Inode] || isTrash(p.Inode) || checkInodeName(p.Name) != 0 || p.Name == "." || p.Name == ".." || p.Name == TrashName || strings.HasPrefix(p.Name, ".juicemount-stage-") {
++			return false, syscall.EINVAL
++		}
++		seen[p.Inode] = true
++	}
++	parent := e.Parents[len(e.Parents)-1].Inode
++	keys := []string{m.inodeKey(e.Inode), m.entryKey(RootInode), m.xattrKey(e.Inode), m.parentKey(e.Inode), m.dirDataLengthKey(), m.dirUsedSpaceKey(), m.dirUsedInodesKey(), m.dirQuotaKey()}
++	for _, p := range e.Parents {
++		keys = append(keys, m.inodeKey(p.Inode), m.entryKey(p.Inode))
++	}
++	defer m.of.InvalidateChunk(e.Inode, invalidateAttrOnly)
++	published := false
++	err := m.txn(ctx, func(tx *redis.Tx) error {
++		published = false
++		if n, err := tx.HLen(ctx, m.dirQuotaKey()).Result(); err != nil {
++			return err
++		} else if n != 0 {
++			return syscall.ENOTSUP
++		}
++		readAttr := func(inode Ino) (Attr, error) {
++			var a Attr
++			b, err := tx.Get(ctx, m.inodeKey(inode)).Bytes()
++			if err != nil {
++				return a, err
++			}
++			if len(b) != 72 && len(b) != 80 {
++				return a, syscall.EIO
++			}
++			a.Unmarshal(b)
++			return a, nil
++		}
++		a, err := readAttr(e.Inode)
++		if err != nil {
++			return err
++		}
++		if a.Typ != TypeFile || a.Length != e.Length || a.Flags&(FlagAppend|FlagImmutable) != 0 {
++			return syscall.EIO
++		}
++		entry, err := tx.HGet(ctx, m.entryKey(RootInode), e.StageName).Result()
++		if err != nil || entry != string(m.packEntry(TypeFile, e.Inode)) {
++			return syscall.EIO
++		}
++		marker, err := tx.HGet(ctx, m.xattrKey(e.Inode), "user.juicemount.operation").Result()
++		if err != nil || marker != e.Marker {
++			return syscall.EIO
++		}
++		counts, err := tx.HGetAll(ctx, m.parentKey(e.Inode)).Result()
++		if err != nil {
++			return err
++		}
++		destination, destErr := tx.HGet(ctx, m.entryKey(parent), e.Name).Result()
++		if destErr != nil && destErr != redis.Nil {
++			return destErr
++		}
++		isPrivate := a.Nlink == 1 && a.Parent == RootInode && len(counts) == 0
++		if recovering && isPrivate && destination != string(m.packEntry(TypeFile, e.Inode)) {
++			// The known publication could not have completed. A replacement
++			// parent or foreign target does not authorize adopting that target.
++			_, err = tx.TxPipelined(ctx, func(p redis.Pipeliner) error { p.Get(ctx, m.inodeKey(e.Inode)); return nil })
++			return err
++		}
++		var pattr Attr
++		for i, p := range e.Parents {
++			pa, err := readAttr(p.Inode)
++			if err != nil {
++				return err
++			}
++			if pa.Typ != TypeDirectory {
++				return syscall.ENOTDIR
++			}
++			if i > 0 {
++				prior := e.Parents[i-1].Inode
++				entry, err := tx.HGet(ctx, m.entryKey(prior), p.Name).Result()
++				if err != nil || entry != string(m.packEntry(TypeDirectory, p.Inode)) || pa.Parent != prior {
++					return syscall.ESTALE
++				}
++			}
++			pattr = pa
++		}
++		if recovering {
++			want := map[string]string{RootInode.String(): "1", parent.String(): "1"}
++			if parent == RootInode {
++				want[RootInode.String()] = "2"
++			}
++			if destination != string(m.packEntry(TypeFile, e.Inode)) || a.Nlink != 2 || a.Parent != 0 || len(counts) != len(want) {
++				return syscall.EIO
++			}
++			for k, v := range want {
++				if counts[k] != v {
++					return syscall.EIO
++				}
++			}
++			// The directory entry set is already watched. Watch each referenced
++			// inode BEFORE reading its attributes to obtain one coherent total.
++			entries, err := tx.HGetAll(ctx, m.entryKey(parent)).Result()
++			if err != nil {
++				return err
++			}
++			if len(entries) > 1<<20 {
++				return syscall.EOVERFLOW
++			}
++			var length, space, inodes int64
++			for _, entry := range entries {
++				if len(entry) != 9 {
++					return syscall.EIO
++				}
++				ino := Ino(binary.BigEndian.Uint64([]byte(entry)[1:]))
++				if err := tx.Watch(ctx, m.inodeKey(ino)).Err(); err != nil {
++					return err
++				}
++				child, err := readAttr(ino)
++				if err != nil {
++					return err
++				}
++				if child.Typ != entry[0] {
++					return syscall.EIO
++				}
++				var size uint64
++				if child.Typ == TypeFile {
++					size = child.Length
++				}
++				if size > math.MaxInt64-4095 {
++					return syscall.EOVERFLOW
++				}
++				allocated := align4K(size)
++				if int64(size) > math.MaxInt64-length || allocated > math.MaxInt64-space {
++					return syscall.EOVERFLOW
++				}
++				length += int64(size)
++				space += allocated
++				inodes++
++			}
++			for _, key := range []string{m.dirDataLengthKey(), m.dirUsedSpaceKey(), m.dirUsedInodesKey()} {
++				kind, err := tx.Type(ctx, key).Result()
++				if err != nil {
++					return err
++				}
++				if kind != "hash" && kind != "none" {
++					return syscall.EIO
++				}
++			}
++			_, err = tx.TxPipelined(ctx, func(p redis.Pipeliner) error {
++				p.HSet(ctx, m.dirDataLengthKey(), parent.String(), length)
++				p.HSet(ctx, m.dirUsedSpaceKey(), parent.String(), space)
++				p.HSet(ctx, m.dirUsedInodesKey(), parent.String(), inodes)
++				return nil
++			})
++			published = err == nil
++			return err
++		}
++		if !isPrivate {
++			return syscall.EIO
++		}
++		if destErr == nil || (m.conf.CaseInsensi && m.resolveCase(ctx, parent, e.Name) != nil) {
++			return syscall.EEXIST
++		}
++		if pattr.Flags&FlagImmutable != 0 {
++			return syscall.EPERM
++		}
++		if st := m.Access(ctx, parent, MODE_MASK_W|MODE_MASK_X, &pattr); st != 0 {
++			return st
++		}
++		deltas := []int64{int64(a.Length), align4K(a.Length), 1}
++		statKeys := []string{m.dirDataLengthKey(), m.dirUsedSpaceKey(), m.dirUsedInodesKey()}
++		for i, key := range statKeys {
++			raw, err := tx.HGet(ctx, key, parent.String()).Result()
++			if err == redis.Nil {
++				return syscall.EAGAIN
++			}
++			if err != nil {
++				return err
++			}
++			n, err := strconv.ParseInt(raw, 10, 64)
++			if err != nil || n < 0 || strconv.FormatInt(n, 10) != raw || n > math.MaxInt64-deltas[i] {
++				return syscall.EIO
++			}
++		}
++		now := time.Now()
++		a.Parent = 0
++		a.Nlink = 2
++		a.Ctime = now.Unix()
++		a.Ctimensec = uint32(now.Nanosecond())
++		pattr.Mtime, pattr.Ctime = now.Unix(), now.Unix()
++		pattr.Mtimensec, pattr.Ctimensec = uint32(now.Nanosecond()), uint32(now.Nanosecond())
++		_, err = tx.TxPipelined(ctx, func(p redis.Pipeliner) error {
++			p.HSet(ctx, m.entryKey(parent), e.Name, m.packEntry(TypeFile, e.Inode))
++			p.Set(ctx, m.inodeKey(parent), pattr.Marshal(), 0)
++			p.Set(ctx, m.inodeKey(e.Inode), a.Marshal(), 0)
++			if parent == RootInode {
++				p.HSet(ctx, m.parentKey(e.Inode), RootInode.String(), 2)
++			} else {
++				p.HSet(ctx, m.parentKey(e.Inode), RootInode.String(), 1, parent.String(), 1)
++			}
++			for i, key := range statKeys {
++				p.HIncrBy(ctx, key, parent.String(), deltas[i])
++			}
++			return nil
++		})
++		published = err == nil
++		return err
++	}, keys...)
++	return published, errno(err)
+ }
+ 
+ func (m *redisMeta) fillAttr(ctx Context, es []*Entry) error {

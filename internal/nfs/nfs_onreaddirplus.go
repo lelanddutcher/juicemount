@@ -63,8 +63,7 @@ func onReadDirPlus(ctx context.Context, w *response, userHandle Handler) error {
 	dirBytes := uint32(0)
 	maxBytes := uint32(100) // conservative overhead measure
 
-	started := obj.Cookie == 0
-	if started {
+	if obj.Cookie == 0 {
 		// add '.' and '..' to entities
 		dotdotFileID := uint64(0)
 		if len(p) > 0 {
@@ -88,44 +87,41 @@ func onReadDirPlus(ctx context.Context, w *response, userHandle Handler) error {
 	maxEntities := userHandle.HandleLimit() / 2
 	fb := 0
 	fss := 0
-	for i, c := range contents {
+	for i := readDirStartIndex(obj.Cookie, len(contents)); i < len(contents); i++ {
+		c := contents[i]
 		// cookie equates to index within contents + 2 (for '.' and '..')
 		cookie := uint64(i + 2)
 		fb++
-		if started {
-			fss++
-			// [JM5] Accurate XDR size estimation per entry.
-			// Each readDirPlusEntity encodes as:
-			//   FileID(8) + Name(4+padded) + Cookie(8) + Next(4)
-			//   + PostOpAttr present(4) + fattr3(84)
-			//   + Handle present(4) + handle(4+padded)
-			nameLen := uint32(len(c.Name()))
-			namePadded := (nameLen + 3) &^ 3 // XDR pads to 4-byte boundary
-			entryDirBytes := nameLen + 20    // dir overhead
-			entryMaxBytes := 8 + (4 + namePadded) + 8 + 4 + // FileID + Name + Cookie + Next
-				4 + 84 + // PostOpAttr (present + fattr3)
-				4 + 4 + 36 // Handle (present + length + 32-byte handle padded)
-			dirBytes += entryDirBytes
-			maxBytes += entryMaxBytes
-			if dirBytes > obj.DirCount || maxBytes > obj.MaxCount || len(entities) > maxEntities {
-				eof = false
-				break
-			}
-
-			filePath := joinPath(p, c.Name())
-			handle := userHandle.ToHandle(fs, filePath)
-			attrs := ToFileAttribute(c, path.Join(filePath...))
-			entities = append(entities, readDirPlusEntity{
-				FileID:     attrs.Fileid,
-				Name:       []byte(c.Name()),
-				Cookie:     cookie,
-				Attributes: attrs,
-				Handle:     &handle,
-				Next:       true,
-			})
-		} else if cookie == obj.Cookie {
-			started = true
+		fss++
+		// [JM5] Accurate XDR size estimation per entry.
+		// Each readDirPlusEntity encodes as:
+		//   FileID(8) + Name(4+padded) + Cookie(8) + Next(4)
+		//   + PostOpAttr present(4) + fattr3(84)
+		//   + Handle present(4) + handle(4+padded)
+		nameLen := uint32(len(c.Name()))
+		namePadded := (nameLen + 3) &^ 3                // XDR pads to 4-byte boundary
+		entryDirBytes := nameLen + 20                   // dir overhead
+		entryMaxBytes := 8 + (4 + namePadded) + 8 + 4 + // FileID + Name + Cookie + Next
+			4 + 84 + // PostOpAttr (present + fattr3)
+			4 + 4 + 36 // Handle (present + length + 32-byte handle padded)
+		dirBytes += entryDirBytes
+		maxBytes += entryMaxBytes
+		if dirBytes > obj.DirCount || maxBytes > obj.MaxCount || len(entities) > maxEntities {
+			eof = false
+			break
 		}
+
+		filePath := joinPath(p, c.Name())
+		handle := userHandle.ToHandle(fs, filePath)
+		attrs := ToFileAttribute(c, path.Join(filePath...))
+		entities = append(entities, readDirPlusEntity{
+			FileID:     attrs.Fileid,
+			Name:       []byte(c.Name()),
+			Cookie:     cookie,
+			Attributes: attrs,
+			Handle:     &handle,
+			Next:       true,
+		})
 	}
 
 	writer := bytes.NewBuffer([]byte{})

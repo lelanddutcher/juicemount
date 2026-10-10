@@ -1,6 +1,7 @@
 package nfs
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
@@ -469,11 +470,7 @@ func TestRecoverStalledForceFinalizesLeakedEntry(t *testing.T) {
 // that invariant; RetryFailed re-reserves on requeue). Before Phase 2 a
 // failed row pinned its bytes in `used` until restart.
 func TestFailPermanentReleasesCapacity(t *testing.T) {
-	s := newTestSpoolStore(t, 0)
-	d, err := NewDrainer(s, DrainerConfig{FuseRoot: t.TempDir()}) // MaxAttempts default 5
-	if err != nil {
-		t.Fatalf("new drainer: %v", err)
-	}
+	s, d := newTestDrainer(t, DrainerConfig{}) // wired completion; MaxAttempts default 5
 
 	e, err := s.OpenWrite("/edit/doomed.mov")
 	if err != nil {
@@ -493,10 +490,16 @@ func TestFailPermanentReleasesCapacity(t *testing.T) {
 			t.Fatalf("incr attempts: %v", err)
 		}
 	}
+	if row, err := s.Meta().Get(e.ID()); err != nil || row.DrainAttempts != 5 || row.Size != 256 {
+		t.Fatalf("pre: row=(%+v, %v), want 5 attempts and size 256", row, err)
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	d.DrainOnceForTest(ctx) // exhausted budget → failPermanent
+	// With completion wired, the exhausted budget reaches failPermanent.
+	if got := d.DrainOnceForTest(ctx); got != 1 {
+		t.Fatalf("processed=%d, want 1", got)
+	}
 
 	row, err := s.Meta().Get(e.ID())
 	if err != nil {
@@ -507,6 +510,55 @@ func TestFailPermanentReleasesCapacity(t *testing.T) {
 	}
 	if used, _ := s.Capacity(); used != 0 {
 		t.Errorf("used=%d after failPermanent, want 0 (reservation released)", used)
+	}
+	if got := d.Metrics().DrainsSucceeded.Load(); got != 0 || !d.LastDrainSuccess().IsZero() {
+		t.Errorf("successful completion recorded: successes=%d, last=%v", got, d.LastDrainSuccess())
+	}
+}
+
+func TestFailPermanentTransitionPreservesSourceAndReleasesCapacity(t *testing.T) {
+	s := newTestSpoolStore(t, 0)
+	d, err := NewDrainer(s, DrainerConfig{FuseRoot: t.TempDir()})
+	if err != nil {
+		t.Fatalf("new drainer: %v", err)
+	}
+
+	e, err := s.OpenWrite("/edit/doomed.mov")
+	if err != nil {
+		t.Fatalf("open write: %v", err)
+	}
+	if _, err := e.WriteAt(make([]byte, 256), 0); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := e.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if used, _ := s.Capacity(); used != 256 {
+		t.Fatalf("pre: used=%d, want 256", used)
+	}
+	if claimed, err := s.Meta().MarkDraining(e.ID()); err != nil || !claimed {
+		t.Fatalf("mark draining = (%v, %v)", claimed, err)
+	}
+	row, err := s.Meta().Get(e.ID())
+	if err != nil || row.ID != e.ID() || row.Size != 256 || row.DrainState != metadata.DrainDraining {
+		t.Fatalf("claimed row = (%+v, %v)", row, err)
+	}
+	// Dispatch without a completion hook intentionally holds the source.
+	// This unit isolates capacity release after a permanent-failure transition.
+	d.failPermanent(row, "permanent failure for capacity test")
+
+	row, err = s.Meta().Get(e.ID())
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if string(row.DrainState) != "failed" {
+		t.Fatalf("row state=%q, want failed", row.DrainState)
+	}
+	if used, _ := s.Capacity(); used != 0 {
+		t.Errorf("used=%d after failPermanent, want 0 (reservation released)", used)
+	}
+	if got, err := os.ReadFile(row.SpoolFile); err != nil || !bytes.Equal(got, make([]byte, 256)) {
+		t.Errorf("source after failPermanent = (%d bytes, %v), want original 256 bytes", len(got), err)
 	}
 }
 

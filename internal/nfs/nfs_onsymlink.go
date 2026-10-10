@@ -66,14 +66,14 @@ func onSymlink(ctx context.Context, w *response, userHandle Handler) error {
 		if errors.Is(err, os.ErrExist) {
 			return &NFSStatusError{NFSStatusExist, err}
 		}
-		return &NFSStatusError{NFSStatusAccess, err}
+		return writeRefusalStatus(err, NFSStatusAccess)
 	}
 
 	fp := userHandle.ToHandle(fs, append(path, string(obj.Filename)))
 	changer := userHandle.Change(fs)
 	if changer != nil {
 		if err := attrs.Apply(changer, fs, newFilePath); err != nil {
-			return &NFSStatusError{NFSStatusIO, err}
+			return writeRefusalStatus(err, NFSStatusIO)
 		}
 	}
 

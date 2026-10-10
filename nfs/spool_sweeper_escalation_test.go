@@ -108,13 +108,9 @@ func TestSweeperEscalationSparesActiveSlowWriter(t *testing.T) {
 // TestSweeperEscalationEndToEndDrains: the escalated entry's bytes must
 // actually reach FUSE via the drainer — escalation is recovery, not autopsy.
 func TestSweeperEscalationEndToEndDrains(t *testing.T) {
-	s := newTestSpoolStore(t, 0)
+	s, d := newTestDrainer(t, DrainerConfig{BackoffBase: time.Millisecond})
 	s.SetStuckEscalationWindow(10 * time.Millisecond)
-	fuseRoot := t.TempDir()
-	d, err := NewDrainer(s, DrainerConfig{FuseRoot: fuseRoot, BackoffBase: time.Millisecond})
-	if err != nil {
-		t.Fatalf("drainer: %v", err)
-	}
+	fuseRoot := d.fuseRoot
 
 	e, err := s.OpenWrite("recovered.bin")
 	if err != nil {

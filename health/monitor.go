@@ -8,24 +8,25 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
-	"runtime"
-	"strings"
+	rmetrics "runtime/metrics"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/redis/go-redis/v9"
 
 	"github.com/lelanddutcher/juicemount/internal/cache/pin"
 	"github.com/lelanddutcher/juicemount/internal/jmlog"
+	"github.com/lelanddutcher/juicemount/internal/unmountd/client"
 )
 
 // Config holds the endpoints and paths that the monitor checks.
 type Config struct {
-	RedisURL      string // e.g. "127.0.0.1:6379"
-	MinIOURL      string // e.g. "http://127.0.0.1:9000"
-	FUSEPath      string // e.g. ~/.juicemount/fuse-internal
-	NFSMountPoint string // e.g. /mnt/juice
+	RedisURL      string         // e.g. "127.0.0.1:6379"
+	RedisOptions  *redis.Options // full saved URL options; RedisURL stays address-only for diagnostics
+	MinIOURL      string         // e.g. "http://127.0.0.1:9000"
+	FUSEPath      string         // e.g. ~/.juicemount/fuse-internal
+	NFSMountPoint string         // e.g. /mnt/juice
 }
 
 // ComponentStatus represents the health of a single subsystem.
@@ -33,6 +34,50 @@ type ComponentStatus struct {
 	Healthy   bool
 	LastCheck time.Time
 	Message   string
+	// A failed mount-table observer cannot establish either a present stale
+	// mount or an absent one. Keep reporting unhealthy, but do not recover
+	// from this uncertainty. Unexported to preserve the public status shape.
+	nfsObserverUnavailable bool
+}
+
+// NFSRecoveryState is the typed outcome of stale-NFS recovery. It is
+// reported in HealthStatus.NFSRecovery so the app and diagnostics can tell
+// "stale and waiting for the unmount helper" apart from an ordinary fault.
+type NFSRecoveryState string
+
+const (
+	// NFSRecoveryNone: no stale-mount recovery is pending.
+	NFSRecoveryNone NFSRecoveryState = ""
+	// NFSRecoveryHelperRequired: the NFS mount is present in the kernel
+	// table but stale, the recovery threshold has passed, and detaching it
+	// requires the privileged JuiceMount unmount helper. JuiceMount never
+	// unmounts by pathname, so it keeps serving and waits. The user remedy
+	// until the helper ships is to quit JuiceMount and restart the Mac.
+	NFSRecoveryHelperRequired NFSRecoveryState = "stale_mount_helper_required"
+)
+
+// NFSStaleHelperRequiredMessage is the NFS component message while
+// NFSRecoveryHelperRequired holds. It reaches the app through /health.
+// It must not contain "not mounted": the app reads that phrase as absence.
+const NFSStaleHelperRequiredMessage = "stale mount: recovery requires the JuiceMount unmount helper"
+
+// StaleMountRetirer is the seam for the privileged JuiceMount unmount
+// helper (H-3 design §2, lanes L1/L4), implemented in the bridge.
+// RetireStaleNFSMount must detach the stale NFS mount that this process
+// owns, identified by the helper's own proof of instance authority (kernel
+// fsid plus mount receipt), never by pathname. That is why it takes no path.
+//
+// liveness is PROVEN liveness only: client.LivenessDead (the exact JuiceFS
+// child's own Wait returned) or client.LivenessWedged. The monitor never
+// calls it while the servers are alive or unproven: an ordinary unmount of
+// a slow-but-live volume ejects it, a busy one leaves an EBUSY-backoff job
+// that ejects it later, and on a hard-mounted wedge the ordinary call blocks
+// in VFS_SYNC and sets MNT_LUNMOUNT, after which even a force gets EBUSY.
+// It returns nil only when the helper has proved the owned mount is gone;
+// the monitor then runs a new mount birth. It must return when ctx is done
+// and withdraw what it started if it gives up.
+type StaleMountRetirer interface {
+	RetireStaleNFSMount(ctx context.Context, liveness string) error
 }
 
 // ConnState represents a connection lifecycle state.
@@ -61,6 +106,8 @@ type HealthStatus struct {
 	MinIO ComponentStatus
 	FUSE  ComponentStatus
 	NFS   ComponentStatus
+	// NFSRecovery is the typed stale-recovery state (empty when none).
+	NFSRecovery NFSRecoveryState
 	// Overall is true only when every component is healthy.
 	Overall bool
 
@@ -72,7 +119,7 @@ type HealthStatus struct {
 	HeapAllocMB   float64 // current heap allocation in MB
 	HeapSysMB     float64 // total heap obtained from OS in MB
 	NumGC         uint32  // number of GC cycles
-	GCPauseLastUs uint64  // last GC pause in microseconds
+	GCPauseLastUs uint64  // last GC pause in microseconds; 0 when non-blocking telemetry cannot supply it
 
 	// Application-level memory stats (populated via SetStatsProvider)
 	PathCacheSize  int     // entries in metadata pathCache
@@ -81,6 +128,47 @@ type HealthStatus struct {
 	FDPoolActive   int     // active (in-use) fds in pool
 	MemBufEntries  int     // entries in memory buffer
 	MemBufSizeMB   float64 // total memory buffer size in MB
+}
+
+type runtimeMemorySnapshot struct {
+	heapAllocBytes uint64
+	heapSysBytes   uint64
+	numGC          uint32
+}
+
+// readRuntimeMemorySnapshot uses runtime/metrics counters instead of
+// runtime.ReadMemStats. ReadMemStats performs a stop-the-world: on
+// macOS a goroutine stuck in an uninterruptible FUSE syscall can then prevent
+// the world from restarting, starving the otherwise-independent local control
+// plane and every mirror-served NFS request. Health telemetry must never be
+// able to turn a slow backend operation into an application-wide freeze.
+func readRuntimeMemorySnapshot() runtimeMemorySnapshot {
+	samples := []rmetrics.Sample{
+		{Name: "/memory/classes/heap/objects:bytes"},
+		{Name: "/memory/classes/heap/free:bytes"},
+		{Name: "/memory/classes/heap/released:bytes"},
+		{Name: "/memory/classes/heap/unused:bytes"},
+		{Name: "/gc/cycles/total:gc-cycles"},
+	}
+	rmetrics.Read(samples)
+	readUint := func(i int) uint64 {
+		if samples[i].Value.Kind() != rmetrics.KindUint64 {
+			return 0
+		}
+		return samples[i].Value.Uint64()
+	}
+	heapAlloc := readUint(0)
+	heapSys := heapAlloc + readUint(1) + readUint(2) + readUint(3)
+	gc := readUint(4)
+	maxUint32 := uint64(^uint32(0))
+	if gc > maxUint32 {
+		gc = maxUint32
+	}
+	return runtimeMemorySnapshot{
+		heapAllocBytes: heapAlloc,
+		heapSysBytes:   heapSys,
+		numGC:          uint32(gc),
+	}
 }
 
 // GracePeriod is the duration after a network change during which
@@ -103,6 +191,18 @@ type HealthMonitor struct {
 	remountFn      func() error // optional: called to remount the NFS volume
 	nfsStaleStreak int          // consecutive failed NFS checks
 	lastRemountAt  time.Time    // last successful remount time
+	// nfsRecovery is the typed stale-recovery outcome surfaced in
+	// HealthStatus.NFSRecovery and, while NFS is unhealthy, as the NFS
+	// component message. staleRetirer is the unmount-helper seam; nil until
+	// the privileged helper ships (H-3 L1/L4).
+	nfsRecovery  NFSRecoveryState
+	staleRetirer StaleMountRetirer
+	// juiceFSLiveness is the exact JuiceFS child's liveness (its own Wait),
+	// with proven=false when this process holds no child receipt.
+	juiceFSLiveness func() (alive, proven bool)
+	// ownedFUSEProbe is the retained manager's exact child plus complete
+	// kernel mount proof. When wired, unknown never falls through to ps.
+	ownedFUSEProbe func() FUSESteadyEvidence
 
 	// NFS-layer absent-mount recovery (#93 — see absentremount.go).
 	// Guarded by mu. absentRemountFn is the PROMPT-CAPABLE two-tier mount
@@ -166,8 +266,8 @@ var (
 	// attempts. Prevents flapping if the underlying issue is persistent.
 	NFSRemountCooldown = 60 * time.Second
 
-	// NFSStatTimeout bounds an os.Stat() probe of the NFS mount point.
-	// If the syscall hangs longer than this, the mount is considered stale.
+	// NFSStatTimeout bounds the combined mount-point stat and mount-table probe.
+	// It is also the budget passed to the mount-table query.
 	NFSStatTimeout = 5 * time.Second
 
 	// FUSEFlapToDegraded is the number of consecutive unhealthy raw FUSE
@@ -189,11 +289,13 @@ var (
 	// var so tests can override.
 	DrainBusyRecentWindow = 15 * time.Second
 
-	// forceUnmountFn is the function used to force-unmount a stale mount.
-	// Replaceable so tests can avoid invoking `sudo`.
-	forceUnmountFn = forceUnmount
+	// NFSStaleRetireTimeout bounds one call into the unmount helper seam
+	// (StaleMountRetirer). The 10 s check loop runs the call inline, so an
+	// implementation must return when its context is done.
+	NFSStaleRetireTimeout = 20 * time.Second
 
-	// isJuiceFSProcessAliveFn reports whether a juicefs mount process is alive.
+	// isJuiceFSProcessAliveFn reports whether the juicefs process for one exact
+	// mount point is alive.
 	// Indirected through a var (default: the real pgrep probe in fuse.go) so
 	// the remount-decision tests are deterministic regardless of what's running
 	// on the host. Without this, a developer's own running JuiceMount makes the
@@ -235,11 +337,17 @@ func (m *HealthMonitor) busyIngesting() bool {
 
 // New creates a HealthMonitor for the given configuration.
 func New(cfg Config) *HealthMonitor {
-	rdb := redis.NewClient(&redis.Options{
-		Addr:        cfg.RedisURL,
-		DialTimeout: 3 * time.Second,
-		ReadTimeout: 3 * time.Second,
-	})
+	opts := &redis.Options{Addr: cfg.RedisURL}
+	if cfg.RedisOptions != nil {
+		copy := *cfg.RedisOptions
+		opts = &copy
+		opts.Dialer = nil // The metadata pool's default closure retains its deadlines.
+	}
+	opts.DialTimeout = 3 * time.Second
+	opts.ReadTimeout = 3 * time.Second
+	opts.WriteTimeout = 3 * time.Second
+	opts.ContextTimeoutEnabled = true
+	rdb := redis.NewClient(opts)
 
 	return &HealthMonitor{
 		cfg: cfg,
@@ -298,16 +406,60 @@ func (m *HealthMonitor) SetStatsProvider(fn func() MemoryStats) {
 }
 
 // EnableNFSRemount registers a callback that re-runs the NFS mount
-// command. When set, the monitor will automatically force-unmount and
-// remount when the NFS mount point becomes stale (RPC hangs, Stat
-// timeout, etc.). Auto-remount is gated by NFSStaleThreshold
-// consecutive failures and NFSRemountCooldown between attempts.
+// command. When set, the monitor remounts after NFSStaleThreshold
+// consecutive failures (NFSRemountCooldown between attempts) when the
+// mount is verified absent. A present-but-stale mount is never unmounted by
+// path: it is retired through the StaleMountRetirer seam first, or, with no
+// helper wired, held in NFSRecoveryHelperRequired (see handleNFSAutoRemount).
 //
 // Pass nil to disable auto-remount.
 func (m *HealthMonitor) EnableNFSRemount(fn func() error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.remountFn = fn
+}
+
+// SetJuiceFSLiveness wires the exact-child liveness used by the stale-NFS
+// path (FUSEManager.ExactChildLiveness). Without it, liveness is never
+// proven and the stale path never calls the unmount helper.
+func (m *HealthMonitor) SetJuiceFSLiveness(fn func() (alive, proven bool)) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.juiceFSLiveness = fn
+}
+
+// SetOwnedFUSEProbe supplies the original manager's bounded local evidence.
+// A nil hook preserves the legacy unowned monitor path.
+func (m *HealthMonitor) SetOwnedFUSEProbe(fn func() FUSESteadyEvidence) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.ownedFUSEProbe = fn
+}
+
+func (m *HealthMonitor) ownedFUSESource() func() FUSESteadyEvidence {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.ownedFUSEProbe
+}
+
+// JuiceFSLiveness reports the wired exact-child liveness, or (false,
+// false) — unproven — when none is wired.
+func (m *HealthMonitor) JuiceFSLiveness() (alive, proven bool) {
+	m.mu.RLock()
+	fn := m.juiceFSLiveness
+	m.mu.RUnlock()
+	if fn == nil {
+		return false, false
+	}
+	return fn()
+}
+
+// SetStaleMountRetirer wires the privileged unmount helper seam. Pass nil
+// to remove it.
+func (m *HealthMonitor) SetStaleMountRetirer(r StaleMountRetirer) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.staleRetirer = r
 }
 
 // EnableNFSAbsentRemount registers the mount callback for the NFS-layer
@@ -339,6 +491,56 @@ func (m *HealthMonitor) Status() HealthStatus {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.status
+}
+
+// RefreshNFS performs an out-of-band, truthful NFS probe and folds only that
+// component into the cached health snapshot. The app's user-visible mount is
+// created asynchronously after the NFS server starts; a successful mount can
+// therefore land just after Start's initial check and would otherwise remain
+// reported as "not mounted" until the next 10-second tick. Mount completion
+// calls this method to remove that stale window. It never assumes success: the
+// same bounded stat + kernel mount-table checks as the periodic monitor must
+// pass before NFS or Overall become healthy.
+func (m *HealthMonitor) RefreshNFS() ComponentStatus {
+	nextNFS := m.checkNFS()
+
+	m.mu.Lock()
+	recovery := m.nfsRecovery
+	nextNFS = overlayNFSRecovery(nextNFS, recovery)
+	prevNFS := m.status.NFS
+	prevOverall := m.status.Overall
+	m.status.NFS = nextNFS
+	m.status.NFSRecovery = recovery
+	m.status.Overall = m.status.Redis.Healthy && m.status.MinIO.Healthy &&
+		m.status.FUSE.Healthy && nextNFS.Healthy
+	nextOverall := m.status.Overall
+	m.mu.Unlock()
+
+	m.logTransition("NFS", prevNFS, nextNFS)
+	if prevOverall != nextOverall {
+		if nextOverall {
+			jmlog.Info("system recovered — all components healthy")
+		} else {
+			jmlog.Warn("system degraded — one or more components unhealthy")
+		}
+	}
+	return nextNFS
+}
+
+// RecoverAbsentNFSNow performs an out-of-band, fully guarded absent-mount
+// observation. The FUSE watchdog calls this immediately after a verified
+// watchdog remount so the user-visible NFS volume does not wait for the next
+// 10-second health tick. It does not trust the notification by itself: the
+// ordinary raw FUSE probe, kernel mount-table check, JuiceFS process check,
+// loopback listener probe, offline/kill-switch guards, single-flight, and
+// failure backoff all still apply. A qualifying recovery is launched
+// asynchronously by handleNFSAbsentRecovery. The return value reports whether
+// this monitor claimed the absent-mount condition, not whether the asynchronous
+// mount has completed.
+func (m *HealthMonitor) RecoverAbsentNFSNow() bool {
+	fuseStatus := m.checkFUSE()
+	nfsStatus := m.checkNFS()
+	return m.handleNFSAbsentRecovery(nfsStatus, fuseStatus.Healthy)
 }
 
 // InGracePeriod returns true if a network change happened recently enough
@@ -382,10 +584,11 @@ func (m *HealthMonitor) runChecks(ctx context.Context) {
 	// up), the legacy handler is fed "healthy" so the two paths can never
 	// double-act on the same condition — no more per-tick "deferring to the
 	// fuse watchdog" spam, no 180s hard remount racing this path.
-	claimed := m.handleNFSAbsentRecovery(nfsStatus, rawFUSEHealthy)
-
-	// Track NFS staleness streaks and trigger auto-remount when needed.
-	m.handleNFSAutoRemount(nfsStatus.Healthy || claimed)
+	m.routeNFSRecovery(nfsStatus, rawFUSEHealthy)
+	m.mu.RLock()
+	nfsRecovery := m.nfsRecovery
+	m.mu.RUnlock()
+	nfsStatus = overlayNFSRecovery(nfsStatus, nfsRecovery)
 
 	// Derive connection states
 	redisConnState := connStateFor(prev.RedisConnState, prev.Redis.Healthy, redisStatus.Healthy)
@@ -394,27 +597,24 @@ func (m *HealthMonitor) runChecks(ctx context.Context) {
 	overall := redisStatus.Healthy && minioStatus.Healthy &&
 		fuseStatus.Healthy && nfsStatus.Healthy
 
-	// Collect runtime memory stats.
-	var ms runtime.MemStats
-	runtime.ReadMemStats(&ms)
-
-	var gcPauseUs uint64
-	if ms.NumGC > 0 {
-		gcPauseUs = ms.PauseNs[(ms.NumGC+255)%256] / 1000
-	}
+	// Collect runtime memory stats without the ReadMemStats stop-the-world path.
+	// runtime/metrics exposes a cumulative pause histogram, not a truthful
+	// "last pause" sample, so report unavailable instead of retaining stale data.
+	ms := readRuntimeMemorySnapshot()
 
 	next := HealthStatus{
 		Redis:          redisStatus,
 		MinIO:          minioStatus,
 		FUSE:           fuseStatus,
 		NFS:            nfsStatus,
+		NFSRecovery:    nfsRecovery,
 		Overall:        overall,
 		RedisConnState: redisConnState,
 		MinIOConnState: minioConnState,
-		HeapAllocMB:    float64(ms.HeapAlloc) / (1024 * 1024),
-		HeapSysMB:      float64(ms.HeapSys) / (1024 * 1024),
-		NumGC:          ms.NumGC,
-		GCPauseLastUs:  gcPauseUs,
+		HeapAllocMB:    float64(ms.heapAllocBytes) / (1024 * 1024),
+		HeapSysMB:      float64(ms.heapSysBytes) / (1024 * 1024),
+		NumGC:          ms.numGC,
+		GCPauseLastUs:  0,
 	}
 
 	// Populate application-level stats if a provider is registered.
@@ -447,23 +647,70 @@ func (m *HealthMonitor) runChecks(ctx context.Context) {
 	}
 }
 
+// Route one probe verdict through both recovery paths. An unreadable mount
+// table is still an unhealthy observation, but cannot authorize an unmount or
+// contribute to a stale-mount streak. The legacy bool handler stays unchanged.
+func (m *HealthMonitor) routeNFSRecovery(st ComponentStatus, rawFUSEHealthy bool) {
+	claimed := m.handleNFSAbsentRecovery(st, rawFUSEHealthy)
+	m.handleNFSAutoRemount(st.Healthy || claimed || st.nfsObserverUnavailable,
+		st.Message == nfsMsgNotMounted)
+}
+
+// overlayNFSRecovery makes the typed stale-recovery state user-visible: while
+// NFS is unhealthy and recovery waits for the unmount helper, the component
+// message names that cause instead of the raw probe text. A healthy status
+// is never rewritten, and neither is a verified-absent one: the app decides
+// mounted-vs-absent by looking for "not mounted" in this message.
+func overlayNFSRecovery(st ComponentStatus, state NFSRecoveryState) ComponentStatus {
+	if !st.Healthy && st.Message != nfsMsgNotMounted && state == NFSRecoveryHelperRequired {
+		st.Message = NFSStaleHelperRequiredMessage
+	}
+	return st
+}
+
 // handleNFSAutoRemount tracks consecutive NFS health failures and, once
-// the threshold is crossed (and cooldown allows), invokes a force-
-// unmount + remount sequence. It is a no-op when no remount callback
-// is registered or when the mount point is not configured.
-func (m *HealthMonitor) handleNFSAutoRemount(healthy bool) {
+// the threshold is crossed (and cooldown allows), recovers the volume.
+// It is a no-op when no remount callback is registered or when the mount
+// point is not configured.
+//
+// H-3 (2026-10-06): this path never unmounts by pathname. The former
+// `sudo umount -f <mountpoint>` step was deleted because a pathname cannot
+// prove which kernel mount it reaches: a replaced or foreign mount at the
+// same path would be force-detached, together with every mount nested
+// under it. Recovery now splits on what the probe observed:
+//
+//   - verified absent ("not mounted"): nothing needs detaching, so the
+//     registered remount callback runs a new birth directly.
+//   - present but stale/unresponsive: a detach is required first. Only the
+//     privileged JuiceMount unmount helper may perform it, because it
+//     targets the kernel mount by its proven identity, not by path. It is
+//     asked only when the exact JuiceFS child is PROVEN dead (its own Wait
+//     returned; SetJuiceFSLiveness), with Liveness Dead. While the servers
+//     are alive or unproven, or no helper is wired, the monitor enters the
+//     typed NFSRecoveryHelperRequired state, keeps serving, and reports
+//     NFSStaleHelperRequiredMessage to the user instead of acting.
+func (m *HealthMonitor) handleNFSAutoRemount(healthy, absent bool) {
 	m.mu.Lock()
 	remountFn := m.remountFn
 	mountPoint := m.cfg.NFSMountPoint
 	if remountFn == nil || mountPoint == "" {
 		m.nfsStaleStreak = 0
+		m.nfsRecovery = NFSRecoveryNone
 		m.mu.Unlock()
 		return
 	}
 	if healthy {
 		m.nfsStaleStreak = 0
+		m.nfsRecovery = NFSRecoveryNone
 		m.mu.Unlock()
 		return
+	}
+	if absent {
+		// A confirmed-absent probe proves there is no stale mount left to
+		// detach (e.g. the user chose Disconnect in macOS's "server not
+		// responding" dialog). Helper-required no longer applies, even if
+		// the remount below fails: the app must see "not mounted".
+		m.nfsRecovery = NFSRecoveryNone
 	}
 	m.nfsStaleStreak++
 	streak := m.nfsStaleStreak
@@ -475,18 +722,19 @@ func (m *HealthMonitor) handleNFSAutoRemount(healthy bool) {
 
 	// QA-39 (2026-06-13): do NOT tear the mount down while juicefs is alive.
 	// NFS staleness during a backend-link blip is a temporarily-wedged FUSE
-	// mount, not a dead one — and force-unmount + SIGKILL of the juicefs tree
-	// (the unmount kills processes matching "juicefs mount.*<mountpoint>",
-	// which also takes out juicefs's own -d supervisor) is exactly the macFUSE
-	// remount-thrash that the fuse.go monitorLoop was rewritten to avoid on
-	// 2026-05-29 — yet this NFS path kept the old "remount after N stale
-	// checks" policy and fired it on a flap, vanishing the volume mid-copy
-	// ("device disappeared"). While juicefs is alive, defer to the FUSE
-	// watchdog (health/fuse.go), which owns the last-resort escalation after a
-	// sustained window + backend-reachable check. Remount from here only when
+	// mount, not a dead one. While juicefs is alive, defer to the FUSE
+	// watchdog (health/fuse.go), which owns the last-resort escalation after
+	// a sustained window + backend-reachable check. Act from here only when
 	// the juicefs process tree is gone, or — as a far-out backstop — if the
 	// NFS layer stays wedged well past the FUSE watchdog's own window.
-	alive := isJuiceFSProcessAliveFn()
+	// Liveness comes from the exact child's own Wait. Without a child
+	// receipt in this process it is unproven; the process-table probe then
+	// only informs the deferral below and never licenses a helper call.
+	alive, proven := m.JuiceFSLiveness()
+	if !proven {
+		alive = isJuiceFSProcessAliveFn(m.cfg.FUSEPath)
+	}
+	provenDead := proven && !alive
 	if alive && streak < NFSStaleHardRemountThreshold {
 		jmlog.Warn("nfs mount stale but juicefs alive — deferring to the fuse watchdog, not remounting",
 			"mount_point", mountPoint, "consecutive_failures", streak)
@@ -494,6 +742,27 @@ func (m *HealthMonitor) handleNFSAutoRemount(healthy bool) {
 	}
 
 	m.mu.Lock()
+	retirer := m.staleRetirer
+	if !absent && (retirer == nil || !provenDead) {
+		// A stale mount is still in the kernel table and nothing here may
+		// detach it. Hold the typed state while unhealthy; log only on the
+		// edge so the 10 s loop does not spam. The NFS server keeps serving
+		// so the mount can recover by itself if the wedge clears.
+		entered := m.nfsRecovery != NFSRecoveryHelperRequired
+		m.nfsRecovery = NFSRecoveryHelperRequired
+		m.mu.Unlock()
+		if entered {
+			jmlog.Warn("nfs mount stale; recovery requires the JuiceMount unmount helper — not unmounting by path",
+				"mount_point", mountPoint,
+				"consecutive_failures", streak,
+				"juicefs_alive", alive,
+				"liveness_proven", proven,
+				"helper_wired", retirer != nil,
+				"state", string(NFSRecoveryHelperRequired),
+			)
+		}
+		return
+	}
 	if !m.lastRemountAt.IsZero() && time.Since(m.lastRemountAt) < NFSRemountCooldown {
 		jmlog.Debug("nfs auto-remount suppressed by cooldown",
 			"streak", streak,
@@ -507,20 +776,37 @@ func (m *HealthMonitor) handleNFSAutoRemount(healthy bool) {
 	m.lastRemountAt = time.Now()
 	m.mu.Unlock()
 
+	if !absent {
+		// The helper proves and retires the stale mount by kernel identity.
+		// It is given no path on purpose. A failure keeps the typed state:
+		// remounting over a still-present mount would stack a second mount.
+		ctx, cancel := context.WithTimeout(context.Background(), NFSStaleRetireTimeout)
+		err := retirer.RetireStaleNFSMount(ctx, client.LivenessDead)
+		cancel()
+		if err != nil {
+			m.mu.Lock()
+			m.nfsRecovery = NFSRecoveryHelperRequired
+			m.mu.Unlock()
+			jmlog.Warn("nfs stale-mount retirement by the unmount helper failed; not remounting",
+				"mount_point", mountPoint, "error", err.Error())
+			return
+		}
+	}
+
 	jmlog.Warn("nfs mount stale, attempting auto-remount",
 		"mount_point", mountPoint,
 		"consecutive_failures", streak,
 		"juicefs_alive", alive,
+		"absent", absent,
 	)
-	if err := forceUnmountFn(mountPoint); err != nil {
-		jmlog.Warn("nfs force-unmount failed (continuing to remount anyway)",
-			"mount_point", mountPoint, "error", err.Error())
-	}
 	if err := remountFn(); err != nil {
 		jmlog.Error("nfs auto-remount failed",
 			"mount_point", mountPoint, "error", err.Error())
 		return
 	}
+	m.mu.Lock()
+	m.nfsRecovery = NFSRecoveryNone
+	m.mu.Unlock()
 	jmlog.Info("nfs auto-remount succeeded", "mount_point", mountPoint)
 }
 
@@ -563,7 +849,12 @@ func (m *HealthMonitor) handleNFSAbsentRecovery(st ComponentStatus, rawFUSEHealt
 	// Probe process table + listener only on ticks that could qualify —
 	// never exec pgrep / dial per tick on the happy path.
 	if absent && in.Enabled && !in.Offline {
-		in.JuiceFSAlive = rawFUSEHealthy && isJuiceFSProcessAliveFn()
+		if m.ownedFUSESource() != nil {
+			alive, proven := m.JuiceFSLiveness()
+			in.JuiceFSAlive = rawFUSEHealthy && proven && alive
+		} else {
+			in.JuiceFSAlive = rawFUSEHealthy && isJuiceFSProcessAliveFn(m.cfg.FUSEPath)
+		}
 		in.ServerUp = serverAddr != "" && nfsServerUpFn(serverAddr)
 	}
 	claimed := absent && in.Enabled && !in.Offline && in.JuiceFSAlive && in.ServerUp
@@ -629,28 +920,6 @@ func (m *HealthMonitor) runAbsentRemount(fn func() error, mountPoint string) {
 	}
 	jmlog.Warn("nfs-layer auto-remount failed, will retry in "+retry,
 		"mount_point", mountPoint, "attempt", failures, "error", err.Error())
-}
-
-// forceUnmount runs `umount -f` on the given mount point. Errors here
-// are non-fatal: the subsequent mount attempt is the actual recovery.
-//
-// Bounded at 20 s. `sudo umount -f` can hang on a truly-wedged kernel
-// mount (the original `umount` syscall enters uninterruptible D state on
-// some failure modes). Without a context, the runChecks goroutine that
-// called this would never tick again, and the health-monitor loop would
-// be functionally dead.
-func forceUnmount(mountPoint string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, "sudo", "umount", "-f", mountPoint)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		if ctx.Err() == context.DeadlineExceeded {
-			return fmt.Errorf("umount -f %s: timed out after 20s (kernel mount likely wedged)", mountPoint)
-		}
-		return fmt.Errorf("umount -f %s: %v: %s", mountPoint, err, strings.TrimSpace(string(out)))
-	}
-	return nil
 }
 
 // debounceFUSE applies hysteresis to the raw FUSE probe so a transient
@@ -814,59 +1083,27 @@ func minioHostPort(rawURL string) string {
 }
 
 func (m *HealthMonitor) checkFUSE() ComponentStatus {
-	now := time.Now()
+	return m.checkFUSEWith(productionHealthMountDeps())
+}
 
-	// Check 1: directory exists, AND stat doesn't hang.
-	// A bare os.Stat on a wedged FUSE path enters uninterruptible kernel
-	// wait. Wrap in the same goroutine+timeout pattern used below for
-	// readdir.
-	statDone := make(chan struct {
-		info os.FileInfo
-		err  error
-	}, 1)
-	go func() {
-		info, err := os.Stat(m.cfg.FUSEPath)
-		statDone <- struct {
-			info os.FileInfo
-			err  error
-		}{info, err}
-	}()
-	select {
-	case r := <-statDone:
-		if r.err != nil || !r.info.IsDir() {
-			jmlog.Debug("fuse mount missing", "path", m.cfg.FUSEPath)
-			return ComponentStatus{Healthy: false, LastCheck: now, Message: fmt.Sprintf("stat failed: %v", r.err)}
+func (m *HealthMonitor) checkFUSEWith(deps healthMountDeps) ComponentStatus {
+	now := time.Now()
+	if probe := m.ownedFUSESource(); probe != nil {
+		evidence := probe()
+		if evidence.Ready && evidence.ChildProven && evidence.ChildAlive {
+			return ComponentStatus{Healthy: true, LastCheck: now, Message: "ok"}
 		}
-	case <-time.After(5 * time.Second):
-		// #89 online busy-suppression: a foreground stat that TIMES OUT while a
-		// legitimate heavy ingest is draining is the drain's synchronous MinIO
-		// PUTs saturating the FUSE request queue — BUSY, not wedged. Reporting
-		// degraded here surfaces as the Finder "mount losing communication"
-		// report even though the mount is fine (the destructive remount path
-		// already defers safely; this is purely the reporting layer). The
-		// ONLINE analogue of the pin.IsOffline() readdir suppression below. Only
-		// a TIMEOUT is suppressed — a genuine stat error still degrades (that's
-		// the error branch above, unreachable from here).
-		if m.busyIngesting() {
-			jmlog.Info("fuse stat slow but drain in flight (busy, heavy ingest) — not flagging wedged", "path", m.cfg.FUSEPath)
-			return ComponentStatus{Healthy: true, LastCheck: now, Message: "busy (heavy ingest)"}
-		}
-		jmlog.Warn("fuse stat timed out (path likely wedged)", "path", m.cfg.FUSEPath)
-		go m.logWedgeDiagnostics("stat_timeout")
-		return ComponentStatus{Healthy: false, LastCheck: now, Message: "stat timed out (wedged FUSE mount)"}
+		return ComponentStatus{Healthy: false, LastCheck: now, Message: "owned JuiceFS mount unproven or unavailable"}
 	}
 
-	// Check 2: mount is actually a FUSE filesystem (appears in mount table).
-	// `mount` (getfsstat) can hang in the kernel if the table contains a
-	// wedged entry; bound it.
-	mountCtx, mountCancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer mountCancel()
-	out, _ := exec.CommandContext(mountCtx, "mount").Output()
-	if mountCtx.Err() == context.DeadlineExceeded {
+	// Check 1: a complete native snapshot proves exact macFUSE presence on
+	// Darwin. An unknown observation is never a proof of absence.
+	present, mountErr := healthMountPresentWith(m.cfg.FUSEPath, "macfuse", 5*time.Second, deps)
+	if mountErr != nil {
 		jmlog.Warn("mount table query timed out in checkFUSE", "path", m.cfg.FUSEPath)
 		return ComponentStatus{Healthy: false, LastCheck: now, Message: "mount table query timed out"}
 	}
-	if !strings.Contains(string(out), m.cfg.FUSEPath) {
+	if !present {
 		jmlog.Debug("fuse mount not in mount table", "path", m.cfg.FUSEPath)
 		// V2.3 G0d: when the miss is the kext-approval loss, say so with the
 		// remediation — "no FUSE" alone reads like a transient.
@@ -877,45 +1114,16 @@ func (m *HealthMonitor) checkFUSE() ComponentStatus {
 		return ComponentStatus{Healthy: false, LastCheck: now, Message: "not mounted (directory exists but no FUSE)"}
 	}
 
-	// Check 3: mount is responsive (stale FUSE mounts hang on readdir)
-	done := make(chan error, 1)
-	go func() {
-		_, err := os.ReadDir(m.cfg.FUSEPath)
-		done <- err
-	}()
-	select {
-	case err := <-done:
-		if err != nil {
-			jmlog.Debug("fuse readdir failed", "path", m.cfg.FUSEPath, "error", err.Error())
-			return ComponentStatus{Healthy: false, LastCheck: now, Message: fmt.Sprintf("readdir failed: %v", err)}
-		}
-		return ComponentStatus{Healthy: true, LastCheck: now, Message: "ok"}
-	case <-time.After(5 * time.Second):
-		// Offline-aware (release fix): a root readdir that times out while the
-		// user is OFFLINE is the juicefs daemon being SATURATED by in-flight
-		// spool drains (writes with nowhere to go offline) — BUSY, not wedged.
-		// Reporting unhealthy here feeds the watchdog's escalate-to-remount,
-		// which SIGTERMs a healthy daemon and drops the NFS mount → Finder
-		// "connection interrupted". Offline, treat a readdir timeout as a
-		// transient busy state, not a stale-mount fault.
-		if pin.IsOffline() {
-			jmlog.Debug("fuse readdir slow but offline (busy draining) — not flagging stale", "path", m.cfg.FUSEPath)
-			return ComponentStatus{Healthy: true, LastCheck: now, Message: "offline (busy/draining)"}
-		}
-		// #89 ONLINE analogue of the offline suppression above: a readdir that
-		// times out while a heavy ingest is draining is the same saturated-FUSE-
-		// queue busy state, just ONLINE. Suppress it (busy, not stale) so a
-		// high-concurrency ingest doesn't surface as "mount losing communication"
-		// / feed the watchdog's escalate-to-remount. TIMEOUT-only (genuine
-		// readdir errors take the error branch above and still degrade).
-		if m.busyIngesting() {
-			jmlog.Info("fuse readdir slow but drain in flight (busy, heavy ingest) — not flagging stale", "path", m.cfg.FUSEPath)
-			return ComponentStatus{Healthy: true, LastCheck: now, Message: "busy (heavy ingest)"}
-		}
-		jmlog.Warn("fuse mount unresponsive (stale)", "path", m.cfg.FUSEPath)
-		go m.logWedgeDiagnostics("readdir_unresponsive")
-		return ComponentStatus{Healthy: false, LastCheck: now, Message: "unresponsive (stale mount)"}
+	// Check 2: the exact JuiceFS service process is alive. Do not stat, read,
+	// or readdir any FUSE path here: even .config incurs an uncached Redis lookup
+	// on the shipping JuiceFS build, and this function runs every 10 seconds
+	// forever. Redis and object-store reachability are checked independently;
+	// actual user I/O feeds the NFS stall detector.
+	if !isJuiceFSProcessAliveFn(m.cfg.FUSEPath) {
+		jmlog.Warn("fuse mount present but JuiceFS service is not running", "path", m.cfg.FUSEPath)
+		return ComponentStatus{Healthy: false, LastCheck: now, Message: "JuiceFS service not running"}
 	}
+	return ComponentStatus{Healthy: true, LastCheck: now, Message: "ok"}
 }
 
 // logWedgeDiagnostics captures backend RTT + process liveness at the instant a
@@ -951,24 +1159,43 @@ func (m *HealthMonitor) logWedgeDiagnostics(reason string) {
 		"reason", reason,
 		"redis_ok", redisStatus.Healthy, "redis_probe_ms", redisMs, "redis_msg", redisStatus.Message,
 		"minio_ok", minioStatus.Healthy, "minio_probe_ms", minioMs, "minio_msg", minioStatus.Message,
-		"juicefs_alive", isJuiceFSProcessAliveFn(),
+		"juicefs_alive", isJuiceFSProcessAliveFn(m.cfg.FUSEPath),
 	)
 }
 
-// checkNFS verifies the NFS mount is responsive. A simple os.Stat() can
-// hang indefinitely on a stale mount, so we time-bound the call: any
-// stat call that does not return within NFSStatTimeout is treated as a
-// stale-mount signal (the same condition that produces the Finder
-// spinning beach ball).
+// checkNFS verifies both the mount-point stat and kernel mount-table entry.
+// The combined probe is time-bounded; the last observed phase identifies
+// how far the worker progressed without changing the health decision.
 func (m *HealthMonitor) checkNFS() ComponentStatus {
+	st, _ := m.checkNFSWithProbe(nfsProbeDeps{stat: os.Stat, mountTable: mountTableHas}, NFSStatTimeout)
+	return st
+}
+
+type nfsProbeDeps struct {
+	stat       func(string) (os.FileInfo, error)
+	mountTable func(string, time.Duration) (bool, error)
+}
+
+const (
+	nfsProbeStat uint32 = iota
+	nfsProbeMountTable
+)
+
+// The completion channel belongs to this invocation. Production ignores it;
+// focused tests release held dependencies and join the original worker.
+func (m *HealthMonitor) checkNFSWithProbe(deps nfsProbeDeps, timeout time.Duration) (ComponentStatus, <-chan struct{}) {
 	now := time.Now()
+	workerDone := make(chan struct{})
 	if m.cfg.NFSMountPoint == "" {
-		return ComponentStatus{Healthy: true, LastCheck: now, Message: "not configured"}
+		close(workerDone)
+		return ComponentStatus{Healthy: true, LastCheck: now, Message: "not configured"}, workerDone
 	}
 
 	done := make(chan ComponentStatus, 1)
+	var phase atomic.Uint32
 	go func() {
-		if _, err := os.Stat(m.cfg.NFSMountPoint); err != nil {
+		defer close(workerDone)
+		if _, err := deps.stat(m.cfg.NFSMountPoint); err != nil {
 			if os.IsNotExist(err) {
 				// Mount-point directory gone — nothing is mounted there.
 				// Distinct from "stale" so the UI can offer "Mount Now"
@@ -987,9 +1214,10 @@ func (m *HealthMonitor) checkNFS() ComponentStatus {
 		// a wedged entry; on table-read failure report stale rather than
 		// not-mounted so the UI doesn't offer a Mount Now that would fail
 		// against a busy mount point.
-		mounted, err := mountTableHas(m.cfg.NFSMountPoint, NFSStatTimeout)
+		phase.Store(nfsProbeMountTable)
+		mounted, err := deps.mountTable(m.cfg.NFSMountPoint, timeout)
 		if err != nil {
-			done <- ComponentStatus{Healthy: false, LastCheck: now, Message: fmt.Sprintf("stale: mount table unreadable: %v", err)}
+			done <- ComponentStatus{Healthy: false, LastCheck: now, Message: fmt.Sprintf("stale: mount table unreadable: %v", err), nfsObserverUnavailable: true}
 			return
 		}
 		if !mounted {
@@ -1004,8 +1232,14 @@ func (m *HealthMonitor) checkNFS() ComponentStatus {
 		// A resolved probe (success OR a genuine error/ENOTCONN from the inner
 		// goroutine) is authoritative — return it verbatim. The busy-suppression
 		// below covers ONLY the TIMEOUT branch, never a real error.
-		return st
-	case <-time.After(NFSStatTimeout):
+		return st, workerDone
+	case <-time.After(timeout):
+		observedPhase := "stat"
+		message := "unresponsive (stat timeout)"
+		if phase.Load() == nfsProbeMountTable {
+			observedPhase = "mount_table"
+			message = "unresponsive (mount table timeout)"
+		}
 		// #89 online busy-suppression (same rationale as checkFUSE): an NFS stat
 		// that TIMES OUT while a heavy ingest is draining is the drain saturating
 		// the FUSE queue behind the NFS layer — BUSY, not stale. Suppress the
@@ -1013,33 +1247,21 @@ func (m *HealthMonitor) checkNFS() ComponentStatus {
 		// losing communication". TIMEOUT-only: a resolved error/ENOTCONN takes
 		// the `case st := <-done` branch above and still degrades.
 		if m.busyIngesting() {
-			jmlog.Info("nfs stat slow but drain in flight (busy, heavy ingest) — not flagging stale",
-				"mount_point", m.cfg.NFSMountPoint, "timeout_ms", NFSStatTimeout.Milliseconds())
-			return ComponentStatus{Healthy: true, LastCheck: now, Message: "busy (heavy ingest)"}
+			jmlog.Info("nfs probe slow but drain in flight (busy, heavy ingest) — not flagging stale",
+				"mount_point", m.cfg.NFSMountPoint, "timeout_ms", timeout.Milliseconds(), "phase", observedPhase)
+			return ComponentStatus{Healthy: true, LastCheck: now, Message: "busy (heavy ingest)"}, workerDone
 		}
-		jmlog.Warn("nfs mount unresponsive (stat timed out)",
+		jmlog.Warn("nfs mount unresponsive (probe timed out)",
 			"mount_point", m.cfg.NFSMountPoint,
-			"timeout_ms", NFSStatTimeout.Milliseconds(),
+			"timeout_ms", timeout.Milliseconds(), "phase", observedPhase,
 		)
-		return ComponentStatus{Healthy: false, LastCheck: now, Message: "unresponsive (stat timeout)"}
+		return ComponentStatus{Healthy: false, LastCheck: now, Message: message,
+			nfsObserverUnavailable: observedPhase == "mount_table"}, workerDone
 	}
 }
 
-// mountTableHas reports whether path appears as a mount point in the
-// kernel mount table. Matches " on <path> (" so prefix-sharing paths
-// (/Volumes/zpool vs /Volumes/zpool2) can't false-positive. Bounded:
-// `mount` calls getfsstat(), which can hang in the kernel when the table
-// holds a wedged entry — on timeout (or any exec failure) an error is
-// returned and the caller decides how to degrade.
+// mountTableHas reports exact NFS presence, not ownership or retirement
+// authority. Native observer errors stay unknown for recovery routing.
 func mountTableHas(path string, timeout time.Duration) (bool, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-	out, err := exec.CommandContext(ctx, "mount").Output()
-	if err != nil {
-		if ctx.Err() == context.DeadlineExceeded {
-			return false, fmt.Errorf("mount table query timed out after %s", timeout)
-		}
-		return false, err
-	}
-	return strings.Contains(string(out), " on "+path+" ("), nil
+	return healthMountPresent(path, "nfs", timeout)
 }

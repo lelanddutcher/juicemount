@@ -8,8 +8,8 @@ import UserNotifications
 ///     that states exactly WHEN each group takes effect (immediate vs next
 ///     start vs full Stop → Start) — accurate to the actual plumbing:
 ///     `Preferences.toServerConfig()` is read once in
-///     `ServerController.start()`, and Restart (soft-stop) keeps the
-///     JuiceFS daemon + Finder mount alive, so daemon-level settings only
+///     `ServerController.start()`, and Restart keeps the JuiceFS daemon warm
+///     while briefly remounting Finder/NFS, so daemon-level settings only
 ///     apply after a full Stop everything → Start.
 ///   - Fixed 600 pt width; each tab declares its own content height so the
 ///     window hugs the form (no scroll-within-scroll, no dead space). The
@@ -25,6 +25,10 @@ struct PreferencesWindowView: View {
     @State private var selectedTab: Tab = .general
     @State private var advancedAddressesExpanded = false
     @State private var customMountExpanded = false
+    // Connection tab: Redis password entry. The draft never leaves this view
+    // except through Preferences.setRedisPassword (Keychain).
+    @State private var redisPasswordDraft = ""
+    @State private var redisPasswordSaveFailed = false
     /// Last non-empty sanitized volume name — the comparison anchor for the
     /// name→mount-point derivation (see deriveMountPoint).
     @State private var derivationAnchor = ""
@@ -55,19 +59,27 @@ struct PreferencesWindowView: View {
                 .tabItem { Label("Maintenance", systemImage: "wrench.and.screwdriver") }
                 .tag(Tab.maintenance)
         }
-        .frame(width: 600, height: idealHeight)
-    }
-
-    /// Per-tab content height so the window fits each form without dead
-    /// space. The grouped Form scrolls gracefully if a localized build
-    /// wraps a footer onto an extra line.
-    private var idealHeight: CGFloat {
-        switch selectedTab {
-        case .general:      return 360
-        case .connection:   return advancedAddressesExpanded ? 660 : customMountExpanded ? 615 : 545
-        case .cacheStorage: return 610
-        case .maintenance:  return 500
-        }
+        // NO fixed size here, in EITHER axis, and do not add one back.
+        //
+        // The window owns its size now (see openPreferencesWindow). The content
+        // fills whatever it is given and each tab's grouped Form scrolls if it
+        // needs more room. That is deliberate: while this view declared its own
+        // size AND the window derived its size from this view, the two chased
+        // each other through SwiftUI's preferredContentSize getter until AppKit
+        // hit its 141-iteration display-cycle limit and aborted the process.
+        //
+        //   Marking window as needing Update Constraints in Window
+        //   for identifier 2702 (limit: 141, count: 143)
+        //
+        // Clicking either disclosure caret below did it every time (four
+        // crashes in eleven minutes on 2026-08-16), and it recurred on
+        // 2026-08-18 through the same getter after only the changing HEIGHT had
+        // been removed. Each crash costs minutes of unusable mount, because the
+        // app relaunches and re-runs a full metadata sync before the NFS server
+        // starts listening.
+        //
+        // A size here would restore the second authority and with it the loop.
+        .frame(minWidth: 560, minHeight: 420)
     }
 
     // MARK: - General
@@ -191,6 +203,17 @@ struct PreferencesWindowView: View {
                             if clean != newValue { preferences.redisURL = clean }
                         }
                 }
+                LabeledContent("Redis password") {
+                    HStack(spacing: 6) {
+                        SecureField("Password for this Mac", text: $redisPasswordDraft)
+                            .textFieldStyle(.roundedBorder)
+                            .frame(width: 220, alignment: .leading)
+                            .onSubmit(saveRedisPassword)
+                        Button("Save") { saveRedisPassword() }
+                            .disabled(redisPasswordDraft.isEmpty)
+                    }
+                }
+                redisPasswordStatusLine
                 LabeledContent("S3 endpoint override") {
                     TextField("http://<server-ip>:9000/<bucket>", text: $preferences.s3EndpointOverride)
                         .textFieldStyle(.roundedBorder)
@@ -206,6 +229,8 @@ struct PreferencesWindowView: View {
             } footer: {
                 footnote("Redis stores the JuiceFS metadata this Mac syncs from. Leave the S3 override empty for direct-LAN setups; set it when the server formatted JuiceFS with a hostname this Mac can't resolve (typical for docker-internal names) — e.g. http://<server-ip>:9000/<bucket>. Applies on the next start; the background JuiceFS daemon re-reads these only after Stop everything → Start.")
             }
+
+            serverAccessSection
 
             Section {
                 DisclosureGroup("Advanced addresses", isExpanded: $advancedAddressesExpanded) {
@@ -231,14 +256,250 @@ struct PreferencesWindowView: View {
                     }
                 }
             } footer: {
-                footnote("Local loopback endpoints for the built-in NFS server and its control plane. The NFS listen address takes effect after Stop everything → Start (the Finder mount must re-target it); the metrics address applies on the next start — Restart Server is enough. After editing the metrics address, health readouts in the popover pause until that restart.")
+                footnote("Local loopback endpoints for the built-in NFS server and its control plane. Changed addresses are saved while the mounted server keeps its current configuration. They remain pending until the volume can be safely restarted.")
+            }
+
+            // MARK: - Remote Access (JuiceMount Link)
+
+            Section {
+                Toggle("Use existing private network", isOn: $preferences.useExistingPrivateNetwork)
+                if preferences.useExistingPrivateNetwork {
+                    footnote("Uses the Redis and object-store addresses above through macOS routing. Choose this when Tailscale, NetBird, Firezone, ZeroTier, or another trusted VPN already makes the NAS reachable. JuiceMount does not receive or store that provider's credentials. A mode change is saved; the mounted server keeps its previous route until the volume can be safely restarted.")
+                }
+                if let status = server.restartConfigurationStatus {
+                    Label(status, systemImage: "clock.arrow.circlepath")
+                        .font(.caption)
+                        .foregroundStyle(MenuPopoverView.glanceAmber)
+                }
+                LabeledContent("Server URL") {
+                    TextField("http://<nas-ip>:30193", text: $preferences.linkServerURL)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.body.monospaced())
+                        .onChange(of: preferences.linkServerURL) { _, newValue in
+                            let clean = newValue.trimmingCharacters(in: .whitespaces)
+                            if clean != newValue { preferences.linkServerURL = clean }
+                        }
+                        .disabled(preferences.useExistingPrivateNetwork)
+                }
+                LabeledContent("Pairing Code") {
+                    SecureField("hskey-auth-…", text: $preferences.linkAuthKey)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.body.monospaced())
+                        .disabled(preferences.useExistingPrivateNetwork)
+                }
+                LabeledContent("Hostname") {
+                    TextField("juicemount-mac", text: $preferences.linkHostname)
+                        .textFieldStyle(.roundedBorder)
+                        .disabled(preferences.useExistingPrivateNetwork)
+                }
+                HStack(spacing: 10) {
+                    Button {
+                        server.testLink()
+                    } label: {
+                        if server.linkTestInFlight {
+                            HStack(spacing: 6) {
+                                ProgressView().controlSize(.small)
+                                Text("Pairing & Testing…")
+                            }
+                        } else {
+                            Label("Apply & Test", systemImage: "network.badge.shield.half.filled")
+                        }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(preferences.useExistingPrivateNetwork || server.linkTestInFlight || preferences.linkServerURL.isEmpty || preferences.linkAuthKey.isEmpty)
+
+                    if let result = server.linkTestResult {
+                        Label(linkResultText(result), systemImage: result.ok ? "checkmark.circle.fill" : (result.online ? "exclamationmark.triangle.fill" : "xmark.circle.fill"))
+                            .font(.caption)
+                            .foregroundStyle(result.ok ? .green : (result.online ? .orange : .red))
+                            .lineLimit(2)
+                            .help(result.error ?? linkResultText(result))
+                    }
+                }
+                footnote("Apply & Test is available before a volume is mounted. It confirms pairing, authorization, object storage, and the encrypted data route. Pairing changes made while a volume is mounted remain saved until the volume can be safely restarted.")
+            } header: {
+                Text("Remote Access")
+            } footer: {
+                if preferences.useExistingPrivateNetwork {
+                    footnote("Your VPN owns peer discovery, encryption, relays, and access policy. JuiceMount uses only the private NAS addresses you configured; no inbound public port or JuiceMount-hosted coordination service is required.")
+                } else {
+                    footnote("When configured, JuiceMount routes backend traffic through an encrypted tailnet tunnel. Get a code from your NAS manager's Link tab. Requires JM_NET_HEADSCALE=on on the server.")
+                }
             }
         }
         .formStyle(.grouped)
         .onAppear { seedDerivationAnchor() }
     }
 
+    // MARK: - Server access (H-8B enrollment)
+
+    /// This Mac's own access to the server: it asks the Manager for a
+    /// principal, an admin approves it there, and the password and object key
+    /// arrive in the Keychain. The clone notice lives here too, so a migrated
+    /// or cloned Mac sees why it must be approved again.
+    private var serverAccessSection: some View {
+        Section {
+            LabeledContent("Manager URL") {
+                TextField(preferences.effectiveManagerURL ?? "http://<nas-ip>:30190", text: $preferences.managerURL)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.body.monospaced())
+                    .frame(width: 300, alignment: .leading)
+                    .onChange(of: preferences.managerURL) { _, newValue in
+                        let clean = stripWhitespace(newValue)
+                        if clean != newValue { preferences.managerURL = clean }
+                    }
+            }
+            if let notice = preferences.deviceMigrationNotice {
+                Label(notice, systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(MenuPopoverView.glanceAmber)
+            }
+            LabeledContent("Access") {
+                HStack(spacing: 8) {
+                    Label(preferences.enrollment.summary, systemImage: enrollmentSymbol)
+                        .font(.caption)
+                        .foregroundStyle(enrollmentTint)
+                        .textSelection(.enabled)
+                        .lineLimit(4)
+                        .frame(maxWidth: 320, alignment: .leading)
+                    Button("Request access") { preferences.requestAccess() }
+                        .disabled(!enrollmentCanRequest)
+                }
+            }
+            if let note = preferences.enrollment.storageKeyNote {
+                LabeledContent("Storage key") {
+                    Label(note, systemImage: storageKeySymbol)
+                        .font(.caption)
+                        .foregroundStyle(storageKeyTint)
+                        .textSelection(.enabled)
+                        .lineLimit(6)
+                        .frame(maxWidth: 400, alignment: .leading)
+                }
+            }
+            if preferences.canRestorePreviousLogin,
+               [.approved, .approvedPendingCutover, .approvedLoginRefused, .approvedNotInUse].contains(preferences.enrollment.phase) {
+                LabeledContent("Previous login") {
+                    Button("Use previous login") { preferences.restorePreviousLogin() }
+                        .help("Go back to the Redis login this Mac used before it switched to its approved principal. Request access switches to the principal again.")
+                }
+            }
+            if preferences.enrollment.phase == .waiting, !preferences.enrollment.fingerprint.isEmpty {
+                LabeledContent("Code") {
+                    Text(preferences.enrollment.fingerprint)
+                        .font(.body.monospaced().weight(.semibold))
+                        .textSelection(.enabled)
+                }
+            }
+        } header: {
+            Text("Server access")
+        } footer: {
+            footnote("Each Mac signs in to the server as itself. Request access sends this Mac's request to the Manager; an admin approves it on the Principals page after checking that the code matches. The approved password and object-store key are saved in the Keychain only once the server accepts them (after its proxy cutover); until then this Mac keeps its current login. They apply after Stop everything → Start. Leave the Manager URL empty to use the Redis host on port 30190.")
+        }
+    }
+
+    private var storageKeySymbol: String {
+        switch preferences.enrollment.storageKey {
+        case .refused: return "xmark.octagon.fill"
+        case .pending: return "hourglass"
+        case .restartNeeded: return "arrow.clockwise.circle"
+        case .normal: return "key"
+        }
+    }
+
+    private var storageKeyTint: Color {
+        switch preferences.enrollment.storageKey {
+        case .refused: return .red
+        case .pending, .restartNeeded: return MenuPopoverView.glanceAmber
+        case .normal: return .secondary
+        }
+    }
+
+    private var enrollmentCanRequest: Bool {
+        switch preferences.enrollment.phase {
+        case .notEnrolled, .failed, .conflict, .revoked, .approvedPendingCutover, .approvedLoginRefused, .approvedNotInUse: return true
+        case .requesting, .waiting, .approved: return false
+        }
+    }
+
+    private var enrollmentSymbol: String {
+        switch preferences.enrollment.phase {
+        case .approved: return "checkmark.seal.fill"
+        case .waiting, .requesting, .approvedPendingCutover: return "hourglass"
+        case .revoked, .conflict: return "xmark.octagon.fill"
+        case .failed, .approvedLoginRefused: return "exclamationmark.triangle.fill"
+        case .approvedNotInUse: return "arrow.uturn.backward.circle"
+        case .notEnrolled: return "person.crop.circle.badge.questionmark"
+        }
+    }
+
+    private var enrollmentTint: Color {
+        switch preferences.enrollment.phase {
+        case .approved: return .green
+        case .waiting, .requesting, .failed, .approvedPendingCutover, .approvedLoginRefused, .approvedNotInUse: return MenuPopoverView.glanceAmber
+        case .revoked, .conflict: return .red
+        case .notEnrolled: return .secondary
+        }
+    }
+
+    private func linkResultText(_ result: NFSBridge.LinkTestResult) -> String {
+        if result.ok {
+            let latency = result.rttMS.map { " · \($0) ms" } ?? ""
+            let transport = result.transportMode.map { " · \($0 == "direct" ? "direct" : $0)" } ?? ""
+            let throughput: String
+            if let up = result.uploadMbps, let down = result.downloadMbps {
+                throughput = String(format: " · %.0f/%.0f Mb/s", up, down)
+            } else {
+                throughput = ""
+            }
+            return "Paired · data plane verified\(transport)\(throughput)\(latency)"
+        }
+        if result.online {
+            if result.redisReachable && result.objectStoreReachable {
+                let transport = result.transportMode.map { " (\($0))" } ?? ""
+                return "Paired; endpoints ready, data-plane test failed\(transport)"
+            }
+            if result.redisReachable {
+                return "Paired; Redis ready, object storage unavailable"
+            }
+            return "Paired; Redis unavailable through Link"
+        }
+        return result.error ?? "Pairing failed"
+    }
+
     // MARK: - Cache & Storage
+
+    /// Which server the saved password belongs to, from memory only (no
+    /// Keychain read in a render). A changed host, port or user is called out
+    /// rather than silently leaving the new server without a password.
+    @ViewBuilder
+    private var redisPasswordStatusLine: some View {
+        switch preferences.redisPasswordStatus {
+        case .saved(let account):
+            footnote("Saved in the Keychain for \(account).")
+        case .missing(let account):
+            Label("No password saved for \(account). Enter it above if this server requires one.",
+                  systemImage: "key")
+                .font(.caption)
+                .foregroundStyle(MenuPopoverView.glanceAmber)
+        case .invalidURL:
+            footnote("Enter a valid Redis URL to save a password for it.")
+        }
+        if redisPasswordSaveFailed {
+            Label("The Keychain did not accept the password. It is used until JuiceMount quits but is not saved.",
+                  systemImage: "exclamationmark.triangle")
+                .font(.caption)
+                .foregroundStyle(.red)
+        }
+    }
+
+    private func saveRedisPassword() {
+        guard !redisPasswordDraft.isEmpty else { return }
+        let draft = redisPasswordDraft
+        redisPasswordDraft = ""
+        preferences.setRedisPassword(draft) { ok in
+            DispatchQueue.main.async { redisPasswordSaveFailed = !ok }
+        }
+    }
 
     private var cacheStorageTab: some View {
         Form {
@@ -260,27 +521,49 @@ struct PreferencesWindowView: View {
             } header: {
                 Text("Cache layers")
             } footer: {
-                footnote("The SSD cache stores file blocks via JuiceFS (it may grow automatically to keep pinned files resident). The memory buffer serves small files (project files, LUTs) under the size threshold from RAM with zero syscalls. Memory-buffer changes apply on the next start — Restart Server is enough; the SSD cache size is read by the JuiceFS daemon, so it needs the full volume restart offered when you change it.")
+                footnote("The SSD cache stores file blocks via JuiceFS (it may grow automatically to keep pinned files resident). The memory buffer serves small files (project files, LUTs) under the size threshold from RAM with zero syscalls. Changes to either setting remain saved while the mounted server uses its current configuration; they remain pending until the volume can be safely restarted.")
             }
 
             Section {
-                Toggle("Enable write spool", isOn: $preferences.spoolEnabled)
-                    .onChange(of: preferences.spoolEnabled) { _, newValue in
-                        // The Go core reads the spool flag only at start, so
-                        // a running server must restart to pick up the change.
-                        guard !suppressSpoolToggleSideEffect else { return }
-                        guard isRunningLike else { return }
-                        if newValue {
-                            server.restart()
-                        } else {
-                            // LB-3 stranded-writes guard: restarting with the
-                            // spool DISABLED skips ALL spool wiring including
-                            // boot recovery, so any not-yet-uploaded entries
-                            // would be orphaned forever — Finder already told
-                            // the user "copied". Check pending before applying.
-                            checkPendingThenDisableSpool()
+                Toggle("Prepare video previews in background", isOn: $preferences.nativePreviewWarm)
+            } header: {
+                Text("Video previews")
+            } footer: {
+                footnote("Downloads parts of videos in the background on healthy connections. This can use additional data. The saved choice applies after Stop everything, then Start; the mounted server keeps its current setting until then.")
+            }
+
+            Section {
+                HStack {
+                    Toggle("Enable write spool", isOn: Binding(
+                        get: { preferences.spoolEnabled },
+                        set: { enabled in
+                            if enabled {
+                                preferences.spoolEnabled = true
+                            } else {
+                                // Do not persist false before the asynchronous
+                                // queue check, including while the server is stopped.
+                                checkPendingThenDisableSpool()
+                            }
                         }
+                    ))
+                    .disabled(spoolDisableCheckInFlight)
+                    if spoolDisableCheckInFlight {
+                        ProgressView().controlSize(.small)
                     }
+                }
+                if let status = server.writeSpoolConfigurationStatus {
+                    Label(status, systemImage: "clock.arrow.circlepath")
+                        .font(.caption)
+                        .foregroundStyle(MenuPopoverView.glanceAmber)
+                }
+                Toggle("Automatically recover saved files", isOn: $preferences.replacementRecovery)
+                    .disabled(!preferences.spoolEnabled)
+                footnote("An accepted save stays readable on this Mac while it waits. Automatic recovery needs support from the storage provider. This saved choice applies after Stop everything, then Start.")
+                if let status = server.recoveryConfigurationStatus {
+                    Label(status, systemImage: "clock.arrow.circlepath")
+                        .font(.caption)
+                        .foregroundStyle(MenuPopoverView.glanceAmber)
+                }
                 Toggle("Auto-size spool to free disk", isOn: Binding(
                     get: { preferences.spoolCapacityGB == 0 },
                     set: { preferences.spoolCapacityGB = $0 ? 0 : 200 }
@@ -294,7 +577,7 @@ struct PreferencesWindowView: View {
             } header: {
                 Text("Write spool (background uploads)")
             } footer: {
-                footnote("Writes land on the local SSD and are acknowledged immediately, then upload in the background — large copies feel local even over a slow link. Auto-size lets the buffer grow to nearly all free disk (keeping a 20 GB safety floor) so a big offline ingest fits; you can set a fixed cap instead. When the buffer fills, copies PAUSE (not fail) and resume as space frees or you reconnect. Pending uploads show in the menu-bar popover. Capacity changes apply on the next start.")
+                footnote("When active, writes land on the local SSD and upload in the background. Auto-size normally keeps a 20 GB safety floor. If the Mac is below it, a small working window remains without crossing the 10 GB OS floor. When the buffer fills, copies pause until space frees or you reconnect. Pending uploads show in the menu-bar popover. Spool and capacity changes are saved while the mounted server keeps its current configuration; they remain pending until the volume can be safely restarted.")
             }
 
             Section {
@@ -326,35 +609,45 @@ struct PreferencesWindowView: View {
         // LB-3 stranded-writes guard dialogs. confirmationDialog matches the
         // destructive-action idiom used elsewhere (Stop everything, Reset DB).
         .confirmationDialog(
-            "\(spoolDisablePendingFiles) file\(spoolDisablePendingFiles == 1 ? "" : "s") (\(formatBytesPrefs(spoolDisablePendingBytes))) not yet uploaded",
+            spoolDisableStatusUnknown ? "Can't verify the upload queue"
+                : spoolDisableVerifiedEmpty ? "No unfinished changes in the latest check"
+                : "Unfinished changes remain on this Mac",
             isPresented: $showSpoolDisableDialog,
             titleVisibility: .visible
         ) {
-            Button("Upload now, then turn off") {
-                spoolDrainWaitActive = true
+            if !spoolDisableVerifiedEmpty {
+                Button(spoolDisableStatusUnknown ? "Check again" : "Upload now, then turn off") {
+                    if spoolDisableStatusUnknown {
+                        checkPendingThenDisableSpool()
+                    } else {
+                        spoolDrainWaitActive = true
+                    }
+                }
             }
-            Button("Turn off anyway", role: .destructive) {
-                // The bytes stay on the local SSD and the rows stay in the
-                // index, but with the spool off nothing will ever upload
-                // them (the Go side logs a loud warning at start).
-                server.restart()
+            Button(spoolDisableVerifiedEmpty ? "Save write spool off" : "Save off anyway", role: .destructive) {
+                // The live mount keeps its current spool wiring. Pending rows
+                // remain on SSD; applying the saved disable later can strand them.
+                commitSpoolDisable()
             }
-            Button("Cancel", role: .cancel) {
-                revertSpoolToggleToEnabled()
-            }
+            Button("Cancel", role: .cancel) {}
         } message: {
-            Text("Turning the write spool off skips its recovery at start, so files still waiting to upload would stay stranded on this Mac — even though Finder already reported them as copied. Upload them first, or keep the spool on.")
+            Text(spoolDisableStatusUnknown
+                 ? "JuiceMount couldn't confirm whether copied files remain on this Mac. If the server is stopped, start it with the spool enabled before checking again. Otherwise, keep the setting on or explicitly save it off for a later full restart."
+                 : spoolDisableVerifiedEmpty
+                 ? "The latest check found no unfinished changes, but another write can arrive before the setting is applied. Save the spool off only when copying to this volume has stopped. The current mount keeps its live setting."
+                 : "\(spoolDisablePendingFiles) files pending (\(formatBytesPrefs(spoolDisablePendingBytes))); \(spoolDisablePendingSymlinks) links pending; \(spoolDisableFailedFiles) failed or declined. Saving the write spool off leaves the current mount unchanged, but applying that setting at a later full restart may strand copied changes on this Mac.")
         }
         .sheet(isPresented: $spoolDrainWaitActive) {
             SpoolDrainWaitView(
                 metricsAddr: preferences.metricsAddr,
                 onDrained: {
                     spoolDrainWaitActive = false
-                    server.restart()
+                    // A zero poll from the wait sheet can be stale by the
+                    // time it closes; inspect again before changing the flag.
+                    checkPendingThenDisableSpool()
                 },
                 onCancel: {
                     spoolDrainWaitActive = false
-                    revertSpoolToggleToEnabled()
                 }
             )
         }
@@ -384,7 +677,7 @@ struct PreferencesWindowView: View {
             } header: {
                 Text("Local database")
             } footer: {
-                footnote("The metadata cache is a local SQLite mirror of Redis — resetting it is safe and rebuilds on the next start. Offline pins (pin.db) are never touched. Database-file changes apply on the next start — Restart Server is enough.")
+                footnote("The metadata cache is a local SQLite mirror of Redis — resetting it is safe, but rebuilding a large index transfers metadata and can take much longer on cellular or a VPN. Prefer LAN when possible. Ordinary restarts do not need a rebuild. Offline pins (pin.db) are never touched. Database-file changes stay saved while the mounted server uses its current configuration; they remain pending until the volume can be safely restarted.")
             }
 
             Section {
@@ -392,7 +685,12 @@ struct PreferencesWindowView: View {
                     Button("Restart Server") {
                         server.restart()
                     }
-                    .disabled(!isRunningLike)
+                    .disabled(!isRunningLike || server.restartConfigurationStatus != nil)
+                }
+                if let status = server.restartConfigurationStatus {
+                    Label(status, systemImage: "clock.arrow.circlepath")
+                        .font(.caption)
+                        .foregroundStyle(MenuPopoverView.glanceAmber)
                 }
                 LabeledContent("Backend health") {
                     HStack(spacing: 14) {
@@ -404,7 +702,7 @@ struct PreferencesWindowView: View {
             } header: {
                 Text("Server")
             } footer: {
-                footnote("Restart soft-stops and starts the server; the JuiceFS daemon and the Finder mount stay up throughout.")
+                footnote("Changed settings are saved and remain pending until the volume can be safely restarted.")
             }
 
             Section {
@@ -614,12 +912,14 @@ struct PreferencesWindowView: View {
     @State private var resetDBInFlight = false
 
     private var canResetDatabase: Bool {
+        if NFSBridge.usesServingService { return false }
         if resetDBInFlight { return false }
         if case .starting = server.state { return false }
         return true
     }
 
     private var resetDatabaseHelp: String {
+        if NFSBridge.usesServingService { return ServingControlSafety.resetUnavailable }
         if resetDBInFlight {
             return "Reset in progress — waiting for the server to stop and the cache files to be deleted."
         }
@@ -633,11 +933,18 @@ struct PreferencesWindowView: View {
     /// RUNNING server — the open file handle kept the data live, so it was
     /// a silent no-op until some future restart the dialog never mentioned.
     /// New flow: explain exactly what will happen → stop the server first
-    /// (soft-stop: the Go side closes the store; FUSE + the Finder mount
-    /// stay up, so no admin re-prompt) → delete metadata.db/-wal/-shm
+    /// (the Go side closes the store; FUSE stays warm while the Finder mount
+    /// briefly disappears) → delete metadata.db/-wal/-shm
     /// (NOT pin.db — pins are a user contract for offline availability) →
     /// offer "Start Now" / "Later".
     private func resetDatabase() {
+        guard !NFSBridge.usesServingService else {
+            let alert = NSAlert()
+            alert.messageText = "Cache kept"
+            alert.informativeText = ServingControlSafety.resetUnavailable
+            alert.runModal()
+            return
+        }
         let dbPath = preferences.dbPath
         // Trust the Go-side truth, not the UI state machine: a degraded /
         // disconnected UI can still have a live server holding the SQLite
@@ -646,9 +953,9 @@ struct PreferencesWindowView: View {
 
         let alert = NSAlert()
         alert.messageText = "Reset local metadata cache?"
-        var info = "The local metadata cache will be deleted:\n\(dbPath)\n\nIt is a mirror of the metadata in Redis and rebuilds on the next start. Files on the volume are not affected. Offline pins (pin.db) are NOT touched — pinned files stay available offline."
+        var info = "The local metadata cache will be deleted:\n\(dbPath)\n\nIt is a mirror of the metadata in Redis and rebuilds on the next start. Rebuilding a large index transfers metadata and can take much longer on cellular or a VPN; prefer LAN when possible. Ordinary restarts do not need a rebuild. Files on the volume are not affected. Offline pins (pin.db) are NOT touched — pinned files stay available offline."
         if serverIsRunning {
-            info += "\n\nThe server will stop first so the delete is real (deleting under a running server silently does nothing). The volume stays mounted but won't respond until the server starts again."
+            info += "\n\nThe server will stop first so the delete is real (deleting under a running server silently does nothing). The Finder mount briefly disappears; the warm JuiceFS backend is retained for a fast restart."
         }
         alert.informativeText = info
         alert.alertStyle = .warning
@@ -673,8 +980,8 @@ struct PreferencesWindowView: View {
     private func deleteMetadataDBFiles(at path: String) {
         // metadata.db plus SQLite WAL sidecars. pin.db is deliberately
         // NOT in this list.
-        for suffix in ["", "-wal", "-shm"] {
-            try? FileManager.default.removeItem(atPath: path + suffix)
+        try? ServingControlSafety.deleteMetadataFiles(at: path, serviceManaged: NFSBridge.usesServingService) {
+            try FileManager.default.removeItem(atPath: $0)
         }
     }
 
@@ -699,15 +1006,19 @@ struct PreferencesWindowView: View {
 
     @State private var showSpoolDisableDialog = false
     @State private var spoolDisablePendingFiles = 0
+    @State private var spoolDisablePendingSymlinks = 0
     @State private var spoolDisablePendingBytes: Int64 = 0
+    @State private var spoolDisableFailedFiles = 0
+    @State private var spoolDisableStatusUnknown = false
+    @State private var spoolDisableVerifiedEmpty = false
     @State private var spoolDrainWaitActive = false
-    /// Set while we programmatically revert the toggle so onChange doesn't
-    /// treat the revert as a user-initiated enable (and restart again).
-    @State private var suppressSpoolToggleSideEffect = false
+    @State private var spoolDisableCheckInFlight = false
 
-    /// Fetch a FRESH pending snapshot off the main thread, then either
-    /// apply the disable directly (nothing pending) or raise the dialog.
+    /// Fetch a fresh pending snapshot off the main thread, then ask for an
+    /// explicit decision. A live snapshot cannot quiesce new Finder writes.
     private func checkPendingThenDisableSpool() {
+        guard !spoolDisableCheckInFlight else { return }
+        spoolDisableCheckInFlight = true
         // Snapshot on MainActor; the detached task must not touch
         // actor-isolated state (Swift 6 error-to-be).
         let metricsAddr = preferences.metricsAddr
@@ -715,25 +1026,32 @@ struct PreferencesWindowView: View {
             // NFSBridge.spoolStatus is blocking HTTP — keep it off MainActor.
             let sp = await Task.detached { NFSBridge.spoolStatus(metricsAddr: metricsAddr) }.value
             await MainActor.run {
-                if let sp, sp.enabled, sp.hasActivity {
+                spoolDisableCheckInFlight = false
+                switch sp?.safetyState ?? .unknown {
+                case .pending:
+                    guard let sp else { return }
                     spoolDisablePendingFiles = sp.pendingFiles
+                    spoolDisablePendingSymlinks = sp.pendingSymlinks
                     spoolDisablePendingBytes = sp.pendingBytes
+                    spoolDisableFailedFiles = sp.failedFiles + sp.declinedFiles
+                    spoolDisableStatusUnknown = false
+                    spoolDisableVerifiedEmpty = false
                     showSpoolDisableDialog = true
-                } else {
-                    // Nothing pending (or spool already off server-side):
-                    // safe to restart with the spool disabled.
-                    server.restart()
+                case .verifiedEmpty:
+                    spoolDisableStatusUnknown = false
+                    spoolDisableVerifiedEmpty = true
+                    showSpoolDisableDialog = true
+                case .unknown:
+                    spoolDisableStatusUnknown = true
+                    spoolDisableVerifiedEmpty = false
+                    showSpoolDisableDialog = true
                 }
             }
         }
     }
 
-    private func revertSpoolToggleToEnabled() {
-        suppressSpoolToggleSideEffect = true
-        preferences.spoolEnabled = true
-        // Clear on the next runloop tick, after onChange has observed the
-        // revert with the suppression flag still up.
-        DispatchQueue.main.async { suppressSpoolToggleSideEffect = false }
+    private func commitSpoolDisable() {
+        preferences.spoolEnabled = false
     }
 
     private func formatBytesPrefs(_ bytes: Int64) -> String {
@@ -809,10 +1127,12 @@ struct SpoolDrainWaitView: View {
     let onCancel: () -> Void
 
     @State private var pendingFiles = 0
+    @State private var pendingSymlinks = 0
     @State private var pendingBytes: Int64 = 0
     @State private var inProgress: Int64 = 0
     @State private var stalledFiles = 0
     @State private var failedFiles = 0
+    @State private var declinedFiles = 0
     @State private var hasFetched = false
     /// Terminal states: the wait STOPPED without success. Auto-proceed must
     /// never fire from these — "all the files failed" is not "all the files
@@ -823,9 +1143,7 @@ struct SpoolDrainWaitView: View {
     @State private var endedWithFailures = false
     @State private var serverUnreachable = false
     @State private var nilStreak = 0
-
-    private var proceedTitle: String { skipTitle ?? "Continue anyway" }
-    private func proceedAnyway() { (onSkip ?? onDrained)() }
+    @State private var retryToken = 0
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -837,21 +1155,21 @@ struct SpoolDrainWaitView: View {
                     ProgressView()
                         .controlSize(.small)
                 }
-                Text(endedWithFailures ? "Uploads finished with failures"
-                     : serverUnreachable ? "Can't reach the upload service"
+                Text(endedWithFailures ? "Uploads need attention"
+                     : serverUnreachable ? "Can't verify the upload queue"
                      : "Uploading pending files…")
                     .font(.headline)
             }
             if endedWithFailures {
-                Text("\(failedFiles) file\(failedFiles == 1 ? "" : "s") failed to upload — they remain only on this Mac. Use \"Retry failed\" in the menu-bar popover once the server is reachable, or continue and they stay parked in the local spool.")
+                Text("\(failedFiles + declinedFiles) failed or declined, and \(stalledFiles) stalled. These entries need attention before they can be considered uploaded.")
                     .font(.caption)
                     .foregroundStyle(.red)
             } else if serverUnreachable {
-                Text("The control plane stopped answering. The queue state is unknown — continuing may leave files un-uploaded.")
+                Text("The queue state is unknown. The service may be unreachable or returned an incomplete status; continuing may leave files un-uploaded.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             } else if hasFetched {
-                Text("\(pendingFiles) file\(pendingFiles == 1 ? "" : "s") (\(ByteCountFormatter.string(fromByteCount: pendingBytes, countStyle: .file))) remaining\(inProgress > 0 ? " · \(inProgress) uploading now" : "")")
+                Text("\(pendingFiles) files (\(ByteCountFormatter.string(fromByteCount: pendingBytes, countStyle: .file))) and \(pendingSymlinks) links remaining\(inProgress > 0 ? " · \(inProgress) uploading now" : "")")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             } else {
@@ -859,16 +1177,21 @@ struct SpoolDrainWaitView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
-            if !endedWithFailures && !serverUnreachable && (stalledFiles + failedFiles) > 0 {
-                Label("\(stalledFiles + failedFiles) entr\(stalledFiles + failedFiles == 1 ? "y" : "ies") look stuck — this wait may not finish. Use \"Retry failed\" / \"Recover stalled\" in the menu-bar popover.", systemImage: "exclamationmark.triangle")
+            if !endedWithFailures && !serverUnreachable && (stalledFiles + failedFiles + declinedFiles) > 0 {
+                Label("\(stalledFiles + failedFiles + declinedFiles) entr\(stalledFiles + failedFiles + declinedFiles == 1 ? "y" : "ies") need attention. Use \"Retry failed\" / \"Recover stalled\" in the menu-bar popover.", systemImage: "exclamationmark.triangle")
                     .font(.caption2)
                     .foregroundStyle(.orange)
             }
             HStack {
                 Spacer()
-                if endedWithFailures || serverUnreachable {
-                    Button(proceedTitle, role: .destructive) { proceedAnyway() }
-                } else if let skipTitle, let onSkip {
+                if serverUnreachable {
+                    Button("Retry") {
+                        serverUnreachable = false
+                        nilStreak = 0
+                        retryToken += 1
+                    }
+                }
+                if let skipTitle, let onSkip {
                     Button(skipTitle, role: .destructive) { onSkip() }
                 }
                 Button("Cancel") { onCancel() }
@@ -877,42 +1200,35 @@ struct SpoolDrainWaitView: View {
         }
         .padding(20)
         .frame(width: 380)
-        .task {
+        .task(id: retryToken) {
             // 1 Hz poll until drained or the view goes away. The fetch is
             // blocking HTTP, so it runs detached off MainActor.
             while !Task.isCancelled {
                 let sp = await Task.detached { NFSBridge.spoolStatus(metricsAddr: metricsAddr) }.value
                 if Task.isCancelled { return }
-                if let sp {
+                switch sp?.safetyState ?? .unknown {
+                case .pending:
+                    guard let sp else { return }
                     nilStreak = 0
                     serverUnreachable = false
                     pendingFiles = sp.pendingFiles
+                    pendingSymlinks = sp.pendingSymlinks
                     pendingBytes = sp.pendingBytes
                     inProgress = sp.inProgress
                     stalledFiles = sp.stalledFiles
                     failedFiles = sp.failedFiles
+                    declinedFiles = sp.declinedFiles
                     hasFetched = true
-                    if sp.enabled && !sp.hasActivity {
-                        if sp.failedFiles > 0 {
-                            // Queue emptied by FAILURE, not success: stop and
-                            // make the user decide (BUG 2). No auto-proceed.
-                            endedWithFailures = true
-                            return
-                        }
-                        onDrained()
+                    if sp.pendingFiles == 0 && sp.pendingSymlinks == 0 && sp.inProgress == 0 {
+                        endedWithFailures = true
                         return
                     }
-                    if !sp.enabled {
-                        // Spool vanished server-side (e.g. server stopped):
-                        // nothing more to wait for here.
-                        onDrained()
-                        return
-                    }
-                } else {
+                case .verifiedEmpty:
+                    onDrained()
+                    return
+                case .unknown:
                     nilStreak += 1
                     if nilStreak >= 5 {
-                        // ~5s of no answers: stop spinning forever on a dead
-                        // control plane; surface it and let the user decide.
                         serverUnreachable = true
                         return
                     }

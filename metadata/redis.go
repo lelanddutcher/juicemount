@@ -7,18 +7,21 @@ import (
 	"fmt"
 	"io/fs"
 	"log"
+	"maps"
 	"net"
-	"net/url"
 	"os"
 	"path"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/lelanddutcher/juicemount/internal/netprofile"
+	"github.com/lelanddutcher/juicemount/internal/redisurl"
 	"github.com/redis/go-redis/v9"
 
 	"github.com/lelanddutcher/juicemount/internal/cache/pin"
@@ -70,7 +73,9 @@ const (
 	// this bounds the actual DOWNTIME across a restart — the basis for
 	// skipping the boot gap-fill SCAN (shouldSkipBootGapFill, keyspace.go),
 	// which costs 160s+ and real data per boot on a cellular link.
-	metaKeyPushLastAlive = "push_last_alive"
+	metaKeyPushLastAlive      = "push_last_alive"
+	metaKeyIncompleteBaseline = "push_baseline_incomplete"
+	metaKeyPushSessionDirty   = "push_session_dirty"
 
 	// defaultBootSyncMaxAge is the freshness window ShouldSkipBootSync uses when
 	// JM_BOOT_SYNC_MAX_AGE_SEC is unset. A persisted last-sync newer than this
@@ -107,6 +112,8 @@ type MetadataEvent struct {
 //  1. SUBSCRIBE: event-driven, <100ms propagation for real-time changes
 //  2. Batch reconciliation: periodic full tree pull, catches anything SUBSCRIBE missed
 type RedisClient struct {
+	cacheCandidateMu   sync.RWMutex
+	cacheCandidateSink cacheCandidateSink
 	// rdb is an atomic.Pointer because Reconnect() swaps the underlying
 	// *redis.Client (on a network-interface change) concurrently with readers
 	// on other goroutines — the periodic SCAN (syncMetadata), the self-write
@@ -123,8 +130,18 @@ type RedisClient struct {
 
 	reconcileInterval time.Duration
 	stopCh            chan struct{}
+	startOnce         sync.Once
 	stopOnce          sync.Once
+	background        sync.WaitGroup
 	syncNowCh         chan struct{} // signals reconcileLoop to run immediately
+
+	// subscribeReady is closed only after Redis has acknowledged the
+	// juicemount:metadata SUBSCRIBE. It gives tests and startup diagnostics a
+	// real readiness boundary instead of guessing with sleeps. Production does
+	// not block Start on it: an offline launch must continue serving the recalled
+	// mirror while the subscriber reconnects in the background.
+	subscribeReady     chan struct{}
+	subscribeReadyOnce sync.Once
 
 	// syncMu single-flights syncMetadata. Originally the full SCAN had exactly
 	// one caller goroutine (reconcileLoop), so pruneAbsent (a plain map) was a
@@ -139,6 +156,29 @@ type RedisClient struct {
 	lastSyncDuration  time.Duration
 	lastSyncTime      time.Time
 	lastSyncStartedAt time.Time // when the most recent sync BEGAN (for flap debounce)
+
+	// Resumable-SCAN carry-over (2026-08-01). A SCAN that ran out of budget or
+	// lost the connection saves its progress here so the next attempt continues
+	// instead of re-pulling the same prefix. Guarded by mu. See takeScanResume.
+	scanResumeRaws   []scanRawEntry
+	scanResumeRev    map[string][2]string
+	scanResumeCursor string
+	scanResumeAt     time.Time
+	scanResumeToken  scanBaselineToken
+
+	lifecycleMu sync.Mutex
+	// Optional backend admission is set by the production binding owner before
+	// Start/SyncOnce. Zero value preserves existing standalone callers.
+	backendGateEnabled    bool
+	backendQualified      bool
+	backendGeneration     uint64
+	backendGateChanged    chan struct{}
+	debtGeneration        uint64
+	sessionGeneration     uint64
+	eventGeneration       uint64
+	publicationGeneration uint64
+	sessionActive         bool
+	sessionClean          bool
 	// G7 (task #80): truthful IsSyncing across failed/deferred syncs.
 	// lastSyncEndedAt records when the most recent sync attempt ENDED —
 	// success, failure, OR deferral (set by noteSyncOutcome on every
@@ -170,6 +210,13 @@ type RedisClient struct {
 	// recovery (NOT to the captured baseInterval). Always holds a value >=
 	// 1; zero is treated as DefaultReconcileInterval by reconcileLoop.
 	backstopNanos atomic.Int64
+	// backstopChangedCh wakes reconcileLoop when resolveBackstop changes the
+	// live cadence. An atomic value alone is insufficient: a loop already
+	// blocked on its old 30-second ticker cannot observe a new 24-hour push
+	// backstop until that stale tick fires, which launches exactly one
+	// redundant full SCAN at startup. Buffered/coalesced because only the most
+	// recent cadence matters.
+	backstopChangedCh chan struct{}
 
 	// configReconcileNanos holds the CONFIG-SEED reconcile cadence (in
 	// nanoseconds) supplied by SetReconcileInterval — the LB-4 "Reconcile
@@ -283,14 +330,32 @@ type RedisClient struct {
 	// dropped as unknown-ancestor. Requeueing it walks the new subtree
 	// through the same debounced, burst-ceilinged machinery until nothing
 	// new is discovered. Same atomic-pointer idiom as spoolPending.
-	keyspaceRequeue atomic.Pointer[requeueFunc]
+	keyspaceRequeue   atomic.Pointer[requeueFunc]
+	attrRetryMu       sync.Mutex
+	attrRetries       map[uint64]*attrRetryState
+	attrRetryStopped  bool
+	attrRetryWG       sync.WaitGroup
+	attrRetryWake     chan struct{}
+	attrRetryWork     chan attrRetryTask
+	attrRetryRunning  bool
+	attrRetryOverflow bool
 
 	// Test seams for the keyspace-push path. Production leaves these nil and
 	// the real methods run. Tests set them to observe coalescer behavior
 	// (which dirs got reconciled, how many full-SCAN promotions) without a
 	// live Redis. See keyspaceReconcileDir / keyspaceTriggerSync below.
-	testReconcileDir func(uint64) error
-	testTriggerSync  func()
+	testReconcileDir             func(uint64) error
+	testTriggerSync              func()
+	testReadDirRaw               func(uint64) (map[string]string, error)
+	testReadAttrs                func([]string) ([]interface{}, error)
+	testScanBatch                func(context.Context, string, string) ([]string, error)
+	testAfterScanTokenCheck      func()
+	testAfterScanUpsertChunk     func()
+	testBeforeBootSkipPromotion  func()
+	testBeforePruneLadderPersist func()
+	testBeforeAttrRetryEnqueue   func()
+	testProbeKeyspaceConfig      func(context.Context) (bool, string)
+	testBeforeConfigBackoff      func()
 	// testChildDirInodes overrides the d{inode} child-dir discovery that drives
 	// ReconcileSubtree's walk, so the bounding/dedup/cap logic is testable
 	// without a live Redis. Production leaves it nil (real HGETALL runs).
@@ -300,6 +365,215 @@ type RedisClient struct {
 // requeueFunc re-enqueues a dir inode into the live push coalescer.
 type requeueFunc func(uint64)
 
+type attrRetryState struct {
+	needed  bool
+	running bool
+	due     time.Time
+	delay   time.Duration
+	backend uint64
+}
+
+type attrRetryTask struct {
+	inode uint64
+	state *attrRetryState
+}
+
+const maxAttrRetryParents = 1024
+const attrRetryWorkers = 4
+
+// scheduleAttrRetry deduplicates parents into one bounded scheduler for the
+// client lifetime, including gaps between keyspace subscriptions.
+func (rc *RedisClient) scheduleAttrRetry(inode uint64) {
+	generation, _, _ := rc.backendAdmission()
+	rc.scheduleAttrRetryWithBackend(inode, generation)
+}
+
+func (rc *RedisClient) scheduleAttrRetryWithBackend(inode, generation uint64) {
+	rc.lifecycleMu.Lock()
+	if !rc.backendAdmittedLocked(generation) {
+		rc.lifecycleMu.Unlock()
+		return
+	}
+	if rc.testBeforeAttrRetryEnqueue != nil {
+		rc.testBeforeAttrRetryEnqueue()
+	}
+	rc.attrRetryMu.Lock()
+	unlock := func() {
+		rc.attrRetryMu.Unlock()
+		rc.lifecycleMu.Unlock()
+	}
+	if rc.attrRetryStopped {
+		unlock()
+		return
+	}
+	select {
+	case <-rc.stopCh:
+		unlock()
+		return
+	default:
+	}
+	if state := rc.attrRetries[inode]; state != nil {
+		if state.backend != generation {
+			// A prior generation cannot suppress a current retry. Loss normally
+			// clears the map; replace it as a defense against queued old work.
+			delete(rc.attrRetries, inode)
+		} else {
+			state.needed = true
+			unlock()
+			return
+		}
+	}
+	if rc.attrRetries == nil {
+		rc.attrRetries = make(map[uint64]*attrRetryState)
+	}
+	if len(rc.attrRetries) >= maxAttrRetryParents {
+		firstOverflow := !rc.attrRetryOverflow
+		rc.attrRetryOverflow = true
+		unlock()
+		if err := rc.recordBaselineDebt(); err != nil {
+			jmlog.Warn("metadata attr retry: could not persist overflow debt", "error", err.Error())
+		}
+		rc.setEngagement(keyspaceDegraded)
+		if firstOverflow {
+			rc.keyspaceTriggerSync()
+		}
+		return
+	}
+	if rc.attrRetryWake == nil {
+		rc.attrRetryWake = make(chan struct{}, 1)
+		rc.attrRetryWork = make(chan attrRetryTask, attrRetryWorkers)
+	}
+	rc.attrRetries[inode] = &attrRetryState{needed: true, due: time.Now().Add(time.Second), delay: time.Second, backend: generation}
+	if !rc.attrRetryRunning {
+		rc.attrRetryRunning = true
+		rc.attrRetryWG.Add(1 + attrRetryWorkers)
+		go rc.runAttrRetryScheduler()
+		for i := 0; i < attrRetryWorkers; i++ {
+			go rc.runAttrRetryWorker()
+		}
+	}
+	select {
+	case rc.attrRetryWake <- struct{}{}:
+	default:
+	}
+	unlock()
+	if err := rc.recordBaselineDebt(); err != nil {
+		jmlog.Warn("metadata attr retry: could not persist parent debt", "error", err.Error())
+	}
+	rc.setEngagement(keyspaceDegraded)
+}
+
+func (rc *RedisClient) runAttrRetryScheduler() {
+	defer rc.attrRetryWG.Done()
+	for {
+		rc.attrRetryMu.Lock()
+		var inode uint64
+		var state *attrRetryState
+		for candidate, pending := range rc.attrRetries {
+			if pending.running {
+				continue
+			}
+			if state == nil || pending.due.Before(state.due) {
+				inode, state = candidate, pending
+			}
+		}
+		if state == nil {
+			rc.attrRetryMu.Unlock()
+			select {
+			case <-rc.stopCh:
+				return
+			case <-rc.attrRetryWake:
+				continue
+			}
+		}
+		wait := time.Until(state.due)
+		rc.attrRetryMu.Unlock()
+		if wait > 0 {
+			timer := time.NewTimer(wait)
+			select {
+			case <-rc.stopCh:
+				timer.Stop()
+				return
+			case <-rc.attrRetryWake:
+				timer.Stop()
+				continue
+			case <-timer.C:
+			}
+		}
+		select {
+		case <-rc.stopCh:
+			return
+		default:
+		}
+		rc.attrRetryMu.Lock()
+		if rc.attrRetries[inode] != state || state.running || time.Until(state.due) > 0 {
+			rc.attrRetryMu.Unlock()
+			continue
+		}
+		state.needed = false
+		state.running = true
+		rc.attrRetryMu.Unlock()
+		select {
+		case rc.attrRetryWork <- attrRetryTask{inode: inode, state: state}:
+		case <-rc.stopCh:
+			return
+		}
+	}
+}
+
+func (rc *RedisClient) runAttrRetryWorker() {
+	defer rc.attrRetryWG.Done()
+	for {
+		var task attrRetryTask
+		select {
+		case <-rc.stopCh:
+			return
+		case task = <-rc.attrRetryWork:
+		}
+		select {
+		case <-rc.stopCh:
+			return
+		default:
+		}
+		err := rc.keyspaceReconcileDirWithBackend(task.inode, task.state.backend)
+		admitted := rc.backendAdmitted(task.state.backend)
+		rc.attrRetryMu.Lock()
+		state := task.state
+		if rc.attrRetries[task.inode] != state {
+			rc.attrRetryMu.Unlock()
+			continue
+		}
+		if !admitted {
+			delete(rc.attrRetries, task.inode)
+			state.running = false
+			rc.attrRetryMu.Unlock()
+			continue
+		}
+		needed := state.needed || err != nil
+		if !needed {
+			delete(rc.attrRetries, task.inode)
+		} else {
+			if state.delay < 60*time.Second {
+				state.delay *= 2
+				if state.delay > 60*time.Second {
+					state.delay = 60 * time.Second
+				}
+			}
+			state.due = time.Now().Add(state.delay)
+		}
+		state.running = false
+		empty := len(rc.attrRetries) == 0
+		select {
+		case rc.attrRetryWake <- struct{}{}:
+		default:
+		}
+		rc.attrRetryMu.Unlock()
+		if empty {
+			rc.keyspaceTriggerSync()
+		}
+	}
+}
+
 // keyspaceReconcileDir dispatches to the test seam when set, else the real
 // single-dir reconcile. Used by the coalescer so tests can count calls.
 func (rc *RedisClient) keyspaceReconcileDir(inode uint64) error {
@@ -307,6 +581,16 @@ func (rc *RedisClient) keyspaceReconcileDir(inode uint64) error {
 		return rc.testReconcileDir(inode)
 	}
 	return rc.reconcileDir(inode)
+}
+
+func (rc *RedisClient) keyspaceReconcileDirWithBackend(inode, generation uint64) error {
+	if !rc.backendAdmitted(generation) {
+		return ErrBackendUnqualified
+	}
+	if rc.testReconcileDir != nil {
+		return rc.testReconcileDir(inode)
+	}
+	return rc.reconcileDirWithBackend(inode, generation)
 }
 
 // keyspaceTriggerSync dispatches to the test seam when set, else the real
@@ -373,10 +657,10 @@ func (rc *RedisClient) loadSpoolGuard() spoolGuardFunc {
 
 // SetReconcileInterval overrides the periodic reconcile cadence (LB-4:
 // the app's "Reconcile interval" preference, previously a placebo). Same
-// contract as SetPathConfig: must be called before Start — reconcileLoop
-// snapshots the value once at launch, so later writes are both racy and
-// ineffective. d <= 0 keeps DefaultReconcileInterval, letting callers
-// pass an unset (zero) config value straight through.
+// contract as SetPathConfig. It may be called before or after Start;
+// resolveBackstop wakes the running loop so an already-armed ticker cannot
+// fire once at its obsolete cadence. d <= 0 keeps DefaultReconcileInterval,
+// letting callers pass an unset (zero) config value straight through.
 func (rc *RedisClient) SetReconcileInterval(d time.Duration) {
 	if d <= 0 {
 		return
@@ -511,46 +795,39 @@ func (rc *RedisClient) fusePathFor(internalPath string) string {
 	return rc.fuseRoot + "/" + strings.TrimLeft(internalPath, "/")
 }
 
-// ParseRedisURL extracts host, port, and db from a redis:// URL.
+// ParseRedisURL is the address-only compatibility API for route policy,
+// reachability and keyspace DB selection. Client pools use full options.
 func ParseRedisURL(rawURL string) (addr string, db int, err error) {
-	if !strings.HasPrefix(rawURL, "redis://") {
-		rawURL = "redis://" + rawURL
-	}
-	u, err := url.Parse(rawURL)
+	return redisurl.Address(rawURL)
+}
+
+func metadataRedisOptions(rawURL string) (*redis.Options, error) {
+	opts, err := redisurl.Parse(rawURL)
 	if err != nil {
-		return "", 0, fmt.Errorf("parse redis URL: %w", err)
+		return nil, err
 	}
-	host := u.Hostname()
-	port := "6379"
-	if p := u.Port(); p != "" {
-		port = p
-	}
-	db = 0
-	if len(u.Path) > 1 {
-		db, _ = strconv.Atoi(u.Path[1:])
-	}
-	return host + ":" + port, db, nil
+	opts.ReadTimeout = 60 * time.Second
+	opts.WriteTimeout = 10 * time.Second
+	opts.DialTimeout = 10 * time.Second
+	opts.ContextTimeoutEnabled = true
+	return opts, nil
 }
 
 // NewRedisClient connects to Redis and prepares for syncing.
 // It does NOT start background goroutines — call Start() for that.
 func NewRedisClient(redisURL string, store *Store) (*RedisClient, error) {
-	addr, db, err := ParseRedisURL(redisURL)
+	opts, err := metadataRedisOptions(redisURL)
 	if err != nil {
 		return nil, err
 	}
 
-	rdb := redis.NewClient(&redis.Options{
-		Addr:         addr,
-		DB:           db,
-		ReadTimeout:  60 * time.Second,
-		WriteTimeout: 10 * time.Second,
-		DialTimeout:  10 * time.Second,
-	})
+	rdb := redis.NewClient(opts)
+	instrumentRedis(rdb) // count metadata round trips — see redishook.go
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := rdb.Ping(ctx).Err(); err != nil {
+		_ = rdb.Close()
 		return nil, fmt.Errorf("redis ping: %w", err)
 	}
 
@@ -560,6 +837,8 @@ func NewRedisClient(redisURL string, store *Store) (*RedisClient, error) {
 		reconcileInterval: DefaultReconcileInterval,
 		stopCh:            make(chan struct{}),
 		syncNowCh:         make(chan struct{}, 1),
+		backstopChangedCh: make(chan struct{}, 1),
+		subscribeReady:    make(chan struct{}),
 		connected:         true,
 		pruneAbsent:       make(map[string]int),
 		ladderPersisted:   make(map[string]int),
@@ -590,23 +869,20 @@ func NewRedisClient(redisURL string, store *Store) (*RedisClient, error) {
 // (rc.Start) lifts connected once a reconcile succeeds; redis.NewClient itself is
 // lazy (it dials on first use), so no network happens here.
 func NewRedisClientDeferred(redisURL string, store *Store) (*RedisClient, error) {
-	addr, db, err := ParseRedisURL(redisURL)
+	opts, err := metadataRedisOptions(redisURL)
 	if err != nil {
 		return nil, err
 	}
-	rdb := redis.NewClient(&redis.Options{
-		Addr:         addr,
-		DB:           db,
-		ReadTimeout:  60 * time.Second,
-		WriteTimeout: 10 * time.Second,
-		DialTimeout:  10 * time.Second,
-	})
+	rdb := redis.NewClient(opts)
+	instrumentRedis(rdb) // count metadata round trips — see redishook.go
 	rc := &RedisClient{
 		redisURL:          redisURL,
 		store:             store,
 		reconcileInterval: DefaultReconcileInterval,
 		stopCh:            make(chan struct{}),
 		syncNowCh:         make(chan struct{}, 1),
+		backstopChangedCh: make(chan struct{}, 1),
+		subscribeReady:    make(chan struct{}),
 		connected:         false,
 		lastDisconnect:    time.Now(),
 		pruneAbsent:       make(map[string]int),
@@ -626,6 +902,10 @@ func NewRedisClientDeferred(redisURL string, store *Store) (*RedisClient, error)
 // see a consistent pointer even while Reconnect() swaps it. Never read the
 // rc.rdb field directly.
 func (rc *RedisClient) redisDB() *redis.Client { return rc.rdb.Load() }
+
+// RawDB exposes the live redis client for peer subsystems that need their own
+// keyspace presence (Tier-1 #3 presence tracker). Nil before Start wiring.
+func (rc *RedisClient) RawDB() *redis.Client { return rc.rdb.Load() }
 
 // Store returns the underlying metadata store.
 func (rc *RedisClient) Store() *Store { return rc.store }
@@ -706,7 +986,7 @@ func (rc *RedisClient) RecentlyDegraded(cooldown time.Duration) bool {
 // Called when a network interface change is detected so that TCP connections
 // bound to the old interface are replaced with connections on the new one.
 func (rc *RedisClient) Reconnect() error {
-	addr, db, err := ParseRedisURL(rc.redisURL)
+	opts, err := metadataRedisOptions(rc.redisURL)
 	if err != nil {
 		return err
 	}
@@ -714,17 +994,13 @@ func (rc *RedisClient) Reconnect() error {
 	// Close the old connection (ignore errors — it may already be broken)
 	rc.redisDB().Close()
 
-	rdb := redis.NewClient(&redis.Options{
-		Addr:         addr,
-		DB:           db,
-		ReadTimeout:  60 * time.Second,
-		WriteTimeout: 10 * time.Second,
-		DialTimeout:  10 * time.Second,
-	})
+	rdb := redis.NewClient(opts)
+	instrumentRedis(rdb) // count metadata round trips — see redishook.go
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := rdb.Ping(ctx).Err(); err != nil {
+		_ = rdb.Close()
 		rc.mu.Lock()
 		rc.connected = false
 		rc.lastDisconnect = time.Now()
@@ -960,7 +1236,7 @@ func (rc *RedisClient) SyncOnce() error {
 // skipped because the persisted mirror is FRESH and the keyspace-notification
 // push is engaged (C1, 2026-07-02).
 //
-// Rationale: with JM_METADATA_KEYSPACE_PUSH=1 the PSUBSCRIBE gap-fill plus the
+// Rationale: with the default-on keyspace push the PSUBSCRIBE gap-fill plus the
 // periodic backstop SCAN already guarantee convergence, so re-running a full
 // boot SCAN over a recently-synced mirror is pure redundant work (the 174s
 // "Rebuilding index…" spinner on a cellular relay). We skip it ONLY when both
@@ -989,6 +1265,9 @@ func (rc *RedisClient) ShouldSkipBootSync() bool {
 		return false // no push → the SCAN is the only authoritative sync
 	}
 	if rc.store == nil {
+		return false
+	}
+	if rc.baselineIncomplete() {
 		return false
 	}
 
@@ -1020,27 +1299,342 @@ func (rc *RedisClient) ShouldSkipBootSync() bool {
 	return age <= maxAge
 }
 
-// Start begins the SUBSCRIBE listener, periodic batch reconciliation, and —
-// when enabled — the Redis keyspace-notification push loop.
-//
-// The keyspace loop is strictly additive and flag-gated (JM_METADATA_KEYSPACE_PUSH).
-// When it is not engaged the system behaves byte-identically to before: 30s
-// full-SCAN reconcile + the self-write juicemount:metadata pub/sub. See
-// keyspace.go for the engagement state machine (DISABLED/ENABLED/DEGRADED).
-func (rc *RedisClient) Start() {
-	go rc.subscribeLoop()
-	go rc.reconcileLoop()
-	if rc.keyspacePushEnabled() {
-		go rc.keyspaceLoop()
+func (rc *RedisClient) baselineIncomplete() bool {
+	if rc.store == nil {
+		return true
+	}
+	raw, ok, err := rc.store.GetMeta(metaKeyIncompleteBaseline)
+	if err != nil || (ok && raw != "0") {
+		return true
+	}
+	raw, ok, err = rc.store.GetMeta(metaKeyPushSessionDirty)
+	return err != nil || (ok && raw != "0")
+}
+
+func (rc *RedisClient) markBaselineIncomplete() error {
+	if rc.store == nil {
+		return nil
+	}
+	return rc.store.SetMeta(metaKeyIncompleteBaseline, "1")
+}
+
+func (rc *RedisClient) clearBaselineIncomplete() error {
+	if rc.store == nil {
+		return nil
+	}
+	return rc.store.SetMeta(metaKeyIncompleteBaseline, "0")
+}
+
+type scanBaselineToken struct {
+	debt, session, events, publication, backend uint64
+	store                                       StoreEpoch
+}
+
+var errScanPublicationInvalidated = errors.New("SCAN invalidated by newer mirror publication")
+var ErrBackendUnqualified = errors.New("metadata backend is not qualified")
+
+// SetBackendQualified enables admission for this client. The binding owner
+// calls false before remote work and true only after qualifying that backend.
+// A loss/requalification invalidates observations and wakes old subscriptions;
+// neither path performs network I/O or touches the local mirror.
+func (rc *RedisClient) SetBackendQualified(qualified bool) {
+	rc.lifecycleMu.Lock()
+	if rc.backendGateEnabled && rc.backendQualified == qualified {
+		rc.lifecycleMu.Unlock()
+		return
+	}
+	rc.backendGateEnabled = true
+	rc.backendQualified = qualified
+	rc.backendGeneration++
+	rc.publicationGeneration++
+	if !qualified {
+		// Same lifecycle -> retry lock order as enqueue. A pre-loss retry
+		// either commits before this clear or fails its generation check.
+		rc.attrRetryMu.Lock()
+		rc.attrRetries = nil
+		rc.attrRetryOverflow = false
+		rc.attrRetryMu.Unlock()
+	}
+	if rc.backendGateChanged != nil {
+		close(rc.backendGateChanged)
+	}
+	rc.backendGateChanged = make(chan struct{})
+	rc.lifecycleMu.Unlock()
+	if !qualified {
+		rc.setEngagement(keyspaceDegraded)
 	}
 }
 
-// Stop halts all background goroutines and closes the Redis connection.
+func (rc *RedisClient) backendAdmission() (uint64, <-chan struct{}, bool) {
+	rc.lifecycleMu.Lock()
+	defer rc.lifecycleMu.Unlock()
+	return rc.backendGeneration, rc.backendGateChanged,
+		!rc.backendGateEnabled || rc.backendQualified
+}
+
+func (rc *RedisClient) backendAdmittedLocked(generation uint64) bool {
+	return generation == rc.backendGeneration &&
+		(!rc.backendGateEnabled || rc.backendQualified)
+}
+
+func (rc *RedisClient) backendAdmitted(generation uint64) bool {
+	rc.lifecycleMu.Lock()
+	defer rc.lifecycleMu.Unlock()
+	return rc.backendAdmittedLocked(generation)
+}
+
+// Session dirt is independent of SCAN debt: a crash can lose a notification
+// even after the last complete SCAN. Only a joined, clean Stop seals it.
+func (rc *RedisClient) openPushSession() (uint64, error) {
+	rc.lifecycleMu.Lock()
+	defer rc.lifecycleMu.Unlock()
+	if !rc.backendAdmittedLocked(rc.backendGeneration) {
+		return 0, ErrBackendUnqualified
+	}
+	if rc.store == nil {
+		return 0, errors.New("missing metadata store")
+	}
+	if err := rc.store.SetMeta(metaKeyPushSessionDirty, "1"); err != nil {
+		return 0, err
+	}
+	rc.sessionGeneration++
+	rc.publicationGeneration++
+	rc.sessionActive = true
+	rc.sessionClean = false
+	return rc.sessionGeneration, nil
+}
+
+func (rc *RedisClient) closePushSession(generation uint64, clean bool) {
+	rc.lifecycleMu.Lock()
+	if rc.sessionGeneration == generation {
+		rc.sessionActive = false
+		rc.sessionClean = rc.sessionClean && clean
+	}
+	rc.lifecycleMu.Unlock()
+}
+
+func (rc *RedisClient) notePushEvent() {
+	rc.lifecycleMu.Lock()
+	rc.eventGeneration++
+	rc.sessionClean = false
+	rc.lifecycleMu.Unlock()
+}
+
+func (rc *RedisClient) recordBaselineDebt() error {
+	rc.lifecycleMu.Lock()
+	defer rc.lifecycleMu.Unlock()
+	rc.debtGeneration++
+	rc.publicationGeneration++
+	if rc.store == nil {
+		return nil
+	}
+	return rc.store.SetMeta(metaKeyIncompleteBaseline, "1")
+}
+
+func (rc *RedisClient) scanToken() scanBaselineToken {
+	rc.lifecycleMu.Lock()
+	defer rc.lifecycleMu.Unlock()
+	return scanBaselineToken{debt: rc.debtGeneration, session: rc.sessionGeneration, events: rc.eventGeneration, publication: rc.publicationGeneration, backend: rc.backendGeneration}
+}
+
+func (rc *RedisClient) scanTokenValidLocked(token scanBaselineToken) bool {
+	return rc.backendAdmittedLocked(token.backend) &&
+		token.debt == rc.debtGeneration && token.session == rc.sessionGeneration &&
+		token.publication == rc.publicationGeneration
+}
+
+func (rc *RedisClient) scanTokenValid(token scanBaselineToken) bool {
+	rc.lifecycleMu.Lock()
+	defer rc.lifecycleMu.Unlock()
+	return rc.scanTokenValidLocked(token)
+}
+
+// fencedScanMutation keeps the freshness check and one bounded Store write in
+// the same critical section. A failed write may have partially committed, so
+// it still advances the epoch and invalidates every observer holding an older
+// token.
+func (rc *RedisClient) fencedScanMutation(token *scanBaselineToken, mutate func() error) error {
+	rc.lifecycleMu.Lock()
+	defer rc.lifecycleMu.Unlock()
+	if !rc.scanTokenValidLocked(*token) {
+		return errScanPublicationInvalidated
+	}
+	err := mutate()
+	rc.publicationGeneration++
+	token.publication = rc.publicationGeneration
+	return err
+}
+
+// finishScanBaseline is the only path that certifies a complete SCAN.
+func (rc *RedisClient) finishScanBaseline(token scanBaselineToken) error {
+	rc.lifecycleMu.Lock()
+	defer rc.lifecycleMu.Unlock()
+	if !rc.scanTokenValidLocked(token) {
+		rc.setEngagement(keyspaceDegraded)
+		return nil
+	}
+	rc.attrRetryMu.Lock()
+	blocked := len(rc.attrRetries) != 0
+	rc.attrRetryMu.Unlock()
+	if blocked {
+		rc.setEngagement(keyspaceDegraded)
+		return nil
+	}
+	if err := rc.clearBaselineIncomplete(); err != nil {
+		rc.setEngagement(keyspaceDegraded)
+		return err
+	}
+	rc.attrRetryMu.Lock()
+	rc.attrRetryOverflow = false
+	rc.attrRetryMu.Unlock()
+	if rc.sessionActive {
+		rc.sessionClean = token.events == rc.eventGeneration
+		rc.setEngagement(keyspaceEnabled)
+	}
+	return nil
+}
+
+func (rc *RedisClient) completeScanPublication(token scanBaselineToken, syncedAt time.Time) (bool, error) {
+	if !rc.scanTokenValid(token) {
+		rc.setEngagement(keyspaceDegraded)
+		return false, nil
+	}
+	if rc.testBeforePruneLadderPersist != nil {
+		rc.testBeforePruneLadderPersist()
+	}
+	var generation string
+	var ladderSnapshot map[string]int
+	if rc.store != nil && pruneLadderDurableEnabled() && !maps.Equal(rc.pruneAbsent, rc.ladderPersisted) {
+		ladderSnapshot = maps.Clone(rc.pruneAbsent)
+		var err error
+		generation, err = rc.store.StagePruneLadderSnapshot(ladderSnapshot)
+		if err != nil {
+			rc.setEngagement(keyspaceDegraded)
+			return false, fmt.Errorf("stage completed SCAN prune ladder: %w", err)
+		}
+	}
+	rc.lifecycleMu.Lock()
+	published := false
+	defer func() {
+		rc.lifecycleMu.Unlock()
+		if generation != "" && !published && rc.store != nil {
+			if err := rc.store.AbandonPruneLadderStage(generation); err != nil {
+				jmlog.Warn("metadata prune ladder stage abandonment failed", "generation", generation, "error", err.Error())
+			}
+		}
+	}()
+	if !rc.scanTokenValidLocked(token) {
+		rc.setEngagement(keyspaceDegraded)
+		return false, nil
+	}
+	rc.attrRetryMu.Lock()
+	blocked := len(rc.attrRetries) != 0
+	rc.attrRetryMu.Unlock()
+	if blocked {
+		rc.setEngagement(keyspaceDegraded)
+		return false, nil
+	}
+	if rc.store != nil {
+		if err := rc.store.activatePruneLadderStage(generation, syncedAt, &token.store); err != nil {
+			rc.publicationGeneration++
+			rc.setEngagement(keyspaceDegraded)
+			if errors.Is(err, ErrMirrorConflict) {
+				return false, nil
+			}
+			return false, fmt.Errorf("activate completed SCAN baseline: %w", err)
+		}
+	}
+	if generation != "" {
+		rc.ladderPersisted = ladderSnapshot
+	}
+	rc.publicationGeneration++
+	rc.attrRetryMu.Lock()
+	rc.attrRetryOverflow = false
+	rc.attrRetryMu.Unlock()
+	if rc.sessionActive {
+		rc.sessionClean = token.events == rc.eventGeneration
+		rc.setEngagement(keyspaceEnabled)
+	}
+	published = true
+	return true, nil
+}
+
+func (rc *RedisClient) sealStoppedPushSession() {
+	rc.lifecycleMu.Lock()
+	defer rc.lifecycleMu.Unlock()
+	if rc.store == nil || rc.sessionActive || !rc.sessionClean {
+		return
+	}
+	rc.attrRetryMu.Lock()
+	blocked := len(rc.attrRetries) != 0 || rc.attrRetryOverflow
+	rc.attrRetryMu.Unlock()
+	raw, ok, err := rc.store.GetMeta(metaKeyIncompleteBaseline)
+	if err != nil || blocked || (ok && raw != "0") {
+		return
+	}
+	if err := rc.store.SetMeta(metaKeyPushSessionDirty, "0"); err != nil {
+		jmlog.Warn("metadata keyspace push: could not seal stopped session", "error", err.Error())
+	}
+}
+
+// Start begins the SUBSCRIBE listener, periodic batch reconciliation, and —
+// when enabled — the Redis keyspace-notification push loop.
+//
+// The keyspace loop is default-on and rollback-gated
+// (JM_METADATA_KEYSPACE_PUSH=0). When it is not engaged the system uses the
+// configured full-SCAN reconcile + the self-write juicemount:metadata pub/sub. See
+// keyspace.go for the engagement state machine (DISABLED/ENABLED/DEGRADED).
+func (rc *RedisClient) Start() {
+	rc.startOnce.Do(func() {
+		rc.background.Add(2)
+		go func() {
+			defer rc.background.Done()
+			rc.subscribeLoop()
+		}()
+		go func() {
+			defer rc.background.Done()
+			rc.reconcileLoop()
+		}()
+		if rc.keyspacePushEnabled() {
+			rc.background.Add(1)
+			go func() {
+				defer rc.background.Done()
+				rc.keyspaceLoop()
+			}()
+		}
+	})
+}
+
+// Stop halts all background goroutines and closes the Redis connection. It
+// does not return until no subscriber, reconcile, or background gap-fill can
+// touch the metadata store, so callers may safely close SQLite immediately
+// afterward.
 func (rc *RedisClient) Stop() {
 	rc.stopOnce.Do(func() {
 		close(rc.stopCh)
+		rc.attrRetryMu.Lock()
+		rc.attrRetryStopped = true
+		rc.attrRetryMu.Unlock()
 		rc.redisDB().Close()
 	})
+	rc.attrRetryWG.Wait()
+	rc.background.Wait()
+	rc.sealStoppedPushSession()
+}
+
+// waitSubscribeReady waits for Redis to acknowledge the self-write metadata
+// subscription. Kept package-private because production startup must remain
+// non-blocking while offline; tests use it to establish a deterministic
+// publish-after-subscribe contract.
+func (rc *RedisClient) waitSubscribeReady(ctx context.Context) error {
+	select {
+	case <-rc.subscribeReady:
+		return nil
+	case <-rc.stopCh:
+		return os.ErrClosed
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // PublishEvent sends a metadata event to all subscribed clients.
@@ -1049,7 +1643,14 @@ func (rc *RedisClient) PublishEvent(ctx context.Context, evt MetadataEvent) erro
 	if err != nil {
 		return err
 	}
-	return rc.redisDB().Publish(ctx, SubscribeChannel, string(data)).Err()
+	if err := rc.redisDB().Publish(ctx, SubscribeChannel, string(data)).Err(); err != nil {
+		return err
+	}
+	// Validity denominator for KeyspaceStatus: our own writes are replayed back
+	// to us (the publisher carries no origin field), so "published N, received
+	// zero" is a genuine push failure rather than an absence of traffic.
+	noteKeyspacePublished()
+	return nil
 }
 
 // subscribeLoop listens for real-time metadata events via Redis SUBSCRIBE.
@@ -1074,13 +1675,20 @@ func (rc *RedisClient) subscribeLoop() {
 }
 
 func (rc *RedisClient) runSubscribe() {
+	generation, changed, admitted := rc.backendAdmission()
+	if !admitted {
+		return
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Monitor stopCh to cancel the subscription context
+	// Monitor stopCh and qualification loss so a stale subscription does not
+	// survive recovery with buffered events from the old backend generation.
 	go func() {
 		select {
 		case <-rc.stopCh:
+			cancel()
+		case <-changed:
 			cancel()
 		case <-ctx.Done():
 		}
@@ -1088,22 +1696,111 @@ func (rc *RedisClient) runSubscribe() {
 
 	sub := rc.redisDB().Subscribe(ctx, SubscribeChannel)
 	defer sub.Close()
+	if _, err := sub.Receive(ctx); err != nil {
+		return
+	}
+	if !rc.backendAdmitted(generation) {
+		return
+	}
+	rc.subscribeReadyOnce.Do(func() { close(rc.subscribeReady) })
 
 	ch := sub.Channel()
-	for msg := range ch {
+	for {
+		var msg *redis.Message
+		select {
+		case <-changed:
+			return
+		case <-rc.stopCh:
+			return
+		case m, ok := <-ch:
+			if !ok {
+				return
+			}
+			msg = m
+		}
 		var evt MetadataEvent
 		if err := json.Unmarshal([]byte(msg.Payload), &evt); err != nil {
 			log.Printf("subscribe: invalid event: %v", err)
 			continue
 		}
-		rc.applyEvent(evt)
+		rc.applyEventFromSubscription(evt, generation)
 	}
 }
 
 // applyEvent applies a single real-time metadata event to the local store.
 // Updates the in-memory cache immediately (never blocked), then writes to
 // SQLite with retry (may be briefly blocked by BulkInsert transactions).
+// reconcileShrunkEntry handles a keyspace event that would shrink a cached
+// entry: drop the event and ask the backend instead of believing it.
+//
+// Reuses the EXISTING reconcile path rather than inventing a per-path lookup —
+// requeueing the parent directory makes the normal reconcileDir sweep re-read
+// authoritative sizes for every child, which is machinery already proven in the
+// newly-discovered-dirs path. Requeue rather than a direct call because this
+// runs on the subscribe goroutine, and a blocking backend read here would stall
+// every subsequent event behind one shrink.
+//
+// The requeue is what makes this NOT the C4 bug. Simply refusing to shrink would
+// be MAX() by another name and would make a legitimate remote truncate
+// permanently invisible; the reconcile lets the real size land, downward or not,
+// on the authority's word rather than on an event that carries no ordering.
+//
+// With no requeue wired (tests, or before the consumer starts) the event is
+// dropped and logged. A stale-large size costs a read that returns short and
+// re-stats; a wrongly-small one truncates the file for every reader. Those are
+// not symmetric, so uncertainty takes the recoverable side.
+func (rc *RedisClient) reconcileShrunkEntry(evt MetadataEvent, cachedSize int64) {
+	noteKeyspaceShrinkReconciled()
+
+	parent := path.Dir(evt.Path)
+	pe := rc.store.LookupByPath(parent)
+	if pe == nil || pe.Inode == 0 {
+		jmlog.Debug("keyspace: dropped a shrinking event; parent not mirrored so it "+
+			"cannot be reconciled", "path", evt.Path,
+			"event_size", evt.Size, "cached_size", cachedSize)
+		return
+	}
+	if fnp := rc.keyspaceRequeue.Load(); fnp != nil {
+		(*fnp)(pe.Inode)
+		jmlog.Debug("keyspace: shrinking event dropped, parent requeued for reconcile",
+			"path", evt.Path, "event_size", evt.Size, "cached_size", cachedSize,
+			"parent_inode", pe.Inode)
+		return
+	}
+	jmlog.Debug("keyspace: dropped a shrinking event with no reconcile consumer wired",
+		"path", evt.Path, "event_size", evt.Size, "cached_size", cachedSize)
+}
+
 func (rc *RedisClient) applyEvent(evt MetadataEvent) {
+	generation, _, _ := rc.backendAdmission()
+	rc.applyEventFromSubscription(evt, generation)
+}
+
+func (rc *RedisClient) applyEventFromSubscription(evt MetadataEvent, generation uint64) {
+	rc.lifecycleMu.Lock()
+	defer rc.lifecycleMu.Unlock()
+	if !rc.backendAdmittedLocked(generation) {
+		return
+	}
+	// Counted here rather than at the subscription read, and BEFORE any
+	// namespace filtering below: the question this answers is "did push deliver
+	// to us at all", which a filtered-out event answers just as well as an
+	// applied one. Counting only post-filter events would report a healthy
+	// pipeline as broken whenever the only traffic was internal-namespace churn.
+	noteKeyspaceEventApplied()
+	// Acceptance and settlement take this gate before Store's writer lock and
+	// hold it through RAM publication. Read ownership in a closed SQLite
+	// snapshot before any invalidation callback or cache mutation below.
+	rc.store.replacementObservationMu.Lock()
+	defer rc.store.replacementObservationMu.Unlock()
+	protected, activeReplacement, err := rc.store.subscriptionEventProtected(evt)
+	if err != nil {
+		log.Printf("subscribe replacement observation refused: %v", err)
+		return
+	}
+	if protected {
+		return
+	}
 	// Classify mode from the event's type discriminators. IsSymlink takes
 	// precedence so a create/update/rename of a symlink keeps os.ModeSymlink
 	// (and never downgrades the locally-minted ModeSymlink cache Entry) instead
@@ -1120,6 +1817,24 @@ func (rc *RedisClient) applyEvent(evt MetadataEvent) {
 	}
 
 	switch evt.Op {
+	case "reconcile":
+		// A completion hint carries no predecessor size, mtime or inode. Queue
+		// the parent for an authoritative backend rescan; a late hint after
+		// replacement can never insert the old generation into the mirror.
+		if len(evt.Path) > 4096 || !utf8.ValidString(evt.Path) || !validCustodyPath(evt.Path) || scanFilteredPath(evt.Path) {
+			return
+		}
+		parentInode := uint64(1) // internal root for bare child paths
+		if parentPath := path.Dir(evt.Path); parentPath != "." {
+			parent := rc.store.LookupByPath(parentPath)
+			if parent == nil || parent.Inode == 0 {
+				return
+			}
+			parentInode = parent.Inode
+		}
+		if fnp := rc.keyspaceRequeue.Load(); fnp != nil {
+			(*fnp)(parentInode)
+		}
 	case "create", "update":
 		// Task #78: never mirror push events for scan-filtered namespaces
 		// (.trash/, .juicemount/ — see scanFilteredPath). The full SCAN can
@@ -1131,6 +1846,37 @@ func (rc *RedisClient) applyEvent(evt MetadataEvent) {
 			noteScanFilteredSkip("applyEvent", evt.Path, 1)
 			return
 		}
+		// L6 — A SHRINKING EVENT IS NOT TRUSTED, IT IS RECONCILED.
+		//
+		// THE BUG: applyEvent wrote evt.Size unconditionally. Keyspace events
+		// carry no sequence or version, and delivery is not ordered, so a
+		// REORDERED event could lower a cached size below the truth and every
+		// subsequent read would be short. Reachable rather than theoretical:
+		// juicemount:metadata replays this client's OWN writes back to it (the
+		// publisher has no origin field), so ordinary local activity generates
+		// the racing events.
+		//
+		// WHY NOT MAX(). That is the obvious fix and it is wrong here. It is the
+		// C4 shape: a sticky high-water mark with no way down. UpdateSize CAN use
+		// MAX because its comment establishes that truncation reaches the store
+		// by a different path — "Truncate(2) does not go through this code path".
+		// applyEvent has no such luxury: it handles create/update from REMOTE
+		// actors, so a legitimate remote truncate arrives here and only here. MAX
+		// would make every remote shrink permanently invisible.
+		//
+		// So a shrink is treated as a signal that we may be behind, not as data:
+		// re-read the authoritative value and let the backend decide. Costs one
+		// round trip, and only on the rare shrink — an append-only write stream
+		// (the common case) never takes this path at all.
+		existing := rc.store.LookupByPath(evt.Path)
+		// Byte-cache identity changes even when path + inode do not. Fire before
+		// replacing the mirror row so the consumer can resolve the old inode's
+		// cached JuiceFS slice mapping. Spurious self-echo invalidation is safe.
+		rc.store.NotifyContentInvalidated(evt.Path, evt.IsDir)
+		if existing != nil && !evt.IsDir && evt.Size < existing.Size {
+			rc.reconcileShrunkEntry(evt, existing.Size)
+			return
+		}
 		e := &Entry{
 			Path:       evt.Path,
 			Name:       path.Base(evt.Path),
@@ -1140,6 +1886,13 @@ func (rc *RedisClient) applyEvent(evt MetadataEvent) {
 			Mtime:      time.Unix(evt.Mtime, 0),
 			Inode:      evt.Inode,
 			Mode:       mode,
+			// juicemount:metadata is an unversioned visibility feed and echoes
+			// this client's own writes. Receiving our create/update back is not
+			// proof that JuiceFS has published the child in d{parent}; preserving
+			// LocalOnly keeps a concurrent keyspace HGETALL from treating that
+			// publication gap as a delete. reconcileDir/full SCAN clear the flag
+			// only after observing the path in authoritative Redis metadata.
+			LocalOnly: existing != nil && existing.LocalOnly,
 		}
 		// In-memory cache first (instant, never blocked)
 		rc.store.InsertToCache(e)
@@ -1147,22 +1900,62 @@ func (rc *RedisClient) applyEvent(evt MetadataEvent) {
 		if err := rc.store.Insert(e); err != nil {
 			log.Printf("subscribe apply create/update: %v", err)
 		}
+		if evt.Op == "create" {
+			rc.store.NoteDirectoryChanged(path.Dir(evt.Path))
+		}
 
 	case "delete":
 		// Deletes are NOT namespace-filtered: removing an internal-namespace
 		// row (if one was seeded by an older build) is convergent.
+		//
+		// R1: resolve the type BEFORE the eviction — the local delete publisher
+		// does not set IsDir, so the mirror is the only thing that knows whether
+		// this path had a pooled SUBTREE behind it.
+		delIsDir := evt.IsDir
+		if !activeReplacement {
+			if e := rc.store.LookupByPath(evt.Path); e != nil && e.IsDir {
+				delIsDir = true
+			}
+		}
+		// Must precede mirror eviction: the byte-cache consumer resolves the
+		// old inode from this row in order to drop its slice mapping.
+		rc.store.NotifyContentInvalidated(evt.Path, delIsDir)
 		rc.store.DeleteFromCache(evt.Path)
 		if err := rc.store.Delete(evt.Path); err != nil {
 			log.Printf("subscribe apply delete: %v", err)
 		}
+		// R1: the mirror is not the only thing holding this path — the NFS layer
+		// pools open FUSE fds keyed by path alone. Dropping only the mirror row
+		// left a recreated file being served the DELETED inode's bytes (C1/C3
+		// with a remote actor). Fired outside the store lock; see
+		// Store.SetOnPathInvalidated.
+		rc.store.NotifyPathInvalidated(evt.Path, delIsDir)
+		rc.store.NoteDirectoryChanged(path.Dir(evt.Path))
 
 	case "rename":
+		renameIsDir := evt.IsDir
+		if !activeReplacement {
+			if e := rc.store.LookupByPath(evt.OldPath); e != nil && e.IsDir {
+				renameIsDir = true
+			}
+		}
+		// Both ends are invalidated before either mirror row changes: the source
+		// carries the old inode and POSIX rename may replace a cached destination.
+		rc.store.NotifyContentInvalidated(evt.OldPath, renameIsDir)
+		rc.store.NotifyContentInvalidated(evt.Path, renameIsDir)
 		// The OldPath removal is UNGATED: a rename INTO .trash is JuiceFS's
 		// delete-to-trash, and the source row must still be dropped.
 		if evt.OldPath != "" {
 			rc.store.DeleteFromCache(evt.OldPath)
 			rc.store.Delete(evt.OldPath)
+			rc.store.NoteDirectoryChanged(path.Dir(evt.OldPath))
 		}
+		// R1: both ends, same reasoning as juiceFS.Rename's local invalidation —
+		// the source name may be recreated and the destination just replaced
+		// whatever POSIX rename unlinked there. evt.IsDir is set by the rename
+		// publisher (it rides along for the symlink/type discriminators).
+		rc.store.NotifyPathInvalidated(evt.OldPath, renameIsDir)
+		rc.store.NotifyPathInvalidated(evt.Path, renameIsDir)
 		// Task #78: skip mirroring the DESTINATION when it lands in a
 		// scan-filtered namespace (delete-to-trash). A rename OUT of .trash
 		// (restore) has a non-filtered destination and is mirrored normally.
@@ -1184,6 +1977,7 @@ func (rc *RedisClient) applyEvent(evt MetadataEvent) {
 		if err := rc.store.Insert(e); err != nil {
 			log.Printf("subscribe apply rename: %v", err)
 		}
+		rc.store.NoteDirectoryChanged(path.Dir(evt.Path))
 	}
 }
 
@@ -1230,25 +2024,24 @@ func (rc *RedisClient) reconcileLoop() {
 		// ticker (short intervals) and must not be overridden by the long
 		// backstop value until it recovers. (Regression guard for the
 		// `baseInterval` captured-once bug.)
-		if consecutiveFailures == 0 {
-			want := rc.currentBackstop()
-			// Re-baseline only when the BASE itself changed (a keyspace engagement
-			// transition or a SetReconcileInterval write) — compare to lastBase,
-			// NOT backoff. backoff can legitimately sit ABOVE the base because
-			// doReconcile applied a task #22 adaptive STRETCH; comparing to backoff
-			// would clobber that stretch every turn, pulling the cadence back down
-			// to the base and defeating the 500GB-copy duty-cycle. On a real base
-			// change we re-baseline; doReconcile re-applies any stretch next sync.
-			if want != lastBase {
-				lastBase = want
-				backoff = want
-				ticker.Reset(backoff)
-			}
-		}
+		rc.rebaselineReconcileTicker(&lastBase, &consecutiveFailures, &backoff, ticker)
 
 		select {
 		case <-ticker.C:
+			// A backstop change and the old tick can become ready together. select
+			// is intentionally random among ready cases, so re-check here before
+			// doing any work. Without this guard startup can still run one full
+			// SCAN after push has already demoted it to the 24-hour backstop.
+			if rc.rebaselineReconcileTicker(&lastBase, &consecutiveFailures, &backoff, ticker) {
+				continue
+			}
 			rc.doReconcile(&consecutiveFailures, &backoff, maxBackoff, ticker)
+		case <-rc.backstopChangedCh:
+			// Wake an already-blocked loop immediately. A successful keyspace
+			// gap-fill followed by ENABLED is also authoritative recovery from a
+			// prior SCAN failure, so the long push cadence may end that stale
+			// failure backoff.
+			rc.rebaselineReconcileTicker(&lastBase, &consecutiveFailures, &backoff, ticker)
 		case <-rc.syncNowCh:
 			// G5 fast-path continuation (review fix): a capped mass-delete
 			// cycle with confirmed survivors schedules its own follow-up.
@@ -1263,8 +2056,8 @@ func (rc *RedisClient) reconcileLoop() {
 				continue
 			}
 			// Keyspace-push deferral (2026-06-27): when the push is actively
-			// ENABLED the backstop is long (setEngagement stores a >30s interval
-			// ONLY for ENABLED+reachable). In that state a network-change/reconnect
+			// ENABLED and the backend is reachable, pushCarriesDeltas reports that
+			// delivery is live. In that state a network-change/reconnect
 			// must NOT fire a full SCAN here — the keyspace loop OWNS reconnect
 			// convergence (PSUBSCRIBE-then-gap-fill on its OWN (re)connect), and the
 			// rare backstop is the safety net. On a flaky link — cellular, or a
@@ -1272,10 +2065,10 @@ func (rc *RedisClient) reconcileLoop() {
 			// PSUBSCRIBE (observed: backend pinging at 16ms while the probe flapped
 			// "unreachable" every ~10s) — this path otherwise fires a full 200k SCAN
 			// PER flap, the exact contention the push was built to remove. When the
-			// push is NOT carrying deltas (backstop == 30s: DISABLED / DEGRADED /
-			// unreachable) we fall through to the classic flap-debounce + SCAN, which
+			// push is NOT carrying deltas (DISABLED / DEGRADED / unreachable) we
+			// fall through to the classic flap-debounce + SCAN, which
 			// is then the authoritative convergence path (byte-identical to before).
-			if rc.currentBackstop() > DefaultReconcileInterval {
+			if rc.pushCarriesDeltas() {
 				jmlog.Info("network-change reconcile deferred to keyspace push",
 					"reason", "push ENABLED; keyspace loop owns reconnect gap-fill")
 				continue
@@ -1287,17 +2080,42 @@ func (rc *RedisClient) reconcileLoop() {
 			// if a sync STARTED or COMPLETED within the class-aware debounce window;
 			// the periodic ticker still catches any real drift within the cadence.
 			// LAN (medium/fast) → window 0 → NO debounce, behavior unchanged.
-			if d := flapDebounceInterval(); d > 0 {
+			// The flap debounce alone is NOT enough once syncs are FAILING.
+			//
+			// Measured on Leland's cellular link 2026-07-31 — the log is a
+			// textbook feedback loop:
+			//
+			//	21:24:47 reconciliation failed (attempt 21) ... next_in_sec: 300
+			//	21:24:47 reconciliation triggered by network change   <- immediately
+			//	21:26:07 network path lost   (attempt 22) next_in_sec: 300
+			//	21:26:07 reconciliation triggered by network change   <- again
+			//	... 28 attempts, ending "SCAN budget 5m0s exceeded"
+			//
+			// doReconcile computed a 300s backoff and the flap path walked
+			// straight past it, because the debounce window (60s, class-aware)
+			// is INDEPENDENT of consecutiveFailures. On cellular the link flaps
+			// constantly, so: SCAN starts -> saturates the uplink -> the link
+			// looks changed/degraded -> another flap -> another SCAN. The scan
+			// is its own trigger. Leland's report: "when index rebuilding on
+			// cellular it really hogs all bandwidth and even a simple web
+			// search fails" — a background index task starving the user's
+			// entire uplink, for a SCAN that cannot finish anyway.
+			//
+			// So while we are in failure backoff, the BACKOFF is the floor: a
+			// flap may not retry sooner than the retry we already scheduled.
+			// Zero failures -> backoff is irrelevant and the classic debounce
+			// applies byte-identically (LAN unchanged: window 0, no debounce).
+			suppress := flapSuppressWindow(consecutiveFailures, backoff)
+			if suppress > 0 {
 				rc.mu.RLock()
-				recent := rc.lastSyncStartedAt
-				if rc.lastSyncTime.After(recent) {
-					recent = rc.lastSyncTime
-				}
+				recent := mostRecentSyncMark(rc.lastSyncStartedAt, rc.lastSyncTime, rc.lastSyncEndedAt)
 				rc.mu.RUnlock()
-				if !recent.IsZero() && time.Since(recent) < d {
-					jmlog.Info("flap-triggered reconcile suppressed (recent sync within debounce window)",
+				if !recent.IsZero() && time.Since(recent) < suppress {
+					jmlog.Info("flap-triggered reconcile suppressed",
 						"since_last_sec", int(time.Since(recent).Seconds()),
-						"debounce_sec", int(d.Seconds()))
+						"window_sec", int(suppress.Seconds()),
+						"consecutive_failures", consecutiveFailures,
+						"reason", map[bool]string{true: "failure backoff", false: "flap debounce"}[consecutiveFailures > 0 && backoff >= flapDebounceInterval()])
 					continue
 				}
 			}
@@ -1307,6 +2125,39 @@ func (rc *RedisClient) reconcileLoop() {
 			return
 		}
 	}
+}
+
+// rebaselineReconcileTicker applies an actual base-cadence change to a running
+// loop. It returns true when the old ticker was stale and has been reset, so a
+// caller that just received from ticker.C can skip that obsolete tick.
+//
+// Failure backoff normally owns the ticker until doReconcile recovers. The one
+// safe exception is keyspace push becoming ENABLED+reachable: that transition
+// occurs only after its own authoritative gap-fill succeeds, so carrying a
+// stale full-SCAN failure retry into push mode is redundant and harmful.
+func (rc *RedisClient) rebaselineReconcileTicker(lastBase *time.Duration, consecutiveFailures *int, backoff *time.Duration, ticker *time.Ticker) bool {
+	want := rc.currentBackstop()
+	if want == *lastBase {
+		return false
+	}
+	if *consecutiveFailures != 0 {
+		if !rc.pushCarriesDeltas() {
+			return false
+		}
+		*consecutiveFailures = 0
+	}
+	*lastBase = want
+	*backoff = want
+	ticker.Reset(want)
+	return true
+}
+
+// pushCarriesDeltas is the explicit predicate for suppressing redundant full
+// SCANs. A long configured reconcile interval is not proof of push engagement:
+// SetReconcileInterval may legitimately be longer than 30 seconds while push
+// is disabled. The old currentBackstop()>30s shortcut confused those states.
+func (rc *RedisClient) pushCarriesDeltas() bool {
+	return keyspaceEngagement(rc.engaged.Load()) == keyspaceEnabled && reachableNow()
 }
 
 // currentBackstop returns the current desired reconcile interval, reading
@@ -1320,6 +2171,41 @@ func (rc *RedisClient) currentBackstop() time.Duration {
 	return time.Duration(n)
 }
 
+// adaptReconcileInterval returns how long to wait before the next periodic
+// full reconcile: the backstop the engagement logic chose, stretched when the
+// last SCAN was expensive, and NEVER shorter than that backstop.
+//
+// THE BUG THIS FIXES. The ceiling used to be applied AFTER the floor, so it
+// undercut the floor and a mechanism documented to make the interval LONGER
+// made it SHORTER instead. Live numbers, 2026-08-16, push ENABLED on a LAN:
+//
+//	base   = 900s          the 15-minute backstop, correctly chosen
+//	scaled = 26.2s x 30    = 787s
+//	floor  -> 900s
+//	ceiling-> 300s         the backstop truncated to a third of itself
+//
+// The user-visible result was a full 420,699-entry SCAN every ~5 minutes that
+// upserted NOTHING, on a client whose Redis keyspace push was working
+// perfectly — read as "the index keeps rebuilding for no reason".
+//
+// maxBackoff is the FAILURE-retry cap (see doReconcile, where it bounds the
+// 30s x 2^n escalation). Reusing it as a ceiling on the HEALTHY cadence is what
+// let a retry constant govern a success path. It still bounds the stretch, but
+// the backstop is now the floor and wins.
+func adaptReconcileInterval(base, lastSync, maxBackoff time.Duration) time.Duration {
+	if lastSync <= reconcileAdaptiveThreshold {
+		return base
+	}
+	scaled := lastSync * reconcileDutyDivisor
+	if scaled > maxBackoff {
+		scaled = maxBackoff
+	}
+	if scaled < base {
+		scaled = base
+	}
+	return scaled
+}
+
 func (rc *RedisClient) doReconcile(consecutiveFailures *int, backoff *time.Duration, maxBackoff time.Duration, ticker *time.Ticker) {
 	// Backoff is computed off DefaultReconcileInterval, NOT the (possibly
 	// minutes/hours-long) backstop interval — a failure streak must drive
@@ -1328,9 +2214,9 @@ func (rc *RedisClient) doReconcile(consecutiveFailures *int, backoff *time.Durat
 	baseInterval := DefaultReconcileInterval
 	if err := rc.syncMetadata(); err != nil {
 		// G7 (task #80): DEFERRED, not failed. A SCAN that exceeded its
-		// class-gated budget WHILE the keyspace push is engaged (backstop >
-		// DefaultReconcileInterval — the established push-carrying test, see
-		// the reconcileLoop deferral above) is redundant convergence work:
+		// class-gated budget WHILE keyspace push is explicitly ENABLED and
+		// reachable (the same pushCarriesDeltas test used by reconcileLoop) is
+		// redundant convergence work:
 		// deltas are flowing via push the whole time. The failure backoff is
 		// deliberately FASTER than the backstop (outage recovery), which is
 		// exactly wrong here — live 2026-07-01, each fast retry saturated a
@@ -1407,17 +2293,7 @@ func (rc *RedisClient) doReconcile(consecutiveFailures *int, backoff *time.Durat
 		// ENABLED the backstop is already long, so the stretch rarely engages;
 		// with push DISABLED the backstop is 30s and the stretch behaves as before.
 		base := rc.currentBackstop()
-		next := base
-		if lastSync > reconcileAdaptiveThreshold {
-			scaled := lastSync * reconcileDutyDivisor
-			if scaled < base {
-				scaled = base
-			}
-			if scaled > maxBackoff {
-				scaled = maxBackoff
-			}
-			next = scaled
-		}
+		next := adaptReconcileInterval(base, lastSync, maxBackoff)
 		if next != *backoff {
 			if next > base {
 				jmlog.Info("reconcile cadence adapted to sync cost",
@@ -1436,9 +2312,8 @@ func (rc *RedisClient) doReconcile(consecutiveFailures *int, backoff *time.Durat
 // context.DeadlineExceeded (the SCAN exceeded its class-gated wall budget —
 // syncMetadata guarantees the sentinel is present whenever its own context
 // expired) AND the keyspace push is engaged and carrying deltas
-// (currentBackstop() > DefaultReconcileInterval — the same push-carrying test
-// reconcileLoop's network-change deferral uses; setEngagement stores a long
-// backstop ONLY for ENABLED+reachable). In that state the backstop SCAN is
+// (pushCarriesDeltas() — the same explicit predicate reconcileLoop's
+// network-change deferral uses). In that state the backstop SCAN is
 // redundant convergence work and must not drive the fast failure backoff.
 //
 // If the push drops, setEngagement(degraded/disabled) snaps the backstop back
@@ -1449,8 +2324,7 @@ func (rc *RedisClient) isDeferredSyncErr(err error) bool {
 	if err == nil || os.Getenv("JM_SYNC_DEFERRAL") == "0" {
 		return false
 	}
-	return errors.Is(err, context.DeadlineExceeded) &&
-		rc.currentBackstop() > DefaultReconcileInterval
+	return errors.Is(err, context.DeadlineExceeded) && rc.pushCarriesDeltas()
 }
 
 // noteSyncOutcome records the end of a sync attempt (G7, task #80). Called on
@@ -1462,6 +2336,34 @@ func (rc *RedisClient) isDeferredSyncErr(err error) bool {
 // after a failed/deferred attempt (the link was just saturated for the full
 // budget). The deferral Warn logs ONCE per streak, not per attempt — on a
 // cellular relay the streak can run for hours at the backstop cadence.
+// mostRecentSyncMark is the anchor for the flap-suppression window: the latest
+// of when a sync STARTED, when one last SUCCEEDED, and when one last ENDED.
+//
+// endedAt is the one that was missing, and it is the one that matters on a
+// tunnel. lastSyncTime is stamped only on SUCCESS; lastSyncEndedAt is stamped
+// on every exit including FAILURE and DEFERRAL — and on a slow link the
+// common outcome is deferral ("SCAN budget exceeded"). With endedAt excluded,
+// the window was anchored to the START of the failed attempt, and since the
+// tunnel SCAN budget (300s) equals the maximum suppress window (maxBackoff,
+// 300s), time.Since(start) >= suppress the instant the attempt gave up. The
+// next flap therefore launched another full-budget SCAN immediately: the
+// ~100%-duty-cycle loop where the SCAN saturates the uplink, the saturated
+// uplink looks like a link change, and the link change triggers the SCAN.
+//
+// noteSyncOutcome documents this exact intent ("must keep suppressing
+// flap-triggered SCANs right after a failed/deferred attempt — the link was
+// just saturated for the full budget"). It was reading the wrong field.
+func mostRecentSyncMark(startedAt, syncedAt, endedAt time.Time) time.Time {
+	recent := startedAt
+	if syncedAt.After(recent) {
+		recent = syncedAt
+	}
+	if endedAt.After(recent) {
+		recent = endedAt
+	}
+	return recent
+}
+
 func (rc *RedisClient) noteSyncOutcome(err error) {
 	deferred := rc.isDeferredSyncErr(err)
 	now := time.Now()
@@ -1718,7 +2620,8 @@ func min(a, b int) int {
 //
 // ARGV[1] = SCAN cursor, ARGV[2] = COUNT. Returns a flat list whose FIRST
 // element is the next cursor, followed by one
-// "fileType:mtime:fileSize:inode:parentInode:name" string per child entry
+// "v2:fileType:attrValid:mtime:mtimeNsec:fileSize:inode:parentInode:name"
+// string per child entry (seconds and fraction remain separate integers)
 // (parentInode, not a path — Go reconstructs the path from the reverse map).
 const luaScanBatch = `
 local function gi(v) if #v~=9 then return nil end
@@ -1732,14 +2635,57 @@ local ent=redis.call('HGETALL',key)
 for i=1,#ent,2 do local nm=ent[i] local val=ent[i+1]
 local ci=gi(val) local ft=string.byte(val,1)
 if ci then
-local mt=0 local sz=0
+local mt=0 local ns=0 local sz=0 local valid=0
 local attr=redis.call('GET','i'..tostring(ci))
-if attr and #attr>=59 then mt=u64(attr,24) sz=u64(attr,52) end
-table.insert(out,tostring(ft)..':'..tostring(mt)..':'..tostring(sz)..':'..tostring(ci)..':'..pi..':'..nm)
+if attr and #attr>=59 then mt=u64(attr,24) ns=u32(attr,32) sz=u64(attr,52) if ns<1000000000 then valid=1 end end
+table.insert(out,'v2:'..tostring(ft)..':'..tostring(valid)..':'..tostring(mt)..':'..tostring(ns)..':'..tostring(sz)..':'..tostring(ci)..':'..pi..':'..nm)
 end
 end end
 return out
 `
+
+var errIncompleteInodeAttrs = errors.New("redis SCAN found unreadable inode attrs")
+
+func parseScanRawEntry(raw string) (scanRawEntry, error) {
+	var nsec int64
+	known := strings.HasPrefix(raw, "v2:")
+	if known {
+		v2 := strings.SplitN(raw, ":", 9)
+		if len(v2) != 9 {
+			return scanRawEntry{}, fmt.Errorf("malformed precise SCAN row")
+		}
+		var err error
+		nsec, err = strconv.ParseInt(v2[4], 10, 64)
+		if err != nil || nsec < 0 || nsec >= 1e9 {
+			return scanRawEntry{}, fmt.Errorf("invalid SCAN nanoseconds")
+		}
+		raw = strings.Join(append(v2[1:4], v2[5:]...), ":")
+	}
+	parts := strings.SplitN(raw, ":", 7)
+	if len(parts) != 7 {
+		return scanRawEntry{}, fmt.Errorf("malformed SCAN row")
+	}
+	ft, err := strconv.Atoi(parts[0])
+	if err != nil {
+		return scanRawEntry{}, err
+	}
+	if parts[1] != "0" && parts[1] != "1" {
+		return scanRawEntry{}, fmt.Errorf("invalid attr validity")
+	}
+	mt, err := strconv.ParseInt(parts[2], 10, 64)
+	if err != nil {
+		return scanRawEntry{}, err
+	}
+	sz, err := strconv.ParseInt(parts[3], 10, 64)
+	if err != nil {
+		return scanRawEntry{}, err
+	}
+	ino, err := strconv.ParseUint(parts[4], 10, 64)
+	if err != nil {
+		return scanRawEntry{}, err
+	}
+	return scanRawEntry{ft: ft, attrValid: parts[1] == "1", mtime: mt, mtimeNsec: nsec, mtimeNsecKnown: known && parts[1] == "1", size: sz, inode: ino, parentInode: parts[5], name: parts[6]}, nil
+}
 
 // syncMetadata performs a full batch reconciliation: Lua tree pull → SQLite sync.
 //
@@ -1750,6 +2696,11 @@ return out
 func (rc *RedisClient) syncMetadata() (err error) {
 	rc.syncMu.Lock()
 	defer rc.syncMu.Unlock()
+	if token := rc.scanToken(); !rc.scanTokenValid(token) {
+		return ErrBackendUnqualified
+	}
+	var pruneSnapshot map[string]int
+	completed := false
 
 	start := time.Now()
 	// Record sync START so the flap debounce (reconcileLoop) can tell a sync is
@@ -1765,7 +2716,26 @@ func (rc *RedisClient) syncMetadata() (err error) {
 	// G7 (task #80): record the attempt's outcome on EVERY exit — success,
 	// failure, or deferral — so IsSyncing() turns false the moment this
 	// attempt ends (named return; runs before the syncMu unlock above).
-	defer func() { rc.noteSyncOutcome(err) }()
+	defer func() {
+		if !completed && pruneSnapshot != nil {
+			rc.pruneAbsent = pruneSnapshot
+		}
+		if err != nil {
+			rc.lifecycleMu.Lock()
+			active := rc.sessionActive
+			rc.lifecycleMu.Unlock()
+			if active {
+				rc.setEngagement(keyspaceDegraded)
+			}
+		}
+		rc.noteSyncOutcome(err)
+	}()
+	rc.lifecycleMu.Lock()
+	markErr := rc.markBaselineIncomplete()
+	rc.lifecycleMu.Unlock()
+	if markErr != nil {
+		return fmt.Errorf("persist pending SCAN baseline: %w", markErr)
+	}
 
 	// G7 (task #80): class-gated SCAN budget (was a fixed 120s; LAN/WiFi are
 	// byte-identical, tunnel/cellular gets 300s so a ~200-300s slow-link SCAN
@@ -1781,24 +2751,53 @@ func (rc *RedisClient) syncMetadata() (err error) {
 	// no single batch (incl. a big dir's HGETALL + per-child attr GETs) keeps
 	// Redis BUSY long enough to starve a concurrent copy.
 	const scanCount = "500"
-	type rawEntry struct {
-		ft          int
-		mtime, size int64
-		inode       uint64
-		parentInode string
-		name        string
+
+	// RESUMABLE SCAN (2026-08-01). A full SCAN used to be all-or-nothing: on a
+	// budget expiry or a dropped connection the loop returned and the cursor,
+	// plus every entry already pulled, was DISCARDED. The next attempt started
+	// at cursor "0". On a link where the SCAN cannot finish inside its budget
+	// that is not "slow convergence", it is a treadmill — Leland's log shows 28
+	// attempts, none finishing, each re-pulling the same prefix of a ~200k
+	// keyspace over cellular. His words: "it really hogs all bandwidth and even
+	// a simple web search fails".
+	//
+	// The network work is now resumable while RECONSTRUCTION stays atomic. Path
+	// reconstruction walks parentInode → root over a rev map built from the
+	// WHOLE keyspace, so a partial scan genuinely cannot be applied — that part
+	// of the old design was right. What was wasteful was throwing away the
+	// bytes. We now carry (cursor, raws, rev) across attempts and reconstruct
+	// only when the cursor completes, so each attempt advances the scan instead
+	// of repeating it.
+	raws, rev, cursor, token := rc.takeScanResumeWithToken()
+	if rc.store != nil {
+		storeEpoch, err := rc.store.CaptureStoreEpoch()
+		if err != nil {
+			return fmt.Errorf("capture SCAN store epoch: %w", err)
+		}
+		if cursor != "0" && token.store != storeEpoch {
+			jmlog.Info("metadata sync: discarding partial SCAN after Store mutation", "entries", len(raws))
+			raws, rev, cursor, token = nil, make(map[string][2]string), "0", rc.scanToken()
+		}
+		token.store = storeEpoch
 	}
-	var raws []rawEntry
-	rev := make(map[string][2]string) // childInode → {parentInode, name}
-	cursor := "0"
 	for {
-		res, err := rc.redisDB().Eval(ctx, luaScanBatch, nil, cursor, scanCount).StringSlice()
+		var res []string
+		var err error
+		if rc.testScanBatch != nil {
+			res, err = rc.testScanBatch(ctx, cursor, scanCount)
+		} else {
+			res, err = rc.redisDB().Eval(ctx, luaScanBatch, nil, cursor, scanCount).StringSlice()
+		}
 		if err != nil {
 			// G7 (task #80): when OUR scan budget expired, make the returned
 			// error uniformly match errors.Is(_, context.DeadlineExceeded)
 			// regardless of how go-redis dressed the expiry (ctx sentinel vs
 			// a net "i/o timeout" from the ctx-derived read deadline) — the
 			// deferred-not-failed classification keys on that sentinel.
+			// Save the progress this attempt made so the next one resumes
+			// instead of re-pulling it. Applies to BOTH exits: a budget expiry
+			// and a dropped connection cost the same wasted bytes.
+			rc.saveScanResumeWithToken(raws, rev, cursor, token)
 			if ctx.Err() == context.DeadlineExceeded {
 				return fmt.Errorf("redis SCAN batch: %w (SCAN budget %v exceeded): %w",
 					err, scanBudget, context.DeadlineExceeded)
@@ -1811,21 +2810,22 @@ func (rc *RedisClient) syncMetadata() (err error) {
 		cursor = res[0]
 		rc.syncScanned.Add(int64(len(res) - 1)) // U6 progress
 		for _, raw := range res[1:] {
-			// "fileType:mtime:fileSize:inode:parentInode:name"
-			parts := strings.SplitN(raw, ":", 6)
-			if len(parts) != 6 {
-				continue
+			e, parseErr := parseScanRawEntry(raw)
+			if parseErr != nil {
+				return fmt.Errorf("redis SCAN row: %w", parseErr)
 			}
-			ft, _ := strconv.Atoi(parts[0])
-			mt, _ := strconv.ParseInt(parts[1], 10, 64)
-			sz, _ := strconv.ParseInt(parts[2], 10, 64)
-			ino, _ := strconv.ParseUint(parts[3], 10, 64)
-			raws = append(raws, rawEntry{ft: ft, mtime: mt, size: sz, inode: ino, parentInode: parts[4], name: parts[5]})
-			rev[parts[3]] = [2]string{parts[4], parts[5]}
+			raws = append(raws, e)
+			rev[strconv.FormatUint(e.inode, 10)] = [2]string{e.parentInode, e.name}
 		}
 		if cursor == "0" {
 			break
 		}
+	}
+	if !rc.scanTokenValid(token) {
+		return errors.New("SCAN invalidated by newer baseline debt or subscription")
+	}
+	if rc.testAfterScanTokenCheck != nil {
+		rc.testAfterScanTokenCheck()
 	}
 
 	// Reconstruct each entry's path by walking parentInode → root ("1") via the
@@ -1834,6 +2834,8 @@ func (rc *RedisClient) syncMetadata() (err error) {
 	// exactly as before.
 	redisEntries := make([]*Entry, 0, len(raws))
 	redisPaths := make(map[string]struct{}, len(raws))
+	incompleteAttrs := false
+	retryParents := make(map[uint64]struct{})
 	for _, e := range raws {
 		parts := []string{e.name}
 		cur := e.parentInode
@@ -1867,8 +2869,8 @@ func (rc *RedisClient) syncMetadata() (err error) {
 		}
 
 		var mtime time.Time
-		if e.mtime > 0 {
-			mtime = time.Unix(e.mtime, 0)
+		if e.mtimeNsecKnown || e.mtime > 0 {
+			mtime = time.Unix(e.mtime, e.mtimeNsec)
 		}
 
 		// Classify via the shared single-source-of-truth mapper (keyspace.go)
@@ -1877,43 +2879,103 @@ func (rc *RedisClient) syncMetadata() (err error) {
 		// symlink would UPSERT a regular-file Entry over the locally-minted
 		// ModeSymlink cache entry and silently degrade it. ft==2 still → ModeDir.
 		mode, isDir := modeForFiletype(byte(e.ft))
+		redisPaths[entryPath] = struct{}{}
+		if !e.attrValid {
+			incompleteAttrs = true
+			if parent, parseErr := strconv.ParseUint(e.parentInode, 10, 64); parseErr == nil {
+				retryParents[parent] = struct{}{}
+			}
+			if rc.store.LookupByPath(entryPath) != nil || !isDir {
+				continue
+			}
+		}
 
 		redisEntries = append(redisEntries, &Entry{
-			Path:       entryPath,
-			Name:       path.Base(entryPath),
-			ParentPath: path.Dir(entryPath),
-			IsDir:      isDir,
-			Size:       e.size,
-			Mtime:      mtime,
-			Inode:      e.inode,
-			Mode:       mode,
+			Path:           entryPath,
+			Name:           path.Base(entryPath),
+			ParentPath:     path.Dir(entryPath),
+			IsDir:          isDir,
+			Size:           e.size,
+			Mtime:          mtime,
+			MtimeNsecKnown: e.mtimeNsecKnown,
+			Inode:          e.inode,
+			Mode:           mode,
 		})
-		redisPaths[entryPath] = struct{}{}
 	}
 
 	// Incremental upsert: only insert entries that are new or changed.
 	// Comparing with the in-memory cache avoids rewriting all 131K entries
 	// to SQLite on every sync cycle (reduces ~6s to <500ms steady-state).
 	var toUpsert []*Entry
+	var changedFiles []string
 	for _, e := range redisEntries {
 		existing := rc.store.LookupByPath(e.Path)
 		if existing == nil ||
-			existing.Mtime.Unix() != e.Mtime.Unix() ||
+			!existing.Mtime.Equal(e.Mtime) || existing.MtimeNsecKnown != e.MtimeNsecKnown ||
 			existing.Size != e.Size ||
 			existing.Inode != e.Inode {
 			toUpsert = append(toUpsert, e)
+			if existing != nil && !existing.IsDir {
+				changedFiles = append(changedFiles, existing.Path)
+			}
 		}
 	}
 
 	if len(toUpsert) > 0 {
-		if err := rc.store.BulkInsert(toUpsert, 500); err != nil {
-			return fmt.Errorf("bulk insert: %w", err)
+		// The reconnect path revalidates persisted slice maps against Redis in
+		// one pipelined metadata exchange. This full-tree diff remains the
+		// backstop for missed pub/sub events: invalidate only files whose
+		// authoritative inode/size/mtime generation changed, while their old
+		// mirror row is still available to resolve the previous inode.
+		changed := make(map[string]struct{}, len(changedFiles))
+		for _, p := range changedFiles {
+			changed[p] = struct{}{}
 		}
+		for start := 0; start < len(toUpsert); start += 500 {
+			end := start + 500
+			if end > len(toUpsert) {
+				end = len(toUpsert)
+			}
+			chunk := toUpsert[start:end]
+			err := rc.fencedScanMutation(&token, func() error {
+				var invalidatePaths []string
+				for _, e := range chunk {
+					if _, ok := changed[e.Path]; ok {
+						invalidatePaths = append(invalidatePaths, e.Path)
+					}
+				}
+				next, err := rc.store.ScanUpsertBatch(chunk, token.store, invalidatePaths)
+				if err != nil {
+					return err
+				}
+				token.store = next
+				return nil
+			})
+			if err != nil {
+				if errors.Is(err, errScanPublicationInvalidated) || errors.Is(err, ErrMirrorConflict) {
+					return nil
+				}
+				return fmt.Errorf("bulk insert: %w", err)
+			}
+			if rc.testAfterScanUpsertChunk != nil {
+				rc.testAfterScanUpsertChunk()
+			}
+			rc.offerCacheCandidates(chunk, token)
+		}
+	}
+	if incompleteAttrs {
+		for parent := range retryParents {
+			rc.scheduleAttrRetryWithBackend(parent, token.backend)
+		}
+		return errIncompleteInodeAttrs
 	}
 
 	// Clear local_only flag only for entries that are actually local_only.
 	// No need to update all 131K entries — typically only 0-10 are local_only.
-	localOnly, _ := rc.store.LocalOnlyEntries()
+	localOnly, err := rc.store.LocalOnlyEntries()
+	if err != nil {
+		return fmt.Errorf("list local_only entries: %w", err)
+	}
 	if len(localOnly) > 0 {
 		var clearPaths []string
 		for _, e := range localOnly {
@@ -1922,8 +2984,22 @@ func (rc *RedisClient) syncMetadata() (err error) {
 			}
 		}
 		if len(clearPaths) > 0 {
-			if err := rc.store.BulkClearLocalOnly(clearPaths); err != nil {
-				return fmt.Errorf("bulk clear local_only: %w", err)
+			for start := 0; start < len(clearPaths); start += scanMutationChunk {
+				end := min(start+scanMutationChunk, len(clearPaths))
+				chunk := clearPaths[start:end]
+				err := rc.fencedScanMutation(&token, func() error {
+					next, err := rc.store.ScanClearLocalOnlyBatch(chunk, token.store)
+					if err == nil {
+						token.store = next
+					}
+					return err
+				})
+				if err != nil {
+					if errors.Is(err, errScanPublicationInvalidated) || errors.Is(err, ErrMirrorConflict) {
+						return nil
+					}
+					return fmt.Errorf("bulk clear local_only: %w", err)
+				}
 			}
 		}
 	}
@@ -1959,6 +3035,10 @@ func (rc *RedisClient) syncMetadata() (err error) {
 	// cycle. This pairs with the phantom-purge gate in nfs/handler.go
 	// (commit bbc6bff) to give recovery a full pruneThreshold-cycle
 	// window before any destructive cache mutation can fire.
+	pruneSnapshot = make(map[string]int, len(rc.pruneAbsent))
+	for p, count := range rc.pruneAbsent {
+		pruneSnapshot[p] = count
+	}
 	skipIncrement := rc.RecentlyDegraded(60 * time.Second)
 	rc.trackAbsentPaths(existingPaths, redisPaths, skipIncrement)
 	// Collect paths that have been absent long enough to prune.
@@ -2145,8 +3225,40 @@ func (rc *RedisClient) syncMetadata() (err error) {
 	}
 
 	if len(toDelete) > 0 {
-		if err := rc.store.DeletePaths(toDelete); err != nil {
-			return fmt.Errorf("delete pruned: %w", err)
+		// A directory is admitted only after its children have been removed.
+		// Deduplication also ensures a path cannot straddle two transactions.
+		seen := make(map[string]struct{}, len(toDelete))
+		unique := toDelete[:0]
+		for _, p := range toDelete {
+			if _, ok := seen[p]; !ok {
+				seen[p] = struct{}{}
+				unique = append(unique, p)
+			}
+		}
+		toDelete = unique
+		sort.Slice(toDelete, func(i, j int) bool {
+			a, b := strings.Count(toDelete[i], "/"), strings.Count(toDelete[j], "/")
+			if a != b {
+				return a > b
+			}
+			return toDelete[i] < toDelete[j]
+		})
+		for start := 0; start < len(toDelete); start += scanMutationChunk {
+			end := min(start+scanMutationChunk, len(toDelete))
+			chunk := toDelete[start:end]
+			err := rc.fencedScanMutation(&token, func() error {
+				next, err := rc.store.ScanDeletePathsBatch(chunk, token.store)
+				if err == nil {
+					token.store = next
+				}
+				return err
+			})
+			if err != nil {
+				if errors.Is(err, errScanPublicationInvalidated) || errors.Is(err, ErrMirrorConflict) {
+					return nil
+				}
+				return fmt.Errorf("delete pruned: %w", err)
+			}
 		}
 	}
 
@@ -2173,36 +3285,22 @@ func (rc *RedisClient) syncMetadata() (err error) {
 		}
 	}
 
-	// #10 (task #73 second half): persist the ladder's post-cycle state. This
-	// is the SINGLE durable-ladder call site, deliberately placed after every
-	// pruneAbsent mutation this cycle — trackAbsentPaths increments and
-	// reappearance clears, the qualification drain, collectFastPathPrunes
-	// removals, and verifyPruneCandidates deferral re-insertions — so the
-	// snapshot-diff observes only the cycle's final state (correct by
-	// construction against any future mutation site too). Best-effort and
-	// no-op when the diff is empty; see the method for degraded-cycle and
-	// error-exit semantics.
-	rc.persistPruneLadderDiff()
-
 	duration := time.Since(start)
 	syncedAt := time.Now()
+	finished, err := rc.completeScanPublication(token, syncedAt)
+	if err != nil {
+		return fmt.Errorf("finish SCAN baseline: %w", err)
+	}
+	if !finished {
+		return nil
+	}
+	completed = true
 	rc.mu.Lock()
 	rc.lastSyncDuration = duration
 	rc.lastSyncTime = syncedAt
 	rc.lastSyncEntries = len(redisEntries)
 	pendingPrune := len(rc.pruneAbsent)
 	rc.mu.Unlock()
-
-	// C1 (2026-07-02): persist the successful-sync wall clock durably so the
-	// NEXT boot can decide (via ShouldSkipBootSync) whether the mirror is fresh
-	// enough to skip the redundant boot SCAN when keyspace push is engaged.
-	// Best-effort: a write error here must not fail the sync (it only costs the
-	// next boot a SCAN it could have skipped), so it is logged and swallowed.
-	if rc.store != nil {
-		if err := rc.store.SetMeta(metaKeyLastSyncTime, strconv.FormatInt(syncedAt.Unix(), 10)); err != nil {
-			jmlog.Warn("failed to persist last_sync_time (next boot may re-SCAN)", "error", err.Error())
-		}
-	}
 
 	jmlog.Info("metadata sync complete",
 		"entries", len(redisEntries),
@@ -2391,3 +3489,117 @@ func (rc *RedisClient) verifyPruneCandidates(toDelete []string, fastConfirmed ma
 	}
 	return verified, fusePresent
 }
+
+// flapSuppressWindow is the minimum quiet period a network-change ("flap")
+// trigger must observe before it may start another full SCAN.
+//
+// Extracted from the reconcile loop purely so it is testable — the loop itself
+// is a select over channels. See the call site for the measured feedback loop
+// this closes.
+//
+// Zero consecutive failures: the classic class-aware flap debounce, unchanged
+// (LAN returns 0 = no debounce). While FAILING: the failure backoff becomes the
+// floor, because a retry sooner than the one already scheduled is exactly the
+// storm — 28 attempts on a cellular link, each a full SCAN that saturated the
+// uplink and could not finish.
+func flapSuppressWindow(consecutiveFailures int, backoff time.Duration) time.Duration {
+	d := flapDebounceInterval()
+	if consecutiveFailures > 0 && backoff > d {
+		return backoff
+	}
+	return d
+}
+
+// ---- resumable SCAN state (2026-08-01) ----
+
+// scanRawEntry is one child row pulled by luaScanBatch, before path
+// reconstruction. Package-scope so a partially completed SCAN can be carried
+// across attempts.
+type scanRawEntry struct {
+	ft             int
+	attrValid      bool
+	mtime, size    int64
+	mtimeNsec      int64
+	mtimeNsecKnown bool
+	inode          uint64
+	parentInode    string
+	name           string
+}
+
+// scanResumeMaxAge bounds how long a partially-scanned keyspace may be carried.
+// Entries pulled long ago describe a backend that has since moved on, and
+// reconstruction would mix epochs. Past this the partial is discarded and the
+// next attempt starts clean — correctness over saved bytes.
+const scanResumeMaxAge = 15 * time.Minute
+
+// takeScanResume returns any saved partial scan and CLEARS it, so a resume is
+// consumed exactly once. A partial older than scanResumeMaxAge, or one saved
+// under a different backend generation, is dropped. Returns a fresh empty state
+// when there is nothing usable to resume.
+func (rc *RedisClient) takeScanResume() ([]scanRawEntry, map[string][2]string, string) {
+	raws, rev, cursor, _ := rc.takeScanResumeWithToken()
+	return raws, rev, cursor
+}
+
+func (rc *RedisClient) takeScanResumeWithToken() ([]scanRawEntry, map[string][2]string, string, scanBaselineToken) {
+	current := rc.scanToken()
+	fresh := func() ([]scanRawEntry, map[string][2]string, string, scanBaselineToken) {
+		return nil, make(map[string][2]string), "0", current
+	}
+	if !scanResumeEnabled() {
+		return fresh()
+	}
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+	if rc.scanResumeCursor == "" || rc.scanResumeCursor == "0" {
+		return fresh()
+	}
+	if time.Since(rc.scanResumeAt) > scanResumeMaxAge {
+		jmlog.Info("metadata sync: discarding stale partial SCAN",
+			"age_sec", int(time.Since(rc.scanResumeAt).Seconds()),
+			"max_age_sec", int(scanResumeMaxAge.Seconds()),
+			"entries", len(rc.scanResumeRaws))
+		rc.scanResumeRaws, rc.scanResumeRev, rc.scanResumeCursor = nil, nil, ""
+		return fresh()
+	}
+	raws, rev, cursor, token := rc.scanResumeRaws, rc.scanResumeRev, rc.scanResumeCursor, rc.scanResumeToken
+	rc.scanResumeRaws, rc.scanResumeRev, rc.scanResumeCursor = nil, nil, ""
+	if token.debt != current.debt || token.session != current.session ||
+		token.backend != current.backend ||
+		token.publication != current.publication {
+		jmlog.Info("metadata sync: discarding invalidated partial SCAN", "entries", len(raws))
+		return fresh()
+	}
+	jmlog.Info("metadata sync: resuming partial SCAN",
+		"entries_carried", len(raws), "cursor", cursor,
+		"age_sec", int(time.Since(rc.scanResumeAt).Seconds()))
+	if rev == nil {
+		rev = make(map[string][2]string)
+	}
+	return raws, rev, cursor, token
+}
+
+// saveScanResume stores the progress of an attempt that did not finish, so the
+// next one continues from here. A completed scan (cursor "0") saves nothing —
+// there is nothing to resume.
+func (rc *RedisClient) saveScanResume(raws []scanRawEntry, rev map[string][2]string, cursor string) {
+	rc.saveScanResumeWithToken(raws, rev, cursor, rc.scanToken())
+}
+
+func (rc *RedisClient) saveScanResumeWithToken(raws []scanRawEntry, rev map[string][2]string, cursor string, token scanBaselineToken) {
+	if !scanResumeEnabled() || cursor == "" || cursor == "0" || len(raws) == 0 {
+		return
+	}
+	rc.mu.Lock()
+	rc.scanResumeRaws, rc.scanResumeRev, rc.scanResumeCursor = raws, rev, cursor
+	rc.scanResumeToken = token
+	rc.scanResumeAt = time.Now()
+	rc.mu.Unlock()
+	jmlog.Info("metadata sync: saved partial SCAN for resume",
+		"entries", len(raws), "cursor", cursor,
+		"note", "next attempt continues here instead of re-pulling this prefix")
+}
+
+// scanResumeEnabled — kill switch JM_SCAN_RESUME=0 restores the all-or-nothing
+// SCAN byte-identically.
+func scanResumeEnabled() bool { return os.Getenv("JM_SCAN_RESUME") != "0" }

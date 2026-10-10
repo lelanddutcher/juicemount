@@ -99,6 +99,9 @@ func callAPI(method, path string, query url.Values) (map[string]any, error) {
 	if err != nil {
 		return nil, err
 	}
+	if method == http.MethodPost {
+		req.Header.Set("X-JM-Control", "1")
+	}
 	client := &http.Client{Timeout: 10 * time.Minute} // pin can take a while on big trees
 	resp, err := client.Do(req)
 	if err != nil {

@@ -146,3 +146,47 @@ func TestRenameSubtreeDurablePersists(t *testing.T) {
 		t.Fatalf("%d SQLite rows under root/MOVED/, want 6", n)
 	}
 }
+
+// TestRenameSubtreeFiresInvalidationHook pins the metadata→nfs seam added for
+// serving-path data integrity: the NFS layer pools open FUSE fds keyed by PATH
+// ALONE, so a directory rename instantly staleness every descendant's pooled fd
+// (a later read of the same name is served the PRE-rename file's bytes, and a
+// later in-place write lands inside the moved-away file). metadata must not
+// import nfs, so RenameSubtree publishes the move through this hook.
+//
+// The hook MUST fire even when the mirror knows no descendants: an entry can be
+// evicted from the mirror while its fd is still pooled, so "no rows to re-key"
+// is not "nothing to invalidate".
+func TestRenameSubtreeFiresInvalidationHook(t *testing.T) {
+	s := buildRenameTree(t)
+
+	type call struct{ oldDir, newDir string }
+	var calls []call
+	s.SetOnSubtreeRenamed(func(oldDir, newDir string) {
+		calls = append(calls, call{oldDir, newDir})
+	})
+
+	if n := s.RenameSubtree("root/A", "root/A2"); n == 0 {
+		t.Fatal("precondition: expected descendants to be re-keyed")
+	}
+	if len(calls) != 1 || calls[0] != (call{"root/A", "root/A2"}) {
+		t.Fatalf("hook calls = %+v, want exactly one {root/A root/A2}", calls)
+	}
+
+	// Zero-descendant early return must STILL fire the hook.
+	calls = nil
+	if n := s.RenameSubtree("root/does-not-exist", "root/moved"); n != 0 {
+		t.Fatalf("expected 0 descendants, got %d", n)
+	}
+	if len(calls) != 1 || calls[0] != (call{"root/does-not-exist", "root/moved"}) {
+		t.Fatalf("hook did not fire on the empty-subtree path: %+v", calls)
+	}
+
+	// Detaching must be safe and silent.
+	s.SetOnSubtreeRenamed(nil)
+	calls = nil
+	s.RenameSubtree("root/Z", "root/Z2")
+	if len(calls) != 0 {
+		t.Fatalf("hook fired after detach: %+v", calls)
+	}
+}

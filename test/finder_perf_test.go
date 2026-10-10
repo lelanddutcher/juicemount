@@ -1,6 +1,7 @@
 package test
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -9,6 +10,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/lelanddutcher/juicemount/internal/mounttable"
 )
 
 // These tests benchmark the metadata operations that determine how "snappy"
@@ -21,37 +24,141 @@ import (
 //
 // For each, we compare NFS (our server) vs direct FUSE (JuiceFS mount).
 
-const fuseMountPath = "/Users/USER/.juicemount/fuse-internal"
+// fuseMountPath is resolved at run time; see fuseInternalPath below.
+var fuseMountPath = fuseInternalPath()
 
-// findDirWithNEntries finds a directory with approximately n entries.
-func findDirWithNEntries(root string, target int, tolerance float64) (string, int) {
-	best := ""
-	bestCount := 0
-	bestDiff := target
+// fuseInternalPath resolves the JuiceFS FUSE mount for the CURRENT user.
+//
+// This was the literal string "/Users/USER/.juicemount/fuse-internal" — a
+// placeholder that no machine has. Every NFS-vs-FUSE comparison in this file
+// therefore compared our server against a directory that does not exist, at 20
+// call sites, and reported the result as a measurement. That is the exact
+// failure the "harnesses must refuse to report" rule exists for: a number
+// produced from no data is worse than silence.
+//
+// Resolving from os.UserHomeDir also means the comparison arm now works in a
+// worktree and on any machine, instead of only on the one whose path was
+// hardcoded.
+func fuseInternalPath() string {
+	if path := os.Getenv("JM_TEST_FUSE_PATH"); path != "" {
+		return filepath.Clean(path)
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".juicemount", "fuse-internal")
+}
 
-	filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
-		if err != nil || !info.IsDir() {
-			return nil
+// requireFUSEMount skips (never fails) when the FUSE mount is absent, and
+// REFUSES to let a caller benchmark a path that isn't there.
+func requireFUSEMount(t *testing.T) string {
+	t.Helper()
+	p := fuseInternalPath()
+	if p == "" {
+		t.Skip("cannot resolve home dir; FUSE comparison arm unavailable")
+	}
+	st, err := os.Stat(p)
+	if err != nil || !st.IsDir() {
+		t.Skipf("FUSE mount %s not present — skipping the FUSE comparison arm "+
+			"rather than timing a directory that does not exist", p)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	out, err := mounttable.Output(ctx)
+	if err != nil || !strings.Contains(string(out), " on "+p+" (") {
+		t.Skipf("FUSE path %s is only a directory, not an active mount — skipping "+
+			"rather than reading or writing the hidden local mountpoint", p)
+	}
+	return p
+}
+
+// finderFixture is a bounded namespace created through the NFS arm and then
+// observed through the underlying FUSE arm.  Earlier versions selected paths
+// by walking the live volume.  Besides comparing unrelated corpora when the
+// test Redis and the running app used different volumes, that could spend the
+// package's entire ten-minute timeout enumerating a founder's media archive.
+// A deterministic common fixture measures the serving paths, not user data.
+type finderFixture struct {
+	nfsRoot, fuseRoot string
+	nfsMedium         string
+	fuseMedium        string
+	nfsLarge          string
+	fuseLarge         string
+	nfsDeep           string
+	fuseDeep          string
+	deepRel           string
+}
+
+func setupFinderFixture(t *testing.T, env *e2eEnv) finderFixture {
+	t.Helper()
+	requireFUSEMount(t)
+
+	name := fmt.Sprintf("__jm_finder_fixture_%d", time.Now().UnixNano())
+	nfsRoot := filepath.Join(env.mount, name)
+	fuseRoot := filepath.Join(fuseInternalPath(), name)
+	fx := finderFixture{
+		nfsRoot: nfsRoot, fuseRoot: fuseRoot,
+		nfsMedium:  filepath.Join(nfsRoot, "medium"),
+		fuseMedium: filepath.Join(fuseRoot, "medium"),
+		nfsLarge:   filepath.Join(nfsRoot, "large"),
+		fuseLarge:  filepath.Join(fuseRoot, "large"),
+		deepRel:    filepath.Join("Project", "Footage", "Day1", "Camera A"),
+	}
+	fx.nfsDeep = filepath.Join(nfsRoot, fx.deepRel)
+	fx.fuseDeep = filepath.Join(fuseRoot, fx.deepRel)
+
+	for _, dir := range []string{fx.nfsMedium, fx.nfsLarge, fx.nfsDeep} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("create Finder fixture %s: %v", dir, err)
 		}
-		entries, err := os.ReadDir(path)
-		if err != nil {
-			return nil
+	}
+	for i := 0; i < 20; i++ {
+		if err := os.Mkdir(filepath.Join(fx.nfsMedium, fmt.Sprintf("item-%03d", i)), 0o755); err != nil {
+			t.Fatalf("create medium Finder fixture: %v", err)
 		}
-		diff := len(entries) - target
-		if diff < 0 {
-			diff = -diff
+	}
+	for i := 0; i < 100; i++ {
+		if err := os.Mkdir(filepath.Join(fx.nfsLarge, fmt.Sprintf("item-%03d", i)), 0o755); err != nil {
+			t.Fatalf("create large Finder fixture: %v", err)
 		}
-		if diff < bestDiff || (diff == bestDiff && len(entries) > bestCount) {
-			best = path
-			bestCount = len(entries)
-			bestDiff = diff
+	}
+	for i := 0; i < 10; i++ {
+		if err := os.Mkdir(filepath.Join(fx.nfsDeep, fmt.Sprintf("take-%02d", i)), 0o755); err != nil {
+			t.Fatalf("create deep Finder fixture: %v", err)
 		}
-		if float64(diff)/float64(target) < tolerance {
-			return filepath.SkipAll
+	}
+
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		entries, err := os.ReadDir(fx.fuseLarge)
+		logical := 0
+		for _, entry := range entries {
+			// macOS may create one AppleDouble `._item-*` sidecar for every
+			// directory made through NFS.  Those are legitimate Finder traffic,
+			// but they must not make the fixture's convergence check expect an
+			// impossible exact raw count of 100.
+			if !strings.HasPrefix(entry.Name(), "._") {
+				logical++
+			}
 		}
-		return nil
+		if err == nil && logical == 100 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("Finder fixture did not converge into FUSE view: raw=%d logical=%d err=%v", len(entries), logical, err)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	t.Cleanup(func() {
+		// Both paths name the exact same unique test subtree.  Try NFS first so
+		// handler metadata stays coherent, then remove the same exact FUSE path
+		// only if an interrupted test left it behind.
+		_ = os.RemoveAll(fx.nfsRoot)
+		_ = os.RemoveAll(fx.fuseRoot)
 	})
-	return best, bestCount
+	return fx
 }
 
 // benchmarkReadDir measures directory listing performance.
@@ -75,11 +182,16 @@ func benchmarkReadDir(t *testing.T, label, dirPath string, iterations int) time.
 		entryCount = len(entries)
 	}
 
-	avg := totalDur / time.Duration(iterations)
-	perEntry := time.Duration(0)
-	if entryCount > 0 {
-		perEntry = avg / time.Duration(entryCount)
+	// VALIDITY GATE. A ReadDir over an empty (or nonexistent-but-readable)
+	// directory returns instantly, and without this the harness printed that
+	// instant as a great result. No entries walked = no measurement.
+	if entryCount == 0 {
+		t.Fatalf("%s: ReadDir(%s) returned 0 entries — refusing to report a "+
+			"latency for a walk that covered nothing", label, dirPath)
 	}
+
+	avg := totalDur / time.Duration(iterations)
+	perEntry := avg / time.Duration(entryCount)
 	t.Logf("  %s: %d entries, avg %v total, %v/entry (%d iterations)",
 		label, entryCount, avg, perEntry, iterations)
 	return avg
@@ -123,6 +235,16 @@ func benchmarkStat(t *testing.T, label, dirPath string, iterations int) time.Dur
 		}
 	}
 
+	// VALIDITY GATE. This was `totalDur / time.Duration(statCount)` with
+	// statCount possibly 0 — a divide-by-zero PANIC when every stat errored
+	// (each error hits `continue`). The empty-dir guard above does not cover
+	// it: the directory can be non-empty and every stat still fail, which is
+	// exactly what a wedged mount looks like.
+	if statCount == 0 {
+		t.Fatalf("%s: all %d stats failed in %s — refusing to report an average "+
+			"over zero samples", label, limit*iterations, dirPath)
+	}
+
 	avg := totalDur / time.Duration(statCount)
 	t.Logf("  %s: avg %v/stat (%d stats)", label, avg, statCount)
 	return avg
@@ -156,53 +278,21 @@ func benchmarkDeepLookup(t *testing.T, label, deepPath string, iterations int) t
 // TestFinderPerf_ReadDir compares NFS vs FUSE readdir for directories of varying sizes.
 func TestFinderPerf_ReadDir(t *testing.T) {
 	env := setupE2E(t)
-	nfsMount := env.mount
+	fx := setupFinderFixture(t, env)
 
 	t.Log("=== READDIR PERFORMANCE: NFS vs FUSE ===")
 	t.Log("(Simulates: Finder opens a folder and lists contents)")
 	t.Log("")
 
-	// Find directories with different entry counts
 	type dirTest struct {
 		label   string
 		nfsDir  string
 		fuseDir string
-		count   int
 	}
-
-	var tests []dirTest
-
-	// Root directory
-	nfsEntries, _ := os.ReadDir(nfsMount)
-	tests = append(tests, dirTest{
-		label:   fmt.Sprintf("Root (%d entries)", len(nfsEntries)),
-		nfsDir:  nfsMount,
-		fuseDir: fuseMountPath,
-		count:   len(nfsEntries),
-	})
-
-	// Find a medium directory (10-30 entries)
-	medDir, medCount := findDirWithNEntries(fuseMountPath, 20, 0.5)
-	if medDir != "" {
-		rel, _ := filepath.Rel(fuseMountPath, medDir)
-		tests = append(tests, dirTest{
-			label:   fmt.Sprintf("Medium dir (%d entries): %s", medCount, rel),
-			nfsDir:  filepath.Join(nfsMount, rel),
-			fuseDir: medDir,
-			count:   medCount,
-		})
-	}
-
-	// Find a large directory (100+ entries)
-	lgDir, lgCount := findDirWithNEntries(fuseMountPath, 100, 0.5)
-	if lgDir != "" {
-		rel, _ := filepath.Rel(fuseMountPath, lgDir)
-		tests = append(tests, dirTest{
-			label:   fmt.Sprintf("Large dir (%d entries): %s", lgCount, rel),
-			nfsDir:  filepath.Join(nfsMount, rel),
-			fuseDir: lgDir,
-			count:   lgCount,
-		})
+	tests := []dirTest{
+		{label: "Fixture root (3 entries)", nfsDir: fx.nfsRoot, fuseDir: fx.fuseRoot},
+		{label: "Medium directory (20 entries)", nfsDir: fx.nfsMedium, fuseDir: fx.fuseMedium},
+		{label: "Large directory (100 entries)", nfsDir: fx.nfsLarge, fuseDir: fx.fuseLarge},
 	}
 
 	for _, tt := range tests {
@@ -220,64 +310,39 @@ func TestFinderPerf_ReadDir(t *testing.T) {
 // TestFinderPerf_Stat compares individual file stat latency.
 func TestFinderPerf_Stat(t *testing.T) {
 	env := setupE2E(t)
-	nfsMount := env.mount
+	fx := setupFinderFixture(t, env)
 
 	t.Log("=== STAT PERFORMANCE: NFS vs FUSE ===")
 	t.Log("(Simulates: Finder displaying file size, date, type for each item)")
 	t.Log("")
 
-	// Test stat on root entries
-	t.Log("--- Root directory files ---")
-	nfsStat := benchmarkStat(t, "NFS ", nfsMount, 10)
-	fuseStat := benchmarkStat(t, "FUSE", fuseMountPath, 10)
+	t.Log("--- Large common fixture ---")
+	nfsStat := benchmarkStat(t, "NFS ", fx.nfsLarge, 10)
+	fuseStat := benchmarkStat(t, "FUSE", fx.fuseLarge, 10)
 	if fuseStat > 0 {
 		t.Logf("  Speedup: NFS is %.1fx faster than FUSE", float64(fuseStat)/float64(nfsStat))
-	}
-
-	// Test stat on a subdirectory with many files
-	t.Log("")
-	t.Log("--- Subdirectory files ---")
-	subDir, count := findDirWithNEntries(fuseMountPath, 50, 0.5)
-	if subDir != "" {
-		rel, _ := filepath.Rel(fuseMountPath, subDir)
-		t.Logf("Using: %s (%d entries)", rel, count)
-		nfsSub := benchmarkStat(t, "NFS ", filepath.Join(nfsMount, rel), 10)
-		fuseSub := benchmarkStat(t, "FUSE", subDir, 10)
-		if fuseSub > 0 {
-			t.Logf("  Speedup: NFS is %.1fx faster than FUSE", float64(fuseSub)/float64(nfsSub))
-		}
 	}
 }
 
 // TestFinderPerf_DeepNavigation simulates clicking through nested folders in Finder.
 func TestFinderPerf_DeepNavigation(t *testing.T) {
 	env := setupE2E(t)
-	nfsMount := env.mount
+	fx := setupFinderFixture(t, env)
 
 	t.Log("=== DEEP NAVIGATION: NFS vs FUSE ===")
 	t.Log("(Simulates: Finder clicking through Project > Footage > Day1 > Camera A)")
 	t.Log("")
 
-	// Use a known deep path instead of walking the entire FUSE tree
-	// (walking 146K entries through FUSE takes too long over WiFi)
-	rel := "Film Projects/GMTM/All Sports Combines/7v7 Elite SPARQ St Pete/Footage/Friday"
-	maxDepth := strings.Count(rel, "/") + 1
-
-	// Verify it exists
-	if _, err := os.Stat(filepath.Join(fuseMountPath, rel)); err != nil {
-		t.Skipf("Deep path not found: %v", err)
-	}
-	t.Logf("Deepest path: %s (depth=%d)", rel, maxDepth)
-
-	nfsDeep := filepath.Join(nfsMount, rel)
+	maxDepth := strings.Count(fx.deepRel, string(filepath.Separator)) + 1
+	t.Logf("Fixture path: %s (depth=%d)", fx.deepRel, maxDepth)
 	t.Log("")
-	benchmarkDeepLookup(t, "NFS ", nfsDeep, 50)
-	benchmarkDeepLookup(t, "FUSE", filepath.Join(fuseMountPath, rel), 50)
+	benchmarkDeepLookup(t, "NFS ", fx.nfsDeep, 50)
+	benchmarkDeepLookup(t, "FUSE", fx.fuseDeep, 50)
 
 	// Also test incremental navigation (stat each path component)
 	t.Log("")
 	t.Log("--- Incremental navigation (stat each level) ---")
-	parts := strings.Split(rel, "/")
+	parts := strings.Split(fx.deepRel, string(filepath.Separator))
 
 	nfsTotal := time.Duration(0)
 	fuseTotal := time.Duration(0)
@@ -285,8 +350,8 @@ func TestFinderPerf_DeepNavigation(t *testing.T) {
 	for i := 1; i <= len(parts); i++ {
 		partial := filepath.Join(parts[:i]...)
 
-		nfsPath := filepath.Join(nfsMount, partial)
-		fusePath := filepath.Join(fuseMountPath, partial)
+		nfsPath := filepath.Join(fx.nfsRoot, partial)
+		fusePath := filepath.Join(fx.fuseRoot, partial)
 
 		start := time.Now()
 		os.Stat(nfsPath)
@@ -312,32 +377,22 @@ func TestFinderPerf_DeepNavigation(t *testing.T) {
 // (cold NFS attribute cache, cold FUSE stat cache).
 func TestFinderPerf_ColdDirectoryOpen(t *testing.T) {
 	env := setupE2E(t)
-	nfsMount := env.mount
+	fx := setupFinderFixture(t, env)
 
 	t.Log("=== COLD DIRECTORY OPEN: NFS vs FUSE ===")
 	t.Log("(Simulates: First time opening a folder in Finder)")
 	t.Log("")
 
-	// Use known directories instead of walking FUSE tree
 	testDirs := []string{
 		".",
-		"Film Projects",
-		"Film Projects/GMTM",
-		"Film Projects/GMTM/All Sports Combines",
-		"Soap Regular",
+		"medium",
+		"large",
+		fx.deepRel,
 	}
-	// Filter to ones that exist
-	var validDirs []string
-	for _, d := range testDirs {
-		if _, err := os.Stat(filepath.Join(fuseMountPath, d)); err == nil {
-			validDirs = append(validDirs, d)
-		}
-	}
-	testDirs = validDirs
 
 	for _, rel := range testDirs {
-		nfsDir := filepath.Join(nfsMount, rel)
-		fuseDir := filepath.Join(fuseMountPath, rel)
+		nfsDir := filepath.Join(fx.nfsRoot, rel)
+		fuseDir := filepath.Join(fx.fuseRoot, rel)
 
 		// Cold open: readdir + stat every entry (what Finder does)
 		nfsDur := benchColdOpen(nfsDir)
@@ -366,7 +421,7 @@ func benchColdOpen(dirPath string) time.Duration {
 // TestFinderPerf_ConcurrentBrowse simulates multiple Finder windows open simultaneously.
 func TestFinderPerf_ConcurrentBrowse(t *testing.T) {
 	env := setupE2E(t)
-	nfsMount := env.mount
+	fx := setupFinderFixture(t, env)
 
 	t.Log("=== CONCURRENT BROWSING: NFS vs FUSE ===")
 	t.Log("(Simulates: Multiple Finder windows/tabs open)")
@@ -374,14 +429,14 @@ func TestFinderPerf_ConcurrentBrowse(t *testing.T) {
 
 	dirs := []string{
 		".",
-		"Film Projects",
-		"Film Projects/GMTM",
-		"Soap Regular",
+		"medium",
+		"large",
+		fx.deepRel,
 	}
 
 	// Concurrent NFS browse
-	nfsDur := benchConcurrentBrowse(nfsMount, dirs)
-	fuseDur := benchConcurrentBrowse(fuseMountPath, dirs)
+	nfsDur := benchConcurrentBrowse(fx.nfsRoot, dirs)
+	fuseDur := benchConcurrentBrowse(fx.fuseRoot, dirs)
 
 	t.Logf("  NFS  concurrent (%d dirs): %v", len(dirs), nfsDur)
 	t.Logf("  FUSE concurrent (%d dirs): %v", len(dirs), fuseDur)
@@ -412,20 +467,23 @@ func benchConcurrentBrowse(root string, dirs []string) time.Duration {
 // TestFinderPerf_TreeWalk simulates Finder's "Calculate Size" or Spotlight indexing.
 func TestFinderPerf_TreeWalk(t *testing.T) {
 	env := setupE2E(t)
-	nfsMount := env.mount
+	fx := setupFinderFixture(t, env)
 
 	t.Log("=== FULL TREE WALK: NFS vs FUSE ===")
 	t.Log("(Simulates: Finder 'Get Info' → Calculate Size, or Spotlight indexing)")
 	t.Log("")
 
-	// Walk Film Projects/GMTM (subset — full FUSE walk takes minutes on WiFi)
-	testDir := "Film Projects/GMTM"
-
 	nfsStart := time.Now()
 	var nfsFiles, nfsDirs int
-	filepath.Walk(filepath.Join(nfsMount, testDir), func(path string, info os.FileInfo, err error) error {
-		if err != nil { return nil }
-		if info.IsDir() { nfsDirs++ } else { nfsFiles++ }
+	filepath.Walk(fx.nfsRoot, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil
+		}
+		if info.IsDir() {
+			nfsDirs++
+		} else {
+			nfsFiles++
+		}
 		return nil
 	})
 	nfsDur := time.Since(nfsStart)
@@ -435,9 +493,15 @@ func TestFinderPerf_TreeWalk(t *testing.T) {
 	// FUSE walk of same subtree (may be slow on WiFi)
 	fuseStart := time.Now()
 	var fuseFiles, fuseDirs int
-	filepath.Walk(filepath.Join(fuseMountPath, testDir), func(path string, info os.FileInfo, err error) error {
-		if err != nil { return nil }
-		if info.IsDir() { fuseDirs++ } else { fuseFiles++ }
+	filepath.Walk(fx.fuseRoot, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil
+		}
+		if info.IsDir() {
+			fuseDirs++
+		} else {
+			fuseFiles++
+		}
 		return nil
 	})
 	fuseDur := time.Since(fuseStart)
@@ -474,7 +538,7 @@ func TestFinderPerf_SMBReference(t *testing.T) {
 // TestFinderPerf_Summary aggregates all results.
 func TestFinderPerf_Summary(t *testing.T) {
 	env := setupE2E(t)
-	nfsMount := env.mount
+	fx := setupFinderFixture(t, env)
 
 	t.Log("=== PERFORMANCE SUMMARY ===")
 	t.Log("")
@@ -488,31 +552,28 @@ func TestFinderPerf_Summary(t *testing.T) {
 
 	var results []result
 
-	// ReadDir root
-	nfsRD := benchmarkReadDir(t, "NFS", nfsMount, 20)
-	fuseRD := benchmarkReadDir(t, "FUSE", fuseMountPath, 20)
-	results = append(results, result{"ReadDir root", nfsRD, fuseRD, float64(fuseRD) / float64(nfsRD)})
+	// ReadDir a 100-entry directory shared by both arms.
+	nfsRD := benchmarkReadDir(t, "NFS", fx.nfsLarge, 20)
+	fuseRD := benchmarkReadDir(t, "FUSE", fx.fuseLarge, 20)
+	results = append(results, result{"ReadDir (100 entries)", nfsRD, fuseRD, float64(fuseRD) / float64(nfsRD)})
 
 	// Stat
-	nfsST := benchmarkStat(t, "NFS", nfsMount, 10)
-	fuseST := benchmarkStat(t, "FUSE", fuseMountPath, 10)
+	nfsST := benchmarkStat(t, "NFS", fx.nfsLarge, 10)
+	fuseST := benchmarkStat(t, "FUSE", fx.fuseLarge, 10)
 	results = append(results, result{"Stat (per file)", nfsST, fuseST, float64(fuseST) / float64(nfsST)})
 
-	// Deep lookup — use known path
-	deepRel := "Film Projects/GMTM/All Sports Combines/7v7 Elite SPARQ St Pete/Footage/Friday"
-	deepDepth := strings.Count(deepRel, "/") + 1
-	nfsDL := benchmarkDeepLookup(t, "NFS", filepath.Join(nfsMount, deepRel), 50)
-	fuseDL := benchmarkDeepLookup(t, "FUSE", filepath.Join(fuseMountPath, deepRel), 50)
+	deepDepth := strings.Count(fx.deepRel, string(filepath.Separator)) + 1
+	nfsDL := benchmarkDeepLookup(t, "NFS", fx.nfsDeep, 50)
+	fuseDL := benchmarkDeepLookup(t, "FUSE", fx.fuseDeep, 50)
 	results = append(results, result{fmt.Sprintf("Deep lookup (%d levels)", deepDepth), nfsDL, fuseDL, float64(fuseDL) / float64(nfsDL)})
 
-	// Tree walk
 	nfsTW := time.Now()
-	filepath.Walk(filepath.Join(nfsMount, "Film Projects"), func(path string, info os.FileInfo, err error) error { return nil })
+	filepath.Walk(fx.nfsRoot, func(path string, info os.FileInfo, err error) error { return nil })
 	nfsTWDur := time.Since(nfsTW)
 	fuseTW := time.Now()
-	filepath.Walk(filepath.Join(fuseMountPath, "Film Projects"), func(path string, info os.FileInfo, err error) error { return nil })
+	filepath.Walk(fx.fuseRoot, func(path string, info os.FileInfo, err error) error { return nil })
 	fuseTWDur := time.Since(fuseTW)
-	results = append(results, result{"Tree walk (Film Projects)", nfsTWDur, fuseTWDur, float64(fuseTWDur) / float64(nfsTWDur)})
+	results = append(results, result{"Tree walk (fixture)", nfsTWDur, fuseTWDur, float64(fuseTWDur) / float64(nfsTWDur)})
 
 	// Print summary table
 	t.Log("")

@@ -4,7 +4,9 @@
 #
 # Careful by design:
 #   1. Stops the app (SIGTERM, wait, escalate only if needed).
-#   2. Unmounts the NFS volume and the internal FUSE mount.
+#   2. Checks that no JuiceMount volume is still mounted. It never
+#      unmounts by path (H-3): quitting the app retires its own mounts,
+#      and anything still mounted is left alone and reported.
 #   3. Shows exactly what it WILL remove (with sizes), then asks once.
 #   4. If the write spool still holds files, those are UPLOADS THAT NEVER
 #      REACHED THE SERVER — deleting them loses data. That removal requires
@@ -12,7 +14,8 @@
 #
 # What it removes:
 #   - LaunchAgent            ~/Library/LaunchAgents/com.juicemount.agent.plist
-#   - Sudoers rule           /etc/sudoers.d/juicemount-mount   (needs sudo)
+#   - Legacy sudoers rule    /etc/sudoers.d/juicemount-mount   (needs sudo;
+#                            older versions offered it; it granted umount)
 #   - App state              ~/.juicemount        (incl. metadata.db — the
 #                            local metadata cache; rebuilt from Redis on a
 #                            future reinstall, pin list lives here too)
@@ -43,8 +46,8 @@ set -u
 # would silently miss the real user's data, and the launchctl gui-domain
 # bootout targets the wrong UID. Run as the user who runs JuiceMount.
 if [ "$(id -u)" -eq 0 ]; then
-    echo "uninstall.sh: run as your normal user, not root (sudo is requested" >&2
-    echo "only for the one sudoers-file removal step)." >&2
+    echo "uninstall.sh: run as your normal user, not root (an administrator" >&2
+    echo "password is requested only to remove /etc/sudoers.d/juicemount-mount)." >&2
     exit 2
 fi
 # set -u catches UNSET, not EMPTY — and an empty $HOME would aim every
@@ -163,45 +166,33 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 2. Unmount NFS volume(s) + the internal FUSE mount
+# 2. Check for JuiceMount mounts that are still present
+#
+# H-3 (2026-10-06): this script never unmounts by path. A pathname cannot
+# prove which kernel mount it reaches, so a force-unmount could detach a
+# replaced or foreign volume. Quitting JuiceMount (step 1) retires the
+# mounts it owns. Anything still mounted is reported, and remove_dir below
+# refuses to delete a directory that still contains a mount.
 
-unmount_path() {
-    # unmount_path <mountpoint> — retry loop; force-unmount via diskutil.
-    local mp="$1" attempt
-    for attempt in 1 2 3; do
-        if ! mount | grep -qF " on $mp "; then
-            return 0
-        fi
-        note "unmounting $mp (attempt $attempt)…"
-        if [ "$DRY_RUN" -eq 1 ]; then
-            note "[dry-run] diskutil unmount force $mp"
-            return 0
-        fi
-        if diskutil unmount force "$mp" >/dev/null 2>&1; then
-            return 0
-        fi
-        sleep 2
-    done
-    if mount | grep -qF " on $mp "; then
-        warn "could not unmount $mp — close any apps using it and re-run. Continuing without deleting mounted state."
-        return 1
-    fi
-    return 0
-}
-
-info "Unmounting JuiceMount volumes"
-
-# NFS volumes served by the local JuiceMount NFS server (127.0.0.1:/).
-# (loop over whatever is mounted; usually exactly one /Volumes/<name>)
-mount | sed -nE 's|^127\.0\.0\.1:/ on (.*) \(nfs.*|\1|p' | while read -r nfs_mp; do
-    [ -n "$nfs_mp" ] && unmount_path "$nfs_mp" || true
-done
-
-# The internal JuiceFS FUSE mount.
+info "Checking for JuiceMount volumes that are still mounted"
+STILL_MOUNTED=0
+while read -r nfs_mp; do
+    [ -n "$nfs_mp" ] || continue
+    warn "still mounted: $nfs_mp"
+    STILL_MOUNTED=1
+done <<EOF_MOUNTS
+$(mount | sed -nE 's|^127\.0\.0\.1:/ on (.*) \(nfs.*|\1|p')
+EOF_MOUNTS
 if mount | grep -qF " on $FUSE_INTERNAL "; then
-    unmount_path "$FUSE_INTERNAL" || true
+    warn "still mounted: $FUSE_INTERNAL"
+    STILL_MOUNTED=1
+fi
+if [ "$STILL_MOUNTED" -eq 1 ]; then
+    warn "JuiceMount cannot safely eject these until its unmount helper is"
+    warn "installed. Restart the Mac, then re-run this script. State under a"
+    warn "mounted directory is kept; everything else proceeds."
 else
-    note "no FUSE mount at $FUSE_INTERNAL."
+    note "none."
 fi
 
 # ---------------------------------------------------------------------------
@@ -283,12 +274,12 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 6. Sudoers rule (root-owned; needs sudo)
+# 6. Legacy sudoers rule (root-owned; needs sudo). Older versions offered
+#    it; it granted passwordless umount, so removing it is a hardening step.
 
-info "Sudoers rule"
+info "Legacy sudoers rule"
 if [ -f "$SUDOERS_FILE" ] || sudo -n test -f "$SUDOERS_FILE" 2>/dev/null; then
-    if sudo -n true 2>/dev/null; then
-        run sudo rm -f "$SUDOERS_FILE"
+    if run sudo -n rm -f "$SUDOERS_FILE" 2>/dev/null; then
         note "removed $SUDOERS_FILE"
     elif [ -t 0 ] && [ "$ASSUME_YES" -ne 1 ]; then
         note "removing $SUDOERS_FILE requires your admin password:"
@@ -298,7 +289,7 @@ if [ -f "$SUDOERS_FILE" ] || sudo -n test -f "$SUDOERS_FILE" 2>/dev/null; then
             warn "could not remove $SUDOERS_FILE — remove it manually: sudo rm $SUDOERS_FILE"
         fi
     else
-        warn "skipping $SUDOERS_FILE (no passwordless sudo in unattended mode)."
+        warn "skipping $SUDOERS_FILE (unattended mode cannot ask for a password)."
         warn "Remove it manually: sudo rm $SUDOERS_FILE"
     fi
 else

@@ -120,10 +120,10 @@ func TestEvictOldest_NilPinCheckerIsSafe(t *testing.T) {
 		t.Fatalf("BulkInsert: %v", err)
 	}
 	// Existing LRU behavior preserved: oldest gone, newest kept.
-	if got := store.LookupByPath("dir/file_0000.txt"); got != nil {
+	if got := store.lookupByPathRAM("dir/file_0000.txt"); got != nil {
 		t.Error("oldest should be evicted with nil PinChecker")
 	}
-	if got := store.LookupByPath("dir/file_0199.txt"); got == nil {
+	if got := store.lookupByPathRAM("dir/file_0199.txt"); got == nil {
 		t.Error("newest should be retained with nil PinChecker")
 	}
 }

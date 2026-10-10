@@ -19,11 +19,19 @@ import (
 	jmnfs "github.com/lelanddutcher/juicemount/nfs"
 )
 
-const (
-	redisURL  = "redis://127.0.0.1:6379/1"
-	fusePath  = "/Users/USER/.juicemount/fuse-internal"
-	mountBase = "/tmp/jm5-e2e"
+const mountBase = "/tmp/jm5-e2e"
+
+var (
+	redisURL = testEnvOrDefault("JM_TEST_VOLUME_REDIS", "redis://127.0.0.1:6379/1")
+	minioURL = testEnvOrDefault("JM_TEST_MINIO_URL", "http://127.0.0.1:9000")
 )
+
+func testEnvOrDefault(key, fallback string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return fallback
+}
 
 // e2eEnv holds the full stack for E2E testing.
 type e2eEnv struct {
@@ -39,6 +47,7 @@ type e2eEnv struct {
 
 func setupE2E(t *testing.T) *e2eEnv {
 	t.Helper()
+	activeFUSEPath := requireFUSEMount(t)
 
 	dbPath := filepath.Join(t.TempDir(), "e2e.db")
 	store, err := metadata.Open(dbPath)
@@ -75,21 +84,22 @@ func setupE2E(t *testing.T) *e2eEnv {
 	// NFS server
 	srv := jmnfs.NewServer(jmnfs.Config{
 		ListenAddr: "127.0.0.1:0",
-		FUSEPath:   fusePath,
+		FUSEPath:   activeFUSEPath,
 	}, store)
-	if err := srv.Start(); err != nil {
-		t.Fatalf("Start NFS: %v", err)
-	}
 	if cr != nil {
 		srv.Handler().SetCacheReader(cr)
 	}
 	srv.Handler().SetRedisClient(rc)
+	if err := srv.Start(); err != nil {
+		t.Fatalf("Start NFS: %v", err)
+	}
 
 	// Health monitor
+	redisAddr, _, _ := metadata.ParseRedisURL(redisURL)
 	mon := health.New(health.Config{
-		RedisURL:      "127.0.0.1:6379",
-		MinIOURL:      "http://127.0.0.1:9000",
-		FUSEPath:      fusePath,
+		RedisURL:      redisAddr,
+		MinIOURL:      minioURL,
+		FUSEPath:      activeFUSEPath,
 		NFSMountPoint: "",
 	})
 	mon.Start()
@@ -100,7 +110,7 @@ func setupE2E(t *testing.T) *e2eEnv {
 
 	parts := splitAddr(srv.Addr())
 	opts := fmt.Sprintf("port=%s,mountport=%s,soft,intr,timeo=50,retrans=3,nolocks,locallocks,rsize=1048576,wsize=1048576,noac,vers=3,tcp", parts[1], parts[1])
-	cmd := exec.Command("sudo", "mount_nfs", "-o", opts, fmt.Sprintf("%s:/", parts[0]), mountPoint)
+	cmd := exec.Command("sudo", "mount_nfs", "-o", opts, parts[0]+":"+srv.ExportPath(), mountPoint)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Skipf("mount_nfs failed: %v\n%s", err, out)
 	}
@@ -113,7 +123,12 @@ func setupE2E(t *testing.T) *e2eEnv {
 	}
 
 	t.Cleanup(func() {
-		exec.Command("sudo", "umount", "-f", mountPoint).Run()
+		// A failed NFS assertion can leave the kernel client waiting on an RPC.
+		// Never let cleanup consume the package's entire timeout; closing the
+		// in-process server below remains the second teardown lever.
+		unmountCtx, unmountCancel := context.WithTimeout(context.Background(), 20*time.Second)
+		_ = exec.CommandContext(unmountCtx, "sudo", "umount", "-f", mountPoint).Run()
+		unmountCancel()
 		os.Remove(mountPoint)
 		mon.Stop()
 		srv.Handler().StopHandler()

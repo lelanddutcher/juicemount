@@ -1,7 +1,8 @@
 import Foundation
 import JuiceMountCore
 
-/// Idiomatic Swift wrapper around the Go c-archive (libnfsd.a).
+/// Swift wrapper around the Go control client (libnfsd.a). Storage lives in the
+/// independent serving service; an unavailable service never falls back here.
 /// All calls are blocking — wrap in a background queue if calling from the UI thread.
 public enum NFSBridge {
 
@@ -21,7 +22,7 @@ public enum NFSBridge {
         return URLSession(configuration: cfg)
     }
 
-    public struct ServerConfig: Codable {
+    public struct ServerConfig: Codable, Equatable, Sendable {
         public var redisURL: String
         public var fusePath: String
         public var mountPoint: String
@@ -30,16 +31,48 @@ public enum NFSBridge {
         public var cacheSize: String
         public var metricsAddr: String
         public var logFile: String
+        public var spoolDir: String = ""
+        public var fuseMetricsAddr: String = ""
         public var logLevel: String
         public var bucketOverride: String
+        public var netControlURL: String = ""
+        public var netAuthKey: String = ""
+        public var netHostname: String = ""
+        // Retained for compatibility with pre-RC Link configs. The Go bridge
+        // now reaches the original LAN endpoint through the NAS subnet route,
+        // so desktop users never need to supply a NAS tailnet address.
+        public var netNASAddr: String = ""
         public var spoolEnable: Bool
         public var spoolSizeGB: Int
+        /// Explicit replacement recovery opt-in. Older config JSON stays off.
+        public var replacementRecovery: Bool
         /// LB-4 (Phase 3b) tuning knobs. 0 means "Go-side default"
         /// (2048 MB membuf budget / 128 MB file limit / 30 s reconcile)
         /// so config JSON without these fields keeps prior behavior.
         public var memoryBufferMB: Int
         public var memBufFileLimitMB: Int
         public var reconcileSeconds: Int
+        /// juicefs `--open-cache` duration, e.g. "5s". "" = off (every open
+        /// re-validates against Redis, today's behavior).
+        ///
+        /// This is a MEASUREMENT LEVER, not a shipping feature, and it is
+        /// deliberately absent from the Preferences UI. On a real cellular link
+        /// on 2026-07-29 the first open of a file cost 1226-5660 ms and the
+        /// second cost 24-36 ms — a ~66x difference that is per-FILE, not
+        /// per-byte. The reason it is off by default is that juicefs offers no
+        /// external cache invalidation, so the exposure is a stale slice map:
+        /// WRONG BYTES from a file that still exists. Set it only for a
+        /// measured test, on a volume whose files nobody else is rewriting.
+        public var openCacheTTL: String
+        /// Explicit app opt-in. Older JSON without this key decodes as off.
+        public var nativePreviewWarm: Bool
+        /// H-8B: this Mac's object-store key from Manager enrollment, read
+        /// from the Keychain and held in memory only. The service strips it
+        /// before saving its config and gives it to juicefs as
+        /// MINIO_ACCESS_KEY / MINIO_SECRET_KEY (never argv). Empty = juicefs
+        /// uses the key in the volume settings (before the server's switch).
+        public var objectAccessKey: String = ""
+        public var objectSecretKey: String = ""
 
         enum CodingKeys: String, CodingKey {
             case redisURL = "redis_url"
@@ -50,13 +83,24 @@ public enum NFSBridge {
             case cacheSize = "cache_size"
             case metricsAddr = "metrics_addr"
             case logFile = "log_file"
+            case spoolDir = "spool_dir"
+            case fuseMetricsAddr = "fuse_metrics_addr"
             case logLevel = "log_level"
             case bucketOverride = "bucket_override"
             case spoolEnable = "spool_enable"
             case spoolSizeGB = "spool_size_gb"
+            case replacementRecovery = "replacement_recovery"
             case memoryBufferMB = "memory_buffer_mb"
             case memBufFileLimitMB = "membuf_file_limit_mb"
             case reconcileSeconds = "reconcile_seconds"
+            case openCacheTTL = "open_cache_ttl"
+            case nativePreviewWarm = "native_preview_warm"
+            case netControlURL = "net_control_url"
+            case netAuthKey = "net_authkey"
+            case netHostname = "net_hostname"
+            case netNASAddr = "net_nas_addr"
+            case objectAccessKey = "object_access_key"
+            case objectSecretKey = "object_secret_key"
         }
 
         public init(
@@ -68,13 +112,18 @@ public enum NFSBridge {
             cacheSize: String = "100000",
             metricsAddr: String = "127.0.0.1:11050",
             logFile: String = "",
+            spoolDir: String = "",
+            fuseMetricsAddr: String = "",
             logLevel: String = "info",
             bucketOverride: String = "",
             spoolEnable: Bool = false,
             spoolSizeGB: Int = 0, // 0 = Auto (Go core sizes to free disk minus floor)
+            replacementRecovery: Bool = false,
             memoryBufferMB: Int = 0,
             memBufFileLimitMB: Int = 0,
-            reconcileSeconds: Int = 0
+            reconcileSeconds: Int = 0,
+            openCacheTTL: String = "",
+            nativePreviewWarm: Bool = false
         ) {
             self.redisURL = redisURL
             self.fusePath = fusePath
@@ -84,13 +133,126 @@ public enum NFSBridge {
             self.cacheSize = cacheSize
             self.metricsAddr = metricsAddr
             self.logFile = logFile
+            self.spoolDir = spoolDir
+            self.fuseMetricsAddr = fuseMetricsAddr
             self.logLevel = logLevel
             self.bucketOverride = bucketOverride
             self.spoolEnable = spoolEnable
             self.spoolSizeGB = spoolSizeGB
+            self.replacementRecovery = replacementRecovery
             self.memoryBufferMB = memoryBufferMB
             self.memBufFileLimitMB = memBufFileLimitMB
             self.reconcileSeconds = reconcileSeconds
+            self.openCacheTTL = openCacheTTL
+            self.nativePreviewWarm = nativePreviewWarm
+        }
+
+        public init(from decoder: Decoder) throws {
+            let values = try decoder.container(keyedBy: CodingKeys.self)
+            redisURL = try values.decode(String.self, forKey: .redisURL)
+            fusePath = try values.decode(String.self, forKey: .fusePath)
+            mountPoint = try values.decode(String.self, forKey: .mountPoint)
+            listenAddr = try values.decode(String.self, forKey: .listenAddr)
+            dbPath = try values.decode(String.self, forKey: .dbPath)
+            cacheSize = try values.decode(String.self, forKey: .cacheSize)
+            metricsAddr = try values.decode(String.self, forKey: .metricsAddr)
+            logFile = try values.decode(String.self, forKey: .logFile)
+            spoolDir = try values.decode(String.self, forKey: .spoolDir)
+            fuseMetricsAddr = try values.decode(String.self, forKey: .fuseMetricsAddr)
+            logLevel = try values.decode(String.self, forKey: .logLevel)
+            bucketOverride = try values.decode(String.self, forKey: .bucketOverride)
+            netControlURL = try values.decode(String.self, forKey: .netControlURL)
+            netAuthKey = try values.decode(String.self, forKey: .netAuthKey)
+            netHostname = try values.decode(String.self, forKey: .netHostname)
+            netNASAddr = try values.decode(String.self, forKey: .netNASAddr)
+            spoolEnable = try values.decode(Bool.self, forKey: .spoolEnable)
+            spoolSizeGB = try values.decode(Int.self, forKey: .spoolSizeGB)
+            replacementRecovery = try values.decodeIfPresent(Bool.self, forKey: .replacementRecovery) ?? false
+            memoryBufferMB = try values.decode(Int.self, forKey: .memoryBufferMB)
+            memBufFileLimitMB = try values.decode(Int.self, forKey: .memBufFileLimitMB)
+            reconcileSeconds = try values.decode(Int.self, forKey: .reconcileSeconds)
+            openCacheTTL = try values.decode(String.self, forKey: .openCacheTTL)
+            nativePreviewWarm = try values.decodeIfPresent(Bool.self, forKey: .nativePreviewWarm) ?? false
+            objectAccessKey = try values.decodeIfPresent(String.self, forKey: .objectAccessKey) ?? ""
+            objectSecretKey = try values.decodeIfPresent(String.self, forKey: .objectSecretKey) ?? ""
+        }
+    }
+
+    public struct LinkTestResult: Codable, Equatable, Sendable {
+        public var ok: Bool
+        public var authorized: Bool
+        public var online: Bool
+        public var backendReachable: Bool
+        public var redisReachable: Bool
+        public var objectStoreReachable: Bool
+        public var hostname: String?
+        public var addresses: [String]
+        public var rttMS: Int64?
+        public var transportMode: String?
+        public var uploadMbps: Double?
+        public var downloadMbps: Double?
+        public var error: String?
+
+        enum CodingKeys: String, CodingKey {
+            case ok, authorized, online, hostname, addresses, error
+            case backendReachable = "backend_reachable"
+            case redisReachable = "redis_reachable"
+            case objectStoreReachable = "object_store_reachable"
+            case rttMS = "rtt_ms"
+            case transportMode = "transport_mode"
+            case uploadMbps = "upload_mbps"
+            case downloadMbps = "download_mbps"
+        }
+
+        public init(
+            ok: Bool,
+            authorized: Bool,
+            online: Bool,
+            backendReachable: Bool,
+            redisReachable: Bool,
+            objectStoreReachable: Bool,
+            hostname: String?,
+            addresses: [String],
+            rttMS: Int64?,
+            transportMode: String? = nil,
+            uploadMbps: Double? = nil,
+            downloadMbps: Double? = nil,
+            error: String?
+        ) {
+            self.ok = ok
+            self.authorized = authorized
+            self.online = online
+            self.backendReachable = backendReachable
+            self.redisReachable = redisReachable
+            self.objectStoreReachable = objectStoreReachable
+            self.hostname = hostname
+            self.addresses = addresses
+            self.rttMS = rttMS
+            self.transportMode = transportMode
+            self.uploadMbps = uploadMbps
+            self.downloadMbps = downloadMbps
+            self.error = error
+        }
+
+        // Decode additively so the desktop can still display a useful result
+        // when paired with a Manager/bridge from the immediately preceding RC.
+        // Link status is a diagnostic surface; one newly-added boolean must not
+        // turn the entire Apply & Test response into an opaque decode failure.
+        public init(from decoder: Decoder) throws {
+            let values = try decoder.container(keyedBy: CodingKeys.self)
+            ok = try values.decodeIfPresent(Bool.self, forKey: .ok) ?? false
+            authorized = try values.decodeIfPresent(Bool.self, forKey: .authorized) ?? false
+            online = try values.decodeIfPresent(Bool.self, forKey: .online) ?? false
+            backendReachable = try values.decodeIfPresent(Bool.self, forKey: .backendReachable) ?? false
+            redisReachable = try values.decodeIfPresent(Bool.self, forKey: .redisReachable) ?? backendReachable
+            objectStoreReachable = try values.decodeIfPresent(Bool.self, forKey: .objectStoreReachable) ?? backendReachable
+            hostname = try values.decodeIfPresent(String.self, forKey: .hostname)
+            addresses = try values.decodeIfPresent([String].self, forKey: .addresses) ?? []
+            rttMS = try values.decodeIfPresent(Int64.self, forKey: .rttMS)
+            transportMode = try values.decodeIfPresent(String.self, forKey: .transportMode)
+            uploadMbps = try values.decodeIfPresent(Double.self, forKey: .uploadMbps)
+            downloadMbps = try values.decodeIfPresent(Double.self, forKey: .downloadMbps)
+            error = try values.decodeIfPresent(String.self, forKey: .error)
         }
     }
 
@@ -184,12 +346,16 @@ public enum NFSBridge {
         public var shortfall_bytes: Int64 = 0
         public var disk_free_bytes: Int64 = 0
         public var cache_usage_bytes: Int64 = 0
+        /// Effective JuiceFS eviction floor selected by the Go mount policy.
+        /// Zero means an older core omitted the additive field.
+        public var cache_free_floor_bytes: Int64 = 0
 
         public init() {}
 
         private enum CodingKeys: String, CodingKey {
             case over_capacity, pinned_bytes, cache_capacity_bytes
             case shortfall_bytes, disk_free_bytes, cache_usage_bytes
+            case cache_free_floor_bytes
         }
 
         // Absence-tolerant: an older Go core (or the no-pinstore branch) omits
@@ -203,6 +369,7 @@ public enum NFSBridge {
             self.shortfall_bytes = try c.decodeIfPresent(Int64.self, forKey: .shortfall_bytes) ?? 0
             self.disk_free_bytes = try c.decodeIfPresent(Int64.self, forKey: .disk_free_bytes) ?? 0
             self.cache_usage_bytes = try c.decodeIfPresent(Int64.self, forKey: .cache_usage_bytes) ?? 0
+            self.cache_free_floor_bytes = try c.decodeIfPresent(Int64.self, forKey: .cache_free_floor_bytes) ?? 0
         }
     }
 
@@ -313,8 +480,8 @@ public enum NFSBridge {
         return try JSONDecoder().decode(PinResult.self, from: Data(json.utf8))
     }
 
-    public static func cacheStatus() -> CacheStatus {
-        guard let cstr = NFSServerCacheStatus() else { return CacheStatus() }
+    public static func cacheStatus() -> CacheStatus? {
+        guard let cstr = NFSServerCacheStatus() else { return nil }
         defer { NFSServerFreeString(cstr) }
         let json = String(cString: cstr)
         do {
@@ -325,19 +492,28 @@ public enum NFSBridge {
             // exactly how the roots:null decode bug stayed invisible across many
             // sessions while the offline toggle appeared stuck. With the
             // null-tolerant CacheStatus.init(from:) this should never fire.
-            appLog("cacheStatus decode failed — returning default, offline state may be wrong: \(error)")
-            return CacheStatus()
+            appLog("cacheStatus unavailable — retaining the last confirmed state: \(error)")
+            return nil
         }
     }
 
-    public static func setOffline(_ on: Bool) {
-        let cstr = NFSServerSetOffline(on ? 1 : 0)
-        if let cstr { NFSServerFreeString(cstr) }
+    @discardableResult public static func setOffline(_ on: Bool) throws -> Bool {
+        guard let cstr = NFSServerSetOffline(on ? 1 : 0) else { throw BridgeError.notRunning }
+        defer { NFSServerFreeString(cstr) }
+        return try ServingControlSafety.offlineAcknowledgement(String(cString: cstr))
     }
 
     public static var isOffline: Bool {
         NFSServerIsOffline() != 0
     }
+
+    public static func confirmedOfflineState() throws -> Bool {
+        let value = NFSServerIsOffline()
+        guard value >= 0 else { throw BridgeError.startFailed("The service's offline state is unknown.") }
+        return value != 0
+    }
+
+    public static var usesServingService: Bool { NFSServerUsesServingService() != 0 }
 
     // MARK: - Offline state (iter 5 — tier-1.7/1.8/1.9)
     //
@@ -434,7 +610,14 @@ public enum NFSBridge {
                 appLog("healthProbe decode failed — returning nil: \(error)")
             }
         }.resume()
-        sem.wait()
+        // URLRequest's timeout normally completes the callback, but it is not
+        // a contract that the callback must run. Never let the independent
+        // recovery lane park forever when the embedded control plane is wedged.
+        guard sem.wait(timeout: .now() + 3) == .success else {
+            session.invalidateAndCancel()
+            appLog("healthProbe timed out — returning nil")
+            return nil
+        }
         session.finishTasksAndInvalidate()
         return result
     }
@@ -468,123 +651,10 @@ public enum NFSBridge {
     // so a non-nil `SpoolStatus{enabled:false}` means "reachable but off",
     // whereas nil means the metrics server itself was unreachable.
 
-    public struct SpoolEntryView: Codable, Equatable, Identifiable {
-        public var path: String = ""
-        public var size: Int64 = 0
-        public var drainState: String = ""
-        public var drainAttempts: Int = 0
-        public var lastError: String?
-        public var updatedAtUnix: Int64 = 0
-        /// Seconds since the row last made progress (now - updated_at).
-        public var ageSec: Int64 = 0
-        /// True when the entry is making no progress and won't without
-        /// intervention (LB-5): a leaked-handle `writing` row quiescent
-        /// beyond the escalation window, or a row whose drain retries are
-        /// exhausted. The popover offers "Recover stalled" for these.
-        public var stalled: Bool = false
-
-        // Identity for ForEach: path + last-update so a re-queued path
-        // (same name, new generation) gets a fresh row rather than animating
-        // a stale one.
-        public var id: String { "\(path)|\(updatedAtUnix)" }
-
-        enum CodingKeys: String, CodingKey {
-            case path, size
-            case drainState = "drain_state"
-            case drainAttempts = "drain_attempts"
-            case lastError = "last_error"
-            case updatedAtUnix = "updated_at_unix"
-            case ageSec = "age_sec"
-            case stalled
-        }
-
-        public init() {}
-
-        /// Null/absence-tolerant decode — same discipline as SpoolStatus
-        /// and CacheStatus below. Synthesized Codable would `decode` the
-        /// non-optionals and abort the WHOLE /spool decode on a missing
-        /// key (e.g. polling an older Go core that doesn't emit age_sec/
-        /// stalled yet), silently blanking the spool UI.
-        public init(from decoder: Decoder) throws {
-            let c = try decoder.container(keyedBy: CodingKeys.self)
-            self.path = try c.decodeIfPresent(String.self, forKey: .path) ?? ""
-            self.size = try c.decodeIfPresent(Int64.self, forKey: .size) ?? 0
-            self.drainState = try c.decodeIfPresent(String.self, forKey: .drainState) ?? ""
-            self.drainAttempts = try c.decodeIfPresent(Int.self, forKey: .drainAttempts) ?? 0
-            self.lastError = try c.decodeIfPresent(String.self, forKey: .lastError)
-            self.updatedAtUnix = try c.decodeIfPresent(Int64.self, forKey: .updatedAtUnix) ?? 0
-            self.ageSec = try c.decodeIfPresent(Int64.self, forKey: .ageSec) ?? 0
-            self.stalled = try c.decodeIfPresent(Bool.self, forKey: .stalled) ?? false
-        }
-    }
-
-    public struct SpoolStatus: Codable, Equatable {
-        public var enabled: Bool = false
-        public var error: String?
-        public var pendingFiles: Int = 0
-        public var pendingBytes: Int64 = 0
-        public var inProgress: Int64 = 0
-        public var succeeded: Int64 = 0
-        public var failed: Int64 = 0
-        public var quarantined: Int64 = 0
-        public var capacityUsed: Int64 = 0
-        public var capacityTotal: Int64 = 0
-        /// LB-5 stuck-spool signals (Phase 2): counts of listed stalled /
-        /// failed entries and the age of the oldest pending row.
-        public var stalledFiles: Int = 0
-        public var failedFiles: Int = 0
-        public var oldestPendingAgeSec: Int64 = 0
-        public var entries: [SpoolEntryView] = []
-
-        /// True when there is active or queued upload work to surface.
-        public var hasActivity: Bool { pendingFiles > 0 || inProgress > 0 }
-
-        /// True when something needs the user's attention (stalled or
-        /// failed entries) even if nothing is actively uploading.
-        public var needsAttention: Bool { stalledFiles > 0 || failedFiles > 0 }
-
-        enum CodingKeys: String, CodingKey {
-            case enabled, error
-            case pendingFiles = "pending_files"
-            case pendingBytes = "pending_bytes"
-            case inProgress = "in_progress"
-            case succeeded, failed, quarantined
-            case capacityUsed = "capacity_used"
-            case capacityTotal = "capacity_total"
-            case stalledFiles = "stalled_files"
-            case failedFiles = "failed_files"
-            case oldestPendingAgeSec = "oldest_pending_age_sec"
-            case entries
-        }
-
-        /// Null/absence-tolerant decode. Same root cause as the long-standing
-        /// CacheStatus.roots:null bug (see `CacheStatus.init(from:)`): the Go
-        /// `/spool` handler returns `"entries": null` whenever the spool is
-        /// disabled — the COMMON case, since it is opt-in via JM_SPOOL_ENABLE=1
-        /// — or an early error path is taken, because a nil Go slice marshals
-        /// to JSON `null`. Swift's *synthesized* Codable uses `decode` (not
-        /// `decodeIfPresent`) for the non-optional `entries`, so that null
-        /// throws valueNotFound and aborts the ENTIRE decode — silently
-        /// discarding the `enabled` flag the UI reads to show spool state.
-        /// `decodeIfPresent` + defaults make every field tolerant of
-        /// null/missing. (Go side also emits `[]` instead of null.)
-        public init(from decoder: Decoder) throws {
-            let c = try decoder.container(keyedBy: CodingKeys.self)
-            self.enabled = try c.decodeIfPresent(Bool.self, forKey: .enabled) ?? false
-            self.error = try c.decodeIfPresent(String.self, forKey: .error)
-            self.pendingFiles = try c.decodeIfPresent(Int.self, forKey: .pendingFiles) ?? 0
-            self.pendingBytes = try c.decodeIfPresent(Int64.self, forKey: .pendingBytes) ?? 0
-            self.inProgress = try c.decodeIfPresent(Int64.self, forKey: .inProgress) ?? 0
-            self.succeeded = try c.decodeIfPresent(Int64.self, forKey: .succeeded) ?? 0
-            self.failed = try c.decodeIfPresent(Int64.self, forKey: .failed) ?? 0
-            self.quarantined = try c.decodeIfPresent(Int64.self, forKey: .quarantined) ?? 0
-            self.capacityUsed = try c.decodeIfPresent(Int64.self, forKey: .capacityUsed) ?? 0
-            self.capacityTotal = try c.decodeIfPresent(Int64.self, forKey: .capacityTotal) ?? 0
-            self.stalledFiles = try c.decodeIfPresent(Int.self, forKey: .stalledFiles) ?? 0
-            self.failedFiles = try c.decodeIfPresent(Int.self, forKey: .failedFiles) ?? 0
-            self.oldestPendingAgeSec = try c.decodeIfPresent(Int64.self, forKey: .oldestPendingAgeSec) ?? 0
-            self.entries = try c.decodeIfPresent([SpoolEntryView].self, forKey: .entries) ?? []
-        }
+    public enum SpoolSafetyState {
+        case verifiedEmpty
+        case pending
+        case unknown
     }
 
     /// Fetch the write-spool status from the local metrics server. Blocking
@@ -599,14 +669,16 @@ public enum NFSBridge {
         let sem = DispatchSemaphore(value: 0)
         var result: SpoolStatus?
         let session = loopbackSession()
-        session.dataTask(with: req) { data, _, _ in
+        session.dataTask(with: req) { data, response, _ in
             defer { sem.signal() }
             guard let data else { return }
             // Log decode failures rather than swallowing them with `try?` (see
             // `cacheStatus()` and the roots:null root cause). nil is still
             // returned (= "/spool unreachable or unparseable").
             do {
-                result = try JSONDecoder().decode(SpoolStatus.self, from: data)
+                var status = try JSONDecoder().decode(SpoolStatus.self, from: data)
+                status.httpStatusCode = (response as? HTTPURLResponse)?.statusCode
+                result = status
             } catch {
                 appLog("spoolStatus decode failed — returning nil: \(error)")
             }
@@ -634,9 +706,7 @@ public enum NFSBridge {
     }
 
     /// Trigger a spool recovery action on the Go side (LB-5). Blocking —
-    /// call from a background queue. Endpoint: `/spool-recover` (GET with
-    /// query params, the same loopback mutation convention as
-    /// `/offline?on=…`).
+    /// call from a background queue. Endpoint: `POST /spool-recover`.
     ///
     ///   - `retry-failed`:  requeue failed rows whose spool file survives
     ///                      (fresh attempt budget) and wake the drainer.
@@ -656,7 +726,8 @@ public enum NFSBridge {
         comps.queryItems = [URLQueryItem(name: "action", value: action)]
         guard let url = comps.url else { return nil }
         var req = URLRequest(url: url)
-        req.httpMethod = "GET"
+        req.httpMethod = "POST"
+        req.setValue("1", forHTTPHeaderField: "X-JM-Control")
         // clear-stalled fsyncs + finalizes entries; allow headroom.
         req.timeoutInterval = 15
         let sem = DispatchSemaphore(value: 0)
@@ -727,7 +798,8 @@ public enum NFSBridge {
         if confirm { comps.queryItems?.append(URLQueryItem(name: "confirm", value: "true")) }
         guard let url = comps.url else { return nil }
         var req = URLRequest(url: url)
-        req.httpMethod = "GET"
+        req.httpMethod = confirm ? "POST" : "GET"
+        if confirm { req.setValue("1", forHTTPHeaderField: "X-JM-Control") }
         req.timeoutInterval = 15
         let sem = DispatchSemaphore(value: 0)
         var result: ClearFailedResult?
@@ -861,9 +933,13 @@ public enum NFSBridge {
     /// the popover hides the card on nil rather than blocking anything.
     public static func warmupStatus(metricsAddr: String = "127.0.0.1:11050") -> WarmupStatus? {
         guard let url = URL(string: "http://\(metricsAddr)/warmup") else { return nil }
-        var req = URLRequest(url: url)
+        // `/warmup` is live process state. Never replay the initial 5%
+        // response from URLCache after the core has confirmed the mount.
+        var req = URLRequest(url: url,
+                             cachePolicy: .reloadIgnoringLocalCacheData,
+                             timeoutInterval: 2)
         req.httpMethod = "GET"
-        req.timeoutInterval = 2
+        req.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
         let sem = DispatchSemaphore(value: 0)
         var result: WarmupStatus?
         let session = loopbackSession()
@@ -995,7 +1071,8 @@ public enum NFSBridge {
     public static func mountNow(metricsAddr: String = "127.0.0.1:11050") -> MountNowResult? {
         guard let url = URL(string: "http://\(metricsAddr)/mount-now") else { return nil }
         var req = URLRequest(url: url)
-        req.httpMethod = "GET"
+        req.httpMethod = "POST"
+        req.setValue("1", forHTTPHeaderField: "X-JM-Control")
         // Generous: the AppleScript admin prompt waits on the human.
         req.timeoutInterval = 180
         // Deliberately NOT loopbackSession(): its 5 s resource timeout
@@ -1051,13 +1128,36 @@ public enum NFSBridge {
         /// surfaces both alongside each other.
         public var first_byte_ms: Int64 = 0
 
+        enum CodingKeys: String, CodingKey {
+            case elapsed_ms, bytes_read, mb_per_sec, status, hint, ran_at, target
+            case write_ok, write_ms, write_hint, first_byte_ms
+        }
+
+        public init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            elapsed_ms = try c.decode(Int64.self, forKey: .elapsed_ms)
+            bytes_read = try c.decode(Int64.self, forKey: .bytes_read)
+            mb_per_sec = try c.decode(Double.self, forKey: .mb_per_sec)
+            status = try c.decode(String.self, forKey: .status)
+            hint = try c.decode(String.self, forKey: .hint)
+            ran_at = try c.decode(String.self, forKey: .ran_at)
+            target = try c.decode(String.self, forKey: .target)
+            write_ok = try c.decode(Bool.self, forKey: .write_ok)
+            write_ms = try c.decode(Int64.self, forKey: .write_ms)
+            // Go omits these zero-value fields, including on pending/deferred
+            // results. Required health fields above must still be present.
+            write_hint = try c.decodeIfPresent(String.self, forKey: .write_hint) ?? ""
+            first_byte_ms = try c.decodeIfPresent(Int64.self, forKey: .first_byte_ms) ?? 0
+        }
+
         /// True when the result represents something the user might care to
         /// see surfaced on the icon (anything not green, including errors).
         /// "pending" (no run yet — placeholder served while Go's background
         /// goroutine is still running its first probe) is NOT attention-worthy;
         /// it's a transient state, not a real problem.
         public var isAttentionWorthy: Bool {
-            !(status == "green" || status.isEmpty || status == "pending")
+            !(status == "green" || status == "deferred" || status == "constrained"
+              || status.isEmpty || status == "pending")
         }
     }
 
@@ -1072,6 +1172,7 @@ public enum NFSBridge {
         guard let url = URL(string: "http://\(metricsAddr)/self-test") else { return nil }
         var req = URLRequest(url: url)
         req.httpMethod = force ? "POST" : "GET"
+        if force { req.setValue("1", forHTTPHeaderField: "X-JM-Control") }
         // The probe itself blocks up to ~200 ms on a healthy mount; allow
         // headroom for slow paths (a red mount measuring at 5 MB/s still
         // needs ~2 s).
@@ -1137,10 +1238,20 @@ public enum NFSBridge {
     /// Start the NFS server with the given configuration. Returns the bound listen address.
     @discardableResult
     public static func start(config: ServerConfig) throws -> String {
+		try start(config: config, automatic: false)
+	}
+
+	public static func autoStart(config: ServerConfig) throws -> String {
+		try start(config: config, automatic: true)
+	}
+
+	private static func start(config: ServerConfig, automatic: Bool) throws -> String {
+        try AppIsolation.validate(config)
+        try ServingService.ensureAvailable()
         let json = try JSONEncoder().encode(config)
         let cString = String(data: json, encoding: .utf8) ?? ""
         return try cString.withMutableCString { ptr in
-            guard let result = NFSServerStart(ptr) else {
+            guard let result = (automatic ? NFSServerStartAutomatic(ptr) : NFSServerStart(ptr)) else {
                 throw BridgeError.startFailed("null response")
             }
             defer { NFSServerFreeString(result) }
@@ -1152,27 +1263,66 @@ public enum NFSBridge {
         }
     }
 
+    /// Pair (or refresh an existing Link identity), then prove the encrypted
+    /// subnet route can reach the configured Redis backend. A successful node
+    /// is retained by the Go bridge so the next server start can immediately
+    /// install its loopback proxies without pairing again.
+    public static func testLink(config: ServerConfig) throws -> LinkTestResult {
+        try AppIsolation.validate(config)
+        try ServingService.ensureAvailable(forMount: false)
+        let json = try JSONEncoder().encode(config)
+        let cString = String(data: json, encoding: .utf8) ?? ""
+        return try cString.withMutableCString { ptr in
+            guard let result = NFSServerLinkTest(ptr) else {
+                throw BridgeError.startFailed("Link test returned no response")
+            }
+            defer { NFSServerFreeString(result) }
+            let raw = String(cString: result)
+            guard let data = raw.data(using: .utf8) else {
+                throw BridgeError.decodingFailed("invalid UTF-8 in Link test")
+            }
+            do {
+                return try JSONDecoder().decode(LinkTestResult.self, from: data)
+            } catch {
+                throw BridgeError.decodingFailed("Link test: \(error.localizedDescription)")
+            }
+        }
+    }
+
     /// User-visible Stop: tears everything down AND unmounts FUSE + NFS.
     /// This matches user expectations — "Stop" means the mount is gone.
     ///
-    /// NFS unmount goes through `diskutil unmount` first (no admin prompt
-    /// in the common case), falling back to a privileged umount only if
-    /// the mount is genuinely busy.
-    public static func stop() {
-        NFSServerShutdown()
+    /// An incomplete stop retains the independent serving runtime. No pathname
+    /// cleanup or GUI exit is allowed to substitute for verified completion.
+    ///
+    /// Returns the typed outcome: `complete` comes only from the C result;
+    /// on failure the engine's recorded reason explains why.
+    @discardableResult static func stop() -> ShutdownOutcome {
+        shutdown(allowPending: false)
     }
 
-    /// Soft stop for the internal Restart path. Leaves FUSE + NFS mounted
-    /// so the subsequent Start avoids re-mounting. Never call this from a
-    /// user-initiated Stop — the user expects the mount to disappear.
-    public static func softStop() {
-        NFSServerStop()
+    /// Legacy low-level soft stop. It leaves FUSE + NFS mounted, so it must not
+    /// be followed by a new server with freshly-opened stores: cached NFS file
+    /// handles would still reference the closed handler. Desktop restart and
+    /// maintenance flows use stopMount() instead.
+    @discardableResult public static func softStop() -> Bool {
+        NFSServerStop() != 0
     }
 
     /// Hard stop (alias for `stop()`). Kept for callers that want to be
     /// explicit about intent (e.g. applicationWillTerminate).
-    public static func shutdown() {
-        NFSServerShutdown()
+    @discardableResult static func shutdown(allowPending: Bool = false) -> ShutdownOutcome {
+        let result = allowPending ? NFSServerShutdownForced() : NFSServerShutdown()
+        guard result == 0 else { return .completed }
+        return ShutdownOutcome.resolve(cResult: result, fetchedJSON: lastShutdownOutcomeJSON())
+    }
+
+    /// Raw JSON from NFSServerLastShutdownOutcome, or nil when the engine gave
+    /// no answer. Called only after a failed shutdown, off the main thread.
+    static func lastShutdownOutcomeJSON() -> String? {
+        guard let cstr = NFSServerLastShutdownOutcome() else { return nil }
+        defer { NFSServerFreeString(cstr) }
+        return String(cString: cstr)
     }
 
     /// Middle-ground stop (QA-7, 2026-05-17): unmounts NFS so the
@@ -1181,12 +1331,24 @@ public enum NFSBridge {
     /// and the JuiceFS daemon alive so the subsequent Start avoids the
     /// admin password re-prompt for re-mount. Wired to the "Stop mount
     /// and finish sync" menu item.
-    public static func stopMount() {
-        NFSServerStopMount()
+    @discardableResult public static func stopMount() -> Bool {
+        NFSServerStopMount() != 0
     }
 
     public static var isRunning: Bool {
         NFSServerIsRunning() != 0
+    }
+
+    public static var autoStartEligible: Bool {
+        NFSServerAutoStartEligible() == 1
+    }
+
+    /// Feed macOS's authoritative path-cost signal into the Go policy engine.
+    /// This is independent of server lifecycle: applying it before start lets
+    /// immutable JuiceFS cache/prefetch flags be minted for the correct class,
+    /// while live updates retune read QoS after a Wi-Fi/cellular transition.
+    public static func setNetworkCost(expensive: Bool, constrained: Bool) {
+        NFSServerSetNetworkCost(expensive ? 1 : 0, constrained ? 1 : 0)
     }
 
     // MARK: - Stats

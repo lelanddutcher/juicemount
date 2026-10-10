@@ -173,7 +173,14 @@ func (f *spoolWriteFile) Truncate(size int64) error {
 // stays up through ReleaseHandle, and a panic still drops the active-writer
 // count, so it's leak-free under abnormal exit.
 func (f *spoolWriteFile) Close() error {
-	defer f.handler.decActiveWriter(f.name)
+	defer func() {
+		f.handler.decActiveWriter(f.name)
+		// NFS closes one billy.File after every WRITE RPC. Preserve a complete,
+		// contiguous small metadata image at that boundary so an offline Finder
+		// continuation can safely copy it up even if this short-lived spool
+		// generation is finalized/evicted before the next range write arrives.
+		f.handler.cacheWrittenMetadataFromSpool(f.name, f.entry)
+	}()
 	f.entry.ReleaseHandle()
 	return nil
 }

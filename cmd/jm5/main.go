@@ -3,21 +3,22 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
-	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
 	"strconv"
-
-	"github.com/redis/go-redis/v9"
 
 	"github.com/lelanddutcher/juicemount/cache"
 	"github.com/lelanddutcher/juicemount/health"
@@ -26,7 +27,9 @@ import (
 	"github.com/lelanddutcher/juicemount/internal/jmlog"
 	"github.com/lelanddutcher/juicemount/internal/manager"
 	"github.com/lelanddutcher/juicemount/internal/metrics"
+	"github.com/lelanddutcher/juicemount/internal/mountbroker"
 	jmlibnfs "github.com/lelanddutcher/juicemount/internal/nfs"
+	"github.com/lelanddutcher/juicemount/internal/nfscustody"
 	"github.com/lelanddutcher/juicemount/internal/version"
 	"github.com/lelanddutcher/juicemount/metadata"
 	jmnfs "github.com/lelanddutcher/juicemount/nfs"
@@ -57,7 +60,98 @@ func splitNonEmpty(s, sep string) []string {
 	return out
 }
 
+func openCheckedStore(path string) (*metadata.Store, error) {
+	store, err := metadata.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	if err := metadata.InitSpoolSchema(store.DB()); err != nil {
+		_ = store.Close()
+		return nil, fmt.Errorf("initialize spool schema: %w", err)
+	}
+	if err := store.CheckSpoolRecovery(); err != nil {
+		_ = store.Close()
+		return nil, fmt.Errorf("inspect spool publication before serving: %w", err)
+	}
+	return store, nil
+}
+
+type cliStartupCleanup struct{ steps []func() }
+
+func (c *cliStartupCleanup) add(step func()) { c.steps = append(c.steps, step) }
+
+func (c *cliStartupCleanup) fail(err error) error {
+	for i := len(c.steps) - 1; i >= 0; i-- {
+		c.steps[i]()
+	}
+	c.steps = nil
+	return err
+}
+
+var errCLICleanupIncomplete = errors.New("CLI cleanup incomplete; serving dependencies retained")
+
+func failCLIStartup(err error, retire func() error, quiesce, stopHandler func() bool,
+	rollback func() error, cleanup *cliStartupCleanup) error {
+	retireErr := retire()
+	if retireErr != nil {
+		return errors.Join(err, errCLICleanupIncomplete, fmt.Errorf("NFS listener retirement incomplete: %w", retireErr))
+	}
+	if !quiesce() {
+		return errors.Join(err, errCLICleanupIncomplete, errors.New("NFS clients did not quiesce"))
+	}
+	if !stopHandler() {
+		return errors.Join(err, errCLICleanupIncomplete, errors.New("NFS handler cleanup incomplete"))
+	}
+	if rollbackErr := rollback(); rollbackErr != nil {
+		return errors.Join(err, errCLICleanupIncomplete, rollbackErr)
+	}
+	return cleanup.fail(err)
+}
+
+func runCLIStartup(prepareSpool, prepareFUSE func() error, syncMirror func(), startListener func() error,
+	startWorkers func(), onFailure func(error) error) error {
+	if err := prepareSpool(); err != nil {
+		return onFailure(err)
+	}
+	if err := prepareFUSE(); err != nil {
+		return onFailure(err)
+	}
+	syncMirror()
+	if err := startListener(); err != nil {
+		return onFailure(err)
+	}
+	startWorkers()
+	return nil
+}
+
+// An explicit recovery request must not silently become an inactive queue.
+func validateCLIReplacementRecovery(enabled, spoolConfigured bool) error {
+	if enabled && !spoolConfigured {
+		return errors.New("replacement recovery requires JM_SPOOL_ENABLE=1")
+	}
+	return nil
+}
+
+// Construct without dialing. Startup owns Start; cleanup owns Stop only after
+// the handler has joined its drainer, including an unstarted failure path.
+func newCLIReplacementLeases(enabled bool, redisURL string, spool *jmnfs.SpoolStore, drainer *jmnfs.Drainer) (*jmnfs.ProjectLeaseClient, error) {
+	if !enabled {
+		return nil, nil
+	}
+	if spool == nil || drainer == nil {
+		return nil, errors.New("replacement recovery requires a spool and drainer")
+	}
+	leases, err := jmnfs.NewProjectLeaseClient(jmnfs.ProjectLeaseConfig{RedisURL: redisURL, Spool: spool})
+	if err != nil {
+		return nil, err
+	}
+	drainer.SetProjectLeases(leases)
+	return leases, nil
+}
+
 func main() {
+	buildInfo := flag.Bool("build-info", false, "print release version and source commit, then exit")
+	replacementRecovery := flag.Bool("replacement-recovery", false, "Recover accepted atomic saves (requires spool and enforcing lease proxy)")
 	redisURL := flag.String("redis", "redis://127.0.0.1:6379/1", "Redis URL")
 	fusePath := flag.String("fuse-path", "", "Path to JuiceFS FUSE mount (auto-detected if empty)")
 	mountPoint := flag.String("mount", "/Volumes/zpool", "Mount point for NFS volume")
@@ -83,6 +177,21 @@ func main() {
 	migratorSourceRoots := flag.String("migrator-source-roots", "", "DEPRECATED: alias for --manager-source-roots, kept for one-release compat.")
 	migratorAdminKey := flag.String("migrator-admin-key", "", "DEPRECATED: alias for --manager-admin-key, kept for one-release compat.")
 	flag.Parse()
+	if *buildInfo {
+		fmt.Printf("jm5 %s (%s)\n", version.Version, version.Commit)
+		return
+	}
+
+	if err := validateCLIReplacementRecovery(*replacementRecovery, os.Getenv("JM_SPOOL_ENABLE") == "1"); err != nil {
+		log.Fatal(err)
+	}
+
+	// Own stop signals before starting any child or admitting mount effects.
+	// During incomplete cleanup a signal wakes the next observation; it never
+	// authorizes abandoning a mount or pending work by exiting the process.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
 
 	// Initialize structured logging before anything else logs.
 	if err := jmlog.Init(jmlog.Config{
@@ -102,83 +211,99 @@ func main() {
 		os.MkdirAll(dir, 0755)
 		*dbPath = filepath.Join(dir, "metadata.db")
 	}
+	// Refuse unresolved spool publication before stale-session cleanup, FUSE,
+	// reconcile, recovery, or either listener can affect the existing volume.
+	store, err := openCheckedStore(*dbPath)
+	if err != nil {
+		log.Fatalf("Open metadata store: %v", err)
+	}
+	var startupCleanup cliStartupCleanup
+	startupCleanup.add(func() { _ = store.Close() })
 
-	// Clean up stale sessions from previous runs
-	cleanupStaleSession(*mountPoint, *listenAddr)
+	// Previous processes and mounts require broker reconciliation. A name or
+	// path is not authority to kill or force-unmount a stale session.
 
 	jmlog.Info("starting JuiceMount5",
-		"redis", *redisURL,
+		"version", version.Version,
+		"commit", version.Commit,
+		"redis", "configured",
 		"fuse", *fusePath,
 		"mount", *mountPoint,
 		"db", *dbPath,
 		"metrics_addr", *metricsAddr,
 	)
 
-	// 0. Mount JuiceFS FUSE (unless --no-fuse)
+	// FUSE startup follows spool recovery below, so a refused local queue
+	// cannot leave a new mount or remount monitor behind.
 	var fuseMgr *health.FUSEManager
-	if !*noFuse {
-		fuseMgr = health.NewFUSEManager(health.FUSEConfig{
-			RedisURL:       *redisURL,
-			MountPoint:     *fusePath,
-			CacheSize:      *cacheSize,
-			BucketOverride: *bucketOverride,
-		})
-		if err := fuseMgr.Mount(); err != nil {
-			jmlog.Error("juicefs FUSE mount failed", "error", err)
-			log.Fatalf("JuiceFS FUSE mount: %v", err)
-		}
-		fuseMgr.StartMonitor()
-	} else {
-		// Verify FUSE mount exists when not managing it
-		if _, err := os.Stat(*fusePath); err != nil {
-			log.Fatalf("FUSE mount not found at %s (use without --no-fuse to auto-mount)", *fusePath)
-		}
-	}
-
-	// 1. Open metadata store
-	store, err := metadata.Open(*dbPath)
-	if err != nil {
-		log.Fatalf("Open metadata store: %v", err)
-	}
-
-	// 2. Connect to Redis and do initial sync
+	var fuseReceipt *health.MountReceipt
+	// 2. Connect to Redis. Sync follows spool recovery below.
 	rc, err := metadata.NewRedisClient(*redisURL, store)
 	if err != nil {
-		log.Fatalf("Redis connect: %v", err)
+		log.Fatal(startupCleanup.fail(fmt.Errorf("Redis connect: %w", err)))
 	}
+	startupCleanup.add(rc.Stop)
 
-	jmlog.Info("initial metadata sync starting")
-	start := time.Now()
-	if err := rc.SyncOnce(); err != nil {
-		// V2.3 U1/K4: a transient sync failure (slow WAN, backend hiccup)
-		// must not abort the CLI server — the GUI core only Warns here, the
-		// mirror serves what it has, and rc.Start()'s reconcile loop retries
-		// until the backend answers.
-		jmlog.Warn("initial sync failed — serving existing mirror; reconcile loop retries",
-			"error", err.Error())
+	// Bind the selected backend and load only its durable path eligibility
+	// before FUSE or metadata publication. An offline saved Reader exists at
+	// NewSession return and must be attached explicitly below.
+	cachePaths, err := metadata.OpenCachePathEligibility(store)
+	if err != nil {
+		log.Fatal(startupCleanup.fail(fmt.Errorf("open cache path eligibility: %w", err)))
 	}
-	count, _ := store.Count()
-	jmlog.Info("initial metadata sync complete",
-		"entries", count,
-		"duration_ms", time.Since(start).Round(time.Millisecond).Milliseconds(),
-	)
+	// --no-fuse serves an externally owned generation. Its executable is
+	// unknown; finding another installed binary cannot prove cache layout.
+	juiceFSBin := ""
+	if !*noFuse {
+		juiceFSBin = health.ResolveJuiceFSBinary()
+	}
+	stateDir, err := filepath.Abs(filepath.Dir(*dbPath))
+	if err != nil {
+		log.Fatal(startupCleanup.fail(fmt.Errorf("cache state directory: %w", err)))
+	}
+	var cacheHandler atomic.Pointer[jmnfs.JuiceMountHandler]
+	cacheNetwork := newCLICacheNetworkOwner(nil, rc)
+	cacheSession, err := cache.NewSession(cache.SessionConfig{
+		Store: store, LogicalURL: *redisURL,
+		Selection: []string{*bucketOverride, "", ""},
+		Options:   rc.RawDB().Options(), StateDir: stateDir, JuiceFSBin: juiceFSBin,
+		VerifyReader: func(r *cache.Reader) error {
+			if juiceFSBin == "" {
+				return cache.ErrReaderUnavailable
+			}
+			return r.VerifyWithBinary(context.Background(), juiceFSBin)
+		},
+		OnReader: func(r *cache.Reader) {
+			if h := cacheHandler.Load(); h != nil {
+				h.SetCacheReader(r)
+			}
+		},
+		OnQualified: cacheNetwork.qualificationChanged,
+		OnStatus: func(qualified bool, err error) {
+			if h := cacheHandler.Load(); h != nil {
+				h.SetCacheBackendStatus(qualified, err)
+			}
+		},
+	})
+	if err != nil {
+		log.Fatal(startupCleanup.fail(fmt.Errorf("bind cache session: %w", err)))
+	}
+	startupCleanup.add(cacheSession.Stop)
+	cacheNetwork.session = cacheSession
+	startupCleanup.add(cacheNetwork.stop)
 
-	// Start background sync (SUBSCRIBE + reconciliation)
-	rc.Start()
-
-	// 3. Set up SSD cache reader
-	cacheDir := cache.DetectCacheDir()
-	var cr *cache.Reader
-	if cacheDir != "" {
-		addr, db, _ := metadata.ParseRedisURL(*redisURL)
-		rdb := redis.NewClient(&redis.Options{Addr: addr, DB: db})
-		cr = cache.NewReader(cacheDir, cache.DefaultBlockSize, rdb)
-		if err := cr.Verify(); err != nil {
-			jmlog.Warn("ssd cache reader disabled", "error", err)
-			cr = nil
-		} else {
-			jmlog.Info("ssd cache reader enabled")
+	// Reserve the physical generation before constructing any FUSE consumer.
+	// The logical --fuse-path is used only for allocation; all later paths
+	// refer to this generation's immutable mount directory.
+	if !*noFuse {
+		fuseMgr, err = health.NewGenerationFUSEManager(health.FUSEConfig{
+			RedisURL: *redisURL, MountPoint: *fusePath, CacheSize: *cacheSize, JuiceFSBin: juiceFSBin,
+			BucketOverride: *bucketOverride,
+		})
+		if err != nil {
+			log.Fatal(startupCleanup.fail(fmt.Errorf("reserve FUSE generation: %w", err)))
 		}
+		*fusePath = fuseMgr.MountPoint()
 	}
 
 	// 4. Start NFS server
@@ -191,59 +316,63 @@ func main() {
 		FUSEPath:   *fusePath,
 	}, store)
 
-	if err := srv.Start(); err != nil {
-		log.Fatalf("NFS server start: %v", err)
-	}
-
-	// Attach cache reader and redis client to handler
-	if cr != nil {
-		srv.Handler().SetCacheReader(cr)
+	// Wire dependencies before opening the listener; the first RPC must never
+	// observe a partially initialized handler.
+	srv.Handler().SetBoundCacheSession(cacheSession, rc, cachePaths)
+	cacheHandler.Store(srv.Handler())
+	if saved := cacheSession.Reader(); saved != nil {
+		srv.Handler().SetCacheReader(saved)
 	}
 	srv.Handler().SetRedisClient(rc)
-
+	// The selected saved binding is attached above. Restore Finder images
+	// before the first listener request, including offline and no-Reader boot.
+	if *dbPath != ":memory:" {
+		srv.Handler().SidecarPersistEnable(filepath.Join(stateDir, "sidecars.gob"))
+		startupCleanup.add(srv.Handler().SidecarPersistStop)
+	}
 	// Spool wiring (Option 2). Same env-gated path as bridge/cbridge.go
 	// — JM_SPOOL_ENABLE=1 + optional JM_SPOOL_DIR / JM_SPOOL_SIZE_GB.
 	// Defaults to ~/Library/Application Support/JuiceMount/spool/ on
 	// Darwin or $TMPDIR/jm5-spool/ elsewhere.
 	var (
-		spoolStore *jmnfs.SpoolStore
-		drainer    *jmnfs.Drainer
+		spoolStore    *jmnfs.SpoolStore
+		drainer       *jmnfs.Drainer
+		projectLeases *jmnfs.ProjectLeaseClient
 	)
-	if os.Getenv("JM_SPOOL_ENABLE") == "1" {
-		spoolDir := os.Getenv("JM_SPOOL_DIR")
-		if spoolDir == "" {
-			home, err := os.UserHomeDir()
-			if err != nil || home == "" {
-				spoolDir = filepath.Join(os.TempDir(), "jm5-spool")
-				jmlog.Warn("UserHomeDir failed; spool dir fell back to tmp",
-					"dir", spoolDir, "error", fmt.Sprintf("%v", err))
-			} else {
-				spoolDir = filepath.Join(home, "Library", "Application Support", "JuiceMount", "spool")
+	prepareSpool := func() error {
+		if os.Getenv("JM_SPOOL_ENABLE") == "1" {
+			spoolDir := os.Getenv("JM_SPOOL_DIR")
+			if spoolDir == "" {
+				home, err := os.UserHomeDir()
+				if err != nil || home == "" {
+					spoolDir = filepath.Join(os.TempDir(), "jm5-spool")
+					jmlog.Warn("UserHomeDir failed; spool dir fell back to tmp",
+						"dir", spoolDir, "error", fmt.Sprintf("%v", err))
+				} else {
+					spoolDir = filepath.Join(home, "Library", "Application Support", "JuiceMount", "spool")
+				}
 			}
-		}
-		// Auto-size to free disk by default so a large SD-card offload fits;
-		// explicit JM_SPOOL_SIZE_GB still wins (clamped to disk in NewSpoolStore).
-		spoolCapacity := jmnfs.AutoSpoolCapacity(spoolDir)
-		if s := os.Getenv("JM_SPOOL_SIZE_GB"); s != "" {
-			if v, err := strconv.ParseInt(s, 10, 64); err != nil || v < 1 {
-				jmlog.Warn("JM_SPOOL_SIZE_GB ignored (must be >= 1), using auto-sized default",
-					"raw", s)
-			} else {
-				spoolCapacity = v << 30
+			// Auto-size to free disk by default so a large SD-card offload fits;
+			// explicit JM_SPOOL_SIZE_GB still wins (clamped to disk in NewSpoolStore).
+			spoolCapacity := jmnfs.AutoSpoolCapacity(spoolDir)
+			if s := os.Getenv("JM_SPOOL_SIZE_GB"); s != "" {
+				if v, err := strconv.ParseInt(s, 10, 64); err != nil || v < 1 {
+					jmlog.Warn("JM_SPOOL_SIZE_GB ignored (must be >= 1), using auto-sized default",
+						"raw", s)
+				} else {
+					spoolCapacity = v << 30
+				}
 			}
-		}
-		if err := metadata.InitSpoolSchema(store.DB()); err != nil {
-			jmlog.Warn("spool schema init failed (spool disabled)", "error", err.Error())
-		} else {
 			meta := metadata.NewSpoolStore(store.DB())
+			store.SetSpoolStore(meta) // recovery validates accepted local images against the mirror
 			ss, err := jmnfs.NewSpoolStore(spoolDir, spoolCapacity, meta)
 			if err != nil {
-				jmlog.Warn("spool store open failed (spool disabled)", "error", err.Error())
+				return fmt.Errorf("open spool store before serving: %w", err)
 			} else {
-				dr, err := jmnfs.NewDrainer(ss, jmnfs.DrainerConfig{FuseRoot: *fusePath})
+				startupCleanup.add(ss.Stop)
+				dr, err := jmnfs.NewDrainer(ss, jmnfs.DrainerConfig{FuseRoot: *fusePath, ReplacementRecovery: *replacementRecovery})
 				if err != nil {
-					jmlog.Warn("drainer construct failed (spool disabled)", "error", err.Error())
-					ss.Stop()
+					return fmt.Errorf("construct spool drainer before serving: %w", err)
 				} else {
 					// Slice F: boot-time scrubber. MUST run BEFORE
 					// drainer.Start so it doesn't race with workers. Generous
@@ -253,8 +382,7 @@ func main() {
 					recReport, recErr := ss.RecoverOnBoot(recCtx)
 					recCancel()
 					if recErr != nil {
-						jmlog.Warn("spool boot scrubber failed (proceeding anyway)",
-							"error", recErr.Error())
+						return fmt.Errorf("recover local spool before serving: %w", recErr)
 					} else if recReport.OrphanFilesDeleted > 0 || recReport.OrphanRowsFailed > 0 ||
 						recReport.WritingFailedRows > 0 || recReport.DrainingReset > 0 ||
 						recReport.ReadyResumed > 0 {
@@ -266,13 +394,19 @@ func main() {
 							"ready_resumed", recReport.ReadyResumed)
 					}
 
+					projectLeases, err = newCLIReplacementLeases(*replacementRecovery, *redisURL, ss, dr)
+					if err != nil {
+						return fmt.Errorf("configure replacement recovery: %w", err)
+					}
+					if projectLeases != nil {
+						startupCleanup.add(projectLeases.Stop)
+					}
 					srv.Handler().SetSpool(ss, dr)
 					// QA-30 Layer D: scopedPrune spares paths with a live,
 					// not-yet-drained spool entry (absent from Redis AND FUSE)
 					// so an in-flight spool file is never pruned mid-copy and its
 					// Track-B NFS handle never Forgotten (build-438 error 100070).
 					rc.SetSpoolGuard(ss.HasPending)
-					dr.Start()
 					spoolStore = ss
 					drainer = dr
 					jmlog.Info("spool ready",
@@ -281,6 +415,76 @@ func main() {
 				}
 			}
 		}
+		return nil
+	}
+	if err := runCLIStartup(prepareSpool, func() error {
+		if *noFuse {
+			if _, err := os.Stat(*fusePath); err != nil {
+				return fmt.Errorf("FUSE mount not found at %s (use without --no-fuse to auto-mount): %w", *fusePath, err)
+			}
+			return nil
+		}
+		var err error
+		fuseReceipt, err = fuseMgr.MountWithReceipt()
+		if err != nil {
+			return fmt.Errorf("JuiceFS FUSE mount: %w", err)
+		}
+		return nil
+	}, func() {
+		cacheSession.SetOnline(true)
+		qualifyCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		if err := cacheSession.Qualify(qualifyCtx); err != nil {
+			jmlog.Warn("cache backend qualification unavailable; serving local mirror", "error", err)
+		}
+		cancel()
+		jmlog.Info("initial metadata sync starting")
+		start := time.Now()
+		if err := rc.SyncOnce(); err != nil {
+			// A transient sync failure leaves the existing mirror available;
+			// the background reconcile loop retries after startup.
+			jmlog.Warn("initial sync failed — serving existing mirror; reconcile loop retries",
+				"error", err.Error())
+		}
+		count, _ := store.Count()
+		jmlog.Info("initial metadata sync complete",
+			"entries", count,
+			"duration_ms", time.Since(start).Round(time.Millisecond).Milliseconds())
+	}, func() error {
+		if err := srv.Start(); err != nil {
+			return fmt.Errorf("NFS server start: %w", err)
+		}
+		return nil
+	}, func() {
+		if fuseMgr != nil {
+			fuseMgr.StartMonitor()
+		}
+		if projectLeases != nil {
+			projectLeases.Start()
+		}
+		if drainer != nil {
+			drainer.Start()
+		}
+		rc.Start()
+		cacheNetwork.start(*redisURL, *fusePath)
+	}, func(err error) error {
+		return waitForCLICleanup(func() error {
+			return failCLIStartup(err, srv.DisableStart, func() bool {
+				return srv.QuiesceClients(7 * time.Second)
+			}, srv.Handler().StopHandler, func() error {
+				// Even a launch with no child receipt can have unknown path
+				// occupancy. The manager owns that unresolved lifecycle.
+				if fuseMgr != nil {
+					result := fuseMgr.Stop()
+					if !result.Complete() {
+						return fmt.Errorf("FUSE: %s", result.String())
+					}
+					return nil
+				}
+				return fuseReceipt.Rollback()
+			}, &startupCleanup)
+		}, sigCh, 5*time.Second)
+	}); err != nil {
+		log.Fatal(err)
 	}
 	jmlog.Info("nfs server listening", "addr", srv.Addr())
 
@@ -384,19 +588,7 @@ func main() {
 		if a := metricsSrv.Addr(); a != "" {
 			addr = a
 		}
-		who := cplane.WhoAmI{
-			App:             "JuiceMount",
-			Version:         version.Version,
-			ContractVersion: cplane.ContractVersion,
-			InstanceID:      jm5InstanceID,
-			VolumeName:      filepath.Base(*mountPoint),
-			MountPoint:      *mountPoint,
-			NASRoot:         *mountPoint,
-			ControlPlane:    "http://" + addr,
-			MetadataDBPath:  *dbPath,
-			Deployment:      "cli",
-			Capabilities:    cplane.DeriveCapabilities(served),
-		}
+		who := jm5WhoAmI(jm5InstanceID, *mountPoint, addr, *dbPath, served)
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(who)
 	}
@@ -412,66 +604,39 @@ func main() {
 	netWatcher.OnChange(func(oldIface, newIface string) {
 		jmlog.Info("network interface changed",
 			"old", oldIface, "new", newIface)
-		if err := rc.Reconnect(); err != nil {
-			jmlog.Warn("redis reconnect failed (will retry)", "error", err)
-		} else {
-			jmlog.Info("redis reconnected, triggering immediate sync")
-			rc.TriggerSync()
-		}
+		cacheNetwork.interfaceChanged()
 	})
 	netWatcher.Start()
 
-	healthMon := health.New(health.Config{
-		RedisURL: func() string {
-			addr, _, _ := metadata.ParseRedisURL(*redisURL)
-			return addr
-		}(),
-		MinIOURL:      "http://127.0.0.1:9000",
-		FUSEPath:      *fusePath,
-		NFSMountPoint: *mountPoint,
-	})
+	healthCfg := newHealthConfig(*redisURL, *managerMinIOURL, *fusePath, *mountPoint, *noMount)
+	healthCfg.RedisOptions = rc.RawDB().Options()
+	healthMon := health.New(healthCfg)
 	healthMon.SetNetWatcher(netWatcher)
-	// Allow auto-remount only when we own the mount lifecycle.
-	if !*noMount {
-		healthMon.EnableNFSRemount(func() error {
-			return mountNFS(srv.Addr(), *mountPoint)
-		})
-	}
 	healthMon.Start()
 
 	// Expose health status to /health endpoint.
 	metrics.Default().SetHealthProvider(func() metrics.HealthSnapshot {
-		st := healthMon.Status()
-		comps := map[string]string{
-			"redis": componentLabel(st.Redis.Healthy, st.Redis.Message),
-			"minio": componentLabel(st.MinIO.Healthy, st.MinIO.Message),
-			"fuse":  componentLabel(st.FUSE.Healthy, st.FUSE.Message),
-			"nfs":   componentLabel(st.NFS.Healthy, st.NFS.Message),
-		}
-		reason := ""
-		if !st.Overall {
-			reason = "degraded"
-		}
-		return metrics.HealthSnapshot{
-			Healthy:    st.Overall,
-			Components: comps,
-			Reason:     reason,
-		}
+		return jm5HealthSnapshot(healthMon.Status(), *noMount, srv.IsRunning())
 	})
 
 	// 6. Mount NFS (unless --no-mount)
 	if !*noMount {
-		if err := mountNFS(srv.Addr(), *mountPoint); err != nil {
-			log.Fatalf("NFS mount: %v", err)
+		if err := mountNFS(srv.Addr(), srv.ExportPath(), *mountPoint, *dbPath); err != nil {
+			jmlog.Error("NFS mount outcome incomplete; retaining serving dependencies", "error", err)
+		} else {
+			jmlog.Info("nfs mounted", "mount_point", *mountPoint)
 		}
-		jmlog.Info("nfs mounted", "mount_point", *mountPoint)
 	}
 
-	jmlog.Info("juicemount5 ready, awaiting signal")
+	// Allow auto-remount only when we own the mount lifecycle.
+	if !*noMount {
+		healthMon.EnableNFSRemount(func() error {
+			return mountNFSNonInteractive(srv.Addr(), srv.ExportPath(), *mountPoint, *dbPath)
+		})
+	}
+	jmlog.Info("juicemount5 serving, awaiting signal")
 
-	// Wait for signal
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	// Wait for signal (including one received during initial creation).
 	<-sigCh
 
 	// Graceful shutdown in dependency order:
@@ -481,15 +646,33 @@ func main() {
 	// 4. Stop network watcher and health monitor
 	// 5. Stop Redis (close subscription and reconciliation)
 	// 6. Close SQLite
+	if !*noMount {
+		cliNFSMu.Lock()
+		cliNFSStopping = true
+		cliNFSMu.Unlock()
+	}
 	jmlog.Info("shutting down")
 
 	if !*noMount {
 		jmlog.Info("unmounting", "mount_point", *mountPoint)
-		unmountNFS(*mountPoint)
+		healthMon.EnableNFSRemount(nil)
+		healthMon.EnableNFSAbsentRemount(nil)
+		waitForNFSMountAbsent(*mountPoint, sigCh, 5*time.Second, unmountNFS)
 	}
 
-	srv.Stop()
-	srv.Handler().StopHandler()
+	_ = waitForCLICleanup(func() error {
+		if !prepareServerOnlyShutdown(srv, 7*time.Second) {
+			return errors.Join(errCLICleanupIncomplete, errors.New("NFS clients still active"))
+		}
+		if !srv.Handler().StopHandler() {
+			return errors.Join(errCLICleanupIncomplete, errors.New("NFS handler still active"))
+		}
+		return nil
+	}, sigCh, 5*time.Second)
+
+	if projectLeases != nil {
+		projectLeases.Stop() // StopHandler proved the original drainer has joined.
+	}
 
 	if mgrJobMgr != nil {
 		// Cancel in-flight migrations before tearing down the FUSE mount;
@@ -497,22 +680,29 @@ func main() {
 		// disappearing under it.
 		mgrJobMgr.StopAll()
 	}
+	// FUSE still needs its backend while a child, helper or mount is live.
+	// Retain SQLite/spool/Redis and status until the manager proves completion.
+	if fuseMgr != nil {
+		_ = waitForCLICleanup(func() error {
+			result := fuseMgr.Stop()
+			if !result.Complete() {
+				return errors.Join(errCLICleanupIncomplete, fmt.Errorf("FUSE: %s", result.String()))
+			}
+			return nil
+		}, sigCh, 5*time.Second)
+	}
 	if metricsSrv != nil {
 		metricsSrv.Stop()
 	}
 	netWatcher.Stop()
 	healthMon.Stop()
-
-	if cr != nil {
-		cr.Stop()
-	}
+	cacheNetwork.stop()
+	cacheHandler.Store(nil)
+	srv.Handler().SidecarPersistStop()
+	cacheSession.Stop()
 	rc.Stop()
 	store.Close()
 
-	// 7. Unmount JuiceFS FUSE last (after everything else is stopped)
-	if fuseMgr != nil {
-		fuseMgr.Stop()
-	}
 }
 
 // componentLabel returns "ok" for healthy, or the underlying reason.
@@ -526,42 +716,111 @@ func componentLabel(healthy bool, msg string) string {
 	return msg
 }
 
-func mountNFS(addr, mountPoint string) error {
-	// /Volumes requires root to create dirs
-	if _, err := os.Stat(mountPoint); os.IsNotExist(err) {
-		exec.Command("sudo", "mkdir", "-p", mountPoint).Run()
+func newHealthConfig(redisURL, minioURL, fusePath, mountPoint string, serverOnly bool) health.Config {
+	redisAddr, _, _ := metadata.ParseRedisURL(redisURL)
+	if serverOnly {
+		// A server container exports NFS to other machines; it intentionally
+		// does not mount its own export as a client.
+		mountPoint = ""
 	}
-
-	// Parse host:port
-	host := "127.0.0.1"
-	port := "11049"
-	parts := splitAddr(addr)
-	if len(parts) == 2 {
-		host = parts[0]
-		port = parts[1]
-	} else {
-		return fmt.Errorf("invalid addr: %s", addr)
+	return health.Config{
+		RedisURL:      redisAddr,
+		MinIOURL:      minioURL,
+		FUSEPath:      fusePath,
+		NFSMountPoint: mountPoint,
 	}
+}
 
-	// readahead=16 (was 128): readahead=128 over-drives the macOS NFS client and
-	// causes silent file TRUNCATION under high concurrent reads (server is
-	// correct). See bridge/cbridge.go nfsMountOpts + [torn-read 2026-06-15].
-	// hard (was soft): a soft mount's ETIMEDOUT (errno 60) on a timed-out mmap
-	// pagein becomes SIGBUS, crashing apps that mmap media. See bridge/cbridge.go
-	// nfsMountOpts + [mmap-SIGBUS 2026-06-15].
-	// [B4' Fix B] acdir 3-15s (was actimeo=3600): dir-attr + negative-name
-	// cache re-validates in seconds so server-created content becomes visible
-	// at ~(push 3s + acdirmax 15s) instead of up to an hour. acreg stays 3600.
-	// Mirrors bridge/cbridge.go nfsMountOpts — keep in sync.
-	opts := fmt.Sprintf("port=%s,mountport=%s,hard,intr,timeo=300,retrans=5,nolocks,locallocks,rsize=1048576,wsize=1048576,readahead=16,acregmin=3600,acregmax=3600,acdirmin=3,acdirmax=15,vers=3,tcp", port, port)
-	cmd := exec.Command("sudo", "mount_nfs", "-o", opts,
-		fmt.Sprintf("%s:/", host), mountPoint)
+func jm5HealthSnapshot(st health.HealthStatus, serverOnly, serverRunning bool) metrics.HealthSnapshot {
+	nfsHealthy := st.NFS.Healthy
+	nfsMessage := st.NFS.Message
+	overall := st.Overall
+	if serverOnly {
+		nfsHealthy = serverRunning
+		nfsMessage = "listener stopped"
+		overall = st.Redis.Healthy && st.MinIO.Healthy && st.FUSE.Healthy && serverRunning
+	}
+	components := map[string]string{
+		"redis": componentLabel(st.Redis.Healthy, st.Redis.Message),
+		"minio": componentLabel(st.MinIO.Healthy, st.MinIO.Message),
+		"fuse":  componentLabel(st.FUSE.Healthy, st.FUSE.Message),
+		"nfs":   componentLabel(nfsHealthy, nfsMessage),
+	}
+	reason := ""
+	if !overall {
+		reason = "degraded"
+	}
+	return metrics.HealthSnapshot{Healthy: overall, Components: components, Reason: reason}
+}
 
-	out, err := cmd.CombinedOutput()
+func cliNFSMountSource(addr, exportPath string) (source, port string, err error) {
+	if !validNFSExportPath(exportPath) {
+		return "", "", fmt.Errorf("invalid NFS export path %q", exportPath)
+	}
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil || host == "" {
+		return "", "", fmt.Errorf("invalid addr: %s", addr)
+	}
+	portNumber, err := strconv.Atoi(port)
+	if err != nil || portNumber < 1 || portNumber > 65535 {
+		return "", "", fmt.Errorf("invalid NFS listener port %q", port)
+	}
+	if strings.Contains(host, ":") {
+		host = "[" + host + "]"
+	}
+	return host + ":" + exportPath, port, nil
+}
+
+func validNFSExportPath(path string) bool {
+	if len(path) != 36 || !strings.HasPrefix(path, "/jm-") {
+		return false
+	}
+	nonzero := false
+	for i := 4; i < len(path); i++ {
+		b := path[i]
+		if (b < '0' || b > '9') && (b < 'a' || b > 'f') {
+			return false
+		}
+		nonzero = nonzero || b != '0'
+	}
+	return nonzero
+}
+
+func mountNFS(addr, exportPath, mountPoint, metadataPath string) error {
+	return mountNFSWithProvisioning(addr, exportPath, mountPoint, metadataPath, true)
+}
+func mountNFSNonInteractive(addr, exportPath, mountPoint, metadataPath string) error {
+	return mountNFSWithProvisioning(addr, exportPath, mountPoint, metadataPath, false)
+}
+func mountNFSWithProvisioning(addr, exportPath, mountPoint, metadataPath string, interactive bool) error {
+	source, port, err := cliNFSMountSource(addr, exportPath)
 	if err != nil {
-		return fmt.Errorf("mount_nfs: %v\n%s", err, out)
+		return err
 	}
-	return nil
+	creator, err := newCLINFSMountCreator()
+	if err != nil {
+		return err
+	}
+	spec := mountbroker.Spec{
+		MountPath: mountPoint, Source: source, Endpoint: addr,
+		ExportPath: exportPath, MetadataPath: metadataPath,
+	}
+	// Preserve the CLI's existing NFS options while moving birth and retirement
+	// into the same exact-operation descriptor controller as the app service.
+	opts := fmt.Sprintf("port=%s,mountport=%s,hard,intr,timeo=300,retrans=5,nonegnamecache,nolocks,locallocks,rsize=1048576,wsize=1048576,readahead=16,acregmin=3600,acregmax=3600,acdirmin=3,acdirmax=15,vers=3,tcp", port, port)
+	cliNFSMu.Lock()
+	if cliNFSStopping || cliNFSCustody != nil {
+		cliNFSMu.Unlock()
+		return errors.New("NFS generation already owned or stopping")
+	}
+	controller, err := newCLINFSCustodyController(creator, spec, opts, interactive)
+	if err != nil {
+		cliNFSMu.Unlock()
+		return err
+	}
+	cliNFSCustody = controller
+	cliNFSMu.Unlock()
+	return controller.Start(context.Background())
 }
 
 func splitAddr(addr string) []string {
@@ -574,47 +833,112 @@ func splitAddr(addr string) []string {
 	return []string{addr}
 }
 
-// cleanupStaleSession kills any leftover JM5 processes, frees the NFS port,
-// and unmounts stale NFS mounts from a previous run that didn't shut down cleanly.
-func cleanupStaleSession(mountPoint, listenAddr string) {
-	// Kill any old jm5 processes (but not us or JuiceFS)
-	myPID := os.Getpid()
-	out, _ := exec.Command("pgrep", "-x", "jm5").Output()
-	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-		pid := strings.TrimSpace(line)
-		if pid == "" {
-			continue
-		}
-		pidInt := 0
-		fmt.Sscanf(pid, "%d", &pidInt)
-		if pidInt != 0 && pidInt != myPID {
-			jmlog.Info("killing stale jm5 process", "pid", pid)
-			exec.Command("kill", "-9", pid).Run()
+func prepareServerOnlyShutdown(srv *jmnfs.Server, deadline time.Duration) bool {
+	if err := srv.DisableStart(); err != nil {
+		jmlog.Error("cannot retire NFS listener", "error", err)
+		return false
+	}
+	return srv.QuiesceClients(deadline)
+}
+
+// Without an instance-safe broker, only observed absence completes shutdown.
+// An error is unknown, never absence, and no pathname unmount is attempted.
+func unmountNFS(mountPoint string) bool {
+	cliNFSMu.Lock()
+	controller := cliNFSCustody
+	cliNFSMu.Unlock()
+	if controller != nil {
+		if err := controller.Stop(context.Background(), 20*time.Second); err != nil {
+			jmlog.Error("NFS custody retirement incomplete", "error", err)
+			return false
 		}
 	}
+	creator, err := newCLINFSMountCreator()
+	if err != nil {
+		return false
+	}
+	snapshot, err := creator.Observe(context.Background())
+	if err != nil {
+		return false
+	}
+	if !mountbroker.ObservedAbsent(snapshot, mountPoint) {
+		return false
+	}
+	if controller != nil {
+		cliNFSMu.Lock()
+		if cliNFSCustody == controller {
+			cliNFSCustody = nil
+		}
+		cliNFSMu.Unlock()
+	}
+	return true
+}
 
-	// Unmount stale NFS mount
-	exec.Command("sudo", "umount", "-f", mountPoint).Run()
+var newCLINFSMountCreator = mountbroker.LocalCreator
 
-	// Wait for port to be free
-	parts := splitAddr(listenAddr)
-	if len(parts) == 2 {
-		for i := 0; i < 10; i++ {
-			out, _ := exec.Command("lsof", "-i", ":"+parts[1]).Output()
-			if !strings.Contains(string(out), "LISTEN") {
-				break
+type cliNFSController interface {
+	Start(context.Context) error
+	Stop(context.Context, time.Duration) error
+}
+
+var cliNFSMu sync.Mutex
+var cliNFSCustody cliNFSController
+var cliNFSStopping bool
+var newCLINFSCustodyController = func(creator mountbroker.Creator, spec mountbroker.Spec, opts string, interactive bool) (cliNFSController, error) {
+	return nfscustody.NewWithProvisioning(creator, spec, opts, interactive)
+}
+
+func waitForNFSMountAbsent(mountPoint string, signals <-chan os.Signal, interval time.Duration, inspect func(string) bool) {
+	for !inspect(mountPoint) {
+		jmlog.Warn("NFS shutdown incomplete; retaining serving dependencies", "mount_point", mountPoint)
+		timer := time.NewTimer(interval)
+		select {
+		case <-signals:
+			if !timer.Stop() {
+				<-timer.C
 			}
-			jmlog.Info("waiting for port to release", "port", parts[1])
-			time.Sleep(500 * time.Millisecond)
+		case <-timer.C:
 		}
 	}
 }
 
-func unmountNFS(mountPoint string) {
-	// Try graceful unmount first
-	if err := exec.Command("sudo", "umount", mountPoint).Run(); err != nil {
-		// Force unmount
-		exec.Command("sudo", "umount", "-f", mountPoint).Run()
+// Each attempt is bounded by its owning component. An incomplete attempt
+// retains dependencies and retries automatically; repeated signals only wake
+// an observation and never turn uncertainty into successful process exit.
+func waitForCLICleanup(attempt func() error, signals <-chan os.Signal, interval time.Duration) error {
+	for {
+		err := attempt()
+		if !errors.Is(err, errCLICleanupIncomplete) {
+			return err
+		}
+		jmlog.Warn("CLI cleanup incomplete; retaining serving dependencies", "error", err)
+		timer := time.NewTimer(interval)
+		select {
+		case <-signals:
+			if !timer.Stop() {
+				<-timer.C
+			}
+		case <-timer.C:
+		}
 	}
-	os.Remove(mountPoint)
+}
+
+// jm5WhoAmI builds the CLI's /whoami body. device_digest is filled the same
+// way as the GUI core's (cplane.DeviceDigest) so both servers agree.
+func jm5WhoAmI(instanceID, mountPoint, addr, dbPath string, served []string) cplane.WhoAmI {
+	return cplane.WhoAmI{
+		App:             "JuiceMount",
+		Version:         version.Version,
+		ContractVersion: cplane.ContractVersion,
+		InstanceID:      instanceID,
+		DeviceDigest:    cplane.DeviceDigest(),
+		VolumeName:      filepath.Base(mountPoint),
+		MountPoint:      mountPoint,
+		NASRoot:         mountPoint,
+		ControlPlane:    "http://" + addr,
+		MetadataDBPath:  dbPath,
+		Deployment:      "cli",
+		WireTerms:       cplane.WireTerms,
+		Capabilities:    cplane.DeriveCapabilities(served),
+	}
 }

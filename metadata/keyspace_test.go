@@ -3,12 +3,14 @@ package metadata
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sort"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/lelanddutcher/juicemount/internal/redisurl"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -174,11 +176,11 @@ func TestKeyspaceNotifySufficient(t *testing.T) {
 func TestKeyspacePushEnabledKillSwitch(t *testing.T) {
 	rc := &RedisClient{}
 	t.Setenv("JM_METADATA_KEYSPACE_PUSH", "")
-	if rc.keyspacePushEnabled() {
-		t.Error("unset env should be DISABLED")
+	if !rc.keyspacePushEnabled() || !KeyspacePushEnabled() {
+		t.Error("unset env should be ENABLED by default")
 	}
 	t.Setenv("JM_METADATA_KEYSPACE_PUSH", "0")
-	if rc.keyspacePushEnabled() {
+	if rc.keyspacePushEnabled() || KeyspacePushEnabled() {
 		t.Error("=0 should be DISABLED")
 	}
 	t.Setenv("JM_METADATA_KEYSPACE_PUSH", "1")
@@ -229,9 +231,9 @@ func TestCurrentLinkClassBands(t *testing.T) {
 
 func TestBackstopAndTuningOrdering(t *testing.T) {
 	// With keyspace-push engaged, the periodic full SCAN is only a missed-event
-	// backstop, so every class demotes it to a LONG interval in the intended
-	// 15-30m range (lengthened 2026-06-30 from 10/15/5m after field testing showed
-	// the ~5m WAN SCAN "rebuilding every 5 min" was too eager + churned the mirror).
+	// backstop, so every class demotes it to a DAILY safety audit. Push is the
+	// steady-state path; a full-tree scan every few minutes is polling and makes
+	// a cellular online mount slower than the recalled offline mirror.
 	// All stay well above the 30s DISABLED/DEGRADED cadence; staleness from a
 	// missed push event is bounded by that dir's next d-key event, and a real push
 	// DROP snaps the cadence back to 30s (the unreachable/DEGRADED cases below).
@@ -240,19 +242,12 @@ func TestBackstopAndTuningOrdering(t *testing.T) {
 		if b <= DefaultReconcileInterval {
 			t.Errorf("class %v backstop %v must exceed the 30s DISABLED cadence", c, b)
 		}
-		if b < 10*time.Minute || b > 30*time.Minute {
-			t.Errorf("class %v backstop %v out of the intended ~15-30m demoted-SCAN range", c, b)
+		if b != 24*time.Hour {
+			t.Errorf("class %v backstop %v, want the daily healthy-push safety audit", c, b)
 		}
 	}
-	// Tunnel/cellular stays <= lan/wifi (never the LONGEST): its SCAN is the most
-	// expensive (377k rows over the tunnel) AND push is flappiest there, so a
-	// missed in-place attr edit / reconnect-gap delete is caught soonest on the
-	// link most likely to miss one.
-	if backstopForClass(classTunnel) > backstopForClass(classLAN) ||
-		backstopForClass(classTunnel) > backstopForClass(classWiFi) {
-		t.Errorf("tunnel backstop must be <= lan/wifi: lan=%v wifi=%v tunnel=%v",
-			backstopForClass(classLAN), backstopForClass(classWiFi), backstopForClass(classTunnel))
-	}
+	// A cellular/tunnel link must not audit more often merely because its scan is
+	// more expensive. Detected push loss still switches every class to fallback.
 	// JM_RECONCILE_BACKSTOP_SEC overrides every class (field-tuning kill switch).
 	t.Setenv("JM_RECONCILE_BACKSTOP_SEC", "1800")
 	for _, c := range []linkClass{classLAN, classWiFi, classTunnel} {
@@ -315,7 +310,7 @@ func TestReconcileBackstopPrecedence(t *testing.T) {
 
 	// Seed the config to 300s (the exact value cfg.reconcileInterval() supplies).
 	rc.SetReconcileInterval(300 * time.Second)
-	// With push DISABLED (default engaged state), the config cadence applies —
+	// With push DISABLED (the initial engagement state), the config cadence applies —
 	// this is the non-push fallback path, so 300s is the honored value.
 	if got := rc.currentBackstop(); got != 300*time.Second {
 		t.Fatalf("push DISABLED + config=300s: backstop = %v, want 300s (config cadence)", got)
@@ -383,8 +378,8 @@ func TestReconcileBackstopPrecedence(t *testing.T) {
 
 // TestNetworkChangeDeferralPredicate locks the exact gate the reconcileLoop
 // syncNowCh handler uses to DEFER a network-change full SCAN to the keyspace
-// push: currentBackstop() > DefaultReconcileInterval. That is true IFF the push
-// is ENABLED + reachable (PSUBSCRIBE up, deltas flowing) — the one state in
+// push: pushCarriesDeltas(). That is true IFF the push is ENABLED + reachable
+// (PSUBSCRIBE up, deltas flowing) — the one state in
 // which a per-flap full 200k SCAN is redundant, because the keyspace loop owns
 // reconnect gap-fill and the rare backstop is the safety net. In every other
 // state (DISABLED / DEGRADED / ENABLED-but-unreachable) the gate is false and
@@ -394,9 +389,7 @@ func TestReconcileBackstopPrecedence(t *testing.T) {
 // regression (a flaky link silently losing its convergence SCAN) ever ships.
 func TestNetworkChangeDeferralPredicate(t *testing.T) {
 	// Mirrors the reconcileLoop syncNowCh gate exactly.
-	deferred := func(rc *RedisClient) bool {
-		return rc.currentBackstop() > DefaultReconcileInterval
-	}
+	deferred := func(rc *RedisClient) bool { return rc.pushCarriesDeltas() }
 	rc := &RedisClient{}
 	rc.backstopNanos.Store(int64(DefaultReconcileInterval))
 
@@ -415,6 +408,12 @@ func TestNetworkChangeDeferralPredicate(t *testing.T) {
 	rc.setEngagement(keyspaceDisabled)
 	if deferred(rc) {
 		t.Errorf("DISABLED must NOT defer (backstop=%v)", rc.currentBackstop())
+	}
+	// A user-configured long fallback cadence is not push engagement. The old
+	// currentBackstop()>30s shortcut falsely deferred this state forever.
+	rc.SetReconcileInterval(5 * time.Minute)
+	if deferred(rc) {
+		t.Errorf("DISABLED+long config must NOT defer (backstop=%v)", rc.currentBackstop())
 	}
 	// ENABLED but UNREACHABLE -> do NOT defer (push delivery is down).
 	SetClassSignals(func() string { return "en0" }, func() bool { return false })
@@ -515,9 +514,7 @@ func waitFor(t *testing.T, d time.Duration, cond func() bool) {
 // ---------------------------------------------------------------------------
 // Backstop controller: a RUNNING reconcileLoop must pick up a live
 // backstopNanos change (regression guard for the baseInterval captured-once
-// bug). We don't run the full loop here (it would hit Redis); instead we
-// assert the read path currentBackstop reflects atomic writes, which is what
-// reconcileLoop consults each turn.
+// bug).
 // ---------------------------------------------------------------------------
 
 func TestCurrentBackstopReflectsLiveWrites(t *testing.T) {
@@ -534,6 +531,52 @@ func TestCurrentBackstopReflectsLiveWrites(t *testing.T) {
 	rc.backstopNanos.Store(0)
 	if rc.currentBackstop() != DefaultReconcileInterval {
 		t.Fatalf("zero backstop = %v, want default", rc.currentBackstop())
+	}
+}
+
+// TestBackstopChangeWakesAndRebaselinesTicker locks the startup race found in
+// the signed RC: reconcileLoop armed its initial 30s ticker, keyspace push
+// engaged and changed the backstop to 24h, but the sleeping loop received no
+// wake. The obsolete 30s tick then launched a full 325k-entry SCAN and stalled
+// Finder plus /health immediately after mount.
+func TestBackstopChangeWakesAndRebaselinesTicker(t *testing.T) {
+	t.Setenv("JM_WAN_MODE", "")
+	t.Setenv("JM_RECONCILE_BACKSTOP_SEC", "")
+	SetClassSignals(func() string { return "en21" }, func() bool { return true })
+	t.Cleanup(func() { SetClassSignals(nil, nil) })
+
+	rc := &RedisClient{backstopChangedCh: make(chan struct{}, 1)}
+	rc.backstopNanos.Store(int64(DefaultReconcileInterval))
+	rc.setEngagement(keyspaceEnabled)
+
+	select {
+	case <-rc.backstopChangedCh:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("backstop change did not wake the running reconcile loop")
+	}
+
+	lastBase := DefaultReconcileInterval
+	backoff := DefaultReconcileInterval
+	consecutiveFailures := 0
+	ticker := time.NewTicker(time.Hour)
+	defer ticker.Stop()
+	if !rc.rebaselineReconcileTicker(&lastBase, &consecutiveFailures, &backoff, ticker) {
+		t.Fatal("running ticker was not rebaselined after push engagement")
+	}
+	if want := backstopForClass(classLAN); lastBase != want || backoff != want {
+		t.Fatalf("rebaseline lastBase=%v backoff=%v, want %v", lastBase, backoff, want)
+	}
+
+	// A successful push gap-fill is authoritative recovery and cancels an old
+	// full-SCAN failure retry instead of carrying it into healthy push mode.
+	lastBase = DefaultReconcileInterval
+	backoff = 5 * time.Minute
+	consecutiveFailures = 3
+	if !rc.rebaselineReconcileTicker(&lastBase, &consecutiveFailures, &backoff, ticker) {
+		t.Fatal("push recovery did not replace stale failure backoff")
+	}
+	if consecutiveFailures != 0 {
+		t.Fatalf("failure streak=%d after authoritative push recovery, want 0", consecutiveFailures)
 	}
 }
 
@@ -602,34 +645,131 @@ func TestScopedPruneRootKey(t *testing.T) {
 	}
 }
 
+// A local create becomes visible to NFS before JuiceFS necessarily publishes
+// the child into Redis's d{parent} hash. The unversioned metadata pub/sub feed
+// echoes our own create event during that gap. That echo must not clear
+// LocalOnly, and a concurrent partial HGETALL must not prune the later files in
+// a burst. This is the exact live multi-track regression where four valid files
+// were created but two returned ENOENT when reopened immediately.
+func TestScopedPrunePreservesLocalCreateUntilRedisDirectoryConfirmation(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "store.db"))
+	if err != nil {
+		t.Fatalf("Open store: %v", err)
+	}
+	defer store.Close()
+
+	mt := time.Unix(1700000000, 0)
+	parent := MakeEntry("shoot", true, 0, mt, 10)
+	store.InsertToCache(parent)
+	if err := store.Insert(parent); err != nil {
+		t.Fatalf("Insert parent: %v", err)
+	}
+	for i := 0; i < 4; i++ {
+		p := fmt.Sprintf("shoot/track-%02d.mov", i)
+		e := MakeEntry(p, false, 20<<20, mt, uint64(20+i))
+		e.LocalOnly = true
+		store.InsertToCache(e)
+		if err := store.Insert(e); err != nil {
+			t.Fatalf("Insert %s: %v", p, err)
+		}
+	}
+
+	rc := &RedisClient{store: store}
+	markPruneHealthy(rc)
+
+	// The self-write visibility feed is not backend directory confirmation.
+	// Replaying all four creates must leave their LocalOnly protection intact.
+	for i := 0; i < 4; i++ {
+		p := fmt.Sprintf("shoot/track-%02d.mov", i)
+		rc.applyEvent(MetadataEvent{
+			Op: "create", Path: p, Size: 20 << 20,
+			Mtime: mt.Unix(), Inode: uint64(20 + i),
+		})
+		if got := store.LookupByPath(p); got == nil || !got.LocalOnly {
+			t.Fatalf("pub/sub echo cleared LocalOnly for %s: %#v", p, got)
+		}
+	}
+
+	// Redis currently exposes only the first half of the just-created burst.
+	// The later local entries must remain visible rather than being interpreted
+	// as deletes.
+	rc.scopedPrune("shoot", map[string]struct{}{
+		"track-00.mov": {},
+		"track-01.mov": {},
+	})
+	for i := 0; i < 4; i++ {
+		p := fmt.Sprintf("shoot/track-%02d.mov", i)
+		if store.LookupByPath(p) == nil {
+			t.Fatalf("publication-gap prune removed valid local file %s", p)
+		}
+	}
+
+	// Unlike the pub/sub echo, observing a child in the authoritative directory
+	// hash must produce an upsert even when every scalar is unchanged, because
+	// that upsert clears LocalOnly.
+	confirmedPath := "shoot/track-02.mov"
+	upserts, _ := buildReconcileChildEntries(
+		[]dirChild{{inode: 22, childPath: confirmedPath, mode: 0o644}},
+		map[uint64][]byte{22: encodeInodeAttr(mt.Unix(), 20<<20)},
+		store.LookupByPath,
+	)
+	if len(upserts) != 1 {
+		t.Fatalf("directory confirmation produced %d upserts, want 1 to clear LocalOnly", len(upserts))
+	}
+	store.InsertToCache(upserts[0])
+	if err := store.Insert(upserts[0]); err != nil {
+		t.Fatalf("persist confirmed child: %v", err)
+	}
+	if got := store.LookupByPath(confirmedPath); got == nil || got.LocalOnly {
+		t.Fatalf("directory confirmation did not clear LocalOnly: %#v", got)
+	}
+}
+
 // ===========================================================================
-// LIVE-REDIS tests (skip cleanly when no local Redis is reachable). These
+// LIVE-REDIS tests require an explicit, caller-owned disposable Redis DB. These
 // exercise reconcileDir end-to-end and the PARITY gate: incremental store
 // state MUST equal a fresh full-SCAN store state over the same Redis data.
 // ===========================================================================
 
-const liveTestRedisURL = "redis://127.0.0.1:6379/15" // db 15: throwaway test db
+func metadataLiveTestRedisURL() string {
+	return os.Getenv("JM_TEST_METADATA_REDIS")
+}
 
 func liveRedisOrSkip(t *testing.T) *redis.Client {
 	t.Helper()
-	addr, db, _ := ParseRedisURL(liveTestRedisURL)
-	rdb := redis.NewClient(&redis.Options{Addr: addr, DB: db, DialTimeout: 1 * time.Second})
-	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
-	defer cancel()
+	url := metadataLiveTestRedisURL()
+	if url == "" {
+		t.Skip("requires JM_TEST_METADATA_REDIS pointing at a caller-owned disposable Redis database")
+	}
+	opts, err := redisurl.Parse(url)
+	if err != nil {
+		t.Fatalf("invalid JM_TEST_METADATA_REDIS: %v", err)
+	}
+	opts.DialTimeout = time.Second
+	opts.ReadTimeout = time.Second
+	opts.WriteTimeout = time.Second
+	opts.ContextTimeoutEnabled = true
+	opts.MaxRetries = -1
+	rdb := redis.NewClient(opts)
+	t.Cleanup(func() { _ = rdb.Close() })
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	if err := rdb.Ping(ctx).Err(); err != nil {
-		rdb.Close()
-		t.Skipf("local Redis not reachable, skipping live test: %v", err)
+		cancel()
+		t.Fatalf("configured JM_TEST_METADATA_REDIS unreachable: %v", err)
 	}
-	if err := rdb.FlushDB(ctx).Err(); err != nil {
-		rdb.Close()
-		t.Skipf("cannot flush test db15, refusing to touch a shared db: %v", err)
-	}
+	cancel()
 	t.Cleanup(func() {
 		ctx2, c2 := context.WithTimeout(context.Background(), 1*time.Second)
 		defer c2()
-		rdb.FlushDB(ctx2)
-		rdb.Close()
+		if err := rdb.FlushDB(ctx2).Err(); err != nil {
+			t.Errorf("cleanup JM_TEST_METADATA_REDIS: %v", err)
+		}
 	})
+	ctx, cancel = context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := rdb.FlushDB(ctx).Err(); err != nil {
+		t.Fatalf("configured JM_TEST_METADATA_REDIS cannot flush: %v", err)
+	}
 	return rdb
 }
 
@@ -709,9 +849,9 @@ func newLiveRC(t *testing.T, rdb *redis.Client) *RedisClient {
 		t.Fatalf("Open store: %v", err)
 	}
 	t.Cleanup(func() { store.Close() })
-	rc, err := NewRedisClient(liveTestRedisURL, store)
+	rc, err := NewRedisClient(metadataLiveTestRedisURL(), store)
 	if err != nil {
-		t.Skipf("Redis not reachable: %v", err)
+		t.Fatalf("configured JM_TEST_METADATA_REDIS unreachable: %v", err)
 	}
 	t.Cleanup(func() { rc.Stop() })
 	return rc

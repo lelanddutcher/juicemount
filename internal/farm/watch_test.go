@@ -113,6 +113,42 @@ func TestWatchPerTickCapAndCarryover(t *testing.T) {
 	}
 }
 
+func TestWatchResolvesSettledInodesConcurrently(t *testing.T) {
+	started := make(chan uint64, 4)
+	release := make(chan struct{})
+	w := NewWatcher(WatchConfig{
+		Resolve: func(_ context.Context, ino uint64) (string, bool) {
+			started <- ino
+			<-release
+			return fmt.Sprintf("dir%d", ino), true
+		},
+		Enqueue:        func(context.Context, string) error { return nil },
+		Settle:         time.Second,
+		Tick:           time.Second,
+		MaxPerTick:     4,
+		ResolveWorkers: 4,
+	})
+	t0 := time.Now()
+	for ino := uint64(10); ino < 14; ino++ {
+		w.Note(ino, t0)
+	}
+
+	done := make(chan int, 1)
+	go func() { done <- w.Tick(context.Background(), t0.Add(2*time.Second)) }()
+	for i := 0; i < 4; i++ {
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			close(release)
+			t.Fatal("settled inode lookups did not run concurrently")
+		}
+	}
+	close(release)
+	if got := <-done; got != 4 {
+		t.Fatalf("enqueued %d concurrently resolved targets, want 4", got)
+	}
+}
+
 func TestWatchDedupeTTL(t *testing.T) {
 	w, got := testWatcher(map[uint64]string{42: "clips/reel1"}, 200)
 	t0 := time.Now()
@@ -131,6 +167,28 @@ func TestWatchDedupeTTL(t *testing.T) {
 	}
 	if len(*got) != 2 {
 		t.Fatalf("total enqueues = %d, want 2", len(*got))
+	}
+}
+
+func TestWatchPrunesOverlappingAncestors(t *testing.T) {
+	w, got := testWatcher(map[uint64]string{
+		10: "Projects",
+		11: "Projects/Film A",
+		12: "Projects/Film A/Reel 1",
+		13: "Projects/Film B/Reel 2",
+	}, 200)
+	t0 := time.Now()
+	for _, inode := range []uint64{10, 11, 12, 13} {
+		w.Note(inode, t0)
+	}
+	if n := w.Tick(context.Background(), t0.Add(2*time.Minute)); n != 2 {
+		t.Fatalf("enqueued %d overlapping targets, want 2 leaf batches (%v)", n, *got)
+	}
+	want := map[string]bool{"Projects/Film A/Reel 1": true, "Projects/Film B/Reel 2": true}
+	for _, path := range *got {
+		if !want[path] {
+			t.Fatalf("unexpected overlapping batch %q (all=%v)", path, *got)
+		}
 	}
 }
 
@@ -188,7 +246,7 @@ func TestWatchDirtyOverflow(t *testing.T) {
 
 func TestWatchKindsFromEnv(t *testing.T) {
 	t.Setenv("JM_FARM_WATCH_KINDS", "")
-	if k := WatchKindsFromEnv(); len(k) != 1 || k[0] != "derivatives" {
+	if k := WatchKindsFromEnv(); len(k) != 3 || k[0] != "derivatives" || k[1] != "proxy" || k[2] != "transcript" {
 		t.Fatalf("default kinds = %v", k)
 	}
 	t.Setenv("JM_FARM_WATCH_KINDS", "derivatives, transcript")
@@ -202,5 +260,29 @@ func TestWatchKindsFromEnv(t *testing.T) {
 	t.Setenv("JM_FARM_WATCH", "")
 	if !WatchEnabled() {
 		t.Fatal("default should be enabled")
+	}
+}
+
+func TestWatchPausePreservesDirtyWork(t *testing.T) {
+	enabled := false
+	var got []string
+	w := NewWatcher(WatchConfig{
+		Settle:  time.Second,
+		Tick:    time.Second,
+		Enabled: func(context.Context) bool { return enabled },
+		Resolve: func(context.Context, uint64) (string, bool) { return "ingest/reel-1", true },
+		Enqueue: func(_ context.Context, path string) error {
+			got = append(got, path)
+			return nil
+		},
+	})
+	t0 := time.Now()
+	w.Note(42, t0)
+	if n := w.Tick(context.Background(), t0.Add(2*time.Second)); n != 0 {
+		t.Fatalf("paused watcher enqueued %d jobs", n)
+	}
+	enabled = true
+	if n := w.Tick(context.Background(), t0.Add(3*time.Second)); n != 1 || len(got) != 1 {
+		t.Fatalf("resume enqueued %d jobs, got %v", n, got)
 	}
 }

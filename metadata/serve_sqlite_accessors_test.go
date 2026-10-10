@@ -2,7 +2,6 @@ package metadata
 
 import (
 	"os"
-	"reflect"
 	"sort"
 	"testing"
 	"time"
@@ -15,8 +14,8 @@ import (
 // SAME seeded store, proving JM_SERVE_FROM_SQLITE=1 returns identical results.
 // seedStore lives in serve_sqlite_test.go (Item 1).
 
-// entryEqual compares the load-bearing fields (ignores PreSerializedGetAttr,
-// which is a lazy per-access cache, not stored metadata).
+// entryEqual compares the load-bearing fields and ignores the lazy, RAM-only
+// GETATTR cache.
 func entryEqual(a, b *Entry) bool {
 	if a == nil || b == nil {
 		return a == b
@@ -142,8 +141,8 @@ func TestServeParity_EmptyDir(t *testing.T) {
 }
 
 // TestServeFlagOff_UsesRAM confirms the PUBLIC accessors read RAM when the flag
-// is unset (default). This is the rollback guarantee: flag off = RAM path
-// unchanged.
+// is unset (default). The accessor returns a stable snapshot rather than
+// exposing the mutable cache entry to concurrent Store writers.
 func TestServeFlagOff_UsesRAM(t *testing.T) {
 	if os.Getenv("JM_SERVE_FROM_SQLITE") == "1" {
 		t.Skip("JM_SERVE_FROM_SQLITE=1 in env; this test asserts the default-off path")
@@ -153,14 +152,14 @@ func TestServeFlagOff_UsesRAM(t *testing.T) {
 	if serveFromSQLite() {
 		t.Fatalf("serveFromSQLite() true with flag unset — default must be OFF")
 	}
-	// Public accessor must equal the RAM helper (same pointer even, since RAM
-	// returns the cached *Entry directly).
+	// Both accessors use the RAM substrate and return equivalent, independent
+	// snapshots. Pointer inequality is the concurrency-safety contract.
 	pub := s.LookupByPath("dir/file_000001.mov")
 	ram := s.lookupByPathRAM("dir/file_000001.mov")
-	if pub != ram {
-		t.Fatalf("public LookupByPath did not return the RAM cache entry with flag off")
+	if pub == ram {
+		t.Fatalf("public LookupByPath exposed the same mutable RAM cache pointer")
 	}
-	if !reflect.DeepEqual(pub, ram) {
+	if !entryEqual(pub, ram) {
 		t.Fatalf("public vs RAM entry differ with flag off")
 	}
 }

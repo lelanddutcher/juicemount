@@ -1,0 +1,138 @@
+package juicefarm
+
+import (
+	"os"
+	"regexp"
+	"strings"
+	"testing"
+)
+
+var pinnedSHAArg = regexp.MustCompile(`(?m)^ARG ([A-Z_]+_COMMIT)=([0-9a-f]{40})$`)
+
+func dockerfile(t *testing.T, path string) string {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
+}
+
+func commitArg(t *testing.T, src, name string) string {
+	t.Helper()
+	for _, match := range pinnedSHAArg.FindAllStringSubmatch(src, -1) {
+		if match[1] == name {
+			return match[2]
+		}
+	}
+	t.Fatalf("%s is not pinned to a full commit SHA", name)
+	return ""
+}
+
+func TestWorkerDockerfilesPinSourceAndBakedModel(t *testing.T) {
+	cpu := dockerfile(t, "Dockerfile")
+	gpu := dockerfile(t, "../juicefarm-gpu/Dockerfile")
+
+	cpuWhisper := commitArg(t, cpu, "WHISPER_CPP_COMMIT")
+	gpuWhisper := commitArg(t, gpu, "WHISPER_CPP_COMMIT")
+	if cpuWhisper != gpuWhisper {
+		t.Fatalf("CPU/GPU whisper revisions differ: %s != %s", cpuWhisper, gpuWhisper)
+	}
+	for name, src := range map[string]string{"CPU": cpu, "GPU": gpu} {
+		if strings.Contains(src, "git clone --depth 1 https://github.com/ggml-org/whisper.cpp") {
+			t.Fatalf("%s worker regressed to an unpinned whisper.cpp clone", name)
+		}
+		if !strings.Contains(src, "fetch --depth 1 origin ${WHISPER_CPP_COMMIT}") ||
+			!strings.Contains(src, `test "$(git -C /w rev-parse HEAD)" = "${WHISPER_CPP_COMMIT}"`) {
+			t.Fatalf("%s worker does not fetch and verify its pinned whisper.cpp commit", name)
+		}
+		if !strings.Contains(src, "ARG WHISPER_MODEL_SHA256=") ||
+			!strings.Contains(src, "${WHISPER_MODEL_SHA256}  models/ggml-${WHISPER_MODEL}.bin") {
+			t.Fatalf("%s worker does not checksum its baked speech model", name)
+		}
+	}
+
+	commitArg(t, gpu, "SPIRV_HEADERS_COMMIT")
+	commitArg(t, gpu, "VULKAN_HEADERS_COMMIT")
+}
+
+func TestCPUWorkerUsesModernFFmpegRuntime(t *testing.T) {
+	cpu := dockerfile(t, "Dockerfile")
+
+	for _, required := range []string{
+		"FROM juicedata/mount:ce-v1.3.1 AS juicefs",
+		"FROM debian:trixie-slim",
+		"RUN mkdir -p /juicemount-runtime/usr/local/bin /juicemount-runtime/usr/lib",
+		"if [ -f /usr/lib/libfdb_c.so ]; then",
+		"COPY --from=juicefs /juicemount-runtime/ /",
+	} {
+		if !strings.Contains(cpu, required) {
+			t.Fatalf("CPU worker runtime no longer contains %q", required)
+		}
+	}
+	if strings.Contains(cpu, "COPY --from=juicefs /usr/lib/libfdb_c.so /usr/lib/libfdb_c.so") {
+		t.Fatal("CPU worker regressed to an unconditional amd64-only FoundationDB library copy")
+	}
+	if strings.Contains(cpu, "FROM juicedata/mount:ce-v1.3.1\n") {
+		t.Fatal("CPU worker regressed to the Debian 11 JuiceFS runtime with ffmpeg 4.3")
+	}
+}
+
+func TestWorkerImagesRequireAndVerifyExactReleaseIdentity(t *testing.T) {
+	for name, src := range map[string]string{
+		"CPU": dockerfile(t, "Dockerfile"),
+		"GPU": dockerfile(t, "../juicefarm-gpu/Dockerfile"),
+	} {
+		for _, forbidden := range []string{"ARG JM_COMMIT=unknown", "ARG JM_VERSION=0.5.0"} {
+			if strings.Contains(src, forbidden) {
+				t.Fatalf("%s worker still permits default release identity %q", name, forbidden)
+			}
+		}
+		if !strings.Contains(src, `grep -Eq '^[0-9a-f]{40}$'`) {
+			t.Fatalf("%s worker does not reject a missing or abbreviated commit", name)
+		}
+		if !strings.Contains(src, `jmfarm --build-info`) {
+			t.Fatalf("%s worker does not execute its final binary to verify embedded identity", name)
+		}
+	}
+}
+
+func TestDeploymentDoesNotPinProducerGeneration(t *testing.T) {
+	entrypoint := dockerfile(t, "entrypoint.sh")
+	compose := dockerfile(t, "../docker-compose.yml")
+	for name, src := range map[string]string{"entrypoint": entrypoint, "compose": compose} {
+		if strings.Contains(src, "JM_FARM_PRODUCER_VERSION=") || strings.Contains(src, `-version "$`) {
+			t.Fatalf("%s pins the producer generation; release builds must derive it from their exact embedded commit", name)
+		}
+	}
+}
+
+// go.mod replaces modules with in-repo directories (third_party/juicefs). A
+// Dockerfile that runs `go mod download` after copying only go.mod/go.sum
+// fails before compiling anything, so every image was unbuildable from a clean
+// tree. Each local replace target must be copied before the download.
+func TestDockerfilesCopyLocalReplacesBeforeModDownload(t *testing.T) {
+	gomod := dockerfile(t, "../../go.mod")
+	local := regexp.MustCompile(`(?m)=>\s+(\./\S+)`).FindAllStringSubmatch(gomod, -1)
+	if len(local) == 0 {
+		t.Fatal("expected at least one local replace in go.mod")
+	}
+	for _, path := range []string{
+		"Dockerfile", "Dockerfile.binary-only",
+		"../juicefarm-gpu/Dockerfile", "../juicemount-server/Dockerfile",
+		"../juicemount-manager/Dockerfile", "../juicemount-manager/Dockerfile.binary-only",
+	} {
+		src := dockerfile(t, path)
+		download := strings.Index(src, "go mod download")
+		if download < 0 {
+			t.Fatalf("%s: no go mod download", path)
+		}
+		for _, m := range local {
+			dir := strings.TrimPrefix(m[1], "./")
+			copyAt := strings.Index(src, "COPY "+dir+" ")
+			if copyAt < 0 || copyAt > download {
+				t.Errorf("%s: %s must be copied before go mod download", path, dir)
+			}
+		}
+	}
+}

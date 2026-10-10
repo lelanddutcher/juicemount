@@ -36,6 +36,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/lelanddutcher/juicemount/internal/redisurl"
 	"github.com/redis/go-redis/v9"
 	"golang.org/x/crypto/ssh"
 )
@@ -673,13 +674,13 @@ func (a *API) handleDestinationTest(w http.ResponseWriter, r *http.Request, name
 //
 //   - file:   os.Stat the path; verify directory + writable.
 //   - s3/b2:  HEAD <endpoint>/<bucket>. We use raw HTTP rather than an
-//             SDK to keep the dependency surface small; the response
-//             code distinguishes 200 (ok), 403 (auth), 404 (bucket not
-//             found), 0 (network).
+//     SDK to keep the dependency surface small; the response
+//     code distinguishes 200 (ok), 403 (auth), 404 (bucket not
+//     found), 0 (network).
 //   - sftp:   SSH dial + handshake + close. Does not open a session;
-//             the auth handshake is enough.
+//     the auth handshake is enough.
 //   - webdav: PROPFIND on the root with Depth: 0. Servers return 207
-//             Multi-Status on success.
+//     Multi-Status on success.
 //   - jfs:    Redis PING against the meta_url.
 //
 // For test-only HTTP probes (s3, b2, webdav) we use a short HTTP
@@ -904,17 +905,15 @@ func testConnectionJFS(ctx context.Context, cfg map[string]string) error {
 	if !strings.HasPrefix(meta, "redis://") && !strings.HasPrefix(meta, "rediss://") {
 		return errors.New("only redis://… meta URLs are supported by the jfs probe (set meta_url accordingly)")
 	}
-	addr, db, err := parseRedisAddr(meta)
+	opts, err := redisurl.Parse(meta)
 	if err != nil {
 		return fmt.Errorf("meta_url parse: %w", err)
 	}
-	rdb := redis.NewClient(&redis.Options{
-		Addr:         addr,
-		DB:           db,
-		DialTimeout:  4 * time.Second,
-		ReadTimeout:  4 * time.Second,
-		WriteTimeout: 4 * time.Second,
-	})
+	opts.DialTimeout = 4 * time.Second
+	opts.ReadTimeout = 4 * time.Second
+	opts.WriteTimeout = 4 * time.Second
+	opts.ContextTimeoutEnabled = true
+	rdb := redis.NewClient(opts)
 	defer rdb.Close()
 	pong, err := rdb.Ping(ctx).Result()
 	if err != nil {

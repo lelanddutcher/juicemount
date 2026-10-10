@@ -1,0 +1,47 @@
+--- a/pkg/chunk/cached_store.go
++++ b/pkg/chunk/cached_store.go
+@@ -27,6 +27,7 @@
+ 	"strconv"
+ 	"strings"
+ 	"sync"
++	"sync/atomic"
+ 	"time"
+ 
+ 	"github.com/juicedata/juicefs/pkg/compress"
+@@ -269,12 +270,12 @@
+ // slice for write only
+ type wSlice struct {
+ 	rSlice
+-	pages       [][]*Page
+-	uploaded    int
+-	errors      chan error
+-	uploadError error
+-	pendings    int
+-	writeback   bool
++	pages        [][]*Page
++	uploaded     int
++	errors       chan error
++	uploadFailed atomic.Bool
++	pendings     int
++	writeback    bool
+ }
+ 
+ func sliceForWrite(id uint64, store *cachedStore) *wSlice {
+@@ -412,7 +413,7 @@
+ 	}
+ 	for ; try < max; try++ {
+ 		time.Sleep(time.Second * time.Duration(try*try))
+-		if s != nil && s.uploadError != nil {
++		if s != nil && s.uploadFailed.Load() {
+ 			err = fmt.Errorf("(cancelled) upload block %s: %s (after %d tries)", key, err, try)
+ 			break
+ 		}
+@@ -534,7 +535,7 @@
+ 	}
+ 	for i := 0; i < s.pendings; i++ {
+ 		if err := <-s.errors; err != nil {
+-			s.uploadError = err
++			s.uploadFailed.Store(true)
+ 			return err
+ 		}
+ 	}

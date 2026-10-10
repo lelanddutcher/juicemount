@@ -1,0 +1,30 @@
+{
+  "comment": "Shared by internal/credstore (Go) and app/JuiceMount/Tests/RedisCredentialMigrationProbe.swift. Both sides must produce exactly these strings.",
+  "redis_accounts": [
+    {"url": "redis://mac-edit2:s3cr%3Aet@NAS.local:30179/1?x=1", "account": "redis://mac-edit2@nas.local:30179"},
+    {"url": "redis://mac-edit2@nas.local/1", "account": "redis://mac-edit2@nas.local:6379"},
+    {"url": "redis://:pw@10.0.0.5:6379/1", "account": "redis://10.0.0.5:6379"},
+    {"url": "REDISS://u@h:1", "account": "rediss://u@h:1"},
+    {"url": "redis://mac%2Dedit2@nas.local:30179/1", "account": "redis://mac-edit2@nas.local:30179"},
+    {"url": "redis://a+b@nas.local:30179/1", "account": "redis://a%2Bb@nas.local:30179"},
+    {"url": "redis://a%40b@nas.local:30179/1", "account": "redis://a%40b@nas.local:30179"},
+    {"url": "redis://mac-edit2@[FD00::1]:30179/1", "account": "redis://mac-edit2@[fd00::1]:30179"},
+    {"url": "redis://[fd00::1]/1", "account": "redis://[fd00::1]:6379"},
+    {"url": " redis://u@h:1/1 ", "account": "redis://u@h:1"}
+  ],
+  "link_accounts": [
+    {"url": " https://hs.example/ ", "account": "https://hs.example"},
+    {"url": "https://hs.example", "account": "https://hs.example"}
+  ],
+  "password_urls": [
+    {"url": "redis://mac-edit2@nas.local:30179/1", "password": "a+b=c$d&e,f;g:h@i/j%k", "canonical": "redis://mac-edit2:a%2Bb%3Dc%24d%26e%2Cf%3Bg%3Ah%40i%2Fj%25k@nas.local:30179/1"},
+    {"url": "redis://nas.local:30179/1", "password": "pw", "canonical": "redis://:pw@nas.local:30179/1"},
+    {"url": "redis://mac%2Dedit2@nas.local:30179/1", "password": "p+w", "canonical": "redis://mac-edit2:p%2Bw@nas.local:30179/1"}
+  ],
+  "canonical_urls": [
+    {"url": "redis://mac-edit2:a+b=c$d&e,f;g@nas.local:30179/1", "canonical": "redis://mac-edit2:a%2Bb%3Dc%24d%26e%2Cf%3Bg@nas.local:30179/1"},
+    {"url": "redis://mac-edit2:a%2bb%3dc@nas.local:30179/1", "canonical": "redis://mac-edit2:a%2Bb%3Dc@nas.local:30179/1"},
+    {"url": "redis://mac-edit2@nas.local:30179/1", "canonical": "redis://mac-edit2@nas.local:30179/1"},
+    {"url": "redis://nas.local:30179/1", "canonical": "redis://nas.local:30179/1"}
+  ]
+}

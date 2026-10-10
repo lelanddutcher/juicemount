@@ -2,16 +2,21 @@
 #
 # Triggers:
 #   - push to main / production-hardening  → tags: <branch>, <branch>-<sha>
-#   - tag push matching v*.*.*             → tags: <version>, latest
+#   - tag push matching v*.*.*             → tag: <version>
 #
-# Three images are published in parallel as a matrix job:
+# Five runtime images plus one compatibility alias are published in parallel:
 #   ghcr.io/<owner>/juicemount-server    NFSv3 gateway daemon
 #   ghcr.io/<owner>/juicemount-manager   data-migration / control-plane web UI (new name)
 #   ghcr.io/<owner>/juicemount-migrator  legacy alias of juicemount-manager
 #                                        (SLICE 0 compat tag; both images are
 #                                        built from server/juicemount-manager/Dockerfile
-#                                        for the transition period — drop after
-#                                        two releases per docs/ROADMAP/juicemount-manager.md §3.6).
+#                                        for the transition period).
+#   ghcr.io/<owner>/juicefarm            CPU derivative/transcription worker
+#   ghcr.io/<owner>/juicefarm-gpu        Intel VAAPI/Vulkan render worker
+#   ghcr.io/<owner>/jm-respproxy         authenticated Redis gateway
+#
+# The stable `latest` channel is promoted separately after a release is
+# accepted. A preview tag must never move that mutable channel.
 #
 # Multi-arch (amd64 + arm64) so the same images run on Intel + Apple
 # Silicon TrueNAS hosts and on Synology/QNAP ARM-based NAS units.
@@ -31,7 +36,97 @@ env:
   REGISTRY: ghcr.io
 
 jobs:
+  quality:
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7.4-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # respproxy history gate must see the published entrypoint ancestry
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Go tests
+        env:
+          JM_REQUIRE_GATE_HISTORY: '1'
+          JM_TEST_LINK_REDIS: redis://127.0.0.1:6379/13
+          JM_TEST_MANAGER_REDIS: redis://127.0.0.1:6379/12
+          JM_TEST_METADATA_REDIS: redis://127.0.0.1:6379/14
+          JM_TEST_REDIS: redis://127.0.0.1:6379/15
+        run: go test -count=1 ./...
+      - name: Redis-backed farm durability tests
+        env:
+          JM_FARM_TEST_REDIS_URL: redis://127.0.0.1:6379/15
+          JM_FARM_TEST_REDIS_FLUSH: '1'
+        run: go test -count=1 ./internal/farmqueue
+      - name: Go vet
+        run: go vet ./...
+      - name: Reachable vulnerability scan
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+      - name: Static release configuration checks
+        env:
+          JM_ADMIN_KEY: ci-only-placeholder-not-a-secret-value
+          MINIO_ROOT_PASSWORD: ci-only-placeholder-not-a-secret-value
+          JM_FARM_STORAGE_CAPACITY_BYTES: '1099511627776'
+          JM_MANAGER_DIGEST: sha256:0000000000000000000000000000000000000000000000000000000000000000
+          JM_RESPPROXY_DIGEST: sha256:0000000000000000000000000000000000000000000000000000000000000000
+          JM_FARM_DIGEST: sha256:0000000000000000000000000000000000000000000000000000000000000000
+          JM_FARM_RENDER_DIGEST: sha256:0000000000000000000000000000000000000000000000000000000000000000
+          JM_REDIS_PROXY_PASSWORD: ci-only-placeholder-not-a-secret-value
+          JM_PROXY_FARM_PASSWORD: ci-only-placeholder-not-a-secret-value
+          JM_PROXY_MANAGER_PASSWORD: ci-only-placeholder-not-a-secret-value
+          JM_PROXY_BG_PASSWORD: ci-only-placeholder-not-a-secret-value
+          JM_PROXY_WEBDAV_PASSWORD: ci-only-placeholder-not-a-secret-value
+          JM_PROXY_ADMIN_PASSWORD: ci-only-placeholder-not-a-secret-value
+          JM_OBJ_CLIENT_SECRET_KEY: ci-only-placeholder-not-a-secret-value
+          JM_OBJ_GC_SECRET_KEY: ci-only-placeholder-not-a-secret-value
+          JM_NET_SERVER_URL: https://link.example.com:30193
+          JM_NET_NAS_ROUTE: 192.0.2.0/24
+        run: |
+          find scripts server/scripts test -type f -name '*.sh' -print0 | xargs -0 -n1 bash -n
+          node --check internal/manager/static/app.js
+          docker compose -f server/docker-compose.yml config --quiet
+          bash server/scripts/update-server.test.sh
+
+  mac-app:
+    runs-on: macos-26
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Build signed-equivalent app
+        env:
+          JM_ADHOC: '1'
+          JM_QUICK: '1'
+        run: scripts/build-app.sh --release
+      - name: Verify exact source identity
+        run: |
+          commit="$(git rev-parse HEAD)"
+          version="$(awk -F'"' '/^var Version = / { print $2; exit }' internal/version/version.go)"
+          scripts/verify-build.sh --app build/JuiceMount.app --version "$version" --commit "$commit"
+          if scripts/verify-build.sh --app build/JuiceMount.app --version "$version" --commit 0000000000000000000000000000000000000000; then
+            echo 'stale-identity negative test unexpectedly passed' >&2
+            exit 1
+          fi
+
   build:
+    needs: [quality, mac-app]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -43,17 +138,31 @@ jobs:
           - name: juicemount-server
             dockerfile: server/juicemount-server/Dockerfile
             description: NFSv3 gateway for JuiceFS — self-hosted media editing (includes embedded manager UI)
+            platforms: linux/amd64,linux/arm64
           - name: juicemount-manager
             dockerfile: server/juicemount-manager/Dockerfile
             description: JuiceMount control-plane web UI (migrations, trash, backups, maintenance, settings)
+            platforms: linux/amd64,linux/arm64
           # SLICE 0 compat alias: same Dockerfile, published as the
           # pre-rename image name so TrueNAS apps with pull_policy:
           # always on the migrator tag keep working through the
-          # transition. Drop this matrix entry two releases after
-          # slice-0 ships (see docs/ROADMAP/juicemount-manager.md §3.6).
+          # transition. Retire it after the compatibility window.
           - name: juicemount-migrator
             dockerfile: server/juicemount-manager/Dockerfile
             description: DEPRECATED — legacy alias of juicemount-manager; drop after two releases
+            platforms: linux/amd64,linux/arm64
+          - name: juicefarm
+            dockerfile: server/juicefarm/Dockerfile
+            description: JuiceMount CPU derivative and transcription worker
+            platforms: linux/amd64,linux/arm64
+          - name: juicefarm-gpu
+            dockerfile: server/juicefarm-gpu/Dockerfile
+            description: JuiceMount Intel VAAPI and Vulkan render worker
+            platforms: linux/amd64
+          - name: jm-respproxy
+            dockerfile: server/respproxy/Dockerfile
+            description: Authenticated Redis gateway for JuiceMount metadata
+            platforms: linux/amd64,linux/arm64
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -71,11 +180,27 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Resolve immutable build identity
+        id: identity
+        shell: bash
+        run: |
+          version="$(awk -F'"' '/^var Version = / { print $2; exit }' internal/version/version.go)"
+          test -n "$version"
+          if [[ "${GITHUB_REF_TYPE}" == tag && "${GITHUB_REF_NAME}" != "v${version}" ]]; then
+            echo "tag ${GITHUB_REF_NAME} does not match source version v${version}" >&2
+            exit 1
+          fi
+          [[ "${GITHUB_SHA}" =~ ^[0-9a-f]{40}$ ]]
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "commit=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+
       - name: Extract metadata for ${{ matrix.name }}
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.name }}
+          flavor: |
+            latest=false
           tags: |
             # branch name on branch push
             type=ref,event=branch
@@ -85,9 +210,6 @@ jobs:
             type=sha,prefix={{branch}}-,format=short,enable=${{ github.ref_type == 'branch' }}
             # semver tags on git tag push
             type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            # 'latest' on release tags only
-            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
           labels: |
             org.opencontainers.image.title=${{ matrix.name }}
             org.opencontainers.image.description=${{ matrix.description }}
@@ -101,10 +223,15 @@ jobs:
           # arm64 build via QEMU is ~3-4x slower than amd64. Keeping it
           # in CI is worth it for the Synology/QNAP ARM cases; revisit
           # if total wall time becomes a real bottleneck.
-          platforms: linux/amd64,linux/arm64
+          platforms: ${{ matrix.platforms }}
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            JM_VERSION=${{ steps.identity.outputs.version }}
+            JM_COMMIT=${{ steps.identity.outputs.commit }}
+          provenance: mode=max
+          sbom: true
           # Per-image GHA cache scope so the matrix jobs don't
           # invalidate each other's layers. juicemount-manager and
           # juicemount-migrator share the same Dockerfile so they

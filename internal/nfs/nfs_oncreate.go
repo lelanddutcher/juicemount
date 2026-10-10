@@ -119,11 +119,11 @@ func onCreate(ctx context.Context, w *response, userHandle Handler) error {
 		if errors.Is(err, syscall.ENOSPC) {
 			return &NFSStatusError{NFSStatusNoSPC, err}
 		}
-		return &NFSStatusError{NFSStatusAccess, err}
+		return writeRefusalStatus(err, NFSStatusAccess)
 	}
 	if err := file.Close(); err != nil {
 		Log.Errorf("Error Creating: %v", err)
-		return &NFSStatusError{NFSStatusAccess, err}
+		return writeRefusalStatus(err, NFSStatusAccess)
 	}
 
 	fp := userHandle.ToHandle(fs, newFile)

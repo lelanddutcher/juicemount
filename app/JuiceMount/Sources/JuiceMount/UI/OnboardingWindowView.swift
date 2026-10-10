@@ -1,36 +1,39 @@
 import SwiftUI
 import AppKit
 import Network
+import Security
 
 // MARK: - Preflight (LB-1)
 //
 // First-run / guided-setup checks. Each check mirrors where the truth
 // already lives on the Go side so the two can't drift:
 //
-//   1. juicefs binary  — same candidate paths as health/fuse.go
-//      findJuiceFSBin (plus $PATH as a last resort there; we check the
-//      fixed paths, which is what a Homebrew or pkg install produces).
+//   1. juicefs binary  — the pinned, patched JuiceFS the app ships at
+//      Contents/MacOS/juicefs, the only one health/fuse.go findJuiceFSBin
+//      will run (no PATH or Homebrew). It must report the version
+//      build-app.sh stamped into Info.plist and carry the app's signer.
 //   2. macFUSE         — /Library/Filesystems/macfuse.fs, the filesystem
 //      bundle the macFUSE installer drops.
 //   3. backend         — short TCP dial to the host:port parsed from the
 //      Redis URL in Preferences (the metadata server; if this is down,
 //      start() is guaranteed to fail).
-//   4. mount privilege — informational: probes `sudo -n /sbin/mount_nfs`
-//      exactly like bridge/cbridge.go runMountViaSudo. Pass = mounting is
-//      prompt-free; fail = macOS will show ONE admin prompt per session
-//      (expected for end users; the scoped sudoers snippet from
-//      docs/dev-setup.md removes it).
+//   4. mount permission — informational text only. The mount helper asks
+//      for administrator approval when it must create the mount folder.
+//      H-3 (2026-10-06): the former passwordless-privilege probe and its
+//      copyable rule are gone. That rule also granted a path-based
+//      force-unmount, which JuiceMount must never perform.
 
 struct PreflightReport: Sendable, Equatable {
     var juicefsPath: String?
+    /// Why the bundled JuiceFS failed its check; nil when it passed.
+    var juicefsProblem: String?
     var macFUSEInstalled: Bool = false
     var backendReachable: Bool = false
     /// host:port we dialed, or a parse-failure explanation.
     var backendDetail: String = ""
-    var passwordlessSudo: Bool = false
 
-    /// The checks a successful start() actually depends on. The sudoers
-    /// row is deliberately NOT critical — the admin-prompt path works.
+    /// The checks a successful start() actually depends on. The mount
+    /// permission row is informational and never critical.
     var criticalOK: Bool {
         juicefsPath != nil && macFUSEInstalled && backendReachable
     }
@@ -38,33 +41,21 @@ struct PreflightReport: Sendable, Equatable {
 
 enum OnboardingPreflight {
 
-    /// Mirror of health/fuse.go findJuiceFSBin's fixed candidates.
-    static let juicefsCandidates = [
-        "/opt/homebrew/bin/juicefs",
-        "/usr/local/bin/juicefs",
-        "/usr/bin/juicefs",
-    ]
-
     static let macFUSEBundlePath = "/Library/Filesystems/macfuse.fs"
 
-    /// Scoped sudoers snippet (docs/dev-setup.md) offered with a copy
-    /// button so power users can skip the per-session admin prompt.
-    static let sudoersSnippet = """
-        sudo tee /etc/sudoers.d/juicemount-mount >/dev/null <<EOF
-        # JuiceMount passwordless mount/unmount (see docs/dev-setup.md).
-        %admin ALL=(ALL) NOPASSWD: /sbin/mount_nfs, /sbin/umount, /bin/mkdir
-        EOF
-        sudo chmod 0440 /etc/sudoers.d/juicemount-mount
-        sudo visudo -c -f /etc/sudoers.d/juicemount-mount
-        """
-
-    /// Run every check. Blocking pieces (TCP dial, sudo probe) happen off
-    /// the calling actor; total worst case ≈ the dial timeout (3 s).
+    /// Run every check. The blocking piece (TCP dial) happens off the
+    /// calling actor; total worst case ≈ the dial timeout (3 s).
     static func run(redisURL: String) async -> PreflightReport {
         var report = PreflightReport()
-        report.juicefsPath = juicefsCandidates.first {
-            FileManager.default.isExecutableFile(atPath: $0)
-        } ?? pathLookup("juicefs")
+        let juicefs = await Task.detached(priority: .userInitiated) {
+            BundledJuiceFS.check(
+                executable: Bundle.main.executableURL,
+                expectedVersion: Bundle.main.object(forInfoDictionaryKey: BundledJuiceFS.versionInfoKey) as? String)
+        }.value
+        switch juicefs {
+        case .success(let path): report.juicefsPath = path
+        case .failure(let problem): report.juicefsProblem = problem.message
+        }
         report.macFUSEInstalled = FileManager.default.fileExists(atPath: macFUSEBundlePath)
 
         switch parseRedisHostPort(redisURL) {
@@ -76,28 +67,7 @@ enum OnboardingPreflight {
             report.backendReachable = false
         }
 
-        report.passwordlessSudo = await Task.detached(priority: .userInitiated) {
-            passwordlessSudoAvailable()
-        }.value
         return report
-    }
-
-    /// PATH fallback mirroring health/fuse.go findJuiceFSBin's
-    /// exec.LookPath tier (Phase 3 review follow-up: without this, an
-    /// unconventional install passes the Go side's check at start but
-    /// fails the Swift preflight — the assistant blocks a launch that
-    /// would have worked). Searches the app process's PATH, same
-    /// semantics as Go's exec.LookPath, no subprocess needed.
-    static func pathLookup(_ binary: String) -> String? {
-        guard let pathEnv = ProcessInfo.processInfo.environment["PATH"],
-              !pathEnv.isEmpty else { return nil }
-        for dir in pathEnv.split(separator: ":") where !dir.isEmpty {
-            let candidate = "\(dir)/\(binary)"
-            if FileManager.default.isExecutableFile(atPath: candidate) {
-                return candidate
-            }
-        }
-        return nil
     }
 
     /// Parses "redis://host:port/db" (or bare "host:port") into a dial
@@ -110,14 +80,24 @@ enum OnboardingPreflight {
     static func parseRedisHostPort(_ raw: String) -> ParseResult {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return .failure("Redis URL is empty — set it in Preferences") }
-        // URLComponents handles the redis:// scheme fine; fall back to a
-        // bare host:port for hand-typed values.
+        // The Go client accepts redis://, rediss://, or a bare host:port.
+        // Do not let an unrelated scheme look healthy
+        // merely because its host happens to accept a TCP connection.
+        if trimmed.contains("://") && !trimmed.hasPrefix("redis://") && !trimmed.hasPrefix("rediss://") {
+            return .failure("Use redis://host:port/db or rediss://host:port/db")
+        }
+        // URLComponents handles the redis:// scheme; fall back to a bare
+        // host:port for hand-typed values. Never echo the input in an error:
+        // a Redis URL may contain credentials.
         let withScheme = trimmed.contains("://") ? trimmed : "redis://\(trimmed)"
         guard let comps = URLComponents(string: withScheme), let host = comps.host, !host.isEmpty else {
-            return .failure("Can't parse Redis URL \"\(trimmed)\"")
+            return .failure("Redis URL needs a valid host and optional port (redis://host:port/db)")
         }
-        let port = UInt16(clamping: comps.port ?? 6379)
-        return .success((host, port))
+        let port = comps.port ?? 6379
+        guard (1...65535).contains(port) else {
+            return .failure("Redis port must be between 1 and 65535")
+        }
+        return .success((host, UInt16(port)))
     }
 
     /// Short TCP dial via Network.framework. True iff the connection
@@ -171,28 +151,6 @@ enum OnboardingPreflight {
             }
         }
     }
-
-    /// Same probe shape as bridge/cbridge.go runMountViaSudo: run one of
-    /// the actually-allowed binaries under `sudo -n` and look for sudo's
-    /// "password is required" gate. mount_nfs printing usage and exiting
-    /// non-zero is SUCCESS for our purposes (sudo let it through).
-    static func passwordlessSudoAvailable() -> Bool {
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/usr/bin/sudo")
-        p.arguments = ["-n", "/sbin/mount_nfs"]
-        let pipe = Pipe()
-        p.standardOutput = pipe
-        p.standardError = pipe
-        do {
-            try p.run()
-        } catch {
-            return false
-        }
-        p.waitUntilExit()
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        let out = String(data: data, encoding: .utf8) ?? ""
-        return !out.contains("password is required")
-    }
 }
 
 // MARK: - Welcome window (LB-1)
@@ -208,9 +166,12 @@ struct OnboardingWindowView: View {
     let onContinue: () -> Void
 
     @State private var report: PreflightReport?
+    @State private var permissions: PermissionReport?
     @State private var checking = false
-    @State private var showSudoersSnippet = false
-    @State private var copiedSnippet = false
+    @State private var recheck = SingleFlight()
+    /// H-3 L3: privileged eject helper. nil while the first check runs.
+    @State private var helper: UnmountHelperReadiness?
+    @State private var helperBusy = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -226,16 +187,35 @@ struct OnboardingWindowView: View {
 
             Divider()
 
-            // Checklist
+            VStack(alignment: .leading, spacing: 5) {
+                Toggle("Use this Mac's existing private network", isOn: Binding(
+                    get: { server.preferences.useExistingPrivateNetwork },
+                    set: { server.preferences.useExistingPrivateNetwork = $0 }
+                ))
+                if server.preferences.useExistingPrivateNetwork {
+                    Text("Connect this Mac to your NAS through Tailscale or your trusted VPN. In Preferences → Connection, set Redis URL to the NAS's private address. Set the S3 endpoint override only if the stored object-store address is unreachable from this Mac. No JuiceMount Link pairing code is needed.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                } else {
+                    Text("Configure JuiceMount Link in Preferences → Connection before starting.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            // Keep the checklist scrollable as repair hints expand so Re-check
+            // and Continue stay visible in the fixed-size setup window.
+            ScrollView {
             VStack(alignment: .leading, spacing: 12) {
                 checkRow(
                     ok: report.map { $0.juicefsPath != nil },
                     title: "JuiceFS engine",
                     passDetail: report?.juicefsPath ?? "",
-                    failDetail: "The juicefs binary wasn't found.",
-                    fixHint: "Install it with Homebrew:"
+                    failDetail: report?.juicefsProblem ?? "The bundled JuiceFS engine failed its check.",
+                    fixHint: "JuiceFS ships inside JuiceMount. Reinstall JuiceMount from a signed download, then re-check."
                 ) {
-                    copyableCommand("brew install juicefs")
+                    EmptyView()
                 }
 
                 checkRow(
@@ -251,10 +231,12 @@ struct OnboardingWindowView: View {
 
                 checkRow(
                     ok: report.map(\.backendReachable),
-                    title: "Storage backend",
-                    passDetail: "Reachable at \(report?.backendDetail ?? "")",
-                    failDetail: "Can't reach the metadata server (\(report?.backendDetail ?? "")).",
-                    fixHint: "Check that your server is running (server/juicemount-server compose stack) and that the Redis URL in Preferences points at it."
+                    title: "Redis connection",
+                    passDetail: "TCP connection succeeded at \(report?.backendDetail ?? ""). This does not verify TLS, Redis authentication, or access to stored files.",
+                    failDetail: "Can't reach Redis (\(report?.backendDetail ?? "")).",
+                    fixHint: server.preferences.useExistingPrivateNetwork
+                        ? "Check that this Mac's private network is connected. In Preferences → Connection, enter the NAS's private Redis address, then Re-check. A JuiceMount Link pairing code is not required."
+                        : "Check that the server is running and the Redis URL in Preferences → Connection points at it. Link pairing is checked when JuiceMount starts."
                 ) {
                     Button("Open Preferences…") {
                         (NSApp.delegate as? AppDelegate)?.menuBarController?.openPreferencesWindow()
@@ -262,63 +244,48 @@ struct OnboardingWindowView: View {
                     .controlSize(.small)
                 }
 
-                // Mount privilege — informational, never blocks Continue.
-                VStack(alignment: .leading, spacing: 4) {
-                    HStack(alignment: .firstTextBaseline, spacing: 8) {
-                        statusGlyph(ok: report.map(\.passwordlessSudo), infoStyle: true)
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("Mount permission")
-                                .font(.body.weight(.medium))
-                            if let r = report {
-                                if r.passwordlessSudo {
-                                    Text("Passwordless mount is configured — no prompts.")
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                } else {
-                                    Text("macOS will ask for your administrator password once per session to mount the volume. That's normal. To make it prompt-free, add a scoped sudoers rule:")
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                        .fixedSize(horizontal: false, vertical: true)
-                                }
-                            } else {
-                                Text("Checking…")
-                                    .font(.caption)
-                                    .foregroundStyle(.tertiary)
-                            }
-                        }
-                        Spacer()
+                Divider()
+                Text("macOS permissions")
+                    .font(.subheadline.weight(.semibold))
+
+                permissionRow(
+                    status: permissions?.serviceApproval,
+                    title: "Background service",
+                    fixTitle: "Open Login Items…",
+                    fix: { SystemSettingsLinks.openLoginItems() }
+                )
+                helperRow
+                permissionRow(
+                    status: permissions?.localNetwork,
+                    title: "Local Network",
+                    fixTitle: "Open Local Network Settings…",
+                    fix: { SystemSettingsLinks.open(SystemSettingsLinks.localNetwork) }
+                )
+                permissionRow(
+                    status: permissions?.networkVolumes,
+                    title: "Network Volumes",
+                    fixTitle: "Open Files & Folders Settings…",
+                    fix: { SystemSettingsLinks.open(SystemSettingsLinks.filesAndFolders) }
+                )
+
+                // Mount permission — informational, never blocks Continue.
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Image(systemName: "info.circle.fill")
+                        .foregroundStyle(.blue)
+                        .frame(width: 16)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Mount permission")
+                            .font(.body.weight(.medium))
+                        Text("macOS may ask for your administrator password when JuiceMount creates the mount folder, and separately ask JuiceMount for permission to access network volumes.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
-                    if let r = report, !r.passwordlessSudo {
-                        DisclosureGroup(isExpanded: $showSudoersSnippet) {
-                            VStack(alignment: .leading, spacing: 6) {
-                                Text(OnboardingPreflight.sudoersSnippet)
-                                    .font(.caption2.monospaced())
-                                    .textSelection(.enabled)
-                                    .padding(8)
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                                    .background(
-                                        RoundedRectangle(cornerRadius: 6)
-                                            .fill(Color.secondary.opacity(0.1))
-                                    )
-                                Button(copiedSnippet ? "Copied" : "Copy to Clipboard") {
-                                    let pb = NSPasteboard.general
-                                    pb.clearContents()
-                                    pb.setString(OnboardingPreflight.sudoersSnippet, forType: .string)
-                                    copiedSnippet = true
-                                }
-                                .controlSize(.small)
-                            }
-                            .padding(.top, 4)
-                        } label: {
-                            Text("Show terminal snippet (optional)")
-                                .font(.caption)
-                        }
-                        .padding(.leading, 24)
-                    }
+                    Spacer()
                 }
             }
-
-            Spacer(minLength: 4)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
 
             // Footer
             HStack {
@@ -339,7 +306,15 @@ struct OnboardingWindowView: View {
                 Spacer()
 
                 Button(continueTitle) {
-                    onContinue()
+                    switch server.state {
+                    case .error, .disconnected:
+                        // Continue from a failed state stops everything and
+                        // then starts (MenuBarController). Run the helper
+                        // gate first so a refusal stops nothing.
+                        server.helperGatedLifecycle { onContinue() }
+                    default:
+                        onContinue()
+                    }
                 }
                 .keyboardShortcut(.defaultAction)
                 .disabled(checking && report == nil)
@@ -349,6 +324,16 @@ struct OnboardingWindowView: View {
         .frame(width: 480)
         .frame(minHeight: 430)
         .onAppear { runChecks() }
+        // Re-check when the user comes back from System Settings. runChecks
+        // is single-flight and every probe is bounded, so repeated focus
+        // changes cannot stack work or hang the window.
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            runChecks()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { note in
+            guard (note.object as? NSWindow)?.identifier?.rawValue == "OnboardingWindow" else { return }
+            runChecks()
+        }
     }
 
     private var continueTitle: String {
@@ -357,20 +342,158 @@ struct OnboardingWindowView: View {
     }
 
     private func runChecks() {
-        checking = true
-        copiedSnippet = false
         let redisURL = server.preferences.redisURL
+        let volumePath = Preferences.fuseMountPath()
+        let serviceReportsLocalNetwork = server.localNetworkPermissionSuspected
+        // Single-flight: a burst of focus/activation notifications (or a
+        // Re-check click during a check) starts at most one check.
+        recheck.run {
+            checking = true
+            async let preflight = OnboardingPreflight.run(redisURL: redisURL)
+            async let perms = PermissionProbes.run(
+                redisURL: redisURL, volumePath: volumePath,
+                serviceReportsLocalNetwork: serviceReportsLocalNetwork)
+            async let helperState = Task.detached(priority: .userInitiated) {
+                UnmountHelperService.shared.readiness(isolated: AppIsolation.active != nil)
+            }.value
+            let (result, permissionResult, helperResult) = await (preflight, perms, helperState)
+            report = result
+            permissions = permissionResult
+            helper = helperResult
+            checking = false
+        }
+    }
+
+    /// Founder Q1: JuiceMount does not start a mount until its privileged
+    /// eject helper is turned on and answering. "Set Up Helper…" registers
+    /// it (macOS then lists it in Login Items & Extensions) and opens that
+    /// pane; reading the row never registers anything.
+    @ViewBuilder
+    private var helperRow: some View {
+        let row = helper.map(UnmountHelperDecision.row(for:))
+        if row?.visible ?? true {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                helperGlyph(row?.tone)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(UnmountHelperDecision.rowTitle)
+                        .font(.body.weight(.medium))
+                    if let row {
+                        Text(row.detail)
+                            .font(.caption)
+                            .foregroundStyle(row.tone == .failed ? .red : (row.tone == .attention ? .orange : .secondary))
+                            .fixedSize(horizontal: false, vertical: true)
+                        switch row.action {
+                        case .setUp:
+                            Button(helperBusy ? "Setting Up…" : "Set Up Helper…") { setUpHelper() }
+                                .controlSize(.small)
+                                .disabled(helperBusy)
+                        case .openLoginItems:
+                            Button("Open Login Items…") { UnmountHelperService.openLoginItems() }
+                                .controlSize(.small)
+                        case .none:
+                            EmptyView()
+                        }
+                    } else {
+                        Text("Checking…")
+                            .font(.caption)
+                            .foregroundStyle(.tertiary)
+                    }
+                }
+                Spacer()
+            }
+        }
+    }
+
+    private func setUpHelper() {
+        helperBusy = true
         Task {
-            let result = await OnboardingPreflight.run(redisURL: redisURL)
-            await MainActor.run {
-                report = result
-                checking = false
-                // Surface the failure case in the disclosure by default so
-                // the fix is visible without an extra click.
-                if !result.passwordlessSudo && !result.criticalOK {
-                    showSudoersSnippet = false
+            let result = await Task.detached(priority: .userInitiated) {
+                UnmountHelperService.shared.prepare(
+                    isolated: AppIsolation.active != nil,
+                    mountActive: NFSBridge.isRunning)
+            }.value
+            helper = result
+            helperBusy = false
+            if result == .requiresApproval || result == .notRegistered {
+                UnmountHelperService.openLoginItems()
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func helperGlyph(_ tone: UnmountHelperRow.Tone?) -> some View {
+        switch tone {
+        case .none:
+            ProgressView().controlSize(.small).frame(width: 16)
+        case .some(.ok):
+            Image(systemName: "checkmark.circle.fill").foregroundStyle(.green).frame(width: 16)
+        case .some(.attention):
+            Image(systemName: "clock.fill").foregroundStyle(.orange).frame(width: 16)
+        case .some(.failed):
+            Image(systemName: "xmark.circle.fill").foregroundStyle(.red).frame(width: 16)
+        case .some(.neutral):
+            Image(systemName: "minus.circle").foregroundStyle(.secondary).frame(width: 16)
+        }
+    }
+
+    /// One permission row: glyph + title + status detail + a System Settings
+    /// deep link shown whenever the user has something to do.
+    @ViewBuilder
+    private func permissionRow(status: PermissionStatus?, title: String, fixTitle: String, fix: @escaping () -> Void) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            permissionGlyph(status)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(.body.weight(.medium))
+                if let status {
+                    Text(permissionDetail(status))
+                        .font(.caption)
+                        .foregroundStyle(permissionDetailColor(status))
+                        .fixedSize(horizontal: false, vertical: true)
+                    if status.needsUserAction {
+                        Button(fixTitle, action: fix)
+                            .controlSize(.small)
+                    }
+                } else {
+                    Text("Checking…")
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
                 }
             }
+            Spacer()
+        }
+    }
+
+    private func permissionDetail(_ status: PermissionStatus) -> String {
+        switch status {
+        case .granted: return "Allowed."
+        case .denied(let s), .pending(let s), .notYetRequested(let s), .unknown(let s), .notApplicable(let s): return s
+        }
+    }
+
+    private func permissionDetailColor(_ status: PermissionStatus) -> Color {
+        switch status {
+        case .denied: return .red
+        case .pending: return .orange
+        default: return .secondary
+        }
+    }
+
+    @ViewBuilder
+    private func permissionGlyph(_ status: PermissionStatus?) -> some View {
+        switch status {
+        case .none:
+            ProgressView().controlSize(.small).frame(width: 16)
+        case .some(.granted):
+            Image(systemName: "checkmark.circle.fill").foregroundStyle(.green).frame(width: 16)
+        case .some(.denied):
+            Image(systemName: "xmark.circle.fill").foregroundStyle(.red).frame(width: 16)
+        case .some(.pending):
+            Image(systemName: "clock.fill").foregroundStyle(.orange).frame(width: 16)
+        case .some(.notYetRequested), .some(.notApplicable):
+            Image(systemName: "minus.circle").foregroundStyle(.secondary).frame(width: 16)
+        case .some(.unknown):
+            Image(systemName: "questionmark.circle").foregroundStyle(.secondary).frame(width: 16)
         }
     }
 
@@ -395,8 +518,7 @@ struct OnboardingWindowView: View {
                     Text(passDetail)
                         .font(.caption)
                         .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
+                        .fixedSize(horizontal: false, vertical: true)
                 case .some(false):
                     Text(failDetail)
                         .font(.caption)
@@ -418,14 +540,14 @@ struct OnboardingWindowView: View {
     }
 
     @ViewBuilder
-    private func statusGlyph(ok: Bool?, infoStyle: Bool = false) -> some View {
+    private func statusGlyph(ok: Bool?) -> some View {
         switch ok {
         case .some(true):
             Image(systemName: "checkmark.circle.fill")
                 .foregroundStyle(.green)
         case .some(false):
-            Image(systemName: infoStyle ? "info.circle.fill" : "xmark.circle.fill")
-                .foregroundStyle(infoStyle ? Color.blue : Color.red)
+            Image(systemName: "xmark.circle.fill")
+                .foregroundStyle(.red)
         case .none:
             ProgressView()
                 .controlSize(.small)
@@ -459,3 +581,72 @@ struct OnboardingWindowView: View {
         }
     }
 }
+
+// BEGIN BundledJuiceFS — extracted verbatim by Tests/bundled_juicefs_preflight_probe.py
+/// The JuiceFS engine the app ships beside its executable. Mirrors
+/// health/fuse.go findJuiceFSBin (same location, no PATH or Homebrew) and the
+/// scripts/verify-build.sh gate (pinned version, same signer as the app).
+enum BundledJuiceFS {
+    static let name = "juicefs"
+    static let versionInfoKey = "JMBundledJuiceFSVersion"
+
+    struct Problem: Error, Equatable { let message: String }
+
+    static func check(executable: URL?, expectedVersion: String?) -> Result<String, Problem> {
+        guard let executable else { return .failure(Problem(message: "The app's own executable path is unknown.")) }
+        let path = executable.deletingLastPathComponent().appendingPathComponent(name).path
+        guard FileManager.default.isExecutableFile(atPath: path) else {
+            return .failure(Problem(message: "The bundled JuiceFS engine is missing from this copy of JuiceMount."))
+        }
+        guard let expectedVersion, !expectedVersion.isEmpty else {
+            return .failure(Problem(message: "This copy of JuiceMount does not record its JuiceFS version."))
+        }
+        guard let appSigner = signer(of: executable.path), let engineSigner = signer(of: path),
+              engineSigner == appSigner else {
+            return .failure(Problem(message: "The bundled JuiceFS engine is not signed by JuiceMount's signer."))
+        }
+        guard let version = versionOutput(path), version == expectedVersion else {
+            return .failure(Problem(message: "The bundled JuiceFS engine is not the version this JuiceMount expects."))
+        }
+        return .success(path)
+    }
+
+    /// A valid code signature's identity: team ID plus leaf certificate, or
+    /// "adhoc" for an ad-hoc signature. nil when unsigned or invalid.
+    static func signer(of path: String) -> String? {
+        var code: SecStaticCode?
+        guard SecStaticCodeCreateWithPath(URL(fileURLWithPath: path) as CFURL, [], &code) == errSecSuccess,
+              let code,
+              SecStaticCodeCheckValidity(code, SecCSFlags(rawValue: kSecCSStrictValidate), nil) == errSecSuccess
+        else { return nil }
+        var info: CFDictionary?
+        guard SecCodeCopySigningInformation(code, SecCSFlags(rawValue: kSecCSSigningInformation), &info) == errSecSuccess,
+              let dict = info as? [String: Any] else { return nil }
+        guard let certs = dict[kSecCodeInfoCertificates as String] as? [SecCertificate], let leaf = certs.first else {
+            return "adhoc"
+        }
+        let team = dict[kSecCodeInfoTeamIdentifier as String] as? String ?? ""
+        return team + ":" + (SecCertificateCopyData(leaf) as Data).base64EncodedString()
+    }
+
+    /// `juicefs --version`, bounded so a wedged binary cannot hold preflight.
+    static func versionOutput(_ path: String, timeout: TimeInterval = 5) -> String? {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: path)
+        process.arguments = ["--version"]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = FileHandle.nullDevice
+        let done = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in done.signal() }
+        do { try process.run() } catch { return nil }
+        if done.wait(timeout: .now() + timeout) == .timedOut {
+            process.terminate()
+            return nil
+        }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        guard process.terminationStatus == 0 else { return nil }
+        return String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}
+// END BundledJuiceFS

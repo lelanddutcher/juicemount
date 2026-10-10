@@ -1,0 +1,27 @@
+--- a/pkg/fuse/fuse.go
++++ b/pkg/fuse/fuse.go
+@@ -158,9 +158,13 @@
+ }
+ 
+ func (fs *fileSystem) Rename(cancel <-chan struct{}, in *fuse.RenameIn, oldName string, newName string) (code fuse.Status) {
+-	ctx := fs.newContext(cancel, &in.InHeader)
+-	defer releaseContext(ctx)
+-	err := fs.v.Rename(ctx, Ino(in.NodeId), oldName, Ino(in.Newdir), newName, in.Flags)
++	flags, status := normalizeRenameFlags(in.Flags)
++	if status != 0 {
++		return fuse.Status(status)
++	}
++	ctx := fs.newContext(cancel, &in.InHeader)
++	defer releaseContext(ctx)
++	err := fs.v.Rename(ctx, Ino(in.NodeId), oldName, Ino(in.Newdir), newName, flags)
+ 	return fuse.Status(err)
+ }
+ 
+@@ -478,6 +482,7 @@
+ 	opt.DirectMount = true
+ 	opt.AllowOther = os.Getuid() == 0
+ 	opt.Timeout = conf.FuseOpts.Timeout
++	opt.OtherCaps |= renameCapabilities()
+ 
+ 	if opt.EnableAcl && conf.NonDefaultPermission {
+ 		logger.Warnf("it is recommended to turn on 'default-permissions' when enable acl")

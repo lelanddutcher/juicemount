@@ -1,0 +1,506 @@
+package nfs
+
+import (
+	"testing"
+	"time"
+
+	"github.com/lelanddutcher/juicemount/internal/cache/pin"
+)
+
+// seedDiskAvail pins the sampled ceiling as if free disk were `avail` at this
+// instant. avail < 0 means "Statfs failed".
+//
+// It CALLS refreshCeiling's own headroom function rather than restating the
+// arithmetic (which is how a helper silently stops matching the code it stands
+// in for). The zero-valued cacheReclaimInputs means "nothing known about the
+// JuiceFS cache", which is precisely the historical `avail - floor` — so these
+// tests stay deterministic and independent of the host's real block cache.
+func seedDiskAvail(s *SpoolStore, avail int64) {
+	if avail < 0 {
+		s.capCeiling.Store(-1)
+		s.diskAvailAt.Store(time.Now().UnixNano())
+		return
+	}
+	ceiling := s.used.Load() + spoolHeadroomBytes(avail, cacheReclaimInputs{})
+	if ceiling < minClampedCeiling {
+		ceiling = minClampedCeiling
+	}
+	s.capCeiling.Store(ceiling)
+	s.diskAvailAt.Store(time.Now().UnixNano())
+}
+
+const gib = int64(1) << 30
+
+// newFixedCapSpool builds a store whose CONFIGURED capacity is exactly `cap`,
+// independent of the machine's real free disk.
+//
+// NewSpoolStore clamps the requested capacity against a live statfs at
+// construction, so a test that passes `200*gib` gets whatever the host happens
+// to have free minus the 20 GiB floor. That made these tests
+// environment-dependent: they passed on a roomy machine and FAILED on a
+// nearly-full one — i.e. on exactly the machine the feature exists for. Pin the
+// field directly so the arithmetic under test is the only variable.
+func newFixedCapSpool(t *testing.T, capacity int64) *SpoolStore {
+	t.Helper()
+	s := newTestSpoolStore(t, capacity)
+	s.capacity = capacity
+	return s
+}
+
+// The founder's incident (2026-08-03): copying to the volume while local disk is
+// low stalls instead of failing. Root cause — NewSpoolStore clamps capacity to
+// free disk ONCE, so the budget goes stale as the disk fills underneath it, and
+// admission keeps saying yes until the DISK (not the budget) runs out. Because a
+// full spool is designed to stall for backpressure, that produced an unbounded
+// hang rather than an ENOSPC.
+func TestEffectiveCapacity_TracksFreeDiskAfterConstruction(t *testing.T) {
+	// NewSpoolStore applies its OWN construction-time clamp against the real
+	// disk, so read back what it actually stored rather than assuming our
+	// literal survived — the whole point of this fix is that the stored value
+	// is a snapshot.
+	const want200 = 200 * gib
+	s := newFixedCapSpool(t, want200)
+	configured := s.ConfiguredCapacity()
+	if configured != want200 {
+		t.Fatalf("configured cap = %d, want the pinned %d", configured, want200)
+	}
+
+	t.Run("plenty of disk keeps the configured cap", func(t *testing.T) {
+		seedDiskAvail(s, 900*gib)
+		if got := s.effectiveCapacity(); got != configured {
+			t.Errorf("got %d GiB, want the configured %d GiB", got>>30, configured>>30)
+		}
+	})
+
+	t.Run("shrinking disk clamps below the configured cap", func(t *testing.T) {
+		// 50 GiB free, 20 GiB floor -> only 30 GiB may still be consumed.
+		s.used.Store(5 * gib)
+		seedDiskAvail(s, 50*gib)
+		want := 5*gib + (50*gib - SpoolFreeFloorBytes)
+		if got := s.effectiveCapacity(); got != want {
+			t.Errorf("got %d GiB, want %d GiB (used + headroom above the floor)", got>>30, want>>30)
+		}
+		if s.effectiveCapacity() >= configured {
+			t.Error("a nearly-full disk must NOT still report the configured capacity — that is the bug")
+		}
+	})
+
+	t.Run("at the preferred floor a bounded working window remains", func(t *testing.T) {
+		s.used.Store(12 * gib)
+		seedDiskAvail(s, SpoolFreeFloorBytes)
+		if got, want := s.effectiveCapacity(), 12*gib+spoolLowDiskWorkingSetBytes; got != want {
+			t.Errorf("got %d, want %d (used + bounded low-disk working window)", got, want)
+		}
+	})
+
+	t.Run("at the hard floor there is zero headroom, so admission stops", func(t *testing.T) {
+		s.used.Store(12 * gib)
+		seedDiskAvail(s, SpoolHardFreeFloorBytes)
+		if got, want := s.effectiveCapacity(), 12*gib; got != want {
+			t.Errorf("got %d, want %d (== used: hard OS floor forbids new bytes)", got, want)
+		}
+	})
+
+	t.Run("below the floor never goes negative", func(t *testing.T) {
+		s.used.Store(3 * gib)
+		seedDiskAvail(s, 1*gib) // already past the floor
+		if got, want := s.effectiveCapacity(), 3*gib; got != want {
+			t.Errorf("got %d, want %d — headroom must clamp at zero, not go negative", got, want)
+		}
+	})
+
+	t.Run("unreadable statfs fails OPEN, not closed", func(t *testing.T) {
+		s.used.Store(1 * gib)
+		seedDiskAvail(s, -1) // Statfs never succeeded
+		if got := s.effectiveCapacity(); got != configured {
+			t.Errorf("got %d, want the configured cap — an unreadable statfs is not a full disk", got)
+		}
+	})
+}
+
+// The exact shape measured during the incident: a configured capacity that,
+// added to the free-disk floor, already exceeded the disk.
+func TestEffectiveCapacity_IncidentShape(t *testing.T) {
+	s := newFixedCapSpool(t, 37*gib) // what /spool actually reported
+	configured := s.ConfiguredCapacity()
+	s.used.Store(0)
+	seedDiskAvail(s, 50*gib) // what the volume actually had free
+
+	got := s.effectiveCapacity()
+	if got >= configured {
+		t.Fatalf("effective %d GiB >= configured %d GiB: the budget still over-commits the disk", got>>30, configured>>30)
+	}
+	if want := 50*gib - SpoolFreeFloorBytes; got != want {
+		t.Errorf("effective = %d GiB, want %d GiB (free minus the floor)", got>>30, want>>30)
+	}
+}
+
+// Unlimited (capacity 0) stays truly unlimited — a deliberate scope limit.
+// "total=0 means unlimited" is the documented /spool contract that consumers
+// branch on, and production never runs unlimited (AutoSpoolCapacity always
+// yields a positive cap), so the incident cannot occur there. Disk-clamping it
+// would change a public contract to fix a case that does not arise.
+func TestEffectiveCapacity_UnlimitedStaysUnlimited(t *testing.T) {
+	s := newTestSpoolStore(t, 0)
+
+	seedDiskAvail(s, -1)
+	if got := s.effectiveCapacity(); got != 0 {
+		t.Errorf("unknown disk: got %d, want 0 (unlimited)", got)
+	}
+
+	// Even with a nearly-full disk, unlimited stays unlimited.
+	s.used.Store(2 * gib)
+	seedDiskAvail(s, 1*gib)
+	if got := s.effectiveCapacity(); got != 0 {
+		t.Errorf("low disk: got %d, want 0 — see the SCOPE LIMIT note in effectiveCapacity", got)
+	}
+}
+
+// Capacity() must report the enforced budget, not the startup snapshot, so the
+// UI and /spool don't advertise headroom that admission will refuse.
+func TestCapacityReportsEffectiveNotConfigured(t *testing.T) {
+	s := newFixedCapSpool(t, 400*gib)
+	configured := s.ConfiguredCapacity()
+	s.used.Store(1 * gib)
+	seedDiskAvail(s, 30*gib)
+
+	used, total := s.Capacity()
+	if used != 1*gib {
+		t.Errorf("used = %d, want %d", used, 1*gib)
+	}
+	if total >= configured {
+		t.Errorf("Capacity total = %d GiB, still the configured snapshot", total>>30)
+	}
+	if s.ConfiguredCapacity() != configured {
+		t.Errorf("ConfiguredCapacity must be stable, got %d want %d", s.ConfiguredCapacity(), configured)
+	}
+}
+
+// The sample must be cached: admission runs per write, and Statfs-per-write on a
+// large copy is exactly the kind of syscall amplification this codebase bans on
+// hot paths.
+func TestCachedCeiling_IsCachedWithinTTL(t *testing.T) {
+	s := newTestSpoolStore(t, 100*gib)
+
+	seedDiskAvail(s, 42*gib)
+	at := s.diskAvailAt.Load()
+	want := s.capCeiling.Load()
+	for i := 0; i < 50; i++ {
+		if v, ok := s.cachedCeiling(); !ok || v != want {
+			t.Fatalf("call %d: got (%d,%v), want the cached ceiling %d", i, v, ok, want)
+		}
+	}
+	if s.diskAvailAt.Load() != at {
+		t.Error("cache was re-sampled inside the TTL — admission would Statfs per write")
+	}
+
+	// Expiring the stamp must allow a real resample (value will be the real
+	// disk, so only assert that the timestamp moved).
+	s.diskAvailAt.Store(time.Now().Add(-2 * diskAvailTTL).UnixNano())
+	if _, ok := s.cachedCeiling(); !ok {
+		t.Skip("Statfs unavailable in this environment")
+	}
+	if s.diskAvailAt.Load() == at {
+		t.Error("cache did not resample after the TTL expired")
+	}
+}
+
+// CRITICAL regression (2026-08-03 review, defect 1). The first version derived
+// the ceiling from the LIVE `used` on every check, so `cur+delta > used+headroom`
+// reduced to `delta > headroom` per call and cumulative admission inside one
+// sample window was unbounded. The reviewer's reproduction: six 9 GiB
+// reservations all cleared a 10 GiB headroom, driving used to 54 GiB.
+//
+// The ceiling must be pinned to a `used` snapshot taken with the disk reading,
+// so a window admits at most `headroom` in TOTAL.
+func TestTryReserveCapacity_CumulativeAdmissionIsBoundedWithinOneSample(t *testing.T) {
+	s := newFixedCapSpool(t, 200*gib)
+	s.used.Store(0)
+	seedDiskAvail(s, 30*gib) // headroom = 10 GiB, pinned for this window
+
+	var admitted int64
+	for i := 0; i < 6; i++ {
+		if s.tryReserveCapacity(9 * gib) {
+			admitted += 9 * gib
+		}
+	}
+	if headroom := 30*gib - SpoolFreeFloorBytes; admitted > headroom {
+		t.Errorf("admitted %d GiB against %d GiB of headroom — the ceiling is chasing `used` again",
+			admitted>>30, headroom>>30)
+	}
+	if admitted == 0 {
+		t.Error("admitted nothing; the clamp is now too strict to accept a fitting write")
+	}
+}
+
+// CRITICAL regression (2026-08-03 review, defect 2). Every admission gate spells
+// "unlimited" as `ec <= 0`. A legitimately-computed ceiling of exactly zero —
+// spool EMPTY and disk at/under the floor, the resting state of a chronically
+// low-disk machine — collided with that sentinel and re-opened admission with no
+// cap at all, at the worst possible moment.
+func TestEffectiveCapacity_ZeroCeilingDoesNotReadAsUnlimited(t *testing.T) {
+	s := newFixedCapSpool(t, 100*gib)
+	s.used.Store(0)                           // empty spool
+	seedDiskAvail(s, SpoolHardFreeFloorBytes) // exactly at hard floor -> headroom 0
+
+	ec := s.effectiveCapacity()
+	if ec <= 0 {
+		t.Fatalf("effectiveCapacity()=%d reads as the 'unlimited' sentinel at the hard floor", ec)
+	}
+	if s.tryReserveCapacity(50 * gib) {
+		t.Error("admitted 50 GiB with an empty spool on a floor-constrained disk — sentinel collision is back")
+	}
+	if !s.DiskConstrained() {
+		t.Error("DiskConstrained() should be true when the disk clamp is what blocks admission")
+	}
+}
+
+// DiskConstrained must distinguish "the configured budget is full" (waiting on
+// the drain can help) from "the volume is full" (it cannot). The offline stall
+// branches on this to avoid parking forever on a hang reconnecting won't fix.
+func TestDiskConstrained_OnlyWhenTheDiskIsTheBlocker(t *testing.T) {
+	s := newFixedCapSpool(t, 8*gib)
+
+	// Budget-full but plenty of disk: NOT disk-constrained.
+	s.used.Store(8 * gib)
+	seedDiskAvail(s, 500*gib)
+	if s.DiskConstrained() {
+		t.Error("budget-full with a roomy disk must not report disk-constrained")
+	}
+
+	// Disk at the floor: constrained.
+	s.used.Store(1 * gib)
+	seedDiskAvail(s, SpoolHardFreeFloorBytes)
+	if !s.DiskConstrained() {
+		t.Error("disk at the floor must report disk-constrained")
+	}
+
+	// Unlimited config is never disk-constrained (scope limit).
+	u := newTestSpoolStore(t, 0)
+	seedDiskAvail(u, 1*gib)
+	if u.DiskConstrained() {
+		t.Error("unlimited config must never report disk-constrained")
+	}
+}
+
+// --- The offline + disk-constrained stall (2026-08-04 review, defects 1-3) ---
+//
+// This is the riskiest path in the free-space work and it originally shipped with
+// NO test touching it: the existing offline-stall test never seeds a constrained
+// ceiling, so DiskConstrained() reads false throughout and the branch never runs.
+
+// pinConstrained parks the store permanently at the free-disk floor so
+// DiskConstrained() is true and stays true for the length of a test.
+func pinConstrained(t *testing.T, s *SpoolStore) {
+	t.Helper()
+	go func() {
+		for i := 0; i < 4000; i++ { // outlive the test; refreshes every ~1s TTL
+			seedDiskAvail(s, SpoolHardFreeFloorBytes)
+			time.Sleep(2 * time.Millisecond)
+		}
+	}()
+	seedDiskAvail(s, SpoolHardFreeFloorBytes)
+	if !s.DiskConstrained() {
+		t.Fatal("precondition: store should be disk-constrained")
+	}
+}
+
+// (a) Offline + disk-constrained must TIME OUT. Reconnecting cannot free local
+// disk, so waiting forever is an unbounded Finder hang on a hard mount.
+//
+// HONEST LABEL (2026-08-04 review): this is BRANCH COVERAGE, not a regression
+// guard. It passes against the broken parent too, because a CONSTANT
+// DiskConstrained()==true gave up there as well — the bugs were in the reconnect
+// edge and the flapping case. Kept because the branch had zero coverage; the two
+// tests below are the ones that actually discriminate (verified failing against
+// the parent commit).
+func TestWaitForCapacity_OfflineButDiskConstrainedGivesUp(t *testing.T) {
+	old := capacityWaitDeadline
+	capacityWaitDeadline = 80 * time.Millisecond
+	t.Cleanup(func() { capacityWaitDeadline = old })
+	pin.SetOffline(true)
+	t.Cleanup(func() { pin.SetOffline(false) })
+
+	s := newFixedCapSpool(t, 4*gib)
+	s.used.Store(1 * gib)
+	pinConstrained(t, s)
+
+	done := make(chan bool, 1)
+	go func() { done <- s.waitForCapacity(func() bool { return false }, nil) }()
+
+	select {
+	case ok := <-done:
+		if ok {
+			t.Error("waitForCapacity reported success though try() never succeeded")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("offline + disk-constrained stalled forever — the unbounded hang is back")
+	}
+}
+
+// (b) A GENUINE reconnect mid-stall must still grant a fresh window. Overwriting
+// the `offline` var poisoned wasOffline, so the offline->online edge went
+// undetected and the reconnect had no effect on the timer at all.
+func TestWaitForCapacity_ReconnectStillResetsTheWindow(t *testing.T) {
+	old := capacityWaitDeadline
+	capacityWaitDeadline = 200 * time.Millisecond
+	t.Cleanup(func() { capacityWaitDeadline = old })
+	pin.SetOffline(true)
+	t.Cleanup(func() { pin.SetOffline(false) })
+
+	s := newFixedCapSpool(t, 4*gib)
+	s.used.Store(1 * gib)
+	pinConstrained(t, s)
+
+	start := time.Now()
+	done := make(chan bool, 1)
+	go func() { done <- s.waitForCapacity(func() bool { return false }, nil) }()
+
+	// Reconnect just before the first window would close. The edge must restart
+	// the clock, so the total must exceed one bare deadline.
+	time.Sleep(150 * time.Millisecond)
+	pin.SetOffline(false)
+
+	select {
+	case <-done:
+		if elapsed := time.Since(start); elapsed < 300*time.Millisecond {
+			t.Errorf("gave up after %v; a reconnect at 150ms must grant a fresh %v window "+
+				"(wasOffline was poisoned, so the edge went undetected)", elapsed, capacityWaitDeadline)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("never returned")
+	}
+}
+
+// (c) A FLAPPING DiskConstrained() while genuinely offline must not defeat the
+// backstop. Resetting the window on STATE rather than PROGRESS meant a value
+// that flaps — and this one is a ~1s statfs sampled right at the floor, so it
+// flaps in normal operation — reset the clock forever.
+func TestWaitForCapacity_FlappingDiskConstrainedStillTimesOut(t *testing.T) {
+	old := capacityWaitDeadline
+	capacityWaitDeadline = 100 * time.Millisecond
+	t.Cleanup(func() { capacityWaitDeadline = old })
+	pin.SetOffline(true)
+	t.Cleanup(func() { pin.SetOffline(false) })
+
+	s := newFixedCapSpool(t, 400*gib)
+	s.used.Store(1 * gib)
+
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		roomy := true
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if roomy {
+				seedDiskAvail(s, 900*gib) // not constrained
+			} else {
+				seedDiskAvail(s, SpoolHardFreeFloorBytes) // constrained
+			}
+			roomy = !roomy
+			time.Sleep(2 * time.Millisecond)
+		}
+	}()
+
+	done := make(chan bool, 1)
+	go func() { done <- s.waitForCapacity(func() bool { return false }, nil) }()
+
+	select {
+	case <-done: // gave up — correct
+	case <-time.After(3 * time.Second):
+		t.Fatal("flapping DiskConstrained() reset the window forever — the CRITICAL hang is back")
+	}
+}
+
+// The ceiling refresh must NEVER block a caller. statfs has no timeout and this
+// path is reached from tryReserveCapacity/effectiveCapacity, which callers hold
+// a path shard or the per-entry e.mu across — a blocking Lock there serialized
+// unrelated writers and blocked readers of a file still being copied
+// (2026-08-04 review, HIGH). TryLock means a loser uses the current value.
+func TestCachedCeiling_NeverBlocksWhileAnotherGoroutineRefreshes(t *testing.T) {
+	s := newFixedCapSpool(t, 100*gib)
+	seedDiskAvail(s, 80*gib)
+	want := s.capCeiling.Load()
+
+	// Stand in for a refresh stuck in a wedged statfs.
+	s.ceilingMu.Lock()
+	defer s.ceilingMu.Unlock()
+
+	// Force the TTL to look expired so every call takes the refresh branch.
+	s.diskAvailAt.Store(time.Now().Add(-10 * diskAvailTTL).UnixNano())
+
+	done := make(chan int64, 1)
+	go func() {
+		v, _ := s.cachedCeiling()
+		done <- v
+	}()
+	select {
+	case got := <-done:
+		if got != want {
+			t.Errorf("got ceiling %d while a refresh was in flight, want the cached %d", got, want)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("cachedCeiling BLOCKED behind an in-flight refresh — a wedged statfs would stall writers")
+	}
+
+	// And the admission path built on it must stay responsive too.
+	adm := make(chan bool, 1)
+	go func() { adm <- s.tryReserveCapacity(1) }()
+	select {
+	case <-adm:
+	case <-time.After(2 * time.Second):
+		t.Fatal("tryReserveCapacity blocked behind an in-flight refresh — violates the cheap-and-lock-free rule")
+	}
+}
+
+// A store must never report the "unlimited" sentinel just because its first
+// ceiling sample has not landed. NewSpoolStore seeds it synchronously.
+func TestNewSpoolStore_SeedsCeilingSoItNeverReadsUnlimited(t *testing.T) {
+	s := newFixedCapSpool(t, 64*gib)
+	if s.capCeiling.Load() == 0 {
+		t.Error("capCeiling left at its zero value — that reads as the unlimited sentinel")
+	}
+	if ec := s.effectiveCapacity(); ec <= 0 {
+		t.Errorf("effectiveCapacity()=%d on a fresh store with a positive configured cap", ec)
+	}
+}
+
+// A wedged statfs holding the refresh slot must not leave admission running
+// against a frozen roomy ceiling forever (2026-08-04 review, MEDIUM). Past
+// staleCeilingMax the ceiling collapses to what is already used, so no new bytes
+// are admitted and the wedge backstop turns the stall into an honest ErrSpoolFull.
+func TestCachedCeiling_VeryStaleSampleFreezesAdmission(t *testing.T) {
+	s := newTestSpoolStore(t, 400*gib)
+	s.used.Store(3 * gib)
+	seedDiskAvail(s, 900*gib) // a very roomy ceiling...
+	roomy := s.capCeiling.Load()
+	if roomy <= 3*gib {
+		t.Fatalf("precondition: expected a roomy ceiling, got %d", roomy)
+	}
+
+	// ...that is now far too old to trust. Hold the refresh slot so the TryLock
+	// loses, exactly as a hung statfs would.
+	s.ceilingMu.Lock()
+	defer s.ceilingMu.Unlock()
+	s.diskAvailAt.Store(time.Now().Add(-2 * staleCeilingMax).UnixNano())
+
+	got, ok := s.cachedCeiling()
+	if !ok {
+		t.Fatal("expected a usable (frozen) ceiling, got ok=false")
+	}
+	if got != 3*gib {
+		t.Errorf("stale ceiling = %d, want %d (== used: admission frozen)", got, 3*gib)
+	}
+	if s.tryReserveCapacity(1 * gib) {
+		t.Error("admitted 1 GiB against a sample we can no longer trust")
+	}
+	// And it must never read as the unlimited sentinel, even with an empty spool.
+	s.used.Store(0)
+	if v, _ := s.cachedCeiling(); v <= 0 {
+		t.Errorf("frozen ceiling %d reads as the unlimited sentinel", v)
+	}
+}

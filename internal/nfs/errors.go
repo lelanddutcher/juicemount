@@ -287,5 +287,67 @@ func nfsStatusErrorFrom(err error) error {
 		// match fires without this package importing nfs/ (cycle).
 		return &NFSStatusError{NFSStatusNoSPC, err}
 	}
+	if errors.Is(err, syscall.EROFS) {
+		// See writeRefusalStatus: a write refused by a read-only backend is
+		// NFS3ERR_ROFS, never the generic NFS3ERR_IO.
+		//
+		// Callers that reach this branch: SETATTR (through
+		// SetFileAttributes.Apply), WRITE (OpenFile and WriteAt failures),
+		// and READ (readTransientStatusError in nfs_onread.go). RFC 1813 does
+		// not list ROFS among the READ3 errors. READ should never get here:
+		// read-only JuiceFS refuses only operations that change data or
+		// metadata (meta txn and the base.go write ops), never a read. If a
+		// read ever does carry EROFS, ROFS is still a more truthful reply
+		// than IO, so the branch is not special-cased for READ.
+		return &NFSStatusError{NFSStatusROFS, err}
+	}
 	return &NFSStatusError{NFSStatusIO, err}
+}
+
+// writeRefusalStatus maps an error from a namespace or data mutation to the
+// status a write-path handler (CREATE, MKDIR, SYMLINK, MKNOD, LINK, REMOVE,
+// RMDIR, RENAME, WRITE, SETATTR) returns. An error that carries
+// syscall.EROFS, at any wrapping depth and including one already wrapped in
+// an *NFSStatusError with another status, becomes NFS3ERR_ROFS (30). Every
+// other error keeps the handler's existing fallback status, so this changes
+// no mapping except the read-only one.
+//
+// Why: JuiceFS returns EROFS from every metadata transaction when the client
+// runs read-only (third_party/juicefs/pkg/meta/redis.go txn, base.go). Before
+// this mapping the handlers turned it into NFS3ERR_IO or NFS3ERR_ACCES, and
+// Finder reported "an I/O error occurred" (-36) or a permission error
+// (-5000), both on the release bar's forbidden list.
+//
+// COMMIT deliberately does not use this: RFC 1813 lists only IO, STALE,
+// BADHANDLE and SERVERFAULT as COMMIT3 errors, and JuiceMount's COMMIT is a
+// local spool fsync that never reaches JuiceFS.
+//
+// What the macOS client does with NFS3ERR_ROFS (evidence level noted; none of
+// this was tested against a live mount):
+//   - NFSv3 status values equal the BSD errno values, and the xnu NFS client
+//     returns the reply status to the system call as that errno. So ROFS
+//     reaches the application as EROFS (30), and IO reaches it as EIO (5).
+//     (From the xnu NFS client design; not measured here.)
+//   - Finder: EIO is the -36 "I/O error" dialog. The dialog text and OSErr
+//     code Finder shows for EROFS are UNVERIFIED; no test, comment or memory
+//     note in this tree records one. EROFS is not one of the codes the QA
+//     battery tracks (-36, -48, -5000, 100060, 100070), but it is still a
+//     failure dialog, not a silent success.
+//   - Volume-wide read-only flip: no evidence either way in this tree. xnu
+//     takes the volume read-only flag (MNT_RDONLY) from the mount arguments,
+//     not from per-operation errors, so a single ROFS reply is not expected to
+//     mark the whole volume read-only for the session. UNVERIFIED in Finder.
+//   - Buffered writes: macOS sends UNSTABLE WRITE RPCs after write(2) has
+//     already returned, so a WRITE refusal surfaces late, at close(2) or
+//     fsync(2). In JuiceMount the gap is larger: with the write spool enabled,
+//     CREATE and WRITE land in the local spool and never call JuiceFS inside
+//     the RPC, so a read-only refusal there happens at drain time and no NFS
+//     reply carries it. The status mapped here applies to the operations that
+//     do reach JuiceFS inside the RPC: when online, MKDIR, SYMLINK, REMOVE,
+//     and RENAME of an already-drained entry (nfs/handler.go juiceFS).
+func writeRefusalStatus(err error, fallback NFSStatus) *NFSStatusError {
+	if errors.Is(err, syscall.EROFS) {
+		return &NFSStatusError{NFSStatusROFS, err}
+	}
+	return &NFSStatusError{fallback, err}
 }

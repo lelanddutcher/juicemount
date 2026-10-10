@@ -1,0 +1,29 @@
+{
+  "recipe": "jm1",
+  "spec": "spec/DERIVATIVE_KEY.md",
+  "algorithm": "xxh3-64, default seed 0, no custom secret",
+  "hash_format": "%016x — lowercase hex, zero-padded to exactly 16 chars",
+  "key_format": "jm1:<hash>:<size>  (substitute _ for : on filesystems that reject it, e.g. exFAT)",
+  "sample_window_bytes": 1048576,
+  "input_order": [
+    "size as 8-byte LITTLE-ENDIAN uint64 — always, including for an empty file",
+    "head: min(1048576, size) bytes from offset 0 — skipped only when size == 0",
+    "tail: exactly 1048576 bytes from offset (size - 1048576) — ONLY when size > 2097152"
+  ],
+  "fill": "byte at offset i == (i * 37 + 11) mod 256",
+  "notes": [
+    "For 1048576 < size <= 2097152 the head is capped AND the tail is skipped, so bytes past 1 MiB are not hashed. Deliberate; see spec 3.1.",
+    "A short read of either window is an ERROR, never a zero-padded buffer (spec 3.2).",
+    "The hash half is byte-identical to the source_hash/asset_key already on the wire."
+  ],
+  "vectors": [
+    { "size": 0,       "hash": "c77b3abb6f87acd9", "key": "jm1:c77b3abb6f87acd9:0",       "covers": "empty file — the length prefix alone" },
+    { "size": 11,      "hash": "68fd8b5a4aefd666", "key": "jm1:68fd8b5a4aefd666:11",      "covers": "tiny file — whole file is the head" },
+    { "size": 1048576, "hash": "0acccca480537429", "key": "jm1:0acccca480537429:1048576", "covers": "exactly one window; no tail" },
+    { "size": 1048577, "hash": "9ab1d1e5f05a2b91", "key": "jm1:9ab1d1e5f05a2b91:1048577", "covers": "head capped at one window; still no tail" },
+    { "size": 1572864, "hash": "4b0648b67fce051a", "key": "jm1:4b0648b67fce051a:1572864", "covers": "1.5 MiB — the bytes past 1 MiB are NOT hashed" },
+    { "size": 2097152, "hash": "556ec8137c8c575e", "key": "jm1:556ec8137c8c575e:2097152", "covers": "exactly two windows — NOT > 2 windows, so still no tail" },
+    { "size": 2097153, "hash": "1c72362ca4a8a97a", "key": "jm1:1c72362ca4a8a97a:2097153", "covers": "first size where the tail engages" },
+    { "size": 3145728, "hash": "acd8772d176ec7ee", "key": "jm1:acd8772d176ec7ee:3145728", "covers": "head + tail with a clear unhashed gap between" }
+  ]
+}

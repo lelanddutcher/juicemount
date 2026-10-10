@@ -1,6 +1,6 @@
 package main
 
-// Contract conformance test (juicemount-contract v1).
+// Contract conformance test (juicemount-contract v3).
 //
 // The contract is only real if the live control plane serves what the vendored
 // fixtures + schemas say it does. This test is the provider's proof: it boots
@@ -12,13 +12,14 @@ package main
 // Coverage in this round: the additive endpoints implemented on feat/contract-v1
 // — /whoami (gui), /residency (resident/streaming/warming/absent), /lookup. Plus
 // schema-validation of EVERY fixture (cheap drift guard). Live coverage of
-// /cache-status (JM-3, deferred — still capitalized on the wire), the jm5
+// /cache-status beyond the empty-roots response, the jm5
 // /whoami (cli, separate binary), /residency uploading (needs spool seed), and
-// the POST/stateful endpoints (/offline,/spool,/pin,/activity) is intentionally
+// the POST/stateful endpoints (/offline,/pin,/activity) is intentionally
 // out of scope here and tracked in contract/BACKLOG.md.
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -36,7 +37,9 @@ import (
 	"github.com/lelanddutcher/juicemount/internal/cache/pin"
 	"github.com/lelanddutcher/juicemount/internal/cplane"
 	"github.com/lelanddutcher/juicemount/internal/derivatives"
+	"github.com/lelanddutcher/juicemount/internal/servicecontrol"
 	"github.com/lelanddutcher/juicemount/metadata"
+	jmnfs "github.com/lelanddutcher/juicemount/nfs"
 )
 
 const contractDir = "../contract"
@@ -45,7 +48,7 @@ const contractDir = "../contract"
 // host/runtime-specific. Mirrors contract/conformance/README.md "Volatile fields".
 var volatileFields = map[string]bool{
 	"checked_at": true, "since": true, "since_sec": true,
-	"instance_id": true, "current_file": true,
+	"instance_id": true, "device_digest": true, "current_file": true,
 	"control_plane": true, "metadata_db_path": true,
 }
 
@@ -89,7 +92,8 @@ func loadJSONValue(t *testing.T, rel string) any {
 // $defs resolve correctly.
 func compileSchema(t *testing.T, schemaFile string) *jsonschema.Schema {
 	t.Helper()
-	b, err := os.ReadFile(filepath.Join(contractDir, "spec", "schema", schemaFile))
+	filePart, fragment, hasFragment := strings.Cut(schemaFile, "#")
+	b, err := os.ReadFile(filepath.Join(contractDir, "spec", "schema", filePart))
 	if err != nil {
 		t.Fatalf("read schema %s: %v", schemaFile, err)
 	}
@@ -99,14 +103,18 @@ func compileSchema(t *testing.T, schemaFile string) *jsonschema.Schema {
 	_ = json.Unmarshal(b, &meta)
 	id := meta.ID
 	if id == "" {
-		id = schemaFile
+		id = filePart
 	}
 	c := jsonschema.NewCompiler()
 	c.Draft = jsonschema.Draft2020
 	if err := c.AddResource(id, bytes.NewReader(b)); err != nil {
 		t.Fatalf("add schema %s: %v", schemaFile, err)
 	}
-	sch, err := c.Compile(id)
+	ref := id
+	if hasFragment {
+		ref += "#" + fragment
+	}
+	sch, err := c.Compile(ref)
 	if err != nil {
 		t.Fatalf("compile schema %s: %v", schemaFile, err)
 	}
@@ -117,9 +125,6 @@ func compileSchema(t *testing.T, schemaFile string) *jsonschema.Schema {
 // internal consistency: every golden fixture must validate against its schema.
 func TestContractFixturesValidateAgainstSchemas(t *testing.T) {
 	for _, fx := range loadFixtureIndex(t) {
-		if strings.Contains(fx.Schema, "#") {
-			continue // fragment-ref schema (offline toggle) — covered elsewhere
-		}
 		fx := fx
 		t.Run(fx.File, func(t *testing.T) {
 			sch := compileSchema(t, fx.Schema)
@@ -140,10 +145,92 @@ const (
 	seedMtime = 1700000000
 )
 
+// Seed a raw durable Ready status. Callers that report local availability must
+// separately install a validator and admit the exact test generation.
+func seedStatusReady(t *testing.T, store *pin.Store, path string) {
+	t.Helper()
+	e, ok := store.Get(path)
+	if !ok {
+		t.Fatal("missing seeded pin")
+	}
+	claimed, ok, err := store.ClaimPrefetch(*e)
+	if err != nil || !ok {
+		t.Fatalf("claim seeded pin: claimed=%v err=%v", ok, err)
+	}
+	if changed, err := store.CompleteReady(claimed, []byte("status-only-test-witness")); err != nil || !changed {
+		t.Fatalf("complete seeded status: changed=%v err=%v", changed, err)
+	}
+}
+
 // seedControlPlane wires the cbridge globals to seeded in-memory stores matching
 // the contract's fixture seed (contract/fake/README.md §Seed). Returns a restore
 // func that nils them so the package's other state is untouched.
-func seedControlPlane(t *testing.T) func() {
+// productionGUIServedRoutes mirrors the startup derivation in cbridge.go: the
+// metrics server's built-ins plus every route in controlPlaneRoutes.
+func productionGUIServedRoutes() []string {
+	served := []string{"/health", "/metrics"}
+	for route := range controlPlaneRoutes() {
+		served = append(served, route)
+	}
+	sort.Strings(served)
+	return served
+}
+
+// TestProductionCapabilitiesAreInVendoredWhoamiEnum is the direct B-7 guard:
+// every token the production GUI route inventory derives must be accepted by
+// the vendored whoami schema's capability enum, and the GUI fixture must list
+// exactly that set.
+func TestProductionCapabilitiesAreInVendoredWhoamiEnum(t *testing.T) {
+	caps := cplane.DeriveCapabilities(productionGUIServedRoutes())
+
+	var schema struct {
+		Properties struct {
+			Capabilities struct {
+				Items struct {
+					Enum []string `json:"enum"`
+				} `json:"items"`
+			} `json:"capabilities"`
+		} `json:"properties"`
+	}
+	if err := json.Unmarshal(readContractFile(t, "spec/schema/whoami.schema.json"), &schema); err != nil {
+		t.Fatal(err)
+	}
+	enum := map[string]bool{}
+	for _, tok := range schema.Properties.Capabilities.Items.Enum {
+		enum[tok] = true
+	}
+	if len(enum) == 0 {
+		t.Fatal("vendored whoami schema has no capability enum; refusing to report")
+	}
+	for _, tok := range caps {
+		if !enum[tok] {
+			t.Errorf("production /whoami advertises %q, which the vendored whoami schema enum rejects", tok)
+		}
+	}
+
+	var fixture struct {
+		Capabilities []string `json:"capabilities"`
+	}
+	if err := json.Unmarshal(readContractFile(t, "fixtures/whoami/gui.json"), &fixture); err != nil {
+		t.Fatal(err)
+	}
+	want := append([]string(nil), fixture.Capabilities...)
+	sort.Strings(want)
+	if !reflect.DeepEqual(caps, want) {
+		t.Errorf("production GUI capabilities drift from fixtures/whoami/gui.json:\n got  %v\n want %v", caps, want)
+	}
+}
+
+func readContractFile(t *testing.T, rel string) []byte {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join("..", "contract", filepath.FromSlash(rel)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+func seedControlPlane(t *testing.T, validator ...func(pin.Entry) bool) func() {
 	t.Helper()
 	mstore, err := metadata.Open(":memory:")
 	if err != nil {
@@ -160,16 +247,35 @@ func seedControlPlane(t *testing.T) func() {
 		{Path: "Project_Foo/clip_204.mov", Name: "clip_204.mov", ParentPath: "Project_Foo", Size: 1240000000, Inode: 1180620, Mtime: mt},
 		{Path: "Project_Foo/clip_205.mov", Name: "clip_205.mov", ParentPath: "Project_Foo", Size: 1240000000, Inode: 1180621, Mtime: mt},
 	} {
-		mstore.InsertToCache(e)
+		e.MtimeNsecKnown = true
+		if err := mstore.Insert(e); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	pstore, err := pin.Open(":memory:")
 	if err != nil {
 		t.Fatalf("pin.Open: %v", err)
 	}
-	// clip_031: fully resident (status ready, bytes_cached == size).
-	_ = pstore.Pin(clip031, 880000000, "/Volumes/zpool/Project_Foo")
-	_ = pstore.UpdateStatus(clip031, pin.StatusReady, 880000000, "")
+	// clip_031: durable Ready plus explicit mock admission for JSON contracts.
+	if err := pstore.Pin(clip031, 880000000, "/Volumes/zpool/Project_Foo"); err != nil {
+		t.Fatal(err)
+	}
+	seedStatusReady(t, pstore, clip031)
+	checkReady := func(e pin.Entry) bool { return len(e.Authority) != 0 }
+	if len(validator) == 1 {
+		checkReady = validator[0]
+	}
+	if err := pstore.SetReadyValidator(checkReady); err != nil {
+		t.Fatal(err)
+	}
+	seeded, ok := pstore.Get(clip031)
+	if !ok {
+		t.Fatal("missing seeded Ready pin")
+	}
+	if admitted, err := pstore.AdmitReady(*seeded); err != nil || !admitted {
+		t.Fatalf("admit JSON fixture: admitted=%v err=%v", admitted, err)
+	}
 	// clip_205: warming (prefetching, bytes_cached < size).
 	_ = pstore.Pin(clip205, 1240000000, "/Volumes/zpool/Project_Foo")
 	_ = pstore.UpdateStatus(clip205, pin.StatusPrefetching, 620000000, "")
@@ -183,31 +289,33 @@ func seedControlPlane(t *testing.T) func() {
 		t.Fatalf("derivatives.Open: %v", err)
 	}
 	seedDerivatives(t, dstore)
+	// Keep the absent-derivative fixture hermetic. The live handler performs a
+	// one-sidecar reconcile on an unknown inode and prefers globalFUSEPath; if a
+	// test leaves it empty, it falls back to the contract's display path
+	// (/Volumes/zpool) and can read whichever unrelated share the host mounted
+	// there. A local empty root proves the same absent-sidecar contract without
+	// touching user data or poisoning the process-wide sidecar admission gate.
+	fuseRoot := t.TempDir()
 
-	guiRoutes := []string{
-		"/health", "/metrics", "/pin", "/unpin", "/cache-status", "/offline",
-		"/whoami", "/residency", "/lookup", "/derivatives", "/metadata",
-		"/derivatives/register", // OL-1 → contribute capability
-		"/derivatives/changes",  // since= delta feed → changes capability
-		"/blob",                 // PROXY-CODEC #50 byte-range blob delivery → blob capability
-		"/assertions",           // JM-ASSERT #51 portable human metadata → assertions capability
-		"/reclaim", "/cache-clear", "/verify-pins", "/force-eject", "/stop",
-		"/self-test", "/spool", "/activity", "/spool-recover", "/mount-now",
-		"/debug/pprof/",
-	}
+	// B-7: derive the served set from the PRODUCTION route inventory, exactly
+	// as startup does (metrics built-ins + controlPlaneRoutes). A hand-kept
+	// list here once omitted /derivatives/batch, so live /whoami emitted a
+	// token the vendored schema rejected while this suite stayed green.
+	guiRoutes := productionGUIServedRoutes()
 
 	globalMu.Lock()
 	old := struct {
-		store                             *metadata.Store
-		pin                               *pin.Store
-		deriv                             *derivatives.Store
-		mount, want, vol, dbp, addr, inst string
-		caps                              []string
-	}{globalStore, globalPinStore, globalDerivStore, globalMountPath, globalWantMountPoint, globalVolumeName, globalDBPath, globalMetricsAddr, globalInstanceID, globalCapabilities}
+		store                                   *metadata.Store
+		pin                                     *pin.Store
+		deriv                                   *derivatives.Store
+		mount, fuse, want, vol, dbp, addr, inst string
+		caps                                    []string
+	}{globalStore, globalPinStore, globalDerivStore, globalMountPath, globalFUSEPath, globalWantMountPoint, globalVolumeName, globalDBPath, globalMetricsAddr, globalInstanceID, globalCapabilities}
 	globalStore = mstore
 	globalPinStore = pstore
 	globalDerivStore = dstore
 	globalMountPath = mp
+	globalFUSEPath = fuseRoot
 	globalWantMountPoint = mp
 	globalVolumeName = "zpool"
 	globalDBPath = "/seed/Library/Application Support/JuiceMount/metadata.db"
@@ -222,6 +330,7 @@ func seedControlPlane(t *testing.T) func() {
 		globalPinStore = old.pin
 		globalDerivStore = old.deriv
 		globalMountPath = old.mount
+		globalFUSEPath = old.fuse
 		globalWantMountPoint = old.want
 		globalVolumeName = old.vol
 		globalDBPath = old.dbp
@@ -336,6 +445,78 @@ func TestContractLiveConformance(t *testing.T) {
 	}
 }
 
+func TestContractResidencyUploadState(t *testing.T) {
+	restore := seedControlPlane(t)
+	defer restore()
+	globalMu.Lock()
+	store := globalStore
+	oldSpool := globalSpool
+	globalMu.Unlock()
+	if err := metadata.InitSpoolSchema(store.DB()); err != nil {
+		t.Fatal(err)
+	}
+	spoolMeta := metadata.NewSpoolStore(store.DB())
+	spool, err := jmnfs.NewSpoolStore(t.TempDir(), 0, spoolMeta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	globalMu.Lock()
+	globalSpool = spool
+	globalMu.Unlock()
+	defer func() {
+		globalMu.Lock()
+		globalSpool = oldSpool
+		globalMu.Unlock()
+		spool.Stop()
+	}()
+
+	check := func(path string, want any) {
+		t.Helper()
+		rr := httptest.NewRecorder()
+		handleResidencyHTTP(rr, httptest.NewRequest("GET", "/residency?"+url.Values{"path": {path}}.Encode(), nil))
+		if rr.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+		}
+		var got map[string]any
+		if err := json.Unmarshal(rr.Body.Bytes(), &got); err != nil {
+			t.Fatal(err)
+		}
+		if err := compileSchema(t, "residency.schema.json").Validate(got); err != nil {
+			t.Fatalf("invalid residency response: %v", err)
+		}
+		if got["upload_state"] != want {
+			t.Errorf("%s upload_state=%v, want %v", path, got["upload_state"], want)
+		}
+	}
+
+	check(clip204, nil)
+	failedID, err := spoolMeta.Insert("Project_Foo/clip_204.mov", "/spool/files/failed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := spoolMeta.MarkFailed(failedID, "upload exhausted"); err != nil {
+		t.Fatal(err)
+	}
+	check(clip204, "failed")
+
+	doneID, err := spoolMeta.Insert("Project_Foo/clip_031.mov", "/spool/files/done")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := spoolMeta.MarkDone(doneID); err != nil {
+		t.Fatal(err)
+	}
+	check(clip031, nil)
+	if ok, err := spoolMeta.ResetForRetry(failedID); err != nil || !ok {
+		t.Fatalf("retry failed upload: ok=%v err=%v", ok, err)
+	}
+	check(clip204, "ready")
+	if _, err := spoolMeta.MarkDone(failedID); err != nil {
+		t.Fatal(err)
+	}
+	check(clip204, nil)
+}
+
 // TestCacheStatusSnakeCaseTags is the JM-3 proof: the inner cache-status structs
 // (pin.AggregateStats / RootSummary / LiveStats) now marshal with snake_case wire
 // keys and no longer leak capitalized Go field names. Deterministic — avoids the
@@ -381,6 +562,63 @@ func TestCacheStatusSnakeCaseTags(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestContractCacheStatusEmptyRootsLive(t *testing.T) {
+	pstore, err := pin.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	globalMu.Lock()
+	oldPin, oldPrefetcher := globalPinStore, globalPrefetcher
+	globalPinStore, globalPrefetcher = pstore, nil
+	globalMu.Unlock()
+	t.Cleanup(func() {
+		globalMu.Lock()
+		globalPinStore, globalPrefetcher = oldPin, oldPrefetcher
+		globalMu.Unlock()
+		pstore.Close()
+	})
+
+	// The desktop archive (-tags serviceclient) never owns the pin store: its
+	// NFSServerCacheStatus forwards to the launchd serving process, which is
+	// built without the tag and answers from engineCacheStatus. Stand in for
+	// that process with the same engine snapshot, so the client build checks
+	// the document the user's GUI really receives, through the real forward.
+	var forwarded []string
+	if serviceClientBuild {
+		oldCall, oldPath := callServingProcess, servingSocketPath
+		callServingProcess = func(_ context.Context, _ string, req servicecontrol.Request) (servicecontrol.Response, error) {
+			forwarded = append(forwarded, req.Method)
+			b, err := json.Marshal(engineCacheStatus())
+			if err != nil {
+				return servicecontrol.Response{}, err
+			}
+			return servicecontrol.Response{Version: 1, Text: string(b)}, nil
+		}
+		servingSocketPath = func() (string, error) { return "/private/fixture/control.sock", nil }
+		t.Cleanup(func() { callServingProcess, servingSocketPath = oldCall, oldPath })
+	}
+
+	rec := httptest.NewRecorder()
+	handleCacheStatusHTTP(rec, httptest.NewRequest(http.MethodGet, "/cache-status", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+	}
+	if serviceClientBuild && !reflect.DeepEqual(forwarded, []string{"cache-status"}) {
+		t.Fatalf("desktop cache-status forwards = %v; want exactly one cache-status call", forwarded)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &doc); err != nil {
+		t.Fatal(err)
+	}
+	roots, ok := doc["roots"].([]any)
+	if !ok || len(roots) != 0 {
+		t.Fatalf("empty pin store roots = %v; want []", doc["roots"])
+	}
+	if err := compileSchema(t, "cache-status.schema.json").Validate(doc); err != nil {
+		t.Fatalf("live cache-status violates contract: %v", err)
 	}
 }
 

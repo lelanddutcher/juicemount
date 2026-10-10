@@ -44,7 +44,7 @@ func evictionRepairDecision(prevUsage, curUsage int64, fastLink, overCapacity bo
 	return prevUsage-curUsage >= evictionDropThreshold(prevUsage)
 }
 
-func evictionWatchLoop(ctx context.Context) {
+func evictionWatchLoop(ctx context.Context, pf *pin.Prefetcher) {
 	interval := evictionWatchInterval
 	if raw := os.Getenv("JM_EVICTION_WATCH_SEC"); raw != "" {
 		if n, err := strconv.Atoi(raw); err == nil && n >= 10 {
@@ -64,6 +64,9 @@ func evictionWatchLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
+			if ctx.Err() != nil {
+				return
+			}
 			v := pin.Capacity()
 			if v.Computed.IsZero() {
 				continue // CapacityLoop hasn't produced a verdict yet
@@ -76,15 +79,15 @@ func evictionWatchLoop(ctx context.Context) {
 				since = time.Since(lastRepair)
 			}
 			if evictionRepairDecision(prevUsage, cur, fast, v.OverCapacity, since) {
+				if ctx.Err() != nil {
+					return
+				}
 				lastRepair = time.Now()
-				globalMu.Lock()
-				pfr := globalPrefetcher
-				globalMu.Unlock()
-				if pfr != nil {
+				if pf != nil {
 					jmlog.Info("eviction watch: cache usage dropped — verifying pinned residency",
 						"prev_bytes", prevUsage, "now_bytes", cur)
-					ctx2, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
-					if rep, err := pfr.VerifyAndRepair(ctx2); err == nil {
+					ctx2, cancel := context.WithTimeout(ctx, 10*time.Minute)
+					if rep, err := pf.VerifyAndRepair(ctx2); err == nil {
 						jmlog.Info("eviction watch: pinned verify scheduled",
 							"files", rep.TotalPinned, "reenqueued", rep.Reenqueued)
 					} else {

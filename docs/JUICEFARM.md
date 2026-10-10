@@ -20,8 +20,8 @@ derivatives** of your media so that client apps never have to compute them on-de
 | **poster** | a representative still frame | `ffmpeg` |
 | **filmstrip** | a contact-sheet of frames for scrubbing | `ffmpeg` |
 | **waveform** | an audio waveform image (per-channel) | `ffmpeg` |
-| **proxy** | a small, seek-friendly H.264/MP4 playback proxy of a heavy original | `ffmpeg` (`libx264`) |
-| **transcript** | a spoken-word transcript (`ai.loupe.json`) | `whisper.cpp` |
+| **proxy** | a small, seek-friendly MP4 playback proxy of a heavy original | `ffmpeg` (verified hardware HEVC/H.264, or CPU H.264) |
+| **transcript** | a spoken-word transcript (`ai.logger.json`) | `whisper.cpp` |
 
 The point: a 4K ProRes camera original is expensive to scrub, preview, or transcode.
 The farm transcodes a lightweight proxy **once, server-side**, and **every** client that
@@ -55,15 +55,12 @@ camera originals over a shared volume. Two problems the farm solves:
         │   Redis (JuiceFS metadata)        MinIO/S3 (JuiceFS data)           │
         │        ▲                                ▲                           │
         │        │ juicefs mount (its OWN client) │                           │
-        │   ┌────┴────────────────────────────────┴────┐                      │
-        │   │  juicefarm-worker  (container, image      │                      │
-        │   │  juicefarm:local)                         │                      │
-        │   │   • BRPOP juicefarm:queue  (job intake)   │                      │
-        │   │   • ffprobe / ffmpeg / whisper.cpp        │                      │
-        │   │   • writes blobs + a JM-15 manifest       │                      │
-        │   │     sidecar to the VOLUME, + a server     │                      │
-        │   │     derivatives.db (Tier-B index)         │                      │
-        │   └───────────────────────────────────────────┘                     │
+        │   ┌────┴───────────────────────────────┐  ┌──────────────────────┐ │
+        │   │ server worker                      │  │ render worker        │ │
+        │   │ • tech + waveform metadata lane    │  │ • verified GPU only  │ │
+        │   │ • discovery leader + backstop      │  │ • HEVC/H.264 proxy   │ │
+        │   │ • visible CPU fallback lane        │  │ • video previews/AI  │ │
+        │   └─────────────────────────────────────┘  └──────────────────────┘ │
         └─────────────────────────────────────────────────────────────────────┘
                                    │  derivatives land on the shared volume at
                                    ▼  /<vol>/.juicemount/derivatives/<inode>/
@@ -86,17 +83,37 @@ Key properties:
   It is **byte-stable across macOS and Linux**, so a farm-generated blob passes a
   consumer's hash-freshness gate directly — a client trusts a derivative only when
   `hash == live source_hash`.
-- **Two passes, decoupled.** Cheap derivatives (tech/poster/filmstrip/waveform) commit
-  atomically and fast; the slow `-preset slow` proxy transcode and the whisper
-  transcript run as **separate** passes so a long encode never withholds the fast
-  results.
+- **Compute-aware derivative passes.** The public `derivatives` kind is planned into
+  server metadata/audio children and one-file video preview children. Poster and
+  filmstrip decoding uses a verified hardware decoder when available; unsupported
+  sources enter an explicit `cpu-decode` lane instead of demoting the rest of a batch.
+  Proxy transcode and Whisper transcript remain separate passes.
+- **Observed capability, not advertised hardware.** A render worker is admitted only
+  after it completes real encode and hardware-decode probes. H.264 Constrained
+  Baseline/Main/High and HEVC Main/Main10 are probed independently; plain H.264
+  Baseline remains distinct and is not inferred from Constrained Baseline. A worker may
+  claim only the source profiles it actually decoded in hardware. Its measured
+  encode, decode, transcript, and mount-read rates are published in the Manager.
+- **Durable claims.** Claiming a job atomically moves it to a per-worker processing
+  list with a renewable lease. If the worker disappears, another worker requeues the
+  receipt instead of losing work between a Redis pop and execution.
+- **Server-planned render batches.** Fresh derivatives, proxy, and transcript requests first enter
+  a metadata-only server lane. The server recursively discovers targets and publishes
+  deterministic bounded children (one file for transcripts and video previews, small
+  groups for proxy work); only those children enter measured GPU/CPU execution lanes. A render node
+  therefore never burns accelerator time walking an entire directory, and one
+  incompatible source cannot demote or block a directory-sized batch.
 
 ---
 
 ## How a job flows (queue mode)
 
-The worker runs `jmfarm -queue` and `BRPOP`s the Redis key `juicefarm:queue` (on the
-same metadata Redis, db 1). A job is a small JSON document:
+The worker runs `jmfarm -queue` against the same metadata Redis (db 1). Producers
+create one job per requested kind. Fresh derivatives/proxy/transcript requests first
+become server planning jobs; after recursive discovery, each bounded child is routed
+from the live, verified worker profiles to a server-metadata, render, or explicit
+CPU-fallback lane. A job is a small JSON document; scheduler
+annotations are additive. The planning parent looks like:
 
 ```json
 {
@@ -105,19 +122,68 @@ same metadata Redis, db 1). A job is a small JSON document:
   "kinds": ["proxy"],
   "producer": "manager",
   "enqueued_at": "<RFC-3339>",
-  "crf": 21, "preset": "slow", "vcodec": "libx264",
+  "crf": 21, "preset": "slow",
+  "plan_only": true,
+  "queue_class": "server",
+  "required_capabilities": ["metadata"],
+  "selected_backend": "server-dispatch",
   "model": "", "workers": 0, "proxy_workers": 0
 }
 ```
 
-Enqueue from the manager UI, from OpenLoupe, or by hand
-(`redis-cli -n 1 LPUSH juicefarm:queue '<json>'`). The worker:
+Its bounded children carry `parent_id`, `shard_index`, `shard_count`, exact
+`retry_targets`, and the measured execution admission such as
+`selected_backend: "hevc_vaapi"` or `selected_backend: "h264_vaapi"` for a preview
+decoder. Derivative children also carry `derivative_pass: "metadata"|"previews"`;
+`source_video_codec`, `source_video_profile`, `source_bit_depth`,
+`source_pixel_format`, `source_video_width`, and `source_video_height` preserve the server's live
+ffprobe result through retry/recovery. Proxy children are homogeneous bounded
+batches: a render child requires its hardware encoder plus both
+`decoder:h264_vaapi` and (for example)
+`decoder:h264_vaapi:profile:high`. Worker heartbeats publish the largest frame
+geometry and pixel formats each decoder actually completed during startup.
+Measured AV1 Main/Main10 and HEVC Rext 4:2:2/4:4:4 decoding can therefore feed
+the preferred hardware HEVC encoder on capable nodes. Sources exceeding the
+measured envelope, truly unverified codecs such as ProRes, and unverified pixel
+formats enter the explicit CPU/H.264 lane directly; they do not consume a GPU
+lease first. Intentional software decode is visible as `cpu-decode`. Planner
+admission is never copied to a child.
+
+Jobs arrive automatically from the recursive discovery watcher and its cursored
+backstop. The Manager's advanced path sweep and OpenLoupe remain repair/manual
+producers. Do not push raw JSON directly to a class queue: using the Manager API or
+`farmqueue.Enqueue` is what applies routing, status, dedupe, and recovery metadata.
+The execution worker:
 
 1. stats the source on its `/jfs` mount → inode + sampled hash,
 2. runs the requested generators,
 3. writes the blob(s) + the `manifest.json` sidecar + the `derivatives.db` row,
-4. (a permanently-failed job publishes a `failed` row so the consumer regenerates
+4. acknowledges the durable claim only after the terminal status is stored,
+5. (a permanently-failed job publishes a `failed` row so the consumer regenerates
    locally rather than waiting forever).
+
+The whole transport is controlled through `GET|PUT /api/farm/control`. Pause lets an
+in-flight atomic job finish, then prevents new claims. Automatic discovery has its
+own enable switch; dirty events remain pending while the farm is paused. One worker
+holds the short discovery-leader lease, and a 15-minute recursive modified-directory
+scan repairs events missed while Redis pub/sub or a worker was offline.
+
+Manager also exposes explicit per-node lifecycle controls. **Pause** stops that node
+from taking another claim while its current atomic work finishes. **Drain** does the
+same but reports `draining` immediately so planned maintenance is distinguishable
+from a general pause; **Resume** clears both flags. Heartbeats retain the legacy
+`current_job` ID and add `current_activity {id,kind,path,started_at,stage,pct}`.
+`GET /api/farm/queues` reports each physical execution lane, and
+`GET /api/farm/node/{name}/log` returns the live runtime's newest 200 bounded log
+lines. These routes, like every Manager API route, require the admin key.
+
+Queued or running work can be cooperatively canceled with
+`POST /api/farm/job/{id}/cancel`. The durable `juicefarm:cancel:{id}` flag is checked
+before work starts and once per second during execution; the worker commits terminal
+`canceled` before acknowledging its claim. A failed job can be retried with
+`POST /api/farm/job/{id}/requeue`. That creates exactly one new ID from the failed
+job's stored payload—including narrowed targets, backend, and explicit fallback
+lock—while the original terminal record remains immutable and links to the retry.
 
 ---
 
@@ -150,7 +216,7 @@ Build natively on the storage host (no cross-compile):
 docker build -f server/juicefarm/Dockerfile -t juicefarm:local .
 ```
 
-Run the standing **queue worker** as a side container on the JuiceFS compose network —
+Run a standing **server worker** as a side container on the JuiceFS compose network —
 **never** by re-applying the whole stack YAML (that restarts redis/minio, which the
 Mac client depends on):
 
@@ -161,18 +227,86 @@ docker run -d --name juicefarm-worker \
   --restart unless-stopped \
   -e JM_META=redis://redis:6379/1 \
   -e JM_FARM_QUEUE=1 \
+  -e JM_WORKER_NAME=nas-server-01 \
+  -e JM_WORKER_ROLE=server \
   -e JM_FARM_PRODUCER=linux-farm \
   -e JM_FARM_MODEL=/models/ggml-medium.en.bin \
+  -e JM_FARM_ENCODE_SCRATCH=/tmp \
   -v /path/to/juicefarm-cache:/jfs-cache \
   -v /path/to/juicefarm-state:/state \
-  juicefarm:local
+juicefarm:local
 ```
+
+Every standing worker should set a unique lowercase `JM_WORKER_NAME` and use a
+persistent `/state`, persistent `/jfs-cache`, and `--restart unless-stopped`. Those
+are the contracts behind Manager's pause/drain/resume/restart controls. The older
+emergency disable flag remains readable for rolling-upgrade compatibility, but the
+0.5 UI does not use it for planned maintenance. Restart is one-shot and is reported
+as successful only after the command is acknowledged and a replacement runtime ID
+heartbeats.
+
+Do not pin `jmfarm -version` in Compose, TrueNAS custom-app YAML, or enrollment
+scripts. Release builds derive the producer generation from their required exact
+commit. A `failed` derivative is terminal only for that producer generation, so a
+new image retries an older build's negative result once (for example, after an
+FFmpeg decoder upgrade) without retrying permanently unsupported media every sweep.
+
+Run render workers separately with `JM_WORKER_ROLE=render` and the GPU device(s)
+passed into the container. Render admission fails closed if the configured
+accelerator cannot complete its live probe. `auto` chooses render only when the
+probe succeeds; otherwise it becomes a server worker.
+
+For the Intel Arc/Vulkan image, expose the render node and the host's matching
+userspace drivers as read-only files. This matters for a GPU whose PCI ID is newer
+than the Mesa release in the image (for example, Intel Battlemage `8086:e223`). The
+Intel image pins `VK_ICD_FILENAMES` to the hardware ICD so Mesa's CPU-only llvmpipe
+device cannot satisfy admission:
+
+```bash
+docker run -d --name juicefarm-gpu-worker \
+  --restart unless-stopped \
+  --network <juicefs_compose_network> \
+  --cap-add SYS_ADMIN --security-opt apparmor=unconfined \
+  --device /dev/fuse --device /dev/dri \
+  -v /usr/lib/x86_64-linux-gnu/dri/iHD_drv_video.so:/usr/lib/x86_64-linux-gnu/dri/iHD_drv_video.so:ro \
+  -v /usr/lib/x86_64-linux-gnu/libvulkan_intel.so:/usr/lib/x86_64-linux-gnu/libvulkan_intel.so:ro \
+  -v /path/to/juicefarm-cache:/jfs-cache \
+  -v /path/to/juicefarm-state:/state \
+  -e JM_META=redis://redis:6379/1 \
+  -e JM_FARM_QUEUE=1 \
+  -e JM_WORKER_NAME=studio-render-01 \
+  -e JM_WORKER_ROLE=render \
+  -e JM_FARM_TRANSCRIPT_DEVICE=vulkan \
+  -e JM_FARM_VCODEC=hevc_vaapi \
+  -e JM_FARM_ENCODE_SCRATCH=/tmp \
+  juicefarm-gpu:local
+```
+
+The host driver bind is a recorded deployment dependency, not evidence of GPU
+readiness by itself. On every start, `jmfarm` runs a real hardware encode and
+decode plus a one-second Whisper inference. The worker advertises
+`transcript:vulkan` only after that inference succeeds. Check the Manager worker
+profile for a non-zero transcript real-time ratio and no Vulkan probe error before
+allowing it to claim accelerated AI jobs.
 
 Build gotchas (baked into the Dockerfile):
 
-- The JuiceFS `ce-v1.3.x` runtime is Debian **bullseye / glibc 2.31**; statically link
-  `jmfarm` and build `whisper.cpp` on bullseye so the symbols match.
+- Source the JuiceFS binary and FoundationDB client from the pinned
+  `ce-v1.3.x` image, but run the worker on Debian **trixie**. Its FFmpeg 7.1+
+  decodes modern camera audio such as Sony MOV/MP4 `ipcm`; inheriting the
+  upstream Debian 11 userland strands those tracks on FFmpeg 4.3. `jmfarm`
+  remains statically linked, and the bullseye-built static whisper binary runs
+  on the newer glibc runtime.
 - Use a **dedicated** farm cache dir, never the primary juicefs container's cache.
+- Bind that cache from persistent local storage; do not leave `/jfs-cache` in the
+  container writable layer. `JM_FARM_CACHE_DIR` selects the in-container path and
+  `JM_FARM_CACHE_SIZE` sets its MiB budget (default `20000`). Keep the budget below
+  the node's actual free space.
+- Keep `JM_FARM_ENCODE_SCRATCH` on node-local storage (the shipped default is
+  `/tmp`) and never under `/jfs`. FFmpeg closes its seek/rewrite-heavy MP4 there;
+  the worker then copies the completed immutable file into JuiceFS in one
+  sequential pass. A custom path must exist in the container and have room for
+  the largest single proxy or Quick Look preview each concurrent worker can emit.
 
 Modes: `JM_FARM_QUEUE=1` (standing queue drain) or `JM_FARM_MODE=all|transcript|…`
 with `JM_FARM_ONCE=1` (one-shot sweep). Throttling knobs: `JM_FARM_PROXY_WORKERS`
@@ -183,36 +317,94 @@ passes), `JM_FARM_CRF`/`JM_FARM_PRESET`, `JM_FARM_NICE`/`JM_FARM_IONICE`.
 
 ## The proxy contract (interoperability)
 
-So a farm-made proxy and a client's local fallback are **byte-interchangeable**, the
-proxy profile is locked: MP4 (ISO BMFF), single file, `+faststart` (moov first);
-H.264/AVC High, 8-bit `yuv420p` 4:2:0, BT.709 SDR, CFR, closed 2 s GOP; AAC-LC stereo
-128 kbps / 48 kHz; type string `video/mp4; codecs="avc1.640028, mp4a.40.2"`. The
-`proxy` derivative row carries `codec` / `codec_string` / `blob_size` so a consumer can
-gate playback (and skip the proxy if it isn't actually smaller) without re-probing.
-CRF/preset are a quality knob only; HEVC/AV1 are additive rungs where the farm has
-hardware encode — H.264 remains the guaranteed-decodable floor.
+Every proxy is a single MP4 (ISO BMFF) with `+faststart`; AAC-LC stereo 128 kbps /
+48 kHz; a closed 2 s GOP; and recorded `codec`, `codec_string`, and `blob_size` fields
+so a consumer can gate playback without re-probing. A verified hardware worker uses
+HEVC/H.265 first (`hvc1` tag), then hardware H.264 if HEVC is unavailable. CPU H.264
+(`libx264`) is the compatibility and outage fallback. Hardware proxy execution sets
+an explicit matching hardware decoder and never retries with software decode inside
+the render node; a failed/offline render node produces a visible reroute instead.
 
 ---
 
 ## Manager integration
 
-The `juicemount-manager` web UI exposes a **Farm tab** (read-only Phase 1): coverage by
-derivative kind, last-sweep summary, provenance (tech→ffprobe, proxy→libx264,
-ai→whisper.cpp), and the resolved throttling governor. The manager is CGO-free, so the
-farm pre-aggregates status to `/state/farm-status.json` and the manager relays it via
-`GET /api/farm`. Job control, scheduling, and per-directory opt-in are on the roadmap.
+The `juicemount-manager` web UI exposes a **Farm tab** with play/pause, automatic
+discovery control, per-lane queue depth and history, cooperative job cancel and
+exact-payload failed retry, live worker roles/capabilities/current stage, bounded
+worker logs, measured throughput, selected backend, attempts, explicit node
+pause/drain/resume/restart, commit-pinned node enrollment, and advanced manual
+repair sweeps. Set `JM_FARM_NODE_META_URL` to the Redis URL that
+new nodes can reach; Manager deliberately does not reuse a docker-internal Redis
+hostname for enrollment. Optional `JM_FARM_SERVER_IMAGE` and
+`JM_FARM_RENDER_IMAGE` values select registry images; otherwise the Manager derives
+the exact `rc-0.5-<commit>` tag from its own build. Remote enrollment additionally
+requires JuiceMount Link and returns a one-time Headscale command in an authenticated,
+`no-store` response.
+
+The manager is CGO-free: farm coverage is relayed from
+`/state/farm-status.json`, while queue, control, and worker state are read from Redis
+through bounded probes. Live sweep progress is freshness-checked: if a killed worker
+leaves an old `in_progress` record behind, Manager presents it as interrupted work
+instead of claiming that it is still running. Stable coverage and last-sweep history
+remain available.
+
+The same read-only state mount is also the Manager's physical-pool headroom probe.
+Before admitting a manual sweep or farm-wide resume, Manager requires the larger of
+64 GiB and 1% of the configured physical pool capacity to remain available. Set
+`JM_FARM_STORAGE_CAPACITY_BYTES` to `zpool list -Hp -o size <pool>` on ZFS: `statfs`
+available bytes reflect shared pool headroom, but its total is dataset-scoped and
+must not be presented as the zpool capacity. The server worker performs the
+same check before claiming output work. Each safe server-side probe refreshes a
+20-second Redis storage permit. Render workers expose that they require the permit and
+verify it in the same Redis transaction that claims a job. If the Manager/server loses
+its pool view, Redis stops accepting permit refreshes, or the permit expires, render
+workers remain visible as `waiting-storage-permit` but cannot claim more write-heavy
+work. An unprobeable or undersized backend revokes the permit and engages an atomic
+Redis safety pause for every worker; it never auto-resumes, and the Manager shows the
+reason until an operator restores space and explicitly presses Play.
+`JM_FARM_STORAGE_PATH` may name a more representative server-side path and
+`JM_FARM_MIN_FREE_BYTES` may override the worker reserve for a deliberately sized
+deployment.
+
+Proxy publication uses a durable, byte-bound receipt next to `proxy.mp4`. The worker
+writes the completed MP4 on node-local scratch, copies it into a descriptor-relative
+staged file in one sequential pass, and fsyncs the byte-bound receipt before the
+final blob rename. If the blob commits but
+the worker loses its private index or the shared manifest write fails, any later
+worker validates the exact blob, repairs registration, and skips re-encoding. This
+keeps retries idempotent across nodes and prevents overwritten JuiceFS slices from
+multiplying physical storage during an outage.
+
+JuiceFS intentionally retains both deleted files and stale slices from overwrites for
+the configured trash period. Automatic farm sweeps therefore preserve any current,
+source-matched, byte-validated portable proxy regardless of whether it is H.264,
+HEVC, or AV1; codec migration requires explicit regeneration. JuiceMount treats
+derivative idempotency and physical headroom as its own responsibilities. Do not put
+the MinIO object dataset under a high-retention recursive ZFS snapshot policy: those
+snapshots retain blocks after JuiceFS GC deletes the objects and make logical cleanup
+appear ineffective. Selective `chattr +s` trash bypass is
+not used by this RC: it was added upstream in JuiceFS v1.4.0, while the deployed stack
+is pinned to v1.3.1. A coordinated all-client JuiceFS upgrade can add that optional
+defense later; it is not required for the receipt and storage-permit fixes above.
 
 ---
 
 ## Status & roadmap
 
-- **Live + proven:** tech / poster / filmstrip / waveform / **proxy** / whisper
-  **transcript** generation; the queue worker; on-miss + full JM-15 discovery; the
-  proxy-codec + `/blob` byte-range contract; portable assertion sidecars; the Manager
-  Farm tab (read-only).
-- **Earmarked:** atomic blob writes deploy; manager-driven job control + scheduling +
-  per-directory opt-in (don't proxy an NLE's own proxies); GPU/ML workers for richer AI
-  (faces / OCR / framing) writing `ai.loupe.json`; locality/residency hints.
+- **RC:** automatic recursive discovery + persistent catch-up; durable queue claims;
+  farm-wide pause/play; server/render lane separation; benchmarked GPU admission;
+  hardware-decoded poster/filmstrip routing with per-file CPU fallback; HEVC-first
+  proxy routing with explicit H.264 fallback; a two-heartbeat render-outage grace
+  that prevents a brief node restart from dumping the ready backlog onto CPU;
+  portable-proxy preservation across worker codecs with explicit-only codec migration;
+  backend-headroom safety pause; cross-worker proxy commit recovery;
+  live Manager control, per-node drain/pause, cooperative cancellation,
+  exact-payload failed retry, and bounded node telemetry; tech/poster/filmstrip/waveform/proxy/
+  transcript generation; JM-15 discovery; `/blob` byte ranges; and portable
+  assertion sidecars.
+- **Not in this RC:** richer AI (faces/OCR/framing), historical benchmark models,
+  cross-volume locality scheduling, and the incomplete Teams/seats authorization UI.
 
 For the wire contract OpenLoupe and JuiceMount share, see the private
 `juicemount-contract` repository (spec + golden fixtures + `PROVIDER_STATUS` /

@@ -1,0 +1,37 @@
+--- a/pkg/meta/redis.go
++++ b/pkg/meta/redis.go
+@@ -1326,7 +1326,13 @@
+ }
+ 
+ func (m *redisMeta) doMknod(ctx Context, parent Ino, name string, _type uint8, mode, cumask uint16, path string, inode *Ino, attr *Attr) syscall.Errno {
++	operationID, birth := replaceguard.ParseBirthStageName(name)
+ 	return errno(m.txn(ctx, func(tx *redis.Tx) error {
++		if birth {
++			if err := m.prepareBirthCreate(ctx, tx, operationID, parent, *inode, _type, attr); err != nil {
++				return err
++			}
++		}
+ 		var pattr Attr
+ 		a, err := tx.Get(ctx, m.inodeKey(parent)).Bytes()
+ 		if err != nil {
+@@ -1345,10 +1351,20 @@
+ 		if (pattr.Flags & FlagImmutable) != 0 {
+ 			return syscall.EPERM
+ 		}
++		if birth && pattr.DefaultACL != 0 {
++			// getACL/insertACL may touch additional keys before TxPipelined.
++			return syscall.ENOTSUP
++		}
+ 
+ 		buf, err := tx.HGet(ctx, m.entryKey(parent), name).Bytes()
+ 		if err != nil && err != redis.Nil {
+ 			return err
++		}
++		if birth && err == nil {
++			// Clear candidate outputs: baseMeta.Create may otherwise turn
++			// EEXIST plus TypeFile into successful nonexclusive adoption.
++			*inode, *attr = 0, Attr{}
++			return syscall.EEXIST
+ 		}
+ 		var foundIno Ino
+ 		var foundType uint8

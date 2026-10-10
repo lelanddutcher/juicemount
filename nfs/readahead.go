@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/lelanddutcher/juicemount/internal/cache/pin"
 	"github.com/lelanddutcher/juicemount/internal/metrics"
 	"github.com/lelanddutcher/juicemount/internal/netprofile"
 )
@@ -32,6 +33,16 @@ const (
 
 	// Stale tracker entries are cleaned up after this duration.
 	trackerTTL = 30 * time.Second
+
+	// wanBulkSignalBytes is the amount of contiguous foreground demand that is
+	// strong enough to distinguish an actual file read from Finder's small
+	// metadata/preview probes. NFS subdivides each 1 MiB READ into 256 KiB
+	// ReadAt calls, so the historical hit-count-only guard could not recognize
+	// the user's intent reliably when some of those calls were served by the
+	// direct SSD cache. One MiB is bounded enough for cellular while allowing a
+	// single 4 MiB block to overlap the next foreground reads.
+	wanBulkSignalBytes = 1 << 20
+	wanBulkSubreadMax  = 256 << 10
 )
 
 // ReadaheadManager detects sequential read patterns and triggers
@@ -39,6 +50,20 @@ const (
 type ReadaheadManager struct {
 	fusePath string
 	fdPool   *FDPool // reuse pooled fds instead of opening new ones
+	// Acceptance-only: never let a local foreground cache hit schedule a
+	// speculative FUSE read behind the zero-byte remote-content guard.
+	refuseFUSEContentReads bool
+
+	// Test barriers observe real descriptor acquisition and wrap a real ReadAt.
+	// Set only before the manager starts workers; nil leaves production unchanged.
+	prefetchWorkerEntry  func()
+	prefetchWorkerExit   func()
+	afterPrefetchAcquire func(*os.File)
+	afterPrefetchGate    func()
+	prefetchReadAt       func(*os.File, []byte, int64) (int, error)
+	// Installed by the handler before serving. It captures local authority for
+	// the scheduled inode before this worker opens/reads its source descriptor.
+	mappingCapture func(uint64, string) *readaheadMappingJob
 
 	// profile drives link-aware prefetch policy (depth/width/enable) and is fed
 	// throughput samples from prefetch block reads. nil → historical defaults
@@ -50,8 +75,27 @@ type ReadaheadManager struct {
 
 	// Semaphore for concurrent readahead goroutines (sized to the fast-link max;
 	// the per-link policy.Workers caps how many slots are actually used).
-	sem    chan struct{}
-	stopCh chan struct{}
+	sem          chan struct{}
+	stopCh       chan struct{}
+	stopped      bool
+	stopOnce     sync.Once
+	wg           sync.WaitGroup
+	previewQueue chan previewJob
+	previewSeen  map[previewKey]time.Time
+	// A separate TryLock serializes best-effort directory scan progress without
+	// making foreground ReadDir wait for another speculative selector.
+	previewScanMu  sync.Mutex
+	previewCursors map[previewCursorKey]previewCursor
+	previewScanAge uint64
+	previewStop    chan struct{}
+	previewDone    chan struct{}
+	previewOnce    sync.Once
+	previewClosed  bool
+	previewRun     func(previewJob)
+	// Construction-only scalars, set before previewLoop starts. No caller
+	// pointer or live environment mutation is retained by the manager.
+	previewOptInSet   bool
+	previewOptInValue bool
 
 	// activePrefetch is the live count of in-flight prefetch goroutines, gated
 	// against the current policy's Workers so a slow link stays gentle.
@@ -78,22 +122,39 @@ func (rm *ReadaheadManager) effectivePolicy() netprofile.ReadaheadPolicy {
 }
 
 type readTracker struct {
-	lastOffset     int64
-	sequentialHits int
-	lastAccess     time.Time
-	prefetchedTo   int64 // highest offset we've already prefetched to
+	lastOffset      int64
+	sequentialHits  int
+	sequentialBytes int64
+	wanSubreadRun   bool
+	lastAccess      time.Time
+	prefetchedTo    int64 // highest offset we've already prefetched to
 }
 
-func NewReadaheadManager(fusePath string, fdPool *FDPool, profile *netprofile.Profile) *ReadaheadManager {
+func NewReadaheadManager(fusePath string, fdPool *FDPool, profile *netprofile.Profile, previewOptIn ...bool) *ReadaheadManager {
 	rm := &ReadaheadManager{
-		fusePath: fusePath,
-		fdPool:   fdPool,
-		profile:  profile,
-		trackers: make(map[uint64]*readTracker),
-		sem:      make(chan struct{}, maxReadaheadWorkers),
-		stopCh:   make(chan struct{}),
+		fusePath:       fusePath,
+		fdPool:         fdPool,
+		profile:        profile,
+		trackers:       make(map[uint64]*readTracker),
+		sem:            make(chan struct{}, maxReadaheadWorkers),
+		stopCh:         make(chan struct{}),
+		previewQueue:   make(chan previewJob, previewQueueLimit),
+		previewSeen:    make(map[previewKey]time.Time),
+		previewCursors: make(map[previewCursorKey]previewCursor),
+		previewStop:    make(chan struct{}),
+		previewDone:    make(chan struct{}),
 	}
-	go rm.cleanupLoop()
+	if len(previewOptIn) != 0 {
+		rm.previewOptInSet = true
+		rm.previewOptInValue = previewOptIn[0]
+	}
+	rm.wg.Add(1)
+	go rm.previewLoop()
+	rm.wg.Add(1)
+	go func() {
+		defer rm.wg.Done()
+		rm.cleanupLoop()
+	}()
 	return rm
 }
 
@@ -113,12 +174,11 @@ func serverReadaheadEnabled() bool {
 // the guard.
 //
 // Class-scaled so 10GbE/GbE (Fast/Medium) are UNCHANGED — the guard is DISABLED
-// there (0) so LAN prefetch fires exactly as before; only the slow WAN class
-// tightens, where an over-pull crosses the tunnel and costs seconds. ClassMetered
-// never reaches the trip at all (its policy is Enabled:false — the OnRead early
-// return above), so the guard is moot there. The value is set ABOVE the slow
-// class's SeqThreshold (4) so it actually creates a suppression band (runs of
-// 4–5 blocks are held; 6+ escalate) rather than being inert. nil profile ⇒
+// there (0) so LAN prefetch fires exactly as before; only constrained WAN
+// classes tighten, where an over-pull crosses the tunnel and costs seconds.
+// The value is ABOVE slow's SeqThreshold (4), creating a suppression band at
+// hits 4–5; it equals metered's threshold (6), so metered does not schedule
+// until a genuine run crosses six sequential blocks. nil profile ⇒
 // Medium (0, disabled), so an unwired manager behaves exactly as before.
 func smallPreviewRunBlocks(prof *netprofile.Profile) int {
 	if prof == nil {
@@ -137,9 +197,12 @@ func smallPreviewRunBlocks(prof *netprofile.Profile) int {
 // OnRead is called by the NFS read handler after every READ operation.
 // It tracks the read pattern and triggers readahead if sequential.
 func (rm *ReadaheadManager) OnRead(inode uint64, offset int64, size int, filePath string) {
+	if rm.refuseFUSEContentReads {
+		return
+	}
 	// S2 kill-switch (WAVE 1): default-on, env-disable. Off the per-RPC FUSE
 	// path — a single env read + early return, no lock taken when disabled.
-	if !serverReadaheadEnabled() {
+	if !serverReadaheadEnabled() || pin.IsOffline() {
 		return
 	}
 
@@ -147,10 +210,16 @@ func (rm *ReadaheadManager) OnRead(inode uint64, offset int64, size int, filePat
 
 	rm.mu.Lock()
 	defer rm.mu.Unlock()
+	if rm.stopped || pin.IsOffline() {
+		return
+	}
 
 	tracker, ok := rm.trackers[inode]
 	if !ok {
-		tracker = &readTracker{}
+		tracker = &readTracker{
+			sequentialBytes: int64(size),
+			wanSubreadRun:   size > 0 && size <= wanBulkSubreadMax,
+		}
 		rm.trackers[inode] = tracker
 	}
 
@@ -163,21 +232,36 @@ func (rm *ReadaheadManager) OnRead(inode uint64, offset int64, size int, filePat
 
 	if isSequential && offset > tracker.lastOffset {
 		tracker.sequentialHits++
+		tracker.sequentialBytes += int64(size)
+		tracker.wanSubreadRun = tracker.wanSubreadRun && size > 0 && size <= wanBulkSubreadMax
 	} else {
 		tracker.sequentialHits = 0
+		if ok {
+			tracker.sequentialBytes = int64(size)
+			tracker.wanSubreadRun = size > 0 && size <= wanBulkSubreadMax
+		}
 	}
 	tracker.lastOffset = offset
 
-	// Metered/weak link: do NOT prefetch ahead at all. We still keep tracking the
-	// pattern (cheap) so that if the link recovers and reclassifies, the very next
-	// read can trigger — but on a metered link an xattr/Quick-Look probe must
-	// never escalate to a whole-file pull (docs/TUNING/01-bandwidth §Read amp).
+	// A disabled policy (operator kill-switch/override) still tracks the pattern
+	// so a live policy change can trigger on the next read. Production's metered
+	// policy is enabled but guarded and limited to one block/one worker.
 	if !policy.Enabled {
 		return
 	}
 
-	// Trigger readahead after the link-aware threshold of consecutive sequential reads
-	if tracker.sequentialHits >= policy.SeqThreshold {
+	// On WAN, a contiguous 1 MiB foreground run is itself a strong signal even
+	// when NFS's 256 KiB subdivision has not reached the historical hit count.
+	// Medium/Fast links retain the hit-count-only policy exactly.
+	strongWANRun := false
+	if rm.profile != nil && tracker.wanSubreadRun && tracker.sequentialBytes >= wanBulkSignalBytes {
+		class := rm.profile.Class()
+		strongWANRun = class == netprofile.ClassMetered || class == netprofile.ClassSlow
+	}
+
+	// Trigger readahead after the link-aware hit threshold or a bounded WAN
+	// bulk signal.
+	if tracker.sequentialHits >= policy.SeqThreshold || strongWANRun {
 		// S2 short-run guard (WAVE 1, RC-4): a SHORT sequential run on a WAN link
 		// is a Finder preview probe (a few 256KiB subreads of one file), not a
 		// real large sequential reel read. Escalating it to the policy's 64MB
@@ -187,8 +271,13 @@ func (rm *ReadaheadManager) OnRead(inode uint64, offset int64, size int, filePat
 		// read still escalates once it grows past the threshold. This is a plain
 		// comparison on the already-tracked sequentialHits — NO new syscall.
 		// Disabled (threshold 0) on Fast/Medium, so 10GbE/GbE are unchanged.
-		if guard := smallPreviewRunBlocks(rm.profile); guard > 0 && tracker.sequentialHits < guard {
+		if guard := smallPreviewRunBlocks(rm.profile); !strongWANRun && guard > 0 && tracker.sequentialHits < guard {
 			metrics.Default().IncReadaheadSuppressed()
+			return
+		}
+		// Offline may have engaged while this read updated its tracker.
+		// Admission and WaitGroup registration stay serialized with Stop.
+		if pin.IsOffline() {
 			return
 		}
 		// Calculate the range to prefetch (depth scales with the link).
@@ -211,7 +300,25 @@ func (rm *ReadaheadManager) OnRead(inode uint64, offset int64, size int, filePat
 		metrics.Default().IncReadaheadTriggered()
 
 		// Fire background prefetch (non-blocking), capped by the policy's worker budget.
-		go rm.prefetch(filePath, prefetchStart, prefetchEnd, policy.Workers)
+		rm.wg.Add(1)
+		go func() {
+			defer rm.wg.Done()
+			rm.prefetchWithInode(inode, filePath, prefetchStart, prefetchEnd, policy.Workers)
+		}()
+	}
+}
+
+// prefetchAllowed checks the current offline and lifecycle state at each
+// admission boundary. A syscall already admitted remains owned until it ends.
+func (rm *ReadaheadManager) prefetchAllowed() bool {
+	if pin.IsOffline() {
+		return false
+	}
+	select {
+	case <-rm.stopCh:
+		return false
+	default:
+		return true
 	}
 }
 
@@ -219,6 +326,20 @@ func (rm *ReadaheadManager) OnRead(inode uint64, offset int64, size int, filePat
 // maxWorkers caps concurrency to the current link policy (the semaphore is sized
 // to the fast-link max; a slow link uses fewer of its slots).
 func (rm *ReadaheadManager) prefetch(filePath string, start, end int64, maxWorkers int) {
+	rm.prefetchWithInode(0, filePath, start, end, maxWorkers)
+}
+
+func (rm *ReadaheadManager) prefetchWithInode(inode uint64, filePath string, start, end int64, maxWorkers int) {
+	if rm.prefetchWorkerExit != nil {
+		defer rm.prefetchWorkerExit()
+	}
+	// Defense in depth for work queued before a lifecycle toggled the guard.
+	if rm.prefetchWorkerEntry != nil {
+		rm.prefetchWorkerEntry()
+	}
+	if rm.refuseFUSEContentReads || !rm.prefetchAllowed() {
+		return
+	}
 	// Gate against the link-aware worker budget BEFORE taking a semaphore slot.
 	if maxWorkers < 1 {
 		maxWorkers = 1
@@ -236,10 +357,8 @@ func (rm *ReadaheadManager) prefetch(filePath string, start, end int64, maxWorke
 		return // all workers busy, skip this round
 	}
 
-	select {
-	case <-rm.stopCh:
+	if !rm.prefetchAllowed() {
 		return
-	default:
 	}
 
 	// Read-QoS (#4, INSTANT-NAV): prefetch is the LOWEST read class. On
@@ -251,61 +370,115 @@ func (rm *ReadaheadManager) prefetch(filePath string, start, end int64, maxWorke
 	if !qosOK {
 		return
 	}
-	defer qosRelease()
-
-	fusePath := rm.fusePath + "/" + filePath
-
-	// Use FDPool if available, otherwise fall back to direct open
-	var fd *os.File
-	var usePool bool
-	if rm.fdPool != nil {
-		var err error
-		fd, err = rm.fdPool.Get(fusePath)
-		if err != nil {
-			return
-		}
-		usePool = true
-	} else {
-		var err error
-		fd, err = os.Open(fusePath)
-		if err != nil {
-			return
+	if !rm.prefetchAllowed() {
+		qosRelease()
+		return
+	}
+	var mapping *readaheadMappingJob
+	if inode != 0 && rm.mappingCapture != nil {
+		mapping = rm.mappingCapture(inode, filePath)
+		if mapping != nil {
+			defer mapping.release()
 		}
 	}
-	defer func() {
-		if usePool {
-			rm.fdPool.Release(fusePath)
+
+	fusePath := rm.fusePath + "/" + filePath
+	// Scope the descriptor before mapping preparation. Metadata traffic must
+	// not retain a FUSE source fd or any per-read FUSE data gate.
+	func() {
+		defer qosRelease()
+
+		// Use FDPool if available, otherwise fall back to direct open
+		var fd *os.File
+		var usePool bool
+		if rm.fdPool != nil {
+			var err error
+			fd, err = rm.fdPool.Get(fusePath)
+			if err != nil {
+				return
+			}
+			usePool = true
 		} else {
-			fd.Close()
-		}
-	}()
-
-	buf := make([]byte, readaheadBlockSize)
-	for off := start; off < end; off += readaheadBlockSize {
-		select {
-		case <-rm.stopCh:
-			return
-		default:
-		}
-
-		t0 := time.Now()
-		n, err := fd.ReadAt(buf, off)
-		if n > 0 {
-			rm.statsMu.Lock()
-			rm.prefetched++
-			rm.statsMu.Unlock()
-			// WAVE 0 (grades S2): accumulate blocks actually prefetched.
-			metrics.Default().AddReadaheadPrefetchedBlocks(1)
-			// Feed the link estimator. A cold block is a real backend transfer
-			// (slow); a cache hit is sub-ms and gets filtered out inside
-			// ObserveThroughput, so only wire-speed samples move the estimate.
-			if rm.profile != nil {
-				rm.profile.ObserveThroughput(int64(n), time.Since(t0))
+			var err error
+			fd, err = os.Open(fusePath)
+			if err != nil {
+				return
 			}
 		}
-		if err != nil {
-			break // EOF or error
+		defer func() {
+			if usePool {
+				rm.fdPool.Release(fusePath)
+			} else {
+				fd.Close()
+			}
+		}()
+		if rm.afterPrefetchAcquire != nil {
+			rm.afterPrefetchAcquire(fd)
 		}
+		if !rm.prefetchAllowed() {
+			return
+		}
+
+		buf := make([]byte, readaheadBlockSize)
+		for off := start; off < end; off += readaheadBlockSize {
+			if !rm.prefetchAllowed() {
+				return
+			}
+
+			// FUSE data ceiling (2026-08-05 double kernel panic). Prefetch adds up
+			// to 8 concurrent readers on a fast link — a third of the 16-wide
+			// ceiling — spent entirely on work nobody asked for yet. Use the
+			// NON-BLOCKING background acquire: a foreground acquireFUSEData would
+			// let speculative reads sit in the 250ms admission window ahead of a
+			// user's actual read, inverting the priority this prefetcher exists to
+			// serve. If there is no room, drop the block; the next real read will
+			// fetch it.
+			gateRelease, gateOK := tryAcquireFUSEDataBackground()
+			if !gateOK {
+				metrics.Default().IncReadQoSPrefetchShed()
+				continue
+			}
+			if rm.afterPrefetchGate != nil {
+				rm.afterPrefetchGate()
+			}
+			// The nonblocking gate is owned even when offline/Stop wins after
+			// acquisition. Keep it through an admitted ReadAt and release it once.
+			if !rm.prefetchAllowed() {
+				gateRelease()
+				return
+			}
+			t0 := time.Now()
+			var n int
+			var err error
+			if rm.prefetchReadAt != nil {
+				n, err = rm.prefetchReadAt(fd, buf, off)
+			} else {
+				n, err = fd.ReadAt(buf, off)
+			}
+			gateRelease()
+			if n > 0 {
+				if mapping != nil {
+					mapping.record(off, n)
+				}
+				rm.statsMu.Lock()
+				rm.prefetched++
+				rm.statsMu.Unlock()
+				// WAVE 0 (grades S2): accumulate blocks actually prefetched.
+				metrics.Default().AddReadaheadPrefetchedBlocks(1)
+				// Feed the link estimator. A cold block is a real backend transfer
+				// (slow); a cache hit is sub-ms and gets filtered out inside
+				// ObserveThroughput, so only wire-speed samples move the estimate.
+				if rm.profile != nil {
+					rm.profile.ObserveThroughput(int64(n), time.Since(t0))
+				}
+			}
+			if err != nil {
+				break // EOF or error
+			}
+		}
+	}()
+	if mapping != nil {
+		mapping.prepare()
 	}
 }
 
@@ -339,7 +512,19 @@ func (rm *ReadaheadManager) cleanupLoop() {
 
 // Stop shuts down the readahead manager.
 func (rm *ReadaheadManager) Stop() {
-	close(rm.stopCh)
-	log.Printf("readahead: stopped (triggered=%d, prefetched=%d blocks)",
-		rm.triggered, rm.prefetched)
+	rm.beginPreviewStop()
+	rm.stopOnce.Do(func() {
+		// Serialize the stopped transition with OnRead's WaitGroup.Add. Once
+		// stopped is visible, no new prefetch goroutine can be registered, so
+		// waiting for the existing set is valid and teardown cannot leak work
+		// into the next server/test instance.
+		rm.mu.Lock()
+		rm.stopped = true
+		close(rm.stopCh)
+		rm.mu.Unlock()
+		rm.wg.Wait()
+		triggered, prefetched := rm.Stats()
+		log.Printf("readahead: stopped (triggered=%d, prefetched=%d blocks)",
+			triggered, prefetched)
+	})
 }

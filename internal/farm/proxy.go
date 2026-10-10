@@ -1,9 +1,10 @@
 package farm
 
 import (
+	"context"
 	"fmt"
+	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -11,6 +12,76 @@ import (
 
 	"github.com/lelanddutcher/juicemount/internal/derivatives"
 )
+
+// proxyEncodeArgs returns the video-encoder portion of the ffmpeg command for
+// a contract-locked proxy. Encoder families require materially different
+// options: passing the software CRF/preset pair to VAAPI is a hard ffmpeg error
+// and VAAPI needs frames uploaded to the DRM device before it can encode.
+//
+// H.264 remains the default floor. HEVC is an explicit per-worker/per-job
+// choice; the completed bytes, rather than this intent, supply the published
+// codec metadata.
+func proxyEncodeArgs(vcodec string, crf int, preset string) []string {
+	switch {
+	case strings.HasSuffix(vcodec, "_vaapi"):
+		if crf <= 0 {
+			crf = 23
+		}
+		return []string{
+			"-vf", "scale_vaapi=format=nv12",
+			"-c:v", vcodec,
+			"-qp", strconv.Itoa(crf),
+			"-compression_level", "3",
+			"-bf", "2",
+		}
+	case strings.HasSuffix(vcodec, "_qsv"):
+		if crf <= 0 {
+			crf = 23
+		}
+		if preset == "" {
+			preset = "veryfast"
+		}
+		return []string{
+			"-vf", "scale_qsv=format=nv12",
+			"-c:v", vcodec,
+			"-global_quality", strconv.Itoa(crf),
+			"-preset", preset,
+		}
+	case strings.HasSuffix(vcodec, "_nvenc"):
+		// NVENC's constant-quality switch is -cq, not the software
+		// encoders' -crf. Keep the public Farm quality control as CRF-like
+		// 1-51, but translate it at the encoder boundary.
+		return []string{
+			"-c:v", vcodec,
+			"-cq", strconv.Itoa(crf),
+			"-preset", preset,
+		}
+	default:
+		return []string{
+			"-c:v", vcodec,
+			"-pix_fmt", "yuv420p",
+			"-crf", strconv.Itoa(crf),
+			"-preset", preset,
+		}
+	}
+}
+
+// proxyDecodeArgs forces accelerator-backed decode whenever an accelerator
+// encoder was selected. There is deliberately no software-decode retry inside
+// Proxy: a render node must either complete the whole video path on its GPU or
+// fail the job so the queue can visibly re-route it to the server fallback.
+func proxyDecodeArgs(vcodec string) []string {
+	switch {
+	case strings.HasSuffix(vcodec, "_vaapi"):
+		return []string{"-hwaccel", "vaapi", "-hwaccel_device", "/dev/dri/renderD128", "-hwaccel_output_format", "vaapi"}
+	case strings.HasSuffix(vcodec, "_qsv"):
+		return []string{"-hwaccel", "qsv", "-hwaccel_device", "/dev/dri/renderD128", "-hwaccel_output_format", "qsv"}
+	case strings.HasSuffix(vcodec, "_nvenc"):
+		return []string{"-hwaccel", "cuda", "-hwaccel_output_format", "cuda"}
+	default:
+		return nil
+	}
+}
 
 // Proxy transcodes the source to the contract-locked OL-3 proxy: a SINGLE
 // progressive MP4 with the moov atom first (-movflags +faststart) so both
@@ -31,6 +102,10 @@ import (
 // GPU/APU NAS — the locked container/pix_fmt/audio stay identical so the blob is
 // still interchangeable. The HTTP Range/206 serving is a SEPARATE lane.
 func Proxy(ffmpegBin, vcodec string, crf int, preset, srcPath, outPath string) error {
+	return ProxyContext(context.Background(), ffmpegBin, vcodec, crf, preset, srcPath, outPath)
+}
+
+func ProxyContext(ctx context.Context, ffmpegBin, vcodec string, crf int, preset, srcPath, outPath string) error {
 	if ffmpegBin == "" {
 		ffmpegBin = "ffmpeg"
 	}
@@ -43,43 +118,165 @@ func Proxy(ffmpegBin, vcodec string, crf int, preset, srcPath, outPath string) e
 	if preset == "" {
 		preset = "slow"
 	}
-	if err := os.MkdirAll(filepath.Dir(outPath), 0o755); err != nil {
-		return err
-	}
-	// Encode to a temp sibling, then atomically rename onto outPath so a
-	// concurrent OpenLoupe reader never sees a partially-encoded proxy.
-	tmpPath := atomicTempPath(outPath)
-	defer os.Remove(tmpPath) // no-op once the commit rename consumes it
-	// -pix_fmt yuv420p forces 8-bit 4:2:0 from any source (10-bit/HDR/422
-	// originals included), the lowest-common-denominator both decoders accept.
-	// crf/preset are the quality knob (size/quality only — interchange-safe).
+	// WRITES DIRECTLY TO outPath, which the caller already created inside the
+	// derivative directory with O_EXCL|O_NOFOLLOW and will commit onto the real
+	// blob name with renameat through a held descriptor.
+	//
+	// This function used to add its OWN atomic layer — encode to a temp sibling,
+	// then rename by path — which was redundant once the caller had one, and was
+	// the last unanchored surface here: the sibling was NOT created by us, so it
+	// could already BE a planted symlink, and os.Rename/os.Open/syncDir all
+	// resolve by name. On the farm host that is a root-privileged write out of
+	// the volume. Reader visibility is unaffected: the staged name is dot-
+	// prefixed and is never the blob's real name, so a reader only ever sees the
+	// final name appear atomically at the caller's renameat.
+	// proxyEncodeArgs selects the correct quality and device wiring for the
+	// configured encoder. GenerateProxy supplies a node-local output path and
+	// owns the later descriptor-anchored one-pass publish and final rename.
 	args := append([]string{"-y", "-loglevel", "error"}, proxyThreadArgs()...)
+	args = append(args, proxyDecodeArgs(vcodec)...)
 	args = append(args,
 		"-i", srcPath,
-		"-c:v", vcodec, "-pix_fmt", "yuv420p", "-crf", strconv.Itoa(crf), "-preset", preset,
 		"-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-ac", "2",
 		"-movflags", "+faststart",
-		// Force the MP4 muxer: the temp path lacks the .mp4 extension ffmpeg
-		// would otherwise infer the container from.
-		"-f", "mp4",
-		tmpPath)
-	cmd := exec.Command(ffmpegBin, args...)
+		// Force the MP4 muxer so container selection never depends on the caller's
+		// scratch filename.
+		"-f", "mp4")
+	args = append(args, proxyEncodeArgs(vcodec, crf, preset)...)
+	if strings.Contains(vcodec, "hevc") || strings.Contains(vcodec, "h265") || strings.Contains(vcodec, "265") {
+		args = append(args, "-tag:v", "hvc1")
+	}
+	args = append(args, outPath)
+	cmd := commandContext(ctx, ffmpegBin, args...)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("ffmpeg proxy %q: %w: %s", srcPath, err, out)
-	}
-	if err := atomicCommitFile(tmpPath, outPath); err != nil {
-		return fmt.Errorf("commit proxy %q: %w", outPath, err)
 	}
 	return nil
 }
 
 // ProxyResult is the per-file outcome of a proxy-generation pass.
 type ProxyResult struct {
-	Path  string
-	Inode uint64
-	Hash  string
-	Wrote bool
-	Err   error
+	Path         string
+	Inode        uint64
+	Hash         string
+	Wrote        bool
+	SkippedFresh bool
+	Err          error
+}
+
+// proxyFresh reports whether the current proxy already satisfies this pass.
+// One-shot/explicit codec runs retain exact-codec semantics. Automatic queue
+// sweeps set PreserveExistingProxy, because replacing a current portable proxy
+// merely to promote H.264 to HEVC creates no new derivative and retains the old
+// JuiceFS slices for TrashDays. Operators can still request a codec migration
+// deliberately with RegenerateFresh.
+//
+// Fail closed. The source record, derivative vouch, codec label, and actual
+// regular blob must all agree. Missing/legacy fields regenerate once and become
+// eligible for future skips. RegenerateFresh is the explicit operator override.
+func proxyFresh(store *derivatives.Store, inode uint64, hash string, size int64, opt Options) bool {
+	if store == nil || opt.RegenerateFresh || opt.Mount == "" {
+		return false
+	}
+	if proxyFreshIndexed(store, inode, hash, size, opt) {
+		return true
+	}
+	// Farm workers keep private SQLite caches, while manifest.json is the
+	// cross-worker index. A NAS fallback cannot decide freshness from its local
+	// rows alone: the successful HEVC proxy may have been produced by a GPU whose
+	// /state database is on another host. Reconcile on a local miss, then repeat
+	// the exact same fail-closed checks. This read is avoided for the common hot
+	// path where the current worker already owns a valid row.
+	if _, err := ReconcileOneSidecar(store, opt.Mount, inode); err != nil {
+		return false
+	}
+	return proxyFreshIndexed(store, inode, hash, size, opt)
+}
+
+func proxyFreshIndexed(store *derivatives.Store, inode uint64, hash string, size int64, opt Options) bool {
+	known, sourceHash := store.Known(inode)
+	if !known || sourceHash == nil || *sourceHash != hash {
+		return false
+	}
+	rows, err := store.Manifest(inode)
+	if err != nil {
+		return false
+	}
+	desiredCodec := proxyDesiredCodec(opt.ProxyVCodec)
+	for _, row := range rows {
+		codecSatisfied, verifyCodec := proxyCodecSatisfied(row.Codec, desiredCodec, opt)
+		if row.Kind != "proxy" || row.Status != "ready" ||
+			row.Hash == nil || *row.Hash != hash ||
+			row.SourceSize == nil || *row.SourceSize != size ||
+			!codecSatisfied ||
+			row.BlobRelPath == nil || *row.BlobRelPath != "proxy.mp4" {
+			continue
+		}
+		blobRel := derivatives.DerivBlobRel(inode, "proxy.mp4")
+		blobInfo, err := derivatives.StatRegularUnder(opt.Mount, blobRel)
+		if err != nil {
+			continue
+		}
+		// Cross-worker replacement is possible: a GPU cache can still say HEVC
+		// after a CPU worker atomically replaced the shared bytes with H.264.
+		// Generated rows carry the exact blob size, so reject that stale vouch.
+		if row.BlobSize != nil && *row.BlobSize != blobInfo.Size() {
+			continue
+		}
+		if verifyCodec {
+			// A cross-codec preservation exception must validate the bytes, not
+			// merely trust the sidecar's label. manifest.json is consumer-writable;
+			// ffprobe of the held regular file proves the shared blob really is the
+			// codec the row advertises.
+			actual, err := probeProxyBlobCodecContext(optionContext(opt), opt.FFprobeBin, opt.Mount, blobRel)
+			if err != nil || row.Codec == nil || actual != *row.Codec {
+				continue
+			}
+		}
+		return true
+	}
+	return false
+}
+
+func proxyCodecSatisfied(existing *string, desired string, opt Options) (satisfied, verify bool) {
+	if existing == nil {
+		return false, false
+	}
+	if *existing == desired {
+		return true, false
+	}
+	if opt.PreserveHEVCOnFallback && desired == "h264" && *existing == "hevc" {
+		return true, true
+	}
+	if opt.PreserveExistingProxy && supportedProxyCodec(*existing) {
+		return true, true
+	}
+	return false, false
+}
+
+func supportedProxyCodec(codec string) bool {
+	switch codec {
+	case "h264", "hevc", "av1":
+		return true
+	default:
+		return false
+	}
+}
+
+func probeProxyBlobCodec(ffprobeBin, mount, rel string) (string, error) {
+	return probeProxyBlobCodecContext(context.Background(), ffprobeBin, mount, rel)
+}
+
+func probeProxyBlobCodecContext(ctx context.Context, ffprobeBin, mount, rel string) (string, error) {
+	f, err := derivatives.OpenRegularUnder(mount, rel)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	// Pass the already-open, O_NOFOLLOW-validated descriptor to ffprobe. Using
+	// the joined path here would reintroduce a check/use race after the anchored
+	// stat above. ExtraFiles exposes f as descriptor 3 in the child on Unix.
+	return probeProxyFileCodecContext(ctx, ffprobeBin, f)
 }
 
 // GenerateProxy renders the OL-3 proxy for one file and commits a single `proxy`
@@ -89,6 +286,11 @@ type ProxyResult struct {
 // publishing immediately instead of withholding them behind the proxy encode.
 func GenerateProxy(store *derivatives.Store, path string, opt Options) ProxyResult {
 	res := ProxyResult{Path: path}
+	ctx := optionContext(opt)
+	if err := ctx.Err(); err != nil {
+		res.Err = err
+		return res
+	}
 	fi, err := os.Stat(path)
 	if err != nil {
 		res.Err = err
@@ -108,45 +310,194 @@ func GenerateProxy(store *derivatives.Store, path string, opt Options) ProxyResu
 		return res
 	}
 	res.Hash = hash
+	if err := ctx.Err(); err != nil {
+		res.Err = err
+		return res
+	}
 
-	tech, err := Probe(opt.FFprobeBin, path, fi.Size())
+	if proxyFresh(store, inode, hash, fi.Size(), opt) {
+		// The existing row is a source/blob freshness vouch, not authority for
+		// codec metadata. Repair the row and shared sidecar from the held bytes.
+		fresh, repairErr := repairFreshProxyMetadata(store, fi, inode, hash, opt)
+		if repairErr != nil {
+			res.Err = fmt.Errorf("repair current proxy metadata: %w", repairErr)
+			return res
+		}
+		if fresh {
+			res.SkippedFresh = true
+			return res
+		}
+	}
+	if recovered, recoverErr := recoverProxyCommitReceipt(store, fi, inode, hash, opt); recovered {
+		if recoverErr != nil {
+			res.Err = recoverErr
+			return res
+		}
+		res.SkippedFresh = true
+		return res
+	}
+	if err := ctx.Err(); err != nil {
+		res.Err = err
+		return res
+	}
+
+	tech, err := ProbeContext(ctx, opt.FFprobeBin, path, fi.Size())
 	if err != nil {
 		res.Err = err
 		return res
 	}
 	if tech.Video == nil {
+		// A previous ffprobe could mistake attached cover art for video and leave
+		// a failed proxy row. Omission cannot remove it from the cross-worker
+		// sidecar union, so replace only that failed row with an explicit absent
+		// tombstone. A ready contributed proxy is never touched.
+		if row, stale := absentIfPreviouslyFailed(store, inode, "proxy", opt.Producer, opt.Version, hash); stale {
+			stampSource(&row, fi)
+			if err := store.PutSource(inode, &hash); err != nil {
+				res.Err = fmt.Errorf("put source for absent proxy: %w", err)
+				return res
+			}
+			if err := store.PutDeriv(inode, row); err != nil {
+				res.Err = fmt.Errorf("put absent proxy: %w", err)
+				return res
+			}
+			if opt.Mount != "" {
+				if err := WriteManifestSidecar(store, opt.Mount, inode); err != nil {
+					res.Err = fmt.Errorf("publish absent proxy manifest: %w", err)
+					return res
+				}
+			}
+		}
 		return res // audio-only / no video stream → no proxy (Wrote stays false)
 	}
 
 	rel := "proxy.mp4"
 	mt := "video/mp4"
-	out := filepath.Join(DerivBlobDir(opt.Mount, inode), rel)
-	// PROXY-CODEC (#50): stamp which codec THIS blob is + its exact
-	// canPlayType/isTypeSupported token so OL/web can gate without re-probing.
-	// The codec is derived from the configured encoder (libx264 ⇒ h264 floor;
-	// the locked container/audio make the codec_string deterministic). audio
-	// channels carry the AAC suffix.
-	codec, codecString := proxyCodecStrings(opt.ProxyVCodec, tech)
+	// GenerateProxy is its OWN entry point — cmd/jmfarm runs -proxy as a separate
+	// mutually-exclusive pass that never reaches farm.Process, so the guard added
+	// there did not apply here at all. Hold the descriptor and stage under it.
+	derivDir, ddErr := derivDirFor(opt.Mount, inode)
+	if ddErr != nil {
+		res.Err = fmt.Errorf("derivative dir: %w", ddErr)
+		return res
+	}
+	defer derivDir.Close()
+	// The encoder is intent only. Completed output bytes provide both fields.
+	var codec, codecString string
 	row := derivatives.DerivRow{
 		Kind: "proxy", Producer: opt.Producer, Version: opt.Version,
 		Hash: &hash, BlobRelPath: &rel, MediaType: &mt,
-		Codec: &codec, CodecString: &codecString,
 	}
 	stampSource(&row, fi)
-	if err := Proxy(opt.FFmpegBin, opt.ProxyVCodec, opt.ProxyCRF, opt.ProxyPreset, path, out); err != nil {
+	scratch, err := createEncodeScratch(opt, "proxy")
+	if err != nil {
+		res.Err = fmt.Errorf("create local proxy scratch: %w", err)
+		return res
+	}
+	scratchPath := scratch.Name()
+	if err := scratch.Close(); err != nil {
+		_ = os.Remove(scratchPath)
+		res.Err = fmt.Errorf("close local proxy scratch: %w", err)
+		return res
+	}
+	defer os.Remove(scratchPath)
+
+	// ffmpeg's MP4 muxer appends, seeks, and performs a +faststart rewrite. Do
+	// all of that on node-local storage. Sending those mutations directly into
+	// JuiceFS creates superseded object slices that TrashDays deliberately keeps,
+	// amplifying a few gigabytes of visible proxies into tens of gigabytes of
+	// physical MinIO writes. Only the completed immutable bytes cross FUSE.
+	err = ProxyContext(ctx, opt.FFmpegBin, opt.ProxyVCodec, opt.ProxyCRF, opt.ProxyPreset, path, scratchPath)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		res.Err = ctxErr
+		return res
+	}
+	staged := ""
+	var heldBlob *os.File
+	var heldInfo os.FileInfo
+	defer func() {
+		if heldBlob != nil {
+			heldBlob.Close()
+		}
+	}()
+	if err == nil {
+		local, openErr := os.Open(scratchPath)
+		if openErr != nil {
+			err = fmt.Errorf("open completed local proxy: %w", openErr)
+		} else {
+			localInfo, statErr := local.Stat()
+			if statErr != nil || !localInfo.Mode().IsRegular() || localInfo.Size() <= 0 {
+				err = fmt.Errorf("completed local proxy is not a nonempty regular file: %v", statErr)
+			} else {
+				metadata, probeErr := probeProxyOutputMetadata(ctx, opt.FFprobeBin, local)
+				if probeErr != nil {
+					err = fmt.Errorf("probe completed local proxy: %w", probeErr)
+				} else if identityErr := verifyRegularNamedFile(local, scratchPath, localInfo); identityErr != nil {
+					err = fmt.Errorf("completed local proxy changed during probe: %w", identityErr)
+				} else {
+					codec, codecString = metadata.Codec, metadata.CodecString
+					row.Codec, row.CodecString = &codec, &codecString
+					if _, err = local.Seek(0, io.SeekStart); err == nil {
+						staged, err = derivatives.StageReaderAt(derivDir, rel, local, 0o644)
+					}
+					if err != nil {
+						err = fmt.Errorf("copy completed proxy into shared storage: %w", err)
+					} else if identityErr := verifyRegularNamedFile(local, scratchPath, localInfo); identityErr != nil {
+						err = fmt.Errorf("completed local proxy changed during staging: %w", identityErr)
+					}
+				}
+			}
+			if closeErr := local.Close(); err == nil && closeErr != nil {
+				err = fmt.Errorf("close completed local proxy: %w", closeErr)
+			}
+		}
+	}
+	if err == nil {
+		// Persist a byte-bound recovery receipt before the final rename. If any
+		// later private-store/manifest write fails, another worker can prove the
+		// committed blob and repair indexes without replacing it.
+		receipt, held, receiptErr := proxyReceiptFromStaged(
+			derivDir, staged, inode, hash, fi.Size(), codec, codecString)
+		if receiptErr != nil {
+			err = receiptErr
+		} else {
+			heldBlob = held
+			size := receipt.BlobSize
+			row.BlobSize = &size
+			heldInfo, receiptErr = held.Stat()
+			if receiptErr != nil {
+				err = fmt.Errorf("stat staged proxy: %w", receiptErr)
+			} else if receiptErr = writeProxyCommitReceipt(derivDir, receipt); receiptErr != nil {
+				err = fmt.Errorf("persist proxy commit receipt: %w", receiptErr)
+			}
+		}
+	}
+	if err == nil {
+		err = derivatives.CommitStagedAt(derivDir, staged, rel)
+		if err == nil {
+			res.Wrote = true
+			if verifyErr := verifyRegularAt(derivDir, rel, heldBlob, heldInfo); verifyErr != nil {
+				res.Err = fmt.Errorf("verify published proxy identity: %w", verifyErr)
+				return res
+			}
+		}
+	}
+	if err != nil {
+		if staged != "" {
+			derivatives.DiscardStagedAt(derivDir, staged)
+		}
 		// Non-fatal: publish a failed row so the consumer regenerates locally.
 		res.Err = err
 		row.Status = "failed"
 	} else {
 		res.Wrote = true
 		row.Status = "ready"
-		// blob_size = actual produced bytes (required-intent on a ready proxy).
-		// Best-effort stat; a stat failure leaves blob_size absent (honest — the
-		// schema permits null), it does not fail the row.
-		if bi, serr := os.Stat(out); serr == nil {
-			sz := bi.Size()
-			row.BlobSize = &sz
-		}
+		// The receipt already bound blob_size to the staged bytes that were
+		// renamed into the final name; keep that exact size in the row.
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		res.Err = ctxErr
+		return res
 	}
 	if err := store.PutSource(inode, &hash); err != nil {
 		res.Err = fmt.Errorf("put source: %w", err)
@@ -157,35 +508,62 @@ func GenerateProxy(store *derivatives.Store, path string, opt Options) ProxyResu
 		return res
 	}
 	if opt.Mount != "" {
-		_ = WriteManifestSidecar(store, opt.Mount, inode) // JM-15: best-effort
+		var manifestErr error
+		if row.Status == "ready" {
+			manifestErr = writeVerifiedProxyManifest(store, opt.Mount, inode, hash, fi.Size(), heldBlob, heldInfo,
+				proxyOutputMetadata{Codec: codec, CodecString: codecString})
+		} else {
+			manifestErr = WriteManifestSidecar(store, opt.Mount, inode)
+		}
+		if manifestErr != nil {
+			res.Err = fmt.Errorf("publish proxy manifest: %w", manifestErr)
+			return res
+		}
 	}
 	return res
 }
 
-// proxyCodecStrings derives the PROXY-CODEC `codec` label and the exact
-// MediaSource.isTypeSupported()/canPlayType() `codec_string` token for the proxy
-// THIS run produces (#50, derivatives.schema.json v2). The farm's interchange
-// lock fixes the rest of the token: MP4 container, +faststart, yuv420p 8-bit, AAC
-// 48 kHz stereo — so given the video codec the token is deterministic.
-//
-// libx264 (the floor + default) ⇒ "h264" / "avc1.640028, mp4a.40.2" (High@4.0).
-// A hardware H.264 encoder (h264_nvenc/qsv/vaapi) is still the H.264 floor.
-// An HEVC encoder ⇒ "hevc" / "hvc1.1.6.L120.90, …"; AV1 ⇒ "av1" / "av01.…".
-// The audio half is always mp4a.40.2 (AAC-LC) because the Proxy() command hard-
-// codes `-c:a aac` regardless of the source.
-func proxyCodecStrings(vcodec string, tech *Tech) (codec, codecString string) {
-	const aac = "mp4a.40.2" // AAC-LC, the locked proxy audio
-	audioSuffix := ""
-	if tech != nil && len(tech.Audio) > 0 {
-		audioSuffix = ", " + aac
+func createEncodeScratch(opt Options, kind string) (*os.File, error) {
+	dir := strings.TrimSpace(opt.EncodeScratchDir)
+	if dir == "" {
+		dir = os.TempDir()
 	}
+	resolvedDir, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		return nil, fmt.Errorf("resolve scratch directory %q: %w", dir, err)
+	}
+	if strings.TrimSpace(opt.Mount) != "" {
+		resolvedMount, mountErr := filepath.EvalSymlinks(opt.Mount)
+		if mountErr != nil {
+			return nil, fmt.Errorf("resolve mount %q: %w", opt.Mount, mountErr)
+		}
+		rel, relErr := filepath.Rel(resolvedMount, resolvedDir)
+		if relErr != nil {
+			return nil, fmt.Errorf("compare scratch and mount: %w", relErr)
+		}
+		if rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator))) {
+			return nil, fmt.Errorf("proxy scratch %q resolves inside shared mount %q", dir, opt.Mount)
+		}
+	}
+	if kind == "" {
+		kind = "media"
+	}
+	f, err := os.CreateTemp(resolvedDir, "jmfarm-"+kind+"-*.mp4")
+	if err != nil {
+		return nil, err
+	}
+	return f, nil
+}
+
+// proxyDesiredCodec describes encoder intent for the freshness decision only.
+// Publication derives the token from a probe of the completed output bytes.
+func proxyDesiredCodec(vcodec string) string {
 	switch {
 	case strings.Contains(vcodec, "hevc") || strings.Contains(vcodec, "h265") || strings.Contains(vcodec, "265"):
-		return "hevc", "hvc1.1.6.L120.90" + audioSuffix
+		return "hevc"
 	case strings.Contains(vcodec, "av1"):
-		return "av1", "av01.0.08M.08" + audioSuffix
+		return "av1"
 	default:
-		// libx264 / h264_nvenc / h264_qsv / h264_vaapi / "" — all the H.264 floor.
-		return "h264", "avc1.640028" + audioSuffix
+		return "h264"
 	}
 }

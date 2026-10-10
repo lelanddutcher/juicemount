@@ -1,8 +1,43 @@
 package nfs
 
 import (
+	"net"
 	"testing"
+	"time"
 )
+
+func TestManagedServerQuiescesAcceptedClientBeforeStoreClose(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := NewManagedServer(nil)
+	go func() { _ = server.Serve(listener) }()
+	client, err := net.Dial("tcp", listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	deadline := time.Now().Add(time.Second)
+	for server.ActiveConnections() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if server.ActiveConnections() == 0 {
+		t.Fatal("client was not accepted")
+	}
+	server.rpcStarted() // Model a handler blocked after dispatch.
+	_ = listener.Close()
+	if server.Quiesce(20 * time.Millisecond) {
+		t.Fatal("quiesce completed while an RPC still owned the handler")
+	}
+	server.rpcDone()
+	if !server.Quiesce(time.Second) {
+		t.Fatal("quiesce did not finish after the RPC exited")
+	}
+	if server.ActiveConnections() != 0 {
+		t.Fatal("accepted client remained after quiesce")
+	}
+}
 
 func TestRPCSemaphoreDefault(t *testing.T) {
 	s := &Server{}
@@ -47,6 +82,45 @@ func TestRPCSemaphoreBackpressure(t *testing.T) {
 	// Drain
 	for len(s.rpcSem) > 0 {
 		<-s.rpcSem
+	}
+}
+
+func TestRPCAdmissionClassification(t *testing.T) {
+	for _, proc := range []NFSProcedure{
+		NFSProcedureGetAttr,
+		NFSProcedureLookup,
+		NFSProcedureReadDir,
+		NFSProcedureReadDirPlus,
+		NFSProcedureFSStat,
+	} {
+		if got := classifyRPCAdmission(nfsServiceID, uint32(proc)); got != rpcAdmissionRead {
+			t.Errorf("%s admission=%v, want read", proc, got)
+		}
+	}
+	if got := classifyRPCAdmission(nfsServiceID, uint32(NFSProcedureRead)); got != rpcAdmissionDataRead {
+		t.Errorf("Read admission=%v, want separate data-read pool", got)
+	}
+	if got := classifyRPCAdmission(nfsServiceID, uint32(NFSProcedureWrite)); got != rpcAdmissionWrite {
+		t.Errorf("Write admission=%v, want write", got)
+	}
+	for _, proc := range []NFSProcedure{
+		NFSProcedureSetAttr,
+		NFSProcedureCreate,
+		NFSProcedureMkDir,
+		NFSProcedureSymlink,
+		NFSProcedureMkNod,
+		NFSProcedureRemove,
+		NFSProcedureRmDir,
+		NFSProcedureRename,
+		NFSProcedureLink,
+		NFSProcedureCommit,
+	} {
+		if got := classifyRPCAdmission(nfsServiceID, uint32(proc)); got != rpcAdmissionMutation {
+			t.Errorf("%s admission=%v, want mutation", proc, got)
+		}
+	}
+	if got := classifyRPCAdmission(mountServiceID, 1); got != rpcAdmissionRead {
+		t.Errorf("non-NFS admission=%v, want read", got)
 	}
 }
 

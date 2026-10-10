@@ -25,6 +25,7 @@ package netprofile
 
 import (
 	"os"
+	"sort"
 	"strconv"
 	"sync"
 	"time"
@@ -55,24 +56,22 @@ func (c LinkClass) String() string {
 	}
 }
 
-// ReadaheadPolicy is the concrete knob set the ReadaheadManager consumes. Values
-// are chosen so ClassMedium == the historical hard-coded defaults (no LAN
-// regression), ClassFast is strictly MORE aggressive (chase 10GbE), and the slow
-// classes strictly LESS (stop the WAN whole-file over-fetch).
+// ReadaheadPolicy is the concrete knob set the live ReadaheadManager consumes.
+// This is the one layer that may scale up after mount: unlike JuiceFS and the
+// kernel NFS client, it can react to every RTT/throughput reclassification
+// without tearing down Finder's open handles.
 type ReadaheadPolicy struct {
-	Enabled      bool // false → suppress our server-side readahead entirely (metered)
+	Enabled      bool // false → suppress our server-side readahead entirely (kill-switch/override)
 	SeqThreshold int  // consecutive sequential reads before triggering
 	Blocks       int  // 4 MB blocks to prefetch ahead once triggered
 	Workers      int  // max concurrent prefetch goroutines
 }
 
-// JuiceFSPolicy is the link-aware juicefs MOUNT-time flag set. These are the
-// DOMINANT prefetchers (validated 2026-06-15: with our server readahead capped
-// at 2 blocks a cold 4 KB read still pulled the whole 64 MB file — juicefs's own
-// sequential readahead, driven by --buffer-size + --prefetch, did it). Because
-// they're mount flags they can only change on a (re)mount; the bridge picks them
-// from a one-shot RTT probe at mount time. ClassMedium == the historical mount
-// defaults exactly, so a normal LAN mount is unchanged.
+// JuiceFSPolicy is the juicefs MOUNT-time flag set. These are dominant
+// prefetchers (validated 2026-06-15: with server readahead capped at 2 blocks,
+// a cold 4 KB read still pulled a whole 64 MB file). Because the flags can only
+// change on a disruptive remount, read prefetch is intentionally conservative
+// for every startup class; only the live server layer scales upward.
 //
 // Note --buffer-size also backs write-burst absorption, but writes land on the
 // SPOOL first and durability is independent of it (writeback is off), so a
@@ -83,7 +82,11 @@ type JuiceFSPolicy struct {
 	Prefetch     int // --prefetch (concurrent blocks)
 }
 
-// JuiceFS maps the current link class to mount-time prefetch flags.
+// JuiceFS maps the startup link class to mount-time flags. JuiceFS cannot
+// safely retune these after a handoff without a disruptive FUSE remount, so
+// prefetch stays at a transition-safe floor for every non-metered class. The
+// live server ReadaheadManager is solely responsible for scaling up on a
+// measured fast link.
 func (p *Profile) JuiceFS() JuiceFSPolicy {
 	switch p.Class() {
 	case ClassMetered:
@@ -103,35 +106,27 @@ func (p *Profile) JuiceFS() JuiceFSPolicy {
 		// negligible throughput cost on a 3-30 MB/s link (see ClassMetered).
 		return JuiceFSPolicy{BufferSizeMB: 512, Prefetch: 1}
 	case ClassFast:
-		// 10GbE: keep the big buffer and widen concurrent prefetch to keep more
-		// 4 MB blocks in flight to MinIO (addresses the ~3-of-10 Gbit/s starve).
-		return JuiceFSPolicy{BufferSizeMB: 4096, Prefetch: 8}
-	default: // ClassMedium — the historical mount defaults
-		return JuiceFSPolicy{BufferSizeMB: 4096, Prefetch: 3}
+		return JuiceFSPolicy{BufferSizeMB: 4096, Prefetch: 1}
+	default: // Medium: large write buffer, conservative immutable prefetch floor
+		return JuiceFSPolicy{BufferSizeMB: 4096, Prefetch: 1}
 	}
 }
 
-// NFSReadahead returns the macOS NFS-client `readahead` mount option for the
-// current link. This is the prefetcher that turns a single small touch into a
+// NFSReadahead returns the macOS NFS-client `readahead` mount option. This is
+// the prefetcher that turns a single small touch into a
 // sequential burst (16 × rsize) which juicefs then extends to a whole-file pull
 // (validated 2026-06-15: juicefs --buffer-size/--prefetch alone did NOT cap it;
 // the client-side fan-out is what triggers juicefs's sequential readahead).
 //
-// We only ever LOWER it from the default 16 — never raise it — because 16 is the
-// concurrent-read-TRUNCATION mitigation (#18/#19, the bug appeared at 128). A
-// smaller value is strictly safer for that bug AND shrinks the amplification, so
-// metered/slow are pure wins; medium/fast keep the validated 16 (10GbE throughput
-// comes from juicefs-side concurrency, not client readahead — not worth the
-// truncation risk of raising it). Mount-time only.
+// Mount options cannot be changed safely after a Wi-Fi→cellular handoff without
+// unmounting Finder. Therefore this layer is deliberately fixed at the metered-
+// safe floor for EVERY startup class. The live server ReadaheadManager scales up
+// on a measured fast link; the kernel layer never retains a LAN-sized burst after
+// a handoff. A smaller value is also strictly safer for the concurrent-read
+// truncation family (#18/#19, originally observed at 128).
 func (p *Profile) NFSReadahead() int {
-	switch p.Class() {
-	case ClassMetered:
-		return 2
-	case ClassSlow:
-		return 4
-	default: // medium + fast: keep the truncation-validated default
-		return 16
-	}
+	_ = p
+	return 2
 }
 
 // Snapshot is an immutable read of the profile for metrics/observability.
@@ -150,36 +145,65 @@ var (
 	thrMeteredBps = 3.0 * 1024 * 1024   // < → metered
 	thrSlowBps    = 30.0 * 1024 * 1024  // < → slow
 	thrFastBps    = 200.0 * 1024 * 1024 // >= → fast; between slow & fast → medium
+
+	// Latency thresholds for the high-latency ceiling, with hysteresis so a
+	// jittery link cannot flap the class. Above 40ms, round trips—not headline
+	// bandwidth—already dominate Finder metadata/open latency, so the link may
+	// not retain the LAN/medium prefetch path. Clear only after smoothed RTT is
+	// back below 20ms. LAN and normal local Wi-Fi remain comfortably below it.
+	rttHighEnter = 40 * time.Millisecond
+	rttHighExit  = 20 * time.Millisecond
 )
 
 // Profile is the concurrency-safe link estimator. The zero value is not usable;
 // construct with New().
 type Profile struct {
-	mu          sync.RWMutex
-	rtt         time.Duration
-	rttvar      time.Duration
-	haveRTT     bool
-	bwBps       float64
-	haveBW      bool
-	bwSamples   int64
-	forcedClass *LinkClass // operator/OS override (e.g. detected metered link); nil = auto
+	mu               sync.RWMutex
+	rtt              time.Duration
+	rttvar           time.Duration
+	haveRTT          bool
+	bwBps            float64
+	haveBW           bool
+	bwSamples        int64
+	forcedClass      *LinkClass // explicit operator/test override; nil = auto
+	networkCostClass *LinkClass // host OS expensive/constrained signal; nil = no cost override
+	ceilingClass     *LinkClass // route safety ceiling (e.g. backend traverses utun); nil = uncapped
 
-	// Windowed throughput accumulator. Bandwidth is measured as AGGREGATE bytes
-	// over WALL-CLOCK time within an active read window — not per-read bytes/dur,
-	// which underestimates badly under concurrency (8 parallel 1 MB reads each
-	// look like 1 MB/s when the link is really doing 8 MB/s). All bytes that land
-	// in the same wall-clock window are summed, so concurrency is captured.
-	winStart   time.Time
-	winLastEnd time.Time
-	winBytes   int64
+	// highLatency is the LATENCY dimension of classification, kept separate from
+	// bandwidth because the two are independent and a link can be fast AND far.
+	// Hysteretic: set when smoothed RTT rises above rttHighEnter, cleared only
+	// when it falls back under rttHighExit, so a jittery cellular link cannot
+	// flap the class (measured on a real Tailscale-over-cellular link: RTT
+	// 105-349ms, stddev 86ms — a single threshold would oscillate every probe).
+	highLatency bool
+
+	// Windowed throughput accumulator. Bytes are divided by the UNION of active
+	// transfer intervals, not the span between the first and last completion.
+	// That preserves concurrent aggregate throughput while excluding Finder or
+	// an NLE's think time between otherwise-fast reads. The old wall-span
+	// denominator turned 256 KiB LAN reads arriving 300 ms apart into a 1.6 MiB/s
+	// "metered" link even when each transfer itself sustained 50 MiB/s.
+	winStart     time.Time
+	winLastEnd   time.Time
+	winBytes     int64
+	winIntervals []throughputInterval
 
 	// now is the clock (injectable for tests). Production uses time.Now.
 	now func() time.Time
 }
 
+type throughputInterval struct {
+	start time.Time
+	end   time.Time
+}
+
 // New builds a fresh profile in the "unknown → medium-safe" state: until a
 // sample arrives, policy is the historical defaults so behavior is unchanged.
-func New() *Profile { return &Profile{now: time.Now} }
+func New() *Profile {
+	p := &Profile{now: time.Now}
+	applyToProfile(p)
+	return p
+}
 
 var (
 	def     *Profile
@@ -247,6 +271,15 @@ func applyEnvThresholds() {
 // ObserveRTT folds a successful-probe dial latency into the smoothed RTT
 // (RFC-6298 style: alpha=1/8, beta=1/4). Cheap; safe from any goroutine.
 func (p *Profile) ObserveRTT(sample time.Duration) {
+	if fl := FakeLinkSpec(); fl != nil {
+		// Simulated link: replace the measurement. A ±10% sawtooth keeps the
+		// RTT-variance smoothing and the hysteretic high-latency flag honest
+		// under synthetic input (a perfectly constant signal would leave
+		// rttvar at its initial value and never exercise the flap logic).
+		phase := (time.Now().UnixNano() / int64(500*time.Millisecond)) % 2
+		jitter := time.Duration(float64(fl.RTT) * 0.10 * float64(phase))
+		sample = fl.RTT + jitter
+	}
 	if sample <= 0 {
 		return
 	}
@@ -256,6 +289,11 @@ func (p *Profile) ObserveRTT(sample time.Duration) {
 		p.rtt = sample
 		p.rttvar = sample / 2
 		p.haveRTT = true
+		// Evaluate the ceiling on the FIRST sample too. Omitting this meant a
+		// link that was already far when the app started never tripped the flag
+		// until a second sample arrived — and on a link whose very first probe
+		// is 156ms, that is precisely the case we care about.
+		p.updateHighLatencyLocked()
 		return
 	}
 	diff := p.rtt - sample
@@ -264,6 +302,38 @@ func (p *Profile) ObserveRTT(sample time.Duration) {
 	}
 	p.rttvar += (diff - p.rttvar) / 4
 	p.rtt += (sample - p.rtt) / 8
+	p.updateHighLatencyLocked()
+	// Handoff fast-path: EWMA is intentionally stable, but stability is the wrong
+	// direction on a LAN→cellular transition. One real far-link probe must clamp
+	// speculative reads immediately; otherwise an old 1ms average can take many
+	// probe periods to cross the ceiling while Finder keeps the LAN policy.
+	if sample >= rttHighEnter {
+		p.highLatency = true
+	}
+}
+
+// updateHighLatencyLocked maintains the hysteretic high-latency flag. Caller
+// holds p.mu for writing.
+func (p *Profile) updateHighLatencyLocked() {
+	if p.highLatency {
+		if p.rtt < rttHighExit {
+			p.highLatency = false
+		}
+		return
+	}
+	if p.rtt >= rttHighEnter {
+		p.highLatency = true
+	}
+}
+
+// HighLatency reports whether the link is currently far, independent of how
+// much bandwidth it has. Consumers that care about ROUND TRIPS rather than
+// throughput (metadata chatter, per-file opens, cold directory populates)
+// should gate on this rather than on Class().
+func (p *Profile) HighLatency() bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.highLatency
 }
 
 // minThroughputBytes / minThroughputDur gate which read samples count as a real
@@ -290,11 +360,12 @@ const (
 )
 
 // ObserveThroughput folds a measured backend transfer into the bandwidth
-// estimate using an AGGREGATE bytes-over-wall-time window (not per-read
-// bytes/dur, which under-counts under concurrency). Cache hits (sub-threshold
-// bytes/dur) are ignored so only wire transfers move the estimate. The windowed
-// rate is EWMA-smoothed (alpha=1/4) so it tracks link changes within a few
-// windows without thrashing.
+// estimate using aggregate bytes divided by the union of active transfer time.
+// Overlapping reads therefore retain their aggregate throughput, while idle
+// application think time between reads cannot dilute a fast wire into the
+// metered bucket. Cache hits (sub-threshold bytes/dur) are ignored so only wire
+// transfers move the estimate. The windowed rate is EWMA-smoothed (alpha=1/4)
+// so it tracks link changes within a few windows without thrashing.
 //
 // `dur` is the read's own duration, used both as the cache-hit filter and to
 // anchor a fresh window's start (the read began ~dur before now).
@@ -303,29 +374,44 @@ func (p *Profile) ObserveThroughput(bytes int64, dur time.Duration) {
 		return
 	}
 	now := p.now()
+	started := now.Add(-dur)
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	// Start a fresh window if this is the first sample or the link went idle.
 	if p.winStart.IsZero() || now.Sub(p.winLastEnd) > bwIdleGap {
-		p.winStart = now.Add(-dur)
+		p.winStart = started
+		p.winLastEnd = time.Time{}
 		p.winBytes = 0
+		p.winIntervals = p.winIntervals[:0]
+	}
+	if started.Before(p.winStart) {
+		p.winStart = started
 	}
 	p.winBytes += bytes
-	p.winLastEnd = now
+	if now.After(p.winLastEnd) {
+		p.winLastEnd = now
+	}
+	p.winIntervals = append(p.winIntervals, throughputInterval{start: started, end: now})
 
-	elapsed := now.Sub(p.winStart)
-	if elapsed < bwWindowFlush && p.winBytes < bwWindowFlushBytes {
+	span := p.winLastEnd.Sub(p.winStart)
+	if span < bwWindowFlush && p.winBytes < bwWindowFlushBytes {
 		return // keep accumulating; not enough wall-time or bytes yet
 	}
-	if elapsed <= 0 {
+	active := activeTransferDuration(p.winIntervals)
+	if active <= 0 {
 		return // guard against a zero divisor (clock didn't advance)
 	}
-	rate := float64(p.winBytes) / elapsed.Seconds()
+	rate := float64(p.winBytes) / active.Seconds()
+	if fl := FakeLinkSpec(); fl != nil && fl.BWDown > 0 {
+		rate = fl.BWDown
+	}
 	// Tumble the window so concurrent reads in the next interval aren't
 	// double-counted against this one's already-folded bytes.
-	p.winStart = now
+	p.winStart = time.Time{}
+	p.winLastEnd = time.Time{}
 	p.winBytes = 0
+	p.winIntervals = p.winIntervals[:0]
 
 	p.bwSamples++
 	if !p.haveBW {
@@ -336,11 +422,88 @@ func (p *Profile) ObserveThroughput(bytes int64, dur time.Duration) {
 	p.bwBps += (rate - p.bwBps) / 4
 }
 
-// ForceClass pins the link class (e.g. when the OS reports a metered/expensive
-// interface). Pass nil to return to automatic classification.
+// activeTransferDuration returns the union of the supplied intervals. The
+// window is capped by bwWindowFlushBytes (at most 32 minimum-sized samples), so
+// sorting this tiny slice keeps the accounting exact without putting a
+// persistent timer or probe on the read path.
+func activeTransferDuration(intervals []throughputInterval) time.Duration {
+	if len(intervals) == 0 {
+		return 0
+	}
+	sort.Slice(intervals, func(i, j int) bool {
+		if intervals[i].start.Equal(intervals[j].start) {
+			return intervals[i].end.Before(intervals[j].end)
+		}
+		return intervals[i].start.Before(intervals[j].start)
+	})
+	start, end := intervals[0].start, intervals[0].end
+	var total time.Duration
+	for _, interval := range intervals[1:] {
+		if interval.start.After(end) {
+			total += end.Sub(start)
+			start, end = interval.start, interval.end
+			continue
+		}
+		if interval.end.After(end) {
+			end = interval.end
+		}
+	}
+	return total + end.Sub(start)
+}
+
+// ForceClass pins the link class for an explicit operator or test override.
+// Pass nil to return to host-cost/automatic classification.
 func (p *Profile) ForceClass(c *LinkClass) {
 	p.mu.Lock()
 	p.forcedClass = c
+	p.mu.Unlock()
+}
+
+// SetNetworkCostClass records the host OS's expensive/constrained path signal
+// without sharing the explicit-operator ForceClass slot. Explicit force keeps
+// precedence; in automatic mode a positive cost signal is authoritative until
+// the OS clears it. Pass nil to clear the signal.
+func (p *Profile) SetNetworkCostClass(c *LinkClass) {
+	p.mu.Lock()
+	p.networkCostClass = c
+	p.mu.Unlock()
+}
+
+// CeilingClass caps automatic classification without pinning it. It is used
+// when the route to the backend crosses a VPN/tunnel: a nearby VPN endpoint may
+// yield a 2 ms RTT even when the physical underlay is cellular, so that route
+// may not earn Medium/Fast speculative behavior. Metered observations remain
+// Metered, and an explicit ForceClass still wins. Pass nil to remove the cap.
+func (p *Profile) CeilingClass(c *LinkClass) {
+	p.mu.Lock()
+	p.ceilingClass = c
+	p.mu.Unlock()
+}
+
+// ResetForTransportChange invalidates every passive measurement tied to the
+// previous physical path. An adaptive Link proxy can move between an encrypted
+// tunnel and a verified direct-LAN connection without restarting the process;
+// carrying the old path's bandwidth EWMA across that boundary made the first
+// LAN cold read retain cellular readahead (and the reverse handoff could retain
+// LAN optimism). With no fresh samples Class() returns the transition-safe
+// medium policy until the existing RTT/read observers classify the new path.
+//
+// Explicit operator force and host-cost state are deliberately preserved. A
+// metered interface remains metered across proxy reconnects, while automatic
+// mode forgets only measurements, not configuration.
+func (p *Profile) ResetForTransportChange() {
+	p.mu.Lock()
+	p.rtt = 0
+	p.rttvar = 0
+	p.haveRTT = false
+	p.bwBps = 0
+	p.haveBW = false
+	p.bwSamples = 0
+	p.highLatency = false
+	p.winStart = time.Time{}
+	p.winLastEnd = time.Time{}
+	p.winBytes = 0
+	p.winIntervals = p.winIntervals[:0]
 	p.mu.Unlock()
 }
 
@@ -349,18 +512,53 @@ func (p *Profile) classLocked() (LinkClass, bool) {
 	if p.forcedClass != nil {
 		return *p.forcedClass, false
 	}
+	if p.networkCostClass != nil {
+		return *p.networkCostClass, false
+	}
+	bounded := func(class LinkClass, boot bool) (LinkClass, bool) {
+		if p.ceilingClass != nil && class > *p.ceilingClass {
+			return *p.ceilingClass, boot
+		}
+		return class, boot
+	}
 	// Bandwidth is the primary, most trustworthy signal once we have it.
 	if p.haveBW {
+		byBW := ClassFast
 		switch {
 		case p.bwBps < thrMeteredBps:
-			return ClassMetered, false
+			byBW = ClassMetered
 		case p.bwBps < thrSlowBps:
-			return ClassSlow, false
+			byBW = ClassSlow
 		case p.bwBps < thrFastBps:
-			return ClassMedium, false
-		default:
-			return ClassFast, false
+			byBW = ClassMedium
 		}
+		// LATENCY CEILING — bandwidth alone is not the link.
+		//
+		// This branch used to return byBW directly, and RTT was never consulted
+		// again once a single throughput sample existed. Measured live on
+		// 2026-07-29 over Tailscale-on-cellular:
+		//
+		//	route utun9 · real RTT 156ms avg (105-349, stddev 86)
+		//	netprofile: class=fast  bandwidth=518.9 Mbps  rtt_ms=105
+		//
+		// It HELD a 105ms RTT and still said "fast", because a phone tunnel can
+		// carry real throughput while every round trip costs 100ms+. Eight
+		// protections gate on this class, and the synchronous cold-directory
+		// populate is gated to ClassFast specifically — so a link that could not
+		// be less LAN-like was getting the LAN foreground path.
+		//
+		// A far link is capped at ClassSlow no matter how fat the pipe is:
+		// what makes navigation and file opens hurt is ROUND TRIPS, not
+		// megabits, and every consumer of "slow" is doing round-trip-reducing
+		// work. Metered stays metered (it is already stricter). Kill switch
+		// JM_NET_LATENCY_CEILING=0 restores bandwidth-only classification
+		// byte-identically (WAN-tuning revert discipline).
+		// LinkClass is ordered slow→fast (Metered=0 … Fast=3), so "faster than
+		// Slow" is >, and Metered (which is already stricter) is left alone.
+		if p.highLatency && latencyCeilingEnabled() && byBW > ClassSlow {
+			return bounded(ClassSlow, false)
+		}
+		return bounded(byBW, false)
 	}
 	// Bootstrap from RTT before any throughput sample. Conservative: a high-RTT
 	// link is assumed slow until bandwidth proves otherwise (safe direction —
@@ -369,15 +567,15 @@ func (p *Profile) classLocked() (LinkClass, bool) {
 	if p.haveRTT {
 		switch {
 		case p.rtt < 2*time.Millisecond:
-			return ClassFast, true
+			return bounded(ClassFast, true)
 		case p.rtt < 20*time.Millisecond:
-			return ClassMedium, true
+			return bounded(ClassMedium, true)
 		default:
-			return ClassSlow, true
+			return bounded(ClassSlow, true)
 		}
 	}
 	// No signal at all → historical defaults (medium == unchanged behavior).
-	return ClassMedium, false
+	return bounded(ClassMedium, false)
 }
 
 // Class returns the current link class.
@@ -393,19 +591,21 @@ func (p *Profile) Class() LinkClass {
 func (p *Profile) Readahead() ReadaheadPolicy {
 	switch p.Class() {
 	case ClassMetered:
-		// Cellular / weak / metered: do NOT prefetch ahead. Serve exactly the
-		// block touched (still subject to the 4 MB BlockSize minimum), require a
-		// strong sequential signal so an xattr/Quick-Look probe never escalates
-		// to a whole-file pull, and protect the user's data cap.
-		return ReadaheadPolicy{Enabled: false, SeqThreshold: 6, Blocks: 1, Workers: 1}
+		// Cellular / weak / metered: keep exactly one bounded 4 MiB block in
+		// flight after a strong sequential signal. Disabling this layer entirely
+		// serialized foreground subreads across the tunnel: a live 40 Mbit/s,
+		// 80 ms shaped Link delivered only ~7.9 Mbit/s. One worker fills the
+		// bandwidth-delay product without turning a Quick Look/xattr probe into a
+		// whole-file pull; the six-block guard below still has to be crossed.
+		return ReadaheadPolicy{Enabled: true, SeqThreshold: 6, Blocks: 1, Workers: 1}
 	case ClassSlow:
 		return ReadaheadPolicy{Enabled: true, SeqThreshold: 4, Blocks: 2, Workers: 2}
 	case ClassFast:
 		// 10GbE / LAN: go deep + wide to keep enough 4 MB blocks in flight to
 		// MinIO to actually fill the pipe (addresses the ~3 Gbit/s-of-10 starve).
 		return ReadaheadPolicy{Enabled: true, SeqThreshold: 2, Blocks: 16, Workers: 8}
-	default: // ClassMedium — the historical hard-coded defaults
-		return ReadaheadPolicy{Enabled: true, SeqThreshold: 3, Blocks: 8, Workers: 4}
+	default: // ClassMedium — bounded; Fast alone earns the deep/wide path
+		return ReadaheadPolicy{Enabled: true, SeqThreshold: 3, Blocks: 4, Workers: 2}
 	}
 }
 
@@ -423,4 +623,13 @@ func (p *Profile) Snapshot() Snapshot {
 		ThroughputN:     p.bwSamples,
 		BootstrappedRTT: boot,
 	}
+}
+
+// latencyCeilingEnabled reports whether the RTT ceiling may downgrade a
+// bandwidth-derived class. Default ON; JM_NET_LATENCY_CEILING=0 restores
+// bandwidth-only classification byte-identically, per the WAN-tuning revert
+// discipline (a cellular tuning change must always be revertible without a
+// rebuild).
+func latencyCeilingEnabled() bool {
+	return os.Getenv("JM_NET_LATENCY_CEILING") != "0"
 }

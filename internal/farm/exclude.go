@@ -2,6 +2,8 @@ package farm
 
 import (
 	"os"
+	"path/filepath"
+	"regexp"
 	"strings"
 )
 
@@ -28,6 +30,9 @@ import (
 // adds more via JM_FARM_SKIP_DIRS.
 var defaultSkipDirSubstrings = []string{
 	"proxy", "proxies",
+	// Farm/node capability probes and release tests use __bench_* directories.
+	// They may contain valid MP4 samples but are instrumentation, never media.
+	"__bench_",
 	"adobe premiere pro video previews",
 	"adobe premiere pro audio previews",
 	// "media cache" already covers "Media Cache Files/" (superstring), so the
@@ -35,6 +40,27 @@ var defaultSkipDirSubstrings = []string{
 	"media cache",
 	".cache", "peak files",
 }
+
+// appleDoubleHusk matches the orphaned AppleDouble shells macOS leaves beside
+// media when a consumer does an atomic sidecar write over SMB — e.g.
+// `._.C0012.MXF.logger.json.9F3A-...tmp.sb-1a2b3c4d-XyZ`. The consumer reported
+// these on 2026-08-03 (FARM-4), owns the fix, and asked us not to classify them
+// as sidecars or alarm on them meanwhile.
+//
+// Shape: an AppleDouble prefix `._` AND a `.tmp.sb-` marker somewhere after it.
+// Both are required — `._` alone is an ordinary AppleDouble sidecar (which the
+// NFS layer handles and which is NOT a husk), and `.tmp.sb-` alone is a live
+// atomic-write temp we should also leave alone but which is not this class.
+var appleDoubleHusk = regexp.MustCompile(`(^|/)\._.*\.tmp\.sb-`)
+
+// IsAppleDoubleHusk reports whether path is one of those orphaned husks.
+//
+// In practice these are ~4 KB and were already excluded by the size floor, so
+// this rule changes nothing today — it is here so the exclusion is EXPLICIT and
+// survives someone lowering JM_FARM_MIN_SIZE_MB, rather than resting on a
+// coincidence. Safe to garbage-collect on age > 24h, but the farm never deletes:
+// we only decline to derive them.
+func IsAppleDoubleHusk(path string) bool { return appleDoubleHusk.MatchString(path) }
 
 // SkipDirSubstrings is the exported resolver (defaults + JM_FARM_SKIP_DIRS)
 // for callers that pass the list into ExcludeReason.
@@ -66,8 +92,37 @@ func pathIsProxy(lowerPath string) bool {
 // "" to process it. size<0 means "size unknown" (the size rule is not applied).
 // skipSubs is the resolved skip-dir substring list (pass skipDirSubstrings());
 // minBytes is the size floor (0 = no floor).
+// streamPartialPrefix marks an in-flight streamed destination. MUST match
+// nfs.streamTempPrefix and metadata.streamPartialPrefix exactly — the farm is a
+// separate server-side binary and cannot import either, so the constant is
+// duplicated deliberately and pinned by test.
+const streamPartialPrefix = ".juicemount-streaming-"
+
 func ExcludeReason(path string, size, minBytes int64, skipSubs []string) string {
 	l := strings.ToLower(path)
+	if IsAppleDoubleHusk(path) {
+		return "appledouble-husk"
+	}
+	// An in-flight STREAMED destination is incomplete by construction.
+	//
+	// The streaming spool drain writes a large file to a hidden sibling of its
+	// destination and renames it into place only when complete. While that copy
+	// is in flight — hours for a multi-hundred-GB file — the partial is a real,
+	// walkable file of substantial size sitting next to real footage.
+	//
+	// collectTargets does NOT otherwise catch it: its dot-prefix rule is inside
+	// `if info.IsDir()` and so skips dot-DIRECTORIES only, the only file-name
+	// rule is the "._" AppleDouble prefix, and a partial is far too large to be
+	// excluded by min-size. So without this the farm enqueues it and generates a
+	// proxy or thumbnail from truncated bytes — the black-frame class of failure,
+	// arriving through the farm rather than through a read.
+	//
+	// Checked on the BASE NAME, since the partial is a sibling and can appear at
+	// any depth. Kept in lockstep with nfs.streamTempPrefix and
+	// metadata.StreamPartialName by TestStreamPartialPrefixIsConsistent.
+	if strings.HasPrefix(filepath.Base(path), streamPartialPrefix) {
+		return "streaming-partial"
+	}
 	if pathIsProxy(l) {
 		return "proxy"
 	}

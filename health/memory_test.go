@@ -67,3 +67,13 @@ func TestMemoryTelemetry(t *testing.T) {
 		t.Errorf("expected MemBufSizeMB 2.5, got %f", s.MemBufSizeMB)
 	}
 }
+
+func TestRuntimeMemorySnapshotUsesAvailableRuntimeMetrics(t *testing.T) {
+	s := readRuntimeMemorySnapshot()
+	if s.heapAllocBytes == 0 {
+		t.Fatal("runtime heap allocation metric was zero")
+	}
+	if s.heapSysBytes < s.heapAllocBytes {
+		t.Fatalf("runtime heap system bytes %d < allocated bytes %d", s.heapSysBytes, s.heapAllocBytes)
+	}
+}

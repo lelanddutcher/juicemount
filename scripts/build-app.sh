@@ -10,30 +10,273 @@
 #      (including Contents/PlugIns/JuiceMountThumbnails.appex)
 #   4. Codesign inside-out (Sparkle helpers, appex, then the app)
 #
-# Output: build/JuiceMount.app
+# Output: build/JuiceMount.app (or JM_BUILD_DIR/JuiceMount.app when set)
 #
-# Usage: ./scripts/build-app.sh [--release|--debug]
+# Usage: ./scripts/build-app.sh [--release|--debug|--distribution]
+# JM_BUILD_DIR=/absolute/fresh-or-empty/output changes the output root.
+#
+# --release selects Swift's optimized build configuration for local testing.
+# --distribution is the fail-closed shipping path: it requires explicit exact
+# source identity, Developer ID signing, notarization, stapling, Sparkle
+# appcast signing, and final artifact verification.
+# JM_BUILD_NUMBER must exceed every build in the published feed (SUFeedURL,
+# fetched live; JM_PREVIOUS_APPCAST may supply a downloaded copy). JM_APPCAST is
+# refused outside --distribution; only --distribution stamps JMBuildChannel.
 
-set -e
+set -eo pipefail
 
-CONFIG="${1:---release}"
+CONFIG="--release"
 SWIFT_CONFIG="release"
-if [ "$CONFIG" = "--debug" ]; then
-    SWIFT_CONFIG="debug"
-fi
+DISTRIBUTION=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --release) CONFIG="--release"; SWIFT_CONFIG="release" ;;
+        --debug) CONFIG="--debug"; SWIFT_CONFIG="debug" ;;
+        --distribution) CONFIG="--distribution"; SWIFT_CONFIG="release"; DISTRIBUTION=1 ;;
+        -h|--help)
+            sed -n '1,23p' "$0" | sed 's/^# \?//'
+            exit 0
+            ;;
+        *) echo "ERROR: unknown build mode: $1" >&2; exit 2 ;;
+    esac
+    shift
+done
 
-PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+# Resolve an explicit output root before network access or any build write.
+# The ordinary unset case retains the historical build/ path. An override
+# must be fresh or empty: later steps remove the app and release subdirectory.
+if [ "${JM_BUILD_DIR+x}" = x ]; then
+    if ! BUILD_DIR="$(python3 -I -B - "$JM_BUILD_DIR" "$PROJECT_ROOT" <<'PY'
+import os
+import sys
+
+raw, project = sys.argv[1:]
+def refuse(reason):
+    sys.exit("ERROR: JM_BUILD_DIR " + reason)
+
+def has_control(path):
+    return any(ord(char) < 32 or ord(char) == 127 for char in path)
+
+def inside_app(path):
+    return any(part.lower().endswith(".app") for part in path.split(os.sep))
+
+if not raw:
+    refuse("is explicitly empty")
+if has_control(raw):
+    refuse("must not contain control characters")
+if not os.path.isabs(raw):
+    refuse("must be an absolute path")
+if inside_app(raw):
+    refuse("must not be inside an app bundle")
+if os.path.islink(raw.rstrip(os.sep)):
+    refuse("must not be a symlink")
+resolved = os.path.realpath(raw)
+if has_control(resolved):
+    refuse("must not resolve through control characters")
+project = os.path.realpath(project)
+if os.path.commonpath((project, resolved)) == resolved:
+    refuse("must not be the project root or one of its ancestors")
+if resolved == os.path.join(project, "build"):
+    refuse("must not resolve to the default build directory")
+if inside_app(resolved):
+    refuse("must not be inside an app bundle")
+if os.path.lexists(resolved):
+    if not os.path.isdir(resolved):
+        refuse("exists but is not a directory")
+    with os.scandir(resolved) as entries:
+        if next(entries, None) is not None:
+            refuse("must be empty when it already exists")
+print(resolved)
+PY
+)"; then
+        exit 1
+    fi
+else
+    BUILD_DIR="$PROJECT_ROOT/build"
+fi
 cd "$PROJECT_ROOT"
 
-BUILD_DIR="$PROJECT_ROOT/build"
+# Reject stale SDK provenance before network access or expensive compilation.
+python3 -I -B "$PROJECT_ROOT/scripts/verify-juicefs-sdk.py" >/dev/null
+
 APP_DIR="$BUILD_DIR/JuiceMount.app"
 APP_BIN_DIR="$APP_DIR/Contents/MacOS"
 APP_RES_DIR="$APP_DIR/Contents/Resources"
 SWIFT_PKG="$PROJECT_ROOT/app/JuiceMount"
+PLISTBUDDY="/usr/libexec/PlistBuddy"
+JM_BUILD_VERSION="${JM_VERSION:-0.5.0}"
+JM_BUNDLE_BUILD_NUMBER="${JM_BUILD_NUMBER:-}"
+GO_BUILD_VCS_ARGS=()
+if [ "$DISTRIBUTION" = 1 ]; then
+    if [ -z "${JM_VERSION:-}" ] || [ -z "${JM_COMMIT:-}" ] || [ -z "$JM_BUNDLE_BUILD_NUMBER" ]; then
+        echo "ERROR: --distribution requires explicit JM_VERSION, JM_COMMIT, and JM_BUILD_NUMBER" >&2
+        exit 1
+    fi
+    if [[ ! "$JM_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+        echo "ERROR: JM_VERSION is not a release version: $JM_VERSION" >&2
+        exit 1
+    fi
+    if [[ ! "$JM_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+        echo "ERROR: JM_COMMIT must be the full lowercase 40-character git SHA" >&2
+        exit 1
+    fi
+    if [[ ! "$JM_BUNDLE_BUILD_NUMBER" =~ ^[1-9][0-9]*$ ]] ||
+       (( ${#JM_BUNDLE_BUILD_NUMBER} > 15 )) ||
+       (( JM_BUNDLE_BUILD_NUMBER <= 13 )); then
+        echo "ERROR: JM_BUILD_NUMBER must be a positive decimal integer greater than 13 (the current RC build)" >&2
+        exit 1
+    fi
+    # Sparkle offers an update only when the new CFBundleVersion compares
+    # greater than the installed one. "> 13" is only a floor; monotonicity
+    # needs the CURRENTLY PUBLISHED feed (SUFeedURL) as input, so a reused or
+    # lower number cannot pass every other gate and then silently never be
+    # offered. Without JM_PREVIOUS_APPCAST the live feed is fetched and a failed
+    # fetch refuses. With it, the local copy is still checked against the live
+    # feed when that is reachable, and a stale local copy refuses.
+    SPARKLE_FEED_URL="$("$PLISTBUDDY" -c 'Print :SUFeedURL' "$SWIFT_PKG/Resources/Info.plist" 2>/dev/null || true)"
+    if [[ ! "$SPARKLE_FEED_URL" =~ ^https:// ]]; then
+        echo "ERROR: cannot read an https SUFeedURL from $SWIFT_PKG/Resources/Info.plist" >&2
+        exit 1
+    fi
+    published_max_build() {
+        python3 -I -B - "$1" <<'PY'
+import re, sys
+import xml.etree.ElementTree as ET
+SPARKLE = "{http://www.andymatuschak.org/xml-namespaces/sparkle}"
+versions = []
+for item in ET.parse(sys.argv[1]).getroot().iter("item"):
+    found = [e.text for e in item.iter(SPARKLE + "version")]
+    found += [e.get(SPARKLE + "version") for e in item.iter("enclosure")]
+    found = [v.strip() for v in found if v is not None and v.strip()]
+    if not found:
+        sys.exit("an appcast item carries no sparkle:version")
+    for v in found:
+        if not re.fullmatch(r"[1-9][0-9]*", v):
+            sys.exit("non-integer published sparkle:version: " + v)
+        versions.append(int(v))
+if not versions:
+    sys.exit("appcast lists no published items")
+print(max(versions))
+PY
+    }
+    LIVE_FEED_DIR="$(mktemp -d -t jm-published-appcast.XXXXXX)"
+    LIVE_FEED="$LIVE_FEED_DIR/appcast.xml"
+    LIVE_FEED_OK=0
+    if curl -fsSL --max-time 30 -o "$LIVE_FEED" "$SPARKLE_FEED_URL"; then
+        LIVE_FEED_OK=1
+    fi
+    if [ -z "${JM_PREVIOUS_APPCAST:-}" ]; then
+        if [ "$LIVE_FEED_OK" != 1 ]; then
+            rm -rf "$LIVE_FEED_DIR"
+            echo "ERROR: could not fetch the published appcast from $SPARKLE_FEED_URL; refusing distribution build (download it and set JM_PREVIOUS_APPCAST)" >&2
+            exit 1
+        fi
+        if ! PUBLISHED_MAX_BUILD="$(published_max_build "$LIVE_FEED")"; then
+            rm -rf "$LIVE_FEED_DIR"
+            echo "ERROR: the published appcast at $SPARKLE_FEED_URL could not be read as a Sparkle appcast with integer build numbers" >&2
+            exit 1
+        fi
+        echo "    published feed: $SPARKLE_FEED_URL (highest build $PUBLISHED_MAX_BUILD)"
+    else
+        if [ ! -f "$JM_PREVIOUS_APPCAST" ]; then
+            rm -rf "$LIVE_FEED_DIR"
+            echo "ERROR: JM_PREVIOUS_APPCAST does not name a file: $JM_PREVIOUS_APPCAST" >&2
+            exit 1
+        fi
+        if ! PUBLISHED_MAX_BUILD="$(published_max_build "$JM_PREVIOUS_APPCAST")"; then
+            rm -rf "$LIVE_FEED_DIR"
+            echo "ERROR: JM_PREVIOUS_APPCAST could not be read as a Sparkle appcast with integer build numbers" >&2
+            exit 1
+        fi
+        if [ "$LIVE_FEED_OK" = 1 ]; then
+            if ! LIVE_MAX_BUILD="$(published_max_build "$LIVE_FEED")"; then
+                rm -rf "$LIVE_FEED_DIR"
+                echo "ERROR: the published appcast at $SPARKLE_FEED_URL could not be read as a Sparkle appcast with integer build numbers" >&2
+                exit 1
+            fi
+            if (( LIVE_MAX_BUILD > PUBLISHED_MAX_BUILD )); then
+                rm -rf "$LIVE_FEED_DIR"
+                echo "ERROR: JM_PREVIOUS_APPCAST is stale: its highest build is $PUBLISHED_MAX_BUILD but $SPARKLE_FEED_URL lists $LIVE_MAX_BUILD" >&2
+                exit 1
+            fi
+        else
+            echo "    WARNING: could not reach $SPARKLE_FEED_URL; trusting JM_PREVIOUS_APPCAST (highest build $PUBLISHED_MAX_BUILD)" >&2
+        fi
+    fi
+    rm -rf "$LIVE_FEED_DIR"
+    if (( JM_BUNDLE_BUILD_NUMBER <= PUBLISHED_MAX_BUILD )); then
+        echo "ERROR: JM_BUILD_NUMBER ($JM_BUNDLE_BUILD_NUMBER) must exceed the highest published build ($PUBLISHED_MAX_BUILD) or Sparkle will not offer it" >&2
+        exit 1
+    fi
+    if [ -n "${JM_ADHOC:-}" ] || [ -n "${JM_QUICK:-}" ]; then
+        echo "ERROR: --distribution forbids JM_ADHOC and JM_QUICK" >&2
+        exit 1
+    fi
+    # Appcast generation is mandatory for a distributable build, not an
+    # optional post-build suggestion.
+    JM_APPCAST=1
+    JM_BUILD_CHANNEL="distribution"
+else
+    # A signed update feed is a shipping artifact. Producing one outside the
+    # gated distribution path would publish a bundle that skipped the
+    # build-number, clean-source, and artifact-verification gates.
+    if [ -n "${JM_APPCAST:-}" ]; then
+        echo "ERROR: JM_APPCAST is only allowed with --distribution" >&2
+        exit 1
+    fi
+    JM_BUILD_CHANNEL="development"
+fi
+if [ -n "$JM_BUNDLE_BUILD_NUMBER" ] && [[ ! "$JM_BUNDLE_BUILD_NUMBER" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: JM_BUILD_NUMBER must be a positive decimal integer" >&2
+    exit 1
+fi
+if [ -n "${JM_COMMIT:-}" ]; then
+    JM_BUILD_COMMIT="$JM_COMMIT"
+    if ! git rev-parse --verify HEAD >/dev/null 2>&1; then
+        echo "ERROR: JM_COMMIT was supplied, but this source tree has no verifiable git HEAD" >&2
+        exit 1
+    fi
+    SOURCE_HEAD="$(git rev-parse HEAD)"
+    if [ "$JM_BUILD_COMMIT" != "$SOURCE_HEAD" ]; then
+        echo "ERROR: JM_COMMIT ($JM_BUILD_COMMIT) does not match source HEAD ($SOURCE_HEAD)" >&2
+        exit 1
+    fi
+    if ! git diff --quiet --ignore-submodules -- || ! git diff --cached --quiet --ignore-submodules --; then
+        echo "ERROR: explicit-commit release builds require a clean tracked source tree" >&2
+        exit 1
+    fi
+    # build/ is generated output; every other untracked input could be picked
+    # up by Go, SwiftPM, or bundle assembly without appearing in HEAD.
+    while IFS= read -r -d '' untracked_path; do
+        case "$untracked_path" in
+            build/*) ;;
+            *)
+                echo "ERROR: explicit-commit release builds reject untracked files: $untracked_path" >&2
+                exit 1
+                ;;
+        esac
+    done < <(git ls-files --others --exclude-standard -z)
+    # Go's automatic VCS stamping can report the primary checkout's revision
+    # when building from a linked worktree. The explicit commit validated above
+    # is embedded by ldflags and in both bundle plists, so omit the misleading
+    # automatic stamp for release artifacts.
+    GO_BUILD_VCS_ARGS=(-buildvcs=false)
+elif git rev-parse --verify HEAD >/dev/null 2>&1; then
+    JM_BUILD_COMMIT="$(git rev-parse HEAD)"
+else
+    JM_BUILD_COMMIT="unknown"
+fi
+GO_VERSION_PACKAGE="github.com/lelanddutcher/juicemount/internal/version"
+GO_BUILD_LDFLAGS="-X ${GO_VERSION_PACKAGE}.Version=${JM_BUILD_VERSION} -X ${GO_VERSION_PACKAGE}.Commit=${JM_BUILD_COMMIT}"
 
 echo "==> JuiceMount Build"
 echo "    config:    $SWIFT_CONFIG"
 echo "    project:   $PROJECT_ROOT"
+echo "    version:   $JM_BUILD_VERSION"
+echo "    build:     ${JM_BUNDLE_BUILD_NUMBER:-plist default}"
+echo "    commit:    $JM_BUILD_COMMIT"
+echo "    shipping:  $([ "$DISTRIBUTION" = 1 ] && echo yes || echo no)"
 echo ""
 
 # 1. Build the Go c-archive
@@ -44,7 +287,16 @@ mkdir -p "$BUILD_DIR"
 # changed under an unchanged mtime. Removing the .a/.h pair so the
 # subsequent build creates fresh inodes.
 rm -f "$BUILD_DIR/libnfsd.a" "$BUILD_DIR/libnfsd.h"
+# Darwin ar otherwise timestamps its symbol index. Go hashes that archive
+# into the build ID embedded in the GUI, so identical code gets a new ID.
+ZERO_AR_DATE=1 \
+MACOSX_DEPLOYMENT_TARGET=26.0 \
+CGO_CFLAGS="${CGO_CFLAGS:-} -mmacosx-version-min=26.0" \
+CGO_LDFLAGS="${CGO_LDFLAGS:-} -mmacosx-version-min=26.0" \
 CGO_ENABLED=1 go build \
+    "${GO_BUILD_VCS_ARGS[@]}" \
+    -ldflags "$GO_BUILD_LDFLAGS" \
+    -tags serviceclient \
     -buildmode=c-archive \
     -o "$BUILD_DIR/libnfsd.a" \
     ./bridge/
@@ -68,11 +320,15 @@ rm -rf "$SWIFT_PKG/.build/$SWIFT_CONFIG/JuiceMount"
 # Sparkle rpath) belong to the app executable ONLY. The thumbnail appex is
 # built in step 2b as a separate product so these flags never leak into its
 # link (and its differing link flags never dirty the app's incremental build).
+# Keep the archive's debug-map path stable across fresh output directories.
 swift build -c "$SWIFT_CONFIG" --product JuiceMount \
     -Xlinker "-L$BUILD_DIR" \
+    -Xlinker "-oso_prefix" -Xlinker "$BUILD_DIR/" \
     -Xlinker "-lnfsd" \
+    -Xlinker "-lresolv" \
     -Xlinker "-framework" -Xlinker "CoreFoundation" \
     -Xlinker "-framework" -Xlinker "Security" \
+    -Xlinker "-framework" -Xlinker "IOKit" \
     -Xlinker "-framework" -Xlinker "AppKit" \
     -Xlinker "-framework" -Xlinker "Quartz" \
     -Xlinker "-framework" -Xlinker "Carbon" \
@@ -96,9 +352,11 @@ echo "    Built: $SWIFT_BIN"
 # 2b. QuickLook thumbnail appex executable. A tiny sandboxed XPC process that
 # serves the farm-pre-rendered posters from the daemon's loopback endpoint
 # (127.0.0.1:11050/thumb-local) so Finder never decodes remote video just to
-# draw a thumbnail; on any miss/error it fails fast and macOS falls back to
-# Apple's generator. Its link settings (QuickLookThumbnailing etc.) live in
-# Package.swift — no -Xlinker flags here on purpose (see step 2 comment).
+# draw a thumbnail. On constrained-link misses it draws a local placeholder
+# so macOS cannot decode the remote source merely to render Finder; LAN misses
+# and errors retain Apple's normal fallback. Its link settings
+# (QuickLookThumbnailing etc.) live in Package.swift — no -Xlinker flags here
+# on purpose (see step 2 comment).
 echo ""
 echo "==> [2b] Building QuickLook thumbnail appex (JuiceMountThumbnails)..."
 swift build -c "$SWIFT_CONFIG" --product JuiceMountThumbnails
@@ -119,8 +377,96 @@ mkdir -p "$APP_BIN_DIR" "$APP_RES_DIR"
 # Copy executable
 cp "$SWIFT_BIN" "$APP_BIN_DIR/JuiceMount"
 
+# The app archive is only a control client. launchd owns the serving runtime so
+# GUI death does not discard NFS, Link, FUSE supervision, caches or local stores.
+MACOSX_DEPLOYMENT_TARGET=26.0 \
+CGO_CFLAGS="${CGO_CFLAGS:-} -mmacosx-version-min=26.0" \
+CGO_LDFLAGS="${CGO_LDFLAGS:-} -mmacosx-version-min=26.0 -framework IOKit" \
+CGO_ENABLED=1 go build "${GO_BUILD_VCS_ARGS[@]}" -trimpath \
+    -ldflags "$GO_BUILD_LDFLAGS" \
+    -o "$APP_BIN_DIR/juicemount-service" ./bridge
+mkdir -p "$APP_DIR/Contents/Library/LaunchAgents"
+cp "$PROJECT_ROOT/scripts/com.juicemount.serving.plist" "$APP_DIR/Contents/Library/LaunchAgents/"
+
+# Privileged unmount helper (H-3): a root LaunchDaemon registered by the app
+# with SMAppService.daemon(plistName: "com.juicemount.unmountd.plist"). That
+# API requires the plist in Contents/Library/LaunchDaemons/ and resolves its
+# BundleProgram (Contents/MacOS/juicemount-unmountd) inside this bundle.
+#
+# Channel. The RELEASE helper admits only NOTARIZED peers. Its status channel
+# therefore refuses an app bundle that is not notarized AND stapled (an
+# unstapled ticket needs the network, so an offline Mac also refuses), and
+# with founder Q1 such an app can never Start. Every non-distribution bundle
+# that will not end up notarized+stapled gets the DEV helper instead
+# (-tags jmdevunmountd: Developer ID + team + identifier, no notarization):
+#   - JM_UNMOUNTD_DEV=1, JM_QUICK=1 or JM_ADHOC=1: decided here, up front;
+#   - no notary profile, notarization failed, or stapling failed: decided
+#     after the notarization step, which rebuilds and re-signs the helper and
+#     re-seals the app (see "Unmount helper channel" below).
+# A dev helper never ships: --distribution refuses it here and below, and
+# verify-build.sh --release fails a helper carrying the tag.
+UNMOUNTD_CHANNEL=release
+UNMOUNTD_DEV_REASON=""
+if [ -n "${JM_UNMOUNTD_DEV:-}" ]; then
+    if [ "$DISTRIBUTION" = 1 ]; then
+        echo "ERROR: --distribution forbids JM_UNMOUNTD_DEV" >&2
+        exit 1
+    fi
+    UNMOUNTD_CHANNEL=dev
+    UNMOUNTD_DEV_REASON="JM_UNMOUNTD_DEV=1"
+elif [ "$DISTRIBUTION" != 1 ] && { [ -n "${JM_QUICK:-}" ] || [ -n "${JM_ADHOC:-}" ]; }; then
+    UNMOUNTD_CHANNEL=dev
+    UNMOUNTD_DEV_REASON="$([ -n "${JM_QUICK:-}" ] && echo JM_QUICK=1 || echo JM_ADHOC=1): this bundle will not be notarized"
+fi
+build_unmountd() {
+    local tags=()
+    if [ "$UNMOUNTD_CHANNEL" = dev ]; then
+        if [ "$DISTRIBUTION" = 1 ]; then
+            echo "ERROR: --distribution must never ship the dev unmount helper" >&2
+            exit 1
+        fi
+        tags=(-tags jmdevunmountd)
+        echo "    ${YELLOW:-}NOTE: unmount helper built with the DEV peer requirement (${UNMOUNTD_DEV_REASON}). It admits unnotarized Developer ID peers and must never ship.${RESET:-}"
+    fi
+    MACOSX_DEPLOYMENT_TARGET=26.0 \
+    CGO_CFLAGS="${CGO_CFLAGS:-} -mmacosx-version-min=26.0" \
+    CGO_LDFLAGS="${CGO_LDFLAGS:-} -mmacosx-version-min=26.0" \
+    CGO_ENABLED=1 go build "${GO_BUILD_VCS_ARGS[@]}" "${tags[@]}" -trimpath \
+        -ldflags "$GO_BUILD_LDFLAGS" \
+        -o "$APP_BIN_DIR/juicemount-unmountd" ./cmd/juicemount-unmountd
+}
+build_unmountd
+mkdir -p "$APP_DIR/Contents/Library/LaunchDaemons"
+cp "$PROJECT_ROOT/scripts/com.juicemount.unmountd.plist" "$APP_DIR/Contents/Library/LaunchDaemons/"
+
+# Kernel mount-table inspection must never run in the GUI process. Ship the
+# small observer beside the executable; the runtime does not search PATH.
+MACOSX_DEPLOYMENT_TARGET=26.0 \
+CGO_CFLAGS="${CGO_CFLAGS:-} -mmacosx-version-min=26.0" \
+CGO_LDFLAGS="${CGO_LDFLAGS:-} -mmacosx-version-min=26.0" \
+CGO_ENABLED=1 go build "${GO_BUILD_VCS_ARGS[@]}" -trimpath \
+    -ldflags "$GO_BUILD_LDFLAGS" \
+    -o "$APP_BIN_DIR/juicemount-mount-probe" ./cmd/juicemount-mount-probe
+
+# Bundled, pinned, patched JuiceFS: the only juicefs the runtime will run.
+# The helper verifies third_party/juicefs against SOURCE.json and its patches
+# (scripts/verify-juicefs-sdk.py), builds it and checks its --version.
+GO_BUILD_VCS_ARGS="${GO_BUILD_VCS_ARGS[*]}" "$PROJECT_ROOT/scripts/build-bundled-juicefs.sh" "$APP_BIN_DIR/juicefs"
+JUICEFS_EXPECTED_VERSION="$("$APP_BIN_DIR/juicefs" --version)"
+
+
 # Copy Info.plist
 cp "$SWIFT_PKG/Resources/Info.plist" "$APP_DIR/Contents/Info.plist"
+"$PLISTBUDDY" -c "Set :CFBundleShortVersionString $JM_BUILD_VERSION" "$APP_DIR/Contents/Info.plist"
+if [ -n "$JM_BUNDLE_BUILD_NUMBER" ]; then
+    "$PLISTBUDDY" -c "Set :CFBundleVersion $JM_BUNDLE_BUILD_NUMBER" "$APP_DIR/Contents/Info.plist"
+fi
+"$PLISTBUDDY" -c "Set :JMBuildCommit $JM_BUILD_COMMIT" "$APP_DIR/Contents/Info.plist"
+# Onboarding preflight compares the bundled juicefs --version with this.
+"$PLISTBUDDY" -c "Add :JMBundledJuiceFSVersion string $JUICEFS_EXPECTED_VERSION" "$APP_DIR/Contents/Info.plist"
+# Artifact-level channel: verify-build.sh --release refuses anything but
+# "distribution", so a dev bundle cannot pass the shipping gate by accident.
+"$PLISTBUDDY" -c "Add :JMBuildChannel string $JM_BUILD_CHANNEL" "$APP_DIR/Contents/Info.plist"
 
 # --- Icon rendering (Phase 3 identity) -------------------------------------
 # Render the state-tinted citrus mark SVGs to menu-bar PNGs and the AppIcon
@@ -249,6 +595,11 @@ if [ -n "${SPARKLE_FW_SRC:-}" ] && [ -d "$SPARKLE_FW_SRC" ]; then
     SPARKLE_EMBEDDED=1
     echo "    Embedded: Sparkle.framework -> Contents/Frameworks/ (from $SPARKLE_FW_SRC)"
 else
+    if [ "$DISTRIBUTION" = 1 ]; then
+        echo "ERROR: Sparkle.framework not found under .build/artifacts; refusing distribution build." >&2
+        echo "       Run 'swift package resolve' in $SWIFT_PKG and rebuild." >&2
+        exit 1
+    fi
     echo "    ${YELLOW}WARNING: Sparkle.framework not found under .build/artifacts — auto-updater will crash at launch.${RESET}"
     echo "    ${YELLOW}         Run 'swift package resolve' in $SWIFT_PKG and rebuild.${RESET}"
 fi
@@ -265,7 +616,6 @@ cp "$SWIFT_PKG/Resources/JuiceMountThumbnails-Info.plist" "$APPEX_DIR/Contents/I
 # Keep the appex version in lockstep with the app's (single source of truth:
 # the app Info.plist already copied above) so a release bump can't drift the
 # two apart — mismatched versions are a notarization/App-verify footgun.
-PLISTBUDDY="/usr/libexec/PlistBuddy"
 APP_SHORT_VER="$($PLISTBUDDY -c 'Print :CFBundleShortVersionString' "$APP_DIR/Contents/Info.plist" 2>/dev/null || true)"
 APP_BUNDLE_VER="$($PLISTBUDDY -c 'Print :CFBundleVersion' "$APP_DIR/Contents/Info.plist" 2>/dev/null || true)"
 if [ -n "$APP_SHORT_VER" ]; then
@@ -274,6 +624,8 @@ fi
 if [ -n "$APP_BUNDLE_VER" ]; then
     "$PLISTBUDDY" -c "Set :CFBundleVersion $APP_BUNDLE_VER" "$APPEX_DIR/Contents/Info.plist"
 fi
+"$PLISTBUDDY" -c "Add :JMBuildCommit string $JM_BUILD_COMMIT" "$APPEX_DIR/Contents/Info.plist"
+"$PLISTBUDDY" -c "Add :JMBuildChannel string $JM_BUILD_CHANNEL" "$APPEX_DIR/Contents/Info.plist"
 echo "    Embedded: JuiceMountThumbnails.appex -> Contents/PlugIns/ (v${APP_SHORT_VER:-?})"
 # --- end QuickLook thumbnail appex embed --------------------------------------
 
@@ -330,11 +682,19 @@ elif command -v security >/dev/null 2>&1; then
         fi
         echo "    Signing with Developer ID: $SIGN_IDENTITY_LABEL"
     else
+        if [ "$DISTRIBUTION" = 1 ]; then
+            echo "ERROR: no Developer ID Application certificate found; refusing distribution build." >&2
+            exit 1
+        fi
         SIGN_IDENTITY="-"
         SIGN_IDENTITY_LABEL="ad-hoc"
         echo "    ${YELLOW}WARNING: no Developer ID Application cert found; signing ad-hoc (not distributable)${RESET}"
     fi
 else
+    if [ "$DISTRIBUTION" = 1 ]; then
+        echo "ERROR: 'security' command not found; refusing distribution build." >&2
+        exit 1
+    fi
     SIGN_IDENTITY="-"
     SIGN_IDENTITY_LABEL="ad-hoc"
     echo "    ${YELLOW}WARNING: 'security' command not found; signing ad-hoc (not distributable)${RESET}"
@@ -349,6 +709,19 @@ HARDEN_ARGS=()
 if [ "$SIGN_IDENTITY" != "-" ]; then
     HARDEN_ARGS=(--options runtime --timestamp)
 fi
+
+# Sign the standalone observer before sealing its containing app bundle.
+codesign --force "${HARDEN_ARGS[@]}" --sign "$SIGN_IDENTITY" "$APP_BIN_DIR/juicemount-mount-probe"
+# Explicit identifier: the unmount helper's peer requirement pins
+# "juicemount-service" (client.ServiceSigningID). Without it an ad-hoc
+# signature becomes "juicemount-service-<hash>". Developer ID builds already
+# got exactly this name from the file, so TCC identity does not change.
+codesign --force "${HARDEN_ARGS[@]}" --identifier juicemount-service --sign "$SIGN_IDENTITY" "$APP_BIN_DIR/juicemount-service"
+codesign --force "${HARDEN_ARGS[@]}" --sign "$SIGN_IDENTITY" "$APP_BIN_DIR/juicefs"
+# The unmount helper runs as root. Its identifier is explicit (not the file
+# name) because clients pin it: client.DaemonRequirement names
+# com.juicemount.unmountd. Hardened runtime comes with any real identity.
+codesign --force "${HARDEN_ARGS[@]}" --identifier com.juicemount.unmountd --sign "$SIGN_IDENTITY" "$APP_BIN_DIR/juicemount-unmountd"
 
 # --- Inside-out codesign of the embedded Sparkle.framework ------------------
 # We do NOT rely on `codesign --deep`: Apple deprecated it for signing and it
@@ -407,7 +780,7 @@ if [ -n "$ENT_FILE" ]; then
 fi
 
 codesign "${CS_ARGS[@]}" "$APP_DIR"
-codesign --verify --deep --strict --verbose=2 "$APP_DIR" 2>&1 | head -5 || true
+codesign --verify --deep --strict --verbose=2 "$APP_DIR"
 
 # Notarization, gated. Skipped on:
 #   - JM_QUICK=1  (dev iteration; notarization is slow, 1-5 minutes)
@@ -433,18 +806,60 @@ else
                 STAPLED="yes"
             else
                 STAPLED="no"
+                if [ "$DISTRIBUTION" = 1 ]; then
+                    echo "ERROR: stapling failed; refusing distribution build." >&2
+                    exit 1
+                fi
                 echo "    ${YELLOW}WARNING: stapling failed; the notarization ticket exists at Apple but is not embedded in the app.${RESET}"
             fi
         else
+            if [ "$DISTRIBUTION" = 1 ]; then
+                echo "ERROR: notarization failed; refusing distribution build." >&2
+                exit 1
+            fi
             echo "    ${YELLOW}WARNING: notarization failed (see output above). App will work locally but Gatekeeper will warn on other Macs.${RESET}"
         fi
         rm -f "$NOTARY_ZIP"
     else
+        if [ "$DISTRIBUTION" = 1 ]; then
+            echo "ERROR: no usable notary profile '$NOTARY_PROFILE'; refusing distribution build." >&2
+            exit 1
+        fi
         echo "    INFO: no notary profile '$NOTARY_PROFILE' found in keychain — skipping notarization."
         echo "          To set up: xcrun notarytool store-credentials JuiceMount \\"
         echo "                       --apple-id <email> --team-id <team> --password <app-specific-password>"
     fi
 fi
+
+# --- Unmount helper channel ------------------------------------------------
+# The release helper refuses an app that is not notarized AND stapled (see the
+# helper build above). A non-distribution bundle that ended up without both
+# gets the dev helper now: rebuild it, re-sign it, and re-seal the app. Re-
+# sealing changes the app's code directory, so an unstapled ticket no longer
+# matches it; report that bundle as not notarized.
+if [ "$UNMOUNTD_CHANNEL" = release ] && { [ "$NOTARIZED" != "yes" ] || [ "$STAPLED" != "yes" ]; }; then
+    if [ "$DISTRIBUTION" = 1 ]; then
+        echo "ERROR: distribution bundle is not notarized and stapled; refusing." >&2
+        exit 1
+    fi
+    if [ "$NOTARIZED" = "yes" ]; then
+        echo ""
+        echo "    ${YELLOW}WARNING: notarized but NOT STAPLED. The release unmount helper would refuse this app on an${RESET}"
+        echo "    ${YELLOW}         offline Mac, and JuiceMount could not Start. Switching to the dev helper; the re-sealed${RESET}"
+        echo "    ${YELLOW}         app no longer matches Apple's ticket and is reported as NOT notarized.${RESET}"
+        UNMOUNTD_DEV_REASON="notarized but not stapled"
+    else
+        UNMOUNTD_DEV_REASON="this bundle is not notarized"
+    fi
+    UNMOUNTD_CHANNEL=dev
+    build_unmountd
+    codesign --force "${HARDEN_ARGS[@]}" --identifier com.juicemount.unmountd --sign "$SIGN_IDENTITY" "$APP_BIN_DIR/juicemount-unmountd"
+    codesign "${CS_ARGS[@]}" "$APP_DIR"
+    codesign --verify --deep --strict --verbose=2 "$APP_DIR"
+    NOTARIZED="no"
+    if [ "$STAPLED" = "yes" ] || [ "$STAPLED" = "no" ]; then STAPLED="no"; fi
+fi
+# --- end unmount helper channel ----------------------------------------------
 
 # --- Sparkle appcast generation (release artifact step) ---------------------
 # Produces build/sparkle-release/{JuiceMount.zip, appcast.xml}. These are the
@@ -460,8 +875,16 @@ fi
 if [ -n "${JM_APPCAST:-}" ]; then
     GEN_APPCAST="$(find "$SWIFT_PKG/.build/artifacts" -type f -name 'generate_appcast' 2>/dev/null | head -1)"
     if [ "$NOTARIZED" != "yes" ]; then
+        if [ "$DISTRIBUTION" = 1 ]; then
+            echo "ERROR: distribution appcast requires a notarized build." >&2
+            exit 1
+        fi
         echo "    ${YELLOW}WARNING: JM_APPCAST=1 but build was not notarized — refusing to publish an un-notarized update.${RESET}"
     elif [ -z "$GEN_APPCAST" ]; then
+        if [ "$DISTRIBUTION" = 1 ]; then
+            echo "ERROR: generate_appcast is unavailable; refusing distribution build." >&2
+            exit 1
+        fi
         echo "    ${YELLOW}WARNING: generate_appcast not found under .build/artifacts — run 'swift package resolve'.${RESET}"
     else
         echo ""
@@ -475,13 +898,17 @@ if [ -n "${JM_APPCAST:-}" ]; then
         # --download-url-prefix makes the appcast's enclosure URL point at the
         # GitHub release asset path so clients fetch the zip from the right place.
         if "$GEN_APPCAST" \
-              --download-url-prefix "https://github.com/lelanddutcher/juicemount/releases/latest/download/" \
+              --download-url-prefix "https://github.com/lelanddutcher/juicemount/releases/download/v${JM_BUILD_VERSION}/" \
               -o "$REL_DIR/appcast.xml" \
               "$REL_DIR"; then
             echo "    Appcast: $REL_DIR/appcast.xml"
             echo "    Archive: $REL_DIR/JuiceMount.zip"
             echo "    Upload BOTH to the GitHub Release tagged for this version."
         else
+            if [ "$DISTRIBUTION" = 1 ]; then
+                echo "ERROR: generate_appcast failed; refusing distribution build." >&2
+                exit 1
+            fi
             echo "    ${YELLOW}WARNING: generate_appcast failed — see output above.${RESET}"
         fi
     fi
@@ -544,12 +971,42 @@ if [ -n "$PLUGINS_GUARD_FAIL" ]; then
     exit 1
 fi
 
+# A shipping build is not complete until the artifact verifier independently
+# proves identity, signature, notarization, staple, archive, and appcast. The
+# resulting manifest is deliberately generated only after that gate passes.
+if [ "$DISTRIBUTION" = 1 ]; then
+    REL_DIR="$BUILD_DIR/sparkle-release"
+    ARCHIVE="$REL_DIR/JuiceMount.zip"
+    APPCAST="$REL_DIR/appcast.xml"
+    "$PROJECT_ROOT/scripts/verify-build.sh" \
+        --app "$APP_DIR" \
+        --version "$JM_BUILD_VERSION" \
+        --build-number "$JM_BUNDLE_BUILD_NUMBER" \
+        --commit "$JM_BUILD_COMMIT" \
+        --release \
+        --archive "$ARCHIVE" \
+        --appcast "$APPCAST"
+
+    ARCHIVE_SHA="$(shasum -a 256 "$ARCHIVE" | awk '{print $1}')"
+    APPCAST_SHA="$(shasum -a 256 "$APPCAST" | awk '{print $1}')"
+    printf '{\n  "version": "%s",\n  "build_number": "%s",\n  "commit": "%s",\n  "artifacts": {\n    "JuiceMount.zip": {"sha256": "%s"},\n    "appcast.xml": {"sha256": "%s"}\n  }\n}\n' \
+        "$JM_BUILD_VERSION" "$JM_BUNDLE_BUILD_NUMBER" "$JM_BUILD_COMMIT" "$ARCHIVE_SHA" "$APPCAST_SHA" \
+        > "$REL_DIR/release-manifest.json"
+    (
+        cd "$REL_DIR"
+        shasum -a 256 JuiceMount.zip appcast.xml release-manifest.json > SHA256SUMS
+    )
+    echo "    Manifest: $REL_DIR/release-manifest.json"
+    echo "    Checksums: $REL_DIR/SHA256SUMS"
+fi
+
 echo ""
 echo "==> Build complete"
 echo "    App:        $APP_DIR"
 echo "    Identity:   ${SIGN_IDENTITY_LABEL:-unknown}"
 echo "    Notarized:  $NOTARIZED"
 echo "    Staple:     $STAPLED"
+echo "    Helper:     $UNMOUNTD_CHANNEL channel${UNMOUNTD_DEV_REASON:+ ($UNMOUNTD_DEV_REASON)}"
 echo "    Run:        open $APP_DIR"
 echo "    Or:         $APP_BIN_DIR/JuiceMount"
 

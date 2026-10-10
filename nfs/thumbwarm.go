@@ -1,6 +1,7 @@
 package nfs
 
 import (
+	"github.com/lelanddutcher/juicemount/internal/derivatives"
 	"io"
 	"os"
 	"sync"
@@ -9,6 +10,8 @@ import (
 	"github.com/lelanddutcher/juicemount/internal/cache/pin"
 	"github.com/lelanddutcher/juicemount/internal/jmlog"
 	"github.com/lelanddutcher/juicemount/internal/metrics"
+	"github.com/lelanddutcher/juicemount/internal/netprofile"
+	"github.com/lelanddutcher/juicemount/internal/testguard"
 )
 
 // ThumbWarmer (#1, INSTANT-NAV — the P2 "hydration pack" substrate consumer).
@@ -78,13 +81,22 @@ type ThumbChildRef struct {
 
 type ThumbWarmer struct {
 	cache ThumbBlobCache
-	// resolve returns the ABSOLUTE on-FUSE path of the ready thumbnail blob
-	// for an inode (bridge composes Known → ReconcileOneSidecar → Manifest →
-	// DerivBlobDir). ok=false means no ready thumbnail exists (yet).
-	resolve func(inode uint64) (blobPath string, ok bool)
+	// resolve returns the MOUNT and the MOUNT-RELATIVE path of the ready
+	// thumbnail blob for an inode (bridge composes Known → ReconcileOneSidecar →
+	// Manifest). ok=false means no ready thumbnail exists (yet).
+	//
+	// It deliberately does NOT return a joined absolute path: this blob lives in
+	// a consumer-writable tree, and an absolute path can only be opened with
+	// O_NOFOLLOW on its FINAL component — which leaves the per-inode DIRECTORY
+	// swappable for a symlink pointing anywhere. Keeping root and relative path
+	// apart is what lets the open walk every component.
+	resolve func(inode uint64) (mount, blobRel string, ok bool)
 	// children lists a dir from the RAM mirror (bridge wires
 	// store.ListChildren; µs, never a backend call).
 	children func(dir string) []ThumbChildRef
+	// Acceptance-only: local thumb-cache hits remain available elsewhere, but
+	// a directory visit may not hydrate a miss from FUSE.
+	refuseFUSEContentReads bool
 
 	queue  chan string
 	stopCh chan struct{}
@@ -95,15 +107,16 @@ type ThumbWarmer struct {
 	negative map[uint64]time.Time // inode → no-thumbnail verdict (TTL)
 }
 
-func NewThumbWarmer(cache ThumbBlobCache, resolve func(uint64) (string, bool), children func(string) []ThumbChildRef) *ThumbWarmer {
+func NewThumbWarmer(cache ThumbBlobCache, resolve func(uint64) (string, string, bool), children func(string) []ThumbChildRef) *ThumbWarmer {
 	w := &ThumbWarmer{
-		cache:    cache,
-		resolve:  resolve,
-		children: children,
-		queue:    make(chan string, thumbWarmQueueCap),
-		stopCh:   make(chan struct{}),
-		recent:   make(map[string]time.Time),
-		negative: make(map[uint64]time.Time),
+		cache:                  cache,
+		resolve:                resolve,
+		children:               children,
+		queue:                  make(chan string, thumbWarmQueueCap),
+		stopCh:                 make(chan struct{}),
+		recent:                 make(map[string]time.Time),
+		negative:               make(map[uint64]time.Time),
+		refuseFUSEContentReads: testguard.RefuseFUSEContentReads(),
 	}
 	for i := 0; i < thumbWarmWorkers; i++ {
 		w.wg.Add(1)
@@ -117,7 +130,7 @@ func NewThumbWarmer(cache ThumbBlobCache, resolve func(uint64) (string, bool), c
 // a full queue or a recently-visited dir is silently dropped (the next
 // readdir past the TTL re-triggers).
 func (w *ThumbWarmer) WarmDirAsync(dir string) {
-	if w == nil {
+	if w == nil || w.refuseFUSEContentReads {
 		return
 	}
 	now := time.Now()
@@ -165,7 +178,7 @@ func (w *ThumbWarmer) worker() {
 }
 
 func (w *ThumbWarmer) warmDir(dir string) {
-	if pin.IsOffline() {
+	if w.refuseFUSEContentReads || pin.IsOffline() || !allowSpeculativeDirectoryWarm(netprofile.Default().Class()) {
 		return // dropped; the next online readdir re-triggers
 	}
 	kids := w.children(dir)
@@ -200,7 +213,7 @@ func (w *ThumbWarmer) warmDir(dir string) {
 			continue // budget spent; the next visit resumes
 		}
 		resolves++
-		blobPath, ok := w.resolve(k.Inode)
+		mount, blobRel, ok := w.resolve(k.Inode)
 		if !ok {
 			w.noteNegative(k.Inode, now)
 			metrics.Default().IncThumbWarmNegative()
@@ -213,7 +226,7 @@ func (w *ThumbWarmer) warmDir(dir string) {
 			metrics.Default().IncThumbWarmShed()
 			return
 		}
-		n, err := w.hydrateOne(k.Inode, blobPath)
+		n, err := w.hydrateOne(k.Inode, mount, blobRel)
 		release()
 		if err != nil {
 			// Treat as negative (missing/oversized/unreadable blob) so a
@@ -233,8 +246,31 @@ func (w *ThumbWarmer) warmDir(dir string) {
 
 // hydrateOne pulls one thumbnail blob from FUSE into the local cache.
 // Bounded open (a wedged FUSE can't pin a warm worker) + size cap.
-func (w *ThumbWarmer) hydrateOne(inode uint64, blobPath string) (int64, error) {
-	f, err, ok := openFileWithTimeout(blobPath, os.O_RDONLY, 0, fuseStatTimeout)
+func (w *ThumbWarmer) hydrateOne(inode uint64, mount, blobRel string) (int64, error) {
+	if w.refuseFUSEContentReads {
+		return 0, testguard.ErrFUSEContentReadRefused
+	}
+	// BACKGROUND hydration. The FUSESrcThumbWarm label routes this to warmGate
+	// rather than the FOREGROUND nfsLstatGate (fuseGateForSource, audit P0) —
+	// same reasoning as the sidecar warmer: nobody is waiting on a thumbnail,
+	// so it must not be able to starve someone who IS waiting on navigation.
+	// O_NOFOLLOW (2026-08-04 review, CRITICAL): the derivative tree is
+	// consumer-writable, and this warmer fires off an ordinary Finder directory
+	// listing with NO HTTP request — so an unguarded open copies a symlink
+	// target straight into the local persistent thumb cache, which the serve
+	// path then happily serves because the cached file is regular by then.
+	// ANCHORED at the mount, and still bounded by the warm gate + timeout.
+	//
+	// This path needs no HTTP request at all — an ordinary Finder directory
+	// listing drives it — so it was the cheapest way to reach the symlink bug,
+	// and it stayed reachable through two rounds because each fix was applied
+	// only where the report happened to name it. OpenRegularUnder walks every
+	// component with O_NOFOLLOW (an ancestor directory cannot be a symlink),
+	// adds O_NONBLOCK so a planted FIFO returns instead of pinning a gate slot
+	// forever, and rejects anything that is not a regular file.
+	f, err, ok := openWithTimeout(metrics.FUSESrcThumbWarm, warmOpTimeout(), func() (*os.File, error) {
+		return derivatives.OpenRegularUnder(mount, blobRel)
+	})
 	if !ok {
 		return 0, errFUSETimeout
 	}

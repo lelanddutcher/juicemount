@@ -33,18 +33,20 @@
 #   - a file with an ACL: chmod +a "<user> allow read"
 #
 # CHAIN OF CUSTODY (principle #2): Finder write → NFS handler (CREATE/WRITE) →
-# write spool → drainer (io.CopyBuffer + SHA re-read verify) → JuiceFS backend →
-# READBACK md5 == source. We qa_wait_drain (pending_files==0 && in_progress==0)
-# BEFORE any verify — verifying a non-drained spool reads cache, not at-rest.
+# write spool → drainer (durable checkpoints + SHA verify) → JuiceFS backend.
+# We qa_wait_drain before mounted readback, but drain plus a mounted hash can
+# still read resident cache. Independent backend readback is needed to prove
+# at-rest custody; this category alone does not establish it.
 #
 # ZERO-FINDER-ERROR GATE (principle #3): bracket the copy with qa_log_mark …
 # qa_error_scan and FAIL on any FromHandle STALE / purging phantom / 100070 /
 # 100060 / -48 'already an item' / -36 / -5000 / permission signature, naming the
 # offending path. Known residual ~1 STALE per ~960 ._ files is qa_warn, not fail.
 #
-# NON-DESTRUCTIVE (principle #5): sources live under $QA_STAGE (/tmp); the copy
+# NON-DESTRUCTIVE (principle #5): sources live under $QA_STAGE; the copy
 # lands in a UNIQUE timestamped dest under $QA_DEST_ROOT; the EXIT trap clears any
-# uchg lock we set and removes ONLY what we created. We NEVER touch real folders.
+# uchg lock we set and removes ONLY what we created by default. QA_KEEP_DATA=1
+# retains this category's source and destination for independent inspection.
 #
 # NOT RUN HERE: the orchestrator runs this against the live mount afterward.
 # Final line is a single VERDICT: 'PASS 01-file-types' or
@@ -75,6 +77,8 @@ _ft_unlock_all() {
 }
 
 _ft_cleanup() {
+    # Preserve both stage and landed evidence, including uchg metadata.
+    [ "${QA_KEEP_DATA:-0}" = 1 ] && return 0
     # Clear any uchg locks first so qa_cleanup's rm -rf can actually delete.
     _ft_unlock_all
     # Our dest leaf (qa_cleanup's guard only removes QA_*_$$_* dirs; ours matches,
@@ -209,7 +213,8 @@ ln -s "no_such_file_$$"            "$SRC/links/dangling_link"      # dangling
 qa_log "  staged loose symlinks: relative / absolute / dangling"
 
 # --- a macOS Finder alias (NOT a symlink — a real alias file) ----------------
-# Built via Finder so it's a genuine alias resource, exactly what a user makes.
+# Built via Finder on the off-mount stage, so this is a second Finder mutation
+# before the mounted corpus duplicate. Its result remains in the retained source.
 ALIAS_TARGET="$SRC/links/real_target.dat"
 ALIAS_OUT="$SRC/links"
 _alias_made=1

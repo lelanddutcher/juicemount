@@ -1,0 +1,968 @@
+package farmqueue
+
+import (
+	"context"
+	"os"
+	"strings"
+	"testing"
+	"time"
+)
+
+// TestRedisClaimRecovery exercises the queue's Lua claim/recovery path against
+// a real, disposable Redis. It is intentionally opt-in because the test clears
+// its selected Redis DB; CI/local callers must provide an isolated instance.
+func TestRedisClaimRecovery(t *testing.T) {
+	metaURL := os.Getenv("JM_FARM_TEST_REDIS_URL")
+	if metaURL == "" || os.Getenv("JM_FARM_TEST_REDIS_FLUSH") != "1" {
+		t.Skip("set JM_FARM_TEST_REDIS_URL to an isolated Redis and JM_FARM_TEST_REDIS_FLUSH=1")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	q, err := Open(metaURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer q.Close()
+	if err := q.Ping(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.rdb.FlushDB(ctx).Err(); err != nil {
+		t.Fatal(err)
+	}
+
+	server := Worker{ID: "redis-test-server", Name: "server", Role: QueueClassServer,
+		Capabilities: []string{"cpu", "metadata"}}
+	render := Worker{ID: "redis-test-render", Name: "render", Role: QueueClassRender,
+		Capabilities: []string{"cpu", "vaapi", "encoder:hevc_vaapi"},
+		Encoders:     []string{"hevc_vaapi"},
+		Benchmarks:   WorkerBenchmarks{EncodeFPS: 180, ProbedAt: nowISO()}}
+	if err := q.Heartbeat(ctx, server); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.Heartbeat(ctx, render); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.PublishStoragePermit(ctx, StoragePermit{Source: "test", AvailableBytes: 2, RequiredBytes: 1}); err != nil {
+		t.Fatal(err)
+	}
+
+	job := NewJob("/jfs/incoming/clip.mov", []string{KindProxy}, "manager")
+	// This test exercises execution-claim recovery, not parent discovery.
+	// Model the bounded child that the server planner publishes.
+	job.ShardIndex, job.ShardCount = 1, 1
+	job.RetryTargets = []string{job.Path}
+	q.RouteJob(ctx, &job)
+	if err := q.Enqueue(ctx, job); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := q.ClaimForWorker(ctx, 0, server); err != nil || ok {
+		t.Fatalf("server claimed render work: ok=%v err=%v", ok, err)
+	}
+	claim, ok, err := q.ClaimForWorker(ctx, time.Second, render)
+	if err != nil || !ok {
+		t.Fatalf("render claim: ok=%v err=%v", ok, err)
+	}
+	if claim.Job.SelectedBackend != "hevc_vaapi" {
+		t.Fatalf("backend = %q, want hevc_vaapi", claim.Job.SelectedBackend)
+	}
+	if claim.Job.SelectedWorker != "render" {
+		t.Fatalf("selected worker = %q, want render", claim.Job.SelectedWorker)
+	}
+	if err := q.MarkClaimRunning(ctx, claim, render); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.rdb.Del(ctx, WorkerPrefix+render.ID).Err(); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := q.RecoverAbandonedWorkers(ctx); err != nil || n != 1 {
+		t.Fatalf("recover abandoned = %d, %v; want 1, nil", n, err)
+	}
+
+	fallback, ok, err := q.ClaimForWorker(ctx, time.Second, server)
+	if err != nil || !ok {
+		t.Fatalf("server fallback claim: ok=%v err=%v", ok, err)
+	}
+	if fallback.Job.SelectedBackend != "libx264" || fallback.Job.QueueClass != QueueClassCPU {
+		t.Fatalf("fallback = backend %q class %q", fallback.Job.SelectedBackend, fallback.Job.QueueClass)
+	}
+	if fallback.Job.SelectedWorker != "" {
+		t.Fatalf("CPU fallback retained selected worker %q", fallback.Job.SelectedWorker)
+	}
+	if err := q.MarkDone(ctx, fallback.Job.ID, 1, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.AckClaim(ctx, fallback); err != nil {
+		t.Fatal(err)
+	}
+
+	control := DefaultFarmControl()
+	control.Paused = true
+	if _, err := q.StoreControl(ctx, control, 0); err != nil {
+		t.Fatal(err)
+	}
+	got, err := q.GetControl(ctx)
+	if err != nil || !got.Paused || !got.WatchEnabled {
+		t.Fatalf("control = %+v, %v", got, err)
+	}
+	pausedJob := NewJob("/jfs/incoming/paused.mov", []string{KindDerivatives}, "manager")
+	if err := q.Enqueue(ctx, pausedJob); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := q.ClaimForWorker(ctx, 100*time.Millisecond, server); err != nil || ok {
+		t.Fatalf("paused farm allowed claim: ok=%v err=%v", ok, err)
+	}
+	control.Paused = false
+	if _, err := q.StoreControl(ctx, control, 0); err != nil {
+		t.Fatal(err)
+	}
+	pausedClaim, ok, err := q.ClaimForWorker(ctx, time.Second, server)
+	if err != nil || !ok || pausedClaim.Job.ID != pausedJob.ID {
+		t.Fatalf("resumed claim = %+v, ok=%v err=%v", pausedClaim.Job, ok, err)
+	}
+	if err := q.AckClaim(ctx, pausedClaim); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRedisSafetyPauseIsAtomicAndIdempotent(t *testing.T) {
+	metaURL := os.Getenv("JM_FARM_TEST_REDIS_URL")
+	if metaURL == "" || os.Getenv("JM_FARM_TEST_REDIS_FLUSH") != "1" {
+		t.Skip("set JM_FARM_TEST_REDIS_URL to an isolated Redis and JM_FARM_TEST_REDIS_FLUSH=1")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	q, err := Open(metaURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer q.Close()
+	if err := q.rdb.FlushDB(ctx).Err(); err != nil {
+		t.Fatal(err)
+	}
+
+	control := DefaultFarmControl()
+	control.WatchEnabled = false
+	revision, err := q.StoreControl(ctx, control, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	paused, err := q.PauseForSafety(ctx, "storage-pressure", "backend reserve exhausted")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !paused.Paused || !paused.AutoPaused || paused.WatchEnabled ||
+		paused.PauseCode != "storage-pressure" || paused.Revision != revision+1 {
+		t.Fatalf("safety control = %+v", paused)
+	}
+
+	again, err := q.PauseForSafety(ctx, "storage-pressure", "backend reserve exhausted")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.Revision != paused.Revision {
+		t.Fatalf("idempotent pause changed revision %d -> %d", paused.Revision, again.Revision)
+	}
+	changed, err := q.PauseForSafety(ctx, "storage-probe-failed", "backend headroom unverified")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed.Revision != paused.Revision+1 || changed.PauseCode != "storage-probe-failed" || changed.WatchEnabled {
+		t.Fatalf("changed safety control = %+v", changed)
+	}
+}
+
+func TestRedisRenderClaimRequiresFreshStoragePermit(t *testing.T) {
+	metaURL := os.Getenv("JM_FARM_TEST_REDIS_URL")
+	if metaURL == "" || os.Getenv("JM_FARM_TEST_REDIS_FLUSH") != "1" {
+		t.Skip("set JM_FARM_TEST_REDIS_URL to an isolated Redis and JM_FARM_TEST_REDIS_FLUSH=1")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	q, err := Open(metaURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer q.Close()
+	if err := q.rdb.FlushDB(ctx).Err(); err != nil {
+		t.Fatal(err)
+	}
+
+	render := Worker{
+		ID: "permit-render", Name: "permit-render", Role: QueueClassRender,
+		Capabilities: []string{"encoder:hevc_vaapi"}, Encoders: []string{"hevc_vaapi"},
+		RequireStoragePermit: true, Benchmarks: WorkerBenchmarks{EncodeFPS: 100, ProbedAt: nowISO()},
+	}
+	if err := q.Heartbeat(ctx, render); err != nil {
+		t.Fatal(err)
+	}
+	enqueue := func() Job {
+		job := NewJob("/jfs/incoming/permit.mov", []string{KindProxy}, "manager")
+		job.QueueClass = QueueClassRender
+		job.RequiredCapabilities = []string{"encoder:hevc_vaapi"}
+		job.SelectedBackend = "hevc_vaapi"
+		job.ShardIndex, job.ShardCount = 1, 1
+		job.RetryTargets = []string{job.Path}
+		if err := q.Enqueue(ctx, job); err != nil {
+			t.Fatal(err)
+		}
+		return job
+	}
+
+	first := enqueue()
+	if _, ok, err := q.ClaimForWorker(ctx, 100*time.Millisecond, render); err != nil || ok {
+		t.Fatalf("render claimed without storage permit: ok=%v err=%v", ok, err)
+	}
+	if err := q.PublishStoragePermit(ctx, StoragePermit{
+		Source: "test", TotalBytes: 1000, AvailableBytes: 99, RequiredBytes: 100,
+	}); err == nil {
+		t.Fatal("published unsafe storage permit")
+	}
+	if err := q.PublishStoragePermit(ctx, StoragePermit{
+		Source: "test", TotalBytes: 1000, AvailableBytes: 400, RequiredBytes: 100,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	permit, err := q.GetStoragePermit(ctx)
+	if err != nil || permit.Source != "test" || permit.AvailableBytes != 400 {
+		t.Fatalf("permit=%+v err=%v", permit, err)
+	}
+	claim, ok, err := q.ClaimForWorker(ctx, time.Second, render)
+	if err != nil || !ok || claim.Job.ID != first.ID {
+		t.Fatalf("permitted render claim=%+v ok=%v err=%v", claim.Job, ok, err)
+	}
+	if err := q.AckClaim(ctx, claim); err != nil {
+		t.Fatal(err)
+	}
+
+	second := enqueue()
+	if err := q.RevokeStoragePermit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := q.GetStoragePermit(ctx); err == nil {
+		t.Fatal("revoked storage permit remained readable")
+	}
+	if _, ok, err := q.ClaimForWorker(ctx, 100*time.Millisecond, render); err != nil || ok {
+		t.Fatalf("render claimed %s after permit revocation: ok=%v err=%v", second.ID, ok, err)
+	}
+	if err := q.PublishStoragePermit(ctx, StoragePermit{
+		Source: "test", TotalBytes: 1000, AvailableBytes: 400, RequiredBytes: 100,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.rdb.PExpire(ctx, StoragePermitKey, 20*time.Millisecond).Err(); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(40 * time.Millisecond)
+	if _, ok, err := q.ClaimForWorker(ctx, 100*time.Millisecond, render); err != nil || ok {
+		t.Fatalf("render claimed %s after permit expiry: ok=%v err=%v", second.ID, ok, err)
+	}
+}
+
+func TestRedisRecoveryOnlyAcknowledgesTerminalClaim(t *testing.T) {
+	metaURL := os.Getenv("JM_FARM_TEST_REDIS_URL")
+	if metaURL == "" || os.Getenv("JM_FARM_TEST_REDIS_FLUSH") != "1" {
+		t.Skip("set JM_FARM_TEST_REDIS_URL to an isolated Redis and JM_FARM_TEST_REDIS_FLUSH=1")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	q, err := Open(metaURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer q.Close()
+	if err := q.rdb.FlushDB(ctx).Err(); err != nil {
+		t.Fatal(err)
+	}
+
+	server := Worker{ID: "terminal-ack-server", Name: "terminal-ack-server", Role: QueueClassServer,
+		Capabilities: []string{"cpu", "metadata"}}
+	if err := q.Heartbeat(ctx, server); err != nil {
+		t.Fatal(err)
+	}
+	job := NewJob("/jfs/terminal.mov", []string{KindDerivatives}, "manager")
+	job.DerivativePass = DerivativePassMetadata
+	job.QueueClass = QueueClassServer
+	job.RequiredCapabilities = []string{"metadata"}
+	if err := q.Enqueue(ctx, job); err != nil {
+		t.Fatal(err)
+	}
+	claim, ok, err := q.ClaimForWorker(ctx, time.Second, server)
+	if err != nil || !ok {
+		t.Fatalf("claim: ok=%v err=%v", ok, err)
+	}
+	if err := q.MarkClaimRunning(ctx, claim, server); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.MarkDone(ctx, job.ID, 1, 0); err != nil {
+		t.Fatal(err)
+	}
+	// Model a lost ACK response: terminal status is durable, the processing
+	// receipt remains, and the worker heartbeat then expires.
+	if err := q.rdb.Del(ctx, WorkerPrefix+server.ID).Err(); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := q.RecoverAbandonedWorkers(ctx); err != nil || n != 1 {
+		t.Fatalf("terminal recovery = %d, %v; want one orphaned ACK cleaned", n, err)
+	}
+	if n, err := q.rdb.LLen(ctx, ProcessingPrefix+server.ID).Result(); err != nil || n != 0 {
+		t.Fatalf("processing depth = %d, %v; want 0", n, err)
+	}
+	if depth, err := q.QueueDepth(ctx); err != nil || depth != 0 {
+		t.Fatalf("queue depth = %d, %v; terminal job was requeued", depth, err)
+	}
+	if status, err := q.rdb.HGet(ctx, JobHashPrefix+job.ID, "status").Result(); err != nil || status != StatusDone {
+		t.Fatalf("terminal status = %q, %v", status, err)
+	}
+}
+
+func TestRedisClaimRecoveryPrefersAnotherRenderWorker(t *testing.T) {
+	metaURL := os.Getenv("JM_FARM_TEST_REDIS_URL")
+	if metaURL == "" || os.Getenv("JM_FARM_TEST_REDIS_FLUSH") != "1" {
+		t.Skip("set JM_FARM_TEST_REDIS_URL to an isolated Redis and JM_FARM_TEST_REDIS_FLUSH=1")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	q, err := Open(metaURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer q.Close()
+	if err := q.Ping(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.rdb.FlushDB(ctx).Err(); err != nil {
+		t.Fatal(err)
+	}
+
+	server := Worker{ID: "redis-test-server", Name: "server", Role: QueueClassServer,
+		Capabilities: []string{"cpu", "metadata"}}
+	renderA := Worker{ID: "redis-test-render-a", Name: "render-a", Role: QueueClassRender,
+		Capabilities: []string{"vaapi", "encoder:hevc_vaapi", "decoder:hevc_vaapi"},
+		Encoders:     []string{"hevc_vaapi"}, Decoders: []string{"hevc_vaapi"},
+		Benchmarks: WorkerBenchmarks{EncodeFPS: 180, DecodeFPS: 180, ProbedAt: nowISO()}}
+	renderB := Worker{ID: "redis-test-render-b", Name: "render-b", Role: QueueClassRender,
+		Capabilities: []string{"vaapi", "encoder:hevc_vaapi", "decoder:hevc_vaapi"},
+		Encoders:     []string{"hevc_vaapi"}, Decoders: []string{"hevc_vaapi"},
+		Benchmarks: WorkerBenchmarks{EncodeFPS: 160, DecodeFPS: 160, ProbedAt: nowISO()}}
+	if err := q.Heartbeat(ctx, server); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.Heartbeat(ctx, renderA); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.PublishStoragePermit(ctx, StoragePermit{Source: "test", AvailableBytes: 2, RequiredBytes: 1}); err != nil {
+		t.Fatal(err)
+	}
+
+	job := NewJob("/jfs/incoming/recover-to-gpu.mov", []string{KindProxy}, "manager")
+	job.ShardIndex, job.ShardCount = 1, 1
+	job.RetryTargets = []string{job.Path}
+	q.RouteJob(ctx, &job)
+	if err := q.Enqueue(ctx, job); err != nil {
+		t.Fatal(err)
+	}
+	claim, ok, err := q.ClaimForWorker(ctx, time.Second, renderA)
+	if err != nil || !ok {
+		t.Fatalf("first render claim: ok=%v err=%v", ok, err)
+	}
+	if err := q.MarkClaimRunning(ctx, claim, renderA); err != nil {
+		t.Fatal(err)
+	}
+
+	// Bring a second verified GPU online only after A owns the durable claim,
+	// then simulate A disappearing. Recovery must re-run scheduling and select B.
+	if err := q.Heartbeat(ctx, renderB); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.rdb.Del(ctx, WorkerPrefix+renderA.ID).Err(); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := q.RecoverAbandonedWorkers(ctx); err != nil || n != 1 {
+		t.Fatalf("recover abandoned = %d, %v; want 1, nil", n, err)
+	}
+	// Recovery is exactly-once for the durable receipt. A delayed second reaper
+	// must not duplicate the job in the replacement worker's ready lane.
+	if err := q.RequeueClaim(ctx, claim, false, "duplicate recovery"); err == nil {
+		t.Fatal("already recovered claim was requeued a second time")
+	}
+	if _, ok, err := q.ClaimForWorker(ctx, 100*time.Millisecond, server); err != nil || ok {
+		t.Fatalf("server claimed work while replacement GPU was online: ok=%v err=%v", ok, err)
+	}
+	recovered, ok, err := q.ClaimForWorker(ctx, time.Second, renderB)
+	if err != nil || !ok {
+		t.Fatalf("replacement render claim: ok=%v err=%v", ok, err)
+	}
+	if recovered.Job.SelectedBackend != "hevc_vaapi" || recovered.Job.QueueClass != QueueClassRender {
+		t.Fatalf("recovered route = backend %q class %q", recovered.Job.SelectedBackend, recovered.Job.QueueClass)
+	}
+	if recovered.Job.SelectedWorker != renderB.Name || recovered.Job.Attempts != 1 || recovered.Job.HardwareFailures != 0 {
+		t.Fatalf("recovered target = %q attempts=%d hardware_failures=%d, want %q/1/0",
+			recovered.Job.SelectedWorker, recovered.Job.Attempts, recovered.Job.HardwareFailures, renderB.Name)
+	}
+	if err := q.RequeueClaimAfterHardwareFailure(ctx, recovered, false, "verified hardware execution failed"); err != nil {
+		t.Fatal(err)
+	}
+	retry, ok, err := q.ClaimForWorker(ctx, time.Second, renderB)
+	if err != nil || !ok {
+		t.Fatalf("hardware retry claim: ok=%v err=%v", ok, err)
+	}
+	if retry.Job.Attempts != 2 || retry.Job.HardwareFailures != 1 {
+		t.Fatalf("hardware retry counters = attempts %d failures %d, want 2/1",
+			retry.Job.Attempts, retry.Job.HardwareFailures)
+	}
+	status, err := q.rdb.HGetAll(ctx, JobHashPrefix+job.ID).Result()
+	if err != nil || status["attempts"] != "2" || status["hardware_failures"] != "1" {
+		t.Fatalf("hardware retry status = %+v, %v", status, err)
+	}
+	if err := q.AckClaim(ctx, retry); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A farm-wide pause stops new claims, not durable queue maintenance. This is
+// the exact restart-during-pause case that left a live validation transcript
+// status:"running" on an expired worker receipt indefinitely.
+func TestRedisPausedFarmRecoversAbandonedClaimWithoutExecutingIt(t *testing.T) {
+	metaURL := os.Getenv("JM_FARM_TEST_REDIS_URL")
+	if metaURL == "" || os.Getenv("JM_FARM_TEST_REDIS_FLUSH") != "1" {
+		t.Skip("set JM_FARM_TEST_REDIS_URL to an isolated Redis and JM_FARM_TEST_REDIS_FLUSH=1")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	q, err := Open(metaURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer q.Close()
+	if err := q.Ping(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.rdb.FlushDB(ctx).Err(); err != nil {
+		t.Fatal(err)
+	}
+
+	server := Worker{ID: "paused-recovery-server", Name: "server", Role: QueueClassServer,
+		Capabilities: []string{"cpu", "metadata"}}
+	render := Worker{ID: "paused-recovery-render", Name: "render", Role: QueueClassRender,
+		Capabilities: []string{"encoder:hevc_vaapi"}, Encoders: []string{"hevc_vaapi"},
+		Benchmarks: WorkerBenchmarks{EncodeFPS: 120, ProbedAt: nowISO()}}
+	if err := q.Heartbeat(ctx, server); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.Heartbeat(ctx, render); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.PublishStoragePermit(ctx, StoragePermit{Source: "test", AvailableBytes: 2, RequiredBytes: 1}); err != nil {
+		t.Fatal(err)
+	}
+	job := NewJob("/jfs/incoming/paused-recovery.mov", []string{KindProxy}, "manager")
+	job.ShardIndex, job.ShardCount = 1, 1
+	job.RetryTargets = []string{job.Path}
+	q.RouteJob(ctx, &job)
+	if err := q.Enqueue(ctx, job); err != nil {
+		t.Fatal(err)
+	}
+	claim, ok, err := q.ClaimForWorker(ctx, time.Second, render)
+	if err != nil || !ok {
+		t.Fatalf("initial render claim: ok=%v err=%v", ok, err)
+	}
+	if err := q.MarkClaimRunning(ctx, claim, render); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.rdb.Del(ctx, WorkerPrefix+render.ID).Err(); err != nil {
+		t.Fatal(err)
+	}
+	control := DefaultFarmControl()
+	control.Paused = true
+	if _, err := q.StoreControl(ctx, control, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	if n, err := q.RecoverAbandonedWorkers(ctx); err != nil || n != 1 {
+		t.Fatalf("paused recovery = %d, %v; want 1, nil", n, err)
+	}
+	if _, ok, err := q.ClaimForWorker(ctx, 100*time.Millisecond, server); err != nil || ok {
+		t.Fatalf("paused farm executed recovered work: ok=%v err=%v", ok, err)
+	}
+	status, err := q.rdb.HGetAll(ctx, JobHashPrefix+job.ID).Result()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status["status"] != StatusQueued || status["attempts"] != "1" || status["backend"] != "libx264" {
+		t.Fatalf("recovered status = %+v, want queued attempt 1 on explicit CPU fallback", status)
+	}
+
+	control.Paused = false
+	if _, err := q.StoreControl(ctx, control, 0); err != nil {
+		t.Fatal(err)
+	}
+	recovered, ok, err := q.ClaimForWorker(ctx, time.Second, server)
+	if err != nil || !ok || recovered.Job.ID != job.ID {
+		t.Fatalf("resumed claim = %+v ok=%v err=%v", recovered.Job, ok, err)
+	}
+}
+
+func TestRedisReadyCPUPromotionWhenVerifiedRenderReturns(t *testing.T) {
+	metaURL := os.Getenv("JM_FARM_TEST_REDIS_URL")
+	if metaURL == "" || os.Getenv("JM_FARM_TEST_REDIS_FLUSH") != "1" {
+		t.Skip("set JM_FARM_TEST_REDIS_URL to an isolated Redis and JM_FARM_TEST_REDIS_FLUSH=1")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	q, err := Open(metaURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer q.Close()
+	if err := q.Ping(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.rdb.FlushDB(ctx).Err(); err != nil {
+		t.Fatal(err)
+	}
+
+	server := Worker{ID: "promotion-server", Name: "server", Role: QueueClassServer,
+		Capabilities: []string{"cpu", "metadata"}}
+	if err := q.Heartbeat(ctx, server); err != nil {
+		t.Fatal(err)
+	}
+
+	temporaryProxy := NewJob("/jfs/incoming/temporary.mp4", []string{KindProxy}, "manager")
+	temporaryProxy.ShardIndex, temporaryProxy.ShardCount = 1, 1
+	temporaryProxy.RetryTargets = []string{temporaryProxy.Path}
+	q.RouteJob(ctx, &temporaryProxy)
+	if temporaryProxy.QueueClass != QueueClassCPU || temporaryProxy.CPUFallbackLocked {
+		t.Fatalf("temporary proxy route = %+v, want promotable CPU", temporaryProxy)
+	}
+	if err := q.Enqueue(ctx, temporaryProxy); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.rdb.HSet(ctx, JobHashPrefix+temporaryProxy.ID,
+		"error", "recovered after worker old-render disappeared; compatible worker selection rerun").Err(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Deployed-RC migration case: an old deterministic -cpu child was promoted,
+	// retained its stale lock bit, then moved back to CPU when that ephemeral
+	// render identity disappeared. Availability provenance must repair the stale
+	// lock; the returning worker's live admission probe remains the safety gate.
+	staleOutageLock := temporaryProxy
+	staleOutageLock.ID = NewID() + "-cpu"
+	staleOutageLock.ParentID = strings.TrimSuffix(staleOutageLock.ID, "-cpu")
+	staleOutageLock.Path = "/jfs/incoming/stale-outage-lock.mp4"
+	staleOutageLock.RetryTargets = []string{staleOutageLock.Path}
+	staleOutageLock.QueueClass = QueueClassCPU
+	staleOutageLock.SelectedBackend = "libx264"
+	staleOutageLock.SelectedWorker = ""
+	staleOutageLock.RequiredCapabilities = []string{"cpu"}
+	staleOutageLock.CPUFallbackLocked = true
+	staleOutageLock.RoutingReason = "render capability went offline before claim; queued CPU fallback"
+	if err := q.Enqueue(ctx, staleOutageLock); err != nil {
+		t.Fatal(err)
+	}
+
+	// A live worker-loss recovery keeps the bounded child's historical -cpu
+	// suffix but clears the terminal lock and records availability only in the
+	// mutable status hash. This is the exact deployed shape produced by
+	// RecoverAbandonedWorkers when the sole render node restarts. The suffix
+	// must not override that explicit availability provenance.
+	recoveredLegacySuffix := temporaryProxy
+	recoveredLegacySuffix.ID = NewID() + "-cpu"
+	recoveredLegacySuffix.ParentID = strings.TrimSuffix(recoveredLegacySuffix.ID, "-cpu")
+	recoveredLegacySuffix.Path = "/jfs/incoming/recovered-worker-loss.mp4"
+	recoveredLegacySuffix.RetryTargets = []string{recoveredLegacySuffix.Path}
+	recoveredLegacySuffix.QueueClass = QueueClassCPU
+	recoveredLegacySuffix.SelectedBackend = "libx264"
+	recoveredLegacySuffix.SelectedWorker = ""
+	recoveredLegacySuffix.RequiredCapabilities = []string{"cpu"}
+	recoveredLegacySuffix.CPUFallbackLocked = false
+	recoveredLegacySuffix.RoutingReason = ""
+	if err := q.Enqueue(ctx, recoveredLegacySuffix); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.rdb.HSet(ctx, JobHashPrefix+recoveredLegacySuffix.ID,
+		"error", "recovered after worker vanished-render disappeared; compatible worker selection rerun").Err(); err != nil {
+		t.Fatal(err)
+	}
+
+	parent := NewJob("/jfs/incoming/incompatible.mov", []string{KindProxy}, "manager")
+	lockedProxy, err := newCPUFallbackSubset(parent, []string{parent.Path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !lockedProxy.CPUFallbackLocked {
+		t.Fatal("source-incompatible CPU subset was not locked")
+	}
+	if err := q.Enqueue(ctx, lockedProxy); err != nil {
+		t.Fatal(err)
+	}
+
+	temporaryPreview := NewJob("/jfs/incoming/temporary-high.mp4", []string{KindDerivatives}, "manager")
+	temporaryPreview.ShardIndex, temporaryPreview.ShardCount = 1, 1
+	temporaryPreview.DerivativePass = DerivativePassPreviews
+	temporaryPreview.SourceVideoCodec = "h264"
+	temporaryPreview.SourceVideoProfile = "high"
+	temporaryPreview.SourceBitDepth = 8
+	temporaryPreview.RetryTargets = []string{temporaryPreview.Path}
+	q.RouteJob(ctx, &temporaryPreview)
+	if temporaryPreview.QueueClass != QueueClassCPU || temporaryPreview.CPUFallbackLocked {
+		t.Fatalf("temporary preview route = %+v, want promotable CPU", temporaryPreview)
+	}
+	if err := q.Enqueue(ctx, temporaryPreview); err != nil {
+		t.Fatal(err)
+	}
+
+	lockedPreview := temporaryPreview
+	lockedPreview.ID = NewID()
+	lockedPreview.Path = "/jfs/incoming/yuv422.mp4"
+	lockedPreview.RetryTargets = []string{lockedPreview.Path}
+	lockedPreview.RoutingReason = "pixel format yuv422p10le requires a non-4:2:0 decode path"
+	lockedPreview.CPUFallbackLocked = true
+	if err := q.Enqueue(ctx, lockedPreview); err != nil {
+		t.Fatal(err)
+	}
+
+	render := Worker{ID: "promotion-render", Name: "render", Role: QueueClassRender,
+		Capabilities: []string{
+			"encoder:hevc_vaapi", "decoder:h264_vaapi", "decoder:h264_vaapi:profile:high",
+		},
+		Encoders: []string{"hevc_vaapi"}, Decoders: []string{"h264_vaapi"},
+		Benchmarks: WorkerBenchmarks{EncodeFPS: 200, DecodeFPS: 300, ProbedAt: nowISO()}}
+	if err := q.Heartbeat(ctx, render); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.PublishStoragePermit(ctx, StoragePermit{Source: "test", AvailableBytes: 2, RequiredBytes: 1}); err != nil {
+		t.Fatal(err)
+	}
+
+	if n, err := q.PromoteServiceableReady(ctx); err != nil || n != 4 {
+		t.Fatalf("promote ready CPU = %d, %v; want 4, nil", n, err)
+	}
+	if n, err := q.PromoteServiceableReady(ctx); err != nil || n != 0 {
+		t.Fatalf("idempotent promotion = %d, %v; want 0, nil", n, err)
+	}
+
+	wantRender := map[string]bool{
+		temporaryProxy.ID: true, temporaryPreview.ID: true, staleOutageLock.ID: true,
+		recoveredLegacySuffix.ID: true,
+	}
+	for i := 0; i < 4; i++ {
+		claim, ok, err := q.ClaimForWorker(ctx, time.Second, render)
+		if err != nil || !ok {
+			t.Fatalf("render claim after promotion: ok=%v err=%v", ok, err)
+		}
+		if !wantRender[claim.Job.ID] || claim.Job.QueueClass != QueueClassRender || claim.Job.CPUFallbackLocked {
+			t.Fatalf("unexpected promoted claim: %+v", claim.Job)
+		}
+		delete(wantRender, claim.Job.ID)
+		status, err := q.rdb.HGetAll(ctx, JobHashPrefix+claim.Job.ID).Result()
+		if err != nil || !strings.Contains(status["error"], "promoted queued CPU fallback") {
+			t.Fatalf("promotion status = %+v, %v", status, err)
+		}
+		if err := q.AckClaim(ctx, claim); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(wantRender) != 0 {
+		t.Fatalf("promoted render jobs not claimed: %v", wantRender)
+	}
+
+	wantCPU := map[string]bool{lockedProxy.ID: true, lockedPreview.ID: true}
+	for i := 0; i < 2; i++ {
+		claim, ok, err := q.ClaimForWorker(ctx, time.Second, server)
+		if err != nil || !ok {
+			t.Fatalf("server claim for locked fallback: ok=%v err=%v", ok, err)
+		}
+		if !wantCPU[claim.Job.ID] || claim.Job.QueueClass != QueueClassCPU || !claim.Job.CPUFallbackLocked {
+			t.Fatalf("unexpected locked CPU claim: %+v", claim.Job)
+		}
+		delete(wantCPU, claim.Job.ID)
+		if err := q.AckClaim(ctx, claim); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// Portable source-aware jobs intentionally omit a worker pin so another
+// compatible accelerator can take over. Capability names alone are not enough:
+// the atomic claim must also enforce that worker's measured frame envelope.
+func TestRedisClaimEnforcesMeasuredDecodeGeometry(t *testing.T) {
+	metaURL := os.Getenv("JM_FARM_TEST_REDIS_URL")
+	if metaURL == "" || os.Getenv("JM_FARM_TEST_REDIS_FLUSH") != "1" {
+		t.Skip("set JM_FARM_TEST_REDIS_URL to an isolated Redis and JM_FARM_TEST_REDIS_FLUSH=1")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	q, err := Open(metaURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer q.Close()
+	if err := q.Ping(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.rdb.FlushDB(ctx).Err(); err != nil {
+		t.Fatal(err)
+	}
+
+	capabilities := []string{
+		"encoder:hevc_vaapi", "decoder:h264_vaapi",
+		"decoder:h264_vaapi:profile:high", "decoder:h264_vaapi:pixfmt:yuv420p",
+	}
+	server := Worker{ID: "geometry-server", Name: "server", Role: QueueClassServer,
+		Capabilities: []string{"cpu", "metadata"}}
+	low := Worker{ID: "geometry-low", Name: "low", Role: QueueClassRender,
+		Capabilities: capabilities, Encoders: []string{"hevc_vaapi"}, Decoders: []string{"h264_vaapi"},
+		Benchmarks:   WorkerBenchmarks{EncodeFPS: 100, DecodeFPS: 100, ProbedAt: nowISO()},
+		DecodeLimits: map[string]VideoDecodeLimit{"h264_vaapi": {MaxWidth: 4096, MaxHeight: 4096}}}
+	high := Worker{ID: "geometry-high", Name: "high", Role: QueueClassRender,
+		Capabilities: capabilities, Encoders: []string{"hevc_vaapi"}, Decoders: []string{"h264_vaapi"},
+		Benchmarks:   WorkerBenchmarks{EncodeFPS: 150, DecodeFPS: 150, ProbedAt: nowISO()},
+		DecodeLimits: map[string]VideoDecodeLimit{"h264_vaapi": {MaxWidth: 7680, MaxHeight: 4320}}}
+	for _, worker := range []Worker{server, low, high} {
+		if err := q.Heartbeat(ctx, worker); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := q.PublishStoragePermit(ctx, StoragePermit{Source: "test", AvailableBytes: 2, RequiredBytes: 1}); err != nil {
+		t.Fatal(err)
+	}
+
+	newOversizedJob := func(path string) Job {
+		job := NewJob(path, []string{KindProxy}, "manager")
+		job.ShardIndex, job.ShardCount = 1, 1
+		job.RetryTargets = []string{path}
+		job.QueueClass = QueueClassRender
+		job.VCodec = "hevc_vaapi"
+		job.SelectedBackend = "hevc_vaapi"
+		job.RequiredCapabilities = append([]string(nil), capabilities...)
+		job.SourceVideoCodec = "h264"
+		job.SourceVideoProfile = "high"
+		job.SourcePixelFormat = "yuv420p"
+		job.SourceVideoWidth, job.SourceVideoHeight = 5760, 2880
+		return job
+	}
+
+	job := newOversizedJob("/jfs/incoming/geometry-portable.mp4")
+	if !WorkerSupports(low, job.RequiredCapabilities) || workerCanClaimJob(low, job) {
+		t.Fatal("lower-capacity worker was not distinguished by measured geometry")
+	}
+	if !workerCanClaimJob(high, job) {
+		t.Fatal("verified 8K worker rejected the source")
+	}
+	if err := q.Enqueue(ctx, job); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := q.ClaimForWorker(ctx, 100*time.Millisecond, low); err != nil || ok {
+		t.Fatalf("lower-capacity worker claimed 5760-wide source: ok=%v err=%v", ok, err)
+	}
+	claim, ok, err := q.ClaimForWorker(ctx, time.Second, high)
+	if err != nil || !ok || claim.Job.ID != job.ID {
+		t.Fatalf("verified worker claim=%+v ok=%v err=%v", claim.Job, ok, err)
+	}
+	if err := q.AckClaim(ctx, claim); err != nil {
+		t.Fatal(err)
+	}
+
+	// With the high-capacity worker gone, ready-queue recovery must observe
+	// geometry too and move the source to an explicit, visible CPU route.
+	if err := q.rdb.Del(ctx, WorkerPrefix+high.ID).Err(); err != nil {
+		t.Fatal(err)
+	}
+	fallback := newOversizedJob("/jfs/incoming/geometry-fallback.mp4")
+	if err := q.Enqueue(ctx, fallback); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := q.RecoverUnserviceableReady(ctx); err != nil || n != 0 {
+		t.Fatalf("first geometry recovery=%d, %v; want grace hold", n, err)
+	}
+	if class, err := q.rdb.HGet(ctx, JobHashPrefix+fallback.ID, "queue_class").Result(); err != nil || class != QueueClassRender {
+		t.Fatalf("grace moved render work early: class=%q err=%v", class, err)
+	}
+	if err := q.rdb.HSet(ctx, JobHashPrefix+fallback.ID, readyFallbackSinceField,
+		time.Now().Add(-readyFallbackGrace-time.Second).UTC().Format(time.RFC3339Nano)).Err(); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := q.RecoverUnserviceableReady(ctx); err != nil || n != 1 {
+		t.Fatalf("geometry recovery=%d, %v; want one CPU reroute", n, err)
+	}
+	cpuClaim, ok, err := q.ClaimForWorker(ctx, time.Second, server)
+	if err != nil || !ok || cpuClaim.Job.ID != fallback.ID {
+		t.Fatalf("CPU fallback claim=%+v ok=%v err=%v", cpuClaim.Job, ok, err)
+	}
+	if cpuClaim.Job.QueueClass != QueueClassCPU || cpuClaim.Job.SelectedBackend != "libx264" ||
+		cpuClaim.Job.CPUFallbackLocked {
+		t.Fatalf("geometry fallback route=%+v", cpuClaim.Job)
+	}
+	if cpuClaim.Job.Attempts != 0 || cpuClaim.Job.HardwareFailures != 0 {
+		t.Fatalf("ready-lane availability reroute consumed retry budget: %+v", cpuClaim.Job)
+	}
+	if !temporaryAvailabilityFallback(cpuClaim.Job, "") {
+		t.Fatalf("geometry outage lost temporary provenance: %+v", cpuClaim.Job)
+	}
+	if err := q.AckClaim(ctx, cpuClaim); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRedisRestartAdoptsLegacyRuntimePinWithoutBulkRewrite(t *testing.T) {
+	metaURL := os.Getenv("JM_FARM_TEST_REDIS_URL")
+	if metaURL == "" || os.Getenv("JM_FARM_TEST_REDIS_FLUSH") != "1" {
+		t.Skip("set JM_FARM_TEST_REDIS_URL to an isolated Redis and JM_FARM_TEST_REDIS_FLUSH=1")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	q, err := Open(metaURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer q.Close()
+	if err := q.rdb.FlushDB(ctx).Err(); err != nil {
+		t.Fatal(err)
+	}
+
+	old := Worker{ID: "ephemeral-old", Name: "stable-render", Role: QueueClassRender,
+		Capabilities: []string{"encoder:hevc_vaapi"}, Encoders: []string{"hevc_vaapi"},
+		Benchmarks: WorkerBenchmarks{EncodeFPS: 140, ProbedAt: nowISO()}}
+	if err := q.Heartbeat(ctx, old); err != nil {
+		t.Fatal(err)
+	}
+	const jobs = 150
+	for i := 0; i < jobs; i++ {
+		job := NewJob("/jfs/incoming/restart.mov", []string{KindProxy}, "manager")
+		job.ShardIndex, job.ShardCount = i+1, jobs
+		job.RetryTargets = []string{job.Path}
+		job.QueueClass = QueueClassRender
+		job.VCodec = "hevc_vaapi"
+		job.SelectedBackend = "hevc_vaapi"
+		job.SelectedWorker = old.Name
+		job.RequiredCapabilities = []string{"encoder:hevc_vaapi", "worker:" + old.ID}
+		if err := q.Enqueue(ctx, job); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := q.rdb.Del(ctx, WorkerPrefix+old.ID).Err(); err != nil {
+		t.Fatal(err)
+	}
+	restarted := old
+	restarted.ID = "ephemeral-new"
+	if err := q.Heartbeat(ctx, restarted); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.PublishStoragePermit(ctx, StoragePermit{Source: "test", AvailableBytes: 2, RequiredBytes: 1}); err != nil {
+		t.Fatal(err)
+	}
+	fresh := NewJob("/jfs/incoming/fresh-after-restart.mov", []string{KindProxy}, "manager")
+	fresh.ShardIndex, fresh.ShardCount = 1, 1
+	fresh.RetryTargets = []string{fresh.Path}
+	q.RouteJob(ctx, &fresh)
+	if !containsString(fresh.RequiredCapabilities, "worker-name:"+restarted.Name) ||
+		containsString(fresh.RequiredCapabilities, "worker:"+restarted.ID) {
+		t.Fatalf("fresh route did not use stable worker pin: %v", fresh.RequiredCapabilities)
+	}
+
+	if n, err := q.RecoverUnserviceableReady(ctx); err != nil || n != 0 {
+		t.Fatalf("restart ready recovery = %d, %v; compatible stale pins must stay in place", n, err)
+	}
+	if got, err := q.rdb.LLen(ctx, classQueue(KindProxy, QueueClassRender)).Result(); err != nil || got != jobs {
+		t.Fatalf("render queue after restart = %d, %v; want %d untouched jobs", got, err, jobs)
+	}
+	if got, err := q.rdb.LLen(ctx, classQueue(KindProxy, QueueClassCPU)).Result(); err != nil || got != 0 {
+		t.Fatalf("CPU queue after restart = %d, %v; want zero demotions", got, err)
+	}
+	claim, ok, err := q.ClaimForWorker(ctx, time.Second, restarted)
+	if err != nil || !ok {
+		t.Fatalf("restarted worker did not adopt stale pin: ok=%v err=%v", ok, err)
+	}
+	if !WorkerSupports(restarted, claim.Job.RequiredCapabilities) ||
+		!containsString(claim.Job.RequiredCapabilities, "worker-name:"+restarted.Name) ||
+		containsString(claim.Job.RequiredCapabilities, "worker:"+old.ID) {
+		t.Fatalf("adopted requirements = %v", claim.Job.RequiredCapabilities)
+	}
+	if err := q.AckClaim(ctx, claim); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRedisAbandonedExplicitCPUFallbackPreservesRoute(t *testing.T) {
+	metaURL := os.Getenv("JM_FARM_TEST_REDIS_URL")
+	if metaURL == "" || os.Getenv("JM_FARM_TEST_REDIS_FLUSH") != "1" {
+		t.Skip("set JM_FARM_TEST_REDIS_URL to an isolated Redis and JM_FARM_TEST_REDIS_FLUSH=1")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	q, err := Open(metaURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer q.Close()
+	if err := q.rdb.FlushDB(ctx).Err(); err != nil {
+		t.Fatal(err)
+	}
+
+	serverA := Worker{ID: "cpu-before-restart", Name: "nas-a", Role: QueueClassServer,
+		Capabilities: []string{"cpu", "metadata"}}
+	serverB := Worker{ID: "cpu-after-restart", Name: "nas-b", Role: QueueClassServer,
+		Capabilities: []string{"cpu", "metadata"}}
+	render := Worker{ID: "render-online", Name: "render", Role: QueueClassRender,
+		Capabilities: []string{"encoder:hevc_vaapi", "decoder:h264_vaapi"},
+		Encoders:     []string{"hevc_vaapi"}, Decoders: []string{"h264_vaapi"}}
+	if err := q.Heartbeat(ctx, serverA); err != nil {
+		t.Fatal(err)
+	}
+	parent := NewJob("/jfs/incoming/baseline.mov", []string{KindProxy}, "manager")
+	child, err := newCPUFallbackSubset(parent, []string{parent.Path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	child.RoutingReason = "1 source(s) partitioned to explicit CPU/H.264 fallback; first reason: baseline profile was not verified"
+	if err := q.Enqueue(ctx, child); err != nil {
+		t.Fatal(err)
+	}
+	claim, ok, err := q.ClaimForWorker(ctx, time.Second, serverA)
+	if err != nil || !ok {
+		t.Fatalf("initial CPU claim: ok=%v err=%v", ok, err)
+	}
+	if err := q.MarkClaimRunning(ctx, claim, serverA); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.Heartbeat(ctx, serverB); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.Heartbeat(ctx, render); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.rdb.Del(ctx, WorkerPrefix+serverA.ID).Err(); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := q.RecoverAbandonedWorkers(ctx); err != nil || n != 1 {
+		t.Fatalf("abandoned CPU recovery = %d, %v; want one", n, err)
+	}
+	if _, ok, err := q.ClaimForWorker(ctx, 100*time.Millisecond, render); err != nil || ok {
+		t.Fatalf("render worker claimed explicit CPU fallback: ok=%v err=%v", ok, err)
+	}
+	recovered, ok, err := q.ClaimForWorker(ctx, time.Second, serverB)
+	if err != nil || !ok {
+		t.Fatalf("replacement CPU worker did not recover claim: ok=%v err=%v", ok, err)
+	}
+	if recovered.Job.ID != child.ID || recovered.Job.ParentID != parent.ID ||
+		recovered.Job.QueueClass != QueueClassCPU || recovered.Job.SelectedBackend != "libx264" ||
+		!recovered.Job.CPUFallbackLocked || recovered.Job.Attempts != 1 {
+		t.Fatalf("recovered explicit CPU route = %+v", recovered.Job)
+	}
+	if strings.Count(recovered.Job.ID, "-cpu") != 1 {
+		t.Fatalf("recovery created nested CPU identity %q", recovered.Job.ID)
+	}
+	if err := q.AckClaim(ctx, recovered); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}

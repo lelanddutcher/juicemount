@@ -465,3 +465,153 @@ func TestConcurrencySmoke(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 }
+
+// --- C5: invalidation (stale-derivative correctness) -----------------------
+//
+// The cache is keyed {inode, kind} and persists across restarts, so an inode
+// whose source bytes changed (in-place overwrite, recycled inode) would keep
+// serving the OLD blob forever. Invalidate is the escape hatch; these tests
+// pin the two properties the serve-path gate depends on: the in-RAM index
+// entry is dropped AND the on-disk file is gone (so the next Open, which
+// rebuilds the index by walking the directory, cannot resurrect it).
+
+func TestInvalidateDropsIndexAndFile(t *testing.T) {
+	dir := t.TempDir()
+	c := mustOpen(t, dir, 1<<20)
+	defer c.Close()
+
+	body := payload(64)
+	mustPut(t, c, 42, "thumbnail", body)
+	p, ok := c.Path(42, "thumbnail")
+	if !ok {
+		t.Fatal("Path(42, thumbnail) = miss right after Put")
+	}
+	if _, err := os.Stat(p); err != nil {
+		t.Fatalf("blob not on disk after Put: %v", err)
+	}
+
+	if !c.Invalidate(42, "thumbnail") {
+		t.Fatal("Invalidate(42, thumbnail) = false, want true (entry was resident)")
+	}
+	if c.Has(42, "thumbnail") {
+		t.Error("Has(42, thumbnail) = true after Invalidate")
+	}
+	if _, ok := c.Path(42, "thumbnail"); ok {
+		t.Error("Path(42, thumbnail) = hit after Invalidate")
+	}
+	if _, err := os.Stat(p); !os.IsNotExist(err) {
+		t.Errorf("on-disk blob still present after Invalidate: stat err = %v", err)
+	}
+
+	s := c.Stats()
+	if s.Bytes != 0 || s.Files != 0 {
+		t.Errorf("Stats after Invalidate: Bytes=%d Files=%d, want 0/0", s.Bytes, s.Files)
+	}
+	if s.Invalidations != 1 {
+		t.Errorf("Stats.Invalidations = %d, want 1", s.Invalidations)
+	}
+	if s.Evictions != 0 {
+		t.Errorf("Stats.Evictions = %d, want 0 (invalidation is not a capacity eviction)", s.Evictions)
+	}
+}
+
+// TestInvalidateSurvivesReopen is the restart half of the bug: a stale poster
+// must not come back when thumbcache.Open re-indexes the directory.
+func TestInvalidateSurvivesReopen(t *testing.T) {
+	dir := t.TempDir()
+	c := mustOpen(t, dir, 1<<20)
+	mustPut(t, c, 7, "thumbnail", payload(32))
+	mustPut(t, c, 7, "waveform", payload(16))
+	c.Invalidate(7, "thumbnail")
+	c.Close()
+
+	c2 := mustOpen(t, dir, 1<<20)
+	defer c2.Close()
+	if c2.Has(7, "thumbnail") {
+		t.Error("invalidated blob came back after reopen — the on-disk file was not removed")
+	}
+	if !c2.Has(7, "waveform") {
+		t.Error("Invalidate(7, thumbnail) also dropped the waveform blob")
+	}
+}
+
+func TestInvalidateMissIsNoop(t *testing.T) {
+	dir := t.TempDir()
+	c := mustOpen(t, dir, 1<<20)
+	defer c.Close()
+
+	mustPut(t, c, 1, "thumbnail", payload(20))
+	before := c.Stats()
+	if c.Invalidate(99, "thumbnail") {
+		t.Error("Invalidate on an absent key = true, want false")
+	}
+	if c.Invalidate(1, "nosuchkind") {
+		t.Error("Invalidate on an absent kind = true, want false")
+	}
+	if c.Invalidate(1, "bad/kind") {
+		t.Error("Invalidate with an unsafe kind = true, want false")
+	}
+	after := c.Stats()
+	if after.Bytes != before.Bytes || after.Files != before.Files || after.Invalidations != 0 {
+		t.Errorf("no-op Invalidate mutated state: before=%+v after=%+v", before, after)
+	}
+	if !c.Has(1, "thumbnail") {
+		t.Error("unrelated entry lost")
+	}
+}
+
+// TestInvalidateRemovesUnindexedBlob covers the restart-adjacent case where a
+// blob is on disk under the canonical name but not in this process's index
+// (written by an earlier run whose index we haven't rebuilt). It must still be
+// deleted, or the next Open picks it up and serves it.
+func TestInvalidateRemovesUnindexedBlob(t *testing.T) {
+	dir := t.TempDir()
+	c := mustOpen(t, dir, 1<<20)
+	defer c.Close()
+
+	shard, canonical := c.blobPath(1234, "thumbnail")
+	if err := os.MkdirAll(shard, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(canonical, payload(24), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if c.Invalidate(1234, "thumbnail") {
+		t.Error("Invalidate = true for an unindexed blob, want false (nothing was indexed)")
+	}
+	if _, err := os.Stat(canonical); !os.IsNotExist(err) {
+		t.Errorf("unindexed on-disk blob survived Invalidate: stat err = %v", err)
+	}
+}
+
+func TestInvalidateInodeDropsEveryKind(t *testing.T) {
+	dir := t.TempDir()
+	c := mustOpen(t, dir, 1<<20)
+	defer c.Close()
+
+	mustPut(t, c, 5, "thumbnail", payload(10))
+	mustPut(t, c, 5, "waveform", payload(12))
+	mustPut(t, c, 5, "filmstrip", payload(14))
+	mustPut(t, c, 6, "thumbnail", payload(16))
+
+	if n := c.InvalidateInode(5); n != 3 {
+		t.Errorf("InvalidateInode(5) = %d, want 3", n)
+	}
+	for _, kind := range []string{"thumbnail", "waveform", "filmstrip"} {
+		if c.Has(5, kind) {
+			t.Errorf("inode 5 %s survived InvalidateInode", kind)
+		}
+	}
+	if !c.Has(6, "thumbnail") {
+		t.Error("InvalidateInode(5) dropped inode 6")
+	}
+	s := c.Stats()
+	if s.Files != 1 || s.Invalidations != 3 {
+		t.Errorf("Stats = %+v, want Files=1 Invalidations=3", s)
+	}
+	// Byte accounting stays exact.
+	total, files := diskUsage(t, dir)
+	if files != 1 || total != s.Bytes {
+		t.Errorf("disk = %d bytes/%d files, index = %d bytes/%d files", total, files, s.Bytes, s.Files)
+	}
+}

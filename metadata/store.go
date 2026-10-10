@@ -1,7 +1,9 @@
 package metadata
 
 import (
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"fmt"
 	"io/fs"
 	"log"
@@ -62,6 +64,16 @@ CREATE TABLE IF NOT EXISTS store_meta (
 );
 `
 
+// ftsIndexEpoch is a durable declaration that entries_fts was fully built by
+// code with the current FTS schema/maintenance invariants. Bump the value when
+// the FTS schema or tokenizer changes. A missing/older value makes Open perform
+// one migration rebuild; subsequent clean launches can safely skip it.
+const (
+	ftsIndexEpochKey = "fts_index_epoch"
+	ftsIndexEpoch    = "1"
+	ftsIndexDirty    = "dirty"
+)
+
 // ftsSchema creates a full-text search virtual table for instant filename search.
 // Uses FTS5 with a trigram tokenizer so partial matches work (e.g. "explosion" matches
 // "Big_Explosion_4K.mov"). NO triggers — FTS is rebuilt manually after bulk operations
@@ -98,7 +110,8 @@ DROP TRIGGER IF EXISTS entries_au;
 // crash+restart the compactor resumes from whatever pending rows survived — and
 // because entries_fts is external-content, the index is always fully rebuildable
 // from `entries` regardless (RebuildFTS at Open re-derives everything). No FTS
-// data can be lost, only deferred.
+// data can be lost, only deferred. Open performs a recovery rebuild whenever
+// pending markers survive a restart.
 //
 // INTEGRITY (the landmine): a pending marker is ONLY ever the NEW rowid of a
 // still-present entries row. The OLD-rowid entries_fts('delete', ...) stays
@@ -212,14 +225,49 @@ type PinChecker interface {
 
 // Store is a SQLite-backed metadata store with in-memory caches.
 type Store struct {
-	db           *sql.DB
-	writeMu      sync.Mutex   // serializes all SQLite write operations (eliminates SQLITE_BUSY)
-	mu           sync.RWMutex // protects in-memory caches
-	inodeCache   map[uint64]*Entry
-	pathCache    map[string]*Entry
-	childrenIdx  map[string]map[string]*Entry // parentPath → {path → *Entry}
-	maxCacheSize int
-	pinChecker   PinChecker // optional (QA-30); see PinChecker docstring
+	db                 *sql.DB
+	fileLock           *storeFileLock
+	pruneLadderOwnerID string
+	writeMu            sync.Mutex // serializes all SQLite write operations (eliminates SQLITE_BUSY)
+	// Serializes remote subscription observations with replacement acceptance,
+	// legacy intent upgrade, settlement, and legacy completion hold admission/
+	// cleanup. It precedes writeMu and stays held through RAM publication.
+	// Other Store writers do not take it.
+	replacementObservationMu sync.Mutex
+	// A bulk transaction holds this gate without holding mu across SQL or
+	// callbacks. Cache-only namespace publishers take it before mu. Lock order:
+	// writeMu -> cachePublicationMu -> mu; never acquire writeMu under this gate.
+	cachePublicationMu          sync.Mutex
+	evictionMu                  sync.Mutex   // serializes bounded pressure passes; never acquired under mu/publication
+	nextCacheIdentity           uint64       // fresh RAM publication identity, guarded by mu
+	readDirAfterCacheCheckHook  func()       // deterministic completeness-race tests; nil in production
+	mu                          sync.RWMutex // protects in-memory caches
+	deletePathsAfterCommitHook  func()       // test-only synchronization point; nil in production
+	evictionAfterSelectHook     func()       // deterministic interleavings; nil in production
+	evictionAfterApplyChunkHook func()       // called without serving locks; nil in production
+	inodeCache                  map[uint64]*Entry
+	pathCache                   map[string]*Entry
+	preparedCreates             map[string]PreparedCreate    // unresolved local CREATEs, guarded by mu
+	cacheGeneration             uint64                       // cache-only publications, guarded by mu
+	childrenIdx                 map[string]map[string]*Entry // parentPath → {path → *Entry}
+	// dirVisibilityMtime is an in-memory NFS cache-invalidation generation for
+	// each directory. Redis/JuiceFS directory attrs have second precision, so a
+	// remote mkdir+create burst can leave the directory's authoritative mtime
+	// unchanged even though its child set changed. macOS then keeps an already-
+	// cached empty READDIR result indefinitely. Keyspace-push calls
+	// NoteDirectoryChanged after applying a membership event; the NFS adapter
+	// overlays this timestamp on FileInfo without changing canonical SQLite
+	// metadata or adding a write to the cellular hot path. Guarded by mu.
+	dirVisibilityMtime map[string]time.Time
+	maxCacheSize       int
+	pinChecker         PinChecker // optional (QA-30); see PinChecker docstring
+
+	// cacheEvicted records that the bounded RAM shadow has dropped at least one
+	// durable file row. Once true, a RAM miss is no longer evidence that the
+	// path is absent, and a RAM READDIR child set may be incomplete. The NFS
+	// serve accessors then use the local SQLite-WAL mirror as a miss/completeness
+	// fallback. It is monotonic for the Store lifetime.
+	cacheEvicted atomic.Bool
 
 	// spoolStore is the sibling SpoolStore over the SAME *sql.DB (both created
 	// from store.DB(); see the shared-DB note on Open). Wired via
@@ -230,6 +278,31 @@ type Store struct {
 	// when the batch-insert lever is off — BatchDrainComplete errors rather
 	// than run the mark-done unserialized. Read-only after SetSpoolStore.
 	spoolStore *SpoolStore
+
+	// onSubtreeRenamed is fired by RenameSubtree so the NFS layer can drop the
+	// pooled FUSE fds for a moved subtree (they are keyed by path alone and
+	// would otherwise keep serving the pre-rename inodes). Injected via
+	// SetOnSubtreeRenamed; nil when unwired. Guarded by mu.
+	onSubtreeRenamed func(oldDir, newDir string)
+
+	// onPathInvalidated is fired when a REMOTE mutation (a peer's, the farm's or
+	// OpenLoupe's delete/rename, applied via RedisClient.applyEvent) changes what
+	// lives at a path, so the NFS layer can drop the pooled FUSE fds for it.
+	// Injected via SetOnPathInvalidated; nil when unwired. Guarded by mu.
+	onPathInvalidated func(path string, isDir bool)
+
+	// onContentInvalidated is distinct from onPathInvalidated: create/update
+	// events commonly preserve path identity (so pooled FUSE descriptors stay
+	// valid) while changing the JuiceFS slice mapping behind the inode. The NFS
+	// layer uses this hook to drop byte caches without disturbing write slots.
+	// onContentReset is the coarse companion for a full reconciliation or
+	// subtree prune where missed events make exact path generations unknowable.
+	// Both are injected by the NFS layer and guarded by mu.
+	onContentInvalidated func(path string, isDir bool)
+	// Conditional SCAN and scoped prune publish exact pre-mutation inodes under
+	// Store locks; this hook must not call back into Store.
+	onScanContentInvalidated func(path string, oldInode uint64)
+	onContentReset           func()
 
 	// ftsInitialized is set once the external-content FTS has been built (the
 	// first BulkInsert / initial sync). After that EVERY BulkInsert maintains
@@ -271,6 +344,13 @@ type Store struct {
 	// test-observable proxy for "the compactor ran and made progress".
 	ftsCompactedBatches atomic.Uint64
 
+	pruneLadderGCStop        chan struct{}
+	pruneLadderGCStopOnce    sync.Once
+	pruneLadderGCDone        chan struct{}
+	pruneLadderGCWake        chan struct{}
+	pruneLadderGCHookMu      sync.RWMutex
+	pruneLadderGCBeforeBatch func()
+
 	// QA-30 Layer B (2026-05-25): recently-evicted shadow map. When an entry
 	// is removed from pathCache+inodeCache via Delete/DeleteFromCache/
 	// DeletePaths or via evictOldest's rebuild, a copy of its scalar
@@ -292,6 +372,10 @@ type Store struct {
 	// pinnedSetErr non-nil → evictOldest skips this cycle (fail-safe).
 	pinnedSetForEviction map[string]struct{}
 	pinnedSetErr         error
+	// Shadow expiry maintenance shares mu with navigation. Full scans are
+	// amortized across expiry cohorts, never repeated for every evicted file.
+	shadowSweepAfter time.Time
+	shadowSweep      *shadowExpiryCursor // bounded cursor; guarded by mu, stopped at Close
 
 	// syntheticHandles maps a SYNTHETIC inode (high bit set — handed out by
 	// ToHandle's fnv64a fallback for a path not yet in the store) to its path.
@@ -398,6 +482,15 @@ func (s *Store) stagePinnedForEviction() {
 	s.mu.Unlock()
 }
 
+// evictWithPinnedSet serializes pressure passes without retaining either
+// serving lock across pin SQL, catalog selection, or sorting. Startup rebuild
+// still uses evictOldest before the Store is exposed to serving goroutines.
+func (s *Store) evictWithPinnedSet() {
+	s.evictionMu.Lock()
+	defer s.evictionMu.Unlock()
+	s.evictCacheChunks()
+}
+
 // ShadowTTL is the lifetime of recently-evicted shadow entries. 5 min is
 // chosen to comfortably outlive any reasonable NFS-client handle-cache
 // retry window — macOS NFS hangs onto handles for ~3 min by default,
@@ -417,30 +510,58 @@ type evictedShadow struct {
 	Size       int64
 	Mtime      time.Time
 	IsDir      bool
-	ExpiresAt  time.Time
+	// Deleted distinguishes an authoritative local unlink from ordinary cache
+	// eviction/pruning. NFS clients may keep using the unlinked inode's handle;
+	// the serving layer must preserve that handle without recovering the name
+	// back into pathCache/childrenIdx.
+	Deleted   bool
+	ExpiresAt time.Time
 }
 
 // shadowEvictedLocked parks a scalar copy of an entry being removed from
 // the caches, keyed by inode, with a TTL. Caller must hold s.mu.Lock.
-// Opportunistically expires any other shadow entries that are past TTL —
-// keeps the map size bounded without a separate sweep goroutine.
+// Expiry cleanup is lazy and bounded per insertion; lookups reject expired
+// records immediately. Completed passes are separated by shadowSweepInterval.
+// An unfinished pass advances by at most evictionChunk records per insertion.
 //
 // nil-safe: nil entry is a no-op (legitimate for Delete calls where the
 // pre-fetch found nothing).
 func (s *Store) shadowEvictedLocked(e *Entry) {
+	s.shadowEvictedAtLocked(e, time.Now())
+}
+
+// Even staggered expirations must not trigger a full scan on every insertion.
+const shadowSweepInterval = time.Second
+
+func (s *Store) shadowEvictedAtLocked(e *Entry, now time.Time) {
 	if e == nil {
 		return
 	}
 	if s.recentlyEvicted == nil {
 		s.recentlyEvicted = make(map[uint64]evictedShadow, 64)
 	}
-	now := time.Now()
-	// Opportunistic TTL sweep (cheap, bounded by map size).
-	if len(s.recentlyEvicted) > 1024 {
-		for k, v := range s.recentlyEvicted {
-			if v.ExpiresAt.Before(now) {
-				delete(s.recentlyEvicted, k)
-			}
+	s.sweepShadowChunkLocked(now)
+	s.parkEvictedShadowLocked(e, now)
+}
+
+// parkEvictedShadowLocked records the current generation without a whole-map
+// expiry scan. Bounded pressure eviction performs cleanup in separate chunks.
+func (s *Store) parkEvictedShadowLocked(e *Entry, now time.Time) {
+	if e == nil {
+		return
+	}
+	if s.recentlyEvicted == nil {
+		s.recentlyEvicted = make(map[uint64]evictedShadow, 64)
+	}
+	if s.shadowSweepAfter.IsZero() {
+		s.shadowSweepAfter = now.Add(ShadowTTL)
+	}
+	// A map iterator may yield keys inserted while it was suspended. Account
+	// for that work so a new key cannot consume an original key's visit budget.
+	// Refreshing an existing inode does not extend the cursor.
+	if s.shadowSweep != nil {
+		if _, present := s.recentlyEvicted[e.Inode]; !present {
+			s.shadowSweep.remaining++
 		}
 	}
 	s.recentlyEvicted[e.Inode] = evictedShadow{
@@ -471,6 +592,33 @@ func (s *Store) LookupRecentlyEvicted(inode uint64) (evictedShadow, bool) {
 	return rec, true
 }
 
+// LookupDeletedAlias resolves the subtle handle-generation case where an old
+// inode-cache key was redirected to a replacement entry, that replacement was
+// later unlinked, and the same pathname has since been recreated. The alias
+// key still points at the unlinked entry object by design (it preserves NFS
+// handles across metadata reconciliation), while pathCache now points at a
+// different live generation. If the replacement entry's own inode has an
+// authoritative deleted shadow, callers must treat the alias as a handle-only
+// tombstone instead of routing it to the recreated pathname.
+//
+// This check is O(1) and stays under the store lock so pointer identity between
+// inodeCache and pathCache is observed atomically. It deliberately returns
+// false for the current live entry, including legitimate inode reuse.
+func (s *Store) LookupDeletedAlias(inode uint64) (evictedShadow, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	aliased := s.inodeCache[inode]
+	if aliased == nil || s.pathCache[aliased.Path] == aliased {
+		return evictedShadow{}, false
+	}
+	rec, ok := s.recentlyEvicted[aliased.Inode]
+	if !ok || !rec.Deleted || rec.ExpiresAt.Before(time.Now()) {
+		return evictedShadow{}, false
+	}
+	return rec, true
+}
+
 // EvictedShadow is the public type alias for the shadow record. Renamed
 // from evictedShadow without changing fields so external callers (NFS
 // handler) can name the type by exported identifier.
@@ -491,6 +639,8 @@ func (s *Store) RecoverShadow(rec evictedShadow, inode uint64) *Entry {
 		Inode:      inode,
 		Mode:       rec.Mode,
 	}
+	e.prepareGetAttrCache()
+	s.cachePublicationMu.Lock()
 	s.mu.Lock()
 	old := s.pathCache[e.Path]
 	if old != nil {
@@ -500,12 +650,16 @@ func (s *Store) RecoverShadow(rec evictedShadow, inode uint64) *Entry {
 	s.evictInodeOrphanLocked(e)
 	s.subtreeUpsertLocked(old, e) // INSTANT-NAV #2
 	s.inodeCache[e.Inode] = e
+	s.markCachePublicationLocked(e)
 	s.pathCache[e.Path] = e
 	s.addToChildrenIdx(e)
 	// Clear the shadow now that the entry is live again.
 	delete(s.recentlyEvicted, inode)
+	s.cacheGeneration++
+	result := e.snapshot()
 	s.mu.Unlock()
-	return e
+	s.cachePublicationMu.Unlock()
+	return result
 }
 
 // SetPinChecker installs the pin-store backed pin checker. Nil-safe: callers
@@ -529,7 +683,147 @@ func (s *Store) SetPinChecker(pc PinChecker) {
 // alongside SetOnBatchDrainComplete. Idempotent; read-only afterwards, so no
 // lock is needed (matches the one-shot SetOnBatchDrainComplete wiring).
 func (s *Store) SetSpoolStore(ss *SpoolStore) {
+	if ss != nil {
+		if ss.db != s.db || (!ss.owner.CompareAndSwap(nil, s) && ss.owner.Load() != s) {
+			panic("metadata: spool store must belong to exactly one mirror store and database")
+		}
+	}
 	s.spoolStore = ss
+}
+
+// SetOnSubtreeRenamed registers the hook RenameSubtree fires when a directory
+// rename re-parents a subtree.
+//
+// WHY (serving-path data integrity, 2026-07-28): the NFS layer pools open FUSE
+// fds keyed by PATH ALONE. A directory rename moves every descendant in one
+// syscall, so every descendant's pooled fd instantly refers to the previous
+// inode behind that name — a later read of `dir/clip.mov` can be served the
+// pre-rename file's bytes, and a later in-place write can land inside it.
+// metadata/ must not import nfs/ (and holds no reference to the FDPool), so
+// the invalidation is injected as a function hook set once at startup, the
+// same idiom as SetClassSignals (keyspace.go) and lstatFnPtr (redis.go).
+//
+// The hook is handed the two DIRECTORY paths, not the descendant list, on
+// purpose: the consumer invalidates off the POOL's own key set, which stays
+// correct for descendants the mirror has evicted or never knew about.
+//
+// Nil-safe; may be called with nil to detach. Concurrency: guarded by s.mu
+// because the bridge wires it on the start path while reconcile goroutines may
+// already be running.
+func (s *Store) SetOnSubtreeRenamed(fn func(oldDir, newDir string)) {
+	s.mu.Lock()
+	s.onSubtreeRenamed = fn
+	s.mu.Unlock()
+}
+
+// fireSubtreeRenamed invokes the registered hook (if any) OUTSIDE s.mu — the
+// consumer takes its own locks (the FDPool mutex) and must never be called
+// with the store's write lock held.
+func (s *Store) fireSubtreeRenamed(oldDir, newDir string) {
+	s.mu.RLock()
+	fn := s.onSubtreeRenamed
+	s.mu.RUnlock()
+	if fn != nil {
+		fn(oldDir, newDir)
+	}
+}
+
+// SetOnPathInvalidated registers the hook the REMOTE-event apply path fires when
+// a peer's delete or rename changes what lives at a path.
+//
+// WHY (serving-path data integrity, 2026-07-28): the local RPC paths
+// (juiceFS.Rename / juiceFS.Remove) drop their pooled FUSE fds directly, but the
+// remote-apply path only ever touched the MIRROR — so in this explicitly
+// multi-writer product (the farm, ClipLogger, a second Mac) the sequence
+//
+//	read X.mov here (fd pooled) → a PEER deletes X.mov → the mirror entry drops
+//	→ someone recreates X.mov and it re-mirrors → OpenFile takes the `e != nil`
+//	branch → fdPool.Get hands back the fd to the DELETED inode
+//
+// is C1/C3 with a remote actor: wrong bytes served, no error at any layer.
+// metadata/ must not import nfs/, so the invalidation is injected as a function
+// hook, exactly like SetOnSubtreeRenamed above.
+//
+// isDir selects the consumer's scope (a directory needs its whole pooled subtree
+// dropped, a file only its own two slots). Nil-safe; may be called with nil to
+// detach. Guarded by s.mu — the bridge wires it on the start path while the
+// subscribe goroutine may already be running.
+func (s *Store) SetOnPathInvalidated(fn func(path string, isDir bool)) {
+	s.mu.Lock()
+	s.onPathInvalidated = fn
+	s.mu.Unlock()
+}
+
+// NotifyPathInvalidated announces that something OUTSIDE this process changed
+// what lives at `path`, and invokes the registered hook (if any) OUTSIDE s.mu —
+// the consumer takes its own locks (the FDPool mutex), so it must never be
+// called with the store's write lock held. Same discipline as
+// fireSubtreeRenamed; exported for the same reason RenameSubtree is, so the
+// announcement has a public trigger the consumer side can be tested against.
+// Nil-safe on an unwired hook; ignores an empty path.
+func (s *Store) NotifyPathInvalidated(p string, isDir bool) {
+	if p == "" {
+		return
+	}
+	s.mu.RLock()
+	fn := s.onPathInvalidated
+	s.mu.RUnlock()
+	if fn != nil {
+		fn(p, isDir)
+	}
+}
+
+// SetOnContentInvalidated registers the byte-cache invalidation hook. Unlike
+// SetOnPathInvalidated, this is intentionally fired for create/update too: a
+// same-inode overwrite changes JuiceFS slice IDs without making a pooled FUSE
+// descriptor stale.
+func (s *Store) SetOnContentInvalidated(fn func(path string, isDir bool)) {
+	s.mu.Lock()
+	s.onContentInvalidated = fn
+	s.mu.Unlock()
+}
+
+// SetOnScanContentInvalidated registers the non-reentrant byte-cache hook for
+// conditionally admitted SCAN and scoped-prune mutations. The old inode is
+// captured before the mirror row changes, so the consumer needs no Store lookup.
+func (s *Store) SetOnScanContentInvalidated(fn func(path string, oldInode uint64)) {
+	s.mu.Lock()
+	s.onScanContentInvalidated = fn
+	s.mu.Unlock()
+}
+
+// NotifyContentInvalidated invokes the byte-cache hook outside s.mu. Callers
+// must fire it before replacing/removing the mirror row so the consumer can
+// resolve the previous inode and invalidate its cached chunk mappings.
+func (s *Store) NotifyContentInvalidated(p string, isDir bool) {
+	if p == "" {
+		return
+	}
+	s.mu.RLock()
+	fn := s.onContentInvalidated
+	s.mu.RUnlock()
+	if fn != nil {
+		fn(p, isDir)
+	}
+}
+
+// SetOnContentReset registers the coarse byte-cache reset hook used when a
+// reconciliation can cover changes whose individual pub/sub events were lost.
+func (s *Store) SetOnContentReset(fn func()) {
+	s.mu.Lock()
+	s.onContentReset = fn
+	s.mu.Unlock()
+}
+
+// NotifyContentReset drops all derived byte mappings through the registered
+// consumer hook. It is nil-safe and, like the targeted hook, runs outside s.mu.
+func (s *Store) NotifyContentReset() {
+	s.mu.RLock()
+	fn := s.onContentReset
+	s.mu.RUnlock()
+	if fn != nil {
+		fn()
+	}
 }
 
 // pinnedSetLocked returns the current pinned-path set under s.mu (caller
@@ -575,6 +869,20 @@ func Open(dbPath string) (*Store, error) {
 // configurable maximum cache size. When the in-memory caches exceed this
 // limit, the oldest entries (by mtime) are evicted.
 func OpenWithMaxCacheSize(dbPath string, maxCacheSize int) (*Store, error) {
+	fileLock, canonicalPath, err := acquireStoreFileLock(dbPath)
+	if err != nil {
+		return nil, err
+	}
+	keepFileLock := false
+	defer func() {
+		if !keepFileLock && fileLock != nil {
+			_ = fileLock.Close()
+		}
+	}()
+	if canonicalPath != "" {
+		dbPath = canonicalPath
+	}
+
 	// For in-memory databases with multiple connections, use shared cache
 	// so all connections see the same database.
 	dsn := dbPath
@@ -654,6 +962,43 @@ func OpenWithMaxCacheSize(dbPath string, maxCacheSize int) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("create meta schema: %w", err)
 	}
+	if _, err := db.Exec(onlineMutationSchema); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("create online mutation schema: %w", err)
+	}
+	if _, err := db.Exec(preparedCreateSchema); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("create prepared create schema: %w", err)
+	}
+	if pending, err := inspectPreparedCreates(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("inspect prepared creates at open: %w", err)
+	} else if len(pending) != 0 {
+		db.Close()
+		return nil, &PendingPreparedCreate{Creates: pending}
+	}
+	if pending, err := inspectOnlineMutations(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("inspect online mutations at open: %w", err)
+	} else if len(pending) != 0 {
+		db.Close()
+		return nil, &PendingOnlineMutation{Mutations: pending}
+	}
+	if err := initIncarnationSchema(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("initialize mirror incarnations: %w", err)
+	}
+
+	// Capture this before CREATE IF NOT EXISTS. A database upgraded from a
+	// pre-FTS build may already contain entries but no index; the epoch alone
+	// cannot be trusted if the virtual table itself had to be created now.
+	var ftsTableExisted int
+	if err := db.QueryRow(`SELECT EXISTS(
+		SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'entries_fts'
+	)`).Scan(&ftsTableExisted); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("detect existing FTS schema: %w", err)
+	}
 
 	if _, err := db.Exec(ftsSchema); err != nil {
 		db.Close()
@@ -689,10 +1034,10 @@ func OpenWithMaxCacheSize(dbPath string, maxCacheSize int) (*Store, error) {
 	// The full SCAN can never return these paths (see scanFilteredPath), so
 	// they were permanently absent from every SCAN diff and cycled in the
 	// pruneAbsent ladder forever (~112k pending_prune floor). Runs HERE —
-	// after the schema, BEFORE rebuildCaches and RebuildFTS — so neither the
-	// in-memory caches nor the FTS index ever see the removed rows (RebuildFTS
-	// below re-derives FTS from `entries`, which is why bare DELETEs without
-	// per-row FTS 'delete' ops are safe at this site and only this site).
+	// after the schema and before rebuildCaches. gcInternalNamespaces deletes
+	// the FTS epoch in the SAME transaction as any bare entries delete, so Open
+	// must rebuild the index before it can declare it current again. That makes
+	// interruption between cleanup and rebuild crash-safe.
 	// `._` rows are deliberately NOT touched. Kill switch: JM_MIRROR_NS_GC=0
 	// (see docs/TUNING/REVERT_LOG.md).
 	if os.Getenv("JM_MIRROR_NS_GC") != "0" {
@@ -709,12 +1054,23 @@ func OpenWithMaxCacheSize(dbPath string, maxCacheSize int) (*Store, error) {
 	if maxCacheSize <= 0 {
 		maxCacheSize = DefaultMaxCacheSize
 	}
+	var ownerBytes [16]byte
+	if _, err := rand.Read(ownerBytes[:]); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("create metadata store owner ID: %w", err)
+	}
 
 	s := &Store{
-		db:               db,
-		inodeCache:       make(map[uint64]*Entry),
-		pathCache:        make(map[string]*Entry),
-		childrenIdx:      make(map[string]map[string]*Entry),
+		db:                 db,
+		fileLock:           fileLock,
+		pruneLadderOwnerID: hex.EncodeToString(ownerBytes[:]),
+		inodeCache:         make(map[uint64]*Entry),
+		pathCache:          make(map[string]*Entry),
+		preparedCreates:    make(map[string]PreparedCreate),
+		childrenIdx:        make(map[string]map[string]*Entry),
+		dirVisibilityMtime: map[string]time.Time{
+			".": time.Now(),
+		},
 		maxCacheSize:     maxCacheSize,
 		syntheticHandles: make(map[uint64]string),
 		serve:            &serveStmts{},
@@ -729,6 +1085,12 @@ func OpenWithMaxCacheSize(dbPath string, maxCacheSize int) (*Store, error) {
 		s.subtreeBytes = make(map[string]int64)
 		s.subtreeFiles = make(map[string]int64)
 	}
+	if s.fileLock != nil {
+		if err := s.recoverOwnedPruneLadderCandidates(); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("recover owned prune ladder candidates: %w", err)
+		}
+	}
 
 	// Item 2: log the serve substrate ONCE per boot (RAM shadow vs SQLite-WAL)
 	// so a live A/B run (JM_SERVE_FROM_SQLITE=0 vs =1 on the same binary) is
@@ -740,20 +1102,56 @@ func OpenWithMaxCacheSize(dbPath string, maxCacheSize int) (*Store, error) {
 		return nil, fmt.Errorf("rebuild caches: %w", err)
 	}
 
-	// Rebuild FTS index on startup to ensure consistency with the entries table.
-	// This is fast (<1s for 131K entries) and only runs once.
+	// Do not unconditionally rebuild FTS on every app launch. Every ordinary
+	// Insert/Delete/BulkInsert changes `entries` and its external-content FTS
+	// state in the SAME SQLite transaction, so a clean steady-state database is
+	// already crash-atomic. Rebuilding 383K live rows was measured at 10.4s and
+	// sat directly between a ready FUSE mount and Finder's NFS mount.
 	//
-	// This full rebuild re-derives entries_fts from `entries` and is exactly the
-	// FTS-deferral crash-safety backstop: it makes the index consistent with
-	// EVERY entries row regardless of what was pending when the process last
-	// exited. So after a crash under the flag the index is already correct at
-	// boot; the fts_pending markers that survived are then indexed again
-	// (idempotent INSERT OR REPLACE into an external-content FTS) by the
-	// compactor and cleared. The rebuild also does NOT touch fts_pending, so a
-	// pending marker for a row that still exists survives into the compactor.
-	if err := s.RebuildFTS(); err != nil {
+	// A durable fts_pending row is the exceptional state that DOES require the
+	// crash-recovery backstop; preserve the previous full-rebuild behavior for
+	// that case. JM_FTS_REBUILD_ON_BOOT=1 remains an explicit repair lever. A
+	// genuinely empty/new database stays uninitialized so its first large sync
+	// still gets the efficient one-shot bulk build instead of hundreds of
+	// thousands of per-row FTS inserts.
+	var entryCount, pendingFTS int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM entries`).Scan(&entryCount); err != nil {
 		db.Close()
-		return nil, fmt.Errorf("rebuild FTS: %w", err)
+		return nil, fmt.Errorf("count entries for FTS init: %w", err)
+	}
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM fts_pending`).Scan(&pendingFTS); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("count pending FTS at open: %w", err)
+	}
+	var persistedFTSEpoch string
+	ftsEpochErr := s.db.QueryRow(`SELECT value FROM store_meta WHERE key = ?`, ftsIndexEpochKey).Scan(&persistedFTSEpoch)
+	if ftsEpochErr != nil && ftsEpochErr != sql.ErrNoRows {
+		db.Close()
+		return nil, fmt.Errorf("read FTS index epoch: %w", ftsEpochErr)
+	}
+	forcedFTSRebuild := os.Getenv("JM_FTS_REBUILD_ON_BOOT") == "1"
+	// A present non-current value is an explicit dirty marker and must rebuild
+	// even when cleanup removed the final entry (stale FTS tokens can otherwise
+	// survive in an externally-backed index). A wholly new empty DB has neither
+	// rows nor a marker and correctly defers its first build.
+	ftsEpochPresent := ftsEpochErr == nil
+	migrationFTSRebuild := (entryCount > 0 && (ftsTableExisted == 0 || !ftsEpochPresent)) ||
+		(ftsEpochPresent && persistedFTSEpoch != ftsIndexEpoch)
+	if pendingFTS > 0 || forcedFTSRebuild || migrationFTSRebuild {
+		if err := s.RebuildFTS(); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("rebuild FTS: %w", err)
+		}
+		log.Printf("metadata: FTS boot rebuild complete (entries=%d pending_before=%d migration=%t forced=%t)",
+			entryCount, pendingFTS, migrationFTSRebuild, forcedFTSRebuild)
+	}
+	if entryCount > 0 {
+		// Existing FTS is transactionally current, or the recovery rebuild above
+		// just made it so. Large post-open reconciles must remain incremental.
+		s.ftsInitialized.Store(true)
+		if pendingFTS == 0 && !migrationFTSRebuild && !forcedFTSRebuild {
+			log.Printf("metadata: FTS boot rebuild skipped (transactionally current, entries=%d)", entryCount)
+		}
 	}
 
 	// Start the background FTS compactor only when the deferral flag is on. It
@@ -765,7 +1163,13 @@ func OpenWithMaxCacheSize(dbPath string, maxCacheSize int) (*Store, error) {
 		s.ftsWake = make(chan struct{}, 1)
 		go s.ftsCompactorLoop()
 	}
+	s.pruneLadderGCStop = make(chan struct{})
+	s.pruneLadderGCDone = make(chan struct{})
+	s.pruneLadderGCWake = make(chan struct{}, 1)
+	go s.pruneLadderGCWorker()
+	s.wakePruneLadderGC()
 
+	keepFileLock = true
 	return s, nil
 }
 
@@ -800,12 +1204,34 @@ func gcInternalNamespaces(db *sql.DB) (int64, error) {
 		LIMIT 5000)`
 	var total int64
 	for {
-		res, err := db.Exec(batch)
+		tx, err := db.Begin()
 		if err != nil {
+			return total, err
+		}
+		res, err := tx.Exec(batch)
+		if err != nil {
+			tx.Rollback()
 			return total, err
 		}
 		n, err := res.RowsAffected()
 		if err != nil {
+			tx.Rollback()
+			return total, err
+		}
+		if n > 0 {
+			// The deletes above deliberately bypass per-row external-content
+			// FTS maintenance. Invalidate the epoch atomically with the rows so
+			// a crash before Open's rebuild cannot make a stale index look clean.
+			if _, err := tx.Exec(
+				`INSERT INTO store_meta (key, value) VALUES (?, ?)
+				 ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+				ftsIndexEpochKey, ftsIndexDirty,
+			); err != nil {
+				tx.Rollback()
+				return total, err
+			}
+		}
+		if err := tx.Commit(); err != nil {
 			return total, err
 		}
 		total += n
@@ -817,6 +1243,10 @@ func gcInternalNamespaces(db *sql.DB) (int64, error) {
 
 // Close closes the database connection.
 func (s *Store) Close() error {
+	if s.pruneLadderGCStop != nil {
+		s.pruneLadderGCStopOnce.Do(func() { close(s.pruneLadderGCStop) })
+		<-s.pruneLadderGCDone
+	}
 	// Stop the FTS compactor (if running) and wait for it to exit BEFORE
 	// closing the DB, so it can never touch a closed *sql.DB. Idempotent via
 	// ftsStopOnce so a double Close (or Close after a flag-off Open) is safe.
@@ -824,7 +1254,19 @@ func (s *Store) Close() error {
 		s.ftsStopOnce.Do(func() { close(s.ftsStop) })
 		<-s.ftsCompactorDone
 	}
-	return s.db.Close()
+	s.mu.Lock()
+	if s.shadowSweep != nil {
+		s.shadowSweep.stop()
+		s.shadowSweep = nil
+	}
+	s.mu.Unlock()
+	if err := s.db.Close(); err != nil {
+		return err
+	}
+	if s.fileLock != nil {
+		return s.fileLock.Close()
+	}
+	return nil
 }
 
 // DB returns the underlying *sql.DB. Exposed so peer subsystems can
@@ -837,7 +1279,42 @@ func (s *Store) DB() *sql.DB { return s.db }
 
 // Insert adds or replaces an entry in the store.
 func (s *Store) Insert(e *Entry) error {
+	if !e.Version.IsZero() {
+		_, err := s.PublishExpected(e.Version, e)
+		return err
+	}
+	// Streamed partials must never enter the mirror — see InsertToCache.
+	if StreamPartialName(e.Name) {
+		return nil
+	}
+	// Serialize the durable write and the cache publication as one ordered
+	// operation. NFS create paths intentionally publish the same *Entry to the
+	// RAM cache first, then persist it asynchronously; a concurrent WRITE close
+	// can therefore call UpdateSize while this goroutine is still starting.
+	//
+	// Snapshot only the durable fields while holding s.mu. The NFS GETATTR fast
+	// path owns an independent atomic cache and does not participate in SQLite
+	// persistence.
+	// Holding writeMu before the snapshot gives Insert and UpdateSize a single
+	// total order, so an old CREATE snapshot can never replace a later size bump
+	// in SQLite or pathCache.
 	s.writeMu.Lock()
+	s.mu.RLock()
+	persisted := &Entry{
+		Path:           e.Path,
+		Name:           e.Name,
+		ParentPath:     e.ParentPath,
+		IsDir:          e.IsDir,
+		Size:           e.Size,
+		Mtime:          e.Mtime,
+		MtimeNsecKnown: e.MtimeNsecKnown,
+		Inode:          e.Inode,
+		Mode:           e.Mode,
+		LocalOnly:      e.LocalOnly,
+	}
+	persisted.prepareGetAttrCache()
+	s.mu.RUnlock()
+	e = persisted
 	// entries + external-content FTS updated atomically so search stays in sync
 	// without a periodic full rebuild (QA-40). The inode int64 cast for
 	// modernc.org/sqlite (rejects uint64 with the high bit set) is inside
@@ -852,15 +1329,15 @@ func (s *Store) Insert(e *Entry) error {
 		s.writeMu.Unlock()
 		return fmt.Errorf("insert %q: %w", e.Path, err)
 	}
+	if err := loadEntryVersion(tx, e); err != nil {
+		tx.Rollback()
+		s.writeMu.Unlock()
+		return err
+	}
 	if err := tx.Commit(); err != nil {
 		s.writeMu.Unlock()
 		return fmt.Errorf("insert commit %q: %w", e.Path, err)
 	}
-	s.writeMu.Unlock()
-	// Nudge the compactor so a just-created file becomes searchable promptly
-	// (within a compact batch) rather than only on the next ticker. No-op when
-	// the flag is off (ftsWake is nil). Non-blocking / coalesced.
-	s.wakeFTSCompactor()
 
 	s.mu.Lock()
 	// Remove old entry from children index if path existed with different parent
@@ -880,20 +1357,26 @@ func (s *Store) Insert(e *Entry) error {
 	s.evictInodeOrphanLocked(e)
 	s.subtreeUpsertLocked(old, e) // INSTANT-NAV #2: (new−old) size/count delta
 	s.inodeCache[e.Inode] = e
+	s.markCachePublicationLocked(e)
 	s.pathCache[e.Path] = e
 	s.addToChildrenIdx(e)
 	s.mu.Unlock()
+	s.writeMu.Unlock()
+
+	// Nudge the compactor so a just-created file becomes searchable promptly
+	// (within a compact batch) rather than only on the next ticker. No-op when
+	// the flag is off (ftsWake is nil). Non-blocking / coalesced.
+	s.wakeFTSCompactor()
 
 	return nil
 }
 
 // Delete removes an entry by path.
 func (s *Store) Delete(entryPath string) error {
+	s.writeMu.Lock()
 	s.mu.RLock()
 	e := s.pathCache[entryPath]
 	s.mu.RUnlock()
-
-	s.writeMu.Lock()
 	tx, err := s.db.Begin()
 	if err != nil {
 		s.writeMu.Unlock()
@@ -934,8 +1417,6 @@ func (s *Store) Delete(entryPath string) error {
 		s.writeMu.Unlock()
 		return fmt.Errorf("delete commit %q: %w", entryPath, err)
 	}
-	s.writeMu.Unlock()
-
 	s.mu.Lock()
 	if e != nil {
 		// QA-25 (2026-05-20): only drop the inode mapping if it still points
@@ -951,6 +1432,7 @@ func (s *Store) Delete(entryPath string) error {
 		// later proves the file actually exists. Cheap; bounded TTL.
 		s.shadowEvictedLocked(e)
 	}
+	delete(s.dirVisibilityMtime, entryPath)
 	// INSTANT-NAV #2: subtract whatever entry is ACTUALLY leaving pathCache
 	// NOW — re-fetched under this lock, not the pre-fetched e, which can be
 	// stale if a concurrent Insert replaced the path since the RLock above.
@@ -960,6 +1442,7 @@ func (s *Store) Delete(entryPath string) error {
 	}
 	delete(s.pathCache, entryPath)
 	s.mu.Unlock()
+	s.writeMu.Unlock()
 
 	return nil
 }
@@ -968,7 +1451,29 @@ func (s *Store) Delete(entryPath string) error {
 // This makes the entry immediately visible to NFS LOOKUP/GETATTR while the
 // SQLite write may be blocked by a concurrent BulkInsert transaction.
 func (s *Store) InsertToCache(e *Entry) {
+	// A versioned snapshot must publish through its CAS API. Cache-only
+	// publication would expose changed fields without changing its token.
+	if !e.Version.IsZero() {
+		return
+	}
+	// Streamed partials must never enter the mirror. See StreamPartialName: an
+	// in-flight streamed destination is a REAL, root-resolvable JuiceFS file, so
+	// the SCAN returns it and keyspace push reports it — but it is a half-written
+	// file whose name is the only thing marking it as not-yet-content. Mirrored,
+	// it would list in Finder as real and publish its partial size as
+	// authoritative. This is the single choke point that covers SCAN, push and
+	// reconcile at once; readdir is mirror-served, so what never enters here can
+	// never be served.
+	if StreamPartialName(e.Name) {
+		return
+	}
+	s.cachePublicationMu.Lock()
+	defer s.cachePublicationMu.Unlock()
 	s.mu.Lock()
+	if s.preparedCreateConflictLocked(e.Path) {
+		s.mu.Unlock()
+		return
+	}
 	old := s.pathCache[e.Path]
 	if old != nil {
 		s.removeFromChildrenIdx(old)
@@ -979,13 +1484,29 @@ func (s *Store) InsertToCache(e *Entry) {
 	s.evictInodeOrphanLocked(e)
 	s.subtreeUpsertLocked(old, e) // INSTANT-NAV #2
 	s.inodeCache[e.Inode] = e
+	s.markCachePublicationLocked(e)
 	s.pathCache[e.Path] = e
 	s.addToChildrenIdx(e)
+	s.cacheGeneration++
 	s.mu.Unlock()
 }
 
 // DeleteFromCache removes an entry from the in-memory cache without touching SQLite.
 func (s *Store) DeleteFromCache(entryPath string) {
+	s.deleteFromCache(entryPath, false)
+}
+
+// DeleteFromCacheForUnlink removes an entry from the live namespace and marks
+// its bounded shadow as authoritatively unlinked. The distinction matters for
+// an NFS handle retained across REMOVE: ordinary eviction may be recovered if
+// the path still exists, while an unlink must never relist the old generation.
+func (s *Store) DeleteFromCacheForUnlink(entryPath string) {
+	s.deleteFromCache(entryPath, true)
+}
+
+func (s *Store) deleteFromCache(entryPath string, unlinked bool) {
+	s.cachePublicationMu.Lock()
+	defer s.cachePublicationMu.Unlock()
 	s.mu.Lock()
 	if e, ok := s.pathCache[entryPath]; ok {
 		// QA-25: see Delete.
@@ -995,9 +1516,16 @@ func (s *Store) DeleteFromCache(entryPath string) {
 		s.removeFromChildrenIdx(e)
 		// QA-30 Layer B: shadow for possible recovery (see Delete).
 		s.shadowEvictedLocked(e)
+		if unlinked {
+			rec := s.recentlyEvicted[e.Inode]
+			rec.Deleted = true
+			s.recentlyEvicted[e.Inode] = rec
+		}
 		s.subtreeRemoveLocked(e) // INSTANT-NAV #2
 		delete(s.pathCache, entryPath)
 	}
+	delete(s.dirVisibilityMtime, entryPath)
+	s.cacheGeneration++
 	s.mu.Unlock()
 }
 
@@ -1022,6 +1550,7 @@ func (s *Store) evictInodeOrphanLocked(new *Entry) {
 		s.subtreeRemoveLocked(cur)
 	}
 	delete(s.pathCache, prev.Path)
+	delete(s.dirVisibilityMtime, prev.Path)
 }
 
 // evictPathOrphanLocked is the symmetric counterpart to
@@ -1047,8 +1576,8 @@ func (s *Store) evictInodeOrphanLocked(new *Entry) {
 // with `new` in the next line). Cost: inodeCache may carry alias
 // entries for displaced inodes; bounded by the rate of inode-change
 // events on shared paths and far below the 500k cache limit in
-// realistic use. evictOldest rebuilds from pathCache so aliases
-// eventually drop after enough churn — at which point any kernel
+// realistic use. Pressure eviction retires observed, unchanged aliases in bounded chunks,
+// so aliases eventually drop after enough churn — at which point any kernel
 // handles still pointing at them will get a fresh ESTALE and the
 // client will re-LOOKUP, which is the correct NFSv3 protocol behavior.
 //
@@ -1071,21 +1600,23 @@ func (s *Store) evictPathOrphanLocked(old, new *Entry) {
 // SUBSTRATE SWITCH (serving-layer-decision.md §Item 2): when
 // JM_SERVE_FROM_SQLITE=1 this queries SQLite-WAL directly via a prepared point
 // lookup on idx_inode (no s.mu, WAL reader snapshots around a contending
-// writer); otherwise it reads the in-RAM inodeCache exactly as before. The
-// switch lives HERE so both paths are compiled in and no handler.go call site
-// changes — the flag picks per call. Default OFF = RAM path, byte-identical to
-// prior behavior.
+// writer). Otherwise it reads the in-RAM inodeCache first. After bounded-cache
+// eviction, a RAM miss falls back to SQLite because the durable mirror is still
+// complete; JM_DURABLE_SERVE_FALLBACK=0 restores strict RAM-only misses.
 func (s *Store) LookupByInode(inode uint64) *Entry {
 	if serveFromSQLite() {
 		return s.lookupByInodeSQLite(inode)
 	}
-	return s.lookupByInodeRAM(inode)
+	if e := s.lookupByInodeRAM(inode); e != nil || !s.cacheEvicted.Load() || !durableServeFallbackEnabled() {
+		return e
+	}
+	return s.lookupByInodeSQLite(inode)
 }
 
 func (s *Store) lookupByInodeRAM(inode uint64) *Entry {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.inodeCache[inode]
+	return s.inodeCache[inode].snapshot()
 }
 
 // LookupByPath returns the entry at the given path, or nil.
@@ -1096,13 +1627,85 @@ func (s *Store) LookupByPath(entryPath string) *Entry {
 	if serveFromSQLite() {
 		return s.lookupByPathSQLite(entryPath)
 	}
-	return s.lookupByPathRAM(entryPath)
+	if e := s.lookupByPathRAM(entryPath); e != nil || !s.cacheEvicted.Load() || !durableServeFallbackEnabled() {
+		return e
+	}
+	return s.lookupByPathSQLite(entryPath)
 }
 
 func (s *Store) lookupByPathRAM(entryPath string) *Entry {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.pathCache[entryPath]
+	return s.pathCache[entryPath].snapshot()
+}
+
+// CachedFileIdentity is a process-local observation of a resident durable file.
+// It is not a backend revision or a token that can survive process restart.
+type CachedFileIdentity struct {
+	Path        string
+	Inode       uint64
+	Size        int64
+	MtimeNS     int64
+	Version     MirrorToken
+	Publication uint64
+}
+
+// LookupCachedFileIdentity performs no SQL or filesystem I/O. Evicted,
+// unversioned and locally provisional rows cannot authorize a content cache.
+func (s *Store) LookupCachedFileIdentity(name string) (CachedFileIdentity, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	e := s.pathCache[name]
+	if e == nil || e.IsDir || e.LocalOnly || !e.MtimeNsecKnown || e.cacheIdentity == 0 || e.Version.Incarnation == "" || e.Version.Revision <= 0 {
+		return CachedFileIdentity{}, false
+	}
+	return CachedFileIdentity{e.Path, e.Inode, e.Size, e.Mtime.UnixNano(), e.Version, e.cacheIdentity}, true
+}
+
+// NoteDirectoryChanged advances the local visibility generation for dirPath.
+// It is intentionally memory-only: the canonical JuiceFS mtime remains the
+// authority persisted in SQLite, while this overlay exists solely to make the
+// loopback NFS client's directory/name caches notice a push-delivered child-set
+// change. Nanosecond monotonicity handles multiple mutations in one filesystem
+// mtime second without drifting the durable metadata or generating WAL traffic.
+func (s *Store) NoteDirectoryChanged(dirPath string) {
+	if dirPath == "" || dirPath == "/" {
+		dirPath = "."
+	}
+	now := time.Now()
+
+	s.cachePublicationMu.Lock()
+	defer s.cachePublicationMu.Unlock()
+	s.mu.Lock()
+	if e := s.pathCache[dirPath]; e != nil && e.Mtime.After(now) {
+		now = e.Mtime
+	}
+	if previous := s.dirVisibilityMtime[dirPath]; !now.After(previous) {
+		now = previous.Add(time.Nanosecond)
+	}
+	s.dirVisibilityMtime[dirPath] = now
+	// A directory GETATTR body serialized before this event contains the old
+	// mtime. Detach it so the next request serializes the visibility overlay.
+	if e := s.pathCache[dirPath]; e != nil {
+		e.ResetGetAttrCache()
+	}
+	s.mu.Unlock()
+}
+
+// DirectoryVisibilityMtime returns the mtime the NFS adapter should expose for
+// a directory: canonical metadata unless a newer push-driven visibility
+// generation exists. It performs no I/O and is safe on the per-RPC hot path.
+func (s *Store) DirectoryVisibilityMtime(dirPath string, canonical time.Time) time.Time {
+	if dirPath == "" || dirPath == "/" {
+		dirPath = "."
+	}
+	s.mu.RLock()
+	visible := s.dirVisibilityMtime[dirPath]
+	s.mu.RUnlock()
+	if visible.After(canonical) {
+		return visible
+	}
+	return canonical
 }
 
 // ListChildren returns all entries whose parent_path matches the given path.
@@ -1132,7 +1735,7 @@ func (s *Store) listChildrenRAM(parentPath string) ([]*Entry, error) {
 	}
 	entries := make([]*Entry, 0, len(children))
 	for _, e := range children {
-		entries = append(entries, e)
+		entries = append(entries, e.snapshot())
 	}
 	return entries, nil
 }
@@ -1183,43 +1786,8 @@ func (s *Store) BulkInsert(entries []*Entry, batchSize int) error {
 	// QA-30 Layer B HIGH-2: pre-fetch the pinned set BEFORE taking mu so
 	// the SQLite query on pin.db doesn't block NFS LookupByInode while
 	// the write lock is held.
-	s.stagePinnedForEviction()
-
-	// Rebuild caches after all batches insert.
-	//
-	// DRAIN-LATENCY tail fix: do NOT hold s.mu.Lock across the WHOLE delta.
-	// Under a sustained drain a single reconcile cycle can carry thousands of
-	// changed entries; a one-shot write-lock over all of them parks every
-	// concurrent serve RLock (LookupByPath / LookupByInode / ListChildren) for
-	// the full pass — the residual ~300ms p99 tail. Chunk the in-memory
-	// mutation so the lock is released between bounded batches, letting serve
-	// reads interleave. Each entry's cache effect is independent and
-	// idempotent, so the final cache state is identical to the one-shot loop;
-	// chunking only yields the lock more often. No stale read: a reader between
-	// chunks sees a prefix of the delta already applied and the rest still
-	// pending, never an inconsistent or rolled-back view.
-	for i := 0; i < len(entries); i += cacheMutationChunk {
-		end := i + cacheMutationChunk
-		if end > len(entries) {
-			end = len(entries)
-		}
-		s.mu.Lock()
-		for _, e := range entries[i:end] {
-			old := s.pathCache[e.Path]
-			if old != nil {
-				s.removeFromChildrenIdx(old)
-				// QA-27: see Insert.
-				s.evictPathOrphanLocked(old, e)
-			}
-			// QA-25: see Insert.
-			s.evictInodeOrphanLocked(e)
-			s.subtreeUpsertLocked(old, e) // INSTANT-NAV #2
-			s.inodeCache[e.Inode] = e
-			s.pathCache[e.Path] = e
-			s.addToChildrenIdx(e)
-		}
-		s.mu.Unlock()
-	}
+	// Each bounded SQL batch publishes its committed snapshots before releasing
+	// writeMu. A later writer cannot be overwritten by a delayed RAM rebuild.
 
 	// Eviction is a separate, final critical section. In production this is a
 	// no-op (pathCache ~200k <= maxCacheSize 500k, early return in evictOldest)
@@ -1229,9 +1797,7 @@ func (s *Store) BulkInsert(entries []*Entry, batchSize int) error {
 	// budget. When eviction DOES fire (small test cache), this single short
 	// lock does the trim against the fully-applied delta — same result as
 	// before.
-	s.mu.Lock()
-	s.evictOldest()
-	s.mu.Unlock()
+	s.evictWithPinnedSet()
 
 	// Startup/large load only: one bulk RebuildFTS. Steady-state reconcile
 	// deltas already maintained the external-content FTS incrementally in
@@ -1366,14 +1932,17 @@ func ftsExternalUpsert(tx *sql.Tx, e *Entry, deferFTS bool) error {
 		return fmt.Errorf("fts upsert read old %q: %w", e.Path, err)
 	}
 	res, err := tx.Exec(
-		`INSERT OR REPLACE INTO entries (path, name, parent_path, is_dir, size, mtime, inode, mode, local_only)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		incarnationUpsertSQL,
 		e.Path, e.Name, e.ParentPath,
 		boolToInt(e.IsDir), e.Size, e.Mtime.Unix(),
-		int64(e.Inode), uint32(e.Mode), boolToInt(e.LocalOnly),
+		int64(e.Inode), uint32(e.Mode), boolToInt(e.LocalOnly), e.mtimeNsecSQL(),
+		e.Path, int64(e.Inode), boolToInt(e.IsDir), e.Path,
 	)
 	if err != nil {
 		return fmt.Errorf("fts upsert %q: %w", e.Path, err)
+	}
+	if err := exactlyOneRow(res); err != nil {
+		return err
 	}
 	newRowid, err := res.LastInsertId()
 	if err != nil {
@@ -1410,59 +1979,243 @@ func ftsExternalUpsert(tx *sql.Tx, e *Entry, deferFTS bool) error {
 // reconcile deltas); incremental=false skips FTS here and the caller does a
 // single bulk RebuildFTS (startup/initial load).
 func (s *Store) bulkInsertBatch(batch []*Entry, incremental bool) error {
+	_, err := s.bulkInsertBatchWithEpoch(batch, incremental, nil, nil, false)
+	return err
+}
+
+// ScanUpsertBatch conditionally publishes one SCAN chunk. Its returned token
+// includes this batch's commit and is the precondition for the next chunk.
+func (s *Store) ScanUpsertBatch(batch []*Entry, expected StoreEpoch, invalidatePaths []string) (StoreEpoch, error) {
+	if len(batch) == 0 || len(batch) > 500 {
+		return StoreEpoch{}, ErrMirrorConflict
+	}
+	next, err := s.bulkInsertBatchWithEpoch(batch, true, &expected, invalidatePaths, false)
+	if err != nil {
+		return StoreEpoch{}, err
+	}
+	s.evictWithPinnedSet()
+	s.ftsInitialized.Store(true)
+	return next, nil
+}
+
+// ReconcileUpsertBatch gives the keyspace HGETALL path the SCAN admission
+// fence while preserving its original byte-cache callback for each admitted
+// row. The callback runs after the accepted-publication check and before the
+// mirror row changes; protected entries never invoke it.
+func (s *Store) ReconcileUpsertBatch(batch []*Entry, expected StoreEpoch) (StoreEpoch, error) {
+	if len(batch) == 0 || len(batch) > 500 {
+		return StoreEpoch{}, ErrMirrorConflict
+	}
+	next, err := s.bulkInsertBatchWithEpoch(batch, true, &expected, nil, true)
+	if err != nil {
+		return StoreEpoch{}, err
+	}
+	s.evictWithPinnedSet()
+	s.ftsInitialized.Store(true)
+	return next, nil
+}
+
+func (s *Store) bulkInsertBatchWithEpoch(batch []*Entry, incremental bool, expected *StoreEpoch, invalidatePaths []string, reconcile bool) (StoreEpoch, error) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+	s.cachePublicationMu.Lock()
+	defer s.cachePublicationMu.Unlock()
+
+	// The publication gate freezes cache-only successors while writeMu freezes
+	// durable writers. Snapshot every cache fact used by admission under a
+	// short read lock; no SQL or callback below runs with mu held.
+	type cachePreimage struct {
+		present bool
+		inode   uint64
+		version MirrorToken
+	}
+	snapshots := make([]*Entry, len(batch))
+	cached := make(map[string]cachePreimage, len(batch))
+	s.mu.RLock()
+	cacheGeneration := s.cacheGeneration
+	invalidate := s.onScanContentInvalidated
+	for i, input := range batch {
+		e := input.snapshot()
+		snapshots[i] = e
+		if old := s.pathCache[e.Path]; old != nil {
+			cached[e.Path] = cachePreimage{present: true, inode: old.Inode, version: old.Version}
+		}
+	}
+	s.mu.RUnlock()
 
 	tx, err := s.db.Begin()
 	if err != nil {
-		return fmt.Errorf("begin tx: %w", err)
+		return StoreEpoch{}, fmt.Errorf("begin tx: %w", err)
 	}
 
-	// Steady-state reconcile delta: maintain the external-content FTS per row
-	// so we never wipe+reindex the whole table under writeMu (QA-40). Under
-	// JM_FTS_DEFER the per-row trigram INSERT is deferred to fts_pending (the
-	// old-rowid delete stays synchronous) — this is the hot reconcile path under
-	// write storms, so deferring it here is the main CPU win.
-	if incremental {
-		for _, e := range batch {
-			if err := ftsExternalUpsert(tx, e, s.ftsDefer); err != nil {
-				tx.Rollback()
-				return err
+	defer tx.Rollback()
+	if expected != nil {
+		got, err := captureStoreEpoch(tx, cacheGeneration)
+		if err != nil {
+			return StoreEpoch{}, err
+		}
+		if got != *expected {
+			return StoreEpoch{}, ErrMirrorConflict
+		}
+	}
+	var protected replacementObservation
+	if expected != nil {
+		protected, err = s.scanProtectedObservation(tx)
+		if err != nil {
+			return StoreEpoch{}, err
+		}
+	}
+	// Incoming aliases must be refused before callbacks or cache publication.
+	for _, e := range snapshots {
+		if _, held := protected.inodes[e.Inode]; held {
+			protected.paths[e.Path] = struct{}{}
+		}
+	}
+	selected := make(map[string]struct{}, len(batch))
+	for _, e := range snapshots {
+		selected[e.Path] = struct{}{}
+	}
+	// A directory content callback invalidates every cached slice mapping,
+	// including those owned by an accepted replacement elsewhere in the tree.
+	// Refuse an admitted directory before any row or callback in this batch can
+	// change; a later reconciliation can retry after the publication is cleaned.
+	if reconcile && len(protected.paths) != 0 {
+		for _, e := range snapshots {
+			if e.IsDir && !StreamPartialName(e.Name) {
+				if _, held := protected.paths[e.Path]; !held {
+					return StoreEpoch{}, ErrMirrorConflict
+				}
 			}
 		}
-		if err := tx.Commit(); err != nil {
-			return fmt.Errorf("commit: %w", err)
+	}
+	type oldContent struct {
+		path  string
+		inode uint64
+	}
+	oldContentRows := make([]oldContent, 0, len(invalidatePaths))
+	seenInvalidations := make(map[string]struct{}, len(invalidatePaths))
+	for _, p := range invalidatePaths {
+		if _, held := protected.paths[p]; held {
+			continue
 		}
-		s.wakeFTSCompactor()
-		return nil
+		if _, ok := selected[p]; !ok {
+			return StoreEpoch{}, ErrMirrorConflict
+		}
+		if _, duplicate := seenInvalidations[p]; duplicate {
+			continue
+		}
+		seenInvalidations[p] = struct{}{}
+		old := cached[p]
+		if old.present {
+			oldContentRows = append(oldContentRows, oldContent{path: p, inode: old.inode})
+		}
+		var inode int64
+		if err := tx.QueryRow(`SELECT inode FROM entries WHERE path=?`, p).Scan(&inode); err == sql.ErrNoRows {
+			if !old.present {
+				return StoreEpoch{}, ErrMirrorConflict
+			}
+		} else if err != nil {
+			return StoreEpoch{}, err
+		} else if !old.present || old.inode != uint64(inode) {
+			oldContentRows = append(oldContentRows, oldContent{path: p, inode: uint64(inode)})
+		}
 	}
-
-	stmt, err := tx.Prepare(
-		`INSERT OR REPLACE INTO entries (path, name, parent_path, is_dir, size, mtime, inode, mode, local_only)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-	if err != nil {
-		tx.Rollback()
-		return fmt.Errorf("prepare: %w", err)
-	}
-
-	for _, e := range batch {
-		_, err := stmt.Exec(
-			e.Path, e.Name, e.ParentPath,
-			boolToInt(e.IsDir), e.Size, e.Mtime.Unix(),
-			int64(e.Inode), uint32(e.Mode), boolToInt(e.LocalOnly),
-		)
+	committed := make([]*Entry, 0, len(batch))
+	var reconcileDirs []string
+	for _, input := range snapshots {
+		e := input
+		if StreamPartialName(e.Name) {
+			continue
+		}
+		if _, held := protected.paths[e.Path]; held {
+			continue
+		}
+		if !e.Version.IsZero() {
+			if e.Version.Path != e.Path {
+				return StoreEpoch{}, ErrMirrorConflict
+			}
+			if old := cached[e.Path]; old.present && old.version != e.Version {
+				return StoreEpoch{}, ErrMirrorConflict
+			}
+			if err := validateExpected(tx, e.Version); err != nil {
+				return StoreEpoch{}, err
+			}
+		}
+		if reconcile {
+			if e.IsDir {
+				reconcileDirs = append(reconcileDirs, e.Path)
+			} else if invalidate != nil {
+				// The ordinary content hook can query Store and is unsafe
+				// with this transaction open. Use the non-reentrant SCAN
+				// hook with the exact preimage inode instead.
+				old := cached[e.Path]
+				if old.present {
+					invalidate(e.Path, old.inode)
+				}
+				var durable int64
+				switch err := tx.QueryRow(`SELECT inode FROM entries WHERE path=?`, e.Path).Scan(&durable); err {
+				case nil:
+					if !old.present || old.inode != uint64(durable) {
+						invalidate(e.Path, uint64(durable))
+					}
+				case sql.ErrNoRows:
+					if !old.present {
+						invalidate(e.Path, 0) // still drop path-keyed memory buffers
+					}
+				default:
+					return StoreEpoch{}, err
+				}
+			}
+		}
+		if incremental {
+			err = ftsExternalUpsert(tx, e, s.ftsDefer)
+		} else {
+			var result sql.Result
+			result, err = tx.Exec(incarnationUpsertSQL,
+				e.Path, e.Name, e.ParentPath, boolToInt(e.IsDir), e.Size, e.Mtime.Unix(),
+				int64(e.Inode), uint32(e.Mode), boolToInt(e.LocalOnly), e.mtimeNsecSQL(),
+				e.Path, int64(e.Inode), boolToInt(e.IsDir), e.Path)
+			if err == nil {
+				err = exactlyOneRow(result)
+			}
+		}
 		if err != nil {
-			stmt.Close()
-			tx.Rollback()
-			return fmt.Errorf("exec %q: %w", e.Path, err)
+			return StoreEpoch{}, err
+		}
+		if err := loadEntryVersion(tx, e); err != nil {
+			return StoreEpoch{}, err
+		}
+		e.ResetGetAttrCache()
+		committed = append(committed, e)
+	}
+	var next StoreEpoch
+	if expected != nil {
+		next, err = captureStoreEpoch(tx, cacheGeneration)
+		if err != nil {
+			return StoreEpoch{}, err
 		}
 	}
-
-	stmt.Close()
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit: %w", err)
+	if fn := invalidate; fn != nil {
+		for _, old := range oldContentRows {
+			fn(old.path, old.inode)
+		}
 	}
-	return nil
+	if err := tx.Commit(); err != nil {
+		return StoreEpoch{}, fmt.Errorf("commit: %w", err)
+	}
+	// Directory invalidation is whole-tree and needs no old inode. Defer its
+	// legacy callback until the SQL transaction is closed, so a callback that
+	// reads Store cannot reenter an open SQLite writer.
+	for _, p := range reconcileDirs {
+		s.NotifyContentInvalidated(p, true)
+	}
+	s.mu.Lock()
+	for _, e := range committed {
+		s.publishEntryLocked(e)
+	}
+	s.mu.Unlock()
+	s.wakeFTSCompactor()
+	return next, nil
 }
 
 // BulkInsertAbsent is the insert-if-absent sibling of BulkInsert, for ASYNC
@@ -1514,38 +2267,11 @@ func (s *Store) BulkInsertAbsent(entries []*Entry, batchSize int) error {
 
 	// See BulkInsert for the QA-30 Layer B HIGH-2 + chunked-mutation
 	// (drain-latency tail) rationale — same structure, absent semantics.
-	s.stagePinnedForEviction()
-
-	for i := 0; i < len(entries); i += cacheMutationChunk {
-		end := i + cacheMutationChunk
-		if end > len(entries) {
-			end = len(entries)
-		}
-		s.mu.Lock()
-		for _, e := range entries[i:end] {
-			// The whole point of the absent variant: presence is checked
-			// under THIS lock hold, not in the caller's earlier filter pass.
-			if _, exists := s.pathCache[e.Path]; exists {
-				continue // fresher row won the race — never overwrite it
-			}
-			if _, taken := s.inodeCache[e.Inode]; taken {
-				// Inode already owned by a live cached path (a rename raced
-				// the FUSE snapshot). Inserting our stale path would evict
-				// the fresher owner (QA-25 class) — skip; the reconcile
-				// converges the mirror.
-				continue
-			}
-			s.subtreeUpsertLocked(nil, e) // INSTANT-NAV #2: genuinely new (absent-only path)
-			s.inodeCache[e.Inode] = e
-			s.pathCache[e.Path] = e
-			s.addToChildrenIdx(e)
-		}
-		s.mu.Unlock()
+	if err := s.publishAbsentEntries(entries); err != nil {
+		return err
 	}
 
-	s.mu.Lock()
-	s.evictOldest()
-	s.mu.Unlock()
+	s.evictWithPinnedSet()
 
 	if !incremental {
 		if err := s.RebuildFTS(); err != nil {
@@ -1554,6 +2280,62 @@ func (s *Store) BulkInsertAbsent(entries []*Entry, batchSize int) error {
 	}
 	if len(entries) > 0 {
 		s.ftsInitialized.Store(true)
+	}
+	return nil
+}
+
+// publishAbsentEntries fills missing cache entries from committed SQLite rows.
+// It is the final publication phase of BulkInsertAbsent; durable insertion and
+// its token checks have already completed. It owns writeMu across this phase.
+func (s *Store) publishAbsentEntries(entries []*Entry) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	for i := 0; i < len(entries); i += cacheMutationChunk {
+		end := i + cacheMutationChunk
+		if end > len(entries) {
+			end = len(entries)
+		}
+		if err := s.publishAbsentChunk(entries[i:end]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// publishAbsentChunk fences one bounded interval against cache-only namespace
+// successors. It never holds mu over the committed-row SELECT, so unrelated
+// cached readers continue while SQLite waits. The caller owns writeMu.
+func (s *Store) publishAbsentChunk(entries []*Entry) error {
+	s.cachePublicationMu.Lock()
+	defer s.cachePublicationMu.Unlock()
+	for _, input := range entries {
+		// A cached winner skips SQL entirely, even if the durable row has since
+		// disappeared. This is the original fresh-wins admission check.
+		s.mu.RLock()
+		_, present := s.pathCache[input.Path]
+		s.mu.RUnlock()
+		if present {
+			continue
+		}
+		// Read the actual committed row and its version, never the warmer's
+		// potentially stale input. writeMu and the publication gate keep it
+		// stable until the final cache checks and publication below.
+		e, err := scanEntry(s.db.QueryRow(`SELECT `+serveColumns+` FROM entries WHERE path=?`, input.Path))
+		if err != nil {
+			return err
+		}
+		s.mu.Lock()
+		if _, present := s.pathCache[e.Path]; !present {
+			if _, taken := s.inodeCache[e.Inode]; !taken {
+				// Do not displace an inode's fresher cached owner (rename race).
+				s.subtreeUpsertLocked(nil, e)
+				s.inodeCache[e.Inode] = e
+				s.markCachePublicationLocked(e)
+				s.pathCache[e.Path] = e
+				s.addToChildrenIdx(e)
+			}
+		}
+		s.mu.Unlock()
 	}
 	return nil
 }
@@ -1580,11 +2362,11 @@ func ftsExternalInsertAbsent(tx *sql.Tx, e *Entry, deferFTS bool) error {
 		return fmt.Errorf("insert-absent read %q: %w", e.Path, err)
 	}
 	res, err := tx.Exec(
-		`INSERT OR IGNORE INTO entries (path, name, parent_path, is_dir, size, mtime, inode, mode, local_only)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT OR IGNORE INTO entries (path, name, parent_path, is_dir, size, mtime, inode, mode, local_only, mtime_nsec)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		e.Path, e.Name, e.ParentPath,
 		boolToInt(e.IsDir), e.Size, e.Mtime.Unix(),
-		int64(e.Inode), uint32(e.Mode), boolToInt(e.LocalOnly),
+		int64(e.Inode), uint32(e.Mode), boolToInt(e.LocalOnly), e.mtimeNsecSQL(),
 	)
 	if err != nil {
 		return fmt.Errorf("insert-absent %q: %w", e.Path, err)
@@ -1624,6 +2406,17 @@ func (s *Store) bulkInsertAbsentBatch(batch []*Entry, incremental bool) error {
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
+	defer tx.Rollback()
+	for _, e := range batch {
+		if !e.Version.IsZero() {
+			if e.Version.Path != e.Path {
+				return ErrMirrorConflict
+			}
+			if err := validateExpected(tx, e.Version); err != nil {
+				return err
+			}
+		}
+	}
 
 	if incremental {
 		for _, e := range batch {
@@ -1643,8 +2436,8 @@ func (s *Store) bulkInsertAbsentBatch(batch []*Entry, incremental bool) error {
 	// does one bulk RebuildFTS, which re-derives FTS from `entries` and is
 	// therefore consistent with IGNOREd rows too.
 	stmt, err := tx.Prepare(
-		`INSERT OR IGNORE INTO entries (path, name, parent_path, is_dir, size, mtime, inode, mode, local_only)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+		`INSERT OR IGNORE INTO entries (path, name, parent_path, is_dir, size, mtime, inode, mode, local_only, mtime_nsec)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 	if err != nil {
 		tx.Rollback()
 		return fmt.Errorf("prepare: %w", err)
@@ -1653,7 +2446,7 @@ func (s *Store) bulkInsertAbsentBatch(batch []*Entry, incremental bool) error {
 		if _, err := stmt.Exec(
 			e.Path, e.Name, e.ParentPath,
 			boolToInt(e.IsDir), e.Size, e.Mtime.Unix(),
-			int64(e.Inode), uint32(e.Mode), boolToInt(e.LocalOnly),
+			int64(e.Inode), uint32(e.Mode), boolToInt(e.LocalOnly), e.mtimeNsecSQL(),
 		); err != nil {
 			stmt.Close()
 			tx.Rollback()
@@ -1686,15 +2479,17 @@ func (s *Store) bulkInsertAbsentBatch(batch []*Entry, incremental bool) error {
 func (s *Store) UpdateSize(entryPath string, size int64, mtime time.Time) error {
 	s.writeMu.Lock()
 	_, err := s.db.Exec(
-		`UPDATE entries SET size = MAX(size, ?), mtime = ? WHERE path = ?`,
+		`UPDATE entries SET size = MAX(size, ?), mtime = ?, mtime_nsec = NULL WHERE path = ?`,
 		size, mtime.Unix(), entryPath,
 	)
-	s.writeMu.Unlock()
-
 	if err != nil {
+		s.writeMu.Unlock()
 		return fmt.Errorf("update size %q: %w", entryPath, err)
 	}
 
+	// Keep writeMu through the cache update. Insert uses the same lock order
+	// (writeMu -> mu), making the SQLite row and its serving-cache counterpart
+	// one ordered publication instead of two independently raceable phases.
 	s.mu.Lock()
 	if e, ok := s.pathCache[entryPath]; ok {
 		oldSize := e.Size
@@ -1705,10 +2500,66 @@ func (s *Store) UpdateSize(entryPath string, size int64, mtime time.Time) error 
 		// the ancestor aggregates. Zero delta (MAX rejected a shrink) no-ops.
 		s.subtreeResizeLocked(e, oldSize)
 		e.Mtime = mtime
-		e.PreSerializedGetAttr = nil // [JM5] invalidate cached XDR bytes
+		e.MtimeNsecKnown = false
+		e.ResetGetAttrCache()
+		if !e.Version.IsZero() {
+			e.Version.Revision++
+		}
 	}
 	s.mu.Unlock()
+	s.writeMu.Unlock()
 
+	return nil
+}
+
+// SetSizeExact records an authoritative file size, including a shrink to zero.
+// Unlike UpdateSize, this is not a concurrent-write high-water contribution:
+// callers use it only after an explicit truncate or after a completed spool
+// drain, where the supplied size is the complete file length.
+func (s *Store) SetSizeExact(entryPath string, size int64, mtime time.Time) error {
+	return s.setSizeExact(entryPath, size, mtime, false)
+}
+
+// SetSizeExactAfterMutation publishes a size that already changed on the backing
+// filesystem. Even if SQLite fails, RAM must reflect the new EOF so readers do
+// not serve the removed tail. The error still prevents acknowledging durable
+// success; after a failed publication, restart requires reconciliation or a
+// successful retry because the durable row can retain the old size.
+func (s *Store) SetSizeExactAfterMutation(entryPath string, size int64, mtime time.Time) error {
+	return s.setSizeExact(entryPath, size, mtime, true)
+}
+
+func (s *Store) setSizeExact(entryPath string, size int64, mtime time.Time, publishOnError bool) error {
+	s.writeMu.Lock()
+	_, err := s.db.Exec(
+		`UPDATE entries SET size = ?, mtime = ?, mtime_nsec = NULL WHERE path = ?`,
+		size, mtime.Unix(), entryPath,
+	)
+	if err != nil && !publishOnError {
+		s.writeMu.Unlock()
+		return fmt.Errorf("set exact size %q: %w", entryPath, err)
+	}
+
+	s.mu.Lock()
+	if e, ok := s.pathCache[entryPath]; ok {
+		oldSize := e.Size
+		e.Size = size
+		s.subtreeResizeLocked(e, oldSize)
+		e.Mtime = mtime
+		e.MtimeNsecKnown = false
+		e.ResetGetAttrCache()
+		if err != nil {
+			e.Version = MirrorToken{}
+		} else if !e.Version.IsZero() {
+			e.Version.Revision++
+		}
+	}
+	s.mu.Unlock()
+	s.writeMu.Unlock()
+
+	if err != nil {
+		return fmt.Errorf("set exact size %q: %w", entryPath, err)
+	}
 	return nil
 }
 
@@ -1728,12 +2579,14 @@ func (s *Store) UpdateMode(entryPath string, mode fs.FileMode) error {
 	perm := uint32(mode & fs.ModePerm)
 
 	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if handled, err := s.updateBoundSidecarModeLocked(entryPath, mode); handled {
+		return err
+	}
 	_, err := s.db.Exec(
 		`UPDATE entries SET mode = (mode & ~511) | ? WHERE path = ?`,
 		perm, entryPath,
 	)
-	s.writeMu.Unlock()
-
 	if err != nil {
 		return fmt.Errorf("update mode %q: %w", entryPath, err)
 	}
@@ -1742,7 +2595,10 @@ func (s *Store) UpdateMode(entryPath string, mode fs.FileMode) error {
 	if e, ok := s.pathCache[entryPath]; ok {
 		// Preserve type bits (ModeDir/ModeSymlink), replace perm bits only.
 		e.Mode = (e.Mode &^ fs.ModePerm) | (mode & fs.ModePerm)
-		e.PreSerializedGetAttr = nil // invalidate cached XDR attrs (see UpdateSize)
+		e.ResetGetAttrCache()
+		if !e.Version.IsZero() {
+			e.Version.Revision++
+		}
 	}
 	s.mu.Unlock()
 
@@ -1752,11 +2608,10 @@ func (s *Store) UpdateMode(entryPath string, mode fs.FileMode) error {
 // ClearLocalOnly marks an entry as no longer local-only (confirmed in Redis).
 func (s *Store) ClearLocalOnly(entryPath string) error {
 	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	_, err := s.db.Exec(
 		`UPDATE entries SET local_only = 0 WHERE path = ?`, entryPath,
 	)
-	s.writeMu.Unlock()
-
 	if err != nil {
 		return fmt.Errorf("clear local_only %q: %w", entryPath, err)
 	}
@@ -1764,6 +2619,9 @@ func (s *Store) ClearLocalOnly(entryPath string) error {
 	s.mu.Lock()
 	if e, ok := s.pathCache[entryPath]; ok {
 		e.LocalOnly = false
+		if !e.Version.IsZero() {
+			e.Version.Revision++
+		}
 	}
 	s.mu.Unlock()
 
@@ -1815,8 +2673,6 @@ func (s *Store) BulkClearLocalOnly(paths []string) error {
 			return fmt.Errorf("commit: %w", err)
 		}
 	}
-	s.writeMu.Unlock()
-
 	// Update in-memory cache in bounded chunks (S5 / nav-latency H3) so a large
 	// offline->online reconcile clear (e.g. ~146k local_only paths after a big
 	// offload) cannot hold s.mu across the WHOLE slice and block concurrent
@@ -1832,10 +2688,14 @@ func (s *Store) BulkClearLocalOnly(paths []string) error {
 		for _, p := range paths[i:end] {
 			if e, ok := s.pathCache[p]; ok {
 				e.LocalOnly = false
+				if !e.Version.IsZero() {
+					e.Version.Revision++
+				}
 			}
 		}
 		s.mu.Unlock()
 	}
+	s.writeMu.Unlock()
 
 	return nil
 }
@@ -1843,7 +2703,7 @@ func (s *Store) BulkClearLocalOnly(paths []string) error {
 // LocalOnlyEntries returns all entries marked as local_only.
 func (s *Store) LocalOnlyEntries() ([]*Entry, error) {
 	rows, err := s.db.Query(
-		`SELECT path, name, parent_path, is_dir, size, mtime, inode, mode, local_only
+		`SELECT ` + serveColumns + `
 		 FROM entries WHERE local_only = 1`)
 	if err != nil {
 		return nil, err
@@ -1948,7 +2808,7 @@ func (s *Store) Search(query string, limit int, parentPath string) ([]SearchResu
 	if parentPath != "" {
 		// Scoped search: only entries under parentPath
 		rows, err = s.db.Query(
-			`SELECT e.path, e.name, e.parent_path, e.is_dir, e.size, e.mtime, e.inode, e.mode, e.local_only, rank
+			`SELECT e.path, e.name, e.parent_path, e.is_dir, e.size, e.mtime, e.inode, e.mode, e.local_only, e.incarnation, e.revision, e.mtime_nsec, rank
 			 FROM entries_fts fts
 			 JOIN entries e ON e.rowid = fts.rowid
 			 WHERE entries_fts MATCH ?
@@ -1959,7 +2819,7 @@ func (s *Store) Search(query string, limit int, parentPath string) ([]SearchResu
 		)
 	} else {
 		rows, err = s.db.Query(
-			`SELECT e.path, e.name, e.parent_path, e.is_dir, e.size, e.mtime, e.inode, e.mode, e.local_only, rank
+			`SELECT e.path, e.name, e.parent_path, e.is_dir, e.size, e.mtime, e.inode, e.mode, e.local_only, e.incarnation, e.revision, e.mtime_nsec, rank
 			 FROM entries_fts fts
 			 JOIN entries e ON e.rowid = fts.rowid
 			 WHERE entries_fts MATCH ?
@@ -1980,23 +2840,25 @@ func (s *Store) Search(query string, limit int, parentPath string) ([]SearchResu
 			e         Entry
 			isDir     int
 			mtimeUnix int64
+			mtimeNsec sql.NullInt64
 			inodeRaw  int64
 			mode      uint32
 			localOnly int
 			rank      float64
 		)
-		err := rows.Scan(&e.Path, &e.Name, &e.ParentPath, &isDir, &e.Size, &mtimeUnix, &inodeRaw, &mode, &localOnly, &rank)
+		err := rows.Scan(&e.Path, &e.Name, &e.ParentPath, &isDir, &e.Size, &mtimeUnix, &inodeRaw, &mode, &localOnly, &e.Version.Incarnation, &e.Version.Revision, &mtimeNsec, &rank)
 		if err != nil {
 			return nil, err
 		}
 		e.Inode = uint64(inodeRaw)
 		e.IsDir = isDir != 0
-		e.Mtime = time.Unix(mtimeUnix, 0)
+		e.restoreMtime(mtimeUnix, mtimeNsec)
 		e.Mode = fs.FileMode(mode)
 		if e.IsDir {
 			e.Mode |= fs.ModeDir
 		}
 		e.LocalOnly = localOnly != 0
+		e.Version.Path = e.Path
 		results = append(results, SearchResult{Entry: &e, Rank: rank})
 	}
 	return results, rows.Err()
@@ -2013,11 +2875,21 @@ func (s *Store) RebuildFTS() error {
 	// NOT take this path (the QA-40 stall). Incremented under writeMu.
 	s.ftsFullRebuilds.Add(1)
 
-	// Delete all FTS content, then re-insert from entries table
-	if _, err := s.db.Exec(`INSERT INTO entries_fts(entries_fts) VALUES('delete-all')`); err != nil {
+	// Keep delete-all, reinsert, pending-marker clear, and the durable epoch in
+	// one transaction. Without this, a crash after delete-all could leave an
+	// empty index carrying a previously-current epoch and the next boot would
+	// incorrectly skip repair.
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("fts rebuild begin: %w", err)
+	}
+	defer tx.Rollback()
+
+	// Delete all FTS content, then re-insert from entries table.
+	if _, err := tx.Exec(`INSERT INTO entries_fts(entries_fts) VALUES('delete-all')`); err != nil {
 		return fmt.Errorf("fts delete-all: %w", err)
 	}
-	if _, err := s.db.Exec(`INSERT INTO entries_fts(rowid, name, path) SELECT rowid, name, path FROM entries`); err != nil {
+	if _, err := tx.Exec(`INSERT INTO entries_fts(rowid, name, path) SELECT rowid, name, path FROM entries`); err != nil {
 		return fmt.Errorf("fts rebuild: %w", err)
 	}
 	// A full rebuild indexes EVERY entries row, so nothing is un-indexed
@@ -2025,8 +2897,18 @@ func (s *Store) RebuildFTS() error {
 	// and the compactor does no redundant re-index work. Safe: the FTS now
 	// covers every row these markers pointed at. No-op when the table is empty
 	// (flag-off). This runs under writeMu so it is atomic w.r.t. the write path.
-	if _, err := s.db.Exec(`DELETE FROM fts_pending`); err != nil {
+	if _, err := tx.Exec(`DELETE FROM fts_pending`); err != nil {
 		return fmt.Errorf("fts clear pending: %w", err)
+	}
+	if _, err := tx.Exec(
+		`INSERT INTO store_meta (key, value) VALUES (?, ?)
+		 ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+		ftsIndexEpochKey, ftsIndexEpoch,
+	); err != nil {
+		return fmt.Errorf("fts persist index epoch: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("fts rebuild commit: %w", err)
 	}
 	return nil
 }
@@ -2230,6 +3112,26 @@ func (s *Store) DeletePaths(paths []string) error {
 	}
 
 	s.writeMu.Lock()
+	// Remember the cache incarnation each delete is allowed to remove. Durable
+	// writers are serialized by writeMu, but cache-only publications may still
+	// replace an entry after this snapshot and before the cache cleanup below.
+	// Keep each mu hold bounded just like the cleanup loop.
+	observedEntries := make([]*Entry, len(paths))
+	observedVisibility := make([]time.Time, len(paths))
+	observedVisibilityPresent := make([]bool, len(paths))
+	for i := 0; i < len(paths); i += cacheMutationChunk {
+		end := i + cacheMutationChunk
+		if end > len(paths) {
+			end = len(paths)
+		}
+		s.mu.RLock()
+		for j, p := range paths[i:end] {
+			observedEntries[i+j] = s.pathCache[p]
+			observedVisibility[i+j], observedVisibilityPresent[i+j] = s.dirVisibilityMtime[p]
+		}
+		s.mu.RUnlock()
+	}
+
 	tx, err := s.db.Begin()
 	if err != nil {
 		s.writeMu.Unlock()
@@ -2276,7 +3178,9 @@ func (s *Store) DeletePaths(paths []string) error {
 		s.writeMu.Unlock()
 		return err
 	}
-	s.writeMu.Unlock()
+	if s.deletePathsAfterCommitHook != nil {
+		s.deletePathsAfterCommitHook()
+	}
 
 	// DRAIN-LATENCY tail fix: chunk the in-memory removal the same way as
 	// BulkInsert's rebuild loop. The periodic reconcile's prune (toDelete) can
@@ -2291,8 +3195,9 @@ func (s *Store) DeletePaths(paths []string) error {
 			end = len(paths)
 		}
 		s.mu.Lock()
-		for _, p := range paths[i:end] {
-			if e, ok := s.pathCache[p]; ok {
+		for j, p := range paths[i:end] {
+			observed := observedEntries[i+j]
+			if e, ok := s.pathCache[p]; ok && e == observed {
 				// QA-25: see Delete.
 				if cur, inodeOk := s.inodeCache[e.Inode]; inodeOk && cur == e {
 					delete(s.inodeCache, e.Inode)
@@ -2303,9 +3208,15 @@ func (s *Store) DeletePaths(paths []string) error {
 				s.subtreeRemoveLocked(e) // INSTANT-NAV #2
 				delete(s.pathCache, p)
 			}
+			if observedVisibilityPresent[i+j] {
+				if current, ok := s.dirVisibilityMtime[p]; ok && current == observedVisibility[i+j] {
+					delete(s.dirVisibilityMtime, p)
+				}
+			}
 		}
 		s.mu.Unlock()
 	}
+	s.writeMu.Unlock()
 
 	return nil
 }
@@ -2430,6 +3341,9 @@ func (s *Store) evictOldest() {
 	// path re-adds exactly once via subtreeUpsertLocked(old=nil, e).
 	for path, e := range s.pathCache {
 		if _, kept := newPathCache[path]; !kept {
+			if s.cacheEvicted.CompareAndSwap(false, true) {
+				log.Printf("metadata: RAM shadow reached its bound; serving evicted metadata from the local SQLite mirror")
+			}
 			s.shadowEvictedLocked(e)
 			s.subtreeRemoveLocked(e)
 		}
@@ -2443,7 +3357,7 @@ func (s *Store) evictOldest() {
 // rebuildCaches loads all entries from SQLite into the in-memory caches.
 func (s *Store) rebuildCaches() error {
 	rows, err := s.db.Query(
-		`SELECT path, name, parent_path, is_dir, size, mtime, inode, mode, local_only FROM entries`)
+		`SELECT ` + serveColumns + ` FROM entries`)
 	if err != nil {
 		return err
 	}
@@ -2476,6 +3390,11 @@ func (s *Store) rebuildCaches() error {
 	s.pathCache = pCache
 	s.childrenIdx = cIdx
 	s.evictOldest()
+	// Recalled metadata is a fresh RAM publication. This identity is process-local;
+	// cached bytes still require a new complete read and descriptor validation.
+	for _, e := range s.pathCache {
+		s.markCachePublicationLocked(e)
+	}
 	// INSTANT-NAV #2: the caches were replaced wholesale (boot / full rebuild
 	// from SQLite), so recompute the subtree aggregates in one O(N×depth)
 	// pass over the FINAL pathCache — after evictOldest, so the pass sees
@@ -2493,7 +3412,7 @@ func MakeEntry(entryPath string, isDir bool, size int64, mtime time.Time, inode 
 	if isDir {
 		mode = 0755 | fs.ModeDir
 	}
-	return &Entry{
+	e := &Entry{
 		Path:       entryPath,
 		Name:       path.Base(entryPath),
 		ParentPath: path.Dir(entryPath),
@@ -2503,6 +3422,8 @@ func MakeEntry(entryPath string, isDir bool, size int64, mtime time.Time, inode 
 		Inode:      inode,
 		Mode:       mode,
 	}
+	e.prepareGetAttrCache()
+	return e
 }
 
 type scanner interface {
@@ -2514,22 +3435,25 @@ func scanEntry(s scanner) (*Entry, error) {
 		e         Entry
 		isDir     int
 		mtimeUnix int64
+		mtimeNsec sql.NullInt64
 		inodeRaw  int64 // SQLite stores uint64 as int64; high-bit inodes become negative
 		mode      uint32
 		localOnly int
 	)
-	err := s.Scan(&e.Path, &e.Name, &e.ParentPath, &isDir, &e.Size, &mtimeUnix, &inodeRaw, &mode, &localOnly)
+	err := s.Scan(&e.Path, &e.Name, &e.ParentPath, &isDir, &e.Size, &mtimeUnix, &inodeRaw, &mode, &localOnly, &e.Version.Incarnation, &e.Version.Revision, &mtimeNsec)
 	if err != nil {
 		return nil, err
 	}
 	e.Inode = uint64(inodeRaw) // reinterpret bits — negative int64 → high-bit uint64
 	e.IsDir = isDir != 0
-	e.Mtime = time.Unix(mtimeUnix, 0)
+	e.restoreMtime(mtimeUnix, mtimeNsec)
 	e.Mode = fs.FileMode(mode)
 	if e.IsDir {
 		e.Mode |= fs.ModeDir
 	}
 	e.LocalOnly = localOnly != 0
+	e.Version.Path = e.Path
+	e.prepareGetAttrCache()
 	return &e, nil
 }
 

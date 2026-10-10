@@ -10,7 +10,7 @@ func mb(f float64) int64 { return int64(f * 1024 * 1024) }
 // fakeClock drives the windowed throughput estimator deterministically.
 type fakeClock struct{ t time.Time }
 
-func (c *fakeClock) now() time.Time      { return c.t }
+func (c *fakeClock) now() time.Time          { return c.t }
 func (c *fakeClock) advance(d time.Duration) { c.t = c.t.Add(d) }
 
 // sampleFor feeds `blocks` 4 MB backend reads at the given bytes/sec, driving an
@@ -34,19 +34,18 @@ func TestUnknownDefaultsToMedium(t *testing.T) {
 		t.Fatalf("no-signal class = %v, want medium (unchanged behavior)", c)
 	}
 	ra := p.Readahead()
-	// Medium must equal the historical hard-coded defaults exactly.
-	if ra.SeqThreshold != 3 || ra.Blocks != 8 || ra.Workers != 4 || !ra.Enabled {
-		t.Fatalf("medium policy %+v != historical default {Enabled:true Seq:3 Blocks:8 Workers:4}", ra)
+	if ra.SeqThreshold != 3 || ra.Blocks != 4 || ra.Workers != 2 || !ra.Enabled {
+		t.Fatalf("medium policy %+v != bounded live default {Enabled:true Seq:3 Blocks:4 Workers:2}", ra)
 	}
 }
 
 func TestBandwidthClassification(t *testing.T) {
 	cases := []struct {
-		name  string
-		mbps  float64
-		want  LinkClass
+		name string
+		mbps float64
+		want LinkClass
 	}{
-		{"cellular", 5, ClassSlow},   // 5 MB/s is >3 (metered) and <30 (slow) → slow
+		{"cellular", 5, ClassSlow}, // 5 MB/s is >3 (metered) and <30 (slow) → slow
 		{"weak-cellular", 2, ClassMetered},
 		{"good-wifi", 100, ClassMedium},
 		{"ten-gig", 600, ClassFast},
@@ -64,15 +63,15 @@ func TestBandwidthClassification(t *testing.T) {
 	}
 }
 
-func TestMeteredSuppressesReadahead(t *testing.T) {
+func TestMeteredUsesOneBoundedReadahead(t *testing.T) {
 	p := New()
 	sampleFor(p, 1.5*1024*1024, 6) // 1.5 MB/s → metered
 	ra := p.Readahead()
-	if ra.Enabled {
-		t.Fatalf("metered link must disable server readahead, got %+v", ra)
+	if !ra.Enabled {
+		t.Fatalf("metered link must retain bounded server readahead, got %+v", ra)
 	}
-	if ra.Blocks > 1 {
-		t.Fatalf("metered link must not prefetch ahead, got Blocks=%d", ra.Blocks)
+	if ra.SeqThreshold != 6 || ra.Blocks != 1 || ra.Workers != 1 {
+		t.Fatalf("metered link must use the guarded 1-block/1-worker policy, got %+v", ra)
 	}
 }
 
@@ -105,14 +104,14 @@ func TestRTTBootstrapBeforeBandwidth(t *testing.T) {
 	}
 }
 
-func TestBandwidthOverridesRTTBootstrap(t *testing.T) {
-	// A 56ms-RTT link that turns out to be high-bandwidth should reclassify up
-	// once throughput samples arrive (RTT bootstrap was only a placeholder).
+func TestLatencyCapsFatFarLink(t *testing.T) {
+	// A fat 56ms link is still far: bandwidth must not buy the LAN readahead
+	// path when every metadata/open round trip already dominates responsiveness.
 	p := New()
-	p.ObserveRTT(56 * time.Millisecond) // would bootstrap to slow
-	sampleFor(p, 300*1024*1024, 8)      // but it's actually fast
-	if c := p.Class(); c != ClassFast {
-		t.Fatalf("high-bw 56ms link → %v, want fast (bw overrides rtt bootstrap)", c)
+	p.ObserveRTT(56 * time.Millisecond)
+	sampleFor(p, 300*1024*1024, 8)
+	if c := p.Class(); c != ClassSlow {
+		t.Fatalf("high-bw 56ms link → %v, want slow (latency ceiling must win)", c)
 	}
 	if p.Snapshot().BootstrappedRTT {
 		t.Fatal("BootstrappedRTT should be false once bandwidth is known")
@@ -144,10 +143,10 @@ func TestTinySamplesIgnored(t *testing.T) {
 }
 
 func TestJuiceFSPolicyByClass(t *testing.T) {
-	// medium (no signal) == historical mount defaults exactly.
+	// Medium uses a large write buffer but transition-safe immutable prefetch.
 	med := New().JuiceFS()
-	if med.BufferSizeMB != 4096 || med.Prefetch != 3 {
-		t.Fatalf("medium juicefs policy %+v != historical {4096,3}", med)
+	if med.BufferSizeMB != 4096 || med.Prefetch != 1 {
+		t.Fatalf("medium juicefs policy %+v != transition-safe {4096,1}", med)
 	}
 	// metered: prefetch off, buffer still >= a single media file.
 	metered := New()
@@ -159,12 +158,19 @@ func TestJuiceFSPolicyByClass(t *testing.T) {
 	if mp.BufferSizeMB < 256 {
 		t.Fatalf("metered buffer %d MB too small to absorb a single media write", mp.BufferSizeMB)
 	}
-	// fast: wider prefetch than medium to fill the pipe.
+	// Fast keeps the same immutable floor; live server readahead scales up.
 	fast := New()
 	sampleFor(fast, 800*1024*1024, 8)
 	fp := fast.JuiceFS()
-	if fp.Prefetch <= med.Prefetch {
-		t.Fatalf("fast prefetch %d must exceed medium %d (fill 10GbE)", fp.Prefetch, med.Prefetch)
+	if fp.Prefetch != med.Prefetch || fp.Prefetch != 1 {
+		t.Fatalf("fast/medium mount prefetch must stay transition-safe: fast=%d medium=%d", fp.Prefetch, med.Prefetch)
+	}
+	for _, c := range []LinkClass{ClassMetered, ClassSlow, ClassMedium, ClassFast} {
+		p := New()
+		p.ForceClass(&c)
+		if got := p.NFSReadahead(); got != 2 {
+			t.Fatalf("class %s NFS readahead=%d, want immutable handoff-safe floor 2", c, got)
+		}
 	}
 }
 
@@ -188,6 +194,33 @@ func TestWindowedAggregatesConcurrentReads(t *testing.T) {
 	}
 }
 
+func TestWindowExcludesApplicationThinkTime(t *testing.T) {
+	// Finder and an NLE do not issue one continuous read stream. Two 256 KiB
+	// transfers can each sustain 50 MiB/s while their callers pause 300 ms
+	// between completions. The old first-to-last wall span divided 512 KiB by
+	// ~305 ms and permanently mislabeled this as a ~1.6 MiB/s metered link.
+	p := New()
+	c := &fakeClock{t: time.Unix(1_700_000_000, 0)}
+	p.now = c.now
+	const bytes = int64(256 * 1024)
+	dur := 5 * time.Millisecond // 50 MiB/s active transfer rate
+	for i := 0; i < 2; i++ {
+		c.advance(300 * time.Millisecond)
+		p.ObserveThroughput(bytes, dur)
+	}
+	snap := p.Snapshot()
+	if !snap.HaveBW {
+		t.Fatal("sparse transfer window did not produce a bandwidth sample")
+	}
+	want := float64(50 * 1024 * 1024)
+	if snap.BytesPerSec < want*0.99 || snap.BytesPerSec > want*1.01 {
+		t.Fatalf("sparse active-transfer estimate = %.1f MiB/s, want 50 MiB/s", snap.BytesPerSec/(1024*1024))
+	}
+	if snap.Class != ClassMedium {
+		t.Fatalf("50 MiB/s sparse LAN transfers classified %s, want medium", snap.Class)
+	}
+}
+
 func TestForceClass(t *testing.T) {
 	p := New()
 	sampleFor(p, 800*1024*1024, 8) // would be fast
@@ -196,11 +229,208 @@ func TestForceClass(t *testing.T) {
 	if got := p.Class(); got != ClassMetered {
 		t.Fatalf("ForceClass(metered) → %v, want metered despite fast bandwidth", got)
 	}
-	if p.Readahead().Enabled {
-		t.Fatal("forced metered must disable readahead")
+	if got := p.Readahead(); !got.Enabled || got.Blocks != 1 || got.Workers != 1 {
+		t.Fatalf("forced metered must retain bounded readahead, got %+v", got)
 	}
 	p.ForceClass(nil)
 	if got := p.Class(); got != ClassFast {
 		t.Fatalf("after ForceClass(nil) → %v, want fast (auto resumes)", got)
+	}
+}
+
+func TestCeilingClassCapsOptimismButPreservesSlowerEvidence(t *testing.T) {
+	p := New()
+	sampleFor(p, 800*1024*1024, 8) // would be fast
+	ceiling := ClassSlow
+	p.CeilingClass(&ceiling)
+	if got := p.Class(); got != ClassSlow {
+		t.Fatalf("tunnel ceiling over fast evidence = %s, want slow", got)
+	}
+
+	forced := ClassMetered
+	p.ForceClass(&forced)
+	if got := p.Class(); got != ClassMetered {
+		t.Fatalf("forced metered under slow ceiling = %s, want metered", got)
+	}
+	p.ForceClass(nil)
+	p.CeilingClass(nil)
+	if got := p.Class(); got != ClassFast {
+		t.Fatalf("after clearing ceiling = %s, want fast passive evidence", got)
+	}
+}
+
+func TestNetworkCostClassDoesNotEraseExplicitForce(t *testing.T) {
+	p := New()
+	sampleFor(p, 800*1024*1024, 8) // automatic class would be fast
+
+	cost := ClassMetered
+	p.SetNetworkCostClass(&cost)
+	if got := p.Class(); got != ClassMetered {
+		t.Fatalf("host cost over fast evidence = %s, want metered", got)
+	}
+
+	forced := ClassSlow
+	p.ForceClass(&forced)
+	if got := p.Class(); got != ClassSlow {
+		t.Fatalf("explicit force under host cost = %s, want slow", got)
+	}
+
+	// A later non-expensive OS callback clears only the cost slot, not the
+	// operator's explicit setting.
+	p.SetNetworkCostClass(nil)
+	if got := p.Class(); got != ClassSlow {
+		t.Fatalf("clearing host cost erased explicit force: %s", got)
+	}
+
+	p.ForceClass(nil)
+	if got := p.Class(); got != ClassFast {
+		t.Fatalf("clearing explicit force did not resume passive evidence: %s", got)
+	}
+}
+
+func TestTransportChangePreservesNetworkCostClass(t *testing.T) {
+	p := New()
+	cost := ClassMetered
+	p.SetNetworkCostClass(&cost)
+	p.ObserveRTT(time.Millisecond)
+	sampleFor(p, 300*1024*1024, 4)
+	p.ResetForTransportChange()
+	if got := p.Class(); got != ClassMetered {
+		t.Fatalf("transport reset cleared host-cost class: %s", got)
+	}
+}
+
+func TestTransportChangeInvalidatesStaleMeasurements(t *testing.T) {
+	p := New()
+	p.ObserveRTT(180 * time.Millisecond)
+	sampleFor(p, 1.5*1024*1024, 6)
+	before := p.Snapshot()
+	if before.Class != ClassMetered || !before.HaveRTT || !before.HaveBW || before.ThroughputN == 0 {
+		t.Fatalf("precondition stale cellular profile = %+v", before)
+	}
+
+	p.ResetForTransportChange()
+	after := p.Snapshot()
+	if after.HaveRTT || after.HaveBW || after.ThroughputN != 0 || after.RTT != 0 || after.BytesPerSec != 0 {
+		t.Fatalf("transport reset retained prior-path measurements: %+v", after)
+	}
+	if after.Class != ClassMedium || after.BootstrappedRTT {
+		t.Fatalf("fresh transport class = %s boot=%v, want transition-safe medium/unbootstrapped",
+			after.Class, after.BootstrappedRTT)
+	}
+
+	// A fresh direct-LAN sample must immediately replace the old cellular RTT;
+	// it must not take many EWMA periods to decay from 180 ms.
+	p.ObserveRTT(500 * time.Microsecond)
+	if got := p.Snapshot(); got.Class != ClassFast || got.RTT != 500*time.Microsecond || !got.BootstrappedRTT {
+		t.Fatalf("fresh LAN sample after handoff = %+v, want fast 500us bootstrap", got)
+	}
+}
+
+func TestTransportChangePreservesForcedClass(t *testing.T) {
+	p := New()
+	forced := ClassMetered
+	p.ForceClass(&forced)
+	p.ObserveRTT(time.Millisecond)
+	sampleFor(p, 300*1024*1024, 4)
+	p.ResetForTransportChange()
+	if got := p.Class(); got != ClassMetered {
+		t.Fatalf("transport reset cleared explicit forced class: %s", got)
+	}
+}
+
+// TestSamplerObservabilityFloor pins the RATE CEILING the per-sample filter
+// imposes on each producer, and the fact that it differs between the two.
+//
+// A sample is folded in only when it moved >= minThroughputBytes (256 KiB) in
+// >= minThroughputDur (3 ms). That pair is a rate: a read faster than
+// bytes/3ms is DISCARDED as a cache hit before the aggregation window ever
+// sees it. The ceiling therefore depends on the read SIZE of the caller:
+//
+//   - nfs/handler.go cachedFile.ReadAt feeds one NFS subread at a time, and
+//     internal/nfs/nfs_onread.go subreadSize pins that at exactly 256 KiB.
+//     Ceiling: 256 KiB / 3 ms = ~85 MB/s. A link faster than that yields NO
+//     bandwidth sample from the main read path — and 85 MB/s sits inside the
+//     ClassMedium band (30-200 MB/s), so the handler path alone can never
+//     observe ClassFast.
+//   - nfs/readahead.go prefetchRange feeds 4 MiB blocks (readaheadBlockSize).
+//     Ceiling: 4 MiB / 3 ms = ~1365 MB/s. This is the ONLY producer that can
+//     ever register a fast-class link, which is why the 2026-08 baselines
+//     (560-1218 MB/s, class fast) exist at all.
+//
+// This is not asserted as desirable — it is asserted so a change to
+// subreadSize, readaheadBlockSize, or minThroughputDur cannot silently move
+// the range of links the estimator is able to see.
+func TestSamplerObservabilityFloor(t *testing.T) {
+	const (
+		nfsSubread  = 256 * 1024 // internal/nfs.subreadSize
+		prefetchBlk = 4 << 20    // nfs.readaheadBlockSize
+	)
+
+	// Handler path, link just above its ceiling: 256 KiB in 2ms (~128 MB/s).
+	p := New()
+	for i := 0; i < 100; i++ {
+		p.ObserveThroughput(nfsSubread, 2*time.Millisecond)
+	}
+	if p.Snapshot().HaveBW {
+		t.Fatal("256 KiB subreads faster than 3ms must not register — the handler " +
+			"path is blind above ~85 MB/s")
+	}
+
+	// Same link, prefetcher path: 4 MiB at the same 128 MB/s takes 32ms, well
+	// over the floor, so it IS observed.
+	q := New()
+	sampleFor(q, 128*1024*1024, 4)
+	if !q.Snapshot().HaveBW {
+		t.Fatal("4 MiB prefetch blocks at 128 MB/s must register")
+	}
+	if c := q.Class(); c != ClassMedium {
+		t.Fatalf("128 MB/s → %v, want medium", c)
+	}
+
+	// The handler path CAN see a slow link: 256 KiB at 20 MB/s takes ~12ms.
+	r := New()
+	c := &fakeClock{t: time.Unix(1_700_000_000, 0)}
+	r.now = c.now
+	dur := time.Duration(float64(nfsSubread) / (20 * 1024 * 1024) * float64(time.Second))
+	for i := 0; i < 200; i++ {
+		c.advance(dur)
+		r.ObserveThroughput(nfsSubread, dur)
+	}
+	if !r.Snapshot().HaveBW {
+		t.Fatal("256 KiB subreads on a 20 MB/s link must register")
+	}
+	if cl := r.Class(); cl != ClassSlow {
+		t.Fatalf("20 MB/s via 256 KiB subreads → %v, want slow", cl)
+	}
+	_ = prefetchBlk
+}
+
+// TestNoReadsMeansNoBandwidth documents the state the live control plane was
+// found in on 2026-08-18: uptime 5015s, rpc_total 5836, bytes_read 12288,
+// read_cold_subread 0, throughput_samples 0, have_bandwidth false, class
+// medium (bootstrapped from an 8.4ms RTT).
+//
+// Bandwidth is fed ONLY by file-data reads. Navigation (LOOKUP/GETATTR/
+// READDIR), writes, and drains contribute nothing. A session that browses and
+// writes but never reads file data therefore runs indefinitely on the RTT
+// bootstrap — this is not a broken sampler, it is a sampler with no input.
+func TestNoReadsMeansNoBandwidth(t *testing.T) {
+	p := New()
+	p.ObserveRTT(8400 * time.Microsecond) // the observed 8.4ms
+	s := p.Snapshot()
+	if !s.HaveRTT || s.HaveBW {
+		t.Fatalf("RTT-only profile: HaveRTT=%v HaveBW=%v, want true/false", s.HaveRTT, s.HaveBW)
+	}
+	if !s.BootstrappedRTT || s.Class != ClassMedium {
+		t.Fatalf("8.4ms RTT bootstrap → class=%v bootstrapped=%v, want medium/true",
+			s.Class, s.BootstrappedRTT)
+	}
+	// The one bandwidth sample this machine's real link ever recorded
+	// (2026-08-18T18:35, 104.0 MB/s) lands in the SAME class the bootstrap
+	// guessed — so on this link the half-observed class was not wrong.
+	sampleFor(p, 104*1024*1024, 4)
+	if c := p.Class(); c != ClassMedium {
+		t.Fatalf("104 MB/s measured → %v, want medium (same as the RTT bootstrap)", c)
 	}
 }

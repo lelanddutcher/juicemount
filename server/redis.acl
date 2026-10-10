@@ -1,0 +1,20 @@
+# JuiceMount metadata Redis ACL template (H-8B, plan section 1.6).
+#
+# The redis service renders this file at every start into
+# /run/jm-redis/users.acl, replacing each #@...@ placeholder with the sha256
+# of the secret. Plaintext secrets never appear in this file, in argv, or in
+# the rendered file.
+#
+#   default   off: no unauthenticated access at all.
+#   jm-proxy  the RESP proxy's upstream login. All commands, all keys and all
+#             channels: Redis 7 defaults to resetchannels, and the Mac's
+#             keyspace push (PSUBSCRIBE) passes through the proxy.
+#             Secret: JM_REDIS_PROXY_PASSWORD in server/.env.
+#   jm-admin  loopback only. Its secret is minted inside the Redis container
+#             at every start and never leaves it; use it with docker exec.
+#
+# Severity-3 rollback (rollout-compose.sh --proxy-rollback) appends one plain
+# user per proxy principal after these lines.
+user default off resetpass resetkeys resetchannels -@all
+user jm-proxy on #@JM_REDIS_PROXY_PASSWORD_SHA256@ ~* &* +@all
+user jm-admin on #@JM_ADMIN_LOOPBACK_SHA256@ ~* &* +@all

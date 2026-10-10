@@ -2,15 +2,15 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://juicemount.contract/v1/cache-status.schema.json",
   "title": "CacheStatus",
-  "description": "GET /cache-status — aggregate + per-root warm progress, live prefetcher state, capacity verdict, and in-flight scans. Grounded in origin/main (CacheStatus bridge/cbridge.go:2046). NORMALIZATION REQUIRED (JM-3): the inner aggregate/roots/live structs (pin.AggregateStats store.go:490, RootSummary store.go:440, LiveStats prefetcher.go:372) still carry NO json tags on main, so they marshal with capitalized Go field names. v1 specifies snake_case via added json tags; the fixtures are the TARGET (snake_case) form. capacity and scanning ALREADY carry snake_case tags and are always present.",
+  "description": "GET /cache-status — aggregate + per-root warm progress, live prefetcher state, capacity verdict, and in-flight scans. The RC bridge emits the normalized snake_case v1 form; capacity and scanning are always present.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["aggregate", "live", "offline_mode", "capacity", "scanning"],
+  "required": ["aggregate", "roots", "live", "offline_mode", "capacity", "scanning"],
   "properties": {
     "aggregate": { "$ref": "#/$defs/rootStats" },
     "roots": {
-      "type": ["array", "null"],
-      "description": "Per-pin-root summaries; null/absent when no pin roots.",
+      "type": "array",
+      "description": "Per-pin-root summaries; always an array, empty when no pin roots.",
       "items": {
         "allOf": [{ "$ref": "#/$defs/rootStats" }],
         "type": "object",
@@ -40,7 +40,7 @@
     "capacity": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["over_capacity", "pinned_bytes", "cache_capacity_bytes", "shortfall_bytes", "disk_free_bytes", "cache_usage_bytes", "computed_sec"],
+      "required": ["over_capacity", "pinned_bytes", "cache_capacity_bytes", "shortfall_bytes", "disk_free_bytes", "cache_usage_bytes", "cache_free_floor_bytes", "cache_budget_bytes", "computed_sec"],
       "description": "pin.CapacityVerdict (capacity.go:46) — always present, snake_case already.",
       "properties": {
         "over_capacity": { "type": "boolean" },
@@ -49,6 +49,8 @@
         "shortfall_bytes": { "type": "integer", "minimum": 0 },
         "disk_free_bytes": { "type": "integer", "minimum": 0 },
         "cache_usage_bytes": { "type": "integer", "minimum": 0 },
+        "cache_free_floor_bytes": { "type": "integer", "minimum": 0, "description": "Effective JuiceFS free-space eviction floor selected at mount time; clients use this instead of a hard-coded percentage when reporting cache suspension or pressure." },
+        "cache_budget_bytes": { "type": "integer", "minimum": 0, "description": "Configured JuiceFS cache-size budget, or 0 when unknown or unlimited." },
         "computed_sec": { "type": "integer", "description": "Unix seconds the verdict was computed." }
       }
     },

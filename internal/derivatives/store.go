@@ -24,6 +24,12 @@ import (
 
 // DerivRow is one derivative's manifest entry. Pointer fields are nullable on
 // the wire (omitted/serialized as null) per derivatives.schema.json.
+// ProvenanceSidecar marks a row reconstructed from a manifest.json on the
+// volume — i.e. from a file ANY volume writer can author. Rows carrying it are
+// still indexed (disaster recovery and thumbnail serving keep working) but are
+// never treated as authoritative about who produced them.
+const ProvenanceSidecar = "sidecar"
+
 type DerivRow struct {
 	Kind        string  `json:"kind"`
 	Status      string  `json:"status"`
@@ -42,6 +48,23 @@ type DerivRow struct {
 	// predate the columns + the closed-key conformance fixtures.
 	SourceSize  *int64 `json:"source_size,omitempty"`
 	SourceMtime *int64 `json:"source_mtime,omitempty"`
+	// Provenance is HOW this row entered the index, which is NOT the same
+	// question as what it CLAIMS about itself (`Producer`). It is local-only
+	// (json:"-") — never on the wire, never in the manifest, so it cannot be
+	// asserted by anyone outside this process.
+	//
+	// 2026-08-04 second adversarial review, CRITICAL: manifest.json lives on a
+	// consumer-writable volume, so `Producer` is attacker-chosen. A hand-written
+	// sidecar declaring producer:"linux-farm" both impersonated the farm and
+	// weaponised the register route's producer-precedence guard — every genuine
+	// on-device register for that (inode,kind) 409'd, locking the real farm out.
+	//
+	// The locator beats the identifier in the payload: security decisions key on
+	// Provenance (unforgeable — set by the code path that ingested the row), while
+	// Producer stays whatever the sidecar said so DR keeps its fidelity.
+	// "" == not from a sidecar, which is correct both for rows written directly by
+	// the farm/register route and for legacy rows predating the column.
+	Provenance string `json:"-"`
 	// Filmstrip is the sprite-sheet geometry (JM-16), present ONLY for
 	// kind=="filmstrip". Persisted in the row's kind-specific `extra` JSON
 	// column. omitempty so every other kind omits it on the wire.
@@ -58,6 +81,19 @@ type DerivRow struct {
 	Codec       *string `json:"codec,omitempty"`
 	CodecString *string `json:"codec_string,omitempty"`
 	BlobSize    *int64  `json:"blob_size,omitempty"`
+	// ARTIFACT DESCRIPTORS (2026-08-04). Pixel dimensions and bitrate let a
+	// server rank a contributed artifact WITHOUT decoding it, so a cheap one can
+	// be earmarked for upgrade by a more capable node or the farm. Present for
+	// thumbnail/proxy/audio_proxy/filmstrip only; `dim` is embedding
+	// dimensionality and is a different thing entirely.
+	//
+	// Stored in the same kind-scoped `extra` JSON column as Filmstrip/Codec — no
+	// SQL migration. NOTE: anything added here must ALSO be re-hydrated in
+	// decodeExtra for its kinds, or the row cannot round-trip and the reconcile's
+	// unchanged-row skip re-publishes it on every sweep forever.
+	Width      *int   `json:"width,omitempty"`
+	Height     *int   `json:"height,omitempty"`
+	BitrateBPS *int64 `json:"bitrate_bps,omitempty"`
 }
 
 // FilmstripGeo is the sprite-sheet geometry a scrubber needs to map a time to a
@@ -147,7 +183,7 @@ func Open(dbPath string) (*Store, error) {
 	}
 	// Migration: source_size / source_mtime (consumer read-gate). Same
 	// duplicate-column-is-fine pattern as `extra`.
-	for _, col := range []string{"source_size INTEGER", "source_mtime INTEGER"} {
+	for _, col := range []string{"source_size INTEGER", "source_mtime INTEGER", "provenance TEXT"} {
 		if _, err := db.Exec(`ALTER TABLE derivatives ADD COLUMN ` + col); err != nil && !strings.Contains(err.Error(), "duplicate column") {
 			db.Close()
 			return nil, fmt.Errorf("derivatives: migrate %s: %w", col, err)
@@ -181,12 +217,44 @@ func (s *Store) Known(inode uint64) (bool, *string) {
 	return true, nil
 }
 
+// ListKnownInodes returns every inode the store has a source row for, ascending.
+//
+// For the JM-15 sidecar BACKFILL: assets generated before the sidecar emit
+// worked have blobs on the volume and rows in this store, but no
+// manifest.json — so the consumer's reconcile refuses them as "not indexed"
+// and the whole existing corpus is invisible to it. Re-emitting a manifest is
+// a pure store-to-JSON write; it re-encodes nothing, which is what makes a
+// backfill of the entire volume cheap enough to just run.
+//
+// Returns the full set rather than a page: the corpus is tens of thousands of
+// rows, not millions, and a caller that wants to bound the work can slice it.
+func (s *Store) ListKnownInodes() ([]uint64, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	rows, err := s.db.Query(`SELECT inode FROM source_assets ORDER BY inode`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []uint64
+	for rows.Next() {
+		var ino int64
+		if err := rows.Scan(&ino); err != nil {
+			return nil, err
+		}
+		if ino > 0 {
+			out = append(out, uint64(ino))
+		}
+	}
+	return out, rows.Err()
+}
+
 // Manifest returns the derivative rows for an asset (nil slice if none).
 func (s *Store) Manifest(inode uint64) ([]DerivRow, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	rows, err := s.db.Query(`
-		SELECT kind, status, producer, version, hash, blob_rel_path, media_type, model, dim, updated_at, extra, source_size, source_mtime
+		SELECT kind, status, producer, version, hash, blob_rel_path, media_type, model, dim, updated_at, extra, source_size, source_mtime, provenance
 		FROM derivatives WHERE inode = ? ORDER BY kind`, int64(inode))
 	if err != nil {
 		return nil, err
@@ -195,11 +263,12 @@ func (s *Store) Manifest(inode uint64) ([]DerivRow, error) {
 	var out []DerivRow
 	for rows.Next() {
 		var d DerivRow
-		var hash, blob, mt, model, extra sql.NullString
+		var hash, blob, mt, model, extra, prov sql.NullString
 		var dim, srcSize, srcMtime sql.NullInt64
-		if err := rows.Scan(&d.Kind, &d.Status, &d.Producer, &d.Version, &hash, &blob, &mt, &model, &dim, &d.UpdatedAt, &extra, &srcSize, &srcMtime); err != nil {
+		if err := rows.Scan(&d.Kind, &d.Status, &d.Producer, &d.Version, &hash, &blob, &mt, &model, &dim, &d.UpdatedAt, &extra, &srcSize, &srcMtime, &prov); err != nil {
 			return nil, err
 		}
+		d.Provenance = prov.String
 		d.Hash = nullStr(hash)
 		d.BlobRelPath = nullStr(blob)
 		d.MediaType = nullStr(mt)
@@ -263,16 +332,16 @@ func (s *Store) PutDeriv(inode uint64, d DerivRow) error {
 		d.UpdatedAt = time.Now().Unix()
 	}
 	_, err := s.db.Exec(`
-		INSERT INTO derivatives (inode, kind, status, producer, version, hash, blob_rel_path, media_type, model, dim, updated_at, extra, source_size, source_mtime)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+		INSERT INTO derivatives (inode, kind, status, producer, version, hash, blob_rel_path, media_type, model, dim, updated_at, extra, source_size, source_mtime, provenance)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(inode, kind) DO UPDATE SET
 		    status=excluded.status, producer=excluded.producer, version=excluded.version,
 		    hash=excluded.hash, blob_rel_path=excluded.blob_rel_path, media_type=excluded.media_type,
 		    model=excluded.model, dim=excluded.dim, updated_at=excluded.updated_at, extra=excluded.extra,
-		    source_size=excluded.source_size, source_mtime=excluded.source_mtime`,
+		    source_size=excluded.source_size, source_mtime=excluded.source_mtime, provenance=excluded.provenance`,
 		int64(inode), d.Kind, d.Status, d.Producer, d.Version, strOrNil(d.Hash),
 		strOrNil(d.BlobRelPath), strOrNil(d.MediaType), strOrNil(d.Model), intOrNil(d.Dim), d.UpdatedAt, extraJSON(d),
-		int64OrNil(d.SourceSize), int64OrNil(d.SourceMtime))
+		int64OrNil(d.SourceSize), int64OrNil(d.SourceMtime), d.Provenance)
 	return err
 }
 
@@ -373,6 +442,40 @@ func (s *Store) ListProxyRows() ([]ProxyRow, error) {
 	return out, rows.Err()
 }
 
+// ListAccessBenchmarkInodes returns recent, sufficiently large source assets
+// that still have derivative provenance. A worker can reverse-resolve one of
+// these JuiceFS inodes without recursively walking a production volume merely
+// to find a representative file for its mount-access benchmark.
+func (s *Store) ListAccessBenchmarkInodes(limit int) ([]uint64, error) {
+	if limit <= 0 {
+		return []uint64{}, nil
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	rows, err := s.db.Query(`
+		SELECT inode
+		FROM derivatives
+		WHERE source_size >= ?
+		GROUP BY inode
+		ORDER BY MAX(updated_at) DESC
+		LIMIT ?`, int64(4<<20), limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]uint64, 0, limit)
+	for rows.Next() {
+		var inode int64
+		if err := rows.Scan(&inode); err != nil {
+			return nil, err
+		}
+		if inode > 0 {
+			out = append(out, uint64(inode))
+		}
+	}
+	return out, rows.Err()
+}
+
 // ChangeRow is one entry in the /derivatives/changes delta feed.
 type ChangeRow struct {
 	Inode     uint64  `json:"inode"`
@@ -463,16 +566,16 @@ func (s *Store) IngestTech(inode uint64, hash *string, producer string, version 
 		if ts == 0 {
 			ts = now
 		}
-		if _, err := tx.Exec(`INSERT INTO derivatives (inode, kind, status, producer, version, hash, blob_rel_path, media_type, model, dim, updated_at, extra, source_size, source_mtime)
-			VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+		if _, err := tx.Exec(`INSERT INTO derivatives (inode, kind, status, producer, version, hash, blob_rel_path, media_type, model, dim, updated_at, extra, source_size, source_mtime, provenance)
+			VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 			ON CONFLICT(inode, kind) DO UPDATE SET
 				status=excluded.status, producer=excluded.producer, version=excluded.version,
 				hash=excluded.hash, blob_rel_path=excluded.blob_rel_path, media_type=excluded.media_type,
 				model=excluded.model, dim=excluded.dim, updated_at=excluded.updated_at, extra=excluded.extra,
-				source_size=excluded.source_size, source_mtime=excluded.source_mtime`,
+				source_size=excluded.source_size, source_mtime=excluded.source_mtime, provenance=excluded.provenance`,
 			int64(inode), d.Kind, d.Status, d.Producer, d.Version, strOrNil(d.Hash),
 			strOrNil(d.BlobRelPath), strOrNil(d.MediaType), strOrNil(d.Model), intOrNil(d.Dim), ts, extraJSON(d),
-			int64OrNil(d.SourceSize), int64OrNil(d.SourceMtime)); err != nil {
+			int64OrNil(d.SourceSize), int64OrNil(d.SourceMtime), d.Provenance); err != nil {
 			return err
 		}
 	}
@@ -515,7 +618,20 @@ type extraEnvelope struct {
 	Codec       *string       `json:"codec,omitempty"`
 	CodecString *string       `json:"codec_string,omitempty"`
 	BlobSize    *int64        `json:"blob_size,omitempty"`
+	Width       *int          `json:"width,omitempty"`
+	Height      *int          `json:"height,omitempty"`
+	BitrateBPS  *int64        `json:"bitrate_bps,omitempty"`
 }
+
+// dimensionedKinds are the kinds for which pixel width/height are meaningful.
+// decodeExtra MUST re-hydrate for exactly this set — persisting a field for a
+// kind that does not read it back is the never-round-trips bug that made the
+// reconcile re-publish a row on every sweep forever.
+func dimensionedKind(kind string) bool {
+	return kind == "thumbnail" || kind == "proxy" || kind == "audio_proxy" || kind == "filmstrip"
+}
+
+func proxyKind(kind string) bool { return kind == "proxy" || kind == "audio_proxy" }
 
 // extraJSON serializes a row's kind-specific sub-object into the `extra` column.
 // Filmstrip geometry (JM-16) or the proxy-codec triple (#50); nil (NULL column)
@@ -530,6 +646,10 @@ func extraJSON(d DerivRow) any {
 	}
 	if d.Codec != nil || d.CodecString != nil || d.BlobSize != nil {
 		env.Codec, env.CodecString, env.BlobSize = d.Codec, d.CodecString, d.BlobSize
+		has = true
+	}
+	if d.Width != nil || d.Height != nil || d.BitrateBPS != nil {
+		env.Width, env.Height, env.BitrateBPS = d.Width, d.Height, d.BitrateBPS
 		has = true
 	}
 	if !has {
@@ -552,12 +672,22 @@ func decodeExtra(d *DerivRow, extra sql.NullString) {
 	}
 	var env extraEnvelope
 	if json.Unmarshal([]byte(extra.String), &env) == nil &&
-		(env.Filmstrip != nil || env.Codec != nil || env.CodecString != nil || env.BlobSize != nil) {
+		(env.Filmstrip != nil || env.Codec != nil || env.CodecString != nil || env.BlobSize != nil ||
+			env.Width != nil || env.Height != nil || env.BitrateBPS != nil) {
 		if d.Kind == "filmstrip" {
 			d.Filmstrip = env.Filmstrip
 		}
-		if d.Kind == "proxy" {
+		// audio_proxy carries the same codec envelope as proxy (A8: a small
+		// streamable stereo-AAC MP4). Re-hydrating for only one of them meant an
+		// audio_proxy row was persisted WITH these fields and read back WITHOUT
+		// them, so it could never round-trip — and the reconcile's unchanged-row
+		// skip therefore re-published it on every sweep, forever.
+		if proxyKind(d.Kind) {
 			d.Codec, d.CodecString, d.BlobSize = env.Codec, env.CodecString, env.BlobSize
+			d.BitrateBPS = env.BitrateBPS
+		}
+		if dimensionedKind(d.Kind) {
+			d.Width, d.Height = env.Width, env.Height
 		}
 		return
 	}

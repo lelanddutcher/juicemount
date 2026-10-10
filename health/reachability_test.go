@@ -3,6 +3,7 @@ package health
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -18,6 +19,9 @@ type fakeDialer struct {
 	mu        sync.Mutex
 	reachable bool
 	attempts  atomic.Int64
+	// silent models a middlebox that accepts the TCP connection but is not
+	// actually the backend — it never sends a RESP reply.
+	silent bool
 }
 
 func (f *fakeDialer) setReachable(v bool) {
@@ -38,9 +42,33 @@ func (f *fakeDialer) DialContext(ctx context.Context, network, address string) (
 		time.Sleep(5 * time.Millisecond)
 		return nil, &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("no route to host")}
 	}
-	// Return a closeable null conn. Cheap mock.
-	left, _ := net.Pipe()
-	return left, nil
+	// Return a conn that behaves like a LIVE Redis: the probe now requires a
+	// protocol-level answer (any RESP reply), not just a completed handshake,
+	// so a mock that never speaks would be — correctly — "unreachable".
+	return respondingPipe(f.silent), nil
+}
+
+// respondingPipe returns one end of a pipe whose peer answers any request with
+// "+PONG\r\n" (a live Redis). With silent=true the peer accepts the connection
+// and then says NOTHING — modelling the carrier NAT / middlebox that completes
+// a TCP handshake for an address it cannot actually route to. That false
+// "reachable" is what wrongly lifted auto-offline on a hotspot.
+func respondingPipe(silent bool) net.Conn {
+	left, right := net.Pipe()
+	go func() {
+		defer right.Close()
+		buf := make([]byte, 64)
+		if _, err := right.Read(buf); err != nil {
+			return
+		}
+		if silent {
+			// Hold the connection open, answer nothing.
+			time.Sleep(2 * time.Second)
+			return
+		}
+		_, _ = right.Write([]byte("+PONG\r\n"))
+	}()
+	return left
 }
 
 // TestReachability_InitialStateIsReachable verifies the monitor is
@@ -122,6 +150,13 @@ func TestReachability_RecoveryAfterFailure(t *testing.T) {
 	if err := waitFor(200*time.Millisecond, func() bool { return r.Reachable() }); err != nil {
 		t.Fatalf("recovery transition didn't fire: %v", err)
 	}
+	if err := waitFor(200*time.Millisecond, func() bool {
+		statesMu.Lock()
+		defer statesMu.Unlock()
+		return len(states) == 2
+	}); err != nil {
+		t.Fatalf("recovery callbacks didn't arrive: %v", err)
+	}
 
 	statesMu.Lock()
 	defer statesMu.Unlock()
@@ -130,6 +165,59 @@ func TestReachability_RecoveryAfterFailure(t *testing.T) {
 	}
 	if states[0] || !states[1] {
 		t.Errorf("expected transitions [false, true], got %v", states)
+	}
+}
+
+func TestReachabilityCallbacksPreserveTransitionOrder(t *testing.T) {
+	d := &fakeDialer{reachable: false}
+	r := NewReachability("ignored:0",
+		withDialer(d),
+		WithBaseInterval(10*time.Second),
+		WithFailureThreshold(1),
+		WithSuccessThreshold(1),
+	)
+	var states []bool
+	var mu sync.Mutex
+	firstEntered := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	r.OnChange(func(reachable bool, _ string) {
+		if !reachable {
+			close(firstEntered)
+			<-releaseFirst
+		}
+		mu.Lock()
+		states = append(states, reachable)
+		mu.Unlock()
+	})
+
+	r.Start()
+	defer r.Stop()
+	select {
+	case <-firstEntered:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("offline callback did not start")
+	}
+
+	// Recover while the offline callback is deliberately parked. The probe and
+	// state machine must advance, but the online callback must remain ordered
+	// behind the offline callback.
+	d.setReachable(true)
+	r.Notify()
+	if err := waitFor(500*time.Millisecond, r.Reachable); err != nil {
+		t.Fatalf("slow callback parked reachability recovery: %v", err)
+	}
+	close(releaseFirst)
+	if err := waitFor(500*time.Millisecond, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(states) == 2
+	}); err != nil {
+		t.Fatalf("ordered callbacks did not drain: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if states[0] || !states[1] {
+		t.Fatalf("callback order = %v, want [false true]", states)
 	}
 }
 
@@ -321,6 +409,20 @@ func TestReachabilityAdaptiveDialTimeout(t *testing.T) {
 	}
 }
 
+func TestReachabilityInitialRTTBreaksColdWANBootstrapLoop(t *testing.T) {
+	r := NewReachability("127.0.0.1:1", WithInitialRTT(800*time.Millisecond))
+	got := r.effectiveDialTimeout()
+	// First observation sets srtt=800ms, rttvar=400ms, so the RFC-6298-style
+	// 2*srtt+4*rttvar budget is 3.2s: enough for handshake + protocol PING.
+	if got < 3*time.Second {
+		t.Fatalf("effectiveDialTimeout = %v, want >= 3s for an 800ms cold path", got)
+	}
+	lan := NewReachability("127.0.0.1:1", WithInitialRTT(5*time.Millisecond))
+	if got := lan.effectiveDialTimeout(); got != lan.dialTimeout {
+		t.Fatalf("LAN seed changed timeout: got %v want floor %v", got, lan.dialTimeout)
+	}
+}
+
 // TestReachability_DrainLivenessSuppressesFalseFlap is the fix-(a) gate for the
 // NFSv3-sprint slow-link false-flap. When a Finder copy saturates the uplink,
 // the drainer's bulk PUT traffic queues a cold probe SYN past its dial timeout —
@@ -466,5 +568,71 @@ func TestReachability_DrainLivenessKillSwitchByteIdentical(t *testing.T) {
 	}
 	if hookCalls.Load() != 0 {
 		t.Errorf("override disabled but liveness hook was consulted %d time(s) — must be byte-identical (never called)", hookCalls.Load())
+	}
+}
+
+// TestReachability_MiddleboxHandshakeIsNotReachable is the regression test for
+// the bug that produced the user-reported symptom.
+//
+// Observed live 2026-07-29 on an iPhone hotspot, where the NAS (192.168.0.x) is
+// genuinely unroutable: the probe's bare TCP dial SUCCEEDED — carrier NAT
+// answered the SYN — so the monitor logged "reachability transition →
+// reachable" and lifted auto-offline, while a real Redis PING to that same
+// address timed out and ping(8) reported 100% packet loss.
+//
+// Lifting auto-offline on that false signal leaves the app ONLINE WITH A DEAD
+// BACKEND, which is worse than either honest state: navigation still feels fine
+// (the mirror serves it, ~25ms) but the FIRST open of every file walks the full
+// timeout stack before falling back to locally cached blocks — measured 1,527ms
+// / 6,250ms / 28,150ms for 32 KB, versus 24-36ms for later reads of the same
+// file. Hence "offline mode is amazing, but with offline mode disabled
+// performance is absolute trash and even my pinned files struggle".
+//
+// A completed handshake must NOT count as reachable.
+func TestReachability_MiddleboxHandshakeIsNotReachable(t *testing.T) {
+	d := &fakeDialer{reachable: true, silent: true} // connects, never answers
+	r := NewReachability("ignored:0",
+		WithBaseInterval(20*time.Millisecond),
+		WithDialTimeout(150*time.Millisecond),
+		WithFailureThreshold(2),
+		withDialer(d),
+	)
+	r.Start()
+	defer r.Stop()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if !r.Reachable() {
+			return // correctly refused to call a silent middlebox "reachable"
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("a TCP handshake with no RESP reply was treated as REACHABLE — " +
+		"this lifts auto-offline against a dead backend and reintroduces the " +
+		"multi-second first-open stall on cellular")
+}
+
+func TestWithDialContextUsesFarSideDialerAndRequiresRESP(t *testing.T) {
+	var gotNetwork, gotAddress string
+	r := NewReachability("nas.private:6379", WithDialContext(func(_ context.Context, network, address string) (net.Conn, error) {
+		gotNetwork, gotAddress = network, address
+		client, server := net.Pipe()
+		go func() {
+			defer server.Close()
+			request := make([]byte, len("PING\r\n"))
+			if _, err := io.ReadFull(server, request); err != nil {
+				return
+			}
+			if string(request) == "PING\r\n" {
+				_, _ = server.Write([]byte("+PONG\r\n"))
+			}
+		}()
+		return client, nil
+	}))
+	if !r.probe() {
+		t.Fatal("far-side Redis PING through custom dialer was not accepted")
+	}
+	if gotNetwork != "tcp" || gotAddress != "nas.private:6379" {
+		t.Fatalf("custom dialer received (%q, %q)", gotNetwork, gotAddress)
 	}
 }

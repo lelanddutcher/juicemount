@@ -59,9 +59,13 @@ detect mount (signature) ──► GET /health (confirm live JuiceMount)
 The canonical vocabulary — the **only** tokens that may appear in `capabilities`:
 
 `health`, `whoami`, `residency`, `lookup`, `cache-status`, `offline`, `spool`, `activity`, `pin`, `unpin`,
-`self-test`, `verify-pins`, `metrics`, `derivatives`, `metadata`, `contribute`, `changes`, `assertions`, `blob`.
+`self-test`, `verify-pins`, `metrics`, `derivatives`, `derivatives-batch`, `metadata`, `contribute`,
+`contribute-derivatives`, `changes`, `assertions`, `blob`.
 
 (`derivatives` + `metadata` are the JM-14 shared-derivative-platform reads — GUI-only, like residency/lookup.)
+
+(`derivatives-batch` means the GUI serves `POST /derivatives/batch` for a bounded bulk manifest query. It is
+derived from that route, not from the single-inode `/derivatives` route.)
 
 (`blob` is the PROXY-CODEC byte-range blob delivery — `GET /blob?inode=N&kind=proxy` (PROXY_CODEC_SPEC §JuiceMount
 ratification §3). GUI-only. Streams a derivative blob (proxy.mp4 etc.) with `Accept-Ranges: bytes`, answers `Range`
@@ -70,7 +74,7 @@ with `206 Partial Content` (`Content-Range`/`Content-Length`), `Content-Type` fr
 path == the token.)
 
 (`assertions` is the JM-ASSERT portable-human-metadata channel — `POST`/`GET /assertions` (ASSERTIONS_SIDECAR.md).
-GUI-only. POST writes the `<media>.loupe.json` sidecar (the source of truth — atomic, LWW, merge-not-clobber) +
+GUI-only. POST writes the `<media>.logger.json` sidecar (legacy `.loupe.json` still read) (the source of truth — atomic, LWW, merge-not-clobber) +
 upserts JuiceMount's rebuildable, content-hash-`asset_key`-keyed Tier-B index; GET reads the resolved set by
 `asset_key`, or by `inode`/`path` resolved to `asset_key`. The route path == the token.)
 

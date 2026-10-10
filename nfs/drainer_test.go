@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -20,7 +21,22 @@ import (
 // in that temp dir.
 func newTestDrainer(t *testing.T, cfg DrainerConfig) (*SpoolStore, *Drainer) {
 	t.Helper()
-	spool := newTestSpoolStore(t, 0)
+	store, err := metadata.Open(filepath.Join(t.TempDir(), "meta.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if err := metadata.InitSpoolSchema(store.DB()); err != nil {
+		t.Fatal(err)
+	}
+	meta := metadata.NewSpoolStore(store.DB())
+	spool, err := NewSpoolStore(t.TempDir(), 0, meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spool.capCeiling.Store(int64(1) << 50)
+	spool.diskAvailAt.Store(time.Now().UnixNano())
+	store.SetSpoolStore(meta)
 	fuseRoot := t.TempDir()
 	cfg.FuseRoot = fuseRoot
 	// Fast backoff for tests.
@@ -34,6 +50,18 @@ func newTestDrainer(t *testing.T, cfg DrainerConfig) (*SpoolStore, *Drainer) {
 	if err != nil {
 		t.Fatalf("new drainer: %v", err)
 	}
+	// These copy/lifecycle unit tests write directly to the spool without an
+	// NFS CREATE. Supply its missing fixture mirror before exercising the real
+	// transaction. Cancellation/ownership tests use production-wired handlers
+	// and never this fixture publisher.
+	d.SetOnDrainCommit(func(item metadata.DrainCommitItem) (metadata.DrainCommitResult, error) {
+		if store.LookupByPath(item.NFSPath) == nil {
+			if err := store.Insert(metadata.MakeEntry(item.NFSPath, false, 0, time.Now(), uint64(item.SpoolID))); err != nil {
+				return metadata.DrainCommitResult{}, err
+			}
+		}
+		return store.DrainComplete(item)
+	})
 	return spool, d
 }
 
@@ -106,6 +134,34 @@ func TestDrainerHappyPath(t *testing.T) {
 	}
 }
 
+// TestDrainerReplacesReadOnlyRegularDestination was removed with
+// retryCreateAfterPermission (H-8): replacing a read-only destination required
+// deleting it first. See TestDrainPermissionCaseNeverRemovesReadOnlyDestination.
+
+// The former permission retry removed and recreated dest; os.Create also
+// wrote THROUGH a symlink at dest into its target. The stage install replaces
+// the directory entry and never opens dest, so a symlink target is untouched.
+func TestDrainNeverWritesThroughDestinationSymlink(t *testing.T) {
+	spool, d := newTestDrainer(t, DrainerConfig{})
+	target := filepath.Join(t.TempDir(), "target")
+	if err := os.WriteFile(target, []byte("keep-me"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(d.fuseRoot, "destination")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	writeSpoolEntry(t, spool, "/destination", []byte("drained-bytes"))
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if n := d.DrainOnceForTest(ctx); n != 1 {
+		t.Fatalf("processed=%d, want 1", n)
+	}
+	if got, err := os.ReadFile(target); err != nil || string(got) != "keep-me" {
+		t.Fatalf("symlink target changed: %q err=%v", got, err)
+	}
+}
+
 // TestDrainerLastDrainSuccessStamp is the fix-(a) producer-side gate (task #66
 // salvage): the drainer must stamp LastDrainSuccess ONLY on a COMPLETED drain
 // (a real MinIO PUT landed and the row was marked done) — never before. The
@@ -146,7 +202,12 @@ func TestDrainerLastDrainSuccessStamp(t *testing.T) {
 }
 
 func TestDrainerWorkerPoolBounded(t *testing.T) {
-	spool, d := newTestDrainer(t, DrainerConfig{Workers: 2})
+	// SmallWorkers: -1 disables the small-row lane, so this keeps testing what
+	// it always tested: the MEDIA lane honours Workers. Without it the 1-byte
+	// entries below would take the small lane and peak at Workers+SmallWorkers,
+	// which is the new bound and is asserted separately in
+	// TestDrainerTotalConcurrencyIsMediaPlusSmall.
+	spool, d := newTestDrainer(t, DrainerConfig{Workers: 2, SmallWorkers: -1})
 
 	// 8 entries, but only 2 workers should be active concurrently.
 	for i := 0; i < 8; i++ {
@@ -444,8 +505,12 @@ func TestDrainerStopWaitsForInFlight(t *testing.T) {
 	}
 
 	d.Start()
-	// Give the dispatcher a moment to claim work.
-	time.Sleep(50 * time.Millisecond)
+	// Wait until the dispatcher has claimed work. A fixed 50ms sleep flaked
+	// under -race at base (2/40) when no drain had started before Stop.
+	deadline := time.Now().Add(5 * time.Second)
+	for d.Metrics().DrainsAttempted.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
 
 	if !d.Stop(2 * time.Second) {
 		t.Errorf("Stop should have completed within deadline")
@@ -466,6 +531,72 @@ func TestDrainerStopIdempotent(t *testing.T) {
 	}
 	if !d.Stop(1 * time.Second) {
 		t.Errorf("second Stop should also return true (no-op)")
+	}
+}
+
+func TestDrainerStopDeadlineIncludesBlockedDispatcher(t *testing.T) {
+	t.Setenv("JM_DRAIN_BATCH_INSERT", "1")
+	_, d := newTestDrainer(t, DrainerConfig{})
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
+	// A pending batch without a timer makes the dispatcher the only possible
+	// caller of this flush. No worker needs to be running for Stop to block.
+	d.batch.pending = []pendingDrain{{row: &metadata.SpoolRow{ID: 1}}}
+	d.SetOnBatchDrainComplete(func([]metadata.DrainCommitItem) ([]metadata.DrainCommitResult, error) {
+		close(entered)
+		<-release
+		return []metadata.DrainCommitResult{{SpoolID: 1, Done: false}}, nil
+	})
+	d.Start()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("dispatcher did not enter batch flush")
+	}
+	start := time.Now()
+	if d.Stop(30 * time.Millisecond) {
+		t.Fatal("Stop claimed success while dispatcher was blocked")
+	}
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("Stop exceeded dispatcher deadline: %s", elapsed)
+	}
+	if d.Stop(0) {
+		t.Fatal("repeated Stop claimed success while dispatcher was blocked")
+	}
+	releaseOnce.Do(func() { close(release) })
+	if !d.Stop(time.Second) {
+		t.Fatal("Stop did not observe dispatcher completion after release")
+	}
+}
+
+func TestDrainerStopDeadlineIncludesBlockedWorker(t *testing.T) {
+	spool, d := newTestDrainer(t, DrainerConfig{})
+	writeSpoolEntry(t, spool, "/blocked-worker.bin", []byte("durable bytes"))
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
+	d.SetOnSizeReady(func(string, int64, time.Time) {
+		close(entered)
+		<-release
+	})
+	d.Start()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("worker did not enter size publish")
+	}
+	if d.Stop(30 * time.Millisecond) {
+		t.Fatal("Stop claimed success while worker was blocked")
+	}
+	if d.Stop(0) {
+		t.Fatal("repeated Stop claimed success while worker was blocked")
+	}
+	releaseOnce.Do(func() { close(release) })
+	if !d.Stop(time.Second) {
+		t.Fatal("Stop did not observe worker completion after release")
 	}
 }
 

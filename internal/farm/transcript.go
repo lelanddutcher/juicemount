@@ -1,10 +1,11 @@
 package farm
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -21,11 +22,68 @@ import (
 // (unlike OL-1's on-device push, which uses the size/mtime gate). ---
 
 type LoupeJSON struct {
-	LoupeVersion  int        `json:"loupe_version"`
-	SchemaVersion string     `json:"schema_version"`
-	IndexedAt     string     `json:"indexed_at"` // ISO8601 / RFC3339
-	Media         LoupeMedia `json:"media"`
-	AI            *LoupeAI   `json:"ai,omitempty"`
+	// LoggerVersion is the envelope version. WIRE-TERM CUTOVER (2026-08-03,
+	// CONSUMER_STATUS 07-18 §2, founder-acked): the key on the wire is now
+	// `logger_version`. omitempty because EXACTLY ONE of the two version keys is
+	// emitted — see SetVersionKeyForBlob.
+	LoggerVersion int `json:"logger_version,omitempty"`
+	// LegacyLoupeVersion carries the pre-cutover `loupe_version` key on READ
+	// only — `omitempty` plus the normalization in UnmarshalJSON means we never
+	// emit it. Kept indefinitely: the old name is still accepted on both sides
+	// and is not scheduled for removal without a further coordinated step.
+	LegacyLoupeVersion int        `json:"loupe_version,omitempty"`
+	SchemaVersion      string     `json:"schema_version"`
+	IndexedAt          string     `json:"indexed_at"` // ISO8601 / RFC3339
+	Media              LoupeMedia `json:"media"`
+	AI                 *LoupeAI   `json:"ai,omitempty"`
+}
+
+// UnmarshalJSON folds the legacy `loupe_version` key into LoggerVersion so every
+// reader downstream only ever consults LoggerVersion. Exactly one of the two
+// keys is present in practice; if both appear, the new name wins.
+func (l *LoupeJSON) UnmarshalJSON(b []byte) error {
+	type alias LoupeJSON // avoid recursing into this method
+	var a alias
+	if err := json.Unmarshal(b, &a); err != nil {
+		return err
+	}
+	if a.LoggerVersion == 0 && a.LegacyLoupeVersion != 0 {
+		a.LoggerVersion = a.LegacyLoupeVersion
+	}
+	a.LegacyLoupeVersion = 0 // normalize: readers consult LoggerVersion only
+	*l = LoupeJSON(a)
+	return nil
+}
+
+// SetVersionKeyForBlob makes the envelope's version KEY agree with the blob's
+// FILENAME, and must be called immediately before writing.
+//
+// WHY (2026-08-03 audit, HIGH). AIBlobWriteName deliberately keeps writing to a
+// legacy-named `ai.loupe.json` when that is the only blob present, so a
+// pre-cutover reader is not left on a stale file. But the envelope emitted
+// `logger_version` unconditionally, so that write kept the old NAME while
+// flipping the KEY inside — and a consumer that decodes only `loupe_version`
+// (shipped ClipLogger v0.9.3 does exactly that) would stop reading a file it had
+// been reading fine. The consume path wraps the decode in `try?`, so it would
+// have gone dark silently rather than erroring. There are ~2,000 such blobs in
+// the field.
+//
+// Rule: legacy filename => legacy key; post-cutover filename => new key. The
+// schema requires exactly one of the two (anyOf), and both are omitempty, so
+// whichever we zero simply does not appear.
+func (l *LoupeJSON) SetVersionKeyForBlob(blobName string) {
+	v := l.LoggerVersion
+	if v == 0 {
+		v = l.LegacyLoupeVersion
+	}
+	if v == 0 {
+		v = 1
+	}
+	if blobName == derivatives.AIBlobNameLegacy {
+		l.LegacyLoupeVersion, l.LoggerVersion = v, 0
+		return
+	}
+	l.LoggerVersion, l.LegacyLoupeVersion = v, 0
 }
 
 // LoupeMedia is the FULL tech block. Per AI_DELIVERY_SPEC Rule B, OpenLoupe's
@@ -101,6 +159,18 @@ type whisperJSON struct {
 // across lanes (no Apple framework). Returns (nil, nil) when the clip has no
 // audio or no speech.
 func Transcribe(ffmpegBin, whisperBin, modelPath, srcPath string) (*LoupeTranscript, error) {
+	return TranscribeDeviceContext(context.Background(), ffmpegBin, whisperBin, modelPath, "", srcPath)
+}
+
+// TranscribeDevice is Transcribe with a whisper.cpp backend override ("" = the
+// binary's default CPU path; "vulkan"/"cuda"/"sycl" use GPU device index 0 in
+// a binary compiled for that backend). Kept as a separate entry point so existing
+// callers (one-shot sweeps, tests) stay source-compatible.
+func TranscribeDevice(ffmpegBin, whisperBin, modelPath, device, srcPath string) (*LoupeTranscript, error) {
+	return TranscribeDeviceContext(context.Background(), ffmpegBin, whisperBin, modelPath, device, srcPath)
+}
+
+func TranscribeDeviceContext(ctx context.Context, ffmpegBin, whisperBin, modelPath, device, srcPath string) (*LoupeTranscript, error) {
 	if ffmpegBin == "" {
 		ffmpegBin = "ffmpeg"
 	}
@@ -121,7 +191,7 @@ func Transcribe(ffmpegBin, whisperBin, modelPath, srcPath string) (*LoupeTranscr
 	// required input). Folding every stream — not just 0:a:0 — is the silent-data-
 	// loss fix (audioFoldArgs): on multi-mono camera clips the first stream is
 	// often the dead mic, so a:0-only transcribed pure silence.
-	foldArgs, hasAudio, ferr := audioFoldArgs(ffmpegBin, srcPath, 16000)
+	foldArgs, hasAudio, ferr := audioFoldArgsContext(ctx, ffmpegBin, srcPath, 16000)
 	if ferr != nil {
 		return nil, fmt.Errorf("transcribe: probe audio %q: %w", srcPath, ferr)
 	}
@@ -130,7 +200,7 @@ func Transcribe(ffmpegBin, whisperBin, modelPath, srcPath string) (*LoupeTranscr
 	}
 	extArgs := append([]string{"-v", "error", "-y", "-i", srcPath}, foldArgs...)
 	extArgs = append(extArgs, "-c:a", "pcm_s16le", wav)
-	ext := exec.Command(ffmpegBin, extArgs...)
+	ext := commandContext(ctx, ffmpegBin, extArgs...)
 	if out, err := ext.CombinedOutput(); err != nil {
 		// Belt-and-suspenders: a stream-map miss ⇒ no audio, not an error.
 		if strings.Contains(string(out), "Stream map") || strings.Contains(string(out), "matches no streams") {
@@ -140,7 +210,9 @@ func Transcribe(ffmpegBin, whisperBin, modelPath, srcPath string) (*LoupeTranscr
 	}
 
 	prefix := filepath.Join(tmp, "out")
-	asr := exec.Command(whisperBin, "-m", modelPath, "-f", wav, "-oj", "-of", prefix, "-l", "auto", "-np")
+	asrArgs := []string{"-m", modelPath, "-f", wav, "-oj", "-of", prefix, "-l", "auto", "-np"}
+	asrArgs = append(asrArgs, WhisperDeviceArgs(device)...)
+	asr := commandContext(ctx, whisperBin, asrArgs...)
 	if out, err := asr.CombinedOutput(); err != nil {
 		return nil, fmt.Errorf("transcribe: whisper %q: %w: %s", srcPath, err, out)
 	}
@@ -167,6 +239,18 @@ func Transcribe(ffmpegBin, whisperBin, modelPath, srcPath string) (*LoupeTranscr
 	return tr, nil
 }
 
+// WhisperDeviceArgs translates JuiceFarm's backend label into whisper.cpp's
+// current CLI contract. The backend is selected when whisper.cpp is compiled;
+// --device selects a numeric device within that backend. Passing "vulkan" here
+// used to abort in std::stoi before any inference ran.
+func WhisperDeviceArgs(backend string) []string {
+	backend = strings.ToLower(strings.TrimSpace(backend))
+	if backend == "" || backend == "cpu" {
+		return nil
+	}
+	return []string{"--device", "0"}
+}
+
 // whisperModelID turns a ggml model path into the contract's provider/model id
 // (AI_DELIVERY_SPEC §2.1), e.g. "/models/ggml-base.en.bin" → "whisper.cpp/base.en".
 // The id is the invalidation key OpenLoupe stamps + shows for provenance.
@@ -191,12 +275,75 @@ func isNonSpeechMarker(t string) bool {
 
 // AIResult is the per-file outcome of an AI-generation pass.
 type AIResult struct {
-	Path      string
-	Inode     uint64
-	Hash      string
-	HasSpeech bool
-	Segments  int
-	Err       error
+	Path         string
+	Inode        uint64
+	Hash         string
+	HasSpeech    bool
+	Segments     int
+	SkippedFresh bool
+	Err          error
+}
+
+// transcriptFresh reports whether the shared AI bundle already contains a
+// transcript for these exact source bytes and the requested model. Queue
+// producers are intentionally at-least-once (Manager, watch events and the
+// catch-up scan may all observe the same file), so this gate must run before
+// ffprobe/audio extraction/Whisper or every duplicate event spends the GPU.
+//
+// Worker SQLite stores are private to each node. On a local miss, reconcile the
+// volume sidecar once and repeat the same fail-closed checks. A row alone is not
+// sufficient: the blob is opened through the descriptor-anchored regular-file
+// guard and decoded, and its embedded source hash/model must agree.
+func transcriptFresh(store *derivatives.Store, inode uint64, hash string, size int64, opt Options) bool {
+	if store == nil || opt.RegenerateFresh || opt.Mount == "" || strings.TrimSpace(opt.WhisperModel) == "" {
+		return false
+	}
+	if transcriptFreshIndexed(store, inode, hash, size, opt) {
+		return true
+	}
+	if _, err := ReconcileOneSidecar(store, opt.Mount, inode); err != nil {
+		return false
+	}
+	return transcriptFreshIndexed(store, inode, hash, size, opt)
+}
+
+func transcriptFreshIndexed(store *derivatives.Store, inode uint64, hash string, size int64, opt Options) bool {
+	known, sourceHash := store.Known(inode)
+	if !known || sourceHash == nil || *sourceHash != hash {
+		return false
+	}
+	desiredModel := whisperModelID(opt.WhisperModel)
+	rows, err := store.Manifest(inode)
+	if err != nil {
+		return false
+	}
+	for _, row := range rows {
+		if row.Kind != "ai" || row.Status != "ready" ||
+			row.Hash == nil || *row.Hash != hash ||
+			row.SourceSize == nil || *row.SourceSize != size ||
+			row.Model == nil || *row.Model != desiredModel ||
+			row.BlobRelPath == nil ||
+			(*row.BlobRelPath != derivatives.AIBlobName && *row.BlobRelPath != derivatives.AIBlobNameLegacy) {
+			continue
+		}
+		f, err := derivatives.OpenRegularUnder(opt.Mount, derivatives.DerivBlobRel(inode, *row.BlobRelPath))
+		if err != nil {
+			continue
+		}
+		raw, readErr := io.ReadAll(io.LimitReader(f, maxAIBlobBytes+1))
+		closeErr := f.Close()
+		if readErr != nil || closeErr != nil || len(raw) > maxAIBlobBytes {
+			continue
+		}
+		var doc LoupeJSON
+		if json.Unmarshal(raw, &doc) != nil || doc.Media.HashXXH3 != hash ||
+			doc.AI == nil || doc.AI.Transcript == nil ||
+			doc.AI.Transcript.Model != desiredModel || len(doc.AI.Transcript.Segments) == 0 {
+			continue
+		}
+		return true
+	}
+	return false
 }
 
 // GenerateTranscript transcribes one file and merges the result into its
@@ -205,6 +352,11 @@ type AIResult struct {
 // written through opt.Mount; the manifest row is hash-gated (hash == source_hash).
 func GenerateTranscript(store *derivatives.Store, path string, opt Options) AIResult {
 	res := AIResult{Path: path}
+	ctx := optionContext(opt)
+	if err := ctx.Err(); err != nil {
+		res.Err = err
+		return res
+	}
 	fi, err := os.Stat(path)
 	if err != nil {
 		res.Err = err
@@ -224,14 +376,28 @@ func GenerateTranscript(store *derivatives.Store, path string, opt Options) AIRe
 		return res
 	}
 	res.Hash = hash
+	if err := ctx.Err(); err != nil {
+		res.Err = err
+		return res
+	}
 
-	tech, err := Probe(opt.FFprobeBin, path, fi.Size())
+	if transcriptFresh(store, inode, hash, fi.Size(), opt) {
+		res.SkippedFresh = true
+		_ = WriteManifestSidecar(store, opt.Mount, inode)
+		return res
+	}
+	if err := ctx.Err(); err != nil {
+		res.Err = err
+		return res
+	}
+
+	tech, err := ProbeContext(ctx, opt.FFprobeBin, path, fi.Size())
 	if err != nil {
 		res.Err = err
 		return res
 	}
 
-	tr, err := Transcribe(opt.FFmpegBin, opt.WhisperBin, opt.WhisperModel, path)
+	tr, err := TranscribeDeviceContext(ctx, opt.FFmpegBin, opt.WhisperBin, opt.WhisperModel, opt.TranscriptDevice, path)
 	if err != nil {
 		res.Err = fmt.Errorf("transcribe: %w", err)
 		return res
@@ -239,30 +405,58 @@ func GenerateTranscript(store *derivatives.Store, path string, opt Options) AIRe
 	if tr == nil {
 		return res // no speech ⇒ nothing to publish (HasSpeech stays false)
 	}
+	if err := ctx.Err(); err != nil {
+		res.Err = err
+		return res
+	}
 	res.HasSpeech = true
 	res.Segments = len(tr.Segments)
 
 	// Path A (AI_DELIVERY_SPEC Rule A): the consumer's apply is a destructive
 	// replace, so we always re-write the COMPLETE bundle — preserve any prior
 	// sub-kinds (embeddings/faces) and set the transcript into the same bundle.
-	rel := "ai.loupe.json"
-	blobPath := filepath.Join(DerivBlobDir(opt.Mount, inode), rel)
-	ai := loadExistingAI(blobPath)
+	// Dual-read the blob: an existing bundle may sit under the pre-cutover
+	// `ai.loupe.json`, under the post-cutover `ai.logger.json`, or BOTH — the
+	// last being an expected transitional state, not an edge case. We merge
+	// across every blob that exists, because reading only one and writing the
+	// result back permanently drops the other's sub-kinds (the manifest row is
+	// repointed at what we write). A fresh blob gets the new name.
+	// GenerateTranscript is its own mutually-exclusive entry point too, so it
+	// never reached the guard in farm.Process. Hold the descriptor for the whole
+	// write, and pick the blob NAME through it rather than by stat'ing a joined
+	// path — AIBlobWriteName used to resolve through a symlinked <inode>.
+	derivDir, ddErr := derivDirFor(opt.Mount, inode)
+	if ddErr != nil {
+		res.Err = fmt.Errorf("derivative dir: %w", ddErr)
+		return res
+	}
+	defer derivDir.Close()
+	rel := derivatives.AIBlobWriteNameAt(derivDir)
+	ai := loadExistingAIMerged(opt.Mount, inode)
 	ai.Transcript = tr
 	if ai.AIProviderSummary == nil {
 		ai.AIProviderSummary = map[string]string{}
 	}
 	ai.AIProviderSummary["transcript"] = tr.Model
 	doc := &LoupeJSON{
-		LoupeVersion:  1,
+		LoggerVersion: 1,
 		SchemaVersion: "1.0",
 		IndexedAt:     time.Now().UTC().Format(time.RFC3339),
 		Media:         buildMedia(path, tech, hash), // full block every time (Rule B)
 		AI:            ai,
 	}
 
-	if err := writeLoupe(blobPath, doc); err != nil {
-		res.Err = fmt.Errorf("write ai.loupe.json: %w", err)
+	// Keep the version KEY consistent with the blob's NAME. Writing
+	// `logger_version` into a still-legacy-named blob silently breaks a consumer
+	// that decodes only `loupe_version`.
+	doc.SetVersionKeyForBlob(rel)
+	if err := ctx.Err(); err != nil {
+		res.Err = err
+		return res
+	}
+
+	if err := writeLoupeAt(derivDir, rel, doc); err != nil {
+		res.Err = fmt.Errorf("write %s: %w", rel, err)
 		return res
 	}
 
@@ -273,6 +467,10 @@ func GenerateTranscript(store *derivatives.Store, path string, opt Options) AIRe
 		Hash: &hash, BlobRelPath: &rel, MediaType: &mt, Model: &model,
 	}
 	stampSource(&row, fi)
+	if err := ctx.Err(); err != nil {
+		res.Err = err
+		return res
+	}
 	if err := store.PutSource(inode, &hash); err != nil {
 		res.Err = fmt.Errorf("put source: %w", err)
 		return res
@@ -290,14 +488,81 @@ func GenerateTranscript(store *derivatives.Store, path string, opt Options) AIRe
 // loadExistingAI returns the asset's current AI sub-bundle (embeddings/faces from
 // a prior pass) so the new sub-kind merges INTO it — Path A: we always re-write
 // the COMPLETE bundle so the consumer's destructive-replace never drops a kind.
-func loadExistingAI(blobPath string) *LoupeAI {
-	if raw, err := os.ReadFile(blobPath); err == nil {
+// maxAIBlobBytes bounds the AI sidecar read: the file is consumer-writable, so
+// an unbounded ReadFile is an unbounded allocation driven by another app.
+const maxAIBlobBytes = 64 << 20
+
+func loadExistingAI(mount, blobRel string) *LoupeAI {
+	// Symlink guard (2026-08-04 review): this runs server-side on the farm host
+	// against a consumer-writable tree, so an unguarded ReadFile is an arbitrary
+	// local-file read on the farm.
+	// Read from the VALIDATED DESCRIPTOR. Stat-then-ReadFile resolves the name
+	// twice, so the path can be swapped for a symlink in between — the guard
+	// returns an fd precisely so the bytes read are the bytes checked.
+	fh, gerr := derivatives.OpenRegularUnder(mount, blobRel)
+	if gerr != nil {
+		return &LoupeAI{}
+	}
+	defer fh.Close()
+	if raw, err := io.ReadAll(io.LimitReader(fh, maxAIBlobBytes)); err == nil {
 		var d LoupeJSON
 		if json.Unmarshal(raw, &d) == nil && d.AI != nil {
 			return d.AI
 		}
 	}
 	return &LoupeAI{}
+}
+
+// loadExistingAIMerged unions the AI blocks of EVERY blob present in blobDir —
+// the pre-cutover `ai.loupe.json`, the post-cutover `ai.logger.json`, or both.
+//
+// WHY THIS EXISTS (2026-08-03). Picking a single blob here was a real data-loss
+// bug: with both files present (an expected transitional state — the register
+// schema tells consumers to switch names once the provider advertises the flag)
+// the unread one's sub-kinds were silently dropped, the poorer merge was written
+// back under Rule A, and the single (inode,"ai") manifest row was repointed at
+// it — so nothing ever looked at the abandoned blob again. Faces and embeddings
+// pushed on-device before the cutover would vanish on the next farm pass.
+//
+// Merge order is legacy-then-current (AIBlobReadPaths), so the newer file wins
+// any sub-kind both define while sub-kinds only the legacy file has survive.
+func loadExistingAIMerged(mount string, inode uint64) *LoupeAI {
+	out := &LoupeAI{}
+	// Anchored at the mount so no component of .juicemount/derivatives/<inode>/
+	// can be a symlink — this runs on the farm host against a tree the consumer
+	// can write. Order stays legacy-then-current so the newer file wins.
+	for _, name := range []string{derivatives.AIBlobNameLegacy, derivatives.AIBlobName} {
+		mergeAIInto(out, loadExistingAI(mount, derivatives.DerivBlobRel(inode, name)))
+	}
+	return out
+}
+
+// mergeAIInto unions src into dst. A sub-kind present in src replaces dst's —
+// callers order their sources so the preferred one is applied last. An absent
+// sub-kind (nil pointer / empty slice) never clobbers one already collected,
+// which is what makes the union non-destructive.
+func mergeAIInto(dst, src *LoupeAI) {
+	if dst == nil || src == nil {
+		return
+	}
+	if src.ImageEmbeddingGlobal != nil {
+		dst.ImageEmbeddingGlobal = src.ImageEmbeddingGlobal
+	}
+	if len(src.SceneEmbeddings) > 0 {
+		dst.SceneEmbeddings = src.SceneEmbeddings
+	}
+	if len(src.Faces) > 0 {
+		dst.Faces = src.Faces
+	}
+	if src.Transcript != nil {
+		dst.Transcript = src.Transcript
+	}
+	for k, v := range src.AIProviderSummary {
+		if dst.AIProviderSummary == nil {
+			dst.AIProviderSummary = map[string]string{}
+		}
+		dst.AIProviderSummary[k] = v
+	}
 }
 
 // buildMedia assembles the FULL media block from tech (Rule B). color_space ←
@@ -324,13 +589,10 @@ func buildMedia(srcPath string, tech *Tech, hash string) LoupeMedia {
 	return m
 }
 
-func writeLoupe(blobPath string, doc *LoupeJSON) error {
-	if err := os.MkdirAll(filepath.Dir(blobPath), 0o755); err != nil {
-		return err
-	}
+func writeLoupeAt(dir *os.File, name string, doc *LoupeJSON) error {
 	b, err := json.MarshalIndent(doc, "", "  ")
 	if err != nil {
 		return err
 	}
-	return atomicWriteFile(blobPath, b, 0o644)
+	return derivatives.WriteFileAt(dir, name, b, 0o644)
 }

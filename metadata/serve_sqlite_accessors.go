@@ -6,7 +6,6 @@ import (
 	"log"
 	"os"
 	"sync"
-	"time"
 
 	"io/fs"
 )
@@ -43,6 +42,15 @@ func serveFromSQLite() bool {
 // the GETATTR pre-serialization cache, which is a no-op when serving throwaway
 // Entries from SQLite (review fix, LOW).
 func ServeFromSQLite() bool { return serveFromSQLite() }
+
+// durableServeFallbackEnabled keeps the RAM shadow as the default fast path
+// but lets the serving accessors consult the complete local SQLite mirror after
+// memory-pressure eviction. This fallback transfers no network data. It is
+// default-on because a partial READDIR is a correctness failure; the kill
+// switch exists for same-binary incident rollback.
+func durableServeFallbackEnabled() bool {
+	return os.Getenv("JM_DURABLE_SERVE_FALLBACK") != "0"
+}
 
 // logServeSubstrate logs the chosen serve substrate ONCE per boot (not per RPC)
 // so an A/B run is attributable in the logs. Called from OpenWithMaxCacheSize
@@ -120,6 +128,7 @@ func scanRow(row *sql.Row) (*Entry, error) {
 		e         Entry
 		isDir     int
 		mtimeUnix int64
+		mtimeNsec sql.NullInt64
 		inodeRaw  int64
 		mode      uint32
 		localOnly int
@@ -127,16 +136,18 @@ func scanRow(row *sql.Row) (*Entry, error) {
 	if err := row.Scan(
 		&e.Path, &e.Name, &e.ParentPath,
 		&isDir, &e.Size, &mtimeUnix, &inodeRaw, &mode, &localOnly,
+		&e.Version.Incarnation, &e.Version.Revision, &mtimeNsec,
 	); err != nil {
 		return nil, err
 	}
 	e.Inode = uint64(inodeRaw)
 	e.IsDir = isDir != 0
-	e.Mtime = time.Unix(mtimeUnix, 0)
+	e.restoreMtime(mtimeUnix, mtimeNsec)
 	e.Mode = fs.FileMode(mode)
 	if e.IsDir {
 		e.Mode |= fs.ModeDir
 	}
 	e.LocalOnly = localOnly != 0
+	e.Version.Path = e.Path
 	return &e, nil
 }

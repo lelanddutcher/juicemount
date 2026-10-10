@@ -255,7 +255,8 @@ func TestClassifyFUSE(t *testing.T) {
 	}
 
 	c = classifyFUSE(false, "statfs timed out — mount wedged")
-	if c.Status != diagStatusFail || !strings.Contains(c.Remedy, "Force Eject") {
+	if c.Status != diagStatusFail || !strings.Contains(c.Remedy, "Stop mount and finish sync") ||
+		!strings.Contains(c.Remedy, "restart the Mac") || strings.Contains(c.Remedy, "Force Eject") {
 		t.Fatalf("wedged: got %+v", c)
 	}
 }
@@ -305,6 +306,32 @@ func TestClassifyLinkRTT(t *testing.T) {
 	c := classifyLinkRTT(2*time.Millisecond, nil, withBW)
 	if !strings.Contains(c.Detail, "smoothed link class: medium") {
 		t.Fatalf("smoothed suffix missing: %q", c.Detail)
+	}
+}
+
+func TestAdaptiveProxyRTTNeverMeasuresLoopbackAsBackend(t *testing.T) {
+	if !backendAddrIsLoopback("127.0.0.1:49152") || !backendAddrIsLoopback("[::1]:49152") {
+		t.Fatal("loopback proxy address was not recognized")
+	}
+	if backendAddrIsLoopback("192.168.0.197:30179") {
+		t.Fatal("private NAS address was mistaken for loopback")
+	}
+
+	c := classifyAdaptiveProxyRTT(netprofile.Snapshot{})
+	if c.Status != diagStatusWarn || strings.Contains(c.Detail, "LAN-class") ||
+		!strings.Contains(c.Detail, "no end-to-end") {
+		t.Fatalf("missing-sample proxy diagnosis = %+v", c)
+	}
+
+	snap := netprofile.Snapshot{
+		Class:   netprofile.ClassSlow,
+		RTT:     112 * time.Millisecond,
+		HaveRTT: true,
+	}
+	c = classifyAdaptiveProxyRTT(snap)
+	if c.Status != diagStatusWarn || !strings.Contains(c.Detail, "112.0 ms") ||
+		!strings.Contains(c.Detail, "high-latency") {
+		t.Fatalf("end-to-end proxy diagnosis = %+v", c)
 	}
 }
 

@@ -34,8 +34,8 @@ func TestNFSHandlerPathResolution(t *testing.T) {
 
 	// Test root handle
 	rootHandle := handler.ToHandle(&juiceFS{handler: handler}, []string{})
-	if len(rootHandle) != 8 {
-		t.Fatalf("root handle length = %d, want 8", len(rootHandle))
+	if len(rootHandle) != exportHandleSize {
+		t.Fatalf("root handle length = %d, want %d", len(rootHandle), exportHandleSize)
 	}
 
 	// Root should resolve back
@@ -55,8 +55,8 @@ func TestNFSHandlerPathResolution(t *testing.T) {
 
 	e := children[0]
 	handle := handler.ToHandle(&juiceFS{handler: handler}, splitPath(e.Path))
-	if len(handle) != 8 {
-		t.Fatalf("handle length = %d, want 8", len(handle))
+	if len(handle) != exportHandleSize {
+		t.Fatalf("handle length = %d, want %d", len(handle), exportHandleSize)
 	}
 
 	// Should resolve back to the same path
@@ -77,6 +77,7 @@ func TestNFSHandlerPathResolution(t *testing.T) {
 }
 
 func TestJuiceFSStatAndReadDir(t *testing.T) {
+	requireLiveTestVolume(t)
 	_, store := setupTestServer(t)
 
 	handler := NewHandler(store, testFUSEPath)

@@ -11,6 +11,12 @@ import (
 // state); distinct new inodes inside the global rate window defer to the
 // backstop instead of promoting.
 func TestUnknownAncestorPromotionLimiter(t *testing.T) {
+	// Promotion is now ALSO gated on link latency (915b209): a far link skips
+	// the promoted SCAN entirely. netprofile.Default() is a PROCESS SINGLETON,
+	// so this test must state the link it assumes rather than inherit whatever
+	// a previously-run test left behind.
+	settleNetprofileLAN(t)
+
 	rc := &RedisClient{}
 	triggered := 0
 	rc.testTriggerSync = func() { triggered++ }

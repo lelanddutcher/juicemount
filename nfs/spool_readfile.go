@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/lelanddutcher/juicemount/internal/cache/pin"
@@ -32,9 +33,20 @@ type spoolReadFile struct {
 	// JUKEBOX-holds an in-flight hole (see ReadAt / IncompleteAt, #100).
 	isAppleDouble bool
 
-	mu  sync.Mutex
-	fd  *os.File // lazily opened on first Read/ReadAt
-	pos int64
+	mu sync.Mutex
+	fd spoolReadDescriptor // lazily opened on first Read/ReadAt
+	// destFD is the in-flight backend copy, opened lazily the first time a read
+	// lands below punchedEnd (see readFromStreamDestLocked). Nil for the
+	// overwhelming majority of handles, which never touch a punched range.
+	destFD spoolReadDescriptor
+	pos    int64
+}
+
+// Production descriptors are local spool or destination *os.File handles.
+// Keeping the read/close contract narrow also permits deterministic I/O barriers.
+type spoolReadDescriptor interface {
+	io.ReaderAt
+	io.Closer
 }
 
 // Name returns the in-mount path.
@@ -73,10 +85,11 @@ func (f *spoolReadFile) ensureFDLocked() error {
 func (f *spoolReadFile) Read(p []byte) (int, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if err := f.ensureFDLocked(); err != nil {
-		return 0, err
+	if len(p) == 0 {
+		// A zero-byte read does not enter an incomplete or punched range.
+		return 0, f.ensureFDLocked()
 	}
-	n, err := f.fd.ReadAt(p, f.pos)
+	n, err := f.readAtLocked(p, f.pos)
 	if n > 0 {
 		f.pos += int64(n)
 	}
@@ -90,6 +103,15 @@ func (f *spoolReadFile) Read(p []byte) (int, error) {
 func (f *spoolReadFile) ReadAt(p []byte, off int64) (int, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	return f.readAtLocked(p, off)
+}
+
+// readAtLocked applies the same admission and routing to sequential and
+// positional reads. Caller holds f.mu.
+func (f *spoolReadFile) readAtLocked(p []byte, off int64) (int, error) {
+	if f.entry.readBlocked.Load() {
+		return 0, syscall.EIO
+	}
 	if err := f.ensureFDLocked(); err != nil {
 		// GAP A (task #65) — the drain-evict race: the spool file was unlinked
 		// after our LookupActive hit but before this first read opened its fd. The
@@ -103,73 +125,109 @@ func (f *spoolReadFile) ReadAt(p []byte, off int64) (int, error) {
 		// NFS3ERR_IO that ABORTS the copy instead of NFS3ERR_NOENT (which makes
 		// the client reopen onto the drained FUSE copy). errors.Is unwraps.
 		if errors.Is(err, os.ErrNotExist) {
-			return 0, pin.ErrSpoolDrained
+			if f.entry.retired.Load() {
+				return 0, pin.ErrSpoolDrained
+			}
+			return 0, syscall.EIO
 		}
 		return 0, err
 	}
-	// Never serve bytes from an unwritten region of an in-flight file. A
-	// preallocated (ftruncate) or out-of-order write leaves a hole that a raw
-	// pread returns as ZEROS with err=nil — indistinguishable from real data,
-	// so an NLE reading a still-copying clip renders black frames / corrupt
-	// RAW. Clamp every read to the contiguous-written prefix and classify a
-	// past-prefix offset against a CONSISTENT (cend,wend) snapshot.
-	cend, wend := f.entry.ReadableBounds()
-	// #100 — ._ AppleDouble sidecars must NEVER JUKEBOX-hold an in-flight hole.
-	// A large xattr (e.g. a camera's com.blackmagicdesign.thumbnail, ~20KB) makes
-	// copyfile write the ._ sidecar with SEEKS — header at 0, FinderInfo at 0x20,
-	// the resource fork far later — so the spool file has a sparse hole BELOW
-	// writtenEnd. During that same fsetxattr the macOS Quarantine kext reads
-	// com.apple.quarantine from the very ._ being written (qtn_track_vnode_if_
-	// needed → mac_vnop_getxattr). If that read lands in the hole we return
-	// ErrSpoolIncomplete → NFS3ERR_JUKEBOX → the client retries to its ~40s
-	// soft-mount timeout → the notorious ~73s-per-file "copies take forever"
-	// hang (a plain-disk NFS server has no such window and copies the identical
-	// file in ~1s). ._ sidecars are tiny SAME-CLIENT metadata — never the NLE
-	// torn-read / black-frame concern #65's JUKEBOX guards — so serve them exactly
-	// like a plain server: straight from the (sparse) spool file up to writtenEnd,
-	// real bytes where written and zeros in holes, with NO hold. The concurrent
-	// xattr WRITES still land fully in the spool and drain intact, so the final ._
-	// content is unaffected; only the racing quarantine READ sees a transient
-	// zero-hole, which is harmless (it just reads quarantine as absent).
-	readEnd := cend
-	if f.isAppleDouble {
-		readEnd = wend
-	}
-	if off >= readEnd {
-		// GAP B (task #65): at/past the readable prefix. If there are still-
-		// expected bytes below the high-water (a not-yet-filled in-flight hole)
-		// and the writer is still active, HOLD (JUKEBOX via the sentinel) — a
-		// short/EOF read here would let the client treat a partially-arrived file
-		// as COMPLETE (silent truncation). A genuine past-end (off>=wend, the file
-		// merely appears to grow) — or a writer gone silent past the stall window
-		// (wedged/abandoned, the partial is the best available) — reports io.EOF
-		// as before, so the client re-stats and reissues / accepts the partial.
-		// ._ sidecars skip the hold entirely (readEnd==wend already, so off>=wend
-		// here → plain EOF, matching a durable local server).
-		if !f.isAppleDouble && off < wend && time.Since(f.entry.LastWrite()) < pin.SpoolIncompleteStallWindow {
-			// Diagnostic (throttled): a real (non-._) file JUKEBOX-held because
-			// the read offset is past the contiguous prefix but below the
-			// high-water. Post-coalesce-fix this should be rare (a genuine
-			// not-yet-arrived hole); a burst keyed to an export path at its end
-			// is the "connection interrupted" smoking gun.
+	// A routing snapshot alone is insufficient: publishPunchedEnd could move
+	// and the spool could be punched before pread uses it. Hold the entry's
+	// read lock continuously through LOCAL spool I/O. OpenForRead above must
+	// precede this lock because it takes its own RLock.
+	total := 0
+	for {
+		f.entry.mu.RLock()
+		cend, wend := f.entry.contiguousEnd, f.entry.writtenEnd
+		punched, streamDest := f.entry.punchedEnd, f.entry.streamDest
+		switch planReadAt(off, readPlanInputs{
+			punchedEnd:    punched,
+			contiguousEnd: cend,
+			writtenEnd:    wend,
+			writerActive:  time.Since(f.entry.LastWrite()) < pin.SpoolIncompleteStallWindow,
+			isAppleDouble: f.isAppleDouble,
+		}) {
+		case planDest:
+			// Only the published prefix belongs to this destination snapshot.
+			// Never hold entry.mu across a destination open/read: it may be
+			// remote FUSE I/O. A remaining tail gets a fresh routing decision.
+			f.entry.mu.RUnlock()
+			if streamDest == "" {
+				return total, fmt.Errorf("spool: read at %d is below punchedEnd %d but the "+
+					"entry has no stream destination: refusing to serve a punched range",
+					off, punched)
+			}
+			count := len(p)
+			if int64(count) > punched-off {
+				count = int(punched - off)
+			}
+			n, err := f.readFromStreamDestLocked(p[:count], off, streamDest)
+			total += n
+			// EOF inside a promised destination range is a failed read, not
+			// logical file EOF. NFS otherwise accepts it as a truncated file.
+			if errors.Is(err, io.EOF) || (err == nil && n != count) {
+				err = fmt.Errorf("spool: short acknowledged destination read at %d: %w", off, io.ErrUnexpectedEOF)
+			}
+			if err != nil || n == len(p) {
+				return total, err
+			}
+			p, off = p[n:], off+int64(n)
+		case planHold:
+			f.entry.mu.RUnlock()
 			f.entry.logInflightJukebox(f.name, off, cend, wend)
-			return 0, pin.ErrSpoolIncomplete
+			return total, pin.ErrSpoolIncomplete
+		case planEOF:
+			f.entry.mu.RUnlock()
+			return total, io.EOF
+		default:
+			// Match planReadAt's readable bound, including the ._ exemption.
+			// Preserve short non-EOF reads at a growing contiguous prefix;
+			// the next request performs the hole/EOF classification.
+			readEnd := cend
+			if f.isAppleDouble {
+				readEnd = wend
+			}
+			if int64(len(p)) > readEnd-off {
+				p = p[:readEnd-off]
+			}
+			n, err := f.fd.ReadAt(p, off)
+			f.entry.mu.RUnlock()
+			return total + n, err
 		}
-		return 0, io.EOF
 	}
-	if int64(len(p)) > readEnd-off {
-		p = p[:readEnd-off]
+}
+
+// readFromStreamDestLocked serves a punched range from the in-flight backend
+// copy. Caller holds f.mu.
+//
+// The fd is opened lazily and kept for the handle's lifetime, mirroring the
+// spool fd: a punched read is most often a Finder thumbnail probe walking the
+// head of a file, so reopening per RPC would pay a FUSE open (~60ms) for every
+// one of them.
+func (f *spoolReadFile) readFromStreamDestLocked(p []byte, off int64, destPath string) (int, error) {
+	if f.destFD == nil {
+		fd, err := os.Open(destPath)
+		if err != nil {
+			// The rename window: finishStream has published the file at its real
+			// path and the temp name is gone, but we read streamDest a moment
+			// before it was re-pointed. Deliberately not closed by holding e.mu
+			// across the rename — that would put an unbounded FUSE syscall under a
+			// hot lock (the cachedCeiling mistake, 2026-08-04 HIGH).
+			//
+			// ErrSpoolDrained makes the client REOPEN onto the real file, which is
+			// exactly the recovery the drain-evict race (GAP A) already uses. The
+			// bytes are whole and present; only this handle is stale.
+			if os.IsNotExist(err) {
+				return 0, pin.ErrSpoolDrained
+			}
+			// Anything else is a real failure. No fallback to the spool — those
+			// bytes are holes, and serving them would be silent corruption.
+			return 0, fmt.Errorf("spool: open stream destination %q: %w", destPath, err)
+		}
+		f.destFD = fd
 	}
-	n, err := f.fd.ReadAt(p, off)
-	// A short read because we clamped at the contiguous boundary is NOT a real
-	// EOF if the file is still growing. Post-#85 FileInfo.Size reports writtenEnd
-	// (the full high-water), DECOUPLED from this contiguous prefix — so a read CAN
-	// be directed into [contiguousEnd, writtenEnd), a genuine in-flight hole. The
-	// cend clamp + JUKEBOX hold above is therefore the SOLE authoritative guard
-	// against serving zeros from a hole; do NOT remove it on the assumption that
-	// the reported size already keeps reads within the readable prefix — it no
-	// longer does.
-	return n, err
+	return f.destFD.ReadAt(p, off)
 }
 
 // IncompleteAt implements the internal/nfs incompleteReader gate. It reports
@@ -217,12 +275,27 @@ func (f *spoolReadFile) Seek(offset int64, whence int) (int64, error) {
 func (f *spoolReadFile) Close() error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.fd == nil {
-		return nil
+	// Release BOTH descriptors unconditionally. The previous early return on
+	// `f.fd == nil` would have leaked destFD; that is unreachable today only
+	// because ReadAt opens fd before it can ever open destFD, which is an
+	// ordering coincidence rather than a guarantee. An fd leak here is
+	// particularly bad: destFD is a FUSE handle, the repo has no Setrlimit
+	// anywhere, and the audit already measured orphaned fds accumulating under
+	// rename storms.
+	var firstErr error
+	if f.fd != nil {
+		if err := f.fd.Close(); err != nil {
+			firstErr = err
+		}
+		f.fd = nil
 	}
-	err := f.fd.Close()
-	f.fd = nil
-	return err
+	if f.destFD != nil {
+		if err := f.destFD.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+		f.destFD = nil
+	}
+	return firstErr
 }
 
 // spoolFileInfo is the os.FileInfo returned by Stat/Lstat for a path
@@ -241,7 +314,50 @@ func (i *spoolFileInfo) Size() int64        { return i.size }
 func (i *spoolFileInfo) Mode() os.FileMode  { return 0o644 }
 func (i *spoolFileInfo) ModTime() time.Time { return i.mtime }
 func (i *spoolFileInfo) IsDir() bool        { return false }
-func (i *spoolFileInfo) Sys() any           { return nil }
+
+// Sys MUST return a *syscall.Stat_t, not nil.
+//
+// THE BUG THIS FIXES (measured live 2026-08-05). nfslib's ToFileAttribute asks
+// file.GetInfo(info) for the real attributes; that returns nil unless Sys() is a
+// *syscall.Stat_t (internal/nfs/file/file_unix.go), and the nil branch
+// (internal/nfs/file.go:122) FABRICATES the fileid as `fnv.New64(path)` and
+// leaves UID/GID at 0. So for the whole spool window every GETATTR on an
+// in-flight file reported:
+//
+//   - an inode that is a hash of the PATH — no relation to any real inode, and
+//     not a key in any store, so nothing can ever look it up; and
+//   - owner root:wheel, because 0 is the zero value.
+//
+// Both were invisible because READDIR takes a different path
+// (metadata.FileInfo.Sys() does return a Stat_t), so `ls` looked right while
+// `stat` did not. Measured on the live volume: stat said 8983717010171850480
+// (0x7cac9305e1ed6ef0) for a file READDIR correctly reported as 2002031.
+//
+// This is not merely a derivative-registration problem. Any client that uses
+// st_ino for file identity — hardlink detection, backup/rsync change detection,
+// an NLE relinking media — was handed a fabricated value during the window.
+//
+// The inode was already sitting in the struct (spoolFileInfoForEntry sets it);
+// it was simply being thrown away here. It may still be a SYNTHETIC inode when
+// the file was created offline or is not yet reconciled, but a synthetic inode
+// is at least honest and detectable (high bit set) and agrees with READDIR — a
+// path hash is neither.
+func (i *spoolFileInfo) Sys() any {
+	return &syscall.Stat_t{
+		Ino:   i.inode,
+		Nlink: 1,
+		Uid:   spoolOwnerUID,
+		Gid:   spoolOwnerGID,
+	}
+}
+
+// The spool file is written through the mount by the logged-in user, and the
+// mount is single-user, so the process identity is the file's owner. Resolved
+// once: os.Getuid/os.Getgid are syscalls and this sits on the GETATTR hot path.
+var (
+	spoolOwnerUID = uint32(os.Getuid())
+	spoolOwnerGID = uint32(os.Getgid())
+)
 
 // spoolFileInfoForEntry constructs a FileInfo snapshot from a SpoolEntry.
 // Filename is `base` — the trailing component of the NFS path — so

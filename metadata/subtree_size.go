@@ -37,10 +37,11 @@ import (
 //     the full mirror (maxCacheSize 500k ≫ ~300k entries; evictOldest is a
 //     no-op), so "Σ over pathCache" == "Σ over the mirror".
 //
-// HOT-PATH DISCIPLINE: the RAM read accessors (lookupByPathRAM ~15-38ns
-// 0-alloc, listChildrenRAM ~82µs 1-alloc) are NOT touched — no reads consult
-// the aggregates. All maintenance rides existing s.mu.Lock() WRITE sections,
-// adding O(depth) map ops to paths already dominated by SQLite work.
+// HOT-PATH DISCIPLINE: no read accessor consults the aggregate maps. RAM
+// lookups and child listings only take the existing cache lock and create the
+// immutable snapshots required to keep callers race-free. All aggregate
+// maintenance rides existing s.mu.Lock() WRITE sections, adding O(depth) map
+// ops to paths already dominated by SQLite work.
 //
 // GATE: JM_SUBTREE_SIZES, DEFAULT ON. Off (=0): the maps stay nil, every
 // maintenance helper returns before touching them (zero map writes on any

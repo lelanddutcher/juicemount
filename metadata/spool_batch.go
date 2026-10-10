@@ -2,6 +2,7 @@ package metadata
 
 import (
 	"fmt"
+	"io/fs"
 	"time"
 )
 
@@ -13,6 +14,8 @@ import (
 type DrainCommitItem struct {
 	// SpoolID is the spool_entries row id to mark done.
 	SpoolID int64
+	// SpoolFile identifies the private source selected by the drainer.
+	SpoolFile string
 	// NFSPath is the entries-table path whose size is being published, and the
 	// key for the in-memory pathCache size bump.
 	NFSPath string
@@ -20,67 +23,63 @@ type DrainCommitItem struct {
 	// verified by the drainer). Published MAX-only into entries.size.
 	Size int64
 	// Mtime is the publish timestamp for the entries row.
-	Mtime time.Time
+	Mtime           time.Time
+	BackingIdentity string
 }
 
-// DrainCommitResult reports, per input item, whether the spool row was actually
-// marked done. Done==false means the row was DELETED out from under the drainer
-// (CancelForDelete / rename-requeue — the QA-37 cancel contract): the caller
-// must UNDO the FUSE write for that file instead of completing it, exactly as
-// the per-file MarkDone==false path does today. Aligned by index with the input
-// slice.
+// DrainCommitResult is aligned with the input items. Done authorizes local
+// spool cleanup only after the transaction commits. A rejected item must not
+// change the mirror or trigger deletion of a public backing pathname.
 type DrainCommitResult struct {
-	SpoolID int64
-	Done    bool
+	SpoolID         int64
+	Done            bool
+	CompletionID    string
+	Published       MirrorToken
+	Inode           uint64
+	Mode            fs.FileMode
+	Size            int64
+	Mtime           time.Time
+	BackingIdentity string
 }
 
-// BatchDrainComplete commits a batch of drained-file metadata writes in a SINGLE
-// cross-table SQLite transaction, then updates the in-memory entries cache.
-// It is the coalesced form of the drainer's per-file (UpdateSize → MarkDone)
-// pair, behind JM_DRAIN_BATCH_INSERT.
+// BatchDrainComplete commits eligible legacy spool rows and their metadata in
+// one transaction, then publishes only those results to the RAM mirror. A
+// canceled, requeued or mismatched row has no metadata effects. Bound rows
+// must use CompleteSpool instead.
 //
-// TASK #65 ORDERING — preserved by construction. For every item the transaction
-// runs `UPDATE entries SET size=MAX(...)` (the authoritative size publish)
-// BEFORE `UPDATE spool_entries SET drain_state=done` (the eviction trigger), and
-// both commit atomically. The caller runs the eviction side-effects (index
-// evict, spool-file removal, capacity release) ONLY after this returns success —
-// so a fresh read can never observe a post-eviction-but-pre-size (0/partial)
-// Entry.Size. Atomicity subsumes the per-file "publish-before-evict" ordering:
-// the size is durably committed no later than the mark-done in the same tx, and
-// the shadow is not evicted until after the whole tx commits.
+// Lock order is Store.writeMu → cachePublicationMu → SpoolStore.writeMu →
+// SQLite transaction. The shared spool mutex serializes qualification against
+// DeleteActiveByPath and
+// other state transitions. Store.writeMu remains held through RAM publication.
+// Both SQL updates commit before the caller may evict a spool shadow; their
+// statement order does not expose a partially committed result. Any SQL error
+// rolls back the entire batch, including eligible siblings.
 //
-// entries.size stays MAX-only (idempotent, same as UpdateSize) so a concurrent
-// reconcile or a re-drain can't shrink a size; spool_entries mark-done is by id
-// with a rows-affected check so a row CANCELLED mid-drain (deleted by
-// DeleteActiveByPath, whose DELETE filters drain_state IN writing/ready/draining
-// and thus can't touch a just-done row) reports Done=false.
-//
-// QA-37 CANCEL CONTRACT — held by SHARING SpoolStore.writeMu, not by tx timing.
-// The mark-done (SpoolStore.batchMarkDoneTx) runs UNDER SpoolStore.writeMu, the
-// SAME mutex DeleteActiveByPath / MarkDone serialize on, so a concurrent cancel
-// and this mark-done cannot interleave — one runs entirely before the other,
-// exactly as MarkDone vs DeleteActiveByPath do in the per-file path. (The
-// earlier "_txlock=immediate is enough" reasoning was WRONG: in WAL mode the
-// cancel's SELECT is a snapshot reader holding NO write lock, so it could
-// observe a still-'draining' row and collect it for deletion while this batch
-// committed the mark-done first — resurrecting a user-deleted file. Sharing the
-// mutex closes that window.)
-//
-// LOCK ORDER — global, uninverted: Store.writeMu → SpoolStore.writeMu →
-// SQLite-write-lock (tx.Begin, _txlock=immediate). SpoolStore.writeMu is taken
-// BEFORE tx.Begin so no SpoolStore writer can be mid-DB-write (holding
-// SpoolStore.writeMu, blocked on the WAL write lock this tx holds) while this
-// path waits on SpoolStore.writeMu — that reversed pairing would 30s-stall on
-// busy_timeout. Because this is the ONLY site that holds both Go mutexes and no
-// SpoolStore method ever calls back into a Store method, the order has no cycle.
-//
-// On ANY SQL error the whole tx rolls back and NO item is marked done, so the
-// caller retries every file transiently (no partial commit, no half-evicted
-// batch). The entries-size publish for the failed batch is rolled back too, so
-// there is no orphaned size ahead of an un-drained shadow.
-//
-// results is aligned by index with items. A nil/empty items returns nil, nil.
+// This legacy interface has no mirror incarnation or backend publication
+// receipt. It does not authorize writes or deletion at a public pathname.
 func (s *Store) BatchDrainComplete(items []DrainCommitItem) ([]DrainCommitResult, error) {
+	return s.completeDrains(items, false)
+}
+
+// BatchDrainCompleteExact is the production full-image policy. Keep the
+// historical MAX-only batch API for callers that explicitly need it.
+func (s *Store) BatchDrainCompleteExact(items []DrainCommitItem) ([]DrainCommitResult, error) {
+	return s.completeDrains(items, true)
+}
+
+// DrainComplete atomically qualifies one legacy row, publishes its exact size
+// (including shrink and zero), and marks it done. Rejection has no mirror
+// effects. Like BatchDrainComplete, this is local completion only: it carries
+// no authority to mutate a public backing pathname or a later replacement.
+func (s *Store) DrainComplete(item DrainCommitItem) (DrainCommitResult, error) {
+	results, err := s.completeDrains([]DrainCommitItem{item}, true)
+	if err != nil {
+		return DrainCommitResult{}, err
+	}
+	return results[0], nil
+}
+
+func (s *Store) completeDrains(items []DrainCommitItem, exactSize bool) ([]DrainCommitResult, error) {
 	if len(items) == 0 {
 		return nil, nil
 	}
@@ -91,18 +90,74 @@ func (s *Store) BatchDrainComplete(items []DrainCommitItem) ([]DrainCommitResult
 		return nil, fmt.Errorf("batch drain complete: spool store not wired (SetSpoolStore)")
 	}
 
-	// LOCK ORDER: Store.writeMu, then SpoolStore.writeMu, then tx (see docstring).
+	seen := make(map[int64]struct{}, len(items))
+	paths := make(map[string]struct{}, len(items))
+	for _, it := range items {
+		if it.SpoolID <= 0 || it.NFSPath == "" || it.Size < 0 {
+			return nil, fmt.Errorf("batch drain complete: invalid item for spool %d", it.SpoolID)
+		}
+		if _, exists := seen[it.SpoolID]; exists {
+			return nil, fmt.Errorf("batch drain complete: duplicate spool %d", it.SpoolID)
+		}
+		if _, exists := paths[it.NFSPath]; exists {
+			return nil, fmt.Errorf("batch drain complete: duplicate path %q", it.NFSPath)
+		}
+		seen[it.SpoolID] = struct{}{}
+		paths[it.NFSPath] = struct{}{}
+	}
+
+	// Keep both durable and cache-only publishers outside qualification and
+	// publication; readers do not acquire cachePublicationMu.
 	// SpoolStore.writeMu is held across the whole tx so the batched mark-done
 	// serializes against DeleteActiveByPath / MarkDone (QA-37).
+	s.replacementObservationMu.Lock()
+	defer s.replacementObservationMu.Unlock()
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+	s.cachePublicationMu.Lock()
+	defer s.cachePublicationMu.Unlock()
+
 	s.spoolStore.writeMu.Lock()
 	defer s.spoolStore.writeMu.Unlock()
+	preimages := make(map[string]*Entry, len(items))
+	if exactSize {
+		for _, it := range items {
+			var eligible int
+			if err := s.db.QueryRow(`SELECT count(*) FROM spool_entries r WHERE r.id=? AND r.nfs_path=?
+ AND r.spool_file=? AND r.size=? AND r.drain_state='draining' AND r.punched_end=0
+ AND NOT EXISTS (SELECT 1 FROM spool_bindings b WHERE b.spool_id=r.id)`,
+				it.SpoolID, it.NFSPath, it.SpoolFile, it.Size).Scan(&eligible); err != nil {
+				return nil, err
+			}
+			if eligible == 0 {
+				continue
+			}
+			e, err := scanEntry(s.db.QueryRow(`SELECT `+serveColumns+` FROM entries WHERE path=?`, it.NFSPath))
+			if err != nil || e.Version.IsZero() {
+				return nil, ErrMirrorConflict
+			}
+			s.mu.RLock()
+			cached := s.pathCache[it.NFSPath]
+			conflict := s.preparedCreateConflictLocked(it.NFSPath) || cached == nil ||
+				cached.Version != e.Version || cached.Inode != e.Inode || cached.Mode != e.Mode ||
+				cached.Size != e.Size || cached.Mtime.Unix() != e.Mtime.Unix()
+			s.mu.RUnlock()
+			if conflict {
+				return nil, ErrMirrorConflict
+			}
+			preimages[it.NFSPath] = e
+		}
+	}
 
-	tx, err := s.db.Begin()
+	completionIDs, err := s.prepareDrainCompletionsLocked(items)
+	if err != nil {
+		return nil, fmt.Errorf("prepare drain completion: %w", err)
+	}
+	tx, closeConn, err := s.beginSpoolDurableTx()
 	if err != nil {
 		return nil, fmt.Errorf("batch drain complete begin: %w", err)
 	}
+	defer closeConn()
 	// Rollback is a no-op after a successful Commit.
 	committed := false
 	defer func() {
@@ -111,54 +166,107 @@ func (s *Store) BatchDrainComplete(items []DrainCommitItem) ([]DrainCommitResult
 		}
 	}()
 
-	// (1) size publish onto entries — MAX-only + mtime, identical to UpdateSize's
-	//     SQL. Runs BEFORE every mark-done below (task #65).
 	for _, it := range items {
-		if it.Size > 0 {
-			if _, err := tx.Exec(
-				`UPDATE entries SET size = MAX(size, ?), mtime = ? WHERE path = ?`,
-				it.Size, it.Mtime.Unix(), it.NFSPath,
-			); err != nil {
-				return nil, fmt.Errorf("batch drain complete update size %q: %w", it.NFSPath, err)
-			}
+		if err := rejectBoundSpool(tx, it.SpoolID); err != nil {
+			return nil, err
 		}
 	}
-
-	// (2) mark every spool row done — the eviction trigger — under
-	//     SpoolStore.writeMu (already held), inside this same tx. rows-affected==0
-	//     ⇒ row cancelled mid-drain ⇒ Done=false (caller undoes the FUSE write).
-	//     Kept BELOW the size publishes so entries.size is durable no later than
-	//     the mark-done in the single atomic commit (task #65).
+	// Qualify the current spool row before any path-only mirror update. These
+	// provisional transitions roll back if a later metadata update fails.
 	results, err := s.spoolStore.batchMarkDoneTx(tx, items)
 	if err != nil {
 		return nil, fmt.Errorf("batch drain complete: %w", err)
+	}
+	for i, it := range items {
+		if !results[i].Done || (!exactSize && it.Size == 0) {
+			continue
+		}
+		query := `UPDATE entries SET size = MAX(size, ?), mtime = ?, mtime_nsec = NULL WHERE path = ?`
+		args := []any{it.Size, it.Mtime.Unix(), it.NFSPath}
+		if exactSize {
+			query = `UPDATE entries SET size = ?, mtime = ?, mtime_nsec = NULL WHERE path = ? AND incarnation=? AND revision=? AND inode=?`
+			pre := preimages[it.NFSPath]
+			args = append(args, pre.Version.Incarnation, pre.Version.Revision, int64(pre.Inode))
+		}
+		updated, err := tx.Exec(query, args...)
+		if err != nil {
+			return nil, fmt.Errorf("drain complete update size %q: %w", it.NFSPath, err)
+		}
+		if exactSize {
+			if err := exactlyOneRow(updated); err != nil {
+				return nil, fmt.Errorf("drain complete missing mirror %q: %w", it.NFSPath, err)
+			}
+		}
+	}
+	// Bind the post-update mirror generation and attributes to the exact FULL
+	// legacy hold in this transaction. A caller cannot forge a current token
+	// onto an old completion ID after the original generation has retired.
+	for i, it := range items {
+		if !exactSize || !results[i].Done {
+			continue
+		}
+		if completionIDs[i] == "" {
+			return nil, ErrMirrorConflict
+		}
+		e, err := scanEntry(tx.QueryRow(`SELECT `+serveColumns+` FROM entries WHERE path=?`, it.NFSPath))
+		if err != nil || e.Version.IsZero() || e.Version.Path != it.NFSPath {
+			return nil, fmt.Errorf("drain complete missing versioned mirror %q: %w", it.NFSPath, ErrMirrorConflict)
+		}
+		if exactSize && (e.Size != it.Size || e.Mtime.Unix() != it.Mtime.Unix()) {
+			return nil, ErrMirrorConflict
+		}
+		res, err := tx.Exec(`UPDATE spool_completion_holds SET incarnation=?,published_revision=?,original_inode=?,original_mode=?,backing_identity=?
+ WHERE completion_id=? AND spool_id=? AND nfs_path=? AND spool_file=? AND size=? AND kind='legacy' AND birth_id=''`,
+			e.Version.Incarnation, e.Version.Revision, int64(e.Inode), uint32(e.Mode), it.BackingIdentity, completionIDs[i], it.SpoolID, it.NFSPath, it.SpoolFile, it.Size)
+		if err != nil {
+			return nil, err
+		}
+		if err := exactlyOneRow(res); err != nil {
+			return nil, ErrMirrorConflict
+		}
+		results[i].Published, results[i].Inode, results[i].Mode = e.Version, e.Inode, e.Mode
+		results[i].Size, results[i].Mtime = e.Size, e.Mtime
+		results[i].BackingIdentity = it.BackingIdentity
 	}
 
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("batch drain complete commit: %w", err)
 	}
 	committed = true
+	for i := range results {
+		if results[i].Done {
+			results[i].CompletionID = completionIDs[i]
+		}
+	}
 
-	// Post-commit: mirror UpdateSize's in-memory cache bump (MAX-only, mtime,
-	// invalidate cached XDR bytes) for every item that carried a size. Done
+	// Post-commit: publish the selected size policy and mtime to RAM,
+	// invalidate cached XDR bytes) only for accepted items that carried a size. Done
 	// under s.mu, AFTER the durable commit, so a reader either sees the old
 	// cached size (still correct — the shadow hasn't been evicted yet by the
 	// caller) or the freshly-published one.
 	s.mu.Lock()
-	for _, it := range items {
-		if it.Size <= 0 {
+	for i, it := range items {
+		if !results[i].Done || (!exactSize && it.Size == 0) {
 			continue
 		}
 		if e, ok := s.pathCache[it.NFSPath]; ok {
 			oldSize := e.Size
-			if it.Size > e.Size {
+			if exactSize || it.Size > e.Size {
 				e.Size = it.Size
 			}
 			// INSTANT-NAV #2: mirror UpdateSize — an in-place size bump applies
 			// the (new−old) delta to the ancestor subtree aggregates.
 			s.subtreeResizeLocked(e, oldSize)
-			e.Mtime = it.Mtime
-			e.PreSerializedGetAttr = nil
+			if exactSize {
+				e.Mtime = results[i].Mtime
+			} else {
+				e.Mtime = it.Mtime
+			}
+			e.MtimeNsecKnown = false
+			e.ResetGetAttrCache()
+			if !e.Version.IsZero() {
+				e.Version.Revision++
+			}
 		}
 	}
 	s.mu.Unlock()

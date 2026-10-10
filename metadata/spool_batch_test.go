@@ -77,8 +77,8 @@ func TestBatchDrainCompletePublishesSizeAndMarksDone(t *testing.T) {
 
 	now := time.Now()
 	results, err := store.BatchDrainComplete([]DrainCommitItem{
-		{SpoolID: id1, NFSPath: "/Films/a.mov", Size: 4096, Mtime: now},
-		{SpoolID: id2, NFSPath: "/Films/b.mov", Size: 8192, Mtime: now},
+		{SpoolID: id1, NFSPath: "/Films/a.mov", SpoolFile: "/spool/files/" + filepath.Base("/Films/a.mov"), Size: 4096, Mtime: now},
+		{SpoolID: id2, NFSPath: "/Films/b.mov", SpoolFile: "/spool/files/" + filepath.Base("/Films/b.mov"), Size: 8192, Mtime: now},
 	})
 	if err != nil {
 		t.Fatalf("BatchDrainComplete: %v", err)
@@ -140,7 +140,7 @@ func TestBatchDrainCompleteSizeIsMaxOnly(t *testing.T) {
 	}
 
 	if _, err := store.BatchDrainComplete([]DrainCommitItem{
-		{SpoolID: id, NFSPath: nfsPath, Size: 100, Mtime: time.Now()},
+		{SpoolID: id, NFSPath: nfsPath, SpoolFile: "/spool/files/" + filepath.Base(nfsPath), Size: 100, Mtime: time.Now()},
 	}); err != nil {
 		t.Fatalf("BatchDrainComplete: %v", err)
 	}
@@ -155,8 +155,7 @@ func TestBatchDrainCompleteSizeIsMaxOnly(t *testing.T) {
 
 // TestBatchDrainCompleteCancelledRowReportsNotDone proves the QA-37 cancel
 // contract survives batching: a spool row DELETED out from under the drainer
-// (the NFS delete path) is reported Done=false so the caller undoes the FUSE
-// write, while sibling rows in the same batch still complete.
+// (the NFS delete path) is reported Done=false without changing the mirror, while sibling rows in the same batch still complete.
 func TestBatchDrainCompleteCancelledRowReportsNotDone(t *testing.T) {
 	store, spool := openStoreWithSpool(t)
 
@@ -170,8 +169,8 @@ func TestBatchDrainCompleteCancelledRowReportsNotDone(t *testing.T) {
 	}
 
 	results, err := store.BatchDrainComplete([]DrainCommitItem{
-		{SpoolID: id1, NFSPath: "/Films/keep.mov", Size: 4096, Mtime: time.Now()},
-		{SpoolID: id2, NFSPath: "/Films/deleted.mov", Size: 4096, Mtime: time.Now()},
+		{SpoolID: id1, NFSPath: "/Films/keep.mov", SpoolFile: "/spool/files/" + filepath.Base("/Films/keep.mov"), Size: 4096, Mtime: time.Now()},
+		{SpoolID: id2, NFSPath: "/Films/deleted.mov", SpoolFile: "/spool/files/" + filepath.Base("/Films/deleted.mov"), Size: 4096, Mtime: time.Now()},
 	})
 	if err != nil {
 		t.Fatalf("BatchDrainComplete: %v", err)
@@ -216,8 +215,7 @@ func TestBatchDrainCompleteCancelledRowReportsNotDone(t *testing.T) {
 //
 // INVARIANT ASSERTED. The cancelled row must never be BOTH deleted-away AND
 // reported Done=true. Here the cancel wins the row (DELETE removes it), so the
-// batch's mark-done must see 0 rows → Done=false → the drainer undoes its FUSE
-// write. A surviving (keep) row in the same batch must still commit Done=true,
+// batch's mark-done must see 0 rows → Done=false, with no publication effects. A surviving (keep) row in the same batch must still commit Done=true,
 // proving the batch isn't wholesale-poisoned by one cancel. Run under -race.
 func TestBatchDrainCompleteConcurrentCancelDoesNotResurrect(t *testing.T) {
 	store, spool := openStoreWithSpool(t)
@@ -267,8 +265,8 @@ func TestBatchDrainCompleteConcurrentCancelDoesNotResurrect(t *testing.T) {
 	batchDone := make(chan struct{})
 	go func() {
 		results, batchErr = store.BatchDrainComplete([]DrainCommitItem{
-			{SpoolID: keepID, NFSPath: "/Films/keep.mov", Size: 4096, Mtime: time.Now()},
-			{SpoolID: delID, NFSPath: "/Films/deleted.mov", Size: 8192, Mtime: time.Now()},
+			{SpoolID: keepID, NFSPath: "/Films/keep.mov", SpoolFile: "/spool/files/" + filepath.Base("/Films/keep.mov"), Size: 4096, Mtime: time.Now()},
+			{SpoolID: delID, NFSPath: "/Films/deleted.mov", SpoolFile: "/spool/files/" + filepath.Base("/Films/deleted.mov"), Size: 8192, Mtime: time.Now()},
 		})
 		close(batchDone)
 	}()
@@ -346,4 +344,92 @@ func durableSize(t *testing.T, store *Store, path string) int64 {
 		t.Fatalf("durable size read %q: %v", path, err)
 	}
 	return size
+}
+
+// An exact production completion binds its final EOF and generation to the
+// FULL hold. A high-bit inode must round-trip through SQLite's signed integer.
+func TestBatchDrainCompleteExactBindsHighBitZeroImage(t *testing.T) {
+	store, spool := openStoreWithSpool(t)
+	const name = "exact/zero.mov" // FNV fixture inode has the high bit set.
+	id := seedReadyRow(t, store, spool, name, 0)
+	if before := store.LookupByPath(name); before == nil || before.Inode&(uint64(1)<<63) == 0 {
+		t.Fatal("fixture did not create a high-bit inode")
+	}
+	if err := store.SetSizeExact(name, 8192, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	item := DrainCommitItem{SpoolID: id, NFSPath: name, SpoolFile: "/spool/files/zero.mov", Size: 0,
+		Mtime: time.Unix(1800000000, 0), BackingIdentity: "41:42"}
+	results, err := store.BatchDrainCompleteExact([]DrainCommitItem{item})
+	if err != nil || len(results) != 1 || !results[0].Done {
+		t.Fatalf("exact completion: results=%+v err=%v", results, err)
+	}
+	r := results[0]
+	if got := store.LookupByPath(name); got == nil || got.Size != 0 || got.Version != r.Published || got.Inode != r.Inode {
+		t.Fatalf("exact RAM image: %+v receipt=%+v", got, r)
+	}
+	if got := durableSize(t, store, name); got != 0 {
+		t.Fatalf("exact durable EOF=%d", got)
+	}
+	applied := 0
+	if err := store.ApplyLegacyDrainEffects(item, r, func(DrainCommitResult) { applied++ }); err != nil || applied != 1 {
+		t.Fatalf("live exact receipt refused: applied=%d err=%v", applied, err)
+	}
+	forged := r
+	forged.BackingIdentity = "99:100"
+	if err := store.ApplyLegacyDrainEffects(item, forged, func(DrainCommitResult) { applied++ }); err == nil || applied != 1 {
+		t.Fatalf("forged identity applied: applied=%d err=%v", applied, err)
+	}
+	if err := spool.CleanupDrainCompletion(item, r, func() error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ApplyLegacyDrainEffects(item, r, func(DrainCommitResult) { applied++ }); err == nil || applied != 1 {
+		t.Fatalf("retired hold replay applied: applied=%d err=%v", applied, err)
+	}
+}
+
+func TestDrainCompleteExactRejectsCacheOnlySuccessorBeforeCommit(t *testing.T) {
+	store, spool := openStoreWithSpool(t)
+	const name = "cache/successor.mov"
+	id := seedReadyRow(t, store, spool, name, 4096)
+	before := store.LookupByPath(name)
+	replacement := MakeEntry(name, false, 17, time.Unix(1900000000, 0), before.Inode+1)
+	store.InsertToCache(replacement)
+	item := DrainCommitItem{SpoolID: id, NFSPath: name, SpoolFile: "/spool/files/successor.mov", Size: 4096,
+		Mtime: time.Unix(1800000000, 0), BackingIdentity: "41:42"}
+	if _, err := store.DrainComplete(item); err == nil {
+		t.Fatal("cache-only successor was overwritten")
+	}
+	if got := store.LookupByPath(name); got == nil || got.Inode != replacement.Inode || got.Size != replacement.Size {
+		t.Fatalf("cache successor changed: %+v", got)
+	}
+	if got := durableSize(t, store, name); got != before.Size {
+		t.Fatalf("durable predecessor changed: %d", got)
+	}
+	if row, err := spool.Get(id); err != nil || row.DrainState != DrainDraining {
+		t.Fatalf("spool row changed: %+v err=%v", row, err)
+	}
+}
+
+func TestLegacyDrainReceiptRejectsSameInodeNewRevisionWhileHeld(t *testing.T) {
+	store, spool := openStoreWithSpool(t)
+	const name = "revision/same-inode.mov"
+	id := seedReadyRow(t, store, spool, name, 128)
+	item := DrainCommitItem{SpoolID: id, NFSPath: name, SpoolFile: "/spool/files/same-inode.mov",
+		Size: 128, Mtime: time.Unix(1800000000, 0), BackingIdentity: "41:42"}
+	r, err := store.DrainComplete(item)
+	if err != nil || !r.Done {
+		t.Fatalf("receipt=%+v err=%v", r, err)
+	}
+	if _, err := store.DB().Exec(`UPDATE entries SET revision=revision+1 WHERE path=?`, name); err != nil {
+		t.Fatal(err)
+	}
+	var inode int64
+	if err := store.DB().QueryRow(`SELECT inode FROM entries WHERE path=?`, name).Scan(&inode); err != nil || uint64(inode) != r.Inode {
+		t.Fatalf("same-inode fixture changed: inode=%d err=%v", inode, err)
+	}
+	applied := false
+	if err := store.ApplyLegacyDrainEffects(item, r, func(DrainCommitResult) { applied = true }); err == nil || applied {
+		t.Fatalf("same-inode newer revision accepted: applied=%t err=%v", applied, err)
+	}
 }

@@ -22,8 +22,8 @@
         "required": ["kind", "status", "producer", "version"],
         "properties": {
           "kind": {
-            "enum": ["thumbnail", "filmstrip", "waveform", "proxy", "tech", "embedding", "transcript", "ocr", "faces", "ai"],
-            "description": "Blob kinds (thumbnail/filmstrip/waveform/proxy/ai) carry blob_rel_path; DB kinds (tech/embedding/transcript/ocr/faces) are fetched via /metadata. 'ai' is a JSON blob (LoupeJSON `ai` shape: embeddings/faces/transcript/auto-tags) — JM-17."
+            "enum": ["thumbnail", "filmstrip", "waveform", "proxy", "audio_proxy", "tech", "embedding", "transcript", "ocr", "faces", "ai"],
+            "description": "Blob kinds (thumbnail/filmstrip/waveform/proxy/audio_proxy/ai) carry blob_rel_path; DB kinds (tech/embedding/transcript/ocr/faces) are fetched via /metadata. 'ai' is a JSON blob (LoupeJSON `ai` shape: embeddings/faces/transcript/auto-tags) — JM-17. 'audio_proxy' (A8) is a small streamable stereo-AAC MP4 (audio/mp4, codec `aac`) emitted ONLY for large uncompressed-PCM audio-only assets so a remote fallback resolver can prefer it over the 2GB original; distinct from `proxy` because the derivatives PK is (inode,kind) and an asset could carry both."
           },
           "status": { "enum": ["ready", "pending", "failed", "absent"] },
           "producer": {
@@ -49,12 +49,12 @@
           "source_size": { "type": ["integer", "null"], "description": "Source file size (bytes) at generation time — lets a consumer stat-verify the derivative off the manifest (live /lookup size == source_size) without a separate tech row. Omitted on rows that predate this field." },
           "source_mtime": { "type": ["integer", "null"], "description": "Source file mtime (unix seconds) at generation time; the companion stat-guard to source_size." },
           "codec": {
-            "enum": ["h264", "hevc", "av1"],
-            "description": "PROXY-CODEC (PROXY_CODEC_SPEC §JuiceMount ratification §2). Which video codec THIS proxy blob is. Present only on kind=='proxy'. ABSENT ⇒ assume \"h264\" (back-compat: every pre-existing proxy is the H.264 floor). H.264 is the guaranteed-decodable floor; the farm MUST NOT emit an asset whose only proxy is non-h264. Invariant across all codecs: MP4 container, +faststart, closed-GOP/CFR/BT.709 discipline, byte-range serving."
+            "enum": ["h264", "hevc", "av1", "aac", "opus"],
+            "description": "Which codec THIS proxy blob is. Present only on kind=='proxy' (video codecs h264/hevc/av1) or kind=='audio_proxy' (audio codecs aac/opus). VIDEO (proxy): ABSENT ⇒ assume \"h264\" (back-compat: every pre-existing proxy is the H.264 floor); H.264 is the guaranteed-decodable floor and the farm MUST NOT emit an asset whose only proxy is non-h264; invariant across all codecs: MP4 container, +faststart, closed-GOP/CFR/BT.709 discipline, byte-range serving. AUDIO (audio_proxy, A8): \"aac\" is the streamable floor (MP4/audio-mp4 container, +faststart, stereo); \"opus\" reserved for a future variant."
           },
           "codec_string": {
             "type": ["string", "null"],
-            "description": "PROXY-CODEC. The exact MediaSource.isTypeSupported()/canPlayType() / AVURLAsset probe token for THIS blob (e.g. \"avc1.640028, mp4a.40.2\"). The web UI and OpenLoupe MUST gate on this, not on `codec` alone. Present only on kind=='proxy'."
+            "description": "PROXY-CODEC. The exact MediaSource.isTypeSupported()/canPlayType() / AVURLAsset probe token for THIS blob (e.g. video \"avc1.640028, mp4a.40.2\" for kind=='proxy', audio \"mp4a.40.2\" for kind=='audio_proxy'). The web UI and OpenLoupe MUST gate on this, not on `codec` alone. Present only on kind=='proxy' or kind=='audio_proxy'."
           },
           "blob_size": {
             "type": ["integer", "null"],
@@ -83,7 +83,7 @@
             "then": { "not": { "required": ["filmstrip"] } }
           },
           {
-            "if": { "not": { "properties": { "kind": { "const": "proxy" } }, "required": ["kind"] } },
+            "if": { "not": { "properties": { "kind": { "enum": ["proxy", "audio_proxy"] } }, "required": ["kind"] } },
             "then": { "not": { "required": ["codec"] }, "properties": { "codec_string": { "const": null } } }
           }
         ]

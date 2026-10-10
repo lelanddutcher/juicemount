@@ -5,29 +5,23 @@ import (
 	"testing"
 )
 
-// TestProxyCodecStrings: the codec label + canPlayType token are derived from the
-// configured encoder; the AAC audio suffix appears only when the source has audio.
-func TestProxyCodecStrings(t *testing.T) {
-	withAudio := &Tech{Audio: []AudioTrack{{Codec: "pcm_s24le"}}}
-	noAudio := &Tech{Audio: nil}
+// Encoder choice determines desired freshness codec, never the published token.
+func TestProxyDesiredCodec(t *testing.T) {
 	cases := []struct {
-		vcodec     string
-		tech       *Tech
-		wantCodec  string
-		wantString string
+		vcodec    string
+		wantCodec string
 	}{
-		{"libx264", withAudio, "h264", "avc1.640028, mp4a.40.2"},
-		{"", withAudio, "h264", "avc1.640028, mp4a.40.2"},
-		{"h264_nvenc", withAudio, "h264", "avc1.640028, mp4a.40.2"},
-		{"libx264", noAudio, "h264", "avc1.640028"},
-		{"hevc_nvenc", withAudio, "hevc", "hvc1.1.6.L120.90, mp4a.40.2"},
-		{"libx265", withAudio, "hevc", "hvc1.1.6.L120.90, mp4a.40.2"},
-		{"libaom-av1", withAudio, "av1", "av01.0.08M.08, mp4a.40.2"},
+		{"libx264", "h264"},
+		{"", "h264"},
+		{"h264_nvenc", "h264"},
+		{"hevc_nvenc", "hevc"},
+		{"libx265", "hevc"},
+		{"libaom-av1", "av1"},
 	}
 	for _, c := range cases {
-		codec, cs := proxyCodecStrings(c.vcodec, c.tech)
-		if codec != c.wantCodec || cs != c.wantString {
-			t.Errorf("proxyCodecStrings(%q) = (%q,%q), want (%q,%q)", c.vcodec, codec, cs, c.wantCodec, c.wantString)
+		codec := proxyDesiredCodec(c.vcodec)
+		if codec != c.wantCodec {
+			t.Errorf("proxyDesiredCodec(%q) = %q, want %q", c.vcodec, codec, c.wantCodec)
 		}
 	}
 }

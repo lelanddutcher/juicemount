@@ -6,6 +6,7 @@ import (
 	"io"
 	"math"
 	"os"
+	"syscall"
 	"time"
 
 	"github.com/go-git/go-billy/v5"
@@ -85,9 +86,22 @@ func (f FileAttribute) AsCache() *FileCacheAttribute {
 	return &wcc
 }
 
-// ToFileAttribute creates an NFS fattr3 struct from an OS.FileInfo
+// ToFileAttribute creates an NFS fattr3 struct from an OS.FileInfo.
 func ToFileAttribute(info os.FileInfo, filePath string) *FileAttribute {
+	attr, _ := toFileAttribute(info, filePath, false)
+	return attr
+}
+
+// ToFileAttributeWithIdentity also reports whether Fileid came from a real
+// syscall.Stat_t inode. A pathname hash is useful for generic attributes but
+// cannot authorize an identity-sensitive rename.
+func ToFileAttributeWithIdentity(info os.FileInfo, filePath string) (*FileAttribute, bool) {
+	return toFileAttribute(info, filePath, true)
+}
+
+func toFileAttribute(info os.FileInfo, filePath string, wantProof bool) (*FileAttribute, bool) {
 	f := FileAttribute{}
+	proven := false
 
 	m := info.Mode()
 	f.FileMode = uint32(m)
@@ -115,6 +129,11 @@ func ToFileAttribute(info os.FileInfo, filePath string) *FileAttribute {
 		f.GID = a.GID
 		f.SpecData = [2]uint32{a.Major, a.Minor}
 		f.Fileid = a.Fileid
+		if wantProof {
+			if st, ok := info.Sys().(*syscall.Stat_t); ok && st != nil && st.Ino != 0 && st.Ino == a.Fileid {
+				proven = true
+			}
+		}
 		if nfsTrace {
 			Log.Infof("TRACE attr path=%q fileid=%d type=%d src=info", filePath, f.Fileid, f.Type)
 		}
@@ -132,7 +151,7 @@ func ToFileAttribute(info os.FileInfo, filePath string) *FileAttribute {
 	f.Atime = ToNFSTime(info.ModTime())
 	f.Mtime = f.Atime
 	f.Ctime = f.Atime
-	return &f
+	return &f, proven
 }
 
 // [JM5] Pre-serialized GETATTR response support.
@@ -212,6 +231,40 @@ func tryStat(fs billy.Filesystem, path []string) *FileAttribute {
 // handle that returns nil falls back to the legacy fs.Stat / tryStat path.
 type CachedInfoProvider interface {
 	CachedInfo() os.FileInfo
+}
+
+// readAdmissionProvider keeps one generation across READ's size decision,
+// subreads, and response encoding. A mutation can invalidate it without
+// holding a lock across backend I/O.
+type readAdmissionProvider interface {
+	BeginReadAdmission() (check func() error, release func(), err error)
+}
+
+// completeCachedSizer reports a current-process complete-body proof bound to
+// this handle. A cold read may establish it during ReadAt; callers query before
+// and after reading, then retain readAdmissionProvider's final reply check.
+// A rejected proof returns an error; callers must not reuse its old size.
+type completeCachedSizer interface {
+	CompleteCachedSize() (size int64, available bool, err error)
+}
+
+// ResidentRead is an immutable, fully verified local range and a terminal
+// boundary for this local snapshot. Check revokes it if its identity, ancestry,
+// writer, selected volume, or cache mapping changes before reply publication.
+type ResidentRead struct {
+	Data  []byte
+	Size  int64
+	Check func() error
+}
+
+type residentReadPreparer interface {
+	PrepareResidentRead(offset uint64, count uint32) (*ResidentRead, error)
+}
+
+// authoritativeSizer must return the actual size or an error, never a mirror
+// fallback that could turn an unavailable backend into a false short EOF.
+type authoritativeSizer interface {
+	AuthoritativeSize() (int64, error)
 }
 
 // liveSizer, if implemented by a read handle, returns the AUTHORITATIVE current
@@ -308,6 +361,19 @@ type SetFileAttributes struct {
 	SetMtime *time.Time
 }
 
+// FileTruncater is an optional filesystem capability for handling an
+// authoritative SETATTR{size} without opening the file through the generic
+// billy write path. Filesystems that return handled=false retain the default
+// OpenFile+Truncate behavior below.
+//
+// JuiceMount uses this seam while its remote backend is unavailable: a safe
+// whole-file replacement (truncate-to-zero followed by WRITE RPCs) can begin
+// in the durable local spool, while an unsafe partial in-place truncate can
+// fail promptly instead of blocking inside FUSE until the route recovers.
+type FileTruncater interface {
+	TruncateFile(file string, size int64) (handled bool, err error)
+}
+
 // Apply uses a `Change` implementation to set defined attributes on a
 // provided file.
 func (s *SetFileAttributes) Apply(changer billy.Change, fs billy.Filesystem, file string) error {
@@ -317,7 +383,7 @@ func (s *SetFileAttributes) Apply(changer billy.Change, fs billy.Filesystem, fil
 	} else if errors.Is(err, os.ErrPermission) {
 		return &NFSStatusError{NFSStatusAccess, os.ErrPermission}
 	} else if err != nil {
-		return nil
+		return nfsStatusErrorFrom(err)
 	}
 	curr := ToFileAttribute(curOS, file)
 
@@ -362,27 +428,39 @@ func (s *SetFileAttributes) Apply(changer billy.Change, fs billy.Filesystem, fil
 		if curr.Mode()&os.ModeSymlink != 0 {
 			return &NFSStatusError{NFSStatusNotSupp, os.ErrInvalid}
 		}
-		fp, err := fs.OpenFile(file, os.O_WRONLY|os.O_EXCL, 0)
-		if errors.Is(err, os.ErrPermission) {
-			return &NFSStatusError{NFSStatusAccess, err}
-		} else if err != nil {
-			return nfsStatusErrorFrom(err)
+		handled := false
+		if truncater, ok := fs.(FileTruncater); ok {
+			if *s.SetSize > math.MaxInt64 {
+				return &NFSStatusError{NFSStatusInval, os.ErrInvalid}
+			}
+			handled, err = truncater.TruncateFile(file, int64(*s.SetSize))
+			if err != nil {
+				return nfsStatusErrorFrom(err)
+			}
 		}
-		// From here on fp MUST be closed on every path. The backing
-		// handler counts open write handles (JuiceMount's spool entries
-		// refcount them); a dropped handle blocks idle-finalize forever —
-		// the entry sits in `writing` state, never drains, and leaks its
-		// capacity reservation (Phase-1 BUG 2, 43 stuck entries).
-		if *s.SetSize > math.MaxInt64 {
-			_ = fp.Close()
-			return &NFSStatusError{NFSStatusInval, os.ErrInvalid}
-		}
-		if err := fp.Truncate(int64(*s.SetSize)); err != nil {
-			_ = fp.Close()
-			return nfsStatusErrorFrom(err)
-		}
-		if err := fp.Close(); err != nil {
-			return nfsStatusErrorFrom(err)
+		if !handled {
+			fp, err := fs.OpenFile(file, os.O_WRONLY|os.O_EXCL, 0)
+			if errors.Is(err, os.ErrPermission) {
+				return &NFSStatusError{NFSStatusAccess, err}
+			} else if err != nil {
+				return nfsStatusErrorFrom(err)
+			}
+			// From here on fp MUST be closed on every path. The backing
+			// handler counts open write handles (JuiceMount's spool entries
+			// refcount them); a dropped handle blocks idle-finalize forever —
+			// the entry sits in `writing` state, never drains, and leaks its
+			// capacity reservation (Phase-1 BUG 2, 43 stuck entries).
+			if *s.SetSize > math.MaxInt64 {
+				_ = fp.Close()
+				return &NFSStatusError{NFSStatusInval, os.ErrInvalid}
+			}
+			if err := fp.Truncate(int64(*s.SetSize)); err != nil {
+				_ = fp.Close()
+				return nfsStatusErrorFrom(err)
+			}
+			if err := fp.Close(); err != nil {
+				return nfsStatusErrorFrom(err)
+			}
 		}
 	}
 

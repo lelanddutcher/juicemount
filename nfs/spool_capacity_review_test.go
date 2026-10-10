@@ -13,8 +13,10 @@ package nfs
 // clobbering fresh bytes with the stale spool file.
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 )
 
@@ -147,17 +149,14 @@ func TestRetryFailedSkipsRowsWithNewerRowForPath(t *testing.T) {
 	rowOld, _ = spool.Meta().Get(rowOld.ID)
 	drainer.failPermanent(rowOld, "test: NAS unreachable")
 
-	// User deletes the failed file in Finder (evicts the zombie index entry;
-	// the FAILED SQL row survives — it's not "active"), then re-copies it:
-	// fresh bytes, NEWER row for the same path.
-	if err := jfs.Remove("doc.bin"); err != nil {
-		t.Fatalf("remove: %v", err)
+	// A failed latest save owns the namespace until resolved; REMOVE must
+	// refuse it. Seed a newer accepted local save directly to exercise the
+	// retained failed-history retry guard without weakening that refusal.
+	if err := jfs.Remove("doc.bin"); !errors.Is(err, syscall.EIO) {
+		t.Fatalf("failed source removal = %v, want EIO", err)
 	}
 	fresh := patternedPayload(20<<10, 53)
-	simulateNFSCreateThenWrite(t, jfs, "doc.bin", fresh, 10<<10)
-	if n := spool.sweepOnce(0); n != 1 {
-		t.Fatalf("sweep2: %d", n)
-	}
+	writeSpoolEntry(t, spool, "doc.bin", fresh)
 	drainAllForTest(t, drainer) // fresh bytes land on FUSE
 
 	// Retry must SKIP the stale failed row (newer row exists).

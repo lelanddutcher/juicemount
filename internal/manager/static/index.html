@@ -4,35 +4,45 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>JuiceMount Manager</title>
-  <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="style.css?v=0.5.0-rc5">
 </head>
 <body>
-  <header>
-    <h1>JuiceMount Manager</h1>
-    <p class="subtitle">Single-pane control plane for your JuiceFS volume</p>
+  <a class="skip-link" href="#app">Skip to Manager content</a>
+  <header class="app-header">
+    <div class="brand-lockup">
+      <span class="brand-mark" aria-hidden="true">JM</span>
+      <div>
+        <p class="brand-eyebrow">Storage orchestration</p>
+        <h1>JuiceMount Manager</h1>
+      </div>
+    </div>
+    <p class="subtitle"><span class="header-status-dot" aria-hidden="true"></span>Volume control plane</p>
   </header>
 
   <div class="layout">
     <!-- Sidebar nav. Hash-route driven: clicking an entry sets
          location.hash to "#/<name>" and app.js swaps the visible
-         <section data-tab>. SLICE 0 ships Migrations functional;
-         every other entry is a "Coming soon" placeholder so the
-         routing skeleton is testable before later slices land. -->
+         <section data-tab>. -->
     <nav id="sidebar" class="sidebar" aria-label="Manager sections">
       <ul class="sidebar-list">
+        <li class="sidebar-heading" aria-hidden="true">Monitor</li>
         <li><a href="#/overview"     data-tab-link="overview">Overview</a></li>
         <li><a href="#/farm"         data-tab-link="farm">Farm</a></li>
+        <li class="sidebar-heading" aria-hidden="true">Storage</li>
         <li><a href="#/migrations"   data-tab-link="migrations">Migrations</a></li>
         <li><a href="#/trash"        data-tab-link="trash">Trash</a></li>
         <li><a href="#/destinations" data-tab-link="destinations">Destinations</a></li>
         <li><a href="#/backups"      data-tab-link="backups">Backups</a></li>
         <li><a href="#/maintenance"  data-tab-link="maintenance">Maintenance</a></li>
+        <li class="sidebar-heading" aria-hidden="true">Network</li>
+        <li><a href="#/link"         data-tab-link="link">JuiceMount Link</a></li>
+        <li class="sidebar-heading" aria-hidden="true">Administration</li>
         <li><a href="#/permissions"  data-tab-link="permissions">Permissions</a></li>
         <li><a href="#/settings"     data-tab-link="settings">Settings</a></li>
       </ul>
     </nav>
 
-    <main id="app">
+    <main id="app" tabindex="-1">
       <!-- Overview tab (SLICE 2). Read-only at-a-glance dashboard.
            Polls /api/overview every 10s while the tab is visible
            (paused on document visibilitychange when hidden). Each
@@ -53,8 +63,23 @@
             <header><h3>Volume</h3><span class="overview-card-state"></span></header>
             <dl>
               <dt>Name</dt><dd data-field="name">—</dd>
+              <dt>Metadata</dt><dd data-field="status">—</dd>
               <dt>Used</dt><dd data-field="used">—</dd>
               <dt>Files</dt><dd data-field="files">—</dd>
+            </dl>
+            <p class="overview-error" hidden></p>
+          </article>
+
+          <!-- T1.3 home polish: farm health at a glance. Worker presence +
+               queue depth come from /api/farm/jobs, sweep progress from the
+               /api/farm rollup — both polled on the same 10s cadence as
+               /api/overview inside pollOverview(). -->
+          <article class="overview-card" data-card="farm">
+            <header><h3>Farm</h3><span class="overview-card-state"></span></header>
+            <dl>
+              <dt>Workers</dt><dd data-field="workers">—</dd>
+              <dt>Queue</dt><dd data-field="queue">—</dd>
+              <dt>Sweep</dt><dd data-field="sweep">—</dd>
             </dl>
             <p class="overview-error" hidden></p>
           </article>
@@ -79,24 +104,43 @@
             <p class="overview-error" hidden></p>
           </article>
 
+          <!-- T1.3 home polish: remote-access (JuiceMount Link) health,
+               from GET /api/net/link on the same overview cadence. -->
+          <article class="overview-card" data-card="link">
+            <header><h3>Link</h3><span class="overview-card-state"></span></header>
+            <dl>
+              <dt>Status</dt><dd data-field="status">—</dd>
+              <dt>Server</dt><dd data-field="server">—</dd>
+            </dl>
+            <p class="overview-error" hidden></p>
+          </article>
+
           <article class="overview-card overview-card-wide" data-card="jobs">
             <header><h3>Recent jobs</h3><span class="overview-card-state"></span></header>
+            <ul class="overview-jobs" data-field="items"></ul>
+            <p class="overview-error" hidden></p>
+          </article>
+
+          <!-- T1.3 home polish: one-screen "what's wrong" rollup. Backend
+               probe errors + failed jobs, derived client-side from the same
+               /api/overview snapshot — no extra endpoint. -->
+          <article class="overview-card overview-card-wide" data-card="errors">
+            <header><h3>Recent errors</h3><span class="overview-card-state"></span></header>
             <ul class="overview-jobs" data-field="items"></ul>
             <p class="overview-error" hidden></p>
           </article>
         </div>
       </section>
 
-      <!-- Farm tab (Phase 1, read-only) — the server-side juicefarm's
-           generation coverage + last sweep, read from the farm's
-           farm-status.json rollup via /api/farm. No farm control here
-           yet (throttle/trigger come later); this is the "what has the
-           farm produced" glance. -->
+      <!-- Farm operations tab — combines the server-side farm-status.json
+           rollup with durable queue transport, node enrollment/lifecycle,
+           measured routing telemetry, and recent job history. -->
       <section data-tab="farm" class="tab-pane farm-pane" hidden>
-        <div class="overview-header">
-          <h2>Farm</h2>
+        <div class="overview-header farm-page-header">
+          <p class="section-kicker">Compute fabric</p>
+          <h2>Media Farm</h2>
           <p class="hint">
-            Server-side derivative + AI generation coverage. Refreshed every 10 seconds while this tab is open.
+            An always-on ingest queue that discovers media, keeps metadata local, and routes heavy work to verified accelerators.
             <span id="farm-updated" class="overview-updated"></span>
           </p>
         </div>
@@ -108,10 +152,8 @@
           <div class="farm-explainer-body">
             <h3>What is the farm?</h3>
             <p>
-              The farm is a background worker on your NAS that pre-generates the
-              previews, proxies, and transcripts your media needs — so OpenLoupe
-              and this web UI can show thumbnails, scrub clips, and search speech
-              instantly instead of regenerating everything on your laptop.
+              The farm pre-generates previews, proxies, and transcripts on the NAS
+              so OpenLoupe can show thumbnails, scrub video, and search speech immediately.
             </p>
           </div>
           <button type="button" id="farm-explainer-dismiss" class="farm-explainer-dismiss"
@@ -128,10 +170,10 @@
              untrusted path or error string can't inject markup. -->
         <section class="farm-generate" aria-label="Generate on the farm">
           <div class="overview-header">
-            <h3 class="farm-generate-title">Generate on the farm</h3>
+            <p class="section-kicker">Queue command</p>
+            <h3 class="farm-generate-title">Automatic ingest</h3>
             <p class="hint">
-              Queue a folder or file for the NAS to pre-generate previews, proxies,
-              and transcripts in the background. Jobs run as soon as a farm worker is online.
+              New media is detected recursively. Metadata stays on the server; HEVC video and accelerated AI work go to the fastest verified render node.
             </p>
           </div>
 
@@ -141,8 +183,156 @@
             <span id="farm-active-text" class="farm-active-text">Checking the farm…</span>
             <span id="farm-active-depth" class="farm-active-depth" hidden></span>
           </div>
+          <div id="farm-queue-depths" class="farm-queue-depths" aria-label="Queue depth by processing lane"></div>
 
-          <!-- Queue-a-sweep form. -->
+          <div class="farm-control-deck" aria-label="Farm queue controls">
+            <button id="farm-queue-toggle" class="farm-transport" type="button" disabled>
+              <span class="farm-transport-icon" aria-hidden="true">Ⅱ</span>
+              <span><strong>Pause queue</strong><em>Finish active work, then stop claiming jobs</em></span>
+            </button>
+            <button id="farm-watch-toggle" class="farm-transport secondary" type="button" disabled>
+              <span class="farm-transport-icon" aria-hidden="true">◎</span>
+              <span><strong>Discovery on</strong><em>Recursively watch for newly landed media</em></span>
+            </button>
+            <p id="farm-control-status" class="farm-control-status" role="status">Loading queue controls…</p>
+          </div>
+
+          <details id="farm-enrollment" class="farm-enrollment-card">
+            <summary>
+              <span><strong>Add a processing node</strong><em>Generate an exact, persistent worker install plan</em></span>
+            </summary>
+            <form id="farm-enrollment-form" class="farm-enrollment-form">
+              <p class="farm-config-hint">The plan pins the RC image, stable node identity, local state/cache,
+                restart policy, and hardware role. Remote plans also mint a one-time JuiceMount Link authorization.
+                Credentials are shown once and this response is never cached.</p>
+              <div class="farm-config-grid">
+                <label class="field"><span>Node name</span>
+                  <input id="farm-enroll-name" type="text" placeholder="studio-render-01"
+                         autocomplete="off" spellcheck="false" required></label>
+                <label class="field"><span>Node role</span>
+                  <select id="farm-enroll-role">
+                    <option value="render">Intel GPU render</option>
+                    <option value="server">Server / metadata</option>
+                  </select></label>
+                <label class="field"><span>Persistent state path</span>
+                  <input id="farm-enroll-state" type="text" placeholder="Auto: /var/lib/juicemount/&lt;name&gt;/state"
+                         autocomplete="off" spellcheck="false"></label>
+                <label class="field"><span>SSD cache path</span>
+                  <input id="farm-enroll-cache" type="text" placeholder="Auto: /var/cache/juicemount/&lt;name&gt;"
+                         autocomplete="off" spellcheck="false"></label>
+              </div>
+              <label class="opt farm-enroll-remote"><input id="farm-enroll-remote" type="checkbox">
+                <span><strong>Node is outside this LAN</strong><em>Include a one-time Headscale/Tailscale join command.</em></span>
+              </label>
+              <div class="farm-enrollment-actions">
+                <button id="farm-enroll-create" type="submit">Create install plan</button>
+                <span id="farm-enroll-status" class="farm-config-status" role="status"></span>
+              </div>
+            </form>
+            <div id="farm-enrollment-result" class="farm-enrollment-result" hidden>
+              <div class="farm-enrollment-result-head">
+                <div><p class="section-kicker">Prepared plan</p><h4 id="farm-enroll-plan-title">Processing node</h4></div>
+                <span id="farm-enroll-plan-commit" class="farm-worker-build"></span>
+              </div>
+              <div id="farm-enroll-link-row" class="farm-command-block" hidden>
+                <div><strong>Join JuiceMount Link</strong><button type="button" class="btn btn-sm" data-copy-target="farm-enroll-link-command">Copy</button></div>
+                <code id="farm-enroll-link-command"></code>
+              </div>
+              <div class="farm-command-block">
+                <div><strong>Prepare persistent storage</strong><button type="button" class="btn btn-sm" data-copy-target="farm-enroll-prepare-command">Copy</button></div>
+                <code id="farm-enroll-prepare-command"></code>
+              </div>
+              <div class="farm-command-block">
+                <div><strong>Start the exact worker</strong><button type="button" class="btn btn-sm" data-copy-target="farm-enroll-docker-command">Copy</button></div>
+                <code id="farm-enroll-docker-command"></code>
+              </div>
+              <div class="farm-command-block">
+                <div><strong>Install reboot recovery</strong><button type="button" class="btn btn-sm" data-copy-target="farm-enroll-recovery-unit">Copy</button></div>
+                <pre><code id="farm-enroll-recovery-unit"></code></pre>
+              </div>
+              <div class="farm-command-block">
+                <div><strong>Install and enable unit</strong><button type="button" class="btn btn-sm" data-copy-target="farm-enroll-recovery-command">Copy</button></div>
+                <pre><code id="farm-enroll-recovery-command"></code></pre>
+              </div>
+              <ul id="farm-enroll-checks" class="farm-enrollment-checks"></ul>
+            </div>
+          </details>
+
+          <section class="farm-node-section" aria-labelledby="farm-node-title">
+            <div class="farm-jobs-header">
+              <div>
+                <p class="section-kicker">Routing telemetry</p>
+                <h4 id="farm-node-title" class="farm-jobs-title">Active nodes</h4>
+              </div>
+              <span class="farm-routing-note">HEVC → hardware H.264 → CPU H.264</span>
+            </div>
+            <div id="farm-workers-list" class="farm-workers-list"></div>
+          </section>
+
+          <!-- Node config drawer (FARM-NODE-CONFIG): manager-owned per-worker settings. -->
+          <details id="farm-config-drawer" class="farm-config-drawer">
+            <summary>Advanced node configuration</summary>
+            <p class="farm-config-hint">Settings here are pushed to every farm node over the
+              queue connection — no need to restart containers for quality, model or encoder
+              changes. A node that can't apply a change live shows a “needs restart” badge.</p>
+            <form id="farm-config-form" class="farm-config-form">
+              <label class="field">
+                <span>Node name (blank = all nodes)</span>
+                <input id="farm-config-node" type="text" placeholder="e.g. b70-gpu"
+                       autocomplete="off" spellcheck="false">
+              </label>
+              <div class="farm-config-grid">
+                <label class="field"><span>Whisper model</span>
+                  <input id="cfg-model" type="text" placeholder="medium.en"></label>
+                <label class="field"><span>Transcript device</span>
+                  <select id="cfg-device">
+                    <option value="">(keep current)</option>
+                    <option value="cpu">cpu</option>
+                    <option value="vulkan">vulkan</option>
+                    <option value="cuda">cuda</option>
+                    <option value="sycl">sycl</option>
+                  </select></label>
+                <label class="field"><span>Proxy encoder</span>
+                  <select id="cfg-vcodec">
+                    <option value="">(keep current)</option>
+                    <option value="libx264">libx264</option>
+                    <option value="h264_vaapi">h264_vaapi</option>
+                    <option value="h264_qsv">h264_qsv</option>
+                    <option value="h264_nvenc">h264_nvenc</option>
+                    <option value="hevc_vaapi">hevc_vaapi (HEVC)</option>
+                    <option value="hevc_qsv">hevc_qsv (HEVC)</option>
+                    <option value="hevc_nvenc">hevc_nvenc (HEVC)</option>
+                    <option value="libx265">libx265 (HEVC, CPU)</option>
+                  </select></label>
+                <label class="field"><span>CRF</span>
+                  <input id="cfg-crf" type="number" min="1" max="51" placeholder="21"></label>
+                <label class="field"><span>x264 preset</span>
+                  <select id="cfg-preset">
+                    <option value="">(keep current)</option>
+                    <option value="ultrafast">ultrafast</option><option value="superfast">superfast</option>
+                    <option value="veryfast">veryfast</option><option value="faster">faster</option>
+                    <option value="fast">fast</option><option value="medium">medium</option>
+                    <option value="slow">slow</option><option value="slower">slower</option>
+                    <option value="veryslow">veryslow</option>
+                  </select></label>
+                <label class="field"><span>Workers</span>
+                  <input id="cfg-workers" type="number" min="1" max="256" placeholder="auto"></label>
+                <label class="field"><span>Proxy workers</span>
+                  <input id="cfg-proxy-workers" type="number" min="0" max="256" placeholder="auto"></label>
+                <label class="field"><span>ffmpeg threads</span>
+                  <input id="cfg-ffmpeg-threads" type="number" min="0" max="64" placeholder="2"></label>
+              </div>
+              <div class="farm-config-actions">
+                <button type="submit" id="farm-config-save">Save config</button>
+                <span id="farm-config-status" class="farm-config-status" role="status"></span>
+              </div>
+            </form>
+          </details>
+
+          <!-- The standing watcher is the normal path. This manual override is
+               deliberately secondary for repairs and targeted re-runs. -->
+          <details class="farm-manual-drawer">
+            <summary>Manual target override</summary>
           <div class="farm-sweep-form">
             <label class="field">
               <span>Path to sweep (a folder or a single file)</span>
@@ -160,7 +350,7 @@
               <label class="opt">
                 <input type="checkbox" id="farm-kind-proxy" value="proxy">
                 <span><strong>Proxy</strong>
-                  <em>A lightweight, fast-to-scrub editing copy. CPU-heavy.</em></span>
+                  <em>HEVC on a verified GPU; H.264 only on the explicit CPU fallback lane.</em></span>
               </label>
               <label class="opt">
                 <input type="checkbox" id="farm-kind-transcript" value="transcript">
@@ -174,17 +364,25 @@
             </div>
             <p id="farm-sweep-error" class="error" hidden></p>
           </div>
+          </details>
 
           <!-- Recent jobs from the queue, newest first. -->
           <div class="farm-jobs-wrap">
             <div class="farm-jobs-header">
               <h4 class="farm-jobs-title">Recent jobs</h4>
-              <button id="farm-jobs-clear" class="farm-jobs-clear" type="button" title="Remove finished (done/failed) jobs from this list. Running and queued jobs are kept.">Clear finished</button>
+              <div class="farm-jobs-toolbar">
+                <span id="farm-jobs-summary" class="farm-jobs-summary" role="status"></span>
+                <button id="farm-jobs-clear" class="farm-jobs-clear" type="button" title="Remove terminal (done/failed/canceled) jobs from this list. Running and queued jobs are kept.">Clear finished</button>
+              </div>
             </div>
             <span id="farm-jobs-clear-flash" class="farm-jobs-flash" hidden></span>
             <ul id="farm-jobs-list" class="farm-jobs-list">
               <li class="farm-jobs-empty">No jobs queued yet.</li>
             </ul>
+            <div class="farm-jobs-pagination" aria-label="Recent job history">
+              <button id="farm-jobs-more" type="button" hidden>Show older</button>
+              <button id="farm-jobs-collapse" type="button" hidden>Show recent only</button>
+            </div>
           </div>
         </section>
 
@@ -218,9 +416,13 @@
                  progress bar, derived from index.by_kind + total_assets. -->
             <article class="overview-card overview-card-wide" data-card="farm-coverage">
               <header>
-                <h3>Coverage</h3>
+                <h3>Server-local coverage</h3>
                 <span class="overview-card-state" id="farm-assets"></span>
               </header>
+              <p class="farm-card-sub">
+                This rollup comes from the server worker's local index. Remote-node outputs remain portable through
+                derivative sidecars and appear here after the server reconciles them.
+              </p>
               <ul id="farm-coverage-list" class="farm-coverage-list"></ul>
             </article>
 
@@ -228,13 +430,14 @@
                  process that produces it. Static knowledge; the proxy + ai
                  rows show live governor values when present. -->
             <article class="overview-card overview-card-wide" data-card="farm-provenance">
-              <header><h3>How each derivative is made</h3></header>
+              <header><h3>How farm work is produced</h3></header>
               <p class="farm-card-sub">
-                Every preview is produced by a real, inspectable tool on the NAS —
-                nothing is invented. Here is what runs for each kind.
+                Lightweight metadata stays on the server; heavy video and AI work route to verified processing nodes.
+                Server-local fallback values below are not the farm-wide routing decision.
               </p>
               <table class="farm-table farm-provenance-table">
-                <thead><tr><th>Derivative</th><th>Tool</th><th>What it does</th></tr></thead>
+                <caption class="sr-only">Derivative generation tools and purposes</caption>
+                <thead><tr><th scope="col">Derivative</th><th scope="col">Tool</th><th scope="col">What it does</th></tr></thead>
                 <tbody id="farm-provenance"></tbody>
               </table>
             </article>
@@ -242,10 +445,10 @@
             <!-- Knob inspector: read-only view of status.governor. Degrades
                  to a "settings not yet reported" hint when governor absent. -->
             <article class="overview-card overview-card-wide" data-card="farm-governor">
-              <header><h3>Farm settings</h3></header>
+              <header><h3>Server worker defaults</h3></header>
               <p class="farm-card-sub">
-                Read-only. These are the knobs the farm is running with right now
-                (set on the NAS, not editable here). Hover a label for what it means.
+                Read-only defaults reported by the server-local rollup. Active Nodes above is authoritative for each
+                worker's live encoder, AI device, capacity, and measured route.
               </p>
               <p id="farm-governor-empty" class="hint" hidden>Settings not yet reported by the farm.</p>
               <dl id="farm-governor" class="farm-governor-grid"></dl>
@@ -725,7 +928,7 @@
               local cache. Defaults to the volume root.
             </p>
             <div class="maintenance-controls">
-              <input type="text" data-field="path" placeholder="/jfs (volume root)">
+              <input type="text" data-field="path" aria-label="Warmup path" placeholder="/jfs (volume root)">
               <button type="button" data-action="run">Run warmup</button>
             </div>
             <pre class="maintenance-output" data-field="output" aria-live="polite"></pre>
@@ -833,6 +1036,42 @@
 
       <!-- Settings tab — wired to GET/PUT /api/settings and POST
            /api/settings/rotate-admin-key. -->
+      <section data-tab="link" class="tab-pane link-pane" hidden>
+        <div class="link-page-header">
+          <p class="section-kicker">Encrypted edge access</p>
+          <h2>JuiceMount Link</h2>
+          <p class="hint">Pair Macs into your private media network, then watch authorization and route presence update live.</p>
+        </div>
+        <div id="link-status" class="card link-card link-status-card offline">
+          <span class="link-status-light" aria-hidden="true"></span>
+          <div><p class="section-kicker">Control plane</p>
+          <h3 id="link-enabled">Checking…</h3>
+          <p id="link-status-detail" class="hint">Contacting the coordination service.</p></div>
+        </div>
+        <div id="link-pair" class="card link-card" style="display:none">
+          <p class="section-kicker">Enrollment</p>
+          <h3>Add a Mac</h3>
+          <p class="hint">Generate a one-hour authorization code, then use Apply &amp; Test in the desktop app.</p>
+          <button id="btn-pair" class="btn link-primary-button">Generate pairing code</button>
+          <div id="pair-result" class="pair-result" style="display:none">
+            <p>Paste this code in the Mac app's <strong>Remote Access</strong> settings:</p>
+            <code id="pair-code" class="pair-code"></code>
+            <p class="hint">Expires in 1 hour. Each Mac needs its own code.</p>
+          </div>
+        </div>
+        <div id="link-devices" class="card link-card" style="display:none">
+          <div class="link-devices-head"><div><p class="section-kicker">Tailnet presence</p><h3>Paired devices</h3></div>
+          <button id="btn-refresh-devices" class="btn">Refresh</button></div>
+          <div class="link-table-wrap"><table id="devices-table" class="link-devices-table">
+            <caption class="sr-only">Paired JuiceMount Link devices</caption>
+            <thead><tr>
+              <th scope="col">Hostname</th><th scope="col">IP</th><th scope="col">Status</th><th scope="col">Last seen</th><th scope="col"><span class="sr-only">Actions</span></th>
+            </tr></thead>
+            <tbody id="devices-body"></tbody>
+          </table></div>
+        </div>
+      </section>
+
       <section data-tab="settings" class="tab-pane settings-pane" hidden>
         <div class="settings-header">
           <h2>Settings</h2>
@@ -927,13 +1166,33 @@
     </main>
   </div>
 
+  <dialog id="auth-dialog" class="auth-dialog" aria-labelledby="auth-dialog-title" aria-describedby="auth-dialog-description">
+    <form id="auth-form" class="auth-dialog-card" method="dialog">
+      <p class="section-kicker">Secure administration</p>
+      <h2 id="auth-dialog-title">Connect to this Manager</h2>
+      <p id="auth-dialog-description" class="auth-dialog-description">
+        Enter the admin key configured on this JuiceMount server. It is saved only in this browser's local storage.
+      </p>
+      <label class="field auth-dialog-field" for="auth-key-input">
+        <span>Admin key</span>
+        <input id="auth-key-input" name="admin-key" type="password" autocomplete="off" spellcheck="false" required>
+      </label>
+      <p id="auth-dialog-status" class="auth-dialog-status" role="alert" aria-live="assertive" hidden></p>
+      <div class="auth-dialog-actions">
+        <button id="auth-dialog-cancel" type="button">Cancel</button>
+        <button id="auth-dialog-connect" type="submit">Connect</button>
+      </div>
+    </form>
+  </dialog>
+
   <footer>
     <small>
-      <span id="auth-state">No auth required</span> ·
+      <span id="auth-state" aria-live="polite">Authentication not yet verified</span>
+      <button id="auth-key-button" class="auth-key-button" type="button">Enter or change admin key</button> ·
       <a href="https://github.com/lelanddutcher/juicemount" rel="noopener">github.com/lelanddutcher/juicemount</a>
     </small>
   </footer>
 
-  <script src="app.js"></script>
+  <script src="app.js?v=0.5.0-rc5"></script>
 </body>
 </html>

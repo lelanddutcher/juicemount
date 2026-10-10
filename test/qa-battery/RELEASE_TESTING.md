@@ -35,12 +35,14 @@ integrity after the fact — never to drive a copy.
 
 2. **Full chain of custody, end to end.** For every file the chain is:
    Finder write → NFS handler (CREATE/WRITE/SETATTR) → write spool →
-   drainer (`io.CopyBuffer` + SHA at-rest re-read verify) → JuiceFS backend →
+   drainer (bounded durable checkpoints + streaming SHA verification) → JuiceFS backend →
    **readback** (`md5` == source). The drain gate is **mandatory before
    verifying**: `qa_wait_drain` blocks until `pending_files == 0 AND
-   in_progress == 0` so custody reads the at-rest backend copy, never the spool
-   or cache. `qa_verify_custody` passes **only** when `MISSING == 0 AND
-   WRONG == 0` (zero data loss, zero corruption).
+   in_progress == 0`. `qa_verify_custody` passes **only** when `MISSING == 0
+   AND WRONG == 0` for mounted readback. Drain plus a mounted hash match is
+   necessary, but resident caching can still serve that read; it does not by
+   itself prove backend persistence. Compare the retained source manifest to
+   an independent backend readback before claiming full custody.
 
 3. **Zero random Finder errors gate.** No user-visible failure may appear in the
    JuiceMount log during the run. Gated signatures (grounded in `nfs/handler.go`):
@@ -64,7 +66,7 @@ integrity after the fact — never to drive a copy.
 5. **Offline / spool-disconnect hardening.** The write spool must keep full
    chain of custody when the backend is unavailable — the field scenario (NAS
    asleep, Wi-Fi drops, laptop carried out of range mid-copy). The control plane
-   `GET /offline?on=1|0` forces offline / back-online; the spool buffers writes
+   `POST /offline?on=1|0` forces offline / back-online; the spool buffers writes
    with NO drain while offline, then drains losslessly on reconnect. Cached
    directory listings must stay snappy while offline (principle #4 holds with no
    network).
@@ -97,15 +99,15 @@ integrity after the fact — never to drive a copy.
 |---|--------|--------|---------------|
 | 01 | `01-file-types.sh` | One real Finder copy of a folder holding **every realistic item type**: media (`.mov/.mp4/.wav/.aac`), docs (`.pdf/.jpg/.png`), archives (`.zip/.dmg`), a `.app` bundle, a `*.framework` with `Versions/A` + `Versions/Current` symlinks, a relative symlink, a dangling symlink, files with xattrs/resource forks, `uchg`/ACL items. | Per-item custody md5 == source for regular files; `Versions/Current -> A` stays a symlink and resolves; top-level `Sample` shim resolves through it to the real binary; relative-link target string preserved; dangling link stays dangling; perms/`uchg`/ACL/xattr-sidecar preserved. Zero gated errors. |
 | 02 | `02-file-sizes.sh` | **Size spectrum** through the full spool/drain chain: `zero` (0B), `onebyte`, `kb` (4KiB), `mb5`, `mb100`, `gb1` (>1GB). | Real Finder duplicate drives every copy; full custody per size; **no torn/partial-size read** during the drain tail (landed size only ever equals the final source size, polled during drain); landed size == source size exactly. Zero gated errors. |
-| 03 | `03-deep-wide-trees.sh` | Tree shapes that stress LOOKUP/CREATE/readdir at the edges: **DEEP** (14-level chain), **WIDE** (1200 files in one dir), **MIXED** (3200 files over 64 dirs, with mid-copy navigation probes). | Whole-folder real Finder duplicate; full drain; total file count + full md5 custody; intermediate dirs stay navigable during the in-flight MIXED copy (worst observed listing latency recorded). Zero gated errors. |
+| 03 | `03-deep-wide-trees.sh` | Tree shapes that stress LOOKUP/CREATE/readdir at the edges: **DEEP** (14-level chain), **WIDE** (1200 files in one dir), **MIXED** (3200 files over 64 dirs, with mid-copy navigation probes). | Whole-folder real Finder duplicate; full drain; total file count + full md5 custody; intermediate dirs stay navigable during the in-flight MIXED copy. A persistent probe process times only opendir/readdir/closedir: p99 must remain `< QA_SNAPPY_MS`, no sample may reach `QA_HARD_STALL_MS`, and gated errors remain zero. |
 | 04 | `04-unicode-names.sh` | **Pathological filenames**: emoji, NFC **and** NFD accents, CJK, RTL/bidi marks, 255-byte max leaf, spaces/`&`/`;`/parens, leading dot, trailing space. | Every name lands, is findable, drains, reads back byte-identical. No normalization-induced collision/loss; no `-36/-43/-1407/STALE/phantom`. The NFC-vs-NFD lookup gap is asserted as its own explicit `qa_warn` (driven to zero, not masked). |
 | 05 | `05-concurrent-copies.sh` | **Genuine concurrency**: 3–4 simultaneous real Finder duplicates (each own dest+manifest) + 1 concurrent large-file readback loop + concurrent dir-nav sampling, all overlapping. | One combined drain, per-dest custody (`MISSING==0 && WRONG==0` each), single error scan over the whole concurrency window. No `100060` retry-storm, no shared-handle STALE, listings stay `< QA_SNAPPY_MS` and never beachball while the spool is hot. |
 | 06 | `06-cancel-retry.sh` | **Interruption resilience**: (a) cancel mid-flight ×N then a clean retry of the same source; (b) back-to-back copy to the SAME dest name after `rm -rf` (directory delete-lag `-48`). | A cancelled copy strands **no** handle / phantom / STALE; mount stays healthy; the clean retry succeeds with full custody. The back-to-back same-dest case completes; the single `-48` delete-lag is the named known-open edge (driven to zero). |
-| 07 | `07-offline-spool.sh` | **Write-spool hardening**: offline toggle buffers writes with no drain; a real mid-copy disconnect; stall/backpressure when the offline buffer fills. | Full custody after reconnect (lossless drain); spool fields (`pending/in_progress/failed/quarantined/stall_waiters/offline_buffer_full`) behave per `nfs/spool_status.go`; cached listings stay snappy while offline; nothing quarantined that shouldn't be. Zero gated errors. |
-| 08 | `08-chain-of-custody.sh` | **Dedicated end-to-end custody stress** (long-tail readback / at-rest SHA verify) for a large mixed corpus incl. a >1GB camera-original-scale file. | REAL Finder copy → spool transit observed → mandatory full drain → two readback sweeps md5 == source (MISSING==0 && WRONG==0) exercising the at-rest SHA verify path → zero gated Finder errors. |
-| 09 | `09-finder-snappiness.sh` | **Directory-open snappiness** across dir sizes (10/100/1000/5000 files, with real `._AppleDouble` sidecars): COLD (first listing), WARM (re-list from DB), OFFLINE (DB-served with control plane offline), DRAINING (unrelated cached dir while a copy drains). | Every local-DB-resident listing `< QA_SNAPPY_MS`. Key metric = worst observed `MS` vs budget (from `latency-table.tsv`). Any listing `>=` budget is a hard FAIL naming the dir. |
-| 10 | `10-index-stability.sh` | **Stability during a metadata index reconcile** (the Chrome file-picker-froze-all-of-Finder symptom). Also verifies the build uses **keyspace-PUSH** (incremental Redis deltas) and is NOT doing a ~30s full SCAN re-pull when it shouldn't. | Listings stay snappy and a parallel Finder copy keeps progressing while a reconcile runs (`GET /activity` `busy`/`reconcile`); log shows keyspace-push events, no spurious "promoting to full SCAN". Full custody on the parallel copy; zero gated errors. |
-| 11 | `11-drain-latency.sh` | **Directory-open + Stat latency UNDER sustained spool-drain load** (the "Finder spinner while a copy drains" regression). Pre-caches an unrelated tree, starts a sustained multi-GB Finder copy to keep the drainer's `CopyBuffer`+`Sync` hot, then loops measuring dir-open (`qa_dir_listing_ms`) AND per-file Stat/GETATTR on the cached tree for the whole drain window, recording p50/p99. | Across the entire drain window, **p99 of both dir-open and Stat `< QA_SNAPPY_MS`** (any single sample over budget is a hard FAIL naming it). Proves the async phantom-purge + isolated prefetch gate keep the synchronous Stat hot path off FUSE so a hot drain can't head-of-line-block Finder's NFS connection. LOAD-payload custody intact (zero data loss under load); zero gated errors. Key metric in `drain-latency-table.tsv`. |
+| 07 | `07-offline-spool.sh` | **Write-spool hardening**: offline toggle buffers writes with no drain; a real mid-copy disconnect; stall/backpressure when the offline buffer fills. | Full custody after reconnect (lossless drain); spool fields (`pending/in_progress/failed_files/quarantined/stall_waiters/offline_buffer_full`) behave per `nfs/spool_status.go`; cached listings stay snappy while offline; nothing quarantined that shouldn't be. Zero gated errors. |
+| 08 | `08-chain-of-custody.sh` | **Dedicated end-to-end custody stress** (long-tail backend readback) for a large mixed corpus incl. a >1GB camera-original-scale file. | REAL Finder copy → spool transit observed → mandatory full drain → two independent backend readback sweeps md5 == source (MISSING==0 && WRONG==0) → zero gated Finder errors. |
+| 09 | `09-finder-snappiness.sh` | Finder-populated **directory enumeration** for 10/100/1000/5000 primary files, with separately inventoried AppleDouble/system entries. First-timed (not cold), warm, effective forced-offline, and active-drain-progress brackets. Original Finder replies and worker joins are retained; unknown completion holds the fixture. | Exact primary names/counts, typed monotonic NFS counters, positive drain progress and every valid enumeration `< QA_SNAPPY_MS`. Per-interval JSON and console output label client-cache-only intervals as server-path unproven; `latency-table.tsv` retains the five-column timing format. This is not Finder paint timing or proof of no network; independent backend verification remains a controller gate. |
+| 10 | `10-index-stability.sh` | One supported metadata sync with sampled reconcile-active boundaries. Defaults remain20×15×262144B plus2×5×131072B; primary bytes79,953,920. | At least12 valid listings spanning both owned namespaces, all below200ms; actual parallel Finder reply below45s and a covered interval inside its original lifetime. Real keyspace delivery and published-mutation deltas required separately from intentional sync. Unknown or uncovered is RED/HOLD, never warning-based PASS. Backend proof remains an independent controller gate. |
+| 11 | `11-drain-latency.sh` | Finder-populated probe (200×4096B) and sustained load (8×40×8MiB), with original copy intent/reply/join custody. Paired enumeration and regular-file stat are retained from load dispatch until positive original reply plus typed settled spool. | At least40 valid pairs active at both spool acquisition boundaries and positive succeeded growth across the covered window. Both whole-window and active-only nearest-rank p99 must be `< QA_SNAPPY_MS` (200ms), every valid sample below `QA_HARD_STALL_MS` (1000ms). No post-drain padding. Deadlines, errors, invalid schemas or missing coverage are RED. Global READDIR/READDIRPLUS and GETATTR brackets distinguish client-cache-only observations; they do not establish exclusive probe attribution, Finder paint or a no-network path. Original operations remain owned through failure; `QA_KEEP_DATA=1` retains evidence. Mounted-byte custody is checked; independent backend readback remains the controller gate. |
 
 Category labels in the table match the `VERDICT:` line each script emits
 (`VERDICT: PASS <label>` / `VERDICT: FAIL <label>: <reason>`). Scripts always
@@ -157,6 +159,21 @@ QA_SNAPPY_MS=150 ./run-all.sh
 MOUNT=/Volumes/zpool CP_ADDR=127.0.0.1:11050 ./run-all.sh
 ```
 
+An explicitly supplied `MOUNT` is used exactly as given, including
+`/Volumes/zpool`; an empty explicit value fails before any fallback. Only an
+unset `MOUNT` may autodetect a loopback NFS mount. An explicit `QA_POOL` is
+honored; otherwise its lazily generated 64 MiB file lives under `QA_STAGE`.
+For an isolated persistent staging root, set `QA_STAGE` and `QA_ARTIFACTS` to
+owned paths before running the battery.
+
+`QA_KEEP_DATA=1` is an opt-in inspection aid: it skips `lib.sh`'s `qa_cleanup`
+and category 04's EXIT-trap offline reset and deletion. The default cleanup
+behavior is unchanged. This retention applies only to the library cleanup and
+category 04 trap; other categories may have their own cleanup actions. It does
+not establish Finder timeout completion, ownership of pending operations, or
+custody of a retained mount. Inspect those separately before using retained
+data as release evidence.
+
 Run a **single category script directly** (it sources `lib.sh`, runs its own
 preflight, and prints its own `VERDICT:` line):
 
@@ -190,7 +207,8 @@ preflight, and prints its own `VERDICT:` line):
 - every category that ran **PASSed**, AND
 - the cross-cutting error tally across the whole run is **0**
   (STALE + phantom + 100070 + 100060 + -48 + -36 + -5000 + permission), AND
-- **snappiness held** (no listing `>= QA_SNAPPY_MS`), AND
+- **snappiness held** (every category-specific latency contract passed: strict
+  per-sample where specified, otherwise p99 plus hard-stall ceiling), AND
 - no selected category was **missing / not-run**.
 
 Otherwise the gate is **RED** with an itemized reason list, and `run-all.sh`
@@ -245,3 +263,13 @@ Everything lands under one run dir (`$QA_ARTIFACTS`, default
   gates, preflight, cleanup) lives in `lib.sh`. Add helpers there, not inline.
 - The orchestrator's gate is intentionally strict: a missing script, a single
   gated error, or one slow listing turns it RED. That strictness is the point.
+
+### Category10 owned sync adapter contract
+
+Category10 requires `QA_INDEX_SYNC_DIR`, a precreated literal0700 directory on the same primary device as real HOME and the product metadata directory, under the controller's exact isolated root. It must never be a CACHE/external directory. The controller binds this root to its retained original service process; `/whoami.instance_id` is durable identity, not a process-unique token. QA checks live `/whoami` before any Finder operation and again before its one request, and rechecks identity after completion. No executable command is accepted through this interface.
+
+`arm.json` contains `clock_domain:"posix-clock-monotonic-ns"`, `schema:1`, `method:"sync"`, a32–64lowercase-hex `request_nonce`, `service_instance`, exact `metadata_db_path`, `mount_point`, and `isolation_root`. QA exclusively creates and fsyncs `request.json` once, containing `schema`, `method`, `request_nonce`, `service_instance`, `clock_domain`, plus integer `requested_ns` from `time.clock_gettime_ns(time.CLOCK_MONOTONIC)`. Every adapter/helper cross-process timestamp must use this exact POSIX clock domain. Python `time.monotonic_ns()` is not interchangeable on macOS Python3.9 because its origin can be process-local; a different or absent domain is rejected. The owner must latch that exact request before invoking one supported service `sync`, retain its original socket/thread through uncertainty, and atomically publish `reply.json` only after the original joins. The reply repeats all request fields and adds integer `dispatched_ns`, `completed_ns`, `joined:true`, and exact `text:"ok"`. Timestamps must be ordered. Files are bounded regular no-follow files; no partial file or absence authorizes another request. The directory must be private control storage; independent backend/media payloads do not belong there.
+
+The QA process latches request uncertainty before publication and never resends, deletes, cancels, toggles offline or shuts down on uncertainty. Its terminal receipt is published only after every issued Finder operation and the original sync are known joined. The unchanged custody helper preserves original worker reply timestamps; actual worker `reply_at`, not later parent observation, bounds copy overlap. Wall/monotonic acquisition anchors must have a nonempty common offset interval no wider than1s; copy overlap uses the conservative inner bounds after conversion, and inconsistent clocks reject coverage. `QA_KEEP_DATA=1` retains the fixture. Known failure also retains data; unknown completion keeps the original category process in HOLD.
+
+Measurements are directory-enumeration syscalls with typed reconcile-active observations at both acquisition boundaries and monotonic metric chains including inter-sample gaps. They do not establish continuous/exclusive scan attribution, local SQL contention, WAN behavior, Finder paint or server coverage when the client cache answered. No arbitrary sleep pads coverage and no second sync retries an uncovered window. Root qualification of an existing bounded client-side latency fixture is separate from this source contract; singleton renewal must bypass any simulated delay.

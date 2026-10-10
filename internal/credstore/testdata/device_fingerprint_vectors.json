@@ -1,0 +1,13 @@
+{
+  "comment": "deviceid.Digest(platform_uuid) and the app's DeviceFingerprint.digest must agree: first 16 bytes of SHA-256(\"juicemount-device-v1\\n\" + upper(trim(uuid))), lower-case hex.",
+  "vectors": [
+    {
+      "platform_uuid": "00000000-1111-2222-3333-444444444444",
+      "digest": "e09373f9fc8999d5408f33976a1b4f01"
+    },
+    {
+      "platform_uuid": " 8f0c2b1e-7d3a-4c55-9e10-a1b2c3d4e5f6\n",
+      "digest": "b4f39749220880dd3b9b3dd20dda7ea2"
+    }
+  ]
+}

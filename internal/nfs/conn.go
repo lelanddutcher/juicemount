@@ -29,18 +29,74 @@ var responseBufferPool = sync.Pool{
 	},
 }
 
+// largeResponseBufferPool serves READ replies, which are up to the client's
+// rsize (1 MiB with our mount options).
+//
+// WHY A SECOND POOL (2026-08-19, measured). The small pool hands out 4 KiB
+// buffers and putResponseBuffer refused to pool anything above 64 KiB — so the
+// ONE RPC that is reliably large, READ, could never benefit from either. Every
+// read reply grew 4K -> 8K -> ... -> 1M (about eight realloc-and-copy steps),
+// then finish() copied the whole thing once more, and the grown buffer was
+// discarded so the next read repeated all of it.
+//
+// A CPU profile under sustained reads was ~50% garbage collection, and an
+// allocation profile over 15 s of reads showed 50 GB allocated:
+// bytes.growSlice 24.3 GB (48.5%), response.finish 12.1 GB (24.3%),
+// xdr encodeFixedArray 12.1 GB (24.2%). Serving 706 MB/s cost ~3.3 GB/s of
+// garbage.
+//
+// The 64 KiB cap was right in spirit — a 1 MiB buffer inherited by a small
+// GETATTR reply is waste — so the fix is a SECOND pool rather than a bigger
+// cap: small RPCs keep small buffers, READs get one already big enough.
+const largeResponseBufferCap = 1 << 20
+
+// maxSerializedResponseBatch bounds how many ready RPC replies the single TCP
+// writer may collect before it must flush.  The response queue is continuously
+// refilled during a large Finder copy; draining it "until empty" can therefore
+// postpone a flush indefinitely even though READDIR/GETATTR handlers completed
+// promptly.  A small fixed batch preserves syscall coalescing while putting a
+// hard bound on response-egress head-of-line latency.
+const maxSerializedResponseBatch = 32
+
+var largeResponseBufferPool = sync.Pool{
+	New: func() interface{} {
+		return bytes.NewBuffer(make([]byte, 0, largeResponseBufferCap+4096))
+	},
+}
+
+// getResponseBufferFor picks a pool by RPC. Only NFS READ is reliably large;
+// everything else stays on the small pool.
+func getResponseBufferFor(prog, proc uint32) *bytes.Buffer {
+	var buf *bytes.Buffer
+	if prog == nfsServiceID && proc == uint32(NFSProcedureRead) {
+		buf = largeResponseBufferPool.Get().(*bytes.Buffer)
+	} else {
+		buf = responseBufferPool.Get().(*bytes.Buffer)
+	}
+	buf.Reset()
+	return buf
+}
+
 func getResponseBuffer() *bytes.Buffer {
 	buf := responseBufferPool.Get().(*bytes.Buffer)
 	buf.Reset()
 	return buf
 }
 
+// putResponseBuffer returns a buffer to the pool that matches its CAPACITY, not
+// the RPC it served — a small RPC that happened to take a large buffer must not
+// demote it back to the small pool, or the next READ pays the growth again.
 func putResponseBuffer(buf *bytes.Buffer) {
-	if buf.Cap() > 65536 {
-		// Don't pool oversized buffers (e.g. from large READ responses)
-		return
+	c := buf.Cap()
+	switch {
+	case c <= 65536:
+		responseBufferPool.Put(buf)
+	case c <= 4*largeResponseBufferCap:
+		largeResponseBufferPool.Put(buf)
+	default:
+		// Genuinely oversized (a jumbo reply): let it go rather than pin
+		// multiple megabytes per pool slot indefinitely.
 	}
-	responseBufferPool.Put(buf)
 }
 
 var (
@@ -182,6 +238,10 @@ func (c *conn) serve(ctx context.Context) {
 				c.Close()
 				return
 			}
+			// Malformed/oversized frame: without Close the socket and the
+			// serializeWrites goroutine leak per bad frame (a buggy client
+			// could hold fds hostage). Mirror the EOF path.
+			c.Close()
 			return
 		}
 		Log.Tracef("request: %v", w.req)
@@ -193,14 +253,26 @@ func (c *conn) serve(ctx context.Context) {
 		//      over-cap write head-of-line-blocks every following read/LOOKUP/
 		//      GETATTR on the same TCP mount — the whole mount goes unnavigable.
 		//   2. A parked write must NOT hold an rpcSem slot that reads need.
-		// So: NON-WRITE RPCs acquire the shared rpcSem HERE (reader back-pressure,
-		// bounds read goroutines). WRITE RPCs are dispatched immediately and
-		// acquire the SEPARATE writeSem INSIDE their goroutine — the reader never
-		// parks on a write, and reads keep their full rpcSem pool even when every
-		// write is stalled. The two pools are independent.
-		isWrite := w.req.Header.Prog == nfsServiceID &&
-			w.req.Header.Proc == uint32(NFSProcedureWrite)
-		if !isWrite && c.Server.rpcSem != nil {
+		// So: read/navigation RPCs acquire the shared rpcSem HERE (reader
+		// back-pressure, bounds read goroutines). WRITE and metadata-mutation RPCs
+		// are dispatched immediately and acquire their independent semaphores
+		// INSIDE their goroutine. Slow JuiceFS REMOVE/SETATTR/COMMIT bursts therefore
+		// cannot consume every reader slot or park this loop ahead of READDIR.
+		admission := classifyRPCAdmission(w.req.Header.Prog, w.req.Header.Proc)
+		if admission == rpcAdmissionDataRead && c.Server.dataReadSem != nil {
+			select {
+			case c.Server.dataReadSem <- struct{}{}:
+			default:
+				// Never park this TCP reader behind backend data work: the
+				// next frame may be a fully cached Finder navigation request.
+				if err := c.rejectSaturatedRead(connCtx, w); err != nil {
+					c.Close()
+					return
+				}
+				continue
+			}
+		}
+		if admission == rpcAdmissionRead && c.Server.rpcSem != nil {
 			// [S6 / H1 grader] Admission is the read head-of-line point: when the
 			// shared rpcSem is saturated the reader parks HERE, blocking every
 			// following LOOKUP/GETATTR/READ on this single TCP mount. Grade the
@@ -245,7 +317,9 @@ func (c *conn) serve(ctx context.Context) {
 		// here. The serve loop's next readRequestHeader will then
 		// return an error and we exit cleanly. net.Conn.Close is
 		// idempotent so multiple goroutines closing is safe.
+		c.Server.rpcStarted()
 		go func(w *response) {
+			defer c.Server.rpcDone()
 			defer func() {
 				// [JM6-concurrent] Recover from handler panics so a
 				// nil-deref or unanticipated XDR state in a single
@@ -260,8 +334,11 @@ func (c *conn) serve(ctx context.Context) {
 					Log.Errorf("handler panic: %v", r)
 					c.Close()
 				}
-				if !isWrite && c.Server.rpcSem != nil {
+				if admission == rpcAdmissionRead && c.Server.rpcSem != nil {
 					<-c.Server.rpcSem
+				}
+				if admission == rpcAdmissionDataRead && c.Server.dataReadSem != nil {
+					<-c.Server.dataReadSem
 				}
 			}()
 
@@ -269,13 +346,21 @@ func (c *conn) serve(ctx context.Context) {
 			// parked on a full writeSem is a cheap goroutine holding NO rpcSem
 			// slot, so reads stay live. connCtx.Done() lets an abandoned /
 			// disconnected write unwind before it ever runs the handler.
-			if isWrite && c.Server.writeSem != nil {
+			if admission == rpcAdmissionWrite && c.Server.writeSem != nil {
 				select {
 				case c.Server.writeSem <- struct{}{}:
 				case <-connCtx.Done():
 					return
 				}
 				defer func() { <-c.Server.writeSem }()
+			}
+			if admission == rpcAdmissionMutation && c.Server.mutationSem != nil {
+				select {
+				case c.Server.mutationSem <- struct{}{}:
+				case <-connCtx.Done():
+					return
+				}
+				defer func() { <-c.Server.mutationSem }()
 			}
 
 			start := time.Now()
@@ -294,7 +379,25 @@ func (c *conn) serve(ctx context.Context) {
 			rpcCount.Add(1)
 			if elapsed > 5*time.Millisecond {
 				slowRPCCount.Add(1)
-				if elapsed > 50*time.Millisecond {
+				// RATE-LIMITED, and it has to be. This line was the single
+				// largest source of mutex contention in the whole process
+				// under a concurrent read -- 45.6% of all contention, every
+				// bit of it slog's global logger lock, reached from these
+				// handler goroutines.
+				//
+				// It is a feedback loop, not just overhead. Load makes RPCs
+				// queue; queueing pushes them past 50ms; every one that
+				// crosses then takes a PROCESS-WIDE lock and formats the
+				// whole request with %v; that serializes the handlers, which
+				// lengthens the queue, which makes more RPCs cross 50ms. The
+				// line meant to report slowness was causing it. A read at
+				// 1,650 MB/s with 88 RPCs in flight puts per-RPC wall time at
+				// ~53ms -- sitting exactly on the threshold, so nearly every
+				// RPC logged.
+				//
+				// The COUNTER above stays unconditional, so nothing is lost
+				// that anyone measures; only the log line is thinned.
+				if elapsed > 50*time.Millisecond && allowSlowRPCLog() {
 					Log.Warnf("slow RPC: %v took %v", w.req, elapsed)
 				}
 			}
@@ -342,13 +445,15 @@ func (c *conn) serializeWrites(ctx context.Context) {
 			if err := writeMsg(msg); err != nil {
 				return
 			}
-			// [JM5] Batch-drain: collect all queued responses before flushing.
-			// This prevents TCP send buffer deadlock under concurrent load
-			// (e.g., Finder copying 20 files simultaneously) and reduces
-			// the number of TCP write syscalls.
+			// [JM5/JM6] Batch ready responses before flushing, but never drain
+			// an unbounded continuously-refilled queue. Under a large Finder
+			// copy the old "until empty" loop could run for hundreds of
+			// milliseconds, leaving an already-completed READDIR reply stranded
+			// in the userspace buffer. The fixed cap preserves coalescing while
+			// guaranteeing regular progress onto the wire.
 			batchCount := int64(1)
 		drain:
-			for {
+			for batchCount < maxSerializedResponseBatch {
 				select {
 				case msg, ok = <-c.writeSerializer:
 					if !ok {
@@ -647,9 +752,10 @@ func (c *conn) readRequestHeader(ctx context.Context, reader *bufio.Reader) (w *
 		return nil, err
 	}
 
-	// [JM5] Use pooled buffer to avoid allocation per RPC.
-	buf := responseBufferPool.Get().(*bytes.Buffer)
-	buf.Reset()
+	// [JM5] Use pooled buffer to avoid allocation per RPC. The header is
+	// already parsed here, so a READ can be given a buffer that is big enough
+	// from the start instead of growing into one.
+	buf := getResponseBufferFor(req.Header.Prog, req.Header.Proc)
 	w = &response{
 		conn:     c,
 		req:      &req,

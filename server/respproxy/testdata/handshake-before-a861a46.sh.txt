@@ -1,0 +1,21 @@
+sha_of() { sha256sum "$1" 2>/dev/null | cut -d' ' -f1; }
+last_req=""
+[ -f "$DIR/reload.request" ] && last_req="$(cat "$DIR/reload.request" 2>/dev/null || true)"
+while kill -0 "$child" 2>/dev/null; do
+  if [ -f "$DIR/reload.request" ]; then
+    req="$(cat "$DIR/reload.request" 2>/dev/null || true)"
+    if [ -n "$req" ] && [ "$req" != "$last_req" ]; then
+      want="${req%% *}"
+      # A request names the file it was written for. A mismatch means a
+      # newer write is in flight; retry on the next tick.
+      if [ "$want" = "$(sha_of "$PRINCIPALS")" ]; then
+        kill -HUP "$child"
+        printf '%s %s\n' "$want" "$(date +%s)" > "$DIR/.reload.ack.tmp" && mv -f "$DIR/.reload.ack.tmp" "$DIR/reload.ack"
+        log "principals reload signalled (sha256 $want)"
+        last_req="$req"
+      fi
+    fi
+  fi
+  sleep 2 &
+  wait $! 2>/dev/null || true
+done

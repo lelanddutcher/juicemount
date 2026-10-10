@@ -1,11 +1,28 @@
 package health
 
 import (
+	"net/url"
 	"testing"
 	"time"
 
 	"github.com/lelanddutcher/juicemount/internal/netprofile"
 )
+
+func TestLinkAwarePolicySkipsLoopbackProxySample(t *testing.T) {
+	for _, raw := range []string{"redis://127.0.0.1:49152/1", "redis://[::1]:49152/1", "redis://localhost:49152/1"} {
+		u, err := url.Parse(raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !urlHostIsLoopback(u) {
+			t.Errorf("urlHostIsLoopback(%q) = false", raw)
+		}
+	}
+	u, _ := url.Parse("redis://192.168.0.197:30179/1")
+	if urlHostIsLoopback(u) {
+		t.Fatal("NAS endpoint was mistaken for local Link proxy")
+	}
+}
 
 // TestWatchdogThresholdsLinkAware locks in the revert-safety invariant: on
 // medium/fast (LAN) the watchdog escalation thresholds are BYTE-FOR-BYTE the
@@ -20,12 +37,12 @@ func TestWatchdogThresholdsLinkAware(t *testing.T) {
 	fm := &FUSEManager{}
 
 	cases := []struct {
-		class      netprofile.LinkClass
-		wantTicks  int
+		class       netprofile.LinkClass
+		wantTicks   int
 		wantConfirm time.Duration
 	}{
-		{netprofile.ClassMedium, FUSEStaleEscalateTicks, fuseConfirmProbeTimeout},   // == historical
-		{netprofile.ClassFast, FUSEStaleEscalateTicks, fuseConfirmProbeTimeout},     // == historical (no LAN change)
+		{netprofile.ClassMedium, FUSEStaleEscalateTicks, fuseConfirmProbeTimeout}, // == historical
+		{netprofile.ClassFast, FUSEStaleEscalateTicks, fuseConfirmProbeTimeout},   // == historical (no LAN change)
 		{netprofile.ClassSlow, FUSEStaleEscalateTicks * 2, 45 * time.Second},
 		{netprofile.ClassMetered, FUSEStaleEscalateTicks * 3, 90 * time.Second},
 	}

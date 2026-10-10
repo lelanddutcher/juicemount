@@ -81,7 +81,7 @@ func TestProducerEndToEnd(t *testing.T) {
 	}
 
 	// The poster/strip/waveform blobs landed at the Tier-A location.
-	blobDir := farm.DerivBlobDir(tmp, wantInode)
+	blobDir := filepath.Join(tmp, derivatives.DerivDirRel(wantInode))
 	for _, name := range []string{"poster.jpg", "strip.jpg", "waveform.json"} {
 		if st, err := os.Stat(filepath.Join(blobDir, name)); err != nil || st.Size() == 0 {
 			t.Fatalf("blob %s missing/empty: err=%v", name, err)

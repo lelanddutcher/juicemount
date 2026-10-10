@@ -74,10 +74,13 @@ WP=$!
 sleep 1  # Let it get into the write
 # Trigger user-offline. The /offline contract is ?on=true|false as a query
 # param (verified against cbridge.go:handleOfflineHTTP) — POST with JSON
-# body is not supported; the GET-with-query form works for both directions.
-set +e
-curl -s --max-time 3 "http://${JM_METRICS_ADDR}/offline?on=true" >/dev/null
-set -e
+# body is not supported; POST with the local control marker is required.
+if ! OFFLINE_RESP=$(curl -fsS --max-time 3 -X POST -H 'X-JM-Control: 1' "http://${JM_METRICS_ADDR}/offline?on=true") ||
+    ! printf '%s' "$OFFLINE_RESP" | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(not (d.get("ok") is True and d.get("offline_mode") is True))'; then
+    fail "offline-on was not acknowledged; scenario cannot prove offline behavior"
+    wait "$WP" 2>/dev/null || true
+    exit 1
+fi
 sleep 1
 # Whatever happens to the write, capture state
 wait "$WP" 2>/dev/null
@@ -85,7 +88,11 @@ W_EXIT=$?
 B_SZ=$(sz "$TROOT/B-write.bin")
 log "write-during-offline-toggle: exit=$W_EXIT, dst size=$B_SZ"
 # Toggle back online
-curl -s --max-time 3 "http://${JM_METRICS_ADDR}/offline?on=false" >/dev/null 2>&1
+if ! OFFLINE_RESP=$(curl -fsS --max-time 3 -X POST -H 'X-JM-Control: 1' "http://${JM_METRICS_ADDR}/offline?on=false") ||
+    ! printf '%s' "$OFFLINE_RESP" | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(not (d.get("ok") is True and d.get("offline_mode") is False))'; then
+    fail "offline-off was not acknowledged; server state needs inspection"
+    exit 1
+fi
 sleep 2
 # The write either succeeded (offline was set AFTER write completed) or failed
 # fast (offline gate refused). Either is correct; what matters is no hang and
@@ -130,33 +137,33 @@ pool_slice "$PIN_TARGET" 20
 PIN_PATH=$(python3 -c "import os; print(os.path.basename('$PIN_TARGET'))")
 # Pin via HTTP endpoint
 set +e
-PIN_RESP=$(curl -s --max-time 10 -X POST "http://${JM_METRICS_ADDR}/pin" \
-    -H "Content-Type: application/json" \
-    -d "{\"paths\":[\"/.jmqa-failure-$$/$PIN_PATH\"]}" 2>/dev/null)
+PIN_RESP=$(curl -fsS --max-time 10 -X POST -H 'X-JM-Control: 1' --get \
+    --data-urlencode "path=$PIN_TARGET" "http://${JM_METRICS_ADDR}/pin" 2>/dev/null)
+pin_rc=$?
 set -e
 sleep 3
-if echo "$PIN_RESP" | grep -q -E 'queued|ready|"err":""|"err":null'; then
+if [[ $pin_rc -eq 0 ]] && printf '%s' "$PIN_RESP" | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(d.get("ok") is not True)'; then
     pass "pin accepted by /pin endpoint"
 else
-    warn "pin response unexpected: $(echo "$PIN_RESP" | head -c 200)"
+    fail "pin response unexpected: $(echo "$PIN_RESP" | head -c 200)"
 fi
 # Unpin
 set +e
-UNPIN_RESP=$(curl -s --max-time 10 -X POST "http://${JM_METRICS_ADDR}/unpin" \
-    -H "Content-Type: application/json" \
-    -d "{\"paths\":[\"/.jmqa-failure-$$/$PIN_PATH\"]}" 2>/dev/null)
+UNPIN_RESP=$(curl -fsS --max-time 10 -X POST -H 'X-JM-Control: 1' --get \
+    --data-urlencode "path=$PIN_TARGET" "http://${JM_METRICS_ADDR}/unpin" 2>/dev/null)
+unpin_rc=$?
 set -e
-if [[ -n "$UNPIN_RESP" ]]; then
+if [[ $unpin_rc -eq 0 ]] && printf '%s' "$UNPIN_RESP" | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(d.get("ok") is not True)'; then
     pass "unpin completed"
 else
-    warn "unpin returned empty"
+    fail "unpin failed or did not acknowledge success"
 fi
 
 # ---------------------------------------------------------------------------
-section "scenario E: trigger /sync — does the metadata reconciler complete?"
+section "scenario E: trigger /sync — is the reconcile request accepted?"
 START=$(date +%s)
 set +e
-SYNC_RESP=$(curl -s --max-time 60 -X POST "http://${JM_METRICS_ADDR}/sync" 2>/dev/null)
+SYNC_RESP=$(curl -fsS --max-time 60 -X POST -H 'X-JM-Control: 1' "http://${JM_METRICS_ADDR}/sync" 2>/dev/null)
 sync_rc=$?
 set -e
 ELAPSED=$(( $(date +%s) - START ))

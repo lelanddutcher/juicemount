@@ -1,10 +1,14 @@
 package nfs
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/lelanddutcher/juicemount/metadata"
@@ -64,21 +68,109 @@ func TestRecoverOnBootCleanState(t *testing.T) {
 	}
 }
 
-// TestRecoverOnBootOrphanFile drops a file into the spool dir without
-// a corresponding SQL row. RecoverOnBoot must delete it.
+// Unindexed bytes may be the last copy of a write acknowledged before its
+// SQL row was published. Recovery must refuse startup until they are resolved.
 func TestRecoverOnBootOrphanFile(t *testing.T) {
 	s, root, _ := newSpoolStoreForRecovery(t)
-	orphan := dropFile(t, root, "phantom-12345", []byte("no SQL row for me"))
-
-	report, err := s.RecoverOnBoot(context.Background())
+	bytes := []byte("no SQL row for me")
+	orphan := dropFile(t, root, "phantom-12345", bytes)
+	ready := dropFile(t, root, "ready-before-orphan", []byte("ready"))
+	id, err := s.Meta().Insert("/ready.bin", ready)
 	if err != nil {
-		t.Fatalf("recover: %v", err)
+		t.Fatal(err)
 	}
-	if report.OrphanFilesDeleted != 1 {
-		t.Errorf("OrphanFilesDeleted=%d, want 1", report.OrphanFilesDeleted)
+	if err := s.Meta().MarkReady(id, 5, nil); err != nil {
+		t.Fatal(err)
 	}
-	if _, err := os.Stat(orphan); !os.IsNotExist(err) {
-		t.Errorf("orphan file should be deleted, stat err=%v", err)
+
+	for attempt := 0; attempt < 2; attempt++ {
+		report, err := s.RecoverOnBoot(context.Background())
+		want := fmt.Sprintf("recover: unindexed spool entry %s preserved for manual recovery: %s", orphan, ErrSpoolOrphanBytes)
+		if !errors.Is(err, ErrSpoolOrphanBytes) || err.Error() != want {
+			t.Fatalf("attempt %d recovery error = %v, want %q", attempt, err, want)
+		}
+		if report != (RecoveryReport{}) {
+			t.Fatalf("attempt %d returned partial success: %+v", attempt, report)
+		}
+		if got, err := os.ReadFile(orphan); err != nil || string(got) != string(bytes) {
+			t.Fatalf("attempt %d changed orphan bytes: (%q, %v)", attempt, got, err)
+		}
+		if used, _ := s.Capacity(); used != 0 {
+			t.Fatalf("attempt %d accounted rows before refusal: used=%d", attempt, used)
+		}
+	}
+	if err := os.Remove(orphan); err != nil {
+		t.Fatalf("resolve orphan: %v", err)
+	}
+	report, err := s.RecoverOnBoot(context.Background())
+	if err != nil || report.ReadyResumed != 1 {
+		t.Fatalf("recovery after explicit resolution = (%+v, %v)", report, err)
+	}
+	if used, _ := s.Capacity(); used != 5 {
+		t.Fatalf("used after retry = %d, want 5", used)
+	}
+}
+
+func TestRecoverOnBootEmptyOrphanFilePreservedAcrossAppend(t *testing.T) {
+	s, root, _ := newSpoolStoreForRecovery(t)
+	orphan := dropFile(t, root, "empty-orphan", nil)
+	report, err := s.RecoverOnBoot(context.Background())
+	if !errors.Is(err, ErrSpoolOrphanBytes) || report != (RecoveryReport{}) {
+		t.Fatalf("empty orphan recovery = (%+v, %v), want refusal", report, err)
+	}
+	if info, err := os.Lstat(orphan); err != nil || info.Size() != 0 {
+		t.Fatalf("empty orphan changed: (%v, %v)", info, err)
+	}
+	bytes := []byte("appended after first recovery refusal")
+	if err := os.WriteFile(orphan, bytes, 0o600); err != nil {
+		t.Fatalf("append bytes: %v", err)
+	}
+	report, err = s.RecoverOnBoot(context.Background())
+	if !errors.Is(err, ErrSpoolOrphanBytes) || report != (RecoveryReport{}) {
+		t.Fatalf("second orphan recovery = (%+v, %v), want refusal", report, err)
+	}
+	if got, err := os.ReadFile(orphan); err != nil || string(got) != string(bytes) {
+		t.Fatalf("appended orphan bytes changed: (%q, %v)", got, err)
+	}
+}
+
+func TestRecoverOnBootNonregularEntriesPreserved(t *testing.T) {
+	for _, kind := range []string{"symlink", "directory"} {
+		t.Run(kind, func(t *testing.T) {
+			s, root, _ := newSpoolStoreForRecovery(t)
+			filesDir := filepath.Join(root, SpoolFilesSubdir)
+			entry := filepath.Join(filesDir, "unexpected")
+			bytes := []byte("do not follow or delete")
+			var payload string
+			if kind == "symlink" {
+				payload = dropFile(t, root, "target", bytes)
+				// Index the target so only the link is anomalous.
+				if _, err := s.Meta().Insert("/target.bin", payload); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(payload, entry); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				if err := os.Mkdir(entry, 0o700); err != nil {
+					t.Fatal(err)
+				}
+				payload = filepath.Join(entry, "payload")
+				if err := os.WriteFile(payload, bytes, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			report, err := s.RecoverOnBoot(context.Background())
+			if !errors.Is(err, ErrSpoolOrphanBytes) || !strings.Contains(err.Error(), "unindexed spool entry "+entry) {
+				t.Fatalf("recovery = (%+v, %v), want nonregular entry refusal", report, err)
+			}
+			if got, err := os.ReadFile(payload); err != nil || string(got) != string(bytes) {
+				t.Fatalf("payload changed: (%q, %v)", got, err)
+			}
+			if _, err := os.Lstat(entry); err != nil {
+				t.Fatalf("entry removed: %v", err)
+			}
+		})
 	}
 }
 
@@ -165,37 +257,36 @@ func TestRecoverOnBootWritingEmptyFileFails(t *testing.T) {
 	}
 }
 
-// TestRecoverOnBootDrainingResetToReady: a row in `draining` state at
-// crash time means a worker was mid-copy. The work is restartable; the
-// row is reset to ready and the drainer will pick it up.
-func TestRecoverOnBootDrainingResetToReady(t *testing.T) {
+// A legacy draining row has no proof that an earlier public copy can be replayed.
+// Refuse before changing state, source bytes or recovery accounting.
+func TestRecoverOnBootDrainingRequiresReconciliation(t *testing.T) {
 	s, root, _ := newSpoolStoreForRecovery(t)
-	file := dropFile(t, root, "draining-1", make([]byte, 4096))
-	id, _ := s.Meta().Insert("/inflight.bin", file)
-	_ = s.Meta().MarkReady(id, 4096, nil)
-	claimed, _ := s.Meta().MarkDraining(id)
-	if !claimed {
-		t.Fatalf("setup MarkDraining failed")
-	}
-
-	report, err := s.RecoverOnBoot(context.Background())
+	body := bytes.Repeat([]byte("x"), 4096)
+	file := dropFile(t, root, "draining-1", body)
+	id, err := s.Meta().Insert("/inflight.bin", file)
 	if err != nil {
-		t.Fatalf("recover: %v", err)
+		t.Fatal(err)
 	}
-	if report.DrainingReset != 1 {
-		t.Errorf("DrainingReset=%d, want 1", report.DrainingReset)
+	if err := s.Meta().MarkReady(id, 4096, nil); err != nil {
+		t.Fatal(err)
 	}
-	row, _ := s.Meta().Get(id)
-	if row.DrainState != metadata.DrainReady {
-		t.Errorf("row state=%q, want ready", row.DrainState)
+	if claimed, err := s.Meta().MarkDraining(id); err != nil || !claimed {
+		t.Fatalf("claim=%v err=%v", claimed, err)
 	}
-	// File is still on disk for the drainer to use.
-	if _, err := os.Stat(file); err != nil {
-		t.Errorf("file should remain on disk for drain retry: %v", err)
+	s.used.Store(17)
+	report, err := s.RecoverOnBoot(context.Background())
+	var pending *metadata.PendingDrainCompletion
+	if !errors.As(err, &pending) || report != (RecoveryReport{}) {
+		t.Fatalf("recovery=(%+v,%v)", report, err)
 	}
-	// Used bytes should reflect the recovered file size.
-	if used, _ := s.Capacity(); used != 4096 {
-		t.Errorf("used=%d, want 4096", used)
+	if row, err := s.Meta().Get(id); err != nil || row.DrainState != metadata.DrainDraining {
+		t.Errorf("row changed=%+v err=%v", row, err)
+	}
+	if got, err := os.ReadFile(file); err != nil || !bytes.Equal(got, body) {
+		t.Errorf("source changed len=%d err=%v", len(got), err)
+	}
+	if used, _ := s.Capacity(); used != 17 {
+		t.Errorf("capacity changed=%d", used)
 	}
 }
 
@@ -226,31 +317,40 @@ func TestRecoverOnBootReadyAccountsCapacity(t *testing.T) {
 	}
 }
 
-// TestRecoverOnBootTerminalRowStaleFileCleaned covers reviewer HIGH:
-// a `failed` row that NEVER FINALIZED (row.Size==0 — a writing-state
-// crash whose best-effort partial remove failed) leaves a stale partial
-// on disk. RecoverOnBoot reclaims it (the user already re-copied). The
-// size-0 gate is what distinguishes this reclaimable partial from an
-// intact finalized copy (see TestRecoverOnBootFailedIntactFileRecovered),
-// which must NEVER be deleted.
-func TestRecoverOnBootTerminalRowStaleFileCleaned(t *testing.T) {
+// A size-zero failed row does not prove its file is disposable: COMMIT may
+// have acknowledged a writing file before Close persisted its final size.
+func TestRecoverOnBootFailedSizeZeroNonemptyFilePreserved(t *testing.T) {
 	s, root, _ := newSpoolStoreForRecovery(t)
-	// Insert a failed-state row with its file still on disk. Insert leaves
-	// size=0 (never finalized), so this is the reclaimable-partial case.
-	f := dropFile(t, root, "stale-failed", []byte("stranded by failed remove"))
+	bytes := []byte("possibly acknowledged bytes")
+	f := dropFile(t, root, "stale-failed", bytes)
 	id, _ := s.Meta().Insert("/stranded.bin", f)
 	_, _ = s.Meta().MarkFailed(id, "test setup")
 
-	if _, err := s.RecoverOnBoot(context.Background()); err != nil {
-		t.Fatalf("recover: %v", err)
+	if _, err := s.RecoverOnBoot(context.Background()); err == nil {
+		t.Fatal("recovery accepted ambiguous nonempty size-zero failed file")
 	}
-	if _, err := os.Stat(f); !os.IsNotExist(err) {
-		t.Errorf("stale size-0 partial under failed row should be removed: stat err=%v", err)
+	if got, err := os.ReadFile(f); err != nil || string(got) != string(bytes) {
+		t.Fatalf("ambiguous local bytes changed: (%q, %v)", got, err)
 	}
-	// Row state preserved.
 	row, _ := s.Meta().Get(id)
 	if row.DrainState != metadata.DrainFailed {
 		t.Errorf("row state changed unexpectedly: %q", row.DrainState)
+	}
+}
+
+func TestRecoverOnBootUnfinalizedEmptyFilePreserved(t *testing.T) {
+	s, root, _ := newSpoolStoreForRecovery(t)
+	f := dropFile(t, root, "empty-failed", nil)
+	id, _ := s.Meta().Insert("/empty.bin", f)
+	_, _ = s.Meta().MarkFailed(id, "test setup")
+	if _, err := s.RecoverOnBoot(context.Background()); err != nil {
+		t.Fatalf("recover empty failed file: %v", err)
+	}
+	if info, err := os.Stat(f); err != nil || info.Size() != 0 {
+		t.Fatalf("unfinalized empty source was removed: %v", err)
+	}
+	if row, err := s.Meta().Get(id); err != nil || row.DrainState != metadata.DrainFailed {
+		t.Fatalf("unfinalized empty source gained retry authority: %+v %v", row, err)
 	}
 }
 
@@ -401,11 +501,16 @@ func TestRecoverOnBootSkipsQuarantineDir(t *testing.T) {
 // TestRecoverOnBootMixedFixture exercises all five paths at once and
 // asserts the report sums correctly.
 func TestRecoverOnBootMixedFixture(t *testing.T) {
+	for _, uncertain := range []bool{false, true} {
+		t.Run(map[bool]string{false: "ordinary", true: "uncertain"}[uncertain], func(t *testing.T) { testRecoverOnBootMixedFixture(t, uncertain) })
+	}
+}
+func testRecoverOnBootMixedFixture(t *testing.T, uncertain bool) {
 	s, root, _ := newSpoolStoreForRecovery(t)
 
-	// 2 orphan files (no SQL).
-	dropFile(t, root, "orphan-a", []byte("a"))
-	dropFile(t, root, "orphan-b", []byte("b"))
+	// 2 empty orphan files (no SQL). Resolve them explicitly after refusal.
+	orphanA := dropFile(t, root, "orphan-a", nil)
+	orphanB := dropFile(t, root, "orphan-b", nil)
 
 	// 1 orphan row (SQL ready, file missing).
 	idOrphan, _ := s.Meta().Insert("/orphan-row.bin", filepath.Join(s.Root(), SpoolFilesSubdir, "missing"))
@@ -413,26 +518,60 @@ func TestRecoverOnBootMixedFixture(t *testing.T) {
 
 	// 1 writing row (file present with data, will be RESUMED — preserve bytes).
 	writingFile := dropFile(t, root, "writing-1", make([]byte, 50))
-	_, _ = s.Meta().Insert("/writing.bin", writingFile)
+	idWriting, _ := s.Meta().Insert("/writing.bin", writingFile)
 
 	// 1 draining row (file present, reset to ready).
 	drainingFile := dropFile(t, root, "draining-1", make([]byte, 200))
 	idDr, _ := s.Meta().Insert("/draining.bin", drainingFile)
 	_ = s.Meta().MarkReady(idDr, 200, nil)
-	_, _ = s.Meta().MarkDraining(idDr)
+	if uncertain {
+		_, _ = s.Meta().MarkDraining(idDr)
+	}
 
 	// 1 ready row (file present, just resumed).
 	readyFile := dropFile(t, root, "ready-1", make([]byte, 1000))
 	idRd, _ := s.Meta().Insert("/ready.bin", readyFile)
 	_ = s.Meta().MarkReady(idRd, 1000, nil)
 
+	if uncertain {
+		report, err := s.RecoverOnBoot(context.Background())
+		var pending *metadata.PendingDrainCompletion
+		if !errors.As(err, &pending) || report != (RecoveryReport{}) {
+			t.Fatalf("uncertain recovery=(%+v,%v)", report, err)
+		}
+		for id, want := range map[int64]metadata.DrainState{idOrphan: metadata.DrainReady, idWriting: metadata.DrainWriting, idDr: metadata.DrainDraining, idRd: metadata.DrainReady} {
+			if row, err := s.Meta().Get(id); err != nil || row.DrainState != want {
+				t.Errorf("row changed=%+v err=%v", row, err)
+			}
+		}
+		for file, size := range map[string]int{orphanA: 0, orphanB: 0, writingFile: 50, drainingFile: 200, readyFile: 1000} {
+			if got, err := os.ReadFile(file); err != nil || !bytes.Equal(got, make([]byte, size)) {
+				t.Errorf("file changed=%s err=%v", file, err)
+			}
+		}
+		if used, _ := s.Capacity(); used != 0 {
+			t.Errorf("capacity changed=%d", used)
+		}
+		return
+	}
+	if report, err := s.RecoverOnBoot(context.Background()); !errors.Is(err, ErrSpoolOrphanBytes) || report != (RecoveryReport{}) {
+		t.Fatalf("mixed fixture orphan recovery = (%+v, %v), want refusal", report, err)
+	}
+	for _, orphan := range []string{orphanA, orphanB} {
+		if _, err := os.Lstat(orphan); err != nil {
+			t.Fatalf("orphan removed before explicit resolution: %v", err)
+		}
+		if err := os.Remove(orphan); err != nil {
+			t.Fatalf("resolve orphan: %v", err)
+		}
+	}
 	report, err := s.RecoverOnBoot(context.Background())
 	if err != nil {
 		t.Fatalf("recover: %v", err)
 	}
 
-	if report.OrphanFilesDeleted != 2 {
-		t.Errorf("OrphanFilesDeleted=%d, want 2", report.OrphanFilesDeleted)
+	if report.OrphanFilesDeleted != 0 {
+		t.Errorf("OrphanFilesDeleted=%d, want 0", report.OrphanFilesDeleted)
 	}
 	if report.OrphanRowsFailed != 1 {
 		t.Errorf("OrphanRowsFailed=%d, want 1", report.OrphanRowsFailed)
@@ -440,11 +579,11 @@ func TestRecoverOnBootMixedFixture(t *testing.T) {
 	if report.WritingResumed != 1 || report.WritingFailedRows != 0 {
 		t.Errorf("WritingResumed=%d WritingFailedRows=%d, want 1 and 0 (non-empty writing file is preserved)", report.WritingResumed, report.WritingFailedRows)
 	}
-	if report.DrainingReset != 1 {
-		t.Errorf("DrainingReset=%d, want 1", report.DrainingReset)
+	if report.DrainingReset != 0 {
+		t.Errorf("DrainingReset=%d, want 0", report.DrainingReset)
 	}
-	if report.ReadyResumed != 1 {
-		t.Errorf("ReadyResumed=%d, want 1", report.ReadyResumed)
+	if report.ReadyResumed != 2 {
+		t.Errorf("ReadyResumed=%d, want 2", report.ReadyResumed)
 	}
 
 	// Capacity counter = resumed writing 50 + draining 200 + ready 1000 = 1250.
@@ -592,5 +731,81 @@ func TestRecoverOnBootIdempotent(t *testing.T) {
 	used2, _ := s.Capacity()
 	if used2 != 500 {
 		t.Errorf("used2=%d, want 500 (no double-counting)", used2)
+	}
+}
+
+// A STREAMED (punched) spool file must NEVER be resumed from disk.
+//
+// This is the data-loss case that motivated the punched_end column. The streaming
+// drain punches drained prefixes out of the spool file, and F_PUNCHHOLE leaves
+// the LOGICAL size unchanged — so a half-punched file passes the
+// `diskSize == r.Size` intactness check EXACTLY while its first punchedEnd bytes
+// read as zeros.
+//
+// Resuming it would copy the whole file to the backend and overwrite real,
+// already-durable bytes with those zeros: silent, total loss of the streamed
+// prefix, with no error at any layer. Same class as the incident that made this
+// branch preserve rather than delete in the first place.
+//
+// The fixture deliberately makes the size match, so nothing but punched_end can
+// distinguish this row from an ordinary resumable one.
+func TestRecoverOnBootNeverResumesAPunchedSpoolFile(t *testing.T) {
+	s, root, _ := newSpoolStoreForRecovery(t)
+
+	content := []byte("0123456789abcdefghijklmnopqrstuvwxyz")
+	f := dropFile(t, root, "streamed-failed", content)
+	id, _ := s.Meta().Insert("/DCIM/BIG.MOV", f)
+	// Row size EQUALS the on-disk size — the intactness test passes.
+	if err := s.Meta().MarkReady(id, int64(len(content)), []byte("sha")); err != nil {
+		t.Fatalf("mark ready: %v", err)
+	}
+	if _, err := s.Meta().MarkFailed(id, "crashed mid-stream"); err != nil {
+		t.Fatalf("mark failed: %v", err)
+	}
+	// ...but a prefix was already drained to the backend and punched away.
+	if err := s.Meta().SetPunchedEnd(id, 16); err != nil {
+		t.Fatalf("set punched_end: %v", err)
+	}
+
+	report, err := s.RecoverOnBoot(context.Background())
+	var pending *metadata.PendingPunchedSpool
+	if !errors.As(err, &pending) || len(pending.Rows) != 1 || pending.Rows[0].ID != id {
+		t.Fatalf("recover = %v, want typed punched-row refusal", err)
+	}
+	if report != (RecoveryReport{}) {
+		t.Errorf("recovery accounted punched file before refusal: %+v", report)
+	}
+	row, _ := s.Meta().Get(id)
+	if row.DrainState != metadata.DrainFailed {
+		t.Errorf("row state=%q, want failed — a streamed row must be preserved for "+
+			"the operator, never re-driven from a holey spool file", row.DrainState)
+	}
+	if _, err := os.Stat(f); err != nil {
+		t.Errorf("streamed spool file must be preserved, not deleted: %v", err)
+	}
+}
+
+// The guard must be NARROW: an ordinary un-punched failed row still resumes.
+// A guard that preserved everything would silently stop all failed-row recovery.
+func TestRecoverOnBootStillResumesUnpunchedFailedRows(t *testing.T) {
+	s, root, _ := newSpoolStoreForRecovery(t)
+
+	content := []byte("intact and never streamed")
+	f := dropFile(t, root, "plain-failed", content)
+	id, _ := s.Meta().Insert("/DCIM/PLAIN.MOV", f)
+	if err := s.Meta().MarkReady(id, int64(len(content)), []byte("sha")); err != nil {
+		t.Fatalf("mark ready: %v", err)
+	}
+	if _, err := s.Meta().MarkFailed(id, "transient backend outage"); err != nil {
+		t.Fatalf("mark failed: %v", err)
+	}
+
+	report, err := s.RecoverOnBoot(context.Background())
+	if err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+	if report.FailedResumed != 1 {
+		t.Errorf("FailedResumed=%d, want 1 — the punched_end guard must not stop "+
+			"ordinary failed-row recovery", report.FailedResumed)
 	}
 }

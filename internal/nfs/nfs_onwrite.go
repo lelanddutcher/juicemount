@@ -76,8 +76,8 @@ func onWrite(ctx context.Context, w *response, userHandle Handler) error {
 			recordJukebox(inflightOpName(w.req))
 			return &NFSStatusError{NFSStatusJukebox, err}
 		}
-		Log.Errorf("write OpenFile failed → NFS3ERR_ACCES: path=%s off=%d err=%v", fullPath, req.Offset, err)
-		return &NFSStatusError{NFSStatusAccess, err}
+		Log.Errorf("write OpenFile failed: path=%s off=%d err=%v", fullPath, req.Offset, err)
+		return nfsStatusErrorFrom(err)
 	}
 	end := req.Count
 	if len(req.Data) < int(end) {
@@ -132,7 +132,7 @@ func onWrite(ctx context.Context, w *response, userHandle Handler) error {
 	}
 	if err := file.Close(); err != nil {
 		Log.Errorf("error closing: %v", err)
-		return &NFSStatusError{NFSStatusIO, err}
+		return writeRefusalStatus(err, NFSStatusIO)
 	}
 	if writtenCount > 0 {
 		// [JM6] Mark data-transfer activity so the keep-awake assertion
@@ -152,7 +152,7 @@ func onWrite(ctx context.Context, w *response, userHandle Handler) error {
 	if req.How != uint32(unstable) {
 		if c, ok := fs.(Committer); ok {
 			if cErr := c.CommitFile(fullPath); cErr != nil {
-				return &NFSStatusError{NFSStatusIO, cErr}
+				return writeRefusalStatus(cErr, NFSStatusIO)
 			}
 		}
 		stability = writeStability(req.How)

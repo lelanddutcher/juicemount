@@ -7,13 +7,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"net/url"
-	"os/exec"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/lelanddutcher/juicemount/internal/redisurl"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -235,7 +234,8 @@ func (s *overviewSource) realProbeVolume(ctx context.Context) VolumeStatusSectio
 	// "unknown option: --json"). The INFO banner lines go to stderr;
 	// we only consume stdout. parseJuicefsStatusJSON tolerantly finds
 	// the first `{` in case a future version prepends anything.
-	cmd := exec.CommandContext(ctx, bin, "status", s.metaURL)
+	// H-8B: user@host in argv, password via META_PASSWORD.
+	cmd := juicefsMetaCmd(ctx, bin, "status", s.metaURL, metaRoleSelf)
 	out, err := cmd.Output()
 	if err != nil {
 		// Surface a short, operator-friendly message — the full stderr
@@ -314,12 +314,12 @@ func (s *overviewSource) realProbeRedis(ctx context.Context) RedisStatusSection 
 	// package's full client surface into the manager (would create
 	// an import cycle once future slices land settings.go that imports
 	// other manager primitives).
-	addr, db, err := parseRedisAddr(s.metaURL)
+	opts, err := redisurl.Parse(s.metaURL)
 	if err != nil {
 		return RedisStatusSection{Error: "parse metaURL: " + err.Error()}
 	}
 	start := time.Now()
-	info, err := redisInfo(ctx, addr, db)
+	info, err := redisInfo(ctx, opts)
 	latency := time.Since(start).Milliseconds()
 	if err != nil {
 		return RedisStatusSection{Error: "redis INFO: " + err.Error(), LatencyMs: latency}
@@ -428,28 +428,7 @@ func trimErr(err error) string {
 // the manager package stays free of upstream import cycles as future
 // slices add more cross-package state.
 func parseRedisAddr(rawURL string) (addr string, db int, err error) {
-	u, err := url.Parse(rawURL)
-	if err != nil {
-		return "", 0, err
-	}
-	if u.Scheme != "redis" && u.Scheme != "rediss" {
-		return "", 0, fmt.Errorf("unsupported scheme %q (want redis://)", u.Scheme)
-	}
-	addr = u.Host
-	if addr == "" {
-		return "", 0, fmt.Errorf("missing host in %q", rawURL)
-	}
-	if !strings.Contains(addr, ":") {
-		addr += ":6379"
-	}
-	if p := strings.TrimPrefix(u.Path, "/"); p != "" {
-		n, perr := strconv.Atoi(p)
-		if perr != nil {
-			return "", 0, fmt.Errorf("invalid db %q", p)
-		}
-		db = n
-	}
-	return addr, db, nil
+	return redisurl.Address(rawURL)
 }
 
 // redisInfo runs the INFO command against a Redis at addr/db and
@@ -458,14 +437,12 @@ func parseRedisAddr(rawURL string) (addr string, db int, err error) {
 // endpoint is polled and the lifecycle is unbounded; the cost of TCP
 // setup is dominated by the INFO command itself anyway. Honors ctx
 // for timeout / cancellation.
-func redisInfo(ctx context.Context, addr string, db int) (string, error) {
-	rdb := redis.NewClient(&redis.Options{
-		Addr:         addr,
-		DB:           db,
-		DialTimeout:  overviewBackendTimeout,
-		ReadTimeout:  overviewBackendTimeout,
-		WriteTimeout: overviewBackendTimeout,
-	})
+func redisInfo(ctx context.Context, opts *redis.Options) (string, error) {
+	opts.DialTimeout = overviewBackendTimeout
+	opts.ReadTimeout = overviewBackendTimeout
+	opts.WriteTimeout = overviewBackendTimeout
+	opts.ContextTimeoutEnabled = true
+	rdb := redis.NewClient(opts)
 	defer rdb.Close()
 	res, err := rdb.Info(ctx, "server", "memory").Result()
 	if err != nil {

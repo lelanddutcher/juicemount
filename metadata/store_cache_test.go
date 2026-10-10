@@ -45,13 +45,13 @@ func TestCacheEviction(t *testing.T) {
 
 	// The most recent entries (highest mtime) should be retained.
 	// Entry 199 has the latest mtime and should be in the cache.
-	newest := store.LookupByPath("dir/file_0199.txt")
+	newest := store.lookupByPathRAM("dir/file_0199.txt")
 	if newest == nil {
 		t.Error("newest entry (file_0199.txt) should be in cache after eviction")
 	}
 
 	// Entry 0 has the oldest mtime and should be evicted.
-	oldest := store.LookupByPath("dir/file_0000.txt")
+	oldest := store.lookupByPathRAM("dir/file_0000.txt")
 	if oldest != nil {
 		t.Error("oldest entry (file_0000.txt) should have been evicted")
 	}
@@ -60,13 +60,13 @@ func TestCacheEviction(t *testing.T) {
 	// With 200 entries and maxCache=100, entries 100-199 should survive.
 	for i := 100; i < 200; i++ {
 		p := fmt.Sprintf("dir/file_%04d.txt", i)
-		if store.LookupByPath(p) == nil {
+		if store.lookupByPathRAM(p) == nil {
 			t.Errorf("entry %s (recent) should be in cache", p)
 		}
 	}
 	for i := 0; i < 100; i++ {
 		p := fmt.Sprintf("dir/file_%04d.txt", i)
-		if store.LookupByPath(p) != nil {
+		if store.lookupByPathRAM(p) != nil {
 			t.Errorf("entry %s (old) should have been evicted", p)
 		}
 	}

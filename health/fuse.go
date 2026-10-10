@@ -6,16 +6,21 @@ package health
 
 import (
 	"bufio"
-	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -23,9 +28,16 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/redis/go-redis/v9"
+
+	"github.com/lelanddutcher/juicemount/internal/appisolation"
 	"github.com/lelanddutcher/juicemount/internal/cache/pin"
+	"github.com/lelanddutcher/juicemount/internal/fusecustody"
 	"github.com/lelanddutcher/juicemount/internal/jmlog"
+	"github.com/lelanddutcher/juicemount/internal/juicefsbin"
+	"github.com/lelanddutcher/juicemount/internal/mounttable"
 	"github.com/lelanddutcher/juicemount/internal/netprofile"
+	"github.com/lelanddutcher/juicemount/internal/redisurl"
 )
 
 // linkAwareJuiceFSPolicy picks the mount-time juicefs prefetch flags
@@ -40,34 +52,400 @@ import (
 // profile's default (medium == the historical mount flags), so a transient
 // backend hiccup never degrades the mount config.
 func (fm *FUSEManager) linkAwareJuiceFSPolicy() netprofile.JuiceFSPolicy {
-	if u, err := url.Parse(fm.cfg.RedisURL); err == nil && u.Host != "" {
+	if u, err := url.Parse(fm.cfg.RedisURL); err == nil && u.Host != "" && !urlHostIsLoopback(u) {
 		start := time.Now()
 		conn, derr := net.DialTimeout("tcp", u.Host, 2*time.Second)
 		if derr == nil {
 			rtt := time.Since(start)
 			_ = conn.Close()
 			netprofile.Default().ObserveRTT(rtt)
-			jmlog.Info("link-aware mount probe",
-				"backend", u.Host,
-				"rtt_ms", rtt.Milliseconds(),
-				"class", netprofile.Default().Class().String())
 		}
 	}
-	return netprofile.Default().JuiceFS()
+	pol := netprofile.Default().JuiceFS()
+	snap := netprofile.Default().Snapshot()
+
+	// Log the DECISION, not just the probe. These flags are mount-time only and
+	// never re-track the class afterwards, so this line is the sole record of
+	// what the mount actually got and how much the estimator knew when it chose.
+	//
+	// class_measured matters more than class here. At mount the profile has just
+	// been restarted, so it usually has an RTT bootstrap and NO bandwidth
+	// sample, and class is BW-driven once samples exist. Measured 2026-08-16
+	// across six runs on one 10GbE link: three recorded bandwidth=0 with
+	// class_measured=false, and the observed class swung medium/fast (and the
+	// bandwidth estimate 0 -> 26 -> 1098 -> 1650 MB/s) while the mount flags
+	// stayed frozen at whatever this moment decided. A mount that came up
+	// `medium` and a runtime that reports `fast` is not a bug by itself — but it
+	// is indistinguishable from one without this line.
+	jmlog.Info("link-aware mount policy chosen",
+		"class", snap.Class.String(),
+		"class_measured", snap.HaveRTT && snap.HaveBW,
+		"have_rtt", snap.HaveRTT, "have_bandwidth", snap.HaveBW,
+		"rtt_ms", snap.RTT.Milliseconds(),
+		"bandwidth_mbps", snap.BytesPerSec/(1024*1024),
+		"bootstrapped_from_rtt", snap.BootstrappedRTT,
+		"buffer_size_mb", pol.BufferSizeMB,
+		"prefetch", pol.Prefetch,
+		"nfs_readahead", netprofile.Default().NFSReadahead())
+	return pol
 }
 
-// redactURLCreds returns a copy of `raw` with any user:password component
-// of a parseable URL replaced by `<redacted>`. Used to keep credentials
-// out of logs when a user supplies a `--bucket` URL of the form
-// `http://user:pass@host:port/bucket`. Non-URL strings pass through
-// unchanged so this is safe to apply to anything log-suspect.
+func urlHostIsLoopback(u *url.URL) bool {
+	host := strings.TrimSuffix(strings.ToLower(u.Hostname()), ".")
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+// redactURLCreds keeps only a URL's scheme and authority for diagnostics.
+// Userinfo, paths and arbitrary query values may contain credentials.
 func redactURLCreds(raw string) string {
 	u, err := url.Parse(raw)
-	if err != nil || u.User == nil {
-		return raw
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return "<invalid URL>"
 	}
-	u.User = url.User("<redacted>")
-	return u.String()
+	return u.Scheme + "://" + u.Host
+}
+
+func mountLogArgs(args []string) []string {
+	logArgs := append([]string(nil), args...)
+	for i, a := range logArgs {
+		if a == "mount" && i+1 < len(logArgs) {
+			logArgs[i+1] = redactURLCreds(logArgs[i+1])
+		}
+		if a == "--bucket" && i+1 < len(logArgs) {
+			logArgs[i+1] = redactURLCreds(logArgs[i+1])
+		}
+	}
+	return logArgs
+}
+
+const desktopJuiceFSHeartbeat = "60s"
+
+func desktopJuiceFSSessionArgs() []string {
+	return []string{
+		"--heartbeat", desktopJuiceFSHeartbeat,
+		"--max-uploads", "4",
+	}
+}
+
+// desktopJuiceFSObjectIOArgs keeps one fixed 4 MiB JuiceFS block viable on a
+// measured cellular path without allowing the upstream default of ten full
+// retries to hold a dirty inode indefinitely. At 1 Mbps a block needs at least
+// 33.6 seconds before protocol overhead, and a contended phone uplink can take
+// materially longer than the upstream 60-second PUT deadline. JuiceMount's
+// durable spool owns retry across attempts, so the filesystem client needs
+// only a small in-session retry budget.
+//
+// Fast and medium links retain upstream defaults. JM_JFS_OBJECT_TIMEOUTS=0 is
+// the field rollback switch for slow/metered overrides.
+func desktopJuiceFSObjectIOArgs(class netprofile.LinkClass) []string {
+	if os.Getenv("JM_JFS_OBJECT_TIMEOUTS") == "0" {
+		return nil
+	}
+	switch class {
+	case netprofile.ClassMetered:
+		return []string{"--get-timeout", "3m", "--put-timeout", "5m", "--io-retries", "2"}
+	case netprofile.ClassSlow:
+		return []string{"--get-timeout", "2m", "--put-timeout", "3m", "--io-retries", "3"}
+	default:
+		return nil
+	}
+}
+
+// desktopJuiceFSReadAheadArgs fixes JuiceFS's immutable per-mount session
+// readahead at the conservative floor.  JuiceMount's NFS readahead controller
+// is the adaptive layer: it changes depth and concurrency live as measured RTT
+// and throughput move between fast, slow, and metered classes.
+//
+// Leaving JuiceFS's own 32 MiB default enabled on a mount that happened to
+// start on Wi-Fi defeats that controller after a Wi-Fi -> cellular handoff:
+// JuiceMount can disable its own speculative reads, but the already-running
+// JuiceFS session continues pulling ahead until the next remount.  A fixed 1
+// MiB ceiling disables that hidden second prefetcher for every startup class;
+// fast links still get parallel 4 MiB block reads from JuiceMount's measured,
+// live controller.  JM_JFS_MAX_READAHEAD=0 is the field rollback switch.
+func desktopJuiceFSReadAheadArgs() []string {
+	if os.Getenv("JM_JFS_MAX_READAHEAD") == "0" {
+		return nil
+	}
+	return []string{"--max-readahead", "1M"}
+}
+
+// juiceFSChildEnvironment deliberately gives the external JuiceFS daemon a
+// small, non-secret environment. The upstream macOS daemon launcher preserves
+// its environment in the daemon process title, which makes inherited API keys
+// and tokens visible through the process table even though JuiceMount never
+// logs them. The desktop mount is fully configured by flags plus the volume
+// metadata in Redis, so it does not need arbitrary parent-process variables.
+//
+// Keep only values required to find the user's cache/home, execute helper
+// binaries, localize diagnostics, and validate TLS certificates. Missing
+// values are omitted rather than synthesized.
+func juiceFSChildEnvironment() []string {
+	allowed := [...]string{
+		"HOME", "USER", "LOGNAME", "PATH", "TMPDIR",
+		"LANG", "LC_ALL", "LC_CTYPE", "TZ",
+		"SSL_CERT_FILE", "SSL_CERT_DIR",
+	}
+	env := make([]string, 0, len(allowed))
+	for _, key := range allowed {
+		if value, ok := os.LookupEnv(key); ok {
+			env = append(env, key+"="+value)
+		}
+	}
+	return env
+}
+
+// juiceFSDirectEnvironment selects JuiceFS's service stage directly instead
+// of its built-in launchMount supervisor. The upstream supervisor probes the
+// mountpoint every five seconds and SIGKILLs the service after roughly one
+// minute without a response. A cellular object request is legitimately allowed
+// to run for 60 seconds and retry, so that watchdog can destroy a slow-but-live
+// macFUSE session in the middle of useful work. JuiceMount already owns mount
+// health, link-aware grace periods, restart backoff, and exact-process cleanup;
+// running the service stage directly leaves one lifecycle authority.
+//
+// The value is intentionally the JuiceMount process ID. JuiceFS currently only
+// tests that JFS_SUPERVISOR is non-empty, while retaining the parent identity is
+// useful in diagnostics and matches the value set by its own launcher.
+//
+// metaPassword is the Redis password split out of the metadata URL by
+// desktopJuiceFSMountArgs. It is the one credential the child receives, as
+// META_PASSWORD (pkg/meta/redis.go reads it when the URL has no password), so
+// it never appears in argv, which any local user can read with ps. The
+// allowlist above already drops an inherited META_PASSWORD or REDIS_PASSWORD
+// (REDIS_PASSWORD would take precedence in juicefs), so no other value can win.
+//
+// objectKey is this Mac's object-store key from enrollment (H-8B §2.1: the
+// volume's `setting` holds no key once the server switches, and stock juicefs
+// then reads MINIO_ACCESS_KEY / MINIO_SECRET_KEY, pkg/object/minio.go). It is
+// passed only when both halves are present; an inherited MINIO_* is already
+// dropped by the allowlist. While `setting` still holds a key, juicefs
+// ignores these, so passing them before the switch changes nothing.
+//
+// The AWS SDK's default credential chain is closed (review 2026-10-06,
+// finding 2). With no key in `setting` and none in MINIO_*, juicefs's minio
+// backend calls config.LoadDefaultConfig, which reads ~/.aws/credentials and
+// ~/.aws/config (HOME is passed through), a credential_process or SSO
+// profile named there, and the EC2 instance metadata service. A Mac with an
+// AWS default profile for the same MinIO would then mount with that key,
+// possibly a delete-capable one. The AWS_* variables the chain reads from
+// the environment (AWS_ACCESS_KEY_ID, AWS_PROFILE, AWS_WEB_IDENTITY_TOKEN_FILE,
+// AWS_CONTAINER_*...) are already dropped by the allowlist; the three below
+// point the file sources at /dev/null and turn off the metadata service.
+func juiceFSDirectEnvironment(supervisorPID int, metaPassword string, objectKey ObjectKey) []string {
+	env := juiceFSChildEnvironment()
+	env = append(env, juiceFSNoAWSCredentialChain...)
+	env = append(env, "JFS_SUPERVISOR="+strconv.Itoa(supervisorPID))
+	if metaPassword != "" {
+		env = append(env, "META_PASSWORD="+metaPassword)
+	}
+	if objectKey.Complete() {
+		env = append(env, "MINIO_ACCESS_KEY="+objectKey.AccessKey, "MINIO_SECRET_KEY="+objectKey.SecretKey)
+	}
+	return env
+}
+
+// juiceFSNoAWSCredentialChain closes every file and network source of the
+// AWS SDK default credential chain for a juicefs child (see
+// juiceFSDirectEnvironment).
+var juiceFSNoAWSCredentialChain = []string{
+	"AWS_SHARED_CREDENTIALS_FILE=/dev/null",
+	"AWS_CONFIG_FILE=/dev/null",
+	"AWS_EC2_METADATA_DISABLED=true",
+}
+
+// ObjectKey is an object-store access key pair. It is never logged,
+// serialized or hashed (FUSEConfig carries it with json:"-").
+type ObjectKey struct {
+	AccessKey string
+	SecretKey string
+}
+
+// Complete reports whether both halves are present.
+func (k ObjectKey) Complete() bool { return k.AccessKey != "" && k.SecretKey != "" }
+
+// accessKeyIfComplete is the access-key ID juicefsDirectEnvironment passes,
+// "" when it passes none.
+func (k ObjectKey) accessKeyIfComplete() string {
+	if !k.Complete() {
+		return ""
+	}
+	return k.AccessKey
+}
+
+// ObjectKeyStatus is what this process knows about the object key its juicefs
+// child uses (H-8 per-Mac keys, design §5 "Mac side"). It holds no secret:
+// InUse is the access-key ID only, which MinIO prints in `mc admin` output and
+// the Manager already knows.
+type ObjectKeyStatus struct {
+	// InUse is the access-key ID the last started juicefs child received
+	// ("" = none: no child yet, or no key was configured).
+	InUse string `json:"object_key_in_use,omitempty"`
+	// Refusals counts juicefs log lines since that child started in which
+	// the object store refused the key (ObjectKeyRefusalCode). 0 = none.
+	Refusals uint64 `json:"refusals,omitempty"`
+	// RefusedCode is the S3 error code of the last refusal.
+	RefusedCode string `json:"refused_code,omitempty"`
+	// RefusedAtMS is the time of the last refusal (Unix ms).
+	RefusedAtMS int64 `json:"refused_at_ms,omitempty"`
+}
+
+var objectKeyState struct {
+	sync.Mutex
+	st ObjectKeyStatus
+}
+
+// CurrentObjectKeyStatus returns the object-key status of this process's
+// juicefs child.
+func CurrentObjectKeyStatus() ObjectKeyStatus {
+	objectKeyState.Lock()
+	defer objectKeyState.Unlock()
+	return objectKeyState.st
+}
+
+// noteObjectKeyInUse records the key a juicefs child was just started with.
+// A new child starts a new record: a refusal belonged to the previous child.
+func noteObjectKeyInUse(accessKey string) {
+	objectKeyState.Lock()
+	objectKeyState.st = ObjectKeyStatus{InUse: accessKey}
+	objectKeyState.Unlock()
+}
+
+// noteObjectKeyLogLine records a refusal when line is one. It reports
+// whether it was.
+func noteObjectKeyLogLine(line string, now time.Time) bool {
+	code := ObjectKeyRefusalCode(line)
+	if code == "" {
+		return false
+	}
+	objectKeyState.Lock()
+	objectKeyState.st.Refusals++
+	objectKeyState.st.RefusedCode = code
+	objectKeyState.st.RefusedAtMS = now.UnixMilli()
+	objectKeyState.Unlock()
+	return true
+}
+
+var (
+	// The S3 error codes that mean "this key is not accepted": the key ID
+	// is unknown (deleted service account), the secret is wrong, or the
+	// policy denies the request. Only the full aws-sdk-go-v2 error form
+	// counts (juicefs's s3/minio backend, third_party/juicefs/pkg/object/
+	// s3.go; smithy-go OperationError + s3shared.ResponseError + GenericAPIError):
+	//
+	//	operation error S3: PutObject, [retry text, ]https response error
+	//	StatusCode: 403, RequestID: <id>, HostID: <id>, api error <Code>: <msg>
+	//
+	// A code anywhere else in a line is not a refusal: juicefs also logs
+	// file names other users chose (pkg/meta/redis.go "no attribute for
+	// inode %d (%d, %s)"), and a file named "InvalidAccessKeyId.mov" must
+	// not turn this Mac's status red (review keys-l3 F4).
+	objectKeyRefusalRe = regexp.MustCompile(`operation error S3: (\w+), .*?https response error StatusCode: 403, RequestID: [^,]*, HostID: [^,]*, api error (InvalidAccessKeyId|SignatureDoesNotMatch|AccessDenied): `)
+	// AccessDenied also answers an operation the Mac's policy never allowed
+	// (jm-client has no Delete or multipart abort). Such a line says nothing
+	// about the key, so AccessDenied counts only on a data read or write.
+	objectKeyDataOps = map[string]bool{
+		"PutObject": true, "GetObject": true, "UploadPart": true,
+		"CreateMultipartUpload": true, "CompleteMultipartUpload": true,
+	}
+)
+
+// ObjectKeyRefusalCode returns the S3 error code when a juicefs log line
+// reports that the object store refused this Mac's key, else "". Only
+// WARNING and ERROR records count (an upload retry is a WARNING,
+// cached_store.go "Upload %s: %s (try %d)").
+func ObjectKeyRefusalCode(line string) string {
+	if !strings.Contains(line, "<WARNING>:") && !strings.Contains(line, "<ERROR>:") {
+		return ""
+	}
+	m := objectKeyRefusalRe.FindStringSubmatch(line)
+	if m == nil {
+		return ""
+	}
+	if m[2] == "AccessDenied" && !objectKeyDataOps[m[1]] {
+		return ""
+	}
+	return m[2]
+}
+
+// desktopJuiceFSMountArgs returns the fixed prefix for the directly supervised
+// desktop mount. In particular it must never contain -d/--background: direct
+// service mode stays attached to the exact child process JuiceMount starts and
+// reaps.
+//
+// H-8 option B: under the per-project Redis proxy the Mac is an ordinary
+// writer. The server's bg principal owns trash, deleted-file and slice cleanup
+// and metadata backup, which the proxy refuses from a Mac, so the Mac runs no
+// background jobs (--no-bgjob gates them in pkg/meta/base.go) and deletes no
+// objects itself (--max-deletes 0; the upstream default is 2). Objects a Mac
+// delete leaves behind are reclaimed by the server's gc.
+//
+// The metadata URL keeps its username (the Mac's principal) but loses its
+// password, which is returned for the child environment instead (see
+// juiceFSDirectEnvironment). A URL that does not parse is passed unchanged
+// with no password; juicefs then refuses it with a redacted error (patch 0006).
+func desktopJuiceFSMountArgs(redisURL, mountPoint string, bufferSizeMB, prefetch int) (args []string, metaPassword string) {
+	metaURL, metaPassword := SplitMetaPassword(redisURL)
+	return []string{
+		"mount", metaURL, mountPoint,
+		"--no-usage-report",
+		"--no-bgjob",
+		"--max-deletes", "0",
+		"--buffer-size", strconv.Itoa(bufferSizeMB),
+		"--prefetch", strconv.Itoa(prefetch),
+	}, metaPassword
+}
+
+// SplitMetaPassword removes the password from a metadata URL's userinfo and
+// returns it decoded. The username, host, database and query are unchanged.
+// The bridge uses it too, so nothing it persists carries the password.
+func SplitMetaPassword(raw string) (string, string) {
+	u, err := url.Parse(raw)
+	if err != nil || u.User == nil {
+		return raw, ""
+	}
+	password, ok := u.User.Password()
+	if !ok {
+		return raw, ""
+	}
+	if name := u.User.Username(); name != "" {
+		u.User = url.User(name)
+	} else {
+		u.User = nil
+	}
+	return u.String(), password
+}
+
+// readFileTailSince returns at most max bytes written to path since offset.
+// Directing the long-lived JuiceFS service to a real file descriptor avoids
+// os/exec's hidden pipe-copy goroutines; on a LaunchServices app stderr can be
+// undrained, and a forever-lived MultiWriter pipe eventually backpressures the
+// filesystem daemon itself. Reading the bounded startup tail only on failure
+// preserves actionable errors without putting a pipe in the hot lifecycle.
+func readFileTailSince(path string, offset int64, max int) string {
+	if path == "" || max < 1 {
+		return ""
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil || st.Size() <= offset {
+		return ""
+	}
+	start := st.Size() - int64(max)
+	if start < offset {
+		start = offset
+	}
+	buf := make([]byte, st.Size()-start)
+	n, _ := f.ReadAt(buf, start)
+	return string(buf[:n])
 }
 
 // FUSEConfig holds JuiceFS mount configuration.
@@ -91,6 +469,20 @@ type FUSEConfig struct {
 	//
 	// Empty = pass nothing (JuiceFS default applies). "0.01" = keep 1% free.
 	FreeSpaceRatio string
+
+	// OpenCacheTTL is the --open-cache duration, e.g. "5s". Empty = omit the
+	// flag (juicefs default 0s = every open re-validates against Redis).
+	//
+	// THIS TRAVELS IN THE CONFIG, NOT THE ENVIRONMENT, and that is the whole
+	// point. Go snapshots os.Environ at c-archive init, so a host-side setenv()
+	// from Swift is invisible to os.Getenv (see ServerController.start). Every
+	// JM_* knob in this file is therefore UNREACHABLE from a shipped app — only
+	// its default ships. That is harmless for the knobs whose default is the
+	// wanted behaviour, and fatal for this one, whose default is OFF: the
+	// measured 66x open win (2026-07-29 cellular: first open 1226-5660ms,
+	// second 24-36ms) could not be switched on by the person running the test.
+	// JM_WAN_MODE died exactly this way — read in six paths, set by nothing.
+	OpenCacheTTL string
 
 	// BucketOverride is the S3 endpoint URL the Mac juicefs daemon should
 	// use, overriding whatever bucket URL was stored in Redis at format
@@ -124,6 +516,11 @@ type FUSEConfig struct {
 	// bridge only scrapes the addr it knows about, so an empty value just
 	// means cache_used_bytes uses the dir-walk fallback.
 	FUSEMetricsAddr string
+
+	// ObjectKey is this Mac's object-store key (enrollment), given to the
+	// juicefs child as MINIO_ACCESS_KEY / MINIO_SECRET_KEY, never argv.
+	// Excluded from JSON so generationConfigDigest never hashes it.
+	ObjectKey ObjectKey `json:"-"`
 }
 
 // DefaultFUSEMetricsAddr is the loopback host:port the FUSE mount daemon binds
@@ -135,33 +532,137 @@ const DefaultFUSEMetricsAddr = "127.0.0.1:9568"
 
 // FUSEManager manages the JuiceFS FUSE mount lifecycle.
 type FUSEManager struct {
-	cfg    FUSEConfig
-	mu     sync.Mutex
-	cmd    *exec.Cmd
-	stopCh chan struct{}
-	done   chan struct{}
-	// onRemount fires after a successful WATCHDOG remount (#12): pooled
-	// FUSE fds reference the dead mount and must be flushed. Guarded by mu;
-	// invoked without mu held. Set via SetOnRemount (bridge wiring).
-	onRemount func()
+	cfg                 FUSEConfig
+	mu                  sync.Mutex
+	cacheVolumePath     string // configured cache root, guarded by mu
+	cacheVolumeDev      uint64 // device of that location's existing ancestor
+	cacheFloorBytes     int64  // exact selected --free-space-ratio reserve
+	cachePolicyKnown    bool   // false when volume or selected reserve was unmeasurable
+	cachePolicyMeasured bool   // selected candidate, published only after custody admission
+	stopCh              chan struct{}
+	done                chan struct{}
+	stopping            atomic.Bool
+	stopOnce            sync.Once
+	monitorState        atomic.Int32           // 0 unstarted, 1 running, 2 stopped before start
+	activeReceipt       *MountReceipt          // guarded by mu, including incomplete launches
+	generation          *GenerationReservation // durable physical-path intent; held until proven retirement
+	callbackMu          sync.Mutex
+	onRemount           func()
+	callbacksClosed     bool
+	callbacksActive     int
+	callbacksIdle       chan struct{}
+	helperMu            sync.Mutex
+	helperClosed        bool
+	helperActive        int
+	helperIdle          chan struct{}
+	// observeMount is injected only by health package tests. Production uses
+	// the sibling standalone kernel observer, never an in-process mount syscall.
+	observeMount     func(context.Context) (mounttable.Snapshot, error)
+	dataPlaneProbe   func(string, time.Duration) bool        // test-only; nil uses the bounded child probes
+	spotlightWrite   func(string, []byte, os.FileMode) error // test-only; nil uses os.WriteFile
+	capabilityProbe  *fusecustody.CapabilityProbe
+	custodyPreflight func() error // test-only capability seam
+	// unmountd is the privileged unmount helper (H-3 L5); nil keeps the
+	// descriptor-only behaviour. Set before Mount.
+	unmountd UnmountHelper
+	// helperView is the newest child's helper receipt, readable without
+	// fm.mu for /health.
+	helperView atomic.Pointer[fuseHelperReceipt]
+}
+
+// MountReceipt owns only the foreground child started by one MountWithReceipt
+// call. An adopted mount has no receipt. It is deliberately independent of
+// the mountpoint, whose current occupant may change before cleanup runs.
+type MountReceipt struct {
+	owner      *FUSEManager
+	generation *GenerationReservation
+	process    *os.Process
+	waitDone   <-chan struct{}
+	// A complete kernel observation is bound to this exact child before root
+	// probes. It is process-local readiness evidence, not detach authority.
+	readinessBoot   string
+	readinessSource string
+	readinessFSID   [2]int32
+	tailStop        chan struct{}
+	tailDone        <-chan struct{}
+	observerDone    <-chan struct{}
+	custody         fuseCustodian
+	custodyBoot     string
+	custodySource   string
+	custodyFSID     [2]int32
+	custodyUUID     string
+	custodyRecorded bool
+	exitErr         error
+	tailStopOnce    sync.Once
+	// juiceFSLogStart is the size of ~/.juicefs/juicefs.log just before
+	// this child started (-1 = unknown). The log tail reads from there, so
+	// the lines the child writes during mount verification (up to a
+	// minute) are not skipped (review keys-l3 F5).
+	juiceFSLogStart int64
+	// custodyStartedAt is when the current custodian began its root open;
+	// a pending admission hands off to the helper after
+	// FUSEPendingHelperHandoff measured from here (design Q5).
+	custodyStartedAt time.Time
+	// helper is this child's unmount-helper receipt (H-3 L5); nil until a
+	// registration was attempted. Its fields have their own lock.
+	helper *fuseHelperReceipt
+}
+
+// Rollback enters the owner's typed teardown. A failed/uncertain teardown
+// retains the receipt and dependencies for retry; it never kills by PID/path.
+func (r *MountReceipt) Rollback() error {
+	if r == nil {
+		return nil
+	}
+	if r.owner == nil {
+		if r.process == nil && r.waitDone == nil && r.tailDone == nil {
+			return nil
+		}
+		return errors.New("FUSE child receipt has no lifecycle owner")
+	}
+	return r.owner.rollbackReceipt(r)
 }
 
 // SetOnRemount registers a callback invoked after every successful
-// watchdog-driven remount. Safe to call before or after StartMonitor.
+// watchdog-driven remount. A caller-serialized new soft-stop session may
+// rearm only after the previous callback has joined. Hard Stop never rearms.
 func (fm *FUSEManager) SetOnRemount(fn func()) {
-	fm.mu.Lock()
+	fm.callbackMu.Lock()
+	defer fm.callbackMu.Unlock()
+	if fm.stopping.Load() {
+		return
+	}
+	if fm.callbacksClosed {
+		if fn == nil || fm.callbacksActive != 0 {
+			return
+		}
+		fm.callbacksClosed = false
+	}
 	fm.onRemount = fn
-	fm.mu.Unlock()
 }
 
 // fireOnRemount invokes the registered callback (if any) without holding mu.
 func (fm *FUSEManager) fireOnRemount() {
-	fm.mu.Lock()
-	fn := fm.onRemount
-	fm.mu.Unlock()
-	if fn != nil {
-		fn()
+	fm.callbackMu.Lock()
+	if fm.callbacksClosed || fm.stopping.Load() || fm.onRemount == nil {
+		fm.callbackMu.Unlock()
+		return
 	}
+	fn := fm.onRemount
+	if fm.callbacksActive == 0 {
+		fm.callbacksIdle = make(chan struct{})
+	}
+	fm.callbacksActive++
+	fm.callbackMu.Unlock()
+	defer func() {
+		fm.callbackMu.Lock()
+		fm.callbacksActive--
+		if fm.callbacksActive == 0 {
+			close(fm.callbacksIdle)
+		}
+		fm.callbackMu.Unlock()
+	}()
+	fn()
 }
 
 // EffectiveCacheSize returns the cache-size string actually passed to the
@@ -185,6 +686,30 @@ func (fm *FUSEManager) EffectiveMetricsAddr() string {
 // lastNonEmptyLine returns the last non-blank line of s, trimmed. juicefs
 // prints progress/info lines before the fatal one, so the final non-empty
 // line is the actionable reason. Returns "" if s has no non-blank content.
+// juiceFSStartupFailureReason turns the failed child's log tail into the
+// reason reported for the mount failure.
+//
+// H-8: the per-project Redis proxy refuses an unauthenticated client, or a
+// wrong password, with "-JMDENY AUTH_REQUIRED ..." on every command, and the
+// bundled juicefs exits at once with that line as its FATAL. Retrying cannot
+// fix it, so say what can: enrolment approval or the saved password.
+func juiceFSStartupFailureReason(tail string) string {
+	last := lastNonEmptyLine(tail)
+	i := strings.Index(last, "JMDENY ")
+	if i < 0 {
+		return last
+	}
+	fields := strings.Fields(last[i+len("JMDENY "):])
+	if len(fields) == 0 {
+		return last
+	}
+	if fields[0] == "AUTH_REQUIRED" {
+		return "the metadata server refused this Mac's sign-in (JMDENY AUTH_REQUIRED): " +
+			"approve this Mac in the JuiceMount Manager, or enter its Redis password in Settings > Connection"
+	}
+	return "the metadata server refused this Mac (JMDENY " + fields[0] + ")"
+}
+
 func lastNonEmptyLine(s string) string {
 	lines := strings.Split(s, "\n")
 	for i := len(lines) - 1; i >= 0; i-- {
@@ -215,13 +740,21 @@ var kextBlockedFlag atomic.Bool
 // as the macFUSE kext being unloaded (approval loss). Cheap; any goroutine.
 func KextApprovalBlocked() bool { return kextBlockedFlag.Load() }
 
-// noteMountFailure classifies a mount failure. Only latches the blocked flag
-// on high confidence (kmutil ran and macfuse is absent); on kmutil error or
-// timeout it stays quiet — the FUSE identity gate is the safety mechanism,
-// this is diagnosis for the human.
-func noteMountFailure() {
+// noteMountFailure classifies a mount verification failure. A missing kext is
+// actionable only after Redis and object storage both answer their application
+// protocols. A Link proxy can accept a loopback TCP connection while its
+// encrypted route is still unavailable, so TCP-only reachability would falsely
+// blame macFUSE for a backend outage.
+func (fm *FUSEManager) noteMountFailure() {
 	if kextLoaded() {
 		kextBlockedFlag.Store(false)
+		return
+	}
+	redisReady, objectReady := fm.mountBackendsReady()
+	if !shouldClassifyKextApproval(false, redisReady, objectReady) {
+		kextBlockedFlag.Store(false)
+		jmlog.Warn("mount failed before backend readiness; macFUSE approval not inferred",
+			"redis_ready", redisReady, "object_store_ready", objectReady)
 		return
 	}
 	if kextBlockedFlag.CompareAndSwap(false, true) {
@@ -230,6 +763,79 @@ func noteMountFailure() {
 			"USER ACTION: System Settings → Privacy & Security → Allow \"Benjamin Fleischer\" (macFUSE), then reboot if prompted. " +
 			"Until then the FUSE identity gate parks drains and prunes; writes stay safely in the spool.")
 	}
+}
+
+// shouldClassifyKextApproval centralizes the high-confidence gate so regression
+// tests can prove a backend failure is never presented as an approval loss.
+func shouldClassifyKextApproval(kextIsLoaded, redisReady, objectReady bool) bool {
+	return !kextIsLoaded && redisReady && objectReady
+}
+
+func (fm *FUSEManager) mountBackendsReady() (redisReady, objectReady bool) {
+	if fm == nil {
+		return false, false
+	}
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		redisReady = redisMountBackendReady(fm.cfg.RedisURL)
+	}()
+	go func() {
+		defer wg.Done()
+		objectReady = objectMountBackendReady(fm.cfg.BucketOverride)
+	}()
+	wg.Wait()
+	return redisReady, objectReady
+}
+
+func redisMountBackendReady(raw string) bool {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return false
+	}
+	opts, err := redisurl.Parse(raw)
+	if err != nil || opts.Addr == "" {
+		return false
+	}
+	opts.DialTimeout = 2 * time.Second
+	opts.ReadTimeout = 2 * time.Second
+	opts.WriteTimeout = 2 * time.Second
+	// This is a single compatibility PING, not a long-lived feature client.
+	// RESP2 avoids a HELLO negotiation and identity command on a backend that
+	// may be an older Redis-compatible JuiceFS metadata service.
+	opts.Protocol = 2
+	opts.DisableIdentity = true
+	opts.ContextTimeoutEnabled = true
+	opts.MaxRetries = -1
+	client := redis.NewClient(opts)
+	defer client.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	return client.Ping(ctx).Err() == nil
+}
+
+func objectMountBackendReady(raw string) bool {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
+		return false
+	}
+	u.Path = "/minio/health/live"
+	u.RawPath = ""
+	u.RawQuery = ""
+	u.Fragment = ""
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return false
+	}
+	resp, err := (&http.Client{Timeout: 3 * time.Second}).Do(req)
+	if err != nil {
+		return false
+	}
+	_ = resp.Body.Close()
+	return resp.StatusCode >= 200 && resp.StatusCode < 300
 }
 
 // kextLoaded reports whether any macFUSE kext is currently loaded, bounded.
@@ -256,57 +862,131 @@ func NewFUSEManager(cfg FUSEConfig) *FUSEManager {
 	}
 }
 
-// Mount starts the JuiceFS FUSE mount. Blocks until the mount is verified live.
-func (fm *FUSEManager) Mount() error {
-	fm.mu.Lock()
-	defer fm.mu.Unlock()
-
-	if fm.cfg.JuiceFSBin == "" {
-		return fmt.Errorf("juicefs binary not found")
+// NewGenerationFUSEManager reserves one durable physical path before a caller
+// publishes it to FUSE-dependent consumers. A failed reservation starts no child.
+// A failed birth consumes the path; automatic replacement remains closed until
+// a generation-aware frontend barrier and exact custody join are implemented.
+func NewGenerationFUSEManager(cfg FUSEConfig) (*FUSEManager, error) {
+	paths, isolated, scopeErr := appisolation.ResolvePaths()
+	if scopeErr != nil {
+		return nil, scopeErr
 	}
-
-	// Create mount point directory
-	if err := os.MkdirAll(fm.cfg.MountPoint, 0755); err != nil {
-		return fmt.Errorf("create mount point: %w", err)
+	if isolated && cfg.CacheDir != paths.CacheBase {
+		return nil, errors.New("isolated FUSE cache must use the private cache base")
 	}
-
-	// Check if already mounted
-	if fm.isMountedLocked() {
-		log.Printf("[fuse] already mounted at %s", fm.cfg.MountPoint)
-		return nil
-	}
-
-	// Unmount any stale mount first — and VERIFY the kernel actually released
-	// the mountpoint before relaunching juicefs onto it. A `juicefs mount`
-	// against a still-occupied mountpoint fails with a bare "exit status 1"
-	// (mountpoint/device busy). The pre-2026-06-14 code unmounted once without
-	// checking, so a watchdog remount after a wedge (kill juicefs → mount
-	// entry survives a moment) would fail right here and leave the share down.
-	if err := fm.ensureUnmountedLocked(3); err != nil {
-		return err
-	}
-
-	// Pre-mount: if free space is tight on the cache volume but APFS is
-	// holding lots of purgeable (Time Machine local snapshots, mostly),
-	// reclaim it so JuiceFS doesn't immediately hit "space not enough on
-	// device" warnings on the very first cache write. This is the diff
-	// between the conservative statfs view and macOS's "important capacity"
-	// view, which can be hundreds of GB on a laptop.
-	//
-	// Threshold: reclaim if free is below 50 GB. Conservative — won't fire
-	// for users with healthy disks; will fire for the typical "97% full
-	// video editor's laptop" we shipped this for.
-	{
-		free, _ := volumeFreeBytes("/")
-		if free < 50*(1<<30) {
-			if freed, _, _, err := ReclaimPurgeableSpace("/", 0); err != nil {
-				jmlog.Warn("auto-reclaim failed (non-fatal)", "error", err.Error())
-			} else if freed > 0 {
-				jmlog.Info("auto-reclaim succeeded before mount",
-					"freed_gb", fmt.Sprintf("%.1f", float64(freed)/(1<<30)))
-			}
+	if isolated {
+		if err := os.MkdirAll(paths.CacheBase, 0700); err != nil {
+			return nil, err
+		}
+		if _, _, err := appisolation.ResolvePaths(); err != nil {
+			return nil, err
 		}
 	}
+	fm := NewFUSEManager(cfg)
+	reservation, err := reserveFUSEGeneration(cfg.MountPoint, generationConfigDigest(cfg), fm.observeFUSE)
+	if err != nil {
+		return nil, err
+	}
+	fm.generation = reservation
+	fm.cfg.MountPoint = reservation.Path
+	fm.unmountd = defaultUnmountHelper()
+	return fm, nil
+}
+
+// MountPoint is the reserved physical child path. The requested path remains
+// in the caller's logical configuration and in the reservation record.
+func (fm *FUSEManager) MountPoint() string { return fm.cfg.MountPoint }
+
+// GenerationAttempted reports whether the reserved path has been consumed by
+// a child launch attempt. The current watchdog cannot safely replace it.
+func (fm *FUSEManager) GenerationAttempted() bool {
+	if fm == nil {
+		return false
+	}
+	fm.mu.Lock()
+	defer fm.mu.Unlock()
+	return fm.generation != nil && fm.generation.spent
+}
+
+// Mount starts the JuiceFS FUSE mount. Blocks until the mount is verified live.
+func (fm *FUSEManager) Mount() error {
+	_, err := fm.MountWithReceipt()
+	return err
+}
+
+// startFUSEChildWaiter owns the sole cmd.Wait from the moment Start succeeds.
+// Closing waitDone publishes exitErr to Stop and failed-birth callers.
+func startFUSEChildWaiter(cmd *exec.Cmd, logFile *os.File, receipt *MountReceipt) <-chan error {
+	processExit := make(chan error, 1)
+	waitDone := make(chan struct{})
+	receipt.waitDone = waitDone
+	go func() {
+		err := cmd.Wait()
+		if logFile != nil {
+			_ = logFile.Close()
+		}
+		receipt.exitErr = err
+		processExit <- err
+		close(waitDone)
+	}()
+	return processExit
+}
+
+// MountWithReceipt returns a rollback receipt only when this call started a
+// child, including when subsequent readiness verification fails.
+func (fm *FUSEManager) MountWithReceipt() (*MountReceipt, error) {
+	if fm.stopping.Load() {
+		return nil, errors.New("FUSE manager is stopping")
+	}
+	fm.mu.Lock()
+	defer fm.mu.Unlock()
+	if fm.stopping.Load() {
+		return nil, errors.New("FUSE manager is stopping")
+	}
+
+	if fm.cfg.JuiceFSBin == "" {
+		return nil, fmt.Errorf("juicefs binary not found")
+	}
+	if fm.generation != nil && fm.generation.spent {
+		return nil, errors.New("generation path already attempted; replacement requires a joined generation handoff")
+	}
+
+	// A complete observation is mandatory before every creation, including
+	// watchdog recovery. A present/unknown occupant is never replaced by path.
+	if err := fm.prepareMountLocked(); err != nil {
+		return nil, err
+	}
+	if fm.custodyPreflight != nil {
+		if err := fm.custodyPreflight(); err != nil {
+			return nil, fmt.Errorf("FUSE custody capability: %w", err)
+		}
+	} else {
+		executable, err := os.Executable()
+		if err != nil {
+			return nil, err
+		}
+		probe, err := fusecustody.StartCapability(filepath.Join(filepath.Dir(executable), "juicemount-mount-probe"))
+		if err != nil {
+			return nil, fmt.Errorf("FUSE custody capability start: %w", err)
+		}
+		fm.capabilityProbe = probe
+		if err := probe.Wait(3 * time.Second); err != nil {
+			return nil, fmt.Errorf("FUSE custody capability: %w", err)
+		}
+		fm.capabilityProbe = nil
+	}
+	// Only a proven clear path may be traversed or created. An unavailable
+	// observer cannot even trigger a mountpoint MkdirAll.
+	if err := os.MkdirAll(fm.cfg.MountPoint, 0755); err != nil {
+		return nil, fmt.Errorf("create mount point: %w", err)
+	}
+
+	// Never reclaim storage on startup. ReclaimPurgeableSpace thins Time
+	// Machine local snapshots and can take up to 90 seconds; doing that before
+	// mount made an ordinary app launch both destructive and Finder-blocking.
+	// The cache-size/free-space-ratio policy below already preserves the hard
+	// disk floor. Low space is surfaced in health/UI, and the user may choose
+	// the explicit Reclaim action if they want to trade snapshots for cache.
 
 	// Cache-size policy (2026-06-08). Replaces the prior "max(configured, 85%
 	// of disk)" auto-expansion, which IGNORED the user's configured size — it
@@ -324,29 +1004,26 @@ func (fm *FUSEManager) Mount() error {
 	//      raised so JuiceFS dynamically keeps ≥10 GiB free at write time (the
 	//      REAL guarantee: it also covers OTHER files filling the disk after
 	//      mount, which a static cap cannot).
-	const cacheFreeFloorBytes = int64(10) << 30 // 10 GiB
-	if total, err := volumeTotalBytes("/"); err == nil && total > 0 {
+	const cacheFreeFloorBytes = cacheFreeFloorBytesConst
+	fm.cachePolicyKnown, fm.cachePolicyMeasured, fm.cacheFloorBytes = false, false, 0
+	cacheProbePath := ""
+	fm.cacheVolumePath, cacheProbePath, fm.cacheVolumeDev = cacheVolumeLocation(fm.cfg.CacheDir)
+	pin.SetCachePolicy(0, 0, fm.cacheVolumePath, fm.cacheVolumeDev, false)
+	if total, err := volumeTotalBytes(cacheProbePath); err == nil && total > 0 && fm.cacheVolumeDev != 0 {
+		free, freeErr := volumeFreeBytes(cacheProbePath)
+		if freeErr != nil {
+			free = 0
+		}
 		var configuredMiB int64
 		fmt.Sscanf(fm.cfg.CacheSize, "%d", &configuredMiB)
-		configuredBytes := configuredMiB << 20 // MiB → bytes
 
-		// (1)+(2): respect configured; grow only to fit the pinned set.
-		desired := configuredBytes
-		if fm.cfg.PinnedBytes > desired {
-			desired = fm.cfg.PinnedBytes
-		}
-
-		// (3) clamp: never set cache-size above (disk total − 10 GiB floor).
-		if maxForFloor := total - cacheFreeFloorBytes; maxForFloor > 0 && desired > maxForFloor {
-			desired = maxForFloor
-		}
-
-		if newMiB := desired >> 20; newMiB > 0 && newMiB != configuredMiB {
-			fm.cfg.CacheSize = fmt.Sprintf("%d", newMiB)
+		effectiveMiB, seededBytes := resolveCacheSizeMiB(configuredMiB, fm.cfg.PinnedBytes, total)
+		if effectiveMiB > 0 && effectiveMiB != configuredMiB {
+			fm.cfg.CacheSize = fmt.Sprintf("%d", effectiveMiB)
 			jmlog.Info("cache-size resolved",
-				"configured_gb", configuredBytes>>30,
+				"configured_gb", seededBytes>>30,
 				"pinned_gb", fm.cfg.PinnedBytes>>30,
-				"effective_gb", desired>>30,
+				"effective_gb", (effectiveMiB<<20)>>30,
 				"disk_total_gb", total>>30,
 				"reason", "max(configured, pinned) clamped to keep >=10GiB free")
 		}
@@ -358,7 +1035,7 @@ func (fm *FUSEManager) Mount() error {
 		// CapacityLoop) surfaces this to the user; logging it here makes the
 		// condition obvious at mount time. Compares against FREE disk, not
 		// total — the prior policy's blind spot.
-		if free, ferr := volumeFreeBytes("/"); ferr == nil {
+		if free > 0 {
 			if sustainable := free - cacheFreeFloorBytes; sustainable > 0 && fm.cfg.PinnedBytes > sustainable {
 				jmlog.Warn("pinned set exceeds free disk — cannot stay fully cached offline",
 					"pinned_gb", fm.cfg.PinnedBytes>>30,
@@ -369,16 +1046,44 @@ func (fm *FUSEManager) Mount() error {
 			}
 		}
 
-		// Raise --free-space-ratio so JuiceFS keeps >= 10 GiB free dynamically
-		// (the absolute floor that prevents boot-disk starvation). max() so we
-		// never weaken an already-stricter configured ratio.
-		floorRatio := float64(cacheFreeFloorBytes) / float64(total)
-		var curRatio float64
-		fmt.Sscanf(fm.cfg.FreeSpaceRatio, "%f", &curRatio)
-		if floorRatio > curRatio {
-			fm.cfg.FreeSpaceRatio = fmt.Sprintf("%.4f", floorRatio)
-			jmlog.Info("free-space-ratio raised to enforce 10 GiB free floor",
-				"ratio", fmt.Sprintf("%.4f", floorRatio), "disk_total_gb", total>>30)
+		// Raise --free-space-ratio so JuiceFS's EVICTION floor sits ABOVE the
+		// write spool's ADMISSION floor (B-2 — see resolveFreeSpaceRatio). The
+		// old value was cacheFreeFloorBytes/total, i.e. JuiceFS only started
+		// evicting below 10 GiB free while the spool already stopped admitting
+		// at 20 GiB — so the spool blocked itself first and the cache never gave
+		// the space back. resolveFreeSpaceRatio still guarantees the >= 10 GiB
+		// free floor this line originally existed for. max() so we never weaken
+		// an already-stricter configured ratio.
+		derivedRatio := resolveFreeSpaceRatio(total, free)
+		if ratioArg, replace := resolveFreeSpaceRatioArg(fm.cfg.FreeSpaceRatio, total, free); replace {
+			fm.cfg.FreeSpaceRatio = ratioArg
+		}
+		// PUBLISH the floor we are actually mounting with, including a stricter
+		// configured value. The UI and pin-capacity guard must agree with the
+		// exact JuiceFS argument rather than a historical constant or the raw
+		// derived value before wire rounding.
+		var effectiveRatio float64
+		ratioCount, ratioErr := fmt.Sscanf(fm.cfg.FreeSpaceRatio, "%f", &effectiveRatio)
+		ratioKnown := ratioCount == 1 && ratioErr == nil && effectiveRatio > 0 && effectiveRatio < 1
+		if effectiveRatio <= 0 {
+			effectiveRatio = derivedRatio
+		}
+		effectiveFloor := int64(effectiveRatio * float64(total))
+		if effectiveFloor > 0 {
+			budgetMiB, budgetErr := strconv.ParseInt(fm.cfg.CacheSize, 10, 64)
+			fm.cachePolicyMeasured = freeErr == nil && ratioKnown && budgetErr == nil && budgetMiB > 0 && budgetMiB <= (1<<63-1)>>20
+			if fm.cachePolicyMeasured {
+				fm.cacheFloorBytes = effectiveFloor
+			}
+			preferredFloor := spoolFreeFloorBytesConst + cacheYieldHeadroomBytes
+			jmlog.Info("free-space-ratio resolved to keep the JuiceFS eviction floor above the spool floor",
+				"ratio", fm.cfg.FreeSpaceRatio,
+				"keeps_free_gb", effectiveFloor>>30,
+				"current_free_gb", free>>30,
+				"cache_window_mb", max(int64(0), free-effectiveFloor)>>20,
+				"spool_floor_gb", spoolFreeFloorBytesConst>>30,
+				"adaptive", free > 0 && effectiveFloor < preferredFloor,
+				"disk_total_gb", total>>30)
 		}
 	}
 
@@ -416,27 +1121,34 @@ func (fm *FUSEManager) Mount() error {
 			bufMB = n
 		}
 	}
-	args = append(args,
-		"mount", fm.cfg.RedisURL, fm.cfg.MountPoint,
-		"-d", // daemon mode
-		"--no-usage-report",
-		"--buffer-size", strconv.Itoa(bufMB),
-		"--prefetch", strconv.Itoa(jfp.Prefetch),
-		"-o", "nobrowse", // hide from Finder (MNT_DONTBROWSE flag)
+	mountArgs, metaPassword := desktopJuiceFSMountArgs(
+		fm.cfg.RedisURL, fm.cfg.MountPoint, bufMB, jfp.Prefetch,
 	)
-	// S1 (WAVE 1, RC-5): cap JuiceFS session readahead on a WAN link only.
-	// juicefs's --max-readahead defaults to 8×BlockSize = 32 MiB, so a single
-	// cold 4 KB preview touch pulls up to 32 MiB extra off the backend across
-	// the tunnel. On the metered/slow class we set --max-readahead 1M to disable
-	// session readahead entirely (~28 MiB less per cold first-touch). Mount-time
-	// flag ONLY — zero NFS hot-path impact. Fast/Medium (10GbE/GbE) are left
-	// UNSET so they keep the JuiceFS 32 MiB default (LAN behavior unchanged).
-	// Kill-switch: JM_JFS_MAX_READAHEAD=0. Auto-reverts on 10GbE by class.
-	if cls := netprofile.Default().Class(); cls == netprofile.ClassMetered || cls == netprofile.ClassSlow {
-		if os.Getenv("JM_JFS_MAX_READAHEAD") != "0" {
-			args = append(args, "--max-readahead", "1M")
-		}
-	}
+	args = append(args, mountArgs...)
+	// The benchmark that selected jfp also determines whether fixed-size object
+	// blocks need cellular-safe deadlines. Append these before starting JuiceFS
+	// so the very first spool drain cannot inherit a guaranteed 60-second PUT
+	// timeout/retry loop.
+	args = append(args, desktopJuiceFSObjectIOArgs(netprofile.Default().Class())...)
+	// A JuiceFS session expires at five heartbeat intervals. The upstream
+	// 12s default therefore lets another always-on client reap this Mac
+	// after only 60s. A cold or cellular S3 PUT can legitimately consume
+	// that entire window; the live RC test reproduced the GPU worker
+	// deleting the Mac session during the first 10 MiB write. Five minutes
+	// protects slow-but-progressing writes without enabling writeback or
+	// weakening durability. Metadata liveness is still monitored by
+	// JuiceMount's independent, seconds-scale reachability checks.
+	// Twenty simultaneous uploads can monopolize a cellular uplink and inflate
+	// latency for Redis/Finder control traffic. Four 4 MiB flows still provide
+	// ample bandwidth-delay-product on LAN and WAN while bounding queueing
+	// pressure across a Wi-Fi -> cellular handoff.
+	args = append(args, desktopJuiceFSSessionArgs()...)
+	args = append(args, juiceFSMountPlatformOptions(runtime.GOOS)...)
+	// Keep JuiceFS's mount-time-only prefetcher at its conservative floor on
+	// every startup class.  The live, measured controller in nfs/readahead.go
+	// supplies parallel depth on fast links and can actually react to a later
+	// Wi-Fi <-> cellular handoff.  See desktopJuiceFSReadAheadArgs.
+	args = append(args, desktopJuiceFSReadAheadArgs()...)
 	// Bind the Prometheus metrics endpoint EXPLICITLY so the bridge can scrape
 	// `juicefs_blockcache_bytes` (the true on-disk block-cache size) for the
 	// cache_used_bytes field. We do NOT rely on JuiceFS's :9567 default — that
@@ -506,18 +1218,116 @@ func (fm *FUSEManager) Mount() error {
 	// update SQLite directly and don't depend on FUSE-cache freshness. 60s is
 	// reserved for WAN to keep the worst-case phantom-linger ≤5s on LAN.
 	// Tunable via JM_META_CACHE_SECS.
-	metaTTL := "5s"
-	if os.Getenv("JM_WAN_MODE") == "1" {
-		metaTTL = "60s"
+	// 2026-07-28 — THE NAVIGATION FIX, and why it is unconditional.
+	//
+	// The 60s branch below used to be gated on JM_WAN_MODE=1. That knob is read
+	// in six production paths and SET IN NOTHING BUT TESTS — no Swift setenv, no
+	// LSEnvironment entry, no shell wrapper. So every shipping build has run
+	// with a 5s TTL on ALL FOUR caches, and the WAN fix written here has never
+	// once been active for a user. On a LAN that is invisible (5s revalidation
+	// costs ~0.4ms). On cellular each revalidation is a ~250ms round trip, which
+	// is exactly the reported symptom: navigating a directory is instant while
+	// OFFLINE (never touches the network) and terrible while ONLINE (re-validates
+	// against Redis every 5 seconds per entry).
+	//
+	// It is unconditional rather than link-conditional because these flags are
+	// fixed AT MOUNT TIME: juicefs cannot be re-tuned when the link changes, so
+	// a class-gated value would just bake in whatever the link looked like at
+	// startup and be wrong after the first WiFi<->cellular switch. Picking one
+	// value that is correct everywhere beats picking the wrong one adaptively.
+	//
+	// SAFETY — unchanged from the 2026-06-08 audit above, which already cleared
+	// the 60s value: JuiceMount serves Stat/ReadDir from its own mirror first and
+	// FUSE is fallback-only, the kernel NFS client already serves attrs up to
+	// actimeo=3600s stale, and the only consumer of FUSE metadata freshness is
+	// the phantom-purge / reconcile-prune Lstat, which a longer cache makes
+	// LAZIER — the strictly-safe direction, and those were over-aggressive bugs
+	// (QA-19/30/32/35), never under-aggressive.
+	//
+	// SPLIT, rather than one scalar for all four (audit P4):
+	//   entry / dir-entry 60s — the navigation win; these are what a directory
+	//     listing revalidates, and staleness here only delays a NEWLY ADDED file
+	//     becoming visible. Leland explicitly accepted that trade for throttled
+	//     links ("compromise of delay before new files show up ... is fine").
+	//   attr 10s — deliberately NOT 60s. attr-cache backs LiveSize(), the
+	//     anti-staleness authority for #85 (OpenLoupe verified-offload reads a
+	//     transient short size after a big write, hashes it, and discards a good
+	//     file). A 60s attr cache widens that window by 6x; 10s still removes
+	//     most revalidation chatter.
+	//   negative 5s — unchanged. A stale NEGATIVE is the one users experience as
+	//     "I just created this file and it isn't there", which is far more
+	//     confusing than a stale positive, and the ._* ENOENT storm this was
+	//     added for is already absorbed at 5s.
+	//
+	// JM_META_CACHE_SECS still overrides ALL FOUR together (documented escape
+	// hatch); the per-cache vars below allow finer tuning without it.
+	// --fast-statfs: answer statfs from juicefs's LOCAL counters instead of
+	// querying the metadata service. Default in juicefs is false, and we have
+	// never passed it, so EVERY free-space query has been a Redis round trip.
+	//
+	// That is not a rare call. Profiling one real cellular session measured
+	// StatFS 1,727 times at 230ms average — 397 seconds, 6.6 minutes, spent
+	// reporting how much space is free. Finder polls it while a window is open,
+	// `df` hits it, and the app's own health surface reads it. On a LAN each
+	// call is sub-millisecond and invisible; on cellular it is pure latency
+	// tax on an operation nobody is waiting for the exact answer to.
+	//
+	// SAFETY: the cost is a slightly stale free-space figure. Nothing in
+	// JuiceMount makes a correctness decision from statfs — the pin-store
+	// capacity guard (R-1) measures the LOCAL cache volume with syscall.Statfs
+	// on the Mac's own disk, not the JuiceFS mount, so it is unaffected. A
+	// stale byte count in a Finder window is exactly the class of staleness
+	// already accepted for throttled links. Kill switch JM_FAST_STATFS=0.
+	if os.Getenv("JM_FAST_STATFS") != "0" {
+		args = append(args, "--fast-statfs")
 	}
-	if v := os.Getenv("JM_META_CACHE_SECS"); v != "" {
-		metaTTL = v
+
+	// --open-cache: reuse an open file WITHOUT re-checking for updates.
+	//
+	// THE PRIZE. Measured on a real cellular link 2026-07-29: the FIRST open of
+	// a file costs 1,226-5,660ms while the SECOND costs 24-36ms — a ~66x gap,
+	// and the cost is per-FILE, not per-byte (5.7 KB costs the same as 4.4 MB;
+	// a directory is 26ms). juicefs defaults this to 0s and we have never
+	// passed it, so every open re-validates against Redis. That re-validation
+	// IS the gap, and it is redundant for us: we already run a coherence engine
+	// (the SQLite/RAM mirror + the Redis keyspace push feed).
+	//
+	// DEFAULT OFF, DELIBERATELY. Two facts make this opt-in rather than on:
+	//
+	//  1. juicefs exposes NO external cache invalidation — checked the whole
+	//     subcommand surface (format/config/quota/destroy/gc/fsck/restore/dump/
+	//     load/status/stats/profile/info/debug/summary/mount/umount/gateway/
+	//     webdav/bench/objbench/warmup/rmr/sync). Our push feed can drop OUR
+	//     pooled fd (R1) but cannot make juicefs re-check inside its window. The
+	//     TTL is therefore a HARD staleness bound with no escape hatch.
+	//  2. The exposure is a stale SLICE MAP — wrong bytes from an existing file,
+	//     not a stale listing. That is the family this codebase has been burned
+	//     by three times (#18 torn reads, #104 zero-tailed black frames, the
+	//     membuf stale-partial image). It is NOT covered by the "delay before
+	//     new files appear" trade that was accepted for throttled links.
+	//
+	// So: build the lever, measure the win on the real link, THEN decide the
+	// default with data — rather than defaulting it on from reasoning, which is
+	// how the metadata-TTL change earned a measurement that showed it did
+	// nothing.
+	//
+	// Sizing when enabled: SHORT. The measured repeat-opens were seconds apart
+	// (a browse-and-preview burst), so 5-10s captures nearly all of the 66x
+	// while keeping the window too short for a farm/ClipLogger write to land
+	// inside it. Do not reach for 30s+ without a multi-writer test.
+	//
+	// JM_OPEN_CACHE="" (unset) = OFF, today's behavior byte-identically.
+	// JM_OPEN_CACHE="5s"       = pass --open-cache 5s.
+	if v := fm.openCacheTTL(); v != "" {
+		args = append(args, "--open-cache", v)
 	}
+
+	attrTTL, entryTTL, dirEntryTTL, negTTL := metaCacheTTLs()
 	args = append(args,
-		"--attr-cache", metaTTL,
-		"--entry-cache", metaTTL,
-		"--dir-entry-cache", metaTTL,
-		"--negative-entry-cache", metaTTL,
+		"--attr-cache", attrTTL,
+		"--entry-cache", entryTTL,
+		"--dir-entry-cache", dirEntryTTL,
+		"--negative-entry-cache", negTTL,
 	)
 	if v := os.Getenv("JM_MAX_UPLOADS"); v != "" {
 		// Direct override wins over WAN mode for operators that want
@@ -548,57 +1358,176 @@ func (fm *FUSEManager) Mount() error {
 		args = append(args, "--bucket", fm.cfg.BucketOverride)
 	}
 
-	// Redact secrets from the log line. Currently only the bucket URL
-	// can carry creds (user:pass@host form). Build a sanitized copy of
-	// args just for logging; the actual exec.Command still gets the
-	// real values.
-	logArgs := make([]string, len(args))
-	copy(logArgs, args)
-	for i, a := range logArgs {
-		if a == "--bucket" && i+1 < len(logArgs) {
-			logArgs[i+1] = redactURLCreds(logArgs[i+1])
-		}
-	}
+	// Build a sanitized copy for both log sinks; exec receives real args.
+	logArgs := mountLogArgs(args)
 	log.Printf("[fuse] mounting JuiceFS: %s %s", fm.cfg.JuiceFSBin, strings.Join(logArgs, " "))
 	jmlog.Info("mounting juicefs", "bin", fm.cfg.JuiceFSBin, "args", strings.Join(logArgs, " "))
 
-	// `juicefs mount -d` daemonizes and returns quickly in the happy path,
-	// but can hang on certain backend failures (e.g. unreachable Redis
-	// during Lua init). Bounded at 30 s so a stuck launch can't park the
-	// caller forever.
-	launchCtx, launchCancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer launchCancel()
-	cmd := exec.CommandContext(launchCtx, fm.cfg.JuiceFSBin, args...)
-	cmd.Stdout = os.Stdout
-	// Tee stderr: still stream to os.Stderr (the log tail) but also capture it
-	// so a failed launch's RETURNED error carries juicefs's actual reason
-	// (e.g. "mountpoint is not empty", "address already in use") instead of a
-	// bare "exit status 1" that tells the user nothing (2026-06-14).
-	var stderrBuf bytes.Buffer
-	cmd.Stderr = io.MultiWriter(os.Stderr, &stderrBuf)
-
-	if err := cmd.Run(); err != nil {
-		noteMountFailure()
-		if launchCtx.Err() == context.DeadlineExceeded {
-			return fmt.Errorf("juicefs mount: timed out after 30s (backend unreachable?)")
+	// Run JuiceFS's service stage as one foreground child owned and reaped by
+	// JuiceMount. Do NOT use `-d`: upstream's launchMount supervisor has a
+	// fixed activity watchdog that SIGKILLs a healthy mount when one cellular
+	// object request exceeds roughly a minute. JuiceMount's monitor below has
+	// measured-link grace periods and is the sole restart authority.
+	cmd := exec.Command(fm.cfg.JuiceFSBin, args...)
+	cmd.Env = juiceFSDirectEnvironment(os.Getpid(), metaPassword, fm.cfg.ObjectKey)
+	scope, isolated, isolationErr := appisolation.Current()
+	if isolationErr != nil {
+		return nil, isolationErr
+	}
+	privatePaths, privateMode, privateErr := appisolation.ResolvePaths()
+	if privateErr != nil {
+		return nil, privateErr
+	}
+	if privateMode && (!isolated || fm.cfg.CacheDir != privatePaths.CacheBase) {
+		return nil, errors.New("isolated FUSE child cache differs from the private cache base")
+	}
+	if isolated {
+		var nonce [16]byte
+		if _, err := rand.Read(nonce[:]); err != nil {
+			return nil, err
 		}
-		if reason := lastNonEmptyLine(stderrBuf.String()); reason != "" {
-			return fmt.Errorf("juicefs mount: %w: %s", err, reason)
+		statePath := filepath.Join(scope.Root, "fuse-recovery-"+hex.EncodeToString(nonce[:])+".json")
+		if _, err := os.Lstat(statePath); !os.IsNotExist(err) {
+			return nil, fmt.Errorf("private FUSE recovery state pathname is occupied or unknown: %v", err)
 		}
-		return fmt.Errorf("juicefs mount: %w", err)
+		cmd.Env = append(cmd.Env, "_FUSE_STATE_PATH="+statePath)
 	}
 
-	// Wait for the mount to become live (juicefs mount -d returns before FUSE is ready)
-	if err := fm.waitForMount(fm.mountVerifyTimeout()); err != nil {
-		noteMountFailure()
-		return fmt.Errorf("mount verification: %w", err)
+	// Foreground JuiceFS writes to stdout/stderr rather than its background log.
+	// Give it a REAL file descriptor, not an io.MultiWriter: os/exec implements
+	// non-file writers with parent-side pipes, which can backpressure a daemon
+	// launched by Finder/LaunchServices when the app's stderr is not drained.
+	// tailJuiceFSLog still promotes warnings; failures read a bounded suffix.
+	logWriter := os.Stderr
+	var juiceFSLog *os.File
+	var juiceFSLogPath string
+	var juiceFSLogOffset int64
+	juiceFSLogStart := int64(-1) // for the tail: -1 = unknown
+	logDir := ""
+	if privateMode {
+		logDir = filepath.Dir(privatePaths.FUSELog)
+	} else if home, err := os.UserHomeDir(); err == nil {
+		logDir = filepath.Join(home, ".juicefs")
+	}
+	if logDir != "" {
+		if err := os.MkdirAll(logDir, 0700); err == nil {
+			logPath := filepath.Join(logDir, "juicefs.log")
+			if privateMode {
+				logPath = privatePaths.FUSELog
+			}
+			if f, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600); err == nil {
+				juiceFSLog = f
+				juiceFSLogPath = logPath
+				if st, err := f.Stat(); err == nil {
+					juiceFSLogOffset = st.Size()
+					juiceFSLogStart = st.Size()
+				}
+				logWriter = f
+			} else {
+				if privateMode {
+					return nil, fmt.Errorf("open private FUSE log: %w", err)
+				}
+				jmlog.Warn("juicefs log open failed; continuing with stderr", "path", logPath, "error", err.Error())
+			}
+		} else if privateMode {
+			return nil, fmt.Errorf("create private FUSE log directory: %w", err)
+		}
+	}
+	cmd.Stdout = logWriter
+	cmd.Stderr = logWriter
+	if fm.stopping.Load() {
+		if juiceFSLog != nil {
+			_ = juiceFSLog.Close()
+		}
+		return nil, errors.New("FUSE manager stopped before child start")
+	}
+	if fm.generation != nil {
+		if err := fm.generation.markLaunching(); err != nil {
+			if juiceFSLog != nil {
+				_ = juiceFSLog.Close()
+			}
+			return nil, fmt.Errorf("persist generation launch intent: %w", err)
+		}
+	}
+	if err := cmd.Start(); err != nil {
+		if juiceFSLog != nil {
+			_ = juiceFSLog.Close()
+		}
+		// The process never started, so no kext diagnosis is possible.
+		kextBlockedFlag.Store(false)
+		return nil, fmt.Errorf("juicefs mount start: %w", err)
+	}
+
+	// The child runs with this key from now on (access-key ID only).
+	noteObjectKeyInUse(fm.cfg.ObjectKey.accessKeyIfComplete())
+	receipt := &MountReceipt{owner: fm, generation: fm.generation, process: cmd.Process, tailStop: make(chan struct{}),
+		juiceFSLogStart: juiceFSLogStart}
+	processExit := startFUSEChildWaiter(cmd, juiceFSLog, receipt)
+	fm.activeReceipt = receipt // exact waiter exists before any post-spawn journal work
+	if fm.generation != nil {
+		if err := fm.generation.markChild(cmd.Process.Pid); err != nil {
+			return receipt, fmt.Errorf("persist exact generation child: %w", err)
+		}
+	}
+	if fm.stopping.Load() {
+		return receipt, errors.New("FUSE manager stopped during child creation; exact child retained")
+	}
+
+	// The direct service stays attached, so verification also watches for a
+	// fast child exit and returns its actual final stderr line immediately.
+	if err := fm.waitForMountProcess(fm.mountVerifyTimeout(), processExit); err != nil {
+		fm.noteMountFailure()
+		if reason := juiceFSStartupFailureReason(readFileTailSince(juiceFSLogPath, juiceFSLogOffset, 64<<10)); reason != "" {
+			return receipt, fmt.Errorf("mount verification: %w: %s", err, reason)
+		}
+		return receipt, fmt.Errorf("mount verification: %w", err)
+	}
+	// A published kernel mount needs its durable FSID and retained retirement
+	// handles before any root-inode probe can park or time out. The custodian
+	// opens the root in its own process; Start does not wait for that open.
+	if err := fm.startOriginalCustody(receipt); err != nil {
+		return receipt, err
+	}
+	// Mount-table publication plus a live JuiceFS process is necessary but not
+	// sufficient on macOS. A fresh macFUSE session can be visible while its
+	// first open/readdir calls still park in the kernel until daemon_timeout.
+	// Prove the actual root data plane from short-lived helper processes before
+	// any in-process goroutine, NFS listener, Spotlight marker, or spool drainer
+	// is allowed to touch it. A timed-out helper can be killed without poisoning
+	// an application thread; two consecutive successes reject a single lucky
+	// response during session warm-up.
+	probe := fm.dataPlaneProbe
+	if probe == nil {
+		probe = WaitForFUSEDataPlaneStable
+	}
+	if !probe(fm.cfg.MountPoint, fm.mountVerifyTimeout()) {
+		fm.noteMountFailure()
+		return receipt, fmt.Errorf("mount verification: FUSE data plane did not become stable within %v", fm.mountVerifyTimeout())
+	}
+	if fm.stopping.Load() {
+		return receipt, errors.New("FUSE manager stopped during mount verification; exact child retained")
+	}
+	if !fm.isMountedSteadyLocked() {
+		return receipt, errors.New("FUSE mount identity changed during readiness verification")
+	}
+	if err := fm.admitMountBudget(receipt, 3*time.Second); err != nil {
+		return receipt, err
 	}
 	kextBlockedFlag.Store(false)
+	observerDone := make(chan struct{})
+	receipt.observerDone = observerDone
+	go func() { defer close(observerDone); fm.observeJuiceFSExit(cmd.Process.Pid, receipt) }()
 
 	log.Printf("[fuse] JuiceFS mounted at %s", fm.cfg.MountPoint)
 
-	// Suppress Spotlight indexing on the hidden FUSE mount
-	os.WriteFile(fm.cfg.MountPoint+"/.metadata_never_index", nil, 0644)
+	// Suppress Spotlight indexing on the hidden FUSE mount. This marker is a
+	// cosmetic optimization, not a readiness dependency. A live cold launch
+	// demonstrated that the FUSE CREATE/TRUNCATE syscall can remain blocked even
+	// after mount-table/process verification succeeds; performing it inline
+	// held NFSServerStart forever while the control plane truthfully stayed in
+	// "starting". Best-effort it in the background so navigation readiness can
+	// never depend on Spotlight suppression.
+	fm.scheduleSpotlightIndexing()
 
 	// Up-front disk-space sanity check. If the cache volume is so full that
 	// JuiceFS will refuse to cache, we want the user to KNOW now — before
@@ -621,13 +1550,146 @@ func (fm *FUSEManager) Mount() error {
 		"free_space_ratio", fm.cfg.FreeSpaceRatio,
 		"cache_dir", fm.cfg.CacheDir)
 
-	// Tail JuiceFS's daemon log into our structured logger so warnings like
+	// Tail JuiceFS's service log into our structured logger so warnings like
 	// "space not enough on device, upload it directly" are visible to the
 	// user instead of buried in ~/.juicefs/juicefs.log. Bound to fm.stopCh
 	// so the goroutine exits cleanly when the FUSEManager is stopped
 	// (previously leaked on every Stop, holding the open file handle).
-	go fm.tailJuiceFSLog()
+	tailDone := make(chan struct{})
+	receipt.tailDone = tailDone
+	go func() {
+		defer close(tailDone)
+		fm.tailJuiceFSLog(receipt.tailStop, receipt.juiceFSLogStart)
+	}()
 
+	return receipt, nil
+}
+
+// startOriginalCustody retains retirement authority as soon as the original
+// child publishes one exact kernel mount. The custodian's root open is async:
+// data-plane probes can still fail without discarding its process handle.
+// Caller holds fm.mu; neither a path nor a process title alone is authority.
+func (fm *FUSEManager) startOriginalCustody(receipt *MountReceipt) error {
+	if receipt == nil || receipt != fm.activeReceipt || receipt.owner != fm ||
+		receipt.generation != fm.generation || receipt.process == nil || receipt.process.Pid <= 1 ||
+		receipt.waitDone == nil || waitFUSEChannel(receipt.waitDone, 0) || fm.stopping.Load() {
+		return errors.New("original FUSE child unavailable before custody")
+	}
+	snapshot, present, err := fm.snapshotFUSE()
+	if err != nil || !present || (fm.generation != nil && snapshot.BootID != fm.generation.bootID) {
+		return errors.New("FUSE custody admission has no same-boot mount observation")
+	}
+	var source, onName string
+	var fsid [2]int32
+	for _, entry := range snapshot.Entries {
+		if strings.EqualFold(entry.Path, fm.cfg.MountPoint) {
+			if source != "" || entry.Path != fm.cfg.MountPoint || entry.Type != "macfuse" || entry.FSID == [2]int32{} {
+				return errors.New("FUSE custody root observation is ambiguous")
+			}
+			source, fsid, onName = entry.Source, entry.FSID, entry.Path
+		} else if strings.HasPrefix(strings.ToLower(entry.Path), strings.ToLower(fm.cfg.MountPoint)+string(os.PathSeparator)) {
+			return errors.New("FUSE custody root has mounted descendant")
+		}
+	}
+	if source == "" || snapshot.BootID != receipt.readinessBoot ||
+		source != receipt.readinessSource || fsid != receipt.readinessFSID ||
+		waitFUSEChannel(receipt.waitDone, 0) || fm.stopping.Load() {
+		return errors.New("FUSE mount identity changed before custody retention")
+	}
+	receipt.custodyBoot, receipt.custodySource, receipt.custodyFSID = snapshot.BootID, source, fsid
+	// Preserve the normal durable-observation-before-custodian order. Capture
+	// a journal failure instead of returning yet: this same live owner can
+	// still retain a descriptor custodian for a safe Stop.
+	var observedErr error
+	if fm.generation != nil {
+		observedErr = fm.generation.markObserved(fsid)
+	}
+	if observedErr == nil {
+		fm.registerWithHelperLocked(receipt, onName, source, fsid)
+	}
+	// The helper root open is async. Attempt it even when the journal failed,
+	// but never admit dependent services after such a failure. If it too fails,
+	// retain the original child and report both errors without false retirement.
+	custody, custodyErr := startFUSECustodian(fm.cfg.MountPoint, source, receipt.process.Pid, os.Getpid())
+	receipt.custody = custody
+	if custody != nil {
+		receipt.custodyStartedAt = fuseNow()
+	}
+	if observedErr != nil {
+		journalErr := fmt.Errorf("persist observed FUSE identity: %w", observedErr)
+		if custodyErr != nil {
+			return errors.Join(journalErr, fmt.Errorf("FUSE custody helper start incomplete: %w", custodyErr))
+		}
+		return journalErr
+	}
+	if custodyErr != nil {
+		return fmt.Errorf("FUSE custody helper start incomplete: %w", custodyErr)
+	}
+	if custody == nil {
+		return errors.New("FUSE custody helper start returned no session")
+	}
+	return nil
+}
+
+// admitMountBudget is shared by inline startup and watchdog mounts. A failed
+// birth cannot publish a resolved budget for a daemon it never admitted.
+func (fm *FUSEManager) admitMountBudget(receipt *MountReceipt, timeout time.Duration) error {
+	if err := fm.finishCustodyAdmission(receipt, timeout); err != nil {
+		return err
+	}
+	var budget int64 // Unknown must not inherit a previous mount's budget.
+	if mb, err := strconv.ParseInt(fm.cfg.CacheSize, 10, 64); err == nil && mb > 0 && mb <= (1<<63-1)>>20 {
+		budget = mb << 20
+	}
+	fm.cachePolicyKnown = fm.cachePolicyMeasured && budget > 0
+	pin.SetCachePolicy(budget, fm.cacheFloorBytes, fm.cacheVolumePath, fm.cacheVolumeDev, fm.cachePolicyKnown)
+	return nil
+}
+
+func suppressSpotlightIndexing(mountPoint string, writeFile func(string, []byte, os.FileMode) error) <-chan struct{} {
+	done := make(chan struct{})
+	if mountPoint == "" || writeFile == nil {
+		close(done)
+		return done
+	}
+	go func() {
+		defer close(done)
+		if err := writeFile(filepath.Join(mountPoint, ".metadata_never_index"), nil, 0644); err != nil {
+			jmlog.Warn("could not create Spotlight suppression marker",
+				"mount_point", mountPoint, "error", err.Error())
+		}
+	}()
+	return done
+}
+
+const desktopMacFUSEDaemonTimeoutSeconds = 900
+
+// juiceFSMountPlatformOptions returns only options supported by the host FUSE
+// implementation. nobrowse maps to macOS's MNT_DONTBROWSE flag; Linux
+// fusermount3 rejects it and prevents JuiceFS from mounting at all. The
+// internal macOS mount also needs native xattrs: otherwise macOS can create
+// its own `._` AppleDouble companion when a directory or file is materialized,
+// racing the separate AppleDouble body accepted through the NFS spool.
+//
+// macFUSE's default daemon timeout is 60 seconds. That is shorter than one
+// legitimate JuiceFS object request (--get-timeout/--put-timeout both default
+// to 60s), and far shorter than JuiceFS's bounded retry envelope. On a weak
+// cellular path, or when a foreground read shares the tunnel with a durable
+// spool upload, a single request can therefore cross exactly 60s while the
+// daemon is still alive and making progress. macFUSE then tears the whole
+// device down with ENXIO ("device not configured"). Finder loses every open
+// handle and the app spends tens of seconds unmounting/remounting a filesystem
+// that never actually crashed.
+//
+// Keep the kernel/daemon contract alive for the full bounded JuiceFS retry
+// window. NFS still applies its own request/retry policy, JuiceMount still
+// reports backend degradation promptly, and the FUSE watchdog still recovers a
+// genuinely dead process. This only prevents a slow data operation from being
+// mistaken for a dead filesystem session.
+func juiceFSMountPlatformOptions(goos string) []string {
+	if goos == "darwin" {
+		return []string{"--enable-xattr", "-o", fmt.Sprintf("nobrowse,daemon_timeout=%d", desktopMacFUSEDaemonTimeoutSeconds)}
+	}
 	return nil
 }
 
@@ -675,7 +1737,7 @@ func checkCacheVolumeHealth(cfg FUSEConfig) string {
 	return ""
 }
 
-// tailJuiceFSLog watches the JuiceFS daemon log file for new lines and
+// tailJuiceFSLog watches the JuiceFS service log file for new lines and
 // promotes WARNING / ERROR records into jmlog so the user can see them in
 // the same JSON stream as everything else. Aggregates the chatty
 // "space not enough" message — emit once per minute with a count instead
@@ -684,12 +1746,23 @@ func checkCacheVolumeHealth(cfg FUSEConfig) string {
 // Exits cleanly when fm.stopCh closes. Previously a package-level
 // function with no stop signal — leaked the goroutine + open file handle
 // on every FUSEManager.Stop(), accumulating across Stop/Start cycles.
-func (fm *FUSEManager) tailJuiceFSLog() {
-	home, err := os.UserHomeDir()
-	if err != nil {
+//
+// startAt is the log offset to read from: the size of the log just before
+// this child started, so its startup lines are seen. startAt < 0 reads only
+// lines written after the tail opens the file.
+func (fm *FUSEManager) tailJuiceFSLog(receiptStop <-chan struct{}, startAt int64) {
+	paths, isolated, scopeErr := appisolation.ResolvePaths()
+	if scopeErr != nil {
 		return
 	}
-	logPath := filepath.Join(home, ".juicefs", "juicefs.log")
+	logPath := paths.FUSELog
+	if !isolated {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return
+		}
+		logPath = filepath.Join(home, ".juicefs", "juicefs.log")
+	}
 	// Wait for the file to appear (juicefs daemon may not have created it
 	// yet). Interruptible by fm.stopCh so Stop() doesn't have to wait the
 	// full 30 s to reap this goroutine.
@@ -700,6 +1773,8 @@ func (fm *FUSEManager) tailJuiceFSLog() {
 		select {
 		case <-fm.stopCh:
 			return
+		case <-receiptStop:
+			return
 		case <-time.After(1 * time.Second):
 		}
 	}
@@ -709,12 +1784,23 @@ func (fm *FUSEManager) tailJuiceFSLog() {
 		return
 	}
 	defer f.Close()
-	// Seek to end so we don't replay history.
-	if _, err := f.Seek(0, 2); err != nil {
+	// Start where this child's lines start; never replay older history.
+	// An offset past the end (the log was truncated meanwhile) is handled
+	// by the reader's truncation check, which reads again from 0.
+	if startAt >= 0 {
+		_, err = f.Seek(startAt, io.SeekStart)
+	} else {
+		_, err = f.Seek(0, io.SeekEnd)
+	}
+	if err != nil {
 		return
 	}
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 64*1024), 1<<20)
+	// A bufio.Reader, not a bufio.Scanner: a Scanner stops for good at its
+	// first EOF, so the old loop promoted nothing written after the tail
+	// caught up (in practice, nothing at all). The Reader reads the file
+	// again on every pass and keeps a partial last line until its newline
+	// arrives.
+	lines := newLogLineReader(f, 1<<20)
 
 	type aggKey struct{ pattern string }
 	type aggState struct {
@@ -724,6 +1810,13 @@ func (fm *FUSEManager) tailJuiceFSLog() {
 	}
 	agg := map[aggKey]*aggState{}
 	const flushEvery = 60 * time.Second
+	// At most juiceFSPromoteBudget lines a minute reach jmlog one by one; the
+	// rest are counted under one aggregated warning. A revoked key makes
+	// juicefs log every upload retry, and a slow link logs every slow
+	// request: unbounded promotion would flood the JuiceMount log (the
+	// slow-RPC log line alone once measured 45.6% of mutex contention).
+	var windowStart time.Time
+	promoted := 0
 	flushAgg := func() {
 		now := time.Now()
 		for k, st := range agg {
@@ -745,19 +1838,44 @@ func (fm *FUSEManager) tailJuiceFSLog() {
 		select {
 		case <-fm.stopCh:
 			return
+		case <-receiptStop:
+			return
 		default:
 		}
-		for scanner.Scan() {
-			line := scanner.Text()
+		for {
+			line, ok, err := lines.next()
+			if err != nil {
+				jmlog.Debug("juicefs log tail: read error", "error", err.Error())
+				return
+			}
+			if !ok {
+				break
+			}
 			// Two interesting tokens: <WARNING> and <ERROR>
 			isWarn := strings.Contains(line, "<WARNING>:")
 			isErr := strings.Contains(line, "<ERROR>:")
 			if !isWarn && !isErr {
 				continue
 			}
-			// Aggregate the disk-full pattern; surface others immediately.
-			if strings.Contains(line, "space not enough on device") {
-				k := aggKey{"space not enough on device, upload directly"}
+			// The object store refused this Mac's key (revoked, or
+			// replaced): the app polls the Manager now instead of at the
+			// next 30-minute approved poll (bridge objectKeyStatus).
+			noteObjectKeyLogLine(line, time.Now())
+			// Aggregate the disk-full pattern and anything over the
+			// budget; surface others immediately.
+			now := time.Now()
+			if now.Sub(windowStart) >= flushEvery {
+				windowStart, promoted = now, 0
+			}
+			pattern := ""
+			switch {
+			case strings.Contains(line, "space not enough on device"):
+				pattern = "space not enough on device, upload directly"
+			case promoted >= juiceFSPromoteBudget:
+				pattern = "juicefs warnings over the per-minute budget (see ~/.juicefs/juicefs.log)"
+			}
+			if pattern != "" {
+				k := aggKey{pattern}
 				st := agg[k]
 				if st == nil {
 					st = &aggState{firstAt: time.Now(), lastFlush: time.Now()}
@@ -766,6 +1884,7 @@ func (fm *FUSEManager) tailJuiceFSLog() {
 				st.count++
 				continue
 			}
+			promoted++
 			level := jmlog.LevelWarn
 			if isErr {
 				level = jmlog.LevelError
@@ -777,17 +1896,105 @@ func (fm *FUSEManager) tailJuiceFSLog() {
 			}
 		}
 		flushAgg()
-		// scanner exited — file may have rotated or be at EOF; sleep + retry.
-		if err := scanner.Err(); err != nil {
-			jmlog.Debug("juicefs log tail: scanner error", "error", err.Error())
-			return
-		}
+		// At EOF: sleep, then read again.
 		// Interruptible sleep so Stop() reaps us within 2 s instead of
 		// waiting for the next read attempt.
 		select {
 		case <-fm.stopCh:
 			return
+		case <-receiptStop:
+			return
 		case <-time.After(2 * time.Second):
+		}
+	}
+}
+
+// juiceFSPromoteBudget is how many juicefs WARNING/ERROR lines a minute
+// tailJuiceFSLog copies to jmlog one by one.
+const juiceFSPromoteBudget = 30
+
+// logLineReader returns whole lines from a file that is still being written.
+// At EOF it keeps the partial last line and reads the file again on the next
+// call. A line longer than max is dropped up to its newline.
+//
+// When the source is a file that was truncated in place (the user cleared
+// ~/.juicefs/juicefs.log, or a log cleaner did; juicefs keeps appending
+// through its O_APPEND descriptor), the reader notices at EOF that the file
+// is now shorter than what it has read, and reads again from offset 0
+// (review keys-l3 F5). A truncation followed by more new bytes than were
+// read before the next EOF check is not noticed.
+type logLineReader struct {
+	src     io.Reader
+	r       *bufio.Reader
+	partial []byte
+	max     int
+	skip    bool // dropping an over-long line until its newline
+}
+
+func newLogLineReader(f io.Reader, max int) *logLineReader {
+	return &logLineReader{src: f, r: bufio.NewReaderSize(f, 64<<10), max: max}
+}
+
+// rewindIfTruncated restarts at offset 0 when the source file is now
+// shorter than the offset read so far. It reports whether it did.
+func (l *logLineReader) rewindIfTruncated() bool {
+	f, ok := l.src.(interface {
+		io.Seeker
+		Stat() (os.FileInfo, error)
+	})
+	if !ok {
+		return false
+	}
+	pos, err := f.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return false
+	}
+	st, err := f.Stat()
+	if err != nil || st.Size() >= pos {
+		return false
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return false
+	}
+	l.r.Reset(l.src)
+	l.partial, l.skip = l.partial[:0], false
+	return true
+}
+
+// next returns the next complete line without its newline; ok is false at
+// EOF (call again later). err is a read error other than EOF.
+func (l *logLineReader) next() (line string, ok bool, err error) {
+	for {
+		chunk, err := l.r.ReadSlice('\n')
+		switch {
+		case err == nil:
+			if l.skip {
+				l.skip = false
+				continue
+			}
+			l.partial = append(l.partial, chunk[:len(chunk)-1]...)
+			if len(l.partial) > l.max {
+				l.partial = l.partial[:0]
+				continue
+			}
+			line = strings.TrimSuffix(string(l.partial), "\r")
+			l.partial = l.partial[:0]
+			return line, true, nil
+		case errors.Is(err, bufio.ErrBufferFull) || errors.Is(err, io.EOF):
+			if !l.skip {
+				l.partial = append(l.partial, chunk...)
+				if len(l.partial) > l.max {
+					l.partial, l.skip = l.partial[:0], true
+				}
+			}
+			if errors.Is(err, io.EOF) {
+				if l.rewindIfTruncated() {
+					continue
+				}
+				return "", false, nil
+			}
+		default:
+			return "", false, err
 		}
 	}
 }
@@ -795,46 +2002,43 @@ func (fm *FUSEManager) tailJuiceFSLog() {
 // StartMonitor begins a background goroutine that checks mount health
 // and remounts if the FUSE mount dies.
 func (fm *FUSEManager) StartMonitor() {
+	if fm.stopping.Load() || !fm.monitorState.CompareAndSwap(0, 1) {
+		return
+	}
 	go fm.monitorLoop()
 }
 
-// Stop unmounts JuiceFS and stops the monitor.
-func (fm *FUSEManager) Stop() {
-	close(fm.stopCh)
+// Stop refuses to detach a present or uncertain kernel mount. The process
+// receipt and dependencies remain owned until a repeatable typed result proves
+// exact path-tree absence and child settlement.
+func (fm *FUSEManager) Stop() FUSEStopResult {
+	return fm.stopWithBounds(10*time.Second, 2*time.Second)
+}
 
-	// Kill juicefs FIRST — lock-free, before the monitor join and before
-	// fm.mu.Lock() below. 2026-07-15 teardown-deadlock fix: the watchdog's
-	// escalation Mount() holds fm.mu across an un-abortable `juicefs mount` +
-	// umount (up to the verify budget, longer on a wedged mount). If the user
-	// hits "Stop everything" during a remount, the ONLY juicefs kill (inside
-	// unmountLocked) sits behind that contended fm.mu.Lock — so the whole
-	// NFSServerShutdown blocked, the daemon stayed alive, and because Swift
-	// flips state=.idle only AFTER this cgo call returns, the UI froze,
-	// couldn't relaunch, and a force-quit orphaned the mount. Killing the
-	// daemon up front makes that in-flight mount/umount return at once, so
-	// Mount() releases fm.mu and the Lock() below can't deadlock behind it —
-	// and juicefs is guaranteed dead even if the steps below stall. A daemon
-	// the watchdog's last tick may re-spawn in the tiny window before it sees
-	// stopCh is caught by unmountLocked's own (idempotent) kill.
-	fm.killJuiceFSProcesses()
-
-	// Bound the wait for monitorLoop to exit. Even with iteration-2's
-	// bounded `mount` syscall (5 s context), one tick can still take that
-	// long if it fires while we're trying to stop. Race the join against
-	// a 10 s deadline so callers (NFSServerShutdown → fuse.Stop) never
-	// park indefinitely. If the monitor doesn't exit cleanly in time, we
-	// proceed to unmount anyway — the goroutine will become a zombie
-	// rather than blocking the user-visible Stop button.
-	select {
-	case <-fm.done:
-	case <-time.After(10 * time.Second):
-		jmlog.Warn("FUSEManager.Stop: monitor goroutine didn't exit in 10s — proceeding with unmount anyway")
+// tryLockWithin acquires fm.mu or returns when wait elapses. sync.Mutex.TryLock
+// keeps the caller itself out of the mutex wait queue, which matters when the
+// owner is parked in an uninterruptible filesystem syscall.
+func (fm *FUSEManager) tryLockWithin(wait time.Duration) bool {
+	if fm.mu.TryLock() {
+		return true
 	}
-
-	fm.mu.Lock()
-	defer fm.mu.Unlock()
-	fm.unmountLocked()
-	log.Printf("[fuse] stopped")
+	if wait <= 0 {
+		return false
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			if fm.mu.TryLock() {
+				return true
+			}
+		case <-timer.C:
+			return false
+		}
+	}
 }
 
 // IsMounted returns true if the FUSE mount is live and responsive.
@@ -844,14 +2048,57 @@ func (fm *FUSEManager) IsMounted() bool {
 	return fm.isMountedLocked()
 }
 
+// isMountedSteadyLocked is the backend-free steady-state health probe. A ps
+// command title is not child identity: macOS truncates long mount paths in ps,
+// so a live directly supervised child can be missed indefinitely. Instead use
+// its retained Wait handle and a complete, bounded kernel snapshot. Neither
+// this probe nor periodic health opens the FUSE root or .config.
+// Must be called with fm.mu held.
+func (fm *FUSEManager) isMountedSteadyLocked() bool {
+	r := fm.activeReceipt
+	if r == nil || r.owner != fm || r.process == nil || r.process.Pid <= 1 || r.waitDone == nil ||
+		waitFUSEChannel(r.waitDone, 0) || r.generation != fm.generation {
+		return false
+	}
+	snapshot, present, err := fm.snapshotFUSE()
+	if err != nil || !present || (fm.generation != nil &&
+		(fm.generation.Path != fm.cfg.MountPoint || snapshot.BootID != fm.generation.bootID)) {
+		return false
+	}
+	var root *mounttable.MountEntry
+	folded := strings.ToLower(fm.cfg.MountPoint)
+	for i := range snapshot.Entries {
+		entry := &snapshot.Entries[i]
+		if strings.EqualFold(entry.Path, fm.cfg.MountPoint) {
+			if root != nil || entry.Path != fm.cfg.MountPoint || entry.Type != "macfuse" || entry.FSID == [2]int32{} {
+				return false
+			}
+			root = entry
+		} else if strings.HasPrefix(strings.ToLower(entry.Path), folded+string(os.PathSeparator)) {
+			return false
+		}
+	}
+	if root == nil || (r.readinessBoot != "" && (snapshot.BootID != r.readinessBoot ||
+		root.Source != r.readinessSource || root.FSID != r.readinessFSID)) ||
+		(r.custodyBoot != "" && (snapshot.BootID != r.custodyBoot ||
+			root.Source != r.custodySource || root.FSID != r.custodyFSID)) ||
+		waitFUSEChannel(r.waitDone, 0) {
+		return false
+	}
+	if r.readinessBoot == "" {
+		r.readinessBoot, r.readinessSource, r.readinessFSID = snapshot.BootID, root.Source, root.FSID
+	}
+	return true
+}
+
 // isMountedLocked checks if the FUSE mount is live. Must be called with fm.mu held.
 //
 // CRITICAL: `mount` (which calls `getfsstat()`) hangs in the kernel if the
 // mount table contains a wedged entry (server gone, kernel mount retained).
-// Without the context timeout, this function — called every 10 s by the
-// monitor loop under fm.mu — wedges the FUSEManager lock forever, parking
-// every other caller (Stop, IsMounted, Mount) behind it. That was the
-// "click menu → app freezes" pattern.
+// Without the context timeout, this function can wedge the FUSEManager lock
+// forever during startup or an explicit IsMounted call, parking every other
+// caller (Stop, IsMounted, Mount) behind it. That was the "click menu → app
+// freezes" pattern. Periodic monitoring uses isMountedSteadyLocked instead.
 func (fm *FUSEManager) isMountedLocked() bool {
 	// Check 1: appears in macOS mount table as a FUSE mount.
 	// Hard-bounded at 5 s. On timeout, treat as "unknown" (return false) so
@@ -860,12 +2107,12 @@ func (fm *FUSEManager) isMountedLocked() bool {
 	// of hanging is the entire UI.
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, "mount").Output()
+	out, err := mounttable.Output(ctx)
 	if err != nil {
 		if ctx.Err() == context.DeadlineExceeded {
 			jmlog.Warn("mount table query timed out — likely a wedged mount entry blocking getfsstat",
 				"mount_point", fm.cfg.MountPoint,
-				"hint", "treating as not-mounted; reboot or `sudo umount -f -t nfs` may be needed")
+				"hint", "treating as not-mounted; a wedged mount is retired by the JuiceMount unmount helper, never by path")
 		}
 		return false
 	}
@@ -876,31 +2123,17 @@ func (fm *FUSEManager) isMountedLocked() bool {
 	// Check 2: actually responsive — try listing the directory. A stale FUSE
 	// mount (dead daemon) hangs on any fs op. Kept as a root readdir (NOT the
 	// .config probe) because this same check gates LAUNCH readiness via
-	// waitForMount: right after `juicefs mount -d` the dir is listable before the
-	// .config control file is served, so a .config probe here false-fails the
-	// launch verification. Pure-read, no side-effect umount (QA-34 Slice 2): the
-	// monitorLoop owns the remount decision with its failure tolerance.
-	//
-	// task #72: this 5s readdir DOES flip to "stale" under backend slowness /
-	// cold-start warm, but the DESTRUCTIVE remount is gated by the escalation-
-	// confirm probe (mountResponsiveWithin), which reads the in-memory .config and
-	// so never trips on data-path slowness — a slow-but-alive mount is NEVER
-	// SIGKILLed even though this 5s readdir over-reports "stale" under load. (The
-	// residual cosmetic false "degraded" during heavy load is acceptable; the
-	// watchdog defers to the .config confirm, never destroys on this 5s probe. See
-	// mountResponsiveWithin for why .config beat a generous readdir here.)
-	done := make(chan bool, 1)
-	go func() {
-		_, err := os.ReadDir(fm.cfg.MountPoint)
-		done <- (err == nil)
-	}()
-	select {
-	case ok := <-done:
-		return ok
-	case <-time.After(5 * time.Second):
+	// waitForMount: right after the JuiceFS service starts the dir is listable
+	// before the .config control file is served, so a .config probe here would
+	// false-fail launch verification. This stronger data-path check must not be
+	// used by a periodic loop; isMountedSteadyLocked owns that path. Run it in
+	// a disposable helper process: a timed-out in-process ReadDir used to leave
+	// a Go thread parked for the full 15-minute macFUSE daemon timeout.
+	if !FUSEDataPlaneResponsive(fm.cfg.MountPoint, 5*time.Second) {
 		log.Printf("[fuse] mount at %s is unresponsive (stale); reporting unhealthy. Remount decision deferred to monitorLoop.", fm.cfg.MountPoint)
 		return false
 	}
+	return true
 }
 
 // fuseConfirmProbeTimeout is the GENEROUS window used to CONFIRM a mount is
@@ -1017,163 +2250,217 @@ func runBoundedCommand(timeout time.Duration, name string, args ...string) {
 	}
 }
 
-// waitForMount polls until the mount is live or timeout expires.
-func (fm *FUSEManager) waitForMount(timeout time.Duration) error {
+const (
+	fuseDataPlaneProbeTimeout  = 5 * time.Second
+	fuseDataPlaneInitialSettle = 750 * time.Millisecond
+	fuseDataPlaneRetryPause    = 250 * time.Millisecond
+	fuseDataPlaneStablePasses  = 2
+)
+
+// FUSEDataPlaneResponsive performs one root-inode data-plane probe in a
+// disposable process. macFUSE can park an early filesystem syscall in the
+// kernel even though the mount table and JuiceFS process both look healthy.
+// Keeping that syscall out of this process prevents a failed readiness check
+// from consuming an application goroutine/thread until daemon_timeout.
+//
+// This must NOT enumerate the root. JuiceMount serves directory listings from
+// its local metadata mirror; making launch readiness run `ls -A` over the
+// JuiceFS root needlessly fetched every top-level entry from remote Redis. A
+// measured cellular start paid 20.9 seconds for one lookup inside that probe
+// and required two complete enumerations before publishing an otherwise-ready
+// mount. `test -d` still crosses the mount boundary and asks the live FUSE
+// daemon for the root inode, which proves the kernel/FUSE request path without
+// turning readiness into a namespace warm-up job.
+func FUSEDataPlaneResponsive(path string, timeout time.Duration) bool {
+	if path == "" || timeout <= 0 {
+		return false
+	}
+	cmd := fuseDataPlaneProbeCommand(path)
+	if err := cmd.Start(); err != nil {
+		return false
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case err := <-done:
+		return err == nil
+	case <-timer.C:
+		_ = cmd.Process.Kill()
+		// The waiter reaps the helper if and when macFUSE releases its syscall.
+		// Crucially, the application itself remains unpoisoned and can retry.
+		return false
+	}
+}
+
+func fuseDataPlaneProbeCommand(path string) *exec.Cmd {
+	return exec.Command("/bin/test", "-d", path)
+}
+
+// WaitForFUSEDataPlaneStable admits dependent services only after two
+// consecutive root-inode probes succeed. The small initial settle window
+// avoids issuing the very first request at the exact mount-publication edge;
+// failures reset the streak and remain bounded by the caller's total budget.
+func WaitForFUSEDataPlaneStable(path string, timeout time.Duration) bool {
+	// A fixed 5-second child budget made the wider slow/metered mount budget
+	// ineffective: every root READDIR was killed at five seconds, so a
+	// legitimate high-RTT mount could never produce even one successful probe
+	// during its 90/120-second verification window. Give an individual probe a
+	// proportional share of the caller's class-aware budget while retaining the
+	// 5-second LAN floor. Dividing by passes+1 leaves room for one cold/failed
+	// attempt followed by the required consecutive successes.
+	probeBudget := fuseDataPlaneProbeBudget(timeout, fuseDataPlaneStablePasses)
+	return waitForFUSEDataPlaneStable(
+		path,
+		timeout,
+		probeBudget,
+		fuseDataPlaneInitialSettle,
+		fuseDataPlaneRetryPause,
+		fuseDataPlaneStablePasses,
+		FUSEDataPlaneResponsive,
+	)
+}
+
+func fuseDataPlaneProbeBudget(totalBudget time.Duration, requiredPasses int) time.Duration {
+	if totalBudget <= 0 || requiredPasses < 1 {
+		return fuseDataPlaneProbeTimeout
+	}
+	budget := totalBudget / time.Duration(requiredPasses+1)
+	if budget < fuseDataPlaneProbeTimeout {
+		return fuseDataPlaneProbeTimeout
+	}
+	return budget
+}
+
+func waitForFUSEDataPlaneStable(
+	path string,
+	totalBudget time.Duration,
+	probeBudget time.Duration,
+	initialSettle time.Duration,
+	retryPause time.Duration,
+	requiredPasses int,
+	probe func(string, time.Duration) bool,
+) bool {
+	if path == "" || totalBudget <= 0 || probeBudget <= 0 || requiredPasses < 1 || probe == nil {
+		return false
+	}
+	deadline := time.Now().Add(totalBudget)
+	if !pauseBeforeDeadline(initialSettle, deadline) {
+		return false
+	}
+	consecutive := 0
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return false
+		}
+		attemptBudget := probeBudget
+		if remaining < attemptBudget {
+			attemptBudget = remaining
+		}
+		if probe(path, attemptBudget) {
+			consecutive++
+			if consecutive >= requiredPasses {
+				return true
+			}
+		} else {
+			consecutive = 0
+		}
+		if !pauseBeforeDeadline(retryPause, deadline) {
+			return false
+		}
+	}
+}
+
+func pauseBeforeDeadline(delay time.Duration, deadline time.Time) bool {
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		return false
+	}
+	if delay <= 0 {
+		return true
+	}
+	if delay > remaining {
+		delay = remaining
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	<-timer.C
+	return time.Now().Before(deadline)
+}
+
+// waitForMountProcess polls until the kernel mount and its exact directly
+// supervised JuiceFS process both exist, the process exits, the manager stops,
+// or the verification budget expires. Launch readiness deliberately uses the
+// backend-free steady probe: a root ReadDir can legitimately block behind a
+// high-latency object read, and using it here caused a healthy service to be
+// killed at the verification deadline during a LAN-to-cellular handoff.
+// A nil processExit preserves the old polling behavior for focused tests.
+func (fm *FUSEManager) waitForMountProcess(timeout time.Duration, processExit <-chan error) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		if fm.isMountedLocked() {
+		select {
+		case err := <-processExit:
+			if err == nil {
+				return fmt.Errorf("juicefs service exited before mount became ready")
+			}
+			return fmt.Errorf("juicefs service exited before mount became ready: %w", err)
+		default:
+		}
+		if fm.isMountedSteadyLocked() {
 			return nil
 		}
 		// U5 review fix: with class-widened budgets (45s/90s) a failing
 		// verify would otherwise pin fm.mu through Mount() and park the
 		// user's Stop/quit for the whole window — abort promptly on Stop.
 		select {
+		case err := <-processExit:
+			if err == nil {
+				return fmt.Errorf("juicefs service exited before mount became ready")
+			}
+			return fmt.Errorf("juicefs service exited before mount became ready: %w", err)
 		case <-fm.stopCh:
 			return fmt.Errorf("mount verification aborted: manager stopping")
 		case <-time.After(500 * time.Millisecond):
 		}
 	}
+	select {
+	case err := <-processExit:
+		if err == nil {
+			return fmt.Errorf("juicefs service exited before mount became ready")
+		}
+		return fmt.Errorf("juicefs service exited before mount became ready: %w", err)
+	default:
+	}
 	return fmt.Errorf("mount not ready after %v", timeout)
 }
 
-// killJuiceFSProcesses SIGKILLs every `juicefs mount` process bound to this
-// mountpoint. It takes NO lock and each shell-out is time-bounded, so it is safe
-// to call from Stop() BEFORE fm.mu is held — killing the daemon is what releases
-// the FUSE mount, and doing it lock-free breaks the teardown deadlock (see Stop).
-// Returns the number killed. Idempotent: a second call finds nothing.
-func (fm *FUSEManager) killJuiceFSProcesses() int {
-	pgrepCtx, pgrepCancel := context.WithTimeout(context.Background(), 2*time.Second)
-	procs, _ := exec.CommandContext(pgrepCtx, "pgrep", "-f", "juicefs mount.*"+filepath.Base(fm.cfg.MountPoint)).Output()
-	pgrepCancel()
-	killed := 0
-	for _, line := range strings.Split(strings.TrimSpace(string(procs)), "\n") {
-		if line != "" {
-			killCtx, killCancel := context.WithTimeout(context.Background(), 2*time.Second)
-			_ = exec.CommandContext(killCtx, "kill", "-9", line).Run()
-			killCancel()
-			killed++
-		}
-	}
-	if killed > 0 {
-		// Visibility into the one destructive action in this subsystem. This
-		// pattern also matches juicefs's own `-d` supervisor, so a kill here
-		// removes JuiceFS's self-heal too — only acceptable on an explicit
-		// remount/stop, never as a reaction to a transient stall.
-		jmlog.Warn("unmount: SIGKILL'd juicefs processes for mountpoint",
-			"count", killed, "mountpoint", fm.cfg.MountPoint)
-	}
-	return killed
+// waitForMount keeps the original focused-test seam while production Mount
+// also observes the foreground service process.
+func (fm *FUSEManager) waitForMount(timeout time.Duration) error {
+	return fm.waitForMountProcess(timeout, nil)
 }
 
-// unmountLocked forcibly unmounts the FUSE mount. Must be called with fm.mu held.
-// Every shell-out is time-bounded so a wedged kernel state can't pin fm.mu.
-func (fm *FUSEManager) unmountLocked() {
-	// Kill any lingering JuiceFS mount processes for this mount point first.
-	// Killing the process lets the kernel release the mount.
-	fm.killJuiceFSProcesses()
-	time.Sleep(500 * time.Millisecond)
-
-	// FAST PATH (2026-07-10): when the mountpoint is NOT in the kernel mount
-	// table there is nothing to tear down — the diskutil + umount calls were
-	// pure waste that burned their bounds against the (possibly wedged)
-	// diskarbitrationd. This was the dominant cost of the 12:01→12:04 organic
-	// remount (vs 35s when the teardown had real work): juicefs had died, the
-	// mountpoint was already a plain dir, and every ensureUnmounted attempt
-	// still crawled through both commands. The juicefs-process kill above
-	// already ran (ensureUnmountedLocked depends on it even when the table is
-	// clear).
-	if !fm.stillInMountTable() {
-		jmlog.Debug("unmount: mountpoint not in the kernel mount table — teardown skipped",
-			"mountpoint", fm.cfg.MountPoint)
-		return
-	}
-
-	// QA-34 Slice 2 (2026-05-25): umount is now BLOCKING on this
-	// goroutine with a 60s budget. Pre-fix it was fire-and-forget,
-	// which created a race window where the caller (typically
-	// Mount() about to relaunch juicefs) could attempt to attach
-	// to a mount point the kernel had not yet released. At 15 s
-	// budget the window was small; at the new 60 s budget required
-	// to absorb realistic juicefs fsync durations (15-30 s), the
-	// race window would have been catastrophic.
-	//
-	// Holding fm.mu across the umount is fine: this is the
-	// explicit remount path. By definition the world is waiting
-	// for the mount transition; no other useful work can complete
-	// while the FUSE mount is half-gone.
-	//
-	// runBoundedCommand handles the timeout + reaping internally.
-	done := make(chan struct{})
-	go func() {
-		// `diskutil unmount force` is more reliable than `umount -f` for a
-		// WEDGED macFUSE mount: `umount -f` of a dead-daemon mount can hang in
-		// the kernel indefinitely (observed 2026-06-01 — only diskutil cleared
-		// it), whereas diskutil tears the FUSE device down cleanly. Try
-		// diskutil first; fall back to `umount -f` only if the entry survives.
-		runBoundedCommand(30*time.Second, "diskutil", "unmount", "force", fm.cfg.MountPoint)
-		if fm.stillInMountTable() {
-			runBoundedCommand(30*time.Second, "umount", "-f", fm.cfg.MountPoint)
-		}
-		close(done)
-	}()
+// observeJuiceFSExit reports a direct service exit. The monitor loop remains
+// the single remount authority; this observer only makes the cause visible.
+func (fm *FUSEManager) observeJuiceFSExit(pid int, receipt *MountReceipt) {
 	select {
-	case <-done:
-	case <-time.After(65 * time.Second):
-		// Safety net: even if a bounded command hangs (shouldn't, each has its
-		// own ctx deadline), don't pin fm.mu forever.
-		jmlog.Warn("unmountLocked: unmount goroutine did not return in 65s, proceeding anyway")
-	}
-}
-
-// ensureUnmountedLocked runs unmountLocked and verifies the mountpoint left the
-// kernel mount table, retrying up to `attempts` times with a short backoff.
-// Returns an error only if the entry survives every attempt — in which case
-// relaunching juicefs onto the busy mountpoint would fail with a bare
-// "exit status 1", so the caller should surface this descriptive error instead
-// of churning on a doomed launch. Must be called with fm.mu held.
-//
-// Always runs unmountLocked at least once (it also SIGKILLs any lingering
-// juicefs processes for this mountpoint, which we want even when the kernel
-// table is already clear).
-func (fm *FUSEManager) ensureUnmountedLocked(attempts int) error {
-	if attempts < 1 {
-		attempts = 1
-	}
-	for i := 0; i < attempts; i++ {
-		fm.unmountLocked()
-		if !fm.stillInMountTable() {
-			if i > 0 {
-				jmlog.Info("ensureUnmounted: mountpoint cleared",
-					"attempt", i+1, "mountpoint", fm.cfg.MountPoint)
-			}
-			return nil
+	case <-receipt.waitDone:
+		select {
+		case <-fm.stopCh:
+			return
+		default:
 		}
-		jmlog.Warn("ensureUnmounted: mountpoint still in mount table after unmount",
-			"attempt", i+1, "of", attempts, "mountpoint", fm.cfg.MountPoint)
-		// Linear backoff: give the kernel a moment to drain in-flight FUSE
-		// teardown before the next forced attempt.
-		time.Sleep(time.Duration(i+1) * time.Second)
+		if receipt.exitErr != nil {
+			jmlog.Warn("juicefs service exited; mount monitor will recover it",
+				"pid", pid, "error", receipt.exitErr.Error())
+		} else {
+			jmlog.Warn("juicefs service exited cleanly outside manager shutdown; mount monitor will recover it",
+				"pid", pid)
+		}
+	case <-fm.stopCh:
 	}
-	if fm.stillInMountTable() {
-		return fmt.Errorf("mountpoint %s still in kernel mount table after %d unmount attempts; "+
-			"refusing to relaunch juicefs onto a busy mountpoint (would fail 'exit status 1')",
-			fm.cfg.MountPoint, attempts)
-	}
-	return nil
-}
-
-// stillInMountTable reports whether fm.cfg.MountPoint appears in the kernel
-// mount table. Pure-read, bounded; unlike isMountedLocked it does NOT probe
-// responsiveness (a wedged mount still appears here), so it's the right check
-// for "did the unmount actually remove the entry".
-func (fm *FUSEManager) stillInMountTable() bool {
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	out, err := exec.CommandContext(ctx, "mount").Output()
-	if err != nil {
-		return false
-	}
-	return strings.Contains(string(out), fm.cfg.MountPoint)
 }
 
 // FUSEStaleEscalateTicks is the number of CONTINUOUS "stale but juicefs alive"
@@ -1366,28 +2653,27 @@ func redisHostPort(redisURL string) string {
 // monitorLoop checks mount health periodically and remounts ONLY when the
 // JuiceFS process tree is genuinely gone.
 //
-// Design (2026-05-29 audit). There are two layers of self-heal and they
-// must not fight:
+// Design (2026-08-26 cellular RC). There is one lifecycle authority:
 //
-//  1. JuiceFS's own `-d` supervisor: `juicefs mount -d` spawns a watchdog
-//     process that restarts the mount child if it crashes. This is the
-//     first and best line of recovery — it re-establishes the FUSE session
-//     cleanly and knows how to talk to the kernel.
-//  2. This loop: the app-side backstop for when JuiceFS's own supervisor has
-//     itself exhausted its retries and exited (the whole tree is dead).
+//  1. Mount starts one directly supervised JuiceFS service process. The
+//     upstream launchMount supervisor is deliberately bypassed because its
+//     fixed activity watchdog kills legitimate >60s cellular operations.
+//  2. This loop observes service and mount health, applies measured-link grace
+//     periods, and performs the only restart when the service is truly gone.
 //
 // The pre-2026-05-29 code remounted after 3 consecutive unhealthy checks
 // EVEN WHILE juicefs was still alive. On a flapping backend link that was
 // catastrophic: it `kill -9`'d a live-but-slow daemon — and because the kill
-// pattern matches `juicefs mount.*<mountpoint>`, it ALSO killed JuiceFS's own
-// supervisor — then thrashed mount/unmount until macFUSE wedged with
+// pattern matched `juicefs mount.*<mountpoint>`, it killed the whole process
+// tree — then thrashed mount/unmount until macFUSE wedged with
 // "init: 19=operation not supported by device", a kernel state only a full
 // app restart clears. Observed live: juicefs SIGKILL'd mid-slow-PUT, never
 // recovered, mount dead with no log trace.
 //
-// New policy: while ANY juicefs process is alive, NEVER remount — report the
-// staleness and wait for juicefs's supervisor + backend recovery to clear it.
-// Only when the process tree is gone do we own recovery. All decisions log via
+// New policy: while the JuiceFS service is alive, do not remount for ordinary
+// staleness — report it and let backend recovery clear it. Only after the
+// measured-link grace and an independent liveness confirmation may a sustained
+// wedge be replaced. A gone service is restarted here. All decisions log via
 // jmlog (the rotating juicemount.log), not log.Printf → the app's /dev/null
 // stdout — the old channel made this safety-critical loop invisible.
 func (fm *FUSEManager) monitorLoop() {
@@ -1406,7 +2692,7 @@ func (fm *FUSEManager) monitorLoop() {
 			return
 		case <-ticker.C:
 			fm.mu.Lock()
-			healthy := fm.isMountedLocked()
+			healthy := fm.isMountedSteadyLocked()
 			fm.mu.Unlock()
 
 			if healthy {
@@ -1422,7 +2708,7 @@ func (fm *FUSEManager) monitorLoop() {
 
 			// The mount is unhealthy. Decide WHY before acting — killing a
 			// live-but-slow juicefs is what drove the macFUSE remount thrash.
-			if isJuiceFSProcessAliveFn() {
+			if fm.juiceFSAlive() {
 				// OFFLINE GUARD (release fix — Finder "connection interrupted"):
 				// when the user is OFFLINE, a "stale" probe is overwhelmingly the
 				// juicefs daemon being SATURATED by in-flight spool drains (writes
@@ -1446,11 +2732,11 @@ func (fm *FUSEManager) monitorLoop() {
 					continue
 				}
 				offlineDeferTicks = 0
-				// juicefs (and its own supervisor) is alive — the mount is
+				// juicefs is alive — the mount is
 				// stale, usually a flapping/blipping backend link. Default to
-				// deferring (no kill, no macFUSE thrash). BUT juicefs's own
-				// supervisor only restarts the mount child on a CRASH, not on a
-				// stuck backend connection: a blip can leave juicefs's
+				// deferring (no kill, no macFUSE thrash). A live process does not
+				// necessarily mean its backend connection is making progress: a
+				// link blip can leave juicefs's
 				// connection wedged with FUSE stat hanging indefinitely
 				// (observed 2026-06-01 — a 7-minute continuous wedge with zero
 				// self-recovery). So after a SUSTAINED continuous wedge,
@@ -1506,15 +2792,14 @@ func (fm *FUSEManager) monitorLoop() {
 				}
 				// Rate-limit: first stale tick, then ~once a minute.
 				if staleWhileAliveTicks == 1 || staleWhileAliveTicks%6 == 0 {
-					jmlog.Warn("fuse mount stale but juicefs alive — deferring to juicefs's own supervisor, not remounting",
+					jmlog.Warn("fuse mount stale but juicefs alive — deferring, not remounting",
 						"stale_ticks", staleWhileAliveTicks,
-						"hint", "transient backend/link stall; an app-side remount here would kill juicefs's supervisor and thrash macFUSE")
+						"hint", "transient backend/link stall; replacing a live service here would thrash macFUSE")
 				}
 				continue
 			}
 
-			// juicefs is genuinely GONE — its own supervisor exhausted its
-			// retries and exited. App-side recovery is now the only option.
+			// juicefs is genuinely GONE. App-side recovery is now the only option.
 			staleWhileAliveTicks = 0
 
 			// V2.3 U4: suppress the retry loop when it cannot or should not
@@ -1544,6 +2829,12 @@ func (fm *FUSEManager) monitorLoop() {
 			consecutiveFailures++
 			jmlog.Warn("juicefs process tree gone — app-side remount",
 				"attempt", consecutiveFailures)
+			// H-3 L5: the exact child's Wait returned, so its mount is proven
+			// stale. Only the unmount helper may detach it (by fsid, with
+			// Liveness Dead it forces); a new birth over it is refused.
+			if err := fm.RetireDeadChildMount(20 * time.Second); err != nil {
+				jmlog.Warn("dead juicefs mount not retired by the unmount helper", "error", err.Error())
+			}
 
 			if err := fm.Mount(); err != nil {
 				jmlog.Error("fuse remount failed",
@@ -1579,51 +2870,147 @@ func (fm *FUSEManager) monitorLoop() {
 	}
 }
 
-// isJuiceFSProcessAlive returns true if any `juicefs mount` process
-// is currently running. Used by the watchdog's fast-path exception
-// to distinguish "daemon is slow" from "daemon is dead".
-func isJuiceFSProcessAlive() bool {
-	out, err := exec.Command("pgrep", "-f", "juicefs mount").Output()
-	if err != nil {
-		return false
+// juiceFSMountCommandTargets reports whether one process-table command is a
+// JuiceFS mount for the exact mount point. Scoping is release-critical: a test
+// mount or a second JuiceMount volume must never convince this manager that its
+// own dead daemon is still alive and suppress recovery forever.
+func parseJuiceFSMountCommand(command string) (redisURL, mountPoint string, ok bool) {
+	fields := strings.Fields(command)
+	if len(fields) < 4 || filepath.Base(fields[0]) != "juicefs" {
+		return "", "", false
 	}
-	return len(strings.TrimSpace(string(out))) > 0
-}
-
-// findJuiceFSBin locates the juicefs binary.
-func findJuiceFSBin() string {
-	// Check common locations
-	candidates := []string{
-		"/opt/homebrew/bin/juicefs",
-		"/usr/local/bin/juicefs",
-		"/usr/bin/juicefs",
-	}
-	for _, c := range candidates {
-		if _, err := os.Stat(c); err == nil {
-			return c
+	// --verbose is a global JuiceFS option and may precede the subcommand.
+	// Keep the scan deliberately tight so an unrelated command containing the
+	// word "mount" cannot be mistaken for the daemon.
+	mountIndex := -1
+	for i := 1; i < len(fields) && i <= 3; i++ {
+		if fields[i] == "mount" {
+			mountIndex = i
+			break
 		}
 	}
-	// Try PATH
-	if p, err := exec.LookPath("juicefs"); err == nil {
-		return p
+	if mountIndex < 0 || mountIndex+2 >= len(fields) {
+		return "", "", false
 	}
-	return ""
+	return fields[mountIndex+1], fields[mountIndex+2], true
 }
+
+func juiceFSMountCommandTargets(command, mountPoint string) bool {
+	mountPoint = filepath.Clean(strings.TrimSpace(mountPoint))
+	if mountPoint == "." || mountPoint == "" {
+		return false
+	}
+	_, commandMount, ok := parseJuiceFSMountCommand(command)
+	if !ok {
+		return false
+	}
+	return filepath.Clean(commandMount) == mountPoint
+}
+
+type juiceFSMountProcess struct {
+	pid     string
+	command string
+}
+
+func juiceFSMountEndpointMatchesProcesses(processes []juiceFSMountProcess, redisURL string) (known, matches bool) {
+	for _, process := range processes {
+		processRedis, _, ok := parseJuiceFSMountCommand(process.command)
+		if !ok {
+			continue
+		}
+		known = true
+		if processRedis == redisURL {
+			return true, true
+		}
+	}
+	return known, false
+}
+
+// juiceFSMountProcesses returns the processes for JuiceFS daemons targeting
+// one exact mount point. The ps call is bounded so a sick host cannot pin the
+// watchdog, startup, or shutdown path.
+func juiceFSMountProcesses(mountPoint string) []juiceFSMountProcess {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "ps", "-axo", "pid=,command=").Output()
+	if err != nil {
+		return nil
+	}
+	var processes []juiceFSMountProcess
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		cut := strings.IndexAny(line, " \t")
+		if cut <= 0 {
+			continue
+		}
+		pid := line[:cut]
+		command := strings.TrimSpace(line[cut:])
+		if juiceFSMountCommandTargets(command, mountPoint) {
+			processes = append(processes, juiceFSMountProcess{pid: pid, command: command})
+		}
+	}
+	return processes
+}
+
+// juiceFSMountProcessIDs returns the process IDs for JuiceFS daemons targeting
+// one exact mount point.
+func juiceFSMountProcessIDs(mountPoint string) []string {
+	processes := juiceFSMountProcesses(mountPoint)
+	ids := make([]string, 0, len(processes))
+	for _, process := range processes {
+		ids = append(ids, process.pid)
+	}
+	return ids
+}
+
+// isJuiceFSProcessAlive reports whether the daemon for mountPoint is alive.
+func isJuiceFSProcessAlive(mountPoint string) bool {
+	return len(juiceFSMountProcessIDs(mountPoint)) > 0
+}
+
+// BundledJuiceFSName is the pinned, patched JuiceFS executable that
+// scripts/build-app.sh places beside the app's executables in Contents/MacOS.
+// Its signal handlers never unmount by path (third_party/juicefs patch 0005).
+const BundledJuiceFSName = juicefsbin.Name
+
+// ResolveJuiceFSBinary captures the GUI's executable search before transferring
+// an explicit path to the serving process, whose launchd PATH may differ.
+func ResolveJuiceFSBinary() string { return findJuiceFSBin() }
+
+// findJuiceFSBin returns the bundled JuiceFS beside the running executable, or
+// "" when it is absent. It never searches PATH, Homebrew or /usr: any other
+// juicefs answers SIGTERM with `umount -f <path>`, which can remove a mount
+// this process does not own. Tests substitute it with juicefsbin.SetForTest.
+func findJuiceFSBin() string { return juicefsbin.Resolve() }
 
 // DetectJuiceFSCacheDir finds the default JuiceFS cache directory for the volume.
 func DetectJuiceFSCacheDir() string {
-	home, err := os.UserHomeDir()
-	if err != nil {
+	paths, isolated, scopeErr := appisolation.ResolvePaths()
+	if scopeErr != nil {
 		return ""
 	}
-	cacheBase := filepath.Join(home, ".juicefs", "cache")
+	cacheBase := paths.CacheBase
+	if !isolated {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return ""
+		}
+		cacheBase = filepath.Join(home, ".juicefs", "cache")
+	}
 	entries, err := os.ReadDir(cacheBase)
 	if err != nil {
 		return ""
 	}
 	for _, e := range entries {
 		if e.IsDir() {
-			return filepath.Join(cacheBase, e.Name())
+			selected := filepath.Join(cacheBase, e.Name())
+			if err := appisolation.ValidateCachePath(filepath.Join(selected, "raw", "chunks"), true); err != nil {
+				return ""
+			}
+			return selected
 		}
 	}
 	return ""
@@ -1672,6 +3059,13 @@ func logVolumeCapacityBreakdown(volume string) {
 		"hint", "popover shows reclaimable space (Foundation URLResourceKey for important usage); use the Reclaim button or POST /reclaim to free Time Machine local snapshots")
 }
 
+// ReclaimAuthorization makes the destructive nature of purgeable-space
+// reclamation explicit at every call site. There is deliberately no startup or
+// automatic authorization value.
+type ReclaimAuthorization uint8
+
+const ReclaimExplicitUserAction ReclaimAuthorization = 1
+
 // ReclaimPurgeableSpace asks macOS to free purgeable disk space — primarily
 // Time Machine local snapshots, which can hoard tens of GB on a typical
 // laptop. Returns the bytes freed, count of snapshots thinned, and a
@@ -1684,7 +3078,10 @@ func logVolumeCapacityBreakdown(volume string) {
 // We measure the actual freed bytes by sampling the volume's free space
 // before and after; the tmutil command's own output is unreliable for this
 // (depends on macOS version and which snapshots existed).
-func ReclaimPurgeableSpace(volume string, targetBytes int64) (freedBytes int64, snapshotsThinned int, source string, err error) {
+func ReclaimPurgeableSpace(auth ReclaimAuthorization, volume string, targetBytes int64) (freedBytes int64, snapshotsThinned int, source string, err error) {
+	if auth != ReclaimExplicitUserAction {
+		return 0, 0, "Time Machine local snapshots", fmt.Errorf("purgeable-space reclaim requires explicit user authorization")
+	}
 	beforeFree, _ := volumeFreeBytes(volume)
 
 	// Urgency 4 = thin as much as possible. tmutil rejects "0" as an invalid
@@ -1775,4 +3172,142 @@ func volumeTotalBytes(volume string) (int64, error) {
 		return 0, err
 	}
 	return int64(st.Bsize) * int64(st.Blocks), nil
+}
+
+// cacheVolumeLocation resolves the volume JuiceFS will use for its block cache.
+// The nearest existing ancestor handles a cache directory JuiceFS has not yet
+// created; its device is checked again by engine capacity sampling.
+func cacheVolumeLocation(configured string) (root, probe string, device uint64) {
+	path := configured
+	if path == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", "", 0
+		}
+		path = filepath.Join(home, ".juicefs", "cache")
+	}
+	// A multi-directory JuiceFS cache needs per-volume accounting. Refuse to
+	// publish a single-volume policy for one.
+	if path == "memory" || strings.Contains(path, ":") {
+		return "", "", 0
+	}
+	path, err := filepath.Abs(path)
+	if err != nil {
+		return "", "", 0
+	}
+	root = path
+	for {
+		var st syscall.Stat_t
+		if err := syscall.Stat(path, &st); err == nil {
+			return root, path, uint64(st.Dev)
+		} else if !errors.Is(err, syscall.ENOENT) {
+			return root, "", 0
+		}
+		parent := filepath.Dir(path)
+		if parent == path {
+			return root, "", 0
+		}
+		path = parent
+	}
+}
+
+// envOr returns the value of environment variable key, or def when unset/empty.
+// Used for the per-cache FUSE metadata TTL overrides so each knob has a visible
+// default at its call site instead of a bare literal.
+func envOr(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}
+
+// metaCacheTTLs returns the four juicefs FUSE metadata cache TTLs, split by
+// role. Extracted from Mount() purely so the values are unit-testable: the
+// previous incarnation of this policy sat behind JM_WAN_MODE, which nothing in
+// production ever set, so the intended WAN values shipped dead for months with
+// no test to notice. See the commentary at the call site for the full rationale.
+//
+// Returns (attr, entry, dirEntry, negative).
+func metaCacheTTLs() (attr, entry, dirEntry, negative string) {
+	entry = envOr("JM_META_ENTRY_CACHE", "60s")
+	dirEntry = envOr("JM_META_DIR_ENTRY_CACHE", "60s")
+	attr = envOr("JM_META_ATTR_CACHE", "10s")
+	negative = envOr("JM_META_NEGATIVE_CACHE", "5s")
+	// Documented escape hatch: one value for all four.
+	if v := os.Getenv("JM_META_CACHE_SECS"); v != "" {
+		return v, v, v, v
+	}
+	return attr, entry, dirEntry, negative
+}
+
+// MetaURLForMount returns the metadata URL to use, applying the
+// JM_DEBUG_META_ADDR development override when set.
+//
+// WHY THIS EXISTS. The reported bug — navigation instant offline, awful on
+// cellular — is only reproducible at high RTT. Every measurement taken on a LAN
+// shows online nav already at parity with offline (3ms/dir vs 6ms/dir at 4.8ms
+// RTT), so a fix cannot be validated where it is being written. Iterating on a
+// cellular problem while measuring on WiFi is how you convince yourself of a fix
+// that does nothing.
+//
+// The latency lives in juicefs's own Redis round trips, not in this process's
+// metadata client, so an in-Go delay would inject latency into the wrong path
+// entirely. Pointing juicefs at a latency-injecting TCP proxy (cmd/jmlatency)
+// reproduces the real thing: the same syscalls, the same FUSE layer, the same
+// gates, with only the metadata round trip slowed.
+//
+// SAFETY. Unset — the overwhelmingly normal case — this is a pure passthrough
+// and the mount is byte-identical to before. It never rewrites the SCHEME, DB
+// index, or credentials, only host:port, and only when the override parses as a
+// URL; anything malformed leaves the original untouched rather than mounting
+// against a half-built address. It is deliberately NOT a persisted setting: an
+// env var dies with the process, so a forgotten debug knob cannot survive a
+// relaunch and silently degrade a user's mount.
+func MetaURLForMount(redisURL string) string {
+	addr := os.Getenv("JM_DEBUG_META_ADDR")
+	if addr == "" {
+		return redisURL
+	}
+	u, err := url.Parse(redisURL)
+	if err != nil || u.Host == "" {
+		return redisURL
+	}
+	u.Host = addr
+	return u.String()
+}
+
+// openCacheTTL returns the --open-cache duration to pass, or "" to omit the
+// flag entirely (juicefs default 0s = disabled = today's behavior). See the
+// call site for why this is opt-in rather than on by default.
+// Config wins over the environment: the config is the only channel that can
+// reach a shipped app (see FUSEConfig.OpenCacheTTL). The env var is retained so
+// a CLI/test run can still set it without building a config.
+func (fm *FUSEManager) openCacheTTL() string {
+	if v := normalizeOpenCacheTTL(fm.cfg.OpenCacheTTL); v != "" {
+		return v
+	}
+	return normalizeOpenCacheTTL(os.Getenv("JM_OPEN_CACHE"))
+}
+
+// normalizeOpenCacheTTL treats empty/0/0s as "omit the flag" so an explicitly
+// zeroed config reads as OFF rather than as unset.
+func normalizeOpenCacheTTL(v string) string {
+	if v == "" || v == "0" || v == "0s" {
+		return ""
+	}
+	return v
+}
+
+// juiceFSAlive is the watchdog's liveness signal. With an exact child
+// receipt it is that child's own Wait (design §5: no ps-title or path
+// matching); without one it falls back to the process-table probe.
+func (fm *FUSEManager) juiceFSAlive() bool {
+	if fm.mu.TryLock() {
+		r := fm.activeReceipt
+		fm.mu.Unlock()
+		if r != nil && r.waitDone != nil {
+			return !waitFUSEChannel(r.waitDone, 0)
+		}
+	}
+	return isJuiceFSProcessAliveFn(fm.cfg.MountPoint)
 }

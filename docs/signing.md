@@ -3,19 +3,32 @@
 `scripts/build-app.sh` produces a `JuiceMount.app` bundle. Whether that bundle
 will run on **other** Macs (or just yours) depends on how it's signed.
 
+The [0.5 release notes](release-0.5.md) explain installation, upgrade
+precautions, and open acceptance work. For any artifact, use the checks below
+to establish the exact signed and notarized build rather than relying on a
+version label alone.
+
 ## TL;DR
 
 - **Daily dev:** `./scripts/build-app.sh` — auto-detects a Developer ID
   Application cert if present, otherwise falls back to **ad-hoc** with a
-  warning. Ad-hoc builds run on the build machine but Gatekeeper rejects them
-  on every other Mac.
+  warning. Ad-hoc builds may launch locally but cannot Start a mount: the
+  bundled eject helper admits only JuiceMount Developer ID peers. Gatekeeper
+  also rejects ad-hoc builds on other Macs.
 - **Fast dev iteration:** `JM_QUICK=1 ./scripts/build-app.sh` — same as above
   but explicitly skips notarization (saves 1-5 minutes per build).
-- **Distribution build:** `./scripts/build-app.sh` with a Developer ID cert in
-  your login keychain **and** a `JuiceMount` notary credential profile stored
-  via `xcrun notarytool store-credentials`. The script signs with timestamp,
-  notarizes, and staples — producing an artifact that runs cleanly on any
-  recent macOS.
+- **Distribution build:** `JM_VERSION=0.5.0 JM_COMMIT=$(git rev-parse HEAD)
+  JM_BUILD_NUMBER=37 ./scripts/build-app.sh --distribution` with a Developer ID
+  cert in your login keychain **and** a `JuiceMount` notary credential profile
+  stored via `xcrun notarytool store-credentials`. The build number must be
+  greater than 13 and greater than every build in the published update feed;
+  37 is the 0.5 release build number after development build 36. Check the
+  live feed and exact release plan before any later distribution build.
+  The script reads the published feed from the app's `SUFeedURL`
+  (`https://github.com/lelanddutcher/juicemount/releases/latest/download/appcast.xml`)
+  and refuses to build if it cannot fetch it. When offline, download that file
+  at release time and pass it as `JM_PREVIOUS_APPCAST=<path>`.
+  The script signs with timestamp, notarizes, and staples.
 
 The build footer prints a status block so you can tell at a glance what kind
 of artifact you got:
@@ -35,9 +48,36 @@ of artifact you got:
 | `JM_SIGN_IDENTITY`   | Override auto-detection. Pass either the full cert name (`"Developer ID Application: Jane Doe (TEAMID12)"`) or a SHA-1 hash. |
 | `JM_NOTARY_PROFILE`  | Name of the `notarytool` keychain profile to use. Default: `JuiceMount`.                                       |
 | `JM_QUICK`           | If set (any value), skip notarization entirely. Use this for inner-loop dev iteration.                         |
+| `JM_BUILD_NUMBER`    | Positive decimal `CFBundleVersion`. Optional for local builds; required and greater than 13 for `--distribution`. Must be greater than every `sparkle:version` in the published feed, or the build refuses. |
+| `JM_PREVIOUS_APPCAST` | Optional path to a downloaded copy of the published feed (`SUFeedURL`: `https://github.com/lelanddutcher/juicemount/releases/latest/download/appcast.xml`). Download it at release time. When unset, `--distribution` fetches the feed itself and refuses if the fetch fails. When set, the live feed is still checked if reachable, and an older local copy refuses. |
+| `JM_APPCAST`         | Refused unless `--distribution` is used. Only the distribution path produces a signed update feed. |
+| `JM_VERSION`         | Marketing version (`CFBundleShortVersionString`), required for `--distribution`. |
+| `JM_COMMIT`          | Exact 40-character source SHA, required for `--distribution`. |
 
 There is no `JM_TEAM_ID` — the team ID is embedded in your Developer ID cert
 and in the stored notary profile, so the build script doesn't need to know it.
+
+## Inspecting and preparing the eject helper
+
+The bundled app supports two commands that return one JSON line and exit before
+normal app startup. They do not start the serving service, mount a volume, or
+read or change saved application preferences:
+
+```bash
+/path/to/JuiceMount.app/Contents/MacOS/JuiceMount --eject-helper-status
+/path/to/JuiceMount.app/Contents/MacOS/JuiceMount --prepare-eject-helper
+```
+
+Status never registers the helper. Prepare registers an absent helper once and
+may require approval in **System Settings → General → Login Items & Extensions**.
+It requires JuiceMount's exact Developer-ID app identity without a debug
+entitlement, and refuses when app isolation is configured. An enabled helper
+is only pinged; this command does not replace or re-register it.
+
+Exit `0` means the enabled helper answered an authenticated ping. Exit `2` means
+registration or user approval is still needed. Exit `1` reports invalid arguments,
+a refused operation, or a failure. These commands do not establish that a mount
+has registered its own recovery receipt.
 
 ## First-time setup
 
@@ -109,8 +149,17 @@ you're set.
 ### 4. Produce a distributable build
 
 ```bash
-./scripts/build-app.sh
+# Optional when online: the script fetches SUFeedURL itself.
+curl -fsSL -o "$HOME/Downloads/published-appcast.xml" \
+  https://github.com/lelanddutcher/juicemount/releases/latest/download/appcast.xml
+
+JM_VERSION=0.5.0 JM_COMMIT=$(git rev-parse HEAD) JM_BUILD_NUMBER=37 \
+  JM_PREVIOUS_APPCAST="$HOME/Downloads/published-appcast.xml" \
+  ./scripts/build-app.sh --distribution
 ```
+
+Keep the downloaded feed outside the source tree. A distribution build refuses
+untracked files in the tree.
 
 The script will:
 
@@ -123,7 +172,18 @@ The script will:
 4. Validate the staple.
 
 The footer line `Notarized: yes` and `Staple: yes` mean the artifact is ready
-to ship.
+for the independent release verifier. The distribution path also checks that
+the app, QuickLook extension, update archive, and Sparkle appcast agree on
+both marketing version and build number, and that each carries
+`JMBuildChannel=distribution` (only `--distribution` writes it, so a dev build
+cannot pass the release verifier). Increase `JM_BUILD_NUMBER` for every
+subsequent published build, including repackaged 0.5 releases.
+
+Before publishing, verify the exact app, archive, checksum, appcast signature,
+version/build identity, Gatekeeper acceptance, and stapled notary ticket from
+the final artifact. Do not treat a successful development build as that
+verification. A user upgrading from an earlier app must first drain or retain
+the local upload queue, then Stop and Quit before replacing the bundle.
 
 ## Verifying a finished build
 
@@ -177,8 +237,10 @@ different profile name). See [First-time setup](#first-time-setup) §3.
 The submit succeeded, but Apple rejected the artifact. Common causes:
 
 - Some embedded binary isn't signed with `--options runtime` (hardened
-  runtime). The build script signs the top-level bundle with `--deep`, which
-  covers helpers, but if you add a Mach-O file manually, sign it explicitly.
+  runtime). The build script signs nested Sparkle helpers and the Quick Look
+  extension first, then seals the app last. `codesign --verify --deep` checks
+  the result; `--deep` is not used to sign nested code. Rebuild if embedded
+  code changes.
 - The bundle contains a non-allowed entitlement, or claims an entitlement
   that requires a provisioning profile.
 - A timestamp couldn't be obtained at sign time.
@@ -189,14 +251,13 @@ Retrieve the log for diagnostics:
 xcrun notarytool log <submission-id> --keychain-profile JuiceMount
 ```
 
-## Build guard: no PlugIns / app extensions
+## Build guard: exact PlugIns allowlist
 
-The build script refuses to produce a bundle that contains a
-`Contents/PlugIns/` directory — meaning **no embedded app extensions, ever**.
-This is a load-bearing guard, not a stylistic preference: see
-[`docs/no-fileprovider.md`](no-fileprovider.md) for the postmortem on what
-happens when a stray FileProviderExtension gets registered with macOS.
+The bundle must contain `Contents/PlugIns/JuiceMountThumbnails.appex`, its
+Quick Look thumbnail extension. The build script refuses any other item in
+`Contents/PlugIns/`, especially a FileProvider extension. This guard is
+load-bearing: see [`docs/no-fileprovider.md`](no-fileprovider.md) for the
+postmortem on a stray FileProvider registration.
 
-If a future architectural change ever genuinely needs an app extension, the
-guard must be removed deliberately and the FileProvider domain removal
-lifecycle documented before merging.
+Any future extension requires a deliberate guard change and a documented
+registration and removal lifecycle before merging.

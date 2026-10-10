@@ -180,3 +180,34 @@ func TestListProxyRows(t *testing.T) {
 		t.Errorf("row = %+v, want inode=10 source_size=5000000", rows[0])
 	}
 }
+
+func TestListAccessBenchmarkInodesPrefersRecentLargeSources(t *testing.T) {
+	s := openTest(t)
+	rows := []struct {
+		inode   uint64
+		size    int64
+		updated int64
+	}{
+		{inode: 10, size: 64 << 20, updated: 100},
+		{inode: 11, size: 2 << 20, updated: 300}, // below benchmark floor
+		{inode: 12, size: 32 << 20, updated: 200},
+	}
+	for _, row := range rows {
+		if err := s.PutDeriv(row.inode, DerivRow{
+			Kind: "tech", Status: "ready", Producer: "linux-farm", Version: 1,
+			SourceSize: i64p(row.size), UpdatedAt: row.updated,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := s.ListAccessBenchmarkInodes(2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, []uint64{12, 10}) {
+		t.Fatalf("benchmark inodes = %v, want [12 10]", got)
+	}
+	if got, err := s.ListAccessBenchmarkInodes(0); err != nil || len(got) != 0 {
+		t.Fatalf("zero-limit benchmark inodes = %v, %v", got, err)
+	}
+}

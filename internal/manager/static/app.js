@@ -46,6 +46,7 @@
     'maintenance',
     'permissions',
     'settings',
+    'link',
   ];
   const DEFAULT_TAB = 'migrations';
 
@@ -73,7 +74,16 @@
       el.hidden = el.dataset.tab !== name;
     });
     $$('.sidebar a[data-tab-link]').forEach((a) => {
-      a.classList.toggle('active', a.dataset.tabLink === name);
+      const active = a.dataset.tabLink === name;
+      a.classList.toggle('active', active);
+      // The active route was previously communicated by color alone. Keep the
+      // visual state and expose the same single-current-page contract to screen
+      // readers and other assistive technology.
+      if (active) {
+        a.setAttribute('aria-current', 'page');
+      } else {
+        a.removeAttribute('aria-current');
+      }
     });
     if (name === 'migrations') {
       initMigrationsOnce();
@@ -95,6 +105,13 @@
     } else {
       stopFarmPolling();
     }
+    // JuiceMount Link tab
+		if (name === 'link') {
+			initLinkOnce();
+			startLinkPolling();
+		} else {
+			stopLinkPolling();
+		}
     // SLICE 3: lazy-init Trash on first activation. Subsequent
     // activations call refreshTrash() so the list reflects any
     // out-of-band deletions/restores since the user last viewed it.
@@ -168,6 +185,119 @@
     previewTotals: { bytes: 0, files: 0, truncated: false },
   };
 
+  let authPromptDeclined = false;
+  let authRequestPromise = null;
+
+  function updateAuthState(message) {
+    const el = $('#auth-state');
+    if (el) el.textContent = message;
+  }
+
+  updateAuthState(state.adminKey
+    ? 'Admin key stored · verification pending'
+    : 'Authentication not yet verified');
+
+  function storeAdminKey(key) {
+    state.adminKey = key;
+    localStorage.setItem('jm-admin-key', key);
+    authPromptDeclined = false;
+    updateAuthState('Admin key stored · verification pending');
+  }
+
+  function clearAdminKey(key) {
+    // A newer key may have arrived from the shared dialog while this request
+    // was in flight. Never erase it in response to an older request's 401.
+    if (key !== undefined && state.adminKey !== key) return;
+    state.adminKey = '';
+    localStorage.removeItem('jm-admin-key');
+  }
+
+  // All concurrent 401 responses await one in-page dialog. Native modal
+  // prompts are unavailable in embedded browsers and can also multiply when Farm,
+  // Overview and Link poll at the same time. Cancelling suppresses background
+  // re-opening until the operator explicitly uses the footer recovery button.
+  function requestAdminKey({ message = '', force = false } = {}) {
+    if (authRequestPromise) return authRequestPromise;
+    if (authPromptDeclined && !force) return Promise.resolve(null);
+
+    const dialog = $('#auth-dialog');
+    const form = $('#auth-form');
+    const input = $('#auth-key-input');
+    const status = $('#auth-dialog-status');
+    const cancelButton = $('#auth-dialog-cancel');
+    if (!dialog || !form || !input || !status || !cancelButton || typeof dialog.showModal !== 'function') {
+      authPromptDeclined = true;
+      updateAuthState('Authentication required · use a supported browser');
+      return Promise.resolve(null);
+    }
+
+    authPromptDeclined = false;
+    status.textContent = message;
+    status.hidden = !message;
+    input.value = '';
+
+    authRequestPromise = new Promise((resolve) => {
+      let settled = false;
+
+      const cleanup = () => {
+        form.removeEventListener('submit', onSubmit);
+        cancelButton.removeEventListener('click', onCancel);
+        dialog.removeEventListener('cancel', onDialogCancel);
+        dialog.removeEventListener('close', onUnexpectedClose);
+      };
+      const finish = (key) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        if (dialog.open) dialog.close();
+        input.value = '';
+        authRequestPromise = null;
+        resolve(key);
+      };
+      const onSubmit = (event) => {
+        event.preventDefault();
+        const key = input.value.trim();
+        if (!key) {
+          status.textContent = 'Enter the admin key to continue.';
+          status.hidden = false;
+          input.focus();
+          return;
+        }
+        finish(key);
+      };
+      const onCancel = () => {
+        authPromptDeclined = true;
+        updateAuthState('Authentication required · key entry cancelled');
+        finish(null);
+      };
+      const onDialogCancel = (event) => {
+        event.preventDefault();
+        onCancel();
+      };
+      const onUnexpectedClose = () => {
+        if (!settled) onCancel();
+      };
+
+      form.addEventListener('submit', onSubmit);
+      cancelButton.addEventListener('click', onCancel);
+      dialog.addEventListener('cancel', onDialogCancel);
+      dialog.addEventListener('close', onUnexpectedClose);
+      // Defer opening until authRequestPromise has been assigned, so another
+      // 401 arriving in the same turn observes and reuses this request.
+      queueMicrotask(() => {
+        try {
+          if (!dialog.open) dialog.showModal();
+          input.focus();
+        } catch {
+          authPromptDeclined = true;
+          updateAuthState('Authentication required · dialog unavailable');
+          finish(null);
+        }
+      });
+    });
+    return authRequestPromise;
+  }
+
   // -------- Fetch helpers --------
   function authHeaders() {
     const h = { 'Content-Type': 'application/json' };
@@ -175,22 +305,67 @@
     return h;
   }
 
-  async function api(method, path, body) {
+  function compactHTTPError(raw, contentType) {
+    let detail = String(raw || '');
+    if ((contentType || '').includes('application/json')) {
+      try {
+        const parsed = JSON.parse(detail);
+        detail = parsed.error || parsed.message || parsed.detail || detail;
+      } catch { /* retain the bounded raw response */ }
+    } else if ((contentType || '').includes('text/html') || /<\/?[a-z][\s\S]*>/i.test(detail)) {
+      // Reverse proxies and static preview servers return complete HTML error
+      // documents. Render one useful sentence, never the markup dump.
+      const message = detail.match(/<p[^>]*>\s*Message:\s*([^<]+)<\/p>/i);
+      detail = message ? message[1] : detail.replace(/<script[\s\S]*?<\/script>/gi, ' ')
+        .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+        .replace(/<[^>]+>/g, ' ');
+    }
+    detail = detail.replace(/\s+/g, ' ').trim();
+    if (detail.length > 240) detail = detail.slice(0, 237) + '…';
+    return detail;
+  }
+
+  async function api(method, path, body, authRetry = false) {
     const opts = { method, headers: authHeaders() };
     if (body) opts.body = JSON.stringify(body);
     // path is "/api/..." with no base; rewrite to BASE-relative.
     const url = path.startsWith('/api') ? BASE + path : path;
+    const sentKey = state.adminKey;
     const r = await fetch(url, opts);
     if (r.status === 401) {
-      const key = prompt('X-JuiceMount-Admin-Key (will be saved locally):');
+      updateAuthState('Authentication required');
+      // Another concurrent request may already have collected a key while
+      // this request was in flight. Retry with it instead of opening a
+      // second native prompt.
+      if (!authRetry && state.adminKey && state.adminKey !== sentKey) {
+        return api(method, path, body, true);
+      }
+      if (authRetry) {
+        clearAdminKey(sentKey);
+        authPromptDeclined = true;
+        updateAuthState('Admin key rejected · enter the correct key to retry');
+        throw new Error('authentication failed');
+      }
+      const rejectedStoredKey = Boolean(sentKey && state.adminKey === sentKey);
+      if (rejectedStoredKey) clearAdminKey(sentKey);
+      // Background Farm/Overview polls often fail together. Once the user
+      // declines, suppress the dialog until they explicitly reopen it instead
+      // of nagging on every interval tick.
+      if (authPromptDeclined) throw new Error('authentication required');
+      const key = await requestAdminKey({
+        message: rejectedStoredKey ? 'The saved admin key was rejected. Enter the current server key.' : '',
+      });
       if (key) {
-        state.adminKey = key;
-        localStorage.setItem('jm-admin-key', key);
-        return api(method, path, body); // retry once
+        storeAdminKey(key);
+        return api(method, path, body, true); // retry once
       }
       throw new Error('authentication required');
     }
-    if (!r.ok) throw new Error(`${r.status} ${r.statusText} — ${await r.text()}`);
+    if (!r.ok) {
+      const detail = compactHTTPError(await r.text(), r.headers.get('content-type'));
+      throw new Error(`${r.status} ${r.statusText}${detail ? ' — ' + detail : ''}`);
+    }
+    updateAuthState(state.adminKey ? 'Admin key verified' : 'Authentication disabled');
     if (r.status === 204) return null;
     return r.json();
   }
@@ -848,21 +1023,33 @@
   // by the SAME tab lifecycle (startFarmPolling/stopFarmPolling) so there's
   // never a second uncleared interval running after the tab is left.
   let farmJobsTimer = null;
-  let farmGenerateInited = false;
-  const FARM_JOBS_INTERVAL_MS = 5000;
-  let farmSweepInFlight = false;
+  let farmWorkersTimer = null;
+	let farmGenerateInited = false;
+	const FARM_JOBS_INTERVAL_MS = 5000;
+	const FARM_JOBS_PAGE_SIZE = 12;
+	let farmSweepInFlight = false;
+	let farmControlInFlight = false;
+	let farmControlState = { known: false, paused: false, watch_enabled: true };
+	let farmJobsVisibleLimit = FARM_JOBS_PAGE_SIZE;
+	let farmJobsSnapshot = [];
+	let farmJobsWorkersActive = false;
+	const farmJobControlInFlight = new Set();
 
   function startFarmPolling() {
     initFarmExplainerOnce();
     initFarmGenerateOnce();
+    initFarmConfigOnce();
     loadFarm();
     loadFarmJobs();
+    loadFarmWorkers();
     if (!farmTimer) farmTimer = setInterval(loadFarm, 10000);
     if (!farmJobsTimer) farmJobsTimer = setInterval(loadFarmJobs, FARM_JOBS_INTERVAL_MS);
+    if (!farmWorkersTimer) farmWorkersTimer = setInterval(loadFarmWorkers, FARM_JOBS_INTERVAL_MS);
   }
   function stopFarmPolling() {
     if (farmTimer) { clearInterval(farmTimer); farmTimer = null; }
     if (farmJobsTimer) { clearInterval(farmJobsTimer); farmJobsTimer = null; }
+    if (farmWorkersTimer) { clearInterval(farmWorkersTimer); farmWorkersTimer = null; }
   }
 
   // initFarmExplainerOnce wires the dismissible "What is the farm?" banner.
@@ -902,9 +1089,23 @@
       });
     }
     if (btn) btn.addEventListener('click', submitFarmSweep);
-    const clearBtn = $('#farm-jobs-clear');
-    if (clearBtn) clearBtn.addEventListener('click', clearFarmFinishedJobs);
-    updateFarmSweepButton();
+		const clearBtn = $('#farm-jobs-clear');
+		if (clearBtn) clearBtn.addEventListener('click', clearFarmFinishedJobs);
+		const moreBtn = $('#farm-jobs-more');
+		if (moreBtn) moreBtn.addEventListener('click', () => {
+			farmJobsVisibleLimit += FARM_JOBS_PAGE_SIZE;
+			renderFarmJobsList(farmJobsSnapshot, farmJobsWorkersActive);
+		});
+		const collapseBtn = $('#farm-jobs-collapse');
+		if (collapseBtn) collapseBtn.addEventListener('click', () => {
+			farmJobsVisibleLimit = FARM_JOBS_PAGE_SIZE;
+			renderFarmJobsList(farmJobsSnapshot, farmJobsWorkersActive);
+		});
+		const queueToggle = $('#farm-queue-toggle');
+		if (queueToggle) queueToggle.addEventListener('click', () => updateFarmControl({ paused: !farmControlState.paused }));
+		const watchToggle = $('#farm-watch-toggle');
+		if (watchToggle) watchToggle.addEventListener('click', () => updateFarmControl({ watch_enabled: !farmControlState.watch_enabled }));
+		updateFarmSweepButton();
   }
 
   // clearFarmFinishedJobs removes terminal (done/failed) rows from the
@@ -923,6 +1124,7 @@
         flash.hidden = false;
         setTimeout(() => { flash.hidden = true; }, 4000);
       }
+		farmJobsVisibleLimit = FARM_JOBS_PAGE_SIZE;
       await loadFarmJobs();
     } catch (e) {
       if (flash) {
@@ -1012,28 +1214,122 @@
   // loadFarmJobs polls GET /api/farm/jobs and renders the active-worker banner
   // + the recent-jobs list. Failures are swallowed (network blip / tab navigated
   // mid-flight) so a transient error doesn't blank the panel mid-session.
-  async function loadFarmJobs() {
+	async function loadFarmJobs() {
     let res;
-    try { res = await api('GET', '/api/farm/jobs'); } catch (e) { return; }
+    try { res = await api('GET', '/api/farm/jobs'); } catch (e) {
+			renderFarmControl({ known: false });
+			return;
+		}
     if (!res) return;
-    renderFarmActiveBanner(!!res.available, res.queue_depth || 0);
-    renderFarmJobsList(Array.isArray(res.jobs) ? res.jobs : [], !!res.available);
-  }
+		renderFarmControl(res.control || { known: false });
+		const workers = Array.isArray(res.workers) ? res.workers : [];
+		renderFarmActiveBanner(!!res.available, res.queue_depth || 0, farmControlState, workers);
+		renderFarmQueueDepths(res.queue_depths || {});
+		farmJobsSnapshot = Array.isArray(res.jobs) ? res.jobs : [];
+		farmJobsWorkersActive = !!res.available;
+		renderFarmJobsList(farmJobsSnapshot, farmJobsWorkersActive);
+	}
 
-  // renderFarmActiveBanner shows worker presence: green + "draining the queue"
-  // when ≥1 worker, muted "offline" otherwise. The queue depth ("N waiting")
-  // rides along when there's anything queued so the user knows work is pending.
-  function renderFarmActiveBanner(available, depth) {
+	async function updateFarmControl(patch) {
+		if (farmControlInFlight) return;
+		farmControlInFlight = true;
+		let controlError = '';
+		const status = $('#farm-control-status');
+		if (status) status.textContent = 'Applying control state…';
+		renderFarmControl(farmControlState);
+		try {
+			const control = await api('PUT', '/api/farm/control', patch);
+			renderFarmControl(control || { ...farmControlState, ...patch });
+			await loadFarmJobs();
+		} catch (e) {
+			controlError = 'Control update failed: ' + (e.message || e);
+		} finally {
+			farmControlInFlight = false;
+			renderFarmControl(farmControlState);
+			if (status && controlError) status.textContent = controlError;
+		}
+	}
+
+	function renderFarmControl(control) {
+		farmControlState = {
+			known: !!(control && control.known),
+			paused: !!(control && control.paused),
+			watch_enabled: !(control && control.watch_enabled === false),
+			auto_paused: !!(control && control.auto_paused),
+			pause_reason: (control && control.pause_reason) || '',
+			node_holds: (control && control.node_holds) || { known: false, nodes: [] },
+		};
+		const queueBtn = $('#farm-queue-toggle');
+		const watchBtn = $('#farm-watch-toggle');
+		const status = $('#farm-control-status');
+		if (queueBtn) {
+			queueBtn.disabled = farmControlInFlight || !farmControlState.known;
+			queueBtn.classList.toggle('engaged', farmControlState.paused);
+			queueBtn.querySelector('.farm-transport-icon').textContent = !farmControlState.known ? '?' : (farmControlState.paused ? '▶' : 'Ⅱ');
+			queueBtn.querySelector('strong').textContent = !farmControlState.known ? 'Queue state unknown' : (farmControlState.paused ? 'Resume queue' : 'Pause queue');
+			queueBtn.querySelector('em').textContent = farmControlState.paused
+				? (farmControlState.auto_paused ? 'Restore backend headroom before resuming' : 'Clear global pause; node holds remain in effect')
+				: (farmControlState.known ? 'Finish active work, then stop claiming jobs' : 'Control state unavailable');
+		}
+		if (watchBtn) {
+			watchBtn.disabled = farmControlInFlight || !farmControlState.known;
+			watchBtn.classList.toggle('engaged', !farmControlState.watch_enabled);
+			watchBtn.querySelector('strong').textContent = !farmControlState.known ? 'Discovery unknown' : (farmControlState.watch_enabled ? 'Discovery on' : 'Discovery off');
+			watchBtn.querySelector('em').textContent = !farmControlState.known ? 'Control state unavailable' : (farmControlState.watch_enabled
+				? 'Recursively watch for newly landed media'
+				: 'Filesystem events are retained until re-enabled');
+		}
+		if (status && !farmControlInFlight) {
+			const holds = farmControlState.node_holds;
+			const nodes = Array.isArray(holds.nodes) ? holds.nodes : [];
+			if (!farmControlState.known) {
+				status.textContent = 'Global queue state unknown; control is unavailable.';
+			} else if (farmControlState.paused) {
+				status.textContent = farmControlState.pause_reason || 'Global queue paused. Active atomic jobs may still be finishing.';
+			} else if (!holds.known) {
+				status.textContent = 'Global pause off; configured node hold status unknown. Check farm configuration and node state.';
+			} else if (holds.default_paused || holds.default_drain) {
+				status.textContent = 'Global pause off; default node pause or drain remains in farm configuration.';
+			} else if (nodes.length) {
+				const names = nodes.slice(0, 3).map((node) => node.name).join(', ');
+				status.textContent = `Global pause off; ${nodes.length} configured node hold${nodes.length === 1 ? '' : 's'} remain (${names}${nodes.length > 3 ? ', …' : ''}). Use Resume node for each held node.`;
+			} else {
+				status.textContent = 'Global pause off; no configured node holds. Check live node and storage state for claim eligibility.';
+			}
+		}
+	}
+
+  // Worker presence and queue depth are separate observations; a heartbeat
+  // does not prove that this worker can claim the pending lane.
+	function renderFarmActiveBanner(available, depth, control, workers) {
     const banner = $('#farm-active-banner');
     const text = $('#farm-active-text');
     const depthEl = $('#farm-active-depth');
     if (!banner) return;
-    banner.classList.toggle('online', available);
-    banner.classList.toggle('offline', !available);
-    if (available) {
-      text.textContent = 'Farm worker online — draining the queue';
+		const workerCount = workers.length;
+		const permitBlocked = workers.filter((worker) => worker && worker.state === 'waiting-storage-permit').length;
+		const eligibleCount = workers.filter((worker) => worker && !worker.admission_blocked &&
+			!['paused', 'draining', 'disabled', 'waiting-storage-permit'].includes(worker.state || 'idle')).length;
+		banner.classList.toggle('online', available);
+		banner.classList.toggle('offline', !available);
+		banner.classList.toggle('paused', !!control.paused);
+		banner.classList.toggle('waiting', !control.paused && available && eligibleCount === 0 && permitBlocked > 0);
+		if (!control.known) {
+			text.textContent = 'Farm control state unknown';
+		} else if (control.paused) {
+			text.textContent = control.pause_reason
+				? 'Safety pause — ' + control.pause_reason
+				: 'Queue paused — ' + workerCount + ' node' + (workerCount === 1 ? '' : 's') + ' standing by';
+		} else if (available && eligibleCount === 0 && permitBlocked > 0) {
+			text.textContent = workerCount + ' farm node' + (workerCount === 1 ? '' : 's') +
+				' online — waiting for fresh NAS storage proof';
+		} else if (available && eligibleCount === 0) {
+			text.textContent = workerCount + ' farm node' + (workerCount === 1 ? '' : 's') +
+				' online — paused, draining, or disabled';
+		} else if (available) {
+			text.textContent = workerCount + ' farm node' + (workerCount === 1 ? '' : 's') + ' online — check job and node state for current work';
     } else {
-      text.textContent = 'Farm worker offline — queued jobs will run once it starts';
+      text.textContent = 'Farm worker offline — queued jobs are waiting';
     }
     if (depth > 0) {
       depthEl.textContent = depth.toLocaleString() + ' waiting';
@@ -1043,9 +1339,33 @@
     }
   }
 
+	function renderFarmQueueDepths(depths) {
+		const root = $('#farm-queue-depths');
+		if (!root) return;
+		root.replaceChildren();
+		const labels = {
+			'derivatives:render': 'Derivatives · render', 'derivatives:cpu': 'Derivatives · CPU',
+			'proxy:render': 'Proxy · render', 'proxy:cpu': 'Proxy · CPU',
+			'transcript:render': 'Transcript · render', 'transcript:cpu': 'Transcript · CPU',
+			catch_all: 'Compatibility lane',
+		};
+		Object.keys(depths).sort().forEach((key) => {
+			const chip = document.createElement('span');
+			chip.className = 'farm-queue-lane' + (Number(depths[key] || 0) > 0 ? ' active' : '');
+			const name = document.createElement('span');
+			name.textContent = labels[key] || key.replace(':', ' · ');
+			const count = document.createElement('strong');
+			count.textContent = Number(depths[key] || 0).toLocaleString();
+			chip.appendChild(name);
+			chip.appendChild(count);
+			root.appendChild(chip);
+		});
+	}
+
   // FARM_JOB_STATUS_LABEL maps a queue status to readable chip copy.
   const FARM_JOB_STATUS_LABEL = {
-    queued: 'Queued', running: 'Running', done: 'Done', failed: 'Failed',
+    queued: 'Queued', running: 'Running', dispatched: 'Dispatched', done: 'Done', partial: 'Partial', failed: 'Failed',
+		canceled: 'Canceled', blocked: 'On hold', 'cancel-requested': 'Cancel pending',
   };
 
   // renderFarmJobsList renders one row per JobStatus, newest first (the backend
@@ -1062,6 +1382,7 @@
       li.className = 'farm-jobs-empty';
       li.textContent = 'No jobs queued yet.';
       list.appendChild(li);
+		renderFarmJobsPagination(0, 0);
       return;
     }
     // Float the running job(s) to the top so the active sweep is always
@@ -1074,8 +1395,14 @@
     const ordered = workersActive
       ? [...jobs].sort((a, b) => ((a.status === 'running') ? 0 : 1) - ((b.status === 'running') ? 0 : 1))
       : jobs;
-    ordered.forEach((j) => {
-      const status = j.status || 'queued';
+	const visible = ordered.slice(0, farmJobsVisibleLimit);
+    visible.forEach((j) => {
+		const failed = j.failed != null && j.failed !== '' ? Number(j.failed) : null;
+		const rawStatus = j.status || 'queued';
+		let status = rawStatus === 'done' && failed != null && !Number.isNaN(failed) && failed > 0
+			? 'partial'
+			: rawStatus;
+		if (j.cancel_requested_at && (rawStatus === 'queued' || rawStatus === 'running')) status = 'cancel-requested';
       const li = document.createElement('li');
       li.className = 'farm-job-row';
 
@@ -1128,34 +1455,150 @@
         });
       }
 
-      const processed = j.processed != null && j.processed !== '' ? Number(j.processed) : null;
-      const failed = j.failed != null && j.failed !== '' ? Number(j.failed) : null;
+		const processed = j.processed != null && j.processed !== '' ? Number(j.processed) : null;
       if (processed != null && !Number.isNaN(processed) && processed > 0) {
         const p = document.createElement('span');
         p.className = 'farm-job-count';
         p.textContent = processed.toLocaleString() + ' done';
         meta.appendChild(p);
       }
-      if (failed != null && !Number.isNaN(failed) && failed > 0) {
+		if (failed != null && !Number.isNaN(failed) && failed > 0) {
         const f = document.createElement('span');
         f.className = 'farm-job-count failed';
         f.textContent = failed.toLocaleString() + ' failed';
-        meta.appendChild(f);
-      }
+			meta.appendChild(f);
+		}
+		const cpuH264Fallback = kinds.includes('proxy') && j.backend === 'libx264';
+		if (cpuH264Fallback) {
+			const fallback = document.createElement('span');
+			fallback.className = 'farm-job-count fallback';
+			fallback.textContent = 'CPU H.264 fallback';
+			meta.appendChild(fallback);
+			li.classList.add('fallback');
+		}
+		if (j.parent_id) {
+			const parent = document.createElement('span');
+			parent.className = 'farm-job-count telemetry';
+			parent.textContent = 'split from ' + j.parent_id;
+			meta.appendChild(parent);
+		}
+		if (j.requeue_of) {
+			const origin = document.createElement('span');
+			origin.className = 'farm-job-count telemetry';
+			origin.textContent = 'retry of ' + j.requeue_of;
+			meta.appendChild(origin);
+		}
+		if (j.requeued_as) {
+			const retried = document.createElement('span');
+			retried.className = 'farm-job-count telemetry';
+			retried.textContent = 'requeued as ' + j.requeued_as;
+			meta.appendChild(retried);
+		}
+		for (const [label, value] of [['backend', j.backend], ['target', j.target_worker], ['running on', j.worker]]) {
+			if (!value || (label === 'target' && value === j.worker)) continue;
+			const detail = document.createElement('span');
+			detail.className = 'farm-job-count telemetry';
+			detail.textContent = label + ' ' + value;
+			meta.appendChild(detail);
+		}
+		if (Number(j.attempts || 0) > 0) {
+			const retry = document.createElement('span');
+			retry.className = 'farm-job-count failed';
+			retry.textContent = 'attempt ' + (Number(j.attempts) + 1);
+			meta.appendChild(retry);
+		}
+		if (Number(j.hardware_failures || 0) > 0) {
+			const failures = document.createElement('span');
+			failures.className = 'farm-job-count failed';
+			failures.textContent = 'GPU failures ' + Number(j.hardware_failures);
+			meta.appendChild(failures);
+		}
 
       if (meta.childNodes.length) li.appendChild(meta);
 
-      // Failed rows surface the error string.
-      if (status === 'failed' && j.error) {
+      // Surface fallback/recovery notes even when the eventual job succeeded.
+      // A successful CPU fallback must never look like a clean GPU completion.
+      if (j.error) {
         const errEl = document.createElement('p');
-        errEl.className = 'farm-job-error';
-        errEl.textContent = j.error;
+		errEl.className = status === 'failed' ? 'farm-job-error' : 'farm-job-notice';
+		errEl.textContent = status === 'blocked' ? ('Job note: ' + j.error)
+          : status === 'failed' ? j.error : ('Recovery note: ' + j.error);
         li.appendChild(errEl);
       }
 
+		const action = document.createElement('div');
+		action.className = 'farm-job-actions';
+		const actionStatus = document.createElement('span');
+		actionStatus.className = 'farm-job-action-status';
+		actionStatus.setAttribute('role', 'status');
+		const busy = farmJobControlInFlight.has(j.id);
+		if ((rawStatus === 'queued' || rawStatus === 'running') && !j.cancel_requested_at) {
+			const cancel = document.createElement('button');
+			cancel.type = 'button';
+			cancel.className = 'btn btn-sm';
+			cancel.textContent = 'Cancel job';
+			cancel.disabled = busy;
+			cancel.addEventListener('click', () => controlFarmJob(j.id, 'cancel', actionStatus, cancel));
+			action.appendChild(cancel);
+		} else if (rawStatus === 'failed' && !j.requeued_as) {
+			const requeue = document.createElement('button');
+			requeue.type = 'button';
+			requeue.className = 'btn btn-sm';
+			requeue.textContent = 'Requeue failed job';
+			requeue.disabled = busy;
+			requeue.title = 'Creates one new job from the exact failed payload; the original remains terminal.';
+			requeue.addEventListener('click', () => controlFarmJob(j.id, 'requeue', actionStatus, requeue));
+			action.appendChild(requeue);
+		}
+		if (action.childNodes.length) {
+			action.appendChild(actionStatus);
+			li.appendChild(action);
+		}
+
       list.appendChild(li);
     });
+	renderFarmJobsPagination(ordered.length, visible.length);
   }
+
+	function renderFarmJobsPagination(total, shown) {
+		const summary = $('#farm-jobs-summary');
+		const more = $('#farm-jobs-more');
+		const collapse = $('#farm-jobs-collapse');
+		if (summary) summary.textContent = total === 0 ? '' : ('Showing ' + shown + ' of ' + total);
+		if (more) {
+			const remaining = Math.max(0, total - shown);
+			more.hidden = remaining === 0;
+			more.textContent = remaining > 0
+				? ('Show ' + Math.min(FARM_JOBS_PAGE_SIZE, remaining) + ' older')
+				: 'Show older';
+		}
+		if (collapse) collapse.hidden = shown <= FARM_JOBS_PAGE_SIZE;
+	}
+
+	async function controlFarmJob(id, action, status, button) {
+		const prompt = action === 'cancel'
+			? `Cancel job ${id}? The worker will stop cooperatively and preserve completed outputs.`
+			: `Requeue failed job ${id} from its exact durable payload?`;
+		if (!confirm(prompt)) return;
+		farmJobControlInFlight.add(id);
+		button.disabled = true;
+		status.classList.remove('ok', 'error');
+		status.textContent = action === 'cancel' ? 'Requesting cooperative cancel…' : 'Creating exact retry…';
+		try {
+			const result = await api('POST', '/api/farm/job/' + encodeURIComponent(id) + '/' + action);
+			status.classList.add('ok');
+			status.textContent = action === 'cancel'
+				? 'Cancellation requested; waiting for terminal acknowledgment.'
+				: ('Queued as ' + result.id + (result.created === false ? ' (already created)' : ''));
+			await loadFarmJobs();
+		} catch (error) {
+			status.classList.add('error');
+			status.textContent = error && error.message ? error.message : String(error);
+		} finally {
+			farmJobControlInFlight.delete(id);
+			button.disabled = false;
+		}
+	}
 
   // farmRelativeTime renders an RFC3339 timestamp as a calm "just now / 5 min
   // ago / 2 hr ago / 3 days ago" label. Unparseable / missing → ''.
@@ -1177,7 +1620,8 @@
 
   // FARM_PROVENANCE maps each derivative kind to the real process that produces
   // it. Static knowledge (the farm always uses these tools); the proxy + ai rows
-  // get LIVE governor values spliced in by farmToolLabel when present.
+  // show server-local governor values with explicit fallback scope. Live routing
+  // is authoritative in Active Nodes and Recent Jobs, not this rollup.
   const FARM_PROVENANCE = [
     { kind: 'tech',      label: 'Tech metadata', tool: 'ffprobe',
       desc: 'Reads codec, resolution, duration and bitrate. Read-only — never touches the file.' },
@@ -1187,8 +1631,8 @@
       desc: 'Renders a sprite sheet of evenly-spaced frames for hover-scrubbing.' },
     { kind: 'waveform',  label: 'Waveform',      tool: 'ffmpeg + audiowaveform',
       desc: 'Decodes the audio and emits a compact JSON waveform for the timeline.' },
-    { kind: 'proxy',     label: 'Proxy',         tool: 'ffmpeg (libx264)',
-      desc: 'Transcodes a lightweight, fast-to-scrub editing copy.' },
+    { kind: 'proxy',     label: 'Proxy',         tool: 'ffmpeg (HEVC-first hardware)',
+      desc: 'Transcodes on a verified accelerator, with an explicit CPU H.264 outage fallback.' },
     { kind: 'ai',        label: 'AI transcript', tool: 'whisper.cpp',
       desc: 'Transcribes spoken audio to searchable, time-coded text.' },
   ];
@@ -1265,6 +1709,7 @@
     const sweep = s.last_sweep || {};
     const governor = s.governor || null;
     const inProgress = s.in_progress || null;
+    const staleProgress = res.stale_progress || null;
     const economics = s.proxy_economics || null;
 
     // P2: when a sweep is live, the banner takes over and we hide the
@@ -1273,6 +1718,9 @@
     const sentenceEl = $('#farm-sweep-sentence');
     if (inProgress) {
       sentenceEl.hidden = true;
+    } else if (staleProgress && staleProgress.progress) {
+      sentenceEl.hidden = false;
+      renderFarmInterruptedSentence(staleProgress);
     } else {
       sentenceEl.hidden = false;
       renderFarmSweepSentence(sweep);
@@ -1448,6 +1896,21 @@
     el.textContent = txt;
   }
 
+  // A worker can be terminated before its final idle-status write. The API
+  // removes that stale record from status.in_progress and supplies it here so
+  // we can report the interrupted work without ever calling it "running".
+  function renderFarmInterruptedSentence(stale) {
+    const el = $('#farm-sweep-sentence');
+    const ip = (stale && stale.progress) || {};
+    const done = ip.done != null ? ip.done : 0;
+    const total = ip.total != null ? ip.total : 0;
+    let txt = 'Previous ' + farmModePhrase(ip.pass) + ' stopped reporting at ' +
+      done.toLocaleString() + ' of ' + total.toLocaleString() + ' files';
+    if (stale.age_seconds > 0) txt += ' (' + formatEta(stale.age_seconds) + ' ago)';
+    txt += '. It is not reported as running; review Recent jobs before retrying.';
+    el.textContent = txt;
+  }
+
   // farmModePhrase maps the farm's mode string to readable copy. The producer
   // emits "derivatives" | "transcript(AI)" | "proxy" (see cmd/jmfarm); anything
   // else passes through verbatim so a new mode still reads sensibly.
@@ -1563,8 +2026,10 @@
     });
   }
 
-  // farmToolLabel returns the tool-column text, enriched with live governor
-  // settings for proxy/ai when the governor object reports them.
+  // farmToolLabel returns the tool-column text, enriched with server-local
+  // governor settings for proxy/ai when the rollup reports them. The scope is
+  // visible so libx264 here cannot be mistaken for the scheduler's farm-wide
+  // route while a HEVC render node is online.
   function farmToolLabel(row, governor) {
     if (!governor) return row.tool;
     if (row.kind === 'proxy') {
@@ -1572,12 +2037,12 @@
       const bits = [];
       if (governor.crf != null && governor.crf !== 0) bits.push('CRF ' + governor.crf);
       if (governor.preset) bits.push(governor.preset);
-      let t = 'ffmpeg (' + codec + ')';
+      let t = 'ffmpeg (server fallback: ' + codec + ')';
       if (bits.length) t += ' · ' + bits.join(', ');
       return t;
     }
     if (row.kind === 'ai' && governor.model) {
-      return 'whisper.cpp · ' + governor.model;
+      return 'whisper.cpp · server-local ' + governor.model;
     }
     return row.tool;
   }
@@ -1623,18 +2088,188 @@
     if (overviewState.inFlight) return; // skip overlap; next tick re-tries
     overviewState.inFlight = true;
     try {
-      const snap = await api('GET', '/api/overview');
-      renderOverview(snap);
-    } catch (err) {
-      // The endpoint is supposed to never 5xx, so anything reaching
-      // here is a transport-layer issue (network blip, auth prompt
-      // cancellation, page navigated mid-flight). Show a non-blocking
-      // hint in the header without nuking the previously-rendered cards.
-      const upd = document.getElementById('overview-updated');
-      if (upd) upd.textContent = 'last poll failed: ' + (err.message || err);
+      // T1.3 home polish: one-screen health summary. The overview snapshot
+      // (volume/redis/minio/jobs) is joined with the farm rollup, farm
+      // worker presence, and Link status — all pre-existing endpoints.
+      // Promise.allSettled so a single unreachable backend degrades only
+      // its own card instead of blanking the dashboard.
+      const [ov, farm, farmJobs, link] = await Promise.allSettled([
+        api('GET', '/api/overview'),
+        api('GET', '/api/farm'),
+        api('GET', '/api/farm/jobs'),
+        api('GET', '/api/net/link'),
+      ]);
+      if (ov.status === 'fulfilled') {
+        renderOverview(ov.value);
+      } else {
+        // Transport-layer failure on the snapshot itself (network blip,
+        // auth prompt cancellation). Non-blocking header hint; previously
+        // rendered cards stay as-is.
+        const upd = document.getElementById('overview-updated');
+        if (upd) upd.textContent = 'last poll failed: ' + ((ov.reason && ov.reason.message) || ov.reason);
+      }
+      renderOverviewFarm(farm, farmJobs);
+      renderOverviewLink(link);
+      renderOverviewErrors(ov.status === 'fulfilled' ? ov.value : null);
     } finally {
       overviewState.inFlight = false;
     }
+  }
+
+  // overviewCardEl + setOverviewCardError are T1.3 helpers for the new
+  // Farm/Link/Errors cards. They reuse the same DOM contract as
+  // renderOverviewCard (header pill + .overview-error <p>) so no new CSS.
+  function overviewCardEl(name) {
+    return document.querySelector(`.overview-card[data-card="${name}"]`);
+  }
+
+  function setOverviewCardError(card, msg) {
+    const errEl = card.querySelector('.overview-error');
+    const stateEl = card.querySelector('.overview-card-state');
+    if (!errEl || !stateEl) return;
+    if (msg) {
+      errEl.textContent = msg;
+      errEl.hidden = false;
+      stateEl.textContent = 'error';
+      stateEl.className = 'overview-card-state error';
+    } else {
+      errEl.hidden = true;
+      errEl.textContent = '';
+    }
+  }
+
+  // renderOverviewFarm fills the Farm health card from two settled fetches:
+  // /api/farm (sweep progress) and /api/farm/jobs (worker presence + depth).
+  // A rejected /api/farm/jobs marks the whole card errored — worker presence
+  // is the load-bearing signal; sweep text degrades independently.
+  function renderOverviewFarm(farmSettled, jobsSettled) {
+    const card = overviewCardEl('farm');
+    if (!card) return;
+    let workers = null;
+    let depth = null;
+    let paused = false;
+    let errMsg = '';
+    if (jobsSettled.status === 'fulfilled' && jobsSettled.value) {
+      workers = Array.isArray(jobsSettled.value.workers) ? jobsSettled.value.workers.length : 0;
+      depth = jobsSettled.value.queue_depth != null ? jobsSettled.value.queue_depth : 0;
+      paused = !!(jobsSettled.value.control && jobsSettled.value.control.paused);
+    } else {
+      errMsg = jobsSettled.status === 'rejected'
+        ? String((jobsSettled.reason && jobsSettled.reason.message) || jobsSettled.reason)
+        : 'unreachable';
+    }
+    let sweepTxt = '—';
+    if (farmSettled.status === 'fulfilled' && farmSettled.value && farmSettled.value.available) {
+      const s = farmSettled.value.status || {};
+      const ip = s.in_progress;
+      const stale = farmSettled.value.stale_progress;
+      if (paused) {
+        sweepTxt = 'paused';
+      } else if (ip) {
+        sweepTxt = 'running — ' + (ip.done || 0).toLocaleString() + ' of ' + (ip.total || 0).toLocaleString();
+      } else if (stale && stale.progress) {
+        sweepTxt = 'interrupted — ' + (stale.progress.done || 0).toLocaleString() + ' of ' +
+          (stale.progress.total || 0).toLocaleString();
+      } else {
+        const sw = s.last_sweep;
+        if (sw && (sw.mode || sw.target || sw.processed != null)) {
+          sweepTxt = 'done — ' + (sw.processed || 0).toLocaleString() + ' ok' +
+            ((sw.failed || 0) ? ', ' + sw.failed.toLocaleString() + ' failed' : '');
+        } else {
+          sweepTxt = 'none yet';
+        }
+      }
+    } else if (farmSettled.status === 'rejected') {
+      sweepTxt = 'unavailable';
+    } else {
+      sweepTxt = 'not configured';
+    }
+    setField(card, 'workers', workers == null ? '—' : workers.toLocaleString());
+    setField(card, 'queue', depth == null ? '—' : depth.toLocaleString());
+    setField(card, 'sweep', sweepTxt);
+    setOverviewCardError(card, errMsg);
+    if (!errMsg) {
+      const stateEl = card.querySelector('.overview-card-state');
+      const ok = (workers || 0) > 0;
+      stateEl.textContent = paused ? 'paused' : (ok ? 'ok' : 'down');
+      stateEl.className = (!paused && ok) ? 'overview-card-state ok' : 'overview-card-state warn';
+    }
+  }
+
+  // renderOverviewLink fills the Link health card from GET /api/net/link.
+  function renderOverviewLink(linkSettled) {
+    const card = overviewCardEl('link');
+    if (!card) return;
+    if (linkSettled.status !== 'fulfilled') {
+      const reason = linkSettled.reason;
+      setField(card, 'status', '—');
+      setField(card, 'server', '—');
+      setOverviewCardError(card, String((reason && reason.message) || reason));
+      return;
+    }
+    const st = linkSettled.value || {};
+    setOverviewCardError(card, st.error || '');
+    const stateEl = card.querySelector('.overview-card-state');
+    if (st.data_plane_ready && st.remote_ready) {
+      setField(card, 'status', 'ready');
+      setField(card, 'server', st.server_url || '—');
+      stateEl.textContent = 'ok';
+      stateEl.className = 'overview-card-state ok';
+    } else if (st.enabled) {
+      setField(card, 'status', 'degraded');
+      setField(card, 'server', st.server_url || '—');
+      stateEl.textContent = 'check';
+      stateEl.className = 'overview-card-state warn';
+    } else {
+      setField(card, 'status', 'not configured');
+      setField(card, 'server', '—');
+      stateEl.textContent = 'down';
+      stateEl.className = 'overview-card-state warn';
+    }
+  }
+
+  // renderOverviewErrors rolls every problem visible in one overview
+  // snapshot into a single list: per-backend probe errors first, then
+  // failed jobs. Derived entirely client-side from /api/overview — no
+  // extra endpoint.
+  function renderOverviewErrors(snap) {
+    const card = overviewCardEl('errors');
+    if (!card) return;
+    const list = card.querySelector('[data-field="items"]');
+    const stateEl = card.querySelector('.overview-card-state');
+    list.innerHTML = '';
+    if (!snap) {
+      setOverviewCardError(card, 'snapshot unavailable');
+      return;
+    }
+    setOverviewCardError(card, '');
+    const problems = [];
+    if (snap.volume && snap.volume.error) problems.push('volume: ' + snap.volume.error);
+    if (snap.redis && snap.redis.error) problems.push('redis: ' + snap.redis.error);
+    if (snap.minio && snap.minio.error) problems.push('minio: ' + snap.minio.error);
+    const jobItems = (snap.jobs && snap.jobs.items) || [];
+    if (snap.jobs && snap.jobs.error) {
+      problems.push('jobs: ' + snap.jobs.error);
+    } else {
+      for (const j of jobItems) {
+        if (j.state === 'error') problems.push('job ' + j.id + ' failed — ' + j.source + ' → ' + j.destination);
+      }
+    }
+    if (!problems.length) {
+      const li = document.createElement('li');
+      li.innerHTML = '<span class="ov-paths">none in the last ' + jobItems.length + ' jobs</span>';
+      list.appendChild(li);
+      stateEl.textContent = 'clear';
+      stateEl.className = 'overview-card-state ok';
+      return;
+    }
+    for (const p of problems) {
+      const li = document.createElement('li');
+      li.textContent = p;
+      list.appendChild(li);
+    }
+    stateEl.textContent = problems.length + (problems.length === 1 ? ' issue' : ' issues');
+    stateEl.className = 'overview-card-state error';
   }
 
   function renderOverview(snap) {
@@ -1648,6 +2283,10 @@
     }
     renderOverviewCard('volume', snap.volume, (card, v) => {
       setField(card, 'name', v.name || '(unset)');
+      // T1.3: closest existing signal for "volume up" is the `juicefs
+      // status` probe — a successful probe means the metadata engine
+      // answered. There is no dedicated FUSE-mount-state endpoint.
+      setField(card, 'status', v.error ? 'unreachable' : 'healthy');
       setField(card, 'used', formatBytes(v.used_bytes || 0));
       setField(card, 'files', (v.files || 0).toLocaleString());
     });
@@ -1897,6 +2536,7 @@
         const cb = document.createElement('input');
         cb.type = 'checkbox';
         cb.checked = trashState.selected.has(e.path);
+        cb.setAttribute('aria-label', `Select ${e.original_path || e.path}`);
         cb.addEventListener('click', (evt) => onTrashRowSelect(e, li, evt));
         li.appendChild(cb);
 
@@ -1916,10 +2556,12 @@
         const restore = document.createElement('button');
         restore.type = 'button';
         restore.textContent = 'Restore';
+        restore.setAttribute('aria-label', `Restore ${e.original_path || e.path}`);
         restore.addEventListener('click', () => restoreOne(e));
         const del = document.createElement('button');
         del.type = 'button';
         del.textContent = 'Delete';
+        del.setAttribute('aria-label', `Permanently delete ${e.original_path || e.path}`);
         del.className = 'danger';
         del.addEventListener('click', () => deleteOne(e));
         actions.appendChild(restore);
@@ -2546,14 +3188,17 @@
       const edit = document.createElement('button');
       edit.type = 'button';
       edit.textContent = 'Edit';
+      edit.setAttribute('aria-label', `Edit destination ${d.name}`);
       edit.addEventListener('click', () => beginEditDest(d));
       const test = document.createElement('button');
       test.type = 'button';
       test.textContent = 'Test';
+      test.setAttribute('aria-label', `Test destination ${d.name}`);
       test.addEventListener('click', () => testDestination(d.name, test));
       const del = document.createElement('button');
       del.type = 'button';
       del.textContent = 'Delete';
+      del.setAttribute('aria-label', `Delete destination ${d.name}`);
       del.className = 'danger';
       del.addEventListener('click', () => deleteDestination(d.name));
       actions.appendChild(edit);
@@ -2835,18 +3480,22 @@
       const edit = document.createElement('button');
       edit.type = 'button';
       edit.textContent = 'Edit';
+      edit.setAttribute('aria-label', `Edit backup schedule ${s.name}`);
       edit.addEventListener('click', () => beginEditBackup(s));
       const runNow = document.createElement('button');
       runNow.type = 'button';
       runNow.textContent = 'Run now';
+      runNow.setAttribute('aria-label', `Run backup schedule ${s.name} now`);
       runNow.addEventListener('click', () => runBackupNow(s.name, runNow));
       const toggle = document.createElement('button');
       toggle.type = 'button';
       toggle.textContent = s.paused ? 'Resume' : 'Pause';
+      toggle.setAttribute('aria-label', `${s.paused ? 'Resume' : 'Pause'} backup schedule ${s.name}`);
       toggle.addEventListener('click', () => togglePauseBackup(s));
       const del = document.createElement('button');
       del.type = 'button';
       del.textContent = 'Delete';
+      del.setAttribute('aria-label', `Delete backup schedule ${s.name}`);
       del.className = 'danger';
       del.addEventListener('click', () => deleteBackup(s.name));
       actions.appendChild(edit);
@@ -3250,10 +3899,558 @@
     } catch (err) { showPermError('Save failed: ' + (err.message || err)); }
   }
 
+// ─── JuiceMount Link tab (Tier-2) ────────────────────────────────────────
+let linkInitDone = false;
+let linkPollTimer = null;
+
+function startLinkPolling() {
+  refreshLinkStatus();
+  refreshDevices();
+  if (!linkPollTimer) {
+    linkPollTimer = setInterval(() => {
+      refreshLinkStatus();
+      refreshDevices();
+    }, 5000);
+  }
+}
+
+function stopLinkPolling() {
+  if (linkPollTimer) { clearInterval(linkPollTimer); linkPollTimer = null; }
+}
+
+function initLinkOnce() {
+  if (linkInitDone) return;
+  linkInitDone = true;
+  document.getElementById('btn-pair')?.addEventListener('click', async () => {
+    const btn = document.getElementById('btn-pair');
+    btn.disabled = true; btn.textContent = 'Generating…';
+    try {
+      const res = await api('POST', '/api/net/pair');
+      if (res.ok && res.code) {
+        document.getElementById('pair-code').textContent = res.code + '\nserver: ' + res.server_url;
+        document.getElementById('pair-result').style.display = 'block';
+        setTimeout(refreshDevices, 30000); // check for new node after code window
+      } else {
+        document.getElementById('pair-code').textContent = 'Error: ' + (res.error || 'unknown');
+        document.getElementById('pair-result').style.display = 'block';
+      }
+    } catch (e) {
+      document.getElementById('pair-code').textContent = 'Error: ' + e.message;
+      document.getElementById('pair-result').style.display = 'block';
+    }
+    btn.disabled = false; btn.textContent = 'Generate Pairing Code';
+  });
+
+  document.getElementById('btn-refresh-devices')?.addEventListener('click', refreshDevices);
+}
+
+async function refreshLinkStatus() {
+  try {
+    const st = await api('GET', '/api/net/link');
+    const status = document.getElementById('link-status');
+    const ready = !!(st.data_plane_ready && st.remote_ready);
+    status.classList.toggle('online', ready);
+    status.classList.toggle('offline', !ready);
+    document.getElementById('link-enabled').textContent = ready
+      ? 'Server-side Link path ready'
+      : (st.lan_only ? 'Link is LAN-only; remote cold start unavailable'
+        : (st.enabled ? 'Link control plane ready; server path degraded' : 'Link not configured'));
+    const detail = document.getElementById('link-status-detail');
+    if (detail) detail.textContent = ready
+      ? ('Server coordination, active NAS route, Redis, and object storage verified · run Apply & Test on the Mac to verify the client path · ' + (st.server_url || 'online'))
+      : (st.error || 'Enable Headscale and set the external Link server URL on the Manager container.');
+    document.getElementById('link-pair').style.display = st.enabled ? 'block' : 'none';
+    document.getElementById('link-devices').style.display = st.enabled ? 'block' : 'none';
+  } catch {
+    document.getElementById('link-enabled').textContent = 'Link status unreachable';
+    document.getElementById('link-status')?.classList.add('offline');
+  }
+}
+
+async function refreshDevices() {
+  try {
+    const res = await api('GET', '/api/net/paired');
+    const body = document.getElementById('devices-body');
+    body.innerHTML = '';
+    // Parse the raw `headscale nodes list` table. Column order varies
+    // between headscale versions, so locate each field by its header
+    // name instead of fixed positions.
+    const lines = (res.raw || '').split('\n').map(l => l.replace(/\x1b\[[0-9;]*m/g, ''));
+    const hdrIdx = lines.findIndex(l => l.includes('Hostname') && l.includes('|'));
+    if (hdrIdx === -1) return;
+    const headers = lines[hdrIdx].split('|').map(c => c.trim().toLowerCase());
+    const colOf = (name) => headers.indexOf(name);
+    for (const line of lines.slice(hdrIdx + 1)) {
+      if (!line.includes('|') || line.includes('---')) continue;
+      const cells = line.split('|').map(c => c.trim());
+      if (cells.length < headers.length) continue; // wrapped-cell continuation row
+      const id = cells[colOf('id')] || '';
+      const hostname = cells[colOf('hostname')] || cells[colOf('name')] || '';
+      if (!id && !hostname) continue;
+      const ips = cells[colOf('ip addresses')] || '';
+      const connected = (cells[colOf('connected')] || '').toLowerCase();
+      const lastSeen = cells[colOf('last seen')] || '';
+      const tr = document.createElement('tr');
+      const values = [hostname, ips, connected.includes('online') ? 'Online' : 'Offline', lastSeen];
+      values.forEach((value, idx) => {
+        const td = document.createElement('td');
+        td.textContent = value;
+        if (idx === 2) td.className = connected.includes('online') ? 'link-node-online' : 'link-node-offline';
+        tr.appendChild(td);
+      });
+      const actions = document.createElement('td');
+      const revoke = document.createElement('button');
+      revoke.type = 'button'; revoke.className = 'btn btn-sm'; revoke.textContent = 'Revoke';
+      revoke.setAttribute('aria-label', `Revoke remote access for ${hostname || id}`);
+      revoke.addEventListener('click', () => revokeNode(id));
+      actions.appendChild(revoke); tr.appendChild(actions);
+      body.appendChild(tr);
+    }
+  } catch { /* silent */ }
+}
+
+async function revokeNode(id) {
+  if (!confirm('Revoke this device? It will lose remote access immediately.')) return;
+  await api('POST', '/api/net/revoke?id=' + id);
+  refreshDevices();
+}
+
+function escHtml(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+
+// Lazy-init hook: called by showTab when link tab activates
+
+  // ==== FARM NODE CONFIG (FARM-NODE-CONFIG spec) ====
+  // The manager owns worker settings: GET /api/farm/config + /api/farm/workers
+  // render live state; PUT saves a patch that workers apply on their next loop
+  // tick. All wire values go through textContent — no innerHTML.
+  let farmConfigInited = false;
+	let farmWorkerControlInFlight = false;
+
+  function initFarmConfigOnce() {
+    if (farmConfigInited) return;
+    farmConfigInited = true;
+    const form = document.getElementById('farm-config-form');
+    if (form) form.addEventListener('submit', onFarmConfigSave);
+		const enrollment = document.getElementById('farm-enrollment-form');
+		if (enrollment) enrollment.addEventListener('submit', onFarmEnrollment);
+		document.querySelectorAll('[data-copy-target]').forEach((button) => {
+			button.addEventListener('click', () => copyFarmCommand(button.dataset.copyTarget, button));
+		});
+  }
+
+  async function loadFarmWorkers() {
+    const list = document.getElementById('farm-workers-list');
+    if (!list) return;
+		// Keep the live status/button nodes attached while a lifecycle action is
+		// awaiting acknowledgement. The normal five-second poll resumes as soon
+		// as the action reaches a truthful terminal UI state.
+		if (farmWorkerControlInFlight) return;
+    let res;
+    try { res = await api('GET', '/api/farm/workers'); } catch (e) { return; }
+    if (!res || !res.available) { list.textContent = ''; return; }
+    list.innerHTML = '';
+    const ws = Array.isArray(res.workers) ? res.workers : [];
+    if (ws.length === 0) {
+      const p = document.createElement('p');
+      p.className = 'farm-config-hint';
+      p.textContent = 'No farm nodes are online right now.';
+      list.appendChild(p);
+      return;
+    }
+		for (const w of ws) {
+			const row = document.createElement('div');
+			row.className = 'farm-worker-row farm-worker-card';
+			const head = document.createElement('div');
+			head.className = 'farm-worker-head';
+			const name = document.createElement('strong');
+			name.textContent = w.name || ('worker ' + (w.id || '').slice(0, 8));
+			head.appendChild(name);
+			const role = document.createElement('span');
+			role.className = 'farm-worker-role ' + (w.role || 'legacy');
+			role.textContent = (w.role || 'legacy') + ' node';
+			head.appendChild(role);
+			const state = document.createElement('span');
+			state.className = 'farm-worker-state ' + (w.state || 'idle');
+			state.textContent = ({
+				'waiting-storage-permit': 'waiting for NAS capacity proof',
+			})[w.state] || w.state || (w.current_job ? 'working' : 'idle');
+			head.appendChild(state);
+			if (w.build_commit) {
+				const build = document.createElement('span');
+				build.className = 'farm-worker-build';
+				build.textContent = (w.build_version ? ('v' + w.build_version + ' · ') : '') + String(w.build_commit).slice(0, 7);
+				build.title = 'Worker artifact commit ' + w.build_commit;
+				head.appendChild(build);
+			}
+			row.appendChild(head);
+
+			const route = document.createElement('p');
+			route.className = 'farm-worker-route';
+			const encoders = Array.isArray(w.encoders) ? w.encoders : [];
+			const transcript = (Array.isArray(w.transcript_backends) ? w.transcript_backends : []).filter((v) => v !== 'cpu');
+			route.textContent = encoders.length
+				? ('Verified video: ' + encoders.join(' · '))
+				: 'Metadata and CPU fallback lane';
+			if (transcript.length) route.textContent += '  /  AI: ' + transcript.join(' · ');
+			row.appendChild(route);
+			const decodeLimits = w.decode_limits && typeof w.decode_limits === 'object' ? w.decode_limits : {};
+			const limitLabels = Object.keys(decodeLimits).sort().map((decoder) => {
+				const limit = decodeLimits[decoder] || {};
+				const width = Number(limit.max_width || 0);
+				const height = Number(limit.max_height || 0);
+				return width > 0 && height > 0 ? `${decoder} ≤ ${width}×${height}` : '';
+			}).filter(Boolean);
+			if (limitLabels.length) {
+				const limits = document.createElement('p');
+				limits.className = 'farm-worker-route';
+				limits.textContent = 'Measured decode: ' + limitLabels.join(' · ');
+				row.appendChild(limits);
+			}
+
+			const bench = w.benchmarks || {};
+			const metrics = document.createElement('div');
+			metrics.className = 'farm-worker-metrics';
+			const metric = (label, value) => {
+				const box = document.createElement('span');
+				const val = document.createElement('strong'); val.textContent = value;
+				const key = document.createElement('em'); key.textContent = label;
+				box.appendChild(val); box.appendChild(key); metrics.appendChild(box);
+			};
+			if (Number(bench.encode_fps) > 0) metric('encode fps', Number(bench.encode_fps).toFixed(1));
+			if (Number(bench.decode_fps) > 0) metric('decode fps', Number(bench.decode_fps).toFixed(1));
+			if (Number(bench.access_mbps) > 0) metric('mount MB/s', Number(bench.access_mbps).toFixed(1));
+			if (Number(bench.transcript_x_realtime) > 0) metric('AI × realtime', Number(bench.transcript_x_realtime).toFixed(2));
+			if (Number(bench.jobs_completed) > 0) metric('jobs observed', Number(bench.jobs_completed).toLocaleString());
+			if (metrics.childNodes.length) row.appendChild(metrics);
+			if (w.current_activity || w.current_job) {
+				const current = document.createElement('p');
+				current.className = 'farm-worker-current';
+				const activity = w.current_activity || { id: w.current_job };
+				const parts = ['Current job ' + (activity.id || w.current_job)];
+				if (activity.kind) parts.push(activity.kind);
+				if (activity.stage) parts.push(activity.stage);
+				if (Number.isFinite(Number(activity.pct))) parts.push(Math.max(0, Math.min(100, Number(activity.pct))) + '%');
+				current.textContent = parts.join(' · ');
+				row.appendChild(current);
+				if (activity.path) {
+					const currentPath = document.createElement('p');
+					currentPath.className = 'farm-worker-current-path';
+					currentPath.textContent = activity.path;
+					row.appendChild(currentPath);
+				}
+			}
+			if (w.config_revision) {
+        const rev = document.createElement('span');
+        rev.className = 'farm-worker-rev';
+        rev.textContent = 'config r' + w.config_revision;
+        row.appendChild(rev);
+      }
+      if (Array.isArray(w.pending_restart) && w.pending_restart.length) {
+        const badge = document.createElement('span');
+        badge.className = 'farm-worker-badge';
+        badge.title = 'Applied after the node container restarts';
+        badge.textContent = 'needs restart: ' + w.pending_restart.join(', ');
+				row.appendChild(badge);
+			}
+			if (bench.probe_error) {
+				const warning = document.createElement('p');
+				warning.className = 'farm-worker-probe-error';
+				warning.textContent = bench.probe_error;
+				row.appendChild(warning);
+			}
+			const nodeName = String(w.name || '').trim();
+			const configuredHolds = farmControlState.node_holds;
+			const nodeHeld = configuredHolds && configuredHolds.known &&
+				Array.isArray(configuredHolds.nodes) && configuredHolds.nodes.some((hold) => hold.name === nodeName);
+			const actions = document.createElement('div');
+			actions.className = 'farm-worker-actions';
+			const actionStatus = document.createElement('span');
+			actionStatus.className = 'farm-worker-action-status';
+			actionStatus.setAttribute('role', 'status');
+			if (nodeName) {
+				const disabled = w.state === 'disabled';
+				const lifecycleButtons = [];
+				if (disabled) {
+					const legacyEnable = document.createElement('button');
+					legacyEnable.type = 'button';
+					legacyEnable.className = 'btn btn-sm';
+					legacyEnable.textContent = 'Enable legacy node';
+					legacyEnable.title = 'Clears the pre-0.5 emergency-disable flag.';
+					legacyEnable.addEventListener('click', () => controlFarmWorker(nodeName, w.id || '', 'enable', actionStatus, [legacyEnable]));
+					lifecycleButtons.push(legacyEnable);
+					actions.appendChild(legacyEnable);
+				} else if (w.state === 'paused' || w.state === 'draining' || nodeHeld) {
+					const resume = farmNodeActionButton(nodeName, 'resume', 'Resume node', actionStatus, lifecycleButtons);
+					lifecycleButtons.push(resume);
+					actions.appendChild(resume);
+				} else {
+					const pause = farmNodeActionButton(nodeName, 'pause', 'Pause node', actionStatus, lifecycleButtons);
+					const drain = farmNodeActionButton(nodeName, 'drain', 'Drain node', actionStatus, lifecycleButtons);
+					lifecycleButtons.push(pause, drain);
+					actions.appendChild(pause);
+					actions.appendChild(drain);
+				}
+
+				const restart = document.createElement('button');
+				restart.type = 'button';
+				restart.className = 'btn btn-sm';
+				restart.textContent = 'Restart worker';
+				restart.setAttribute('aria-label', `Restart farm node ${nodeName}`);
+				restart.disabled = disabled;
+				restart.title = disabled ? 'Enable the node before requesting a restart' : 'Acknowledged by the worker before its durable claim is released';
+				restart.addEventListener('click', () => controlFarmWorker(nodeName, w.id || '', 'restart', actionStatus, [...lifecycleButtons, restart]));
+				actions.appendChild(restart);
+			} else {
+				actionStatus.textContent = 'Set a stable worker name to enable lifecycle controls.';
+			}
+			actions.appendChild(actionStatus);
+			row.appendChild(actions);
+			if (nodeName) row.appendChild(farmWorkerLogDetails(nodeName));
+			list.appendChild(row);
+    }
+  }
+
+	function farmNodeActionButton(name, action, label, status, buttonGroup) {
+		const button = document.createElement('button');
+		button.type = 'button';
+		button.className = 'btn btn-sm';
+		button.textContent = label;
+		button.title = action === 'drain'
+			? 'Finish current work, then stop claiming new jobs.'
+			: action === 'pause' ? 'Stop claiming new jobs immediately; current work continues.' : 'Allow this node to claim work again.';
+		button.addEventListener('click', () => controlFarmNode(name, action, status, buttonGroup));
+		return button;
+	}
+
+	async function controlFarmNode(name, action, status, buttons) {
+		farmWorkerControlInFlight = true;
+		buttons.forEach((button) => { button.disabled = true; });
+		status.classList.remove('ok', 'error');
+		status.textContent = action === 'drain' ? 'Requesting drain…' : `${action === 'pause' ? 'Pausing' : 'Resuming'}…`;
+		try {
+			const result = await api('POST', '/api/farm/node/' + encodeURIComponent(name) + '/' + action);
+			status.classList.add('ok');
+			status.textContent = action === 'drain'
+				? 'Drain requested; active work may finish before the node stands by.'
+				: `${action === 'pause' ? 'Pause' : 'Resume'} applied in config r${result.revision}.`;
+			await loadFarmJobs();
+		} catch (error) {
+			status.classList.add('error');
+			status.textContent = error && error.message ? error.message : String(error);
+		} finally {
+			buttons.forEach((button) => { button.disabled = false; });
+			farmWorkerControlInFlight = false;
+			setTimeout(loadFarmWorkers, 600);
+		}
+	}
+
+	function farmWorkerLogDetails(name) {
+		const details = document.createElement('details');
+		details.className = 'farm-worker-log';
+		const summary = document.createElement('summary');
+		summary.textContent = 'Worker log · latest 200 lines';
+		const pre = document.createElement('pre');
+		pre.textContent = 'Open to load the live bounded tail.';
+		details.appendChild(summary);
+		details.appendChild(pre);
+		let loaded = false;
+		details.addEventListener('toggle', async () => {
+			if (!details.open || loaded) return;
+			pre.textContent = 'Loading…';
+			try {
+				const result = await api('GET', '/api/farm/node/' + encodeURIComponent(name) + '/log');
+				const lines = Array.isArray(result.lines) ? result.lines : [];
+				pre.textContent = lines.length
+					? lines.map((entry) => `${entry.at || ''} ${entry.line || ''}`.trim()).join('\n')
+					: 'No worker log lines have been published yet.';
+				loaded = true;
+			} catch (error) {
+				pre.textContent = 'Log unavailable: ' + (error && error.message ? error.message : String(error));
+			}
+		});
+		return details;
+	}
+
+	async function controlFarmWorker(name, previousID, action, status, buttons) {
+		const prompt = action === 'restart'
+			? `Restart ${name}? Active work will return to its durable queue before the replacement process claims it.`
+			: `${action === 'disable' ? 'Disable' : 'Enable'} ${name}?`;
+		if (!confirm(prompt)) return;
+		farmWorkerControlInFlight = true;
+		buttons.forEach((button) => { button.disabled = true; });
+		status.classList.remove('ok', 'error');
+		status.textContent = action === 'restart' ? 'Requesting restart…' : `${action === 'disable' ? 'Disabling' : 'Enabling'}…`;
+		try {
+			const result = await api('POST', '/api/farm/workers/control', { name, action });
+			status.classList.add('ok');
+			status.textContent = result.note || `${action} accepted`;
+			if (action === 'restart' && result.command && result.command.id) {
+				let acknowledged = false;
+				for (let attempt = 0; attempt < 12; attempt += 1) {
+					await new Promise((resolve) => setTimeout(resolve, 1000));
+					const ack = await api('GET', '/api/farm/workers/control?command_id=' + encodeURIComponent(result.command.id));
+					if (ack.command && ack.command.state === 'acknowledged') {
+						status.textContent = 'Restart acknowledged · waiting for a fresh heartbeat';
+						acknowledged = true;
+						break;
+					}
+				}
+				if (!acknowledged) {
+					status.classList.remove('ok');
+					status.classList.add('error');
+					status.textContent = 'Restart was requested, but the node did not acknowledge it within 12 seconds.';
+				} else {
+					await waitForFarmWorkerReplacement(name, previousID, status);
+				}
+			}
+		} catch (error) {
+			status.classList.add('error');
+			status.textContent = error && error.message ? error.message : String(error);
+		} finally {
+			buttons.forEach((button) => { button.disabled = false; });
+			farmWorkerControlInFlight = false;
+			loadFarmWorkers();
+		}
+	}
+
+	async function waitForFarmWorkerReplacement(name, previousID, status) {
+		const deadline = Date.now() + 45000;
+		while (Date.now() < deadline) {
+			await new Promise((resolve) => setTimeout(resolve, 1500));
+			let snapshot;
+			try {
+				snapshot = await api('GET', '/api/farm/workers');
+			} catch (_) {
+				continue;
+			}
+			const matches = Array.isArray(snapshot && snapshot.workers)
+				? snapshot.workers.filter((worker) => worker && worker.name === name)
+				: [];
+			if (matches.length === 1 && matches[0].id && matches[0].id !== previousID) {
+				status.classList.remove('error');
+				status.classList.add('ok');
+				status.textContent = 'Restart verified · fresh heartbeat online';
+				return true;
+			}
+		}
+		status.classList.remove('ok');
+		status.classList.add('error');
+		status.textContent = 'Restart was acknowledged, but no replacement heartbeat appeared within 45 seconds.';
+		return false;
+	}
+
+	async function onFarmEnrollment(event) {
+		event.preventDefault();
+		const button = document.getElementById('farm-enroll-create');
+		const status = document.getElementById('farm-enroll-status');
+		const result = document.getElementById('farm-enrollment-result');
+		const name = document.getElementById('farm-enroll-name').value.trim().toLowerCase();
+		const role = document.getElementById('farm-enroll-role').value;
+		const statePath = document.getElementById('farm-enroll-state').value.trim();
+		const cachePath = document.getElementById('farm-enroll-cache').value.trim();
+		button.disabled = true;
+		status.classList.remove('ok', 'error');
+		status.textContent = 'Preparing a no-store install plan…';
+		result.hidden = true;
+		try {
+			const response = await api('POST', '/api/farm/enrollment', {
+				name, role, state_path: statePath, cache_path: cachePath,
+				remote: document.getElementById('farm-enroll-remote').checked,
+			});
+			const plan = response.plan || {};
+			document.getElementById('farm-enroll-plan-title').textContent = `${plan.name || name} · ${plan.role || role} node`;
+			document.getElementById('farm-enroll-plan-commit').textContent = plan.expected_commit ? String(plan.expected_commit).slice(0, 12) : 'unversioned';
+			document.getElementById('farm-enroll-plan-commit').title = plan.expected_commit || '';
+			document.getElementById('farm-enroll-prepare-command').textContent = plan.prepare_command || '';
+			document.getElementById('farm-enroll-docker-command').textContent = plan.docker_command || '';
+			document.getElementById('farm-enroll-recovery-unit').textContent = plan.recovery_unit || '';
+			document.getElementById('farm-enroll-recovery-command').textContent = plan.recovery_command || '';
+			const linkRow = document.getElementById('farm-enroll-link-row');
+			linkRow.hidden = !plan.link_command;
+			document.getElementById('farm-enroll-link-command').textContent = plan.link_command || '';
+			const checks = document.getElementById('farm-enroll-checks');
+			checks.replaceChildren();
+			(plan.checks || []).forEach((text) => {
+				const item = document.createElement('li');
+				item.textContent = text;
+				checks.appendChild(item);
+			});
+			result.hidden = false;
+			status.classList.add('ok');
+			status.textContent = 'Plan ready. Verify each command before running it on the node.';
+		} catch (error) {
+			status.classList.add('error');
+			status.textContent = error && error.message ? error.message : String(error);
+		} finally {
+			button.disabled = false;
+		}
+	}
+
+	async function copyFarmCommand(targetID, button) {
+		const source = document.getElementById(targetID);
+		if (!source) return;
+		const text = source.textContent || '';
+		try {
+			if (navigator.clipboard && navigator.clipboard.writeText) {
+				await navigator.clipboard.writeText(text);
+			} else {
+				const area = document.createElement('textarea');
+				area.value = text; area.setAttribute('readonly', ''); area.style.position = 'fixed'; area.style.opacity = '0';
+				document.body.appendChild(area); area.select(); document.execCommand('copy'); area.remove();
+			}
+			const prior = button.textContent;
+			button.textContent = 'Copied';
+			setTimeout(() => { button.textContent = prior; }, 1200);
+		} catch {
+			button.textContent = 'Copy failed';
+			setTimeout(() => { button.textContent = 'Copy'; }, 1600);
+		}
+	}
+
+  async function onFarmConfigSave(ev) {
+    ev.preventDefault();
+    const status = document.getElementById('farm-config-status');
+    const setMsg = (t, ok) => { if (status) { status.textContent = t; status.classList.toggle('ok', !!ok); } };
+    const num = (id) => { const v = document.getElementById(id).value.trim(); return v === '' ? null : Number(v); };
+    const str = (id) => document.getElementById(id).value.trim();
+    const patch = {};
+    const pairs = [['crf', num('cfg-crf')], ['workers', num('cfg-workers')],
+                   ['proxy_workers', num('cfg-proxy-workers')], ['ffmpeg_threads', num('cfg-ffmpeg-threads')]];
+    for (const [k, v] of pairs) if (v !== null && !Number.isNaN(v)) patch[k] = v;
+    for (const [id, key] of [['cfg-model', 'model'], ['cfg-device', 'transcript_device'],
+                             ['cfg-vcodec', 'vcodec'], ['cfg-preset', 'preset']]) {
+      const v = str(id);
+      if (v !== '') patch[key] = v;
+    }
+    if (Object.keys(patch).length === 0) { setMsg('Nothing to save — fill in at least one field.', false); return; }
+    const node = str('farm-config-node').toLowerCase().replace(/[^a-z0-9_-]/g, '');
+    const body = node ? { overrides: { [node]: patch } } : { defaults: patch };
+    setMsg('Saving…', false);
+    try {
+      const res = await api('PUT', '/api/farm/config', body);
+      setMsg(res && res.ok ? 'Saved — revision r' + res.revision + '. Nodes pick it up within ~5 seconds.' : 'Save failed.', !!(res && res.ok));
+      loadFarmWorkers();
+    } catch (e) {
+      setMsg('Save failed: ' + (e && e.message ? e.message : e), false);
+    }
+  }
+
   // -------- Boot --------
-  // route() reads location.hash, falls back to DEFAULT_TAB
-  // (#/migrations), and shows the matching <section data-tab>.
-  // showTab → initMigrationsOnce, so visiting the page with the
-  // default route immediately fires the migrator boot path.
+  const authKeyButton = $('#auth-key-button');
+  if (authKeyButton) {
+    authKeyButton.addEventListener('click', async () => {
+      authPromptDeclined = false;
+      const key = await requestAdminKey({ force: true });
+      if (!key) return;
+      storeAdminKey(key);
+      // Re-run every lazy initializer cleanly after an explicit key change.
+      // This also clears any visible initialization errors from the old key.
+      location.reload();
+    });
+  }
+
+  // Keep this after every top-level `let`/`const` initializer. A deep link such
+  // as #/farm immediately calls the tab's lazy initializer; booting earlier
+  // would hit the temporal dead zone for state declared later in this file.
   route();
 })();

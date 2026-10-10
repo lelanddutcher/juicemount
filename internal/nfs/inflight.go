@@ -7,9 +7,13 @@ import (
 	"runtime/pprof"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/lelanddutcher/juicemount/internal/appisolation"
+	"github.com/lelanddutcher/juicemount/internal/metrics"
 )
 
 // In-flight RPC tracking. The completed-RPC latency metrics (max_us per op)
@@ -50,12 +54,64 @@ var inflightDumpAfter = func() time.Duration {
 	return 22 * time.Second
 }()
 
+// inflightDumpDir must OUTLIVE A REBOOT.
+//
+// This defaulted to /tmp/jm_dumps, which macOS clears on boot. The dump is
+// written precisely when the mount is wedging — i.e. in the minutes before the
+// machine may panic or be force-restarted — so the one moment the stack traces
+// matter is the one moment they are guaranteed to be gone.
+//
+// That is not hypothetical: on 2026-08-05 twelve dumps were written while NFS
+// reads sat in-flight for 592s, the box panicked, and every one of them
+// evaporated in the reboot. The stalled-goroutine stacks — the only direct
+// evidence of WHERE the read was blocked — were lost.
+//
+// ~/Library/Logs/JuiceMount sits beside juicemount.log, which is where an
+// operator already looks and which survives a restart.
 var inflightDumpDir = func() string {
 	if d := os.Getenv("JM_INFLIGHT_DUMP_DIR"); d != "" {
 		return d
 	}
-	return "/tmp/jm_dumps"
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		return filepath.Join(home, "Library", "Logs", "JuiceMount", "stall-dumps")
+	}
+	return "/tmp/jm_dumps" // last resort: better than not dumping at all
 }()
+
+// pruneStallDumps keeps the dump directory bounded. Persisting dumps across
+// reboots means they accumulate, and an unbounded debug directory on the boot
+// disk is its own failure — this system already fights for free space (the
+// spool and the JuiceFS cache share the SSD). Keeps the newest maxStallDumps.
+const maxStallDumps = 40
+
+func pruneStallDumps(dir string) {
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	type fi struct {
+		name string
+		mod  time.Time
+	}
+	var files []fi
+	for _, e := range ents {
+		if e.IsDir() || !strings.HasPrefix(e.Name(), "inflight_stall_") {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		files = append(files, fi{e.Name(), info.ModTime()})
+	}
+	if len(files) <= maxStallDumps {
+		return
+	}
+	sort.Slice(files, func(i, j int) bool { return files[i].mod.After(files[j].mod) })
+	for _, f := range files[maxStallDumps:] {
+		_ = os.Remove(filepath.Join(dir, f.name))
+	}
+}
 
 // inflightRegister records an in-flight RPC and returns its id. The watchdog is
 // started lazily on first use so no explicit wiring is needed.
@@ -101,6 +157,15 @@ func InflightStats() (count int, oldestOp string, oldestAge time.Duration) {
 // another guess.
 var jukeboxByOp sync.Map // op string -> *atomic.Int64
 
+// A single JUKEBOX reply is an expected, invisible recovery mechanism for an
+// idempotent RPC crossing a bounded FUSE blip. Finder's error 100060 signature
+// is a retry storm, not one successful retry. Keep every reply in metrics, but
+// reserve the release-gating error log for three or more replies in one ~15s
+// window. Lower rates remain visible as warnings without the 100060 signature.
+const jukeboxStormMinReplies int64 = 3
+
+func isJukeboxStormWindow(total int64) bool { return total >= jukeboxStormMinReplies }
+
 func recordJukebox(op string) {
 	v, _ := jukeboxByOp.LoadOrStore(op, new(atomic.Int64))
 	v.(*atomic.Int64).Add(1)
@@ -123,8 +188,9 @@ func inflightWatchdog() {
 	prevJuke := map[string]int64{}
 	var sinceJukeLog int
 	for range tick.C {
-		// Every ~15s, report any op whose JUKEBOX count grew — a storming op
-		// is the "error 100060" signature.
+		// Every ~15s, report every op whose JUKEBOX count grew. Isolated retries
+		// stay diagnostic; only a high-rate window carries the release-gating
+		// "error 100060" signature.
 		sinceJukeLog++
 		if sinceJukeLog >= 5 {
 			sinceJukeLog = 0
@@ -143,10 +209,16 @@ func inflightWatchdog() {
 			if len(grew) > 0 {
 				sort.Slice(grew, func(i, j int) bool { return grew[i].d > grew[j].d })
 				parts := ""
+				var total int64
 				for _, g := range grew {
 					parts += fmt.Sprintf(" %s=%d", g.op, g.d)
+					total += g.d
 				}
-				Log.Errorf("JUKEBOX-RATE (per ~15s):%s — a high per-op rate is the 'error 100060' retry-storm signature", parts)
+				if isJukeboxStormWindow(total) {
+					Log.Errorf("JUKEBOX-RATE (per ~15s):%s — a high retry rate is the 'error 100060' retry-storm signature", parts)
+				} else {
+					Log.Warnf("JUKEBOX-RETRY (per ~15s):%s — isolated idempotent retry recovered", parts)
+				}
 			}
 		}
 		count, op, age := InflightStats()
@@ -161,11 +233,26 @@ func inflightWatchdog() {
 			continue
 		}
 		lastDump = time.Now()
-		if err := os.MkdirAll(inflightDumpDir, 0o755); err != nil {
+		dumpDir := inflightDumpDir
+		mode := os.FileMode(0755)
+		paths, isolated, scopeErr := appisolation.ResolvePaths()
+		if scopeErr != nil {
 			continue
 		}
-		fn := filepath.Join(inflightDumpDir, fmt.Sprintf("inflight_stall_%d.txt", time.Now().Unix()))
-		f, err := os.Create(fn)
+		if isolated {
+			dumpDir, mode = paths.StallDumps, 0700
+		}
+		if err := os.MkdirAll(dumpDir, mode); err != nil {
+			continue
+		}
+		fn := filepath.Join(dumpDir, fmt.Sprintf("inflight_stall_%d.txt", time.Now().Unix()))
+		var f *os.File
+		var err error
+		if isolated {
+			f, err = os.OpenFile(fn, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+		} else {
+			f, err = os.Create(fn)
+		}
 		if err != nil {
 			continue
 		}
@@ -173,6 +260,7 @@ func inflightWatchdog() {
 			op, age.Seconds(), count, time.Now().Format(time.RFC3339))
 		_ = pprof.Lookup("goroutine").WriteTo(f, 2)
 		_ = f.Close()
+		pruneStallDumps(dumpDir)
 		Log.Errorf("INFLIGHT-STALL: goroutine dump written to %s", fn)
 	}
 }
@@ -187,4 +275,37 @@ func inflightOpName(r *request) string {
 	default:
 		return fmt.Sprintf("%d.%d", r.Header.Prog, r.Header.Proc)
 	}
+}
+
+// Wire live stall telemetry into /metrics at package init.
+//
+// InflightStats' doc comment above says it is "Exposed for the metrics
+// endpoint so external monitors can watch for a hang live". That was false
+// until this init() existed: its only caller was inflightWatchdog, which does
+// not speak until >=22s. snapshotJukebox was in the same state — one caller, a
+// ~15s watchdog log line — and this mount runs with jukebox logging muted, so
+// a JUKEBOX storm reached neither the user nor /metrics.
+//
+// Registering from init() rather than a wiring site is deliberate: the failure
+// mode being fixed IS the forgotten wiring site. See nfs/fusedatagate.go for
+// the same reasoning and [[feedback_architect_role]] "dead knobs".
+func init() {
+	metrics.Default().SetStallProvider(func() *metrics.StallSnapshot {
+		count, oldestOp, oldestAge := InflightStats()
+		jb := snapshotJukebox()
+		var total int64
+		for _, v := range jb {
+			total += v
+		}
+		if len(jb) == 0 {
+			jb = nil // omitempty: an empty map is noise, not a reading
+		}
+		return &metrics.StallSnapshot{
+			Inflight:     count,
+			OldestOp:     oldestOp,
+			OldestAgeMs:  oldestAge.Milliseconds(),
+			JukeboxByOp:  jb,
+			JukeboxTotal: total,
+		}
+	})
 }

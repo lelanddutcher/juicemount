@@ -9,7 +9,6 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -413,7 +412,7 @@ func getTrashConfig(ctx context.Context, juicefsBin, metaURL string) (int, error
 	if bin == "" {
 		bin = "juicefs"
 	}
-	cmd := exec.CommandContext(ctx, bin, "config", metaURL)
+	cmd := juicefsMetaCmd(ctx, bin, "config", metaURL, metaRoleSelf)
 	out, err := cmd.Output()
 	if err != nil {
 		return 0, fmt.Errorf("juicefs config: %v", trimErr(err))
@@ -435,6 +434,9 @@ func getTrashConfig(ctx context.Context, juicefsBin, metaURL string) (int, error
 func parseTrashConfig(raw []byte) (int, error) {
 	lines := strings.Split(string(raw), "\n")
 	for _, line := range lines {
+		// juicefs 1.3.1 prints the config as JSON (`"TrashDays": 7,`):
+		// drop the quotes and the trailing comma so the shapes below match.
+		line = strings.TrimSuffix(strings.ReplaceAll(strings.TrimSpace(line), `"`, ""), ",")
 		ll := strings.ToLower(strings.TrimSpace(line))
 		// Match either "trashdays" or "trash-days" prefix. juicefs
 		// has used both — the YAML shape uses snake_case, the CLI
@@ -489,7 +491,8 @@ func setTrashConfig(ctx context.Context, juicefsBin, metaURL string, days int) e
 	if bin == "" {
 		bin = "juicefs"
 	}
-	cmd := exec.CommandContext(ctx, bin, "config", metaURL, "--trash-days", strconv.Itoa(days))
+	// H-8B: writing the volume settings is admin-only at the proxy.
+	cmd := juicefsMetaCmd(ctx, bin, "config", metaURL, metaRoleAdmin, "--trash-days", strconv.Itoa(days))
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		// Trim and length-cap the upstream message so we don't echo
@@ -514,9 +517,9 @@ func setTrashConfig(ctx context.Context, juicefsBin, metaURL string, days int) e
 // it); Recommended is trashConfigRetentionDays so the UI can mark
 // the matching drop-down entry.
 type trashConfigResponse struct {
-	Days        int   `json:"days"`
-	Recommended int   `json:"recommended"`
-	Choices     []int `json:"choices"`
+	Days        int    `json:"days"`
+	Recommended int    `json:"recommended"`
+	Choices     []int  `json:"choices"`
 	Error       string `json:"error,omitempty"`
 }
 
@@ -740,6 +743,27 @@ func (a *API) handleTrashRestore(w http.ResponseWriter, r *http.Request) {
 	if isInsideTrash(fuseTarget, a.fuseMount) {
 		http.Error(w, "target cannot be inside .trash/", http.StatusBadRequest)
 		return
+	}
+	// H-8B: the restore writes into the target's project; check it out
+	// first so a project another principal holds is refused before the
+	// rename, not by the proxy after it.
+	if leaser := a.jobs.projectLeaser(); leaser != nil {
+		if proj := projectOfVolumePath(strings.TrimPrefix(fuseTarget, strings.TrimSuffix(a.fuseMount, "/"))); proj != "" {
+			release, _, lerr := leaser.Checkout(r.Context(), []string{proj})
+			var leased *ProjectLeasedError
+			switch {
+			case errors.As(lerr, &leased):
+				http.Error(w, leased.Error(), http.StatusConflict)
+				return
+			case lerr != nil:
+				log.Printf("manager: trash restore lease checkout failed: %v", lerr)
+				http.Error(w, "restore refused: the project lease could not be checked", http.StatusServiceUnavailable)
+				return
+			}
+			if release != nil {
+				defer release()
+			}
+		}
 	}
 	final, err := restoreTrash(entryPath, fuseTarget)
 	if err != nil {

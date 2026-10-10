@@ -10,10 +10,10 @@
 package farm
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"math"
-	"os/exec"
 	"strconv"
 	"strings"
 )
@@ -34,6 +34,7 @@ type Tech struct {
 // pointers so they serialize as JSON null (not "") when ffprobe omits them.
 type VideoTrack struct {
 	Codec          string  `json:"codec"`
+	Profile        string  `json:"profile,omitempty"`
 	Width          int     `json:"width"`
 	Height         int     `json:"height"`
 	FPS            float64 `json:"fps"`
@@ -67,6 +68,7 @@ type ffProbe struct {
 type ffStream struct {
 	CodecType        string            `json:"codec_type"`
 	CodecName        string            `json:"codec_name"`
+	Profile          string            `json:"profile"`
 	Width            int               `json:"width"`
 	Height           int               `json:"height"`
 	PixFmt           string            `json:"pix_fmt"`
@@ -82,6 +84,14 @@ type ffStream struct {
 	Duration         string            `json:"duration"`
 	BitRate          string            `json:"bit_rate"`
 	Tags             map[string]string `json:"tags"`
+	Disposition      ffDisposition     `json:"disposition"`
+}
+
+type ffDisposition struct {
+	// ffprobe reports embedded album artwork as a video stream with
+	// disposition.attached_pic=1. It is still-image metadata, not a motion-video
+	// track, and must never make an audio asset eligible for proxy encoding.
+	AttachedPic int `json:"attached_pic"`
 }
 
 type ffFormat struct {
@@ -97,10 +107,14 @@ type ffFormat struct {
 // payload ready to marshal, plus the raw Tech for callers that want fields
 // (e.g. blob generation gated on video presence).
 func Probe(ffprobeBin, path string, fallbackSize int64) (*Tech, error) {
+	return ProbeContext(context.Background(), ffprobeBin, path, fallbackSize)
+}
+
+func ProbeContext(ctx context.Context, ffprobeBin, path string, fallbackSize int64) (*Tech, error) {
 	if ffprobeBin == "" {
 		ffprobeBin = "ffprobe"
 	}
-	out, err := exec.Command(ffprobeBin, "-v", "quiet", "-print_format", "json",
+	out, err := commandContext(ctx, ffprobeBin, "-v", "quiet", "-print_format", "json",
 		"-show_format", "-show_streams", path).Output()
 	if err != nil {
 		return nil, fmt.Errorf("ffprobe %q: %w", path, err)
@@ -124,7 +138,10 @@ func mapTech(p *ffProbe, fallbackSize int64) *Tech {
 		s := &p.Streams[i]
 		switch s.CodecType {
 		case "video":
-			if t.Video == nil { // first video stream wins
+			if s.Disposition.AttachedPic != 0 {
+				continue
+			}
+			if t.Video == nil { // first non-attached-picture video stream wins
 				t.Video = mapVideo(s)
 			}
 		case "audio":
@@ -141,6 +158,7 @@ func mapTech(p *ffProbe, fallbackSize int64) *Tech {
 func mapVideo(s *ffStream) *VideoTrack {
 	v := &VideoTrack{
 		Codec:          s.CodecName,
+		Profile:        s.Profile,
 		Width:          s.Width,
 		Height:         s.Height,
 		FPS:            parseFPS(s.RFrameRate, s.AvgFrameRate),

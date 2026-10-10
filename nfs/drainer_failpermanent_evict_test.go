@@ -40,6 +40,9 @@ func TestFailPermanentEvictsIndexEntry(t *testing.T) {
 	if err != nil || row == nil {
 		t.Fatalf("get row: %v", err)
 	}
+	if claimed, err := spool.Meta().MarkDraining(row.ID); err != nil || !claimed {
+		t.Fatalf("claim row before terminal worker failure: %v %v", claimed, err)
+	}
 
 	// Permanent failure: mark failed, release capacity, AND (FIX 3) evict the
 	// index entry.

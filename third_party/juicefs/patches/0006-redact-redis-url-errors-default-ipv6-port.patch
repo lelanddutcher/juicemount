@@ -1,0 +1,43 @@
+--- a/pkg/meta/redis.go
++++ b/pkg/meta/redis.go
+@@ -109,7 +109,13 @@
+ 	uri := driver + "://" + addr
+ 	u, err := url.Parse(uri)
+ 	if err != nil {
+-		return nil, fmt.Errorf("url parse %s: %s", uri, err)
++		return nil, fmt.Errorf("invalid Redis metadata URL")
++	}
++	// go-redis's missing-port fallback treats a bracketed IPv6 literal as
++	// part of the hostname. Normalize only the address, retaining JuiceFS's
++	// custom query options for the processing below.
++	if strings.HasPrefix(u.Host, "[") && u.Port() == "" {
++		u.Host = net.JoinHostPort(u.Hostname(), "6379")
+ 	}
+ 	values := u.Query()
+ 	query := queryMap{&values}
+@@ -128,7 +134,7 @@
+ 	hosts := u.Host
+ 	opt, err := redis.ParseURL(u.String())
+ 	if err != nil {
+-		return nil, fmt.Errorf("redis parse %s: %s", uri, err)
++		return nil, fmt.Errorf("redis URL has invalid options")
+ 	}
+ 	if opt.TLSConfig != nil {
+ 		opt.TLSConfig.ServerName = tlsServerName // use the host of each connection as ServerName
+--- a/pkg/object/redis.go
++++ b/pkg/object/redis.go
+@@ -184,12 +184,12 @@
+ func newRedis(uri, user, passwd, token string) (ObjectStorage, error) {
+ 	u, err := url.Parse(uri)
+ 	if err != nil {
+-		return nil, fmt.Errorf("url parse %s: %s", uri, err)
++		return nil, fmt.Errorf("invalid Redis object URL")
+ 	}
+ 	hosts := u.Host
+ 	opt, err := redis.ParseURL(u.String())
+ 	if err != nil {
+-		return nil, fmt.Errorf("redis parse %s: %s", uri, err)
++		return nil, fmt.Errorf("Redis object URL has invalid options")
+ 	}
+ 	if user != "" {
+ 		opt.Username = user

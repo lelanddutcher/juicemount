@@ -1,0 +1,35 @@
+# Rebuild ONLY the Go binary and layer it over the proven runtime image.
+# The full juicefarm image compiles whisper.cpp from source; nothing in this
+# change touches whisper, ffmpeg or juicefs, so re-running that would be a long
+# build with a large blast radius for a one-file Go fix.
+#
+# Build flags are copied verbatim from server/juicefarm/Dockerfile stage 1 —
+# static CGO in particular, because the juicedata/mount runtime ships an older
+# glibc than the bookworm builder and a dynamically-linked binary will not run.
+ARG BASE_IMAGE=juicefarm:stream-exclusion
+ARG JM_VERSION
+ARG JM_COMMIT
+FROM golang:1.26.6-bookworm AS gobuild
+ARG JM_VERSION
+ARG JM_COMMIT
+WORKDIR /src
+RUN apt-get update && apt-get install -y --no-install-recommends build-essential git \
+    && rm -rf /var/lib/apt/lists/*
+RUN test -n "$JM_VERSION" \
+    && echo "$JM_COMMIT" | grep -Eq '^[0-9a-f]{40}$'
+COPY go.mod go.sum ./
+# go.mod replaces juicefs with this vendored tree; module download needs it.
+COPY third_party/juicefs ./third_party/juicefs
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=1 GOOS=linux go build -tags sqlite_omit_load_extension \
+      -ldflags="-s -w -linkmode external -extldflags '-static' -X github.com/lelanddutcher/juicemount/internal/version.Version=${JM_VERSION} -X github.com/lelanddutcher/juicemount/internal/version.Commit=${JM_COMMIT}" \
+      -o /out/jmfarm ./cmd/jmfarm
+
+FROM ${BASE_IMAGE}
+ARG JM_VERSION
+ARG JM_COMMIT
+LABEL org.opencontainers.image.version="${JM_VERSION}" \
+      org.opencontainers.image.revision="${JM_COMMIT}"
+COPY --from=gobuild /out/jmfarm /usr/local/bin/jmfarm
+RUN test "$(/usr/local/bin/jmfarm --build-info)" = "jmfarm ${JM_VERSION} (${JM_COMMIT})"

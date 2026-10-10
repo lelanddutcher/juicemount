@@ -1,0 +1,507 @@
+package farmqueue
+
+import (
+	"encoding/json"
+	"reflect"
+	"strings"
+	"testing"
+)
+
+// TestQueueKeyFor pins the routing rule: single explicit kind → dedicated
+// queue; multi-kind / all / empty → catch-all.
+func TestQueueKeyFor(t *testing.T) {
+	cases := []struct {
+		kinds []string
+		want  string
+	}{
+		{[]string{"transcript"}, QueueKey + ":transcript"},
+		{[]string{"proxy"}, QueueKey + ":proxy"},
+		{[]string{"derivatives"}, QueueKey + ":derivatives"},
+		{[]string{"all"}, QueueKey},
+		{[]string{}, QueueKey},
+		{nil, QueueKey},
+		{[]string{"proxy", "transcript"}, QueueKey}, // multi-kind → catch-all
+		{[]string{"not-a-kind"}, QueueKey},
+		{[]string{"proxy"}, classQueue("proxy", QueueClassRender)},
+	}
+	for _, tc := range cases {
+		job := &Job{Kinds: tc.kinds}
+		if len(tc.kinds) == 1 && tc.kinds[0] == "proxy" && tc.want == classQueue("proxy", QueueClassRender) {
+			job.QueueClass = QueueClassRender
+		}
+		got := QueueKeyFor(job)
+		if got != tc.want {
+			t.Errorf("QueueKeyFor(%v) = %q, want %q", tc.kinds, got, tc.want)
+		}
+	}
+}
+
+func TestWorkerQueueKeysAreDisjointByRole(t *testing.T) {
+	server := WorkerQueueKeys(Worker{Role: QueueClassServer})
+	render := WorkerQueueKeys(Worker{
+		Role: QueueClassRender, Encoders: []string{"hevc_vaapi"}, Decoders: []string{"h264_vaapi", "hevc_vaapi"},
+		TranscriptBackends: []string{"cpu", "vulkan"},
+		Benchmarks:         WorkerBenchmarks{ProbedAt: nowISO(), EncodeFPS: 1, DecodeFPS: 1, TranscriptXReal: 1},
+	})
+	serverSet := map[string]bool{}
+	for _, key := range server {
+		serverSet[key] = true
+	}
+	for _, key := range render {
+		if serverSet[key] {
+			t.Fatalf("server/render both drain %q; accelerator jobs could race CPU", key)
+		}
+	}
+	if !serverSet[classQueue(KindDerivatives, QueueClassServer)] ||
+		!serverSet[classQueue(KindDerivatives, QueueClassCPU)] ||
+		!serverSet[classQueue(KindProxy, QueueClassServer)] ||
+		!serverSet[classQueue(KindTranscript, QueueClassServer)] ||
+		!serverSet[classQueue(KindProxy, QueueClassCPU)] || !serverSet[QueueKey] {
+		t.Fatalf("server queues = %v, want planning, CPU fallback, and legacy catch-all lanes", server)
+	}
+	wantServerOrder := []string{
+		TrackedQueuePrefix + QueueClassServer + ":" + KindDerivatives,
+		TrackedQueuePrefix + QueueClassServer + ":" + KindProxy,
+		TrackedQueuePrefix + QueueClassServer + ":" + KindTranscript,
+		TrackedQueuePrefix + QueueClassCPU + ":" + KindDerivatives,
+		TrackedQueuePrefix + QueueClassCPU + ":" + KindProxy,
+		TrackedQueuePrefix + QueueClassCPU + ":" + KindTranscript,
+		classQueue(KindDerivatives, QueueClassServer),
+		classQueue(KindProxy, QueueClassServer),
+		classQueue(KindTranscript, QueueClassServer),
+		classQueue(KindDerivatives, QueueClassCPU),
+		classQueue(KindProxy, QueueClassCPU),
+		classQueue(KindTranscript, QueueClassCPU),
+		QueueKey,
+	}
+	if len(server) != len(wantServerOrder) {
+		t.Fatalf("server queues = %v, want planning lanes before CPU lanes: %v", server, wantServerOrder)
+	}
+	for i := range wantServerOrder {
+		if server[i] != wantServerOrder[i] {
+			t.Fatalf("server queues = %v, want planning lanes before CPU lanes: %v", server, wantServerOrder)
+		}
+	}
+	if len(render) != 6 || render[0] != TrackedQueuePrefix+QueueClassRender+":"+KindDerivatives ||
+		render[1] != classQueue(KindDerivatives, QueueClassRender) ||
+		render[2] != TrackedQueuePrefix+QueueClassRender+":"+KindProxy ||
+		render[3] != classQueue(KindProxy, QueueClassRender) ||
+		render[4] != TrackedQueuePrefix+QueueClassRender+":"+KindTranscript ||
+		render[5] != classQueue(KindTranscript, QueueClassRender) {
+		t.Fatalf("render queues = %v", render)
+	}
+	for _, key := range WorkerQueueKeys(Worker{Kinds: []string{KindAll}}) {
+		if strings.HasPrefix(key, TrackedQueuePrefix) {
+			t.Fatalf("legacy worker can claim tracked lane %q", key)
+		}
+	}
+}
+
+func TestInitialCompositeKindsRouteThroughServerPlanner(t *testing.T) {
+	for _, kind := range []string{KindDerivatives, KindProxy, KindTranscript} {
+		job := Job{ID: "parent", Path: "/jfs/library", Kinds: []string{kind}}
+		(&Client{}).RouteInitialJob(t.Context(), &job)
+		if !job.PlanOnly || job.QueueClass != QueueClassServer || job.SelectedBackend != "server-dispatch" {
+			t.Fatalf("initial %s route = %+v, want server planner", kind, job)
+		}
+		if !WorkerSupports(Worker{Role: QueueClassServer}, job.RequiredCapabilities) {
+			t.Fatalf("server cannot satisfy %s planner capabilities %v", kind, job.RequiredCapabilities)
+		}
+	}
+	preview := Job{ID: "preview", Path: "/jfs/library", Kinds: []string{KindDerivatives}, DerivativePass: DerivativePassPreviews}
+	if shouldPlanOnServer(preview) {
+		t.Fatal("bounded derivative execution pass was routed back through the planner")
+	}
+
+	child := Job{ID: "child", Path: "/jfs/library", Kinds: []string{KindProxy}, ShardIndex: 1, ShardCount: 2}
+	if shouldPlanOnServer(child) {
+		t.Fatal("bounded execution child was routed back through the planner")
+	}
+	fallback := Job{ID: "fallback", Path: "/jfs/library", Kinds: []string{KindProxy}, RetryTargets: []string{"clip.mov"}}
+	if shouldPlanOnServer(fallback) {
+		t.Fatal("exact retry subset was routed back through the planner")
+	}
+}
+
+func TestPreviewDecoderSelectionUsesMeasuredDecodeAndCodec(t *testing.T) {
+	workers := []Worker{
+		{ID: "slow-h264", Role: QueueClassRender, Decoders: []string{"h264_vaapi"}, Benchmarks: WorkerBenchmarks{DecodeFPS: 90, AccessMBps: 500, ProbedAt: nowISO()}},
+		{ID: "fast-h264", Role: QueueClassRender, Decoders: []string{"h264_qsv"}, Benchmarks: WorkerBenchmarks{DecodeFPS: 240, AccessMBps: 500, ProbedAt: nowISO()}},
+		{ID: "hevc-only", Role: QueueClassRender, Decoders: []string{"hevc_vaapi"}, Benchmarks: WorkerBenchmarks{DecodeFPS: 500, AccessMBps: 500, ProbedAt: nowISO()}},
+	}
+	selected, decoder, ok := preferredHardwareDecoderWorkerWithLoad(workers, "h264", "", nil)
+	if !ok || selected.ID != "fast-h264" || decoder != "h264_qsv" {
+		t.Fatalf("H.264 decoder selection=%q/%q/%v", selected.ID, decoder, ok)
+	}
+	if _, _, ok := preferredHardwareDecoderWorkerWithLoad(workers, "prores", "", nil); ok {
+		t.Fatal("unverified ProRes decoder was admitted")
+	}
+}
+
+func TestPreviewDecoderSelectionRequiresMeasuredSourceProfile(t *testing.T) {
+	intel := Worker{
+		ID: "intel", Role: QueueClassRender, Decoders: []string{"h264_vaapi"},
+		Capabilities: []string{
+			"decoder:h264_vaapi:profile:main",
+			"decoder:h264_vaapi:profile:high",
+		},
+		Benchmarks: WorkerBenchmarks{DecodeFPS: 1, ProbedAt: nowISO()},
+	}
+	if _, _, ok := preferredHardwareDecoderWorkerWithLoad([]Worker{intel}, "h264", "Baseline", nil); ok {
+		t.Fatal("H.264 Baseline was admitted without a successful profile probe")
+	}
+	selected, decoder, ok := preferredHardwareDecoderWorkerWithLoad([]Worker{intel}, "h264", "Main", nil)
+	if !ok || selected.ID != intel.ID || decoder != "h264_vaapi" {
+		t.Fatalf("H.264 Main selection=%q/%q/%v, want measured Intel decoder", selected.ID, decoder, ok)
+	}
+
+	job := Job{
+		Kinds: []string{KindDerivatives}, DerivativePass: DerivativePassPreviews,
+		SourceVideoCodec: "h264", SourceVideoProfile: "Baseline",
+	}
+	routeJobWithWorkers(&job, []Worker{intel}, nil)
+	if job.QueueClass != QueueClassCPU || job.SelectedBackend != "cpu-decode" ||
+		!strings.Contains(job.RoutingReason, "profile baseline") {
+		t.Fatalf("Baseline route=%+v, want visible CPU fallback", job)
+	}
+}
+
+func TestProxySelectionRequiresVerifiedEndToEndHardwarePath(t *testing.T) {
+	mismatched := Worker{
+		ID: "mismatched", Name: "mismatched", Role: QueueClassRender,
+		Capabilities: []string{
+			"encoder:hevc_vaapi", "decoder:h264_qsv", "decoder:h264_qsv:profile:high",
+		},
+		Encoders: []string{"hevc_vaapi"}, Decoders: []string{"h264_qsv"},
+		Benchmarks: WorkerBenchmarks{EncodeFPS: 1, DecodeFPS: 1, ProbedAt: nowISO()},
+	}
+	job := Job{Kinds: []string{KindProxy}, SourceVideoCodec: "h264", SourceVideoProfile: "High"}
+	routeJobWithWorkers(&job, []Worker{mismatched}, nil)
+	if job.QueueClass != QueueClassCPU || job.SelectedBackend != "libx264" ||
+		!strings.Contains(job.RoutingReason, "decode+encode") {
+		t.Fatalf("mismatched-family route=%+v, want explicit CPU fallback", job)
+	}
+
+	verified := Worker{
+		ID: "verified", Name: "verified", Role: QueueClassRender,
+		Capabilities: []string{
+			"encoder:hevc_vaapi", "decoder:h264_vaapi", "decoder:h264_vaapi:profile:high",
+		},
+		Encoders: []string{"hevc_vaapi"}, Decoders: []string{"h264_vaapi"},
+		Benchmarks: WorkerBenchmarks{EncodeFPS: 1, DecodeFPS: 1, ProbedAt: nowISO()},
+	}
+	job = Job{Kinds: []string{KindProxy}, SourceVideoCodec: "h264", SourceVideoProfile: "High"}
+	routeJobWithWorkers(&job, []Worker{verified}, nil)
+	wantCaps := []string{
+		"encoder:hevc_vaapi", "decoder:h264_vaapi", "decoder:h264_vaapi:profile:high", "worker-name:verified",
+	}
+	if job.QueueClass != QueueClassRender || job.SelectedBackend != "hevc_vaapi" ||
+		!reflect.DeepEqual(job.RequiredCapabilities, wantCaps) {
+		t.Fatalf("verified route=%+v, want full path capabilities %v", job, wantCaps)
+	}
+}
+
+func TestMeasuredDecodeLimitRejectsOversizedSourceBeforeQueue(t *testing.T) {
+	worker := Worker{
+		ID: "intel", Name: "intel", Role: QueueClassRender,
+		Capabilities: []string{
+			"encoder:hevc_vaapi", "decoder:h264_vaapi", "decoder:h264_vaapi:profile:high",
+		},
+		Encoders: []string{"hevc_vaapi"}, Decoders: []string{"h264_vaapi"},
+		DecodeLimits: map[string]VideoDecodeLimit{
+			"h264_vaapi": {MaxWidth: 4096, MaxHeight: 4096},
+		},
+		Benchmarks: WorkerBenchmarks{EncodeFPS: 1, DecodeFPS: 1, ProbedAt: nowISO()},
+	}
+	if !WorkerSupportsDecodeSize(worker, "h264_vaapi", 4096, 2160) {
+		t.Fatal("verified 4096x2160 source was rejected")
+	}
+	if WorkerSupportsDecodeSize(worker, "h264_vaapi", 5760, 2880) {
+		t.Fatal("5760x2880 source exceeded measured decoder limit but was admitted")
+	}
+	job := Job{
+		Kinds: []string{KindProxy}, SourceVideoCodec: "h264", SourceVideoProfile: "High",
+		SourceVideoWidth: 5760, SourceVideoHeight: 2880,
+	}
+	routeJobWithWorkers(&job, []Worker{worker}, nil)
+	if job.QueueClass != QueueClassCPU || job.SelectedBackend != "libx264" {
+		t.Fatalf("oversized proxy route=%+v, want explicit CPU lane", job)
+	}
+	job = Job{
+		Kinds: []string{KindProxy}, SourceVideoCodec: "h264", SourceVideoProfile: "High",
+		SourceVideoWidth: 4096, SourceVideoHeight: 2160,
+	}
+	routeJobWithWorkers(&job, []Worker{worker}, nil)
+	if job.QueueClass != QueueClassRender || job.SelectedBackend != "hevc_vaapi" {
+		t.Fatalf("verified-size proxy route=%+v, want HEVC render lane", job)
+	}
+}
+
+func TestProxySelectionUsesMeasuredAV1AndRextDecodeCapabilities(t *testing.T) {
+	worker := Worker{
+		ID: "arc", Name: "arc", Role: QueueClassRender,
+		Capabilities: []string{
+			"encoder:hevc_vaapi",
+			"decoder:av1_vaapi", "decoder:av1_vaapi:profile:main", "decoder:av1_vaapi:pixfmt:yuv420p10le",
+			"decoder:hevc_vaapi", "decoder:hevc_vaapi:profile:rext", "decoder:hevc_vaapi:pixfmt:yuv422p10le",
+		},
+		Encoders: []string{"hevc_vaapi"}, Decoders: []string{"av1_vaapi", "hevc_vaapi"},
+		DecodeLimits: map[string]VideoDecodeLimit{
+			"av1_vaapi":  {MaxWidth: 7680, MaxHeight: 4320},
+			"hevc_vaapi": {MaxWidth: 7680, MaxHeight: 4320},
+		},
+		Benchmarks: WorkerBenchmarks{EncodeFPS: 1, DecodeFPS: 1, ProbedAt: nowISO()},
+	}
+	tests := []struct {
+		name, codec, profile, pixelFormat, decoder string
+		bitDepth, width, height                    int
+	}{
+		{name: "AV1 Main 10", codec: "av1", profile: "Main", pixelFormat: "yuv420p10le", decoder: "av1_vaapi", bitDepth: 10, width: 3840, height: 2160},
+		{name: "HEVC Rext 422", codec: "hevc", profile: "Rext", pixelFormat: "yuv422p10le", decoder: "hevc_vaapi", bitDepth: 10, width: 4096, height: 2160},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			job := Job{
+				Kinds: []string{KindProxy}, SourceVideoCodec: tc.codec, SourceVideoProfile: tc.profile,
+				SourcePixelFormat: tc.pixelFormat, SourceBitDepth: tc.bitDepth,
+				SourceVideoWidth: tc.width, SourceVideoHeight: tc.height,
+			}
+			routeJobWithWorkers(&job, []Worker{worker}, nil)
+			want := []string{
+				"encoder:hevc_vaapi", "decoder:" + tc.decoder,
+				"decoder:" + tc.decoder + ":profile:" + NormalizeVideoProfile(tc.codec, tc.profile),
+				DecoderPixelFormatRequirement(tc.decoder, tc.pixelFormat), "worker-name:arc",
+			}
+			if job.QueueClass != QueueClassRender || job.SelectedBackend != "hevc_vaapi" || !reflect.DeepEqual(job.RequiredCapabilities, want) {
+				t.Fatalf("route=%+v, want measured full path %v", job, want)
+			}
+		})
+	}
+}
+
+func TestNormalizeVideoProfile(t *testing.T) {
+	tests := map[string]string{
+		"Baseline": "baseline", "Constrained Baseline": "constrained_baseline", "Main": "main",
+		"High": "high", "High 10": "high", "Extended": "extended",
+	}
+	for input, want := range tests {
+		if got := NormalizeVideoProfile("h264", input); got != want {
+			t.Errorf("NormalizeVideoProfile(h264, %q)=%q, want %q", input, got, want)
+		}
+	}
+	if got := NormalizeVideoProfile("hevc", "Main 10"); got != "main10" {
+		t.Fatalf("NormalizeVideoProfile(hevc, Main 10)=%q", got)
+	}
+	if got := NormalizeVideoProfile("av1", "Profile 0"); got != "main" {
+		t.Fatalf("NormalizeVideoProfile(av1, Profile 0)=%q", got)
+	}
+	if got := NormalizePixelFormat(" YUV422P10LE "); got != "yuv422p10le" {
+		t.Fatalf("NormalizePixelFormat=%q", got)
+	}
+}
+
+func TestHardwarePreferenceIsHEVCThenObservedSpeed(t *testing.T) {
+	workers := []Worker{
+		{ID: "fast-h264", Role: QueueClassRender, Encoders: []string{"h264_nvenc"}, Benchmarks: WorkerBenchmarks{EncodeFPS: 400, ProbedAt: nowISO()}},
+		{ID: "hevc", Role: QueueClassRender, Encoders: []string{"hevc_vaapi"}, Benchmarks: WorkerBenchmarks{EncodeFPS: 120, ProbedAt: nowISO()}},
+	}
+	if got, ok := preferredHardwareEncoder(workers); !ok || got != "hevc_vaapi" {
+		t.Fatalf("preferred encoder = %q/%v, want HEVC hardware", got, ok)
+	}
+	if selected, _, ok := preferredHardwareWorker(workers); !ok || selected.ID != "hevc" {
+		t.Fatalf("selected worker = %q/%v, want HEVC worker", selected.ID, ok)
+	}
+	workers = []Worker{
+		{ID: "server", Role: QueueClassServer, Encoders: []string{"hevc_vaapi"}},
+		{ID: "render", Role: QueueClassRender, Encoders: []string{"h264_qsv"}, Benchmarks: WorkerBenchmarks{EncodeFPS: 1, ProbedAt: nowISO()}},
+	}
+	if got, ok := preferredHardwareEncoder(workers); !ok || got != "h264_qsv" {
+		t.Fatalf("preferred encoder = %q/%v, want eligible render encoder", got, ok)
+	}
+	workers = []Worker{
+		{ID: "slow", Role: QueueClassRender, Encoders: []string{"hevc_vaapi"}, Benchmarks: WorkerBenchmarks{EncodeFPS: 80, ProbedAt: nowISO()}},
+		{ID: "fast", Role: QueueClassRender, Encoders: []string{"hevc_qsv"}, Benchmarks: WorkerBenchmarks{EncodeFPS: 220, ProbedAt: nowISO()}},
+	}
+	if selected, _, ok := preferredHardwareWorker(workers); !ok || selected.ID != "fast" {
+		t.Fatalf("same-codec selection = %q/%v, want fastest observed worker", selected.ID, ok)
+	}
+}
+
+func TestHardwarePreferenceBalancesMeasuredQueueWithinCodecFamily(t *testing.T) {
+	workers := []Worker{
+		{ID: "busy-fast", Role: QueueClassRender, CurrentJob: "running", Encoders: []string{"hevc_qsv"},
+			Benchmarks: WorkerBenchmarks{EncodeFPS: 300, DecodeFPS: 300, AccessMBps: 500, ProbedAt: nowISO()}},
+		{ID: "idle-balanced", Role: QueueClassRender, Encoders: []string{"hevc_vaapi"},
+			Benchmarks: WorkerBenchmarks{EncodeFPS: 180, DecodeFPS: 180, AccessMBps: 500, ProbedAt: nowISO()}},
+	}
+	selected, _, ok := preferredHardwareWorkerWithLoad(workers, map[string]int{"busy-fast": 3})
+	if !ok || selected.ID != "idle-balanced" {
+		t.Fatalf("load-aware selection = %q/%v, want idle-balanced", selected.ID, ok)
+	}
+
+	// HEVC preference is an invariant, not a soft score: even a heavily loaded
+	// HEVC node remains the target while it is healthy; H.264 is only the next
+	// hardware family when no verified HEVC encoder is online.
+	workers = []Worker{
+		{ID: "busy-hevc", Role: QueueClassRender, CurrentJob: "running", Encoders: []string{"hevc_vaapi"},
+			Benchmarks: WorkerBenchmarks{EncodeFPS: 100, DecodeFPS: 100, AccessMBps: 100, ProbedAt: nowISO()}},
+		{ID: "idle-h264", Role: QueueClassRender, Encoders: []string{"h264_nvenc"},
+			Benchmarks: WorkerBenchmarks{EncodeFPS: 500, DecodeFPS: 500, AccessMBps: 1000, ProbedAt: nowISO()}},
+	}
+	selected, encoder, ok := preferredHardwareWorkerWithLoad(workers, map[string]int{"busy-hevc": 20})
+	if !ok || selected.ID != "busy-hevc" || encoder != "hevc_vaapi" {
+		t.Fatalf("codec priority selection = %q/%q/%v, want busy-hevc/hevc_vaapi", selected.ID, encoder, ok)
+	}
+}
+
+func TestVideoCostUsesDecodeAndMountMeasurements(t *testing.T) {
+	encodeOnlyFast := Worker{ID: "decode-bound", Role: QueueClassRender, Encoders: []string{"hevc_vaapi"},
+		Benchmarks: WorkerBenchmarks{EncodeFPS: 500, DecodeFPS: 40, AccessMBps: 80, ProbedAt: nowISO()}}
+	balanced := Worker{ID: "balanced", Role: QueueClassRender, Encoders: []string{"hevc_qsv"},
+		Benchmarks: WorkerBenchmarks{EncodeFPS: 180, DecodeFPS: 180, AccessMBps: 500, ProbedAt: nowISO()}}
+	selected, _, ok := preferredHardwareWorkerWithLoad([]Worker{encodeOnlyFast, balanced}, nil)
+	if !ok || selected.ID != "balanced" {
+		t.Fatalf("measured pipeline selection = %q/%v, want balanced", selected.ID, ok)
+	}
+}
+
+func TestVideoCostPenalizesObservedFailures(t *testing.T) {
+	reliable := Worker{ID: "reliable", Role: QueueClassRender, Encoders: []string{"hevc_vaapi"},
+		Benchmarks: WorkerBenchmarks{EncodeFPS: 200, DecodeFPS: 200, AccessMBps: 500,
+			ProxyFilesProcessed: 20, ProbedAt: nowISO()}}
+	flaky := Worker{ID: "flaky", Role: QueueClassRender, Encoders: []string{"hevc_qsv"},
+		Benchmarks: WorkerBenchmarks{EncodeFPS: 220, DecodeFPS: 220, AccessMBps: 500,
+			ProxyFilesProcessed: 15, ProxyFilesFailed: 5, ProbedAt: nowISO()}}
+	selected, _, ok := preferredHardwareWorkerWithLoad([]Worker{flaky, reliable}, nil)
+	if !ok || selected.ID != reliable.ID {
+		t.Fatalf("reliability-aware selection = %q/%v, want reliable", selected.ID, ok)
+	}
+}
+
+func TestTranscriptPreferenceUsesObservedSpeed(t *testing.T) {
+	workers := []Worker{
+		{ID: "slow", Role: QueueClassRender, TranscriptBackends: []string{"cpu", "vulkan"}, Benchmarks: WorkerBenchmarks{TranscriptXReal: 2, ProbedAt: nowISO()}},
+		{ID: "fast", Role: QueueClassRender, TranscriptBackends: []string{"cpu", "cuda"}, Benchmarks: WorkerBenchmarks{TranscriptXReal: 7, ProbedAt: nowISO()}},
+	}
+	selected, backend, ok := preferredTranscriptWorker(workers)
+	if !ok || selected.ID != "fast" || backend != "cuda" {
+		t.Fatalf("selected transcript worker/backend = %q/%q/%v", selected.ID, backend, ok)
+	}
+}
+
+func TestTranscriptPreferenceBalancesQueuedWork(t *testing.T) {
+	workers := []Worker{
+		{ID: "busy", Role: QueueClassRender, TranscriptBackends: []string{"cuda"},
+			Benchmarks: WorkerBenchmarks{TranscriptXReal: 8, AccessMBps: 500, ProbedAt: nowISO()}},
+		{ID: "idle", Role: QueueClassRender, TranscriptBackends: []string{"vulkan"},
+			Benchmarks: WorkerBenchmarks{TranscriptXReal: 4, AccessMBps: 500, ProbedAt: nowISO()}},
+	}
+	selected, backend, ok := preferredTranscriptWorkerWithLoad(workers, map[string]int{"busy": 4})
+	if !ok || selected.ID != "idle" || backend != "vulkan" {
+		t.Fatalf("load-aware transcript selection = %q/%q/%v, want idle/vulkan", selected.ID, backend, ok)
+	}
+}
+
+func TestQueueKeysForKinds(t *testing.T) {
+	cases := []struct {
+		name  string
+		kinds []string
+		want  []string
+	}{
+		{
+			name:  "specific kinds",
+			kinds: []string{KindTranscript, KindProxy, KindTranscript},
+			want:  []string{QueueKey + ":transcript", QueueKey + ":proxy", QueueKey},
+		},
+		{
+			name:  "all expands to every dedicated queue",
+			kinds: []string{KindAll},
+			want:  []string{QueueKey + ":derivatives", QueueKey + ":proxy", QueueKey + ":transcript", QueueKey},
+		},
+		{
+			name:  "empty defaults to generic worker",
+			kinds: nil,
+			want:  []string{QueueKey + ":derivatives", QueueKey + ":proxy", QueueKey + ":transcript", QueueKey},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := QueueKeysForKinds(tc.kinds)
+			if len(got) != len(tc.want) {
+				t.Fatalf("keys = %v, want %v", got, tc.want)
+			}
+			for i := range tc.want {
+				if got[i] != tc.want[i] {
+					t.Errorf("keys[%d] = %q, want %q", i, got[i], tc.want[i])
+				}
+			}
+		})
+	}
+}
+
+// TestFarmConfigRoundTrip ensures the config doc marshals/unmarshals cleanly
+// and that unknown fields on the wire don't break decoding (forward compat).
+func TestFarmConfigRoundTrip(t *testing.T) {
+	in := FarmConfig{
+		Revision: 7,
+		Defaults: map[string]any{"crf": float64(21), "preset": "slow"},
+		Overrides: map[string]map[string]any{
+			"b70-gpu": {"transcript_device": "vulkan", "model": "whisper.cpp/large-v3"},
+		},
+	}
+	raw, err := json.Marshal(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Simulate an older/newer manager adding a field we don't know about.
+	poked := append([]byte(nil), raw...)
+	poked = append(poked[:len(poked)-1], []byte(`,"future_field":{"x":1}}`)...)
+	var out FarmConfig
+	if err := json.Unmarshal(poked, &out); err != nil {
+		t.Fatalf("decode with unknown field: %v", err)
+	}
+	if out.Revision != 7 {
+		t.Errorf("revision = %d, want 7", out.Revision)
+	}
+	patch := out.Overrides["b70-gpu"]
+	if patch == nil || patch["transcript_device"] != "vulkan" {
+		t.Errorf("override patch lost: %#v", patch)
+	}
+}
+
+// TestWorkerHeartbeatAdditiveFields verifies the enriched heartbeat still
+// decodes with an OLD reader's struct (unknown fields ignored).
+type oldWorker struct {
+	ID         string `json:"id"`
+	StartedAt  string `json:"started_at"`
+	LastSeen   string `json:"last_seen"`
+	CurrentJob string `json:"current_job,omitempty"`
+}
+
+func TestWorkerHeartbeatAdditiveFields(t *testing.T) {
+	w := Worker{
+		ID:             "w1",
+		BuildVersion:   "0.5.0",
+		BuildCommit:    "0123456789abcdef",
+		Name:           "b70-gpu",
+		ConfigRevision: 3,
+		PendingRestart: []string{"nice"},
+		Capabilities:   []string{"vulkan", "vaapi"},
+		Effective:      map[string]string{"crf": "21"},
+	}
+	raw, _ := json.Marshal(w)
+	var legacy oldWorker
+	if err := json.Unmarshal(raw, &legacy); err != nil {
+		t.Fatal(err)
+	}
+	if legacy.ID != "w1" {
+		t.Errorf("legacy decode lost id")
+	}
+	var current Worker
+	if err := json.Unmarshal(raw, &current); err != nil {
+		t.Fatal(err)
+	}
+	if current.BuildVersion != "0.5.0" || current.BuildCommit != "0123456789abcdef" {
+		t.Fatalf("build provenance lost: version=%q commit=%q", current.BuildVersion, current.BuildCommit)
+	}
+}

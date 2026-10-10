@@ -10,36 +10,60 @@ import (
 	"time"
 
 	"github.com/lelanddutcher/juicemount/cache"
+	"github.com/lelanddutcher/juicemount/internal/redisurl"
 	"github.com/lelanddutcher/juicemount/metadata"
 	"github.com/redis/go-redis/v9"
 )
 
 func setupReadTestServer(t *testing.T) (*Server, *metadata.Store) {
 	t.Helper()
+	requireMountedTest(t)
+	requireLiveTestVolume(t)
+	cacheDir := os.Getenv("JM_TEST_CACHE_DIR")
+	if cacheDir != "" {
+		if !filepath.IsAbs(cacheDir) || filepath.Clean(cacheDir) != cacheDir {
+			t.Fatalf("JM_TEST_CACHE_DIR must be an absolute clean path: %q", cacheDir)
+		}
+		info, err := os.Stat(cacheDir)
+		if err != nil || !info.IsDir() {
+			t.Fatalf("JM_TEST_CACHE_DIR is not an accessible directory: %v", err)
+		}
+	}
 
 	store, err := metadata.Open(filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
 		t.Fatalf("Open store: %v", err)
 	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Errorf("close test metadata store: %v", err)
+		}
+	})
+	initServerTestSpoolSchema(t, store)
 
 	rc, err := metadata.NewRedisClient(testRedisURL, store)
 	if err != nil {
-		t.Skipf("Redis not reachable: %v", err)
+		t.Fatalf("configured JM_TEST_VOLUME_REDIS unreachable: %v", err)
 	}
+	t.Cleanup(func() { rc.Stop() })
 	if err := rc.SyncOnce(); err != nil {
 		t.Fatalf("SyncOnce: %v", err)
 	}
 
-	// Set up cache reader
-	cacheDir := cache.DetectCacheDir()
-	rdb := redis.NewClient(&redis.Options{
-		Addr: "127.0.0.1:6379",
-		DB:   1,
-	})
-	t.Cleanup(func() { rdb.Close() })
-
 	var cr *cache.Reader
 	if cacheDir != "" {
+		opts, err := redisurl.Parse(testRedisURL)
+		if err != nil {
+			t.Fatalf("invalid JM_TEST_VOLUME_REDIS for cache reader: %v", err)
+		}
+		rdb := redis.NewClient(opts)
+		t.Cleanup(func() {
+			if cr == nil {
+				if err := rdb.Close(); err != nil {
+					t.Errorf("close test cache Redis client: %v", err)
+				}
+			}
+		})
 		cr = cache.NewReader(cacheDir, cache.DefaultBlockSize, rdb)
 		t.Cleanup(func() { cr.Stop() })
 		t.Logf("Cache reader enabled at %s", cacheDir)
@@ -50,28 +74,27 @@ func setupReadTestServer(t *testing.T) (*Server, *metadata.Store) {
 		FUSEPath:   testFUSEPath,
 	}, store)
 
-	if err := srv.Start(); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-
-	// Attach cache reader to handler
 	if cr != nil {
 		srv.handler.SetCacheReader(cr)
 	}
-
-	rc.Stop()
 	t.Cleanup(func() {
-		srv.handler.StopHandler()
-		srv.Stop()
-		store.Close()
+		if err := srv.Stop(); err != nil {
+			t.Errorf("stop test NFS listener: %v", err)
+		}
+		if !srv.handler.StopHandler() {
+			t.Error("test NFS handler did not settle")
+		}
 	})
+	if err := srv.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
 
 	return srv, store
 }
 
 func TestNFSReadFile(t *testing.T) {
 	srv, store := setupReadTestServer(t)
-	mountPoint := mountNFS(t, srv.Addr())
+	mountPoint := mountNFS(t, srv)
 
 	// Find a small file to read (skip ._* files — they're fast-rejected by the NFS handler)
 	isReadable := func(e *metadata.Entry) bool {
@@ -147,7 +170,7 @@ func TestNFSReadFile(t *testing.T) {
 
 func TestNFSReadLargeFile(t *testing.T) {
 	srv, store := setupReadTestServer(t)
-	mountPoint := mountNFS(t, srv.Addr())
+	mountPoint := mountNFS(t, srv)
 
 	// Find a larger file (>1MB, skip ._* files)
 	var testFile *metadata.Entry
@@ -213,7 +236,7 @@ func TestNFSReadLargeFile(t *testing.T) {
 
 func TestNFSFDPoolStats(t *testing.T) {
 	srv, _ := setupReadTestServer(t)
-	mountPoint := mountNFS(t, srv.Addr())
+	mountPoint := mountNFS(t, srv)
 
 	// Read a few files to populate the fd pool
 	entries, _ := os.ReadDir(mountPoint)

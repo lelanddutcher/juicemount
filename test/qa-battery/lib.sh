@@ -36,13 +36,21 @@
 # ---------------------------------------------------------------------------
 # Env defaults (override by exporting before sourcing)
 
-: "${MOUNT:=/Volumes/zpool}"
-# If the literal default isn't an active NFS mount, fall back to autodetecting
-# the first 127.0.0.1:/ NFS mount (matches the sibling suite's behavior so the
-# battery runs against whatever mount JuiceMount actually brought up).
-if ! mount | awk -v m="$MOUNT" '$0 ~ " "m" " && /nfs/ {f=1} END{exit !f}'; then
-    _auto="$(mount | awk '$1 == "127.0.0.1:/" && $3 != "" && /nfs/ {print $3; exit}')"
-    [ -n "$_auto" ] && MOUNT="$_auto"
+# An explicit mount is an identity choice, even when another NFS mount is
+# available. In particular, never redirect an explicit /Volumes/zpool run to
+# a foreign mount. Empty-but-explicit is invalid rather than autodetectable.
+if [ "${MOUNT+x}" = x ]; then
+    if [ -z "$MOUNT" ]; then
+        printf 'qa-battery: explicit MOUNT is empty; refusing autodetection\n' >&2
+        exit 2
+    fi
+else
+    MOUNT=/Volumes/zpool
+    # Autodetect only when no mount was supplied by the caller.
+    if ! mount | awk -v m="$MOUNT" '$0 ~ " "m" " && /nfs/ {f=1} END{exit !f}'; then
+        _auto="$(mount | awk '$1 == "127.0.0.1:/" && $3 != "" && /nfs/ {print $3; exit}')"
+        [ -n "$_auto" ] && MOUNT="$_auto"
+    fi
 fi
 export MOUNT
 
@@ -62,13 +70,16 @@ export QA_ARTIFACTS="${QA_ARTIFACTS:-/tmp/jm-battery-artifacts/$(date +%Y%m%d-%H
 
 mkdir -p "$QA_STAGE" "$QA_ARTIFACTS" 2>/dev/null
 
-# Snappiness budget: a cached dir listing served from the local metadata DB
-# must return in under this many ms (principle #4 — user must NEVER see the
-# Finder spinner). 200ms hard ceiling.
+# Snappiness budget: the p99 of cached directory/stat calls served from the
+# local metadata DB must return in under this many ms. A separate catastrophic
+# single-sample ceiling catches genuine multi-second stalls without making one
+# scheduler preemption among hundreds of probes a false release blocker.
 : "${QA_SNAPPY_MS:=200}"
+: "${QA_HARD_STALL_MS:=1000}"
 
 # Drain wait default ceiling (seconds).
 : "${QA_DRAIN_TIMEOUT:=300}"
+: "${QA_CLEANUP_WORKERS:=16}"
 
 # ---------------------------------------------------------------------------
 # Reporting + counters
@@ -195,7 +206,7 @@ qa_stage_file() {
     md5 -q "$path" 2>/dev/null
 }
 
-QA_POOL="/tmp/jm-battery-pool-64MiB"
+QA_POOL="${QA_POOL:-$QA_STAGE/jm-battery-pool-64MiB}"
 QA_POOL_BYTES=67108864
 _qa_ensure_pool() {
     if [ ! -f "$QA_POOL" ] || [ "$(stat -f%z "$QA_POOL" 2>/dev/null || echo 0)" -lt "$QA_POOL_BYTES" ]; then
@@ -463,7 +474,7 @@ qa_spool_pending() {
 }
 
 # qa_spool_field FIELD — echo any integer field from GET /spool (e.g. in_progress,
-# failed, quarantined, succeeded). -1 on error/missing.
+# failed_files, quarantined, succeeded). -1 on error/missing.
 qa_spool_field() {
     local field="$1" body
     body="$(qa_timeout 5 curl -s "$CP_BASE/spool" 2>/dev/null)"
@@ -473,40 +484,50 @@ qa_spool_field() {
         | awk -F: -v f="\"$field\"" '$0 ~ f {gsub(/[^0-9-]/,"",$2); print $2; found=1} END{if(!found) print -1}'
 }
 
-# qa_spool_pending_bytes — echo the total bytes still in flight (pending_bytes +
-# in_progress) from GET /spool, used to scale the drain timeout to the real
+# qa_spool_actionable_failed — current rows that genuinely require operator or
+# retry action. Do NOT gate on `.failed`: that field is the process-lifetime
+# cumulative DrainsFailed metric and remains non-zero after an old failure has
+# been retried, cleared, or classified as a deliberate policy decline.
+qa_spool_actionable_failed() {
+    qa_spool_field failed_files
+}
+
+# qa_spool_pending_bytes — echo the total bytes still in flight (pending_bytes)
+# from GET /spool, used to scale the drain timeout to the real
 # payload. Echoes 0 when the field is absent or the control plane is unreachable
 # (callers then fall back to the static $QA_DRAIN_TIMEOUT / $QA_DRAIN_MIN floor).
 qa_spool_pending_bytes() {
-    local pb ip total
+    local pb
     pb="$(qa_spool_field pending_bytes)"
-    ip="$(qa_spool_field in_progress)"
     case "$pb" in ''|*[!0-9-]*) pb=0 ;; esac
-    case "$ip" in ''|*[!0-9-]*) ip=0 ;; esac
     [ "$pb" -lt 0 ] 2>/dev/null && pb=0
-    [ "$ip" -lt 0 ] 2>/dev/null && ip=0
-    total=$(( pb + ip ))
-    printf '%s' "$total"
+    printf '%s' "$pb"
 }
 
-# qa_drain_ceiling PAYLOAD_BYTES
+# qa_drain_ceiling PAYLOAD_BYTES [PAYLOAD_FILES]
 #   Echo a payload-SCALED drain ceiling (seconds) for a known in-flight payload.
 #   A multi-GB Finder copy drains single-threaded at a conservatively-assumed
 #   floor of ~5 MB/s to the backend (proven: 2.3GB drains in ~5min ≈ 7.8MB/s, so
 #   5MB/s is a safe under-estimate that never cuts a real drain short). We derive
-#   ceil(bytes / 5MiB), clamp to a generous [min,max] band, and round so a tree
-#   that's still legitimately draining is never timed out. Callers that know how
-#   many bytes they staged pass that total here and feed the result to
-#   qa_wait_drain instead of a hand-picked short timeout.
+#   BOTH ceil(bytes / 5MiB) and ceil(files / 5 files/s), take the larger, then
+#   clamp to a generous [min,max] band. The file floor matters for tiny-file
+#   trees: each object has backend create/mtime/metadata costs even when its byte
+#   count is negligible, and a 10,000-entry Finder corpus legitimately takes far
+#   longer than the old bytes-only 600s minimum.
 #     floor:  $QA_DRAIN_MIN  (default 600s)   — never wait LESS than this
 #     cap:    $QA_DRAIN_MAX  (default 3600s)  — never wait MORE than this
 : "${QA_DRAIN_FLOOR_BPS:=5242880}"   # 5 MiB/s assumed drain floor
+: "${QA_DRAIN_FLOOR_FILES_PER_SEC:=5}"
 : "${QA_DRAIN_MIN:=600}"
 : "${QA_DRAIN_MAX:=3600}"
 qa_drain_ceiling() {
-    local bytes="${1:-0}" secs
+    local bytes="${1:-0}" files="${2:-0}" byte_secs file_secs secs
     case "$bytes" in ''|*[!0-9]*) bytes=0 ;; esac
-    secs=$(( (bytes + QA_DRAIN_FLOOR_BPS - 1) / QA_DRAIN_FLOOR_BPS ))
+    case "$files" in ''|*[!0-9]*) files=0 ;; esac
+    byte_secs=$(( (bytes + QA_DRAIN_FLOOR_BPS - 1) / QA_DRAIN_FLOOR_BPS ))
+    file_secs=$(( (files + QA_DRAIN_FLOOR_FILES_PER_SEC - 1) / QA_DRAIN_FLOOR_FILES_PER_SEC ))
+    secs="$byte_secs"
+    [ "$file_secs" -gt "$secs" ] && secs="$file_secs"
     [ "$secs" -lt "$QA_DRAIN_MIN" ] && secs="$QA_DRAIN_MIN"
     [ "$secs" -gt "$QA_DRAIN_MAX" ] && secs="$QA_DRAIN_MAX"
     printf '%s' "$secs"
@@ -531,9 +552,16 @@ qa_wait_drain() {
     if [ -n "${1:-}" ]; then
         timeout="$1"
     else
-        local pb; pb="$(qa_spool_pending_bytes)"
-        if [ "$pb" -gt 0 ] 2>/dev/null; then
-            timeout="$(qa_drain_ceiling "$pb")"
+        local pb pf; pb="$(qa_spool_pending_bytes)"
+        p="$(qa_spool_pending)"
+        ip="$(qa_spool_field in_progress)"
+        case "$p" in ''|*[!0-9-]*) p=0 ;; esac
+        case "$ip" in ''|*[!0-9-]*) ip=0 ;; esac
+        [ "$p" -lt 0 ] 2>/dev/null && p=0
+        [ "$ip" -lt 0 ] 2>/dev/null && ip=0
+        pf=$(( p + ip ))
+        if [ "$pb" -gt 0 ] 2>/dev/null || [ "$pf" -gt 0 ] 2>/dev/null; then
+            timeout="$(qa_drain_ceiling "$pb" "$pf")"
         else
             timeout="$QA_DRAIN_TIMEOUT"
             [ "$timeout" -lt "$QA_DRAIN_MIN" ] 2>/dev/null && timeout="$QA_DRAIN_MIN"
@@ -553,7 +581,7 @@ qa_wait_drain() {
         perl -e 'select undef,undef,undef,2'
         waited=$((waited+2))
     done
-    qa_warn "qa_wait_drain TIMEOUT after ${timeout}s (pending=$(qa_spool_pending) in_progress=$(qa_spool_field in_progress) failed=$(qa_spool_field failed) quarantined=$(qa_spool_field quarantined))"
+    qa_warn "qa_wait_drain TIMEOUT after ${timeout}s (pending=$(qa_spool_pending) in_progress=$(qa_spool_field in_progress) failed_files=$(qa_spool_actionable_failed) quarantined=$(qa_spool_field quarantined))"
     return 1
 }
 
@@ -637,12 +665,73 @@ _qa_grep_count() {
     printf '%s' "$n"
 }
 
-# qa_log_mark — echo the current line count of the JuiceMount log. Capture this
-# BEFORE a test; pass it to qa_error_scan AFTER so only the test's own window is
-# scanned. Echoes 0 if the log doesn't exist yet.
+# _qa_file_inode FILE — portable inode lookup (macOS first, GNU fallback).
+_qa_file_inode() {
+    stat -f '%i' "$1" 2>/dev/null || stat -c '%i' "$1" 2>/dev/null
+}
+
+# qa_log_mark — echo INODE:LINE for the current JuiceMount log. Capture this
+# BEFORE a test; pass it to qa_error_scan/qa_log_window AFTER so only the test's
+# own window is scanned. The inode makes the mark survive lumberjack rotation;
+# a bare numeric legacy mark remains accepted by qa_log_window.
 qa_log_mark() {
-    [ -f "$JM_LOG" ] || { echo 0; return; }
-    wc -l < "$JM_LOG" | tr -d ' '
+    [ -f "$JM_LOG" ] || { echo "0:0"; return; }
+    local inode lines
+    inode="$(_qa_file_inode "$JM_LOG")"
+    lines="$(wc -l < "$JM_LOG" | tr -d ' ')"
+    echo "${inode:-0}:${lines:-0}"
+}
+
+# qa_log_window MARK OUT
+#   Materialize MARK..now in chronological order, including any numbered
+#   rotated logs. Returns 2 if the marked inode has already aged out; callers
+#   must fail closed because a zero-error assertion is then unknowable.
+qa_log_window() {
+    local mark="${1:-0:0}" out="$2"
+    local marked_inode marked_line current_inode candidate suffix matched_suffix i
+    case "$mark" in
+        *:*) marked_inode="${mark%%:*}"; marked_line="${mark#*:}" ;;
+        *)   marked_inode=""; marked_line="$mark" ;;
+    esac
+    case "$marked_line" in ''|*[!0-9]*) marked_line=0 ;; esac
+    : > "$out"
+
+    if [ ! -f "$JM_LOG" ]; then
+        [ "$marked_inode" = "0" ] && return 0
+        return 2
+    fi
+    current_inode="$(_qa_file_inode "$JM_LOG")"
+    [ -z "$marked_inode" ] && marked_inode="$current_inode"
+
+    if [ "$marked_inode" = "0" ]; then
+        cat "$JM_LOG" > "$out" 2>/dev/null
+        return 0
+    fi
+    if [ "$marked_inode" = "$current_inode" ]; then
+        tail -n +$(( marked_line + 1 )) "$JM_LOG" > "$out" 2>/dev/null
+        return 0
+    fi
+
+    matched_suffix=""
+    for candidate in "$JM_LOG".[0-9]*; do
+        [ -f "$candidate" ] || continue
+        suffix="${candidate#"$JM_LOG".}"
+        case "$suffix" in *[!0-9]*|'') continue ;; esac
+        if [ "$(_qa_file_inode "$candidate")" = "$marked_inode" ]; then
+            matched_suffix="$suffix"
+            break
+        fi
+    done
+    [ -n "$matched_suffix" ] || return 2
+
+    tail -n +$(( marked_line + 1 )) "$JM_LOG.$matched_suffix" > "$out" 2>/dev/null
+    i=$(( matched_suffix - 1 ))
+    while [ "$i" -ge 1 ]; do
+        [ -f "$JM_LOG.$i" ] || return 2
+        cat "$JM_LOG.$i" >> "$out" 2>/dev/null
+        i=$(( i - 1 ))
+    done
+    cat "$JM_LOG" >> "$out" 2>/dev/null
 }
 
 # qa_error_scan SINCE_LINE [LABEL]
@@ -651,7 +740,7 @@ qa_log_mark() {
 #     FromHandle STALE | purging phantom | 100070 | 100060 | -48 'already an item'
 #     | -36 | -5000 | "you don't have permission" | "Operation not permitted"
 #   Writes the matching lines to $QA_CAT_DIR/errscan-<LABEL>.txt and echoes a
-#   tally line:  "errscan STALE=<n> PHANTOM=<n> E100070=<n> E100060=<n> E48=<n> E36=<n> E5000=<n> PERM=<n>"
+#   tally line:  "errscan STALE=<n> PHANTOM=<n> E100070=<n> E100060=<n> E48=<n> E36=<n> E5000=<n> PERM=<n> LOGLOSS=<n>"
 #   Returns 0 if ALL counts are zero (clean), 1 otherwise.
 #
 #   KNOWN-OPEN EDGES (assert-on, drive to zero — do NOT mask): the caller may
@@ -662,13 +751,13 @@ qa_log_mark() {
 #   Every OTHER occurrence = qa_fail with the offending path named. Pull the
 #   path from the dumped errscan file (each STALE line logs path=...).
 qa_error_scan() {
-    local since="${1:-0}" label="${2:-scan}"
+    local since="${1:-0:0}" label="${2:-scan}"
     local out="$QA_CAT_DIR/errscan-${label}.txt"
-    [ -f "$JM_LOG" ] || { echo "errscan STALE=0 PHANTOM=0 E100070=0 E100060=0 E48=0 E36=0 E5000=0 PERM=0"; return 0; }
-    local total
-    total="$(wc -l < "$JM_LOG" | tr -d ' ')"
-    # Window = lines (since+1)..end. tail -n +K is 1-based.
-    tail -n +$(( since + 1 )) "$JM_LOG" > "$out.window" 2>/dev/null
+    local logloss=0
+    # Window = marked line+1 through the current log, crossing rotation(s).
+    if ! qa_log_window "$since" "$out.window"; then
+        logloss=1
+    fi
 
     local stale phantom e70 e60 e48 e36 e5000 perm
     stale=$(_qa_grep_count   "$out.window" ""   'FromHandle STALE')
@@ -678,16 +767,17 @@ qa_error_scan() {
     e48=$(_qa_grep_count     "$out.window" "-i" 'already an item' 'error -48' 'errAEItemAlreadyExists')
     e36=$(_qa_grep_count     "$out.window" ""   'error -36' 'ioErr')
     e5000=$(_qa_grep_count   "$out.window" ""   '-5000' 'afpAccessDenied')
-    perm=$(_qa_grep_count    "$out.window" "-i" "you don't have permission" 'Operation not permitted' 'permission denied')
+    perm=$(_qa_grep_count    "$out.window" "-i" "you don't have permission" 'Operation not permitted' 'permission denied' 'NFS3ERR_ACCES' 'media not available offline' 'refusing unsafe in-place write')
 
     # Keep only the matching lines in the artifact for path attribution.
-    grep -nE 'FromHandle STALE|purging phantom|100070|100060|already an item|error -48|error -36|ioErr|-5000|permission' \
+    grep -niE 'FromHandle STALE|purging phantom|100070|100060|already an item|error -48|error -36|ioErr|-5000|permission|NFS3ERR_ACCES|media not available offline|refusing unsafe in-place write' \
         "$out.window" > "$out" 2>/dev/null
     rm -f "$out.window" 2>/dev/null
 
-    echo "errscan STALE=$stale PHANTOM=$phantom E100070=$e70 E100060=$e60 E48=$e48 E36=$e36 E5000=$e5000 PERM=$perm"
+    echo "errscan STALE=$stale PHANTOM=$phantom E100070=$e70 E100060=$e60 E48=$e48 E36=$e36 E5000=$e5000 PERM=$perm LOGLOSS=$logloss"
     [ "$stale" -eq 0 ] && [ "$phantom" -eq 0 ] && [ "$e70" -eq 0 ] && [ "$e60" -eq 0 ] \
-        && [ "$e48" -eq 0 ] && [ "$e36" -eq 0 ] && [ "$e5000" -eq 0 ] && [ "$perm" -eq 0 ]
+        && [ "$e48" -eq 0 ] && [ "$e36" -eq 0 ] && [ "$e5000" -eq 0 ] && [ "$perm" -eq 0 ] \
+        && [ "$logloss" -eq 0 ]
 }
 
 # qa_finder_result_clean RESULT_STRING — inspect a captured Finder result/error
@@ -703,20 +793,48 @@ qa_finder_result_clean() {
 # ---------------------------------------------------------------------------
 # Snappiness gate (principle #4)
 
-# qa_dir_listing_ms PATH — time a single readdir (`ls -1f`) of PATH and echo the
-# elapsed wall time in integer milliseconds. `-f` disables sorting/stat so we
-# measure the readdir/LOOKUP path served from the local metadata DB, not a
-# stat-storm. A cached dir over the local DB must come back < $QA_SNAPPY_MS.
-# Echoes -1 if the listing itself failed (caller treats as FAIL, not slow).
+# qa_dir_listing_ms PATH — time one complete opendir/readdir/closedir traversal
+# and echo the elapsed wall time in integer milliseconds. The timer starts
+# INSIDE the same already-running Perl process that performs the syscalls. The
+# old t0-perl -> timeout-perl -> exec(ls) -> t1-perl chain accidentally included
+# three process-launch/scheduling gaps; under a hot Finder copy one such gap
+# could add ~500ms even when the NFS server's READDIR max was <20ms. This probe
+# deliberately does no sorting or per-entry stat, so it measures the directory
+# path served from the local metadata DB. Echoes -1 on failure/timeout.
 qa_dir_listing_ms() {
     local path="$1"
-    local t0 t1
-    t0=$(_qa_now_ms)
-    if ! qa_timeout 30 ls -1f "$path" >/dev/null 2>&1; then
+    local out rc
+    out="$(perl -MTime::HiRes=time -e '
+        $SIG{ALRM} = sub { exit 124 };
+        alarm 30;
+        my $path = shift;
+        my $t0 = time();
+        opendir(my $dh, $path) or exit 2;
+        1 while readdir($dh);
+        closedir($dh) or exit 3;
+        printf "%d", (time() - $t0) * 1000;
+    ' "$path" 2>/dev/null)"
+    rc=$?
+    if [ "$rc" -ne 0 ] || ! printf '%s' "$out" | grep -Eq '^[0-9]+$'; then
         echo -1; return
     fi
-    t1=$(_qa_now_ms)
-    echo $(( t1 - t0 ))
+    echo "$out"
+}
+
+# qa_pctile PCT — nearest-rank percentile of newline-delimited non-negative
+# integer samples read from stdin. Echoes -1 when no valid sample exists.
+qa_pctile() {
+    local pct="$1"
+    awk -v pct="$pct" '
+        /^[0-9]+$/ { a[n++]=$1 }
+        END {
+            if (n==0) { print -1; exit }
+            for (i=1;i<n;i++){ v=a[i]; j=i-1; while(j>=0 && a[j]>v){a[j+1]=a[j];j--}; a[j+1]=v }
+            rank = int((pct/100.0)*n + 0.999999)
+            if (rank < 1) rank = 1
+            if (rank > n) rank = n
+            print a[rank-1]
+        }'
 }
 
 # _qa_now_ms — current time in ms. perl gives sub-second precision (date +%N is
@@ -728,10 +846,10 @@ _qa_now_ms() {
 # ---------------------------------------------------------------------------
 # Offline / control plane
 
-# qa_offline on|off — POST/GET the offline toggle. Maps:
-#   on  → GET /offline?on=1   (force offline: writes buffer to spool, no drain)
-#   off → GET /offline?on=0   (back online: drainer resumes)
-# Echoes the JSON response; returns 0 if the call succeeded (HTTP body non-empty).
+# qa_offline on|off — POST the offline toggle. Maps:
+#   on  → POST /offline?on=1   (force offline: writes buffer to spool, no drain)
+#   off → POST /offline?on=0   (back online: drainer resumes)
+# Echoes the JSON response; transport or HTTP failures return nonzero.
 qa_offline() {
     local mode="$1" v body
     case "$mode" in
@@ -739,7 +857,7 @@ qa_offline() {
         off|0|false) v=0 ;;
         *) qa_fail "qa_offline: bad mode '$mode' (want on|off)"; return 2 ;;
     esac
-    body="$(qa_timeout 5 curl -s "$CP_BASE/offline?on=$v" 2>/dev/null)"
+    body="$(qa_timeout 5 curl -fsS -X POST -H 'X-JM-Control: 1' "$CP_BASE/offline?on=$v" 2>/dev/null)" || return 1
     printf '%s\n' "$body"
     [ -n "$body" ]
 }
@@ -797,11 +915,28 @@ qa_preflight() {
 # so a misconfigured QA_DEST_ROOT can never delete user data. Best-effort; never
 # fails the gate. Leaves $QA_ARTIFACTS (manifests/scans) for post-run review.
 qa_cleanup() {
+    [ "${QA_KEEP_DATA:-0}" = 1 ] && return 0
+    local dest
     case "$QA_DEST_ROOT" in
         "$MOUNT"/JM_RELEASE_BATTERY*)
             # Delete only the THIS-RUN tagged subdirs the scripts created; the
             # scripts name their dests QA_<epoch>_<pid>_* under QA_DEST_ROOT.
-            find "$QA_DEST_ROOT" -maxdepth 1 -type d -name "QA_*_$$_*" -prune -exec rm -rf {} + 2>/dev/null
+            # Finder trees contain thousands of independent NFS removals; a
+            # serial rm can take longer than the test. Delete only regular test
+            # files through a bounded worker pool, then remove directories
+            # deepest-first. Virtual AppleDouble views are intentionally not
+            # targeted as independent files.
+            find "$QA_DEST_ROOT" -maxdepth 1 -type d -name "QA_*_$$_*" -print 2>/dev/null \
+                | while IFS= read -r dest; do
+                    case "$dest" in
+                        "$QA_DEST_ROOT"/QA_*_$$_*)
+                            find "$dest" -type f ! -name '._*' -print0 2>/dev/null \
+                                | xargs -0 -P "$QA_CLEANUP_WORKERS" -n 8 sh -c \
+                                    'for target do find "$target" -maxdepth 0 -delete 2>/dev/null; done' sh
+                            find "$dest" -depth ! -name '._*' -type d -delete 2>/dev/null || true
+                            ;;
+                    esac
+                done
             ;;
         *)
             qa_warn "qa_cleanup: QA_DEST_ROOT '$QA_DEST_ROOT' outside guard — NOT removing"

@@ -15,16 +15,32 @@ import (
 // by the menu bar app + Manager UI. Exported so the Swift JSON decoder
 // can reference the same key names via tags here.
 type SpoolStatusResponse struct {
-	Enabled       bool   `json:"enabled"`
-	Error         string `json:"error,omitempty"`
-	PendingFiles  int    `json:"pending_files"`
-	PendingBytes  int64  `json:"pending_bytes"`
-	InProgress    int64  `json:"in_progress"`
-	Succeeded     int64  `json:"succeeded"`
-	Failed        int64  `json:"failed"`
-	Quarantined   int64  `json:"quarantined"`
-	CapacityUsed  int64  `json:"capacity_used"`
-	CapacityTotal int64  `json:"capacity_total"`
+	Enabled              bool   `json:"enabled"`
+	RecoveryEnabled      *bool  `json:"recovery_enabled,omitempty"`
+	Error                string `json:"error,omitempty"`
+	PendingFiles         int    `json:"pending_files"`
+	PendingSymlinks      int    `json:"pending_symlinks"`
+	PendingBytes         int64  `json:"pending_bytes"`
+	InProgress           int64  `json:"in_progress"`
+	Succeeded            int64  `json:"succeeded"`
+	Failed               int64  `json:"failed"`
+	Quarantined          int64  `json:"quarantined"`
+	ReplacementConflicts int    `json:"replacement_conflicts"`
+	ReplacementWaiting   int    `json:"replacement_waiting"`
+	// SidecarsSkipped counts ._ AppleDouble rows completed WITHOUT writing a
+	// backend file (the empty-sidecar elision, JM_DRAIN_SKIP_EMPTY_SIDECARS).
+	//
+	// Exposed because the elision was previously UNOBSERVABLE: the counter was
+	// incremented and never surfaced, so "is it firing at all, and how often?"
+	// could not be answered from outside the process. That cost a whole
+	// investigation on 2026-08-19 — sidecars kept appearing on the backend and
+	// the reasonable-sounding conclusion was that something re-created them.
+	// It had simply never fired: those sidecars carried a 286-byte resource
+	// fork, so the predicate correctly refused them. A counter you cannot read
+	// invites exactly that kind of confident wrong answer.
+	SidecarsSkipped int64 `json:"sidecars_skipped"`
+	CapacityUsed    int64 `json:"capacity_used"`
+	CapacityTotal   int64 `json:"capacity_total"`
 	// StalledFiles counts listed entries flagged Stalled (see
 	// SpoolEntryView.Stalled). FailedFiles counts the listed failed
 	// rows — i.e. failed rows still relevant to the user (recoverable
@@ -32,8 +48,15 @@ type SpoolStatusResponse struct {
 	// OldestPendingAgeSec is the age of the oldest writing/ready/
 	// draining row, so the UI can say "queued · 2h" without timestamp
 	// math. All three are LB-5 stuck-spool affordance signals.
-	StalledFiles        int   `json:"stalled_files"`
+	StalledFiles int `json:"stalled_files"`
+	// FailedFiles counts only rows that failed for a REASON WE SHOULD FIX.
+	// DeclinedFiles counts terminal rows that are a policy decision — today the
+	// derivative clobber guard preserving another producer's blob. Both are
+	// drain_state=failed underneath; splitting them is the whole point, because
+	// lumping them together made "the guard is working" look identical to "your
+	// uploads are broken" (measured: failed_files=111, every one a decline).
 	FailedFiles         int   `json:"failed_files"`
+	DeclinedFiles       int   `json:"declined_files"`
 	OldestPendingAgeSec int64 `json:"oldest_pending_age_sec"`
 	// SuspectZeroTail counts listed entries flagged suspect_zero_tail (#104):
 	// the entry finalized with unwritten hole(s) below its written size — the
@@ -58,12 +81,13 @@ type SpoolStatusResponse struct {
 
 // SpoolEntryView is a single row's worth of UI-facing state.
 type SpoolEntryView struct {
-	Path          string `json:"path"`
-	Size          int64  `json:"size"`
-	DrainState    string `json:"drain_state"`
-	DrainAttempts int    `json:"drain_attempts"`
-	LastError     string `json:"last_error,omitempty"`
-	UpdatedAtUnix int64  `json:"updated_at_unix"`
+	Path             string `json:"path"`
+	Size             int64  `json:"size"`
+	DrainState       string `json:"drain_state"`
+	DrainAttempts    int    `json:"drain_attempts"`
+	LastError        string `json:"last_error,omitempty"`
+	ReplacementState string `json:"replacement_state,omitempty"`
+	UpdatedAtUnix    int64  `json:"updated_at_unix"`
 	// AgeSec is now - updated_at, floored at 0.
 	AgeSec int64 `json:"age_sec"`
 	// Stalled means this entry is making no progress and won't without
@@ -112,9 +136,11 @@ const SpoolStatusFailedRetention = time.Hour
 // in that case so the UI can render a degraded view.
 func BuildSpoolStatus(spool *SpoolStore, drainer *Drainer) (SpoolStatusResponse, error) {
 	if spool == nil {
+		disabled := false
 		return SpoolStatusResponse{
-			Enabled: false,
-			Error:   "spool not enabled (set JM_SPOOL_ENABLE=1 to opt in)",
+			Enabled:         false,
+			RecoveryEnabled: &disabled,
+			Error:           "spool not enabled (set JM_SPOOL_ENABLE=1 to opt in)",
 			// Non-nil empty slice so the JSON is `"entries": []`, never null.
 			// A nil Go slice marshals to JSON null, which makes Swift's
 			// synthesized Codable throw valueNotFound and abort the whole
@@ -128,6 +154,10 @@ func BuildSpoolStatus(spool *SpoolStore, drainer *Drainer) (SpoolStatusResponse,
 	// error returns below (pending-stats / list failures) emit `"entries": []`
 	// rather than null — same roots:null decode-abort guard as the branch above.
 	resp := SpoolStatusResponse{Enabled: true, Entries: []SpoolEntryView{}}
+	if drainer != nil && drainer.replacementDispatch != nil && drainer.replacementDispatch.resume != nil {
+		enabled := drainer.replacementDispatch.enabled
+		resp.RecoveryEnabled = &enabled
+	}
 
 	pendingFiles, pendingBytes, err := spool.Meta().PendingStats()
 	if err != nil {
@@ -136,6 +166,12 @@ func BuildSpoolStatus(spool *SpoolStore, drainer *Drainer) (SpoolStatusResponse,
 	}
 	resp.PendingFiles = pendingFiles
 	resp.PendingBytes = pendingBytes
+	links, err := spool.Meta().CountPendingSymlinks()
+	if err != nil {
+		resp.Error = "pending symlinks: " + err.Error()
+		return resp, err
+	}
+	resp.PendingSymlinks = links
 
 	used, total := spool.Capacity()
 	resp.CapacityUsed = used
@@ -158,6 +194,16 @@ func BuildSpoolStatus(spool *SpoolStore, drainer *Drainer) (SpoolStatusResponse,
 	if listErr != nil {
 		resp.Error = "list entries: " + listErr.Error()
 		// Continue — counters above are still useful for the UI.
+	}
+	dispositions, dispositionErr := spool.Meta().ReplacementDispositionsForStatus(rows)
+	if dispositionErr != nil {
+		resp.Error = "replacement dispositions: " + dispositionErr.Error()
+		return resp, dispositionErr
+	}
+	publications, publicationErr := spool.Meta().ReplacementPublicationsForStatus(rows)
+	if publicationErr != nil {
+		resp.Error = "replacement status: " + publicationErr.Error()
+		return resp, publicationErr
 	}
 
 	// maxAttempts mirrors the drainer's retry ceiling for the
@@ -204,6 +250,35 @@ func BuildSpoolStatus(spool *SpoolStore, drainer *Drainer) (SpoolStatusResponse,
 			SuspectZeroTail:       r.SuspectZeroTail != "",
 			SuspectZeroTailDetail: r.SuspectZeroTail,
 		}
+		if disposition := dispositions[r.ID]; disposition != nil {
+			v.ReplacementState = disposition.State
+			switch disposition.State {
+			case metadata.ReplacementWaitingWriter:
+				resp.ReplacementWaiting++
+			case metadata.ReplacementWriterChanged:
+				resp.ReplacementConflicts++
+			}
+		}
+		if p, ok := publications[r.ID]; ok {
+			switch p.Phase {
+			case metadata.ReplacementPublicationCommitted, metadata.ReplacementPublicationSettled, metadata.ReplacementPublicationCleaning:
+				v.ReplacementState = "finishing"
+			case metadata.ReplacementPublicationQueued, metadata.ReplacementPublicationIntent,
+				metadata.ReplacementPublicationArming, metadata.ReplacementPublicationArmed:
+				if v.ReplacementState == "" {
+					switch {
+					case resp.RecoveryEnabled != nil && !*resp.RecoveryEnabled:
+						v.ReplacementState = "recovery_disabled"
+					case resp.Offline:
+						v.ReplacementState = "offline"
+					case drainer != nil && drainer.replacementDispatch != nil && drainer.replacementDispatch.recentlyUnavailable(p):
+						v.ReplacementState = "provider_unavailable"
+					default:
+						v.ReplacementState = "queued"
+					}
+				}
+			}
+		}
 		switch r.DrainState {
 		case metadata.DrainWriting, metadata.DrainReady, metadata.DrainDraining:
 			if r.DrainState == metadata.DrainWriting {
@@ -236,6 +311,17 @@ func BuildSpoolStatus(spool *SpoolStore, drainer *Drainer) (SpoolStatusResponse,
 				// offering recovery.
 				v.Stalled = true
 			}
+			// A drain PAUSED after it already changed the server copy
+			// (pauseIfServerCopyAtRisk) is flagged Stalled from its first
+			// pause, so the menu shows its last_error ("server copy
+			// incomplete — will retry ...") with no app change and no new
+			// key in the contract's closed /spool schema.
+			if isDrainPaused(r.LastError) {
+				v.Stalled = true
+			}
+			if v.ReplacementState != "" {
+				v.Stalled = false
+			}
 			if v.Stalled {
 				resp.StalledFiles++
 			}
@@ -257,7 +343,11 @@ func BuildSpoolStatus(spool *SpoolStore, drainer *Drainer) (SpoolStatusResponse,
 				fileExists = statErr == nil
 			}
 			if fileExists || now.Sub(r.UpdatedAt) <= SpoolStatusFailedRetention {
-				resp.FailedFiles++
+				if isDeclinedReason(r.LastError) {
+					resp.DeclinedFiles++
+				} else {
+					resp.FailedFiles++
+				}
 				countIfSuspect(v)
 				views = append(views, v)
 			}
@@ -296,6 +386,7 @@ func BuildSpoolStatus(spool *SpoolStore, drainer *Drainer) (SpoolStatusResponse,
 		resp.Succeeded = m.DrainsSucceeded.Load()
 		resp.Failed = m.DrainsFailed.Load()
 		resp.Quarantined = m.Quarantined.Load()
+		resp.SidecarsSkipped = m.SidecarsSkipped.Load()
 	}
 
 	return resp, listErr

@@ -11,7 +11,7 @@ import (
 
 func TestNFSCreateAndWrite(t *testing.T) {
 	srv, _ := setupReadTestServer(t)
-	mountPoint := mountNFS(t, srv.Addr())
+	mountPoint := mountNFS(t, srv)
 
 	testFile := filepath.Join(mountPoint, fmt.Sprintf("__test_write_%d.txt", time.Now().UnixNano()))
 	testData := []byte("Hello from JuiceMount5 NFS write test!\n")
@@ -50,7 +50,7 @@ func TestNFSCreateAndWrite(t *testing.T) {
 
 func TestNFSCreateAndReadLarger(t *testing.T) {
 	srv, _ := setupReadTestServer(t)
-	mountPoint := mountNFS(t, srv.Addr())
+	mountPoint := mountNFS(t, srv)
 
 	testFile := filepath.Join(mountPoint, fmt.Sprintf("__test_write_large_%d.bin", time.Now().UnixNano()))
 
@@ -83,7 +83,7 @@ func TestNFSCreateAndReadLarger(t *testing.T) {
 
 func TestNFSMkdir(t *testing.T) {
 	srv, _ := setupReadTestServer(t)
-	mountPoint := mountNFS(t, srv.Addr())
+	mountPoint := mountNFS(t, srv)
 
 	dirPath := filepath.Join(mountPoint, fmt.Sprintf("__test_dir_%d", time.Now().UnixNano()))
 
@@ -119,7 +119,7 @@ func TestNFSMkdir(t *testing.T) {
 
 func TestNFSRename(t *testing.T) {
 	srv, _ := setupReadTestServer(t)
-	mountPoint := mountNFS(t, srv.Addr())
+	mountPoint := mountNFS(t, srv)
 
 	oldName := filepath.Join(mountPoint, fmt.Sprintf("__test_rename_old_%d.txt", time.Now().UnixNano()))
 	newName := filepath.Join(mountPoint, fmt.Sprintf("__test_rename_new_%d.txt", time.Now().UnixNano()))
@@ -152,7 +152,7 @@ func TestNFSRename(t *testing.T) {
 
 func TestNFSRemove(t *testing.T) {
 	srv, _ := setupReadTestServer(t)
-	mountPoint := mountNFS(t, srv.Addr())
+	mountPoint := mountNFS(t, srv)
 
 	testFile := filepath.Join(mountPoint, fmt.Sprintf("__test_remove_%d.txt", time.Now().UnixNano()))
 	os.WriteFile(testFile, []byte("delete me"), 0644)
@@ -170,7 +170,7 @@ func TestNFSRemove(t *testing.T) {
 
 func TestNFSFileCopy(t *testing.T) {
 	srv, _ := setupReadTestServer(t)
-	mountPoint := mountNFS(t, srv.Addr())
+	mountPoint := mountNFS(t, srv)
 
 	// Create 5 test files
 	srcDir := filepath.Join(mountPoint, fmt.Sprintf("__test_copy_src_%d", time.Now().UnixNano()))

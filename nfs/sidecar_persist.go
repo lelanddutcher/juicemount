@@ -1,6 +1,7 @@
 package nfs
 
 import (
+	"crypto/sha256"
 	"encoding/gob"
 	"os"
 	"path/filepath"
@@ -17,32 +18,34 @@ import (
 // (measured live: 138s for a 255-entry dir that then lists in ms). Persisting
 // the cache turns "first visit per RESTART" into "first visit EVER".
 //
-// SAFETY: persistence adds zero staleness risk by construction — every serve
-// already validates the entry against the MIRROR's live (mtime,size)
-// (sidecarServe → sidecarCache.get), and write-opens invalidate. A loaded
-// entry whose file changed while the app was down simply never matches and
-// falls through to a fresh read. Load also re-applies the put-side guards
-// (complete body, size caps), so a corrupt/truncated file degrades to a cold
-// cache, never to a wrong serve.
+// V3 stores only complete strong-source captures as read-only snapshots with
+// body integrity, exact attributes, a durable local mirror revision and the
+// selected logical volume. Restored records are admitted lazily from resident
+// RAM mirror rows. Unobserved remote changes may remain absent until normal
+// reconciliation; local successor publications revoke reads before reply.
+// V1/V2 records retain legacy weak behavior and never gain terminal proof.
 //
 // Loss model: saved every sidecarPersistInterval when dirty, plus a final
 // save on clean shutdown. A hard kill loses at most the last interval's
 // puts — they re-warm on demand exactly as before.
 const (
-	sidecarPersistVersion  = 1
+	sidecarPersistVersion  = 3
 	sidecarPersistInterval = 2 * time.Minute
 )
 
 type sidecarPersistEntry struct {
-	Path  string
-	Mtime int64
-	Size  int64
-	Data  []byte
+	Path     string
+	Mtime    int64
+	Size     int64
+	Data     []byte // v1 compatibility; v2 stores the shared body in Blobs
+	Blob     uint32
+	Snapshot *sidecarSnapshot // v3 only; immutable read authority, never a write seed
 }
 
 type sidecarPersistFile struct {
 	Version int
 	Entries []sidecarPersistEntry
+	Blobs   [][]byte
 }
 
 // dirty counts puts/invalidates since the last save (checked by the saver).
@@ -68,6 +71,7 @@ func (c *sidecarCache) enablePersist(path string) {
 	c.persistPath = path
 	c.loadFromDisk()
 	c.persistStop = make(chan struct{})
+	c.persistDone = make(chan struct{})
 	go c.persistLoop()
 }
 
@@ -76,13 +80,17 @@ func (c *sidecarCache) stopPersist() {
 	if c == nil || c.persistPath == "" {
 		return
 	}
-	if c.persistStop != nil {
-		close(c.persistStop)
-	}
-	c.saveToDisk()
+	c.persistStopOnce.Do(func() {
+		if c.persistStop != nil {
+			close(c.persistStop)
+			<-c.persistDone // periodic save has released the shared temp path
+		}
+		c.saveToDisk()
+	})
 }
 
 func (c *sidecarCache) persistLoop() {
+	defer close(c.persistDone)
 	t := time.NewTicker(sidecarPersistIntervalFromEnv())
 	defer t.Stop()
 	for {
@@ -108,29 +116,52 @@ func (c *sidecarCache) loadFromDisk() {
 	}
 	defer f.Close()
 	var pf sidecarPersistFile
-	if err := gob.NewDecoder(f).Decode(&pf); err != nil || pf.Version != sidecarPersistVersion {
+	if err := gob.NewDecoder(f).Decode(&pf); err != nil || (pf.Version != 1 && pf.Version != 2 && pf.Version != sidecarPersistVersion) {
 		jmlog.Info("sidecar cache: snapshot unreadable — starting cold", "path", c.persistPath)
 		return
 	}
-	loaded, bytes := 0, int64(0)
+	c.mu.Lock()
+	before := len(c.m)
 	for _, e := range pf.Entries {
+		data := e.Data
+		if pf.Version >= 2 {
+			if int(e.Blob) >= len(pf.Blobs) {
+				continue
+			}
+			data = pf.Blobs[e.Blob]
+		}
 		// Re-apply the put guards: complete body, positive bounded size.
-		if e.Size <= 0 || e.Size > sidecarMaxFile || int64(len(e.Data)) != e.Size {
+		if e.Size <= 0 || e.Size > sidecarMaxFile || int64(len(data)) != e.Size {
 			continue
 		}
-		c.mu.Lock()
-		if _, exists := c.m[e.Path]; !exists && c.bytes+e.Size <= c.maxBytes {
-			c.tick++
-			c.m[e.Path] = &sidecarEntry{data: e.Data, mtime: e.Mtime, size: e.Size, lastUsed: c.tick}
-			c.bytes += e.Size
-			loaded++
-			bytes += e.Size
+		if e.Snapshot != nil && (pf.Version != sidecarPersistVersion ||
+			e.Snapshot.Token.Path != e.Path || e.Snapshot.Token.Incarnation == "" ||
+			e.Snapshot.Token.Revision <= 0 || e.Snapshot.Inode == 0 ||
+			e.Snapshot.Size != e.Size || e.Snapshot.MtimeNS/1e9 != e.Mtime ||
+			e.Snapshot.Name != filepath.Base(e.Path) || !e.Snapshot.Mode.IsRegular() ||
+			sha256.Sum256(data) != e.Snapshot.SHA256) {
+			continue
 		}
-		c.mu.Unlock()
+		if _, exists := c.m[e.Path]; exists {
+			continue
+		}
+		c.putLocked(e.Path, data, e.Mtime, e.Size)
+		if e.Snapshot != nil {
+			copyOf := *e.Snapshot
+			c.m[e.Path].snapshot = &copyOf
+		}
+		for (c.bytes > c.maxBytes || len(c.m) > c.fileLimitLocked()) && len(c.m) > 1 {
+			c.evictOneLRULocked()
+		}
 	}
+	loaded := len(c.m) - before
+	uniqueBytes := c.bytes
+	uniqueBodies := len(c.blobs)
+	c.mu.Unlock()
+	atomic.StoreInt64(&c.dirty, 0)
 	if loaded > 0 {
 		jmlog.Info("sidecar cache: snapshot restored — repeat-visit folders stay warm across restarts",
-			"entries", loaded, "bytes", bytes, "path", c.persistPath)
+			"entries", loaded, "unique_bodies", uniqueBodies, "unique_bytes", uniqueBytes, "path", c.persistPath)
 	}
 }
 
@@ -141,13 +172,24 @@ func (c *sidecarCache) saveToDisk() {
 	if c.persistPath == "" {
 		return
 	}
+	c.persistWriteMu.Lock()
+	defer c.persistWriteMu.Unlock()
 	c.mu.Lock()
+	dirtyAtSnapshot := atomic.LoadInt64(&c.dirty)
+	c.ensureInternLocked()
 	entries := make([]sidecarPersistEntry, 0, len(c.m))
+	blobs := make([][]byte, 0, len(c.blobs))
+	blobIndex := make(map[string]uint32, len(c.blobs))
 	for p, e := range c.m {
-		entries = append(entries, sidecarPersistEntry{Path: p, Mtime: e.mtime, Size: e.size, Data: e.data})
+		idx, ok := blobIndex[e.contentKey]
+		if !ok {
+			idx = uint32(len(blobs))
+			blobIndex[e.contentKey] = idx
+			blobs = append(blobs, e.data)
+		}
+		entries = append(entries, sidecarPersistEntry{Path: p, Mtime: e.mtime, Size: e.size, Blob: idx, Snapshot: e.snapshot})
 	}
 	c.mu.Unlock()
-	atomic.StoreInt64(&c.dirty, 0)
 
 	tmp := c.persistPath + ".tmp"
 	if err := os.MkdirAll(filepath.Dir(c.persistPath), 0o755); err != nil {
@@ -158,7 +200,7 @@ func (c *sidecarCache) saveToDisk() {
 		return
 	}
 	enc := gob.NewEncoder(f)
-	if err := enc.Encode(sidecarPersistFile{Version: sidecarPersistVersion, Entries: entries}); err != nil {
+	if err := enc.Encode(sidecarPersistFile{Version: sidecarPersistVersion, Entries: entries, Blobs: blobs}); err != nil {
 		f.Close()
 		os.Remove(tmp)
 		return
@@ -171,7 +213,8 @@ func (c *sidecarCache) saveToDisk() {
 		os.Remove(tmp)
 		return
 	}
-	jmlog.Debug("sidecar cache: snapshot saved", "entries", len(entries))
+	atomic.CompareAndSwapInt64(&c.dirty, dirtyAtSnapshot, 0)
+	jmlog.Debug("sidecar cache: snapshot saved", "entries", len(entries), "unique_bodies", len(blobs))
 }
 
 // ---- handler wrappers (bridge-facing) ----

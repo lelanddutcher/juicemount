@@ -273,6 +273,14 @@ func resolveRouteInterface(target string) (string, error) {
 	return interfaceForIP(la.IP)
 }
 
+// ResolveRouteInterface exposes the same probe-free backend-route lookup used
+// by NetWatcher so startup policy can be set before the FUSE daemon chooses its
+// immutable cache/prefetch flags. It sends no packets (UDP connect only asks
+// the kernel to select a source address/interface).
+func ResolveRouteInterface(target string) (string, error) {
+	return resolveRouteInterface(target)
+}
+
 // interfaceForIP returns the name of the first up interface that owns ip.
 // This is the local-IP → interface half of the backend-route resolver: the
 // kernel told us which SOURCE address the route to the backend binds; the

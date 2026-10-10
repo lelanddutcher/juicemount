@@ -10,11 +10,11 @@
 #
 #   1. JuiceMount must be running with the mount up.
 #
-#   2. Passwordless sudo for pfctl must be configured. Add this line to
-#      /etc/sudoers.d/juicemount-mount (alongside the existing mount_nfs
-#      / umount / mkdir grants from docs/dev-setup.md):
+#   2. Passwordless sudo for pfctl must be configured on this DEV Mac
+#      (a dev-only grant in its own file, e.g. /etc/sudoers.d/jm-dev-pfctl).
+#      Do NOT grant umount: JuiceMount never unmounts by path (H-3).
 #
-#         %admin ALL=(ALL) NOPASSWD: /sbin/mount_nfs, /sbin/umount, /bin/mkdir, /sbin/pfctl
+#         %admin ALL=(ALL) NOPASSWD: /sbin/pfctl
 #
 #      Verify with:  sudo -n /sbin/pfctl -s rules >/dev/null 2>&1 && echo OK
 #

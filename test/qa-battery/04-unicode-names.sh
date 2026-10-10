@@ -27,8 +27,10 @@
 #         is used ONLY off-mount inside qa_stage_file to produce source bytes.
 #
 # CHAIN OF CUSTODY: Finder write -> NFS handler -> write spool -> drainer ->
-#   JuiceFS backend -> readback md5. qa_wait_drain (pending_files==0 &&
-#   in_progress==0) is MANDATORY before qa_verify_custody.
+#   mounted readback md5. qa_wait_drain (pending_files==0 && in_progress==0)
+#   is MANDATORY before qa_verify_custody. Resident cache may still serve that
+#   read: compare the source manifest with an independent backend readback
+#   before claiming persisted backend custody.
 #
 # NON-DESTRUCTIVE: copies ONLY into a unique $QA_DEST_ROOT/QA_<epoch>_<pid>_*
 #   dest; stages ONLY under $QA_STAGE; EXIT trap + qa_cleanup tear down only
@@ -57,6 +59,9 @@ _cleanup_done=0
 _on_exit() {
     [ "$_cleanup_done" = "1" ] && return
     _cleanup_done=1
+    # Explicit retention keeps both the staged corpus and this run's mount
+    # subtree. It also leaves offline state untouched for custody inspection.
+    [ "${QA_KEEP_DATA:-0}" = 1 ] && return
     # Best-effort: ensure we never leave the mount stuck offline.
     qa_offline off >/dev/null 2>&1 || true
     # Remove only THIS run's unique dest leaf (qa_cleanup also sweeps QA_*_$$_*).
@@ -67,7 +72,9 @@ _on_exit() {
     fi
     qa_cleanup 2>/dev/null || true
 }
-trap _on_exit EXIT INT TERM
+trap _on_exit EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # ---------------------------------------------------------------------------
 # Helpers local to this category (NOT lib.sh helpers — pure shell, no mount).
@@ -176,6 +183,10 @@ fi
 # NOTE: '/' and ':' are NOT usable as literal leaf bytes (path separator / HFS
 # colon-mapped) — we exercise the HFS colon edge via a name CONTAINING a colon,
 # which Finder maps to '/' on display; we assert it lands without a -36/-43.
+# Literal `._*` source leaves are also excluded: Finder reserves that namespace
+# for AppleDouble metadata and silently omits an ordinary `._foo` file when
+# duplicating between two local APFS directories too. Requiring it here tested
+# Finder's platform policy, not JuiceMount's filename handling.
 _NAMES="
 emoji_🎬🔥_clip.mov
 ${CAFE_NFC}
@@ -194,7 +205,6 @@ single'quote.mov
 double\"quote.mov
 hash#and%percent.mov
 ${LONG255}
-._real_dot_underscore.mov
 "
 
 _staged=0

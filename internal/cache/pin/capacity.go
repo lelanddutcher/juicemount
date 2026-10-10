@@ -1,12 +1,15 @@
 package pin
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"github.com/lelanddutcher/juicemount/internal/appisolation"
 )
 
 // capacity.go — pinned-set vs disk-capacity verdict (R-1, release punch list).
@@ -29,11 +32,77 @@ import (
 //      skips re-warming while over capacity (PullPending already warmed what
 //      fits; re-warming only thrashes the LRU).
 
-// CacheFreeFloorBytes mirrors health.cacheFreeFloorBytes: JuiceFS keeps at
+// CacheFreeFloorBytes mirrors health.cacheFreeFloorBytesConst: JuiceFS keeps at
 // least this much free on the cache volume at runtime (via --free-space-ratio).
 // The space actually usable BY the cache is therefore
 // (current free) + (bytes the cache already occupies) − floor.
-const CacheFreeFloorBytes = int64(10) << 30 // 10 GiB
+//
+// The floor is DERIVED AT MOUNT TIME and published here, because it is no longer
+// a constant: health.resolveFreeSpaceRatio sets --free-space-ratio so JuiceFS's
+// eviction floor sits ABOVE the write spool's 20 GiB admission floor (~30 GiB on
+// a typical disk). Otherwise the spool always blocked first and the cache never
+// yielded a byte — which is the whole premise of counting reclaimable cache as
+// spool headroom.
+//
+// Reading the stale 10 GiB here OVER-stated sustainable capacity by the
+// difference, so the over-capacity banner UNDER-warned and IsOverCapacity() —
+// which gates the prefetcher's re-warm — released the futile-churn guard late.
+// Both errors were in the unsafe direction.
+const CacheFreeFloorBytesDefault = int64(10) << 30 // 10 GiB, pre-derivation
+
+// cacheFreeFloorBytes is the LIVE floor, published by health at mount time via
+// SetCacheFreeFloorBytes. Zero means "not yet published" and reads fall back to
+// the default, so a verdict computed before the mount is no worse than before.
+var cacheFreeFloorBytes atomic.Int64
+
+var cacheVolumeMu sync.RWMutex
+var cacheVolumePath string
+var cacheVolumeDev uint64
+var cachePolicyKnown bool
+var cachePolicyEpoch uint64
+
+// SetCachePolicy replaces one admitted mount's policy as a single tuple.
+func SetCachePolicy(budget, floor int64, path string, device uint64, known bool) {
+	if budget < 0 {
+		budget = 0
+	}
+	if floor < 0 {
+		floor = 0
+	}
+	cacheVolumeMu.Lock()
+	cacheBudgetBytes.Store(budget)
+	cacheFreeFloorBytes.Store(floor)
+	cacheVolumePath, cacheVolumeDev = path, device
+	cachePolicyKnown = known && budget > 0 && floor > 0 && path != "" && device != 0
+	cachePolicyEpoch++
+	capacityMu.Lock()
+	capacityVerdict.Computed = time.Time{} // a prior mount cannot admit this one
+	capacityMu.Unlock()
+	cacheVolumeMu.Unlock()
+}
+
+// SetCacheFreeFloorBytes publishes the free-space floor JuiceFS was actually
+// mounted with. Mirrors SetCacheBudgetBytes.
+func SetCacheFreeFloorBytes(b int64) {
+	if b < 0 {
+		b = 0
+	}
+	cacheVolumeMu.Lock()
+	cacheFreeFloorBytes.Store(b)
+	cachePolicyEpoch++
+	capacityMu.Lock()
+	capacityVerdict.Computed = time.Time{}
+	capacityMu.Unlock()
+	cacheVolumeMu.Unlock()
+}
+
+// CacheFreeFloorBytes returns the live floor, or the default if none published.
+func CacheFreeFloorBytes() int64 {
+	if v := cacheFreeFloorBytes.Load(); v > 0 {
+		return v
+	}
+	return CacheFreeFloorBytesDefault
+}
 
 // capacityFlapMarginBytes is hysteresis so the verdict doesn't toggle on/off as
 // free space jitters by a few hundred MB during normal use. The pinned set must
@@ -61,6 +130,28 @@ type CapacityVerdict struct {
 	// and for debugging the verdict.
 	DiskFreeBytes   int64 `json:"disk_free_bytes"`
 	CacheUsageBytes int64 `json:"cache_usage_bytes"`
+	// CacheFreeFloorBytes is the effective JuiceFS eviction floor selected at
+	// mount time. It is surfaced so clients can report the real caching cutoff;
+	// a hard-coded 1% UI became false once the floor was made disk- and
+	// spool-aware.
+	CacheFreeFloorBytes int64 `json:"cache_free_floor_bytes"`
+	// BlockCacheBytes is JuiceFS's own `juicefs_blockcache_bytes` gauge — the
+	// AUTHORITATIVE on-disk block-cache size — as of Computed. 0 when the gauge
+	// is unavailable (no metrics addr, daemon not up, never scraped), in which
+	// case CacheUsageBytes (the cache-dir du) is the only figure available.
+	//
+	// Carried here so a consumer that must not perform I/O can read the gauge
+	// from this snapshot. The write spool's admission path is exactly that
+	// consumer: nfs.refreshCeiling runs under a TryLock on the write hot path
+	// and may not scrape, so it reads this field (see nfs/spool_headroom.go).
+	// Before this, the ONLY thing that refreshed the gauge was the /cache-status
+	// poll — i.e. it ticked only while the menu-bar popover was open.
+	//
+	// NOT SERIALIZED, deliberately: contract/spec/schema/cache-status.schema.json
+	// declares the `capacity` object "additionalProperties": false, so adding a
+	// key here would fail wire conformance. Consumers already receive the same
+	// gauge as /cache-status's top-level `cache_used_bytes`.
+	BlockCacheBytes int64 `json:"-"`
 	// CacheBudgetBytes is the USER-CONFIGURED juicefs --cache-size (0 =
 	// unknown/unlimited). When set, it caps sustainable capacity: juicefs
 	// will never hold more than the budget no matter how roomy the disk is,
@@ -75,6 +166,9 @@ type CapacityVerdict struct {
 	// ComputedSec is elapsed seconds since Computed, for clients that don't
 	// want to do timestamp math. 0 when never computed.
 	ComputedSec int64 `json:"computed_sec"`
+	// PolicyKnown is local admission evidence; it is not a wire schema field.
+	PolicyKnown bool   `json:"-"`
+	PolicyEpoch uint64 `json:"-"`
 }
 
 var (
@@ -131,26 +225,108 @@ func SetCacheBudgetBytes(b int64) {
 	if b < 0 {
 		b = 0
 	}
+	cacheVolumeMu.Lock()
 	cacheBudgetBytes.Store(b)
+	cachePolicyEpoch++
+	capacityMu.Lock()
+	capacityVerdict.Computed = time.Time{}
+	capacityMu.Unlock()
+	cacheVolumeMu.Unlock()
 }
 
+// CacheBudgetBytes returns the configured pre-mount baseline or the latest
+// admitted mount budget. Write-path consumers avoid a stale capacity verdict.
+func CacheBudgetBytes() int64 { return cacheBudgetBytes.Load() }
+
 func ComputeCapacity(store *Store, cacheBaseDir string) CapacityVerdict {
+	cacheVolumeMu.RLock()
+	selectedPath, selectedDev, selectedKnown, selectedEpoch := cacheVolumePath, cacheVolumeDev, cachePolicyKnown, cachePolicyEpoch
+	selectedBudget, selectedFloor := cacheBudgetBytes.Load(), cacheFreeFloorBytes.Load()
+	cacheVolumeMu.RUnlock()
 	if cacheBaseDir == "" {
-		cacheBaseDir = defaultCacheBaseDir()
+		cacheBaseDir = selectedPath
+		if cacheBaseDir == "" {
+			cacheBaseDir = defaultCacheBaseDir()
+		}
 	}
-	v := CapacityVerdict{Computed: time.Now(), CacheBudgetBytes: cacheBudgetBytes.Load()}
+	v := CapacityVerdict{Computed: time.Now(), CacheBudgetBytes: selectedBudget, CacheFreeFloorBytes: selectedFloor, PolicyEpoch: selectedEpoch, PolicyKnown: selectedKnown && cacheBaseDir == selectedPath}
 
 	if store != nil {
 		if agg, err := store.AggregateStats(); err == nil {
 			v.PinnedBytes = agg.TotalBytes
+		} else {
+			v.PolicyKnown = false // unknown total demand cannot admit downloads
 		}
 	}
-	v.DiskFreeBytes = volumeFreeBytesAt(cacheBaseDir)
+	free, device, freeKnown := volumeFreeBytesAtKnown(cacheBaseDir)
+	v.DiskFreeBytes = free
+	v.PolicyKnown = v.PolicyKnown && freeKnown && device == selectedDev && v.CacheBudgetBytes > 0
 	v.CacheUsageBytes = dirUsageBytes(cacheBaseDir)
+	// Refresh AND record the authoritative block-cache gauge on this same slow
+	// cadence. The scrape is a bounded (3s-timeout) HTTP GET, internally
+	// throttled to once per 2s; running it HERE — beside a full directory walk,
+	// on the 60s CapacityLoop, explicitly off the read hot path — is what lets
+	// the spool's admission path consume the gauge as a plain snapshot read with
+	// no I/O of its own. A miss leaves the field 0 and the consumer falls back.
+	if bc, ok := BlockCacheBytes(); ok {
+		v.BlockCacheBytes = bc
+	}
 
 	evaluateCapacity(&v)
+	cacheVolumeMu.RLock()
+	stillCurrent := cachePolicyEpoch == selectedEpoch
+	if !stillCurrent {
+		cacheVolumeMu.RUnlock()
+		v.PolicyKnown = false
+		return v
+	}
 	setCapacityVerdict(v)
+	cacheVolumeMu.RUnlock()
 	return v
+}
+
+var ErrCacheCapacityUnknown = errors.New("cache capacity unknown; pin download pending")
+var ErrNoUsableCacheCapacity = errors.New("no usable cache capacity; pin download pending")
+var ErrInsufficientCacheCapacity = errors.New("pinned bytes exceed available cache capacity; pin download pending")
+
+// DownloadAdmission is evaluated only by pin workers, never mounted reads.
+// It checks the latest slow-cadence cache accounting and samples current local
+// free space so a queued job cannot download after the volume fills.
+func DownloadAdmission() error { return DownloadAdmissionFor(0, 0) }
+
+// DownloadAdmissionFor also refuses a known file or pinned set that cannot
+// fit the selected budget and current sustainable capacity. Zero is used by
+// callers that only need a policy/window check before they know a file size.
+func DownloadAdmissionFor(fileBytes, currentPinnedBytes int64) error {
+	v := Capacity()
+	if v.Computed.IsZero() || !v.PolicyKnown || v.ComputedSec > 120 {
+		return ErrCacheCapacityUnknown
+	}
+	cacheVolumeMu.RLock()
+	path, device, known, epoch := cacheVolumePath, cacheVolumeDev, cachePolicyKnown, cachePolicyEpoch
+	cacheVolumeMu.RUnlock()
+	if epoch != v.PolicyEpoch {
+		return ErrCacheCapacityUnknown
+	}
+	free, currentDevice, ok := volumeFreeBytesAtKnown(path)
+	cacheVolumeMu.RLock()
+	unchanged := cachePolicyEpoch == epoch
+	cacheVolumeMu.RUnlock()
+	if !known || !unchanged || !ok || currentDevice != device {
+		return ErrCacheCapacityUnknown
+	}
+	if free <= v.CacheFreeFloorBytes || v.CacheCapacityBytes == 0 {
+		return ErrNoUsableCacheCapacity
+	}
+	// Demand and reclaimable-cache usage come from one capacity snapshot.
+	// Mixing live free with old cache usage would make an in-flight download
+	// refuse itself as its own bytes move from free space into cache usage.
+	pinnedDemand := max(v.PinnedBytes, currentPinnedBytes)
+	if fileBytes < 0 || fileBytes > v.CacheCapacityBytes || pinnedDemand > v.CacheCapacityBytes ||
+		(v.CacheBudgetBytes > 0 && (fileBytes > v.CacheBudgetBytes || pinnedDemand > v.CacheBudgetBytes)) {
+		return ErrInsufficientCacheCapacity
+	}
+	return nil
 }
 
 // evaluateCapacity fills the derived fields (CacheCapacityBytes, ShortfallBytes,
@@ -161,7 +337,12 @@ func evaluateCapacity(v *CapacityVerdict) {
 	// The cache can sustainably hold what's free now PLUS what it already
 	// occupies (JuiceFS reuses its own blocks via LRU), minus the floor it must
 	// keep free on the volume.
-	capacity := v.DiskFreeBytes + v.CacheUsageBytes - CacheFreeFloorBytes
+	floor := v.CacheFreeFloorBytes
+	if floor <= 0 {
+		floor = CacheFreeFloorBytes()
+	}
+	v.CacheFreeFloorBytes = floor
+	capacity := v.DiskFreeBytes + v.CacheUsageBytes - floor
 	if capacity < 0 {
 		capacity = 0
 	}
@@ -177,15 +358,25 @@ func evaluateCapacity(v *CapacityVerdict) {
 	if shortfall := v.PinnedBytes - capacity; shortfall > 0 {
 		v.ShortfallBytes = shortfall
 	}
-	// Only a pinned set that's actually present AND over by more than the flap
-	// margin counts as over-capacity.
-	v.OverCapacity = v.PinnedBytes > 0 && v.ShortfallBytes > capacityFlapMarginBytes
+	// Disk-space estimates retain the flap margin; a fixed hard budget does not.
+	// The flap margin applies to a fluctuating disk-space estimate, never to
+	// the daemon's fixed --cache-size ceiling. Even a one-byte excess over a
+	// known hard budget cannot remain fully resident.
+	hardBudgetExcess := v.CacheBudgetBytes > 0 && v.PinnedBytes > v.CacheBudgetBytes
+	v.OverCapacity = v.PinnedBytes > 0 && (capacity == 0 || hardBudgetExcess || v.ShortfallBytes > capacityFlapMarginBytes)
 }
 
 // defaultCacheBaseDir returns ~/.juicefs/cache — the JuiceFS cache root we mount
 // against (the mount command in health/fuse.go does not pass --cache-dir, so
 // JuiceFS uses this default).
 func defaultCacheBaseDir() string {
+	paths, isolated, err := appisolation.ResolvePaths()
+	if err != nil {
+		return ""
+	}
+	if isolated {
+		return paths.CacheBase
+	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return ""
@@ -196,11 +387,22 @@ func defaultCacheBaseDir() string {
 // volumeFreeBytesAt statfs-es the nearest existing ancestor of path and returns
 // the free bytes on that volume. Returns 0 if nothing along the path resolves.
 func volumeFreeBytesAt(path string) int64 {
+	free, _, _ := volumeFreeBytesAtKnown(path)
+	return free
+}
+
+func volumeFreeBytesAtKnown(path string) (int64, uint64, bool) {
 	p := path
 	for p != "" {
 		var st syscall.Statfs_t
 		if err := syscall.Statfs(p, &st); err == nil {
-			return int64(st.Bsize) * int64(st.Bavail)
+			var identity syscall.Stat_t
+			if err := syscall.Stat(p, &identity); err != nil {
+				return 0, 0, false
+			}
+			return int64(st.Bsize) * int64(st.Bavail), uint64(identity.Dev), true
+		} else if !errors.Is(err, syscall.ENOENT) {
+			return 0, 0, false
 		}
 		parent := filepath.Dir(p)
 		if parent == p {
@@ -208,12 +410,7 @@ func volumeFreeBytesAt(path string) int64 {
 		}
 		p = parent
 	}
-	// Last resort: the boot volume.
-	var st syscall.Statfs_t
-	if err := syscall.Statfs("/", &st); err == nil {
-		return int64(st.Bsize) * int64(st.Bavail)
-	}
-	return 0
+	return 0, 0, false
 }
 
 // dirUsageBytes sums the logical sizes of every regular file under dir. Best

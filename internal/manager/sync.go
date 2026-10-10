@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -16,12 +17,59 @@ import (
 	"time"
 )
 
-// juicefsMetricsAddr is the host:port juicefs sync exposes Prometheus
-// metrics on. The default is 127.0.0.1:9567; we pin it explicitly via
-// --metrics so the parent process can poll a known address. Only one
-// juicefs sync runs at a time (JobManager serializes), so a fixed port
-// is safe.
-const juicefsMetricsAddr = "127.0.0.1:9567"
+// juicefsMetricsFallbackAddr is used only when we cannot allocate a free
+// port. See freeMetricsAddr.
+//
+// THIS WAS A FIXED 127.0.0.1:9567 AND IT NEVER WORKED IN PRODUCTION.
+//
+// The old comment justified the fixed port with "only one juicefs sync runs
+// at a time (JobManager serializes), so a fixed port is safe". Serializing
+// SYNCS was never the relevant question: the manager container also runs a
+// long-lived `juicefs mount`, which takes 127.0.0.1:9567 as ITS default and
+// had held it for 27 days by the time this was diagnosed. juicefs sync then
+// asked for the same port and lost.
+//
+// The failure was silent in the worst way. Scraping 9567 succeeded — it just
+// returned the MOUNT's metrics, which contain no juicefs_sync_* series at
+// all, so parseJuicefsMetrics produced a zero event, the zero event matched
+// the previous zero event, and the poller emitted nothing for the entire run.
+// The UI showed 0 files / 0 bytes / 0% while a 210 GB copy ran at ~475 MB/s.
+//
+// PRECISELY WHAT BREAKS, since the distinction matters when reading a job
+// record: the FINAL counts still land. parseSyncProgress picks juicefs's
+// end-of-run summary off stderr, so a completed job ends up with a populated
+// `last` and a non-zero updated_at, and looks fine in the API afterwards. It
+// is the LIVE updates that never arrive. Observed directly mid-run on
+// 2026-08-13: `last` was {files:0, bytes:0, updated_at:0} while 2.85 GB
+// landed on disk in a 6-second sample. So a job history full of healthy-looking
+// final counts is not evidence this ever worked — only a mid-run poll is.
+// The old comment even predicted the symptom — "without it the UI shows
+// '0 files' for the duration of any non-trivial copy" — without noticing it
+// was describing the shipped behaviour.
+//
+// health/fuse.go already learned this and deliberately puts the client's own
+// mount on :9568 "to dodge the sync-path collision". The manager did not get
+// the memo. See [[project_loopback_port_collision]].
+const juicefsMetricsFallbackAddr = "127.0.0.1:9567"
+
+// freeMetricsAddr returns a loopback address with a kernel-chosen free port
+// for juicefs sync to bind its Prometheus endpoint to.
+//
+// Asking the kernel is the only approach that cannot collide with whatever
+// else happens to be in this network namespace — today a juicefs mount,
+// tomorrow anything. We bind, read the assigned port, and close; juicefs
+// binds it moments later. That leaves a small race window, which is exactly
+// why pollJuicefsMetrics refuses to report from an endpoint that is not
+// serving sync metrics rather than trusting the address blindly.
+func freeMetricsAddr() string {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return juicefsMetricsFallbackAddr
+	}
+	addr := l.Addr().String()
+	_ = l.Close()
+	return addr
+}
 
 // Direction is the migration direction selected in the UI's Migrations
 // tab. SLICE 1 of the manager roadmap adds Out-of-JuiceFS and JuiceFS-
@@ -125,6 +173,10 @@ type RunSyncSpec struct {
 	// A future per-user ACL policy supersedes this single-owner model.
 	OwnerUID int
 	OwnerGID int
+
+	// Leases (H-8B): checkout leases on the target projects before any
+	// write into the volume (see leases_admin.go). Nil = no lease client.
+	Leases ProjectLeaser
 }
 
 // RunSync invokes `juicefs sync` against the given source and
@@ -143,6 +195,15 @@ type RunSyncSpec struct {
 // Emits ProgressEvent on `progress` each time juicefs writes a
 // recognized progress line. Blocks until juicefs exits or ctx cancels.
 func RunSync(ctx context.Context, juicefsBin string, spec RunSyncSpec, source, destination string, opts SyncOptions, extraEnv []string, progress chan<- ProgressEvent) error {
+	// H-8B: check out every target project before the first write. A
+	// project another principal holds refuses the whole job here, instead
+	// of the proxy refusing it file by file half way through.
+	ctx, releaseLeases, err := checkoutForSync(ctx, spec, source, destination, opts)
+	if err != nil {
+		return err
+	}
+	defer releaseLeases()
+	metricsAddr := freeMetricsAddr()
 	// SLICE 1: route the source through normalizeAnyURI so /jfs/...
 	// sources (Out direction) get rewritten to file:///<FUSEMount>/...
 	// — same kernel-mount path the destination side uses for In. For
@@ -172,6 +233,11 @@ func RunSync(ctx context.Context, juicefsBin string, spec RunSyncSpec, source, d
 			// juicefs sync's URL syntax: env var name = URL alias. So
 			// for jfs://zpool/... we set zpool=redis://...
 			modeEnv = append(modeEnv, spec.VolName+"="+spec.MetaURL)
+			// H-8B: `setting` holds no object key; juicefs takes the
+			// volume's key from MINIO_ACCESS_KEY/MINIO_SECRET_KEY. Only
+			// set when the volume is an endpoint, so a user-configured
+			// minio destination without its own key never sees it.
+			modeEnv = append(modeEnv, objectStoreEnv()...)
 		} else {
 			dst = normalizeAnyURI(destination, "", opts.PreserveStructure)
 		}
@@ -201,10 +267,13 @@ func RunSync(ctx context.Context, juicefsBin string, spec RunSyncSpec, source, d
 		"--threads", strconv.Itoa(threads),
 		"--update",
 		"--check-change",
+		// Metrics port, chosen free at spawn time — a FIXED port collided
+		// with the container's own juicefs mount and silently produced a
+		// permanently-zero progress bar. See freeMetricsAddr.
 		// Pin metrics port so the parent can poll for accurate progress
 		// counters (juicefs's stderr progress bar is TTY-only; non-TTY
 		// stderr emits sparse logs that the regex parser barely catches).
-		"--metrics", juicefsMetricsAddr,
+		"--metrics", metricsAddr,
 	}
 	if opts.PreserveTimes {
 		// juicefs sync 1.3.1 only exposes --perms (mode bits). mtime
@@ -284,7 +353,7 @@ func RunSync(ctx context.Context, juicefsBin string, spec RunSyncSpec, source, d
 	metricsDone := make(chan struct{})
 	go func() {
 		defer close(metricsDone)
-		pollJuicefsMetrics(metricsCtx, juicefsMetricsAddr, progress)
+		pollJuicefsMetrics(metricsCtx, metricsAddr, progress)
 	}()
 	parseSyncProgress(teed, progress)
 	stopMetrics()
@@ -411,6 +480,20 @@ func pollJuicefsMetrics(ctx context.Context, addr string, progress chan<- Progre
 	defer firstScrape.Stop()
 
 	var last ProgressEvent
+	// Validity accounting. A scrape that SUCCEEDS but carries no sync series
+	// is not progress information — it is proof we are pointed at the wrong
+	// process — and it must be said out loud exactly once rather than
+	// swallowed into a permanently-zero progress bar.
+	scrapesOK := 0
+	sawAnySync := false
+	warned := false
+	// Throughput has to be DERIVED. juicefs's sync metrics expose cumulative
+	// counters (copied, copied_bytes, failed) and no rate, so without this the
+	// UI's rate and ETA sit at zero even once the counters are flowing — which
+	// is the state this file shipped in: the metrics path set Files, Bytes and
+	// Errors and never touched BPS or ETASec at all.
+	var prevBytes int64
+	var prevAt time.Time
 	scrape := func() {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 		if err != nil {
@@ -428,13 +511,33 @@ func pollJuicefsMetrics(ctx context.Context, addr string, progress chan<- Progre
 		if err != nil {
 			return
 		}
-		ev := parseJuicefsMetrics(body)
+		scrapesOK++
+		ev, sawSync := parseJuicefsMetrics(body)
+		if sawSync {
+			sawAnySync = true
+		} else if !sawAnySync && !warned && scrapesOK >= 3 {
+			warned = true
+			fmt.Fprintf(os.Stderr, "manager: %s answered %d scrapes with NO juicefs_sync_* series. "+
+				"Progress will read zero for this job. Something else owns that port — the "+
+				"container's own `juicefs mount` defaults to 127.0.0.1:9567 and will win it. "+
+				"This is a wiring fault, not a stalled copy.\n", url, scrapesOK)
+		}
 		// Only emit on change so we don't spam the SSE stream during
 		// long idle periods.
 		if ev.Files == last.Files && ev.Bytes == last.Bytes && ev.Errors == last.Errors {
 			return
 		}
-		ev.UpdatedAt = time.Now().UnixMilli()
+		now := time.Now()
+		// Rate over the interval between scrapes. Guarded three ways: a first
+		// sample has nothing to difference against, a non-positive interval
+		// would divide by zero, and a NEGATIVE byte delta means the counter
+		// reset under us (juicefs restarted) rather than that the copy ran
+		// backwards — in all three cases report no rate rather than a wrong one.
+		if !prevAt.IsZero() {
+			ev.BPS = deriveBPS(prevBytes, ev.Bytes, now.Sub(prevAt))
+		}
+		prevBytes, prevAt = ev.Bytes, now
+		ev.UpdatedAt = now.UnixMilli()
 		select {
 		case progress <- ev:
 			last = ev
@@ -458,7 +561,9 @@ func pollJuicefsMetrics(ctx context.Context, addr string, progress chan<- Progre
 }
 
 // metricNameRegex captures any line of the form
-//   juicefs_sync_<name>{...} <number>
+//
+//	juicefs_sync_<name>{...} <number>
+//
 // and pulls out the counter name + value. We don't strip labels — the
 // juicefs sync metrics have only {cmd="sync",pid="..."} so the simplest
 // thing is to scan for known counter names by prefix.
@@ -468,8 +573,29 @@ var metricLineRegex = regexp.MustCompile(`^(juicefs_sync_[a-z_]+)\{[^}]*\}\s+([0
 // /metrics scrape body. Unrecognized counters are ignored. Bytes are
 // rounded down (juicefs reports bytes as float64; we keep int64 for the
 // SSE wire format consistency with the regex-parser path).
-func parseJuicefsMetrics(body []byte) ProgressEvent {
+// deriveBPS is the rate between two cumulative byte readings, or 0 when the
+// pair cannot yield an honest one: a non-positive interval (divide by zero) or
+// a counter that moved BACKWARDS, which means juicefs restarted and reset it
+// rather than that the copy ran in reverse. Reporting no rate beats reporting
+// a wrong or negative one.
+func deriveBPS(prevBytes, curBytes int64, elapsed time.Duration) float64 {
+	if elapsed <= 0 || curBytes < prevBytes {
+		return 0
+	}
+	return float64(curBytes-prevBytes) / elapsed.Seconds()
+}
+
+// parseJuicefsMetrics extracts sync counters from a Prometheus scrape and
+// reports whether the body contained ANY juicefs_sync_* series at all.
+//
+// That second return is the difference between "the sync has copied nothing
+// yet" and "we are scraping the wrong process". They are indistinguishable in
+// the counters — both yield zeros — and conflating them is what let a metrics
+// port collision masquerade as a stalled copy for the entire life of this
+// feature.
+func parseJuicefsMetrics(body []byte) (ProgressEvent, bool) {
 	var ev ProgressEvent
+	sawSync := false
 	scanner := bufio.NewScanner(strings.NewReader(string(body)))
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 	for scanner.Scan() {
@@ -477,6 +603,7 @@ func parseJuicefsMetrics(body []byte) ProgressEvent {
 		if !strings.HasPrefix(line, "juicefs_sync_") {
 			continue
 		}
+		sawSync = true
 		m := metricLineRegex.FindStringSubmatch(line)
 		if m == nil {
 			continue
@@ -494,7 +621,7 @@ func parseJuicefsMetrics(body []byte) ProgressEvent {
 			ev.Errors = int64(val)
 		}
 	}
-	return ev
+	return ev, sawSync
 }
 
 // ringBuffer is a tiny io.Writer that keeps only the last N bytes.
@@ -550,8 +677,9 @@ func (r *ringBuffer) String() string {
 
 // progressRegex matches a juicefs sync progress line. Example formats
 // the parser handles (juicefs's output has evolved across versions):
-//   Scanned: 1234, copied: 567 (12.3 MiB/s), skipped: 0, failed: 0, eta: 12s
-//   2026/05/26 14:33:21 <INFO> Scanned 100 entries, copied 50 (1.5 GiB), failed 0
+//
+//	Scanned: 1234, copied: 567 (12.3 MiB/s), skipped: 0, failed: 0, eta: 12s
+//	2026/05/26 14:33:21 <INFO> Scanned 100 entries, copied 50 (1.5 GiB), failed 0
 //
 // Any unmatched line is ignored. Robust to format drift — emits a
 // partial event with whatever fields parsed.

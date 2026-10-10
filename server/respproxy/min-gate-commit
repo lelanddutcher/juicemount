@@ -1,0 +1,32 @@
+# The oldest jm-respproxy source commit the canonical compose may run.
+# rollout-compose.sh --cutover-proxy / --proxy-restore read the proxy image's
+# org.opencontainers.image.revision label and refuse unless this commit is an
+# ancestor of it (git merge-base --is-ancestor) in the deploying checkout.
+#
+# e42737d: proxy-authored applied credential receipts, exact-byte reload
+# validation, retained-session revocation before acknowledgment, and an
+# exec entrypoint with one original process identity. The Manager requires
+# this applied-reload protocol and never trusts signal-only acknowledgments.
+# Inherits ce7483e stage-birth startup configuration, enforcing ownership
+# prerequisites, and joined lease/proxy shutdown.
+#
+# Inherits 5fb0fab: the reload heartbeat. The
+# Manager from the same change counts the proxy live only while
+# reload.heartbeat is fresh, so an older image (no heartbeat) is refused
+# every approval. It descends from a861a46 (whole-line reload ack) and from
+# 733de16 (the merged H-8B lease engine: every-mode gate fa5d0fc,
+# slice-accounting and counter hardening, per-project leases).
+#
+# The check is by ancestry, so this commit stays valid after a regular merge
+# into the release line. A squash or rebase merge rewrites it: then set this
+# file to the release-line commit that carries these proxy requirements.
+#
+# server/respproxy TestH8BGateCoversEntrypointHandshake enforces the bump
+# for entrypoint.sh. It needs full git history: CI (.github/workflows/ci.yml)
+# checks out with fetch-depth: 0 and sets JM_REQUIRE_GATE_HISTORY=1, so a
+# shallow clone fails the test there instead of skipping it.
+#
+# Bump at each release that changes internal/respproxy OR
+# server/respproxy/entrypoint.sh (its reload handshake is a contract with
+# the Manager's principal store).
+e42737dec63ed577d18cd46172dcda03a5cff4e5

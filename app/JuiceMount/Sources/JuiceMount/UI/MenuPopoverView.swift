@@ -13,8 +13,8 @@ struct MenuPopoverView: View {
 
     /// Computed mirror of `server.cacheStatus` — kept under the original
     /// name so the rest of this view's bindings stay untouched. The
-    /// underlying cgo call now runs on `ServerController.workQueue`
-    /// (see `ServerController.refreshCacheStatus`), never on MainActor.
+    /// underlying cgo call now runs on ServerController's dedicated status
+    /// queue (see `ServerController.refreshCacheStatus`), never on MainActor.
     private var cacheStatus: NFSBridge.CacheStatus { server.cacheStatus }
     @State private var cacheTimer: Timer?
     /// Local source of truth for the offline switch. Deliberately NOT a
@@ -69,6 +69,18 @@ struct MenuPopoverView: View {
     // shows what will be discarded BEFORE the destructive confirm.
     @State private var showClearFailedConfirm = false
     @State private var clearFailedPreview: NFSBridge.ClearFailedResult?
+    // Project leases (H-8B): which projects this Mac is editing, and which
+    // are being edited by another Mac (changes wait here until it is free).
+    // Polled from GET /project-leases on the same 2s tick; an unreachable or
+    // absent endpoint leaves the list empty and the section hidden.
+    @State private var projectLeases: [ProjectLeaseItem] = []
+    @State private var leaseReleaseInFlight: String?
+    // H-3 L3: privileged eject helper status (read-only; never registers).
+    // Refreshed on open and every ~10 s on the 2 s tick, single-flight.
+    @State private var helperReadiness: UnmountHelperReadiness?
+    @State private var helperFetchedAt: Date = .distantPast
+    @State private var helperFetchInFlight = false
+    @State private var helperSetUpInFlight = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -79,8 +91,16 @@ struct MenuPopoverView: View {
             activitySection
             Divider()
             healthSection
+            if let row = helperReadiness.map(UnmountHelperDecision.row(for:)), row.visible, row.tone != .ok {
+                Divider()
+                helperStatusSection(row)
+            }
             Divider()
             cacheSection
+            if !projectLeases.isEmpty {
+                Divider()
+                projectLeaseSection
+            }
             if let sp = server.spoolStatus, sp.enabled {
                 Divider()
                 pendingUploadsSection
@@ -108,13 +128,219 @@ struct MenuPopoverView: View {
     }
 
     private func refreshCacheStatus() {
-        // Dispatches the cgo call to ServerController.workQueue and hops
+        // Dispatches the cgo call to ServerController's dedicated status
+        // queue (single-flight, never queued behind mutations) and hops
         // back to MainActor to publish. The view rerenders via the
         // @Bindable server reference.
         server.refreshCacheStatus()
         updatePinRate()
         refreshSelfTest()
         refreshWarmup()
+        refreshProjectLeases()
+        refreshHelperStatus()
+    }
+
+    // MARK: - Eject helper (H-3 L3)
+
+    private func refreshHelperStatus(force: Bool = false) {
+        guard !helperFetchInFlight else { return }
+        guard force || Date().timeIntervalSince(helperFetchedAt) >= 10 else { return }
+        helperFetchInFlight = true
+        DispatchQueue.global(qos: .utility).async {
+            let r = UnmountHelperService.shared.readiness(isolated: AppIsolation.active != nil)
+            DispatchQueue.main.async {
+                helperReadiness = r
+                helperFetchedAt = Date()
+                helperFetchInFlight = false
+            }
+        }
+    }
+
+    /// Shown only when the helper needs the user. A running volume is never
+    /// affected; the helper gates only the next Start.
+    private func helperStatusSection(_ row: UnmountHelperRow) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Image(systemName: row.tone == .failed ? "xmark.circle.fill" : "exclamationmark.triangle.fill")
+                .foregroundStyle(row.tone == .failed ? Color.red : Self.glanceAmber)
+                .frame(width: 16)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(row.title)
+                    .font(.caption.weight(.semibold))
+                Text(row.detail)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                switch row.action {
+                case .setUp:
+                    Button(helperSetUpInFlight ? "Setting Up…" : "Set Up Helper…") { setUpHelper() }
+                        .controlSize(.small)
+                        .disabled(helperSetUpInFlight)
+                case .openLoginItems:
+                    Button("Open Login Items…") { UnmountHelperService.openLoginItems() }
+                        .controlSize(.small)
+                case .none:
+                    EmptyView()
+                }
+            }
+            Spacer()
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+    }
+
+    private func setUpHelper() {
+        helperSetUpInFlight = true
+        DispatchQueue.global(qos: .userInitiated).async {
+            let r = UnmountHelperService.shared.prepare(
+                isolated: AppIsolation.active != nil,
+                mountActive: NFSBridge.isRunning)
+            DispatchQueue.main.async {
+                helperReadiness = r
+                helperFetchedAt = Date()
+                helperSetUpInFlight = false
+                if r == .requiresApproval || r == .notRegistered {
+                    UnmountHelperService.openLoginItems()
+                }
+            }
+        }
+    }
+
+    // MARK: - Project leases (H-8B)
+
+    /// One project from GET /project-leases (nfs/project_lease.go).
+    fileprivate struct ProjectLeaseItem: Decodable, Equatable, Identifiable {
+        var project: String
+        var name: String
+        /// held | waiting | other | idle
+        var state: String
+        var holder_host: String?
+        var pending_rows: Int
+        var waiting_rows: Int
+        var release_requested: Bool
+        var id: String { project }
+    }
+
+    private struct ProjectLeaseStatusBody: Decodable {
+        var enabled: Bool
+        var supported: Bool
+        var projects: [ProjectLeaseItem]?
+    }
+
+    /// Fire-and-forget poll; never blocks MainActor. A failed fetch empties
+    /// the list so a stale "being edited" line never outlives the core.
+    private func refreshProjectLeases() {
+        let metricsAddr = server.preferences.metricsAddr
+        DispatchQueue.global(qos: .utility).async {
+            var items: [ProjectLeaseItem] = []
+            if let url = URL(string: "http://\(metricsAddr)/project-leases"),
+               let data = try? Data(contentsOf: url),
+               let body = try? JSONDecoder().decode(ProjectLeaseStatusBody.self, from: data),
+               body.enabled, body.supported {
+                items = (body.projects ?? []).filter { $0.state != "idle" }
+            }
+            DispatchQueue.main.async {
+                if projectLeases != items { projectLeases = items }
+            }
+        }
+    }
+
+    /// "Done editing <project>": ask the core to release the lease. With
+    /// changes still uploading, the core defers the release until they land.
+    private func releaseProjectLease(_ project: String) {
+        let metricsAddr = server.preferences.metricsAddr
+        leaseReleaseInFlight = project
+        DispatchQueue.global(qos: .userInitiated).async {
+            var comps = URLComponents()
+            comps.scheme = "http"
+            let parts = metricsAddr.split(separator: ":", maxSplits: 1)
+            comps.host = parts.first.map(String.init) ?? "127.0.0.1"
+            comps.port = parts.count > 1 ? Int(parts[1]) : nil
+            comps.path = "/project-leases/release"
+            comps.queryItems = [URLQueryItem(name: "project", value: project)]
+            if let url = comps.url {
+                var req = URLRequest(url: url)
+                req.httpMethod = "POST"
+                req.setValue("1", forHTTPHeaderField: "X-JM-Control")
+                req.timeoutInterval = 10
+                let sem = DispatchSemaphore(value: 0)
+                URLSession.shared.dataTask(with: req) { _, _, error in
+                    if let error {
+                        NFSBridge.appLog("project-leases release \(project) failed: \(error)")
+                    }
+                    sem.signal()
+                }.resume()
+                sem.wait()
+            }
+            DispatchQueue.main.async {
+                leaseReleaseInFlight = nil
+                refreshProjectLeases()
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var projectLeaseSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Image(systemName: "person.2")
+                    .foregroundStyle(.secondary)
+                Text("Projects")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer()
+            }
+            ForEach(projectLeases) { item in
+                projectLeaseRow(item)
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+    }
+
+    @ViewBuilder
+    private func projectLeaseRow(_ item: ProjectLeaseItem) -> some View {
+        switch item.state {
+        case "waiting", "other":
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 6) {
+                    Image(systemName: "lock.fill")
+                        .foregroundStyle(.orange)
+                    Text(Self.beingEditedText(item))
+                        .font(.caption)
+                        .lineLimit(2)
+                }
+                if item.waiting_rows > 0 {
+                    Text("\(item.waiting_rows) change\(item.waiting_rows == 1 ? "" : "s") will upload when it is free")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .help("Your changes are safe on this Mac. They upload when the other Mac finishes editing.")
+        default: // held
+            HStack(spacing: 6) {
+                Image(systemName: "pencil.circle.fill")
+                    .foregroundStyle(.green)
+                Text(item.release_requested
+                     ? "Releasing \(item.name) after uploads finish"
+                     : "Editing \(item.name)")
+                    .font(.caption)
+                    .lineLimit(1)
+                Spacer()
+                if !item.release_requested {
+                    Button("Done editing \(item.name)") { releaseProjectLease(item.project) }
+                        .buttonStyle(.borderless)
+                        .font(.caption2)
+                        .disabled(leaseReleaseInFlight != nil)
+                        .help("Let other Macs edit \(item.name). Changes still uploading finish first.")
+                }
+            }
+        }
+    }
+
+    /// "<Project> is being edited by <host>" (H-8B menu-bar string).
+    fileprivate static func beingEditedText(_ item: ProjectLeaseItem) -> String {
+        let host = (item.holder_host?.isEmpty == false) ? item.holder_host! : "another Mac"
+        return "\(item.name) is being edited by \(host)"
     }
 
     /// Warm-up card poll. Rides the popover's 2s tick but self-throttles to
@@ -311,12 +537,18 @@ struct MenuPopoverView: View {
     private var diskSpaceRow: some View {
         let purgeable = max(0, diskImportantGB - diskFreeGB)
 
-        // JuiceFS is launched with --free-space-ratio 0.01 — it skips cache
-        // writes when free < 1% of total disk. Surface that operational
-        // reality, not theoretical concerns.
+        // Use the backend's ACTUAL mount-time eviction floor. The old 1% mirror
+        // became false when the Go policy raised or adaptively reduced the
+        // floor to keep cache eviction ahead of the write spool.
         let freeRatio = diskTotalGB > 0 ? diskFreeGB / diskTotalGB : 1.0
-        let cacheOff = freeRatio < 0.01     // hard cutoff: JuiceFS already refusing
-        let cacheCutoffSoon = freeRatio < 0.03 && !cacheOff
+        let freeBytes = max(0, diskFreeGB * 1e9)
+        let floorBytes = Double(cacheStatus.capacity.cache_free_floor_bytes)
+        let hasEffectiveFloor = floorBytes > 0
+        let cacheHeadroomBytes = hasEffectiveFloor ? freeBytes - floorBytes : 0
+        let cacheOff = hasEffectiveFloor ? cacheHeadroomBytes <= 0 : freeRatio < 0.01
+        let cacheCutoffSoon = !cacheOff && (hasEffectiveFloor
+            ? cacheHeadroomBytes < 2e9
+            : freeRatio < 0.03)
         // R-1: the backend's capacity verdict is the accurate signal. It
         // compares the pinned set against what the cache can sustainably hold
         // (free disk + space the cache already occupies − the 10 GiB floor) —
@@ -364,12 +596,16 @@ struct MenuPopoverView: View {
             if cacheOff {
                 pressureBanner(
                     color: .red,
-                    text: "Disk under 1% free — JuiceFS has stopped caching. Reads fall back to network until you free space (try Reclaim)."
+                    text: hasEffectiveFloor
+                        ? String(format: "Cache paused at the %.1f GB safety floor — reads use the network until you free space (try Reclaim).", floorBytes / 1e9)
+                        : "Disk under 1% free — JuiceFS has stopped caching. Reads fall back to network until you free space (try Reclaim)."
                 )
             } else if cacheCutoffSoon {
                 pressureBanner(
                     color: .orange,
-                    text: "Disk under 3% free — JuiceFS will stop caching at 1% free. Reclaim or unpin large folders to keep caching alive."
+                    text: hasEffectiveFloor
+                        ? String(format: "Cache has %.1f GB before its safety floor — reclaim space or unpin large folders to keep SSD-speed reads available.", max(0, cacheHeadroomBytes) / 1e9)
+                        : "Disk under 3% free — JuiceFS will stop caching at 1% free. Reclaim or unpin large folders to keep caching alive."
                 )
             } else if overCapacity {
                 pressureBanner(
@@ -405,6 +641,7 @@ struct MenuPopoverView: View {
             guard let url = URL(string: "http://\(metricsAddr)/verify-pins") else { return }
             var req = URLRequest(url: url)
             req.httpMethod = "POST"
+            req.setValue("1", forHTTPHeaderField: "X-JM-Control")
             URLSession.shared.dataTask(with: req) { data, _, err in
                 if let err = err {
                     NSLog("[JuiceMount] verify-pins failed: %@",
@@ -462,6 +699,7 @@ struct MenuPopoverView: View {
             }
             var req = URLRequest(url: url)
             req.httpMethod = "POST"
+            req.setValue("1", forHTTPHeaderField: "X-JM-Control")
             let sem = DispatchSemaphore(value: 0)
             var freedGB: Double = 0
             var snapshots: Int = 0
@@ -520,6 +758,7 @@ struct MenuPopoverView: View {
             }
             var req = URLRequest(url: url)
             req.httpMethod = "POST"
+            req.setValue("1", forHTTPHeaderField: "X-JM-Control")
             let sem = DispatchSemaphore(value: 0)
             var freedGB: Double = 0
             var filesRemoved: Int = 0
@@ -551,70 +790,28 @@ struct MenuPopoverView: View {
 
     // MARK: - Diagnostics export
 
-    /// In-app rescue: force-unmount the NFS volume via the privileged
-    /// `umount -f -t nfs` path. Used when the kernel mount table has a
-    /// wedged entry (server died, kernel still has the mount registered,
-    /// every stat() hangs). Confirms first so it can't be accidental,
-    /// then POSTs /force-eject on the control plane which triggers the
-    /// AppleScript-with-admin path.
-    private func forceEjectMount() {
-        // S-2: derive the mount point + control-plane address from
-        // preferences instead of hardcoding the developer's setup.
+    /// Honest guidance for a stuck volume. H-3 (2026-10-06): the former
+    /// "Force Eject" action asked for an administrator password and
+    /// detached the volume by its path. A path cannot prove which kernel
+    /// mount it reaches, so a replaced or foreign volume at the same path
+    /// could be ejected. That action is gone. Until the JuiceMount unmount
+    /// helper ships, the only safe remedy is Quit + restart the Mac.
+    private func showStuckVolumeHelp() {
         let mountPoint = server.preferences.mountPoint
-        let metricsAddr = server.preferences.metricsAddr
         let alert = NSAlert()
-        alert.messageText = "Force Eject JuiceMount?"
+        alert.messageText = "Volume stuck?"
         alert.informativeText = """
-            This will unmount \(mountPoint) using a privileged kernel-level \
-            unmount. macOS will prompt for your administrator password.
+            If Finder hangs on \(mountPoint), or the menu reports a stale \
+            mount, first try Stop mount and finish sync, then Start.
 
-            Use this only if Stop didn't work or Finder is hanging on the \
-            mount. Any file currently open from the mount will see an \
-            "input/output error."
+            If the volume is still stuck, quit JuiceMount and restart the \
+            Mac. JuiceMount cannot safely eject a stuck volume until its \
+            unmount helper is installed. Pending uploads are kept and resume \
+            at the next launch.
             """
-        alert.alertStyle = .warning
-        alert.addButton(withTitle: "Force Eject")
-        alert.addButton(withTitle: "Cancel")
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
-
-        DispatchQueue.global(qos: .userInitiated).async {
-            guard let url = URL(string: "http://\(metricsAddr)/force-eject") else { return }
-            var req = URLRequest(url: url)
-            req.httpMethod = "POST"
-            // Long timeout — the AppleScript admin prompt may sit waiting
-            // for the user to enter their password before the underlying
-            // umount even runs.
-            req.timeoutInterval = 120
-
-            let sem = DispatchSemaphore(value: 0)
-            var ok = false
-            var errMsg: String?
-            URLSession.shared.dataTask(with: req) { data, _, err in
-                defer { sem.signal() }
-                if let err = err { errMsg = err.localizedDescription; return }
-                guard let data = data,
-                      let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-                else { errMsg = "Empty or invalid response from /force-eject"; return }
-                ok = (obj["ok"] as? Bool) ?? false
-                if !ok { errMsg = (obj["error"] as? String) ?? "Unknown error" }
-            }.resume()
-            sem.wait()
-
-            DispatchQueue.main.async {
-                if ok {
-                    let done = NSAlert()
-                    done.messageText = "Mount Ejected"
-                    done.informativeText = "\(mountPoint) is no longer in the kernel mount table. Finder should now be responsive."
-                    done.runModal()
-                } else {
-                    showAlert(
-                        title: "Force Eject Failed",
-                        message: (errMsg ?? "Unknown error")
-                            + "\n\nA reboot, or `sudo umount -f -t nfs \(mountPoint)` from a fresh terminal, will clear the wedge."
-                    )
-                }
-            }
-        }
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "OK")
+        alert.runModal()
     }
 
     /// Shows an NSSavePanel suggesting a timestamped filename on the
@@ -788,7 +985,7 @@ struct MenuPopoverView: View {
                 // needs the user (stalled/failed rows + the recover actions).
                 if s.hasActivity || s.needsAttention {
                     HStack {
-                        Text("\(s.pendingFiles) waiting · \(formatBytes(s.pendingBytes))\(s.oldestPendingAgeSec >= 120 ? " · oldest \(formatAge(s.oldestPendingAgeSec))" : "")")
+                        Text("\(s.pendingFiles) files · \(s.pendingSymlinks) links waiting · \(formatBytes(s.pendingBytes))\(s.oldestPendingAgeSec >= 120 ? " · oldest \(formatAge(s.oldestPendingAgeSec))" : "")")
                             .font(.caption)
                         Spacer()
                         if s.inProgress > 0 {
@@ -808,6 +1005,10 @@ struct MenuPopoverView: View {
                         HStack(spacing: 10) {
                             if s.stalledFiles > 0 {
                                 Label("\(s.stalledFiles) stalled", systemImage: "exclamationmark.circle.fill")
+                                    .foregroundStyle(.orange)
+                            }
+                            if s.replacementConflicts > 0 {
+                                Label("\(s.replacementConflicts) need review", systemImage: "exclamationmark.circle.fill")
                                     .foregroundStyle(.orange)
                             }
                             if s.failedFiles > 0 {
@@ -837,7 +1038,7 @@ struct MenuPopoverView: View {
                             }
                             // Status detail line for problem entries only:
                             // "writing · 2h — stalled" / "failed · 5m".
-                            if e.stalled || e.drainState == "failed" {
+                            if e.stalled || e.drainState == "failed" || e.replacementStatusLabel != nil {
                                 Text(entryStatusLine(e))
                                     .font(.caption2)
                                     .foregroundStyle(e.drainState == "failed" ? .red : .orange)
@@ -865,8 +1066,8 @@ struct MenuPopoverView: View {
                             .help(err)
                     }
 
-                    // Recovery actions → /spool-recover (LB-5).
-                    if s.needsAttention {
+                    // Generic recovery cannot resolve an accepted replacement.
+                    if s.failedFiles > 0 || s.stalledFiles > 0 {
                         HStack(spacing: 8) {
                             if s.failedFiles > 0 {
                                 Button("Retry failed") { runSpoolRecover("retry-failed") }
@@ -958,18 +1159,21 @@ struct MenuPopoverView: View {
     /// Entry-aware icon: stalled overrides the per-state icon so a stuck
     /// `writing` row stops masquerading as routine activity.
     private func entryIcon(_ e: NFSBridge.SpoolEntryView) -> String {
-        e.stalled ? "exclamationmark.circle.fill" : drainStateIcon(e.drainState)
+        if e.replacementNeedsAttention { return "exclamationmark.circle.fill" }
+        if e.replacementIsWaiting { return "clock" }
+        return e.stalled ? "exclamationmark.circle.fill" : drainStateIcon(e.drainState)
     }
 
     private func entryColor(_ e: NFSBridge.SpoolEntryView) -> Color {
-        e.stalled ? .orange : drainStateColor(e.drainState)
+        if e.replacementNeedsAttention || e.replacementIsWaiting { return .orange }
+        return e.stalled ? .orange : drainStateColor(e.drainState)
     }
 
     /// "writing · 2h — stalled" / "failed · 5m" status detail.
     private func entryStatusLine(_ e: NFSBridge.SpoolEntryView) -> String {
-        var line = "\(e.drainState) · \(formatAge(e.ageSec))"
+        var line = "\(e.replacementStatusLabel ?? e.drainState) · \(formatAge(e.ageSec))"
         if e.stalled { line += " — stalled" }
-        if e.drainState == "failed", let err = e.lastError, !err.isEmpty {
+        if e.drainState == "failed" || e.replacementNeedsAttention || e.replacementIsWaiting, let err = e.lastError, !err.isEmpty {
             line += " — \(err)"
         }
         return line
@@ -979,14 +1183,15 @@ struct MenuPopoverView: View {
     private func entryTooltip(_ e: NFSBridge.SpoolEntryView) -> String {
         var parts = ["\(e.path)", "state: \(e.drainState)\(e.stalled ? " (stalled)" : "")", "age: \(formatAge(e.ageSec))"]
         if e.drainAttempts > 0 { parts.append("attempts: \(e.drainAttempts)") }
-        if let err = e.lastError, !err.isEmpty { parts.append("last error: \(err)") }
+        if e.drainState == "failed" || e.replacementNeedsAttention || e.replacementIsWaiting,
+           let err = e.lastError, !err.isEmpty { parts.append("last error: \(err)") }
         return parts.joined(separator: "\n")
     }
 
     /// First error worth surfacing under the entry list: a problem entry's
     /// last_error, else the endpoint-level error string.
     private func firstSpoolError(_ s: NFSBridge.SpoolStatus) -> String? {
-        if let e = s.entries.first(where: { ($0.stalled || $0.drainState == "failed") && !($0.lastError ?? "").isEmpty }) {
+        if let e = s.entries.first(where: { ($0.stalled || $0.drainState == "failed" || $0.replacementNeedsAttention) && !($0.lastError ?? "").isEmpty }) {
             return e.lastError
         }
         if let err = s.error, !err.isEmpty { return err }
@@ -1102,16 +1307,20 @@ struct MenuPopoverView: View {
                     Text("Self-test: error")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
+                } else if result.status == "deferred" {
+                    Text("Self-test: deferred on constrained link")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
                 } else if result.mb_per_sec > 0 {
                     // B.6: show first-byte RTT alongside MB/s when
                     // available. RTT is a distinct signal (round-trip
                     // latency) from throughput (sustained transfer).
                     if result.first_byte_ms > 0 {
-                        Text("Self-test: \(String(format: "%.0f", result.mb_per_sec)) MB/s · \(result.first_byte_ms)ms RTT")
+                        Text("Self-test: \(selfTestSpeed(result.mb_per_sec)) MB/s · \(result.first_byte_ms)ms RTT")
                             .font(.caption2)
                             .foregroundStyle(.secondary)
                     } else {
-                        Text("Self-test: \(String(format: "%.0f", result.mb_per_sec)) MB/s")
+                        Text("Self-test: \(selfTestSpeed(result.mb_per_sec)) MB/s")
                             .font(.caption2)
                             .foregroundStyle(.secondary)
                     }
@@ -1129,7 +1338,7 @@ struct MenuPopoverView: View {
                 }
                 .buttonStyle(.plain)
                 .help(result.hint.isEmpty
-                      ? "Re-run the 10 MB read self-test."
+                      ? "Run an adaptive read self-test."
                       : "\(result.hint)\n\nClick to re-run.")
             }
         }
@@ -1141,8 +1350,13 @@ struct MenuPopoverView: View {
         case "yellow": return .yellow
         case "red":    return .red
         case "error":  return .orange
+        case "constrained": return .blue
         default:       return .gray
         }
+    }
+
+    private func selfTestSpeed(_ mbPerSec: Double) -> String {
+        String(format: mbPerSec < 10 ? "%.2f" : "%.0f", mbPerSec)
     }
 
     /// Opens a folder picker rooted at the JuiceMount mount and pins the
@@ -1323,6 +1537,10 @@ struct MenuPopoverView: View {
         .onChange(of: server.cacheStatus.offline_mode) { _, backend in
             // Reflect backend-driven changes without triggering a write.
             if offlineSwitch != backend { offlineSwitch = backend }
+        }
+        .disabled(server.offlineChangeInFlight)
+        .onChange(of: server.offlineChangeInFlight) { _, pending in
+            if !pending { offlineSwitch = server.cacheStatus.offline_mode }
         }
         .onAppear { offlineSwitch = server.cacheStatus.offline_mode }
         .help(offlineSwitch
@@ -1540,8 +1758,8 @@ struct MenuPopoverView: View {
         switch phase {
         case "starting": return "Starting up…"
         case "indexing": return "Rebuilding index…"
-        case "warming":  return "Warming up…"
-        default:         return "Warming up…"
+        case "warming":  return "Ready — optimizing…"
+        default:         return "Optimizing…"
         }
     }
 
@@ -1638,7 +1856,7 @@ struct MenuPopoverView: View {
                     }
                 }
                 .disabled(server.mountNowInFlight)
-                .help("Re-mounts the volume via mount_nfs. May ask for your password once unless the scoped sudoers rule is installed.")
+                .help("Re-mounts the volume. macOS may ask for your administrator password to create the mount folder.")
             }
         }
     }
@@ -1772,6 +1990,16 @@ struct MenuPopoverView: View {
                 Text("\(sp.inProgress) uploading · \(max(0, sp.pendingFiles - Int(sp.inProgress))) queued")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                if sp.pendingSymlinks > 0 {
+                    Text("\(sp.pendingSymlinks) links")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                if sp.replacementConflicts > 0 {
+                    Text("\(sp.replacementConflicts) need review")
+                        .font(.caption2)
+                        .foregroundStyle(Self.glanceAmber)
+                }
                 if sp.failedFiles > 0 {
                     Text("\(sp.failedFiles) failed")
                         .font(.caption2)
@@ -1927,6 +2155,9 @@ struct MenuPopoverView: View {
                 healthRow(label: "Redis", healthy: server.stats.healthRedis)
                 healthRow(label: "MinIO", healthy: server.stats.healthMinIO)
                 healthRow(label: "FUSE",  healthy: server.stats.healthFUSE)
+                if let row = helperReadiness.map(UnmountHelperDecision.row(for:)), row.visible {
+                    healthRow(label: row.title, healthy: row.tone == .ok)
+                }
             }
             .padding(.top, 4)
         } label: {
@@ -2058,21 +2289,18 @@ struct MenuPopoverView: View {
                 action: { exportDiagnostics() }
             )
 
-            // In-app rescue when the kernel mount table is wedged.
-            // Runs `umount -f -t nfs <path>` via AppleScript-with-admin,
-            // which is the only thing that can dislodge an NFS mount whose
-            // server has died. Hidden behind a clear confirmation so the
-            // user doesn't accidentally trigger it.
+            // Stuck-volume guidance. There is no in-app eject until the
+            // JuiceMount unmount helper ships (see showStuckVolumeHelp).
             ActionButton(
-                title: "Force Eject Mount",
-                systemImage: "eject.circle",
-                tint: .orange,
-                action: { forceEjectMount() }
+                title: "Volume Stuck?",
+                systemImage: "questionmark.circle",
+                action: { showStuckVolumeHelp() }
             )
 
-            // Sparkle auto-updater. Manual trigger; background checks run on
-            // their own schedule (SUScheduledCheckInterval). The handler
-            // brings the accessory app forward so the update sheet is visible.
+            // Sparkle updater. Manual-only by privacy policy: the controller is
+            // not started until this action, and Info.plist disables automatic
+            // checks. The handler brings the accessory app forward so the
+            // update sheet is visible.
             ActionButton(
                 title: "Check for Updates…",
                 systemImage: "arrow.down.circle",
@@ -2095,9 +2323,11 @@ struct MenuPopoverView: View {
         switch server.state {
         case .idle:
             ActionButton(
-                title: "Start JuiceMount",
+                title: server.linkTestInFlight ? "Testing Link…" :
+                    (server.lifecycleOperationInFlight ? "Finishing stop…" : "Start JuiceMount"),
                 systemImage: "play.fill",
                 tint: .accentColor,
+                disabled: server.linkTestInFlight || server.lifecycleOperationInFlight,
                 action: { server.start() }
             )
         case .error, .disconnected:
@@ -2151,8 +2381,8 @@ struct MenuPopoverView: View {
             //     keeps FUSE + JuiceFS alive so next Start is fast.
             //   - "Stop everything" → ServerController.stop()
             //     Full teardown — also unmounts FUSE + kills JuiceFS
-            //     daemons. Next Start re-mounts (admin password if
-            //     passwordless-sudo not configured).
+            //     daemons. Next Start re-mounts (may ask for
+            //     administrator approval).
             ActionButton(
                 title: "Stop mount and finish sync",
                 systemImage: "pause.fill",
@@ -2187,7 +2417,7 @@ struct MenuPopoverView: View {
     /// Start — but the user should know uploads are pausing.)
     private var stopEverythingSpoolWarning: String {
         guard let s = server.spoolStatus, s.enabled, s.hasActivity else { return "" }
-        return "\n\n\(s.pendingFiles) file\(s.pendingFiles == 1 ? "" : "s") (\(formatBytes(s.pendingBytes))) are still uploading to the NAS — they stay queued on this Mac and resume on the next Start (keep the write spool enabled)."
+        return "\n\n\(s.pendingFiles) file\(s.pendingFiles == 1 ? "" : "s") (\(formatBytes(s.pendingBytes))) and \(s.pendingSymlinks) link\(s.pendingSymlinks == 1 ? "" : "s") are still pending — they stay queued on this Mac and resume on the next Start (keep the write spool enabled)."
     }
 
     private var isRunningLike: Bool {

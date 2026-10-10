@@ -63,7 +63,9 @@ func newSpoolWiredHandlerNoDrain(t *testing.T) (*juiceFS, *SpoolStore, *Drainer,
 		t.Fatalf("new drainer: %v", err)
 	}
 	handler.SetSpool(spool, nil)
-	drainer.SetOnDrainComplete(handler.onSpoolDrained)
+	drainer.SetOnDrainCommit(store.DrainComplete)
+	drainer.SetOnDrainAdmission(func(name string) *namespaceOperation { return handler.namespace.begin([]string{name}) })
+	drainer.SetOnDrainEffects(handler.applyLegacyDrainEffects)
 	t.Cleanup(func() {
 		handler.StopHandler()
 		_ = store.Close()
@@ -82,6 +84,23 @@ func patternedPayload(n int, seed byte) []byte {
 
 func drainAllForTest(t *testing.T, d *Drainer) {
 	t.Helper()
+	// Retry eligibility is durable now. Keep this broad fixture helper's
+	// existing "process next available attempt" meaning for short test
+	// backoffs, while focused due-time tests call DrainOnceForTest directly.
+	if rows, err := d.spool.Meta().ListAll(); err == nil {
+		var earliest time.Time
+		for _, r := range rows {
+			if r.DrainState != metadata.DrainReady || r.RetryAfter.IsZero() {
+				continue
+			}
+			if earliest.IsZero() || r.RetryAfter.Before(earliest) {
+				earliest = r.RetryAfter
+			}
+		}
+		if wait := time.Until(earliest); !earliest.IsZero() && wait > 0 && wait < 100*time.Millisecond {
+			time.Sleep(wait + time.Millisecond)
+		}
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	d.DrainOnceForTest(ctx)
@@ -520,21 +539,22 @@ func TestDrainerStaleSnapshotClaimDrainsToFreshPath(t *testing.T) {
 		t.Fatalf("dispatchRow reported stop signal")
 	}
 
-	// The drain runs in a worker goroutine — wait for the row to terminal.
-	deadline := time.Now().Add(10 * time.Second)
-	for {
-		r, gerr := spool.Meta().Get(snap.ID)
-		if gerr == nil && r.DrainState == metadata.DrainDone {
-			break
-		}
-		if time.Now().After(deadline) {
-			state := "<unreadable>"
-			if gerr == nil {
-				state = string(r.DrainState)
-			}
-			t.Fatalf("drain never reached done: state=%s err=%v", state, gerr)
-		}
-		time.Sleep(10 * time.Millisecond)
+	// SQL done precedes descriptor effects and private-source cleanup. The
+	// fixture has no dispatcher, and dispatchRow adds this worker before
+	// returning, so joining it proves the entire stale-snapshot drain settled.
+	done := make(chan struct{})
+	go func() { drainer.inFlight.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		panic("stale-snapshot drain worker did not settle before fixture teardown")
+	}
+	row, err := spool.Meta().Get(snap.ID)
+	if err != nil || row.DrainState != metadata.DrainDone {
+		t.Fatalf("settled drain row=%+v err=%v, want done", row, err)
+	}
+	if got := drainer.Metrics().DrainsSucceeded.Load(); got != 1 {
+		t.Fatalf("settled successful drains=%d, want 1", got)
 	}
 
 	got, err := os.ReadFile(filepath.Join(fuseRoot, "stale-new.bin"))

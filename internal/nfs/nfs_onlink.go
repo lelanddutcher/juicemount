@@ -61,10 +61,10 @@ func onLink(ctx context.Context, w *response, userHandle Handler) error {
 
 	err = cos.Link(string(target), newFilePath)
 	if err != nil {
-		return &NFSStatusError{NFSStatusAccess, err}
+		return writeRefusalStatus(err, NFSStatusAccess)
 	}
 	if err := attrs.Apply(changer, fs, newFilePath); err != nil {
-		return &NFSStatusError{NFSStatusIO, err}
+		return writeRefusalStatus(err, NFSStatusIO)
 	}
 
 	writer := bytes.NewBuffer([]byte{})

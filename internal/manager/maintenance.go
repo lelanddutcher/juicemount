@@ -28,6 +28,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -100,10 +101,11 @@ type MaintenanceOp struct {
 	Error      string           `json:"error,omitempty"`
 
 	// runtime-only — not serialized
-	mu        sync.Mutex          `json:"-"`
-	cancel    context.CancelFunc  `json:"-"`
-	listeners []chan string       `json:"-"`
-	truncated bool                `json:"-"`
+	mu        sync.Mutex         `json:"-"`
+	cancel    context.CancelFunc `json:"-"`
+	listeners []chan string      `json:"-"`
+	truncated bool               `json:"-"`
+	env       []string           `json:"-"` // extra subprocess env (META_PASSWORD); never serialized
 }
 
 // MaintenanceRunner is the subprocess-execution indirection. Default
@@ -123,9 +125,10 @@ type MaintenanceRunner func(ctx context.Context, argv []string, op *MaintenanceO
 // have a stable receiver.
 type MaintenanceManager struct {
 	juicefsBin string
-	fuseMount  string // empty in standalone mode (warmup / cache-flush degrade to 501)
-	metaURL    string // empty when not configured (gc / fsck / compact-meta degrade to 501)
-	destMount  string // user-facing /jfs prefix for warmup-path rewriting
+	fuseMount  string   // empty in standalone mode (warmup / cache-flush degrade to 501)
+	metaURL    string   // empty when not configured (gc / fsck / compact-meta degrade to 501). Never carries a password (H-8B).
+	metaEnv    []string // META_PASSWORD for the maintenance principal (bg), passed to every op
+	destMount  string   // user-facing /jfs prefix for warmup-path rewriting
 
 	runner MaintenanceRunner
 
@@ -148,10 +151,18 @@ type MaintenanceManager struct {
 // mirror the same-named API fields; destMount is the user-facing
 // prefix the warmup handler rewrites against.
 func newMaintenanceManager(juicefsBin, fuseMount, metaURL, destMount string) *MaintenanceManager {
+	// H-8B: gc / compact / fsck run as the background-job principal (bg):
+	// delSlices and sliceRef are bg-only at the proxy. The argv URL is
+	// user@host only; the password reaches juicefs through META_PASSWORD.
+	var metaEnv []string
+	if metaURL != "" {
+		metaURL, metaEnv = metaArgvEnv(metaURL, metaRoleBG)
+	}
 	mm := &MaintenanceManager{
 		juicefsBin: juicefsBin,
 		fuseMount:  fuseMount,
 		metaURL:    metaURL,
+		metaEnv:    metaEnv,
 		destMount:  destMount,
 		runner:     execMaintenance,
 		kindMu:     make(map[MaintenanceKind]*sync.Mutex, len(allMaintenanceKinds)),
@@ -201,6 +212,7 @@ func (mm *MaintenanceManager) tryStart(kind MaintenanceKind, argv []string) (*Ma
 		State:     MaintenancePending,
 		StartedAt: time.Now().UnixMilli(),
 		Output:    make([]string, 0, 64),
+		env:       mm.metaEnv,
 	}
 	mm.mu.Lock()
 	mm.active[kind] = op
@@ -214,11 +226,10 @@ func (mm *MaintenanceManager) tryStart(kind MaintenanceKind, argv []string) (*Ma
 
 	// Run the subprocess on a goroutine so the HTTP handler can
 	// return immediately and the client polls /stream for live
-	// output. Mutex is released in the goroutine's defer chain so a
-	// second same-kind request between accept and exec correctly
-	// returns 409.
+	// output. The mutex is released only after the runner reaches a terminal
+	// state, so a second same-kind request between accept and completion
+	// correctly returns 409.
 	go func() {
-		defer mu.Unlock()
 		// Release context resources as soon as the runner returns.
 		// Without this, ctx + its internal channels stay live until GC
 		// runs on the op snapshot — bounded (≤5 ops in mm.last) but
@@ -239,9 +250,17 @@ func (mm *MaintenanceManager) tryStart(kind MaintenanceKind, argv []string) (*Ma
 		}
 		op.closeListenersLocked()
 		op.mu.Unlock()
+
+		// Publish completion and release the per-kind gate as one ordered
+		// handoff. Previously active[kind] was cleared before a deferred
+		// mu.Unlock ran, so a caller could observe "not active" and still receive
+		// errKindBusy. Keep mm.mu held while unlocking the gate, then clear the
+		// active slot; any new starter can acquire the gate but cannot publish its
+		// new active op until this bookkeeping is complete.
 		mm.mu.Lock()
-		delete(mm.active, kind)
 		mm.last[kind] = op
+		mu.Unlock()
+		delete(mm.active, kind)
 		mm.mu.Unlock()
 	}()
 	return op, nil
@@ -383,6 +402,9 @@ func execMaintenance(ctx context.Context, argv []string, op *MaintenanceOp) erro
 		return errors.New("empty argv")
 	}
 	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
+	if len(op.env) > 0 {
+		cmd.Env = append(os.Environ(), op.env...)
+	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return fmt.Errorf("stdout pipe: %w", err)

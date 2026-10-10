@@ -44,14 +44,14 @@ type ProgressEvent struct {
 
 // Job tracks the lifecycle of one sync invocation.
 type Job struct {
-	ID          string        `json:"id"`
-	Source      string        `json:"source"`
-	Destination string        `json:"destination"`
-	Options     SyncOptions   `json:"options"`
-	State       JobState      `json:"state"`
-	CreatedAt   int64         `json:"created_at"` // unix-ms
-	StartedAt   int64         `json:"started_at"`
-	FinishedAt  int64         `json:"finished_at"`
+	ID          string      `json:"id"`
+	Source      string      `json:"source"`
+	Destination string      `json:"destination"`
+	Options     SyncOptions `json:"options"`
+	State       JobState    `json:"state"`
+	CreatedAt   int64       `json:"created_at"` // unix-ms
+	StartedAt   int64       `json:"started_at"`
+	FinishedAt  int64       `json:"finished_at"`
 	// TotalBytes is the pre-computed source size from the UI's preview
 	// pane, passed through on job creation. Used by the frontend to
 	// render a real % progress bar (vs an indeterminate placeholder).
@@ -703,7 +703,7 @@ func (m *JobManager) Cancel(id string) bool {
 		return false
 	}
 	j.mu.Lock()
-	defer j.mu.Unlock()
+	canceled := false
 	switch j.State {
 	case JobPending, JobRunning:
 		if j.cancel != nil {
@@ -711,7 +711,7 @@ func (m *JobManager) Cancel(id string) bool {
 		}
 		j.State = JobCanceled
 		j.FinishedAt = time.Now().UnixMilli()
-		j.notifyListenersLocked(ProgressEvent{
+		j.Last = mergeProgress(j.Last, ProgressEvent{
 			Files:     j.Last.Files,
 			Bytes:     j.Last.Bytes,
 			Errors:    j.Last.Errors,
@@ -719,11 +719,21 @@ func (m *JobManager) Cancel(id string) bool {
 			ETASec:    -1,
 			UpdatedAt: j.FinishedAt,
 		})
+		j.notifyListenersLocked(j.Last)
 		j.closeListenersLocked()
-		return true
-	default:
-		return false
+		canceled = true
 	}
+	j.mu.Unlock()
+	if canceled {
+		// Pending cancellations have no runner completion path to persist them;
+		// running cancellations should be durable immediately rather than only
+		// after the subprocess notices its context. Do not hold j.mu here because
+		// saveStateLocked snapshots every job under that same lock.
+		m.mu.Lock()
+		m.saveStateLocked()
+		m.mu.Unlock()
+	}
+	return canceled
 }
 
 // Subscribe returns a channel that receives every subsequent
@@ -737,19 +747,32 @@ func (m *JobManager) Subscribe(id string) (<-chan ProgressEvent, func(), bool) {
 	}
 	ch := make(chan ProgressEvent, 32)
 	j.mu.Lock()
-	j.listeners = append(j.listeners, ch)
 	last := j.Last
-	state := j.State
-	j.mu.Unlock()
-
-	// Emit the current snapshot immediately so the subscriber gets
-	// the latest state without waiting for the next tick.
-	if last.UpdatedAt > 0 {
-		ch <- last
+	terminal := j.State == JobDone || j.State == JobError || j.State == JobCanceled
+	// Every subscriber gets one immediate snapshot, even when the runner emitted
+	// no progress events (for example an empty migration that completed before
+	// the browser opened its SSE stream). Use the lifecycle timestamp so this is
+	// a real point-in-time state, not an all-zero placeholder.
+	if last.UpdatedAt == 0 {
+		last.UpdatedAt = j.CreatedAt
+		if j.StartedAt > last.UpdatedAt {
+			last.UpdatedAt = j.StartedAt
+		}
+		if j.FinishedAt > last.UpdatedAt {
+			last.UpdatedAt = j.FinishedAt
+		}
 	}
-	if state == JobDone || state == JobError || state == JobCanceled {
+	ch <- last
+	if terminal {
 		close(ch)
+	} else {
+		// Register while still holding j.mu. The runner uses the same lock to
+		// notify and close listeners, so it cannot close ch between this initial
+		// send and registration (the old unlock-then-send ordering could panic by
+		// sending on a concurrently closed channel).
+		j.listeners = append(j.listeners, ch)
 	}
+	j.mu.Unlock()
 
 	cleanup := func() {
 		j.mu.Lock()
@@ -792,6 +815,15 @@ func (m *JobManager) StopAll() {
 func (m *JobManager) run(j *Job) {
 	ctx, cancel := context.WithCancel(context.Background())
 	j.mu.Lock()
+	// Cancel/StopAll can win the small window between Submit launching this
+	// goroutine and the goroutine acquiring j.mu. Never resurrect that terminal
+	// job as Running or start its external sync process.
+	if j.State != JobPending {
+		j.mu.Unlock()
+		cancel()
+		m.advanceQueue(j)
+		return
+	}
 	j.cancel = cancel
 	j.State = JobRunning
 	j.StartedAt = time.Now().UnixMilli()
@@ -853,17 +885,28 @@ func (m *JobManager) run(j *Job) {
 	default:
 		j.State = JobDone
 	}
+	if j.Last.UpdatedAt < j.FinishedAt {
+		j.Last.UpdatedAt = j.FinishedAt
+	}
 	j.notifyListenersLocked(j.Last)
 	j.closeListenersLocked()
 	j.mu.Unlock()
 
-	// Dequeue and kick the next pending job if any.
+	m.advanceQueue(j)
+}
+
+// advanceQueue removes completed from the single active slot and starts the
+// next job that is still pending. Job state belongs to Job.mu; reading it only
+// under JobManager.mu raced with Cancel, which writes the state under Job.mu.
+func (m *JobManager) advanceQueue(completed *Job) {
 	m.mu.Lock()
-	m.active = nil
+	if m.active == completed {
+		m.active = nil
+	}
 	var nextToRun *Job
 	for _, id := range m.order {
 		next := m.jobs[id]
-		if next.State == JobPending {
+		if next.GetState() == JobPending {
 			m.active = next
 			nextToRun = next
 			break

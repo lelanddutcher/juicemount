@@ -1,0 +1,59 @@
+# Rebuild only the Manager Go binary and layer it over a proven runtime image.
+# This keeps headscale, JuiceFS, curl, and the runtime entrypoint identical while
+# allowing a small control-plane fix to be promoted without re-fetching them.
+ARG BASE_IMAGE=jm-manager:rc-0.5
+ARG JM_VERSION
+ARG JM_COMMIT
+FROM golang:1.26.6-alpine AS gobuild
+ARG JM_VERSION
+ARG JM_COMMIT
+
+WORKDIR /src
+RUN apk add --no-cache git build-base
+RUN test -n "$JM_VERSION" \
+    && echo "$JM_COMMIT" | grep -Eq '^[0-9a-f]{40}$'
+COPY go.mod go.sum ./
+# go.mod replaces juicefs with this vendored tree; module download needs it.
+COPY third_party/juicefs ./third_party/juicefs
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build \
+      -ldflags="-s -w -X github.com/lelanddutcher/juicemount/internal/version.Version=${JM_VERSION} -X github.com/lelanddutcher/juicemount/internal/version.Commit=${JM_COMMIT}" \
+      -o /out/juicemount-manager ./cmd/juicemount-manager
+
+FROM ${BASE_IMAGE}
+ARG JM_VERSION
+ARG JM_COMMIT
+LABEL org.opencontainers.image.version="${JM_VERSION}" \
+      org.opencontainers.image.revision="${JM_COMMIT}"
+COPY --from=gobuild /out/juicemount-manager /usr/local/bin/juicemount-manager
+RUN test "$(/usr/local/bin/juicemount-manager --build-info)" = "juicemount-manager ${JM_VERSION} (${JM_COMMIT})"
+
+# Override any older base-image probe that placed the expanded admin key in
+# curl argv. Stream curl configuration over stdin so the credential stays out
+# of process listings while retaining full Link-readiness validation.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
+    CMD printf 'header = "X-JuiceMount-Admin-Key: %s"\n' "$JM_ADMIN_KEY" \
+          | curl --config - -fsS http://localhost:8080/api/sources >/dev/null \
+      && { [ "$JM_NET_HEADSCALE" != "on" ] \
+        || printf 'header = "X-JuiceMount-Admin-Key: %s"\n' "$JM_ADMIN_KEY" \
+          | curl --config - -fsS http://localhost:8080/api/net/link \
+          | grep -Eq '"data_plane_ready"[[:space:]]*:[[:space:]]*true'; } \
+      || exit 1
+
+# Override the base image entrypoint so an older proven runtime can be used
+# without inheriting an entrypoint that expands JM_ADMIN_KEY into argv. The Go
+# binary reads JM_ADMIN_KEY directly from the environment when --admin-key is
+# omitted.
+# H-8B: --meta and --overview-meta reach argv (/proc/<pid>/cmdline), so they
+# must be user@host only; the Manager reads the password from
+# JM_META_PASSWORD. Refuse to start with a password inline.
+ENTRYPOINT ["/bin/sh", "-c", "for u in \"${JM_META:-}\" \"${JM_OVERVIEW_META:-}\"; do case \"$u\" in *://*:*@*) echo 'juicemount-manager: JM_META/JM_OVERVIEW_META must not carry a password; set JM_META_PASSWORD' >&2; exit 2 ;; esac; done; \
+    exec /usr/local/bin/juicemount-manager \
+    --listen=\"$JM_LISTEN\" \
+    --dest-mount=\"$JM_DEST_MOUNT\" \
+    --source-roots=\"$JM_SOURCE_ROOTS\" \
+    --vol-name=\"$JM_VOL_NAME\" \
+    --meta=\"${JM_META:-}\" \
+    --overview-meta=\"${JM_OVERVIEW_META:-}\" \
+    \"$@\"", "--"]

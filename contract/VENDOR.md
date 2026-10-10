@@ -1,28 +1,21 @@
-# Vendored contract (pinned copy)
+# Contract bundled with the 0.5 checkpoint
 
-This directory is a **pinned, read-only copy** of the [`juicemount-contract`](https://github.com/lelanddutcher/juicemount-contract)
-repo — the language-neutral wire contract between JuiceMount and OpenLoupe.
+This directory contains version 3 of the language-neutral control-plane schemas
+and golden fixtures used by this JuiceMount source snapshot. The release source
+commit identifies these exact bytes. Provider conformance tests read `spec/`,
+`fixtures/`, and `VERSION` directly.
 
-- **Source:** `github.com/lelanddutcher/juicemount-contract`
-- **Pinned commit:** `a59b87f1534b0ab82ae233581c625a92fc8b08e2`
-- **contract_version:** see [`VERSION`](VERSION) (currently `1`)
+The bundle has not been reconciled to a clean canonical consumer-contract commit.
+Passing its provider tests does not establish full compatibility with every
+consumer. The final consumer workflow, including pin and unpin, remains under
+qualification; see [checkpoint limits](../docs/release-0.5.md).
 
-Only `spec/` (schemas) + `fixtures/` (golden responses) + `VERSION` are vendored — the
-files the Go conformance test reads. We vendor a copy rather than a git submodule because
-JuiceMount is a **public** repo and the contract repo is private; a private submodule would
-break `git clone --recursive` and CI for the public.
+## Updating the bundle
 
-## Re-vendoring after a contract bump
+Review schema and fixture changes together with the provider and consumer. Import
+only `spec/`, `fixtures/`, and `VERSION` from a clean canonical revision, record
+that revision here, and run provider and consumer conformance before claiming
+compatibility. A historical version-2 pin does not identify these version-3 bytes.
 
-```sh
-SRC=/path/to/juicemount-contract
-rm -rf contract/spec contract/fixtures
-cp -R "$SRC/spec" "$SRC/fixtures" contract/
-cp "$SRC/VERSION" contract/VERSION
-# update the pinned commit above; the conformance test will fail loudly if the
-# real control plane no longer matches the new fixtures.
-```
-
-The conformance test (`bridge/contract_conformance_test.go`) reads `contract/spec/` +
-`contract/fixtures/` directly, so a re-vendor immediately re-checks the live server against
-the new contract.
+The schemas are vendored so a public clone can build and run conformance tests
+without access to a private repository or submodule.
