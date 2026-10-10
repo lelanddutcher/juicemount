@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -16,6 +17,16 @@ import (
 	"github.com/lelanddutcher/juicemount/internal/mountbroker"
 	"github.com/lelanddutcher/juicemount/internal/mounttable"
 )
+
+// These tests enter the native target admission path, whose ACL and descriptor
+// custody implementations exist only on macOS. Pure gate/protocol tests remain
+// cross-platform in the same files.
+func requireDarwinNativeTarget(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS != "darwin" {
+		t.Skip("native NFS target admission requires macOS")
+	}
+}
 
 func noMountController(t *testing.T) (*Controller, mountbroker.Creator, mountbroker.Spec) {
 	t.Helper()
@@ -74,6 +85,7 @@ func TestNFSForegroundMountArgsOverrideInheritedBackground(t *testing.T) {
 }
 
 func TestNFSNormalFailedForegroundChildRetiresOwnOperation(t *testing.T) {
+	requireDarwinNativeTarget(t)
 	c, creator, spec := harmlessMountChild(t, "exit 7")
 	done := c.createOperation(context.Background(), c.startCommand)
 	<-done
@@ -100,6 +112,7 @@ func TestNFSNormalFailedForegroundChildRetiresOwnOperation(t *testing.T) {
 }
 
 func TestNFSForegroundFailureProofRefusesZeroSignalAndPending(t *testing.T) {
+	requireDarwinNativeTarget(t)
 	for _, tc := range []struct {
 		name, body string
 		pending    bool
@@ -410,6 +423,7 @@ func TestNFSControllerRefusesRemoteAncestorBeforeTraversal(t *testing.T) {
 }
 
 func TestNFSTargetRevalidationReadsNewDirectoryStream(t *testing.T) {
+	requireDarwinNativeTarget(t)
 	root := t.TempDir()
 	path := filepath.Join(root, "leaf")
 	if err := os.Mkdir(path, 0700); err != nil {

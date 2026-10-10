@@ -174,6 +174,7 @@ func journalState(t *testing.T, c *Controller) mountbroker.State {
 }
 
 func TestNFSStartRegistersExactReceiptAndHoldsLease(t *testing.T) {
+	requireDarwinNativeTarget(t)
 	c, _ := helperFixture(t, "detached")
 	fake := &fakeUnmountd{}
 	c.SetUnmountHelper(fake)
@@ -208,6 +209,7 @@ func TestNFSStartRegistersExactReceiptAndHoldsLease(t *testing.T) {
 }
 
 func TestNFSRegisterFailureKeepsDescriptorBehaviour(t *testing.T) {
+	requireDarwinNativeTarget(t)
 	c, _ := helperFixture(t, "detached")
 	c.SetUnmountHelper(&fakeUnmountd{registerErr: client.ErrUnavailable})
 	if err := c.Start(context.Background()); err != nil {
@@ -225,6 +227,7 @@ func TestNFSRegisterFailureKeepsDescriptorBehaviour(t *testing.T) {
 // registered fsid to the helper; after the helper's RETIRED proof and a
 // fresh absence it kills only the held custodian and retires the journal.
 func TestNFSStopFallsBackToHelperWhenDescriptorDetachRetained(t *testing.T) {
+	requireDarwinNativeTarget(t)
 	c, marker := helperFixture(t, "retained_retry")
 	fake := &fakeUnmountd{}
 	fake.onRetire = func(call retireCall) { _ = os.Remove(marker) } // the helper's kernel effect
@@ -252,6 +255,7 @@ func TestNFSStopFallsBackToHelperWhenDescriptorDetachRetained(t *testing.T) {
 
 // Without proof (helper busy, pending, or absent) Stop retains everything.
 func TestNFSStopWithoutHelperProofRetainsBusyMount(t *testing.T) {
+	requireDarwinNativeTarget(t)
 	for name, fake := range map[string]*fakeUnmountd{
 		"pending": {retireErr: client.ErrPending},
 		"refused": {retireState: "REFUSED_IDENTITY"},
@@ -284,6 +288,7 @@ func TestNFSStopWithoutHelperProofRetainsBusyMount(t *testing.T) {
 // Eject-now while a Stop is blocked: RetireWithHelper does not take the
 // controller gate and the next Stop consumes its proof.
 func TestNFSEjectNowProofCompletesLaterStop(t *testing.T) {
+	requireDarwinNativeTarget(t)
 	c, marker := helperFixture(t, "retained_retry")
 	fake := &fakeUnmountd{retireErr: client.ErrPending}
 	c.SetUnmountHelper(fake)
@@ -328,6 +333,7 @@ func TestNFSRetireWithHelperRefusesUnregistered(t *testing.T) {
 // /eject-now's 30 s floor is measured from the first ordinary retire that
 // came back still busy; a Stop's cancel clears it.
 func TestNFSOrdinaryBusyTrackedAndClearedByCancel(t *testing.T) {
+	requireDarwinNativeTarget(t)
 	c, _ := helperFixture(t, "retained_retry")
 	fake := &fakeUnmountd{retireErr: client.ErrPending}
 	c.SetUnmountHelper(fake)
@@ -375,6 +381,7 @@ func TestNFSOrdinaryBusyTrackedAndClearedByCancel(t *testing.T) {
 // the floor must be met at the second POST's return (t=33), not land on a
 // coin flip of the two round trips.
 func TestNFSOrdinaryBusyWindowStartsAtArrival(t *testing.T) {
+	requireDarwinNativeTarget(t)
 	c, _ := helperFixture(t, "retained_retry")
 	base := time.Unix(1_000_000, 0)
 	now := base
@@ -414,6 +421,7 @@ func TestNFSOrdinaryBusyWindowStartsAtArrival(t *testing.T) {
 // DELETE /eject-now's controller half: the withdrawal reaches the helper,
 // clears the busy window, and a force-path refusal is returned, not hidden.
 func TestNFSWithdrawHelperRetireReportsRefusal(t *testing.T) {
+	requireDarwinNativeTarget(t)
 	c, _ := helperFixture(t, "retained_retry")
 	fake := &fakeUnmountd{retireErr: client.ErrPending}
 	c.SetUnmountHelper(fake)

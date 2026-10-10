@@ -131,6 +131,7 @@ func TestRetireGateR7OlderInFlightRequestCannotPredateStart(t *testing.T) {
 // The controller's start entry point runs the gate's start path: it
 // restarts a carried-over window at its arrival and never sends a force.
 func TestNFSStartRetireWithHelperRestartsWindowAndNeverForces(t *testing.T) {
+	requireDarwinNativeTarget(t)
 	c, _ := helperFixture(t, "retained_retry")
 	fake := &fakeUnmountd{retireErr: client.ErrPending}
 	c.SetUnmountHelper(fake)

@@ -175,6 +175,7 @@ func TestGateWithdrawDoesNotSwallowLaterRequest(t *testing.T) {
 // DELETE on a job the helper already retired: the controller keeps the
 // RETIRED proof, so a later Stop completes without the descriptor.
 func TestNFSWithdrawOfRetiredJobKeepsProof(t *testing.T) {
+	requireDarwinNativeTarget(t)
 	c, _ := helperFixture(t, "retained_retry")
 	fake := &retiredCancelHelper{fakeUnmountd: &fakeUnmountd{retireErr: client.ErrPending}}
 	c.SetUnmountHelper(fake)

@@ -206,6 +206,7 @@ func TestGateInternalWithdrawNeverRefusesUser(t *testing.T) {
 // (WithdrawHelperRetire) through the user's: only the latter refuses a
 // request that arrived before it.
 func TestNFSInternalCancelKeepsUserGeneration(t *testing.T) {
+	requireDarwinNativeTarget(t)
 	c, _ := helperFixture(t, "retained_retry")
 	c.SetUnmountHelper(&fakeUnmountd{retireErr: client.ErrPending})
 	if err := c.Start(context.Background()); err != nil {

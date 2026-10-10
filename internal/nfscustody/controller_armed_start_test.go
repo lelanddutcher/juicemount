@@ -81,6 +81,7 @@ func waitOwnedFile(t *testing.T, path string) {
 }
 
 func TestControllerStartArmsOnlyAfterOriginalMountChildJoins(t *testing.T) {
+	requireDarwinNativeTarget(t)
 	c, entered, release, armSeen := armedStartFixture(t, false)
 	result := make(chan error, 1)
 	go func() { result <- c.Start(context.Background()) }()
@@ -143,6 +144,7 @@ func mustReadOwned(t *testing.T, path string) []byte {
 }
 
 func TestControllerStartPendingArmStopReconcilesOriginalID(t *testing.T) {
+	requireDarwinNativeTarget(t)
 	c, entered, release, armSeen := armedStartFixture(t, true)
 	ackGate := filepath.Join(filepath.Dir(entered), "ack-gate")
 	result := make(chan error, 1)
