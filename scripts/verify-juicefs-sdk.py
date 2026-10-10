@@ -29,6 +29,7 @@ PATCH_FILES = {
     "patches/0012-born-stage-upload-watch.patch": ["pkg/meta/redis.go"],
     "patches/0013-security-dependencies-and-etcd-transport.patch": [
         "go.mod", "go.sum", "pkg/meta/tkv_etcd.go", "pkg/object/etcd.go"],
+    "patches/0014-literal-fatal-error.patch": ["pkg/meta/interface.go"],
 }
 VERSION_PACKAGE = "github.com/juicedata/juicefs/pkg/version"
 

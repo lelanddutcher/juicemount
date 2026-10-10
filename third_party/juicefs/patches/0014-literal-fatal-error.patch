@@ -1,0 +1,11 @@
+--- a/pkg/meta/interface.go
++++ b/pkg/meta/interface.go
+@@ -578,7 +578,7 @@
+ 	driver := uri[:p]
+ 	if os.Getenv("META_PASSWORD") != "" && (driver == "mysql" || driver == "postgres") {
+ 		if uri, err = setPasswordFromEnv(uri); err != nil {
+-			logger.Fatalf(err.Error())
++			logger.Fatal(err.Error())
+ 		}
+ 	}
+ 	logger.Infof("Meta address: %s", utils.RemovePassword(uri))

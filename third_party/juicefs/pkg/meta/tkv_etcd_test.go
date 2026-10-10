@@ -12,6 +12,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"errors"
 	"math/big"
 	"net"
 	"net/url"
@@ -84,7 +85,8 @@ func newEtcdTLSFixture(t *testing.T) etcdTLSFixture {
 	return f
 }
 
-func etcdTLSHandshake(clientConfig, serverConfig *tls.Config) error {
+func etcdTLSHandshake(t *testing.T, clientConfig, serverConfig *tls.Config) (error, error) {
+	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	clientConn, serverConn := net.Pipe()
@@ -93,14 +95,16 @@ func etcdTLSHandshake(clientConfig, serverConfig *tls.Config) error {
 	done := make(chan error, 1)
 	go func() { done <- tls.Server(serverConn, serverConfig).HandshakeContext(ctx) }()
 	clientErr := tls.Client(clientConn, clientConfig).HandshakeContext(ctx)
-	if clientErr != nil {
-		_ = clientConn.Close()
-	}
+	// TLS 1.3 can finish the client handshake before the server rejects an
+	// absent client certificate. Close the underlying pipe even on success:
+	// the client's handshake flight has been consumed, and this unblocks any
+	// server alert write without waiting for a client application read.
+	_ = clientConn.Close()
 	serverErr := <-done
-	if clientErr != nil {
-		return clientErr
+	if err := ctx.Err(); err != nil {
+		t.Fatalf("TLS handshake did not settle before its deadline: %v (client=%v server=%v)", err, clientErr, serverErr)
 	}
-	return serverErr
+	return clientErr, serverErr
 }
 
 func TestEtcdTLSConfigTrustHostnameAndClientIdentity(t *testing.T) {
@@ -137,8 +141,30 @@ func TestEtcdTLSConfigTrustHostnameAndClientIdentity(t *testing.T) {
 			if tc.requireClient {
 				server.ClientAuth, server.ClientCAs = tls.RequireAndVerifyClientCert, f.roots
 			}
-			if err := etcdTLSHandshake(cfg, server); (err != nil) != tc.wantError {
-				t.Fatalf("TLS handshake error=%v, wantError=%t", err, tc.wantError)
+			clientErr, serverErr := etcdTLSHandshake(t, cfg, server)
+			if !tc.wantError {
+				if clientErr != nil || serverErr != nil {
+					t.Fatalf("TLS handshake failed: client=%v server=%v", clientErr, serverErr)
+				}
+				return
+			}
+			switch tc.name {
+			case "wrong hostname":
+				var hostnameError x509.HostnameError
+				if !errors.As(clientErr, &hostnameError) {
+					t.Fatalf("want hostname rejection, got client=%v server=%v", clientErr, serverErr)
+				}
+			case "untrusted CA":
+				var authorityError x509.UnknownAuthorityError
+				if !errors.As(clientErr, &authorityError) {
+					t.Fatalf("want CA trust rejection, got client=%v server=%v", clientErr, serverErr)
+				}
+			case "missing client identity":
+				if serverErr == nil || serverErr.Error() != "tls: client didn't provide a certificate" {
+					t.Fatalf("want missing client certificate rejection, got client=%v server=%v", clientErr, serverErr)
+				}
+			default:
+				t.Fatalf("missing rejection oracle for %q", tc.name)
 			}
 		})
 	}
