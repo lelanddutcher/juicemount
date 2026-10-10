@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Qualify the recovery/TLS regressions and prove their behavioral oracles.
+"""Qualify recovery, transaction, and TLS regressions and their behavioral oracles.
 
 Run in CI after module download. Source overlays change behavior without
 modifying the checkout. A build error is never an accepted negative result.
@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SDK = ROOT / "third_party/juicefs"
 RECOVERY = "TestObjKeysRepeatedCrashBeforeResultReissues"
 TLS = "TestEtcdTLSConfigTrustHostnameAndClientIdentity"
+SETTLEMENT = "TestCachePathConfirmRetainsStoreAndConnectionUntilDriverSettlement"
 
 
 def test(cwd, args, log, expected_failure=None, expected_passes=None):
@@ -88,6 +89,16 @@ def main():
             'case next.ObjKeySecret == "" && !next.ObjKeyNeedsSecret && next.ObjKeyMintSeq > 0 &&')])
         test(ROOT, [old_guard, "./internal/manager", "-run", "^" + RECOVERY + "$"],
              work / "recovery-negative.log", (RECOVERY, "attempt 2 did not request a new re-create"))
+        # The isolated real-SQLite fixture must retain both settlement phases,
+        # and still reject a compiled implementation that leaks its connection.
+        test(ROOT, ["-race", "./metadata", "-run", "^" + SETTLEMENT + "$"],
+             work / "settlement-pass.log", expected_passes=3)
+        leaked_conn = overlay(work, "settlement-leaked-connection", [(
+            "metadata/cache_path_eligibility.go",
+            "\tdefer conn.Close()\n", "\t// Negative control: omit connection release.\n")])
+        test(ROOT, [leaked_conn, "./metadata", "-run", "^" + SETTLEMENT + "$/^commit$"],
+             work / "settlement-negative.log",
+             (SETTLEMENT + "/commit", "SQL connection still owned after Confirm returned: inUse=1"))
         test(SDK, ["./pkg/object", "./pkg/meta", "-run", "^TestEtcdTLSConfig"], work / "tls-pass.log", expected_passes=26)
         for package, filename in [("object", "etcd.go"), ("meta", "tkv_etcd.go")]:
             lost_ca = overlay(work, package + "-lost-ca", [(

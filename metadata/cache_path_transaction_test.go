@@ -117,8 +117,23 @@ func cachePathAwaitSettlement(t *testing.T, stage string, ch <-chan struct{}) {
 func TestCachePathConfirmRetainsStoreAndConnectionUntilDriverSettlement(t *testing.T) {
 	for _, phase := range []string{"rollback", "commit"} {
 		t.Run(phase, func(t *testing.T) {
+			t.Setenv("JM_FTS_DEFER", "0")
 			filename := filepath.Join(t.TempDir(), "mirror.db")
 			s, eligibility, old, oldID := qualifiedCachePathFixture(t, filename)
+			if s.ftsStop != nil {
+				t.Fatal("settlement fixture requires no FTS worker")
+			}
+			// The prune worker can query before writeMu and acquire the wrapped
+			// connection independently of Confirm. Join it before replacing s.db,
+			// so InUse measures only the transaction under test.
+			if s.pruneLadderGCStop != nil {
+				s.pruneLadderGCStopOnce.Do(func() { close(s.pruneLadderGCStop) })
+				select {
+				case <-s.pruneLadderGCDone:
+				case <-time.After(5 * time.Second):
+					t.Fatal("prune ladder GC did not stop before SQL driver swap")
+				}
+			}
 			if err := eligibility.ConfirmCachePath(testCachePathBinding, old, cachePathTestProof(old, testCachePathBinding.FormatUUID)); err != nil {
 				t.Fatal(err)
 			}
