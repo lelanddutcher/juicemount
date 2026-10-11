@@ -99,6 +99,26 @@ def main():
         test(ROOT, [leaked_conn, "./metadata", "-run", "^" + SETTLEMENT + "$/^commit$"],
              work / "settlement-negative.log",
              (SETTLEMENT + "/commit", "SQL connection still owned after Confirm returned: inUse=1"))
+        # Witness the failed first pass before testing the production retry.
+        # Six trials per mode exercise scheduling; a compiled no-retry mutant
+        # must reach that witness and then fail the pending-row completion check.
+        symlink = "TestH4OnlineStartRetriesPendingSymlinkFailure"
+        selected = "^TestH4OnlineStart(MaterializesPendingOnlySymlink|RetriesPendingSymlinkFailure)$"
+        witness = "initial failed attempt witnessed:"
+        for mode, flags in (("normal", []), ("race", ["-race"])):
+            log = work / ("symlink-" + mode + ".log")
+            test(ROOT, [*flags, "-timeout=120s", "-count=6", "./nfs", "-run", selected],
+                 log, expected_passes=12)
+            if log.read_text().count(witness) != 6:
+                raise SystemExit("symlink first-attempt witnesses missing: " + mode)
+        retry_disabled = overlay(work, "symlink-no-retry", [(
+            "nfs/drainer.go", "symlinkCheckNeeded = d.materializePendingSymlinks()",
+            "d.materializePendingSymlinks()\n\t\t\tsymlinkCheckNeeded = false")])
+        log = work / "symlink-no-retry.log"
+        test(ROOT, [retry_disabled, "-timeout=120s", "./nfs", "-run", "^" + symlink + "$"],
+             log, (symlink, 'pending symlink "Blocked/Current" did not reach pending=false'))
+        if log.read_text().count(witness) != 1:
+            raise SystemExit("symlink negative did not reach the failed-attempt witness")
         test(SDK, ["./pkg/object", "./pkg/meta", "-run", "^TestEtcdTLSConfig"], work / "tls-pass.log", expected_passes=26)
         for package, filename in [("object", "etcd.go"), ("meta", "tkv_etcd.go")]:
             lost_ca = overlay(work, package + "-lost-ca", [(
