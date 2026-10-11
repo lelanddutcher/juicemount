@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/juicedata/juicefs/pkg/meta"
 	"github.com/juicedata/juicefs/pkg/replaceguard"
@@ -271,46 +272,110 @@ func TestBirthLegacyStageCannotBeAdopted(t *testing.T) {
 }
 
 func TestBirthLostSDKCreateReplyRetainsCustody(t *testing.T) {
-	r := startBirthRig(t)
-	m := birthSDK(t, r)
-	var once sync.Once
-	var lost atomic.Bool
-	r.eng.hooks.Store(&engineHooks{done: func(p Principal, u *Unit, o Outcome, _ map[uint64]uint64) {
-		if u.replacementReceipt == nil || !o.Committed {
-			return
+	for _, delayed := range []bool{false, true} {
+		name := "ordinary"
+		if delayed {
+			name = "delayed-bookkeeping"
 		}
-		once.Do(func() {
-			r.tp.mu.Lock()
-			defer r.tp.mu.Unlock()
-			for client := range r.tp.conns {
-				if client.RemoteAddr().String() == u.Remote {
-					_ = client.Close()
-					lost.Store(true)
-				}
+		t.Run(name, func(t *testing.T) {
+			r := startBirthRig(t)
+			m := birthSDK(t, r)
+			type closeResult struct {
+				matched bool
+				err     error
 			}
+			hookDone := make(chan closeResult, 1)
+			closed := make(chan struct{})
+			release := make(chan struct{})
+			var releaseOnce, hookOnce sync.Once
+			unblock := func() { releaseOnce.Do(func() { close(release) }) }
+			// Run before the rig's cleanup even when an assertion fails while the
+			// hook is paused outside tp.mu.
+			t.Cleanup(unblock)
+			var lost atomic.Bool
+			r.eng.hooks.Store(&engineHooks{done: func(p Principal, u *Unit, o Outcome, _ map[uint64]uint64) {
+				if u.replacementReceipt == nil || !o.Committed {
+					return
+				}
+				hookOnce.Do(func() {
+					r.tp.mu.Lock()
+					result := closeResult{}
+					for client := range r.tp.conns {
+						if client.RemoteAddr().String() == u.Remote {
+							result.matched = true
+							result.err = client.Close()
+							break
+						}
+					}
+					r.tp.mu.Unlock()
+					if result.matched && result.err == nil {
+						close(closed)
+						if delayed {
+							<-release
+						}
+						lost.Store(true)
+					}
+					hookDone <- result
+				})
+			}})
+			op := strings.Repeat("f", 32)
+			createCtx, cancelCreate := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancelCreate()
+			sdkCtx := meta.WrapContext(createCtx)
+			defer sdkCtx.Cancel()
+			var ino meta.Ino
+			var attr meta.Attr
+			st := m.Create(sdkCtx, 3, replaceguard.BirthStageName(op), 0600, 0, syscall.O_EXCL, &ino, &attr)
+			if createCtx.Err() != nil {
+				t.Fatalf("SDK create deadline is not a lost-reply witness: %v", createCtx.Err())
+			}
+			if st == 0 {
+				t.Fatal("injected lost acknowledgement reported success")
+			}
+			if delayed {
+				select {
+				case <-closed:
+				case result := <-hookDone:
+					if !result.matched {
+						t.Fatal("committed hook found no matching SDK client")
+					}
+					t.Fatalf("committed hook could not close SDK client: %v", result.err)
+				case <-time.After(5 * time.Second):
+					t.Fatal("committed hook did not close SDK connection")
+				}
+				if lost.Load() {
+					t.Fatal("hook bookkeeping completed before release")
+				}
+				unblock()
+			}
+			select {
+			case result := <-hookDone:
+				if !result.matched {
+					t.Fatal("committed hook found no matching SDK client")
+				}
+				if result.err != nil {
+					t.Fatalf("committed hook could not close SDK client: %v", result.err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("committed hook did not complete")
+			}
+			if !lost.Load() {
+				t.Fatal("did not interrupt actual committed create reply")
+			}
+			raw, err := r.db.Get(context.Background(), replaceguard.BirthOperationKey(op)).Bytes()
+			if err != nil {
+				t.Fatal(err)
+			}
+			b, err := replaceguard.DecodeBirth(raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if r.db.Get(context.Background(), replaceguard.BirthInodeKey(b.Stage.Inode)).Val() != string(raw) || r.db.HGet(context.Background(), "d3", b.Stage.Name).Val() != mkEntry(typeFile, b.Stage.Inode) {
+				t.Fatal("lost create custody differs")
+			}
+			r.unchanged(t)
 		})
-	}})
-	op := strings.Repeat("f", 32)
-	var ino meta.Ino
-	var attr meta.Attr
-	if st := m.Create(meta.Background(), 3, replaceguard.BirthStageName(op), 0600, 0, syscall.O_EXCL, &ino, &attr); st == 0 {
-		t.Fatal("injected lost acknowledgement reported success")
 	}
-	if !lost.Load() {
-		t.Fatal("did not interrupt actual committed create reply")
-	}
-	raw, err := r.db.Get(context.Background(), replaceguard.BirthOperationKey(op)).Bytes()
-	if err != nil {
-		t.Fatal(err)
-	}
-	b, err := replaceguard.DecodeBirth(raw)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if r.db.Get(context.Background(), replaceguard.BirthInodeKey(b.Stage.Inode)).Val() != string(raw) || r.db.HGet(context.Background(), "d3", b.Stage.Name).Val() != mkEntry(typeFile, b.Stage.Inode) {
-		t.Fatal("lost create custody differs")
-	}
-	r.unchanged(t)
 }
 
 func TestBirthEveryWatchedPredicateAbortsCreate(t *testing.T) {
