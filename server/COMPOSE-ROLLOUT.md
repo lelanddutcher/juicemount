@@ -535,11 +535,11 @@ Losing the principal store makes every Mac request access again.
 
 ### Per-Mac object keys (not yet enabled)
 
-> **Not yet enabled.** The server side exists (`minio-keyd`, the
-> `JM_OBJ_PER_MAC_SERVER` switch), but the Manager and the Mac app do not
-> use it yet. Leave `JM_OBJ_PER_MAC_SERVER` and `JM_OBJ_PER_MAC` unset.
-> While they are unset, `minio-keys` behaves exactly as before and
-> `minio-keyd` is never started.
+> **Rollout qualification pending.** Per-Mac key code exists in `minio-keyd`,
+> the Manager, and the Mac app, but the complete Manager-to-Mac workflow is
+> not qualified for deployment. Leave `JM_OBJ_PER_MAC_SERVER` and
+> `JM_OBJ_PER_MAC` unset. While they are unset, `minio-keys` behaves exactly
+> as before and `minio-keyd` is never started.
 
 There are two switches, one per step, so that enabling the server side
 never also switches the Manager on at its next redeploy:
@@ -547,7 +547,7 @@ never also switches the Manager on at its next redeploy:
 | Switch | Read by | Step |
 |---|---|---|
 | `JM_OBJ_PER_MAC_SERVER` | `minio-keys`, `minio-keyd` | M1: create `jm-macs` and `jm-keyadmin`, run keyd. No Mac is affected. |
-| `JM_OBJ_PER_MAC` | the Manager | M2: mint and deliver per-Mac keys. Not built yet. |
+| `JM_OBJ_PER_MAC` | the Manager | M2: request, verify, and deliver per-Mac keys when explicitly enabled. Rollout qualification is pending. |
 
 Each takes exactly `1` or `0` (unset means `0`). Any other value (`true`,
 `yes`, ` 1`) is logged as an error and treated as off.
@@ -666,10 +666,11 @@ environment.
    `$C -f server/docker-compose.yml stop minio-keyd` and unset
    `JM_OBJ_PER_MAC_SERVER`.
 
-Steps M2-M5 (M2: `JM_OBJ_PER_MAC=1` for the Manager, which mints keys for
-approved Macs; then Macs adopting them, and finally rotating the
-`jm-client` secret) need the Manager and Mac changes that are not built
-yet. Until then, stop after M1 and leave `JM_OBJ_PER_MAC` unset.
+The Manager's M2 key request and delivery path and the Mac's key adoption
+path are implemented behind the switches. The full deployment sequence,
+including Mac cutover and eventual `jm-client` secret rotation, is not yet
+qualified. A keyd/IAM check alone does not establish that workflow. Stop
+after M1 and leave `JM_OBJ_PER_MAC` unset.
 
 Offline tests for the scripts (fake `mc`, no MinIO needed):
 

@@ -113,13 +113,20 @@ func TestGCPolicyDeletesButNoBucketAdmin(t *testing.T) {
 	}
 }
 
-// fakeMC records every invocation (argv and the MC_HOST alias) and keeps
-// users, policies and attachments in files, the way MinIO would.
+// fakeMC records every invocation and the native mc config supplied to it.
+// It keeps users, policies and attachments in files, the way MinIO would.
 const fakeMC = `#!/bin/sh
 PATH=/usr/bin:/bin
 st="$FAKE_MC_STATE"
+[ -z "${MC_HOST_jmkeys+x}" ] && [ -z "${MC_CONFIG_ENV_FILE+x}" ] || { echo "inherited mc alias override" >&2; exit 8; }
+[ -r "$MC_CONFIG_DIR/config.json" ] || { echo "missing native mc config" >&2; exit 8; }
+printf '%s\n' "$MC_CONFIG_DIR" >> "$st/config-dirs"
+cp "$MC_CONFIG_DIR/config.json" "$st/config.json"
+for path in "$MC_CONFIG_DIR" "$MC_CONFIG_DIR/config.json"; do
+  mode=$(stat -c %a "$path" 2>/dev/null) || mode=$(stat -f %Lp "$path") || exit 8
+  printf '%s\n' "$mode" >> "$st/config-modes"
+done
 printf '%s\n' "$*" >> "$st/argv"
-printf '%s\n' "$MC_HOST_jmkeys" >> "$st/hosts"
 json=0
 [ "$1" = --json ] && { json=1; shift; }
 case "$1 $2 $3" in
@@ -143,6 +150,64 @@ esac
 // Keep the root user distinct from repository path components: argv may
 // legitimately contain absolute policy paths under a juicemount checkout.
 const fixtureRootUser = "root-fixture-7c42"
+
+type nativeMCAlias struct {
+	URL       string `json:"url"`
+	AccessKey string `json:"accessKey"`
+	SecretKey string `json:"secretKey"`
+	API       string `json:"api"`
+	Path      string `json:"path"`
+}
+
+func readNativeMCConfig(t *testing.T, state string) nativeMCAlias {
+	t.Helper()
+	var cfg struct {
+		Version string                   `json:"version"`
+		Aliases map[string]nativeMCAlias `json:"aliases"`
+	}
+	b, err := os.ReadFile(filepath.Join(state, "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(b, &cfg); err != nil {
+		t.Fatalf("native mc config is invalid JSON: %v", err)
+	}
+	if cfg.Version != "10" || len(cfg.Aliases) != 1 {
+		t.Fatalf("native mc config has version %q, aliases %v", cfg.Version, cfg.Aliases)
+	}
+	a, ok := cfg.Aliases["jmkeys"]
+	if !ok || a.API != "S3v4" || a.Path != "auto" {
+		t.Fatalf("native mc alias = %+v", a)
+	}
+	return a
+}
+
+func assertPrivateMCConfigRetired(t *testing.T, state string) {
+	t.Helper()
+	dirsRaw := strings.TrimSuffix(readOpt(filepath.Join(state, "config-dirs")), "\n")
+	if dirsRaw == "" {
+		t.Fatal("mc never saw a config directory")
+	}
+	dirs := strings.Split(dirsRaw, "\n")
+	for _, dir := range dirs {
+		if _, err := os.Lstat(dir); !os.IsNotExist(err) {
+			t.Fatalf("private mc config directory %q survived: %v", dir, err)
+		}
+	}
+	modes := strings.Fields(readOpt(filepath.Join(state, "config-modes")))
+	if len(modes) != 2*len(dirs) {
+		t.Fatalf("saw %d mc config paths but %d recorded modes", len(dirs), len(modes))
+	}
+	for i, mode := range modes {
+		want := "700"
+		if i%2 == 1 {
+			want = "600"
+		}
+		if mode != want {
+			t.Fatalf("mc config mode %d = %q, want %q", i, mode, want)
+		}
+	}
+}
 
 func runProvision(t *testing.T, state string, env ...string) (string, error) {
 	t.Helper()
@@ -203,11 +268,109 @@ func TestProvisionCreatesExactlyTwoUsersIdempotently(t *testing.T) {
 	if read("user.jm-client") != strings.Repeat("c", 40) || read("user.jm-gc") != strings.Repeat("g", 40) {
 		t.Error("user secrets did not reach mc through stdin")
 	}
-	if !strings.Contains(read("hosts"), "http://"+fixtureRootUser+":root%2fpass%40word@127.0.0.1:9000") {
-		t.Errorf("MC_HOST alias not percent-encoded as expected:\n%s", read("hosts"))
+	if got := readNativeMCConfig(t, state); got != (nativeMCAlias{URL: "http://127.0.0.1:9000", AccessKey: fixtureRootUser, SecretKey: "root/pass@word", API: "S3v4", Path: "auto"}) {
+		t.Errorf("native mc alias = %+v", got)
 	}
+	assertPrivateMCConfigRetired(t, state)
 	if strings.Contains(argv, "juicefs") || strings.Contains(argv, "config") {
 		t.Errorf("provisioning touched the volume setting:\n%s", argv)
+	}
+}
+
+// The pinned mc treats MC_HOST credentials literally, so its native config
+// must carry every byte of the root credentials without URL encoding.
+func TestProvisionNativeMCConfigPreservesRootCredentials(t *testing.T) {
+	state := t.TempDir()
+	rootUser := "Root:admin+%/\"\\é\t"
+	rootPass := "p:@+%/\"\\é\r\n\t\x01\x7f"
+	endpoint := "https://minio.example.test:9000"
+	out, err := runProvision(t, state,
+		"MINIO_ROOT_USER="+rootUser,
+		"MINIO_ROOT_PASSWORD="+rootPass,
+		"JM_MINIO_ENDPOINT="+endpoint)
+	if err != nil {
+		t.Fatalf("provisioning with special root credentials: %v\n%s", err, out)
+	}
+	if got := readNativeMCConfig(t, state); got != (nativeMCAlias{URL: endpoint, AccessKey: rootUser, SecretKey: rootPass, API: "S3v4", Path: "auto"}) {
+		t.Fatalf("root credentials changed in native mc config: %+v", got)
+	}
+	argv := readOpt(filepath.Join(state, "argv"))
+	for _, secret := range []string{rootUser, rootPass} {
+		if strings.Contains(argv, secret) {
+			t.Fatal("root credential reached mc argv")
+		}
+	}
+	assertPrivateMCConfigRetired(t, state)
+}
+
+func TestProvisionIgnoresForeignMCConfigAndRetiresOnlyOwnedDirectory(t *testing.T) {
+	state := t.TempDir()
+	foreign := filepath.Join(state, "foreign-mc-config")
+	if err := os.Mkdir(foreign, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	sentinel := filepath.Join(foreign, "keep")
+	if err := os.WriteFile(sentinel, []byte("unchanged"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out, err := runProvision(t, state,
+		"MC_CONFIG_DIR="+foreign,
+		"MC_CONFIG_ENV_FILE="+sentinel,
+		"MC_HOST_jmkeys=http://attacker:credential@elsewhere.invalid")
+	if err != nil {
+		t.Fatalf("foreign mc config override affected provisioning: %v\n%s", err, out)
+	}
+	if got := readOpt(sentinel); got != "unchanged" {
+		t.Fatalf("caller config changed: %q", got)
+	}
+	if got := readNativeMCConfig(t, state); got.AccessKey != fixtureRootUser || got.SecretKey != "root/pass@word" {
+		t.Fatalf("foreign alias overrode private config: %+v", got)
+	}
+	for _, dir := range strings.Split(strings.TrimSuffix(readOpt(filepath.Join(state, "config-dirs")), "\n"), "\n") {
+		if dir == foreign {
+			t.Fatal("mc used the caller's config directory")
+		}
+	}
+	assertPrivateMCConfigRetired(t, state)
+}
+
+func TestProvisionNativeMCConfigCleanupOnFailure(t *testing.T) {
+	state := t.TempDir()
+	if err := os.WriteFile(filepath.Join(state, "attach.jm-client"), []byte("jm-client,readwrite"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out, err := runProvision(t, state)
+	if err == nil || !strings.Contains(out, "want exactly 'jm-client'") {
+		t.Fatalf("expected policy failure, got %v\n%s", err, out)
+	}
+	assertPrivateMCConfigRetired(t, state)
+}
+
+func TestProvisionRefusesUnsafeConfigParentBeforeMC(t *testing.T) {
+	state := t.TempDir()
+	foreign := filepath.Join(state, "foreign")
+	if err := os.Mkdir(foreign, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	sentinel := filepath.Join(foreign, "keep")
+	if err := os.WriteFile(sentinel, []byte("unchanged"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(state, "symlink-parent")
+	if err := os.Symlink(foreign, link); err != nil {
+		t.Fatal(err)
+	}
+	for _, parent := range []string{link, filepath.Join(state, "missing-parent")} {
+		out, err := runProvision(t, state, "TMPDIR="+parent)
+		if err == nil || !strings.Contains(out, "TMPDIR must be an existing directory") {
+			t.Fatalf("unsafe TMPDIR %q accepted: %v\n%s", parent, err, out)
+		}
+		if _, err := os.Stat(filepath.Join(state, "argv")); !os.IsNotExist(err) {
+			t.Fatalf("mc ran despite unsafe TMPDIR: %v", err)
+		}
+	}
+	if got := readOpt(sentinel); got != "unchanged" {
+		t.Fatalf("foreign directory changed: %q", got)
 	}
 }
 
@@ -418,8 +581,17 @@ func TestProvisionPerMacFailureDoesNotBlockStack(t *testing.T) {
 	})
 	t.Run("no tr or head", func(t *testing.T) {
 		state := t.TempDir()
-		empty := t.TempDir() // a PATH with no coreutils; mc is called by path
-		out, err := runProvision(t, state, append(perMacEnv(), "PATH="+empty)...)
+		limited := t.TempDir() // config setup can run, but tr/head cannot
+		for _, name := range []string{"mkdir", "rm"} {
+			binary, err := exec.LookPath(name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(binary, filepath.Join(limited, name)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		out, err := runProvision(t, state, append(perMacEnv(), "PATH="+limited)...)
 		assertSharedReadyPerMacSkipped(t, state, out, err, "could not generate a secret for jm-macs")
 	})
 	t.Run("jm-gc fails with per-Mac on", func(t *testing.T) {

@@ -39,8 +39,9 @@
 #
 # Runs in the `minio-keys` compose service (minio image: bash + mc), or by
 # hand inside the minio container. No secret is ever on a command line:
-# the root credential reaches mc through MC_HOST_<alias>, and each user's
-# secret through mc's stdin.
+# the root credential reaches mc through a private native config.json, and
+# each user's secret through mc's stdin. The pinned mc does not URL-decode
+# credentials from MC_HOST_<alias>, so percent-encoding there changes them.
 #
 # Environment:
 #   MINIO_ROOT_USER            default juicemount
@@ -57,8 +58,8 @@
 #   JM_MINIO_POLICY_DIR        default: this script's directory
 #   MC                         default mc
 #
-# Uses bash builtins and mc; the per-Mac parent secret also uses tr and
-# head (the minio image is ubi-micro, which has coreutils).
+# Uses bash builtins, mkdir/rm and mc; the per-Mac parent secret also uses
+# tr and head (the minio image is ubi-micro, which has coreutils).
 set -eu
 
 MC="${MC:-mc}"
@@ -139,22 +140,56 @@ case "$PER_MAC" in
 	;;
 esac
 
-# Percent-encode for the userinfo part of MC_HOST_<alias>.
-urlenc() {
-	local s="$1" out='' c i
+# JSON string contents, byte by byte. Bash variables cannot contain NUL;
+# every other control byte is escaped, including newlines and DEL. This is
+# deliberately Bash-only: the minio image has no jq or Python dependency.
+json_string() {
+	local LC_ALL=C s="$1" out='' c hex i
 	for ((i = 0; i < ${#s}; i++)); do
 		c="${s:i:1}"
 		case "$c" in
-		[A-Za-z0-9._~-]) out+="$c" ;;
-		*) out+="$(printf '%%%02x' "'$c")" ;;
+		'"') out+='\"' ;;
+		'\') out+='\\' ;;
+		[[:cntrl:]])
+			printf -v hex '%04x' "'$c"
+			out+="\\u$hex" ;;
+		*) out+="$c" ;;
 		esac
 	done
 	printf '%s' "$out"
 }
-[[ "$ENDPOINT" =~ ^(https?)://(.+)$ ]] || die "JM_MINIO_ENDPOINT must start with http:// or https://"
-export MC_HOST_jmkeys="${BASH_REMATCH[1]}://$(urlenc "$ROOT_USER"):$(urlenc "$ROOT_PASS")@${BASH_REMATCH[2]}"
-export MC_CONFIG_DIR="${TMPDIR:-/tmp}/jm-mc-$$"
-trap 'rm -rf "$MC_CONFIG_DIR" || true' EXIT
+[[ "$ENDPOINT" =~ ^https?://.+$ ]] || die "JM_MINIO_ENDPOINT must start with http:// or https://"
+
+# Never use an inherited alias/config override, and never remove a caller's
+# MC_CONFIG_DIR. mkdir is exclusive, so an existing path cannot be adopted.
+unset MC_HOST_jmkeys MC_CONFIG_ENV_FILE
+config_parent="${TMPDIR:-/tmp}"
+[ -d "$config_parent" ] && [ ! -L "$config_parent" ] || die "TMPDIR must be an existing directory, not a symlink"
+umask 077
+owned_config_dir=''
+for ((attempt = 0; attempt < 16; attempt++)); do
+	candidate="$config_parent/jm-mc-$$-$RANDOM-$RANDOM"
+	if mkdir -m 0700 -- "$candidate" 2>/dev/null; then
+		owned_config_dir="$candidate"
+		break
+	fi
+done
+[ -n "$owned_config_dir" ] || die "cannot create a private mc config directory"
+cleanup_mc_config() {
+	local status=$?
+	trap - EXIT
+	if ! rm -rf -- "$owned_config_dir"; then
+		echo '[object-keys] ERROR: could not remove private mc config' >&2
+		[ "$status" -ne 0 ] || status=2
+	fi
+	exit "$status"
+}
+trap cleanup_mc_config EXIT
+export MC_CONFIG_DIR="$owned_config_dir"
+if ! printf '{"version":"10","aliases":{"%s":{"url":"%s","accessKey":"%s","secretKey":"%s","api":"S3v4","path":"auto"}}}\n' \
+	"$ALIAS" "$(json_string "$ENDPOINT")" "$(json_string "$ROOT_USER")" "$(json_string "$ROOT_PASS")" >"$owned_config_dir/config.json"; then
+	die "cannot write private mc config"
+fi
 
 # verify_user <access-key> <policy-name>: exactly that policy, enabled.
 verify_user() {
