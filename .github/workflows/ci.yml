@@ -1,149 +1,86 @@
-name: ci
+name: minio-source-real-iam
 
 on:
-  pull_request:
-  push:
-    branches:
-      - main
-      - 'codex/**'
   workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  linux:
+  source-real-iam:
     runs-on: ubuntu-latest
-    services:
-      redis:
-        image: redis:7.4-alpine
-        ports:
-          - 6379:6379
-        options: >-
-          --health-cmd "redis-cli ping"
-          --health-interval 5s
-          --health-timeout 3s
-          --health-retries 10
-      respproxy-redis:
-        image: redis:7.4-alpine
-        ports:
-          - 6380:6379
-        options: >-
-          --health-cmd "redis-cli ping"
-          --health-interval 5s
-          --health-timeout 3s
-          --health-retries 10
+    timeout-minutes: 25
+    env:
+      CANDIDATE: 4dc11fed3533de754a2e04fce3307985774789d2
+      MINIO_SOURCE: 827004cd6d3da8f49a5320c94ae74ae128156ed6
+      MC_SOURCE: cc8758c88da31b95dde7b0b6997980ebfb8b98c4
+      GOTOOLCHAIN: local
+      CGO_ENABLED: '0'
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # server/respproxy gate test reads entrypoint.sh history
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Bind unchanged production source and create private cloud workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD^)" = "$CANDIDATE"
+          python3 - <<'PY'
+          import subprocess
+          changed=set(subprocess.check_output(['git','diff','--name-only','HEAD^','HEAD'],text=True).splitlines())
+          assert changed=={'.github/workflows/ci.yml','server/minio/qualify-real-iam.py'}, changed
+          PY
+          export MINIO_TRIAL_ROOT="$RUNNER_TEMP/jm-minio-source-iam-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          mkdir -m 700 "$MINIO_TRIAL_ROOT"
+          mkdir -m 700 "$MINIO_TRIAL_ROOT/bin" "$MINIO_TRIAL_ROOT/tmp" "$MINIO_TRIAL_ROOT/build-evidence"
+          printf 'MINIO_TRIAL_ROOT=%s\nTMPDIR=%s\nGOTMPDIR=%s\n' "$MINIO_TRIAL_ROOT" "$MINIO_TRIAL_ROOT/tmp" "$MINIO_TRIAL_ROOT/tmp" >> "$GITHUB_ENV"
       - uses: actions/setup-go@v5
         with:
-          go-version-file: go.mod
-          cache: true
-      - name: Prepare private Bash for keyd tests
+          go-version: '1.26.6'
+          cache: false
+      - uses: actions/checkout@v4
+        with:
+          repository: minio/minio
+          ref: 827004cd6d3da8f49a5320c94ae74ae128156ed6
+          path: _trial/minio
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: minio/mc
+          ref: cc8758c88da31b95dde7b0b6997980ebfb8b98c4
+          path: _trial/mc
+          persist-credentials: false
+      - name: Build immutable source inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C _trial/minio rev-parse HEAD)" = "$MINIO_SOURCE"
+          test "$(git -C _trial/mc rev-parse HEAD)" = "$MC_SOURCE"
+          go version > "$MINIO_TRIAL_ROOT/build-evidence/identity.txt"
+          printf 'candidate=%s\nworkflow=%s\nminio=%s\nmc=%s\n' "$CANDIDATE" "$GITHUB_SHA" "$MINIO_SOURCE" "$MC_SOURCE" >> "$MINIO_TRIAL_ROOT/build-evidence/identity.txt"
+          for name in minio mc; do
+            (
+              cd "_trial/$name"
+              sha256sum go.mod go.sum >> "$MINIO_TRIAL_ROOT/build-evidence/identity.txt"
+              go build -mod=readonly -trimpath -buildvcs=true -o "$MINIO_TRIAL_ROOT/bin/$name" .
+              test -z "$(git status --porcelain)"
+            )
+            go version -m "$MINIO_TRIAL_ROOT/bin/$name" > "$MINIO_TRIAL_ROOT/build-evidence/$name-build.txt"
+            "$MINIO_TRIAL_ROOT/bin/$name" --version >> "$MINIO_TRIAL_ROOT/build-evidence/identity.txt"
+            sha256sum "$MINIO_TRIAL_ROOT/bin/$name" >> "$MINIO_TRIAL_ROOT/build-evidence/identity.txt"
+          done
+      - name: Prepare known private Bash
         run: bash scripts/prepare-ci-bash.sh
-      - name: Unit and integration-safe tests
-        env:
-          JM_REQUIRE_GATE_HISTORY: '1'
-          JM_TEST_LINK_REDIS: redis://127.0.0.1:6379/13
-          JM_TEST_MANAGER_REDIS: redis://127.0.0.1:6379/12
-          JM_TEST_METADATA_REDIS: redis://127.0.0.1:6379/14
-          JM_TEST_REDIS: redis://127.0.0.1:6379/15
-          JM_RESPPROXY_TEST_REDIS: 127.0.0.1:6380
-        run: go test -count=1 ./...
-      - name: Redis-backed farm durability tests
-        env:
-          JM_FARM_TEST_REDIS_URL: redis://127.0.0.1:6379/15
-          JM_FARM_TEST_REDIS_FLUSH: '1'
-        run: go test -count=1 ./internal/farmqueue
-      - name: Static analysis
-        run: go vet ./...
-      - name: Scan both shipped Go module graphs
-        run: bash scripts/check-go-security.sh
-      - name: Recovery and TLS regression controls
-        run: python3 scripts/test-release-security-regressions.py
-      - name: Shell, JavaScript, compose, and deployment tests
-        env:
-          JM_ADMIN_KEY: ci-only-placeholder-not-a-secret-value
-          MINIO_ROOT_PASSWORD: ci-only-placeholder-not-a-secret-value
-          JM_FARM_STORAGE_CAPACITY_BYTES: '1099511627776'
-          JM_MANAGER_DIGEST: sha256:0000000000000000000000000000000000000000000000000000000000000000
-          JM_RESPPROXY_DIGEST: sha256:0000000000000000000000000000000000000000000000000000000000000000
-          JM_FARM_DIGEST: sha256:0000000000000000000000000000000000000000000000000000000000000000
-          JM_FARM_RENDER_DIGEST: sha256:0000000000000000000000000000000000000000000000000000000000000000
-          JM_REDIS_PROXY_PASSWORD: ci-only-placeholder-not-a-secret-value
-          JM_PROXY_FARM_PASSWORD: ci-only-placeholder-not-a-secret-value
-          JM_PROXY_MANAGER_PASSWORD: ci-only-placeholder-not-a-secret-value
-          JM_PROXY_BG_PASSWORD: ci-only-placeholder-not-a-secret-value
-          JM_PROXY_WEBDAV_PASSWORD: ci-only-placeholder-not-a-secret-value
-          JM_PROXY_ADMIN_PASSWORD: ci-only-placeholder-not-a-secret-value
-          JM_OBJ_CLIENT_SECRET_KEY: ci-only-placeholder-not-a-secret-value
-          JM_OBJ_GC_SECRET_KEY: ci-only-placeholder-not-a-secret-value
-          JM_NET_SERVER_URL: https://link.example.com:30193
-          JM_NET_NAS_ROUTE: 192.0.2.0/24
-        run: |
-          find scripts server/scripts test -type f -name '*.sh' -print0 | xargs -0 -n1 bash -n
-          node --check internal/manager/static/app.js
-          docker compose -f server/docker-compose.yml config --quiet
-          bash server/scripts/update-server.test.sh
-
-  mac-app:
-    runs-on: macos-26
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - name: Real provisioning, S3 permissions, key recovery and revocation
+        run: python3 server/minio/qualify-real-iam.py
+      - name: Upload bounded nonsecret evidence
+        if: always()
+        uses: actions/upload-artifact@v4
         with:
-          go-version-file: go.mod
-          cache: true
-      - name: Scan macOS Go module graphs
-        run: bash scripts/check-go-security.sh
-      - name: Media-tool cancellation and cleanup controls
-        run: python3 scripts/test-release-security-regressions.py --farm-cancellation
-      - name: Unit and macOS platform tests
-        run: |
-          brew install redis
-          export JM_CI_REDIS_BIN="$(brew --prefix redis)/bin"
-          python3 - <<'PYTHON'
-          import os, pathlib, subprocess, tempfile, time
-
-          root = pathlib.Path(tempfile.mkdtemp(prefix="jm-respproxy-redis-", dir=os.environ["RUNNER_TEMP"])).resolve()
-          binary = pathlib.Path(os.environ["JM_CI_REDIS_BIN"])
-          with (root / "server.log").open("wb") as log:
-              child = subprocess.Popen([str(binary / "redis-server"), "--bind", "127.0.0.1", "--port", "6380", "--save", "", "--appendonly", "no", "--dir", str(root)], stdout=log, stderr=subprocess.STDOUT)
-              try:
-                  for attempt in range(30):
-                      if child.poll() is not None:
-                          raise RuntimeError("owned Redis exited before readiness")
-                      info = subprocess.run([str(binary / "redis-cli"), "-h", "127.0.0.1", "-p", "6380", "INFO", "server"], capture_output=True, text=True, timeout=2)
-                      fields = dict(line.split(":", 1) for line in info.stdout.splitlines() if ":" in line)
-                      if info.returncode == 0 and fields.get("process_id") == str(child.pid) and child.poll() is None:
-                          break
-                      time.sleep(1)
-                  else:
-                      raise RuntimeError("Redis readiness did not match owned child")
-                  env = dict(os.environ, JM_RESPPROXY_TEST_REDIS="127.0.0.1:6380")
-                  subprocess.run(["go", "test", "-count=1", "./..."], env=env, check=True)
-              finally:
-                  if child.poll() is None:
-                      child.terminate()
-                  try:
-                      child.wait(timeout=10)
-                  except subprocess.TimeoutExpired:
-                      child.kill()
-                      child.wait()
-          PYTHON
-      - name: Build signed-equivalent app
-        env:
-          JM_ADHOC: '1'
-          JM_QUICK: '1'
-        run: scripts/build-app.sh --release
-      - name: Verify exact linked identity and reject a stale expectation
-        run: |
-          commit="$(git rev-parse HEAD)"
-          version="$(awk -F'"' '/^var Version = / { print $2; exit }' internal/version/version.go)"
-          scripts/verify-build.sh --app build/JuiceMount.app --version "$version" --commit "$commit"
-          if scripts/verify-build.sh --app build/JuiceMount.app --version "$version" --commit 0000000000000000000000000000000000000000; then
-            echo 'stale-identity negative test unexpectedly passed' >&2
-            exit 1
-          fi
+          name: minio-source-real-iam-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: error
+          path: |
+            ${{ runner.temp }}/jm-minio-source-iam-${{ github.run_id }}-${{ github.run_attempt }}/build-evidence/*.txt
+            ${{ runner.temp }}/jm-minio-source-iam-${{ github.run_id }}-${{ github.run_attempt }}/evidence/result.json
