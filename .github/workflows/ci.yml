@@ -13,8 +13,6 @@ jobs:
     env:
       IMAGE: minio/minio:RELEASE.2025-01-20T14-49-07Z@sha256:ed9be66eb5f2636c18289c34c3b725ddf57815f2777c77b5938543b78a44f144
       CANDIDATE: 4dc11fed3533de754a2e04fce3307985774789d2
-      DOCKER_CONFIG: ${{ runner.temp }}/minio-anon-docker-config
-      AUDIT_DIR: ${{ runner.temp }}/minio-audit
     steps:
       - uses: actions/checkout@v4
         with:
@@ -25,8 +23,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          export DOCKER_CONFIG="$RUNNER_TEMP/minio-anon-docker-config"
+          export AUDIT_DIR="$RUNNER_TEMP/minio-audit"
           mkdir -m 700 "$DOCKER_CONFIG"
           mkdir -m 700 "$AUDIT_DIR"
+          printf 'DOCKER_CONFIG=%s\nAUDIT_DIR=%s\n' "$DOCKER_CONFIG" "$AUDIT_DIR" >> "$GITHUB_ENV"
           test -z "$(ls -A "$DOCKER_CONFIG")"
           test "$(git rev-parse HEAD)" = "$CANDIDATE"
           {
