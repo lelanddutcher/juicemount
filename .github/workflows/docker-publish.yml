@@ -126,6 +126,8 @@ jobs:
           cache: true
       - name: Scan macOS Go module graphs
         run: bash scripts/check-go-security.sh
+      - name: Media-tool cancellation and cleanup controls
+        run: python3 scripts/test-release-security-regressions.py --farm-cancellation
       - name: Build signed-equivalent app
         env:
           JM_ADHOC: '1'

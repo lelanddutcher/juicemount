@@ -7,6 +7,7 @@ modifying the checkout. A build error is never an accepted negative result.
 import json
 import os
 import signal
+import sys
 from pathlib import Path
 import subprocess
 import tempfile
@@ -128,5 +129,44 @@ def main():
                  work / (package + "-negative.log"), (TLS + "/trusted_CA", "certificate signed by unknown authority"))
 
 
+def farm_cancellation():
+    # The observed readiness race was on macOS. This also avoids interpreting
+    # an unreaped Linux orphan zombie as a live media-tool descendant.
+    if sys.platform != "darwin":
+        raise SystemExit("farm cancellation controls require macOS")
+    name = "TestCommandContextCancellationKillsToolProcessGroup"
+    with tempfile.TemporaryDirectory(prefix="jm-farm-cancellation-", dir=os.environ["RUNNER_TEMP"]) as directory:
+        work = Path(directory)
+
+        def witnesses(log, count):
+            output = log.read_text()
+            live = output.count("live tool descendant witnessed:")
+            retired = output.count("tool fixture retired:")
+            if live != count or retired != count:
+                print(output, flush=True)
+                raise SystemExit("farm fixture did not prove live setup and joined retirement")
+            print(json.dumps({"fixture": log.name, "live_witnesses": live,
+                              "retirement_witnesses": retired}), flush=True)
+
+        for mode, flags in (("normal", []), ("race", ["-race"])):
+            log = work / (mode + ".log")
+            test(ROOT, [*flags, "-timeout=120s", "-count=6", "./internal/farm", "-run", "^" + name + "$"],
+                 log, expected_passes=6)
+            witnesses(log, 6)
+        parent_only = overlay(work, "parent-only-cancellation", [(
+            "internal/farm/command_unix.go",
+            "syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)",
+            "syscall.Kill(cmd.Process.Pid, syscall.SIGKILL)")])
+        log = work / "parent-only-negative.log"
+        test(ROOT, [parent_only, "-timeout=120s", "./internal/farm", "-run", "^" + name + "$"],
+             log, (name, "survived context cancellation"))
+        witnesses(log, 1)
+
+
 if __name__ == "__main__":
-    main()
+    if sys.argv[1:] == ["--farm-cancellation"]:
+        farm_cancellation()
+    elif not sys.argv[1:]:
+        main()
+    else:
+        raise SystemExit("unknown regression-control mode")

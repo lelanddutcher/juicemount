@@ -33,9 +33,9 @@ RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache
       -ldflags="-s -w -linkmode external -extldflags '-static' -X github.com/lelanddutcher/juicemount/internal/version.Version=${JM_VERSION} -X github.com/lelanddutcher/juicemount/internal/version.Commit=${JM_COMMIT}" -o /out/jmfarm ./cmd/jmfarm
 
 # ----- Stage 2: whisper.cpp (whisper-cli) + the ggml model -----
-# Bullseye matches the juicedata/mount runtime's glibc 2.31 + libstdc++, so
-# whisper-cli links cleanly there (BUILD_SHARED_LIBS=OFF folds in whisper/ggml).
-FROM debian:bullseye AS whisper
+# Build on Bookworm, as the GPU worker does. The final runtime is Trixie;
+# execute whisper-cli there below so a loader/ABI mismatch fails the image build.
+FROM debian:bookworm AS whisper
 # GPU-readiness seam: the default CPU build matches the juicedata/mount runtime.
 # For a GPU NAS (CUDA/Vulkan APU), build a variant with WHISPER_CMAKE_FLAGS, e.g.
 #   --build-arg WHISPER_CMAKE_FLAGS="-DGGML_CUDA=ON"   (needs an nvidia/cuda base
@@ -100,6 +100,7 @@ RUN ldconfig
 COPY --from=gobuild /out/jmfarm /usr/local/bin/jmfarm
 RUN test "$(/usr/local/bin/jmfarm --build-info)" = "jmfarm ${JM_VERSION} (${JM_COMMIT})"
 COPY --from=whisper /usr/local/bin/whisper-cli /usr/local/bin/whisper-cli
+RUN /usr/local/bin/whisper-cli --help >/dev/null
 COPY --from=whisper /ggml-${WHISPER_MODEL}.bin /models/ggml-${WHISPER_MODEL}.bin
 COPY --from=whisper /download-ggml-model.sh /usr/local/bin/download-ggml-model.sh
 COPY server/juicefarm/entrypoint.sh /entrypoint.sh

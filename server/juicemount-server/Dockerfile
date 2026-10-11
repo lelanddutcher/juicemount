@@ -72,14 +72,16 @@ ARG JM_COMMIT
 LABEL org.opencontainers.image.version="${JM_VERSION}" \
       org.opencontainers.image.revision="${JM_COMMIT}"
 
-# Tools the entrypoint needs: curl for healthcheck, ca-certificates
-# for any future S3 over HTTPS. The juicedata/mount:ce-v1.3.1 base
-# image is Debian-based (the pre-ce-* alpine variants are gone), so
-# this uses apt-get instead of apk. Cache cleanup keeps image size
-# down; we don't need apt at runtime.
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends curl ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+# The pinned mount base supplies curl for healthchecks and a CA bundle for
+# HTTPS. Check both capabilities in the runtime image; its Bullseye apt pool
+# may no longer contain the package versions referenced by its package index.
+RUN command -v curl >/dev/null \
+    && test -r /etc/ssl/certs/ca-certificates.crt \
+    && test -s /etc/ssl/certs/ca-certificates.crt \
+    && curl_caps="$(curl -q --version)" \
+    && printf '%s\n' "$curl_caps" \
+    && printf '%s\n' "$curl_caps" | grep -Eq '^Protocols:.*[[:space:]]https([[:space:]]|$)' \
+    && printf '%s\n' "$curl_caps" | grep -Eq '^Features:.*[[:space:]]SSL([[:space:]]|$)'
 
 # Drop the jm5 binary in. The base image already has /usr/local/bin
 # on PATH; juicefs lives there too so PATH lookups inside the
