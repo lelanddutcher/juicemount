@@ -32,12 +32,11 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 
-PARENT = "857bdb7acfc563108d8120645ebe18649edec2dc"
-PARENT_TREE = "390c0e42a1ae1a2db038e89a92b4dc90b1f2afa1"
-BRANCH = "refs/heads/codex/0.5-storage-migration-arm64-857bdb7"
+PARENT = "b60e5c67fdf0a858989f5917ad3a70db472979bd"
+PARENT_TREE = "86d78155d579bbc25a44f74f82fa00dd8ae8dee2"
+BRANCH = "refs/heads/codex/0.5-storage-migration-arm64-r2-b60e5c6"
 HELPER_SHA = "c1a48d4172dcbdc3e4cba2acdae4d073e4ddf13921a9dffd4ae254a0b88cb6e2"
-PATHS = [".github/workflows/ci.yml", "server/minio/qualify-storage-candidate.py",
-         "server/minio/qualify-storage-migration.py"]
+PATHS = ["server/minio/qualify-storage-migration.py"]
 URL = "http://127.0.0.1:19000"
 ACTIVE = "mac-0123456789ab-1"
 PRE_REVOKED = "mac-0123456789ac-1"
@@ -543,16 +542,57 @@ class Migration:
                       "legacy module input differs")
         return source
 
+    def admit_legacy_environment(self):
+        # GOENV=off disables the config file; go env reports its effective path as empty.
+        private_fields = {"GOPATH", "GOCACHE", "GOTMPDIR"}
+        wanted = dict(BUILD_ENV, GOENV="", GOVERSION="go1.26.6", GOHOSTOS="linux", GOHOSTARCH="arm64",
+                      **{key: self.env[key] for key in private_fields})
+        receipt = {"outcome": "HOLD", "configured_goenv_is_off": self.env.get("GOENV") == "off",
+                   "expected_effective_goenv": "", "category": "COMMAND_NOT_RETURNED"}
+        self.phases[self.stage]["go_environment_admission"] = receipt
+        code, output, error = self.call(["go", "env", "-json", *sorted(wanted)], expected=None)
+        receipt.update(exit_code=code, stdout_type=type(output).__name__[:32],
+                       stderr_type=type(error).__name__[:32], category="OUTPUT_TYPE")
+        H.require(type(output) is bytes and type(error) is bytes, "go env returned unexpected output types")
+        receipt.update(stdout_bytes=len(output), stderr_bytes=len(error), stdout_sha256=digest(output),
+                       stderr_sha256=digest(error), category="OUTPUT_BOUND")
+        H.require(len(output) <= 65536 and len(error) <= 65536, "go env output exceeds diagnostic bound")
+        try:
+            observed = json.loads(output)
+        except (ValueError, UnicodeError) as exc:
+            receipt.update(category="JSON_PARSE", parse_error_type=type(exc).__name__[:32])
+            raise H.Hold("go env JSON parse failed; bounded receipt retained") from None
+        receipt.update(json_type=type(observed).__name__, category="JSON_SHAPE")
+        H.require(type(observed) is dict, "go env JSON is not an object")
+        # Unexpected strings are hashed, not copied: even a normally public field
+        # can contain a private path. Known private paths are never emitted.
+        safe_values = set(BUILD_ENV.values()) | {"go1.26.6", "linux", "darwin", "arm64", "amd64", "auto"}
+        fields = {}
+        for key, expected in sorted(wanted.items()):
+            value = observed.get(key)
+            row = {"present": key in observed, "type": type(value).__name__,
+                   "matches": type(value) is str and value == expected}
+            if type(value) is str:
+                encoded = value.encode("utf-8", errors="surrogatepass")
+                row.update(bytes=len(encoded), sha256=digest(encoded))
+                if key not in private_fields and value in safe_values:
+                    row["observed"] = value
+            fields[key] = row
+        mismatches = [key for key, row in fields.items() if not row["matches"]]
+        receipt.update(fields=fields, mismatched_fields=mismatches,
+                       missing_fields=sorted(set(wanted)-set(observed)),
+                       unexpected_field_count=len(set(observed)-set(wanted)), category="FIELD_COMPARISON")
+        H.require(code == 0 and receipt["configured_goenv_is_off"] and set(observed) == set(wanted)
+                  and not mismatches, "native Go host/target or private build environment differs")
+        receipt.update(outcome="PASS", category="EXACT_EFFECTIVE_ENVIRONMENT")
+
     def build_legacy(self):
         self.step(PHASES[2])
         H.require(not self.secrets and self.native is None and not self.create_attempted,
                   "legacy input build must precede runtime credentials and servers")
-        wanted = dict(BUILD_ENV, GOVERSION="go1.26.6", GOHOSTOS="linux", GOHOSTARCH="arm64",
-                      GOPATH=self.env["GOPATH"], GOCACHE=self.env["GOCACHE"], GOTMPDIR=self.env["GOTMPDIR"])
         H.require(self.call(["go", "version"])[1].strip() == b"go version go1.26.6 linux/arm64",
                   "native Go1.26.6 required")
-        observed = json.loads(self.call(["go", "env", "-json", *sorted(wanted)])[1])
-        H.require(observed == wanted, "native Go host/target or private build environment differs")
+        self.admit_legacy_environment()
         self.phases[self.stage]["toolchain"] = {
             "version": "go1.26.6", "host": "linux/arm64", "environment": BUILD_ENV,
             "private_tmp_and_caches": True, "home_preserved": True}
