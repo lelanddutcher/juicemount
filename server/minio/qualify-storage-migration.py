@@ -32,9 +32,9 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 
-PARENT = "1926003336f6aa76da5c46c7fc52b7f5c8df6974"
-PARENT_TREE = "bcfcd82a284ae0daa046dab4157a5ed3ed4ec0ee"
-BRANCH = "refs/heads/codex/0.5-storage-migration-r2-1926003"
+PARENT = "58e894db0a2272c9233a44406d8ecdcdc339c558"
+PARENT_TREE = "0c079236603fd52da95cfadefc5948ab6702691f"
+BRANCH = "refs/heads/codex/0.5-storage-migration-r3-58e894d"
 HELPER_SHA = "fd21c2a9174eac69dcd29ef26cdcd2a17ade3fe63249c70a47e8964e493e53c4"
 PATHS = [".github/workflows/ci.yml", "server/minio/qualify-storage-migration.py"]
 URL = "http://127.0.0.1:19000"
@@ -168,44 +168,79 @@ PORT_CONTROL_CASES = ["vacant", "active_loopback", "active_wildcard", "observed_
 
 
 def scoped_socket_states(port):
-    """Read only the requested local port; infer no PID or listener ownership."""
-    result = {"status": "KNOWN", "local_port": port, "rows": []}
+    """Aggregate complete byte-bounded tables; rows is only a bounded preview.
+
+    Counts concern the requested local port. Every input row is parsed, including
+    the unpreviewed tail. No PID, address or ownership claim is exported.
+    """
+    result = {
+        "status": "UNKNOWN", "complete": False, "local_port": port, "row_count": 0,
+        "state_counts": {}, "protocol_counts": {"tcp": 0, "tcp6": 0},
+        "scope_counts": {"loopback": 0, "wildcard": 0, "other": 0},
+        "rows": [], "preview_truncated": False,
+        "tables": {name: {"complete": False, "bytes_read": None, "parsed_rows": 0, "matched_rows": 0}
+                   for name in ["tcp", "tcp6"]},
+    }
+    protocol, stage, line_number = "tcp", "READ", None
     try:
         for protocol in ["tcp", "tcp6"]:
+            table = result["tables"][protocol]
+            stage, line_number = "READ", None
             with open("/proc/net/" + protocol, "rb") as stream:
                 data = stream.read(2 * 1024**2 + 1)
+            table["bytes_read"] = len(data)
+            stage = "BYTE_BOUND"
             if len(data) > 2 * 1024**2:
-                raise ValueError("socket table bound")
+                raise ValueError("socket table byte bound")
+            stage = "ASCII"
             lines = data.decode("ascii").splitlines()
+            stage = "HEADER"
             if not lines or not {"local_address", "st"} <= set(lines[0].split()):
                 raise ValueError("socket table header absent or unknown")
-            for line in lines[1:]:
+            stage = "TERMINAL_NEWLINE"
+            if not data.endswith(b"\n"):
+                raise ValueError("socket table possibly truncated")
+            width = 8 if protocol == "tcp" else 32
+            address_pattern = r"[0-9A-Fa-f]{" + str(width) + r"}:[0-9A-Fa-f]{4}"
+            stage = "ROW"
+            for line_number, line in enumerate(lines[1:], start=2):
                 fields = line.split()
-                if len(fields) < 10 or not re.fullmatch(r"[0-9A-Fa-f]{8,32}:[0-9A-Fa-f]{4}", fields[1]):
-                    raise ValueError("socket table shape")
+                if (len(fields) < 10 or not re.fullmatch(r"[0-9]+:", fields[0])
+                        or not re.fullmatch(address_pattern, fields[1])
+                        or not re.fullmatch(address_pattern, fields[2])
+                        or not re.fullmatch(r"[0-9A-Fa-f]{2}", fields[3])):
+                    raise ValueError("socket table row shape")
+                table["parsed_rows"] += 1
                 address, local_port = fields[1].split(":")
                 if int(local_port, 16) != port:
                     continue
                 state = fields[3].upper()
-                if not re.fullmatch(r"[0-9A-F]{2}", state):
-                    raise ValueError("socket state shape")
+                state_name = TCP_STATES.get(state, "UNKNOWN")
                 raw = bytes.fromhex(address)
-                if protocol == "tcp" and len(raw) == 4:
+                if protocol == "tcp":
                     packed = raw[::-1]
                     scope = "wildcard" if packed == b"\0"*4 else "loopback" if packed[0] == 127 else "other"
-                elif protocol == "tcp6" and len(raw) == 16:
+                else:
                     packed = b"".join(raw[i:i+4][::-1] for i in range(0, 16, 4))
                     scope = ("wildcard" if packed == b"\0"*16 else "loopback" if packed == b"\0"*15+b"\1"
                              or packed[:12] == b"\0"*10+b"\xff\xff" and packed[12] == 127 else "other")
+                table["matched_rows"] += 1
+                result["row_count"] += 1
+                result["state_counts"][state_name] = result["state_counts"].get(state_name, 0) + 1
+                result["protocol_counts"][protocol] += 1
+                result["scope_counts"][scope] += 1
+                if len(result["rows"]) < 64:
+                    result["rows"].append({"protocol": protocol, "local_scope": scope,
+                                           "state": state_name, "state_hex": state})
                 else:
-                    raise ValueError("address shape")
-                result["rows"].append({"protocol": protocol, "local_scope": scope,
-                                       "state": TCP_STATES.get(state, "UNKNOWN"), "state_hex": state})
-                if len(result["rows"]) > 64:
-                    raise ValueError("scoped socket row bound")
+                    result["preview_truncated"] = True
+            table["complete"] = True
+        result.update(status="KNOWN", complete=True)
     except (OSError, ValueError, UnicodeError) as exc:
-        result.update(status="UNKNOWN", error_category=type(exc).__name__,
-                      errno=exc.errno if isinstance(exc, OSError) else None)
+        diagnostic = {"error_category": type(exc).__name__, "error_stage": stage,
+                      "error_line": line_number, "errno": exc.errno if isinstance(exc, OSError) else None}
+        result["tables"][protocol].update(diagnostic)
+        result.update(status="UNKNOWN", complete=False, error_protocol=protocol, **diagnostic)
     return result
 
 
@@ -237,12 +272,13 @@ def port_admission(port):
     receipt["after"] = scoped_socket_states(port)
     receipt["elapsed_ms"] = round((time.monotonic() - start) * 1000)
     observations = [receipt["before"], receipt["after"]]
-    rows = [row for observation in observations for row in observation["rows"]]
-    if any(observation["status"] != "KNOWN" for observation in observations):
+    total_rows = sum(observation["row_count"] for observation in observations)
+    if any(observation["status"] != "KNOWN" or observation["complete"] is not True for observation in observations):
         receipt["category"] = "UNKNOWN_SOCKET_TABLE"
-    elif any(row["state"] == "LISTEN" for row in rows):
+    elif any(observation["state_counts"].get("LISTEN", 0) > 0 for observation in observations):
         receipt["category"] = "ACTIVE_LISTENER_OBSERVED"
-    elif any(row["state"] != "TIME_WAIT" for row in rows):
+    elif any(observation["row_count"] != observation["state_counts"].get("TIME_WAIT", 0)
+             for observation in observations):
         receipt["category"] = "OTHER_OR_UNKNOWN_SOCKET_STATE"
     elif receipt["reuseaddr"] != 1 or receipt["reuseport"] != 0:
         receipt["category"] = "UNEXPECTED_SOCKET_OPTIONS"
@@ -251,7 +287,7 @@ def port_admission(port):
     elif receipt["elapsed_ms"] > 2000:
         receipt["category"] = "ADMISSION_TIME_BOUND_EXCEEDED"
     else:
-        receipt.update(outcome="ADMIT", category="CLOSED_ADDRESS_REUSABLE" if rows else "VACANT")
+        receipt.update(outcome="ADMIT", category="CLOSED_ADDRESS_REUSABLE" if total_rows else "VACANT")
     return receipt
 
 
@@ -604,13 +640,15 @@ class Migration:
                     while True:
                         observation = scoped_socket_states(port)
                         samples.append(observation)
-                        if observation["status"] != "KNOWN" or any(r["state"] == "TIME_WAIT" for r in observation["rows"]):
+                        if (observation["status"] != "KNOWN" or observation["complete"] is not True
+                                or observation["state_counts"].get("TIME_WAIT", 0) > 0):
                             break
                         if time.monotonic() >= deadline:
                             break
                         time.sleep(0.05)
-                    H.require(observation["status"] == "KNOWN" and observation["rows"]
-                              and all(r["state"] == "TIME_WAIT" for r in observation["rows"]),
+                    H.require(observation["status"] == "KNOWN" and observation["complete"] is True
+                              and observation["row_count"] > 0
+                              and observation["row_count"] == observation["state_counts"].get("TIME_WAIT", 0),
                               "owned TIME_WAIT counterexample not observed; inconclusive")
                     row["old_bare_bind"] = bare_bind_control(port)
                     row["admission"] = port_admission(port)
@@ -1225,5 +1263,6 @@ def main():
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
 
 

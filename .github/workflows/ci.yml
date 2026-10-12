@@ -1,4 +1,4 @@
-name: Storage stopped migration and snapshot restore
+name: Storage migration and restore with complete port observations
 
 on:
   workflow_dispatch:
@@ -60,5 +60,6 @@ jobs:
             ${{ steps.qualify.outputs.evidence_dir }}/candidate-image-reference.json
             ${{ steps.qualify.outputs.evidence_dir }}/phase-evidence.json
             ${{ steps.qualify.outputs.evidence_dir }}/artifact-manifest.json
+
 
 
