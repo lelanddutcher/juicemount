@@ -58,6 +58,7 @@ type JuiceMountHandler struct {
 	// construction; the production read hot path pays one predictable branch,
 	// never an os.Getenv call.
 	testRefuseFUSEContentReads bool
+	metadataTrace              *metadataMutationTrace // constructor-only opt-in; nil adds no observations
 	testBeforeInPlaceMutation  func(path, operation string) error
 	testAfterInPlaceMutation   func(path, operation string)
 	testReadAfterAdmission     func(path string)
@@ -922,6 +923,7 @@ func NewHandler(store *metadata.Store, fusePath string, opts ...HandlerOption) *
 		sidecarWarmSem:             make(chan struct{}, 3), // max 3 concurrent dir warm passes
 		sidecarWarmed:              make(map[string]time.Time),
 		testRefuseFUSEContentReads: testguard.RefuseFUSEContentReads(),
+		metadataTrace:              newMetadataMutationTrace(os.Getenv("JM_DIAGNOSTIC_METADATA_TRACE_PREFIX"), os.Getenv("JM_APP_ISOLATION")),
 	}
 	h.readahead.refuseFUSEContentReads = h.testRefuseFUSEContentReads
 	h.readahead.previewRun = h.runNativePreview
@@ -1357,7 +1359,18 @@ func (h *JuiceMountHandler) applyLegacyDrainEffects(item metadata.DrainCommitIte
 	}
 	observedSidecar := h.sidecar.captureEntry(item.NFSPath)
 	observedMemBuf := h.memBuf.captureEntry(item.NFSPath)
-	if err := fd.Chmod(receipt.Mode.Perm()); err != nil {
+	var trace *metadataMutationInterval
+	if h.metadataTrace != nil {
+		trace = h.metadataTrace.beginCompletion(item, receipt)
+		if trace != nil {
+			trace.before(h.fusePath, fd)
+		}
+	}
+	chmodErr := fd.Chmod(receipt.Mode.Perm())
+	if trace != nil {
+		trace.after(h.fusePath, fd, chmodErr)
+	}
+	if err := chmodErr; err != nil {
 		if !errors.Is(err, syscall.EPERM) {
 			return err
 		}
@@ -5099,8 +5112,18 @@ func (jc *juiceChange) Chmod(name string, mode os.FileMode) error {
 					0, gateWait, time.Since(start), metrics.FUSEOutcomeGateTimeout)
 				return result, errFUSETimeout
 			}
+			var trace *metadataMutationInterval
+			if h.metadataTrace != nil {
+				trace = h.metadataTrace.beginChmod(rel, mode.Perm(), result.spoolChecked, result.spoolPending)
+				if trace != nil {
+					trace.before(h.fusePath, nil)
+				}
+			}
 			result.backendAttempted = true
 			chmodErr := os.Chmod(fusePath, mode.Perm())
+			if trace != nil {
+				trace.after(h.fusePath, nil, chmodErr)
+			}
 			result.backendApplied = chmodErr == nil
 			if chmodErr == nil {
 				result.errnoKnown = true
