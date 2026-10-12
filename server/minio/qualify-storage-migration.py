@@ -10,6 +10,7 @@ if sys.flags.optimize:
     raise SystemExit(2)
 
 import datetime as dt
+import errno
 import hashlib
 import hmac
 import json
@@ -31,9 +32,9 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 
-PARENT = "e5887b772b7014032e983b74ac95a94c7c59af69"
-PARENT_TREE = "fe1eb5e6fec881d8bbc37f965e30e4a7afc70ae4"
-BRANCH = "refs/heads/codex/0.5-storage-migration-e5887b7"
+PARENT = "1926003336f6aa76da5c46c7fc52b7f5c8df6974"
+PARENT_TREE = "bcfcd82a284ae0daa046dab4157a5ed3ed4ec0ee"
+BRANCH = "refs/heads/codex/0.5-storage-migration-r2-1926003"
 HELPER_SHA = "fd21c2a9174eac69dcd29ef26cdcd2a17ade3fe63249c70a47e8964e493e53c4"
 PATHS = [".github/workflows/ci.yml", "server/minio/qualify-storage-migration.py"]
 URL = "http://127.0.0.1:19000"
@@ -43,7 +44,7 @@ PASS = "PASS_STOPPED_SINGLE_NODE_MIGRATION_RESTORE_SECURITY_AND_MOUNTED_ACCEPTAN
 PHASES = [
     "verify original immutable artifact before image load",
     "load verified archive and extract packaged binaries without starting",
-    "rebuild and retain exact legacy binaries",
+    "verify retained legacy inputs and four owned socket controls",
     "legacy provisioning and seeded access",
     "stopped complete snapshot and disjoint copies",
     "first Silo start inherited IAM and objects before repair",
@@ -77,8 +78,14 @@ POLICIES = {"jm-client": "jm-client", "jm-gc": "jm-gc",
             "jm-macs": "jm-client", "jm-keyadmin": "jm-keyadmin"}
 ARTIFACTS = {"result.json", "provenance.json", "candidate-image-reference.json",
              "phase-evidence.json", "artifact-manifest.json"}
-BUILD_ARTIFACTS = {"minio", "mc", "minio-buildinfo.txt", "mc-buildinfo.txt",
-                   "provenance.json", "artifact-manifest.json"}
+LEGACY_SOURCE = "1926003336f6aa76da5c46c7fc52b7f5c8df6974"
+LEGACY_RUN = "38219780080"
+LEGACY_ARTIFACT = "storage-migration-legacy-inputs-38219780080-1"
+LEGACY_IMPORT_DIR = "storage-migration-legacy-import-38219780080-1"
+LEGACY_MANIFEST_SHA = "a17e9191daf424082ee9d048aa115aac398423da9f1ef443d222b994398d61b6"
+LEGACY_BYTES = {"minio": 157127351, "mc": 42984924}
+LEGACY_TREES = {"minio": "2589ae46ba8ca031131c65b655306850045fccc6",
+                "mc": "9592ee60ee40ce8dc73ed1df08032da4fbda442b"}
 H = None
 
 
@@ -152,6 +159,119 @@ def classify_readiness(exit_code, output, error):
     return result
 
 
+TCP_STATES = {
+    "01": "ESTABLISHED", "02": "SYN_SENT", "03": "SYN_RECV", "04": "FIN_WAIT1",
+    "05": "FIN_WAIT2", "06": "TIME_WAIT", "07": "CLOSE", "08": "CLOSE_WAIT",
+    "09": "LAST_ACK", "0A": "LISTEN", "0B": "CLOSING", "0C": "NEW_SYN_RECV",
+}
+PORT_CONTROL_CASES = ["vacant", "active_loopback", "active_wildcard", "observed_time_wait"]
+
+
+def scoped_socket_states(port):
+    """Read only the requested local port; infer no PID or listener ownership."""
+    result = {"status": "KNOWN", "local_port": port, "rows": []}
+    try:
+        for protocol in ["tcp", "tcp6"]:
+            with open("/proc/net/" + protocol, "rb") as stream:
+                data = stream.read(2 * 1024**2 + 1)
+            if len(data) > 2 * 1024**2:
+                raise ValueError("socket table bound")
+            lines = data.decode("ascii").splitlines()
+            if not lines or not {"local_address", "st"} <= set(lines[0].split()):
+                raise ValueError("socket table header absent or unknown")
+            for line in lines[1:]:
+                fields = line.split()
+                if len(fields) < 10 or not re.fullmatch(r"[0-9A-Fa-f]{8,32}:[0-9A-Fa-f]{4}", fields[1]):
+                    raise ValueError("socket table shape")
+                address, local_port = fields[1].split(":")
+                if int(local_port, 16) != port:
+                    continue
+                state = fields[3].upper()
+                if not re.fullmatch(r"[0-9A-F]{2}", state):
+                    raise ValueError("socket state shape")
+                raw = bytes.fromhex(address)
+                if protocol == "tcp" and len(raw) == 4:
+                    packed = raw[::-1]
+                    scope = "wildcard" if packed == b"\0"*4 else "loopback" if packed[0] == 127 else "other"
+                elif protocol == "tcp6" and len(raw) == 16:
+                    packed = b"".join(raw[i:i+4][::-1] for i in range(0, 16, 4))
+                    scope = ("wildcard" if packed == b"\0"*16 else "loopback" if packed == b"\0"*15+b"\1"
+                             or packed[:12] == b"\0"*10+b"\xff\xff" and packed[12] == 127 else "other")
+                else:
+                    raise ValueError("address shape")
+                result["rows"].append({"protocol": protocol, "local_scope": scope,
+                                       "state": TCP_STATES.get(state, "UNKNOWN"), "state_hex": state})
+                if len(result["rows"]) > 64:
+                    raise ValueError("scoped socket row bound")
+    except (OSError, ValueError, UnicodeError) as exc:
+        result.update(status="UNKNOWN", error_category=type(exc).__name__,
+                      errno=exc.errno if isinstance(exc, OSError) else None)
+    return result
+
+
+def port_admission(port):
+    """A non-reserving Linux bind probe, matching Go's SO_REUSEADDR semantics.
+
+    Only empty or TIME_WAIT scoped tables are admissible. A bind error never
+    establishes a listener or ownership. Startup still requires the exact owned
+    server handle/CID and authenticated readiness after this probe closes.
+    """
+    H.require(sys.platform == "linux" and type(port) is int and 1 <= port <= 65535,
+              "Linux scoped port admission required")
+    start = time.monotonic()
+    receipt = {"port": port, "address": "127.0.0.1", "outcome": "HOLD",
+               "category": "UNCLASSIFIED", "before": scoped_socket_states(port),
+               "reuseaddr": None, "reuseport": None, "bind_succeeded": False, "errno": None}
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            receipt["reuseaddr"] = probe.getsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR)
+            receipt["reuseport"] = probe.getsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT)
+            if receipt["reuseaddr"] != 1 or receipt["reuseport"] != 0:
+                receipt["category"] = "UNEXPECTED_SOCKET_OPTIONS"
+            else:
+                probe.bind(("127.0.0.1", port))
+                receipt["bind_succeeded"] = True
+    except OSError as exc:
+        receipt["errno"] = exc.errno
+    receipt["after"] = scoped_socket_states(port)
+    receipt["elapsed_ms"] = round((time.monotonic() - start) * 1000)
+    observations = [receipt["before"], receipt["after"]]
+    rows = [row for observation in observations for row in observation["rows"]]
+    if any(observation["status"] != "KNOWN" for observation in observations):
+        receipt["category"] = "UNKNOWN_SOCKET_TABLE"
+    elif any(row["state"] == "LISTEN" for row in rows):
+        receipt["category"] = "ACTIVE_LISTENER_OBSERVED"
+    elif any(row["state"] != "TIME_WAIT" for row in rows):
+        receipt["category"] = "OTHER_OR_UNKNOWN_SOCKET_STATE"
+    elif receipt["reuseaddr"] != 1 or receipt["reuseport"] != 0:
+        receipt["category"] = "UNEXPECTED_SOCKET_OPTIONS"
+    elif not receipt["bind_succeeded"]:
+        receipt["category"] = "BIND_ERROR_CAUSE_UNRESOLVED"
+    elif receipt["elapsed_ms"] > 2000:
+        receipt["category"] = "ADMISSION_TIME_BOUND_EXCEEDED"
+    else:
+        receipt.update(outcome="ADMIT", category="CLOSED_ADDRESS_REUSABLE" if rows else "VACANT")
+    return receipt
+
+
+def bare_bind_control(port):
+    """Only invoked on a port from this controller's closed connection."""
+    receipt = {"port": port, "bind_succeeded": False, "errno": None,
+               "reuseaddr": None, "reuseport": None}
+    start = time.monotonic()
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            receipt["reuseaddr"] = probe.getsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR)
+            receipt["reuseport"] = probe.getsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT)
+            probe.bind(("127.0.0.1", port))
+            receipt["bind_succeeded"] = True
+    except OSError as exc:
+        receipt["errno"] = exc.errno
+    receipt["elapsed_ms"] = round((time.monotonic() - start) * 1000)
+    return receipt
+
+
 def load_helpers():
     path = Path(__file__).resolve().with_name("qualify-storage-candidate.py")
     data = path.read_bytes()
@@ -193,9 +313,6 @@ def preflight():
                               "server/minio/jm-keyadmin-policy.json", "scripts/prepare-ci-bash.sh"]:
         path = repo / relative
         H.require(path.is_file() and not path.is_symlink(), "source file not regular")
-    env.update(GOTOOLCHAIN="local", GOWORK="off", GOENV="off")
-    H.require(H.command(["go", "version"], env)[1].decode().strip() == "go version go1.26.6 linux/amd64",
-              "exact legacy Go1.26.6 required")
     temp = Path(os.environ["RUNNER_TEMP"])
     H.require(temp.is_absolute() and temp.resolve(strict=True) == temp and temp.is_dir()
               and temp.stat().st_uid == os.geteuid(), "RUNNER_TEMP custody differs")
@@ -259,16 +376,13 @@ class Migration:
         self.root = Path(tempfile.mkdtemp(prefix="jm-storage-migration-" + self.run_id + "-", dir=temp))
         H.owned_dir(self.root)
         self.private, self.evidence, self.build_inputs = [self.root / n for n in ["private", "evidence", "legacy-inputs"]]
-        for folder in [self.private, self.evidence, self.build_inputs]:
+        self.legacy_reference = self.root / "legacy-reference"
+        for folder in [self.private, self.evidence, self.build_inputs, self.legacy_reference]:
             folder.mkdir(mode=0o700)
-        for n in ["tmp", "gotmp", "gopath", "gocache", "docker", "data", "control", "extract",
-                  "sources", "built", "runtime", "snapshots", "seed-inputs", "probes"]:
+        for n in ["tmp", "docker", "data", "control", "extract",
+                  "runtime", "snapshots", "seed-inputs", "probes"]:
             (self.private / n).mkdir(mode=0o700)
-        self.env.update(TMPDIR=str(self.private / "tmp"), GOTMPDIR=str(self.private / "gotmp"),
-                        GOPATH=str(self.private / "gopath"), GOCACHE=str(self.private / "gocache"),
-                        GOTOOLCHAIN="local", GOWORK="off", GOENV="off", CGO_ENABLED="0",
-                        GOOS="linux", GOARCH="amd64", GOAMD64="v1", GOPROXY="https://proxy.golang.org",
-                        GOSUMDB="sum.golang.org", DOCKER_CONFIG=str(self.private / "docker"))
+        self.env.update(TMPDIR=str(self.private / "tmp"), DOCKER_CONFIG=str(self.private / "docker"))
         self.stage = "admitted"
         self.result = {"schema": 1, "status": "HOLD", "run_id": self.run_id, "source_sha": self.source_sha,
                        "parent": PARENT, "declared_phases": PHASES, "stages": [],
@@ -299,6 +413,7 @@ class Migration:
             "retained_helper_sha256": HELPER_SHA, "production_inputs": {p: H.sha(self.repo / p) for p in scripts},
             "bash_prerequisite_source_sha256": H.sha(self.repo / "scripts/prepare-ci-bash.sh"),
             "bash_binary_sha256": H.sha(self.bash), "legacy_identities": LEGACY,
+            "legacy_input_mode": "verified retained artifact; no Go toolchain or source build",
             "image_source_sha": H.IMAGE_SOURCE, "image_archive_sha256": H.ARCHIVE_SHA,
             "image_config_id": H.IMAGE_ID, "endpoint": URL,
             "image_scope": "unchanged original artifact; no pull, image rebuild or scan",
@@ -366,73 +481,164 @@ class Migration:
     def import_image(self):
         H.Qualification.import_image(self)
 
-    def build_legacy(self):
+    def import_legacy(self):
         self.step(PHASES[2])
+        imported = Path(os.environ["RUNNER_TEMP"]) / LEGACY_IMPORT_DIR
+        H.require(imported.resolve(strict=True) == imported and imported.is_dir()
+                  and imported.stat().st_uid == os.geteuid(), "legacy import directory custody differs")
+        expected_files = {"minio", "mc", "minio-buildinfo.txt", "mc-buildinfo.txt", "provenance.json"}
+        manifest_path = imported / "artifact-manifest.json"
+        H.require(manifest_path.is_file() and not manifest_path.is_symlink()
+                  and H.sha(manifest_path) == LEGACY_MANIFEST_SHA, "original legacy manifest differs")
+        manifest = json.loads(manifest_path.read_text())
+        H.require(manifest.get("schema") == 1 and manifest.get("source_sha") == LEGACY_SOURCE
+                  and manifest.get("run_id") == LEGACY_RUN and manifest.get("private_fixture_excluded") is True
+                  and set(manifest.get("files", {})) == expected_files
+                  and {p.name for p in imported.iterdir()} == expected_files | {"artifact-manifest.json"},
+                  "original legacy manifest identity or six-file set differs")
+        for name, identity in manifest["files"].items():
+            path = imported / name
+            H.require(path.is_file() and not path.is_symlink() and path.resolve(strict=True) == path
+                      and path.stat().st_uid == os.geteuid() and path.stat().st_size == identity["bytes"]
+                      and H.sha(path) == identity["sha256"], "legacy artifact member differs")
+        provenance = json.loads((imported / "provenance.json").read_text())
+        H.require(provenance.get("schema") == 1 and provenance.get("source_sha") == LEGACY_SOURCE
+                  and provenance.get("run_id") == LEGACY_RUN
+                  and provenance.get("status") == "VERIFIED_BUILD_INPUTS"
+                  and provenance.get("environment") == {"CGO_ENABLED": "0", "GOOS": "linux",
+                                                        "GOARCH": "amd64", "GOAMD64": "v1"}
+                  and provenance.get("build_command") == "go build -mod=readonly -trimpath -buildvcs=true -o <binary> ."
+                  and set(provenance.get("binaries", {})) == set(LEGACY),
+                  "legacy provenance differs")
         for name, identity in LEGACY.items():
-            source = self.private / "sources" / name
-            source.mkdir(mode=0o700)
-            H.git(source, self.env, "init", "--quiet")
-            H.git(source, self.env, "remote", "add", "origin", identity["url"])
-            self.call(["git", "-c", "credential.helper=", "-C", source, "fetch", "--depth=1",
-                       "origin", identity["revision"]], timeout=180)
-            H.git(source, self.env, "checkout", "--quiet", "--detach", "FETCH_HEAD")
-            H.require(H.git(source, self.env, "rev-parse", "HEAD") == identity["revision"]
-                      and H.git(source, self.env, "remote", "get-url", "origin") == identity["url"]
-                      and not H.git(source, self.env, "status", "--porcelain", "--untracked-files=all"),
-                      "legacy source identity differs")
-            for filename in ["go.mod", "go.sum"]:
-                path = source / filename
-                H.require(path.is_file() and not path.is_symlink() and H.sha(path) == identity[filename],
-                          "legacy module input differs")
-            binary = self.private / "built" / name
-            self.call(["go", "build", "-mod=readonly", "-trimpath", "-buildvcs=true",
-                       "-o", binary, "."], cwd=source, timeout=900)
-            H.require(not H.git(source, self.env, "status", "--porcelain", "--untracked-files=all"),
-                      "legacy build changed source")
-            H.require(binary.is_file() and not binary.is_symlink() and H.sha(binary) == identity["sha256"],
-                      "legacy binary differs from prior receipt; no further build or runtime")
-            info = self.call(["go", "version", "-m", binary])[1].decode()
+            prior = provenance["binaries"][name]
+            H.require(prior == {"sha256": identity["sha256"], "bytes": LEGACY_BYTES[name],
+                                "revision": identity["revision"], "tree": LEGACY_TREES[name],
+                                "toolchain": "go1.26.6", "vcs_modified": False}
+                      and H.sha(imported / name) == identity["sha256"], "legacy source/binary receipt differs")
+            info = (imported / (name + "-buildinfo.txt")).read_text()
             lines = info.splitlines()
-            H.require(lines[0] == str(binary) + ": go1.26.6", "legacy binary toolchain differs")
+            H.require(lines and lines[0] == "<" + name + ">: go1.26.6", "retained legacy toolchain differs")
             fields = {}
             for line in lines[1:]:
                 parts = line.strip().split("\t")
                 if len(parts) >= 2 and parts[0] == "build" and "=" in parts[1]:
                     key, value = parts[1].split("=", 1)
                     fields[key] = value
-            for key, value in {"CGO_ENABLED": "0", "GOOS": "linux", "GOARCH": "amd64",
-                               "GOAMD64": "v1", "vcs": "git", "vcs.revision": identity["revision"],
-                               "vcs.modified": "false", "-trimpath": "true"}.items():
-                H.require(fields.get(key) == value, "legacy buildinfo setting differs")
+            for key, value in {"CGO_ENABLED": "0", "GOOS": "linux", "GOARCH": "amd64", "GOAMD64": "v1",
+                               "vcs": "git", "vcs.revision": identity["revision"], "vcs.modified": "false",
+                               "-trimpath": "true"}.items():
+                H.require(fields.get(key) == value, "retained legacy buildinfo setting differs")
             H.require(any(line.strip().split("\t")[:2] == ["path", identity["module"]] for line in lines),
-                      "legacy module path differs")
-            shutil.copy2(binary, self.build_inputs / name)
-            H.write_new(self.build_inputs / (name + "-buildinfo.txt"), info.replace(str(binary), "<" + name + ">"))
-            self.verified_binaries[name] = {
-                "sha256": H.sha(binary), "bytes": binary.stat().st_size, "revision": identity["revision"],
-                "tree": H.git(source, self.env, "rev-parse", "HEAD^{tree}"), "toolchain": "go1.26.6",
-                "vcs_modified": False,
-            }
-        H.write_json(self.build_inputs / "provenance.json", {
-            "schema": 1, "source_sha": self.source_sha, "run_id": self.run_id,
-            "purpose": "verified legacy executables; independent of migration outcome",
-            "status": "VERIFIED_BUILD_INPUTS", "binaries": self.verified_binaries,
-            "build_command": "go build -mod=readonly -trimpath -buildvcs=true -o <binary> .",
-            "environment": {"CGO_ENABLED": "0", "GOOS": "linux", "GOARCH": "amd64", "GOAMD64": "v1"},
+                      "retained legacy module path differs")
+            destination = self.build_inputs / name
+            H.require(not destination.exists() and not destination.is_symlink(), "legacy runtime copy already exists")
+            shutil.copyfile(imported / name, destination)
+            destination.chmod(0o500)
+            H.require(destination.is_file() and not destination.is_symlink()
+                      and destination.stat().st_uid == os.geteuid() and H.sha(destination) == identity["sha256"],
+                      "legacy runtime executable copy differs")
+            self.verified_binaries[name] = prior
+        H.write_json(self.legacy_reference / "legacy-input-reference.json", {
+            "schema": 1, "trial_source_sha": self.source_sha, "original_source_sha": LEGACY_SOURCE,
+            "original_run_id": LEGACY_RUN, "original_attempt": 1, "original_artifact_id": 11733683437,
+            "original_artifact_name": LEGACY_ARTIFACT, "original_manifest_sha256": LEGACY_MANIFEST_SHA,
+            "original_archive_sha256_reference": "862e862f806003a3d9f107fdf2d5ecdb56a55872fe8c68c0fa1847eff0191482",
+            "verification": "all six extracted members bound by exact original manifest; copied executables rehashed",
+            "custody": "original executable artifact referenced; no rebuild or binary re-upload",
+            "binaries": self.verified_binaries,
         })
         self.result["legacy_binaries"] = self.verified_binaries
         self.phases[self.stage]["verified_binary_names"] = sorted(self.verified_binaries)
-        # Publish verified build custody before creating any runtime credential.
-        self.publish_artifacts(self.build_inputs, BUILD_ARTIFACTS, "legacy")
+        self.publish_artifacts(self.legacy_reference, {"legacy-input-reference.json"}, "legacy")
+        self.qualify_ports()
         self.passed()
 
+    def qualify_ports(self):
+        controls = {"declared_cases": PORT_CONTROL_CASES, "completed": [], "cases": {}, "outcome": "HOLD"}
+        self.phases[self.stage]["port_controls"] = controls
+        for name in PORT_CONTROL_CASES:
+            row = {"outcome": "HOLD", "owned_socket_handles_closed": False}
+            controls["cases"][name] = row
+            handles = []
+            try:
+                listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                handles.append(listener)
+                listener.settimeout(2)
+                listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                listener.bind(("0.0.0.0" if name == "active_wildcard" else "127.0.0.1", 0))
+                port = listener.getsockname()[1]
+                row["port"] = port
+                if name == "vacant":
+                    listener.close()
+                    row["admission"] = port_admission(port)
+                    H.require(row["admission"]["outcome"] == "ADMIT"
+                              and row["admission"]["category"] == "VACANT", "vacant socket control inconclusive")
+                elif name in ["active_loopback", "active_wildcard"]:
+                    listener.listen(1)
+                    row["admission"] = port_admission(port)
+                    H.require(row["admission"]["outcome"] == "HOLD"
+                              and row["admission"]["category"] == "ACTIVE_LISTENER_OBSERVED",
+                              "active listener refusal control inconclusive")
+                else:
+                    listener.listen(1)
+                    client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    handles.append(client)
+                    client.settimeout(2)
+                    client.bind(("127.0.0.1", 0))
+                    client.connect(("127.0.0.1", port))  # Only this original owned listener.
+                    accepted, peer = listener.accept()
+                    handles.append(accepted)
+                    accepted.settimeout(2)
+                    H.require(peer == client.getsockname() and accepted.getsockname() == ("127.0.0.1", port),
+                              "control connection identity differs")
+                    accepted.shutdown(socket.SHUT_WR)  # Server side deliberately closes first.
+                    H.require(client.recv(1) == b"", "control client did not observe owned FIN")
+                    client.shutdown(socket.SHUT_WR)
+                    H.require(accepted.recv(1) == b"", "control server did not observe owned FIN")
+                    accepted.close()
+                    client.close()
+                    listener.close()
+                    deadline = time.monotonic() + 2
+                    samples = row["time_wait_observations"] = []
+                    while True:
+                        observation = scoped_socket_states(port)
+                        samples.append(observation)
+                        if observation["status"] != "KNOWN" or any(r["state"] == "TIME_WAIT" for r in observation["rows"]):
+                            break
+                        if time.monotonic() >= deadline:
+                            break
+                        time.sleep(0.05)
+                    H.require(observation["status"] == "KNOWN" and observation["rows"]
+                              and all(r["state"] == "TIME_WAIT" for r in observation["rows"]),
+                              "owned TIME_WAIT counterexample not observed; inconclusive")
+                    row["old_bare_bind"] = bare_bind_control(port)
+                    row["admission"] = port_admission(port)
+                    H.require(not row["old_bare_bind"]["bind_succeeded"]
+                              and row["old_bare_bind"]["errno"] == errno.EADDRINUSE
+                              and row["old_bare_bind"]["reuseaddr"] == 0
+                              and row["old_bare_bind"]["reuseport"] == 0
+                              and row["admission"]["outcome"] == "ADMIT"
+                              and row["admission"]["category"] == "CLOSED_ADDRESS_REUSABLE",
+                              "bare-bind versus TIME_WAIT reuse counterexample inconclusive")
+                row["outcome"] = "PASS"
+                controls["completed"].append(name)
+            except OSError as exc:
+                row.update(socket_error_category=type(exc).__name__, errno=exc.errno)
+                raise H.Hold("owned socket control failed; scoped evidence retained") from None
+            finally:
+                for handle in reversed(handles):
+                    handle.close()  # Never rediscover, signal, or close a foreign descriptor.
+                row["owned_socket_handles_closed"] = True
+        H.require(controls["completed"] == PORT_CONTROL_CASES, "four socket controls did not complete")
+        controls.update(outcome="PASS", completed_count=4)
+
     def ports_free(self):
+        observations = self.phases[self.stage].setdefault("port_admissions", [])
         for port in [19000, 19001]:
-            with socket.socket() as probe:
-                try:
-                    probe.bind(("127.0.0.1", port))
-                except OSError:
-                    raise H.Hold("fixture loopback port occupied; foreign listener not touched") from None
+            receipt = port_admission(port)
+            observations.append(receipt)
+            H.require(receipt["outcome"] == "ADMIT", "loopback port admission unresolved; no foreign listener attribution")
 
     def server_env(self):
         return dict(self.env, MINIO_ROOT_USER="juicemount", MINIO_ROOT_PASSWORD=self.creds["root"],
@@ -471,10 +677,10 @@ class Migration:
             raise H.Hold("native server did not join; no forced termination") from None
         receipt.update(wait_outcome="JOINED", returncode=code)
         H.require(code == 0, "native server exited nonzero; state retained")
+        receipt["status"] = "JOINED_ZERO"  # Process fact precedes any independent port admission.
         self.native_log.close()
         self.native = self.native_log = None
         self.ports_free()
-        receipt["status"] = "JOINED_ZERO"
 
     def mc(self, *args, who="root", **kwargs):
         return self.call([self.build_inputs / "mc", "--config-dir", self.auth / ROLE[who], *args], **kwargs)
@@ -946,7 +1152,7 @@ class Migration:
             "schema": 1, "status": "HOLD", "source_sha": self.source_sha, "run_id": self.run_id,
             "first_red": self.result["first_red"], "finalization_error_category": type(exc).__name__,
             "failed_staging_exported": False, "private_state_exported": False,
-            "legacy_inputs_published": "legacy" in self.published,
+            "legacy_reference_published": "legacy" in self.published,
         })
         self.publish_artifacts(failure, {"result.json"}, "evidence")
 
@@ -988,7 +1194,7 @@ def main():
         signal.signal(signal.SIGTERM, interrupted)
         signal.signal(signal.SIGINT, interrupted)
         trial.import_image()
-        trial.build_legacy()
+        trial.import_legacy()
         trial.seed_legacy()
         trial.snapshot()
         trial.first_silo()
@@ -1019,4 +1225,5 @@ def main():
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
 

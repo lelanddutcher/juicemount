@@ -16,10 +16,6 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 2
-      - uses: actions/setup-go@v5
-        with:
-          go-version: '1.26.6'
-          cache: false
       - name: Prepare existing private Bash prerequisite
         run: bash scripts/prepare-ci-bash.sh
       - name: Download original immutable candidate image evidence
@@ -29,23 +25,26 @@ jobs:
           run-id: 38209969671
           github-token: ${{ github.token }}
           path: ${{ runner.temp }}/storage-candidate-import-38209969671-1
+      - name: Download original verified legacy executables
+        uses: actions/download-artifact@v4
+        with:
+          name: storage-migration-legacy-inputs-38219780080-1
+          run-id: 38219780080
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/storage-migration-legacy-import-38219780080-1
       - name: Verify inputs and run one owned stopped migration
         id: qualify
         run: python3 -I -B server/minio/qualify-storage-migration.py
-      - name: Retain verified legacy build inputs independently of runtime outcome
+      - name: Retain verified original legacy input reference independently of runtime outcome
         if: ${{ always() && steps.qualify.outputs.legacy_ready == 'true' && steps.qualify.outputs.legacy_dir != '' }}
         uses: actions/upload-artifact@v4
         with:
-          name: storage-migration-legacy-inputs-${{ github.run_id }}-${{ github.run_attempt }}
+          name: storage-migration-legacy-reference-${{ github.run_id }}-${{ github.run_attempt }}
           retention-days: 14
           compression-level: 0
           if-no-files-found: error
           path: |
-            ${{ steps.qualify.outputs.legacy_dir }}/minio
-            ${{ steps.qualify.outputs.legacy_dir }}/mc
-            ${{ steps.qualify.outputs.legacy_dir }}/minio-buildinfo.txt
-            ${{ steps.qualify.outputs.legacy_dir }}/mc-buildinfo.txt
-            ${{ steps.qualify.outputs.legacy_dir }}/provenance.json
+            ${{ steps.qualify.outputs.legacy_dir }}/legacy-input-reference.json
             ${{ steps.qualify.outputs.legacy_dir }}/artifact-manifest.json
       - name: Retain sanitized migration evidence and original image reference
         if: ${{ always() && steps.qualify.outputs.evidence_ready == 'true' && steps.qualify.outputs.evidence_dir != '' }}
@@ -61,4 +60,5 @@ jobs:
             ${{ steps.qualify.outputs.evidence_dir }}/candidate-image-reference.json
             ${{ steps.qualify.outputs.evidence_dir }}/phase-evidence.json
             ${{ steps.qualify.outputs.evidence_dir }}/artifact-manifest.json
+
 
