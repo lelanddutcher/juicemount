@@ -272,6 +272,92 @@ shell redirection (`echo x >> file`) ignores `close` errors and reports exit
 0 even though nothing was written. Test with `touch`, `mkdir`, or
 `dd if=/dev/zero of=FILE bs=1k count=1 conv=fsync`, and check the content.
 
+### Enable recoverable replacement saves
+
+Desktop recovery is enabled by default; the canonical server defaults to
+`JM_RESPPROXY_MODE=passthrough` and `JM_RESPPROXY_STAGE_BIRTH=false`.
+Enabling provider recovery also enables project lease enforcement. Qualify
+the layout and every deployed writer before opting in; a healthy container
+or a positive capability reply alone is not mounted save/recovery acceptance.
+
+**Preflight.** Identify the exact host, Compose project, configuration files,
+private environment file, immutable proxy image, volume UUID and metadata DB
+(canonical default: 1). Check the resolved mode/birth settings without
+printing credentials or the complete Compose environment. Read the stored
+`mode` and `depth` fields of `jmlease:v1:cfg` in that DB through the identified
+administrator connection. Require project depth 2 (an absent depth defaults
+to 2); the Manager and Mac project mapping assume two directory components.
+Confirm all enrolled Macs and the farm, Manager, background mount and WebDAV
+use their intended principals. Existing installations must complete steps
+1–3 above, including the seven-day observe exit criteria. Before recreating
+a service, establish its owned restart/rollback plan and confirm active I/O
+has quiesced and pending saves remain durably retained.
+
+Recovery covers files inside a project, for example
+`/collection/project/file.mov`. Files at `/file.mov` or
+`/collection/file.mov`, derivative and trash namespaces are outside this
+scope. Enforce also makes renaming/removing a project-root or top-level
+directory an administrator operation; qualify those organization workflows
+before enabling it. Unsupported create shapes or ancestry (including an
+ancestor directory with more than 65,536 entries) can still hold a save.
+
+**Fresh volume.** After qualifying the images, storage and writer workflows,
+set both `JM_RESPPROXY_MODE=enforce` and `JM_RESPPROXY_STAGE_BIRTH=true` in the
+identified deployment's private environment file before starting its proxy.
+This assumes a newly owned empty volume with no conflicting stored mode.
+New containers attached to an existing Redis dataset are an existing
+installation; never reformat that volume to activate recovery.
+
+**Existing volume.** Keep stage births off during topology cutover and
+observe qualification. On the identified Manager's authenticated Principals
+page, switch to enforce, or use authenticated `POST /api/leases/mode` with
+`{"mode":"enforce","confirm":"enforce"}`. Verify the stored response and
+the proxy's live `jm_respproxy_mode{mode="enforce"}` metric is 1. Then set
+both environment values above and recreate only that deployment's proxy
+under the reviewed restart plan. The ordinary release rollout at the top of
+this guide updates Manager/farm only; it does not perform this activation.
+
+The stored mode overrides the environment. Setting both environment values
+while the stored mode is `passthrough` or `observe` makes the proxy refuse
+startup. `GET /api/leases/mode` reports stored configuration, not a live
+readiness check: `{"mode":"","source":"proxy-start"}` means no stored
+override and does not prove enforce is active.
+
+**Check from the enrolled Mac.** Through that Mac's authenticated connection
+to the identified proxy, select the volume DB and issue the read-only RESP
+command (use the existing credential mechanism; never put secrets in command
+arguments or logs):
+
+```text
+JM.LEASE REPLACEMENT_CAPABILITIES
+```
+
+Require the five-element reply `[1, expectedDB, expectedMacPrincipal,
+nonemptyProxyIncarnation, 1]`. An admin connection cannot replace this check.
+The final 1 establishes current enforcing singleton/lease-engine readiness
+to attempt a new stage; the exact stage receipt still authorizes the save.
+On an error, readiness 0, identity mismatch or a held recovery, stop the
+activation/acceptance procedure and investigate. Preserve the original
+operation ID, pending bytes and spool accounting; do not resubmit the save,
+repair its journal or delete its private stage to force progress.
+
+**Acceptance and rollback.** Use an owned fixture on the real Mac mount to
+accept a replacement while the provider is unavailable, activate recovery,
+and verify that the same operation publishes. Require its committed receipt,
+exact remote readback through a fresh reader and eventual local settlement.
+Then qualify provider restart recovery, peer-writer conflicts, deferred
+cleanup and every deployed writer role. Isolated SDK tests do not establish
+these mounted/deployed outcomes.
+
+Setting `JM_RESPPROXY_STAGE_BIRTH=false` and recreating the owned proxy stops
+new birth creation; existing birth receipts remain protected, and qualified
+existing operations can continue under enforce. Changing effective mode to
+observe/passthrough instead holds stage operations until enforce returns.
+Neither action authorizes discarding pending saves. Topology transitions
+must keep births off: the rollout script deliberately resets stored mode to
+passthrough and refuses an enabled birth setting. After a topology transition,
+repeat the mode qualification and deliberate activation above.
+
 ### Rollback, in increasing severity
 
 1. Mode `observe`: immediate, no restart.
