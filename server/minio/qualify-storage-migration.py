@@ -32,19 +32,20 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 
-PARENT = "58e894db0a2272c9233a44406d8ecdcdc339c558"
-PARENT_TREE = "0c079236603fd52da95cfadefc5948ab6702691f"
-BRANCH = "refs/heads/codex/0.5-storage-migration-r3-58e894d"
-HELPER_SHA = "fd21c2a9174eac69dcd29ef26cdcd2a17ade3fe63249c70a47e8964e493e53c4"
-PATHS = [".github/workflows/ci.yml", "server/minio/qualify-storage-migration.py"]
+PARENT = "857bdb7acfc563108d8120645ebe18649edec2dc"
+PARENT_TREE = "390c0e42a1ae1a2db038e89a92b4dc90b1f2afa1"
+BRANCH = "refs/heads/codex/0.5-storage-migration-arm64-857bdb7"
+HELPER_SHA = "c1a48d4172dcbdc3e4cba2acdae4d073e4ddf13921a9dffd4ae254a0b88cb6e2"
+PATHS = [".github/workflows/ci.yml", "server/minio/qualify-storage-candidate.py",
+         "server/minio/qualify-storage-migration.py"]
 URL = "http://127.0.0.1:19000"
 ACTIVE = "mac-0123456789ab-1"
 PRE_REVOKED = "mac-0123456789ac-1"
-PASS = "PASS_STOPPED_SINGLE_NODE_MIGRATION_RESTORE_SECURITY_AND_MOUNTED_ACCEPTANCE_OPEN"
+PASS = "PASS_NATIVE_ARM64_STOPPED_SINGLE_NODE_MIGRATION_RESTORE_SECURITY_AND_MOUNTED_ACCEPTANCE_OPEN"
 PHASES = [
     "verify original immutable artifact before image load",
     "load verified archive and extract packaged binaries without starting",
-    "verify retained legacy inputs and four owned socket controls",
+    "build exact-source native legacy inputs and four owned socket controls",
     "legacy provisioning and seeded access",
     "stopped complete snapshot and disjoint copies",
     "first Silo start inherited IAM and objects before repair",
@@ -61,7 +62,7 @@ LEGACY = {
         "module": "github.com/minio/minio",
         "go.mod": "1653dc86c87c79625fddcac3d120e039772a6f5eacf57fdfa4ca1263001a61d7",
         "go.sum": "4508802c4fb08a2a14abe557a6ea10cdffed8c33f6b80ef3d88c62b02380d953",
-        "sha256": "3e0c506e74fa02a6e9788402b51b4eecbae4d2a301d6f8508db8d308ce5df29d",
+        "tree": "2589ae46ba8ca031131c65b655306850045fccc6",
     },
     "mc": {
         "url": "https://github.com/minio/mc.git",
@@ -69,7 +70,7 @@ LEGACY = {
         "module": "github.com/minio/mc",
         "go.mod": "91a5bc05ad8590ffe7697028f25875ec5ad8582e85d80bb416876021bef2a23a",
         "go.sum": "51e4747efc81524863faba0ecfffd2a0cf115007dbcd0622edeeb98bda5ecada",
-        "sha256": "bf2961e6ecee008ff853d905fbf0752d46ae7699b91ecd4e7ced7b9691f9bd43",
+        "tree": "9592ee60ee40ce8dc73ed1df08032da4fbda442b",
     },
 }
 ROLE = {"root": "juicemount", "client": "jm-client", "gc": "jm-gc",
@@ -78,14 +79,10 @@ POLICIES = {"jm-client": "jm-client", "jm-gc": "jm-gc",
             "jm-macs": "jm-client", "jm-keyadmin": "jm-keyadmin"}
 ARTIFACTS = {"result.json", "provenance.json", "candidate-image-reference.json",
              "phase-evidence.json", "artifact-manifest.json"}
-LEGACY_SOURCE = "1926003336f6aa76da5c46c7fc52b7f5c8df6974"
-LEGACY_RUN = "38219780080"
-LEGACY_ARTIFACT = "storage-migration-legacy-inputs-38219780080-1"
-LEGACY_IMPORT_DIR = "storage-migration-legacy-import-38219780080-1"
-LEGACY_MANIFEST_SHA = "a17e9191daf424082ee9d048aa115aac398423da9f1ef443d222b994398d61b6"
-LEGACY_BYTES = {"minio": 157127351, "mc": 42984924}
-LEGACY_TREES = {"minio": "2589ae46ba8ca031131c65b655306850045fccc6",
-                "mc": "9592ee60ee40ce8dc73ed1df08032da4fbda442b"}
+BUILD_ARTIFACTS = {"minio", "mc", "minio-buildinfo.txt", "mc-buildinfo.txt", "provenance.json"}
+BUILD_ENV = {"CGO_ENABLED": "0", "GOOS": "linux", "GOARCH": "arm64", "GOARM64": "v8.0",
+             "GOTOOLCHAIN": "local", "GOWORK": "off", "GOENV": "off", "GOFLAGS": "", "GOEXPERIMENT": "",
+             "GOPROXY": "https://proxy.golang.org,direct", "GOSUMDB": "sum.golang.org"}
 H = None
 
 
@@ -321,10 +318,10 @@ def load_helpers():
 
 def preflight():
     H.require(len(sys.argv) == 1 and sys.dont_write_bytecode, "isolated no-bytecode invocation required")
-    H.require(sys.platform == "linux" and platform.machine() == "x86_64", "Linux amd64 required")
+    H.require(sys.platform == "linux" and platform.machine() == "aarch64", "native Linux ARM64 required")
     H.require(os.environ.get("GITHUB_ACTIONS") == "true"
-              and os.environ.get("RUNNER_OS") == "Linux" and os.environ.get("RUNNER_ARCH") == "X64",
-              "GitHub-hosted Linux x64 required")
+              and os.environ.get("RUNNER_OS") == "Linux" and os.environ.get("RUNNER_ARCH") == "ARM64",
+              "GitHub-hosted Linux ARM64 required")
     H.require(os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
               and os.environ.get("GITHUB_REF") == BRANCH
               and os.environ.get("GITHUB_RUN_ATTEMPT") == "1", "exact first manual diagnostic run required")
@@ -335,7 +332,7 @@ def preflight():
     H.require(re.fullmatch(r"[0-9a-f]{40}", source) and re.fullmatch(r"[0-9]+", run), "source/run missing")
     repo = Path(os.environ["GITHUB_WORKSPACE"])
     H.require(repo.is_absolute() and repo.resolve(strict=True) == repo
-              and Path(__file__).resolve() == repo / PATHS[1], "canonical admitted checkout required")
+              and Path(__file__).resolve() == repo / "server/minio/qualify-storage-migration.py", "canonical admitted checkout required")
     env = H.clean_env()
     H.require(H.git(repo, env, "rev-parse", "HEAD") == source, "checkout source differs")
     H.require(H.git(repo, env, "show", "-s", "--format=%P", "HEAD") == PARENT, "single parent differs")
@@ -343,8 +340,7 @@ def preflight():
     H.require(not H.git(repo, env, "status", "--porcelain", "--untracked-files=all"), "checkout not clean")
     H.require(sorted(H.git(repo, env, "diff", "--name-only", PARENT, "HEAD").splitlines()) == PATHS,
               "diagnostic delta differs")
-    for relative in PATHS + ["server/minio/qualify-storage-candidate.py",
-                              "server/minio/provision-object-keys.sh", "server/minio/keyd.sh",
+    for relative in PATHS + ["server/minio/provision-object-keys.sh", "server/minio/keyd.sh",
                               "server/minio/jm-client-policy.json", "server/minio/jm-gc-policy.json",
                               "server/minio/jm-keyadmin-policy.json", "scripts/prepare-ci-bash.sh"]:
         path = repo / relative
@@ -412,22 +408,26 @@ class Migration:
         self.root = Path(tempfile.mkdtemp(prefix="jm-storage-migration-" + self.run_id + "-", dir=temp))
         H.owned_dir(self.root)
         self.private, self.evidence, self.build_inputs = [self.root / n for n in ["private", "evidence", "legacy-inputs"]]
-        self.legacy_reference = self.root / "legacy-reference"
-        for folder in [self.private, self.evidence, self.build_inputs, self.legacy_reference]:
+        for folder in [self.private, self.evidence, self.build_inputs]:
             folder.mkdir(mode=0o700)
         for n in ["tmp", "docker", "data", "control", "extract",
-                  "runtime", "snapshots", "seed-inputs", "probes"]:
+                  "runtime", "snapshots", "seed-inputs", "probes",
+                  "sources", "built", "gotmp", "gopath", "gocache"]:
             (self.private / n).mkdir(mode=0o700)
-        self.env.update(TMPDIR=str(self.private / "tmp"), DOCKER_CONFIG=str(self.private / "docker"))
+        self.env.update(BUILD_ENV)
+        self.env.update(TMPDIR=str(self.private / "tmp"), GOTMPDIR=str(self.private / "gotmp"),
+                        GOPATH=str(self.private / "gopath"), GOCACHE=str(self.private / "gocache"),
+                        DOCKER_CONFIG=str(self.private / "docker"))
         self.stage = "admitted"
         self.result = {"schema": 1, "status": "HOLD", "run_id": self.run_id, "source_sha": self.source_sha,
                        "parent": PARENT, "declared_phases": PHASES, "stages": [],
                        "container_retirement": [], "native_retirement": [],
-                       "limits": ["single-node stopped Linux amd64 data/IAM/keyd/config migration only",
+                       "limits": ["single-node stopped native Linux ARM64 data/IAM/keyd/config migration only",
                                   "security acceptance open", "full JuiceFS metadata acceptance open",
                                   "Manager/Mac/Link and mounted/provider acceptance open",
                                   "encryption/versioning/distributed/live-writer acceptance open",
-                                  "arm64 acceptance open", "no production or registry changes"]}
+                                  "legacy exact-source rebuild; original image runtime equivalence not claimed",
+                                  "no production or registry changes"]}
         self.phases, self.verified_binaries = {}, {}
         self.image_id = self.container = self.container_name = None
         self.create_attempted = False
@@ -449,7 +449,8 @@ class Migration:
             "retained_helper_sha256": HELPER_SHA, "production_inputs": {p: H.sha(self.repo / p) for p in scripts},
             "bash_prerequisite_source_sha256": H.sha(self.repo / "scripts/prepare-ci-bash.sh"),
             "bash_binary_sha256": H.sha(self.bash), "legacy_identities": LEGACY,
-            "legacy_input_mode": "verified retained artifact; no Go toolchain or source build",
+            "legacy_input_mode": "native exact-source Go1.26.6 builds; newly measured ARM64 hashes",
+            "legacy_equivalence": "historical source identity only; original-image runtime/security equivalence not claimed",
             "image_source_sha": H.IMAGE_SOURCE, "image_archive_sha256": H.ARCHIVE_SHA,
             "image_config_id": H.IMAGE_ID, "endpoint": URL,
             "image_scope": "unchanged original artifact; no pull, image rebuild or scan",
@@ -517,76 +518,105 @@ class Migration:
     def import_image(self):
         H.Qualification.import_image(self)
 
-    def import_legacy(self):
+    def legacy_binary(self, name):
+        H.require(name in LEGACY and name in self.verified_binaries, "legacy executable not admitted")
+        path = self.build_inputs / name
+        identity = self.verified_binaries[name]
+        H.require(path.is_file() and not path.is_symlink() and path.resolve(strict=True) == path
+                  and path.stat().st_uid == os.geteuid() and stat.S_IMODE(path.stat().st_mode) == 0o500
+                  and path.stat().st_size == identity["bytes"] and H.sha(path) == identity["sha256"],
+                  "legacy executable differs from this trial's verified native build")
+        return path
+
+    def verify_legacy_source(self, name):
+        identity = LEGACY[name]
+        source = self.private / "sources" / name
+        H.owned_dir(source)
+        H.require(H.git(source, self.env, "rev-parse", "HEAD") == identity["revision"]
+                  and H.git(source, self.env, "rev-parse", "HEAD^{tree}") == identity["tree"]
+                  and H.git(source, self.env, "remote", "get-url", "origin") == identity["url"]
+                  and not H.git(source, self.env, "status", "--porcelain", "--untracked-files=all"),
+                  "legacy source revision/tree/origin/cleanliness differs")
+        for filename in ["go.mod", "go.sum"]:
+            path = source / filename
+            H.require(path.is_file() and not path.is_symlink() and H.sha(path) == identity[filename],
+                      "legacy module input differs")
+        return source
+
+    def build_legacy(self):
         self.step(PHASES[2])
-        imported = Path(os.environ["RUNNER_TEMP"]) / LEGACY_IMPORT_DIR
-        H.require(imported.resolve(strict=True) == imported and imported.is_dir()
-                  and imported.stat().st_uid == os.geteuid(), "legacy import directory custody differs")
-        expected_files = {"minio", "mc", "minio-buildinfo.txt", "mc-buildinfo.txt", "provenance.json"}
-        manifest_path = imported / "artifact-manifest.json"
-        H.require(manifest_path.is_file() and not manifest_path.is_symlink()
-                  and H.sha(manifest_path) == LEGACY_MANIFEST_SHA, "original legacy manifest differs")
-        manifest = json.loads(manifest_path.read_text())
-        H.require(manifest.get("schema") == 1 and manifest.get("source_sha") == LEGACY_SOURCE
-                  and manifest.get("run_id") == LEGACY_RUN and manifest.get("private_fixture_excluded") is True
-                  and set(manifest.get("files", {})) == expected_files
-                  and {p.name for p in imported.iterdir()} == expected_files | {"artifact-manifest.json"},
-                  "original legacy manifest identity or six-file set differs")
-        for name, identity in manifest["files"].items():
-            path = imported / name
-            H.require(path.is_file() and not path.is_symlink() and path.resolve(strict=True) == path
-                      and path.stat().st_uid == os.geteuid() and path.stat().st_size == identity["bytes"]
-                      and H.sha(path) == identity["sha256"], "legacy artifact member differs")
-        provenance = json.loads((imported / "provenance.json").read_text())
-        H.require(provenance.get("schema") == 1 and provenance.get("source_sha") == LEGACY_SOURCE
-                  and provenance.get("run_id") == LEGACY_RUN
-                  and provenance.get("status") == "VERIFIED_BUILD_INPUTS"
-                  and provenance.get("environment") == {"CGO_ENABLED": "0", "GOOS": "linux",
-                                                        "GOARCH": "amd64", "GOAMD64": "v1"}
-                  and provenance.get("build_command") == "go build -mod=readonly -trimpath -buildvcs=true -o <binary> ."
-                  and set(provenance.get("binaries", {})) == set(LEGACY),
-                  "legacy provenance differs")
+        H.require(not self.secrets and self.native is None and not self.create_attempted,
+                  "legacy input build must precede runtime credentials and servers")
+        wanted = dict(BUILD_ENV, GOVERSION="go1.26.6", GOHOSTOS="linux", GOHOSTARCH="arm64",
+                      GOPATH=self.env["GOPATH"], GOCACHE=self.env["GOCACHE"], GOTMPDIR=self.env["GOTMPDIR"])
+        H.require(self.call(["go", "version"])[1].strip() == b"go version go1.26.6 linux/arm64",
+                  "native Go1.26.6 required")
+        observed = json.loads(self.call(["go", "env", "-json", *sorted(wanted)])[1])
+        H.require(observed == wanted, "native Go host/target or private build environment differs")
+        self.phases[self.stage]["toolchain"] = {
+            "version": "go1.26.6", "host": "linux/arm64", "environment": BUILD_ENV,
+            "private_tmp_and_caches": True, "home_preserved": True}
         for name, identity in LEGACY.items():
-            prior = provenance["binaries"][name]
-            H.require(prior == {"sha256": identity["sha256"], "bytes": LEGACY_BYTES[name],
-                                "revision": identity["revision"], "tree": LEGACY_TREES[name],
-                                "toolchain": "go1.26.6", "vcs_modified": False}
-                      and H.sha(imported / name) == identity["sha256"], "legacy source/binary receipt differs")
-            info = (imported / (name + "-buildinfo.txt")).read_text()
+            source = self.private / "sources" / name
+            source.mkdir(mode=0o700)
+            H.git(source, self.env, "init", "--quiet")
+            H.git(source, self.env, "remote", "add", "origin", identity["url"])
+            self.call(["git", "-c", "credential.helper=", "-C", source, "fetch", "--depth=1",
+                       "origin", identity["revision"]], timeout=180)
+            H.git(source, self.env, "checkout", "--quiet", "--detach", "FETCH_HEAD")
+            self.verify_legacy_source(name)
+            binary = self.private / "built" / name
+            code, output, error = self.call(["go", "build", "-mod=readonly", "-trimpath", "-buildvcs=true",
+                                             "-o", binary, "."], cwd=source, timeout=900, expected=None)
+            row = {"name": name, "exit_code": code, "stdout_sha256": digest(output),
+                   "stderr_sha256": digest(error), "outcome": "HOLD"}
+            self.phases[self.stage].setdefault("builds", []).append(row)
+            H.require(code == 0, "native legacy build failed; bounded output hashes retained")
+            self.verify_legacy_source(name)
+            H.require_arm64_elf(binary)
+            info = self.call(["go", "version", "-m", binary])[1].decode()
             lines = info.splitlines()
-            H.require(lines and lines[0] == "<" + name + ">: go1.26.6", "retained legacy toolchain differs")
+            H.require(lines and lines[0] == str(binary) + ": go1.26.6", "legacy binary toolchain differs")
             fields = {}
             for line in lines[1:]:
                 parts = line.strip().split("\t")
                 if len(parts) >= 2 and parts[0] == "build" and "=" in parts[1]:
                     key, value = parts[1].split("=", 1)
+                    H.require(key not in fields, "duplicate legacy buildinfo setting")
                     fields[key] = value
-            for key, value in {"CGO_ENABLED": "0", "GOOS": "linux", "GOARCH": "amd64", "GOAMD64": "v1",
+            for key, value in {"CGO_ENABLED": "0", "GOOS": "linux", "GOARCH": "arm64", "GOARM64": "v8.0",
                                "vcs": "git", "vcs.revision": identity["revision"], "vcs.modified": "false",
                                "-trimpath": "true"}.items():
-                H.require(fields.get(key) == value, "retained legacy buildinfo setting differs")
+                H.require(fields.get(key) == value, "native legacy buildinfo setting differs")
             H.require(any(line.strip().split("\t")[:2] == ["path", identity["module"]] for line in lines),
-                      "retained legacy module path differs")
+                      "legacy module path differs")
+            admitted = {"sha256": H.sha(binary), "bytes": binary.stat().st_size,
+                        "revision": identity["revision"], "tree": identity["tree"], "url": identity["url"],
+                        "module": identity["module"], "go.mod": identity["go.mod"], "go.sum": identity["go.sum"],
+                        "toolchain": "go1.26.6", "platform": "linux/arm64", "GOARM64": "v8.0",
+                        "elf_machine": "AArch64", "vcs_modified": False,
+                        "identity_kind": "new exact-source build; no prior ARM64 binary equivalence claim"}
             destination = self.build_inputs / name
-            H.require(not destination.exists() and not destination.is_symlink(), "legacy runtime copy already exists")
-            shutil.copyfile(imported / name, destination)
+            H.require(not destination.exists() and not destination.is_symlink(), "legacy runtime copy exists")
+            shutil.copyfile(binary, destination)
             destination.chmod(0o500)
-            H.require(destination.is_file() and not destination.is_symlink()
-                      and destination.stat().st_uid == os.geteuid() and H.sha(destination) == identity["sha256"],
-                      "legacy runtime executable copy differs")
-            self.verified_binaries[name] = prior
-        H.write_json(self.legacy_reference / "legacy-input-reference.json", {
-            "schema": 1, "trial_source_sha": self.source_sha, "original_source_sha": LEGACY_SOURCE,
-            "original_run_id": LEGACY_RUN, "original_attempt": 1, "original_artifact_id": 11733683437,
-            "original_artifact_name": LEGACY_ARTIFACT, "original_manifest_sha256": LEGACY_MANIFEST_SHA,
-            "original_archive_sha256_reference": "862e862f806003a3d9f107fdf2d5ecdb56a55872fe8c68c0fa1847eff0191482",
-            "verification": "all six extracted members bound by exact original manifest; copied executables rehashed",
-            "custody": "original executable artifact referenced; no rebuild or binary re-upload",
-            "binaries": self.verified_binaries,
+            self.verified_binaries[name] = admitted
+            self.legacy_binary(name)
+            H.write_new(self.build_inputs / (name + "-buildinfo.txt"), info.replace(str(binary), "<" + name + ">"))
+            row.update(outcome="PASS", binary=admitted)
+        H.require(set(self.verified_binaries) == set(LEGACY), "two legacy builds did not complete")
+        H.write_json(self.build_inputs / "provenance.json", {
+            "schema": 1, "source_sha": self.source_sha, "run_id": self.run_id,
+            "purpose": "new native exact-source legacy executables; independent of migration outcome",
+            "status": "VERIFIED_BUILD_INPUTS", "binaries": self.verified_binaries,
+            "build_command": "go build -mod=readonly -trimpath -buildvcs=true -o <binary> .",
+            "environment": BUILD_ENV, "host": "linux/arm64",
+            "limits": "source identity does not establish original legacy image runtime or security equivalence",
         })
         self.result["legacy_binaries"] = self.verified_binaries
         self.phases[self.stage]["verified_binary_names"] = sorted(self.verified_binaries)
-        self.publish_artifacts(self.legacy_reference, {"legacy-input-reference.json"}, "legacy")
+        # Publish reusable inputs before any runtime credential or socket fixture.
+        self.publish_artifacts(self.build_inputs, BUILD_ARTIFACTS, "legacy")
         self.qualify_ports()
         self.passed()
 
@@ -691,7 +721,7 @@ class Migration:
         descriptor = os.open(log, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
         self.native_log = os.fdopen(descriptor, "wb")
         self.native = subprocess.Popen(
-            [str(self.build_inputs / "minio"), "server", "--address", "127.0.0.1:19000",
+            [str(self.legacy_binary("minio")), "server", "--address", "127.0.0.1:19000",
              "--console-address", "127.0.0.1:19001", str(data)],
             env=self.server_env(), stdin=subprocess.DEVNULL,
             stdout=self.native_log, stderr=subprocess.STDOUT, start_new_session=True)
@@ -721,7 +751,7 @@ class Migration:
         self.ports_free()
 
     def mc(self, *args, who="root", **kwargs):
-        return self.call([self.build_inputs / "mc", "--config-dir", self.auth / ROLE[who], *args], **kwargs)
+        return self.call([self.legacy_binary("mc"), "--config-dir", self.auth / ROLE[who], *args], **kwargs)
 
     def mc_json(self, *args, who="root"):
         code, output, error = self.mc("--json", *args, who=who, expected=None)
@@ -782,6 +812,8 @@ class Migration:
             "url": URL, "accessKey": name, "secretKey": secret, "api": "S3v4", "path": "auto"}}})
 
     def provision(self, binary):
+        if binary == self.build_inputs / "mc":
+            binary = self.legacy_binary("mc")
         env = dict(self.server_env(), MC=str(binary), JM_MINIO_ENDPOINT=URL,
                    JM_MINIO_POLICY_DIR=str(self.repo / "server/minio"),
                    JM_OBJ_CLIENT_SECRET_KEY=self.creds["client"], JM_OBJ_GC_SECRET_KEY=self.creds["gc"],
@@ -795,7 +827,7 @@ class Migration:
         H.write_json(pending, {"seq": seq, "keys": [{"name": n, "state": "active"} for n in wanted],
                                "remove": list(remove)})
         pending.replace(keys / "desired.json")
-        env = dict(self.env, MC=str(self.private / "extract/mcli" if candidate else self.build_inputs / "mc"),
+        env = dict(self.env, MC=str(self.private / "extract/mcli" if candidate else self.legacy_binary("mc")),
                    JM_OBJ_PER_MAC_SERVER="1", JM_OBJ_KEYADMIN_SECRET_KEY=self.creds["keyadmin"],
                    JM_MINIO_ENDPOINT=URL, JM_OBJKEYS_DIR=str(keys), JM_KEYD_ONCE="1")
         self.call([self.bash, self.repo / "server/minio/keyd.sh"], env=env, timeout=90)
@@ -1026,6 +1058,9 @@ class Migration:
         H.require(tree_manifest(source) == tree_manifest(target), "snapshot copy bytes/metadata differ")
 
     def preserve_sources(self):
+        for name in self.verified_binaries:
+            self.verify_legacy_source(name)
+            self.legacy_binary(name)
         if self.seed_manifest is not None:
             H.require(tree_manifest(self.private / "seed-inputs") == self.seed_manifest, "original seed bytes changed")
         if self.snapshots is not None:
@@ -1163,7 +1198,7 @@ class Migration:
                   "artifact allowlist differs")
         for path in files:
             if path.name in LEGACY:
-                H.require(kind == "legacy" and H.sha(path) == LEGACY[path.name]["sha256"],
+                H.require(kind == "legacy" and path == self.legacy_binary(path.name),
                           "published legacy executable differs")
             else:
                 value = path.read_text()
@@ -1190,7 +1225,7 @@ class Migration:
             "schema": 1, "status": "HOLD", "source_sha": self.source_sha, "run_id": self.run_id,
             "first_red": self.result["first_red"], "finalization_error_category": type(exc).__name__,
             "failed_staging_exported": False, "private_state_exported": False,
-            "legacy_reference_published": "legacy" in self.published,
+            "legacy_build_inputs_published": "legacy" in self.published,
         })
         self.publish_artifacts(failure, {"result.json"}, "evidence")
 
@@ -1232,7 +1267,7 @@ def main():
         signal.signal(signal.SIGTERM, interrupted)
         signal.signal(signal.SIGINT, interrupted)
         trial.import_image()
-        trial.import_legacy()
+        trial.build_legacy()
         trial.seed_legacy()
         trial.snapshot()
         trial.first_silo()
@@ -1263,6 +1298,3 @@ def main():
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
-
-

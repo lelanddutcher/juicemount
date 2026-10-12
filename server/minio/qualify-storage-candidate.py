@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""One cloud-only imported-image and ordinary JuiceFS object compatibility trial.
+"""Hash-bound import and container-custody helpers for native ARM64 migration.
 
-No registry push, advisory rescan, auth-bypass probe, migration, or production
-qualification. Failed/uncertain operations are not retried. Private fixture
-state is never an artifact; only the explicit evidence allowlist is exported.
+The migration controller owns admission, provenance and all eleven phases.
+Direct execution is refused; retained compatibility methods are never called.
+Only the original qualified image artifact is imported, without rebuild or scan.
 """
 import sys
 
@@ -32,8 +32,8 @@ PARENT_TREE = "c408e101642d615de471c305a4752070df76f8e4"
 BRANCH = "refs/heads/codex/0.5-storage-trial-410b49e"
 TEST_SOURCE_SHA = "0b42a6e0ed8f2267f2d14d06fe295812a81016cdbb33f8efec1109b2835d389e"
 BASE = ("docker.io/pgsty/silo:RELEASE.2026-09-16T00-00-00Z@sha256:"
-        "635197cb9f36d01bee221d34d1c7d7960f6a95c48b0b6c01d99cd13bdae51a46")
-BASE_ID = "sha256:983b34aec255b1ef414506989ec0106b319aef815a4f6fbaddd57e4d2bf2494f"
+        "1ff329e4507f742a8437f1773d43cf6adb0131477074dd45c770d1a1db19e99c")
+BASE_ID = "sha256:a9590da2668a2589dee6e1f8754c755074695794aaba389b6c7e78199688e2d5"
 # Exact reviewed base config defaults. These contain file names, not secrets;
 # root mcli uses --config-dir and production provisioning owns its MC_CONFIG_DIR.
 BASE_ENV = [
@@ -68,8 +68,8 @@ IDENTITIES = {
             "go.sum": "747a263bbbfe655f26d06e5848e112ee6c9a0fcafd92eb6f5efc86e730521c4e",
         },
         "patch_sha256": "650bd2fc5bccb8d910fce3c9ee27f0b5874a90ce4bc94eb190ec06cee691a388",
-        "binary_sha256": "032d265a8a0977ee037b112787b2d207aa398b091df1a531860eef633b8303a5",
-        "binary_bytes": 44332565,
+        "binary_sha256": "a376e0bf9cbf74644fd21cdd68194a64cd042d72df45be5b8935ca3c1bff44a8",
+        "binary_bytes": 41005853,
     },
     "silo": {
         "url": "https://github.com/pgsty/silo.git",
@@ -85,23 +85,55 @@ IDENTITIES = {
             "go.sum": "140d249124a1a2658ce80206229ea4c21fdddef4a0aa47452ea9411e5993f2ad",
         },
         "patch_sha256": "88f97d09ce56a8837cab629f650bf2e9b67c7e31533d9e8fd79bb206fe9fc5ce",
-        "binary_sha256": "2cf9e63da4717be41a044096467bf8f5d230f1b5ca08645d7837e383126fd87a",
-        "binary_bytes": 137603284,
+        "binary_sha256": "99cec0faf03e826bdcdca0badbf62280d15039d7ba851561487857c388d98b26",
+        "binary_bytes": 127733479,
     },
 }
-IMAGE_ID = "sha256:67e0cbe5ad67922a509351d357b4609c325a9562b69d4fcf2318d51c32dfdd1d"
-IMAGE_SOURCE = PARENT  # Image build identity intentionally differs from this trial SHA.
-IMPORT_RUN = "38209969671"
-IMPORT_ARTIFACT = "storage-candidate-38209969671-1"
-IMPORT_DIR = "storage-candidate-import-38209969671-1"
-IMPORT_MANIFEST_SHA = "7e07fca4386a5d4127cf78aa0b234fea999f5e5f3a9b8ee076cb9acf6e2fe635"
-IMPORT_METADATA_SHA = "aee28426dee0220dacf1db877dc9096bd1c9b37028211eab5215f73c3b30fc0f"
-ARCHIVE_SHA = "66ef11edb5f3c22908c409da350faabb95da2cd880e8c020ea31531997768c0d"
-ARCHIVE_BYTES = 137893411
+IMAGE_ID = "sha256:754c7ed1ea9af679e2a5325b566ca6a03235139ea285bd495c9c352fe2bb7a9f"
+IMAGE_SOURCE = "6ce4e427f12f938ef69001cd25801f2d3f493f3f"  # Original image build, not migration trial.
+IMPORT_RUN = "38241710613"
+IMPORT_ARTIFACT = "storage-candidate-arm64-38241710613-1"
+IMPORT_DIR = "storage-candidate-arm64-import-38241710613-1"
+IMPORT_MANIFEST_SHA = "c14164e6b5877476dfb168d1c8e79968cd4636a5fb1e1a5c4bb22d86b660bb92"
+IMPORT_METADATA_SHA = "15e12779ff197b3892ef23afc447c4768dcd65517e7ce9e65ab827f2064abb91"
+ARCHIVE_SHA = "1e53bdaa320901532c5f13f75467fc2310419c194d70a4b6652c0d991189f9d3"
+ARCHIVE_BYTES = 126502689
 IMPORT_FILES = {
-    "candidate-Dockerfile", "candidate-image.json", "candidate-image.tar.gz",
-    "compatibility-buildinfo.txt", "mcli-buildinfo.txt", "mcli-module.patch",
-    "provenance.json", "result.json", "silo-buildinfo.txt", "silo-module.patch",
+    "candidate-Dockerfile",
+    "candidate-image.json",
+    "candidate-image.tar.gz",
+    "compatibility-buildinfo.txt",
+    "compatibility-result.json",
+    "compatibility-status.txt",
+    "mcli-binary-govulncheck.jsonl",
+    "mcli-binary-govulncheck.stderr",
+    "mcli-buildinfo.txt",
+    "mcli-graph-summary.json",
+    "mcli-module.patch",
+    "mcli-modules.jsonl",
+    "mcli-modules.stderr",
+    "mcli-packages.jsonl",
+    "mcli-packages.stderr",
+    "mcli-source-govulncheck.jsonl",
+    "mcli-source-govulncheck.stderr",
+    "native-preflight.json",
+    "provenance.json",
+    "result.json",
+    "scan-summary.json",
+    "scanner-buildinfo.txt",
+    "scanner-module.json",
+    "scanner-provenance.json",
+    "silo-binary-govulncheck.jsonl",
+    "silo-binary-govulncheck.stderr",
+    "silo-buildinfo.txt",
+    "silo-graph-summary.json",
+    "silo-module.patch",
+    "silo-modules.jsonl",
+    "silo-modules.stderr",
+    "silo-packages.jsonl",
+    "silo-packages.stderr",
+    "silo-source-govulncheck.jsonl",
+    "silo-source-govulncheck.stderr",
 }
 ARTIFACTS = {
     "result.json", "provenance.json", "candidate-image-reference.json",
@@ -127,6 +159,18 @@ def sha(path):
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def require_arm64_elf(path):
+    require(path.is_file() and not path.is_symlink() and path.stat().st_uid == os.geteuid(),
+            "native binary must be an owned regular file")
+    with path.open("rb") as stream:
+        header = stream.read(64)
+    require(len(header) == 64 and header[:7] == b"\x7fELF\x02\x01\x01"
+            and int.from_bytes(header[16:18], "little") in [2, 3]
+            and int.from_bytes(header[18:20], "little") == 183
+            and int.from_bytes(header[20:24], "little") == 1,
+            "native binary is not ELF64 little-endian AArch64")
 
 
 def owned_dir(path):
@@ -492,6 +536,10 @@ class Qualification:
 
     def import_image(self):
         self.step("verify original immutable artifact before image load")
+        # The isolated environment admits only the local default Docker socket.
+        native = self.call(["docker", "version", "--format", "{{.Server.Os}}/{{.Server.Arch}}"])[1].strip()
+        require(native == b"linux/arm64", "native Linux ARM64 Docker daemon required")
+        self.phases[self.stage]["docker_server_platform"] = "linux/arm64"
         imported = Path(os.environ["RUNNER_TEMP"]) / IMPORT_DIR
         require(imported.resolve(strict=True) == imported and imported.is_dir()
                 and imported.stat().st_uid == os.geteuid(), "import directory identity differs")
@@ -500,7 +548,7 @@ class Qualification:
                 and sha(manifest_file) == IMPORT_MANIFEST_SHA, "original artifact manifest differs")
         manifest = json.loads(manifest_file.read_text())
         require(manifest.get("schema") == 1 and manifest.get("source_sha") == IMAGE_SOURCE
-                and manifest.get("private_fixture_excluded") is True
+                and manifest.get("private_fixture_excluded") is True and manifest.get("platform") == "linux/arm64"
                 and set(manifest.get("files", {})) == IMPORT_FILES, "original manifest identity/files differ")
         require({p.name for p in imported.iterdir()} == IMPORT_FILES | {"artifact-manifest.json"},
                 "unexpected imported artifact member")
@@ -519,7 +567,7 @@ class Qualification:
         require(metadata.get("archive_sha256") == ARCHIVE_SHA and metadata.get("archive_bytes") == ARCHIVE_BYTES
                 and metadata.get("config_id") == IMAGE_ID and metadata.get("source_sha") == IMAGE_SOURCE
                 and metadata.get("base") == BASE and metadata.get("base_config_id") == BASE_ID
-                and metadata.get("platform") == "linux/amd64"
+                and metadata.get("platform") == "linux/arm64"
                 and metadata.get("extracted_binary_sha256") == {n: IDENTITIES[n]["binary_sha256"] for n in IDENTITIES},
                 "original image metadata identity differs")
         prior = json.loads((imported / "provenance.json").read_text())
@@ -535,7 +583,8 @@ class Qualification:
                     "original module patch differs")
         reference = {"schema": 1, "repository": "lelanddutcher/juicemount",
                      "original_run_id": IMPORT_RUN, "original_attempt": 1,
-                     "original_artifact_name": IMPORT_ARTIFACT, "original_artifact_id": 11729043028,
+                     "original_artifact_name": IMPORT_ARTIFACT, "original_artifact_id": 11743580544,
+                     "original_artifact_zip_sha256_reference": "9417e5d8323f3d456972bd4947bac0d97de1b030100e698b722df27f20d4c742",
                      "original_manifest_sha256": IMPORT_MANIFEST_SHA,
                      "original_image_metadata_sha256": IMPORT_METADATA_SHA,
                      "archive_sha256": ARCHIVE_SHA, "archive_bytes": ARCHIVE_BYTES, "config_id": IMAGE_ID,
@@ -550,7 +599,7 @@ class Qualification:
         self.image_id = IMAGE_ID
         candidate = self.docker_json("image", "inspect", self.image_id)[0]
         require(candidate.get("Id") == self.image_id and candidate.get("Os") == "linux"
-                and candidate.get("Architecture") == "amd64", "imported candidate config/platform differs")
+                and candidate.get("Architecture") == "arm64", "imported candidate config/platform differs")
         config = candidate.get("Config", {})
         require(config.get("Env") == BASE_ENV and config.get("Entrypoint") == ["/usr/bin/docker-entrypoint.sh"],
                 "imported candidate runtime defaults differ")
@@ -568,6 +617,7 @@ class Qualification:
                     and extracted.stat().st_size == IDENTITIES[name]["binary_bytes"]
                     and sha(extracted) == IDENTITIES[name]["binary_sha256"],
                     "image binary differs from scanned build")
+            require_arm64_elf(extracted)
         link = self.private / "extract/mc"
         self.call(["docker", "cp", self.container + ":/usr/bin/mc", link])
         require(link.is_symlink() and os.readlink(link) == "mcli", "packaged mc symlink differs")
@@ -766,36 +816,9 @@ class Qualification:
 
 
 def main():
-    trial = None
-    try:
-        admission = preflight()
-        trial = Qualification(admission)
-        def interrupted(signum, frame):
-            raise Hold("controller interrupted; first outcome retained")
-        signal.signal(signal.SIGTERM, interrupted)
-        signal.signal(signal.SIGINT, interrupted)
-        trial.import_image()
-        trial.compile_test()
-        fixture = trial.fixture()
-        trial.compatibility(*fixture)
-        trial.result["status"] = PASS
-    except BaseException as exc:
-        if trial is None:
-            print("HOLD: preflight or private-root admission failed (" + type(exc).__name__ + ")", flush=True)
-            return 1
-        trial.result["status"] = "HOLD"
-        trial.result["first_red"] = {"stage": trial.stage, "reason": exc.args[0] if isinstance(exc, Hold) and exc.args else type(exc).__name__}
-    finally:
-        if trial is not None:
-            try:
-                trial.finalize()
-            except BaseException:
-                print("HOLD: evidence finalization incomplete; no retry", flush=True)
-                return 1
-    print(trial.result["status"], flush=True)
-    return 0 if trial.result["status"] == PASS else 1
+    sys.stderr.write("HOLD: migration custody helper is import-only\n")
+    return 2
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
