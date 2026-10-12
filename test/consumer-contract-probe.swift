@@ -2,6 +2,7 @@ import Foundation
 import AVFoundation
 import CryptoKit
 import ImageIO
+import Dispatch
 
 // Compiled alongside the consumer's unmodified production client sources by
 // scripts/build-consumer-contract-probe.sh. The Go acceptance test supplies an
@@ -205,6 +206,54 @@ struct ConsumerContractProbe {
         print("PASS proxy-ranges: three exact ranges, 416, and full provider GET; raw URLSession transport")
     }
 
+
+    // One production client and its default URLSession survive all three
+    // explicit phases. No automatic application retry or cache override.
+    static func thumbnailReconnect(_ client: JuiceMountClient, base: URL) async throws {
+        guard let transport = client.transport as? URLSessionJuiceMountTransport else {
+            throw ProbeError.failed("reconnect requires production URLSession transport")
+        }
+        let clientID = UUID().uuidString
+        let sessionID = String(describing: ObjectIdentifier(transport.session))
+        let slot = try thumbnailSlot()
+        func emit(_ phase: String, elapsedMS: Double = 0, jpeg: String = "") throws {
+            try require(String(describing: ObjectIdentifier(transport.session)) == sessionID,
+                        "URLSession identity changed")
+            let value: [String: Any] = [
+                "phase": phase, "pid": Int(ProcessInfo.processInfo.processIdentifier),
+                "client": clientID, "session": sessionID, "address": base.absoluteString,
+                "elapsedMS": elapsedMS, "jpeg": jpeg
+            ]
+            var bytes = Data("JM_RECONNECT ".utf8)
+            bytes.append(try JSONSerialization.data(withJSONObject: value, options: [.sortedKeys]))
+            bytes.append(10)
+            try FileHandle.standardOutput.write(contentsOf: bytes)
+        }
+        try emit("ready")
+        for phase in ["initial", "unavailable", "reconnected"] {
+            guard let command = readLine(), command == phase else {
+                throw ProbeError.failed("missing or out-of-order retained-client phase")
+            }
+            let start = DispatchTime.now().uptimeNanoseconds
+            if phase == "unavailable" {
+                // blob() first calls whoami(). This records a failed normal
+                // client call; it does not claim an HTTP /blob was dispatched.
+                let bytes = await client.blob(inode: Int64(slot.inode), kind: "thumbnail")
+                let elapsed = Double(DispatchTime.now().uptimeNanoseconds - start) / 1_000_000
+                try require(bytes == nil && elapsed <= 6500,
+                            "unavailable client call returned cached bytes or exceeded bound")
+                try emit(phase, elapsedMS: elapsed)
+            } else {
+                try await thumbnail(client, positive: true)
+                try emit(phase,
+                         elapsedMS: Double(DispatchTime.now().uptimeNanoseconds - start) / 1_000_000,
+                         jpeg: slot.jpegSHA256)
+            }
+        }
+        try require(readLine() == nil, "retained-client retirement requires ordinary stdin EOF")
+        try emit("finished")
+    }
+
     static func main() async {
         do {
             try await run()
@@ -222,6 +271,8 @@ struct ConsumerContractProbe {
         }
         let client = JuiceMountClient(baseURL: url, timeout: 2)
         switch CommandLine.arguments[2] {
+        case "thumbnail-reconnect":
+            try await thumbnailReconnect(client, base: url)
         case "thumbnail-positive":
             try await thumbnail(client, positive: true)
         case "thumbnail-negative":
