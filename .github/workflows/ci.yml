@@ -5,6 +5,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
   candidate:
@@ -19,28 +20,30 @@ jobs:
         with:
           go-version: '1.27.2'
           cache: false
-      - name: Build exact candidate and run ordinary compatibility once
+      - name: Download the original immutable candidate
+        uses: actions/download-artifact@v4
+        with:
+          name: storage-candidate-38209969671-1
+          run-id: 38209969671
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/storage-candidate-import-38209969671-1
+      - name: Verify retained image and run ordinary compatibility once
         id: qualify
         run: python3 -I -B server/minio/qualify-storage-candidate.py
-      - name: Retain only reviewed candidate and sanitized evidence
+      - name: Retain sanitized trial evidence and original image reference
         if: ${{ always() && steps.qualify.outputs.evidence_dir != '' }}
         uses: actions/upload-artifact@v4
         with:
-          name: storage-candidate-${{ github.run_id }}-${{ github.run_attempt }}
+          name: storage-trial-${{ github.run_id }}-${{ github.run_attempt }}
           retention-days: 14
           compression-level: 0
           if-no-files-found: error
           path: |
             ${{ steps.qualify.outputs.evidence_dir }}/result.json
             ${{ steps.qualify.outputs.evidence_dir }}/provenance.json
-            ${{ steps.qualify.outputs.evidence_dir }}/candidate-image.json
-            ${{ steps.qualify.outputs.evidence_dir }}/candidate-image.tar.gz
-            ${{ steps.qualify.outputs.evidence_dir }}/candidate-Dockerfile
-            ${{ steps.qualify.outputs.evidence_dir }}/mcli-module.patch
-            ${{ steps.qualify.outputs.evidence_dir }}/silo-module.patch
-            ${{ steps.qualify.outputs.evidence_dir }}/mcli-buildinfo.txt
-            ${{ steps.qualify.outputs.evidence_dir }}/silo-buildinfo.txt
+            ${{ steps.qualify.outputs.evidence_dir }}/candidate-image-reference.json
             ${{ steps.qualify.outputs.evidence_dir }}/compatibility-buildinfo.txt
             ${{ steps.qualify.outputs.evidence_dir }}/compatibility-result.json
             ${{ steps.qualify.outputs.evidence_dir }}/compatibility-status.txt
             ${{ steps.qualify.outputs.evidence_dir }}/artifact-manifest.json
+

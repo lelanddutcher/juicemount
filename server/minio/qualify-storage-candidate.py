@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""One cloud-only candidate build and ordinary JuiceFS object compatibility run.
+"""One cloud-only imported-image and ordinary JuiceFS object compatibility trial.
 
 No registry push, advisory rescan, auth-bypass probe, migration, or production
 qualification. Failed/uncertain operations are not retried. Private fixture
@@ -12,7 +12,6 @@ if sys.flags.optimize:
     sys.stderr.write("HOLD: optimized Python is not admitted\n")
     raise SystemExit(2)
 
-import gzip
 import hashlib
 import json
 import os
@@ -28,9 +27,9 @@ import tempfile
 import time
 
 
-PARENT = "e67ab65ca88dc00f2f121457961cdd1fe79d58a1"
-PARENT_TREE = "618a941c4308f5f471e2fb12c9106335c17e0b92"
-BRANCH = "refs/heads/codex/0.5-storage-candidate-e67ab65"
+PARENT = "410b49ec153f81354728f41c81c80ff676df6c50"
+PARENT_TREE = "c408e101642d615de471c305a4752070df76f8e4"
+BRANCH = "refs/heads/codex/0.5-storage-trial-410b49e"
 TEST_SOURCE_SHA = "0b42a6e0ed8f2267f2d14d06fe295812a81016cdbb33f8efec1109b2835d389e"
 BASE = ("docker.io/pgsty/silo:RELEASE.2026-09-16T00-00-00Z@sha256:"
         "635197cb9f36d01bee221d34d1c7d7960f6a95c48b0b6c01d99cd13bdae51a46")
@@ -46,8 +45,6 @@ BASE_ENV = [
 ]
 CHANGED_PATHS = sorted([
     ".github/workflows/ci.yml", "server/minio/qualify-storage-candidate.py",
-    "server/minio/candidate-patches/mcli-module.patch",
-    "server/minio/candidate-patches/silo-module.patch",
 ])
 CHECKS = [
     "fresh_prefix", "client_zero_put_read_range_head",
@@ -92,11 +89,24 @@ IDENTITIES = {
         "binary_bytes": 137603284,
     },
 }
+IMAGE_ID = "sha256:67e0cbe5ad67922a509351d357b4609c325a9562b69d4fcf2318d51c32dfdd1d"
+IMAGE_SOURCE = PARENT  # Image build identity intentionally differs from this trial SHA.
+IMPORT_RUN = "38209969671"
+IMPORT_ARTIFACT = "storage-candidate-38209969671-1"
+IMPORT_DIR = "storage-candidate-import-38209969671-1"
+IMPORT_MANIFEST_SHA = "7e07fca4386a5d4127cf78aa0b234fea999f5e5f3a9b8ee076cb9acf6e2fe635"
+IMPORT_METADATA_SHA = "aee28426dee0220dacf1db877dc9096bd1c9b37028211eab5215f73c3b30fc0f"
+ARCHIVE_SHA = "66ef11edb5f3c22908c409da350faabb95da2cd880e8c020ea31531997768c0d"
+ARCHIVE_BYTES = 137893411
+IMPORT_FILES = {
+    "candidate-Dockerfile", "candidate-image.json", "candidate-image.tar.gz",
+    "compatibility-buildinfo.txt", "mcli-buildinfo.txt", "mcli-module.patch",
+    "provenance.json", "result.json", "silo-buildinfo.txt", "silo-module.patch",
+}
 ARTIFACTS = {
-    "result.json", "provenance.json", "candidate-image.json", "candidate-image.tar.gz",
-    "candidate-Dockerfile", "mcli-module.patch", "silo-module.patch",
-    "mcli-buildinfo.txt", "silo-buildinfo.txt", "compatibility-buildinfo.txt",
-    "compatibility-result.json", "compatibility-status.txt", "artifact-manifest.json",
+    "result.json", "provenance.json", "candidate-image-reference.json",
+    "compatibility-buildinfo.txt", "compatibility-result.json",
+    "compatibility-status.txt", "artifact-manifest.json",
 }
 LABEL = "org.juicemount.candidate-fixture"
 PASS = "PASS_ORDINARY_COMPATIBILITY_SECURITY_AND_MIGRATION_OPEN"
@@ -179,6 +189,81 @@ def git(repo, env, *args):
     return command(["git", "-c", "credential.helper=", "-C", repo, *args], env)[1].decode().strip()
 
 
+def classify_readiness(exit_code, output, error):
+    """Pure, credential-free oracle; caller supplies timing/owned-CID evidence."""
+    result = {"outcome": "HOLD", "category": "unknown_error", "json_status": "unknown",
+              "exit_code": exit_code, "stdout_sha256": hashlib.sha256(output).hexdigest(),
+              "stderr_sha256": hashlib.sha256(error).hexdigest()}
+    if len(output) > 1024 * 1024 or len(error) > 1024 * 1024:
+        result["category"] = "oversized_response"
+        return result
+    try:
+        payload = json.loads(output.decode("utf-8"))
+    except (ValueError, UnicodeError):
+        result["category"] = "malformed_json"
+        return result
+    if not isinstance(payload, dict):
+        result["category"] = "malformed_json"
+        return result
+    status = payload.get("status")
+    result["json_status"] = status if status in ["success", "error"] else "unknown"
+    # Authentication/authorization evidence wins over any transient phrase.
+    searchable = json.dumps(payload.get("error", {})) + error.decode("utf-8", errors="replace")
+    if re.search(r"access[ _-]?denied|invalidaccesskeyid|signaturedoesnotmatch|unauthorized|forbidden|"
+                 r"authentication|authorization|invalid credentials|invalid access key|invalid secret key|"
+                 r"invalid token|(?:statusCode|status_code|httpStatusCode)[\" ]*:[ ]*(?:401|403)",
+                 searchable, re.IGNORECASE):
+        result["category"] = "authentication_or_authorization_error"
+        return result
+    if error.strip():
+        result["category"] = "unexpected_stderr"
+        return result
+    if status == "success":
+        info = payload.get("info")
+        servers = info.get("servers") if isinstance(info, dict) else None
+        if exit_code != 0 or payload.get("error"):
+            result["category"] = "success_with_error_or_nonzero_exit"
+        elif not isinstance(servers, list) or not servers or not all(isinstance(v, dict) and v for v in servers):
+            result["category"] = "missing_required_server_info"
+        else:
+            result.update(outcome="PASS", category="authenticated_admin_info")
+        return result
+    if status != "error" or not isinstance(payload.get("error"), str):
+        result["category"] = "unknown_status_or_error_shape"
+        return result
+    if exit_code not in [0, 1]:
+        result["category"] = "unexpected_exit"
+        return result
+    # Pinned mcli admin-info serializes ServerInfo's Error() as a JSON string.
+    # Other error shapes and arbitrary substrings never authorize a retry.
+    message = payload["error"]
+    connection = re.compile(r'(?:Get "http://127\.0\.0\.1:9000/minio/admin/v[0-9]+/info(?:\?[^"\s]*)?": )?'
+                            r'dial tcp 127\.0\.0\.1:9000: connect: connection refused')
+    initialization = {"Server not initialized, please try again.",
+                      "Server not initialized yet, please try again."}
+    if connection.fullmatch(message):
+        result.update(outcome="RETRY", category="loopback_connection_refused")
+    elif message in initialization:
+        result.update(outcome="RETRY", category="server_initializing")
+    return result
+
+
+def safe_container_state(obj):
+    """Only documented scalars; Docker State.Error is hashed, never exported."""
+    state = obj.get("State", {})
+    status = state.get("Status")
+    result = {"status": status if status in ["created", "restarting", "running", "removing", "paused", "exited", "dead"] else "unknown"}
+    for field in ["Running", "Paused", "Restarting", "OOMKilled", "Dead"]:
+        result[field] = state.get(field) if isinstance(state.get(field), bool) else None
+    for field in ["Pid", "ExitCode"]:
+        result[field] = state.get(field) if type(state.get(field)) is int else None
+    for field in ["StartedAt", "FinishedAt"]:
+        value = state.get(field)
+        result[field] = value if isinstance(value, str) and re.fullmatch(r"[0-9T:.Z+\-]+", value) else None
+    result["error_sha256"] = hashlib.sha256(str(state.get("Error", "")).encode()).hexdigest()
+    return result
+
+
 def preflight():
     require(len(sys.argv) == 1, "runner takes no arguments")
     require(sys.platform == "linux" and platform.machine() == "x86_64", "Linux amd64 required")
@@ -239,7 +324,7 @@ class Qualification:
         for folder in [self.evidence, self.private]:
             folder.mkdir(mode=0o700)
             owned_dir(folder)
-        for name in ["tmp", "gotmp", "gopath", "gocache", "docker", "build", "data", "control", "extract"]:
+        for name in ["tmp", "gotmp", "gopath", "gocache", "docker", "data", "control", "extract"]:
             (self.private / name).mkdir(mode=0o700)
         for name in ["tmp", "policies", "mc-root"]:
             (self.private / "control" / name).mkdir(mode=0o700)
@@ -268,9 +353,11 @@ class Qualification:
         write_json(self.evidence / "provenance.json", {
             "source_sha": self.source_sha, "parent": PARENT, "parent_tree": PARENT_TREE,
             "diagnostic_paths": {p: sha(self.repo / p) for p in CHANGED_PATHS},
-            "compatibility_source_sha256": TEST_SOURCE_SHA, "reviewed_build_identities": IDENTITIES,
+            "compatibility_source_sha256": TEST_SOURCE_SHA, "prior_reviewed_build_identities": IDENTITIES,
             "base": BASE, "base_config_id": BASE_ID, "toolchain": "go1.27.2 linux/amd64",
-            "build_command": "go build -mod=readonly -trimpath -buildvcs=true -o <binary> .",
+            "trial_scope": "import original archive; no binary/image rebuild, pull, or rescan",
+            "image_source_sha": IMAGE_SOURCE, "original_artifact_run_id": IMPORT_RUN,
+            "original_artifact_name": IMPORT_ARTIFACT,
             "build_environment": {k: self.env[k] for k in ["CGO_ENABLED", "GOOS", "GOARCH", "GOTOOLCHAIN", "GOWORK", "GOENV"]},
             "policy_hashes": {name: sha(self.repo / "server/minio" / name) for name in
                               ["provision-object-keys.sh", "jm-client-policy.json", "jm-gc-policy.json"]},
@@ -288,50 +375,6 @@ class Qualification:
 
     def docker_json(self, *args):
         return json.loads(self.call(["docker", *args])[1])
-
-    def build_binaries(self):
-        self.step("exact reviewed source builds")
-        build_dir = self.private / "build"
-        for name, identity in IDENTITIES.items():
-            checkout = self.private / ("source-" + name)
-            checkout.mkdir(mode=0o700)
-            git(checkout, self.env, "init", "--quiet")
-            git(checkout, self.env, "remote", "add", "origin", identity["url"])
-            self.call(["git", "-c", "credential.helper=", "-C", checkout, "fetch", "--depth=1",
-                       "origin", identity["revision"]], timeout=180)
-            git(checkout, self.env, "checkout", "--detach", "--quiet", identity["revision"])
-            require(git(checkout, self.env, "remote", "get-url", "origin") == identity["url"], "source URL differs")
-            require(git(checkout, self.env, "rev-parse", "HEAD") == identity["revision"], "source revision differs")
-            require(git(checkout, self.env, "rev-parse", "HEAD^{tree}") == identity["tree"], "source tree differs")
-            require(not git(checkout, self.env, "status", "--porcelain", "--untracked-files=all"), "source checkout dirty")
-            for filename, expected in identity["original"].items():
-                require(sha(checkout / filename) == expected, "original module bytes differ")
-            patch = self.repo / ("server/minio/candidate-patches/" + name + "-module.patch")
-            git(checkout, self.env, "apply", "--check", str(patch))
-            git(checkout, self.env, "apply", str(patch))
-            for filename, expected in identity["patched"].items():
-                require(sha(checkout / filename) == expected, "patched module bytes differ")
-            changes = git(checkout, self.env, "status", "--porcelain", "--untracked-files=all").splitlines()
-            require([line.strip() for line in changes] == ["M go.mod", "M go.sum"],
-                    "source changes exceed reviewed modules")
-            binary = build_dir / name
-            self.call(["go", "build", "-mod=readonly", "-trimpath", "-buildvcs=true", "-o", binary, "."],
-                      cwd=checkout, timeout=900)
-            info = self.call(["go", "version", "-m", binary])[1].decode()
-            require(info.splitlines()[0] == str(binary) + ": go1.27.2", "built toolchain differs")
-            for marker in ["\tpath\t" + identity["module"], "\tdep\tgolang.org/x/net\tv0.60.0\t",
-                           "\tbuild\tvcs.revision=" + identity["revision"], "\tbuild\tvcs.modified=true",
-                           "\tbuild\tCGO_ENABLED=0", "\tbuild\tGOOS=linux", "\tbuild\tGOARCH=amd64"]:
-                require(marker in info, "required buildinfo marker absent")
-            write_new(self.evidence / (name + "-buildinfo.txt"), info.replace(str(binary), "<" + name + ">"))
-            write_new(self.evidence / (name + "-module.patch"), patch.read_bytes())
-            actual = sha(binary)
-            self.result.setdefault("built_binaries", {})[name] = {"sha256": actual, "bytes": binary.stat().st_size}
-            require(actual == identity["binary_sha256"] and binary.stat().st_size == identity["binary_bytes"],
-                    "binary differs from prior scan; HOLD without rescan or runtime")
-            for filename, expected in identity["patched"].items():
-                require(sha(checkout / filename) == expected, "build changed reviewed modules")
-        self.passed()
 
     def verify_container(self, *, running=None):
         require(self.create_attempted and self.container_name and self.image_id, "container ownership unavailable")
@@ -396,17 +439,50 @@ class Qualification:
         self.result["container_retirement"].append(retirement)
         obj = self.verify_container()
         retirement["container_id"] = self.container
+        retirement["before_stop"] = safe_container_state(obj)
+        retirement["stop_attempted"] = bool(obj["State"]["Running"])
+        stop_ok = True
         if obj["State"]["Running"]:
-            # -1 permits graceful stop only. The controller's timeout never
-            # sends SIGKILL to the server or removes a still-running fixture.
-            self.call(["docker", "stop", "--time", "-1", self.container], timeout=35)
-            obj = self.verify_container(running=False)
-        require(obj["State"].get("Status") in ["created", "exited"]
+            # Infinite Docker grace timeout: controller timeout never SIGKILLs
+            # the server and never permits removal of an uncertain fixture.
+            try:
+                code, out, err = self.call(["docker", "stop", "--time", "-1", self.container],
+                                           timeout=35, expected=None)
+                retirement["stop_exit_code"] = code
+                retirement["stop_stdout_sha256"] = hashlib.sha256(out).hexdigest()
+                retirement["stop_stderr_sha256"] = hashlib.sha256(err).hexdigest()
+                stop_ok = code == 0
+            except Hold:
+                retirement["stop_outcome"] = "INTERRUPTED_OR_TIMEOUT"
+                stop_ok = False
+        obj = self.verify_container()
+        retirement["after_stop"] = safe_container_state(obj)
+        # Capture the wait outcome BEFORE judging a nonzero server exit.
+        wait_ok = obj["State"].get("Status") == "created"
+        if obj["State"].get("Status") == "created":
+            retirement["wait_outcome"] = "NOT_STARTED"
+        elif not obj["State"].get("Running"):
+            try:
+                code, out, err = self.call(["docker", "wait", self.container], timeout=5, expected=None)
+                retirement["wait_cli_exit_code"] = code
+                retirement["wait_stdout_sha256"] = hashlib.sha256(out).hexdigest()
+                retirement["wait_stderr_sha256"] = hashlib.sha256(err).hexdigest()
+                number = out.decode("ascii", errors="replace").strip()
+                value = int(number) if re.fullmatch(r"-?[0-9]+", number) else None
+                retirement["wait_container_exit_code"] = value
+                retirement["wait_outcome"] = "OBSERVED" if value is not None else "MALFORMED"
+                wait_ok = code == 0 and value == 0
+            except Hold:
+                retirement["wait_outcome"] = "INTERRUPTED_OR_TIMEOUT"
+                wait_ok = False
+        else:
+            retirement["wait_outcome"] = "NOT_JOINED_STILL_RUNNING"
+        obj = self.verify_container()
+        retirement["after_wait"] = safe_container_state(obj)
+        require(stop_ok and wait_ok and not obj["State"].get("Running")
+                and obj["State"].get("Status") in ["created", "exited"]
                 and obj["State"].get("ExitCode") == 0 and not obj["State"].get("OOMKilled"),
-                "fixture did not stop normally; retained")
-        if obj["State"]["Status"] == "exited":
-            require(self.call(["docker", "wait", self.container], timeout=5)[1].strip() == b"0",
-                    "fixture join did not report exit zero")
+                "fixture did not stop and join normally; retained")
         self.verify_container(running=False)
         self.call(["docker", "rm", self.container])
         retirement["status"] = "REMOVED_AFTER_NORMAL_STOP" if obj["State"]["Status"] == "exited" else "REMOVED_NEVER_STARTED"
@@ -414,68 +490,91 @@ class Qualification:
         self.container_name = None
         self.create_attempted = False
 
-    def build_image(self):
-        self.step("immutable candidate image build and extracted binary identity")
-        self.call(["docker", "pull", "--platform", "linux/amd64", BASE], timeout=240)
-        base = self.docker_json("image", "inspect", BASE)[0]
-        require(base.get("Id") == BASE_ID and base.get("Os") == "linux" and base.get("Architecture") == "amd64",
-                "base image platform/config identity differs")
-        require(base.get("Config", {}).get("Labels", {}).get("org.opencontainers.image.revision")
-                == IDENTITIES["silo"]["revision"], "base source revision differs")
-        require(base.get("Config", {}).get("Env") == BASE_ENV,
-                "base image environment differs from exact reviewed defaults")
-        dockerfile = ("FROM " + BASE + "\nCOPY --chmod=0755 silo /usr/bin/silo\n"
-                      "COPY --chmod=0755 mcli /usr/bin/mcli\n"
-                      "LABEL org.juicemount.candidate.source=\"" + self.source_sha + "\"\n"
-                      "LABEL org.juicemount.candidate.scope=\"ordinary-compatibility-security-and-migration-open\"\n"
-                      "LABEL org.juicemount.candidate.silo-sha256=\"" + IDENTITIES["silo"]["binary_sha256"] + "\"\n"
-                      "LABEL org.juicemount.candidate.mcli-sha256=\"" + IDENTITIES["mcli"]["binary_sha256"] + "\"\n")
-        write_new(self.private / "build/Dockerfile", dockerfile)
-        write_new(self.evidence / "candidate-Dockerfile", dockerfile)
-        iid = self.private / "image-id"
-        self.call(["docker", "build", "--network=none", "--platform", "linux/amd64", "--iidfile", iid,
-                   str(self.private / "build")], timeout=240)
-        self.image_id = iid.read_text().strip()
-        require(re.fullmatch(r"sha256:[0-9a-f]{64}", self.image_id), "candidate image ID invalid")
+    def import_image(self):
+        self.step("verify original immutable artifact before image load")
+        imported = Path(os.environ["RUNNER_TEMP"]) / IMPORT_DIR
+        require(imported.resolve(strict=True) == imported and imported.is_dir()
+                and imported.stat().st_uid == os.geteuid(), "import directory identity differs")
+        manifest_file = imported / "artifact-manifest.json"
+        require(manifest_file.is_file() and not manifest_file.is_symlink()
+                and sha(manifest_file) == IMPORT_MANIFEST_SHA, "original artifact manifest differs")
+        manifest = json.loads(manifest_file.read_text())
+        require(manifest.get("schema") == 1 and manifest.get("source_sha") == IMAGE_SOURCE
+                and manifest.get("private_fixture_excluded") is True
+                and set(manifest.get("files", {})) == IMPORT_FILES, "original manifest identity/files differ")
+        require({p.name for p in imported.iterdir()} == IMPORT_FILES | {"artifact-manifest.json"},
+                "unexpected imported artifact member")
+        for name, identity in manifest["files"].items():
+            path = imported / name
+            require(path.is_file() and not path.is_symlink() and path.resolve(strict=True) == path
+                    and path.stat().st_uid == os.geteuid()
+                    and path.stat().st_size == identity["bytes"] and sha(path) == identity["sha256"],
+                    "imported artifact member bytes differ")
+        metadata_file = imported / "candidate-image.json"
+        require(sha(metadata_file) == IMPORT_METADATA_SHA, "original image metadata differs")
+        metadata = json.loads(metadata_file.read_text())
+        archive = imported / "candidate-image.tar.gz"
+        require(archive.stat().st_size == ARCHIVE_BYTES and sha(archive) == ARCHIVE_SHA,
+                "original image archive differs")
+        require(metadata.get("archive_sha256") == ARCHIVE_SHA and metadata.get("archive_bytes") == ARCHIVE_BYTES
+                and metadata.get("config_id") == IMAGE_ID and metadata.get("source_sha") == IMAGE_SOURCE
+                and metadata.get("base") == BASE and metadata.get("base_config_id") == BASE_ID
+                and metadata.get("platform") == "linux/amd64"
+                and metadata.get("extracted_binary_sha256") == {n: IDENTITIES[n]["binary_sha256"] for n in IDENTITIES},
+                "original image metadata identity differs")
+        prior = json.loads((imported / "provenance.json").read_text())
+        prior_result = json.loads((imported / "result.json").read_text())
+        require(prior.get("source_sha") == IMAGE_SOURCE and prior.get("compatibility_source_sha256") == TEST_SOURCE_SHA
+                and prior_result.get("source_sha") == IMAGE_SOURCE and prior_result.get("run_id") == IMPORT_RUN,
+                "original source/run identity differs")
+        for name, identity in IDENTITIES.items():
+            require(prior_result.get("built_binaries", {}).get(name) ==
+                    {"sha256": identity["binary_sha256"], "bytes": identity["binary_bytes"]},
+                    "original binary receipt differs")
+            require(sha(imported / (name + "-module.patch")) == identity["patch_sha256"],
+                    "original module patch differs")
+        reference = {"schema": 1, "repository": "lelanddutcher/juicemount",
+                     "original_run_id": IMPORT_RUN, "original_attempt": 1,
+                     "original_artifact_name": IMPORT_ARTIFACT, "original_artifact_id": 11729043028,
+                     "original_manifest_sha256": IMPORT_MANIFEST_SHA,
+                     "original_image_metadata_sha256": IMPORT_METADATA_SHA,
+                     "archive_sha256": ARCHIVE_SHA, "archive_bytes": ARCHIVE_BYTES, "config_id": IMAGE_ID,
+                     "image_source_sha": IMAGE_SOURCE, "trial_source_sha": self.source_sha,
+                     "archive_custody": "original artifact referenced; bytes verified and not modified or re-uploaded",
+                     "qualification_receipt": "result.json", "security_and_migration": "OPEN"}
+        write_json(self.evidence / "candidate-image-reference.json", reference)
+        self.result["candidate_image"] = reference
+        self.passed()
+        self.step("load verified archive and extract packaged binaries without starting")
+        self.call(["docker", "image", "load", "--input", archive], timeout=180)
+        self.image_id = IMAGE_ID
         candidate = self.docker_json("image", "inspect", self.image_id)[0]
         require(candidate.get("Id") == self.image_id and candidate.get("Os") == "linux"
-                and candidate.get("Architecture") == "amd64", "candidate platform/config identity differs")
-        require(candidate["Config"].get("Entrypoint") == base["Config"].get("Entrypoint")
-                and candidate["Config"].get("Env") == base["Config"].get("Env"), "candidate changed runtime defaults")
-        labels = candidate["Config"].get("Labels", {})
-        require(labels.get("org.juicemount.candidate.source") == self.source_sha, "candidate provenance label differs")
+                and candidate.get("Architecture") == "amd64", "imported candidate config/platform differs")
+        config = candidate.get("Config", {})
+        require(config.get("Env") == BASE_ENV and config.get("Entrypoint") == ["/usr/bin/docker-entrypoint.sh"],
+                "imported candidate runtime defaults differ")
+        labels = config.get("Labels", {})
+        require(labels.get("org.juicemount.candidate.source") == IMAGE_SOURCE
+                and labels.get("org.juicemount.candidate.silo-sha256") == IDENTITIES["silo"]["binary_sha256"]
+                and labels.get("org.juicemount.candidate.mcli-sha256") == IDENTITIES["mcli"]["binary_sha256"],
+                "imported candidate provenance labels differ")
         self.create_container("extract")
         for name in ["silo", "mcli"]:
             self.verify_container(running=False)
             extracted = self.private / "extract" / name
             self.call(["docker", "cp", self.container + ":/usr/bin/" + name, extracted])
             require(extracted.is_file() and not extracted.is_symlink()
-                    and sha(extracted) == IDENTITIES[name]["binary_sha256"], "image binary differs from scanned build")
+                    and extracted.stat().st_size == IDENTITIES[name]["binary_bytes"]
+                    and sha(extracted) == IDENTITIES[name]["binary_sha256"],
+                    "image binary differs from scanned build")
         link = self.private / "extract/mc"
         self.call(["docker", "cp", self.container + ":/usr/bin/mc", link])
-        require(link.is_symlink() and os.readlink(link) in ["mcli", "/usr/bin/mcli"], "packaged mc symlink differs")
+        require(link.is_symlink() and os.readlink(link) == "mcli", "packaged mc symlink differs")
         followed = self.private / "extract/mc-followed"
         self.call(["docker", "cp", "-L", self.container + ":/usr/bin/mc", followed])
         require(sha(followed) == IDENTITIES["mcli"]["binary_sha256"], "packaged mc target differs")
         self.retire_container()
-        self.passed()
-        self.step("export verified candidate before credentials")
-        tar = self.private / "candidate-image.tar"
-        self.call(["docker", "image", "save", "--output", tar, self.image_id], timeout=120)
-        exported = self.evidence / "candidate-image.tar.gz"
-        with tar.open("rb") as source, exported.open("xb") as target:
-            with gzip.GzipFile(filename="", mode="wb", fileobj=target, mtime=0) as compressed:
-                shutil.copyfileobj(source, compressed, 1024 * 1024)
-        tar.unlink()
-        image_record = {"config_id": self.image_id, "base": BASE, "base_config_id": BASE_ID,
-                        "platform": "linux/amd64", "archive_sha256": sha(exported),
-                        "archive_bytes": exported.stat().st_size,
-                        "extracted_binary_sha256": {n: IDENTITIES[n]["binary_sha256"] for n in IDENTITIES},
-                        "source_sha": self.source_sha, "qualification_receipt": "result.json",
-                        "ordinary_compatibility_at_export": "NOT_RUN",
-                        "security_and_migration": "OPEN"}
-        write_json(self.evidence / "candidate-image.json", image_record)
-        self.result["candidate_image"] = image_record
         self.passed()
 
     def compile_test(self):
@@ -512,7 +611,7 @@ class Qualification:
     def fixture(self):
         self.step("fresh owned fixture and authenticated readiness")
         require(not any((self.private / "data").iterdir()), "fixture data is not empty")
-        # Credential generation happens only after image export and compilation.
+        # Credentials follow verified image import/extraction and test compilation.
         root_secret, client_secret, gc_secret = (secrets.token_hex(20) for _ in range(3))
         require(len({root_secret, client_secret, gc_secret}) == 3, "credential collision")
         self.secrets = [root_secret, client_secret, gc_secret]
@@ -527,16 +626,30 @@ class Qualification:
         self.result["private_fixture"] = "retained privately; never uploaded"
         self.verify_container(running=False)
         self.call(["docker", "start", self.container])
-        deadline = time.monotonic() + 45
+        started = time.monotonic()
+        deadline = started + 45
+        attempts = []
+        self.result["readiness_attempts"] = attempts
         while True:
-            self.verify_container(running=True)
-            code, out, _ = self.mc("--json", "admin", "info", "trial", expected=None, timeout=5)
-            if code == 0:
-                info = json.loads(out)
-                require(info.get("status") == "success", "authenticated readiness receipt is not success")
+            remaining = deadline - time.monotonic()
+            require(remaining > 0, "authenticated readiness deadline exceeded")
+            obj = self.verify_container()
+            attempt = {"attempt": len(attempts) + 1, "elapsed_start_ms": round((time.monotonic() - started) * 1000),
+                       "container_state": safe_container_state(obj), "outcome": "HOLD", "category": "command_incomplete"}
+            attempts.append(attempt)
+            require(obj["State"].get("Running") is True, "owned storage container exited before readiness")
+            try:
+                code, out, err = self.mc("--json", "admin", "info", "trial", expected=None, timeout=min(5, remaining))
+                attempt.update(classify_readiness(code, out, err))
+            finally:
+                attempt["elapsed_end_ms"] = round((time.monotonic() - started) * 1000)
+            if attempt["outcome"] == "PASS":
+                require(time.monotonic() <= deadline, "authenticated success arrived after readiness deadline")
                 break
-            require(time.monotonic() < deadline, "authenticated readiness deadline exceeded")
-            time.sleep(0.3)
+            require(attempt["outcome"] == "RETRY", "readiness HOLD: " + attempt["category"])
+            remaining = deadline - time.monotonic()
+            require(remaining > 0, "authenticated readiness deadline exceeded")
+            time.sleep(min(0.3, remaining))
         obj = self.verify_container(running=True)
         ports = obj.get("NetworkSettings", {}).get("Ports", {})
         published = {key: value for key, value in ports.items() if value}
@@ -661,8 +774,7 @@ def main():
             raise Hold("controller interrupted; first outcome retained")
         signal.signal(signal.SIGTERM, interrupted)
         signal.signal(signal.SIGINT, interrupted)
-        trial.build_binaries()
-        trial.build_image()
+        trial.import_image()
         trial.compile_test()
         fixture = trial.fixture()
         trial.compatibility(*fixture)
@@ -686,3 +798,4 @@ def main():
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
