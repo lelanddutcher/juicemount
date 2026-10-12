@@ -218,6 +218,19 @@ func TestRunQueueCPUMediaInterruptedRestart(t *testing.T) {
 		fmt.Println("QUIESCENT interrupted-restart")
 		os.Exit(code)
 	}
+	runCPUMediaInterruptedRestart(t, nil)
+}
+
+type restartMediaCheckpoint struct {
+	Root, WorkerID, ClaimRaw string
+	Job                      farmqueue.Job
+	Command                  farmqueue.WorkerCommand
+	Ack                      farmqueue.WorkerCommandStatus
+	Status                   map[string]string
+}
+
+func runCPUMediaInterruptedRestart(t *testing.T, checkpoint func(context.Context, restartMediaCheckpoint, *redis.Client, *farmqueue.Client)) string {
+	t.Helper()
 	if os.Getenv("JM_FARM_CPU_MEDIA_RESTART_TEST") != "1" {
 		t.Skip("requires explicit interrupted real-media admission")
 	}
@@ -454,6 +467,10 @@ func TestRunQueueCPUMediaInterruptedRestart(t *testing.T) {
 		t.Fatal("interrupted claim published terminal outcome")
 	}
 	restartMediaRecord(t, root, "interrupted-custody", map[string]any{"claim_raw": raws, "status": status, "no_blob": true, "no_scratch": true})
+	if checkpoint != nil {
+		checkpoint(ctx, restartMediaCheckpoint{Root: root, WorkerID: firstWorker.ID, ClaimRaw: claimRaw, Job: job, Command: command, Ack: ack, Status: status}, rdb, q)
+	}
+
 	// No DEL/EXPIRE, fabricated heartbeat or manual reaper. Observe ordinary
 	// liveness expiry before launching a fresh generation.
 	deadline = time.Now().Add(35 * time.Second)
@@ -641,5 +658,14 @@ func TestRunQueueCPUMediaInterruptedRestart(t *testing.T) {
 	if cpuMediaSHA(t, ffmpeg) != strings.ToLower(os.Getenv("JM_FARM_CPU_MEDIA_FFMPEG_SHA256")) || cpuMediaSHA(t, ffprobe) != strings.ToLower(os.Getenv("JM_FARM_CPU_MEDIA_FFPROBE_SHA256")) {
 		t.Fatal("tool bytes changed")
 	}
-	restartMediaRecord(t, root, "result", map[string]any{"state": "PASS_INTERRUPTED_CPU_MEDIA_RECOVERY_BOUNDED", "job_id": job.ID, "restart_command_id": command.ID, "worker_before": firstWorker.ID, "worker_after": secondWorker.ID, "source_sha256": sourceSHA, "proxy_sha256": cpuMediaSHA(t, proxy), "status": status, "row": row, "receipt": receipt, "all_original_children_joined": true, "limits": []string{"isolated CPU/local filesystem only", "no GPU/deployed queue/Redis restart/mount acceptance", "media join follows production CombinedOutput and quiescent worker return", "restart interrupted an unpublished real-media job after scratch growth; encode/mux/probe phase is not distinguished"}})
+	result := map[string]any{"state": "PASS_INTERRUPTED_CPU_MEDIA_RECOVERY_BOUNDED", "job_id": job.ID, "restart_command_id": command.ID, "worker_before": firstWorker.ID, "worker_after": secondWorker.ID, "source_sha256": sourceSHA, "proxy_sha256": cpuMediaSHA(t, proxy), "status": status, "row": row, "receipt": receipt, "all_original_children_joined": true, "limits": []string{"isolated CPU/local filesystem only", "no GPU/deployed queue/Redis restart/mount acceptance", "media join follows production CombinedOutput and quiescent worker return", "restart interrupted an unpublished real-media job after scratch growth; encode/mux/probe phase is not distinguished"}}
+	if checkpoint != nil {
+		result["state"] = "PASS_MEDIA_AFTER_ORDERLY_REDIS_REPLAY_BOUNDED"
+		delete(result, "all_original_children_joined")
+		result["all_original_media_children_joined"] = true
+		result["redis_retirement"] = "pending; Redis owner result is authoritative"
+		result["limits"] = []string{"isolated CPU/local filesystem; one direct/untracked job", "orderly AOF Redis replay; no crash/power-loss, GPU, deployed queue or mount acceptance", "media join follows production CombinedOutput and quiescent worker return", "restart phase encode/mux/probe is not distinguished"}
+	}
+	restartMediaRecord(t, root, "result", result)
+	return root
 }
