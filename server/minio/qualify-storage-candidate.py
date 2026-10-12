@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""One cloud-only imported-image and ordinary JuiceFS object compatibility trial.
+"""PRIVATE DRAFT: native ARM64 build, scans and ten ordinary compatibility cases.
 
-No registry push, advisory rescan, auth-bypass probe, migration, or production
+No registry push, auth-bypass probe, migration, or production
 qualification. Failed/uncertain operations are not retried. Private fixture
 state is never an artifact; only the explicit evidence allowlist is exported.
 """
@@ -12,6 +12,7 @@ if sys.flags.optimize:
     sys.stderr.write("HOLD: optimized Python is not admitted\n")
     raise SystemExit(2)
 
+import gzip
 import hashlib
 import json
 import os
@@ -27,13 +28,13 @@ import tempfile
 import time
 
 
-PARENT = "410b49ec153f81354728f41c81c80ff676df6c50"
-PARENT_TREE = "c408e101642d615de471c305a4752070df76f8e4"
-BRANCH = "refs/heads/codex/0.5-storage-trial-410b49e"
+PARENT = "857bdb7acfc563108d8120645ebe18649edec2dc"
+PARENT_TREE = "390c0e42a1ae1a2db038e89a92b4dc90b1f2afa1"
+BRANCH = "refs/heads/codex/0.5-storage-arm64-857bdb7"
 TEST_SOURCE_SHA = "0b42a6e0ed8f2267f2d14d06fe295812a81016cdbb33f8efec1109b2835d389e"
 BASE = ("docker.io/pgsty/silo:RELEASE.2026-09-16T00-00-00Z@sha256:"
-        "635197cb9f36d01bee221d34d1c7d7960f6a95c48b0b6c01d99cd13bdae51a46")
-BASE_ID = "sha256:983b34aec255b1ef414506989ec0106b319aef815a4f6fbaddd57e4d2bf2494f"
+        "1ff329e4507f742a8437f1773d43cf6adb0131477074dd45c770d1a1db19e99c")
+BASE_ID = "sha256:a9590da2668a2589dee6e1f8754c755074695794aaba389b6c7e78199688e2d5"
 # Exact reviewed base config defaults. These contain file names, not secrets;
 # root mcli uses --config-dir and production provisioning owns its MC_CONFIG_DIR.
 BASE_ENV = [
@@ -68,8 +69,6 @@ IDENTITIES = {
             "go.sum": "747a263bbbfe655f26d06e5848e112ee6c9a0fcafd92eb6f5efc86e730521c4e",
         },
         "patch_sha256": "650bd2fc5bccb8d910fce3c9ee27f0b5874a90ce4bc94eb190ec06cee691a388",
-        "binary_sha256": "032d265a8a0977ee037b112787b2d207aa398b091df1a531860eef633b8303a5",
-        "binary_bytes": 44332565,
     },
     "silo": {
         "url": "https://github.com/pgsty/silo.git",
@@ -85,31 +84,16 @@ IDENTITIES = {
             "go.sum": "140d249124a1a2658ce80206229ea4c21fdddef4a0aa47452ea9411e5993f2ad",
         },
         "patch_sha256": "88f97d09ce56a8837cab629f650bf2e9b67c7e31533d9e8fd79bb206fe9fc5ce",
-        "binary_sha256": "2cf9e63da4717be41a044096467bf8f5d230f1b5ca08645d7837e383126fd87a",
-        "binary_bytes": 137603284,
     },
 }
-IMAGE_ID = "sha256:67e0cbe5ad67922a509351d357b4609c325a9562b69d4fcf2318d51c32dfdd1d"
-IMAGE_SOURCE = PARENT  # Image build identity intentionally differs from this trial SHA.
-IMPORT_RUN = "38209969671"
-IMPORT_ARTIFACT = "storage-candidate-38209969671-1"
-IMPORT_DIR = "storage-candidate-import-38209969671-1"
-IMPORT_MANIFEST_SHA = "7e07fca4386a5d4127cf78aa0b234fea999f5e5f3a9b8ee076cb9acf6e2fe635"
-IMPORT_METADATA_SHA = "aee28426dee0220dacf1db877dc9096bd1c9b37028211eab5215f73c3b30fc0f"
-ARCHIVE_SHA = "66ef11edb5f3c22908c409da350faabb95da2cd880e8c020ea31531997768c0d"
-ARCHIVE_BYTES = 137893411
-IMPORT_FILES = {
-    "candidate-Dockerfile", "candidate-image.json", "candidate-image.tar.gz",
-    "compatibility-buildinfo.txt", "mcli-buildinfo.txt", "mcli-module.patch",
-    "provenance.json", "result.json", "silo-buildinfo.txt", "silo-module.patch",
-}
-ARTIFACTS = {
-    "result.json", "provenance.json", "candidate-image-reference.json",
-    "compatibility-buildinfo.txt", "compatibility-result.json",
-    "compatibility-status.txt", "artifact-manifest.json",
-}
+ARTIFACTS = {'silo-modules.jsonl', 'mcli-graph-summary.json', 'mcli-modules.jsonl', 'silo-packages.jsonl', 'compatibility-result.json', 'scanner-provenance.json', 'native-preflight.json', 'candidate-image.tar.gz', 'mcli-source-govulncheck.stderr', 'provenance.json', 'silo-packages.stderr', 'scan-summary.json', 'mcli-source-govulncheck.jsonl', 'mcli-binary-govulncheck.jsonl', 'silo-modules.stderr', 'silo-binary-govulncheck.stderr', 'compatibility-buildinfo.txt', 'mcli-packages.jsonl', 'candidate-image.json', 'silo-module.patch', 'mcli-buildinfo.txt', 'silo-buildinfo.txt', 'silo-source-govulncheck.stderr', 'scanner-module.json', 'result.json', 'mcli-packages.stderr', 'scanner-buildinfo.txt', 'mcli-modules.stderr', 'silo-source-govulncheck.jsonl', 'mcli-binary-govulncheck.stderr', 'compatibility-status.txt', 'silo-binary-govulncheck.jsonl', 'artifact-manifest.json', 'mcli-module.patch', 'candidate-Dockerfile', 'silo-graph-summary.json'}
+BASE_RUNTIME = {'ArgsEscaped': True, 'Cmd': ['silo'], 'Entrypoint': ['/usr/bin/docker-entrypoint.sh'], 'ExposedPorts': {'9000/tcp': {}}, 'Volumes': {'/data': {}}, 'WorkingDir': '/'}
+REMOVED_IDS = {'GO-2026-6605', 'GO-2026-6607', 'GO-2026-6612', 'GO-2026-6600', 'GO-2026-6599', 'GO-2026-6608', 'GO-2026-6609', 'GO-2026-6610', 'GO-2026-6617', 'GO-2026-6613', 'GO-2026-6611', 'GO-2026-6603'}
+KNOWN_OPEN_IDS = {'GO-2026-4803', 'GO-2026-5757', 'GO-2026-5932', 'GO-2026-4896', 'GO-2026-5284', 'GO-2026-5415', 'GO-2026-5437', 'GO-2025-3495', 'GO-2026-4779'}
+SCANNER_MODULE_SUM = "h1:clG4qBU6zH5VKjti8n5j8BBuYzoSha392xXMkXS351U="
+MIGRATION_SOURCE_SHA = "c0726403375d371da7c16d0490da054f1a6f396c71a82056ec824a933cf50414"
 LABEL = "org.juicemount.candidate-fixture"
-PASS = "PASS_ORDINARY_COMPATIBILITY_SECURITY_AND_MIGRATION_OPEN"
+PASS = "PASS_NATIVE_ARM64_ORDINARY_COMPATIBILITY_SECURITY_AND_MIGRATION_OPEN"
 
 
 class Hold(Exception):
@@ -264,12 +248,217 @@ def safe_container_state(obj):
     return result
 
 
+
+def unique_json_pairs(pairs):
+    value = {}
+    for key, item in pairs:
+        require(key not in value, "duplicate JSON object key")
+        value[key] = item
+    return value
+
+
+def invalid_json_constant(value):
+    raise Hold("non-finite JSON number")
+
+
+def parse_json_stream(raw):
+    """Offset parser: all records and every tail byte are accounted for."""
+    require(isinstance(raw, bytes), "JSON stream must be bytes")
+    try:
+        text = raw.decode("utf-8")
+        decoder = json.JSONDecoder(object_pairs_hook=unique_json_pairs, parse_constant=invalid_json_constant)
+        records, offset = [], 0
+        while offset < len(text):
+            while offset < len(text) and text[offset] in " \t\r\n":
+                offset += 1
+            if offset == len(text):
+                break
+            value, end = decoder.raw_decode(text, offset)
+            require(end > offset and isinstance(value, dict), "JSON record must be an object")
+            records.append(value)
+            offset = end
+    except (ValueError, UnicodeError):
+        raise Hold("malformed or truncated JSON stream") from None
+    require(bool(records), "empty JSON stream")
+    return records
+
+
+def validate_graph(records, root_module):
+    require(isinstance(records, list) and bool(records), "package graph absent")
+    packages = {}
+    for item in records:
+        require(isinstance(item, dict), "package graph record malformed")
+        path = item.get("ImportPath")
+        require(isinstance(path, str) and bool(path) and path not in packages, "missing or duplicate package identity")
+        require(not item.get("Error") and not item.get("DepsErrors") and not item.get("Incomplete"), "package errors or incomplete nodes")
+        imports = item.get("Imports", [])
+        require(isinstance(imports, list) and all(isinstance(v, str) and v for v in imports)
+                and len(imports) == len(set(imports)), "package imports malformed or duplicate")
+        mapping = item.get("ImportMap", {})
+        require(isinstance(mapping, dict) and all(isinstance(k, str) and isinstance(v, str) for k, v in mapping.items()), "package import map malformed")
+        packages[path] = item
+    require(root_module in packages and packages[root_module].get("Name") == "main", "expected main root absent")
+    edges = {}
+    for path, item in packages.items():
+        mapping = item.get("ImportMap", {})
+        edges[path] = [mapping.get(v, v) for v in item.get("Imports", [])]
+        require(all(v in packages for v in edges[path]), "unresolved native package import edge")
+    reachable, pending = set(), [root_module]
+    while pending:
+        path = pending.pop()
+        if path not in reachable:
+            reachable.add(path)
+            pending.extend(edges[path])
+    require(reachable == set(packages), "package graph exceeds root closure")
+    openpgp = sorted(v for v in reachable if "openpgp" in v.lower().split("/"))
+    require(not openpgp, "native root imports OpenPGP")
+    return {"root_module": root_module, "complete": True, "package_count": len(packages),
+            "package_paths": sorted(packages), "openpgp_imports": openpgp}
+
+
+def validate_modules(records, identity):
+    require(isinstance(records, list) and bool(records), "native module records absent")
+    modules = {}
+    for item in records:
+        require(isinstance(item, dict) and not item.get("Error"), "module record incomplete")
+        path = item.get("Path")
+        require(isinstance(path, str) and path and path not in modules, "module identity absent or duplicate")
+        modules[path] = item
+    root = identity["module"]
+    require(root in modules and modules[root].get("Main") is True and not modules[root].get("Version")
+            and not modules[root].get("Replace"), "module root differs")
+    require(sum(item.get("Main") is True for item in modules.values()) == 1, "ambiguous main modules")
+    for path in ["golang.org/x/net", "golang.org/x/crypto"]:
+        require(path in modules and not modules[path].get("Replace") and isinstance(modules[path].get("Version"), str)
+                and modules[path]["Version"], "required native module identity absent")
+    require(modules["golang.org/x/net"]["Version"] == "v0.60.0", "selected native x/net differs")
+    return {path: item.get("Version", "") for path, item in modules.items()}
+
+
+def validate_scan(records, mode, identity, graph):
+    """Actual finding.osv is adjudicated; catalog presence alone is not a finding."""
+    require(mode in ["source", "binary"] and isinstance(records, list) and records, "scan mode/records invalid")
+    require(graph.get("complete") is True and graph.get("root_module") == identity["module"]
+            and graph.get("openpgp_imports") == [], "native graph binding incomplete")
+    configs, sboms, findings, catalog = [], [], [], {}
+    catalog_record_count = 0
+    for record in records:
+        require(isinstance(record, dict) and len(record) == 1, "scan protocol record malformed")
+        kind, value = next(iter(record.items()))
+        require(kind in ["config", "SBOM", "osv", "finding", "progress"] and isinstance(value, dict), "unknown scan protocol message")
+        if kind == "config": configs.append(value)
+        elif kind == "SBOM": sboms.append(value)
+        elif kind == "finding": findings.append(value)
+        elif kind == "osv":
+            key = value.get("id")
+            require(isinstance(key, str) and re.fullmatch(r"GO-[0-9]{4}-[0-9]+", key), "OSV catalog identity absent")
+            catalog_record_count += 1
+            canonical = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False)
+            require(key not in catalog or catalog[key] == canonical, "conflicting repeated OSV catalog content")
+            catalog[key] = canonical
+        else:
+            require(isinstance(value.get("message"), str), "progress message malformed")
+    require(len(configs) == 1 and len(sboms) == 1 and "config" in records[0], "scan config/SBOM absent or duplicated")
+    config, sbom = configs[0], sboms[0]
+    expected = {"protocol_version": "v1.0.0", "scanner_name": "govulncheck", "scanner_version": "v1.8.0",
+                "db": "https://vuln.go.dev", "scan_level": "symbol", "scan_mode": mode}
+    require(all(config.get(k) == v for k, v in expected.items()), "scanner configuration differs")
+    require(isinstance(config.get("db_last_modified"), str)
+            and re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?Z", config["db_last_modified"]), "scan DB version absent")
+    require((mode != "source" or config.get("go_version") == "go1.27.2")
+            and ("go_version" not in config or config["go_version"] == "go1.27.2"), "scanner source toolchain differs")
+    require(sbom.get("go_version") == "go1.27.2" and isinstance(sbom.get("modules"), list) and sbom["modules"], "scan SBOM/toolchain incomplete")
+    modules, module_records = {}, {}
+    for item in sbom["modules"]:
+        require(isinstance(item, dict), "SBOM module malformed")
+        path = item.get("path")
+        require(isinstance(path, str) and path, "SBOM module identity absent")
+        require(isinstance(item.get("version", ""), str), "SBOM module version malformed")
+        canonical = json.dumps(item, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False)
+        require(path not in module_records or module_records[path] == canonical, "conflicting repeated SBOM module content")
+        module_records[path] = canonical
+        modules[path] = item.get("version", "")
+    root = identity["module"]
+    require(root in modules and modules.get("golang.org/x/net") == "v0.60.0", "SBOM root/x-net differs")
+    require(sbom.get("roots") == [root], "SBOM roots differ from exact expected root")
+    require(modules.get("stdlib") == ("v1.27.2" if mode == "source" else "go1.27.2"), "SBOM standard library differs")
+    if mode == "source":
+        require(modules[root] == "", "source SBOM main version differs")
+    else:
+        require(re.fullmatch(r"v0\.0\.0-[0-9]{14}-" + re.escape(identity["revision"][:12]) + r"\+dirty", modules[root]), "binary SBOM source revision differs")
+    native_versions = graph.get("module_versions", {})
+    require(native_versions.get("golang.org/x/net") == modules["golang.org/x/net"], "native module/SBOM x-net differs")
+    counts = {}
+    for finding in findings:
+        key, trace = finding.get("osv"), finding.get("trace")
+        require(isinstance(key, str) and key in catalog, "finding lacks associated OSV record")
+        require(isinstance(trace, list) and trace and all(isinstance(frame, dict) and frame for frame in trace), "finding trace empty or malformed")
+        require(all(isinstance(frame.get("module"), str) and frame["module"] for frame in trace), "finding trace module missing")
+        require(all(all(field not in frame or isinstance(frame[field], str) for field in ["version", "package", "function", "receiver"])
+                    for frame in trace), "finding trace scalar malformed")
+        counts[key] = counts.get(key, 0) + 1
+        require(key not in REMOVED_IDS, "removed Go/net advisory present in native findings")
+        require(key in KNOWN_OPEN_IDS, "unknown native finding requires review")
+        if key == "GO-2026-5932":
+            version = native_versions.get("golang.org/x/crypto")
+            require(isinstance(version, str) and version and modules.get("golang.org/x/crypto") == version, "OpenPGP SBOM/native module version differs")
+            require(all(frame.get("module") == "golang.org/x/crypto" and frame.get("version") == version
+                        and not frame.get("package") and not frame.get("function") for frame in trace), "OpenPGP trace not bound module-only evidence")
+    return {"mode": mode, "complete_protocol": True, "config": config, "sbom_module_count": len(modules),
+            "sbom_module_record_count": len(sbom["modules"]), "sbom_distinct_module_count": len(modules),
+            "root_module": root, "catalog_record_count": catalog_record_count, "catalog_distinct_id_count": len(catalog),
+            "finding_record_count": len(findings),
+            "finding_counts": counts, "finding_ids": sorted(counts), "removed_ids_absent": sorted(REMOVED_IDS),
+            "known_findings_disposition": "OPEN; ordinary qualification only", "security_acceptance": "OPEN"}
+
+
+def format_finalization_failure(first_red, error, secrets, phase="finalization"):
+    """Pure, fixed-schema CI-log receipt; redact dynamic text before capping it.
+
+    A publication write can fail after a partial write; that phase is explicitly
+    UNKNOWN. Finalization failures precede all publication output. No raw error
+    repr/str or arbitrary prior metadata is serialized.
+    """
+    needles = sorted({value for value in secrets if isinstance(value, str) and value}, key=len, reverse=True) if isinstance(secrets, (list, tuple)) else []
+    def bounded(value, limit, fallback):
+        text = value if isinstance(value, str) else fallback
+        for secret in needles:
+            text = text.replace(secret, "[REDACTED]")
+        return text if len(text) <= limit else text[:limit - 14] + "...[truncated]"
+    phase = phase if phase in ["finalization", "publication"] else "finalization"
+    raw_type = type(error).__name__
+    error_type = raw_type if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", raw_type) else "Exception"
+    error_type = bounded(error_type, 64, "Exception")
+    expected_hold = isinstance(error, Hold)
+    reason = error.args[0] if expected_hold and error.args and isinstance(error.args[0], str) else error_type
+    failure = {"classification": "HOLD" if expected_hold else "UNEXPECTED_EXCEPTION",
+               "exception_type": error_type, "reason": bounded(reason, 192, "failure")}
+    prior_present = first_red is not None
+    if isinstance(first_red, dict):
+        retained = {"stage": bounded(first_red.get("stage"), 80, "prior failure"),
+                    "reason": bounded(first_red.get("reason"), 192, "prior failure metadata unavailable")}
+    elif prior_present:
+        retained = {"stage": "prior failure", "reason": "prior failure metadata unavailable"}
+    else:
+        retained = {"stage": "evidence " + phase, "reason": failure["reason"]}
+    receipt = {"schema": 1, "status": "HOLD", "failure_phase": phase,
+               "prior_first_red_present": prior_present, "first_red": retained, "failure": failure,
+               "evidence_ready": False if phase == "finalization" else None,
+               "artifact_publication": "WITHHELD" if phase == "finalization" else "UNKNOWN",
+               "private_staging": "NOT_EXPORTED_BY_CONTROLLER", "retry": False}
+    # ensure_ascii escapes control characters into one line; fixed fields and
+    # bounded dynamic values keep the encoded receipt below 8192 bytes.
+    encoded = json.dumps(receipt, ensure_ascii=True, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    require(len(encoded.encode("ascii")) <= 8192, "failure receipt exceeds fixed bound")
+    return encoded
+
 def preflight():
     require(len(sys.argv) == 1, "runner takes no arguments")
-    require(sys.platform == "linux" and platform.machine() == "x86_64", "Linux amd64 required")
+    require(sys.platform == "linux" and platform.machine() == "aarch64", "Linux ARM64 required")
     require(os.environ.get("GITHUB_ACTIONS") == "true"
+            and os.environ.get("RUNNER_ENVIRONMENT") == "github-hosted"
             and os.environ.get("RUNNER_OS") == "Linux"
-            and os.environ.get("RUNNER_ARCH") == "X64", "GitHub-hosted Linux x64 context required")
+            and os.environ.get("RUNNER_ARCH") == "ARM64", "GitHub-hosted Linux ARM64 context required")
     require(os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch", "manual dispatch required")
     require(os.environ.get("GITHUB_REPOSITORY", "").lower() == "lelanddutcher/juicemount",
             "repository context differs")
@@ -298,9 +487,14 @@ def preflight():
     for name, identity in IDENTITIES.items():
         require(sha(repo / ("server/minio/candidate-patches/" + name + "-module.patch"))
                 == identity["patch_sha256"], "reviewed module patch differs")
-    env.update(GOTOOLCHAIN="local", GOWORK="off", GOENV="off")
-    require(command(["go", "version"], env)[1].decode().strip() == "go version go1.27.2 linux/amd64",
-            "exact Go 1.27.2 linux/amd64 toolchain required")
+    env.update(GOTOOLCHAIN="local", GOWORK="off", GOENV="off", GOOS="linux", GOARCH="arm64", GOARM64="v8.0", CGO_ENABLED="0", GOFLAGS="", GOEXPERIMENT="")
+    require(command(["go", "version"], env)[1].decode().strip() == "go version go1.27.2 linux/arm64",
+            "exact Go 1.27.2 linux/arm64 toolchain required")
+    native = json.loads(command(["go", "env", "-json", "GOHOSTOS", "GOHOSTARCH", "GOOS", "GOARCH", "GOARM64", "CGO_ENABLED", "GOFLAGS", "GOEXPERIMENT", "GOVERSION"], env)[1])
+    require(native == {"GOHOSTOS": "linux", "GOHOSTARCH": "arm64", "GOOS": "linux", "GOARCH": "arm64", "GOARM64": "v8.0", "CGO_ENABLED": "0", "GOFLAGS": "", "GOEXPERIMENT": "", "GOVERSION": "go1.27.2"}, "native Go host/target/options differ")
+    docker = json.loads(command(["docker", "version", "--format", "{{json .Server}}"], env)[1])
+    require(docker.get("Os") == "linux" and docker.get("Arch") == "arm64", "native Docker server required")
+    require(sha(repo / "server/minio/qualify-storage-migration.py") == MIGRATION_SOURCE_SHA, "migration source differs")
     runner_temp = Path(os.environ["RUNNER_TEMP"])
     require(runner_temp.is_absolute() and runner_temp.resolve(strict=True) == runner_temp,
             "canonical RUNNER_TEMP required")
@@ -310,12 +504,12 @@ def preflight():
     output_info = output_file.lstat()
     require(stat.S_ISREG(output_info.st_mode) and output_info.st_uid == os.geteuid()
             and not output_file.is_symlink(), "owned GITHUB_OUTPUT required")
-    return repo, env, runner_temp, output_file, run_id, source_sha
+    return repo, env, runner_temp, output_file, run_id, source_sha, native, {k: docker.get(k) for k in ["Os", "Arch", "Version", "ApiVersion"]}
 
 
 class Qualification:
     def __init__(self, admission):
-        self.repo, self.env, temp, output_file, self.run_id, self.source_sha = admission
+        self.repo, self.env, temp, output_file, self.run_id, self.source_sha, native, docker = admission
         os.umask(0o077)
         self.root = Path(tempfile.mkdtemp(prefix="jm-storage-candidate-" + self.run_id + "-", dir=temp))
         owned_dir(self.root)
@@ -331,14 +525,18 @@ class Qualification:
         self.env.update(TMPDIR=str(self.private / "tmp"), GOTMPDIR=str(self.private / "gotmp"),
                         GOPATH=str(self.private / "gopath"), GOCACHE=str(self.private / "gocache"),
                         GOTOOLCHAIN="local", GOWORK="off", GOENV="off", CGO_ENABLED="0",
-                        GOOS="linux", GOARCH="amd64", GOPROXY="https://proxy.golang.org",
+                        GOOS="linux", GOARCH="arm64", GOPROXY="https://proxy.golang.org",
                         GOSUMDB="sum.golang.org", DOCKER_CONFIG=str(self.private / "docker"))
+        self.output_file = output_file
+        self.binary_identities = {}
+        self.source_dirs = {}
+        self.scan_records = {}
         self.stage = "admitted"
         self.result = {"schema": 1, "status": "HOLD", "source_sha": self.source_sha,
                        "parent": PARENT, "run_id": self.run_id, "stages": [],
                        "limits": ["ordinary compatibility only", "security acceptance open",
                                   "fresh-install acceptance open", "migration and restore open",
-                                  "arm64 acceptance open", "mounted/provider acceptance open",
+                                  "ARM64 migration and full security open", "mounted/provider acceptance open",
                                   "no registry publication"],
                        "container_retirement": [], "private_fixture": "not created"}
         self.image_id = None
@@ -347,18 +545,15 @@ class Qualification:
         self.owner = secrets.token_hex(32)
         self.create_attempted = False
         self.secrets = []
-        descriptor = os.open(output_file, os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW)
-        with os.fdopen(descriptor, "w") as output:
-            output.write("evidence_dir=" + str(self.evidence) + "\n")
+        write_json(self.evidence / "native-preflight.json", {"go": native, "docker_server": docker,
+                   "host": {"platform": sys.platform, "machine": platform.machine(), "runner_arch": os.environ.get("RUNNER_ARCH")}})
         write_json(self.evidence / "provenance.json", {
             "source_sha": self.source_sha, "parent": PARENT, "parent_tree": PARENT_TREE,
             "diagnostic_paths": {p: sha(self.repo / p) for p in CHANGED_PATHS},
-            "compatibility_source_sha256": TEST_SOURCE_SHA, "prior_reviewed_build_identities": IDENTITIES,
-            "base": BASE, "base_config_id": BASE_ID, "toolchain": "go1.27.2 linux/amd64",
-            "trial_scope": "import original archive; no binary/image rebuild, pull, or rescan",
-            "image_source_sha": IMAGE_SOURCE, "original_artifact_run_id": IMPORT_RUN,
-            "original_artifact_name": IMPORT_ARTIFACT,
-            "build_environment": {k: self.env[k] for k in ["CGO_ENABLED", "GOOS", "GOARCH", "GOTOOLCHAIN", "GOWORK", "GOENV"]},
+            "compatibility_source_sha256": TEST_SOURCE_SHA, "source_module_identities": IDENTITIES,
+            "base": BASE, "base_config_id": BASE_ID, "toolchain": "go1.27.2 linux/arm64",
+            "trial_scope": "native ARM64 build, four scans and ten ordinary cases; no migration",
+            "build_environment": {k: self.env[k] for k in ["CGO_ENABLED", "GOOS", "GOARCH", "GOARM64", "GOFLAGS", "GOEXPERIMENT", "GOTOOLCHAIN", "GOWORK", "GOENV"]},
             "policy_hashes": {name: sha(self.repo / "server/minio" / name) for name in
                               ["provision-object-keys.sh", "jm-client-policy.json", "jm-gc-policy.json"]},
         })
@@ -490,91 +685,212 @@ class Qualification:
         self.container_name = None
         self.create_attempted = False
 
-    def import_image(self):
-        self.step("verify original immutable artifact before image load")
-        imported = Path(os.environ["RUNNER_TEMP"]) / IMPORT_DIR
-        require(imported.resolve(strict=True) == imported and imported.is_dir()
-                and imported.stat().st_uid == os.geteuid(), "import directory identity differs")
-        manifest_file = imported / "artifact-manifest.json"
-        require(manifest_file.is_file() and not manifest_file.is_symlink()
-                and sha(manifest_file) == IMPORT_MANIFEST_SHA, "original artifact manifest differs")
-        manifest = json.loads(manifest_file.read_text())
-        require(manifest.get("schema") == 1 and manifest.get("source_sha") == IMAGE_SOURCE
-                and manifest.get("private_fixture_excluded") is True
-                and set(manifest.get("files", {})) == IMPORT_FILES, "original manifest identity/files differ")
-        require({p.name for p in imported.iterdir()} == IMPORT_FILES | {"artifact-manifest.json"},
-                "unexpected imported artifact member")
-        for name, identity in manifest["files"].items():
-            path = imported / name
-            require(path.is_file() and not path.is_symlink() and path.resolve(strict=True) == path
-                    and path.stat().st_uid == os.geteuid()
-                    and path.stat().st_size == identity["bytes"] and sha(path) == identity["sha256"],
-                    "imported artifact member bytes differ")
-        metadata_file = imported / "candidate-image.json"
-        require(sha(metadata_file) == IMPORT_METADATA_SHA, "original image metadata differs")
-        metadata = json.loads(metadata_file.read_text())
-        archive = imported / "candidate-image.tar.gz"
-        require(archive.stat().st_size == ARCHIVE_BYTES and sha(archive) == ARCHIVE_SHA,
-                "original image archive differs")
-        require(metadata.get("archive_sha256") == ARCHIVE_SHA and metadata.get("archive_bytes") == ARCHIVE_BYTES
-                and metadata.get("config_id") == IMAGE_ID and metadata.get("source_sha") == IMAGE_SOURCE
-                and metadata.get("base") == BASE and metadata.get("base_config_id") == BASE_ID
-                and metadata.get("platform") == "linux/amd64"
-                and metadata.get("extracted_binary_sha256") == {n: IDENTITIES[n]["binary_sha256"] for n in IDENTITIES},
-                "original image metadata identity differs")
-        prior = json.loads((imported / "provenance.json").read_text())
-        prior_result = json.loads((imported / "result.json").read_text())
-        require(prior.get("source_sha") == IMAGE_SOURCE and prior.get("compatibility_source_sha256") == TEST_SOURCE_SHA
-                and prior_result.get("source_sha") == IMAGE_SOURCE and prior_result.get("run_id") == IMPORT_RUN,
-                "original source/run identity differs")
+
+    def capacity(self, stage):
+        free = shutil.disk_usage(self.root).free
+        self.result.setdefault("capacity", []).append({"stage": stage, "free_bytes": free, "minimum_bytes": 12 * 1024**3})
+        require(free >= 12 * 1024**3, "at least 12 GiB free required before heavy stage")
+
+    def verify_binaries(self):
+        require(set(self.binary_identities) == set(IDENTITIES), "native binary identities incomplete")
+        for name, identity in self.binary_identities.items():
+            path = self.private / "build" / name
+            require(path.is_file() and not path.is_symlink() and path.stat().st_size == identity["bytes"]
+                    and sha(path) == identity["sha256"], "native built/scanned binary changed")
+
+    def verify_source_modules(self, name):
+        checkout, identity = self.source_dirs[name], IDENTITIES[name]
+        require(git(checkout, self.env, "rev-parse", "HEAD") == identity["revision"], "scan source revision changed")
+        require([line.strip() for line in git(checkout, self.env, "status", "--porcelain", "--untracked-files=all").splitlines()]
+                == ["M go.mod", "M go.sum"], "scan changed source beyond reviewed modules")
+        require(all(sha(checkout / filename) == expected for filename, expected in identity["patched"].items()), "scan changed patched module bytes")
+
+    def scan_binaries(self):
+        self.step("native scanner identity and four complete scans")
+        self.capacity("native graphs and scans")
+        self.verify_binaries()
+        tool_dir = self.private / "scanner-bin"
+        tool_dir.mkdir(mode=0o700)
+        install_env = dict(self.env, GOBIN=str(tool_dir))
+        _, module_out, module_err = self.call(["go", "mod", "download", "-json", "golang.org/x/vuln@v1.8.0"], cwd=self.private, env=install_env, timeout=180)
+        write_new(self.evidence / "scanner-module.json", module_out)
+        module = json.loads(module_out)
+        require(not module_err.strip() and not module.get("Error") and module.get("Path") == "golang.org/x/vuln"
+                and module.get("Version") == "v1.8.0" and module.get("Sum") == SCANNER_MODULE_SUM, "scanner module identity differs")
+        self.call(["go", "install", "golang.org/x/vuln/cmd/govulncheck@v1.8.0"], cwd=self.private, env=install_env, timeout=600)
+        scanner = tool_dir / "govulncheck"
+        info = self.call(["go", "version", "-m", scanner])[1].decode()
+        require(info.splitlines()[0] == str(scanner) + ": go1.27.2", "scanner toolchain differs")
+        for marker in ["\tpath\tgolang.org/x/vuln/cmd/govulncheck", "\tmod\tgolang.org/x/vuln\tv1.8.0\t" + SCANNER_MODULE_SUM,
+                       "\tbuild\tGOOS=linux", "\tbuild\tGOARCH=arm64", "\tbuild\tCGO_ENABLED=0"]:
+            require(marker in info, "scanner build identity incomplete")
+        write_new(self.evidence / "scanner-buildinfo.txt", info.replace(str(scanner), "<govulncheck>"))
+        scanner_identity = {"sha256": sha(scanner), "bytes": scanner.stat().st_size, "module_sum": SCANNER_MODULE_SUM,
+                            "install_command": ["go", "install", "golang.org/x/vuln/cmd/govulncheck@v1.8.0"], "toolchain": "go1.27.2 linux/arm64"}
+        write_json(self.evidence / "scanner-provenance.json", scanner_identity)
+        self.result["scanner"] = scanner_identity
+        database_versions = set()
         for name, identity in IDENTITIES.items():
-            require(prior_result.get("built_binaries", {}).get(name) ==
-                    {"sha256": identity["binary_sha256"], "bytes": identity["binary_bytes"]},
-                    "original binary receipt differs")
-            require(sha(imported / (name + "-module.patch")) == identity["patch_sha256"],
-                    "original module patch differs")
-        reference = {"schema": 1, "repository": "lelanddutcher/juicemount",
-                     "original_run_id": IMPORT_RUN, "original_attempt": 1,
-                     "original_artifact_name": IMPORT_ARTIFACT, "original_artifact_id": 11729043028,
-                     "original_manifest_sha256": IMPORT_MANIFEST_SHA,
-                     "original_image_metadata_sha256": IMPORT_METADATA_SHA,
-                     "archive_sha256": ARCHIVE_SHA, "archive_bytes": ARCHIVE_BYTES, "config_id": IMAGE_ID,
-                     "image_source_sha": IMAGE_SOURCE, "trial_source_sha": self.source_sha,
-                     "archive_custody": "original artifact referenced; bytes verified and not modified or re-uploaded",
-                     "qualification_receipt": "result.json", "security_and_migration": "OPEN"}
-        write_json(self.evidence / "candidate-image-reference.json", reference)
-        self.result["candidate_image"] = reference
+            checkout = self.source_dirs[name]
+            self.verify_source_modules(name)
+            graph_args = ["go", "list", "-mod=readonly", "-deps", "-json", "."]
+            graph_code, graph_raw, graph_err = self.call(graph_args, cwd=checkout, timeout=300, expected=None)
+            write_new(self.evidence / (name + "-packages.jsonl"), graph_raw)
+            write_new(self.evidence / (name + "-packages.stderr"), graph_err)
+            require(graph_code == 0 and not graph_err.strip(), "native package graph command incomplete")
+            graph = validate_graph(parse_json_stream(graph_raw), identity["module"])
+            module_args = ["go", "list", "-mod=readonly", "-m", "-json", "all"]
+            module_code, module_raw, module_err = self.call(module_args, cwd=checkout, timeout=180, expected=None)
+            write_new(self.evidence / (name + "-modules.jsonl"), module_raw)
+            write_new(self.evidence / (name + "-modules.stderr"), module_err)
+            require(module_code == 0 and not module_err.strip(), "native module list command incomplete")
+            graph["module_versions"] = validate_modules(parse_json_stream(module_raw), identity)
+            graph.update(package_command=graph_args, module_command=module_args, package_exit=graph_code, module_exit=module_code,
+                         package_sha256=sha(self.evidence / (name + "-packages.jsonl")), modules_sha256=sha(self.evidence / (name + "-modules.jsonl")))
+            write_json(self.evidence / (name + "-graph-summary.json"), graph)
+            for mode in ["source", "binary"]:
+                self.verify_binaries()
+                require(sha(scanner) == scanner_identity["sha256"], "scanner executable changed")
+                target = "." if mode == "source" else self.private / "build" / name
+                args = [scanner, "-format=json", "-scan=symbol", "-mode=" + mode, target]
+                code, raw, err = self.call(args, cwd=checkout, env=dict(self.env, GOFLAGS="-mod=readonly"), timeout=900 if mode == "source" else 300, expected=None)
+                prefix = name + "-" + mode + "-govulncheck"
+                write_new(self.evidence / (prefix + ".jsonl"), raw)
+                write_new(self.evidence / (prefix + ".stderr"), err)
+                record = {"target": name, "mode": mode, "exit_code": code, "complete": False,
+                          "command": ["<govulncheck>", "-format=json", "-scan=symbol", "-mode=" + mode, "." if mode == "source" else "<" + name + ">"],
+                          "cwd": "<source-" + name + ">", "scanner_sha256": scanner_identity["sha256"],
+                          "source_revision": identity["revision"], "native_binary": dict(self.binary_identities[name]),
+                          "report_sha256": sha(self.evidence / (prefix + ".jsonl")), "stderr_sha256": sha(self.evidence / (prefix + ".stderr"))}
+                self.result.setdefault("scan_attempts", []).append(record)
+                require(code == 0 and not err.strip(), "native scanner process incomplete or failed")
+                summary = validate_scan(parse_json_stream(raw), mode, identity, graph)
+                record.update(summary)
+                record["complete"] = True
+                self.scan_records[name + "-" + mode] = record
+                database_versions.add(summary["config"]["db_last_modified"])
+                self.verify_source_modules(name)
+                self.verify_binaries()
+        require(len(self.scan_records) == 4 and len(database_versions) == 1, "four complete scans of one reported DB version required")
+        write_json(self.evidence / "scan-summary.json", {"schema": 1, "scans": self.scan_records, "scan_count": 4,
+                   "security_acceptance": "OPEN", "base_layer_scan": "NOT_PERFORMED",
+                   "finding_disposition": "known findings OPEN; removed and unknown finding IDs refused before runtime"})
         self.passed()
-        self.step("load verified archive and extract packaged binaries without starting")
-        self.call(["docker", "image", "load", "--input", archive], timeout=180)
-        self.image_id = IMAGE_ID
+
+    def build_binaries(self):
+        self.step("exact reviewed source builds")
+        self.capacity("native builds")
+        build_dir = self.private / "build"
+        for name, identity in IDENTITIES.items():
+            checkout = self.private / ("source-" + name)
+            checkout.mkdir(mode=0o700)
+            git(checkout, self.env, "init", "--quiet")
+            git(checkout, self.env, "remote", "add", "origin", identity["url"])
+            self.call(["git", "-c", "credential.helper=", "-C", checkout, "fetch", "--depth=1",
+                       "origin", identity["revision"]], timeout=180)
+            git(checkout, self.env, "checkout", "--detach", "--quiet", identity["revision"])
+            require(git(checkout, self.env, "remote", "get-url", "origin") == identity["url"], "source URL differs")
+            require(git(checkout, self.env, "rev-parse", "HEAD") == identity["revision"], "source revision differs")
+            require(git(checkout, self.env, "rev-parse", "HEAD^{tree}") == identity["tree"], "source tree differs")
+            require(not git(checkout, self.env, "status", "--porcelain", "--untracked-files=all"), "source checkout dirty")
+            for filename, expected in identity["original"].items():
+                require(sha(checkout / filename) == expected, "original module bytes differ")
+            patch = self.repo / ("server/minio/candidate-patches/" + name + "-module.patch")
+            git(checkout, self.env, "apply", "--check", str(patch))
+            git(checkout, self.env, "apply", str(patch))
+            for filename, expected in identity["patched"].items():
+                require(sha(checkout / filename) == expected, "patched module bytes differ")
+            changes = git(checkout, self.env, "status", "--porcelain", "--untracked-files=all").splitlines()
+            require([line.strip() for line in changes] == ["M go.mod", "M go.sum"],
+                    "source changes exceed reviewed modules")
+            binary = build_dir / name
+            self.call(["go", "build", "-mod=readonly", "-trimpath", "-buildvcs=true", "-o", binary, "."],
+                      cwd=checkout, timeout=900)
+            info = self.call(["go", "version", "-m", binary])[1].decode()
+            require(info.splitlines()[0] == str(binary) + ": go1.27.2", "built toolchain differs")
+            for marker in ["\tpath\t" + identity["module"], "\tdep\tgolang.org/x/net\tv0.60.0\t",
+                           "\tbuild\tvcs.revision=" + identity["revision"], "\tbuild\tvcs.modified=true",
+                           "\tbuild\tCGO_ENABLED=0", "\tbuild\tGOOS=linux", "\tbuild\tGOARCH=arm64"]:
+                require(marker in info, "required buildinfo marker absent")
+            write_new(self.evidence / (name + "-buildinfo.txt"), info.replace(str(binary), "<" + name + ">"))
+            write_new(self.evidence / (name + "-module.patch"), patch.read_bytes())
+            actual = sha(binary)
+            self.binary_identities[name] = {"sha256": actual, "bytes": binary.stat().st_size}
+            self.result.setdefault("built_binaries", {})[name] = dict(self.binary_identities[name])
+            self.source_dirs[name] = checkout
+            for filename, expected in identity["patched"].items():
+                require(sha(checkout / filename) == expected, "build changed reviewed modules")
+        self.passed()
+
+
+    def build_image(self):
+        self.step("immutable candidate image build and extracted binary identity")
+        self.capacity("image build/export")
+        require(set(self.scan_records) == {"mcli-source", "mcli-binary", "silo-source", "silo-binary"}, "four native scans required")
+        self.verify_binaries()
+        self.call(["docker", "pull", "--platform", "linux/arm64", BASE], timeout=240)
+        base = self.docker_json("image", "inspect", BASE)[0]
+        require(base.get("Id") == BASE_ID and base.get("Os") == "linux" and base.get("Architecture") == "arm64",
+                "base image platform/config identity differs")
+        require(base.get("Config", {}).get("Labels", {}).get("org.opencontainers.image.revision")
+                == IDENTITIES["silo"]["revision"], "base source revision differs")
+        require(base.get("Config", {}).get("Env") == BASE_ENV,
+                "base image environment differs from exact reviewed defaults")
+        require(all(base["Config"].get(k) == v for k, v in BASE_RUNTIME.items()), "base runtime defaults differ")
+        dockerfile = ("FROM " + BASE + "\nCOPY --chmod=0755 silo /usr/bin/silo\n"
+                      "COPY --chmod=0755 mcli /usr/bin/mcli\n"
+                      "LABEL org.juicemount.candidate.source=\"" + self.source_sha + "\"\n"
+                      "LABEL org.juicemount.candidate.scope=\"ordinary-compatibility-security-and-migration-open\"\n"
+                      "LABEL org.juicemount.candidate.silo-sha256=\"" + self.binary_identities["silo"]["sha256"] + "\"\n"
+                      "LABEL org.juicemount.candidate.mcli-sha256=\"" + self.binary_identities["mcli"]["sha256"] + "\"\n")
+        write_new(self.private / "build/Dockerfile", dockerfile)
+        write_new(self.evidence / "candidate-Dockerfile", dockerfile)
+        iid = self.private / "image-id"
+        self.call(["docker", "build", "--network=none", "--platform", "linux/arm64", "--iidfile", iid,
+                   str(self.private / "build")], timeout=240)
+        self.image_id = iid.read_text().strip()
+        require(re.fullmatch(r"sha256:[0-9a-f]{64}", self.image_id), "candidate image ID invalid")
         candidate = self.docker_json("image", "inspect", self.image_id)[0]
         require(candidate.get("Id") == self.image_id and candidate.get("Os") == "linux"
-                and candidate.get("Architecture") == "amd64", "imported candidate config/platform differs")
-        config = candidate.get("Config", {})
-        require(config.get("Env") == BASE_ENV and config.get("Entrypoint") == ["/usr/bin/docker-entrypoint.sh"],
-                "imported candidate runtime defaults differ")
-        labels = config.get("Labels", {})
-        require(labels.get("org.juicemount.candidate.source") == IMAGE_SOURCE
-                and labels.get("org.juicemount.candidate.silo-sha256") == IDENTITIES["silo"]["binary_sha256"]
-                and labels.get("org.juicemount.candidate.mcli-sha256") == IDENTITIES["mcli"]["binary_sha256"],
-                "imported candidate provenance labels differ")
+                and candidate.get("Architecture") == "arm64", "candidate platform/config identity differs")
+        require(candidate["Config"].get("Entrypoint") == base["Config"].get("Entrypoint")
+                and candidate["Config"].get("Env") == base["Config"].get("Env"), "candidate changed runtime defaults")
+        require(all(candidate["Config"].get(k) == v for k, v in BASE_RUNTIME.items()), "candidate runtime defaults differ")
+        labels = candidate["Config"].get("Labels", {})
+        require(labels.get("org.juicemount.candidate.source") == self.source_sha, "candidate provenance label differs")
+        require(all(labels.get("org.juicemount.candidate." + n + "-sha256") == self.binary_identities[n]["sha256"] for n in IDENTITIES), "candidate binary labels differ")
         self.create_container("extract")
         for name in ["silo", "mcli"]:
             self.verify_container(running=False)
             extracted = self.private / "extract" / name
             self.call(["docker", "cp", self.container + ":/usr/bin/" + name, extracted])
             require(extracted.is_file() and not extracted.is_symlink()
-                    and extracted.stat().st_size == IDENTITIES[name]["binary_bytes"]
-                    and sha(extracted) == IDENTITIES[name]["binary_sha256"],
-                    "image binary differs from scanned build")
+                    and sha(extracted) == self.binary_identities[name]["sha256"], "image binary differs from scanned build")
         link = self.private / "extract/mc"
         self.call(["docker", "cp", self.container + ":/usr/bin/mc", link])
-        require(link.is_symlink() and os.readlink(link) == "mcli", "packaged mc symlink differs")
+        require(link.is_symlink() and os.readlink(link) in ["mcli", "/usr/bin/mcli"], "packaged mc symlink differs")
         followed = self.private / "extract/mc-followed"
         self.call(["docker", "cp", "-L", self.container + ":/usr/bin/mc", followed])
-        require(sha(followed) == IDENTITIES["mcli"]["binary_sha256"], "packaged mc target differs")
+        require(sha(followed) == self.binary_identities["mcli"]["sha256"], "packaged mc target differs")
         self.retire_container()
+        self.passed()
+        self.step("export verified candidate before credentials")
+        tar = self.private / "candidate-image.tar"
+        self.call(["docker", "image", "save", "--output", tar, self.image_id], timeout=120)
+        exported = self.evidence / "candidate-image.tar.gz"
+        with tar.open("rb") as source, exported.open("xb") as target:
+            with gzip.GzipFile(filename="", mode="wb", fileobj=target, mtime=0) as compressed:
+                shutil.copyfileobj(source, compressed, 1024 * 1024)
+        tar.unlink()
+        image_record = {"config_id": self.image_id, "base": BASE, "base_config_id": BASE_ID,
+                        "platform": "linux/arm64", "archive_sha256": sha(exported),
+                        "archive_bytes": exported.stat().st_size,
+                        "extracted_binary_sha256": {n: self.binary_identities[n]["sha256"] for n in IDENTITIES},
+                        "source_sha": self.source_sha, "scan_summary_sha256": sha(self.evidence / "scan-summary.json"), "qualification_receipt": "result.json",
+                        "ordinary_compatibility_at_export": "NOT_RUN",
+                        "security_and_migration": "OPEN"}
+        write_json(self.evidence / "candidate-image.json", image_record)
+        self.result["candidate_image"] = image_record
         self.passed()
 
     def compile_test(self):
@@ -585,6 +901,8 @@ class Qualification:
         require(not git(self.repo, self.env, "status", "--porcelain", "--untracked-files=all"), "test compile changed checkout")
         info = self.call(["go", "version", "-m", self.test_binary])[1].decode()
         require(info.splitlines()[0] == str(self.test_binary) + ": go1.27.2", "test binary toolchain differs")
+        for marker in ["\tbuild\tGOOS=linux", "\tbuild\tGOARCH=arm64", "\tbuild\tCGO_ENABLED=0"]:
+            require(marker in info, "native test architecture marker absent")
         self.test_binary_sha = sha(self.test_binary)
         write_new(self.evidence / "compatibility-buildinfo.txt", info.replace(str(self.test_binary), "<storage-compatibility.test>"))
         self.result["compatibility_binary_sha256"] = self.test_binary_sha
@@ -754,15 +1072,39 @@ class Qualification:
             self.result["status"] = "HOLD"
         self.result["last_stage"] = self.stage
         self.result["private_state_exported"] = False
+        self.result["full_security"] = "OPEN"
+        self.result["closure"] = {"blocker_groups_closed": 0, "blocker_groups_total": 3, "founder_workflows_closed": 0, "founder_total": 7}
         write_json(self.evidence / "result.json", self.result)
         existing = list(self.evidence.iterdir())
-        require(all(p.name in ARTIFACTS and p.is_file() and not p.is_symlink() for p in existing),
-                "artifact allowlist violated")
-        write_json(self.evidence / "artifact-manifest.json", {
-            "schema": 1, "source_sha": self.source_sha,
-            "files": {p.name: {"sha256": sha(p), "bytes": p.stat().st_size} for p in sorted(existing)},
-            "private_fixture_excluded": True,
-        })
+        require(all(p.name in ARTIFACTS and p.name != "artifact-manifest.json" and p.is_file() and not p.is_symlink()
+                    and p.stat().st_uid == os.geteuid() and stat.S_IMODE(p.stat().st_mode) == 0o600 for p in existing), "artifact custody/allowlist violated")
+        needles = [secret.encode() for secret in self.secrets]
+        overlap = max([len(v) for v in needles] + [1]) - 1
+        for path in existing:
+            tail = b""
+            with path.open("rb") as source:
+                while True:
+                    chunk = source.read(1024 * 1024)
+                    if not chunk: break
+                    combined = tail + chunk
+                    require(not any(secret in combined for secret in needles), "credential found in evidence; publication withheld")
+                    tail = combined[-overlap:] if overlap else b""
+        manifest = {"schema": 1, "source_sha": self.source_sha, "platform": "linux/arm64",
+                    "files": {p.name: {"sha256": sha(p), "bytes": p.stat().st_size} for p in sorted(existing)},
+                    "private_fixture_excluded": True, "retirement_outcome_recorded": True}
+        write_json(self.evidence / "artifact-manifest.json", manifest)
+        require({p.name for p in self.evidence.iterdir()} == set(manifest["files"]) | {"artifact-manifest.json"}, "artifact set changed before publication")
+        require(all(sha(self.evidence / name) == value["sha256"] and (self.evidence / name).stat().st_size == value["bytes"]
+                    for name, value in manifest["files"].items()), "artifact bytes changed before publication")
+        self.evidence_validated = True
+
+    def publish_evidence(self):
+        # Invoked only after finalize returns successfully; no retry. A partial
+        # filesystem write failure cannot establish whether readiness was emitted.
+        require(getattr(self, "evidence_validated", False) is True, "evidence publication precedes validation")
+        descriptor = os.open(self.output_file, os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW)
+        with os.fdopen(descriptor, "w") as output:
+            output.write("evidence_dir=" + str(self.evidence) + "\nevidence_ready=true\n")
 
 
 def main():
@@ -774,7 +1116,9 @@ def main():
             raise Hold("controller interrupted; first outcome retained")
         signal.signal(signal.SIGTERM, interrupted)
         signal.signal(signal.SIGINT, interrupted)
-        trial.import_image()
+        trial.build_binaries()
+        trial.scan_binaries()
+        trial.build_image()
         trial.compile_test()
         fixture = trial.fixture()
         trial.compatibility(*fixture)
@@ -789,8 +1133,13 @@ def main():
         if trial is not None:
             try:
                 trial.finalize()
-            except BaseException:
-                print("HOLD: evidence finalization incomplete; no retry", flush=True)
+            except BaseException as exc:
+                print("HOLD_RECEIPT " + format_finalization_failure(trial.result.get("first_red"), exc, trial.secrets), flush=True)
+                return 1
+            try:
+                trial.publish_evidence()
+            except BaseException as exc:
+                print("HOLD_RECEIPT " + format_finalization_failure(trial.result.get("first_red"), exc, trial.secrets, phase="publication"), flush=True)
                 return 1
     print(trial.result["status"], flush=True)
     return 0 if trial.result["status"] == PASS else 1
@@ -798,4 +1147,3 @@ def main():
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
