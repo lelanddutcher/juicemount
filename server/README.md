@@ -6,6 +6,22 @@ storage paths, and a rendered Compose file before it can start. Use the
 on a Docker host. Obtain the release image digests from its published manifest;
 do not replace them with mutable tags.
 
+## Storage installation status
+
+Fresh 0.5 server installation has not passed qualification. The legacy MinIO
+release pinned by the Compose file is affected by published
+[object-write authentication bypass](https://github.com/minio/minio/security/advisories/GHSA-hv4r-mvr4-25vw)
+and [Snowball authentication bypass](https://github.com/minio/minio/security/advisories/GHSA-9c4q-hq6p-c237)
+advisories. Digest pinning, authenticated pulls, and cached images do not fix
+these vulnerabilities. Keep MinIO on a trusted private route; do not expose
+it to the public Internet.
+
+The proposed storage replacement has passed bounded compatibility and stopped
+migration checks, but full security and deployment qualification remain open.
+It is not shipped or approved for production installation. Preserve working
+deployments and their data; image access alone does not qualify a fresh install
+or a storage replacement.
+
 ## Production install (TrueNAS Scale)
 
 Use **TrueNAS Apps → Discover → ⋮ → Install via YAML** with the rendered,

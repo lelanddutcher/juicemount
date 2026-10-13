@@ -8,6 +8,20 @@ takes a Docker Compose YAML and runs it as a native TrueNAS app.
 
 ## Before you start
 
+Fresh 0.5 server installation has not passed qualification. The legacy MinIO
+release pinned by the Compose file is affected by published
+[object-write authentication bypass](https://github.com/minio/minio/security/advisories/GHSA-hv4r-mvr4-25vw)
+and [Snowball authentication bypass](https://github.com/minio/minio/security/advisories/GHSA-9c4q-hq6p-c237)
+advisories. Digest pinning, authenticated pulls, and cached images do not fix
+these vulnerabilities. Keep MinIO on a trusted private route; do not expose
+it to the public Internet.
+
+The proposed storage replacement has passed bounded compatibility and stopped
+migration checks, but full security and deployment qualification remain open.
+It is not shipped or approved for production installation. Preserve working
+deployments and their data; image access alone does not qualify a fresh install
+or a storage replacement.
+
 If this installation uses ZFS periodic snapshots, exclude the MinIO bucket dataset
 from recursive snapshots of the parent pool (for the default layout,
 `zSSD/juicemount/bucket`). JuiceFS already owns file/trash history in metadata; ZFS
@@ -91,8 +105,9 @@ without pull scope, and Quay's anonymous request also returned 401. This does
 not establish whether authenticated accounts can pull it or whether an existing
 image cache works. Before a fresh install or replacing a working stack, verify
 that the deployment host can access that exact MinIO image and every matching
-server and base image digest. Keep the working stack and its data in place until
-the image access and rendered configuration are verified.
+server and base image digest. Image access and a valid rendered configuration
+are prerequisites, not security or installation qualification. Preserve the
+working stack and its data while the qualification gaps above remain open.
 
 1. Copy `server/release.env.example` outside the repository and replace every
    placeholder. Obtain `JM_FARM_STORAGE_CAPACITY_BYTES` from
