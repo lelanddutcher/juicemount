@@ -429,6 +429,9 @@ func runServingProcess(args []string) error {
 // owns the Go engine. Service-process death/reboot still requires the broker's
 // durable reconciliation; this boundary protects against GUI death only.
 func main() {
+	if isUnmountOperationStatusCommand(os.Args[1:]) {
+		os.Exit(runUnmountOperationStatusCommand(os.Args[1:], os.Stdout, os.Stderr))
+	}
 	if volumeOwnerMode(os.Args[1:]) {
 		if err := runVolumeOwnerProcess(); err != nil {
 			fmt.Fprintln(os.Stderr, "juicemount-volume-owner:", err)
