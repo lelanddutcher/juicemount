@@ -78,3 +78,6 @@ secrets/
 /compose temp.yml
 compose temp.yml
 /juicemount-manager
+
+# Local Codex scratch and retained test evidence are private, not source.
+/.codex/
