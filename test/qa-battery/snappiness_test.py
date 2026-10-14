@@ -317,5 +317,128 @@ snap_measure warm flat_1 /unused /unused
             self.assertEqual((Path(work)/'latency-table.tsv').read_text(),'warm\tflat_1\t1\t1.000\tPASS\n')
 
 
+    def run_drain_measurement(self, mode, reply='positive'):
+        # Actual phase/custody functions; stub only host-effect boundaries.
+        # A real original shell child exits and the actual wait consumes it.
+        # The strict HOLD boundary exits this test instead of waiting forever.
+        root = os.environ.get('QA_TEST_ROOT'); self.assertTrue(root)
+        with tempfile.TemporaryDirectory(prefix='snappiness-drain-', dir=root) as work:
+            functions = ''.join(function(SCRIPT, name) for name in
+                                ('snap_measurement_fail', 'snap_measure', 'snap_drain_phase'))
+            functions += ''.join(function(CUSTODY, name) for name in
+                                 ('snap_intent', 'snap_start_copy', 'snap_hold_unknown',
+                                  'snap_reply_positive', 'snap_join_positive',
+                                  'snap_wait_original', 'snap_publish_joined', 'snap_admit_next'))
+            strict = (HERE / 'release_custody.sh').read_text()
+            functions += function(strict, 'qa_fail')
+            body = 'QA_CAT_DIR='+repr(work)+'; MODE='+repr(mode)+'; REPLY='+repr(reply)+r'''
+QA_STAGE="$QA_CAT_DIR"; SNAP_TMP="$QA_CAT_DIR"; SNAP_DEST=/unused
+SNAP_DRAIN_PROBE_FILES=100; SNAP_FILE_BYTES=4096; SNAP_SEQ=0; QA_SNAPPY_MS=200
+SNAP_BIG_N=5000; SNAP_BIG_LEAF=/unused; SNAP_BIG_NAMES=/unused
+TRACE="$QA_CAT_DIR/trace"
+qa_unique_tag() { echo s_1_2_3; }
+qa_stage_tree() { echo "$QA_CAT_DIR/manifest"; }
+qa_pass() { printf 'pass\n' >> "$TRACE"; }
+date() { printf '1\n'; }
+perl() { printf '1.5\n'; }
+snap_bg_copy() {
+    printf 'worker\n' >> "$TRACE"
+    if [ "$REPLY" = missing ]; then : > "$SNAP_TMP/$3.out"
+    elif [ "$REPLY" = negative ]; then printf 'execution error -36' > "$SNAP_TMP/$3.out"
+    else printf 'folder original' > "$SNAP_TMP/$3.out"; fi
+    printf '2.0' > "$SNAP_TMP/$3.reply_at"
+    printf '0' > "$SNAP_TMP/$3.rc"
+}
+wait() { printf 'wait:%s\n' "$1" >> "$TRACE"; builtin wait "$@"; }
+qa_release_hold() {
+    printf 'hold:%s\n' "$SNAP_PENDING" >> "$TRACE"
+    [ "$SNAP_PENDING" = 0 ] && exit 1
+    exit 88
+}
+snap_get() { printf '{}\n' > "$2"; }
+snap_evidence() {
+    case "$1" in
+        manifest) printf '["file1.dat"]\n';;
+        spool) [ "$MODE" != uncovered ];;
+        list) printf '{"names":[],"elapsed_ns":1}\n';;
+        interval)
+            printf '{"retained":"%s"}\n' "$MODE" > "$2.result.json"
+            printf '5000\t1.000\tserver-activity-in-bracket'
+            [ "$MODE" != invalid ];;
+        *) return 99;;
+    esac
+}
+snap_flush_soft_reason() { :; }
+snap_settled() {
+    [ "$SNAP_PENDING" = 0 ] && [ -s "$SNAP_TMP/drain.joined" ] || exit 92
+    printf 'settled\n' >> "$TRACE"
+}
+snap_custody() {
+    [ "$SNAP_PENDING" = 0 ] && [ -s "$SNAP_TMP/drain.joined" ] || exit 93
+    printf 'mounted+sdk-custody\n' >> "$TRACE"
+}
+snap_drain_phase
+rc=$?
+printf 'returned:%s,fail:%s,pending:%s,keep:%s\n' "$rc" "$QA_FAIL" "$SNAP_PENDING" "$QA_KEEP_DATA" >> "$TRACE"
+[ "$rc" = 0 ] || qa_fail 'category09 required phase failed or uncovered; no replacement operation'
+'''
+            run = shell(functions, body)
+            path = Path(work)
+            evidence = {name: (path/name).read_text() if (path/name).exists() else None
+                        for name in ('trace', 'drain.worker', 'drain.joined',
+                                     'interval-1-under-drain.result.json', 'latency-table.tsv')}
+            return run, evidence
+
+    def test_uncovered_drain_joins_and_custody_before_red(self):
+        run, evidence = self.run_drain_measurement('uncovered')
+        self.assertEqual(run.returncode, 1, run.stderr)
+        trace = evidence['trace'].splitlines(); pid = evidence['drain.worker'].split()[0]
+        self.assertEqual(trace.count('worker'), 1)
+        self.assertEqual(trace.count('wait:'+pid), 1)
+        self.assertTrue(evidence['drain.joined'].startswith('0 '))
+        self.assertLess(trace.index('wait:'+pid), trace.index('settled'))
+        self.assertLess(trace.index('settled'), trace.index('mounted+sdk-custody'))
+        self.assertLess(trace.index('mounted+sdk-custody'), trace.index('hold:0'))
+        self.assertIn('returned:1,fail:1,pending:0,keep:1', trace)
+        self.assertNotIn('pass', trace)
+
+    def test_invalid_drain_sample_joins_and_retains_raw_red(self):
+        run, evidence = self.run_drain_measurement('invalid')
+        self.assertEqual(run.returncode, 1, run.stderr)
+        trace = evidence['trace'].splitlines(); pid = evidence['drain.worker'].split()[0]
+        self.assertEqual(trace.count('worker'), 1)
+        self.assertEqual(trace.count('wait:'+pid), 1)
+        self.assertLess(trace.index('mounted+sdk-custody'), trace.index('hold:0'))
+        self.assertIn('returned:1,fail:1,pending:0,keep:1', trace)
+        self.assertIn('invalid', evidence['interval-1-under-drain.result.json'])
+        self.assertTrue(evidence['latency-table.tsv'].endswith('\tFAIL\n'))
+        self.assertNotIn('pass', trace)
+
+    def test_measurement_red_never_admits_unknown_finder_reply(self):
+        for reply in ('missing', 'negative'):
+            with self.subTest(reply=reply):
+                run, evidence = self.run_drain_measurement('uncovered', reply)
+                self.assertEqual(run.returncode, 88, run.stderr)
+                trace = evidence['trace'].splitlines()
+                self.assertEqual(trace.count('worker'), 1)
+                self.assertIn('hold:1', trace)
+                self.assertIsNone(evidence['drain.joined'])
+                self.assertNotIn('settled', trace)
+                self.assertNotIn('mounted+sdk-custody', trace)
+
+    def test_earlier_measurement_failure_stays_strict(self):
+        root = os.environ.get('QA_TEST_ROOT'); self.assertTrue(root)
+        with tempfile.TemporaryDirectory(prefix='snappiness-earlier-', dir=root) as work:
+            functions = function(SCRIPT, 'snap_measurement_fail') + function(SCRIPT, 'snap_measure')
+            run = shell(functions, 'QA_CAT_DIR='+repr(work)+r'''
+SNAP_SEQ=0; QA_SNAPPY_MS=200
+snap_get() { return 0; }
+snap_evidence() { [ "$1" = list ] && printf '{}' && return 0; return 1; }
+qa_fail() { printf 'STRICT_EARLIER\n'; exit 87; }
+snap_measure warm flat_10 /unused /unused
+''')
+            self.assertEqual((run.returncode, run.stdout), (87, 'STRICT_EARLIER\n'), run.stderr)
+
+
 if __name__ == '__main__':
     unittest.main()
