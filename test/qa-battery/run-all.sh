@@ -141,6 +141,11 @@ precheck() {
 
     # spool idle at the START (so we attribute only THIS run's drain activity).
     if [ "$ok" -eq 0 ]; then
+        if [ "${QA_STRICT_RELEASE:-0}" = 1 ]; then
+            qa_wait_drain
+            qa_pass "spool has typed zero work/error counters before run"
+            return "$ok"
+        fi
         local p ip
         p="$(qa_spool_pending)"
         ip="$(qa_spool_field in_progress)"
@@ -226,10 +231,14 @@ $cat|SKIP(missing)|script not present"
     # (QA_ARTIFACTS, MOUNT, CP_ADDR, QA_SNAPPY_MS, ...). Each script always
     # exits 0; the real result is the VERDICT line on stdout.
     "$script" 2>&1 | tee "$logf"
+    local pipeline_status=("${PIPESTATUS[@]}")
 
     # Pull the LAST 'VERDICT:' line the script emitted (authoritative result).
     verdict="$(grep '^VERDICT:' "$logf" 2>/dev/null | tail -1)"
-    if [ -z "$verdict" ]; then
+    if [ "${pipeline_status[0]}" -ne 0 ] || [ "${pipeline_status[1]}" -ne 0 ]; then
+        status="FAIL"
+        ANY_FAIL=1
+    elif [ -z "$verdict" ]; then
         status="FAIL"
         verdict="VERDICT: FAIL $cat: no VERDICT line emitted (script crashed before reporting — see $logf)"
         ANY_FAIL=1
@@ -302,6 +311,10 @@ mkdir -p "$QA_CAT_DIR" 2>/dev/null
 for cat in $SELECTED; do
     [ -z "$cat" ] && continue
     run_category "$cat"
+    if [ "$ANY_FAIL" != 0 ] || [ -n "$SKIPPED" ]; then
+        qa_warn "stopping category dispatch at the first RED; retained work requires owner review"
+        break
+    fi
 done
 
 # ---------------------------------------------------------------------------
@@ -380,6 +393,7 @@ GATE_GREEN=1
 [ "$XTOTAL" -eq 0 ]         || GATE_GREEN=0
 [ "$SNAPPY_OK" -eq 1 ]      || GATE_GREEN=0
 [ "$MISSING_SELECTED" -eq 0 ] || GATE_GREEN=0
+[ "$RAN_COUNT" -eq "$SELECTED_COUNT" ] || GATE_GREEN=0
 
 {
     if [ "$GATE_GREEN" -eq 1 ]; then

@@ -228,7 +228,7 @@ osascript \
 if [ "$_alias_made" -eq 1 ]; then
     qa_log "  staged macOS Finder alias file in links/"
 else
-    qa_warn "could not stage a Finder alias (osascript make alias failed) — alias check will be skipped"
+    if [ "${QA_STRICT_RELEASE:-0}" = 1 ]; then qa_fail "could not stage a Finder alias (osascript make alias failed) — alias check will be skipped"; else qa_warn "could not stage a Finder alias (osascript make alias failed) — alias check will be skipped"; fi
 fi
 
 # --- hidden dotfiles ---------------------------------------------------------
@@ -279,7 +279,7 @@ chmod +a "$_acl_user allow read,write" "$ACLF" 2>/dev/null || _acl_made=0
 if [ "$_acl_made" -eq 1 ]; then
     qa_log "  staged file with ACL: perms/acl.dat ($_acl_user allow read,write)"
 else
-    qa_warn "could not stage an ACL (chmod +a failed) — ACL check will be skipped"
+    if [ "${QA_STRICT_RELEASE:-0}" = 1 ]; then qa_fail "could not stage an ACL (chmod +a failed) — ACL check will be skipped"; else qa_warn "could not stage an ACL (chmod +a failed) — ACL check will be skipped"; fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -470,7 +470,7 @@ if [ "${_acl_made:-0}" -eq 1 ]; then
         if ls -le "$ACLL" 2>/dev/null | grep -qi 'allow'; then
             qa_pass "ACL entry preserved on dest: $ACLL"
         else
-            qa_warn "ACL not present on dest (bytes intact via custody): $ACLL"
+            if [ "${QA_STRICT_RELEASE:-0}" = 1 ]; then qa_fail "ACL not present on dest (bytes intact via custody): $ACLL"; else qa_warn "ACL not present on dest (bytes intact via custody): $ACLL"; fi
         fi
     else
         qa_fail "ACL file MISSING after copy: $ACLL"
