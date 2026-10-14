@@ -103,8 +103,12 @@ func (l *ownerLifetime) close() {
 }
 
 func readOwnerRetirement(scope appisolation.Scope, i volumeOwnerIntent) (ownerRetirement, error) {
+	return readOwnerRetirementForBuild(scope, i, version.Commit)
+}
+
+func readOwnerRetirementForBuild(scope appisolation.Scope, i volumeOwnerIntent, build string) (ownerRetirement, error) {
 	var got ownerRetirement
-	if err := validateOwnerIntent(i, scope.Root); err != nil {
+	if err := validateOwnerIntentForBuild(i, scope.Root, build); err != nil {
 		return got, err
 	}
 	dir, err := os.Open(scope.Root)
@@ -210,11 +214,23 @@ func confirmOwnerRetired(i volumeOwnerIntent) error {
 		return err
 	}
 	defer l.close()
-	current, err := readOwnerIntent(scope)
+	return confirmOwnerRetiredUnderLifetime(l, i, version.Commit)
+}
+
+// An explicit old build proves retirement only. It cannot claim an owner or
+// attach to an old socket, and does not relax the active current-build guard.
+func confirmOwnerRetiredUnderLifetime(l *ownerLifetime, i volumeOwnerIntent, build string) error {
+	if l == nil || l.lock == nil || l.dir == nil || l.scope.Root != i.Root {
+		return errors.New("owner retirement lifetime fence unavailable")
+	}
+	if err := validateOwnerIntentForBuild(i, l.scope.Root, build); err != nil {
+		return err
+	}
+	current, err := readOwnerIntentRecord(l.scope)
 	if err != nil || current != i {
 		return errors.New("owner intent changed while confirming retirement")
 	}
-	_, err = readOwnerRetirement(scope, i)
+	_, err = readOwnerRetirementForBuild(l.scope, i, build)
 	return err
 }
 
@@ -286,7 +302,7 @@ func createOwnerIntent(scope appisolation.Scope, cfg ServerConfig) (volumeOwnerI
 			return volumeOwnerIntent{}, false, err
 		}
 	} else if !errors.Is(readErr, os.ErrNotExist) {
-		return volumeOwnerIntent{}, false, readErr
+		return createHistoricalRetiredOwnerSuccessor(scope, cfg, readErr)
 	}
 	l, err := acquireOwnerLifetime(scope)
 	if err != nil {
@@ -301,6 +317,52 @@ func createOwnerIntent(scope appisolation.Scope, cfg ServerConfig) (volumeOwnerI
 		return volumeOwnerIntent{}, false, errors.New("selected intent changed during successor selection")
 	}
 	if _, err := readOwnerRetirement(scope, old); err != nil {
+		return volumeOwnerIntent{}, false, err
+	}
+	next, err := intendedOwner(cfg, scope)
+	if err != nil {
+		return volumeOwnerIntent{}, false, err
+	}
+	if err := l.atomicRecord(filepath.Base(ownerIntentPath(scope.Root)), next); err != nil {
+		return volumeOwnerIntent{}, false, fmt.Errorf("successor publication uncertain; retain selected intent: %w", err)
+	}
+	return next, true, nil
+}
+
+// Historical succession requires both the archived stopped predecessor and a
+// current fresh Start. Recheck every terminal proof under the SAME fence that
+// publishes the successor. Never adopt a live old-build owner.
+func createHistoricalRetiredOwnerSuccessor(scope appisolation.Scope, cfg ServerConfig, originalErr error) (volumeOwnerIntent, bool, error) {
+	l, err := acquireOwnerLifetime(scope)
+	if err != nil {
+		return volumeOwnerIntent{}, false, err
+	}
+	defer l.close()
+	old, err := readOwnerIntentRecord(scope)
+	if err != nil || old.Build == version.Commit {
+		return volumeOwnerIntent{}, false, originalErr
+	}
+	current, err := readServingDesiredRecord(scope, servingDesiredLeaf)
+	if err != nil || current.Build != version.Commit || current.Desired != "pending" ||
+		current.Owner != (volumeOwnerIntent{}) || current.NFSPhase != "none" || current.NFSRecord != nil {
+		return volumeOwnerIntent{}, false, errors.New("legacy succession lacks current fresh Start admission")
+	}
+	wantDigest, err := servingConfigDigest(cfg)
+	if err != nil {
+		return volumeOwnerIntent{}, false, err
+	}
+	currentDigest, err := servingConfigDigest(current.Config)
+	if err != nil || currentDigest != wantDigest {
+		return volumeOwnerIntent{}, false, errors.New("fresh Start configuration changed before legacy succession")
+	}
+	previous, err := readServingDesiredRecord(scope, retiredServingDesiredLeaf(old))
+	if err != nil {
+		return volumeOwnerIntent{}, false, err
+	}
+	if previous.Owner != old || current.Revision <= previous.Revision {
+		return volumeOwnerIntent{}, false, errors.New("legacy stopped archive belongs to another admission")
+	}
+	if err := validateRetiredServingRecord(l, previous, old.Build); err != nil {
 		return volumeOwnerIntent{}, false, err
 	}
 	next, err := intendedOwner(cfg, scope)

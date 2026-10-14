@@ -99,7 +99,12 @@ func intendedOwner(cfg ServerConfig, scope appisolation.Scope) (volumeOwnerInten
 }
 
 func validateOwnerIntent(i volumeOwnerIntent, root string) error {
-	if i.Version != 1 || i.Build != version.Commit || i.Root != root || len(i.ConfigDigest) != 64 {
+	return validateOwnerIntentForBuild(i, root, version.Commit)
+}
+
+// An explicit historical build is used only by lifetime-fenced retirement proof.
+func validateOwnerIntentForBuild(i volumeOwnerIntent, root, build string) error {
+	if build == "" || i.Version != 1 || i.Build != build || i.Root != root || len(i.ConfigDigest) != 64 {
 		return errors.New("owner intent build, root, or configuration unavailable")
 	}
 	if b, err := hex.DecodeString(i.ConfigDigest); err != nil || len(b) != 32 || hex.EncodeToString(b) != i.ConfigDigest {
@@ -155,6 +160,19 @@ func authorizeOriginalOwner(scope appisolation.Scope, bootstrapFD string, pipe i
 }
 
 func readOwnerIntent(scope appisolation.Scope) (volumeOwnerIntent, error) {
+	i, err := readOwnerIntentRecord(scope)
+	if err != nil {
+		return volumeOwnerIntent{}, err
+	}
+	if err := validateOwnerIntent(i, scope.Root); err != nil {
+		return volumeOwnerIntent{}, err
+	}
+	return i, nil
+}
+
+// Parsing alone grants no active-owner authority. Historical callers must hold
+// the lifetime fence and prove exact retirement before using the parsed intent.
+func readOwnerIntentRecord(scope appisolation.Scope) (volumeOwnerIntent, error) {
 	path := ownerIntentPath(scope.Root)
 	if err := scope.RequireChild(path); err != nil {
 		return volumeOwnerIntent{}, err
@@ -186,7 +204,7 @@ func readOwnerIntent(scope appisolation.Scope) (volumeOwnerIntent, error) {
 	if err := dec.Decode(new(any)); err != io.EOF {
 		return volumeOwnerIntent{}, errors.New("owner intent has trailing data")
 	}
-	if err := validateOwnerIntent(i, scope.Root); err != nil {
+	if err := validateOwnerIntentForBuild(i, scope.Root, i.Build); err != nil {
 		return volumeOwnerIntent{}, err
 	}
 	return i, nil

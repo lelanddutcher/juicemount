@@ -3,6 +3,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -15,6 +16,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/lelanddutcher/juicemount/internal/appisolation"
+	"github.com/lelanddutcher/juicemount/internal/mountbroker"
+	"github.com/lelanddutcher/juicemount/internal/mounttable"
 	"github.com/lelanddutcher/juicemount/internal/servicecontrol"
 	"github.com/lelanddutcher/juicemount/internal/version"
 )
@@ -428,4 +432,249 @@ func TestDesiredRecordFromPreviousBuild(t *testing.T) {
 			t.Fatal("a running record from another build was accepted")
 		}
 	})
+}
+
+// This fixture uses only private files and fake native inventory callbacks.
+// It creates/retire journals through mountbroker without mounting anything.
+func legacyRetiredServingFixture(t *testing.T) (appisolation.Scope, servingDesiredRecord, *mounttable.Snapshot) {
+	t.Helper()
+	root := controlIsolationFixture(t)
+	scope := appisolation.Scope{Root: root}
+	cfg := ServerConfig{DBPath: filepath.Join(root, "metadata.db"), MountPoint: filepath.Join(root, "volume")}
+	for _, path := range []string{cfg.MountPoint, filepath.Join(root, "mount-transactions")} {
+		if err := os.Mkdir(path, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	owner, err := intendedOwner(cfg, scope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner.Build = "historical-retired-fixture"
+	put := func(path string, value any) {
+		t.Helper()
+		b, err := json.Marshal(value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, b, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	put(ownerIntentPath(root), owner)
+	put(filepath.Join(root, ownerRetirementLeaf(owner)), ownerRetirement{Version: 1, Intent: owner, ShutdownID: ownerShutdownID(owner)})
+	if err := os.WriteFile(filepath.Join(root, ownerLifetimeLeaf), nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := &mounttable.Snapshot{Version: 1, BootID: "legacy-upgrade-boot", Entries: []mounttable.MountEntry{}}
+	spec := mountbroker.Spec{MountPath: cfg.MountPoint, Source: "127.0.0.1:/jm-0123456789abcdef0123456789abcdef", Endpoint: "127.0.0.1:11049", ExportPath: "/jm-0123456789abcdef0123456789abcdef", MetadataPath: cfg.DBPath}
+	creator := mountbroker.Creator{Directory: filepath.Join(root, "mount-transactions"), Observe: func(context.Context) (mounttable.Snapshot, error) { return *snapshot, nil }}
+	result := creator.CreateBound(context.Background(), spec, func(mountbroker.Record) error {
+		snapshot.Entries = []mounttable.MountEntry{{Path: cfg.MountPoint, Source: spec.Source, Type: "nfs", FSID: [2]int32{21, 22}}}
+		return nil
+	})
+	if err := result.Failure(); err != nil {
+		t.Fatal(err)
+	}
+	snapshot.Entries = []mounttable.MountEntry{}
+	if err := creator.Retire(context.Background(), *result.Record, func() error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	r := servingDesiredRecord{Version: 1, Build: owner.Build, Root: root, Revision: 8, Desired: "stopped", Config: cfg, Owner: owner, NFSPhase: "bound", NFSRecord: result.Record}
+	put(filepath.Join(root, servingDesiredLeaf), r)
+	oldObserve := observeOwnedNFS
+	observeOwnedNFS = func(context.Context) (mounttable.Snapshot, error) { return *snapshot, nil }
+	t.Cleanup(func() { observeOwnedNFS = oldObserve })
+	return scope, r, snapshot
+}
+
+func TestRetiredLegacyServingStartPreservesEvidenceAndSelectsSuccessor(t *testing.T) {
+	scope, old, _ := legacyRetiredServingFixture(t)
+	before, err := os.ReadFile(filepath.Join(scope.Root, servingDesiredLeaf))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := readServingDesired(); err != nil || got.Build != old.Build || got.Owner != old.Owner {
+		t.Fatalf("retired predecessor: %+v %v", got, err)
+	}
+	if got, err := readOwnerIntent(scope); err == nil || got != (volumeOwnerIntent{}) {
+		t.Fatal("historical owner passed active current-build reader")
+	}
+	if _, err := beginServingDesired(old.Config); err != nil {
+		t.Fatal(err)
+	}
+	archive := filepath.Join(scope.Root, retiredServingDesiredLeaf(old.Owner))
+	if got, err := os.ReadFile(archive); err != nil || !bytes.Equal(got, before) {
+		t.Fatal("exact predecessor was not preserved")
+	}
+	current, err := readServingDesired()
+	if err != nil || current.Build != version.Commit || current.Desired != "pending" || current.Owner != (volumeOwnerIntent{}) {
+		t.Fatalf("fresh admission: %+v %v", current, err)
+	}
+	next, born, err := createOwnerIntent(scope, old.Config)
+	if err != nil || !born || next.Build != version.Commit || next.Instance == old.Owner.Instance {
+		t.Fatalf("successor: %+v %v %v", next, born, err)
+	}
+	if got, err := os.ReadFile(archive); err != nil || !bytes.Equal(got, before) {
+		t.Fatal("successor changed immutable predecessor")
+	}
+	if _, err := readOwnerRetirementForBuild(scope, old.Owner, old.Build); err != nil {
+		t.Fatal("predecessor terminal receipt lost:", err)
+	}
+	if selected, err := readOwnerIntent(scope); err != nil || selected != next {
+		t.Fatal("successor not selected")
+	}
+}
+
+func TestRetiredLegacyServingRejectsIncompleteProof(t *testing.T) {
+	for _, kind := range []string{"running", "pending", "recovering", "nfs-pending", "none-with-record", "missing-retirement", "foreign-retirement", "held-lifetime", "unknown-inventory", "mounted", "other-boot", "wrong-nfs-operation", "changed-config", "changed-owner-build"} {
+		t.Run(kind, func(t *testing.T) {
+			scope, r, snapshot := legacyRetiredServingFixture(t)
+			switch kind {
+			case "running", "pending", "recovering":
+				r.Desired = kind
+			case "nfs-pending":
+				r.NFSPhase, r.NFSRecord = "pending", nil
+			case "none-with-record":
+				r.NFSPhase = "none"
+			case "missing-retirement":
+				if err := os.Remove(filepath.Join(scope.Root, ownerRetirementLeaf(r.Owner))); err != nil {
+					t.Fatal(err)
+				}
+			case "foreign-retirement":
+				if err := os.WriteFile(filepath.Join(scope.Root, ownerRetirementLeaf(r.Owner)), []byte(`{}`), 0600); err != nil {
+					t.Fatal(err)
+				}
+			case "held-lifetime":
+				l, err := acquireOwnerLifetime(scope)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer l.close()
+			case "unknown-inventory":
+				snapshot.Entries = nil
+			case "mounted":
+				snapshot.Entries = []mounttable.MountEntry{{Path: r.Config.MountPoint, Source: "foreign:/", Type: "nfs", FSID: [2]int32{90, 91}}}
+			case "other-boot":
+				snapshot.BootID = "other"
+			case "wrong-nfs-operation":
+				r.NFSRecord.OperationID = strings.Repeat("f", 32)
+			case "changed-config":
+				r.Config.DBPath += ".changed"
+			case "changed-owner-build":
+				r.Owner.Build = "different"
+			}
+			b, err := json.Marshal(r)
+			if err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(scope.Root, servingDesiredLeaf)
+			if err := os.WriteFile(path, b, 0600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := readServingDesired(); err == nil {
+				t.Fatal("incomplete predecessor admitted")
+			}
+			if _, err := beginServingDesired(r.Config); err == nil {
+				t.Fatal("incomplete predecessor superseded")
+			}
+			if got, err := os.ReadFile(path); err != nil || !bytes.Equal(got, b) {
+				t.Fatal("refusal changed desired evidence")
+			}
+		})
+	}
+}
+
+func TestRetiredLegacyServingRepeatedStopAndPreBirthRetry(t *testing.T) {
+	scope, old, _ := legacyRetiredServingFixture(t)
+	for n := 1; n <= 2; n++ {
+		if rev, err := stopServingDesired(); err != nil || rev != old.Revision+uint64(n) {
+			t.Fatalf("Stop revision=%d err=%v", rev, err)
+		}
+		got, err := readServingDesired()
+		if err != nil || got.Build != old.Build || got.Owner != old.Owner {
+			t.Fatal("Stop relabelled historical owner")
+		}
+	}
+	prior, err := os.ReadFile(filepath.Join(scope.Root, servingDesiredLeaf))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for n := 0; n < 2; n++ {
+		if _, err := beginServingDesired(old.Config); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got, err := os.ReadFile(filepath.Join(scope.Root, retiredServingDesiredLeaf(old.Owner))); err != nil || !bytes.Equal(got, prior) {
+		t.Fatal("pre-birth retry changed predecessor archive")
+	}
+	if _, born, err := createOwnerIntent(scope, old.Config); err != nil || !born {
+		t.Fatalf("retry successor born=%v err=%v", born, err)
+	}
+}
+
+func TestRetiredLegacySuccessorRequiresFreshConfigAndArchive(t *testing.T) {
+	scope, old, _ := legacyRetiredServingFixture(t)
+	if _, born, err := createOwnerIntent(scope, old.Config); err == nil || born {
+		t.Fatal("historical owner replaced without fresh Start")
+	}
+	if _, err := beginServingDesired(old.Config); err != nil {
+		t.Fatal(err)
+	}
+	changed := old.Config
+	changed.DBPath += ".different"
+	if _, born, err := createOwnerIntent(scope, changed); err == nil || born {
+		t.Fatal("unbound fresh configuration replaced historical owner")
+	}
+	archive := filepath.Join(scope.Root, retiredServingDesiredLeaf(old.Owner))
+	if err := os.Rename(archive, archive+".retained"); err != nil {
+		t.Fatal(err)
+	}
+	if _, born, err := createOwnerIntent(scope, old.Config); err == nil || born {
+		t.Fatal("missing archive replaced historical owner")
+	}
+}
+
+func TestRetiredLegacyArchiveConflictPreservesOriginal(t *testing.T) {
+	scope, old, _ := legacyRetiredServingFixture(t)
+	path := filepath.Join(scope.Root, servingDesiredLeaf)
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	archive := filepath.Join(scope.Root, retiredServingDesiredLeaf(old.Owner))
+	if err := os.WriteFile(archive, []byte("retained-conflict"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := beginServingDesired(old.Config); err == nil {
+		t.Fatal("archive conflict overwritten")
+	}
+	if got, err := os.ReadFile(path); err != nil || !bytes.Equal(got, before) {
+		t.Fatal("archive failure changed predecessor")
+	}
+	if got, err := os.ReadFile(archive); err != nil || string(got) != "retained-conflict" {
+		t.Fatal("conflicting archive was replaced")
+	}
+}
+
+func TestRetiredServingUpgradeGuardRetainsCallerFence(t *testing.T) {
+	scope, old, _ := legacyRetiredServingFixture(t)
+	l, err := acquireOwnerLifetime(scope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.close()
+	for n := 0; n < 2; n++ {
+		got, err := validateRetiredServingForUpgrade(l, old.Build)
+		if err != nil || got.Build != old.Build || got.Owner != old.Owner || got.Revision != old.Revision {
+			t.Fatalf("held-fence proof lost original: %+v %v", got, err)
+		}
+	}
+	if second, err := acquireOwnerLifetime(scope); err == nil {
+		second.close()
+		t.Fatal("upgrade guard released caller fence")
+	}
+	if _, err := validateRetiredServingForUpgrade(l, "wrong-build"); err == nil {
+		t.Fatal("wrong expected build admitted")
+	}
 }
