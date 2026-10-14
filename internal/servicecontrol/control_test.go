@@ -461,3 +461,31 @@ func TestCallErrNotSentOnlyBeforeTheWrite(t *testing.T) {
 		t.Fatalf("lost reply after the write: %v, must not be ErrNotSent", err)
 	}
 }
+
+// The explicit peer guard must reject before dispatch, even when the socket
+// authenticates as the same user. This is not an authorization bypass probe.
+func TestCallWithPeerPIDBindsBeforeDispatch(t *testing.T) {
+	var calls atomic.Int32
+	_, path := startServer(t, func(req Request) Response {
+		calls.Add(1)
+		return Response{Version: ProtocolVersion, Text: req.Build, Int: 1}
+	})
+	request := Request{Version: ProtocolVersion, Method: "ready", Build: "exact-old-build"}
+	for _, pid := range []int{-1, 0, os.Getpid() + 1} {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		_, err := CallWithPeerPID(ctx, path, request, pid)
+		cancel()
+		if !errors.Is(err, ErrNotSent) {
+			t.Fatalf("PID %d: %v; want not-sent", pid, err)
+		}
+		if calls.Load() != 0 {
+			t.Fatal("mismatched peer reached request handler")
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	got, err := CallWithPeerPID(ctx, path, request, os.Getpid())
+	if err != nil || got.Int != 1 || got.Text != request.Build || calls.Load() != 1 {
+		t.Fatalf("exact peer response=%+v err=%v dispatches=%d", got, err, calls.Load())
+	}
+}

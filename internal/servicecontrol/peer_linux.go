@@ -29,3 +29,23 @@ func peerUID(conn *net.UnixConn) (uint32, error) {
 	}
 	return uid, socketErr
 }
+
+func peerPID(conn *net.UnixConn) (int, error) {
+	raw, err := conn.SyscallConn()
+	if err != nil {
+		return 0, err
+	}
+	var got int
+	var socketErr error
+	err = raw.Control(func(fd uintptr) {
+		var cred *unix.Ucred
+		cred, socketErr = unix.GetsockoptUcred(int(fd), unix.SOL_SOCKET, unix.SO_PEERCRED)
+		if socketErr == nil {
+			got = int(cred.Pid)
+		}
+	})
+	if err != nil {
+		return 0, err
+	}
+	return got, socketErr
+}

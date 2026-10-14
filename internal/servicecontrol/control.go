@@ -137,11 +137,34 @@ func (e notSent) Is(target error) bool { return target == ErrNotSent }
 // Response.Error is the service's application error, not a transport retry cue.
 // An error that matches ErrNotSent (errors.Is) means nothing was sent.
 func Call(ctx context.Context, path string, req Request) (Response, error) {
+	return callWithPeerPID(ctx, path, req, 0)
+}
+
+// CallWithPeerPID admits an explicitly identified service before writing. Used
+// by upgrade clients; the ordinary transport retains its same-UID API.
+func CallWithPeerPID(ctx context.Context, path string, req Request, pid int) (Response, error) {
+	if pid <= 0 {
+		return Response{}, notSent{errors.New("invalid expected service PID")}
+	}
+	return callWithPeerPID(ctx, path, req, pid)
+}
+
+func callWithPeerPID(ctx context.Context, path string, req Request, pid int) (Response, error) {
 	conn, err := dialChecked(ctx, path, req)
 	if err != nil {
 		return Response{}, notSent{err}
 	}
 	defer conn.Close()
+	if pid != 0 {
+		uc, ok := conn.(*net.UnixConn)
+		if !ok {
+			return Response{}, notSent{errors.New("service peer is not Unix")}
+		}
+		got, err := peerPID(uc)
+		if err != nil || got != pid {
+			return Response{}, notSent{errors.New("service peer PID changed")}
+		}
+	}
 	stop := context.AfterFunc(ctx, func() { _ = conn.SetDeadline(time.Now()) })
 	defer stop()
 	if err := writeFrame(conn, req); err != nil {
