@@ -130,6 +130,20 @@ printf '%s\n' "$*" >> "$st/argv"
 json=0
 [ "$1" = --json ] && { json=1; shift; }
 case "$1 $2 $3" in
+"mb --ignore-existing jmkeys/zpool")
+  [ "$json" = 1 ] || exit 8
+  case "${FAKE_MC_BUCKET_RESULT:-success}" in
+  denied) echo '{"status":"error","error":{"message":"Access Denied"}}'; exit 1 ;;
+  error-zero) echo '{"status":"error","error":{"message":"not ready"}}'; exit 0 ;;
+  wrong-bucket) echo '{"status":"success","bucket":"jmkeys/other","region":""}'; exit 0 ;;
+  malformed) echo '{"status":"success","bucket":"jmkeys/zpool","region":""'; exit 0 ;;
+  extra-error) printf '%s\n' '{"status":"success","bucket":"jmkeys/zpool","region":""}' '{"status":"error"}'; exit 0 ;;
+  duplicate-status) echo '{"status":"error","status":"success","bucket":"jmkeys/zpool","region":""}'; exit 0 ;;
+  empty) exit 0 ;;
+  esac
+  # An existing bucket's bytes must never be truncated by provisioning.
+  [ -f "$st/bucket.zpool" ] || printf '%s' 'fresh bucket' > "$st/bucket.zpool"
+  printf '{\n "status": "success",\n "bucket": "jmkeys/zpool",\n "region": ""\n}\n' ;;
 "admin policy create") cp "$6" "$st/policy.$5" ;;
 "admin user add")
   [ -n "$6" ] && { echo "secret on argv" >&2; exit 8; }
@@ -274,6 +288,64 @@ func TestProvisionCreatesExactlyTwoUsersIdempotently(t *testing.T) {
 	assertPrivateMCConfigRetired(t, state)
 	if strings.Contains(argv, "juicefs") || strings.Contains(argv, "config") {
 		t.Errorf("provisioning touched the volume setting:\n%s", argv)
+	}
+}
+
+// This is setup before restricted-role format, not a new privilege for either
+// role. The original script had no mb call, so the fresh case detects the gap.
+func TestProvisionEnsuresFixedBucketBeforeUsers(t *testing.T) {
+	for _, existing := range []bool{false, true} {
+		name := "fresh"
+		if existing {
+			name = "existing"
+		}
+		t.Run(name, func(t *testing.T) {
+			state := t.TempDir()
+			bucket := filepath.Join(state, "bucket.zpool")
+			want := "fresh bucket"
+			if existing {
+				want = "existing objects must remain"
+				if err := os.WriteFile(bucket, []byte(want), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for run := 0; run < 2; run++ {
+				out, err := runProvision(t, state)
+				if err != nil {
+					t.Fatalf("run %d: %v\n%s", run, err, out)
+				}
+				got, err := os.ReadFile(bucket)
+				if err != nil || string(got) != want {
+					t.Fatalf("bucket bytes = %q, %v; want %q", got, err, want)
+				}
+			}
+			argv := readOpt(filepath.Join(state, "argv"))
+			call := "--json mb --ignore-existing jmkeys/zpool\n"
+			if !strings.HasPrefix(argv, call) || strings.Count(argv, call) != 2 {
+				t.Fatalf("fixed bucket was not ensured first on both runs: %s", argv)
+			}
+			assertPrivateMCConfigRetired(t, state)
+		})
+	}
+}
+
+func TestProvisionRefusesUnverifiedBucketBeforeUsers(t *testing.T) {
+	for _, result := range []string{"denied", "error-zero", "wrong-bucket", "malformed", "extra-error", "duplicate-status", "empty"} {
+		t.Run(result, func(t *testing.T) {
+			state := t.TempDir()
+			out, err := runProvision(t, state, "FAKE_MC_BUCKET_RESULT="+result)
+			if err == nil || !strings.Contains(out, "zpool bucket") {
+				t.Fatalf("unverified bucket accepted: %v\n%s", err, out)
+			}
+			argv := readOpt(filepath.Join(state, "argv"))
+			if argv != "--json mb --ignore-existing jmkeys/zpool\n" {
+				t.Fatalf("continued after unverified bucket: %s", argv)
+			}
+			if _, err := os.Stat(filepath.Join(state, "user.jm-gc")); !os.IsNotExist(err) {
+				t.Fatalf("restricted user created before bucket proof: %v", err)
+			}
+			assertPrivateMCConfigRetired(t, state)
+		})
 	}
 }
 
