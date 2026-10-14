@@ -273,3 +273,67 @@ Category10 requires `QA_INDEX_SYNC_DIR`, a precreated literal0700 directory on t
 The QA process latches request uncertainty before publication and never resends, deletes, cancels, toggles offline or shuts down on uncertainty. Its terminal receipt is published only after every issued Finder operation and the original sync are known joined. The unchanged custody helper preserves original worker reply timestamps; actual worker `reply_at`, not later parent observation, bounds copy overlap. Wall/monotonic acquisition anchors must have a nonempty common offset interval no wider than1s; copy overlap uses the conservative inner bounds after conversion, and inconsistent clocks reject coverage. `QA_KEEP_DATA=1` retains the fixture. Known failure also retains data; unknown completion keeps the original category process in HOLD.
 
 Measurements are directory-enumeration syscalls with typed reconcile-active observations at both acquisition boundaries and monotonic metric chains including inter-sample gaps. They do not establish continuous/exclusive scan attribution, local SQL contention, WAN behavior, Finder paint or server coverage when the client cache answered. No arbitrary sleep pads coverage and no second sync retries an uncovered window. Root qualification of an existing bounded client-side latency fixture is separate from this source contract; singleton renewal must bypass any simulated delay.
+
+
+## Strict disposable-fixture execution
+
+For a complete single-device acceptance run, use `QA_STRICT_RELEASE=1` and
+`QA_KEEP_DATA=1`. Supply explicit `MOUNT`, `CP_ADDR`, `JM_LOG`, `QA_STAGE` and
+`QA_ARTIFACTS` from the already admitted isolated fixture owner. Strict mode
+never selects a mount automatically. The owner admits capacity for all retained
+sources, destinations and SDK readbacks, and no unrelated Finder copy may be in
+progress when the category06 Cmd-. action runs. Keep the original controller
+and category handles; do not use an outer timeout or kill a Finder driver.
+
+Also supply `QA_OWNER_HOOK` (an absolute executable path) and
+`QA_OWNER_HOOK_SHA256`. This small, independently reviewed fixture-owner adapter
+is invoked directly, with no shell evaluation. It must retain typed receipts
+and return zero only after these operations have completed:
+
+- `preflight 07`: prove the exact owned transport, unchanged upstream Redis
+  lifetime and metadata identity, source/tool binding, no production/foreign
+  route control, and a spool cap that the bounded workload can actually reach.
+- `transport off` / `transport verify-off`: disconnect only that fixture's
+  transport, including existing sessions; retain ordinary connection-failure
+  proof. A forced-offline flag alone is insufficient. Do not use pf, routes,
+  host-wide networking or SIGSTOP of a process holding singleton renewal.
+- `transport on` / `transport verify-on`: restore the same admitted endpoint
+  under its owner, retain the new transport lifetime and authenticated readiness,
+  and preserve the original upstream metadata. Unknown restoration is HOLD.
+- `backend-readback MANIFEST DEST`: admit the exact regular source manifest and
+  destination below this fixture's `JM_RELEASE_BATTERY`; use the pinned bundled
+  JuiceFS SDK CLI and explicit metadata identity to read the corresponding
+  backend path into a fresh private internal directory. Verify every manifest
+  entry against the independent bytes, and retain command, original child join,
+  full output and source/readback hashes. A second mounted read is insufficient.
+
+The fixture hook is a required execution input, not supplied by a successful
+shell exit or invented by the battery. Freeze its bytes with the controller
+before starting. A missing or changed hook cannot earn acceptance. The existing
+qualified SDK readback and transport-owner mechanisms should be reused.
+
+The strict path requires all declared real cancellations (original Finder -128
+reply following destination growth), actual buffered writes during transport
+loss, an observed spool-cap stall, and verification of all originally submitted
+stall inputs. Required alias/ACL/NFC/navigation observations cannot be warnings.
+Category06/07/08 reuse `snappiness_custody.sh` original-worker receipts and waits.
+An outstanding worker or unknown observation retains custody; a known RED with
+no registered worker stops the category. The outer owner must independently
+prove quiescence before retirement. No failure trap removes source or destination
+bytes or silently restores a transport of unknown state.
+
+Example after the fixture and hook are frozen (all angle-bracket values must be
+replaced with their exact admitted paths/identities):
+
+```sh
+QA_STRICT_RELEASE=1 QA_KEEP_DATA=1 \
+MOUNT=<owned-mount> CP_ADDR=<owned-loopback> JM_LOG=<owned-log> \
+QA_STAGE=<owned-stage> QA_ARTIFACTS=<new-owned-artifacts> \
+QA_OWNER_HOOK=<reviewed-owner-hook> QA_OWNER_HOOK_SHA256=<exact-sha256> \
+QA_INDEX_SYNC_DIR=<armed-owned-sync-dir> /bin/bash test/qa-battery/run-all.sh
+```
+
+A subset, first-RED stop, missing hook, unobserved required case, or outstanding
+original operation never constitutes a complete release battery PASS. All data
+are retained until the owner has independently reconciled custody and retired
+the fixture. Existing category09/10/11 latency and coverage bars are unchanged.

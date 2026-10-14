@@ -320,7 +320,7 @@ _cafe_nfc_raw="$(_nfc "$CAFE_NFC")"; [ -z "$_cafe_nfc_raw" ] && _cafe_nfc_raw="$
 if [ -f "$LANDED/$_cafe_nfc_raw" ]; then
     qa_info "raw NFC-spelled lookup happened to resolve (filesystem normalized on lookup): $_cafe_nfc_raw"
 else
-    qa_warn "KNOWN GAP: raw NFC-spelled lookup MISSED an NFD-stored leaf — caller must NFD-normalize before lookup (orig hex=$(_hexname "$CAFE_NFC"))"
+    if [ "${QA_STRICT_RELEASE:-0}" = 1 ]; then qa_fail "KNOWN GAP: raw NFC-spelled lookup MISSED an NFD-stored leaf — caller must NFD-normalize before lookup (orig hex=$(_hexname "$CAFE_NFC"))"; else qa_warn "KNOWN GAP: raw NFC-spelled lookup MISSED an NFD-stored leaf — caller must NFD-normalize before lookup (orig hex=$(_hexname "$CAFE_NFC"))"; fi
 fi
 # The authoritative behavior we DO require: normalize-then-find succeeds.
 if [ -f "$LANDED/$_cafe_nfc_stored" ]; then

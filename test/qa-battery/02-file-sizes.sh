@@ -62,6 +62,7 @@ RESTORE_OFFLINE=0   # set to 1 if we ever flip offline and must restore
 # EXIT trap: restore any toggled state, then tear down ONLY our own dest + stage.
 # qa_cleanup() already guards to $MOUNT/JM_RELEASE_BATTERY/QA_*_$$_* + $QA_STAGE.
 _on_exit() {
+    [ "${QA_KEEP_DATA:-0}" = 1 ] && return 0
     # If anything left us offline, force back online so we never strand the mount.
     if [ "$RESTORE_OFFLINE" = "1" ]; then
         qa_offline off >/dev/null 2>&1 || true
@@ -192,7 +193,7 @@ run_size_case() {
     fi
 
     # Stage cleanup of this size's source as we go (keep /tmp small for the GB file).
-    rm -f "$src" 2>/dev/null || true
+    [ "${QA_KEEP_DATA:-0}" = 1 ] || rm -f "$src" 2>/dev/null || true
 }
 
 # _torn_watch LANDED_PATH FINAL_SIZE TIMEOUT_S LABEL

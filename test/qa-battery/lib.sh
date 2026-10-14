@@ -36,6 +36,19 @@
 # ---------------------------------------------------------------------------
 # Env defaults (override by exporting before sourcing)
 
+# Strict release runs require a separately admitted disposable fixture owner.
+# Check before defaults or filesystem effects; never select a production mount.
+if [ "${QA_STRICT_RELEASE:-0}" = 1 ]; then
+    for _qa_required in MOUNT CP_ADDR JM_LOG QA_STAGE QA_ARTIFACTS QA_OWNER_HOOK QA_OWNER_HOOK_SHA256; do
+        [ -n "${!_qa_required:-}" ] || { printf 'required release input missing: %s\n' "$_qa_required" >&2; exit 2; }
+    done
+    [ "${QA_KEEP_DATA:-0}" = 1 ] || { printf 'strict release requires QA_KEEP_DATA=1\n' >&2; exit 2; }
+    case "$QA_OWNER_HOOK" in /*) ;; *) printf 'absolute owner hook required\n' >&2; exit 2 ;; esac
+    [ -f "$QA_OWNER_HOOK" ] && [ ! -L "$QA_OWNER_HOOK" ] && [ -x "$QA_OWNER_HOOK" ] || exit 2
+    _qa_hook_hash="$(shasum -a 256 "$QA_OWNER_HOOK")" || exit 2
+    [ "${_qa_hook_hash%% *}" = "$QA_OWNER_HOOK_SHA256" ] || { printf 'owner hook hash mismatch\n' >&2; exit 2; }
+fi
+
 # An explicit mount is an identity choice, even when another NFS mount is
 # available. In particular, never redirect an explicit /Volumes/zpool run to
 # a foreign mount. Empty-but-explicit is invalid rather than autodetectable.
@@ -601,7 +614,7 @@ qa_wait_drain() {
 #   readback (not a cached spool read), set QA_DROP_CACHE=1 and provide a
 #   /sync or pin-drop hook if available; by default we read straight through the
 #   mount, which is what the user experiences.
-qa_verify_custody() {
+_qa_verify_mounted_custody() {
     local manifest="$1" dest="$2"
     local ok=0 missing=0 wrong=0 total=0
     local rel want got landed
@@ -624,7 +637,14 @@ qa_verify_custody() {
         fi
     done < "$manifest"
     qa_log "custody OK=$ok MISSING=$missing WRONG=$wrong total=$total"
-    [ "$missing" -eq 0 ] && [ "$wrong" -eq 0 ]
+    [ "$total" -gt 0 ] && [ "$missing" -eq 0 ] && [ "$wrong" -eq 0 ]
+}
+
+qa_verify_custody() {
+    _qa_verify_mounted_custody "$@" || return 1
+    if [ "${QA_STRICT_RELEASE:-0}" = 1 ]; then
+        qa_release_hook backend-readback "$1" "$2" || qa_release_hold "independent backend readback failed or unknown"
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -947,3 +967,9 @@ qa_cleanup() {
     esac
     return 0
 }
+
+# Source-only strict helpers; the fixture owner remains the lifecycle authority.
+if [ "${QA_STRICT_RELEASE:-0}" = 1 ]; then
+    QA_BATTERY_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    . "$QA_BATTERY_LIB_DIR/release_custody.sh"
+fi
