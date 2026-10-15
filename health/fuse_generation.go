@@ -510,6 +510,12 @@ func reserveFUSEGeneration(logical string, digest string, observe func(context.C
 			if !ok || og.boot != r.bootID {
 				return nil, errors.New("prior generation unresolved; new child refused")
 			}
+			// An explicit recovery's fsynced attempt can have an unknown
+			// helper result. Ordinary reservation must not replay it.
+			attempted, attemptErr := retainedRecoveryAttemptPresent(install, id)
+			if attemptErr != nil || attempted {
+				return nil, errors.New("prior generation explicit recovery unresolved; new child refused")
+			}
 			if err := r.resolvePriorWithHelper(id, og, nonce, observe); err != nil {
 				return nil, fmt.Errorf("prior generation unresolved; new child refused: %w", err)
 			}
@@ -901,4 +907,485 @@ func (r *GenerationReservation) resolvePriorWithHelper(id string, og observedGen
 	}
 	log.Printf("[fuse] prior generation %s retired by the unmount helper", id)
 	return nil
+}
+
+// RetainedGenerationRecovery identifies one historical generation without
+// authorizing a new owner, mount, namespace, or generation reservation.
+type RetainedGenerationRecovery struct {
+	Root, OwnerInstance, Build, ConfigDigest string
+	LogicalPath, OpID                        string
+}
+
+// RetainedGenerationOutcome describes only this resource, not overall service
+// quiescence or the original owner's Wait result.
+type RetainedGenerationOutcome struct {
+	State             string
+	Retired           bool
+	Forced            bool
+	Syscalls          int
+	ErrorCode         string
+	HelperMayContinue bool
+}
+
+// RetainedGenerationHelper is deliberately narrower than a mount controller:
+// it cannot register a new receipt, cancel a job, or authorize force.
+type RetainedGenerationHelper interface {
+	Status(context.Context, string) (client.Outcome, error)
+	Reclaim(context.Context, string) (UnmountLease, client.ReclaimResult, error)
+	Retire(context.Context, string, client.RetireRequest, time.Duration) (client.Outcome, error)
+}
+
+const recoveryAttemptName = "recovery-attempt.json"
+
+type generationRecoveryAttempt struct {
+	Version       int      `json:"version"`
+	Root          string   `json:"root"`
+	OwnerInstance string   `json:"owner_instance"`
+	Build         string   `json:"build"`
+	ConfigDigest  string   `json:"config_digest"`
+	OpID          string   `json:"op_id"`
+	Path          string   `json:"path"`
+	BootID        string   `json:"boot_id"`
+	FSID          [2]int32 `json:"fsid"`
+}
+
+func recoveryHold(code string) RetainedGenerationOutcome {
+	return RetainedGenerationOutcome{State: "HOLD", ErrorCode: code, HelperMayContinue: true}
+}
+
+func recoveryAttemptHold(code string) RetainedGenerationOutcome {
+	return RetainedGenerationOutcome{State: "HOLD", ErrorCode: code, HelperMayContinue: true}
+}
+
+// openRetainedGeneration opens only existing, private, anchored files. It does
+// not call reserveFUSEGeneration, mkdir, create a ledger, or allocate a nonce.
+func parseRecoveryGenerationID(id string) (string, uint64, bool) {
+	nonce, sequence, ok := strings.Cut(id, "-")
+	if !ok || len(nonce) != 32 || len(sequence) != 16 {
+		return "", 0, false
+	}
+	if b, err := hex.DecodeString(nonce); err != nil || len(b) != 16 || hex.EncodeToString(b) != nonce {
+		return "", 0, false
+	}
+	var n uint64
+	if _, err := fmt.Sscanf(sequence, "%016x", &n); err != nil || n == 0 || fmt.Sprintf("%016x", n) != sequence {
+		return "", 0, false
+	}
+	return nonce, n, true
+}
+
+func openRetainedGeneration(spec RetainedGenerationRecovery) (_ *GenerationReservation, _ observedGeneration, _ *os.File, err error) {
+	if !generationPathValid(spec.LogicalPath) || !generationPathValid(spec.Root) ||
+		spec.OwnerInstance == "" || spec.Build == "" || spec.ConfigDigest == "" ||
+		!strings.HasPrefix(spec.OpID, "fuse-") {
+		return nil, observedGeneration{}, nil, errors.New("invalid recovery identity")
+	}
+	rel, relErr := filepath.Rel(spec.Root, spec.LogicalPath)
+	if relErr != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+		return nil, observedGeneration{}, nil, errors.New("generation outside recovery root")
+	}
+	id := strings.TrimPrefix(spec.OpID, "fuse-")
+	nonce, seq, ok := parseRecoveryGenerationID(id)
+	if !ok {
+		return nil, observedGeneration{}, nil, errors.New("invalid generation operation")
+	}
+	rootPath := spec.LogicalPath + ".generations"
+	path := filepath.Join(rootPath, nonce, fmt.Sprintf("%016x", seq), "mount")
+	if FUSEHelperOpID(path) != spec.OpID {
+		return nil, observedGeneration{}, nil, errors.New("operation does not name generation")
+	}
+	parent, _, err := openGenerationAncestors(filepath.Dir(spec.LogicalPath))
+	if err != nil {
+		return nil, observedGeneration{}, nil, err
+	}
+	defer parent.Close()
+	rootName := filepath.Base(rootPath)
+	fd, err := unix.Openat(int(parent.Fd()), rootName, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, observedGeneration{}, nil, err
+	}
+	r := &GenerationReservation{LogicalPath: spec.LogicalPath, Path: path, ID: id, rootPath: rootPath, root: os.NewFile(uintptr(fd), rootPath)}
+	defer func() {
+		if err != nil {
+			r.close()
+		}
+	}()
+	if err = generationPrivateDir(r.root); err != nil {
+		return nil, observedGeneration{}, nil, err
+	}
+	if err = checkGenerationAnchor(parent, r.root, rootName, spec.LogicalPath, rootPath, false); err != nil {
+		return nil, observedGeneration{}, nil, err
+	}
+	r.lock, err = privatefile.OpenAt(r.root, "ledger.lock", os.O_RDWR, 0)
+	if err != nil {
+		return nil, observedGeneration{}, nil, err
+	}
+	if err = privateGenerationRecoveryFile(r.lock, 0); err != nil {
+		return nil, observedGeneration{}, nil, err
+	}
+	if err = unix.Flock(int(r.lock.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		return nil, observedGeneration{}, nil, errors.New("generation lifetime held")
+	}
+	r.ledger, err = privatefile.OpenAt(r.root, "ledger.jsonl", os.O_RDWR, 0)
+	if err != nil {
+		return nil, observedGeneration{}, nil, err
+	}
+	if err = privateGenerationRecoveryFile(r.ledger, 4<<20); err != nil {
+		return nil, observedGeneration{}, nil, err
+	}
+	events, err := generationEvents(r.ledger)
+	if err != nil {
+		return nil, observedGeneration{}, nil, err
+	}
+	if events[0].LogicalPath != spec.LogicalPath || events[0].Nonce != nonce {
+		return nil, observedGeneration{}, nil, errors.New("generation installation mismatch")
+	}
+	states := make(map[string]string)
+	var intent, ready generationEvent
+	for _, e := range events[1:] {
+		enonce, _, valid := parseRecoveryGenerationID(e.ID)
+		if !valid || enonce != nonce {
+			return nil, observedGeneration{}, nil, errors.New("generation ledger ID mismatch")
+		}
+		prior := states[e.ID]
+		transition := (prior == "" && e.State == "intent") ||
+			(prior == "intent" && e.State == "ready") ||
+			(prior == "ready" && (e.State == "launching" || e.State == "retired")) ||
+			(prior == "launching" && (e.State == "born" || e.State == "retired")) ||
+			(prior == "born" && (e.State == "custody" || e.State == "retired")) ||
+			(prior == "custody" && e.State == "retired")
+		if !transition {
+			return nil, observedGeneration{}, nil, errors.New("generation ledger transition invalid")
+		}
+		states[e.ID] = e.State
+		if e.ID == id {
+			if e.State == "intent" {
+				intent = e
+			}
+			if e.State == "ready" {
+				ready = e
+			}
+		}
+	}
+	if states[id] == "" || intent.State != "intent" || ready.State != "ready" ||
+		intent.Path != path || ready.Path != path || intent.BootID == "" || ready.BootID != intent.BootID ||
+		len(intent.ConfigDigest) != 64 {
+		return nil, observedGeneration{}, nil, errors.New("exact generation intent unavailable")
+	}
+	// This digest is over the original FUSEConfig (including fields not
+	// persisted in serving desired); it is distinct from the owner config
+	// digest. Validate its encoding, while anchored path, ledger ID, boot,
+	// and observed FSID provide the exact resource identity.
+	if b, decodeErr := hex.DecodeString(intent.ConfigDigest); decodeErr != nil || len(b) != 32 || hex.EncodeToString(b) != intent.ConfigDigest {
+		return nil, observedGeneration{}, nil, errors.New("generation config digest invalid")
+	}
+	if states[id] == "retired" {
+		return nil, observedGeneration{}, nil, errors.New("generation already retired")
+	}
+	names, err := generationNames(r.root)
+	if err != nil {
+		return nil, observedGeneration{}, nil, err
+	}
+	for _, name := range names {
+		if name != "ledger.lock" && name != "ledger.jsonl" && name != nonce {
+			return nil, observedGeneration{}, nil, errors.New("untracked generation root entry")
+		}
+	}
+	installFD, err := unix.Openat(int(r.root.Fd()), nonce, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, observedGeneration{}, nil, err
+	}
+	install := os.NewFile(uintptr(installFD), nonce)
+	if err = generationPrivateDir(install); err != nil {
+		install.Close()
+		return nil, observedGeneration{}, nil, err
+	}
+	genNames, err := generationNames(install)
+	if err != nil {
+		install.Close()
+		return nil, observedGeneration{}, nil, err
+	}
+	seen := make(map[string]bool)
+	for _, name := range genNames {
+		priorID := nonce + "-" + name
+		if states[priorID] == "" {
+			install.Close()
+			return nil, observedGeneration{}, nil, errors.New("untracked generation directory")
+		}
+		seen[priorID] = true
+	}
+	for priorID, state := range states {
+		if !seen[priorID] || (priorID != id && state != "retired") {
+			install.Close()
+			return nil, observedGeneration{}, nil, errors.New("other generation unresolved")
+		}
+	}
+	if err := verifyPrivateObservedSidecar(install, id); err != nil {
+		install.Close()
+		return nil, observedGeneration{}, nil, err
+	}
+	og, ok := readObservedSidecar(install, nonce, id)
+	if !ok || og.path != path || og.boot != intent.BootID || og.fsid == [2]int32{} {
+		install.Close()
+		return nil, observedGeneration{}, nil, errors.New("generation observed sidecar mismatch")
+	}
+	r.bootID = og.boot
+	// Opening the mounted leaf could enter its data plane. Verify all saved
+	// parents except the leaf now; the leaf is checked after retirement.
+	fd2, ids, err := openGenerationAncestors(filepath.Dir(path))
+	if err != nil {
+		install.Close()
+		return nil, observedGeneration{}, nil, err
+	}
+	fd2.Close()
+	if len(ready.Parents) != len(ids)+1 {
+		install.Close()
+		return nil, observedGeneration{}, nil, errors.New("generation ancestry length changed")
+	}
+	for i := range ids {
+		if ids[i] != ready.Parents[i] {
+			install.Close()
+			return nil, observedGeneration{}, nil, errors.New("generation ancestry changed")
+		}
+	}
+	r.identities = ready.Parents
+	return r, og, install, nil
+}
+
+func verifyPrivateObservedSidecar(install *os.File, id string) error {
+	genName := id[len(id)-16:]
+	fd, err := unix.Openat(int(install.Fd()), genName, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return err
+	}
+	gen := os.NewFile(uintptr(fd), genName)
+	defer gen.Close()
+	if err := generationPrivateDir(gen); err != nil {
+		return err
+	}
+	f, err := privatefile.OpenAt(gen, observedSidecarName, os.O_RDONLY, 0)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return privateGenerationRecoveryFile(f, 4096)
+}
+
+func privateGenerationRecoveryFile(f *os.File, maxSize int64) error {
+	info, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || !info.Mode().IsRegular() || info.Mode().Perm() != 0600 || st.Nlink != 1 ||
+		int(st.Uid) != os.Geteuid() || info.Size() > maxSize {
+		return errors.New("generation recovery file is not private")
+	}
+	return nil
+}
+
+func recoverySnapshot(ctx context.Context, observe func(context.Context) (mounttable.Snapshot, error),
+	logical, root string, og observedGeneration, requireAbsent bool) error {
+	window, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	s, err := observe(window)
+	if err != nil || s.Version != 1 || s.BootID != og.boot || s.Entries == nil {
+		return errors.New("generation inventory unavailable")
+	}
+	found := false
+	for _, e := range s.Entries {
+		if !generationInventoryPathValid(e.Path) || e.Source == "" || e.Type == "" {
+			return errors.New("generation inventory incomplete")
+		}
+		under := func(p string) bool {
+			return strings.EqualFold(e.Path, p) || strings.HasPrefix(strings.ToLower(e.Path), strings.ToLower(p)+"/")
+		}
+		if under(logical) || under(root) || e.FSID == og.fsid {
+			if requireAbsent || found || e.Path != og.path || e.FSID != og.fsid || e.Type != "macfuse" {
+				return errors.New("generation namespace occupied or identity changed")
+			}
+			found = true
+		}
+	}
+	if !requireAbsent && !found {
+		return errors.New("observed generation mount absent before retirement")
+	}
+	return nil
+}
+
+func retainedRecoveryAttemptPresent(install *os.File, id string) (bool, error) {
+	genName := id[len(id)-16:]
+	fd, err := unix.Openat(int(install.Fd()), genName, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return false, err
+	}
+	gen := os.NewFile(uintptr(fd), genName)
+	defer gen.Close()
+	f, err := privatefile.OpenAt(gen, recoveryAttemptName, os.O_RDONLY, 0)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	defer f.Close()
+	if err := privateGenerationRecoveryFile(f, 4096); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func recoveryAttempt(install *os.File, id string, expected generationRecoveryAttempt) (bool, error) {
+	genName := id[len(id)-16:]
+	fd, err := unix.Openat(int(install.Fd()), genName, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return false, err
+	}
+	gen := os.NewFile(uintptr(fd), genName)
+	defer gen.Close()
+	if err := generationPrivateDir(gen); err != nil {
+		return false, err
+	}
+	f, err := privatefile.OpenAt(gen, recoveryAttemptName, os.O_RDONLY, 0)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	defer f.Close()
+	if err := privateGenerationRecoveryFile(f, 4096); err != nil {
+		return false, err
+	}
+	raw, err := io.ReadAll(io.LimitReader(f, 4097))
+	if err != nil || len(raw) == 0 || len(raw) > 4096 {
+		return false, errors.New("recovery attempt unreadable")
+	}
+	var got generationRecoveryAttempt
+	if err := json.Unmarshal(raw, &got); err != nil || got != expected {
+		return false, errors.New("recovery attempt identity mismatch")
+	}
+	return true, nil
+}
+
+func publishRecoveryAttempt(install *os.File, id string, attempt generationRecoveryAttempt) error {
+	genName := id[len(id)-16:]
+	fd, err := unix.Openat(int(install.Fd()), genName, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return err
+	}
+	gen := os.NewFile(uintptr(fd), genName)
+	defer gen.Close()
+	if err := generationPrivateDir(gen); err != nil {
+		return err
+	}
+	raw, err := json.Marshal(attempt)
+	if err != nil {
+		return err
+	}
+	f, err := privatefile.OpenAt(gen, recoveryAttemptName, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if err != nil {
+		return err
+	}
+	if n, e := f.Write(append(raw, '\n')); e != nil {
+		f.Close()
+		return e
+	} else if n != len(raw)+1 {
+		f.Close()
+		return io.ErrShortWrite
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return gen.Sync()
+}
+
+// RecoverRetainedGeneration acts on exactly one previously observed, same-boot
+// generation. Its exclusive sidecar makes a lost Reclaim/Retire reply a HOLD on
+// rerun; only an independently observed clean RETIRED helper state may settle
+// the existing ledger. A pending helper job can outlive this call.
+func RecoverRetainedGeneration(ctx context.Context, spec RetainedGenerationRecovery,
+	h RetainedGenerationHelper, observe func(context.Context) (mounttable.Snapshot, error)) RetainedGenerationOutcome {
+	if h == nil || observe == nil {
+		return recoveryHold("helper_or_observer_unavailable")
+	}
+	r, og, install, err := openRetainedGeneration(spec)
+	if err != nil {
+		return recoveryHold("generation_identity_unavailable")
+	}
+	defer r.close()
+	defer install.Close()
+	attempt := generationRecoveryAttempt{Version: 1, Root: spec.Root, OwnerInstance: spec.OwnerInstance,
+		Build: spec.Build, ConfigDigest: spec.ConfigDigest, OpID: spec.OpID, Path: og.path, BootID: og.boot, FSID: og.fsid}
+	attempted, err := recoveryAttempt(install, r.ID, attempt)
+	if err != nil {
+		return recoveryAttemptHold("attempt_identity_unavailable")
+	}
+	sctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	status, err := h.Status(sctx, spec.OpID)
+	cancel()
+	if err != nil || status.OpID != spec.OpID || status.Forced || status.Err != "" || len(status.Anomaly) != 0 || len(status.Descendants) != 0 {
+		if attempted {
+			return recoveryAttemptHold("helper_status_unknown_or_unsafe")
+		}
+		return recoveryHold("helper_status_unknown_or_unsafe")
+	}
+	if status.State != "RETIRED" {
+		if attempted {
+			return recoveryAttemptHold("previous_helper_attempt_uncertain")
+		}
+		if status.State != "REGISTERED" {
+			return recoveryHold("helper_not_registered")
+		}
+		if err := recoverySnapshot(ctx, observe, spec.LogicalPath, r.rootPath, og, false); err != nil {
+			return recoveryHold("pre_retirement_inventory_unavailable")
+		}
+		if err := publishRecoveryAttempt(install, r.ID, attempt); err != nil {
+			return recoveryHold("attempt_publication_uncertain")
+		}
+		// No helper request precedes the fsynced identity-bound attempt.
+		rctx, rcancel := context.WithTimeout(ctx, priorResolveWait+5*time.Second)
+		defer rcancel()
+		lease, res, err := h.Reclaim(rctx, spec.OpID)
+		if err != nil {
+			return recoveryAttemptHold("reclaim_outcome_unknown")
+		}
+		if lease == nil {
+			return recoveryAttemptHold("reclaim_without_lease")
+		}
+		defer lease.Close()
+		if !res.Reclaimed || res.Outcome.OpID != spec.OpID ||
+			res.Outcome.State != "REGISTERED" || res.Outcome.Forced || res.Outcome.Err != "" || len(res.Outcome.Anomaly) != 0 || len(res.Outcome.Descendants) != 0 {
+			return recoveryAttemptHold("reclaim_not_ordinary_or_live_owner")
+		}
+		status, err = h.Retire(rctx, spec.OpID, client.RetireRequest{Liveness: client.LivenessUnknown}, priorResolveWait)
+		if err != nil || status.OpID != spec.OpID {
+			return recoveryAttemptHold("retire_outcome_unknown_helper_may_continue")
+		}
+	}
+	result := RetainedGenerationOutcome{State: "HELPER_RETIRED_LOCAL_SETTLEMENT_PENDING",
+		Forced: status.Forced, Syscalls: status.Syscalls}
+	if status.State != "RETIRED" || status.Forced || status.Err != "" || len(status.Anomaly) != 0 || len(status.Descendants) != 0 {
+		result.State, result.ErrorCode = "HOLD", "helper_not_cleanly_retired"
+		result.HelperMayContinue = status.State != "RETIRED"
+		return result
+	}
+	if err := recoverySnapshot(ctx, observe, spec.LogicalPath, r.rootPath, og, true); err != nil {
+		result.ErrorCode = "post_retirement_inventory_unavailable"
+		return result
+	}
+	if err := r.verifyAncestry(); err != nil {
+		result.ErrorCode = "post_retirement_ancestry_changed"
+		return result
+	}
+	if err := r.append(generationEvent{State: "retired", Path: og.path, BootID: og.boot}); err != nil {
+		result.ErrorCode = "ledger_settlement_uncertain"
+		return result
+	}
+	result.State, result.Retired = "RECOVERED_RESOURCE_RETIRED", true
+	return result
 }

@@ -429,6 +429,9 @@ func runServingProcess(args []string) error {
 // owns the Go engine. Service-process death/reboot still requires the broker's
 // durable reconciliation; this boundary protects against GUI death only.
 func main() {
+	if isRetainedGenerationRecoveryCommand(os.Args[1:]) {
+		os.Exit(runRetainedGenerationRecovery(os.Args[1:], os.Stdout, os.Geteuid() == 0, serviceClientBuild))
+	}
 	if isUnmountOperationStatusCommand(os.Args[1:]) {
 		os.Exit(runUnmountOperationStatusCommand(os.Args[1:], os.Stdout, os.Stderr))
 	}
