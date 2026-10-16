@@ -19,6 +19,8 @@ import (
 )
 
 const retainedRecoveryFlag = "--recover-retained-generation"
+const retainedRecoveryEjectFlag = "--eject-now"
+const retainedRecoveryWithdrawFlag = "--withdraw"
 
 type retainedRecoveryReport struct {
 	SchemaVersion           int    `json:"schema_version"`
@@ -27,6 +29,7 @@ type retainedRecoveryReport struct {
 	OpID                    string `json:"op_id,omitempty"`
 	State                   string `json:"state"`
 	Retired                 bool   `json:"retired"`
+	Withdrawn               bool   `json:"withdrawn"`
 	Forced                  bool   `json:"forced"`
 	Syscalls                int    `json:"syscalls"`
 	ErrorCode               string `json:"error_code,omitempty"`
@@ -114,7 +117,8 @@ func recoveryOwnerAbsent(scope appisolation.Scope, desired servingDesiredRecord,
 
 func runRetainedGenerationRecovery(args []string, stdout io.Writer, root bool, serviceBuild bool) int {
 	r := retainedRecoveryReport{SchemaVersion: 1, SourceCommit: version.Commit, State: "HOLD"}
-	if len(args) != 5 || args[0] != retainedRecoveryFlag || args[1] == "" ||
+	if (len(args) != 5 && len(args) != 6) || args[0] != retainedRecoveryFlag ||
+		(len(args) == 6 && args[5] != retainedRecoveryEjectFlag && args[5] != retainedRecoveryWithdrawFlag) || args[1] == "" ||
 		args[2] == "" || args[3] == "" || args[4] == "" || !client.ValidOpID(args[4]) {
 		r.ErrorCode = "invalid_arguments"
 		return writeRetainedRecoveryReport(stdout, r, 2)
@@ -191,11 +195,13 @@ func runRetainedGenerationRecovery(args []string, stdout io.Writer, root bool, s
 	result := recoverRetainedGeneration(context.Background(), health.RetainedGenerationRecovery{
 		Root: scope.Root, OwnerInstance: intent.Instance, Build: intent.Build, ConfigDigest: intent.ConfigDigest,
 		LogicalPath: desired.Config.FUSEPath, OpID: args[4],
+		Withdraw: len(args) == 6 && args[5] == retainedRecoveryWithdrawFlag,
+		EjectNow: len(args) == 6 && args[5] == retainedRecoveryEjectFlag,
 	}, helper, observeRetainedGeneration)
-	r.State, r.Retired, r.Forced, r.Syscalls, r.ErrorCode =
-		result.State, result.Retired, result.Forced, result.Syscalls, result.ErrorCode
+	r.State, r.Retired, r.Withdrawn, r.Forced, r.Syscalls, r.ErrorCode =
+		result.State, result.Retired, result.Withdrawn, result.Forced, result.Syscalls, result.ErrorCode
 	r.HelperMayContinue = result.HelperMayContinue
-	if !result.Retired {
+	if !result.Retired && !result.Withdrawn {
 		return writeRetainedRecoveryReport(stdout, r, 1)
 	}
 	return writeRetainedRecoveryReport(stdout, r, 0)

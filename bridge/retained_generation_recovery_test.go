@@ -36,6 +36,8 @@ func TestRetainedRecoveryRejectsArgumentsRootAndProductionBeforeHelper(t *testin
 		code string
 	}{
 		{"arguments", []string{retainedRecoveryFlag}, false, "invalid_arguments"},
+		{"both-stages", append(append([]string{}, valid...), retainedRecoveryWithdrawFlag, retainedRecoveryEjectFlag), false, "invalid_arguments"},
+		{"unknown-stage", append(append([]string{}, valid...), "--unknown"), false, "invalid_arguments"},
 		{"root", valid, true, "root_not_allowed"},
 		{"production", valid, false, "isolation_mismatch"},
 	} {
@@ -188,7 +190,10 @@ func TestRetainedRecoveryAdmitsExactHistoricalStoppedResourceOnly(t *testing.T) 
 			spec.ConfigDigest != intent.ConfigDigest || spec.LogicalPath != cfg.FUSEPath {
 			t.Fatalf("wrong historical handoff: %+v", spec)
 		}
-		return health.RetainedGenerationOutcome{State: "RECOVERED_RESOURCE_RETIRED", Retired: true, Syscalls: 1}
+		if spec.Withdraw {
+			return health.RetainedGenerationOutcome{State: "RECOVERED_RESOURCE_WITHDRAWN", Withdrawn: true}
+		}
+		return health.RetainedGenerationOutcome{State: "RECOVERED_RESOURCE_RETIRED", Retired: true, Forced: spec.EjectNow, Syscalls: 1}
 	}
 	newRetainedGenerationClient = func() (health.RetainedGenerationHelper, func()) {
 		return retainedGenerationClient{}, func() {}
@@ -211,6 +216,23 @@ func TestRetainedRecoveryAdmitsExactHistoricalStoppedResourceOnly(t *testing.T) 
 	}
 	if _, err := os.Lstat(filepath.Join(root, ownerRetirementLeaf(intent))); !os.IsNotExist(err) {
 		t.Fatalf("recovery manufactured owner retirement: %v", err)
+	}
+	for _, tc := range []struct {
+		flag              string
+		withdrawn, forced bool
+	}{
+		{retainedRecoveryWithdrawFlag, true, false},
+		{retainedRecoveryEjectFlag, false, true},
+	} {
+		out.Reset()
+		args := []string{retainedRecoveryFlag, root, intent.Instance, intent.Build, op, tc.flag}
+		if exit := runRetainedGenerationRecovery(args, &out, false, false); exit != 0 {
+			t.Fatalf("%s flag not dispatched: exit=%d report=%s", tc.flag, exit, out.String())
+		}
+		if err := json.Unmarshal(out.Bytes(), &report); err != nil || report.Withdrawn != tc.withdrawn || report.Forced != tc.forced ||
+			report.WholeServiceQuiescent || report.OriginalOwnerWaitProven {
+			t.Fatalf("%s report: %+v %v", tc.flag, report, err)
+		}
 	}
 }
 

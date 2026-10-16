@@ -914,6 +914,8 @@ func (r *GenerationReservation) resolvePriorWithHelper(id string, og observedGen
 type RetainedGenerationRecovery struct {
 	Root, OwnerInstance, Build, ConfigDigest string
 	LogicalPath, OpID                        string
+	Withdraw                                 bool
+	EjectNow                                 bool
 }
 
 // RetainedGenerationOutcome describes only this resource, not overall service
@@ -921,21 +923,28 @@ type RetainedGenerationRecovery struct {
 type RetainedGenerationOutcome struct {
 	State             string
 	Retired           bool
+	Withdrawn         bool
 	Forced            bool
 	Syscalls          int
 	ErrorCode         string
 	HelperMayContinue bool
 }
 
-// RetainedGenerationHelper is deliberately narrower than a mount controller:
-// it cannot register a new receipt, cancel a job, or authorize force.
+// RetainedGenerationHelper cannot register a new receipt. Cancel and force
+// are reachable only through the two explicit, durable staged modes below.
 type RetainedGenerationHelper interface {
 	Status(context.Context, string) (client.Outcome, error)
 	Reclaim(context.Context, string) (UnmountLease, client.ReclaimResult, error)
+	Cancel(context.Context, string) (client.Outcome, error)
 	Retire(context.Context, string, client.RetireRequest, time.Duration) (client.Outcome, error)
 }
 
-const recoveryAttemptName = "recovery-attempt.json"
+const (
+	recoveryAttemptName          = "recovery-attempt.json"
+	recoveryEjectAttemptName     = "recovery-eject-attempt.json"
+	recoveryWithdrawAttemptName  = "recovery-withdraw-attempt.json"
+	recoveryWithdrawCompleteName = "recovery-withdraw-complete.json"
+)
 
 type generationRecoveryAttempt struct {
 	Version       int      `json:"version"`
@@ -1235,7 +1244,7 @@ func retainedRecoveryAttemptPresent(install *os.File, id string) (bool, error) {
 	return true, nil
 }
 
-func recoveryAttempt(install *os.File, id string, expected generationRecoveryAttempt) (bool, error) {
+func recoveryAttemptNamed(install *os.File, id, name string, expected generationRecoveryAttempt) (bool, error) {
 	genName := id[len(id)-16:]
 	fd, err := unix.Openat(int(install.Fd()), genName, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
@@ -1246,7 +1255,7 @@ func recoveryAttempt(install *os.File, id string, expected generationRecoveryAtt
 	if err := generationPrivateDir(gen); err != nil {
 		return false, err
 	}
-	f, err := privatefile.OpenAt(gen, recoveryAttemptName, os.O_RDONLY, 0)
+	f, err := privatefile.OpenAt(gen, name, os.O_RDONLY, 0)
 	if errors.Is(err, os.ErrNotExist) {
 		return false, nil
 	}
@@ -1268,7 +1277,7 @@ func recoveryAttempt(install *os.File, id string, expected generationRecoveryAtt
 	return true, nil
 }
 
-func publishRecoveryAttempt(install *os.File, id string, attempt generationRecoveryAttempt) error {
+func publishRecoveryAttemptNamed(install *os.File, id, name string, attempt generationRecoveryAttempt) error {
 	genName := id[len(id)-16:]
 	fd, err := unix.Openat(int(install.Fd()), genName, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
@@ -1283,7 +1292,7 @@ func publishRecoveryAttempt(install *os.File, id string, attempt generationRecov
 	if err != nil {
 		return err
 	}
-	f, err := privatefile.OpenAt(gen, recoveryAttemptName, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	f, err := privatefile.OpenAt(gen, name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
 	if err != nil {
 		return err
 	}
@@ -1321,9 +1330,12 @@ func RecoverRetainedGeneration(ctx context.Context, spec RetainedGenerationRecov
 	defer install.Close()
 	attempt := generationRecoveryAttempt{Version: 1, Root: spec.Root, OwnerInstance: spec.OwnerInstance,
 		Build: spec.Build, ConfigDigest: spec.ConfigDigest, OpID: spec.OpID, Path: og.path, BootID: og.boot, FSID: og.fsid}
-	attempted, err := recoveryAttempt(install, r.ID, attempt)
+	attempted, err := recoveryAttemptNamed(install, r.ID, recoveryAttemptName, attempt)
 	if err != nil {
 		return recoveryAttemptHold("attempt_identity_unavailable")
+	}
+	if spec.Withdraw || spec.EjectNow {
+		return recoverRetainedGenerationStaged(ctx, spec, h, observe, r, og, install, attempt, attempted)
 	}
 	sctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	status, err := h.Status(sctx, spec.OpID)
@@ -1344,7 +1356,7 @@ func RecoverRetainedGeneration(ctx context.Context, spec RetainedGenerationRecov
 		if err := recoverySnapshot(ctx, observe, spec.LogicalPath, r.rootPath, og, false); err != nil {
 			return recoveryHold("pre_retirement_inventory_unavailable")
 		}
-		if err := publishRecoveryAttempt(install, r.ID, attempt); err != nil {
+		if err := publishRecoveryAttemptNamed(install, r.ID, recoveryAttemptName, attempt); err != nil {
 			return recoveryHold("attempt_publication_uncertain")
 		}
 		// No helper request precedes the fsynced identity-bound attempt.
@@ -1373,6 +1385,188 @@ func RecoverRetainedGeneration(ctx context.Context, spec RetainedGenerationRecov
 		result.State, result.ErrorCode = "HOLD", "helper_not_cleanly_retired"
 		result.HelperMayContinue = status.State != "RETIRED"
 		return result
+	}
+	if err := recoverySnapshot(ctx, observe, spec.LogicalPath, r.rootPath, og, true); err != nil {
+		result.ErrorCode = "post_retirement_inventory_unavailable"
+		return result
+	}
+	if err := r.verifyAncestry(); err != nil {
+		result.ErrorCode = "post_retirement_ancestry_changed"
+		return result
+	}
+	if err := r.append(generationEvent{State: "retired", Path: og.path, BootID: og.boot}); err != nil {
+		result.ErrorCode = "ledger_settlement_uncertain"
+		return result
+	}
+	result.State, result.Retired = "RECOVERED_RESOURCE_RETIRED", true
+	return result
+}
+
+// Staged recovery never infers live ownership from the old owner's record or
+// Reclaimed (which describes only the helper's orphan timer). Each mutation
+// follows an fsynced, identity-bound, exclusive attempt marker.
+func recoverRetainedGenerationStaged(ctx context.Context, spec RetainedGenerationRecovery,
+	h RetainedGenerationHelper, observe func(context.Context) (mounttable.Snapshot, error),
+	r *GenerationReservation, og observedGeneration, install *os.File,
+	attempt generationRecoveryAttempt, ordinaryAttempted bool) RetainedGenerationOutcome {
+	if spec.Withdraw == spec.EjectNow || !ordinaryAttempted {
+		return recoveryHold("ordinary_attempt_required_for_stage")
+	}
+	withdrawAttempted, err := recoveryAttemptNamed(install, r.ID, recoveryWithdrawAttemptName, attempt)
+	if err != nil {
+		return recoveryAttemptHold("withdraw_attempt_identity_unavailable")
+	}
+	withdrawComplete, err := recoveryAttemptNamed(install, r.ID, recoveryWithdrawCompleteName, attempt)
+	if err != nil {
+		return recoveryAttemptHold("withdraw_complete_identity_unavailable")
+	}
+	ejectAttempted, err := recoveryAttemptNamed(install, r.ID, recoveryEjectAttemptName, attempt)
+	if err != nil {
+		return recoveryAttemptHold("eject_attempt_identity_unavailable")
+	}
+	if spec.EjectNow && (!withdrawAttempted || !withdrawComplete) {
+		return recoveryAttemptHold("withdraw_complete_required_for_eject")
+	}
+	if spec.Withdraw && (withdrawComplete || ejectAttempted) {
+		return recoveryAttemptHold("withdrawal_already_completed")
+	}
+	status, err := stagedRecoveryStatus(ctx, h, spec.OpID)
+	if err != nil || !stagedRecoveryOutcome(status, spec.OpID, status.State == "RETIRED" && spec.EjectNow && ejectAttempted) {
+		return recoveryAttemptHold("helper_status_unknown_or_unsafe")
+	}
+	if status.State == "RETIRED" {
+		if status.Forced && !ejectAttempted {
+			return recoveryAttemptHold("forced_retirement_without_eject_attempt")
+		}
+		return settleRetainedGeneration(ctx, spec, observe, r, og, status)
+	}
+	if (spec.Withdraw && withdrawAttempted) || (spec.EjectNow && ejectAttempted) {
+		return recoveryAttemptHold("previous_stage_attempt_uncertain")
+	}
+	if spec.Withdraw {
+		if status.State != "REGISTERED" && status.State != "BACKOFF" {
+			return recoveryAttemptHold("withdraw_precondition_unavailable")
+		}
+	} else if status.State != "REGISTERED" || status.HoldersStale || len(status.Holders) != 0 {
+		return recoveryAttemptHold("eject_precondition_unavailable")
+	}
+	if err := recoverySnapshot(ctx, observe, spec.LogicalPath, r.rootPath, og, false); err != nil {
+		return recoveryAttemptHold("pre_stage_inventory_unavailable")
+	}
+	marker := recoveryWithdrawAttemptName
+	if spec.EjectNow {
+		marker = recoveryEjectAttemptName
+	}
+	if err := publishRecoveryAttemptNamed(install, r.ID, marker, attempt); err != nil {
+		return recoveryAttemptHold("stage_publication_uncertain")
+	}
+	rctx, cancel := context.WithTimeout(ctx, priorResolveWait+5*time.Second)
+	defer cancel()
+	lease, bound, err := h.Reclaim(rctx, spec.OpID)
+	if err != nil || lease == nil {
+		return recoveryAttemptHold("stage_reclaim_unknown")
+	}
+	defer lease.Close()
+	if !stagedLeaseAlive(lease, spec.OpID) || !stagedRecoveryOutcome(bound.Outcome, spec.OpID, false) {
+		return recoveryAttemptHold("stage_binding_unsafe")
+	}
+	if spec.Withdraw {
+		if bound.Outcome.State != "REGISTERED" && bound.Outcome.State != "BACKOFF" {
+			return recoveryAttemptHold("withdraw_binding_unsafe")
+		}
+		if !stagedLeaseAlive(lease, spec.OpID) {
+			return recoveryAttemptHold("withdraw_lease_lost")
+		}
+		cancelled, err := h.Cancel(rctx, spec.OpID)
+		if err != nil || !stagedLeaseAlive(lease, spec.OpID) || !stagedRecoveryOutcome(cancelled, spec.OpID, false) {
+			return recoveryAttemptHold("withdraw_cancel_unknown")
+		}
+		if cancelled.State == "RETIRED" {
+			return settleRetainedGeneration(ctx, spec, observe, r, og, cancelled)
+		}
+		if cancelled.State != "CANCELLED" && cancelled.State != "REGISTERED" {
+			return recoveryAttemptHold("withdraw_cancel_pending")
+		}
+		// CANCELLED can precede removal of the old job. Poll status only;
+		// never issue a second Cancel or Reclaim on an uncertain response.
+		for n := 0; n < 40; n++ {
+			if !stagedLeaseAlive(lease, spec.OpID) {
+				return recoveryAttemptHold("withdraw_lease_lost")
+			}
+			status, err = stagedRecoveryStatus(rctx, h, spec.OpID)
+			if err != nil || !stagedRecoveryOutcome(status, spec.OpID, false) {
+				return recoveryAttemptHold("withdraw_status_unknown")
+			}
+			if status.State == "RETIRED" {
+				return settleRetainedGeneration(ctx, spec, observe, r, og, status)
+			}
+			if status.State == "REGISTERED" {
+				if err := recoverySnapshot(ctx, observe, spec.LogicalPath, r.rootPath, og, false); err != nil || !stagedLeaseAlive(lease, spec.OpID) {
+					return recoveryAttemptHold("withdraw_final_inventory_unknown")
+				}
+				if err := publishRecoveryAttemptNamed(install, r.ID, recoveryWithdrawCompleteName, attempt); err != nil {
+					return recoveryAttemptHold("withdraw_complete_publication_uncertain")
+				}
+				return RetainedGenerationOutcome{State: "RECOVERED_RESOURCE_WITHDRAWN", Withdrawn: true, HelperMayContinue: true}
+			}
+			if status.State != "CANCELLED" {
+				return recoveryAttemptHold("withdraw_not_completed")
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		return recoveryAttemptHold("withdraw_status_timeout")
+	}
+	if bound.Outcome.State != "REGISTERED" || bound.Outcome.HoldersStale || len(bound.Outcome.Holders) != 0 {
+		return recoveryAttemptHold("eject_binding_unsafe")
+	}
+	status, err = stagedRecoveryStatus(rctx, h, spec.OpID)
+	if err != nil || !stagedLeaseAlive(lease, spec.OpID) || !stagedRecoveryOutcome(status, spec.OpID, false) ||
+		status.State != "REGISTERED" || status.HoldersStale || len(status.Holders) != 0 {
+		return recoveryAttemptHold("eject_postbinding_unsafe")
+	}
+	if err := recoverySnapshot(rctx, observe, spec.LogicalPath, r.rootPath, og, false); err != nil || !stagedLeaseAlive(lease, spec.OpID) {
+		return recoveryAttemptHold("eject_postbinding_inventory_unknown")
+	}
+	status, err = h.Retire(rctx, spec.OpID, client.RetireRequest{Liveness: client.LivenessUnknown, EjectNow: true}, priorResolveWait)
+	if err != nil || !stagedLeaseAlive(lease, spec.OpID) || !stagedRecoveryOutcome(status, spec.OpID, true) {
+		return recoveryAttemptHold("eject_retire_unknown")
+	}
+	if status.State != "RETIRED" {
+		return recoveryAttemptHold("eject_retire_pending")
+	}
+	return settleRetainedGeneration(ctx, spec, observe, r, og, status)
+}
+
+func stagedLeaseAlive(lease UnmountLease, op string) bool {
+	if lease == nil || lease.OpID() != op || lease.Err() != nil {
+		return false
+	}
+	select {
+	case <-lease.Lost():
+		return false
+	default:
+		return true
+	}
+}
+
+func stagedRecoveryStatus(ctx context.Context, h RetainedGenerationHelper, op string) (client.Outcome, error) {
+	sctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	return h.Status(sctx, op)
+}
+
+func stagedRecoveryOutcome(out client.Outcome, op string, allowForced bool) bool {
+	return out.OpID == op && (!out.Forced || allowForced) && out.Err == "" &&
+		len(out.Anomaly) == 0 && len(out.Descendants) == 0
+}
+
+func settleRetainedGeneration(ctx context.Context, spec RetainedGenerationRecovery,
+	observe func(context.Context) (mounttable.Snapshot, error), r *GenerationReservation,
+	og observedGeneration, status client.Outcome) RetainedGenerationOutcome {
+	result := RetainedGenerationOutcome{State: "HELPER_RETIRED_LOCAL_SETTLEMENT_PENDING",
+		Forced: status.Forced, Syscalls: status.Syscalls}
+	if status.State != "RETIRED" || !stagedRecoveryOutcome(status, spec.OpID, spec.EjectNow) {
+		return recoveryAttemptHold("helper_not_cleanly_retired")
 	}
 	if err := recoverySnapshot(ctx, observe, spec.LogicalPath, r.rootPath, og, true); err != nil {
 		result.ErrorCode = "post_retirement_inventory_unavailable"
