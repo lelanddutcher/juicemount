@@ -1,0 +1,394 @@
+{
+  "fixture_version": 1,
+  "synthetic_test_vector": true,
+  "source_commit": "d1325199d7702fe1e74dd4804737336f5cd8b5ec",
+  "contract_sha256": "d96018ea6e86c65559c4460507a4d08ed4ef3a2e1b59263e0508e43a9e9e8787",
+  "legacy_fixture_sha256": "b3a8ea849648c6568b46d28f31d8bfa9f8e320eb6df0141fdcbb5e434117e55e",
+  "library_id": "lib_000102030405060708090a0b0c0d0e0f",
+  "policy_event_count": 4,
+  "events": [
+    {
+      "name": "synthetic_bootstrap_001",
+      "request_json": "{\"version\":1,\"library_id\":\"lib_000102030405060708090a0b0c0d0e0f\",\"operation_id\":\"synthetic_bootstrap_001\",\"administration\":\"local_owner\",\"operator_subject_id\":\"sub_11111111111111111111111111111111\",\"changes\":[{\"kind\":\"create_subject\",\"value\":{\"subject_id\":\"sub_11111111111111111111111111111111\",\"value\":{\"kind\":\"person\",\"label\":\"SYNTHETIC owner \\u003ctest\\u003e \\u0026 caf\u00e9\\u2028line\\u2029end\",\"enabled\":true}}}]}",
+      "request_hex": "7b2276657273696f6e223a312c226c6962726172795f6964223a226c69625f3030303130323033303430353036303730383039306130623063306430653066222c226f7065726174696f6e5f6964223a2273796e7468657469635f626f6f7473747261705f303031222c2261646d696e697374726174696f6e223a226c6f63616c5f6f776e6572222c226f70657261746f725f7375626a6563745f6964223a227375625f3131313131313131313131313131313131313131313131313131313131313131222c226368616e676573223a5b7b226b696e64223a226372656174655f7375626a656374222c2276616c7565223a7b227375626a6563745f6964223a227375625f3131313131313131313131313131313131313131313131313131313131313131222c2276616c7565223a7b226b696e64223a22706572736f6e222c226c6162656c223a2253594e544845544943206f776e6572205c7530303363746573745c7530303365205c753030323620636166c3a95c75323032386c696e655c7532303239656e64222c22656e61626c6564223a747275657d7d7d5d7d",
+      "request_bytes": 414,
+      "payload_sha256": "3db6e1d6c5a23afd911d2471cc84cd6f05656ba0e09ab0103ca9998949bfc71c",
+      "sequence": 1,
+      "receipt_json": "{\"version\":1,\"library_id\":\"lib_000102030405060708090a0b0c0d0e0f\",\"operation_id\":\"synthetic_bootstrap_001\",\"sequence\":1,\"payload_sha256\":\"3db6e1d6c5a23afd911d2471cc84cd6f05656ba0e09ab0103ca9998949bfc71c\",\"recorded_unix_nano\":1700000000000001001}",
+      "receipt_hex": "7b2276657273696f6e223a312c226c6962726172795f6964223a226c69625f3030303130323033303430353036303730383039306130623063306430653066222c226f7065726174696f6e5f6964223a2273796e7468657469635f626f6f7473747261705f303031222c2273657175656e6365223a312c227061796c6f61645f736861323536223a2233646236653164366335613233616664393131643234373163633834636436663035363536626130653039616230313033636139393938393439626663373163222c227265636f726465645f756e69785f6e616e6f223a313730303030303030303030303030313030317d",
+      "receipt_bytes": 244
+    },
+    {
+      "name": "synthetic_policy_002",
+      "request_json": "{\"version\":1,\"library_id\":\"lib_000102030405060708090a0b0c0d0e0f\",\"operation_id\":\"synthetic_policy_002\",\"administration\":\"local_owner\",\"operator_subject_id\":\"sub_11111111111111111111111111111111\",\"changes\":[{\"kind\":\"create_subject\",\"value\":{\"subject_id\":\"sub_22222222222222222222222222222222\",\"value\":{\"kind\":\"person\",\"label\":\"SYNTHETIC person \\\"quoted\\\" \\\\ slash\\nline\",\"enabled\":true}}},{\"kind\":\"create_subject\",\"value\":{\"subject_id\":\"sub_33333333333333333333333333333333\",\"value\":{\"kind\":\"service\",\"label\":\"SYNTHETIC service\",\"enabled\":true}}},{\"kind\":\"put_grant\",\"value\":{\"id\":\"synthetic_person_grant\",\"expected\":null,\"value\":{\"subject_id\":\"sub_22222222222222222222222222222222\",\"scope\":{\"kind\":\"library\",\"asset_id\":\"\"},\"actions\":[\"activity.record\",\"assets.discover\",\"locations.read\",\"relationships.read\",\"revisions.read\"]}}},{\"kind\":\"put_grant\",\"value\":{\"id\":\"synthetic_service_grant\",\"expected\":null,\"value\":{\"subject_id\":\"sub_33333333333333333333333333333333\",\"scope\":{\"kind\":\"asset\",\"asset_id\":\"asset_101112131415161718191a1b1c1d1e1f\"},\"actions\":[\"assets.discover\",\"revisions.read\"]}}}]}",
+      "request_hex": "7b2276657273696f6e223a312c226c6962726172795f6964223a226c69625f3030303130323033303430353036303730383039306130623063306430653066222c226f7065726174696f6e5f6964223a2273796e7468657469635f706f6c6963795f303032222c2261646d696e697374726174696f6e223a226c6f63616c5f6f776e6572222c226f70657261746f725f7375626a6563745f6964223a227375625f3131313131313131313131313131313131313131313131313131313131313131222c226368616e676573223a5b7b226b696e64223a226372656174655f7375626a656374222c2276616c7565223a7b227375626a6563745f6964223a227375625f3232323232323232323232323232323232323232323232323232323232323232222c2276616c7565223a7b226b696e64223a22706572736f6e222c226c6162656c223a2253594e54484554494320706572736f6e205c2271756f7465645c22205c5c20736c6173685c6e6c696e65222c22656e61626c6564223a747275657d7d7d2c7b226b696e64223a226372656174655f7375626a656374222c2276616c7565223a7b227375626a6563745f6964223a227375625f3333333333333333333333333333333333333333333333333333333333333333222c2276616c7565223a7b226b696e64223a2273657276696365222c226c6162656c223a2253594e5448455449432073657276696365222c22656e61626c6564223a747275657d7d7d2c7b226b696e64223a227075745f6772616e74222c2276616c7565223a7b226964223a2273796e7468657469635f706572736f6e5f6772616e74222c226578706563746564223a6e756c6c2c2276616c7565223a7b227375626a6563745f6964223a227375625f3232323232323232323232323232323232323232323232323232323232323232222c2273636f7065223a7b226b696e64223a226c696272617279222c2261737365745f6964223a22227d2c22616374696f6e73223a5b2261637469766974792e7265636f7264222c226173736574732e646973636f766572222c226c6f636174696f6e732e72656164222c2272656c6174696f6e73686970732e72656164222c227265766973696f6e732e72656164225d7d7d7d2c7b226b696e64223a227075745f6772616e74222c2276616c7565223a7b226964223a2273796e7468657469635f736572766963655f6772616e74222c226578706563746564223a6e756c6c2c2276616c7565223a7b227375626a6563745f6964223a227375625f3333333333333333333333333333333333333333333333333333333333333333222c2273636f7065223a7b226b696e64223a226173736574222c2261737365745f6964223a2261737365745f3130313131323133313431353136313731383139316131623163316431653166227d2c22616374696f6e73223a5b226173736574732e646973636f766572222c227265766973696f6e732e72656164225d7d7d7d5d7d",
+      "request_bytes": 1094,
+      "payload_sha256": "25d2a4ea62b119e61c8b35bfdda0509aeaee982515f14f3ee3ccf39d335f06e8",
+      "sequence": 2,
+      "receipt_json": "{\"version\":1,\"library_id\":\"lib_000102030405060708090a0b0c0d0e0f\",\"operation_id\":\"synthetic_policy_002\",\"sequence\":2,\"payload_sha256\":\"25d2a4ea62b119e61c8b35bfdda0509aeaee982515f14f3ee3ccf39d335f06e8\",\"recorded_unix_nano\":1700000000000001002}",
+      "receipt_hex": "7b2276657273696f6e223a312c226c6962726172795f6964223a226c69625f3030303130323033303430353036303730383039306130623063306430653066222c226f7065726174696f6e5f6964223a2273796e7468657469635f706f6c6963795f303032222c2273657175656e6365223a322c227061796c6f61645f736861323536223a2232356432613465613632623131396536316338623335626664646130353039616561656539383235313566313466336565336363663339643333356630366538222c227265636f726465645f756e69785f6e616e6f223a313730303030303030303030303030313030327d",
+      "receipt_bytes": 241
+    },
+    {
+      "name": "synthetic_policy_003",
+      "request_json": "{\"version\":1,\"library_id\":\"lib_000102030405060708090a0b0c0d0e0f\",\"operation_id\":\"synthetic_policy_003\",\"administration\":\"local_owner\",\"operator_subject_id\":\"sub_11111111111111111111111111111111\",\"changes\":[{\"kind\":\"update_subject\",\"value\":{\"subject_id\":\"sub_22222222222222222222222222222222\",\"expected\":{\"value\":{\"kind\":\"person\",\"label\":\"SYNTHETIC person \\\"quoted\\\" \\\\ slash\\nline\",\"enabled\":true},\"authorization_generation\":1,\"updated_sequence\":2},\"value\":{\"kind\":\"person\",\"label\":\"SYNTHETIC person \\\"quoted\\\" \\\\ slash\\nline\",\"enabled\":false}}},{\"kind\":\"remove_grant\",\"value\":{\"id\":\"synthetic_person_grant\",\"expected\":{\"value\":{\"subject_id\":\"sub_22222222222222222222222222222222\",\"scope\":{\"kind\":\"library\",\"asset_id\":\"\"},\"actions\":[\"activity.record\",\"assets.discover\",\"locations.read\",\"relationships.read\",\"revisions.read\"]},\"updated_sequence\":2,\"removed\":false}}},{\"kind\":\"remove_grant\",\"value\":{\"id\":\"synthetic_service_grant\",\"expected\":{\"value\":{\"subject_id\":\"sub_33333333333333333333333333333333\",\"scope\":{\"kind\":\"asset\",\"asset_id\":\"asset_101112131415161718191a1b1c1d1e1f\"},\"actions\":[\"assets.discover\",\"revisions.read\"]},\"updated_sequence\":2,\"removed\":false}}}]}",
+      "request_hex": "7b2276657273696f6e223a312c226c6962726172795f6964223a226c69625f3030303130323033303430353036303730383039306130623063306430653066222c226f7065726174696f6e5f6964223a2273796e7468657469635f706f6c6963795f303033222c2261646d696e697374726174696f6e223a226c6f63616c5f6f776e6572222c226f70657261746f725f7375626a6563745f6964223a227375625f3131313131313131313131313131313131313131313131313131313131313131222c226368616e676573223a5b7b226b696e64223a227570646174655f7375626a656374222c2276616c7565223a7b227375626a6563745f6964223a227375625f3232323232323232323232323232323232323232323232323232323232323232222c226578706563746564223a7b2276616c7565223a7b226b696e64223a22706572736f6e222c226c6162656c223a2253594e54484554494320706572736f6e205c2271756f7465645c22205c5c20736c6173685c6e6c696e65222c22656e61626c6564223a747275657d2c22617574686f72697a6174696f6e5f67656e65726174696f6e223a312c22757064617465645f73657175656e6365223a327d2c2276616c7565223a7b226b696e64223a22706572736f6e222c226c6162656c223a2253594e54484554494320706572736f6e205c2271756f7465645c22205c5c20736c6173685c6e6c696e65222c22656e61626c6564223a66616c73657d7d7d2c7b226b696e64223a2272656d6f76655f6772616e74222c2276616c7565223a7b226964223a2273796e7468657469635f706572736f6e5f6772616e74222c226578706563746564223a7b2276616c7565223a7b227375626a6563745f6964223a227375625f3232323232323232323232323232323232323232323232323232323232323232222c2273636f7065223a7b226b696e64223a226c696272617279222c2261737365745f6964223a22227d2c22616374696f6e73223a5b2261637469766974792e7265636f7264222c226173736574732e646973636f766572222c226c6f636174696f6e732e72656164222c2272656c6174696f6e73686970732e72656164222c227265766973696f6e732e72656164225d7d2c22757064617465645f73657175656e6365223a322c2272656d6f766564223a66616c73657d7d7d2c7b226b696e64223a2272656d6f76655f6772616e74222c2276616c7565223a7b226964223a2273796e7468657469635f736572766963655f6772616e74222c226578706563746564223a7b2276616c7565223a7b227375626a6563745f6964223a227375625f3333333333333333333333333333333333333333333333333333333333333333222c2273636f7065223a7b226b696e64223a226173736574222c2261737365745f6964223a2261737365745f3130313131323133313431353136313731383139316131623163316431653166227d2c22616374696f6e73223a5b226173736574732e646973636f766572222c227265766973696f6e732e72656164225d7d2c22757064617465645f73657175656e6365223a322c2272656d6f766564223a66616c73657d7d7d5d7d",
+      "request_bytes": 1168,
+      "payload_sha256": "a1fa3688a9c87e71673e5c5ac6311398578081f3bba2d34c0c401834ea58971c",
+      "sequence": 3,
+      "receipt_json": "{\"version\":1,\"library_id\":\"lib_000102030405060708090a0b0c0d0e0f\",\"operation_id\":\"synthetic_policy_003\",\"sequence\":3,\"payload_sha256\":\"a1fa3688a9c87e71673e5c5ac6311398578081f3bba2d34c0c401834ea58971c\",\"recorded_unix_nano\":1700000000000001003}",
+      "receipt_hex": "7b2276657273696f6e223a312c226c6962726172795f6964223a226c69625f3030303130323033303430353036303730383039306130623063306430653066222c226f7065726174696f6e5f6964223a2273796e7468657469635f706f6c6963795f303033222c2273657175656e6365223a332c227061796c6f61645f736861323536223a2261316661333638386139633837653731363733653563356163363331313339383537383038316633626261326433346330633430313833346561353839373163222c227265636f726465645f756e69785f6e616e6f223a313730303030303030303030303030313030337d",
+      "receipt_bytes": 241
+    },
+    {
+      "name": "synthetic_policy_004",
+      "request_json": "{\"version\":1,\"library_id\":\"lib_000102030405060708090a0b0c0d0e0f\",\"operation_id\":\"synthetic_policy_004\",\"administration\":\"local_owner\",\"operator_subject_id\":\"sub_11111111111111111111111111111111\",\"changes\":[{\"kind\":\"update_subject\",\"value\":{\"subject_id\":\"sub_22222222222222222222222222222222\",\"expected\":{\"value\":{\"kind\":\"person\",\"label\":\"SYNTHETIC person \\\"quoted\\\" \\\\ slash\\nline\",\"enabled\":false},\"authorization_generation\":2,\"updated_sequence\":3},\"value\":{\"kind\":\"person\",\"label\":\"SYNTHETIC person \\\"quoted\\\" \\\\ slash\\nline\",\"enabled\":false}}},{\"kind\":\"put_grant\",\"value\":{\"id\":\"synthetic_person_grant\",\"expected\":{\"value\":{\"subject_id\":\"sub_22222222222222222222222222222222\",\"scope\":{\"kind\":\"library\",\"asset_id\":\"\"},\"actions\":[\"activity.record\",\"assets.discover\",\"locations.read\",\"relationships.read\",\"revisions.read\"]},\"updated_sequence\":3,\"removed\":true},\"value\":{\"subject_id\":\"sub_22222222222222222222222222222222\",\"scope\":{\"kind\":\"asset\",\"asset_id\":\"asset_101112131415161718191a1b1c1d1e1f\"},\"actions\":[\"assets.discover\",\"locations.read\"]}}}]}",
+      "request_hex": "7b2276657273696f6e223a312c226c6962726172795f6964223a226c69625f3030303130323033303430353036303730383039306130623063306430653066222c226f7065726174696f6e5f6964223a2273796e7468657469635f706f6c6963795f303034222c2261646d696e697374726174696f6e223a226c6f63616c5f6f776e6572222c226f70657261746f725f7375626a6563745f6964223a227375625f3131313131313131313131313131313131313131313131313131313131313131222c226368616e676573223a5b7b226b696e64223a227570646174655f7375626a656374222c2276616c7565223a7b227375626a6563745f6964223a227375625f3232323232323232323232323232323232323232323232323232323232323232222c226578706563746564223a7b2276616c7565223a7b226b696e64223a22706572736f6e222c226c6162656c223a2253594e54484554494320706572736f6e205c2271756f7465645c22205c5c20736c6173685c6e6c696e65222c22656e61626c6564223a66616c73657d2c22617574686f72697a6174696f6e5f67656e65726174696f6e223a322c22757064617465645f73657175656e6365223a337d2c2276616c7565223a7b226b696e64223a22706572736f6e222c226c6162656c223a2253594e54484554494320706572736f6e205c2271756f7465645c22205c5c20736c6173685c6e6c696e65222c22656e61626c6564223a66616c73657d7d7d2c7b226b696e64223a227075745f6772616e74222c2276616c7565223a7b226964223a2273796e7468657469635f706572736f6e5f6772616e74222c226578706563746564223a7b2276616c7565223a7b227375626a6563745f6964223a227375625f3232323232323232323232323232323232323232323232323232323232323232222c2273636f7065223a7b226b696e64223a226c696272617279222c2261737365745f6964223a22227d2c22616374696f6e73223a5b2261637469766974792e7265636f7264222c226173736574732e646973636f766572222c226c6f636174696f6e732e72656164222c2272656c6174696f6e73686970732e72656164222c227265766973696f6e732e72656164225d7d2c22757064617465645f73657175656e6365223a332c2272656d6f766564223a747275657d2c2276616c7565223a7b227375626a6563745f6964223a227375625f3232323232323232323232323232323232323232323232323232323232323232222c2273636f7065223a7b226b696e64223a226173736574222c2261737365745f6964223a2261737365745f3130313131323133313431353136313731383139316131623163316431653166227d2c22616374696f6e73223a5b226173736574732e646973636f766572222c226c6f636174696f6e732e72656164225d7d7d7d5d7d",
+      "request_bytes": 1050,
+      "payload_sha256": "82754519d1e2f0fbe0e78cfe69bf77648beb7c38b3b592fd5ea1d83e56da3cbd",
+      "sequence": 4,
+      "receipt_json": "{\"version\":1,\"library_id\":\"lib_000102030405060708090a0b0c0d0e0f\",\"operation_id\":\"synthetic_policy_004\",\"sequence\":4,\"payload_sha256\":\"82754519d1e2f0fbe0e78cfe69bf77648beb7c38b3b592fd5ea1d83e56da3cbd\",\"recorded_unix_nano\":1700000000000001004}",
+      "receipt_hex": "7b2276657273696f6e223a312c226c6962726172795f6964223a226c69625f3030303130323033303430353036303730383039306130623063306430653066222c226f7065726174696f6e5f6964223a2273796e7468657469635f706f6c6963795f303034222c2273657175656e6365223a342c227061796c6f61645f736861323536223a2238323735343531396431653266306662653065373863666536396266373736343862656237633338623362353932666435656131643833653536646133636264222c227265636f726465645f756e69785f6e616e6f223a313730303030303030303030303030313030347d",
+      "receipt_bytes": 241
+    }
+  ],
+  "checkpoints": [
+    {
+      "sequence": 1,
+      "subjects": [
+        {
+          "library_id": "lib_000102030405060708090a0b0c0d0e0f",
+          "subject_id": "sub_11111111111111111111111111111111",
+          "value": {
+            "kind": "person",
+            "label": "SYNTHETIC owner <test> & caf\u00e9\u2028line\u2029end",
+            "enabled": true
+          },
+          "authorization_generation": 1,
+          "created_sequence": 1,
+          "updated_sequence": 1
+        }
+      ],
+      "grants": []
+    },
+    {
+      "sequence": 2,
+      "subjects": [
+        {
+          "library_id": "lib_000102030405060708090a0b0c0d0e0f",
+          "subject_id": "sub_11111111111111111111111111111111",
+          "value": {
+            "kind": "person",
+            "label": "SYNTHETIC owner <test> & caf\u00e9\u2028line\u2029end",
+            "enabled": true
+          },
+          "authorization_generation": 1,
+          "created_sequence": 1,
+          "updated_sequence": 1
+        },
+        {
+          "library_id": "lib_000102030405060708090a0b0c0d0e0f",
+          "subject_id": "sub_22222222222222222222222222222222",
+          "value": {
+            "kind": "person",
+            "label": "SYNTHETIC person \"quoted\" \\ slash\nline",
+            "enabled": true
+          },
+          "authorization_generation": 1,
+          "created_sequence": 2,
+          "updated_sequence": 2
+        },
+        {
+          "library_id": "lib_000102030405060708090a0b0c0d0e0f",
+          "subject_id": "sub_33333333333333333333333333333333",
+          "value": {
+            "kind": "service",
+            "label": "SYNTHETIC service",
+            "enabled": true
+          },
+          "authorization_generation": 1,
+          "created_sequence": 2,
+          "updated_sequence": 2
+        }
+      ],
+      "grants": [
+        {
+          "library_id": "lib_000102030405060708090a0b0c0d0e0f",
+          "id": "synthetic_person_grant",
+          "value": {
+            "subject_id": "sub_22222222222222222222222222222222",
+            "scope": {
+              "kind": "library",
+              "asset_id": ""
+            },
+            "actions": [
+              "activity.record",
+              "assets.discover",
+              "locations.read",
+              "relationships.read",
+              "revisions.read"
+            ]
+          },
+          "created_sequence": 2,
+          "updated_sequence": 2,
+          "removed": false
+        },
+        {
+          "library_id": "lib_000102030405060708090a0b0c0d0e0f",
+          "id": "synthetic_service_grant",
+          "value": {
+            "subject_id": "sub_33333333333333333333333333333333",
+            "scope": {
+              "kind": "asset",
+              "asset_id": "asset_101112131415161718191a1b1c1d1e1f"
+            },
+            "actions": [
+              "assets.discover",
+              "revisions.read"
+            ]
+          },
+          "created_sequence": 2,
+          "updated_sequence": 2,
+          "removed": false
+        }
+      ]
+    },
+    {
+      "sequence": 3,
+      "subjects": [
+        {
+          "library_id": "lib_000102030405060708090a0b0c0d0e0f",
+          "subject_id": "sub_11111111111111111111111111111111",
+          "value": {
+            "kind": "person",
+            "label": "SYNTHETIC owner <test> & caf\u00e9\u2028line\u2029end",
+            "enabled": true
+          },
+          "authorization_generation": 1,
+          "created_sequence": 1,
+          "updated_sequence": 1
+        },
+        {
+          "library_id": "lib_000102030405060708090a0b0c0d0e0f",
+          "subject_id": "sub_22222222222222222222222222222222",
+          "value": {
+            "kind": "person",
+            "label": "SYNTHETIC person \"quoted\" \\ slash\nline",
+            "enabled": false
+          },
+          "authorization_generation": 2,
+          "created_sequence": 2,
+          "updated_sequence": 3
+        },
+        {
+          "library_id": "lib_000102030405060708090a0b0c0d0e0f",
+          "subject_id": "sub_33333333333333333333333333333333",
+          "value": {
+            "kind": "service",
+            "label": "SYNTHETIC service",
+            "enabled": true
+          },
+          "authorization_generation": 2,
+          "created_sequence": 2,
+          "updated_sequence": 3
+        }
+      ],
+      "grants": [
+        {
+          "library_id": "lib_000102030405060708090a0b0c0d0e0f",
+          "id": "synthetic_person_grant",
+          "value": {
+            "subject_id": "sub_22222222222222222222222222222222",
+            "scope": {
+              "kind": "library",
+              "asset_id": ""
+            },
+            "actions": [
+              "activity.record",
+              "assets.discover",
+              "locations.read",
+              "relationships.read",
+              "revisions.read"
+            ]
+          },
+          "created_sequence": 2,
+          "updated_sequence": 3,
+          "removed": true
+        },
+        {
+          "library_id": "lib_000102030405060708090a0b0c0d0e0f",
+          "id": "synthetic_service_grant",
+          "value": {
+            "subject_id": "sub_33333333333333333333333333333333",
+            "scope": {
+              "kind": "asset",
+              "asset_id": "asset_101112131415161718191a1b1c1d1e1f"
+            },
+            "actions": [
+              "assets.discover",
+              "revisions.read"
+            ]
+          },
+          "created_sequence": 2,
+          "updated_sequence": 3,
+          "removed": true
+        }
+      ]
+    },
+    {
+      "sequence": 4,
+      "subjects": [
+        {
+          "library_id": "lib_000102030405060708090a0b0c0d0e0f",
+          "subject_id": "sub_11111111111111111111111111111111",
+          "value": {
+            "kind": "person",
+            "label": "SYNTHETIC owner <test> & caf\u00e9\u2028line\u2029end",
+            "enabled": true
+          },
+          "authorization_generation": 1,
+          "created_sequence": 1,
+          "updated_sequence": 1
+        },
+        {
+          "library_id": "lib_000102030405060708090a0b0c0d0e0f",
+          "subject_id": "sub_22222222222222222222222222222222",
+          "value": {
+            "kind": "person",
+            "label": "SYNTHETIC person \"quoted\" \\ slash\nline",
+            "enabled": false
+          },
+          "authorization_generation": 3,
+          "created_sequence": 2,
+          "updated_sequence": 4
+        },
+        {
+          "library_id": "lib_000102030405060708090a0b0c0d0e0f",
+          "subject_id": "sub_33333333333333333333333333333333",
+          "value": {
+            "kind": "service",
+            "label": "SYNTHETIC service",
+            "enabled": true
+          },
+          "authorization_generation": 2,
+          "created_sequence": 2,
+          "updated_sequence": 3
+        }
+      ],
+      "grants": [
+        {
+          "library_id": "lib_000102030405060708090a0b0c0d0e0f",
+          "id": "synthetic_person_grant",
+          "value": {
+            "subject_id": "sub_22222222222222222222222222222222",
+            "scope": {
+              "kind": "asset",
+              "asset_id": "asset_101112131415161718191a1b1c1d1e1f"
+            },
+            "actions": [
+              "assets.discover",
+              "locations.read"
+            ]
+          },
+          "created_sequence": 2,
+          "updated_sequence": 4,
+          "removed": false
+        },
+        {
+          "library_id": "lib_000102030405060708090a0b0c0d0e0f",
+          "id": "synthetic_service_grant",
+          "value": {
+            "subject_id": "sub_33333333333333333333333333333333",
+            "scope": {
+              "kind": "asset",
+              "asset_id": "asset_101112131415161718191a1b1c1d1e1f"
+            },
+            "actions": [
+              "assets.discover",
+              "revisions.read"
+            ]
+          },
+          "created_sequence": 2,
+          "updated_sequence": 3,
+          "removed": true
+        }
+      ]
+    }
+  ],
+  "subjects": [
+    {
+      "library_id": "lib_000102030405060708090a0b0c0d0e0f",
+      "subject_id": "sub_11111111111111111111111111111111",
+      "value": {
+        "kind": "person",
+        "label": "SYNTHETIC owner <test> & caf\u00e9\u2028line\u2029end",
+        "enabled": true
+      },
+      "authorization_generation": 1,
+      "created_sequence": 1,
+      "updated_sequence": 1
+    },
+    {
+      "library_id": "lib_000102030405060708090a0b0c0d0e0f",
+      "subject_id": "sub_22222222222222222222222222222222",
+      "value": {
+        "kind": "person",
+        "label": "SYNTHETIC person \"quoted\" \\ slash\nline",
+        "enabled": false
+      },
+      "authorization_generation": 3,
+      "created_sequence": 2,
+      "updated_sequence": 4
+    },
+    {
+      "library_id": "lib_000102030405060708090a0b0c0d0e0f",
+      "subject_id": "sub_33333333333333333333333333333333",
+      "value": {
+        "kind": "service",
+        "label": "SYNTHETIC service",
+        "enabled": true
+      },
+      "authorization_generation": 2,
+      "created_sequence": 2,
+      "updated_sequence": 3
+    }
+  ],
+  "grants": [
+    {
+      "library_id": "lib_000102030405060708090a0b0c0d0e0f",
+      "id": "synthetic_person_grant",
+      "value": {
+        "subject_id": "sub_22222222222222222222222222222222",
+        "scope": {
+          "kind": "asset",
+          "asset_id": "asset_101112131415161718191a1b1c1d1e1f"
+        },
+        "actions": [
+          "assets.discover",
+          "locations.read"
+        ]
+      },
+      "created_sequence": 2,
+      "updated_sequence": 4,
+      "removed": false
+    },
+    {
+      "library_id": "lib_000102030405060708090a0b0c0d0e0f",
+      "id": "synthetic_service_grant",
+      "value": {
+        "subject_id": "sub_33333333333333333333333333333333",
+        "scope": {
+          "kind": "asset",
+          "asset_id": "asset_101112131415161718191a1b1c1d1e1f"
+        },
+        "actions": [
+          "assets.discover",
+          "revisions.read"
+        ]
+      },
+      "created_sequence": 2,
+      "updated_sequence": 3,
+      "removed": true
+    }
+  ]
+}

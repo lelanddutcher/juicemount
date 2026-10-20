@@ -15,6 +15,7 @@ import (
 
 const applicationID = 0x4a4d4341 // JMCA
 const schemaVersion = 2
+const authoritySchemaVersion = 3
 
 type queryer interface {
 	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
@@ -116,6 +117,19 @@ func expectedSchema() []schemaObject {
 	return objects
 }
 
+// expectedSchema remains the frozen v2 definition, including its ledger hash.
+func expectedSchemaFor(version int) []schemaObject {
+	if version == 1 {
+		return legacySchema()
+	}
+	objects := expectedSchema()
+	if version == authoritySchemaVersion {
+		objects = append(objects, authoritySchema()...)
+	}
+	sort.Slice(objects, func(i, j int) bool { return objects[i].Name < objects[j].Name })
+	return objects
+}
+
 func schemaFingerprint(objects []schemaObject) string {
 	data, _ := json.Marshal(objects)
 	digest := sha256.Sum256(data)
@@ -123,6 +137,10 @@ func schemaFingerprint(objects []schemaObject) string {
 }
 
 func initialize(ctx context.Context, db *sql.DB, library continuity.LibraryID) error {
+	return initializeVersion(ctx, db, library, schemaVersion)
+}
+
+func initializeVersion(ctx context.Context, db *sql.DB, library continuity.LibraryID, version int) error {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -134,12 +152,19 @@ func initialize(ctx context.Context, db *sql.DB, library continuity.LibraryID) e
 			tables = append(tables, object.SQL)
 		}
 	}
+	if version == authoritySchemaVersion {
+		for _, object := range authoritySchema() {
+			if object.Type == "table" {
+				tables = append(tables, object.SQL)
+			}
+		}
+	}
 	for _, ddl := range tables {
 		if _, err := tx.ExecContext(ctx, ddl); err != nil {
 			return err
 		}
 	}
-	for _, object := range expectedSchema() {
+	for _, object := range expectedSchemaFor(version) {
 		if object.Type != "table" {
 			if _, err := tx.ExecContext(ctx, object.SQL); err != nil {
 				return err
@@ -154,6 +179,14 @@ func initialize(ctx context.Context, db *sql.DB, library continuity.LibraryID) e
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations(version,fingerprint) VALUES(1,?),(2,?)`, schemaFingerprint(legacySchema()), schemaFingerprint(expectedSchema())); err != nil {
 		return err
+	}
+	if version == authoritySchemaVersion {
+		if _, err := tx.ExecContext(ctx, `PRAGMA user_version=3`); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations(version,fingerprint) VALUES(3,?)`, schemaFingerprint(expectedSchemaFor(3))); err != nil {
+			return err
+		}
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO catalog(singleton,library_id,ready) VALUES(1,?,0)`, library); err != nil {
 		return err
@@ -181,7 +214,7 @@ func recognizeSchema(ctx context.Context, q queryer, initializing bool) (continu
 	if err := q.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&version); err != nil {
 		return "", 0, formatError(err)
 	}
-	if app != applicationID || (version != 1 && version != schemaVersion) {
+	if app != applicationID || (version != 1 && version != schemaVersion && version != authoritySchemaVersion) {
 		return "", 0, corrupt("unsupported application or schema version")
 	}
 	rows, err := q.QueryContext(ctx, `SELECT type,name,tbl_name,sql FROM sqlite_schema WHERE NOT(type='index' AND substr(name,1,17)='sqlite_autoindex_' AND sql IS NULL) ORDER BY name`)
@@ -202,10 +235,7 @@ func recognizeSchema(ctx context.Context, q queryer, initializing bool) (continu
 	if err != nil {
 		return "", 0, formatError(err)
 	}
-	expected := expectedSchema()
-	if version == 1 {
-		expected = legacySchema()
-	}
+	expected := expectedSchemaFor(version)
 	if len(actual) != len(expected) {
 		return "", 0, corrupt("unexpected schema objects")
 	}
@@ -230,6 +260,9 @@ func recognizeSchema(ctx context.Context, q queryer, initializing bool) (continu
 		want := schemaFingerprint(legacySchema())
 		if entry == 2 {
 			want = schemaFingerprint(expectedSchema())
+		}
+		if entry == 3 {
+			want = schemaFingerprint(expectedSchemaFor(3))
 		}
 		if entry != ledgerCount || entry > version || fingerprint != want {
 			rows.Close()

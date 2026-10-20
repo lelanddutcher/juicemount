@@ -44,6 +44,14 @@ func Upgrade(ctx context.Context, input string, expectedLibrary continuity.Libra
 }
 
 func upgradeCatalog(ctx context.Context, input string, expectedLibrary continuity.LibraryID, directoryBarrier func(string) error) (resultErr error) {
+	return upgradeCatalogVersion(ctx, input, expectedLibrary, schemaVersion, directoryBarrier)
+}
+
+func UpgradeAuthority(ctx context.Context, input string, expectedLibrary continuity.LibraryID) error {
+	return upgradeCatalogVersion(ctx, input, expectedLibrary, authoritySchemaVersion, syncParent)
+}
+
+func upgradeCatalogVersion(ctx context.Context, input string, expectedLibrary continuity.LibraryID, target int, directoryBarrier func(string) error) (resultErr error) {
 	if expectedLibrary.Validate() != nil {
 		return invalid("expected library identity")
 	}
@@ -64,6 +72,11 @@ func upgradeCatalog(ctx context.Context, input string, expectedLibrary continuit
 	if err := checkSidecars(path); err != nil {
 		return err
 	}
+	if target == authoritySchemaVersion {
+		if err := checkPrivatePaths(path); err != nil {
+			return err
+		}
+	}
 	file, err := openRegular(path, false)
 	if err != nil {
 		return err
@@ -73,12 +86,18 @@ func upgradeCatalog(ctx context.Context, input string, expectedLibrary continuit
 			resultErr = errors.Join(resultErr, file.Close())
 		}
 	}()
-	library, _, err := snapshotCatalog(ctx, path)
+	library, initialVersion, err := snapshotCatalog(ctx, path)
 	if err != nil {
 		return err
 	}
 	if library != expectedLibrary {
 		return invalid("upgrade library mismatch")
+	}
+	if target == authoritySchemaVersion && initialVersion == 1 {
+		return ErrUpgradeRequired
+	}
+	if target == schemaVersion && initialVersion == authoritySchemaVersion {
+		return invalid("authority catalog requires explicit authority upgrade")
 	}
 	db, err := openDB(path, false)
 	if err != nil {
@@ -94,7 +113,7 @@ func upgradeCatalog(ctx context.Context, input string, expectedLibrary continuit
 		return err
 	}
 	defer tx.Rollback()
-	held := &Store{path: path, file: file}
+	held := &Store{path: path, file: file, version: target}
 	if err := held.checkPaths(); err != nil {
 		return err
 	}
@@ -104,6 +123,12 @@ func upgradeCatalog(ctx context.Context, input string, expectedLibrary continuit
 	}
 	if library != expectedLibrary {
 		return invalid("upgrade library mismatch")
+	}
+	if target == authoritySchemaVersion && version != 2 && version != 3 {
+		return ErrUpgradeRequired
+	}
+	if target == schemaVersion && version != 1 && version != 2 {
+		return ErrUpgradeRequired
 	}
 	if err := checkIntegrity(ctx, tx); err != nil {
 		return err
@@ -121,6 +146,21 @@ func upgradeCatalog(ctx context.Context, input string, expectedLibrary continuit
 		}
 		if actual != expectedLibrary || current != schemaVersion {
 			return corrupt("migration identity mismatch")
+		}
+		if err := checkIntegrity(ctx, tx); err != nil {
+			return err
+		}
+	}
+	if target == authoritySchemaVersion && version == schemaVersion {
+		if err := migrateV2(ctx, tx); err != nil {
+			return err
+		}
+		actual, current, err := recognizeSchema(ctx, tx, false)
+		if err != nil {
+			return err
+		}
+		if actual != expectedLibrary || current != authoritySchemaVersion {
+			return corrupt("authority migration identity")
 		}
 		if err := checkIntegrity(ctx, tx); err != nil {
 			return err
@@ -144,6 +184,23 @@ func upgradeCatalog(ctx context.Context, input string, expectedLibrary continuit
 		return fmt.Errorf("catalog upgrade directory barrier uncertain: %w", err)
 	}
 	return nil
+}
+
+func migrateV2(ctx context.Context, tx *sql.Tx) error {
+	for _, kind := range []string{"table", "index", "trigger"} {
+		for _, object := range authoritySchema() {
+			if object.Type == kind {
+				if _, err := tx.ExecContext(ctx, object.SQL); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations(version,fingerprint) VALUES(3,?)`, schemaFingerprint(expectedSchemaFor(3))); err != nil {
+		return err
+	}
+	_, err := tx.ExecContext(ctx, `PRAGMA user_version=3`)
+	return err
 }
 
 // The caller has validated v1 inside this same immediate transaction.

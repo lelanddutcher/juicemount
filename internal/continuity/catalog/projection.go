@@ -73,6 +73,18 @@ func walkRows(ctx context.Context, q queryer, query string, fn func(*sql.Rows) e
 func projectionTotal(ctx context.Context, q queryer) (int64, error) {
 	var count int64
 	err := q.QueryRowContext(ctx, `SELECT (SELECT count(*) FROM catalog)+(SELECT count(*) FROM assets)+(SELECT count(*) FROM revisions)+(SELECT count(*) FROM revision_parents)+(SELECT count(*) FROM relationships)+(SELECT count(*) FROM locations)`).Scan(&count)
+	if err != nil {
+		return 0, err
+	}
+	version, err := catalogVersion(ctx, q)
+	if err != nil {
+		return 0, err
+	}
+	if version == authoritySchemaVersion {
+		var policy int64
+		err = q.QueryRowContext(ctx, `SELECT (SELECT count(*) FROM policy_subjects)+(SELECT count(*) FROM policy_grants)`).Scan(&policy)
+		count += policy
+	}
 	return count, err
 }
 
@@ -80,7 +92,15 @@ func projectionTotal(ctx context.Context, q queryer) (int64, error) {
 // accumulating records. The caller owns one consistent transaction snapshot.
 func projectionDigest(ctx context.Context, q queryer, library continuity.LibraryID, maxRows int64) (string, int64, error) {
 	h := sha256.New()
-	_, _ = h.Write([]byte("juicemount.catalog.projection\x00\x01"))
+	version, err := catalogVersion(ctx, q)
+	if err != nil {
+		return "", 0, err
+	}
+	domain := "juicemount.catalog.projection\x00\x01"
+	if version == authoritySchemaVersion {
+		domain = "juicemount.catalog.projection\x00\x02"
+	}
+	_, _ = h.Write([]byte(domain))
 	var count int64
 	emit := func(kind byte, value any) error {
 		if err := ctx.Err(); err != nil {
@@ -105,7 +125,7 @@ func projectionDigest(ctx context.Context, q queryer, library continuity.Library
 	if err := emit(0x11, libraryProjection{library}); err != nil {
 		return "", 0, err
 	}
-	err := walkRows(ctx, q, `SELECT library_id,asset_id,CASE WHEN length(CAST(label AS BLOB))<=4096 THEN label END,COALESCE(head,''),created_sequence,updated_sequence FROM assets ORDER BY asset_id COLLATE BINARY`, func(rows *sql.Rows) error {
+	err = walkRows(ctx, q, `SELECT library_id,asset_id,CASE WHEN length(CAST(label AS BLOB))<=4096 THEN label END,COALESCE(head,''),created_sequence,updated_sequence FROM assets ORDER BY asset_id COLLATE BINARY`, func(rows *sql.Rows) error {
 		a, err := scanAsset(rows, library)
 		if err != nil {
 			return err
@@ -183,6 +203,26 @@ func projectionDigest(ctx context.Context, q queryer, library continuity.Library
 	})
 	if err != nil {
 		return "", 0, err
+	}
+	if version == authoritySchemaVersion {
+		if err := walkRows(ctx, q, `SELECT `+subjectColumns+` FROM policy_subjects ORDER BY subject_id COLLATE BINARY`, func(rows *sql.Rows) error {
+			sub, err := scanSubject(rows, library)
+			if err != nil {
+				return err
+			}
+			return emit(0x17, sub)
+		}); err != nil {
+			return "", 0, err
+		}
+		if err := walkRows(ctx, q, `SELECT `+grantColumns+` FROM policy_grants ORDER BY grant_id COLLATE BINARY`, func(rows *sql.Rows) error {
+			g, err := scanGrant(rows, library)
+			if err != nil {
+				return err
+			}
+			return emit(0x18, g)
+		}); err != nil {
+			return "", 0, err
+		}
 	}
 	return hex.EncodeToString(h.Sum(nil)), count, nil
 }

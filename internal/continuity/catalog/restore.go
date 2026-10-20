@@ -28,29 +28,29 @@ func restoreCatalog(ctx context.Context, path string, library continuity.Library
 	if err := input.exact(magic); err != nil {
 		return err
 	}
-	if string(magic) != streamMagic {
+	format := 1
+	if string(magic) == streamMagic2 {
+		format = 2
+	} else if string(magic) != streamMagic {
 		return corrupt("export magic")
 	}
-	h := streamHash()
+	h := streamHashFor(format)
 	_, _ = h.Write(magic)
 	headerData, err := input.frame(1, h)
 	if err != nil {
 		return err
 	}
-	var header streamHeader
-	if err := canonicalJSON(headerData, &header); err != nil {
+	header, err := decodeHeader(headerData, format, library)
+	if err != nil {
 		return err
 	}
-	if header.Version != 1 || header.SchemaVersion != schemaVersion || header.LibraryID != library || header.EventCount < 0 {
-		return corrupt("export header identity or version")
-	}
-	if header.EventCount > limits.MaxEvents {
+	if header.EventCount > limits.MaxEvents || header.PolicyEventCount > limits.MaxEvents-header.EventCount {
 		return ErrLimit
 	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	s, err := openStoreContext(ctx, path, library, true, false)
+	s, err := openStoreVersionContext(ctx, path, library, true, false, header.SchemaVersion)
 	if err != nil {
 		return err
 	}
@@ -75,21 +75,35 @@ func restoreCatalog(ctx context.Context, path string, library continuity.Library
 		}
 		projectionRows = nextRows
 	}
+	for sequence := int64(1); sequence <= header.PolicyEventCount; sequence++ {
+		payload, err := input.frame(4, h)
+		if err != nil {
+			return protocolError("restore policy event", err)
+		}
+		e, op, err := decodeStreamPolicyEvent(payload, library, sequence)
+		if err != nil {
+			return err
+		}
+		projectionRows, err = s.replayPolicyEvent(ctx, e, op, projectionRows, limits.MaxProjectionRows)
+		if err != nil {
+			return protocolError("restore policy replay", err)
+		}
+	}
 	footerData, err := input.frame(3, nil)
 	if err != nil {
 		return err
 	}
-	var footer streamFooter
-	if err := canonicalJSON(footerData, &footer); err != nil {
+	footer, err := decodeFooter(footerData, format)
+	if err != nil {
 		return err
 	}
-	if footer.EventCount != header.EventCount || footer.ProjectionRows < 1 {
+	if footer.EventCount != header.EventCount || footer.PolicyEventCount != header.PolicyEventCount || footer.ProjectionRows < 1 {
 		return corrupt("footer counts")
 	}
 	if footer.ProjectionRows > limits.MaxProjectionRows {
 		return ErrLimit
 	}
-	digest, err := finishStreamHash(h, header.EventCount, footer.ProjectionRows, footer.ProjectionSHA256)
+	digest, err := finishStreamHashFor(format, h, header.EventCount, header.PolicyEventCount, footer.ProjectionRows, footer.ProjectionSHA256)
 	if err != nil {
 		return err
 	}
@@ -122,6 +136,11 @@ func restoreCatalog(ctx context.Context, path string, library continuity.Library
 	}
 	if err := walkEvents(ctx, tx, library, header.EventCount, nil); err != nil {
 		return err
+	}
+	if format == 2 {
+		if err := walkPolicyEvents(ctx, tx, library, header.PolicyEventCount, nil); err != nil {
+			return err
+		}
 	}
 	projection, rows, err := projectionDigest(ctx, tx, library, limits.MaxProjectionRows)
 	if err != nil {

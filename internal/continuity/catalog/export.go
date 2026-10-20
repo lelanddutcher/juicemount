@@ -3,7 +3,6 @@ package catalog
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"errors"
 	"io"
 
@@ -107,24 +106,46 @@ func (s *Store) Export(ctx context.Context, library continuity.LibraryID, writer
 	if err != nil {
 		return err
 	}
+	version, err := catalogVersion(ctx, tx)
+	if err != nil {
+		return err
+	}
+	format := 1
+	var policy int64
+	if version == authoritySchemaVersion {
+		format = 2
+		policy, err = policyTotal(ctx, tx)
+		if err != nil {
+			return err
+		}
+	}
 	rows, err := projectionTotal(ctx, tx)
 	if err != nil {
 		return err
 	}
-	if count > limits.MaxEvents || rows > limits.MaxProjectionRows {
+	if count > limits.MaxEvents || policy > limits.MaxEvents-count || rows > limits.MaxProjectionRows {
 		return ErrLimit
 	}
 	output := streamOutput{ctx: ctx, w: writer, max: limits.MaxBytes}
-	h := streamHash()
-	if err := output.write([]byte(streamMagic), h); err != nil {
+	h := streamHashFor(format)
+	magic := streamMagic
+	if format == 2 {
+		magic = streamMagic2
+	}
+	if err := output.write([]byte(magic), h); err != nil {
 		return err
 	}
-	header, _ := json.Marshal(streamHeader{1, schemaVersion, library, count})
+	header := encodeHeader(format, library, count, policy)
 	if err := output.frame(1, header, h); err != nil {
 		return err
 	}
 	if err := walkEvents(ctx, tx, library, count, func(e eventRow) error { return output.frame(2, encodeEvent(e), h) }); err != nil {
 		return err
+	}
+	if format == 2 {
+		if err := walkPolicyEvents(ctx, tx, library, policy, func(e eventRow) error { return output.frame(4, encodeEvent(e), h) }); err != nil {
+			return err
+		}
 	}
 	projection, observedRows, err := projectionDigest(ctx, tx, library, limits.MaxProjectionRows)
 	if err != nil {
@@ -133,7 +154,7 @@ func (s *Store) Export(ctx context.Context, library continuity.LibraryID, writer
 	if rows != observedRows {
 		return corrupt("projection row count mismatch")
 	}
-	digest, err := finishStreamHash(h, count, rows, projection)
+	digest, err := finishStreamHashFor(format, h, count, policy, rows, projection)
 	if err != nil {
 		return err
 	}
@@ -151,7 +172,7 @@ func (s *Store) Export(ctx context.Context, library continuity.LibraryID, writer
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	footer, _ := json.Marshal(streamFooter{count, rows, projection, digest})
+	footer := encodeFooter(format, streamFooter2{count, policy, rows, projection, digest})
 	if err := output.frame(3, footer, nil); err != nil {
 		return err
 	}

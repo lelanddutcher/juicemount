@@ -2,7 +2,8 @@
 
 This internal package stores one library's asset identities, immutable revision
 declarations, selected heads, relationships, location observations and ordered metadata operations in a dedicated
-SQLite database. It has no routes, policy grants, media writes, filesystem rename
+SQLite database. Opt-in schema 3 also stores policy subjects/grants and separate
+local operational authority. It has no routes, media writes, filesystem rename
 operations, or verified/published/reachable states. A head selects a declaration;
 it does not certify the current contents of a filesystem path.
 
@@ -269,3 +270,83 @@ leave a completed target with uncertain acknowledgment. Restore succeeds only
 after closing owned resources and the final directory barrier; recovery inspects
 with Open and the exact expected library/history. A second Restore must refuse
 that destination and cannot manufacture certainty by overwriting it.
+
+Schema 3 adds local policy and bearer credentials through explicit
+`CreateAuthority(ctx,path,library)` or `UpgradeAuthority(ctx,path,expectedLibrary)`.
+Default Create and the 1→2 Upgrade retain schema 2. OpenContext recognizes exact
+schema 2 or 3; policy/authentication methods require 3. Versioned DDL fingerprints
+retain the historical v1/v2 ledger. Schema-3 files and existing SQLite sidecars
+must be regular, single-link files without group/other permission bits; unsafe
+files are refused rather than chmodded. Keep their parent directory private.
+
+LocalOwnerService is privileged through OS catalog access. It is separate from
+bearer authentication and does not identify a shell user as an authenticated
+person. Bootstrap explicitly creates or binds a stable enabled person. Recovery
+keeps that person and rotates the persisted incarnation, invalidating all older
+credentials/handles. Exact recovery retry returns the same result only while that
+result is still current. No authority is automatically activated by opening,
+upgrading or restoring a catalog.
+
+Portable subjects/grants use independent policy events, full expected-value and
+sequence comparisons, subject authorization generations, retained grant
+tombstones, and immutable lifetime identities. Administrative audit/idempotency,
+authority binding, credential verifiers and issuance mappings are operational
+tables excluded from portable history. Metadata Actor remains attribution.
+
+IssueCredential atomically stores a random selector, verifier and nonsecret
+receipt before returning a one-time 256-bit secret. Retry returns no bearer and
+reports the original receipt with fresh status. Absolute expiry is explicit:
+60 seconds through 24 hours after the server clock on first issuance; there is no
+implicit retry-dependent default. Expiry is rechecked on authentication and each
+access decision, with the trusted wall clock's rollback limitations.
+
+Authenticate creates an opaque store/incarnation/credential-bound handle.
+CheckAccess checks a current deferred snapshot and returns only allowed/denied
+for one exact asset and action. Permission requires credential scope AND action
+ceiling AND an active matching current grant; library grants cannot widen an
+asset credential. An owner bearer has no implicit grant. This decision seam does
+not expose metadata or enforce existing Manager/HTTP/browser/mount entry points.
+
+Schema 3 exports format 2: metadata event frames precede a separately sequenced
+policy stream. The combined event count uses the existing event budget; subjects
+and grants consume projection rows including tombstones. Separate format-2 hash
+domains and subject/grant projection frames protect the complete portable state.
+Restore replays both histories and compares the source projection, leaving all
+operational tables empty. Format 1/schema 2 bytes remain unchanged.
+
+`cmd/juicemount-catalog` is a standalone local program with global flags before
+the command. Commands include init-authority, upgrade-authority, owner
+status/bootstrap/recover, subject new-id/list, grant list, policy apply,
+credential issue/status/revoke, auth whoami/check, export and restore. Mutations
+read canonical AdminRequest JSON from stdin. Issue requires explicit absolute
+expires_unix and `--secret-out PATH` (exclusive new 0600 file) or `--secret-out -`.
+Exact issuance lookup precedes output reservation, so a matched historical retry
+does not touch its original output path. Nonsecret issuance status goes to
+stderr; only a first returned bearer goes to the selected secret output.
+Credential status accepts `--operation-id` for uncertain issuance recovery or
+`--selector` for an existing credential. Auth check reads one bearer line from
+stdin and uses `--asset` and `--action`; it prints only allowed or denied.
+Export/restore require explicit --max-bytes, --max-events and --max-rows.
+
+The generic run entry point borrows Reader/Writer objects and checks context
+cooperatively; it cannot interrupt an arbitrary blocking caller implementation.
+Main uses a separate owned-I/O path. On Darwin/Linux, it captures all inherited
+stdio flags before changing any, prepares pollable pipe/terminal copies on
+descriptors above 2, and keeps control descriptors for restoration. A single
+watcher closes owned I/O on timeout, SIGINT or SIGTERM. It is joined before flags
+are restored and owners closed; there are no detached read/write workers.
+O_NONBLOCK temporarily affects other holders of the same inherited open-file
+description during the invocation. Flags are restored on normal completion,
+cancellation and setup failure. SIGKILL/process crashes cannot run cleanup.
+Regular-file kernel I/O still depends on the filesystem; there is no promise of
+preempting arbitrary kernel disk stalls. Named --input files must be regular and
+are opened nonblocking; use stdin for a pipe. Owned-I/O support refuses other
+unqualified platforms.
+
+Reserved-output close failures are retained alongside write/sync failures.
+Uncertain diagnostics include a validated operation ID and known selector,
+without raw decoder/error input or secrets. Diagnostic delivery can itself fail;
+the caller already owns its explicit operation ID and can inspect credential
+status with it. Partial/failed secret delivery can leave an active issuance:
+inspect status before deliberate revoke/new-ID reissue. Source and declared
+tests alone do not establish CLI, existing integration, or product acceptance.

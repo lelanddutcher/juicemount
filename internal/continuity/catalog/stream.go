@@ -146,7 +146,7 @@ func (s *streamInput) frame(expected byte, h hash.Hash) ([]byte, error) {
 	}
 	size := binary.BigEndian.Uint32(header[1:])
 	max := uint32(1024)
-	if expected == 2 {
+	if expected == 2 || expected == 4 {
 		max = maxEventPayload
 	}
 	if size == 0 || size > max {

@@ -24,8 +24,17 @@ type Store struct {
 	file     *os.File
 	path     string
 	library  continuity.LibraryID
+	version  int
+	clock    func() time.Time // nil uses the server wall clock; unexported test seam.
 	closed   bool
 	closeErr error
+}
+
+func (s *Store) now() time.Time {
+	if s.clock != nil {
+		return s.clock()
+	}
+	return time.Now()
 }
 
 // Create reserves a new 0600 database in a caller-provisioned private directory.
@@ -41,6 +50,17 @@ func Create(path string, library continuity.LibraryID) (*Store, error) {
 
 // Open recognizes an existing complete catalog; it never initializes or repairs.
 func Open(path string) (*Store, error) { return openStore(path, "", false) }
+
+func OpenContext(ctx context.Context, path string) (*Store, error) {
+	return openStoreContext(ctx, path, "", false, true)
+}
+
+func CreateAuthority(ctx context.Context, path string, library continuity.LibraryID) (*Store, error) {
+	if library.Validate() != nil {
+		return nil, invalid("library identity")
+	}
+	return openStoreVersionContext(ctx, path, library, true, true, authoritySchemaVersion)
+}
 
 func canonicalPath(path string) (string, error) {
 	if path == "" || path == ":memory:" || strings.HasPrefix(path, "file:") || strings.ContainsRune(path, 0) {
@@ -102,6 +122,10 @@ func openStore(input string, library continuity.LibraryID, create bool) (_ *Stor
 }
 
 func openStoreContext(ctx context.Context, input string, library continuity.LibraryID, create, complete bool) (_ *Store, resultErr error) {
+	return openStoreVersionContext(ctx, input, library, create, complete, schemaVersion)
+}
+
+func openStoreVersionContext(ctx context.Context, input string, library continuity.LibraryID, create, complete bool, version int) (_ *Store, resultErr error) {
 	path, err := canonicalPath(input)
 	if err != nil {
 		return nil, err
@@ -144,13 +168,17 @@ func openStoreContext(ctx context.Context, input string, library continuity.Libr
 	}()
 	if !create {
 		// Version, DDL, ledger, identity and integrity share one read snapshot.
-		var version int
 		library, version, err = snapshotCatalog(ctx, path)
 		if err != nil {
 			return nil, err
 		}
 		if version == 1 {
 			return nil, ErrUpgradeRequired
+		}
+	}
+	if version == authoritySchemaVersion {
+		if err := checkPrivatePaths(path); err != nil {
+			return nil, err
 		}
 	}
 	db, err := openDB(path, false)
@@ -163,15 +191,15 @@ func openStoreContext(ctx context.Context, input string, library continuity.Libr
 		}
 	}()
 	if create {
-		if err := initialize(ctx, db, library); err != nil {
+		if err := initializeVersion(ctx, db, library, version); err != nil {
 			return nil, err
 		}
 	}
-	actual, err := validateSchemaState(ctx, db, create)
+	actual, recognizedVersion, err := recognizeSchema(ctx, db, create)
 	if err != nil {
 		return nil, err
 	}
-	if actual != library {
+	if actual != library || recognizedVersion != version {
 		return nil, corrupt("library changed while opening")
 	}
 	if err := checkIntegrity(ctx, db); err != nil {
@@ -187,7 +215,7 @@ func openStoreContext(ctx context.Context, input string, library continuity.Libr
 	if mode != "wal" {
 		return nil, corrupt("WAL unavailable")
 	}
-	store := &Store{db: db, file: file, path: path, library: library}
+	store := &Store{db: db, file: file, path: path, library: library, version: version}
 	if err := store.checkPaths(); err != nil {
 		return nil, err
 	}
@@ -261,7 +289,13 @@ func (s *Store) checkPaths() error {
 	if !os.SameFile(info, held) {
 		return corrupt("catalog path identity changed")
 	}
-	return checkSidecars(s.path)
+	if err := checkSidecars(s.path); err != nil {
+		return err
+	}
+	if s.version == authoritySchemaVersion {
+		return checkPrivatePaths(s.path)
+	}
+	return nil
 }
 
 func (s *Store) enter() error {
