@@ -9,12 +9,13 @@ import (
 )
 
 var (
-	ErrInvalid        = errors.New("invalid catalog input")
-	ErrNotFound       = errors.New("catalog record not found")
-	ErrConflict       = errors.New("catalog optimistic conflict")
-	ErrChangedRequest = errors.New("catalog operation ID reused with changed request")
-	ErrClosed         = errors.New("catalog closed")
-	ErrFormat         = errors.New("invalid or corrupt catalog format")
+	ErrInvalid         = errors.New("invalid catalog input")
+	ErrNotFound        = errors.New("catalog record not found")
+	ErrConflict        = errors.New("catalog optimistic conflict")
+	ErrChangedRequest  = errors.New("catalog operation ID reused with changed request")
+	ErrClosed          = errors.New("catalog closed")
+	ErrFormat          = errors.New("invalid or corrupt catalog format")
+	ErrUpgradeRequired = errors.New("catalog requires explicit schema upgrade")
 )
 
 const (
@@ -35,10 +36,14 @@ type Operation struct {
 
 // Change has exactly one non-nil variant. The ordered batch is atomic.
 type Change struct {
-	CreateAsset    *CreateAsset
-	RenameAsset    *RenameAsset
-	RecordRevision *continuity.Manifest
-	AdvanceHead    *AdvanceHead
+	CreateAsset        *CreateAsset
+	RenameAsset        *RenameAsset
+	RecordRevision     *continuity.Manifest
+	AdvanceHead        *AdvanceHead
+	PutRelationship    *PutRelationship
+	RemoveRelationship *RemoveRelationship
+	PutLocation        *PutLocation
+	RemoveLocation     *RemoveLocation
 }
 
 type CreateAsset struct {

@@ -129,6 +129,14 @@ func (s *Store) applyChange(ctx context.Context, tx *sql.Tx, c Change, sequence 
 		result, err := tx.ExecContext(ctx, `UPDATE assets SET head=?,updated_sequence=? WHERE asset_id=? AND library_id=? AND ((head IS NULL AND ?='') OR head=?)`,
 			v.Revision, sequence, v.AssetID, s.library, v.ExpectedRevision, v.ExpectedRevision)
 		return changedOne(result, err)
+	case c.PutRelationship != nil:
+		return s.putRelationship(ctx, tx, *c.PutRelationship, sequence)
+	case c.RemoveRelationship != nil:
+		return s.removeRelationship(ctx, tx, *c.RemoveRelationship, sequence)
+	case c.PutLocation != nil:
+		return s.putLocation(ctx, tx, *c.PutLocation, sequence)
+	case c.RemoveLocation != nil:
+		return s.removeLocation(ctx, tx, *c.RemoveLocation, sequence)
 	default:
 		return invalid("unknown change")
 	}

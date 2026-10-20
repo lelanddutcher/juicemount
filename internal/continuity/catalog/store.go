@@ -139,21 +139,14 @@ func openStore(input string, library continuity.LibraryID, create bool) (_ *Stor
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if !create {
-		// Refuse unrecognized databases before any writable SQLite connection.
-		probe, err := openDB(path, true)
-		if err != nil {
-			return nil, formatError(err)
-		}
-		library, err = validateSchema(ctx, probe)
-		if err == nil {
-			err = checkIntegrity(ctx, probe)
-		}
-		closeErr := probe.Close()
+		// Version, DDL, ledger, identity and integrity share one read snapshot.
+		var version int
+		library, version, err = snapshotCatalog(ctx, path)
 		if err != nil {
 			return nil, err
 		}
-		if closeErr != nil {
-			return nil, closeErr
+		if version == 1 {
+			return nil, ErrUpgradeRequired
 		}
 	}
 	db, err := openDB(path, false)
