@@ -80,7 +80,7 @@ func projectionTotal(ctx context.Context, q queryer) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	if version == authoritySchemaVersion {
+	if portableSchemaVersion(version) == authoritySchemaVersion {
 		var policy int64
 		err = q.QueryRowContext(ctx, `SELECT (SELECT count(*) FROM policy_subjects)+(SELECT count(*) FROM policy_grants)`).Scan(&policy)
 		count += policy
@@ -97,7 +97,7 @@ func projectionDigest(ctx context.Context, q queryer, library continuity.Library
 		return "", 0, err
 	}
 	domain := "juicemount.catalog.projection\x00\x01"
-	if version == authoritySchemaVersion {
+	if portableSchemaVersion(version) == authoritySchemaVersion {
 		domain = "juicemount.catalog.projection\x00\x02"
 	}
 	_, _ = h.Write([]byte(domain))
@@ -204,7 +204,7 @@ func projectionDigest(ctx context.Context, q queryer, library continuity.Library
 	if err != nil {
 		return "", 0, err
 	}
-	if version == authoritySchemaVersion {
+	if portableSchemaVersion(version) == authoritySchemaVersion {
 		if err := walkRows(ctx, q, `SELECT `+subjectColumns+` FROM policy_subjects ORDER BY subject_id COLLATE BINARY`, func(rows *sql.Rows) error {
 			sub, err := scanSubject(rows, library)
 			if err != nil {

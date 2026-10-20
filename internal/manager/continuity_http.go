@@ -64,7 +64,7 @@ func continuityStatus(code string) int {
 		return http.StatusUnauthorized
 	case "not_found":
 		return http.StatusNotFound
-	case "restart_query":
+	case "restart_query", "conflict", "expired_request":
 		return http.StatusConflict
 	case "work_budget":
 		return http.StatusUnprocessableEntity
@@ -84,6 +84,10 @@ func writeContinuityError(w http.ResponseWriter, output io.Writer, code string) 
 }
 
 func (c *Continuity) serveHTTP(w http.ResponseWriter, r *http.Request, base string) {
+	c.serveHTTPVersion(w, r, base, 1)
+}
+
+func (c *Continuity) serveHTTPVersion(w http.ResponseWriter, r *http.Request, base string, version int) {
 	start := time.Now()
 	continuityHeaders(w)
 	controller := http.NewResponseController(w)
@@ -99,9 +103,17 @@ func (c *Continuity) serveHTTP(w http.ResponseWriter, r *http.Request, base stri
 	}
 	route := "unknown"
 	if strings.HasPrefix(r.URL.Path, base) {
-		switch candidate := strings.TrimPrefix(r.URL.Path, base); candidate {
-		case "search", "asset", "revisions", "history", "relationships", "locations", "counts", "page":
-			route = candidate
+		candidate := strings.TrimPrefix(r.URL.Path, base)
+		if version == 1 {
+			switch candidate {
+			case "search", "asset", "revisions", "history", "relationships", "locations", "counts", "page":
+				route = candidate
+			}
+		} else if version == 2 {
+			switch candidate {
+			case "search", "page", "select", "clear", "preference":
+				route = candidate
+			}
 		}
 	}
 	var randomID [16]byte
@@ -171,20 +183,37 @@ func (c *Continuity) serveHTTP(w http.ResponseWriter, r *http.Request, base stri
 		}
 		return
 	}
-	request, err := decodeContinuityRequest(route, body)
-	if err != nil {
-		fail("invalid")
-		return
-	}
 	if ctx.Err() != nil {
 		fail("deadline")
 		return
 	}
-	result, err = c.service.Query(ctx, bearer, request, output)
+	switch route {
+	case "select", "clear":
+		request, decodeErr := decodeContinuityPreference(route, body)
+		if decodeErr != nil {
+			fail("invalid")
+			return
+		}
+		result, err = c.service.RecordPreference(ctx, bearer, request, output)
+	case "preference":
+		request, decodeErr := decodeContinuityPreferenceState(body)
+		if decodeErr != nil {
+			fail("invalid")
+			return
+		}
+		result, err = c.service.PreferenceState(ctx, bearer, request, output)
+	default:
+		request, decodeErr := decodeContinuityRequestVersion(route, body, version)
+		if decodeErr != nil {
+			fail("invalid")
+			return
+		}
+		result, err = c.service.Query(ctx, bearer, request, output)
+	}
 	if err != nil {
 		outcome = catalog.DiscoveryErrorCode(err)
 		switch outcome {
-		case "invalid", "unauthenticated", "not_found", "restart_query", "work_budget", "busy", "unavailable", "deadline":
+		case "invalid", "unauthenticated", "not_found", "restart_query", "conflict", "expired_request", "work_budget", "busy", "unavailable", "deadline":
 		default:
 			outcome = "unavailable"
 		}
@@ -259,9 +288,13 @@ func continuityOriginAllowed(r *http.Request) bool {
 }
 
 func decodeContinuityRequest(kind string, body []byte) (catalog.DiscoveryRequest, error) {
+	return decodeContinuityRequestVersion(kind, body, 1)
+}
+
+func decodeContinuityRequestVersion(kind string, body []byte, version int) (catalog.DiscoveryRequest, error) {
 	request := catalog.DiscoveryRequest{Kind: kind}
 	invalid := errors.New("invalid discovery request")
-	if !utf8.Valid(body) {
+	if version != 1 && version != 2 || version == 2 && kind != "search" && kind != "page" {
 		return request, invalid
 	}
 	fields := map[string]any{"version": &request.Version, "library_id": &request.LibraryID}
@@ -277,42 +310,12 @@ func decodeContinuityRequest(kind string, body []byte) (catalog.DiscoveryRequest
 	default:
 		return request, invalid
 	}
-	d := json.NewDecoder(bytes.NewReader(body))
-	first, err := d.Token()
-	if err != nil || first != json.Delim('{') {
-		return request, invalid
-	}
-	seen := make(map[string]bool, len(fields))
-	for d.More() {
-		token, err := d.Token()
-		name, ok := token.(string)
-		target, allowed := fields[name]
-		if err != nil || !ok || !allowed || seen[name] {
-			return request, invalid
-		}
-		seen[name] = true
-		var raw json.RawMessage
-		if d.Decode(&raw) != nil || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) ||
-			json.Unmarshal(raw, target) != nil {
-			return request, invalid
-		}
-	}
-	end, err := d.Token()
-	if err != nil || end != json.Delim('}') || len(seen) != len(fields) {
-		return request, invalid
-	}
-	var trailing any
-	if d.Decode(&trailing) != io.EOF || request.Version != 1 || request.LibraryID.Validate() != nil {
+	if decodeContinuityFields(body, fields, "") != nil || request.Version != version || request.LibraryID.Validate() != nil {
 		return request, invalid
 	}
 	if kind == "page" {
-		if len(request.Token) != 70 || !strings.HasPrefix(request.Token, "page1_") {
+		if !continuityOpaqueToken(request.Token, "page1_") {
 			return request, invalid
-		}
-		for _, c := range request.Token[6:] {
-			if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
-				return request, invalid
-			}
 		}
 		return request, nil
 	}
@@ -333,6 +336,90 @@ func decodeContinuityRequest(kind string, body []byte) (catalog.DiscoveryRequest
 			}
 			ids[id] = true
 		}
+	}
+	return request, nil
+}
+
+// Every field must occur exactly once. Only the explicitly nullable field may
+// contain null; omission never silently acquires the semantics of null.
+func decodeContinuityFields(body []byte, fields map[string]any, nullable string) error {
+	invalid := errors.New("invalid continuity request")
+	if !utf8.Valid(body) {
+		return invalid
+	}
+	d := json.NewDecoder(bytes.NewReader(body))
+	first, err := d.Token()
+	if err != nil || first != json.Delim('{') {
+		return invalid
+	}
+	seen := make(map[string]bool, len(fields))
+	for d.More() {
+		token, err := d.Token()
+		name, ok := token.(string)
+		target, allowed := fields[name]
+		if err != nil || !ok || !allowed || seen[name] {
+			return invalid
+		}
+		seen[name] = true
+		var raw json.RawMessage
+		if d.Decode(&raw) != nil || name != nullable && bytes.Equal(bytes.TrimSpace(raw), []byte("null")) ||
+			json.Unmarshal(raw, target) != nil {
+			return invalid
+		}
+	}
+	end, err := d.Token()
+	if err != nil || end != json.Delim('}') || len(seen) != len(fields) {
+		return invalid
+	}
+	var trailing any
+	if d.Decode(&trailing) != io.EOF {
+		return invalid
+	}
+	return nil
+}
+
+func continuityOpaqueToken(token, prefix string) bool {
+	if len(token) != len(prefix)+64 || !strings.HasPrefix(token, prefix) {
+		return false
+	}
+	for _, c := range token[len(prefix):] {
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+func decodeContinuityPreference(kind string, body []byte) (catalog.PreferenceRequest, error) {
+	request := catalog.PreferenceRequest{Kind: kind}
+	invalid := errors.New("invalid preference request")
+	fields := map[string]any{"version": &request.Version, "library_id": &request.LibraryID,
+		"operation_id": &request.OperationID, "asset_id": &request.AssetID,
+		"expected_token": &request.ExpectedToken, "expires_unix": &request.ExpiresUnix}
+	if decodeContinuityFields(body, fields, "expected_token") != nil || request.Version != 2 ||
+		request.LibraryID.Validate() != nil || request.AssetID.Validate() != nil ||
+		len(request.OperationID) == 0 || len(request.OperationID) > 128 {
+		return request, invalid
+	}
+	for _, c := range request.OperationID {
+		if !(c >= '0' && c <= '9' || c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z' || c == '_' || c == '-') {
+			return request, invalid
+		}
+	}
+	if kind == "select" && request.ExpectedToken != nil ||
+		kind == "clear" && (request.ExpectedToken == nil || !continuityOpaqueToken(*request.ExpectedToken, "sel1_")) ||
+		kind != "select" && kind != "clear" {
+		return request, invalid
+	}
+	return request, nil
+}
+
+func decodeContinuityPreferenceState(body []byte) (catalog.PreferenceStateRequest, error) {
+	var request catalog.PreferenceStateRequest
+	fields := map[string]any{"version": &request.Version, "library_id": &request.LibraryID, "asset_id": &request.AssetID}
+	if decodeContinuityFields(body, fields, "") != nil || request.Version != 2 ||
+		request.LibraryID.Validate() != nil || request.AssetID.Validate() != nil {
+		return request, errors.New("invalid preference state request")
 	}
 	return request, nil
 }

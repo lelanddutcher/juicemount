@@ -23,6 +23,7 @@ type discoveryBinding struct {
 	handle          *AuthHandle
 	generation      int64
 	issued, expires int64
+	preference      *preferenceBinding
 }
 type DiscoveryService struct {
 	store      *Store
@@ -55,7 +56,7 @@ func NewDiscoveryService(ctx context.Context, s *Store, library continuity.Libra
 	if err := s.requireLibrary(library); err != nil {
 		return nil, err
 	}
-	if s.version != authoritySchemaVersion {
+	if !supportsAuthority(s.version) {
 		return nil, ErrUpgradeRequired
 	}
 	tx, done, err := s.readSnapshot(ctx)
@@ -72,7 +73,7 @@ func NewDiscoveryService(ctx context.Context, s *Store, library continuity.Libra
 	if err != nil {
 		return nil, err
 	}
-	if actual != library || version != 3 {
+	if actual != library || !supportsAuthority(version) {
 		return nil, corrupt("discovery catalog identity")
 	}
 	a, err := readAuthority(ctx, tx, library)
@@ -174,6 +175,9 @@ func (d *DiscoveryService) Query(parent context.Context, bearer []byte, input Di
 	if err != nil {
 		return result, err
 	}
+	if request.Version == 2 && d.store.version != 4 {
+		return result, ErrUpgradeRequired
+	}
 	if err := d.store.enter(); err != nil {
 		return result, err
 	}
@@ -198,18 +202,19 @@ func (d *DiscoveryService) Query(parent context.Context, bearer []byte, input Di
 		return result, errors.Join(err, d.finishSnapshot(done))
 	}
 	result.SubjectID, result.Selector = c.subject, c.selector
-	binding := discoveryBinding{handle, subject.AuthorizationGeneration, c.issued, c.expires}
+	binding := discoveryBinding{handle, subject.AuthorizationGeneration, c.issued, c.expires, nil}
 	var body []byte
 	var window *discoveryWindow
 	if request.Kind == "page" {
 		if err := d.finishSnapshot(done); err != nil {
 			return result, err
 		}
-		body, window, err = d.leasePage(request.Token, binding)
+		body, window, err = d.leasePage(request.Token, binding, request.Version)
 		if err != nil {
 			return result, err
 		}
 		defer d.releasePage(window)
+		binding = cloneDiscoveryBinding(window.binding)
 	} else {
 		if err := d.reserveNew(binding); err != nil {
 			return result, errors.Join(err, d.finishSnapshot(done))
@@ -229,6 +234,15 @@ func (d *DiscoveryService) Query(parent context.Context, bearer []byte, input Di
 			return result, errors.Join(err, d.finishSnapshot(done))
 		}
 		reader := discoveryReader{ctx: ctx, q: tx, library: d.library, rights: rights, assets: make(map[continuity.AssetID]*Asset)}
+		if request.Version == 2 && subject.Value.Kind == "person" {
+			view, pref, err := d.readPreferenceView(ctx, tx, c.subject)
+			if err != nil {
+				return result, errors.Join(err, d.finishSnapshot(done))
+			}
+			reader.preferences = view
+			reader.preferenceFence = pref
+			binding.preference = pref
+		}
 		items, single, complete, err := reader.query(request)
 		err = errors.Join(err, d.finishSnapshot(done))
 		if err != nil {
@@ -302,6 +316,16 @@ func (d *DiscoveryService) Query(parent context.Context, bearer []byte, input Di
 		}
 		return result, ErrUnauthenticated
 	}
+	if binding.preference != nil {
+		if err := binding.preference.checkTime(now); err != nil {
+			if window != nil {
+				d.mu.Lock()
+				d.retireLocked(window)
+				d.mu.Unlock()
+			}
+			return result, err
+		}
+	}
 	if err := ctx.Err(); err != nil {
 		if window != nil {
 			d.mu.Lock()
@@ -338,5 +362,30 @@ func (d *DiscoveryService) fence(ctx context.Context, b discoveryBinding) error 
 			err = errDiscoveryRestart
 		}
 	}
+	if err == nil && b.preference != nil {
+		control, e := readPreferenceControl(ctx, tx, d.library)
+		err = e
+		if err == nil {
+			b.preference.floor = control.floor
+			if b.preference.generation >= 0 {
+				current, e := readPreferenceSubject(ctx, tx, d.library, b.handle.subject)
+				err = e
+				if err == nil && current.generation != b.preference.generation {
+					err = errDiscoveryRestart
+				}
+			}
+		}
+		if err == nil {
+			err = b.preference.checkTime(d.store.now().Unix())
+		}
+	}
 	return errors.Join(err, d.finishSnapshot(done))
+}
+
+func cloneDiscoveryBinding(b discoveryBinding) discoveryBinding {
+	if b.preference != nil {
+		copy := *b.preference
+		b.preference = &copy
+	}
+	return b
 }

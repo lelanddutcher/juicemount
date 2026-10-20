@@ -173,7 +173,7 @@ func TestDiscoveryConstructionBoundsBeforePublication(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	binding := discoveryBinding{h, subject.AuthorizationGeneration, c.issued, c.expires}
+	binding := discoveryBinding{h, subject.AuthorizationGeneration, c.issued, c.expires, nil}
 	r := discoveryRequestTest("search", "")
 	// Distinct live raw buffers and their encoded page copies share the same
 	// construction reservation; counting only retained JSON would accept this.

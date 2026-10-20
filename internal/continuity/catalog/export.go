@@ -112,7 +112,7 @@ func (s *Store) Export(ctx context.Context, library continuity.LibraryID, writer
 	}
 	format := 1
 	var policy int64
-	if version == authoritySchemaVersion {
+	if portableSchemaVersion(version) == authoritySchemaVersion {
 		format = 2
 		policy, err = policyTotal(ctx, tx)
 		if err != nil {

@@ -27,6 +27,10 @@ func DiscoveryErrorCode(err error) string {
 		return "invalid"
 	case errors.Is(err, ErrNotFound):
 		return "not_found"
+	case errors.Is(err, ErrChangedRequest), errors.Is(err, ErrConflict):
+		return "conflict"
+	case errors.Is(err, errPreferenceExpired):
+		return "expired_request"
 	case errors.Is(err, errDiscoveryRestart):
 		return "restart_query"
 	case errors.Is(err, errDiscoveryWork):
@@ -76,7 +80,7 @@ func validPageToken(token string) bool {
 	return err == nil
 }
 func freezeDiscoveryRequest(r DiscoveryRequest, library continuity.LibraryID) (DiscoveryRequest, error) {
-	if r.Version != 1 || r.LibraryID != library {
+	if (r.Version != 1 && r.Version != 2) || r.LibraryID != library || r.Version == 2 && r.Kind != "search" && r.Kind != "page" {
 		return r, invalid("discovery identity")
 	}
 	if r.Kind == "page" {

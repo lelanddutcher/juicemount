@@ -9,6 +9,7 @@ import (
 
 type discoveryWindow struct {
 	binding discoveryBinding
+	version int
 	request []byte
 	created time.Time
 	ordinal uint64
@@ -76,12 +77,12 @@ func sameDiscoveryOwner(a, b discoveryBinding) bool {
 	return a.handle.store == b.handle.store && a.handle.selector == b.handle.selector && a.handle.subject == b.handle.subject
 }
 
-func (d *DiscoveryService) leasePage(token string, b discoveryBinding) ([]byte, *discoveryWindow, error) {
+func (d *DiscoveryService) leasePage(token string, b discoveryBinding, version int) ([]byte, *discoveryWindow, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	p := d.tokens[token]
 	// No expiration sweep, allocation reservation or eviction before ownership.
-	if p == nil || !sameDiscoveryOwner(p.window.binding, b) {
+	if p == nil || p.window.version != version || !sameDiscoveryOwner(p.window.binding, b) {
 		return nil, nil, errDiscoveryRestart
 	}
 	w := p.window
@@ -163,7 +164,7 @@ func (d *DiscoveryService) makeWindow(request DiscoveryRequest, b discoveryBindi
 	if len(groups) == 0 {
 		groups = append(groups, make([]json.RawMessage, 0))
 	}
-	w := &discoveryWindow{binding: b, created: time.Now(), tokens: make([]string, len(groups))}
+	w := &discoveryWindow{binding: cloneDiscoveryBinding(b), version: request.Version, created: time.Now(), tokens: make([]string, len(groups))}
 	used := make(map[string]bool)
 	for i := range groups {
 		for attempt := 0; attempt < 8; attempt++ {
@@ -204,7 +205,11 @@ func (d *DiscoveryService) makeWindow(request DiscoveryRequest, b discoveryBindi
 		if rawBytes+w.charge+2*estimate > discoveryBuildBytes {
 			return nil, errDiscoveryWork
 		}
-		body, err := encodeDiscoveryValue(discoveryCollection{1, request.Kind, group, len(items), "frozen_window", complete, next, "discovery1"}, 1<<20)
+		sortVersion := "discovery1"
+		if request.Version == 2 {
+			sortVersion = "discovery2"
+		}
+		body, err := encodeDiscoveryValue(discoveryCollection{request.Version, request.Kind, group, len(items), "frozen_window", complete, next, sortVersion}, 1<<20)
 		if err != nil {
 			return nil, err
 		}

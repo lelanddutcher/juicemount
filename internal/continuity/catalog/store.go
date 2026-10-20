@@ -62,6 +62,13 @@ func CreateAuthority(ctx context.Context, path string, library continuity.Librar
 	return openStoreVersionContext(ctx, path, library, true, true, authoritySchemaVersion)
 }
 
+func CreatePreferences(ctx context.Context, path string, library continuity.LibraryID) (*Store, error) {
+	if library.Validate() != nil {
+		return nil, invalid("library identity")
+	}
+	return openStoreVersionContext(ctx, path, library, true, true, preferencesSchemaVersion)
+}
+
 func canonicalPath(path string) (string, error) {
 	if path == "" || path == ":memory:" || strings.HasPrefix(path, "file:") || strings.ContainsRune(path, 0) {
 		return "", invalid("a filesystem catalog path is required")
@@ -176,7 +183,7 @@ func openStoreVersionContext(ctx context.Context, input string, library continui
 			return nil, ErrUpgradeRequired
 		}
 	}
-	if version == authoritySchemaVersion {
+	if supportsAuthority(version) {
 		if err := checkPrivatePaths(path); err != nil {
 			return nil, err
 		}
@@ -292,7 +299,7 @@ func (s *Store) checkPaths() error {
 	if err := checkSidecars(s.path); err != nil {
 		return err
 	}
-	if s.version == authoritySchemaVersion {
+	if supportsAuthority(s.version) {
 		return checkPrivatePaths(s.path)
 	}
 	return nil

@@ -50,7 +50,7 @@ func (s *Store) LocalOwner(library continuity.LibraryID) (*LocalOwnerService, er
 	if err := s.requireLibrary(library); err != nil {
 		return nil, err
 	}
-	if s.version != authoritySchemaVersion {
+	if !supportsAuthority(s.version) {
 		return nil, ErrUpgradeRequired
 	}
 	return &LocalOwnerService{s, library}, nil
@@ -62,7 +62,7 @@ func (o *LocalOwnerService) enter() error {
 	if err := o.store.enter(); err != nil {
 		return err
 	}
-	if o.store.version != authoritySchemaVersion {
+	if !supportsAuthority(o.store.version) {
 		o.store.leave()
 		return ErrUpgradeRequired
 	}

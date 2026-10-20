@@ -16,6 +16,15 @@ import (
 const applicationID = 0x4a4d4341 // JMCA
 const schemaVersion = 2
 const authoritySchemaVersion = 3
+const preferencesSchemaVersion = 4
+
+func supportsAuthority(version int) bool { return version == 3 || version == 4 }
+func portableSchemaVersion(version int) int {
+	if version == 4 {
+		return 3
+	}
+	return version
+}
 
 type queryer interface {
 	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
@@ -123,8 +132,11 @@ func expectedSchemaFor(version int) []schemaObject {
 		return legacySchema()
 	}
 	objects := expectedSchema()
-	if version == authoritySchemaVersion {
+	if supportsAuthority(version) {
 		objects = append(objects, authoritySchema()...)
+	}
+	if version == preferencesSchemaVersion {
+		objects = append(objects, preferencesSchema()...)
 	}
 	sort.Slice(objects, func(i, j int) bool { return objects[i].Name < objects[j].Name })
 	return objects
@@ -152,8 +164,15 @@ func initializeVersion(ctx context.Context, db *sql.DB, library continuity.Libra
 			tables = append(tables, object.SQL)
 		}
 	}
-	if version == authoritySchemaVersion {
+	if supportsAuthority(version) {
 		for _, object := range authoritySchema() {
+			if object.Type == "table" {
+				tables = append(tables, object.SQL)
+			}
+		}
+	}
+	if version == preferencesSchemaVersion {
+		for _, object := range preferencesSchema() {
 			if object.Type == "table" {
 				tables = append(tables, object.SQL)
 			}
@@ -180,7 +199,7 @@ func initializeVersion(ctx context.Context, db *sql.DB, library continuity.Libra
 	if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations(version,fingerprint) VALUES(1,?),(2,?)`, schemaFingerprint(legacySchema()), schemaFingerprint(expectedSchema())); err != nil {
 		return err
 	}
-	if version == authoritySchemaVersion {
+	if supportsAuthority(version) {
 		if _, err := tx.ExecContext(ctx, `PRAGMA user_version=3`); err != nil {
 			return err
 		}
@@ -188,8 +207,21 @@ func initializeVersion(ctx context.Context, db *sql.DB, library continuity.Libra
 			return err
 		}
 	}
+	if version == preferencesSchemaVersion {
+		if _, err := tx.ExecContext(ctx, `PRAGMA user_version=4`); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations(version,fingerprint) VALUES(4,?)`, schemaFingerprint(expectedSchemaFor(4))); err != nil {
+			return err
+		}
+	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO catalog(singleton,library_id,ready) VALUES(1,?,0)`, library); err != nil {
 		return err
+	}
+	if version == preferencesSchemaVersion {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO preference_control(singleton,library_id,clock_floor_unix,subject_count,entry_count,receipt_count) VALUES(1,?,0,0,0,0)`, library); err != nil {
+			return err
+		}
 	}
 	return tx.Commit()
 }
@@ -214,7 +246,7 @@ func recognizeSchema(ctx context.Context, q queryer, initializing bool) (continu
 	if err := q.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&version); err != nil {
 		return "", 0, formatError(err)
 	}
-	if app != applicationID || (version != 1 && version != schemaVersion && version != authoritySchemaVersion) {
+	if app != applicationID || (version != 1 && version != schemaVersion && !supportsAuthority(version)) {
 		return "", 0, corrupt("unsupported application or schema version")
 	}
 	rows, err := q.QueryContext(ctx, `SELECT type,name,tbl_name,sql FROM sqlite_schema WHERE NOT(type='index' AND substr(name,1,17)='sqlite_autoindex_' AND sql IS NULL) ORDER BY name`)
@@ -264,6 +296,9 @@ func recognizeSchema(ctx context.Context, q queryer, initializing bool) (continu
 		if entry == 3 {
 			want = schemaFingerprint(expectedSchemaFor(3))
 		}
+		if entry == 4 {
+			want = schemaFingerprint(expectedSchemaFor(4))
+		}
 		if entry != ledgerCount || entry > version || fingerprint != want {
 			rows.Close()
 			return "", 0, corrupt("migration fingerprint lineage mismatch")
@@ -290,6 +325,11 @@ func recognizeSchema(ctx context.Context, q queryer, initializing bool) (continu
 	}
 	if (ready != 1 && !(initializing && ready == 0)) || library.Validate() != nil {
 		return "", 0, corrupt("incomplete catalog or invalid library")
+	}
+	if version == 4 {
+		if err := checkPreferences(ctx, q, library); err != nil {
+			return "", 0, err
+		}
 	}
 	return library, version, nil
 }

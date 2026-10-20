@@ -1,0 +1,564 @@
+{
+  "fixture_version": 1,
+  "synthetic_test_vector": true,
+  "source_commit": "671da4cc1d8191845c925c89e1a66277b28121fa",
+  "source_hashes": {
+    "internal/continuity/catalog/schema.go": "b30eef29017b652cc9b15a2d2c0b848571513a14473d61927aee4229de21ddca",
+    "internal/continuity/catalog/relations_schema.go": "25ae041028e8584ab5927c84ad0f73fa3ef9ad5770fdf997206c7b7ce78e2115",
+    "internal/continuity/catalog/authority_schema.go": "91a4c6202f232bb5e18f7270143ba4922fc7f4fb55350865bc2059b02b1ba44e",
+    "internal/continuity/catalog/policy_stream.go": "a113fb249a46cdd3e345cb912c9ab5410dcbd4bc750f528e9276172ba1c84b94",
+    "internal/continuity/catalog/projection.go": "b44a76ed887eeefff9370456f26e253a51b223a57defe64e9a38917670c61aad",
+    "internal/continuity/catalog/encoding.go": "deb85584f3081e58900af281475529b83b72e6e27118b228a61d514fdffc3d8a",
+    "internal/continuity/catalog/policy_encoding.go": "8d21d3bce648e956e7648a902af8c12246431fe28b6baf1d851b09ef67dbb094",
+    "internal/continuity/catalog/testdata/continuity-c03a-v2-fixture.sql": "4e1c925a989237bd676a966a80bdfc238929375c6900866526702cb98b827681",
+    "internal/continuity/catalog/testdata/continuity-c03a-v2-fixture.json": "45bc895ba479531ad647fb972de54bebe0aecac97ae55a6069013dc49c1e12f4",
+    "internal/continuity/catalog/testdata/continuity-c03a-policy-rich.json": "42e5df42b27f80479e1279c26123c02e123a022edd9d91c71da3fc149f6e6b84"
+  },
+  "schema_version": 3,
+  "application_id": 1246577473,
+  "schema_fingerprints": {
+    "1": "752faa61a0812eef6fb7cd2a3d71a2aac3cee19f660b2d129e78cfc1a1b86f26",
+    "2": "1d67308e722a028662374a942e4b19bebe836df7d5f903a27a4ac3412e944a6d",
+    "3": "7b4a3ba35d87d80b9fd16f9c161f72a148ffcd55effd8b9199ba152d75213582"
+  },
+  "schema_objects": [
+    {
+      "Type": "table",
+      "Name": "assets",
+      "Table": "assets",
+      "SQL": "CREATE TABLE assets (\n asset_id TEXT PRIMARY KEY NOT NULL CHECK(length(asset_id)=38 AND substr(asset_id,1,6)='asset_' AND substr(asset_id,7) NOT GLOB '*[^0-9a-f]*' AND substr(asset_id,7)<>'00000000000000000000000000000000'),\n library_id TEXT NOT NULL REFERENCES catalog(library_id),\n label TEXT NOT NULL CHECK(length(CAST(label AS BLOB))<=4096 AND instr(label,char(0))=0),\n head TEXT,\n created_sequence INTEGER NOT NULL REFERENCES events(sequence) DEFERRABLE INITIALLY DEFERRED,\n updated_sequence INTEGER NOT NULL REFERENCES events(sequence) DEFERRABLE INITIALLY DEFERRED,\n CHECK(created_sequence>0 AND updated_sequence>=created_sequence),\n FOREIGN KEY(asset_id,head) REFERENCES revisions(asset_id,revision_id) DEFERRABLE INITIALLY DEFERRED\n)"
+    },
+    {
+      "Type": "table",
+      "Name": "catalog",
+      "Table": "catalog",
+      "SQL": "CREATE TABLE catalog (\n singleton INTEGER PRIMARY KEY CHECK(singleton=1),\n library_id TEXT NOT NULL UNIQUE CHECK(length(library_id)=36 AND substr(library_id,1,4)='lib_' AND substr(library_id,5) NOT GLOB '*[^0-9a-f]*' AND substr(library_id,5)<>'00000000000000000000000000000000'),\n ready INTEGER NOT NULL CHECK(ready IN (0,1))\n)"
+    },
+    {
+      "Type": "table",
+      "Name": "catalog_admin_events",
+      "Table": "catalog_admin_events",
+      "SQL": "CREATE TABLE catalog_admin_events (\n sequence INTEGER PRIMARY KEY CHECK(sequence>0),\n library_id TEXT NOT NULL REFERENCES catalog(library_id),\n operation_id TEXT NOT NULL UNIQUE CHECK(length(operation_id) BETWEEN 1 AND 128 AND operation_id NOT GLOB '*[^a-zA-Z0-9_-]*'),\n request BLOB NOT NULL CHECK(typeof(request)='blob' AND length(request) BETWEEN 1 AND 1048576),\n payload_sha256 TEXT NOT NULL CHECK(length(payload_sha256)=64 AND payload_sha256 NOT GLOB '*[^0-9a-f]*'),\n recorded_unix_nano INTEGER NOT NULL,\n receipt BLOB NOT NULL CHECK(typeof(receipt)='blob' AND length(receipt) BETWEEN 1 AND 2048)\n)"
+    },
+    {
+      "Type": "trigger",
+      "Name": "catalog_admin_events_no_delete",
+      "Table": "catalog_admin_events",
+      "SQL": "CREATE TRIGGER catalog_admin_events_no_delete BEFORE DELETE ON catalog_admin_events BEGIN SELECT RAISE(ABORT,'immutable authority row'); END"
+    },
+    {
+      "Type": "trigger",
+      "Name": "catalog_admin_events_no_update",
+      "Table": "catalog_admin_events",
+      "SQL": "CREATE TRIGGER catalog_admin_events_no_update BEFORE UPDATE ON catalog_admin_events BEGIN SELECT RAISE(ABORT,'immutable authority row'); END"
+    },
+    {
+      "Type": "table",
+      "Name": "catalog_authority",
+      "Table": "catalog_authority",
+      "SQL": "CREATE TABLE catalog_authority (\n singleton INTEGER PRIMARY KEY CHECK(singleton=1),\n library_id TEXT NOT NULL REFERENCES catalog(library_id),\n incarnation TEXT NOT NULL CHECK(length(incarnation)=37 AND substr(incarnation,1,5)='auth_' AND substr(incarnation,6) NOT GLOB '*[^0-9a-f]*' AND substr(incarnation,6)<>'00000000000000000000000000000000'),\n owner_subject_id TEXT NOT NULL REFERENCES policy_subjects(subject_id)\n)"
+    },
+    {
+      "Type": "trigger",
+      "Name": "catalog_authority_identity",
+      "Table": "catalog_authority",
+      "SQL": "CREATE TRIGGER catalog_authority_identity BEFORE UPDATE ON catalog_authority WHEN NEW.singleton<>OLD.singleton OR NEW.library_id<>OLD.library_id OR NEW.owner_subject_id<>OLD.owner_subject_id BEGIN SELECT RAISE(ABORT,'immutable authority identity'); END"
+    },
+    {
+      "Type": "trigger",
+      "Name": "catalog_authority_no_delete",
+      "Table": "catalog_authority",
+      "SQL": "CREATE TRIGGER catalog_authority_no_delete BEFORE DELETE ON catalog_authority BEGIN SELECT RAISE(ABORT,'authority lifetime identity'); END"
+    },
+    {
+      "Type": "table",
+      "Name": "catalog_credentials",
+      "Table": "catalog_credentials",
+      "SQL": "CREATE TABLE catalog_credentials (\n selector TEXT PRIMARY KEY NOT NULL CHECK(length(selector)=37 AND substr(selector,1,5)='cred_' AND substr(selector,6) NOT GLOB '*[^0-9a-f]*' AND substr(selector,6)<>'00000000000000000000000000000000'),\n library_id TEXT NOT NULL REFERENCES catalog(library_id),\n incarnation TEXT NOT NULL,\n subject_id TEXT NOT NULL REFERENCES policy_subjects(subject_id),\n scope_kind TEXT NOT NULL CHECK(scope_kind IN ('library','asset')),\n asset_id TEXT REFERENCES assets(asset_id),\n actions BLOB NOT NULL CHECK(typeof(actions)='blob' AND length(actions) BETWEEN 1 AND 256),\n verifier BLOB NOT NULL CHECK(typeof(verifier)='blob' AND length(verifier)=32),\n issued_unix INTEGER NOT NULL,\n expires_unix INTEGER NOT NULL CHECK(expires_unix>issued_unix),\n generation INTEGER NOT NULL CHECK(generation>0),\n revoked INTEGER NOT NULL CHECK(revoked IN (0,1)),\n CHECK((scope_kind='library' AND asset_id IS NULL) OR (scope_kind='asset' AND asset_id IS NOT NULL))\n)"
+    },
+    {
+      "Type": "trigger",
+      "Name": "catalog_credentials_identity",
+      "Table": "catalog_credentials",
+      "SQL": "CREATE TRIGGER catalog_credentials_identity BEFORE UPDATE ON catalog_credentials WHEN NEW.selector<>OLD.selector OR NEW.library_id<>OLD.library_id OR NEW.incarnation<>OLD.incarnation OR NEW.subject_id<>OLD.subject_id OR NEW.scope_kind<>OLD.scope_kind OR NEW.asset_id IS NOT OLD.asset_id OR NEW.actions<>OLD.actions OR NEW.verifier<>OLD.verifier OR NEW.issued_unix<>OLD.issued_unix OR NEW.expires_unix<>OLD.expires_unix OR OLD.revoked<>0 OR NEW.revoked<>1 OR NEW.generation<>OLD.generation+1 BEGIN SELECT RAISE(ABORT,'immutable authority identity'); END"
+    },
+    {
+      "Type": "trigger",
+      "Name": "catalog_credentials_no_delete",
+      "Table": "catalog_credentials",
+      "SQL": "CREATE TRIGGER catalog_credentials_no_delete BEFORE DELETE ON catalog_credentials BEGIN SELECT RAISE(ABORT,'authority lifetime identity'); END"
+    },
+    {
+      "Type": "trigger",
+      "Name": "catalog_no_delete",
+      "Table": "catalog",
+      "SQL": "CREATE TRIGGER catalog_no_delete BEFORE DELETE ON catalog BEGIN SELECT RAISE(ABORT,'immutable catalog row'); END"
+    },
+    {
+      "Type": "trigger",
+      "Name": "catalog_no_update",
+      "Table": "catalog",
+      "SQL": "CREATE TRIGGER catalog_no_update BEFORE UPDATE ON catalog WHEN OLD.ready<>0 OR NEW.ready<>1 OR NEW.singleton<>OLD.singleton OR NEW.library_id<>OLD.library_id BEGIN SELECT RAISE(ABORT,'immutable catalog row'); END"
+    },
+    {
+      "Type": "table",
+      "Name": "credential_issuance_receipts",
+      "Table": "credential_issuance_receipts",
+      "SQL": "CREATE TABLE credential_issuance_receipts (\n operation_id TEXT PRIMARY KEY NOT NULL REFERENCES catalog_admin_events(operation_id) DEFERRABLE INITIALLY DEFERRED,\n selector TEXT NOT NULL UNIQUE REFERENCES catalog_credentials(selector)\n)"
+    },
+    {
+      "Type": "trigger",
+      "Name": "credential_issuance_receipts_no_delete",
+      "Table": "credential_issuance_receipts",
+      "SQL": "CREATE TRIGGER credential_issuance_receipts_no_delete BEFORE DELETE ON credential_issuance_receipts BEGIN SELECT RAISE(ABORT,'immutable authority row'); END"
+    },
+    {
+      "Type": "trigger",
+      "Name": "credential_issuance_receipts_no_update",
+      "Table": "credential_issuance_receipts",
+      "SQL": "CREATE TRIGGER credential_issuance_receipts_no_update BEFORE UPDATE ON credential_issuance_receipts BEGIN SELECT RAISE(ABORT,'immutable authority row'); END"
+    },
+    {
+      "Type": "table",
+      "Name": "events",
+      "Table": "events",
+      "SQL": "CREATE TABLE events (\n sequence INTEGER PRIMARY KEY CHECK(sequence>0),\n library_id TEXT NOT NULL REFERENCES catalog(library_id),\n operation_id TEXT NOT NULL UNIQUE CHECK(length(operation_id) BETWEEN 1 AND 128 AND operation_id NOT GLOB '*[^a-zA-Z0-9_-]*'),\n request BLOB NOT NULL CHECK(typeof(request)='blob' AND length(request) BETWEEN 1 AND 1048576),\n payload_sha256 TEXT NOT NULL CHECK(length(payload_sha256)=64 AND payload_sha256 NOT GLOB '*[^0-9a-f]*'),\n recorded_unix_nano INTEGER NOT NULL,\n receipt BLOB NOT NULL CHECK(typeof(receipt)='blob' AND length(receipt) BETWEEN 1 AND 1024)\n)"
+    },
+    {
+      "Type": "trigger",
+      "Name": "events_no_delete",
+      "Table": "events",
+      "SQL": "CREATE TRIGGER events_no_delete BEFORE DELETE ON events BEGIN SELECT RAISE(ABORT,'immutable catalog row'); END"
+    },
+    {
+      "Type": "trigger",
+      "Name": "events_no_update",
+      "Table": "events",
+      "SQL": "CREATE TRIGGER events_no_update BEFORE UPDATE ON events BEGIN SELECT RAISE(ABORT,'immutable catalog row'); END"
+    },
+    {
+      "Type": "table",
+      "Name": "locations",
+      "Table": "locations",
+      "SQL": "CREATE TABLE locations (\n location_id TEXT PRIMARY KEY NOT NULL CHECK(length(location_id) BETWEEN 1 AND 128 AND location_id NOT GLOB '*[^a-zA-Z0-9_-]*'),\n library_id TEXT NOT NULL REFERENCES catalog(library_id),\n asset_id TEXT NOT NULL REFERENCES assets(asset_id),\n revision TEXT,\n source TEXT NOT NULL CHECK(length(CAST(source AS BLOB)) BETWEEN 1 AND 256 AND instr(source,char(0))=0),\n locator TEXT NOT NULL CHECK(length(CAST(locator AS BLOB)) BETWEEN 1 AND 8192 AND instr(locator,char(0))=0),\n created_sequence INTEGER NOT NULL REFERENCES events(sequence) DEFERRABLE INITIALLY DEFERRED,\n updated_sequence INTEGER NOT NULL REFERENCES events(sequence) DEFERRABLE INITIALLY DEFERRED,\n removed INTEGER NOT NULL CHECK(removed IN (0,1)),\n CHECK(created_sequence>0 AND updated_sequence>=created_sequence),\n FOREIGN KEY(asset_id,revision) REFERENCES revisions(asset_id,revision_id)\n)"
+    },
+    {
+      "Type": "index",
+      "Name": "locations_asset_active",
+      "Table": "locations",
+      "SQL": "CREATE INDEX locations_asset_active ON locations(asset_id,removed,location_id)"
+    },
+    {
+      "Type": "trigger",
+      "Name": "locations_identity",
+      "Table": "locations",
+      "SQL": "CREATE TRIGGER locations_identity BEFORE UPDATE ON locations WHEN NEW.location_id<>OLD.location_id OR NEW.library_id<>OLD.library_id OR NEW.asset_id<>OLD.asset_id OR NEW.created_sequence<>OLD.created_sequence OR NEW.updated_sequence<OLD.updated_sequence BEGIN SELECT RAISE(ABORT,'immutable location identity'); END"
+    },
+    {
+      "Type": "trigger",
+      "Name": "locations_no_delete",
+      "Table": "locations",
+      "SQL": "CREATE TRIGGER locations_no_delete BEFORE DELETE ON locations BEGIN SELECT RAISE(ABORT,'catalog tombstone required'); END"
+    },
+    {
+      "Type": "table",
+      "Name": "policy_events",
+      "Table": "policy_events",
+      "SQL": "CREATE TABLE policy_events (\n sequence INTEGER PRIMARY KEY CHECK(sequence>0),\n library_id TEXT NOT NULL REFERENCES catalog(library_id),\n operation_id TEXT NOT NULL UNIQUE CHECK(length(operation_id) BETWEEN 1 AND 128 AND operation_id NOT GLOB '*[^a-zA-Z0-9_-]*'),\n request BLOB NOT NULL CHECK(typeof(request)='blob' AND length(request) BETWEEN 1 AND 1048576),\n payload_sha256 TEXT NOT NULL CHECK(length(payload_sha256)=64 AND payload_sha256 NOT GLOB '*[^0-9a-f]*'),\n recorded_unix_nano INTEGER NOT NULL,\n receipt BLOB NOT NULL CHECK(typeof(receipt)='blob' AND length(receipt) BETWEEN 1 AND 1024)\n)"
+    },
+    {
+      "Type": "trigger",
+      "Name": "policy_events_no_delete",
+      "Table": "policy_events",
+      "SQL": "CREATE TRIGGER policy_events_no_delete BEFORE DELETE ON policy_events BEGIN SELECT RAISE(ABORT,'immutable authority row'); END"
+    },
+    {
+      "Type": "trigger",
+      "Name": "policy_events_no_update",
+      "Table": "policy_events",
+      "SQL": "CREATE TRIGGER policy_events_no_update BEFORE UPDATE ON policy_events BEGIN SELECT RAISE(ABORT,'immutable authority row'); END"
+    },
+    {
+      "Type": "table",
+      "Name": "policy_grants",
+      "Table": "policy_grants",
+      "SQL": "CREATE TABLE policy_grants (\n grant_id TEXT PRIMARY KEY NOT NULL CHECK(length(grant_id) BETWEEN 1 AND 128 AND grant_id NOT GLOB '*[^a-zA-Z0-9_-]*'),\n library_id TEXT NOT NULL REFERENCES catalog(library_id),\n subject_id TEXT NOT NULL REFERENCES policy_subjects(subject_id),\n scope_kind TEXT NOT NULL CHECK(scope_kind IN ('library','asset')),\n asset_id TEXT REFERENCES assets(asset_id),\n actions BLOB NOT NULL CHECK(typeof(actions)='blob' AND length(actions) BETWEEN 1 AND 256),\n created_sequence INTEGER NOT NULL REFERENCES policy_events(sequence) DEFERRABLE INITIALLY DEFERRED,\n updated_sequence INTEGER NOT NULL REFERENCES policy_events(sequence) DEFERRABLE INITIALLY DEFERRED,\n removed INTEGER NOT NULL CHECK(removed IN (0,1)),\n CHECK((scope_kind='library' AND asset_id IS NULL) OR (scope_kind='asset' AND asset_id IS NOT NULL)),\n CHECK(created_sequence>0 AND updated_sequence>=created_sequence)\n)"
+    },
+    {
+      "Type": "index",
+      "Name": "policy_grants_access",
+      "Table": "policy_grants",
+      "SQL": "CREATE INDEX policy_grants_access ON policy_grants(subject_id,removed,scope_kind,asset_id)"
+    },
+    {
+      "Type": "trigger",
+      "Name": "policy_grants_identity",
+      "Table": "policy_grants",
+      "SQL": "CREATE TRIGGER policy_grants_identity BEFORE UPDATE ON policy_grants WHEN NEW.grant_id<>OLD.grant_id OR NEW.library_id<>OLD.library_id OR NEW.subject_id<>OLD.subject_id OR NEW.created_sequence<>OLD.created_sequence BEGIN SELECT RAISE(ABORT,'immutable authority identity'); END"
+    },
+    {
+      "Type": "trigger",
+      "Name": "policy_grants_no_delete",
+      "Table": "policy_grants",
+      "SQL": "CREATE TRIGGER policy_grants_no_delete BEFORE DELETE ON policy_grants BEGIN SELECT RAISE(ABORT,'authority lifetime identity'); END"
+    },
+    {
+      "Type": "table",
+      "Name": "policy_subjects",
+      "Table": "policy_subjects",
+      "SQL": "CREATE TABLE policy_subjects (\n subject_id TEXT PRIMARY KEY NOT NULL CHECK(length(subject_id)=36 AND substr(subject_id,1,4)='sub_' AND substr(subject_id,5) NOT GLOB '*[^0-9a-f]*' AND substr(subject_id,5)<>'00000000000000000000000000000000'),\n library_id TEXT NOT NULL REFERENCES catalog(library_id),\n kind TEXT NOT NULL CHECK(kind IN ('person','service')),\n label TEXT NOT NULL CHECK(length(CAST(label AS BLOB))<=256 AND instr(label,char(0))=0),\n enabled INTEGER NOT NULL CHECK(enabled IN (0,1)),\n authorization_generation INTEGER NOT NULL CHECK(authorization_generation>0),\n created_sequence INTEGER NOT NULL REFERENCES policy_events(sequence) DEFERRABLE INITIALLY DEFERRED,\n updated_sequence INTEGER NOT NULL REFERENCES policy_events(sequence) DEFERRABLE INITIALLY DEFERRED,\n CHECK(created_sequence>0 AND updated_sequence>=created_sequence)\n)"
+    },
+    {
+      "Type": "trigger",
+      "Name": "policy_subjects_identity",
+      "Table": "policy_subjects",
+      "SQL": "CREATE TRIGGER policy_subjects_identity BEFORE UPDATE ON policy_subjects WHEN NEW.subject_id<>OLD.subject_id OR NEW.library_id<>OLD.library_id OR NEW.kind<>OLD.kind OR NEW.created_sequence<>OLD.created_sequence BEGIN SELECT RAISE(ABORT,'immutable authority identity'); END"
+    },
+    {
+      "Type": "trigger",
+      "Name": "policy_subjects_no_delete",
+      "Table": "policy_subjects",
+      "SQL": "CREATE TRIGGER policy_subjects_no_delete BEFORE DELETE ON policy_subjects BEGIN SELECT RAISE(ABORT,'authority lifetime identity'); END"
+    },
+    {
+      "Type": "table",
+      "Name": "relationships",
+      "Table": "relationships",
+      "SQL": "CREATE TABLE relationships (\n relationship_id TEXT PRIMARY KEY NOT NULL CHECK(length(relationship_id) BETWEEN 1 AND 128 AND relationship_id NOT GLOB '*[^a-zA-Z0-9_-]*'),\n library_id TEXT NOT NULL REFERENCES catalog(library_id),\n source_asset_id TEXT NOT NULL REFERENCES assets(asset_id),\n source_revision TEXT,\n target_asset_id TEXT NOT NULL REFERENCES assets(asset_id),\n target_revision TEXT,\n predicate TEXT NOT NULL CHECK(length(CAST(predicate AS BLOB)) BETWEEN 1 AND 128 AND instr(predicate,char(0))=0),\n provenance TEXT NOT NULL CHECK(provenance IN ('observed','claimed','inferred')),\n source TEXT NOT NULL CHECK(length(CAST(source AS BLOB)) BETWEEN 1 AND 256 AND instr(source,char(0))=0),\n created_sequence INTEGER NOT NULL REFERENCES events(sequence) DEFERRABLE INITIALLY DEFERRED,\n updated_sequence INTEGER NOT NULL REFERENCES events(sequence) DEFERRABLE INITIALLY DEFERRED,\n removed INTEGER NOT NULL CHECK(removed IN (0,1)),\n CHECK(created_sequence>0 AND updated_sequence>=created_sequence),\n FOREIGN KEY(source_asset_id,source_revision) REFERENCES revisions(asset_id,revision_id),\n FOREIGN KEY(target_asset_id,target_revision) REFERENCES revisions(asset_id,revision_id)\n)"
+    },
+    {
+      "Type": "trigger",
+      "Name": "relationships_identity",
+      "Table": "relationships",
+      "SQL": "CREATE TRIGGER relationships_identity BEFORE UPDATE ON relationships WHEN NEW.relationship_id<>OLD.relationship_id OR NEW.library_id<>OLD.library_id OR NEW.created_sequence<>OLD.created_sequence OR NEW.updated_sequence<OLD.updated_sequence BEGIN SELECT RAISE(ABORT,'immutable relationship identity'); END"
+    },
+    {
+      "Type": "trigger",
+      "Name": "relationships_no_delete",
+      "Table": "relationships",
+      "SQL": "CREATE TRIGGER relationships_no_delete BEFORE DELETE ON relationships BEGIN SELECT RAISE(ABORT,'catalog tombstone required'); END"
+    },
+    {
+      "Type": "index",
+      "Name": "relationships_source_active",
+      "Table": "relationships",
+      "SQL": "CREATE INDEX relationships_source_active ON relationships(source_asset_id,removed,relationship_id)"
+    },
+    {
+      "Type": "index",
+      "Name": "relationships_target_active",
+      "Table": "relationships",
+      "SQL": "CREATE INDEX relationships_target_active ON relationships(target_asset_id,removed,relationship_id)"
+    },
+    {
+      "Type": "table",
+      "Name": "revision_parents",
+      "Table": "revision_parents",
+      "SQL": "CREATE TABLE revision_parents (\n revision_id TEXT NOT NULL,\n parent_id TEXT NOT NULL,\n asset_id TEXT NOT NULL,\n PRIMARY KEY(revision_id,parent_id),\n CHECK(revision_id<>parent_id),\n FOREIGN KEY(asset_id,revision_id) REFERENCES revisions(asset_id,revision_id),\n FOREIGN KEY(asset_id,parent_id) REFERENCES revisions(asset_id,revision_id)\n)"
+    },
+    {
+      "Type": "trigger",
+      "Name": "revision_parents_no_delete",
+      "Table": "revision_parents",
+      "SQL": "CREATE TRIGGER revision_parents_no_delete BEFORE DELETE ON revision_parents BEGIN SELECT RAISE(ABORT,'immutable catalog row'); END"
+    },
+    {
+      "Type": "trigger",
+      "Name": "revision_parents_no_update",
+      "Table": "revision_parents",
+      "SQL": "CREATE TRIGGER revision_parents_no_update BEFORE UPDATE ON revision_parents BEGIN SELECT RAISE(ABORT,'immutable catalog row'); END"
+    },
+    {
+      "Type": "table",
+      "Name": "revisions",
+      "Table": "revisions",
+      "SQL": "CREATE TABLE revisions (\n revision_id TEXT PRIMARY KEY NOT NULL CHECK(length(revision_id)=69 AND substr(revision_id,1,5)='rev1_' AND substr(revision_id,6) NOT GLOB '*[^0-9a-f]*'),\n library_id TEXT NOT NULL REFERENCES catalog(library_id),\n asset_id TEXT NOT NULL REFERENCES assets(asset_id),\n canonical BLOB NOT NULL CHECK(typeof(canonical)='blob' AND length(canonical) BETWEEN 95 AND 2143),\n manifest_json BLOB NOT NULL CHECK(typeof(manifest_json)='blob' AND length(manifest_json) BETWEEN 1 AND 8192),\n created_sequence INTEGER NOT NULL CHECK(created_sequence>0) REFERENCES events(sequence) DEFERRABLE INITIALLY DEFERRED,\n UNIQUE(asset_id,revision_id)\n)"
+    },
+    {
+      "Type": "trigger",
+      "Name": "revisions_no_delete",
+      "Table": "revisions",
+      "SQL": "CREATE TRIGGER revisions_no_delete BEFORE DELETE ON revisions BEGIN SELECT RAISE(ABORT,'immutable catalog row'); END"
+    },
+    {
+      "Type": "trigger",
+      "Name": "revisions_no_update",
+      "Table": "revisions",
+      "SQL": "CREATE TRIGGER revisions_no_update BEFORE UPDATE ON revisions BEGIN SELECT RAISE(ABORT,'immutable catalog row'); END"
+    },
+    {
+      "Type": "table",
+      "Name": "schema_migrations",
+      "Table": "schema_migrations",
+      "SQL": "CREATE TABLE schema_migrations (\n version INTEGER PRIMARY KEY CHECK(version>=1),\n fingerprint TEXT NOT NULL CHECK(length(fingerprint)=64 AND fingerprint NOT GLOB '*[^0-9a-f]*')\n)"
+    },
+    {
+      "Type": "trigger",
+      "Name": "schema_migrations_no_delete",
+      "Table": "schema_migrations",
+      "SQL": "CREATE TRIGGER schema_migrations_no_delete BEFORE DELETE ON schema_migrations BEGIN SELECT RAISE(ABORT,'immutable catalog row'); END"
+    },
+    {
+      "Type": "trigger",
+      "Name": "schema_migrations_no_update",
+      "Table": "schema_migrations",
+      "SQL": "CREATE TRIGGER schema_migrations_no_update BEFORE UPDATE ON schema_migrations BEGIN SELECT RAISE(ABORT,'immutable catalog row'); END"
+    }
+  ],
+  "library_id": "lib_000102030405060708090a0b0c0d0e0f",
+  "ready": true,
+  "event_count": 5,
+  "policy_event_count": 4,
+  "combined_event_count": 9,
+  "projection_rows": 12,
+  "projection_sha256": "9e8ffbab12b700adc3baf35c1937cf0e8e30008ba9c794c463e5169a39fc2041",
+  "metadata_projection_sha256_format1": "c14181688157741b9fd2c81f34037f21cd370e85d751292b040fdf85b9e39c15",
+  "events": [
+    {
+      "request_json": "{\"version\":1,\"library_id\":\"lib_000102030405060708090a0b0c0d0e0f\",\"operation_id\":\"create_scene_001\",\"actor\":\"owner-demo\",\"changes\":[{\"create_asset\":{\"asset_id\":\"asset_101112131415161718191a1b1c1d1e1f\",\"label\":\"Scene \\u003cA\\u003e \\u0026 café\\u2028next\"}},{\"record_revision\":{\"version\":1,\"library_id\":\"lib_000102030405060708090a0b0c0d0e0f\",\"asset_id\":\"asset_101112131415161718191a1b1c1d1e1f\",\"content\":{\"sha256\":\"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad\",\"size\":3},\"parents\":[]}},{\"advance_head\":{\"asset_id\":\"asset_101112131415161718191a1b1c1d1e1f\",\"expected_revision\":\"\",\"revision\":\"rev1_08360b41fa64c32ba1decf26ca750f4d74748870d2b3b9c8b682f22b8ca51b2b\"}}]}",
+      "receipt_json": "{\"version\":1,\"library_id\":\"lib_000102030405060708090a0b0c0d0e0f\",\"operation_id\":\"create_scene_001\",\"sequence\":1,\"payload_sha256\":\"260069e3c1382a1b20cbb618a247285f2fe32c7a46a62b9e6693dd23a5b63530\",\"recorded_unix_nano\":1700000000000000001}"
+    },
+    {
+      "request_json": "{\"version\":1,\"library_id\":\"lib_000102030405060708090a0b0c0d0e0f\",\"operation_id\":\"advance_scene_002\",\"actor\":\"owner-demo\",\"changes\":[{\"record_revision\":{\"version\":1,\"library_id\":\"lib_000102030405060708090a0b0c0d0e0f\",\"asset_id\":\"asset_101112131415161718191a1b1c1d1e1f\",\"content\":{\"sha256\":\"88d4266fd4e6338d13b845fcf289579d209c897823b9217da3e161936f031589\",\"size\":4},\"parents\":[\"rev1_08360b41fa64c32ba1decf26ca750f4d74748870d2b3b9c8b682f22b8ca51b2b\"]}},{\"advance_head\":{\"asset_id\":\"asset_101112131415161718191a1b1c1d1e1f\",\"expected_revision\":\"rev1_08360b41fa64c32ba1decf26ca750f4d74748870d2b3b9c8b682f22b8ca51b2b\",\"revision\":\"rev1_3cdcd7314dd6c4ff0dd95e4286d5227d4f086be0e2d4b1efe1590bc14c003510\"}}]}",
+      "receipt_json": "{\"version\":1,\"library_id\":\"lib_000102030405060708090a0b0c0d0e0f\",\"operation_id\":\"advance_scene_002\",\"sequence\":2,\"payload_sha256\":\"5deaa899a9c6bf16f6151512cc15b3ad9b4d455cf5b790ee88f246e020829e83\",\"recorded_unix_nano\":1700000000000000002}"
+    },
+    {
+      "request_json": "{\"version\":1,\"library_id\":\"lib_000102030405060708090a0b0c0d0e0f\",\"operation_id\":\"relate_and_locate_003\",\"actor\":\"owner-demo\",\"changes\":[{\"put_relationship\":{\"id\":\"edge_scene_001\",\"expected\":null,\"value\":{\"source_asset_id\":\"asset_101112131415161718191a1b1c1d1e1f\",\"source_revision\":\"\",\"target_asset_id\":\"asset_101112131415161718191a1b1c1d1e1f\",\"target_revision\":\"rev1_3cdcd7314dd6c4ff0dd95e4286d5227d4f086be0e2d4b1efe1590bc14c003510\",\"predicate\":\"related_to\",\"provenance\":\"observed\",\"source\":\"fixture \\u003cobserver\\u003e \\u0026 café\\u2029next\"}}},{\"put_location\":{\"id\":\"location_scene_001\",\"expected\":null,\"value\":{\"asset_id\":\"asset_101112131415161718191a1b1c1d1e1f\",\"revision\":\"rev1_3cdcd7314dd6c4ff0dd95e4286d5227d4f086be0e2d4b1efe1590bc14c003510\",\"source\":\"fixture\",\"locator\":\"nas://demo/scene%20A.mov\"}}}]}",
+      "receipt_json": "{\"version\":1,\"library_id\":\"lib_000102030405060708090a0b0c0d0e0f\",\"operation_id\":\"relate_and_locate_003\",\"sequence\":3,\"payload_sha256\":\"85b7f063a6eccae9d63735146f90c1c14ad8225ae1453a330a3d85d908b1c210\",\"recorded_unix_nano\":1700000000000000003}"
+    },
+    {
+      "request_json": "{\"version\":1,\"library_id\":\"lib_000102030405060708090a0b0c0d0e0f\",\"operation_id\":\"remove_observations_004\",\"actor\":\"owner-demo\",\"changes\":[{\"remove_relationship\":{\"id\":\"edge_scene_001\",\"expected\":{\"value\":{\"source_asset_id\":\"asset_101112131415161718191a1b1c1d1e1f\",\"source_revision\":\"\",\"target_asset_id\":\"asset_101112131415161718191a1b1c1d1e1f\",\"target_revision\":\"rev1_3cdcd7314dd6c4ff0dd95e4286d5227d4f086be0e2d4b1efe1590bc14c003510\",\"predicate\":\"related_to\",\"provenance\":\"observed\",\"source\":\"fixture \\u003cobserver\\u003e \\u0026 café\\u2029next\"},\"updated_sequence\":3,\"removed\":false}}},{\"remove_location\":{\"id\":\"location_scene_001\",\"expected\":{\"value\":{\"asset_id\":\"asset_101112131415161718191a1b1c1d1e1f\",\"revision\":\"rev1_3cdcd7314dd6c4ff0dd95e4286d5227d4f086be0e2d4b1efe1590bc14c003510\",\"source\":\"fixture\",\"locator\":\"nas://demo/scene%20A.mov\"},\"updated_sequence\":3,\"removed\":false}}}]}",
+      "receipt_json": "{\"version\":1,\"library_id\":\"lib_000102030405060708090a0b0c0d0e0f\",\"operation_id\":\"remove_observations_004\",\"sequence\":4,\"payload_sha256\":\"cd4142324dad253991b14ddc9e6b60f3009ee33898b15559b182dfbebf25666f\",\"recorded_unix_nano\":1700000000000000004}"
+    },
+    {
+      "request_json": "{\"version\":1,\"library_id\":\"lib_000102030405060708090a0b0c0d0e0f\",\"operation_id\":\"reactivate_and_repeat_005\",\"actor\":\"owner-demo\",\"changes\":[{\"record_revision\":{\"version\":1,\"library_id\":\"lib_000102030405060708090a0b0c0d0e0f\",\"asset_id\":\"asset_101112131415161718191a1b1c1d1e1f\",\"content\":{\"sha256\":\"88d4266fd4e6338d13b845fcf289579d209c897823b9217da3e161936f031589\",\"size\":4},\"parents\":[\"rev1_08360b41fa64c32ba1decf26ca750f4d74748870d2b3b9c8b682f22b8ca51b2b\"]}},{\"put_relationship\":{\"id\":\"edge_scene_001\",\"expected\":{\"value\":{\"source_asset_id\":\"asset_101112131415161718191a1b1c1d1e1f\",\"source_revision\":\"\",\"target_asset_id\":\"asset_101112131415161718191a1b1c1d1e1f\",\"target_revision\":\"rev1_3cdcd7314dd6c4ff0dd95e4286d5227d4f086be0e2d4b1efe1590bc14c003510\",\"predicate\":\"related_to\",\"provenance\":\"observed\",\"source\":\"fixture \\u003cobserver\\u003e \\u0026 café\\u2029next\"},\"updated_sequence\":4,\"removed\":true},\"value\":{\"source_asset_id\":\"asset_101112131415161718191a1b1c1d1e1f\",\"source_revision\":\"rev1_3cdcd7314dd6c4ff0dd95e4286d5227d4f086be0e2d4b1efe1590bc14c003510\",\"target_asset_id\":\"asset_101112131415161718191a1b1c1d1e1f\",\"target_revision\":\"rev1_08360b41fa64c32ba1decf26ca750f4d74748870d2b3b9c8b682f22b8ca51b2b\",\"predicate\":\"related_to\",\"provenance\":\"claimed\",\"source\":\"owner correction\"}}}]}",
+      "receipt_json": "{\"version\":1,\"library_id\":\"lib_000102030405060708090a0b0c0d0e0f\",\"operation_id\":\"reactivate_and_repeat_005\",\"sequence\":5,\"payload_sha256\":\"6cbbef4a63c13937dd979417d28325fc95d58f8b0ca2593d330c954333d8e650\",\"recorded_unix_nano\":1700000000000000005}"
+    }
+  ],
+  "policy_events": [
+    {
+      "name": "synthetic_bootstrap_001",
+      "request_json": "{\"version\":1,\"library_id\":\"lib_000102030405060708090a0b0c0d0e0f\",\"operation_id\":\"synthetic_bootstrap_001\",\"administration\":\"local_owner\",\"operator_subject_id\":\"sub_11111111111111111111111111111111\",\"changes\":[{\"kind\":\"create_subject\",\"value\":{\"subject_id\":\"sub_11111111111111111111111111111111\",\"value\":{\"kind\":\"person\",\"label\":\"SYNTHETIC owner \\u003ctest\\u003e \\u0026 café\\u2028line\\u2029end\",\"enabled\":true}}}]}",
+      "request_hex": "7b2276657273696f6e223a312c226c6962726172795f6964223a226c69625f3030303130323033303430353036303730383039306130623063306430653066222c226f7065726174696f6e5f6964223a2273796e7468657469635f626f6f7473747261705f303031222c2261646d696e697374726174696f6e223a226c6f63616c5f6f776e6572222c226f70657261746f725f7375626a6563745f6964223a227375625f3131313131313131313131313131313131313131313131313131313131313131222c226368616e676573223a5b7b226b696e64223a226372656174655f7375626a656374222c2276616c7565223a7b227375626a6563745f6964223a227375625f3131313131313131313131313131313131313131313131313131313131313131222c2276616c7565223a7b226b696e64223a22706572736f6e222c226c6162656c223a2253594e544845544943206f776e6572205c7530303363746573745c7530303365205c753030323620636166c3a95c75323032386c696e655c7532303239656e64222c22656e61626c6564223a747275657d7d7d5d7d",
+      "request_bytes": 414,
+      "payload_sha256": "3db6e1d6c5a23afd911d2471cc84cd6f05656ba0e09ab0103ca9998949bfc71c",
+      "sequence": 1,
+      "receipt_json": "{\"version\":1,\"library_id\":\"lib_000102030405060708090a0b0c0d0e0f\",\"operation_id\":\"synthetic_bootstrap_001\",\"sequence\":1,\"payload_sha256\":\"3db6e1d6c5a23afd911d2471cc84cd6f05656ba0e09ab0103ca9998949bfc71c\",\"recorded_unix_nano\":1700000000000001001}",
+      "receipt_hex": "7b2276657273696f6e223a312c226c6962726172795f6964223a226c69625f3030303130323033303430353036303730383039306130623063306430653066222c226f7065726174696f6e5f6964223a2273796e7468657469635f626f6f7473747261705f303031222c2273657175656e6365223a312c227061796c6f61645f736861323536223a2233646236653164366335613233616664393131643234373163633834636436663035363536626130653039616230313033636139393938393439626663373163222c227265636f726465645f756e69785f6e616e6f223a313730303030303030303030303030313030317d",
+      "receipt_bytes": 244
+    },
+    {
+      "name": "synthetic_policy_002",
+      "request_json": "{\"version\":1,\"library_id\":\"lib_000102030405060708090a0b0c0d0e0f\",\"operation_id\":\"synthetic_policy_002\",\"administration\":\"local_owner\",\"operator_subject_id\":\"sub_11111111111111111111111111111111\",\"changes\":[{\"kind\":\"create_subject\",\"value\":{\"subject_id\":\"sub_22222222222222222222222222222222\",\"value\":{\"kind\":\"person\",\"label\":\"SYNTHETIC person \\\"quoted\\\" \\\\ slash\\nline\",\"enabled\":true}}},{\"kind\":\"create_subject\",\"value\":{\"subject_id\":\"sub_33333333333333333333333333333333\",\"value\":{\"kind\":\"service\",\"label\":\"SYNTHETIC service\",\"enabled\":true}}},{\"kind\":\"put_grant\",\"value\":{\"id\":\"synthetic_person_grant\",\"expected\":null,\"value\":{\"subject_id\":\"sub_22222222222222222222222222222222\",\"scope\":{\"kind\":\"library\",\"asset_id\":\"\"},\"actions\":[\"activity.record\",\"assets.discover\",\"locations.read\",\"relationships.read\",\"revisions.read\"]}}},{\"kind\":\"put_grant\",\"value\":{\"id\":\"synthetic_service_grant\",\"expected\":null,\"value\":{\"subject_id\":\"sub_33333333333333333333333333333333\",\"scope\":{\"kind\":\"asset\",\"asset_id\":\"asset_101112131415161718191a1b1c1d1e1f\"},\"actions\":[\"assets.discover\",\"revisions.read\"]}}}]}",
+      "request_hex": "7b2276657273696f6e223a312c226c6962726172795f6964223a226c69625f3030303130323033303430353036303730383039306130623063306430653066222c226f7065726174696f6e5f6964223a2273796e7468657469635f706f6c6963795f303032222c2261646d696e697374726174696f6e223a226c6f63616c5f6f776e6572222c226f70657261746f725f7375626a6563745f6964223a227375625f3131313131313131313131313131313131313131313131313131313131313131222c226368616e676573223a5b7b226b696e64223a226372656174655f7375626a656374222c2276616c7565223a7b227375626a6563745f6964223a227375625f3232323232323232323232323232323232323232323232323232323232323232222c2276616c7565223a7b226b696e64223a22706572736f6e222c226c6162656c223a2253594e54484554494320706572736f6e205c2271756f7465645c22205c5c20736c6173685c6e6c696e65222c22656e61626c6564223a747275657d7d7d2c7b226b696e64223a226372656174655f7375626a656374222c2276616c7565223a7b227375626a6563745f6964223a227375625f3333333333333333333333333333333333333333333333333333333333333333222c2276616c7565223a7b226b696e64223a2273657276696365222c226c6162656c223a2253594e5448455449432073657276696365222c22656e61626c6564223a747275657d7d7d2c7b226b696e64223a227075745f6772616e74222c2276616c7565223a7b226964223a2273796e7468657469635f706572736f6e5f6772616e74222c226578706563746564223a6e756c6c2c2276616c7565223a7b227375626a6563745f6964223a227375625f3232323232323232323232323232323232323232323232323232323232323232222c2273636f7065223a7b226b696e64223a226c696272617279222c2261737365745f6964223a22227d2c22616374696f6e73223a5b2261637469766974792e7265636f7264222c226173736574732e646973636f766572222c226c6f636174696f6e732e72656164222c2272656c6174696f6e73686970732e72656164222c227265766973696f6e732e72656164225d7d7d7d2c7b226b696e64223a227075745f6772616e74222c2276616c7565223a7b226964223a2273796e7468657469635f736572766963655f6772616e74222c226578706563746564223a6e756c6c2c2276616c7565223a7b227375626a6563745f6964223a227375625f3333333333333333333333333333333333333333333333333333333333333333222c2273636f7065223a7b226b696e64223a226173736574222c2261737365745f6964223a2261737365745f3130313131323133313431353136313731383139316131623163316431653166227d2c22616374696f6e73223a5b226173736574732e646973636f766572222c227265766973696f6e732e72656164225d7d7d7d5d7d",
+      "request_bytes": 1094,
+      "payload_sha256": "25d2a4ea62b119e61c8b35bfdda0509aeaee982515f14f3ee3ccf39d335f06e8",
+      "sequence": 2,
+      "receipt_json": "{\"version\":1,\"library_id\":\"lib_000102030405060708090a0b0c0d0e0f\",\"operation_id\":\"synthetic_policy_002\",\"sequence\":2,\"payload_sha256\":\"25d2a4ea62b119e61c8b35bfdda0509aeaee982515f14f3ee3ccf39d335f06e8\",\"recorded_unix_nano\":1700000000000001002}",
+      "receipt_hex": "7b2276657273696f6e223a312c226c6962726172795f6964223a226c69625f3030303130323033303430353036303730383039306130623063306430653066222c226f7065726174696f6e5f6964223a2273796e7468657469635f706f6c6963795f303032222c2273657175656e6365223a322c227061796c6f61645f736861323536223a2232356432613465613632623131396536316338623335626664646130353039616561656539383235313566313466336565336363663339643333356630366538222c227265636f726465645f756e69785f6e616e6f223a313730303030303030303030303030313030327d",
+      "receipt_bytes": 241
+    },
+    {
+      "name": "synthetic_policy_003",
+      "request_json": "{\"version\":1,\"library_id\":\"lib_000102030405060708090a0b0c0d0e0f\",\"operation_id\":\"synthetic_policy_003\",\"administration\":\"local_owner\",\"operator_subject_id\":\"sub_11111111111111111111111111111111\",\"changes\":[{\"kind\":\"update_subject\",\"value\":{\"subject_id\":\"sub_22222222222222222222222222222222\",\"expected\":{\"value\":{\"kind\":\"person\",\"label\":\"SYNTHETIC person \\\"quoted\\\" \\\\ slash\\nline\",\"enabled\":true},\"authorization_generation\":1,\"updated_sequence\":2},\"value\":{\"kind\":\"person\",\"label\":\"SYNTHETIC person \\\"quoted\\\" \\\\ slash\\nline\",\"enabled\":false}}},{\"kind\":\"remove_grant\",\"value\":{\"id\":\"synthetic_person_grant\",\"expected\":{\"value\":{\"subject_id\":\"sub_22222222222222222222222222222222\",\"scope\":{\"kind\":\"library\",\"asset_id\":\"\"},\"actions\":[\"activity.record\",\"assets.discover\",\"locations.read\",\"relationships.read\",\"revisions.read\"]},\"updated_sequence\":2,\"removed\":false}}},{\"kind\":\"remove_grant\",\"value\":{\"id\":\"synthetic_service_grant\",\"expected\":{\"value\":{\"subject_id\":\"sub_33333333333333333333333333333333\",\"scope\":{\"kind\":\"asset\",\"asset_id\":\"asset_101112131415161718191a1b1c1d1e1f\"},\"actions\":[\"assets.discover\",\"revisions.read\"]},\"updated_sequence\":2,\"removed\":false}}}]}",
+      "request_hex": "7b2276657273696f6e223a312c226c6962726172795f6964223a226c69625f3030303130323033303430353036303730383039306130623063306430653066222c226f7065726174696f6e5f6964223a2273796e7468657469635f706f6c6963795f303033222c2261646d696e697374726174696f6e223a226c6f63616c5f6f776e6572222c226f70657261746f725f7375626a6563745f6964223a227375625f3131313131313131313131313131313131313131313131313131313131313131222c226368616e676573223a5b7b226b696e64223a227570646174655f7375626a656374222c2276616c7565223a7b227375626a6563745f6964223a227375625f3232323232323232323232323232323232323232323232323232323232323232222c226578706563746564223a7b2276616c7565223a7b226b696e64223a22706572736f6e222c226c6162656c223a2253594e54484554494320706572736f6e205c2271756f7465645c22205c5c20736c6173685c6e6c696e65222c22656e61626c6564223a747275657d2c22617574686f72697a6174696f6e5f67656e65726174696f6e223a312c22757064617465645f73657175656e6365223a327d2c2276616c7565223a7b226b696e64223a22706572736f6e222c226c6162656c223a2253594e54484554494320706572736f6e205c2271756f7465645c22205c5c20736c6173685c6e6c696e65222c22656e61626c6564223a66616c73657d7d7d2c7b226b696e64223a2272656d6f76655f6772616e74222c2276616c7565223a7b226964223a2273796e7468657469635f706572736f6e5f6772616e74222c226578706563746564223a7b2276616c7565223a7b227375626a6563745f6964223a227375625f3232323232323232323232323232323232323232323232323232323232323232222c2273636f7065223a7b226b696e64223a226c696272617279222c2261737365745f6964223a22227d2c22616374696f6e73223a5b2261637469766974792e7265636f7264222c226173736574732e646973636f766572222c226c6f636174696f6e732e72656164222c2272656c6174696f6e73686970732e72656164222c227265766973696f6e732e72656164225d7d2c22757064617465645f73657175656e6365223a322c2272656d6f766564223a66616c73657d7d7d2c7b226b696e64223a2272656d6f76655f6772616e74222c2276616c7565223a7b226964223a2273796e7468657469635f736572766963655f6772616e74222c226578706563746564223a7b2276616c7565223a7b227375626a6563745f6964223a227375625f3333333333333333333333333333333333333333333333333333333333333333222c2273636f7065223a7b226b696e64223a226173736574222c2261737365745f6964223a2261737365745f3130313131323133313431353136313731383139316131623163316431653166227d2c22616374696f6e73223a5b226173736574732e646973636f766572222c227265766973696f6e732e72656164225d7d2c22757064617465645f73657175656e6365223a322c2272656d6f766564223a66616c73657d7d7d5d7d",
+      "request_bytes": 1168,
+      "payload_sha256": "a1fa3688a9c87e71673e5c5ac6311398578081f3bba2d34c0c401834ea58971c",
+      "sequence": 3,
+      "receipt_json": "{\"version\":1,\"library_id\":\"lib_000102030405060708090a0b0c0d0e0f\",\"operation_id\":\"synthetic_policy_003\",\"sequence\":3,\"payload_sha256\":\"a1fa3688a9c87e71673e5c5ac6311398578081f3bba2d34c0c401834ea58971c\",\"recorded_unix_nano\":1700000000000001003}",
+      "receipt_hex": "7b2276657273696f6e223a312c226c6962726172795f6964223a226c69625f3030303130323033303430353036303730383039306130623063306430653066222c226f7065726174696f6e5f6964223a2273796e7468657469635f706f6c6963795f303033222c2273657175656e6365223a332c227061796c6f61645f736861323536223a2261316661333638386139633837653731363733653563356163363331313339383537383038316633626261326433346330633430313833346561353839373163222c227265636f726465645f756e69785f6e616e6f223a313730303030303030303030303030313030337d",
+      "receipt_bytes": 241
+    },
+    {
+      "name": "synthetic_policy_004",
+      "request_json": "{\"version\":1,\"library_id\":\"lib_000102030405060708090a0b0c0d0e0f\",\"operation_id\":\"synthetic_policy_004\",\"administration\":\"local_owner\",\"operator_subject_id\":\"sub_11111111111111111111111111111111\",\"changes\":[{\"kind\":\"update_subject\",\"value\":{\"subject_id\":\"sub_22222222222222222222222222222222\",\"expected\":{\"value\":{\"kind\":\"person\",\"label\":\"SYNTHETIC person \\\"quoted\\\" \\\\ slash\\nline\",\"enabled\":false},\"authorization_generation\":2,\"updated_sequence\":3},\"value\":{\"kind\":\"person\",\"label\":\"SYNTHETIC person \\\"quoted\\\" \\\\ slash\\nline\",\"enabled\":false}}},{\"kind\":\"put_grant\",\"value\":{\"id\":\"synthetic_person_grant\",\"expected\":{\"value\":{\"subject_id\":\"sub_22222222222222222222222222222222\",\"scope\":{\"kind\":\"library\",\"asset_id\":\"\"},\"actions\":[\"activity.record\",\"assets.discover\",\"locations.read\",\"relationships.read\",\"revisions.read\"]},\"updated_sequence\":3,\"removed\":true},\"value\":{\"subject_id\":\"sub_22222222222222222222222222222222\",\"scope\":{\"kind\":\"asset\",\"asset_id\":\"asset_101112131415161718191a1b1c1d1e1f\"},\"actions\":[\"assets.discover\",\"locations.read\"]}}}]}",
+      "request_hex": "7b2276657273696f6e223a312c226c6962726172795f6964223a226c69625f3030303130323033303430353036303730383039306130623063306430653066222c226f7065726174696f6e5f6964223a2273796e7468657469635f706f6c6963795f303034222c2261646d696e697374726174696f6e223a226c6f63616c5f6f776e6572222c226f70657261746f725f7375626a6563745f6964223a227375625f3131313131313131313131313131313131313131313131313131313131313131222c226368616e676573223a5b7b226b696e64223a227570646174655f7375626a656374222c2276616c7565223a7b227375626a6563745f6964223a227375625f3232323232323232323232323232323232323232323232323232323232323232222c226578706563746564223a7b2276616c7565223a7b226b696e64223a22706572736f6e222c226c6162656c223a2253594e54484554494320706572736f6e205c2271756f7465645c22205c5c20736c6173685c6e6c696e65222c22656e61626c6564223a66616c73657d2c22617574686f72697a6174696f6e5f67656e65726174696f6e223a322c22757064617465645f73657175656e6365223a337d2c2276616c7565223a7b226b696e64223a22706572736f6e222c226c6162656c223a2253594e54484554494320706572736f6e205c2271756f7465645c22205c5c20736c6173685c6e6c696e65222c22656e61626c6564223a66616c73657d7d7d2c7b226b696e64223a227075745f6772616e74222c2276616c7565223a7b226964223a2273796e7468657469635f706572736f6e5f6772616e74222c226578706563746564223a7b2276616c7565223a7b227375626a6563745f6964223a227375625f3232323232323232323232323232323232323232323232323232323232323232222c2273636f7065223a7b226b696e64223a226c696272617279222c2261737365745f6964223a22227d2c22616374696f6e73223a5b2261637469766974792e7265636f7264222c226173736574732e646973636f766572222c226c6f636174696f6e732e72656164222c2272656c6174696f6e73686970732e72656164222c227265766973696f6e732e72656164225d7d2c22757064617465645f73657175656e6365223a332c2272656d6f766564223a747275657d2c2276616c7565223a7b227375626a6563745f6964223a227375625f3232323232323232323232323232323232323232323232323232323232323232222c2273636f7065223a7b226b696e64223a226173736574222c2261737365745f6964223a2261737365745f3130313131323133313431353136313731383139316131623163316431653166227d2c22616374696f6e73223a5b226173736574732e646973636f766572222c226c6f636174696f6e732e72656164225d7d7d7d5d7d",
+      "request_bytes": 1050,
+      "payload_sha256": "82754519d1e2f0fbe0e78cfe69bf77648beb7c38b3b592fd5ea1d83e56da3cbd",
+      "sequence": 4,
+      "receipt_json": "{\"version\":1,\"library_id\":\"lib_000102030405060708090a0b0c0d0e0f\",\"operation_id\":\"synthetic_policy_004\",\"sequence\":4,\"payload_sha256\":\"82754519d1e2f0fbe0e78cfe69bf77648beb7c38b3b592fd5ea1d83e56da3cbd\",\"recorded_unix_nano\":1700000000000001004}",
+      "receipt_hex": "7b2276657273696f6e223a312c226c6962726172795f6964223a226c69625f3030303130323033303430353036303730383039306130623063306430653066222c226f7065726174696f6e5f6964223a2273796e7468657469635f706f6c6963795f303034222c2273657175656e6365223a342c227061796c6f61645f736861323536223a2238323735343531396431653266306662653065373863666536396266373736343862656237633338623362353932666435656131643833653536646133636264222c227265636f726465645f756e69785f6e616e6f223a313730303030303030303030303030313030347d",
+      "receipt_bytes": 241
+    }
+  ],
+  "projections": [
+    {
+      "kind": 17,
+      "payload_json": "{\"library_id\":\"lib_000102030405060708090a0b0c0d0e0f\"}",
+      "frame_hex": "11000000357b226c6962726172795f6964223a226c69625f3030303130323033303430353036303730383039306130623063306430653066227d"
+    },
+    {
+      "kind": 18,
+      "payload_json": "{\"library_id\":\"lib_000102030405060708090a0b0c0d0e0f\",\"asset_id\":\"asset_101112131415161718191a1b1c1d1e1f\",\"label\":\"Scene \\u003cA\\u003e \\u0026 café\\u2028next\",\"head\":\"rev1_3cdcd7314dd6c4ff0dd95e4286d5227d4f086be0e2d4b1efe1590bc14c003510\",\"created_sequence\":1,\"updated_sequence\":2}",
+      "frame_hex": "12000001177b226c6962726172795f6964223a226c69625f3030303130323033303430353036303730383039306130623063306430653066222c2261737365745f6964223a2261737365745f3130313131323133313431353136313731383139316131623163316431653166222c226c6162656c223a225363656e65205c7530303363415c7530303365205c753030323620636166c3a95c75323032386e657874222c2268656164223a22726576315f33636463643733313464643663346666306464393565343238366435323237643466303836626530653264346231656665313539306263313463303033353130222c22637265617465645f73657175656e6365223a312c22757064617465645f73657175656e6365223a327d"
+    },
+    {
+      "kind": 19,
+      "payload_json": "{\"library_id\":\"lib_000102030405060708090a0b0c0d0e0f\",\"revision_id\":\"rev1_08360b41fa64c32ba1decf26ca750f4d74748870d2b3b9c8b682f22b8ca51b2b\",\"asset_id\":\"asset_101112131415161718191a1b1c1d1e1f\",\"canonical_hex\":\"6a756963656d6f756e742e7265766973696f6e0001000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f0000000000000003ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad0000\",\"manifest\":{\"version\":1,\"library_id\":\"lib_000102030405060708090a0b0c0d0e0f\",\"asset_id\":\"asset_101112131415161718191a1b1c1d1e1f\",\"content\":{\"sha256\":\"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad\",\"size\":3},\"parents\":[]},\"created_sequence\":1}",
+      "frame_hex": "13000002947b226c6962726172795f6964223a226c69625f3030303130323033303430353036303730383039306130623063306430653066222c227265766973696f6e5f6964223a22726576315f30383336306234316661363463333262613164656366323663613735306634643734373438383730643262336239633862363832663232623863613531623262222c2261737365745f6964223a2261737365745f3130313131323133313431353136313731383139316131623163316431653166222c2263616e6f6e6963616c5f686578223a2236613735363936333635366436663735366537343265373236353736363937333639366636653030303130303031303230333034303530363037303830393061306230633064306530663130313131323133313431353136313731383139316131623163316431653166303030303030303030303030303030336261373831366266386630316366656134313431343064653564616532323233623030333631613339363137376139636234313066663631663230303135616430303030222c226d616e6966657374223a7b2276657273696f6e223a312c226c6962726172795f6964223a226c69625f3030303130323033303430353036303730383039306130623063306430653066222c2261737365745f6964223a2261737365745f3130313131323133313431353136313731383139316131623163316431653166222c22636f6e74656e74223a7b22736861323536223a2262613738313662663866303163666561343134313430646535646165323232336230303336316133393631373761396362343130666636316632303031356164222c2273697a65223a337d2c22706172656e7473223a5b5d7d2c22637265617465645f73657175656e6365223a317d"
+    },
+    {
+      "kind": 19,
+      "payload_json": "{\"library_id\":\"lib_000102030405060708090a0b0c0d0e0f\",\"revision_id\":\"rev1_3cdcd7314dd6c4ff0dd95e4286d5227d4f086be0e2d4b1efe1590bc14c003510\",\"asset_id\":\"asset_101112131415161718191a1b1c1d1e1f\",\"canonical_hex\":\"6a756963656d6f756e742e7265766973696f6e0001000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f000000000000000488d4266fd4e6338d13b845fcf289579d209c897823b9217da3e161936f031589000108360b41fa64c32ba1decf26ca750f4d74748870d2b3b9c8b682f22b8ca51b2b\",\"manifest\":{\"version\":1,\"library_id\":\"lib_000102030405060708090a0b0c0d0e0f\",\"asset_id\":\"asset_101112131415161718191a1b1c1d1e1f\",\"content\":{\"sha256\":\"88d4266fd4e6338d13b845fcf289579d209c897823b9217da3e161936f031589\",\"size\":4},\"parents\":[\"rev1_08360b41fa64c32ba1decf26ca750f4d74748870d2b3b9c8b682f22b8ca51b2b\"]},\"created_sequence\":2}",
+      "frame_hex": "130000031b7b226c6962726172795f6964223a226c69625f3030303130323033303430353036303730383039306130623063306430653066222c227265766973696f6e5f6964223a22726576315f33636463643733313464643663346666306464393565343238366435323237643466303836626530653264346231656665313539306263313463303033353130222c2261737365745f6964223a2261737365745f3130313131323133313431353136313731383139316131623163316431653166222c2263616e6f6e6963616c5f686578223a223661373536393633363536643666373536653734326537323635373636393733363936663665303030313030303130323033303430353036303730383039306130623063306430653066313031313132313331343135313631373138313931613162316331643165316630303030303030303030303030303034383864343236366664346536333338643133623834356663663238393537396432303963383937383233623932313764613365313631393336663033313538393030303130383336306234316661363463333262613164656366323663613735306634643734373438383730643262336239633862363832663232623863613531623262222c226d616e6966657374223a7b2276657273696f6e223a312c226c6962726172795f6964223a226c69625f3030303130323033303430353036303730383039306130623063306430653066222c2261737365745f6964223a2261737365745f3130313131323133313431353136313731383139316131623163316431653166222c22636f6e74656e74223a7b22736861323536223a2238386434323636666434653633333864313362383435666366323839353739643230396338393738323362393231376461336531363139333666303331353839222c2273697a65223a347d2c22706172656e7473223a5b22726576315f30383336306234316661363463333262613164656366323663613735306634643734373438383730643262336239633862363832663232623863613531623262225d7d2c22637265617465645f73657175656e6365223a327d"
+    },
+    {
+      "kind": 20,
+      "payload_json": "{\"library_id\":\"lib_000102030405060708090a0b0c0d0e0f\",\"revision_id\":\"rev1_3cdcd7314dd6c4ff0dd95e4286d5227d4f086be0e2d4b1efe1590bc14c003510\",\"parent_id\":\"rev1_08360b41fa64c32ba1decf26ca750f4d74748870d2b3b9c8b682f22b8ca51b2b\",\"asset_id\":\"asset_101112131415161718191a1b1c1d1e1f\"}",
+      "frame_hex": "14000001137b226c6962726172795f6964223a226c69625f3030303130323033303430353036303730383039306130623063306430653066222c227265766973696f6e5f6964223a22726576315f33636463643733313464643663346666306464393565343238366435323237643466303836626530653264346231656665313539306263313463303033353130222c22706172656e745f6964223a22726576315f30383336306234316661363463333262613164656366323663613735306634643734373438383730643262336239633862363832663232623863613531623262222c2261737365745f6964223a2261737365745f3130313131323133313431353136313731383139316131623163316431653166227d"
+    },
+    {
+      "kind": 21,
+      "payload_json": "{\"library_id\":\"lib_000102030405060708090a0b0c0d0e0f\",\"id\":\"edge_scene_001\",\"value\":{\"source_asset_id\":\"asset_101112131415161718191a1b1c1d1e1f\",\"source_revision\":\"rev1_3cdcd7314dd6c4ff0dd95e4286d5227d4f086be0e2d4b1efe1590bc14c003510\",\"target_asset_id\":\"asset_101112131415161718191a1b1c1d1e1f\",\"target_revision\":\"rev1_08360b41fa64c32ba1decf26ca750f4d74748870d2b3b9c8b682f22b8ca51b2b\",\"predicate\":\"related_to\",\"provenance\":\"claimed\",\"source\":\"owner correction\"},\"created_sequence\":3,\"updated_sequence\":5,\"removed\":false}",
+      "frame_hex": "15000002057b226c6962726172795f6964223a226c69625f3030303130323033303430353036303730383039306130623063306430653066222c226964223a22656467655f7363656e655f303031222c2276616c7565223a7b22736f757263655f61737365745f6964223a2261737365745f3130313131323133313431353136313731383139316131623163316431653166222c22736f757263655f7265766973696f6e223a22726576315f33636463643733313464643663346666306464393565343238366435323237643466303836626530653264346231656665313539306263313463303033353130222c227461726765745f61737365745f6964223a2261737365745f3130313131323133313431353136313731383139316131623163316431653166222c227461726765745f7265766973696f6e223a22726576315f30383336306234316661363463333262613164656366323663613735306634643734373438383730643262336239633862363832663232623863613531623262222c22707265646963617465223a2272656c617465645f746f222c2270726f76656e616e6365223a22636c61696d6564222c22736f75726365223a226f776e657220636f7272656374696f6e227d2c22637265617465645f73657175656e6365223a332c22757064617465645f73657175656e6365223a352c2272656d6f766564223a66616c73657d"
+    },
+    {
+      "kind": 22,
+      "payload_json": "{\"library_id\":\"lib_000102030405060708090a0b0c0d0e0f\",\"id\":\"location_scene_001\",\"value\":{\"asset_id\":\"asset_101112131415161718191a1b1c1d1e1f\",\"revision\":\"rev1_3cdcd7314dd6c4ff0dd95e4286d5227d4f086be0e2d4b1efe1590bc14c003510\",\"source\":\"fixture\",\"locator\":\"nas://demo/scene%20A.mov\"},\"created_sequence\":3,\"updated_sequence\":4,\"removed\":true}",
+      "frame_hex": "16000001517b226c6962726172795f6964223a226c69625f3030303130323033303430353036303730383039306130623063306430653066222c226964223a226c6f636174696f6e5f7363656e655f303031222c2276616c7565223a7b2261737365745f6964223a2261737365745f3130313131323133313431353136313731383139316131623163316431653166222c227265766973696f6e223a22726576315f33636463643733313464643663346666306464393565343238366435323237643466303836626530653264346231656665313539306263313463303033353130222c22736f75726365223a2266697874757265222c226c6f6361746f72223a226e61733a2f2f64656d6f2f7363656e65253230412e6d6f76227d2c22637265617465645f73657175656e6365223a332c22757064617465645f73657175656e6365223a342c2272656d6f766564223a747275657d"
+    },
+    {
+      "kind": 23,
+      "payload_json": "{\"library_id\":\"lib_000102030405060708090a0b0c0d0e0f\",\"subject_id\":\"sub_11111111111111111111111111111111\",\"value\":{\"kind\":\"person\",\"label\":\"SYNTHETIC owner \\u003ctest\\u003e \\u0026 café\\u2028line\\u2029end\",\"enabled\":true},\"authorization_generation\":1,\"created_sequence\":1,\"updated_sequence\":1}",
+      "frame_hex": "17000001247b226c6962726172795f6964223a226c69625f3030303130323033303430353036303730383039306130623063306430653066222c227375626a6563745f6964223a227375625f3131313131313131313131313131313131313131313131313131313131313131222c2276616c7565223a7b226b696e64223a22706572736f6e222c226c6162656c223a2253594e544845544943206f776e6572205c7530303363746573745c7530303365205c753030323620636166c3a95c75323032386c696e655c7532303239656e64222c22656e61626c6564223a747275657d2c22617574686f72697a6174696f6e5f67656e65726174696f6e223a312c22637265617465645f73657175656e6365223a312c22757064617465645f73657175656e6365223a317d"
+    },
+    {
+      "kind": 23,
+      "payload_json": "{\"library_id\":\"lib_000102030405060708090a0b0c0d0e0f\",\"subject_id\":\"sub_22222222222222222222222222222222\",\"value\":{\"kind\":\"person\",\"label\":\"SYNTHETIC person \\\"quoted\\\" \\\\ slash\\nline\",\"enabled\":false},\"authorization_generation\":3,\"created_sequence\":2,\"updated_sequence\":4}",
+      "frame_hex": "170000010f7b226c6962726172795f6964223a226c69625f3030303130323033303430353036303730383039306130623063306430653066222c227375626a6563745f6964223a227375625f3232323232323232323232323232323232323232323232323232323232323232222c2276616c7565223a7b226b696e64223a22706572736f6e222c226c6162656c223a2253594e54484554494320706572736f6e205c2271756f7465645c22205c5c20736c6173685c6e6c696e65222c22656e61626c6564223a66616c73657d2c22617574686f72697a6174696f6e5f67656e65726174696f6e223a332c22637265617465645f73657175656e6365223a322c22757064617465645f73657175656e6365223a347d"
+    },
+    {
+      "kind": 23,
+      "payload_json": "{\"library_id\":\"lib_000102030405060708090a0b0c0d0e0f\",\"subject_id\":\"sub_33333333333333333333333333333333\",\"value\":{\"kind\":\"service\",\"label\":\"SYNTHETIC service\",\"enabled\":true},\"authorization_generation\":2,\"created_sequence\":2,\"updated_sequence\":3}",
+      "frame_hex": "17000000f67b226c6962726172795f6964223a226c69625f3030303130323033303430353036303730383039306130623063306430653066222c227375626a6563745f6964223a227375625f3333333333333333333333333333333333333333333333333333333333333333222c2276616c7565223a7b226b696e64223a2273657276696365222c226c6162656c223a2253594e5448455449432073657276696365222c22656e61626c6564223a747275657d2c22617574686f72697a6174696f6e5f67656e65726174696f6e223a322c22637265617465645f73657175656e6365223a322c22757064617465645f73657175656e6365223a337d"
+    },
+    {
+      "kind": 24,
+      "payload_json": "{\"library_id\":\"lib_000102030405060708090a0b0c0d0e0f\",\"id\":\"synthetic_person_grant\",\"value\":{\"subject_id\":\"sub_22222222222222222222222222222222\",\"scope\":{\"kind\":\"asset\",\"asset_id\":\"asset_101112131415161718191a1b1c1d1e1f\"},\"actions\":[\"assets.discover\",\"locations.read\"]},\"created_sequence\":2,\"updated_sequence\":4,\"removed\":false}",
+      "frame_hex": "18000001477b226c6962726172795f6964223a226c69625f3030303130323033303430353036303730383039306130623063306430653066222c226964223a2273796e7468657469635f706572736f6e5f6772616e74222c2276616c7565223a7b227375626a6563745f6964223a227375625f3232323232323232323232323232323232323232323232323232323232323232222c2273636f7065223a7b226b696e64223a226173736574222c2261737365745f6964223a2261737365745f3130313131323133313431353136313731383139316131623163316431653166227d2c22616374696f6e73223a5b226173736574732e646973636f766572222c226c6f636174696f6e732e72656164225d7d2c22637265617465645f73657175656e6365223a322c22757064617465645f73657175656e6365223a342c2272656d6f766564223a66616c73657d"
+    },
+    {
+      "kind": 24,
+      "payload_json": "{\"library_id\":\"lib_000102030405060708090a0b0c0d0e0f\",\"id\":\"synthetic_service_grant\",\"value\":{\"subject_id\":\"sub_33333333333333333333333333333333\",\"scope\":{\"kind\":\"asset\",\"asset_id\":\"asset_101112131415161718191a1b1c1d1e1f\"},\"actions\":[\"assets.discover\",\"revisions.read\"]},\"created_sequence\":2,\"updated_sequence\":3,\"removed\":true}",
+      "frame_hex": "18000001477b226c6962726172795f6964223a226c69625f3030303130323033303430353036303730383039306130623063306430653066222c226964223a2273796e7468657469635f736572766963655f6772616e74222c2276616c7565223a7b227375626a6563745f6964223a227375625f3333333333333333333333333333333333333333333333333333333333333333222c2273636f7065223a7b226b696e64223a226173736574222c2261737365745f6964223a2261737365745f3130313131323133313431353136313731383139316131623163316431653166227d2c22616374696f6e73223a5b226173736574732e646973636f766572222c227265766973696f6e732e72656164225d7d2c22637265617465645f73657175656e6365223a322c22757064617465645f73657175656e6365223a332c2272656d6f766564223a747275657d"
+    }
+  ],
+  "subjects": [
+    {
+      "library_id": "lib_000102030405060708090a0b0c0d0e0f",
+      "subject_id": "sub_11111111111111111111111111111111",
+      "value": {
+        "kind": "person",
+        "label": "SYNTHETIC owner <test> & café line end",
+        "enabled": true
+      },
+      "authorization_generation": 1,
+      "created_sequence": 1,
+      "updated_sequence": 1
+    },
+    {
+      "library_id": "lib_000102030405060708090a0b0c0d0e0f",
+      "subject_id": "sub_22222222222222222222222222222222",
+      "value": {
+        "kind": "person",
+        "label": "SYNTHETIC person \"quoted\" \\ slash\nline",
+        "enabled": false
+      },
+      "authorization_generation": 3,
+      "created_sequence": 2,
+      "updated_sequence": 4
+    },
+    {
+      "library_id": "lib_000102030405060708090a0b0c0d0e0f",
+      "subject_id": "sub_33333333333333333333333333333333",
+      "value": {
+        "kind": "service",
+        "label": "SYNTHETIC service",
+        "enabled": true
+      },
+      "authorization_generation": 2,
+      "created_sequence": 2,
+      "updated_sequence": 3
+    }
+  ],
+  "grants": [
+    {
+      "library_id": "lib_000102030405060708090a0b0c0d0e0f",
+      "id": "synthetic_person_grant",
+      "value": {
+        "subject_id": "sub_22222222222222222222222222222222",
+        "scope": {
+          "kind": "asset",
+          "asset_id": "asset_101112131415161718191a1b1c1d1e1f"
+        },
+        "actions": [
+          "assets.discover",
+          "locations.read"
+        ]
+      },
+      "created_sequence": 2,
+      "updated_sequence": 4,
+      "removed": false
+    },
+    {
+      "library_id": "lib_000102030405060708090a0b0c0d0e0f",
+      "id": "synthetic_service_grant",
+      "value": {
+        "subject_id": "sub_33333333333333333333333333333333",
+        "scope": {
+          "kind": "asset",
+          "asset_id": "asset_101112131415161718191a1b1c1d1e1f"
+        },
+        "actions": [
+          "assets.discover",
+          "revisions.read"
+        ]
+      },
+      "created_sequence": 2,
+      "updated_sequence": 3,
+      "removed": true
+    }
+  ],
+  "expected_table_counts": {
+    "schema_migrations": 3,
+    "catalog": 1,
+    "assets": 1,
+    "revisions": 2,
+    "revision_parents": 1,
+    "relationships": 1,
+    "locations": 1,
+    "events": 5,
+    "policy_events": 4,
+    "policy_subjects": 3,
+    "policy_grants": 2,
+    "catalog_authority": 0,
+    "catalog_admin_events": 0,
+    "catalog_credentials": 0,
+    "credential_issuance_receipts": 0
+  },
+  "expected_operational_authority": "inactive",
+  "expected_empty_operational_tables": {
+    "catalog_authority": 0,
+    "catalog_admin_events": 0,
+    "catalog_credentials": 0,
+    "credential_issuance_receipts": 0
+  },
+  "metadata_insert_statements_sha256": "05d7024108459f544491900dc04b654ac9459c7608d5a9390e358b909a92b007",
+  "policy_row_sql_sha256": "a9d345b482cba186ccf3f726f33a23031e183eb535915720d4d4d39c99412ce9",
+  "sql_sha256": "d3e7d504c9b6c3f9cb8416386a244eac2587eaaa4802d5a2436bcf70c03c9e43",
+  "sql_bytes": 45414,
+  "generator": {
+    "file": "frozen-v3-prepare.py",
+    "sha256": "60d8d6e8fc8980c30e9bf6d95cd6ad2eff162cdfe424bf1ee1dd1a34e85b2ff7"
+  },
+  "validation": {
+    "go_json_fingerprint_matches_frozen_v1_v2": true,
+    "policy_projection_independently_replayed": true,
+    "sql_executed": false
+  },
+  "scope_limits": [
+    "No live authority incarnation, admin history, credentials or issuance receipts.",
+    "No schema 4 objects or migration implementation are used.",
+    "The old format 1 and format 2 fixture files are unchanged; this fixture combines their compatible histories."
+  ]
+}

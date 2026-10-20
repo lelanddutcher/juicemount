@@ -50,6 +50,9 @@ func upgradeCatalog(ctx context.Context, input string, expectedLibrary continuit
 func UpgradeAuthority(ctx context.Context, input string, expectedLibrary continuity.LibraryID) error {
 	return upgradeCatalogVersion(ctx, input, expectedLibrary, authoritySchemaVersion, syncParent)
 }
+func UpgradePreferences(ctx context.Context, input string, library continuity.LibraryID) error {
+	return upgradeCatalogVersion(ctx, input, library, preferencesSchemaVersion, syncParent)
+}
 
 func upgradeCatalogVersion(ctx context.Context, input string, expectedLibrary continuity.LibraryID, target int, directoryBarrier func(string) error) (resultErr error) {
 	if expectedLibrary.Validate() != nil {
@@ -72,7 +75,7 @@ func upgradeCatalogVersion(ctx context.Context, input string, expectedLibrary co
 	if err := checkSidecars(path); err != nil {
 		return err
 	}
-	if target == authoritySchemaVersion {
+	if supportsAuthority(target) {
 		if err := checkPrivatePaths(path); err != nil {
 			return err
 		}
@@ -92,6 +95,9 @@ func upgradeCatalogVersion(ctx context.Context, input string, expectedLibrary co
 	}
 	if library != expectedLibrary {
 		return invalid("upgrade library mismatch")
+	}
+	if target == preferencesSchemaVersion && initialVersion != 3 && initialVersion != 4 {
+		return ErrUpgradeRequired
 	}
 	if target == authoritySchemaVersion && initialVersion == 1 {
 		return ErrUpgradeRequired
@@ -123,6 +129,9 @@ func upgradeCatalogVersion(ctx context.Context, input string, expectedLibrary co
 	}
 	if library != expectedLibrary {
 		return invalid("upgrade library mismatch")
+	}
+	if target == preferencesSchemaVersion && version != 3 && version != 4 {
+		return ErrUpgradeRequired
 	}
 	if target == authoritySchemaVersion && version != 2 && version != 3 {
 		return ErrUpgradeRequired
@@ -161,6 +170,36 @@ func upgradeCatalogVersion(ctx context.Context, input string, expectedLibrary co
 		}
 		if actual != expectedLibrary || current != authoritySchemaVersion {
 			return corrupt("authority migration identity")
+		}
+		if err := checkIntegrity(ctx, tx); err != nil {
+			return err
+		}
+	}
+	if target == preferencesSchemaVersion && version == 3 {
+		for _, kind := range []string{"table", "index", "trigger"} {
+			for _, object := range preferencesSchema() {
+				if object.Type == kind {
+					if _, err := tx.ExecContext(ctx, object.SQL); err != nil {
+						return err
+					}
+				}
+			}
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO preference_control(singleton,library_id,clock_floor_unix,subject_count,entry_count,receipt_count) VALUES(1,?,0,0,0,0)`, library); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations(version,fingerprint) VALUES(4,?)`, schemaFingerprint(expectedSchemaFor(4))); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `PRAGMA user_version=4`); err != nil {
+			return err
+		}
+		actual, current, err := recognizeSchema(ctx, tx, false)
+		if err != nil {
+			return err
+		}
+		if actual != library || current != 4 {
+			return corrupt("preference migration identity")
 		}
 		if err := checkIntegrity(ctx, tx); err != nil {
 			return err

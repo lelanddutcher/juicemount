@@ -423,3 +423,70 @@ releasing token state. ErrDiscoveryDraining means callers must retain the borrow
 Store and retry the incomplete close. Terminal resource errors are distinct.
 Schema, historical encodings and portable exports are unchanged. Source tests
 do not establish actual HTTP host wiring or product acceptance.
+
+## Private selections and contextual ranking
+
+CreatePreferences explicitly creates schema4; UpgradePreferences admits exact
+schema3→4 or an idempotent schema4 retry. The existing creation/upgrade APIs retain
+their meanings. Schema4 supports the existing authority and v1 discovery APIs,
+plus opt-in v2 search/page and person-only select/clear/own-asset status. Manager
+supplies the real scoped HTTP adapter; no bearer identity comes from an Actor,
+subject argument or deployment key. A person declaration is not proof of a
+physical human click, read or edit. Discovery, previews, indexing and prefetch
+never record a selection.
+
+Preferences are bounded private operational state in the same catalog, separate
+from immutable file custody. Select requires current assets.discover AND
+activity.record through credential scope, action ceiling and grants. Clear uses
+the current opaque token; exact own-asset status recovers that token after client
+restart. Service identities are independently refused. Tokens and generation
+checks prevent a stale clear from clearing a replacement selection. Clear
+physically deletes its active row; it does not delete a file, metadata or grant.
+
+Each request has an explicit absolute expiry, initially60–900 seconds ahead.
+Within validity an identical operation returns its original receipt without
+changing recency; changed retry conflicts. At expiry the original request refuses
+even after receipt cleanup. A receipt says operation_result and does not assert
+that its token is still current. Commit/output failures can be uncertain; keep
+the operation ID, retry within its finite validity or inspect current own state.
+No permanent selection-operation history is promised.
+
+The caps are1024 permanent person-generation rows,256 preferences/person and
+65536 globally,128 retry receipts/person and32768 globally. Permanent rows never
+reset or disappear; reads never allocate them. At capacity refuse busy rather
+than evicting live state. New-person admission can permanently refuse after1024
+people have used this feature. Entries expire after30days. Unexpired receipts
+are never evicted; expired entries/receipts are pruned in bounded indexed batches
+during an authenticated maintenance phase, committed before final mutation
+admission. Thus a later refused mutation does not undo cleanup progress. The
+privileged local owner can request a bounded prune batch without a new worker.
+The stated <=97MiB operational charge bounds logical row values/accounting,
+not SQLite/WAL file size, whole-catalog storage or RSS.
+
+Every committed preference mutation/cleanup advances a durable wall-clock floor.
+Clock rollback below it refuses across restart. Reads do not persist time; v2
+responses also bind their captured lower time and the earliest contributing
+selection expiry across the whole frozen window. Generation, floor and expiry
+are checked in the fresh post-encoding fence and again after read cleanup. Own
+select/clear or expiry requires restarting old ranked pages. Wrong-version page
+presentation refuses before changing the original token's state. This does not
+protect against expiry never durably observed or an off-device backup restoring
+older state; credential wall-clock limitations remain explicit.
+
+V2 includes authorized recent selections after explicit context candidates and
+before the stable-ID candidate fill, so a recent high-ID asset can enter the
+bounded window. Within that window the tuple is context, label tier, own recency,
+stable ID, with categorical declared_selection reasons. Another person's activity
+and service activity do not supply personal features. This is bounded contextual
+ordering, not global relevance or proof of representation suitability. V1 behavior
+is unchanged.
+
+Schema4 metadata export deliberately emits the unchanged format2/schema3 logical
+projection. All preferences, generation/counter/clock state and retry receipts
+are omitted. Format2 restore creates schema3 with inactive authority and no
+preferences or credentials; explicit upgrade/binding is required. This is not a
+preference backup. A raw DB/WAL/backup may contain preferences and credentials,
+and a local OS/catalog owner can inspect them. Cleared asset associations may
+remain in finite retry requests for up to15minutes, or in WAL/snapshots/backups;
+there is no secure-erasure or encryption-from-owner claim. Actual CLI/HTTP host
+qualification and independent frozen-source review remain required.

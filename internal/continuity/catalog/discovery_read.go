@@ -56,13 +56,15 @@ type discoveryBudget struct {
 	raw                                                            int64
 }
 type discoveryReader struct {
-	ctx       context.Context
-	q         queryer
-	library   continuity.LibraryID
-	rights    discoveryRights
-	budget    discoveryBudget
-	assets    map[continuity.AssetID]*Asset
-	itemBytes int64
+	ctx             context.Context
+	q               queryer
+	library         continuity.LibraryID
+	rights          discoveryRights
+	budget          discoveryBudget
+	assets          map[continuity.AssetID]*Asset
+	itemBytes       int64
+	preferences     map[continuity.AssetID]preferenceEntry
+	preferenceFence *preferenceBinding
 }
 
 func (r *discoveryReader) asset(id continuity.AssetID) (Asset, error) {
@@ -168,6 +170,7 @@ func (r *discoveryReader) search(request DiscoveryRequest) ([]json.RawMessage, b
 		asset   Asset
 		context bool
 		tier    int
+		order   int64
 	}
 	found := make([]candidate, 0)
 	seen := make(map[continuity.AssetID]bool)
@@ -194,7 +197,11 @@ func (r *discoveryReader) search(request DiscoveryRequest) ([]json.RawMessage, b
 				return false
 			}
 		}
-		found = append(found, candidate{a, contextIDs[a.ID], tier})
+		preference, selected := r.preferences[a.ID]
+		found = append(found, candidate{a, contextIDs[a.ID], tier, preference.order})
+		if selected && r.preferenceFence != nil && (r.preferenceFence.expiry == 0 || preference.expires < r.preferenceFence.expiry) {
+			r.preferenceFence.expiry = preference.expires
+		}
 		return len(found) >= 1000
 	}
 	contexts := append([]continuity.AssetID(nil), request.ContextAssetIDs...)
@@ -217,6 +224,36 @@ func (r *discoveryReader) search(request DiscoveryRequest) ([]json.RawMessage, b
 		consider(a)
 	}
 	complete := true
+	recent := make([]preferenceEntry, 0, len(r.preferences))
+	for _, e := range r.preferences {
+		recent = append(recent, e)
+	}
+	sort.Slice(recent, func(i, j int) bool {
+		if recent[i].order != recent[j].order {
+			return recent[i].order > recent[j].order
+		}
+		return recent[i].asset < recent[j].asset
+	})
+	for _, e := range recent {
+		if seen[e.asset] || !r.rights.allows(e.asset, "assets.discover") {
+			continue
+		}
+		if r.budget.assets >= 4096 {
+			return nil, false, errDiscoveryWork
+		}
+		r.budget.assets++
+		a, err := r.asset(e.asset)
+		if errors.Is(err, ErrNotFound) {
+			continue
+		}
+		if err != nil {
+			return nil, false, err
+		}
+		if consider(a) {
+			complete = false
+			break
+		}
+	}
 	if r.rights.credential.scope.Kind == "library" && r.rights.library["assets.discover"] && containsAction(r.rights.credential.actions, "assets.discover") {
 		remaining := 4096 - r.budget.assets
 		if remaining <= 0 {
@@ -283,6 +320,9 @@ func (r *discoveryReader) search(request DiscoveryRequest) ([]json.RawMessage, b
 		if a.tier != b.tier {
 			return a.tier > b.tier
 		}
+		if a.order != b.order {
+			return a.order > b.order
+		}
 		return a.asset.ID < b.asset.ID
 	})
 	items := make([]json.RawMessage, 0, len(found))
@@ -290,6 +330,9 @@ func (r *discoveryReader) search(request DiscoveryRequest) ([]json.RawMessage, b
 		reasons := make([]string, 0, 2)
 		if c.context {
 			reasons = append(reasons, "context")
+		}
+		if c.order > 0 {
+			reasons = append(reasons, "declared_selection")
 		}
 		switch c.tier {
 		case 3:

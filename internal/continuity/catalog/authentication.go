@@ -105,7 +105,7 @@ func (s *Store) Authenticate(ctx context.Context, library continuity.LibraryID, 
 		return nil, err
 	}
 	defer s.leave()
-	if s.version != authoritySchemaVersion {
+	if !supportsAuthority(s.version) {
 		return nil, ErrUpgradeRequired
 	}
 	if library != s.library {
@@ -186,7 +186,7 @@ func (s *Store) CheckAccess(ctx context.Context, handle *AuthHandle, request Acc
 		return AccessDecision{}, err
 	}
 	defer s.leave()
-	if s.version != authoritySchemaVersion {
+	if !supportsAuthority(s.version) {
 		return AccessDecision{}, ErrUpgradeRequired
 	}
 	if request.LibraryID != s.library {
@@ -236,7 +236,7 @@ func (s *Store) WhoAmI(ctx context.Context, handle *AuthHandle) (result Identity
 		return Identity{}, err
 	}
 	defer s.leave()
-	if s.version != authoritySchemaVersion {
+	if !supportsAuthority(s.version) {
 		return Identity{}, ErrUpgradeRequired
 	}
 	tx, done, err := s.readSnapshot(ctx)

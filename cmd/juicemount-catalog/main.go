@@ -83,10 +83,14 @@ func finishOutput(f fileResource) error {
 func runConfigured(parent context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer, ownStdio bool, files cliFiles) (code int) {
 	knownOperationID, knownSelector := "", ""
 	outputCloseFailed := false
+	preferenceMaintenance := false
 	fail := func(uncertain bool) int {
 		message := "catalog operation failed"
 		if uncertain {
 			message = "catalog outcome uncertain; inspect operation status before revoke/reissue"
+			if preferenceMaintenance {
+				message = "catalog preference maintenance outcome uncertain"
+			}
 		}
 		_ = writeJSON(stderr, struct {
 			Error             string `json:"error"`
@@ -153,6 +157,7 @@ func runConfigured(parent context.Context, args []string, stdin io.Reader, stdou
 		return fail(false)
 	}
 	command := strings.Join(fs.Args(), " ")
+	preferenceMaintenance = command == "init-preferences" || command == "upgrade-preferences" || command == "owner preference prune"
 	if command == "subject new-id" {
 		id, err := catalog.NewSubjectID()
 		if err != nil {
@@ -196,10 +201,18 @@ func runConfigured(parent context.Context, args []string, stdin io.Reader, stdou
 		}
 		return 0
 	}
+	if command == "upgrade-preferences" {
+		if err := catalog.UpgradePreferences(ctx, *path, library); err != nil {
+			return fail(strings.Contains(err.Error(), "uncertain"))
+		}
+		return 0
+	}
 	var s *catalog.Store
 	var err error
 	if command == "init-authority" {
 		s, err = catalog.CreateAuthority(ctx, *path, library)
+	} else if command == "init-preferences" {
+		s, err = catalog.CreatePreferences(ctx, *path, library)
 	} else {
 		s, err = catalog.OpenContext(ctx, *path)
 	}
@@ -215,7 +228,7 @@ func runConfigured(parent context.Context, args []string, stdin io.Reader, stdou
 	if err != nil || actual != library {
 		return fail(false)
 	}
-	if command == "init-authority" {
+	if command == "init-authority" || command == "init-preferences" {
 		return 0
 	}
 	if command == "export" {
@@ -298,6 +311,17 @@ func runConfigured(parent context.Context, args []string, stdin io.Reader, stdou
 		return fail(false)
 	}
 	switch command {
+	case "owner preference prune":
+		if err := owner.PrunePreferences(ctx); err != nil {
+			return fail(strings.Contains(err.Error(), "uncertain"))
+		}
+		if writeJSON(stdout, struct {
+			Version int    `json:"version"`
+			Status  string `json:"status"`
+		}{1, "complete"}) != nil {
+			return fail(true)
+		}
+		return 0
 	case "owner status":
 		v, err := owner.Status(ctx)
 		if err != nil {
