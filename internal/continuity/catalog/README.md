@@ -490,3 +490,32 @@ and a local OS/catalog owner can inspect them. Cleared asset associations may
 remain in finite retry requests for up to15minutes, or in WAL/snapshots/backups;
 there is no secure-erasure or encryption-from-owner claim. Actual CLI/HTTP host
 qualification and independent frozen-source review remain required.
+
+The Manager Library pane (`#/library`) is an opt-in client for these existing
+scoped APIs at either Manager prefix. It accepts the library ID and access
+credential issued by the local owner CLI; this is separate from Manager admin
+authentication. The credential stays only in the current tab's memory and is
+forgotten on disconnect, reload or pagehide. No automatic catalog ingestion or
+integrated credential provisioning is implied.
+
+Library v2 searches use explicit text/context submission and opaque frozen
+pages. Returning to a visible pane first revalidates the complete context prefix
+(up to64IDs, at most5pages) before publishing fresh labels and search results.
+Inspector sections read permitted v1 declarations with at most4 concurrent reads;
+null counts/heads remain undisclosed, locators are inert recorded claims, and
+unsafe JavaScript numeric values are labelled outside its exact range. Each
+rendered list is bounded to1000items. Client transport streams at most8MiB under
+an owned10second fetch/body deadline, with redirects refused and no cookies.
+
+Remember/clear are deliberate personal preference actions, separate from reading
+or using temporary context. A dispatched action without a matching validated
+receipt retains its exact operation/expiry/body for explicit retry, including
+valid503/504/restart responses which can follow COMMIT. Fresh status does not
+prove a historical unknown result. Expiry discards retry bytes into one bounded
+warning, requiring fresh status and explicit acknowledgement before another
+new action. The UI supplies neither durable collections nor media delivery.
+
+Client state/transport/rendering checks use the actual dependency-free module:
+`node --test test/continuity-ui/library.test.cjs`. Those checks do not qualify
+browser integration, storage or release readiness; real Manager browser evidence
+at both prefixes remains a separate acceptance requirement.

@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>JuiceMount Manager</title>
-  <link rel="stylesheet" href="style.css?v=0.5.0-rc5">
+  <link rel="stylesheet" href="style.css?v=0.5.0-continuity1">
 </head>
 <body>
   <a class="skip-link" href="#app">Skip to Manager content</a>
@@ -28,6 +28,8 @@
         <li class="sidebar-heading" aria-hidden="true">Monitor</li>
         <li><a href="#/overview"     data-tab-link="overview">Overview</a></li>
         <li><a href="#/farm"         data-tab-link="farm">Farm</a></li>
+        <li class="sidebar-heading" aria-hidden="true">Library</li>
+        <li><a href="#/library" data-tab-link="library">Library</a></li>
         <li class="sidebar-heading" aria-hidden="true">Storage</li>
         <li><a href="#/migrations"   data-tab-link="migrations">Migrations</a></li>
         <li><a href="#/trash"        data-tab-link="trash">Trash</a></li>
@@ -43,6 +45,33 @@
     </nav>
 
     <main id="app" tabindex="-1">
+      <section id="library-pane" data-tab="library" class="tab-pane library-pane" hidden aria-labelledby="library-title">
+        <header class="library-header"><p class="section-kicker">Continuity · permitted metadata</p><h2 id="library-title">Library</h2>
+          <p class="hint">Find declared assets, follow their history, and build temporary context. Files must already be recorded in the catalog.</p></header>
+        <section class="library-connection" aria-label="Library connection">
+          <div><h3 id="library-connection-state">Connect to an existing catalog</h3><p class="hint">Use a library ID and scoped access credential from the owner CLI. The credential stays in this tab’s memory until you disconnect or leave the page. Manager admin keys are separate.</p></div>
+          <form id="library-connection-form" class="library-connect-form" autocomplete="off">
+            <label class="field"><span>Library ID</span><input id="library-id" type="text" required spellcheck="false" autocomplete="off" placeholder="lib_…"></label>
+            <label class="field"><span>Access credential</span><input id="library-credential" type="password" required autocomplete="off" spellcheck="false" aria-describedby="library-credential-help"></label>
+            <span id="library-credential-help" class="hint">Cleared from this input immediately after connection.</span><button type="submit">Connect to library</button>
+          </form>
+          <button id="library-disconnect" type="button" hidden>Disconnect and forget access</button>
+        </section>
+        <p id="library-status" class="library-status" role="status" aria-live="polite"></p>
+        <button id="library-retry-access" type="button" hidden>Retry access and context check</button>
+        <aside id="library-outcome" class="library-outcome" aria-label="Personal action outcome" aria-live="polite" hidden></aside>
+        <div id="library-workspace" hidden>
+          <form id="library-search-form" class="library-search-form" role="search" aria-label="Search permitted assets">
+            <label class="field"><span>Search asset labels</span><input id="library-query" type="search" autocomplete="off" placeholder="A scene, source, or working label"></label><button id="library-search-button" type="submit">Search library</button>
+          </form>
+          <div class="library-context"><h3>Temporary context</h3><p class="hint">Read-only query context · up to 64 assets. Remembering an asset is a separate personal action.</p><div id="library-contexts" aria-label="Current context"></div></div>
+          <div class="library-columns">
+            <section class="library-results-panel" aria-labelledby="library-results-title"><h3 id="library-results-title">Permitted assets</h3><p id="library-window" class="hint"></p><ul id="library-results" class="library-results"></ul><button id="library-more" type="button" hidden>More results</button></section>
+            <aside class="library-inspector" aria-labelledby="library-inspector-title"><h3 id="library-inspector-title">Inspector</h3><p class="hint">Metadata declarations only. Location claims do not verify media availability; hashes do not deliver or play bytes.</p><div id="library-inspector-body"></div></aside>
+          </div>
+        </div>
+      </section>
+
       <!-- Overview tab (SLICE 2). Read-only at-a-glance dashboard.
            Polls /api/overview every 10s while the tab is visible
            (paused on document visibilitychange when hidden). Each
@@ -1193,6 +1222,7 @@
     </small>
   </footer>
 
-  <script src="app.js?v=0.5.0-rc5"></script>
+  <script src="library.js?v=0.5.0-continuity1"></script>
+  <script src="app.js?v=0.5.0-continuity1"></script>
 </body>
 </html>

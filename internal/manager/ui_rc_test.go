@@ -83,10 +83,14 @@ func TestManagerRCAssetsShareCurrentCacheBuster(t *testing.T) {
 	if len(style) != 2 || len(app) != 2 {
 		t.Fatalf("Manager release assets must carry explicit cache-busting versions")
 	}
+	library := regexp.MustCompile(`library\.js\?v=([^"']+)`).FindStringSubmatch(index)
+	if len(library) != 2 || library[1] != style[1] {
+		t.Fatal("Library asset must share the Manager cache version")
+	}
 	if style[1] != app[1] {
 		t.Fatalf("Manager asset cache busters differ: style=%q app=%q", style[1], app[1])
 	}
-	if style[1] != "0.5.0-rc5" {
+	if style[1] != "0.5.0-continuity1" {
 		t.Fatalf("Manager asset cache buster = %q, want current RC", style[1])
 	}
 }
@@ -370,4 +374,29 @@ func relativeLuminance(hex string) float64 {
 		return math.Pow((c+0.055)/1.055, 2.4)
 	}
 	return 0.2126*channel(1) + 0.7152*channel(3) + 0.0722*channel(5)
+}
+
+func TestManagerLibraryScopedSurface(t *testing.T) {
+	indexRaw, err := staticFS.ReadFile("static/index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, marker := range []string{`data-tab-link="library"`, `id="library-pane"`, `id="library-credential" type="password"`, `id="library-status" class="library-status" role="status"`, `id="library-search-form"`, `id="library-inspector-body"`, `Access credential`, `The credential stays in this tab’s memory`} {
+		if !strings.Contains(string(indexRaw), marker) {
+			t.Errorf("Library markup missing %q", marker)
+		}
+	}
+	libraryRaw, err := staticFS.ReadFile("static/library.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	library := string(libraryRaw)
+	for _, forbidden := range []string{"localStorage", "sessionStorage", "innerHTML", "console.", "indexedDB", "document.cookie"} {
+		if strings.Contains(library, forbidden) {
+			t.Errorf("Library must not use %q", forbidden)
+		}
+	}
+	if strings.Index(string(indexRaw), `src="library.js?`) > strings.Index(string(indexRaw), `src="app.js?`) {
+		t.Fatal("Library lifecycle must load before shell")
+	}
 }

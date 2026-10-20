@@ -37,6 +37,7 @@
   // doesn't need to know about every route — every URL still resolves
   // to the same index.html and the JS picks the section.
   const TABS = [
+    'library',
     'overview',
     'farm',
     'migrations',
@@ -70,6 +71,8 @@
   // hook for Migrations on first activation — subsequent activations
   // are cheap (just unhiding the same DOM).
   function showTab(name) {
+    window.ManagerLibrary.init(BASE);
+    window.ManagerLibrary.setActive(name === 'library');
     $$('.tab-pane').forEach((el) => {
       el.hidden = el.dataset.tab !== name;
     });
