@@ -1167,8 +1167,15 @@ type Server struct {
 	ExtraRoutes map[string]http.HandlerFunc
 	// mux is set once Start() builds the serve mux; RegisterRoutes adds
 	// handlers to a LIVE listener safely (Go 1.22+ ServeMux is concurrency-safe).
-	mux *http.ServeMux
-	ru  sync.Mutex
+	mux            *http.ServeMux
+	ru             sync.Mutex
+	lifecycleMu    sync.Mutex
+	startAttempted bool
+	stopping       bool
+	serveErrors    chan error
+	serveDone      []<-chan struct{}
+	stopOnce       sync.Once
+	stopErr        error
 }
 
 // NewServer creates a metrics HTTP server bound to addr (e.g. 127.0.0.1:11050).
@@ -1177,11 +1184,13 @@ func NewServer(addr string, reg *Registry) *Server {
 	if reg == nil {
 		reg = Default()
 	}
-	return &Server{addr: addr, registry: reg}
+	return &Server{addr: addr, registry: reg, serveErrors: make(chan error, 2)}
 }
 
 // Addr returns the actual listening address (after Start).
 func (s *Server) Addr() string {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
 	if s.listener != nil {
 		return s.listener.Addr().String()
 	}
@@ -1190,6 +1199,15 @@ func (s *Server) Addr() string {
 
 // Start binds the listener and serves on a background goroutine.
 func (s *Server) Start() error {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+	if s.startAttempted || s.stopping {
+		return fmt.Errorf("metrics server already started or stopped")
+	}
+	s.startAttempted = true
+	if s.serveErrors == nil {
+		s.serveErrors = make(chan error, 2)
+	}
 	if err := validateLoopbackListenAddr(s.addr); err != nil {
 		return err
 	}
@@ -1214,9 +1232,7 @@ func (s *Server) Start() error {
 		Handler:           controlRequestGuard(strconv.Itoa(l.Addr().(*net.TCPAddr).Port), mux),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
-	go func() {
-		_ = s.httpSrv.Serve(l)
-	}()
+	s.startServe(l)
 
 	// ALSO BIND IPv6 LOOPBACK.
 	//
@@ -1242,9 +1258,7 @@ func (s *Server) Start() error {
 		boundPort := strconv.Itoa(l.Addr().(*net.TCPAddr).Port)
 		if l6, e6 := net.Listen("tcp6", net.JoinHostPort("::1", boundPort)); e6 == nil {
 			s.listener6 = l6
-			go func() {
-				_ = s.httpSrv.Serve(l6)
-			}()
+			s.startServe(l6)
 		}
 	}
 	return nil
@@ -1314,12 +1328,7 @@ func sameControlOrigin(raw, host, port string) bool {
 
 // Stop closes the HTTP server and listener.
 func (s *Server) Stop() {
-	if s.httpSrv != nil {
-		_ = s.httpSrv.Close() // closes every listener it is serving, incl. ::1
-	}
-	if s.listener6 != nil {
-		_ = s.listener6.Close()
-	}
+	s.stopAndWaitUnbounded()
 }
 
 func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {

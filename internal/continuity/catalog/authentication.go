@@ -111,38 +111,49 @@ func (s *Store) Authenticate(ctx context.Context, library continuity.LibraryID, 
 	if library != s.library {
 		return nil, ErrUnauthenticated
 	}
-	if len(bearer) != 102 || string(bearer[:5]) != "jmc1_" || bearer[37] != '.' || strings.ToLower(string(bearer)) != string(bearer) {
-		return nil, ErrUnauthenticated
-	}
-	selector := "cred_" + string(bearer[5:37])
-	if !validRandomID(selector, "cred_") {
-		return nil, ErrUnauthenticated
-	}
-	secret, err := hex.DecodeString(string(bearer[38:]))
-	if err != nil || len(secret) != 32 {
-		return nil, ErrUnauthenticated
-	}
 	tx, done, err := s.readSnapshot(ctx)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { resultErr = errors.Join(resultErr, done()) }()
-	c, err := readCredential(ctx, tx, library, selector)
+	handle, _, _, err := s.authenticateSnapshot(ctx, tx, library, bearer)
+	return handle, err
+}
+
+// authenticateSnapshot shares the complete verifier/current-authority check
+// with discovery without opening a second, inconsistent metadata snapshot.
+func (s *Store) authenticateSnapshot(ctx context.Context, q queryer, library continuity.LibraryID, bearer []byte) (*AuthHandle, credential, Subject, error) {
+	if len(bearer) != 102 || string(bearer[:5]) != "jmc1_" || bearer[37] != '.' || strings.ToLower(string(bearer)) != string(bearer) {
+		return nil, credential{}, Subject{}, ErrUnauthenticated
+	}
+	selector := "cred_" + string(bearer[5:37])
+	if !validRandomID(selector, "cred_") {
+		return nil, credential{}, Subject{}, ErrUnauthenticated
+	}
+	secret, err := hex.DecodeString(string(bearer[38:]))
+	if err != nil || len(secret) != 32 {
+		return nil, credential{}, Subject{}, ErrUnauthenticated
+	}
+	c, err := readCredential(ctx, q, library, selector)
 	if err != nil {
-		return nil, ErrUnauthenticated
+		return nil, credential{}, Subject{}, ErrUnauthenticated
 	}
 	verifier := credentialVerifier(library, c.incarnation, selector, secret)
 	if subtle.ConstantTimeCompare(verifier[:], c.verifier) != 1 {
-		return nil, ErrUnauthenticated
+		return nil, credential{}, Subject{}, ErrUnauthenticated
 	}
-	status, err := credentialStatus(ctx, tx, library, selector, s.now().Unix())
+	status, err := credentialStatus(ctx, q, library, selector, s.now().Unix())
 	if err != nil {
-		return nil, err
+		return nil, credential{}, Subject{}, err
 	}
 	if status != "active" {
-		return nil, ErrUnauthenticated
+		return nil, credential{}, Subject{}, ErrUnauthenticated
 	}
-	return &AuthHandle{s, c.incarnation, selector, c.subject, c.generation}, nil
+	sub, err := readSubject(ctx, q, library, c.subject)
+	if err != nil {
+		return nil, credential{}, Subject{}, err
+	}
+	return &AuthHandle{s, c.incarnation, selector, c.subject, c.generation}, c, sub, nil
 }
 
 func (s *Store) currentHandle(ctx context.Context, q queryer, handle *AuthHandle) (credential, Subject, error) {

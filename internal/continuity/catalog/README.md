@@ -304,8 +304,9 @@ Authenticate creates an opaque store/incarnation/credential-bound handle.
 CheckAccess checks a current deferred snapshot and returns only allowed/denied
 for one exact asset and action. Permission requires credential scope AND action
 ceiling AND an active matching current grant; library grants cannot widen an
-asset credential. An owner bearer has no implicit grant. This decision seam does
-not expose metadata or enforce existing Manager/HTTP/browser/mount entry points.
+asset credential. An owner bearer has no implicit grant. The separate opt-in
+discovery service applies these permissions to projected catalog metadata.
+Existing browser and mount entry points do not inherit those permissions.
 
 Schema 3 exports format 2: metadata event frames precede a separately sequenced
 policy stream. The combined event count uses the existing event budget; subjects
@@ -350,3 +351,75 @@ the caller already owns its explicit operation ID and can inspect credential
 status with it. Partial/failed secret delivery can leave an active issuance:
 inspect status before deliberate revoke/new-ID reissue. Source and declared
 tests alone do not establish CLI, existing integration, or product acceptance.
+
+## Authenticated discovery
+
+NewDiscoveryService borrows an already-open, ready schema-3 catalog with an
+active local authority binding and an exact expected library. It never creates,
+upgrades or activates authority. Query takes a scoped bearer and a typed request;
+caller-supplied subject identities are not authentication. The opt-in Manager
+adapter owns HTTP decoding, transport deadlines and deployment configuration.
+The domain service owns metadata authorization, buffering, frozen pages and the
+final release fence. Disabled host integrations do not open this service.
+
+A single deferred snapshot authenticates the credential, reads current grants
+and projects the selected metadata. Permission is the intersection of credential
+scope, action ceiling and active grants. Asset heads and revision content/parents
+require revisions.read. Edges require discovery and relationship rights on both
+endpoints, including every old endpoint in corrected-edge history. Optional edge
+and location revision anchors become null without revision rights; null does not
+assert absence. Counts are exact for the authorized scope, or null when the
+count's action is absent. Locations remain literal observations and are never
+opened or probed.
+
+History emits whitelisted per-change before/after values, including tombstone
+flags and repeated revision declarations. It preserves newest-event ordering and
+original change order within an event while withholding operation IDs, ordinals,
+sequences, receipts, digests and hidden changes. Actor/source strings remain
+claims. Permission cannot certify that free text contains no private fact.
+
+Search selects authorized context matches first, then binary asset IDs, into a
+maximum 1000-item frozen window. Within that window it ranks context, ASCII-folded
+label exact/prefix/substring match and stable ID. This is not global relevance or
+activity ranking. Active grants are bounded to 4096; candidate/edge/revision/
+location scans to 4096, endpoint membership probes to 8192, and history to 8192
+events/32 MiB of raw requests plus receipts. Joined membership probes are charged
+conservatively, so a request can exhaust that budget before its row budget.
+History has no asset-event index: sparse old history can return work_budget.
+Budget/decode/deadline failure never becomes empty or complete success. Stopping
+at 1000 authorized items returns an incomplete frozen window.
+
+Each collection response states matched_count for its frozen window,
+count_scope=frozen_window, window_complete and sort_version=discovery1. Pages
+contain at most 100 items and 1 MiB; single items are bounded to 64 KiB. Opaque random
+page tokens bind the subject, credential, authorization generation and immutable
+query. Replays return identical encoded bytes and next token without advancing
+state or extending the five-minute monotonic lifetime. Unknown, foreign, expired
+and evicted valid-shaped tokens all require restart_query. Foreign token lookup
+does not expire or evict another owner's state.
+
+The service admits 16 calls and four concurrent SQL owners without queuing. Its
+64 MiB logical quota includes fixed admission scratch, working/construction/copy
+reservations and retained buffer capacities plus query/item/token accounting;
+it is not a Go RSS guarantee. Each subject has at most 16 retained or building
+queries. Expiration precedes oldest-query eviction. Leased windows cannot be
+evicted and remain charged until every output owner drains. No expiration or
+response worker runs in the background.
+
+After encoding, Query opens a fresh deferred snapshot and rechecks authority,
+credential status and subject authorization generation. Its first authority read
+is the release linearization point. After that snapshot closes, it rechecks
+credential wall-clock bounds and cancellation immediately before one output
+Write. Already-fenced plaintext cannot be recalled. DisclosureResult identity
+fields are for private adapter auditing after Query returns, never response data.
+Started marks an attempted write, including partial/full-write-plus-error; the
+adapter must not append another body. Borrowed writers must provide their own
+bounded I/O; context alone cannot interrupt arbitrary implementations. A private,
+normally nil beforeFence callback only schedules package tests after encoding
+and before the fresh snapshot; no public API configures it.
+
+Close stops admission, cancels calls and drains their output owners before
+releasing token state. ErrDiscoveryDraining means callers must retain the borrowed
+Store and retry the incomplete close. Terminal resource errors are distinct.
+Schema, historical encodings and portable exports are unchanged. Source tests
+do not establish actual HTTP host wiring or product acceptance.

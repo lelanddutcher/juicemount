@@ -26,6 +26,8 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -42,6 +44,13 @@ import (
 )
 
 func main() {
+	if err := runManager(); err != nil {
+		log.Print(err)
+		os.Exit(1)
+	}
+}
+
+func runManager() error {
 	buildInfo := flag.Bool("build-info", false, "print release version and source commit, then exit")
 	addr := flag.String("listen", "0.0.0.0:8080", "HTTP listen address")
 	juicefsBin := flag.String("juicefs", "juicefs", "Path to juicefs binary (or just 'juicefs' for PATH lookup)")
@@ -51,6 +60,8 @@ func main() {
 	destMount := flag.String("dest-mount", "/jfs", "User-facing destination prefix shown in the UI")
 	sourceRoots := flag.String("source-roots", "/sources", "Comma-separated host paths the manager may browse from")
 	adminKey := flag.String("admin-key", os.Getenv("JM_ADMIN_KEY"), "Admin key for X-JuiceMount-Admin-Key auth (empty = disabled)")
+	continuityCatalog := flag.String("continuity-catalog", "", "Existing private continuity catalog (requires --continuity-library)")
+	continuityLibrary := flag.String("continuity-library", "", "Expected continuity library identity")
 	stateFile := flag.String("state-file", os.Getenv("JM_STATE_FILE"), "Optional JSON path for job-history persistence (empty = jobs lost on restart). Bind-mount the dir to make history survive container churn.")
 	minioURL := flag.String("minio-url", envOr("JM_MINIO_URL", ""), "SLICE 2: MinIO base URL the Overview dashboard pings via /minio/health/live. Empty disables the MinIO probe (Overview card shows an actionable hint). Use the same URL Mac clients connect to so the dashboard reflects what they see.")
 	farmStatus := flag.String("farm-status", envOr("JM_FARM_STATUS", ""), "Path to the juicefarm rollup (farm-status.json) for the Farm tab. Empty = Farm tab shows an empty state. Mount the juicefarm-state volume read-only to enable.")
@@ -62,29 +73,38 @@ func main() {
 	flag.Parse()
 	if *buildInfo {
 		fmt.Printf("juicemount-manager %s (%s)\n", version.Version, version.Commit)
-		return
+		return nil
 	}
 
 	roots := splitNonEmpty(*sourceRoots, ",")
 	if len(roots) == 0 {
-		log.Fatal("--source-roots must contain at least one path")
+		return errors.New("--source-roots must contain at least one path")
 	}
 	if *fuseMount == "" && *metaURL == "" {
-		log.Fatal("exactly one of --fuse-mount or --meta must be set")
+		return errors.New("exactly one of --fuse-mount or --meta must be set")
 	}
 	if *fuseMount != "" && *metaURL != "" {
-		log.Fatal("--fuse-mount and --meta are mutually exclusive (pick one mode)")
+		return errors.New("--fuse-mount and --meta are mutually exclusive (pick one mode)")
 	}
 	if *metaURL != "" && *volName == "" {
-		log.Fatal("--vol-name is required with --meta (standalone mode)")
+		return errors.New("--vol-name is required with --meta (standalone mode)")
 	}
 	if err := validateAdminKey(*adminKey); err != nil {
-		log.Fatal(err)
+		return err
 	}
 
 	ownerUID, ownerGID := parseOwner(*mountOwner)
 
+	discovery, err := manager.PrepareContinuity(context.Background(), manager.ContinuityConfig{
+		CatalogPath: *continuityCatalog, LibraryID: *continuityLibrary, ManagerAdminKey: *adminKey,
+	})
+	if err != nil {
+		return err
+	}
 	mux := http.NewServeMux()
+	if err := discovery.RegisterRoutes(mux, ""); err != nil {
+		return errors.Join(err, closeManagerContinuity(discovery.Close))
+	}
 	cfg := manager.Config{
 		JuiceFSBin:               *juicefsBin,
 		FUSEMount:                *fuseMount, // embedded mode if non-empty
@@ -104,6 +124,7 @@ func main() {
 		OverviewMetaURL:          *overviewMeta,
 	}
 	mgr := manager.Register(mux, "", cfg)
+	defer mgr.StopAll()
 
 	// Teams/seats is intentionally withheld from the RC. Its old account
 	// scaffold did not enforce permissions on Manager or JuiceFS operations,
@@ -156,18 +177,10 @@ func main() {
 	log.Printf("  auth enabled: %v", *adminKey != "")
 	log.Printf("  state-file:   %s", *stateFile)
 
-	go func() {
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("listen: %v", err)
-		}
-	}()
-
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
-	<-sig
-	log.Println("shutting down...")
-	mgr.StopAll()
-	_ = srv.Close()
+	defer signal.Stop(sig)
+	return serveManagerHTTP(srv, discovery.Close, sig)
 }
 
 // validateAdminKey enforces the Manager deployment authentication boundary.

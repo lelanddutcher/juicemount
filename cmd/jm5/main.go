@@ -76,13 +76,19 @@ func openCheckedStore(path string) (*metadata.Store, error) {
 	return store, nil
 }
 
-type cliStartupCleanup struct{ steps []func() }
+type cliStartupCleanup struct{ steps []func() error }
 
-func (c *cliStartupCleanup) add(step func()) { c.steps = append(c.steps, step) }
+func (c *cliStartupCleanup) add(step func()) {
+	c.addError(func() error { step(); return nil })
+}
+
+func (c *cliStartupCleanup) addError(step func() error) { c.steps = append(c.steps, step) }
 
 func (c *cliStartupCleanup) fail(err error) error {
 	for i := len(c.steps) - 1; i >= 0; i-- {
-		c.steps[i]()
+		if closeErr := c.steps[i](); closeErr != nil {
+			err = errors.Join(err, closeErr)
+		}
 	}
 	c.steps = nil
 	return err
@@ -150,6 +156,13 @@ func newCLIReplacementLeases(enabled bool, redisURL string, spool *jmnfs.SpoolSt
 }
 
 func main() {
+	if err := runJM5(); err != nil {
+		log.Print(err)
+		os.Exit(1)
+	}
+}
+
+func runJM5() error {
 	buildInfo := flag.Bool("build-info", false, "print release version and source commit, then exit")
 	replacementRecovery := flag.Bool("replacement-recovery", false, "Recover accepted atomic saves (requires spool and enforcing lease proxy)")
 	redisURL := flag.String("redis", "redis://127.0.0.1:6379/1", "Redis URL")
@@ -174,16 +187,18 @@ func main() {
 	// If both are set, --manager-* wins.
 	managerSourceRoots := flag.String("manager-source-roots", "", "Comma-separated host paths the manager's web UI may browse from. Empty = manager disabled.")
 	managerAdminKey := flag.String("manager-admin-key", "", "Admin key for the manager's X-JuiceMount-Admin-Key header. Empty disables auth. JM_ADMIN_KEY env var used as fallback if neither this nor --migrator-admin-key is set explicitly.")
+	managerContinuityCatalog := flag.String("manager-continuity-catalog", "", "Existing private continuity catalog (requires enabled Manager and library)")
+	managerContinuityLibrary := flag.String("manager-continuity-library", "", "Expected continuity library identity")
 	migratorSourceRoots := flag.String("migrator-source-roots", "", "DEPRECATED: alias for --manager-source-roots, kept for one-release compat.")
 	migratorAdminKey := flag.String("migrator-admin-key", "", "DEPRECATED: alias for --manager-admin-key, kept for one-release compat.")
 	flag.Parse()
 	if *buildInfo {
 		fmt.Printf("jm5 %s (%s)\n", version.Version, version.Commit)
-		return
+		return nil
 	}
 
 	if err := validateCLIReplacementRecovery(*replacementRecovery, os.Getenv("JM_SPOOL_ENABLE") == "1"); err != nil {
-		log.Fatal(err)
+		return err
 	}
 
 	// Own stop signals before starting any child or admitting mount effects.
@@ -198,9 +213,26 @@ func main() {
 		LogFile: *logFile,
 		Level:   jmlog.ParseLevel(*logLevel),
 	}); err != nil {
-		log.Fatalf("init logger: %v", err)
+		return fmt.Errorf("init logger: %w", err)
 	}
 	defer jmlog.Close()
+
+	effectiveSourceRoots, effectiveAdminKey := resolveContinuityManagerSettings(
+		*managerSourceRoots, *migratorSourceRoots, *managerAdminKey, *migratorAdminKey, os.Getenv("JM_ADMIN_KEY"))
+	discovery, err := prepareEmbeddedContinuity(context.Background(), effectiveSourceRoots, manager.ContinuityConfig{
+		CatalogPath: *managerContinuityCatalog, LibraryID: *managerContinuityLibrary, ManagerAdminKey: effectiveAdminKey,
+	})
+	if err != nil {
+		return err
+	}
+	var startupCleanup cliStartupCleanup
+	startupCleanup.addError(func() error { return closeEmbeddedContinuity(discovery.Close) })
+	// Register the scoped subtree on its future production mux before any
+	// storage effect. Legacy Register attaches its routes only after startup.
+	mgrMux := http.NewServeMux()
+	if err := discovery.RegisterRoutes(mgrMux, "/manager"); err != nil {
+		return startupCleanup.fail(err)
+	}
 
 	// Defaults
 	if *fusePath == "" {
@@ -215,9 +247,8 @@ func main() {
 	// reconcile, recovery, or either listener can affect the existing volume.
 	store, err := openCheckedStore(*dbPath)
 	if err != nil {
-		log.Fatalf("Open metadata store: %v", err)
+		return startupCleanup.fail(fmt.Errorf("open metadata store: %w", err))
 	}
-	var startupCleanup cliStartupCleanup
 	startupCleanup.add(func() { _ = store.Close() })
 
 	// Previous processes and mounts require broker reconciliation. A name or
@@ -240,7 +271,7 @@ func main() {
 	// 2. Connect to Redis. Sync follows spool recovery below.
 	rc, err := metadata.NewRedisClient(*redisURL, store)
 	if err != nil {
-		log.Fatal(startupCleanup.fail(fmt.Errorf("Redis connect: %w", err)))
+		return startupCleanup.fail(fmt.Errorf("Redis connect: %w", err))
 	}
 	startupCleanup.add(rc.Stop)
 
@@ -249,7 +280,7 @@ func main() {
 	// NewSession return and must be attached explicitly below.
 	cachePaths, err := metadata.OpenCachePathEligibility(store)
 	if err != nil {
-		log.Fatal(startupCleanup.fail(fmt.Errorf("open cache path eligibility: %w", err)))
+		return startupCleanup.fail(fmt.Errorf("open cache path eligibility: %w", err))
 	}
 	// --no-fuse serves an externally owned generation. Its executable is
 	// unknown; finding another installed binary cannot prove cache layout.
@@ -259,7 +290,7 @@ func main() {
 	}
 	stateDir, err := filepath.Abs(filepath.Dir(*dbPath))
 	if err != nil {
-		log.Fatal(startupCleanup.fail(fmt.Errorf("cache state directory: %w", err)))
+		return startupCleanup.fail(fmt.Errorf("cache state directory: %w", err))
 	}
 	var cacheHandler atomic.Pointer[jmnfs.JuiceMountHandler]
 	cacheNetwork := newCLICacheNetworkOwner(nil, rc)
@@ -286,7 +317,7 @@ func main() {
 		},
 	})
 	if err != nil {
-		log.Fatal(startupCleanup.fail(fmt.Errorf("bind cache session: %w", err)))
+		return startupCleanup.fail(fmt.Errorf("bind cache session: %w", err))
 	}
 	startupCleanup.add(cacheSession.Stop)
 	cacheNetwork.session = cacheSession
@@ -301,7 +332,7 @@ func main() {
 			BucketOverride: *bucketOverride,
 		})
 		if err != nil {
-			log.Fatal(startupCleanup.fail(fmt.Errorf("reserve FUSE generation: %w", err)))
+			return startupCleanup.fail(fmt.Errorf("reserve FUSE generation: %w", err))
 		}
 		*fusePath = fuseMgr.MountPoint()
 	}
@@ -484,7 +515,7 @@ func main() {
 			}, &startupCleanup)
 		}, sigCh, 5*time.Second)
 	}); err != nil {
-		log.Fatal(err)
+		return err
 	}
 	jmlog.Info("nfs server listening", "addr", srv.Addr())
 
@@ -500,25 +531,8 @@ func main() {
 	// in-process FUSE mount so chunks flow via the same juicefs
 	// daemon as the NFS gateway.
 	//
-	// SLICE 0 rename compat: --manager-* wins if set; otherwise fall
-	// back to the legacy --migrator-* aliases.
-	effectiveSourceRoots := *managerSourceRoots
-	if effectiveSourceRoots == "" {
-		effectiveSourceRoots = *migratorSourceRoots
-	}
-	// Admin-key precedence: explicit --manager-admin-key > explicit
-	// --migrator-admin-key (legacy alias) > JM_ADMIN_KEY env var. The
-	// env var is only a fallback so an operator who passes a flag
-	// value explicitly always overrides whatever's in env (matches
-	// pre-rename behaviour of --migrator-admin-key, which had env as
-	// its flag default and thus was overridden by any explicit value).
-	effectiveAdminKey := *managerAdminKey
-	if effectiveAdminKey == "" {
-		effectiveAdminKey = *migratorAdminKey
-	}
-	if effectiveAdminKey == "" {
-		effectiveAdminKey = os.Getenv("JM_ADMIN_KEY")
-	}
+	// Pure root/key resolution and scoped preparation already completed before
+	// storage startup. Preserve legacy alias and environment precedence.
 	var mgrJobMgr *manager.JobManager
 	if effectiveSourceRoots != "" {
 		roots := splitNonEmpty(effectiveSourceRoots, ",")
@@ -530,7 +544,6 @@ func main() {
 		// not directly to ExtraRoutes — so we build a sub-mux and
 		// register one catch-all that forwards everything under
 		// /manager/ to it.
-		mgrMux := http.NewServeMux()
 		mgrJobMgr = manager.Register(mgrMux, "/manager", manager.Config{
 			JuiceFSBin:  "juicefs", // PATH lookup
 			FUSEMount:   *fusePath, // embedded mode: write via in-process FUSE mount
@@ -593,11 +606,17 @@ func main() {
 		_ = json.NewEncoder(w).Encode(who)
 	}
 
+	var continuityHostErr error
 	if err := metricsSrv.Start(); err != nil {
 		jmlog.Warn("metrics server failed to start", "error", err, "addr", *metricsAddr)
+		if discovery != nil {
+			continuityHostErr = err
+		}
 	} else {
 		jmlog.Info("metrics server listening", "addr", metricsSrv.Addr())
 	}
+	monitorsStarted := continuityHostErr == nil
+	nfsMountAttempted := false
 
 	// 5. Start network watcher + health monitor
 	netWatcher := health.NewNetWatcher(1 * time.Second)
@@ -606,13 +625,17 @@ func main() {
 			"old", oldIface, "new", newIface)
 		cacheNetwork.interfaceChanged()
 	})
-	netWatcher.Start()
+	if monitorsStarted {
+		netWatcher.Start()
+	}
 
 	healthCfg := newHealthConfig(*redisURL, *managerMinIOURL, *fusePath, *mountPoint, *noMount)
 	healthCfg.RedisOptions = rc.RawDB().Options()
 	healthMon := health.New(healthCfg)
 	healthMon.SetNetWatcher(netWatcher)
-	healthMon.Start()
+	if monitorsStarted {
+		healthMon.Start()
+	}
 
 	// Expose health status to /health endpoint.
 	metrics.Default().SetHealthProvider(func() metrics.HealthSnapshot {
@@ -620,7 +643,8 @@ func main() {
 	})
 
 	// 6. Mount NFS (unless --no-mount)
-	if !*noMount {
+	if continuityHostErr == nil && !*noMount {
+		nfsMountAttempted = true
 		if err := mountNFS(srv.Addr(), srv.ExportPath(), *mountPoint, *dbPath); err != nil {
 			jmlog.Error("NFS mount outcome incomplete; retaining serving dependencies", "error", err)
 		} else {
@@ -629,15 +653,29 @@ func main() {
 	}
 
 	// Allow auto-remount only when we own the mount lifecycle.
-	if !*noMount {
+	if continuityHostErr == nil && !*noMount {
 		healthMon.EnableNFSRemount(func() error {
 			return mountNFSNonInteractive(srv.Addr(), srv.ExportPath(), *mountPoint, *dbPath)
 		})
 	}
-	jmlog.Info("juicemount5 serving, awaiting signal")
-
-	// Wait for signal (including one received during initial creation).
-	<-sigCh
+	// An opted-in listener failure shares the normal storage cleanup path.
+	// A startup failure skips subsequent mount/admission instead of continuing
+	// with a silently unavailable explicitly configured service.
+	if continuityHostErr == nil {
+		jmlog.Info("juicemount5 serving, awaiting signal")
+		var failures <-chan error
+		if discovery != nil {
+			failures = metricsSrv.ServeErrors()
+		}
+		select {
+		case <-sigCh:
+		case continuityHostErr = <-failures:
+		}
+	}
+	continuityCloseErr := closeEmbeddedContinuity(discovery.Close)
+	if continuityCloseErr != nil {
+		jmlog.Error("continuity closed with error", "error", continuityCloseErr)
+	}
 
 	// Graceful shutdown in dependency order:
 	// 1. Unmount NFS (stop new RPCs from reaching the server)
@@ -646,14 +684,14 @@ func main() {
 	// 4. Stop network watcher and health monitor
 	// 5. Stop Redis (close subscription and reconciliation)
 	// 6. Close SQLite
-	if !*noMount {
+	if nfsMountAttempted {
 		cliNFSMu.Lock()
 		cliNFSStopping = true
 		cliNFSMu.Unlock()
 	}
 	jmlog.Info("shutting down")
 
-	if !*noMount {
+	if nfsMountAttempted {
 		jmlog.Info("unmounting", "mount_point", *mountPoint)
 		healthMon.EnableNFSRemount(nil)
 		healthMon.EnableNFSAbsentRemount(nil)
@@ -691,11 +729,19 @@ func main() {
 			return nil
 		}, sigCh, 5*time.Second)
 	}
+	var metricsCloseErr error
 	if metricsSrv != nil {
-		metricsSrv.Stop()
+		if discovery != nil {
+			metricsCloseErr = stopEmbeddedMetrics(metricsSrv)
+		} else {
+			metricsSrv.Stop()
+		}
 	}
-	netWatcher.Stop()
-	healthMon.Stop()
+	if monitorsStarted {
+		// The start-failure path above never started these monitors.
+		netWatcher.Stop()
+		healthMon.Stop()
+	}
 	cacheNetwork.stop()
 	cacheHandler.Store(nil)
 	srv.Handler().SidecarPersistStop()
@@ -703,6 +749,7 @@ func main() {
 	rc.Stop()
 	store.Close()
 
+	return errors.Join(continuityHostErr, continuityCloseErr, metricsCloseErr)
 }
 
 // componentLabel returns "ok" for healthy, or the underlying reason.
