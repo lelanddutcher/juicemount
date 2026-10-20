@@ -1,0 +1,240 @@
+{
+  "version": 1,
+  "vectors": [
+    {
+      "name": "content_create_empty",
+      "codec": "CollectionRequest",
+      "canonical_literal": "{\"version\":1,\"library_id\":\"lib_11111111111111111111111111111111\",\"operation_id\":\"cop_22222222222222222222222222222222\",\"collection_id\":\"col_33333333333333333333333333333333\",\"expected_version\":\"\",\"kind\":\"create\",\"value\":{\"name\":\"SYNTHETIC Empty\",\"creator_grant_id\":\"cgr_44444444444444444444444444444444\",\"entries\":[]}}",
+      "domain": "juicemount.catalog.collection.operation\u0000\u0001",
+      "expected_valid": true,
+      "expected_digest_sha256": "bb5448ac34fefff9db3ac53c9e73f1720c910172aafd81dee95182f28ceb5435",
+      "literal_bytes": 318,
+      "reason": "Required explicit empty entries, empty create expected version; no actor."
+    },
+    {
+      "name": "content_create_hostile_name",
+      "codec": "CollectionRequest",
+      "canonical_literal": "{\"version\":1,\"library_id\":\"lib_11111111111111111111111111111111\",\"operation_id\":\"cop_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"collection_id\":\"col_33333333333333333333333333333333\",\"expected_version\":\"\",\"kind\":\"create\",\"value\":{\"name\":\"SYNTHETIC \\u003cimg src=\\\"x\\\"\\u003e \\u0026 slash\\\\ line\\n\\u2028\\u2029\",\"creator_grant_id\":\"cgr_44444444444444444444444444444444\",\"entries\":[{\"entry_id\":\"cent_55555555555555555555555555555555\",\"asset_id\":\"asset_66666666666666666666666666666666\"}]}}",
+      "domain": "juicemount.catalog.collection.operation\u0000\u0001",
+      "expected_valid": true,
+      "expected_digest_sha256": "4fae04f3a094f25a26b32f1d665b085982b6148eb94381f6ccf4367bd61b606e",
+      "literal_bytes": 476,
+      "reason": "Go HTML/quote/backslash/newline/U+2028/U+2029 escaping; one entry."
+    },
+    {
+      "name": "content_entries_explicit_order",
+      "codec": "CollectionRequest",
+      "canonical_literal": "{\"version\":1,\"library_id\":\"lib_11111111111111111111111111111111\",\"operation_id\":\"cop_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"collection_id\":\"col_33333333333333333333333333333333\",\"expected_version\":\"cv_77777777777777777777777777777777\",\"kind\":\"entries\",\"value\":{\"changes\":[{\"kind\":\"remove\",\"entry_id\":\"cent_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"asset_id\":\"asset_66666666666666666666666666666666\"},{\"kind\":\"add\",\"entry_id\":\"cent_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"asset_id\":\"asset_77777777777777777777777777777777\"}]}}",
+      "domain": "juicemount.catalog.collection.operation\u0000\u0001",
+      "expected_valid": true,
+      "expected_digest_sha256": "7d86335846110329944722c7c5fe219e49d9e222db45ebbda81b882a9fa2c107",
+      "literal_bytes": 509,
+      "reason": "Ordered deltas intentionally descending entry IDs; distinct assets, no implicit sort."
+    },
+    {
+      "name": "content_record_create",
+      "codec": "CollectionRecord",
+      "canonical_literal": "{\"version\":1,\"request\":{\"version\":1,\"library_id\":\"lib_11111111111111111111111111111111\",\"operation_id\":\"cop_22222222222222222222222222222222\",\"collection_id\":\"col_33333333333333333333333333333333\",\"expected_version\":\"\",\"kind\":\"create\",\"value\":{\"name\":\"SYNTHETIC Empty\",\"creator_grant_id\":\"cgr_44444444444444444444444444444444\",\"entries\":[]}},\"actor_subject_id\":\"sub_88888888888888888888888888888888\",\"result_version\":\"cv_77777777777777777777777777777777\",\"generated_policy_operation_id\":\"cpo_22222222222222222222222222222222\",\"recorded_unix_nano\":1700000000000000001}",
+      "domain": "juicemount.catalog.collection.record\u0000\u0001",
+      "expected_valid": true,
+      "expected_digest_sha256": "93700a0534ad1d1929ad59dcb14e43c8d89be4bb0a96f1b6c4846e4305e2d11f",
+      "literal_bytes": 567,
+      "reason": "Nested exact empty-create request; actor/time/result/generation ID explicit."
+    },
+    {
+      "name": "content_minimal_receipt",
+      "codec": "CollectionReceipt",
+      "canonical_literal": "{\"version\":1,\"operation_id\":\"cop_22222222222222222222222222222222\",\"collection_id\":\"col_33333333333333333333333333333333\",\"result_version\":\"cv_77777777777777777777777777777777\"}",
+      "domain": null,
+      "expected_valid": true,
+      "literal_bytes": 177,
+      "reason": "No actor, time, sequence or hash; optional portable receipt-domain digest deliberately omitted."
+    },
+    {
+      "name": "policy_library_create",
+      "codec": "CollectionPolicyRequest",
+      "canonical_literal": "{\"version\":2,\"library_id\":\"lib_11111111111111111111111111111111\",\"operation_id\":\"cpo_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"category\":\"library_create\",\"collection_id\":\"\",\"binding_operation_id\":\"\",\"binding_payload_sha256\":\"\",\"changes\":[{\"kind\":\"put\",\"grant_id\":\"cgr_44444444444444444444444444444444\",\"expected\":null,\"value\":{\"subject_id\":\"sub_88888888888888888888888888888888\",\"scope\":{\"kind\":\"library_create\",\"collection_id\":\"\"},\"actions\":[\"collections.create\"]}}]}",
+      "domain": "juicemount.catalog.collection.policy.operation\u0000\u0002",
+      "expected_valid": true,
+      "expected_digest_sha256": "05f27b48c54636bbf731b2bee82b67e7d9a6f16d31a312b4c30f968ab365eec1",
+      "literal_bytes": 461,
+      "reason": "Owner binding empty, library-only category and scope."
+    },
+    {
+      "name": "policy_generated_creator",
+      "codec": "CollectionPolicyRequest",
+      "canonical_literal": "{\"version\":2,\"library_id\":\"lib_11111111111111111111111111111111\",\"operation_id\":\"cpo_22222222222222222222222222222222\",\"category\":\"collection\",\"collection_id\":\"col_33333333333333333333333333333333\",\"binding_operation_id\":\"cop_22222222222222222222222222222222\",\"binding_payload_sha256\":\"bb5448ac34fefff9db3ac53c9e73f1720c910172aafd81dee95182f28ceb5435\",\"changes\":[{\"kind\":\"put\",\"grant_id\":\"cgr_44444444444444444444444444444444\",\"expected\":null,\"value\":{\"subject_id\":\"sub_88888888888888888888888888888888\",\"scope\":{\"kind\":\"collection\",\"collection_id\":\"col_33333333333333333333333333333333\"},\"actions\":[\"collections.admin\",\"collections.edit\",\"collections.read\"]}}]}",
+      "domain": "juicemount.catalog.collection.policy.operation\u0000\u0002",
+      "expected_valid": true,
+      "expected_digest_sha256": "c79d0cddde1d5d1744d9eddb195bd764bececbca45f24848a3d53f211fb65748",
+      "literal_bytes": 662,
+      "reason": "Generated cpo copies cop payload; binds independently hashed empty create."
+    },
+    {
+      "name": "policy_security_collection",
+      "codec": "CollectionPolicyRequest",
+      "canonical_literal": "{\"version\":2,\"library_id\":\"lib_11111111111111111111111111111111\",\"operation_id\":\"cpo_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"category\":\"security_remove\",\"collection_id\":\"col_33333333333333333333333333333333\",\"binding_operation_id\":\"\",\"binding_payload_sha256\":\"\",\"changes\":[{\"kind\":\"remove\",\"grant_id\":\"cgr_44444444444444444444444444444444\",\"expected\":{\"value\":{\"subject_id\":\"sub_88888888888888888888888888888888\",\"scope\":{\"kind\":\"collection\",\"collection_id\":\"col_33333333333333333333333333333333\"},\"actions\":[\"collections.admin\",\"collections.edit\",\"collections.read\"]},\"version\":\"cgv_99999999999999999999999999999999\",\"removed\":false},\"value\":null}]}",
+      "domain": "juicemount.catalog.collection.policy.operation\u0000\u0002",
+      "expected_valid": true,
+      "expected_digest_sha256": "eacadfe245a868f90b1d85ab3f77280eab3d1f50e5e488696d892b92ef586dd9",
+      "literal_bytes": 645,
+      "reason": "One active whole remove with full expected value, empty binding."
+    },
+    {
+      "name": "policy_security_library",
+      "codec": "CollectionPolicyRequest",
+      "canonical_literal": "{\"version\":2,\"library_id\":\"lib_11111111111111111111111111111111\",\"operation_id\":\"cpo_cccccccccccccccccccccccccccccccc\",\"category\":\"security_remove\",\"collection_id\":\"\",\"binding_operation_id\":\"\",\"binding_payload_sha256\":\"\",\"changes\":[{\"kind\":\"remove\",\"grant_id\":\"cgr_44444444444444444444444444444444\",\"expected\":{\"value\":{\"subject_id\":\"sub_88888888888888888888888888888888\",\"scope\":{\"kind\":\"library_create\",\"collection_id\":\"\"},\"actions\":[\"collections.create\"]},\"version\":\"cgv_99999999999999999999999999999999\",\"removed\":false},\"value\":null}]}",
+      "domain": "juicemount.catalog.collection.policy.operation\u0000\u0002",
+      "expected_valid": true,
+      "expected_digest_sha256": "96fae6b26199d822179a6a5923fce12c0be3b2f05a8300cc788d67adbfe12351",
+      "literal_bytes": 540,
+      "reason": "Library-create removal needs no collection identity."
+    },
+    {
+      "name": "policy_record_generated",
+      "codec": "CollectionPolicyRecord",
+      "canonical_literal": "{\"version\":2,\"request\":{\"version\":2,\"library_id\":\"lib_11111111111111111111111111111111\",\"operation_id\":\"cpo_22222222222222222222222222222222\",\"category\":\"collection\",\"collection_id\":\"col_33333333333333333333333333333333\",\"binding_operation_id\":\"cop_22222222222222222222222222222222\",\"binding_payload_sha256\":\"bb5448ac34fefff9db3ac53c9e73f1720c910172aafd81dee95182f28ceb5435\",\"changes\":[{\"kind\":\"put\",\"grant_id\":\"cgr_44444444444444444444444444444444\",\"expected\":null,\"value\":{\"subject_id\":\"sub_88888888888888888888888888888888\",\"scope\":{\"kind\":\"collection\",\"collection_id\":\"col_33333333333333333333333333333333\"},\"actions\":[\"collections.admin\",\"collections.edit\",\"collections.read\"]}}]},\"administration\":\"collection_service\",\"operator_subject_id\":\"sub_88888888888888888888888888888888\",\"results\":[{\"grant_id\":\"cgr_44444444444444444444444444444444\",\"version\":\"cgv_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"removed\":false}],\"recorded_unix_nano\":1700000000000000001}",
+      "domain": "juicemount.catalog.collection.policy.record\u0000\u0002",
+      "expected_valid": true,
+      "expected_digest_sha256": "93b8fff16d7da7e96024cf56d2a4cafb7f55dedab388e73e29c142eb6ae947e5",
+      "literal_bytes": 955,
+      "reason": "Collection-service attribution, matching actor and one fresh result."
+    },
+    {
+      "name": "policy_receipt_generated",
+      "codec": "CollectionPolicyReceipt",
+      "canonical_literal": "{\"version\":2,\"library_id\":\"lib_11111111111111111111111111111111\",\"operation_id\":\"cpo_22222222222222222222222222222222\",\"payload_sha256\":\"c79d0cddde1d5d1744d9eddb195bd764bececbca45f24848a3d53f211fb65748\",\"recorded_unix_nano\":1700000000000000001}",
+      "domain": null,
+      "expected_valid": true,
+      "literal_bytes": 244,
+      "reason": "Internal owner receipt binds generated request digest; not a public content receipt."
+    },
+    {
+      "name": "credential_issue_all_nine",
+      "codec": "AdminRequestV2",
+      "canonical_literal": "{\"version\":2,\"library_id\":\"lib_11111111111111111111111111111111\",\"operation_id\":\"synthetic_issue_all_nine\",\"expected_incarnation\":\"auth_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"kind\":\"issue_credential\",\"value\":{\"subject_id\":\"sub_88888888888888888888888888888888\",\"scope\":{\"kind\":\"library\",\"asset_id\":\"\"},\"actions\":[\"activity.record\",\"assets.discover\",\"collections.admin\",\"collections.create\",\"collections.edit\",\"collections.read\",\"locations.read\",\"relationships.read\",\"revisions.read\"],\"expires_unix\":1800000000}}",
+      "domain": "juicemount.catalog.authority.operation\u0000\u0002",
+      "expected_valid": true,
+      "expected_digest_sha256": "4227ff4c2bf112bf536044ae3fb7f75b48f9089b428e4389c7da8219b9fe9073",
+      "literal_bytes": 507,
+      "reason": "New request codec only, sorted union9 and library scope; does not issue a credential."
+    },
+    {
+      "name": "invalid_missing_expected_version",
+      "codec": "CollectionRequest",
+      "canonical_literal": "{\"version\":1,\"library_id\":\"lib_11111111111111111111111111111111\",\"operation_id\":\"cop_22222222222222222222222222222222\",\"collection_id\":\"col_33333333333333333333333333333333\",\"kind\":\"create\",\"value\":{\"name\":\"SYNTHETIC Empty\",\"creator_grant_id\":\"cgr_44444444444444444444444444444444\",\"entries\":[]}}",
+      "domain": "juicemount.catalog.collection.operation\u0000\u0001",
+      "expected_valid": false,
+      "literal_bytes": 296,
+      "reason": "Missing required empty-valued field must not default successfully."
+    },
+    {
+      "name": "invalid_duplicate_version",
+      "codec": "CollectionRequest",
+      "canonical_literal": "{\"version\":1,\"version\":1,\"library_id\":\"lib_11111111111111111111111111111111\",\"operation_id\":\"cop_22222222222222222222222222222222\",\"collection_id\":\"col_33333333333333333333333333333333\",\"expected_version\":\"\",\"kind\":\"create\",\"value\":{\"name\":\"SYNTHETIC Empty\",\"creator_grant_id\":\"cgr_44444444444444444444444444444444\",\"entries\":[]}}",
+      "domain": "juicemount.catalog.collection.operation\u0000\u0001",
+      "expected_valid": false,
+      "literal_bytes": 330,
+      "reason": "Duplicate known field even with identical value."
+    },
+    {
+      "name": "invalid_null_entries",
+      "codec": "CollectionRequest",
+      "canonical_literal": "{\"version\":1,\"library_id\":\"lib_11111111111111111111111111111111\",\"operation_id\":\"cop_22222222222222222222222222222222\",\"collection_id\":\"col_33333333333333333333333333333333\",\"expected_version\":\"\",\"kind\":\"create\",\"value\":{\"name\":\"SYNTHETIC Empty\",\"creator_grant_id\":\"cgr_44444444444444444444444444444444\",\"entries\":null}}",
+      "domain": "juicemount.catalog.collection.operation\u0000\u0001",
+      "expected_valid": false,
+      "literal_bytes": 320,
+      "reason": "Required array cannot be null."
+    },
+    {
+      "name": "invalid_spoof_actor",
+      "codec": "CollectionRequest",
+      "canonical_literal": "{\"version\":1,\"library_id\":\"lib_11111111111111111111111111111111\",\"operation_id\":\"cop_22222222222222222222222222222222\",\"collection_id\":\"col_33333333333333333333333333333333\",\"actor_subject_id\":\"sub_88888888888888888888888888888888\",\"expected_version\":\"\",\"kind\":\"create\",\"value\":{\"name\":\"SYNTHETIC Empty\",\"creator_grant_id\":\"cgr_44444444444444444444444444444444\",\"entries\":[]}}",
+      "domain": "juicemount.catalog.collection.operation\u0000\u0001",
+      "expected_valid": false,
+      "literal_bytes": 376,
+      "reason": "Request cannot carry server-derived actor."
+    },
+    {
+      "name": "invalid_zero_collection_id",
+      "codec": "CollectionRequest",
+      "canonical_literal": "{\"version\":1,\"library_id\":\"lib_11111111111111111111111111111111\",\"operation_id\":\"cop_22222222222222222222222222222222\",\"collection_id\":\"col_00000000000000000000000000000000\",\"expected_version\":\"\",\"kind\":\"create\",\"value\":{\"name\":\"SYNTHETIC Empty\",\"creator_grant_id\":\"cgr_44444444444444444444444444444444\",\"entries\":[]}}",
+      "domain": "juicemount.catalog.collection.operation\u0000\u0001",
+      "expected_valid": false,
+      "literal_bytes": 318,
+      "reason": "All-zero random identity is invalid."
+    },
+    {
+      "name": "invalid_grant_retarget_subject",
+      "codec": "CollectionPolicyRequest",
+      "canonical_literal": "{\"version\":2,\"library_id\":\"lib_11111111111111111111111111111111\",\"operation_id\":\"cpo_dddddddddddddddddddddddddddddddd\",\"category\":\"collection\",\"collection_id\":\"col_33333333333333333333333333333333\",\"binding_operation_id\":\"\",\"binding_payload_sha256\":\"\",\"changes\":[{\"kind\":\"put\",\"grant_id\":\"cgr_44444444444444444444444444444444\",\"expected\":{\"value\":{\"subject_id\":\"sub_88888888888888888888888888888888\",\"scope\":{\"kind\":\"collection\",\"collection_id\":\"col_33333333333333333333333333333333\"},\"actions\":[\"collections.admin\",\"collections.edit\",\"collections.read\"]},\"version\":\"cgv_99999999999999999999999999999999\",\"removed\":false},\"value\":{\"subject_id\":\"sub_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"scope\":{\"kind\":\"collection\",\"collection_id\":\"col_33333333333333333333333333333333\"},\"actions\":[\"collections.admin\",\"collections.edit\",\"collections.read\"]}}]}",
+      "domain": "juicemount.catalog.collection.policy.operation\u0000\u0002",
+      "expected_valid": false,
+      "literal_bytes": 841,
+      "reason": "Expected present: immutable grantee cannot change, even with same scope/actions."
+    },
+    {
+      "name": "invalid_active_grant_noop",
+      "codec": "CollectionPolicyRequest",
+      "canonical_literal": "{\"version\":2,\"library_id\":\"lib_11111111111111111111111111111111\",\"operation_id\":\"cpo_dddddddddddddddddddddddddddddddd\",\"category\":\"collection\",\"collection_id\":\"col_33333333333333333333333333333333\",\"binding_operation_id\":\"\",\"binding_payload_sha256\":\"\",\"changes\":[{\"kind\":\"put\",\"grant_id\":\"cgr_44444444444444444444444444444444\",\"expected\":{\"value\":{\"subject_id\":\"sub_88888888888888888888888888888888\",\"scope\":{\"kind\":\"collection\",\"collection_id\":\"col_33333333333333333333333333333333\"},\"actions\":[\"collections.admin\",\"collections.edit\",\"collections.read\"]},\"version\":\"cgv_99999999999999999999999999999999\",\"removed\":false},\"value\":{\"subject_id\":\"sub_88888888888888888888888888888888\",\"scope\":{\"kind\":\"collection\",\"collection_id\":\"col_33333333333333333333333333333333\"},\"actions\":[\"collections.admin\",\"collections.edit\",\"collections.read\"]}}]}",
+      "domain": "juicemount.catalog.collection.policy.operation\u0000\u0002",
+      "expected_valid": false,
+      "literal_bytes": 841,
+      "reason": "Active put with identical complete value is a no-op."
+    },
+    {
+      "name": "invalid_security_widen",
+      "codec": "CollectionPolicyRequest",
+      "canonical_literal": "{\"version\":2,\"library_id\":\"lib_11111111111111111111111111111111\",\"operation_id\":\"cpo_dddddddddddddddddddddddddddddddd\",\"category\":\"security_remove\",\"collection_id\":\"col_33333333333333333333333333333333\",\"binding_operation_id\":\"\",\"binding_payload_sha256\":\"\",\"changes\":[{\"kind\":\"put\",\"grant_id\":\"cgr_44444444444444444444444444444444\",\"expected\":{\"value\":{\"subject_id\":\"sub_88888888888888888888888888888888\",\"scope\":{\"kind\":\"collection\",\"collection_id\":\"col_33333333333333333333333333333333\"},\"actions\":[\"collections.read\"]},\"version\":\"cgv_99999999999999999999999999999999\",\"removed\":false},\"value\":{\"subject_id\":\"sub_88888888888888888888888888888888\",\"scope\":{\"kind\":\"collection\",\"collection_id\":\"col_33333333333333333333333333333333\"},\"actions\":[\"collections.admin\",\"collections.edit\",\"collections.read\"]}}]}",
+      "domain": "juicemount.catalog.collection.policy.operation\u0000\u0002",
+      "expected_valid": false,
+      "literal_bytes": 807,
+      "reason": "Security category cannot perform a put/action widening; otherwise structurally valid correction."
+    },
+    {
+      "name": "invalid_record_reuses_expected_version",
+      "codec": "CollectionRecord",
+      "canonical_literal": "{\"version\":1,\"request\":{\"version\":1,\"library_id\":\"lib_11111111111111111111111111111111\",\"operation_id\":\"cop_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"collection_id\":\"col_33333333333333333333333333333333\",\"expected_version\":\"cv_77777777777777777777777777777777\",\"kind\":\"entries\",\"value\":{\"changes\":[{\"kind\":\"remove\",\"entry_id\":\"cent_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"asset_id\":\"asset_66666666666666666666666666666666\"},{\"kind\":\"add\",\"entry_id\":\"cent_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"asset_id\":\"asset_77777777777777777777777777777777\"}]}},\"actor_subject_id\":\"sub_88888888888888888888888888888888\",\"result_version\":\"cv_77777777777777777777777777777777\",\"generated_policy_operation_id\":\"\",\"recorded_unix_nano\":1700000000000000001}",
+      "domain": "juicemount.catalog.collection.record\u0000\u0001",
+      "expected_valid": false,
+      "literal_bytes": 722,
+      "reason": "New record result equals request expected version; no persistent history needed to reject."
+    },
+    {
+      "name": "invalid_record_generated_id",
+      "codec": "CollectionRecord",
+      "canonical_literal": "{\"version\":1,\"request\":{\"version\":1,\"library_id\":\"lib_11111111111111111111111111111111\",\"operation_id\":\"cop_22222222222222222222222222222222\",\"collection_id\":\"col_33333333333333333333333333333333\",\"expected_version\":\"\",\"kind\":\"create\",\"value\":{\"name\":\"SYNTHETIC Empty\",\"creator_grant_id\":\"cgr_44444444444444444444444444444444\",\"entries\":[]}},\"actor_subject_id\":\"sub_88888888888888888888888888888888\",\"result_version\":\"cv_77777777777777777777777777777777\",\"generated_policy_operation_id\":\"cpo_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"recorded_unix_nano\":1700000000000000001}",
+      "domain": "juicemount.catalog.collection.record\u0000\u0001",
+      "expected_valid": false,
+      "literal_bytes": 567,
+      "reason": "Create record generated policy ID must transform content operation ID."
+    },
+    {
+      "name": "invalid_issuance_unsorted_actions",
+      "codec": "AdminRequestV2",
+      "canonical_literal": "{\"version\":2,\"library_id\":\"lib_11111111111111111111111111111111\",\"operation_id\":\"synthetic_issue_all_nine\",\"expected_incarnation\":\"auth_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"kind\":\"issue_credential\",\"value\":{\"subject_id\":\"sub_88888888888888888888888888888888\",\"scope\":{\"kind\":\"library\",\"asset_id\":\"\"},\"actions\":[\"assets.discover\",\"activity.record\",\"collections.admin\",\"collections.create\",\"collections.edit\",\"collections.read\",\"locations.read\",\"relationships.read\",\"revisions.read\"],\"expires_unix\":1800000000}}",
+      "domain": "juicemount.catalog.authority.operation\u0000\u0002",
+      "expected_valid": false,
+      "literal_bytes": 507,
+      "reason": "No silent action sorting."
+    },
+    {
+      "name": "invalid_create_unsorted_entries",
+      "codec": "CollectionRequest",
+      "canonical_literal": "{\"version\":1,\"library_id\":\"lib_11111111111111111111111111111111\",\"operation_id\":\"cop_22222222222222222222222222222222\",\"collection_id\":\"col_33333333333333333333333333333333\",\"expected_version\":\"\",\"kind\":\"create\",\"value\":{\"name\":\"SYNTHETIC Empty\",\"creator_grant_id\":\"cgr_44444444444444444444444444444444\",\"entries\":[{\"entry_id\":\"cent_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"asset_id\":\"asset_66666666666666666666666666666666\"},{\"entry_id\":\"cent_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"asset_id\":\"asset_77777777777777777777777777777777\"}]}}",
+      "domain": "juicemount.catalog.collection.operation\u0000\u0001",
+      "expected_valid": false,
+      "literal_bytes": 527,
+      "reason": "Create entries are sorted unlike ordered entries deltas."
+    },
+    {
+      "name": "invalid_hostile_alternate_escape",
+      "codec": "CollectionRequest",
+      "canonical_literal": "{\"version\":1,\"library_id\":\"lib_11111111111111111111111111111111\",\"operation_id\":\"cop_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"collection_id\":\"col_33333333333333333333333333333333\",\"expected_version\":\"\",\"kind\":\"create\",\"value\":{\"name\":\"SYNTHETIC <img src=\\\"x\\\"\\u003e \\u0026 slash\\\\ line\\n\\u2028\\u2029\",\"creator_grant_id\":\"cgr_44444444444444444444444444444444\",\"entries\":[{\"entry_id\":\"cent_55555555555555555555555555555555\",\"asset_id\":\"asset_66666666666666666666666666666666\"}]}}",
+      "domain": "juicemount.catalog.collection.operation\u0000\u0001",
+      "expected_valid": false,
+      "literal_bytes": 471,
+      "reason": "Equivalent JSON string with raw HTML character is not canonical Go escaping."
+    }
+  ]
+}
