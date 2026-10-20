@@ -18,7 +18,7 @@ const schemaVersion = 2
 const authoritySchemaVersion = 3
 const preferencesSchemaVersion = 4
 
-func supportsAuthority(version int) bool { return version == 3 || version == 4 }
+func supportsAuthority(version int) bool { return version == 3 || version == 4 || version == 5 }
 func portableSchemaVersion(version int) int {
 	if version == 4 {
 		return 3
@@ -135,8 +135,11 @@ func expectedSchemaFor(version int) []schemaObject {
 	if supportsAuthority(version) {
 		objects = append(objects, authoritySchema()...)
 	}
-	if version == preferencesSchemaVersion {
+	if supportsPreferences(version) {
 		objects = append(objects, preferencesSchema()...)
+	}
+	if supportsCollections(version) {
+		objects = append(objects, collectionsSchema()...)
 	}
 	sort.Slice(objects, func(i, j int) bool { return objects[i].Name < objects[j].Name })
 	return objects
@@ -171,8 +174,15 @@ func initializeVersion(ctx context.Context, db *sql.DB, library continuity.Libra
 			}
 		}
 	}
-	if version == preferencesSchemaVersion {
+	if supportsPreferences(version) {
 		for _, object := range preferencesSchema() {
+			if object.Type == "table" {
+				tables = append(tables, object.SQL)
+			}
+		}
+	}
+	if supportsCollections(version) {
+		for _, object := range collectionsSchema() {
 			if object.Type == "table" {
 				tables = append(tables, object.SQL)
 			}
@@ -207,7 +217,7 @@ func initializeVersion(ctx context.Context, db *sql.DB, library continuity.Libra
 			return err
 		}
 	}
-	if version == preferencesSchemaVersion {
+	if supportsPreferences(version) {
 		if _, err := tx.ExecContext(ctx, `PRAGMA user_version=4`); err != nil {
 			return err
 		}
@@ -218,8 +228,19 @@ func initializeVersion(ctx context.Context, db *sql.DB, library continuity.Libra
 	if _, err := tx.ExecContext(ctx, `INSERT INTO catalog(singleton,library_id,ready) VALUES(1,?,0)`, library); err != nil {
 		return err
 	}
-	if version == preferencesSchemaVersion {
+	if supportsPreferences(version) {
 		if _, err := tx.ExecContext(ctx, `INSERT INTO preference_control(singleton,library_id,clock_floor_unix,subject_count,entry_count,receipt_count) VALUES(1,?,0,0,0,0)`, library); err != nil {
+			return err
+		}
+	}
+	if supportsCollections(version) {
+		if err := initializeCollections(ctx, tx, string(library), false); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `PRAGMA user_version=5`); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations(version,fingerprint) VALUES(5,?)`, schemaFingerprint(expectedSchemaFor(5))); err != nil {
 			return err
 		}
 	}
@@ -299,6 +320,9 @@ func recognizeSchema(ctx context.Context, q queryer, initializing bool) (continu
 		if entry == 4 {
 			want = schemaFingerprint(expectedSchemaFor(4))
 		}
+		if entry == 5 {
+			want = schemaFingerprint(expectedSchemaFor(5))
+		}
 		if entry != ledgerCount || entry > version || fingerprint != want {
 			rows.Close()
 			return "", 0, corrupt("migration fingerprint lineage mismatch")
@@ -326,8 +350,13 @@ func recognizeSchema(ctx context.Context, q queryer, initializing bool) (continu
 	if (ready != 1 && !(initializing && ready == 0)) || library.Validate() != nil {
 		return "", 0, corrupt("incomplete catalog or invalid library")
 	}
-	if version == 4 {
+	if supportsPreferences(version) {
 		if err := checkPreferences(ctx, q, library); err != nil {
+			return "", 0, err
+		}
+	}
+	if supportsCollections(version) && ready == 1 {
+		if err := checkCollectionState(ctx, q, library); err != nil {
 			return "", 0, err
 		}
 	}

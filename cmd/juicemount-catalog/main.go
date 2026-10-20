@@ -1,5 +1,6 @@
 // Command juicemount-catalog administers a local catalog through OS file access.
-// It does not start a Manager, mount, HTTP server or metadata discovery service.
+// Collection mutations use the authenticated in-process discovery service;
+// this command does not start a Manager, mount or HTTP server.
 package main
 
 import (
@@ -84,12 +85,16 @@ func runConfigured(parent context.Context, args []string, stdin io.Reader, stdou
 	knownOperationID, knownSelector := "", ""
 	outputCloseFailed := false
 	preferenceMaintenance := false
+	collectionMutationAttempted := false
 	fail := func(uncertain bool) int {
 		message := "catalog operation failed"
 		if uncertain {
 			message = "catalog outcome uncertain; inspect operation status before revoke/reissue"
 			if preferenceMaintenance {
 				message = "catalog preference maintenance outcome uncertain"
+			}
+			if collectionMutationAttempted {
+				message = "catalog collection outcome uncertain; retry same exact request or refresh current state"
 			}
 		}
 		_ = writeJSON(stderr, struct {
@@ -207,12 +212,20 @@ func runConfigured(parent context.Context, args []string, stdin io.Reader, stdou
 		}
 		return 0
 	}
+	if command == "upgrade-collections" {
+		if err := catalog.UpgradeCollections(ctx, *path, library); err != nil {
+			return fail(strings.Contains(err.Error(), "uncertain"))
+		}
+		return 0
+	}
 	var s *catalog.Store
 	var err error
 	if command == "init-authority" {
 		s, err = catalog.CreateAuthority(ctx, *path, library)
 	} else if command == "init-preferences" {
 		s, err = catalog.CreatePreferences(ctx, *path, library)
+	} else if command == "init-collections" {
+		s, err = catalog.CreateCollections(ctx, *path, library)
 	} else {
 		s, err = catalog.OpenContext(ctx, *path)
 	}
@@ -228,7 +241,19 @@ func runConfigured(parent context.Context, args []string, stdin io.Reader, stdou
 	if err != nil || actual != library {
 		return fail(false)
 	}
-	if command == "init-authority" || command == "init-preferences" {
+	if command == "init-authority" || command == "init-preferences" || command == "init-collections" {
+		return 0
+	}
+	if command == "collection mutate" {
+		request, bearer, err := readCollectionMutation(stdin, library)
+		if err != nil {
+			return fail(false)
+		}
+		knownOperationID = string(request.ID)
+		collectionMutationAttempted, err = runCollectionMutation(ctx, s, library, request, bearer, stdout)
+		if err != nil {
+			return fail(collectionMutationAttempted)
+		}
 		return 0
 	}
 	if command == "export" {
@@ -311,6 +336,42 @@ func runConfigured(parent context.Context, args []string, stdin io.Reader, stdou
 		return fail(false)
 	}
 	switch command {
+	case "credential status-v2":
+		if *operationID == "" {
+			return fail(false)
+		}
+		v, err := owner.IssuanceStatusV2(ctx, *operationID)
+		if err != nil || writeJSON(stdout, v) != nil {
+			return fail(false)
+		}
+		return 0
+	case "credential issue-v2":
+		body, err := readBounded(stdin, 64<<10)
+		if err != nil {
+			return fail(false)
+		}
+		request, err := catalog.DecodeAdminRequestV2(bytes.TrimSpace(body))
+		if err != nil || request.LibraryID != library || request.Kind != "issue_credential" || *secretOut == "" {
+			return fail(false)
+		}
+		knownOperationID = request.ID
+		return runCollectionIssuance(ctx, owner, request, *secretOut, stdout, stderr, owners, files, &knownSelector, &outputCloseFailed, fail)
+	case "collection policy apply":
+		body, err := readBounded(stdin, catalog.MaxRequestBytes)
+		if err != nil {
+			return fail(false)
+		}
+		request, err := catalog.DecodeCollectionOwnerRequest(bytes.TrimSpace(body))
+		if err != nil || request.LibraryID != library || request.Kind != "apply_collection_policy" {
+			return fail(false)
+		}
+		knownOperationID = request.ID
+		collectionMutationAttempted = true
+		receipt, err := owner.ApplyCollectionPolicy(ctx, request)
+		if err != nil || writeJSON(stdout, receipt) != nil {
+			return fail(true)
+		}
+		return 0
 	case "owner preference prune":
 		if err := owner.PrunePreferences(ctx); err != nil {
 			return fail(strings.Contains(err.Error(), "uncertain"))

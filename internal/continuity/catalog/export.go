@@ -110,6 +110,9 @@ func (s *Store) Export(ctx context.Context, library continuity.LibraryID, writer
 	if err != nil {
 		return err
 	}
+	if supportsCollections(version) {
+		return ErrUpgradeRequired
+	} // Format3 must preserve collections before export is enabled.
 	format := 1
 	var policy int64
 	if portableSchemaVersion(version) == authoritySchemaVersion {

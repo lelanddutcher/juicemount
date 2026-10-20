@@ -21,7 +21,7 @@ func (d *DiscoveryService) enterPreferences(parent context.Context) (context.Con
 		leave()
 		return nil, nil, err
 	}
-	if d.store.version != 4 {
+	if !supportsPreferences(d.store.version) {
 		d.store.leave()
 		leave()
 		return nil, nil, ErrUpgradeRequired
@@ -78,6 +78,9 @@ func (d *DiscoveryService) authorizePreference(ctx context.Context, q queryer, b
 }
 
 func (s *Store) finishPreferenceTx(ctx context.Context, tx *sql.Tx, c *credential, expiry int64) error {
+	if err := s.checkVersion(ctx, tx); err != nil {
+		return err
+	}
 	control, err := readPreferenceControl(ctx, tx, s.library)
 	if err != nil {
 		return err
@@ -183,7 +186,7 @@ func (o *LocalOwnerService) PrunePreferences(ctx context.Context) (resultErr err
 	}
 	defer o.store.leave()
 	s := o.store
-	if s.version != 4 {
+	if !supportsPreferences(s.version) {
 		return ErrUpgradeRequired
 	}
 	tx, err := s.db.BeginTx(ctx, nil)

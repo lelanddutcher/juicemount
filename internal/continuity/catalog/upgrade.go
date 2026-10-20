@@ -54,6 +54,10 @@ func UpgradePreferences(ctx context.Context, input string, library continuity.Li
 	return upgradeCatalogVersion(ctx, input, library, preferencesSchemaVersion, syncParent)
 }
 
+func UpgradeCollections(ctx context.Context, path string, library continuity.LibraryID) error {
+	return upgradeCatalogVersion(ctx, path, library, collectionsSchemaVersion, syncParent)
+}
+
 func upgradeCatalogVersion(ctx context.Context, input string, expectedLibrary continuity.LibraryID, target int, directoryBarrier func(string) error) (resultErr error) {
 	if expectedLibrary.Validate() != nil {
 		return invalid("expected library identity")
@@ -96,6 +100,9 @@ func upgradeCatalogVersion(ctx context.Context, input string, expectedLibrary co
 	if library != expectedLibrary {
 		return invalid("upgrade library mismatch")
 	}
+	if target == collectionsSchemaVersion && initialVersion != 4 && initialVersion != 5 {
+		return ErrUpgradeRequired
+	}
 	if target == preferencesSchemaVersion && initialVersion != 3 && initialVersion != 4 {
 		return ErrUpgradeRequired
 	}
@@ -129,6 +136,9 @@ func upgradeCatalogVersion(ctx context.Context, input string, expectedLibrary co
 	}
 	if library != expectedLibrary {
 		return invalid("upgrade library mismatch")
+	}
+	if target == collectionsSchemaVersion && version != 4 && version != 5 {
+		return ErrUpgradeRequired
 	}
 	if target == preferencesSchemaVersion && version != 3 && version != 4 {
 		return ErrUpgradeRequired
@@ -200,6 +210,27 @@ func upgradeCatalogVersion(ctx context.Context, input string, expectedLibrary co
 		}
 		if actual != library || current != 4 {
 			return corrupt("preference migration identity")
+		}
+		if err := checkIntegrity(ctx, tx); err != nil {
+			return err
+		}
+	}
+	if target == collectionsSchemaVersion && version == 4 {
+		if err := initializeCollections(ctx, tx, string(library), true); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `PRAGMA user_version=5`); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations(version,fingerprint) VALUES(5,?)`, schemaFingerprint(expectedSchemaFor(5))); err != nil {
+			return err
+		}
+		actual, current, err := recognizeSchema(ctx, tx, false)
+		if err != nil {
+			return err
+		}
+		if actual != library || current != 5 {
+			return corrupt("collection migration identity")
 		}
 		if err := checkIntegrity(ctx, tx); err != nil {
 			return err

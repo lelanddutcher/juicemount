@@ -18,6 +18,7 @@ type AuthHandle struct {
 	generation            int64
 }
 type credential struct {
+	codec                       int
 	selector, incarnation       string
 	subject                     SubjectID
 	scope                       Scope
@@ -43,13 +44,20 @@ func (s *Store) readSnapshot(ctx context.Context) (*sql.Tx, func() error, error)
 		}
 		return errors.Join(err, db.Close())
 	}
+	if err := s.checkVersion(ctx, tx); err != nil {
+		return nil, nil, errors.Join(err, done())
+	}
 	if err := checkSettings(ctx, tx); err != nil {
 		return nil, nil, errors.Join(err, done())
 	}
 	return tx, done, nil
 }
 
+// Legacy test seam; production always supplies the recognized schema version.
 func readCredential(ctx context.Context, q queryer, library continuity.LibraryID, selector string) (credential, error) {
+	return readCredentialVersion(ctx, q, library, selector, 3)
+}
+func readCredentialVersion(ctx context.Context, q queryer, library continuity.LibraryID, selector string, version int) (credential, error) {
 	var c credential
 	var lib continuity.LibraryID
 	var actions []byte
@@ -60,14 +68,27 @@ func readCredential(ctx context.Context, q queryer, library continuity.LibraryID
 	if err != nil {
 		return c, corrupt("credential fields")
 	}
-	if lib != library || c.selector != selector || !validRandomID(c.selector, "cred_") || !validRandomID(c.incarnation, "auth_") || c.subject.Validate() != nil || !c.scope.valid() || decodeCanonicalValue(actions, &c.actions) != nil || !validActions(c.actions) || len(c.verifier) != 32 || c.expires <= c.issued || c.generation <= 0 {
+	c.codec = 1
+	if supportsCollections(version) {
+		if err := q.QueryRowContext(ctx, `SELECT codec FROM credential_codecs WHERE selector=?`, selector).Scan(&c.codec); err != nil {
+			return credential{}, corrupt("credential codec")
+		}
+	}
+	if decodeCanonicalValue(actions, &c.actions) != nil {
+		return credential{}, corrupt("credential actions")
+	}
+	validCeiling := c.codec == 1 && validActions(c.actions) || c.codec == 2 && c.scope.Kind == "library" && c.scope.AssetID == "" && validCredentialActionsV2(c.actions)
+	if lib != library || c.selector != selector || !validRandomID(c.selector, "cred_") || !validRandomID(c.incarnation, "auth_") || c.subject.Validate() != nil || !c.scope.valid() || !validCeiling || len(c.verifier) != 32 || c.expires <= c.issued || c.generation <= 0 {
 		return credential{}, corrupt("credential fields")
 	}
 	return c, nil
 }
 
 func credentialStatus(ctx context.Context, q queryer, library continuity.LibraryID, selector string, now int64) (string, error) {
-	c, err := readCredential(ctx, q, library, selector)
+	return credentialStatusVersion(ctx, q, library, selector, now, 3)
+}
+func credentialStatusVersion(ctx context.Context, q queryer, library continuity.LibraryID, selector string, now int64, version int) (string, error) {
+	c, err := readCredentialVersion(ctx, q, library, selector, version)
 	if err != nil {
 		return "", err
 	}
@@ -123,6 +144,9 @@ func (s *Store) Authenticate(ctx context.Context, library continuity.LibraryID, 
 // authenticateSnapshot shares the complete verifier/current-authority check
 // with discovery without opening a second, inconsistent metadata snapshot.
 func (s *Store) authenticateSnapshot(ctx context.Context, q queryer, library continuity.LibraryID, bearer []byte) (*AuthHandle, credential, Subject, error) {
+	if err := s.checkVersion(ctx, q); err != nil {
+		return nil, credential{}, Subject{}, err
+	}
 	if len(bearer) != 102 || string(bearer[:5]) != "jmc1_" || bearer[37] != '.' || strings.ToLower(string(bearer)) != string(bearer) {
 		return nil, credential{}, Subject{}, ErrUnauthenticated
 	}
@@ -134,7 +158,7 @@ func (s *Store) authenticateSnapshot(ctx context.Context, q queryer, library con
 	if err != nil || len(secret) != 32 {
 		return nil, credential{}, Subject{}, ErrUnauthenticated
 	}
-	c, err := readCredential(ctx, q, library, selector)
+	c, err := readCredentialVersion(ctx, q, library, selector, s.version)
 	if err != nil {
 		return nil, credential{}, Subject{}, ErrUnauthenticated
 	}
@@ -142,7 +166,7 @@ func (s *Store) authenticateSnapshot(ctx context.Context, q queryer, library con
 	if subtle.ConstantTimeCompare(verifier[:], c.verifier) != 1 {
 		return nil, credential{}, Subject{}, ErrUnauthenticated
 	}
-	status, err := credentialStatus(ctx, q, library, selector, s.now().Unix())
+	status, err := credentialStatusVersion(ctx, q, library, selector, s.now().Unix(), s.version)
 	if err != nil {
 		return nil, credential{}, Subject{}, err
 	}
@@ -157,17 +181,20 @@ func (s *Store) authenticateSnapshot(ctx context.Context, q queryer, library con
 }
 
 func (s *Store) currentHandle(ctx context.Context, q queryer, handle *AuthHandle) (credential, Subject, error) {
+	if err := s.checkVersion(ctx, q); err != nil {
+		return credential{}, Subject{}, err
+	}
 	if handle == nil || handle.store != s || !validRandomID(handle.selector, "cred_") || handle.generation <= 0 {
 		return credential{}, Subject{}, ErrUnauthenticated
 	}
-	c, err := readCredential(ctx, q, s.library, handle.selector)
+	c, err := readCredentialVersion(ctx, q, s.library, handle.selector, s.version)
 	if err != nil {
 		return credential{}, Subject{}, ErrUnauthenticated
 	}
 	if c.incarnation != handle.incarnation || c.subject != handle.subject || c.generation != handle.generation {
 		return credential{}, Subject{}, ErrUnauthenticated
 	}
-	status, err := credentialStatus(ctx, q, s.library, handle.selector, s.now().Unix())
+	status, err := credentialStatusVersion(ctx, q, s.library, handle.selector, s.now().Unix(), s.version)
 	if err != nil {
 		return credential{}, Subject{}, err
 	}

@@ -69,6 +69,13 @@ func CreatePreferences(ctx context.Context, path string, library continuity.Libr
 	return openStoreVersionContext(ctx, path, library, true, true, preferencesSchemaVersion)
 }
 
+func CreateCollections(ctx context.Context, path string, library continuity.LibraryID) (*Store, error) {
+	if library.Validate() != nil {
+		return nil, invalid("library identity")
+	}
+	return openStoreVersionContext(ctx, path, library, true, true, collectionsSchemaVersion)
+}
+
 func canonicalPath(path string) (string, error) {
 	if path == "" || path == ":memory:" || strings.HasPrefix(path, "file:") || strings.ContainsRune(path, 0) {
 		return "", invalid("a filesystem catalog path is required")

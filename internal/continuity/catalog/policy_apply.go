@@ -152,6 +152,9 @@ func insertPolicyEvent(ctx context.Context, tx *sql.Tx, e eventRow) error {
 }
 
 func (s *Store) applyPolicy(ctx context.Context, tx *sql.Tx, op PolicyOperation) (Receipt, error) {
+	if err := s.checkVersion(ctx, tx); err != nil {
+		return Receipt{}, err
+	}
 	data, digest, err := CanonicalPolicyRequest(op)
 	if err != nil {
 		return Receipt{}, err
@@ -174,6 +177,9 @@ func (s *Store) applyPolicy(ctx context.Context, tx *sql.Tx, op PolicyOperation)
 	receipt := Receipt{1, s.library, op.ID, sequence, digest, time.Now().UnixNano()}
 	receiptBytes, _ := json.Marshal(receipt)
 	err = insertPolicyEvent(ctx, tx, eventRow{sequence, s.library, op.ID, data, digest, receipt.RecordedUnixNano, receiptBytes})
+	if err == nil && supportsCollections(s.version) {
+		err = appendCollectionOrder(ctx, tx, "legacy_sequence", sequence)
+	}
 	return receipt, err
 }
 

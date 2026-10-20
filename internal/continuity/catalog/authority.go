@@ -125,6 +125,9 @@ func adminRetry(ctx context.Context, q queryer, library continuity.LibraryID, op
 	if err != nil {
 		return AdminReceipt{}, false, err
 	}
+	if err := requireAdminCodec(ctx, q, op.ID, "admin1"); err != nil {
+		return AdminReceipt{}, false, err
+	}
 	if !bytes.Equal(request, data) {
 		return AdminReceipt{}, false, ErrChangedRequest
 	}
@@ -170,7 +173,7 @@ func (o *LocalOwnerService) LookupIssuance(ctx context.Context, op AdminRequest)
 	if err != nil || !found {
 		return IssuanceResult{}, found, err
 	}
-	status, err := credentialStatus(ctx, tx, o.library, r.Result.Selector, o.store.now().Unix())
+	status, err := credentialStatusVersion(ctx, tx, o.library, r.Result.Selector, o.store.now().Unix(), o.store.version)
 	return IssuanceResult{Receipt: r, Status: status}, true, err
 }
 
@@ -187,7 +190,7 @@ func (o *LocalOwnerService) CredentialStatus(ctx context.Context, selector strin
 		return "", err
 	}
 	defer func() { resultErr = errors.Join(resultErr, done()) }()
-	return credentialStatus(ctx, tx, o.library, selector, o.store.now().Unix())
+	return credentialStatusVersion(ctx, tx, o.library, selector, o.store.now().Unix(), o.store.version)
 }
 
 func (o *LocalOwnerService) IssuanceStatus(ctx context.Context, id string) (result IssuanceResult, resultErr error) {
@@ -211,6 +214,9 @@ func (o *LocalOwnerService) IssuanceStatus(ctx context.Context, id string) (resu
 	if err != nil {
 		return result, err
 	}
+	if err := requireAdminCodec(ctx, tx, id, "admin1"); err != nil {
+		return result, err
+	}
 	op, err := DecodeAdminRequest(data)
 	if err != nil || op.Kind != "issue_credential" {
 		return result, ErrNotFound
@@ -222,7 +228,7 @@ func (o *LocalOwnerService) IssuanceStatus(ctx context.Context, id string) (resu
 	if !found {
 		return result, ErrNotFound
 	}
-	status, err := credentialStatus(ctx, tx, o.library, receipt.Result.Selector, o.store.now().Unix())
+	status, err := credentialStatusVersion(ctx, tx, o.library, receipt.Result.Selector, o.store.now().Unix(), o.store.version)
 	return IssuanceResult{Receipt: receipt, Status: status}, err
 }
 
@@ -249,6 +255,9 @@ func (o *LocalOwnerService) mutate(ctx context.Context, input AdminRequest) (Iss
 		return IssuanceResult{}, err
 	}
 	defer tx.Rollback()
+	if err := s.checkVersion(ctx, tx); err != nil {
+		return IssuanceResult{}, err
+	}
 	if err := s.checkPaths(); err != nil {
 		return IssuanceResult{}, err
 	}
@@ -259,7 +268,7 @@ func (o *LocalOwnerService) mutate(ctx context.Context, input AdminRequest) (Iss
 	if found {
 		result := IssuanceResult{Receipt: prior}
 		if prior.Result.Selector != "" {
-			result.Status, err = credentialStatus(ctx, tx, o.library, prior.Result.Selector, s.now().Unix())
+			result.Status, err = credentialStatusVersion(ctx, tx, o.library, prior.Result.Selector, s.now().Unix(), s.version)
 		}
 		return result, err
 	}
@@ -376,6 +385,11 @@ func (o *LocalOwnerService) mutate(ctx context.Context, input AdminRequest) (Iss
 		if _, err := tx.ExecContext(ctx, `INSERT INTO catalog_credentials(selector,library_id,incarnation,subject_id,scope_kind,asset_id,actions,verifier,issued_unix,expires_unix,generation,revoked) VALUES(?,?,?,?,?,?,?,?,?,?,1,0)`, selector, s.library, a.Incarnation, v.SubjectID, v.Scope.Kind, nullableAsset(v.Scope), actionsBytes(v.Actions), verifier[:], now, v.ExpiresUnix); err != nil {
 			return result, errors.New("catalog credential insertion failed")
 		}
+		if supportsCollections(s.version) {
+			if _, err := tx.ExecContext(ctx, `INSERT INTO credential_codecs(selector,codec) VALUES(?,1)`, selector); err != nil {
+				return result, err
+			}
+		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO credential_issuance_receipts(operation_id,selector) VALUES(?,?)`, op.ID, selector); err != nil {
 			return result, err
 		}
@@ -383,7 +397,7 @@ func (o *LocalOwnerService) mutate(ctx context.Context, input AdminRequest) (Iss
 		r.Incarnation, r.SubjectID, r.Selector = a.Incarnation, v.SubjectID, selector
 		result.Status = "active"
 	case *RevokeCredentialRequest:
-		c, err := readCredential(ctx, tx, s.library, v.Selector)
+		c, err := readCredentialVersion(ctx, tx, s.library, v.Selector, s.version)
 		if err != nil {
 			return result, err
 		}
@@ -404,6 +418,11 @@ func (o *LocalOwnerService) mutate(ctx context.Context, input AdminRequest) (Iss
 	b, _ := json.Marshal(receipt)
 	if _, err := tx.ExecContext(ctx, `INSERT INTO catalog_admin_events(sequence,library_id,operation_id,request,payload_sha256,recorded_unix_nano,receipt) VALUES(?,?,?,?,?,?,?)`, sequence, s.library, op.ID, data, digest, receipt.RecordedUnixNano, b); err != nil {
 		return IssuanceResult{}, err
+	}
+	if supportsCollections(s.version) {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO catalog_admin_codecs(operation_id,codec) VALUES(?,'admin1')`, op.ID); err != nil {
+			return IssuanceResult{}, err
+		}
 	}
 	if err := ctx.Err(); err != nil {
 		return IssuanceResult{}, err

@@ -1,0 +1,1051 @@
+{
+  "fixture_version": 1,
+  "synthetic_test_vector": true,
+  "source_commit": "4298319fae182d407e076737c4312a6795f7c617",
+  "source_hashes": {
+    "internal/continuity/catalog/preferences_schema.go": "eeb2531d2d350e572dd31666e72e0fe71beb95451ee951afa284080b815bc0b6",
+    "internal/continuity/catalog/preferences_types.go": "627b81f1986e5da141e0c81515255d9fa5c05f7a7ecbca5c976690d2aa66110a",
+    "internal/continuity/catalog/preferences_apply.go": "2d7be54beea4005b0c9d1376249a5a89ebc75035ea6c4a427d6f81350e9b8492",
+    "internal/continuity/catalog/preferences_migration_test.go": "bae649e0a2412171ce256a5968e13b5e8fda88ab7a39368c95d159ddae9824cb",
+    "internal/continuity/catalog/preferences_test.go": "1f2e33738921365bd566b8513ca3113b5640e66775526447d143d8b0c4612ca9",
+    "internal/continuity/catalog/schema.go": "79623819d6fd3968257b6205744cd0f2d461169f898ff6d54c044d44e2705f16",
+    "internal/continuity/catalog/encoding.go": "deb85584f3081e58900af281475529b83b72e6e27118b228a61d514fdffc3d8a",
+    "internal/continuity/catalog/upgrade.go": "bffdd4dbfa55eb7165a8b3ac562def47e7d617c82f4da640cca8fa7fd54aef13"
+  },
+  "schema_version": 4,
+  "application_id": 1246577473,
+  "library_id": "lib_000102030405060708090a0b0c0d0e0f",
+  "schema_fingerprints": {
+    "1": "752faa61a0812eef6fb7cd2a3d71a2aac3cee19f660b2d129e78cfc1a1b86f26",
+    "2": "1d67308e722a028662374a942e4b19bebe836df7d5f903a27a4ac3412e944a6d",
+    "3": "7b4a3ba35d87d80b9fd16f9c161f72a148ffcd55effd8b9199ba152d75213582",
+    "4": "ec4f4c3de045dd7adbd37da0a0381d0aa17b294550b6f2135c88b60a6453b65d"
+  },
+  "schema_objects": [
+    {
+      "Type": "table",
+      "Name": "assets",
+      "Table": "assets",
+      "SQL": "CREATE TABLE assets (\n asset_id TEXT PRIMARY KEY NOT NULL CHECK(length(asset_id)=38 AND substr(asset_id,1,6)='asset_' AND substr(asset_id,7) NOT GLOB '*[^0-9a-f]*' AND substr(asset_id,7)<>'00000000000000000000000000000000'),\n library_id TEXT NOT NULL REFERENCES catalog(library_id),\n label TEXT NOT NULL CHECK(length(CAST(label AS BLOB))<=4096 AND instr(label,char(0))=0),\n head TEXT,\n created_sequence INTEGER NOT NULL REFERENCES events(sequence) DEFERRABLE INITIALLY DEFERRED,\n updated_sequence INTEGER NOT NULL REFERENCES events(sequence) DEFERRABLE INITIALLY DEFERRED,\n CHECK(created_sequence>0 AND updated_sequence>=created_sequence),\n FOREIGN KEY(asset_id,head) REFERENCES revisions(asset_id,revision_id) DEFERRABLE INITIALLY DEFERRED\n)"
+    },
+    {
+      "Type": "table",
+      "Name": "catalog",
+      "Table": "catalog",
+      "SQL": "CREATE TABLE catalog (\n singleton INTEGER PRIMARY KEY CHECK(singleton=1),\n library_id TEXT NOT NULL UNIQUE CHECK(length(library_id)=36 AND substr(library_id,1,4)='lib_' AND substr(library_id,5) NOT GLOB '*[^0-9a-f]*' AND substr(library_id,5)<>'00000000000000000000000000000000'),\n ready INTEGER NOT NULL CHECK(ready IN (0,1))\n)"
+    },
+    {
+      "Type": "table",
+      "Name": "catalog_admin_events",
+      "Table": "catalog_admin_events",
+      "SQL": "CREATE TABLE catalog_admin_events (\n sequence INTEGER PRIMARY KEY CHECK(sequence>0),\n library_id TEXT NOT NULL REFERENCES catalog(library_id),\n operation_id TEXT NOT NULL UNIQUE CHECK(length(operation_id) BETWEEN 1 AND 128 AND operation_id NOT GLOB '*[^a-zA-Z0-9_-]*'),\n request BLOB NOT NULL CHECK(typeof(request)='blob' AND length(request) BETWEEN 1 AND 1048576),\n payload_sha256 TEXT NOT NULL CHECK(length(payload_sha256)=64 AND payload_sha256 NOT GLOB '*[^0-9a-f]*'),\n recorded_unix_nano INTEGER NOT NULL,\n receipt BLOB NOT NULL CHECK(typeof(receipt)='blob' AND length(receipt) BETWEEN 1 AND 2048)\n)"
+    },
+    {
+      "Type": "trigger",
+      "Name": "catalog_admin_events_no_delete",
+      "Table": "catalog_admin_events",
+      "SQL": "CREATE TRIGGER catalog_admin_events_no_delete BEFORE DELETE ON catalog_admin_events BEGIN SELECT RAISE(ABORT,'immutable authority row'); END"
+    },
+    {
+      "Type": "trigger",
+      "Name": "catalog_admin_events_no_update",
+      "Table": "catalog_admin_events",
+      "SQL": "CREATE TRIGGER catalog_admin_events_no_update BEFORE UPDATE ON catalog_admin_events BEGIN SELECT RAISE(ABORT,'immutable authority row'); END"
+    },
+    {
+      "Type": "table",
+      "Name": "catalog_authority",
+      "Table": "catalog_authority",
+      "SQL": "CREATE TABLE catalog_authority (\n singleton INTEGER PRIMARY KEY CHECK(singleton=1),\n library_id TEXT NOT NULL REFERENCES catalog(library_id),\n incarnation TEXT NOT NULL CHECK(length(incarnation)=37 AND substr(incarnation,1,5)='auth_' AND substr(incarnation,6) NOT GLOB '*[^0-9a-f]*' AND substr(incarnation,6)<>'00000000000000000000000000000000'),\n owner_subject_id TEXT NOT NULL REFERENCES policy_subjects(subject_id)\n)"
+    },
+    {
+      "Type": "trigger",
+      "Name": "catalog_authority_identity",
+      "Table": "catalog_authority",
+      "SQL": "CREATE TRIGGER catalog_authority_identity BEFORE UPDATE ON catalog_authority WHEN NEW.singleton<>OLD.singleton OR NEW.library_id<>OLD.library_id OR NEW.owner_subject_id<>OLD.owner_subject_id BEGIN SELECT RAISE(ABORT,'immutable authority identity'); END"
+    },
+    {
+      "Type": "trigger",
+      "Name": "catalog_authority_no_delete",
+      "Table": "catalog_authority",
+      "SQL": "CREATE TRIGGER catalog_authority_no_delete BEFORE DELETE ON catalog_authority BEGIN SELECT RAISE(ABORT,'authority lifetime identity'); END"
+    },
+    {
+      "Type": "table",
+      "Name": "catalog_credentials",
+      "Table": "catalog_credentials",
+      "SQL": "CREATE TABLE catalog_credentials (\n selector TEXT PRIMARY KEY NOT NULL CHECK(length(selector)=37 AND substr(selector,1,5)='cred_' AND substr(selector,6) NOT GLOB '*[^0-9a-f]*' AND substr(selector,6)<>'00000000000000000000000000000000'),\n library_id TEXT NOT NULL REFERENCES catalog(library_id),\n incarnation TEXT NOT NULL,\n subject_id TEXT NOT NULL REFERENCES policy_subjects(subject_id),\n scope_kind TEXT NOT NULL CHECK(scope_kind IN ('library','asset')),\n asset_id TEXT REFERENCES assets(asset_id),\n actions BLOB NOT NULL CHECK(typeof(actions)='blob' AND length(actions) BETWEEN 1 AND 256),\n verifier BLOB NOT NULL CHECK(typeof(verifier)='blob' AND length(verifier)=32),\n issued_unix INTEGER NOT NULL,\n expires_unix INTEGER NOT NULL CHECK(expires_unix>issued_unix),\n generation INTEGER NOT NULL CHECK(generation>0),\n revoked INTEGER NOT NULL CHECK(revoked IN (0,1)),\n CHECK((scope_kind='library' AND asset_id IS NULL) OR (scope_kind='asset' AND asset_id IS NOT NULL))\n)"
+    },
+    {
+      "Type": "trigger",
+      "Name": "catalog_credentials_identity",
+      "Table": "catalog_credentials",
+      "SQL": "CREATE TRIGGER catalog_credentials_identity BEFORE UPDATE ON catalog_credentials WHEN NEW.selector<>OLD.selector OR NEW.library_id<>OLD.library_id OR NEW.incarnation<>OLD.incarnation OR NEW.subject_id<>OLD.subject_id OR NEW.scope_kind<>OLD.scope_kind OR NEW.asset_id IS NOT OLD.asset_id OR NEW.actions<>OLD.actions OR NEW.verifier<>OLD.verifier OR NEW.issued_unix<>OLD.issued_unix OR NEW.expires_unix<>OLD.expires_unix OR OLD.revoked<>0 OR NEW.revoked<>1 OR NEW.generation<>OLD.generation+1 BEGIN SELECT RAISE(ABORT,'immutable authority identity'); END"
+    },
+    {
+      "Type": "trigger",
+      "Name": "catalog_credentials_no_delete",
+      "Table": "catalog_credentials",
+      "SQL": "CREATE TRIGGER catalog_credentials_no_delete BEFORE DELETE ON catalog_credentials BEGIN SELECT RAISE(ABORT,'authority lifetime identity'); END"
+    },
+    {
+      "Type": "trigger",
+      "Name": "catalog_no_delete",
+      "Table": "catalog",
+      "SQL": "CREATE TRIGGER catalog_no_delete BEFORE DELETE ON catalog BEGIN SELECT RAISE(ABORT,'immutable catalog row'); END"
+    },
+    {
+      "Type": "trigger",
+      "Name": "catalog_no_update",
+      "Table": "catalog",
+      "SQL": "CREATE TRIGGER catalog_no_update BEFORE UPDATE ON catalog WHEN OLD.ready<>0 OR NEW.ready<>1 OR NEW.singleton<>OLD.singleton OR NEW.library_id<>OLD.library_id BEGIN SELECT RAISE(ABORT,'immutable catalog row'); END"
+    },
+    {
+      "Type": "table",
+      "Name": "credential_issuance_receipts",
+      "Table": "credential_issuance_receipts",
+      "SQL": "CREATE TABLE credential_issuance_receipts (\n operation_id TEXT PRIMARY KEY NOT NULL REFERENCES catalog_admin_events(operation_id) DEFERRABLE INITIALLY DEFERRED,\n selector TEXT NOT NULL UNIQUE REFERENCES catalog_credentials(selector)\n)"
+    },
+    {
+      "Type": "trigger",
+      "Name": "credential_issuance_receipts_no_delete",
+      "Table": "credential_issuance_receipts",
+      "SQL": "CREATE TRIGGER credential_issuance_receipts_no_delete BEFORE DELETE ON credential_issuance_receipts BEGIN SELECT RAISE(ABORT,'immutable authority row'); END"
+    },
+    {
+      "Type": "trigger",
+      "Name": "credential_issuance_receipts_no_update",
+      "Table": "credential_issuance_receipts",
+      "SQL": "CREATE TRIGGER credential_issuance_receipts_no_update BEFORE UPDATE ON credential_issuance_receipts BEGIN SELECT RAISE(ABORT,'immutable authority row'); END"
+    },
+    {
+      "Type": "table",
+      "Name": "events",
+      "Table": "events",
+      "SQL": "CREATE TABLE events (\n sequence INTEGER PRIMARY KEY CHECK(sequence>0),\n library_id TEXT NOT NULL REFERENCES catalog(library_id),\n operation_id TEXT NOT NULL UNIQUE CHECK(length(operation_id) BETWEEN 1 AND 128 AND operation_id NOT GLOB '*[^a-zA-Z0-9_-]*'),\n request BLOB NOT NULL CHECK(typeof(request)='blob' AND length(request) BETWEEN 1 AND 1048576),\n payload_sha256 TEXT NOT NULL CHECK(length(payload_sha256)=64 AND payload_sha256 NOT GLOB '*[^0-9a-f]*'),\n recorded_unix_nano INTEGER NOT NULL,\n receipt BLOB NOT NULL CHECK(typeof(receipt)='blob' AND length(receipt) BETWEEN 1 AND 1024)\n)"
+    },
+    {
+      "Type": "trigger",
+      "Name": "events_no_delete",
+      "Table": "events",
+      "SQL": "CREATE TRIGGER events_no_delete BEFORE DELETE ON events BEGIN SELECT RAISE(ABORT,'immutable catalog row'); END"
+    },
+    {
+      "Type": "trigger",
+      "Name": "events_no_update",
+      "Table": "events",
+      "SQL": "CREATE TRIGGER events_no_update BEFORE UPDATE ON events BEGIN SELECT RAISE(ABORT,'immutable catalog row'); END"
+    },
+    {
+      "Type": "table",
+      "Name": "locations",
+      "Table": "locations",
+      "SQL": "CREATE TABLE locations (\n location_id TEXT PRIMARY KEY NOT NULL CHECK(length(location_id) BETWEEN 1 AND 128 AND location_id NOT GLOB '*[^a-zA-Z0-9_-]*'),\n library_id TEXT NOT NULL REFERENCES catalog(library_id),\n asset_id TEXT NOT NULL REFERENCES assets(asset_id),\n revision TEXT,\n source TEXT NOT NULL CHECK(length(CAST(source AS BLOB)) BETWEEN 1 AND 256 AND instr(source,char(0))=0),\n locator TEXT NOT NULL CHECK(length(CAST(locator AS BLOB)) BETWEEN 1 AND 8192 AND instr(locator,char(0))=0),\n created_sequence INTEGER NOT NULL REFERENCES events(sequence) DEFERRABLE INITIALLY DEFERRED,\n updated_sequence INTEGER NOT NULL REFERENCES events(sequence) DEFERRABLE INITIALLY DEFERRED,\n removed INTEGER NOT NULL CHECK(removed IN (0,1)),\n CHECK(created_sequence>0 AND updated_sequence>=created_sequence),\n FOREIGN KEY(asset_id,revision) REFERENCES revisions(asset_id,revision_id)\n)"
+    },
+    {
+      "Type": "index",
+      "Name": "locations_asset_active",
+      "Table": "locations",
+      "SQL": "CREATE INDEX locations_asset_active ON locations(asset_id,removed,location_id)"
+    },
+    {
+      "Type": "trigger",
+      "Name": "locations_identity",
+      "Table": "locations",
+      "SQL": "CREATE TRIGGER locations_identity BEFORE UPDATE ON locations WHEN NEW.location_id<>OLD.location_id OR NEW.library_id<>OLD.library_id OR NEW.asset_id<>OLD.asset_id OR NEW.created_sequence<>OLD.created_sequence OR NEW.updated_sequence<OLD.updated_sequence BEGIN SELECT RAISE(ABORT,'immutable location identity'); END"
+    },
+    {
+      "Type": "trigger",
+      "Name": "locations_no_delete",
+      "Table": "locations",
+      "SQL": "CREATE TRIGGER locations_no_delete BEFORE DELETE ON locations BEGIN SELECT RAISE(ABORT,'catalog tombstone required'); END"
+    },
+    {
+      "Type": "table",
+      "Name": "policy_events",
+      "Table": "policy_events",
+      "SQL": "CREATE TABLE policy_events (\n sequence INTEGER PRIMARY KEY CHECK(sequence>0),\n library_id TEXT NOT NULL REFERENCES catalog(library_id),\n operation_id TEXT NOT NULL UNIQUE CHECK(length(operation_id) BETWEEN 1 AND 128 AND operation_id NOT GLOB '*[^a-zA-Z0-9_-]*'),\n request BLOB NOT NULL CHECK(typeof(request)='blob' AND length(request) BETWEEN 1 AND 1048576),\n payload_sha256 TEXT NOT NULL CHECK(length(payload_sha256)=64 AND payload_sha256 NOT GLOB '*[^0-9a-f]*'),\n recorded_unix_nano INTEGER NOT NULL,\n receipt BLOB NOT NULL CHECK(typeof(receipt)='blob' AND length(receipt) BETWEEN 1 AND 1024)\n)"
+    },
+    {
+      "Type": "trigger",
+      "Name": "policy_events_no_delete",
+      "Table": "policy_events",
+      "SQL": "CREATE TRIGGER policy_events_no_delete BEFORE DELETE ON policy_events BEGIN SELECT RAISE(ABORT,'immutable authority row'); END"
+    },
+    {
+      "Type": "trigger",
+      "Name": "policy_events_no_update",
+      "Table": "policy_events",
+      "SQL": "CREATE TRIGGER policy_events_no_update BEFORE UPDATE ON policy_events BEGIN SELECT RAISE(ABORT,'immutable authority row'); END"
+    },
+    {
+      "Type": "table",
+      "Name": "policy_grants",
+      "Table": "policy_grants",
+      "SQL": "CREATE TABLE policy_grants (\n grant_id TEXT PRIMARY KEY NOT NULL CHECK(length(grant_id) BETWEEN 1 AND 128 AND grant_id NOT GLOB '*[^a-zA-Z0-9_-]*'),\n library_id TEXT NOT NULL REFERENCES catalog(library_id),\n subject_id TEXT NOT NULL REFERENCES policy_subjects(subject_id),\n scope_kind TEXT NOT NULL CHECK(scope_kind IN ('library','asset')),\n asset_id TEXT REFERENCES assets(asset_id),\n actions BLOB NOT NULL CHECK(typeof(actions)='blob' AND length(actions) BETWEEN 1 AND 256),\n created_sequence INTEGER NOT NULL REFERENCES policy_events(sequence) DEFERRABLE INITIALLY DEFERRED,\n updated_sequence INTEGER NOT NULL REFERENCES policy_events(sequence) DEFERRABLE INITIALLY DEFERRED,\n removed INTEGER NOT NULL CHECK(removed IN (0,1)),\n CHECK((scope_kind='library' AND asset_id IS NULL) OR (scope_kind='asset' AND asset_id IS NOT NULL)),\n CHECK(created_sequence>0 AND updated_sequence>=created_sequence)\n)"
+    },
+    {
+      "Type": "index",
+      "Name": "policy_grants_access",
+      "Table": "policy_grants",
+      "SQL": "CREATE INDEX policy_grants_access ON policy_grants(subject_id,removed,scope_kind,asset_id)"
+    },
+    {
+      "Type": "trigger",
+      "Name": "policy_grants_identity",
+      "Table": "policy_grants",
+      "SQL": "CREATE TRIGGER policy_grants_identity BEFORE UPDATE ON policy_grants WHEN NEW.grant_id<>OLD.grant_id OR NEW.library_id<>OLD.library_id OR NEW.subject_id<>OLD.subject_id OR NEW.created_sequence<>OLD.created_sequence BEGIN SELECT RAISE(ABORT,'immutable authority identity'); END"
+    },
+    {
+      "Type": "trigger",
+      "Name": "policy_grants_no_delete",
+      "Table": "policy_grants",
+      "SQL": "CREATE TRIGGER policy_grants_no_delete BEFORE DELETE ON policy_grants BEGIN SELECT RAISE(ABORT,'authority lifetime identity'); END"
+    },
+    {
+      "Type": "table",
+      "Name": "policy_subjects",
+      "Table": "policy_subjects",
+      "SQL": "CREATE TABLE policy_subjects (\n subject_id TEXT PRIMARY KEY NOT NULL CHECK(length(subject_id)=36 AND substr(subject_id,1,4)='sub_' AND substr(subject_id,5) NOT GLOB '*[^0-9a-f]*' AND substr(subject_id,5)<>'00000000000000000000000000000000'),\n library_id TEXT NOT NULL REFERENCES catalog(library_id),\n kind TEXT NOT NULL CHECK(kind IN ('person','service')),\n label TEXT NOT NULL CHECK(length(CAST(label AS BLOB))<=256 AND instr(label,char(0))=0),\n enabled INTEGER NOT NULL CHECK(enabled IN (0,1)),\n authorization_generation INTEGER NOT NULL CHECK(authorization_generation>0),\n created_sequence INTEGER NOT NULL REFERENCES policy_events(sequence) DEFERRABLE INITIALLY DEFERRED,\n updated_sequence INTEGER NOT NULL REFERENCES policy_events(sequence) DEFERRABLE INITIALLY DEFERRED,\n CHECK(created_sequence>0 AND updated_sequence>=created_sequence)\n)"
+    },
+    {
+      "Type": "trigger",
+      "Name": "policy_subjects_identity",
+      "Table": "policy_subjects",
+      "SQL": "CREATE TRIGGER policy_subjects_identity BEFORE UPDATE ON policy_subjects WHEN NEW.subject_id<>OLD.subject_id OR NEW.library_id<>OLD.library_id OR NEW.kind<>OLD.kind OR NEW.created_sequence<>OLD.created_sequence BEGIN SELECT RAISE(ABORT,'immutable authority identity'); END"
+    },
+    {
+      "Type": "trigger",
+      "Name": "policy_subjects_no_delete",
+      "Table": "policy_subjects",
+      "SQL": "CREATE TRIGGER policy_subjects_no_delete BEFORE DELETE ON policy_subjects BEGIN SELECT RAISE(ABORT,'authority lifetime identity'); END"
+    },
+    {
+      "Type": "table",
+      "Name": "preference_control",
+      "Table": "preference_control",
+      "SQL": "CREATE TABLE preference_control (\n singleton INTEGER PRIMARY KEY CHECK(singleton=1),\n library_id TEXT NOT NULL REFERENCES catalog(library_id),\n clock_floor_unix INTEGER NOT NULL CHECK(clock_floor_unix>=0),\n subject_count INTEGER NOT NULL CHECK(subject_count BETWEEN 0 AND 1024),\n entry_count INTEGER NOT NULL CHECK(entry_count BETWEEN 0 AND 65536),\n receipt_count INTEGER NOT NULL CHECK(receipt_count BETWEEN 0 AND 32768)\n)"
+    },
+    {
+      "Type": "trigger",
+      "Name": "preference_control_identity",
+      "Table": "preference_control",
+      "SQL": "CREATE TRIGGER preference_control_identity BEFORE UPDATE ON preference_control WHEN NEW.singleton<>OLD.singleton OR NEW.library_id<>OLD.library_id OR NEW.clock_floor_unix<OLD.clock_floor_unix BEGIN SELECT RAISE(ABORT,'preference control identity'); END"
+    },
+    {
+      "Type": "trigger",
+      "Name": "preference_control_no_delete",
+      "Table": "preference_control",
+      "SQL": "CREATE TRIGGER preference_control_no_delete BEFORE DELETE ON preference_control BEGIN SELECT RAISE(ABORT,'preference control lifetime'); END"
+    },
+    {
+      "Type": "table",
+      "Name": "preference_receipts",
+      "Table": "preference_receipts",
+      "SQL": "CREATE TABLE preference_receipts (\n subject_id TEXT NOT NULL REFERENCES preference_subjects(subject_id),\n operation_id TEXT NOT NULL CHECK(length(operation_id) BETWEEN 1 AND 128 AND operation_id NOT GLOB '*[^a-zA-Z0-9_-]*'),\n request BLOB NOT NULL CHECK(typeof(request)='blob' AND length(request) BETWEEN 1 AND 1024),\n payload_sha256 TEXT NOT NULL CHECK(length(payload_sha256)=64 AND payload_sha256 NOT GLOB '*[^0-9a-f]*'),\n receipt BLOB NOT NULL CHECK(typeof(receipt)='blob' AND length(receipt) BETWEEN 1 AND 512),\n expires_unix INTEGER NOT NULL CHECK(expires_unix>0),\n PRIMARY KEY(subject_id,operation_id)\n)"
+    },
+    {
+      "Type": "trigger",
+      "Name": "preference_receipts_delete",
+      "Table": "preference_receipts",
+      "SQL": "CREATE TRIGGER preference_receipts_delete AFTER DELETE ON preference_receipts BEGIN UPDATE preference_subjects SET receipt_count=receipt_count-1 WHERE subject_id=OLD.subject_id; UPDATE preference_control SET receipt_count=receipt_count-1 WHERE singleton=1; END"
+    },
+    {
+      "Type": "trigger",
+      "Name": "preference_receipts_delete_guard",
+      "Table": "preference_receipts",
+      "SQL": "CREATE TRIGGER preference_receipts_delete_guard BEFORE DELETE ON preference_receipts WHEN OLD.expires_unix>(SELECT clock_floor_unix FROM preference_control WHERE singleton=1) BEGIN SELECT RAISE(ABORT,'unexpired preference receipt'); END"
+    },
+    {
+      "Type": "index",
+      "Name": "preference_receipts_expiry",
+      "Table": "preference_receipts",
+      "SQL": "CREATE INDEX preference_receipts_expiry ON preference_receipts(expires_unix,subject_id,operation_id)"
+    },
+    {
+      "Type": "trigger",
+      "Name": "preference_receipts_insert",
+      "Table": "preference_receipts",
+      "SQL": "CREATE TRIGGER preference_receipts_insert AFTER INSERT ON preference_receipts BEGIN UPDATE preference_subjects SET receipt_count=receipt_count+1 WHERE subject_id=NEW.subject_id; UPDATE preference_control SET receipt_count=receipt_count+1 WHERE singleton=1; END"
+    },
+    {
+      "Type": "trigger",
+      "Name": "preference_receipts_no_update",
+      "Table": "preference_receipts",
+      "SQL": "CREATE TRIGGER preference_receipts_no_update BEFORE UPDATE ON preference_receipts BEGIN SELECT RAISE(ABORT,'immutable preference receipt'); END"
+    },
+    {
+      "Type": "index",
+      "Name": "preference_receipts_subject_expiry",
+      "Table": "preference_receipts",
+      "SQL": "CREATE INDEX preference_receipts_subject_expiry ON preference_receipts(subject_id,expires_unix,operation_id)"
+    },
+    {
+      "Type": "table",
+      "Name": "preference_subjects",
+      "Table": "preference_subjects",
+      "SQL": "CREATE TABLE preference_subjects (\n subject_id TEXT PRIMARY KEY NOT NULL REFERENCES policy_subjects(subject_id),\n library_id TEXT NOT NULL REFERENCES catalog(library_id),\n generation INTEGER NOT NULL CHECK(generation>0),\n entry_count INTEGER NOT NULL CHECK(entry_count BETWEEN 0 AND 256),\n receipt_count INTEGER NOT NULL CHECK(receipt_count BETWEEN 0 AND 128)\n)"
+    },
+    {
+      "Type": "trigger",
+      "Name": "preference_subjects_identity",
+      "Table": "preference_subjects",
+      "SQL": "CREATE TRIGGER preference_subjects_identity BEFORE UPDATE ON preference_subjects WHEN NEW.subject_id<>OLD.subject_id OR NEW.library_id<>OLD.library_id OR NEW.generation<OLD.generation OR (NEW.generation<>OLD.generation AND NEW.generation<>OLD.generation+1) BEGIN SELECT RAISE(ABORT,'preference generation identity'); END"
+    },
+    {
+      "Type": "trigger",
+      "Name": "preference_subjects_insert",
+      "Table": "preference_subjects",
+      "SQL": "CREATE TRIGGER preference_subjects_insert AFTER INSERT ON preference_subjects BEGIN SELECT CASE WHEN NOT EXISTS(SELECT 1 FROM policy_subjects WHERE subject_id=NEW.subject_id AND library_id=NEW.library_id AND kind='person') THEN RAISE(ABORT,'preference person membership') END; UPDATE preference_control SET subject_count=subject_count+1 WHERE singleton=1; END"
+    },
+    {
+      "Type": "trigger",
+      "Name": "preference_subjects_no_delete",
+      "Table": "preference_subjects",
+      "SQL": "CREATE TRIGGER preference_subjects_no_delete BEFORE DELETE ON preference_subjects BEGIN SELECT RAISE(ABORT,'preference generation lifetime'); END"
+    },
+    {
+      "Type": "table",
+      "Name": "preferences",
+      "Table": "preferences",
+      "SQL": "CREATE TABLE preferences (\n subject_id TEXT NOT NULL REFERENCES preference_subjects(subject_id),\n asset_id TEXT NOT NULL REFERENCES assets(asset_id),\n selection_token TEXT NOT NULL UNIQUE CHECK(length(selection_token)=69 AND substr(selection_token,1,5)='sel1_' AND substr(selection_token,6) NOT GLOB '*[^0-9a-f]*'),\n person_order INTEGER NOT NULL CHECK(person_order>0),\n selected_unix INTEGER NOT NULL CHECK(selected_unix>=0 AND selected_unix<=9223372036852183807),\n expires_unix INTEGER NOT NULL CHECK(expires_unix=selected_unix+2592000),\n PRIMARY KEY(subject_id,asset_id),\n UNIQUE(subject_id,person_order)\n)"
+    },
+    {
+      "Type": "trigger",
+      "Name": "preferences_delete",
+      "Table": "preferences",
+      "SQL": "CREATE TRIGGER preferences_delete AFTER DELETE ON preferences BEGIN UPDATE preference_subjects SET entry_count=entry_count-1 WHERE subject_id=OLD.subject_id; UPDATE preference_control SET entry_count=entry_count-1 WHERE singleton=1; END"
+    },
+    {
+      "Type": "index",
+      "Name": "preferences_expiry",
+      "Table": "preferences",
+      "SQL": "CREATE INDEX preferences_expiry ON preferences(expires_unix,subject_id,asset_id)"
+    },
+    {
+      "Type": "trigger",
+      "Name": "preferences_identity",
+      "Table": "preferences",
+      "SQL": "CREATE TRIGGER preferences_identity BEFORE UPDATE ON preferences WHEN NEW.subject_id<>OLD.subject_id OR NEW.asset_id<>OLD.asset_id OR NEW.selection_token=OLD.selection_token OR NEW.person_order<=OLD.person_order BEGIN SELECT RAISE(ABORT,'preference replacement identity'); END"
+    },
+    {
+      "Type": "trigger",
+      "Name": "preferences_insert",
+      "Table": "preferences",
+      "SQL": "CREATE TRIGGER preferences_insert AFTER INSERT ON preferences BEGIN SELECT CASE WHEN NOT EXISTS(SELECT 1 FROM preference_subjects p JOIN assets a ON a.library_id=p.library_id WHERE p.subject_id=NEW.subject_id AND a.asset_id=NEW.asset_id AND p.generation=NEW.person_order) THEN RAISE(ABORT,'preference membership') END; UPDATE preference_subjects SET entry_count=entry_count+1 WHERE subject_id=NEW.subject_id; UPDATE preference_control SET entry_count=entry_count+1 WHERE singleton=1; END"
+    },
+    {
+      "Type": "trigger",
+      "Name": "preferences_order",
+      "Table": "preferences",
+      "SQL": "CREATE TRIGGER preferences_order AFTER UPDATE ON preferences WHEN NEW.person_order<>(SELECT generation FROM preference_subjects WHERE subject_id=NEW.subject_id) BEGIN SELECT RAISE(ABORT,'preference order'); END"
+    },
+    {
+      "Type": "index",
+      "Name": "preferences_recent",
+      "Table": "preferences",
+      "SQL": "CREATE INDEX preferences_recent ON preferences(subject_id,person_order DESC,asset_id)"
+    },
+    {
+      "Type": "table",
+      "Name": "relationships",
+      "Table": "relationships",
+      "SQL": "CREATE TABLE relationships (\n relationship_id TEXT PRIMARY KEY NOT NULL CHECK(length(relationship_id) BETWEEN 1 AND 128 AND relationship_id NOT GLOB '*[^a-zA-Z0-9_-]*'),\n library_id TEXT NOT NULL REFERENCES catalog(library_id),\n source_asset_id TEXT NOT NULL REFERENCES assets(asset_id),\n source_revision TEXT,\n target_asset_id TEXT NOT NULL REFERENCES assets(asset_id),\n target_revision TEXT,\n predicate TEXT NOT NULL CHECK(length(CAST(predicate AS BLOB)) BETWEEN 1 AND 128 AND instr(predicate,char(0))=0),\n provenance TEXT NOT NULL CHECK(provenance IN ('observed','claimed','inferred')),\n source TEXT NOT NULL CHECK(length(CAST(source AS BLOB)) BETWEEN 1 AND 256 AND instr(source,char(0))=0),\n created_sequence INTEGER NOT NULL REFERENCES events(sequence) DEFERRABLE INITIALLY DEFERRED,\n updated_sequence INTEGER NOT NULL REFERENCES events(sequence) DEFERRABLE INITIALLY DEFERRED,\n removed INTEGER NOT NULL CHECK(removed IN (0,1)),\n CHECK(created_sequence>0 AND updated_sequence>=created_sequence),\n FOREIGN KEY(source_asset_id,source_revision) REFERENCES revisions(asset_id,revision_id),\n FOREIGN KEY(target_asset_id,target_revision) REFERENCES revisions(asset_id,revision_id)\n)"
+    },
+    {
+      "Type": "trigger",
+      "Name": "relationships_identity",
+      "Table": "relationships",
+      "SQL": "CREATE TRIGGER relationships_identity BEFORE UPDATE ON relationships WHEN NEW.relationship_id<>OLD.relationship_id OR NEW.library_id<>OLD.library_id OR NEW.created_sequence<>OLD.created_sequence OR NEW.updated_sequence<OLD.updated_sequence BEGIN SELECT RAISE(ABORT,'immutable relationship identity'); END"
+    },
+    {
+      "Type": "trigger",
+      "Name": "relationships_no_delete",
+      "Table": "relationships",
+      "SQL": "CREATE TRIGGER relationships_no_delete BEFORE DELETE ON relationships BEGIN SELECT RAISE(ABORT,'catalog tombstone required'); END"
+    },
+    {
+      "Type": "index",
+      "Name": "relationships_source_active",
+      "Table": "relationships",
+      "SQL": "CREATE INDEX relationships_source_active ON relationships(source_asset_id,removed,relationship_id)"
+    },
+    {
+      "Type": "index",
+      "Name": "relationships_target_active",
+      "Table": "relationships",
+      "SQL": "CREATE INDEX relationships_target_active ON relationships(target_asset_id,removed,relationship_id)"
+    },
+    {
+      "Type": "table",
+      "Name": "revision_parents",
+      "Table": "revision_parents",
+      "SQL": "CREATE TABLE revision_parents (\n revision_id TEXT NOT NULL,\n parent_id TEXT NOT NULL,\n asset_id TEXT NOT NULL,\n PRIMARY KEY(revision_id,parent_id),\n CHECK(revision_id<>parent_id),\n FOREIGN KEY(asset_id,revision_id) REFERENCES revisions(asset_id,revision_id),\n FOREIGN KEY(asset_id,parent_id) REFERENCES revisions(asset_id,revision_id)\n)"
+    },
+    {
+      "Type": "trigger",
+      "Name": "revision_parents_no_delete",
+      "Table": "revision_parents",
+      "SQL": "CREATE TRIGGER revision_parents_no_delete BEFORE DELETE ON revision_parents BEGIN SELECT RAISE(ABORT,'immutable catalog row'); END"
+    },
+    {
+      "Type": "trigger",
+      "Name": "revision_parents_no_update",
+      "Table": "revision_parents",
+      "SQL": "CREATE TRIGGER revision_parents_no_update BEFORE UPDATE ON revision_parents BEGIN SELECT RAISE(ABORT,'immutable catalog row'); END"
+    },
+    {
+      "Type": "table",
+      "Name": "revisions",
+      "Table": "revisions",
+      "SQL": "CREATE TABLE revisions (\n revision_id TEXT PRIMARY KEY NOT NULL CHECK(length(revision_id)=69 AND substr(revision_id,1,5)='rev1_' AND substr(revision_id,6) NOT GLOB '*[^0-9a-f]*'),\n library_id TEXT NOT NULL REFERENCES catalog(library_id),\n asset_id TEXT NOT NULL REFERENCES assets(asset_id),\n canonical BLOB NOT NULL CHECK(typeof(canonical)='blob' AND length(canonical) BETWEEN 95 AND 2143),\n manifest_json BLOB NOT NULL CHECK(typeof(manifest_json)='blob' AND length(manifest_json) BETWEEN 1 AND 8192),\n created_sequence INTEGER NOT NULL CHECK(created_sequence>0) REFERENCES events(sequence) DEFERRABLE INITIALLY DEFERRED,\n UNIQUE(asset_id,revision_id)\n)"
+    },
+    {
+      "Type": "trigger",
+      "Name": "revisions_no_delete",
+      "Table": "revisions",
+      "SQL": "CREATE TRIGGER revisions_no_delete BEFORE DELETE ON revisions BEGIN SELECT RAISE(ABORT,'immutable catalog row'); END"
+    },
+    {
+      "Type": "trigger",
+      "Name": "revisions_no_update",
+      "Table": "revisions",
+      "SQL": "CREATE TRIGGER revisions_no_update BEFORE UPDATE ON revisions BEGIN SELECT RAISE(ABORT,'immutable catalog row'); END"
+    },
+    {
+      "Type": "table",
+      "Name": "schema_migrations",
+      "Table": "schema_migrations",
+      "SQL": "CREATE TABLE schema_migrations (\n version INTEGER PRIMARY KEY CHECK(version>=1),\n fingerprint TEXT NOT NULL CHECK(length(fingerprint)=64 AND fingerprint NOT GLOB '*[^0-9a-f]*')\n)"
+    },
+    {
+      "Type": "trigger",
+      "Name": "schema_migrations_no_delete",
+      "Table": "schema_migrations",
+      "SQL": "CREATE TRIGGER schema_migrations_no_delete BEFORE DELETE ON schema_migrations BEGIN SELECT RAISE(ABORT,'immutable catalog row'); END"
+    },
+    {
+      "Type": "trigger",
+      "Name": "schema_migrations_no_update",
+      "Table": "schema_migrations",
+      "SQL": "CREATE TRIGGER schema_migrations_no_update BEFORE UPDATE ON schema_migrations BEGIN SELECT RAISE(ABORT,'immutable catalog row'); END"
+    }
+  ],
+  "legacy_fixture": {
+    "sql_path": "internal/continuity/catalog/testdata/continuity-c03c-v3-fixture.sql",
+    "sql_sha256": "d3e7d504c9b6c3f9cb8416386a244eac2587eaaa4802d5a2436bcf70c03c9e43",
+    "manifest_path": "internal/continuity/catalog/testdata/continuity-c03c-v3-fixture.json",
+    "manifest_sha256": "8327c516277a69bf044ddafe848146d634283ef334c747cc1f93391994c9a5d1"
+  },
+  "old_table_rows_preserved": {
+    "assets": {
+      "columns": [
+        "asset_id",
+        "library_id",
+        "label",
+        "head",
+        "created_sequence",
+        "updated_sequence"
+      ],
+      "ordering": "all columns ascending in declared order",
+      "count": 1,
+      "rows_sha256": "12f18c76c5f2958079afe7889b5d4431664695bee570a17282fcb5df46a61d81",
+      "ordered_row_sha256": [
+        "c68db63ec6d10f17cf3d4926b98cba2c6c623f76316010e1451c030085d2a055"
+      ]
+    },
+    "catalog": {
+      "columns": [
+        "singleton",
+        "library_id",
+        "ready"
+      ],
+      "ordering": "all columns ascending in declared order",
+      "count": 1,
+      "rows_sha256": "fcb1c18af13f85546fb7e9ca1c7d4a481b30b8e4ac93669f887e87c424db8dea",
+      "ordered_row_sha256": [
+        "7100d10ef64e64eb4ee67174e544ab2d4d376c3bf73c50c617c19c622ccbbb2f"
+      ]
+    },
+    "catalog_admin_events": {
+      "columns": [
+        "sequence",
+        "library_id",
+        "operation_id",
+        "request",
+        "payload_sha256",
+        "recorded_unix_nano",
+        "receipt"
+      ],
+      "ordering": "all columns ascending in declared order",
+      "count": 0,
+      "rows_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "ordered_row_sha256": []
+    },
+    "catalog_authority": {
+      "columns": [
+        "singleton",
+        "library_id",
+        "incarnation",
+        "owner_subject_id"
+      ],
+      "ordering": "all columns ascending in declared order",
+      "count": 0,
+      "rows_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "ordered_row_sha256": []
+    },
+    "catalog_credentials": {
+      "columns": [
+        "selector",
+        "library_id",
+        "incarnation",
+        "subject_id",
+        "scope_kind",
+        "asset_id",
+        "actions",
+        "verifier",
+        "issued_unix",
+        "expires_unix",
+        "generation",
+        "revoked"
+      ],
+      "ordering": "all columns ascending in declared order",
+      "count": 0,
+      "rows_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "ordered_row_sha256": []
+    },
+    "credential_issuance_receipts": {
+      "columns": [
+        "operation_id",
+        "selector"
+      ],
+      "ordering": "all columns ascending in declared order",
+      "count": 0,
+      "rows_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "ordered_row_sha256": []
+    },
+    "events": {
+      "columns": [
+        "sequence",
+        "library_id",
+        "operation_id",
+        "request",
+        "payload_sha256",
+        "recorded_unix_nano",
+        "receipt"
+      ],
+      "ordering": "all columns ascending in declared order",
+      "count": 5,
+      "rows_sha256": "3b8c6e47ed32388c971c6a3a596b8e30871bcc384a033cc903019f125b91d055",
+      "ordered_row_sha256": [
+        "1b4b0645118519daf544baa25c5b2cf6d229ff757bd7b391a6e26f449d809221",
+        "652f852b94f57a4ef6b5838714b578e424446e82dad5c6cdbd7789e1d2a670ea",
+        "f33a315de0f4d42e6fee79c6972b6c5405c60614a29f7cb5cdeb4b263c4552bf",
+        "5befd10a680e5ce024aed75d8000e7ff0754968d7424aa3c22e619a15883629a",
+        "e07445f5f295d6305424f631b21b75c7c8c29b73a10a3932e0eee34c0fd42992"
+      ]
+    },
+    "locations": {
+      "columns": [
+        "location_id",
+        "library_id",
+        "asset_id",
+        "revision",
+        "source",
+        "locator",
+        "created_sequence",
+        "updated_sequence",
+        "removed"
+      ],
+      "ordering": "all columns ascending in declared order",
+      "count": 1,
+      "rows_sha256": "b9ae9df738b983c589c42d082b5d505c3717f9a8baf82ddf28bc13edea3e803f",
+      "ordered_row_sha256": [
+        "8de9a122c269eb69c7046551789aad7ef49cf7210e78b62897cb10c7346337e3"
+      ]
+    },
+    "policy_events": {
+      "columns": [
+        "sequence",
+        "library_id",
+        "operation_id",
+        "request",
+        "payload_sha256",
+        "recorded_unix_nano",
+        "receipt"
+      ],
+      "ordering": "all columns ascending in declared order",
+      "count": 4,
+      "rows_sha256": "7afc829efc2618aea7f3c7fcd4480f9e3fbc583400d92459339f69eb6549c86c",
+      "ordered_row_sha256": [
+        "4e97f43c0a34973094b23e818a2f4eb405dae1ff8c671f5d4aa92b25b46d6c07",
+        "c921a81f434c3d9ccc9a53480f60ddc44c626e2cfea748baabc94ad89fb5cfd7",
+        "55a75d03a795492cb0a2d0d949222b318c3ac4dd2306201081d9815b2dc555b5",
+        "d1f19d7b205b28272ce40373117b7df3f9f51332672bb4d6cab88c3ee577e7e1"
+      ]
+    },
+    "policy_grants": {
+      "columns": [
+        "grant_id",
+        "library_id",
+        "subject_id",
+        "scope_kind",
+        "asset_id",
+        "actions",
+        "created_sequence",
+        "updated_sequence",
+        "removed"
+      ],
+      "ordering": "all columns ascending in declared order",
+      "count": 2,
+      "rows_sha256": "74225a31785da4afcc1fc04699b429f33cc05406c876b265cfe8340fc75d73c2",
+      "ordered_row_sha256": [
+        "df0466fb40d60d2f6ab5756917c1793be8b329ab8e58a7fa7fc1f471863fe40e",
+        "8b866c973a1d21a696457fdc1700686cf6d60b9efb00fb53fb25d3336902d9a5"
+      ]
+    },
+    "policy_subjects": {
+      "columns": [
+        "subject_id",
+        "library_id",
+        "kind",
+        "label",
+        "enabled",
+        "authorization_generation",
+        "created_sequence",
+        "updated_sequence"
+      ],
+      "ordering": "all columns ascending in declared order",
+      "count": 3,
+      "rows_sha256": "8ee3aad61ee85c6505ca239499ed0276f6a7b8a1cedd83348557f92441d1e24e",
+      "ordered_row_sha256": [
+        "8de3ae3e2efd8eb75bd75228ebf756897067f723327573caebf8c6620b2583ba",
+        "7d8869d5286797f7135c67e5895cdd8c32645b8161e316d6be680796b535fcfd",
+        "f6fe11d8d4c8779c5b079987244f4014e70370957904c4c4fe5e988b5943d39a"
+      ]
+    },
+    "relationships": {
+      "columns": [
+        "relationship_id",
+        "library_id",
+        "source_asset_id",
+        "source_revision",
+        "target_asset_id",
+        "target_revision",
+        "predicate",
+        "provenance",
+        "source",
+        "created_sequence",
+        "updated_sequence",
+        "removed"
+      ],
+      "ordering": "all columns ascending in declared order",
+      "count": 1,
+      "rows_sha256": "e88f5b1e66b641ad79a409a81c61d89d18ac7c5bc19cb1d00502c40a97f778f0",
+      "ordered_row_sha256": [
+        "b8ebfdc6b53495a815b6f6bae79089f0908d027716ae3b5127ca98d3934b953b"
+      ]
+    },
+    "revision_parents": {
+      "columns": [
+        "revision_id",
+        "parent_id",
+        "asset_id"
+      ],
+      "ordering": "all columns ascending in declared order",
+      "count": 1,
+      "rows_sha256": "0ae7ee33470493f10bf7f7b8afa75da4387b90b4975d767a35dcb33f080994a9",
+      "ordered_row_sha256": [
+        "666280dc887dfbcf630d2f743b5ba4122b4a9f562ab823d45d0a8cd41601b404"
+      ]
+    },
+    "revisions": {
+      "columns": [
+        "revision_id",
+        "library_id",
+        "asset_id",
+        "canonical",
+        "manifest_json",
+        "created_sequence"
+      ],
+      "ordering": "all columns ascending in declared order",
+      "count": 2,
+      "rows_sha256": "c28e3aa2b3dbce06581d73d60c10aa080a06ee08d6ee1609614f116d0f1ac9e1",
+      "ordered_row_sha256": [
+        "435ddd35002adccdcf632b41aa12f6c9a2e729ba86b9098728914d4cc5e7fce7",
+        "34301ee196581306c9366f94aa9b2488a080e5c870b03921bd0e52479d9a06fd"
+      ]
+    },
+    "schema_migrations": {
+      "columns": [
+        "version",
+        "fingerprint"
+      ],
+      "ordering": "all columns ascending in declared order",
+      "count": 3,
+      "rows_sha256": "2501a6ea5a508ad5f46c0d755925236638c72cadc4209d7bafce9da2f6bbed22",
+      "ordered_row_sha256": [
+        "b3247cb42668f33df39fa83d5c5831ebdb70e1e74ac9682ac134e0c8e072b9c4",
+        "a9f2239af225472aa5ec2d8a6fe86fcf2da4479e8e6265833366857667e1fa6a",
+        "cf3a52e4d2e2e2078b08fc33bb2ca10879415e9172d6a892a662a204bf0bac30"
+      ]
+    }
+  },
+  "all_table_rows": {
+    "assets": {
+      "columns": [
+        "asset_id",
+        "library_id",
+        "label",
+        "head",
+        "created_sequence",
+        "updated_sequence"
+      ],
+      "ordering": "all columns ascending in declared order",
+      "count": 1,
+      "rows_sha256": "12f18c76c5f2958079afe7889b5d4431664695bee570a17282fcb5df46a61d81",
+      "ordered_row_sha256": [
+        "c68db63ec6d10f17cf3d4926b98cba2c6c623f76316010e1451c030085d2a055"
+      ]
+    },
+    "catalog": {
+      "columns": [
+        "singleton",
+        "library_id",
+        "ready"
+      ],
+      "ordering": "all columns ascending in declared order",
+      "count": 1,
+      "rows_sha256": "fcb1c18af13f85546fb7e9ca1c7d4a481b30b8e4ac93669f887e87c424db8dea",
+      "ordered_row_sha256": [
+        "7100d10ef64e64eb4ee67174e544ab2d4d376c3bf73c50c617c19c622ccbbb2f"
+      ]
+    },
+    "catalog_admin_events": {
+      "columns": [
+        "sequence",
+        "library_id",
+        "operation_id",
+        "request",
+        "payload_sha256",
+        "recorded_unix_nano",
+        "receipt"
+      ],
+      "ordering": "all columns ascending in declared order",
+      "count": 0,
+      "rows_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "ordered_row_sha256": []
+    },
+    "catalog_authority": {
+      "columns": [
+        "singleton",
+        "library_id",
+        "incarnation",
+        "owner_subject_id"
+      ],
+      "ordering": "all columns ascending in declared order",
+      "count": 0,
+      "rows_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "ordered_row_sha256": []
+    },
+    "catalog_credentials": {
+      "columns": [
+        "selector",
+        "library_id",
+        "incarnation",
+        "subject_id",
+        "scope_kind",
+        "asset_id",
+        "actions",
+        "verifier",
+        "issued_unix",
+        "expires_unix",
+        "generation",
+        "revoked"
+      ],
+      "ordering": "all columns ascending in declared order",
+      "count": 0,
+      "rows_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "ordered_row_sha256": []
+    },
+    "credential_issuance_receipts": {
+      "columns": [
+        "operation_id",
+        "selector"
+      ],
+      "ordering": "all columns ascending in declared order",
+      "count": 0,
+      "rows_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "ordered_row_sha256": []
+    },
+    "events": {
+      "columns": [
+        "sequence",
+        "library_id",
+        "operation_id",
+        "request",
+        "payload_sha256",
+        "recorded_unix_nano",
+        "receipt"
+      ],
+      "ordering": "all columns ascending in declared order",
+      "count": 5,
+      "rows_sha256": "3b8c6e47ed32388c971c6a3a596b8e30871bcc384a033cc903019f125b91d055",
+      "ordered_row_sha256": [
+        "1b4b0645118519daf544baa25c5b2cf6d229ff757bd7b391a6e26f449d809221",
+        "652f852b94f57a4ef6b5838714b578e424446e82dad5c6cdbd7789e1d2a670ea",
+        "f33a315de0f4d42e6fee79c6972b6c5405c60614a29f7cb5cdeb4b263c4552bf",
+        "5befd10a680e5ce024aed75d8000e7ff0754968d7424aa3c22e619a15883629a",
+        "e07445f5f295d6305424f631b21b75c7c8c29b73a10a3932e0eee34c0fd42992"
+      ]
+    },
+    "locations": {
+      "columns": [
+        "location_id",
+        "library_id",
+        "asset_id",
+        "revision",
+        "source",
+        "locator",
+        "created_sequence",
+        "updated_sequence",
+        "removed"
+      ],
+      "ordering": "all columns ascending in declared order",
+      "count": 1,
+      "rows_sha256": "b9ae9df738b983c589c42d082b5d505c3717f9a8baf82ddf28bc13edea3e803f",
+      "ordered_row_sha256": [
+        "8de9a122c269eb69c7046551789aad7ef49cf7210e78b62897cb10c7346337e3"
+      ]
+    },
+    "policy_events": {
+      "columns": [
+        "sequence",
+        "library_id",
+        "operation_id",
+        "request",
+        "payload_sha256",
+        "recorded_unix_nano",
+        "receipt"
+      ],
+      "ordering": "all columns ascending in declared order",
+      "count": 4,
+      "rows_sha256": "7afc829efc2618aea7f3c7fcd4480f9e3fbc583400d92459339f69eb6549c86c",
+      "ordered_row_sha256": [
+        "4e97f43c0a34973094b23e818a2f4eb405dae1ff8c671f5d4aa92b25b46d6c07",
+        "c921a81f434c3d9ccc9a53480f60ddc44c626e2cfea748baabc94ad89fb5cfd7",
+        "55a75d03a795492cb0a2d0d949222b318c3ac4dd2306201081d9815b2dc555b5",
+        "d1f19d7b205b28272ce40373117b7df3f9f51332672bb4d6cab88c3ee577e7e1"
+      ]
+    },
+    "policy_grants": {
+      "columns": [
+        "grant_id",
+        "library_id",
+        "subject_id",
+        "scope_kind",
+        "asset_id",
+        "actions",
+        "created_sequence",
+        "updated_sequence",
+        "removed"
+      ],
+      "ordering": "all columns ascending in declared order",
+      "count": 2,
+      "rows_sha256": "74225a31785da4afcc1fc04699b429f33cc05406c876b265cfe8340fc75d73c2",
+      "ordered_row_sha256": [
+        "df0466fb40d60d2f6ab5756917c1793be8b329ab8e58a7fa7fc1f471863fe40e",
+        "8b866c973a1d21a696457fdc1700686cf6d60b9efb00fb53fb25d3336902d9a5"
+      ]
+    },
+    "policy_subjects": {
+      "columns": [
+        "subject_id",
+        "library_id",
+        "kind",
+        "label",
+        "enabled",
+        "authorization_generation",
+        "created_sequence",
+        "updated_sequence"
+      ],
+      "ordering": "all columns ascending in declared order",
+      "count": 3,
+      "rows_sha256": "8ee3aad61ee85c6505ca239499ed0276f6a7b8a1cedd83348557f92441d1e24e",
+      "ordered_row_sha256": [
+        "8de3ae3e2efd8eb75bd75228ebf756897067f723327573caebf8c6620b2583ba",
+        "7d8869d5286797f7135c67e5895cdd8c32645b8161e316d6be680796b535fcfd",
+        "f6fe11d8d4c8779c5b079987244f4014e70370957904c4c4fe5e988b5943d39a"
+      ]
+    },
+    "preference_control": {
+      "columns": [
+        "singleton",
+        "library_id",
+        "clock_floor_unix",
+        "subject_count",
+        "entry_count",
+        "receipt_count"
+      ],
+      "ordering": "all columns ascending in declared order",
+      "count": 1,
+      "rows_sha256": "c6b98578ba67bd30c19ab6d937b5e0257c8ab08206c684678ff3d13a929e3f8d",
+      "ordered_row_sha256": [
+        "510821fd753f8ac2b9809e345682cb431343e4b5031edffd1d8a6c2d94e4e072"
+      ]
+    },
+    "preference_receipts": {
+      "columns": [
+        "subject_id",
+        "operation_id",
+        "request",
+        "payload_sha256",
+        "receipt",
+        "expires_unix"
+      ],
+      "ordering": "all columns ascending in declared order",
+      "count": 1,
+      "rows_sha256": "e5eb7e012b390c3b07ee6a3153482f40dd966096e23fea623328acb5643c58bd",
+      "ordered_row_sha256": [
+        "dea2750034959b43a1511f707c1434c656a4616e95c1a097125bf27158b69a70"
+      ]
+    },
+    "preference_subjects": {
+      "columns": [
+        "subject_id",
+        "library_id",
+        "generation",
+        "entry_count",
+        "receipt_count"
+      ],
+      "ordering": "all columns ascending in declared order",
+      "count": 1,
+      "rows_sha256": "89e0955e03d230d5ec8f4acc07bf128230c9682a939660adbe77f8e22f312bf6",
+      "ordered_row_sha256": [
+        "4c55a607a807a7fad9757b8d417d700e2e6a077661e95f5edc10097c71aa6d5e"
+      ]
+    },
+    "preferences": {
+      "columns": [
+        "subject_id",
+        "asset_id",
+        "selection_token",
+        "person_order",
+        "selected_unix",
+        "expires_unix"
+      ],
+      "ordering": "all columns ascending in declared order",
+      "count": 1,
+      "rows_sha256": "ec917e9325d6251295a57fa92a6347a5d0b8638aacc42d1690d444646089e8f5",
+      "ordered_row_sha256": [
+        "be4569efae8fec395b6d201b03edd79e2090bab0ad87e3dfe83082317f850871"
+      ]
+    },
+    "relationships": {
+      "columns": [
+        "relationship_id",
+        "library_id",
+        "source_asset_id",
+        "source_revision",
+        "target_asset_id",
+        "target_revision",
+        "predicate",
+        "provenance",
+        "source",
+        "created_sequence",
+        "updated_sequence",
+        "removed"
+      ],
+      "ordering": "all columns ascending in declared order",
+      "count": 1,
+      "rows_sha256": "e88f5b1e66b641ad79a409a81c61d89d18ac7c5bc19cb1d00502c40a97f778f0",
+      "ordered_row_sha256": [
+        "b8ebfdc6b53495a815b6f6bae79089f0908d027716ae3b5127ca98d3934b953b"
+      ]
+    },
+    "revision_parents": {
+      "columns": [
+        "revision_id",
+        "parent_id",
+        "asset_id"
+      ],
+      "ordering": "all columns ascending in declared order",
+      "count": 1,
+      "rows_sha256": "0ae7ee33470493f10bf7f7b8afa75da4387b90b4975d767a35dcb33f080994a9",
+      "ordered_row_sha256": [
+        "666280dc887dfbcf630d2f743b5ba4122b4a9f562ab823d45d0a8cd41601b404"
+      ]
+    },
+    "revisions": {
+      "columns": [
+        "revision_id",
+        "library_id",
+        "asset_id",
+        "canonical",
+        "manifest_json",
+        "created_sequence"
+      ],
+      "ordering": "all columns ascending in declared order",
+      "count": 2,
+      "rows_sha256": "c28e3aa2b3dbce06581d73d60c10aa080a06ee08d6ee1609614f116d0f1ac9e1",
+      "ordered_row_sha256": [
+        "435ddd35002adccdcf632b41aa12f6c9a2e729ba86b9098728914d4cc5e7fce7",
+        "34301ee196581306c9366f94aa9b2488a080e5c870b03921bd0e52479d9a06fd"
+      ]
+    },
+    "schema_migrations": {
+      "columns": [
+        "version",
+        "fingerprint"
+      ],
+      "ordering": "all columns ascending in declared order",
+      "count": 4,
+      "rows_sha256": "b105f0c288589824cade1d444961132aee0b995ee877e191f01a8b9b9091bc2b",
+      "ordered_row_sha256": [
+        "b3247cb42668f33df39fa83d5c5831ebdb70e1e74ac9682ac134e0c8e072b9c4",
+        "a9f2239af225472aa5ec2d8a6fe86fcf2da4479e8e6265833366857667e1fa6a",
+        "cf3a52e4d2e2e2078b08fc33bb2ca10879415e9172d6a892a662a204bf0bac30",
+        "c21030a876c38b512be072fe53e35b869ca0dc31bac4649c96b3880a03ef45aa"
+      ]
+    }
+  },
+  "preferences": {
+    "subject_id": "sub_11111111111111111111111111111111",
+    "asset_id": "asset_101112131415161718191a1b1c1d1e1f",
+    "generation": 1,
+    "selection_token": "sel1_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "selected_unix": 1800000000,
+    "selection_expires_unix": 1802592000,
+    "request_expires_unix": 1800000600,
+    "request_json": "{\"version\":2,\"library_id\":\"lib_000102030405060708090a0b0c0d0e0f\",\"operation_id\":\"synthetic_schema4_select_001\",\"kind\":\"select\",\"asset_id\":\"asset_101112131415161718191a1b1c1d1e1f\",\"expected_token\":null,\"expires_unix\":1800000600}",
+    "request_hex": "7b2276657273696f6e223a322c226c6962726172795f6964223a226c69625f3030303130323033303430353036303730383039306130623063306430653066222c226f7065726174696f6e5f6964223a2273796e7468657469635f736368656d61345f73656c6563745f303031222c226b696e64223a2273656c656374222c2261737365745f6964223a2261737365745f3130313131323133313431353136313731383139316131623163316431653166222c2265787065637465645f746f6b656e223a6e756c6c2c22657870697265735f756e6978223a313830303030303630307d",
+    "payload_sha256": "dc330d6e57eb765d1366d53deea279ac2f5e460f0bcf308d5ecb260a7bfac330",
+    "receipt_json": "{\"version\":2,\"operation_id\":\"synthetic_schema4_select_001\",\"kind\":\"select\",\"selection_token\":\"sel1_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"receipt_scope\":\"operation_result\"}",
+    "receipt_hex": "7b2276657273696f6e223a322c226f7065726174696f6e5f6964223a2273796e7468657469635f736368656d61345f73656c6563745f303031222c226b696e64223a2273656c656374222c2273656c656374696f6e5f746f6b656e223a2273656c315f62626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262222c22726563656970745f73636f7065223a226f7065726174696f6e5f726573756c74227d"
+  },
+  "expected_operational_authority": "inactive",
+  "expected_empty_operational_tables": {
+    "catalog_authority": 0,
+    "catalog_admin_events": 0,
+    "catalog_credentials": 0,
+    "credential_issuance_receipts": 0
+  },
+  "expected_portable_projection_sha256": "9e8ffbab12b700adc3baf35c1937cf0e8e30008ba9c794c463e5169a39fc2041",
+  "expected_portable_projection_rows": 12,
+  "sql_sha256": "3a3f419e55e7c9a86112bb5b4b550d23e0433b7838ae2fd65c88b94f7d8ccc74",
+  "sql_bytes": 53179,
+  "generator_sha256": "5e14116e97ed6d15e5bfae19bec9787e9aec1b14725ea1dd18899d2569fada84",
+  "preparation": {
+    "python_sqlite_version": "3.45.3",
+    "sqlite_integrity_checked": true,
+    "old_rows_equal": true,
+    "go_or_product_executed": false
+  },
+  "limits": [
+    "Synthetic operational preferences are nonempty; frozen old authority/admin/credential/issuance tables remain empty.",
+    "No live issuance/authentication or observed production selection is claimed.",
+    "Future expiry is fixed synthetic time; this fixture is for structural migration, not a wall-clock request.",
+    "Portable digest is inherited expected metadata/policy projection, not independently Go-export verified here.",
+    "Root must verify baseline Open/export at frozen source before schema5 migration."
+  ]
+}

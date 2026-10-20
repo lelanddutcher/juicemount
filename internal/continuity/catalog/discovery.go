@@ -175,7 +175,7 @@ func (d *DiscoveryService) Query(parent context.Context, bearer []byte, input Di
 	if err != nil {
 		return result, err
 	}
-	if request.Version == 2 && d.store.version != 4 {
+	if request.Version == 2 && !supportsPreferences(d.store.version) {
 		return result, ErrUpgradeRequired
 	}
 	if err := d.store.enter(); err != nil {
