@@ -29,10 +29,14 @@ type manifestJSON struct {
 }
 
 type changeJSON struct {
-	CreateAsset    *CreateAsset  `json:"create_asset,omitempty"`
-	RenameAsset    *RenameAsset  `json:"rename_asset,omitempty"`
-	RecordRevision *manifestJSON `json:"record_revision,omitempty"`
-	AdvanceHead    *AdvanceHead  `json:"advance_head,omitempty"`
+	CreateAsset        *CreateAsset        `json:"create_asset,omitempty"`
+	RenameAsset        *RenameAsset        `json:"rename_asset,omitempty"`
+	RecordRevision     *manifestJSON       `json:"record_revision,omitempty"`
+	AdvanceHead        *AdvanceHead        `json:"advance_head,omitempty"`
+	PutRelationship    *PutRelationship    `json:"put_relationship,omitempty"`
+	RemoveRelationship *RemoveRelationship `json:"remove_relationship,omitempty"`
+	PutLocation        *PutLocation        `json:"put_location,omitempty"`
+	RemoveLocation     *RemoveLocation     `json:"remove_location,omitempty"`
 }
 
 type operationJSON struct {
@@ -103,6 +107,18 @@ func freezeOperation(op Operation) (Operation, []byte, string, error) {
 		if change.AdvanceHead != nil {
 			count++
 		}
+		if change.PutRelationship != nil {
+			count++
+		}
+		if change.RemoveRelationship != nil {
+			count++
+		}
+		if change.PutLocation != nil {
+			count++
+		}
+		if change.RemoveLocation != nil {
+			count++
+		}
 		if count != 1 {
 			return Operation{}, nil, "", invalid("change requires exactly one variant")
 		}
@@ -138,6 +154,50 @@ func freezeOperation(op Operation) (Operation, []byte, string, error) {
 				return Operation{}, nil, "", invalid("advance head")
 			}
 			frozen.Changes[i].AdvanceHead, wire.Changes[i].AdvanceHead = &c, &c
+		case change.PutRelationship != nil:
+			c := *change.PutRelationship
+			if !validOperationID(c.ID) || !c.Value.valid() {
+				return Operation{}, nil, "", invalid("put relationship")
+			}
+			var err error
+			c.Expected, err = freezeRelationshipExpected(c.Expected)
+			if err != nil {
+				return Operation{}, nil, "", err
+			}
+			frozen.Changes[i].PutRelationship, wire.Changes[i].PutRelationship = &c, &c
+		case change.RemoveRelationship != nil:
+			c := *change.RemoveRelationship
+			if !validOperationID(c.ID) || c.Expected == nil {
+				return Operation{}, nil, "", invalid("remove relationship")
+			}
+			var err error
+			c.Expected, err = freezeRelationshipExpected(c.Expected)
+			if err != nil {
+				return Operation{}, nil, "", err
+			}
+			frozen.Changes[i].RemoveRelationship, wire.Changes[i].RemoveRelationship = &c, &c
+		case change.PutLocation != nil:
+			c := *change.PutLocation
+			if !validOperationID(c.ID) || !c.Value.valid() {
+				return Operation{}, nil, "", invalid("put location")
+			}
+			var err error
+			c.Expected, err = freezeLocationExpected(c.Expected)
+			if err != nil {
+				return Operation{}, nil, "", err
+			}
+			frozen.Changes[i].PutLocation, wire.Changes[i].PutLocation = &c, &c
+		case change.RemoveLocation != nil:
+			c := *change.RemoveLocation
+			if !validOperationID(c.ID) || c.Expected == nil {
+				return Operation{}, nil, "", invalid("remove location")
+			}
+			var err error
+			c.Expected, err = freezeLocationExpected(c.Expected)
+			if err != nil {
+				return Operation{}, nil, "", err
+			}
+			frozen.Changes[i].RemoveLocation, wire.Changes[i].RemoveLocation = &c, &c
 		}
 	}
 	data, err := json.Marshal(wire)
@@ -180,6 +240,8 @@ func decodeOperation(data []byte) (Operation, error) {
 	op := Operation{Version: wire.Version, LibraryID: wire.LibraryID, ID: wire.ID, Actor: wire.Actor, Changes: make([]Change, len(wire.Changes))}
 	for i, c := range wire.Changes {
 		op.Changes[i] = Change{CreateAsset: c.CreateAsset, RenameAsset: c.RenameAsset, AdvanceHead: c.AdvanceHead}
+		op.Changes[i].PutRelationship, op.Changes[i].RemoveRelationship = c.PutRelationship, c.RemoveRelationship
+		op.Changes[i].PutLocation, op.Changes[i].RemoveLocation = c.PutLocation, c.RemoveLocation
 		if c.RecordRevision != nil {
 			m := c.RecordRevision.manifest()
 			op.Changes[i].RecordRevision = &m

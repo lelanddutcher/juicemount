@@ -27,7 +27,7 @@ func TestCatalogSQLConstraintsAndImmutableRows(t *testing.T) {
 		"parent delete":           `DELETE FROM revision_parents`,
 		"catalog identity update": `UPDATE catalog SET library_id='lib_202122232425262728292a2b2c2d2e2f'`,
 		"catalog delete":          `DELETE FROM catalog`,
-		"ledger update":           `UPDATE schema_migrations SET version=1`,
+		"ledger update":           `UPDATE schema_migrations SET fingerprint=fingerprint WHERE version=1`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			if _, err := s.db.Exec(statement); err == nil {

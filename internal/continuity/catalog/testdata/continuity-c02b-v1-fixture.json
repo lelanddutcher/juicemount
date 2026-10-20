@@ -1,0 +1,62 @@
+{
+  "source_commit": "635ad0613fac8b8af576fbe8c6da9c572a369269",
+  "schema_fingerprint": "752faa61a0812eef6fb7cd2a3d71a2aac3cee19f660b2d129e78cfc1a1b86f26",
+  "library_id": "lib_000102030405060708090a0b0c0d0e0f",
+  "asset_id": "asset_101112131415161718191a1b1c1d1e1f",
+  "label": "Scene <A> & café next",
+  "head": "rev1_3cdcd7314dd6c4ff0dd95e4286d5227d4f086be0e2d4b1efe1590bc14c003510",
+  "created_sequence": 1,
+  "updated_sequence": 2,
+  "revisions": [
+    {
+      "id": "rev1_08360b41fa64c32ba1decf26ca750f4d74748870d2b3b9c8b682f22b8ca51b2b",
+      "canonical_hex": "6a756963656d6f756e742e7265766973696f6e0001000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f0000000000000003ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad0000",
+      "manifest_json": "{\"version\":1,\"library_id\":\"lib_000102030405060708090a0b0c0d0e0f\",\"asset_id\":\"asset_101112131415161718191a1b1c1d1e1f\",\"content\":{\"sha256\":\"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad\",\"size\":3},\"parents\":[]}",
+      "manifest": {
+        "version": 1,
+        "library_id": "lib_000102030405060708090a0b0c0d0e0f",
+        "asset_id": "asset_101112131415161718191a1b1c1d1e1f",
+        "content": {
+          "sha256": "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+          "size": 3
+        },
+        "parents": []
+      }
+    },
+    {
+      "id": "rev1_3cdcd7314dd6c4ff0dd95e4286d5227d4f086be0e2d4b1efe1590bc14c003510",
+      "canonical_hex": "6a756963656d6f756e742e7265766973696f6e0001000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f000000000000000488d4266fd4e6338d13b845fcf289579d209c897823b9217da3e161936f031589000108360b41fa64c32ba1decf26ca750f4d74748870d2b3b9c8b682f22b8ca51b2b",
+      "manifest_json": "{\"version\":1,\"library_id\":\"lib_000102030405060708090a0b0c0d0e0f\",\"asset_id\":\"asset_101112131415161718191a1b1c1d1e1f\",\"content\":{\"sha256\":\"88d4266fd4e6338d13b845fcf289579d209c897823b9217da3e161936f031589\",\"size\":4},\"parents\":[\"rev1_08360b41fa64c32ba1decf26ca750f4d74748870d2b3b9c8b682f22b8ca51b2b\"]}",
+      "manifest": {
+        "version": 1,
+        "library_id": "lib_000102030405060708090a0b0c0d0e0f",
+        "asset_id": "asset_101112131415161718191a1b1c1d1e1f",
+        "content": {
+          "sha256": "88d4266fd4e6338d13b845fcf289579d209c897823b9217da3e161936f031589",
+          "size": 4
+        },
+        "parents": [
+          "rev1_08360b41fa64c32ba1decf26ca750f4d74748870d2b3b9c8b682f22b8ca51b2b"
+        ]
+      }
+    }
+  ],
+  "events": [
+    {
+      "sequence": 1,
+      "operation_id": "create_scene_001",
+      "request_json": "{\"version\":1,\"library_id\":\"lib_000102030405060708090a0b0c0d0e0f\",\"operation_id\":\"create_scene_001\",\"actor\":\"owner-demo\",\"changes\":[{\"create_asset\":{\"asset_id\":\"asset_101112131415161718191a1b1c1d1e1f\",\"label\":\"Scene \\u003cA\\u003e \\u0026 café\\u2028next\"}},{\"record_revision\":{\"version\":1,\"library_id\":\"lib_000102030405060708090a0b0c0d0e0f\",\"asset_id\":\"asset_101112131415161718191a1b1c1d1e1f\",\"content\":{\"sha256\":\"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad\",\"size\":3},\"parents\":[]}},{\"advance_head\":{\"asset_id\":\"asset_101112131415161718191a1b1c1d1e1f\",\"expected_revision\":\"\",\"revision\":\"rev1_08360b41fa64c32ba1decf26ca750f4d74748870d2b3b9c8b682f22b8ca51b2b\"}}]}",
+      "payload_sha256": "260069e3c1382a1b20cbb618a247285f2fe32c7a46a62b9e6693dd23a5b63530",
+      "recorded_unix_nano": 1700000000000000001,
+      "receipt_json": "{\"version\":1,\"library_id\":\"lib_000102030405060708090a0b0c0d0e0f\",\"operation_id\":\"create_scene_001\",\"sequence\":1,\"payload_sha256\":\"260069e3c1382a1b20cbb618a247285f2fe32c7a46a62b9e6693dd23a5b63530\",\"recorded_unix_nano\":1700000000000000001}"
+    },
+    {
+      "sequence": 2,
+      "operation_id": "advance_scene_002",
+      "request_json": "{\"version\":1,\"library_id\":\"lib_000102030405060708090a0b0c0d0e0f\",\"operation_id\":\"advance_scene_002\",\"actor\":\"owner-demo\",\"changes\":[{\"record_revision\":{\"version\":1,\"library_id\":\"lib_000102030405060708090a0b0c0d0e0f\",\"asset_id\":\"asset_101112131415161718191a1b1c1d1e1f\",\"content\":{\"sha256\":\"88d4266fd4e6338d13b845fcf289579d209c897823b9217da3e161936f031589\",\"size\":4},\"parents\":[\"rev1_08360b41fa64c32ba1decf26ca750f4d74748870d2b3b9c8b682f22b8ca51b2b\"]}},{\"advance_head\":{\"asset_id\":\"asset_101112131415161718191a1b1c1d1e1f\",\"expected_revision\":\"rev1_08360b41fa64c32ba1decf26ca750f4d74748870d2b3b9c8b682f22b8ca51b2b\",\"revision\":\"rev1_3cdcd7314dd6c4ff0dd95e4286d5227d4f086be0e2d4b1efe1590bc14c003510\"}}]}",
+      "payload_sha256": "5deaa899a9c6bf16f6151512cc15b3ad9b4d455cf5b790ee88f246e020829e83",
+      "recorded_unix_nano": 1700000000000000002,
+      "receipt_json": "{\"version\":1,\"library_id\":\"lib_000102030405060708090a0b0c0d0e0f\",\"operation_id\":\"advance_scene_002\",\"sequence\":2,\"payload_sha256\":\"5deaa899a9c6bf16f6151512cc15b3ad9b4d455cf5b790ee88f246e020829e83\",\"recorded_unix_nano\":1700000000000000002}"
+    }
+  ]
+}

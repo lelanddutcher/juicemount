@@ -36,7 +36,7 @@ func triggerDDL(name string) string {
 func TestCatalogRefusesUnrecognizedAndChangedFormats(t *testing.T) {
 	for name, statements := range map[string][]string{
 		"foreign app":                  {`PRAGMA application_id=42`},
-		"newer schema":                 {`PRAGMA user_version=2`},
+		"newer schema":                 {`PRAGMA user_version=3`},
 		"missing table":                {`DROP TABLE revision_parents`},
 		"missing immutable trigger":    {`DROP TRIGGER events_no_update`},
 		"extra table":                  {`CREATE TABLE unrelated(value TEXT)`},
@@ -309,14 +309,21 @@ func TestCatalogCloseDrainsAndRefusesNewCalls(t *testing.T) {
 		t.Fatal("repeated Close:", err)
 	}
 	for name, call := range map[string]func() error{
-		"library":   func() error { _, e := s.LibraryID(); return e },
-		"apply":     func() error { _, e := s.Apply(context.Background(), initialOperation()); return e },
-		"asset":     func() error { _, e := s.GetAsset(context.Background(), testLibrary, testAsset); return e },
-		"revision":  func() error { _, e := s.GetRevision(context.Background(), testLibrary, rootRevision); return e },
-		"event":     func() error { _, e := s.GetEvent(context.Background(), testLibrary, "initial"); return e },
-		"assets":    func() error { _, e := s.ListAssets(context.Background(), testLibrary, "", 10); return e },
-		"revisions": func() error { _, e := s.ListRevisions(context.Background(), testLibrary, testAsset, "", 10); return e },
-		"events":    func() error { _, e := s.Events(context.Background(), testLibrary, 0, 10); return e },
+		"library":      func() error { _, e := s.LibraryID(); return e },
+		"apply":        func() error { _, e := s.Apply(context.Background(), initialOperation()); return e },
+		"asset":        func() error { _, e := s.GetAsset(context.Background(), testLibrary, testAsset); return e },
+		"revision":     func() error { _, e := s.GetRevision(context.Background(), testLibrary, rootRevision); return e },
+		"event":        func() error { _, e := s.GetEvent(context.Background(), testLibrary, "initial"); return e },
+		"assets":       func() error { _, e := s.ListAssets(context.Background(), testLibrary, "", 10); return e },
+		"revisions":    func() error { _, e := s.ListRevisions(context.Background(), testLibrary, testAsset, "", 10); return e },
+		"events":       func() error { _, e := s.Events(context.Background(), testLibrary, 0, 10); return e },
+		"relationship": func() error { _, e := s.GetRelationship(context.Background(), testLibrary, "r"); return e },
+		"location":     func() error { _, e := s.GetLocation(context.Background(), testLibrary, "l"); return e },
+		"relationships": func() error {
+			_, e := s.ListRelationships(context.Background(), testLibrary, testAsset, "", 10)
+			return e
+		},
+		"locations": func() error { _, e := s.ListLocations(context.Background(), testLibrary, testAsset, "", 10); return e },
 	} {
 		t.Run(name, func(t *testing.T) {
 			if err := call(); !errors.Is(err, ErrClosed) {
