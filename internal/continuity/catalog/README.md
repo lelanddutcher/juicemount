@@ -44,8 +44,8 @@ and the busy timeout bound lock waits. Point reads do not start transactions;
 ListAssets and the relationship/location lists return one statement's snapshot
 of all returned mutable fields and joined membership checks.
 `Close` refuses new calls, drains admitted calls, and closes its database and
-held file identity. There are no background workers. Future consistent exports
-must use a separate read-only pool with deferred snapshot transactions and the
+held file identity. There are no background workers. Exports use a separate
+read-only pool with deferred snapshot transactions and the
 same lifecycle draining; the immediate write pool is not an export handle.
 
 `Apply` accepts an explicit library ID, version 1, an operation ID, nonempty Actor,
@@ -166,5 +166,106 @@ compatible backup for rollback; there is no schema downgrade that discards histo
 Stored Actor strings are caller-supplied attribution, not authenticated identity
 or evidence of human activity. Catalog membership/history checks grant no access
 and prove no immutable source snapshot or media durability. Permissions/disclosure
-belong to the trusted service boundary. Portable export/restore requires its own
-reviewed format and subsequent implementation; this package does not provide it.
+belong to the trusted service boundary. Metadata portability below preserves these
+declarations and their history; it grants no import authority or media guarantee.
+
+`Store.Export(ctx,library,writer,Limits)` captures a complete schema2 metadata
+snapshot. `Restore(ctx,path,expectedLibrary,reader,Limits)` replays it into a new
+exclusive 0600 target only. Restore never merges, resumes, downgrades, overwrites
+or removes a failed target. Existing Create/Open/Upgrade behavior is preserved.
+
+All three Limits fields are explicit positive budgets: MaxBytes, MaxEvents and
+MaxProjectionRows. Hard ceilings are 64 GiB, 1,000,000 events and 10,000,000 logical
+projection rows. Zero is invalid, rather than unlimited. Empty catalogs have no
+events and one library projection row. Every magic/frame/footer byte counts.
+API guardrails do not make maximum-size runs cheap; callers should use smaller
+operational budgets and deadlines. ErrLimit distinguishes a reached budget.
+
+The caller owns reader/writer lifecycle, interruptible I/O/deadlines and durable
+output storage. These functions do not close caller I/O, rename export files or
+fsync exported bytes. Context is checked between I/O and SQL operations; ordinary
+io.Reader/io.Writer cannot forcibly interrupt a blocked call. Impossible counts,
+100 consecutive empty reads, read errors accompanying bytes and short nil-error
+writes refuse. A full footer write returning an error can still deliver a complete
+artifact; an export error is not proof of truncation.
+
+Portable format1 begins with ASCII `juicemount.catalog.export`, NUL, byte1.
+Frames contain one kind byte, uint32 big-endian payload length, then that payload.
+There is exactly one header, its declared number of events, one footer, then EOF.
+Any trailing byte, including whitespace, refuses. Header/footer canonical JSON
+uses the existing Go encoding/json escaping and strict decode/re-encode equality.
+Unknown/missing/duplicate fields, unsupported versions, malformed UTF-8, extra
+frames, sequence gaps, duplicate operation IDs and noncanonical encodings refuse.
+
+| Kind | Payload |
+| --- | --- |
+| 0x01 | JSON fields `version,schema_version,library_id,event_count`, requiring 1 and 2 |
+| 0x02 | uint32 request length, exact request bytes, uint32 receipt length, exact receipt bytes |
+| 0x03 | JSON fields `event_count,projection_rows,projection_sha256,stream_sha256` |
+
+Header/footer payloads are at most 1 KiB; event payloads at most 1,049,608 bytes,
+with the unchanged 1 MiB request and 1 KiB receipt bounds. Inner and outer lengths
+must agree exactly. Lengths and remaining budgets are checked before allocation.
+Memory is bounded by a frame/event plus decoder buffers or a bounded revision-ID
+page, never the entire history. Stored blob lengths are checked before decoding.
+
+P is SHA256 of ASCII `juicemount.catalog.projection`, NUL, byte1, then every
+canonical projection frame. H is SHA256 of ASCII
+`juicemount.catalog.export.stream`, NUL, byte1, then magic and all exact header/event
+frames, then uint64 big-endian event count, uint64 big-endian projection-row count,
+then the 32 decoded P bytes. The footer contains lowercase P/H; its own frame is
+excluded from H. Hashes detect mismatch, not sender authenticity or authorization.
+
+Projection frames are internal digest input, with the same framing and at most
+64 KiB canonical JSON payload. Scan fixed kinds in this order using SQLite BINARY
+identifier ordering, including all tombstones:
+
+| Kind | Ordered JSON fields |
+| --- | --- |
+| 0x11 library | `library_id` |
+| 0x12 assets | `library_id,asset_id,label,head,created_sequence,updated_sequence` |
+| 0x13 revisions | `library_id,revision_id,asset_id,canonical_hex,manifest,created_sequence` |
+| 0x14 parent edges | `library_id,revision_id,parent_id,asset_id` |
+| 0x15 relationships | `library_id,id,value,created_sequence,updated_sequence,removed` |
+| 0x16 locations | `library_id,id,value,created_sequence,updated_sequence,removed` |
+
+Canonical manifest hex is lowercase; manifest/value objects retain their existing
+field order and explicit empty optional revisions. Parent edges sort by child
+then parent. Revision canonical identity, parent membership, endpoint/anchor
+membership and chronology are validated. Readiness, ledger, indexes and SQLite
+layout are excluded. A future logical field/table/schema needs a reviewed format.
+
+Export holds Store lifecycle admission and a separately owned read-only pool
+with one deferred transaction. Recognition, integrity, event history/count and
+all projections share that snapshot. It never uses the immediate write pool.
+Concurrent writers can progress under WAL; the result represents the captured
+snapshot. Cursors close before nested queries. Only after source validation,
+successful transaction completion and pool close can the footer be emitted.
+Path/context checks precede completion. Close drains an admitted export and its
+owned pool; no detached worker or caller-I/O close is used.
+
+Restore validates magic/header/expected library and budgets before reserving a
+destination. It initializes schema2 with ready=0 and initial file/directory
+barriers. Each event reuses the mutation invariants in an immediate transaction,
+inserts its original canonical request/digest/timestamp/receipt, and preserves
+sequence exactly. It does not call public Apply or sample time. Incremental
+projection-row accounting observes actual existing identities inside the same
+transaction. New assets/revisions/parent edges/relationships/locations add rows;
+repeated revisions, corrections, removals and reactivations do not. An event
+exceeding the row budget rolls back before consuming further input or committing;
+the running count advances only after commit, without growing-table rescans.
+
+After a valid footer and EOF, a final immediate transaction independently scans
+target history/projections, compares counts/P, and validates schema/integrity/path
+identity before atomically setting ready=1. Complete source-history/projection
+equivalence is proved by this replay comparison. A structurally valid source
+projection edited outside history may export successfully but cannot restore
+as the same claimed projection. Export success alone does not prove replayability.
+
+Invalid/truncated input, late reader errors, budget failures and cancellation
+before completion retain an incomplete target that Open refuses. Prior complete
+replay batches may remain inside it. Final commit/close/directory-sync errors can
+leave a completed target with uncertain acknowledgment. Restore succeeds only
+after closing owned resources and the final directory barrier; recovery inspects
+with Open and the exact expected library/history. A second Restore must refuse
+that destination and cannot manufacture certainty by overwriting it.

@@ -35,7 +35,7 @@ func readRevision(ctx context.Context, q queryer, library continuity.LibraryID, 
 	var owner continuity.LibraryID
 	var asset continuity.AssetID
 	var manifestJSON []byte
-	err := q.QueryRowContext(ctx, `SELECT revision_id,library_id,asset_id,canonical,manifest_json,created_sequence FROM revisions WHERE revision_id=?`, id).
+	err := q.QueryRowContext(ctx, `SELECT revision_id,library_id,asset_id,CASE WHEN length(canonical) BETWEEN 95 AND 2143 THEN canonical END,CASE WHEN length(manifest_json) BETWEEN 1 AND 8192 THEN manifest_json END,created_sequence FROM revisions WHERE revision_id=?`, id).
 		Scan(&r.ID, &owner, &asset, &r.Canonical, &manifestJSON, &r.CreatedSequence)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Revision{}, ErrNotFound
