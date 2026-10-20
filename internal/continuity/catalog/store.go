@@ -96,6 +96,12 @@ func openDB(path string, readonly bool) (*sql.DB, error) {
 }
 
 func openStore(input string, library continuity.LibraryID, create bool) (_ *Store, resultErr error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	return openStoreContext(ctx, input, library, create, true)
+}
+
+func openStoreContext(ctx context.Context, input string, library continuity.LibraryID, create, complete bool) (_ *Store, resultErr error) {
 	path, err := canonicalPath(input)
 	if err != nil {
 		return nil, err
@@ -136,8 +142,6 @@ func openStore(input string, library continuity.LibraryID, create bool) (_ *Stor
 			file.Close()
 		}
 	}()
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
 	if !create {
 		// Version, DDL, ledger, identity and integrity share one read snapshot.
 		var version int
@@ -193,6 +197,9 @@ func openStore(input string, library continuity.LibraryID, create bool) (_ *Stor
 		}
 		if err := syncParent(path); err != nil {
 			return nil, err
+		}
+		if !complete {
+			return store, nil
 		}
 		// Readiness is the final atomic initialization step, after directory sync.
 		tx, err := db.BeginTx(ctx, nil)
