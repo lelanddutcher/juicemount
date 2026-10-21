@@ -76,7 +76,13 @@ func (c collectionStreamCounts) validate(limits Limits) error {
 	return nil
 }
 func decodeCollectionHeader(data []byte, library continuity.LibraryID, limits Limits) (collectionStreamHeader, error) {
+	return decodeCollectionFormatHeader(data, library, limits, 3)
+}
+func decodeCollectionFormatHeader(data []byte, library continuity.LibraryID, limits Limits, format int) (collectionStreamHeader, error) {
 	var h collectionStreamHeader
+	if format != 3 && format != 4 {
+		return h, corrupt("collection stream version")
+	}
 	if len(data) == 0 || len(data) > 1024 {
 		return h, corrupt("collection header length")
 	}
@@ -86,7 +92,7 @@ func decodeCollectionHeader(data []byte, library continuity.LibraryID, limits Li
 	if err := canonicalJSON(data, &h); err != nil {
 		return h, err
 	}
-	if h.Version != 3 || h.SchemaVersion != 5 || h.LibraryID != library {
+	if h.Version != format || h.SchemaVersion != format+2 || h.LibraryID != library {
 		return h, corrupt("collection stream identity or version")
 	}
 	return h, h.collectionStreamCounts.validate(limits)
@@ -493,11 +499,10 @@ func walkCollectionTransactions(ctx context.Context, q queryer, library continui
 			if n != content || content > c.CollectionEventCount {
 				return corrupt("content collection order")
 			}
-			r, receipt, child, err := readCollectionContentRecord(ctx, q, library, n)
+			data, receipt, child, bindChild, err := readPortableCollectionContent(ctx, q, library, n)
 			if err != nil {
 				return err
 			}
-			data, _, _ := CanonicalCollectionRecord(r)
 			payload := appendCollectionPair(nil, data, receipt)
 			var generated *CollectionPolicyRecord
 			if child != 0 {
@@ -515,7 +520,7 @@ func walkCollectionTransactions(ctx context.Context, q queryer, library continui
 			} else {
 				payload = appendCollectionPair(payload, nil, nil)
 			}
-			if err := bindCollectionChild(r, generated); err != nil {
+			if err := bindChild(generated); err != nil {
 				return err
 			}
 			if err := emit(7, payload); err != nil {
@@ -628,11 +633,21 @@ func exportCollectionSnapshot(ctx context.Context, q queryer, library continuity
 	if err := validateCollectionPortableState(ctx, q, library); err != nil {
 		return nil, err
 	}
-	h := collectionStreamHash()
-	if err := output.write([]byte(streamMagic3), h); err != nil {
+	version, err := catalogVersion(ctx, q)
+	if err != nil {
 		return nil, err
 	}
-	header, err := json.Marshal(collectionStreamHeader{3, 5, library, c})
+	format := 3
+	if version == 6 {
+		format = 4
+	} else if version != 5 {
+		return nil, corrupt("collection export schema")
+	}
+	h, magic := collectionFormatHash(format)
+	if err := output.write([]byte(magic), h); err != nil {
+		return nil, err
+	}
+	header, err := json.Marshal(collectionStreamHeader{format, version, library, c})
 	if err != nil {
 		return nil, err
 	}

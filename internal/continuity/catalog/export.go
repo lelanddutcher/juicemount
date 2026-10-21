@@ -110,11 +110,6 @@ func (s *Store) Export(ctx context.Context, library continuity.LibraryID, writer
 	if err != nil {
 		return err
 	}
-	// Schema6 requires format4. Until that format is available, refuse before
-	// writing even a header; format3 cannot represent query definitions.
-	if supportsSavedQueries(version) {
-		return ErrUpgradeRequired
-	}
 	if err := s.checkVersion(ctx, tx); err != nil {
 		return err
 	}

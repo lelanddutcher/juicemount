@@ -92,17 +92,36 @@ func validateRecordedCollectionPolicyReceipt(op CollectionPolicyRequest, receipt
 	return receipt, nil
 }
 func consumeCollectionDeclaration(ctx context.Context, q queryer, library continuity.LibraryID, record CollectionRecord, digest string) error {
+	if record.Request.Kind != "create" {
+		return corrupt("declaration requires create")
+	}
+	return consumeTypedCollectionDeclaration(ctx, q, library, record.Request.CollectionID, record.ActorSubjectID, record.Request.ID, digest)
+}
+func consumeTypedCollectionDeclaration(ctx context.Context, q queryer, library continuity.LibraryID, id CollectionID, actor SubjectID, operationID CollectionOperationID, digest string) error {
+	version, err := catalogVersion(ctx, q)
+	if err != nil {
+		return err
+	}
+	if supportsSavedQueries(version) {
+		var exists bool
+		if err := q.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM saved_query_definitions WHERE collection_id=?)`, id).Scan(&exists); err != nil {
+			return err
+		}
+		if exists {
+			return corrupt("consumed query declaration")
+		}
+	}
 	var lib continuity.LibraryID
 	var creator SubjectID
 	var operation CollectionOperationID
 	var storedDigest string
 	var generation int64
 	var definition, quota, event bool
-	err := q.QueryRowContext(ctx, `SELECT library_id,creator_subject_id,creation_operation_id,creation_payload_sha256,policy_generation,EXISTS(SELECT 1 FROM collection_definitions d WHERE d.collection_id=i.collection_id),EXISTS(SELECT 1 FROM collection_quota q WHERE q.collection_id=i.collection_id),EXISTS(SELECT 1 FROM collection_events e WHERE e.collection_id=i.collection_id) FROM collection_identities i WHERE collection_id=?`, record.Request.CollectionID).Scan(&lib, &creator, &operation, &storedDigest, &generation, &definition, &quota, &event)
+	err = q.QueryRowContext(ctx, `SELECT library_id,creator_subject_id,creation_operation_id,creation_payload_sha256,policy_generation,EXISTS(SELECT 1 FROM collection_definitions d WHERE d.collection_id=i.collection_id),EXISTS(SELECT 1 FROM collection_quota q WHERE q.collection_id=i.collection_id),EXISTS(SELECT 1 FROM collection_events e WHERE e.collection_id=i.collection_id) FROM collection_identities i WHERE collection_id=?`, id).Scan(&lib, &creator, &operation, &storedDigest, &generation, &definition, &quota, &event)
 	if err != nil {
 		return err
 	}
-	if record.Request.Kind != "create" || lib != library || creator != record.ActorSubjectID || operation != record.Request.ID || storedDigest != digest || generation != 0 || definition || quota || event {
+	if lib != library || creator != actor || operation != operationID || storedDigest != digest || generation != 0 || definition || quota || event {
 		return corrupt("unconsumed collection declaration binding")
 	}
 	// Consumption is the definition insertion in this same transaction. Identity
@@ -255,6 +274,18 @@ func (s *Store) replayCollectionOwnerPolicy(ctx context.Context, record Collecti
 	if err := s.prepareCollectionReplay(ctx, tx); err != nil {
 		return 0, err
 	}
+	// Format4 admits owner attribution against this historical prefix, without
+	// consulting operational authority or the subject's later final state.
+	// Format3 retains its existing replay contract.
+	if supportsSavedQueries(s.version) {
+		operator, err := readSubject(ctx, tx, s.library, record.OperatorSubjectID)
+		if err != nil {
+			return 0, err
+		}
+		if operator.Value.Kind != "person" || !operator.Value.Enabled {
+			return 0, ErrConflict
+		}
+	}
 	sequence, delta, err := s.applyRecordedCollectionPolicy(ctx, tx, record, receiptBytes, &budget)
 	if err != nil {
 		return 0, err
@@ -329,20 +360,26 @@ func validateInactiveCollectionImport(ctx context.Context, q queryer) error {
 // complete format3 header can reserve a new schema5 target. Every replay call
 // commits one bounded incomplete transaction; failed targets are never adopted.
 func restoreCollections(ctx context.Context, path string, library continuity.LibraryID, input *streamInput, limits Limits, directoryBarrier func(string) error) (resultErr error) {
-	h := collectionStreamHash()
-	h.Write([]byte(streamMagic3))
+	return restoreCollectionFormat(ctx, path, library, input, limits, directoryBarrier, 3)
+}
+func restoreCollectionFormat(ctx context.Context, path string, library continuity.LibraryID, input *streamInput, limits Limits, directoryBarrier func(string) error, format int) (resultErr error) {
+	if format != 3 && format != 4 {
+		return corrupt("collection restore format")
+	}
+	h, magic := collectionFormatHash(format)
+	h.Write([]byte(magic))
 	_, data, err := input.collectionFrame(false, 1, h)
 	if err != nil {
 		return err
 	}
-	header, err := decodeCollectionHeader(data, library, limits)
+	header, err := decodeCollectionFormatHeader(data, library, limits, format)
 	if err != nil {
 		return err
 	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	s, err := openStoreVersionContext(ctx, path, library, true, false, 5)
+	s, err := openStoreVersionContext(ctx, path, library, true, false, header.SchemaVersion)
 	if err != nil {
 		return err
 	}
@@ -430,17 +467,17 @@ func restoreCollections(ctx context.Context, path string, library continuity.Lib
 			if content > header.CollectionEventCount {
 				return corrupt("excess collection content")
 			}
-			record, receipt, child, childReceipt, err := decodeCollectionContentPair(payload, library)
+			replay, hasChild, err := decodePortableCollectionContent(payload, library, format)
 			if err != nil {
 				return err
 			}
-			if child != nil {
+			if hasChild {
 				policy++
 				if policy > header.CollectionPolicyEventCount {
 					return corrupt("excess generated policy")
 				}
 			}
-			next, err := s.replayCollectionContent(ctx, record, receipt, child, childReceipt, rows, limits.MaxProjectionRows)
+			next, err := replay(ctx, s, rows, limits.MaxProjectionRows)
 			if err != nil {
 				return protocolError("restore content replay", err)
 			}

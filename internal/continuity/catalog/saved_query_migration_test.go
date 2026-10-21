@@ -150,8 +150,8 @@ func TestSavedQuerySchemaFingerprintsAndExplicitCreate(t *testing.T) {
 		t.Fatal("wrong initialization version")
 	}
 	var out bytes.Buffer
-	if err := s.Export(context.Background(), testLibrary, &out, Limits{MaxStreamBytes, MaxStreamEvents, MaxStreamProjectionRows}); !errors.Is(err, ErrUpgradeRequired) || out.Len() != 0 {
-		t.Fatalf("schema6 silently exported incomplete format3: %v", err)
+	if err := s.Export(context.Background(), testLibrary, &out, Limits{MaxStreamBytes, MaxStreamEvents, MaxStreamProjectionRows}); err != nil || !bytes.HasPrefix(out.Bytes(), []byte(streamMagic4)) {
+		t.Fatalf("schema6 format4 export: %v", err)
 	}
 }
 

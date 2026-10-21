@@ -3,12 +3,12 @@ package catalog
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"github.com/lelanddutcher/juicemount/internal/continuity"
 )
 
 // These bounded readers validate retained history, without live authorization.
-// Stream framing and public schema6 restore are a separate format.
 func validateRecordedSavedQueryContent(record SavedQueryRecord, data, receiptBytes []byte, library continuity.LibraryID) (SavedQueryReceipt, error) {
 	if _, _, err := CanonicalSavedQueryRecord(record); err != nil {
 		return SavedQueryReceipt{}, err
@@ -99,4 +99,71 @@ func readSavedQueryContentRecord(ctx context.Context, q queryer, library continu
 		return r, nil, 0, corrupt("stored collection content receipt")
 	}
 	return r, receipt, child, nil
+}
+
+func (s *Store) applyRecordedSavedQueryContent(ctx context.Context, tx *sql.Tx, record SavedQueryRecord, receiptBytes []byte, child *CollectionPolicyRecord, childReceipt []byte, budget *collectionProjectionBudget) (SavedQueryReceipt, error) {
+	data, _, err := CanonicalSavedQueryRequest(record.Request)
+	if err != nil {
+		return SavedQueryReceipt{}, err
+	}
+	if _, err := validateRecordedSavedQueryContent(record, data, receiptBytes, s.library); err != nil {
+		return SavedQueryReceipt{}, err
+	}
+	if err := bindSavedQueryChild(record, child); err != nil {
+		return SavedQueryReceipt{}, err
+	}
+	if child == nil && len(childReceipt) != 0 {
+		return SavedQueryReceipt{}, corrupt("receipt without generated policy")
+	}
+	if child != nil {
+		if _, _, err := CanonicalCollectionPolicyRecord(*child); err != nil {
+			return SavedQueryReceipt{}, err
+		}
+		if _, err := validateRecordedCollectionPolicyReceipt(child.Request, childReceipt, child.RecordedUnixNano); err != nil {
+			return SavedQueryReceipt{}, err
+		}
+	}
+	// Metadata was replayed first. Existence and immutable member bindings are
+	// historical structural facts; current discovery grants are not replay proof.
+	assetCheck := func(asset continuity.AssetID) error { _, err := readAsset(ctx, tx, s.library, asset); return err }
+	policyApply := func(expected CollectionPolicyRequest) (int64, CollectionQuotaCounters, error) {
+		if child == nil {
+			return 0, CollectionQuotaCounters{}, corrupt("missing recorded child")
+		}
+		want, _, err := CanonicalCollectionPolicyRequest(expected)
+		if err != nil {
+			return 0, CollectionQuotaCounters{}, err
+		}
+		have, _, err := CanonicalCollectionPolicyRequest(child.Request)
+		if err != nil || !bytes.Equal(want, have) {
+			return 0, CollectionQuotaCounters{}, corrupt("recorded child request")
+		}
+		return s.applyRecordedCollectionPolicy(ctx, tx, *child, childReceipt, budget)
+	}
+	return s.applySavedQueryContentStructuralMode(ctx, tx, record, data, receiptBytes, true, budget, assetCheck, policyApply)
+}
+
+func (s *Store) replaySavedQueryContent(ctx context.Context, record SavedQueryRecord, receiptBytes []byte, child *CollectionPolicyRecord, childReceipt []byte, rows, maxRows int64) (int64, error) {
+	if !supportsSavedQueries(s.version) {
+		return 0, ErrUpgradeRequired
+	}
+	budget, err := newCollectionProjectionBudget(rows, maxRows)
+	if err != nil {
+		return 0, err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	if err := s.prepareCollectionReplay(ctx, tx); err != nil {
+		return 0, err
+	}
+	if _, err := s.applyRecordedSavedQueryContent(ctx, tx, record, receiptBytes, child, childReceipt, &budget); err != nil {
+		return 0, err
+	}
+	if err := s.commitCollectionReplay(ctx, tx); err != nil {
+		return 0, err
+	}
+	return budget.rows, nil
 }

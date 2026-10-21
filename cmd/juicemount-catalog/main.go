@@ -86,6 +86,7 @@ func runConfigured(parent context.Context, args []string, stdin io.Reader, stdou
 	outputCloseFailed := false
 	preferenceMaintenance := false
 	collectionMutationAttempted := false
+	savedQueryMutationAttempted, savedQueryMaintenance := false, false
 	collectionReadCommand, collectionReadAttempted := false, false
 	fail := func(uncertain bool) int {
 		message := "catalog operation failed"
@@ -93,6 +94,12 @@ func runConfigured(parent context.Context, args []string, stdin io.Reader, stdou
 			message = "catalog outcome uncertain; inspect operation status before revoke/reissue"
 			if preferenceMaintenance {
 				message = "catalog preference maintenance outcome uncertain"
+			}
+			if savedQueryMaintenance {
+				message = "catalog saved query maintenance outcome uncertain"
+			}
+			if savedQueryMutationAttempted {
+				message = "catalog saved query outcome uncertain; retry same exact request or refresh current state"
 			}
 			if collectionMutationAttempted {
 				message = "catalog collection outcome uncertain; retry same exact request or refresh current state"
@@ -139,6 +146,7 @@ func runConfigured(parent context.Context, args []string, stdin io.Reader, stdou
 	defer cancel()
 	owners := &fileOwners{}
 	var restoreStdio func() error
+	var ownedStdin, ownedStdout *ownedFile
 	if ownStdio {
 		input, inOK := stdin.(*os.File)
 		output, outOK := stdout.(*os.File)
@@ -152,15 +160,28 @@ func runConfigured(parent context.Context, args []string, stdin io.Reader, stdou
 		}
 		restoreStdio = restore
 		stdin, stdout, stderr = owners.track(prepared[0]), owners.track(prepared[1]), owners.track(prepared[2])
+		ownedStdin, _ = stdin.(*ownedFile)
+		ownedStdout, _ = stdout.(*ownedFile)
 	}
 	stopOwners := owners.watch(ctx)
 	defer func() {
+		// A query mutation may already be committed. Diagnose its owned stdout
+		// close before the diagnostic descriptor is itself closed by stopOwners.
+		if savedQueryMutationAttempted && ownedStdout != nil {
+			if err := ownedStdout.Close(); err != nil {
+				outputCloseFailed = true
+				code = fail(true)
+			}
+		}
 		err := stopOwners()
 		if restoreStdio != nil {
 			err = errors.Join(err, restoreStdio())
 		}
 		if err != nil || ctx.Err() != nil {
 			code = 3
+			if savedQueryMutationAttempted {
+				code = fail(true)
+			}
 		}
 	}()
 	stdin = contextReader{ctx, stdin}
@@ -171,6 +192,7 @@ func runConfigured(parent context.Context, args []string, stdin io.Reader, stdou
 	}
 	command := strings.Join(fs.Args(), " ")
 	collectionReadCommand = command == "collection read"
+	savedQueryMaintenance = command == "init-saved-queries" || command == "upgrade-saved-queries"
 	preferenceMaintenance = command == "init-preferences" || command == "upgrade-preferences" || command == "owner preference prune"
 	if command == "subject new-id" {
 		id, err := catalog.NewSubjectID()
@@ -227,6 +249,12 @@ func runConfigured(parent context.Context, args []string, stdin io.Reader, stdou
 		}
 		return 0
 	}
+	if command == "upgrade-saved-queries" {
+		if err := catalog.UpgradeSavedQueries(ctx, *path, library); err != nil {
+			return fail(strings.Contains(err.Error(), "uncertain"))
+		}
+		return 0
+	}
 	var s *catalog.Store
 	var err error
 	if command == "init-authority" {
@@ -235,6 +263,8 @@ func runConfigured(parent context.Context, args []string, stdin io.Reader, stdou
 		s, err = catalog.CreatePreferences(ctx, *path, library)
 	} else if command == "init-collections" {
 		s, err = catalog.CreateCollections(ctx, *path, library)
+	} else if command == "init-saved-queries" {
+		s, err = catalog.CreateSavedQueries(ctx, *path, library)
 	} else {
 		s, err = catalog.OpenContext(ctx, *path)
 	}
@@ -250,7 +280,7 @@ func runConfigured(parent context.Context, args []string, stdin io.Reader, stdou
 	if err != nil || actual != library {
 		return fail(false)
 	}
-	if command == "init-authority" || command == "init-preferences" || command == "init-collections" {
+	if command == "init-authority" || command == "init-preferences" || command == "init-collections" || command == "init-saved-queries" {
 		return 0
 	}
 	if collectionReadCommand {
@@ -275,6 +305,36 @@ func runConfigured(parent context.Context, args []string, stdin io.Reader, stdou
 		collectionReadAttempted, err = runCollectionRead(ctx, s, library, request, bearer, stdout)
 		if err != nil {
 			return fail(false)
+		}
+		return 0
+	}
+	if command == "query mutate" {
+		reader := stdin
+		// Borrowed stdin remains caller-owned; prepared OS stdin is owned.
+		input := ownedStdin
+		if *inputPath != "-" {
+			raw, err := files.input(*inputPath)
+			if err != nil {
+				return fail(false)
+			}
+			input = owners.track(raw)
+			reader = contextReader{ctx, input}
+		}
+		request, bearer, err := readSavedQueryMutation(reader, library)
+		defer clear(bearer)
+		if input != nil {
+			err = errors.Join(err, input.Close())
+		}
+		if ownedStdin != nil && ownedStdin != input {
+			err = errors.Join(err, ownedStdin.Close())
+		}
+		if err != nil {
+			return fail(false)
+		}
+		knownOperationID = string(request.ID)
+		savedQueryMutationAttempted, err = runSavedQueryMutation(ctx, s, library, request, bearer, stdout)
+		if err != nil {
+			return fail(savedQueryMutationAttempted)
 		}
 		return 0
 	}

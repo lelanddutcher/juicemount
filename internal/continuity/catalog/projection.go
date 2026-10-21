@@ -102,6 +102,16 @@ func projectionTotal(ctx context.Context, q queryer) (int64, error) {
 		}
 		count, err = addCollectionProjectionRows(count, extra)
 	}
+	if err != nil {
+		return 0, err
+	}
+	if supportsSavedQueries(version) {
+		var extra int64
+		if err := q.QueryRowContext(ctx, `SELECT count(*) FROM saved_query_definitions`).Scan(&extra); err != nil {
+			return 0, err
+		}
+		count, err = addCollectionProjectionRows(count, extra)
+	}
 	return count, err
 }
 
@@ -119,6 +129,9 @@ func projectionDigest(ctx context.Context, q queryer, library continuity.Library
 	}
 	if supportsCollections(version) {
 		domain = "juicemount.catalog.projection\x00\x03"
+	}
+	if supportsSavedQueries(version) {
+		domain = "juicemount.catalog.projection\x00\x04"
 	}
 	_, _ = h.Write([]byte(domain))
 	var count int64
@@ -246,6 +259,11 @@ func projectionDigest(ctx context.Context, q queryer, library continuity.Library
 	}
 	if supportsCollections(version) {
 		if err := walkCollectionProjections(ctx, q, library, emit); err != nil {
+			return "", 0, err
+		}
+	}
+	if supportsSavedQueries(version) {
+		if err := walkSavedQueryProjections(ctx, q, library, emit); err != nil {
 			return "", 0, err
 		}
 	}

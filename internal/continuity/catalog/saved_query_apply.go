@@ -240,6 +240,9 @@ func (s *Store) applySavedQueryContent(ctx context.Context, tx *sql.Tx, op Saved
 // The caller owns authorization and commit. The core consumes resolved tokens,
 // time and child-policy results, and charges the existing shared counters once.
 func (s *Store) applySavedQueryContentStructural(ctx context.Context, tx *sql.Tx, record SavedQueryRecord, data, receiptBytes []byte, budget *collectionProjectionBudget, assetCheck func(continuity.AssetID) error, policyApply func(CollectionPolicyRequest) (int64, CollectionQuotaCounters, error)) (SavedQueryReceipt, error) {
+	return s.applySavedQueryContentStructuralMode(ctx, tx, record, data, receiptBytes, false, budget, assetCheck, policyApply)
+}
+func (s *Store) applySavedQueryContentStructuralMode(ctx context.Context, tx *sql.Tx, record SavedQueryRecord, data, receiptBytes []byte, staged bool, budget *collectionProjectionBudget, assetCheck func(continuity.AssetID) error, policyApply func(CollectionPolicyRequest) (int64, CollectionQuotaCounters, error)) (SavedQueryReceipt, error) {
 	receipt, err := validateRecordedSavedQueryContent(record, data, receiptBytes, s.library)
 	if err != nil {
 		return SavedQueryReceipt{}, err
@@ -300,11 +303,17 @@ func (s *Store) applySavedQueryContentStructural(ctx context.Context, tx *sql.Tx
 	var policy *CollectionPolicyRequest
 	switch v := value.(type) {
 	case *CreateSavedQuery:
-		if err := budget.take(); err != nil {
-			return receipt, err
-		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO collection_identities(collection_id,library_id,creator_subject_id,creation_operation_id,creation_payload_sha256,policy_generation) VALUES(?,?,?,?,?,0)`, op.CollectionID, s.library, record.ActorSubjectID, op.ID, digest); err != nil {
-			return receipt, ErrConflict
+		if staged {
+			if err := consumeTypedCollectionDeclaration(ctx, tx, s.library, op.CollectionID, record.ActorSubjectID, op.ID, digest); err != nil {
+				return receipt, err
+			}
+		} else {
+			if err := budget.take(); err != nil {
+				return receipt, err
+			}
+			if _, err := tx.ExecContext(ctx, `INSERT INTO collection_identities(collection_id,library_id,creator_subject_id,creation_operation_id,creation_payload_sha256,policy_generation) VALUES(?,?,?,?,?,0)`, op.CollectionID, s.library, record.ActorSubjectID, op.ID, digest); err != nil {
+				return receipt, ErrConflict
+			}
 		}
 		if err := budget.take(); err != nil {
 			return receipt, err
