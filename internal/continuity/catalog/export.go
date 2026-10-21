@@ -110,9 +110,37 @@ func (s *Store) Export(ctx context.Context, library continuity.LibraryID, writer
 	if err != nil {
 		return err
 	}
+	if err := s.checkVersion(ctx, tx); err != nil {
+		return err
+	}
 	if supportsCollections(version) {
-		return ErrUpgradeRequired
-	} // Format3 must preserve collections before export is enabled.
+		output := streamOutput{ctx: ctx, w: writer, max: limits.MaxBytes}
+		footer, err := exportCollectionSnapshot(ctx, tx, library, &output, limits)
+		if err != nil {
+			return err
+		}
+		if err := tx.Commit(); err != nil {
+			return err
+		}
+		closeErr := db.Close()
+		db = nil
+		if closeErr != nil {
+			return closeErr
+		}
+		if err := s.checkPaths(); err != nil {
+			return err
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := output.frame(3, footer, nil); err != nil {
+			return err
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		return s.checkPaths()
+	}
 	format := 1
 	var policy int64
 	if portableSchemaVersion(version) == authoritySchemaVersion {

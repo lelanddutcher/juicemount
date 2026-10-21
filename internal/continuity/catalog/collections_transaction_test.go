@@ -151,8 +151,39 @@ func TestCollectionTransactionCreateShareHiddenRetentionAndRetry(t *testing.T) {
 		t.Fatalf("restart identity: %+v %v", def, err)
 	}
 	var out bytes.Buffer
-	if err := reopened.Export(ctx, testLibrary, &out, Limits{MaxBytes: 1 << 20, MaxEvents: 100, MaxProjectionRows: 1000}); !errors.Is(err, ErrUpgradeRequired) || out.Len() != 0 {
-		t.Fatalf("schema5 export silently dropped data: %v", err)
+	limits := Limits{MaxBytes: 1 << 20, MaxEvents: 100, MaxProjectionRows: 1000}
+	if err := reopened.Export(ctx, testLibrary, &out, limits); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(t.TempDir(), "portable.sqlite")
+	if err := Restore(ctx, target, testLibrary, bytes.NewReader(out.Bytes()), limits); err != nil {
+		t.Fatal(err)
+	}
+	imported, err := Open(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer imported.Close()
+	importedDef, err := readCollectionDefinition(ctx, imported.db, create.CollectionID)
+	if err != nil || importedDef != def {
+		t.Fatalf("portable collection identity/name/version changed: %+v %v", importedDef, err)
+	}
+	var retained int
+	if err := imported.db.QueryRowContext(ctx, "SELECT count(*) FROM collection_entries WHERE collection_id=? AND removed=0", create.CollectionID).Scan(&retained); err != nil || retained != 2 {
+		t.Fatalf("portable hidden membership: %d %v", retained, err)
+	}
+	var request, receipt []byte
+	if err := imported.db.QueryRowContext(ctx, "SELECT request,receipt FROM collection_events WHERE actor_subject_id=? AND operation_id=?", ownerSubject, create.ID).Scan(&request, &receipt); err != nil {
+		t.Fatal(err)
+	}
+	expectedRequest, _, _ := CanonicalCollectionRequest(create)
+	expectedReceipt, _ := CanonicalCollectionReceipt(created)
+	if !bytes.Equal(request, expectedRequest) || !bytes.Equal(receipt, expectedReceipt) {
+		t.Fatal("portable original create retry state changed")
+	}
+	var again bytes.Buffer
+	if err := imported.Export(ctx, testLibrary, &again, limits); err != nil || !bytes.Equal(again.Bytes(), out.Bytes()) {
+		t.Fatalf("portable exact roundtrip: %v", err)
 	}
 }
 func TestCollectionTransactionRollbackIncludesGeneratedPolicy(t *testing.T) {

@@ -288,3 +288,22 @@ If JuiceFS itself fits your (non-video, non-macOS) problem, use it directly — 
 - **Developer setup** (local test workflows, headless CLI, config reference): [`docs/dev-setup.md`](docs/dev-setup.md).
 
 *Non-negotiables, so you don't waste a PR:* no telemetry without opt-in, no proprietary dependencies for self-hosters, no FileProviderExtension (ever — [`docs/no-fileprovider.md`](docs/no-fileprovider.md) is the postmortem), reliability beats novelty.
+
+
+### Catalog metadata portability
+
+The local `juicemount-catalog export` and `restore` commands require an explicit
+library ID and byte, combined-event and projection-row budgets. Schema2 uses
+format1; schema3/4 use format2 (preferences are excluded); schema5 uses format3
+and preserves collection identities, shared grants, tombstones, original
+content retry receipts, historical transaction order and used/reserved quotas.
+Named export output is reserved exclusively with mode0600 and synced with its
+parent directory. Restore reserves a fresh private target and never replaces,
+resumes or adopts an existing database or orphan sidecar.
+
+An imported catalog has inactive operational authority and no imported
+credentials or preferences. First bind an enabled imported person with local
+owner `Bootstrap(create_label=null)`, then issue fresh scoped credentials.
+Later `Recover` rotates that bound authority incarnation. Historical content
+retries still require the actor's current read+edit rights; a historical receipt
+is not current collection state. Export is catalog metadata, not a media backup.

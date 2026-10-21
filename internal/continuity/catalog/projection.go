@@ -80,10 +80,27 @@ func projectionTotal(ctx context.Context, q queryer) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	if portableSchemaVersion(version) == authoritySchemaVersion {
+	if portableSchemaVersion(version) == authoritySchemaVersion || supportsCollections(version) {
 		var policy int64
 		err = q.QueryRowContext(ctx, `SELECT (SELECT count(*) FROM policy_subjects)+(SELECT count(*) FROM policy_grants)`).Scan(&policy)
-		count += policy
+		if err != nil {
+			return 0, err
+		}
+		if supportsCollections(version) {
+			count, err = addCollectionProjectionRows(count, policy)
+		} else {
+			count += policy
+		}
+	}
+	if err != nil {
+		return 0, err
+	}
+	if supportsCollections(version) {
+		extra, e := collectionProjectionTotal(ctx, q)
+		if e != nil {
+			return 0, e
+		}
+		count, err = addCollectionProjectionRows(count, extra)
 	}
 	return count, err
 }
@@ -97,8 +114,11 @@ func projectionDigest(ctx context.Context, q queryer, library continuity.Library
 		return "", 0, err
 	}
 	domain := "juicemount.catalog.projection\x00\x01"
-	if portableSchemaVersion(version) == authoritySchemaVersion {
+	if portableSchemaVersion(version) == authoritySchemaVersion || supportsCollections(version) {
 		domain = "juicemount.catalog.projection\x00\x02"
+	}
+	if supportsCollections(version) {
+		domain = "juicemount.catalog.projection\x00\x03"
 	}
 	_, _ = h.Write([]byte(domain))
 	var count int64
@@ -204,7 +224,7 @@ func projectionDigest(ctx context.Context, q queryer, library continuity.Library
 	if err != nil {
 		return "", 0, err
 	}
-	if portableSchemaVersion(version) == authoritySchemaVersion {
+	if portableSchemaVersion(version) == authoritySchemaVersion || supportsCollections(version) {
 		if err := walkRows(ctx, q, `SELECT `+subjectColumns+` FROM policy_subjects ORDER BY subject_id COLLATE BINARY`, func(rows *sql.Rows) error {
 			sub, err := scanSubject(rows, library)
 			if err != nil {
@@ -221,6 +241,11 @@ func projectionDigest(ctx context.Context, q queryer, library continuity.Library
 			}
 			return emit(0x18, g)
 		}); err != nil {
+			return "", 0, err
+		}
+	}
+	if supportsCollections(version) {
+		if err := walkCollectionProjections(ctx, q, library, emit); err != nil {
 			return "", 0, err
 		}
 	}

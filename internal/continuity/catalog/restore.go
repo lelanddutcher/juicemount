@@ -28,6 +28,9 @@ func restoreCatalog(ctx context.Context, path string, library continuity.Library
 	if err := input.exact(magic); err != nil {
 		return err
 	}
+	if string(magic) == streamMagic3 {
+		return restoreCollections(ctx, path, library, &input, limits, directoryBarrier)
+	}
 	format := 1
 	if string(magic) == streamMagic2 {
 		format = 2
@@ -197,6 +200,17 @@ func (s *Store) replayEvent(ctx context.Context, event eventRow, op Operation, r
 		return 0, err
 	}
 	defer tx.Rollback()
+	if err := s.checkVersion(ctx, tx); err != nil {
+		return 0, err
+	}
+	if supportsCollections(s.version) {
+		if event.library != s.library || op.LibraryID != s.library {
+			return 0, corrupt("metadata replay library")
+		}
+		if err := s.prepareCollectionReplay(ctx, tx); err != nil {
+			return 0, err
+		}
+	}
 	if err := requireIncomplete(ctx, tx); err != nil {
 		return 0, err
 	}
@@ -226,6 +240,9 @@ func (s *Store) replayEvent(ctx context.Context, event eventRow, op Operation, r
 	if _, err := tx.ExecContext(ctx, `INSERT INTO events(sequence,library_id,operation_id,request,payload_sha256,recorded_unix_nano,receipt) VALUES(?,?,?,?,?,?,?)`,
 		event.sequence, event.library, event.id, event.request, event.digest, event.timestamp, event.receipt); err != nil {
 		return 0, formatError(err)
+	}
+	if err := s.checkPaths(); err != nil {
+		return 0, err
 	}
 	if err := ctx.Err(); err != nil {
 		return 0, err

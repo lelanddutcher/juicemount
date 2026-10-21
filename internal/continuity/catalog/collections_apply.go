@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+
+	"github.com/lelanddutcher/juicemount/internal/continuity"
 )
 
 type collectionMutationBinding struct {
@@ -187,10 +189,6 @@ func (d *DiscoveryService) collectionMutationFence(ctx context.Context, b collec
 	return errors.Join(err, d.finishSnapshot(done))
 }
 func (s *Store) applyCollectionContent(ctx context.Context, tx *sql.Tx, op CollectionRequest, data []byte, c credential) (CollectionReceipt, error) {
-	sequence, err := nextSequence(ctx, tx, "collection_events")
-	if err != nil {
-		return CollectionReceipt{}, err
-	}
 	timestamp := s.now().UnixNano()
 	if timestamp <= 0 {
 		return CollectionReceipt{}, invalid("collection time")
@@ -199,10 +197,57 @@ func (s *Store) applyCollectionContent(ctx context.Context, tx *sql.Tx, op Colle
 	if err != nil {
 		return CollectionReceipt{}, err
 	}
-	receipt := CollectionReceipt{1, op.ID, op.CollectionID, CollectionVersion(version)}
+	record := CollectionRecord{1, op, c.subject, CollectionVersion(version), "", timestamp}
+	if op.Kind == "create" || op.Kind == "grants" {
+		record.GeneratedPolicyOperationID = generatedCollectionPolicyID(op.ID)
+	}
+	receipt := CollectionReceipt{1, op.ID, op.CollectionID, record.ResultVersion}
 	receiptBytes, err := CanonicalCollectionReceipt(receipt)
 	if err != nil {
 		return receipt, err
+	}
+	assetCheck := func(asset continuity.AssetID) error { return collectionAssetAllowed(ctx, tx, s.library, c, asset) }
+	policyApply := func(p CollectionPolicyRequest) (int64, CollectionQuotaCounters, error) {
+		return s.applyCollectionPolicy(ctx, tx, p, c.subject, "collection_service", timestamp)
+	}
+	return s.applyCollectionContentStructural(ctx, tx, record, data, receiptBytes, false, nil, assetCheck, policyApply)
+}
+
+// Structural history and live writes share this transaction core. All clocks,
+// random tokens and current-credential checks belong to the live caller. Replay
+// supplies recorded inputs and historical membership checks instead.
+func (s *Store) applyCollectionContentStructural(ctx context.Context, tx *sql.Tx, record CollectionRecord, data, receiptBytes []byte, staged bool, budget *collectionProjectionBudget, assetCheck func(continuity.AssetID) error, policyApply func(CollectionPolicyRequest) (int64, CollectionQuotaCounters, error)) (CollectionReceipt, error) {
+	if assetCheck == nil || policyApply == nil {
+		return CollectionReceipt{}, invalid("collection structural callbacks")
+	}
+	op := record.Request
+	receipt, err := validateRecordedCollectionContent(record, data, receiptBytes, s.library)
+	if err != nil {
+		return CollectionReceipt{}, err
+	}
+	sequence, err := nextSequence(ctx, tx, "collection_events")
+	if err != nil {
+		return receipt, err
+	}
+	timestamp, version, actor := record.RecordedUnixNano, string(record.ResultVersion), record.ActorSubjectID
+	subject, err := readSubject(ctx, tx, s.library, actor)
+	if err != nil {
+		return receipt, err
+	}
+	if !subject.Value.Enabled || subject.Value.Kind != "person" {
+		return receipt, ErrConflict
+	}
+	if err := requireFreshCollectionVersion(ctx, tx, op.CollectionID, record.ResultVersion); err != nil {
+		return receipt, err
+	}
+	if op.Kind != "create" {
+		current, err := readCollectionDefinition(ctx, tx, op.CollectionID)
+		if err != nil {
+			return receipt, err
+		}
+		if current.version != op.ExpectedVersion {
+			return receipt, ErrConflict
+		}
 	}
 	value, err := collectionValue(op)
 	if err != nil {
@@ -213,14 +258,29 @@ func (s *Store) applyCollectionContent(ctx context.Context, tx *sql.Tx, op Colle
 	switch v := value.(type) {
 	case *CreateCollection:
 		_, digest, _ := CanonicalCollectionRequest(op)
-		if _, err := tx.ExecContext(ctx, `INSERT INTO collection_identities(collection_id,library_id,creator_subject_id,creation_operation_id,creation_payload_sha256,policy_generation) VALUES(?,?,?,?,?,0)`, op.CollectionID, s.library, c.subject, op.ID, digest); err != nil {
-			return receipt, ErrConflict
+		if staged {
+			if err := consumeCollectionDeclaration(ctx, tx, s.library, record, digest); err != nil {
+				return receipt, err
+			}
+		} else {
+			if err := budget.take(); err != nil {
+				return receipt, err
+			}
+			if _, err := tx.ExecContext(ctx, `INSERT INTO collection_identities(collection_id,library_id,creator_subject_id,creation_operation_id,creation_payload_sha256,policy_generation) VALUES(?,?,?,?,?,0)`, op.CollectionID, s.library, actor, op.ID, digest); err != nil {
+				return receipt, ErrConflict
+			}
+		}
+		if err := budget.take(); err != nil {
+			return receipt, err
 		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO collection_quota(collection_id,`+collectionQuotaColumns+`) VALUES(?,0,0,0,0,0,0,0,0,0,0,0,0)`, op.CollectionID); err != nil {
 			return receipt, err
 		}
 		for _, entry := range v.Entries {
-			if err := collectionAssetAllowed(ctx, tx, s.library, c, entry.AssetID); err != nil {
+			if err := assetCheck(entry.AssetID); err != nil {
+				return receipt, err
+			}
+			if err := budget.take(); err != nil {
 				return receipt, err
 			}
 			if _, err := tx.ExecContext(ctx, `INSERT INTO collection_entries(entry_id,library_id,collection_id,asset_id,removed,created_sequence,updated_sequence) VALUES(?,?,?,?,0,?,?)`, entry.ID, s.library, op.CollectionID, entry.AssetID, sequence, sequence); err != nil {
@@ -230,9 +290,12 @@ func (s *Store) applyCollectionContent(ctx context.Context, tx *sql.Tx, op Colle
 		delta.Collections = 1
 		delta.ActiveEntries = int64(len(v.Entries))
 		delta.LifetimeEntries = delta.ActiveEntries
-		grant := CollectionGrantValue{c.subject, CollectionGrantScope{"collection", op.CollectionID}, []string{"collections.admin", "collections.edit", "collections.read"}}
+		grant := CollectionGrantValue{actor, CollectionGrantScope{"collection", op.CollectionID}, []string{"collections.admin", "collections.edit", "collections.read"}}
 		p := CollectionPolicyRequest{2, s.library, generatedCollectionPolicyID(op.ID), "collection", op.CollectionID, op.ID, digest, []CollectionGrantChange{{"put", v.CreatorGrantID, nil, &grant}}}
 		policy = &p
+		if err := budget.take(); err != nil {
+			return receipt, err
+		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO collection_definitions(collection_id,kind,name,archived,definition_version,created_sequence,updated_sequence) VALUES(?,'manual',?,0,?,?,?)`, op.CollectionID, v.Name, version, sequence, sequence); err != nil {
 			return receipt, err
 		}
@@ -260,10 +323,13 @@ func (s *Store) applyCollectionContent(ctx context.Context, tx *sql.Tx, op Colle
 		}
 	case *EditCollectionEntries:
 		for _, change := range v.Changes {
-			if err := collectionAssetAllowed(ctx, tx, s.library, c, change.AssetID); err != nil {
+			if err := assetCheck(change.AssetID); err != nil {
 				return receipt, err
 			}
 			if change.Kind == "add" {
+				if err := budget.take(); err != nil {
+					return receipt, err
+				}
 				if _, err := tx.ExecContext(ctx, `INSERT INTO collection_entries(entry_id,library_id,collection_id,asset_id,removed,created_sequence,updated_sequence) VALUES(?,?,?,?,0,?,?)`, change.ID, s.library, op.CollectionID, change.AssetID, sequence, sequence); err != nil {
 					return receipt, ErrConflict
 				}
@@ -288,7 +354,7 @@ func (s *Store) applyCollectionContent(ctx context.Context, tx *sql.Tx, op Colle
 	}
 	var child any
 	if policy != nil {
-		p, change, err := s.applyCollectionPolicy(ctx, tx, *policy, c.subject, "collection_service", timestamp)
+		p, change, err := policyApply(*policy)
 		if err != nil {
 			return receipt, err
 		}
@@ -317,8 +383,11 @@ func (s *Store) applyCollectionContent(ctx context.Context, tx *sql.Tx, op Colle
 		return receipt, err
 	}
 	_, digest, _ := CanonicalCollectionRequest(op)
-	_, err = tx.ExecContext(ctx, `INSERT INTO collection_events(sequence,library_id,actor_subject_id,operation_id,collection_id,request,payload_sha256,receipt,result_version,generated_policy_sequence,recorded_unix_nano) VALUES(?,?,?,?,?,?,?,?,?,?,?)`, sequence, s.library, c.subject, op.ID, op.CollectionID, data, digest, receiptBytes, version, child, timestamp)
+	_, err = tx.ExecContext(ctx, `INSERT INTO collection_events(sequence,library_id,actor_subject_id,operation_id,collection_id,request,payload_sha256,receipt,result_version,generated_policy_sequence,recorded_unix_nano) VALUES(?,?,?,?,?,?,?,?,?,?,?)`, sequence, s.library, actor, op.ID, op.CollectionID, data, digest, receiptBytes, version, child, timestamp)
 	if err != nil {
+		return receipt, err
+	}
+	if err := budget.take(); err != nil {
 		return receipt, err
 	}
 	if err := appendCollectionOrder(ctx, tx, "content_sequence", sequence); err != nil {

@@ -189,8 +189,19 @@ func (s *Store) replayPolicyEvent(ctx context.Context, e eventRow, op PolicyOper
 		return 0, err
 	}
 	defer tx.Rollback()
+	if err := s.checkVersion(ctx, tx); err != nil {
+		return 0, err
+	}
 	if err := requireIncomplete(ctx, tx); err != nil {
 		return 0, err
+	}
+	if supportsCollections(s.version) {
+		if e.library != s.library || op.LibraryID != s.library {
+			return 0, corrupt("legacy collection replay library")
+		}
+		if err := s.prepareCollectionReplay(ctx, tx); err != nil {
+			return 0, err
+		}
 	}
 	if err := s.checkPaths(); err != nil {
 		return 0, err
@@ -207,6 +218,18 @@ func (s *Store) replayPolicyEvent(ctx context.Context, e eventRow, op PolicyOper
 		return 0, err
 	}
 	if err := insertPolicyEvent(ctx, tx, e); err != nil {
+		return 0, err
+	}
+	if supportsCollections(s.version) {
+		if next >= maxRows {
+			return 0, ErrLimit
+		}
+		if err := appendCollectionOrder(ctx, tx, "legacy_sequence", e.sequence); err != nil {
+			return 0, err
+		}
+		next++
+	}
+	if err := s.checkPaths(); err != nil {
 		return 0, err
 	}
 	if err := ctx.Err(); err != nil {

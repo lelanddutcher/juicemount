@@ -89,8 +89,37 @@ func preserveCollectionAdministrator(ctx context.Context, q queryer, id Collecti
 // Applies structural projection changes inside its caller's immediate transaction.
 // Live authorization and the single combined quota plan remain caller-owned.
 func (s *Store) applyCollectionPolicy(ctx context.Context, tx *sql.Tx, op CollectionPolicyRequest, actor SubjectID, administration string, timestamp int64) (int64, CollectionQuotaCounters, error) {
+	_, digest, err := CanonicalCollectionPolicyRequest(op)
+	if err != nil {
+		return 0, CollectionQuotaCounters{}, err
+	}
+	receiptBytes, err := CanonicalCollectionPolicyReceipt(CollectionPolicyReceipt{2, s.library, op.ID, digest, timestamp})
+	if err != nil {
+		return 0, CollectionQuotaCounters{}, err
+	}
+	versions := func(_ int, id CollectionGrantID) (CollectionGrantVersion, error) {
+		v, err := freshCollectionToken(ctx, tx, "cgv_", id)
+		return CollectionGrantVersion(v), err
+	}
+	return s.applyCollectionPolicyStructural(ctx, tx, op, actor, administration, timestamp, receiptBytes, versions, nil)
+}
+
+// This core has no clock, random source, credential or operational-owner lookup.
+// The live wrapper resolves fresh versions at the original per-change point;
+// recorded replay supplies its already-decoded result versions in that slot.
+func (s *Store) applyCollectionPolicyStructural(ctx context.Context, tx *sql.Tx, op CollectionPolicyRequest, actor SubjectID, administration string, timestamp int64, receiptBytes []byte, versions func(int, CollectionGrantID) (CollectionGrantVersion, error), budget *collectionProjectionBudget) (int64, CollectionQuotaCounters, error) {
 	var delta CollectionQuotaCounters
 	request, digest, err := CanonicalCollectionPolicyRequest(op)
+	if err != nil {
+		return 0, delta, err
+	}
+	if versions == nil {
+		return 0, delta, invalid("collection policy versions")
+	}
+	if op.LibraryID != s.library {
+		return 0, delta, invalid("collection policy library")
+	}
+	receipt, err := validateRecordedCollectionPolicyReceipt(op, receiptBytes, timestamp)
 	if err != nil {
 		return 0, delta, err
 	}
@@ -114,7 +143,7 @@ func (s *Store) applyCollectionPolicy(ctx context.Context, tx *sql.Tx, op Collec
 	}
 	results := make([]CollectionGrantResult, 0, len(op.Changes))
 	touched := make(map[SubjectID]bool)
-	for _, change := range op.Changes {
+	for index, change := range op.Changes {
 		prior, readErr := readCollectionGrant(ctx, tx, change.ID)
 		missing := errors.Is(readErr, ErrNotFound)
 		if readErr != nil && !missing {
@@ -151,11 +180,17 @@ func (s *Store) applyCollectionPolicy(ctx context.Context, tx *sql.Tx, op Collec
 				delta.ReservedBytes += CollectionRemovalReserveBytes
 			}
 		}
-		version, err := freshCollectionToken(ctx, tx, "cgv_", change.ID)
+		version, err := versions(index, change.ID)
 		if err != nil {
 			return 0, delta, err
 		}
+		if err := requireFreshCollectionGrantVersion(ctx, tx, change.ID, version); err != nil {
+			return 0, delta, err
+		}
 		if missing {
+			if err := budget.take(); err != nil {
+				return 0, delta, err
+			}
 			_, err = tx.ExecContext(ctx, `INSERT INTO collection_grants(grant_id,library_id,subject_id,scope_kind,collection_id,actions,grant_version,removed,created_sequence,updated_sequence) VALUES(?,?,?,?,?,?,?,0,?,?)`, change.ID, s.library, value.SubjectID, value.Scope.Kind, collectionNullable(value.Scope.CollectionID), actionsBytes(value.Actions), version, sequence, sequence)
 		} else {
 			err = changedOne(tx.ExecContext(ctx, `UPDATE collection_grants SET actions=?,grant_version=?,removed=?,updated_sequence=? WHERE grant_id=? AND grant_version=? AND removed=?`, actionsBytes(value.Actions), version, removed, sequence, change.ID, prior.expected.Version, prior.expected.Removed))
@@ -188,11 +223,6 @@ func (s *Store) applyCollectionPolicy(ctx context.Context, tx *sql.Tx, op Collec
 			return 0, delta, err
 		}
 	}
-	receipt := CollectionPolicyReceipt{2, s.library, op.ID, digest, timestamp}
-	receiptBytes, err := CanonicalCollectionPolicyReceipt(receipt)
-	if err != nil {
-		return 0, delta, err
-	}
 	if op.Category == "security_remove" {
 		if _, err := collectionSecurityRemovalCost(op, receipt); err != nil {
 			return 0, delta, err
@@ -211,6 +241,9 @@ func (s *Store) applyCollectionPolicy(ctx context.Context, tx *sql.Tx, op Collec
 		return 0, delta, err
 	}
 	for _, r := range results {
+		if err := budget.take(); err != nil {
+			return 0, delta, err
+		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO collection_policy_results(policy_sequence,grant_id,result_version,removed) VALUES(?,?,?,?)`, sequence, r.ID, r.Version, r.Removed); err != nil {
 			return 0, delta, err
 		}
