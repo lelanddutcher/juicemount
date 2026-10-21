@@ -274,17 +274,14 @@ func (s *Store) replayCollectionOwnerPolicy(ctx context.Context, record Collecti
 	if err := s.prepareCollectionReplay(ctx, tx); err != nil {
 		return 0, err
 	}
-	// Format4 admits owner attribution against this historical prefix, without
-	// consulting operational authority or the subject's later final state.
-	// Format3 retains its existing replay contract.
-	if supportsSavedQueries(s.version) {
-		operator, err := readSubject(ctx, tx, s.library, record.OperatorSubjectID)
-		if err != nil {
-			return 0, err
-		}
-		if operator.Value.Kind != "person" || !operator.Value.Enabled {
-			return 0, ErrConflict
-		}
+	// Both collection formats admit owner attribution at this historical prefix,
+	// without operational authority or the subject's later final state.
+	operator, err := readSubject(ctx, tx, s.library, record.OperatorSubjectID)
+	if err != nil {
+		return 0, err
+	}
+	if operator.Value.Kind != "person" || !operator.Value.Enabled {
+		return 0, ErrConflict
 	}
 	sequence, delta, err := s.applyRecordedCollectionPolicy(ctx, tx, record, receiptBytes, &budget)
 	if err != nil {
