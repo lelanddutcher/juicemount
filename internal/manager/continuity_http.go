@@ -92,6 +92,15 @@ func (c *Continuity) serveHTTPVersion(w http.ResponseWriter, r *http.Request, ba
 }
 
 func (c *Continuity) serveContinuityHTTP(w http.ResponseWriter, r *http.Request, base string, version int, collections bool) {
+	family := ""
+	if collections {
+		family = "collections"
+	}
+	c.serveContinuityFamilyHTTP(w, r, base, version, family)
+}
+
+// All families share the same admission, transport defenses and original host.
+func (c *Continuity) serveContinuityFamilyHTTP(w http.ResponseWriter, r *http.Request, base string, version int, family string) {
 	start := time.Now()
 	continuityHeaders(w)
 	controller := http.NewResponseController(w)
@@ -108,7 +117,17 @@ func (c *Continuity) serveContinuityHTTP(w http.ResponseWriter, r *http.Request,
 	route := "unknown"
 	if strings.HasPrefix(r.URL.Path, base) {
 		candidate := strings.TrimPrefix(r.URL.Path, base)
-		if collections {
+		if family == "saved_queries" {
+			switch candidate {
+			case "directory", "open", "definition", "execute", "history", "access", "page", "mutate":
+				route = candidate
+			}
+		} else if family == "recents" {
+			switch candidate {
+			case "list", "page":
+				route = candidate
+			}
+		} else if family == "collections" {
 			switch candidate {
 			case "directory", "open", "members", "history", "access", "page", "mutate":
 				route = candidate
@@ -134,8 +153,8 @@ func (c *Continuity) serveContinuityHTTP(w http.ResponseWriter, r *http.Request,
 	outcome := "unavailable"
 	var result catalog.DisclosureResult
 	auditRoute := route
-	if collections {
-		auditRoute = "collections." + route
+	if family != "" {
+		auditRoute = family + "." + route
 	}
 	defer func() {
 		// Fields have fixed shapes. Never log a URL, body, bearer, page token,
@@ -200,7 +219,11 @@ func (c *Continuity) serveContinuityHTTP(w http.ResponseWriter, r *http.Request,
 		fail("deadline")
 		return
 	}
-	if collections {
+	if family == "saved_queries" {
+		result, err = c.dispatchSavedQueryHTTP(ctx, bearer, route, body, output)
+	} else if family == "recents" {
+		result, err = c.dispatchRecentsHTTP(ctx, bearer, route, body, output)
+	} else if family == "collections" {
 		result, err = c.dispatchCollectionHTTP(ctx, bearer, route, body, output)
 	} else {
 		switch route {
@@ -229,7 +252,7 @@ func (c *Continuity) serveContinuityHTTP(w http.ResponseWriter, r *http.Request,
 	}
 	if err != nil {
 		outcome = catalog.DiscoveryErrorCode(err)
-		if collections && errors.Is(err, catalog.ErrCollectionCapacity) {
+		if (family == "collections" || family == "saved_queries") && errors.Is(err, catalog.ErrCollectionCapacity) {
 			outcome = "unavailable"
 		}
 		switch outcome {

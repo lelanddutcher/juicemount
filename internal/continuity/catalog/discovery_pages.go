@@ -10,6 +10,8 @@ import (
 type discoveryWindow struct {
 	family     string
 	collection *collectionReadWindow
+	saved      *savedQueryReadWindow
+	recent     *recentsWindow
 	binding    discoveryBinding
 	version    int
 	request    []byte

@@ -88,6 +88,7 @@ func runConfigured(parent context.Context, args []string, stdin io.Reader, stdou
 	collectionMutationAttempted := false
 	savedQueryMutationAttempted, savedQueryMaintenance := false, false
 	collectionReadCommand, collectionReadAttempted := false, false
+	readLabel := "collection"
 	fail := func(uncertain bool) int {
 		message := "catalog operation failed"
 		if uncertain {
@@ -106,9 +107,9 @@ func runConfigured(parent context.Context, args []string, stdin io.Reader, stdou
 			}
 		}
 		if collectionReadCommand {
-			message = "catalog collection read failed"
+			message = "catalog " + readLabel + " read failed"
 			if collectionReadAttempted {
-				message = "catalog collection read failed; partial output may have been written"
+				message += "; partial output may have been written"
 			}
 		}
 		_ = writeJSON(stderr, struct {
@@ -167,7 +168,7 @@ func runConfigured(parent context.Context, args []string, stdin io.Reader, stdou
 	defer func() {
 		// A query mutation may already be committed. Diagnose its owned stdout
 		// close before the diagnostic descriptor is itself closed by stopOwners.
-		if savedQueryMutationAttempted && ownedStdout != nil {
+		if (savedQueryMutationAttempted || collectionReadCommand && readLabel != "collection") && ownedStdout != nil {
 			if err := ownedStdout.Close(); err != nil {
 				outputCloseFailed = true
 				code = fail(true)
@@ -179,7 +180,7 @@ func runConfigured(parent context.Context, args []string, stdin io.Reader, stdou
 		}
 		if err != nil || ctx.Err() != nil {
 			code = 3
-			if savedQueryMutationAttempted {
+			if savedQueryMutationAttempted || collectionReadCommand && readLabel != "collection" {
 				code = fail(true)
 			}
 		}
@@ -191,7 +192,12 @@ func runConfigured(parent context.Context, args []string, stdin io.Reader, stdou
 		return fail(false)
 	}
 	command := strings.Join(fs.Args(), " ")
-	collectionReadCommand = command == "collection read"
+	collectionReadCommand = command == "collection read" || command == "query read" || command == "recents read"
+	if command == "query read" {
+		readLabel = "saved query"
+	} else if command == "recents read" {
+		readLabel = "recents"
+	}
 	savedQueryMaintenance = command == "init-saved-queries" || command == "upgrade-saved-queries"
 	preferenceMaintenance = command == "init-preferences" || command == "upgrade-preferences" || command == "owner preference prune"
 	if command == "subject new-id" {
@@ -286,6 +292,9 @@ func runConfigured(parent context.Context, args []string, stdin io.Reader, stdou
 	if collectionReadCommand {
 		reader := stdin
 		var input *ownedFile
+		if readLabel != "collection" {
+			input = ownedStdin
+		}
 		if *inputPath != "-" {
 			raw, err := files.input(*inputPath)
 			if err != nil {
@@ -294,15 +303,37 @@ func runConfigured(parent context.Context, args []string, stdin io.Reader, stdou
 			input = owners.track(raw)
 			reader = contextReader{ctx, input}
 		}
-		request, bearer, err := readCollectionQuery(reader, library)
+		var request catalog.CollectionQueryRequest
+		var savedRequest catalog.SavedQueryReadRequest
+		var recentsRequest catalog.RecentsReadRequest
+		var bearer []byte
+		var err error
+		switch command {
+		case "query read":
+			savedRequest, bearer, err = readSavedQueryRead(reader, library)
+		case "recents read":
+			recentsRequest, bearer, err = readRecentsRead(reader, library)
+		default:
+			request, bearer, err = readCollectionQuery(reader, library)
+		}
 		defer clear(bearer)
 		if input != nil {
 			err = errors.Join(err, input.Close())
 		}
+		if readLabel != "collection" && ownedStdin != nil && ownedStdin != input {
+			err = errors.Join(err, ownedStdin.Close())
+		}
 		if err != nil {
 			return fail(false)
 		}
-		collectionReadAttempted, err = runCollectionRead(ctx, s, library, request, bearer, stdout)
+		switch command {
+		case "query read":
+			collectionReadAttempted, err = runSavedQueryRead(ctx, s, library, savedRequest, bearer, stdout)
+		case "recents read":
+			collectionReadAttempted, err = runRecentsRead(ctx, s, library, recentsRequest, bearer, stdout)
+		default:
+			collectionReadAttempted, err = runCollectionRead(ctx, s, library, request, bearer, stdout)
+		}
 		if err != nil {
 			return fail(false)
 		}
