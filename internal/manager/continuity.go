@@ -96,6 +96,10 @@ func (c *Continuity) RegisterRoutes(mux *http.ServeMux, prefix string) (err erro
 	}()
 	base := prefix + "/api/continuity"
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, base+"/v1/collections/") {
+			c.serveContinuityHTTP(w, r, base+"/v1/collections/", 1, true)
+			return
+		}
 		if strings.HasPrefix(r.URL.Path, base+"/v2/") {
 			c.serveHTTPVersion(w, r, base+"/v2/", 2)
 			return

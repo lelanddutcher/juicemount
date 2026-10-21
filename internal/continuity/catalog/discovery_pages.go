@@ -8,16 +8,18 @@ import (
 )
 
 type discoveryWindow struct {
-	binding discoveryBinding
-	version int
-	request []byte
-	created time.Time
-	ordinal uint64
-	tokens  []string
-	bodies  [][]byte
-	charge  int64
-	leases  int
-	retired bool
+	family     string
+	collection *collectionReadWindow
+	binding    discoveryBinding
+	version    int
+	request    []byte
+	created    time.Time
+	ordinal    uint64
+	tokens     []string
+	bodies     [][]byte
+	charge     int64
+	leases     int
+	retired    bool
 }
 type discoveryPage struct {
 	window *discoveryWindow
@@ -82,7 +84,7 @@ func (d *DiscoveryService) leasePage(token string, b discoveryBinding, version i
 	defer d.mu.Unlock()
 	p := d.tokens[token]
 	// No expiration sweep, allocation reservation or eviction before ownership.
-	if p == nil || p.window.version != version || !sameDiscoveryOwner(p.window.binding, b) {
+	if p == nil || p.window.family != "" || p.window.version != version || !sameDiscoveryOwner(p.window.binding, b) {
 		return nil, nil, errDiscoveryRestart
 	}
 	w := p.window

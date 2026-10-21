@@ -519,3 +519,53 @@ Client state/transport/rendering checks use the actual dependency-free module:
 `node --test test/continuity-ui/library.test.cjs`. Those checks do not qualify
 browser integration, storage or release readiness; real Manager browser evidence
 at both prefixes remains a separate acceptance requirement.
+
+`DiscoveryService.QueryCollections` reads schema5 manual collections through the
+same owned, bounded discovery service. `ValidateCollectionQueryRequest` accepts
+explicit directory/open/members/history/access/page shapes; the CLI's canonical
+initial decoder additionally refuses external page requests. These APIs derive
+the person from a current library credential. Manager administration credentials
+and caller-supplied subjects do not provide collection authority.
+
+Directory/open expose the full name, current definition CAS version, a creator
+category and independent read/edit/admin permissions. Directory alone reports
+whether the current person can create. Access requires all three current rights
+and ceilings; it returns active and tombstoned grants with their complete
+`ExpectedCollectionGrant` values for a subsequent real CAS mutation. It includes
+SubjectIDs for that explicit administration purpose, not a people directory.
+Numeric policy generations and historical operation/receipt fields stay private.
+
+Member windows freeze only authorized entry/asset identities, supporting4096
+active and8192 lifetime entries without caching all labels. Each new page resolves
+full labels (up to4096 UTF-8 bytes) and permission-gated heads from its own current
+snapshot. The declared scope is `frozen_membership_current_page`; it does not
+claim all pages' metadata came from one instant. Repeated published pages retain
+identical bytes or require a restart. Hidden membership has no placeholders or
+unfiltered count. Removed-member reads use the same current asset permissions.
+
+History is a typed recent window, omitting grant administration and any entire
+create/entry event with a currently hidden referenced asset. It is capped at1000
+visible items, an8MiB output-build window,8192 examined source events and32MiB of
+canonical source input. Output cutoff is explicitly incomplete; source-work or
+deadline exhaustion returns a fixed error without a partial page. It is not the
+full owner event-stream export.
+
+Collection windows share the64MiB logical service quota, sixteen operations,
+four SQL slots, sixteen windows per person and five-minute monotonic lifetime.
+Lazy continuations pin their window before reserving construction space. Member
+body retention is limited to2MiB; only unleased bodies can be evicted. Evicted
+page tokens remain tombstones until their window retires, so forward traversal
+can progress without rebuilding an old page under its original token. These are
+logical/reserved byte bounds, not Go RSS or SQLite file-size guarantees.
+
+Construction read owners are closed and their SQL slot released before the
+fresh authority fence. A bounded fresh slot checks current person/credential,
+subject authorization generation, collection definition and policy, or the exact
+permitted directory vector. Member replays also check only that page's asset
+versions; unchanged current subject generation preserves its original asset
+rights decision without rebuilding the old grant map. Snapshot cleanup errors,
+expiry and cancellation refuse before the first external write. `Started` means
+an attempted write, including a zero-byte/error result; callers must not append
+another error body. Already disclosed bytes cannot be recalled, and existing
+credential wall-clock rollback limits still apply. `Close` cancels admitted work
+and joins its owners; callers remain responsible for interruptible external I/O.

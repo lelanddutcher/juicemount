@@ -1,0 +1,413 @@
+{
+  "version": 1,
+  "vectors": [
+    {
+      "name": "directory/valid",
+      "library_id": "lib_11111111111111111111111111111111",
+      "input": "{\"version\":1,\"kind\":\"directory\",\"library_id\":\"lib_11111111111111111111111111111111\",\"state\":\"all\",\"page_size\":100}",
+      "valid": true,
+      "expected": {
+        "version": 1,
+        "kind": "directory",
+        "library_id": "lib_11111111111111111111111111111111",
+        "collection_id": "",
+        "state": "all",
+        "page_size": 100,
+        "token": ""
+      }
+    },
+    {
+      "name": "directory/missing-version",
+      "library_id": "lib_11111111111111111111111111111111",
+      "input": "{\"kind\":\"directory\",\"library_id\":\"lib_11111111111111111111111111111111\",\"state\":\"all\",\"page_size\":100}",
+      "valid": false
+    },
+    {
+      "name": "directory/null-version",
+      "library_id": "lib_11111111111111111111111111111111",
+      "input": "{\"version\":null,\"kind\":\"directory\",\"library_id\":\"lib_11111111111111111111111111111111\",\"state\":\"all\",\"page_size\":100}",
+      "valid": false
+    },
+    {
+      "name": "directory/duplicate-version",
+      "library_id": "lib_11111111111111111111111111111111",
+      "input": "{\"version\":1,\"version\":1,\"kind\":\"directory\",\"library_id\":\"lib_11111111111111111111111111111111\",\"state\":\"all\",\"page_size\":100}",
+      "valid": false
+    },
+    {
+      "name": "directory/unknown-field",
+      "library_id": "lib_11111111111111111111111111111111",
+      "input": "{\"version\":1,\"hidden\":false,\"kind\":\"directory\",\"library_id\":\"lib_11111111111111111111111111111111\",\"state\":\"all\",\"page_size\":100}",
+      "valid": false
+    },
+    {
+      "name": "directory/trailing-object",
+      "library_id": "lib_11111111111111111111111111111111",
+      "input": "{\"version\":1,\"kind\":\"directory\",\"library_id\":\"lib_11111111111111111111111111111111\",\"state\":\"all\",\"page_size\":100}{}",
+      "valid": false
+    },
+    {
+      "name": "directory/noncanonical-whitespace",
+      "library_id": "lib_11111111111111111111111111111111",
+      "input": " {\"version\":1,\"kind\":\"directory\",\"library_id\":\"lib_11111111111111111111111111111111\",\"state\":\"all\",\"page_size\":100}",
+      "valid": false
+    },
+    {
+      "name": "directory/wrong-version",
+      "library_id": "lib_11111111111111111111111111111111",
+      "input": "{\"version\":2,\"kind\":\"directory\",\"library_id\":\"lib_11111111111111111111111111111111\",\"state\":\"all\",\"page_size\":100}",
+      "valid": false
+    },
+    {
+      "name": "directory/wrong-library",
+      "library_id": "lib_33333333333333333333333333333333",
+      "input": "{\"version\":1,\"kind\":\"directory\",\"library_id\":\"lib_11111111111111111111111111111111\",\"state\":\"all\",\"page_size\":100}",
+      "valid": false
+    },
+    {
+      "name": "open/valid",
+      "library_id": "lib_11111111111111111111111111111111",
+      "input": "{\"version\":1,\"kind\":\"open\",\"library_id\":\"lib_11111111111111111111111111111111\",\"collection_id\":\"col_22222222222222222222222222222222\"}",
+      "valid": true,
+      "expected": {
+        "version": 1,
+        "kind": "open",
+        "library_id": "lib_11111111111111111111111111111111",
+        "collection_id": "col_22222222222222222222222222222222",
+        "state": "",
+        "page_size": 0,
+        "token": ""
+      }
+    },
+    {
+      "name": "open/missing-version",
+      "library_id": "lib_11111111111111111111111111111111",
+      "input": "{\"kind\":\"open\",\"library_id\":\"lib_11111111111111111111111111111111\",\"collection_id\":\"col_22222222222222222222222222222222\"}",
+      "valid": false
+    },
+    {
+      "name": "open/null-version",
+      "library_id": "lib_11111111111111111111111111111111",
+      "input": "{\"version\":null,\"kind\":\"open\",\"library_id\":\"lib_11111111111111111111111111111111\",\"collection_id\":\"col_22222222222222222222222222222222\"}",
+      "valid": false
+    },
+    {
+      "name": "open/duplicate-version",
+      "library_id": "lib_11111111111111111111111111111111",
+      "input": "{\"version\":1,\"version\":1,\"kind\":\"open\",\"library_id\":\"lib_11111111111111111111111111111111\",\"collection_id\":\"col_22222222222222222222222222222222\"}",
+      "valid": false
+    },
+    {
+      "name": "open/unknown-field",
+      "library_id": "lib_11111111111111111111111111111111",
+      "input": "{\"version\":1,\"hidden\":false,\"kind\":\"open\",\"library_id\":\"lib_11111111111111111111111111111111\",\"collection_id\":\"col_22222222222222222222222222222222\"}",
+      "valid": false
+    },
+    {
+      "name": "open/trailing-object",
+      "library_id": "lib_11111111111111111111111111111111",
+      "input": "{\"version\":1,\"kind\":\"open\",\"library_id\":\"lib_11111111111111111111111111111111\",\"collection_id\":\"col_22222222222222222222222222222222\"}{}",
+      "valid": false
+    },
+    {
+      "name": "open/noncanonical-whitespace",
+      "library_id": "lib_11111111111111111111111111111111",
+      "input": " {\"version\":1,\"kind\":\"open\",\"library_id\":\"lib_11111111111111111111111111111111\",\"collection_id\":\"col_22222222222222222222222222222222\"}",
+      "valid": false
+    },
+    {
+      "name": "open/wrong-version",
+      "library_id": "lib_11111111111111111111111111111111",
+      "input": "{\"version\":2,\"kind\":\"open\",\"library_id\":\"lib_11111111111111111111111111111111\",\"collection_id\":\"col_22222222222222222222222222222222\"}",
+      "valid": false
+    },
+    {
+      "name": "open/wrong-library",
+      "library_id": "lib_33333333333333333333333333333333",
+      "input": "{\"version\":1,\"kind\":\"open\",\"library_id\":\"lib_11111111111111111111111111111111\",\"collection_id\":\"col_22222222222222222222222222222222\"}",
+      "valid": false
+    },
+    {
+      "name": "members-active/valid",
+      "library_id": "lib_11111111111111111111111111111111",
+      "input": "{\"version\":1,\"kind\":\"members\",\"library_id\":\"lib_11111111111111111111111111111111\",\"collection_id\":\"col_22222222222222222222222222222222\",\"state\":\"active\",\"page_size\":100}",
+      "valid": true,
+      "expected": {
+        "version": 1,
+        "kind": "members",
+        "library_id": "lib_11111111111111111111111111111111",
+        "collection_id": "col_22222222222222222222222222222222",
+        "state": "active",
+        "page_size": 100,
+        "token": ""
+      }
+    },
+    {
+      "name": "members-active/missing-version",
+      "library_id": "lib_11111111111111111111111111111111",
+      "input": "{\"kind\":\"members\",\"library_id\":\"lib_11111111111111111111111111111111\",\"collection_id\":\"col_22222222222222222222222222222222\",\"state\":\"active\",\"page_size\":100}",
+      "valid": false
+    },
+    {
+      "name": "members-active/null-version",
+      "library_id": "lib_11111111111111111111111111111111",
+      "input": "{\"version\":null,\"kind\":\"members\",\"library_id\":\"lib_11111111111111111111111111111111\",\"collection_id\":\"col_22222222222222222222222222222222\",\"state\":\"active\",\"page_size\":100}",
+      "valid": false
+    },
+    {
+      "name": "members-active/duplicate-version",
+      "library_id": "lib_11111111111111111111111111111111",
+      "input": "{\"version\":1,\"version\":1,\"kind\":\"members\",\"library_id\":\"lib_11111111111111111111111111111111\",\"collection_id\":\"col_22222222222222222222222222222222\",\"state\":\"active\",\"page_size\":100}",
+      "valid": false
+    },
+    {
+      "name": "members-active/unknown-field",
+      "library_id": "lib_11111111111111111111111111111111",
+      "input": "{\"version\":1,\"hidden\":false,\"kind\":\"members\",\"library_id\":\"lib_11111111111111111111111111111111\",\"collection_id\":\"col_22222222222222222222222222222222\",\"state\":\"active\",\"page_size\":100}",
+      "valid": false
+    },
+    {
+      "name": "members-active/trailing-object",
+      "library_id": "lib_11111111111111111111111111111111",
+      "input": "{\"version\":1,\"kind\":\"members\",\"library_id\":\"lib_11111111111111111111111111111111\",\"collection_id\":\"col_22222222222222222222222222222222\",\"state\":\"active\",\"page_size\":100}{}",
+      "valid": false
+    },
+    {
+      "name": "members-active/noncanonical-whitespace",
+      "library_id": "lib_11111111111111111111111111111111",
+      "input": " {\"version\":1,\"kind\":\"members\",\"library_id\":\"lib_11111111111111111111111111111111\",\"collection_id\":\"col_22222222222222222222222222222222\",\"state\":\"active\",\"page_size\":100}",
+      "valid": false
+    },
+    {
+      "name": "members-active/wrong-version",
+      "library_id": "lib_11111111111111111111111111111111",
+      "input": "{\"version\":2,\"kind\":\"members\",\"library_id\":\"lib_11111111111111111111111111111111\",\"collection_id\":\"col_22222222222222222222222222222222\",\"state\":\"active\",\"page_size\":100}",
+      "valid": false
+    },
+    {
+      "name": "members-active/wrong-library",
+      "library_id": "lib_33333333333333333333333333333333",
+      "input": "{\"version\":1,\"kind\":\"members\",\"library_id\":\"lib_11111111111111111111111111111111\",\"collection_id\":\"col_22222222222222222222222222222222\",\"state\":\"active\",\"page_size\":100}",
+      "valid": false
+    },
+    {
+      "name": "members-removed/valid",
+      "library_id": "lib_11111111111111111111111111111111",
+      "input": "{\"version\":1,\"kind\":\"members\",\"library_id\":\"lib_11111111111111111111111111111111\",\"collection_id\":\"col_22222222222222222222222222222222\",\"state\":\"removed\",\"page_size\":1}",
+      "valid": true,
+      "expected": {
+        "version": 1,
+        "kind": "members",
+        "library_id": "lib_11111111111111111111111111111111",
+        "collection_id": "col_22222222222222222222222222222222",
+        "state": "removed",
+        "page_size": 1,
+        "token": ""
+      }
+    },
+    {
+      "name": "members-removed/missing-version",
+      "library_id": "lib_11111111111111111111111111111111",
+      "input": "{\"kind\":\"members\",\"library_id\":\"lib_11111111111111111111111111111111\",\"collection_id\":\"col_22222222222222222222222222222222\",\"state\":\"removed\",\"page_size\":1}",
+      "valid": false
+    },
+    {
+      "name": "members-removed/null-version",
+      "library_id": "lib_11111111111111111111111111111111",
+      "input": "{\"version\":null,\"kind\":\"members\",\"library_id\":\"lib_11111111111111111111111111111111\",\"collection_id\":\"col_22222222222222222222222222222222\",\"state\":\"removed\",\"page_size\":1}",
+      "valid": false
+    },
+    {
+      "name": "members-removed/duplicate-version",
+      "library_id": "lib_11111111111111111111111111111111",
+      "input": "{\"version\":1,\"version\":1,\"kind\":\"members\",\"library_id\":\"lib_11111111111111111111111111111111\",\"collection_id\":\"col_22222222222222222222222222222222\",\"state\":\"removed\",\"page_size\":1}",
+      "valid": false
+    },
+    {
+      "name": "members-removed/unknown-field",
+      "library_id": "lib_11111111111111111111111111111111",
+      "input": "{\"version\":1,\"hidden\":false,\"kind\":\"members\",\"library_id\":\"lib_11111111111111111111111111111111\",\"collection_id\":\"col_22222222222222222222222222222222\",\"state\":\"removed\",\"page_size\":1}",
+      "valid": false
+    },
+    {
+      "name": "members-removed/trailing-object",
+      "library_id": "lib_11111111111111111111111111111111",
+      "input": "{\"version\":1,\"kind\":\"members\",\"library_id\":\"lib_11111111111111111111111111111111\",\"collection_id\":\"col_22222222222222222222222222222222\",\"state\":\"removed\",\"page_size\":1}{}",
+      "valid": false
+    },
+    {
+      "name": "members-removed/noncanonical-whitespace",
+      "library_id": "lib_11111111111111111111111111111111",
+      "input": " {\"version\":1,\"kind\":\"members\",\"library_id\":\"lib_11111111111111111111111111111111\",\"collection_id\":\"col_22222222222222222222222222222222\",\"state\":\"removed\",\"page_size\":1}",
+      "valid": false
+    },
+    {
+      "name": "members-removed/wrong-version",
+      "library_id": "lib_11111111111111111111111111111111",
+      "input": "{\"version\":2,\"kind\":\"members\",\"library_id\":\"lib_11111111111111111111111111111111\",\"collection_id\":\"col_22222222222222222222222222222222\",\"state\":\"removed\",\"page_size\":1}",
+      "valid": false
+    },
+    {
+      "name": "members-removed/wrong-library",
+      "library_id": "lib_33333333333333333333333333333333",
+      "input": "{\"version\":1,\"kind\":\"members\",\"library_id\":\"lib_11111111111111111111111111111111\",\"collection_id\":\"col_22222222222222222222222222222222\",\"state\":\"removed\",\"page_size\":1}",
+      "valid": false
+    },
+    {
+      "name": "history/valid",
+      "library_id": "lib_11111111111111111111111111111111",
+      "input": "{\"version\":1,\"kind\":\"history\",\"library_id\":\"lib_11111111111111111111111111111111\",\"collection_id\":\"col_22222222222222222222222222222222\",\"page_size\":100}",
+      "valid": true,
+      "expected": {
+        "version": 1,
+        "kind": "history",
+        "library_id": "lib_11111111111111111111111111111111",
+        "collection_id": "col_22222222222222222222222222222222",
+        "state": "",
+        "page_size": 100,
+        "token": ""
+      }
+    },
+    {
+      "name": "history/missing-version",
+      "library_id": "lib_11111111111111111111111111111111",
+      "input": "{\"kind\":\"history\",\"library_id\":\"lib_11111111111111111111111111111111\",\"collection_id\":\"col_22222222222222222222222222222222\",\"page_size\":100}",
+      "valid": false
+    },
+    {
+      "name": "history/null-version",
+      "library_id": "lib_11111111111111111111111111111111",
+      "input": "{\"version\":null,\"kind\":\"history\",\"library_id\":\"lib_11111111111111111111111111111111\",\"collection_id\":\"col_22222222222222222222222222222222\",\"page_size\":100}",
+      "valid": false
+    },
+    {
+      "name": "history/duplicate-version",
+      "library_id": "lib_11111111111111111111111111111111",
+      "input": "{\"version\":1,\"version\":1,\"kind\":\"history\",\"library_id\":\"lib_11111111111111111111111111111111\",\"collection_id\":\"col_22222222222222222222222222222222\",\"page_size\":100}",
+      "valid": false
+    },
+    {
+      "name": "history/unknown-field",
+      "library_id": "lib_11111111111111111111111111111111",
+      "input": "{\"version\":1,\"hidden\":false,\"kind\":\"history\",\"library_id\":\"lib_11111111111111111111111111111111\",\"collection_id\":\"col_22222222222222222222222222222222\",\"page_size\":100}",
+      "valid": false
+    },
+    {
+      "name": "history/trailing-object",
+      "library_id": "lib_11111111111111111111111111111111",
+      "input": "{\"version\":1,\"kind\":\"history\",\"library_id\":\"lib_11111111111111111111111111111111\",\"collection_id\":\"col_22222222222222222222222222222222\",\"page_size\":100}{}",
+      "valid": false
+    },
+    {
+      "name": "history/noncanonical-whitespace",
+      "library_id": "lib_11111111111111111111111111111111",
+      "input": " {\"version\":1,\"kind\":\"history\",\"library_id\":\"lib_11111111111111111111111111111111\",\"collection_id\":\"col_22222222222222222222222222222222\",\"page_size\":100}",
+      "valid": false
+    },
+    {
+      "name": "history/wrong-version",
+      "library_id": "lib_11111111111111111111111111111111",
+      "input": "{\"version\":2,\"kind\":\"history\",\"library_id\":\"lib_11111111111111111111111111111111\",\"collection_id\":\"col_22222222222222222222222222222222\",\"page_size\":100}",
+      "valid": false
+    },
+    {
+      "name": "history/wrong-library",
+      "library_id": "lib_33333333333333333333333333333333",
+      "input": "{\"version\":1,\"kind\":\"history\",\"library_id\":\"lib_11111111111111111111111111111111\",\"collection_id\":\"col_22222222222222222222222222222222\",\"page_size\":100}",
+      "valid": false
+    },
+    {
+      "name": "access/valid",
+      "library_id": "lib_11111111111111111111111111111111",
+      "input": "{\"version\":1,\"kind\":\"access\",\"library_id\":\"lib_11111111111111111111111111111111\",\"collection_id\":\"col_22222222222222222222222222222222\",\"page_size\":100}",
+      "valid": true,
+      "expected": {
+        "version": 1,
+        "kind": "access",
+        "library_id": "lib_11111111111111111111111111111111",
+        "collection_id": "col_22222222222222222222222222222222",
+        "state": "",
+        "page_size": 100,
+        "token": ""
+      }
+    },
+    {
+      "name": "access/missing-version",
+      "library_id": "lib_11111111111111111111111111111111",
+      "input": "{\"kind\":\"access\",\"library_id\":\"lib_11111111111111111111111111111111\",\"collection_id\":\"col_22222222222222222222222222222222\",\"page_size\":100}",
+      "valid": false
+    },
+    {
+      "name": "access/null-version",
+      "library_id": "lib_11111111111111111111111111111111",
+      "input": "{\"version\":null,\"kind\":\"access\",\"library_id\":\"lib_11111111111111111111111111111111\",\"collection_id\":\"col_22222222222222222222222222222222\",\"page_size\":100}",
+      "valid": false
+    },
+    {
+      "name": "access/duplicate-version",
+      "library_id": "lib_11111111111111111111111111111111",
+      "input": "{\"version\":1,\"version\":1,\"kind\":\"access\",\"library_id\":\"lib_11111111111111111111111111111111\",\"collection_id\":\"col_22222222222222222222222222222222\",\"page_size\":100}",
+      "valid": false
+    },
+    {
+      "name": "access/unknown-field",
+      "library_id": "lib_11111111111111111111111111111111",
+      "input": "{\"version\":1,\"hidden\":false,\"kind\":\"access\",\"library_id\":\"lib_11111111111111111111111111111111\",\"collection_id\":\"col_22222222222222222222222222222222\",\"page_size\":100}",
+      "valid": false
+    },
+    {
+      "name": "access/trailing-object",
+      "library_id": "lib_11111111111111111111111111111111",
+      "input": "{\"version\":1,\"kind\":\"access\",\"library_id\":\"lib_11111111111111111111111111111111\",\"collection_id\":\"col_22222222222222222222222222222222\",\"page_size\":100}{}",
+      "valid": false
+    },
+    {
+      "name": "access/noncanonical-whitespace",
+      "library_id": "lib_11111111111111111111111111111111",
+      "input": " {\"version\":1,\"kind\":\"access\",\"library_id\":\"lib_11111111111111111111111111111111\",\"collection_id\":\"col_22222222222222222222222222222222\",\"page_size\":100}",
+      "valid": false
+    },
+    {
+      "name": "access/wrong-version",
+      "library_id": "lib_11111111111111111111111111111111",
+      "input": "{\"version\":2,\"kind\":\"access\",\"library_id\":\"lib_11111111111111111111111111111111\",\"collection_id\":\"col_22222222222222222222222222222222\",\"page_size\":100}",
+      "valid": false
+    },
+    {
+      "name": "access/wrong-library",
+      "library_id": "lib_33333333333333333333333333333333",
+      "input": "{\"version\":1,\"kind\":\"access\",\"library_id\":\"lib_11111111111111111111111111111111\",\"collection_id\":\"col_22222222222222222222222222222222\",\"page_size\":100}",
+      "valid": false
+    },
+    {
+      "name": "page/forbidden-initial",
+      "library_id": "lib_11111111111111111111111111111111",
+      "input": "{\"version\":1,\"kind\":\"page\",\"library_id\":\"lib_11111111111111111111111111111111\",\"token\":\"page1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}",
+      "valid": false
+    },
+    {
+      "name": "directory/page-size-0",
+      "library_id": "lib_11111111111111111111111111111111",
+      "input": "{\"version\":1,\"kind\":\"directory\",\"library_id\":\"lib_11111111111111111111111111111111\",\"state\":\"all\",\"page_size\":0}",
+      "valid": false
+    },
+    {
+      "name": "directory/page-size-101",
+      "library_id": "lib_11111111111111111111111111111111",
+      "input": "{\"version\":1,\"kind\":\"directory\",\"library_id\":\"lib_11111111111111111111111111111111\",\"state\":\"all\",\"page_size\":101}",
+      "valid": false
+    },
+    {
+      "name": "open/unused-page-size",
+      "library_id": "lib_11111111111111111111111111111111",
+      "input": "{\"version\":1,\"kind\":\"open\",\"library_id\":\"lib_11111111111111111111111111111111\",\"collection_id\":\"col_22222222222222222222222222222222\",\"page_size\":1}",
+      "valid": false
+    },
+    {
+      "name": "members/invalid-state",
+      "library_id": "lib_11111111111111111111111111111111",
+      "input": "{\"version\":1,\"kind\":\"members\",\"library_id\":\"lib_11111111111111111111111111111111\",\"collection_id\":\"col_22222222222222222222222222222222\",\"state\":\"all\",\"page_size\":100}",
+      "valid": false
+    }
+  ]
+}

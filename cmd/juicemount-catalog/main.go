@@ -86,6 +86,7 @@ func runConfigured(parent context.Context, args []string, stdin io.Reader, stdou
 	outputCloseFailed := false
 	preferenceMaintenance := false
 	collectionMutationAttempted := false
+	collectionReadCommand, collectionReadAttempted := false, false
 	fail := func(uncertain bool) int {
 		message := "catalog operation failed"
 		if uncertain {
@@ -97,12 +98,19 @@ func runConfigured(parent context.Context, args []string, stdin io.Reader, stdou
 				message = "catalog collection outcome uncertain; retry same exact request or refresh current state"
 			}
 		}
+		if collectionReadCommand {
+			message = "catalog collection read failed"
+			if collectionReadAttempted {
+				message = "catalog collection read failed; partial output may have been written"
+			}
+		}
 		_ = writeJSON(stderr, struct {
 			Error             string `json:"error"`
 			OperationID       string `json:"operation_id,omitempty"`
 			Selector          string `json:"selector,omitempty"`
 			OutputCloseFailed bool   `json:"output_close_failed,omitempty"`
-		}{message, knownOperationID, knownSelector, outputCloseFailed})
+			PartialOutput     bool   `json:"partial_output,omitempty"`
+		}{message, knownOperationID, knownSelector, outputCloseFailed, collectionReadAttempted})
 		return 3
 	}
 	fs := flag.NewFlagSet("juicemount-catalog", flag.ContinueOnError)
@@ -162,6 +170,7 @@ func runConfigured(parent context.Context, args []string, stdin io.Reader, stdou
 		return fail(false)
 	}
 	command := strings.Join(fs.Args(), " ")
+	collectionReadCommand = command == "collection read"
 	preferenceMaintenance = command == "init-preferences" || command == "upgrade-preferences" || command == "owner preference prune"
 	if command == "subject new-id" {
 		id, err := catalog.NewSubjectID()
@@ -242,6 +251,31 @@ func runConfigured(parent context.Context, args []string, stdin io.Reader, stdou
 		return fail(false)
 	}
 	if command == "init-authority" || command == "init-preferences" || command == "init-collections" {
+		return 0
+	}
+	if collectionReadCommand {
+		reader := stdin
+		var input *ownedFile
+		if *inputPath != "-" {
+			raw, err := files.input(*inputPath)
+			if err != nil {
+				return fail(false)
+			}
+			input = owners.track(raw)
+			reader = contextReader{ctx, input}
+		}
+		request, bearer, err := readCollectionQuery(reader, library)
+		defer clear(bearer)
+		if input != nil {
+			err = errors.Join(err, input.Close())
+		}
+		if err != nil {
+			return fail(false)
+		}
+		collectionReadAttempted, err = runCollectionRead(ctx, s, library, request, bearer, stdout)
+		if err != nil {
+			return fail(false)
+		}
 		return 0
 	}
 	if command == "collection mutate" {

@@ -88,6 +88,10 @@ func (c *Continuity) serveHTTP(w http.ResponseWriter, r *http.Request, base stri
 }
 
 func (c *Continuity) serveHTTPVersion(w http.ResponseWriter, r *http.Request, base string, version int) {
+	c.serveContinuityHTTP(w, r, base, version, false)
+}
+
+func (c *Continuity) serveContinuityHTTP(w http.ResponseWriter, r *http.Request, base string, version int, collections bool) {
 	start := time.Now()
 	continuityHeaders(w)
 	controller := http.NewResponseController(w)
@@ -104,7 +108,12 @@ func (c *Continuity) serveHTTPVersion(w http.ResponseWriter, r *http.Request, ba
 	route := "unknown"
 	if strings.HasPrefix(r.URL.Path, base) {
 		candidate := strings.TrimPrefix(r.URL.Path, base)
-		if version == 1 {
+		if collections {
+			switch candidate {
+			case "directory", "open", "members", "history", "access", "page", "mutate":
+				route = candidate
+			}
+		} else if version == 1 {
 			switch candidate {
 			case "search", "asset", "revisions", "history", "relationships", "locations", "counts", "page":
 				route = candidate
@@ -124,6 +133,10 @@ func (c *Continuity) serveHTTPVersion(w http.ResponseWriter, r *http.Request, ba
 	requestID := hex.EncodeToString(randomID[:])
 	outcome := "unavailable"
 	var result catalog.DisclosureResult
+	auditRoute := route
+	if collections {
+		auditRoute = "collections." + route
+	}
 	defer func() {
 		// Fields have fixed shapes. Never log a URL, body, bearer, page token,
 		// raw error, query counts, or any value before the release fence.
@@ -133,7 +146,7 @@ func (c *Continuity) serveHTTPVersion(w http.ResponseWriter, r *http.Request, ba
 			Selector  string            `json:"selector"`
 			Route     string            `json:"route"`
 			Outcome   string            `json:"outcome"`
-		}{requestID, result.SubjectID, result.Selector, route, outcome})
+		}{requestID, result.SubjectID, result.Selector, auditRoute, outcome})
 		log.Printf("continuity %s", record)
 	}()
 	if !c.admit() {
@@ -187,31 +200,38 @@ func (c *Continuity) serveHTTPVersion(w http.ResponseWriter, r *http.Request, ba
 		fail("deadline")
 		return
 	}
-	switch route {
-	case "select", "clear":
-		request, decodeErr := decodeContinuityPreference(route, body)
-		if decodeErr != nil {
-			fail("invalid")
-			return
+	if collections {
+		result, err = c.dispatchCollectionHTTP(ctx, bearer, route, body, output)
+	} else {
+		switch route {
+		case "select", "clear":
+			request, decodeErr := decodeContinuityPreference(route, body)
+			if decodeErr != nil {
+				fail("invalid")
+				return
+			}
+			result, err = c.service.RecordPreference(ctx, bearer, request, output)
+		case "preference":
+			request, decodeErr := decodeContinuityPreferenceState(body)
+			if decodeErr != nil {
+				fail("invalid")
+				return
+			}
+			result, err = c.service.PreferenceState(ctx, bearer, request, output)
+		default:
+			request, decodeErr := decodeContinuityRequestVersion(route, body, version)
+			if decodeErr != nil {
+				fail("invalid")
+				return
+			}
+			result, err = c.service.Query(ctx, bearer, request, output)
 		}
-		result, err = c.service.RecordPreference(ctx, bearer, request, output)
-	case "preference":
-		request, decodeErr := decodeContinuityPreferenceState(body)
-		if decodeErr != nil {
-			fail("invalid")
-			return
-		}
-		result, err = c.service.PreferenceState(ctx, bearer, request, output)
-	default:
-		request, decodeErr := decodeContinuityRequestVersion(route, body, version)
-		if decodeErr != nil {
-			fail("invalid")
-			return
-		}
-		result, err = c.service.Query(ctx, bearer, request, output)
 	}
 	if err != nil {
 		outcome = catalog.DiscoveryErrorCode(err)
+		if collections && errors.Is(err, catalog.ErrCollectionCapacity) {
+			outcome = "unavailable"
+		}
 		switch outcome {
 		case "invalid", "unauthenticated", "not_found", "restart_query", "conflict", "expired_request", "work_budget", "busy", "unavailable", "deadline":
 		default:
