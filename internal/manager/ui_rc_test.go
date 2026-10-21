@@ -90,7 +90,7 @@ func TestManagerRCAssetsShareCurrentCacheBuster(t *testing.T) {
 	if style[1] != app[1] {
 		t.Fatalf("Manager asset cache busters differ: style=%q app=%q", style[1], app[1])
 	}
-	if style[1] != "0.5.0-continuity1" {
+	if style[1] != "0.5.0-collections1" {
 		t.Fatalf("Manager asset cache buster = %q, want current RC", style[1])
 	}
 }
@@ -381,7 +381,7 @@ func TestManagerLibraryScopedSurface(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, marker := range []string{`data-tab-link="library"`, `id="library-pane"`, `id="library-credential" type="password"`, `id="library-status" class="library-status" role="status"`, `id="library-search-form"`, `id="library-inspector-body"`, `Access credential`, `The credential stays in this tab’s memory`} {
+	for _, marker := range []string{`data-tab-link="library"`, `id="library-pane"`, `id="library-credential" type="password"`, `id="library-status" class="library-status" role="status"`, `id="library-search-form"`, `id="library-inspector-body"`, `Access credential`, `The credential stays in this tab’s memory`, `id="library-view-assets"`, `id="library-view-collections"`, `id="library-collections-panel"`, `id="library-collections-body"`, `id="library-picker-bar"`, `aria-label="Library view"`} {
 		if !strings.Contains(string(indexRaw), marker) {
 			t.Errorf("Library markup missing %q", marker)
 		}
@@ -394,6 +394,17 @@ func TestManagerLibraryScopedSurface(t *testing.T) {
 	for _, forbidden := range []string{"localStorage", "sessionStorage", "innerHTML", "console.", "indexedDB", "document.cookie"} {
 		if strings.Contains(library, forbidden) {
 			t.Errorf("Library must not use %q", forbidden)
+		}
+	}
+	if !strings.Contains(library, `root.ManagerLibrary = { init: api.init, setActive: api.setActive }`) {
+		t.Fatal("Library browser export must retain the single private connection owner")
+	}
+	if strings.Count(string(indexRaw), `id="library-credential"`) != 1 {
+		t.Fatal("Collections must share the existing Library credential input")
+	}
+	for _, marker := range []string{"Use selection as temporary context", "Share collection", "Restore access entry", "Remove from collection", "Retry same action", "Recorded nanoseconds"} {
+		if !strings.Contains(library, marker) {
+			t.Errorf("Collections workflow missing %q", marker)
 		}
 	}
 	if strings.Index(string(indexRaw), `src="library.js?`) > strings.Index(string(indexRaw), `src="app.js?`) {

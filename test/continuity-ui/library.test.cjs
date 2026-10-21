@@ -373,3 +373,33 @@ test('uncertain retry cancels a held context proof without leaving access recove
     assert.equal(f.client.snapshot().contexts[0].label, 'Recovered fresh context'); assert.doesNotMatch(JSON.stringify(f.client.snapshot()), /OLD cancelled proof/);
   } finally { heldProof.resolve(stale()); if (returning) await returning; f.client.disconnect(); }
 }));
+
+test('personal status admission cannot overwrite an already dispatched collection action', async () => {
+  const heldStatus = deferred(), statusEntered = deferred(), heldMutation = deferred(), mutationEntered = deferred(); let holdStatus = false, request;
+  const collectionID = 'col_' + '1'.repeat(32);
+  const definition = { collection_id: collectionID, kind: 'manual', name: 'Shared', archived: false, definition_version: 'cv_' + '1'.repeat(32), creator: 'you', permissions: { read: true, edit: true, admin: true } };
+  const lists = (kind, values) => ({ version: 1, kind, collection: kind === 'directory' ? null : definition, ...(kind === 'directory' ? { can_create: true } : { state: 'active' }), items: values, matched_count: values.length, count_scope: kind === 'directory' ? 'frozen_window' : 'frozen_visible_membership', window_complete: true, next_page_token: null, sort_version: 'collections1', snapshot_scope: kind === 'directory' ? 'frozen_snapshot' : 'frozen_membership_current_page' });
+  const f = fixture(call => {
+    if (call.route === 'v2/preference' && holdStatus) { statusEntered.resolve(); return heldStatus.promise; }
+    if (call.route === 'v1/collections/open') return json({ version: 1, kind: 'collection', collection: definition });
+    if (call.route === 'v1/collections/members') return json(lists('members', []));
+    if (call.route === 'v1/collections/directory') return json(lists('directory', [definition]));
+    if (call.route === 'v1/collections/mutate') { request = call.body; mutationEntered.resolve(); return heldMutation.promise; }
+    return ordinary(call);
+  });
+  await connected(f); await f.client.inspect(A); await f.client.openCollection(collectionID);
+  holdStatus = true; const personal = f.client.remember(); await statusEntered.promise;
+  const shared = f.client.renameCollection('Changed'); await mutationEntered.promise;
+  heldStatus.resolve(json({ version: 2, asset_id: A, selection_token: null })); await personal;
+  const personalCalls = f.calls.filter(call => call.route === 'v2/select').length, collectionStillOwns = f.client.snapshot().pendingCollection;
+  heldMutation.resolve(json({ version: 1, operation_id: request.operation_id, collection_id: collectionID, result_version: 'cv_' + '2'.repeat(32) })); await shared;
+  assert.equal(personalCalls, 0, 'personal preflight must recheck the global mutation owner');
+  assert.equal(collectionStillOwns, true);
+  assert.equal(f.client.snapshot().pending, false);
+});
+
+test('public inspector snapshot keeps continuation opaque without disabling explicit More', async () => {
+  const f = fixture(call => call.route === 'v1/revisions' ? json(collection([], { version: 1, kind: 'revisions', matched_count: 1, next_page_token: pageToken('c'), sort_version: 'discovery1' })) : call.route === 'v1/page' ? json(collection([], { version: 1, kind: 'revisions', matched_count: 1, sort_version: 'discovery1' })) : ordinary(call));
+  await connected(f); await f.client.inspect(A); assert.equal(f.client.snapshot().sections.revisions.next, true); assert.doesNotMatch(JSON.stringify(f.client.snapshot()), /page1_/);
+  await f.client.loadSection('revisions', true); assert.equal(f.calls.at(-1).body.token, pageToken('c')); assert.equal(f.client.snapshot().sections.revisions.next, false);
+});
