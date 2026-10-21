@@ -133,7 +133,7 @@ func (s *Store) applyCollectionPolicyStructural(ctx context.Context, tx *sql.Tx,
 		return 0, delta, invalid("collection policy administration")
 	}
 	if op.CollectionID != "" && administration == "local_owner" {
-		if _, err := readCollectionDefinition(ctx, tx, op.CollectionID); err != nil {
+		if _, err := readAnyCollectionDefinition(ctx, tx, op.CollectionID); err != nil {
 			return 0, delta, err
 		}
 	}

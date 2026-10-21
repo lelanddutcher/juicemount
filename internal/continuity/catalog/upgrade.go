@@ -58,6 +58,10 @@ func UpgradeCollections(ctx context.Context, path string, library continuity.Lib
 	return upgradeCatalogVersion(ctx, path, library, collectionsSchemaVersion, syncParent)
 }
 
+func UpgradeSavedQueries(ctx context.Context, path string, library continuity.LibraryID) error {
+	return upgradeCatalogVersion(ctx, path, library, savedQueriesSchemaVersion, syncParent)
+}
+
 func upgradeCatalogVersion(ctx context.Context, input string, expectedLibrary continuity.LibraryID, target int, directoryBarrier func(string) error) (resultErr error) {
 	if expectedLibrary.Validate() != nil {
 		return invalid("expected library identity")
@@ -100,6 +104,9 @@ func upgradeCatalogVersion(ctx context.Context, input string, expectedLibrary co
 	if library != expectedLibrary {
 		return invalid("upgrade library mismatch")
 	}
+	if target == savedQueriesSchemaVersion && initialVersion != 5 && initialVersion != 6 {
+		return ErrUpgradeRequired
+	}
 	if target == collectionsSchemaVersion && initialVersion != 4 && initialVersion != 5 {
 		return ErrUpgradeRequired
 	}
@@ -136,6 +143,9 @@ func upgradeCatalogVersion(ctx context.Context, input string, expectedLibrary co
 	}
 	if library != expectedLibrary {
 		return invalid("upgrade library mismatch")
+	}
+	if target == savedQueriesSchemaVersion && version != 5 && version != 6 {
+		return ErrUpgradeRequired
 	}
 	if target == collectionsSchemaVersion && version != 4 && version != 5 {
 		return ErrUpgradeRequired
@@ -231,6 +241,21 @@ func upgradeCatalogVersion(ctx context.Context, input string, expectedLibrary co
 		}
 		if actual != library || current != 5 {
 			return corrupt("collection migration identity")
+		}
+		if err := checkIntegrity(ctx, tx); err != nil {
+			return err
+		}
+	}
+	if target == savedQueriesSchemaVersion && version == 5 {
+		if err := initializeSavedQueries(ctx, tx); err != nil {
+			return err
+		}
+		actual, current, err := recognizeSchema(ctx, tx, false)
+		if err != nil {
+			return err
+		}
+		if actual != library || current != 6 {
+			return corrupt("saved query migration identity")
 		}
 		if err := checkIntegrity(ctx, tx); err != nil {
 			return err

@@ -267,6 +267,13 @@ func requireAdminCodec(ctx context.Context, q queryer, id, expected string) erro
 }
 
 func checkCollectionState(ctx context.Context, q queryer, library continuity.LibraryID) error {
+	version, err := catalogVersion(ctx, q)
+	if err != nil {
+		return err
+	}
+	if supportsSavedQueries(version) {
+		return checkSavedQueryState(ctx, q, library)
+	}
 	if _, err := readCollectionQuota(ctx, q, ""); err != nil {
 		return err
 	}
@@ -302,7 +309,7 @@ func checkCollectionState(ctx context.Context, q queryer, library continuity.Lib
 	}
 
 	var invalidRows int
-	err := q.QueryRowContext(ctx, `SELECT
+	err = q.QueryRowContext(ctx, `SELECT
  (SELECT count(*) FROM catalog_credentials c WHERE NOT EXISTS(SELECT 1 FROM credential_codecs d WHERE d.selector=c.selector))+
  (SELECT count(*) FROM catalog_admin_events a WHERE NOT EXISTS(SELECT 1 FROM catalog_admin_codecs d WHERE d.operation_id=a.operation_id))+
  (SELECT count(*) FROM collection_identities i WHERE i.library_id<>? OR NOT EXISTS(SELECT 1 FROM collection_definitions d WHERE d.collection_id=i.collection_id) OR NOT EXISTS(SELECT 1 FROM policy_subjects s WHERE s.subject_id=i.creator_subject_id))`, library).Scan(&invalidRows)

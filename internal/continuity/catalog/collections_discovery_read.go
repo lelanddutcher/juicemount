@@ -144,6 +144,13 @@ func readCollectionDirectory(ctx context.Context, q queryer, c credential, r Col
 	items := make([]json.RawMessage, 0, len(ids))
 	bindings := make([]collectionDirectoryBinding, 0, len(ids))
 	for _, id := range ids {
+		manual, err := manualDirectoryIdentity(ctx, q, id)
+		if err != nil {
+			return nil, nil, false, err
+		}
+		if !manual {
+			continue
+		}
 		def, err := readCollectionReadDefinition(ctx, q, id)
 		if err != nil {
 			return nil, nil, false, err
@@ -338,6 +345,13 @@ func collectionDirectoryFence(ctx context.Context, q queryer, c credential, r Co
 	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
 	out := make([]collectionDirectoryBinding, 0, len(ids))
 	for _, id := range ids {
+		manual, err := manualDirectoryIdentity(ctx, q, id)
+		if err != nil {
+			return nil, err
+		}
+		if !manual {
+			continue
+		}
 		def, err := readCollectionReadDefinition(ctx, q, id)
 		if err != nil {
 			return nil, err

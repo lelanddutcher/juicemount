@@ -18,7 +18,9 @@ const schemaVersion = 2
 const authoritySchemaVersion = 3
 const preferencesSchemaVersion = 4
 
-func supportsAuthority(version int) bool { return version == 3 || version == 4 || version == 5 }
+func supportsAuthority(version int) bool {
+	return version == 3 || version == 4 || version == 5 || version == 6
+}
 func portableSchemaVersion(version int) int {
 	if version == 4 {
 		return 3
@@ -141,6 +143,9 @@ func expectedSchemaFor(version int) []schemaObject {
 	if supportsCollections(version) {
 		objects = append(objects, collectionsSchema()...)
 	}
+	if supportsSavedQueries(version) {
+		objects = append(objects, savedQuerySchema()...)
+	}
 	sort.Slice(objects, func(i, j int) bool { return objects[i].Name < objects[j].Name })
 	return objects
 }
@@ -183,6 +188,13 @@ func initializeVersion(ctx context.Context, db *sql.DB, library continuity.Libra
 	}
 	if supportsCollections(version) {
 		for _, object := range collectionsSchema() {
+			if object.Type == "table" {
+				tables = append(tables, object.SQL)
+			}
+		}
+	}
+	if supportsSavedQueries(version) {
+		for _, object := range savedQuerySchema() {
 			if object.Type == "table" {
 				tables = append(tables, object.SQL)
 			}
@@ -241,6 +253,14 @@ func initializeVersion(ctx context.Context, db *sql.DB, library continuity.Libra
 			return err
 		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations(version,fingerprint) VALUES(5,?)`, schemaFingerprint(expectedSchemaFor(5))); err != nil {
+			return err
+		}
+	}
+	if supportsSavedQueries(version) {
+		if _, err := tx.ExecContext(ctx, `PRAGMA user_version=6`); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations(version,fingerprint) VALUES(6,?)`, schemaFingerprint(expectedSchemaFor(6))); err != nil {
 			return err
 		}
 	}
@@ -322,6 +342,9 @@ func recognizeSchema(ctx context.Context, q queryer, initializing bool) (continu
 		}
 		if entry == 5 {
 			want = schemaFingerprint(expectedSchemaFor(5))
+		}
+		if entry == 6 {
+			want = schemaFingerprint(expectedSchemaFor(6))
 		}
 		if entry != ledgerCount || entry > version || fingerprint != want {
 			rows.Close()
