@@ -3,14 +3,14 @@ package mutationgateway
 import (
 	"bytes"
 	"context"
-	"crypto/tls"
-	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
-	"time"
+	"crypto/tls"
+	"crypto/x509"
+
+	"github.com/lelanddutcher/juicemount/internal/mutationclient"
 )
 
 // Client supplies typed custody APIs only. It never publishes media, retires a
@@ -18,16 +18,14 @@ import (
 type Client struct {
 	base string
 	http *http.Client
+	image *mutationclient.Client
 }
 
 func NewClient(endpoint string, cert tls.Certificate, roots *x509.CertPool) (*Client, error) {
-	u, err := url.Parse(endpoint)
-	if err != nil || u.Scheme != "https" || u.Host == "" || (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.Fragment != "" || u.User != nil ||
-		len(cert.Certificate) == 0 || cert.PrivateKey == nil || roots == nil || len(roots.Subjects()) == 0 {
-		return nil, fmt.Errorf("invalid authenticated gateway endpoint")
-	}
-	t := &http.Transport{TLSClientConfig: &tls.Config{Certificates: []tls.Certificate{cert}, RootCAs: roots, MinVersion: tls.VersionTLS13}, MaxConnsPerHost: 4, MaxIdleConnsPerHost: 4, IdleConnTimeout: 30 * time.Second, TLSHandshakeTimeout: 5 * time.Second}
-	return &Client{base: "https://" + u.Host, http: &http.Client{Transport: t, Timeout: 30 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}, nil
+	image, err := mutationclient.NewClient(endpoint, cert, roots)
+	if err != nil { return nil, err }
+	base, transport := image.Transport()
+	return &Client{base: base, http: transport, image: image}, nil
 }
 
 func (c *Client) Close() { c.http.CloseIdleConnections() }

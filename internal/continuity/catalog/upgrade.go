@@ -62,6 +62,10 @@ func UpgradeSavedQueries(ctx context.Context, path string, library continuity.Li
 	return upgradeCatalogVersion(ctx, path, library, savedQueriesSchemaVersion, syncParent)
 }
 
+func UpgradeDelivery(ctx context.Context, path string, library continuity.LibraryID) error {
+	return upgradeCatalogVersion(ctx, path, library, deliverySchemaVersion, syncParent)
+}
+
 func upgradeCatalogVersion(ctx context.Context, input string, expectedLibrary continuity.LibraryID, target int, directoryBarrier func(string) error) (resultErr error) {
 	if expectedLibrary.Validate() != nil {
 		return invalid("expected library identity")
@@ -107,6 +111,7 @@ func upgradeCatalogVersion(ctx context.Context, input string, expectedLibrary co
 	if target == savedQueriesSchemaVersion && initialVersion != 5 && initialVersion != 6 {
 		return ErrUpgradeRequired
 	}
+	if target == deliverySchemaVersion && initialVersion != 6 && initialVersion != 7 { return ErrUpgradeRequired }
 	if target == collectionsSchemaVersion && initialVersion != 4 && initialVersion != 5 {
 		return ErrUpgradeRequired
 	}
@@ -147,6 +152,7 @@ func upgradeCatalogVersion(ctx context.Context, input string, expectedLibrary co
 	if target == savedQueriesSchemaVersion && version != 5 && version != 6 {
 		return ErrUpgradeRequired
 	}
+	if target == deliverySchemaVersion && version != 6 && version != 7 { return ErrUpgradeRequired }
 	if target == collectionsSchemaVersion && version != 4 && version != 5 {
 		return ErrUpgradeRequired
 	}
@@ -260,6 +266,13 @@ func upgradeCatalogVersion(ctx context.Context, input string, expectedLibrary co
 		if err := checkIntegrity(ctx, tx); err != nil {
 			return err
 		}
+	}
+	if target == deliverySchemaVersion && version == savedQueriesSchemaVersion {
+		if err := migrateV6Delivery(ctx, tx, library); err != nil { return err }
+		actual, current, err := recognizeSchema(ctx, tx, false)
+		if err != nil { return err }
+		if actual != library || current != deliverySchemaVersion { return corrupt("delivery migration identity") }
+		if err := checkIntegrity(ctx, tx); err != nil { return err }
 	}
 	if err := held.checkPaths(); err != nil {
 		return err

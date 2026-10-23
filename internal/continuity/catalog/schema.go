@@ -19,7 +19,7 @@ const authoritySchemaVersion = 3
 const preferencesSchemaVersion = 4
 
 func supportsAuthority(version int) bool {
-	return version == 3 || version == 4 || version == 5 || version == 6
+	return version == 3 || version == 4 || version == 5 || version == 6 || version == 7
 }
 func portableSchemaVersion(version int) int {
 	if version == 4 {
@@ -146,6 +146,14 @@ func expectedSchemaFor(version int) []schemaObject {
 	if supportsSavedQueries(version) {
 		objects = append(objects, savedQuerySchema()...)
 	}
+	if supportsDelivery(version) {
+		for i := range objects {
+			if replacement, ok := deliveryOverrides()[objects[i].Name]; ok {
+				objects[i].SQL = replacement
+			}
+		}
+		objects = append(objects, deliverySchema()...)
+	}
 	sort.Slice(objects, func(i, j int) bool { return objects[i].Name < objects[j].Name })
 	return objects
 }
@@ -205,7 +213,9 @@ func initializeVersion(ctx context.Context, db *sql.DB, library continuity.Libra
 			return err
 		}
 	}
-	for _, object := range expectedSchemaFor(version) {
+	initialVersion := version
+	if supportsDelivery(version) { initialVersion = savedQueriesSchemaVersion }
+	for _, object := range expectedSchemaFor(initialVersion) {
 		if object.Type != "table" {
 			if _, err := tx.ExecContext(ctx, object.SQL); err != nil {
 				return err
@@ -263,6 +273,9 @@ func initializeVersion(ctx context.Context, db *sql.DB, library continuity.Libra
 		if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations(version,fingerprint) VALUES(6,?)`, schemaFingerprint(expectedSchemaFor(6))); err != nil {
 			return err
 		}
+	}
+	if supportsDelivery(version) {
+		if err := migrateV6Delivery(ctx, tx, library); err != nil { return err }
 	}
 	return tx.Commit()
 }
@@ -345,6 +358,9 @@ func recognizeSchema(ctx context.Context, q queryer, initializing bool) (continu
 		}
 		if entry == 6 {
 			want = schemaFingerprint(expectedSchemaFor(6))
+		}
+		if entry == 7 {
+			want = schemaFingerprint(expectedSchemaFor(7))
 		}
 		if entry != ledgerCount || entry > version || fingerprint != want {
 			rows.Close()

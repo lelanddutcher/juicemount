@@ -84,6 +84,7 @@ func finishOutput(f fileResource) error {
 func runConfigured(parent context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer, ownStdio bool, files cliFiles) (code int) {
 	knownOperationID, knownSelector := "", ""
 	outputCloseFailed := false
+	deliveryCommand, deliveryOutputStarted := false, false
 	preferenceMaintenance := false
 	collectionMutationAttempted := false
 	savedQueryMutationAttempted, savedQueryMaintenance := false, false
@@ -112,13 +113,19 @@ func runConfigured(parent context.Context, args []string, stdin io.Reader, stdou
 				message += "; partial output may have been written"
 			}
 		}
+		if deliveryCommand && uncertain {
+			message = "delivery handoff uncertain; retain the operation ID and inspect before retrying"
+			if deliveryOutputStarted {
+				message += "; partial receipt may have been written"
+			}
+		}
 		_ = writeJSON(stderr, struct {
 			Error             string `json:"error"`
 			OperationID       string `json:"operation_id,omitempty"`
 			Selector          string `json:"selector,omitempty"`
 			OutputCloseFailed bool   `json:"output_close_failed,omitempty"`
 			PartialOutput     bool   `json:"partial_output,omitempty"`
-		}{message, knownOperationID, knownSelector, outputCloseFailed, collectionReadAttempted})
+		}{message, knownOperationID, knownSelector, outputCloseFailed, collectionReadAttempted || deliveryOutputStarted})
 		return 3
 	}
 	fs := flag.NewFlagSet("juicemount-catalog", flag.ContinueOnError)
@@ -130,6 +137,9 @@ func runConfigured(parent context.Context, args []string, stdin io.Reader, stdou
 	asset := fs.String("asset", "", "exact asset ID")
 	selector := fs.String("selector", "", "credential selector")
 	operationID := fs.String("operation-id", "", "issuance operation ID")
+	deliveryConfig := fs.String("delivery-config", "", "private delivery registry")
+	routeID := fs.String("route-id", "", "configured delivery route")
+	selectionID := fs.String("selection-id", "", "pinned delivery selection")
 	after := fs.String("after", "", "list cursor")
 	limit := fs.Int("limit", 100, "list page size")
 	inputPath := fs.String("input", "-", "stream input")
@@ -168,7 +178,7 @@ func runConfigured(parent context.Context, args []string, stdin io.Reader, stdou
 	defer func() {
 		// A query mutation may already be committed. Diagnose its owned stdout
 		// close before the diagnostic descriptor is itself closed by stopOwners.
-		if (savedQueryMutationAttempted || collectionReadCommand && readLabel != "collection") && ownedStdout != nil {
+		if (deliveryCommand || savedQueryMutationAttempted || collectionReadCommand && readLabel != "collection") && ownedStdout != nil {
 			if err := ownedStdout.Close(); err != nil {
 				outputCloseFailed = true
 				code = fail(true)
@@ -180,7 +190,7 @@ func runConfigured(parent context.Context, args []string, stdin io.Reader, stdou
 		}
 		if err != nil || ctx.Err() != nil {
 			code = 3
-			if savedQueryMutationAttempted || collectionReadCommand && readLabel != "collection" {
+			if deliveryCommand || savedQueryMutationAttempted || collectionReadCommand && readLabel != "collection" {
 				code = fail(true)
 			}
 		}
@@ -192,6 +202,7 @@ func runConfigured(parent context.Context, args []string, stdin io.Reader, stdou
 		return fail(false)
 	}
 	command := strings.Join(fs.Args(), " ")
+	deliveryCommand = strings.HasPrefix(command, "delivery ") || strings.HasPrefix(command, "source ")
 	collectionReadCommand = command == "collection read" || command == "query read" || command == "recents read"
 	if command == "query read" {
 		readLabel = "saved query"
@@ -261,6 +272,12 @@ func runConfigured(parent context.Context, args []string, stdin io.Reader, stdou
 		}
 		return 0
 	}
+	if command == "upgrade-delivery" {
+		if err := catalog.UpgradeDelivery(ctx, *path, library); err != nil {
+			return fail(strings.Contains(err.Error(), "uncertain"))
+		}
+		return 0
+	}
 	var s *catalog.Store
 	var err error
 	if command == "init-authority" {
@@ -271,14 +288,27 @@ func runConfigured(parent context.Context, args []string, stdin io.Reader, stdou
 		s, err = catalog.CreateCollections(ctx, *path, library)
 	} else if command == "init-saved-queries" {
 		s, err = catalog.CreateSavedQueries(ctx, *path, library)
+	} else if command == "init-delivery" {
+		s, err = catalog.CreateDelivery(ctx, *path, library)
 	} else {
 		s, err = catalog.OpenContext(ctx, *path)
 	}
 	if err != nil {
 		return fail(strings.Contains(err.Error(), "uncertain"))
 	}
+	storeClosed := false
+	closeStore := func() error {
+		storeClosed = true
+		if files.closeCatalog != nil {
+			return files.closeCatalog(s)
+		}
+		return s.Close()
+	}
 	defer func() {
-		if err := s.Close(); err != nil {
+		if storeClosed {
+			return
+		}
+		if err := closeStore(); err != nil {
 			code = fail(true)
 		}
 	}()
@@ -286,7 +316,7 @@ func runConfigured(parent context.Context, args []string, stdin io.Reader, stdou
 	if err != nil || actual != library {
 		return fail(false)
 	}
-	if command == "init-authority" || command == "init-preferences" || command == "init-collections" || command == "init-saved-queries" {
+	if command == "init-authority" || command == "init-preferences" || command == "init-collections" || command == "init-saved-queries" || command == "init-delivery" {
 		return 0
 	}
 	if collectionReadCommand {
@@ -456,11 +486,49 @@ func runConfigured(parent context.Context, args []string, stdin io.Reader, stdou
 		}
 		return code
 	}
+	if deliveryCommand {
+		pending, operationErr := runDeliveryCLI(ctx, s, library, command, *deliveryConfig, *routeID, *selectionID, *operationID, stdin, &knownOperationID, files)
+		var inputErr error
+		if ownedStdin != nil {
+			inputErr = ownedStdin.Close()
+		}
+		storeErr := closeStore()
+		if operationErr != nil || inputErr != nil || storeErr != nil {
+			return fail(inputErr != nil || storeErr != nil || operationErr != nil && strings.Contains(operationErr.Error(), "uncertain"))
+		}
+		// Service, original input and catalog are closed before disclosing the
+		// pending receipt. Output errors can still mean partial disclosure.
+		deliveryOutputStarted = true
+		if writeBytes(stdout, pending) != nil {
+			return fail(true)
+		}
+		return 0
+	}
 	owner, err := s.LocalOwner(library)
 	if err != nil {
 		return fail(false)
 	}
 	switch command {
+	case "credential status-v3":
+		if *operationID == "" {
+			return fail(false)
+		}
+		v, err := owner.IssuanceStatusV3(ctx, *operationID)
+		if err != nil || writeJSON(stdout, v) != nil {
+			return fail(false)
+		}
+		return 0
+	case "credential issue-v3":
+		body, err := readBounded(stdin, 64<<10)
+		if err != nil {
+			return fail(false)
+		}
+		request, err := catalog.DecodeAdminRequestV3(bytes.TrimSpace(body))
+		if err != nil || request.LibraryID != library || request.Kind != "issue_credential" || *secretOut == "" {
+			return fail(false)
+		}
+		knownOperationID = request.ID
+		return runDeliveryIssuance(ctx, owner, request, *secretOut, stdout, stderr, owners, files, &knownSelector, &outputCloseFailed, fail)
 	case "credential status-v2":
 		if *operationID == "" {
 			return fail(false)

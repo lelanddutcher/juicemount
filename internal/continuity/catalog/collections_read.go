@@ -180,7 +180,7 @@ func saveCollectionQuota(ctx context.Context, tx *sql.Tx, id CollectionID, usage
 	return nil
 }
 func appendCollectionOrder(ctx context.Context, tx *sql.Tx, column string, sequence int64) error {
-	if column != "legacy_sequence" && column != "owner_policy_sequence" && column != "content_sequence" {
+	if column != "legacy_sequence" && column != "owner_policy_sequence" && column != "content_sequence" && column != "byte_policy_sequence" {
 		return invalid("collection order reference")
 	}
 	var ordinal int64
@@ -243,7 +243,11 @@ func checkCollectionOrder(ctx context.Context, q queryer) error {
 			}
 		}
 	}
-	return rows.Err()
+	if err := rows.Err(); err != nil { return err }
+	version, err := catalogVersion(ctx, q)
+	if err != nil { return err }
+	if supportsDelivery(version) { return checkDeliveryOrder(ctx, q) }
+	return nil
 }
 func requireAdminCodec(ctx context.Context, q queryer, id, expected string) error {
 	version, err := catalogVersion(ctx, q)

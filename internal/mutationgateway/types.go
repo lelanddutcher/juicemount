@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/lelanddutcher/juicemount/internal/mutationauthority"
+	"github.com/lelanddutcher/juicemount/internal/mutationclient"
 )
 
 const (
@@ -21,7 +22,7 @@ const (
 )
 
 var (
-	ErrIntegrity    = errors.New("custody artifact integrity could not be established")
+	ErrIntegrity    = mutationclient.ErrIntegrity
 	ErrUnauthorized = errors.New("client does not own this operation")
 	identifier      = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
 )

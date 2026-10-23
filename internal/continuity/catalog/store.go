@@ -83,6 +83,11 @@ func CreateSavedQueries(ctx context.Context, path string, library continuity.Lib
 	return openStoreVersionContext(ctx, path, library, true, true, savedQueriesSchemaVersion)
 }
 
+func CreateDelivery(ctx context.Context, path string, library continuity.LibraryID) (*Store, error) {
+	if library.Validate() != nil { return nil, invalid("library identity") }
+	return openStoreVersionContext(ctx, path, library, true, true, deliverySchemaVersion)
+}
+
 func canonicalPath(path string) (string, error) {
 	if path == "" || path == ":memory:" || strings.HasPrefix(path, "file:") || strings.ContainsRune(path, 0) {
 		return "", invalid("a filesystem catalog path is required")

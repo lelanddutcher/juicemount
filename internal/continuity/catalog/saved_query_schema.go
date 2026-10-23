@@ -7,7 +7,7 @@ import (
 
 const savedQueriesSchemaVersion = 6
 
-func supportsSavedQueries(v int) bool { return v == savedQueriesSchemaVersion }
+func supportsSavedQueries(v int) bool { return v == savedQueriesSchemaVersion || v == deliverySchemaVersion }
 
 // The additive objects preserve every earlier schema fingerprint.
 func savedQuerySchema() []schemaObject {

@@ -6,6 +6,9 @@ import (
 	"io"
 	"os"
 	"sync"
+
+	"github.com/lelanddutcher/juicemount/internal/continuity"
+	"github.com/lelanddutcher/juicemount/internal/continuity/catalog"
 )
 
 // run borrows generic I/O: context checks cannot interrupt an arbitrary blocked
@@ -30,6 +33,10 @@ type cliFiles struct {
 	reserve func(string) (fileResource, error)
 	input   func(string) (fileResource, error)
 	stdio   func([]*os.File) ([]fileResource, func() error, error)
+	// Private per-invocation ownership seams. Nil uses the real constructors and
+	// original Close; tests wrap those originals without global mutable hooks.
+	deliveryService func(context.Context, *catalog.Store, continuity.LibraryID, string) (deliveryCommandService, error)
+	closeCatalog    func(*catalog.Store) error
 }
 
 func defaultFiles() cliFiles {

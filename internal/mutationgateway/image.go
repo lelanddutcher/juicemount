@@ -11,6 +11,7 @@ import (
 
 	"github.com/lelanddutcher/juicemount/internal/continuity"
 	"github.com/lelanddutcher/juicemount/internal/mutationauthority"
+	"github.com/lelanddutcher/juicemount/internal/mutationclient"
 	"github.com/lelanddutcher/juicemount/internal/privatefile"
 )
 
@@ -25,14 +26,7 @@ type ImageSealReceipt = mutationauthority.ImageSealReceipt
 type ImageReaderReceipt = mutationauthority.ImageReaderReceipt
 type ImageCustodyReceipt = mutationauthority.ImageCustodyReceipt
 
-type ImageSealStatus struct {
-	Version     int64             `json:"version"`
-	StoreID     string            `json:"store_id"`
-	ImageID     string            `json:"image_id"`
-	ImageDigest string            `json:"image_digest"`
-	State       string            `json:"state"`
-	Receipt     *ImageSealReceipt `json:"receipt"`
-}
+type ImageSealStatus = mutationclient.ImageSealStatus
 
 // ImageCustody preserves the historical receipt projection when binding
 // previously committed custody into a new immutable image.

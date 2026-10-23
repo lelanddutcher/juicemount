@@ -77,7 +77,7 @@ func readCredentialVersion(ctx context.Context, q queryer, library continuity.Li
 	if decodeCanonicalValue(actions, &c.actions) != nil {
 		return credential{}, corrupt("credential actions")
 	}
-	validCeiling := c.codec == 1 && validActions(c.actions) || c.codec == 2 && c.scope.Kind == "library" && c.scope.AssetID == "" && validCredentialActionsV2(c.actions)
+	validCeiling := c.codec == 1 && validActions(c.actions) || c.codec == 2 && c.scope.Kind == "library" && c.scope.AssetID == "" && validCredentialActionsV2(c.actions) || c.codec == 3 && supportsDelivery(version) && validCredentialActionsV3(c.scope, c.actions)
 	if lib != library || c.selector != selector || !validRandomID(c.selector, "cred_") || !validRandomID(c.incarnation, "auth_") || c.subject.Validate() != nil || !c.scope.valid() || !validCeiling || len(c.verifier) != 32 || c.expires <= c.issued || c.generation <= 0 {
 		return credential{}, corrupt("credential fields")
 	}
@@ -144,6 +144,16 @@ func (s *Store) Authenticate(ctx context.Context, library continuity.LibraryID, 
 // authenticateSnapshot shares the complete verifier/current-authority check
 // with discovery without opening a second, inconsistent metadata snapshot.
 func (s *Store) authenticateSnapshot(ctx context.Context, q queryer, library continuity.LibraryID, bearer []byte) (*AuthHandle, credential, Subject, error) {
+	// Keep legacy sampling at credentialStatusVersion, after credential and
+	// verifier reads. Delivery uses its already recorded clock observation.
+	return s.authenticateSnapshotTimed(ctx, q, library, bearer, func() int64 { return s.now().Unix() })
+}
+
+func (s *Store) authenticateSnapshotAt(ctx context.Context, q queryer, library continuity.LibraryID, bearer []byte, now int64) (*AuthHandle, credential, Subject, error) {
+	return s.authenticateSnapshotTimed(ctx, q, library, bearer, func() int64 { return now })
+}
+
+func (s *Store) authenticateSnapshotTimed(ctx context.Context, q queryer, library continuity.LibraryID, bearer []byte, sampleTime func() int64) (*AuthHandle, credential, Subject, error) {
 	if err := s.checkVersion(ctx, q); err != nil {
 		return nil, credential{}, Subject{}, err
 	}
@@ -166,7 +176,7 @@ func (s *Store) authenticateSnapshot(ctx context.Context, q queryer, library con
 	if subtle.ConstantTimeCompare(verifier[:], c.verifier) != 1 {
 		return nil, credential{}, Subject{}, ErrUnauthenticated
 	}
-	status, err := credentialStatusVersion(ctx, q, library, selector, s.now().Unix(), s.version)
+	status, err := credentialStatusVersion(ctx, q, library, selector, sampleTime(), s.version)
 	if err != nil {
 		return nil, credential{}, Subject{}, err
 	}
