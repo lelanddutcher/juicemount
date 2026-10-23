@@ -61,19 +61,22 @@
         <button id="library-retry-access" type="button" hidden>Retry access and context check</button>
         <aside id="library-outcome" class="library-outcome" aria-label="Action outcome" aria-live="polite" hidden></aside>
         <div id="library-workspace" hidden>
-          <nav class="library-view-switch" aria-label="Library view"><button id="library-view-assets" type="button" aria-pressed="true">Assets</button><button id="library-view-collections" type="button" aria-pressed="false">Collections</button></nav>
+          <nav class="library-view-switch" aria-label="Library view"><button id="library-view-assets" type="button" aria-pressed="true">Assets</button><button id="library-view-collections" type="button" aria-pressed="false">Collections</button><button id="library-view-saved" type="button" aria-pressed="false">Saved queries</button><button id="library-view-continue" type="button" aria-pressed="false">Continue work</button></nav>
           <section id="library-collections-panel" aria-label="Collections" hidden><div id="library-collections-body"></div></section>
+          <section id="library-saved-panel" tabindex="-1" aria-label="Saved queries" hidden><div id="library-saved-body"></div></section>
+          <section id="library-continue-panel" tabindex="-1" aria-label="Continue work" hidden><div id="library-continue-body"></div></section>
           <div id="library-picker-bar" class="library-selection-bar" aria-live="polite" hidden></div>
           <section id="library-assets-panel" aria-label="Assets">
           <form id="library-search-form" class="library-search-form" role="search" aria-label="Search permitted assets">
             <label class="field"><span>Search asset labels</span><input id="library-query" type="search" autocomplete="off" placeholder="A scene, source, or working label"></label><button id="library-search-button" type="submit">Search library</button>
           </form>
-          <div class="library-context"><h3>Temporary context</h3><p class="hint">Read-only query context · up to 64 assets. Remembering an asset is a separate personal action.</p><div id="library-contexts" aria-label="Current context"></div></div>
-          <div class="library-columns">
+          <div class="library-context"><h3>Temporary context</h3><p class="hint">Read-only query context · up to 64 assets. Remembering an asset is a separate personal action.</p><div id="library-contexts" aria-label="Current context"></div><button id="library-save-search" type="button">Save this search as query</button></div>
+          <div class="library-asset-results">
             <section class="library-results-panel" aria-labelledby="library-results-title"><h3 id="library-results-title">Permitted assets</h3><p id="library-window" class="hint"></p><ul id="library-results" class="library-results"></ul><button id="library-more" type="button" hidden>More results</button></section>
-            <aside class="library-inspector" aria-labelledby="library-inspector-title"><h3 id="library-inspector-title">Inspector</h3><p class="hint">Metadata declarations only. Location claims do not verify media availability; hashes do not deliver or play bytes.</p><div id="library-inspector-body"></div></aside>
+
           </div>
           </section>
+            <aside class="library-inspector" aria-labelledby="library-inspector-title"><h3 id="library-inspector-title">Inspector</h3><p class="hint">Metadata declarations only. Location claims do not verify media availability; hashes do not deliver or play bytes.</p><div id="library-inspector-body"></div></aside>
         </div>
       </section>
 

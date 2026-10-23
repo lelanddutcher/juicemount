@@ -90,7 +90,7 @@ test('collection transport uses exact prefixed route family and a separate one M
   let options, url; const transport = createTransport('/manager', { fetch: async (u, init) => { url = u; options = init; return json(window('directory')); } });
   await transport('v1/collections/directory', '{}', bearer(1));
   assert.equal(url, '/manager/api/continuity/v1/collections/directory'); assert.equal(options.headers.Authorization, 'Bearer ' + bearer(1)); assert.equal(options.credentials, 'omit'); assert.equal(options.redirect, 'error'); assert.equal(options.cache, 'no-store');
-  await assert.rejects(transport('v2/collections/directory', '{}', bearer(1)), /Check/);
+  await assert.rejects(transport('v2/collections/members', '{}', bearer(1)), /Check/); // v2 is saved-query-only; its valid routes have independent exact DTO tests.
   let chunks = 0, cancelled = false;
   const large = { ok: true, redirected: false, headers: new Headers({ 'content-type': 'application/json' }), body: { getReader: () => ({ read: async () => { chunks++; return { done: false, value: new Uint8Array(512 * 1024) }; }, cancel: async () => { cancelled = true; }, releaseLock() {} }) } };
   await assert.rejects(createTransport('', { fetch: async () => large })('v1/collections/members', '{}', bearer(1)), /unreadable/); assert.equal(chunks, 3); assert.equal(cancelled, true);

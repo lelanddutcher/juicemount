@@ -66,6 +66,7 @@
     }
   }
   function validate(route, v) {
+    if (route.startsWith('v2/collections/') || route.startsWith('v2/recents/')) return validateSaved(route, v);
     if (route.startsWith('v1/collections/')) return validateCollection(route.slice(15), v);
     const [versionPart, kind] = route.split('/'); const version = Number(versionPart.slice(1));
     if (kind === 'select' || kind === 'clear') {
@@ -171,12 +172,74 @@
     for (let i = 0; i < 4; i++) { const bytes = new Uint8Array(16); random.getRandomValues(bytes); if (bytes.some(b => b !== 0)) return prefix + Array.from(bytes, b => b.toString(16).padStart(2, '0')).join(''); }
     throw new LibraryError('unavailable');
   }
+  const savedCaps = { directory: 1024, execute: 1000, history: 1000, access: 128, recents: 256 };
+  function ordered(value, keys) { return object(value, keys) && Object.keys(value).every((k, i) => k === keys[i]); }
+  function definition(value) {
+    return ordered(value, ['version', 'kind', 'text', 'context_asset_ids']) && value.version === 1 && value.kind === 'ranked_assets' && collectionText(value.text, 256) && Array.isArray(value.context_asset_ids) && value.context_asset_ids.length <= 64 && value.context_asset_ids.every((x, i, a) => id(x, 'asset') && (!i || a[i - 1] < x)) && encoder.encode(goJSON(value)).length <= 8192;
+  }
+  function savedSummary(value) { return !!value && value.kind === 'saved_query' && ordered(value, ['collection_id', 'kind', 'name', 'archived', 'definition_version', 'creator', 'permissions']) && ordered(value.permissions, ['read', 'edit', 'admin']) && summary({ ...value, kind: 'manual' }); }
+  function decimal(value, positive = false) { return typeof value === 'string' && /^(0|[1-9][0-9]{0,18})$/.test(value) && BigInt(value) <= 9223372036854775807n && (!positive || BigInt(value) > 0n); }
+  function savedHistory(value) {
+    if (!ordered(value, ['kind', 'recorded_unix_nano', 'actor', 'value']) || !decimal(value.recorded_unix_nano, true) || !['you', 'another_authorized_person'].includes(value.actor)) return false;
+    const v = value.value;
+    if (value.kind === 'create') return ordered(v, ['name', 'definition']) && collectionText(v.name, 256, true) && definition(v.definition);
+    if (value.kind === 'replace_definition') return ordered(v, ['definition']) && definition(v.definition);
+    if (value.kind === 'rename') return ordered(v, ['name']) && collectionText(v.name, 256, true);
+    return value.kind === 'archive' && ordered(v, ['archived']) && typeof v.archived === 'boolean';
+  }
+  function savedResult(value, collectionID) {
+    return ordered(value, ['result_id', 'asset_id', 'label', 'head_revision_id', 'reasons']) && ordered(value.result_id, ['collection_id', 'asset_id']) && value.result_id.collection_id === collectionID && value.result_id.asset_id === value.asset_id && asset({ asset_id: value.asset_id, label: value.label, head_revision_id: value.head_revision_id, reasons: value.reasons }) && collectionText(value.label, 4096) && value.reasons.length > 0 && new Set(value.reasons).size === value.reasons.length;
+  }
+  function savedExpected(value, collectionID) { return expectedGrant(value, collectionID) && ordered(value, ['value', 'version', 'removed']) && ordered(value.value, ['subject_id', 'scope', 'actions']) && ordered(value.value.scope, ['kind', 'collection_id']); }
+  function validateSaved(route, value) {
+    const recent = route.startsWith('v2/recents/'), endpoint = route.split('/')[2];
+    if (!recent && endpoint === 'mutate') {
+      requireValue(ordered(value, ['version', 'operation_id', 'collection_id', 'result_version']) && value.version === 2 && cid(value.operation_id, 'operation') && cid(value.collection_id, 'collection') && cid(value.result_version, 'version')); return value;
+    }
+    if (!recent && ['open', 'definition'].includes(endpoint)) {
+      requireValue(ordered(value, endpoint === 'open' ? ['version', 'kind', 'collection'] : ['version', 'kind', 'collection', 'definition']) && value.version === 2 && value.kind === (endpoint === 'open' ? 'collection' : 'definition') && savedSummary(value.collection) && (endpoint === 'open' || definition(value.definition))); return value;
+    }
+    const kind = value && value.kind, cap = savedCaps[kind];
+    let keys = ['version', 'kind'];
+    if (!recent) keys.push('collection');
+    if (kind === 'directory') keys.push('can_create');
+    if (kind === 'execute') keys.push('query_version');
+    keys.push('items', 'matched_count', 'count_scope', 'window_complete', 'next_page_token', 'sort_version', 'snapshot_scope');
+    requireValue(cap && ordered(value, keys) && value.version === 2 && (recent ? kind === 'recents' && ['list', 'page'].includes(endpoint) : ['directory', 'execute', 'history', 'access'].includes(kind) && (endpoint === kind || endpoint === 'page')) && Number.isSafeInteger(value.matched_count) && value.matched_count >= 0 && value.matched_count <= cap && typeof value.window_complete === 'boolean' && (value.next_page_token === null || id(value.next_page_token, 'page')) && value.snapshot_scope === 'frozen_snapshot' && value.count_scope === (recent ? 'frozen_authorized_recent' : 'frozen_window') && value.sort_version === (recent ? 'recents1' : kind === 'execute' ? 'discovery2' : 'saved_queries2') && Array.isArray(value.items) && value.items.length <= 100 && value.items.length <= value.matched_count);
+    requireValue(!['directory', 'access', 'recents'].includes(kind) || value.window_complete);
+    requireValue(recent || (kind === 'directory' ? value.collection === null && typeof value.can_create === 'boolean' : savedSummary(value.collection)));
+    if (kind === 'execute') requireValue(value.query_version === value.collection.definition_version && cid(value.query_version, 'version'));
+    if (kind === 'history') requireValue(value.matched_count > 0 || !value.window_complete);
+    for (const item of value.items) {
+      requireValue(encoder.encode(goJSON(item)).length <= 32768);
+      if (kind === 'directory') requireValue(savedSummary(item));
+      if (kind === 'execute') requireValue(savedResult(item, value.collection.collection_id));
+      if (kind === 'history') requireValue(savedHistory(item));
+      if (kind === 'access') requireValue(ordered(item, ['grant_id', 'expected']) && cid(item.grant_id, 'grant') && savedExpected(item.expected, value.collection.collection_id));
+      if (kind === 'recents') requireValue(ordered(item, ['asset_id', 'label', 'head_revision_id', 'reasons', 'selected_unix', 'expires_unix']) && id(item.asset_id, 'asset') && collectionText(item.label, 4096) && nullableRevision(item.head_revision_id) && Array.isArray(item.reasons) && item.reasons.length === 1 && item.reasons[0] === 'declared_selection' && decimal(item.selected_unix) && decimal(item.expires_unix) && BigInt(item.expires_unix) === BigInt(item.selected_unix) + 2592000n);
+    }
+    return value;
+  }
+  function savedCanonical(request) {
+    const valid = ok => { if (!ok) throw new LibraryError('invalid'); };
+    valid(object(request, ['version', 'library_id', 'operation_id', 'collection_id', 'expected_version', 'kind', 'value']) && request.version === 2 && id(request.library_id, 'library') && cid(request.operation_id, 'operation') && cid(request.collection_id, 'collection') && (request.kind === 'create' ? request.expected_version === '' : cid(request.expected_version, 'version')));
+    const v = request.value; let value;
+    if (request.kind === 'create') { valid(object(v, ['name', 'creator_grant_id', 'definition']) && collectionText(v.name, 256, true) && cid(v.creator_grant_id, 'grant') && definition(v.definition)); value = { name: v.name, creator_grant_id: v.creator_grant_id, definition: v.definition }; }
+    else if (request.kind === 'replace_definition') { valid(object(v, ['definition']) && definition(v.definition)); value = { definition: v.definition }; }
+    else {
+      valid(['rename', 'archive', 'grants'].includes(request.kind));
+      value = JSON.parse(collectionCanonical({ ...request, version: 1 })).value;
+    }
+    const raw = goJSON({ version: 2, library_id: request.library_id, operation_id: request.operation_id, collection_id: request.collection_id, expected_version: request.expected_version, kind: request.kind, value });
+    valid(encoder.encode(raw).length <= 32768); return raw;
+  }
   function createTransport(base, options = {}) {
     if (typeof base !== 'string' || !/^(?:\/[a-zA-Z0-9_-]+)*$/.test(base)) throw new LibraryError('invalid');
     const fetcher = options.fetch || globalThis.fetch;
     const later = options.setTimeout || setTimeout, cancelTimer = options.clearTimeout || clearTimeout;
     return async function transport(route, body, credential, signal) {
-      const collectionRoute = /^v1\/collections\/(directory|open|members|history|access|page|mutate)$/.test(route);
+      const savedRoute = /^v2\/collections\/(directory|open|definition|execute|history|access|page|mutate)$/.test(route) || /^v2\/recents\/(list|page)$/.test(route);
+      const collectionRoute = savedRoute || /^v1\/collections\/(directory|open|members|history|access|page|mutate)$/.test(route);
       if (!collectionRoute && !/^v[12]\/(search|page|asset|counts|revisions|relationships|locations|history|select|clear|preference)$/.test(route)) throw new LibraryError('invalid');
       const controller = new AbortController();
       const abort = () => controller.abort();
@@ -199,6 +262,7 @@
         try { decoded += decoder.decode(); } catch (_) { throw new LibraryError('invalid_response'); }
         if (controller.signal.aborted) throw new LibraryError('deadline');
         let value; try { value = JSON.parse(decoded); } catch (_) { throw new LibraryError('invalid_response'); }
+        if (savedRoute) requireValue(goJSON(value) === decoded);
         if (!response.ok) {
           const statuses = { invalid: 400, unauthenticated: 401, not_found: 404, restart_query: 409, conflict: 409, expired_request: 409, work_budget: 422, busy: 503, unavailable: 503, deadline: 504 };
           if (object(value, ['version', 'error']) && value.version === 1 && statuses[value.error] === response.status) throw new LibraryError(value.error);
@@ -210,7 +274,7 @@
         throw new LibraryError(controller.signal.aborted ? 'deadline' : 'transport');
       } finally {
         controller.abort();
-        if (reader) { try { await reader.cancel(); } catch (_) { /* response is discarded */ } reader.releaseLock(); }
+        if (reader) { try { await reader.cancel(); } catch (_) { /* response is discarded */ } try { reader.releaseLock(); } catch (_) { /* original reader is discarded */ } }
         cancelTimer(timer); if (signal) signal.removeEventListener('abort', abort);
       }
     };
@@ -229,14 +293,17 @@
     let pending = null, warning = null, message = '', searchBusy = false, restoring = false, mutationBusy = false;
     let libraryView = 'assets', directoryState = 'active', collectionID = '', collectionSection = 'members', memberState = 'active';
     let collectionCurrent = null, collectionWindows = {}, collectionError = '', collectionBusy = false, picker = false;
-    let intentGeneration = 0, settlementOwner = null;
+    let savedID = '', savedCurrent = null, savedSection = 'execute', savedState = 'active', savedWindows = {}, savedError = '', savedBusy = false;
+    let savedDefinition = null, savedAnchors = [], draft = null, queryPicker = false, recentWindow = null, querySelection = null, selectionCandidate = null;
+    const savedScopes = ['sqDirectory', 'sqOpen', 'sqDefinition', 'sqExecute', 'sqHistory', 'sqAccess', 'recents'];
+    let intentGeneration = 0, settlementOwner = null, savedSettlement = null, activitySettlement = null;
     const memberSelection = new Map(), pickerSelection = new Map();
     const collectionScopes = ['directory', 'collection', 'members', 'history', 'access'];
-    const generations = { search: 0, detail: 0, status: 0, restore: 0, directory: 0, collection: 0, members: 0, history: 0, access: 0 };
+    const generations = { search: 0, detail: 0, status: 0, restore: 0, directory: 0, collection: 0, members: 0, history: 0, access: 0, sqDirectory: 0, sqOpen: 0, sqDefinition: 0, sqExecute: 0, sqHistory: 0, sqAccess: 0, recents: 0 };
     const requests = new Set(); let readCount = 0; const waiters = [];
     function clearExpiry() { if (expiryTimer !== null) { clearTimeout(expiryTimer); expiryTimer = null; } }
     function expire() {
-      if (pending && pending.family !== 'collection' && (pending.expired || clock() >= pending.expires)) {
+      if (pending && !pending.family && (pending.expired || clock() >= pending.expires)) {
         clearExpiry(); invalidate('status');
         warning = { assetID: pending.assetID, acknowledged: false, message: 'An earlier action may have been accepted. Its retry window ended. Check current state, then acknowledge before a new action.' };
         pending = null; statusFresh = false;
@@ -249,7 +316,7 @@
         count, complete, searchBusy, restoring, inspector: active && connected && selected ? sections.asset && sections.asset.value ? 'ready' : sections.asset && sections.asset.error ? 'error' : 'loading' : 'idle', inspectorError: active && connected && sections.asset && sections.asset.error || '', selected: active && connected && sections.asset && sections.asset.value ? selected : '', sections: active ? Object.fromEntries(Object.entries(sections).map(([key, value]) => [key, { ...value, ...(Object.hasOwn(value, 'next') ? { next: !!value.next } : {}) }])) : {},
         preference: active && statusFresh ? preference !== null : null, statusFresh: active && statusFresh,
         mutationBusy, pending: !!pending, pendingCollection: !!pending && pending.family === 'collection', retryable: !!pending && !pending.expired && !mutationBusy,
-        libraryView, collections: collectionView(),
+        libraryView, collections: collectionView(), saved: savedView(), recents: publicWindow(recentWindow), pendingSavedQuery: !!pending && pending.family === 'saved_query',
         warning: warning ? { acknowledged: warning.acknowledged, message: warning.message } : null, canMutate: active && connected && statusFresh && !pending && !mutationBusy && (!warning || warning.acknowledged) };
     }
     function emit() { onChange(view()); }
@@ -258,10 +325,10 @@
     function invalidate(scope) { generations[scope]++; for (let i = waiters.length - 1; i >= 0; i--) if (waiters[i].scope === scope) { waiters.splice(i, 1)[0].resolve(false); } for (const r of requests) if (r.scope === scope) r.controller.abort(); }
     function abortReads() { for (const key of Object.keys(generations)) invalidate(key); }
     function clearCollections() { collectionCurrent = null; collectionWindows = {}; collectionError = ''; collectionBusy = false; memberSelection.clear(); pickerSelection.clear(); picker = false; }
-    function clearScoped() { contexts = []; items = []; next = null; count = 0; sections = {}; preference = null; statusFresh = false; searchBusy = false; restoring = false; clearCollections(); }
+    function clearScoped() { clearSaved(); recentWindow = null; contexts = []; items = []; next = null; count = 0; sections = {}; preference = null; statusFresh = false; searchBusy = false; restoring = false; clearCollections(); }
     function reset(note) {
       epoch++; clearExpiry(); abortReads(); for (const key of Object.keys(generations)) generations[key] = 0; for (const r of requests) r.controller.abort();
-      credential = ''; library = ''; connected = false; contextIDs = []; query = ''; selected = ''; collectionID = ''; pending = null; warning = null; mutationBusy = false;
+      credential = ''; library = ''; connected = false; contextIDs = []; query = ''; selected = ''; collectionID = ''; savedID = ''; savedSection = 'execute'; savedState = 'active'; pending = null; warning = null; mutationBusy = false;
       directoryState = 'active'; memberState = 'active'; collectionSection = 'members';
       clearScoped(); notice = note || ''; message = note || ''; emit();
     }
@@ -274,7 +341,7 @@
     async function acquire(scope) { if (readCount < READ_LIMIT) { readCount++; return true; } if (waiters.length >= 16) throw new LibraryError('busy'); return new Promise(resolve => waiters.push({ scope, resolve })); }
     function release() { const nextWaiter = waiters.shift(); if (nextWaiter) nextWaiter.resolve(true); else readCount--; }
     async function read(scope, route, value) {
-      const ranked = route === 'v2/search' || route === 'v2/page';
+      const ranked = route === 'v2/search' || route === 'v2/page' || /^v2\/recents\//.test(route) || route === 'v2/collections/execute' || route === 'v2/collections/page' && value.query_kind === 'execute';
       if (ranked && mutationBusy) throw new LibraryError('busy');
       const s = stamp(scope); if (!await acquire(scope)) return null;
       let r;
@@ -308,6 +375,13 @@
     async function resume() {
       if (!credential || !active) return;
       abortReads(); connected = false; clearScoped(); const s = stamp('restore'); restoring = true; message = 'Checking library access and temporary context…'; emit();
+      if (libraryView === 'saved' || libraryView === 'continue') {
+        try {
+          if (libraryView === 'continue') { await Promise.all([recentSelections(), savedDirectory('active')]); }
+          else { await savedDirectory(); if (current(s) && savedID) await openSavedQuery(savedID); }
+        } finally { if (current(s)) { restoring = false; emit(); } }
+        return;
+      }
       if (libraryView === 'collections') {
         try { await collectionDirectory(); if (current(s) && collectionID) await openCollection(collectionID); }
         finally { if (current(s)) { restoring = false; emit(); } }
@@ -380,48 +454,75 @@
       await Promise.all(['asset', 'counts', ...listKinds].map(kind => loadSection(kind)).concat(status()));
     }
     async function dispatch() {
+      if (pending && pending.family === 'saved_query') return dispatchSaved();
       if (pending && pending.family === 'collection') return dispatchCollection();
       expire(); if (!pending || pending.expired || mutationBusy || !credential || !active) { emit(); return; }
-      const operation = pending, s = { epoch }; let refreshRanked = false;
-      mutationBusy = true; invalidate('restore'); restoring = false; dropSearch(); operation.dispatched = true; message = 'Sending personal action…'; emit();
+      const operation = pending, pair = operation.querySelection, currentPair = querySelection || selectionCandidate;
+      const ownedPair = pair && libraryView === 'saved' && savedID === pair.collection_id && currentPair && currentPair.collection_id === pair.collection_id && currentPair.asset_id === pair.asset_id && (!selected || selected === pair.asset_id) ? { ...pair } : null;
+      const ownedPicker = !pair && operation.pickerDraft && operation.pickerDraft === draft && libraryView === 'saved' && queryPicker && selected === operation.assetID ? draft : null;
+      const s = { epoch, intent: intentGeneration, view: libraryView, querySelection: ownedPair, pickerDraft: ownedPicker }; let refreshRanked = false, refreshAsset = false;
+      mutationBusy = true; invalidate('restore'); restoring = false; dropRankedViews(); operation.dispatched = true; message = 'Sending personal action…'; emit();
       const r = { scope: 'mutation', controller: new AbortController() }; requests.add(r);
       try {
         const receipt = await send('v2/' + operation.kind, operation.serialized, credential, r.controller.signal);
         if (s.epoch !== epoch || pending !== operation) return;
         requireValue(receipt.operation_id === operation.id && receipt.kind === operation.kind);
-        dropSearch(); clearExpiry(); pending = null; message = 'Action recorded. Checking current state…'; statusFresh = false;
-        if (active) { if (selected !== operation.assetID) await inspect(operation.assetID); else await status(); refreshRanked = true; }
+        clearExpiry(); pending = null;
+        if (s.intent === intentGeneration) { dropRankedViews(); message = 'Action recorded. Checking current state…'; statusFresh = false; }
+        if (active && s.intent === intentGeneration && s.view === libraryView) {
+          if (s.querySelection && savedID === s.querySelection.collection_id) {
+            // dropRankedViews intentionally cleared selected. Only a fresh
+            // execution may admit this exact original pair back to the inspector.
+            selectionCandidate = { ...s.querySelection }; refreshRanked = true;
+          } else if (!pair && selected === operation.assetID && (s.view !== 'saved' || s.pickerDraft)) { refreshAsset = true; refreshRanked = true; }
+        }
       } catch (error) {
         if (s.epoch !== epoch || pending !== operation) return;
         if (error.code === 'unauthenticated') { authFailure(s); return; }
         // Even a valid server error can follow COMMIT. Neither a later denial
         // nor a current null status proves the historical action rolled back.
-        dropSearch(); operation.uncertain = true;
+        if (s.intent === intentGeneration) dropRankedViews(); operation.uncertain = true;
         if (error.code === 'expired_request') operation.expired = true;
-        message = error.message + ' The action may have been accepted. Check current state.';
+        if (s.intent === intentGeneration) message = error.message + ' The action may have been accepted. Check current state.';
       } finally {
         requests.delete(r); if (s.epoch === epoch) {
-          dropSearch(); mutationBusy = false; expire(); emit();
-          if (refreshRanked && active && credential) { if (connected) await search(query); else await resume(); }
+          if (s.intent === intentGeneration) dropRankedViews();
+          expire();
+          if (refreshRanked && active && credential && s.intent === intentGeneration && s.view === libraryView) {
+            activitySettlement = s;
+            try {
+              try { if (refreshAsset && selected === operation.assetID) await status(); }
+              finally { if (activitySettlement === s && s.epoch === epoch) { mutationBusy = false; emit(); } }
+              if (s.epoch === epoch && active && credential && s.intent === intentGeneration && s.view === libraryView) {
+                if (s.pickerDraft) {
+                  // Refresh this ordinary picker search without executing a
+                  // saved query or replacing its deliberate editor/context.
+                  if (draft === s.pickerDraft && queryPicker && selected === operation.assetID) await search(query);
+                } else await refreshRankedView();
+              }
+            } finally { if (activitySettlement === s) activitySettlement = null; }
+          } else { mutationBusy = false; emit(); }
         }
       }
     }
     async function mutate(kind) {
       expire(); if (!active || !connected || !selected || pending || mutationBusy || warning && !warning.acknowledged) { emit(); return; }
-      const actionEpoch = epoch, actionAsset = selected;
+      const actionEpoch = epoch, actionAsset = selected, actionIntent = intentGeneration, actionView = libraryView;
+      const actionQuery = libraryView === 'saved' && querySelection && querySelection.collection_id === savedID && querySelection.asset_id === selected ? { ...querySelection } : null;
+      const actionPicker = !actionQuery && libraryView === 'saved' && queryPicker && draft ? draft : null;
       if (!await status()) return;
-      if (actionEpoch !== epoch || actionAsset !== selected || !active || !connected || pending || mutationBusy || warning && !warning.acknowledged) return;
+      if (actionEpoch !== epoch || actionIntent !== intentGeneration || actionView !== libraryView || actionAsset !== selected || !active || !connected || pending || mutationBusy || warning && !warning.acknowledged) return;
       if (kind === 'clear' && preference === null) { message = 'There is no current personal selection to clear.'; emit(); return; }
       const bytes = new Uint8Array(16); random.getRandomValues(bytes);
       const operationID = 'ui_' + Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
       const expires = clock() + 600;
       const value = body(2, { operation_id: operationID, asset_id: selected, expected_token: kind === 'clear' ? preference : null, expires_unix: expires });
-      pending = { id: operationID, assetID: selected, kind, expires, serialized: JSON.stringify(value), dispatched: false, uncertain: false, expired: false };
+      pending = { id: operationID, assetID: selected, querySelection: actionQuery, pickerDraft: actionPicker, kind, expires, serialized: JSON.stringify(value), dispatched: false, uncertain: false, expired: false };
       expiryTimer = setTimeout(() => { if (pending && pending.id === operationID) { pending.expired = true; emit(); } }, 600000);
       if (expiryTimer && typeof expiryTimer.unref === 'function') expiryTimer.unref();
       await dispatch();
     }
-    async function checkActionState() { if (pending && pending.family === 'collection') { if (libraryView !== 'collections') { libraryView = 'collections'; abortReads(); clearScoped(); connected = false; emit(); } if (pending.collectionID) await openCollection(pending.collectionID); else await collectionDirectory(); return; } const target = pending ? pending.assetID : warning ? warning.assetID : selected; if (target && target !== selected) await inspect(target); else await status(); }
+    async function checkActionState() { if (pending && pending.family === 'saved_query') { libraryView = 'saved'; abortReads(); clearScoped(); connected = false; savedID = pending.collectionID; emit(); await openSavedQuery(savedID, 'definition'); return; } if (pending && pending.family === 'collection') { if (libraryView !== 'collections') { libraryView = 'collections'; abortReads(); clearScoped(); connected = false; emit(); } if (pending.collectionID) await openCollection(pending.collectionID); else await collectionDirectory(); return; } const target = pending ? pending.assetID : warning ? warning.assetID : selected; if (target && target !== selected) await inspect(target); else await status(); }
     function acknowledge() { expire(); if (warning && statusFresh && selected === warning.assetID) { warning.acknowledged = true; message = 'Earlier outcome acknowledged. Current state is shown separately.'; emit(); } }
     function publicSummary(value) { if (!value) return null; const { collection_id, name, archived, creator, permissions } = value; return { collection_id, name, archived, creator, permissions: { ...permissions } }; }
     function collectionView() {
@@ -438,7 +539,18 @@
     function settlementCurrent(owner) { return owner.epoch === epoch && owner.intent === intentGeneration && active && !!credential && libraryView === 'collections' && collectionID === owner.collectionID; }
     function userIntent(action) {
       return (...args) => {
+        // A search excluded by the pending personal action owns no new state.
+        if (action === search && mutationBusy) return action(...args);
         intentGeneration++;
+        if (activitySettlement) {
+          // The receipt is settled; the accepted intent owns subsequent state.
+          activitySettlement = null; mutationBusy = false;
+          for (const scope of ['search', 'sqExecute', 'recents', 'detail', 'status']) invalidate(scope);
+          searchBusy = false; next = null; querySelection = null; selectionCandidate = null;
+          if (savedWindows.execute && savedWindows.execute.busy) delete savedWindows.execute;
+          if (recentWindow && recentWindow.busy) recentWindow = null;
+        }
+        if (savedSettlement) { savedSettlement = null; for (const scope of savedScopes) invalidate(scope); savedBusy = false; for (const [kind, w] of Object.entries(savedWindows)) if (w.busy) delete savedWindows[kind]; }
         // Cancel only the older settlement's collection reads. A settled
         // receipt stays settled; the next user action owns displayed state.
         if (settlementOwner) {
@@ -451,7 +563,7 @@
       };
     }
     async function switchView(value) {
-      if (!['assets', 'collections'].includes(value)) return;
+      if (!['assets', 'collections', 'saved', 'continue'].includes(value)) return;
       libraryView = value; abortReads(); clearScoped(); connected = false; emit(); await resume();
     }
     function windowBinding(v) { return JSON.stringify([v.kind, v.collection, v.state, v.can_create, v.matched_count, v.count_scope, v.window_complete, v.sort_version, v.snapshot_scope]); }
@@ -515,7 +627,7 @@
       if (values.size >= 64) { collectionNotice('Select up to 64 assets for one action. You can add more in another batch.'); return; }
       const found = picker ? items.find(x => x.asset_id === assetID) : (collectionWindows.members && collectionWindows.members.items || []).find(x => x.asset_id === assetID && x.entry_id === entryID && !x.removed);
       if (!found) return;
-      values.set(assetID, { asset_id: assetID, ...(picker ? {} : { entry_id: entryID }) }); emit();
+      values.set(assetID, { asset_id: assetID, label: found.label, ...(picker ? {} : { entry_id: entryID }) }); emit();
     }
     async function startPicker() {
       if (!collectionView().canChange || collectionCurrent.archived) return;
@@ -598,7 +710,243 @@
         await collectionMutation('grants', { changes: [{ kind: remove ? 'remove' : 'put', grant_id: existing ? existing.grant_id : newID('grant'), expected: existing ? JSON.parse(JSON.stringify(existing.expected)) : null, value: remove ? null : value }] });
       } catch (_) { collectionNotice(messages.invalid); }
     }
-    const client = { connect, setActive, search, inspect, status, loadSection, context, remember: () => mutate('select'), clear: () => mutate('clear'), retry: dispatch, acknowledge,
+    function publicWindow(w) {
+      if (!active || !w) return null;
+      return { busy: !!w.busy, error: w.error || '', next: !!w.next, count: w.count || 0, complete: w.complete !== false, page: w.page || 0, canCreate: !!w.canCreate,
+        items: (w.items || []).map(x => w.kind === 'directory' ? publicSummary(x) : w.kind === 'access' ? { grant_id: x.grant_id, subject_id: x.expected.value.subject_id, actions: x.expected.value.actions.slice(), removed: x.expected.removed } : JSON.parse(JSON.stringify(x))) };
+    }
+    function savedView() {
+      return { current: active ? publicSummary(savedCurrent) : null, section: savedSection, directoryState: savedState, busy: savedBusy, error: active ? savedError : '',
+        windows: active ? Object.fromEntries(Object.entries(savedWindows).map(([k, w]) => [k, publicWindow(w)])) : {},
+        definition: active && savedDefinition ? JSON.parse(JSON.stringify(savedDefinition)) : null, anchors: active ? savedAnchors.map(x => ({ ...x })) : [],
+        editor: active && draft ? { mode: draft.mode, name: draft.name, text: draft.text, anchors: draft.anchors.map(x => ({ ...x })) } : null,
+        picker: active && queryPicker, canChange: savedCanChange(), selected: active && querySelection && selected === querySelection.asset_id ? { ...querySelection } : null,
+        canAcknowledge: active && !!pending && pending.family === 'saved_query' && !mutationBusy && !!savedCurrent && savedCurrent.collection_id === pending.collectionID };
+    }
+    function savedCanChange() { return active && connected && !savedBusy && !!savedCurrent && savedCurrent.permissions.read && savedCurrent.permissions.edit && !pending && !mutationBusy && (!warning || warning.acknowledged); }
+    function clearSaved() { savedCurrent = null; savedWindows = {}; savedDefinition = null; savedAnchors = []; savedError = ''; savedBusy = false; draft = null; queryPicker = false; querySelection = null; selectionCandidate = null; }
+    function invalidateSaved() { for (const scope of savedScopes) invalidate(scope); clearSaved(); }
+    function clearInspector(note = '') { invalidate('detail'); invalidate('status'); selected = ''; sections = {}; preference = null; statusFresh = false; if (note) message = note; }
+    function dropRankedViews() {
+      dropSearch(); invalidate('sqExecute'); invalidate('recents'); delete savedWindows.execute; recentWindow = null;
+      if (querySelection) { selectionCandidate = querySelection; querySelection = null; clearInspector('Selection needs to be checked in fresh results.'); }
+    }
+    async function refreshRankedView() {
+      if (libraryView === 'saved' && savedCurrent && !savedCurrent.archived) await savedList('execute');
+      else if (libraryView === 'continue') await recentSelections();
+      else if (libraryView === 'assets') { if (connected) await search(query); else await resume(); }
+    }
+    function scopeFor(kind) { return { directory: 'sqDirectory', definition: 'sqDefinition', execute: 'sqExecute', history: 'sqHistory', access: 'sqAccess' }[kind]; }
+    function savedBinding(v) { return goJSON([v.version, v.kind, v.collection, v.can_create, v.query_version, v.matched_count, v.count_scope, v.window_complete, v.sort_version, v.snapshot_scope]); }
+    function acceptWindow(old, response, more, kind) {
+      const rows = old.rows + response.items.length, bytes = old.bytes + encoder.encode(goJSON(response)).length;
+      requireValue(old.page < 8192 && bytes <= 32 * 1024 * 1024 && rows <= response.matched_count && (!response.next_page_token || response.items.length > 0) && (response.next_page_token !== null || rows === response.matched_count));
+      const binding = savedBinding(response); requireValue(!more || binding === old.binding);
+      const tokens = new Set(old.tokens), identities = new Set(old.identities); let lastIdentity = old.lastIdentity || '';
+      if (more) { requireValue(!tokens.has(old.next)); tokens.add(old.next); }
+      if (response.next_page_token) requireValue(!tokens.has(response.next_page_token));
+      if (kind !== 'history') for (const row of response.items) {
+        const key = kind === 'execute' ? goJSON([row.result_id.collection_id, row.result_id.asset_id]) : row.collection_id || row.grant_id || row.asset_id;
+        requireValue(!identities.has(key) && identities.size < savedCaps[kind] && (!['directory', 'access'].includes(kind) || !lastIdentity || lastIdentity < key)); identities.add(key); lastIdentity = key;
+      }
+      return { kind, items: ['execute', 'recents'].includes(kind) && more ? old.items.concat(response.items) : response.items, next: response.next_page_token,
+        count: response.matched_count, complete: response.window_complete, canCreate: response.can_create === true, binding, tokens, identities, lastIdentity, rows, bytes, page: old.page + 1, busy: false, error: '' };
+    }
+    function emptyWindow(kind) { return { kind, items: [], rows: 0, bytes: 0, page: 0, tokens: new Set(), identities: new Set() }; }
+    async function verifySavedSummary(target, owner) {
+      const value = await read('sqOpen', 'v2/collections/open', body(2, { collection_id: target }));
+      if (!value || !current(owner) || savedID !== target || !['saved', 'continue'].includes(libraryView)) return false;
+      requireValue(value.collection.collection_id === target && value.collection.permissions.read);
+      savedCurrent = value.collection; connected = true; return true;
+    }
+    async function savedList(kind, more = false) {
+      const scope = scopeFor(kind), target = savedID;
+      if (!scope || kind === 'definition' || !active || !credential || mutationBusy) return;
+      if (kind !== 'directory' && (!savedCurrent || !savedCurrent.permissions.read || kind === 'access' && !(savedCurrent.permissions.edit && savedCurrent.permissions.admin) || kind === 'execute' && savedCurrent.archived)) return;
+      const previous = savedWindows[kind]; if (more && (!previous || previous.busy || !previous.next)) return;
+      if (!more) invalidate(scope);
+      const owner = stamp(scope), old = more ? previous : emptyWindow(kind);
+      if (kind === 'execute' && !more && querySelection) { selectionCandidate = querySelection; querySelection = null; clearInspector('Selection needs to be checked in fresh results.'); }
+      savedWindows[kind] = { ...old, busy: true, error: '' }; emit();
+      try {
+        const value = more ? { query_kind: kind, collection_id: kind === 'directory' ? '' : target, token: old.next } : kind === 'directory' ? { state: savedState, page_size: 100 } : { collection_id: target, page_size: 100 };
+        const response = await read(scope, 'v2/collections/' + (more ? 'page' : kind), body(2, value));
+        if (!response || !current(owner) || kind !== 'directory' && savedID !== target) return;
+        requireValue(response.kind === kind && (kind === 'directory' || response.collection.collection_id === target && response.collection.permissions.read && (kind !== 'access' || response.collection.permissions.edit && response.collection.permissions.admin)));
+        const accepted = acceptWindow(old, response, more, kind);
+        if (kind !== 'directory') {
+          if (savedCurrent && response.collection.definition_version !== savedCurrent.definition_version) { savedDefinition = null; savedAnchors = []; draft = null; queryPicker = false; }
+          savedCurrent = response.collection;
+        }
+        savedWindows[kind] = accepted; connected = true; savedError = '';
+        if (kind === 'execute' && selectionCandidate) {
+          const pair = selectionCandidate, found = response.items.find(x => x.result_id.collection_id === pair.collection_id && x.asset_id === pair.asset_id);
+          if (found) { selectionCandidate = null; querySelection = pair; emit(); await inspect(pair.asset_id); }
+          else if (response.next_page_token === null) { selectionCandidate = null; clearInspector('The selected asset is no longer in this query. Choose a result to continue.'); }
+        }
+      } catch (error) {
+        if (current(owner)) {
+          savedWindows[kind] = { ...emptyWindow(kind), error: error.message }; savedError = error.message;
+          if (kind !== 'directory') { savedCurrent = null; savedDefinition = null; savedAnchors = []; draft = null; queryPicker = false; querySelection = null; selectionCandidate = null; clearInspector(); }
+          errorFor(owner, error);
+          if (kind !== 'directory' && current(owner) && error.code !== 'unauthenticated') {
+            try { await verifySavedSummary(target, owner); } catch (summaryError) { if (current(owner)) { savedCurrent = null; errorFor(owner, summaryError); } }
+          }
+        }
+      } finally { if (current(owner)) { if (savedWindows[kind]) savedWindows[kind].busy = false; emit(); } }
+    }
+    async function savedDirectory(state = savedState, more = false) { if (!['active', 'archived', 'all'].includes(state)) return; if (savedBusy && !draft) { for (const scope of savedScopes) if (scope !== 'recents') invalidate(scope); clearSaved(); savedID = ''; } if (state !== savedState) { savedState = state; more = false; } await savedList('directory', more); }
+    async function readDefinition() {
+      if (!active || !credential || !savedCurrent || mutationBusy) return false;
+      invalidate('sqDefinition'); const owner = stamp('sqDefinition'), target = savedID;
+      savedDefinition = null; savedAnchors = []; savedWindows.definition = { ...emptyWindow('definition'), busy: true }; emit();
+      try {
+        const response = await read('sqDefinition', 'v2/collections/definition', body(2, { collection_id: target }));
+        if (!response || !current(owner) || savedID !== target) return false;
+        requireValue(response.collection.collection_id === target && response.collection.permissions.read);
+        savedCurrent = response.collection;
+        const labels = [];
+        for (const assetID of response.definition.context_asset_ids) {
+          const value = await read('sqDefinition', 'v1/asset', body(1, { asset_id: assetID }));
+          if (!value || !current(owner) || savedID !== target) return false;
+          requireValue(value.asset.asset_id === assetID); labels.push({ asset_id: assetID, label: value.asset.label });
+        }
+        savedDefinition = response.definition; savedAnchors = labels; savedWindows.definition = { ...emptyWindow('definition'), busy: false }; return true;
+      } catch (error) {
+        if (current(owner)) { savedDefinition = null; savedAnchors = []; draft = null; savedCurrent = null; savedWindows.definition = { ...emptyWindow('definition'), error: error.message }; errorFor(owner, error); try { if (error.code !== 'unauthenticated') await verifySavedSummary(target, owner); } catch (e) { if (current(owner)) errorFor(owner, e); } }
+        return false;
+      } finally { if (current(owner)) { if (savedWindows.definition) savedWindows.definition.busy = false; emit(); } }
+    }
+    async function openSavedQuery(target, section = 'execute') {
+      if (!credential || !active || mutationBusy || !cid(target, 'collection')) return;
+      const wasSelected = !!selected;
+      if (libraryView !== 'saved') { libraryView = 'saved'; abortReads(); clearScoped(); connected = false; }
+      for (const scope of savedScopes) if (scope !== 'recents') invalidate(scope);
+      clearSaved(); clearInspector(wasSelected ? 'Selection cleared while refreshing this query. Choose a current result to continue.' : ''); savedID = target; savedSection = section; savedBusy = true;
+      const owner = stamp('sqOpen'); emit();
+      try {
+        if (!await verifySavedSummary(target, owner)) return;
+        if (savedSection === 'access' && !(savedCurrent.permissions.edit && savedCurrent.permissions.admin)) savedSection = 'execute';
+        savedBusy = false; emit();
+        if (savedSection === 'definition') await readDefinition(); else if (savedSection !== 'execute' || !savedCurrent.archived) await savedList(savedSection);
+      } catch (error) { if (current(owner)) { savedCurrent = null; savedError = error.message; errorFor(owner, error); } }
+      finally { if (current(owner)) { savedBusy = false; emit(); } }
+    }
+    async function savedTab(kind) {
+      if (!['execute', 'definition', 'history', 'access'].includes(kind) || !savedCurrent || kind === 'access' && !(savedCurrent.permissions.read && savedCurrent.permissions.edit && savedCurrent.permissions.admin)) return;
+      for (const scope of savedScopes) if (!['sqDirectory', 'sqOpen', 'recents'].includes(scope)) invalidate(scope);
+      savedWindows = {}; savedDefinition = null; savedAnchors = []; draft = null; queryPicker = false; savedSection = kind; querySelection = null; selectionCandidate = null; clearInspector(); emit();
+      if (kind === 'definition') await readDefinition(); else await savedList(kind);
+    }
+    async function recentSelections(more = false) {
+      if (!active || !credential || mutationBusy) return;
+      const previous = recentWindow; if (more && (!previous || previous.busy || !previous.next)) return;
+      if (!more) { invalidate('recents'); clearInspector(); }
+      const owner = stamp('recents'), old = more ? previous : emptyWindow('recents'); recentWindow = { ...old, busy: true }; emit();
+      try {
+        const response = await read('recents', 'v2/recents/' + (more ? 'page' : 'list'), body(2, more ? { token: old.next } : { page_size: 100 }));
+        if (!response || !current(owner)) return;
+        recentWindow = acceptWindow(old, response, more, 'recents'); connected = true;
+      } catch (error) { if (current(owner)) { recentWindow = { ...emptyWindow('recents'), error: error.message }; clearInspector(); errorFor(owner, error); } }
+      finally { if (current(owner)) { recentWindow.busy = false; emit(); } }
+    }
+    async function inspectSavedResult(queryID, assetID) {
+      const row = (savedWindows.execute && savedWindows.execute.items || []).find(x => x.result_id.collection_id === queryID && x.result_id.asset_id === assetID && x.asset_id === assetID);
+      if (!row || queryID !== savedID || !savedCurrent) return;
+      querySelection = { collection_id: queryID, asset_id: assetID }; selectionCandidate = null; await inspect(assetID);
+    }
+    async function resumeRecent(assetID) { if (!(recentWindow && recentWindow.items.some(x => x.asset_id === assetID))) return; querySelection = null; selectionCandidate = null; await inspect(assetID); }
+    async function startSavedCreate(source = 'blank') {
+      if (!active || !connected || pending || mutationBusy || warning && !warning.acknowledged || !['blank', 'search', 'manual'].includes(source)) return;
+      const anchors = source === 'manual' ? Array.from(memberSelection.values(), x => ({ asset_id: x.asset_id, label: x.label })) : source === 'search' ? contexts.map(x => ({ asset_id: x.asset_id, label: x.label })) : [];
+      if (anchors.length > 64 || source === 'manual' && !anchors.length) { collectionNotice('Choose up to 64 permitted assets explicitly before saving a context.'); return; }
+      const textValue = source === 'search' ? query : '', owner = { epoch, intent: intentGeneration };
+      libraryView = 'saved'; abortReads(); clearScoped(); clearInspector(); savedID = ''; savedSection = 'definition'; savedState = 'active'; emit();
+      await savedDirectory('active');
+      if (owner.epoch !== epoch || owner.intent !== intentGeneration || !active || libraryView !== 'saved' || !(savedWindows.directory && savedWindows.directory.canCreate)) return;
+      draft = { mode: 'create', name: '', text: textValue, anchors, baseVersion: '' }; emit();
+    }
+    async function editSavedDefinition(repair = false) {
+      if (!savedCanChange()) return;
+      const target = savedID, owner = { epoch, intent: intentGeneration };
+      if (!repair && !await readDefinition()) return;
+      if (owner.epoch !== epoch || owner.intent !== intentGeneration || savedID !== target || !savedCanChange()) return;
+      if (repair) {
+        // The deliberate blank editor owns definition state now, including any
+        // older definition response or still-pending anchor-label continuation.
+        invalidate('sqDefinition'); savedDefinition = null; savedAnchors = []; delete savedWindows.definition;
+      }
+      for (const scope of ['sqExecute', 'sqHistory', 'sqAccess']) invalidate(scope);
+      delete savedWindows.execute; querySelection = null; selectionCandidate = null; clearInspector(); savedSection = 'definition';
+      draft = { mode: repair ? 'repair' : 'replace', name: savedCurrent.name, text: repair ? '' : savedDefinition.text, anchors: repair ? [] : savedAnchors.map(x => ({ ...x })), baseVersion: savedCurrent.definition_version }; emit();
+    }
+    function updateSavedDraft(key, value) {
+      if (!draft || pending || mutationBusy || !['name', 'text'].includes(key)) return;
+      // Input changes are deliberate local state; no repaint or focus reset.
+      draft[key] = value; invalidate('sqExecute'); invalidate('sqHistory'); clearInspector();
+    }
+    function removeSavedAnchor(assetID) { if (!draft || pending || mutationBusy) return; draft.anchors = draft.anchors.filter(x => x.asset_id !== assetID); emit(); }
+    async function pickSavedAnchors() { if (!draft || pending || mutationBusy) return; queryPicker = true; dropSearch(); query = ''; emit(); await search(''); }
+    function chooseSavedAnchor(assetID) {
+      if (!draft || !queryPicker || pending || mutationBusy) return;
+      if (draft.anchors.some(x => x.asset_id === assetID)) { removeSavedAnchor(assetID); return; }
+      if (draft.anchors.length >= 64) { collectionNotice('Ranking context is limited to 64 assets. Remove an anchor before adding another.'); return; }
+      const found = items.find(x => x.asset_id === assetID); if (!found) return;
+      draft.anchors.push({ asset_id: assetID, label: found.label }); emit();
+    }
+    function finishSavedPicker() { queryPicker = false; dropSearch(); emit(); }
+    function cancelSavedEdit() { draft = null; queryPicker = false; dropSearch(); emit(); }
+    async function saveSavedDraft() {
+      if (!draft) return;
+      const d = draft, value = { definition: { version: 1, kind: 'ranked_assets', text: d.text, context_asset_ids: d.anchors.map(x => x.asset_id).sort() } };
+      if (d.mode !== 'create' && (!savedCurrent || d.baseVersion !== savedCurrent.definition_version)) { collectionNotice('The query changed. Read the current definition before saving.'); return; }
+      await savedMutation(d.mode === 'create' ? 'create' : 'replace_definition', d.mode === 'create' ? { name: d.name, ...value } : value);
+    }
+    async function savedMutation(kind, value) {
+      if (!active || !connected || !credential || pending || mutationBusy || warning && !warning.acknowledged) return;
+      const create = kind === 'create';
+      if (create ? !(savedWindows.directory && !savedWindows.directory.busy && savedWindows.directory.canCreate) : !savedCanChange() || ['grants', 'archive'].includes(kind) && !savedCurrent.permissions.admin) return;
+      try {
+        if (!create && (kind === 'rename' && value.name === savedCurrent.name || kind === 'archive' && value.archived === savedCurrent.archived)) { collectionNotice('There is no change to save.'); return; }
+        const target = create ? newID('collection') : savedID, operation = newID('operation');
+        const serialized = savedCanonical({ version: 2, library_id: library, operation_id: operation, collection_id: target, expected_version: create ? '' : savedCurrent.definition_version, kind, value: create ? { name: value.name, creator_grant_id: newID('grant'), definition: value.definition } : value });
+        pending = { family: 'saved_query', id: operation, collectionID: target, kind, serialized, uncertain: false }; await dispatchSaved();
+      } catch (error) { collectionNotice(error instanceof LibraryError ? error.message : messages.invalid); }
+    }
+    async function dispatchSaved() {
+      if (!pending || pending.family !== 'saved_query' || mutationBusy || !active || !credential) return;
+      const operation = pending, owner = { epoch, intent: intentGeneration, view: libraryView }; let refresh = false;
+      mutationBusy = true; invalidate('restore'); restoring = false; invalidateSaved(); dropSearch(); clearInspector(); savedID = operation.collectionID; message = 'Saving query change…'; emit();
+      const r = { scope: 'mutation', controller: new AbortController() }; requests.add(r);
+      try {
+        const receipt = await send('v2/collections/mutate', operation.serialized, credential, r.controller.signal);
+        if (owner.epoch !== epoch || pending !== operation) return;
+        requireValue(receipt.operation_id === operation.id && receipt.collection_id === operation.collectionID);
+        pending = null; refresh = true;
+        if (owner.intent === intentGeneration) message = libraryView === 'saved' ? 'Query change recorded. Reading current state…' : 'Query change recorded. Check the current query separately.';
+      } catch (error) {
+        if (owner.epoch !== epoch || pending !== operation) return;
+        if (error.code === 'unauthenticated') { authFailure(owner); return; }
+        operation.uncertain = true;
+        if (owner.intent === intentGeneration) message = error.message + ' This change may have been accepted. Retry the same action or check current state separately.';
+      } finally {
+        requests.delete(r);
+        if (owner.epoch === epoch) {
+          mutationBusy = false; emit();
+          if (refresh && active && owner.intent === intentGeneration && libraryView === owner.view && libraryView === 'saved') { savedSettlement = owner; try { await openSavedQuery(operation.collectionID); } finally { if (savedSettlement === owner) savedSettlement = null; } }
+        }
+      }
+    }
+    async function changeSavedAccess(subjectID, actions, grantID = '', remove = false) {
+      if (!savedCanChange() || !savedCurrent.permissions.admin) return;
+      const existing = grantID ? (savedWindows.access && savedWindows.access.items || []).find(x => x.grant_id === grantID) : null;
+      if (grantID && !existing) return;
+      try { await savedMutation('grants', { changes: [{ kind: remove ? 'remove' : 'put', grant_id: existing ? existing.grant_id : newID('grant'), expected: existing ? JSON.parse(JSON.stringify(existing.expected)) : null, value: remove ? null : { subject_id: existing ? existing.expected.value.subject_id : subjectID, scope: { kind: 'collection', collection_id: savedID }, actions: actions.slice().sort() } }] }); }
+      catch (_) { collectionNotice(messages.invalid); }
+    }
+    async function backToSaved() { savedID = ''; invalidateSaved(); clearInspector(); emit(); await savedDirectory(); }
+    function acknowledgeSaved() { if (!savedView().canAcknowledge) return; pending = null; message = 'Earlier query outcome acknowledged as unresolved. The fresh current state is separate.'; emit(); }
+    const client = { savedDirectory, openSavedQuery, savedTab, savedNext: kind => savedList(kind, true), executeSaved: () => savedList('execute'), readDefinition, recentSelections, resumeRecent, inspectSavedResult, startSavedCreate, editSavedDefinition, updateSavedDraft, removeSavedAnchor, pickSavedAnchors, chooseSavedAnchor, finishSavedPicker, cancelSavedEdit, saveSavedDraft, backToSaved, acknowledgeSaved, changeSavedAccess, renameSaved: name => savedMutation('rename', { name }), archiveSaved: archived => savedMutation('archive', { archived }), connect, setActive, search, inspect, status, loadSection, context, remember: () => mutate('select'), clear: () => mutate('clear'), retry: dispatch, acknowledge,
       switchView, collectionDirectory, openCollection, collectionTab, collectionNext: kind => collectionList(kind, true), collectionStart: kind => collectionList(kind), backToCollections,
       createCollection: name => collectionMutation('create', { name }), renameCollection: name => collectionMutation('rename', { name }), archiveCollection: archived => collectionMutation('archive', { archived }),
       startPicker, cancelPicker, selectionToggle, addPicked, useCollectionContext, inspectCollectionAsset, changeMember, changeAccess,
@@ -731,6 +1079,7 @@
         const controls = node(document, 'div', undefined, 'library-collection-actions');
         for (const [value, label] of [['active', 'Active members'], ['removed', 'Removed members']]) { const b = action(label, () => client.collectionTab('members', value), state.mutationBusy); b.setAttribute('aria-pressed', String(c.memberState === value)); controls.append(b); }
         if (c.canChange && !current.archived) controls.append(action('Add assets', () => client.startPicker(), disabled));
+        controls.append(action('Save selected context as query', () => client.startSavedCreate('manual'), disabled || !c.selectedMembers.length));
         controls.append(action('Use selection as temporary context', () => client.useCollectionContext(), disabled || !c.selectedMembers.length)); root.append(controls);
         root.append(node(document, 'p', c.selectedMembers.length + ' selected · Select up to 64 for temporary context. Membership can grow in separate batches. Removal changes this collection only; files are not deleted.', 'hint'));
       }
@@ -776,17 +1125,135 @@
         return form;
       }
     }
+    const savedFormValues = new Map();
+    function renderSaved(state) {
+      const root = get('saved-body'); root.replaceChildren(); const c = state.saved, disabled = state.pending || state.mutationBusy;
+      const current = c.current, editor = c.editor;
+      root.append(node(document, 'h3', 'Saved queries'));
+      root.append(node(document, 'p', 'Named queries rerun against current permitted assets. Ranking context affects order; it does not store a result list or grant file access.', 'hint'));
+      if (c.error) root.append(node(document, 'p', c.error, 'library-error'));
+      if (editor) {
+        const form = node(document, 'form', undefined, 'library-query-editor');
+        form.append(node(document, 'h4', editor.mode === 'create' ? 'Create saved query' : 'Edit query definition'));
+        if (editor.mode === 'repair') form.append(node(document, 'p', 'This replaces the entire query and ranking context. The old definition is not shown or copied. Choose all text and anchors you want to keep.', 'library-outcome'));
+        if (editor.mode === 'create') { const input = formInput(form, 'Query name', 'library-saved-name', editor.name); input.maxLength = 256; input.disabled = disabled; input.addEventListener('input', () => client.updateSavedDraft('name', input.value)); }
+        const input = formInput(form, 'Search text (up to 256 UTF-8 bytes)', 'library-saved-text', editor.text); input.required = false; input.maxLength = 256; input.disabled = disabled; input.addEventListener('input', () => client.updateSavedDraft('text', input.value));
+        form.append(node(document, 'p', editor.anchors.length + ' of 64 ranking anchors chosen. Saving a query does not Remember these assets.', 'hint'));
+        const anchors = node(document, 'ul', undefined, 'library-results');
+        for (const anchor of editor.anchors) { const li = node(document, 'li', undefined, 'library-query-anchor'); li.append(node(document, 'span', anchor.label || 'Unlabelled asset'), action('Remove anchor', () => client.removeSavedAnchor(anchor.asset_id), disabled)); collectionIdentity(li, 'Anchor identity', [anchor.asset_id]); anchors.append(li); }
+        form.append(anchors, action('Choose permitted anchors', () => client.pickSavedAnchors(), disabled)); submitButton(form, 'Save query', disabled); form.append(action('Cancel editing', () => client.cancelSavedEdit(), state.mutationBusy));
+        form.addEventListener('submit', event => { event.preventDefault(); client.saveSavedDraft(); }); root.append(form);
+      }
+      if (!current) {
+        if (!editor) root.append(action('Create saved query', () => client.startSavedCreate(), disabled || !(c.windows.directory && c.windows.directory.canCreate)));
+        const filters = node(document, 'nav', undefined, 'library-collection-actions'); filters.setAttribute('aria-label', 'Saved query state');
+        for (const filter of ['active', 'archived', 'all']) { const b = action(({ active: 'Active', archived: 'Archived', all: 'All' })[filter], () => client.savedDirectory(filter), state.mutationBusy); b.setAttribute('aria-pressed', String(c.directoryState === filter)); filters.append(b); } root.append(filters);
+        renderSavedDirectory(root, c.windows.directory, false); return;
+      }
+      root.append(action('All saved queries', () => client.backToSaved(), state.mutationBusy), node(document, 'h3', current.name), node(document, 'p', (current.archived ? 'Archived' : 'Active') + ' · Created by ' + (current.creator === 'you' ? 'you' : 'another authorized person') + '. Current access is separate from creator attribution.', 'hint'));
+      collectionIdentity(root, 'Query identity', [current.collection_id]);
+      root.append(node(document, 'p', 'Your access: ' + [['read', 'Read'], ['edit', 'Edit'], ['admin', 'Manage access']].filter(([key]) => current.permissions[key]).map(([, label]) => label).join(' · '), 'hint'), action('Refresh current query', () => client.openSavedQuery(current.collection_id), state.mutationBusy));
+      if (c.canChange && !editor) {
+        const form = node(document, 'form', undefined, 'library-collection-form'), key = current.collection_id + '.rename';
+        const name = formInput(form, 'Query name', 'library-saved-rename', savedFormValues.has(key) ? savedFormValues.get(key) : current.name);
+        name.addEventListener('input', () => savedFormValues.set(key, name.value)); submitButton(form, 'Rename query', disabled);
+        form.addEventListener('submit', event => { event.preventDefault(); savedFormValues.delete(key); client.renameSaved(name.value); }); root.append(form);
+        if (current.permissions.admin) root.append(action(current.archived ? 'Unarchive query' : 'Archive query', () => client.archiveSaved(!current.archived), disabled));
+      }
+      const nav = node(document, 'nav', undefined, 'library-collection-actions'); nav.setAttribute('aria-label', 'Saved query sections');
+      for (const [kind, label] of [['execute', 'Results'], ['definition', 'Definition'], ['history', 'History'], ['access', 'Access']]) {
+        if (kind === 'access' && !(current.permissions.read && current.permissions.edit && current.permissions.admin)) continue;
+        const b = action(label, () => client.savedTab(kind), state.mutationBusy || !!editor); b.setAttribute('aria-pressed', String(c.section === kind)); nav.append(b);
+      } root.append(nav);
+      const w = c.windows[c.section];
+      if (c.busy || w && w.busy) root.append(node(document, 'p', 'Reading current permitted query…', 'hint'));
+      if (w && w.error) root.append(node(document, 'p', w.error, 'library-error'), action('Retry current section', () => client.savedTab(c.section), disabled));
+      if (c.section === 'execute') {
+        if (current.archived) root.append(node(document, 'p', 'This query is archived. An administrator can unarchive it before running it.', 'library-empty'));
+        else root.append(action('Run fresh query', () => client.executeSaved(), disabled || !!(w && w.busy)));
+      }
+      if (c.section === 'definition' && !editor) {
+        if (c.definition) {
+          root.append(node(document, 'p', 'Search text: ' + (c.definition.text || '(empty)'), 'library-member-label'), node(document, 'p', c.anchors.length + ' ranking anchors', 'hint'));
+          const list = node(document, 'ul', undefined, 'library-results'); for (const anchor of c.anchors) { const li = node(document, 'li', anchor.label || 'Unlabelled asset'); collectionIdentity(li, 'Anchor identity', [anchor.asset_id]); list.append(li); } root.append(list);
+          if (c.canChange) root.append(action('Edit definition', () => client.editSavedDefinition(), disabled));
+        }
+        if (c.canChange) root.append(action('Replace whole definition from blank', () => client.editSavedDefinition(true), disabled));
+      }
+      if (c.section === 'access' && w && !w.busy && !w.error && c.canChange) root.append(savedAccessForm(null));
+      if (w && !w.error && ['execute', 'history', 'access'].includes(c.section)) {
+        const list = node(document, 'ul', undefined, 'library-results');
+        for (const item of w.items) {
+          const li = node(document, 'li', undefined, 'library-result');
+          if (c.section === 'execute') {
+            const selected = c.selected && c.selected.collection_id === item.result_id.collection_id && c.selected.asset_id === item.result_id.asset_id;
+            const b = action(item.label || 'Unlabelled asset', () => client.inspectSavedResult(item.result_id.collection_id, item.result_id.asset_id), state.mutationBusy, 'library-result-title'); b.setAttribute('aria-pressed', String(!!selected));
+            li.append(b, node(document, 'p', item.reasons.map(r => ({ context: 'Saved ranking context', declared_selection: 'Remembered by you', label_exact: 'Exact label', label_prefix: 'Label starts with query', label_contains: 'Label contains query', stable_id: 'Stable order' })[r]).join(' · '), 'library-reasons')); collectionIdentity(li, 'Query result identity', [item.result_id.collection_id, item.asset_id]);
+          } else if (c.section === 'access') li.append(savedAccessForm(item));
+          else {
+            li.append(node(document, 'h4', ({ create: 'Query created', replace_definition: 'Definition replaced', rename: 'Query renamed', archive: item.value.archived ? 'Query archived' : 'Query unarchived' })[item.kind]), node(document, 'p', (item.actor === 'you' ? 'You' : 'Another authorized person') + ' · Recorded nanoseconds: ' + item.recorded_unix_nano, 'hint'));
+            if (item.value.name !== undefined) li.append(node(document, 'p', item.value.name, 'library-member-label'));
+            if (item.value.definition) { li.append(node(document, 'p', 'Search text: ' + (item.value.definition.text || '(empty)'))); collectionIdentity(li, 'Ranking anchors in this definition', item.value.definition.context_asset_ids); }
+          } list.append(li);
+        } root.append(list); savedPager(root, w, () => client.savedNext(c.section));
+      }
+      function savedAccessForm(item) {
+        const form = node(document, 'form', undefined, 'library-access-form'); const blocked = !c.canChange || disabled;
+        let person; if (!item) person = formInput(form, 'Known person ID', 'library-saved-share-person'); else form.append(node(document, 'h4', item.subject_id), node(document, 'p', item.removed ? 'Removed access entry' : 'Active access entry', 'hint'));
+        form.append(node(document, 'p', 'Sharing this query does not grant access to its anchors or results. Access entries remain independent.', 'hint'));
+        const choices = node(document, 'fieldset'), boxes = []; choices.append(node(document, 'legend', 'Direct query rights'));
+        for (const [right, label] of [['collections.read', 'Read'], ['collections.edit', 'Edit'], ['collections.admin', 'Manage access']]) { const line = node(document, 'label', undefined, 'library-right'), input = node(document, 'input'); input.type = 'checkbox'; input.checked = item ? item.actions.includes(right) : right === 'collections.read'; input.disabled = blocked; input.value = right; line.append(input, node(document, 'span', label)); choices.append(line); boxes.push(input); }
+        form.append(choices); submitButton(form, item ? 'Save access changes' : 'Share query', blocked);
+        form.addEventListener('submit', event => { event.preventDefault(); client.changeSavedAccess(item ? item.subject_id : person.value.trim(), boxes.filter(x => x.checked).map(x => x.value), item ? item.grant_id : ''); });
+        if (item && !item.removed) form.append(action('Remove access entry', () => client.changeSavedAccess(item.subject_id, item.actions, item.grant_id, true), blocked)); return form;
+      }
+    }
+    function savedPager(root, w, more) {
+      if (w.busy) return;
+      root.append(node(document, 'p', w.count + ' permitted records in this window' + (w.complete ? '.' : ' · Incomplete window; narrow or rerun to check current results.'), 'hint'));
+      if (!w.items.length) root.append(node(document, 'p', 'No records in this permitted response.', 'library-empty'));
+      if (w.next) root.append(action('More records', more, w.busy));
+    }
+    function renderSavedDirectory(root, w, continued) {
+      if (!w || w.busy) root.append(node(document, 'p', 'Reading permitted saved contexts…', 'hint'));
+      if (!w) return;
+      if (w.error) { root.append(node(document, 'p', w.error, 'library-error'), action('Retry saved contexts', () => client.savedDirectory(continued ? 'active' : undefined))); return; }
+      const list = node(document, 'ul', undefined, 'library-results');
+      for (const item of w.items) { const li = node(document, 'li', undefined, 'library-result'); li.append(action(item.name, () => client.openSavedQuery(item.collection_id), false, 'library-result-title'), node(document, 'p', item.archived ? 'Archived' : 'Active shared or private query', 'hint')); list.append(li); } root.append(list);
+      savedPager(root, w, () => client.savedDirectory(continued ? 'active' : undefined, true));
+    }
+    function recentDate(value) { return BigInt(value) <= 8640000000000n ? new Date(Number(value) * 1000).toLocaleString() : 'Outside the calendar range'; }
+    function renderContinue(state) {
+      const root = get('continue-body'); root.replaceChildren(); root.append(node(document, 'h3', 'My recent selections'), node(document, 'p', 'Explicitly remembered by you; retained up to 30 days; not included in catalog exports. Inspecting, searching, and saving queries do not Remember anything.', 'hint'), action('Refresh recent selections', () => client.recentSelections(), state.mutationBusy));
+      const w = state.recents;
+      if (!w || w.busy) root.append(node(document, 'p', 'Reading your permitted recent selections…', 'hint'));
+      if (w && w.error) root.append(node(document, 'p', w.error, 'library-error'), action('Retry recent selections', () => client.recentSelections()));
+      if (w && !w.error) {
+        const list = node(document, 'ul', undefined, 'library-results');
+        for (const item of w.items) { const li = node(document, 'li', undefined, 'library-result'); li.append(action(item.label || 'Unlabelled asset', () => client.resumeRecent(item.asset_id), state.mutationBusy, 'library-result-title'), node(document, 'p', 'Remembered ' + recentDate(item.selected_unix) + ' · Expires ' + recentDate(item.expires_unix), 'hint')); collectionIdentity(li, 'Asset identity', [item.asset_id]); list.append(li); } root.append(list);
+        if (!w.busy && !w.items.length) root.append(node(document, 'p', 'No current permitted selections. Use Remember for me in an asset inspector to continue here later.', 'library-empty'));
+        savedPager(root, w, () => client.recentSelections(true));
+      }
+      root.append(node(document, 'h3', 'Saved contexts'), node(document, 'p', 'Open an accessible active query to rerun its saved text and ranking context. Each person sees results under their own access.', 'hint')); renderSavedDirectory(root, state.saved.windows.directory, true);
+    }
     function render(state) {
       const focusOwner = document.activeElement, focused = focusOwner && focusOwner.id;
+      const caret = focusOwner && typeof focusOwner.selectionStart === 'number' ? [focusOwner.selectionStart, focusOwner.selectionEnd] : null;
+      if (!state.active || !state.hasConnection) savedFormValues.clear();
       const focusLabel = focusOwner && focusOwner.tagName === 'BUTTON' ? focusOwner.textContent : '';
+      const savedFocus = focusOwner && (get('saved-panel').contains(focusOwner) || get('continue-panel').contains(focusOwner));
       const collectionFocus = focusOwner && get('collections-panel').contains(focusOwner);
       get('connection-state').textContent = state.connected ? 'Connected to library' : state.hasConnection ? 'Connection needs revalidation' : 'Connect to an existing catalog';
       get('disconnect').hidden = !state.hasConnection; get('connection-form').hidden = state.hasConnection;
       get('status').textContent = [...new Set([state.notice, state.message].filter(Boolean))].join(' '); get('workspace').hidden = !state.active || !state.hasConnection;
-      for (const view of ['assets', 'collections']) get('view-' + view).setAttribute('aria-pressed', String(state.libraryView === view));
-      get('collections-panel').hidden = state.libraryView !== 'collections'; get('assets-panel').hidden = state.libraryView !== 'assets' && !state.collections.picker;
+      for (const view of ['assets', 'collections', 'saved', 'continue']) get('view-' + view).setAttribute('aria-pressed', String(state.libraryView === view));
+      get('collections-panel').hidden = state.libraryView !== 'collections'; get('assets-panel').hidden = state.libraryView !== 'assets' && !state.collections.picker && !state.saved.picker;
+      get('saved-panel').hidden = state.libraryView !== 'saved'; get('continue-panel').hidden = state.libraryView !== 'continue';
+      renderSaved(state); renderContinue(state);
+      get('save-search').disabled = !state.connected || state.pending || state.mutationBusy;
       renderCollections(state);
-      const pickerBar = get('picker-bar'); pickerBar.replaceChildren(); pickerBar.hidden = !state.collections.picker;
+      const pickerBar = get('picker-bar'); pickerBar.replaceChildren(); pickerBar.hidden = !state.collections.picker && !state.saved.picker;
+      if (state.saved.picker) pickerBar.append(node(document, 'h3', 'Choose ranking anchors'), node(document, 'p', state.saved.editor.anchors.length + ' of 64 chosen · Only explicitly chosen assets are saved.'), action('Done choosing anchors', () => client.finishSavedPicker(), state.mutationBusy));
       if (state.collections.picker) pickerBar.append(node(document, 'h3', 'Add permitted assets to this collection'), node(document, 'p', state.collections.pickedAssets.length + ' selected · up to 64 in this batch. Only selected assets are added.'), action('Add selected assets', () => client.addPicked(), state.pending || state.mutationBusy || !state.collections.pickedAssets.length), action('Cancel adding assets', () => client.cancelPicker(), state.mutationBusy));
       get('retry-access').hidden = !state.active || !state.hasConnection || state.connected || state.restoring;
       get('search-button').disabled = state.searchBusy || state.restoring || state.mutationBusy;
@@ -801,7 +1268,8 @@
         const reasonNames = { context: 'Temporary context', declared_selection: 'Remembered by you', label_exact: 'Exact label', label_prefix: 'Label starts with query', label_contains: 'Label contains query', stable_id: 'Stable order' };
         row.append(node(document, 'p', a.reasons.map(r => reasonNames[r]).join(' · '), 'library-reasons'));
         const facts = node(document, 'details', undefined, 'library-identities'); facts.append(node(document, 'summary', 'Asset identity'), node(document, 'code', a.asset_id), node(document, 'p', a.head_revision_id === null ? 'Head revision undisclosed or not set.' : 'Disclosed head: ' + a.head_revision_id)); row.append(facts);
-        if (state.collections.picker) { const b = action(state.collections.pickedAssets.includes(a.asset_id) ? 'Deselect asset' : 'Select asset to add', () => client.selectionToggle(a.asset_id), state.pending || state.mutationBusy, 'library-text-button'); b.setAttribute('aria-pressed', String(state.collections.pickedAssets.includes(a.asset_id))); row.append(b); }
+        if (state.saved.picker) { const chosen = state.saved.editor.anchors.some(x => x.asset_id === a.asset_id); const b = action(chosen ? 'Deselect anchor' : 'Choose as ranking anchor', () => client.chooseSavedAnchor(a.asset_id), state.pending || state.mutationBusy); b.setAttribute('aria-pressed', String(chosen)); row.append(b); }
+        else if (state.collections.picker) { const b = action(state.collections.pickedAssets.includes(a.asset_id) ? 'Deselect asset' : 'Select asset to add', () => client.selectionToggle(a.asset_id), state.pending || state.mutationBusy, 'library-text-button'); b.setAttribute('aria-pressed', String(state.collections.pickedAssets.includes(a.asset_id))); row.append(b); }
         else row.append(action('Use as context', () => client.context(a), state.contexts.some(c => c.asset_id === a.asset_id), 'library-text-button')); resultBox.append(row);
       });
       get('window').textContent = state.searchError ? 'Results could not be completed. Run a fresh search.' : state.connected ? state.count + ' in this result window' + (state.complete ? '.' : ' · Incomplete window. Other permitted matches may exist; narrow the query or add context.') : '';
@@ -837,8 +1305,15 @@
       const outcome = get('outcome'); outcome.replaceChildren();
       if (state.pending) { outcome.append(node(document, 'p', 'An action has no matching confirmed receipt. Check current state separately; it cannot prove the earlier outcome.'), action('Retry same action', () => client.retry(), !state.retryable), action('Check current state', () => client.checkActionState(), state.mutationBusy)); }
       if (state.warning) outcome.append(node(document, 'p', state.warning.message), action('Check current state', () => client.checkActionState(), state.mutationBusy), action(state.warning.acknowledged ? 'Earlier outcome acknowledged' : 'Acknowledge unresolved outcome', () => client.acknowledge(), state.warning.acknowledged || !state.statusFresh));
+      if (state.pendingSavedQuery && state.saved.canAcknowledge) outcome.append(action('Acknowledge unresolved query change', () => client.acknowledgeSaved(), state.mutationBusy));
       outcome.hidden = !state.pending && !state.warning;
-      if (focused) { const replacement = document.getElementById(focused); if (replacement && replacement !== document.activeElement && !replacement.disabled && !replacement.closest('[hidden]')) replacement.focus({ preventScroll: true }); }
+      if (focused) { const replacement = document.getElementById(focused); if (replacement && replacement !== document.activeElement && !replacement.disabled && !replacement.closest('[hidden]')) replacement.focus({ preventScroll: true }); if (caret && replacement && typeof replacement.setSelectionRange === 'function') { try { replacement.setSelectionRange(...caret); } catch (_) {} } }
+      if (savedFocus && focusOwner && !focusOwner.isConnected) {
+        const panel = get(state.libraryView === 'continue' ? 'continue-panel' : 'saved-panel');
+        const candidates = Array.from(panel.querySelectorAll('button')).filter(b => b.textContent === focusLabel && !b.disabled && !b.closest('[hidden]'));
+        const replacement = focused && document.getElementById(focused) || (candidates.length === 1 ? candidates[0] : panel);
+        if (!replacement.closest('[hidden]')) replacement.focus({ preventScroll: true });
+      }
       if (collectionFocus && focusOwner && !focusOwner.isConnected) {
         const candidates = focusLabel ? Array.from(get('collections-panel').querySelectorAll('button')).filter(b => b.textContent === focusLabel && !b.disabled && !b.closest('[hidden]')) : [];
         const replacement = focused && document.getElementById(focused) || (candidates.length === 1 ? candidates[0] : get('collections-heading'));
@@ -852,11 +1327,14 @@
     get('search-form').addEventListener('submit', event => { event.preventDefault(); client.search(get('query').value); });
     get('more').addEventListener('click', () => client.search(undefined, true));
     get('view-assets').addEventListener('click', () => client.switchView('assets'));
+    get('view-saved').addEventListener('click', () => client.switchView('saved'));
+    get('view-continue').addEventListener('click', () => client.switchView('continue'));
+    get('save-search').addEventListener('click', () => client.startSavedCreate('search'));
     get('view-collections').addEventListener('click', () => client.switchView('collections'));
     document.addEventListener('visibilitychange', () => client.setActive(tabActive && !document.hidden));
     globalThis.addEventListener('pagehide', () => { get('credential').value = ''; get('id').value = ''; client.pagehide(); });
     client.setActive(tabActive && !document.hidden); render(client.snapshot());
   }
   function setActive(value) { tabActive = !!value; if (mounted) return mounted.setActive(tabActive && !globalThis.document.hidden); }
-  return { init, setActive, createLibraryClient, createTransport, validate, validateCollection, collectionCanonical, randomCollectionID, renderRecord, renderInspectorNotice, node, LibraryError };
+  return { init, setActive, createLibraryClient, createTransport, validate, validateCollection, validateSaved, savedCanonical, collectionCanonical, randomCollectionID, renderRecord, renderInspectorNotice, node, LibraryError };
 });

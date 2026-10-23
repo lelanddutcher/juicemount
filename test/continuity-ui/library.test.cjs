@@ -296,7 +296,8 @@ for (const outcome of ['receipt', 'uncertain']) {
       assert.equal(f.calls.length, beforeReply, 'ranked query admitted before mutation reply');
       mutationReply.resolve(outcome === 'uncertain' ? error('unavailable', 503) : json({ version: 2, operation_id: operationID, kind: 'select', selection_token: token('a'), receipt_scope: 'operation_result' }));
       if (outcome === 'uncertain') { await action; checked = f.client.status(); }
-      await statusEntered.promise;
+      const statusAdmission = await Promise.race([statusEntered.promise.then(() => 'status-entered'), (checked || action).then(() => 'action-completed')]);
+      assert.equal(statusAdmission, 'status-entered', 'personal action must admit current status before completing');
       assert.equal(f.client.snapshot().next, false, 'personal action retained the old ranked cursor');
       assert.equal(f.client.snapshot().items.length, 0, 'personal action retained the old ranked window');
       if (outcome === 'receipt') {
@@ -320,6 +321,37 @@ for (const outcome of ['receipt', 'uncertain']) {
     }
   }));
 }
+
+for (const successor of ['selection', 'connection']) test('cancelled personal status yields to a newer ' + successor + ' without releasing its mutation', { concurrency: false }, async () => ignoringCancellation(async () => {
+  const heldStatus = deferred(), statusEntered = deferred(), heldMutation = deferred(), mutationEntered = deferred();
+  let firstCommitted = false, statusHeld = false, secondCommitted = false, first, second, secondOperation;
+  const f = fixture(call => {
+    if (call.route === 'v2/select' && call.body.asset_id === A) { firstCommitted = true; return json({ version: 2, operation_id: call.body.operation_id, kind: 'select', selection_token: token('a'), receipt_scope: 'operation_result' }); }
+    if (call.route === 'v2/select' && call.body.asset_id === B) { secondCommitted = true; secondOperation = call.body.operation_id; mutationEntered.resolve(); return heldMutation.promise; }
+    if (call.route === 'v2/preference' && call.body.asset_id === A && firstCommitted && !statusHeld) { statusHeld = true; statusEntered.resolve(); return heldStatus.promise; }
+    if (call.route === 'v2/search') return json(collection([asset(B, 'New owner ranking')]));
+    return ordinary(call, call.body.asset_id === A && firstCommitted ? token('a') : call.body.asset_id === B && secondCommitted ? token('b') : null);
+  });
+  try {
+    await connected(f); await f.client.inspect(A); first = f.client.remember();
+    assert.equal(await Promise.race([statusEntered.promise.then(() => 'entered'), first.then(() => 'completed')]), 'entered', 'matching ordinary activity must admit current status before settling');
+    assert.equal(f.client.snapshot().mutationBusy, true); assert.equal(f.client.snapshot().pending, false);
+    if (successor === 'connection') await f.client.connect(lib, bearer('b'));
+    await f.client.inspect(B); second = f.client.remember();
+    assert.equal(await Promise.race([mutationEntered.promise.then(() => 'entered'), second.then(() => 'completed')]), 'entered', 'new owner must be able to dispatch its own explicit action');
+    const state = f.client.snapshot(), reads = f.calls.length;
+    assert.equal(state.selected, B); assert.equal(state.pending, true); assert.equal(state.mutationBusy, true);
+    heldStatus.resolve(json({ version: 2, asset_id: A, selection_token: token('a') })); await first;
+    assert.equal(f.calls.length, reads, 'cancelled status must admit no old ranking or inspector follow-on');
+    assert.deepEqual(f.client.snapshot(), state, 'old dispatch completion must not clear the newer mutation busy state or selected asset');
+    await f.client.search('blocked newer mutation'); assert.equal(f.calls.length, reads);
+    heldMutation.resolve(json({ version: 2, operation_id: secondOperation, kind: 'select', selection_token: token('b'), receipt_scope: 'operation_result' })); await second;
+    const settled = f.client.snapshot(); assert.equal(settled.selected, B); assert.equal(settled.pending, false); assert.equal(settled.mutationBusy, false); assert.equal(settled.statusFresh, true); assert.equal(settled.preference, true); assert.equal(settled.items[0].label, 'New owner ranking');
+  } finally {
+    heldStatus.resolve(json({ version: 2, asset_id: A, selection_token: token('a') })); heldMutation.resolve(error('unavailable', 503));
+    await Promise.all([first, second].filter(Boolean)); f.client.disconnect();
+  }
+}));
 
 test('failed asset read has an honest inspector gate and working local retry without old metadata', async () => {
   let denied = false;

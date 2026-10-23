@@ -2668,3 +2668,13 @@ pre,
 @media (max-width: 600px) { .library-search-form, .library-collection-form { grid-template-columns: minmax(0, 1fr); } .library-inspector, .library-connection { padding: 0.9rem; } .library-access-form { padding: 0.75rem; } .library-collection-actions button { white-space: normal; } }
 
 .library-pane[hidden], .library-pane [hidden] { display: none !important; }
+
+/* Shared inspector remains visible when resuming a query result or recent asset. */
+#library-workspace > .library-inspector { margin-top: 1.5rem; }
+.library-view-switch { flex-wrap: wrap; }
+.library-query-editor { display: grid; gap: 0.8rem; padding: 1.25rem; border: 1px solid var(--border-strong); background: var(--panel); margin: 1rem 0; }
+.library-query-editor h4 { margin: 0; }
+.library-query-anchor { padding: 0.5rem 0; border-bottom: 1px solid var(--border); overflow-wrap: anywhere; }
+.library-query-anchor button { margin-left: 0.75rem; }
+.library-query-anchor span { white-space: pre-wrap; }
+#library-save-search { margin-top: 0.75rem; }
