@@ -33,6 +33,7 @@ func run(args []string, out io.Writer) error {
 	caPath := f.String("client-ca", "", "trusted client CA PEM path")
 	ttl := f.Duration("lease-ttl", time.Minute, "new-operation lease duration (maximum 5m)")
 	sdkPath := f.String("sdk-config", "", "optional private configuration for a preexisting JuiceFS backend")
+	imagesPath := f.String("images-config", "", "optional private immutable image authority configuration")
 	if err := f.Parse(args); err != nil {
 		return err
 	}
@@ -52,6 +53,12 @@ func run(args []string, out io.Writer) error {
 		return errors.New("client CA contains no certificate")
 	}
 	cfg := mutationgateway.Config{Directory: *state, Volume: *volume, LeaseTTL: *ttl}
+	if *imagesPath != "" {
+		cfg.Images, err = mutationgateway.ReadImagesConfig(*imagesPath)
+		if err != nil {
+			return err
+		}
+	}
 	if *sdkPath != "" {
 		cfg.SDK, err = mutationbackend.ReadSDKConfig(*sdkPath)
 		if err != nil {

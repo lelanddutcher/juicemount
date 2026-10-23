@@ -125,6 +125,10 @@ func (g *Gateway) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
+	if strings.HasPrefix(r.URL.Path, "/v1/images/") {
+		g.serveImageHTTP(w, r, principal)
+		return
+	}
 	switch r.URL.Path {
 	case "/v1/claim":
 		if err := decode(w, r, new(struct{}), 1024); err != nil {

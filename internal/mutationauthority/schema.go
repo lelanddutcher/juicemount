@@ -7,7 +7,8 @@ import (
 	"unicode"
 )
 
-const journalSchemaVersion = 4
+const journalSchemaVersion = 4    // ordinary journals retain historical compatibility
+const maxJournalSchemaVersion = 5 // explicit image initialization promotes to 5
 const kindColumn = "kind TEXT NOT NULL DEFAULT '' CHECK(kind IN ('','custody-v1','media-publish-v1'))"
 const fileColumn = "file_id TEXT NOT NULL DEFAULT ''"
 
@@ -69,7 +70,7 @@ func recognizeSchema(q schemaReader) (int, map[string]bool, error) {
 	if err := q.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
 		return 0, nil, err
 	}
-	if version < 0 || version > journalSchemaVersion {
+	if version < 0 || version > maxJournalSchemaVersion {
 		return 0, nil, fmt.Errorf("%w: unsupported journal schema version", ErrInvalid)
 	}
 	rows, err := q.Query(`SELECT type,name,sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'`)
@@ -92,6 +93,9 @@ func recognizeSchema(q schemaReader) (int, map[string]bool, error) {
 		}
 		if !known && version >= 4 {
 			want, known = publicationSchema[name]
+		}
+		if !known && version >= 5 {
+			want, known = imageSchema[name]
 		}
 		if !known || ((name == "operations_unsettled" || name == "media_stage_inode") && typ != "index") || (name != "operations_unsettled" && name != "media_stage_inode" && typ != "table") {
 			return 0, nil, fmt.Errorf("%w: unrecognized journal schema object", ErrInvalid)
@@ -127,6 +131,9 @@ func recognizeSchema(q schemaReader) (int, map[string]bool, error) {
 	}
 	if version >= 4 {
 		wantCount += len(publicationSchema)
+	}
+	if version >= 5 {
+		wantCount += len(imageSchema)
 	}
 	if version >= 1 && len(found) != wantCount {
 		return 0, nil, fmt.Errorf("%w: incomplete typed journal schema", ErrInvalid)
@@ -218,6 +225,11 @@ func migrateSchema(db *sql.DB) error {
 	}
 	if err := validateMediaStages(tx); err != nil {
 		return err
+	}
+	if version == 5 {
+		if err := validateImages(tx); err != nil {
+			return err
+		}
 	}
 	return tx.Commit()
 }

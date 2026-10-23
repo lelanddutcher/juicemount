@@ -25,6 +25,7 @@ type Config struct {
 	Volume    string
 	LeaseTTL  time.Duration
 	SDK       *mutationbackend.SDKConfig
+	Images    *ImageConfig
 }
 
 // Gateway owns both its journal and immutable stage descriptors. No writable
@@ -41,7 +42,10 @@ type Gateway struct {
 	ttl     time.Duration
 	slots   chan struct{}
 	// Test crash boundaries are private; production never installs this hook.
-	stageHook func(string)
+	stageHook      func(string)
+	imageMu        sync.Mutex
+	imageVerifying map[string]bool
+	imageHook      func(string) // isolated tests only; never installed by production
 }
 
 // Open requires a pre-provisioned, private durable local directory. It syncs
@@ -106,6 +110,10 @@ func Open(cfg Config) (_ *Gateway, err error) {
 		return nil, err
 	}
 	g := &Gateway{dir: dir, journal: j, volume: cfg.Volume, ttl: cfg.LeaseTTL, slots: make(chan struct{}, 4)}
+	if err = j.ConfigureImages(context.Background(), cfg.Volume, cfg.Images); err != nil {
+		_ = j.Close()
+		return nil, err
+	}
 	if cfg.SDK == nil {
 		if err = j.RequireNoBackend(context.Background()); err != nil {
 			_ = j.Close()
