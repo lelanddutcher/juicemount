@@ -52,7 +52,15 @@ type serviceRecoveryFixture struct {
 	calls                 *serviceRecoveryImageCalls
 }
 
+// A selected actual TLS status handler can be held after full request validation.
+// Nil preserves every original recovery fixture behavior.
+type serviceRecoveryStatusGate struct {
+	ordinal                              int32
+	entered, canceled, release, returned chan struct{}
+}
+
 type serviceRecoveryImageCalls struct {
+	statusGate           atomic.Pointer[serviceRecoveryStatusGate]
 	status               atomic.Int32
 	read                 atomic.Int32
 	failStatus           atomic.Bool
@@ -81,7 +89,12 @@ func serviceRecoveryImageClient(t *testing.T, payload []byte) (*mutationclient.C
 	t.Helper()
 	ref := mutationauthority.ImageRef{Version: 1, StoreID: "ims_11111111111111111111111111111111", LibraryID: string(recoveryLibrary), ImageID: "img_22222222222222222222222222222222"}
 	split := len(payload) / 2
-	chunks := [][]byte{payload[:split], payload[split:]}
+	chunks := [][]byte{}
+	if len(payload) == 1 {
+		chunks = append(chunks, payload)
+	} else if len(payload) > 1 {
+		chunks = append(chunks, payload[:split], payload[split:])
+	}
 	parts := make([]mutationauthority.ImagePartView, 0, len(chunks))
 	var offset int64
 	for index, chunk := range chunks {
@@ -117,7 +130,17 @@ func serviceRecoveryImageClient(t *testing.T, payload []byte) (*mutationclient.C
 				http.Error(w, "wrong image ref", http.StatusBadRequest)
 				return
 			}
-			calls.status.Add(1)
+			ordinal := calls.status.Add(1)
+			if gate := calls.statusGate.Load(); gate != nil && gate.ordinal == ordinal {
+				defer close(gate.returned)
+				close(gate.entered)
+				select {
+				case <-gate.release:
+				case <-r.Context().Done():
+					close(gate.canceled)
+					return
+				}
+			}
 			threshold := calls.failStatusAfterReads.Load()
 			if calls.failStatus.Load() || threshold > 0 && calls.read.Load() >= threshold {
 				http.Error(w, "injected service status failure", http.StatusServiceUnavailable)
@@ -179,8 +202,13 @@ func serviceRecoveryDirectory(t *testing.T, parent, name string) string {
 
 func newServiceRecoveryFixture(t *testing.T) *serviceRecoveryFixture {
 	t.Helper()
+	return newServiceRecoveryFixtureWithPayload(t, []byte("service recovery exact bytes spanning two chunks"))
+}
+
+func newServiceRecoveryFixtureWithPayload(t *testing.T, payload []byte) *serviceRecoveryFixture {
+	t.Helper()
 	ctx := context.Background()
-	f := &serviceRecoveryFixture{payload: []byte("service recovery exact bytes spanning two chunks")}
+	f := &serviceRecoveryFixture{payload: append([]byte(nil), payload...)}
 	dir := t.TempDir()
 	if err := os.Chmod(dir, 0700); err != nil {
 		t.Fatal(err)
@@ -265,7 +293,7 @@ func newServiceRecoveryFixture(t *testing.T) *serviceRecoveryFixture {
 		t.Fatalf("real source binding: %+v %v", bound, err)
 	}
 	f.bound = bound
-	if calls.read.Load() != 2 || calls.status.Load() == 0 {
+	if calls.read.Load() != int32(min(2, len(f.payload))) || calls.status.Load() == 0 {
 		t.Fatalf("fixture did not verify both image chunks: read=%d status=%d", calls.read.Load(), calls.status.Load())
 	}
 	f.selection, err = f.service.Select(ctx, f.bearer, catalog.DeliverySelectRequest{Version: 1, LibraryID: recoveryLibrary, ID: "service-recovery-select", AssetID: recoveryAsset, Mode: "latest", ExpiresUnix: time.Now().Add(10 * time.Minute).Unix(), MaxBytes: int64(len(f.payload))})
@@ -292,7 +320,7 @@ func (f *serviceRecoveryFixture) materialize(t *testing.T) (string, catalog.Mate
 	if err != nil || a.State != "COMPLETED" || a.ID == "" || path == "" || path != f.readyPath(a.ID) {
 		t.Fatalf("actual first Materialize: path=%q attempt=%+v err=%v", path, a, err)
 	}
-	if f.calls.read.Load()-reads != 2 {
+	if f.calls.read.Load()-reads != int32(min(2, len(f.payload))) {
 		t.Fatalf("Materialize did not read both chunks: before=%d after=%d", reads, f.calls.read.Load())
 	}
 	f.assertBytes(t, path, f.payload)

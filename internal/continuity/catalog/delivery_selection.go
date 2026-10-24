@@ -38,11 +38,11 @@ type DeliverySelection struct {
 type DeliveryChunkBinding struct {
 	// AuthorityIncarnation is the authenticated original pin, never an owner-status snapshot.
 	AuthorityIncarnation string
-	Selection        DeliverySelection
-	RouteID          string
-	RouteDigest      string
-	ReaderLeafSHA256 string
-	View             mutationauthority.ImageView
+	Selection            DeliverySelection
+	RouteID              string
+	RouteDigest          string
+	ReaderLeafSHA256     string
+	View                 mutationauthority.ImageView
 }
 
 func CanonicalDeliverySelectRequest(r DeliverySelectRequest) ([]byte, string, error) {
