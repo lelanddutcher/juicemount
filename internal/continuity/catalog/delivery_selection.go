@@ -36,6 +36,8 @@ type DeliverySelection struct {
 	Canceled      bool                  `json:"canceled"`
 }
 type DeliveryChunkBinding struct {
+	// AuthorityIncarnation is the authenticated original pin, never an owner-status snapshot.
+	AuthorityIncarnation string
 	Selection        DeliverySelection
 	RouteID          string
 	RouteDigest      string
@@ -212,6 +214,7 @@ func (s *Store) selectionFence(ctx context.Context, f *deliveryClockTxn, bearer 
 		return DeliveryChunkBinding{}, ErrNotFound
 	}
 	binding.Selection = selection
+	binding.AuthorityIncarnation = incarnation
 	return binding, nil
 }
 func (s *Store) SelectDelivery(ctx context.Context, bearer []byte, input DeliverySelectRequest) (result DeliverySelection, resultErr error) {
