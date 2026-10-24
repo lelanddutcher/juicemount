@@ -30,6 +30,8 @@ type cliDeliveryFixture struct {
 	path, config, root                    string
 	bearer, payload, bindBody, selectBody []byte
 	selection                             catalog.DeliverySelection
+	bound                                 catalog.SourceBindResult
+	incarnation                           string
 }
 
 type cliDelivered struct {
@@ -161,6 +163,7 @@ func newCLIDeliveryFixture(t *testing.T) cliDeliveryFixture {
 		t.Fatal(err)
 	}
 	inc := boot.Result.Incarnation
+	f.incarnation = inc
 	manifest := continuity.Manifest{Version: 1, LibraryID: cliLibrary, AssetID: cliAssetA, Content: continuity.Content{SHA256: digest, Size: int64(len(f.payload))}}
 	revision, err := manifest.RevisionID()
 	if err != nil {
@@ -190,8 +193,8 @@ func newCLIDeliveryFixture(t *testing.T) cliDeliveryFixture {
 		t.Fatal(err)
 	}
 	f.bindBody = cliCollectionRaw(t, catalog.SourceBindRequest{Version: 1, LibraryID: cliLibrary, ID: "delivery-bind", ExpectedIncarnation: inc, AssetID: cliAssetA, RevisionID: revision, Image: ref})
-	if code, _, _ := invokeCLI(f.path, f.flags(""), f.bindBody, "source", "bind"); code != 0 {
-		t.Fatal("actual source bind failed")
+	if code, out, _ := invokeCLI(f.path, f.flags(""), f.bindBody, "source", "bind"); code != 0 || json.Unmarshal(out, &f.bound) != nil || !f.bound.OriginalReceipt.Enabled || !f.bound.CurrentStatus.Enabled || f.bound.CurrentStatus.SourceID != f.bound.OriginalReceipt.SourceID {
+		t.Fatal("actual source bind did not return original receipt and current status")
 	}
 	selection := catalog.DeliverySelectRequest{Version: 1, LibraryID: cliLibrary, ID: "delivery-select", AssetID: cliAssetA, Mode: "latest", ExpiresUnix: time.Now().Add(10 * time.Minute).Unix(), MaxBytes: int64(len(f.payload))}
 	f.selectBody = cliCollectionRaw(t, collectionMutationEnvelope{Version: 1, Bearer: string(f.bearer), Request: cliCollectionRaw(t, selection)})
@@ -481,5 +484,109 @@ func TestCLIDeliveryOutputFailureIsUncertain(t *testing.T) {
 			// The result remains exactly retrievable; output failure did not delete it.
 			f.materialize(t, operation)
 		})
+	}
+}
+
+func TestCLIDeliveryLifecycleLocalCommandsWithoutConfiguration(t *testing.T) {
+	f := newCLIDeliveryFixture(t)
+	completed := f.materialize(t, "lifecycle-prior-completed")
+	if code, _, _ := invokeCLI(f.path, nil, nil, "upgrade-delivery-lifecycle"); code != 0 {
+		t.Fatal("explicit lifecycle upgrade failed")
+	}
+	if err := os.Remove(f.config); err != nil {
+		t.Fatal(err)
+	}
+	files := defaultFiles()
+	files.deliveryService = func(context.Context, *catalog.Store, continuity.LibraryID, string) (deliveryCommandService, error) {
+		t.Fatal("local lifecycle command constructed a configured delivery service")
+		return nil, errors.New("unexpected delivery service")
+	}
+	invoke := func(command string, body []byte, want int) []byte {
+		t.Helper()
+		var out, diagnostic bytes.Buffer
+		code := runConfigured(context.Background(), cliArgs(f.path, []string{"--delivery-config", f.config}, strings.Fields(command)...), bytes.NewReader(body), &out, &diagnostic, false, files)
+		if code != want || want != 0 && out.Len() != 0 {
+			t.Fatalf("%s code=%d output=%d", command, code, out.Len())
+		}
+		if bytes.Contains(diagnostic.Bytes(), f.bearer) || bytes.Contains(diagnostic.Bytes(), []byte(f.config)) {
+			t.Fatal("lifecycle diagnostic disclosed private input")
+		}
+		return out.Bytes()
+	}
+	envelope := func(request any) []byte {
+		return cliCollectionRaw(t, collectionMutationEnvelope{Version: 1, Bearer: string(f.bearer), Request: cliCollectionRaw(t, request)})
+	}
+	sourceRequest := catalog.SourceStatusRequest{Version: 1, LibraryID: cliLibrary, SourceID: f.bound.OriginalReceipt.SourceID, SourceVersion: f.bound.OriginalReceipt.SourceVersion}
+	var status catalog.SourceStatus
+	if err := json.Unmarshal(invoke("source status", cliCollectionRaw(t, sourceRequest), 0), &status); err != nil || !status.Enabled || status.SourceID != sourceRequest.SourceID {
+		t.Fatal("local source status lost current eligibility")
+	}
+	inspect := catalog.DeliveryInspectRequest{Version: 1, LibraryID: cliLibrary, SelectionID: f.selection.SelectionID}
+	lookup := catalog.DeliveryLookupRequest{Version: 1, LibraryID: cliLibrary, SelectionOperationID: f.selection.OperationID}
+	var inspection catalog.DeliveryInspection
+	original := invoke("delivery inspect", envelope(inspect), 0)
+	if err := json.Unmarshal(original, &inspection); err != nil || inspection.OriginalSelection != f.selection || inspection.RecordState.Canceled || !inspection.RequesterDeliveryEligibility.Eligible {
+		t.Fatal("local inspect did not report original pin/current requester eligibility")
+	}
+	if !bytes.Equal(original, invoke("delivery lookup", envelope(lookup), 0)) {
+		t.Fatal("own-operation lookup did not resolve the original selection")
+	}
+	cancel := catalog.DeliveryCancelRequest{Version: 1, LibraryID: cliLibrary, ID: "cli-lifecycle-cancel", SelectionID: f.selection.SelectionID}
+	var canceled catalog.DeliveryCancelResult
+	cancelBytes := invoke("delivery cancel", envelope(cancel), 0)
+	if err := json.Unmarshal(cancelBytes, &canceled); err != nil || !canceled.CurrentStatus.RecordState.Canceled || canceled.CurrentStatus.OriginalSelection.Canceled || canceled.CurrentStatus.RequesterDeliveryEligibility.Eligible {
+		t.Fatal("cancel conflated the original pin with durable canceled state")
+	}
+	if !bytes.Equal(cancelBytes, invoke("delivery cancel", envelope(cancel), 0)) {
+		t.Fatal("cancel retry changed its immutable receipt/current state")
+	}
+	cancel.ID = "cli-lifecycle-second-cancel"
+	invoke("delivery cancel", envelope(cancel), 3)
+	disable := catalog.SourceDisableRequest{Version: 1, LibraryID: cliLibrary, ID: "cli-lifecycle-disable", ExpectedIncarnation: f.incarnation, SourceID: sourceRequest.SourceID, ExpectedSourceVersion: sourceRequest.SourceVersion}
+	var disabled catalog.SourceDisableResult
+	disableBytes := invoke("source disable", cliCollectionRaw(t, disable), 0)
+	if err := json.Unmarshal(disableBytes, &disabled); err != nil || disabled.CurrentStatus.Enabled {
+		t.Fatal("disable did not report current local denial")
+	}
+	if !bytes.Equal(disableBytes, invoke("source disable", cliCollectionRaw(t, disable), 0)) {
+		t.Fatal("disable retry changed its immutable receipt/current state")
+	}
+	disable.ID = "cli-lifecycle-second-disable"
+	invoke("source disable", cliCollectionRaw(t, disable), 3)
+	if err := json.Unmarshal(invoke("source status", cliCollectionRaw(t, sourceRequest), 0), &status); err != nil || status.Enabled {
+		t.Fatal("source status lost the committed disable")
+	}
+	cancel.ID = "cli-lifecycle-cancel"
+	disable.ID = "cli-lifecycle-disable"
+	for command, body := range map[string][]byte{
+		"source status": cliCollectionRaw(t, sourceRequest),
+		"source disable": cliCollectionRaw(t, disable),
+		"delivery inspect": cliCollectionRaw(t, inspect),
+		"delivery lookup": cliCollectionRaw(t, lookup),
+		"delivery cancel": cliCollectionRaw(t, cancel),
+	} {
+		unknown := append(append([]byte(nil), body[:len(body)-1]...), []byte(",\"unexpected\":true}")...)
+		if strings.HasPrefix(command, "delivery ") {
+			unknown = cliCollectionRaw(t, collectionMutationEnvelope{Version: 1, Bearer: string(f.bearer), Request: unknown})
+		}
+		invoke(command, unknown, 3)
+		invoke(command, bytes.Repeat([]byte("x"), 1537), 3)
+	}
+	got, err := os.ReadFile(completed.Path)
+	if err != nil || !bytes.Equal(got, f.payload) {
+		t.Fatal("local lifecycle operation removed or altered completed bytes")
+	}
+}
+
+func TestCLIDeliveryLifecycleExplicitInitialization(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "lifecycle.sqlite")
+	if code, _, _ := invokeCLI(path, nil, nil, "init-delivery-lifecycle"); code != 0 {
+		t.Fatal("explicit lifecycle creation failed")
+	}
+	if code, _, _ := invokeCLI(path, nil, nil, "upgrade-delivery-lifecycle"); code != 0 {
+		t.Fatal("exact lifecycle upgrade retry failed")
+	}
+	if code, _, _ := invokeCLI(path, nil, nil, "upgrade-delivery"); code == 0 {
+		t.Fatal("target-seven upgrade silently accepted physical eight")
 	}
 }

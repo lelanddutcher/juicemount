@@ -47,6 +47,8 @@ type serviceRecoveryFixture struct {
 	bearer                []byte
 	selector, incarnation string
 	selection             catalog.DeliverySelection
+	bindRequest           catalog.SourceBindRequest
+	bound                 catalog.SourceBindResult
 	calls                 *serviceRecoveryImageCalls
 }
 
@@ -257,10 +259,12 @@ func newServiceRecoveryFixture(t *testing.T) *serviceRecoveryFixture {
 			t.Error(err)
 		}
 	})
-	bound, err := f.service.BindSource(ctx, catalog.SourceBindRequest{Version: 1, LibraryID: recoveryLibrary, ID: "service-recovery-bind", ExpectedIncarnation: f.incarnation, AssetID: recoveryAsset, RevisionID: revision, Image: ref}, "service-recovery-route")
-	if err != nil || bound.Content != manifest.Content {
+	f.bindRequest = catalog.SourceBindRequest{Version: 1, LibraryID: recoveryLibrary, ID: "service-recovery-bind", ExpectedIncarnation: f.incarnation, AssetID: recoveryAsset, RevisionID: revision, Image: ref}
+	bound, err := f.service.BindSource(ctx, f.bindRequest, "service-recovery-route")
+	if err != nil || bound.OriginalReceipt.Content != manifest.Content || !bound.CurrentStatus.Enabled || bound.CurrentStatus.SourceID != bound.OriginalReceipt.SourceID || bound.CurrentStatus.SourceVersion != bound.OriginalReceipt.SourceVersion {
 		t.Fatalf("real source binding: %+v %v", bound, err)
 	}
+	f.bound = bound
 	if calls.read.Load() != 2 || calls.status.Load() == 0 {
 		t.Fatalf("fixture did not verify both image chunks: read=%d status=%d", calls.read.Load(), calls.status.Load())
 	}
@@ -657,4 +661,49 @@ func TestServiceReconcileMissingOperationDoesNotReserve(t *testing.T) {
 	// A different actual materialization operation still works, proving that
 	// the failed reconciliation did not claim this selection's operation ID.
 	f.materialize(t)
+}
+
+func TestServiceBindRetrySeparatesOriginalReceiptAndCurrentStatus(t *testing.T) {
+	f := newServiceRecoveryFixture(t)
+	ctx := context.Background()
+	statusCalls, readCalls := f.calls.status.Load(), f.calls.read.Load()
+	f.calls.failStatus.Store(true)
+	f.calls.failRead.Store(true)
+	retry, err := f.service.BindSource(ctx, f.bindRequest, "service-recovery-route")
+	if err != nil || !bytes.Equal(serviceRecoveryJSON(t, retry.OriginalReceipt), serviceRecoveryJSON(t, f.bound.OriginalReceipt)) || !retry.CurrentStatus.Enabled {
+		t.Fatalf("exact bind retry lost original receipt/current eligibility: %+v %v", retry, err)
+	}
+	if _, err := f.owner.Recover(ctx, serviceRecoveryAdmin(t, "service-bind-recover", f.incarnation, "recover", catalog.RecoverRequest{OwnerSubjectID: recoveryOwner})); err != nil {
+		t.Fatal(err)
+	}
+	retry, err = f.service.BindSource(ctx, f.bindRequest, "service-recovery-route")
+	if err != nil || !bytes.Equal(serviceRecoveryJSON(t, retry.OriginalReceipt), serviceRecoveryJSON(t, f.bound.OriginalReceipt)) || !retry.OriginalReceipt.Enabled || retry.CurrentStatus.Enabled {
+		t.Fatalf("historical bind receipt masqueraded as current eligibility: %+v %v", retry, err)
+	}
+	if f.calls.status.Load() != statusCalls || f.calls.read.Load() != readCalls {
+		t.Fatal("exact bind retry contacted the image endpoint")
+	}
+}
+
+func TestServiceBindHistoricalRetryAfterRebind(t *testing.T) {
+	f := newServiceRecoveryFixture(t)
+	ctx := context.Background()
+	rebind := f.bindRequest
+	rebind.ID = "service-bind-reverify"
+	rebind.SourceID = f.bound.OriginalReceipt.SourceID
+	rebind.ExpectedSourceVersion = f.bound.OriginalReceipt.SourceVersion
+	fresh, err := f.service.BindSource(ctx, rebind, "service-recovery-route")
+	if err != nil || fresh.OriginalReceipt.SourceID != rebind.SourceID || fresh.OriginalReceipt.SourceVersion != rebind.ExpectedSourceVersion+1 || !fresh.CurrentStatus.Enabled {
+		t.Fatalf("explicit rebind did not establish new version: %+v %v", fresh, err)
+	}
+	statusCalls, readCalls := f.calls.status.Load(), f.calls.read.Load()
+	f.calls.failStatus.Store(true)
+	f.calls.failRead.Store(true)
+	retry, err := f.service.BindSource(ctx, f.bindRequest, "service-recovery-route")
+	if err != nil || !bytes.Equal(serviceRecoveryJSON(t, retry.OriginalReceipt), serviceRecoveryJSON(t, f.bound.OriginalReceipt)) || retry.CurrentStatus.Enabled || retry.CurrentStatus.CurrentSourceVersion != fresh.OriginalReceipt.SourceVersion {
+		t.Fatalf("old bind receipt was treated as the new source head: %+v %v", retry, err)
+	}
+	if f.calls.status.Load() != statusCalls || f.calls.read.Load() != readCalls {
+		t.Fatal("historical bind retry fetched/reverified the image")
+	}
 }

@@ -444,8 +444,12 @@ func (f *catalogExecutableFixture) bind(id string, asset continuity.AssetID, rev
 	if prior != nil {
 		request.SourceID, request.ExpectedSourceVersion = prior.SourceID, prior.SourceVersion
 	}
-	var receipt catalog.SourceReceipt
-	catalogExecutableDecode(f.t, f.ok(catalogExecutableJSON(f.t, request), "--delivery-config", f.registry, "--route-id", "gateway", "source", "bind"), &receipt)
+	var result catalog.SourceBindResult
+	catalogExecutableDecode(f.t, f.ok(catalogExecutableJSON(f.t, request), "--delivery-config", f.registry, "--route-id", "gateway", "source", "bind"), &result)
+	receipt := result.OriginalReceipt
+	if !result.CurrentStatus.Enabled || result.CurrentStatus.SourceID != receipt.SourceID || result.CurrentStatus.SourceVersion != receipt.SourceVersion || result.CurrentStatus.CurrentSourceVersion != receipt.SourceVersion {
+		f.t.Fatal("CLI source binding did not separate current eligibility from the original receipt")
+	}
 	if receipt.RevisionID != revision || receipt.AssetID != asset || !receipt.Enabled || receipt.Content.Size != seal.Content.Size || receipt.Content.SHA256 != seal.Content.SHA256 {
 		f.t.Fatal("CLI source binding disagrees with immutable content")
 	}

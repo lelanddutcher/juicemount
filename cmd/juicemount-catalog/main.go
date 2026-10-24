@@ -278,6 +278,12 @@ func runConfigured(parent context.Context, args []string, stdin io.Reader, stdou
 		}
 		return 0
 	}
+	if command == "upgrade-delivery-lifecycle" {
+		if err := catalog.UpgradeDeliveryLifecycle(ctx, *path, library); err != nil {
+			return fail(strings.Contains(err.Error(), "uncertain"))
+		}
+		return 0
+	}
 	var s *catalog.Store
 	var err error
 	if command == "init-authority" {
@@ -290,6 +296,8 @@ func runConfigured(parent context.Context, args []string, stdin io.Reader, stdou
 		s, err = catalog.CreateSavedQueries(ctx, *path, library)
 	} else if command == "init-delivery" {
 		s, err = catalog.CreateDelivery(ctx, *path, library)
+	} else if command == "init-delivery-lifecycle" {
+		s, err = catalog.CreateDeliveryLifecycle(ctx, *path, library)
 	} else {
 		s, err = catalog.OpenContext(ctx, *path)
 	}
@@ -316,7 +324,7 @@ func runConfigured(parent context.Context, args []string, stdin io.Reader, stdou
 	if err != nil || actual != library {
 		return fail(false)
 	}
-	if command == "init-authority" || command == "init-preferences" || command == "init-collections" || command == "init-saved-queries" || command == "init-delivery" {
+	if command == "init-authority" || command == "init-preferences" || command == "init-collections" || command == "init-saved-queries" || command == "init-delivery" || command == "init-delivery-lifecycle" {
 		return 0
 	}
 	if collectionReadCommand {

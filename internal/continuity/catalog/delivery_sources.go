@@ -106,78 +106,93 @@ func (s *sourceImageStream) Read(p []byte) (int,error) {
 // BindDeliverySource verifies the complete actual image before committing a
 // metadata-to-custody binding. The supplied client must come from the owner's
 // pinned private route registry; only its configured route identity is stored.
-func (o *LocalOwnerService) BindDeliverySource(ctx context.Context,input SourceBindRequest,client *mutationclient.Client) (SourceReceipt,error) {
-    if err:=o.enter();err!=nil{return SourceReceipt{},err}
+func (o *LocalOwnerService) BindDeliverySource(ctx context.Context,input SourceBindRequest,client *mutationclient.Client) (SourceBindResult,error) {
+    if err:=o.enter();err!=nil{return SourceBindResult{},err}
     defer o.store.leave()
     s:=o.store
-    if !supportsDelivery(s.version){return SourceReceipt{},ErrUpgradeRequired}
-    if client==nil{return SourceReceipt{},invalid("delivery reader")}
+    if !supportsDelivery(s.version){return SourceBindResult{},ErrUpgradeRequired}
     data,digest,err:=CanonicalSourceBindRequest(input)
-    if err!=nil{return SourceReceipt{},err}
+    if err!=nil{return SourceBindResult{},err}
     op,err:=DecodeSourceBindRequest(data)
-    if err!=nil{return SourceReceipt{},err}
-    if op.LibraryID!=o.library{return SourceReceipt{},invalid("source library")}
+    if err!=nil{return SourceBindResult{},err}
+    if op.LibraryID!=o.library{return SourceBindResult{},invalid("source library")}
     snap,done,err:=s.readSnapshot(ctx)
-    if err!=nil{return SourceReceipt{},err}
+    if err!=nil{return SourceBindResult{},err}
+    if _,authErr:=o.currentDeliveryOwner(ctx,snap);authErr!=nil {return SourceBindResult{},errors.Join(authErr,done())}
     prior,found,priorErr:=sourcePrior(ctx,snap,op,data,digest)
+    var priorStatus SourceStatus
+    if priorErr==nil && found {priorStatus,priorErr=sourceStatusSnapshot(ctx,snap,s,prior.SourceID,prior.SourceVersion)}
     closeErr:=done()
-    if priorErr!=nil || closeErr!=nil || found{return prior,errors.Join(priorErr,closeErr)}
+    if priorErr!=nil || closeErr!=nil {return SourceBindResult{},errors.Join(priorErr,closeErr)}
+    if found {return SourceBindResult{prior,priorStatus},nil}
+    if client==nil{return SourceBindResult{},invalid("delivery reader")}
     view,err:=client.ImageStatus(ctx,op.Image)
-    if err!=nil{return SourceReceipt{},err}
-    if view.Validate()!=nil || view.LibraryID!=string(s.library) || view.Content.Size>mutationauthority.MaxImageBytes{return SourceReceipt{},ErrConflict}
-    if err:=continuity.VerifyContent(&sourceImageStream{ctx:ctx,client:client,view:view},continuity.Content{Size:view.Content.Size,SHA256:view.Content.SHA256});err!=nil{return SourceReceipt{},err}
+    if err!=nil{return SourceBindResult{},err}
+    if view.Validate()!=nil || view.LibraryID!=string(s.library) || view.Content.Size>mutationauthority.MaxImageBytes{return SourceBindResult{},ErrConflict}
+    if err:=continuity.VerifyContent(&sourceImageStream{ctx:ctx,client:client,view:view},continuity.Content{Size:view.Content.Size,SHA256:view.Content.SHA256});err!=nil{return SourceBindResult{},err}
     current,err:=client.ImageStatus(ctx,op.Image)
-    if err!=nil{return SourceReceipt{},err}
+    if err!=nil{return SourceBindResult{},err}
     imageBytes,_:=json.Marshal(view)
     currentBytes,_:=json.Marshal(current)
-    if !bytes.Equal(currentBytes,imageBytes){return SourceReceipt{},ErrConflict}
+    if !bytes.Equal(currentBytes,imageBytes){return SourceBindResult{},ErrConflict}
     tx,err:=s.db.BeginTx(ctx,nil)
-    if err!=nil{return SourceReceipt{},err}
+    if err!=nil{return SourceBindResult{},err}
     defer tx.Rollback()
-    if err:=s.checkVersion(ctx,tx);err!=nil{return SourceReceipt{},err}
+    if err:=s.checkVersion(ctx,tx);err!=nil{return SourceBindResult{},err}
+    authority,err:=o.currentDeliveryOwner(ctx,tx)
+    if err!=nil{return SourceBindResult{},err}
     prior,found,err=sourcePrior(ctx,tx,op,data,digest)
-    if err!=nil || found{return prior,err}
-    authority,err:=readAuthority(ctx,tx,s.library)
-    if err!=nil{return SourceReceipt{},err}
-    if authority.Incarnation=="" || authority.Incarnation!=op.ExpectedIncarnation {return SourceReceipt{},ErrConflict}
+    if err!=nil{return SourceBindResult{},err}
+    if found {
+        status,err:=sourceStatusSnapshot(ctx,tx,s,prior.SourceID,prior.SourceVersion)
+        if err!=nil{return SourceBindResult{},err}
+        if err:=ctx.Err();err!=nil{return SourceBindResult{},err}
+        if err:=s.checkPaths();err!=nil{return SourceBindResult{},err}
+        if err:=tx.Commit();err!=nil{return SourceBindResult{},terminalCommitError("source bind retry",err)}
+        return SourceBindResult{prior,status},nil
+    }
+    if err!=nil{return SourceBindResult{},err}
+    if authority.Incarnation=="" || authority.Incarnation!=op.ExpectedIncarnation {return SourceBindResult{},ErrConflict}
     owner,err:=readSubject(ctx,tx,s.library,authority.OwnerSubjectID)
-    if err!=nil{return SourceReceipt{},err}
-    if !owner.Value.Enabled || owner.Value.Kind!="person" {return SourceReceipt{},ErrConflict}
+    if err!=nil{return SourceBindResult{},err}
+    if !owner.Value.Enabled || owner.Value.Kind!="person" {return SourceBindResult{},ErrConflict}
     revision,err:=readRevision(ctx,tx,s.library,op.RevisionID)
-    if err!=nil{return SourceReceipt{},err}
-    if revision.Manifest.AssetID!=op.AssetID || revision.Manifest.Content.Size!=view.Content.Size || revision.Manifest.Content.SHA256!=view.Content.SHA256{return SourceReceipt{},ErrConflict}
+    if err!=nil{return SourceBindResult{},err}
+    if revision.Manifest.AssetID!=op.AssetID || revision.Manifest.Content.Size!=view.Content.Size || revision.Manifest.Content.SHA256!=view.Content.SHA256{return SourceBindResult{},ErrConflict}
     id:=op.SourceID
     version:=op.ExpectedSourceVersion+1
     if op.ExpectedSourceVersion==0 {
         var existing int
-        if err:=tx.QueryRowContext(ctx,`SELECT count(*) FROM delivery_source_heads WHERE library_id=? AND asset_id=? AND revision_id=?`,s.library,op.AssetID,op.RevisionID).Scan(&existing);err!=nil{return SourceReceipt{},err}
-        if existing!=0{return SourceReceipt{},ErrConflict}
+        if err:=tx.QueryRowContext(ctx,`SELECT count(*) FROM delivery_source_heads WHERE library_id=? AND asset_id=? AND revision_id=?`,s.library,op.AssetID,op.RevisionID).Scan(&existing);err!=nil{return SourceBindResult{},err}
+        if existing!=0{return SourceBindResult{},ErrConflict}
         id,err=randomIdentity("dsrc_")
-        if err!=nil{return SourceReceipt{},err}
+        if err!=nil{return SourceBindResult{},err}
     } else {
         var priorVersion int64
         var priorAsset continuity.AssetID
         var priorRevision continuity.RevisionID
-        if err:=tx.QueryRowContext(ctx,`SELECT source_version,asset_id,revision_id FROM delivery_source_heads WHERE source_id=? AND library_id=?`,id,s.library).Scan(&priorVersion,&priorAsset,&priorRevision);err!=nil{return SourceReceipt{},ErrConflict}
-        if priorVersion!=op.ExpectedSourceVersion || priorAsset!=op.AssetID || priorRevision!=op.RevisionID{return SourceReceipt{},ErrConflict}
+        if err:=tx.QueryRowContext(ctx,`SELECT source_version,asset_id,revision_id FROM delivery_source_heads WHERE source_id=? AND library_id=?`,id,s.library).Scan(&priorVersion,&priorAsset,&priorRevision);err!=nil{return SourceBindResult{},ErrConflict}
+        if priorVersion!=op.ExpectedSourceVersion || priorAsset!=op.AssetID || priorRevision!=op.RevisionID{return SourceBindResult{},ErrConflict}
     }
     var sourceCount,canonical int64
-    if err:=tx.QueryRowContext(ctx,`SELECT source_versions,canonical_bytes FROM delivery_quota WHERE singleton=1`).Scan(&sourceCount,&canonical);err!=nil{return SourceReceipt{},corrupt("delivery quota")}
+    if err:=tx.QueryRowContext(ctx,`SELECT source_versions,canonical_bytes FROM delivery_quota WHERE singleton=1`).Scan(&sourceCount,&canonical);err!=nil{return SourceBindResult{},corrupt("delivery quota")}
     timestamp:=s.now().UnixNano()
     receipt:=SourceReceipt{1,s.library,op.ID,digest,id,version,op.AssetID,op.RevisionID,revision.Manifest.Content,true,timestamp}
     receiptBytes,err:=json.Marshal(receipt)
-    if err!=nil || len(receiptBytes)>2048{return SourceReceipt{},invalid("source receipt bytes")}
-    if sourceCount>=1024 || canonical+int64(len(data)+len(receiptBytes)+len(imageBytes))>64<<20{return SourceReceipt{},ErrLimit}
-    if _,err:=tx.ExecContext(ctx,`INSERT INTO delivery_sources(source_id,source_version,library_id,asset_id,revision_id,content_size,content_sha256,authority_incarnation,route_id,route_digest,reader_leaf_sha256,image_view,enabled,created_unix_nano) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,1,?)`,id,version,s.library,op.AssetID,op.RevisionID,view.Content.Size,view.Content.SHA256,authority.Incarnation,op.RouteID,op.RouteDigest,op.ReaderLeafSHA256,imageBytes,timestamp);err!=nil{return SourceReceipt{},err}
+    if err!=nil || len(receiptBytes)>2048{return SourceBindResult{},invalid("source receipt bytes")}
+    if sourceCount>=1024 || canonical+int64(len(data)+len(receiptBytes)+len(imageBytes))>64<<20{return SourceBindResult{},ErrLimit}
+    if _,err:=tx.ExecContext(ctx,`INSERT INTO delivery_sources(source_id,source_version,library_id,asset_id,revision_id,content_size,content_sha256,authority_incarnation,route_id,route_digest,reader_leaf_sha256,image_view,enabled,created_unix_nano) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,1,?)`,id,version,s.library,op.AssetID,op.RevisionID,view.Content.Size,view.Content.SHA256,authority.Incarnation,op.RouteID,op.RouteDigest,op.ReaderLeafSHA256,imageBytes,timestamp);err!=nil{return SourceBindResult{},err}
     if op.ExpectedSourceVersion==0 {
-        if _,err:=tx.ExecContext(ctx,`INSERT INTO delivery_source_heads(library_id,asset_id,revision_id,source_id,source_version) VALUES(?,?,?,?,?)`,s.library,op.AssetID,op.RevisionID,id,version);err!=nil{return SourceReceipt{},err}
+        if _,err:=tx.ExecContext(ctx,`INSERT INTO delivery_source_heads(library_id,asset_id,revision_id,source_id,source_version) VALUES(?,?,?,?,?)`,s.library,op.AssetID,op.RevisionID,id,version);err!=nil{return SourceBindResult{},err}
     } else {
-        if err:=changedOne(tx.ExecContext(ctx,`UPDATE delivery_source_heads SET source_version=? WHERE library_id=? AND asset_id=? AND revision_id=? AND source_id=? AND source_version=?`,version,s.library,op.AssetID,op.RevisionID,id,op.ExpectedSourceVersion));err!=nil{return SourceReceipt{},err}
+        if err:=changedOne(tx.ExecContext(ctx,`UPDATE delivery_source_heads SET source_version=? WHERE library_id=? AND asset_id=? AND revision_id=? AND source_id=? AND source_version=?`,version,s.library,op.AssetID,op.RevisionID,id,op.ExpectedSourceVersion));err!=nil{return SourceBindResult{},err}
     }
-    if _,err:=tx.ExecContext(ctx,`INSERT INTO delivery_source_events(operation_id,library_id,request,payload_sha256,receipt,source_id,source_version,recorded_unix_nano) VALUES(?,?,?,?,?,?,?,?)`,op.ID,s.library,data,digest,receiptBytes,id,version,timestamp);err!=nil{return SourceReceipt{},err}
-    if _,err:=tx.ExecContext(ctx,`UPDATE delivery_quota SET source_versions=source_versions+1,canonical_bytes=canonical_bytes+? WHERE singleton=1`,len(data)+len(receiptBytes)+len(imageBytes));err!=nil{return SourceReceipt{},err}
-    if err:=ctx.Err();err!=nil{return SourceReceipt{},err}
-    if err:=s.checkPaths();err!=nil{return SourceReceipt{},err}
-    if err:=tx.Commit();err!=nil{return SourceReceipt{},fmt.Errorf("source bind commit uncertain (operation %s): %w",op.ID,err)}
-    return receipt,nil
+    if _,err:=tx.ExecContext(ctx,`INSERT INTO delivery_source_events(operation_id,library_id,request,payload_sha256,receipt,source_id,source_version,recorded_unix_nano) VALUES(?,?,?,?,?,?,?,?)`,op.ID,s.library,data,digest,receiptBytes,id,version,timestamp);err!=nil{return SourceBindResult{},err}
+    if _,err:=tx.ExecContext(ctx,`UPDATE delivery_quota SET source_versions=source_versions+1,canonical_bytes=canonical_bytes+? WHERE singleton=1`,len(data)+len(receiptBytes)+len(imageBytes));err!=nil{return SourceBindResult{},err}
+    status,err:=sourceStatusSnapshot(ctx,tx,s,id,version)
+    if err!=nil{return SourceBindResult{},err}
+    if err:=ctx.Err();err!=nil{return SourceBindResult{},err}
+    if err:=s.checkPaths();err!=nil{return SourceBindResult{},err}
+    if err:=tx.Commit();err!=nil{return SourceBindResult{},fmt.Errorf("source bind commit uncertain (operation %s): %w",op.ID,err)}
+    return SourceBindResult{receipt,status},nil
 }

@@ -686,7 +686,7 @@ func exportCollectionSnapshot(ctx context.Context, q queryer, library continuity
 			return nil, err
 		}
 	}
-	if err := validatePortableCollectionCounts(c, byteCount, version == 7, limits); err != nil {
+	if err := validatePortableCollectionCounts(c, byteCount, supportsDelivery(version), limits); err != nil {
 		return nil, err
 	}
 	rows, err := projectionTotal(ctx, q)
@@ -705,7 +705,7 @@ func exportCollectionSnapshot(ctx context.Context, q queryer, library continuity
 		}
 	}
 	format := 3
-	if version == 7 {
+	if supportsDelivery(version) {
 		format = 5
 	} else if version == 6 {
 		format = 4
@@ -716,7 +716,7 @@ func exportCollectionSnapshot(ctx context.Context, q queryer, library continuity
 	if err := output.write([]byte(magic), h); err != nil {
 		return nil, err
 	}
-	header, err := encodePortableCollectionHeader(collectionStreamHeader{format, version, library, c}, byteCount)
+	header, err := encodePortableCollectionHeader(collectionStreamHeader{format, portableSchemaVersion(version), library, c}, byteCount)
 	if err != nil {
 		return nil, err
 	}

@@ -216,25 +216,25 @@ func (s *Service) routeFor(binding catalog.DeliveryChunkBinding) (route, error) 
 	}
 	return r, nil
 }
-func (s *Service) BindSource(parent context.Context, input catalog.SourceBindRequest, routeID string) (catalog.SourceReceipt, error) {
+func (s *Service) BindSource(parent context.Context, input catalog.SourceBindRequest, routeID string) (catalog.SourceBindResult, error) {
 	ctx, done, err := s.own(parent)
 	if err != nil {
-		return catalog.SourceReceipt{}, err
+		return catalog.SourceBindResult{}, err
 	}
 	defer done()
 	r, ok := s.routes[routeID]
 	if !ok {
-		return catalog.SourceReceipt{}, errors.New("delivery route unavailable")
+		return catalog.SourceBindResult{}, errors.New("delivery route unavailable")
 	}
 	input.RouteID = routeID
 	input.RouteDigest = r.digest
 	input.ReaderLeafSHA256 = r.leaf
 	if input.Image.StoreID != r.store {
-		return catalog.SourceReceipt{}, errors.New("delivery store mismatch")
+		return catalog.SourceBindResult{}, errors.New("delivery store mismatch")
 	}
 	owner, err := s.store.LocalOwner(s.library)
 	if err != nil {
-		return catalog.SourceReceipt{}, err
+		return catalog.SourceBindResult{}, err
 	}
 	return owner.BindDeliverySource(ctx, input, r.client)
 }

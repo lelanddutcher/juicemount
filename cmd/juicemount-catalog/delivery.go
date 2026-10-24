@@ -64,9 +64,36 @@ func readSourceBind(input io.Reader, library continuity.LibraryID) (catalog.Sour
 	return request, nil
 }
 
+// Lifecycle commands use only the catalog. Their request bodies retain the
+// catalog codec's strict canonical validation and one KiB bound.
+func readDeliveryLifecycleRequest(input io.Reader) ([]byte, error) {
+	b, err := readBounded(input, 1024)
+	if err != nil {
+		return nil, err
+	}
+	return bytes.TrimSpace(b), nil
+}
+
+func readDeliveryLifecycleEnvelope(input io.Reader) (json.RawMessage, []byte, error) {
+	b, err := readBounded(input, 1024+512)
+	if err != nil {
+		return nil, nil, err
+	}
+	b = bytes.TrimSpace(b)
+	var envelope collectionMutationEnvelope
+	if json.Unmarshal(b, &envelope) != nil || envelope.Version != 1 || len(envelope.Bearer) != 102 || !strings.HasPrefix(envelope.Bearer, "jmc1_") {
+		return nil, nil, catalog.ErrInvalid
+	}
+	canonical, err := json.Marshal(envelope)
+	if err != nil || !bytes.Equal(b, canonical) {
+		return nil, nil, catalog.ErrInvalid
+	}
+	return envelope.Request, []byte(envelope.Bearer), nil
+}
+
 type deliveryCommandService interface {
 	Close() error
-	BindSource(context.Context, catalog.SourceBindRequest, string) (catalog.SourceReceipt, error)
+	BindSource(context.Context, catalog.SourceBindRequest, string) (catalog.SourceBindResult, error)
 	Select(context.Context, []byte, catalog.DeliverySelectRequest) (catalog.DeliverySelection, error)
 	Status(context.Context, []byte, string) (catalog.DeliverySelection, error)
 	MaterializeForHandoff(context.Context, []byte, string, string) (string, catalog.MaterializationAttempt, *catalog.MaterializationCleanup, error)
@@ -118,6 +145,77 @@ func runDeliveryCLI(ctx context.Context, s *catalog.Store, library continuity.Li
 			return nil, err
 		}
 		return deliveryReceipt(receipt)
+	}
+	switch command {
+	case "source status", "source disable":
+		b, err := readDeliveryLifecycleRequest(input)
+		if err != nil {
+			return nil, err
+		}
+		owner, err := s.LocalOwner(library)
+		if err != nil {
+			return nil, err
+		}
+		if command == "source status" {
+			request, err := catalog.DecodeSourceStatusRequest(b)
+			if err != nil || request.LibraryID != library {
+				return nil, catalog.ErrInvalid
+			}
+			result, err := owner.DeliverySourceStatus(ctx, request)
+			if err != nil {
+				return nil, err
+			}
+			return deliveryReceipt(result)
+		}
+		request, err := catalog.DecodeSourceDisableRequest(b)
+		if err != nil || request.LibraryID != library {
+			return nil, catalog.ErrInvalid
+		}
+		*knownOperationID = request.ID
+		result, err := owner.DisableDeliverySource(ctx, request)
+		if err != nil {
+			return nil, err
+		}
+		return deliveryReceipt(result)
+	case "delivery inspect", "delivery lookup", "delivery cancel":
+		b, bearer, err := readDeliveryLifecycleEnvelope(input)
+		if err != nil {
+			return nil, err
+		}
+		defer clear(bearer)
+		switch command {
+		case "delivery inspect":
+			request, err := catalog.DecodeDeliveryInspectRequest(b)
+			if err != nil || request.LibraryID != library {
+				return nil, catalog.ErrInvalid
+			}
+			result, err := s.InspectDelivery(ctx, bearer, request)
+			if err != nil {
+				return nil, err
+			}
+			return deliveryReceipt(result)
+		case "delivery lookup":
+			request, err := catalog.DecodeDeliveryLookupRequest(b)
+			if err != nil || request.LibraryID != library {
+				return nil, catalog.ErrInvalid
+			}
+			result, err := s.LookupDelivery(ctx, bearer, request)
+			if err != nil {
+				return nil, err
+			}
+			return deliveryReceipt(result)
+		case "delivery cancel":
+			request, err := catalog.DecodeDeliveryCancelRequest(b)
+			if err != nil || request.LibraryID != library {
+				return nil, catalog.ErrInvalid
+			}
+			*knownOperationID = request.ID
+			result, err := s.CancelDelivery(ctx, bearer, request)
+			if err != nil {
+				return nil, err
+			}
+			return deliveryReceipt(result)
+		}
 	}
 	if configPath == "" {
 		return nil, errors.New("delivery configuration required")

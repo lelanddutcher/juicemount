@@ -9,8 +9,8 @@ import (
 
 const collectionsSchemaVersion = 5
 
-func supportsPreferences(v int) bool { return v == 4 || v == 5 || v == 6 || v == 7 }
-func supportsCollections(v int) bool { return v == 5 || v == 6 || v == 7 }
+func supportsPreferences(v int) bool { return v == 4 || v == 5 || v == 6 || v == 7 || v == 8 }
+func supportsCollections(v int) bool { return v == 5 || v == 6 || v == 7 || v == 8 }
 
 func collectionSQLID(column, prefix string) string {
 	return fmt.Sprintf("CHECK(length(%s)=%d AND substr(%s,1,%d)='%s' AND substr(%s,%d) NOT GLOB '*[^0-9a-f]*' AND substr(%s,%d)<>'00000000000000000000000000000000')", column, len(prefix)+32, column, len(prefix), prefix, column, len(prefix)+1, column, len(prefix)+1)

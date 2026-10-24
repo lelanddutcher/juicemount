@@ -123,9 +123,16 @@ func readCurrentDeliverySource(ctx context.Context, q queryer, s *Store, asset c
 	if err != nil {
 		return binding, err
 	}
-	if library != s.library || !enabled || !validRandomID(binding.Selection.SourceID, "dsrc_") || binding.Selection.SourceVersion < 1 || mutationauthority.DecodeImageCanonical(image, &binding.View) != nil || binding.View.Validate() != nil || binding.View.Content.Size != size || binding.View.Content.SHA256 != digest || binding.View.LibraryID != string(s.library) || !validCollectionDigest(binding.RouteDigest) || !mutationauthority.ImageHashValid(binding.ReaderLeafSHA256) {
+	if library != s.library || !validRandomID(binding.Selection.SourceID, "dsrc_") || binding.Selection.SourceVersion < 1 || mutationauthority.DecodeImageCanonical(image, &binding.View) != nil || binding.View.Validate() != nil || binding.View.Content.Size != size || binding.View.Content.SHA256 != digest || binding.View.LibraryID != string(s.library) || !validCollectionDigest(binding.RouteDigest) || !mutationauthority.ImageHashValid(binding.ReaderLeafSHA256) {
 		return DeliveryChunkBinding{}, corrupt("delivery source")
 	}
+	if supportsDeliveryLifecycle(s.version) {
+		slot, err := readSourceTerminal(ctx, q, s.library, binding.Selection.SourceID, binding.Selection.SourceVersion)
+		if err != nil { return DeliveryChunkBinding{}, err }
+		if slot.legacy == enabled { return DeliveryChunkBinding{}, corrupt("source terminal coupling") }
+		if slot.bit { return DeliveryChunkBinding{}, ErrNotFound }
+	}
+	if !enabled { return DeliveryChunkBinding{}, ErrNotFound }
 	authority, err := readAuthority(ctx, q, s.library)
 	if err != nil {
 		return DeliveryChunkBinding{}, err
@@ -150,6 +157,9 @@ func loadSelection(ctx context.Context, q queryer, s *Store, id string) (Deliver
 	}
 	selection.Version = 1
 	selection.LibraryID = library
+	if supportsDeliveryLifecycle(s.version) {
+		if _, err := readSelectionTerminal(ctx, q, s.library, id, selection.Canceled); err != nil { return DeliverySelection{}, nil, "", "", 0, 0, 0, err }
+	}
 	op, err := DecodeDeliverySelectRequest(request)
 	if err != nil || library != s.library || op.ID != selection.OperationID || op.AssetID != selection.AssetID || requestDigest != domainDigest("juicemount.catalog.delivery.select\x00\x01", request) || !validRandomID(selection.SelectionID, "dsel_") || selection.Content.Validate() != nil {
 		return DeliverySelection{}, nil, "", "", 0, 0, 0, corrupt("delivery selection")

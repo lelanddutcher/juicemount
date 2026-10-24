@@ -11,7 +11,7 @@ import (
 
 const deliverySchemaVersion = 7
 
-func supportsDelivery(v int) bool { return v == deliverySchemaVersion }
+func supportsDelivery(v int) bool { return v == deliverySchemaVersion || v == deliveryLifecycleSchemaVersion }
 
 // Only these three constrained tables change in schema 7. Prior schema
 // definitions and fingerprints remain byte-for-byte unchanged.
