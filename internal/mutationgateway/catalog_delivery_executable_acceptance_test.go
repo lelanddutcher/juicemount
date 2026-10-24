@@ -50,6 +50,7 @@ type catalogExecutableFixture struct {
 	gateway                                       *imageExecutableOriginal
 	endpoint                                      string
 	producer, reader                              *Client
+	producerLease                                 Lease
 	bearer                                        []byte
 	selector                                      string
 	cliStarted, cliJoined                         int
@@ -397,10 +398,22 @@ func (f *catalogExecutableFixture) seal(number int, parts [][]byte) (ImageSeal, 
 	f.t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	lease, err := f.producer.Claim(ctx)
+	lease := f.producerLease
+	var err error
+	if lease.Session == "" {
+		lease, err = f.producer.Claim(ctx)
+	} else {
+		// Claim creates a fresh nonce/session. Keep the original producer
+		// admission and renew its exact live epoch for the next image.
+		lease, err = f.producer.Renew(ctx, lease)
+		if err == nil && (lease.Volume != f.producerLease.Volume || lease.Session != f.producerLease.Session || lease.Epoch != f.producerLease.Epoch) {
+			f.t.Fatal("producer renewal changed the owned lease identity")
+		}
+	}
 	if err != nil {
 		f.t.Fatal(err)
 	}
+	f.producerLease = lease
 	complete := []byte{}
 	receipts := make([]ImageCustodyReceipt, 0, len(parts))
 	cohort := fmt.Sprintf("catalog-executable-cohort-%d", number)
@@ -537,6 +550,8 @@ func TestCatalogDeliveryExecutableBytes(t *testing.T) {
 	f.producer.Close()
 	f.reader.Close()
 	f.gateway.stopNormally()
+	// Reopening the journal freezes prior process admission; never renew it.
+	f.producerLease = Lease{}
 	f.cfg.Images.Initialize = false
 	imageExecutableWrite(t, filepath.Join(f.dir, "images.json"), imageJSON(f.cfg.Images))
 	f.gateway = imageExecutableStart(t, "catalog-restart", f.gatewayArgs(strings.TrimPrefix(f.endpoint, "https://")))
