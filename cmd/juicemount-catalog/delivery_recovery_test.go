@@ -559,11 +559,11 @@ func TestCLIDeliveryLifecycleLocalCommandsWithoutConfiguration(t *testing.T) {
 	cancel.ID = "cli-lifecycle-cancel"
 	disable.ID = "cli-lifecycle-disable"
 	for command, body := range map[string][]byte{
-		"source status": cliCollectionRaw(t, sourceRequest),
-		"source disable": cliCollectionRaw(t, disable),
+		"source status":    cliCollectionRaw(t, sourceRequest),
+		"source disable":   cliCollectionRaw(t, disable),
 		"delivery inspect": cliCollectionRaw(t, inspect),
-		"delivery lookup": cliCollectionRaw(t, lookup),
-		"delivery cancel": cliCollectionRaw(t, cancel),
+		"delivery lookup":  cliCollectionRaw(t, lookup),
+		"delivery cancel":  cliCollectionRaw(t, cancel),
 	} {
 		unknown := append(append([]byte(nil), body[:len(body)-1]...), []byte(",\"unexpected\":true}")...)
 		if strings.HasPrefix(command, "delivery ") {

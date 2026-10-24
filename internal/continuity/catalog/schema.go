@@ -22,7 +22,9 @@ func supportsAuthority(version int) bool {
 	return version == 3 || version == 4 || version == 5 || version == 6 || version == 7 || version == 8
 }
 func portableSchemaVersion(version int) int {
-	if supportsDeliveryLifecycle(version) { return deliverySchemaVersion }
+	if supportsDeliveryLifecycle(version) {
+		return deliverySchemaVersion
+	}
 	if version == 4 {
 		return 3
 	}
@@ -155,7 +157,9 @@ func expectedSchemaFor(version int) []schemaObject {
 		}
 		objects = append(objects, deliverySchema()...)
 	}
-	if supportsDeliveryLifecycle(version) { objects = append(objects, deliveryLifecycleSchema()...) }
+	if supportsDeliveryLifecycle(version) {
+		objects = append(objects, deliveryLifecycleSchema()...)
+	}
 	sort.Slice(objects, func(i, j int) bool { return objects[i].Name < objects[j].Name })
 	return objects
 }
@@ -216,7 +220,9 @@ func initializeVersion(ctx context.Context, db *sql.DB, library continuity.Libra
 		}
 	}
 	initialVersion := version
-	if supportsDelivery(version) { initialVersion = savedQueriesSchemaVersion }
+	if supportsDelivery(version) {
+		initialVersion = savedQueriesSchemaVersion
+	}
 	for _, object := range expectedSchemaFor(initialVersion) {
 		if object.Type != "table" {
 			if _, err := tx.ExecContext(ctx, object.SQL); err != nil {
@@ -277,10 +283,14 @@ func initializeVersion(ctx context.Context, db *sql.DB, library continuity.Libra
 		}
 	}
 	if supportsDelivery(version) {
-		if err := migrateV6Delivery(ctx, tx, library); err != nil { return err }
+		if err := migrateV6Delivery(ctx, tx, library); err != nil {
+			return err
+		}
 	}
 	if supportsDeliveryLifecycle(version) {
-		if err := initializeDeliveryLifecycle(ctx, tx, library); err != nil { return err }
+		if err := initializeDeliveryLifecycle(ctx, tx, library); err != nil {
+			return err
+		}
 	}
 	return tx.Commit()
 }
@@ -367,7 +377,9 @@ func recognizeSchema(ctx context.Context, q queryer, initializing bool) (continu
 		if entry == 7 {
 			want = schemaFingerprint(expectedSchemaFor(7))
 		}
-		if entry == 8 { want = schemaFingerprint(expectedSchemaFor(8)) }
+		if entry == 8 {
+			want = schemaFingerprint(expectedSchemaFor(8))
+		}
 		if entry != ledgerCount || entry > version || fingerprint != want {
 			rows.Close()
 			return "", 0, corrupt("migration fingerprint lineage mismatch")
@@ -406,7 +418,9 @@ func recognizeSchema(ctx context.Context, q queryer, initializing bool) (continu
 		}
 	}
 	if supportsDeliveryLifecycle(version) {
-		if err := checkDeliveryLifecycleState(ctx, q, library); err != nil { return "", 0, err }
+		if err := checkDeliveryLifecycleState(ctx, q, library); err != nil {
+			return "", 0, err
+		}
 	}
 	return library, version, nil
 }

@@ -28,7 +28,10 @@ func deliveryLifecycleSchema() []schemaObject {
  CHECK((operation_id IS NULL AND actor_subject_id IS NULL AND authority_incarnation IS NULL AND recorded_unix_nano IS NULL AND request IS NULL AND payload_sha256 IS NULL AND receipt IS NULL AND terminal_bit=legacy_terminal) OR (operation_id IS NOT NULL AND actor_subject_id IS NOT NULL AND authority_incarnation IS NOT NULL AND length(authority_incarnation)=37 AND substr(authority_incarnation,1,5)='auth_' AND substr(authority_incarnation,6) NOT GLOB '*[^0-9a-f]*' AND substr(authority_incarnation,6)<>'00000000000000000000000000000000' AND recorded_unix_nano IS NOT NULL AND recorded_unix_nano>0 AND request IS NOT NULL AND payload_sha256 IS NOT NULL AND length(payload_sha256)=64 AND payload_sha256 NOT GLOB '*[^0-9a-f]*' AND receipt IS NOT NULL AND terminal_bit=1 AND legacy_terminal=0)))`,
 	}
 	objects := []schemaObject{}
-	for _, ddl := range ddls { name := strings.Fields(ddl)[2]; objects = append(objects, schemaObject{"table", name, name, ddl}) }
+	for _, ddl := range ddls {
+		name := strings.Fields(ddl)[2]
+		objects = append(objects, schemaObject{"table", name, name, ddl})
+	}
 	objects = append(objects,
 		schemaObject{"index", "delivery_selection_terminal_pair", "delivery_selections", `CREATE UNIQUE INDEX delivery_selection_terminal_pair ON delivery_selections(selection_id,canceled)`},
 		schemaObject{"index", "delivery_source_terminal_operations", "delivery_terminal_slots", `CREATE UNIQUE INDEX delivery_source_terminal_operations ON delivery_terminal_slots(library_id,operation_id) WHERE target_kind='source_disable' AND operation_id IS NOT NULL`},
@@ -49,15 +52,31 @@ func deliveryLifecycleSchema() []schemaObject {
 func initializeDeliveryLifecycle(ctx context.Context, tx *sql.Tx, library continuity.LibraryID) error {
 	// Parent uniqueness must exist before inserting deferred paired FK rows.
 	for _, kind := range []string{"table", "index", "trigger"} {
-		for _, o := range deliveryLifecycleSchema() { if o.Type == kind { if _, err := tx.ExecContext(ctx, o.SQL); err != nil { return err } } }
+		for _, o := range deliveryLifecycleSchema() {
+			if o.Type == kind {
+				if _, err := tx.ExecContext(ctx, o.SQL); err != nil {
+					return err
+				}
+			}
+		}
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO delivery_terminal_quota VALUES(1,?,0,0,0)`, library); err != nil { return err }
+	if _, err := tx.ExecContext(ctx, `INSERT INTO delivery_terminal_quota VALUES(1,?,0,0,0)`, library); err != nil {
+		return err
+	}
 	for _, statement := range []string{
 		`INSERT INTO delivery_terminal_slots(library_id,target_kind,source_id,source_version,terminal_bit,legacy_terminal) SELECT library_id,'source_disable',source_id,source_version,1-enabled,1-enabled FROM delivery_sources`,
 		`INSERT INTO delivery_terminal_slots(library_id,target_kind,selection_id,terminal_bit,legacy_terminal) SELECT library_id,'selection_cancel',selection_id,canceled,canceled FROM delivery_selections`,
-	} { if _, err := tx.ExecContext(ctx, statement); err != nil { return err } }
-	if err := checkDeliveryLifecycleState(ctx, tx, library); err != nil { return err }
-	if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations(version,fingerprint) VALUES(8,?)`, schemaFingerprint(expectedSchemaFor(8))); err != nil { return err }
+	} {
+		if _, err := tx.ExecContext(ctx, statement); err != nil {
+			return err
+		}
+	}
+	if err := checkDeliveryLifecycleState(ctx, tx, library); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations(version,fingerprint) VALUES(8,?)`, schemaFingerprint(expectedSchemaFor(8))); err != nil {
+		return err
+	}
 	_, err := tx.ExecContext(ctx, `PRAGMA user_version=8`)
 	return err
 }
@@ -66,9 +85,15 @@ func checkDeliveryLifecycleState(ctx context.Context, q queryer, library continu
 	var sources, selections, used, actualSources, actualSelections, slotsSource, slotsSelection, actualUsed, bad int64
 	var lib continuity.LibraryID
 	var normalSources, normalSelections int64
-	if err := q.QueryRowContext(ctx, `SELECT source_versions,selections FROM delivery_quota WHERE singleton=1 AND library_id=?`, library).Scan(&normalSources, &normalSelections); err != nil { return corrupt("normal delivery quota fields") }
-	if err := q.QueryRowContext(ctx, `SELECT library_id,source_slots,selection_slots,used_bytes,(SELECT count(*) FROM delivery_sources),(SELECT count(*) FROM delivery_selections),(SELECT count(*) FROM delivery_terminal_slots WHERE target_kind='source_disable'),(SELECT count(*) FROM delivery_terminal_slots WHERE target_kind='selection_cancel'),(SELECT COALESCE(sum(length(request)+length(receipt)),0) FROM delivery_terminal_slots),(SELECT count(*) FROM delivery_terminal_slots t LEFT JOIN delivery_sources d ON t.source_id=d.source_id AND t.source_version=d.source_version LEFT JOIN delivery_selections s ON s.selection_id=t.selection_id WHERE t.library_id<>? OR (t.target_kind='source_disable' AND (d.library_id IS NULL OR d.library_id<>t.library_id OR t.legacy_terminal<>1-d.enabled)) OR (t.target_kind='selection_cancel' AND (s.library_id IS NULL OR s.library_id<>t.library_id OR s.canceled<>t.terminal_bit OR (t.operation_id IS NOT NULL AND t.actor_subject_id<>s.subject_id)))) FROM delivery_terminal_quota WHERE singleton=1`, library).Scan(&lib, &sources, &selections, &used, &actualSources, &actualSelections, &slotsSource, &slotsSelection, &actualUsed, &bad); err != nil { return corrupt("terminal quota fields") }
-	if lib != library || sources != normalSources || selections != normalSelections || sources != actualSources || sources != slotsSource || selections != actualSelections || selections != slotsSelection || used != actualUsed || sources < 0 || sources > 1024 || selections < 0 || selections > 4096 || used < 0 || used > TerminalReservationBytes*(sources+selections) || bad != 0 { return corrupt("terminal reservation or coupling identity") }
+	if err := q.QueryRowContext(ctx, `SELECT source_versions,selections FROM delivery_quota WHERE singleton=1 AND library_id=?`, library).Scan(&normalSources, &normalSelections); err != nil {
+		return corrupt("normal delivery quota fields")
+	}
+	if err := q.QueryRowContext(ctx, `SELECT library_id,source_slots,selection_slots,used_bytes,(SELECT count(*) FROM delivery_sources),(SELECT count(*) FROM delivery_selections),(SELECT count(*) FROM delivery_terminal_slots WHERE target_kind='source_disable'),(SELECT count(*) FROM delivery_terminal_slots WHERE target_kind='selection_cancel'),(SELECT COALESCE(sum(length(request)+length(receipt)),0) FROM delivery_terminal_slots),(SELECT count(*) FROM delivery_terminal_slots t LEFT JOIN delivery_sources d ON t.source_id=d.source_id AND t.source_version=d.source_version LEFT JOIN delivery_selections s ON s.selection_id=t.selection_id WHERE t.library_id<>? OR (t.target_kind='source_disable' AND (d.library_id IS NULL OR d.library_id<>t.library_id OR t.legacy_terminal<>1-d.enabled)) OR (t.target_kind='selection_cancel' AND (s.library_id IS NULL OR s.library_id<>t.library_id OR s.canceled<>t.terminal_bit OR (t.operation_id IS NOT NULL AND t.actor_subject_id<>s.subject_id)))) FROM delivery_terminal_quota WHERE singleton=1`, library).Scan(&lib, &sources, &selections, &used, &actualSources, &actualSelections, &slotsSource, &slotsSelection, &actualUsed, &bad); err != nil {
+		return corrupt("terminal quota fields")
+	}
+	if lib != library || sources != normalSources || selections != normalSelections || sources != actualSources || sources != slotsSource || selections != actualSelections || selections != slotsSelection || used != actualUsed || sources < 0 || sources > 1024 || selections < 0 || selections > 4096 || used < 0 || used > TerminalReservationBytes*(sources+selections) || bad != 0 {
+		return corrupt("terminal reservation or coupling identity")
+	}
 	// Every committed scalar/request/receipt link is checked, bounded one row at
 	// a time; no operational row enters a portable projection.
 	return walkRows(ctx, q, `SELECT `+terminalSlotColumns+` FROM delivery_terminal_slots WHERE operation_id IS NOT NULL`, func(rows *sql.Rows) error {
@@ -78,17 +103,23 @@ func checkDeliveryLifecycleState(ctx context.Context, q queryer, library continu
 }
 
 func (s *Store) requireLifecycle(ctx context.Context, q queryer) error {
-	if !supportsDeliveryLifecycle(s.version) { return ErrUpgradeRequired }
+	if !supportsDeliveryLifecycle(s.version) {
+		return ErrUpgradeRequired
+	}
 	return s.checkVersion(ctx, q)
 }
 
 // CreateDeliveryLifecycle is explicit: older creation targets keep their meaning.
 func CreateDeliveryLifecycle(ctx context.Context, path string, library continuity.LibraryID) (*Store, error) {
-	if library.Validate() != nil { return nil, invalid("library identity") }
+	if library.Validate() != nil {
+		return nil, invalid("library identity")
+	}
 	return openStoreVersionContext(ctx, path, library, true, true, deliveryLifecycleSchemaVersion)
 }
 func UpgradeDeliveryLifecycle(ctx context.Context, path string, library continuity.LibraryID) error {
 	return upgradeCatalogVersion(ctx, path, library, deliveryLifecycleSchemaVersion, syncParent)
 }
 
-func terminalCommitError(kind string, err error) error { return fmt.Errorf("%s commit outcome uncertain: %w", kind, err) }
+func terminalCommitError(kind string, err error) error {
+	return fmt.Errorf("%s commit outcome uncertain: %w", kind, err)
+}

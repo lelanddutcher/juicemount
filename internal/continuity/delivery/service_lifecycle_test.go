@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -183,6 +184,33 @@ func TestServiceCloseJoinsAuthenticatedBindAndSharesResult(t *testing.T) {
 		_ = s.Close()
 	})
 	input := catalog.SourceBindRequest{Version: 1, LibraryID: library, ID: "lifecycle-bind", ExpectedIncarnation: "auth_" + strings.Repeat("5", 32), AssetID: continuity.AssetID("asset_" + strings.Repeat("6", 32)), RevisionID: continuity.RevisionID("rev1_" + strings.Repeat("7", 64)), Image: mutationauthority.ImageRef{Version: 1, StoreID: "ims_" + strings.Repeat("4", 32), LibraryID: string(library), ImageID: "img_" + strings.Repeat("8", 32)}}
+	// An uninitialized owner must be refused before network I/O. Establish the
+	// real local authority before exercising ownership of the authenticated call.
+	startedBind = true
+	go func() { _, err := s.BindSource(parent, input, "reader"); bindDone <- err }()
+	select {
+	case err := <-bindDone:
+		startedBind = false
+		if !errors.Is(err, catalog.ErrConflict) || requests.Load() != 0 {
+			t.Fatalf("uninitialized bind lost owner refusal: %v requests=%d", err, requests.Load())
+		}
+	case <-entered:
+		t.Fatal("uninitialized bind reached authenticated network I/O")
+	}
+	owner, err := store.LocalOwner(library)
+	if err != nil {
+		t.Fatal(err)
+	}
+	label := "Lifecycle owner"
+	value, err := json.Marshal(catalog.BootstrapRequest{OwnerSubjectID: catalog.SubjectID("sub_" + strings.Repeat("a", 32)), CreateLabel: &label})
+	if err != nil {
+		t.Fatal(err)
+	}
+	boot, err := owner.Bootstrap(parent, catalog.AdminRequest{Version: 1, LibraryID: library, ID: "lifecycle-bootstrap", Kind: "bootstrap", Value: value})
+	if err != nil {
+		t.Fatal(err)
+	}
+	input.ExpectedIncarnation = boot.Result.Incarnation
 	startedBind = true
 	go func() { _, err := s.BindSource(parent, input, "reader"); bindDone <- err }()
 	select {

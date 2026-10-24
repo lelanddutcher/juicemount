@@ -103,7 +103,9 @@ func TestCatalogDeliveryExecutableLifecycle(t *testing.T) {
 
 	cancel := catalog.DeliveryCancelRequest{Version: 1, LibraryID: catalogExecutableLibrary, ID: "lifecycle-executable-cancel", SelectionID: selection.SelectionID}
 	_, cancelDigest, err := catalog.CanonicalDeliveryCancelRequest(cancel)
-	if err != nil { t.Fatal(err) }
+	if err != nil {
+		t.Fatal(err)
+	}
 	var canceled catalog.DeliveryCancelResult
 	cancelBytes := local(envelope(cancel, fresh), "delivery", "cancel")
 	catalogExecutableDecode(t, cancelBytes, &canceled)
@@ -131,7 +133,9 @@ func TestCatalogDeliveryExecutableLifecycle(t *testing.T) {
 
 	disable := catalog.SourceDisableRequest{Version: 1, LibraryID: catalogExecutableLibrary, ID: "lifecycle-executable-disable", ExpectedIncarnation: f.incarnation, SourceID: sourceRequest.SourceID, ExpectedSourceVersion: sourceRequest.SourceVersion}
 	_, disableDigest, err := catalog.CanonicalSourceDisableRequest(disable)
-	if err != nil { t.Fatal(err) }
+	if err != nil {
+		t.Fatal(err)
+	}
 	disableBytes := local(catalogExecutableJSON(t, disable), "source", "disable")
 	var disabled catalog.SourceDisableResult
 	catalogExecutableDecode(t, disableBytes, &disabled)

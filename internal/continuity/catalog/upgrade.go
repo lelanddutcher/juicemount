@@ -111,8 +111,12 @@ func upgradeCatalogVersion(ctx context.Context, input string, expectedLibrary co
 	if target == savedQueriesSchemaVersion && initialVersion != 5 && initialVersion != 6 {
 		return ErrUpgradeRequired
 	}
-	if target == deliveryLifecycleSchemaVersion && initialVersion != 7 && initialVersion != 8 { return ErrUpgradeRequired }
-	if target == deliverySchemaVersion && initialVersion != 6 && initialVersion != 7 { return ErrUpgradeRequired }
+	if target == deliveryLifecycleSchemaVersion && initialVersion != 7 && initialVersion != 8 {
+		return ErrUpgradeRequired
+	}
+	if target == deliverySchemaVersion && initialVersion != 6 && initialVersion != 7 {
+		return ErrUpgradeRequired
+	}
 	if target == collectionsSchemaVersion && initialVersion != 4 && initialVersion != 5 {
 		return ErrUpgradeRequired
 	}
@@ -153,8 +157,12 @@ func upgradeCatalogVersion(ctx context.Context, input string, expectedLibrary co
 	if target == savedQueriesSchemaVersion && version != 5 && version != 6 {
 		return ErrUpgradeRequired
 	}
-	if target == deliveryLifecycleSchemaVersion && version != 7 && version != 8 { return ErrUpgradeRequired }
-	if target == deliverySchemaVersion && version != 6 && version != 7 { return ErrUpgradeRequired }
+	if target == deliveryLifecycleSchemaVersion && version != 7 && version != 8 {
+		return ErrUpgradeRequired
+	}
+	if target == deliverySchemaVersion && version != 6 && version != 7 {
+		return ErrUpgradeRequired
+	}
 	if target == collectionsSchemaVersion && version != 4 && version != 5 {
 		return ErrUpgradeRequired
 	}
@@ -270,18 +278,34 @@ func upgradeCatalogVersion(ctx context.Context, input string, expectedLibrary co
 		}
 	}
 	if target == deliverySchemaVersion && version == savedQueriesSchemaVersion {
-		if err := migrateV6Delivery(ctx, tx, library); err != nil { return err }
+		if err := migrateV6Delivery(ctx, tx, library); err != nil {
+			return err
+		}
 		actual, current, err := recognizeSchema(ctx, tx, false)
-		if err != nil { return err }
-		if actual != library || current != deliverySchemaVersion { return corrupt("delivery migration identity") }
-		if err := checkIntegrity(ctx, tx); err != nil { return err }
+		if err != nil {
+			return err
+		}
+		if actual != library || current != deliverySchemaVersion {
+			return corrupt("delivery migration identity")
+		}
+		if err := checkIntegrity(ctx, tx); err != nil {
+			return err
+		}
 	}
 	if target == deliveryLifecycleSchemaVersion && version == deliverySchemaVersion {
-		if err := initializeDeliveryLifecycle(ctx, tx, library); err != nil { return err }
+		if err := initializeDeliveryLifecycle(ctx, tx, library); err != nil {
+			return err
+		}
 		actual, current, err := recognizeSchema(ctx, tx, false)
-		if err != nil { return err }
-		if actual != library || current != deliveryLifecycleSchemaVersion { return corrupt("lifecycle migration identity") }
-		if err := checkIntegrity(ctx, tx); err != nil { return err }
+		if err != nil {
+			return err
+		}
+		if actual != library || current != deliveryLifecycleSchemaVersion {
+			return corrupt("lifecycle migration identity")
+		}
+		if err := checkIntegrity(ctx, tx); err != nil {
+			return err
+		}
 	}
 	if err := held.checkPaths(); err != nil {
 		return err
