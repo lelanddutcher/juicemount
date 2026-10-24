@@ -93,15 +93,24 @@ func TestCatalogDeliveryExecutableLifecycle(t *testing.T) {
 	fresh := append([]byte(nil), out[:102]...)
 	clear(out)
 	t.Cleanup(func() { clear(fresh) })
-	catalogExecutableDecode(t, local(envelope(inspect, fresh), "delivery", "inspect"), &inspection)
-	if inspection.OriginalSelection != selection || inspection.RequesterDeliveryEligibility.Eligible || inspection.RequesterDeliveryEligibility.Reason != "selector_mismatch" || inspection.RecordState.Canceled {
+	// This pin has never had a materialization attempt. Its first refusal must
+	// therefore exercise selector authority, with no prior-operation conflict.
+	probeSelection := f.selectDelivery(f.request("lifecycle-executable-selector-probe", catalogExecutableAsset, revision, int64(len(payload))))
+	probeInspect := catalog.DeliveryInspectRequest{Version: 1, LibraryID: catalogExecutableLibrary, SelectionID: probeSelection.SelectionID}
+	catalogExecutableDecode(t, local(envelope(probeInspect, fresh), "delivery", "inspect"), &inspection)
+	if inspection.OriginalSelection != probeSelection || inspection.RequesterDeliveryEligibility.Eligible || inspection.RequesterDeliveryEligibility.Reason != "selector_mismatch" || inspection.RecordState.Canceled {
 		t.Fatal("fresh selector changed the original pin or claimed byte eligibility")
 	}
-	f.denied(fresh, "--delivery-config", f.registry, "--selection-id", selection.SelectionID, "--operation-id", "lifecycle-executable-wrong-selector", "delivery", "materialize")
-	stillAvailable := f.materialize(selection, "lifecycle-executable-original-selector", payload)
+	f.denied(fresh, "--delivery-config", f.registry, "--selection-id", probeSelection.SelectionID, "--operation-id", "lifecycle-executable-wrong-selector", "delivery", "materialize")
+	stillAvailable := f.materialize(probeSelection, "lifecycle-executable-original-selector", payload)
 	catalogExecutableCheckpoint(t, "lifecycle8-fresh-subject-credential-inspects-without-inheriting-byte-pin")
 
-	cancel := catalog.DeliveryCancelRequest{Version: 1, LibraryID: catalogExecutableLibrary, ID: "lifecycle-executable-cancel", SelectionID: selection.SelectionID}
+	// A separate unused pin keeps the post-cancel first materialization probe
+	// independent of the already completed schema7 and selector-probe outputs.
+	cancelSelection := f.selectDelivery(f.request("lifecycle-executable-select-cancel", catalogExecutableAsset, revision, int64(len(payload))))
+	cancelInspect := catalog.DeliveryInspectRequest{Version: 1, LibraryID: catalogExecutableLibrary, SelectionID: cancelSelection.SelectionID}
+	cancelLookup := catalog.DeliveryLookupRequest{Version: 1, LibraryID: catalogExecutableLibrary, SelectionOperationID: cancelSelection.OperationID}
+	cancel := catalog.DeliveryCancelRequest{Version: 1, LibraryID: catalogExecutableLibrary, ID: "lifecycle-executable-cancel", SelectionID: cancelSelection.SelectionID}
 	_, cancelDigest, err := catalog.CanonicalDeliveryCancelRequest(cancel)
 	if err != nil {
 		t.Fatal(err)
@@ -109,18 +118,18 @@ func TestCatalogDeliveryExecutableLifecycle(t *testing.T) {
 	var canceled catalog.DeliveryCancelResult
 	cancelBytes := local(envelope(cancel, fresh), "delivery", "cancel")
 	catalogExecutableDecode(t, cancelBytes, &canceled)
-	checkTerminal(canceled.OriginalReceipt, catalog.TerminalReceipt{Version: 1, LibraryID: catalogExecutableLibrary, OperationID: cancel.ID, Kind: "selection_cancel", PayloadSHA256: cancelDigest, ActorSubjectID: catalogExecutableReader, AuthorityIncarnation: f.incarnation, SelectionID: selection.SelectionID})
-	if canceled.CurrentStatus.OriginalSelection != selection || !canceled.CurrentStatus.RecordState.Canceled || canceled.CurrentStatus.RecordState.Terminal != "committed" || canceled.CurrentStatus.RequesterDeliveryEligibility.Eligible {
+	checkTerminal(canceled.OriginalReceipt, catalog.TerminalReceipt{Version: 1, LibraryID: catalogExecutableLibrary, OperationID: cancel.ID, Kind: "selection_cancel", PayloadSHA256: cancelDigest, ActorSubjectID: catalogExecutableReader, AuthorityIncarnation: f.incarnation, SelectionID: cancelSelection.SelectionID})
+	if canceled.CurrentStatus.OriginalSelection != cancelSelection || !canceled.CurrentStatus.RecordState.Canceled || canceled.CurrentStatus.RecordState.Terminal != "committed" || canceled.CurrentStatus.RequesterDeliveryEligibility.Eligible {
 		t.Fatal("cancel did not retain immutable selection and durable terminal provenance")
 	}
 	if !bytes.Equal(cancelBytes, local(envelope(cancel, fresh), "delivery", "cancel")) {
 		t.Fatal("fresh process cancel retry changed terminal result")
 	}
-	catalogExecutableDecode(t, local(envelope(inspect, f.bearer), "delivery", "inspect"), &inspection)
-	if !inspection.RecordState.Canceled || inspection.RequesterDeliveryEligibility.Reason != "canceled" || inspection.RequesterDeliveryEligibility.Eligible {
+	catalogExecutableDecode(t, local(envelope(cancelInspect, f.bearer), "delivery", "inspect"), &inspection)
+	if inspection.OriginalSelection != cancelSelection || !inspection.RecordState.Canceled || inspection.RequesterDeliveryEligibility.Reason != "canceled" || inspection.RequesterDeliveryEligibility.Eligible {
 		t.Fatal("original credential did not observe durable cancellation")
 	}
-	f.denied(f.bearer, "--delivery-config", f.registry, "--selection-id", selection.SelectionID, "--operation-id", "lifecycle-executable-after-cancel", "delivery", "materialize")
+	f.denied(f.bearer, "--delivery-config", f.registry, "--selection-id", cancelSelection.SelectionID, "--operation-id", "lifecycle-executable-after-cancel", "delivery", "materialize")
 	cancelAgain := cancel
 	cancelAgain.ID = "lifecycle-executable-second-cancel"
 	f.denied(envelope(cancelAgain, fresh), "--delivery-config", missingConfig, "delivery", "cancel")
@@ -131,6 +140,9 @@ func TestCatalogDeliveryExecutableLifecycle(t *testing.T) {
 	catalogExecutableCheckpoint(t, "lifecycle8-cancel-cut-retry-and-conflict-with-live-byte-positive")
 	readyBeforeTerminal := f.readyNames()
 
+	// The source-cut target is also unused, so its first materialization
+	// cannot be refused merely because this selection already owns an attempt.
+	disableSelection := f.selectDelivery(f.request("lifecycle-executable-select-disable", catalogExecutableAsset, revision, int64(len(payload))))
 	disable := catalog.SourceDisableRequest{Version: 1, LibraryID: catalogExecutableLibrary, ID: "lifecycle-executable-disable", ExpectedIncarnation: f.incarnation, SourceID: sourceRequest.SourceID, ExpectedSourceVersion: sourceRequest.SourceVersion}
 	_, disableDigest, err := catalog.CanonicalSourceDisableRequest(disable)
 	if err != nil {
@@ -146,18 +158,31 @@ func TestCatalogDeliveryExecutableLifecycle(t *testing.T) {
 	if !bytes.Equal(disableBytes, local(catalogExecutableJSON(t, disable), "source", "disable")) {
 		t.Fatal("fresh process source disable retry changed terminal result")
 	}
-	secondInspect := catalog.DeliveryInspectRequest{Version: 1, LibraryID: catalogExecutableLibrary, SelectionID: second.SelectionID}
-	catalogExecutableDecode(t, local(envelope(secondInspect, f.bearer), "delivery", "inspect"), &inspection)
-	if inspection.RecordState.Canceled || inspection.RequesterDeliveryEligibility.Eligible || inspection.RequesterDeliveryEligibility.Reason != "source_or_pin_changed" {
+	disableInspect := catalog.DeliveryInspectRequest{Version: 1, LibraryID: catalogExecutableLibrary, SelectionID: disableSelection.SelectionID}
+	catalogExecutableDecode(t, local(envelope(disableInspect, f.bearer), "delivery", "inspect"), &inspection)
+	if inspection.OriginalSelection != disableSelection || inspection.RecordState.Canceled || inspection.RequesterDeliveryEligibility.Eligible || inspection.RequesterDeliveryEligibility.Reason != "source_or_pin_changed" {
 		t.Fatal("source cut failed to invalidate an uncanceled selection")
 	}
-	f.denied(f.bearer, "--delivery-config", f.registry, "--selection-id", second.SelectionID, "--operation-id", "lifecycle-executable-after-disable", "delivery", "materialize")
-	ctx, cancelProbe := context.WithTimeout(context.Background(), 20*time.Second)
-	view, probeErr := f.reader.ImageStatus(ctx, imageRef(seal))
-	cancelProbe()
-	if probeErr != nil || view.Content != seal.Content {
-		t.Fatal("source-disable refusal lacks a live authenticated Gateway control")
-	}
+	f.denied(f.bearer, "--delivery-config", f.registry, "--selection-id", disableSelection.SelectionID, "--operation-id", "lifecycle-executable-after-disable", "delivery", "materialize")
+	func() {
+		ctx, cancelProbe := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancelProbe()
+		view, probeErr := f.reader.ImageStatus(ctx, imageRef(seal))
+		if probeErr != nil || view.Content != seal.Content {
+			t.Fatal("source-disable refusal lacks a live authenticated Gateway control")
+		}
+		var readback []byte
+		for index := range view.Chunks {
+			chunk, err := f.reader.ImageReadback(ctx, view, int64(index))
+			if err != nil {
+				t.Fatal("source-disable live reader could not read every image chunk")
+			}
+			readback = append(readback, chunk...)
+		}
+		if int64(len(readback)) != view.Content.Size || !bytes.Equal(readback, payload) {
+			t.Fatal("source-disable live reader returned different whole-image bytes")
+		}
+	}()
 	catalogExecutableCheckpoint(t, "lifecycle8-source-cut-preserves-image-and-invalidates-uncanceled-pin")
 
 	f.producer.Close()
@@ -168,10 +193,10 @@ func TestCatalogDeliveryExecutableLifecycle(t *testing.T) {
 	if !bytes.Equal(cancelBytes, local(envelope(cancel, fresh), "delivery", "cancel")) || !bytes.Equal(disableBytes, local(catalogExecutableJSON(t, disable), "source", "disable")) {
 		t.Fatal("offline exact retry changed immutable terminal results")
 	}
-	offlineCancel := catalog.DeliveryCancelRequest{Version: 1, LibraryID: catalogExecutableLibrary, ID: "lifecycle-executable-offline-cancel", SelectionID: second.SelectionID}
+	offlineCancel := catalog.DeliveryCancelRequest{Version: 1, LibraryID: catalogExecutableLibrary, ID: "lifecycle-executable-offline-cancel", SelectionID: disableSelection.SelectionID}
 	var offlineCanceled catalog.DeliveryCancelResult
 	catalogExecutableDecode(t, local(envelope(offlineCancel, fresh), "delivery", "cancel"), &offlineCanceled)
-	if !offlineCanceled.CurrentStatus.RecordState.Canceled || offlineCanceled.CurrentStatus.OriginalSelection != second || offlineCanceled.OriginalReceipt.ActorSubjectID != catalogExecutableReader || offlineCanceled.OriginalReceipt.OperationID != offlineCancel.ID {
+	if !offlineCanceled.CurrentStatus.RecordState.Canceled || offlineCanceled.CurrentStatus.OriginalSelection != disableSelection || offlineCanceled.OriginalReceipt.ActorSubjectID != catalogExecutableReader || offlineCanceled.OriginalReceipt.OperationID != offlineCancel.ID {
 		t.Fatal("offline terminal commit failed for authorized source-ineligible selection")
 	}
 	var retried catalog.SourceBindResult
@@ -183,8 +208,8 @@ func TestCatalogDeliveryExecutableLifecycle(t *testing.T) {
 	if sourceStatus != disabled.CurrentStatus {
 		t.Fatal("offline status changed after historical bind retry")
 	}
-	catalogExecutableDecode(t, local(envelope(lookup, f.bearer), "delivery", "lookup"), &inspection)
-	if inspection.OriginalSelection != selection || !inspection.RecordState.Canceled || inspection.RecordState.Terminal != "committed" {
+	catalogExecutableDecode(t, local(envelope(cancelLookup, f.bearer), "delivery", "lookup"), &inspection)
+	if inspection.OriginalSelection != cancelSelection || !inspection.RecordState.Canceled || inspection.RecordState.Terminal != "committed" {
 		t.Fatal("offline operation lookup lost terminal selection history")
 	}
 	if !bytes.Equal(readyBeforeTerminal, f.readyNames()) {
