@@ -233,7 +233,10 @@ func TestSavedQueryPortabilityTypedDispatchAndFrameCap(t *testing.T) {
 	if _, _, err := decodePortableCollectionContent(bad, v.LibraryID, 4); err == nil {
 		t.Fatal("accepted future content codec")
 	}
-	if _, _, err := decodePortableCollectionContent(query.payload, v.LibraryID, 5); err == nil {
+	if _, _, err := decodePortableCollectionContent(query.payload, v.LibraryID, 5); err != nil {
+		t.Fatalf("format5 rejected supported query codec: %v", err)
+	}
+	if _, _, err := decodePortableCollectionContent(query.payload, v.LibraryID, 6); err == nil {
 		t.Fatal("accepted future stream format")
 	}
 	if got, err := replaySavedQueryFixtureFrame(t, s, query, rows, MaxStreamProjectionRows); err != nil || got != 60 {

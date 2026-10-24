@@ -360,16 +360,16 @@ func restoreCollections(ctx context.Context, path string, library continuity.Lib
 	return restoreCollectionFormat(ctx, path, library, input, limits, directoryBarrier, 3)
 }
 func restoreCollectionFormat(ctx context.Context, path string, library continuity.LibraryID, input *streamInput, limits Limits, directoryBarrier func(string) error, format int) (resultErr error) {
-	if format != 3 && format != 4 {
+	if format != 3 && format != 4 && format != 5 {
 		return corrupt("collection restore format")
 	}
 	h, magic := collectionFormatHash(format)
 	h.Write([]byte(magic))
-	_, data, err := input.collectionFrame(false, 1, h)
+	_, data, err := input.collectionFormatFrame(false, 1, h, format)
 	if err != nil {
 		return err
 	}
-	header, err := decodeCollectionFormatHeader(data, library, limits, format)
+	header, byteCount, err := decodePortableCollectionHeader(data, library, limits, format)
 	if err != nil {
 		return err
 	}
@@ -386,8 +386,11 @@ func restoreCollectionFormat(ctx context.Context, path string, library continuit
 		}
 	}()
 	rows := int64(2)
+	if format == 5 {
+		rows++
+	} // portable byte-policy quota singleton
 	for sequence := int64(1); sequence <= header.EventCount; sequence++ {
-		_, payload, err := input.collectionFrame(false, 2, h)
+		_, payload, err := input.collectionFormatFrame(false, 2, h, format)
 		if err != nil {
 			return protocolError("restore metadata frame", err)
 		}
@@ -403,7 +406,7 @@ func restoreCollectionFormat(ctx context.Context, path string, library continuit
 	}
 	var last CollectionID
 	for n := int64(0); n < header.CollectionCount; n++ {
-		_, payload, err := input.collectionFrame(false, 5, h)
+		_, payload, err := input.collectionFormatFrame(false, 5, h, format)
 		if err != nil {
 			return protocolError("restore declaration frame", err)
 		}
@@ -424,9 +427,9 @@ func restoreCollectionFormat(ctx context.Context, path string, library continuit
 		rows = next
 		last = d.CollectionID
 	}
-	var legacy, content, policy int64
+	var legacy, content, policy, bytePolicy int64
 	for ordinal := int64(1); ordinal <= header.TransactionCount; ordinal++ {
-		kind, payload, err := input.collectionFrame(true, 0, h)
+		kind, payload, err := input.collectionFormatFrame(true, 0, h, format)
 		if err != nil {
 			return protocolError("restore transaction frame", err)
 		}
@@ -459,6 +462,23 @@ func restoreCollectionFormat(ctx context.Context, path string, library continuit
 				return protocolError("restore owner policy replay", err)
 			}
 			rows = next
+		case 8:
+			bytePolicy++
+			if format != 5 || bytePolicy > byteCount {
+				return corrupt("excess byte policy")
+			}
+			record, err := DecodeBytePolicyRecord(payload)
+			if err != nil {
+				return err
+			}
+			if record.Receipt.Sequence != bytePolicy {
+				return corrupt("byte policy sequence")
+			}
+			next, err := s.replayBytePolicy(ctx, record, rows, limits.MaxProjectionRows)
+			if err != nil {
+				return protocolError("restore byte policy replay", err)
+			}
+			rows = next
 		case 7:
 			content++
 			if content > header.CollectionEventCount {
@@ -483,18 +503,18 @@ func restoreCollectionFormat(ctx context.Context, path string, library continuit
 			return corrupt("restore transaction kind")
 		}
 	}
-	if legacy != header.PolicyEventCount || content != header.CollectionEventCount || policy != header.CollectionPolicyEventCount {
+	if legacy != header.PolicyEventCount || content != header.CollectionEventCount || policy != header.CollectionPolicyEventCount || bytePolicy != byteCount {
 		return corrupt("restore encountered family counts")
 	}
-	_, data, err = input.collectionFrame(false, 3, nil)
+	_, data, err = input.collectionFormatFrame(false, 3, nil, format)
 	if err != nil {
 		return err
 	}
-	footer, err := decodeCollectionFooter(data, header.collectionStreamCounts, limits)
+	footer, err := decodePortableCollectionFooter(data, header.collectionStreamCounts, byteCount, limits, format)
 	if err != nil {
 		return err
 	}
-	digest, err := finishCollectionStreamHash(h, header.collectionStreamCounts, footer.ProjectionRows, footer.ProjectionSHA256)
+	digest, err := finishPortableCollectionStreamHash(format, h, header.collectionStreamCounts, byteCount, footer.ProjectionRows, footer.ProjectionSHA256)
 	if err != nil {
 		return err
 	}
@@ -548,6 +568,21 @@ func restoreCollectionFormat(ctx context.Context, path string, library continuit
 	}
 	if err := walkCollectionTransactions(ctx, tx, library, counts, nil); err != nil {
 		return err
+	}
+	if format == 5 {
+		actualBytes, err := bytePolicyTotal(ctx, tx)
+		if err != nil {
+			return err
+		}
+		if actualBytes != byteCount {
+			return corrupt("restored byte policy count")
+		}
+		if err := validateBytePolicyPortableState(ctx, tx, library); err != nil {
+			return err
+		}
+		if err := validateInactiveDeliveryImport(ctx, tx); err != nil {
+			return err
+		}
 	}
 	if err := validateInactiveCollectionImport(ctx, tx); err != nil {
 		return err

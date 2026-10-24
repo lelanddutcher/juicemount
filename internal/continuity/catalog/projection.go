@@ -112,6 +112,13 @@ func projectionTotal(ctx context.Context, q queryer) (int64, error) {
 		}
 		count, err = addCollectionProjectionRows(count, extra)
 	}
+	if err == nil && supportsDelivery(version) {
+		extra, e := deliveryProjectionTotal(ctx, q)
+		if e != nil {
+			return 0, e
+		}
+		count, err = addCollectionProjectionRows(count, extra)
+	}
 	return count, err
 }
 
@@ -132,6 +139,9 @@ func projectionDigest(ctx context.Context, q queryer, library continuity.Library
 	}
 	if supportsSavedQueries(version) {
 		domain = "juicemount.catalog.projection\x00\x04"
+	}
+	if supportsDelivery(version) {
+		domain = "juicemount.catalog.projection\x00\x05"
 	}
 	_, _ = h.Write([]byte(domain))
 	var count int64
@@ -264,6 +274,11 @@ func projectionDigest(ctx context.Context, q queryer, library continuity.Library
 	}
 	if supportsSavedQueries(version) {
 		if err := walkSavedQueryProjections(ctx, q, library, emit); err != nil {
+			return "", 0, err
+		}
+	}
+	if supportsDelivery(version) {
+		if err := walkDeliveryProjections(ctx, q, library, emit); err != nil {
 			return "", 0, err
 		}
 	}

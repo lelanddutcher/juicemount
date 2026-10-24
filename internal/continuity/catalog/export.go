@@ -113,12 +113,6 @@ func (s *Store) Export(ctx context.Context, library continuity.LibraryID, writer
 	if err := s.checkVersion(ctx, tx); err != nil {
 		return err
 	}
-	// A schema-7 snapshot contains byte-policy chronology and grants. Until the
-	// format-5 writer is available, the older collection writer cannot represent
-	// that state even when there are currently no byte grants.
-	if supportsDelivery(version) {
-		return ErrUpgradeRequired
-	}
 	if supportsCollections(version) {
 		output := streamOutput{ctx: ctx, w: writer, max: limits.MaxBytes}
 		footer, err := exportCollectionSnapshot(ctx, tx, library, &output, limits)

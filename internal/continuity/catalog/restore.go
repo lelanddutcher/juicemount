@@ -28,6 +28,9 @@ func restoreCatalog(ctx context.Context, path string, library continuity.Library
 	if err := input.exact(magic); err != nil {
 		return err
 	}
+	if string(magic) == streamMagic5 {
+		return restoreCollectionFormat(ctx, path, library, &input, limits, directoryBarrier, 5)
+	}
 	if string(magic) == streamMagic4 {
 		return restoreCollectionFormat(ctx, path, library, &input, limits, directoryBarrier, 4)
 	}

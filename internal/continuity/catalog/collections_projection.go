@@ -190,12 +190,21 @@ func walkCollectionProjections(ctx context.Context, q queryer, library continuit
 	}); err != nil {
 		return err
 	}
-	var ordinal, legacy, policy, content int64
-	if err := walkRows(ctx, q, `SELECT o.ordinal,o.legacy_sequence,o.owner_policy_sequence,o.content_sequence,c.generated_policy_sequence,l.library_id,p.library_id,p.administration,c.library_id,g.library_id,g.administration,c.actor_subject_id,g.operator_subject_id,g.namespace_subject_id FROM collection_order o LEFT JOIN policy_events l ON l.sequence=o.legacy_sequence LEFT JOIN collection_policy_events p ON p.sequence=o.owner_policy_sequence LEFT JOIN collection_events c ON c.sequence=o.content_sequence LEFT JOIN collection_policy_events g ON g.sequence=c.generated_policy_sequence ORDER BY o.ordinal`, func(rows *sql.Rows) error {
+	version, err := catalogVersion(ctx, q)
+	if err != nil {
+		return err
+	}
+	byteColumns, byteJoin := "NULL,NULL", ""
+	if supportsDelivery(version) {
+		byteColumns, byteJoin = "o.byte_policy_sequence,b.library_id", " LEFT JOIN byte_policy_events b ON b.sequence=o.byte_policy_sequence"
+	}
+	var ordinal, legacy, policy, content, bytePolicy int64
+	if err := walkRows(ctx, q, `SELECT `+byteColumns+`,o.ordinal,o.legacy_sequence,o.owner_policy_sequence,o.content_sequence,c.generated_policy_sequence,l.library_id,p.library_id,p.administration,c.library_id,g.library_id,g.administration,c.actor_subject_id,g.operator_subject_id,g.namespace_subject_id FROM collection_order o LEFT JOIN policy_events l ON l.sequence=o.legacy_sequence LEFT JOIN collection_policy_events p ON p.sequence=o.owner_policy_sequence LEFT JOIN collection_events c ON c.sequence=o.content_sequence LEFT JOIN collection_policy_events g ON g.sequence=c.generated_policy_sequence`+byteJoin+` ORDER BY o.ordinal`, func(rows *sql.Rows) error {
 		var out collectionOrderProjection
-		var l, p, c, g sql.NullInt64
+		var l, p, c, g, b sql.NullInt64
+		var bl sql.NullString
 		var ll, pl, admin, cl, gl, childAdmin, actor, operator, namespace sql.NullString
-		if err := rows.Scan(&out.Ordinal, &l, &p, &c, &g, &ll, &pl, &admin, &cl, &gl, &childAdmin, &actor, &operator, &namespace); err != nil {
+		if err := rows.Scan(&b, &bl, &out.Ordinal, &l, &p, &c, &g, &ll, &pl, &admin, &cl, &gl, &childAdmin, &actor, &operator, &namespace); err != nil {
 			return formatError(err)
 		}
 		ordinal++
@@ -203,7 +212,7 @@ func walkCollectionProjections(ctx context.Context, q queryer, library continuit
 			return corrupt("order projection ordinal")
 		}
 		references := 0
-		for _, n := range []sql.NullInt64{l, p, c} {
+		for _, n := range []sql.NullInt64{l, p, c, b} {
 			if n.Valid {
 				references++
 				if n.Int64 <= 0 {
@@ -229,6 +238,12 @@ func walkCollectionProjections(ctx context.Context, q queryer, library continuit
 			}
 			out.Kind = "owner_policy"
 			out.Sequence = p.Int64
+		case b.Valid:
+			bytePolicy++
+			if !bl.Valid || bl.String != string(library) || b.Int64 != bytePolicy || g.Valid {
+				return corrupt("order byte policy membership")
+			}
+			out.Kind, out.Sequence = "byte_policy", b.Int64
 		case c.Valid:
 			content++
 			if !cl.Valid || cl.String != string(library) || c.Int64 != content {

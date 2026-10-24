@@ -14,6 +14,9 @@ const streamMagic4 = "juicemount.catalog.export\x00\x04"
 // Callers validate the format before choosing its domain. All subsequent
 // framing, counts and lifecycle ownership are shared with format3.
 func collectionFormatHash(format int) (hash.Hash, string) {
+	if format == 5 {
+		return deliveryStreamHash(), streamMagic5
+	}
 	if format == 4 {
 		h := sha256.New()
 		h.Write([]byte("juicemount.catalog.export.stream\x00\x04"))
@@ -66,7 +69,7 @@ type portableCollectionReplay func(context.Context, *Store, int64, int64) (int64
 // Inspect only the discriminator before the selected strict canonical decoder.
 // A format3 stream can never opt into the query codec.
 func decodePortableCollectionContent(data []byte, library continuity.LibraryID, format int) (portableCollectionReplay, bool, error) {
-	if format != 3 && format != 4 {
+	if format != 3 && format != 4 && format != 5 {
 		return nil, false, corrupt("content stream format")
 	}
 	a, _, _, err := takeCollectionPair(data, MaxCollectionRecordBytes, false)
@@ -89,7 +92,7 @@ func decodePortableCollectionContent(data []byte, library continuity.LibraryID, 
 			return s.replayCollectionContent(ctx, r, receipt, child, childReceipt, rows, max)
 		}, child != nil, nil
 	case 2:
-		if format != 4 {
+		if format != 4 && format != 5 {
 			return nil, false, corrupt("query content in older format")
 		}
 		r, receipt, child, childReceipt, err := decodeSavedQueryContentPair(data, library)
@@ -110,7 +113,7 @@ func readPortableCollectionContent(ctx context.Context, q queryer, library conti
 		return nil, nil, 0, nil, err
 	}
 	kind := "manual"
-	if version == 6 {
+	if supportsSavedQueries(version) {
 		var id CollectionID
 		if err := q.QueryRowContext(ctx, `SELECT collection_id FROM collection_events WHERE sequence=?`, sequence).Scan(&id); err != nil {
 			return nil, nil, 0, nil, err

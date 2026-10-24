@@ -135,6 +135,12 @@ func finishCollectionStreamHash(h hash.Hash, c collectionStreamCounts, rows int6
 // The caller supplies the expected phase. Transaction kinds are selected only
 // within the mixed chronology; declarations and footer cannot appear there.
 func (s *streamInput) collectionFrame(transaction bool, expected byte, h hash.Hash) (byte, []byte, error) {
+	return s.collectionFormatFrame(transaction, expected, h, 3)
+}
+func (s *streamInput) collectionFormatFrame(transaction bool, expected byte, h hash.Hash, format int) (byte, []byte, error) {
+	if format != 3 && format != 4 && format != 5 {
+		return 0, nil, corrupt("collection frame format")
+	}
 	var header [5]byte
 	if err := s.exact(header[:]); err != nil {
 		return 0, nil, err
@@ -149,6 +155,11 @@ func (s *streamInput) collectionFrame(transaction bool, expected byte, h hash.Ha
 			max = maxCollectionOwnerPayload
 		case 7:
 			max = maxCollectionContentPayload
+		case 8:
+			if format != 5 {
+				return 0, nil, corrupt("byte policy in older format")
+			}
+			max = maxBytePolicyRecordBytes
 		default:
 			return 0, nil, corrupt("collection transaction frame kind")
 		}
@@ -435,7 +446,25 @@ func walkCollectionDeclarations(ctx context.Context, q queryer, library continui
 	return nil
 }
 func walkCollectionTransactions(ctx context.Context, q queryer, library continuity.LibraryID, c collectionStreamCounts, fn func(byte, []byte) error) error {
-	var legacy, content, policy int64
+	version, err := catalogVersion(ctx, q)
+	if err != nil {
+		return err
+	}
+	var byteCount int64
+	var owners deliveryOwnerPrefix
+	orderSQL := `SELECT COALESCE(legacy_sequence,0),COALESCE(owner_policy_sequence,0),COALESCE(content_sequence,0),0 FROM collection_order WHERE ordinal=?`
+	if supportsDelivery(version) {
+		byteCount, err = bytePolicyTotal(ctx, q)
+		if err != nil {
+			return err
+		}
+		owners, err = newDeliveryOwnerPrefix(ctx, q)
+		if err != nil {
+			return err
+		}
+		orderSQL = `SELECT COALESCE(legacy_sequence,0),COALESCE(owner_policy_sequence,0),COALESCE(content_sequence,0),COALESCE(byte_policy_sequence,0) FROM collection_order WHERE ordinal=?`
+	}
+	var legacy, content, policy, bytePolicy int64
 	emit := func(kind byte, payload []byte) error {
 		if fn != nil {
 			return fn(kind, payload)
@@ -446,12 +475,12 @@ func walkCollectionTransactions(ctx context.Context, q queryer, library continui
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		var l, p, n int64
-		if err := q.QueryRowContext(ctx, `SELECT COALESCE(legacy_sequence,0),COALESCE(owner_policy_sequence,0),COALESCE(content_sequence,0) FROM collection_order WHERE ordinal=?`, ordinal).Scan(&l, &p, &n); err != nil {
+		var l, p, n, b int64
+		if err := q.QueryRowContext(ctx, orderSQL, ordinal).Scan(&l, &p, &n, &b); err != nil {
 			return err
 		}
 		references := 0
-		for _, v := range []int64{l, p, n} {
+		for _, v := range []int64{l, p, n, b} {
 			if v < 0 {
 				return corrupt("collection order negative reference")
 			}
@@ -472,7 +501,11 @@ func walkCollectionTransactions(ctx context.Context, q queryer, library continui
 			if err != nil {
 				return err
 			}
-			if _, _, err := e.decodePolicy(library); err != nil {
+			op, _, err := e.decodePolicy(library)
+			if err != nil {
+				return err
+			}
+			if err := owners.apply(op); err != nil {
 				return err
 			}
 			if err := emit(4, encodeEvent(e)); err != nil {
@@ -490,8 +523,30 @@ func walkCollectionTransactions(ctx context.Context, q queryer, library continui
 			if r.Administration != "local_owner" {
 				return corrupt("independent generated policy")
 			}
+			if err := owners.require(r.OperatorSubjectID); err != nil {
+				return err
+			}
 			data, _, _ := CanonicalCollectionPolicyRecord(r)
 			if err := emit(6, appendCollectionPair(nil, data, receipt)); err != nil {
+				return err
+			}
+		case b > 0:
+			bytePolicy++
+			if b != bytePolicy || bytePolicy > byteCount {
+				return corrupt("byte policy collection order")
+			}
+			r, err := readBytePolicyRecord(ctx, q, library, b)
+			if err != nil {
+				return err
+			}
+			if err := owners.require(r.OperatorSubjectID); err != nil {
+				return err
+			}
+			data, _, err := CanonicalBytePolicyRecord(r)
+			if err != nil {
+				return err
+			}
+			if err := emit(8, data); err != nil {
 				return err
 			}
 		case n > 0:
@@ -528,7 +583,7 @@ func walkCollectionTransactions(ctx context.Context, q queryer, library continui
 			}
 		}
 	}
-	if legacy != c.PolicyEventCount || content != c.CollectionEventCount || policy != c.CollectionPolicyEventCount {
+	if legacy != c.PolicyEventCount || content != c.CollectionEventCount || policy != c.CollectionPolicyEventCount || bytePolicy != byteCount {
 		return corrupt("collection family coverage")
 	}
 	return nil
@@ -620,7 +675,18 @@ func exportCollectionSnapshot(ctx context.Context, q queryer, library continuity
 	if err != nil {
 		return nil, err
 	}
-	if err := c.validate(limits); err != nil {
+	version, err := catalogVersion(ctx, q)
+	if err != nil {
+		return nil, err
+	}
+	var byteCount int64
+	if supportsDelivery(version) {
+		byteCount, err = bytePolicyTotal(ctx, q)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if err := validatePortableCollectionCounts(c, byteCount, version == 7, limits); err != nil {
 		return nil, err
 	}
 	rows, err := projectionTotal(ctx, q)
@@ -633,12 +699,15 @@ func exportCollectionSnapshot(ctx context.Context, q queryer, library continuity
 	if err := validateCollectionPortableState(ctx, q, library); err != nil {
 		return nil, err
 	}
-	version, err := catalogVersion(ctx, q)
-	if err != nil {
-		return nil, err
+	if supportsDelivery(version) {
+		if err := validateBytePolicyPortableState(ctx, q, library); err != nil {
+			return nil, err
+		}
 	}
 	format := 3
-	if version == 6 {
+	if version == 7 {
+		format = 5
+	} else if version == 6 {
 		format = 4
 	} else if version != 5 {
 		return nil, corrupt("collection export schema")
@@ -647,7 +716,7 @@ func exportCollectionSnapshot(ctx context.Context, q queryer, library continuity
 	if err := output.write([]byte(magic), h); err != nil {
 		return nil, err
 	}
-	header, err := json.Marshal(collectionStreamHeader{format, version, library, c})
+	header, err := encodePortableCollectionHeader(collectionStreamHeader{format, version, library, c}, byteCount)
 	if err != nil {
 		return nil, err
 	}
@@ -682,11 +751,11 @@ func exportCollectionSnapshot(ctx context.Context, q queryer, library continuity
 	if observed != rows {
 		return nil, corrupt("collection projection row count")
 	}
-	digest, err := finishCollectionStreamHash(h, c, rows, projection)
+	digest, err := finishPortableCollectionStreamHash(format, h, c, byteCount, rows, projection)
 	if err != nil {
 		return nil, err
 	}
-	footer, err := json.Marshal(collectionStreamFooter{c, rows, projection, digest})
+	footer, err := encodePortableCollectionFooter(format, collectionStreamFooter{c, rows, projection, digest}, byteCount)
 	if err != nil {
 		return nil, err
 	}
