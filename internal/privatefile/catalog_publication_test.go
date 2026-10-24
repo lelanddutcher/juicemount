@@ -161,12 +161,21 @@ func publicationDirectory(t *testing.T, parent, name string) string {
 
 func newPublicationFixture(t *testing.T) publicationFixture {
 	t.Helper()
+	return newPublicationFixtureVersion(t, false)
+}
+
+func newPublicationFixtureVersion(t *testing.T, lifecycle bool) publicationFixture {
+	t.Helper()
 	ctx := context.Background()
 	f := publicationFixture{path: filepath.Join(t.TempDir(), "publication.sqlite"), payload: []byte("publication exact managed bytes"), expectedCloseFault: &atomic.Bool{}}
 	digestBytes := sha256.Sum256(f.payload)
 	digest := hex.EncodeToString(digestBytes[:])
 	var err error
-	f.store, err = catalog.CreateDelivery(ctx, f.path, publicationLibrary)
+	if lifecycle {
+		f.store, err = catalog.CreateDeliveryLifecycle(ctx, f.path, publicationLibrary)
+	} else {
+		f.store, err = catalog.CreateDelivery(ctx, f.path, publicationLibrary)
+	}
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -219,8 +228,11 @@ func newPublicationFixture(t *testing.T) publicationFixture {
 	f.client = client
 	bind := catalog.SourceBindRequest{Version: 1, LibraryID: publicationLibrary, ID: "publication-bind", ExpectedIncarnation: f.incarnation, AssetID: publicationAsset, RevisionID: revision, RouteID: "publication-test-route", RouteDigest: strings.Repeat("b", 64), ReaderLeafSHA256: strings.Repeat("c", 64), Image: ref}
 	bound, err := owner.BindDeliverySource(ctx, bind, client)
-	if err != nil || bound.Content != manifest.Content {
+	if err != nil || bound.OriginalReceipt.Content != manifest.Content || !bound.OriginalReceipt.Enabled {
 		t.Fatalf("public source binding: %+v %v", bound, err)
+	}
+	if !bound.CurrentStatus.Enabled || bound.CurrentStatus.Eligibility != "eligible" || bound.CurrentStatus.SourceID != bound.OriginalReceipt.SourceID || bound.CurrentStatus.SourceVersion != bound.OriginalReceipt.SourceVersion || bound.CurrentStatus.CurrentSourceVersion != bound.OriginalReceipt.SourceVersion || bound.CurrentStatus.Content != manifest.Content {
+		t.Fatalf("public source binding lost current status: %+v", bound.CurrentStatus)
 	}
 	if status, read := imageCalls.status.Load(), imageCalls.read.Load(); status != 3 || read != 1 {
 		t.Fatalf("strict source binding requests: status=%d read=%d", status, read)
@@ -1046,5 +1058,146 @@ func TestCatalogRecoveryBarrierRetainsWriterFenceAfterCancellation(t *testing.T)
 	_ = f.reopen(t)
 	if state, hasReady := publicationPersistedState(t, f.path, f.attempt.ID); state != "COMPLETED" || !hasReady {
 		t.Fatalf("reopened recovery state: %s ready=%v", state, hasReady)
+	}
+}
+
+// The original no-replace syscall and directory barriers remain owned while a
+// distinct Store tries each schema8 terminal API. A canceled request or expired
+// deadline cannot release that writer fence before the original file call joins.
+func publicationLifecycleTerminalFence(t *testing.T, kind string, phase privatefile.PublicationTestPhase, deadline bool) {
+	t.Helper()
+	f := newPublicationFixtureVersion(t, true)
+	gate, err := privatefile.InstallPublicationGateForTest(f.prepared, phase)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ctx context.Context
+	var stop context.CancelFunc
+	if deadline {
+		ctx, stop = context.WithDeadline(context.Background(), time.Now().Add(2*time.Second))
+	} else {
+		ctx, stop = context.WithCancel(context.Background())
+	}
+	t.Cleanup(stop)
+	publication := &publicationCall{done: make(chan struct{})}
+	t.Cleanup(func() { gate.Release(); <-publication.done })
+	go func() {
+		publication.result, publication.err = f.store.PublishMaterialization(ctx, f.bearer, f.prepared)
+		close(publication.done)
+	}()
+	select {
+	case <-gate.Entered():
+	case <-publication.done:
+		t.Fatalf("schema8 publication returned before original %s: %v", phase, publication.err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("schema8 publication did not reach original file phase")
+	}
+	wantReady, wantAttempt := int32(0), int32(0)
+	if phase != privatefile.PublicationTestRename {
+		wantReady = 1
+	}
+	if phase == privatefile.PublicationTestAttemptSync {
+		wantAttempt = 1
+	}
+	if rename, ready, attempt := gate.Calls(); rename != 1 || ready != wantReady || attempt != wantAttempt {
+		t.Fatalf("held original file phases: rename=%d ready=%d attempt=%d", rename, ready, attempt)
+	}
+	publicationExactReady(t, f)
+	if deadline {
+		<-ctx.Done()
+		if !errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			t.Fatalf("publication deadline did not expire: %v", ctx.Err())
+		}
+	} else {
+		stop()
+		if !errors.Is(ctx.Err(), context.Canceled) {
+			t.Fatalf("publication request did not cancel: %v", ctx.Err())
+		}
+	}
+	cancelRequest := catalog.DeliveryCancelRequest{Version: 1, LibraryID: publicationLibrary, ID: "publication-lifecycle-cancel", SelectionID: f.selection.SelectionID}
+	disableRequest := catalog.SourceDisableRequest{Version: 1, LibraryID: publicationLibrary, ID: "publication-lifecycle-disable", ExpectedIncarnation: f.incarnation, SourceID: f.selection.SourceID, ExpectedSourceVersion: f.selection.SourceVersion}
+	terminal := func() (catalog.TerminalReceipt, error) {
+		if kind == "selection_cancel" {
+			result, err := f.other.CancelDelivery(context.Background(), f.bearer, cancelRequest)
+			return result.OriginalReceipt, err
+		}
+		result, err := f.otherOwner.DisableDeliverySource(context.Background(), disableRequest)
+		return result.OriginalReceipt, err
+	}
+	terminalDone := make(chan struct{})
+	var receipt catalog.TerminalReceipt
+	var terminalErr error
+	t.Cleanup(func() { gate.Release(); <-terminalDone; <-publication.done })
+	go func() {
+		receipt, terminalErr = terminal()
+		close(terminalDone)
+	}()
+	select {
+	case <-terminalDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("schema8 terminal call did not finish under SQLite busy timeout")
+	}
+	var busy *sqlite.Error
+	if !errors.As(terminalErr, &busy) || busy.Code()&0xff != int(sqlitelib.SQLITE_BUSY) || receipt.OperationID != "" {
+		t.Fatalf("%s bypassed original owned exposure fence: receipt=%+v err=%v", kind, receipt, terminalErr)
+	}
+	select {
+	case <-publication.done:
+		t.Fatalf("request interruption returned original publication while file phase held: %+v %v", publication.result, publication.err)
+	default:
+	}
+	gate.Release()
+	<-publication.done
+	if publication.err != nil || publication.result.State != "COMPLETED" {
+		t.Fatalf("original publication after file-phase join: %+v %v", publication.result, publication.err)
+	}
+	if rename, ready, attempt := gate.Calls(); rename != 1 || ready != 1 || attempt != 1 {
+		t.Fatalf("completed original file phases: rename=%d ready=%d attempt=%d", rename, ready, attempt)
+	}
+	receipt, terminalErr = terminal()
+	if terminalErr != nil || receipt.Kind != kind || receipt.RecordedUnixNano <= 0 || receipt.AuthorityIncarnation != f.incarnation {
+		t.Fatalf("terminal retry after original publication joined: %+v %v", receipt, terminalErr)
+	}
+	if kind == "selection_cancel" {
+		if receipt.OperationID != cancelRequest.ID || receipt.SelectionID != f.selection.SelectionID || receipt.ActorSubjectID != publicationReader {
+			t.Fatalf("cancel lost original actor/target binding: %+v", receipt)
+		}
+	} else if receipt.OperationID != disableRequest.ID || receipt.SourceID != f.selection.SourceID || receipt.SourceVersion != f.selection.SourceVersion || receipt.ActorSubjectID != publicationOwner {
+		t.Fatalf("disable lost original actor/target binding: %+v", receipt)
+	}
+	retry, err := terminal()
+	if err != nil || retry != receipt {
+		t.Fatalf("committed terminal retry changed immutable receipt: %+v %v", retry, err)
+	}
+	if _, err := f.other.AdmitDelivery(context.Background(), f.bearer, f.selection.SelectionID); !errors.Is(err, catalog.ErrNotFound) {
+		t.Fatalf("fresh byte admission after committed %s: %v", kind, err)
+	}
+	inspected, err := f.other.InspectDelivery(context.Background(), f.bearer, catalog.DeliveryInspectRequest{Version: 1, LibraryID: publicationLibrary, SelectionID: f.selection.SelectionID})
+	if err != nil || inspected.OriginalSelection != f.selection || inspected.RequesterDeliveryEligibility.Eligible || inspected.RecordState.Canceled != (kind == "selection_cancel") {
+		t.Fatalf("terminal inspection lost original pin/current denial: %+v %v", inspected, err)
+	}
+	publicationExactReady(t, f)
+	_ = f.reopen(t)
+	if state, hasReady := publicationPersistedState(t, f.path, f.attempt.ID); state != "COMPLETED" || !hasReady {
+		t.Fatalf("terminal-after-exposure changed durable completion: state=%s ready=%v", state, hasReady)
+	}
+	publicationExactReady(t, f)
+}
+
+func TestCatalogLifecycleTerminalsWaitForOriginalOwnedExposure(t *testing.T) {
+	for _, kind := range []string{"selection_cancel", "source_disable"} {
+		for _, phase := range []privatefile.PublicationTestPhase{privatefile.PublicationTestRename, privatefile.PublicationTestReadySync, privatefile.PublicationTestAttemptSync} {
+			t.Run(kind+"/"+string(phase), func(t *testing.T) {
+				publicationLifecycleTerminalFence(t, kind, phase, false)
+			})
+		}
+	}
+}
+
+func TestCatalogLifecycleExposureDeadlineRetainsTerminalWriterFence(t *testing.T) {
+	for _, kind := range []string{"selection_cancel", "source_disable"} {
+		t.Run(kind, func(t *testing.T) {
+			publicationLifecycleTerminalFence(t, kind, privatefile.PublicationTestReadySync, true)
+		})
 	}
 }
