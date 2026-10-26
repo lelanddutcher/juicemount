@@ -22,6 +22,8 @@ final class MenuBarController: NSObject {
     private var updaterStarted = false
 
     private var searchWindow: NSWindow?
+    private var nativeLibraryWindow: NSWindow?
+    let nativeLibraryModel = NativeLibraryModel()
     private var preferencesWindow: NSWindow?
     private var onboardingWindow: NSWindow?
     private var stateTimer: Timer?
@@ -75,6 +77,7 @@ final class MenuBarController: NSObject {
         let view = MenuPopoverView(
             server: server,
             onSearch: { [weak self] in self?.openSearchWindow() },
+            onNativeLibrary: { [weak self] in self?.openNativeLibraryWindow() },
             onPreferences: { [weak self] in self?.openPreferencesWindow() },
             onSetupAssistant: { [weak self] in self?.openOnboardingWindow() },
             onCheckForUpdates: { [weak self] in self?.checkForUpdates() },
@@ -402,6 +405,27 @@ final class MenuBarController: NSObject {
         NSApp.activate(ignoringOtherApps: true)
     }
 
+    func openNativeLibraryWindow() {
+        if let window = nativeLibraryWindow {
+            window.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            return
+        }
+        let hosting = NSHostingController(rootView: NativeLibraryWindowView(model: nativeLibraryModel))
+        let window = NSWindow(contentViewController: hosting)
+        window.title = "JuiceMount Mac Library"
+        window.styleMask = [.titled, .closable, .miniaturizable, .resizable]
+        window.setContentSize(NSSize(width: 860, height: 680))
+        window.minSize = NSSize(width: 740, height: 600)
+        window.center()
+        window.isReleasedWhenClosed = false
+        window.delegate = self
+        window.identifier = NSUserInterfaceItemIdentifier("NativeLibraryWindow")
+        nativeLibraryWindow = window
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
     /// LB-1 welcome / setup-assistant window. Opened automatically at
     /// launch by AppDelegate when onboarding was never completed or a
     /// critical preflight check fails; reopenable any time from the
@@ -539,6 +563,7 @@ extension MenuBarController: NSWindowDelegate {
     func windowWillClose(_ notification: Notification) {
         guard let window = notification.object as? NSWindow else { return }
         if window === searchWindow { searchWindow = nil }
+        if window === nativeLibraryWindow { nativeLibraryWindow = nil }
         if window === preferencesWindow { preferencesWindow = nil }
         if window === onboardingWindow { onboardingWindow = nil }
     }

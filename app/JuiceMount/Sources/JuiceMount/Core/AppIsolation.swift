@@ -93,11 +93,25 @@ enum AppIsolation {
         for child in ["s.sock", "mount-transactions", "preferences.plist", "data", "logs", "spool",
                       "fuse-internal", "volume", ".juicefs", ".juicefs/cache", ".juicefs/juicefs.log",
                       ".juicemount", ".juicemount/offline-intent", "Library", "Library/Logs",
-                      "Library/Logs/JuiceMount", "Library/Logs/JuiceMount/stall-dumps"] {
+                      "Library/Logs/JuiceMount", "Library/Logs/JuiceMount/stall-dumps",
+                      "NativeLibrary", "NativeLibrary/index.json", "NativeLibrary/index.lock",
+                      "NativeLibrary/journals"] {
             try scope.requireChild(scope.child(child))
         }
         for name in ["preferences.plist", "credential-metadata.json", "credential-link-authkey.json",
-                     "credential-object-key.json", "credential-enrollment.json", "credential-metadata-previous.json"] {
+                     "credential-object-key.json", "credential-enrollment.json", "credential-metadata-previous.json",
+                     ".native-library-ack-v1"] {
+            try scope.checkPrivateFile(scope.child(name))
+        }
+        // Native delivery credentials are isolation-only, one owned direct
+        // leaf per exact profile digest. None may resolve outside this root.
+        for name in try FileManager.default.contentsOfDirectory(atPath: path)
+            where name.hasPrefix("credential-native-library-") {
+            let digest = name.dropFirst("credential-native-library-".count).dropLast(".json".count)
+            guard name.hasSuffix(".json"), digest.count == 64,
+                  digest.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }) else {
+                throw Failure.invalid("an isolated native credential has an invalid name")
+            }
             try scope.checkPrivateFile(scope.child(name))
         }
         return scope

@@ -189,7 +189,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return .terminateCancel
         }
         quitCheckInFlight = true
-        checkSpoolForQuit(metricsAddr: server?.preferences.metricsAddr ?? "127.0.0.1:11050")
+        // The Mac Library model outlives its window. Quit waits for the same
+        // original helper process and all three pipe workers before entering
+        // the existing serving-service/spool shutdown sequence.
+        Task { @MainActor in
+            await menuBarController.nativeLibraryModel.stopForQuit()
+            checkSpoolForQuit(metricsAddr: server?.preferences.metricsAddr ?? "127.0.0.1:11050")
+        }
         return .terminateLater
     }
 
@@ -227,6 +233,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             beginShutdownForQuit(allowPending: true)
         default:
             quitCheckInFlight = false
+            menuBarController.nativeLibraryModel.resumeAfterCanceledQuit()
             NSApp.reply(toApplicationShouldTerminate: false)
         }
     }
@@ -247,6 +254,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             beginShutdownForQuit(allowPending: true)
         default:
             quitCheckInFlight = false
+            menuBarController.nativeLibraryModel.resumeAfterCanceledQuit()
             NSApp.reply(toApplicationShouldTerminate: false)
         }
     }
@@ -279,6 +287,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             beginShutdownForQuit(allowPending: allowPending)
         } else {
             quitCheckInFlight = false
+            menuBarController.nativeLibraryModel.resumeAfterCanceledQuit()
             NSApp.reply(toApplicationShouldTerminate: false)
         }
     }
@@ -342,6 +351,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             runShutdownForQuit(allowPending: allowPending)
         default:
             quitCheckInFlight = false
+            menuBarController.nativeLibraryModel.resumeAfterCanceledQuit()
             NSApp.reply(toApplicationShouldTerminate: false)
         }
     }
@@ -498,6 +508,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         quitCheckInFlight = false
+        menuBarController.nativeLibraryModel.resumeAfterCanceledQuit()
         NSApp.reply(toApplicationShouldTerminate: false)
         if case .failed(let why) = withdraw {
             NFSBridge.appLog("quit: cancelled, but the eject withdraw failed: \(why)")
@@ -541,6 +552,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         switch phase {
         case .cancelled:
             quitCheckInFlight = false
+            menuBarController.nativeLibraryModel.resumeAfterCanceledQuit()
             NSApp.reply(toApplicationShouldTerminate: false)
         case .holdersReleased:
             NFSBridge.appLog("quit: volume holders released their files — ordinary shutdown")
@@ -620,9 +632,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case openSettings:
             SystemSettingsLinks.open(SystemSettingsLinks.filesAndFolders)
             quitCheckInFlight = false
+            menuBarController.nativeLibraryModel.resumeAfterCanceledQuit()
             NSApp.reply(toApplicationShouldTerminate: false)
         default:
             quitCheckInFlight = false
+            menuBarController.nativeLibraryModel.resumeAfterCanceledQuit()
             NSApp.reply(toApplicationShouldTerminate: false)
         }
     }

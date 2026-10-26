@@ -6,6 +6,7 @@ struct MenuPopoverView: View {
 
     @Bindable var server: ServerController
     let onSearch: () -> Void
+    let onNativeLibrary: () -> Void
     let onPreferences: () -> Void
     let onSetupAssistant: () -> Void
     let onCheckForUpdates: () -> Void
@@ -2218,6 +2219,12 @@ struct MenuPopoverView: View {
                 shortcut: "⌘⇧F",
                 disabled: !isRunningLike,
                 action: onSearch
+            )
+
+            ActionButton(
+                title: "Mac Library…",
+                systemImage: "square.and.arrow.down.on.square",
+                action: onNativeLibrary
             )
 
             // Open the mount in Finder. Most-common need is "drag a file in"
