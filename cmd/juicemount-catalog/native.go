@@ -73,7 +73,7 @@ func validateNativeFlags(fs *flag.FlagSet, command string) error {
 	switch command {
 	case "native version":
 		allowed = map[string]bool{"timeout": true}
-	case "native profile create", "native search", "native page", "native inspect", "native lookup", "native cancel", "native reconcile":
+	case "native profile create", "native profile open", "native search", "native page", "native inspect", "native lookup", "native cancel", "native reconcile":
 	case "native select":
 		allowed["copy-id"], allowed["basename"] = true, true
 	case "native receive", "native recover", "native copy-status":
@@ -214,6 +214,18 @@ func runNativeCLI(ctx context.Context, opts nativeOptions, input io.Reader) (pen
 			pending = nil
 		}
 	}()
+	if opts.command == "native profile open" {
+		if opts.copyID != "" || opts.basename != "" {
+			return nil, catalog.ErrInvalid
+		}
+		if err := journal.RecoverProfile(); err != nil {
+			return nil, err
+		}
+		return nativeReceipt(struct {
+			Version int  `json:"version"`
+			Opened  bool `json:"opened"`
+		}{1, true})
+	}
 	if opts.command == "native recover" || opts.command == "native copy-status" {
 		if opts.copyID == "" || opts.basename != "" {
 			return nil, catalog.ErrInvalid
