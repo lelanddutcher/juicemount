@@ -316,6 +316,13 @@ func TestCatalogDeliveryNativeHelperExecutable(t *testing.T) {
 		t.Fatal("native helper search/page did not disclose the two stable asset IDs")
 	}
 	selectedAsset := catalogExecutableAsset
+	byID := searchRequest
+	byID.Text = string(selectedAsset)
+	var exact catalog.DiscoverySearchPage
+	catalogExecutableDecode(t, originals.success(invoke("search_exact_asset_id", endpoint, envelope(byID), nil, "native", "search")), &exact)
+	if exact.Version != 2 || exact.Kind != "search" || !exact.Complete || exact.Next != nil || exact.MatchedCount != 1 || len(exact.Items) != 1 || exact.Items[0].AssetID != selectedAsset || exact.Items[0].Head == nil || *exact.Items[0].Head != revisionA || len(exact.Items[0].Reasons) != 1 || exact.Items[0].Reasons[0] != "stable_id" {
+		t.Fatalf("native helper exact stable ID search did not return selected A: %+v", exact)
+	}
 	catalogExecutableCheckpoint(t, "native-helper-actual-search-page-typed-asset-IDs")
 
 	const copyA = "copy_11111111111111111111111111111111"
