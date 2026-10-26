@@ -309,13 +309,19 @@ func (j *Journal) scan(control *privatefile.NativeControl) (map[string]journalEn
 				if p.Root != control.RootIdentity() || p.Directory != w.Directory || p.Lock != w.Lock || p.TargetDirectory != directory {
 					return nil, usage, ErrJournalCorrupt
 				}
+				// A valid Intent basename never starts with '.', so Finder's
+				// separately validated .DS_Store cannot be the retained media.
+				// Keep the pre-rename empty-target branch exact. The final branch
+				// also covers explicit recovery after rename but before Verified.
+				finalNames := len(names) == 1 && names[0] == entry.intent.Basename ||
+					len(names) == 2 && slices.Contains(names, entry.intent.Basename) && slices.Contains(names, ".DS_Store")
 				switch {
 				case len(names) == 0 && entry.partial && entry.verified == nil:
 					actual, err := control.CopyPartialIdentity(id)
 					if err != nil || actual != p.File {
 						return nil, usage, errors.Join(err, ErrJournalCorrupt)
 					}
-				case len(names) == 1 && names[0] == entry.intent.Basename && !entry.partial:
+				case finalNames && !entry.partial:
 					actual, err := control.TargetFileIdentity(id, entry.intent.Basename)
 					if err != nil || actual != p.File {
 						return nil, usage, errors.Join(err, ErrJournalCorrupt)

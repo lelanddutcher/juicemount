@@ -45,6 +45,10 @@ func (c *NativeControl) TargetIDs() (_ []string, resultErr error) {
 	if err != nil {
 		return nil, err
 	}
+	names, err = withoutFinderMetadata(dir, names, finderCopiesMetadataMaximum)
+	if err != nil {
+		return nil, err
+	}
 	for _, name := range names {
 		if !nativeCopyID(name) {
 			return nil, ErrNativeCopyChanged
@@ -72,6 +76,12 @@ func (c *NativeControl) TargetDirectory(id string) (_ Identity, _ []string, resu
 	}
 	names, err := dir.Readdirnames(-1)
 	if err != nil {
+		return Identity{}, nil, err
+	}
+	// Validate Finder's one metadata leaf, but return it to the caller. A
+	// target is not empty before exposure merely because its only leaf is
+	// Finder metadata; the journal may ignore it only for a verified final.
+	if _, err := withoutFinderMetadata(dir, names, finderTargetMetadataMaximum); err != nil {
 		return Identity{}, nil, err
 	}
 	for _, name := range names {
@@ -157,7 +167,7 @@ func (c *NativeControl) EnsureTargetDirectory(id string) (_ Identity, resultErr 
 // HashTarget is the post-rename verification of the only expected named leaf.
 // It does not return a path or descriptor and cannot establish current rights.
 func (n *NativeCopy) HashTarget(ctx context.Context, name string, expectedDir Identity, maximum int64) (fileID Identity, digest string, resultErr error) {
-	if ctx == nil || n == nil || !nativeTargetName(name) || maximum < 0 || maximum > nativeReceiveMaximum {
+	if ctx == nil || n == nil || !nativeTargetName(name) || name == finderMetadataName || maximum < 0 || maximum > nativeReceiveMaximum {
 		return Identity{}, "", ErrNativeCopyChanged
 	}
 	if err := n.Revalidate(); err != nil {
@@ -178,6 +188,9 @@ func (n *NativeCopy) HashTarget(ctx context.Context, name string, expectedDir Id
 		return Identity{}, "", errors.Join(err, ErrNativeCopyChanged)
 	}
 	names, err := dir.Readdirnames(-1)
+	if err == nil {
+		names, err = withoutFinderMetadata(dir, names, finderTargetMetadataMaximum)
+	}
 	if err != nil || len(names) != 1 || names[0] != name {
 		return Identity{}, "", errors.Join(err, ErrNativeCopyChanged)
 	}
@@ -231,6 +244,9 @@ func (n *NativeCopy) HashTarget(ctx context.Context, name string, expectedDir Id
 	}
 	liveDir, liveErr := privateDir(live)
 	liveNames, namesErr := live.Readdirnames(-1)
+	if namesErr == nil {
+		liveNames, namesErr = withoutFinderMetadata(live, liveNames, finderTargetMetadataMaximum)
+	}
 	var liveFileID Identity
 	if liveErr == nil && namesErr == nil && liveDir == expectedDir && len(liveNames) == 1 && liveNames[0] == name {
 		currentFile, openErr := OpenAt(live, name, os.O_RDONLY, 0)

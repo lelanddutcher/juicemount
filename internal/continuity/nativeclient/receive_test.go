@@ -134,6 +134,112 @@ func TestNativeReceiveDurablePreparedExplicitExposureAndOfflineStatus(t *testing
 	}
 }
 
+// Finder can write .DS_Store while showing the named copy. It is never a
+// retained receipt or a permitted media basename, but cannot strand the
+// original verified bytes on the next credential-free profile open.
+func TestNativeReceiveFinderMetadataProfileOpenAndOfflineStatus(t *testing.T) {
+	if ValidateBasename(".DS_Store") == nil {
+		t.Fatal("Finder metadata could be a valid retained media basename")
+	}
+	body := []byte("verified named bytes survive Finder metadata and offline reopen")
+	pin := newClientTestPin(body, 0)
+	var requests atomic.Int32
+	j, client, root, intent := nativeReceiveTestFixture(t, pin, func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		clientTestTransferHandler(t, pin, "", "")(w, r)
+	})
+	permit, err := j.Receive(context.Background(), client, intent.CopyID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := permit.Close(); err != nil {
+			t.Errorf("original permit close: %v", err)
+		}
+	})
+	status, err := permit.ExposeNoReplace(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := permit.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for _, dir := range []string{filepath.Join(root, "copies"), filepath.Join(root, "copies", intent.CopyID)} {
+		leaf := filepath.Join(dir, ".DS_Store")
+		if err := os.WriteFile(leaf, bytes.Repeat([]byte{0xa5}, 6148), 0644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(leaf, 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := j.Close(); err != nil {
+		t.Fatal(err)
+	}
+	fresh, err := OpenJournal(root, intent.Endpoint, intent.LibraryID, true)
+	if err != nil {
+		t.Fatalf("Finder metadata blocked strict existing profile open: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := fresh.Close(); err != nil {
+			t.Errorf("fresh journal close: %v", err)
+		}
+	})
+	if err := fresh.RecoverProfile(); err != nil {
+		t.Fatalf("Finder metadata blocked credential-free profile recovery: %v", err)
+	}
+	reopened, err := fresh.CopyStatus(context.Background(), intent.CopyID)
+	if err != nil || reopened != status || requests.Load() != 1 {
+		t.Fatalf("offline status after Finder metadata: got=%+v want=%+v requests=%d err=%v", reopened, status, requests.Load(), err)
+	}
+	got, err := os.ReadFile(reopened.Path)
+	if err != nil || !bytes.Equal(got, body) {
+		t.Fatalf("named bytes changed: %v", err)
+	}
+	if err := fresh.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// TargetDirectory returns raw valid basenames. The journal alone must
+	// reject a second named leaf beside the retained Intent basename, even
+	// when both Finder metadata leaves have passed their separate checks.
+	targetUnknown := filepath.Join(root, "copies", intent.CopyID, "unlisted")
+	if err := os.WriteFile(targetUnknown, []byte("foreign"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	suspect, openErr := OpenJournal(root, intent.Endpoint, intent.LibraryID, true)
+	if suspect != nil {
+		recoveryErr := suspect.RecoverProfile()
+		closeErr := suspect.Close()
+		if closeErr != nil {
+			t.Fatalf("unknown target journal original close: %v", closeErr)
+		}
+		if openErr != nil {
+			t.Fatalf("unknown target open returned an owner and error: %v", openErr)
+		}
+		if !errors.Is(recoveryErr, ErrJournalCorrupt) {
+			t.Fatalf("completed copy admitted unrelated target leaf: %v", recoveryErr)
+		}
+	} else if openErr == nil {
+		t.Fatal("unknown target returned neither journal owner nor error")
+	}
+	if err := os.Remove(targetUnknown); err != nil {
+		t.Fatal(err)
+	}
+	// An unrelated object in the exposed parent is still a corruption, not
+	// a second copy or ignorable Finder metadata.
+	if err := os.WriteFile(filepath.Join(root, "copies", "unlisted"), []byte("foreign"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if unexpected, err := OpenJournal(root, intent.Endpoint, intent.LibraryID, true); err == nil || unexpected != nil {
+		if unexpected != nil {
+			if closeErr := unexpected.Close(); closeErr != nil {
+				t.Errorf("unexpected journal close: %v", closeErr)
+			}
+		}
+		t.Fatalf("unknown copy-root object admitted: %v", err)
+	}
+}
+
 func TestNativeReceiveTruncatedTailSamePinRetryAndCancelBeforeRename(t *testing.T) {
 	body := []byte("original selected content for partial retry")
 	first := newClientTestPin(body, 0)

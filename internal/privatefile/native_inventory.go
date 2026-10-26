@@ -460,6 +460,13 @@ func (r *NativeRoot) copiesEntries() error {
 	if err != nil {
 		return err
 	}
+	names, err = withoutFinderMetadata(fresh, names, finderCopiesMetadataMaximum)
+	if err != nil {
+		return err
+	}
+	if len(names) > nativeInventoryEntries {
+		return ErrNativeCopyChanged
+	}
 	for _, name := range names {
 		if !nativeCopyID(name) {
 			return ErrNativeCopyChanged

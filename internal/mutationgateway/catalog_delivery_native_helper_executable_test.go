@@ -418,6 +418,34 @@ func TestCatalogDeliveryNativeHelperExecutable(t *testing.T) {
 	if offline != received {
 		t.Fatal("fresh offline native helper changed verified PNG status")
 	}
+	// Finder writes this bounded, separately validated metadata while showing
+	// a named copy. Reopen the completed profile with a fresh helper and no
+	// credential, then demand the original whole-file status and bytes again.
+	for _, dir := range []string{filepath.Join(clientRoot, "copies"), filepath.Join(clientRoot, "copies", copyA)} {
+		metadata := filepath.Join(dir, ".DS_Store")
+		if err := os.WriteFile(metadata, bytes.Repeat([]byte{0xa5}, 6148), 0644); err != nil {
+			t.Fatal("write test-owned Finder metadata:", err)
+		}
+		if err := os.Chmod(metadata, 0644); err != nil {
+			t.Fatal("set test-owned Finder metadata mode:", err)
+		}
+	}
+	var opened struct {
+		Version int  `json:"version"`
+		Opened  bool `json:"opened"`
+	}
+	catalogExecutableDecode(t, originals.success(invoke("profile_open_after_finder_metadata", endpoint, nil, nil, "native", "profile", "open")), &opened)
+	if opened.Version != 1 || !opened.Opened {
+		t.Fatal("Finder metadata blocked strict existing native profile open")
+	}
+	var afterFinder nativeHelperLocalStatus
+	catalogExecutableDecode(t, originals.success(invoke("copy_status_after_finder_metadata", endpoint, nil, []string{"--copy-id", copyA}, "native", "copy-status")), &afterFinder)
+	if afterFinder != received {
+		t.Fatal("Finder metadata changed the original verified PNG status")
+	}
+	if actual, err := os.ReadFile(expectedPath); err != nil || !bytes.Equal(actual, dataA) {
+		t.Fatal("Finder metadata changed the retained named PNG bytes:", err)
+	}
 	originals.refused(invoke("profile_mismatch_refusal", "http://127.0.0.1:1", nil, []string{"--copy-id", copyA}, "native", "copy-status"))
 	imageExecutableRecord(t, map[string]any{"kind": "native_helper_actual", "event": "offline_status", "copy_id": copyA, "basename": basename, "size": offline.Size, "sha256": offline.SHA256, "previously_downloaded": offline.PreviouslyDownloaded, "helper_originals_started": originals.started, "helper_originals_joined": originals.joined, "standalone_unprefixed": true, "finder_qualified": false})
 	catalogExecutableCheckpoint(t, "native-helper-actual-offline-named-PNG-status")
