@@ -18,6 +18,14 @@ struct JuiceMountApp: App {
         Settings {
             EmptyView()
         }
+        .commands {
+            CommandGroup(after: .appSettings) {
+                Button("Mac Library…") {
+                    appDelegate.menuBarController?.openNativeLibraryWindow()
+                }
+                .keyboardShortcut("l", modifiers: [.command, .shift])
+            }
+        }
     }
 }
 
