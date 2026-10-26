@@ -189,6 +189,9 @@ func runJM5() error {
 	managerAdminKey := flag.String("manager-admin-key", "", "Admin key for the manager's X-JuiceMount-Admin-Key header. Empty disables auth. JM_ADMIN_KEY env var used as fallback if neither this nor --migrator-admin-key is set explicitly.")
 	managerContinuityCatalog := flag.String("manager-continuity-catalog", "", "Existing private continuity catalog (requires enabled Manager and library)")
 	managerContinuityLibrary := flag.String("manager-continuity-library", "", "Expected continuity library identity")
+	managerDeliveryRegistry := flag.String("manager-continuity-delivery-registry", "", "Private delivery reader registry (requires schema 8)")
+	managerDeliveryMode := flag.String("manager-continuity-delivery-mode", "", "Delivery transport: loopback_http or https_edge")
+	managerDeliveryEdgeOrigin := flag.String("manager-continuity-delivery-edge-origin", "", "Exact public HTTPS edge origin")
 	migratorSourceRoots := flag.String("migrator-source-roots", "", "DEPRECATED: alias for --manager-source-roots, kept for one-release compat.")
 	migratorAdminKey := flag.String("migrator-admin-key", "", "DEPRECATED: alias for --manager-admin-key, kept for one-release compat.")
 	flag.Parse()
@@ -221,6 +224,7 @@ func runJM5() error {
 		*managerSourceRoots, *migratorSourceRoots, *managerAdminKey, *migratorAdminKey, os.Getenv("JM_ADMIN_KEY"))
 	discovery, err := prepareEmbeddedContinuity(context.Background(), effectiveSourceRoots, manager.ContinuityConfig{
 		CatalogPath: *managerContinuityCatalog, LibraryID: *managerContinuityLibrary, ManagerAdminKey: effectiveAdminKey,
+		Delivery: manager.ContinuityDeliveryConfig{RegistryPath: *managerDeliveryRegistry, Mode: *managerDeliveryMode, EdgeOrigin: *managerDeliveryEdgeOrigin},
 	})
 	if err != nil {
 		return err
@@ -525,6 +529,9 @@ func runJM5() error {
 	// Start metrics HTTP server (exposes /metrics and /health, plus
 	// the embedded manager UI at /manager/ when source roots are set).
 	metricsSrv := metrics.NewServer(*metricsAddr, metrics.Default())
+	if discovery != nil {
+		metricsSrv.BindListeners = discovery.BindDeliveryListeners
+	}
 
 	// Wire the manager's routes onto the metrics listener — single
 	// process, no separate container. Manager writes through the

@@ -29,10 +29,15 @@ func closeManagerContinuity(closeService func(context.Context) error) error {
 // serveManagerHTTP owns the listener and joins its original Serve worker.
 // Binding here exposes the actual address for --listen=127.0.0.1:0 without a
 // probe/release/rebind race.
-func serveManagerHTTP(server *http.Server, closeService func(context.Context) error, signals <-chan os.Signal) error {
+func serveManagerHTTP(server *http.Server, closeService func(context.Context) error, signals <-chan os.Signal, bind ...func(net.Listener) error) error {
 	listener, err := net.Listen("tcp", server.Addr)
 	if err != nil {
 		return errors.Join(err, closeManagerContinuity(closeService))
+	}
+	if len(bind) != 0 && bind[0] != nil {
+		if err := bind[0](listener); err != nil {
+			return errors.Join(err, listener.Close(), closeManagerContinuity(closeService))
+		}
 	}
 	log.Printf("manager HTTP listening on %s", listener.Addr())
 	done := make(chan error, 1)

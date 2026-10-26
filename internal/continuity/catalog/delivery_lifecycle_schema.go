@@ -109,6 +109,16 @@ func (s *Store) requireLifecycle(ctx context.Context, q queryer) error {
 	return s.checkVersion(ctx, q)
 }
 
+// RequireDeliveryLifecycle is a read-only admission gate for delivery hosts.
+// Opening a catalog never upgrades an older metadata-only profile.
+func (s *Store) RequireDeliveryLifecycle(ctx context.Context) error {
+	if err := s.enter(); err != nil {
+		return err
+	}
+	defer s.leave()
+	return s.requireLifecycle(ctx, s.db)
+}
+
 // CreateDeliveryLifecycle is explicit: older creation targets keep their meaning.
 func CreateDeliveryLifecycle(ctx context.Context, path string, library continuity.LibraryID) (*Store, error) {
 	if library.Validate() != nil {

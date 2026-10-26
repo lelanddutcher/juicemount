@@ -43,6 +43,28 @@ func TestContinuityManagerListenerFailureClosesOwner(t *testing.T) {
 	}
 }
 
+func TestContinuityDeliveryManagerBindFailureClosesActualListener(t *testing.T) {
+	server := &http.Server{Addr: "127.0.0.1:0"}
+	refusal := errors.New("delivery authority refused")
+	var bound string
+	closed := 0
+	err := serveManagerHTTP(server, func(context.Context) error { closed++; return nil }, nil, func(listener net.Listener) error {
+		bound = listener.Addr().String()
+		if _, port, err := net.SplitHostPort(bound); err != nil || port == "0" {
+			t.Fatalf("actual listener not bound: %q %v", bound, err)
+		}
+		return refusal
+	})
+	if !errors.Is(err, refusal) || closed != 1 || bound == "" {
+		t.Fatalf("bind failure lost owner: %v closes=%d bound=%q", err, closed, bound)
+	}
+	listener, err := net.Listen("tcp", bound)
+	if err != nil {
+		t.Fatalf("failed delivery bind retained listener: %v", err)
+	}
+	listener.Close()
+}
+
 func TestContinuityManagerServeSignalJoinsOriginalWorker(t *testing.T) {
 	address := make(chan string, 1)
 	signals := make(chan os.Signal, 1)

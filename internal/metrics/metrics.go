@@ -1165,6 +1165,9 @@ type Server struct {
 	// on the same listener — Pin/Unpin/CacheStatus/Offline endpoints live
 	// here. Set BEFORE calling Start().
 	ExtraRoutes map[string]http.HandlerFunc
+	// BindListeners runs after every actual listener is bound and before any
+	// Serve worker starts. Delivery uses it to freeze transport authority.
+	BindListeners func(...net.Listener) error
 	// mux is set once Start() builds the serve mux; RegisterRoutes adds
 	// handlers to a LIVE listener safely (Go 1.22+ ServeMux is concurrency-safe).
 	mux            *http.ServeMux
@@ -1176,6 +1179,7 @@ type Server struct {
 	serveDone      []<-chan struct{}
 	stopOnce       sync.Once
 	stopErr        error
+	graceful       bool
 }
 
 // NewServer creates a metrics HTTP server bound to addr (e.g. 127.0.0.1:11050).
@@ -1216,6 +1220,32 @@ func (s *Server) Start() error {
 		return fmt.Errorf("metrics listen %s: %w", s.addr, err)
 	}
 	s.listener = l
+	// Bind the companion before either Serve starts. Explicit delivery opts in
+	// to a fail-closed pair; legacy metrics remains IPv4-first/best-effort IPv6.
+	if host, _, perr := net.SplitHostPort(s.addr); perr == nil && isLoopbackHost(host) {
+		ip, _ := netip.ParseAddr(host)
+		if ip.Is4() {
+			boundPort := strconv.Itoa(l.Addr().(*net.TCPAddr).Port)
+			l6, _ := net.Listen("tcp6", net.JoinHostPort("::1", boundPort))
+			// IPv6 remains best effort, including for delivery. Only listeners
+			// successfully owned by this server enter the frozen authority set.
+			s.listener6 = l6
+		}
+	}
+	if s.BindListeners != nil {
+		listeners := []net.Listener{l}
+		if s.listener6 != nil {
+			listeners = append(listeners, s.listener6)
+		}
+		if err := s.BindListeners(listeners...); err != nil {
+			_ = l.Close()
+			if s.listener6 != nil {
+				_ = s.listener6.Close()
+			}
+			s.listener, s.listener6 = nil, nil
+			return err
+		}
+	}
 
 	s.ru.Lock()
 	s.mux = http.NewServeMux()
@@ -1233,33 +1263,8 @@ func (s *Server) Start() error {
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	s.startServe(l)
-
-	// ALSO BIND IPv6 LOOPBACK.
-	//
-	// macOS resolves "localhost" to ::1 BEFORE 127.0.0.1. This server bound
-	// IPv4 only, so a client that connects to the first resolved address and
-	// does not fall back gets ECONNREFUSED and concludes the control plane is
-	// down — while curl, which does fall back, reports it perfectly healthy.
-	// Measured 2026-08-04: http://[::1]:11050 refused, http://127.0.0.1:11050
-	// 200, and that is the shape of a consumer reporting "no success" against a
-	// control plane that answers fine from a shell.
-	//
-	// Loopback ONLY, deliberately: this is a second loopback family, NOT a
-	// widening of exposure. The control plane is unauthenticated and must never
-	// be reachable off-box.
-	//
-	// Best-effort: a machine with IPv6 disabled must still start. The IPv4
-	// listener above remains the one whose failure is fatal.
-	// Port comes from the BOUND listener, not from s.addr: with an ephemeral
-	// ":0" the configured port is 0, so deriving from s.addr would put the ::1
-	// listener on a DIFFERENT random port than the IPv4 one — the companion
-	// would exist and still not answer where the client is looking.
-	if host, _, perr := net.SplitHostPort(s.addr); perr == nil && isLoopbackHost(host) {
-		boundPort := strconv.Itoa(l.Addr().(*net.TCPAddr).Port)
-		if l6, e6 := net.Listen("tcp6", net.JoinHostPort("::1", boundPort)); e6 == nil {
-			s.listener6 = l6
-			s.startServe(l6)
-		}
+	if s.listener6 != nil {
+		s.startServe(s.listener6)
 	}
 	return nil
 }

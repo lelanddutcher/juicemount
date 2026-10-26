@@ -44,7 +44,7 @@ func closeEmbeddedContinuity(closeService func(context.Context) error) error {
 }
 
 func stopEmbeddedMetrics(server *metrics.Server) error {
-	// Closing the owned listeners makes each original Serve return; join them
-	// without declaring every legacy HTTP application handler drained.
-	return server.StopAndWait(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	return server.ShutdownAndWait(ctx)
 }

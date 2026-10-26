@@ -152,7 +152,7 @@ func continuityTestHost(t *testing.T, f continuityTestFixture, prefix string) (*
 	if err := os.WriteFile(statePath, []byte(`{"schema_version":2,"jobs":{},"order":[]}`), 0600); err != nil {
 		t.Fatal(err)
 	}
-	c, err := PrepareContinuity(context.Background(), ContinuityConfig{f.path, string(continuityTestLibrary), continuityTestAdmin})
+	c, err := PrepareContinuity(context.Background(), ContinuityConfig{CatalogPath: f.path, LibraryID: string(continuityTestLibrary), ManagerAdminKey: continuityTestAdmin})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -361,10 +361,12 @@ func TestContinuityPrepareFailsClosedAndDoesNotCreate(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "missing.sqlite")
 	for _, cfg := range []ContinuityConfig{
-		{path, "", continuityTestAdmin}, {"", string(continuityTestLibrary), continuityTestAdmin},
-		{path, string(continuityTestLibrary), ""}, {path, string(continuityTestLibrary), strings.Repeat(" ", 40)},
-		{path, string(continuityTestLibrary), "cHaNgEmE" + strings.Repeat("x", 32)},
-		{path, string(continuityTestLibrary), continuityTestAdmin},
+		{CatalogPath: path, ManagerAdminKey: continuityTestAdmin},
+		{LibraryID: string(continuityTestLibrary), ManagerAdminKey: continuityTestAdmin},
+		{CatalogPath: path, LibraryID: string(continuityTestLibrary)},
+		{CatalogPath: path, LibraryID: string(continuityTestLibrary), ManagerAdminKey: strings.Repeat(" ", 40)},
+		{CatalogPath: path, LibraryID: string(continuityTestLibrary), ManagerAdminKey: "cHaNgEmE" + strings.Repeat("x", 32)},
+		{CatalogPath: path, LibraryID: string(continuityTestLibrary), ManagerAdminKey: continuityTestAdmin},
 	} {
 		if c, err := PrepareContinuity(context.Background(), cfg); err == nil || c != nil {
 			t.Fatal("invalid preparation succeeded")
@@ -391,7 +393,7 @@ func TestContinuityPrepareFailsClosedAndDoesNotCreate(t *testing.T) {
 		if err = s.Close(); err != nil {
 			t.Fatal(err)
 		}
-		if c, err := PrepareContinuity(context.Background(), ContinuityConfig{p, string(continuityTestLibrary), continuityTestAdmin}); err == nil || c != nil {
+		if c, err := PrepareContinuity(context.Background(), ContinuityConfig{CatalogPath: p, LibraryID: string(continuityTestLibrary), ManagerAdminKey: continuityTestAdmin}); err == nil || c != nil {
 			t.Fatal("unready authority was adopted")
 		}
 	}
@@ -467,7 +469,7 @@ func (w *continuityFailWriter) Write(p []byte) (int, error) {
 
 func TestContinuityWriteFailureNeverAppendsErrorOrLogsSecrets(t *testing.T) {
 	f := newContinuityTestFixture(t)
-	c, err := PrepareContinuity(context.Background(), ContinuityConfig{f.path, string(continuityTestLibrary), continuityTestAdmin})
+	c, err := PrepareContinuity(context.Background(), ContinuityConfig{CatalogPath: f.path, LibraryID: string(continuityTestLibrary), ManagerAdminKey: continuityTestAdmin})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -634,7 +636,7 @@ func TestContinuityEarlyErrorsAndBusyKeepTransportDeadline(t *testing.T) {
 
 func TestContinuityUnsupportedTransportAbortsBeforeQuery(t *testing.T) {
 	f := newContinuityTestFixture(t)
-	c, err := PrepareContinuity(context.Background(), ContinuityConfig{f.path, string(continuityTestLibrary), continuityTestAdmin})
+	c, err := PrepareContinuity(context.Background(), ContinuityConfig{CatalogPath: f.path, LibraryID: string(continuityTestLibrary), ManagerAdminKey: continuityTestAdmin})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -653,7 +655,7 @@ func TestContinuityUnsupportedTransportAbortsBeforeQuery(t *testing.T) {
 
 func TestContinuityRouteRegistrationRejectsUnsafePrefixesAndReuse(t *testing.T) {
 	f := newContinuityTestFixture(t)
-	c, err := PrepareContinuity(context.Background(), ContinuityConfig{f.path, string(continuityTestLibrary), continuityTestAdmin})
+	c, err := PrepareContinuity(context.Background(), ContinuityConfig{CatalogPath: f.path, LibraryID: string(continuityTestLibrary), ManagerAdminKey: continuityTestAdmin})
 	if err != nil {
 		t.Fatal(err)
 	}

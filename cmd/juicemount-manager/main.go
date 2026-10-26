@@ -31,6 +31,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -62,6 +63,9 @@ func runManager() error {
 	adminKey := flag.String("admin-key", os.Getenv("JM_ADMIN_KEY"), "Admin key for X-JuiceMount-Admin-Key auth (empty = disabled)")
 	continuityCatalog := flag.String("continuity-catalog", "", "Existing private continuity catalog (requires --continuity-library)")
 	continuityLibrary := flag.String("continuity-library", "", "Expected continuity library identity")
+	deliveryRegistry := flag.String("continuity-delivery-registry", "", "Private delivery reader registry (requires schema 8)")
+	deliveryMode := flag.String("continuity-delivery-mode", "", "Delivery transport: loopback_http or https_edge")
+	deliveryEdgeOrigin := flag.String("continuity-delivery-edge-origin", "", "Exact public HTTPS edge origin")
 	stateFile := flag.String("state-file", os.Getenv("JM_STATE_FILE"), "Optional JSON path for job-history persistence (empty = jobs lost on restart). Bind-mount the dir to make history survive container churn.")
 	minioURL := flag.String("minio-url", envOr("JM_MINIO_URL", ""), "SLICE 2: MinIO base URL the Overview dashboard pings via /minio/health/live. Empty disables the MinIO probe (Overview card shows an actionable hint). Use the same URL Mac clients connect to so the dashboard reflects what they see.")
 	farmStatus := flag.String("farm-status", envOr("JM_FARM_STATUS", ""), "Path to the juicefarm rollup (farm-status.json) for the Farm tab. Empty = Farm tab shows an empty state. Mount the juicefarm-state volume read-only to enable.")
@@ -97,6 +101,7 @@ func runManager() error {
 
 	discovery, err := manager.PrepareContinuity(context.Background(), manager.ContinuityConfig{
 		CatalogPath: *continuityCatalog, LibraryID: *continuityLibrary, ManagerAdminKey: *adminKey,
+		Delivery: manager.ContinuityDeliveryConfig{RegistryPath: *deliveryRegistry, Mode: *deliveryMode, EdgeOrigin: *deliveryEdgeOrigin},
 	})
 	if err != nil {
 		return err
@@ -180,7 +185,9 @@ func runManager() error {
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	defer signal.Stop(sig)
-	return serveManagerHTTP(srv, discovery.Close, sig)
+	return serveManagerHTTP(srv, discovery.Close, sig, func(listener net.Listener) error {
+		return discovery.BindDeliveryListeners(listener)
+	})
 }
 
 // validateAdminKey enforces the Manager deployment authentication boundary.
