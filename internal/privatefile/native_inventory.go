@@ -460,8 +460,19 @@ func (r *NativeRoot) copiesEntries() error {
 	if err != nil {
 		return err
 	}
-	if len(names) != 0 {
-		return ErrNativeCopyChanged
+	for _, name := range names {
+		if !nativeCopyID(name) {
+			return ErrNativeCopyChanged
+		}
+		child, err := openDirectoryAt(fresh, name)
+		if err != nil {
+			return errors.Join(err, ErrNativeCopyChanged)
+		}
+		_, checkErr := privateDir(child)
+		closeErr := child.Close()
+		if checkErr != nil || closeErr != nil {
+			return errors.Join(checkErr, closeErr, ErrNativeCopyChanged)
+		}
 	}
 	return nil
 }

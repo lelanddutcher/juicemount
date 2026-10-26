@@ -675,11 +675,11 @@ func slicesContain(names []string, want string) bool {
 	}
 	return false
 }
-func (n *NativeCopy) writeRecord(kind string, b []byte) (resultErr error) {
-	if n.control == nil || len(b) < 2 || len(b) > 4096 || b[len(b)-1] != '\n' {
+func (n *NativeCopy) writeRecordUnder(control *NativeControl, kind string, b []byte) (resultErr error) {
+	if control == nil || len(b) < 2 || len(b) > 4096 || b[len(b)-1] != '\n' {
 		return ErrNativeCopyChanged
 	}
-	if err := n.control.check(); err != nil {
+	if err := control.check(); err != nil {
 		return err
 	}
 	if err := n.Revalidate(); err != nil {
@@ -729,9 +729,14 @@ func (n *NativeCopy) writeRecord(kind string, b []byte) (resultErr error) {
 	}
 	return nil
 }
+func (n *NativeCopy) writeRecord(kind string, b []byte) error {
+	return n.writeRecordUnder(n.control, kind, b)
+}
 func (n *NativeCopy) WriteIntent(b []byte) error            { return n.writeRecord("intent", b) }
 func (n *NativeCopy) WriteSelection(b []byte) error         { return n.writeRecord("selection", b) }
 func (n *NativeCopy) WriteInitialCheckpoint(b []byte) error { return n.writeRecord("checkpoint", b) }
+func (n *NativeCopy) WritePrepared(b []byte) error          { return n.writeRecord("prepared", b) }
+func (n *NativeCopy) WriteVerified(b []byte) error          { return n.writeRecord("verified", b) }
 
 // CreateZeroPartial is the only payload mutation in this first slice. A failed
 // write/Sync/close leaves the entry intact for exact inspection on restart.
@@ -809,11 +814,11 @@ func (n *NativeCopy) ReadSelection() ([]byte, error) {
 	return readNativeRecord(n.dir, "selection")
 }
 
-func (n *NativeCopy) syncLeaf(leaf string) (resultErr error) {
-	if n.control == nil {
+func (n *NativeCopy) syncLeafUnder(control *NativeControl, leaf string) (resultErr error) {
+	if control == nil {
 		return ErrNativeCopyChanged
 	}
-	if err := n.control.check(); err != nil {
+	if err := control.check(); err != nil {
 		return err
 	}
 	if err := n.Revalidate(); err != nil {
@@ -839,7 +844,8 @@ func (n *NativeCopy) syncLeaf(leaf string) (resultErr error) {
 	}
 	return nil
 }
-func (n *NativeCopy) SyncIntent() error { return n.syncLeaf("intent.json") }
+func (n *NativeCopy) syncLeaf(leaf string) error { return n.syncLeafUnder(n.control, leaf) }
+func (n *NativeCopy) SyncIntent() error          { return n.syncLeaf("intent.json") }
 
 // SyncNamespace repeats the staging-parent barrier before intent acknowledgment.
 // A prior successful Mkdirat with an uncertain parent Sync is never assumed durable.
@@ -862,3 +868,5 @@ func (n *NativeCopy) SyncNamespace() error {
 func (n *NativeCopy) SyncSelection() error         { return n.syncLeaf("selection.json") }
 func (n *NativeCopy) SyncInitialCheckpoint() error { return n.syncLeaf("checkpoint.json") }
 func (n *NativeCopy) SyncPartial() error           { return n.syncLeaf("payload.partial") }
+func (n *NativeCopy) SyncPrepared() error          { return n.syncLeaf("prepared.json") }
+func (n *NativeCopy) SyncVerified() error          { return n.syncLeaf("verified.json") }

@@ -23,11 +23,15 @@ var ErrJournalUnverifiedTail = errors.New("native partial tail requires server p
 // control lock, then compares every acknowledged custody object against it.
 // Pending phases remain charged while exact original requests finish them.
 type Journal struct {
-	root              *privatefile.NativeRoot
-	endpoint          string
-	library           continuity.LibraryID
-	allowLoopbackHTTP bool
-	controlCloseErr   error // test-only post-close fault; original control is always closed
+	root               *privatefile.NativeRoot
+	rootPath           string
+	endpoint           string
+	library            continuity.LibraryID
+	allowLoopbackHTTP  bool
+	controlCloseErr    error // test-only post-close fault; original control is always closed
+	preparedBarrierErr error // test-only exact receipt-barrier fault; no callback authority
+	targetBarrierErr   error // test-only exact target-barrier fault
+	verifiedBarrierErr error // test-only exact receipt-barrier fault
 }
 
 type NativeUsage struct {
@@ -50,15 +54,18 @@ func reserveSelection(usage NativeUsage, size int64) error {
 }
 
 type journalEntry struct {
-	inventory  privatefile.NativeInventoryEntry
-	intent     Intent
-	intentSHA  string
-	selection  *SelectionRecord
-	checkpoint *Checkpoint
-	prepared   *Prepared
-	verified   *Verified
-	released   *Released
-	partial    bool
+	inventory       privatefile.NativeInventoryEntry
+	intent          Intent
+	intentSHA       string
+	selection       *SelectionRecord
+	checkpoint      *Checkpoint
+	prepared        *Prepared
+	verified        *Verified
+	released        *Released
+	partial         bool
+	targetPending   bool
+	targetDirectory privatefile.Identity
+	final           bool
 }
 
 func OpenJournal(rootPath, endpoint string, library continuity.LibraryID, allowLoopbackHTTP bool) (*Journal, error) {
@@ -69,7 +76,7 @@ func OpenJournal(rootPath, endpoint string, library continuity.LibraryID, allowL
 	if err != nil {
 		return nil, err
 	}
-	return &Journal{root: root, endpoint: endpoint, library: library, allowLoopbackHTTP: allowLoopbackHTTP}, nil
+	return &Journal{root: root, rootPath: rootPath, endpoint: endpoint, library: library, allowLoopbackHTTP: allowLoopbackHTTP}, nil
 }
 func CreateJournal(rootPath, endpoint string, library continuity.LibraryID, allowLoopbackHTTP bool) (*Journal, error) {
 	if _, err := ParseEndpoint(endpoint, allowLoopbackHTTP); err != nil || library.Validate() != nil {
@@ -79,7 +86,7 @@ func CreateJournal(rootPath, endpoint string, library continuity.LibraryID, allo
 	if err != nil {
 		return nil, err
 	}
-	return &Journal{root: root, endpoint: endpoint, library: library, allowLoopbackHTTP: allowLoopbackHTTP}, nil
+	return &Journal{root: root, rootPath: rootPath, endpoint: endpoint, library: library, allowLoopbackHTTP: allowLoopbackHTTP}, nil
 }
 func (j *Journal) Close() error {
 	if j == nil {
@@ -124,6 +131,14 @@ func (j *Journal) scan(control *privatefile.NativeControl) (map[string]journalEn
 	if len(witnesses) > NativeIntentLimit {
 		return nil, usage, ErrJournalCorrupt
 	}
+	targetIDs, err := control.TargetIDs()
+	if err != nil {
+		return nil, usage, errors.Join(ErrJournalCorrupt, err)
+	}
+	ownedTargets := make(map[string]bool, len(targetIDs))
+	for _, id := range targetIDs {
+		ownedTargets[id] = true
+	}
 	entries := make(map[string]journalEntry, len(witnesses))
 	ownedDirs := make(map[string]bool, len(ids))
 	for _, id := range ids {
@@ -136,7 +151,7 @@ func (j *Journal) scan(control *privatefile.NativeControl) (map[string]journalEn
 		usage.MetadataBytes += w.MetadataBytes
 		usage.LogicalBytes += w.LogicalBytes
 		if !ownedDirs[id] {
-			if w.Phase != privatefile.NativeIntentPending {
+			if w.Phase != privatefile.NativeIntentPending || ownedTargets[id] {
 				return nil, usage, ErrJournalCorrupt
 			}
 			entries[id] = entry
@@ -249,7 +264,7 @@ func (j *Journal) scan(control *privatefile.NativeControl) (map[string]journalEn
 			if w.Phase == privatefile.NativeZeroPending && entry.checkpoint != nil {
 				return nil, usage, ErrJournalCorrupt
 			}
-			if w.Phase != privatefile.NativeZeroPending && !entry.partial {
+			if w.Phase != privatefile.NativeZeroPending && !entry.partial && entry.prepared == nil {
 				return nil, usage, ErrJournalCorrupt
 			}
 			if entry.checkpoint != nil {
@@ -271,12 +286,57 @@ func (j *Journal) scan(control *privatefile.NativeControl) (map[string]journalEn
 				}
 			}
 		}
-		if entry.prepared != nil || entry.verified != nil || entry.released != nil {
+		if entry.released != nil {
+			return nil, usage, ErrJournalCorrupt
+		}
+		if ownedTargets[id] {
+			delete(ownedTargets, id)
+			if w.Phase != privatefile.NativeReady {
+				return nil, usage, ErrJournalCorrupt
+			}
+			directory, names, err := control.TargetDirectory(id)
+			if err != nil {
+				return nil, usage, errors.Join(err, ErrJournalCorrupt)
+			}
+			entry.targetDirectory = directory
+			if entry.prepared == nil {
+				if len(names) != 0 || entry.verified != nil || !entry.partial {
+					return nil, usage, ErrJournalCorrupt
+				}
+				entry.targetPending = true
+			} else {
+				p := entry.prepared
+				if p.Root != control.RootIdentity() || p.Directory != w.Directory || p.Lock != w.Lock || p.TargetDirectory != directory {
+					return nil, usage, ErrJournalCorrupt
+				}
+				switch {
+				case len(names) == 0 && entry.partial && entry.verified == nil:
+					actual, err := control.CopyPartialIdentity(id)
+					if err != nil || actual != p.File {
+						return nil, usage, errors.Join(err, ErrJournalCorrupt)
+					}
+				case len(names) == 1 && names[0] == entry.intent.Basename && !entry.partial:
+					actual, err := control.TargetFileIdentity(id, entry.intent.Basename)
+					if err != nil || actual != p.File {
+						return nil, usage, errors.Join(err, ErrJournalCorrupt)
+					}
+					if entry.verified != nil && entry.verified.FinalFile != actual {
+						return nil, usage, ErrJournalCorrupt
+					}
+					entry.final = true
+				default:
+					return nil, usage, ErrJournalCorrupt
+				}
+			}
+		} else if entry.prepared != nil || entry.verified != nil {
+			return nil, usage, ErrJournalCorrupt
+		}
+		if entry.verified != nil && !entry.final {
 			return nil, usage, ErrJournalCorrupt
 		}
 		entries[id] = entry
 	}
-	if len(ownedDirs) != 0 || usage.MetadataBytes > NativeMetadataLimit || usage.LogicalBytes > NativeLogicalLimit {
+	if len(ownedDirs) != 0 || len(ownedTargets) != 0 || usage.MetadataBytes > NativeMetadataLimit || usage.LogicalBytes > NativeLogicalLimit {
 		return nil, usage, ErrJournalCorrupt
 	}
 	return entries, usage, nil
@@ -344,7 +404,7 @@ func (j *Journal) CreateIntent(intent Intent) (resultErr error) {
 		return err
 	}
 	for _, entry := range entries {
-		if entry.inventory.Phase != privatefile.NativeReady && entry.inventory.Phase != privatefile.NativeSelectionReady && entry.inventory.Phase != privatefile.NativeIntentReady {
+		if entry.targetPending || entry.inventory.Phase != privatefile.NativeReady && entry.inventory.Phase != privatefile.NativeSelectionReady && entry.inventory.Phase != privatefile.NativeIntentReady {
 			return ErrJournalCorrupt
 		}
 	}
@@ -441,7 +501,7 @@ func (j *Journal) PinSelection(copyID string, selection catalog.DeliverySelectio
 		return ErrJournalConflict
 	}
 	for id, other := range entries {
-		if id != copyID && other.inventory.Phase != privatefile.NativeReady && other.inventory.Phase != privatefile.NativeSelectionReady && other.inventory.Phase != privatefile.NativeIntentReady {
+		if id != copyID && (other.targetPending || other.inventory.Phase != privatefile.NativeReady && other.inventory.Phase != privatefile.NativeSelectionReady && other.inventory.Phase != privatefile.NativeIntentReady) {
 			return ErrJournalCorrupt
 		}
 	}
