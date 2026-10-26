@@ -107,10 +107,11 @@ info() { printf '  %s\n' "$*"; }
 BINARY="$APP_PATH/Contents/MacOS/JuiceMount"
 SERVICE_BINARY="$APP_PATH/Contents/MacOS/juicemount-service"
 MOUNT_PROBE="$APP_PATH/Contents/MacOS/juicemount-mount-probe"
+CATALOG_HELPER="$APP_PATH/Contents/MacOS/juicemount-catalog"
 PLIST="$APP_PATH/Contents/Info.plist"
 APPEX="$APP_PATH/Contents/PlugIns/JuiceMountThumbnails.appex"
 APPEX_PLIST="$APPEX/Contents/Info.plist"
-for executable in "$BINARY" "$SERVICE_BINARY" "$MOUNT_PROBE"; do
+for executable in "$BINARY" "$SERVICE_BINARY" "$MOUNT_PROBE" "$CATALOG_HELPER"; do
     if [[ ! -f "$executable" || ! -x "$executable" ]]; then
         echo "ERROR: required executable missing or not executable: $executable" >&2
         exit 3
@@ -255,6 +256,32 @@ EXPECTED_JUICEFS_VERSION="$(python3 -I -B -c 'import json,sys; print(json.load(o
 signing_identity() {
     codesign -d --verbose=2 "$1" 2>&1 | grep -E '^(Authority|TeamIdentifier)=|^Signature=adhoc$' || true
 }
+if python3 "$PROJECT_ROOT/scripts/verify-service-stamp.py" "$CATALOG_HELPER" "$EXPECTED_VERSION" "$EXPECTED_COMMIT"; then
+    pass "native catalog helper Version/Commit symbols match expected source"
+else
+    fail "native catalog helper Version/Commit symbols do not match expected source"
+    FAILURES=$((FAILURES + 1))
+fi
+if codesign --verify --strict "$CATALOG_HELPER" >/dev/null 2>&1; then
+    CATALOG_SIGNER="$(signing_identity "$CATALOG_HELPER")"
+    if [[ -n "$CATALOG_SIGNER" && "$CATALOG_SIGNER" == "$(signing_identity "$BINARY")" ]]; then
+        pass "native catalog helper is signed with the bundle identity"
+    else
+        fail "native catalog helper signer differs from the bundle"
+        FAILURES=$((FAILURES + 1))
+    fi
+    check_equal "native catalog helper signing identifier" \
+        "$(codesign -d --verbose=2 "$CATALOG_HELPER" 2>&1 | sed -n 's/^Identifier=//p' | head -1)" "juicemount-catalog"
+    if ! grep -q '^Signature=adhoc$' <<< "$CATALOG_SIGNER"; then
+        if ! /bin/bash "$PROJECT_ROOT/scripts/verify-codesign-runtime.sh" "$CATALOG_HELPER"; then
+            fail "native catalog helper is Developer-ID signed without the hardened runtime"
+            FAILURES=$((FAILURES + 1))
+        fi
+    fi
+else
+    fail "native catalog helper signature is invalid"
+    FAILURES=$((FAILURES + 1))
+fi
 if [[ ! -f "$BUNDLED_JUICEFS" || ! -x "$BUNDLED_JUICEFS" ]]; then
     fail "bundled juicefs is missing or not executable: $BUNDLED_JUICEFS"
     FAILURES=$((FAILURES + 1))

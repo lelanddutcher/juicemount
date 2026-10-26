@@ -2,7 +2,7 @@
 """Refuse a packaged JuiceMount without the exact macOS 26.0 minimum.
 
 Inspect every Mach-O slice directly. Sparkle is third-party code and has its
-own deployment policy, so only the six first-party executables are listed.
+own deployment policy, so only the seven first-party executables are listed.
 """
 
 import plistlib
@@ -15,6 +15,7 @@ EXECUTABLES = (
     "Contents/MacOS/JuiceMount",
     "Contents/MacOS/juicemount-service",
     "Contents/MacOS/juicemount-mount-probe",
+    "Contents/MacOS/juicemount-catalog",
     "Contents/MacOS/juicemount-unmountd",
     "Contents/MacOS/juicefs",
     "Contents/PlugIns/JuiceMountThumbnails.appex/Contents/MacOS/JuiceMountThumbnails",

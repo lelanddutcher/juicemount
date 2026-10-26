@@ -13,6 +13,7 @@ import (
 	"github.com/lelanddutcher/juicemount/internal/continuity"
 	"github.com/lelanddutcher/juicemount/internal/continuity/catalog"
 	"github.com/lelanddutcher/juicemount/internal/continuity/nativeclient"
+	"github.com/lelanddutcher/juicemount/internal/version"
 )
 
 type nativeOptions struct {
@@ -70,6 +71,8 @@ func validateNativeFlags(fs *flag.FlagSet, command string) error {
 		"allow-loopback-http": true, "timeout": true,
 	}
 	switch command {
+	case "native version":
+		allowed = map[string]bool{"timeout": true}
 	case "native profile create", "native search", "native page", "native inspect", "native lookup", "native cancel", "native reconcile":
 	case "native select":
 		allowed["copy-id"], allowed["basename"] = true, true
@@ -161,7 +164,20 @@ type nativeReconcileRequest struct {
 // runNativeCLI owns one strict local profile and, for remote commands, one
 // pinned HTTP Client. Results remain undisclosed until both originals close.
 func runNativeCLI(ctx context.Context, opts nativeOptions, input io.Reader) (pending []byte, resultErr error) {
-	if ctx == nil || opts.library.Validate() != nil || !filepath.IsAbs(opts.root) || opts.root == "" {
+	if ctx == nil {
+		return nil, catalog.ErrInvalid
+	}
+	// Keep build identity reachable so the bundled executable carries real
+	// internal/version linker stamps. This command owns stdio as usual, but
+	// never opens a catalog, profile, credential, or network connection.
+	if opts.command == "native version" {
+		return nativeReceipt(struct {
+			Version        int    `json:"version"`
+			ProductVersion string `json:"product_version"`
+			Commit         string `json:"commit"`
+		}{1, version.Version, version.Commit})
+	}
+	if opts.library.Validate() != nil || !filepath.IsAbs(opts.root) || opts.root == "" {
 		return nil, catalog.ErrInvalid
 	}
 	parsed, err := nativeclient.ParseEndpoint(opts.endpoint, opts.allowLoopbackHTTP)

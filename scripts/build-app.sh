@@ -448,6 +448,16 @@ CGO_ENABLED=1 go build "${GO_BUILD_VCS_ARGS[@]}" -trimpath \
     -ldflags "$GO_BUILD_LDFLAGS" \
     -o "$APP_BIN_DIR/juicemount-mount-probe" ./cmd/juicemount-mount-probe
 
+# The Library UI invokes only this bundled, source-stamped native helper.
+# This pure-Go command otherwise uses Go's internal linker even with CGO
+# enabled, bypassing the SDK deployment target and external stamp layout.
+MACOSX_DEPLOYMENT_TARGET=26.0 \
+CGO_CFLAGS="${CGO_CFLAGS:-} -mmacosx-version-min=26.0" \
+CGO_LDFLAGS="${CGO_LDFLAGS:-} -mmacosx-version-min=26.0" \
+CGO_ENABLED=1 go build "${GO_BUILD_VCS_ARGS[@]}" -trimpath \
+    -ldflags "-linkmode=external $GO_BUILD_LDFLAGS" \
+    -o "$APP_BIN_DIR/juicemount-catalog" ./cmd/juicemount-catalog
+
 # Bundled, pinned, patched JuiceFS: the only juicefs the runtime will run.
 # The helper verifies third_party/juicefs against SOURCE.json and its patches
 # (scripts/verify-juicefs-sdk.py), builds it and checks its --version.
@@ -712,6 +722,7 @@ fi
 
 # Sign the standalone observer before sealing its containing app bundle.
 codesign --force "${HARDEN_ARGS[@]}" --sign "$SIGN_IDENTITY" "$APP_BIN_DIR/juicemount-mount-probe"
+codesign --force "${HARDEN_ARGS[@]}" --identifier juicemount-catalog --sign "$SIGN_IDENTITY" "$APP_BIN_DIR/juicemount-catalog"
 # Explicit identifier: the unmount helper's peer requirement pins
 # "juicemount-service" (client.ServiceSigningID). Without it an ad-hoc
 # signature becomes "juicemount-service-<hash>". Developer ID builds already
