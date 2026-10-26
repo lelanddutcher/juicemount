@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -289,6 +290,100 @@ func TestDiscoverySearchNormalizationOrderingAndWindow(t *testing.T) {
 	c = discoveryItemsTest(t, discoveryQueryTest(t, d, bearer, r))
 	if c.Complete || c.MatchedCount != 1000 || len(c.Items) != 100 || c.Next == nil {
 		t.Fatalf("bounded frozen window: %+v", c)
+	}
+}
+
+func TestDiscoverySearchExactStableAssetID(t *testing.T) {
+	s, o, a, d, _, _ := preferencesTestStore(t)
+	policyTest(t, o, a, "stable-reader", NewPolicyChange("create_subject", CreateSubject{readerSubject, SubjectValue{"person", "reader", true}}))
+	discoveryGrantTest(t, o, a, "stable-discover", readerSubject, Scope{"asset", testAsset}, []string{"assets.discover"})
+	bearer := discoveryIssueTest(t, o, a, "stable-reader", readerSubject, Scope{"library", ""}, []string{"assets.discover", "revisions.read"})
+	query := func(text string, contexts ...continuity.AssetID) (discoveryCollection, []byte) {
+		t.Helper()
+		r := discoveryRequestTest("search", "")
+		r.Version = 2
+		r.Text = text
+		r.ContextAssetIDs = contexts
+		b := discoveryQueryTest(t, d, bearer, r)
+		var c discoveryCollection
+		if err := json.Unmarshal(b, &c); err != nil {
+			t.Fatal(err)
+		}
+		if c.Version != 2 || c.Kind != "search" || c.Sort != "discovery2" || !c.Complete || c.Next != nil || c.MatchedCount != len(c.Items) {
+			t.Fatalf("stable search envelope: %s", b)
+		}
+		return c, b
+	}
+	one := func(text string, id continuity.AssetID, label string, head *continuity.RevisionID, reasons ...string) {
+		t.Helper()
+		c, b := query(text)
+		if len(c.Items) != 1 {
+			t.Fatalf("stable search result count: %s", b)
+		}
+		var got discoveryAsset
+		if err := json.Unmarshal(c.Items[0], &got); err != nil {
+			t.Fatal(err)
+		}
+		if got.AssetID != id || got.Label != label || (got.Head == nil) != (head == nil) || got.Head != nil && *got.Head != *head || !reflect.DeepEqual(got.Reasons, reasons) {
+			t.Fatalf("stable search projection: %+v, expected id=%s label=%q head=%v reasons=%v", got, id, label, head, reasons)
+		}
+		discoveryNoFieldsTest(t, b)
+	}
+	one(" \tORIGINAL\n", testAsset, "original", nil, "label_exact")
+	one(string(testAsset), testAsset, "original", nil, "stable_id")
+	for _, id := range []continuity.AssetID{otherAsset, "asset_ffffffffffffffffffffffffffffffff"} {
+		c, b := query(string(id))
+		if len(c.Items) != 0 {
+			t.Fatalf("unauthorized or missing identity disclosed: %s", b)
+		}
+	}
+	discoveryGrantTest(t, o, a, "stable-revision", readerSubject, Scope{"asset", testAsset}, []string{"revisions.read"})
+	head := rootRevision
+	one(string(testAsset), testAsset, "original", &head, "stable_id")
+	const decoy continuity.AssetID = "asset_33333333333333333333333333333333"
+	applyTest(t, s, testOperation("stable-decoy", Change{CreateAsset: &CreateAsset{decoy, string(testAsset)}}, Change{RenameAsset: &RenameAsset{otherAsset, "B", "asset_ffffffffffffffffffffffffffffffff"}}))
+	discoveryGrantTest(t, o, a, "stable-decoy-grant", readerSubject, Scope{"asset", decoy}, []string{"assets.discover"})
+	discoveryGrantTest(t, o, a, "stable-other-grant", readerSubject, Scope{"asset", otherAsset}, []string{"assets.discover"})
+	one(string(testAsset), testAsset, "original", &head, "stable_id")
+	missing, b := query("asset_ffffffffffffffffffffffffffffffff")
+	if len(missing.Items) != 0 {
+		t.Fatalf("ID-shaped label decoy disclosed absent identity: %s", b)
+	}
+	applyTest(t, s, testOperation("stable-rename", Change{RenameAsset: &RenameAsset{testAsset, "original", "renamed unrelated label"}}))
+	one(string(testAsset), testAsset, "renamed unrelated label", &head, "stable_id")
+	grant, err := readGrant(context.Background(), s.db, testLibrary, "stable-discover")
+	if err != nil {
+		t.Fatal(err)
+	}
+	policyTest(t, o, a, "stable-remove", NewPolicyChange("remove_grant", RemoveGrant{grant.ID, grant.Expected()}))
+	hidden, b := query(string(testAsset), decoy)
+	if len(hidden.Items) != 0 {
+		t.Fatalf("removed grant or ID-shaped label disclosed target: %s", b)
+	}
+}
+
+func TestDiscoverySearchExactStableAssetIDLastBudgetSlot(t *testing.T) {
+	s, _, _, _ := authorityTestStore(t)
+	ctx := context.Background()
+	tx, done, err := s.readSnapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := done(); err != nil {
+			t.Error(err)
+		}
+	}()
+	rights := discoveryRights{
+		credential: credential{scope: Scope{"library", ""}, actions: []string{"assets.discover"}},
+		library:    map[string]bool{"assets.discover": true},
+	}
+	reader := discoveryReader{ctx: ctx, q: tx, library: testLibrary, rights: rights, budget: discoveryBudget{assets: 4095}, assets: make(map[continuity.AssetID]*Asset)}
+	request := discoveryRequestTest("search", "")
+	request.Text = string(testAsset)
+	items, complete, err := reader.search(request)
+	if err != nil || !complete || len(items) != 1 || reader.budget.assets != 4096 || !bytes.Contains(items[0], []byte(`"stable_id"`)) {
+		t.Fatalf("exact lookup consumed enumeration budget: complete=%v items=%s budget=%d err=%v", complete, items, reader.budget.assets, err)
 	}
 }
 

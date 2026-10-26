@@ -166,6 +166,45 @@ func (r *discoveryReader) query(request DiscoveryRequest) (items []json.RawMessa
 }
 
 func (r *discoveryReader) search(request DiscoveryRequest) ([]json.RawMessage, bool, error) {
+	// A canonical stable identity names one asset. It must not fall through to
+	// label matching, where an unrelated asset could carry the same text.
+	if id := continuity.AssetID(request.Text); id.Validate() == nil {
+		if !r.rights.allows(id, "assets.discover") {
+			return nil, true, nil
+		}
+		if r.budget.assets >= 4096 {
+			return nil, false, errDiscoveryWork
+		}
+		r.budget.assets++
+		a, err := r.asset(id)
+		if errors.Is(err, ErrNotFound) {
+			return nil, true, nil
+		}
+		if err != nil {
+			return nil, false, err
+		}
+		reasons := make([]string, 0, 3)
+		for _, contextID := range request.ContextAssetIDs {
+			if contextID == id {
+				reasons = append(reasons, "context")
+				break
+			}
+		}
+		if preference, selected := r.preferences[id]; selected {
+			if preference.order > 0 {
+				reasons = append(reasons, "declared_selection")
+			}
+			if r.preferenceFence != nil && (r.preferenceFence.expiry == 0 || preference.expires < r.preferenceFence.expiry) {
+				r.preferenceFence.expiry = preference.expires
+			}
+		}
+		reasons = append(reasons, "stable_id")
+		items := make([]json.RawMessage, 0, 1)
+		if _, err := r.add(&items, r.assetDTO(a, reasons)); err != nil {
+			return nil, false, err
+		}
+		return items, true, nil
+	}
 	type candidate struct {
 		asset   Asset
 		context bool
