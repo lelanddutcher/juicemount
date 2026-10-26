@@ -85,6 +85,9 @@ func runConfigured(parent context.Context, args []string, stdin io.Reader, stdou
 	knownOperationID, knownSelector := "", ""
 	outputCloseFailed := false
 	deliveryCommand, deliveryOutputStarted := false, false
+	nativeCommand, nativeOutputStarted := false, false
+	nativeMutating := false
+	nativeErrorCode, nativeHTTPStatus := "", 0
 	preferenceMaintenance := false
 	collectionMutationAttempted := false
 	savedQueryMutationAttempted, savedQueryMaintenance := false, false
@@ -119,13 +122,28 @@ func runConfigured(parent context.Context, args []string, stdin io.Reader, stdou
 				message += "; partial receipt may have been written"
 			}
 		}
+		if nativeCommand {
+			message = "native delivery command failed"
+			if uncertain {
+				message = "native delivery outcome uncertain; retain original copy and operation IDs for exact retry or offline status"
+			}
+			if nativeOutputStarted {
+				message += "; partial output may have been written"
+			}
+			if nativeErrorCode == "" {
+				nativeErrorCode = "unavailable"
+			}
+		}
 		_ = writeJSON(stderr, struct {
 			Error             string `json:"error"`
 			OperationID       string `json:"operation_id,omitempty"`
 			Selector          string `json:"selector,omitempty"`
 			OutputCloseFailed bool   `json:"output_close_failed,omitempty"`
 			PartialOutput     bool   `json:"partial_output,omitempty"`
-		}{message, knownOperationID, knownSelector, outputCloseFailed, collectionReadAttempted || deliveryOutputStarted})
+			Code              string `json:"code,omitempty"`
+			HTTPStatus        int    `json:"http_status,omitempty"`
+			OutcomeUncertain  bool   `json:"outcome_uncertain,omitempty"`
+		}{message, knownOperationID, knownSelector, outputCloseFailed, collectionReadAttempted || deliveryOutputStarted || nativeOutputStarted, nativeErrorCode, nativeHTTPStatus, nativeCommand && uncertain})
 		return 3
 	}
 	fs := flag.NewFlagSet("juicemount-catalog", flag.ContinueOnError)
@@ -138,6 +156,11 @@ func runConfigured(parent context.Context, args []string, stdin io.Reader, stdou
 	selector := fs.String("selector", "", "credential selector")
 	operationID := fs.String("operation-id", "", "issuance operation ID")
 	deliveryConfig := fs.String("delivery-config", "", "private delivery registry")
+	nativeRoot := fs.String("native-root", "", "private native copy profile")
+	endpoint := fs.String("endpoint", "", "pinned native delivery endpoint")
+	allowLoopbackHTTP := fs.Bool("allow-loopback-http", false, "explicit numeric loopback HTTP development endpoint")
+	copyID := fs.String("copy-id", "", "retained local copy ID")
+	basename := fs.String("basename", "", "approved local copy basename")
 	routeID := fs.String("route-id", "", "configured delivery route")
 	selectionID := fs.String("selection-id", "", "pinned delivery selection")
 	after := fs.String("after", "", "list cursor")
@@ -178,9 +201,12 @@ func runConfigured(parent context.Context, args []string, stdin io.Reader, stdou
 	defer func() {
 		// A query mutation may already be committed. Diagnose its owned stdout
 		// close before the diagnostic descriptor is itself closed by stopOwners.
-		if (deliveryCommand || savedQueryMutationAttempted || collectionReadCommand && readLabel != "collection") && ownedStdout != nil {
+		if (deliveryCommand || nativeCommand || savedQueryMutationAttempted || collectionReadCommand && readLabel != "collection") && ownedStdout != nil {
 			if err := ownedStdout.Close(); err != nil {
 				outputCloseFailed = true
+				if nativeCommand {
+					nativeErrorCode, nativeHTTPStatus = "uncertain", 0
+				}
 				code = fail(true)
 			}
 		}
@@ -190,7 +216,10 @@ func runConfigured(parent context.Context, args []string, stdin io.Reader, stdou
 		}
 		if err != nil || ctx.Err() != nil {
 			code = 3
-			if deliveryCommand || savedQueryMutationAttempted || collectionReadCommand && readLabel != "collection" {
+			if deliveryCommand || nativeCommand || savedQueryMutationAttempted || collectionReadCommand && readLabel != "collection" {
+				if nativeCommand {
+					nativeErrorCode, nativeHTTPStatus = "uncertain", 0
+				}
 				code = fail(true)
 			}
 		}
@@ -203,6 +232,36 @@ func runConfigured(parent context.Context, args []string, stdin io.Reader, stdou
 	}
 	command := strings.Join(fs.Args(), " ")
 	deliveryCommand = strings.HasPrefix(command, "delivery ") || strings.HasPrefix(command, "source ")
+	nativeCommand = command == "native" || strings.HasPrefix(command, "native ")
+	nativeMutating = command == "native profile create" || command == "native select" || command == "native receive" || command == "native recover" || command == "native cancel" || command == "native reconcile"
+	if nativeCommand {
+		if err := validateNativeFlags(fs, command); err != nil {
+			nativeErrorCode = "invalid"
+			return fail(false)
+		}
+		pending, operationErr := runNativeCLI(ctx, nativeOptions{
+			command: command, root: *nativeRoot, endpoint: *endpoint,
+			library: continuity.LibraryID(*libraryText), allowLoopbackHTTP: *allowLoopbackHTTP,
+			copyID: *copyID, basename: *basename, closeJournal: files.closeNativeJournal,
+		}, stdin)
+		var inputErr error
+		if ownedStdin != nil {
+			inputErr = ownedStdin.Close()
+		}
+		if operationErr != nil || inputErr != nil {
+			nativeErrorCode, nativeHTTPStatus = nativeFailureCode(operationErr)
+			if inputErr != nil {
+				nativeErrorCode, nativeHTTPStatus = "uncertain", 0
+			}
+			return fail(nativeMutating || inputErr != nil || nativeErrorCode == "uncertain")
+		}
+		nativeOutputStarted = true
+		if writeBytes(stdout, pending) != nil {
+			nativeErrorCode, nativeHTTPStatus = "uncertain", 0
+			return fail(true)
+		}
+		return 0
+	}
 	collectionReadCommand = command == "collection read" || command == "query read" || command == "recents read"
 	if command == "query read" {
 		readLabel = "saved query"

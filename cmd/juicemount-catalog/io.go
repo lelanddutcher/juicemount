@@ -9,6 +9,7 @@ import (
 
 	"github.com/lelanddutcher/juicemount/internal/continuity"
 	"github.com/lelanddutcher/juicemount/internal/continuity/catalog"
+	"github.com/lelanddutcher/juicemount/internal/continuity/nativeclient"
 )
 
 // run borrows generic I/O: context checks cannot interrupt an arbitrary blocked
@@ -35,8 +36,9 @@ type cliFiles struct {
 	stdio   func([]*os.File) ([]fileResource, func() error, error)
 	// Private per-invocation ownership seams. Nil uses the real constructors and
 	// original Close; tests wrap those originals without global mutable hooks.
-	deliveryService func(context.Context, *catalog.Store, continuity.LibraryID, string) (deliveryCommandService, error)
-	closeCatalog    func(*catalog.Store) error
+	deliveryService    func(context.Context, *catalog.Store, continuity.LibraryID, string) (deliveryCommandService, error)
+	closeCatalog       func(*catalog.Store) error
+	closeNativeJournal func(*nativeclient.Journal) error
 }
 
 func defaultFiles() cliFiles {
