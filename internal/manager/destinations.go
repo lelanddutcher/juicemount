@@ -20,8 +20,10 @@ package manager
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -39,6 +41,7 @@ import (
 	"github.com/lelanddutcher/juicemount/internal/redisurl"
 	"github.com/redis/go-redis/v9"
 	"golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh/knownhosts"
 )
 
 // destinationKinds is the allow-list of recognized profile kinds. Any
@@ -71,7 +74,9 @@ const maxDestinationNameLen = 64
 // Config keys vary by kind:
 //   - file:   {"path": "/external/backups"}
 //   - s3/b2:  {"endpoint", "bucket", "access_key", "secret_key", "region" (optional)}
-//   - sftp:   {"host", "port", "user", "password" OR "private_key", "path" (optional)}
+//   - sftp:   {"host", "port", "user", "password" OR "private_key", "path" (optional),
+//     "host_key" (pinned server key in authorized_keys form; set by the
+//     first successful Test Connection, see sftpHostKeyCallback)}
 //   - webdav: {"endpoint", "user" (optional), "password" (optional)}
 //   - jfs:    {"meta_url", "volume" (optional, defaults to "jfs")}
 //
@@ -457,6 +462,11 @@ func validateConfig(kind string, cfg map[string]string) error {
 		if cfg["password"] == "" && cfg["private_key"] == "" {
 			return errors.New("sftp requires either 'password' or 'private_key' in config")
 		}
+		if hk := cfg["host_key"]; hk != "" {
+			if _, _, _, _, err := ssh.ParseAuthorizedKey([]byte(hk)); err != nil {
+				return fmt.Errorf("sftp host_key is not a valid public key: %w", err)
+			}
+		}
 	}
 	return nil
 }
@@ -610,6 +620,15 @@ func (a *API) handleDestinationUpdate(w http.ResponseWriter, r *http.Request, na
 		http.Error(w, "destination not found", http.StatusNotFound)
 		return
 	}
+	// The edit form never sends host_key, so keep the pinned SFTP key
+	// while the edit still points at the same server. Dropping it would
+	// silently re-trust whatever answers on the next test.
+	if d.Kind == "sftp" && d.Config["host_key"] == "" {
+		if old, err := a.dests.getPlaintext(name); err == nil && old.Kind == "sftp" &&
+			sftpAddr(old.Config) == sftpAddr(d.Config) && old.Config["host_key"] != "" {
+			d.Config["host_key"] = old.Config["host_key"]
+		}
+	}
 	if err := a.dests.upsert(d, true); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -648,6 +667,10 @@ func (a *API) handleDestinationTest(w http.ResponseWriter, r *http.Request, name
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
+	if d.Kind == "sftp" {
+		a.handleDestinationTestSFTP(ctx, w, d)
+		return
+	}
 	if err := testConnection(ctx, d); err != nil {
 		// 502 = upstream failure (the remote endpoint we proxied to is
 		// the upstream). Includes the diagnostic message so the
@@ -693,7 +716,8 @@ func testConnection(ctx context.Context, d Destination) error {
 	case "s3", "b2":
 		return testConnectionS3(ctx, d.Config)
 	case "sftp":
-		return testConnectionSFTP(ctx, d.Config)
+		_, err := testConnectionSFTP(ctx, d.Config)
+		return err
 	case "webdav":
 		return testConnectionWebDAV(ctx, d.Config)
 	case "jfs":
@@ -789,15 +813,77 @@ func testConnectionS3(ctx context.Context, cfg map[string]string) error {
 	}
 }
 
-func testConnectionSFTP(ctx context.Context, cfg map[string]string) error {
-	host := strings.TrimSpace(cfg["host"])
-	user := strings.TrimSpace(cfg["user"])
-	if host == "" || user == "" {
-		return errors.New("host and user are required")
+// handleDestinationTestSFTP runs the SFTP probe and, on the first
+// successful test of an unpinned destination, stores the server's key
+// so every later connection (tests and sync jobs) must present it.
+func (a *API) handleDestinationTestSFTP(ctx context.Context, w http.ResponseWriter, d Destination) {
+	defer func() {
+		for k := range d.Config {
+			d.Config[k] = ""
+		}
+	}()
+	newKey, err := testConnectionSFTP(ctx, d.Config)
+	if err != nil {
+		http.Error(w, "connection test failed: "+err.Error(), http.StatusBadGateway)
+		return
 	}
+	resp := map[string]any{"ok": true}
+	if newKey != "" {
+		d.Config["host_key"] = newKey
+		if err := a.dests.upsert(d, true); err != nil {
+			http.Error(w, "connection test passed but pinning the host key failed: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		resp["host_key_pinned"] = true
+	}
+	if pub, _, _, _, err := ssh.ParseAuthorizedKey([]byte(d.Config["host_key"])); err == nil {
+		resp["host_key_fingerprint"] = ssh.FingerprintSHA256(pub)
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// sftpAddr is the host:port a destination connects to.
+func sftpAddr(cfg map[string]string) string {
 	port := strings.TrimSpace(cfg["port"])
 	if port == "" {
 		port = "22"
+	}
+	return net.JoinHostPort(strings.TrimSpace(cfg["host"]), port)
+}
+
+// sftpHostKeyCallback checks the server key against the pinned key.
+// With no pin it trusts the presented key (trust on first use) and
+// records it in *seen for the caller to store. With a pin, any other
+// key fails the handshake before authentication, so no password or
+// key signature is sent to an impostor.
+func sftpHostKeyCallback(pinned string, seen *string) (ssh.HostKeyCallback, error) {
+	if pinned == "" {
+		return func(_ string, _ net.Addr, key ssh.PublicKey) error {
+			*seen = strings.TrimSpace(string(ssh.MarshalAuthorizedKey(key)))
+			return nil
+		}, nil
+	}
+	want, _, _, _, err := ssh.ParseAuthorizedKey([]byte(pinned))
+	if err != nil {
+		return nil, fmt.Errorf("pinned host_key is invalid: %w", err)
+	}
+	return func(_ string, _ net.Addr, key ssh.PublicKey) error {
+		if key.Type() != want.Type() || string(key.Marshal()) != string(want.Marshal()) {
+			return fmt.Errorf("host key mismatch: server presented %s, destination is pinned to %s; if the server was rebuilt, re-save the destination with its new host",
+				ssh.FingerprintSHA256(key), ssh.FingerprintSHA256(want))
+		}
+		return nil
+	}, nil
+}
+
+// testConnectionSFTP dials, verifies the host key and authenticates.
+// It returns the server key in authorized_keys form when the
+// destination had no pin yet, so the caller can store it.
+func testConnectionSFTP(ctx context.Context, cfg map[string]string) (string, error) {
+	host := strings.TrimSpace(cfg["host"])
+	user := strings.TrimSpace(cfg["user"])
+	if host == "" || user == "" {
+		return "", errors.New("host and user are required")
 	}
 	authMethods := []ssh.AuthMethod{}
 	if pw := cfg["password"]; pw != "" {
@@ -810,41 +896,40 @@ func testConnectionSFTP(ctx context.Context, cfg map[string]string) error {
 		// explicit so the operator knows what's missing.
 		signer, err := ssh.ParsePrivateKey([]byte(key))
 		if err != nil {
-			return fmt.Errorf("parse private_key: %w", err)
+			return "", fmt.Errorf("parse private_key: %w", err)
 		}
 		authMethods = append(authMethods, ssh.PublicKeys(signer))
 	}
 	if len(authMethods) == 0 {
-		return errors.New("no auth method (set password or private_key)")
+		return "", errors.New("no auth method (set password or private_key)")
 	}
-	// SSH host-key verification: we accept any host key here because
-	// the operator is wiring up a brand-new destination and there's
-	// no UX yet to surface the host-key fingerprint for explicit
-	// confirmation. Documented as a follow-up; the connection-test
-	// surface is narrow (no data transfer), so a MITM here only
-	// confirms a wrong key works against an attacker, not data
-	// disclosure.
+	var seen string
+	hostKeyCallback, err := sftpHostKeyCallback(cfg["host_key"], &seen)
+	if err != nil {
+		return "", err
+	}
 	cfg2 := &ssh.ClientConfig{
 		User:            user,
 		Auth:            authMethods,
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		HostKeyCallback: hostKeyCallback,
 		Timeout:         4 * time.Second,
 	}
 	// Use Dial with a context-aware net.Dialer so ctx cancellation
 	// (handler-timeout) cuts the connect attempt cleanly.
+	addr := sftpAddr(cfg)
 	dialer := &net.Dialer{Timeout: 4 * time.Second}
-	conn, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(host, port))
+	conn, err := dialer.DialContext(ctx, "tcp", addr)
 	if err != nil {
-		return fmt.Errorf("tcp dial: %w", err)
+		return "", fmt.Errorf("tcp dial: %w", err)
 	}
 	defer conn.Close()
-	sshConn, chans, reqs, err := ssh.NewClientConn(conn, net.JoinHostPort(host, port), cfg2)
+	sshConn, chans, reqs, err := ssh.NewClientConn(conn, addr, cfg2)
 	if err != nil {
-		return fmt.Errorf("ssh handshake: %w", err)
+		return "", fmt.Errorf("ssh handshake: %w", err)
 	}
 	client := ssh.NewClient(sshConn, chans, reqs)
 	_ = client.Close()
-	return nil
+	return seen, nil
 }
 
 func testConnectionWebDAV(ctx context.Context, cfg map[string]string) error {
@@ -993,6 +1078,13 @@ func (d Destination) ToSyncURI(preserveStructure bool) (string, []string, error)
 			return "", nil, errors.New("sftp: user and host required")
 		}
 		uri = fmt.Sprintf("sftp://%s@%s:%s%s", user, host, port, path)
+		// juicefs sync accepts any host key unless SSH_KNOWN_HOSTS
+		// names a file, so hand it the pinned key.
+		knownHosts, err := sftpKnownHostsFile(d.Config)
+		if err != nil {
+			return "", nil, err
+		}
+		env = append(env, "SSH_KNOWN_HOSTS="+knownHosts)
 		if pw := d.Config["password"]; pw != "" {
 			env = append(env, "SFTP_PASSWORD="+pw)
 		}
@@ -1029,4 +1121,29 @@ func (d Destination) ToSyncURI(preserveStructure bool) (string, []string, error)
 	}
 	uri = matchSlash(uri, preserveStructure)
 	return uri, env, nil
+}
+
+// sftpKnownHostsFile writes the destination's pinned host key as a
+// known_hosts file for juicefs sync and returns its path. The name is
+// derived from the contents, so repeated jobs reuse one file.
+func sftpKnownHostsFile(cfg map[string]string) (string, error) {
+	hk := strings.TrimSpace(cfg["host_key"])
+	if hk == "" {
+		return "", errors.New("sftp: host key not pinned; run Test Connection on this destination once to pin it")
+	}
+	pub, _, _, _, err := ssh.ParseAuthorizedKey([]byte(hk))
+	if err != nil {
+		return "", fmt.Errorf("sftp: pinned host_key is invalid: %w", err)
+	}
+	line := knownhosts.Line([]string{knownhosts.Normalize(sftpAddr(cfg))}, pub) + "\n"
+	sum := sha256.Sum256([]byte(line))
+	dir := filepath.Join(os.TempDir(), "juicemount-known-hosts")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", fmt.Errorf("sftp: known_hosts dir: %w", err)
+	}
+	path := filepath.Join(dir, hex.EncodeToString(sum[:8])+".known_hosts")
+	if err := os.WriteFile(path, []byte(line), 0o600); err != nil {
+		return "", fmt.Errorf("sftp: write known_hosts: %w", err)
+	}
+	return path, nil
 }
