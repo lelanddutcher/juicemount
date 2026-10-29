@@ -4,7 +4,7 @@
 ARG BASE_IMAGE=jm-manager:rc-0.5
 ARG JM_VERSION
 ARG JM_COMMIT
-FROM golang:1.26.9-alpine AS gobuild
+FROM golang:1.26.10-alpine AS gobuild
 ARG JM_VERSION
 ARG JM_COMMIT
 

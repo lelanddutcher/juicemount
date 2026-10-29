@@ -16,7 +16,7 @@ jobs:
     runs-on: ubuntu-latest
     services:
       redis:
-        image: redis:7.4-alpine
+        image: redis:7.4-alpine@sha256:ff02b58f971e7d7d156a1267e283fcbbeee91773b6aa36c49dac28ecfe28eadf  # same digest as server/docker-compose.yml; the acceptance tests require Redis 7.4.11
         ports:
           - 6379:6379
         options: >-
@@ -25,7 +25,7 @@ jobs:
           --health-timeout 3s
           --health-retries 10
       respproxy-redis:
-        image: redis:7.4-alpine
+        image: redis:7.4-alpine@sha256:ff02b58f971e7d7d156a1267e283fcbbeee91773b6aa36c49dac28ecfe28eadf  # same digest as server/docker-compose.yml; the acceptance tests require Redis 7.4.11
         ports:
           - 6380:6379
         options: >-
