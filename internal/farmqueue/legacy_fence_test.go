@@ -212,7 +212,7 @@ func TestLegacyTerminalPublicationSurvivesLostReplies(t *testing.T) {
 		t.Fatalf("retried complete: %v", err)
 	}
 	ack := h1InstallCommittedReplyLoss(t, q,
-		h1ReplyLossOnEvalContaining("if token == '' and not redis.call('LPOS', KEYS[1], ARGV[1]) then return 1 end"))
+		h1ReplyLossOnEvalContaining("if not redis.call('LPOS', KEYS[1], ARGV[1]) then return 1 end"))
 	if err := q.AckClaim(ctx, claim); err == nil || errors.Is(err, ErrClaimLost) {
 		t.Fatalf("ack with lost reply = %v; want a transport error", err)
 	}
@@ -233,5 +233,46 @@ func TestLegacyTerminalPublicationSurvivesLostReplies(t *testing.T) {
 	// A different status for the same delivery is not a retry.
 	if err := q.CompleteClaim(ctx, claim, StatusDone, 2, 0, ""); !errors.Is(err, ErrClaimLost) {
 		t.Fatalf("complete after ACK = %v; want ErrClaimLost", err)
+	}
+}
+
+// The Manager's "Clear finished" can delete a done record between the
+// worker's terminal write and its ACK. The ACK must still release the
+// worker's own receipt; refusing it stopped the worker, and the reaper then
+// requeued and re-ran completed work.
+func TestLegacyAckAfterClearFinishedReleasesOwnReceipt(t *testing.T) {
+	q, ctx := openWatchEpochTestQueue(t)
+	a := legacyFenceWorker("legacy-cleared-a")
+	job := legacyFenceJob("/jfs/legacy-fence/cleared.mov")
+	if err := q.Enqueue(ctx, job); err != nil {
+		t.Fatal(err)
+	}
+	claim := legacyFenceStart(t, q, ctx, a)
+	if err := q.CompleteClaim(ctx, claim, StatusDone, 1, 0, ""); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := q.ClearFinished(ctx); err != nil || n != 1 {
+		t.Fatalf("clear finished = %d, %v; want the done record removed", n, err)
+	}
+	if err := q.AckClaim(ctx, claim); err != nil {
+		t.Fatalf("ack after clear finished = %v; want the own receipt released", err)
+	}
+	if n, err := q.rdb.LLen(ctx, ProcessingPrefix+a.ID).Result(); err != nil || n != 0 {
+		t.Fatalf("receipt depth = %d, %v; want 0", n, err)
+	}
+	if _, err := q.rdb.ZScore(ctx, LeaseIndexKey, job.ID).Result(); err == nil {
+		t.Fatal("lease index entry survived the ACK")
+	}
+	if n, err := q.rdb.Exists(ctx, JobHashPrefix+job.ID).Result(); err != nil || n != 0 {
+		t.Fatalf("ACK recreated the cleared record: exists=%d err=%v", n, err)
+	}
+	if err := q.rdb.Del(ctx, WorkerPrefix+a.ID).Err(); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := q.RecoverAbandonedWorkers(ctx); err != nil || n != 0 {
+		t.Fatalf("recovery after the ACK = %d, %v; want nothing to rerun", n, err)
+	}
+	if depth, err := q.QueueDepth(ctx); err != nil || depth != 0 {
+		t.Fatalf("queue depth = %d, %v; completed work was requeued", depth, err)
 	}
 }

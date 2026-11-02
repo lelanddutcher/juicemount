@@ -1295,14 +1295,20 @@ return 1`
 		return nil
 	}
 	// Release only the caller's own delivery. A stale worker must not strip the
-	// token and lease of the worker that now owns the job. A missing token with
-	// no receipt left is an ACK retried after its reply was lost.
+	// token and lease of the worker that now owns the job.
+	//
+	// A missing token is not a foreign owner. With no receipt left it is an ACK
+	// retried after its reply was lost. With the receipt still in this worker's
+	// processing list, the record lost its token after the terminal write (the
+	// Manager's "Clear finished" deleted it): the receipt can only be this
+	// delivery's, because every hand-off (requeue, reaper, hold, ACK) removes
+	// the receipt from this list before anyone else can claim the job.
 	const script = `
 if redis.call('HEXISTS', KEYS[3], 'held_token') == 1 then return 1 end
 local token = redis.call('HGET', KEYS[3], 'delivery_token') or ''
 if token ~= ARGV[4] then
-  if token == '' and not redis.call('LPOS', KEYS[1], ARGV[1]) then return 1 end
-  return 0
+  if token ~= '' then return 0 end
+  if not redis.call('LPOS', KEYS[1], ARGV[1]) then return 1 end
 end
 redis.call('LREM', KEYS[1], 1, ARGV[1])
 redis.call('ZREM', KEYS[2], ARGV[2])
