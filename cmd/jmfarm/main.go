@@ -1745,15 +1745,9 @@ func runQueue(cfg queueConfig) (exitCode int) {
 				leaseGuard.Stop()
 				continue
 			}
-			// CompleteClaim fences legacy and tracked outcomes on this delivery.
-			if err := q.CompleteClaim(context.Background(), claim, farmqueue.StatusCanceled,
-				job.ProcessedOffset+processed, failed, "canceled by operator"); err != nil {
-				fmt.Fprintf(os.Stderr, "jmfarm queue: mark-canceled %s: %v\n", job.ID, err)
-				leaseGuard.Stop()
-				return
-			}
-			if err := q.AckClaim(context.Background(), claim); err != nil {
-				fmt.Fprintf(os.Stderr, "jmfarm queue: ack canceled %s: %v\n", job.ID, err)
+			if err := publishClaimOutcome(context.Background(), q, claim, defaultClaimPublishRetry,
+				farmqueue.StatusCanceled, job.ProcessedOffset+processed, failed, "canceled by operator"); err != nil {
+				fmt.Fprintf(os.Stderr, "jmfarm queue: publish canceled %s: %v; %s\n", job.ID, err, claimPublishStopReason(err))
 				leaseGuard.Stop()
 				return
 			}
@@ -1838,14 +1832,9 @@ func runQueue(cfg queueConfig) (exitCode int) {
 				// while leaving the global safety pause engaged. Requeueing an empty
 				// retry set would re-walk the directory and double-count freshness
 				// skips after the operator restores headroom.
-				if err := q.CompleteClaim(context.Background(), claim, farmqueue.StatusDone,
-					job.ProcessedOffset+processed, failed, ""); err != nil {
-					fmt.Fprintf(os.Stderr, "jmfarm queue: mark storage-complete %s: %v; stopping with durable claim intact\n", job.ID, err)
-					leaseGuard.Stop()
-					return
-				}
-				if err := q.AckClaim(context.Background(), claim); err != nil {
-					fmt.Fprintf(os.Stderr, "jmfarm queue: ack storage-complete %s: %v; stopping with durable claim intact\n", job.ID, err)
+				if err := publishClaimOutcome(context.Background(), q, claim, defaultClaimPublishRetry,
+					farmqueue.StatusDone, job.ProcessedOffset+processed, failed, ""); err != nil {
+					fmt.Fprintf(os.Stderr, "jmfarm queue: publish storage-complete %s: %v; %s\n", job.ID, err, claimPublishStopReason(err))
 					leaseGuard.Stop()
 					return
 				}
@@ -1884,35 +1873,24 @@ func runQueue(cfg queueConfig) (exitCode int) {
 			leaseGuard.Stop()
 			continue
 		}
-		terminalWritten := false
+		// A failed or lost publication must not leave the job behind this live
+		// worker: the reaper skips legacy receipts while the heartbeat is fresh.
+		status, errMsg := farmqueue.StatusDone, ""
 		if runErr != nil {
 			fmt.Fprintf(os.Stderr, "jmfarm queue: job %s failed: %v\n", job.ID, runErr)
-			if err := q.CompleteClaim(context.Background(), claim, farmqueue.StatusFailed,
-				job.ProcessedOffset+processed, failed, runErr.Error()); err != nil {
-				fmt.Fprintf(os.Stderr, "jmfarm queue: mark-failed %s: %v\n", job.ID, err)
-			} else {
-				terminalWritten = true
-			}
-		} else {
-			// CompleteClaim records done with no successes as failed.
-			if err := q.CompleteClaim(context.Background(), claim, farmqueue.StatusDone,
-				job.ProcessedOffset+processed, failed, ""); err != nil {
-				fmt.Fprintf(os.Stderr, "jmfarm queue: mark-done %s: %v\n", job.ID, err)
-			} else {
-				terminalWritten = true
-			}
+			status, errMsg = farmqueue.StatusFailed, runErr.Error()
 		}
-		if terminalWritten {
-			if err := q.AckClaim(context.Background(), claim); err != nil {
-				fmt.Fprintf(os.Stderr, "jmfarm queue: ack %s: %v\n", job.ID, err)
-			} else {
-				state := "done"
-				if runErr != nil {
-					state = "failed"
-				}
-				_ = q.AppendWorkerLog(context.Background(), worker.ID, fmt.Sprintf("job %s %s processed=%d failed=%d", job.ID, state, job.ProcessedOffset+processed, failed))
-			}
+		if err := publishClaimOutcome(context.Background(), q, claim, defaultClaimPublishRetry,
+			status, job.ProcessedOffset+processed, failed, errMsg); err != nil {
+			fmt.Fprintf(os.Stderr, "jmfarm queue: publish %s: %v; %s\n", job.ID, err, claimPublishStopReason(err))
+			leaseGuard.Stop()
+			return
 		}
+		state := "done"
+		if runErr != nil {
+			state = "failed"
+		}
+		_ = q.AppendWorkerLog(context.Background(), worker.ID, fmt.Sprintf("job %s %s processed=%d failed=%d", job.ID, state, job.ProcessedOffset+processed, failed))
 		leaseGuard.Stop()
 	}
 
