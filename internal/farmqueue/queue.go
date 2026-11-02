@@ -13,8 +13,9 @@
 //
 //	producer:  Enqueue(job)                        → route + LPUSH lane + HSET queued
 //	worker:    ClaimForWorker() → run              → durable processing list + lease
-//	           MarkDone/MarkFailed → AckClaim       → terminal status + remove receipt
-//	           MarkDispatched      → AckClaim       → bounded children own the work
+//	           CompleteClaim       → AckClaim       → terminal status + remove receipt
+//	           MarkClaimDispatched → AckClaim       → bounded children own the work
+//	           (both fenced on the claim's delivery token; JobTTL starts here)
 //	worker:    Heartbeat() every loop              → SET worker:<id> EX 30
 //	reader:    ListJobs() / ActiveWorkers()        → ZREVRANGE + HGETALL / SCAN
 package farmqueue
@@ -58,7 +59,9 @@ const (
 	LeaseIndexKey             = "juicefarm:leases" // ZSET: job id scored by lease expiry unix seconds
 
 	// JobTTL keeps finished job records around for a week so the UI can show
-	// recent history; the queue LIST entries are consumed immediately.
+	// recent history; the queue LIST entries are consumed immediately. The
+	// clock starts at the terminal transition: queued and running records never
+	// expire. Older producers set it at enqueue; claims clear that TTL.
 	JobTTL = 7 * 24 * time.Hour
 	// WorkerTTL: a worker counts as alive only while its heartbeat key exists.
 	// The worker must refresh well within this window (we use ~1/3).
@@ -479,7 +482,10 @@ func (c *Client) Enqueue(ctx context.Context, j Job) error {
 			pipe.HSet(ctx, JobHashPrefix+j.ID, "tracked_epoch", j.TrackedEpoch)
 		}
 		if j.TrackedEpoch == "" {
-			pipe.Expire(ctx, JobHashPrefix+j.ID, JobTTL)
+			// Legacy retention starts when the job reaches a terminal state. A
+			// TTL counted from enqueue let a long backlog expire records that were
+			// still queued. Clear any TTL left by an earlier run of the same ID.
+			pipe.Persist(ctx, JobHashPrefix+j.ID)
 		}
 		// Unix-second scores make every burst of jobs tie. Redis is then free to
 		// return tied members lexicographically, so a just-completed job can be

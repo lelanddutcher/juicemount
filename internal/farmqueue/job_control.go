@@ -117,8 +117,8 @@ func (c *Client) RequeueFailed(ctx context.Context, id, requestedBy string) (Job
 		_, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
 			pipe.LPush(ctx, QueueKeyFor(&retry), raw)
 			pipe.HSet(ctx, JobHashPrefix+retry.ID, st.toMap())
+			// The retry is queued: its retention starts at its own terminal write.
 			pipe.HSet(ctx, JobHashPrefix+retry.ID, "payload", raw, "requeued_by", strings.TrimSpace(requestedBy))
-			pipe.Expire(ctx, JobHashPrefix+retry.ID, JobTTL)
 			pipe.ZAdd(ctx, JobIndexKey, redis.Z{Score: float64(time.Now().UnixMicro()), Member: retry.ID})
 			pipe.HSet(ctx, oldKey, "requeued_as", retry.ID)
 			return nil

@@ -233,8 +233,8 @@ func (c *Client) enqueueTargetShardsAtomic(ctx context.Context, planner Claim, c
 						continue
 					}
 					pipe.LPush(ctx, QueueKeyFor(&child), raws[i])
+					// No TTL while queued: retention starts at the terminal write.
 					pipe.HSet(ctx, statusKeys[i], statuses[i].toMap())
-					pipe.Expire(ctx, statusKeys[i], JobTTL)
 					pipe.ZAdd(ctx, JobIndexKey, redis.Z{Score: float64(score + int64(i)), Member: child.ID})
 				}
 				return nil

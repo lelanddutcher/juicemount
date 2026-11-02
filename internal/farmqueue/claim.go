@@ -384,7 +384,30 @@ for i = 8, #KEYS do
             redis.call('LPUSH', processing, raw)
             redis.call('SADD', processingIndex, ARGV[1])
             if job and job.id then
-              redis.call('HSET', 'juicefarm:job:' .. job.id, 'delivery_token', ARGV[7])
+              local statusKey = 'juicefarm:job:' .. job.id
+              -- Legacy status retention starts at a terminal state. Records from
+              -- older producers still carry an enqueue-time TTL; never let one
+              -- expire under a live delivery. A record that already expired (or
+              -- only holds maintenance markers) is rebuilt and re-indexed so the
+              -- delivery stays visible and later receives its terminal TTL.
+              redis.call('PERSIST', statusKey)
+              if redis.call('HEXISTS', statusKey, 'id') == 0 then
+                local function text(v) if type(v) == 'string' then return v end return '' end
+                local kinds = ''
+                if type(job.kinds) == 'table' then
+                  for n, kind in ipairs(job.kinds) do
+                    if n > 1 then kinds = kinds .. ',' end
+                    kinds = kinds .. text(kind)
+                  end
+                end
+                redis.call('HSET', statusKey, 'id', text(job.id), 'path', text(job.path), 'kinds', kinds,
+                  'producer', text(job.producer), 'enqueued_at', text(job.enqueued_at), 'payload', raw)
+                redis.call('HSETNX', statusKey, 'status', 'queued')
+                local now = redis.call('TIME')
+                redis.call('ZADD', 'juicefarm:jobs', 'NX',
+                  string.format('%.0f', tonumber(now[1]) * 1000000 + tonumber(now[2])), job.id)
+              end
+              redis.call('HSET', statusKey, 'delivery_token', ARGV[7])
             end
           end
         end
@@ -1092,6 +1115,8 @@ return 1`
 // caller still holds: its token, its started lease owner and its processing
 // receipt. A worker that was partitioned, reaped and replaced must not publish
 // over the new owner. Retrying the same outcome after a lost reply is allowed.
+// Retention starts here, not at enqueue, so a long backlog cannot expire a
+// record that is still queued or running.
 const legacyTerminalScript = `
 if redis.call('HEXISTS', KEYS[1], 'held_token') == 1 or
    (redis.call('HGET', KEYS[1], 'tracked_epoch') or '') ~= '' or
@@ -1105,6 +1130,7 @@ if ARGV[5] ~= '' then
   redis.call('HSET', KEYS[1], 'finished_at', ARGV[5], 'processed', ARGV[6], 'failed', ARGV[7])
 end
 if ARGV[8] ~= '' then redis.call('HSET', KEYS[1], 'error', ARGV[8]) end
+redis.call('EXPIRE', KEYS[1], ARGV[9])
 return 1`
 
 func (c *Client) completeLegacyClaim(ctx context.Context, claim Claim, status, finishedAt, processed, failed, errMsg string) error {
@@ -1112,7 +1138,8 @@ func (c *Client) completeLegacyClaim(ctx context.Context, claim Claim, status, f
 		return fmt.Errorf("%w: legacy job %s has no delivery to complete", ErrClaimLost, claim.Job.ID)
 	}
 	n, err := c.rdb.Eval(ctx, legacyTerminalScript, []string{JobHashPrefix + claim.Job.ID, claimProcessingKey(claim)},
-		claim.Token, claim.WorkerID, claim.Raw, status, finishedAt, processed, failed, errMsg).Int()
+		claim.Token, claim.WorkerID, claim.Raw, status, finishedAt, processed, failed, errMsg,
+		int64(JobTTL/time.Second)).Int()
 	if err != nil {
 		return err
 	}
