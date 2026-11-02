@@ -74,6 +74,7 @@ func TestRedisClaimRecovery(t *testing.T) {
 	if err := q.rdb.Del(ctx, WorkerPrefix+render.ID).Err(); err != nil {
 		t.Fatal(err)
 	}
+	expireLegacyDelivery(t, ctx, q, claim.Job.ID)
 	if n, err := q.RecoverAbandonedWorkers(ctx); err != nil || n != 1 {
 		t.Fatalf("recover abandoned = %d, %v; want 1, nil", n, err)
 	}
@@ -301,6 +302,7 @@ func TestRedisRecoveryOnlyAcknowledgesTerminalClaim(t *testing.T) {
 	if err := q.rdb.Del(ctx, WorkerPrefix+server.ID).Err(); err != nil {
 		t.Fatal(err)
 	}
+	expireLegacyDelivery(t, ctx, q, job.ID)
 	if n, err := q.RecoverAbandonedWorkers(ctx); err != nil || n != 1 {
 		t.Fatalf("terminal recovery = %d, %v; want one orphaned ACK cleaned", n, err)
 	}
@@ -377,6 +379,7 @@ func TestRedisClaimRecoveryPrefersAnotherRenderWorker(t *testing.T) {
 	if err := q.rdb.Del(ctx, WorkerPrefix+renderA.ID).Err(); err != nil {
 		t.Fatal(err)
 	}
+	expireLegacyDelivery(t, ctx, q, claim.Job.ID)
 	if n, err := q.RecoverAbandonedWorkers(ctx); err != nil || n != 1 {
 		t.Fatalf("recover abandoned = %d, %v; want 1, nil", n, err)
 	}
@@ -472,6 +475,7 @@ func TestRedisPausedFarmRecoversAbandonedClaimWithoutExecutingIt(t *testing.T) {
 	if err := q.rdb.Del(ctx, WorkerPrefix+render.ID).Err(); err != nil {
 		t.Fatal(err)
 	}
+	expireLegacyDelivery(t, ctx, q, claim.Job.ID)
 	control := DefaultFarmControl()
 	control.Paused = true
 	if _, err := q.StoreControl(ctx, control, 0); err != nil {
@@ -935,6 +939,7 @@ func TestRedisAbandonedExplicitCPUFallbackPreservesRoute(t *testing.T) {
 	if err := q.rdb.Del(ctx, WorkerPrefix+serverA.ID).Err(); err != nil {
 		t.Fatal(err)
 	}
+	expireLegacyDelivery(t, ctx, q, claim.Job.ID)
 	if n, err := q.RecoverAbandonedWorkers(ctx); err != nil || n != 1 {
 		t.Fatalf("abandoned CPU recovery = %d, %v; want one", n, err)
 	}
@@ -965,4 +970,14 @@ func containsString(values []string, want string) bool {
 		}
 	}
 	return false
+}
+
+// expireLegacyDelivery models a dead worker whose delivery lease has also run
+// out. A lapsed heartbeat alone no longer releases a legacy claim: the reaper
+// waits for delivery_expires_unix, which start and renew stamp from Redis TIME.
+func expireLegacyDelivery(t *testing.T, ctx context.Context, q *Client, jobID string) {
+	t.Helper()
+	if err := q.rdb.HSet(ctx, JobHashPrefix+jobID, "delivery_expires_unix", time.Now().Add(-time.Minute).Unix()).Err(); err != nil {
+		t.Fatal(err)
+	}
 }

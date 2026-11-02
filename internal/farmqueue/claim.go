@@ -47,6 +47,9 @@ type Claim struct {
 	Token          string
 	Generation     int64
 	LeaseExpiresAt time.Time
+	// reapExpired marks a reaper-built legacy claim: requeue only while Redis
+	// agrees the delivery lease has expired.
+	reapExpired bool
 }
 
 func claimProcessingKey(claim Claim) string {
@@ -1039,12 +1042,13 @@ func (c *Client) CompleteClaim(ctx context.Context, claim Claim, status string, 
 	if claim.Job.TrackedEpoch == "" {
 		switch status {
 		case StatusDone:
-			return c.MarkDone(ctx, claim.Job.ID, processed, failed)
+			errMsg = "" // success keeps the routing note already on the record
 		case StatusCanceled:
-			return c.MarkCanceled(ctx, claim.Job.ID, processed, failed)
-		default:
-			return c.MarkFailedWithCounts(ctx, claim.Job.ID, processed, failed, errMsg)
+			if errMsg == "" {
+				errMsg = "canceled by operator"
+			}
 		}
+		return c.completeLegacyClaim(ctx, claim, status, nowISO(), strconv.Itoa(processed), strconv.Itoa(failed), errMsg)
 	}
 	if claim.Job.ParentID == "" {
 		return fmt.Errorf("tracked planner %s requires coverage publication", claim.Job.ID)
@@ -1082,6 +1086,49 @@ return 1`
 		return fmt.Errorf("%w: tracked child %s cannot complete", ErrClaimLost, claim.Job.ID)
 	}
 	return c.retireTrackedTerminal(ctx, claim.Job.ID)
+}
+
+// legacyTerminalScript commits a legacy outcome only for the delivery the
+// caller still holds: its token, its started lease owner and its processing
+// receipt. A worker that was partitioned, reaped and replaced must not publish
+// over the new owner. Retrying the same outcome after a lost reply is allowed.
+const legacyTerminalScript = `
+if redis.call('HEXISTS', KEYS[1], 'held_token') == 1 or
+   (redis.call('HGET', KEYS[1], 'tracked_epoch') or '') ~= '' or
+   redis.call('HGET', KEYS[1], 'delivery_token') ~= ARGV[1] or
+   redis.call('HGET', KEYS[1], 'lease_owner') ~= ARGV[2] or
+   not redis.call('LPOS', KEYS[2], ARGV[3]) then return 0 end
+local status = redis.call('HGET', KEYS[1], 'status')
+if status ~= 'running' and status ~= ARGV[4] then return 0 end
+redis.call('HSET', KEYS[1], 'status', ARGV[4])
+if ARGV[5] ~= '' then
+  redis.call('HSET', KEYS[1], 'finished_at', ARGV[5], 'processed', ARGV[6], 'failed', ARGV[7])
+end
+if ARGV[8] ~= '' then redis.call('HSET', KEYS[1], 'error', ARGV[8]) end
+return 1`
+
+func (c *Client) completeLegacyClaim(ctx context.Context, claim Claim, status, finishedAt, processed, failed, errMsg string) error {
+	if claim.Token == "" || claim.WorkerID == "" || claim.Raw == "" {
+		return fmt.Errorf("%w: legacy job %s has no delivery to complete", ErrClaimLost, claim.Job.ID)
+	}
+	n, err := c.rdb.Eval(ctx, legacyTerminalScript, []string{JobHashPrefix + claim.Job.ID, claimProcessingKey(claim)},
+		claim.Token, claim.WorkerID, claim.Raw, status, finishedAt, processed, failed, errMsg).Int()
+	if err != nil {
+		return err
+	}
+	if n != 1 {
+		return fmt.Errorf("%w: legacy job %s is no longer delivered to worker %s", ErrClaimLost, claim.Job.ID, claim.WorkerID)
+	}
+	return nil
+}
+
+// MarkClaimDispatched records a dispatched parent for the delivery the caller
+// holds. Tracked jobs keep MarkDispatched's existing contract.
+func (c *Client) MarkClaimDispatched(ctx context.Context, claim Claim) error {
+	if claim.Job.TrackedEpoch != "" {
+		return c.MarkDispatched(ctx, claim.Job.ID)
+	}
+	return c.completeLegacyClaim(ctx, claim, StatusDispatched, "", "", "", "")
 }
 
 func (c *Client) AckClaim(ctx context.Context, claim Claim) error {
@@ -1220,8 +1267,16 @@ return 1`
 		}
 		return nil
 	}
+	// Release only the caller's own delivery. A stale worker must not strip the
+	// token and lease of the worker that now owns the job. A missing token with
+	// no receipt left is an ACK retried after its reply was lost.
 	const script = `
 if redis.call('HEXISTS', KEYS[3], 'held_token') == 1 then return 1 end
+local token = redis.call('HGET', KEYS[3], 'delivery_token') or ''
+if token ~= ARGV[4] then
+  if token == '' and not redis.call('LPOS', KEYS[1], ARGV[1]) then return 1 end
+  return 0
+end
 redis.call('LREM', KEYS[1], 1, ARGV[1])
 redis.call('ZREM', KEYS[2], ARGV[2])
 redis.call('HDEL', KEYS[3], 'lease_owner', 'lease_expires_at', 'lease_expires_unix',
@@ -1230,9 +1285,16 @@ if redis.call('LLEN', KEYS[1]) == 0 then
   redis.call('SREM', KEYS[4], ARGV[3])
 end
 return 1`
-	return c.rdb.Eval(ctx, script, []string{
+	n, err := c.rdb.Eval(ctx, script, []string{
 		processingKey, LeaseIndexKey, JobHashPrefix + claim.Job.ID, claimProcessingIndex(claim),
-	}, claim.Raw, claim.Job.ID, claim.WorkerID).Err()
+	}, claim.Raw, claim.Job.ID, claim.WorkerID, claim.Token).Int()
+	if err != nil {
+		return err
+	}
+	if n != 1 {
+		return fmt.Errorf("%w: legacy job %s is no longer delivered to worker %s", ErrClaimLost, claim.Job.ID, claim.WorkerID)
+	}
+	return nil
 }
 
 // RequeueClaim atomically acknowledges a claim and publishes its next delivery.
@@ -1351,8 +1413,22 @@ return 1`
 		}
 		return nil
 	}
+	// A legacy requeue is fenced like its terminal write: the delivery token the
+	// caller holds (empty only for records that predate tokens), no committed
+	// outcome to rerun, and for the reaper a delivery lease Redis agrees has
+	// expired, so a renewal racing the scan keeps its owner.
 	const script = `
 if redis.call('HEXISTS', KEYS[4], 'held_token') == 1 then return 0 end
+if (redis.call('HGET', KEYS[4], 'delivery_token') or '') ~= ARGV[13] then return 0 end
+local status = redis.call('HGET', KEYS[4], 'status')
+if status == 'done' or status == 'failed' or status == 'canceled' or status == 'dispatched' then
+  return 0
+end
+if ARGV[14] == '1' then
+  local expires = math.max(tonumber(redis.call('HGET', KEYS[4], 'delivery_expires_unix') or '0') or 0,
+    tonumber(redis.call('HGET', KEYS[4], 'lease_expires_unix') or '0') or 0)
+  if expires > tonumber(redis.call('TIME')[1]) then return 0 end
+end
 if redis.call('LREM', KEYS[1], 1, ARGV[1]) == 0 then
   return 0
 end
@@ -1369,11 +1445,15 @@ if redis.call('LLEN', KEYS[1]) == 0 then
   redis.call('SREM', KEYS[5], ARGV[10])
 end
 return 1`
+	requireExpired := "0"
+	if claim.reapExpired {
+		requireExpired = "1"
+	}
 	n, err := c.rdb.Eval(ctx, script, []string{
 		processingKey, target, LeaseIndexKey, JobHashPrefix + job.ID, claimProcessingIndex(claim),
 	}, claim.Raw, string(raw), job.ID, job.SelectedBackend, job.SelectedWorker, job.QueueClass,
 		strconv.Itoa(job.Attempts), strconv.Itoa(job.HardwareFailures), reason,
-		claim.WorkerID, strconv.Itoa(job.ProcessedOffset), string(raw)).Int()
+		claim.WorkerID, strconv.Itoa(job.ProcessedOffset), string(raw), claim.Token, requireExpired).Int()
 	if err != nil {
 		return err
 	}
@@ -1592,20 +1672,35 @@ func (c *Client) RecoverAbandonedWorkers(ctx context.Context) (int, error) {
 						_ = c.rdb.Del(ctx, lock).Err()
 						return total, expiryErr
 					}
-					nowUnix := time.Now().Unix()
-					if group.tracked {
-						redisNow, timeErr := c.rdb.Time(ctx).Result()
-						if timeErr != nil {
+					if !group.tracked {
+						// Legacy start and renew write delivery_expires_unix. Honour it
+						// (and any lease_expires_unix) so a worker whose heartbeat lapsed
+						// keeps a delivery it is still renewing.
+						delivery, deliveryErr := c.rdb.HGet(ctx, JobHashPrefix+job.ID, "delivery_expires_unix").Int64()
+						if deliveryErr != nil && deliveryErr != redis.Nil {
 							_ = c.rdb.Del(ctx, lock).Err()
-							return total, timeErr
+							return total, deliveryErr
 						}
-						nowUnix = redisNow.Unix()
+						if delivery > expires {
+							expires = delivery
+						}
 					}
-					if expires > nowUnix {
+					// Both lease deadlines are stamped from Redis TIME.
+					redisNow, timeErr := c.rdb.Time(ctx).Result()
+					if timeErr != nil {
+						_ = c.rdb.Del(ctx, lock).Err()
+						return total, timeErr
+					}
+					if expires > redisNow.Unix() {
 						continue
 					}
 				}
 				claim := Claim{Job: job, Raw: raw, WorkerID: workerID}
+				if !group.tracked {
+					// Fence the ACK or requeue below on the delivery observed here.
+					claim.Token = held["delivery_token"]
+					claim.reapExpired = true
+				}
 				if job.TrackedEpoch != "" {
 					claim.Token, err = c.rdb.HGet(ctx, JobHashPrefix+job.ID, "claim_token").Result()
 					if err != nil {
@@ -1629,6 +1724,9 @@ func (c *Client) RecoverAbandonedWorkers(ctx context.Context) (int, error) {
 					// durable execution proof; requeueing this receipt would run or
 					// recount already-completed work. Finish only the orphaned ACK.
 					if err := c.AckClaim(ctx, claim); err != nil {
+						if !group.tracked && errors.Is(err, ErrClaimLost) {
+							continue // the delivery moved on since this scan read it
+						}
 						_ = c.rdb.Del(ctx, lock).Err()
 						return total, err
 					}
@@ -1683,10 +1781,16 @@ func (c *Client) RecoverAbandonedWorkers(ctx context.Context) (int, error) {
 							" disappeared; preserved explicit CPU route"
 					}
 					if err := c.requeueClaimAs(ctx, claim, job, reason); err != nil {
+						if !group.tracked && errors.Is(err, ErrClaimLost) {
+							continue // renewed, completed or re-delivered since the scan
+						}
 						_ = c.rdb.Del(ctx, lock).Err()
 						return total, err
 					}
 				} else if err := c.RequeueClaim(ctx, claim, false, reason); err != nil {
+					if !group.tracked && errors.Is(err, ErrClaimLost) {
+						continue // renewed, completed or re-delivered since the scan
+					}
 					_ = c.rdb.Del(ctx, lock).Err()
 					return total, err
 				}

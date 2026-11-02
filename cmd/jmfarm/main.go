@@ -1745,14 +1745,9 @@ func runQueue(cfg queueConfig) (exitCode int) {
 				leaseGuard.Stop()
 				continue
 			}
-			var finishErr error
-			if job.TrackedEpoch != "" {
-				finishErr = q.CompleteClaim(context.Background(), claim, farmqueue.StatusCanceled,
-					job.ProcessedOffset+processed, failed, "canceled by operator")
-			} else {
-				finishErr = q.MarkCanceled(context.Background(), job.ID, job.ProcessedOffset+processed, failed)
-			}
-			if err := finishErr; err != nil {
+			// CompleteClaim fences legacy and tracked outcomes on this delivery.
+			if err := q.CompleteClaim(context.Background(), claim, farmqueue.StatusCanceled,
+				job.ProcessedOffset+processed, failed, "canceled by operator"); err != nil {
 				fmt.Fprintf(os.Stderr, "jmfarm queue: mark-canceled %s: %v\n", job.ID, err)
 				leaseGuard.Stop()
 				return
@@ -1791,7 +1786,7 @@ func runQueue(cfg queueConfig) (exitCode int) {
 		}
 		if errors.Is(runErr, errJobDispatched) {
 			if job.TrackedEpoch == "" || job.ParentID != "" {
-				if err := q.MarkDispatched(context.Background(), job.ID); err != nil {
+				if err := q.MarkClaimDispatched(context.Background(), claim); err != nil {
 					// Children are idempotently durable, but the parent receipt is our
 					// recovery proof until its truthful state is committed. Stop and let
 					// another worker replay the claim instead of acknowledging ambiguity.
@@ -1843,14 +1838,8 @@ func runQueue(cfg queueConfig) (exitCode int) {
 				// while leaving the global safety pause engaged. Requeueing an empty
 				// retry set would re-walk the directory and double-count freshness
 				// skips after the operator restores headroom.
-				var finishErr error
-				if job.TrackedEpoch != "" {
-					finishErr = q.CompleteClaim(context.Background(), claim, farmqueue.StatusDone,
-						job.ProcessedOffset+processed, failed, "")
-				} else {
-					finishErr = q.MarkDone(context.Background(), job.ID, job.ProcessedOffset+processed, failed)
-				}
-				if err := finishErr; err != nil {
+				if err := q.CompleteClaim(context.Background(), claim, farmqueue.StatusDone,
+					job.ProcessedOffset+processed, failed, ""); err != nil {
 					fmt.Fprintf(os.Stderr, "jmfarm queue: mark storage-complete %s: %v; stopping with durable claim intact\n", job.ID, err)
 					leaseGuard.Stop()
 					return
@@ -1898,31 +1887,16 @@ func runQueue(cfg queueConfig) (exitCode int) {
 		terminalWritten := false
 		if runErr != nil {
 			fmt.Fprintf(os.Stderr, "jmfarm queue: job %s failed: %v\n", job.ID, runErr)
-			var finishErr error
-			if job.TrackedEpoch != "" {
-				finishErr = q.CompleteClaim(context.Background(), claim, farmqueue.StatusFailed,
-					job.ProcessedOffset+processed, failed, runErr.Error())
-			} else {
-				finishErr = q.MarkFailedWithCounts(context.Background(), job.ID, job.ProcessedOffset+processed, failed, runErr.Error())
-			}
-			if err := finishErr; err != nil {
+			if err := q.CompleteClaim(context.Background(), claim, farmqueue.StatusFailed,
+				job.ProcessedOffset+processed, failed, runErr.Error()); err != nil {
 				fmt.Fprintf(os.Stderr, "jmfarm queue: mark-failed %s: %v\n", job.ID, err)
 			} else {
 				terminalWritten = true
 			}
 		} else {
-			var finishErr error
-			if job.TrackedEpoch != "" {
-				status := farmqueue.StatusDone
-				if failed > 0 && job.ProcessedOffset+processed == 0 {
-					status = farmqueue.StatusFailed
-				}
-				finishErr = q.CompleteClaim(context.Background(), claim, status,
-					job.ProcessedOffset+processed, failed, "")
-			} else {
-				finishErr = q.MarkDone(context.Background(), job.ID, job.ProcessedOffset+processed, failed)
-			}
-			if err := finishErr; err != nil {
+			// CompleteClaim records done with no successes as failed.
+			if err := q.CompleteClaim(context.Background(), claim, farmqueue.StatusDone,
+				job.ProcessedOffset+processed, failed, ""); err != nil {
 				fmt.Fprintf(os.Stderr, "jmfarm queue: mark-done %s: %v\n", job.ID, err)
 			} else {
 				terminalWritten = true
