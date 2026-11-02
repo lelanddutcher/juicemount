@@ -1785,18 +1785,13 @@ func runQueue(cfg queueConfig) (exitCode int) {
 			continue
 		}
 		if errors.Is(runErr, errJobDispatched) {
-			if job.TrackedEpoch == "" || job.ParentID != "" {
-				if err := q.MarkClaimDispatched(context.Background(), claim); err != nil {
-					// Children are idempotently durable, but the parent receipt is our
-					// recovery proof until its truthful state is committed. Stop and let
-					// another worker replay the claim instead of acknowledging ambiguity.
-					fmt.Fprintf(os.Stderr, "jmfarm queue: mark-dispatched %s: %v; stopping with durable claim intact\n", job.ID, err)
-					leaseGuard.Stop()
-					return
-				}
-			}
-			if err := q.AckClaim(context.Background(), claim); err != nil {
-				fmt.Fprintf(os.Stderr, "jmfarm queue: ack dispatched parent %s: %v; stopping with durable claim intact\n", job.ID, err)
+			// Children are idempotently durable, but the parent receipt is our
+			// recovery proof until its truthful state is committed. If that cannot
+			// be published, stop and let another worker replay the claim instead
+			// of acknowledging ambiguity.
+			if err := publishClaimDispatched(context.Background(), q, claim, defaultClaimPublishRetry,
+				job.TrackedEpoch == "" || job.ParentID != ""); err != nil {
+				fmt.Fprintf(os.Stderr, "jmfarm queue: publish dispatched %s: %v; %s\n", job.ID, err, claimPublishStopReason(err))
 				leaseGuard.Stop()
 				return
 			}

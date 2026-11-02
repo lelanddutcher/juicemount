@@ -121,3 +121,37 @@ func TestPublishClaimOutcomeDoesNotRetryDeterministicReplies(t *testing.T) {
 		}
 	}
 }
+
+type scriptedDispatchPublisher struct {
+	scriptedPublisher
+	markErrs []error
+	marks    int
+}
+
+func (p *scriptedDispatchPublisher) MarkClaimDispatched(context.Context, farmqueue.Claim) error {
+	p.marks++
+	return popScriptedErr(&p.markErrs)
+}
+
+func TestPublishClaimDispatchedRetriesTransientFailures(t *testing.T) {
+	transient := errors.New("i/o timeout")
+	p := &scriptedDispatchPublisher{markErrs: []error{transient}}
+	p.ackErrs = []error{transient}
+	if err := publishClaimDispatched(context.Background(), p, farmqueue.Claim{}, fastClaimPublishRetry, true); err != nil {
+		t.Fatalf("dispatch through transient faults: %v", err)
+	}
+	if p.marks != 2 || p.acks != 2 {
+		t.Fatalf("mark calls = %d, ack calls = %d; want 2 and 2", p.marks, p.acks)
+	}
+	planner := &scriptedDispatchPublisher{}
+	if err := publishClaimDispatched(context.Background(), planner, farmqueue.Claim{}, fastClaimPublishRetry, false); err != nil ||
+		planner.marks != 0 || planner.acks != 1 {
+		t.Fatalf("tracked planner: err=%v marks=%d acks=%d; want ACK only", err, planner.marks, planner.acks)
+	}
+	lost := fmt.Errorf("%w: gone", farmqueue.ErrClaimLost)
+	stale := &scriptedDispatchPublisher{markErrs: []error{lost}}
+	if err := publishClaimDispatched(context.Background(), stale, farmqueue.Claim{}, fastClaimPublishRetry, true); !errors.Is(err, farmqueue.ErrClaimLost) ||
+		stale.marks != 1 || stale.acks != 0 {
+		t.Fatalf("lost claim: err=%v marks=%d acks=%d; want no retry and no ACK", err, stale.marks, stale.acks)
+	}
+}

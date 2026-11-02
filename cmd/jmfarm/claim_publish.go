@@ -99,6 +99,33 @@ func publishClaimOutcome(ctx context.Context, q claimPublisher, claim farmqueue.
 	return nil
 }
 
+// dispatchPublisher is the queue surface a worker uses to release a parent
+// whose bounded children now own its work.
+type dispatchPublisher interface {
+	MarkClaimDispatched(ctx context.Context, claim farmqueue.Claim) error
+	AckClaim(ctx context.Context, claim farmqueue.Claim) error
+}
+
+// publishClaimDispatched marks the parent dispatched and releases its receipt
+// with the same retry and stop rules as publishClaimOutcome. A tracked planner
+// passes markDispatched=false: its coverage publication is the outcome.
+func publishClaimDispatched(ctx context.Context, q dispatchPublisher, claim farmqueue.Claim, retry claimPublishRetry,
+	markDispatched bool) error {
+	if markDispatched {
+		if err := retryClaimWrite(ctx, retry, func(ctx context.Context) error {
+			return q.MarkClaimDispatched(ctx, claim)
+		}); err != nil {
+			return fmt.Errorf("mark-dispatched: %w", err)
+		}
+	}
+	if err := retryClaimWrite(ctx, retry, func(ctx context.Context) error {
+		return q.AckClaim(ctx, claim)
+	}); err != nil {
+		return fmt.Errorf("ack dispatched: %w", err)
+	}
+	return nil
+}
+
 // claimPublishStopReason names what the worker leaves behind when it stops
 // after a failed publication.
 func claimPublishStopReason(err error) string {
