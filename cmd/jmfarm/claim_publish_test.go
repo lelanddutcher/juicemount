@@ -85,3 +85,39 @@ func TestPublishClaimOutcomeDoesNotRetryLostClaim(t *testing.T) {
 		}
 	}
 }
+
+// redisReply is a server error reply, as go-redis returns one.
+type redisReply string
+
+func (e redisReply) Error() string { return string(e) }
+func (redisReply) RedisError()     {}
+
+// A script error or WRONGTYPE reply is deterministic: the same call fails the
+// same way, so retrying only delays the stop. Redis's own "try again" replies
+// (BUSY, LOADING, failover) are transient and still retried.
+func TestPublishClaimOutcomeDoesNotRetryDeterministicReplies(t *testing.T) {
+	for _, reply := range []redisReply{
+		"ERR user_script:12: tracked acknowledgement has unexplained coverage overcount script: abc",
+		"WRONGTYPE Operation against a key holding the wrong kind of value",
+		"NOPERM User worker has no permissions to run the 'eval' command",
+	} {
+		p := &scriptedPublisher{ackErrs: []error{reply, reply, reply, reply}}
+		err := publishClaimOutcome(context.Background(), p, farmqueue.Claim{}, fastClaimPublishRetry,
+			farmqueue.StatusDone, 1, 0, "")
+		if !errors.Is(err, reply) || p.acks != 1 {
+			t.Fatalf("%q: err=%v after %d ACK calls; want one call and the reply", reply, err, p.acks)
+		}
+	}
+	for _, reply := range []redisReply{
+		"BUSY Redis is busy running a script. You can only call SCRIPT KILL or SHUTDOWN NOSAVE.",
+		"LOADING Redis is loading the dataset in memory",
+		"READONLY You can't write against a read only replica.",
+		"MASTERDOWN Link with MASTER is down and replica-serve-stale-data is set to 'no'.",
+	} {
+		p := &scriptedPublisher{completeErrs: []error{reply}}
+		if err := publishClaimOutcome(context.Background(), p, farmqueue.Claim{}, fastClaimPublishRetry,
+			farmqueue.StatusDone, 1, 0, ""); err != nil || p.completes != 2 {
+			t.Fatalf("%q: err=%v after %d calls; want a retry that succeeds", reply, err, p.completes)
+		}
+	}
+}

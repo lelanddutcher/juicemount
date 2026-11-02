@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/lelanddutcher/juicemount/internal/farmqueue"
+	"github.com/redis/go-redis/v9"
 )
 
 // claimPublisher is the queue surface a worker uses to publish one claim's
@@ -17,8 +18,8 @@ type claimPublisher interface {
 }
 
 // claimPublishRetry bounds how long a worker keeps trying to publish an
-// outcome through a Redis fault. Both writes are idempotent for the claim that
-// made them, so a retry after a lost reply is safe.
+// outcome through a transient Redis fault. Both writes are idempotent for the
+// claim that made them, so a retry after a lost reply is safe.
 type claimPublishRetry struct {
 	attempts   int
 	backoff    time.Duration
@@ -30,14 +31,38 @@ type claimPublishRetry struct {
 // the worker promptly and leaves the job to the reaper.
 var defaultClaimPublishRetry = claimPublishRetry{attempts: 6, backoff: 250 * time.Millisecond, maxBackoff: 4 * time.Second}
 
-// retryClaimWrite runs op until it succeeds, the claim is lost, or the retry
-// budget is spent. ErrClaimLost means another delivery owns the job: retrying
-// cannot succeed and must not be mistaken for a transient fault.
+// transientRedisReplies are server error replies that clear on their own:
+// a long script, a restarting or failing-over server. go-redis retries most
+// of them internally but not BUSY.
+var transientRedisReplies = []string{"BUSY", "LOADING", "READONLY", "MASTERDOWN", "TRYAGAIN", "CLUSTERDOWN"}
+
+// retryableClaimWriteError reports whether retrying the same write could
+// succeed. ErrClaimLost means another delivery owns the job. Any other Redis
+// error reply (a script error, WRONGTYPE, NOPERM) is deterministic: the same
+// call fails the same way. Network and timeout errors are transient.
+func retryableClaimWriteError(err error) bool {
+	if err == nil || errors.Is(err, farmqueue.ErrClaimLost) {
+		return false
+	}
+	var reply redis.Error
+	if !errors.As(err, &reply) {
+		return true
+	}
+	for _, prefix := range transientRedisReplies {
+		if redis.HasErrorPrefix(err, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// retryClaimWrite runs op until it succeeds, fails in a way a retry cannot
+// fix, or the retry budget is spent.
 func retryClaimWrite(ctx context.Context, retry claimPublishRetry, op func(context.Context) error) error {
 	delay := retry.backoff
 	for attempt := 1; ; attempt++ {
 		err := op(ctx)
-		if err == nil || errors.Is(err, farmqueue.ErrClaimLost) || attempt >= retry.attempts {
+		if !retryableClaimWriteError(err) || attempt >= retry.attempts {
 			return err
 		}
 		timer := time.NewTimer(delay)

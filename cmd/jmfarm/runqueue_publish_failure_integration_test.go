@@ -25,8 +25,8 @@ const publishFailureChildEnv = "JM_FARM_PUBLISH_FAILURE_CHILD"
 // TestRunQueueStopsWhenLegacyOutcomeCannotBePublished runs the real worker loop
 // against a Redis user that loses EVAL permission mid-job. Heartbeats (plain
 // SET) keep working, so the worker looks alive while every terminal write
-// fails. The worker must retry, then stop with its receipt intact so the reaper
-// can recover the job. Before the fix it logged the failure and kept polling
+// fails. NOPERM is not transient, so the worker must stop with its receipt
+// intact so the reaper can recover the job. Before the fix it logged the failure and kept polling
 // with a fresh heartbeat, leaving the job running indefinitely.
 func TestRunQueueStopsWhenLegacyOutcomeCannotBePublished(t *testing.T) {
 	if os.Getenv(publishFailureChildEnv) == "1" {
