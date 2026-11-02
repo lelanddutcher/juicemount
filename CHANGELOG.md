@@ -1,5 +1,38 @@
 # JuiceMount Changelog
 
+## Unreleased
+
+### JuiceFarm and Manager
+
+- A farm worker that was partitioned past its claim lease, reaped, and replaced
+  can no longer publish a legacy job's outcome, dispatch, or acknowledgement
+  over the worker that now owns the job. The reaper also waits for the legacy
+  delivery lease instead of releasing a claim as soon as a heartbeat lapses.
+- A worker retries a transient Redis fault while publishing a job's outcome. If
+  the outcome still cannot be published, the worker stops so another worker
+  recovers the job, instead of leaving it shown as running.
+- Legacy job records no longer expire while queued or running. The 7-day
+  retention starts when a job finishes or is dispatched.
+- The job-index cleanup now walks the whole index from a shared cursor, runs
+  from the workers as well as the Manager status page, sweeps at most once per
+  15 seconds across the farm, and skips index entries that are not job records.
+- Known limit: a queued or running legacy record whose job is no longer in any
+  queue or worker receipt now stays in the jobs list until it is removed by
+  hand. Before, it expired 7 days after it was queued.
+
+### Upgrading the farm
+
+Stop all old farm workers before starting new ones, and do not run v0.5.0 and
+new workers against the same Redis at the same time:
+
+- A stale v0.5.0 worker still writes outcomes by job ID alone, so it can
+  overwrite the outcome of a job that a new worker now owns.
+- v0.5.0 reapers ignore the delivery lease and release a legacy claim as soon
+  as its worker's heartbeat lapses, so a live job can be run twice.
+- Rolling the farm back to v0.5.0 leaves records written by the new version
+  without a TTL: v0.5.0 sets retention only when a job is queued. Remove
+  finished records with **Clear finished**.
+
 ## 0.5.0 — general release (build 37)
 
 Update checks remain manual through **Check for Updates…** in the app.
