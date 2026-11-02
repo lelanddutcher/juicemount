@@ -701,35 +701,61 @@ func (c *Client) ListJobs(ctx context.Context, n int) ([]JobStatus, error) {
 // advance one sweep instead of each rescanning the oldest members.
 const jobIndexPruneCursorKey = JobIndexKey + ":prune-cursor"
 
-// pruneJobIndexEntryScript removes an index member whose HASH has expired. A
-// legacy terminal record without a TTL (an older worker finished it after
-// retention moved from enqueue to the terminal write) gets its JobTTL here, so
-// a mixed-version farm cannot keep finished records forever. Held and tracked
-// records keep their own retention rules.
-const pruneJobIndexEntryScript = `
-if redis.call('EXISTS', KEYS[1]) == 0 then return redis.call('ZREM', KEYS[2], ARGV[1]) end
-if redis.call('TTL', KEYS[1]) == -1 and redis.call('HEXISTS', KEYS[1], 'held_token') == 0 and
-   (redis.call('HGET', KEYS[1], 'tracked_epoch') or '') == '' then
-  local st = redis.call('HGET', KEYS[1], 'status')
-  if st == 'done' or st == 'failed' or st == 'canceled' or st == 'dispatched' then
-    redis.call('EXPIRE', KEYS[1], ARGV[2])
+// jobIndexPruneLockKey lets one process sweep per interval. The Manager and
+// every worker call PruneExpiredJobIndex; the others skip until it expires.
+const jobIndexPruneLockKey = JobIndexKey + ":prune-lock"
+
+const (
+	// JobIndexPruneInterval is the shortest gap between two sweeps farm-wide.
+	JobIndexPruneInterval = 15 * time.Second
+	// maxJobIndexPruneBatch bounds one sweep: one ZRANGE and one script call.
+	maxJobIndexPruneBatch = 100
+)
+
+// pruneJobIndexBatchScript inspects one batch of index members. KEYS[1] is the
+// index; KEYS[2..] are the members' status keys and ARGV[2..] their IDs.
+//
+// A member whose key is missing, or is not a hash at all, is dangling: its
+// index entry is removed and a foreign key is left alone. A legacy terminal
+// record without a TTL (an older worker finished it after retention moved from
+// enqueue to the terminal write) gets its JobTTL, so a mixed-version farm
+// cannot keep finished records forever. Held and tracked records keep their
+// own retention rules. Run through EVALSHA: every worker sends it each tick.
+var pruneJobIndexBatchScript = redis.NewScript(`
+local removed = 0
+for i = 2, #KEYS do
+  if redis.call('TYPE', KEYS[i]).ok ~= 'hash' then
+    removed = removed + redis.call('ZREM', KEYS[1], ARGV[i])
+  elseif redis.call('TTL', KEYS[i]) == -1 and redis.call('HEXISTS', KEYS[i], 'held_token') == 0 and
+     (redis.call('HGET', KEYS[i], 'tracked_epoch') or '') == '' then
+    local st = redis.call('HGET', KEYS[i], 'status')
+    if st == 'done' or st == 'failed' or st == 'canceled' or st == 'dispatched' then
+      redis.call('EXPIRE', KEYS[i], ARGV[1])
+    end
   end
 end
-return 0`
+return removed`)
 
 // PruneExpiredJobIndex removes only job-index members whose HASH has expired,
 // without deleting terminal history or touching queued, running, held or
 // dispatched jobs. A missing hash is an index defect, not a job cancellation,
 // and therefore is safe to remove.
 //
-// Each call inspects at most limit members from a shared rank cursor and then
-// advances it past everything still live, wrapping after the newest member.
-// Long-lived records at the old end of the index therefore cannot stall the
-// sweep. The cursor accounts for its own removals; a member skipped because a
-// concurrent writer shifted ranks is inspected on the next pass.
+// At most one caller sweeps per JobIndexPruneInterval; the rest return (0,
+// nil). A sweep inspects at most limit (capped at 100) members from a shared
+// rank cursor in one script call and then advances the cursor past everything
+// still live, wrapping after the newest member. Long-lived records at the old
+// end of the index therefore cannot stall it, and a failed batch is skipped
+// rather than retried forever. The cursor accounts for its own removals; a
+// member skipped because a concurrent writer shifted ranks is inspected on the
+// next pass.
 func (c *Client) PruneExpiredJobIndex(ctx context.Context, limit int) (int, error) {
-	if limit <= 0 {
-		limit = 100
+	if limit <= 0 || limit > maxJobIndexPruneBatch {
+		limit = maxJobIndexPruneBatch
+	}
+	won, err := c.rdb.SetNX(ctx, jobIndexPruneLockKey, NewID(), JobIndexPruneInterval).Result()
+	if err != nil || !won {
+		return 0, err
 	}
 	cursor, err := c.rdb.Get(ctx, jobIndexPruneCursorKey).Result()
 	if err != nil && err != redis.Nil {
@@ -749,33 +775,29 @@ func (c *Client) PruneExpiredJobIndex(ctx context.Context, limit int) (int, erro
 			return 0, err
 		}
 	}
-	removed := 0
+	removed, sweepErr := 0, error(nil)
 	if len(ids) > 0 {
-		pipe := c.rdb.Pipeline()
-		cmds := make([]*redis.Cmd, len(ids))
-		for i, id := range ids {
-			cmds[i] = pipe.Eval(ctx, pruneJobIndexEntryScript, []string{JobHashPrefix + id, JobIndexKey},
-				id, int64(JobTTL/time.Second))
+		keys := make([]string, 0, len(ids)+1)
+		args := make([]any, 0, len(ids)+1)
+		keys = append(keys, JobIndexKey)
+		args = append(args, int64(JobTTL/time.Second))
+		for _, id := range ids {
+			keys = append(keys, JobHashPrefix+id)
+			args = append(args, id)
 		}
-		if _, err := pipe.Exec(ctx); err != nil {
-			return 0, err
-		}
-		for _, cmd := range cmds {
-			n, err := cmd.Int()
-			if err != nil {
-				return removed, err
-			}
-			removed += n
+		removed, sweepErr = pruneJobIndexBatchScript.Run(ctx, c.rdb, keys, args...).Int()
+		if sweepErr != nil {
+			removed = 0 // step past the whole window; the next pass revisits it
 		}
 	}
 	next := start + int64(len(ids)-removed)
 	if len(ids) < limit {
 		next = 0
 	}
-	if err := c.rdb.Set(ctx, jobIndexPruneCursorKey, next, JobTTL).Err(); err != nil {
-		return removed, err
+	if err := c.rdb.Set(ctx, jobIndexPruneCursorKey, next, JobTTL).Err(); err != nil && sweepErr == nil {
+		sweepErr = err
 	}
-	return removed, nil
+	return removed, sweepErr
 }
 
 // Recheck missing hashes atomically with pruning: a HOLD may have recreated

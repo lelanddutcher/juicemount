@@ -1552,7 +1552,8 @@ func runQueue(cfg queueConfig) (exitCode int) {
 				fmt.Printf("jmfarm queue: promoted %d temporary CPU fallback job(s) to verified hardware\n", promoted)
 			}
 			// The Manager also prunes on its status refresh, but only while
-			// someone has the page open. Workers keep the shared sweep moving.
+			// someone has the page open. Workers keep the shared sweep moving;
+			// a lock lets one process sweep per interval.
 			if _, err := q.PruneExpiredJobIndex(ctx, jobIndexPruneBatch); err != nil {
 				fmt.Fprintf(os.Stderr, "jmfarm queue: job-index prune: %v\n", err)
 			}
@@ -2322,9 +2323,9 @@ func targetShardSize(job farmqueue.Job) int {
 
 const renderHardwareRetries = 1
 
-// jobIndexPruneBatch bounds the job-index members one maintenance tick
-// inspects. Each is one O(1) script in a single pipeline.
-const jobIndexPruneBatch = 250
+// jobIndexPruneBatch bounds the job-index members one sweep inspects, in a
+// single cached script call. Only one process farm-wide sweeps per interval.
+const jobIndexPruneBatch = 100
 
 // renderFailureDisposition keeps CPU fallback visible and deliberate. A
 // transient accelerator admission failure first gets one newly routed hardware
