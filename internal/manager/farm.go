@@ -358,9 +358,9 @@ func (a *API) handleFarmJobs(w http.ResponseWriter, r *http.Request) {
 	depth, _ := a.farmQ.QueueDepth(ctx)
 	depths, _ := a.farmQ.QueueDepths(ctx)
 	// Repair old leaked index members opportunistically without deleting
-	// terminal history. The bounded oldest slice makes this safe on every UI
-	// refresh, even when a historical deployment left thousands of expired
-	// hashes behind.
+	// terminal history. Each call inspects a bounded slice from a cursor shared
+	// with the workers' maintenance tick, so it is safe on every UI refresh and
+	// still reaches expired hashes behind long-lived records.
 	_, _ = a.farmQ.PruneExpiredJobIndex(ctx, 100)
 	jobs, _ := a.farmQ.ListJobs(ctx, farmRecentJobsLimit)
 	control, controlErr := a.farmQ.GetControl(ctx)

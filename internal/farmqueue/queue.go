@@ -696,40 +696,86 @@ func (c *Client) ListJobs(ctx context.Context, n int) ([]JobStatus, error) {
 	return out, nil
 }
 
-// PruneExpiredJobIndex removes only job-index members whose HASH has expired.
-// It scans the oldest bounded slice so a manager refresh gradually repairs a
-// large historical leak without deleting terminal history or touching queued,
-// running, or dispatched jobs. A missing hash is an index defect, not a job
-// cancellation, and therefore is safe to remove.
+// jobIndexPruneCursorKey holds the rank PruneExpiredJobIndex resumes from. It
+// is shared, so the Manager refresh and every worker's maintenance tick
+// advance one sweep instead of each rescanning the oldest members.
+const jobIndexPruneCursorKey = JobIndexKey + ":prune-cursor"
+
+// pruneJobIndexEntryScript removes an index member whose HASH has expired. A
+// legacy terminal record without a TTL (an older worker finished it after
+// retention moved from enqueue to the terminal write) gets its JobTTL here, so
+// a mixed-version farm cannot keep finished records forever. Held and tracked
+// records keep their own retention rules.
+const pruneJobIndexEntryScript = `
+if redis.call('EXISTS', KEYS[1]) == 0 then return redis.call('ZREM', KEYS[2], ARGV[1]) end
+if redis.call('TTL', KEYS[1]) == -1 and redis.call('HEXISTS', KEYS[1], 'held_token') == 0 and
+   (redis.call('HGET', KEYS[1], 'tracked_epoch') or '') == '' then
+  local st = redis.call('HGET', KEYS[1], 'status')
+  if st == 'done' or st == 'failed' or st == 'canceled' or st == 'dispatched' then
+    redis.call('EXPIRE', KEYS[1], ARGV[2])
+  end
+end
+return 0`
+
+// PruneExpiredJobIndex removes only job-index members whose HASH has expired,
+// without deleting terminal history or touching queued, running, held or
+// dispatched jobs. A missing hash is an index defect, not a job cancellation,
+// and therefore is safe to remove.
+//
+// Each call inspects at most limit members from a shared rank cursor and then
+// advances it past everything still live, wrapping after the newest member.
+// Long-lived records at the old end of the index therefore cannot stall the
+// sweep. The cursor accounts for its own removals; a member skipped because a
+// concurrent writer shifted ranks is inspected on the next pass.
 func (c *Client) PruneExpiredJobIndex(ctx context.Context, limit int) (int, error) {
 	if limit <= 0 {
 		limit = 100
 	}
-	ids, err := c.rdb.ZRange(ctx, JobIndexKey, 0, int64(limit-1)).Result()
+	cursor, err := c.rdb.Get(ctx, jobIndexPruneCursorKey).Result()
+	if err != nil && err != redis.Nil {
+		return 0, err
+	}
+	start, parseErr := strconv.ParseInt(cursor, 10, 64)
+	if parseErr != nil || start < 0 {
+		start = 0
+	}
+	ids, err := c.rdb.ZRange(ctx, JobIndexKey, start, start+int64(limit)-1).Result()
 	if err != nil {
 		return 0, err
 	}
-	if len(ids) == 0 {
-		return 0, nil
-	}
-	stale := make([]string, 0)
-	pipe := c.rdb.Pipeline()
-	checks := make([]*redis.IntCmd, len(ids))
-	for i, id := range ids {
-		checks[i] = pipe.Exists(ctx, JobHashPrefix+id)
-	}
-	if _, err := pipe.Exec(ctx); err != nil {
-		return 0, err
-	}
-	for i, check := range checks {
-		if check.Err() == nil && check.Val() == 0 {
-			stale = append(stale, ids[i])
+	if len(ids) == 0 && start > 0 {
+		start = 0
+		if ids, err = c.rdb.ZRange(ctx, JobIndexKey, 0, int64(limit)-1).Result(); err != nil {
+			return 0, err
 		}
 	}
-	if len(stale) == 0 {
-		return 0, nil
+	removed := 0
+	if len(ids) > 0 {
+		pipe := c.rdb.Pipeline()
+		cmds := make([]*redis.Cmd, len(ids))
+		for i, id := range ids {
+			cmds[i] = pipe.Eval(ctx, pruneJobIndexEntryScript, []string{JobHashPrefix + id, JobIndexKey},
+				id, int64(JobTTL/time.Second))
+		}
+		if _, err := pipe.Exec(ctx); err != nil {
+			return 0, err
+		}
+		for _, cmd := range cmds {
+			n, err := cmd.Int()
+			if err != nil {
+				return removed, err
+			}
+			removed += n
+		}
 	}
-	return c.pruneMissingJobIDs(ctx, stale)
+	next := start + int64(len(ids)-removed)
+	if len(ids) < limit {
+		next = 0
+	}
+	if err := c.rdb.Set(ctx, jobIndexPruneCursorKey, next, JobTTL).Err(); err != nil {
+		return removed, err
+	}
+	return removed, nil
 }
 
 // Recheck missing hashes atomically with pruning: a HOLD may have recreated
