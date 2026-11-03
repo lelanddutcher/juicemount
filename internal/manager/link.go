@@ -20,6 +20,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -94,11 +95,113 @@ func currentLinkRuntime() (LinkRuntimeStatus, bool) {
 	return fn(), true
 }
 
-// LinkSubnetRoute returns the legacy subnet route the NAS node advertises,
-// or "" for the default service exposure. Only an explicit JM_NET_NAS_ROUTE
-// selects the subnet path: a guessed default LAN is wrong on most networks
-// and fails silently.
+// LinkSubnetRoute returns JM_NET_NAS_ROUTE, the LAN prefix an operator
+// asked the NAS node to advertise.
 func LinkSubnetRoute() string { return strings.TrimSpace(os.Getenv("JM_NET_NAS_ROUTE")) }
+
+// How the embedded NAS node exposes JuiceMount to the tailnet.
+const (
+	// LinkExposureServices serves only the JuiceMount ports on the NAS
+	// node's own tailnet address, and the node carries tag:jm-nas, which is
+	// how a Mac app finds it. Mac apps from before this exposure, and remote
+	// farm nodes, follow subnet routes only and cannot reach it.
+	LinkExposureServices = "services"
+	// LinkExposureSubnet advertises a LAN prefix through the NAS node, the
+	// only path Link had before service exposure. The node is not tagged
+	// tag:jm-nas, so a Mac waits for the route instead of dialing the
+	// node's tailnet address.
+	LinkExposureSubnet = "subnet"
+)
+
+// linkExposureFile records, next to Headscale's config.yaml, the exposure a
+// NAS node first started with when no environment chose one, so the default
+// does not change once the node's own state exists.
+const linkExposureFile = "nas-exposure"
+
+// NASNodeEmbedded reports whether this Manager runs the NAS tailnet node.
+func NASNodeEmbedded() bool {
+	return os.Getenv("JM_NET_HEADSCALE") == "on" && os.Getenv("JM_NET_NAS_NODE") == "on"
+}
+
+// LinkExposure resolves the NAS node's exposure and, for subnet exposure,
+// the prefix it advertises. cfgPath is Headscale's config.yaml; the NAS node
+// state and the recorded default live in its directory. In order:
+//
+//  1. JM_NET_NAS_EXPOSURE (services or subnet);
+//  2. JM_NET_NAS_ROUTE set: subnet;
+//  3. the default recorded by RecordLinkExposureDefault;
+//  4. a NAS node state directory exists (an install from before service
+//     exposure, whose Mac apps follow the subnet route): subnet;
+//  5. services.
+//
+// Steps 3-5 apply only to an embedded NAS node; without one the result is
+// "" unless 1 or 2 chose. Subnet exposure without JM_NET_NAS_ROUTE
+// advertises NasLanSubnet, the default before service exposure.
+func LinkExposure(cfgPath string) (mode, subnet string, err error) {
+	route := LinkSubnetRoute()
+	switch explicit := strings.TrimSpace(os.Getenv("JM_NET_NAS_EXPOSURE")); explicit {
+	case LinkExposureServices:
+		if route != "" {
+			return "", "", fmt.Errorf("JM_NET_NAS_EXPOSURE=services but JM_NET_NAS_ROUTE=%s is set; unset one", route)
+		}
+		return LinkExposureServices, "", nil
+	case LinkExposureSubnet:
+		mode = LinkExposureSubnet
+	case "":
+		switch {
+		case route != "":
+			mode = LinkExposureSubnet
+		case !NASNodeEmbedded():
+			return "", "", nil
+		default:
+			mode = linkExposureDefault(filepath.Dir(cfgPath))
+		}
+	default:
+		return "", "", fmt.Errorf("JM_NET_NAS_EXPOSURE must be %s or %s, not %q", LinkExposureServices, LinkExposureSubnet, explicit)
+	}
+	if mode == LinkExposureServices {
+		return mode, "", nil
+	}
+	if route == "" {
+		route = NasLanSubnet
+	}
+	return LinkExposureSubnet, route, nil
+}
+
+func linkExposureDefault(dir string) string {
+	if raw, err := os.ReadFile(filepath.Join(dir, linkExposureFile)); err == nil {
+		switch mode := strings.TrimSpace(string(raw)); mode {
+		case LinkExposureServices, LinkExposureSubnet:
+			return mode
+		}
+	}
+	if _, err := os.Stat(filepath.Join(dir, "nas-node")); err == nil {
+		return LinkExposureSubnet
+	}
+	return LinkExposureServices
+}
+
+// RecordLinkExposureDefault records the default exposure next to cfgPath,
+// unless one is recorded already, and returns it. The Manager calls it
+// before the NAS node first runs: without the record, the state directory a
+// fresh install's node creates would make its next start look like an
+// upgrade.
+func RecordLinkExposureDefault(cfgPath string) (string, error) {
+	dir := filepath.Dir(cfgPath)
+	mode := linkExposureDefault(dir)
+	path := filepath.Join(dir, linkExposureFile)
+	if _, err := os.Stat(path); err == nil {
+		return mode, nil
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, []byte(mode+"\n"), 0o600); err != nil {
+		return "", err
+	}
+	return mode, os.Rename(tmp, path)
+}
 
 // embeddedHeadscaleHealthAddr is a var only so tests can point it at their own
 // listener.
@@ -158,17 +261,25 @@ func (a *API) handleLinkStatus(w http.ResponseWriter, r *http.Request) {
 		status.ControlReady = false
 		status.Error = "Headscale is " + status.Headscale.State + componentErrorSuffix(status.Headscale)
 	}
-	if route := LinkSubnetRoute(); route != "" {
-		status.Exposure = "subnet"
-		ready, err := linkRouteReady(headscaleBin(), headscaleConfig(), envString("JM_NET_NAS_HOSTNAME", DefaultNasHostname), route)
+	exposure, subnet, exposureErr := LinkExposure(headscaleConfig())
+	status.Exposure = exposure
+	nasHost := envString("JM_NET_NAS_HOSTNAME", DefaultNasHostname)
+	switch {
+	case exposureErr != nil:
+		status.RouteReady = false
+		if status.Error == "" {
+			status.Error = "Link NAS exposure is misconfigured: " + exposureErr.Error()
+		}
+	case exposure == LinkExposureSubnet:
+		ready, err := linkRouteReady(headscaleBin(), headscaleConfig(), nasHost, subnet)
 		status.RouteReady = ready
 		if err != nil && status.Error == "" {
 			status.Error = err.Error()
 		}
-	} else if os.Getenv("JM_NET_NAS_NODE") == "on" {
-		// Service exposure: the NAS node is the route. It is ready only once
-		// it has joined the tailnet and its service listeners are open.
-		status.Exposure = "services"
+	case exposure == LinkExposureServices:
+		// The NAS node is the route. A Mac finds it only by tag:jm-nas, so
+		// it is ready once the node runs its service listeners and the
+		// control server lists it online with that tag.
 		switch {
 		case !haveRuntime || status.NASNode == nil:
 			status.RouteReady = false
@@ -179,6 +290,13 @@ func (a *API) handleLinkStatus(w http.ResponseWriter, r *http.Request) {
 			status.RouteReady = false
 			if status.Error == "" {
 				status.Error = "Link NAS node is " + status.NASNode.State + componentErrorSuffix(status.NASNode)
+			}
+		default:
+			if err := linkNASServing(headscaleBin(), headscaleConfig(), nasHost); err != nil {
+				status.RouteReady = false
+				if status.Error == "" {
+					status.Error = err.Error()
+				}
 			}
 		}
 	}
@@ -253,10 +371,14 @@ func linkConfigured() bool {
 		strings.TrimSpace(os.Getenv("JM_HEADSCALE_CONFIG")) != ""
 }
 
-// Link tags. Every key the Manager mints is tagged when it owns the
+// Link tags. Mac and farm keys are tagged when the Manager owns the
 // Headscale policy (LinkPolicyManaged), so the policy can say exactly which
-// devices reach which NAS services. A tag is control-assigned identity: a
-// node cannot claim one its key or the policy's tagOwners do not grant.
+// devices reach which NAS services. The NAS node's key carries tag:jm-nas
+// whenever it uses service exposure, under any policy: that tag is how a Mac
+// finds it. A tag is control-assigned identity. Headscale 0.29 applies a
+// tagged key's tags under any policy, and the generated policy lists no tag
+// owners, so no node can give itself a tag (tailscale --advertise-tags);
+// only keys and `headscale nodes tag` assign them.
 const (
 	LinkTagMac  = "tag:jm-mac"
 	LinkTagNAS  = "tag:jm-nas"
@@ -527,9 +649,9 @@ func lastNonEmptyLine(s string) string {
 // `nodes list -o json` emits the protobuf structs' encoding/json shape
 // (snake_case), which HSNode mirrors.
 
-// NasLanSubnet is only the fallback prefix for POST /api/net/routes/approve
-// when no ?prefix= and no JM_NET_NAS_ROUTE are given. The NAS node advertises
-// a subnet only when JM_NET_NAS_ROUTE is set (LinkSubnetRoute).
+// NasLanSubnet is the prefix subnet exposure advertises when JM_NET_NAS_ROUTE
+// is unset (LinkExposure), the default before service exposure, and the
+// fallback for POST /api/net/routes/approve.
 const NasLanSubnet = "192.168.0.0/24"
 
 // DefaultNasHostname is the tailnet hostname of the embedded NAS node
@@ -545,6 +667,23 @@ type HSNode struct {
 	AvailableRoutes []string `json:"available_routes"`
 	ApprovedRoutes  []string `json:"approved_routes"`
 	Tags            []string `json:"tags"`
+	Online          bool     `json:"online"`
+}
+
+// linkNASServing checks the control server's view of a service-exposure NAS
+// node: registered, online, and tagged tag:jm-nas, the tag a Mac looks for.
+func linkNASServing(bin, config, host string) error {
+	n, err := hsNodeByHost(bin, config, host)
+	if err != nil {
+		return fmt.Errorf("Link NAS node: %w", err)
+	}
+	if !containsRoute(n.Tags, LinkTagNAS) {
+		return fmt.Errorf("Link NAS node %q is not tagged %s, so Macs cannot find it", host, LinkTagNAS)
+	}
+	if !n.Online {
+		return fmt.Errorf("Link NAS node %q is offline on the control server", host)
+	}
+	return nil
 }
 
 // EnsureNodeTags makes the node registered as host carry every tag in want,

@@ -12,16 +12,17 @@ package main
 // Flow, retried with capped backoff by the supervisor whenever it fails:
 //
 //  1. wait for the embedded Headscale to be running
-//  2. mint a one-off preauth key (tagged tag:jm-nas when the manager owns the
-//     ACL policy) against the local headscale (CLI)
+//  2. mint a one-off preauth key against the local headscale (CLI), tagged
+//     tag:jm-nas in service exposure (manager.LinkExposure)
 //  3. join as node "juicemount-nas" over the LOCAL control address, so no
-//     router hairpin NAT is needed to reach our own control server, and make
-//     sure the node carries tag:jm-nas (a node registered before tagging
-//     keeps its identity and is tagged server-side)
+//     router hairpin NAT is needed to reach our own control server; in
+//     service exposure, make sure the node carries tag:jm-nas (a node
+//     registered before tagging keeps its identity and is tagged
+//     server-side)
 //  4. listen on the node's tailnet address for each JuiceMount service
 //     (linkpolicy.go) and forward to its compose service
-//  5. only when JM_NET_NAS_ROUTE is set (legacy): also advertise that LAN
-//     subnet and approve it server-side
+//  5. subnet exposure only: also advertise the LAN prefix and approve it
+//     server-side
 //  6. watch the node; if it leaves the tailnet, start over
 //
 // Off unless JM_NET_NAS_NODE=on; never takes the manager down on failure.
@@ -34,6 +35,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -44,7 +46,6 @@ import (
 )
 
 const (
-	nasNodeDir        = "/data/headscale/nas-node"
 	defaultNASUDPPort = 41641
 	nasNodeUpTimeout  = 60 * time.Second
 	// nasNodeLostGrace is how long the node may report a logged-out state
@@ -106,13 +107,16 @@ type nasNodeConfig struct {
 	Dir        string
 	UDPPort    uint16
 	Services   []nasService
-	Subnet     string // legacy LAN route; "" exposes services only
-	MintKey    func() (string, error)
+	Subnet     string // subnet exposure's LAN route; "" in service exposure
+	// Tags are the tags MintKey's key carries and EnsureTags applies.
+	Tags    []string
+	MintKey func() (string, error)
 	// EnsureTags tags the registered node server-side when its key did not
 	// (an identity from before keys were tagged) and reports whether it did.
 	// nil skips it.
 	EnsureTags func() (bool, error)
-	// ApproveRoute approves Subnet on the control server (subnet mode only).
+	// ApproveRoute approves Subnet on the control server (subnet exposure
+	// only).
 	ApproveRoute func(prefix string) error
 	Dial         nasTCPDialer
 	UpTimeout    time.Duration
@@ -120,6 +124,9 @@ type nasNodeConfig struct {
 	Logf         func(string, ...any)
 }
 
+// nasNodeConfigFromEnv resolves one NAS node start. cfgPath is Headscale's
+// config.yaml; the node's state lives next to it, where manager.LinkExposure
+// looks for it.
 func nasNodeConfigFromEnv(cfgPath string) (nasNodeConfig, error) {
 	control, err := nasNodeControlURL()
 	if err != nil {
@@ -133,7 +140,10 @@ func nasNodeConfigFromEnv(cfgPath string) (nasNodeConfig, error) {
 	if err != nil {
 		return nasNodeConfig{}, err
 	}
-	subnet := manager.LinkSubnetRoute()
+	exposure, subnet, err := manager.LinkExposure(cfgPath)
+	if err != nil {
+		return nasNodeConfig{}, err
+	}
 	if subnet != "" {
 		if _, err := netip.ParsePrefix(subnet); err != nil {
 			return nasNodeConfig{}, fmt.Errorf("bad JM_NET_NAS_ROUTE %q: %w", subnet, err)
@@ -142,20 +152,31 @@ func nasNodeConfigFromEnv(cfgPath string) (nasNodeConfig, error) {
 	var tags []string
 	hostname := nasNodeHostname()
 	var ensureTags func() (bool, error)
-	if manager.LinkPolicyManaged(cfgPath) {
+	if exposure == manager.LinkExposureServices {
+		// A Mac finds a NAS node that serves its ports by this tag
+		// (nfs linkNASServicePeer), so it is applied under every policy:
+		// Headscale honors a tagged key's tags with or without one. A
+		// subnet-exposure node stays untagged, so a Mac waits for the route
+		// instead of dialing the node's tailnet address before the route
+		// converges.
 		tags = []string{manager.LinkTagNAS}
 		ensureTags = func() (bool, error) {
-			return manager.EnsureNodeTags(hsBinary, cfgPath, hostname, tags)
+			changed, err := manager.EnsureNodeTags(hsBinary, cfgPath, hostname, tags)
+			if err != nil {
+				return false, fmt.Errorf("%w (Headscale tags a node registered before tagged keys only when its ACL policy defines the tag: use the Manager's policy instead of JM_NET_POLICY=off, add %q: [] to your own policy's tagOwners, or set JM_NET_NAS_EXPOSURE=subnet)", err, manager.LinkTagNAS)
+			}
+			return changed, nil
 		}
 	}
 	dialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
 	return nasNodeConfig{
 		ControlURL: control,
 		Hostname:   hostname,
-		Dir:        nasNodeDir,
+		Dir:        filepath.Join(filepath.Dir(cfgPath), "nas-node"),
 		UDPPort:    udpPort,
 		Services:   services,
 		Subnet:     subnet,
+		Tags:       tags,
 		EnsureTags: ensureTags,
 		MintKey: func() (string, error) {
 			return manager.MintPreauthKey(hsBinary, cfgPath, false, tags)
@@ -296,7 +317,7 @@ func runNASNode(cfg nasNodeConfig, stop <-chan struct{}, ready func(string)) err
 		if cfg.ApproveRoute != nil {
 			go approveLoop(ctx, cfg.ApproveRoute, prefix.String(), cfg.Hostname)
 		}
-		detail += ", legacy subnet route " + prefix.String()
+		detail += ", subnet route " + prefix.String()
 	}
 	ready(detail)
 

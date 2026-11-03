@@ -116,6 +116,19 @@ func main() {
 	// manager down with it: a bad config or binary mismatch degrades to
 	// "pairing unavailable", not a dead UI.
 	if headscaleEnabled() {
+		hsConfig := hsDataDir + "/config.yaml"
+		if nasNodeEnabled() {
+			// Before either component starts: the policy and the NAS node
+			// both follow the exposure, and the node's first run creates
+			// the state directory that marks an upgrade.
+			if mode, err := manager.RecordLinkExposureDefault(hsConfig); err != nil {
+				log.Printf("JuiceMount Link: WARNING could not record the NAS exposure default: %v", err)
+			} else if exposure, _, err := manager.LinkExposure(hsConfig); err != nil {
+				log.Printf("JuiceMount Link: WARNING NAS exposure: %v", err)
+			} else {
+				log.Printf("JuiceMount Link: NAS node exposure %s (recorded default %s)", exposure, mode)
+			}
+		}
 		hs := newHeadscaleSupervisor()
 		hs.Start()
 		defer hs.Stop()
@@ -124,7 +137,7 @@ func main() {
 		// T2.2: join the tailnet as the NAS itself and serve the JuiceMount
 		// ports on its tailnet address so linked Macs reach them remotely.
 		if nasNodeEnabled() {
-			nas = newNASNodeSupervisor(hsDataDir+"/config.yaml", hs)
+			nas = newNASNodeSupervisor(hsConfig, hs)
 			nas.Start()
 			defer nas.Stop()
 		}

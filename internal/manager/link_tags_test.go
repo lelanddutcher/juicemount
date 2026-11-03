@@ -133,7 +133,11 @@ func TestLinkStatusReportsSupervisedComponents(t *testing.T) {
 	t.Setenv("JM_NET_HEADSCALE", "on")
 	t.Setenv("JM_NET_NAS_NODE", "on")
 	t.Setenv("JM_NET_NAS_ROUTE", "")
+	t.Setenv("JM_NET_NAS_EXPOSURE", "")
 	t.Setenv("JM_NET_POLICY", "")
+	if err := os.WriteFile(filepath.Join(dir, "nodes.json"), []byte(`[{"id": 1, "name": "juicemount-nas", "given_name": "juicemount-nas", "tags": ["tag:jm-nas"], "online": true}]`), 0o644); err != nil {
+		t.Fatal(err)
+	}
 
 	status := func() LinkStatus {
 		t.Helper()

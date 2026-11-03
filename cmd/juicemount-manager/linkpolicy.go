@@ -70,8 +70,14 @@ func parseNASServices(raw string) ([]nasService, error) {
 // linkPolicy renders the Headscale (policy v2) ACL. Sources are tagged Macs
 // and farm nodes plus untagged nodes of the Link user, which covers Macs
 // paired before keys were tagged. The only destinations are the service
-// ports on tag:jm-nas and, when the legacy subnet route is on, the same
-// ports inside that route.
+// ports on tag:jm-nas and, in subnet exposure, the same ports inside that
+// route.
+//
+// No tag has an owner. Headscale 0.29 still applies the tags of a key the
+// Manager mints and lets `headscale nodes tag` set a tag the policy defines,
+// but no node may request a tag itself: with jm@ as owner, any untagged
+// Link-user node (a Mac paired before tagged keys) could advertise
+// tag:jm-nas and receive the traffic Macs send to the NAS.
 func linkPolicy(user string, services []nasService, subnet string) ([]byte, error) {
 	if user == "" || len(services) == 0 {
 		return nil, fmt.Errorf("link policy needs a user and at least one service")
@@ -89,7 +95,7 @@ func linkPolicy(user string, services []nasService, subnet string) ([]byte, erro
 		}
 		dst = append(dst, prefix.Masked().String()+":"+portList)
 	}
-	owner := []string{user + "@"}
+	owner := []string{} // defined, unowned: JSON [] (not null)
 	type acl struct {
 		Action string   `json:"action"`
 		Src    []string `json:"src"`
@@ -113,19 +119,23 @@ func linkPolicy(user string, services []nasService, subnet string) ([]byte, erro
 	return json.MarshalIndent(policy, "", "  ")
 }
 
-// writeLinkPolicy regenerates the Manager-owned policy file. Unlike
-// config.yaml it is not user-owned: it follows the service map and route
-// settings on every start.
-func writeLinkPolicy(dir string) (string, error) {
+// writeLinkPolicy regenerates the Manager-owned policy file next to
+// Headscale's config.yaml. Unlike config.yaml it is not user-owned: it
+// follows the service map and exposure on every start.
+func writeLinkPolicy(cfgPath string) (string, error) {
 	services, err := nasServices()
 	if err != nil {
 		return "", err
 	}
-	body, err := linkPolicy(manager.LinkUserName(), services, manager.LinkSubnetRoute())
+	_, subnet, err := manager.LinkExposure(cfgPath)
 	if err != nil {
 		return "", err
 	}
-	path := filepath.Join(dir, "policy.hujson")
+	body, err := linkPolicy(manager.LinkUserName(), services, subnet)
+	if err != nil {
+		return "", err
+	}
+	path := filepath.Join(filepath.Dir(cfgPath), "policy.hujson")
 	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, append(body, '\n'), 0o600); err != nil {
 		return "", err

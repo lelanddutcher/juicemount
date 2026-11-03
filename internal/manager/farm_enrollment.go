@@ -182,6 +182,22 @@ func (a *API) handleFarmEnrollment(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		}
+		// A remote node runs the system tailscale, which reaches the NAS only
+		// through a subnet route (--accept-routes): its juicefs mount dials
+		// the object store at the LAN address stored in the volume format,
+		// which this plan cannot redirect to the NAS node's tailnet address.
+		exposure, subnet, err := LinkExposure(headscaleConfig())
+		if err != nil {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]any{"ok": false, "error": "JuiceMount Link NAS exposure is misconfigured: " + err.Error()})
+			return
+		}
+		if exposure == LinkExposureServices {
+			writeJSON(w, http.StatusConflict, map[string]any{
+				"ok":    false,
+				"error": "remote processing nodes need the NAS subnet route, and this NAS serves Link with service exposure: set JM_NET_NAS_EXPOSURE=subnet and JM_NET_NAS_ROUTE to the NAS LAN prefix, then restart Manager, or enroll the node on the LAN",
+			})
+			return
+		}
 		pairingCode, err := mintLinkPreauthKey(false, LinkTagFarm)
 		if err != nil {
 			writeJSON(w, http.StatusBadGateway, map[string]any{"ok": false, "error": "could not mint one-time Link authorization: " + err.Error()})
@@ -192,7 +208,11 @@ func (a *API) handleFarmEnrollment(w http.ResponseWriter, r *http.Request) {
 			"--auth-key", pairingCode, "--hostname", req.Name, "--accept-routes",
 		})
 		plan.PairingExpiresIn = "1h"
-		plan.Checks = append([]string{"Run the one-time Link command first and verify the NAS route is reachable."}, plan.Checks...)
+		reach := "Run the one-time Link command first, then confirm the node reaches the Redis endpoint in JM_META through Link before the docker command."
+		if subnet != "" {
+			reach = "Run the one-time Link command first, then confirm the node reaches the Redis endpoint in JM_META through the NAS route " + subnet + " (tailscale status lists the NAS node; the JM_META host must be inside that route) before the docker command."
+		}
+		plan.Checks = append([]string{reach}, plan.Checks...)
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "plan": plan})

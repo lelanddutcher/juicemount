@@ -212,7 +212,7 @@ func headscaleServeEnv(cfgPath string) ([]string, error) {
 	if !manager.LinkPolicyManaged(cfgPath) {
 		return nil, nil
 	}
-	path, err := writeLinkPolicy(filepath.Dir(cfgPath))
+	path, err := writeLinkPolicy(cfgPath)
 	if err != nil {
 		return nil, fmt.Errorf("write Link ACL policy: %w", err)
 	}

@@ -41,7 +41,8 @@ type testPolicy struct {
 
 // TestLinkPolicyAllowsOnlyServicePorts: Macs and farm nodes reach the
 // JuiceMount ports on the NAS node and nothing else; no rule reaches the
-// router, the rest of the LAN, or other Macs.
+// router, the rest of the LAN, or other Macs. No tag has an owner, so no
+// node can give itself one.
 func TestLinkPolicyAllowsOnlyServicePorts(t *testing.T) {
 	services, _ := parseNASServices(defaultNASServices)
 	raw, err := linkPolicy("jm", services, "")
@@ -62,8 +63,8 @@ func TestLinkPolicyAllowsOnlyServicePorts(t *testing.T) {
 		t.Fatalf("rule = %+v", rule)
 	}
 	for _, tag := range []string{"tag:jm-mac", "tag:jm-nas", "tag:jm-farm"} {
-		if !reflect.DeepEqual(p.TagOwners[tag], []string{"jm@"}) {
-			t.Fatalf("tagOwners[%s] = %v", tag, p.TagOwners[tag])
+		if owners, ok := p.TagOwners[tag]; !ok || owners == nil || len(owners) != 0 {
+			t.Fatalf("tagOwners[%s] = %v (defined %v), want defined and empty", tag, owners, ok)
 		}
 	}
 	if strings.Contains(string(raw), "*") {
