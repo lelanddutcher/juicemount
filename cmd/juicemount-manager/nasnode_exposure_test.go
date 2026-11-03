@@ -22,6 +22,7 @@ func setNASNodeEnv(t *testing.T) string {
 	t.Setenv("JM_NET_NAS_ROUTE", "")
 	t.Setenv("JM_NET_NAS_EXPOSURE", "")
 	t.Setenv("JM_NET_NAS_SERVICES", "")
+	t.Setenv("JM_NET_NAS_LAN_ADDR", "")
 	return filepath.Join(t.TempDir(), "config.yaml")
 }
 

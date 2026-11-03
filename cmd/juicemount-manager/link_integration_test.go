@@ -41,7 +41,9 @@ import (
 
 	"github.com/lelanddutcher/juicemount/internal/manager"
 	"github.com/lelanddutcher/juicemount/nfs"
+	"tailscale.com/ipn"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tsnet"
 )
 
 func freeLoopbackPort(t *testing.T) int {
@@ -107,6 +109,10 @@ type linkIntegrationCase struct {
 	policy       string // "managed", "off", or an operator policy's HuJSON
 	subnet       bool   // subnet exposure (JM_NET_NAS_ROUTE)
 	legacyNASKey bool   // the NAS identity predates tagged keys
+	// impostorFirst registers, before the NAS node, a Mac-tagged node that
+	// calls itself juicemount-nas and, in subnet exposure, advertises the
+	// NAS prefix.
+	impostorFirst bool
 	// wantNASErr, when set, is a substring of the NAS node's error: the
 	// node must fail loudly instead of running.
 	wantNASErr   string
@@ -151,6 +157,22 @@ func TestLinkIntegrationOperatorPolicyRefusingNASTag(t *testing.T) {
 // address; once approved, the Mac finds the NAS node by its route.
 func TestLinkIntegrationSubnetExposureWaitsForRoute(t *testing.T) {
 	runLinkIntegration(t, linkIntegrationCase{policy: "managed", subnet: true})
+}
+
+// TestLinkIntegrationImpostorRegisteredFirstServices: a node's hostname is
+// its own choice. A paired Mac that registered before the NAS node as
+// "juicemount-nas" must not be given tag:jm-nas; the Manager tags the NAS
+// node it runs, by its node key.
+func TestLinkIntegrationImpostorRegisteredFirstServices(t *testing.T) {
+	runLinkIntegration(t, linkIntegrationCase{policy: "managed", impostorFirst: true})
+}
+
+// TestLinkIntegrationImpostorRegisteredFirstSubnet: the same impostor also
+// advertises the NAS prefix. The Manager approves the route on its own NAS
+// node only, and reports the other advertiser instead of calling the route
+// ready.
+func TestLinkIntegrationImpostorRegisteredFirstSubnet(t *testing.T) {
+	runLinkIntegration(t, linkIntegrationCase{policy: "managed", subnet: true, impostorFirst: true})
 }
 
 func runLinkIntegration(t *testing.T, tc linkIntegrationCase) {
@@ -259,6 +281,34 @@ func runLinkIntegration(t *testing.T, tc linkIntegrationCase) {
 	defer hs.Stop()
 	waitForState(t, "headscale", hs.status, 90*time.Second)
 
+	impostorKey := ""
+	if tc.impostorFirst {
+		key, err := manager.MintPreauthKey(bin, cfgPath, false, []string{manager.LinkTagMac})
+		if err != nil {
+			t.Fatal(err)
+		}
+		imp := &tsnet.Server{Hostname: manager.DefaultNasHostname, ControlURL: localControl, AuthKey: key, Dir: filepath.Join(dir, "impostor"), Logf: func(string, ...any) {}}
+		defer imp.Close()
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		st, err := imp.Up(ctx)
+		if err != nil {
+			cancel()
+			t.Fatalf("impostor up: %v", err)
+		}
+		impostorKey = st.Self.PublicKey.String()
+		if tc.subnet {
+			lc, err := imp.LocalClient()
+			if err == nil {
+				_, err = lc.EditPrefs(ctx, &ipn.MaskedPrefs{Prefs: ipn.Prefs{AdvertiseRoutes: []netip.Prefix{lan}}, AdvertiseRoutesSet: true})
+			}
+			if err != nil {
+				cancel()
+				t.Fatalf("impostor advertise: %v", err)
+			}
+		}
+		cancel()
+	}
+
 	// The Manager's handler answers with the address it saw the request
 	// come from.
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -292,14 +342,16 @@ func runLinkIntegration(t *testing.T, tc linkIntegrationCase) {
 	var approve atomic.Bool
 	if nasCfg.ApproveRoute != nil {
 		realApprove := nasCfg.ApproveRoute
-		nasCfg.ApproveRoute = func(prefix string) error {
+		nasCfg.ApproveRoute = func(nodeKey, prefix string) error {
 			if !approve.Load() {
 				return errors.New("approval held by the test")
 			}
-			return realApprove(prefix)
+			return realApprove(nodeKey, prefix)
 		}
 	}
-	nas := newSupervisor("nas node", func(stop <-chan struct{}, ready func(string)) error {
+	var nas *supervisor
+	nasCfg.Identity = func(key string) { nas.status.setNodeKey(key) }
+	nas = newSupervisor("nas node", func(stop <-chan struct{}, ready func(string)) error {
 		return runNASNode(nasCfg, stop, ready)
 	})
 	nas.Start()
@@ -329,16 +381,46 @@ func runLinkIntegration(t *testing.T, tc linkIntegrationCase) {
 	if tc.subnet {
 		wantNASTags = nil
 	}
-	out, err := exec.Command(bin, "--config", cfgPath, "nodes", "list", "-o", "json").Output()
-	if err != nil {
-		t.Fatalf("nodes list: %v", err)
+	// listNodes returns the NAS node and the impostor (nil without one),
+	// told apart by node key: both call themselves juicemount-nas.
+	listNodes := func() (nasNode, impostor *manager.HSNode) {
+		t.Helper()
+		out, err := exec.Command(bin, "--config", cfgPath, "nodes", "list", "-o", "json").Output()
+		if err != nil {
+			t.Fatalf("nodes list: %v", err)
+		}
+		var nodes []manager.HSNode
+		if err := json.Unmarshal(out, &nodes); err != nil {
+			t.Fatalf("nodes list json: %v\n%s", err, out)
+		}
+		for i := range nodes {
+			switch {
+			case nodes[i].Name == "test-mac":
+			case impostorKey != "" && nodes[i].NodeKey == impostorKey:
+				impostor = &nodes[i]
+			case nasNode == nil:
+				nasNode = &nodes[i]
+			default:
+				t.Fatalf("registered nodes = %+v, want one NAS node", nodes)
+			}
+		}
+		if nasNode != nil && nasNode.NodeKey != nas.status.snapshot().NodeKey {
+			t.Fatalf("NAS node %+v does not hold the key the NAS node reported (%q)", nasNode, nas.status.snapshot().NodeKey)
+		}
+		if nasNode == nil || nasNode.Name != manager.DefaultNasHostname || (impostorKey != "") != (impostor != nil) {
+			t.Fatalf("registered nodes = %+v, want the NAS node (and the impostor %v)", nodes, tc.impostorFirst)
+		}
+		return nasNode, impostor
 	}
-	var nodes []manager.HSNode
-	if err := json.Unmarshal(out, &nodes); err != nil {
-		t.Fatalf("nodes list json: %v\n%s", err, out)
+	nasNode, impostor := listNodes()
+	if err := manager.LinkNASConflicts(bin, cfgPath, nasNode.NodeKey, ""); err != nil {
+		t.Fatalf("NAS node conflicts: %v", err)
 	}
-	if len(nodes) != 1 || nodes[0].GivenName != "juicemount-nas" || !reflect.DeepEqual(nodes[0].Tags, wantNASTags) {
-		t.Fatalf("registered nodes = %+v, want the NAS node tagged %v", nodes, wantNASTags)
+	if !reflect.DeepEqual(nasNode.Tags, wantNASTags) {
+		t.Fatalf("NAS node = %+v, want it tagged %v", nasNode, wantNASTags)
+	}
+	if impostor != nil && !reflect.DeepEqual(impostor.Tags, []string{manager.LinkTagMac}) {
+		t.Fatalf("the Manager changed the impostor's tags: %+v", impostor)
 	}
 
 	var macTags []string
@@ -400,11 +482,22 @@ func runLinkIntegration(t *testing.T, tc linkIntegrationCase) {
 			time.Sleep(200 * time.Millisecond)
 		}
 		t.Logf("route reached the Mac after %v", time.Since(start).Round(time.Millisecond))
-		// Not asserted here: a connection through the route. On this
-		// relay-less loopback tailnet the first routed connection took
-		// 20-60 s in some runs and none connected within 120 s of fresh 5 s
-		// attempts in others, independent of the policy; the subnet data
-		// path (nasRouteTCPHandler) is the one Link has always used.
+		nasNode, impostor := listNodes()
+		if !containsString(nasNode.ApprovedRoutes, lan.String()) {
+			t.Fatalf("NAS node route not approved: %+v", nasNode)
+		}
+		if impostor != nil && len(impostor.ApprovedRoutes) != 0 {
+			t.Fatalf("the Manager approved the impostor's route: %+v", impostor)
+		}
+		// The impostor's advertisement keeps the route from being reported
+		// ready, by name of node.
+		err := manager.LinkNASConflicts(bin, cfgPath, nasNode.NodeKey, lan.String())
+		if impostor == nil && err != nil {
+			t.Fatalf("conflict without an impostor: %v", err)
+		}
+		if impostor != nil && (err == nil || !strings.Contains(err.Error(), fmt.Sprintf("node %d (%q) advertises %s", impostor.ID, impostor.Name, lan))) {
+			t.Fatalf("impostor advertising the NAS prefix not reported: %v", err)
+		}
 	} else {
 		// Link carries the LAN address to the same port on the NAS node's
 		// tailnet address.
@@ -420,8 +513,32 @@ func runLinkIntegration(t *testing.T, tc linkIntegrationCase) {
 		}
 		seen, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
-		if !containsString(addrs, string(seen)) {
-			t.Fatalf("manager saw the request from %q, want one of the Mac's addresses %v", seen, addrs)
+		macV4 := ""
+		for _, a := range addrs {
+			if ip, err := netip.ParseAddr(a); err == nil && ip.Is4() {
+				macV4 = a
+			}
+		}
+		if string(seen) != macV4 {
+			t.Fatalf("manager saw the request from %q, want the Mac's IPv4 address %s (of %v)", seen, macV4, addrs)
+		}
+		// Over the NAS node's IPv6 tailnet address the Mac's source is its
+		// IPv6 address; the Manager still sees the one address per node, so
+		// a Mac cannot double its enrollment allowance.
+		for _, a := range nasNode.IPAddresses {
+			ip, err := netip.ParseAddr(a)
+			if err != nil || !ip.Is6() {
+				continue
+			}
+			resp, err := client.Get("http://" + net.JoinHostPort(a, "30190") + "/")
+			if err != nil {
+				t.Fatalf("manager over the NAS node's IPv6 address: %v", err)
+			}
+			seen, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if string(seen) != macV4 {
+				t.Fatalf("over IPv6 the manager saw %q, want the Mac's IPv4 address %s", seen, macV4)
+			}
 		}
 	}
 
@@ -434,6 +551,27 @@ func runLinkIntegration(t *testing.T, tc linkIntegrationCase) {
 
 	if st := nas.status.snapshot(); st.State != "running" || st.Restarts != tc.wantRestarts {
 		t.Fatalf("nas node status after traffic = %+v", st)
+	}
+
+	if tc.subnet {
+		// Last, because it can end in a skip: a connection through the
+		// approved route. On this relay-less loopback tailnet the first
+		// connection has taken about a minute after the route reached the
+		// Mac, or longer than 120 s, with or without a policy; in those runs
+		// the Mac could not reach the NAS node's own tailnet address either,
+		// so the stall is the peer path, not the route or the policy.
+		start := time.Now()
+		var err error
+		for time.Since(start) < 120*time.Second {
+			if err = echoOver(10*time.Second, 30179); err == nil {
+				break
+			}
+			time.Sleep(time.Second)
+		}
+		if err != nil {
+			t.Skipf("NOT A PASS: the Mac had the approved route, but no connection through it succeeded within 120 s (last error: %v); the route never converged on this loopback tailnet", err)
+		}
+		t.Logf("first connection through the subnet route after %v", time.Since(start).Round(time.Millisecond))
 	}
 }
 

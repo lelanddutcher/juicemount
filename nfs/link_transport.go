@@ -85,7 +85,12 @@ func linkTransportForPeer(peer *ipnstate.PeerStatus) LinkTransportStatus {
 
 // linkNASTag marks the NAS node that serves the JuiceMount ports on its own
 // tailnet address (the Manager's service exposure). Tags are assigned by the
-// control server, so no other node in the tailnet can claim it.
+// control server: the Manager gives this one only to the NAS node it runs,
+// found by node key, and its own policy lets no node request it. That does
+// not make the tag unique. An operator's own policy may let a node claim it,
+// and an earlier NAS identity keeps it in a stale record, so the Manager's
+// status reports any second holder, and linkNASServicePeer below never
+// guesses between two online ones.
 const linkNASTag = "tag:jm-nas"
 
 // linkNASServicePeer returns the one tag:jm-nas peer, preferring online

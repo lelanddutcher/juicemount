@@ -128,9 +128,11 @@ func TestHeadscaleSupervisorKeepsRetryingFailedStarts(t *testing.T) {
 	t.Setenv("JM_NET_TLS_CERT", "")
 	t.Setenv("JM_NET_TLS_KEY", "")
 	t.Setenv("JM_NET_HEADSCALE", "on")
+	t.Setenv("JM_NET_NAS_NODE", "on")
 	t.Setenv("JM_NET_POLICY", "")
 	t.Setenv("JM_NET_NAS_SERVICES", "")
 	t.Setenv("JM_NET_NAS_ROUTE", "")
+	t.Setenv("JM_NET_NAS_EXPOSURE", "")
 
 	hs := newHeadscaleSupervisor()
 	hs.listen = "127.0.0.1:1" // nothing listens there

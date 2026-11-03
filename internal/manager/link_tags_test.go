@@ -52,6 +52,7 @@ func TestPairUsesLinkUserIDAndMacTag(t *testing.T) {
 	bin := fakeHeadscale(t, dir, "tskey-auth-tagged")
 	setLinkEnv(t, bin, filepath.Join(dir, "config.yaml"))
 	t.Setenv("JM_NET_HEADSCALE", "on")
+	t.Setenv("JM_NET_NAS_NODE", "on")
 	t.Setenv("JM_NET_POLICY", "")
 	t.Setenv("JM_HEADSCALE_USER", "")
 	if err := os.WriteFile(filepath.Join(dir, "users.json"), []byte(`[{"id": 1, "name": "admin"}, {"id": 4, "name": "jm"}]`), 0o644); err != nil {
@@ -86,6 +87,7 @@ func TestLinkPolicyManaged(t *testing.T) {
 	dir := t.TempDir()
 	cfg := filepath.Join(dir, "config.yaml")
 	t.Setenv("JM_NET_HEADSCALE", "on")
+	t.Setenv("JM_NET_NAS_NODE", "on")
 	t.Setenv("JM_NET_POLICY", "")
 	if !LinkPolicyManaged(cfg) {
 		t.Fatal("embedded Headscale without a config must be managed")
@@ -108,6 +110,19 @@ func TestLinkPolicyManaged(t *testing.T) {
 		t.Fatal("JM_NET_POLICY=off must disable the managed policy")
 	}
 	t.Setenv("JM_NET_POLICY", "")
+	// Without the embedded NAS node an operator's own router carries the
+	// NAS (JM_NET_NAS_ROUTE set or not). Its services are unknown to the
+	// Manager, so a policy it wrote would deny Link traffic that every
+	// earlier release allowed.
+	t.Setenv("JM_NET_NAS_NODE", "off")
+	for _, route := range []string{"", "192.0.2.0/24"} {
+		t.Setenv("JM_NET_NAS_ROUTE", route)
+		if LinkPolicyManaged(cfg) {
+			t.Fatalf("policy managed without the embedded NAS node (route %q)", route)
+		}
+	}
+	t.Setenv("JM_NET_NAS_ROUTE", "")
+	t.Setenv("JM_NET_NAS_NODE", "on")
 	t.Setenv("JM_NET_HEADSCALE", "off")
 	if LinkPolicyManaged(cfg) {
 		t.Fatal("external Headscale policy must not be managed")
@@ -135,7 +150,7 @@ func TestLinkStatusReportsSupervisedComponents(t *testing.T) {
 	t.Setenv("JM_NET_NAS_ROUTE", "")
 	t.Setenv("JM_NET_NAS_EXPOSURE", "")
 	t.Setenv("JM_NET_POLICY", "")
-	if err := os.WriteFile(filepath.Join(dir, "nodes.json"), []byte(`[{"id": 1, "name": "juicemount-nas", "given_name": "juicemount-nas", "tags": ["tag:jm-nas"], "online": true}]`), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "nodes.json"), []byte(`[{"id": 1, "node_key": "`+nodeKeyNAS+`", "name": "juicemount-nas", "given_name": "juicemount-nas", "tags": ["tag:jm-nas"], "online": true}]`), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -168,7 +183,11 @@ func TestLinkStatusReportsSupervisedComponents(t *testing.T) {
 	}
 
 	runtime.NASNode = &LinkComponentStatus{State: "running"}
-	if got := status(); !got.RouteReady || got.Headscale == nil || got.Headscale.State != "running" {
+	if got := status(); got.RouteReady || !strings.Contains(got.Error, "node key") {
+		t.Fatalf("running status without the node's key = %+v", got)
+	}
+	runtime.NASNode = &LinkComponentStatus{State: "running", NodeKey: nodeKeyNAS}
+	if got := status(); !got.RouteReady || got.Headscale == nil || got.Headscale.State != "running" || got.NASNode.NodeKey != nodeKeyNAS {
 		t.Fatalf("running status = %+v", got)
 	}
 
@@ -191,9 +210,12 @@ func TestEnsureNodeTagsTagsLegacyNode(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	write("nodes.json", `[{"id": 3, "name": "juicemount-nas", "given_name": "juicemount-nas", "tags": ["tag:other"]}]`)
-	write("nodes-tagged.json", `[{"id": 3, "name": "juicemount-nas", "given_name": "juicemount-nas", "tags": ["tag:other", "tag:jm-nas"]}]`)
-	changed, err := EnsureNodeTags(bin, cfg, "juicemount-nas", []string{LinkTagNAS})
+	// Node 2 registered first under the NAS node's name; only the key
+	// selects the NAS node.
+	impostor := `{"id": 2, "node_key": "` + nodeKeyMac + `", "name": "juicemount-nas", "given_name": "juicemount-nas", "tags": ["tag:jm-mac"]}`
+	write("nodes.json", `[`+impostor+`, {"id": 3, "node_key": "`+nodeKeyNAS+`", "name": "juicemount-nas", "given_name": "juicemount-nas-1", "tags": ["tag:other"]}]`)
+	write("nodes-tagged.json", `[`+impostor+`, {"id": 3, "node_key": "`+nodeKeyNAS+`", "name": "juicemount-nas", "given_name": "juicemount-nas-1", "tags": ["tag:other", "tag:jm-nas"]}]`)
+	changed, err := EnsureNodeTags(bin, cfg, nodeKeyNAS, []string{LinkTagNAS})
 	if err != nil || !changed {
 		t.Fatalf("EnsureNodeTags = (%v, %v), want tagged", changed, err)
 	}
@@ -204,7 +226,7 @@ func TestEnsureNodeTagsTagsLegacyNode(t *testing.T) {
 	if err := os.Remove(filepath.Join(dir, "argv.log")); err != nil {
 		t.Fatal(err)
 	}
-	changed, err = EnsureNodeTags(bin, cfg, "juicemount-nas", []string{LinkTagNAS})
+	changed, err = EnsureNodeTags(bin, cfg, nodeKeyNAS, []string{LinkTagNAS})
 	if err != nil || changed {
 		t.Fatalf("already tagged: EnsureNodeTags = (%v, %v)", changed, err)
 	}
@@ -213,12 +235,17 @@ func TestEnsureNodeTagsTagsLegacyNode(t *testing.T) {
 	}
 
 	// The control server ignoring the request must not pass silently.
-	write("nodes.json", `[{"id": 3, "name": "juicemount-nas", "given_name": "juicemount-nas"}]`)
+	write("nodes.json", `[{"id": 3, "node_key": "`+nodeKeyNAS+`", "name": "juicemount-nas", "given_name": "juicemount-nas"}]`)
 	_ = os.Remove(filepath.Join(dir, "nodes-tagged.json"))
-	if _, err := EnsureNodeTags(bin, cfg, "juicemount-nas", []string{LinkTagNAS}); err == nil || !strings.Contains(err.Error(), "still missing") {
+	if _, err := EnsureNodeTags(bin, cfg, nodeKeyNAS, []string{LinkTagNAS}); err == nil || !strings.Contains(err.Error(), "still missing") {
 		t.Fatalf("unverified tagging error = %v", err)
 	}
-	if _, err := EnsureNodeTags(bin, cfg, "ghost", []string{LinkTagNAS}); err == nil {
+	_ = os.Remove(filepath.Join(dir, "argv.log"))
+	write("nodes.json", `[`+impostor+`]`)
+	if _, err := EnsureNodeTags(bin, cfg, nodeKeyNAS, []string{LinkTagNAS}); err == nil {
 		t.Fatal("unregistered node tagged")
+	}
+	if argv, _ := os.ReadFile(filepath.Join(dir, "argv.log")); strings.Contains(string(argv), "nodes tag") {
+		t.Fatalf("a node with only the NAS node's name was tagged: %q", argv)
 	}
 }

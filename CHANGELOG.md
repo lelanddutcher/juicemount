@@ -114,6 +114,16 @@ workers.
 
 ### JuiceMount Link
 
+- Upgrading changes what linked devices can reach. With the embedded control
+  server and NAS node (`JM_NET_HEADSCALE=on`, `JM_NET_NAS_NODE=on`), the
+  Manager now enforces an ACL policy where earlier releases allowed all
+  traffic: Macs and farm nodes reach only ports 30151, 30179 and 30190 on the
+  NAS node and, under `subnet`, inside the route. Anything else used through
+  Link (other ports or hosts on the NAS LAN, one Mac to another) stops
+  working. `JM_NET_POLICY=off`, or a `policy:` stanza of your own in
+  `config.yaml`, keeps the previous behaviour. With `JM_NET_NAS_NODE` off
+  (your own subnet router carries the NAS) the Manager applies no policy and
+  mints untagged keys, as before.
 - Link has two ways to expose the NAS, chosen by `JM_NET_NAS_EXPOSURE`:
   - `services` serves only the JuiceMount ports (Redis proxy 30179, object
     storage 30151, Manager 30190) on the NAS node's own tailnet address. The
@@ -123,16 +133,34 @@ workers.
   - `subnet` advertises a LAN prefix through the NAS node, the only path
     Link had before. Every Mac app version and remote farm node reaches it.
     The prefix is `JM_NET_NAS_ROUTE`, or `192.168.0.0/24` when that is unset,
-    as before. The node is not tagged, so a Mac waits for the route instead
-    of using the node's tailnet address.
+    as before. The Manager does not tag the node, so a Mac waits for the
+    route instead of using the node's tailnet address. A NAS node that ran
+    with `services` keeps `tag:jm-nas` after a switch to `subnet` (Headscale
+    cannot take a tagged node's last tag away), so a current Mac may also
+    reach it at its tailnet address, which serves the same ports.
+  - Under `subnet`, `JM_NET_NAS_LAN_ADDR` (the NAS's own LAN address, inside
+    the route) narrows the policy to the JuiceMount ports on that address
+    instead of on every host in the route.
 - When `JM_NET_NAS_EXPOSURE` is unset, setting `JM_NET_NAS_ROUTE` selects
   `subnet`. Otherwise an install whose NAS node already ran
   (`/data/headscale/nas-node` exists) keeps `subnet`, and a new install uses
   `services`. The Manager records that default in
   `/data/headscale/nas-exposure` before the node first starts, so it does not
-  change later. To switch, set `JM_NET_NAS_EXPOSURE` and restart the Manager.
+  change later; the node does not start until the record is written. To switch, set `JM_NET_NAS_EXPOSURE` and restart the Manager.
   Before switching an existing install to `services`, update every linked
   Mac.
+- `JM_NET_NAS_EXPOSURE=services` together with `JM_NET_NAS_ROUTE` stops only
+  the NAS node, whose status names the conflict. The control server keeps
+  running.
+- The Manager finds its NAS node by the node's key, never by the name
+  `juicemount-nas`, which any node can register under. It tags, approves
+  routes for and reports on that node only. While another node carries
+  `tag:jm-nas` or advertises a route overlapping the NAS prefix,
+  `GET /api/net/link` reports the route not ready and the NAS node logs a
+  warning, naming each such node; remove one that is not yours with
+  `headscale nodes delete --identifier <id>`. `POST /api/net/routes/approve`
+  no longer takes `?host=`: it approves on the NAS node, or on
+  `?id=<node id>`.
 - Remote farm node enrollment needs `subnet`: the node's JuiceFS mount reaches
   object storage at the LAN address stored in the volume. Under `services` the
   Manager refuses the remote plan and says what to set.
@@ -146,8 +174,8 @@ workers.
   untagged Mac could otherwise claim `tag:jm-nas`). Keys the Manager mints
   still get their tags.
 - Under `services`, the Manager on 30190 is served in-process on the tailnet
-  address, so its per-address enrollment limits see each Mac's own tailnet
-  address. The Redis proxy and object storage are forwarded from the Manager
+  address, so its per-address enrollment limits count each Mac once, at its
+  IPv4 tailnet address, whichever of its addresses it connected from. The Redis proxy and object storage are forwarded from the Manager
   container, as is everything through a subnet route, so they see all remote
   clients as that one address. The Redis proxy's AUTH lockout is per address
   and principal, and each Mac has its own principal, so one Mac's wrong secret

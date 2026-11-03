@@ -28,7 +28,8 @@
 #     direct path from outside the LAN.
 #   - an ACL policy (/data/headscale/policy.hujson, regenerated each start):
 #     tag:jm-mac and tag:jm-farm nodes may reach those ports on tag:jm-nas,
-#     and in subnet exposure the same ports inside the route, only.
+#     and in subnet exposure the same ports inside the route (on
+#     JM_NET_NAS_LAN_ADDR only, when set to the NAS's LAN address), only.
 #
 # CHANGELOG.md (JuiceMount Link) says how the exposure default is chosen and
 # how to switch. To relay through your own DERP servers instead of
@@ -43,6 +44,7 @@ services:
       JM_NET_NAS_UDP_PORT: "${JM_NET_NAS_UDP_PORT:-41641}"
       JM_NET_NAS_EXPOSURE: "${JM_NET_NAS_EXPOSURE:-}"
       JM_NET_NAS_ROUTE: "${JM_NET_NAS_ROUTE:-}"
+      JM_NET_NAS_LAN_ADDR: "${JM_NET_NAS_LAN_ADDR:-}"
       JM_NET_TLS_CERT: "${JM_NET_TLS_CERT:-}"
       JM_NET_TLS_KEY: "${JM_NET_TLS_KEY:-}"
     ports:

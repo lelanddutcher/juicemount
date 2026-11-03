@@ -53,6 +53,13 @@ func (c *componentStatus) set(state, detail string) {
 	}
 }
 
+// setNodeKey records the component's node key (the NAS node's identity).
+func (c *componentStatus) setNodeKey(key string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.st.NodeKey = key
+}
+
 func (c *componentStatus) fail(err error, retryAt time.Time) {
 	c.mu.Lock()
 	defer c.mu.Unlock()

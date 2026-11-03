@@ -112,7 +112,7 @@ func TestLinkStatusServiceRouteNeedsTaggedOnlineNode(t *testing.T) {
 	t.Cleanup(func() { embeddedHeadscaleHealthAddr = oldAddr })
 	t.Cleanup(func() { SetLinkRuntimeStatus(nil) })
 	SetLinkRuntimeStatus(func() LinkRuntimeStatus {
-		return LinkRuntimeStatus{Headscale: &LinkComponentStatus{State: "running"}, NASNode: &LinkComponentStatus{State: "running"}}
+		return LinkRuntimeStatus{Headscale: &LinkComponentStatus{State: "running"}, NASNode: &LinkComponentStatus{State: "running", NodeKey: nodeKeyNAS}}
 	})
 
 	for _, policy := range []string{"", "off"} {
@@ -126,21 +126,31 @@ func TestLinkStatusServiceRouteNeedsTaggedOnlineNode(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		nodes(`[{"id": 1, "name": "juicemount-nas", "given_name": "juicemount-nas", "online": true}]`)
+		nodes(`[{"id": 1, "node_key": "` + nodeKeyNAS + `", "name": "juicemount-nas", "given_name": "juicemount-nas", "online": true}]`)
 		if got := linkStatusFor(t); got.Exposure != LinkExposureServices || got.RouteReady || !strings.Contains(got.Error, "not tagged tag:jm-nas") {
 			t.Fatalf("policy %q, untagged NAS node: status = %+v", policy, got)
 		}
-		nodes(`[{"id": 1, "name": "juicemount-nas", "given_name": "juicemount-nas", "tags": ["tag:jm-nas"], "online": false}]`)
+		nodes(`[{"id": 1, "node_key": "` + nodeKeyNAS + `", "name": "juicemount-nas", "given_name": "juicemount-nas", "tags": ["tag:jm-nas"], "online": false}]`)
 		if got := linkStatusFor(t); got.RouteReady || !strings.Contains(got.Error, "offline") {
 			t.Fatalf("policy %q, offline NAS node: status = %+v", policy, got)
 		}
-		nodes(`[]`)
+		// Registered under the NAS node's name, but not holding its key.
+		nodes(`[{"id": 1, "node_key": "` + nodeKeyMac + `", "name": "juicemount-nas", "given_name": "juicemount-nas", "tags": ["tag:jm-nas"], "online": true}]`)
 		if got := linkStatusFor(t); got.RouteReady || !strings.Contains(got.Error, "not registered") {
 			t.Fatalf("policy %q, unregistered NAS node: status = %+v", policy, got)
 		}
-		nodes(`[{"id": 1, "name": "juicemount-nas", "given_name": "juicemount-nas", "tags": ["tag:jm-nas"], "online": true}]`)
+		nas := `{"id": 2, "node_key": "` + nodeKeyNAS + `", "name": "juicemount-nas", "given_name": "juicemount-nas-1", "tags": ["tag:jm-nas"], "online": true}`
+		nodes(`[` + nas + `]`)
 		if got := linkStatusFor(t); !got.RouteReady || !got.ControlReady {
 			t.Fatalf("policy %q, tagged online NAS node: status = %+v", policy, got)
+		}
+		// Another node with tag:jm-nas, online or a stale record, could
+		// receive a Mac's traffic: not ready, and the node is named.
+		for _, online := range []string{"true", "false"} {
+			nodes(`[{"id": 1, "node_key": "` + nodeKeyMac + `", "name": "juicemount-nas", "tags": ["tag:jm-mac", "tag:jm-nas"], "online": ` + online + `}, ` + nas + `]`)
+			if got := linkStatusFor(t); got.RouteReady || !strings.Contains(got.Error, `node 1 ("juicemount-nas") carries tag:jm-nas`) {
+				t.Fatalf("policy %q, second tag:jm-nas node (online %s): status = %+v", policy, online, got)
+			}
 		}
 	}
 }
@@ -156,13 +166,17 @@ func TestLinkStatusUpgradeChecksTheSubnetRoute(t *testing.T) {
 	oldAddr := embeddedHeadscaleHealthAddr
 	embeddedHeadscaleHealthAddr = ln.Addr().String()
 	t.Cleanup(func() { embeddedHeadscaleHealthAddr = oldAddr })
+	t.Cleanup(func() { SetLinkRuntimeStatus(nil) })
+	SetLinkRuntimeStatus(func() LinkRuntimeStatus {
+		return LinkRuntimeStatus{Headscale: &LinkComponentStatus{State: "running"}, NASNode: &LinkComponentStatus{State: "running", NodeKey: nodeKeyNAS}}
+	})
 	dir := t.TempDir()
 	setLinkEnv(t, fakeHeadscale(t, dir, "unused"), filepath.Join(dir, "config.yaml"))
 	setExposureEnv(t)
 	if err := os.MkdirAll(filepath.Join(dir, "nas-node"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "nodes.json"), []byte(`[{"id": 1, "name": "juicemount-nas", "given_name": "juicemount-nas"}]`), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "nodes.json"), []byte(`[{"id": 1, "node_key": "`+nodeKeyNAS+`", "name": "juicemount-nas", "given_name": "juicemount-nas"}]`), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	routes := "ID | Hostname | Approved | Available | Serving (Primary)\n1 | juicemount-nas | " + NasLanSubnet + " | " + NasLanSubnet + " | " + NasLanSubnet + "\n"
@@ -171,6 +185,57 @@ func TestLinkStatusUpgradeChecksTheSubnetRoute(t *testing.T) {
 	}
 	if got := linkStatusFor(t); got.Exposure != LinkExposureSubnet || !got.RouteReady {
 		t.Fatalf("upgrade status = %+v", got)
+	}
+}
+
+// TestLinkStatusWithoutEmbeddedNASNode: with an operator's own subnet router
+// the Manager applies no policy (LinkPolicyManaged), so with no route named
+// the route is not checked, as before Link exposure; a named route is ready
+// when some node serves it approved. A misconfigured exposure is reported.
+func TestLinkStatusWithoutEmbeddedNASNode(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	oldAddr := embeddedHeadscaleHealthAddr
+	embeddedHeadscaleHealthAddr = ln.Addr().String()
+	t.Cleanup(func() { embeddedHeadscaleHealthAddr = oldAddr })
+	t.Cleanup(func() { SetLinkRuntimeStatus(nil) })
+	SetLinkRuntimeStatus(func() LinkRuntimeStatus {
+		return LinkRuntimeStatus{Headscale: &LinkComponentStatus{State: "running"}}
+	})
+	dir := t.TempDir()
+	setLinkEnv(t, fakeHeadscale(t, dir, "unused"), filepath.Join(dir, "config.yaml"))
+	setExposureEnv(t)
+	t.Setenv("JM_NET_NAS_NODE", "off")
+	t.Setenv("JM_NET_POLICY", "")
+	if err := os.WriteFile(filepath.Join(dir, "nodes.json"), []byte(`[{"id": 5, "node_key": "`+nodeKeyMac+`", "name": "router"}]`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "routes.txt"), []byte("ID | Hostname | Approved | Available | Serving (Primary)\n5 | router | 192.0.2.0/24 | 192.0.2.0/24 | 192.0.2.0/24\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := linkStatusFor(t); got.PolicyManaged || got.Exposure != "" || !got.RouteReady || !got.ControlReady {
+		t.Fatalf("no NAS node, no route: status = %+v", got)
+	}
+	t.Setenv("JM_NET_NAS_ROUTE", "192.0.2.0/24")
+	if got := linkStatusFor(t); got.PolicyManaged || got.Exposure != LinkExposureSubnet || !got.RouteReady {
+		t.Fatalf("operator router serving the route: status = %+v", got)
+	}
+	t.Setenv("JM_NET_NAS_ROUTE", "198.51.100.0/24")
+	if got := linkStatusFor(t); got.RouteReady || !strings.Contains(got.Error, "not approved and served") {
+		t.Fatalf("operator route unserved: status = %+v", got)
+	}
+	t.Setenv("JM_NET_NAS_ROUTE", "")
+	t.Setenv("JM_NET_NAS_EXPOSURE", "services")
+	if got := linkStatusFor(t); got.RouteReady || !strings.Contains(got.Error, "JM_NET_NAS_NODE=on") {
+		t.Fatalf("service exposure without the NAS node: status = %+v", got)
+	}
+	t.Setenv("JM_NET_NAS_NODE", "on")
+	t.Setenv("JM_NET_NAS_ROUTE", "192.0.2.0/24")
+	if got := linkStatusFor(t); got.RouteReady || !strings.Contains(got.Error, "misconfigured") {
+		t.Fatalf("services with a route: status = %+v", got)
 	}
 }
 
@@ -244,5 +309,85 @@ func TestRemoteFarmEnrollmentFollowsExposure(t *testing.T) {
 				t.Fatalf("farm key argv = %q", argv)
 			}
 		})
+	}
+}
+
+// TestLinkSubnetNASAddr: JM_NET_NAS_LAN_ADDR narrows the policy to the NAS's
+// own address; one outside the route is a misconfigured exposure.
+func TestLinkSubnetNASAddr(t *testing.T) {
+	cfg := setExposureEnv(t)
+	t.Setenv("JM_NET_NAS_EXPOSURE", "subnet")
+	t.Setenv("JM_NET_NAS_ROUTE", "192.0.2.0/24")
+	for raw, want := range map[string]string{"": "", "192.0.2.10": "192.0.2.10/32"} {
+		t.Setenv("JM_NET_NAS_LAN_ADDR", raw)
+		if got, err := LinkSubnetNASAddr("192.0.2.0/24"); err != nil || got != want {
+			t.Fatalf("LinkSubnetNASAddr(%q) = %q, %v; want %q", raw, got, err, want)
+		}
+		if _, _, err := LinkExposure(cfg); err != nil {
+			t.Fatalf("LinkExposure with %q: %v", raw, err)
+		}
+	}
+	t.Setenv("JM_NET_NAS_LAN_ADDR", "192.0.2.10")
+	if got, err := LinkSubnetNASAddr("2001:db8::/64"); err == nil {
+		t.Fatalf("IPv4 address inside an IPv6 route: %q", got)
+	}
+	t.Setenv("JM_NET_NAS_LAN_ADDR", "2001:db8::5")
+	if got, err := LinkSubnetNASAddr("2001:db8::/64"); err != nil || got != "2001:db8::5/128" {
+		t.Fatalf("IPv6 NAS address = %q, %v", got, err)
+	}
+	for _, bad := range []string{"198.51.100.4", "nas.example.com"} {
+		t.Setenv("JM_NET_NAS_LAN_ADDR", bad)
+		if _, _, err := LinkExposure(cfg); err == nil || !strings.Contains(err.Error(), "JM_NET_NAS_LAN_ADDR") {
+			t.Fatalf("LinkExposure with JM_NET_NAS_LAN_ADDR=%s: %v", bad, err)
+		}
+	}
+}
+
+// TestRouteApproveTargetsNASNodeByKey: POST /api/net/routes/approve without
+// parameters approves on the node holding the NAS node's key, never on a
+// node that only took its name, and refuses ?host=.
+func TestRouteApproveTargetsNASNodeByKey(t *testing.T) {
+	t.Cleanup(func() { SetLinkRuntimeStatus(nil) })
+	dir := t.TempDir()
+	bin := fakeHeadscale(t, dir, "node updated")
+	setLinkEnv(t, bin, filepath.Join(dir, "config.yaml"))
+	t.Setenv("JM_NET_NAS_ROUTE", "192.0.2.0/24")
+	write := func(name, body string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("nodes.json", `[{"id": 1, "node_key": "`+nodeKeyMac+`", "name": "juicemount-nas"}, {"id": 2, "node_key": "`+nodeKeyNAS+`", "name": "juicemount-nas"}]`)
+	const header = "ID | Hostname | Approved | Available | Serving (Primary)\n"
+	write("routes.txt", header+"2 | juicemount-nas |  | 192.0.2.0/24 | \n")
+	write("routes-approved.txt", header+"2 | juicemount-nas | 192.0.2.0/24 | 192.0.2.0/24 | 192.0.2.0/24\n")
+	post := func(query string) (int, map[string]any) {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		(&API{}).handleNetRouteApprove(rec, httptest.NewRequest(http.MethodPost, "/api/net/routes/approve"+query, nil))
+		var got map[string]any
+		_ = json.Unmarshal(rec.Body.Bytes(), &got)
+		return rec.Code, got
+	}
+	if code, got := post("?host=juicemount-nas"); code != http.StatusBadRequest || got["ok"] != false {
+		t.Fatalf("?host= = %d %v", code, got)
+	}
+	if _, got := post(""); got["ok"] != false || !strings.Contains(got["error"].(string), "node key") {
+		t.Fatalf("no NAS node runtime: %v", got)
+	}
+	SetLinkRuntimeStatus(func() LinkRuntimeStatus {
+		return LinkRuntimeStatus{NASNode: &LinkComponentStatus{State: "running", NodeKey: nodeKeyNAS}}
+	})
+	if _, got := post(""); got["ok"] != true {
+		t.Fatalf("approve on the NAS node: %v", got)
+	}
+	argv, _ := os.ReadFile(filepath.Join(dir, "argv.log"))
+	if !strings.Contains(string(argv), "approve-routes --identifier 2 --routes 192.0.2.0/24") || strings.Contains(string(argv), "--identifier 1") {
+		t.Fatalf("approve argv = %q, want node 2 only", argv)
+	}
+	write("routes.txt", header+"2 | juicemount-nas |  | 192.0.2.0/24 | \n")
+	if _, got := post("?id=1"); got["ok"] != false {
+		t.Fatalf("?id=1 (not advertising, no row) approved: %v", got)
 	}
 }

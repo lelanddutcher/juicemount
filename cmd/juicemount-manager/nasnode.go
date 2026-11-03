@@ -18,13 +18,15 @@ package main
 //     router hairpin NAT is needed to reach our own control server; in
 //     service exposure, make sure the node carries tag:jm-nas (a node
 //     registered before tagging keeps its identity and is tagged
-//     server-side)
+//     server-side). The control server finds this node by its node key,
+//     never by its name, which any node may also register under.
 //  4. listen on the node's tailnet address for each JuiceMount service
 //     (linkpolicy.go): forward to its compose service, or serve the
 //     Manager's own handler in-process
 //  5. subnet exposure only: also advertise the LAN prefix and approve it
 //     server-side
-//  6. watch the node; if it leaves the tailnet, start over
+//  6. watch the node; if it leaves the tailnet, start over. Log any other
+//     node a Mac could take for this one (manager.LinkNASConflicts).
 //
 // Off unless JM_NET_NAS_NODE=on; never takes the manager down on failure.
 
@@ -54,6 +56,9 @@ const (
 	// (expired or deleted on the control server) before it is restarted with
 	// a fresh key.
 	nasNodeLostGrace = 30 * time.Second
+	// nasNodeConflictEvery is how often a running NAS node looks for other
+	// nodes a Mac could take for it.
+	nasNodeConflictEvery = 30 * time.Second
 )
 
 func nasNodeEnabled() bool { return os.Getenv("JM_NET_NAS_NODE") == "on" }
@@ -115,23 +120,34 @@ type nasNodeConfig struct {
 	// Tags are the tags MintKey's key carries and EnsureTags applies.
 	Tags    []string
 	MintKey func() (string, error)
-	// EnsureTags tags the registered node server-side when its key did not
-	// (an identity from before keys were tagged) and reports whether it did.
-	// nil skips it.
-	EnsureTags func() (bool, error)
-	// ApproveRoute approves Subnet on the control server (subnet exposure
-	// only).
-	ApproveRoute func(prefix string) error
-	Dial         nasTCPDialer
-	UpTimeout    time.Duration
-	HealthEvery  time.Duration
-	Logf         func(string, ...any)
+	// Identity receives the node's own node key once it is up, the
+	// identity every control-server lookup below uses. nil skips it.
+	Identity func(nodeKey string)
+	// EnsureTags tags the registered node (nodeKey) server-side when its
+	// key did not (an identity from before keys were tagged) and reports
+	// whether it did. nil skips it.
+	EnsureTags func(nodeKey string) (bool, error)
+	// ApproveRoute approves Subnet for the node (nodeKey) on the control
+	// server (subnet exposure only).
+	ApproveRoute func(nodeKey, prefix string) error
+	// Conflicts reports other nodes a Mac could take for this one. nil
+	// skips the check.
+	Conflicts   func(nodeKey string) error
+	Dial        nasTCPDialer
+	UpTimeout   time.Duration
+	HealthEvery time.Duration
+	Logf        func(string, ...any)
 }
 
 // nasNodeConfigFromEnv resolves one NAS node start. cfgPath is Headscale's
 // config.yaml; the node's state lives next to it, where manager.LinkExposure
-// looks for it.
+// looks for it. It first records the exposure default, and fails if it
+// cannot: the state directory the node creates would otherwise turn a fresh
+// install's next start into an upgrade.
 func nasNodeConfigFromEnv(cfgPath string, handler http.Handler) (nasNodeConfig, error) {
+	if _, err := manager.RecordLinkExposureDefault(cfgPath); err != nil {
+		return nasNodeConfig{}, err
+	}
 	control, err := nasNodeControlURL()
 	if err != nil {
 		return nasNodeConfig{}, err
@@ -154,8 +170,7 @@ func nasNodeConfigFromEnv(cfgPath string, handler http.Handler) (nasNodeConfig, 
 		}
 	}
 	var tags []string
-	hostname := nasNodeHostname()
-	var ensureTags func() (bool, error)
+	var ensureTags func(string) (bool, error)
 	if exposure == manager.LinkExposureServices {
 		// A Mac finds a NAS node that serves its ports by this tag
 		// (nfs linkNASServicePeer), so it is applied under every policy:
@@ -164,8 +179,8 @@ func nasNodeConfigFromEnv(cfgPath string, handler http.Handler) (nasNodeConfig, 
 		// instead of dialing the node's tailnet address before the route
 		// converges.
 		tags = []string{manager.LinkTagNAS}
-		ensureTags = func() (bool, error) {
-			changed, err := manager.EnsureNodeTags(hsBinary, cfgPath, hostname, tags)
+		ensureTags = func(nodeKey string) (bool, error) {
+			changed, err := manager.EnsureNodeTags(hsBinary, cfgPath, nodeKey, tags)
 			if err != nil {
 				return false, fmt.Errorf("%w (Headscale tags a node registered before tagged keys only when its ACL policy defines the tag: use the Manager's policy instead of JM_NET_POLICY=off, add %q: [] to your own policy's tagOwners, or set JM_NET_NAS_EXPOSURE=subnet)", err, manager.LinkTagNAS)
 			}
@@ -175,7 +190,7 @@ func nasNodeConfigFromEnv(cfgPath string, handler http.Handler) (nasNodeConfig, 
 	dialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
 	return nasNodeConfig{
 		ControlURL: control,
-		Hostname:   hostname,
+		Hostname:   nasNodeHostname(),
 		Dir:        filepath.Join(filepath.Dir(cfgPath), "nas-node"),
 		UDPPort:    udpPort,
 		Services:   services,
@@ -186,8 +201,11 @@ func nasNodeConfigFromEnv(cfgPath string, handler http.Handler) (nasNodeConfig, 
 		MintKey: func() (string, error) {
 			return manager.MintPreauthKey(hsBinary, cfgPath, false, tags)
 		},
-		ApproveRoute: func(prefix string) error {
-			return manager.ApproveSubnetRoutes(hsBinary, cfgPath, hostname, []string{prefix})
+		ApproveRoute: func(nodeKey, prefix string) error {
+			return manager.ApproveSubnetRoutes(hsBinary, cfgPath, nodeKey, []string{prefix})
+		},
+		Conflicts: func(nodeKey string) error {
+			return manager.LinkNASConflicts(hsBinary, cfgPath, nodeKey, subnet)
 		},
 		Dial:        dialer.DialContext,
 		UpTimeout:   nasNodeUpTimeout,
@@ -214,6 +232,7 @@ func newNASNodeSupervisor(cfgPath string, control *headscaleSupervisor, handler 
 		if err != nil {
 			return err
 		}
+		cfg.Identity = sup.status.setNodeKey
 		if !strings.HasPrefix(cfg.ControlURL, "http://127.0.0.1:") {
 			log.Printf("JuiceMount Link: nas node dials control at %s; without hairpin NAT or split DNS for that name it cannot register", cfg.ControlURL)
 		}
@@ -268,8 +287,15 @@ func runNASNode(cfg nasNodeConfig, stop <-chan struct{}, ready func(string)) err
 		}
 		return fmt.Errorf("nas node up via %s: %w", cfg.ControlURL, err)
 	}
+	if st.Self == nil || st.Self.PublicKey.IsZero() {
+		return fmt.Errorf("nas node up via %s: no node key in its status", cfg.ControlURL)
+	}
+	nodeKey := st.Self.PublicKey.String()
+	if cfg.Identity != nil {
+		cfg.Identity(nodeKey)
+	}
 	if cfg.EnsureTags != nil {
-		changed, err := cfg.EnsureTags()
+		changed, err := cfg.EnsureTags(nodeKey)
 		if err != nil {
 			return fmt.Errorf("nas node tags: %w", err)
 		}
@@ -297,7 +323,20 @@ func runNASNode(cfg nasNodeConfig, stop <-chan struct{}, ready func(string)) err
 			// Manager's per-address limits (principal enrollment) apply
 			// per Mac. Forwarded services see every Link client as this
 			// container: see forwardNASTCP.
-			srv := &http.Server{Handler: cfg.Handler, ReadHeaderTimeout: 5 * time.Second}
+			lc, err := s.LocalClient()
+			if err != nil {
+				return fmt.Errorf("nas node local client: %w", err)
+			}
+			srv := &http.Server{Handler: nasPeerAddrHandler(cfg.Handler, func(ctx context.Context, remoteAddr string) ([]netip.Prefix, error) {
+				who, err := lc.WhoIs(ctx, remoteAddr)
+				if err != nil {
+					return nil, err
+				}
+				if who.Node == nil {
+					return nil, fmt.Errorf("no node for %s", remoteAddr)
+				}
+				return who.Node.Addresses, nil
+			}), ReadHeaderTimeout: 5 * time.Second}
 			defer srv.Close()
 			go func() { _ = srv.Serve(ln) }()
 		} else {
@@ -334,10 +373,35 @@ func runNASNode(cfg nasNodeConfig, stop <-chan struct{}, ready func(string)) err
 		deregister := s.RegisterFallbackTCPHandler(nasRouteTCPHandler(prefix, cfg.Dial))
 		defer deregister()
 		if cfg.ApproveRoute != nil {
-			go approveLoop(ctx, cfg.ApproveRoute, prefix.String(), cfg.Hostname)
+			approve := func(prefix string) error { return cfg.ApproveRoute(nodeKey, prefix) }
+			go approveLoop(ctx, approve, prefix.String(), cfg.Hostname)
 		}
 		detail += ", subnet route " + prefix.String()
 	}
+	// Another node a Mac could take for this one is logged here and keeps
+	// GET /api/net/link from calling the route ready. The node keeps
+	// serving: refusing to would let any node that advertises the NAS
+	// prefix take Link down.
+	lastConflict, lastConflictCheck := "", time.Time{}
+	checkConflicts := func() {
+		if cfg.Conflicts == nil {
+			return
+		}
+		lastConflictCheck = time.Now()
+		msg := ""
+		if err := cfg.Conflicts(nodeKey); err != nil {
+			msg = err.Error()
+		}
+		switch {
+		case msg == lastConflict:
+		case msg != "":
+			log.Printf("JuiceMount Link: WARNING %s", msg)
+		default:
+			log.Printf("JuiceMount Link: no other node claims the NAS node's tag or route")
+		}
+		lastConflict = msg
+	}
+	checkConflicts()
 	ready(detail)
 
 	lc, err := s.LocalClient()
@@ -356,6 +420,9 @@ func runNASNode(cfg nasNodeConfig, stop <-chan struct{}, ready func(string)) err
 		case <-stop:
 			return errStopped
 		case <-ticker.C:
+		}
+		if time.Since(lastConflictCheck) >= nasNodeConflictEvery {
+			checkConflicts()
 		}
 		statusCtx, statusCancel := context.WithTimeout(ctx, 5*time.Second)
 		cur, err := lc.StatusWithoutPeers(statusCtx)
@@ -378,6 +445,37 @@ func runNASNode(cfg nasNodeConfig, stop <-chan struct{}, ready func(string)) err
 }
 
 type nasTCPDialer func(context.Context, string, string) (net.Conn, error)
+
+// nasPeerAddrHandler serves h with each request's RemoteAddr set to one
+// address per peer node: its first IPv4 tailnet address (its first address
+// if it has none), whichever of its addresses it connected from. The
+// Manager keys per-address limits (principal enrollment) by RemoteAddr, and
+// a node reaching both of the NAS node's addresses (IPv4 and IPv6) would
+// otherwise be counted as two clients. whois returns the addresses of the
+// node behind a remote address; a peer it cannot name is refused.
+func nasPeerAddrHandler(h http.Handler, whois func(ctx context.Context, remoteAddr string) ([]netip.Prefix, error)) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		addrs, err := whois(r.Context(), r.RemoteAddr)
+		if err != nil || len(addrs) == 0 {
+			http.Error(w, "could not identify the tailnet peer", http.StatusServiceUnavailable)
+			return
+		}
+		pick := addrs[0].Addr()
+		for _, p := range addrs {
+			if p.Addr().Is4() {
+				pick = p.Addr()
+				break
+			}
+		}
+		_, port, err := net.SplitHostPort(r.RemoteAddr)
+		if err != nil {
+			port = "0"
+		}
+		r2 := r.WithContext(r.Context())
+		r2.RemoteAddr = net.JoinHostPort(pick.String(), port)
+		h.ServeHTTP(w, r2)
+	})
+}
 
 // serveNASService forwards every connection accepted on a tailnet listener
 // to target. The listener only exists for the configured JuiceMount ports;

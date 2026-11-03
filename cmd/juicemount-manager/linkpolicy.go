@@ -12,6 +12,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"net"
 	"net/netip"
 	"os"
@@ -77,14 +78,15 @@ func parseNASServices(raw string) ([]nasService, error) {
 // and farm nodes plus untagged nodes of the Link user, which covers Macs
 // paired before keys were tagged. The only destinations are the service
 // ports on tag:jm-nas and, in subnet exposure, the same ports inside that
-// route.
+// route: on nasAddr (the NAS's own LAN address as a host prefix) when it is
+// known, else on every address in it.
 //
 // No tag has an owner. Headscale 0.29 still applies the tags of a key the
 // Manager mints and lets `headscale nodes tag` set a tag the policy defines,
 // but no node may request a tag itself: with jm@ as owner, any untagged
 // Link-user node (a Mac paired before tagged keys) could advertise
 // tag:jm-nas and receive the traffic Macs send to the NAS.
-func linkPolicy(user string, services []nasService, subnet string) ([]byte, error) {
+func linkPolicy(user string, services []nasService, subnet, nasAddr string) ([]byte, error) {
 	if user == "" || len(services) == 0 {
 		return nil, fmt.Errorf("link policy needs a user and at least one service")
 	}
@@ -99,7 +101,15 @@ func linkPolicy(user string, services []nasService, subnet string) ([]byte, erro
 		if err != nil {
 			return nil, fmt.Errorf("bad JM_NET_NAS_ROUTE %q: %w", subnet, err)
 		}
-		dst = append(dst, prefix.Masked().String()+":"+portList)
+		target := prefix.Masked()
+		if nasAddr != "" {
+			addr, err := netip.ParsePrefix(nasAddr)
+			if err != nil || !addr.IsSingleIP() || !prefix.Contains(addr.Addr()) {
+				return nil, fmt.Errorf("NAS address %q is not one address inside %s", nasAddr, prefix)
+			}
+			target = addr
+		}
+		dst = append(dst, target.String()+":"+portList)
 	}
 	owner := []string{} // defined, unowned: JSON [] (not null)
 	type acl struct {
@@ -128,16 +138,25 @@ func linkPolicy(user string, services []nasService, subnet string) ([]byte, erro
 // writeLinkPolicy regenerates the Manager-owned policy file next to
 // Headscale's config.yaml. Unlike config.yaml it is not user-owned: it
 // follows the service map and exposure on every start.
+//
+// A misconfigured exposure stops only the NAS node (nasNodeConfigFromEnv
+// fails with the same error, shown by GET /api/net/link); the control
+// server keeps running with a policy that reaches tag:jm-nas only, which no
+// running node then holds.
 func writeLinkPolicy(cfgPath string) (string, error) {
 	services, err := nasServices()
 	if err != nil {
 		return "", err
 	}
-	_, subnet, err := manager.LinkExposure(cfgPath)
-	if err != nil {
-		return "", err
+	subnet, nasAddr := "", ""
+	if _, s, err := manager.LinkExposure(cfgPath); err != nil {
+		log.Printf("JuiceMount Link: NAS exposure is misconfigured (%v); the ACL policy reaches no subnet route until it is fixed", err)
+	} else if subnet = s; subnet != "" {
+		if nasAddr, err = manager.LinkSubnetNASAddr(subnet); err != nil {
+			return "", err
+		}
 	}
-	body, err := linkPolicy(manager.LinkUserName(), services, subnet)
+	body, err := linkPolicy(manager.LinkUserName(), services, subnet, nasAddr)
 	if err != nil {
 		return "", err
 	}

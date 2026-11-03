@@ -48,7 +48,7 @@ type testPolicy struct {
 // node can give itself one.
 func TestLinkPolicyAllowsOnlyServicePorts(t *testing.T) {
 	services, _ := parseNASServices(defaultNASServices)
-	raw, err := linkPolicy("jm", services, "")
+	raw, err := linkPolicy("jm", services, "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -74,7 +74,7 @@ func TestLinkPolicyAllowsOnlyServicePorts(t *testing.T) {
 		t.Fatalf("policy contains a wildcard:\n%s", raw)
 	}
 
-	raw, err = linkPolicy("jm", services, "192.0.2.7/24")
+	raw, err = linkPolicy("jm", services, "192.0.2.7/24", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -84,8 +84,24 @@ func TestLinkPolicyAllowsOnlyServicePorts(t *testing.T) {
 	if want := []string{"tag:jm-nas:30151,30179,30190", "192.0.2.0/24:30151,30179,30190"}; !reflect.DeepEqual(p.ACLs[0].Dst, want) {
 		t.Fatalf("subnet dst = %v, want %v", p.ACLs[0].Dst, want)
 	}
-	if _, err := linkPolicy("jm", services, "not-a-prefix"); err == nil {
+	if _, err := linkPolicy("jm", services, "not-a-prefix", ""); err == nil {
 		t.Fatal("bad subnet accepted")
+	}
+	// The NAS's own address, when known, replaces the route as destination.
+	raw, err = linkPolicy("jm", services, "192.0.2.7/24", "192.0.2.10/32")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(raw, &p); err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"tag:jm-nas:30151,30179,30190", "192.0.2.10/32:30151,30179,30190"}; !reflect.DeepEqual(p.ACLs[0].Dst, want) {
+		t.Fatalf("subnet dst with the NAS address = %v, want %v", p.ACLs[0].Dst, want)
+	}
+	for _, bad := range []string{"198.51.100.1/32", "192.0.2.0/25", "nas"} {
+		if _, err := linkPolicy("jm", services, "192.0.2.0/24", bad); err == nil {
+			t.Fatalf("NAS address %q accepted", bad)
+		}
 	}
 }
 

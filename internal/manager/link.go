@@ -14,9 +14,11 @@ package manager
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"os/exec"
@@ -63,6 +65,10 @@ type LinkComponentStatus struct {
 	Restarts  int       `json:"restarts"`
 	Since     time.Time `json:"since"`
 	NextRetry time.Time `json:"next_retry,omitempty"`
+	// NodeKey is the NAS node's own node key (nodekey:...), reported once
+	// the node is up. The control server lists it as node_key; it is how
+	// the Manager finds the NAS node, whose name any node could also take.
+	NodeKey string `json:"node_key,omitempty"`
 }
 
 // LinkRuntimeStatus is the supervisors' snapshot. A nil component means
@@ -165,7 +171,33 @@ func LinkExposure(cfgPath string) (mode, subnet string, err error) {
 	if route == "" {
 		route = NasLanSubnet
 	}
+	if _, err := LinkSubnetNASAddr(route); err != nil {
+		return "", "", err
+	}
 	return LinkExposureSubnet, route, nil
+}
+
+// LinkSubnetNASAddr returns JM_NET_NAS_LAN_ADDR, the NAS's own address
+// inside the subnet route, as a host prefix (a /32 or /128), or "" when it is
+// unset. The Manager's policy then lets Link clients reach the JuiceMount
+// ports on that address only, instead of on every host in the route.
+func LinkSubnetNASAddr(subnet string) (string, error) {
+	raw := strings.TrimSpace(os.Getenv("JM_NET_NAS_LAN_ADDR"))
+	if raw == "" {
+		return "", nil
+	}
+	addr, err := netip.ParseAddr(raw)
+	if err != nil {
+		return "", fmt.Errorf("JM_NET_NAS_LAN_ADDR %q is not an IP address", raw)
+	}
+	prefix, err := netip.ParsePrefix(subnet)
+	if err != nil {
+		return "", fmt.Errorf("bad JM_NET_NAS_ROUTE %q: %w", subnet, err)
+	}
+	if !prefix.Contains(addr) {
+		return "", fmt.Errorf("JM_NET_NAS_LAN_ADDR %s is outside the NAS route %s", addr, prefix)
+	}
+	return netip.PrefixFrom(addr, addr.BitLen()).String(), nil
 }
 
 func linkExposureDefault(dir string) string {
@@ -182,10 +214,10 @@ func linkExposureDefault(dir string) string {
 }
 
 // RecordLinkExposureDefault records the default exposure next to cfgPath,
-// unless one is recorded already, and returns it. The Manager calls it
-// before the NAS node first runs: without the record, the state directory a
-// fresh install's node creates would make its next start look like an
-// upgrade.
+// unless one is recorded already, and returns it. The NAS node must not
+// start until it succeeds: without the record, the state directory a fresh
+// install's node creates would make its next start look like an upgrade.
+// The record is synced, with its directory, before it counts.
 func RecordLinkExposureDefault(cfgPath string) (string, error) {
 	dir := filepath.Dir(cfgPath)
 	mode := linkExposureDefault(dir)
@@ -197,10 +229,40 @@ func RecordLinkExposureDefault(cfgPath string) (string, error) {
 		return "", err
 	}
 	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, []byte(mode+"\n"), 0o600); err != nil {
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
 		return "", err
 	}
-	return mode, os.Rename(tmp, path)
+	_, err = f.WriteString(mode + "\n")
+	if err == nil {
+		err = f.Sync()
+	}
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err == nil {
+		err = os.Rename(tmp, path)
+	}
+	if err == nil {
+		err = syncDir(dir)
+	}
+	if err != nil {
+		_ = os.Remove(tmp)
+		return "", fmt.Errorf("record Link NAS exposure default in %s: %w", path, err)
+	}
+	return mode, nil
+}
+
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	err = d.Sync()
+	if cerr := d.Close(); err == nil {
+		err = cerr
+	}
+	return err
 }
 
 // embeddedHeadscaleHealthAddr is a var only so tests can point it at their own
@@ -263,41 +325,46 @@ func (a *API) handleLinkStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	exposure, subnet, exposureErr := LinkExposure(headscaleConfig())
 	status.Exposure = exposure
-	nasHost := envString("JM_NET_NAS_HOSTNAME", DefaultNasHostname)
-	switch {
-	case exposureErr != nil:
+	routeErr := func(err error) {
 		status.RouteReady = false
-		if status.Error == "" {
-			status.Error = "Link NAS exposure is misconfigured: " + exposureErr.Error()
-		}
-	case exposure == LinkExposureSubnet:
-		ready, err := linkRouteReady(headscaleBin(), headscaleConfig(), nasHost, subnet)
-		status.RouteReady = ready
 		if err != nil && status.Error == "" {
 			status.Error = err.Error()
 		}
-	case exposure == LinkExposureServices:
-		// The NAS node is the route. A Mac finds it only by tag:jm-nas, so
-		// it is ready once the node runs its service listeners and the
-		// control server lists it online with that tag.
-		switch {
-		case !haveRuntime || status.NASNode == nil:
-			status.RouteReady = false
-			if status.Error == "" {
-				status.Error = "Link NAS node status is unavailable in this process"
-			}
-		case status.NASNode.State != "running":
-			status.RouteReady = false
-			if status.Error == "" {
-				status.Error = "Link NAS node is " + status.NASNode.State + componentErrorSuffix(status.NASNode)
-			}
-		default:
-			if err := linkNASServing(headscaleBin(), headscaleConfig(), nasHost); err != nil {
-				status.RouteReady = false
-				if status.Error == "" {
-					status.Error = err.Error()
-				}
-			}
+	}
+	switch {
+	case exposureErr != nil:
+		routeErr(fmt.Errorf("Link NAS exposure is misconfigured: %w", exposureErr))
+	case exposure == "":
+		// No embedded NAS node and no route named: whatever carries the NAS
+		// is the operator's own, and the Manager neither checks it nor
+		// applies a policy to it (LinkPolicyManaged), as before Link
+		// exposure existed.
+	case !NASNodeEmbedded() && exposure == LinkExposureServices:
+		routeErr(errors.New("Link service exposure is served by the embedded NAS node: set JM_NET_NAS_NODE=on"))
+	case !NASNodeEmbedded():
+		// The operator's own subnet router carries JM_NET_NAS_ROUTE. The
+		// Manager approves nothing for it, so the route is ready when the
+		// control server serves the approved prefix from any node.
+		if ready, err := linkRouteReady(headscaleBin(), headscaleConfig(), "", subnet); !ready {
+			routeErr(err)
+		}
+	case !haveRuntime || status.NASNode == nil:
+		routeErr(errors.New("Link NAS node status is unavailable in this process"))
+	case status.NASNode.State != "running":
+		routeErr(errors.New("Link NAS node is " + status.NASNode.State + componentErrorSuffix(status.NASNode)))
+	case status.NASNode.NodeKey == "":
+		routeErr(errors.New("Link NAS node has not reported its node key"))
+	case exposure == LinkExposureSubnet:
+		if ready, err := linkRouteReady(headscaleBin(), headscaleConfig(), status.NASNode.NodeKey, subnet); !ready {
+			routeErr(err)
+		}
+	default:
+		// Service exposure: the NAS node is the route. A Mac finds it only
+		// by tag:jm-nas, so it is ready once the node runs its service
+		// listeners and the control server lists it online with that tag
+		// (and no other node with it).
+		if err := linkNASServing(headscaleBin(), headscaleConfig(), status.NASNode.NodeKey); err != nil {
+			routeErr(err)
 		}
 	}
 	status.RedisReady = probeLinkRedis(a.linkMetaURL)
@@ -378,7 +445,10 @@ func linkConfigured() bool {
 // finds it. A tag is control-assigned identity. Headscale 0.29 applies a
 // tagged key's tags under any policy, and the generated policy lists no tag
 // owners, so no node can give itself a tag (tailscale --advertise-tags);
-// only keys and `headscale nodes tag` assign them.
+// only keys and `headscale nodes tag` assign them. The Manager tags only
+// the node holding its NAS node's key (EnsureNodeTags). An operator's own
+// policy may still let a node claim tag:jm-nas, so status reports any other
+// node that carries it (linkNASConflicts).
 const (
 	LinkTagMac  = "tag:jm-mac"
 	LinkTagNAS  = "tag:jm-nas"
@@ -391,12 +461,15 @@ const (
 func LinkUserName() string { return envString("JM_HEADSCALE_USER", "jm") }
 
 // LinkPolicyManaged reports whether the Manager generates and applies the
-// Headscale ACL policy: only for the embedded control server, unless the
-// operator opted out (JM_NET_POLICY=off) or the persisted config.yaml names
-// its own policy. An external Headscale's policy belongs to its operator, so
-// keys for it stay untagged as before.
+// Headscale ACL policy: only for the embedded control server with the
+// embedded NAS node, unless the operator opted out (JM_NET_POLICY=off) or
+// the persisted config.yaml names its own policy. An external Headscale's
+// policy belongs to its operator, so keys for it stay untagged as before.
+// Without the embedded NAS node the NAS is reached through a router the
+// Manager does not run, whose services the policy cannot know, so the
+// control server keeps allowing all traffic, as it did before the policy.
 func LinkPolicyManaged(cfgPath string) bool {
-	if os.Getenv("JM_NET_HEADSCALE") != "on" || os.Getenv("JM_NET_POLICY") == "off" {
+	if !NASNodeEmbedded() || os.Getenv("JM_NET_POLICY") == "off" {
 		return false
 	}
 	raw, err := os.ReadFile(cfgPath)
@@ -662,6 +735,8 @@ const DefaultNasHostname = "juicemount-nas"
 // package consumes.
 type HSNode struct {
 	ID              uint64   `json:"id"`
+	NodeKey         string   `json:"node_key"`
+	IPAddresses     []string `json:"ip_addresses"`
 	Name            string   `json:"name"`
 	GivenName       string   `json:"given_name"`
 	AvailableRoutes []string `json:"available_routes"`
@@ -670,76 +745,212 @@ type HSNode struct {
 	Online          bool     `json:"online"`
 }
 
-// linkNASServing checks the control server's view of a service-exposure NAS
-// node: registered, online, and tagged tag:jm-nas, the tag a Mac looks for.
-func linkNASServing(bin, config, host string) error {
-	n, err := hsNodeByHost(bin, config, host)
+// The NAS node is found by its node key: the WireGuard public key the
+// embedded tsnet node holds, reported by runNASNode once it is up and listed
+// by the control server as node_key. A node's name is its own choice (a
+// paired Mac, or anyone holding a pairing code, may register as
+// juicemount-nas), so a name never selects the node the Manager tags,
+// approves routes for, or reports on.
+
+func listHSNodes(bin, config string) ([]HSNode, error) {
+	out, err := exec.Command(bin, "--config", config, "nodes", "list", "-o", "json").Output()
 	if err != nil {
-		return fmt.Errorf("Link NAS node: %w", err)
+		return nil, fmt.Errorf("nodes list: %v", err)
 	}
-	if !containsRoute(n.Tags, LinkTagNAS) {
-		return fmt.Errorf("Link NAS node %q is not tagged %s, so Macs cannot find it", host, LinkTagNAS)
+	return parseHSNodes(out)
+}
+
+// nodeByKey finds the node holding nodeKey.
+func nodeByKey(nodes []HSNode, nodeKey string) *HSNode {
+	if nodeKey == "" {
+		return nil
 	}
-	if !n.Online {
-		return fmt.Errorf("Link NAS node %q is offline on the control server", host)
+	for i := range nodes {
+		if nodes[i].NodeKey == nodeKey {
+			return &nodes[i]
+		}
 	}
 	return nil
 }
 
-// EnsureNodeTags makes the node registered as host carry every tag in want,
+func nodeByID(nodes []HSNode, id uint64) *HSNode {
+	for i := range nodes {
+		if nodes[i].ID == id {
+			return &nodes[i]
+		}
+	}
+	return nil
+}
+
+// linkNASServing checks the control server's view of a service-exposure NAS
+// node (nodeKey): registered, online, tagged tag:jm-nas (the tag a Mac looks
+// for), and the only node a Mac could take for it.
+func linkNASServing(bin, config, nodeKey string) error {
+	nodes, err := listHSNodes(bin, config)
+	if err != nil {
+		return fmt.Errorf("Link NAS node: %w", err)
+	}
+	n := nodeByKey(nodes, nodeKey)
+	if n == nil {
+		return fmt.Errorf("Link NAS node %s is not registered on the control server", nodeKey)
+	}
+	if !containsRoute(n.Tags, LinkTagNAS) {
+		return fmt.Errorf("Link NAS node %d is not tagged %s, so Macs cannot find it", n.ID, LinkTagNAS)
+	}
+	if !n.Online {
+		return fmt.Errorf("Link NAS node %d is offline on the control server", n.ID)
+	}
+	return linkNASConflicts(nodes, nil, n.ID, "")
+}
+
+// LinkNASConflicts reports any node other than the NAS node (nodeKey) that a
+// Mac could take for it (linkNASConflicts). subnet is the subnet exposure's
+// prefix, or "" for service exposure.
+func LinkNASConflicts(bin, config, nodeKey, subnet string) error {
+	nodes, err := listHSNodes(bin, config)
+	if err != nil {
+		return err
+	}
+	n := nodeByKey(nodes, nodeKey)
+	if n == nil {
+		return fmt.Errorf("Link NAS node %s is not registered on the control server", nodeKey)
+	}
+	var rows map[uint64]routeRow
+	if subnet != "" {
+		if rows, err = allRouteRows(bin, config); err != nil {
+			return err
+		}
+	}
+	return linkNASConflicts(nodes, rows, n.ID, subnet)
+}
+
+// linkNASConflicts names the nodes other than the NAS node (nasID) that a
+// Mac could take for it: any that carries tag:jm-nas, which a Mac without a
+// route to the NAS dials (nfs linkNASServicePeer), and, with a subnet, any
+// that advertises or holds a route overlapping it (a default route aside).
+// rows, from `nodes list-routes`, adds to the routes nodes lists.
+//
+// The Manager never tags such a node or approves its route, but an
+// operator's own policy may let a node claim the tag, and a stale record of
+// an earlier NAS identity keeps it. Status refuses to call the route ready
+// and names each node; it does not delete or expire it. Headscale 0.29
+// cannot remove a tagged node's last tag, expiring logs a node out but
+// leaves its record and tag in place, and deleting is irreversible: the
+// operator, who knows whether it is a device of theirs, removes it.
+func linkNASConflicts(nodes []HSNode, rows map[uint64]routeRow, nasID uint64, subnet string) error {
+	var nasPrefix netip.Prefix
+	if subnet != "" {
+		p, err := netip.ParsePrefix(subnet)
+		if err != nil {
+			return fmt.Errorf("bad NAS route %q: %w", subnet, err)
+		}
+		nasPrefix = p.Masked()
+	}
+	var found []string
+	for i := range nodes {
+		n := &nodes[i]
+		if n.ID == nasID {
+			continue
+		}
+		var why []string
+		if containsRoute(n.Tags, LinkTagNAS) {
+			why = append(why, "carries "+LinkTagNAS)
+		}
+		if nasPrefix.IsValid() {
+			row := rows[n.ID]
+			for _, list := range [][]string{n.AvailableRoutes, n.ApprovedRoutes, row.available, row.approved} {
+				if r := overlappingRoute(list, nasPrefix); r != "" {
+					why = append(why, "advertises "+r)
+					break
+				}
+			}
+		}
+		if len(why) > 0 {
+			found = append(found, fmt.Sprintf("node %d (%q) %s", n.ID, n.Name, strings.Join(why, " and ")))
+		}
+	}
+	if len(found) == 0 {
+		return nil
+	}
+	return fmt.Errorf("Link NAS node %d is not the only node Macs could take for the NAS: %s. Remove each one that is not yours with `headscale nodes delete --identifier <id>`", nasID, strings.Join(found, "; "))
+}
+
+// overlappingRoute returns the first route in routes that overlaps want,
+// ignoring default (exit) routes, which a Link node never uses.
+func overlappingRoute(routes []string, want netip.Prefix) string {
+	for _, raw := range routes {
+		p, err := netip.ParsePrefix(raw)
+		if err == nil && p.Bits() > 0 && p.Overlaps(want) {
+			return raw
+		}
+	}
+	return ""
+}
+
+// EnsureNodeTags makes the node holding nodeKey carry every tag in want,
 // keeping tags it already has, and reports whether it changed them. A node
 // that registered before JuiceMount tagged its keys keeps its identity (and
 // tailnet address) this way instead of being re-enrolled.
-func EnsureNodeTags(bin, config, host string, want []string) (bool, error) {
-	node, err := hsNodeByHost(bin, config, host)
+func EnsureNodeTags(bin, config, nodeKey string, want []string) (bool, error) {
+	nodes, err := listHSNodes(bin, config)
 	if err != nil {
 		return false, err
+	}
+	node := nodeByKey(nodes, nodeKey)
+	if node == nil {
+		return false, fmt.Errorf("node %s not registered yet", nodeKey)
 	}
 	merged := mergeApproved(node.Tags, want)
 	if len(merged) == len(node.Tags) {
 		return false, nil
 	}
+	id := node.ID
 	out, err := exec.Command(bin, "--config", config, "nodes", "tag",
-		"--identifier", strconv.FormatUint(node.ID, 10),
+		"--identifier", strconv.FormatUint(id, 10),
 		"--tags", strings.Join(merged, ",")).CombinedOutput()
 	if err != nil {
 		return false, fmt.Errorf("nodes tag: %v: %s", err, strings.TrimSpace(string(out)))
 	}
-	node, err = hsNodeByHost(bin, config, host)
-	if err != nil {
+	if nodes, err = listHSNodes(bin, config); err != nil {
 		return false, err
+	}
+	node = nodeByID(nodes, id)
+	if node == nil || node.NodeKey != nodeKey {
+		return false, fmt.Errorf("node %d changed while it was tagged", id)
 	}
 	for _, tag := range want {
 		if !containsRoute(node.Tags, tag) {
-			return false, fmt.Errorf("node %q is still missing tag %s after tagging", host, tag)
+			return false, fmt.Errorf("node %d is still missing tag %s after tagging", id, tag)
 		}
 	}
 	return true, nil
 }
 
-func hsNodeByHost(bin, config, host string) (*HSNode, error) {
-	out, err := exec.Command(bin, "--config", config, "nodes", "list", "-o", "json").Output()
-	if err != nil {
-		return nil, fmt.Errorf("nodes list: %v", err)
-	}
-	nodes, err := parseHSNodes(out)
-	if err != nil {
-		return nil, err
-	}
-	n := nodeForHost(nodes, host)
-	if n == nil {
-		return nil, fmt.Errorf("node %q not registered yet", host)
-	}
-	return n, nil
-}
-
 var ansiEscape = regexp.MustCompile(`\x1b\[[0-9;]*m`)
+
+// routeRow is one node's row of `nodes list-routes`.
+type routeRow struct {
+	approved, available, serving []string
+}
 
 // parseRouteTable reads the stable human table emitted by `nodes list-routes`.
 // Headscale 0.29's general node JSON includes available_routes but omits the
 // approved/serving route state, so that JSON cannot prove approval. The
 // dedicated table is the CLI's authoritative approval surface.
 func parseRouteTable(data []byte, nodeID uint64) (approved, available, serving []string, err error) {
+	rows, err := parseRouteRows(data)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	row, ok := rows[nodeID]
+	if !ok {
+		return nil, nil, nil, fmt.Errorf("parse route table: node %d not found", nodeID)
+	}
+	return row.approved, row.available, row.serving, nil
+}
+
+// parseRouteRows reads every node's row of the `nodes list-routes` table.
+func parseRouteRows(data []byte) (map[uint64]routeRow, error) {
 	lines := strings.Split(ansiEscape.ReplaceAllString(string(data), ""), "\n")
 	approvedCol, availableCol, servingCol, idCol := -1, -1, -1, -1
 	headerLine := -1
@@ -766,20 +977,28 @@ func parseRouteTable(data []byte, nodeID uint64) (approved, available, serving [
 		}
 	}
 	if headerLine < 0 {
-		return nil, nil, nil, fmt.Errorf("parse route table: required columns not found")
+		return nil, fmt.Errorf("parse route table: required columns not found")
 	}
-	wantID := strconv.FormatUint(nodeID, 10)
+	rows := map[uint64]routeRow{}
 	for _, line := range lines[headerLine+1:] {
 		if !strings.Contains(line, "|") {
 			continue
 		}
 		cols := strings.Split(line, "|")
-		if idCol >= len(cols) || approvedCol >= len(cols) || availableCol >= len(cols) || servingCol >= len(cols) || strings.TrimSpace(cols[idCol]) != wantID {
+		if idCol >= len(cols) || approvedCol >= len(cols) || availableCol >= len(cols) || servingCol >= len(cols) {
 			continue
 		}
-		return splitRouteList(cols[approvedCol]), splitRouteList(cols[availableCol]), splitRouteList(cols[servingCol]), nil
+		id, err := strconv.ParseUint(strings.TrimSpace(cols[idCol]), 10, 64)
+		if err != nil {
+			continue
+		}
+		rows[id] = routeRow{
+			approved:  splitRouteList(cols[approvedCol]),
+			available: splitRouteList(cols[availableCol]),
+			serving:   splitRouteList(cols[servingCol]),
+		}
 	}
-	return nil, nil, nil, fmt.Errorf("parse route table: node %d not found", nodeID)
+	return rows, nil
 }
 
 func splitRouteList(cell string) []string {
@@ -802,31 +1021,54 @@ func routeTableForNode(bin, config string, nodeID uint64) (approved, available, 
 	return parseRouteTable(out, nodeID)
 }
 
-func linkRouteReady(bin, config, host, prefix string) (bool, error) {
-	out, err := exec.Command(bin, "--config", config, "nodes", "list", "-o", "json").CombinedOutput()
+func allRouteRows(bin, config string) (map[uint64]routeRow, error) {
+	out, err := exec.Command(bin, "--config", config, "nodes", "list-routes").CombinedOutput()
 	if err != nil {
-		return false, fmt.Errorf("Link route check failed: %v: %s", err, strings.TrimSpace(string(out)))
+		return nil, fmt.Errorf("nodes list-routes: %v: %s", err, strings.TrimSpace(string(out)))
 	}
-	nodes, err := parseHSNodes(out)
+	return parseRouteRows(out)
+}
+
+// linkRouteReady reports whether the NAS node (nodeKey) serves prefix as an
+// approved route and no other node could be taken for it. With nodeKey ""
+// (no embedded NAS node: the operator runs the subnet router) it reports
+// whether any node serves the approved prefix.
+func linkRouteReady(bin, config, nodeKey, prefix string) (bool, error) {
+	nodes, err := listHSNodes(bin, config)
 	if err != nil {
-		return false, err
+		return false, fmt.Errorf("Link route check failed: %w", err)
 	}
-	n := nodeForHost(nodes, host)
+	rows, err := allRouteRows(bin, config)
+	if err != nil {
+		return false, fmt.Errorf("Link route check failed: %w", err)
+	}
+	if nodeKey == "" {
+		for _, row := range rows {
+			if containsRoute(row.approved, prefix) && containsRoute(row.serving, prefix) {
+				return true, nil
+			}
+		}
+		return false, fmt.Errorf("Link NAS route %s is not approved and served by any node", prefix)
+	}
+	n := nodeByKey(nodes, nodeKey)
 	if n == nil {
-		return false, fmt.Errorf("Link NAS node %q is not registered", host)
+		return false, fmt.Errorf("Link NAS node %s is not registered", nodeKey)
 	}
-	approved, available, serving, err := routeTableForNode(bin, config, n.ID)
-	if err != nil {
-		return false, err
+	row, ok := rows[n.ID]
+	if !ok {
+		return false, fmt.Errorf("Link NAS node %d has no row in the route table", n.ID)
 	}
-	if !containsRoute(available, prefix) {
-		return false, fmt.Errorf("Link NAS node %q is not advertising %s", host, prefix)
+	if !containsRoute(row.available, prefix) {
+		return false, fmt.Errorf("Link NAS node %d is not advertising %s", n.ID, prefix)
 	}
-	if !containsRoute(approved, prefix) {
+	if !containsRoute(row.approved, prefix) {
 		return false, fmt.Errorf("Link NAS route %s is advertised but not approved", prefix)
 	}
-	if !containsRoute(serving, prefix) {
+	if !containsRoute(row.serving, prefix) {
 		return false, fmt.Errorf("Link NAS route %s is approved but the NAS node is not serving it", prefix)
+	}
+	if err := linkNASConflicts(nodes, rows, n.ID, prefix); err != nil {
+		return false, err
 	}
 	return true, nil
 }
@@ -839,20 +1081,6 @@ func parseHSNodes(data []byte) ([]HSNode, error) {
 		return nil, fmt.Errorf("parse nodes list: %w", err)
 	}
 	return nodes, nil
-}
-
-// nodeForHost finds the node registered under host (matching given_name or
-// name; headscale's given_name is the deduplicated DNS label form).
-func nodeForHost(nodes []HSNode, host string) *HSNode {
-	if host == "" {
-		return nil
-	}
-	for i := range nodes {
-		if nodes[i].GivenName == host || nodes[i].Name == host || strings.HasPrefix(nodes[i].Name, host+".") {
-			return &nodes[i]
-		}
-	}
-	return nil
 }
 
 // pendingApproval returns the wanted prefixes the node advertises but that
@@ -894,21 +1122,24 @@ func mergeApproved(existing, add []string) []string {
 	return out
 }
 
-// ApproveSubnetRoutes approves prefixes on the node named host. It is
-// idempotent: an already-approved prefix is a no-op. Returns an error when
-// the node has not registered yet (caller retries) or when the CLI fails.
-func ApproveSubnetRoutes(bin, config, host string, prefixes []string) error {
-	out, err := exec.Command(bin, "--config", config, "nodes", "list", "-o", "json").Output()
-	if err != nil {
-		return fmt.Errorf("nodes list: %v: %s", err, strings.TrimSpace(string(out)))
-	}
-	nodes, err := parseHSNodes(out)
+// ApproveSubnetRoutes approves prefixes on the node holding nodeKey (the
+// NAS node). It is idempotent: an already-approved prefix is a no-op.
+// Returns an error when the node has not registered yet (caller retries) or
+// when the CLI fails.
+func ApproveSubnetRoutes(bin, config, nodeKey string, prefixes []string) error {
+	return approveSubnetRoutes(bin, config, func(nodes []HSNode) *HSNode { return nodeByKey(nodes, nodeKey) }, "node "+nodeKey, prefixes)
+}
+
+// approveSubnetRoutes approves prefixes on the node pick selects; label
+// names it in errors.
+func approveSubnetRoutes(bin, config string, pick func([]HSNode) *HSNode, label string, prefixes []string) error {
+	nodes, err := listHSNodes(bin, config)
 	if err != nil {
 		return err
 	}
-	n := nodeForHost(nodes, host)
+	n := pick(nodes)
 	if n == nil {
-		return fmt.Errorf("node %q not registered yet", host)
+		return fmt.Errorf("%s not registered yet", label)
 	}
 	approved, available, _, err := routeTableForNode(bin, config, n.ID)
 	if err != nil {
@@ -921,7 +1152,7 @@ func ApproveSubnetRoutes(bin, config, host string, prefixes []string) error {
 	if len(pending) == 0 {
 		for _, prefix := range prefixes {
 			if prefix != "" && !containsRoute(available, prefix) && !containsRoute(approved, prefix) {
-				return fmt.Errorf("node %q is not advertising route %s", host, prefix)
+				return fmt.Errorf("node %d is not advertising route %s", n.ID, prefix)
 			}
 		}
 		return nil
@@ -940,7 +1171,7 @@ func ApproveSubnetRoutes(bin, config, host string, prefixes []string) error {
 	}
 	for _, route := range merged {
 		if !containsRoute(verified, route) {
-			return fmt.Errorf("route approval did not persist for node %q: %s is still absent", host, route)
+			return fmt.Errorf("route approval did not persist for node %d: %s is still absent", n.ID, route)
 		}
 	}
 	return nil
@@ -957,11 +1188,14 @@ func containsRoute(routes []string, want string) bool {
 
 // handleNetRouteApprove approves the NAS LAN subnet route on demand:
 //
-//	POST /api/net/routes/approve[?host=juicemount-nas&prefix=192.168.0.0/24]
+//	POST /api/net/routes/approve[?id=<node id>&prefix=192.168.0.0/24]
 //
-// Defaults target the embedded NAS node and JM_NET_NAS_ROUTE (falling back
-// to the home-LAN default). GET returns the raw route listing instead, so
-// operators can see advertisement/approval state from the UI later.
+// Defaults target the embedded NAS node, by its node key, and
+// JM_NET_NAS_ROUTE (falling back to the home-LAN default). ?id= names
+// another node by its control-server ID (GET /api/net/nodes); a node's
+// hostname is its own choice, so ?host= is refused. GET returns the raw
+// route listing instead, so operators can see advertisement/approval state
+// from the UI later.
 func (a *API) handleNetRouteApprove(w http.ResponseWriter, r *http.Request) {
 	bin, config := headscaleBin(), headscaleConfig()
 	switch r.Method {
@@ -974,19 +1208,35 @@ func (a *API) handleNetRouteApprove(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write(out)
 	case http.MethodPost:
-		host := r.URL.Query().Get("host")
-		if host == "" {
-			host = os.Getenv("JM_NET_NAS_HOSTNAME")
-		}
-		if host == "" {
-			host = DefaultNasHostname
-		}
 		prefix := r.URL.Query().Get("prefix")
 		if prefix == "" {
 			prefix = envString("JM_NET_NAS_ROUTE", NasLanSubnet)
 		}
-		err := ApproveSubnetRoutes(bin, config, host, []string{prefix})
-		writeJSON(w, http.StatusOK, map[string]any{"ok": err == nil, "host": host, "prefix": prefix, "error": errString(err)})
+		if r.URL.Query().Get("host") != "" {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "prefix": prefix,
+				"error": "host is not accepted: any node can register under any name; pass ?id=<node id> from GET /api/net/nodes, or nothing for the embedded NAS node"})
+			return
+		}
+		var err error
+		node := ""
+		if raw := r.URL.Query().Get("id"); raw != "" {
+			id, perr := strconv.ParseUint(raw, 10, 64)
+			if perr != nil || id == 0 {
+				writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "prefix": prefix, "error": "id must be a node ID"})
+				return
+			}
+			node = "node " + raw
+			err = approveSubnetRoutes(bin, config, func(nodes []HSNode) *HSNode { return nodeByID(nodes, id) }, node, []string{prefix})
+		} else {
+			runtime, _ := currentLinkRuntime()
+			if runtime.NASNode == nil || runtime.NASNode.NodeKey == "" {
+				err = errors.New("the embedded NAS node has not reported its node key (it is not running in this Manager); pass ?id=<node id>")
+			} else {
+				node = runtime.NASNode.NodeKey
+				err = ApproveSubnetRoutes(bin, config, node, []string{prefix})
+			}
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": err == nil, "node": node, "prefix": prefix, "error": errString(err)})
 	default:
 		http.Error(w, "GET or POST only", http.StatusMethodNotAllowed)
 	}
