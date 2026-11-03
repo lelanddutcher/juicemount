@@ -542,6 +542,12 @@ func TestSyncColdPopulateFastLink(t *testing.T) {
 		jfs, store, fuseRoot := newDirRefreshHarness(t)
 		t.Setenv("JM_SYNC_COLD_POPULATE", "1")
 		forceClass(t, netprofile.ClassFast)
+		// This case checks that a fast link takes the synchronous path, not how
+		// fast the populate runs: the 50 ms production budget is missed under
+		// -race on a loaded host, and the fallback then returns empty.
+		prevTimeout := syncColdPopulateTimeout
+		syncColdPopulateTimeout = 30 * time.Second
+		t.Cleanup(func() { syncColdPopulateTimeout = prevTimeout })
 		mkFUSEDir(t, fuseRoot, "d", "a.txt", "b.txt")
 
 		infos, err := jfs.ReadDir("d")
