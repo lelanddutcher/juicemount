@@ -106,6 +106,15 @@ type Unit struct {
 	// inode a non-trusted principal's txn may create.
 	TrashAlloc uint64
 
+	// inodeOwner, set by the proxy, names the principal whose bare INCRBY
+	// nextinode batch held inode n (Guard.inodes); ok is false for a number
+	// the proxy never handed out.
+	inodeOwner func(n uint64) (owner string, ok bool, err error)
+	// upstreamID returns the CLIENT ID of the connection's upstream Redis
+	// connection (0 = not known yet). Its reply precedes every later reply on
+	// that connection, so it is known once beforeSide has returned.
+	upstreamID func() uint64
+
 	// beforeSide, set by the proxy, makes the connection's buffered WATCH
 	// reach Redis (and waits for its +OK) before the guard's first side read.
 	beforeSide func() error

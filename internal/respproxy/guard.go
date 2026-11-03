@@ -100,12 +100,19 @@ type SessionStore interface {
 // validatePushes admits a self-allocated slice only while its bit is clear
 // (review H8B-L1d #3/#5).
 type SliceStore interface {
-	Owner(id uint64) (owner string, ok bool, err error)
-	Record(lo, hi uint64, owner string) error // ids lo..hi inclusive
+	IDOwners
 	Used(id uint64) (bool, error)
 	// MarkUsed records ids as used; persist also writes Redis (when the
 	// bit was not already set by the unit's own MULTI).
 	MarkUsed(ids []uint64, persist bool) error
+}
+
+// IDOwners records which principal an allocator handed each id to, from
+// the reply of that principal's own bare INCRBY (nextchunk: slice ids;
+// nextinode: inode numbers).
+type IDOwners interface {
+	Owner(id uint64) (owner string, ok bool, err error)
+	Record(lo, hi uint64, owner string) error // ids lo..hi inclusive
 }
 
 // UsedBitKey / UsedBitOffset locate slice id's used bit: one 128 KiB bitmap
@@ -113,7 +120,7 @@ type SliceStore interface {
 func UsedBitKey(id uint64) string    { return "jmlease:v1:sused:" + strconv.FormatUint(id>>20, 10) }
 func UsedBitOffset(id uint64) uint64 { return id & (1<<20 - 1) }
 
-// MemSliceStore is an in-memory SliceStore (tests).
+// MemSliceStore is an in-memory SliceStore, and IDOwners (tests).
 type MemSliceStore struct {
 	mu     sync.Mutex
 	ranges []sliceRange
@@ -211,6 +218,10 @@ type Guard struct {
 	sessions SessionStore
 	chunks   ChunkReader
 	slices   SliceStore
+	// inodes: who received each inode number (bare INCRBY nextinode of
+	// juicefs's whole inodeBatch). Decide admits a new inode only from its
+	// creator's own batch (newInodeGate).
+	inodes IDOwners
 
 	mu sync.Mutex
 	// zeroRefs: sliceRef fields a principal set to "0" inside its own,
@@ -251,6 +262,8 @@ type Guard struct {
 
 	// afterSideRead is a test hook run right after a side read.
 	afterSideRead func()
+	// logf, when set, reports writes admitted on a fallback.
+	logf func(format string, args ...any)
 }
 
 // NewGuard returns a guard. chunks may be nil (then compaction-style
@@ -259,7 +272,7 @@ func NewGuard(sessions SessionStore, chunks ChunkReader) *Guard {
 	if sessions == nil {
 		sessions = NewMemSessionStore()
 	}
-	return &Guard{sessions: sessions, chunks: chunks, slices: &MemSliceStore{}, zeroRefs: map[string]zeroRef{},
+	return &Guard{sessions: sessions, chunks: chunks, slices: &MemSliceStore{}, inodes: &MemSliceStore{}, zeroRefs: map[string]zeroRef{},
 		pendingDel: map[string]string{}, ctrCache: map[string]*counterCache{}, rate: map[string]*rateWindow{},
 		dropped: map[string]string{}}
 }
@@ -350,8 +363,10 @@ func serverPrincipal(p Principal) bool {
 }
 
 // Allocation reports the allocator a bare unit advances and by how much
-// (INCR/INCRBY nextsession, nextchunk or nextTrash), so the proxy can record
-// from the reply who received which ids. n == 0 means none.
+// (INCR/INCRBY nextsession, nextchunk, nextTrash, or nextinode by exactly
+// juicefs's inodeBatch), so the proxy can record from the reply who
+// received which ids. n == 0 means none. A smaller nextinode step grants no
+// inode numbers, so the owner table grows by at most one entry per batch.
 func Allocation(u *Unit) (counter string, n int64) {
 	if u.Kind != UnitBare || len(u.Cmds) != 1 {
 		return "", 0
@@ -363,6 +378,10 @@ func Allocation(u *Unit) (counter string, n int64) {
 	switch k := c.Info.Keys[0].Shape; k {
 	case "nextsession", "nextchunk", "nextTrash":
 		if d, ok := counterDelta(c); ok && d > 0 && d <= maxAlloc[k] {
+			return k, d
+		}
+	case "nextinode":
+		if d, ok := counterDelta(c); ok && d == maxAlloc[k] {
 			return k, d
 		}
 	}
@@ -643,6 +662,10 @@ func (g *Guard) Check(p Principal, u *Unit) (*Denial, []guardEffect) {
 		}
 		name := u.Cmds[w.Cmd].Info.Name
 		switch {
+		case nonTrashDentry && w.Key.Shape == ShapeDentry && w.Key.Ino == TrashInode:
+			// The trash root holds only checkTrash's hourly directories
+			// (hourlyTrashCreate); no project dentry anchors a write to it.
+			w.Class = KCBG
 		case nonTrashDentry && u.Kind == UnitTxn:
 			// unlink / rename-replace into trash, or restore out of it:
 			// anchored by the non-trash dentry in the same txn (L2).
@@ -1473,7 +1496,9 @@ func isHSet(name string) bool { return name == "HSET" || name == "HSETNX" || nam
 //
 // CUTOVER (runbook, lane L5): a session a mount registered BEFORE the proxy
 // existed has no owner record, so every heartbeat or session write from it
-// is refused (BG_ONLY), as is any slice from a pre-proxy nextchunk batch.
+// is refused (BG_ONLY), as is any slice from a pre-proxy nextchunk batch
+// and any create from an inode batch no recorded INCRBY nextinode handed it
+// (also a batch a mount took before the proxy recorded inode batches).
 // Every mount must remount through the proxy at cutover: restart the
 // JuiceMount app on every Mac (and the server's juicefs mounts) in the same
 // step that moves port 30179 to the proxy. Removing or rewriting another principal's session is
@@ -1593,8 +1618,11 @@ func sessionMemberWritten(u *Unit, shape, m string) (uint64, bool) {
 // Redis TIME, or below the stored one, would make a live session look stale
 // before its last heartbeat says it is. So the score must be ahead of Redis
 // TIME, and the proxy forwards it as ZADD GT, which never lowers a stored
-// score. The legacy sessions index is bg's alone (juicefs only removes from
-// it).
+// score. If TIME cannot be read, the heartbeat is still forwarded as ZADD
+// GT (logged): GT alone never moves a stored expiry earlier, and refusing it
+// would let a live session's score lapse, after which bg's cleanup would
+// treat that session as stale. The legacy sessions index is bg's alone
+// (juicefs only removes from it).
 func (g *Guard) heartbeatGate(u *Unit, c Cmd, w KeyWrite) *Denial {
 	if w.Key.Shape != "allSessions" || u.Kind != UnitBare || len(c.Args) != 4 {
 		return deny(ReasonBGOnly, "ZADD "+w.Raw+" is not a session heartbeat")
@@ -1604,10 +1632,12 @@ func (g *Guard) heartbeatGate(u *Unit, c Cmd, w KeyWrite) *Denial {
 		return deny(ReasonBGOnly, "heartbeat score "+sanitizeToken(string(c.Args[2]))+" is not whole seconds")
 	}
 	now, err := g.redisNow(u.DB)
-	if err != nil {
-		return deny(ReasonBGOnly, "redis TIME: "+err.Error())
-	}
-	if score <= now {
+	switch {
+	case err != nil:
+		if g.logf != nil {
+			g.logf("respproxy: heartbeat of session %s admitted as ZADD GT without the server clock: %v", sanitizeToken(string(c.Args[3])), err)
+		}
+	case score <= now:
 		return deny(ReasonBGOnly, "heartbeat score is not ahead of the server clock")
 	}
 	u.rewrite = strArgs("ZADD", w.Raw, "GT", string(c.Args[2]), string(c.Args[3]))
@@ -1665,26 +1695,36 @@ func safeConfigGet(args [][]byte) bool {
 // parses it back to decide which hours have expired.
 const trashHourLayout = "2006-01-02-15"
 
+// trashHourSkew bounds how far the hour a txn names may be from Redis
+// TIME. bg expires an hour trash-days (at least one day) after it, so an
+// hour within this bound is never expired as soon as it is created, nor
+// kept much past its time. The writer's clock names the hour: NTP-synced
+// clocks differ by far less, and a mount whose clock runs more than five
+// heartbeats (60 s by default) behind Redis has its heartbeats refused
+// already (heartbeatGate), so an hour leaves ample room for skew.
+const trashHourSkew = time.Hour
+
 // hourlyTrashCreate checks a non-trusted principal's txn that writes the
 // trash root d<TrashInode> without a non-trash dentry. The only such juicefs
 // txn is checkTrash's mknod of a new hourly directory (redis.go doMknod with
-// parent TrashInode): one HSET of a field named like trashHourLayout whose
+// parent TrashInode): one HSET of a field named like trashHourLayout, for an
+// hour within trashHourSkew of Redis TIME, whose
 // entry is a directory at TrashInode+n, where n is what this connection's
 // INCR nextTrash returned (Unit.TrashAlloc), plus SET i<that inode> as a
 // directory under TrashInode. The field must not exist yet, read under the
 // txn's WATCH of the trash root, so an existing hour is never replaced.
 //
 // bg's trash cleanup removes everything below an expired hourly entry and
-// then the directory itself. An entry naming any inode other than a fresh
-// one this txn creates would make that cleanup delete or orphan a tree the
-// principal could not write, so anything else is refused. It returns the
-// inode created.
+// then the directory itself, so the entry names only a fresh, empty
+// directory this txn creates, under an hour that is not taken. It returns
+// the inode created.
 func (g *Guard) hourlyTrashCreate(u *Unit) (uint64, *Denial) {
 	refuse := func(detail string) (uint64, *Denial) {
 		return 0, deny(ReasonBGOnly, "trash root write is not a new hourly directory: "+detail)
 	}
 	var field string
 	var hourly uint64
+	var hourAt time.Time
 	roots := 0
 	for _, w := range u.Writes {
 		if w.Key.Shape != ShapeDentry || w.Key.Ino != TrashInode {
@@ -1696,9 +1736,11 @@ func (g *Guard) hourlyTrashCreate(u *Unit) (uint64, *Denial) {
 			return refuse(c.Info.Name + " of more or other than one field")
 		}
 		field = string(c.Args[2])
-		if ts, err := time.Parse(trashHourLayout, field); err != nil || ts.Format(trashHourLayout) != field {
+		ts, err := time.Parse(trashHourLayout, field)
+		if err != nil || ts.Format(trashHourLayout) != field {
 			return refuse("name " + sanitizeToken(field))
 		}
+		hourAt = ts
 		typ, _ := entryType(c.Args[3])
 		ino, ok := entryInode(c.Args[3])
 		if !ok || typ != typeDir || ino <= TrashInode {
@@ -1729,6 +1771,15 @@ func (g *Guard) hourlyTrashCreate(u *Unit) (uint64, *Denial) {
 	}
 	if attrs != 1 {
 		return refuse("the txn does not create inode " + inoStr(hourly))
+	}
+	// The hour [hourAt, hourAt+1h) must overlap Redis TIME +- trashHourSkew.
+	now, err := g.redisNow(u.DB)
+	if err != nil {
+		return refuse("redis TIME: " + err.Error())
+	}
+	srv := time.Unix(now, 0)
+	if !hourAt.Add(time.Hour).After(srv.Add(-trashHourSkew)) || hourAt.After(srv.Add(trashHourSkew)) {
+		return refuse("hour " + sanitizeToken(field) + " is not the server's current hour")
 	}
 	root := "d" + inoStr(TrashInode)
 	watched := false
@@ -1767,31 +1818,38 @@ func (g *Guard) hourlyTrashCreate(u *Unit) (uint64, *Denial) {
 }
 
 // watchDirty reports whether Redis has flagged the unit's own upstream
-// connection (CLIENT LIST name = Unit.UpstreamName) with "d": a WATCHed key
-// changed, so its EXEC will fail. The flag stays set until EXEC or DISCARD.
+// connection (CLIENT LIST ID Unit.upstreamID: the id Redis gave that
+// connection, unique across every proxy on the server) with "d": a WATCHed
+// key changed, so its EXEC will fail. The flag stays set until EXEC or
+// DISCARD. Call it only after u.beforeSide.
 func (g *Guard) watchDirty(u *Unit) (bool, error) {
-	if u.UpstreamName == "" {
-		return false, errors.New("no upstream name")
+	var n uint64
+	if u.upstreamID != nil {
+		n = u.upstreamID()
 	}
-	v, err := g.side.Do(u.DB, strArgs("CLIENT", "LIST", "TYPE", "normal")...)
+	if n == 0 {
+		return false, errors.New("upstream client id not known")
+	}
+	id := strconv.FormatUint(n, 10)
+	v, err := g.side.Do(u.DB, strArgs("CLIENT", "LIST", "ID", id)...)
 	if err == nil {
 		err = v.Err()
 	}
 	if err != nil {
 		return false, err
 	}
-	want := "name=" + u.UpstreamName
+	want := "id=" + id
 	for _, line := range strings.Split(string(v.Str), "\n") {
-		named, dirty := false, false
-		for _, f := range strings.Fields(line) {
-			named = named || f == want
+		fs := strings.Fields(line)
+		if len(fs) == 0 || fs[0] != want {
+			continue
+		}
+		for _, f := range fs {
 			if strings.HasPrefix(f, "flags=") {
-				dirty = strings.Contains(f[len("flags="):], "d")
+				return strings.Contains(f[len("flags="):], "d"), nil
 			}
 		}
-		if named {
-			return dirty, nil
-		}
+		return false, errors.New("upstream connection listed without flags")
 	}
 	return false, errors.New("upstream connection not listed")
 }

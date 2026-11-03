@@ -190,7 +190,9 @@ func New(cfg Config) (*Proxy, error) {
 	}
 	p.side = &SidePool{dial: p.dialUpstream, max: 8}
 	p.Guard = NewGuard(&redisSessions{p: p, cache: map[uint64]string{}}, sideChunks{p})
-	p.Guard.slices = &redisSlices{p: p}
+	p.Guard.slices = &redisSlices{redisRanges: redisRanges{p: p, key: SliceOwnersKey}}
+	p.Guard.inodes = &redisRanges{p: p, key: InodeOwnersKey}
+	p.Guard.logf = p.Logf
 	p.Guard.counters = sideCounters{p}
 	p.Guard.side = p.side
 	p.stageBirth.Store(cfg.StageBirth)
@@ -592,6 +594,10 @@ type conn struct {
 	txn         *txnState
 	watched     []string
 	watchAck    chan struct{} // closed when the last WATCH's reply was read
+
+	// upID: the CLIENT ID of the upstream connection, stored by the reply
+	// goroutine (Unit.upstreamID).
+	upID atomic.Uint64
 
 	// trashAlloc: the reply of this connection's latest INCR nextTrash,
 	// stored by the reply goroutine before the client sees it and taken by
@@ -1339,6 +1345,8 @@ func (c *conn) newUnit(kind UnitKind, cmds []Cmd) *Unit {
 	if c.principal != nil {
 		u.UpstreamName = c.upstreamName()
 	}
+	u.upstreamID = c.upID.Load
+	u.inodeOwner = c.p.Guard.inodes.Owner
 	if kind == UnitTxn {
 		u.beforeSide = c.confirmWatch
 	}
@@ -1442,7 +1450,9 @@ func (c *conn) gateBare(args [][]byte, info Command) error {
 	case "nextsession":
 		s.hook = c.p.sessionHook(c.principal.Name, n)
 	case "nextchunk":
-		s.hook = c.p.sliceHook(c.principal.Name, n)
+		s.hook = c.p.idHook(c.p.Guard.slices, "slice ids", c.principal.Name, n)
+	case "nextinode":
+		s.hook = c.p.idHook(c.p.Guard.inodes, "inodes", c.principal.Name, n)
 	case "nextTrash":
 		db := c.db
 		s.hook = func(v Value) {
@@ -1475,15 +1485,17 @@ func (p *Proxy) commitOnSuccess(effects []guardEffect, done func(Outcome)) func(
 	}
 }
 
-// sliceHook records the slice ids a principal's own INCRBY nextchunk
-// allocated: (R-n, R] for reply R (juicefs base.go:1658-1663).
-func (p *Proxy) sliceHook(owner string, n int64) func(Value) {
+// idHook records the ids a principal's own INCRBY nextchunk or nextinode
+// allocated: (R-n, R] for reply R (juicefs base.go:1658-1663 for slices;
+// allocateInodes, base.go:1168, with incrCounter's +1, redis.go:419, for
+// inodes).
+func (p *Proxy) idHook(store IDOwners, what, owner string, n int64) func(Value) {
 	return func(v Value) {
 		if v.Type != ':' || v.Int < n {
 			return
 		}
-		if err := p.Guard.slices.Record(uint64(v.Int-n+1), uint64(v.Int), owner); err != nil {
-			p.Logf("respproxy: slice ids %d..%d owner record for %s failed: %v", v.Int-n+1, v.Int, owner, err)
+		if err := store.Record(uint64(v.Int-n+1), uint64(v.Int), owner); err != nil {
+			p.Logf("respproxy: %s %d..%d owner record for %s failed: %v", what, v.Int-n+1, v.Int, owner, err)
 		}
 	}
 }
@@ -1637,7 +1649,13 @@ func (c *conn) ensureUpstream() bool {
 		c.cw.Flush()
 		return false
 	}
-	return true
+	// Its reply precedes every later reply on this connection, so it is
+	// stored before any WATCH the client sends is confirmed (beforeSide).
+	return c.forward(strArgs("CLIENT", "ID"), slot{drop: true, hook: func(v Value) {
+		if v.Type == ':' && v.Int > 0 {
+			c.upID.Store(uint64(v.Int))
+		}
+	}}) == nil
 }
 
 // authenticate checks credentials and, on failure, replies WRONGPASS. A
@@ -1879,13 +1897,23 @@ func (s *redisSessions) Release(sids []uint64) error {
 // because nextchunk only increases. One entry per 4096 slices written.
 const SliceOwnersKey = "jmlease:v1:slices"
 
-// redisSlices persists slice-id ownership; memory holds only a bounded
-// cache of recent ranges (a principal writes from its current batch).
-type redisSlices struct {
+// InodeOwnersKey is the same for inode numbers (nextinode batches).
+const InodeOwnersKey = "jmlease:v1:inodes"
+
+// redisRanges persists id-range ownership in a ZSET shaped like
+// SliceOwnersKey; memory holds only a bounded cache of recent ranges (a
+// principal writes from its current batch).
+type redisRanges struct {
 	p     *Proxy
+	key   string
 	mu    sync.Mutex
 	cache []sliceRange // most recent last; bounded
-	used  map[uint64]bool
+}
+
+// redisSlices is slice-id ownership plus each slice's used bit.
+type redisSlices struct {
+	redisRanges
+	used map[uint64]bool // guarded by mu
 }
 
 const sliceCacheMax = 1024
@@ -1903,7 +1931,7 @@ for _, m in ipairs(prev) do
 end
 return redis.call('ZADD', KEYS[1], hi, lo .. ':' .. hi .. ':' .. owner)`
 
-func (s *redisSlices) remember(r sliceRange) {
+func (s *redisRanges) remember(r sliceRange) {
 	s.mu.Lock()
 	if len(s.cache) >= sliceCacheMax {
 		s.cache = append(s.cache[:0], s.cache[len(s.cache)/2:]...)
@@ -1912,7 +1940,7 @@ func (s *redisSlices) remember(r sliceRange) {
 	s.mu.Unlock()
 }
 
-func (s *redisSlices) Owner(id uint64) (string, bool, error) {
+func (s *redisRanges) Owner(id uint64) (string, bool, error) {
 	s.mu.Lock()
 	for i := len(s.cache) - 1; i >= 0; i-- {
 		if r := s.cache[i]; id >= r.lo && id <= r.hi {
@@ -1921,7 +1949,7 @@ func (s *redisSlices) Owner(id uint64) (string, bool, error) {
 		}
 	}
 	s.mu.Unlock()
-	v, err := s.p.side.Do(s.p.cfg.VolumeDB, strArgs("ZRANGE", SliceOwnersKey, strconv.FormatUint(id, 10), "+inf", "BYSCORE", "LIMIT", "0", "1")...)
+	v, err := s.p.side.Do(s.p.cfg.VolumeDB, strArgs("ZRANGE", s.key, strconv.FormatUint(id, 10), "+inf", "BYSCORE", "LIMIT", "0", "1")...)
 	if err == nil {
 		err = v.Err()
 	}
@@ -1933,7 +1961,7 @@ func (s *redisSlices) Owner(id uint64) (string, bool, error) {
 	}
 	parts := strings.SplitN(string(v.Elems[0].Str), ":", 3)
 	if len(parts) != 3 {
-		return "", false, fmt.Errorf("bad %s member %q", SliceOwnersKey, v.Elems[0].Str)
+		return "", false, fmt.Errorf("bad %s member %q", s.key, v.Elems[0].Str)
 	}
 	lo, e1 := strconv.ParseUint(parts[0], 10, 64)
 	hi, e2 := strconv.ParseUint(parts[1], 10, 64)
@@ -1944,11 +1972,11 @@ func (s *redisSlices) Owner(id uint64) (string, bool, error) {
 	return parts[2], true, nil
 }
 
-func (s *redisSlices) Record(lo, hi uint64, owner string) error {
+func (s *redisRanges) Record(lo, hi uint64, owner string) error {
 	s.remember(sliceRange{lo, hi, owner})
 	// Merge with the owner's range ending at lo-1 (consecutive batches of
 	// one writer), so a busy single-writer volume stays one entry.
-	v, err := s.p.side.Do(s.p.cfg.VolumeDB, strArgs("EVAL", mergeRangeLua, "1", SliceOwnersKey,
+	v, err := s.p.side.Do(s.p.cfg.VolumeDB, strArgs("EVAL", mergeRangeLua, "1", s.key,
 		strconv.FormatUint(lo, 10), strconv.FormatUint(hi, 10), owner)...)
 	if err == nil {
 		err = v.Err()
