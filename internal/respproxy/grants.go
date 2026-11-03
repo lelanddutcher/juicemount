@@ -36,12 +36,12 @@ package respproxy
 //     also above the project depth, and also when it rides along a write
 //     that is otherwise covered;
 //   - so does every dir-stat and quota-usage row, also one that rides along
-//     a covered write, except the dir-stat counters above the project depth
-//     and the quota-usage increments of a folder above a granted one (the
-//     flush of the person's own writes), which may move it only by what
-//     the Mac reported for the person's folders below it (quotaLedger,
-//     accounting.go); rows of an inode the unit itself creates or removes
-//     go with that inode;
+//     a covered write, except the dir-stat counters above the project
+//     depth; rows of an inode the unit itself creates or removes go with
+//     that inode. While grants are in force no quota exists above the
+//     project depth (quotaScopeDenial, accounting.go; the Manager checks it
+//     before it puts grants in force), so a person's own writes never flush
+//     the usage of a quota they do not cover;
 //   - a place the proxy cannot resolve is not covered (fail closed).
 //
 // The check runs in every proxy mode (passthrough and observe relax only
@@ -55,8 +55,6 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-
-	"github.com/lelanddutcher/juicemount/internal/auditlog"
 )
 
 // PersonEntry is one person in a version-2 principals file:
@@ -280,29 +278,6 @@ func (e *LeaseEngine) lookupPath(path string) (uint64, error) {
 	return dir, nil
 }
 
-// aboveGrants: the directories above the granted ones (their ancestors).
-func (e *LeaseEngine) aboveGrants(granted map[uint64]bool) (map[uint64]bool, error) {
-	out := map[uint64]bool{}
-	for g := range granted {
-		d := g
-		for i := 0; d != rootIno; i++ {
-			if i == 4096 {
-				return nil, errUnresolved
-			}
-			p, err := e.anc.parentOfDir(d)
-			if err != nil {
-				return nil, err
-			}
-			if out[p] {
-				break
-			}
-			out[p] = true
-			d = p
-		}
-	}
-	return out, nil
-}
-
 // covered: directory d, or a directory above it, is granted.
 func (e *LeaseEngine) covered(d uint64, granted map[uint64]bool) (bool, error) {
 	for i := 0; i < 4096; i++ {
@@ -319,40 +294,6 @@ func (e *LeaseEngine) covered(d uint64, granted map[uint64]bool) (bool, error) {
 		d = p
 	}
 	return false, errUnresolved
-}
-
-// aboveOf lists the folders above the grants that hold directory d, a
-// directory inside them: its ancestors above the highest granted one.
-// Nothing when an ancestor cannot be resolved (the dir-stat increment then
-// counts for no folder).
-func (e *LeaseEngine) aboveOf(d uint64, granted, above map[uint64]bool) []uint64 {
-	var path []uint64
-	top := -1
-	for i := 0; d != rootIno; i++ {
-		if i == 4096 {
-			return nil
-		}
-		if granted[d] {
-			top = len(path)
-		}
-		path = append(path, d)
-		p, err := e.anc.parentOfDir(d)
-		if err != nil {
-			return nil
-		}
-		d = p
-	}
-	path = append(path, rootIno)
-	if top < 0 {
-		return nil
-	}
-	var out []uint64
-	for _, a := range path[top+1:] {
-		if above[a] {
-			out = append(out, a)
-		}
-	}
-	return out
 }
 
 // grantCheck refuses a unit of a scoped person, or of a Mac with no person
@@ -428,45 +369,17 @@ func (e *LeaseEngine) grantCheck(p Principal, u *Unit, f *unitFacts) *Denial {
 	// that writes more (the lease rules let those through): a field of an
 	// inode the unit itself writes (mknod's rows of the new directory,
 	// rmdir's of the removed one) is placed with that inode below; any
-	// other names a directory the grants must cover, except two kinds of
-	// rows above the project depth: the dir-stat counters, which enforce
-	// nothing, and the quota-usage increments of a folder that holds one
-	// of the person's grants, which juicefs flushes for every write below
-	// it (doFlushQuotas). Those are bounded by the dir-stat increments the
-	// Mac reports below the folder (quotaLedger, accounting.go) and logged.
-	// Overwriting or removing a quota's usage, or changing it for a folder
-	// the person has no grant below, would let a person make another
-	// project hit its quota (EDQUOT) or escape one.
+	// other names a directory the grants must cover, except the dir-stat
+	// counters above the project depth, which enforce nothing. That holds
+	// for the quota-usage rows of a folder above the person's grants too:
+	// such a quota sums the writes of other projects, and changing it
+	// would let a person make them hit their quota (EDQUOT) or escape it.
+	// While grants are in force no such quota is created (quotaScopeDenial,
+	// accounting.go), and the Manager does not put grants in force while
+	// one exists.
 	own := make(map[uint64]bool, len(f.inodes))
 	for _, n := range f.inodes {
 		own[n] = true
-	}
-	var above map[uint64]bool
-	loadAbove := func() *Denial {
-		if above == nil {
-			var err error
-			if above, err = e.aboveGrants(granted); err != nil {
-				return deny(0, "grant lookup failed: "+err.Error())
-			}
-		}
-		return nil
-	}
-	var credits, claims []ledgerMove
-	var claimRows []auditlog.Row
-	// credit books a dir-stat increment of a directory inside the grants
-	// for every folder above the grants that holds it.
-	credit := func(r statRow) {
-		idx, ok := ledgerIndex(r.hash)
-		if !ok || r.op != "incr" || r.quotaUsage() {
-			return
-		}
-		delta, err := strconv.ParseInt(r.val, 10, 64)
-		if err != nil || delta == 0 || loadAbove() != nil {
-			return
-		}
-		for _, a := range e.aboveOf(r.dir, granted, above) {
-			credits = append(credits, ledgerMove{dir: a, idx: idx, delta: delta})
-		}
 	}
 	for _, r := range f.statRows {
 		if r.gc() || own[r.dir] {
@@ -480,59 +393,14 @@ func (e *LeaseEngine) grantCheck(p Principal, u *Unit, f *unitFacts) *Denial {
 			if d := scope(loc); d != nil {
 				return d
 			}
-			credit(r)
 			continue
 		}
-		if r.hash == "dirQuota" {
-			continue // quota definitions were checked above
-		}
-		ok, err := e.covered(r.dir, granted)
-		switch {
-		case err != nil && !r.quotaUsage():
-			continue // dir-stat counters enforce nothing
-		case err != nil:
-			return deny(r.dir, "cannot resolve directory "+inoStr(r.dir)+": "+err.Error())
-		case ok:
-			credit(r) // a folder of the person's own above the project depth
-			continue
-		case !r.quotaUsage():
-			continue
-		}
-		if r.op == "incr" {
-			if d := loadAbove(); d != nil {
-				return d
-			}
-			if above[r.dir] {
-				idx, _ := ledgerIndex(r.hash)
-				delta, err := strconv.ParseInt(r.val, 10, 64)
-				if err != nil {
-					return deny(r.dir, "the quota usage ("+r.hash+") of folder "+inoStr(r.dir)+": delta "+strconv.Quote(r.val)+" is not an int64")
-				}
-				claims = append(claims, ledgerMove{dir: r.dir, idx: idx, delta: delta})
-				row := auditlog.Row{Hash: r.hash, Ino: r.dir, Op: r.op, Value: r.val}
-				if u.wantAudit {
-					row.Path = e.anc.label(r.dir)
-				}
-				claimRows = append(claimRows, row)
-				continue
-			}
+		if !r.quotaUsage() {
+			continue // dir-stat counters; quota definitions were checked above
 		}
 		if d := dirCovered(r.dir, "the quota usage ("+r.hash+") of folder "+inoStr(r.dir)); d != nil {
 			return d
 		}
-	}
-	if len(credits) > 0 || len(claims) > 0 {
-		undo, bad, bal := e.quota.apply(p.Name, credits, claims, e.now())
-		if bad != nil {
-			what := "the quota usage of folder " + inoStr(bad.dir)
-			if lbl := e.anc.label(bad.dir); lbl != "" {
-				what += " (" + lbl + ")"
-			}
-			unit := [2]string{"bytes", "inodes"}[bad.idx]
-			return deny(bad.dir, fmt.Sprintf("%s would move by %d %s beyond what this Mac reported for the person's own folders below it (%d %s; at most %d)",
-				what, bad.delta, unit, bal, unit, ledgerSlack[bad.idx]))
-		}
-		u.quotaUndo, u.aboveRows = undo, claimRows
 	}
 	if f.dirStatOnly() {
 		return nil

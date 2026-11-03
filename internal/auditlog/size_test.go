@@ -44,7 +44,7 @@ func TestOversizedRecordIsWrittenAsStub(t *testing.T) {
 		t.Fatalf("records: %+v", page.Records)
 	}
 	for _, r := range page.Records[1:] { // newest first: the two stubs
-		if r.Omitted == 0 || !strings.HasPrefix(r.Digest, "sha256:") || !strings.Contains(r.Detail, "record not written") ||
+		if r.Omitted == 0 || !strings.Contains(r.Detail, "record not written") ||
 			len(r.Ops) != 0 || r.Principal == "" || r.Action != "create" {
 			t.Errorf("stub: %+v", r)
 		}

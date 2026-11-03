@@ -534,13 +534,15 @@ type PrincipalStoreOptions struct {
 
 // PrincipalStore holds Mac enrollments and renders the proxy's files.
 type PrincipalStore struct {
-	mu        sync.Mutex
-	opts      PrincipalStoreOptions
-	recs      map[string]*MacPrincipal // by principal name
-	autoUntil time.Time
-	autoMax   int            // approvals the open window may still grant in total
-	autoUsed  int            // approvals granted by the current window
-	autoPerIP map[string]int // approvals granted by the current window, per source IP
+	mu   sync.Mutex
+	opts PrincipalStoreOptions
+	// quotaScope: quotas above the project folders (quotascope.go).
+	quotaScope quotaScopeFunc
+	recs       map[string]*MacPrincipal // by principal name
+	autoUntil  time.Time
+	autoMax    int            // approvals the open window may still grant in total
+	autoUsed   int            // approvals granted by the current window
+	autoPerIP  map[string]int // approvals granted by the current window, per source IP
 
 	// Abuse bounds for the unauthenticated route (in memory).
 	reqLimit  *ipLimiter    // every enroll/poll request

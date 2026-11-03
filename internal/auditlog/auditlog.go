@@ -137,12 +137,12 @@ type Record struct {
 	StartPrev string `json:"start_prev,omitempty"`
 
 	// Omitted: entries (ops, rows, inodes, attribute changes, projects)
-	// the record does not list, or names it shortened, because the unit
-	// was too large to log in full. Digest is then "sha256:" and the hex
-	// SHA-256 of the JSON of the complete lists ({"ops":..,"rows":..,
-	// "inodes":..,"attrs":..,"projects":..}, names in full). In the stub
-	// the writer writes for a record longer than MaxRecordBytes, Digest is
-	// the SHA-256 of that record's line.
+	// and values the record leaves out or shortens because the unit was
+	// too large to log in full. Digest then identifies the complete unit:
+	// "sha256:" and the hex SHA-256 of the unit's commands as the proxy
+	// received them, each encoded as a RESP array of bulk strings,
+	// concatenated in order, without MULTI and EXEC (the encoding Redis's
+	// AOF uses), so a capture of the unit can be checked against it.
 	Omitted int    `json:"omitted,omitempty"`
 	Digest  string `json:"digest,omitempty"`
 
@@ -156,7 +156,7 @@ type Record struct {
 
 // MaxRecordBytes bounds one line of the log. The writer never writes a
 // longer one: it writes a stub in its place (the record's seq, time, type,
-// who, action and unit, and the size and SHA-256 of the line it did not
+// who, action, unit and digest, and the size of the line it did not
 // write), and AppendDurable reports ErrTooLarge for it. It is well below
 // what the readers accept (maxLine), so a log stays readable.
 const MaxRecordBytes = 4 << 20
@@ -945,7 +945,6 @@ func (w *Writer) writeBatch(batch []*Record) error {
 // stubOf is what the writer writes in place of r, whose line was longer
 // than MaxRecordBytes.
 func stubOf(r *Record, line []byte) *Record {
-	sum := sha256.Sum256(line)
 	clip := func(v string) string {
 		if len(v) > 256 {
 			return v[:256]
@@ -955,10 +954,8 @@ func stubOf(r *Record, line []byte) *Record {
 	return &Record{Seq: r.Seq, TS: r.TS, Type: r.Type, Unit: r.Unit, Outcome: r.Outcome, Reason: clip(r.Reason),
 		Principal: clip(r.Principal), Kind: clip(r.Kind), Host: clip(r.Host), Person: clip(r.Person),
 		PersonName: clip(r.PersonName), Action: clip(r.Action), Prev: r.Prev,
-		Omitted: max(1, len(r.Ops)+len(r.Rows)+len(r.Inodes)+len(r.Attrs)+len(r.Projects)),
-		Digest:  "sha256:" + hex.EncodeToString(sum[:]),
-		Detail: fmt.Sprintf("record not written: it encoded to %d bytes, more than the limit of %d; digest is the SHA-256 of that line",
-			len(line), MaxRecordBytes)}
+		Omitted: max(1, len(r.Ops)+len(r.Rows)+len(r.Inodes)+len(r.Attrs)+len(r.Projects)), Digest: clip(r.Digest),
+		Detail: fmt.Sprintf("record not written: it encoded to %d bytes, more than the limit of %d", len(line), MaxRecordBytes)}
 }
 
 func (w *Writer) rotate(first uint64) error {

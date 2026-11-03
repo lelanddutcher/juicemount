@@ -60,8 +60,7 @@ type LeaseEngine struct {
 
 	topo sync.RWMutex
 
-	grants grantCache  // person grant paths -> directories (grants.go)
-	quota  quotaLedger // quota usage above grants, per Mac (accounting.go)
+	grants grantCache // person grant paths -> directories (grants.go)
 
 	mu       sync.Mutex
 	leases   map[uint64]*lease
@@ -316,11 +315,6 @@ func (e *LeaseEngine) Decide(p Principal, u *Unit) Verdict {
 		}
 		if released && !timedOut {
 			return // Done called twice
-		}
-		if u.quotaUndo != nil && (!o.Committed || o.Lost) {
-			// juicefs sends a quota sum that failed again with its next
-			// flush: it must not count twice in the ledger.
-			u.quotaUndo()
 		}
 		if o.Lost && !released {
 			// The connection died with this unit in flight (including L1's

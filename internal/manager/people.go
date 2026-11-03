@@ -277,9 +277,16 @@ func (s *PrincipalStore) changePeople(fn func() error) error {
 		s.people = map[string]*Person{}
 	}
 	before := s.savePeopleStateLocked()
+	wasInForce := s.grantsInForceLocked()
 	if err := fn(); err != nil {
 		s.restorePeopleStateLocked(before)
 		return err
+	}
+	if !wasInForce && s.grantsInForceLocked() {
+		if err := s.checkQuotaScopeLocked(); err != nil {
+			s.restorePeopleStateLocked(before)
+			return err
+		}
 	}
 	if err := s.commitLocked(s.opts.ProxyDir != ""); err != nil {
 		s.restorePeopleStateLocked(before)
@@ -507,6 +514,9 @@ type PeopleSnapshot struct {
 	// GrantsInForce).
 	UnassignedMacs int    `json:"unassigned_macs"`
 	Problem        string `json:"problem,omitempty"`
+	// QuotaConflicts: folders above the project depth with a quota while
+	// grants are in force (quotascope.go).
+	QuotaConflicts []string `json:"quota_conflicts,omitempty"`
 	// Audit: the proxy's audit log (set by the HTTP handler).
 	Audit *AuditStatus `json:"audit,omitempty"`
 }
@@ -633,12 +643,31 @@ func (s *PrincipalStore) StartPeopleSync() (stop func()) {
 type peopleAPI struct {
 	store    *PrincipalStore
 	auditDir string
-	watch    *auditWatch // nil: no audit directory
+	watch    *auditWatch      // nil: no audit directory
+	quotas   *quotaScopeCache // nil: no volume to check
 }
 
 // snapshot is the people snapshot with the audit log's state.
 func (p *peopleAPI) snapshot() PeopleSnapshot {
 	snap := p.store.PeopleSnapshot()
+	if p.quotas != nil && snap.GrantsInForce {
+		paths, err := p.quotas.get()
+		msg := ""
+		switch {
+		case err != nil:
+			msg = "the Manager cannot check the volume for quotas above the project folders: " + err.Error()
+		case len(paths) > 0:
+			snap.QuotaConflicts = paths
+			msg = quotaScopeMessage(paths) + ". Until then the quota usage of limited people's writes does not update: " +
+				"the proxy refuses their Macs' quota flushes, which name that quota"
+		}
+		if msg != "" {
+			if snap.Problem != "" {
+				snap.Problem += "; "
+			}
+			snap.Problem += msg
+		}
+	}
 	if p.watch != nil {
 		snap.Audit = p.watch.status(snap.GrantsInForce)
 		if snap.Audit.Problem != "" {
@@ -840,6 +869,11 @@ func (a *API) registerPeople(mux *http.ServeMux, prefix string, store *Principal
 	}
 	if store != nil {
 		a.jobs.onStopAll(store.StartPeopleSync())
+		if a.linkMetaURL != "" {
+			fn := redisQuotaScope(a.linkMetaURL)
+			store.SetQuotaScope(fn)
+			pa.quotas = &quotaScopeCache{fn: fn}
+		}
 	}
 	if pa.auditDir != "" {
 		anchors := ""

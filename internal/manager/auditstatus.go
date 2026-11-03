@@ -124,16 +124,21 @@ type anchorState struct {
 	// kept, like Problem, until a full check.
 	Warning   string `json:"warning,omitempty"`
 	WarningAt int64  `json:"warning_at_ms,omitempty"`
+	// ReadProblem: the log could not be read auditReadFailures times in a
+	// row; cleared by the next successful read.
+	ReadProblem string `json:"read_problem,omitempty"`
 }
 
 // auditWatch anchors the log and reports its state.
 type auditWatch struct {
 	dir, statePath string
 
-	mu      sync.Mutex
-	st      anchorState
-	loadErr error
-	fullMu  sync.Mutex // one full verify at a time
+	mu        sync.Mutex
+	st        anchorState
+	loadErr   error
+	readFails int        // consecutive failed minute reads (in memory)
+	fullFails int        // consecutive failed whole-log reads of checkStart
+	fullMu    sync.Mutex // one full verify at a time
 
 	stop, exited chan struct{}
 	once         sync.Once
@@ -238,7 +243,7 @@ func (w *auditWatch) tick() {
 	case err != nil:
 		// A log the Manager cannot read cannot be anchored: the anchors
 		// would freeze while the page says the chain is fine.
-		w.problemLocked(now, "the audit log cannot be read: "+err.Error())
+		w.readFailedLocked(err, false)
 		w.saveLocked()
 		w.mu.Unlock()
 		return
@@ -251,6 +256,7 @@ func (w *auditWatch) tick() {
 			w.st.Anchors = append([]auditlog.Anchor(nil), w.st.Anchors[len(w.st.Anchors)-maxAnchors:]...)
 		}
 	}
+	w.readOKLocked(false)
 	// The retention policy is in the health file: without it the
 	// retention checks wait for the next tick (a missed record is read
 	// again by checkStart's full pass).
@@ -261,6 +267,38 @@ func (w *auditWatch) tick() {
 	w.mu.Unlock()
 	if herr == nil {
 		w.checkStart(h.Policy(), now)
+	}
+}
+
+// auditReadFailures: consecutive failed reads of the log before the status
+// reports it (one can be a race with the writer's retention); a successful
+// read clears it.
+const auditReadFailures = 2
+
+// readFailedLocked counts a failed read of the log: the minute check's
+// (full false) or the start check's whole-log read (full true).
+func (w *auditWatch) readFailedLocked(err error, full bool) {
+	n := &w.readFails
+	if full {
+		n = &w.fullFails
+	}
+	*n++
+	log.Printf("manager: audit anchors: %v", err)
+	if *n >= auditReadFailures {
+		w.st.ReadProblem = fmt.Sprintf("the Manager cannot read the audit log (%d checks in a row): %v", *n, err)
+	}
+}
+
+// readOKLocked records a successful read of either kind; the read problem
+// goes once neither kind is failing.
+func (w *auditWatch) readOKLocked(full bool) {
+	if full {
+		w.fullFails = 0
+	} else {
+		w.readFails = 0
+	}
+	if w.readFails < auditReadFailures && w.fullFails < auditReadFailures {
+		w.st.ReadProblem = ""
 	}
 }
 
@@ -322,8 +360,12 @@ func (w *auditWatch) judgeLocked(rs []auditlog.Retention, p auditlog.Policy, now
 // read can take a minute on a large log, so it runs without w.mu (status
 // and the People page do not wait for it) and merges what it found.
 func (w *auditWatch) checkStart(p auditlog.Policy, now int64) {
+	st, ok, err := auditlog.FirstRecord(w.dir)
+	if err != nil || !ok {
+		return
+	}
 	w.mu.Lock()
-	issue := w.startIssueLocked()
+	issue := w.startIssueLocked(st)
 	anchors := append([]auditlog.Anchor(nil), w.st.Anchors...)
 	w.mu.Unlock()
 	if issue == "" {
@@ -332,23 +374,23 @@ func (w *auditWatch) checkStart(p auditlog.Policy, now int64) {
 	rep, _, err := auditFullRead(w.dir, anchors)
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if err == nil {
-		w.judgeLocked(rep.Retentions, p, now)
+	defer w.saveLocked()
+	if err != nil {
+		// Unread is not removed: report the read, not a cut.
+		w.readFailedLocked(err, true)
+		return
 	}
-	if msg := w.startIssueLocked(); msg != "" {
+	w.readOKLocked(true)
+	w.judgeLocked(rep.Retentions, p, now)
+	if msg := w.startIssueLocked(st); msg != "" {
 		w.problemLocked(now, msg)
 	}
-	w.saveLocked()
 }
 
-// startIssueLocked: why the log's start is not accounted for ("" = it is,
-// or a problem is already recorded).
-func (w *auditWatch) startIssueLocked() string {
+// startIssueLocked: why the log's start st is not accounted for ("" = it
+// is, or a problem is already recorded).
+func (w *auditWatch) startIssueLocked(st auditlog.Start) string {
 	if w.st.Problem != "" {
-		return ""
-	}
-	st, ok, err := auditlog.FirstRecord(w.dir)
-	if err != nil || !ok {
 		return ""
 	}
 	named := auditlog.ZeroPrev(st.Prev)
@@ -391,6 +433,8 @@ func (w *auditWatch) fullVerify() (auditlog.Report, error) {
 	h, herr := auditlog.ReadHealth(w.healthPath())
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	w.readOKLocked(false)
+	w.readOKLocked(true)
 	now := time.Now().UnixMilli()
 	w.st.CheckedAt = now
 	if herr == nil && w.loadErr == nil {
@@ -459,7 +503,8 @@ func (w *auditWatch) status(grantsInForce bool) *AuditStatus {
 		out.AnchorSeq, out.AnchorAtMs = w.st.Anchors[n-1].Seq, w.st.Anchors[n-1].TS
 	}
 	out.CheckedAtMs, out.ChainIssue = w.st.CheckedAt, w.st.Problem
-	out.ChainOK = w.st.Problem == ""
+	out.ChainOK = w.st.Problem == "" && w.st.ReadProblem == ""
+	readProblem := w.st.ReadProblem
 	out.RetentionWarning = w.st.Warning
 	w.mu.Unlock()
 	if herr == nil {
@@ -493,11 +538,20 @@ func (w *auditWatch) status(grantsInForce bool) *AuditStatus {
 	case why != "" && out.Enabled:
 		out.Problem = why + "; changes are not recorded"
 	}
-	if !out.ChainOK {
+	if out.ChainIssue != "" {
 		if out.Problem != "" {
 			out.Problem += "; "
 		}
 		out.Problem += "the audit log does not match the Manager's anchors: " + out.ChainIssue
+	}
+	if readProblem != "" {
+		if out.ChainIssue == "" {
+			out.ChainIssue = readProblem
+		}
+		if out.Problem != "" {
+			out.Problem += "; "
+		}
+		out.Problem += readProblem
 	}
 	if out.RetentionWarning != "" {
 		if out.Problem != "" {

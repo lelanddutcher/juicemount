@@ -1416,6 +1416,9 @@ func (c *conn) decide(u *Unit) (*Denial, Verdict, []guardEffect) {
 	if d == nil {
 		d = accountingValueDenial(pr, u) // also every mode (accounting.go)
 	}
+	if e, ok := c.p.policy.(*LeaseEngine); ok && d == nil && c.p.Auth.table.Load().GrantsInForce() {
+		d = e.quotaScopeDenial(pr, u)
+	}
 	if d != nil {
 		c.p.Stats.recordDecision(DecDeny, d, pr, u)
 		return d, Verdict{}, nil

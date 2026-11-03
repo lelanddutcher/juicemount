@@ -31,9 +31,9 @@ func hasRow(r auditlog.Record, hash string, ino meta.Ino) bool {
 // file in A. The lease rules let rows ride along a unit that writes an
 // inode, and the grant check did too, so John could set B's quota usage
 // (B then refuses every create with EDQUOT). Every such row is now placed:
-// refused, nothing written, and the refusal names the row. Rows of A, the
-// dir-stat counters above the projects, and quota-usage increments of the
-// folder that holds A (juicefs flushes them for John's own writes) pass.
+// refused, nothing written, and the refusal names the row. Rows of A and
+// the dir-stat counters above the projects pass; the quota usage of the
+// folder that holds A does not (review round 4: quotascope_test.go).
 func TestGrantChecksStatRowsRidingAlong(t *testing.T) {
 	for _, mode := range bothModes {
 		t.Run(string(mode), func(t *testing.T) {
@@ -76,7 +76,7 @@ func TestGrantChecksStatRowsRidingAlong(t *testing.T) {
 				{"HINCRBY dirQuotaUsedSpace /Other alone", alone, func(p redis.Pipeliner) { p.HIncrBy(ctx, "dirQuotaUsedSpace", s(other), 1<<40) }, "dirQuotaUsedSpace", other, false},
 				{"HINCRBY dirQuotaUsedSpace /Other along A", along, func(p redis.Pipeliner) { p.HIncrBy(ctx, "dirQuotaUsedSpace", s(other), 1<<40) }, "dirQuotaUsedSpace", other, false},
 				{"HINCRBY dirQuotaUsedSpace A along A", along, func(p redis.Pipeliner) { p.HIncrBy(ctx, "dirQuotaUsedSpace", s(A), 0) }, "dirQuotaUsedSpace", A, true},
-				{"HINCRBY dirQuotaUsedInodes /Clients alone", alone, func(p redis.Pipeliner) { p.HIncrBy(ctx, "dirQuotaUsedInodes", s(clients), 0) }, "dirQuotaUsedInodes", clients, true},
+				{"HINCRBY dirQuotaUsedInodes /Clients alone", alone, func(p redis.Pipeliner) { p.HIncrBy(ctx, "dirQuotaUsedInodes", s(clients), 0) }, "dirQuotaUsedInodes", clients, false},
 				{"HINCRBY dirUsedSpace /Other alone", alone, func(p redis.Pipeliner) { p.HIncrBy(ctx, "dirUsedSpace", s(other), 0) }, "dirUsedSpace", other, true},
 			} {
 				before, _ := e.rdb.HGet(ctx, c.hash, s(c.dir)).Result()
@@ -105,12 +105,13 @@ func TestGrantChecksStatRowsRidingAlong(t *testing.T) {
 // TestQuotaUsageOfAnotherProjectStaysWritable: with a quota on
 // /Clients/B, John (granted A) cannot inflate B's quota usage riding along
 // a write in A, so a client can still create in B; his own writes in A
-// still flush the usage of the quotas on A and on /Clients above it.
+// still flush the usage of the quota on A. (A quota above the projects is
+// not supported while grants are in force: quotascope_test.go.)
 func TestQuotaUsageOfAnotherProjectStaysWritable(t *testing.T) {
 	e := newEnv(t, respproxy.ModeEnforce, johnGranted("/Clients/A"))
 	ctx := context.Background()
-	A, B, clients := e.ino["/Clients/A"], e.ino["/Clients/B"], e.ino["/Clients"]
-	for _, q := range []string{"/Clients/B", "/Clients/A", "/Clients"} {
+	A, B := e.ino["/Clients/A"], e.ino["/Clients/B"]
+	for _, q := range []string{"/Clients/B", "/Clients/A"} {
 		if err := e.admin.HandleQuota(meta.Background(), meta.QuotaSet, q,
 			map[string]*meta.Quota{q: {MaxSpace: 1 << 30, MaxInodes: 1000}}, false, false, false); err != nil {
 			t.Fatal(err)
@@ -141,8 +142,8 @@ func TestQuotaUsageOfAnotherProjectStaysWritable(t *testing.T) {
 		t.Errorf("create in B after John's transaction: %v", st)
 	}
 
-	// John's own create in A: juicefs flushes the quota usage of A and
-	// /Clients (doFlushQuotas, every 3 s), through the proxy.
+	// John's own create in A: juicefs flushes the quota usage of A
+	// (doFlushQuotas, every 3 s), through the proxy.
 	jm := meta.NewClient("redis://mac-john:"+passOf("mac-john")+"@"+e.paddr+"/"+strconv.Itoa(testDB), metaConf())
 	if _, err := jm.Load(true); err != nil {
 		t.Fatal(err)
@@ -157,12 +158,11 @@ func TestQuotaUsageOfAnotherProjectStaysWritable(t *testing.T) {
 	deadline := time.Now().Add(15 * time.Second)
 	for {
 		a, _ := e.rdb.HGet(ctx, "dirQuotaUsedInodes", strconv.FormatUint(uint64(A), 10)).Int64()
-		c, _ := e.rdb.HGet(ctx, "dirQuotaUsedInodes", strconv.FormatUint(uint64(clients), 10)).Int64()
-		if a == 2 && c >= 6 { // A: g.txt, mine.txt; /Clients: A-D, 3 files, new.txt, mine.txt
+		if a == 2 { // g.txt, mine.txt
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("quota usage after John's create: A %d, /Clients %d (the flush was refused?)", a, c)
+			t.Fatalf("quota usage of A after John's create: %d (the flush was refused?)", a)
 		}
 		time.Sleep(200 * time.Millisecond)
 	}

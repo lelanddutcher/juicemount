@@ -70,17 +70,20 @@
   project's quota usage or folder statistics, also not inside a transaction
   that writes their own files (that let them make another project refuse
   every new file with "disk quota exceeded").
-- The quota usage of a folder above a limited person's projects (a client
-  folder with a quota on it) still moves with their writes, as JuiceFS counts
-  them. Their Mac may move it only by what it reported for the person's own
-  folders below it (plus a slack of 8 GB and 16,384 files for the order in
-  which JuiceFS sends the two), and each Mac's sums are in the audit log.
-  Before, a limited person could add or subtract any amount, which made
-  every other project in the folder refuse new files or lifted the folder's
-  quota. Known limit: a Mac that also inflates its own folders' statistics
-  can move the folder above by as much; it shows in their own folders and in
-  the audit log under their name. The proxy does not recompute usage from
-  file sizes.
+- Quotas and grants: quotas on project folders and below work as before.
+  Quotas above the project folders (on the volume or on a client folder
+  such as `/Clients`) are not supported while per-person grants are in
+  force: such a quota adds up every project below it, so a limited person's
+  Mac could not report its usage without being able to change it for the
+  other projects. The Manager does not put grants in force while one exists
+  and says which and how to remove it (`juicefs quota delete <META-URL>
+  --path /Clients`); while grants are in force the proxy refuses to create
+  one, also for the admin. If one exists anyway (made directly in Redis),
+  the People page names it: until it is removed, the quota usage of limited
+  people's writes does not update, because JuiceFS sends all quotas in one
+  update and the proxy refuses it. Before, a limited person could add or
+  subtract any amount to such a quota's usage, which made every other
+  project in the folder refuse new files or lifted the folder's quota.
 - No writer but the background jobs can store a value other than a whole
   number in the folder statistics or quota usage (for example with
   HINCRBYFLOAT), with or without people, in every proxy mode. One such value
@@ -102,9 +105,11 @@
   that, so a Mac retrying a refused write in a loop cannot push the history
   out through the size limit, nor hide an attempt on another project behind
   it. A change with very many entries (a transaction that adds thousands of
-  names) lists its first 256, how many it leaves out and a SHA-256 of them
-  all; the log never writes a line longer than 4 MB, which once made the
-  whole log unreadable. A log that fills its disk past its size limit
+  names) lists its first entries (at most 256, and at most 1 MB in all), how
+  many it leaves out, and a SHA-256 of the change's commands as Redis's AOF
+  holds them, so a copy of the change can be matched to it. The log never
+  writes a line longer than 4 MB; one longer line once made the whole log
+  unreadable. A log that fills its disk past its size limit
   removes its oldest segments and recovers; under the limit it stays failed
   and the People page says to free space or lower the limit.
 - A volume with no person writes nothing for the log, not even its health
@@ -115,10 +120,12 @@
   every retention record against the size and age limits: a cut of the oldest
   records that the limits do not explain is reported, and a retention that
   removes records less than a week old is a warning (a flood of records, or
-  a size limit too small for the volume). A log the Manager cannot read is
-  reported too; before, its check stopped there and the page said the chain
-  was fine. The full read the check sometimes needs no longer holds up the
-  People page. What it cannot catch: records
+  a size limit too small for the volume), as is a size limit that, at the
+  rate the log grows, will keep less than a week. A log the Manager cannot
+  read in two checks in a row is reported until a read succeeds; before, its
+  check stopped there and the page said the chain was fine. The full read
+  the check sometimes needs no longer holds up the People page, and a
+  failure of that read is reported as such, not as removed records. What it cannot catch: records
   written after the last check can be cut unnoticed, a cut of the oldest
   records that the limits could have made passes, and someone who can write
   both the proxy's directory and the Manager's state can rewrite both. If

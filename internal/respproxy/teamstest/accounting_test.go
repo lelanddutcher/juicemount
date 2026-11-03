@@ -1,8 +1,8 @@
 package teamstest
 
-// Review round 3: the quota usage of folders above a person's grants, the
-// values the accounting hashes take, the size of one unit's record, and
-// refusals in one place hiding an attempt on another.
+// Review rounds 3 and 4: the values the accounting hashes take, the size of
+// one unit's record, and refusals in one place hiding an attempt on
+// another. The quota scope rule is in quotascope_test.go.
 
 import (
 	"context"
@@ -26,104 +26,6 @@ func setQuota(t *testing.T, e *env, path string, space, inodes int64) {
 }
 
 func istr(i meta.Ino) string { return strconv.FormatUint(uint64(i), 10) }
-
-// TestQuotaUsageAboveGrantsMovesOnlyWithOwnUsage: John (granted
-// /Clients/A) could add any amount to the quota usage of /Clients, the
-// folder that holds A and B: 2^40 made every create in B fail with EDQUOT,
-// -2^41 lifted the /Clients quota, and nothing was logged. Such an
-// increment is now admitted only within what John's Mac reported for his
-// own folders below /Clients (dir-stat increments), plus a slack for the
-// order of juicefs's two flushes; a unit that was not committed does not
-// count; and the admitted sums are in the audit log.
-func TestQuotaUsageAboveGrantsMovesOnlyWithOwnUsage(t *testing.T) {
-	for _, mode := range bothModes {
-		t.Run(string(mode), func(t *testing.T) {
-			e := newEnv(t, mode, johnGranted("/Clients/A"))
-			ctx := context.Background()
-			clients, A, B := e.ino["/Clients"], e.ino["/Clients/A"], e.ino["/Clients/B"]
-			setQuota(t, e, "/Clients", 1<<40, 100000)
-			john := e.rawClient("mac-john")
-			used := func(hash string) string { return e.rdb.HGet(ctx, hash, istr(clients)).Val() }
-			refused := func(what string, err error) {
-				t.Helper()
-				if err == nil || !strings.Contains(err.Error(), string(respproxy.ReasonNotGranted)) {
-					t.Errorf("%s: %v, want NOT_GRANTED", what, err)
-				}
-			}
-			inodes0, space0 := used("dirQuotaUsedInodes"), used("dirQuotaUsedSpace")
-			refused("+2^40 inodes", john.HIncrBy(ctx, "dirQuotaUsedInodes", istr(clients), 1<<40).Err())
-			refused("-2^41 inodes", john.HIncrBy(ctx, "dirQuotaUsedInodes", istr(clients), -(1<<41)).Err())
-			refused("+16 GiB space", john.HIncrBy(ctx, "dirQuotaUsedSpace", istr(clients), 16<<30).Err())
-			if a, b := used("dirQuotaUsedInodes"), used("dirQuotaUsedSpace"); a != inodes0 || b != space0 {
-				t.Fatalf("/Clients usage %s/%s -> %s/%s", inodes0, space0, a, b)
-			}
-			m := meta.NewClient("redis://"+e.addr+"/"+strconv.Itoa(testDB), metaConf())
-			if _, err := m.Load(true); err != nil {
-				t.Fatal(err)
-			}
-			var ino meta.Ino
-			var attr meta.Attr
-			if st := m.Create(meta.Background(), B, "new.txt", 0o644, 0o022, 0, &ino, &attr); st != 0 {
-				t.Errorf("create in B: %v", st)
-			}
-			m.Shutdown()
-
-			// 20 GiB reported for A (a dir-stat flush) lets 20 GiB move
-			// /Clients, in two flushes; one more GiB beyond the slack not.
-			// (A juicefs create first: in enforce John then holds A.)
-			var x meta.Ino
-			if st := e.client("mac-john").Create(meta.Background(), A, "own.txt", 0o644, 0o022, 0, &x, &attr); st != 0 {
-				t.Fatal("create in A:", st)
-			}
-			const gib = int64(1 << 30)
-			if err := john.HIncrBy(ctx, "dirUsedSpace", istr(A), 20*gib).Err(); err != nil {
-				t.Fatal(err)
-			}
-			// A flush that is not committed (WATCH abort) books nothing.
-			watched := inoKey("i", A)
-			raw, _ := e.rdb.Get(ctx, watched).Bytes()
-			werr := john.Watch(ctx, func(tx *redis.Tx) error {
-				if err := e.rdb.Set(ctx, watched, raw, 0).Err(); err != nil {
-					return err
-				}
-				_, err := tx.TxPipelined(ctx, func(p redis.Pipeliner) error {
-					p.HIncrBy(ctx, "dirQuotaUsedSpace", istr(clients), 20*gib)
-					return nil
-				})
-				return err
-			}, watched)
-			if werr != redis.TxFailedErr {
-				t.Fatalf("watched flush: %v, want a WATCH abort", werr)
-			}
-			for i, d := range []int64{12 * gib, 8 * gib} {
-				if err := john.HIncrBy(ctx, "dirQuotaUsedSpace", istr(clients), d).Err(); err != nil {
-					t.Fatalf("flush %d of John's reported usage: %v", i, err)
-				}
-			}
-			refused("9 GiB unreported", john.HIncrBy(ctx, "dirQuotaUsedSpace", istr(clients), 9*gib).Err())
-			s0, _ := strconv.ParseInt(space0, 10, 64)
-			if got := used("dirQuotaUsedSpace"); got != strconv.FormatInt(s0+20*gib, 10) {
-				t.Errorf("/Clients space usage %s, want %d", got, s0+20*gib)
-			}
-
-			found := false
-			deadline := time.Now().Add(5 * time.Second)
-			for !found && time.Now().Before(deadline) {
-				time.Sleep(300 * time.Millisecond) // the window closes
-				for _, r := range e.records(auditlog.Filter{Person: "p-john", Types: []string{auditlog.TypeModified}}) {
-					for _, row := range r.Rows {
-						found = found || (r.Action == "quota" && row.Hash == "dirQuotaUsedSpace" && row.Ino == uint64(clients) &&
-							row.Value == strconv.FormatInt(20*gib, 10) && row.Path == "/Clients" && r.Committed == 2)
-					}
-				}
-			}
-			if !found {
-				t.Errorf("no quota record with John's committed 20 GiB on /Clients: %+v",
-					e.records(auditlog.Filter{Person: "p-john"}))
-			}
-		})
-	}
-}
 
 // TestAccountingCountersTakeOnlyIntegers: HINCRBYFLOAT on a quota-usage
 // hash left a float there, after which every new juicefs client failed to
@@ -255,14 +157,12 @@ func TestRefusedFloodKeepsEachPlace(t *testing.T) {
 }
 
 // TestGrantedJuiceFSWorkflowWithQuotas: ordinary juicefs work in a granted
-// project, with quotas on A and on /Clients above it: nothing is refused,
-// the quota usage of both converges, and the usage John's Mac flushed for
-// /Clients is in the audit log.
+// project with a quota on it and on a folder inside it: nothing is
+// refused, and the quota usage of both converges.
 func TestGrantedJuiceFSWorkflowWithQuotas(t *testing.T) {
 	e := newEnv(t, respproxy.ModeEnforce, johnGranted("/Clients/A"))
 	ctx := context.Background()
-	A, clients := e.ino["/Clients/A"], e.ino["/Clients"]
-	setQuota(t, e, "/Clients", 1<<40, 100000)
+	A := e.ino["/Clients/A"]
 	setQuota(t, e, "/Clients/A", 1<<40, 100000)
 	jm := meta.NewClient("redis://mac-john:"+passOf("mac-john")+"@"+e.paddr+"/"+strconv.Itoa(testDB), metaConf())
 	if _, err := jm.Load(true); err != nil {
@@ -308,25 +208,17 @@ func TestGrantedJuiceFSWorkflowWithQuotas(t *testing.T) {
 	deadline := time.Now().Add(15 * time.Second)
 	for {
 		qa, _ := e.rdb.HGet(ctx, "dirQuotaUsedSpace", istr(A)).Int64()
-		qc, _ := e.rdb.HGet(ctx, "dirQuotaUsedSpace", istr(clients)).Int64()
-		if qa >= 1<<20 && qc >= 1<<20 {
+		qi, _ := e.rdb.HGet(ctx, "dirQuotaUsedInodes", istr(A)).Int64()
+		if qa >= 1<<20 && qi == 2 { // g.txt and b.mov
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("quota usage A %d /Clients %d: the flush did not land", qa, qc)
+			t.Fatalf("quota usage of A %d bytes, %d inodes: the flush did not land", qa, qi)
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
-	time.Sleep(500 * time.Millisecond) // the quota window closes
 	if recs := e.records(auditlog.Filter{Person: "p-john", Types: []string{auditlog.TypeRefused}}); len(recs) > 0 {
 		t.Errorf("refusals: %+v", recs)
-	}
-	logged := false
-	for _, r := range e.records(auditlog.Filter{Person: "p-john", Types: []string{auditlog.TypeModified}}) {
-		logged = logged || (r.Action == "quota" && hasRow(r, "dirQuotaUsedSpace", clients))
-	}
-	if !logged {
-		t.Error("no audit record of the usage John's Mac flushed for /Clients")
 	}
 }
 
@@ -387,7 +279,7 @@ func TestOversizedUnitKeepsLogReadable(t *testing.T) {
 		}
 	}
 	if big == nil || len(big.Ops) > 256 || big.Omitted != n-len(big.Ops) || !strings.HasPrefix(big.Digest, "sha256:") ||
-		!strings.Contains(big.Detail, "more entries") {
+		!strings.Contains(big.Detail, "more entries") || len(big.Digest) != len("sha256:")+64 {
 		t.Errorf("the large unit's intent: %+v", big)
 	}
 }

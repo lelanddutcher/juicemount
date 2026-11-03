@@ -1,53 +1,14 @@
 package respproxy
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"strings"
 	"testing"
-	"time"
-)
 
-// The ledger of quota usage above a person's grants: a claim within the
-// reported usage plus the slack lands, one beyond it does not, a claim
-// taken back (not committed) frees its room, and an excess left by a lost
-// dir-stat flush decays instead of blocking the Mac's flushes for good.
-func TestQuotaLedger(t *testing.T) {
-	var l quotaLedger
-	now := time.Unix(1_000_000, 0)
-	const dir = 2
-	s := ledgerSlack[0]
-	move := func(d int64) []ledgerMove { return []ledgerMove{{dir: dir, idx: 0, delta: d}} }
-	if _, bad, _ := l.apply("m", nil, move(s+1), now); bad == nil {
-		t.Fatal("a claim beyond the slack with nothing reported landed")
-	}
-	undo, bad, _ := l.apply("m", move(3*s), move(3*s), now)
-	if bad != nil {
-		t.Fatalf("a claim of what was reported: refused (balance %+v)", l.m)
-	}
-	undo()
-	undo() // once only
-	if _, bad, _ := l.apply("m", nil, move(3*s), now); bad != nil {
-		t.Fatal("a claim taken back still counted")
-	}
-	// Lost credit: s/2 over, then another s/2+1 does not fit until the
-	// excess decays (s an hour).
-	if _, bad, _ := l.apply("m", nil, move(s/2), now); bad != nil {
-		t.Fatal(bad)
-	}
-	if _, bad, _ := l.apply("m", nil, move(s/2+1), now); bad == nil {
-		t.Fatal("past the slack")
-	}
-	if _, bad, _ := l.apply("m", nil, move(s/2+1), now.Add(time.Hour/2)); bad != nil {
-		t.Fatal("the excess did not decay")
-	}
-	// Another Mac has its own balance; a deficit (credit not yet
-	// claimed) does not decay.
-	l.apply("other", move(s), nil, now)
-	if _, bad, _ := l.apply("other", nil, move(2*s), now.Add(10*time.Hour)); bad != nil {
-		t.Fatal("the reported usage of another Mac decayed")
-	}
-	if satAdd(1<<62, 1<<62) != 1<<63-1 || satAdd(-1<<62, -1<<62-1) != -1<<63 {
-		t.Error("satAdd wraps")
-	}
-}
+	"github.com/lelanddutcher/juicemount/internal/auditlog"
+)
 
 func TestAccountingValueDenial(t *testing.T) {
 	key := func(name string) KeyRef { return ParseKey(name) }
@@ -75,5 +36,38 @@ func TestAccountingValueDenial(t *testing.T) {
 		if d := accountingValueDenial(Principal{Name: "x", Kind: c.kind}, u); (d != nil) != c.bad {
 			t.Errorf("%q by %s: %v", c.args, c.kind, d)
 		}
+	}
+}
+
+// A capped intent stays within its encoded bound whatever its names hold:
+// JSON escapes a byte to up to six, so a byte limit on names and paths
+// alone let one reach 4.3 MB (review round 4). The digest is that of the
+// unit's commands in RESP, as an AOF holds them.
+func TestCapRecordBoundsEncodedSize(t *testing.T) {
+	cmds := []Cmd{{Args: [][]byte{[]byte("HSET"), []byte("d5"), []byte("a"), []byte("\x01b")}}, {Args: [][]byte{[]byte("SET"), []byte("i6"), {}}}}
+	for _, ch := range []string{"a", "<", "\x01"} {
+		n, p := strings.Repeat(ch, 300), strings.Repeat(ch, 5000)
+		r := auditlog.Record{Type: auditlog.TypeIntent, Detail: strings.Repeat(ch, 512), Principal: "mac-x", Person: "p-x"}
+		for i := 0; i < 1000; i++ {
+			r.Ops = append(r.Ops, auditlog.Op{Op: "remove", Parent: 1 << 60, Name: n, Ino: 1 << 60, Dir: true, Trash: true, Path: p})
+			r.Rows = append(r.Rows, auditlog.Row{Hash: "dirQuotaUsedInodes", Ino: 1 << 60, Op: "incr", Value: "-9223372036854775808", Path: p})
+			r.Inodes = append(r.Inodes, 1<<60)
+			r.Attrs = append(r.Attrs, auditlog.AttrChange{Ino: 1 << 60, Field: "attr", Old: p, New: p})
+			r.Projects = append(r.Projects, auditlog.Project{Ino: 1 << 60, Path: p})
+		}
+		capRecord(&r, intentLimits, cmds)
+		b, _ := json.Marshal(r)
+		if len(b) > intentLimits.encoded || r.Omitted == 0 || len(r.Ops) == 0 {
+			t.Errorf("%q: %d bytes (bound %d), omitted %d, %d ops", ch, len(b), intentLimits.encoded, r.Omitted, len(r.Ops))
+		}
+		want := sha256.Sum256([]byte("*4\r\n$4\r\nHSET\r\n$2\r\nd5\r\n$1\r\na\r\n$2\r\n\x01b\r\n*3\r\n$3\r\nSET\r\n$2\r\ni6\r\n$0\r\n\r\n"))
+		if r.Digest != "sha256:"+hex.EncodeToString(want[:]) {
+			t.Errorf("digest %s", r.Digest)
+		}
+	}
+	small := auditlog.Record{Type: auditlog.TypeIntent, Ops: []auditlog.Op{{Op: "add", Name: "x"}}}
+	capRecord(&small, intentLimits, cmds)
+	if small.Omitted != 0 || small.Digest != "" || len(small.Ops) != 1 {
+		t.Errorf("an intent within the bounds was changed: %+v", small)
 	}
 }
