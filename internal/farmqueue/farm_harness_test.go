@@ -66,7 +66,12 @@ const (
 	harnessTransientBudget = 3
 	harnessIneligible      = 80
 	harnessChaosWindow     = 2500 * time.Millisecond
-	harnessQuietTimeout    = 25 * time.Second
+	// The farm settles once chaos ends; a loaded host only slows it. The
+	// harness waits while jobs and receipts keep changing state and fails
+	// once nothing has changed for harnessQuietStall, or at harnessQuietLimit
+	// whatever happens (a delivery cycling forever).
+	harnessQuietStall = 25 * time.Second
+	harnessQuietLimit = 90 * time.Second
 	// harnessAbsentCapability is a capability no harness worker has, so the
 	// ineligible backlog stays queued in front of eligible work for the whole
 	// run and every claim must look past it.
@@ -237,10 +242,13 @@ type farmHarness struct {
 	parents    map[string]Job
 	parentDirs []string
 	children   map[string]Job
-	ineligible map[string]bool
-	live       map[int]*harnessWorker
-	stats      map[string]int
-	chaosOn    bool
+	// unconfirmed are the children only a failed walk named. Its write may or
+	// may not have landed; one is a job only once its record exists.
+	unconfirmed map[string]Job
+	ineligible  map[string]bool
+	live        map[int]*harnessWorker
+	stats       map[string]int
+	chaosOn     bool
 	// probes are the scenarios every seed runs once while chaos is on, so
 	// that no run passes without exercising them.
 	probes   map[string]bool
@@ -258,7 +266,8 @@ func runFarmHarnessSeed(t *testing.T, backend harnessBackend, seed int64) map[st
 		rng:    rand.New(rand.NewSource(seed)),
 		grants: map[string][]harnessGrant{}, commits: map[string][]harnessCommit{},
 		walks: map[string][]harnessWalk{}, parents: map[string]Job{}, children: map[string]Job{},
-		ineligible: map[string]bool{}, live: map[int]*harnessWorker{}, stats: map[string]int{},
+		unconfirmed: map[string]Job{},
+		ineligible:  map[string]bool{}, live: map[int]*harnessWorker{}, stats: map[string]int{},
 	}
 	defer cancel()
 	admin := redis.NewClient(backend.options())
@@ -287,7 +296,7 @@ func runFarmHarnessSeed(t *testing.T, backend harnessBackend, seed int64) map[st
 		go h.supervise(slot)
 	}
 	h.chaos(harnessChaosWindow)
-	converged := h.quiesce(harnessQuietTimeout)
+	converged := h.quiesce()
 	h.stopWorkers()
 	if !converged {
 		return h.snapshotStats()
@@ -1190,9 +1199,18 @@ func (h *farmHarness) recordWalk(parentID string, walk harnessWalk) {
 	}
 	h.walks[parentID] = append(prior, walk)
 	for _, child := range walk.children {
-		if _, seen := h.children[child.ID]; !seen {
-			h.children[child.ID] = child
+		if _, seen := h.children[child.ID]; seen {
+			continue
 		}
+		// A walk whose enqueue failed may have written nothing; a file added
+		// before the replay walks then names that shard differently, and the
+		// child it would have been never exists.
+		if walk.err != nil {
+			h.unconfirmed[child.ID] = child
+			continue
+		}
+		delete(h.unconfirmed, child.ID)
+		h.children[child.ID] = child
 	}
 }
 
@@ -1247,7 +1265,10 @@ func harnessTerminal(status string) bool {
 	return status == StatusDone || status == StatusFailed || status == StatusCanceled || status == StatusDispatched
 }
 
-func (h *farmHarness) knownJobs() (parents, children map[string]Job, ineligible map[string]bool) {
+// knownJobs returns the jobs the harness enqueued or a planner returned. A
+// child only a failed walk named counts once records holds it: that walk's
+// write landed after all.
+func (h *farmHarness) knownJobs(records map[string]harnessRecord) (parents, children map[string]Job, ineligible map[string]bool) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	parents, children, ineligible = map[string]Job{}, map[string]Job{}, map[string]bool{}
@@ -1256,6 +1277,11 @@ func (h *farmHarness) knownJobs() (parents, children map[string]Job, ineligible 
 	}
 	for id, job := range h.children {
 		children[id] = job
+	}
+	for id, job := range h.unconfirmed {
+		if _, landed := records[id]; landed {
+			children[id] = job
+		}
 	}
 	for id := range h.ineligible {
 		ineligible[id] = true
@@ -1303,28 +1329,59 @@ func harnessRawID(raw string) string {
 // quiesce waits, fault-free, until every eligible job is terminal and every
 // receipt has been released. Dead workers have been aged, so the live
 // workers' reapers can recover anything left behind. A job that never
-// settles while its holder is alive and idle is stranded.
-func (h *farmHarness) quiesce(timeout time.Duration) bool {
-	deadline := time.Now().Add(timeout)
+// settles while its holder is alive and idle is stranded: the farm stops
+// changing state. Progress, not a wall-clock deadline, keeps the wait going,
+// so a slow host is not mistaken for a stuck farm.
+func (h *farmHarness) quiesce() bool {
+	start := time.Now()
+	state, stalled := "", start.Add(harnessQuietStall)
 	for {
 		pending, receipts, err := h.unsettled()
 		if err == nil && len(pending) == 0 && len(receipts) == 0 {
 			return true
 		}
-		if time.Now().After(deadline) {
-			h.diagnoseUnsettled(pending, receipts, err)
+		now := time.Now()
+		if next := harnessFarmState(pending, receipts, err); next != state {
+			state, stalled = next, now.Add(harnessQuietStall)
+		}
+		if now.After(stalled) || now.Sub(start) > harnessQuietLimit || h.ctx.Err() != nil {
+			why := fmt.Sprintf("made no progress for %s", harnessQuietStall)
+			if !now.After(stalled) {
+				why = fmt.Sprintf("did not settle within %s", now.Sub(start).Round(time.Second))
+			}
+			h.diagnoseUnsettled(why, pending, receipts, err)
 			return false
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
 }
 
+// harnessFarmState summarises what quiesce waits on; any change in it is
+// progress.
+func harnessFarmState(pending map[string]harnessRecord, receipts map[string][]string, err error) string {
+	if err != nil {
+		return "read failed"
+	}
+	var parts []string
+	for id, record := range pending {
+		parts = append(parts, fmt.Sprintf("%s:%s:%s:%s:%s:%s", id, record.fields["status"], record.fields["delivery_token"],
+			record.fields["lease_owner"], record.fields["processed"], record.fields["hardware_failures"]))
+	}
+	for key, raws := range receipts {
+		for _, raw := range raws {
+			parts = append(parts, key+"<"+harnessRawID(raw))
+		}
+	}
+	sort.Strings(parts)
+	return strings.Join(parts, ",")
+}
+
 func (h *farmHarness) unsettled() (pending map[string]harnessRecord, receipts map[string][]string, err error) {
-	parents, children, _ := h.knownJobs()
 	records, err := h.records()
 	if err != nil {
 		return nil, nil, err
 	}
+	parents, children, _ := h.knownJobs(records)
 	pending = map[string]harnessRecord{}
 	for id := range parents {
 		if record := records[id]; !harnessTerminal(record.fields["status"]) {
@@ -1340,9 +1397,9 @@ func (h *farmHarness) unsettled() (pending map[string]harnessRecord, receipts ma
 	return pending, receipts, err
 }
 
-func (h *farmHarness) diagnoseUnsettled(pending map[string]harnessRecord, receipts map[string][]string, err error) {
+func (h *farmHarness) diagnoseUnsettled(why string, pending map[string]harnessRecord, receipts map[string][]string, err error) {
 	if err != nil {
-		h.errorf("did not settle within %s; last read failed: %v", harnessQuietTimeout, err)
+		h.errorf("farm %s; last read failed: %v", why, err)
 		return
 	}
 	holders := map[string]string{}
@@ -1365,11 +1422,22 @@ func (h *farmHarness) diagnoseUnsettled(pending map[string]harnessRecord, receip
 			tokenUse[grant.token] = fmt.Sprintf("delivery %d of %s to %s", grant.serial, jobID, grant.name)
 		}
 	}
+	namedBy := map[string][]string{}
+	for parentID, walks := range h.walks {
+		for i, walk := range walks {
+			for _, child := range walk.children {
+				namedBy[child.ID] = append(namedBy[child.ID], fmt.Sprintf("walk %d of %s (err=%v)", i+1, parentID, walk.err))
+			}
+		}
+	}
 	h.mu.Unlock()
 	var lines []string
 	for id, record := range pending {
 		line := fmt.Sprintf("%s status=%q delivery_token=%q lease_owner=%q", id, record.fields["status"],
 			record.fields["delivery_token"], record.fields["lease_owner"])
+		if record.fields == nil {
+			line += "; no record, named by " + strings.Join(namedBy[id], ", ")
+		}
 		if key := holders[id]; key != "" {
 			owner := strings.TrimPrefix(strings.TrimPrefix(key, ProcessingPrefix), TrackedProcessingPrefix)
 			current, alive := liveCurrent[owner]
@@ -1393,8 +1461,8 @@ func (h *farmHarness) diagnoseUnsettled(pending map[string]harnessRecord, receip
 		}
 	}
 	sort.Strings(lines)
-	h.errorf("did not settle within %s with every worker healthy; %d job(s) and receipts stranded:\n  %s",
-		harnessQuietTimeout, len(pending), strings.Join(lines, "\n  "))
+	h.errorf("farm %s with every worker healthy; %d job(s) and receipts stranded:\n  %s",
+		why, len(pending), strings.Join(lines, "\n  "))
 }
 
 // finalReap lets the reaper see every worker dead and aged: it must find
@@ -1410,12 +1478,12 @@ func (h *farmHarness) finalReap() {
 }
 
 func (h *farmHarness) check() {
-	parents, children, ineligible := h.knownJobs()
 	records, err := h.records()
 	if err != nil {
 		h.errorf("read job records: %v", err)
 		return
 	}
+	parents, children, ineligible := h.knownJobs(records)
 	h.mu.Lock()
 	grants := make(map[string][]harnessGrant, len(h.grants))
 	for id, list := range h.grants {
@@ -1430,6 +1498,11 @@ func (h *farmHarness) check() {
 		walks[id] = append([]harnessWalk(nil), list...)
 	}
 	h.stats["jobs"] += len(parents) + len(children)
+	for id := range h.unconfirmed {
+		if _, landed := records[id]; !landed {
+			h.stats["failed_walk_children_unwritten"]++
+		}
+	}
 	h.mu.Unlock()
 
 	// Every record belongs to a job the harness enqueued or a planner
