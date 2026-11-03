@@ -64,6 +64,10 @@ type unitFacts struct {
 	// quota: directory inodes whose quota definition (dirQuota) the unit
 	// writes. Unlike dirStat it is kept when the unit writes more.
 	quota []uint64
+	// statRows: every dir-stat, quota and deferred-delete field the unit
+	// writes, kept (unlike dirStat) when the unit writes more: the grant
+	// check places each one and the audit log lists them.
+	statRows []statRow
 	// topology: the unit moves a directory between two parents (rename,
 	// exchange, restore from trash). It takes the proxy-wide topology lock
 	// and bumps the project-cache generation when it commits.
@@ -72,6 +76,84 @@ type unitFacts struct {
 	unresolvable []string
 	// touched: every inode the unit names (invalidated after it ends).
 	touched []uint64
+}
+
+// statRow is one field of a volume-wide accounting hash: a dir-stat or
+// quota-usage counter, a quota definition (dirQuota), or a deferred-delete
+// record (delfiles, detachedNodes; dir is then the inode it names).
+type statRow struct {
+	hash string // the key: dirUsedSpace, dirQuotaUsedInodes, dirQuota, delfiles, ...
+	dir  uint64
+	op   string // set, incr or del; add or remove for delfiles / detachedNodes
+	val  string // set: the value; incr: the delta
+}
+
+// quotaUsage: the hash holds the usage of a quota (juicefs checks a write
+// against it, so an inflated value refuses writes with EDQUOT).
+func (r statRow) quotaUsage() bool {
+	return r.hash == "dirQuotaUsedSpace" || r.hash == "dirQuotaUsedInodes"
+}
+
+// gc: a deferred-delete record (its inode is placed like a written one).
+func (r statRow) gc() bool { return r.hash == "delfiles" || r.hash == "detachedNodes" }
+
+// statRowsOf lists the fields one dir-stat, quota or gc command writes
+// (the fields unitFieldInodes names, with what is written).
+func statRowsOf(name string, key KeyRef, args [][]byte) []statRow {
+	field := func(b []byte) (uint64, bool) {
+		if i := bytes.IndexByte(b, ':'); i > 0 {
+			b = b[:i]
+		}
+		return digits(string(b))
+	}
+	val := func(b []byte) string {
+		if len(b) > 64 {
+			return string(b[:64]) + "..."
+		}
+		return string(b)
+	}
+	var out []statRow
+	add := func(b []byte, op, v string) {
+		if n, ok := field(b); ok {
+			out = append(out, statRow{hash: key.Shape, dir: n, op: op, val: v})
+		}
+	}
+	switch {
+	case key.Group == "dirstat" || key.Group == "quota":
+		switch name {
+		case "HINCRBY", "HINCRBYFLOAT", "HSETNX":
+			op := "incr"
+			if name == "HSETNX" {
+				op = "set"
+			}
+			if len(args) > 3 {
+				add(args[2], op, val(args[3]))
+			} else if len(args) > 2 {
+				add(args[2], op, "")
+			}
+		case "HSET", "HMSET":
+			for i := 2; i < len(args); i += 2 {
+				v := ""
+				if i+1 < len(args) {
+					v = val(args[i+1])
+				}
+				add(args[i], "set", v)
+			}
+		case "HDEL":
+			for _, a := range args[2:] {
+				add(a, "del", "")
+			}
+		}
+	case (key.Shape == "delfiles" || key.Shape == "detachedNodes") && name == "ZADD":
+		for i := 3; i < len(args); i += 2 {
+			add(args[i], "add", "")
+		}
+	case (key.Shape == "delfiles" || key.Shape == "detachedNodes") && name == "ZREM":
+		for _, a := range args[2:] {
+			add(a, "remove", "")
+		}
+	}
+	return out
 }
 
 // dirStatOnly: the unit writes nothing but dir-stat fields (the juicefs
@@ -220,6 +302,7 @@ func analyzeUnit(u *Unit) *unitFacts {
 		case "dirstat", "quota":
 			ns := unitFieldInodes(c.Info.Name, w.Key, c.Args)
 			f.dirStat = append(f.dirStat, ns...)
+			f.statRows = append(f.statRows, statRowsOf(c.Info.Name, w.Key, c.Args)...)
 			if w.Key.Group == "quota" {
 				f.quota = append(f.quota, ns...)
 			}
@@ -227,6 +310,7 @@ func analyzeUnit(u *Unit) *unitFacts {
 			// delfiles / detachedNodes members name an inode, which is
 			// anchored like a written one; slice records are covered by
 			// Unit.RefInodes below.
+			f.statRows = append(f.statRows, statRowsOf(c.Info.Name, w.Key, c.Args)...)
 			for _, n := range unitFieldInodes(c.Info.Name, w.Key, c.Args) {
 				if isTrashIno(n) {
 					if f.trashKey == "" {
@@ -255,7 +339,7 @@ func analyzeUnit(u *Unit) *unitFacts {
 
 	// Dir-stat rows of an hourly trash directory created by this same txn
 	// ride with the allow-listed creation (checkTrash's mknod, base.go:2488).
-	if len(f.dirStat) > 0 {
+	if len(f.statRows) > 0 {
 		created := map[uint64]bool{}
 		for _, w := range u.Writes {
 			c := u.Cmds[w.Cmd]
@@ -275,9 +359,17 @@ func analyzeUnit(u *Unit) *unitFacts {
 			}
 		}
 		f.dirStat = kept
+		rows := f.statRows[:0]
+		for _, r := range f.statRows {
+			if r.gc() || !(isTrashIno(r.dir) && created[r.dir]) {
+				rows = append(rows, r)
+			}
+		}
+		f.statRows = rows
 	}
 	// In a unit that also writes entries or inodes, dir-stat fields ride
-	// along (mknod initialises the new dir's rows; rmdir drops them).
+	// along for the lease rules (mknod initialises the new dir's rows;
+	// rmdir drops them). The grant check still places every one (statRows).
 	if len(f.dentries) > 0 || len(f.inodes) > 0 {
 		f.dirStat = nil
 	}

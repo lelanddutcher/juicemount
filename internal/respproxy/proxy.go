@@ -1347,7 +1347,7 @@ func (c *conn) upstreamName() string { return UpstreamName(c.principal.Name, c.i
 
 func (c *conn) newUnit(kind UnitKind, cmds []Cmd) *Unit {
 	u := &Unit{Kind: kind, DB: c.db, Cmds: cmds, Mode: c.p.Mode(), ConnID: c.id, Remote: c.remote,
-		wantAudit: c.p.audit != nil}
+		wantAudit: c.p.auditOn() != nil} // no description while the log is off (a single-user volume)
 	if c.principal != nil {
 		u.UpstreamName = c.upstreamName()
 		if c.principal.Kind == KindMac {

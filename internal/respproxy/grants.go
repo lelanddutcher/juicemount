@@ -34,8 +34,12 @@ package respproxy
 //     says which), so nobody takes another project's deleted files;
 //   - a quota definition (a dirQuota row) needs a grant on its directory,
 //     also above the project depth, and also when it rides along a write
-//     that is otherwise covered; the usage counters above the project depth
-//     (dir-stat flushes) stay open;
+//     that is otherwise covered;
+//   - so does every dir-stat and quota-usage row, also one that rides along
+//     a covered write, except the dir-stat counters above the project depth
+//     and the quota-usage increments of a folder above a granted one (the
+//     flush of the person's own writes); rows of an inode the unit itself
+//     creates or removes go with that inode;
 //   - a place the proxy cannot resolve is not covered (fail closed).
 //
 // The check runs in every proxy mode (passthrough and observe relax only
@@ -272,6 +276,29 @@ func (e *LeaseEngine) lookupPath(path string) (uint64, error) {
 	return dir, nil
 }
 
+// aboveGrants: the directories above the granted ones (their ancestors).
+func (e *LeaseEngine) aboveGrants(granted map[uint64]bool) (map[uint64]bool, error) {
+	out := map[uint64]bool{}
+	for g := range granted {
+		d := g
+		for i := 0; d != rootIno; i++ {
+			if i == 4096 {
+				return nil, errUnresolved
+			}
+			p, err := e.anc.parentOfDir(d)
+			if err != nil {
+				return nil, err
+			}
+			if out[p] {
+				break
+			}
+			out[p] = true
+			d = p
+		}
+	}
+	return out, nil
+}
+
 // covered: directory d, or a directory above it, is granted.
 func (e *LeaseEngine) covered(d uint64, granted map[uint64]bool) (bool, error) {
 	for i := 0; i < 4096; i++ {
@@ -359,22 +386,54 @@ func (e *LeaseEngine) grantCheck(p Principal, u *Unit, f *unitFacts) *Denial {
 			return d
 		}
 	}
-	if f.dirStatOnly() {
-		for _, dir := range f.dirStat {
-			loc, err := e.anc.resolveDir(dir)
-			if err != nil {
-				return deny(0, "dir-stat row of an unresolvable directory "+inoStr(dir))
-			}
-			if loc.kind == nsRoot {
-				// Usage counters of a folder above the project depth
-				// (the lease engine also leaves them open); quota rows
-				// were checked above.
-				continue
-			}
+	// Every dir-stat and quota field, also one that rides along a unit
+	// that writes more (the lease rules let those through): a field of an
+	// inode the unit itself writes (mknod's rows of the new directory,
+	// rmdir's of the removed one) is placed with that inode below; any
+	// other names a directory the grants must cover, except two kinds of
+	// rows above the project depth: the dir-stat counters, which enforce
+	// nothing, and the quota-usage increments of a folder that holds one
+	// of the person's grants, which juicefs flushes for every write below
+	// it (doFlushQuotas). Overwriting or removing a quota's usage, or
+	// changing it for a folder the person has no grant below, would let a
+	// person make another project hit its quota (EDQUOT).
+	own := make(map[uint64]bool, len(f.inodes))
+	for _, n := range f.inodes {
+		own[n] = true
+	}
+	var above map[uint64]bool
+	for _, r := range f.statRows {
+		if r.gc() || own[r.dir] {
+			continue
+		}
+		loc, err := e.anc.resolveDir(r.dir)
+		if err != nil {
+			return deny(0, r.hash+" row of an unresolvable directory "+inoStr(r.dir))
+		}
+		if loc.kind != nsRoot {
 			if d := scope(loc); d != nil {
 				return d
 			}
+			continue
 		}
+		if !r.quotaUsage() {
+			continue // dir-stat counters; quota definitions were checked above
+		}
+		if r.op == "incr" {
+			if above == nil {
+				if above, err = e.aboveGrants(granted); err != nil {
+					return deny(0, "grant lookup failed: "+err.Error())
+				}
+			}
+			if above[r.dir] {
+				continue
+			}
+		}
+		if d := dirCovered(r.dir, "the quota usage ("+r.hash+") of folder "+inoStr(r.dir)); d != nil {
+			return d
+		}
+	}
+	if f.dirStatOnly() {
 		return nil
 	}
 	locs, pd := e.placeUnit(u, f, placeGrant)

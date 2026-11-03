@@ -248,6 +248,20 @@ func TestPeopleFormatFollowsProxyImage(t *testing.T) {
 	if raw, _ = proxyFile(t, dir); oldProxyParse(raw) != nil {
 		t.Fatalf("after a downgrade the file is not version 1:\n%s", raw)
 	}
+	if snap := s.PeopleSnapshot(); snap.GrantsSent || !strings.Contains(snap.Problem, "does not support person grants") {
+		t.Fatalf("after a downgrade the grants are lifted without a problem: %+v", snap)
+	}
+	// With people but no grant, the downgrade stops the per-person log.
+	all := personAccessAll
+	if err := s.UpdatePerson(john.ID, nil, &all); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetRestrictUnassigned(false); err != nil {
+		t.Fatal(err)
+	}
+	if snap := s.PeopleSnapshot(); snap.GrantsInForce || !strings.Contains(snap.Problem, "does not support people") {
+		t.Fatalf("downgraded proxy with unscoped people: %+v", snap)
+	}
 }
 
 // TestProxyFileUnchangedWithoutPeople: an install that never made a person

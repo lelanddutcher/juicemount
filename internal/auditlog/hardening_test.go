@@ -131,11 +131,14 @@ func TestLazyWriterTouchesNothingUntilActivated(t *testing.T) {
 	if _, err := os.Stat(dir); !os.IsNotExist(err) {
 		t.Fatalf("the directory exists before Activate: %v", err)
 	}
-	if h, err := ReadHealth(health); err != nil || h.Active || h.Healthy {
-		t.Fatalf("health before Activate: %+v, %v", h, err)
+	if _, err := os.Stat(health); !os.IsNotExist(err) {
+		t.Fatalf("a health file exists before Activate: %v", err)
 	}
 	if err := w.Activate(); err != nil {
 		t.Fatal(err)
+	}
+	if h, err := ReadHealth(health); err != nil || !h.Active || !h.Healthy {
+		t.Fatalf("health after Activate: %+v, %v", h, err)
 	}
 	if _, err := w.Append(&Record{Type: TypeIntent}); err != nil {
 		t.Fatal(err)
@@ -153,6 +156,13 @@ func TestLazyWriterTouchesNothingUntilActivated(t *testing.T) {
 		t.Fatal(err)
 	}
 	w2.Close()
+	// A health file of an earlier run with the log on is rewritten as
+	// off, so the Manager does not report it stale.
+	w3 := mustOpen(t, dir, Options{Lazy: true, HealthPath: health})
+	if h, err := ReadHealth(health); err != nil || h.Active || h.Healthy || time.Since(time.UnixMilli(h.TS)) > time.Minute {
+		t.Fatalf("leftover health file after a Lazy open: %+v, %v", h, err)
+	}
+	w3.Close()
 }
 
 // Retention removes the oldest segments past the size limit, first

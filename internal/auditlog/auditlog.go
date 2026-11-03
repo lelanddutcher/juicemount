@@ -8,10 +8,10 @@
 // chain at the next line (Verify). The chain is not keyed: whoever can write
 // the directory can rewrite it and recompute every hash, and cutting lines
 // off the END is not detectable from the file alone (the newest records can
-// be lost to a crash as well as removed). The Manager closes most of that
-// gap with anchors (Anchor, Follow, VerifyAnchors): it records the head of
-// the log every minute in its own state, outside this directory, and a
-// rewrite or truncation of anything before the last anchor no longer
+// be lost to a crash as well as removed). The Manager narrows that gap with
+// anchors (Anchor, Follow, VerifyAnchors): it records the head of the log
+// every minute in its own state, outside this directory, and a rewrite of
+// anything before the last anchor, or a truncation to before it, no longer
 // verifies. Someone who can write both places can still rewrite both.
 //
 // The log is split into segments named audit-<first seq>.jsonl; the chain
@@ -19,22 +19,30 @@
 // Retention (Options.RetainBytes, Options.RetainAge) removes the oldest
 // closed segments; before it does, it appends a "retention" record that
 // names the first record kept and that record's "prev", so the chain still
-// verifies from the retained start (and a log whose start was cut without
-// such a record does not).
+// verifies from the retained start, and a log whose start was cut without
+// such a record does not. That record is not authenticated either: whoever
+// can write the directory can remove the oldest segments and append one,
+// chained to the head. The chain alone cannot tell; the Manager judges each
+// retention record it reads against the policy and its anchors
+// (CheckRetention, Uncovered), which catches a cut the policy would not
+// have made, but not one it could have.
 //
 // Append never blocks the caller on disk: it assigns the sequence number and
 // queues the record; one writer goroutine encodes, writes and fsyncs in
 // batches (group commit: everything queued while the previous batch was
 // being written goes out with one write and one fsync). AppendDurable
 // queues a record and waits until that batch is fsynced, for a caller that
-// must not act before its record is on disk. A failed write or fsync puts
-// the writer in the failed state: Append then refuses (ErrUnavailable) until
-// a retry reopens the segment and writes a "gap" record that counts the
-// records lost meanwhile.
+// must not act before its record is on disk. A failed write or fsync, or a
+// segment that is no longer at its path (the directory or file was removed
+// or replaced; checked before every write), puts the writer in the failed
+// state: Append then refuses (ErrUnavailable) until a retry reopens the log
+// (running retention first, so a log that filled its disk can recover) and
+// writes a "gap" record that counts the records lost meanwhile.
 //
 // A Lazy writer touches nothing on disk until Activate: the proxy keeps the
 // log off until the first person exists. With Options.HealthPath the writer
-// keeps a small JSON health file (Health) there for the Manager.
+// keeps a small JSON health file (Health) there for the Manager, from the
+// moment it is active.
 package auditlog
 
 import (
@@ -94,14 +102,21 @@ type Record struct {
 	PersonName string `json:"person_name,omitempty"`
 
 	// Action summarizes a namespace unit: create, remove, rename, trash,
-	// restore, link, setattr or other.
+	// restore, link, setattr, quota (a quota or its usage, nothing else),
+	// accounting (dir-stat or deferred-delete rows only) or other; and
+	// "collapsed" for a refused record that counts refusals (Count, First,
+	// Last) not logged one by one.
 	Action   string    `json:"action,omitempty"`
 	Projects []Project `json:"projects,omitempty"`
 	Ops      []Op      `json:"ops,omitempty"`
 	Inodes   []uint64  `json:"inodes,omitempty"` // inodes whose own keys a setattr unit writes
+	// Rows: the dir-stat, quota and deferred-delete fields the unit
+	// writes (also those that ride along a namespace change).
+	Rows []Row `json:"rows,omitempty"`
 
 	// TypeModified: Inode's contents were written Count times between
-	// First and Last (unix ms).
+	// First and Last (unix ms). A collapsed TypeRefused: Count refusals
+	// between First and Last.
 	Inode        uint64 `json:"inode,omitempty"`
 	First        int64  `json:"first_ms,omitempty"`
 	Last         int64  `json:"last_ms,omitempty"`
@@ -137,6 +152,18 @@ type AttrChange struct {
 	Field string `json:"field"` // mode, uid, gid, flags, acl, or "attr" (unreadable or new)
 	Old   string `json:"old,omitempty"`
 	New   string `json:"new,omitempty"`
+}
+
+// Row is one field of a volume-wide accounting hash a unit writes: a
+// dir-stat or quota-usage counter of directory Ino (dirUsedSpace,
+// dirQuotaUsedInodes, ...), its quota definition (dirQuota), or a
+// deferred-delete record naming inode Ino (delfiles, detachedNodes).
+type Row struct {
+	Hash  string `json:"hash"`
+	Ino   uint64 `json:"ino"`
+	Op    string `json:"op"`              // set, incr or del; add or remove (delfiles)
+	Value string `json:"value,omitempty"` // set: the value; incr: the delta
+	Path  string `json:"path,omitempty"`  // the directory's path, when known
 }
 
 // Project is a project root a unit touches, with its display path when the
@@ -239,8 +266,14 @@ type Writer struct {
 	wake chan struct{}
 	done chan struct{}
 
+	// note (under mu): why a failed writer stays failed (Health.Note).
+	note string
+
 	// writer goroutine (and Open / Activate) only
 	f          *os.File
+	path       string      // f's segment
+	fi         os.FileInfo // f when opened: a removed or replaced segment is noticed
+	unnamed    *Record     // a retention that removed segments before its record was written
 	segSize    int64
 	lastHash   string
 	lastHealth Health
@@ -287,7 +320,12 @@ func Open(dir string, opts Options) (*Writer, error) {
 	w := &Writer{dir: dir, opts: opts, wake: make(chan struct{}, 1), done: make(chan struct{})}
 	w.cond = sync.NewCond(&w.mu)
 	if opts.Lazy {
-		w.writeHealth(true)
+		// No health file for a log that is off (a single-user volume
+		// keeps its state directory as before); one left by an earlier
+		// run that had the log on is rewritten, so it does not go stale.
+		if _, err := os.Stat(opts.HealthPath); opts.HealthPath != "" && err == nil {
+			w.writeHealth(true)
+		}
 		return w, nil
 	}
 	return w, w.activate()
@@ -454,7 +492,15 @@ func (w *Writer) reopen() (torn int64, err error) {
 		}
 	}
 	if path == "" {
-		path = segName(w.dir, 1)
+		// A new log; after a removed directory its records continue the
+		// sequence (the Manager then reports the removal).
+		w.mu.Lock()
+		first := w.nextSeq
+		w.mu.Unlock()
+		if lastSeq >= first {
+			first = lastSeq + 1
+		}
+		path = segName(w.dir, max(first, 1))
 	}
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o600)
 	if err != nil {
@@ -465,13 +511,13 @@ func (w *Writer) reopen() (torn int64, err error) {
 		f.Close()
 		return 0, err
 	}
-	if path == segName(w.dir, 1) && len(segs) == 0 {
+	if len(segs) == 0 {
 		if err := syncDir(w.dir); err != nil {
 			f.Close()
 			return 0, err
 		}
 	}
-	w.f, w.segSize = f, st.Size()
+	w.f, w.path, w.fi, w.segSize = f, path, st, st.Size()
 	w.mu.Lock()
 	if lastSeq >= w.nextSeq {
 		w.nextSeq = lastSeq + 1
@@ -729,25 +775,69 @@ func (w *Writer) fail(err error, batch []*Record) {
 // recover reopens the log after a failure, writes the records queued
 // before the failure was seen (batch, all numbered below the gap) and the
 // gap record. False: still failing (batch is not written).
+//
+// Retention runs here too: a log that filled its disk past its size or age
+// limit would otherwise stay failed (and, while grants are in force, keep
+// every Mac write refused). The retention record goes out with the gap
+// record; if even that cannot be written (the disk is full), the oldest
+// segments the policy removes are removed first and the record, written
+// right after, says so. Health.Note says why a writer stays failed.
 func (w *Writer) recover(batch []*Record) bool {
 	if err := os.MkdirAll(w.dir, 0o700); err != nil {
+		w.setNote("the audit directory cannot be created: " + err.Error())
 		return false
 	}
 	if _, err := w.reopen(); err != nil {
 		w.closeFile()
+		w.setNote("the log cannot be reopened: " + err.Error())
 		return false
 	}
+	plan := w.planRetention()
 	w.mu.Lock()
+	var ret *Record
+	switch {
+	case plan != nil:
+		ret = plan.record(w.nextSeq, w.opts.Now())
+		w.nextSeq++
+	case w.unnamed != nil:
+		r := *w.unnamed
+		ret = &r
+		ret.Seq, ret.TS = w.nextSeq, w.opts.Now().UnixMilli()
+		w.nextSeq++
+	}
 	gap := &Record{Seq: w.nextSeq, TS: w.opts.Now().UnixMilli(), Type: TypeGap, Dropped: w.dropped,
 		Detail: "sink failed: " + w.failed.Error()}
 	w.nextSeq++
 	w.mu.Unlock()
-	all := append(append([]*Record(nil), batch...), gap)
-	if err := w.writeBatch(all); err != nil {
+	all := append([]*Record(nil), batch...)
+	if ret != nil {
+		all = append(all, ret)
+	}
+	all = append(all, gap)
+	err := w.writeBatch(all)
+	removedFirst := false
+	if err != nil && plan != nil {
+		// Nothing can be written: free the space the policy frees, then
+		// name the new start.
+		if start, ok := w.removeSegments(plan); ok {
+			removedFirst = true
+			w.unnamed = &Record{Type: TypeRetention, StartSeq: start.seq, StartPrev: start.prev,
+				Detail: plan.detail() + "; removed before this record was written, while the log could not write: " + err.Error()}
+			ret.StartSeq, ret.StartPrev, ret.Detail = start.seq, start.prev, w.unnamed.Detail
+			err = w.writeBatch(all)
+		}
+	}
+	if err != nil {
 		w.closeFile()
+		w.setNote(w.stuckNote(err))
 		return false
 	}
+	if plan != nil && !removedFirst {
+		w.removeSegments(plan)
+	}
+	w.unnamed = nil
 	w.mu.Lock()
+	w.note = ""
 	w.dropped -= gap.Dropped
 	w.failed = nil
 	w.durable = gap.Seq
@@ -794,8 +884,11 @@ func (w *Writer) writeBatch(batch []*Record) error {
 			return err
 		}
 	}
-	err := error(nil)
-	if w.opts.BeforeWrite != nil {
+	// The file must still be the segment it was opened as: a removed
+	// directory or segment would otherwise take fsynced records into an
+	// unlinked file and the writer would report itself healthy.
+	err := w.sameSegment()
+	if err == nil && w.opts.BeforeWrite != nil {
 		err = w.opts.BeforeWrite()
 	}
 	if err == nil {
@@ -817,15 +910,38 @@ func (w *Writer) rotate(first uint64) error {
 	if err := w.f.Sync(); err != nil {
 		return err
 	}
-	f, err := os.OpenFile(segName(w.dir, first), os.O_WRONLY|os.O_APPEND|os.O_CREATE|os.O_EXCL, 0o600)
+	path := segName(w.dir, first)
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		return err
 	}
-	if err := syncDir(w.dir); err != nil {
+	st, err := f.Stat()
+	if err == nil {
+		err = syncDir(w.dir)
+	}
+	if err != nil {
 		f.Close()
 		return err
 	}
 	w.f.Close()
-	w.f, w.segSize = f, 0
+	w.f, w.path, w.fi, w.segSize = f, path, st, 0
 	return nil
+}
+
+// sameSegment checks that the open file is still the segment at its path.
+func (w *Writer) sameSegment() error {
+	st, err := os.Stat(w.path)
+	switch {
+	case err != nil:
+		return fmt.Errorf("audit segment %s is gone (the log was removed?): %w", filepath.Base(w.path), err)
+	case w.fi != nil && !os.SameFile(st, w.fi):
+		return fmt.Errorf("audit segment %s was replaced", filepath.Base(w.path))
+	}
+	return nil
+}
+
+func (w *Writer) setNote(n string) {
+	w.mu.Lock()
+	w.note = n
+	w.mu.Unlock()
 }

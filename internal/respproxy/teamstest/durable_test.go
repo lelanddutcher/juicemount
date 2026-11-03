@@ -151,8 +151,8 @@ func TestAuditLogStartsWithFirstPerson(t *testing.T) {
 	if _, err := os.Stat(dir); !os.IsNotExist(err) {
 		t.Fatalf("the audit directory exists with no person: %v", err)
 	}
-	if h, err := auditlog.ReadHealth(dir + ".health"); err != nil || h.Active {
-		t.Fatalf("health with no person: %+v, %v", h, err)
+	if _, err := os.Stat(dir + ".health"); !os.IsNotExist(err) {
+		t.Fatalf("a health file exists with no person: %v", err)
 	}
 	e.setPeople([]respproxy.PersonEntry{{ID: "p-john", Name: "John", Access: respproxy.AccessAll, Devices: []string{"mac-john"}}})
 	if st := e.client("mac-john").Mkdir(ctx, e.ino["/Clients/A"], "after", 0o755, 0o022, 0, &ino, &attr); st != 0 {

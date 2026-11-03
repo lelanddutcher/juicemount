@@ -555,6 +555,8 @@ func (s *PrincipalStore) PeopleSnapshot() PeopleSnapshot {
 			ack == requestLine(filepath.Join(s.opts.ProxyDir, reloadRequestName))
 	}
 	switch {
+	case !scoped && len(s.people) > 0 && s.opts.ProxyDir != "" && !out.GrantsSent:
+		out.Problem = "the Redis proxy does not support people (an older jm-respproxy image): changes are not recorded per person"
 	case !scoped:
 	case s.opts.ProxyDir == "":
 		out.Problem = "no proxy directory is configured (JM_RESPPROXY_DIR): grants are not enforced"
@@ -572,6 +574,12 @@ func (s *PrincipalStore) syncPeopleLocked() error {
 	want := s.wantV2Locked()
 	if want == s.peopleWritten {
 		return nil
+	}
+	if !want && len(s.people) > 0 {
+		// A downgraded proxy: it would refuse a version-2 file, so it
+		// gets one without people, and every grant is lifted.
+		log.Printf("manager: WARNING: the Redis proxy no longer reads person grants (an older jm-respproxy image): " +
+			"writing the principals file without people; grants are not enforced and changes are not recorded per person until it is upgraded")
 	}
 	return s.writeProxyFilesLocked()
 }

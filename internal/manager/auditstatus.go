@@ -18,10 +18,25 @@ package manager
 // its own state, outside the audit directory. A rewrite of the log, or a
 // truncation to before the last anchor, then no longer verifies; the
 // problem is kept until a full check with every anchor (GET
-// /api/audit/verify?full=1) passes. The limits: records written after the
-// last anchor (up to a minute) can be cut unnoticed, and whoever can write
-// both the audit directory and the Manager's state directory can rewrite
-// both. If the log is deleted on purpose, delete audit-anchors.json too.
+// /api/audit/verify?full=1) passes. Once anchored, a missing audit
+// directory is a removed log.
+//
+// Retention. A retention record is not authenticated (auditlog), so the
+// Manager judges every one it reads against the policy in the health file
+// (auditlog.CheckRetention) and keeps the verdicts with its anchors; the
+// log's start must be named by a retention record it read, and an anchor
+// older than the start must have been removed by one that fits the
+// policy. A retention that leaves less than auditMinHistory of history is
+// a warning when the size limit made it (a flood of records, or too small
+// a size limit).
+//
+// The limits: records written after the last anchor (up to a minute) can
+// be cut unnoticed; a cut of the oldest records that the retention policy
+// could have made itself (past the age limit, or with the log near its
+// size limit) passes, as does any cut by someone who can also rewrite the
+// health file's policy; and whoever can write both the audit directory and
+// the Manager's state directory can rewrite both. If the log is deleted on
+// purpose, delete audit-anchors.json too.
 
 import (
 	"encoding/json"
@@ -30,6 +45,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -42,6 +58,10 @@ var (
 	// auditHealthMaxAge: an older health file is stale (the proxy
 	// refreshes it every 10 s).
 	auditHealthMaxAge = 45 * time.Second
+	// auditMinHistory: a retention that leaves less history than this
+	// (the first record kept is younger) raises a warning: a flood of
+	// records, or a size limit too small for the volume's activity.
+	auditMinHistory = 7 * 24 * time.Hour
 )
 
 // maxAnchors bounds audit-anchors.json.
@@ -68,6 +88,10 @@ type AuditStatus struct {
 	RetainBytes int64  `json:"retain_bytes,omitempty"`
 	RetainAgeS  int64  `json:"retain_age_s,omitempty"`
 	FreeBytes   uint64 `json:"free_bytes,omitempty"`
+	// Note: why a failed log stays failed (what retention could do).
+	Note string `json:"note,omitempty"`
+	// RetentionWarning: retention removed recent history.
+	RetentionWarning string `json:"retention_warning,omitempty"`
 	// Chain: the anchor checks.
 	AnchorSeq   uint64 `json:"anchor_seq,omitempty"`
 	AnchorAtMs  int64  `json:"anchor_at_ms,omitempty"`
@@ -87,6 +111,13 @@ type anchorState struct {
 	Problem   string            `json:"problem,omitempty"`
 	ProblemAt int64             `json:"problem_at_ms,omitempty"`
 	CheckedAt int64             `json:"checked_at_ms,omitempty"`
+	// Retentions: the retention records the Manager read, each judged
+	// against the retention policy when it was first read.
+	Retentions []auditlog.Retention `json:"retentions,omitempty"`
+	// Warning: retention removed recent history (see auditMinHistory);
+	// kept, like Problem, until a full check.
+	Warning   string `json:"warning,omitempty"`
+	WarningAt int64  `json:"warning_at_ms,omitempty"`
 }
 
 // auditWatch anchors the log and reports its state.
@@ -146,15 +177,13 @@ func (w *auditWatch) start() (stop func()) {
 
 func (w *auditWatch) healthPath() string { return w.dir + ".health" }
 
-// tick follows the log from the last anchor and records the new head.
+// tick follows the log from the last anchor and records the new head. It
+// also judges every retention record it reads (judgeLocked) and checks the
+// log's start (checkStart).
 func (w *auditWatch) tick() {
 	if w.statePath == "" || w.loadErr != nil {
 		return
 	}
-	if _, err := os.Stat(w.dir); err != nil {
-		return // logging is off (no person yet) or not configured
-	}
-	h, _ := auditlog.ReadHealth(w.healthPath())
 	w.mu.Lock()
 	var last *auditlog.Anchor
 	if n := len(w.st.Anchors); n > 0 {
@@ -162,6 +191,22 @@ func (w *auditWatch) tick() {
 		last = &a
 	}
 	w.mu.Unlock()
+	if _, err := os.Stat(w.dir); err != nil {
+		if last == nil {
+			return // logging is off (no person yet) or not configured
+		}
+		// Once the Manager has anchored the log, a missing directory is
+		// a removed log, not "logging off".
+		now := time.Now().UnixMilli()
+		w.mu.Lock()
+		w.st.CheckedAt = now
+		w.problemLocked(now, fmt.Sprintf("the audit directory is gone (%v), but the Manager recorded the log's head at seq %d on %s: the log was removed",
+			err, last.Seq, time.UnixMilli(last.TS).UTC().Format(time.RFC3339)))
+		w.saveLocked()
+		w.mu.Unlock()
+		return
+	}
+	h, herr := auditlog.ReadHealth(w.healthPath())
 	var head auditlog.Anchor
 	var rep auditlog.Report
 	var err error
@@ -183,10 +228,7 @@ func (w *auditWatch) tick() {
 		log.Printf("manager: audit anchors: %v", err)
 		return
 	case !rep.OK:
-		if w.st.Problem == "" {
-			w.st.Problem, w.st.ProblemAt = rep.Problem, now
-			log.Printf("manager: WARNING: the audit log does not match the Manager's anchors: %s", rep.Problem)
-		}
+		w.problemLocked(now, rep.Problem)
 	case head.Seq != 0 && (last == nil || head.Seq > last.Seq):
 		head.TS = now
 		w.st.Anchors = append(w.st.Anchors, head)
@@ -194,7 +236,103 @@ func (w *auditWatch) tick() {
 			w.st.Anchors = append([]auditlog.Anchor(nil), w.st.Anchors[len(w.st.Anchors)-maxAnchors:]...)
 		}
 	}
+	// The retention policy is in the health file: without it the
+	// retention checks wait for the next tick (a missed record is read
+	// again by checkStart's full pass).
+	if herr == nil {
+		w.judgeLocked(rep.Retentions, h.Policy(), now)
+		w.checkStartLocked(h.Policy(), now)
+	}
 	w.saveLocked()
+}
+
+// problemLocked records the first problem (kept until a full check).
+func (w *auditWatch) problemLocked(now int64, p string) {
+	if w.st.Problem == "" {
+		w.st.Problem, w.st.ProblemAt = p, now
+		log.Printf("manager: WARNING: the audit log does not match the Manager's anchors: %s", p)
+	}
+}
+
+// judgeLocked records the retention records not seen before, each judged
+// against the policy (auditlog.CheckRetention): one that does not fit is a
+// problem, and one that leaves less than auditMinHistory of history a
+// warning.
+func (w *auditWatch) judgeLocked(rs []auditlog.Retention, p auditlog.Policy, now int64) {
+	seen := map[uint64]bool{}
+	for _, r := range w.st.Retentions {
+		seen[r.Seq] = true
+	}
+	for _, r := range rs {
+		if seen[r.Seq] {
+			continue
+		}
+		seen[r.Seq] = true
+		r.SeenAt = now
+		r.Problem = auditlog.CheckRetention(w.dir, r, w.st.Anchors, p, time.UnixMilli(now))
+		w.st.Retentions = append(w.st.Retentions, r)
+		if len(w.st.Retentions) > maxAnchors {
+			w.st.Retentions = append([]auditlog.Retention(nil), w.st.Retentions[len(w.st.Retentions)-maxAnchors:]...)
+		}
+		if r.Problem != "" {
+			w.problemLocked(now, r.Problem)
+			continue
+		}
+		min := auditMinHistory
+		if p.RetainAge > 0 && p.RetainAge < min {
+			min = p.RetainAge
+		}
+		if !strings.Contains(r.Detail, "size limit") {
+			continue // the age limit removes only what is older than itself
+		}
+		if st, ok, _ := auditlog.FirstRecord(w.dir); ok && st.Seq == r.StartSeq && st.TS > 0 {
+			if kept := time.UnixMilli(now).Sub(time.UnixMilli(st.TS)); kept < min && w.st.Warning == "" {
+				w.st.Warning, w.st.WarningAt = fmt.Sprintf("retention by the size limit left only %s of history (%s; the log now starts at %s). "+
+					"A Mac sending refused writes in a loop, or a size limit too small for this volume (JM_AUDIT_RETAIN_MB), does this",
+					max(kept.Round(time.Second), time.Second), r.Detail, time.UnixMilli(st.TS).UTC().Format(time.RFC3339)), now
+				log.Printf("manager: WARNING: audit log: %s", w.st.Warning)
+			}
+		}
+	}
+}
+
+// checkStartLocked checks the log's first record: a removed start must be
+// named by a retention record the Manager read, and every anchor older
+// than the start must have been removed by one that fits the policy. When
+// that fails it reads the whole log once for retention records it missed
+// (it started after a retention, or a health file was unreadable).
+func (w *auditWatch) checkStartLocked(p auditlog.Policy, now int64) {
+	if w.st.Problem != "" {
+		return
+	}
+	issue := func() string {
+		st, ok, err := auditlog.FirstRecord(w.dir)
+		if err != nil || !ok {
+			return ""
+		}
+		named := auditlog.ZeroPrev(st.Prev)
+		for _, r := range w.st.Retentions {
+			named = named || (r.StartSeq == st.Seq && r.StartPrev == st.Prev)
+		}
+		if !named {
+			return fmt.Sprintf("the log starts at seq %d and no retention record the Manager read names that start: older records were removed", st.Seq)
+		}
+		if unc := auditlog.Uncovered(w.st.Anchors, st.Seq, w.st.Retentions); len(unc) > 0 {
+			a := unc[len(unc)-1]
+			return fmt.Sprintf("the log starts at seq %d, but the Manager recorded seq %d on %s and no retention record that fits the retention policy removed it: the log was cut",
+				st.Seq, a.Seq, time.UnixMilli(a.TS).UTC().Format(time.RFC3339))
+		}
+		return ""
+	}
+	if issue() == "" {
+		return
+	}
+	if rep, _, err := auditlog.VerifyAnchors(w.dir, w.st.Anchors); err == nil {
+		w.judgeLocked(rep.Retentions, p, now)
+	}
+	if msg := issue(); msg != "" {
+		w.problemLocked(now, msg)
+	}
 }
 
 func (w *auditWatch) saveLocked() {
@@ -219,11 +357,35 @@ func (w *auditWatch) fullVerify() (auditlog.Report, error) {
 	if err != nil {
 		return rep, err
 	}
+	h, herr := auditlog.ReadHealth(w.healthPath())
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	w.st.CheckedAt = time.Now().UnixMilli()
+	now := time.Now().UnixMilli()
+	w.st.CheckedAt = now
+	if herr == nil && w.loadErr == nil {
+		w.judgeLocked(rep.Retentions, h.Policy(), now)
+	}
+	if rep.OK {
+		// Anchors older than the start: removed by a retention that fits
+		// the policy, or the log was cut.
+		for _, r := range w.st.Retentions {
+			if r.StartSeq == rep.StartSeq && r.Problem != "" {
+				rep.OK, rep.Problem = false, r.Problem
+			}
+		}
+		if unc := auditlog.Uncovered(anchors, rep.StartSeq, w.st.Retentions); rep.OK && len(unc) > 0 {
+			a := unc[len(unc)-1]
+			rep.OK, rep.BadSeq = false, a.Seq
+			rep.Problem = fmt.Sprintf("the log starts at seq %d, but the Manager recorded seq %d on %s and no retention record that fits the retention policy removed it: the log was cut",
+				rep.StartSeq, a.Seq, time.UnixMilli(a.TS).UTC().Format(time.RFC3339))
+			if herr != nil {
+				rep.Problem += " (the health file, which states the policy, cannot be read: " + herr.Error() + ")"
+			}
+		}
+	}
 	if rep.OK && w.loadErr == nil {
 		w.st.Problem, w.st.ProblemAt = "", 0
+		w.st.Warning, w.st.WarningAt = "", 0
 	} else if !rep.OK && w.st.Problem == "" {
 		w.st.Problem, w.st.ProblemAt = rep.Problem, w.st.CheckedAt
 	}
@@ -250,7 +412,7 @@ func (w *auditWatch) status(grantsInForce bool) *AuditStatus {
 			out.Stale, out.Healthy = true, false
 		}
 	case errors.Is(herr, os.ErrNotExist):
-		out.Error = "no health file: the proxy has not started the audit log (an older proxy image, or JM_AUDIT=off)"
+		out.Error = "no health file: the proxy has not started the audit log (no person yet, an older proxy image, or JM_AUDIT=off)"
 	default:
 		out.Error = "health file unreadable: " + herr.Error()
 	}
@@ -267,7 +429,11 @@ func (w *auditWatch) status(grantsInForce bool) *AuditStatus {
 	}
 	out.CheckedAtMs, out.ChainIssue = w.st.CheckedAt, w.st.Problem
 	out.ChainOK = w.st.Problem == ""
+	out.RetentionWarning = w.st.Warning
 	w.mu.Unlock()
+	if herr == nil {
+		out.Note = h.Note
+	}
 
 	why := ""
 	switch {
@@ -280,6 +446,9 @@ func (w *auditWatch) status(grantsInForce bool) *AuditStatus {
 		why = out.Error
 	case !out.Healthy:
 		why = "the audit log cannot write: " + out.Error
+		if out.Note != "" {
+			why += " (" + out.Note + ")"
+		}
 	case out.QueueLen > 0 && out.Queue >= out.QueueLen:
 		why = "the audit log's queue is full"
 	}
@@ -298,6 +467,12 @@ func (w *auditWatch) status(grantsInForce bool) *AuditStatus {
 			out.Problem += "; "
 		}
 		out.Problem += "the audit log does not match the Manager's anchors: " + out.ChainIssue
+	}
+	if out.RetentionWarning != "" {
+		if out.Problem != "" {
+			out.Problem += "; "
+		}
+		out.Problem += "the audit log lost recent history: " + out.RetentionWarning
 	}
 	return out
 }

@@ -65,8 +65,11 @@
   does. A Mac that enrolls as a rotated copy of another Mac gets that Mac's
   person when you approve or confirm it, never from the auto-approve window.
 - A limited person can no longer write into, change, or restore a file
-  deleted from a project they have no grant on, and can no longer remove the
-  quota of a folder above their projects.
+  deleted from a project they have no grant on, can no longer remove the
+  quota of a folder above their projects, and can no longer change another
+  project's quota usage or folder statistics, also not inside a transaction
+  that writes their own files (that let them make another project refuse
+  every new file with "disk quota exceeded").
 - The Redis proxy keeps a hash-chained audit log of who changed what in
   `respproxy/audit` beside the principals file. It starts when the first
   person is added (`JM_AUDIT=on` logs from the start, `off` never) and keeps
@@ -76,13 +79,25 @@
   after its record is on disk, and Mac writes are refused when the log cannot
   write (a full disk, for example); the People page says so and why. On this
   test machine that wait added about 1.3 ms to a create. Content writes are
-  summarized per file and 10 seconds and are not waited for.
+  summarized per file and 10 seconds and are not waited for. Refused writes
+  are logged one by one up to 20 per Mac and minute and counted after that,
+  so a Mac retrying a refused write in a loop cannot push the history out
+  through the size limit. A log that fills its disk past its size limit
+  removes its oldest segments and recovers; under the limit it stays failed
+  and the People page says to free space or lower the limit.
+- A volume with no person writes nothing for the log, not even its health
+  file, as before.
 - The Manager checks the log every minute and records its head in its own
-  state (`audit-anchors.json`), so a rewritten log, or one cut back to before
-  the last check, is reported. Records written after the last check can still
-  be cut unnoticed, and someone who can write both the proxy's directory and
-  the Manager's state can rewrite both. If you delete the log on purpose,
-  delete `audit-anchors.json` too.
+  state (`audit-anchors.json`), so a rewritten log, one cut back to before
+  the last check, or a removed audit directory is reported. It also checks
+  every retention record against the size and age limits: a cut of the oldest
+  records that the limits do not explain is reported, and a retention that
+  removes records less than a week old is a warning (a flood of records, or
+  a size limit too small for the volume). What it cannot catch: records
+  written after the last check can be cut unnoticed, a cut of the oldest
+  records that the limits could have made passes, and someone who can write
+  both the proxy's directory and the Manager's state can rewrite both. If
+  you delete the log on purpose, delete `audit-anchors.json` too.
 
 ### Upgrading the Redis proxy and Manager (Teams)
 
@@ -97,6 +112,11 @@
 - The proxy exits at start if it rejects the principals file (one edited by
   hand, for example), and its container restarts until the file is fixed.
   A file the proxy rejects on a reload is refused and the old one kept.
+- Do not downgrade the Redis proxy below this version while people exist. An
+  older proxy cannot read person grants, so the Manager writes it the old
+  file format without people: every grant is lifted (Macs with no person can
+  write again) and nothing is logged per person until you upgrade. The
+  Manager logs a warning and the People page says so.
 
 ### Upgrading the farm
 

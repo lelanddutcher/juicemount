@@ -11,6 +11,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -234,9 +235,13 @@ type Report struct {
 	// StartSeq: the first record on disk; above 1 when retention removed
 	// older segments (a retention record names this start).
 	StartSeq uint64 `json:"start_seq,omitempty"`
-	// Anchors: how many of the given anchors were checked against the log
-	// (anchors older than the retained start are skipped).
+	// Anchors: how many of the given anchors were checked against the log.
+	// Anchors older than the retained start cannot be: whether a retention
+	// that fits the policy removed them is the caller's check (Uncovered).
 	Anchors int `json:"anchors_checked,omitempty"`
+	// Retentions: the retention records the check read (the newest
+	// maxRetentions).
+	Retentions []Retention `json:"retentions,omitempty"`
 	// Problem names the first break: file, line and what is wrong.
 	Problem string `json:"problem,omitempty"`
 	BadSeq  uint64 `json:"bad_seq,omitempty"`
@@ -307,8 +312,15 @@ func (c *chainCheck) line(seg string, n int, off int64, line []byte) error {
 		}
 		c.anchorsHit++
 	}
-	if r.Type == TypeRetention && r.StartSeq == c.rep.StartSeq && r.StartPrev == c.startPrev {
-		c.retainedOK = true
+	if r.Type == TypeRetention {
+		if r.StartSeq == c.rep.StartSeq && r.StartPrev == c.startPrev {
+			c.retainedOK = true
+		}
+		if len(c.rep.Retentions) == maxRetentions {
+			c.rep.Retentions = c.rep.Retentions[1:]
+		}
+		c.rep.Retentions = append(c.rep.Retentions, Retention{Seq: r.Seq, TS: r.TS, StartSeq: r.StartSeq, StartPrev: r.StartPrev,
+			Detail: r.Detail})
 	}
 	c.prev, c.lastSeq = h, r.Seq
 	c.head = Anchor{Seq: r.Seq, Hash: h, Segment: seg, Offset: off, End: off + int64(len(line)) + 1}
@@ -320,6 +332,12 @@ func (c *chainCheck) line(seg string, n int, off int64, line []byte) error {
 // retained start: its line must still be there with the same hash (a
 // rewrite before an anchor, or a truncation of the newest records to before
 // it, is reported). It returns the head of the log (zero when empty).
+//
+// A retention record is not authenticated: whoever can write the directory
+// can remove the oldest segments and append one that names the new start,
+// and the chain verifies. Anchors older than the start are therefore not
+// accepted here or rejected: the caller checks them with Uncovered against
+// the retention records it read and judged (CheckRetention).
 func VerifyAnchors(dir string, anchors []Anchor) (Report, Anchor, error) {
 	var rep Report
 	segs, err := segments(dir)
@@ -448,3 +466,151 @@ func Follow(dir string, a Anchor, maxSeq uint64) (Anchor, Report, error) {
 }
 
 var errStop = errors.New("stop")
+
+// maxRetentions bounds Report.Retentions.
+const maxRetentions = 64
+
+// Retention is a retention record as a check read it. SeenAt and Problem
+// are the reader's (the Manager's): when it first read the record, and why
+// the removal it announces does not fit the retention policy ("" = it fits;
+// CheckRetention).
+type Retention struct {
+	Seq       uint64 `json:"seq"`
+	TS        int64  `json:"ts_ms"`
+	StartSeq  uint64 `json:"start_seq"`
+	StartPrev string `json:"start_prev"`
+	Detail    string `json:"detail,omitempty"`
+	SeenAt    int64  `json:"seen_at_ms,omitempty"`
+	Problem   string `json:"problem,omitempty"`
+}
+
+// Policy is a writer's retention policy (Health.Policy); 0 = no limit.
+type Policy struct {
+	RetainBytes  int64
+	RetainAge    time.Duration
+	SegmentBytes int64
+}
+
+// retentionSlack: how far the times CheckRetention relies on may be off
+// (the health file's durable seq, which caps anchors, is up to a refresh
+// interval old; clocks).
+const retentionSlack = 2 * time.Minute
+
+// CheckRetention says whether removing every record before r.StartSeq fits
+// policy p, given the log in dir as it is now and anchors (when the
+// Manager saw which record): "" = it fits. A removal fits the size limit if
+// the segments kept are at least the limit less two segments (retention
+// stops once the rest fits; a segment is the larger of the segment size and
+// the largest segment kept); it fits the age limit unless an anchor shows
+// that a removed record was written within the age limit (a removed anchor
+// that has an older anchor before it was written after that one was
+// recorded). It cannot tell the writer's removal from a cut someone made
+// that the policy could also have made.
+func CheckRetention(dir string, r Retention, anchors []Anchor, p Policy, now time.Time) string {
+	why := []string{}
+	if p.RetainBytes <= 0 && p.RetainAge <= 0 {
+		why = append(why, "the log has no retention limit")
+	}
+	if p.RetainBytes > 0 {
+		seg := p.SegmentBytes
+		if seg <= 0 {
+			seg = 64 << 20
+		}
+		var kept int64
+		segs, err := segments(dir)
+		if err != nil {
+			return "the log cannot be listed: " + err.Error()
+		}
+		for _, sg := range segs {
+			if first, ok := segFirst(sg); ok && first >= r.StartSeq {
+				if st, err := os.Stat(sg); err == nil {
+					kept += st.Size()
+					seg = max(seg, st.Size()) // one batch can outgrow a segment
+				}
+			}
+		}
+		if kept+2*seg > p.RetainBytes {
+			return ""
+		}
+		why = append(why, fmt.Sprintf("the %d bytes kept are far below the size limit of %d bytes", kept, p.RetainBytes))
+	}
+	if p.RetainAge > 0 {
+		sorted := append([]Anchor(nil), anchors...)
+		sort.Slice(sorted, func(i, j int) bool { return sorted[i].Seq < sorted[j].Seq })
+		j := -1
+		for i, a := range sorted {
+			if a.Seq < r.StartSeq {
+				j = i
+			}
+		}
+		if j < 1 {
+			return "" // no removed record with a known lower bound on its time
+		}
+		after := time.UnixMilli(sorted[j-1].TS)
+		if now.Sub(after) > p.RetainAge-retentionSlack {
+			return ""
+		}
+		why = append(why, fmt.Sprintf("the removed record seq %d was written after %s, within the age limit of %s",
+			sorted[j].Seq, after.UTC().Format(time.RFC3339), p.RetainAge))
+	}
+	return fmt.Sprintf("retention record seq %d removes the records before seq %d, which the retention policy does not explain: %s",
+		r.Seq, r.StartSeq, strings.Join(why, "; "))
+}
+
+// Uncovered returns the anchors older than start (the log's first record)
+// that no retention record in seen removed with a removal that fits the
+// policy (a seen record with StartSeq above the anchor and no Problem).
+func Uncovered(anchors []Anchor, start uint64, seen []Retention) []Anchor {
+	var out []Anchor
+	for _, a := range anchors {
+		if a.Seq >= start {
+			continue
+		}
+		ok := false
+		for _, r := range seen {
+			ok = ok || (r.Problem == "" && r.StartSeq > a.Seq && r.StartSeq <= start)
+		}
+		if !ok {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
+// Start is the first record of the log on disk.
+type Start struct {
+	Seq  uint64
+	Prev string
+	TS   int64
+}
+
+// FirstRecord returns the first record of the log in dir (false: the log
+// is empty).
+func FirstRecord(dir string) (Start, bool, error) {
+	segs, err := segments(dir)
+	if err != nil {
+		return Start{}, false, err
+	}
+	for _, sg := range segs {
+		var st Start
+		found := false
+		err := eachLine(sg, func(_ int, line []byte) error {
+			var r Record
+			if json.Unmarshal(line, &r) == nil {
+				st, found = Start{Seq: r.Seq, Prev: r.Prev, TS: r.TS}, true
+			}
+			return errStop
+		})
+		if err != nil && err != errStop && !errors.Is(err, os.ErrNotExist) {
+			return Start{}, false, err
+		}
+		if found {
+			return st, true, nil
+		}
+	}
+	return Start{}, false, nil
+}
+
+// ZeroPrev reports whether prev is the "prev" of the very first record of
+// a log.
+func ZeroPrev(prev string) bool { return prev == zeroHash }
