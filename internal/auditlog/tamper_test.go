@@ -45,16 +45,23 @@ func anchoredLog(t *testing.T, dir string) []Anchor {
 	return anchors
 }
 
-// forgeRetention removes the oldest half of the segments and appends a
-// retention record naming the new start, chained to the head. It returns
-// the new start.
-func forgeRetention(t *testing.T, dir string) uint64 {
+// forgeRetention removes the oldest segments, up to and with the records
+// of the second anchor (segment boundaries depend on how records were
+// batched), and appends a retention record naming the new start, chained
+// to the head. It returns the new start.
+func forgeRetention(t *testing.T, dir string, anchors []Anchor) uint64 {
 	t.Helper()
 	segs, _ := segments(dir)
-	if len(segs) < 6 {
-		t.Fatalf("only %d segments", len(segs))
+	cut := 0
+	for cut < len(segs) {
+		if first, _ := segFirst(segs[cut]); first > anchors[1].Seq {
+			break
+		}
+		cut++
 	}
-	cut := len(segs) / 2
+	if cut >= len(segs)-1 {
+		t.Fatalf("%d segments, the second anchor (seq %d) is in the last ones", len(segs), anchors[1].Seq)
+	}
 	for _, s := range segs[:cut] {
 		os.Remove(s)
 	}
@@ -83,7 +90,7 @@ func forgeRetention(t *testing.T, dir string) uint64 {
 func TestForgedRetentionIsJudgedAgainstThePolicy(t *testing.T) {
 	dir := t.TempDir()
 	anchors := anchoredLog(t, dir)
-	start := forgeRetention(t, dir)
+	start := forgeRetention(t, dir, anchors)
 
 	rep, _, err := VerifyAnchors(dir, anchors)
 	if err != nil || !rep.OK || rep.StartSeq != start || len(rep.Retentions) != 1 || rep.Retentions[0].StartSeq != start {
