@@ -38,28 +38,63 @@ func startFakeProxyAck(t *testing.T, dir string) (stopProxy func()) {
 				return
 			case <-time.After(5 * time.Millisecond):
 			}
-			_ = os.WriteFile(filepath.Join(dir, reloadHeartbeatName), []byte("1\n"), 0o600)
-			req, err := os.ReadFile(filepath.Join(dir, reloadRequestName))
-			if err != nil || string(req) == last {
-				continue
+			if req, ok := fakeProxyAckOnce(dir, last); ok {
+				last = req
 			}
-			want := strings.Fields(string(req))
-			body, err := os.ReadFile(filepath.Join(dir, proxyPrincipalsName))
-			if len(want) == 0 || err != nil {
-				continue
-			}
-			sum := sha256.Sum256(body)
-			if hex.EncodeToString(sum[:]) != want[0] {
-				continue // a newer write is in flight
-			}
-			_ = os.WriteFile(filepath.Join(dir, reloadAckName), []byte(strings.Join(want, " ")+"\n"), 0o600)
-			last = string(req)
+			fakeProxyWrite(dir, reloadHeartbeatName, "1")
 		}
 	}()
 	var once sync.Once
 	stopProxy = func() { once.Do(func() { close(stop); <-done }) }
 	t.Cleanup(stopProxy)
 	return stopProxy
+}
+
+// fakeProxyAckOnce acknowledges reload.request if it is new and matches the
+// principals bytes, and returns the request it acknowledged.
+func fakeProxyAckOnce(dir, last string) (string, bool) {
+	req, err := os.ReadFile(filepath.Join(dir, reloadRequestName))
+	if err != nil || string(req) == last {
+		return "", false
+	}
+	want := strings.Fields(string(req))
+	body, err := os.ReadFile(filepath.Join(dir, proxyPrincipalsName))
+	if len(want) == 0 || err != nil {
+		return "", false
+	}
+	sum := sha256.Sum256(body)
+	if hex.EncodeToString(sum[:]) != want[0] {
+		return "", false // a newer write is in flight
+	}
+	fakeProxyWrite(dir, reloadAckName, strings.Join(want, " "))
+	return string(req), true
+}
+
+// fakeProxyWrite replaces a handshake file by rename, as jm-respproxy does
+// (internal/respproxy writeReloadFile), so the Manager never reads a
+// half-written receipt. An in-place truncating write let Approve read an empty
+// reload.applied and wait for the next tick. The fake skips the fsync: only
+// the rename's atomicity matters here.
+func fakeProxyWrite(dir, name, line string) {
+	tmp := filepath.Join(dir, ".fake-"+name)
+	if os.WriteFile(tmp, []byte(line+"\n"), 0o600) == nil {
+		_ = os.Rename(tmp, filepath.Join(dir, name))
+	}
+}
+
+// approveIssuedRequests runs Approve and returns how many reload requests it
+// wrote. A live proxy lets Approve through at once, so it writes exactly one,
+// for its own change. Approve that found the proxy not live first re-requests
+// a reload and waits for the acknowledgement, so it writes two.
+func approveIssuedRequests(s *PrincipalStore, name string) (int, error) {
+	count := func() int {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		return len(s.issued)
+	}
+	before := count()
+	err := s.Approve(name)
+	return count() - before, err
 }
 
 func shortProxyAckWait(t *testing.T) {
@@ -319,7 +354,8 @@ func readStringOK(path string) string {
 // refused. The fake proxy here answers on a 2 s tick, like the entrypoint.
 // Eight approvals 400 ms apart span two ticks, so the stall rule (review 4
 // A2: requests left unacknowledged for longer than proxyAckWait) is
-// exercised against a live proxy too: none may be refused.
+// exercised against a live proxy too: none may be refused, and none may
+// re-request a reload and wait for the proxy's next tick.
 func TestH8BSerialApprovalsWithLiveProxy(t *testing.T) {
 	dir := t.TempDir()
 	s, err := NewPrincipalStore(PrincipalStoreOptions{StatePath: filepath.Join(dir, "store.json"), ProxyDir: dir})
@@ -336,15 +372,10 @@ func TestH8BSerialApprovalsWithLiveProxy(t *testing.T) {
 		defer close(done)
 		last := readStringOK(filepath.Join(dir, reloadRequestName))
 		for {
-			_ = os.WriteFile(filepath.Join(dir, reloadHeartbeatName), []byte("1\n"), 0o600)
-			if req := readStringOK(filepath.Join(dir, reloadRequestName)); req != last {
-				body, _ := os.ReadFile(filepath.Join(dir, proxyPrincipalsName))
-				sum := sha256.Sum256(body)
-				if f := strings.Fields(req); len(f) > 0 && f[0] == hex.EncodeToString(sum[:]) {
-					_ = os.WriteFile(filepath.Join(dir, reloadAckName), []byte(strings.Join(f, " ")+"\n"), 0o600)
-					last = req
-				}
+			if req, ok := fakeProxyAckOnce(dir, last); ok {
+				last = req
 			}
+			fakeProxyWrite(dir, reloadHeartbeatName, "1")
 			select {
 			case <-stop:
 				return
@@ -359,14 +390,14 @@ func TestH8BSerialApprovalsWithLiveProxy(t *testing.T) {
 	refused := 0
 	for i, n := range names[1:] {
 		time.Sleep(400 * time.Millisecond)
-		start := time.Now()
-		if err := s.Approve(n); err != nil {
+		issued, err := approveIssuedRequests(s, n)
+		if err != nil {
 			refused++
 			t.Errorf("approve %d, 400 ms after the previous one: %v", i+1, err)
 			continue
 		}
-		if d := time.Since(start); d > time.Second {
-			t.Errorf("approve %d waited %v for a proxy that is live", i+1, d)
+		if issued != 1 {
+			t.Errorf("approve %d wrote %d reload requests: it re-requested a reload and waited for a proxy that is live", i+1, issued)
 		}
 	}
 	t.Logf("serial approvals 400 ms apart: %d/%d refused", refused, len(names)-1)
