@@ -1,9 +1,64 @@
 # JuiceMount Changelog
 
-## Unreleased
+## 0.5.1
+
+A reliability update to 0.5.0. Update checks remain manual through **Check for
+Updates…** in the app. Read **Upgrading the farm** below before updating farm
+workers.
+
+### App and Link
+
+- Starting the mount after updating the app works when the previous version's
+  mount was stopped cleanly. Before, the new build refused the old build's
+  stopped owner record, so Start failed after an upgrade. A previous owner that
+  is still running, or whose stop cannot be proven, is still refused.
+- A mount started by the volume owner now uses this Mac's own object-store key.
+  Before, the key was dropped at that step, so the mount used whatever
+  object-store credentials it inherited instead of this Mac's key.
+- Over JuiceMount Link, a Redis reply that stops partway through no longer
+  hangs the mount. The response watchdog now stays armed until the whole reply
+  has arrived, so a stalled connection is closed after 2 seconds without
+  progress and reconnects. Before, the first byte of a reply disarmed it, and a
+  stall mid-reply could leave Finder waiting indefinitely. Waiting for a slow
+  reader on the Mac does not count as a stall.
+- A file whose stored name differs from the requested name only in Unicode
+  normalization (for example an accented name created on another system in a
+  different form) now opens instead of reporting that it does not exist.
+  Stored names are never changed. If two names in a folder match the same
+  canonical form, or the local view of the folder is incomplete, no match is
+  guessed and the lookup reports the file missing as before.
+- Support commands for a mount left behind after its processes stopped (issue
+  #4), run from a standalone build and never as root:
+  `--unmount-operation-status` reads the eject helper's progress for an
+  unmount without changing anything. `--recover-retained-generation` withdraws
+  that mount's ordinary retirement or, with an explicit `--eject-now`, ejects
+  it; it works only on an isolated test install (`JM_APP_ISOLATION`), only
+  after the owner and its NFS export are proven gone, and leaves queued saves
+  and local databases in place. Ordinary installs are unchanged, and packaged
+  recovery acceptance remains open.
+
+### Server
+
+- A fresh server install creates the `zpool` bucket before it sets up the
+  object-store users. Before, setup used the restricted format key, which
+  cannot create buckets, so a first install failed. An existing bucket and its
+  data are left as they are, and setup stops unless the object store confirms
+  the bucket.
 
 ### JuiceFarm and Manager
 
+- Experimental smart folders, off by default (`JM_SMART_FOLDERS=on` to try
+  them): the Manager keeps a top-level **Recents** folder
+  (`JM_SMART_FOLDERS_ROOT`) with one view per top-level folder of the volume,
+  each listing that folder's most recently changed files as links. Every Mac
+  and every app's file picker sees the same views. The feature never deletes,
+  overwrites or adopts your files, respects project leases, and turns itself
+  off rather than stopping the Manager if it fails.
+- The first successful **Test Connection** of an SFTP destination stores the
+  server's host key. Later connections must present the same key, or they stop
+  before any password or key is sent. Sync jobs use the stored key and refuse
+  to run until the destination has been tested once. Editing a destination
+  keeps its key while the host and port are unchanged.
 - A farm worker that was partitioned past its claim lease, reaped, and replaced
   can no longer publish a legacy job's outcome, dispatch, or acknowledgement
   over the worker that now owns the job. The reaper also waits for the legacy
@@ -51,6 +106,24 @@
   the default 15-minute interval that is the full 2 minutes, but when the
   backstop scans again soon after a catch-up pass (a restarted farm, or a short
   `JM_FARM_WATCH_BACKSTOP_SEC`) it can be shorter.
+
+### Release integrity
+
+- Built with Go 1.26.10 (crypto/x509 fix GO-2026-6809), go-jose v4.1.6 and
+  x/net v0.62.0, which close the published advisories against the earlier
+  versions. CI runs Redis at the same pinned 7.4.11 build the server ships.
+- `scripts/install.sh` installs only a verified JuiceMount Developer ID signed
+  bundle and keeps its signature intact. It refuses to run while JuiceMount or
+  its serving processes are running, and never quits or kills them; Stop and
+  Quit first. It verifies a staged copy, keeps the previous bundle, and leaves
+  failed staging artifacts in place for inspection. `--source` installs an
+  existing signed release and `--destination` installs to a disposable path.
+- The Finder release battery has a strict mode (`QA_STRICT_RELEASE=1`) that
+  passes only when every category and required case completes, verifies
+  copied bytes with an independent backend read, and keeps all data and
+  failed Finder operations until their custody is reconciled. A failed
+  snappiness measurement during drain still waits for its Finder copy and
+  checks it before reporting the failure.
 
 ### Upgrading the farm
 
