@@ -271,7 +271,8 @@ func countStoreCommits(t *testing.T, dbPath string) *atomic.Int64 {
 
 // ladderScaleCalibration writes the same rows, in path order and one
 // transaction, to a scratch table of a store in dir and reads them back: the
-// same work without chunking, on the same disk under the same moment's load.
+// same work without chunking, on the same disk. The caller times it before and
+// after the run and keeps the slower, which absorbs most transient load.
 func ladderScaleCalibration(t *testing.T, dir string, rows map[string]int) time.Duration {
 	t.Helper()
 	s := durableLadderStore(t, filepath.Join(dir, fmt.Sprintf("calibration-%d.db", time.Now().UnixNano())))

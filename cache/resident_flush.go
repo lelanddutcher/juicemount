@@ -25,8 +25,10 @@ const maxResidentFlushBlocks = 1 << 20
 // timestamp tick: a kernel clock tick, or a whole second on filesystems that
 // store seconds. A block whose ctime is this close to its first observation
 // may have been edited unseen after it was hashed, so its bytes are read and
-// compared again at every final check. The window exceeds one-second storage
-// plus a coarse kernel tick.
+// compared again at every final check. The window covers one-second storage
+// plus a coarse kernel tick. It assumes the cache directory's ctime comes from
+// this host's clock: a server clock skewed by more than the window (NFS, SMB)
+// or a backward clock step can hide such an edit.
 const residentRacyWindow = 2 * time.Second
 
 func residentRacy(id residentDiskIdentity, observed time.Time) bool {
