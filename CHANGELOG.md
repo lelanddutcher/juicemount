@@ -68,6 +68,12 @@ workers.
   can no longer publish a legacy job's outcome, dispatch, or acknowledgement
   over the worker that now owns the job. The reaper also waits for the legacy
   delivery lease instead of releasing a claim as soon as a heartbeat lapses.
+- A legacy job claimed while the claim's reply was lost (a dropped
+  connection, a Redis restart, or a client retry after a timeout) is returned
+  by the worker's next claim, or put back in its queue if the worker has
+  stopped claiming (disabled, paused, draining, or waiting on the storage
+  permit). Before, it stayed queued in that worker's processing list, run by
+  no one, until the worker exited.
 - A worker retries a transient Redis fault while publishing a job's outcome. If
   the outcome still cannot be published, the worker stops so another worker
   recovers the job, instead of leaving it shown as running.

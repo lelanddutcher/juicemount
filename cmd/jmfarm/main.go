@@ -1560,6 +1560,13 @@ func runQueue(cfg queueConfig) (exitCode int) {
 			nextReap = time.Now().Add(15 * time.Second)
 		}
 		if nodeDisabled.Load() || nodePaused.Load() || nodeDrain.Load() || ctl.Paused || !storagePermitReady || worker.AdmissionBlocked {
+			// A claim that failed just before may have taken a job; while this
+			// worker is not claiming, give it back rather than hold it.
+			if released, err := q.ReleaseUnconfirmedClaim(ctx, worker); err != nil {
+				fmt.Fprintf(os.Stderr, "jmfarm queue: release unconfirmed claim: %v\n", err)
+			} else if released {
+				fmt.Println("jmfarm queue: released a job claimed while its reply was lost")
+			}
 			select {
 			case <-ctx.Done():
 			case <-time.After(time.Second):
