@@ -14,6 +14,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -37,24 +38,70 @@ func show(v Value) string {
 	return fmt.Sprintf("%c%q", v.Type, v.Str)
 }
 
-func connectedClients(t *testing.T, rdb *redis.Client) int {
-	for _, l := range strings.Split(rdb.Info(context.Background(), "clients").Val(), "\n") {
-		if strings.HasPrefix(l, "connected_clients:") {
-			n, _ := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(l, "connected_clients:")))
-			return n
-		}
+// dialCounter is a TCP relay to Redis that counts the connections made
+// through it: the proxy's own upstream dials, whatever else shares Redis.
+type dialCounter struct {
+	addr  string
+	dials atomic.Int64
+}
+
+func newDialCounter(t *testing.T, upstream string) *dialCounter {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
 	}
-	t.Fatal("no connected_clients in INFO")
-	return 0
+	t.Cleanup(func() { ln.Close() })
+	d := &dialCounter{addr: ln.Addr().String()}
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			d.dials.Add(1)
+			u, err := net.Dial("tcp", upstream)
+			if err != nil {
+				c.Close()
+				continue
+			}
+			go func() { io.Copy(u, c); u.Close() }()
+			go func() { io.Copy(c, u); c.Close() }()
+		}
+	}()
+	return d
 }
 
 // #2: before AUTH the proxy allocates at most PreAuthLimits per command,
-// never dials Redis, and drops a connection that does not log in.
+// never dials Redis, and drops a connection that does not log in. The
+// proxy's dials are counted at a relay of its own, so clients of other
+// packages on the same Redis (here a foreign load opening and closing
+// connections all along) do not count.
 func TestReviewPreAuthResourceBounds(t *testing.T) {
 	addr := redisAddr(t, false)
-	rdb := direct(t, addr)
-	tp := startProxy(t, addr, ModeEnforce, func(c *Config) { c.PreAuthTimeout = 500 * time.Millisecond })
-	base := connectedClients(t, rdb)
+	relay := newDialCounter(t, addr)
+	tp := startProxy(t, relay.addr, ModeEnforce, func(c *Config) { c.PreAuthTimeout = 500 * time.Millisecond })
+	stopLoad := make(chan struct{})
+	loadDone := make(chan struct{})
+	go func() {
+		defer close(loadDone)
+		for {
+			select {
+			case <-stopLoad:
+				return
+			default:
+			}
+			if c, err := net.Dial("tcp", addr); err == nil {
+				fmt.Fprintf(c, "*1\r\n$4\r\nPING\r\n")
+				c.Read(make([]byte, 16))
+				time.AfterFunc(200*time.Millisecond, func() { c.Close() })
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}()
+	defer func() { close(stopLoad); <-loadDone }()
+	time.Sleep(200 * time.Millisecond) // the proxy's side pool settles
+	base := relay.dials.Load()
 	runtime.GC()
 	var m0, m1 runtime.MemStats
 	runtime.ReadMemStats(&m0)
@@ -80,7 +127,7 @@ func TestReviewPreAuthResourceBounds(t *testing.T) {
 		t.Fatal(err)
 	}
 	time.Sleep(300 * time.Millisecond)
-	if n := connectedClients(t, rdb); n > base {
+	if n := relay.dials.Load(); n > base {
 		t.Fatalf("unauthenticated connections opened %d upstream connections", n-base)
 	}
 	runtime.ReadMemStats(&m1)
@@ -100,6 +147,13 @@ func TestReviewPreAuthResourceBounds(t *testing.T) {
 		t.Fatalf("idle unauthenticated connection not closed after the pre-auth deadline: %v", err)
 	}
 	idle.Close()
+	// The relay does see the proxy's dials: a login opens one.
+	n := relay.dials.Load()
+	rc := tp.raw(t)
+	rc.login("mac1")
+	if relay.dials.Load() <= n {
+		t.Fatal("a logged-in client's upstream connection did not go through the counting relay")
+	}
 }
 
 // #3: a client that writes a huge pipeline before reading must not
