@@ -227,6 +227,14 @@ func viewTree(t *testing.T, root string) map[string]string {
 			}
 			p := filepath.Join(base, f.Name(), e.Name())
 			text, err := os.Readlink(p)
+			if errors.Is(err, os.ErrNotExist) {
+				// The reconciler renamed or removed the entry after the
+				// ReadDir (its hidden temp links are renamed into place).
+				// Record it so waitForTree polls again; an exact comparison
+				// fails if the tree never settles.
+				out[f.Name()+"/"+e.Name()] = "<vanished>"
+				continue
+			}
 			if err != nil || filepath.IsAbs(text) {
 				t.Fatalf("%s -> %q (%v): not a relative link", p, text, err)
 			}
