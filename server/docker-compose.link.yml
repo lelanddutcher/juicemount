@@ -16,20 +16,24 @@
 #     https://<public-name>:30193 (a TLS-terminating proxy in front of 30193,
 #     or JM_NET_TLS_CERT/JM_NET_TLS_KEY for Headscale's own TLS).
 #   - the NAS tailnet node, which joins over the in-container address (no
-#     router hairpin NAT) and serves only the JuiceMount ports on its tailnet
-#     address: 30179 -> respproxy:6379, 30151 -> minio:9000, 30190 -> Manager.
-#     A Mac dials the same port it uses on the LAN; nothing else on the LAN is
-#     reachable through Link.
+#     router hairpin NAT). With JM_NET_NAS_EXPOSURE=services (a new install's
+#     default) it serves only the JuiceMount ports on its tailnet address:
+#     30179 -> respproxy:6379, 30151 -> minio:9000, 30190 -> Manager. A Mac
+#     dials the same port it uses on the LAN; nothing else on the LAN is
+#     reachable through Link. Mac apps older than this, and remote farm
+#     nodes, need JM_NET_NAS_EXPOSURE=subnet (an existing install's default):
+#     the node advertises JM_NET_NAS_ROUTE (default 192.168.0.0/24) instead.
 #   - its WireGuard UDP port, published 1:1 so peers can reach it directly
 #     instead of through a relay. Forward this UDP port on the router for a
 #     direct path from outside the LAN.
 #   - an ACL policy (/data/headscale/policy.hujson, regenerated each start):
-#     tag:jm-mac and tag:jm-farm nodes may reach those ports on tag:jm-nas only.
+#     tag:jm-mac and tag:jm-farm nodes may reach those ports on tag:jm-nas,
+#     and in subnet exposure the same ports inside the route, only.
 #
-# Legacy subnet routing (advertise a whole LAN prefix) stays available: set
-# JM_NET_NAS_ROUTE to the prefix. The policy then allows the same ports inside
-# it. To relay through your own DERP servers instead of Tailscale's public map,
-# pass HEADSCALE_DERP_URLS or HEADSCALE_DERP_PATHS to the Manager.
+# CHANGELOG.md (JuiceMount Link) says how the exposure default is chosen and
+# how to switch. To relay through your own DERP servers instead of
+# Tailscale's public map, pass HEADSCALE_DERP_URLS or HEADSCALE_DERP_PATHS to
+# the Manager.
 services:
   juicemount-manager:
     environment:
@@ -37,6 +41,7 @@ services:
       JM_NET_NAS_NODE: "on"
       JM_NET_SERVER_URL: "${JM_NET_SERVER_URL:?set JM_NET_SERVER_URL to the https URL Macs use to reach this NAS on port 30193}"
       JM_NET_NAS_UDP_PORT: "${JM_NET_NAS_UDP_PORT:-41641}"
+      JM_NET_NAS_EXPOSURE: "${JM_NET_NAS_EXPOSURE:-}"
       JM_NET_NAS_ROUTE: "${JM_NET_NAS_ROUTE:-}"
       JM_NET_TLS_CERT: "${JM_NET_TLS_CERT:-}"
       JM_NET_TLS_KEY: "${JM_NET_TLS_KEY:-}"

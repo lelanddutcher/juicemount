@@ -52,6 +52,48 @@
   backstop scans again soon after a catch-up pass (a restarted farm, or a short
   `JM_FARM_WATCH_BACKSTOP_SEC`) it can be shorter.
 
+### JuiceMount Link
+
+- Link has two ways to expose the NAS, chosen by `JM_NET_NAS_EXPOSURE`:
+  - `services` serves only the JuiceMount ports (Redis proxy 30179, object
+    storage 30151, Manager 30190) on the NAS node's own tailnet address. The
+    node carries `tag:jm-nas`, which is how a Mac app from this release finds
+    it. Mac apps from earlier releases, and remote farm nodes, cannot reach
+    it: they follow subnet routes only.
+  - `subnet` advertises a LAN prefix through the NAS node, the only path
+    Link had before. Every Mac app version and remote farm node reaches it.
+    The prefix is `JM_NET_NAS_ROUTE`, or `192.168.0.0/24` when that is unset,
+    as before. The node is not tagged, so a Mac waits for the route instead
+    of using the node's tailnet address.
+- When `JM_NET_NAS_EXPOSURE` is unset, setting `JM_NET_NAS_ROUTE` selects
+  `subnet`. Otherwise an install whose NAS node already ran
+  (`/data/headscale/nas-node` exists) keeps `subnet`, and a new install uses
+  `services`. The Manager records that default in
+  `/data/headscale/nas-exposure` before the node first starts, so it does not
+  change later. To switch, set `JM_NET_NAS_EXPOSURE` and restart the Manager.
+  Before switching an existing install to `services`, update every linked
+  Mac.
+- Remote farm node enrollment needs `subnet`: the node's JuiceFS mount reaches
+  object storage at the LAN address stored in the volume. Under `services` the
+  Manager refuses the remote plan and says what to set.
+- With `services` under `JM_NET_POLICY=off` or your own Headscale policy, the
+  NAS node's key carries `tag:jm-nas`. Headscale cannot add the tag to a NAS
+  node registered before this release unless the policy defines the tag
+  (`"tag:jm-nas": []` in `tagOwners`). Until then the node keeps retrying
+  and `GET /api/net/link` shows why. Route readiness under `services` now
+  also requires the control server to list the NAS node online with the tag.
+- The generated policy gives no tag an owner, so no node can tag itself (an
+  untagged Mac could otherwise claim `tag:jm-nas`). Keys the Manager mints
+  still get their tags.
+- Under `services`, the Manager on 30190 is served in-process on the tailnet
+  address, so its per-address enrollment limits see each Mac's own tailnet
+  address. The Redis proxy and object storage are forwarded from the Manager
+  container, as is everything through a subnet route, so they see all remote
+  clients as that one address. The Redis proxy's AUTH lockout is per address
+  and principal, and each Mac has its own principal, so one Mac's wrong secret
+  does not lock out another. An AUTH flood from one remote Mac can delay the
+  others by up to the 10 second pre-auth timeout.
+
 ### Upgrading the farm
 
 Stop all old farm workers before starting new ones, and do not run v0.5.0 and
