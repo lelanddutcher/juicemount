@@ -26,6 +26,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"net/netip"
 	"os"
 	"os/exec"
@@ -245,8 +246,9 @@ func runLinkIntegration(t *testing.T, tc linkIntegrationCase) {
 	t.Setenv("JM_NET_NAS_ROUTE", subnet)
 	t.Setenv("JM_NET_POLICY", policyEnv)
 	t.Setenv("JM_HEADSCALE_USER", "")
-	// The policy allows only 30179; the NAS node below also serves 30199.
-	t.Setenv("JM_NET_NAS_SERVICES", "30179="+echoAddr)
+	// The policy allows 30179 and the Manager's 30190; the NAS node below
+	// also serves 30199, which no rule allows.
+	t.Setenv("JM_NET_NAS_SERVICES", "30179="+echoAddr+",30190=manager")
 	if _, err := manager.RecordLinkExposureDefault(cfgPath); err != nil {
 		t.Fatal(err)
 	}
@@ -257,7 +259,13 @@ func runLinkIntegration(t *testing.T, tc linkIntegrationCase) {
 	defer hs.Stop()
 	waitForState(t, "headscale", hs.status, 90*time.Second)
 
-	nasCfg, err := nasNodeConfigFromEnv(cfgPath)
+	// The Manager's handler answers with the address it saw the request
+	// come from.
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		host, _, _ := net.SplitHostPort(r.RemoteAddr)
+		_, _ = io.WriteString(w, host)
+	})
+	nasCfg, err := nasNodeConfigFromEnv(cfgPath, handler)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -403,6 +411,18 @@ func runLinkIntegration(t *testing.T, tc linkIntegrationCase) {
 		if err := echoOver(60*time.Second, 30179); err != nil {
 			t.Fatalf("allowed service dial: %v", err)
 		}
+		// The Manager is served in-process, so it sees the Mac's own
+		// tailnet address, not the NAS container's.
+		client := &http.Client{Timeout: 20 * time.Second, Transport: &http.Transport{DialContext: mac.DialContext}}
+		resp, err := client.Get("http://" + net.JoinHostPort(nasLAN, "30190") + "/")
+		if err != nil {
+			t.Fatalf("manager over Link: %v", err)
+		}
+		seen, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if !containsString(addrs, string(seen)) {
+			t.Fatalf("manager saw the request from %q, want one of the Mac's addresses %v", seen, addrs)
+		}
 	}
 
 	if tc.policy == "managed" && !tc.subnet {
@@ -441,4 +461,13 @@ func unusedDocumentationPrefix(t *testing.T) netip.Prefix {
 	}
 	t.Skip("every documentation prefix is on a local interface")
 	return netip.Prefix{}
+}
+
+func containsString(list []string, want string) bool {
+	for _, s := range list {
+		if s == want {
+			return true
+		}
+	}
+	return false
 }

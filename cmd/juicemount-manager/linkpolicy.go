@@ -23,14 +23,18 @@ import (
 	"github.com/lelanddutcher/juicemount/internal/manager"
 )
 
-// defaultNASServices maps each published JuiceMount port to the compose
-// service behind it: the RESP proxy (Redis), MinIO's S3 endpoint, and this
-// Manager. Override with JM_NET_NAS_SERVICES ("port=host:port,...").
-const defaultNASServices = "30179=respproxy:6379,30151=minio:9000,30190=127.0.0.1:8080"
+// defaultNASServices maps each published JuiceMount port to the service
+// behind it: the RESP proxy (Redis), MinIO's S3 endpoint, and this Manager.
+// Override with JM_NET_NAS_SERVICES ("port=host:port,..."; a target of
+// "manager" serves this Manager's handler in-process).
+const defaultNASServices = "30179=respproxy:6379,30151=minio:9000,30190=" + nasManagerTarget
+
+// nasManagerTarget names the Manager itself as a service target.
+const nasManagerTarget = "manager"
 
 type nasService struct {
 	Port   uint16 // tailnet listen port on the NAS node
-	Target string // host:port dialed on the container network
+	Target string // host:port dialed on the container network, or nasManagerTarget
 }
 
 func nasServices() ([]nasService, error) {
@@ -50,9 +54,11 @@ func parseNASServices(raw string) ([]nasService, error) {
 			return nil, fmt.Errorf("JM_NET_NAS_SERVICES entry %q has an invalid port", item)
 		}
 		target = strings.TrimSpace(target)
-		host, targetPort, err := net.SplitHostPort(target)
-		if err != nil || host == "" || targetPort == "" {
-			return nil, fmt.Errorf("JM_NET_NAS_SERVICES entry %q needs a host:port target", item)
+		if target != nasManagerTarget {
+			host, targetPort, err := net.SplitHostPort(target)
+			if err != nil || host == "" || targetPort == "" {
+				return nil, fmt.Errorf("JM_NET_NAS_SERVICES entry %q needs a host:port target or %q", item, nasManagerTarget)
+			}
 		}
 		if seen[uint16(port)] {
 			return nil, fmt.Errorf("JM_NET_NAS_SERVICES lists port %d twice", port)

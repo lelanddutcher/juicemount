@@ -61,7 +61,7 @@ func TestNASNodeTagFollowsExposure(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			cfg, err := nasNodeConfigFromEnv(cfgPath)
+			cfg, err := nasNodeConfigFromEnv(cfgPath, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -89,7 +89,7 @@ func TestNASNodeExposureSurvivesItsOwnState(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(filepath.Dir(cfgPath), "nas-node"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	cfg, err := nasNodeConfigFromEnv(cfgPath)
+	cfg, err := nasNodeConfigFromEnv(cfgPath, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -20,7 +20,8 @@ package main
 //     registered before tagging keeps its identity and is tagged
 //     server-side)
 //  4. listen on the node's tailnet address for each JuiceMount service
-//     (linkpolicy.go) and forward to its compose service
+//     (linkpolicy.go): forward to its compose service, or serve the
+//     Manager's own handler in-process
 //  5. subnet exposure only: also advertise the LAN prefix and approve it
 //     server-side
 //  6. watch the node; if it leaves the tailnet, start over
@@ -33,6 +34,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/http"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -108,6 +110,8 @@ type nasNodeConfig struct {
 	UDPPort    uint16
 	Services   []nasService
 	Subnet     string // subnet exposure's LAN route; "" in service exposure
+	// Handler serves the services whose Target is nasManagerTarget.
+	Handler http.Handler
 	// Tags are the tags MintKey's key carries and EnsureTags applies.
 	Tags    []string
 	MintKey func() (string, error)
@@ -127,7 +131,7 @@ type nasNodeConfig struct {
 // nasNodeConfigFromEnv resolves one NAS node start. cfgPath is Headscale's
 // config.yaml; the node's state lives next to it, where manager.LinkExposure
 // looks for it.
-func nasNodeConfigFromEnv(cfgPath string) (nasNodeConfig, error) {
+func nasNodeConfigFromEnv(cfgPath string, handler http.Handler) (nasNodeConfig, error) {
 	control, err := nasNodeControlURL()
 	if err != nil {
 		return nasNodeConfig{}, err
@@ -176,6 +180,7 @@ func nasNodeConfigFromEnv(cfgPath string) (nasNodeConfig, error) {
 		UDPPort:    udpPort,
 		Services:   services,
 		Subnet:     subnet,
+		Handler:    handler,
 		Tags:       tags,
 		EnsureTags: ensureTags,
 		MintKey: func() (string, error) {
@@ -194,7 +199,7 @@ func nasNodeConfigFromEnv(cfgPath string) (nasNodeConfig, error) {
 // newNASNodeSupervisor supervises the NAS node. It waits for control to be
 // running before each attempt, so a slow Headscale start is not counted as a
 // NAS node failure.
-func newNASNodeSupervisor(cfgPath string, control *headscaleSupervisor) *supervisor {
+func newNASNodeSupervisor(cfgPath string, control *headscaleSupervisor, handler http.Handler) *supervisor {
 	var sup *supervisor
 	sup = newSupervisor("nas node", func(stop <-chan struct{}, ready func(string)) error {
 		for control != nil && !control.status.running() {
@@ -205,7 +210,7 @@ func newNASNodeSupervisor(cfgPath string, control *headscaleSupervisor) *supervi
 			case <-time.After(500 * time.Millisecond):
 			}
 		}
-		cfg, err := nasNodeConfigFromEnv(cfgPath)
+		cfg, err := nasNodeConfigFromEnv(cfgPath, handler)
 		if err != nil {
 			return err
 		}
@@ -283,7 +288,21 @@ func runNASNode(cfg nasNodeConfig, stop <-chan struct{}, ready func(string)) err
 			return fmt.Errorf("nas node listen on tailnet port %d: %w", svc.Port, err)
 		}
 		defer ln.Close()
-		go serveNASService(ln, svc.Target, cfg.Dial)
+		if svc.Target == nasManagerTarget {
+			if cfg.Handler == nil {
+				return fmt.Errorf("nas node: tailnet port %d serves the Manager, but no Manager handler is set", svc.Port)
+			}
+			// Served in-process rather than forwarded, so each request's
+			// RemoteAddr is the peer's own tailnet address and the
+			// Manager's per-address limits (principal enrollment) apply
+			// per Mac. Forwarded services see every Link client as this
+			// container: see forwardNASTCP.
+			srv := &http.Server{Handler: cfg.Handler, ReadHeaderTimeout: 5 * time.Second}
+			defer srv.Close()
+			go func() { _ = srv.Serve(ln) }()
+		} else {
+			go serveNASService(ln, svc.Target, cfg.Dial)
+		}
 		ports = append(ports, strconv.Itoa(int(svc.Port)))
 	}
 	addr := ""
@@ -387,6 +406,23 @@ func nasRouteTCPHandler(prefix netip.Prefix, dial nasTCPDialer) tsnet.FallbackTC
 	}
 }
 
+// forwardNASTCP copies one Link connection to target. The upstream leg is
+// dialed from this container, so the target sees every Link client (all
+// Macs and farm nodes, through a service listener or the subnet route) as
+// one source address. Per-address protections there therefore cover all
+// remote clients together:
+//   - jm-respproxy locks out AUTH failures per (address, principal). Each
+//     Mac authenticates as its own principal, so one Mac's wrong secret
+//     locks out only that Mac (internal/respproxy TestAuthThrottlePerPrincipal
+//     and TestReviewLockoutIsPerPrincipal). Its per-address pre-auth gate
+//     admits 16 AUTHs at once and queues the rest, so an AUTH flood from one
+//     Mac delays the others' AUTH; a connection waits at most the 10 s
+//     pre-auth timeout, and the proxy-wide cap of 256 unauthenticated
+//     connections, which LAN clients share too, binds before the queue.
+//   - MinIO has no per-address limit in this deployment.
+//   - the Manager, which keys principal enrollment limits by address, is
+//     served in-process in service exposure (runNASNode) and sees each peer's
+//     tailnet address. Through the subnet route it is still forwarded.
 func forwardNASTCP(client net.Conn, target string, dial nasTCPDialer) {
 	defer client.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

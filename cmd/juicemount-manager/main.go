@@ -137,7 +137,7 @@ func main() {
 		// T2.2: join the tailnet as the NAS itself and serve the JuiceMount
 		// ports on its tailnet address so linked Macs reach them remotely.
 		if nasNodeEnabled() {
-			nas = newNASNodeSupervisor(hsConfig, hs)
+			nas = newNASNodeSupervisor(hsConfig, hs, mux)
 			nas.Start()
 			defer nas.Stop()
 		}

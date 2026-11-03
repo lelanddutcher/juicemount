@@ -18,12 +18,15 @@ func TestParseNASServices(t *testing.T) {
 	want := []nasService{
 		{Port: 30151, Target: "minio:9000"},
 		{Port: 30179, Target: "respproxy:6379"},
-		{Port: 30190, Target: "127.0.0.1:8080"},
+		{Port: 30190, Target: nasManagerTarget},
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("default services = %+v, want %+v", got, want)
 	}
-	for _, bad := range []string{"", "30179", "0=redis:6379", "70000=redis:6379", "30179=redis", "30179=:6379", "1=a:1,1=b:2"} {
+	if got, err := parseNASServices("30190=127.0.0.1:8080"); err != nil || got[0].Target != "127.0.0.1:8080" {
+		t.Fatalf("forwarded Manager target = %+v, %v", got, err)
+	}
+	for _, bad := range []string{"", "30179", "0=redis:6379", "70000=redis:6379", "30179=redis", "30179=:6379", "1=a:1,1=b:2", "30190=managerx"} {
 		if _, err := parseNASServices(bad); err == nil {
 			t.Errorf("parseNASServices(%q) accepted", bad)
 		}
