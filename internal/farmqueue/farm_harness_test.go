@@ -72,6 +72,10 @@ const (
 	// whatever happens (a delivery cycling forever).
 	harnessQuietStall = 25 * time.Second
 	harnessQuietLimit = 90 * time.Second
+	// harnessTimeBudget stops the run from starting another seed, so a
+	// uniformly slow host reports the seeds it ran instead of reaching go
+	// test's 10-minute timeout. A seed is bounded by its 2-minute context.
+	harnessTimeBudget = 5 * time.Minute
 	// harnessAbsentCapability is a capability no harness worker has, so the
 	// ineligible backlog stays queued in front of eligible work for the whole
 	// run and every claim must look past it.
@@ -130,9 +134,15 @@ func TestFarmHarnessCrashPartitionInvariants(t *testing.T) {
 	t.Logf("farm harness: %d seed(s) from %d; rerun one with JM_FARM_HARNESS_SEED=<seed> JM_FARM_HARNESS_SEEDS=1", seeds, base)
 	total := map[string]int{}
 	started, ran := time.Now(), 0
+	var ranSeeds []string
 	for i := 0; i < seeds; i++ {
+		if i > 0 && time.Since(started) > harnessTimeBudget {
+			t.Logf("farm harness: stopped after %d of %d seed(s): the %s budget is spent", ran, seeds, harnessTimeBudget)
+			break
+		}
 		ran++
 		seed := base + int64(i)
+		ranSeeds = append(ranSeeds, strconv.FormatInt(seed, 10))
 		var stats map[string]int
 		ok := t.Run(fmt.Sprintf("seed=%d", seed), func(t *testing.T) {
 			stats = runFarmHarnessSeed(t, backend, seed)
@@ -145,8 +155,10 @@ func TestFarmHarnessCrashPartitionInvariants(t *testing.T) {
 			break
 		}
 	}
-	t.Logf("farm harness: %d seed(s) in %s: %s", ran, time.Since(started).Round(time.Millisecond), formatHarnessStats(total))
-	if t.Failed() || seeds < harnessDefaultSeeds {
+	t.Logf("farm harness: %d seed(s) in %s (%s): %s", ran, time.Since(started).Round(time.Millisecond),
+		strings.Join(ranSeeds, ","), formatHarnessStats(total))
+	if t.Failed() || ran < harnessDefaultSeeds {
+		// Fewer seeds than the default may not reach every fault.
 		return
 	}
 	// The faults are random; make sure the run exercised what it claims to.
@@ -157,7 +169,7 @@ func TestFarmHarnessCrashPartitionInvariants(t *testing.T) {
 	}
 	for _, key := range required {
 		if total[key] == 0 {
-			t.Errorf("farm harness never exercised %s over %d seeds: %s", key, seeds, formatHarnessStats(total))
+			t.Errorf("farm harness never exercised %s over %d seeds: %s", key, ran, formatHarnessStats(total))
 		}
 	}
 }
