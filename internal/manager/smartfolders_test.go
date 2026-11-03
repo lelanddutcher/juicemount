@@ -231,7 +231,11 @@ func viewTree(t *testing.T, root string) map[string]string {
 				t.Fatalf("%s -> %q (%v): not a relative link", p, text, err)
 			}
 			if _, err := os.Stat(p); err != nil {
-				t.Fatalf("%s -> %q does not resolve: %v", p, text, err)
+				// A link dangles between a user's rename and the next
+				// reconcile. Record it so waitForTree keeps polling and an
+				// exact comparison fails if it never resolves.
+				out[f.Name()+"/"+e.Name()] = "<dangling " + text + ">"
+				continue
 			}
 			rel, _ := filepath.Rel(root, filepath.Join(filepath.Dir(p), text))
 			out[f.Name()+"/"+e.Name()] = filepath.ToSlash(rel)
