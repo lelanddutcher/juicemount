@@ -132,7 +132,7 @@ func TestAuditWatchJudgesRetention(t *testing.T) {
 		// reports the anchors the cut removed.
 		blind := newAuditWatch(dir, filepath.Join(base, "blind-anchors.json"))
 		blind.st.Anchors = append([]auditlog.Anchor(nil), aw.st.Anchors...)
-		blind.checkStartLocked(auditlog.Policy{}, time.Now().UnixMilli())
+		blind.checkStart(auditlog.Policy{}, time.Now().UnixMilli())
 		if blind.st.Problem == "" {
 			t.Error("start check of a cut log with no retention record seen: no problem")
 		}

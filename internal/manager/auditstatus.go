@@ -64,6 +64,9 @@ var (
 	auditMinHistory = 7 * 24 * time.Hour
 )
 
+// auditFullRead is the whole-log read of checkStart (a test hook).
+var auditFullRead = auditlog.VerifyAnchors
+
 // maxAnchors bounds audit-anchors.json.
 const maxAnchors = 64
 
@@ -92,6 +95,9 @@ type AuditStatus struct {
 	Note string `json:"note,omitempty"`
 	// RetentionWarning: retention removed recent history.
 	RetentionWarning string `json:"retention_warning,omitempty"`
+	// RetentionForecast: at the rate the log has grown, the size limit
+	// will keep less than auditMinHistory (before it removes anything).
+	RetentionForecast string `json:"retention_forecast,omitempty"`
 	// Chain: the anchor checks.
 	AnchorSeq   uint64 `json:"anchor_seq,omitempty"`
 	AnchorAtMs  int64  `json:"anchor_at_ms,omitempty"`
@@ -210,22 +216,31 @@ func (w *auditWatch) tick() {
 	var head auditlog.Anchor
 	var rep auditlog.Report
 	var err error
-	if last == nil {
-		// The first anchor: one full check.
-		rep, head, err = auditlog.VerifyAnchors(w.dir, nil)
-		if h.Durable != 0 && head.Seq > h.Durable {
-			head = auditlog.Anchor{} // not provably on disk yet: next time
+	for try := 0; try < 2; try++ {
+		if last == nil {
+			// The first anchor: one full check.
+			rep, head, err = auditlog.VerifyAnchors(w.dir, nil)
+			if h.Durable != 0 && head.Seq > h.Durable {
+				head = auditlog.Anchor{} // not provably on disk yet: next time
+			}
+		} else {
+			head, rep, err = auditlog.Follow(w.dir, *last, h.Durable)
 		}
-	} else {
-		head, rep, err = auditlog.Follow(w.dir, *last, h.Durable)
+		if !errors.Is(err, os.ErrNotExist) {
+			break
+		}
+		// Retention removed a segment while it was read: read again.
 	}
 	now := time.Now().UnixMilli()
 	w.mu.Lock()
-	defer w.mu.Unlock()
 	w.st.CheckedAt = now
 	switch {
 	case err != nil:
-		log.Printf("manager: audit anchors: %v", err)
+		// A log the Manager cannot read cannot be anchored: the anchors
+		// would freeze while the page says the chain is fine.
+		w.problemLocked(now, "the audit log cannot be read: "+err.Error())
+		w.saveLocked()
+		w.mu.Unlock()
 		return
 	case !rep.OK:
 		w.problemLocked(now, rep.Problem)
@@ -241,9 +256,12 @@ func (w *auditWatch) tick() {
 	// again by checkStart's full pass).
 	if herr == nil {
 		w.judgeLocked(rep.Retentions, h.Policy(), now)
-		w.checkStartLocked(h.Policy(), now)
 	}
 	w.saveLocked()
+	w.mu.Unlock()
+	if herr == nil {
+		w.checkStart(h.Policy(), now)
+	}
 }
 
 // problemLocked records the first problem (kept until a full check).
@@ -296,43 +314,56 @@ func (w *auditWatch) judgeLocked(rs []auditlog.Retention, p auditlog.Policy, now
 	}
 }
 
-// checkStartLocked checks the log's first record: a removed start must be
+// checkStart checks the log's first record: a removed start must be
 // named by a retention record the Manager read, and every anchor older
 // than the start must have been removed by one that fits the policy. When
 // that fails it reads the whole log once for retention records it missed
-// (it started after a retention, or a health file was unreadable).
-func (w *auditWatch) checkStartLocked(p auditlog.Policy, now int64) {
-	if w.st.Problem != "" {
+// (it started after a retention, or a health file was unreadable). That
+// read can take a minute on a large log, so it runs without w.mu (status
+// and the People page do not wait for it) and merges what it found.
+func (w *auditWatch) checkStart(p auditlog.Policy, now int64) {
+	w.mu.Lock()
+	issue := w.startIssueLocked()
+	anchors := append([]auditlog.Anchor(nil), w.st.Anchors...)
+	w.mu.Unlock()
+	if issue == "" {
 		return
 	}
-	issue := func() string {
-		st, ok, err := auditlog.FirstRecord(w.dir)
-		if err != nil || !ok {
-			return ""
-		}
-		named := auditlog.ZeroPrev(st.Prev)
-		for _, r := range w.st.Retentions {
-			named = named || (r.StartSeq == st.Seq && r.StartPrev == st.Prev)
-		}
-		if !named {
-			return fmt.Sprintf("the log starts at seq %d and no retention record the Manager read names that start: older records were removed", st.Seq)
-		}
-		if unc := auditlog.Uncovered(w.st.Anchors, st.Seq, w.st.Retentions); len(unc) > 0 {
-			a := unc[len(unc)-1]
-			return fmt.Sprintf("the log starts at seq %d, but the Manager recorded seq %d on %s and no retention record that fits the retention policy removed it: the log was cut",
-				st.Seq, a.Seq, time.UnixMilli(a.TS).UTC().Format(time.RFC3339))
-		}
-		return ""
-	}
-	if issue() == "" {
-		return
-	}
-	if rep, _, err := auditlog.VerifyAnchors(w.dir, w.st.Anchors); err == nil {
+	rep, _, err := auditFullRead(w.dir, anchors)
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if err == nil {
 		w.judgeLocked(rep.Retentions, p, now)
 	}
-	if msg := issue(); msg != "" {
+	if msg := w.startIssueLocked(); msg != "" {
 		w.problemLocked(now, msg)
 	}
+	w.saveLocked()
+}
+
+// startIssueLocked: why the log's start is not accounted for ("" = it is,
+// or a problem is already recorded).
+func (w *auditWatch) startIssueLocked() string {
+	if w.st.Problem != "" {
+		return ""
+	}
+	st, ok, err := auditlog.FirstRecord(w.dir)
+	if err != nil || !ok {
+		return ""
+	}
+	named := auditlog.ZeroPrev(st.Prev)
+	for _, r := range w.st.Retentions {
+		named = named || (r.StartSeq == st.Seq && r.StartPrev == st.Prev)
+	}
+	if !named {
+		return fmt.Sprintf("the log starts at seq %d and no retention record the Manager read names that start: older records were removed", st.Seq)
+	}
+	if unc := auditlog.Uncovered(w.st.Anchors, st.Seq, w.st.Retentions); len(unc) > 0 {
+		a := unc[len(unc)-1]
+		return fmt.Sprintf("the log starts at seq %d, but the Manager recorded seq %d on %s and no retention record that fits the retention policy removed it: the log was cut",
+			st.Seq, a.Seq, time.UnixMilli(a.TS).UTC().Format(time.RFC3339))
+	}
+	return ""
 }
 
 func (w *auditWatch) saveLocked() {
@@ -473,6 +504,38 @@ func (w *auditWatch) status(grantsInForce bool) *AuditStatus {
 			out.Problem += "; "
 		}
 		out.Problem += "the audit log lost recent history: " + out.RetentionWarning
+	} else if herr == nil {
+		out.RetentionForecast = retentionForecast(w.dir, h, time.Now())
+		if out.RetentionForecast != "" {
+			if out.Problem != "" {
+				out.Problem += "; "
+			}
+			out.Problem += out.RetentionForecast
+		}
 	}
 	return out
+}
+
+// retentionForecast warns before the size limit cuts history short: at
+// the rate the log grew since its first record, how much history the limit
+// will keep ("" = at least auditMinHistory, or too little data to say).
+func retentionForecast(dir string, h auditlog.Health, now time.Time) string {
+	if h.RetainBytes <= 0 || h.Bytes < h.RetainBytes/4 {
+		return ""
+	}
+	st, ok, err := auditlog.FirstRecord(dir)
+	if err != nil || !ok || st.TS <= 0 {
+		return ""
+	}
+	age := now.Sub(time.UnixMilli(st.TS))
+	if age < time.Hour {
+		return ""
+	}
+	keep := time.Duration(float64(age) * float64(h.RetainBytes) / float64(h.Bytes))
+	if keep >= auditMinHistory {
+		return ""
+	}
+	return fmt.Sprintf("at the rate the audit log grows (%d MB in %s), its size limit of %d MB keeps only about %s of history; "+
+		"raise JM_AUDIT_RETAIN_MB, or look for a Mac writing in a loop", h.Bytes>>20, age.Round(time.Minute), h.RetainBytes>>20,
+		keep.Round(time.Hour))
 }

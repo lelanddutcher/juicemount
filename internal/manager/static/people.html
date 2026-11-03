@@ -152,6 +152,9 @@ summarized per file and 10-second window.</p>
   });
 
   function what(r) {
+    if (r.type === 'modified' && r.action === 'quota') return 'quota usage flushed ' + esc(r.count) + 'x: ' + (r.rows || []).map(function (x) {
+      return '<code>' + esc(x.path || x.ino) + '</code> ' + esc(x.hash) + ' ' + esc(x.value);
+    }).join(', ');
     if (r.type === 'modified') return 'wrote file ' + esc(r.inode) + ' ' + esc(r.count) + 'x';
     if (r.type === 'gap') return 'log gap: ' + esc(r.dropped) + ' records lost';
     if (r.type === 'open') return 'log opened';

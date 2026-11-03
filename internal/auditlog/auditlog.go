@@ -136,10 +136,30 @@ type Record struct {
 	StartSeq  uint64 `json:"start_seq,omitempty"`
 	StartPrev string `json:"start_prev,omitempty"`
 
+	// Omitted: entries (ops, rows, inodes, attribute changes, projects)
+	// the record does not list, or names it shortened, because the unit
+	// was too large to log in full. Digest is then "sha256:" and the hex
+	// SHA-256 of the JSON of the complete lists ({"ops":..,"rows":..,
+	// "inodes":..,"attrs":..,"projects":..}, names in full). In the stub
+	// the writer writes for a record longer than MaxRecordBytes, Digest is
+	// the SHA-256 of that record's line.
+	Omitted int    `json:"omitted,omitempty"`
+	Digest  string `json:"digest,omitempty"`
+
 	Prev string `json:"prev"`
 
 	st uint8 // writer state: 0 queued, stDurable, stLost (under Writer.mu)
+	// tooLarge: the writer wrote a stub in place of the record (it encoded
+	// to more than MaxRecordBytes). Set before st becomes stDurable.
+	tooLarge bool
 }
+
+// MaxRecordBytes bounds one line of the log. The writer never writes a
+// longer one: it writes a stub in its place (the record's seq, time, type,
+// who, action and unit, and the size and SHA-256 of the line it did not
+// write), and AppendDurable reports ErrTooLarge for it. It is well below
+// what the readers accept (maxLine), so a log stays readable.
+const MaxRecordBytes = 4 << 20
 
 const (
 	stDurable = 1
@@ -198,6 +218,9 @@ var (
 	ErrTimeout = errors.New("auditlog: record not durable in time")
 	// ErrInactive: a Lazy writer was not activated.
 	ErrInactive = errors.New("auditlog: not active")
+	// ErrTooLarge: the record encoded to more than MaxRecordBytes; a stub
+	// was written in its place.
+	ErrTooLarge = errors.New("auditlog: record too large; a stub was written in its place")
 )
 
 // Options configures a Writer.
@@ -602,6 +625,8 @@ func (w *Writer) AppendDurable(r *Record, timeout time.Duration) (uint64, error)
 		}
 	}
 	switch {
+	case r.st == stDurable && r.tooLarge:
+		return seq, ErrTooLarge
 	case r.st == stDurable:
 		return seq, nil
 	case r.st == stLost:
@@ -869,6 +894,10 @@ func (w *Writer) writeBatch(batch []*Record) error {
 	for _, r := range batch {
 		r.Prev = w.lastHash
 		line, err := json.Marshal(r)
+		if err == nil && len(line) > MaxRecordBytes {
+			line, err = json.Marshal(stubOf(r, line))
+			r.tooLarge = true
+		}
 		if err != nil {
 			w.lastHash = prevHash
 			return err
@@ -886,7 +915,14 @@ func (w *Writer) writeBatch(batch []*Record) error {
 	}
 	// The file must still be the segment it was opened as: a removed
 	// directory or segment would otherwise take fsynced records into an
-	// unlinked file and the writer would report itself healthy.
+	// unlinked file and the writer would report itself healthy. The check
+	// and the write are not atomic: a segment removed or replaced between
+	// the two still takes this batch, which is then reported durable
+	// although it is in no file at the segment's path; the next batch's
+	// check fails the writer, and the log reopens with a gap record that
+	// does not count those records (the Manager's anchors show a missing
+	// tail only if one of them was anchored). Whoever can remove the
+	// segment can also edit it, so this is not a new way in.
 	err := w.sameSegment()
 	if err == nil && w.opts.BeforeWrite != nil {
 		err = w.opts.BeforeWrite()
@@ -904,6 +940,25 @@ func (w *Writer) writeBatch(batch []*Record) error {
 	}
 	w.segSize += int64(buf.Len())
 	return nil
+}
+
+// stubOf is what the writer writes in place of r, whose line was longer
+// than MaxRecordBytes.
+func stubOf(r *Record, line []byte) *Record {
+	sum := sha256.Sum256(line)
+	clip := func(v string) string {
+		if len(v) > 256 {
+			return v[:256]
+		}
+		return v
+	}
+	return &Record{Seq: r.Seq, TS: r.TS, Type: r.Type, Unit: r.Unit, Outcome: r.Outcome, Reason: clip(r.Reason),
+		Principal: clip(r.Principal), Kind: clip(r.Kind), Host: clip(r.Host), Person: clip(r.Person),
+		PersonName: clip(r.PersonName), Action: clip(r.Action), Prev: r.Prev,
+		Omitted: max(1, len(r.Ops)+len(r.Rows)+len(r.Inodes)+len(r.Attrs)+len(r.Projects)),
+		Digest:  "sha256:" + hex.EncodeToString(sum[:]),
+		Detail: fmt.Sprintf("record not written: it encoded to %d bytes, more than the limit of %d; digest is the SHA-256 of that line",
+			len(line), MaxRecordBytes)}
 }
 
 func (w *Writer) rotate(first uint64) error {

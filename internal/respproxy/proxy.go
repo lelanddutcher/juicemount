@@ -1413,6 +1413,9 @@ func (c *conn) decide(u *Unit) (*Denial, Verdict, []guardEffect) {
 	// (L5 review: in observe/passthrough a webdav principal ran FLUSHDB and
 	// a Mac rewrote jmlease:v1:cfg).
 	d, effects := c.p.Guard.Check(pr, u)
+	if d == nil {
+		d = accountingValueDenial(pr, u) // also every mode (accounting.go)
+	}
 	if d != nil {
 		c.p.Stats.recordDecision(DecDeny, d, pr, u)
 		return d, Verdict{}, nil

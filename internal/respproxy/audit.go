@@ -21,10 +21,15 @@ package respproxy
 // changes are listed in the intent (Record.Attrs). So is a unit that
 // changes a quota (dirQuota), and one that writes contents and dir-stat or
 // deferred-delete rows; every intent lists the dir-stat, quota and
-// deferred-delete rows its unit writes (Record.Rows). Refused units get one
-// REFUSED record each, up to refusedBurst per principal and window, then a
-// collapsed count. Dir-stat flushes, locks and cleanup records are not
-// logged: they change no name, attribute or content.
+// deferred-delete rows its unit writes (Record.Rows), at most
+// maxIntentEntries of each list (capRecord: the rest are counted and
+// covered by a digest). Refused units get one REFUSED record each, up to
+// refusedBurst per principal and window, and the first per place past
+// that, then a collapsed count. A quota flush that moves the usage of
+// folders above a person's grants (accounting.go) is summed into one
+// MODIFIED record (Action "quota") per principal and window. Other dir-stat
+// flushes, locks and cleanup records are not logged: they change no name,
+// attribute or content.
 //
 // While the log is off (a Lazy writer and no person) the proxy does no
 // audit work at all: no unit is described for it.
@@ -44,9 +49,14 @@ package respproxy
 // failure is counted and logged and the write goes ahead.
 
 import (
+	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -348,10 +358,41 @@ type auditSink struct {
 type aggKey struct {
 	principal string
 	ino       uint64
+	quota     bool // the quota-usage sum of the principal (ino 0)
 }
 
 type aggEnt struct {
 	rec auditlog.Record
+	// sums: a quota entry's committed increments per row.
+	sums  map[rowKey]int64
+	paths map[rowKey]string
+}
+
+type rowKey struct {
+	hash string
+	ino  uint64
+}
+
+// maxQuotaRows bounds the rows of one quota-usage record.
+const maxQuotaRows = 64
+
+// record is the entry's record as the log takes it.
+func (e *aggEnt) record() *auditlog.Record {
+	r := e.rec
+	if e.sums == nil {
+		return &r
+	}
+	keys := make([]rowKey, 0, len(e.sums))
+	for k := range e.sums {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		return keys[i].ino < keys[j].ino || (keys[i].ino == keys[j].ino && keys[i].hash < keys[j].hash)
+	})
+	for _, k := range keys {
+		r.Rows = append(r.Rows, auditlog.Row{Hash: k.hash, Ino: k.ino, Op: "incr", Value: strconv.FormatInt(e.sums[k], 10), Path: e.paths[k]})
+	}
+	return &r
 }
 
 // maxAgg bounds the collapse map; past it everything is flushed early.
@@ -359,28 +400,41 @@ const maxAgg = 1 << 16
 
 // Refused units are logged one by one up to refusedBurst per principal and
 // refused window (refusedWindows content windows: a minute by default).
-// Past that they are only counted, and one "refused" record per principal
-// and window (Action "collapsed": Count, First, Last and the reasons) says
-// how many were not logged one by one. A Mac that sends refused writes in a
-// loop (thousands a second) then adds a few records a minute instead of
-// megabytes, so it cannot push the history out through the size limit.
-// Each refused record is also bounded (capRefused).
+// Past that, the first refusal of each distinct (reason, places) pair of
+// the window is still logged one by one, up to refusedDistinct more, so
+// a flood of refusals in one place cannot hide an attempt on another
+// project; the places are the projects the unit touches (or, for a unit
+// above the project depth, the folders it writes in). The rest are only
+// counted, and one "refused" record per principal and window (Action
+// "collapsed": Count, First, Last, the reasons, and the places with their
+// counts, at most maxRefusedOps of them) says how many were not logged one
+// by one. A Mac that sends refused writes in a loop (thousands a second)
+// then adds a few records a minute instead of megabytes, so it cannot push
+// the history out through the size limit. Each refused record is also
+// bounded (capRecord).
 const (
-	refusedBurst   = 20
-	refusedWindows = 6
-	maxRefusedOps  = 32
-	maxDetail      = 512
-	maxName        = 128
+	refusedBurst    = 20
+	refusedDistinct = 64
+	refusedWindows  = 6
+	maxRefusedOps   = 32
+	maxDetail       = 512
+	maxName         = 128
+	// maxRefusedKeys bounds the (reason, places) pairs a window remembers.
+	maxRefusedKeys = 1024
 )
 
 // refWin is one principal's refusals in the current refused window.
 type refWin struct {
 	start       int64 // unix ms
 	logged      int
+	distinct    int // logged past refusedBurst as the first of their pair
+	seen        map[string]bool
 	base        auditlog.Record
 	extra       int // refused, not logged one by one
 	first, last int64
 	reasons     map[string]int
+	places      map[uint64]int // of the extra ones
+	paths       map[uint64]string
 }
 
 func newAuditSink(w *auditlog.Writer, window, syncTimeout time.Duration, want func() bool, logf func(string, ...any)) *auditSink {
@@ -455,8 +509,7 @@ func (s *auditSink) flush(all bool) {
 	var out []*auditlog.Record
 	for k, e := range s.agg {
 		if all || e.rec.First <= cut {
-			r := e.rec
-			out = append(out, &r)
+			out = append(out, e.record())
 			delete(s.agg, k)
 		}
 	}
@@ -493,7 +546,7 @@ func (s *auditSink) noteData(base auditlog.Record, inodes []uint64, o Outcome) {
 	full := false
 	s.mu.Lock()
 	for _, ino := range inodes {
-		k := aggKey{base.Principal, ino}
+		k := aggKey{principal: base.Principal, ino: ino}
 		e := s.agg[k]
 		if e == nil {
 			e = &aggEnt{rec: base}
@@ -512,6 +565,52 @@ func (s *auditSink) noteData(base auditlog.Record, inodes []uint64, o Outcome) {
 		}
 	}
 	full = len(s.agg) >= maxAgg
+	s.mu.Unlock()
+	if full {
+		s.flush(true)
+	}
+}
+
+// noteQuota adds one unit's quota-usage increments of folders above the
+// person's grants to the principal's window: one MODIFIED record (Action
+// "quota") per principal and window lists the committed sum per folder and
+// hash, and counts the units by outcome.
+func (s *auditSink) noteQuota(base auditlog.Record, rows []auditlog.Row, o Outcome) {
+	now := s.now().UnixMilli()
+	s.mu.Lock()
+	k := aggKey{principal: base.Principal, quota: true}
+	e := s.agg[k]
+	if e == nil {
+		e = &aggEnt{rec: base, sums: map[rowKey]int64{}, paths: map[rowKey]string{}}
+		e.rec.Type, e.rec.Action, e.rec.First = auditlog.TypeModified, "quota", now
+		e.rec.Detail = "quota usage of folders above the person's grants, flushed by their Mac for writes below them (committed sums)"
+		s.agg[k] = e
+	}
+	e.rec.Last = now
+	e.rec.Count++
+	switch outcomeOf(o) {
+	case auditlog.OutcomeCommitted:
+		e.rec.Committed++
+		for _, r := range rows {
+			rk := rowKey{r.Hash, r.Ino}
+			if _, ok := e.sums[rk]; !ok && len(e.sums) >= maxQuotaRows {
+				continue
+			}
+			v, err := strconv.ParseInt(r.Value, 10, 64)
+			if err != nil {
+				continue
+			}
+			e.sums[rk] = satAdd(e.sums[rk], v)
+			if r.Path != "" {
+				e.paths[rk] = r.Path
+			}
+		}
+	case auditlog.OutcomeUnknown:
+		e.rec.Unknown++
+	default:
+		e.rec.NotCommitted++
+	}
+	full := len(s.agg) >= maxAgg
 	s.mu.Unlock()
 	if full {
 		s.flush(true)
@@ -554,7 +653,7 @@ func (c *conn) auditStart(u *Unit, next func(Outcome)) (func(Outcome), *Denial) 
 		return next, nil
 	}
 	cls, attrCheck := classifyAudit(u)
-	if cls == auditNone {
+	if cls == auditNone && len(u.aboveRows) == 0 {
 		return next, nil
 	}
 	failClosed := c.principal.Kind == KindMac && c.p.Auth.table.Load().GrantsInForce()
@@ -562,6 +661,20 @@ func (c *conn) auditStart(u *Unit, next func(Outcome)) (func(Outcome), *Denial) 
 		return &Denial{Reason: ReasonAuditUnavailable, Detail: "audit log unavailable while grants are in force: " + err.Error()}
 	}
 	base := c.baseRecord(u)
+	if cls == auditNone {
+		// A quota flush that moves the usage of folders above the
+		// person's grants: summed per Mac and window, like contents.
+		if failClosed && !s.w.Healthy() {
+			return nil, unavailable(auditlog.ErrUnavailable)
+		}
+		rows := u.aboveRows
+		return func(o Outcome) {
+			s.noteQuota(base, rows, o)
+			if next != nil {
+				next(o)
+			}
+		}, nil
+	}
 	var attrs []auditlog.AttrChange
 	if cls == auditData {
 		if attrs = c.auditAttrs(u, attrCheck, false); len(attrs) > 0 {
@@ -590,6 +703,7 @@ func (c *conn) auditStart(u *Unit, next func(Outcome)) (func(Outcome), *Denial) 
 		rec.Inodes = d.inodes
 	}
 	rec.Rows = d.rows
+	capRecord(&rec, intentLimits)
 	var seq uint64
 	var err error
 	if failClosed {
@@ -608,6 +722,9 @@ func (c *conn) auditStart(u *Unit, next func(Outcome)) (func(Outcome), *Denial) 
 			// so say what became of it.
 			out := c.baseOutcome(base, seq, Outcome{})
 			out.Reason = "not forwarded: the intent was not on disk in time"
+			if errors.Is(err, auditlog.ErrTooLarge) {
+				out.Reason = "not forwarded: the intent was too large for the log"
+			}
 			if _, err := s.w.Append(out); err != nil {
 				s.failed(err)
 			}
@@ -665,15 +782,44 @@ func (w *refWin) summary() *auditlog.Record {
 		}
 		fmt.Fprintf(&b, " %s %d", k, w.reasons[k])
 	}
+	if len(w.places) > 0 {
+		ps := make([]uint64, 0, len(w.places))
+		for k := range w.places {
+			ps = append(ps, k)
+		}
+		sort.Slice(ps, func(i, j int) bool {
+			a, b := ps[i], ps[j]
+			return w.places[a] > w.places[b] || (w.places[a] == w.places[b] && a < b)
+		})
+		b.WriteString("; in:")
+		for _, k := range ps {
+			r.Projects = append(r.Projects, auditlog.Project{Ino: k, Path: w.paths[k]})
+			fmt.Fprintf(&b, " %d", k)
+			if p := w.paths[k]; p != "" {
+				fmt.Fprintf(&b, " (%s)", p)
+			}
+			fmt.Fprintf(&b, " %d", w.places[k])
+		}
+	}
 	r.Detail = b.String()
+	capRecord(&r, refusedLimits)
 	return &r
 }
 
-// admitRefused counts a refusal of base's principal: true while its window
-// has room for one more record of its own.
-func (s *auditSink) admitRefused(base auditlog.Record, reason string) bool {
+// admitRefused counts a refusal of base's principal in places (projects,
+// or folders above the project depth; paths their display paths): true
+// while its window has room for one more record of its own, or when it is
+// the window's first refusal for this reason in these places.
+func (s *auditSink) admitRefused(base auditlog.Record, reason string, places []uint64, paths map[uint64]string) bool {
 	now := s.now().UnixMilli()
 	span := int64(refusedWindows) * s.window.Milliseconds()
+	key := reason
+	for i, p := range places {
+		if i == maxRefusedOps {
+			break
+		}
+		key += " " + strconv.FormatUint(p, 10)
+	}
 	s.mu.Lock()
 	w := s.ref[base.Principal]
 	var ended *auditlog.Record
@@ -681,19 +827,35 @@ func (s *auditSink) admitRefused(base auditlog.Record, reason string) bool {
 		ended, w = w.summary(), nil
 	}
 	if w == nil {
-		w = &refWin{start: now, base: base}
+		w = &refWin{start: now, base: base, seen: map[string]bool{}}
 		s.ref[base.Principal] = w
 	}
 	ok := w.logged < refusedBurst
+	if !ok && !w.seen[key] && w.distinct < refusedDistinct {
+		ok = true
+		w.distinct++
+	}
+	if len(w.seen) < maxRefusedKeys {
+		w.seen[key] = true
+	}
 	if ok {
 		w.logged++
 	} else {
 		if w.reasons == nil {
-			w.reasons = map[string]int{}
+			w.reasons, w.places, w.paths = map[string]int{}, map[uint64]int{}, map[uint64]string{}
 			w.first = now
 		}
 		w.extra++
 		w.reasons[reason]++
+		for _, p := range places {
+			if _, known := w.places[p]; !known && len(w.places) >= maxRefusedOps {
+				continue
+			}
+			w.places[p]++
+			if paths[p] != "" {
+				w.paths[p] = paths[p]
+			}
+		}
 		w.last = now
 	}
 	s.mu.Unlock()
@@ -705,42 +867,145 @@ func (s *auditSink) admitRefused(base auditlog.Record, reason string) bool {
 	return ok
 }
 
-// capRefused bounds a refused record: a refused unit can carry any number
-// of entries with names of any length.
-func capRefused(r *auditlog.Record) {
+// refusedPlaces: the places a refused unit touches, sorted: its projects
+// and the project the refusal names, or else the folders whose entries or
+// rows it writes.
+func refusedPlaces(desc *unitAudit, d *Denial) ([]uint64, map[uint64]string) {
+	set := map[uint64]bool{}
+	paths := map[uint64]string{}
+	if desc != nil {
+		for _, p := range desc.projects {
+			set[p.Ino] = true
+			paths[p.Ino] = p.Path
+		}
+	}
+	if d.Proj != 0 {
+		set[d.Proj] = true
+	}
+	if len(set) == 0 && desc != nil {
+		for _, o := range desc.ops {
+			if !o.Trash {
+				set[o.Parent] = true
+			}
+		}
+		for _, r := range desc.rows {
+			set[r.Ino] = true
+			if r.Path != "" {
+				paths[r.Ino] = r.Path
+			}
+		}
+	}
+	out := make([]uint64, 0, len(set))
+	for p := range set {
+		out = append(out, p)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out, paths
+}
+
+// recLimits bound one record: entries per list, and the length of a name,
+// a path (and an attribute value) and the detail.
+type recLimits struct{ entries, name, path, detail int }
+
+var (
+	// refusedLimits: a refused unit can carry any number of entries with
+	// names of any length.
+	refusedLimits = recLimits{maxRefusedOps, maxName, maxName, maxDetail}
+	// intentLimits: an admitted unit can too (one MULTI of 12,000 entries
+	// with 240-byte names made a 16 MiB line the readers refused). juicefs
+	// names are at most 255 bytes, so a name is never cut for a real
+	// client; the worst case stays well below auditlog.MaxRecordBytes.
+	intentLimits = recLimits{maxIntentEntries, 255, 512, maxDetail}
+)
+
+const maxIntentEntries = 256
+
+// capRecord bounds a record to lim. When it leaves anything out it says how
+// much (Omitted, and the detail) and records the SHA-256 of the complete
+// lists (Digest), so a reconstruction of the unit can be matched to it.
+func capRecord(r *auditlog.Record, lim recLimits) {
+	long := func(v string, n int) bool { return len(v) > n }
+	over := len(r.Ops) > lim.entries || len(r.Rows) > lim.entries || len(r.Inodes) > lim.entries ||
+		len(r.Attrs) > lim.entries || len(r.Projects) > lim.entries
+	for i := 0; !over && i < len(r.Ops); i++ {
+		over = long(r.Ops[i].Name, lim.name) || long(r.Ops[i].Path, lim.path)
+	}
+	for i := 0; !over && i < len(r.Rows); i++ {
+		over = long(r.Rows[i].Path, lim.path)
+	}
+	for i := 0; !over && i < len(r.Attrs); i++ {
+		over = long(r.Attrs[i].Old, lim.path) || long(r.Attrs[i].New, lim.path)
+	}
+	for i := 0; !over && i < len(r.Projects); i++ {
+		over = long(r.Projects[i].Path, lim.path)
+	}
+	if over && r.Digest == "" {
+		b, err := json.Marshal(struct {
+			Ops      []auditlog.Op         `json:"ops"`
+			Rows     []auditlog.Row        `json:"rows"`
+			Inodes   []uint64              `json:"inodes"`
+			Attrs    []auditlog.AttrChange `json:"attrs"`
+			Projects []auditlog.Project    `json:"projects"`
+		}{r.Ops, r.Rows, r.Inodes, r.Attrs, r.Projects})
+		if err == nil {
+			sum := sha256.Sum256(b)
+			r.Digest = "sha256:" + hex.EncodeToString(sum[:])
+		}
+	}
+	omitted := 0
 	clip := func(v string, n int) string {
 		if len(v) <= n {
 			return v
 		}
+		omitted++
 		return v[:n] + fmt.Sprintf("... (%d bytes)", len(v))
 	}
 	var more []string
-	if n := len(r.Ops); n > maxRefusedOps {
-		r.Ops = r.Ops[:maxRefusedOps]
-		more = append(more, fmt.Sprintf("%d more entries", n-maxRefusedOps))
+	if n := len(r.Ops); n > lim.entries {
+		r.Ops = r.Ops[:lim.entries]
+		more = append(more, fmt.Sprintf("%d more entries", n-lim.entries))
+		omitted += n - lim.entries
 	}
 	for i := range r.Ops {
-		r.Ops[i].Name, r.Ops[i].Path = clip(r.Ops[i].Name, maxName), clip(r.Ops[i].Path, maxName)
+		r.Ops[i].Name, r.Ops[i].Path = clip(r.Ops[i].Name, lim.name), clip(r.Ops[i].Path, lim.path)
 	}
-	if n := len(r.Rows); n > maxRefusedOps {
-		r.Rows = r.Rows[:maxRefusedOps]
-		more = append(more, fmt.Sprintf("%d more rows", n-maxRefusedOps))
+	if n := len(r.Rows); n > lim.entries {
+		r.Rows = r.Rows[:lim.entries]
+		more = append(more, fmt.Sprintf("%d more rows", n-lim.entries))
+		omitted += n - lim.entries
 	}
-	if n := len(r.Inodes); n > maxRefusedOps {
-		r.Inodes = r.Inodes[:maxRefusedOps]
-		more = append(more, fmt.Sprintf("%d more inodes", n-maxRefusedOps))
+	for i := range r.Rows {
+		r.Rows[i].Path = clip(r.Rows[i].Path, lim.path)
 	}
-	if n := len(r.Projects); n > maxRefusedOps {
-		r.Projects = r.Projects[:maxRefusedOps]
-		more = append(more, fmt.Sprintf("%d more projects", n-maxRefusedOps))
+	if n := len(r.Inodes); n > lim.entries {
+		r.Inodes = r.Inodes[:lim.entries]
+		more = append(more, fmt.Sprintf("%d more inodes", n-lim.entries))
+		omitted += n - lim.entries
+	}
+	if n := len(r.Attrs); n > lim.entries {
+		r.Attrs = r.Attrs[:lim.entries]
+		more = append(more, fmt.Sprintf("%d more attribute changes", n-lim.entries))
+		omitted += n - lim.entries
+	}
+	for i := range r.Attrs {
+		r.Attrs[i].Old, r.Attrs[i].New = clip(r.Attrs[i].Old, lim.path), clip(r.Attrs[i].New, lim.path)
+	}
+	if n := len(r.Projects); n > lim.entries {
+		r.Projects = r.Projects[:lim.entries]
+		more = append(more, fmt.Sprintf("%d more projects", n-lim.entries))
+		omitted += n - lim.entries
 	}
 	for i := range r.Projects {
-		r.Projects[i].Path = clip(r.Projects[i].Path, maxName)
+		r.Projects[i].Path = clip(r.Projects[i].Path, lim.path)
 	}
-	r.Detail = clip(r.Detail, maxDetail)
+	r.Detail = clip(r.Detail, lim.detail)
 	if len(more) > 0 {
-		r.Detail += " (not listed: " + strings.Join(more, ", ") + ")"
+		if r.Detail != "" {
+			r.Detail += " "
+		}
+		r.Detail += "(not listed: " + strings.Join(more, ", ") + "; digest covers the complete lists)"
 	}
+	r.Omitted += omitted
 }
 
 // auditRefused logs a refused unit that writes anything (see refusedBurst).
@@ -750,12 +1015,16 @@ func (c *conn) auditRefused(u *Unit, d *Denial) {
 		return
 	}
 	r := c.baseRecord(u)
-	if !s.admitRefused(r, string(d.Reason)) {
+	var desc *unitAudit
+	if len(u.Project) > 0 {
+		desc = c.unitDescription(u)
+	}
+	places, paths := refusedPlaces(desc, d)
+	if !s.admitRefused(r, string(d.Reason), places, paths) {
 		return
 	}
 	r.Type, r.Outcome, r.Reason, r.Detail = auditlog.TypeRefused, auditlog.OutcomeRefused, string(d.Reason), d.Detail
-	if len(u.Project) > 0 {
-		desc := c.unitDescription(u)
+	if desc != nil {
 		r.Action, r.Projects, r.Ops, r.Rows = desc.action, desc.projects, desc.ops, desc.rows
 		if len(desc.ops) == 0 {
 			r.Inodes = desc.inodes
@@ -764,7 +1033,7 @@ func (c *conn) auditRefused(u *Unit, d *Denial) {
 	if d.Proj != 0 && len(r.Projects) == 0 {
 		r.Projects = []auditlog.Project{{Ino: d.Proj}}
 	}
-	capRefused(&r)
+	capRecord(&r, refusedLimits)
 	if _, err := s.w.Append(&r); err != nil {
 		s.failed(err)
 	}

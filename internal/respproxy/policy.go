@@ -20,6 +20,8 @@ package respproxy
 import (
 	"fmt"
 	"strings"
+
+	"github.com/lelanddutcher/juicemount/internal/auditlog"
 )
 
 // Kind is the role of an authenticated principal.
@@ -129,6 +131,12 @@ type Unit struct {
 	// engine to describe the unit for it (audit, set by Decide).
 	wantAudit bool
 	audit     *unitAudit
+	// aboveRows, set by the grant check, are the admitted quota-usage
+	// increments of folders above the person's grants (audit.go logs them).
+	aboveRows []auditlog.Row
+	// quotaUndo, also set by the grant check, takes those increments back
+	// from the ledger (accounting.go) when the unit is not committed.
+	quotaUndo func()
 }
 
 // Reason is the second token of a refusal reply.
