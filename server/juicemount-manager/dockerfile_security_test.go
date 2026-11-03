@@ -53,3 +53,18 @@ func TestManagerImageRequiresExactMultiArchReleaseIdentity(t *testing.T) {
 		}
 	}
 }
+
+// The Manager links the JuiceFS metadata client (smart folders, standalone
+// mode). Its CGO-free build only compiles with the non-Redis engines tagged
+// out; without the tags the image build fails on sqlite.
+func TestManagerBuildTagsDropCGOMetadataEngines(t *testing.T) {
+	for _, name := range []string{"Dockerfile", "Dockerfile.binary-only"} {
+		src, err := os.ReadFile(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(src), "CGO_ENABLED=0") || !strings.Contains(string(src), "-tags nosqlite,nomysql,nopg,notikv,nobadger,noetcd") {
+			t.Fatalf("%s must build CGO-free with the JuiceFS metadata-engine tags", name)
+		}
+	}
+}

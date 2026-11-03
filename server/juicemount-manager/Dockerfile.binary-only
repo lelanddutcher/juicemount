@@ -17,7 +17,9 @@ COPY go.mod go.sum ./
 COPY third_party/juicefs ./third_party/juicefs
 RUN go mod download
 COPY . .
+# Same metadata-engine tags as Dockerfile (Redis only, no CGO).
 RUN CGO_ENABLED=0 GOOS=linux go build \
+      -tags nosqlite,nomysql,nopg,notikv,nobadger,noetcd \
       -ldflags="-s -w -X github.com/lelanddutcher/juicemount/internal/version.Version=${JM_VERSION} -X github.com/lelanddutcher/juicemount/internal/version.Commit=${JM_COMMIT}" \
       -o /out/juicemount-manager ./cmd/juicemount-manager
 

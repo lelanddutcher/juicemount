@@ -415,6 +415,15 @@ services:
       # uncomment so Overview, Trash retention, and GC/FSCK read the volume.
       # Standalone mode (the default above, with JM_META set) leaves it empty.
       # JM_OVERVIEW_META: "redis://manager@respproxy:6379/1"
+      # EXPERIMENTAL smart folders, off by default (see README "Smart
+      # folders"). Set JM_SMART_FOLDERS=on in server/.env to keep a
+      # /Recents/<top-level folder>/ view of relative symlinks to recently
+      # changed files in the volume. Works in this standalone mode: the views
+      # are written through a JuiceFS metadata client as principal `manager`
+      # (JM_META above), and what it creates is recorded in /var/lib/manager.
+      JM_SMART_FOLDERS: "${JM_SMART_FOLDERS:-off}"
+      JM_SMART_FOLDERS_ROOT: "${JM_SMART_FOLDERS_ROOT:-Recents}"
+      JM_SMART_FOLDERS_MAX_VIEWS: "${JM_SMART_FOLDERS_MAX_VIEWS:-256}"
     ports:
       - "30190:8080"                              # manager UI
     volumes:

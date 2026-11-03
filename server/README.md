@@ -83,6 +83,74 @@ Features:
   intent).
 - Jobs queue and run sequentially.
 
+## Smart folders (experimental, off by default)
+
+Smart folders make the Manager keep a top-level `Recents` folder in the
+volume: `Recents/<top-level folder>/` holds relative symlinks to the 100 most
+recently changed files under that folder (entries older than 30 days drop
+out). Every client sees it in Finder and in file pickers with no extra app.
+
+**Turning it on (default deployment):** set `JM_SMART_FOLDERS=on` in
+`server/.env` and redeploy the Manager. Nothing else is needed: in the default
+standalone mode the Manager writes the views through a JuiceFS metadata
+client logged in as its own proxy principal (`JM_META`, `manager@respproxy`).
+It opens no JuiceFS session (a session's background check exits the process
+if the volume format changes), and no FUSE mount or object-store key is
+used. Smart folders run only in this standalone mode: a Manager in embedded
+mode (`--fuse-mount`) logs that and does not start them, because a directory
+created through a mount cannot be identified atomically.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `JM_SMART_FOLDERS` | `off` | `on` enables smart folders. |
+| `JM_SMART_FOLDERS_ROOT` | `Recents` | Name of the top-level folder. |
+| `JM_SMART_FOLDERS_MAX_VIEWS` | `256` | Most views (top-level folders) kept, 1 to 4096. |
+
+How it behaves:
+
+- **Ownership is recorded, never guessed.** Everything the Manager creates
+  (the root, each view, each link) is recorded in `smart-folders.json` next to
+  `JM_STATE_FILE` *before* it is created: links under a random hidden
+  temporary name that is then renamed into place without replacing
+  anything, directories with mode `0705`, which is how an interrupted
+  creation is recognised later. A link is replaced only by an atomic
+  exchange after re-checking it is still the Manager's, and swapped back if
+  anything else got there first. It never modifies anything else: an
+  existing `Recents` it did not create (even an empty one) is left alone and
+  looked at again every 10 minutes, and a file someone drops into a view is
+  never touched. It never removes a directory: a view whose files all age
+  out stays, empty. Without a state file the feature stays off.
+- **Only real folders get views.** A top-level folder must exist on the
+  volume before it is tracked, so change events naming made-up folders cost
+  nothing. The state file is bounded (at most `MAX_VIEWS` x 100 entries).
+- **Names stay put.** A file keeps its link name while it stays in the list;
+  a newer file with the same name gets the suffix (`clip (B-Roll).mov`).
+- **Each view update checks out the view's project lease**
+  (`/Recents/<folder>`) as trash restore does, and only when the view needs
+  to change. A refused checkout or failed write backs off (30 s doubling to
+  30 min) and is logged once.
+
+Known gaps:
+
+- Recency comes from the Macs' change events on the `juicemount:metadata`
+  channel. Changes made while the Manager is down are missed. Writes that
+  publish no event are invisible: Manager migrations, the render farm, the
+  WebDAV/S3 gateway, and a Mac renaming a file it had not yet listed.
+- Editing apps may remember the symlink path. When a file ages out of
+  `Recents` the link goes away and media opened through it goes offline;
+  relink to the real path.
+- Name clashes are compared with simple lower-casing (no full Unicode case
+  folding or normalisation), which only affects which file gets a suffix.
+- The standalone metadata client opens no JuiceFS session, so JuiceFS
+  directory quotas are not charged for the views' directories and links (a
+  few bytes each). Usage counters are still flushed after each update.
+- The final unlink of a link the Manager moved aside happens by name, under
+  a random hidden temporary name only the Manager knows; only a client that
+  learned that name could race it.
+- An entry that cannot be moved back from a temporary name (its own name
+  was taken again in the meantime) stays under that hidden name, is never
+  deleted, and is named in the Manager log until it can go back.
+
 ## Persistence & upgrade
 
 Data lives in the host paths set in `volumes:`, but a full-stack

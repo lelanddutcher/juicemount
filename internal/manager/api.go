@@ -416,6 +416,14 @@ func Register(mux *http.ServeMux, prefix string, cfg Config) *JobManager {
 	// H-8B: Mac principal enrollment, leases admin, mode switch, and the
 	// project checkout for sync/trash restore (principals.go).
 	a.registerH8B(mux, prefix, cfg)
+	// Experimental smart folders (JM_SMART_FOLDERS=on, standalone mode only).
+	// Started after registerH8B so view writes check out their project
+	// with the same leaser trash restore uses.
+	if svc := a.startSmartFolders(cfg, os.Getenv); svc != nil {
+		mgr.mu.Lock()
+		mgr.smartFolders = svc
+		mgr.mu.Unlock()
+	}
 	// Static UI: serve <prefix>/ and <prefix>/<file>. Strip prefix so
 	// the existing handleStatic logic still works.
 	staticHandler := http.StripPrefix(prefix, http.HandlerFunc(a.handleStatic))

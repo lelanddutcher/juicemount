@@ -166,6 +166,11 @@ type JobManager struct {
 	// persisted settings on startup.
 	settings        settingsStore
 	pendingSettings *settingsState
+
+	// smartFolders is the experimental smart-folder service
+	// (smartfolders.go), nil unless JM_SMART_FOLDERS=on. StopAll stops it
+	// after cancelling jobs and before the FUSE mount goes away.
+	smartFolders interface{ Stop() }
 }
 
 // destinationStore is the minimum surface JobManager needs to keep the
@@ -794,6 +799,7 @@ func (m *JobManager) StopAll() {
 	m.mu.RLock()
 	sched := m.schedules
 	maintSched := m.maintenanceSchedules
+	smart := m.smartFolders
 	ids := make([]string, 0, len(m.jobs))
 	for id := range m.jobs {
 		ids = append(ids, id)
@@ -807,6 +813,11 @@ func (m *JobManager) StopAll() {
 	}
 	for _, id := range ids {
 		m.Cancel(id)
+	}
+	// After the jobs: smart folders write into the volume too, and their
+	// Stop is bounded, so it never holds up cancelling a sync.
+	if smart != nil {
+		smart.Stop()
 	}
 }
 

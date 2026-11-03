@@ -1,0 +1,283 @@
+//go:build linux || darwin || windows
+
+// Package jfsmeta is the smartfolders.FS for a Manager without the volume
+// mounted (standalone mode): it writes smart-folder views through the
+// JuiceFS metadata client, metadata only. It looks names up, creates
+// directories and symlinks, reads links, renames (no-replace and exchange
+// only) and unlinks; it never reads or writes file contents, so it needs no
+// object-store access.
+//
+// It deliberately opens NO JuiceFS session. A session starts the client's
+// background refresh, which calls os.Exit when the volume's format is
+// removed, changes UUID or gains a newer metadata version (pkg/meta
+// baseMeta.refresh); the Manager must never exit because of smart folders.
+// None of the operations used needs a session: sessions hold open files
+// and locks, and this client opens neither. Its writes go through whatever
+// endpoint the URL names (in the default deployment the RESP proxy, as the
+// Manager's principal), governed by the same leases as every other client.
+// Usage counters are flushed after each batch (Flush) instead of by the
+// session's background flusher.
+package jfsmeta
+
+import (
+	"errors"
+	"fmt"
+	"io/fs"
+	"net/url"
+	"path"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/juicedata/juicefs/pkg/meta"
+	"github.com/lelanddutcher/juicemount/internal/smartfolders"
+	"github.com/redis/go-redis/v9"
+)
+
+// FS implements smartfolders.FS on a JuiceFS metadata client.
+type FS struct {
+	m   meta.Meta
+	ctx meta.Context
+}
+
+var _ smartfolders.FS = (*FS)(nil)
+
+// OpenTimeout bounds Open: the JuiceFS client cannot be cancelled, so an
+// unreachable endpoint must not hold the caller for its own retry budget.
+const OpenTimeout = 15 * time.Second
+
+// Open connects to the volume at metaURL (redis:// or rediss://) and loads
+// its format, within OpenTimeout. The URL is checked first: the JuiceFS
+// client exits the process on a URL it cannot parse.
+func Open(metaURL string) (*FS, error) {
+	return OpenWithin(metaURL, OpenTimeout)
+}
+
+// OpenWithin is Open with an explicit bound. A connection that completes
+// after the bound is shut down in the background.
+func OpenWithin(metaURL string, limit time.Duration) (*FS, error) {
+	u, err := url.Parse(metaURL)
+	if err != nil || (u.Scheme != "redis" && u.Scheme != "rediss") || u.Host == "" {
+		return nil, errors.New("smart folders: the metadata URL must be redis:// or rediss://host")
+	}
+	if _, err := redis.ParseURL(metaURL); err != nil {
+		return nil, errors.New("smart folders: the metadata URL is not a valid Redis URL")
+	}
+	type opened struct {
+		fs  *FS
+		err error
+	}
+	done := make(chan opened, 1)
+	abandoned := make(chan struct{})
+	go func() {
+		conf := meta.DefaultConf()
+		conf.NoBGJob = true // cleanup jobs belong to the volume's own clients
+		conf.MaxDeletes = 0 // never deletes file data (it only unlinks symlinks)
+		conf.Retries = 1    // one retry per command, not the default ten
+		m := meta.NewClient(metaURL, conf)
+		if _, err := m.Load(true); err != nil {
+			_ = m.Shutdown()
+			done <- opened{err: fmt.Errorf("smart folders: loading the volume format: %w", err)}
+			return
+		}
+		f := &FS{m: m, ctx: meta.Background()}
+		select {
+		case done <- opened{fs: f}:
+		case <-abandoned:
+			_ = m.Shutdown()
+		}
+	}()
+	select {
+	case o := <-done:
+		return o.fs, o.err
+	case <-time.After(limit):
+		close(abandoned)
+		return nil, fmt.Errorf("smart folders: the metadata endpoint did not answer within %s", limit)
+	}
+}
+
+// Flush writes the usage counters (used space, inodes, directory stats)
+// the client accumulated; without a session nothing flushes them otherwise.
+func (f *FS) Flush() { f.m.FlushSession() }
+
+// Close flushes the counters and disconnects. There is no session to close.
+func (f *FS) Close() error {
+	f.Flush()
+	return f.m.Shutdown()
+}
+
+// errno turns a JuiceFS status into an error. syscall.Errno values satisfy
+// errors.Is with fs.ErrNotExist / fs.ErrExist, as the FS contract needs.
+func errno(st syscall.Errno) error {
+	if st == 0 {
+		return nil
+	}
+	return st
+}
+
+func split(p string) ([]string, error) {
+	if p == "" || strings.HasPrefix(p, "/") || path.Clean(p) != p {
+		return nil, fmt.Errorf("invalid volume path %q: %w", p, syscall.EINVAL)
+	}
+	parts := strings.Split(p, "/")
+	for _, c := range parts {
+		if c == "" || c == "." || c == ".." {
+			return nil, fmt.Errorf("invalid volume path %q: %w", p, syscall.EINVAL)
+		}
+	}
+	return parts, nil
+}
+
+// parent resolves the directory holding p's last component, by inode from
+// the volume root, refusing any symlink on the way.
+func (f *FS) parent(p string) (meta.Ino, string, error) {
+	parts, err := split(p)
+	if err != nil {
+		return 0, "", err
+	}
+	dir := meta.RootInode
+	for _, c := range parts[:len(parts)-1] {
+		var ino meta.Ino
+		var attr meta.Attr
+		if st := f.m.Lookup(f.ctx, dir, c, &ino, &attr, false); st != 0 {
+			return 0, "", st
+		}
+		switch attr.Typ {
+		case meta.TypeDirectory:
+		case meta.TypeSymlink:
+			return 0, "", smartfolders.ErrSymlinkInPath
+		default:
+			return 0, "", syscall.ENOTDIR
+		}
+		dir = ino
+	}
+	return dir, parts[len(parts)-1], nil
+}
+
+func (f *FS) lookup(p string) (meta.Ino, meta.Attr, error) {
+	var ino meta.Ino
+	var attr meta.Attr
+	dir, leaf, err := f.parent(p)
+	if err != nil {
+		return 0, attr, err
+	}
+	if st := f.m.Lookup(f.ctx, dir, leaf, &ino, &attr, false); st != 0 {
+		return 0, attr, st
+	}
+	return ino, attr, nil
+}
+
+func info(ino meta.Ino, attr *meta.Attr) smartfolders.Info {
+	in := smartfolders.Info{Type: smartfolders.TypeOther, Ino: uint64(ino), Perm: fs.FileMode(attr.Mode & 0o777)}
+	switch attr.Typ {
+	case meta.TypeFile:
+		in.Type = smartfolders.TypeRegular
+	case meta.TypeDirectory:
+		in.Type = smartfolders.TypeDir
+	case meta.TypeSymlink:
+		in.Type = smartfolders.TypeSymlink
+	}
+	return in
+}
+
+func (f *FS) Lstat(p string) (smartfolders.Info, error) {
+	ino, attr, err := f.lookup(p)
+	if err != nil {
+		return smartfolders.Info{}, err
+	}
+	return info(ino, &attr), nil
+}
+
+func (f *FS) Readlink(p string) (string, error) {
+	ino, attr, err := f.lookup(p)
+	if err != nil {
+		return "", err
+	}
+	if attr.Typ != meta.TypeSymlink {
+		return "", syscall.EINVAL
+	}
+	var buf []byte
+	if st := f.m.ReadLink(f.ctx, ino, &buf); st != 0 {
+		return "", st
+	}
+	return string(buf), nil
+}
+
+func (f *FS) Mkdir(p string, perm fs.FileMode) (smartfolders.Info, error) {
+	dir, leaf, err := f.parent(p)
+	if err != nil {
+		return smartfolders.Info{}, err
+	}
+	var ino meta.Ino
+	var attr meta.Attr
+	if st := f.m.Mkdir(f.ctx, dir, leaf, uint16(perm.Perm()), 0, 0, &ino, &attr); st != 0 {
+		return smartfolders.Info{}, st
+	}
+	return info(ino, &attr), nil
+}
+
+func (f *FS) Symlink(text, p string) (smartfolders.Info, error) {
+	dir, leaf, err := f.parent(p)
+	if err != nil {
+		return smartfolders.Info{}, err
+	}
+	var ino meta.Ino
+	var attr meta.Attr
+	if st := f.m.Symlink(f.ctx, dir, leaf, text, &ino, &attr); st != 0 {
+		return smartfolders.Info{}, st
+	}
+	return info(ino, &attr), nil
+}
+
+// Chmod sets perm on the directory p if it is still inode ino. (Mkdir here
+// passes no umask, so the Manager's directories never need it.)
+func (f *FS) Chmod(p string, ino uint64, perm fs.FileMode) error {
+	got, attr, err := f.lookup(p)
+	if err != nil {
+		return err
+	}
+	if uint64(got) != ino || attr.Typ != meta.TypeDirectory {
+		return fmt.Errorf("%s is no longer the directory the Manager created", p)
+	}
+	attr.Mode = uint16(perm.Perm())
+	return errno(f.m.SetAttr(f.ctx, got, meta.SetAttrMode, 0, &attr))
+}
+
+// Place renames tmp to p, never replacing an existing p.
+func (f *FS) Place(tmp, p string) error { return f.rename(tmp, p, meta.RenameNoReplace) }
+
+// Swap atomically exchanges tmp and p. Never a plain rename, so nothing at
+// p is ever destroyed or moved into the trash.
+func (f *FS) Swap(tmp, p string) error { return f.rename(tmp, p, meta.RenameExchange) }
+
+func (f *FS) rename(tmp, p string, flags uint32) error {
+	if path.Dir(tmp) != path.Dir(p) {
+		return fmt.Errorf("rename across directories: %w", syscall.EINVAL)
+	}
+	dir, leaf, err := f.parent(p)
+	if err != nil {
+		return err
+	}
+	var ino meta.Ino
+	var attr meta.Attr
+	return errno(f.m.Rename(f.ctx, dir, path.Base(tmp), dir, leaf, flags, &ino, &attr))
+}
+
+// Remove unlinks a non-directory without moving it to the trash. It is a
+// lookup and then an unlink by name (JuiceFS has no unlink-if-inode); the
+// reconciler only removes under random hidden temp names it recorded.
+func (f *FS) Remove(p string) error {
+	dir, leaf, err := f.parent(p)
+	if err != nil {
+		return err
+	}
+	var ino meta.Ino
+	var attr meta.Attr
+	if st := f.m.Lookup(f.ctx, dir, leaf, &ino, &attr, false); st != 0 {
+		return st
+	}
+	if attr.Typ == meta.TypeDirectory {
+		return syscall.EISDIR
+	}
+	return errno(f.m.Unlink(f.ctx, dir, leaf, true))
+}

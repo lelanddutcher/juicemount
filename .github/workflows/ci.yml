@@ -48,6 +48,10 @@ jobs:
           JM_REQUIRE_GATE_HISTORY: '1'
           JM_TEST_LINK_REDIS: redis://127.0.0.1:6379/13
           JM_TEST_MANAGER_REDIS: redis://127.0.0.1:6379/12
+          # Smart folders format throwaway JuiceFS volumes (each DB is flushed;
+          # one per package, since packages run in parallel).
+          JM_TEST_SMARTFOLDERS_META_REDIS: redis://127.0.0.1:6379/10
+          JM_TEST_SMARTFOLDERS_JFS_REDIS: redis://127.0.0.1:6379/9
           JM_TEST_METADATA_REDIS: redis://127.0.0.1:6379/14
           JM_TEST_REDIS: redis://127.0.0.1:6379/15
           JM_RESPPROXY_TEST_REDIS: 127.0.0.1:6380
