@@ -419,6 +419,7 @@ func TestToSyncURIKeepsCredsOffCommandLine(t *testing.T) {
 		Name: "n", Kind: "sftp", Config: map[string]string{
 			"host": "h.example.com", "user": "u",
 			"password": "VERY-SECRET-PW",
+			"host_key": formatHostKey(newTestHostSigner(t).PublicKey()),
 		},
 	}
 	uri2, env2, err := d2.ToSyncURI(false)

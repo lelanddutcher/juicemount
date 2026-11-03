@@ -3267,8 +3267,17 @@
     btn.disabled = true;
     btn.textContent = 'Testing…';
     try {
-      await api('POST', `/api/destinations/${encodeURIComponent(name)}/test`);
+      const res = await api('POST', `/api/destinations/${encodeURIComponent(name)}/test`);
       btn.textContent = 'OK';
+      // SFTP: show the server's host key fingerprint. The first
+      // successful test records it; later tests refuse any other key.
+      if (res && res.host_key_fingerprint) {
+        const f = $('#dest-flash');
+        f.textContent = res.host_key_recorded
+          ? `${name}: host key recorded (${res.host_key_fingerprint}). Future connections must present this key.`
+          : `${name}: host key verified (${res.host_key_fingerprint}).`;
+        f.hidden = false;
+      }
       setTimeout(() => { btn.textContent = orig; btn.disabled = false; }, 2000);
     } catch (e) {
       btn.textContent = 'Failed';

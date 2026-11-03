@@ -310,6 +310,14 @@ func RunSync(ctx context.Context, juicefsBin string, spec RunSyncSpec, source, d
 	}
 	args = append(args, src, dst)
 
+	// SFTP destinations carry their recorded host key; hand it to
+	// juicefs as a known_hosts file for the lifetime of the process.
+	modeEnv, cleanupKnownHosts, err := prepareKnownHostsEnv(modeEnv)
+	if err != nil {
+		return err
+	}
+	defer cleanupKnownHosts()
+
 	cmd := exec.CommandContext(ctx, juicefsBin, args...)
 	// Inherit parent env (PATH, HOME, TMPDIR) then add the merged env:
 	// the mode-derived vars (URL alias for ModeStandalone) PLUS any

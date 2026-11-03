@@ -19,6 +19,7 @@
 package manager
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/base64"
@@ -39,6 +40,7 @@ import (
 	"github.com/lelanddutcher/juicemount/internal/redisurl"
 	"github.com/redis/go-redis/v9"
 	"golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh/knownhosts"
 )
 
 // destinationKinds is the allow-list of recognized profile kinds. Any
@@ -71,7 +73,8 @@ const maxDestinationNameLen = 64
 // Config keys vary by kind:
 //   - file:   {"path": "/external/backups"}
 //   - s3/b2:  {"endpoint", "bucket", "access_key", "secret_key", "region" (optional)}
-//   - sftp:   {"host", "port", "user", "password" OR "private_key", "path" (optional)}
+//   - sftp:   {"host", "port", "user", "password" OR "private_key", "path" (optional),
+//     "host_key" (optional; recorded by the first successful Test, see sftpHostKeyConfigKey)}
 //   - webdav: {"endpoint", "user" (optional), "password" (optional)}
 //   - jfs:    {"meta_url", "volume" (optional, defaults to "jfs")}
 //
@@ -258,20 +261,9 @@ func (s *destinationStoreImpl) getPlaintext(name string) (Destination, error) {
 		if r.Name != name {
 			continue
 		}
-		blob, err := base64.StdEncoding.DecodeString(r.EncryptedConfig)
-		if err != nil {
-			return Destination{}, fmt.Errorf("base64 decode: %w", err)
-		}
-		plaintext, err := decryptSecret(blob, s.key)
+		cfg, err := s.decryptConfigLocked(r)
 		if err != nil {
 			return Destination{}, err
-		}
-		var cfg map[string]string
-		if err := json.Unmarshal(plaintext, &cfg); err != nil {
-			return Destination{}, fmt.Errorf("config unmarshal: %w", err)
-		}
-		for i := range plaintext {
-			plaintext[i] = 0
 		}
 		return Destination{
 			Name:      r.Name,
@@ -285,6 +277,93 @@ func (s *destinationStoreImpl) getPlaintext(name string) (Destination, error) {
 }
 
 var errDestinationNotFound = errors.New("destination not found")
+
+// decryptConfigLocked returns the plaintext Config of one stored row.
+// Caller holds s.mu.
+func (s *destinationStoreImpl) decryptConfigLocked(r destinationsState) (map[string]string, error) {
+	blob, err := base64.StdEncoding.DecodeString(r.EncryptedConfig)
+	if err != nil {
+		return nil, fmt.Errorf("base64 decode: %w", err)
+	}
+	plaintext, err := decryptSecret(blob, s.key)
+	if err != nil {
+		return nil, err
+	}
+	var cfg map[string]string
+	if err := json.Unmarshal(plaintext, &cfg); err != nil {
+		return nil, fmt.Errorf("config unmarshal: %w", err)
+	}
+	for i := range plaintext {
+		plaintext[i] = 0
+	}
+	return cfg, nil
+}
+
+// encryptConfigLocked is the inverse of decryptConfigLocked: it returns
+// the base64 ciphertext stored in destinationsState.EncryptedConfig.
+// Caller holds s.mu.
+func (s *destinationStoreImpl) encryptConfigLocked(cfg map[string]string) (string, error) {
+	plaintext, err := json.Marshal(cfg)
+	if err != nil {
+		return "", fmt.Errorf("marshal config: %w", err)
+	}
+	blob, err := encryptSecret(plaintext, s.key)
+	// Scrub the plaintext as soon as it's no longer needed; see the
+	// caveat in listRedacted about Go's memory hygiene limits.
+	for i := range plaintext {
+		plaintext[i] = 0
+	}
+	if err != nil {
+		return "", err
+	}
+	return base64.StdEncoding.EncodeToString(blob), nil
+}
+
+// pinHostKey records hostKey (authorized_keys form) as the SFTP host
+// key of destination name, trust-on-first-use. It only writes when the
+// stored row still has no host key and still points at host:port — a
+// concurrent edit that moved the destination or pinned a key wins.
+// Returns whether the key was recorded.
+func (s *destinationStoreImpl) pinHostKey(name, host, port, hostKey string) (bool, error) {
+	recorded, err := s.pinHostKeyLocked(name, host, port, hostKey)
+	if recorded {
+		s.notifyChange()
+	}
+	return recorded, err
+}
+
+func (s *destinationStoreImpl) pinHostKeyLocked(name, host, port, hostKey string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.key) != credKeyLen {
+		return false, errors.New("destinations are unavailable: set JM_ADMIN_KEY to enable encrypted credential storage")
+	}
+	for i, r := range s.rows {
+		if r.Name != name {
+			continue
+		}
+		if r.Kind != "sftp" {
+			return false, nil
+		}
+		cfg, err := s.decryptConfigLocked(r)
+		if err != nil {
+			return false, err
+		}
+		if strings.TrimSpace(cfg[sftpHostKeyConfigKey]) != "" ||
+			!sameSFTPEndpoint(cfg, map[string]string{"host": host, "port": port}) {
+			return false, nil
+		}
+		cfg[sftpHostKeyConfigKey] = hostKey
+		encoded, err := s.encryptConfigLocked(cfg)
+		if err != nil {
+			return false, err
+		}
+		s.rows[i].EncryptedConfig = encoded
+		s.rows[i].UpdatedAt = time.Now().UnixMilli()
+		return true, nil
+	}
+	return false, errDestinationNotFound
+}
 
 // upsert encrypts the given Destination and stores it. If a row with
 // the same name already exists, it's replaced (UpdatedAt bumped,
@@ -307,26 +386,38 @@ func (s *destinationStoreImpl) upsertLocked(d Destination, allowReplace bool) (b
 	if len(s.key) != credKeyLen {
 		return false, errors.New("destinations are unavailable: set JM_ADMIN_KEY to enable encrypted credential storage")
 	}
-	plaintext, err := json.Marshal(d.Config)
-	if err != nil {
-		return false, fmt.Errorf("marshal config: %w", err)
+	cfg := d.Config
+	var existing *destinationsState
+	for i := range s.rows {
+		if s.rows[i].Name == d.Name {
+			existing = &s.rows[i]
+			break
+		}
 	}
-	blob, err := encryptSecret(plaintext, s.key)
-	// Scrub the plaintext as soon as it's no longer needed; see the
-	// caveat in listRedacted about Go's memory hygiene limits.
-	for i := range plaintext {
-		plaintext[i] = 0
+	if existing != nil && !allowReplace {
+		return false, fmt.Errorf("destination %q already exists", d.Name)
 	}
+	// An SFTP edit that leaves host_key blank keeps the recorded host
+	// key as long as it still points at the same host and port. The
+	// edit form never carries the key (it is learned, not typed), so
+	// without this every edit would silently drop the pin and the next
+	// test would trust whatever key it is shown.
+	if existing != nil && d.Kind == "sftp" && existing.Kind == "sftp" && strings.TrimSpace(cfg[sftpHostKeyConfigKey]) == "" {
+		if old, err := s.decryptConfigLocked(*existing); err == nil && old[sftpHostKeyConfigKey] != "" && sameSFTPEndpoint(old, cfg) {
+			cfg = make(map[string]string, len(d.Config)+1)
+			for k, v := range d.Config {
+				cfg[k] = v
+			}
+			cfg[sftpHostKeyConfigKey] = old[sftpHostKeyConfigKey]
+		}
+	}
+	encoded, err := s.encryptConfigLocked(cfg)
 	if err != nil {
 		return false, err
 	}
-	encoded := base64.StdEncoding.EncodeToString(blob)
 	now := time.Now().UnixMilli()
 	for i, r := range s.rows {
 		if r.Name == d.Name {
-			if !allowReplace {
-				return false, fmt.Errorf("destination %q already exists", d.Name)
-			}
 			s.rows[i] = destinationsState{
 				Name:            r.Name,
 				Kind:            d.Kind,
@@ -456,6 +547,11 @@ func validateConfig(kind string, cfg map[string]string) error {
 	if kind == "sftp" {
 		if cfg["password"] == "" && cfg["private_key"] == "" {
 			return errors.New("sftp requires either 'password' or 'private_key' in config")
+		}
+		if hk := strings.TrimSpace(cfg[sftpHostKeyConfigKey]); hk != "" {
+			if _, err := parseHostKey(hk); err != nil {
+				return fmt.Errorf("sftp host_key: %w", err)
+			}
 		}
 	}
 	return nil
@@ -648,7 +744,8 @@ func (a *API) handleDestinationTest(w http.ResponseWriter, r *http.Request, name
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
-	if err := testConnection(ctx, d); err != nil {
+	hostKey, err := testConnection(ctx, d)
+	if err != nil {
 		// 502 = upstream failure (the remote endpoint we proxied to is
 		// the upstream). Includes the diagnostic message so the
 		// operator knows whether it's a credential, a network, or a
@@ -656,7 +753,24 @@ func (a *API) handleDestinationTest(w http.ResponseWriter, r *http.Request, name
 		http.Error(w, "connection test failed: "+err.Error(), http.StatusBadGateway)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	resp := map[string]any{"ok": true}
+	if hostKey != nil {
+		// SFTP: report the server's host key fingerprint, and record
+		// the key on the first successful test (trust on first use).
+		// Later tests and transfers refuse a server presenting any
+		// other key.
+		resp["host_key_fingerprint"] = ssh.FingerprintSHA256(hostKey)
+		recorded := false
+		if strings.TrimSpace(d.Config[sftpHostKeyConfigKey]) == "" {
+			recorded, err = a.dests.pinHostKey(name, d.Config["host"], d.Config["port"], formatHostKey(hostKey))
+			if err != nil {
+				http.Error(w, "record host key: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
+		}
+		resp["host_key_recorded"] = recorded
+	}
+	writeJSON(w, http.StatusOK, resp)
 	// Scrub the plaintext config we held briefly so a subsequent
 	// memory dump doesn't carry it.
 	for k := range d.Config {
@@ -678,7 +792,9 @@ func (a *API) handleDestinationTest(w http.ResponseWriter, r *http.Request, name
 //     code distinguishes 200 (ok), 403 (auth), 404 (bucket not
 //     found), 0 (network).
 //   - sftp:   SSH dial + handshake + close. Does not open a session;
-//     the auth handshake is enough.
+//     the auth handshake is enough. Verifies the server's host key
+//     against the recorded one (if any) before authenticating, and
+//     returns the key so the handler can record it on first use.
 //   - webdav: PROPFIND on the root with Depth: 0. Servers return 207
 //     Multi-Status on success.
 //   - jfs:    Redis PING against the meta_url.
@@ -686,20 +802,22 @@ func (a *API) handleDestinationTest(w http.ResponseWriter, r *http.Request, name
 // For test-only HTTP probes (s3, b2, webdav) we use a short HTTP
 // client timeout (4s) on top of the ctx deadline so a hanging TCP
 // connection can't extend the request beyond the handler's 10s budget.
-func testConnection(ctx context.Context, d Destination) error {
+//
+// hostKey is non-nil only for a successful sftp probe.
+func testConnection(ctx context.Context, d Destination) (hostKey ssh.PublicKey, err error) {
 	switch d.Kind {
 	case "file":
-		return testConnectionFile(d.Config)
+		return nil, testConnectionFile(d.Config)
 	case "s3", "b2":
-		return testConnectionS3(ctx, d.Config)
+		return nil, testConnectionS3(ctx, d.Config)
 	case "sftp":
 		return testConnectionSFTP(ctx, d.Config)
 	case "webdav":
-		return testConnectionWebDAV(ctx, d.Config)
+		return nil, testConnectionWebDAV(ctx, d.Config)
 	case "jfs":
-		return testConnectionJFS(ctx, d.Config)
+		return nil, testConnectionJFS(ctx, d.Config)
 	default:
-		return fmt.Errorf("no probe implemented for kind %q", d.Kind)
+		return nil, fmt.Errorf("no probe implemented for kind %q", d.Kind)
 	}
 }
 
@@ -789,11 +907,11 @@ func testConnectionS3(ctx context.Context, cfg map[string]string) error {
 	}
 }
 
-func testConnectionSFTP(ctx context.Context, cfg map[string]string) error {
+func testConnectionSFTP(ctx context.Context, cfg map[string]string) (ssh.PublicKey, error) {
 	host := strings.TrimSpace(cfg["host"])
 	user := strings.TrimSpace(cfg["user"])
 	if host == "" || user == "" {
-		return errors.New("host and user are required")
+		return nil, errors.New("host and user are required")
 	}
 	port := strings.TrimSpace(cfg["port"])
 	if port == "" {
@@ -810,41 +928,136 @@ func testConnectionSFTP(ctx context.Context, cfg map[string]string) error {
 		// explicit so the operator knows what's missing.
 		signer, err := ssh.ParsePrivateKey([]byte(key))
 		if err != nil {
-			return fmt.Errorf("parse private_key: %w", err)
+			return nil, fmt.Errorf("parse private_key: %w", err)
 		}
 		authMethods = append(authMethods, ssh.PublicKeys(signer))
 	}
 	if len(authMethods) == 0 {
-		return errors.New("no auth method (set password or private_key)")
+		return nil, errors.New("no auth method (set password or private_key)")
 	}
-	// SSH host-key verification: we accept any host key here because
-	// the operator is wiring up a brand-new destination and there's
-	// no UX yet to surface the host-key fingerprint for explicit
-	// confirmation. Documented as a follow-up; the connection-test
-	// surface is narrow (no data transfer), so a MITM here only
-	// confirms a wrong key works against an attacker, not data
-	// disclosure.
+	// Host-key verification. With a recorded key, anything else is
+	// refused inside the key exchange — before the client sends any
+	// credential. Without one (first test of a new destination) the
+	// presented key is accepted and returned so the caller can record
+	// it once authentication has succeeded.
+	var pinned ssh.PublicKey
+	if hk := strings.TrimSpace(cfg[sftpHostKeyConfigKey]); hk != "" {
+		k, err := parseHostKey(hk)
+		if err != nil {
+			return nil, fmt.Errorf("recorded host_key: %w", err)
+		}
+		pinned = k
+	}
+	var seen ssh.PublicKey
 	cfg2 := &ssh.ClientConfig{
-		User:            user,
-		Auth:            authMethods,
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
-		Timeout:         4 * time.Second,
+		User: user,
+		Auth: authMethods,
+		HostKeyCallback: func(_ string, _ net.Addr, key ssh.PublicKey) error {
+			seen = key
+			if pinned != nil && !bytes.Equal(key.Marshal(), pinned.Marshal()) {
+				return fmt.Errorf("server host key %s does not match the recorded host key %s; if the server's key was changed on purpose, delete and re-create this destination", ssh.FingerprintSHA256(key), ssh.FingerprintSHA256(pinned))
+			}
+			return nil
+		},
+		Timeout: 4 * time.Second,
+	}
+	if pinned != nil {
+		// Ask for the recorded key's type so a server holding several
+		// host keys presents the one we know.
+		cfg2.HostKeyAlgorithms = hostKeyAlgorithms(pinned)
 	}
 	// Use Dial with a context-aware net.Dialer so ctx cancellation
 	// (handler-timeout) cuts the connect attempt cleanly.
 	dialer := &net.Dialer{Timeout: 4 * time.Second}
 	conn, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(host, port))
 	if err != nil {
-		return fmt.Errorf("tcp dial: %w", err)
+		return nil, fmt.Errorf("tcp dial: %w", err)
 	}
 	defer conn.Close()
 	sshConn, chans, reqs, err := ssh.NewClientConn(conn, net.JoinHostPort(host, port), cfg2)
 	if err != nil {
-		return fmt.Errorf("ssh handshake: %w", err)
+		return nil, fmt.Errorf("ssh handshake: %w", err)
 	}
 	client := ssh.NewClient(sshConn, chans, reqs)
 	_ = client.Close()
-	return nil
+	return seen, nil
+}
+
+// sftpHostKeyConfigKey is the Config key holding an SFTP destination's
+// recorded host key, in authorized_keys form ("ssh-ed25519 AAAA...").
+// It is learned on the first successful Test (or supplied by the
+// operator) and checked on every later test and transfer.
+const sftpHostKeyConfigKey = "host_key"
+
+// sftpHostKeyEnv carries a known_hosts line from ToSyncURI to RunSync,
+// which writes it to a temporary file and points juicefs sync at it via
+// SSH_KNOWN_HOSTS (see prepareKnownHostsEnv). Never reaches juicefs.
+const sftpHostKeyEnv = "JM_SFTP_KNOWN_HOST"
+
+func formatHostKey(k ssh.PublicKey) string {
+	return strings.TrimSpace(string(ssh.MarshalAuthorizedKey(k)))
+}
+
+func parseHostKey(s string) (ssh.PublicKey, error) {
+	k, _, _, _, err := ssh.ParseAuthorizedKey([]byte(s))
+	if err != nil {
+		return nil, fmt.Errorf("not an SSH public key (want e.g. \"ssh-ed25519 AAAA...\"): %w", err)
+	}
+	return k, nil
+}
+
+// hostKeyAlgorithms lists the signature algorithms that can present k.
+func hostKeyAlgorithms(k ssh.PublicKey) []string {
+	if k.Type() == ssh.KeyAlgoRSA {
+		return []string{ssh.KeyAlgoRSASHA512, ssh.KeyAlgoRSASHA256, ssh.KeyAlgoRSA}
+	}
+	return []string{k.Type()}
+}
+
+// sameSFTPEndpoint reports whether two sftp configs name the same
+// host and port — the scope a recorded host key belongs to.
+func sameSFTPEndpoint(a, b map[string]string) bool {
+	port := func(c map[string]string) string {
+		if p := strings.TrimSpace(c["port"]); p != "" {
+			return p
+		}
+		return "22"
+	}
+	return strings.EqualFold(strings.TrimSpace(a["host"]), strings.TrimSpace(b["host"])) && port(a) == port(b)
+}
+
+// prepareKnownHostsEnv turns sftpHostKeyEnv entries into a temporary
+// known_hosts file and an SSH_KNOWN_HOSTS entry pointing at it, which
+// juicefs sync's sftp backend uses to verify the server. The returned
+// cleanup removes the file; call it once the subprocess has exited.
+func prepareKnownHostsEnv(env []string) ([]string, func(), error) {
+	var lines []string
+	out := make([]string, 0, len(env)+1)
+	for _, e := range env {
+		if v, ok := strings.CutPrefix(e, sftpHostKeyEnv+"="); ok {
+			lines = append(lines, v)
+			continue
+		}
+		out = append(out, e)
+	}
+	if len(lines) == 0 {
+		return env, func() {}, nil
+	}
+	f, err := os.CreateTemp("", "juicemount-known-hosts-*")
+	if err != nil {
+		return nil, nil, fmt.Errorf("known_hosts: %w", err)
+	}
+	cleanup := func() { _ = os.Remove(f.Name()) }
+	if _, err := f.WriteString(strings.Join(lines, "\n") + "\n"); err != nil {
+		_ = f.Close()
+		cleanup()
+		return nil, nil, fmt.Errorf("known_hosts: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		cleanup()
+		return nil, nil, fmt.Errorf("known_hosts: %w", err)
+	}
+	return append(out, "SSH_KNOWN_HOSTS="+f.Name()), cleanup, nil
 }
 
 func testConnectionWebDAV(ctx context.Context, cfg map[string]string) error {
@@ -992,6 +1205,17 @@ func (d Destination) ToSyncURI(preserveStructure bool) (string, []string, error)
 		if user == "" || host == "" {
 			return "", nil, errors.New("sftp: user and host required")
 		}
+		// Transfers verify the server against the recorded host key;
+		// there is no unverified fallback.
+		hk := strings.TrimSpace(d.Config[sftpHostKeyConfigKey])
+		if hk == "" {
+			return "", nil, errors.New("sftp: no recorded host key; run Test on this destination first")
+		}
+		pub, err := parseHostKey(hk)
+		if err != nil {
+			return "", nil, fmt.Errorf("sftp: recorded host_key: %w", err)
+		}
+		env = append(env, sftpHostKeyEnv+"="+knownhosts.Line([]string{net.JoinHostPort(host, port)}, pub))
 		uri = fmt.Sprintf("sftp://%s@%s:%s%s", user, host, port, path)
 		if pw := d.Config["password"]; pw != "" {
 			env = append(env, "SFTP_PASSWORD="+pw)
