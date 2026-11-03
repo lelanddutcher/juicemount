@@ -442,3 +442,114 @@ func TestLegacyRequeueResendAfterSuccessIsNotClaimLost(t *testing.T) {
 		t.Fatal("requeue under a reused token returned success without moving the delivery")
 	}
 }
+
+// A claim whose reply was lost and that the worker replays after the grace
+// is a delivery starting now: the replay must restart its claim time, or a
+// reaper pass before the worker's heartbeat names the job returns it and the
+// worker's start is refused.
+func TestLegacyClaimReplayAfterTheGraceRestartsTheClaimTime(t *testing.T) {
+	q, ctx, worker, first, _ := legacyReplyLossFixture(t)
+	lost := h1InstallEvalTransportReplyLoss(t, q, claimForWorkerScript)
+	if _, ok, err := q.ClaimForWorker(ctx, 0, worker); err == nil || ok || !lost.Load() {
+		t.Fatalf("claim: ok=%v err=%v lost=%v; want the reply dropped and an error", ok, err, lost.Load())
+	}
+	ageLegacyClaim(t, q, ctx, first.ID)
+	claim, ok, err := q.ClaimForWorker(ctx, 0, worker)
+	if err != nil || !ok || claim.Job.ID != first.ID {
+		t.Fatalf("replay: %q ok=%v err=%v; want %s", claim.Job.ID, ok, err, first.ID)
+	}
+	if n, err := q.RecoverAbandonedWorkers(ctx); err != nil || n != 0 {
+		t.Fatalf("reaper right after the replay: recovered=%d err=%v; want the replayed delivery kept", n, err)
+	}
+	runLegacyClaimToAck(t, q, ctx, claim, worker)
+}
+
+// requeued_by answers a resent requeue of one delivery. A later delivery
+// under the same token (a released unconfirmed claim taken back by the next
+// claim) is a new delivery: once it is held, a requeue under that token moved
+// nothing and must not report success.
+func TestLegacyRequeueMarkerDoesNotOutliveItsDelivery(t *testing.T) {
+	q, ctx, worker, first, second := legacyReplyLossFixture(t)
+	lane := routedLane(t, q, ctx, second)
+	if err := q.rdb.LRem(ctx, lane, 0, mustJobPayload(t, q, ctx, second.ID)).Err(); err != nil {
+		t.Fatal(err)
+	}
+	lost := h1InstallEvalTransportReplyLoss(t, q, claimForWorkerScript)
+	if _, ok, err := q.ClaimForWorker(ctx, 0, worker); err == nil || ok || !lost.Load() {
+		t.Fatalf("claim: ok=%v err=%v lost=%v; want the reply dropped and an error", ok, err, lost.Load())
+	}
+	if released, err := q.ReleaseUnconfirmedClaim(ctx, worker); err != nil || !released {
+		t.Fatalf("release: released=%v err=%v", released, err)
+	}
+	released, err := q.rdb.HGet(ctx, JobHashPrefix+first.ID, "requeued_by").Result()
+	if err != nil {
+		t.Fatalf("released record has no requeue marker: %v", err)
+	}
+	// The release keeps the token for the next claim, which takes the job back.
+	claim, ok, err := q.ClaimForWorker(ctx, 0, worker)
+	if err != nil || !ok || claim.Job.ID != first.ID || released != claim.Token+":0" {
+		t.Fatalf("reclaim: %q token marker %q ok=%v err=%v; want %s under the released token", claim.Job.ID,
+			released, ok, err, first.ID)
+	}
+	if err := q.MarkClaimRunning(ctx, claim, worker); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.HoldClaim(ctx, claim, "publication blocked"); err != nil {
+		t.Fatalf("hold: %v", err)
+	}
+	if err := q.RequeueClaimSameRoute(ctx, claim, "after hold"); !errors.Is(err, ErrClaimLost) {
+		status, _ := q.rdb.HGet(ctx, JobHashPrefix+first.ID, "status").Result()
+		t.Fatalf("requeue of a held delivery: err=%v status=%q; want ErrClaimLost", err, status)
+	}
+}
+
+// The marker names who requeued. A worker whose delivery the reaper already
+// returned (its lease lapsed, or it never started) is told its claim is
+// lost, not that its own requeue landed.
+func TestLegacyWorkerRequeueAfterTheReaperReturnedItIsClaimLost(t *testing.T) {
+	t.Run("expired lease", func(t *testing.T) {
+		q, ctx, worker, first, _ := legacyReplyLossFixture(t)
+		claim, ok, err := q.ClaimForWorker(ctx, 0, worker)
+		if err != nil || !ok || claim.Job.ID != first.ID {
+			t.Fatalf("claim: %q ok=%v err=%v", claim.Job.ID, ok, err)
+		}
+		if err := q.MarkClaimRunning(ctx, claim, worker); err != nil {
+			t.Fatal(err)
+		}
+		if err := q.rdb.Del(ctx, WorkerPrefix+worker.ID).Err(); err != nil {
+			t.Fatal(err)
+		}
+		if err := q.rdb.HSet(ctx, JobHashPrefix+first.ID, "delivery_expires_unix", 1).Err(); err != nil {
+			t.Fatal(err)
+		}
+		if n, err := q.RecoverAbandonedWorkers(ctx); err != nil || n != 1 {
+			t.Fatalf("reaper: recovered=%d err=%v; want the expired delivery", n, err)
+		}
+		if err := q.RequeueClaimSameRoute(ctx, claim, "dispatch retry"); !errors.Is(err, ErrClaimLost) {
+			t.Fatalf("worker requeue after the reaper's: %v; want ErrClaimLost", err)
+		}
+	})
+	t.Run("never started", func(t *testing.T) {
+		q, ctx, worker, first, _ := legacyReplyLossFixture(t)
+		claim, ok, err := q.ClaimForWorker(ctx, 0, worker)
+		if err != nil || !ok || claim.Job.ID != first.ID {
+			t.Fatalf("claim: %q ok=%v err=%v", claim.Job.ID, ok, err)
+		}
+		ageLegacyClaim(t, q, ctx, first.ID)
+		if n, err := q.RecoverAbandonedWorkers(ctx); err != nil || n != 1 {
+			t.Fatalf("reaper: recovered=%d err=%v; want the unstarted delivery", n, err)
+		}
+		if err := q.RequeueClaimSameRoute(ctx, claim, "reroute"); !errors.Is(err, ErrClaimLost) {
+			t.Fatalf("worker requeue after the reaper's: %v; want ErrClaimLost", err)
+		}
+	})
+}
+
+func mustJobPayload(t *testing.T, q *Client, ctx context.Context, id string) string {
+	t.Helper()
+	payload, err := q.rdb.HGet(ctx, JobHashPrefix+id, "payload").Result()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return payload
+}

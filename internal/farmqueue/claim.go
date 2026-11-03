@@ -94,7 +94,13 @@ end
 
 const claimForWorkerScript = legacyClaimReplayLua + `
 local replayed = replayLegacyClaim(KEYS[4], ARGV[7])
-if replayed then return {'', replayed, '', KEYS[4]} end
+if replayed then
+  -- The worker learns of this delivery only now: its grace starts here.
+  local job = cjson.decode(replayed)
+  redis.call('HSET', 'juicefarm:job:' .. job.id,
+    'delivery_claimed', ARGV[7] .. ':' .. redis.call('TIME')[1])
+  return {'', replayed, '', KEYS[4]}
+end
 local controlRaw = redis.call('GET', KEYS[1])
 if controlRaw then
   local controlOK, control = pcall(cjson.decode, controlRaw)
@@ -517,9 +523,12 @@ for i = 8, #KEYS do
               end
               -- The claim time, bound to its token, lets the reaper return a
               -- delivery a live worker never starts (legacyUnstartedClaimGrace).
+              -- A new delivery: an earlier one's requeue marker no longer
+              -- answers for this token.
               local claimedAt = redis.call('TIME')
               redis.call('HSET', statusKey, 'delivery_token', ARGV[7],
                 'delivery_claimed', ARGV[7] .. ':' .. claimedAt[1])
+              redis.call('HDEL', statusKey, 'requeued_by')
             end
           end
         end
@@ -1919,8 +1928,9 @@ return 1`
 	//
 	// requeued_by makes the requeue idempotent per delivery: go-redis resends an
 	// EVAL whose reply was lost, and the resend must report the requeue that
-	// already landed, not a lost claim. It never answers for a delivery that
-	// still holds the token, as a later claim replaying a spent token can.
+	// already landed, not a lost claim. It names the caller (worker or reaper
+	// mode), and the next claim of the job clears it, so it never answers for
+	// a requeue by someone else or for a later delivery under the same token.
 	const script = `
 local token = redis.call('HGET', KEYS[4], 'delivery_token') or ''
 if ARGV[13] ~= '' and token ~= ARGV[13] and
