@@ -586,15 +586,21 @@ func testRefusesForbiddenTargets(t *testing.T, fx Fixture) {
 	// Bad names are refused before anything else.
 	res = g.reconcile(t, "Proj", link(".hidden.mov", "Proj/a.mov"), link("a/b.mov", "Proj/a.mov"),
 		link("..", "Proj/a.mov"), link("", "Proj/a.mov"), link("GOOD.MOV", "Proj/a.mov"), link("good.mov", "Proj/a.mov"))
-	if len(res.Refused) != 5 || !reflect.DeepEqual(res.Removed, []string{"good.mov"}) {
+	// GOOD.MOV replaces good.mov. A case-sensitive volume (JuiceFS, every
+	// production backend) does that in one pass: four bad names plus the
+	// duplicate are refused. On a case-insensitive test filesystem (APFS)
+	// the old link still holds the name while GOOD.MOV is placed, so it is
+	// refused as taken as well, nothing is overwritten, and the next pass
+	// places it.
+	refused := 5
+	folds := caseInsensitive(t, fx)
+	if folds {
+		refused = 6
+	}
+	if len(res.Refused) != refused || !reflect.DeepEqual(res.Removed, []string{"good.mov"}) {
 		t.Fatalf("names: %+v", res)
 	}
-	// GOOD.MOV replaces good.mov. A case-sensitive volume (JuiceFS, every
-	// production backend) does that in one pass. On a case-insensitive test
-	// filesystem (APFS) the old link still holds the name while GOOD.MOV is
-	// placed, so it is refused as taken, nothing is overwritten, and the next
-	// pass places it.
-	if caseInsensitive(t, fx) {
+	if folds {
 		if len(res.Created) != 0 {
 			t.Fatalf("case-insensitive pass created %v", res.Created)
 		}
