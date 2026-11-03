@@ -74,6 +74,11 @@ type serveStmts struct {
 // Idempotent; safe under concurrent first-callers (sync.Once). Returns the
 // prepare error (once) if any statement failed — callers fall back to the RAM
 // path on error so a prepare failure can never take down serving.
+// childrenPageSQL is the READDIR seek-cursor page. It must stay an O(limit)
+// seek on idx_parent_name; TestListChildrenPage_BigDirUnderBudget checks its
+// query plan.
+const childrenPageSQL = `SELECT ` + serveColumns + ` FROM entries WHERE parent_path = ? AND name > ? ORDER BY name LIMIT ?`
+
 func (s *Store) initServeStmts() error {
 	s.serve.once.Do(func() {
 		var err error
@@ -89,8 +94,7 @@ func (s *Store) initServeStmts() error {
 			s.serve.err = err
 			return
 		}
-		s.serve.childrenPg, err = s.db.Prepare(
-			`SELECT ` + serveColumns + ` FROM entries WHERE parent_path = ? AND name > ? ORDER BY name LIMIT ?`)
+		s.serve.childrenPg, err = s.db.Prepare(childrenPageSQL)
 		if err != nil {
 			s.serve.err = err
 			return
