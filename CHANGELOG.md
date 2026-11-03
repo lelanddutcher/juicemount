@@ -1,6 +1,6 @@
 # JuiceMount Changelog
 
-## 0.5.1
+## 0.5.1 — unreleased
 
 A reliability update to 0.5.0. Update checks remain manual through **Check for
 Updates…** in the app. Read **Upgrading the farm** below before updating farm
@@ -15,8 +15,8 @@ workers.
 - A mount started by the volume owner now uses this Mac's own object-store key.
   Before, the key was dropped at that step, so the mount used whatever
   object-store credentials it inherited instead of this Mac's key.
-- Over JuiceMount Link, a Redis reply that stops partway through no longer
-  hangs the mount. The response watchdog now stays armed until the whole reply
+- Over JuiceMount Link's adaptive path, a Redis reply that stops partway
+  through no longer hangs the mount. The response watchdog now stays armed until the whole reply
   has arrived, so a stalled connection is closed after 2 seconds without
   progress and reconnects. Before, the first byte of a reply disarmed it, and a
   stall mid-reply could leave Finder waiting indefinitely. Waiting for a slow
@@ -30,9 +30,9 @@ workers.
 - Support commands for a mount left behind after its processes stopped (issue
   #4), run from a standalone build and never as root:
   `--unmount-operation-status` reads the eject helper's progress for an
-  unmount without changing anything. `--recover-retained-generation` withdraws
-  that mount's ordinary retirement or, with an explicit `--eject-now`, ejects
-  it; it works only on an isolated test install (`JM_APP_ISOLATION`), only
+  unmount without changing anything. `--recover-retained-generation` runs that
+  mount's ordinary retirement; with `--withdraw` it withdraws it instead, and
+  `--eject-now` ejects it, but only after a withdrawal has completed. It works only on an isolated test install (`JM_APP_ISOLATION`), only
   after the owner and its NFS export are proven gone, and leaves queued saves
   and local databases in place. Ordinary installs are unchanged, and packaged
   recovery acceptance remains open.
