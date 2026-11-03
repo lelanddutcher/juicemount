@@ -97,6 +97,7 @@ C06_DEST="$QA_DEST_ROOT/$(qa_unique_tag QA)"
 # ---------------------------------------------------------------------------
 # EXIT trap: restore online state + remove ONLY our own staged + dest data.
 _c06_cleanup() {
+    [ "${QA_KEEP_DATA:-0}" = 1 ] && return 0
     # Always try to leave the mount ONLINE regardless of where we failed.
     qa_offline off >/dev/null 2>&1 || true
     # Remove this run's dedicated dest leaf (guarded: must be under the battery root).
@@ -176,6 +177,9 @@ while [ "$i" -le "$C06_CANCEL_REPEATS" ]; do
 
     qa_finder_cancel_copy "$A_SRC_ROOT" "$a_scratch" "$C06_CANCEL_GRACE_MS"
     a_rc=$?
+    if [ "${QA_STRICT_RELEASE:-0}" = 1 ] && [ "$a_rc" != 0 ]; then
+        qa_fail "required real cancellation was not observed; retain the original corpus before any new attempt"
+    fi
 
     # a_rc contract (lib.sh qa_finder_cancel_copy):
     #   0 = REAL in-flight cancel (Cmd-. accepted, copy stopped)
@@ -210,7 +214,7 @@ while [ "$i" -le "$C06_CANCEL_REPEATS" ]; do
 
     # Let the spool settle whatever the interrupted copy already pushed (a partial
     # is allowed; what is NOT allowed is a stranded handle / phantom / stale).
-    qa_wait_drain || qa_warn "case-a attempt $i: spool did not fully drain post-$a_how (residual logged)"
+    qa_wait_drain || qa_fail "case-a attempt $i: spool did not fully drain post-$a_how; source and operation remain held"
 
     # Mount must still be HEALTHY right after a mid-flight interruption.
     if qa_health >/dev/null 2>&1; then
@@ -232,7 +236,7 @@ while [ "$i" -le "$C06_CANCEL_REPEATS" ]; do
     fi
 
     # Clean up the interrupted partial so it can't pollute custody / the next attempt.
-    rm -rf "$a_scratch" 2>/dev/null
+    [ "${QA_KEEP_DATA:-0}" = 1 ] || rm -rf "$a_scratch" 2>/dev/null
     i=$((i+1))
 done
 

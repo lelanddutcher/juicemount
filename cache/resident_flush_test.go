@@ -90,8 +90,40 @@ func TestFlushResidentImageReopensWithoutRedis(t *testing.T) {
 	}
 }
 
+// editResidentInPlace changes block 0 through its existing inode, keeps the
+// size and restores mtime. A rewrite keeps every CRC valid, so only the bytes
+// themselves differ.
+func editResidentInPlace(t *testing.T, r *Reader, name string, body []byte, rewrite bool) {
+	t.Helper()
+	info, err := os.Stat(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rewrite {
+		changed := append([]byte(nil), body[:r.blockSize]...)
+		changed[0] ^= 1
+		writeVerifiedCacheFile(t, name, changed)
+	} else {
+		edit, err := os.OpenFile(name, os.O_WRONLY, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = edit.WriteAt([]byte{255}, 0)
+		_ = edit.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Chtimes(name, info.ModTime(), info.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+	if after, err := os.Stat(name); err != nil || after.Size() != info.Size() || !os.SameFile(after, info) {
+		t.Fatalf("edit left the inode: %v", err)
+	}
+}
+
 func TestFlushResidentImageRejectsUncertainBytes(t *testing.T) {
-	for _, kind := range []string{"wrong-digest", "missing-block", "corrupt-crc", "no-trailer", "file-symlink", "hardlink", "parent-symlink", "hole", "missing-attr", "file-sync", "directory-sync", "replace-block", "edit-same-inode", "replace-parent", "replace-container", "invalidate", "cancel", "mapping-sync", "replace-after-mapping", "replace-mapping-file", "replace-mapping-parent"} {
+	for _, kind := range []string{"wrong-digest", "missing-block", "corrupt-crc", "no-trailer", "file-symlink", "hardlink", "parent-symlink", "hole", "missing-attr", "file-sync", "directory-sync", "replace-block", "edit-same-inode", "rewrite-same-inode", "replace-parent", "replace-container", "invalidate", "cancel", "mapping-sync", "replace-after-mapping", "replace-mapping-file", "replace-mapping-parent"} {
 		t.Run(kind, func(t *testing.T) {
 			r, body, names := residentFlushFixture(t, false)
 			ctx, cancel := context.WithCancel(context.Background())
@@ -168,23 +200,8 @@ func TestFlushResidentImageRejectsUncertainBytes(t *testing.T) {
 					switch kind {
 					case "replace-block":
 						replace(names[0])
-					case "edit-same-inode":
-						info, err := os.Stat(names[0])
-						if err != nil {
-							t.Fatal(err)
-						}
-						edit, err := os.OpenFile(names[0], os.O_WRONLY, 0)
-						if err != nil {
-							t.Fatal(err)
-						}
-						_, err = edit.WriteAt([]byte{255}, 0)
-						_ = edit.Close()
-						if err != nil {
-							t.Fatal(err)
-						}
-						if err := os.Chtimes(names[0], info.ModTime(), info.ModTime()); err != nil {
-							t.Fatal(err)
-						}
+					case "edit-same-inode", "rewrite-same-inode":
+						editResidentInPlace(t, r, names[0], body, kind == "rewrite-same-inode")
 					case "replace-parent":
 						dir := filepath.Dir(names[0])
 						if err := os.Rename(dir, dir+".retained"); err != nil {
@@ -249,6 +266,36 @@ func TestFlushResidentImageRejectsUncertainBytes(t *testing.T) {
 			// Stop may persist ordinary unqualified cache mappings; that never confers
 			// a successful image handoff or permission to discard private saved bytes.
 			r.testSyncMappingDirectory = nil
+		})
+	}
+}
+
+// TestFlushResidentImageRechecksSameTickEdits models a filesystem that stores
+// whole seconds, where an edit in the second the block was written leaves its
+// ctime unchanged. Fresh blocks must still be certified only by their bytes.
+func TestFlushResidentImageRechecksSameTickEdits(t *testing.T) {
+	testResidentFileStat = func(id *residentDiskIdentity) { id.mtime.Nsec, id.ctime.Nsec = 0, 0 }
+	t.Cleanup(func() { testResidentFileStat = nil })
+	for _, kind := range []string{"unchanged", "edit", "rewrite"} {
+		t.Run(kind, func(t *testing.T) {
+			r, body, names := residentFlushFixture(t, false)
+			calls := 0
+			r.testSyncResident = func(f *os.File, directory bool) error {
+				if calls++; calls == 1 && kind != "unchanged" {
+					editResidentInPlace(t, r, names[0], body, kind == "rewrite")
+				}
+				return f.Sync()
+			}
+			graph, err := r.FlushResidentImage(context.Background(), 3, r.inodeAttr[3], sha256.Sum256(body))
+			if kind == "unchanged" {
+				if err != nil || !graph.Token.Valid() {
+					t.Fatalf("fresh unchanged image refused: %v", err)
+				}
+				return
+			}
+			if err == nil || graph.Token.Valid() {
+				t.Fatalf("same-tick %s accepted: %v", kind, err)
+			}
 		})
 	}
 }

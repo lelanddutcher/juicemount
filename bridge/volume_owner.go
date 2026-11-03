@@ -296,6 +296,7 @@ type volumeOwner struct {
 	endpoint             string
 	bucket               string
 	juiceBin             string
+	newFUSEManager       func(health.FUSEConfig) (*health.FUSEManager, error) // fixed before claim; production reserves the generation
 	manager              ownerManagedFUSE
 	status               ownerSnapshotSource // original manager in production; sampled outside o.mu
 	link                 *jmnfs.LinkNode
@@ -332,7 +333,8 @@ func newVolumeOwner(root string) (*volumeOwner, error) {
 		return nil, err
 	}
 	return &volumeOwner{instance: hex.EncodeToString(nonce[:]), root: root,
-		ops: make(map[string]*volumeOwnerOperation)}, nil
+		newFUSEManager: health.NewGenerationFUSEManager,
+		ops:            make(map[string]*volumeOwnerOperation)}, nil
 }
 
 func ownerSocketPath() (string, error) {
@@ -660,10 +662,11 @@ func (o *volumeOwner) claim(raw string, pinnedBytes int64, policy netprofile.Lin
 		}
 		return volumeOwnerReceipt{}, pathErr
 	}
-	fm, err := health.NewGenerationFUSEManager(health.FUSEConfig{
+	fm, err := o.newFUSEManager(health.FUSEConfig{
 		JuiceFSBin: cfg.JuiceFSBin, RedisURL: cfg.RedisURL, MountPoint: cfg.FUSEPath,
 		CacheSize: cfg.CacheSize, CacheDir: privatePaths.CacheBase, FreeSpaceRatio: "0.01", BucketOverride: cfg.BucketOverride,
 		PinnedBytes: pinnedBytes, FUSEMetricsAddr: cfg.FUSEMetricsAddr, OpenCacheTTL: cfg.OpenCacheTTL,
+		ObjectKey: health.ObjectKey{AccessKey: cfg.ObjectAccessKey, SecretKey: cfg.ObjectSecretKey},
 	})
 	if err != nil {
 		if owned && node != nil {

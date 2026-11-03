@@ -141,9 +141,13 @@ func TestProbeOwnReadOnlySidecarRewrite(t *testing.T) {
 	}
 }
 
+// probeDrainLoop runs 40 drain passes. Each pass gets a deadline generous
+// enough for -race on a loaded host: DrainOnceForTest panics when its context
+// expires with a drain still in flight, and these probes check outcomes, not
+// pass latency.
 func probeDrainLoop(d *Drainer) {
 	for i := 0; i < 40; i++ {
-		ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		d.DrainOnceForTest(ctx)
 		cancel()
 		time.Sleep(20 * time.Millisecond)

@@ -229,6 +229,22 @@ ensure_parent() {
 	verify_user "$ak" "$pol"
 }
 
+# The restricted format credential cannot create buckets. Bootstrap only the
+# fixed policy bucket with the root alias; --ignore-existing preserves its data.
+# mc's makeBucketMessage is status/bucket/region (region is empty). Match the
+# entire response: exit 0 alone, a success substring, or another target is not
+# proof. Keep errors private: mc diagnostics may contain endpoint details.
+ensure_bucket() {
+	local reply success
+	reply="$("$MC" --json mb --ignore-existing "$ALIAS/zpool" 2>"$owned_config_dir/bucket.err")" ||
+		die "cannot ensure zpool bucket; check root access and storage availability before retrying setup"
+	success='^[[:space:]]*\{[[:space:]]*"status"[[:space:]]*:[[:space:]]*"success"[[:space:]]*,[[:space:]]*"bucket"[[:space:]]*:[[:space:]]*"jmkeys/zpool"[[:space:]]*,[[:space:]]*"region"[[:space:]]*:[[:space:]]*""[[:space:]]*\}[[:space:]]*$'
+	[[ "$reply" =~ $success ]] ||
+		die "zpool bucket was not verified by mc; check root access, storage readiness and supported mc version"
+	echo "[object-keys] zpool: bucket ready"
+}
+
+ensure_bucket
 ensure_user "$CLIENT_AK" CLIENT_SK jm-client
 ensure_user "$GC_AK" GC_SK jm-gc
 if [ "$PER_MAC" = 1 ]; then

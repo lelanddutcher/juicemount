@@ -147,6 +147,8 @@ func isGateTestOrVendored(rel string) bool {
 		return true // dev-only QA/wedge harnesses run by a developer against dev mounts.
 	case strings.HasPrefix(rel, "scripts/test-"), rel == "scripts/netshape-dev.sh":
 		return true // dev-only acceptance/network-shaping harnesses (pfctl/dnctl, disposable fixture mounts).
+	case strings.HasPrefix(rel, "scripts/test_") && strings.HasSuffix(rel, ".py"):
+		return true // Python unit tests of the scripts beside them; they name stubbed commands to assert they never run.
 	}
 	return false
 }
