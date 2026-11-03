@@ -1,6 +1,7 @@
 package nfs
 
 import (
+	"context"
 	"net/netip"
 	"testing"
 
@@ -99,5 +100,37 @@ func TestLinkServiceDialTarget(t *testing.T) {
 	}
 	if _, ok := linkServiceDialTarget(&ipnstate.Status{}, "192.0.2.10:30179"); ok {
 		t.Fatal("rewrite without a NAS service peer")
+	}
+}
+
+// TestLinkPrefersNASServicePeerOverRoutes: another node's route covering
+// the NAS's LAN address must not take a Mac's traffic, or its transport
+// report, from the tag:jm-nas peer; without that peer the route is used.
+func TestLinkPrefersNASServicePeerOverRoutes(t *testing.T) {
+	routes := views.SliceOf([]netip.Prefix{netip.MustParsePrefix("192.0.2.0/24")})
+	rogue := &ipnstate.PeerStatus{HostName: "rogue", PrimaryRoutes: &routes, CurAddr: "203.0.113.9:41641"}
+	nas := nasServicePeer("juicemount-nas", []string{"100.64.0.1"}, true, "tag:jm-nas")
+	nas.CurAddr = "10.0.0.2:41641"
+	status := &ipnstate.Status{Peer: map[key.NodePublic]*ipnstate.PeerStatus{
+		key.NewNode().Public(): rogue,
+		key.NewNode().Public(): nas,
+	}}
+	if got, err := linkTransportFromStatus(status); err != nil || got.Peer != "juicemount-nas" {
+		t.Fatalf("transport with a rogue route = %+v, %v; want the NAS service peer", got, err)
+	}
+
+	viaRoute := func(context.Context, string, string) (netip.AddrPort, bool, error) {
+		return netip.MustParseAddrPort("192.0.2.10:30179"), true, nil
+	}
+	plan := linkDialPlanner(viaRoute, func(_ context.Context, address string) (netip.AddrPort, bool) {
+		return linkServiceDialTarget(status, address)
+	})
+	if got, ok, err := plan(context.Background(), "tcp", "192.0.2.10:30179"); err != nil || !ok || got.String() != "100.64.0.1:30179" {
+		t.Fatalf("dial plan with a rogue route = %v, %v, %v; want the NAS service peer", got, ok, err)
+	}
+
+	noPeer := linkDialPlanner(viaRoute, func(context.Context, string) (netip.AddrPort, bool) { return netip.AddrPort{}, false })
+	if got, ok, err := noPeer(context.Background(), "tcp", "192.0.2.10:30179"); err != nil || !ok || got.String() != "192.0.2.10:30179" {
+		t.Fatalf("dial plan without a NAS service peer = %v, %v, %v; want the route", got, ok, err)
 	}
 }

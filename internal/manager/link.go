@@ -150,6 +150,9 @@ func LinkExposure(cfgPath string) (mode, subnet string, err error) {
 		if route != "" {
 			return "", "", fmt.Errorf("JM_NET_NAS_EXPOSURE=services but JM_NET_NAS_ROUTE=%s is set; unset one", route)
 		}
+		if _, err := LinkNASLANAddr(); err != nil {
+			return "", "", err
+		}
 		return LinkExposureServices, "", nil
 	case LinkExposureSubnet:
 		mode = LinkExposureSubnet
@@ -166,6 +169,9 @@ func LinkExposure(cfgPath string) (mode, subnet string, err error) {
 		return "", "", fmt.Errorf("JM_NET_NAS_EXPOSURE must be %s or %s, not %q", LinkExposureServices, LinkExposureSubnet, explicit)
 	}
 	if mode == LinkExposureServices {
+		if _, err := LinkNASLANAddr(); err != nil {
+			return "", "", err
+		}
 		return mode, "", nil
 	}
 	if route == "" {
@@ -182,6 +188,25 @@ func LinkExposure(cfgPath string) (mode, subnet string, err error) {
 // unset. The Manager's policy then lets Link clients reach the JuiceMount
 // ports on that address only, instead of on every host in the route.
 func LinkSubnetNASAddr(subnet string) (string, error) {
+	host, err := LinkNASLANAddr()
+	if err != nil || host == "" {
+		return "", err
+	}
+	addr := netip.MustParsePrefix(host).Addr()
+	prefix, err := netip.ParsePrefix(subnet)
+	if err != nil {
+		return "", fmt.Errorf("bad JM_NET_NAS_ROUTE %q: %w", subnet, err)
+	}
+	if !prefix.Contains(addr) {
+		return "", fmt.Errorf("JM_NET_NAS_LAN_ADDR %s is outside the NAS route %s", addr, prefix)
+	}
+	return host, nil
+}
+
+// LinkNASLANAddr returns JM_NET_NAS_LAN_ADDR as a host prefix (a /32 or
+// /128), or "" when it is unset. In service exposure it tells status which
+// approved routes could carry traffic meant for the NAS (linkNASConflicts).
+func LinkNASLANAddr() (string, error) {
 	raw := strings.TrimSpace(os.Getenv("JM_NET_NAS_LAN_ADDR"))
 	if raw == "" {
 		return "", nil
@@ -189,13 +214,6 @@ func LinkSubnetNASAddr(subnet string) (string, error) {
 	addr, err := netip.ParseAddr(raw)
 	if err != nil {
 		return "", fmt.Errorf("JM_NET_NAS_LAN_ADDR %q is not an IP address", raw)
-	}
-	prefix, err := netip.ParsePrefix(subnet)
-	if err != nil {
-		return "", fmt.Errorf("bad JM_NET_NAS_ROUTE %q: %w", subnet, err)
-	}
-	if !prefix.Contains(addr) {
-		return "", fmt.Errorf("JM_NET_NAS_LAN_ADDR %s is outside the NAS route %s", addr, prefix)
 	}
 	return netip.PrefixFrom(addr, addr.BitLen()).String(), nil
 }
@@ -213,17 +231,23 @@ func linkExposureDefault(dir string) string {
 	return LinkExposureServices
 }
 
-// RecordLinkExposureDefault records the default exposure next to cfgPath,
-// unless one is recorded already, and returns it. The NAS node must not
-// start until it succeeds: without the record, the state directory a fresh
-// install's node creates would make its next start look like an upgrade.
-// The record is synced, with its directory, before it counts.
+// RecordLinkExposureDefault records next to cfgPath the exposure the NAS
+// node first runs with (LinkExposure: an explicit JM_NET_NAS_EXPOSURE or
+// JM_NET_NAS_ROUTE included), unless one is recorded already, and returns
+// the recorded exposure. That record is the default once neither variable
+// is set. The NAS node must not start until it succeeds: without the
+// record, the state directory a fresh install's node creates would make its
+// next start look like an upgrade. The record is synced, with its
+// directory, before it counts.
 func RecordLinkExposureDefault(cfgPath string) (string, error) {
 	dir := filepath.Dir(cfgPath)
-	mode := linkExposureDefault(dir)
 	path := filepath.Join(dir, linkExposureFile)
 	if _, err := os.Stat(path); err == nil {
-		return mode, nil
+		return linkExposureDefault(dir), nil
+	}
+	mode, _, err := LinkExposure(cfgPath)
+	if err != nil || mode == "" {
+		return "", err
 	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", err
@@ -752,8 +776,25 @@ type HSNode struct {
 // juicemount-nas), so a name never selects the node the Manager tags,
 // approves routes for, or reports on.
 
-func listHSNodes(bin, config string) ([]HSNode, error) {
-	out, err := exec.Command(bin, "--config", config, "nodes", "list", "-o", "json").Output()
+// hsCommandTimeout bounds each headscale CLI call made to look up nodes
+// and routes, so a wedged control server never holds a caller (the NAS
+// node's watch loop, a status request) for long.
+const hsCommandTimeout = 10 * time.Second
+
+// hsOutput runs one headscale CLI lookup under ctx and hsCommandTimeout.
+func hsOutput(ctx context.Context, combined bool, bin string, args ...string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(ctx, hsCommandTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, bin, args...)
+	cmd.WaitDelay = 2 * time.Second
+	if combined {
+		return cmd.CombinedOutput()
+	}
+	return cmd.Output()
+}
+
+func listHSNodes(ctx context.Context, bin, config string) ([]HSNode, error) {
+	out, err := hsOutput(ctx, false, bin, "--config", config, "nodes", "list", "-o", "json")
 	if err != nil {
 		return nil, fmt.Errorf("nodes list: %v", err)
 	}
@@ -786,7 +827,7 @@ func nodeByID(nodes []HSNode, id uint64) *HSNode {
 // node (nodeKey): registered, online, tagged tag:jm-nas (the tag a Mac looks
 // for), and the only node a Mac could take for it.
 func linkNASServing(bin, config, nodeKey string) error {
-	nodes, err := listHSNodes(bin, config)
+	nodes, err := listHSNodes(context.Background(), bin, config)
 	if err != nil {
 		return fmt.Errorf("Link NAS node: %w", err)
 	}
@@ -800,14 +841,18 @@ func linkNASServing(bin, config, nodeKey string) error {
 	if !n.Online {
 		return fmt.Errorf("Link NAS node %d is offline on the control server", n.ID)
 	}
-	return linkNASConflicts(nodes, nil, n.ID, "")
+	rows, err := allRouteRows(context.Background(), bin, config)
+	if err != nil {
+		return fmt.Errorf("Link NAS node: %w", err)
+	}
+	return linkNASConflicts(nodes, rows, n.ID, "")
 }
 
 // LinkNASConflicts reports any node other than the NAS node (nodeKey) that a
 // Mac could take for it (linkNASConflicts). subnet is the subnet exposure's
-// prefix, or "" for service exposure.
-func LinkNASConflicts(bin, config, nodeKey, subnet string) error {
-	nodes, err := listHSNodes(bin, config)
+// prefix, or "" for service exposure. ctx and hsCommandTimeout bound it.
+func LinkNASConflicts(ctx context.Context, bin, config, nodeKey, subnet string) error {
+	nodes, err := listHSNodes(ctx, bin, config)
 	if err != nil {
 		return err
 	}
@@ -815,64 +860,115 @@ func LinkNASConflicts(bin, config, nodeKey, subnet string) error {
 	if n == nil {
 		return fmt.Errorf("Link NAS node %s is not registered on the control server", nodeKey)
 	}
-	var rows map[uint64]routeRow
-	if subnet != "" {
-		if rows, err = allRouteRows(bin, config); err != nil {
-			return err
-		}
+	rows, err := allRouteRows(ctx, bin, config)
+	if err != nil {
+		return err
 	}
 	return linkNASConflicts(nodes, rows, n.ID, subnet)
 }
 
 // linkNASConflicts names the nodes other than the NAS node (nasID) that a
-// Mac could take for it: any that carries tag:jm-nas, which a Mac without a
-// route to the NAS dials (nfs linkNASServicePeer), and, with a subnet, any
-// that advertises or holds a route overlapping it (a default route aside).
-// rows, from `nodes list-routes`, adds to the routes nodes lists.
+// Mac could take for it, or whose route could carry its traffic:
+//   - any that carries tag:jm-nas, which a Mac dials for the NAS's ports
+//     (nfs linkNASServicePeer);
+//   - with a subnet (subnet exposure), any that advertises or holds a route
+//     overlapping it;
+//   - without one (service exposure), any holding an approved route over
+//     the NAS's LAN address (JM_NET_NAS_LAN_ADDR), or, with that address
+//     unknown, any approved route at all. A current Mac dials the
+//     tag:jm-nas peer ahead of routes, but a route over the NAS's LAN is
+//     still a path a client could take.
+//
+// Default (exit) routes are ignored: a Link node never uses one. rows, from
+// `nodes list-routes`, adds to the routes nodes lists.
 //
 // The Manager never tags such a node or approves its route, but an
-// operator's own policy may let a node claim the tag, and a stale record of
-// an earlier NAS identity keeps it. Status refuses to call the route ready
+// operator's own policy may let a node claim the tag, an operator may
+// approve a route, and a record of this NAS's earlier identity (its node
+// state was reset) keeps the tag. Status refuses to call the route ready
 // and names each node; it does not delete or expire it. Headscale 0.29
 // cannot remove a tagged node's last tag, expiring logs a node out but
 // leaves its record and tag in place, and deleting is irreversible: the
 // operator, who knows whether it is a device of theirs, removes it.
 func linkNASConflicts(nodes []HSNode, rows map[uint64]routeRow, nasID uint64, subnet string) error {
-	var nasPrefix netip.Prefix
+	var nasPrefix, lanAddr netip.Prefix
 	if subnet != "" {
 		p, err := netip.ParsePrefix(subnet)
 		if err != nil {
 			return fmt.Errorf("bad NAS route %q: %w", subnet, err)
 		}
 		nasPrefix = p.Masked()
+	} else if raw, err := LinkNASLANAddr(); err != nil {
+		return err
+	} else if raw != "" {
+		lanAddr = netip.MustParsePrefix(raw)
 	}
+	nas := nodeByID(nodes, nasID)
 	var found []string
+	stale := false
 	for i := range nodes {
 		n := &nodes[i]
 		if n.ID == nasID {
 			continue
 		}
+		row := rows[n.ID]
 		var why []string
 		if containsRoute(n.Tags, LinkTagNAS) {
 			why = append(why, "carries "+LinkTagNAS)
 		}
-		if nasPrefix.IsValid() {
-			row := rows[n.ID]
+		switch {
+		case nasPrefix.IsValid():
 			for _, list := range [][]string{n.AvailableRoutes, n.ApprovedRoutes, row.available, row.approved} {
 				if r := overlappingRoute(list, nasPrefix); r != "" {
 					why = append(why, "advertises "+r)
 					break
 				}
 			}
+		default:
+			for _, list := range [][]string{n.ApprovedRoutes, row.approved} {
+				r := ""
+				if lanAddr.IsValid() {
+					r = overlappingRoute(list, lanAddr)
+				} else {
+					r = firstNonDefaultRoute(list)
+				}
+				if r != "" {
+					why = append(why, "holds the approved route "+r)
+					break
+				}
+			}
 		}
-		if len(why) > 0 {
-			found = append(found, fmt.Sprintf("node %d (%q) %s", n.ID, n.Name, strings.Join(why, " and ")))
+		if len(why) == 0 {
+			continue
 		}
+		entry := fmt.Sprintf("node %d (%q) %s", n.ID, n.Name, strings.Join(why, " and "))
+		if nas != nil && n.Name == nas.Name && !n.Online && n.ID < nasID {
+			// Same name, offline, registered before the NAS node: the
+			// usual leftover when the NAS node's state was reset.
+			entry += " (offline and older than the NAS node under its name: most likely this NAS's own earlier registration, left when its node state was reset)"
+			stale = true
+		}
+		found = append(found, entry)
 	}
 	if len(found) == 0 {
 		return nil
 	}
-	return fmt.Errorf("Link NAS node %d is not the only node Macs could take for the NAS: %s. Remove each one that is not yours with `headscale nodes delete --identifier <id>`", nasID, strings.Join(found, "; "))
+	advice := "Remove each one that is not a device of yours"
+	if stale {
+		advice = "Remove this NAS's earlier registration, and any other node that is not a device of yours"
+	}
+	return fmt.Errorf("Link NAS node %d is not the only node Macs could take for the NAS: %s. %s: `docker exec <Manager container> headscale nodes delete --identifier <id>`", nasID, strings.Join(found, "; "), advice)
+}
+
+// firstNonDefaultRoute returns the first route in routes that is not a
+// default (exit) route.
+func firstNonDefaultRoute(routes []string) string {
+	for _, raw := range routes {
+		if p, err := netip.ParsePrefix(raw); err == nil && p.Bits() > 0 {
+			return raw
+		}
+	}
+	return ""
 }
 
 // overlappingRoute returns the first route in routes that overlaps want,
@@ -892,7 +988,7 @@ func overlappingRoute(routes []string, want netip.Prefix) string {
 // that registered before JuiceMount tagged its keys keeps its identity (and
 // tailnet address) this way instead of being re-enrolled.
 func EnsureNodeTags(bin, config, nodeKey string, want []string) (bool, error) {
-	nodes, err := listHSNodes(bin, config)
+	nodes, err := listHSNodes(context.Background(), bin, config)
 	if err != nil {
 		return false, err
 	}
@@ -911,7 +1007,7 @@ func EnsureNodeTags(bin, config, nodeKey string, want []string) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("nodes tag: %v: %s", err, strings.TrimSpace(string(out)))
 	}
-	if nodes, err = listHSNodes(bin, config); err != nil {
+	if nodes, err = listHSNodes(context.Background(), bin, config); err != nil {
 		return false, err
 	}
 	node = nodeByID(nodes, id)
@@ -1021,8 +1117,8 @@ func routeTableForNode(bin, config string, nodeID uint64) (approved, available, 
 	return parseRouteTable(out, nodeID)
 }
 
-func allRouteRows(bin, config string) (map[uint64]routeRow, error) {
-	out, err := exec.Command(bin, "--config", config, "nodes", "list-routes").CombinedOutput()
+func allRouteRows(ctx context.Context, bin, config string) (map[uint64]routeRow, error) {
+	out, err := hsOutput(ctx, true, bin, "--config", config, "nodes", "list-routes")
 	if err != nil {
 		return nil, fmt.Errorf("nodes list-routes: %v: %s", err, strings.TrimSpace(string(out)))
 	}
@@ -1034,11 +1130,11 @@ func allRouteRows(bin, config string) (map[uint64]routeRow, error) {
 // (no embedded NAS node: the operator runs the subnet router) it reports
 // whether any node serves the approved prefix.
 func linkRouteReady(bin, config, nodeKey, prefix string) (bool, error) {
-	nodes, err := listHSNodes(bin, config)
+	nodes, err := listHSNodes(context.Background(), bin, config)
 	if err != nil {
 		return false, fmt.Errorf("Link route check failed: %w", err)
 	}
-	rows, err := allRouteRows(bin, config)
+	rows, err := allRouteRows(context.Background(), bin, config)
 	if err != nil {
 		return false, fmt.Errorf("Link route check failed: %w", err)
 	}
@@ -1133,7 +1229,7 @@ func ApproveSubnetRoutes(bin, config, nodeKey string, prefixes []string) error {
 // approveSubnetRoutes approves prefixes on the node pick selects; label
 // names it in errors.
 func approveSubnetRoutes(bin, config string, pick func([]HSNode) *HSNode, label string, prefixes []string) error {
-	nodes, err := listHSNodes(bin, config)
+	nodes, err := listHSNodes(context.Background(), bin, config)
 	if err != nil {
 		return err
 	}
@@ -1192,7 +1288,7 @@ func containsRoute(routes []string, want string) bool {
 //
 // Defaults target the embedded NAS node, by its node key, and
 // JM_NET_NAS_ROUTE (falling back to the home-LAN default). ?id= names
-// another node by its control-server ID (GET /api/net/nodes); a node's
+// another node by its control-server ID (GET /api/net/paired); a node's
 // hostname is its own choice, so ?host= is refused. GET returns the raw
 // route listing instead, so operators can see advertisement/approval state
 // from the UI later.
@@ -1214,7 +1310,7 @@ func (a *API) handleNetRouteApprove(w http.ResponseWriter, r *http.Request) {
 		}
 		if r.URL.Query().Get("host") != "" {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "prefix": prefix,
-				"error": "host is not accepted: any node can register under any name; pass ?id=<node id> from GET /api/net/nodes, or nothing for the embedded NAS node"})
+				"error": "host is not accepted: any node can register under any name; pass ?id=<node id> from GET /api/net/paired, or nothing for the embedded NAS node"})
 			return
 		}
 		var err error

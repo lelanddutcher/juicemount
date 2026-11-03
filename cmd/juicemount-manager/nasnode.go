@@ -59,6 +59,8 @@ const (
 	// nasNodeConflictEvery is how often a running NAS node looks for other
 	// nodes a Mac could take for it.
 	nasNodeConflictEvery = 30 * time.Second
+	// nasNodeConflictTimeout bounds one such look.
+	nasNodeConflictTimeout = 10 * time.Second
 )
 
 func nasNodeEnabled() bool { return os.Getenv("JM_NET_NAS_NODE") == "on" }
@@ -130,9 +132,9 @@ type nasNodeConfig struct {
 	// ApproveRoute approves Subnet for the node (nodeKey) on the control
 	// server (subnet exposure only).
 	ApproveRoute func(nodeKey, prefix string) error
-	// Conflicts reports other nodes a Mac could take for this one. nil
-	// skips the check.
-	Conflicts   func(nodeKey string) error
+	// Conflicts reports other nodes a Mac could take for this one. It must
+	// return soon after ctx ends. nil skips the check.
+	Conflicts   func(ctx context.Context, nodeKey string) error
 	Dial        nasTCPDialer
 	UpTimeout   time.Duration
 	HealthEvery time.Duration
@@ -204,8 +206,8 @@ func nasNodeConfigFromEnv(cfgPath string, handler http.Handler) (nasNodeConfig, 
 		ApproveRoute: func(nodeKey, prefix string) error {
 			return manager.ApproveSubnetRoutes(hsBinary, cfgPath, nodeKey, []string{prefix})
 		},
-		Conflicts: func(nodeKey string) error {
-			return manager.LinkNASConflicts(hsBinary, cfgPath, nodeKey, subnet)
+		Conflicts: func(ctx context.Context, nodeKey string) error {
+			return manager.LinkNASConflicts(ctx, hsBinary, cfgPath, nodeKey, subnet)
 		},
 		Dial:        dialer.DialContext,
 		UpTimeout:   nasNodeUpTimeout,
@@ -388,8 +390,15 @@ func runNASNode(cfg nasNodeConfig, stop <-chan struct{}, ready func(string)) err
 			return
 		}
 		lastConflictCheck = time.Now()
+		// ctx ends when stop closes, which kills a lookup in flight.
+		checkCtx, checkCancel := context.WithTimeout(ctx, nasNodeConflictTimeout)
+		err := cfg.Conflicts(checkCtx, nodeKey)
+		checkCancel()
+		if ctx.Err() != nil {
+			return
+		}
 		msg := ""
-		if err := cfg.Conflicts(nodeKey); err != nil {
+		if err != nil {
 			msg = err.Error()
 		}
 		switch {

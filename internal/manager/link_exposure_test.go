@@ -21,6 +21,7 @@ func setExposureEnv(t *testing.T) string {
 	t.Setenv("JM_NET_NAS_NODE", "on")
 	t.Setenv("JM_NET_NAS_ROUTE", "")
 	t.Setenv("JM_NET_NAS_EXPOSURE", "")
+	t.Setenv("JM_NET_NAS_LAN_ADDR", "")
 	return filepath.Join(t.TempDir(), "config.yaml")
 }
 
@@ -126,6 +127,13 @@ func TestLinkStatusServiceRouteNeedsTaggedOnlineNode(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
+		routes := func(rows string) {
+			t.Helper()
+			if err := os.WriteFile(filepath.Join(dir, "routes.txt"), []byte("ID | Hostname | Approved | Available | Serving (Primary)\n"+rows), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		routes("")
 		nodes(`[{"id": 1, "node_key": "` + nodeKeyNAS + `", "name": "juicemount-nas", "given_name": "juicemount-nas", "online": true}]`)
 		if got := linkStatusFor(t); got.Exposure != LinkExposureServices || got.RouteReady || !strings.Contains(got.Error, "not tagged tag:jm-nas") {
 			t.Fatalf("policy %q, untagged NAS node: status = %+v", policy, got)
@@ -144,6 +152,25 @@ func TestLinkStatusServiceRouteNeedsTaggedOnlineNode(t *testing.T) {
 		if got := linkStatusFor(t); !got.RouteReady || !got.ControlReady {
 			t.Fatalf("policy %q, tagged online NAS node: status = %+v", policy, got)
 		}
+		// Another node's approved route over the NAS's LAN address could
+		// carry a client's traffic: reported. With the address known, a
+		// route elsewhere is not.
+		other := `{"id": 4, "node_key": "` + nodeKeyMac + `", "name": "router", "online": true}`
+		nodes(`[` + other + `, ` + nas + `]`)
+		routes("4 | router | 192.0.2.0/24 | 192.0.2.0/24 | 192.0.2.0/24\n")
+		if got := linkStatusFor(t); got.RouteReady || !strings.Contains(got.Error, `node 4 ("router") holds the approved route 192.0.2.0/24`) {
+			t.Fatalf("policy %q, approved route, NAS address unknown: status = %+v", policy, got)
+		}
+		t.Setenv("JM_NET_NAS_LAN_ADDR", "192.0.2.10")
+		if got := linkStatusFor(t); got.RouteReady || !strings.Contains(got.Error, "node 4") {
+			t.Fatalf("policy %q, approved route over the NAS address: status = %+v", policy, got)
+		}
+		t.Setenv("JM_NET_NAS_LAN_ADDR", "198.51.100.10")
+		if got := linkStatusFor(t); !got.RouteReady {
+			t.Fatalf("policy %q, approved route elsewhere: status = %+v", policy, got)
+		}
+		t.Setenv("JM_NET_NAS_LAN_ADDR", "")
+		routes("")
 		// Another node with tag:jm-nas, online or a stale record, could
 		// receive a Mac's traffic: not ready, and the node is named.
 		for _, online := range []string{"true", "false"} {

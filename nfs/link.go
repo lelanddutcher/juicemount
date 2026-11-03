@@ -667,21 +667,12 @@ func (l *LinkNode) DialContext(ctx context.Context, network, address string) (ne
 	// violates JuiceMount Link's contract: backend traffic must never escape
 	// the encrypted route merely because a subnet router is still converging
 	// or has gone offline. Wait for an explicitly Tailscale-routed plan and
-	// dial the resolved address from that plan. A NAS that serves the
-	// JuiceMount ports on its own tailnet address (no subnet route) is
-	// reached there instead, on the same port.
+	// dial the resolved address from that plan.
 	dialer := s.Sys().Dialer.Get()
 	planned, err := waitForTailscaleDialPlan(ctx, network, address,
-		func(ctx context.Context, network, address string) (netip.AddrPort, bool, error) {
-			planned, viaTailscale, err := dialer.UserDialPlan(ctx, network, address)
-			if err == nil && viaTailscale {
-				return planned, true, nil
-			}
-			if target, ok := l.nasServiceDialTarget(ctx, s, address); ok {
-				return target, true, nil
-			}
-			return planned, viaTailscale, err
-		})
+		linkDialPlanner(dialer.UserDialPlan, func(ctx context.Context, address string) (netip.AddrPort, bool) {
+			return l.nasServiceDialTarget(ctx, s, address)
+		}))
 	if err != nil {
 		return nil, err
 	}
@@ -694,6 +685,23 @@ func (l *LinkNode) DialContext(ctx context.Context, network, address string) (ne
 		return nil, fmt.Errorf("link: refused non-tailnet connection to %s", address)
 	}
 	return conn, nil
+}
+
+// linkDialPlanner plans a Link dial. A NAS that serves the JuiceMount ports
+// on its own tailnet address (a tag:jm-nas peer: service exposure) is
+// reached there, on the same port, ahead of any route. The NAS node never
+// needs a route for these ports, and a route from another node that covers
+// the NAS's LAN address (approved by mistake, or by someone who should not)
+// would otherwise carry the volume's traffic, Redis AUTH included, to that
+// node. Without such a peer the dial follows the tailnet route (subnet
+// exposure).
+func linkDialPlanner(route tailscaleDialPlanner, service func(context.Context, string) (netip.AddrPort, bool)) tailscaleDialPlanner {
+	return func(ctx context.Context, network, address string) (netip.AddrPort, bool, error) {
+		if target, ok := service(ctx, address); ok {
+			return target, true, nil
+		}
+		return route(ctx, network, address)
+	}
 }
 
 func (l *LinkNode) nasServiceDialTarget(ctx context.Context, s *tsnet.Server, address string) (netip.AddrPort, bool) {

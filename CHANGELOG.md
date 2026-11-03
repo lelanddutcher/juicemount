@@ -135,25 +135,32 @@ workers.
   - `services` serves only the JuiceMount ports (Redis proxy 30179, object
     storage 30151, Manager 30190) on the NAS node's own tailnet address. The
     node carries `tag:jm-nas`, which is how a Mac app from this release finds
-    it. Mac apps from earlier releases, and remote farm nodes, cannot reach
-    it: they follow subnet routes only.
+    it; the app dials that node for the NAS's ports even when some other
+    node's route covers the NAS's LAN address. Mac apps from earlier
+    releases, and remote farm nodes, cannot reach it: they follow subnet
+    routes only.
   - `subnet` advertises a LAN prefix through the NAS node, the only path
     Link had before. Every Mac app version and remote farm node reaches it.
     The prefix is `JM_NET_NAS_ROUTE`, or `192.168.0.0/24` when that is unset,
     as before. The Manager does not tag the node, so a Mac waits for the
     route instead of using the node's tailnet address. A NAS node that ran
     with `services` keeps `tag:jm-nas` after a switch to `subnet` (Headscale
-    cannot take a tagged node's last tag away), so a current Mac may also
-    reach it at its tailnet address, which serves the same ports.
-  - Under `subnet`, `JM_NET_NAS_LAN_ADDR` (the NAS's own LAN address, inside
-    the route) narrows the policy to the JuiceMount ports on that address
-    instead of on every host in the route.
+    cannot take a tagged node's last tag away), so a current Mac reaches it
+    at its tailnet address, which serves the same ports, rather than through
+    the route.
+  - `JM_NET_NAS_LAN_ADDR` is the NAS's own LAN address. Under `subnet` it
+    must be inside the route, and narrows the policy to the JuiceMount ports
+    on that address instead of on every host in the route. Under `services`
+    it tells status which routes matter (see below).
 - When `JM_NET_NAS_EXPOSURE` is unset, setting `JM_NET_NAS_ROUTE` selects
   `subnet`. Otherwise an install whose NAS node already ran
   (`/data/headscale/nas-node` exists) keeps `subnet`, and a new install uses
-  `services`. The Manager records that default in
-  `/data/headscale/nas-exposure` before the node first starts, so it does not
-  change later; the node does not start until the record is written. To switch, set `JM_NET_NAS_EXPOSURE` and restart the Manager.
+  `services`. Before the NAS node first starts, the Manager records the
+  exposure it starts with (whichever of the above chose it) in
+  `/data/headscale/nas-exposure`, and that record is the default from then
+  on, so removing a variable later does not change the exposure. The node
+  does not start until the record is written. To switch, set
+  `JM_NET_NAS_EXPOSURE` and restart the Manager.
   Before switching an existing install to `services`, update every linked
   Mac.
 - `JM_NET_NAS_EXPOSURE=services` together with `JM_NET_NAS_ROUTE` stops only
@@ -162,12 +169,16 @@ workers.
 - The Manager finds its NAS node by the node's key, never by the name
   `juicemount-nas`, which any node can register under. It tags, approves
   routes for and reports on that node only. While another node carries
-  `tag:jm-nas` or advertises a route overlapping the NAS prefix,
+  `tag:jm-nas`, or (under `subnet`) advertises a route overlapping the NAS
+  prefix, or (under `services`) holds an approved route over
+  `JM_NET_NAS_LAN_ADDR` (any approved route while that is unset),
   `GET /api/net/link` reports the route not ready and the NAS node logs a
-  warning, naming each such node; remove one that is not yours with
-  `headscale nodes delete --identifier <id>`. `POST /api/net/routes/approve`
-  no longer takes `?host=`: it approves on the NAS node, or on
-  `?id=<node id>`.
+  warning, naming each such node. After the NAS node's state is reset, its
+  earlier registration (same name, offline, older) is named as such.
+  Remove one that is not a device of yours with
+  `docker exec <Manager container> headscale nodes delete --identifier <id>`.
+  `POST /api/net/routes/approve` no longer takes `?host=`: it approves on
+  the NAS node, or on `?id=<node id>` (IDs are in `GET /api/net/paired`).
 - Remote farm node enrollment needs `subnet`: the node's JuiceFS mount reaches
   object storage at the LAN address stored in the volume. Under `services` the
   Manager refuses the remote plan and says what to set.

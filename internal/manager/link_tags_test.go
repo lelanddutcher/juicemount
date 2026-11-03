@@ -154,6 +154,10 @@ func TestLinkStatusReportsSupervisedComponents(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	if err := os.WriteFile(filepath.Join(dir, "routes.txt"), []byte("ID | Hostname | Approved | Available | Serving (Primary)\n1 | juicemount-nas |  |  | \n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
 	status := func() LinkStatus {
 		t.Helper()
 		rec := httptest.NewRecorder()

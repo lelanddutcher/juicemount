@@ -14,9 +14,8 @@ package main
 //	echo '8dc183758024ed7095cf610fedea0790233613c71353bc8be2715d82ba29b92c  headscale' | sha256sum -c && chmod +x headscale
 //	JM_TEST_HEADSCALE_BIN=$PWD/headscale go test -run TestLinkIntegration ./cmd/juicemount-manager
 //
-// The DERP map names an unused loopback port (Headscale requires one), so
-// the test needs no network beyond this host and the nodes must connect
-// directly.
+// The test Headscale runs its embedded DERP relay and STUN server on
+// loopback (localDERPMap), so the test needs no network beyond this host.
 
 import (
 	"bufio"
@@ -41,6 +40,8 @@ import (
 
 	"github.com/lelanddutcher/juicemount/internal/manager"
 	"github.com/lelanddutcher/juicemount/nfs"
+	"tailscale.com/client/local"
+	"tailscale.com/envknob"
 	"tailscale.com/ipn"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tsnet"
@@ -56,15 +57,50 @@ func freeLoopbackPort(t *testing.T) int {
 	return ln.Addr().(*net.TCPAddr).Port
 }
 
-// unusedDERPMap names a relay on a loopback port nothing listens on.
-// Headscale requires a non-empty DERP map; the two nodes in this process
-// then find each other directly over their local interface endpoints, which
-// is the path Link is meant to use anyway.
-func unusedDERPMap(t *testing.T) *tailcfg.DERPMap {
+// localDERPMap turns on the test Headscale's embedded DERP relay and STUN
+// server (through Headscale's environment, which the supervised child
+// inherits) and returns the map naming them: the relay on the control
+// listener, spoken over plain HTTP as that listener is, and STUN on a free
+// loopback port. Call it before Headscale starts.
+//
+// Headscale requires a DERP map, and a dead one is not neutral. Without
+// STUN, tsnet's netcheck reports a send error every few seconds and
+// magicsock rebinds its socket each time; without a relay, a node's first
+// WireGuard handshake reply goes to the relay, because its own direct path
+// to the peer is not known yet, and is lost. Either kept a subnet-route
+// connection from starting for 15 s to over two minutes. With both, as on
+// a real tailnet, peers connect through the relay at once.
+func localDERPMap(t *testing.T, dir, listen string) *tailcfg.DERPMap {
+	t.Helper()
+	_, portRaw, err := net.SplitHostPort(listen)
+	if err != nil {
+		t.Fatal(err)
+	}
+	derpPort, _ := strconv.Atoi(portRaw)
+	udp, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stunPort := udp.LocalAddr().(*net.UDPAddr).Port
+	_ = udp.Close()
+	for k, v := range map[string]string{
+		"HEADSCALE_DERP_SERVER_ENABLED":                                "true",
+		"HEADSCALE_DERP_SERVER_REGION_ID":                              "900",
+		"HEADSCALE_DERP_SERVER_REGION_CODE":                            "test",
+		"HEADSCALE_DERP_SERVER_REGION_NAME":                            "test",
+		"HEADSCALE_DERP_SERVER_STUN_LISTEN_ADDR":                       net.JoinHostPort("127.0.0.1", strconv.Itoa(stunPort)),
+		"HEADSCALE_DERP_SERVER_PRIVATE_KEY_PATH":                       filepath.Join(dir, "derp_server_private.key"),
+		"HEADSCALE_DERP_SERVER_AUTOMATICALLY_ADD_EMBEDDED_DERP_REGION": "false",
+	} {
+		t.Setenv(k, v)
+	}
+	prev := os.Getenv("TS_DEBUG_USE_DERP_HTTP")
+	envknob.Setenv("TS_DEBUG_USE_DERP_HTTP", "true")
+	t.Cleanup(func() { envknob.Setenv("TS_DEBUG_USE_DERP_HTTP", prev) })
 	return &tailcfg.DERPMap{Regions: map[int]*tailcfg.DERPRegion{
 		900: {RegionID: 900, RegionCode: "test", Nodes: []*tailcfg.DERPNode{{
 			Name: "900a", RegionID: 900, HostName: "127.0.0.1", IPv4: "127.0.0.1", IPv6: "none",
-			STUNPort: -1, DERPPort: freeLoopbackPort(t), InsecureForTests: true, STUNTestIP: "127.0.0.1",
+			STUNPort: stunPort, DERPPort: derpPort, InsecureForTests: true, STUNTestIP: "127.0.0.1",
 		}}},
 	}}
 }
@@ -113,6 +149,9 @@ type linkIntegrationCase struct {
 	// calls itself juicemount-nas and, in subnet exposure, advertises the
 	// NAS prefix.
 	impostorFirst bool
+	// rogueRoute, in service exposure, adds a node whose approved route
+	// covers the NAS's LAN address.
+	rogueRoute bool
 	// wantNASErr, when set, is a substring of the NAS node's error: the
 	// node must fail loudly instead of running.
 	wantNASErr   string
@@ -157,6 +196,15 @@ func TestLinkIntegrationOperatorPolicyRefusingNASTag(t *testing.T) {
 // address; once approved, the Mac finds the NAS node by its route.
 func TestLinkIntegrationSubnetExposureWaitsForRoute(t *testing.T) {
 	runLinkIntegration(t, linkIntegrationCase{policy: "managed", subnet: true})
+}
+
+// TestLinkIntegrationRouteDoesNotCaptureServiceTraffic: in service exposure
+// another node holding an approved route over the NAS's LAN address must
+// not receive the traffic a Mac sends to the NAS (it dials the tag:jm-nas
+// peer, not the route), and the Manager reports that node. Without a policy
+// the route would otherwise carry the Mac's Redis AUTH to that node.
+func TestLinkIntegrationRouteDoesNotCaptureServiceTraffic(t *testing.T) {
+	runLinkIntegration(t, linkIntegrationCase{policy: "off", rogueRoute: true})
 }
 
 // TestLinkIntegrationImpostorRegisteredFirstServices: a node's hostname is
@@ -221,7 +269,7 @@ func runLinkIntegration(t *testing.T, tc linkIntegrationCase) {
 	listen := net.JoinHostPort("127.0.0.1", strconv.Itoa(hsPort))
 	localControl := "http://" + listen
 	derpPath := filepath.Join(dir, "derp.yaml")
-	writeDERPMapYAML(t, derpPath, unusedDERPMap(t))
+	writeDERPMapYAML(t, derpPath, localDERPMap(t, dir, listen))
 	cfgPath := filepath.Join(dir, "config.yaml")
 	cfg := renderHeadscaleConfig(headscaleConfigParams{
 		ServerURL:     publicURL,
@@ -413,7 +461,7 @@ func runLinkIntegration(t *testing.T, tc linkIntegrationCase) {
 		return nasNode, impostor
 	}
 	nasNode, impostor := listNodes()
-	if err := manager.LinkNASConflicts(bin, cfgPath, nasNode.NodeKey, ""); err != nil {
+	if err := manager.LinkNASConflicts(context.Background(), bin, cfgPath, nasNode.NodeKey, ""); err != nil {
 		t.Fatalf("NAS node conflicts: %v", err)
 	}
 	if !reflect.DeepEqual(nasNode.Tags, wantNASTags) {
@@ -491,7 +539,7 @@ func runLinkIntegration(t *testing.T, tc linkIntegrationCase) {
 		}
 		// The impostor's advertisement keeps the route from being reported
 		// ready, by name of node.
-		err := manager.LinkNASConflicts(bin, cfgPath, nasNode.NodeKey, lan.String())
+		err := manager.LinkNASConflicts(context.Background(), bin, cfgPath, nasNode.NodeKey, lan.String())
 		if impostor == nil && err != nil {
 			t.Fatalf("conflict without an impostor: %v", err)
 		}
@@ -542,6 +590,104 @@ func runLinkIntegration(t *testing.T, tc linkIntegrationCase) {
 		}
 	}
 
+	if tc.rogueRoute {
+		rogueKey, err := manager.MintPreauthKey(bin, cfgPath, false, macTags)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rogue := &tsnet.Server{Hostname: "rogue", ControlURL: localControl, AuthKey: rogueKey, Dir: filepath.Join(dir, "rogue"), Logf: func(string, ...any) {}}
+		defer rogue.Close()
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		st, err := rogue.Up(ctx)
+		if err == nil {
+			var lc *local.Client
+			if lc, err = rogue.LocalClient(); err == nil {
+				_, err = lc.EditPrefs(ctx, &ipn.MaskedPrefs{Prefs: ipn.Prefs{AdvertiseRoutes: []netip.Prefix{lan}}, AdvertiseRoutesSet: true})
+			}
+		}
+		cancel()
+		if err != nil {
+			t.Fatalf("rogue node: %v", err)
+		}
+		rogue.RegisterFallbackTCPHandler(func(_, dst netip.AddrPort) (func(net.Conn), bool) {
+			return func(c net.Conn) {
+				defer c.Close()
+				if line, err := bufio.NewReader(c).ReadString('\n'); err == nil {
+					_, _ = io.WriteString(c, "rogue:"+line)
+				}
+			}, lan.Contains(dst.Addr())
+		})
+		rogueKeyStr := st.Self.PublicKey.String()
+		var rogueID uint64
+		deadline := time.Now().Add(30 * time.Second)
+		for rogueID == 0 {
+			out, err := exec.Command(bin, "--config", cfgPath, "nodes", "list", "-o", "json").Output()
+			var nodes []manager.HSNode
+			if err == nil && json.Unmarshal(out, &nodes) == nil {
+				for _, n := range nodes {
+					if n.NodeKey == rogueKeyStr && containsString(n.AvailableRoutes, lan.String()) {
+						rogueID = n.ID
+					}
+				}
+			}
+			if rogueID == 0 {
+				if time.Now().After(deadline) {
+					t.Fatalf("rogue route never advertised: %s", out)
+				}
+				time.Sleep(200 * time.Millisecond)
+			}
+		}
+		if out, err := exec.Command(bin, "--config", cfgPath, "nodes", "approve-routes", "--identifier", strconv.FormatUint(rogueID, 10), "--routes", lan.String()).CombinedOutput(); err != nil {
+			t.Fatalf("approve the rogue route: %v: %s", err, out)
+		}
+		// An observer with routes accepted shows when the netmap carries
+		// the rogue's route as primary, as the Mac's does.
+		obsKey, err := manager.MintPreauthKey(bin, cfgPath, false, macTags)
+		if err != nil {
+			t.Fatal(err)
+		}
+		obs := &tsnet.Server{Hostname: "observer", ControlURL: localControl, AuthKey: obsKey, Dir: filepath.Join(dir, "observer"), Logf: func(string, ...any) {}}
+		defer obs.Close()
+		ctx, cancel = context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+		if _, err := obs.Up(ctx); err != nil {
+			t.Fatal(err)
+		}
+		olc, err := obs.LocalClient()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := olc.EditPrefs(ctx, &ipn.MaskedPrefs{Prefs: ipn.Prefs{RouteAll: true}, RouteAllSet: true}); err != nil {
+			t.Fatal(err)
+		}
+		for {
+			ost, err := olc.Status(ctx)
+			if err != nil {
+				t.Fatalf("observer never saw the rogue route: %v", err)
+			}
+			seen := false
+			for _, p := range ost.Peer {
+				if p.HostName == "rogue" && p.PrimaryRoutes != nil && p.PrimaryRoutes.Len() > 0 {
+					seen = true
+				}
+			}
+			if seen {
+				break
+			}
+			time.Sleep(200 * time.Millisecond)
+		}
+		time.Sleep(2 * time.Second) // the same netmap reaches the Mac
+		for i := 0; i < 5; i++ {
+			if err := echoOver(10*time.Second, 30179); err != nil {
+				t.Fatalf("with a rogue route over the NAS LAN, dial %d: %v", i, err)
+			}
+		}
+		err = manager.LinkNASConflicts(context.Background(), bin, cfgPath, nas.status.snapshot().NodeKey, "")
+		if err == nil || !strings.Contains(err.Error(), fmt.Sprintf("node %d (\"rogue\")", rogueID)) {
+			t.Fatalf("the Manager did not report the rogue route: %v", err)
+		}
+	}
+
 	if tc.policy == "managed" && !tc.subnet {
 		// 30199 has a listener on the NAS node but no policy rule.
 		if err := echoOver(5*time.Second, 30199); err == nil {
@@ -554,22 +700,19 @@ func runLinkIntegration(t *testing.T, tc linkIntegrationCase) {
 	}
 
 	if tc.subnet {
-		// Last, because it can end in a skip: a connection through the
-		// approved route. On this relay-less loopback tailnet the first
-		// connection has taken about a minute after the route reached the
-		// Mac, or longer than 120 s, with or without a policy; in those runs
-		// the Mac could not reach the NAS node's own tailnet address either,
-		// so the stall is the peer path, not the route or the policy.
+		// A connection through the approved route. The test tailnet has a
+		// working DERP relay and STUN server (localDERPMap), as a real one
+		// does, so the path is up within seconds.
 		start := time.Now()
 		var err error
-		for time.Since(start) < 120*time.Second {
-			if err = echoOver(10*time.Second, 30179); err == nil {
+		for time.Since(start) < 30*time.Second {
+			if err = echoOver(5*time.Second, 30179); err == nil {
 				break
 			}
-			time.Sleep(time.Second)
+			time.Sleep(500 * time.Millisecond)
 		}
 		if err != nil {
-			t.Skipf("NOT A PASS: the Mac had the approved route, but no connection through it succeeded within 120 s (last error: %v); the route never converged on this loopback tailnet", err)
+			t.Fatalf("no connection through the approved subnet route within 30 s: %v", err)
 		}
 		t.Logf("first connection through the subnet route after %v", time.Since(start).Round(time.Millisecond))
 	}

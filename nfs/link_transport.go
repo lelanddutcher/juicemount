@@ -25,8 +25,8 @@ type LinkTransportStatus struct {
 }
 
 // TransportStatus reads live magicsock peer state and identifies the NAS
-// node: the peer advertising a primary subnet route, else the NAS service
-// peer (linkNASServicePeer).
+// node: the NAS service peer (linkNASServicePeer), else the peer
+// advertising a primary subnet route.
 func (l *LinkNode) TransportStatus(ctx context.Context) (LinkTransportStatus, error) {
 	if l == nil {
 		return LinkTransportStatus{}, fmt.Errorf("link: node is nil")
@@ -52,13 +52,14 @@ func linkTransportFromStatus(status *ipnstate.Status) (LinkTransportStatus, erro
 	if status == nil {
 		return LinkTransportStatus{}, fmt.Errorf("link: empty transport status")
 	}
+	// The NAS service peer first, as linkDialPlanner dials it first.
+	if peer := linkNASServicePeer(status); peer != nil {
+		return linkTransportForPeer(peer), nil
+	}
 	for _, peer := range status.Peer {
 		if peer == nil || peer.PrimaryRoutes == nil || peer.PrimaryRoutes.Len() == 0 {
 			continue
 		}
-		return linkTransportForPeer(peer), nil
-	}
-	if peer := linkNASServicePeer(status); peer != nil {
 		return linkTransportForPeer(peer), nil
 	}
 	return LinkTransportStatus{}, fmt.Errorf("link: no peer is advertising the NAS subnet route or serving as the NAS node")

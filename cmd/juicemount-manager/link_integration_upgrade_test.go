@@ -63,7 +63,7 @@ func startTestControl(t *testing.T, operatorPolicy string, env map[string]string
 	const publicURL = "https://link.example.com:30193"
 	c.listen = net.JoinHostPort("127.0.0.1", strconv.Itoa(freeLoopbackPort(t)))
 	derpPath := filepath.Join(c.dir, "derp.yaml")
-	writeDERPMapYAML(t, derpPath, unusedDERPMap(t))
+	writeDERPMapYAML(t, derpPath, localDERPMap(t, c.dir, c.listen))
 	c.cfgPath = filepath.Join(c.dir, "config.yaml")
 	cfg := renderHeadscaleConfig(headscaleConfigParams{
 		ServerURL:     publicURL,
