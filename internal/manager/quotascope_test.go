@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/juicedata/juicefs/pkg/meta"
+	"github.com/lelanddutcher/juicemount/internal/respproxy"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -120,5 +121,14 @@ func TestQuotasAboveProjectsReadsVolume(t *testing.T) {
 	}
 	if p := got(); fmt.Sprint(p) != "[/ /Clients]" {
 		t.Errorf("quotas above the projects: %v", p)
+	}
+	// The project depth the proxy reads (jmlease:v1:cfg depth).
+	rdb.HSet(ctx, respproxy.ConfigKey, "depth", 3)
+	if p := got(); fmt.Sprint(p) != "[/ /Clients /Clients/A]" {
+		t.Errorf("quotas above the projects at depth 3: %v", p)
+	}
+	rdb.HSet(ctx, respproxy.ConfigKey, "depth", 1)
+	if p := got(); fmt.Sprint(p) != "[/]" {
+		t.Errorf("quotas above the projects at depth 1: %v", p)
 	}
 }

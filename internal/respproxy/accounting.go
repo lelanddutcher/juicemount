@@ -8,6 +8,22 @@ import (
 	"strconv"
 )
 
+// DefaultProjectDepth is the project depth when ConfigKey sets none: a
+// project is /<client>/<project>.
+const DefaultProjectDepth = 2
+
+// ProjectDepth parses the "depth" field of ConfigKey (jmlease:v1:cfg) as
+// the lease engine reads it: 1 to 16, else DefaultProjectDepth. The
+// Manager reads the same field with it, so its quota scope check and the
+// proxy agree on what is above the project depth.
+func ProjectDepth(v string) int {
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil || n <= 0 || n > 16 {
+		return DefaultProjectDepth
+	}
+	return int(n)
+}
+
 // counterHash: a dir-stat or quota-usage hash. juicefs stores a decimal
 // int64 in every field and parses it back with strconv.ParseInt
 // (doLoadQuotas, doGetDirStat).
@@ -37,7 +53,16 @@ func canonicalInt(s []byte) bool {
 // running client partially applied and was sent again, counting the other
 // quotas' usage several times. It holds for every principal but bg, in
 // every mode, with or without people.
+//
+// An increment of a quota definition (dirQuota holds packed limits, which
+// juicefs only HSETs) is refused for every principal, bg included: it
+// would make a definition, or a junk row, out of nothing.
 func accountingValueDenial(p Principal, u *Unit) *Denial {
+	for _, w := range u.Writes {
+		if n := u.Cmds[w.Cmd].Info.Name; w.Key.Shape == "dirQuota" && (n == "HINCRBY" || n == "HINCRBYFLOAT") {
+			return &Denial{Reason: ReasonAdminOnly, Detail: n + " on " + w.Raw + ": quota definitions are only set (juicefs quota set)"}
+		}
+	}
 	if p.Kind == KindBG {
 		return nil
 	}
@@ -83,9 +108,23 @@ func accountingValueDenial(p Principal, u *Unit) *Denial {
 // Manager does not put grants in force while such a quota exists.
 // Increments of an existing row by writers that are not limited (their
 // juicefs flushes) still pass. A folder the proxy cannot place is refused.
+// So is every write to these hashes as a whole (COPY, RENAME, DEL, EXPIRE,
+// and the admin's RESTORE and MOVE of them): it could put a row above the
+// project depth without naming its field. Left to the admin principal:
+// its raw maintenance commands that name no key (FLUSHDB, SWAPDB, FCALL,
+// ...), which can rewrite any key of the volume.
 func (e *LeaseEngine) quotaScopeDenial(p Principal, u *Unit) *Denial {
 	if p.Kind == KindBG {
 		return nil
+	}
+	for _, c := range u.Cmds {
+		if (c.Info.Name == "RESTORE" || c.Info.Name == "MOVE") && len(c.Args) > 1 {
+			switch string(c.Args[1]) {
+			case "dirQuota", "dirQuotaUsedSpace", "dirQuotaUsedInodes":
+				return &Denial{Reason: ReasonNotGranted, Detail: c.Info.Name + " of " + string(c.Args[1]) +
+					": while per-person grants are in force, quota rows are changed one field at a time"}
+			}
+		}
 	}
 	locked := false
 	defer func() {
@@ -100,6 +139,12 @@ func (e *LeaseEngine) quotaScopeDenial(p Principal, u *Unit) *Denial {
 			continue
 		}
 		c := u.Cmds[w.Cmd]
+		switch c.Info.Name {
+		case "HSET", "HSETNX", "HMSET", "HDEL", "HINCRBY", "HINCRBYFLOAT":
+		default:
+			return &Denial{Reason: ReasonNotGranted, Detail: c.Info.Name + " of " + w.Raw +
+				" as a whole: while per-person grants are in force, quota rows are changed one field at a time"}
+		}
 		for _, r := range statRowsOf(c.Info.Name, w.Key, c.Args) {
 			if r.op != "set" {
 				continue

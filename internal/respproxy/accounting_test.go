@@ -26,6 +26,8 @@ func TestAccountingValueDenial(t *testing.T) {
 		{[]string{"HSET", "dirUsedInodes", "5", "0", "6", "1.5"}, KindMac, true},
 		{[]string{"HSET", "dirUsedInodes", "5", "0", "6", "12"}, KindMac, false},
 		{[]string{"HSET", "dirQuota", "5", "\x00\x01packed-limits"}, KindAdmin, false},
+		{[]string{"HINCRBY", "dirQuota", "5", "1"}, KindAdmin, true},
+		{[]string{"HINCRBY", "dirQuota", "5", "1"}, KindBG, true},
 	} {
 		args := make([][]byte, len(c.args))
 		for i, a := range c.args {

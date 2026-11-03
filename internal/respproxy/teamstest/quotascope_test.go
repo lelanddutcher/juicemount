@@ -148,6 +148,31 @@ func TestNoQuotaAboveProjectsWhileGrantsInForce(t *testing.T) {
 	if err := set("/Clients/A"); err != nil {
 		t.Errorf("quota set on a project: %v", err)
 	}
+	// Nor by an increment of the definition hash (always refused), or a
+	// write of the quota hashes as a whole (review round 5).
+	ctx := context.Background()
+	before := e.rdb.HGetAll(ctx, "dirQuota").Val()
+	dump := e.rdb.Dump(ctx, "dirQuota").Val()
+	raw := e.rawClient("admin1")
+	for _, c := range []struct {
+		what string
+		args []any
+	}{
+		{"HINCRBY dirQuota /Clients", []any{"HINCRBY", "dirQuota", istr(e.ino["/Clients"]), 1}},
+		{"COPY usage over dirQuota", []any{"COPY", "dirQuotaUsedSpace", "dirQuota", "REPLACE"}},
+		{"RENAME usage to dirQuota", []any{"RENAME", "dirQuotaUsedInodes", "dirQuota"}},
+		{"RESTORE dirQuota", []any{"RESTORE", "dirQuota", 0, dump, "REPLACE"}},
+		{"DEL dirQuota", []any{"DEL", "dirQuota"}},
+		{"DEL dirQuotaUsedSpace", []any{"DEL", "dirQuotaUsedSpace"}},
+		{"MOVE dirQuota", []any{"MOVE", "dirQuota", 11}},
+	} {
+		if err := raw.Do(ctx, c.args...).Err(); err == nil || !strings.HasPrefix(err.Error(), "JMDENY") {
+			t.Errorf("%s by admin while grants are in force: %v", c.what, err)
+		}
+	}
+	if after := e.rdb.HGetAll(ctx, "dirQuota").Val(); len(after) != len(before) || e.rdb.Exists(ctx, "dirQuotaUsedInodes").Val() != 1 {
+		t.Errorf("quota hashes changed: %d -> %d definitions", len(before), len(after))
+	}
 	setQuota(t, e, "/Clients", 1<<40, 1000) // created before grants
 	if err := adm.HandleQuota(meta.Background(), meta.QuotaDel, "/Clients", nil, false, false, false); err != nil {
 		t.Errorf("quota delete /Clients: %v", err)

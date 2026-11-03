@@ -379,8 +379,12 @@ func TestPeopleAndAuditAPI(t *testing.T) {
 	if rr := doJSON(t, mux, http.MethodPost, "/api/people/grant", key, map[string]string{"id": id, "path": "relative"}); rr.Code != http.StatusBadRequest {
 		t.Fatalf("bad grant: %d", rr.Code)
 	}
-	if rr := doJSON(t, mux, http.MethodPost, "/api/people/grant", key, map[string]string{"id": id, "path": "/Clients/A"}); rr.Code != http.StatusOK {
-		t.Fatalf("grant: %d %s", rr.Code, rr.Body)
+	// This Manager has no metadata URL, so it cannot check the volume for
+	// quotas above the project folders: grants are not put in force
+	// (quotascope.go; quotascope_test.go covers a Manager that can check).
+	if rr := doJSON(t, mux, http.MethodPost, "/api/people/grant", key, map[string]string{"id": id, "path": "/Clients/A"}); rr.Code != http.StatusBadRequest ||
+		!strings.Contains(rr.Body.String(), "no metadata URL") {
+		t.Fatalf("grant without a metadata URL: %d %s", rr.Code, rr.Body)
 	}
 	if rr := doJSON(t, mux, http.MethodPost, "/api/people/assign", key, map[string]string{"device": "mac-000000000000", "person": id}); rr.Code != http.StatusNotFound {
 		t.Fatalf("assign unknown Mac: %d", rr.Code)

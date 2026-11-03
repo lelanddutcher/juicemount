@@ -869,11 +869,16 @@ func (a *API) registerPeople(mux *http.ServeMux, prefix string, store *Principal
 	}
 	if store != nil {
 		a.jobs.onStopAll(store.StartPeopleSync())
+		// The volume's metadata URL is the Manager's only way to the
+		// quotas (as for the Overview and leases). Without it grants are
+		// not put in force: a quota above the projects would stall limited
+		// people's quota flushes with nothing to say so (quotascope.go).
+		fn := noQuotaScope
 		if a.linkMetaURL != "" {
-			fn := redisQuotaScope(a.linkMetaURL)
-			store.SetQuotaScope(fn)
-			pa.quotas = &quotaScopeCache{fn: fn}
+			fn = redisQuotaScope(a.linkMetaURL)
 		}
+		store.SetQuotaScope(fn)
+		pa.quotas = &quotaScopeCache{fn: fn}
 	}
 	if pa.auditDir != "" {
 		anchors := ""

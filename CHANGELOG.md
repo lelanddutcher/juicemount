@@ -77,11 +77,15 @@
   Mac could not report its usage without being able to change it for the
   other projects. The Manager does not put grants in force while one exists
   and says which and how to remove it (`juicefs quota delete <META-URL>
-  --path /Clients`); while grants are in force the proxy refuses to create
-  one, also for the admin. If one exists anyway (made directly in Redis),
-  the People page names it: until it is removed, the quota usage of limited
-  people's writes does not update, because JuiceFS sends all quotas in one
-  update and the proxy refuses it. Before, a limited person could add or
+  --path /Clients`), and it cannot put grants in force without a metadata
+  URL to check with. While grants are in force the proxy refuses to create
+  one, including through the admin's juicefs, and refuses writing the quota
+  hashes as a whole; the admin's raw maintenance commands that name no key
+  (FLUSHDB, SWAPDB, scripts) can still rewrite them, as any key. The
+  Manager reads the project depth the proxy uses. If one exists anyway
+  (made directly in Redis), the People page names it: until it is removed,
+  the quota usage of limited people's writes does not update, because
+  JuiceFS sends all quotas in one update and the proxy refuses it. Before, a limited person could add or
   subtract any amount to such a quota's usage, which made every other
   project in the folder refuse new files or lifted the folder's quota.
 - No writer but the background jobs can store a value other than a whole
@@ -106,8 +110,9 @@
   out through the size limit, nor hide an attempt on another project behind
   it. A change with very many entries (a transaction that adds thousands of
   names) lists its first entries (at most 256, and at most 1 MB in all), how
-  many it leaves out, and a SHA-256 of the change's commands as Redis's AOF
-  holds them, so a copy of the change can be matched to it. The log never
+  many it leaves out, and a SHA-256 of the change's commands as the Mac sent
+  them, which matches a capture of its traffic (and Redis's AOF when every
+  command of the change wrote something). The log never
   writes a line longer than 4 MB; one longer line once made the whole log
   unreadable. A log that fills its disk past its size limit
   removes its oldest segments and recovers; under the limit it stays failed

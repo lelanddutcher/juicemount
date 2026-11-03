@@ -141,8 +141,11 @@ type Record struct {
 	// too large to log in full. Digest then identifies the complete unit:
 	// "sha256:" and the hex SHA-256 of the unit's commands as the proxy
 	// received them, each encoded as a RESP array of bulk strings,
-	// concatenated in order, without MULTI and EXEC (the encoding Redis's
-	// AOF uses), so a capture of the unit can be checked against it.
+	// concatenated in order, without MULTI and EXEC. It matches a capture
+	// of the client's traffic; it matches Redis's AOF only when every
+	// command of the unit wrote something (the AOF leaves out reads and
+	// writes that changed nothing, and rewrites EXPIRE as PEXPIREAT and the
+	// like).
 	Omitted int    `json:"omitted,omitempty"`
 	Digest  string `json:"digest,omitempty"`
 

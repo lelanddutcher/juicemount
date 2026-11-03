@@ -835,9 +835,11 @@ const maxIntentEntries = 256
 // unitDigest is the Digest of a unit's record: "sha256:" and the hex
 // SHA-256 of the unit's commands as the proxy received them, each encoded
 // as a RESP array of bulk strings ("*<n>\r\n" then "$<len>\r\n<arg>\r\n" per
-// argument), concatenated in order; MULTI and EXEC are not included. A
-// capture of the client's traffic or Redis's AOF (which writes the same
-// encoding between MULTI and EXEC) can be checked against it.
+// argument), concatenated in order; MULTI and EXEC are not included. It
+// matches a capture of the client's traffic. It matches Redis's AOF only
+// for a unit in which every command wrote something: the AOF leaves out
+// reads and writes that changed nothing, and rewrites some commands (EXPIRE
+// as PEXPIREAT, for example).
 func unitDigest(cmds []Cmd) string {
 	h := sha256.New()
 	var b []byte
