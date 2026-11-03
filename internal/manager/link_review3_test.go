@@ -25,6 +25,43 @@ func TestServicesConflictReportsRouteCapture(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), `node 2 ("evil")`) {
 		t.Fatalf("services exposure: node 2's approved route over the NAS LAN not reported: %v", err)
 	}
+	if !strings.Contains(err.Error(), "or set JM_NET_NAS_LAN_ADDR to the NAS's LAN address") {
+		t.Fatalf("with the NAS address unknown the report does not say how to narrow it: %v", err)
+	}
+	t.Setenv("JM_NET_NAS_LAN_ADDR", "192.0.2.10")
+	if err := linkNASConflicts(nodes, nil, 1, ""); err == nil || strings.Contains(err.Error(), "set JM_NET_NAS_LAN_ADDR") {
+		t.Fatalf("with the NAS address known: %v", err)
+	}
+	t.Setenv("JM_NET_NAS_LAN_ADDR", "198.51.100.10")
+	if err := linkNASConflicts(nodes, nil, 1, ""); err != nil {
+		t.Fatalf("a route away from the known NAS address was reported: %v", err)
+	}
+}
+
+// TestHeadscaleCallsAreBounded: tagging, route approval and key minting
+// run the headscale CLI too; a wedged control server must not hold the NAS
+// node's start, the approval loop or a pairing request.
+func TestHeadscaleCallsAreBounded(t *testing.T) {
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "headscale-hangs")
+	if err := os.WriteFile(bin, []byte("#!/bin/sh\nexec sleep 60\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	old := hsCommandTimeout
+	hsCommandTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { hsCommandTimeout = old })
+	cfg := filepath.Join(dir, "config.yaml")
+	for name, call := range map[string]func() error{
+		"MintPreauthKey":      func() error { _, err := MintPreauthKey(bin, cfg, false, nil); return err },
+		"EnsureNodeTags":      func() error { _, err := EnsureNodeTags(bin, cfg, nodeKeyNAS, []string{LinkTagNAS}); return err },
+		"ApproveSubnetRoutes": func() error { return ApproveSubnetRoutes(bin, cfg, nodeKeyNAS, []string{"192.0.2.0/24"}) },
+		"routeTableForNode":   func() error { _, _, _, err := routeTableForNode(bin, cfg, 1); return err },
+	} {
+		start := time.Now()
+		if err := call(); err == nil || time.Since(start) > 5*time.Second {
+			t.Errorf("%s against a hung CLI: %v after %v", name, err, time.Since(start))
+		}
+	}
 }
 
 // TestRecordedExposureIsTheFirstRun: the record is the exposure the node

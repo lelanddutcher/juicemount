@@ -45,6 +45,7 @@ import (
 type LinkNode struct {
 	srv             *tsnet.Server
 	mu              sync.Mutex
+	peerStatus      peerStatusCache
 	hostname        string
 	recoverNoState  linkRecoveryFunc
 	proxies         []*tcpProxy
@@ -688,13 +689,13 @@ func (l *LinkNode) DialContext(ctx context.Context, network, address string) (ne
 }
 
 // linkDialPlanner plans a Link dial. A NAS that serves the JuiceMount ports
-// on its own tailnet address (a tag:jm-nas peer: service exposure) is
-// reached there, on the same port, ahead of any route. The NAS node never
+// on its own tailnet address (an online tag:jm-nas peer: service exposure)
+// is reached there, on the same port, ahead of any route. The NAS node never
 // needs a route for these ports, and a route from another node that covers
 // the NAS's LAN address (approved by mistake, or by someone who should not)
 // would otherwise carry the volume's traffic, Redis AUTH included, to that
-// node. Without such a peer the dial follows the tailnet route (subnet
-// exposure).
+// node. Without such a peer online the dial follows the tailnet route
+// (subnet exposure, or a stale tagged record of a reset NAS node).
 func linkDialPlanner(route tailscaleDialPlanner, service func(context.Context, string) (netip.AddrPort, bool)) tailscaleDialPlanner {
 	return func(ctx context.Context, network, address string) (netip.AddrPort, bool, error) {
 		if target, ok := service(ctx, address); ok {
@@ -705,15 +706,53 @@ func linkDialPlanner(route tailscaleDialPlanner, service func(context.Context, s
 }
 
 func (l *LinkNode) nasServiceDialTarget(ctx context.Context, s *tsnet.Server, address string) (netip.AddrPort, bool) {
-	lc, err := s.LocalClient()
-	if err != nil {
-		return netip.AddrPort{}, false
-	}
-	status, err := lc.Status(ctx)
-	if err != nil {
+	status := l.peerStatus.get(ctx, s, func(ctx context.Context) (*ipnstate.Status, error) {
+		lc, err := s.LocalClient()
+		if err != nil {
+			return nil, err
+		}
+		return lc.Status(ctx)
+	})
+	if status == nil {
 		return netip.AddrPort{}, false
 	}
 	return linkServiceDialTarget(status, address)
+}
+
+// linkPeerStatusTTL is how long the dial path reuses a peer status. Every
+// dial attempt consults it, every 100 ms while a dial waits for a route.
+const linkPeerStatusTTL = time.Second
+
+// peerStatusCache keeps one tsnet peer status for linkPeerStatusTTL. The
+// status is shared read-only between callers. A fetch error is not cached.
+type peerStatusCache struct {
+	mu     sync.Mutex
+	owner  any // the tsnet server the status came from
+	status *ipnstate.Status
+	at     time.Time
+	now    func() time.Time // tests
+}
+
+func (c *peerStatusCache) get(ctx context.Context, owner any, fetch func(context.Context) (*ipnstate.Status, error)) *ipnstate.Status {
+	now := time.Now
+	if c.now != nil {
+		now = c.now
+	}
+	c.mu.Lock()
+	if c.status != nil && c.owner == owner && now().Sub(c.at) < linkPeerStatusTTL {
+		st := c.status
+		c.mu.Unlock()
+		return st
+	}
+	c.mu.Unlock()
+	st, err := fetch(ctx)
+	if err != nil {
+		return nil
+	}
+	c.mu.Lock()
+	c.owner, c.status, c.at = owner, st, now()
+	c.mu.Unlock()
+	return st
 }
 
 const (

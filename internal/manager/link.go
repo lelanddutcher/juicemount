@@ -535,7 +535,7 @@ func PreauthKeyArgs(userID uint64, reusable bool, tags []string) []string {
 // of the Link user is 1 only on a control server that never had another
 // user created first, which an operator's own Headscale need not be.
 func HeadscaleUserID(bin, config, name string) (uint64, error) {
-	out, err := exec.Command(bin, "--config", config, "users", "list", "-o", "json").Output()
+	out, err := hsOutput(context.Background(), false, bin, "--config", config, "users", "list", "-o", "json")
 	if err != nil {
 		return 0, fmt.Errorf("headscale users list: %v", err)
 	}
@@ -572,7 +572,7 @@ func MintPreauthKey(bin, config string, reusable bool, tags []string) (string, e
 	}
 	args := append([]string{"--config", config}, PreauthKeyArgs(userID, reusable, tags)...)
 	args = append(args, "--expiration", "1h")
-	out, err := exec.Command(bin, args...).CombinedOutput()
+	out, err := hsOutput(context.Background(), true, bin, args...)
 	if err != nil {
 		return "", fmt.Errorf("%v: %s", err, strings.TrimSpace(string(out)))
 	}
@@ -670,8 +670,8 @@ func mintLinkPreauthKey(reusable bool, tag string) (string, error) {
 
 // handlePairedNodes lists all registered tailnet nodes.
 func (a *API) handlePairedNodes(w http.ResponseWriter, r *http.Request) {
-	out, err := exec.Command(headscaleBin(), "--config", headscaleConfig(),
-		"nodes", "list").CombinedOutput()
+	out, err := hsOutput(r.Context(), true, headscaleBin(), "--config", headscaleConfig(),
+		"nodes", "list")
 	if err != nil {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": err.Error()})
 		return
@@ -690,8 +690,8 @@ func (a *API) handleRevokeNode(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "missing ?id=", http.StatusBadRequest)
 		return
 	}
-	out, err := exec.Command(headscaleBin(), "--config", headscaleConfig(),
-		"nodes", "expire", "--identifier", nodeID).CombinedOutput()
+	out, err := hsOutput(r.Context(), true, headscaleBin(), "--config", headscaleConfig(),
+		"nodes", "expire", "--identifier", nodeID)
 	if err != nil {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": fmt.Sprintf("%v: %s", err, strings.TrimSpace(string(out)))})
 		return
@@ -776,10 +776,11 @@ type HSNode struct {
 // juicemount-nas), so a name never selects the node the Manager tags,
 // approves routes for, or reports on.
 
-// hsCommandTimeout bounds each headscale CLI call made to look up nodes
-// and routes, so a wedged control server never holds a caller (the NAS
-// node's watch loop, a status request) for long.
-const hsCommandTimeout = 10 * time.Second
+// hsCommandTimeout bounds each headscale CLI call the Link code makes
+// (lookups, tagging, route approval, key minting), so a wedged control
+// server never holds a caller (the NAS node's start or watch loop, the route
+// approval loop, a status or pairing request) for long.
+var hsCommandTimeout = 10 * time.Second // a var for tests
 
 // hsOutput runs one headscale CLI lookup under ctx and hsCommandTimeout.
 func hsOutput(ctx context.Context, combined bool, bin string, args ...string) ([]byte, error) {
@@ -875,9 +876,12 @@ func LinkNASConflicts(ctx context.Context, bin, config, nodeKey, subnet string) 
 //     overlapping it;
 //   - without one (service exposure), any holding an approved route over
 //     the NAS's LAN address (JM_NET_NAS_LAN_ADDR), or, with that address
-//     unknown, any approved route at all. A current Mac dials the
-//     tag:jm-nas peer ahead of routes, but a route over the NAS's LAN is
-//     still a path a client could take.
+//     unknown, any approved route at all. A current Mac dials the online
+//     tag:jm-nas peer ahead of routes, but while the NAS node is offline it
+//     follows a route over the NAS's LAN address, so such a route can
+//     receive the volume's traffic. The Manager cannot tell which routes
+//     cover that address without JM_NET_NAS_LAN_ADDR, so an unknown address
+//     blocks "ready" rather than warning.
 //
 // Default (exit) routes are ignored: a Link node never uses one. rows, from
 // `nodes list-routes`, adds to the routes nodes lists.
@@ -905,7 +909,7 @@ func linkNASConflicts(nodes []HSNode, rows map[uint64]routeRow, nasID uint64, su
 	}
 	nas := nodeByID(nodes, nasID)
 	var found []string
-	stale := false
+	stale, unknownAddr := false, false
 	for i := range nodes {
 		n := &nodes[i]
 		if n.ID == nasID {
@@ -934,6 +938,7 @@ func linkNASConflicts(nodes []HSNode, rows map[uint64]routeRow, nasID uint64, su
 				}
 				if r != "" {
 					why = append(why, "holds the approved route "+r)
+					unknownAddr = unknownAddr || !lanAddr.IsValid()
 					break
 				}
 			}
@@ -957,7 +962,11 @@ func linkNASConflicts(nodes []HSNode, rows map[uint64]routeRow, nasID uint64, su
 	if stale {
 		advice = "Remove this NAS's earlier registration, and any other node that is not a device of yours"
 	}
-	return fmt.Errorf("Link NAS node %d is not the only node Macs could take for the NAS: %s. %s: `docker exec <Manager container> headscale nodes delete --identifier <id>`", nasID, strings.Join(found, "; "), advice)
+	msg := fmt.Sprintf("Link NAS node %d is not the only node Macs could take for the NAS: %s. %s: `docker exec <Manager container> headscale nodes delete --identifier <id>`", nasID, strings.Join(found, "; "), advice)
+	if unknownAddr {
+		msg += ", or set JM_NET_NAS_LAN_ADDR to the NAS's LAN address so that only routes over it count"
+	}
+	return errors.New(msg)
 }
 
 // firstNonDefaultRoute returns the first route in routes that is not a
@@ -1001,9 +1010,9 @@ func EnsureNodeTags(bin, config, nodeKey string, want []string) (bool, error) {
 		return false, nil
 	}
 	id := node.ID
-	out, err := exec.Command(bin, "--config", config, "nodes", "tag",
+	out, err := hsOutput(context.Background(), true, bin, "--config", config, "nodes", "tag",
 		"--identifier", strconv.FormatUint(id, 10),
-		"--tags", strings.Join(merged, ",")).CombinedOutput()
+		"--tags", strings.Join(merged, ","))
 	if err != nil {
 		return false, fmt.Errorf("nodes tag: %v: %s", err, strings.TrimSpace(string(out)))
 	}
@@ -1109,8 +1118,8 @@ func splitRouteList(cell string) []string {
 }
 
 func routeTableForNode(bin, config string, nodeID uint64) (approved, available, serving []string, err error) {
-	out, err := exec.Command(bin, "--config", config, "nodes", "list-routes",
-		"--identifier", strconv.FormatUint(nodeID, 10)).CombinedOutput()
+	out, err := hsOutput(context.Background(), true, bin, "--config", config, "nodes", "list-routes",
+		"--identifier", strconv.FormatUint(nodeID, 10))
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("nodes list-routes: %v: %s", err, strings.TrimSpace(string(out)))
 	}
@@ -1254,10 +1263,10 @@ func approveSubnetRoutes(bin, config string, pick func([]HSNode) *HSNode, label 
 		return nil
 	}
 	merged := mergeApproved(approved, pending)
-	setOut, err := exec.Command(bin, "--config", config,
+	setOut, err := hsOutput(context.Background(), true, bin, "--config", config,
 		"nodes", "approve-routes",
 		"--identifier", strconv.FormatUint(n.ID, 10),
-		"--routes", strings.Join(merged, ",")).CombinedOutput()
+		"--routes", strings.Join(merged, ","))
 	if err != nil {
 		return fmt.Errorf("approve-routes: %v: %s", err, strings.TrimSpace(string(setOut)))
 	}
@@ -1296,7 +1305,7 @@ func (a *API) handleNetRouteApprove(w http.ResponseWriter, r *http.Request) {
 	bin, config := headscaleBin(), headscaleConfig()
 	switch r.Method {
 	case http.MethodGet:
-		out, err := exec.Command(bin, "--config", config, "nodes", "list-routes", "-o", "json").Output()
+		out, err := hsOutput(r.Context(), false, bin, "--config", config, "nodes", "list-routes", "-o", "json")
 		if err != nil {
 			writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": err.Error()})
 			return

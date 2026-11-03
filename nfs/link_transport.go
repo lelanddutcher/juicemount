@@ -94,27 +94,24 @@ func linkTransportForPeer(peer *ipnstate.PeerStatus) LinkTransportStatus {
 // guesses between two online ones.
 const linkNASTag = "tag:jm-nas"
 
-// linkNASServicePeer returns the one tag:jm-nas peer, preferring online
-// peers when a stale record lingers. Anything ambiguous returns nil: Link
-// must never guess which machine receives the volume's traffic.
+// linkNASServicePeer returns the one online tag:jm-nas peer. An offline one
+// is skipped: it is a NAS node that is down, or a record of the NAS's
+// earlier identity (a reset node state), whose tag outlives it; a Mac then
+// falls through to a subnet route if there is one, and otherwise waits for
+// the NAS node to come back. Two online ones are ambiguous and return nil:
+// Link must never guess which machine receives the volume's traffic.
 func linkNASServicePeer(status *ipnstate.Status) *ipnstate.PeerStatus {
 	if status == nil {
 		return nil
 	}
-	var tagged, online []*ipnstate.PeerStatus
+	var online []*ipnstate.PeerStatus
 	for _, peer := range status.Peer {
-		if peer == nil || peer.Tags == nil || !peer.Tags.ContainsFunc(func(tag string) bool { return tag == linkNASTag }) || len(peer.TailscaleIPs) == 0 {
+		if peer == nil || !peer.Online || peer.Tags == nil || !peer.Tags.ContainsFunc(func(tag string) bool { return tag == linkNASTag }) || len(peer.TailscaleIPs) == 0 {
 			continue
 		}
-		tagged = append(tagged, peer)
-		if peer.Online {
-			online = append(online, peer)
-		}
+		online = append(online, peer)
 	}
-	switch {
-	case len(tagged) == 1:
-		return tagged[0]
-	case len(online) == 1:
+	if len(online) == 1 {
 		return online[0]
 	}
 	return nil
