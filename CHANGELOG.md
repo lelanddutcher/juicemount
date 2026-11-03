@@ -36,6 +36,11 @@ workers.
   after the owner and its NFS export are proven gone, and leaves queued saves
   and local databases in place. Ordinary installs are unchanged, and packaged
   recovery acceptance remains open.
+- Handing a resident file's cached blocks over for upload now rereads any block
+  written in the last two seconds and checks it against its recorded hash.
+  Before, an in-place edit that kept the file's size and timestamp, and landed
+  in the same timestamp tick as the block's last change, could hand over bytes
+  that no longer matched the hash. Older blocks keep the metadata check.
 
 ### Server
 
