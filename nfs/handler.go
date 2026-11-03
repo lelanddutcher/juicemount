@@ -1998,8 +1998,11 @@ func (h *JuiceMountHandler) evictStaleVerifiers(ttl time.Duration) {
 // spool, and the spool's index/db are still needed during the drainer
 // drain-window. Old fdPool and verifierStop sweep after that.
 func (h *JuiceMountHandler) StopHandler() bool {
-	return h.stopHandlerWithDeadline(30 * time.Second)
+	return h.stopHandlerWithDeadline(stopHandlerDeadline)
 }
+
+// stopHandlerDeadline bounds each StopHandler join stage.
+const stopHandlerDeadline = 30 * time.Second
 
 func (h *JuiceMountHandler) stopHandlerWithDeadline(deadline time.Duration) bool {
 	h.stopMu.Lock()
