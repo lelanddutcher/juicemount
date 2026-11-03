@@ -257,13 +257,25 @@ func countStoreCommits(t *testing.T, dbPath string) *atomic.Int64 {
 			return nil
 		})
 	})
+	// The store opens the symlink-resolved path (canonicalStorePath), so key
+	// the count by that: on macOS t.TempDir() is under /var, a link to
+	// /private/var, and the raw path never matches the DSN.
+	abs, err := filepath.Abs(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir, err := filepath.EvalSymlinks(filepath.Dir(abs))
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := filepath.Join(dir, filepath.Base(abs))
 	commits := new(atomic.Int64)
 	ladderCommitCounts.mu.Lock()
-	ladderCommitCounts.byDB[dbPath] = commits
+	ladderCommitCounts.byDB[key] = commits
 	ladderCommitCounts.mu.Unlock()
 	t.Cleanup(func() {
 		ladderCommitCounts.mu.Lock()
-		delete(ladderCommitCounts.byDB, dbPath)
+		delete(ladderCommitCounts.byDB, key)
 		ladderCommitCounts.mu.Unlock()
 	})
 	return commits
