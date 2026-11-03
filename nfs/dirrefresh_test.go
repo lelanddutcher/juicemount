@@ -8,8 +8,15 @@ package nfs
 // same stand-in the spool integration tests use.
 
 import (
+	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -34,6 +41,14 @@ func newDirRefreshHarness(t *testing.T) (*juiceFS, *metadata.Store, string) {
 		pin.ResetFUSEIdentityForTest()
 	})
 	t.Setenv("JM_ASYNC_DIR_REFRESH", "1")
+
+	// The refresh draws its readdir and child stats from these process-wide
+	// gates. A slot still held by an earlier test's background goroutine
+	// (it releases when its FUSE call returns) would turn this test's stats
+	// into gate timeouts, so start only once they are free.
+	if !pollUntil(t, 5*time.Second, gatesQuiescent) {
+		t.Fatalf("FUSE gates not quiescent: prefetchGate=%d nfsLstatGate=%d", len(prefetchGate), len(nfsLstatGate))
+	}
 
 	fuseRoot := t.TempDir()
 	dbPath := filepath.Join(t.TempDir(), "meta.db")
@@ -84,6 +99,20 @@ func mirrorHasChildren(store *metadata.Store, dir string) func() bool {
 	}
 }
 
+// mirrorHasNChildren waits for a finished publication. The refresh publishes
+// rows to the RAM mirror one at a time, so "some children" can be observed
+// before the last one lands.
+func mirrorHasNChildren(store *metadata.Store, dir string, n int) func() bool {
+	return func() bool {
+		kids, _ := store.ListChildren(dir)
+		return len(kids) == n
+	}
+}
+
+func gatesQuiescent() bool {
+	return len(prefetchGate) == 0 && len(nfsLstatGate) == 0
+}
+
 func inFlightEmpty(h *JuiceMountHandler) func() bool {
 	return func() bool {
 		h.dirRefreshMu.Lock()
@@ -107,12 +136,12 @@ func TestAsyncDirRefreshPopulatesStore(t *testing.T) {
 		t.Fatalf("first ReadDir of unmirrored dir = %d entries, want 0 (mirror answer served immediately)", len(infos))
 	}
 
-	if !pollUntil(t, 3*time.Second, mirrorHasChildren(store, "d")) {
-		t.Fatal("async refresh never landed children in the mirror")
-	}
-	kids, _ := store.ListChildren("d")
-	if len(kids) != 2 {
+	if !pollUntil(t, 3*time.Second, mirrorHasNChildren(store, "d", 2)) {
+		kids, _ := store.ListChildren("d")
 		t.Fatalf("mirror children = %d, want 2", len(kids))
+	}
+	if !pollUntil(t, 3*time.Second, inFlightEmpty(jfs.handler)) {
+		t.Fatal("refresh worker never finished")
 	}
 
 	// The NEXT readdir serves from the mirror.
@@ -366,9 +395,12 @@ func TestInfoWithTimeoutWedgedStat(t *testing.T) {
 	gate := make(chan struct{}, 1)
 	de := &blockingDirEntry{name: "wedged.mov", release: make(chan struct{})}
 
-	_, _, ok := infoWithTimeout(metrics.FUSESrcDirRefresh, de, 50*time.Millisecond, gate)
+	_, _, ok, parked := infoWithTimeout(metrics.FUSESrcDirRefresh, de, 50*time.Millisecond, 50*time.Millisecond, gate)
 	if ok {
 		t.Fatal("wedged Info() must report ok=false")
+	}
+	if parked == nil {
+		t.Fatal("a timed-out stat must return its parked channel")
 	}
 	// The parked worker holds the gate slot until the stat returns…
 	select {
@@ -390,6 +422,11 @@ func TestInfoWithTimeoutWedgedStat(t *testing.T) {
 	}) {
 		t.Fatal("gate slot never released after the wedged Info() returned")
 	}
+	select {
+	case <-parked:
+	case <-time.After(2 * time.Second):
+		t.Fatal("parked channel not closed after the wedged Info() returned")
+	}
 }
 
 // TestInfoWithTimeoutCompletes: the healthy path returns the FileInfo.
@@ -403,8 +440,8 @@ func TestInfoWithTimeoutCompletes(t *testing.T) {
 		t.Fatalf("ReadDir: %v (%d entries)", err, len(ents))
 	}
 	gate := make(chan struct{}, 1)
-	fi, ierr, ok := infoWithTimeout(metrics.FUSESrcDirRefresh, ents[0], 2*time.Second, gate)
-	if !ok || ierr != nil || fi == nil || fi.Name() != "a.txt" {
+	fi, ierr, ok, parked := infoWithTimeout(metrics.FUSESrcDirRefresh, ents[0], 2*time.Second, 2*time.Second, gate)
+	if !ok || ierr != nil || fi == nil || fi.Name() != "a.txt" || parked != nil {
 		t.Fatalf("infoWithTimeout = (%v, %v, ok=%v), want a.txt info", fi, ierr, ok)
 	}
 }
@@ -413,9 +450,9 @@ func TestInfoWithTimeoutCompletes(t *testing.T) {
 // (JM_COLD_LIST_FANOUT=0 ⇒ K=1, serial), one wedged child must ABANDON the
 // listing pass — entries behind the wedge are never stat'd — so a U7 worker
 // always returns promptly and its deferred dirRefreshSem/singleflight release
-// runs. The partial toInsert is kept (insert-only; the next readdir re-fires
-// the refresh). This is the serial kill-switch contract; the parallel
-// contract is TestColdDirListingParallelWedgeCompletes.
+// runs. The pass reports itself incomplete, with the parked stat, so callers
+// record the folder for a later re-list. This is the serial kill-switch contract; the parallel contract is
+// TestColdDirListingParallelWedgeCompletes.
 func TestColdDirListingBreaksOnWedgedStat(t *testing.T) {
 	jfs, _, fuseRoot := newDirRefreshHarness(t)
 	t.Setenv("JM_COLD_LIST_FANOUT", "0") // force serial break semantics
@@ -436,12 +473,16 @@ func TestColdDirListingBreaksOnWedgedStat(t *testing.T) {
 	entries := []os.DirEntry{real[0], wedged, real[1]}
 
 	gate := make(chan struct{}, 4)
-	infos, toInsert := jfs.coldDirListing(metrics.FUSESrcDirRefresh, "d", entries, gate)
+	l := jfs.coldDirListing(metrics.FUSESrcDirRefresh, "d", entries, gate)
+	infos, toInsert := l.infos, l.toInsert
+	if l.complete || len(l.parked) != 1 {
+		t.Fatalf("pass over a wedged stat: complete=%v parked=%d, want false/1", l.complete, len(l.parked))
+	}
 	if len(infos) != 1 || infos[0].Name() != "a.txt" {
 		t.Fatalf("infos = %d entries, want only a.txt (break on wedge — no stats issued past it)", len(infos))
 	}
 	if len(toInsert) != 1 || toInsert[0].Path != "d/a.txt" {
-		t.Fatalf("toInsert = %d entries, want only d/a.txt (partial insert is safe)", len(toInsert))
+		t.Fatalf("toInsert = %d entries, want only d/a.txt", len(toInsert))
 	}
 }
 
@@ -472,8 +513,12 @@ func TestColdDirListingParallelWedgeCompletes(t *testing.T) {
 
 	gate := make(chan struct{}, 8)
 	start := time.Now()
-	infos, toInsert := jfs.coldDirListing(metrics.FUSESrcDirRefresh, "d", entries, gate)
+	l := jfs.coldDirListing(metrics.FUSESrcDirRefresh, "d", entries, gate)
+	infos, toInsert := l.infos, l.toInsert
 	elapsed := time.Since(start)
+	if l.complete {
+		t.Fatal("a pass with a dropped (wedged) child reported complete")
+	}
 
 	// Must not hang: bounded by ~fuseStatTimeout (50ms) plus scheduling slack.
 	if elapsed > 2*time.Second {
@@ -492,6 +537,440 @@ func TestColdDirListingParallelWedgeCompletes(t *testing.T) {
 	}
 	if len(toInsert) != 2 {
 		t.Fatalf("toInsert = %d entries, want 2 (both healthy children)", len(toInsert))
+	}
+}
+
+// wedgeChild makes the first `passes` cold listing passes that list the named
+// child see it as a DirEntry whose lstat does not return until release, so
+// those passes end incomplete at the fuseStatTimeout bound. Call it BEFORE
+// newDirRefreshHarness so its cleanup runs after the handler has stopped. It
+// returns the number of passes that saw the wedge, and a release for every
+// parked stat.
+func wedgeChild(t *testing.T, name string, passes int32) (wedged func() int32, release func()) {
+	t.Helper()
+	var used atomic.Int32
+	gate := make(chan struct{})
+	var once sync.Once
+	release = func() { once.Do(func() { close(gate) }) }
+	prev := coldListingEntriesHook
+	coldListingEntriesHook = func(dir string, entries []os.DirEntry) []os.DirEntry {
+		if prev != nil {
+			entries = prev(dir, entries)
+		}
+		out := make([]os.DirEntry, len(entries))
+		copy(out, entries)
+		for i, e := range entries {
+			if e.Name() != name {
+				continue
+			}
+			if n := used.Add(1); n > passes {
+				used.Add(-1)
+				break
+			}
+			out[i] = &blockingDirEntry{name: name, release: gate}
+		}
+		return out
+	}
+	t.Cleanup(func() {
+		release()
+		coldListingEntriesHook = prev
+		if !pollUntil(t, 5*time.Second, gatesQuiescent) {
+			t.Error("wedged stat never released its gate slot")
+		}
+	})
+	return used.Load, release
+}
+
+// slowDirEntry answers its lstat after a fixed delay: a high-latency link.
+type slowDirEntry struct {
+	os.DirEntry
+	delay time.Duration
+}
+
+func (s slowDirEntry) Info() (os.FileInfo, error) {
+	time.Sleep(s.delay)
+	return s.DirEntry.Info()
+}
+
+// errDirEntry fails its lstat with err.
+type errDirEntry struct {
+	name string
+	err  error
+}
+
+func (e errDirEntry) Name() string               { return e.name }
+func (e errDirEntry) IsDir() bool                { return false }
+func (e errDirEntry) Type() os.FileMode          { return 0 }
+func (e errDirEntry) Info() (os.FileInfo, error) { return nil, e.err }
+
+func forceLinkClass(t *testing.T, c netprofile.LinkClass) {
+	t.Helper()
+	netprofile.Default().ForceClass(&c)
+	t.Cleanup(func() { netprofile.Default().ForceClass(nil) })
+}
+
+// fastRetry shortens the incomplete-listing backoff. Call before the harness.
+func fastRetry(t *testing.T) {
+	t.Helper()
+	prev := dirListingRetryBase
+	dirListingRetryBase = 20 * time.Millisecond
+	t.Cleanup(func() { dirListingRetryBase = prev })
+}
+
+func sortedNames(infos []os.FileInfo) []string {
+	names := make([]string, 0, len(infos))
+	for _, fi := range infos {
+		names = append(names, fi.Name())
+	}
+	sort.Strings(names)
+	return names
+}
+
+func wantNames(t *testing.T, what string, infos []os.FileInfo, want ...string) {
+	t.Helper()
+	got := sortedNames(infos)
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("%s = %v, want %v", what, got, want)
+	}
+}
+
+func dirRecorded(h *JuiceMountHandler, dir string) bool {
+	h.dirRefreshMu.Lock()
+	defer h.dirRefreshMu.Unlock()
+	return h.dirIncomplete[dir] != nil
+}
+
+// TestAsyncDirRefreshIncompletePassRelists: a refresh that ends incomplete
+// on a hung child publishes what it reached and records the folder. Its next
+// readdirs serve those rows but do not re-list while the hung stat still
+// holds a gate slot; once it returns, a readdir re-lists the folder on a
+// slow link (which has no speculative re-read), the full listing lands, the
+// record clears and the folder's mtime moves so the client re-reads it.
+func TestAsyncDirRefreshIncompletePassRelists(t *testing.T) {
+	forceLinkClass(t, netprofile.ClassSlow)
+	fastRetry(t)
+	wedged, release := wedgeChild(t, "b.txt", 1)
+	jfs, store, fuseRoot := newDirRefreshHarness(t)
+	h := jfs.handler
+	mkFUSEDir(t, fuseRoot, "d", "a.txt", "b.txt", "c.txt")
+
+	if infos, err := jfs.ReadDir("d"); err != nil || len(infos) != 0 {
+		t.Fatalf("cold ReadDir = %d entries, %v; want 0 (async)", len(infos), err)
+	}
+	if !pollUntil(t, 5*time.Second, inFlightEmpty(h)) {
+		t.Fatal("incomplete refresh never released its singleflight key")
+	}
+	if wedged() != 1 {
+		t.Fatal("the refresh never listed the wedged child (test inconclusive)")
+	}
+	if kids, _ := store.ListChildren("d"); len(kids) != 2 {
+		t.Fatalf("mirror children after incomplete pass = %d, want 2 (a.txt, c.txt published)", len(kids))
+	}
+	if !dirRecorded(h, "d") {
+		t.Fatal("incomplete pass did not record the folder")
+	}
+
+	// The hung stat still holds its slot: readdirs serve the rows and must not
+	// start another pass, however long Finder keeps asking.
+	for i := 0; i < 3; i++ {
+		time.Sleep(3 * dirListingRetryBase)
+		infos, err := jfs.ReadDir("d")
+		if err != nil {
+			t.Fatal(err)
+		}
+		wantNames(t, "ReadDir while the stat is parked", infos, "a.txt", "c.txt")
+		if !inFlightEmpty(h)() {
+			t.Fatal("re-listed the folder while its earlier stat still holds a gate slot")
+		}
+	}
+	if n := len(prefetchGate); n != 1 {
+		t.Fatalf("prefetchGate occupancy = %d, want 1 (one slot per hung child)", n)
+	}
+
+	before := store.DirectoryVisibilityMtime("d", time.Time{})
+	release()
+	if !pollUntil(t, 5*time.Second, gatesQuiescent) {
+		t.Fatal("released stat never freed its slot")
+	}
+	time.Sleep(3 * dirListingRetryBase)
+	if _, err := jfs.ReadDir("d"); err != nil {
+		t.Fatal(err)
+	}
+	if !pollUntil(t, 5*time.Second, mirrorHasNChildren(store, "d", 3)) {
+		kids, _ := store.ListChildren("d")
+		t.Fatalf("mirror children = %d, want 3 (folder not re-listed)", len(kids))
+	}
+	if !pollUntil(t, 5*time.Second, inFlightEmpty(h)) {
+		t.Fatal("re-list never finished")
+	}
+	if dirRecorded(h, "d") {
+		t.Fatal("complete pass did not clear the record")
+	}
+	if after := store.DirectoryVisibilityMtime("d", time.Time{}); !after.After(before) {
+		t.Fatalf("directory mtime not advanced by the completing pass (%v -> %v)", before, after)
+	}
+	infos, err := jfs.ReadDir("d")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantNames(t, "ReadDir after re-list", infos, "a.txt", "b.txt", "c.txt")
+}
+
+// TestHungChildDoesNotStarveOtherFolders: a child whose stat never returns
+// costs one prefetchGate slot. Re-reading its folder must not park another
+// slot per readdir, or the 2-slot background gate fills and every other
+// unloaded folder stays empty.
+func TestHungChildDoesNotStarveOtherFolders(t *testing.T) {
+	forceLinkClass(t, netprofile.ClassSlow)
+	fastRetry(t)
+	_, _ = wedgeChild(t, "b.txt", 1<<30) // hung for the whole test
+	jfs, store, fuseRoot := newDirRefreshHarness(t)
+	h := jfs.handler
+	mkFUSEDir(t, fuseRoot, "hung", "a.txt", "b.txt")
+	mkFUSEDir(t, fuseRoot, "other", "x.txt", "y.txt")
+
+	for i := 0; i < 4; i++ {
+		if _, err := jfs.ReadDir("hung"); err != nil {
+			t.Fatal(err)
+		}
+		if !pollUntil(t, 5*time.Second, inFlightEmpty(h)) {
+			t.Fatal("refresh of the hung folder never returned")
+		}
+		time.Sleep(3 * dirListingRetryBase)
+	}
+	if n := len(prefetchGate); n != 1 {
+		t.Fatalf("prefetchGate occupancy after 4 readdirs of the hung folder = %d, want 1", n)
+	}
+
+	if _, err := jfs.ReadDir("other"); err != nil {
+		t.Fatal(err)
+	}
+	if !pollUntil(t, 5*time.Second, mirrorHasNChildren(store, "other", 2)) {
+		kids, _ := store.ListChildren("other")
+		t.Fatalf("other folder mirrored %d of 2 children: the hung child starved it", len(kids))
+	}
+	if !pollUntil(t, 5*time.Second, inFlightEmpty(h)) {
+		t.Fatal("refresh of the other folder never finished")
+	}
+}
+
+// TestSlowLinkLargeFolderCompletes: at 250 ms per stat on a slow link, a
+// 30-child folder must complete in one pass. The per-stat budget used to
+// include the wait for one of prefetchGate's 2 slots behind the pass's own
+// 8-wide fan-out, so stats past the first few always timed out.
+func TestSlowLinkLargeFolderCompletes(t *testing.T) {
+	forceLinkClass(t, netprofile.ClassSlow)
+	prev := coldListingEntriesHook
+	coldListingEntriesHook = func(_ string, entries []os.DirEntry) []os.DirEntry {
+		out := make([]os.DirEntry, len(entries))
+		for i, e := range entries {
+			out[i] = slowDirEntry{DirEntry: e, delay: 250 * time.Millisecond}
+		}
+		return out
+	}
+	t.Cleanup(func() { coldListingEntriesHook = prev })
+	jfs, store, fuseRoot := newDirRefreshHarness(t)
+	h := jfs.handler
+	names := make([]string, 30)
+	for i := range names {
+		names[i] = fmt.Sprintf("clip%02d.mov", i)
+	}
+	mkFUSEDir(t, fuseRoot, "big", names...)
+
+	if _, err := jfs.ReadDir("big"); err != nil {
+		t.Fatal(err)
+	}
+	if !pollUntil(t, 20*time.Second, inFlightEmpty(h)) {
+		t.Fatal("refresh never finished")
+	}
+	if kids, _ := store.ListChildren("big"); len(kids) != 30 {
+		t.Fatalf("mirror children after one slow-link pass = %d, want 30", len(kids))
+	}
+	if dirRecorded(h, "big") {
+		t.Fatal("a complete slow-link pass was recorded as incomplete")
+	}
+}
+
+// TestColdDirListingOnlyGoneIsBenign: a child deleted between the readdir and
+// its lstat (ENOENT, ENOTDIR) is simply gone; any other stat error leaves an
+// existing child out, so the pass is incomplete.
+func TestColdDirListingOnlyGoneIsBenign(t *testing.T) {
+	jfs, _, fuseRoot := newDirRefreshHarness(t)
+	mkFUSEDir(t, fuseRoot, "d", "a.txt")
+	real, err := os.ReadDir(filepath.Join(fuseRoot, "d"))
+	if err != nil || len(real) != 1 {
+		t.Fatalf("ReadDir: %v (%d entries)", err, len(real))
+	}
+	for _, tc := range []struct {
+		err      error
+		complete bool
+	}{
+		{&fs.PathError{Op: "lstat", Path: "x", Err: syscall.ENOENT}, true},
+		{&fs.PathError{Op: "lstat", Path: "x", Err: syscall.ENOTDIR}, true},
+		{&fs.PathError{Op: "lstat", Path: "x", Err: syscall.EIO}, false},
+		{&fs.PathError{Op: "lstat", Path: "x", Err: syscall.EACCES}, false},
+	} {
+		entries := []os.DirEntry{real[0], errDirEntry{name: "x", err: tc.err}}
+		l := jfs.coldDirListing(metrics.FUSESrcDirRefresh, "d", entries, make(chan struct{}, 2))
+		if l.complete != tc.complete {
+			t.Errorf("stat error %v: complete = %v, want %v", tc.err, l.complete, tc.complete)
+		}
+		wantNames(t, fmt.Sprintf("infos with %v", tc.err), l.infos, "a.txt")
+	}
+}
+
+// TestSyncColdPopulateIncompletePass: on a fast link the first readdir waits
+// for the refresh. An incomplete pass answers empty (not a partial listing)
+// but publishes what it reached; once the hung stat returns, the next readdir
+// re-lists within its wait and serves the full folder.
+func TestSyncColdPopulateIncompletePass(t *testing.T) {
+	forceLinkClass(t, netprofile.ClassFast)
+	fastRetry(t)
+	wedged, release := wedgeChild(t, "b.txt", 1)
+	jfs, store, fuseRoot := newDirRefreshHarness(t)
+	t.Setenv("JM_SYNC_COLD_POPULATE", "1")
+	// Not a latency test: wait for the whole pass, wedge included.
+	prevTimeout := syncColdPopulateTimeout
+	syncColdPopulateTimeout = 30 * time.Second
+	t.Cleanup(func() { syncColdPopulateTimeout = prevTimeout })
+	mkFUSEDir(t, fuseRoot, "d", "a.txt", "b.txt", "c.txt")
+
+	infos, err := jfs.ReadDir("d")
+	if err != nil {
+		t.Fatalf("ReadDir: %v", err)
+	}
+	if wedged() != 1 {
+		t.Fatal("the refresh never listed the wedged child (test inconclusive)")
+	}
+	if len(infos) != 0 {
+		t.Fatalf("fast-link ReadDir over an incomplete pass = %v, want empty", sortedNames(infos))
+	}
+	if !pollUntil(t, 5*time.Second, inFlightEmpty(jfs.handler)) {
+		t.Fatal("incomplete refresh never released its singleflight key")
+	}
+	if kids, _ := store.ListChildren("d"); len(kids) != 2 {
+		t.Fatalf("mirror children after incomplete pass = %d, want 2", len(kids))
+	}
+
+	release()
+	if !pollUntil(t, 5*time.Second, gatesQuiescent) {
+		t.Fatal("released stat never freed its slot")
+	}
+	time.Sleep(3 * dirListingRetryBase)
+	infos, err = jfs.ReadDir("d")
+	if err != nil {
+		t.Fatalf("ReadDir after recovery: %v", err)
+	}
+	wantNames(t, "fast-link ReadDir after recovery", infos, "a.txt", "b.txt", "c.txt")
+}
+
+// TestForegroundColdListingIncompletePass: with the async refresh switched
+// off, the foreground fallback returns what an incomplete pass reached
+// (failing the RPC would make a hard mount retry it forever) and records the
+// folder, so a later readdir re-lists it.
+func TestForegroundColdListingIncompletePass(t *testing.T) {
+	forceLinkClass(t, netprofile.ClassSlow)
+	fastRetry(t)
+	wedged, release := wedgeChild(t, "b.txt", 1)
+	jfs, store, fuseRoot := newDirRefreshHarness(t)
+	t.Setenv("JM_ASYNC_DIR_REFRESH", "0")
+	mkFUSEDir(t, fuseRoot, "d", "a.txt", "b.txt", "c.txt")
+
+	infos, err := jfs.ReadDir("d")
+	if wedged() != 1 {
+		t.Fatal("the foreground listing never saw the wedged child (test inconclusive)")
+	}
+	if err != nil {
+		t.Fatalf("foreground ReadDir over an incomplete pass: %v, want the partial listing", err)
+	}
+	wantNames(t, "foreground ReadDir over an incomplete pass", infos, "a.txt", "c.txt")
+	if !dirRecorded(jfs.handler, "d") {
+		t.Fatal("incomplete foreground pass did not record the folder")
+	}
+
+	release()
+	if !pollUntil(t, 5*time.Second, gatesQuiescent) {
+		t.Fatal("released stat never freed its slot")
+	}
+	time.Sleep(3 * dirListingRetryBase)
+	if _, err := jfs.ReadDir("d"); err != nil {
+		t.Fatal(err)
+	}
+	if !pollUntil(t, 5*time.Second, mirrorHasNChildren(store, "d", 3)) {
+		kids, _ := store.ListChildren("d")
+		t.Fatalf("mirror children = %d, want 3 (folder not re-listed)", len(kids))
+	}
+	if !pollUntil(t, 5*time.Second, inFlightEmpty(jfs.handler)) {
+		t.Fatal("re-list never finished")
+	}
+	infos, err = jfs.ReadDir("d")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantNames(t, "ReadDir after re-list", infos, "a.txt", "b.txt", "c.txt")
+}
+
+// TestSingleRowInsertRelistsFolder: a Stat or ToHandle cache miss inserts
+// one row. Into a folder with no rows, READDIR would serve that row as the
+// whole folder (Premiere resolving a project's media). The folder is
+// recorded, so on a slow link its next readdir re-lists it.
+func TestSingleRowInsertRelistsFolder(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		insert func(jfs *juiceFS, p string)
+	}{
+		{"Stat", func(jfs *juiceFS, p string) {
+			if _, err := jfs.Stat(p); err != nil {
+				t.Fatalf("Stat(%s): %v", p, err)
+			}
+		}},
+		{"ToHandle", func(jfs *juiceFS, p string) {
+			if jfs.handler.ToHandle(jfs, strings.Split(p, "/")) == nil {
+				t.Fatalf("ToHandle(%s) = nil", p)
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			forceLinkClass(t, netprofile.ClassSlow)
+			jfs, store, fuseRoot := newDirRefreshHarness(t)
+			mkFUSEDir(t, fuseRoot, "proj/media", "clip1.mov", "clip2.mov", "clip3.mov")
+
+			tc.insert(jfs, "proj/media/clip1.mov")
+			if !pollUntil(t, 5*time.Second, mirrorHasNChildren(store, "proj/media", 1)) {
+				t.Fatal("the cache miss did not insert its row (test inconclusive)")
+			}
+			if _, err := jfs.ReadDir("proj/media"); err != nil {
+				t.Fatal(err)
+			}
+			if !pollUntil(t, 5*time.Second, mirrorHasNChildren(store, "proj/media", 3)) {
+				kids, _ := store.ListChildren("proj/media")
+				t.Fatalf("mirror children = %d, want 3 (the one-row folder was never listed)", len(kids))
+			}
+			if !pollUntil(t, 5*time.Second, inFlightEmpty(jfs.handler)) {
+				t.Fatal("listing never finished")
+			}
+			infos, err := jfs.ReadDir("proj/media")
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantNames(t, "ReadDir after the listing", infos, "clip1.mov", "clip2.mov", "clip3.mov")
+		})
+	}
+}
+
+// TestSingleRowInsertIntoListedFolderNotRecorded: a cache-miss insert into a
+// folder that already has rows records nothing (no extra FUSE listing).
+func TestSingleRowInsertIntoListedFolderNotRecorded(t *testing.T) {
+	jfs, store, fuseRoot := newDirRefreshHarness(t)
+	mkFUSEDir(t, fuseRoot, "d", "a.txt", "b.txt")
+	if err := store.Insert(metadata.MakeEntry("d/a.txt", false, 1, time.Now(), 4242)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := jfs.Stat("d/b.txt"); err != nil {
+		t.Fatal(err)
+	}
+	if dirRecorded(jfs.handler, "d") {
+		t.Fatal("insert into a folder with rows recorded it as unlisted")
 	}
 }
 
