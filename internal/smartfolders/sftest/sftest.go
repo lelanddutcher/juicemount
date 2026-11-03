@@ -294,6 +294,14 @@ func Run(t *testing.T, newFixture func(t *testing.T) Fixture) {
 	}
 }
 
+// caseInsensitive reports whether the fixture's filesystem folds case.
+func caseInsensitive(t *testing.T, fx Fixture) bool {
+	t.Helper()
+	files(t, fx, "CaseProbe/probe")
+	defer fx.Remove(t, "CaseProbe/probe")
+	return exists(fx, "CaseProbe/PROBE")
+}
+
 func files(t *testing.T, fx Fixture, ps ...string) {
 	for _, p := range ps {
 		fx.WriteFile(t, p)
@@ -581,6 +589,21 @@ func testRefusesForbiddenTargets(t *testing.T, fx Fixture) {
 	if len(res.Refused) != 5 || !reflect.DeepEqual(res.Removed, []string{"good.mov"}) {
 		t.Fatalf("names: %+v", res)
 	}
+	// GOOD.MOV replaces good.mov. A case-sensitive volume (JuiceFS, every
+	// production backend) does that in one pass. On a case-insensitive test
+	// filesystem (APFS) the old link still holds the name while GOOD.MOV is
+	// placed, so it is refused as taken, nothing is overwritten, and the next
+	// pass places it.
+	if caseInsensitive(t, fx) {
+		if len(res.Created) != 0 {
+			t.Fatalf("case-insensitive pass created %v", res.Created)
+		}
+		res = g.reconcile(t, "Proj", link("GOOD.MOV", "Proj/a.mov"))
+	}
+	if !reflect.DeepEqual(res.Created, []string{"GOOD.MOV"}) {
+		t.Fatalf("GOOD.MOV not placed: %+v", res)
+	}
+	assertView(t, fx, "Recents/Proj", map[string]string{"GOOD.MOV": "Proj/a.mov"})
 	for _, folder := range []string{"", ".x", "a/b", "Recents"} {
 		if _, err := g.rec.Reconcile(folder, nil); !errors.Is(err, smartfolders.ErrBadView) {
 			t.Errorf("folder %q: err = %v", folder, err)
