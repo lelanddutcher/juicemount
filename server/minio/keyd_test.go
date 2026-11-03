@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -885,13 +886,33 @@ func TestKeydSwitchIsStrictAndSeparateFromManager(t *testing.T) {
 type keydLoop struct {
 	r    *keydRig
 	cmd  *exec.Cmd
-	out  *strings.Builder
+	out  *keydOutput
 	done chan error
+}
+
+// keydOutput collects keyd's output. exec copies it from a pipe on its own
+// goroutine until every holder of the pipe exits, and the test reads it while
+// keyd runs and on timeout paths, so access is locked.
+type keydOutput struct {
+	mu sync.Mutex
+	b  strings.Builder
+}
+
+func (o *keydOutput) Write(p []byte) (int, error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.b.Write(p)
+}
+
+func (o *keydOutput) String() string {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.b.String()
 }
 
 func (r *keydRig) startLoop(env ...string) *keydLoop {
 	r.t.Helper()
-	l := &keydLoop{r: r, out: &strings.Builder{}, done: make(chan error, 1)}
+	l := &keydLoop{r: r, out: &keydOutput{}, done: make(chan error, 1)}
 	l.cmd = exec.Command(keydBash(r.t), "keyd.sh")
 	l.cmd.Stdout, l.cmd.Stderr = l.out, l.out
 	l.cmd.Env = append([]string{
@@ -948,10 +969,40 @@ func (l *keydLoop) stop(limit time.Duration) time.Duration {
 			l.r.t.Fatalf("keyd exit: %v\n%s", err, l.out.String())
 		}
 	case <-time.After(limit):
+		// Record what keyd was doing before the kill: whether the TERM is
+		// pending, blocked or ignored, where it sleeps, and its children.
+		state := keydProcState(l.cmd.Process.Pid)
 		_ = l.cmd.Process.Kill()
-		l.r.t.Fatalf("keyd did not exit within %v of TERM:\n%s", limit, l.out.String())
+		select {
+		case <-l.done: // exec has copied all output
+		case <-time.After(limit):
+		}
+		l.r.t.Fatalf("keyd did not exit within %v of TERM:\n%s\nkeyd process state at the deadline:\n%s", limit, l.out.String(), state)
 	}
 	return time.Since(start)
+}
+
+// keydProcState reports a live keyd's signal masks, wait channel and
+// children from /proc (Linux; empty elsewhere).
+func keydProcState(pid int) string {
+	var b strings.Builder
+	status, _ := os.ReadFile(fmt.Sprintf("/proc/%d/status", pid))
+	for _, line := range strings.Split(string(status), "\n") {
+		if strings.HasPrefix(line, "State") || strings.HasPrefix(line, "Sig") || strings.HasPrefix(line, "ShdPnd") {
+			b.WriteString(line + "\n")
+		}
+	}
+	wchan, _ := os.ReadFile(fmt.Sprintf("/proc/%d/wchan", pid))
+	b.WriteString("wchan: " + string(wchan) + "\n")
+	lists, _ := filepath.Glob(fmt.Sprintf("/proc/%d/task/*/children", pid))
+	for _, list := range lists {
+		children, _ := os.ReadFile(list)
+		for _, child := range strings.Fields(string(children)) {
+			cmdline, _ := os.ReadFile("/proc/" + child + "/cmdline")
+			b.WriteString("child " + child + ": " + strings.ReplaceAll(string(cmdline), "\x00", " ") + "\n")
+		}
+	}
+	return b.String()
 }
 
 // desiredDoc is the shape the Manager (L2) marshals; Label and Note stand
