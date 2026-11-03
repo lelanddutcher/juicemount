@@ -8,9 +8,11 @@
 # It also includes stage-birth and enforcing-lease prerequisites, and the
 # entrypoint that keeps person grants (principals format 2, including
 # restrict_unassigned) and configures the lazy, retained audit log, with
-# every dir-stat and quota row under the person-grant check.
+# every dir-stat and quota row under the person-grant check, the quota usage
+# above a person's grants bounded by their Mac's own reported usage, integer
+# values only in the accounting hashes, and capped audit records.
 #
 # Bump after changes to internal/respproxy or server/respproxy/entrypoint.sh.
 # TestH8BGateCoversEntrypointHandshake checks ancestry with full Git history.
 # A squash or rebase requires a new pin to the resulting release-line commit.
-215875300582b84c51cbfb945027f37c43863e1d
+349ac880685c8bf2234c04901097bdfd9b00a49c
