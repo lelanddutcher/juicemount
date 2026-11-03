@@ -23,6 +23,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/lelanddutcher/juicemount/internal/linkconfig"
@@ -41,10 +42,67 @@ type LinkStatus struct {
 	RemoteReady      bool   `json:"remote_ready"`
 	LANOnly          bool   `json:"lan_only"`
 	ServerURL        string `json:"server_url,omitempty"`
-	Error            string `json:"error,omitempty"`
+	// Exposure is how the embedded NAS node serves JuiceMount: "services"
+	// (tailnet listeners for the JuiceMount ports only) or "subnet" (the
+	// legacy LAN route, selected by setting JM_NET_NAS_ROUTE).
+	Exposure      string               `json:"exposure,omitempty"`
+	PolicyManaged bool                 `json:"policy_managed"`
+	Headscale     *LinkComponentStatus `json:"headscale,omitempty"`
+	NASNode       *LinkComponentStatus `json:"nas_node,omitempty"`
+	Error         string               `json:"error,omitempty"`
 }
 
-const embeddedHeadscaleHealthAddr = "127.0.0.1:8091"
+// LinkComponentStatus is a supervised Link component's live state as
+// reported by the process that runs it (cmd/juicemount-manager).
+type LinkComponentStatus struct {
+	// State is starting, running, backoff or stopped.
+	State     string    `json:"state"`
+	Detail    string    `json:"detail,omitempty"`
+	LastError string    `json:"last_error,omitempty"`
+	Restarts  int       `json:"restarts"`
+	Since     time.Time `json:"since"`
+	NextRetry time.Time `json:"next_retry,omitempty"`
+}
+
+// LinkRuntimeStatus is the supervisors' snapshot. A nil component means
+// this process does not run it.
+type LinkRuntimeStatus struct {
+	Headscale *LinkComponentStatus
+	NASNode   *LinkComponentStatus
+}
+
+var (
+	linkRuntimeMu sync.RWMutex
+	linkRuntime   func() LinkRuntimeStatus
+)
+
+// SetLinkRuntimeStatus installs the supervisors' status source for
+// GET /api/net/link. Passing nil removes it.
+func SetLinkRuntimeStatus(fn func() LinkRuntimeStatus) {
+	linkRuntimeMu.Lock()
+	linkRuntime = fn
+	linkRuntimeMu.Unlock()
+}
+
+func currentLinkRuntime() (LinkRuntimeStatus, bool) {
+	linkRuntimeMu.RLock()
+	fn := linkRuntime
+	linkRuntimeMu.RUnlock()
+	if fn == nil {
+		return LinkRuntimeStatus{}, false
+	}
+	return fn(), true
+}
+
+// LinkSubnetRoute returns the legacy subnet route the NAS node advertises,
+// or "" for the default service exposure. Only an explicit JM_NET_NAS_ROUTE
+// selects the subnet path: a guessed default LAN is wrong on most networks
+// and fails silently.
+func LinkSubnetRoute() string { return strings.TrimSpace(os.Getenv("JM_NET_NAS_ROUTE")) }
+
+// embeddedHeadscaleHealthAddr is a var only so tests can point it at their own
+// listener.
+var embeddedHeadscaleHealthAddr = "127.0.0.1:8091"
 
 // PairRequest is accepted by POST /api/net/pair (empty body is fine).
 type PairRequest struct{}
@@ -66,10 +124,13 @@ func (a *API) handleLinkStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	status := LinkStatus{
-		Enabled:     true,
-		ServerURL:   url,
-		RemoteReady: linkconfig.RemoteReady(url),
+		Enabled:       true,
+		ServerURL:     url,
+		RemoteReady:   linkconfig.RemoteReady(url),
+		PolicyManaged: LinkPolicyManaged(headscaleConfig()),
 	}
+	runtime, haveRuntime := currentLinkRuntime()
+	status.Headscale, status.NASNode = runtime.Headscale, runtime.NASNode
 	if parsed, err := linkconfig.ParseServerURL(url); err == nil {
 		status.LANOnly = linkconfig.HostIsLANOnly(parsed.Hostname())
 	}
@@ -85,7 +146,7 @@ func (a *API) handleLinkStatus(w http.ResponseWriter, r *http.Request) {
 	if os.Getenv("JM_NET_HEADSCALE") == "on" {
 		conn, err := net.DialTimeout("tcp", embeddedHeadscaleHealthAddr, 250*time.Millisecond)
 		if err != nil {
-			status.Error = "Headscale is configured but not ready: " + err.Error()
+			status.Error = "Headscale is configured but not ready: " + err.Error() + componentErrorSuffix(status.Headscale)
 			writeJSON(w, http.StatusOK, status)
 			return
 		}
@@ -93,11 +154,32 @@ func (a *API) handleLinkStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	status.ControlReady = true
 	status.RouteReady = true
-	if os.Getenv("JM_NET_NAS_NODE") == "on" || strings.TrimSpace(os.Getenv("JM_NET_NAS_ROUTE")) != "" {
-		ready, err := linkRouteReady(headscaleBin(), headscaleConfig(), envString("JM_NET_NAS_HOSTNAME", DefaultNasHostname), envString("JM_NET_NAS_ROUTE", NasLanSubnet))
+	if os.Getenv("JM_NET_HEADSCALE") == "on" && status.Headscale != nil && status.Headscale.State != "running" {
+		status.ControlReady = false
+		status.Error = "Headscale is " + status.Headscale.State + componentErrorSuffix(status.Headscale)
+	}
+	if route := LinkSubnetRoute(); route != "" {
+		status.Exposure = "subnet"
+		ready, err := linkRouteReady(headscaleBin(), headscaleConfig(), envString("JM_NET_NAS_HOSTNAME", DefaultNasHostname), route)
 		status.RouteReady = ready
-		if err != nil {
+		if err != nil && status.Error == "" {
 			status.Error = err.Error()
+		}
+	} else if os.Getenv("JM_NET_NAS_NODE") == "on" {
+		// Service exposure: the NAS node is the route. It is ready only once
+		// it has joined the tailnet and its service listeners are open.
+		status.Exposure = "services"
+		switch {
+		case !haveRuntime || status.NASNode == nil:
+			status.RouteReady = false
+			if status.Error == "" {
+				status.Error = "Link NAS node status is unavailable in this process"
+			}
+		case status.NASNode.State != "running":
+			status.RouteReady = false
+			if status.Error == "" {
+				status.Error = "Link NAS node is " + status.NASNode.State + componentErrorSuffix(status.NASNode)
+			}
 		}
 	}
 	status.RedisReady = probeLinkRedis(a.linkMetaURL)
@@ -119,6 +201,13 @@ func (a *API) handleLinkStatus(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, http.StatusOK, status)
+}
+
+func componentErrorSuffix(c *LinkComponentStatus) string {
+	if c == nil || c.LastError == "" {
+		return ""
+	}
+	return ": " + c.LastError
 }
 
 func probeLinkRedis(raw string) bool {
@@ -164,16 +253,115 @@ func linkConfigured() bool {
 		strings.TrimSpace(os.Getenv("JM_HEADSCALE_CONFIG")) != ""
 }
 
+// Link tags. Every key the Manager mints is tagged when it owns the
+// Headscale policy (LinkPolicyManaged), so the policy can say exactly which
+// devices reach which NAS services. A tag is control-assigned identity: a
+// node cannot claim one its key or the policy's tagOwners do not grant.
+const (
+	LinkTagMac  = "tag:jm-mac"
+	LinkTagNAS  = "tag:jm-nas"
+	LinkTagFarm = "tag:jm-farm"
+)
+
+// LinkUserName is the Headscale user every JuiceMount node registers under.
+// The embedded control server creates it; an external Headscale
+// (JM_HEADSCALE_CONFIG) may name it with JM_HEADSCALE_USER.
+func LinkUserName() string { return envString("JM_HEADSCALE_USER", "jm") }
+
+// LinkPolicyManaged reports whether the Manager generates and applies the
+// Headscale ACL policy: only for the embedded control server, unless the
+// operator opted out (JM_NET_POLICY=off) or the persisted config.yaml names
+// its own policy. An external Headscale's policy belongs to its operator, so
+// keys for it stay untagged as before.
+func LinkPolicyManaged(cfgPath string) bool {
+	if os.Getenv("JM_NET_HEADSCALE") != "on" || os.Getenv("JM_NET_POLICY") == "off" {
+		return false
+	}
+	raw, err := os.ReadFile(cfgPath)
+	if err != nil {
+		return true // not generated yet: the supervisor will manage it
+	}
+	return !HeadscaleConfigHasPolicy(string(raw))
+}
+
+// HeadscaleConfigHasPolicy reports whether config.yaml carries a top-level
+// policy stanza of its own.
+func HeadscaleConfigHasPolicy(cfg string) bool {
+	for _, line := range strings.Split(cfg, "\n") {
+		if strings.HasPrefix(line, "policy:") {
+			return true
+		}
+	}
+	return false
+}
+
 // PreauthKeyArgs builds the headscale CLI argument vector for minting a
-// preauth key. reusable=false produces a ONE-OFF key (T2.3 hardening): it
-// registers exactly one node and is then dead, so a leaked pairing code can
-// never be replayed to add a second machine.
-func PreauthKeyArgs(reusable bool) []string {
-	args := []string{"preauthkeys", "--user", "1", "create"}
+// preauth key for the user with ID userID (Headscale 0.26+ takes the numeric
+// ID, not the name; look it up with HeadscaleUserID). reusable=false produces
+// a ONE-OFF key (T2.3 hardening): it registers exactly one node and is then
+// dead, so a leaked pairing code can never be replayed to add a second
+// machine. tags, when non-empty, are assigned to the node at registration.
+func PreauthKeyArgs(userID uint64, reusable bool, tags []string) []string {
+	args := []string{"preauthkeys", "create", "--user", strconv.FormatUint(userID, 10)}
 	if reusable {
 		args = append(args, "--reusable")
 	}
+	if len(tags) > 0 {
+		args = append(args, "--tags", strings.Join(tags, ","))
+	}
 	return args
+}
+
+// HeadscaleUserID resolves a Headscale user name to its numeric ID. The ID
+// of the Link user is 1 only on a control server that never had another
+// user created first, which an operator's own Headscale need not be.
+func HeadscaleUserID(bin, config, name string) (uint64, error) {
+	out, err := exec.Command(bin, "--config", config, "users", "list", "-o", "json").Output()
+	if err != nil {
+		return 0, fmt.Errorf("headscale users list: %v", err)
+	}
+	return parseHeadscaleUserID(out, name)
+}
+
+func parseHeadscaleUserID(data []byte, name string) (uint64, error) {
+	var users []struct {
+		ID   json.Number `json:"id"`
+		Name string      `json:"name"`
+	}
+	if err := json.Unmarshal(data, &users); err != nil {
+		return 0, fmt.Errorf("parse headscale users list: %w", err)
+	}
+	for _, u := range users {
+		if u.Name != name {
+			continue
+		}
+		id, err := strconv.ParseUint(u.ID.String(), 10, 64)
+		if err != nil || id == 0 {
+			return 0, fmt.Errorf("headscale user %q has unusable id %q", name, u.ID.String())
+		}
+		return id, nil
+	}
+	return 0, fmt.Errorf("headscale user %q does not exist", name)
+}
+
+// MintPreauthKey mints one preauth key for the Link user. It never logs or
+// persists the returned credential.
+func MintPreauthKey(bin, config string, reusable bool, tags []string) (string, error) {
+	userID, err := HeadscaleUserID(bin, config, LinkUserName())
+	if err != nil {
+		return "", err
+	}
+	args := append([]string{"--config", config}, PreauthKeyArgs(userID, reusable, tags)...)
+	args = append(args, "--expiration", "1h")
+	out, err := exec.Command(bin, args...).CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("%v: %s", err, strings.TrimSpace(string(out)))
+	}
+	key := lastNonEmptyLine(string(out))
+	if key == "" {
+		return "", fmt.Errorf("headscale returned no pairing code")
+	}
+	return key, nil
 }
 
 // sanitizeDeviceName reduces a client-supplied ?device= hint to a safe,
@@ -230,7 +418,7 @@ func (a *API) handlePair(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	key, err := mintLinkPreauthKey(reusable)
+	key, err := mintLinkPreauthKey(reusable, LinkTagMac)
 	if err != nil {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "reusable": reusable, "error": err.Error()})
 		return
@@ -251,18 +439,14 @@ func (a *API) handlePair(w http.ResponseWriter, r *http.Request) {
 // mintLinkPreauthKey is shared by Mac pairing and Farm node enrollment. It
 // never logs or persists the returned one-time credential; callers must mark
 // their HTTP response no-store and show it only to an authenticated operator.
-func mintLinkPreauthKey(reusable bool) (string, error) {
-	args := append([]string{"--config", headscaleConfig()}, PreauthKeyArgs(reusable)...)
-	args = append(args, "--expiration", "1h")
-	out, err := exec.Command(headscaleBin(), args...).CombinedOutput()
-	if err != nil {
-		return "", fmt.Errorf("%v: %s", err, strings.TrimSpace(string(out)))
+// tag (LinkTagMac or LinkTagFarm) is applied when the Manager owns the
+// Headscale policy.
+func mintLinkPreauthKey(reusable bool, tag string) (string, error) {
+	var tags []string
+	if LinkPolicyManaged(headscaleConfig()) {
+		tags = []string{tag}
 	}
-	key := lastNonEmptyLine(string(out))
-	if key == "" {
-		return "", fmt.Errorf("headscale returned no pairing code")
-	}
-	return key, nil
+	return MintPreauthKey(headscaleBin(), headscaleConfig(), reusable, tags)
 }
 
 // handlePairedNodes lists all registered tailnet nodes.
@@ -343,8 +527,9 @@ func lastNonEmptyLine(s string) string {
 // `nodes list -o json` emits the protobuf structs' encoding/json shape
 // (snake_case), which HSNode mirrors.
 
-// NasLanSubnet is the NAS-side default advertisement: the home LAN that
-// holds Redis/MinIO/manager, so a linked Mac can reach them remotely.
+// NasLanSubnet is only the fallback prefix for POST /api/net/routes/approve
+// when no ?prefix= and no JM_NET_NAS_ROUTE are given. The NAS node advertises
+// a subnet only when JM_NET_NAS_ROUTE is set (LinkSubnetRoute).
 const NasLanSubnet = "192.168.0.0/24"
 
 // DefaultNasHostname is the tailnet hostname of the embedded NAS node
@@ -359,6 +544,54 @@ type HSNode struct {
 	GivenName       string   `json:"given_name"`
 	AvailableRoutes []string `json:"available_routes"`
 	ApprovedRoutes  []string `json:"approved_routes"`
+	Tags            []string `json:"tags"`
+}
+
+// EnsureNodeTags makes the node registered as host carry every tag in want,
+// keeping tags it already has, and reports whether it changed them. A node
+// that registered before JuiceMount tagged its keys keeps its identity (and
+// tailnet address) this way instead of being re-enrolled.
+func EnsureNodeTags(bin, config, host string, want []string) (bool, error) {
+	node, err := hsNodeByHost(bin, config, host)
+	if err != nil {
+		return false, err
+	}
+	merged := mergeApproved(node.Tags, want)
+	if len(merged) == len(node.Tags) {
+		return false, nil
+	}
+	out, err := exec.Command(bin, "--config", config, "nodes", "tag",
+		"--identifier", strconv.FormatUint(node.ID, 10),
+		"--tags", strings.Join(merged, ",")).CombinedOutput()
+	if err != nil {
+		return false, fmt.Errorf("nodes tag: %v: %s", err, strings.TrimSpace(string(out)))
+	}
+	node, err = hsNodeByHost(bin, config, host)
+	if err != nil {
+		return false, err
+	}
+	for _, tag := range want {
+		if !containsRoute(node.Tags, tag) {
+			return false, fmt.Errorf("node %q is still missing tag %s after tagging", host, tag)
+		}
+	}
+	return true, nil
+}
+
+func hsNodeByHost(bin, config, host string) (*HSNode, error) {
+	out, err := exec.Command(bin, "--config", config, "nodes", "list", "-o", "json").Output()
+	if err != nil {
+		return nil, fmt.Errorf("nodes list: %v", err)
+	}
+	nodes, err := parseHSNodes(out)
+	if err != nil {
+		return nil, err
+	}
+	n := nodeForHost(nodes, host)
+	if n == nil {
+		return nil, fmt.Errorf("node %q not registered yet", host)
+	}
+	return n, nil
 }
 
 var ansiEscape = regexp.MustCompile(`\x1b\[[0-9;]*m`)

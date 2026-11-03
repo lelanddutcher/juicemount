@@ -10,8 +10,10 @@ package nfs
 // juicefs process use the host network stack, so they cannot dial a tailnet
 // route directly. Link therefore exposes short-lived loopback TCP proxies:
 // local clients dial 127.0.0.1 and the proxy's outbound leg dials through
-// tsnet. The NAS node advertises the existing LAN subnet, so the original
-// Redis and S3 endpoint addresses remain the route targets.
+// tsnet. The NAS node either serves the JuiceMount ports on its own tailnet
+// address (the default; the outbound leg keeps the endpoint's port and swaps
+// the host) or advertises the LAN subnet (legacy), where the original Redis
+// and S3 endpoint addresses remain the route targets.
 
 import (
 	"context"
@@ -663,11 +665,20 @@ func (l *LinkNode) DialContext(ctx context.Context, network, address string) (ne
 	// violates JuiceMount Link's contract: backend traffic must never escape
 	// the encrypted route merely because a subnet router is still converging
 	// or has gone offline. Wait for an explicitly Tailscale-routed plan and
-	// dial the resolved address from that plan.
+	// dial the resolved address from that plan. A NAS that serves the
+	// JuiceMount ports on its own tailnet address (no subnet route) is
+	// reached there instead, on the same port.
 	dialer := s.Sys().Dialer.Get()
 	planned, err := waitForTailscaleDialPlan(ctx, network, address,
 		func(ctx context.Context, network, address string) (netip.AddrPort, bool, error) {
-			return dialer.UserDialPlan(ctx, network, address)
+			planned, viaTailscale, err := dialer.UserDialPlan(ctx, network, address)
+			if err == nil && viaTailscale {
+				return planned, true, nil
+			}
+			if target, ok := l.nasServiceDialTarget(ctx, s, address); ok {
+				return target, true, nil
+			}
+			return planned, viaTailscale, err
 		})
 	if err != nil {
 		return nil, err
@@ -681,6 +692,18 @@ func (l *LinkNode) DialContext(ctx context.Context, network, address string) (ne
 		return nil, fmt.Errorf("link: refused non-tailnet connection to %s", address)
 	}
 	return conn, nil
+}
+
+func (l *LinkNode) nasServiceDialTarget(ctx context.Context, s *tsnet.Server, address string) (netip.AddrPort, bool) {
+	lc, err := s.LocalClient()
+	if err != nil {
+		return netip.AddrPort{}, false
+	}
+	status, err := lc.Status(ctx)
+	if err != nil {
+		return netip.AddrPort{}, false
+	}
+	return linkServiceDialTarget(status, address)
 }
 
 const (

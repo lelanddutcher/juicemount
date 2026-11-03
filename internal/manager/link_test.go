@@ -25,6 +25,8 @@ func fakeHeadscale(t *testing.T, dir string, stdout string) string {
 		"case \" $* \" in\n" +
 		"  *\" nodes list-routes \"*) cat " + dir + "/routes.txt; exit 0 ;;\n" +
 		"  *\" nodes list \"*) cat " + dir + "/nodes.json; exit 0 ;;\n" +
+		"  *\" users list \"*) if test -f " + dir + "/users.json; then cat " + dir + "/users.json; else echo '[{\"id\": 1, \"name\": \"jm\"}]'; fi; exit 0 ;;\n" +
+		"  *\" nodes tag \"*) test ! -f " + dir + "/nodes-tagged.json || cp " + dir + "/nodes-tagged.json " + dir + "/nodes.json; exit 0 ;;\n" +
 		"  *\" nodes approve-routes \"*) test ! -f " + dir + "/routes-approved.txt || cp " + dir + "/routes-approved.txt " + dir + "/routes.txt; echo node updated; exit 0 ;;\n" +
 		"esac\n" +
 		"echo " + stdout + "\n"
@@ -358,5 +360,12 @@ func TestApproveSubnetRoutesEndToEnd(t *testing.T) {
 	// Unknown node → retriable error, not a silent success.
 	if err := ApproveSubnetRoutes(bin, dir+"/config.yaml", "ghost", []string{"192.168.0.0/24"}); err == nil {
 		t.Error("expected error for unregistered node")
+	}
+}
+
+func TestLastNonEmptyLineUsesFinalCLIValue(t *testing.T) {
+	output := "2026-08-25T12:00:00Z INFO minting key\nfirst unrelated line\ntskey-auth-final"
+	if got := lastNonEmptyLine(output); got != "tskey-auth-final" {
+		t.Errorf("lastNonEmptyLine = %q, want final key", got)
 	}
 }

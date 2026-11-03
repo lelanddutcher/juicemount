@@ -182,7 +182,7 @@ func (a *API) handleFarmEnrollment(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		}
-		pairingCode, err := mintLinkPreauthKey(false)
+		pairingCode, err := mintLinkPreauthKey(false, LinkTagFarm)
 		if err != nil {
 			writeJSON(w, http.StatusBadGateway, map[string]any{"ok": false, "error": "could not mint one-time Link authorization: " + err.Error()})
 			return

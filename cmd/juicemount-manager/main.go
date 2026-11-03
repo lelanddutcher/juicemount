@@ -110,27 +110,31 @@ func main() {
 	// so enabling it would create a false security boundary.
 
 	// Tier-2 T2.1: embedded Headscale + pairing endpoint (JuiceMount Link).
-	// Off by default; JM_NET_HEADSCALE=on opts the deployment in.
+	// Off by default; JM_NET_HEADSCALE=on opts the deployment in. Both
+	// components are supervised with capped-backoff restarts and report
+	// their state through GET /api/net/link. Link must never take the
+	// manager down with it: a bad config or binary mismatch degrades to
+	// "pairing unavailable", not a dead UI.
 	if headscaleEnabled() {
-		hs := &headscaleSupervisor{}
-		if err := hs.Start(); err != nil {
-			// Link must never take the manager down with it: a bad config or
-			// binary mismatch degrades to "pairing unavailable", not a dead UI.
-			log.Printf("ERROR: headscale supervisor failed — Link disabled: %v", err)
-		} else {
-			defer hs.Stop()
-			log.Printf("JuiceMount Link: headscale supervising on %s (external %s)", hsListen, externalURL())
-			// T2.2: join the tailnet as the NAS itself and advertise/approve
-			// the LAN subnet so linked Macs reach Redis/MinIO/manager remotely.
-			if nasNodeEnabled() {
-				nas := &nasNodeSupervisor{}
-				if err := nas.Start(hsDataDir + "/config.yaml"); err != nil {
-					log.Printf("WARN: nas tailnet node failed — remote LAN routing disabled: %v", err)
-				} else {
-					defer nas.Stop()
-				}
-			}
+		hs := newHeadscaleSupervisor()
+		hs.Start()
+		defer hs.Stop()
+		log.Printf("JuiceMount Link: supervising headscale on %s (external %s)", hsListen, externalURL())
+		var nas *supervisor
+		// T2.2: join the tailnet as the NAS itself and serve the JuiceMount
+		// ports on its tailnet address so linked Macs reach them remotely.
+		if nasNodeEnabled() {
+			nas = newNASNodeSupervisor(hsDataDir+"/config.yaml", hs)
+			nas.Start()
+			defer nas.Stop()
 		}
+		manager.SetLinkRuntimeStatus(func() manager.LinkRuntimeStatus {
+			st := manager.LinkRuntimeStatus{Headscale: hs.status.snapshot()}
+			if nas != nil {
+				st.NASNode = nas.status.snapshot()
+			}
+			return st
+		})
 	}
 
 	srv := &http.Server{

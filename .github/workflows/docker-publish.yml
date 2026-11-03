@@ -116,6 +116,7 @@ jobs:
           find scripts server/scripts test -type f -name '*.sh' -print0 | xargs -0 -n1 bash -n
           node --check internal/manager/static/app.js
           docker compose -f server/docker-compose.yml config --quiet
+          docker compose -f server/docker-compose.yml -f server/docker-compose.link.yml config --quiet
           bash server/scripts/update-server.test.sh
 
   mac-app:

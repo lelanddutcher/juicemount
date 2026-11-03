@@ -43,9 +43,16 @@ jobs:
           cache: true
       - name: Prepare private Bash for keyd tests
         run: bash scripts/prepare-ci-bash.sh
+      - name: Fetch pinned Headscale for the Link integration test
+        # Same release the manager image ships (server/juicemount-manager/Dockerfile).
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/headscale" https://github.com/juanfont/headscale/releases/download/v0.29.3/headscale_0.29.3_linux_amd64
+          echo "8dc183758024ed7095cf610fedea0790233613c71353bc8be2715d82ba29b92c  $RUNNER_TEMP/headscale" | sha256sum -c -
+          chmod +x "$RUNNER_TEMP/headscale"
       - name: Unit and integration-safe tests
         env:
           JM_REQUIRE_GATE_HISTORY: '1'
+          JM_TEST_HEADSCALE_BIN: ${{ runner.temp }}/headscale
           JM_TEST_LINK_REDIS: redis://127.0.0.1:6379/13
           JM_TEST_MANAGER_REDIS: redis://127.0.0.1:6379/12
           # Smart folders format throwaway JuiceFS volumes (each DB is flushed;
@@ -90,6 +97,7 @@ jobs:
           find scripts server/scripts test -type f -name '*.sh' -print0 | xargs -0 -n1 bash -n
           node --check internal/manager/static/app.js
           docker compose -f server/docker-compose.yml config --quiet
+          docker compose -f server/docker-compose.yml -f server/docker-compose.link.yml config --quiet
           bash server/scripts/update-server.test.sh
 
   mac-app:
