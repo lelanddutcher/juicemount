@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -207,13 +208,87 @@ if authoritativeRenderProfile then
     end
   end
 end
+-- Bounded, read-only scan. This Redis also serves every editor's filesystem
+-- metadata, so one poll inspects at most ARGV[11] entries per lane from the
+-- caller's per-lane cursor in ARGV[12] (positions counted from the claim
+-- end), and reports where the next poll should continue. Skipped entries are not
+-- rotated: a backlog no worker can serve costs no writes.
+--
+-- Enqueue pushes to the far end, so the cursor alone would reach new work only
+-- after walking the backlog. Every enqueue path increments <lane>:seq with its
+-- push and claims never touch it, so seq minus the caller's last seen value
+-- (ARGV[13], -1 unknown) is exactly how many entries arrived. They join the
+-- caller's owed count (ARGV[14]): the newest entries of the lane not yet
+-- inspected. After the cursor window, so older eligible work in it wins, each
+-- poll inspects the oldest owed entries, up to the same limit again; the rest
+-- stay owed for the next poll. A claim found deep in a lane costs up to half a
+-- lane walk to remove (see toClaimEnd), more than a poll's inspection.
+local scanLimit = tonumber(ARGV[11]) or 64
+local function csvNumbers(text, default)
+  local values = {}
+  for value in string.gmatch(text or '', '[^,]+') do
+    table.insert(values, tonumber(value) or default)
+  end
+  return values
+end
+local cursors = csvNumbers(ARGV[12], 0)
+local seenSeqs = csvNumbers(ARGV[13], -1)
+local owedCounts = csvNumbers(ARGV[14], 0)
+local scanState = {}
+-- A candidate found deeper in its lane moves to the claim end first, so the
+-- claim takes it with the same single-command transfer as the lane's head. The
+-- lane is a list (checked or written as one above), so nothing between LREM and
+-- RPUSH can fail and leave the raw outside every list. LREM walks from the
+-- nearer end (up to half the lane); the values are identical, so removing
+-- either copy is equivalent.
+local function toClaimEnd(key, position, count, value)
+  if position == 0 then return true end
+  local direction = -1
+  if position > count / 2 then direction = 1 end
+  if redis.call('LREM', key, direction, value) ~= 1 then return false end
+  redis.call('RPUSH', key, value)
+  return true
+end
 for i = 8, #KEYS do
   local count = redis.call('LLEN', KEYS[i])
-  for n = 1, count do
-    -- Inspect the next candidate without removing it. Tracked execution claims
+  local seq = tonumber(redis.call('GET', KEYS[i] .. ':seq') or '0') or 0
+  local first = cursors[i - 7] or 0
+  if first < 0 or first >= count or math.floor(first) ~= first then first = 0 end
+  local last = math.min(count, first + scanLimit) - 1
+  local owed = owedCounts[i - 7] or 0
+  if owed < 0 or math.floor(owed) ~= owed then owed = 0 end
+  local seen = seenSeqs[i - 7] or -1
+  if seen >= 0 and seq > seen then owed = owed + seq - seen end
+  if owed > count then owed = count end
+  local candidates, positions, owedTaken = {}, {}, {}
+  if last >= first then
+    local window = redis.call('LRANGE', KEYS[i], -(last + 1), -(first + 1))
+    for n = #window, 1, -1 do
+      table.insert(candidates, window[n])
+      table.insert(positions, first + #window - n)
+      table.insert(owedTaken, 0)
+    end
+  end
+  local regionSize = math.min(owed, scanLimit)
+  if regionSize > 0 then
+    -- Head indices owed-regionSize .. owed-1, inspected oldest first. An entry
+    -- the window already covered is not inspected twice.
+    local region = redis.call('LRANGE', KEYS[i], owed - regionSize, owed - 1)
+    for j = #region, 1, -1 do
+      local position = count - (owed - regionSize + j)
+      if position < first or position > last then
+        table.insert(candidates, region[j])
+        table.insert(positions, position)
+        table.insert(owedTaken, #region - j + 1)
+      end
+    end
+  end
+  for c = 1, #candidates do
+    -- Inspect the candidate without removing it. Tracked execution claims
     -- must transfer directly from ready to processing after the worker index
     -- is durable, so a Lua runtime error cannot strand an unindexed raw.
-    local raw = redis.call('LINDEX', KEYS[i], -1)
+    local position = positions[c]
+    local raw = candidates[c]
     if raw then
       local sourceRaw = raw
       local eligible = true
@@ -371,6 +446,9 @@ for i = 8, #KEYS do
               'claim_generation', generation, 'claim_token', ARGV[7],
               'lease_owner', ARGV[1], 'custody_source', KEYS[i],
               'custody_raw', sourceRaw, 'custody_processing_raw', custodyRaw)
+            if not toClaimEnd(KEYS[i], position, count, sourceRaw) then
+              return redis.error_reply('tracked ready claim disappeared')
+            end
             local moved = redis.call('LMOVE', KEYS[i], processing, 'RIGHT', 'LEFT')
             if not moved then return redis.error_reply('tracked ready claim disappeared') end
             if moved ~= sourceRaw then return redis.error_reply('tracked ready claim changed') end
@@ -380,6 +458,9 @@ for i = 8, #KEYS do
                 'payload', raw)
             end
           else
+            if not toClaimEnd(KEYS[i], position, count, sourceRaw) then
+              return redis.error_reply('ready claim disappeared')
+            end
             redis.call('RPOP', KEYS[i])
             redis.call('LPUSH', processing, raw)
             redis.call('SADD', processingIndex, ARGV[1])
@@ -438,19 +519,46 @@ for i = 8, #KEYS do
               redis.call('SREM', KEYS[5], reclaimedOwner)
             end
           end
-          if job and job.tracked_epoch then
-            return {raw, KEYS[i], processing, redis.call('HGET', 'juicefarm:job:' .. job.id, 'claim_generation'), tostring(leaseExpires)}
+          -- The claimed entry is gone. Within the window its position is the
+          -- next unseen one; nearer the claim end it shifts the cursor down by
+          -- one. A claim among the owed entries means the whole window was
+          -- inspected first and held nothing eligible, so the cursor moves past
+          -- it; otherwise steady new work would park the cursor and the older
+          -- work beyond the window would never be reached.
+          local nextCursor = first
+          if owedTaken[c] > 0 then
+            nextCursor = last + 1
+            if position < first then nextCursor = last end
+            if nextCursor >= count - 1 then nextCursor = 0 end
+          elseif position < first then
+            nextCursor = first - 1
+          elseif position <= last then
+            nextCursor = position
           end
-          return {raw, KEYS[i], processing}
+          -- Owed entries newer than a claimed one stay owed. A window claim of
+          -- an owed entry (the lane is short, or the cursor reached the
+          -- newest entries) takes one off what is owed.
+          local owedAfter = owed
+          if owedTaken[c] > 0 then
+            owedAfter = owed - owedTaken[c]
+          elseif count - 1 - position < owed then
+            owedAfter = owed - 1
+          end
+          table.insert(scanState, string.format('%d:%d:%d:%d', nextCursor, count - 1, seq, owedAfter))
+          local state = table.concat(scanState, ',')
+          if job and job.tracked_epoch then
+            return {state, raw, KEYS[i], processing, redis.call('HGET', 'juicefarm:job:' .. job.id, 'claim_generation'), tostring(leaseExpires)}
+          end
+          return {state, raw, KEYS[i], processing}
         end
       end
-      -- Rotate skipped candidates without ever making a tracked raw absent
-      -- from both its ready lane and a recoverable processing lane.
-      redis.call('RPOPLPUSH', KEYS[i], KEYS[i])
     end
   end
+  local nextCursor = last + 1
+  if nextCursor >= count then nextCursor = 0 end
+  table.insert(scanState, string.format('%d:%d:%d:%d', nextCursor, count, seq, owed - regionSize))
 end
-return {}`
+return {table.concat(scanState, ',')}`
 
 // ClaimForWorker polls the worker's eligible lanes and atomically moves one raw
 // job into its processing list. Unlike BRPOP, a worker crash cannot lose the
@@ -477,17 +585,32 @@ func (c *Client) ClaimForWorker(ctx context.Context, timeout time.Duration, w Wo
 	if w.RequireStoragePermit {
 		requireStoragePermit = "1"
 	}
+	scan := c.claimScanFor(w.ID)
+	if timeout <= 0 {
+		// A single poll covers every lane once from the claim end, as the
+		// unbounded scan did, in bounded steps.
+		scan.restart()
+	}
+	steps, maxSteps := 0, 0
 	for {
 		token := NewID()
 		requestStart := time.Now()
 		expires := time.Now().Add(claimLeaseTTL)
+		cursors, seqs, owed := scan.scanArgs(keys)
 		res, err := c.rdb.Eval(ctx, claimForWorkerScript, scriptKeys, w.ID, string(capabilities), string(decodeLimits),
 			workerPinCapability(w), workerDisplayName(w), requireStoragePermit,
-			token, expires.UTC().Format(time.RFC3339), expires.Unix(), w.Role).StringSlice()
+			token, expires.UTC().Format(time.RFC3339), expires.Unix(), w.Role,
+			claimScanBatch, cursors, seqs, owed).StringSlice()
 		if err != nil && err != redis.Nil {
 			return Claim{}, false, err
 		}
-		if len(res) >= 3 {
+		cycleDone := true
+		if len(res) >= 1 {
+			cycleDone = scan.observe(keys, res[0])
+		}
+		if len(res) >= 4 {
+			scan.claimed()
+			res = res[1:]
 			var job Job
 			if err := json.Unmarshal([]byte(res[0]), &job); err != nil {
 				_ = c.rdb.LRem(ctx, res[2], 1, res[0]).Err()
@@ -512,15 +635,213 @@ func (c *Client) ClaimForWorker(ctx context.Context, timeout time.Duration, w Wo
 			}
 			return claim, true, nil
 		}
-		if timeout <= 0 || time.Now().After(deadline) {
+		if timeout <= 0 {
+			// The step cap ends the pass if lanes grow faster than one step reads.
+			steps++
+			if maxSteps == 0 {
+				maxSteps = scan.stepsToCover(keys)
+			}
+			if cycleDone || steps >= maxSteps {
+				return Claim{}, false, nil
+			}
+			continue
+		}
+		// One poll covers at most claimScanBatch entries per lane. Until every
+		// lane has been covered, continue from the cursors; a covered backlog
+		// with nothing eligible backs off instead of rescanning.
+		delay := scan.stepDelay()
+		if cycleDone {
+			delay = scan.idleDelay()
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
 			return Claim{}, false, nil
+		}
+		if delay > remaining {
+			delay = remaining
 		}
 		select {
 		case <-ctx.Done():
 			return Claim{}, false, ctx.Err()
-		case <-time.After(250 * time.Millisecond):
+		case <-time.After(delay):
 		}
 	}
+}
+
+const (
+	// claimScanBatch bounds the ready entries one claim poll inspects per lane,
+	// once in the cursor window and once among newly enqueued entries. The claim
+	// script runs inside the metadata Redis, so a poll's cost must not grow with
+	// a backlog this worker cannot serve.
+	claimScanBatch = 64
+	// The polls that continue a partly covered backlog start claimScanStepDelay
+	// apart and double with each poll that claims nothing, up to
+	// claimScanStepMax, so a backlog this worker cannot serve costs Redis about
+	// four short scripts a second however much ineligible work keeps arriving.
+	// New entries do not speed it up: the next poll inspects them anyway.
+	claimScanStepDelay = 25 * time.Millisecond
+	claimScanStepMax   = 250 * time.Millisecond
+	// An idle worker polls at claimIdleBase after a full fruitless pass, doubling
+	// to claimIdleMax. Only a claim resets the pacing.
+	claimIdleBase = 250 * time.Millisecond
+	claimIdleMax  = 2 * time.Second
+)
+
+// claimScanState is one worker's position in its ready lanes. It lives in the
+// process, not in Redis: a poll that claims nothing then writes nothing, and a
+// restart only restarts the scan from the claim end.
+type claimScanState struct {
+	mu      sync.Mutex
+	cursors map[string]int64
+	lengths map[string]int64
+	// seqs is each lane's LaneSeqKey value at the last poll; owed is how many
+	// of the lane's newest entries have arrived since and are not inspected.
+	seqs    map[string]int64
+	owed    map[string]int64
+	covered map[string]bool
+	idle    time.Duration
+	// fruitless counts consecutive polls that claimed nothing.
+	fruitless int
+}
+
+func newClaimScanState() *claimScanState {
+	return &claimScanState{cursors: map[string]int64{}, lengths: map[string]int64{},
+		seqs: map[string]int64{}, owed: map[string]int64{}, covered: map[string]bool{}}
+}
+
+func (c *Client) claimScanFor(workerID string) *claimScanState {
+	c.scanMu.Lock()
+	defer c.scanMu.Unlock()
+	if c.scans == nil {
+		c.scans = make(map[string]*claimScanState)
+	}
+	scan := c.scans[workerID]
+	if scan == nil {
+		scan = newClaimScanState()
+		c.scans[workerID] = scan
+	}
+	return scan
+}
+
+// laneArg renders one per-lane value for the script, missing for unknown.
+func laneArg(keys []string, values map[string]int64, missing int64) string {
+	parts := make([]string, len(keys))
+	for i, key := range keys {
+		value, ok := values[key]
+		if !ok {
+			value = missing
+		}
+		parts[i] = strconv.FormatInt(value, 10)
+	}
+	return strings.Join(parts, ",")
+}
+
+// scanArgs returns the cursors, last seen sequences (-1 unknown) and owed
+// counts the claim script reads as ARGV[12..14].
+func (s *claimScanState) scanArgs(keys []string) (cursors, seqs, owed string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return laneArg(keys, s.cursors, 0), laneArg(keys, s.seqs, -1), laneArg(keys, s.owed, 0)
+}
+
+// observe records the script's per-lane "next:length:seq:owed" report and
+// says whether every lane has been covered since the last full pass. A lane is
+// covered when its cursor returns to the claim end with nothing owed.
+func (s *claimScanState) observe(keys []string, report string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if report != "" {
+		for i, entry := range strings.Split(report, ",") {
+			if i >= len(keys) {
+				break
+			}
+			fields := strings.Split(entry, ":")
+			if len(fields) != 4 {
+				continue
+			}
+			var values [4]int64
+			valid := true
+			for f, field := range fields {
+				v, err := strconv.ParseInt(field, 10, 64)
+				if err != nil {
+					valid = false
+					break
+				}
+				values[f] = v
+			}
+			if !valid {
+				continue
+			}
+			key := keys[i]
+			cursor, size, seq, owed := values[0], values[1], values[2], values[3]
+			s.cursors[key] = cursor
+			s.lengths[key] = size
+			s.seqs[key] = seq
+			s.owed[key] = owed
+			if owed > 0 {
+				s.covered[key] = false
+			} else if cursor == 0 {
+				s.covered[key] = true
+			}
+		}
+	}
+	for _, key := range keys {
+		if !s.covered[key] {
+			return false
+		}
+	}
+	clear(s.covered)
+	return true
+}
+
+func (s *claimScanState) restart() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	clear(s.cursors)
+	clear(s.covered)
+}
+
+func (s *claimScanState) claimed() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.idle = 0
+	s.fruitless = 0
+}
+
+// stepDelay records a poll that claimed nothing and returns the pause before
+// the next one while a pass is still in progress.
+func (s *claimScanState) stepDelay() time.Duration {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.fruitless++
+	delay := claimScanStepDelay
+	for i := 1; i < s.fruitless && delay < claimScanStepMax; i++ {
+		delay *= 2
+	}
+	return min(delay, claimScanStepMax)
+}
+
+func (s *claimScanState) idleDelay() time.Duration {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.idle <= 0 {
+		s.idle = claimIdleBase
+	} else if s.idle < claimIdleMax {
+		s.idle = min(2*s.idle, claimIdleMax)
+	}
+	return s.idle
+}
+
+// stepsToCover is how many bounded polls one pass over the longest lane needs,
+// plus one for a lane the first poll found mid-cycle.
+func (s *claimScanState) stepsToCover(keys []string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var longest int64
+	for _, key := range keys {
+		longest = max(longest, s.lengths[key])
+	}
+	return int(longest/claimScanBatch) + 2
 }
 
 // RecoverUnserviceableReady demotes queued render jobs when no active render
@@ -649,6 +970,7 @@ func (c *Client) RecoverUnserviceableReady(ctx context.Context) (int, error) {
 if redis.call('HEXISTS', KEYS[3], 'held_token') == 1 then return 0 end
 if redis.call('LREM', KEYS[1], 1, ARGV[1]) == 1 then
   redis.call('LPUSH', KEYS[2], ARGV[2])
+  redis.call('INCR', KEYS[2] .. ':seq')
   redis.call('HSET', KEYS[3], 'status', 'queued', 'backend', ARGV[3],
 	'target_worker', ARGV[4], 'queue_class', ARGV[5], 'attempts', ARGV[6],
 	'hardware_failures', ARGV[7], 'error', ARGV[8], 'payload', ARGV[2])
@@ -771,6 +1093,7 @@ func (c *Client) PromoteServiceableReady(ctx context.Context) (int, error) {
 if redis.call('HEXISTS', KEYS[3], 'held_token') == 1 then return 0 end
 if redis.call('LREM', KEYS[1], 1, ARGV[1]) == 1 then
   redis.call('LPUSH', KEYS[2], ARGV[2])
+  redis.call('INCR', KEYS[2] .. ':seq')
   redis.call('HSET', KEYS[3], 'status', 'queued', 'worker', '',
 	'backend', ARGV[3], 'target_worker', ARGV[4], 'queue_class', ARGV[5],
 	'error', ARGV[6], 'payload', ARGV[2])
@@ -1422,6 +1745,7 @@ if (status ~= 'running' and status ~= 'queued') or
    not redis.call('LPOS', KEYS[1], ARGV[1]) then return 0 end
 redis.call('LREM', KEYS[1], 1, ARGV[1])
 redis.call('LPUSH', KEYS[2], ARGV[2])
+redis.call('INCR', KEYS[2] .. ':seq')
 redis.call('ZREM', KEYS[3], ARGV[3])
 redis.call('HSET', KEYS[4],
   'status', 'queued', 'worker', '', 'backend', ARGV[4],
@@ -1466,6 +1790,7 @@ if redis.call('LREM', KEYS[1], 1, ARGV[1]) == 0 then
   return 0
 end
 redis.call('LPUSH', KEYS[2], ARGV[2])
+redis.call('INCR', KEYS[2] .. ':seq')
 redis.call('ZREM', KEYS[3], ARGV[3])
 redis.call('HSET', KEYS[4],
   'status', 'queued', 'worker', '', 'backend', ARGV[4],
@@ -1536,7 +1861,10 @@ if not inReady and not inProcessing then
   return redis.error_reply('tracked transfer has no exact custody raw')
 end
 if inProcessing then
-  if not inReady then redis.call('LPUSH', source, sourceRaw) end
+  if not inReady then
+    redis.call('LPUSH', source, sourceRaw)
+    redis.call('INCR', source .. ':seq')
+  end
   if redis.call('LREM', processing, 1, actualProcessingRaw) ~= 1 then
     return redis.error_reply('tracked transfer processing receipt changed')
   end
@@ -1885,7 +2213,10 @@ end
 if not redis.call('LPOS', KEYS[1], ARGV[1]) then return 0 end
 redis.call('HSET', KEYS[3], 'claim_phase', 'reclaiming', 'lease_owner', ARGV[2], 'error',
   'recovering tracked child before reservation')
-if not redis.call('LPOS', KEYS[2], ARGV[1]) then redis.call('LPUSH', KEYS[2], ARGV[1]) end
+if not redis.call('LPOS', KEYS[2], ARGV[1]) then
+  redis.call('LPUSH', KEYS[2], ARGV[1])
+  redis.call('INCR', KEYS[2] .. ':seq')
+end
 if redis.call('LREM', KEYS[1], 1, ARGV[1]) ~= 1 then return 0 end
 if redis.call('LLEN', KEYS[1]) == 0 then redis.call('SREM', KEYS[4], ARGV[2]) end
 redis.call('HDEL', KEYS[3], 'claim_phase', 'lease_owner')
@@ -1921,6 +2252,7 @@ redis.call('HSET', KEYS[3], 'claim_phase', 'reclaiming', 'error',
   'recovering expired reservation before execution')
 redis.call('LREM', KEYS[2], 0, ARGV[3])
 redis.call('LPUSH', KEYS[2], ARGV[3])
+redis.call('INCR', KEYS[2] .. ':seq')
 redis.call('ZREM', KEYS[4], ARGV[5])
 if redis.call('LREM', KEYS[1], 1, ARGV[3]) ~= 1 then return 0 end
 redis.call('HSET', KEYS[3], 'status', 'queued')
@@ -1933,6 +2265,7 @@ func (c *Client) requeueMalformedClaim(ctx context.Context, processingKey, worke
 	const script = `
 redis.call('LREM', KEYS[1], 1, ARGV[1])
 redis.call('LPUSH', KEYS[2], ARGV[1])
+redis.call('INCR', KEYS[2] .. ':seq')
 if redis.call('LLEN', KEYS[1]) == 0 then
   redis.call('SREM', KEYS[3], ARGV[2])
 end

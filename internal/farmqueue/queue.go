@@ -28,6 +28,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -418,7 +419,13 @@ func NewJob(path string, kinds []string, producer string) Job {
 
 // Client wraps a *redis.Client. Dial with Open; both producers and the worker
 // use the same constructor against the JuiceFS meta URL.
-type Client struct{ rdb *redis.Client }
+type Client struct {
+	rdb *redis.Client
+
+	// scans holds each worker's claim-scan cursors (see claimScanState).
+	scanMu sync.Mutex
+	scans  map[string]*claimScanState
+}
 
 // Open dials Redis from a redis:// URL (the same JM_META the volume uses).
 func Open(metaURL string) (*Client, error) {
@@ -431,6 +438,13 @@ func Open(metaURL string) (*Client, error) {
 
 // Wrap adapts an already-constructed *redis.Client (e.g. one the manager holds).
 func Wrap(rdb *redis.Client) *Client { return &Client{rdb: rdb} }
+
+// LaneSeqKey counts every push into a ready lane. Each enqueue path increments
+// it in the same atomic step as its LPUSH, and claims never touch it, so a
+// worker can tell exactly how many entries arrived at a lane's enqueue end
+// since its last poll however many were claimed meanwhile. A push that does
+// not count (a v0.5.0 enqueuer) is still found by the bounded cursor scan.
+func LaneSeqKey(lane string) string { return lane + ":seq" }
 
 // Close releases the underlying connection pool.
 func (c *Client) Close() error { return c.rdb.Close() }
@@ -476,6 +490,7 @@ func (c *Client) Enqueue(ctx context.Context, j Job) error {
 		}
 		pipe := tx.TxPipeline()
 		pipe.LPush(ctx, QueueKeyFor(&j), raw)
+		pipe.Incr(ctx, LaneSeqKey(QueueKeyFor(&j)))
 		pipe.HSet(ctx, JobHashPrefix+j.ID, st.toMap())
 		pipe.HSet(ctx, JobHashPrefix+j.ID, "payload", raw)
 		if j.TrackedEpoch != "" {

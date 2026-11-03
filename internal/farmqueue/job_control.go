@@ -116,6 +116,7 @@ func (c *Client) RequeueFailed(ctx context.Context, id, requestedBy string) (Job
 		}
 		_, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
 			pipe.LPush(ctx, QueueKeyFor(&retry), raw)
+			pipe.Incr(ctx, LaneSeqKey(QueueKeyFor(&retry)))
 			pipe.HSet(ctx, JobHashPrefix+retry.ID, st.toMap())
 			// The retry is queued: its retention starts at its own terminal write.
 			pipe.HSet(ctx, JobHashPrefix+retry.ID, "payload", raw, "requeued_by", strings.TrimSpace(requestedBy))

@@ -39,7 +39,14 @@ func (c *Client) PublishStoragePermit(ctx context.Context, permit StoragePermit)
 	if permit.Source == "" {
 		permit.Source = "storage-guard"
 	}
-	checkedAt := time.Now().UTC().Truncate(time.Second)
+	// Stamp with Redis TIME, the clock the claim script judges freshness by.
+	// The publisher's own clock is not that clock: a server host 5 s ahead made
+	// every permit look future-dated and blocked every render claim.
+	redisNow, err := c.rdb.Time(ctx).Result()
+	if err != nil {
+		return fmt.Errorf("publish storage permit: redis time: %w", err)
+	}
+	checkedAt := redisNow.UTC().Truncate(time.Second)
 	permit.CheckedAt = checkedAt.Format(time.RFC3339)
 	permit.CheckedAtUnix = checkedAt.Unix()
 	raw, err := json.Marshal(permit)
@@ -67,12 +74,31 @@ func (c *Client) GetStoragePermit(ctx context.Context) (StoragePermit, error) {
 	if c == nil || c.rdb == nil {
 		return StoragePermit{}, fmt.Errorf("get storage permit: queue unavailable")
 	}
-	raw, err := c.rdb.Get(ctx, StoragePermitKey).Bytes()
+	// Read the permit, its expiry and Redis TIME together. Freshness is judged
+	// against Redis TIME, as the claim script judges it, so a render host whose
+	// clock is skewed agrees with Redis about whether it may claim.
+	var getCmd *redis.StringCmd
+	var ttlCmd *redis.DurationCmd
+	var timeCmd *redis.TimeCmd
+	_, err := c.rdb.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+		getCmd = pipe.Get(ctx, StoragePermitKey)
+		ttlCmd = pipe.PTTL(ctx, StoragePermitKey)
+		timeCmd = pipe.Time(ctx)
+		return nil
+	})
+	if err != nil && err != redis.Nil {
+		return StoragePermit{}, fmt.Errorf("get storage permit: %w", err)
+	}
+	raw, err := getCmd.Bytes()
 	if err == redis.Nil {
 		return StoragePermit{}, fmt.Errorf("storage permit unavailable")
 	}
 	if err != nil {
 		return StoragePermit{}, fmt.Errorf("get storage permit: %w", err)
+	}
+	redisNow, err := timeCmd.Result()
+	if err != nil {
+		return StoragePermit{}, fmt.Errorf("get storage permit: redis time: %w", err)
 	}
 	// checked_at is only a display field. Decode authority fields directly so
 	// missing or malformed diagnostics cannot veto valid numeric authority.
@@ -105,11 +131,11 @@ func (c *Client) GetStoragePermit(ctx context.Context) (StoragePermit, error) {
 		permit.RequiredBytes > maxExactPermitInteger || permit.AvailableBytes < permit.RequiredBytes {
 		return StoragePermit{}, fmt.Errorf("storage permit is invalid")
 	}
-	age := time.Now().Unix() - permit.CheckedAtUnix
+	age := redisNow.Unix() - permit.CheckedAtUnix
 	if age < -2 || age >= int64(StoragePermitTTL/time.Second) {
 		return StoragePermit{}, fmt.Errorf("storage permit is stale")
 	}
-	ttl, err := c.rdb.PTTL(ctx, StoragePermitKey).Result()
+	ttl, err := ttlCmd.Result()
 	if err != nil || ttl <= 0 || ttl > StoragePermitTTL {
 		return StoragePermit{}, fmt.Errorf("storage permit expiry is invalid")
 	}

@@ -132,6 +132,7 @@ if ARGV[4] ~= '' then
   if protocol == '1' then redis.call('HSET', KEYS[1], 'coverage_protocol', '1') end
 end
 redis.call('LPUSH', KEYS[2], ARGV[1])
+redis.call('INCR', KEYS[2] .. ':seq')
 redis.call('ZADD', KEYS[3], tonumber(ARGV[3]), statusFields.id)
 redis.call('HSET', KEYS[1], 'cpu_fallback_published', '1')
 return {1, ARGV[1]}

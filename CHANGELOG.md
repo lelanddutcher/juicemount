@@ -19,6 +19,38 @@
 - Known limit: a queued or running legacy record whose job is no longer in any
   queue or worker receipt now stays in the jobs list until it is removed by
   hand. Before, it expired 7 days after it was queued.
+- A poster, filmstrip, or waveform that could not be written because the
+  derivative storage was full, read-only, or unmounted is retried. Before, it
+  was recorded as a failure for the build, so the retry skipped the file as
+  done and the preview stayed missing until the next farm update. A fault
+  that has not cleared after three tries over 6 hours
+  (`JM_FARM_BLOB_RETRY_WINDOW_SEC`; permission faults count as faults that may
+  clear), a broken derivative folder (a symlink or a file where a folder
+  belongs), and media that ffmpeg cannot decode are
+  recorded as failed and tried again only after the next farm update.
+- A worker's claim poll inspects at most 64 queued jobs per queue and continues
+  where it stopped on the next poll, so an idle worker behind a large backlog
+  meant for another GPU no longer holds the shared Redis for up to 0.3 s on
+  every poll. Each poll also checks up to 64 jobs queued since the worker's
+  last poll, after older jobs, so new work behind such a backlog is claimed
+  within a poll or two once the worker is polling. An idle worker polls less
+  often, up to every 2 seconds, so new work can wait up to that long, and it
+  walks a backlog it cannot serve at up to 4 polls a second; a claim speeds it
+  up again. Claiming a job found deep in a long queue costs more than a poll:
+  up to about 2 ms in the middle of 100,000 jobs.
+- The backend storage permit is timed by the Redis clock. A server whose clock
+  ran a few seconds ahead of Redis blocked every render claim.
+- A directory job replayed after a worker crash queues every file it finds. A
+  file added between the crash and the replay could be left without a job.
+- The watch backstop finds a folder copied to the top of the volume with its
+  original dates (rsync -a, cp -p, Finder), and looks back up to 2 minutes
+  before its cursor (`JM_FARM_WATCH_BACKSTOP_SKEW_SEC`) to catch files from
+  editors whose clocks are behind the farm's. A change just before a scan can
+  start one extra catch-up pass, which finds its previews current. To keep it
+  to one, the look-back never reaches before the previous catch-up pass: with
+  the default 15-minute interval that is the full 2 minutes, but when the
+  backstop scans again soon after a catch-up pass (a restarted farm, or a short
+  `JM_FARM_WATCH_BACKSTOP_SEC`) it can be shorter.
 
 ### Upgrading the farm
 
@@ -32,6 +64,16 @@ new workers against the same Redis at the same time:
 - Rolling the farm back to v0.5.0 leaves records written by the new version
   without a TTL: v0.5.0 sets retention only when a job is queued. Remove
   finished records with **Clear finished**.
+- A v0.5.0 server publishes the storage permit by its own clock, so render
+  claims still depend on that server's clock until it is upgraded.
+- A v0.5.0 render worker still judges the storage permit by its own clock
+  before it tries to claim, so a render host whose clock is off may wait or try
+  claims that Redis refuses until it is upgraded.
+- A directory job split by one version and replayed by the other queues its
+  files a second time. The repeat finds the previews current and skips them.
+- Jobs queued by a v0.5.0 worker or Manager are not counted as new, so a new
+  worker finds them only by walking the queue, which can take minutes behind
+  a large backlog meant for another GPU.
 
 ## 0.5.0 — general release (build 37)
 

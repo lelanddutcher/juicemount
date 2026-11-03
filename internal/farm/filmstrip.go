@@ -158,8 +158,9 @@ func FilmstripDecodeContext(ctx context.Context, ffmpegBin, decoder string, bitD
 			"-vf", vf, "-frames:v", "1", "-q:v", "4", "-f", "image2", outPath)
 		fallbackOut, fallbackErr := runFilmstripPassContext(ctx, ffmpegBin, fallbackArgs, outPath)
 		if fallbackErr != nil {
-			return nil, fmt.Errorf("ffmpeg filmstrip %q: keyframe pass: %v: %s; full-decode fallback: %w: %s",
-				srcPath, fastErr, fastOut, fallbackErr, fallbackOut)
+			return nil, newToolFailure(fmt.Sprintf("ffmpeg filmstrip %q: keyframe pass: %v: %s; full-decode fallback: %v: %s",
+				srcPath, fastErr, fastOut, fallbackErr, fallbackOut), fallbackErr,
+				append(append([]byte(nil), fastOut...), fallbackOut...), srcPath, outPath)
 		}
 	}
 

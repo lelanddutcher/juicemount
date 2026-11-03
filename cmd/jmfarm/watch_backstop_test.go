@@ -249,9 +249,44 @@ func TestWatchBackstopCursorPreventsReplayAcrossLeaderRestart(t *testing.T) {
 	if err := q.ReleaseWatchLeadership(ctx, "server-b"); err != nil {
 		t.Fatal(err)
 	}
-	scanWatchBackstop(ctx, cfg, q, "server-c", []string{farmqueue.KindDerivatives}, time.Now())
-	if depth, err := q.QueueDepth(ctx); err != nil || depth != 0 {
-		t.Fatalf("replacement leader replayed old work: depth=%d err=%v", depth, err)
+	// The card landed just before the first epoch's cutoff, inside the clock-skew
+	// look-back, so the next leader may replay it once. The look-back stops at
+	// the previous cursor, so it replays it at most once, however soon leaders
+	// scan after one another.
+	for replay := 0; ; replay++ {
+		scanWatchBackstop(ctx, cfg, q, "server-c", []string{farmqueue.KindDerivatives}, time.Now())
+		depth, err := q.QueueDepth(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if depth == 0 {
+			t.Logf("replacement leaders replayed the change %d time(s)", replay)
+			break
+		}
+		if replay >= 1 || depth > 1 {
+			t.Fatalf("replacement leaders replayed old work again: replay %d depth=%d", replay+1, depth)
+		}
+		claim, ok, err := q.ClaimForWorker(ctx, time.Second, server)
+		if err != nil || !ok || claim.Job.Path != mount || claim.Job.TrackedEpoch == "" {
+			t.Fatalf("claim replayed root: %+v ok=%v err=%v", claim.Job, ok, err)
+		}
+		claim.Job.TrackedClaim = claim.Token
+		if err := q.CompleteTrackedEmptyPlanForClaim(ctx, claim); err != nil {
+			t.Fatal(err)
+		}
+		if err := q.AckClaim(ctx, claim); err != nil {
+			t.Fatal(err)
+		}
+		// Commit the replayed epoch.
+		scanWatchBackstop(ctx, cfg, q, "server-c", []string{farmqueue.KindDerivatives}, time.Now())
+	}
+	// Beyond the look-back, later scans never replay the change.
+	skew := time.Duration(farmEnvInt("JM_FARM_WATCH_BACKSTOP_SKEW_SEC", 120)) * time.Second
+	for _, later := range []time.Duration{skew + time.Minute, 2*skew + 2*time.Minute} {
+		scanWatchBackstop(ctx, cfg, q, "server-c", []string{farmqueue.KindDerivatives}, time.Now().Add(later))
+		if depth, err := q.QueueDepth(ctx); err != nil || depth != 0 {
+			t.Fatalf("scan %v later replayed old work: depth=%d err=%v", later, depth, err)
+		}
 	}
 }
 
@@ -450,5 +485,193 @@ func TestCatchupTraversalErrorCannotCompletePartialRoot(t *testing.T) {
 	targets, err := collectTargets(mount, "", 0, 0)
 	if err != nil || len(targets) != 2 {
 		t.Fatalf("restored root traversal = %v, %v; want both eligible media", targets, err)
+	}
+}
+
+// The cursor is this host's clock, but an mtime comes from the writing client's
+// clock. A client 30 s behind this host that writes just after a scan stamps
+// its file before the cursor, and the next scan used to treat the volume as
+// idle and advance past it for good.
+func TestWatchBackstopCatchesWriteFromClientBehindThisHost(t *testing.T) {
+	q, ctx := openBackstopTestQueue(t)
+	mount := t.TempDir()
+	card := filepath.Join(mount, "camera-card")
+	if err := os.Mkdir(card, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	settled := time.Now().Add(-10 * time.Minute)
+	for _, path := range []string{card, mount} {
+		if err := os.Chtimes(path, settled, settled); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cfg := queueConfig{mount: mount}
+	kinds := []string{farmqueue.KindDerivatives}
+	// Scan an hour ahead of the real clock, so the fixture's real ctimes are
+	// far behind every cursor and only the skewed mtime can be found.
+	firstScan := time.Now().Add(time.Hour)
+	scanWatchBackstop(ctx, cfg, q, "server-a", kinds, firstScan)
+	server := farmqueue.Worker{ID: "skew-claim-server", Name: "skew-claim-server", Role: farmqueue.QueueClassServer,
+		Capabilities: []string{"cpu", "metadata"}}
+	claim, ok, err := q.ClaimForWorker(ctx, time.Second, server)
+	if err != nil || !ok {
+		t.Fatalf("claim first tracked root: ok=%v err=%v", ok, err)
+	}
+	claim.Job.TrackedClaim = claim.Token
+	if err := q.CompleteTrackedEmptyPlanForClaim(ctx, claim); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.AckClaim(ctx, claim); err != nil {
+		t.Fatal(err)
+	}
+	scanWatchBackstop(ctx, cfg, q, "server-a", kinds, firstScan.Add(time.Second))
+	if state, err := q.GetWatchEpoch(ctx, mount); err != nil || state.Active != "" || !state.Cursor.Equal(firstScan) {
+		t.Fatalf("committed epoch = %+v, %v; want idle at cursor %v", state, err, firstScan)
+	}
+
+	// The client writes after the cursor was taken, by its clock 30 s earlier.
+	clip := filepath.Join(card, "late.mov")
+	if err := os.WriteFile(clip, []byte("clip"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	stamped := firstScan.Add(-30 * time.Second)
+	for _, path := range []string{clip, card} {
+		if err := os.Chtimes(path, stamped, stamped); err != nil {
+			t.Fatal(err)
+		}
+	}
+	scanWatchBackstop(ctx, cfg, q, "server-a", kinds, firstScan.Add(2*time.Second))
+	state, err := q.GetWatchEpoch(ctx, mount)
+	if err != nil || state.Active == "" {
+		t.Fatalf("after a skewed write: epoch = %+v, %v; want a new root epoch", state, err)
+	}
+}
+
+// completeWatchEpoch serves the active root epoch's planner with an empty plan
+// and commits the epoch with a scan at commitAt.
+func completeWatchEpoch(t *testing.T, ctx context.Context, q *farmqueue.Client, cfg queueConfig, kinds []string, commitAt time.Time) {
+	t.Helper()
+	server := farmqueue.Worker{ID: "epoch-claim-server", Name: "epoch-claim-server", Role: farmqueue.QueueClassServer,
+		Capabilities: []string{"cpu", "metadata"}}
+	claim, ok, err := q.ClaimForWorker(ctx, time.Second, server)
+	if err != nil || !ok || claim.Job.TrackedEpoch == "" {
+		t.Fatalf("claim root planner: %+v ok=%v err=%v", claim.Job, ok, err)
+	}
+	claim.Job.TrackedClaim = claim.Token
+	if err := q.CompleteTrackedEmptyPlanForClaim(ctx, claim); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.AckClaim(ctx, claim); err != nil {
+		t.Fatal(err)
+	}
+	scanWatchBackstop(ctx, cfg, q, "server-a", kinds, commitAt)
+	if state, err := q.GetWatchEpoch(ctx, cfg.mount); err != nil || state.Active != "" {
+		t.Fatalf("epoch not committed at %v: %+v %v", commitAt, state, err)
+	}
+}
+
+// With scans one minute apart (the shortest backstop interval), one change
+// just before a scan starts the epoch it needs and at most one more from the
+// clock-skew look-back.
+func TestWatchBackstopLookBackStartsAtMostOneExtraEpoch(t *testing.T) {
+	q, ctx := openBackstopTestQueue(t)
+	interval := time.Minute
+	mount := t.TempDir()
+	card := filepath.Join(mount, "camera-card")
+	if err := os.Mkdir(card, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfg := queueConfig{mount: mount}
+	kinds := []string{farmqueue.KindDerivatives}
+	// Scan an hour ahead of the real clock, so real ctimes play no part.
+	t0 := time.Now().Add(time.Hour)
+	old := t0.Add(-time.Hour)
+	for _, path := range []string{card, mount} {
+		if err := os.Chtimes(path, old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+	scanWatchBackstop(ctx, cfg, q, "server-a", kinds, t0.Add(-10*interval))
+	completeWatchEpoch(t, ctx, q, cfg, kinds, t0.Add(-9*interval))
+
+	clip := filepath.Join(card, "take.mov")
+	if err := os.WriteFile(clip, []byte("clip"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	changed := t0.Add(-time.Second)
+	for _, path := range []string{clip, card} {
+		if err := os.Chtimes(path, changed, changed); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	epochs := 0
+	for tick := 0; tick < 10; tick++ {
+		now := t0.Add(time.Duration(tick) * interval)
+		state, err := q.GetWatchEpoch(ctx, mount)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if state.Active != "" {
+			completeWatchEpoch(t, ctx, q, cfg, kinds, now)
+			continue
+		}
+		scanWatchBackstop(ctx, cfg, q, "server-a", kinds, now)
+		if state, err := q.GetWatchEpoch(ctx, mount); err != nil {
+			t.Fatal(err)
+		} else if state.Active != "" {
+			epochs++
+		}
+	}
+	t.Logf("one change started %d epoch(s)", epochs)
+	if epochs < 1 || epochs > 2 {
+		t.Fatalf("one change started %d epochs; want the one it needs and at most one more", epochs)
+	}
+}
+
+// Idle advances must not shrink the look-back. When each idle scan recorded
+// the cursor it replaced as the floor, leaders restarting 30 s apart cut the
+// tolerated skew to 30 s, and a write from a client 60 s behind, landing just
+// after an idle advance, was missed for good.
+func TestWatchBackstopIdleAdvancesKeepTheFullLookBack(t *testing.T) {
+	q, ctx := openBackstopTestQueue(t)
+	mount := t.TempDir()
+	card := filepath.Join(mount, "camera-card")
+	if err := os.Mkdir(card, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfg := queueConfig{mount: mount}
+	kinds := []string{farmqueue.KindDerivatives}
+	// Scan an hour ahead of the real clock, so real ctimes play no part.
+	t0 := time.Now().Add(time.Hour)
+	old := t0.Add(-time.Hour)
+	for _, path := range []string{card, mount} {
+		if err := os.Chtimes(path, old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+	scanWatchBackstop(ctx, cfg, q, "server-a", kinds, t0.Add(-10*time.Minute))
+	completeWatchEpoch(t, ctx, q, cfg, kinds, t0.Add(-9*time.Minute))
+	// Restarting leaders find nothing and advance the idle cursor 30 s apart.
+	for _, at := range []time.Time{t0, t0.Add(30 * time.Second)} {
+		scanWatchBackstop(ctx, cfg, q, "server-a", kinds, at)
+		if state, err := q.GetWatchEpoch(ctx, mount); err != nil || state.Active != "" || !state.Cursor.Equal(at) {
+			t.Fatalf("idle scan at %v: %+v %v", at, state, err)
+		}
+	}
+	// Just after the last advance, a client 60 s behind writes a clip.
+	clip := filepath.Join(card, "late.mov")
+	if err := os.WriteFile(clip, []byte("clip"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	stamped := t0.Add(30*time.Second - 60*time.Second)
+	for _, path := range []string{clip, card} {
+		if err := os.Chtimes(path, stamped, stamped); err != nil {
+			t.Fatal(err)
+		}
+	}
+	scanWatchBackstop(ctx, cfg, q, "server-a", kinds, t0.Add(60*time.Second))
+	if state, err := q.GetWatchEpoch(ctx, mount); err != nil || state.Active == "" {
+		t.Fatalf("write from a client 60 s behind: epoch = %+v, %v; want a new root epoch", state, err)
 	}
 }

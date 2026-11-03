@@ -14,9 +14,24 @@ import (
 // sufficient because queue jobs recurse below it. Root-level files are
 // emitted directly; hidden/derivative trees use the keyspace feedback guard.
 //
+// A folder copied to the volume root with preserved dates (rsync -a, cp -p,
+// Finder) carries mtimes older than the cursor all the way down, and the root
+// itself cannot be a candidate. A copy cannot preserve ctime, so a top-level
+// entry whose ctime is after the cursor is a candidate too. Hidden entries are
+// still skipped, and a delete at the root leaves no entry to report, so a
+// Finder .DS_Store or a removal does not rescan the volume. chmod and xattr
+// changes also move ctime; that costs one recursive job for that entry.
+//
 // This is a low-frequency backstop for Redis PubSub gaps, not the primary
 // watcher. It deliberately performs no writes and is bounded by maxCandidates.
 func DiscoverModified(ctx context.Context, mount string, cursor time.Time, maxCandidates int) ([]string, bool, error) {
+	return discoverModified(ctx, mount, cursor, maxCandidates, changeTime)
+}
+
+// discoverModified takes the ctime source as a parameter so tests can describe
+// a tree whose entries were created at their mtimes.
+func discoverModified(ctx context.Context, mount string, cursor time.Time, maxCandidates int,
+	changeTime func(fs.FileInfo) time.Time) ([]string, bool, error) {
 	if maxCandidates <= 0 {
 		maxCandidates = 2000
 	}
@@ -34,6 +49,7 @@ func DiscoverModified(ctx context.Context, mount string, cursor time.Time, maxCa
 		if err != nil {
 			return err
 		}
+		topLevel := rel != "." && filepath.Dir(rel) == "."
 		if entry.IsDir() {
 			if rel == "." {
 				return nil
@@ -45,7 +61,7 @@ func DiscoverModified(ctx context.Context, mount string, cursor time.Time, maxCa
 			if err != nil {
 				return err
 			}
-			if info.ModTime().After(cursor) {
+			if info.ModTime().After(cursor) || (topLevel && changeTime(info).After(cursor)) {
 				paths = append(paths, filepath.ToSlash(rel))
 				if len(paths) >= maxCandidates {
 					saturated = true
@@ -62,7 +78,7 @@ func DiscoverModified(ctx context.Context, mount string, cursor time.Time, maxCa
 		if err != nil {
 			return err
 		}
-		if !info.ModTime().After(cursor) {
+		if !info.ModTime().After(cursor) && !(topLevel && changeTime(info).After(cursor)) {
 			return nil
 		}
 		// The mount root cannot be enqueued by inode, while nested files are
