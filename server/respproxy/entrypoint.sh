@@ -4,11 +4,14 @@
 # 1. Renders the proxy principals file /etc/jm-respproxy/principals.json:
 #    the server principals (farm, manager, bg, webdav, admin) are hashed
 #    from their JM_PROXY_*_PASSWORD secrets at every start; the Mac
-#    principals the Manager wrote there are kept verbatim. The Manager and
-#    this script serialize on .principals.lock and both replace the file
-#    atomically with mode 0600.
+#    principals the Manager wrote there are kept verbatim, and so are the
+#    format version and people (person grants) of a version-2 file. The
+#    Manager and this script serialize on .principals.lock and both replace
+#    the file atomically with mode 0600.
 # 2. Writes the proxy config to /run/jm-respproxy/config.json (container
-#    local: the shared directory cannot redirect the upstream).
+#    local: the shared directory cannot redirect the upstream). The
+#    per-person audit log goes to $DIR/audit (JM_RESPPROXY_AUDIT_DIR;
+#    "off" disables it), which the Manager reads.
 # 3. Execs jm-respproxy with the applied-reload handshake enabled. The
 #    proxy owns polling, exact-byte validation, session revocation, applied
 #    receipts and heartbeat. A successful signal alone is never an ACK.
@@ -29,6 +32,8 @@ UPSTREAM="${JM_RESPPROXY_UPSTREAM:-redis:6379}"
 LISTEN="${JM_RESPPROXY_LISTEN:-0.0.0.0:6379}"
 STATS="${JM_RESPPROXY_STATS:-127.0.0.1:9180}"
 PROXY_BIN="${JM_RESPPROXY_BIN:-jm-respproxy}"
+AUDIT_DIR="${JM_RESPPROXY_AUDIT_DIR:-$DIR/audit}"
+[ "$AUDIT_DIR" != off ] || AUDIT_DIR=""
 
 log() { printf '[jm-respproxy-entrypoint] %s\n' "$*" >&2; }
 die() { log "$*"; exit 2; }
@@ -63,12 +68,17 @@ render_principals() {
   (
     flock -x 9
     macs="[]"
+    # Keep the people (person grants) of a version-2 file: dropping them here
+    # would lift every grant until the Manager next writes the file.
+    rest="{}"
     if [ -s "$PRINCIPALS" ]; then
       macs="$(jq -c '[.principals[]? | select(.kind == "mac")]' "$PRINCIPALS")" ||
         die "existing $PRINCIPALS is not valid JSON; refusing to drop enrolled Macs"
+      rest="$(jq -c '{version, people} | with_entries(select(.value != null))' "$PRINCIPALS")" ||
+        die "existing $PRINCIPALS is not valid JSON; refusing to drop person grants"
     fi
     tmp="$(mktemp "$DIR/.principals.json.tmp-XXXXXX")"
-    if ! jq -n --argjson s "$server" --argjson m "$macs" '{principals: ($s + $m)}' > "$tmp"; then
+    if ! jq -n --argjson s "$server" --argjson m "$macs" --argjson r "$rest" '$r + {principals: ($s + $m)}' > "$tmp"; then
       rm -f "$tmp"; die "rendering principals failed"
     fi
     chmod 0600 "$tmp"
@@ -78,10 +88,11 @@ render_principals() {
 }
 
 render_config() {
-  jq -n --arg listen "$LISTEN" --arg up "$UPSTREAM" --arg stats "$STATS" --arg p "$PRINCIPALS" --arg mode "$MODE" --argjson stage_birth "$STAGE_BIRTH" '{
+  jq -n --arg listen "$LISTEN" --arg up "$UPSTREAM" --arg stats "$STATS" --arg p "$PRINCIPALS" --arg mode "$MODE" --argjson stage_birth "$STAGE_BIRTH" --arg audit "$AUDIT_DIR" '{
     listen: $listen, upstream: $up, upstream_user: "jm-proxy",
     upstream_password_env: "JM_RESPPROXY_UPSTREAM_PASSWORD",
-    stats: $stats, principals: $p, mode: $mode, stage_birth: $stage_birth, reload_handshake: true }' > "$CONFIG.tmp"
+    stats: $stats, principals: $p, mode: $mode, stage_birth: $stage_birth, reload_handshake: true,
+    audit_dir: $audit }' > "$CONFIG.tmp"
   mv -f "$CONFIG.tmp" "$CONFIG"
 }
 

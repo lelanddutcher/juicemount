@@ -15,6 +15,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/lelanddutcher/juicemount/internal/auditlog"
 )
 
 // Proxy-owned keys in the volume DB (plan §1.2).
@@ -89,6 +91,12 @@ type Config struct {
 	// It runs once and must not wait for this proxy's Close or Done.
 	BeforeSideClose func()
 	Logf            func(format string, args ...any)
+	// Audit, if set, receives the per-person mutation log (audit.go). The
+	// caller owns it and closes it after Done.
+	Audit *auditlog.Writer
+	// AuditWindow is how long content writes of one inode by one principal
+	// are collapsed into one record; default 10 s.
+	AuditWindow time.Duration
 }
 
 // Proxy is the enforcing RESP proxy. One upstream connection per client.
@@ -103,6 +111,7 @@ type Proxy struct {
 	policy     Policy
 	mode       atomic.Value // Mode
 	side       *SidePool
+	audit      *auditSink // nil: no audit log
 
 	mu           sync.Mutex
 	preAuth      map[string]*ipGate // client IP -> unauthenticated connections
@@ -194,6 +203,9 @@ func New(cfg Config) (*Proxy, error) {
 	p.Guard.counters = sideCounters{p}
 	p.stageBirth.Store(cfg.StageBirth)
 	p.setMode(cfg.Mode, "config")
+	if cfg.Audit != nil {
+		p.audit = newAuditSink(cfg.Audit, cfg.AuditWindow, cfg.Logf)
+	}
 	return p, nil
 }
 
@@ -453,6 +465,9 @@ func (p *Proxy) Close() error {
 	p.mu.Unlock()
 	p.wg.Wait()
 	p.bgwg.Wait()
+	if p.audit != nil {
+		p.audit.close() // every connection ended: no Done is still to come
+	}
 	if p.cfg.BeforeSideClose != nil {
 		p.cfg.BeforeSideClose()
 	}
@@ -1324,9 +1339,15 @@ func UpstreamName(principal string, connID uint64) string {
 func (c *conn) upstreamName() string { return UpstreamName(c.principal.Name, c.id) }
 
 func (c *conn) newUnit(kind UnitKind, cmds []Cmd) *Unit {
-	u := &Unit{Kind: kind, DB: c.db, Cmds: cmds, Mode: c.p.Mode(), ConnID: c.id, Remote: c.remote}
+	u := &Unit{Kind: kind, DB: c.db, Cmds: cmds, Mode: c.p.Mode(), ConnID: c.id, Remote: c.remote,
+		wantAudit: c.p.audit != nil}
 	if c.principal != nil {
 		u.UpstreamName = c.upstreamName()
+		if c.principal.Kind == KindMac {
+			// The current table, not the one of the AUTH: a grant change
+			// applies to the next unit without a reconnect.
+			u.Person = c.p.Auth.table.Load().PersonOf(c.principal.Name)
+		}
 	}
 	if kind == UnitTxn {
 		u.beforeSide = c.confirmWatch
@@ -1399,7 +1420,7 @@ func (c *conn) decide(u *Unit) (*Denial, Verdict, []guardEffect) {
 	switch {
 	case d == nil:
 		c.cs.allow(pr)
-	case u.Mode == ModeObserve || u.Mode == ModePassthrough:
+	case (u.Mode == ModeObserve || u.Mode == ModePassthrough) && !enforcedInEveryMode(d.Reason):
 		c.p.Stats.recordDecision(DecWouldDeny, d, pr, u)
 		d = nil
 	default:
@@ -1419,14 +1440,21 @@ func (c *conn) gateBare(args [][]byte, info Command) error {
 	c.p.Stats.analyse("bare", writesOf(cmds))
 	u := c.newUnit(UnitBare, cmds)
 	d, v, effects := c.decide(u)
+	done := v.Done
+	if d == nil {
+		if done, d = c.auditStart(u, v.Done); d != nil {
+			c.p.Stats.recordDecision(DecDeny, d, *c.principal, u)
+		}
+	}
 	if d != nil {
 		if v.Done != nil {
 			v.Done(Outcome{ConnID: c.id})
 		}
+		c.auditRefused(u, d)
 		c.reply(d.Reply())
 		return nil
 	}
-	s := slot{done: c.p.commitOnSuccess(effects, v.Done)}
+	s := slot{done: c.p.commitOnSuccess(effects, done)}
 	switch counter, n := Allocation(u); counter {
 	case "nextsession":
 		s.hook = c.p.sessionHook(c.principal.Name, n)
@@ -1513,10 +1541,17 @@ func (c *conn) exec() error {
 	} else {
 		d, v, effects = c.decide(u)
 	}
+	done := v.Done
+	if d == nil {
+		if done, d = c.auditStart(u, v.Done); d != nil {
+			c.p.Stats.recordDecision(DecDeny, d, *c.principal, u)
+		}
+	}
 	if d != nil {
 		if v.Done != nil {
 			v.Done(Outcome{ConnID: c.id})
 		}
+		c.auditRefused(u, d)
 		c.p.Stats.discards.Add(1)
 		if err := c.forward(strArgs("DISCARD"), slot{drop: true}); err != nil {
 			return err
@@ -1538,14 +1573,14 @@ func (c *conn) exec() error {
 	}
 	if u.replacementReceipt != nil {
 		if err := c.forward(u.replacementReceipt, slot{drop: true}); err != nil {
-			if v.Done != nil {
-				v.Done(Outcome{Forwarded: true, Lost: true, ConnID: c.id})
+			if done != nil {
+				done(Outcome{Forwarded: true, Lost: true, ConnID: c.id})
 			}
 			return err
 		}
 		extra++
 	}
-	es := slot{exec: true, strip: extra, done: c.p.commitOnSuccess(effects, v.Done)}
+	es := slot{exec: true, strip: extra, done: c.p.commitOnSuccess(effects, done)}
 	if u.replacementReceipt != nil {
 		es.execCount = len(u.Cmds) + extra
 	}

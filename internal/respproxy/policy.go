@@ -99,6 +99,11 @@ type Unit struct {
 	// Decide MUST check the principal may write every RefInode, exactly as
 	// for the inodes of Project.
 	RefInodes []uint64
+	// Person (added for Teams slice 1, additive) is the person the
+	// principal's device belongs to in the current principals table (nil:
+	// none). A Mac of a person whose access is "granted" may write only
+	// inside that person's grants; Decide checks it in every mode.
+	Person *Person
 
 	// beforeSide, set by the proxy, makes the connection's buffered WATCH
 	// reach Redis (and waits for its +OK) before the guard's first side read.
@@ -115,6 +120,11 @@ type Unit struct {
 	ConnID       uint64
 	UpstreamName string
 	Remote       string // client address
+
+	// wantAudit, set by the proxy when the audit log is on, asks the lease
+	// engine to describe the unit for it (audit, set by Decide).
+	wantAudit bool
+	audit     *unitAudit
 }
 
 // Reason is the second token of a refusal reply.
@@ -130,12 +140,26 @@ const (
 	ReasonXProject          Reason = "XPROJECT"           // L2: a unit spanning projects the principal cannot hold together
 	ReasonAuthRequired      Reason = "AUTH_REQUIRED"      // the connection has not authenticated
 	ReasonProxyFenced       Reason = "PROXY_FENCED"       // this proxy lost its singleton lease; no writes
+	// ReasonNotGranted: the writer's person may write only inside its
+	// grants, and the unit touches a place they do not cover. Enforced in
+	// every mode.
+	ReasonNotGranted Reason = "NOT_GRANTED"
+	// ReasonAuditUnavailable: grants are in force and the audit log cannot
+	// record the unit. Enforced in every mode.
+	ReasonAuditUnavailable Reason = "AUDIT_UNAVAILABLE"
 )
 
 // AllReasons lists every reason the proxy can emit (tests fuzz over it).
 var AllReasons = []Reason{
 	ReasonLeaseHeld, ReasonAdminOnly, ReasonBGOnly, ReasonFarmOnly,
 	ReasonUnknownKey, ReasonPrincipalReadonly, ReasonXProject, ReasonAuthRequired, ReasonProxyFenced,
+	ReasonNotGranted, ReasonAuditUnavailable,
+}
+
+// enforcedInEveryMode: refusals that passthrough and observe do not relax
+// (the modes relax only the project-lease decision).
+func enforcedInEveryMode(r Reason) bool {
+	return r == ReasonNotGranted || r == ReasonAuditUnavailable
 }
 
 // Denial is a refusal. The proxy renders it as
@@ -216,8 +240,10 @@ const (
 	// Modes relax ONLY the project-lease decision (Policy.Decide). AUTH,
 	// the command gate and the key-class gate (guard.go: ADMIN_ONLY, BG_ONLY,
 	// FARM_ONLY, UNKNOWN_KEY, PRINCIPAL_READONLY, jmlease:*, setting/acl,
-	// unpinned scripts, cross-DB) refuse in every mode.
-	ModePassthrough Mode = "passthrough" // Decide is not called
+	// unpinned scripts, cross-DB) refuse in every mode, and so do person
+	// grants (NOT_GRANTED, AUDIT_UNAVAILABLE), which Decide checks even in
+	// passthrough.
+	ModePassthrough Mode = "passthrough" // leases are not checked (the lease engine's Decide still places units and checks grants)
 	ModeObserve     Mode = "observe"     // Decide is called; its refusals are admitted and logged WOULD_DENY
 	ModeEnforce     Mode = "enforce"     // Decide's refusals are enforced
 )

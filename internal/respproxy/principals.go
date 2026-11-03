@@ -35,8 +35,21 @@ type PrincipalEntry struct {
 }
 
 type principalsFile struct {
+	// Version is the file format: absent (or 1) is the original
+	// {"principals":[...]}; 2 adds People. A proxy refuses a version newer
+	// than PrincipalsFormat, and a proxy built before version 2 refuses
+	// every version-2 file (it does not know the "version" and "people"
+	// fields), keeping its old table. The Manager therefore writes version
+	// 2 only while the proxy's reload heartbeat advertises it
+	// (HeartbeatFormatToken), and the entrypoint of an older image drops
+	// both fields when it re-renders the file at start.
+	Version    int              `json:"version,omitempty"`
 	Principals []PrincipalEntry `json:"principals"`
+	People     []PersonEntry    `json:"people,omitempty"`
 }
+
+// PrincipalsFormat is the newest principals file version this proxy reads.
+const PrincipalsFormat = 2
 
 // argon2Hash is a parsed PHC argon2id string.
 type argon2Hash struct {
@@ -130,6 +143,10 @@ type principalRec struct {
 // Principals is a validated, immutable principal table.
 type Principals struct {
 	byName map[string]principalRec
+	// people maps a Mac principal (device) to its person; scoped is true
+	// when any person's writes are limited to grants (grants in force).
+	people map[string]*Person
+	scoped bool
 }
 
 // ParsePrincipals validates a principals file body. Every entry must have a
@@ -145,6 +162,12 @@ func ParsePrincipals(data []byte) (*Principals, error) {
 	var extra any
 	if err := dec.Decode(&extra); err != io.EOF {
 		return nil, errors.New("principals: trailing JSON or data")
+	}
+	switch {
+	case f.Version < 0 || f.Version > PrincipalsFormat:
+		return nil, fmt.Errorf("principals: format version %d is not supported (this proxy reads up to %d)", f.Version, PrincipalsFormat)
+	case f.Version < 2 && f.People != nil:
+		return nil, errors.New("principals: \"people\" needs format version 2")
 	}
 	ps := &Principals{byName: map[string]principalRec{}}
 	for i, e := range f.Principals {
@@ -167,6 +190,9 @@ func ParsePrincipals(data []byte) (*Principals, error) {
 			continue
 		}
 		ps.byName[e.Name] = principalRec{p: Principal{Name: e.Name, Kind: e.Kind, Host: e.Host}, hash: h}
+	}
+	if err := ps.parsePeople(f.People, f.Principals); err != nil {
+		return nil, err
 	}
 	return ps, nil
 }

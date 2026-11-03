@@ -90,7 +90,11 @@ type proxyPrincipalEntry struct {
 }
 
 type proxyPrincipalsFile struct {
+	// Version and People: format 2 (people.go). Both are omitted from a
+	// version-1 file, which stays byte-identical to the file of before.
+	Version    int                   `json:"version,omitempty"`
 	Principals []proxyPrincipalEntry `json:"principals"`
+	People     []proxyPersonEntry    `json:"people,omitempty"`
 }
 
 // argon2id parameters: the proxy's defaults (respproxy.DefaultArgon*), the
@@ -366,6 +370,10 @@ type MacPrincipal struct {
 	DeviceMismatch   bool   `json:"device_mismatch,omitempty"`
 	MismatchedDigest string `json:"mismatched_device_digest,omitempty"`
 
+	// Person: the ID of the person this Mac belongs to ("" = none;
+	// people.go).
+	Person string `json:"person,omitempty"`
+
 	// Per-Mac object keys (objkeys.go; JM_OBJ_PER_MAC=1). All empty when
 	// the mode was never on, so such a store is byte-identical to before.
 	//
@@ -464,6 +472,8 @@ type principalStoreFile struct {
 	// confirmed that keyd has not yet reported done.
 	ObjKeyOrphans        []string        `json:"obj_key_orphans,omitempty"`
 	ObjKeyOrphanRemoving []ObjKeyRemoval `json:"obj_key_orphan_removing,omitempty"`
+	// People: Teams slice 1 (people.go).
+	People []Person `json:"people,omitempty"`
 }
 
 // ProxySignaler asks the proxy to reload the principals file whose sha256
@@ -549,6 +559,13 @@ type PrincipalStore struct {
 	keepObjGens         map[string]int
 	keepObjOrphans      []string
 	keepObjOrphanRemove []ObjKeyRemoval
+
+	// people (people.go): by ID. proxyFormat: the principals file version
+	// the proxy last advertised (0 = not yet known). peopleWritten: the
+	// last principals file written carries the people.
+	people        map[string]*Person
+	proxyFormat   int
+	peopleWritten bool
 }
 
 // issuedRequest is one reload.request line this process wrote and when.
@@ -766,6 +783,9 @@ func NewPrincipalStore(opts PrincipalStoreOptions) (*PrincipalStore, error) {
 		}
 		s.keepObjSeq, s.keepObjGens = f.ObjKeysSeq, f.ObjKeyGens
 		s.keepObjOrphans, s.keepObjOrphanRemove = f.ObjKeyOrphans, f.ObjKeyOrphanRemoving
+		if err := s.loadPeople(f.People); err != nil {
+			return nil, err
+		}
 	case errors.Is(err, os.ErrNotExist):
 	default:
 		return nil, err
@@ -1594,6 +1614,9 @@ func (s *PrincipalStore) saveStoreLocked() error {
 		f.AutoApprovePerIP = s.autoPerIP
 	}
 	f.Principals = s.snapshotLocked(true).Principals
+	for _, p := range s.peopleLocked() {
+		f.People = append(f.People, *p)
+	}
 	f.ObjKeysSeq, f.ObjKeyGens = s.keepObjSeq, s.keepObjGens
 	if s.objk != nil {
 		f.ObjKeysSeq = s.objk.seq
@@ -1669,6 +1692,9 @@ func (s *PrincipalStore) writeProxyFilesLocked() error {
 	if next.Principals == nil {
 		next.Principals = []proxyPrincipalEntry{}
 	}
+	if next.People = s.proxyPeopleLocked(); next.People != nil {
+		next.Version = 2
+	}
 	body, err := json.MarshalIndent(next, "", "  ")
 	if err != nil {
 		return err
@@ -1682,6 +1708,7 @@ func (s *PrincipalStore) writeProxyFilesLocked() error {
 		return err
 	}
 	if err := writeFileAtomic0600(filepath.Join(dir, rollbackMacsName), []byte(acl.String())); err != nil {
+		defer func() { s.peopleWritten = fileFormat(dir) >= 2 }()
 		var undo error
 		if prev != nil {
 			undo = writeFileAtomic0600(path, prev)
@@ -1693,6 +1720,7 @@ func (s *PrincipalStore) writeProxyFilesLocked() error {
 		}
 		return err
 	}
+	s.peopleWritten = next.People != nil
 	if s.opts.Signal != nil {
 		sum := sha256.Sum256(body)
 		sha := hex.EncodeToString(sum[:])
@@ -2166,6 +2194,8 @@ func (a *API) registerH8B(mux *http.ServeMux, prefix string, cfg Config) {
 		}
 	}
 	mux.HandleFunc(prefix+"/api/principals/auto-approve", a.auth(pa.handleAutoApprove))
+	// Teams slice 1: people, grants and the audit log (people.go).
+	a.registerPeople(mux, prefix, pa.store)
 
 	metaURL := cfg.MetaURL
 	if metaURL == "" {

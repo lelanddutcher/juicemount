@@ -96,7 +96,9 @@ services:
   # applies the lease mode from jmlease:v1:cfg (passthrough → observe →
   # enforce, switched in the Manager). Unauthenticated connections are
   # refused. Principals file and reload handshake live in the shared
-  # directory below (the Manager writes Mac principals there, 0600).
+  # directory below (the Manager writes Mac principals there, 0600), and
+  # so does the per-person audit log (audit/, append-only, hash-chained;
+  # the Manager reads it; segments are never deleted automatically).
   respproxy:
     image: ghcr.io/lelanddutcher/jm-respproxy@${JM_RESPPROXY_DIGEST:?set JM_RESPPROXY_DIGEST to the release sha256 digest}
     pull_policy: always
@@ -124,6 +126,14 @@ services:
       - /mnt/zSSD/juicemount/respproxy:/etc/jm-respproxy   # EDIT — shared with Manager
 
   # ── MinIO: S3 object store for chunks ────────────────────────────
+  # Bucket versioning and MinIO audit logging are deliberately NOT enabled
+  # here (Teams slice 1). Versioning cannot be turned off once on (only
+  # suspended), and juicefs gc deletes without a version id, so every
+  # deleted or compacted object would stay on disk as a noncurrent version
+  # until an ILM expiry rule and MinIO's scanner remove it: space freed by
+  # gc would come back days later, on a NAS that may already be full.
+  # MinIO's audit log has no file target (webhook or Kafka only), so it
+  # needs a receiver this compose does not ship.
   minio:
     image: minio/minio:RELEASE.2025-01-20T14-49-07Z@sha256:ed9be66eb5f2636c18289c34c3b725ddf57815f2777c77b5938543b78a44f144
     restart: unless-stopped

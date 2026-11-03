@@ -171,6 +171,8 @@ type JobManager struct {
 	// (smartfolders.go), nil unless JM_SMART_FOLDERS=on. StopAll stops it
 	// after cancelling jobs and before the FUSE mount goes away.
 	smartFolders interface{ Stop() }
+	// stoppers end background loops StopAll owns (the people sync).
+	stoppers []func()
 }
 
 // destinationStore is the minimum surface JobManager needs to keep the
@@ -800,6 +802,8 @@ func (m *JobManager) StopAll() {
 	sched := m.schedules
 	maintSched := m.maintenanceSchedules
 	smart := m.smartFolders
+	stoppers := m.stoppers
+	m.stoppers = nil
 	ids := make([]string, 0, len(m.jobs))
 	for id := range m.jobs {
 		ids = append(ids, id)
@@ -819,6 +823,16 @@ func (m *JobManager) StopAll() {
 	if smart != nil {
 		smart.Stop()
 	}
+	for _, stop := range stoppers {
+		stop()
+	}
+}
+
+// onStopAll registers a function StopAll calls once.
+func (m *JobManager) onStopAll(stop func()) {
+	m.mu.Lock()
+	m.stoppers = append(m.stoppers, stop)
+	m.mu.Unlock()
 }
 
 // run executes a sync job and updates state as it progresses.

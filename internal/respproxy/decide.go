@@ -60,6 +60,8 @@ type LeaseEngine struct {
 
 	topo sync.RWMutex
 
+	grants grantCache // person grant paths -> directories (grants.go)
+
 	mu       sync.Mutex
 	leases   map[uint64]*lease
 	fences   map[uint64]*sync.RWMutex
@@ -302,6 +304,9 @@ func (e *LeaseEngine) Decide(p Principal, u *Unit) Verdict {
 		}
 	}
 	var onTimeout func()
+	// rootTouch: the unit changes an entry above the project depth; once it
+	// committed (or may have), grant paths are looked up again.
+	rootTouch := false
 	done := func(o Outcome) {
 		relMu.Lock()
 		defer relMu.Unlock()
@@ -331,6 +336,9 @@ func (e *LeaseEngine) Decide(p Principal, u *Unit) Verdict {
 		case o.Committed:
 			e.anc.learnCommitted(f)
 		}
+		if rootTouch && !timedOut && (o.Lost || o.Committed) {
+			e.grants.epoch.Add(1)
+		}
 		if hooks != nil && hooks.done != nil && !released {
 			hooks.done(p, u, o, epochs)
 		}
@@ -357,6 +365,9 @@ func (e *LeaseEngine) Decide(p Principal, u *Unit) Verdict {
 		e.queueLog(logEntry{"event", "fence_timeout", "actor", p.Name, "unit", summarizeUnit(u),
 			"ts_ms", strconv.FormatInt(ms(e.now()), 10)})
 		e.anc.forget(f) // outcome unknown: drop its edges, re-resolve from Redis
+		if rootTouch {
+			e.grants.epoch.Add(1)
+		}
 		timedOut = true
 		releaseLocked()
 	}
@@ -383,6 +394,14 @@ func (e *LeaseEngine) Decide(p Principal, u *Unit) Verdict {
 		e.nDeny.Add(1)
 		e.logDeny(p, d, u.Mode, u)
 		return arm(Verdict{Deny: d, Done: done})
+	}
+
+	// Person grants come first and hold in every mode, also for a unit the
+	// lease rules below would only log (grants.go).
+	if grantsApply(p, u) {
+		if d := e.grantCheck(p, u, f); d != nil {
+			return deny(d)
+		}
 	}
 
 	if len(f.unresolvable) > 0 {
@@ -454,6 +473,10 @@ func (e *LeaseEngine) Decide(p Principal, u *Unit) Verdict {
 			pd = hd
 		}
 		return deny(pd)
+	}
+	rootTouch = e.touchesRoot(f)
+	if u.wantAudit {
+		u.audit = e.describe(f, locs)
 	}
 	projSet := map[uint64]bool{}
 	for _, l := range locs {

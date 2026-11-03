@@ -26,6 +26,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/lelanddutcher/juicemount/internal/auditlog"
 	"github.com/lelanddutcher/juicemount/internal/respproxy"
 )
 
@@ -43,6 +44,10 @@ type fileConfig struct {
 	TrackAnchors        bool   `json:"track_anchors"`
 	StageBirth          bool   `json:"stage_birth"`
 	ReloadHandshake     bool   `json:"reload_handshake"`
+	// AuditDir holds the per-person mutation log (internal/auditlog);
+	// empty = no log. The entrypoint sets <principals dir>/audit, which
+	// the Manager reads.
+	AuditDir string `json:"audit_dir"`
 }
 
 // Resolve the same effective defaults used by the CLI before constructing a
@@ -119,6 +124,18 @@ func main() {
 	}
 	proxyCfg.Principals = ps
 	proxyCfg.UpstreamPassword = os.Getenv(fc.UpstreamPasswordEnv)
+	var audit *auditlog.Writer
+	if fc.AuditDir != "" {
+		// A log that cannot open does not stop the proxy: the writer starts
+		// failed and retries, and Mac writes are refused only while grants
+		// are in force (fail closed); otherwise they go ahead unlogged.
+		audit, err = auditlog.Open(fc.AuditDir, auditlog.Options{})
+		if err != nil {
+			log.Printf("audit log %s unavailable (retrying): %v", fc.AuditDir, err)
+		}
+		defer audit.Close() // after the proxy joined: every outcome is queued
+		proxyCfg.Audit = audit
+	}
 	p, err := respproxy.New(proxyCfg)
 	if err != nil {
 		log.Fatal(err)
@@ -221,6 +238,9 @@ func main() {
 	err = p.Serve(ln)
 	closeJoined()
 	<-controlDone
+	if audit != nil {
+		audit.Close() // log.Fatalf below skips deferred calls
+	}
 	if err != nil {
 		log.Fatalf("serve: %v", err)
 	}
