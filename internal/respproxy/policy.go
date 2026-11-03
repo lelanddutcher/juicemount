@@ -110,6 +110,9 @@ type Unit struct {
 	// nextinode batch held inode n (Guard.inodes); ok is false for a number
 	// the proxy never handed out.
 	inodeOwner func(n uint64) (owner string, ok bool, err error)
+	// inodeMark, set by the proxy, returns the highest inode number handed
+	// out before the proxy began recording batches (InodeMarkKey).
+	inodeMark func() (uint64, error)
 	// upstreamID returns the CLIENT ID of the connection's upstream Redis
 	// connection (0 = not known yet). Its reply precedes every later reply on
 	// that connection, so it is known once beforeSide has returned.

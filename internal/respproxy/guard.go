@@ -1496,9 +1496,9 @@ func isHSet(name string) bool { return name == "HSET" || name == "HSETNX" || nam
 //
 // CUTOVER (runbook, lane L5): a session a mount registered BEFORE the proxy
 // existed has no owner record, so every heartbeat or session write from it
-// is refused (BG_ONLY), as is any slice from a pre-proxy nextchunk batch
-// and any create from an inode batch no recorded INCRBY nextinode handed it
-// (also a batch a mount took before the proxy recorded inode batches).
+// is refused (BG_ONLY), as is any slice from a pre-proxy nextchunk batch.
+// (An inode batch taken before the proxy recorded batches stays usable:
+// newInodeGate.)
 // Every mount must remount through the proxy at cutover: restart the
 // JuiceMount app on every Mac (and the server's juicefs mounts) in the same
 // step that moves port 30179 to the proxy. Removing or rewriting another principal's session is

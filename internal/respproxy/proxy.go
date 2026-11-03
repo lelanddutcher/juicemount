@@ -104,6 +104,13 @@ type Proxy struct {
 	mode       atomic.Value // Mode
 	side       *SidePool
 
+	// inodeOwners is Guard.inodes; inodeMark caches InodeMarkKey once read
+	// (it is set once and never changes).
+	inodeOwners *redisRanges
+	inodeMarkMu sync.Mutex
+	inodeMarkV  uint64
+	inodeMarkOK bool
+
 	mu           sync.Mutex
 	preAuth      map[string]*ipGate // client IP -> unauthenticated connections
 	preAuthTotal int                // unauthenticated connections, all IPs
@@ -191,7 +198,8 @@ func New(cfg Config) (*Proxy, error) {
 	p.side = &SidePool{dial: p.dialUpstream, max: 8}
 	p.Guard = NewGuard(&redisSessions{p: p, cache: map[uint64]string{}}, sideChunks{p})
 	p.Guard.slices = &redisSlices{redisRanges: redisRanges{p: p, key: SliceOwnersKey}}
-	p.Guard.inodes = &redisRanges{p: p, key: InodeOwnersKey}
+	p.inodeOwners = &redisRanges{p: p, key: InodeOwnersKey}
+	p.Guard.inodes = p.inodeOwners
 	p.Guard.logf = p.Logf
 	p.Guard.counters = sideCounters{p}
 	p.Guard.side = p.side
@@ -1347,6 +1355,7 @@ func (c *conn) newUnit(kind UnitKind, cmds []Cmd) *Unit {
 	}
 	u.upstreamID = c.upID.Load
 	u.inodeOwner = c.p.Guard.inodes.Owner
+	u.inodeMark = c.p.inodeMark
 	if kind == UnitTxn {
 		u.beforeSide = c.confirmWatch
 	}
@@ -1452,7 +1461,16 @@ func (c *conn) gateBare(args [][]byte, info Command) error {
 	case "nextchunk":
 		s.hook = c.p.idHook(c.p.Guard.slices, "slice ids", c.principal.Name, n)
 	case "nextinode":
-		s.hook = c.p.idHook(c.p.Guard.inodes, "inodes", c.principal.Name, n)
+		// The batch and its owner record are one script, so Redis (and its
+		// AOF) holds both or neither. The reply is INCRBY's.
+		args = strArgs("EVAL", inodeAllocLua, "3", string(args[1]), InodeOwnersKey, InodeMarkKey,
+			strconv.FormatInt(n, 10), c.principal.Name)
+		owner := c.principal.Name
+		s.hook = func(v Value) {
+			if v.Type == ':' && v.Int >= n {
+				c.p.inodeOwners.remember(sliceRange{uint64(v.Int - n + 1), uint64(v.Int), owner})
+			}
+		}
 	case "nextTrash":
 		db := c.db
 		s.hook = func(v Value) {
@@ -1899,6 +1917,63 @@ const SliceOwnersKey = "jmlease:v1:slices"
 
 // InodeOwnersKey is the same for inode numbers (nextinode batches).
 const InodeOwnersKey = "jmlease:v1:inodes"
+
+// InodeMarkKey holds nextinode as it was when the proxy began recording
+// inode batches. It is set once, before the first recorded batch, and never
+// changed: every number at or below it was handed out before recording
+// began, every number above it by a recorded INCRBY.
+const InodeMarkKey = "jmlease:v1:inodes:mark"
+
+// inodeMarkLua: KEYS nextinode, mark. Sets the mark from nextinode if it is
+// not set yet, and returns it.
+const inodeMarkLua = `if redis.call('EXISTS', KEYS[2]) == 0 then
+  redis.call('SET', KEYS[2], redis.call('GET', KEYS[1]) or '0')
+end
+return redis.call('GET', KEYS[2])`
+
+// inodeAllocLua: KEYS nextinode, owners, mark; ARGV n, owner. A juicefs
+// inode batch (INCRBY nextinode n) recorded as owner's in the same script,
+// merged with owner's range ending just below it; the mark is set first if
+// it is not set yet. Returns the INCRBY reply.
+const inodeAllocLua = `if redis.call('EXISTS', KEYS[3]) == 0 then
+  redis.call('SET', KEYS[3], redis.call('GET', KEYS[1]) or '0')
+end
+local hi = redis.call('INCRBY', KEYS[1], ARGV[1])
+local lo = hi - tonumber(ARGV[1]) + 1
+local owner = ARGV[2]
+local prev = redis.call('ZRANGE', KEYS[2], lo - 1, lo - 1, 'BYSCORE')
+for _, m in ipairs(prev) do
+  local plo, phi, pown = string.match(m, '^(%d+):(%d+):(.+)$')
+  if pown == owner and tonumber(phi) + 1 == lo then
+    redis.call('ZREM', KEYS[2], m)
+    lo = tonumber(plo)
+  end
+end
+redis.call('ZADD', KEYS[2], hi, string.format('%.0f', lo) .. ':' .. string.format('%.0f', hi) .. ':' .. owner)
+return hi`
+
+// inodeMark returns InodeMarkKey, setting it from nextinode if this is the
+// first time recording needs it.
+func (p *Proxy) inodeMark() (uint64, error) {
+	p.inodeMarkMu.Lock()
+	defer p.inodeMarkMu.Unlock()
+	if p.inodeMarkOK {
+		return p.inodeMarkV, nil
+	}
+	v, err := p.side.Do(p.cfg.VolumeDB, strArgs("EVAL", inodeMarkLua, "2", "nextinode", InodeMarkKey)...)
+	if err == nil {
+		err = v.Err()
+	}
+	if err != nil {
+		return 0, err
+	}
+	n, err := strconv.ParseUint(string(v.Str), 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("%s: %q", InodeMarkKey, v.Str)
+	}
+	p.inodeMarkV, p.inodeMarkOK = n, true
+	return n, nil
+}
 
 // redisRanges persists id-range ownership in a ZSET shaped like
 // SliceOwnersKey; memory holds only a bounded cache of recent ranges (a

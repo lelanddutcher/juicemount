@@ -449,6 +449,119 @@ func TestCleanupScopeTrashRootFromProjectTxn(t *testing.T) {
 	}
 }
 
+// forgetInodeRecords puts the proxy and Redis in the state an upgrade from
+// a version that did not record inode batches leaves: no owner records, and
+// recording not begun (its mark is taken at the next need).
+func forgetInodeRecords(t *testing.T, r *leaseRig, db *redis.Client) {
+	t.Helper()
+	if err := db.Del(context.Background(), InodeOwnersKey, InodeMarkKey).Err(); err != nil {
+		t.Fatal(err)
+	}
+	o := r.tp.inodeOwners
+	o.mu.Lock()
+	o.cache = nil
+	o.mu.Unlock()
+	r.tp.inodeMarkMu.Lock()
+	r.tp.inodeMarkOK = false
+	r.tp.inodeMarkMu.Unlock()
+}
+
+// A mount that took its inode batch before the proxy recorded batches keeps
+// creating from it after the upgrade, without a remount. Numbers handed out
+// after recording began must still come from the creator's own batch, and
+// a proxy restart neither moves the mark nor loses an owner.
+func TestCleanupScopeInodesBeforeRecording(t *testing.T) {
+	r, db := cleanupScopeRig(t, 1)
+	ctx := context.Background()
+	mb := scopeClient(t, r, "mac2", nil)
+	var ino meta.Ino
+	var attr meta.Attr
+	if st := mb.Create(meta.Background(), 4, "before.mov", 0644, 0, 0, &ino, &attr); st != 0 || ino != 1001 {
+		t.Fatalf("create before the upgrade: %v, inode %d", st, ino)
+	}
+	forgetInodeRecords(t, r, db) // mac2's mount still holds 1002..2024
+	if st := mb.Create(meta.Background(), 4, "after.mov", 0644, 0, 0, &ino, &attr); st != 0 || ino != 1002 {
+		t.Fatalf("create after the upgrade from the batch taken before it: %v, inode %d", st, ino)
+	}
+	noRefusals(t, r, "mac2", "creates across the upgrade")
+	if got := db.Get(ctx, InodeMarkKey).Val(); got != "2024" {
+		t.Fatalf("mark %q, want nextinode when recording began (2024)", got)
+	}
+
+	rc := r.conn(t, "mac1")
+	wantDeny(t, create(rc, 3, 2030, "forged"), ReasonAdminOnly, "create of a number above the mark that nobody was handed")
+	wantDeny(t, txn(rc, []string{"HSET", "d3", "x", mkEntry(typeFile, 1500)}), ReasonUnknownKey, "entry for a pre-recording number this unit does not create")
+	// A batch taken now is recorded; the mark does not move.
+	ma := scopeClient(t, r, "mac1", nil)
+	if st := ma.Create(meta.Background(), 3, "new.mov", 0644, 0, 0, &ino, &attr); st != 0 || ino != 2025 {
+		t.Fatalf("create from a recorded batch: %v, inode %d", st, ino)
+	}
+	wantDeny(t, create(r.conn(t, "mac2"), 4, 2026, "theirs"), ReasonAdminOnly, "create from mac1's recorded batch")
+
+	// A restarted proxy reads the same mark and owners from Redis.
+	p2 := startProxy(t, redisAddr(t, false), ModeEnforce)
+	if mark, err := p2.inodeMark(); err != nil || mark != 2024 {
+		t.Fatalf("mark after a proxy restart: %d %v", mark, err)
+	}
+	if owner, ok, err := p2.Guard.inodes.Owner(2026); err != nil || !ok || owner != "mac1" {
+		t.Fatalf("owner of 2026 after a proxy restart: %q %v %v", owner, ok, err)
+	}
+	if owner, ok, err := p2.Guard.inodes.Owner(1500); err != nil || ok {
+		t.Fatalf("pre-recording number has an owner after a restart: %q %v %v", owner, ok, err)
+	}
+}
+
+// A restore out of the trash needs the project the entry was trashed from,
+// as named in juicefs's trash entry (<directory>-<inode>-<name>), not only
+// its destination; a trash entry carries that name for the entry it
+// replaces. The owner's own juicefs restore still passes.
+func TestCleanupScopeRestoreNeedsOriginProject(t *testing.T) {
+	r, db := cleanupScopeRig(t, 1)
+	ctx := context.Background()
+	root := "d" + inoStr(TrashInode)
+	mb := scopeClient(t, r, "mac2", nil)
+	if st := mb.Unlink(meta.Background(), 4, "g"); st != 0 {
+		t.Fatalf("B unlink: %v", st)
+	}
+	var hourIno uint64
+	for _, v := range db.HGetAll(ctx, root).Val() {
+		hourIno, _ = entryInode([]byte(v))
+	}
+	hourDir := "d" + inoStr(hourIno)
+	if db.HGet(ctx, hourDir, "4-11-g").Val() != mkEntry(typeFile, 11) {
+		t.Fatalf("B's trash entry: %v", db.HGetAll(ctx, hourDir).Val())
+	}
+	fileAttr := func(parent uint64) string {
+		return string((&meta.Attr{Typ: meta.TypeFile, Mode: 0644, Nlink: 1, Parent: meta.Ino(parent)}).Marshal())
+	}
+	rc := r.conn(t, "mac1")
+	wantDeny(t, txn(rc, []string{"HDEL", hourDir, "4-11-g"}, []string{"SET", "i11", fileAttr(3)},
+		[]string{"HSET", "d3", "taken", mkEntry(typeFile, 11)}), ReasonXProject, "restore of B's trashed file into A")
+	if db.HGet(ctx, hourDir, "4-11-g").Val() != mkEntry(typeFile, 11) || db.HExists(ctx, "d3", "taken").Val() {
+		t.Fatal("a refused restore landed")
+	}
+	// A's own file trashed under a name that claims another directory.
+	wantDeny(t, txn(rc, []string{"HDEL", "d3", "f"}, []string{"SET", "i10", fileAttr(hourIno)},
+		[]string{"HSET", hourDir, "4-10-f", mkEntry(typeFile, 10)}), ReasonBGOnly, "trash entry named for B's directory")
+
+	// The owners' own juicefs unlink and restore.
+	ma := scopeClient(t, r, "mac1", nil)
+	if st := ma.Unlink(meta.Background(), 3, "f"); st != 0 {
+		t.Fatalf("A unlink: %v", st)
+	}
+	if st := ma.Rename(meta.Background(), meta.Ino(hourIno), "3-10-f", 3, "f", meta.RenameNoReplace|meta.RenameRestore, nil, nil); st != 0 {
+		t.Fatalf("A restore: %v", st)
+	}
+	if st := mb.Rename(meta.Background(), meta.Ino(hourIno), "4-11-g", 4, "g", meta.RenameNoReplace|meta.RenameRestore, nil, nil); st != 0 {
+		t.Fatalf("B restore: %v", st)
+	}
+	noRefusals(t, r, "mac2", "B's unlink and restore")
+	if db.HGet(ctx, "d3", "f").Val() != mkEntry(typeFile, 10) {
+		t.Fatalf("A's file not restored: %v", db.HKeys(ctx, "d3").Val())
+	}
+	projectBIntact(t, db)
+}
+
 // fakeScopeSide answers the guard's trash-root HEXISTS, CLIENT LIST and
 // TIME (an error when noTime). The unit's own upstream is client id 2,
 // named "u1", dirty or not; client id 1 carries the same name (another
