@@ -4,12 +4,21 @@ package manager
 // write grants, kept in the principal store and sent to the RESP proxy in
 // the principals file (internal/respproxy/grants.go enforces them).
 //
-// A person starts with access "all": their Macs write everywhere, exactly
-// like a Mac with no person. The first grant switches the person to access
-// "granted": from then on their Macs may write only inside granted folders
-// (a client folder, "/Clients", or a project, "/Clients/A"). Removing the
-// last grant leaves the person with no write access at all; only setting
-// access back to "all" lifts the restriction.
+// A person starts with access "all": their Macs write everywhere. The
+// first grant switches the person to access "granted": from then on their
+// Macs may write only inside granted folders (a client folder, "/Clients",
+// or a project, "/Clients/A"). Removing the last grant leaves the person
+// with no write access at all; only setting access back to "all" lifts the
+// restriction.
+//
+// Grants in force. The first grant also turns on "restrict unassigned":
+// from then on a Mac with no person (a new or auto-approved Mac, the Macs
+// of a deleted person) may read but not write until an admin assigns it.
+// It stays on when the last scoped person is deleted (so offboarding
+// someone never lifts the limit on their Macs) until an admin turns it off
+// (POST /api/people/policy). A Mac enrolled as a rotated identity
+// (PreviousInstanceID) gets the previous Mac's person when an admin
+// approves or confirms it.
 //
 // File format. People travel in a version-2 principals file
 // ({"version":2,"principals":[...],"people":[...]}). A proxy built before
@@ -156,11 +165,12 @@ func (s *PrincipalStore) proxyFormatLocked() int {
 	return s.proxyFormat
 }
 
-// proxyPeopleLocked returns the people section for the proxy file, or nil
-// when the file must stay version 1.
-func (s *PrincipalStore) proxyPeopleLocked() []proxyPersonEntry {
-	if len(s.people) == 0 || s.proxyFormatLocked() < 2 {
-		return nil
+// proxyPeopleLocked returns the people section for the proxy file; v2 is
+// false when the file must stay version 1 (no people and no restriction,
+// or a proxy that reads only version 1).
+func (s *PrincipalStore) proxyPeopleLocked() (people []proxyPersonEntry, v2 bool) {
+	if !s.wantV2Locked() {
+		return nil, false
 	}
 	devices := map[string][]string{}
 	for _, r := range s.approvedLocked() {
@@ -173,7 +183,25 @@ func (s *PrincipalStore) proxyPeopleLocked() []proxyPersonEntry {
 		out = append(out, proxyPersonEntry{ID: p.ID, Name: p.Name, Access: p.Access,
 			Grants: append([]string(nil), p.Grants...), Devices: devices[p.ID]})
 	}
-	return out
+	return out, true
+}
+
+// wantV2Locked: the proxy file carries people or the restriction.
+func (s *PrincipalStore) wantV2Locked() bool {
+	return (len(s.people) > 0 || s.restrictUnassigned) && s.proxyFormatLocked() >= 2
+}
+
+// grantsInForceLocked mirrors respproxy.Principals.GrantsInForce.
+func (s *PrincipalStore) grantsInForceLocked() bool {
+	if s.restrictUnassigned {
+		return true
+	}
+	for _, p := range s.people {
+		if p.Access == personAccessGranted {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *PrincipalStore) peopleLocked() []*Person {
@@ -210,12 +238,13 @@ func (s *PrincipalStore) loadPeople(people []Person) error {
 // peopleState is a copy of what a people change may modify, to undo a
 // change whose proxy file or store write failed.
 type peopleState struct {
-	people  map[string]Person
-	persons map[string]string
+	people   map[string]Person
+	persons  map[string]string
+	restrict bool
 }
 
 func (s *PrincipalStore) savePeopleStateLocked() peopleState {
-	st := peopleState{people: map[string]Person{}, persons: map[string]string{}}
+	st := peopleState{people: map[string]Person{}, persons: map[string]string{}, restrict: s.restrictUnassigned}
 	for id, p := range s.people {
 		c := *p
 		c.Grants = append([]string(nil), p.Grants...)
@@ -236,6 +265,7 @@ func (s *PrincipalStore) restorePeopleStateLocked(st peopleState) {
 	for n, r := range s.recs {
 		r.Person = st.persons[n]
 	}
+	s.restrictUnassigned = st.restrict
 }
 
 // changePeople runs fn under the store lock and commits (store + proxy
@@ -321,12 +351,26 @@ func (s *PrincipalStore) UpdatePerson(id string, name, access *string) error {
 				return fmt.Errorf("%w: access is %q or %q", ErrPersonInvalid, personAccessAll, personAccessGranted)
 			}
 			p.Access = *access
+			if p.Access == personAccessGranted {
+				s.restrictUnassigned = true
+			}
 		}
 		return nil
 	})
 }
 
-// DeletePerson removes a person; its Macs keep working without a person.
+// SetRestrictUnassigned turns the limit on Macs with no person on or off.
+// Off has an effect only while no person is limited to grants.
+func (s *PrincipalStore) SetRestrictUnassigned(on bool) error {
+	return s.changePeople(func() error {
+		s.restrictUnassigned = on
+		return nil
+	})
+}
+
+// DeletePerson removes a person. Its Macs are left with no person: while
+// grants are in force (restrict unassigned stays on) they may read but not
+// write until an admin assigns them.
 func (s *PrincipalStore) DeletePerson(id string) error {
 	return s.changePeople(func() error {
 		if _, err := s.person(id); err != nil {
@@ -340,6 +384,18 @@ func (s *PrincipalStore) DeletePerson(id string) error {
 		}
 		return nil
 	})
+}
+
+// inheritPersonLocked gives p the person of the Mac it rotated from
+// (PersonFromPrevious) if it has none and that person still exists. Called
+// only from an admin's Approve. It reports whether p changed.
+func (s *PrincipalStore) inheritPersonLocked(p *MacPrincipal) bool {
+	if p.Person != "" || p.PersonFromPrevious == "" || s.people[p.PersonFromPrevious] == nil {
+		return false
+	}
+	p.Person = p.PersonFromPrevious
+	log.Printf("manager: principal %s gets person %s from %s (previous instance)", p.Name, p.Person, macPrincipalName(p.PreviousInstanceID))
+	return true
 }
 
 // AssignDevice gives the Mac principal device to a person ("" = none).
@@ -382,6 +438,7 @@ func (s *PrincipalStore) AddGrant(id, path string) error {
 		p.Grants = append(p.Grants, c)
 		sort.Strings(p.Grants)
 		p.Access = personAccessGranted
+		s.restrictUnassigned = true
 		return nil
 	})
 }
@@ -424,6 +481,11 @@ type DeviceView struct {
 	Label  string          `json:"label,omitempty"`
 	Status PrincipalStatus `json:"status"`
 	Person string          `json:"person,omitempty"`
+	// PersonFromPrevious: approving this Mac assigns it that person.
+	PersonFromPrevious string `json:"person_from_previous,omitempty"`
+	// ReadOnly: an approved Mac with no person while grants are in force
+	// (its writes are refused until it is assigned).
+	ReadOnly bool `json:"read_only,omitempty"`
 }
 
 // PeopleSnapshot is the admin view of people and enforcement.
@@ -435,9 +497,18 @@ type PeopleSnapshot struct {
 	ProxyFormat int `json:"proxy_format"`
 	// GrantsSent: the principals file carries the people; GrantsApplied:
 	// the proxy also applied that exact file.
-	GrantsSent    bool   `json:"grants_sent"`
-	GrantsApplied bool   `json:"grants_applied"`
-	Problem       string `json:"problem,omitempty"`
+	GrantsSent    bool `json:"grants_sent"`
+	GrantsApplied bool `json:"grants_applied"`
+	// GrantsInForce: some person is limited to grants, or
+	// RestrictUnassigned; then Macs with no person may not write.
+	GrantsInForce      bool `json:"grants_in_force"`
+	RestrictUnassigned bool `json:"restrict_unassigned"`
+	// UnassignedMacs: approved Macs with no person (read-only while
+	// GrantsInForce).
+	UnassignedMacs int    `json:"unassigned_macs"`
+	Problem        string `json:"problem,omitempty"`
+	// Audit: the proxy's audit log (set by the HTTP handler).
+	Audit *AuditStatus `json:"audit,omitempty"`
 }
 
 // PeopleSnapshot returns people, devices and the enforcement state.
@@ -451,21 +522,30 @@ func (s *PrincipalStore) PeopleSnapshot() PeopleSnapshot {
 		names = append(names, n)
 	}
 	sort.Strings(names)
+	inForce := s.grantsInForceLocked()
+	out.GrantsInForce, out.RestrictUnassigned = inForce, s.restrictUnassigned
 	for _, n := range names {
 		r := s.recs[n]
-		out.Devices = append(out.Devices, DeviceView{Name: r.Name, Host: r.Host, Label: r.Label, Status: r.Status, Person: r.Person})
+		dv := DeviceView{Name: r.Name, Host: r.Host, Label: r.Label, Status: r.Status, Person: r.Person}
+		if r.Person == "" && r.PersonFromPrevious != "" && s.people[r.PersonFromPrevious] != nil {
+			dv.PersonFromPrevious = r.PersonFromPrevious
+		}
+		if r.Person == "" && r.Status == PrincipalApproved {
+			out.UnassignedMacs++
+			dv.ReadOnly = inForce
+		}
+		out.Devices = append(out.Devices, dv)
 		if r.Person != "" {
 			devices[r.Person] = append(devices[r.Person], r.Name)
 		}
 	}
-	scoped := false
+	scoped := inForce
 	for _, p := range s.peopleLocked() {
 		v := PersonView{Person: *p, Devices: devices[p.ID]}
 		if v.Devices == nil {
 			v.Devices = []string{}
 		}
 		out.People = append(out.People, v)
-		scoped = scoped || p.Access == personAccessGranted
 	}
 	out.GrantsSent = s.peopleWritten
 	if s.opts.ProxyDir != "" {
@@ -489,7 +569,7 @@ func (s *PrincipalStore) PeopleSnapshot() PeopleSnapshot {
 // syncPeopleLocked rewrites the proxy file when the people it should carry
 // differ from what was last written (the proxy image changed).
 func (s *PrincipalStore) syncPeopleLocked() error {
-	want := len(s.people) > 0 && s.proxyFormatLocked() >= 2
+	want := s.wantV2Locked()
 	if want == s.peopleWritten {
 		return nil
 	}
@@ -545,6 +625,22 @@ func (s *PrincipalStore) StartPeopleSync() (stop func()) {
 type peopleAPI struct {
 	store    *PrincipalStore
 	auditDir string
+	watch    *auditWatch // nil: no audit directory
+}
+
+// snapshot is the people snapshot with the audit log's state.
+func (p *peopleAPI) snapshot() PeopleSnapshot {
+	snap := p.store.PeopleSnapshot()
+	if p.watch != nil {
+		snap.Audit = p.watch.status(snap.GrantsInForce)
+		if snap.Audit.Problem != "" {
+			if snap.Problem != "" {
+				snap.Problem += "; "
+			}
+			snap.Problem += snap.Audit.Problem
+		}
+	}
+	return snap
 }
 
 func (p *peopleAPI) ready(w http.ResponseWriter) bool {
@@ -564,7 +660,7 @@ func (p *peopleAPI) handleList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Cache-Control", "no-store")
-	writeJSON(w, http.StatusOK, p.store.PeopleSnapshot())
+	writeJSON(w, http.StatusOK, p.snapshot())
 }
 
 // peopleRequest is the body of every people POST.
@@ -575,6 +671,8 @@ type peopleRequest struct {
 	Device string  `json:"device"`
 	Person string  `json:"person"`
 	Path   string  `json:"path"`
+	// RestrictUnassigned: POST /api/people/policy.
+	RestrictUnassigned *bool `json:"restrict_unassigned"`
 }
 
 // handleChange wraps one people mutation: POST, JSON body, snapshot reply.
@@ -605,7 +703,7 @@ func (p *peopleAPI) handleChange(op func(peopleRequest) error) http.HandlerFunc 
 			log.Printf("manager: people change failed: %v", err)
 			http.Error(w, "the change could not be written; nothing changed", http.StatusInternalServerError)
 		default:
-			writeJSON(w, http.StatusOK, p.store.PeopleSnapshot())
+			writeJSON(w, http.StatusOK, p.snapshot())
 		}
 	}
 }
@@ -627,7 +725,9 @@ func parseMillis(v string) (int64, error) {
 // handleAudit is GET /api/audit: one page of the proxy's mutation log,
 // newest first. Filters: person, principal, project (a path: that folder
 // and below), since/until (unix ms or RFC 3339), type; paging: before (the
-// previous page's "next"), limit (default 100, at most 1000).
+// previous page's "next"), limit (default 100, at most 1000). A page reads
+// at most auditlog.QueryScanBytes of the log, so with a narrow filter it
+// can hold fewer records than limit (even none) and still have a "next".
 func (p *peopleAPI) handleAudit(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "GET only", http.StatusMethodNotAllowed)
@@ -671,7 +771,10 @@ func (p *peopleAPI) handleAudit(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, page)
 }
 
-// handleAuditVerify is GET /api/audit/verify: checks the whole hash chain.
+// handleAuditVerify is GET /api/audit/verify: the state of the Manager's
+// anchor checks (cheap; they follow the log every minute). With full=1 it
+// checks the whole chain against every anchor (reads the whole log; one
+// at a time); a pass clears a recorded problem.
 func (p *peopleAPI) handleAuditVerify(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "GET only", http.StatusMethodNotAllowed)
@@ -681,7 +784,14 @@ func (p *peopleAPI) handleAuditVerify(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "the audit log is not configured (JM_RESPPROXY_DIR or JM_AUDIT_DIR)", http.StatusServiceUnavailable)
 		return
 	}
-	rep, err := auditlog.Verify(p.auditDir)
+	w.Header().Set("Cache-Control", "no-store")
+	if r.URL.Query().Get("full") != "1" {
+		st := p.watch.status(false)
+		rep := auditlog.Report{OK: st.ChainOK, Problem: st.ChainIssue, LastSeq: st.AnchorSeq}
+		writeJSON(w, http.StatusOK, rep)
+		return
+	}
+	rep, err := p.watch.fullVerify()
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		log.Printf("manager: audit verify: %v", err)
 		http.Error(w, "the audit log could not be read", http.StatusInternalServerError)
@@ -690,8 +800,25 @@ func (p *peopleAPI) handleAuditVerify(w http.ResponseWriter, r *http.Request) {
 	if errors.Is(err, os.ErrNotExist) {
 		rep = auditlog.Report{OK: true}
 	}
-	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, http.StatusOK, rep)
+}
+
+// handleAuditStatus is GET /api/audit/status: the log's health.
+func (p *peopleAPI) handleAuditStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "GET only", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	if p.watch == nil {
+		writeJSON(w, http.StatusOK, &AuditStatus{})
+		return
+	}
+	inForce := false
+	if p.store != nil {
+		inForce = p.store.PeopleSnapshot().GrantsInForce
+	}
+	writeJSON(w, http.StatusOK, p.watch.status(inForce))
 }
 
 // registerPeople wires the people and audit routes (admin key, like every
@@ -705,6 +832,15 @@ func (a *API) registerPeople(mux *http.ServeMux, prefix string, store *Principal
 	}
 	if store != nil {
 		a.jobs.onStopAll(store.StartPeopleSync())
+	}
+	if pa.auditDir != "" {
+		anchors := ""
+		if store != nil && store.opts.StatePath != "" {
+			// The Manager's own state directory, never the audit directory.
+			anchors = filepath.Join(filepath.Dir(store.opts.StatePath), "audit-anchors.json")
+		}
+		pa.watch = newAuditWatch(pa.auditDir, anchors)
+		a.jobs.onStopAll(pa.watch.start())
 	}
 	mux.HandleFunc(prefix+"/api/people", a.auth(pa.handleList))
 	mux.HandleFunc(prefix+"/api/people/create", a.auth(pa.handleChange(func(b peopleRequest) error {
@@ -732,6 +868,13 @@ func (a *API) registerPeople(mux *http.ServeMux, prefix string, store *Principal
 	mux.HandleFunc(prefix+"/api/people/ungrant", a.auth(pa.handleChange(func(b peopleRequest) error {
 		return pa.store.RemoveGrant(b.ID, b.Path)
 	})))
+	mux.HandleFunc(prefix+"/api/people/policy", a.auth(pa.handleChange(func(b peopleRequest) error {
+		if b.RestrictUnassigned == nil {
+			return fmt.Errorf("%w: restrict_unassigned is required", ErrPersonInvalid)
+		}
+		return pa.store.SetRestrictUnassigned(*b.RestrictUnassigned)
+	})))
 	mux.HandleFunc(prefix+"/api/audit", a.auth(pa.handleAudit))
 	mux.HandleFunc(prefix+"/api/audit/verify", a.auth(pa.handleAuditVerify))
+	mux.HandleFunc(prefix+"/api/audit/status", a.auth(pa.handleAuditStatus))
 }

@@ -98,7 +98,9 @@ services:
   # refused. Principals file and reload handshake live in the shared
   # directory below (the Manager writes Mac principals there, 0600), and
   # so does the per-person audit log (audit/, append-only, hash-chained;
-  # the Manager reads it; segments are never deleted automatically).
+  # the Manager reads it). The log starts when the first person is added
+  # (JM_AUDIT=on: from the start; off: never) and keeps at most
+  # JM_AUDIT_RETAIN_MB (2048) / JM_AUDIT_RETAIN_DAYS (400) of segments.
   respproxy:
     image: ghcr.io/lelanddutcher/jm-respproxy@${JM_RESPPROXY_DIGEST:?set JM_RESPPROXY_DIGEST to the release sha256 digest}
     pull_policy: always
@@ -117,6 +119,11 @@ services:
       # Stage births require initial enforce mode. A later effective mode
       # override away from enforce makes stage operations HOLD; default off.
       JM_RESPPROXY_STAGE_BIRTH: "${JM_RESPPROXY_STAGE_BIRTH:-false}"
+      # Per-person audit log (see above): auto | on | off; retention in MB
+      # and days (0 = default, -1 = no limit).
+      JM_AUDIT: "${JM_AUDIT:-auto}"
+      JM_AUDIT_RETAIN_MB: "${JM_AUDIT_RETAIN_MB:-0}"
+      JM_AUDIT_RETAIN_DAYS: "${JM_AUDIT_RETAIN_DAYS:-0}"
       JM_PROXY_FARM_PASSWORD: "${JM_PROXY_FARM_PASSWORD:?set JM_PROXY_FARM_PASSWORD in server/.env}"
       JM_PROXY_MANAGER_PASSWORD: "${JM_PROXY_MANAGER_PASSWORD:?set JM_PROXY_MANAGER_PASSWORD in server/.env}"
       JM_PROXY_BG_PASSWORD: "${JM_PROXY_BG_PASSWORD:?set JM_PROXY_BG_PASSWORD in server/.env}"

@@ -22,12 +22,14 @@
 <body>
 <p><a href="./">&larr; Manager</a> &middot; <a href="principals.html">Principals and leases</a></p>
 <h1>People and access</h1>
-<p class="note">Give each Mac to the person who uses it. A person with access <b>all</b> writes everywhere (like a Mac
-without a person). The first folder you grant limits that person to granted folders: a client folder
-(<code>/Clients</code>, every project in it, and creating projects there) or one project (<code>/Clients/A</code>).
+<p class="note">Give each Mac to the person who uses it. A person with access <b>all</b> writes everywhere. The first
+folder you grant limits that person to granted folders: a client folder (<code>/Clients</code>, every project in it, and
+creating projects there) or one project (<code>/Clients/A</code>). From then on grants are in force: a Mac that belongs
+to no person (a new Mac, or the Macs of a removed person) can read but not write until you assign it.
 Refused writes fail on the Mac as a read-only error. Reading is not limited.</p>
 <div id="err" role="alert"></div>
 <p class="note-bad" id="problem"></p>
+<p class="row" id="policy"></p>
 
 <h2>People</h2>
 <div class="row"><input id="newName" placeholder="Name" maxlength="128"><button class="primary" id="add">Add person</button></div>
@@ -43,7 +45,9 @@ Refused writes fail on the Mac as a read-only error. Reading is not limited.</p>
 </table>
 
 <h2>Who changed what</h2>
-<p class="note">The proxy's audit log, newest first. File contents are summarized per file and 10-second window.</p>
+<p class="note">The proxy's audit log, newest first. It starts when the first person is added. File contents are
+summarized per file and 10-second window.</p>
+<p class="note" id="auditState"></p>
 <div class="row">
   <select id="fPerson"><option value="">Everyone</option></select>
   <input id="fProject" placeholder="Folder, e.g. /Clients/A">
@@ -83,9 +87,26 @@ Refused writes fail on the Mac as a read-only error. Reading is not limited.</p>
   function change(path, body) { errBox.textContent = ''; return api('POST', 'people/' + path, body).then(render, fail); }
   function nameOf(id) { for (var i = 0; i < people.length; i++) if (people[i].id === id) return people[i].name; return id; }
 
+  function mb(n) { return (n / 1048576).toFixed(1) + ' MB'; }
+  function auditLine(a) {
+    if (!a || !a.configured) return 'The audit log is not configured.';
+    if (!a.enabled) return 'The audit log is off: it starts when the first person is added.' + (a.error ? ' ' + a.error : '');
+    var t = (a.healthy ? 'Recording' : 'NOT recording') + ': ' + mb(a.bytes) + ' in ' + a.segments + ' segment(s)';
+    if (a.retain_bytes) t += ', kept up to ' + mb(a.retain_bytes);
+    if (a.free_bytes) t += ', ' + mb(a.free_bytes) + ' free on disk';
+    if (a.last_fsync_ms) t += '; last written ' + when(a.last_fsync_ms);
+    if (a.lost) t += '; ' + a.lost + ' record(s) lost since the proxy started';
+    t += a.chain_ok ? '; chain checked' + (a.anchor_at_ms ? ' up to ' + when(a.anchor_at_ms) : '') : '; CHAIN PROBLEM: ' + a.chain_problem;
+    return t + '.';
+  }
   function render(s) {
     people = s.people || [];
     document.getElementById('problem').textContent = s.problem || '';
+    document.getElementById('auditState').textContent = auditLine(s.audit);
+    document.getElementById('policy').innerHTML = s.grants_in_force
+      ? 'Grants are in force: Macs with no person are read-only (' + esc(s.unassigned_macs) + ' now).' +
+        (s.restrict_unassigned ? ' <button data-policy="off">Let Macs with no person write again</button>' : '')
+      : (s.unassigned_macs ? esc(s.unassigned_macs) + ' Mac(s) belong to no person; they write everywhere until grants are in force.' : '');
     var rows = '';
     people.forEach(function (p) {
       var grants = (p.grants || []).map(function (g) {
@@ -101,8 +122,10 @@ Refused writes fail on the Mac as a read-only error. Reading is not limited.</p>
     document.getElementById('people').innerHTML = rows;
     var opts = '<option value="">(none)</option>' + people.map(function (p) { return '<option value="' + esc(p.id) + '">' + esc(p.name) + '</option>'; }).join('');
     document.getElementById('devices').innerHTML = (s.devices || []).map(function (d) {
+      var note = d.read_only ? ' <span class="note-bad">no person: read only</span>' : '';
+      if (d.person_from_previous) note += ' <span class="note">approving it makes it ' + esc(nameOf(d.person_from_previous)) + '\'s (previous Mac)</span>';
       return '<tr><td><code>' + esc(d.name) + '</code>' + (d.label ? ' ' + esc(d.label) : '') + '</td><td>' + esc(d.host) + '</td><td>' + esc(d.status) + '</td>' +
-        '<td><select data-device="' + esc(d.name) + '">' + opts.replace('value="' + esc(d.person || '') + '"', 'value="' + esc(d.person || '') + '" selected') + '</select></td></tr>';
+        '<td><select data-device="' + esc(d.name) + '">' + opts.replace('value="' + esc(d.person || '') + '"', 'value="' + esc(d.person || '') + '" selected') + '</select>' + note + '</td></tr>';
     }).join('');
     var f = document.getElementById('fPerson'), cur = f.value;
     f.innerHTML = '<option value="">Everyone</option>' + people.map(function (p) { return '<option value="' + esc(p.id) + '">' + esc(p.name) + '</option>'; }).join('');
@@ -119,7 +142,8 @@ Refused writes fail on the Mac as a read-only error. Reading is not limited.</p>
     if (d.grant) change('grant', { id: d.grant, path: document.querySelector('[data-path-for="' + d.grant + '"]').value });
     if (d.ungrant) change('ungrant', { id: d.ungrant, path: d.path });
     if (d.rename) { var n = window.prompt('New name', nameOf(d.rename)); if (n) change('update', { id: d.rename, name: n }); }
-    if (d['delete'] && window.confirm('Remove ' + nameOf(d['delete']) + '? Their Macs keep working without a person.')) change('delete', { id: d['delete'] });
+    if (d['delete'] && window.confirm('Remove ' + nameOf(d['delete']) + '? Their Macs are left with no person: while grants are in force they can read but not write until you assign them.')) change('delete', { id: d['delete'] });
+    if (d.policy && window.confirm('Let Macs that belong to no person write everywhere again? This has an effect only while no person is limited to grants.')) change('policy', { restrict_unassigned: false });
   });
   document.body.addEventListener('change', function (ev) {
     var d = ev.target.dataset || {};
@@ -131,14 +155,18 @@ Refused writes fail on the Mac as a read-only error. Reading is not limited.</p>
     if (r.type === 'modified') return 'wrote file ' + esc(r.inode) + ' ' + esc(r.count) + 'x';
     if (r.type === 'gap') return 'log gap: ' + esc(r.dropped) + ' records lost';
     if (r.type === 'open') return 'log opened';
+    if (r.type === 'retention') return 'older records removed: ' + esc(r.detail);
     var ops = (r.ops || []).filter(function (o) { return !o.trash; }).map(function (o) {
       return esc(o.op) + ' <code>' + esc(o.path || (o.parent + '/' + o.name)) + '</code>';
     }).join('<br>');
-    return esc(r.action || '') + (ops ? '<br>' + ops : '') + (r.inodes ? ' inode ' + r.inodes.map(esc).join(', ') : '');
+    var attrs = (r.attrs || []).map(function (a) {
+      return 'inode ' + esc(a.ino) + ' ' + esc(a.field) + (a.old ? ' ' + esc(a.old) : '') + ' &rarr; ' + esc(a.new);
+    }).join('<br>');
+    return esc(r.action || '') + (ops ? '<br>' + ops : '') + (r.inodes ? ' inode ' + r.inodes.map(esc).join(', ') : '') + (attrs ? '<br>' + attrs : '');
   }
   function audit(reset) {
     if (reset) { next = 0; outcomes = {}; document.getElementById('audit').innerHTML = ''; }
-    var q = 'audit?limit=100&type=intent,outcome,refused,modified,gap';
+    var q = 'audit?limit=100&type=intent,outcome,refused,modified,gap,retention';
     var p = document.getElementById('fPerson').value, f = document.getElementById('fProject').value.trim();
     if (p) q += '&person=' + encodeURIComponent(p);
     if (f) q += '&project=' + encodeURIComponent(f);
@@ -162,8 +190,8 @@ Refused writes fail on the Mac as a read-only error. Reading is not limited.</p>
   document.getElementById('search').onclick = function () { audit(true); };
   document.getElementById('older').onclick = function () { audit(false); };
   document.getElementById('verify').onclick = function () {
-    api('GET', 'audit/verify').then(function (r) {
-      document.getElementById('verifyOut').textContent = r.ok ? 'chain intact (' + r.records + ' records)' : 'BROKEN: ' + r.problem;
+    api('GET', 'audit/verify?full=1').then(function (r) {
+      document.getElementById('verifyOut').textContent = r.ok ? 'chain intact (' + r.records + ' records, ' + (r.anchors_checked || 0) + ' anchors)' : 'BROKEN: ' + r.problem;
     }, fail);
   };
   load();

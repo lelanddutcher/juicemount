@@ -52,6 +52,52 @@
   backstop scans again soon after a catch-up pass (a restarted farm, or a short
   `JM_FARM_WATCH_BACKSTOP_SEC`) it can be shorter.
 
+### Teams: people, write grants and the audit log
+
+- The Manager has people (**People and access**). Each Mac belongs to one
+  person. A person with access "all" writes everywhere; the first folder you
+  grant limits that person to granted client folders or projects, in every
+  proxy mode, also passthrough. Refused writes fail on the Mac as read-only.
+- Once any grant exists, grants are in force: a Mac that belongs to no person
+  (a new or auto-approved Mac, or the Macs of a person you removed) can read
+  but not write until you assign it. Removing the last limited person does
+  not lift this; **Let Macs with no person write again** on the People page
+  does. A Mac that enrolls as a rotated copy of another Mac gets that Mac's
+  person when you approve or confirm it, never from the auto-approve window.
+- A limited person can no longer write into, change, or restore a file
+  deleted from a project they have no grant on, and can no longer remove the
+  quota of a folder above their projects.
+- The Redis proxy keeps a hash-chained audit log of who changed what in
+  `respproxy/audit` beside the principals file. It starts when the first
+  person is added (`JM_AUDIT=on` logs from the start, `off` never) and keeps
+  at most 2 GB and 400 days (`JM_AUDIT_RETAIN_MB`, `JM_AUDIT_RETAIN_DAYS`;
+  the oldest segments are removed with a record that keeps the chain
+  verifiable). While grants are in force, a Mac's change reaches Redis only
+  after its record is on disk, and Mac writes are refused when the log cannot
+  write (a full disk, for example); the People page says so and why. On this
+  test machine that wait added about 1.3 ms to a create. Content writes are
+  summarized per file and 10 seconds and are not waited for.
+- The Manager checks the log every minute and records its head in its own
+  state (`audit-anchors.json`), so a rewritten log, or one cut back to before
+  the last check, is reported. Records written after the last check can still
+  be cut unnoticed, and someone who can write both the proxy's directory and
+  the Manager's state can rewrite both. If you delete the log on purpose,
+  delete `audit-anchors.json` too.
+
+### Upgrading the Redis proxy and Manager (Teams)
+
+- Upgrade both. Do not run an older Manager against a proxy directory or a
+  principals store written by this one: an older Manager drops the people,
+  their Mac assignments and grants when it next saves the principals file
+  (and its own store), which lifts every grant.
+- Grants reach a proxy only once it advertises the new file format. For about
+  2 seconds (at most 4) after the upgraded proxy starts, the Manager still
+  writes the old format, so grants are not enforced yet; until they are, the
+  People page says the proxy has not applied the latest grants.
+- The proxy exits at start if it rejects the principals file (one edited by
+  hand, for example), and its container restarts until the file is fixed.
+  A file the proxy rejects on a reload is refused and the old one kept.
+
 ### Upgrading the farm
 
 Stop all old farm workers before starting new ones, and do not run v0.5.0 and

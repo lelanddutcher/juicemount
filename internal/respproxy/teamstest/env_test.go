@@ -77,6 +77,8 @@ type volume struct {
 	admin meta.Meta // straight to Redis: setup and ground truth
 	ino   map[string]meta.Ino
 	dir   string // principals.json, reload files, audit/
+	// restrict: principals.json says restrict_unassigned.
+	restrict bool
 }
 
 func metaConf() *meta.Config {
@@ -154,15 +156,17 @@ func hashOf(t testing.TB, name string) string {
 	return h
 }
 
-// writePrincipals writes principals.json: version 1 when people is nil.
+// writePrincipals writes principals.json: version 1 when people is nil
+// (and not restrict).
 func (v *volume) writePrincipals(people []respproxy.PersonEntry) []byte {
 	v.t.Helper()
 	f := struct {
-		Version    int                        `json:"version,omitempty"`
-		Principals []respproxy.PrincipalEntry `json:"principals"`
-		People     []respproxy.PersonEntry    `json:"people,omitempty"`
-	}{People: people}
-	if people != nil {
+		Version            int                        `json:"version,omitempty"`
+		Principals         []respproxy.PrincipalEntry `json:"principals"`
+		People             []respproxy.PersonEntry    `json:"people,omitempty"`
+		RestrictUnassigned bool                       `json:"restrict_unassigned,omitempty"`
+	}{People: people, RestrictUnassigned: v.restrict}
+	if people != nil || v.restrict {
 		f.Version = 2
 	}
 	for _, c := range creds {

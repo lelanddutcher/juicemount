@@ -36,7 +36,8 @@ func TestEntrypointKeepsPeopleAndConfiguresAudit(t *testing.T) {
 	}
 	manager := fmt.Sprintf(`{"version":2,"principals":[{"name":"mac-0123456789ab","kind":"mac","host":"bay","argon2id":%q},`+
 		`{"name":"farm","kind":"farm","argon2id":%q}],`+
-		`"people":[{"id":"p-john","name":"John","access":"granted","grants":["/Clients/A"],"devices":["mac-0123456789ab"]}]}`, h, h)
+		`"people":[{"id":"p-john","name":"John","access":"granted","grants":["/Clients/A"],"devices":["mac-0123456789ab"]}],`+
+		`"restrict_unassigned":true}`, h, h)
 	if err := os.WriteFile(filepath.Join(dir, "principals.json"), []byte(manager), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -70,11 +71,50 @@ func TestEntrypointKeepsPeopleAndConfiguresAudit(t *testing.T) {
 	if ps.Len() != 6 {
 		t.Fatalf("principals after re-render: %d, want 5 server + 1 Mac", ps.Len())
 	}
-	var cfg struct {
-		AuditDir string `json:"audit_dir"`
+	var kept struct {
+		RestrictUnassigned bool `json:"restrict_unassigned"`
 	}
-	b, err := os.ReadFile(filepath.Join(root, "config.out"))
-	if err != nil || json.Unmarshal(b, &cfg) != nil || cfg.AuditDir != filepath.Join(dir, "audit") {
-		t.Fatalf("config audit_dir = %q (%v)\n%s", cfg.AuditDir, err, b)
+	if b, _ := os.ReadFile(filepath.Join(dir, "principals.json")); json.Unmarshal(b, &kept) != nil || !kept.RestrictUnassigned {
+		t.Fatalf("restrict_unassigned dropped by the re-render:\n%s", b)
+	}
+	type config struct {
+		AuditDir   string `json:"audit_dir"`
+		Audit      string `json:"audit"`
+		RetainMB   int64  `json:"audit_retain_mb"`
+		RetainDays int64  `json:"audit_retain_days"`
+	}
+	readCfg := func() config {
+		t.Helper()
+		var cfg config
+		b, err := os.ReadFile(filepath.Join(root, "config.out"))
+		if err != nil || json.Unmarshal(b, &cfg) != nil {
+			t.Fatalf("config: %v\n%s", err, b)
+		}
+		return cfg
+	}
+	if cfg := readCfg(); cfg.AuditDir != filepath.Join(dir, "audit") || cfg.Audit != "auto" || cfg.RetainMB != 0 || cfg.RetainDays != 0 {
+		t.Fatalf("config = %+v", cfg)
+	}
+	rerun := func(extra ...string) ([]byte, error) {
+		c := exec.CommandContext(ctx, "/bin/sh", "entrypoint.sh")
+		c.Env = append(append([]string(nil), cmd.Env...), extra...)
+		return c.CombinedOutput()
+	}
+	if out, err := rerun("JM_AUDIT=on", "JM_AUDIT_RETAIN_MB=512", "JM_AUDIT_RETAIN_DAYS=-1"); err != nil {
+		t.Fatalf("entrypoint: %v\n%s", err, out)
+	}
+	if cfg := readCfg(); cfg.Audit != "on" || cfg.RetainMB != 512 || cfg.RetainDays != -1 {
+		t.Fatalf("config with JM_AUDIT=on = %+v", cfg)
+	}
+	if out, err := rerun("JM_AUDIT=off"); err != nil {
+		t.Fatalf("entrypoint: %v\n%s", err, out)
+	}
+	if cfg := readCfg(); cfg.AuditDir != "" {
+		t.Fatalf("config with JM_AUDIT=off = %+v", cfg)
+	}
+	for _, bad := range []string{"JM_AUDIT=yes", "JM_AUDIT_RETAIN_MB=1e9", "JM_AUDIT_RETAIN_DAYS=-2"} {
+		if out, err := rerun(bad); err == nil {
+			t.Fatalf("%s accepted:\n%s", bad, out)
+		}
 	}
 }

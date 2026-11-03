@@ -465,7 +465,11 @@ func (e *LeaseEngine) Decide(p Principal, u *Unit) Verdict {
 	}
 
 	// Place the unit against the stored tree (txnunit.go).
-	locs, pd := e.placeUnit(u, f, bypass)
+	pm := placeStrict
+	if bypass {
+		pm = placeBypass
+	}
+	locs, pd := e.placeUnit(u, f, pm)
 	if pd != nil {
 		if pd.Reason == ReasonXProject && pd.Proj != 0 {
 			hd := e.leaseDenial(ReasonXProject, pd.Proj)

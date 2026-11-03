@@ -121,6 +121,10 @@ type Unit struct {
 	UpstreamName string
 	Remote       string // client address
 
+	// unassigned: the principal is a Mac with no person while grants are
+	// in force; Decide refuses its project writes (grants.go).
+	unassigned bool
+
 	// wantAudit, set by the proxy when the audit log is on, asks the lease
 	// engine to describe the unit for it (audit, set by Decide).
 	wantAudit bool

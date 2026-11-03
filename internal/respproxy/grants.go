@@ -5,10 +5,12 @@ package respproxy
 // The principals file (format version 2) names people: a stable ID, a
 // display name, the Mac principals (devices) that belong to the person, an
 // access mode and a list of granted folders. A person whose access is
-// "granted" may write only inside granted folders; access "all", or a
-// device with no person, keeps the behaviour from before people existed.
-// Service principals (admin, bg, manager, farm, webdav) are never mapped to
-// a person and keep their rights.
+// "granted" may write only inside granted folders; access "all" keeps the
+// behaviour from before people existed. While grants are in force (any
+// scoped person, or "restrict_unassigned") a Mac with no person may read
+// but not write; otherwise it keeps the behaviour from before. Service
+// principals (admin, bg, manager, farm, webdav) are never mapped to a
+// person and keep their rights.
 //
 // A grant names a folder by path: a client folder (level 1, "/Clients") or
 // a project (level 2, "/Clients/A"), or any folder down to the project
@@ -25,6 +27,15 @@ package respproxy
 //     grant on its client folder and creating a top-level folder is never
 //     covered: only service principals and unscoped people may;
 //   - /.juicemount/derivatives is shared and always covered;
+//   - the trash rules of the lease engine hold (placeGrant): no write to a
+//     trashed inode or inside a trashed directory, trash entries paired
+//     with the removal, no purge; and a restore out of the trash also needs
+//     a grant on the folder the entry was deleted from (its trash name
+//     says which), so nobody takes another project's deleted files;
+//   - a quota definition (a dirQuota row) needs a grant on its directory,
+//     also above the project depth, and also when it rides along a write
+//     that is otherwise covered; the usage counters above the project depth
+//     (dir-stat flushes) stay open;
 //   - a place the proxy cannot resolve is not covered (fail closed).
 //
 // The check runs in every proxy mode (passthrough and observe relax only
@@ -34,6 +45,7 @@ import (
 	"fmt"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -163,6 +175,7 @@ func (ps *Principals) parsePeople(people []PersonEntry, entries []PrincipalEntry
 			ps.people[d] = p // a device not in the table is kept: harmless, and a later table may add it
 		}
 		ps.scoped = ps.scoped || p.Scoped
+		ps.nPeople++
 	}
 	return nil
 }
@@ -175,12 +188,21 @@ func (ps *Principals) PersonOf(name string) *Person {
 	return ps.people[name]
 }
 
-// GrantsInForce reports whether any person's writes are limited to grants.
-func (ps *Principals) GrantsInForce() bool { return ps != nil && ps.scoped }
+// GrantsInForce reports whether grants are in force: a person's writes
+// are limited to grants, or the file says so (restrict_unassigned, which
+// the Manager keeps on once grants were used, so deleting the last scoped
+// person does not lift the limit on the Macs left without a person). While
+// grants are in force a Mac with no person may read but not write.
+func (ps *Principals) GrantsInForce() bool { return ps != nil && (ps.scoped || ps.restrict) }
 
-// grantsApply: the unit of principal p is checked against p's grants.
+// HasPeople reports whether the table names any person.
+func (ps *Principals) HasPeople() bool { return ps != nil && ps.nPeople > 0 }
+
+// grantsApply: the unit of principal p is checked against p's grants (a
+// scoped person), or refused outright (a Mac with no person while grants
+// are in force).
 func grantsApply(p Principal, u *Unit) bool {
-	return p.Kind == KindMac && u.Person != nil && u.Person.Scoped
+	return p.Kind == KindMac && ((u.Person != nil && u.Person.Scoped) || u.unassigned)
 }
 
 // grantCache maps grant paths to directory inodes. It is valid for one
@@ -268,11 +290,16 @@ func (e *LeaseEngine) covered(d uint64, granted map[uint64]bool) (bool, error) {
 	return false, errUnresolved
 }
 
-// grantCheck refuses a unit of a scoped person that touches anything its
-// grants do not cover (see the file comment). It is called with the
-// topology lock held, before the lease rules, in every mode.
+// grantCheck refuses a unit of a scoped person, or of a Mac with no person
+// while grants are in force, that touches anything the grants do not cover
+// (see the file comment). It is called with the topology lock held, before
+// the lease rules, in every mode.
 func (e *LeaseEngine) grantCheck(p Principal, u *Unit, f *unitFacts) *Denial {
 	person := u.Person
+	if person == nil {
+		return &Denial{Reason: ReasonNotGranted,
+			Detail: "Mac " + p.Name + " belongs to no person; while grants are in force such a Mac may read but not write (assign it to a person in the Manager)"}
+	}
 	deny := func(proj uint64, detail string) *Denial {
 		return &Denial{Reason: ReasonNotGranted, Proj: proj,
 			Detail: "person " + person.ID + " (" + p.Name + "): " + detail}
@@ -284,35 +311,53 @@ func (e *LeaseEngine) grantCheck(p Principal, u *Unit, f *unitFacts) *Denial {
 	if err != nil {
 		return deny(0, "grant lookup failed: "+err.Error())
 	}
-	// scope checks one place: a project root, or a directory above the
-	// project depth whose entries or attributes the unit writes.
-	scope := func(loc location) *Denial {
-		var d uint64
-		switch loc.kind {
-		case nsDerivatives, nsTrash:
-			return nil
-		case nsProject:
-			d = loc.proj
-		case nsRoot:
-			d = loc.dir
-		default:
-			return deny(0, "write to an unresolved place")
-		}
+	// dirCovered checks a directory against the grants.
+	dirCovered := func(d uint64, what string) *Denial {
 		ok, err := e.covered(d, granted)
 		switch {
 		case err != nil:
 			return deny(d, "cannot resolve directory "+inoStr(d)+": "+err.Error())
 		case !ok:
-			what := "project " + inoStr(d)
-			if loc.kind == nsRoot {
-				what = "folder " + inoStr(d) + " above the project depth"
-			}
 			if lbl := e.anc.label(d); lbl != "" {
 				what += " (" + lbl + ")"
 			}
 			return deny(d, what+" is not granted")
 		}
 		return nil
+	}
+	// scope checks one place: a project root, or a directory above the
+	// project depth whose entries or attributes the unit writes.
+	scope := func(loc location) *Denial {
+		switch loc.kind {
+		case nsDerivatives:
+			return nil
+		case nsTrash:
+			// Inside a trashed directory: no Mac writes there (the
+			// lease engine refuses it as BG_ONLY in enforce).
+			return deny(0, "write inside a trashed directory")
+		case nsProject:
+			return dirCovered(loc.proj, "project "+inoStr(loc.proj))
+		case nsRoot:
+			return dirCovered(loc.dir, "folder "+inoStr(loc.dir)+" above the project depth")
+		}
+		return deny(0, "write to an unresolved place")
+	}
+	// Quota definitions (dirQuota rows) need a grant on their directory,
+	// also above the project depth (the usage counters there do not).
+	for _, dir := range f.quota {
+		loc, err := e.anc.resolveDir(dir)
+		if err != nil {
+			return deny(0, "quota row of an unresolvable directory "+inoStr(dir))
+		}
+		if loc.kind == nsRoot {
+			if d := dirCovered(dir, "the quota of folder "+inoStr(dir)); d != nil {
+				return d
+			}
+			continue
+		}
+		if d := scope(loc); d != nil {
+			return d
+		}
 	}
 	if f.dirStatOnly() {
 		for _, dir := range f.dirStat {
@@ -322,7 +367,8 @@ func (e *LeaseEngine) grantCheck(p Principal, u *Unit, f *unitFacts) *Denial {
 			}
 			if loc.kind == nsRoot {
 				// Usage counters of a folder above the project depth
-				// (the lease engine also leaves them open).
+				// (the lease engine also leaves them open); quota rows
+				// were checked above.
 				continue
 			}
 			if d := scope(loc); d != nil {
@@ -331,7 +377,7 @@ func (e *LeaseEngine) grantCheck(p Principal, u *Unit, f *unitFacts) *Denial {
 		}
 		return nil
 	}
-	locs, pd := e.placeUnit(u, f, true)
+	locs, pd := e.placeUnit(u, f, placeGrant)
 	if pd != nil {
 		return deny(pd.Proj, "write the proxy cannot place: "+pd.Detail)
 	}
@@ -343,7 +389,41 @@ func (e *LeaseEngine) grantCheck(p Principal, u *Unit, f *unitFacts) *Denial {
 			return d
 		}
 	}
+	// A restore out of the trash: placeUnit admitted it (the entry goes
+	// back outside the trash, which scope covered), and the folder the
+	// entry was deleted from must be granted too, or a person could take
+	// another project's deleted files into their own.
+	for _, op := range f.dentries {
+		if !op.trash || !op.del {
+			continue
+		}
+		parent, ok := trashEntryParent(op.name)
+		if !ok {
+			return deny(0, "restore of trash entry "+strconv.Quote(op.name)+": its original folder is not known")
+		}
+		if d := dirCovered(parent, "folder "+inoStr(parent)+" the restored entry was deleted from"); d != nil {
+			return d
+		}
+	}
 	return nil
+}
+
+// trashEntryParent decodes the folder a trash entry was deleted from:
+// juicefs names it "<parent>-<inode>-<name>" (pkg/meta/base.go trashEntry).
+func trashEntryParent(name string) (uint64, bool) {
+	i := strings.IndexByte(name, '-')
+	if i <= 0 {
+		return 0, false
+	}
+	j := strings.IndexByte(name[i+1:], '-')
+	if j <= 0 {
+		return 0, false
+	}
+	if _, ok := digits(name[i+1 : i+1+j]); !ok {
+		return 0, false
+	}
+	p, ok := digits(name[:i])
+	return p, ok && p != 0
 }
 
 // touchesRoot: the unit changes an entry in a directory above the project

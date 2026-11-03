@@ -61,6 +61,9 @@ type unitFacts struct {
 	trashKey string
 	// dirStat: directory inodes named by dir-stat / quota hash fields.
 	dirStat []uint64
+	// quota: directory inodes whose quota definition (dirQuota) the unit
+	// writes. Unlike dirStat it is kept when the unit writes more.
+	quota []uint64
 	// topology: the unit moves a directory between two parents (rename,
 	// exchange, restore from trash). It takes the proxy-wide topology lock
 	// and bumps the project-cache generation when it commits.
@@ -215,7 +218,11 @@ func analyzeUnit(u *Unit) *unitFacts {
 				}
 			}
 		case "dirstat", "quota":
-			f.dirStat = append(f.dirStat, unitFieldInodes(c.Info.Name, w.Key, c.Args)...)
+			ns := unitFieldInodes(c.Info.Name, w.Key, c.Args)
+			f.dirStat = append(f.dirStat, ns...)
+			if w.Key.Group == "quota" {
+				f.quota = append(f.quota, ns...)
+			}
 		case "gc":
 			// delfiles / detachedNodes members name an inode, which is
 			// anchored like a written one; slice records are covered by
@@ -284,11 +291,28 @@ type placedIn struct {
 	trash bool
 }
 
+// placeMode is how placeUnit treats the refusals of the lease rules.
+type placeMode int
+
+const (
+	// placeStrict: every refusal (a Mac, a manager or farm unit in
+	// enforce and observe).
+	placeStrict placeMode = iota
+	// placeBypass: admin, bg and passthrough. Only an unknown location or
+	// a failed authority read refuses.
+	placeBypass
+	// placeGrant: the person-grant check (grants.go), in every mode. It
+	// keeps every refusal except XPROJECT for a hard link across projects,
+	// which is a lease rule: the trash rules (no write to a trashed inode,
+	// trash pairing, no purge) hold even in passthrough.
+	placeGrant
+)
+
 // placeUnit checks the unit against the stored tree and returns the
-// location of every anchor. Admin/bg bypass policy restrictions, but an
-// unknown location or failed authority read must still refuse.
-func (e *LeaseEngine) placeUnit(u *Unit, f *unitFacts, bypass bool) ([]location, *Denial) {
+// location of every anchor (see placeMode for which refusals apply).
+func (e *LeaseEngine) placeUnit(u *Unit, f *unitFacts, mode placeMode) ([]location, *Denial) {
 	a := e.anc
+	bypass := mode == placeBypass
 	var locs []location
 	refuse := func(d *Denial) *Denial {
 		if bypass && d.Reason != ReasonUnknownKey {
@@ -511,12 +535,12 @@ func (e *LeaseEngine) placeUnit(u *Unit, f *unitFacts, bypass bool) ([]location,
 				}
 			}
 			if !moved || pl.parent == 0 {
-				if d := oneProject(linkSet); d != nil && !bypass {
+				if d := oneProject(linkSet); d != nil && mode == placeStrict {
 					return nil, d
 				}
 			}
 		} else if pl.parent == 0 {
-			if d := oneProject(linkSet); d != nil && !bypass {
+			if d := oneProject(linkSet); d != nil && mode == placeStrict {
 				return nil, d
 			}
 		}

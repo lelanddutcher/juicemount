@@ -46,6 +46,9 @@ type principalsFile struct {
 	Version    int              `json:"version,omitempty"`
 	Principals []PrincipalEntry `json:"principals"`
 	People     []PersonEntry    `json:"people,omitempty"`
+	// RestrictUnassigned (version 2): grants are in force even when no
+	// person is scoped, so a Mac with no person may not write (grants.go).
+	RestrictUnassigned bool `json:"restrict_unassigned,omitempty"`
 }
 
 // PrincipalsFormat is the newest principals file version this proxy reads.
@@ -145,8 +148,10 @@ type Principals struct {
 	byName map[string]principalRec
 	// people maps a Mac principal (device) to its person; scoped is true
 	// when any person's writes are limited to grants (grants in force).
-	people map[string]*Person
-	scoped bool
+	people   map[string]*Person
+	scoped   bool
+	restrict bool // restrict_unassigned
+	nPeople  int
 }
 
 // ParsePrincipals validates a principals file body. Every entry must have a
@@ -168,6 +173,8 @@ func ParsePrincipals(data []byte) (*Principals, error) {
 		return nil, fmt.Errorf("principals: format version %d is not supported (this proxy reads up to %d)", f.Version, PrincipalsFormat)
 	case f.Version < 2 && f.People != nil:
 		return nil, errors.New("principals: \"people\" needs format version 2")
+	case f.Version < 2 && f.RestrictUnassigned:
+		return nil, errors.New("principals: \"restrict_unassigned\" needs format version 2")
 	}
 	ps := &Principals{byName: map[string]principalRec{}}
 	for i, e := range f.Principals {
@@ -194,6 +201,7 @@ func ParsePrincipals(data []byte) (*Principals, error) {
 	if err := ps.parsePeople(f.People, f.Principals); err != nil {
 		return nil, err
 	}
+	ps.restrict = f.RestrictUnassigned
 	return ps, nil
 }
 

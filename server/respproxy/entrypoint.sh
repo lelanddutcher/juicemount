@@ -5,13 +5,17 @@
 #    the server principals (farm, manager, bg, webdav, admin) are hashed
 #    from their JM_PROXY_*_PASSWORD secrets at every start; the Mac
 #    principals the Manager wrote there are kept verbatim, and so are the
-#    format version and people (person grants) of a version-2 file. The
-#    Manager and this script serialize on .principals.lock and both replace
-#    the file atomically with mode 0600.
+#    format version, people (person grants) and restrict_unassigned of a
+#    version-2 file. The Manager and this script serialize on
+#    .principals.lock and both replace the file atomically with mode 0600.
 # 2. Writes the proxy config to /run/jm-respproxy/config.json (container
 #    local: the shared directory cannot redirect the upstream). The
-#    per-person audit log goes to $DIR/audit (JM_RESPPROXY_AUDIT_DIR;
-#    "off" disables it), which the Manager reads.
+#    per-person audit log goes to $DIR/audit (JM_RESPPROXY_AUDIT_DIR),
+#    which the Manager reads, with its health file beside it
+#    ($DIR/audit.health). JM_AUDIT: "auto" (default) starts logging when
+#    the first person exists, "on" logs from the start, "off" never.
+#    JM_AUDIT_RETAIN_MB / JM_AUDIT_RETAIN_DAYS bound its size and age
+#    (default 2048 MB / 400 days; -1 = no limit): the oldest segments go.
 # 3. Execs jm-respproxy with the applied-reload handshake enabled. The
 #    proxy owns polling, exact-byte validation, session revocation, applied
 #    receipts and heartbeat. A successful signal alone is never an ACK.
@@ -33,12 +37,20 @@ LISTEN="${JM_RESPPROXY_LISTEN:-0.0.0.0:6379}"
 STATS="${JM_RESPPROXY_STATS:-127.0.0.1:9180}"
 PROXY_BIN="${JM_RESPPROXY_BIN:-jm-respproxy}"
 AUDIT_DIR="${JM_RESPPROXY_AUDIT_DIR:-$DIR/audit}"
-[ "$AUDIT_DIR" != off ] || AUDIT_DIR=""
+AUDIT="${JM_AUDIT:-auto}"
+AUDIT_RETAIN_MB="${JM_AUDIT_RETAIN_MB:-0}"
+AUDIT_RETAIN_DAYS="${JM_AUDIT_RETAIN_DAYS:-0}"
+[ "$AUDIT_DIR" != off ] || AUDIT=off
 
 log() { printf '[jm-respproxy-entrypoint] %s\n' "$*" >&2; }
 die() { log "$*"; exit 2; }
 
 case "$MODE" in passthrough|observe|enforce) ;; *) die "JM_RESPPROXY_MODE must be passthrough, observe or enforce" ;; esac
+case "$AUDIT" in auto|on) ;; off) AUDIT_DIR="" ;; *) die "JM_AUDIT must be auto, on or off" ;; esac
+for v in "$AUDIT_RETAIN_MB" "$AUDIT_RETAIN_DAYS"; do
+  case "$v" in -1|0|[1-9]|[1-9][0-9]|[1-9][0-9][0-9]|[1-9][0-9][0-9][0-9]|[1-9][0-9][0-9][0-9][0-9]|[1-9][0-9][0-9][0-9][0-9][0-9]) ;;
+  *) die "JM_AUDIT_RETAIN_MB and JM_AUDIT_RETAIN_DAYS must be -1 (no limit), 0 (default) or a whole number up to 999999" ;; esac
+done
 case "$STAGE_BIRTH" in true|false) ;; *) die "JM_RESPPROXY_STAGE_BIRTH must be true or false" ;; esac
 [ "$STAGE_BIRTH" != true ] || [ "$MODE" = enforce ] ||
   die "JM_RESPPROXY_STAGE_BIRTH=true requires JM_RESPPROXY_MODE=enforce"
@@ -68,13 +80,14 @@ render_principals() {
   (
     flock -x 9
     macs="[]"
-    # Keep the people (person grants) of a version-2 file: dropping them here
-    # would lift every grant until the Manager next writes the file.
+    # Keep the people (person grants) and restrict_unassigned of a version-2
+    # file: dropping them here would lift every grant until the Manager next
+    # writes the file.
     rest="{}"
     if [ -s "$PRINCIPALS" ]; then
       macs="$(jq -c '[.principals[]? | select(.kind == "mac")]' "$PRINCIPALS")" ||
         die "existing $PRINCIPALS is not valid JSON; refusing to drop enrolled Macs"
-      rest="$(jq -c '{version, people} | with_entries(select(.value != null))' "$PRINCIPALS")" ||
+      rest="$(jq -c '{version, people, restrict_unassigned} | with_entries(select(.value != null))' "$PRINCIPALS")" ||
         die "existing $PRINCIPALS is not valid JSON; refusing to drop person grants"
     fi
     tmp="$(mktemp "$DIR/.principals.json.tmp-XXXXXX")"
@@ -88,11 +101,12 @@ render_principals() {
 }
 
 render_config() {
-  jq -n --arg listen "$LISTEN" --arg up "$UPSTREAM" --arg stats "$STATS" --arg p "$PRINCIPALS" --arg mode "$MODE" --argjson stage_birth "$STAGE_BIRTH" --arg audit "$AUDIT_DIR" '{
+  jq -n --arg listen "$LISTEN" --arg up "$UPSTREAM" --arg stats "$STATS" --arg p "$PRINCIPALS" --arg mode "$MODE" --argjson stage_birth "$STAGE_BIRTH" \
+    --arg audit "$AUDIT_DIR" --arg audit_mode "$AUDIT" --argjson retain_mb "$AUDIT_RETAIN_MB" --argjson retain_days "$AUDIT_RETAIN_DAYS" '{
     listen: $listen, upstream: $up, upstream_user: "jm-proxy",
     upstream_password_env: "JM_RESPPROXY_UPSTREAM_PASSWORD",
     stats: $stats, principals: $p, mode: $mode, stage_birth: $stage_birth, reload_handshake: true,
-    audit_dir: $audit }' > "$CONFIG.tmp"
+    audit_dir: $audit, audit: $audit_mode, audit_retain_mb: $retain_mb, audit_retain_days: $retain_days }' > "$CONFIG.tmp"
   mv -f "$CONFIG.tmp" "$CONFIG"
 }
 

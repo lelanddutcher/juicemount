@@ -150,15 +150,29 @@ func TestPeopleReachTheProxy(t *testing.T) {
 	if _, ps = proxyFile(t, dir); ps.PersonOf(mac).Scoped {
 		t.Fatal("access all still scoped")
 	}
-	// Without people the file is version 1 again.
+	// Deleting the last person leaves the Mac with no person and grants
+	// still in force (restrict_unassigned, on since the first grant): the
+	// Mac may not write, rather than writing everywhere.
 	if err := s.DeletePerson(john.ID); err != nil {
 		t.Fatal(err)
 	}
 	raw, ps = proxyFile(t, dir)
-	if ps.PersonOf(mac) != nil || bytes.Contains(raw, []byte(`"version"`)) || oldProxyParse(raw) != nil {
+	if ps.PersonOf(mac) != nil || !ps.GrantsInForce() {
 		t.Fatalf("after the last person left: %s", raw)
 	}
-	if snap := s.PeopleSnapshot(); snap.GrantsSent {
+	if snap := s.PeopleSnapshot(); !snap.GrantsSent || !snap.GrantsInForce || snap.UnassignedMacs != 1 ||
+		len(snap.Devices) != 1 || !snap.Devices[0].ReadOnly {
+		t.Fatalf("snapshot after the last person left: %+v", snap)
+	}
+	// Only the admin lifts it: then the file is version 1 again.
+	if err := s.SetRestrictUnassigned(false); err != nil {
+		t.Fatal(err)
+	}
+	raw, ps = proxyFile(t, dir)
+	if ps.GrantsInForce() || bytes.Contains(raw, []byte(`"version"`)) || oldProxyParse(raw) != nil {
+		t.Fatalf("after lifting the restriction: %s", raw)
+	}
+	if snap := s.PeopleSnapshot(); snap.GrantsSent || snap.GrantsInForce || snap.Devices[0].ReadOnly {
 		t.Fatalf("grants still sent: %+v", snap)
 	}
 }
@@ -360,10 +374,24 @@ func TestPeopleAndAuditAPI(t *testing.T) {
 	if rr := doJSON(t, mux, http.MethodGet, "/api/audit?since=yesterday", key, nil); rr.Code != http.StatusBadRequest {
 		t.Fatalf("bad since: %d", rr.Code)
 	}
-	rr = doJSON(t, mux, http.MethodGet, "/api/audit/verify", key, nil)
+	rr = doJSON(t, mux, http.MethodGet, "/api/audit/verify?full=1", key, nil)
 	var rep auditlog.Report
 	if err := json.Unmarshal(rr.Body.Bytes(), &rep); rr.Code != http.StatusOK || err != nil || !rep.OK || rep.Records != 3 {
 		t.Fatalf("verify: %d %s", rr.Code, rr.Body)
+	}
+	if rr := doJSON(t, mux, http.MethodGet, "/api/audit/verify", key, nil); rr.Code != http.StatusOK {
+		t.Fatalf("verify (anchor state): %d %s", rr.Code, rr.Body)
+	}
+	rr = doJSON(t, mux, http.MethodGet, "/api/audit/status", key, nil)
+	var st AuditStatus
+	if err := json.Unmarshal(rr.Body.Bytes(), &st); rr.Code != http.StatusOK || err != nil || !st.Configured {
+		t.Fatalf("audit status: %d %s", rr.Code, rr.Body)
+	}
+	if rr := doJSON(t, mux, http.MethodPost, "/api/people/policy", key, map[string]any{}); rr.Code != http.StatusBadRequest {
+		t.Fatalf("policy without a value: %d", rr.Code)
+	}
+	if rr := doJSON(t, mux, http.MethodPost, "/api/people/policy", key, map[string]any{"restrict_unassigned": false}); rr.Code != http.StatusOK {
+		t.Fatalf("policy: %d %s", rr.Code, rr.Body)
 	}
 	// The page is served.
 	rr = doJSON(t, mux, http.MethodGet, "/people.html", "", nil)

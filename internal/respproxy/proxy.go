@@ -97,6 +97,10 @@ type Config struct {
 	// AuditWindow is how long content writes of one inode by one principal
 	// are collapsed into one record; default 10 s.
 	AuditWindow time.Duration
+	// AuditSyncTimeout bounds the wait for a Mac's intent to be on disk
+	// while grants are in force (audit.go); the unit is refused after it.
+	// Default 2 s.
+	AuditSyncTimeout time.Duration
 }
 
 // Proxy is the enforcing RESP proxy. One upstream connection per client.
@@ -204,7 +208,10 @@ func New(cfg Config) (*Proxy, error) {
 	p.stageBirth.Store(cfg.StageBirth)
 	p.setMode(cfg.Mode, "config")
 	if cfg.Audit != nil {
-		p.audit = newAuditSink(cfg.Audit, cfg.AuditWindow, cfg.Logf)
+		p.audit = newAuditSink(cfg.Audit, cfg.AuditWindow, cfg.AuditSyncTimeout, func() bool {
+			t := p.Auth.table.Load()
+			return t.HasPeople() || t.GrantsInForce()
+		}, cfg.Logf)
 	}
 	return p, nil
 }
@@ -1346,7 +1353,9 @@ func (c *conn) newUnit(kind UnitKind, cmds []Cmd) *Unit {
 		if c.principal.Kind == KindMac {
 			// The current table, not the one of the AUTH: a grant change
 			// applies to the next unit without a reconnect.
-			u.Person = c.p.Auth.table.Load().PersonOf(c.principal.Name)
+			t := c.p.Auth.table.Load()
+			u.Person = t.PersonOf(c.principal.Name)
+			u.unassigned = u.Person == nil && t.GrantsInForce()
 		}
 	}
 	if kind == UnitTxn {

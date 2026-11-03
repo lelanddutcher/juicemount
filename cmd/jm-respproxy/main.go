@@ -46,8 +46,42 @@ type fileConfig struct {
 	ReloadHandshake     bool   `json:"reload_handshake"`
 	// AuditDir holds the per-person mutation log (internal/auditlog);
 	// empty = no log. The entrypoint sets <principals dir>/audit, which
-	// the Manager reads.
+	// the Manager reads; the writer's health file is AuditDir + ".health".
 	AuditDir string `json:"audit_dir"`
+	// Audit: "auto" (or empty) opens the log lazily: nothing is written
+	// until the principals table names a person (or grants are in force).
+	// "on" logs from the start.
+	Audit string `json:"audit"`
+	// AuditRetainMB / AuditRetainDays bound the log (oldest segments are
+	// removed); 0 = the auditlog defaults, -1 = no limit.
+	AuditRetainMB   int64 `json:"audit_retain_mb"`
+	AuditRetainDays int64 `json:"audit_retain_days"`
+}
+
+// auditOptions maps the config to the audit writer's options.
+func (fc fileConfig) auditOptions() (auditlog.Options, error) {
+	o := auditlog.Options{HealthPath: fc.AuditDir + ".health"}
+	switch fc.Audit {
+	case "", "auto":
+		o.Lazy = true
+	case "on":
+	default:
+		return o, fmt.Errorf("audit must be \"auto\" or \"on\", not %q", fc.Audit)
+	}
+	switch {
+	case fc.AuditRetainMB < -1 || fc.AuditRetainDays < -1:
+		return o, fmt.Errorf("audit_retain_mb and audit_retain_days must be -1, 0 or positive")
+	case fc.AuditRetainMB == -1:
+		o.RetainBytes = -1
+	default:
+		o.RetainBytes = fc.AuditRetainMB << 20
+	}
+	if fc.AuditRetainDays == -1 {
+		o.RetainAge = -1
+	} else {
+		o.RetainAge = time.Duration(fc.AuditRetainDays) * 24 * time.Hour
+	}
+	return o, nil
 }
 
 // Resolve the same effective defaults used by the CLI before constructing a
@@ -129,7 +163,11 @@ func main() {
 		// A log that cannot open does not stop the proxy: the writer starts
 		// failed and retries, and Mac writes are refused only while grants
 		// are in force (fail closed); otherwise they go ahead unlogged.
-		audit, err = auditlog.Open(fc.AuditDir, auditlog.Options{})
+		opts, err := fc.auditOptions()
+		if err != nil {
+			log.Fatalf("config %s: %v", *cfgPath, err)
+		}
+		audit, err = auditlog.Open(fc.AuditDir, opts)
 		if err != nil {
 			log.Printf("audit log %s unavailable (retrying): %v", fc.AuditDir, err)
 		}

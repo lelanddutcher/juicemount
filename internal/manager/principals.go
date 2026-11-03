@@ -95,6 +95,8 @@ type proxyPrincipalsFile struct {
 	Version    int                   `json:"version,omitempty"`
 	Principals []proxyPrincipalEntry `json:"principals"`
 	People     []proxyPersonEntry    `json:"people,omitempty"`
+	// RestrictUnassigned (format 2): Macs with no person may not write.
+	RestrictUnassigned bool `json:"restrict_unassigned,omitempty"`
 }
 
 // argon2id parameters: the proxy's defaults (respproxy.DefaultArgon*), the
@@ -373,6 +375,11 @@ type MacPrincipal struct {
 	// Person: the ID of the person this Mac belongs to ("" = none;
 	// people.go).
 	Person string `json:"person,omitempty"`
+	// PersonFromPrevious: the person of the principal PreviousInstanceID
+	// names, when this request was made. Self-reported like that ID, so
+	// it is assigned only when an admin approves (or confirms) this Mac,
+	// never by the auto-approve window.
+	PersonFromPrevious string `json:"person_from_previous,omitempty"`
 
 	// Per-Mac object keys (objkeys.go; JM_OBJ_PER_MAC=1). All empty when
 	// the mode was never on, so such a store is byte-identical to before.
@@ -474,6 +481,8 @@ type principalStoreFile struct {
 	ObjKeyOrphanRemoving []ObjKeyRemoval `json:"obj_key_orphan_removing,omitempty"`
 	// People: Teams slice 1 (people.go).
 	People []Person `json:"people,omitempty"`
+	// RestrictUnassigned: Macs with no person may not write (people.go).
+	RestrictUnassigned bool `json:"restrict_unassigned,omitempty"`
 }
 
 // ProxySignaler asks the proxy to reload the principals file whose sha256
@@ -566,6 +575,9 @@ type PrincipalStore struct {
 	people        map[string]*Person
 	proxyFormat   int
 	peopleWritten bool
+	// restrictUnassigned: Macs with no person may not write. On from the
+	// first grant until an admin turns it off (people.go).
+	restrictUnassigned bool
 }
 
 // issuedRequest is one reload.request line this process wrote and when.
@@ -786,6 +798,7 @@ func NewPrincipalStore(opts PrincipalStoreOptions) (*PrincipalStore, error) {
 		if err := s.loadPeople(f.People); err != nil {
 			return nil, err
 		}
+		s.restrictUnassigned = f.RestrictUnassigned
 	case errors.Is(err, os.ErrNotExist):
 	default:
 		return nil, err
@@ -980,6 +993,11 @@ func (s *PrincipalStore) Enroll(req EnrollRequest, sourceIP string) (EnrollRespo
 	}
 	if s.objk != nil {
 		rec.ObjKeyInUse = req.ObjectKeyInUse
+	}
+	if rec.PreviousInstanceID != "" {
+		if prev := s.recs[macPrincipalName(rec.PreviousInstanceID)]; prev != nil && prev.Person != "" {
+			rec.PersonFromPrevious = prev.Person
+		}
 	}
 	auto := s.autoApprovableLocked(now, sourceIP)
 	if auto && s.objk != nil {
@@ -1345,7 +1363,7 @@ func (s *PrincipalStore) Approve(name string) error {
 		if p.Status == PrincipalApproved {
 			// Confirming an auto-approved Mac clears it from the review list.
 			p.AutoApproved = false
-			return false, nil
+			return s.inheritPersonLocked(p), nil
 		}
 		if s.objk != nil && !objKeyDeliverable(p) {
 			// Invariant: approved => active key. Also covers a revoke or a
@@ -1356,6 +1374,7 @@ func (s *PrincipalStore) Approve(name string) error {
 		p.Status = PrincipalApproved
 		p.DecidedAt = s.opts.Now().UnixMilli()
 		p.AutoApproved = false
+		s.inheritPersonLocked(p)
 		return true, nil
 	})
 	if err == nil {
@@ -1617,6 +1636,7 @@ func (s *PrincipalStore) saveStoreLocked() error {
 	for _, p := range s.peopleLocked() {
 		f.People = append(f.People, *p)
 	}
+	f.RestrictUnassigned = s.restrictUnassigned
 	f.ObjKeysSeq, f.ObjKeyGens = s.keepObjSeq, s.keepObjGens
 	if s.objk != nil {
 		f.ObjKeysSeq = s.objk.seq
@@ -1692,8 +1712,8 @@ func (s *PrincipalStore) writeProxyFilesLocked() error {
 	if next.Principals == nil {
 		next.Principals = []proxyPrincipalEntry{}
 	}
-	if next.People = s.proxyPeopleLocked(); next.People != nil {
-		next.Version = 2
+	if people, v2 := s.proxyPeopleLocked(); v2 {
+		next.Version, next.People, next.RestrictUnassigned = 2, people, s.restrictUnassigned
 	}
 	body, err := json.MarshalIndent(next, "", "  ")
 	if err != nil {
@@ -1720,7 +1740,7 @@ func (s *PrincipalStore) writeProxyFilesLocked() error {
 		}
 		return err
 	}
-	s.peopleWritten = next.People != nil
+	s.peopleWritten = next.Version == 2
 	if s.opts.Signal != nil {
 		sum := sha256.Sum256(body)
 		sha := hex.EncodeToString(sum[:])

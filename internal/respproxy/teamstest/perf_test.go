@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"sync"
 	"testing"
 	"time"
 
@@ -79,6 +80,46 @@ func TestAuditOverhead(t *testing.T) {
 	for _, s := range sides {
 		t.Logf("%s create: %s", s.name, stats(s.create))
 		t.Logf("%s write:  %s", s.name, stats(s.write))
+	}
+	// Concurrent creates: with grants in force every Mac intent waits for
+	// its fsync; group commit lets concurrent connections share one.
+	const workers, each = 8, 200
+	for _, sd := range []struct {
+		name string
+		e    *env
+		dir  meta.Ino
+	}{{"grants, no audit   ", off, v.ino["/Clients/A"]}, {"grants + audit     ", on, v.ino["/Clients/B"]}} {
+		var mu sync.Mutex
+		var lat []time.Duration
+		var wg sync.WaitGroup
+		start := time.Now()
+		for w := 0; w < workers; w++ {
+			m := sd.e.client("mac-john")
+			// One directory per worker: the latency of the log, not of
+			// juicefs retrying conflicting transactions on one directory.
+			wdir := v.mustMkdir(v.admin, "/Clients/"+map[meta.Ino]string{v.ino["/Clients/A"]: "A", v.ino["/Clients/B"]: "B"}[sd.dir], fmt.Sprintf("w%d", w))
+			wg.Add(1)
+			go func(w int, wdir meta.Ino) {
+				defer wg.Done()
+				var ino meta.Ino
+				var a meta.Attr
+				for i := 0; i < each; i++ {
+					t0 := time.Now()
+					if st := m.Create(ctx, wdir, fmt.Sprintf("c%d-%05d", w, i), 0o644, 0o022, 0, &ino, &a); st != 0 {
+						t.Error(st)
+						return
+					}
+					d := time.Since(t0)
+					m.Close(ctx, ino)
+					mu.Lock()
+					lat = append(lat, d)
+					mu.Unlock()
+				}
+			}(w, wdir)
+		}
+		wg.Wait()
+		t.Logf("%s %d concurrent creates: %s; %.0f creates/s", sd.name, workers, stats(lat),
+			float64(workers*each)/time.Since(start).Seconds())
 	}
 	if err := on.audit.Sync(); err != nil {
 		t.Fatal(err)

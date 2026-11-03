@@ -69,8 +69,8 @@ func hasProject(r auditlog.Record, ino meta.Ino, path string) bool {
 // between A and B, and top-level or project creation are refused with
 // nothing committed and an audited refusal. Revoking the grant applies to
 // his next write without a reconnect; a client-folder grant opens every
-// project under it. A Mac without a person and the service principals keep
-// their rights.
+// project under it. A Mac without a person may read but not write while
+// grants are in force; the service principals keep their rights.
 func TestPersonGrantsThroughProxy(t *testing.T) {
 	for _, mode := range bothModes {
 		t.Run(string(mode), func(t *testing.T) { personGrants(t, mode) })
@@ -233,10 +233,13 @@ func personGrants(t *testing.T, mode respproxy.Mode) {
 	ok(john.Mkdir(ctx, B, "z", 0o755, 0o022, 0, &ino, &attr), "mkdir B/z with /Clients granted")
 	refused(john.Mkdir(ctx, meta.RootInode, "Top", 0o755, 0o022, 0, &ino, &attr), "mkdir /Top with /Clients granted")
 
-	// No person: today's behaviour.
+	// No person while grants are in force: reads, but no writes.
 	anon := e.client("mac-anon")
-	ok(anon.Mkdir(ctx, meta.RootInode, "AnonTop", 0o755, 0o022, 0, &ino, &attr), "anon mkdir /AnonTop")
-	ok(anon.Mkdir(ctx, C, "anon", 0o755, 0o022, 0, &ino, &attr), "anon mkdir C/anon")
+	refused(anon.Mkdir(ctx, meta.RootInode, "AnonTop", 0o755, 0o022, 0, &ino, &attr), "anon mkdir /AnonTop")
+	refused(anon.Mkdir(ctx, C, "anon", 0o755, 0o022, 0, &ino, &attr), "anon mkdir C/anon")
+	if st := anon.Lookup(ctx, A, "g.txt", &ino, &attr, false); st != 0 {
+		t.Fatalf("anon lookup A/g.txt: %v", st)
+	}
 
 	// Service principals keep their rights.
 	ok(e.client("admin1").Mkdir(ctx, meta.RootInode, "AdminTop", 0o755, 0o022, 0, &ino, &attr), "admin mkdir /AdminTop")
@@ -247,8 +250,8 @@ func personGrants(t *testing.T, mode respproxy.Mode) {
 	if r, out := intentFor(t, recs, "AdminTop"); out != auditlog.OutcomeCommitted || r.Principal != "admin1" || r.Person != "" {
 		t.Errorf("admin mkdir recorded as %+v / %q", r, out)
 	}
-	if r, out := intentFor(t, recs, "AnonTop"); out != auditlog.OutcomeCommitted || r.Principal != "mac-anon" || r.Person != "" {
-		t.Errorf("anon mkdir recorded as %+v / %q", r, out)
+	if r := refusalFor(recs, "AnonTop"); r == nil || r.Principal != "mac-anon" || r.Person != "" || r.Reason != string(respproxy.ReasonNotGranted) {
+		t.Errorf("anon mkdir recorded as %+v", r)
 	}
 
 	// The chain verifies, and a changed line is detected.

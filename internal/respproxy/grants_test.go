@@ -149,3 +149,93 @@ func TestCleanGrantPath(t *testing.T) {
 		}
 	}
 }
+
+func TestRestrictUnassigned(t *testing.T) {
+	v1 := strings.Replace(string(principalsBody(t, 0, "")), `{"principals"`, `{"restrict_unassigned":true,"principals"`, 1)
+	if _, err := ParsePrincipals([]byte(v1)); err == nil || !strings.Contains(err.Error(), "needs format version 2") {
+		t.Fatalf("restrict_unassigned in a version-1 file: %v", err)
+	}
+	v2 := strings.Replace(string(principalsBody(t, 2, "")), `"version":2,`, `"version":2,"restrict_unassigned":true,`, 1)
+	ps, err := ParsePrincipals([]byte(v2))
+	if err != nil || !ps.GrantsInForce() || ps.HasPeople() {
+		t.Fatalf("restrict_unassigned without people: in force %v, people %v, %v", ps.GrantsInForce(), ps.HasPeople(), err)
+	}
+}
+
+func TestTrashEntryParent(t *testing.T) {
+	for name, want := range map[string]uint64{
+		"12-345-clip.mov": 12, "12-345-a-b.mov": 12, "7-8-": 7,
+		"0-1-x": 0, "x-1-y": 0, "12-x-y": 0, "12": 0, "-1-y": 0, "12--y": 0, "012-1-y": 0,
+	} {
+		got, ok := trashEntryParent(name)
+		if ok != (want != 0) || got != want {
+			t.Errorf("trashEntryParent(%q) = %d, %v; want %d", name, got, ok, want)
+		}
+	}
+}
+
+func TestClassifyAudit(t *testing.T) {
+	unit := func(keys ...string) *Unit {
+		u := &Unit{}
+		for i, k := range keys {
+			u.Cmds = append(u.Cmds, Cmd{Args: [][]byte{[]byte("SET"), []byte(k), []byte("v")}, Info: Command{Name: "SET"}})
+			u.Project = append(u.Project, KeyWrite{Cmd: i, Key: ParseKey(k), Raw: k})
+		}
+		return u
+	}
+	for _, c := range []struct {
+		keys  []string
+		want  auditClass
+		check int
+	}{
+		{[]string{"c7_0", "i7"}, auditData, 1},      // contents and the file's own length: compare its attrs
+		{[]string{"c7_0"}, auditData, 0},            // contents only
+		{[]string{"c7_0", "i8"}, auditNamespace, 0}, // another inode's attributes
+		{[]string{"c7_0", "x7"}, auditNamespace, 0}, // an xattr, even of the written file
+		{[]string{"c7_0", "p7"}, auditNamespace, 0}, // a link parent
+		{[]string{"c7_0", "s9"}, auditNamespace, 0}, // a symlink target
+		{[]string{"c7_0", "d3"}, auditNamespace, 0}, // an entry
+		{[]string{"i7"}, auditNamespace, 0},         // setattr
+		{[]string{"lockf7"}, auditNone, 0},          // a lock
+		{[]string{"c7_0", "lockf8"}, auditData, 0},  // contents and a lock
+	} {
+		got, check := classifyAudit(unit(c.keys...))
+		if got != c.want || len(check) != c.check {
+			t.Errorf("%v: class %d with %d attr checks, want %d with %d", c.keys, got, len(check), c.want, c.check)
+		}
+	}
+}
+
+func TestAttrDiff(t *testing.T) {
+	mk := func(flags byte, mode uint16, uid, gid uint32, acl bool) []byte {
+		n := 72
+		if acl {
+			n = 80
+		}
+		b := make([]byte, n)
+		b[0] = flags
+		b[1], b[2] = byte(mode>>8), byte(mode)
+		b[3], b[4], b[5], b[6] = byte(uid>>24), byte(uid>>16), byte(uid>>8), byte(uid)
+		b[7], b[8], b[9], b[10] = byte(gid>>24), byte(gid>>16), byte(gid>>8), byte(gid)
+		if acl {
+			b[75], b[79] = 3, 4
+		}
+		return b
+	}
+	base := mk(0, 1<<12|0o644, 501, 20, false)
+	if d := attrDiff(7, base, mk(0, 1<<12|0o644, 501, 20, false)); len(d) != 0 {
+		t.Fatalf("no change reported as %+v", d)
+	}
+	d := attrDiff(7, base, mk(1, 1<<12|0o4755, 0, 0, true))
+	got := map[string]string{}
+	for _, c := range d {
+		got[c.Field] = c.Old + ">" + c.New
+	}
+	want := map[string]string{"mode": "0644>4755", "uid": "501>0", "gid": "20>0", "flags": "0x0>0x1", "acl": "none>3/4"}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("changes %v, want %v", got, want)
+	}
+	if d := attrDiff(7, base, []byte("short")); len(d) != 1 || d[0].Field != "attr" {
+		t.Fatalf("unparsable value: %+v", d)
+	}
+}
