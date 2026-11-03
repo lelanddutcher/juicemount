@@ -586,6 +586,10 @@ return {table.concat(scanState, ',')}`
 // ClaimForWorker polls the worker's eligible lanes and atomically moves one raw
 // job into its processing list. Unlike BRPOP, a worker crash cannot lose the
 // entry: RecoverAbandonedWorkers can see and requeue the durable receipt.
+//
+// Callers must not run ClaimForWorker concurrently for the same worker: the
+// worker keeps one unconfirmed claim token, and a second concurrent call's
+// unconfirmed token would be dropped.
 func (c *Client) ClaimForWorker(ctx context.Context, timeout time.Duration, w Worker) (Claim, bool, error) {
 	if w.AdmissionBlocked {
 		return Claim{}, false, nil
@@ -805,8 +809,10 @@ func (s *claimScanState) takeToken() string {
 	return token
 }
 
-// keepToken returns a token no claim was returned for. An unconfirmed token
-// wins over a confirmed one from a concurrent call for the same worker.
+// keepToken returns a token no claim was returned for, so the next call can
+// replay a claim whose reply was lost. An unconfirmed token wins over a
+// confirmed one; only one is kept, which is why callers must not claim
+// concurrently for one worker.
 func (s *claimScanState) keepToken(token string, unconfirmed bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

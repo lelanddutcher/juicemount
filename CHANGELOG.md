@@ -73,7 +73,8 @@ workers.
   by the worker's next claim, or put back in its queue if the worker has
   stopped claiming (disabled, paused, draining, or waiting on the storage
   permit). Before, it stayed queued in that worker's processing list, run by
-  no one, until the worker exited.
+  no one, until the worker exited. The fix runs in each worker's own claim, so
+  every jmfarm worker must be upgraded to get it.
 - A worker retries a transient Redis fault while publishing a job's outcome. If
   the outcome still cannot be published, the worker stops so another worker
   recovers the job, instead of leaving it shown as running.
