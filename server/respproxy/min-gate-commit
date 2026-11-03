@@ -15,4 +15,4 @@
 # Bump after changes to internal/respproxy or server/respproxy/entrypoint.sh.
 # TestH8BGateCoversEntrypointHandshake checks ancestry with full Git history.
 # A squash or rebase requires a new pin to the resulting release-line commit.
-1df417f105252e3ed9e519b819acf0c6a354b1e9
+6b70fa0b132f2e7fde3d396e92df3175c3f8e503
