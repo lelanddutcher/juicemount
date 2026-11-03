@@ -351,7 +351,10 @@ func TestGuardKeyClasses(t *testing.T) {
 		{"delfiles with options", mac, UnitTxn, [][]string{{"SET", "i9", "a"}, {"ZADD", "delfiles", "NX", "1", "9:0"}}, ReasonBGOnly, 0},
 		{"bare trash cleanup is bg", mac, UnitBare, [][]string{{"HDEL", trash(1), "5-9-f"}}, ReasonBGOnly, 0},
 		{"bg trash cleanup", bg, UnitTxn, [][]string{{"HDEL", trash(1), "5-9-f"}, {"DEL", "i9"}}, "", 1},
-		{"hourly trash dir create", mac, UnitTxn, [][]string{{"HSET", trash(0), "2026-10-06-13", "x"}, {"SET", trashI(3), "a"}, {"SET", trashI(0), "a"}}, "", 0},
+		// The real mknod shape is in TestGuardHourlyTrashCreate.
+		{"unchecked trash root write", mac, UnitTxn, [][]string{{"HSET", trash(0), "2026-10-06-13", "x"}, {"SET", trashI(3), "a"}, {"SET", trashI(0), "a"}}, ReasonBGOnly, 0},
+		{"bare trash SETNX of another trash inode", mac, UnitBare, [][]string{{"SETNX", trashI(3), "a"}}, ReasonBGOnly, 0},
+		{"webdav bare trash SETNX", dav, UnitBare, [][]string{{"SETNX", trashI(0), "a"}}, ReasonPrincipalReadonly, 0},
 		{"bare trash SETNX", mac, UnitBare, [][]string{{"SETNX", trashI(0), "a"}}, "", 0},
 		{"bare delfiles ZREM", mac, UnitBare, [][]string{{"ZREM", "delfiles", "9:0"}}, ReasonBGOnly, 0},
 		{"bg delfiles ZREM", bg, UnitBare, [][]string{{"ZREM", "delfiles", "9:0"}}, "", 0},

@@ -99,6 +99,12 @@ type Unit struct {
 	// Decide MUST check the principal may write every RefInode, exactly as
 	// for the inodes of Project.
 	RefInodes []uint64
+	// TrashAlloc is the reply of this connection's latest INCR nextTrash
+	// since its previous EXEC, in this DB (0 = none). juicefs creates an
+	// hourly trash directory as inode TrashInode+TrashAlloc in the txn
+	// that follows that INCR (redis.go doMknod), so it is the only trash
+	// inode a non-trusted principal's txn may create.
+	TrashAlloc uint64
 
 	// beforeSide, set by the proxy, makes the connection's buffered WATCH
 	// reach Redis (and waits for its +OK) before the guard's first side read.

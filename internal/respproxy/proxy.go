@@ -192,6 +192,7 @@ func New(cfg Config) (*Proxy, error) {
 	p.Guard = NewGuard(&redisSessions{p: p, cache: map[uint64]string{}}, sideChunks{p})
 	p.Guard.slices = &redisSlices{p: p}
 	p.Guard.counters = sideCounters{p}
+	p.Guard.side = p.side
 	p.stageBirth.Store(cfg.StageBirth)
 	p.setMode(cfg.Mode, "config")
 	return p, nil
@@ -591,6 +592,16 @@ type conn struct {
 	txn         *txnState
 	watched     []string
 	watchAck    chan struct{} // closed when the last WATCH's reply was read
+
+	// trashAlloc: the reply of this connection's latest INCR nextTrash,
+	// stored by the reply goroutine before the client sees it and taken by
+	// the next EXEC (Unit.TrashAlloc).
+	trashAlloc atomic.Pointer[trashAlloc]
+}
+
+type trashAlloc struct {
+	db int
+	n  uint64
 }
 
 var errClose = errors.New("respproxy: closing connection")
@@ -1432,6 +1443,13 @@ func (c *conn) gateBare(args [][]byte, info Command) error {
 		s.hook = c.p.sessionHook(c.principal.Name, n)
 	case "nextchunk":
 		s.hook = c.p.sliceHook(c.principal.Name, n)
+	case "nextTrash":
+		db := c.db
+		s.hook = func(v Value) {
+			if v.Type == ':' && v.Int > 0 {
+				c.trashAlloc.Store(&trashAlloc{db: db, n: uint64(v.Int)})
+			}
+		}
 	}
 	if u.rewrite != nil {
 		args = u.rewrite
@@ -1503,6 +1521,9 @@ func (c *conn) exec() error {
 	c.p.Stats.analyse("txn", writesOf(t.cmds))
 	u := c.newUnit(UnitTxn, t.cmds)
 	u.Watched = watched
+	if a := c.trashAlloc.Swap(nil); a != nil && a.db == c.db {
+		u.TrashAlloc = a.n // one txn only: the next trash directory needs a new INCR
+	}
 
 	var d *Denial
 	var v Verdict
