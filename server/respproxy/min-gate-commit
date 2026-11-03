@@ -5,9 +5,11 @@
 # This release snapshot includes applied credential receipts, exact-byte
 # reload validation, retained-session revocation, reload heartbeat, joined
 # shutdown, and the exec entrypoint handshake required by Manager.
-# It also includes stage-birth and enforcing-lease prerequisites.
+# It also includes stage-birth and enforcing-lease prerequisites, and the
+# entrypoint that keeps person grants (principals format 2) and sets the
+# audit directory.
 #
 # Bump after changes to internal/respproxy or server/respproxy/entrypoint.sh.
 # TestH8BGateCoversEntrypointHandshake checks ancestry with full Git history.
 # A squash or rebase requires a new pin to the resulting release-line commit.
-5f3352b45c0550a2f9a74221a6276f956bd1223b
+d298e4f00fe0577448e29c0161a27f7fb32df6db
