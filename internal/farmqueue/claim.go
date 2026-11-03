@@ -67,7 +67,30 @@ func claimProcessingIndex(claim Claim) string {
 	return ProcessingIndexKey
 }
 
-const claimForWorkerScript = `
+// legacyClaimReplayLua defines replayLegacyClaim, which finds the legacy
+// receipt an earlier run of the claim script made with this token in the
+// worker's processing list. A legacy claim has no lease, and the reaper leaves
+// a live worker's legacy receipts alone, so a claim whose reply was lost
+// (go-redis resends the EVAL after EOF or a timeout; ClaimForWorker reuses the
+// token of an EVAL that failed) must come back to the next run with that
+// token, or it waits in that list for as long as the worker lives. A token
+// belongs to one ClaimForWorker caller until a claim is returned to it.
+const legacyClaimReplayLua = `
+local function replayLegacyClaim(processing, token)
+  for _, held in ipairs(redis.call('LRANGE', processing, 0, -1)) do
+    local ok, job = pcall(cjson.decode, held)
+    if ok and type(job) == 'table' and type(job.id) == 'string' and
+       redis.call('HGET', 'juicefarm:job:' .. job.id, 'delivery_token') == token then
+      return held
+    end
+  end
+  return nil
+end
+`
+
+const claimForWorkerScript = legacyClaimReplayLua + `
+local replayed = replayLegacyClaim(KEYS[4], ARGV[7])
+if replayed then return {'', replayed, '', KEYS[4]} end
 local controlRaw = redis.call('GET', KEYS[1])
 if controlRaw then
   local controlOK, control = pcall(cjson.decode, controlRaw)
@@ -563,6 +586,10 @@ return {table.concat(scanState, ',')}`
 // ClaimForWorker polls the worker's eligible lanes and atomically moves one raw
 // job into its processing list. Unlike BRPOP, a worker crash cannot lose the
 // entry: RecoverAbandonedWorkers can see and requeue the durable receipt.
+//
+// Callers must not run ClaimForWorker concurrently for the same worker: the
+// worker keeps one unconfirmed claim token, and a second concurrent call's
+// unconfirmed token would be dropped.
 func (c *Client) ClaimForWorker(ctx context.Context, timeout time.Duration, w Worker) (Claim, bool, error) {
 	if w.AdmissionBlocked {
 		return Claim{}, false, nil
@@ -592,8 +619,16 @@ func (c *Client) ClaimForWorker(ctx context.Context, timeout time.Duration, w Wo
 		scan.restart()
 	}
 	steps, maxSteps := 0, 0
+	// Every poll of this call sends the same token, and until a claim is
+	// returned the next call sends it again, so a run whose reply was lost is
+	// replayed rather than left behind (see legacyClaimReplayLua).
+	token, unconfirmed, spent := scan.takeToken(), false, false
+	defer func() {
+		if !spent {
+			scan.keepToken(token, unconfirmed)
+		}
+	}()
 	for {
-		token := NewID()
 		requestStart := time.Now()
 		expires := time.Now().Add(claimLeaseTTL)
 		cursors, seqs, owed := scan.scanArgs(keys)
@@ -602,13 +637,17 @@ func (c *Client) ClaimForWorker(ctx context.Context, timeout time.Duration, w Wo
 			token, expires.UTC().Format(time.RFC3339), expires.Unix(), w.Role,
 			claimScanBatch, cursors, seqs, owed).StringSlice()
 		if err != nil && err != redis.Nil {
+			// The script may have claimed a job before the reply was lost.
+			unconfirmed = true
 			return Claim{}, false, err
 		}
+		unconfirmed = false
 		cycleDone := true
 		if len(res) >= 1 {
 			cycleDone = scan.observe(keys, res[0])
 		}
 		if len(res) >= 4 {
+			spent = true
 			scan.claimed()
 			res = res[1:]
 			var job Job
@@ -624,6 +663,9 @@ func (c *Client) ClaimForWorker(ctx context.Context, timeout time.Duration, w Wo
 				}
 			}
 			claim := Claim{Job: job, Raw: res[0], QueueKey: res[1], WorkerID: w.ID, Token: token, Generation: generation}
+			if claim.QueueKey == "" {
+				claim.QueueKey = QueueKeyFor(&job) // a replayed receipt does not record its lane
+			}
 			if len(res) >= 5 {
 				_, parseErr := strconv.ParseInt(res[4], 10, 64)
 				if parseErr != nil {
@@ -668,6 +710,52 @@ func (c *Client) ClaimForWorker(ctx context.Context, timeout time.Duration, w Wo
 	}
 }
 
+const findLegacyClaimReplayScript = legacyClaimReplayLua + `
+return replayLegacyClaim(KEYS[1], ARGV[1]) or false`
+
+// ReleaseUnconfirmedClaim returns to its lane a legacy job that this worker's
+// last failed claim may have taken without the reply reaching it. The next
+// ClaimForWorker call would return that job; a worker that stops claiming
+// while it lives (disabled, paused, draining, blocked) calls this instead, so
+// the job does not wait for it. It reports whether a job was released.
+func (c *Client) ReleaseUnconfirmedClaim(ctx context.Context, w Worker) (bool, error) {
+	scan := c.claimScanFor(w.ID)
+	token := scan.takeUnconfirmedToken()
+	if token == "" {
+		return false, nil
+	}
+	released, err := c.releaseLegacyClaimByToken(ctx, w.ID, token)
+	scan.keepToken(token, err != nil)
+	return released, err
+}
+
+func (c *Client) releaseLegacyClaimByToken(ctx context.Context, workerID, token string) (bool, error) {
+	raw, err := c.rdb.Eval(ctx, findLegacyClaimReplayScript, []string{ProcessingPrefix + workerID}, token).Text()
+	if err == redis.Nil {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	var job Job
+	if err := json.Unmarshal([]byte(raw), &job); err != nil {
+		return false, fmt.Errorf("decode unconfirmed claim: %w", err)
+	}
+	// The job never ran: keep its route, attempts and routing note.
+	note, err := c.rdb.HGet(ctx, JobHashPrefix+job.ID, "error").Result()
+	if err != nil && err != redis.Nil {
+		return false, err
+	}
+	claim := Claim{Job: job, Raw: raw, WorkerID: workerID, Token: token}
+	if err := c.RequeueClaimSameRoute(ctx, claim, note); err != nil {
+		if errors.Is(err, ErrClaimLost) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
 const (
 	// claimScanBatch bounds the ready entries one claim poll inspects per lane,
 	// once in the cursor window and once among newly enqueued entries. The claim
@@ -702,6 +790,48 @@ type claimScanState struct {
 	idle    time.Duration
 	// fruitless counts consecutive polls that claimed nothing.
 	fruitless int
+	// token is the claim token the next ClaimForWorker call sends; while a
+	// call holds it, it is empty. unconfirmed says the last EVAL that sent it
+	// failed, so it may have claimed a job this process has not seen.
+	token       string
+	unconfirmed bool
+}
+
+// takeToken hands the caller the pending claim token, or a new one.
+func (s *claimScanState) takeToken() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	token := s.token
+	s.token, s.unconfirmed = "", false
+	if token == "" {
+		token = NewID()
+	}
+	return token
+}
+
+// keepToken returns a token no claim was returned for, so the next call can
+// replay a claim whose reply was lost. An unconfirmed token wins over a
+// confirmed one; only one is kept, which is why callers must not claim
+// concurrently for one worker.
+func (s *claimScanState) keepToken(token string, unconfirmed bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.token == "" || unconfirmed && !s.unconfirmed {
+		s.token, s.unconfirmed = token, unconfirmed
+	}
+}
+
+// takeUnconfirmedToken hands the caller the pending token only if it is
+// unconfirmed.
+func (s *claimScanState) takeUnconfirmedToken() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.unconfirmed {
+		return ""
+	}
+	token := s.token
+	s.token, s.unconfirmed = "", false
+	return token
 }
 
 func newClaimScanState() *claimScanState {
