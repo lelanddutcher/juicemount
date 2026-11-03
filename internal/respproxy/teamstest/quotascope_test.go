@@ -41,9 +41,15 @@ func waitUsed(e *env, ino meta.Ino, d time.Duration, cond func(int64) bool) (int
 	}
 }
 
+// johnMount is a juicefs session of John's Mac, flushing dir stats and
+// quotas. Its heartbeat is an hour: the vendored juicefs's session refresh
+// reads the session id without a lock (a data race under -race once it
+// runs, after one heartbeat), and these tests need no refresh.
 func johnMount(t *testing.T, e *env) meta.Meta {
 	t.Helper()
-	jm := meta.NewClient("redis://mac-john:"+passOf("mac-john")+"@"+e.paddr+"/"+strconv.Itoa(testDB), metaConf())
+	conf := metaConf()
+	conf.Heartbeat = time.Hour
+	jm := meta.NewClient("redis://mac-john:"+passOf("mac-john")+"@"+e.paddr+"/"+strconv.Itoa(testDB), conf)
 	if _, err := jm.Load(true); err != nil {
 		t.Fatal(err)
 	}
@@ -154,7 +160,9 @@ func TestNoQuotaAboveProjectsWhileGrantsInForce(t *testing.T) {
 			if err := adm.HandleQuota(meta.Background(), meta.QuotaSet, "/Clients", map[string]*meta.Quota{"/Clients": {MaxSpace: 1 << 50, MaxInodes: 1 << 20}}, false, false, false); err != nil {
 				t.Fatal("quota set via the proxy:", err)
 			}
-			jm := meta.NewClient("redis://mac-anon:"+passOf("mac-anon")+"@"+e.paddr+"/"+strconv.Itoa(testDB), metaConf())
+			conf := metaConf()
+			conf.Heartbeat = time.Hour // see johnMount
+			jm := meta.NewClient("redis://mac-anon:"+passOf("mac-anon")+"@"+e.paddr+"/"+strconv.Itoa(testDB), conf)
 			if _, err := jm.Load(true); err != nil {
 				t.Fatal(err)
 			}
@@ -189,13 +197,15 @@ func TestNoQuotaAboveProjectsWhileGrantsInForce(t *testing.T) {
 // does not put grants in force with a quota above the project folders, and
 // reports one: juicefs flushes every quota in one transaction, so the
 // proxy refuses all of John's flush, his project's quota usage included,
-// for as long as the quota on /Clients exists; deleting it lets the flush
-// through.
+// for as long as his juicefs knows the quota on /Clients. Once it is
+// deleted, a juicefs that loaded the quotas since (here a new mount; a
+// running one reloads them every heartbeat) flushes again.
 func TestLimitedFlushStallsOnQuotaAboveProjects(t *testing.T) {
 	e := newEnv(t, respproxy.ModeEnforce, johnGranted("/Clients/A"))
 	A, clients := e.ino["/Clients/A"], e.ino["/Clients"]
 	setQuota(t, e, "/Clients", 1<<50, 1<<20)
 	setQuota(t, e, "/Clients/A", 1<<50, 1<<20)
+	a0 := used(e, "dirQuotaUsedSpace", A)
 	jm := johnMount(t, e)
 	c := meta.Background()
 	var attr meta.Attr
@@ -207,7 +217,7 @@ func TestLimitedFlushStallsOnQuotaAboveProjects(t *testing.T) {
 		t.Fatal(st)
 	}
 	jm.Close(c, f)
-	if v, ok := waitUsed(e, A, 7*time.Second, func(v int64) bool { return v >= gib }); ok {
+	if v, ok := waitUsed(e, A, 4500*time.Millisecond, func(v int64) bool { return v >= a0+gib }); ok {
 		t.Fatalf("A's usage landed (%d) although the flush names /Clients", v)
 	}
 	named := false
@@ -220,10 +230,19 @@ func TestLimitedFlushStallsOnQuotaAboveProjects(t *testing.T) {
 	if err := e.admin.HandleQuota(c, meta.QuotaDel, "/Clients", nil, false, false, false); err != nil {
 		t.Fatal(err)
 	}
-	// juicefs loads the quotas again every heartbeat (12 s): from then on
-	// its flush no longer names /Clients.
-	if v, ok := waitUsed(e, A, 40*time.Second, func(v int64) bool { return v >= gib }); !ok {
-		t.Errorf("A's usage after the quota on /Clients was deleted: %d", v)
+	jm.CloseSession()
+	a1 := used(e, "dirQuotaUsedSpace", A)
+	jm2 := johnMount(t, e)
+	var f2 meta.Ino
+	if st := jm2.Create(c, A, "clip2.mov", 0o644, 0o022, 0, &f2, &attr); st != 0 {
+		t.Fatal(st)
+	}
+	if st := jm2.Truncate(c, f2, 0, uint64(gib), &attr, false); st != 0 {
+		t.Fatal(st)
+	}
+	jm2.Close(c, f2)
+	if v, ok := waitUsed(e, A, 8*time.Second, func(v int64) bool { return v >= a1+gib }); !ok {
+		t.Errorf("A's usage after the quota on /Clients was deleted: %d -> %d", a1, v)
 	}
 }
 

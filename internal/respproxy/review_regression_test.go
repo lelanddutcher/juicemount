@@ -378,8 +378,10 @@ func TestReviewClientSetnameReplaced(t *testing.T) {
 	rc := tp.raw(t)
 	rc.login("mac1")
 	mustOK(t, rc.do("CLIENT", "SETNAME", "p:admin1"), "SETNAME")
+	// Exactly the requested name: other test packages on the same Redis
+	// hold proxy connections named p:admin1:<id>.
 	list := rdb.ClientList(ctx5(t)).Val()
-	if strings.Contains(list, "name=p:admin1") || !strings.Contains(list, "name=p:mac1:") {
+	if strings.Contains(list, "name=p:admin1 ") || !strings.Contains(list, "name=p:mac1:") {
 		t.Fatalf("client chose its upstream name:\n%s", list)
 	}
 }
