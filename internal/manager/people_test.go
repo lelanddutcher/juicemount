@@ -73,6 +73,23 @@ func approvedMac(t *testing.T, s *PrincipalStore, instance string) string {
 }
 
 // waitApplied waits until the proxy applied the latest request.
+// waitHeartbeatFormat waits until the proxy directory's fresh heartbeat
+// advertises format want (the previous proxy's heartbeat stays fresh for
+// proxyHeartbeatMaxAge, so a fixed sleep races a slow first tick).
+func waitHeartbeatFormat(t *testing.T, dir string, want int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if f, ok := heartbeatFormat(dir); ok && f == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no fresh heartbeat with format %d", want)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 func waitApplied(t *testing.T, s *PrincipalStore) PeopleSnapshot {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
@@ -209,7 +226,7 @@ func TestPeopleFormatFollowsProxyImage(t *testing.T) {
 	// Upgrade.
 	stopOld()
 	stopNew := startRealProxyReloader(t, dir)
-	time.Sleep(50 * time.Millisecond) // a fresh heartbeat with the token
+	waitHeartbeatFormat(t, dir, 2) // a fresh heartbeat with the token
 	s.mu.Lock()
 	err = s.syncPeopleLocked()
 	s.mu.Unlock()
@@ -238,7 +255,7 @@ func TestPeopleFormatFollowsProxyImage(t *testing.T) {
 	// Downgrade: a fresh heartbeat without the token.
 	stopNew()
 	startFakeProxyAck(t, dir)
-	time.Sleep(50 * time.Millisecond)
+	waitHeartbeatFormat(t, dir, 1)
 	s.mu.Lock()
 	err = s.syncPeopleLocked()
 	s.mu.Unlock()
