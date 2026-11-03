@@ -75,6 +75,16 @@ workers.
   permit). Before, it stayed queued in that worker's processing list, run by
   no one, until the worker exited. The fix runs in each worker's own claim, so
   every jmfarm worker must be upgraded to get it.
+- A legacy job claimed for a worker that never learned of the claim (a claim
+  request that reached Redis late, after the worker had moved on) is put back
+  in its queue once it has waited a minute unstarted, even while that worker
+  is alive and working on something else. Before, it waited in that worker's
+  processing list until the worker exited. A worker that starts the job at the
+  same moment either keeps it or is refused the start, so the job runs once.
+- A worker whose request to put a job back in its queue was retried after a
+  lost reply no longer stops as if it had lost the job. The retry now reports
+  that the first request succeeded. This runs in the worker's own request, so
+  an un-upgraded worker still stops.
 - A worker retries a transient Redis fault while publishing a job's outcome. If
   the outcome still cannot be published, the worker stops so another worker
   recovers the job, instead of leaving it shown as running.
@@ -240,6 +250,13 @@ new workers against the same Redis at the same time:
 - Jobs queued by a v0.5.0 worker or Manager are not counted as new, so a new
   worker finds them only by walking the queue, which can take minutes behind
   a large backlog meant for another GPU.
+- The return of a legacy job a live worker never started runs in the
+  workers' recovery scan, so it covers an un-upgraded worker's claims too, as
+  long as one upgraded worker is running: its claims carry no claim time, so
+  the minute counts from when an upgraded worker first sees the claim, up to
+  15 seconds later. An un-upgraded worker that tries to start such a job after
+  it was put back is refused the start and stops, as when a reaper recovers its
+  job today, and its service manager restarts it.
 
 ## 0.5.0 — general release (build 37)
 

@@ -53,7 +53,7 @@ redis.call('ZADD', KEYS[5], ARGV[9], ARGV[6])
 redis.call('LREM', KEYS[2], 1, ARGV[3])
 redis.call('ZREM', KEYS[3], ARGV[6])
 redis.call('HDEL', KEYS[1], 'lease_owner', 'lease_expires_at', 'lease_expires_unix',
-  'claim_token', 'claim_phase', 'delivery_token', 'delivery_expires_unix')
+  'claim_token', 'claim_phase', 'delivery_token', 'delivery_expires_unix', 'delivery_claimed')
 if redis.call('LLEN', KEYS[2]) == 0 then redis.call('SREM', KEYS[4], ARGV[2]) end
 if ARGV[7] ~= '' then redis.call('SREM', KEYS[6], ARGV[6]) end
 return 1`
