@@ -291,12 +291,11 @@ func TestCleanupScopeSustainedSet(t *testing.T) {
 	projectBIntact(t, db)
 }
 
-// An entry for an inode that does not exist yet must create it, from the
-// creator's own nextinode batch. So a Mac cannot plant an entry for (or
-// create) the inode another project's mount is about to create, and bg's
-// trash cleanup of the Mac's directory leaves that file alone. juicefs's
-// own create, mkdir, mknod, symlink, link, rename and file clone pass, and
-// a hard link still needs write access to its target's project.
+// An entry names only an inode its writer created from its own nextinode
+// batch, or an existing inode the writer may link, so bg's trash cleanup of
+// a directory removes only what that directory's project created or
+// linked. juicefs's own create, mkdir, mknod, symlink, link, rename and
+// file clone pass, and a hard link still needs its target's project.
 func TestCleanupScopeNewInodeFromOwnBatch(t *testing.T) {
 	r, db := cleanupScopeRig(t, 1)
 	ctx := context.Background()
@@ -333,11 +332,7 @@ func TestCleanupScopeNewInodeFromOwnBatch(t *testing.T) {
 		ReasonUnknownKey, "new inode whose attr and entry differ in type")
 	wantDeny(t, txn(rc, []string{"SET", "i" + inoStr(lo+1), fileAttr(5)}, []string{"HSET", "d5", "x", mkEntry(typeFile, lo+1)},
 		[]string{"HSET", "d3", "y", mkEntry(typeFile, lo+1)}), ReasonUnknownKey, "new inode in two directories")
-	v := rc.do("INCRBY", "nextinode", "1")
-	if v.Type != ':' {
-		t.Fatalf("INCRBY nextinode 1: %c %q", v.Type, v.Str)
-	}
-	wantDeny(t, create(rc, 5, uint64(v.Int), "small"), ReasonAdminOnly, "create from a step smaller than juicefs's batch")
+	wantDeny(t, rc.do("INCRBY", "nextinode", "1"), ReasonAdminOnly, "nextinode step smaller than juicefs's batch")
 	// A hard link to B's file needs B.
 	wantDeny(t, txn(rc, []string{"SET", "i" + inoStr(next), string((&meta.Attr{Typ: meta.TypeFile, Mode: 0644, Nlink: 2}).Marshal())},
 		[]string{"HSET", "d5", "link", mkEntry(typeFile, next)}, []string{"HINCRBY", "p" + inoStr(next), "5", "1"},
@@ -368,7 +363,7 @@ func TestCleanupScopeNewInodeFromOwnBatch(t *testing.T) {
 	if st := ma.Clone(meta.Background(), 5, file, dir, "copy.mov", 0, 0, &count, &total); st != 0 {
 		t.Fatalf("clone: %v", st)
 	}
-	// A planted directory moved into the trash takes only its own entries.
+	// bg's trash cleanup removes only what the trashing principal could remove.
 	if st := ma.Unlink(meta.Background(), 3, "f"); st != 0 {
 		t.Fatalf("unlink into trash: %v", st)
 	}

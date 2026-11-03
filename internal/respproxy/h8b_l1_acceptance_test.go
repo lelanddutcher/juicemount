@@ -404,7 +404,7 @@ func TestH8BUnknownWriteShapeRefused(t *testing.T) {
 	}
 	// Positive controls: known shapes go through.
 	for _, cmd := range [][]string{
-		{"SET", "i7", "attr"}, {"INCR", "nextinode"}, {"HSET", "jum:presence:mac1-host", "p", "1"},
+		{"SET", "i7", "attr"}, {"INCRBY", "nextinode", "1024"}, {"HSET", "jum:presence:mac1-host", "p", "1"},
 		{"SET", "jm:link-bench:00", "x", "EX", "60"}, {"HINCRBY", "dirUsedSpace", "7", "4096"},
 	} {
 		mustOK(t, rc.do(cmd...), strings.Join(cmd, " "))

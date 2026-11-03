@@ -680,11 +680,9 @@ func trashEntryOrigin(name string) (dir, ino uint64, ok bool) {
 //
 // A number at or below Unit.inodeMark with no recorded owner was handed out
 // before the proxy recorded batches; a mount still holding such a batch
-// creates from it with the structural rules alone. Every such number is
-// already allocated, so the only thing another principal can do with one
-// is create it first in its own project: the holder's later create of that
-// number is then refused (the inode exists elsewhere), until the holder's
-// juicefs restarts and takes a recorded batch.
+// creates from it with the structural rules alone. Each such number names
+// at most one inode, created by whoever creates it first, and every batch
+// taken after recording began is recorded.
 func newInodeGate(p Principal, u *Unit, n uint64, newHere []placedIn, attrs map[uint64]attrInfo) *Denial {
 	refuse := func(r Reason, detail string) *Denial {
 		return &Denial{Reason: r, Detail: "new inode " + inoStr(n) + ": " + detail}

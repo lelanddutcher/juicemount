@@ -536,6 +536,12 @@ func (g *Guard) counterGate(p Principal, u *Unit, c Cmd, w KeyWrite) *Denial {
 		if (name == "nextsession" || name == "nextchunk") && u.Kind != UnitBare {
 			return deny(ReasonAdminOnly, name+" is allocated by a bare INCRBY so the proxy can record who received the ids")
 		}
+		// juicefs takes inodes only as allocateInodes's bare INCRBY of
+		// inodeBatch (base.go:1169), which the proxy records with its owner;
+		// so every number above the recording mark has a recorded owner.
+		if name == "nextinode" && p.Kind != KindBG && (u.Kind != UnitBare || n != maxAlloc["nextinode"]) {
+			return deny(ReasonAdminOnly, "nextinode is allocated by a bare INCRBY of exactly 1024")
+		}
 		// juicefs always takes exactly sliceIdBatch; smaller steps would
 		// grow the slice-owner table by one entry each (review H8B-L1c #3).
 		if name == "nextchunk" && n != maxAlloc["nextchunk"] {
