@@ -616,14 +616,18 @@ func (w *Writer) AppendDurable(r *Record, timeout time.Duration) (uint64, error)
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if r.st == 0 {
+		// The timer's own flag ends the wait: a deadline compared with the
+		// clock after the wake-up could still lie ahead (it was taken after
+		// the timer started), and nothing would wake the wait again.
+		expired := false
 		t := time.AfterFunc(timeout, func() {
 			w.mu.Lock()
+			expired = true
 			w.cond.Broadcast()
 			w.mu.Unlock()
 		})
 		defer t.Stop()
-		deadline := time.Now().Add(timeout)
-		for r.st == 0 && !w.exited && time.Now().Before(deadline) {
+		for r.st == 0 && !w.exited && !expired {
 			w.cond.Wait()
 		}
 	}
