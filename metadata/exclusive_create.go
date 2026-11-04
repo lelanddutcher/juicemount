@@ -16,8 +16,13 @@ import (
 // (the knfsd convention): a spool file has none on the backend yet, and the
 // client's SETATTR after the create overwrites them.
 //
-// The table is additive; a build that does not know it leaves it alone.
+// The table is additive; a build that does not know it leaves it alone. The
+// drops remove an earlier unreleased shape (31c71746), triggers first: an
+// entries trigger left pointing at a dropped table fails every delete.
 const exclusiveCreateSchema = `
+DROP TRIGGER IF EXISTS exclusive_create_entry_delete;
+DROP TRIGGER IF EXISTS exclusive_create_entry_move;
+DROP TABLE IF EXISTS exclusive_creates;
 CREATE TABLE IF NOT EXISTS exclusive_create_verifiers (
  path TEXT PRIMARY KEY,
  verifier BLOB NOT NULL,
@@ -32,8 +37,14 @@ CREATE TABLE IF NOT EXISTS exclusive_create_verifiers (
 // it, or once the server is back after a restart. Beyond that a matching
 // verifier is more likely a new O_EXCL create after the client rebooted
 // (macOS restarts its verifier counter) against a file nobody changed since,
-// for example a lock file.
+// for example a lock file. The age is wall-clock, across restarts too.
 const ExclusiveCreateMaxAge = 10 * time.Minute
+
+// exclusiveCreateWriteDelay lets a record and its clear (the client's first
+// WRITE or SETATTR, milliseconds later) cancel in memory, so an O_EXCL copy
+// of many files adds no SQLite commits for them; what is left is written in
+// one transaction.
+const exclusiveCreateWriteDelay = 750 * time.Millisecond
 
 // ExclusiveCreate is the file an EXCLUSIVE CREATE made: its mirror inode
 // and, when the create already knew it, the backend inode the mirror row
@@ -49,19 +60,23 @@ type ExclusiveCreate struct {
 // the clear on every WRITE and SETATTR waits for SQLite: the table is written
 // behind, by one goroutine, newest operation per path, in order. A record
 // lost to a crash before it was written only costs that create's resend an
-// EEXIST.
+// EEXIST. Lock order: mu, then pendMu.
 type exclusiveCreates struct {
-	mu      sync.RWMutex
-	records map[string]ExclusiveCreate
-	count   atomic.Int64
-	now     func() time.Time // tests only
+	mu       sync.RWMutex
+	records  map[string]ExclusiveCreate
+	count    atomic.Int64
+	lastScan time.Time
+	now      func() time.Time // tests only
 
 	pendMu  sync.Mutex
 	pending map[string]*ExclusiveCreate // nil: delete
+	stored  map[string]bool             // in the table, or about to be
 	wake    chan struct{}
 	stop    chan struct{}
 	done    chan struct{}
 	once    sync.Once
+	commits atomic.Int64 // tests only
+	writes  atomic.Int64 // tests only
 }
 
 func (c *exclusiveCreates) clock() time.Time {
@@ -71,9 +86,14 @@ func (c *exclusiveCreates) clock() time.Time {
 	return time.Now()
 }
 
+// loadExclusiveCreates runs at the end of Open, after the mirror is loaded.
+// A record whose row no longer carries its inode is dropped: synthetic
+// inodes restart at 1 with every process, so a new file could otherwise
+// inherit an old record a lost clear left behind.
 func (s *Store) loadExclusiveCreates() error {
 	c := &s.exclusive
 	c.records = make(map[string]ExclusiveCreate)
+	c.stored = make(map[string]bool)
 	rows, err := s.db.Query(`SELECT path, verifier, inode, backend_inode, created_ns FROM exclusive_create_verifiers`)
 	if err != nil {
 		return err
@@ -87,9 +107,12 @@ func (s *Store) loadExclusiveCreates() error {
 		if err := rows.Scan(&p, &verifier, &inode, &backend, &created); err != nil {
 			return err
 		}
+		c.stored[p] = true
 		rec := ExclusiveCreate{Inode: uint64(inode), BackendInode: uint64(backend), created: time.Unix(0, created)}
-		if len(verifier) != len(rec.Verifier) || now.Sub(rec.created) >= ExclusiveCreateMaxAge {
-			c.queue(p, nil)
+		e := s.LookupByPath(p)
+		if len(verifier) != len(rec.Verifier) || now.Sub(rec.created) >= ExclusiveCreateMaxAge ||
+			e == nil || (e.Inode != rec.Inode && e.Inode != rec.BackendInode) {
+			c.queueLocked(p, nil)
 			continue
 		}
 		copy(rec.Verifier[:], verifier)
@@ -102,7 +125,7 @@ func (s *Store) loadExclusiveCreates() error {
 	c.wake = make(chan struct{}, 1)
 	c.stop = make(chan struct{})
 	c.done = make(chan struct{})
-	c.wake <- struct{}{} // expired rows queued above
+	c.wake <- struct{}{} // dropped rows queued above
 	go c.persist(s.db)
 	return nil
 }
@@ -117,12 +140,22 @@ func (s *Store) stopExclusiveCreates() {
 	<-c.done
 }
 
-func (c *exclusiveCreates) queue(path string, rec *ExclusiveCreate) {
+// queueLocked queues the newest operation for path (rec nil: delete). A
+// record cleared before it was written is simply forgotten. Callers hold mu
+// (or are loading), so the queue's order is the records' order.
+func (c *exclusiveCreates) queueLocked(path string, rec *ExclusiveCreate) {
 	c.pendMu.Lock()
 	if c.pending == nil {
 		c.pending = make(map[string]*ExclusiveCreate)
 	}
-	c.pending[path] = rec
+	if c.stored == nil {
+		c.stored = make(map[string]bool)
+	}
+	if rec == nil && !c.stored[path] {
+		delete(c.pending, path)
+	} else {
+		c.pending[path] = rec
+	}
 	c.pendMu.Unlock()
 	select {
 	case c.wake <- struct{}{}:
@@ -135,6 +168,12 @@ func (c *exclusiveCreates) persist(db *sql.DB) {
 	for {
 		select {
 		case <-c.wake:
+			select {
+			case <-time.After(exclusiveCreateWriteDelay):
+			case <-c.stop:
+				c.flush(db)
+				return
+			}
 			c.flush(db)
 		case <-c.stop:
 			c.flush(db)
@@ -147,19 +186,41 @@ func (c *exclusiveCreates) flush(db *sql.DB) {
 	c.pendMu.Lock()
 	batch := c.pending
 	c.pending = nil
-	c.pendMu.Unlock()
 	for p, rec := range batch {
-		var err error
+		// Decided now, before the commit, so a clear that arrives during it
+		// queues the delete that follows it.
+		c.stored[p] = rec != nil
+	}
+	c.pendMu.Unlock()
+	if len(batch) == 0 {
+		return
+	}
+	if err := writeExclusiveCreates(db, batch); err != nil {
+		log.Printf("metadata: %d exclusive create record(s) not written: %v", len(batch), err)
+		return
+	}
+	c.commits.Add(1)
+	c.writes.Add(int64(len(batch)))
+}
+
+func writeExclusiveCreates(db *sql.DB, batch map[string]*ExclusiveCreate) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for p, rec := range batch {
 		if rec == nil {
-			_, err = db.Exec(`DELETE FROM exclusive_create_verifiers WHERE path=?`, p)
+			_, err = tx.Exec(`DELETE FROM exclusive_create_verifiers WHERE path=?`, p)
 		} else {
-			_, err = db.Exec(`INSERT OR REPLACE INTO exclusive_create_verifiers(path, verifier, inode, backend_inode, created_ns) VALUES(?, ?, ?, ?, ?)`,
+			_, err = tx.Exec(`INSERT OR REPLACE INTO exclusive_create_verifiers(path, verifier, inode, backend_inode, created_ns) VALUES(?, ?, ?, ?, ?)`,
 				p, rec.Verifier[:], int64(rec.Inode), int64(rec.BackendInode), rec.created.UnixNano())
 		}
 		if err != nil {
-			log.Printf("metadata: exclusive create record for %q not written: %v", p, err)
+			return err
 		}
 	}
+	return tx.Commit()
 }
 
 // RecordExclusiveCreate remembers that an EXCLUSIVE CREATE made the file at
@@ -168,6 +229,7 @@ func (s *Store) RecordExclusiveCreate(path string, rec ExclusiveCreate) {
 	c := &s.exclusive
 	rec.created = c.clock()
 	c.mu.Lock()
+	defer c.mu.Unlock()
 	if c.records == nil {
 		c.records = make(map[string]ExclusiveCreate)
 	}
@@ -175,17 +237,20 @@ func (s *Store) RecordExclusiveCreate(path string, rec ExclusiveCreate) {
 		c.count.Add(1)
 	}
 	c.records[path] = rec
+	c.queueLocked(path, &rec)
 	// Records nobody cleared (a file never written or set) age out here, so
 	// the set does not stay non-empty for the clear's fast path.
+	if rec.created.Sub(c.lastScan) < time.Second {
+		return
+	}
+	c.lastScan = rec.created
 	for p, r := range c.records {
 		if rec.created.Sub(r.created) >= ExclusiveCreateMaxAge {
 			delete(c.records, p)
 			c.count.Add(-1)
-			c.queue(p, nil)
+			c.queueLocked(p, nil)
 		}
 	}
-	c.mu.Unlock()
-	c.queue(path, &rec)
 }
 
 // ExclusiveCreateMatches reports whether the file at path, whose mirror row
@@ -207,7 +272,7 @@ func (s *Store) ExclusiveCreateMatches(path string, verifier [8]byte, inode uint
 	if !sameFile || c.clock().Sub(rec.created) >= ExclusiveCreateMaxAge {
 		delete(c.records, path)
 		c.count.Add(-1)
-		c.queue(path, nil)
+		c.queueLocked(path, nil)
 		return false
 	}
 	return rec.Verifier == verifier
@@ -231,7 +296,7 @@ func (s *Store) ClearExclusiveCreate(path string) {
 	if _, ok := c.records[path]; ok {
 		delete(c.records, path)
 		c.count.Add(-1)
-		c.queue(path, nil)
+		c.queueLocked(path, nil)
 	}
 	c.mu.Unlock()
 }
