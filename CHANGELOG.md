@@ -1,10 +1,6 @@
 # JuiceMount Changelog
 
-## 0.5.1 — YYYY-MM-DD (build 38)
-
-<!-- Before tagging: replace YYYY-MM-DD with the release date, confirm build 38
-is above every sparkle:version in the published appcast, and replace
-GHSA-XXXX with the published advisory link. Then delete this comment. -->
+## 0.5.1 — 2026-11-04 (build 38)
 
 A reliability update to 0.5.0, with a security fix in the Redis proxy, the
 first part of Teams (off until you add a person) and changes to JuiceMount
@@ -77,8 +73,8 @@ or farm workers.
   the bucket.
 - The Redis proxy applies tightened checks to records that the server's own
   background cleanup acts on. JuiceFS clients on Macs and farm workers write
-  these records as before. See the security advisory GHSA-XXXX (link added
-  at publication).
+  these records as before. The details are in this
+  repository's GitHub security advisories.
 
 ### JuiceFarm and Manager
 
