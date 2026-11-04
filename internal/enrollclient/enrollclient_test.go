@@ -82,29 +82,42 @@ func startFakeProxyAck(t *testing.T, dir string) {
 			}
 			req, err := os.ReadFile(filepath.Join(dir, "reload.request"))
 			if err != nil || string(req) == last {
-				_ = os.WriteFile(filepath.Join(dir, "reload.heartbeat"), []byte("1\n"), 0o600)
+				_ = fakeProxyWrite(dir, "reload.heartbeat", []byte("1\n"))
 				continue
 			}
 			fields := strings.Fields(string(req))
 			body, err := os.ReadFile(filepath.Join(dir, "principals.json"))
 			if len(fields) != 3 || err != nil {
-				_ = os.WriteFile(filepath.Join(dir, "reload.heartbeat"), []byte("1\n"), 0o600)
+				_ = fakeProxyWrite(dir, "reload.heartbeat", []byte("1\n"))
 				continue
 			}
 			digest := sha256.Sum256(body)
 			if hex.EncodeToString(digest[:]) != fields[0] {
-				_ = os.WriteFile(filepath.Join(dir, "reload.heartbeat"), []byte("1\n"), 0o600)
+				_ = fakeProxyWrite(dir, "reload.heartbeat", []byte("1\n"))
 				continue
 			}
 			applied := []byte(strings.Join(fields, " ") + "\n")
-			if os.WriteFile(filepath.Join(dir, "reload.applied"), applied, 0o600) == nil {
-				_ = os.WriteFile(filepath.Join(dir, "reload.ack"), applied, 0o600)
+			if fakeProxyWrite(dir, "reload.applied", applied) == nil {
+				_ = fakeProxyWrite(dir, "reload.ack", applied)
 				last = string(req)
 			}
-			_ = os.WriteFile(filepath.Join(dir, "reload.heartbeat"), []byte("1\n"), 0o600)
+			_ = fakeProxyWrite(dir, "reload.heartbeat", []byte("1\n"))
 		}
 	}()
 	t.Cleanup(func() { close(stop); <-done })
+}
+
+// fakeProxyWrite replaces a handshake file by rename, as jm-respproxy does
+// (internal/respproxy writeReloadFile). An in-place truncating write let the
+// Manager read an empty reload.applied next to the previous tick's
+// reload.ack, which is how an image that writes only the legacy receipt
+// looks, and Approve refused with "update the jm-respproxy image".
+func fakeProxyWrite(dir, name string, b []byte) error {
+	tmp := filepath.Join(dir, ".fake-"+name)
+	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, filepath.Join(dir, name))
 }
 
 func admin(t *testing.T, srv *httptest.Server, op, name string) {

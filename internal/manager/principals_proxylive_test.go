@@ -464,3 +464,35 @@ func TestH8BManagerIDPersistedAndSent(t *testing.T) {
 		}
 	}
 }
+
+// TestH8BReceiptsWrittenBetweenReadsAreCurrent: the proxy writes
+// reload.applied and then reload.ack in one tick. A tick that lands between
+// the Manager's two receipt reads must not make a current image look like
+// one that writes only the legacy reload.ack (the 409 "update the
+// jm-respproxy image" on the first approval after a start).
+func TestH8BReceiptsWrittenBetweenReadsAreCurrent(t *testing.T) {
+	dir := t.TempDir()
+	s, err := NewPrincipalStore(PrincipalStoreOptions{StatePath: filepath.Join(dir, "state.json"), ProxyDir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fakeProxyWrite(dir, reloadHeartbeatName, "1")
+	req := requestLine(filepath.Join(dir, reloadRequestName))
+	ticked := false
+	proxyBetweenAckReads = func() {
+		if !ticked {
+			ticked = true
+			fakeProxyWrite(dir, reloadAckName, req)
+			fakeProxyWrite(dir, legacyReloadAckName, req)
+		}
+	}
+	t.Cleanup(func() { proxyBetweenAckReads = nil })
+	snap := s.Snapshot()
+	if !ticked {
+		t.Fatal("the receipt reads did not run the hook")
+	}
+	if !snap.ProxyLive || snap.ProxyProblem != "" {
+		t.Fatalf("a current proxy's first ack, written between the receipt reads, read as live=%v problem=%q",
+			snap.ProxyLive, snap.ProxyProblem)
+	}
+}

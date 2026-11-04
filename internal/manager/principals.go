@@ -1190,7 +1190,30 @@ var proxyOutdatedGrace = time.Second
 // heartbeat but stops acknowledging has a backlog that ages past
 // proxyAckWait and is refused (review 4 A2).
 func (s *PrincipalStore) proxyStateLocked() proxyState {
-	return s.proxyStateForAckLocked(requestLine(filepath.Join(s.opts.ProxyDir, reloadAckName)))
+	return s.proxyStateForAckLocked(s.readAcksLocked())
+}
+
+// proxyBetweenAckReads runs between the two receipt reads of readAcksLocked
+// (tests: a proxy tick landing between them).
+var proxyBetweenAckReads func()
+
+// readAcksLocked reads the legacy receipt (reload.ack) and then the applied
+// one (reload.applied). The proxy writes reload.applied first and
+// reload.ack second, so reading them in the other order could see a tick's
+// reload.ack without its reload.applied: the first ack after a start then
+// read as an image that writes only the legacy receipt, and Approve refused
+// with "update the jm-respproxy image". Read in this order, a reload.ack
+// that a current image wrote is already in reload.applied at the second
+// read; only an image that never writes reload.applied leaves it out.
+func (s *PrincipalStore) readAcksLocked() (ack, legacy string) {
+	if s.opts.ProxyDir == "" {
+		return "", ""
+	}
+	legacy = requestLine(filepath.Join(s.opts.ProxyDir, legacyReloadAckName))
+	if proxyBetweenAckReads != nil {
+		proxyBetweenAckReads()
+	}
+	return requestLine(filepath.Join(s.opts.ProxyDir, reloadAckName)), legacy
 }
 
 func (s *PrincipalStore) issuedAckLocked(ack string) int {
@@ -1202,13 +1225,13 @@ func (s *PrincipalStore) issuedAckLocked(ack string) int {
 	return -1
 }
 
-func (s *PrincipalStore) proxyStateForAckLocked(ack string) proxyState {
+// proxyStateForAckLocked judges the receipts readAcksLocked read.
+func (s *PrincipalStore) proxyStateForAckLocked(ack, legacy string) proxyState {
 	if s.opts.ProxyDir == "" {
 		return proxyNoAck
 	}
 	acked := s.issuedAckLocked(ack)
 	ours := acked >= 0
-	legacy := requestLine(filepath.Join(s.opts.ProxyDir, legacyReloadAckName))
 	if !ours && (s.issuedAckLocked(legacy) >= 0 || s.oldStyleAckLocked(legacy)) {
 		return proxyOutdated // signal-only receipts never prove applied credentials
 	}
@@ -1553,12 +1576,12 @@ func (s *PrincipalStore) snapshotLocked(withSecrets bool) PrincipalsSnapshot {
 		if fields := strings.Fields(request); len(fields) > 0 {
 			out.ReloadRequested = fields[0]
 		}
-		ack := requestLine(filepath.Join(s.opts.ProxyDir, reloadAckName))
+		ack, legacy := s.readAcksLocked()
 		acked := s.issuedAckLocked(ack)
 		if acked >= 0 {
 			out.ReloadAcked = strings.Fields(ack)[0]
 		}
-		st := s.proxyStateForAckLocked(ack)
+		st := s.proxyStateForAckLocked(ack, legacy)
 		out.ProxyLive = st == proxyLive
 		out.ReloadApplied = out.ProxyLive && acked == len(s.issued)-1 && acked >= 0 && ack == request
 		if !out.ProxyLive {
