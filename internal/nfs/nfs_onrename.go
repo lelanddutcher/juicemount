@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"reflect"
+	"strconv"
 	"syscall"
 
 	"github.com/go-git/go-billy/v5"
@@ -59,6 +60,20 @@ func renameErrStatus(err error) NFSStatus {
 		return NFSStatusIO
 	}
 }
+
+// requestPrincipal identifies who sent an RPC, for matching a resend to the
+// request it repeats. It is the credential flavor and body, minus the AUTH_SYS
+// stamp, which a client may change between transmissions (macOS sends 0).
+func requestPrincipal(r *request) string {
+	body := r.Header.Cred.Body
+	if r.Header.Cred.Flavor == authSysFlavor && len(body) >= 4 {
+		body = body[4:]
+	}
+	return strconv.FormatUint(uint64(r.Header.Cred.Flavor), 10) + ":" + string(body)
+}
+
+// authSysFlavor is AUTH_SYS (AUTH_UNIX), RFC 5531 section 8.2.
+const authSysFlavor = 1
 
 func onRename(ctx context.Context, w *response, userHandle Handler) error {
 	w.errorFmt = errFormatterWithBody(doubleWccErrorBody[:])
@@ -136,6 +151,9 @@ func onRename(ctx context.Context, w *response, userHandle Handler) error {
 	fromLoc := fs.Join(append(fromPath, string(from.Filename))...)
 	toLoc := fs.Join(append(toPath, string(to.Filename))...)
 
+	if scoped, ok := fs.(MutationPrincipalSetter); ok {
+		scoped.SetMutationPrincipal(requestPrincipal(w.req))
+	}
 	if renamer, ok := fs.(ParentObservedRenamer); ok {
 		err = renamer.RenameWithParentObservations(fromLoc, toLoc, fromObservation, toObservation)
 	} else {
