@@ -1,10 +1,16 @@
 # JuiceMount Changelog
 
-## 0.5.1 — unreleased
+## 0.5.1 — YYYY-MM-DD (build 38)
 
-A reliability update to 0.5.0. Update checks remain manual through **Check for
-Updates…** in the app. Read **Upgrading the farm** below before updating farm
-workers.
+<!-- Before tagging: replace YYYY-MM-DD with the release date, confirm build 38
+is above every sparkle:version in the published appcast, and replace
+GHSA-XXXX with the published advisory link. Then delete this comment. -->
+
+A reliability update to 0.5.0, with a security fix in the Redis proxy, the
+first part of Teams (off until you add a person) and changes to JuiceMount
+Link. Update checks remain manual through **Check for Updates…** in the app.
+Read the **Upgrading** sections at the end before updating the server, Link
+or farm workers.
 
 ### App and Link
 
@@ -41,19 +47,26 @@ workers.
   Before, an in-place edit that kept the file's size and timestamp, and landed
   in the same timestamp tick as the block's last change, could hand over bytes
   that no longer matched the hash. Older blocks keep the metadata check.
-- Renaming a just-copied file while the mount is busy, for example during a
-  large copy onto it, no longer loses the file. When a rename took
-  longer than the mount's reply limit, it still finished, but the Mac's
-  automatic resend of the same rename could discard the renamed file's
-  not-yet-uploaded bytes and leave its name reporting an I/O error, while Finder
-  showed no error. The same resend of a delete or a file creation could delete
-  or empty a file another app had put at that name in the meantime, and a
-  resent rename could replace the moved file with a new one. A resend of a
-  rename, delete or creation that already finished is now answered as the
+- A rename, delete or file creation that the Mac sent again because the
+  mount was busy, for example during a large copy onto it, no longer loses
+  data. The first request had already finished, and running it a second time
+  could discard a just-copied file's not-yet-uploaded bytes and leave its
+  name reporting an I/O error while Finder showed no error, delete or empty
+  a file another app had just put at that name, or replace a moved file with
+  a new one. A resent request that already finished is now answered as the
   success it was, once, for up to 40 seconds, without running it again. The
   Mac cannot tell a resend from an identical new request within that time,
-  so such a request is also answered without running; repeat it if needed. A
-  rename of a missing source no longer touches the destination.
+  so such a request is also answered without running; repeat it if needed.
+  A rename of a missing source no longer touches the destination.
+- A folder the Mac had listed only in part now lists again until it is
+  complete. Before, a listing cut short by a slow reply (most often on a slow
+  or metered link), or a folder the Mac knew only from a file it had opened,
+  created or renamed there, could stay short of files until the server
+  reported a change in that folder or the daily rescan ran. Retries back off,
+  and a stuck one no longer holds up other folders. On a slow link a folder
+  of a few dozen files also lists completely now: before, time spent waiting
+  its turn counted against the listing's own time limit, so every attempt ran
+  out.
 
 ### Server
 
@@ -62,6 +75,10 @@ workers.
   cannot create buckets, so a first install failed. An existing bucket and its
   data are left as they are, and setup stops unless the object store confirms
   the bucket.
+- The Redis proxy applies tightened checks to records that the server's own
+  background cleanup acts on. JuiceFS clients on Macs and farm workers write
+  these records as before. See the security advisory GHSA-XXXX (link added
+  at publication).
 
 ### JuiceFarm and Manager
 
@@ -144,6 +161,13 @@ workers.
 
 ### Teams: people, write grants and the audit log
 
+- Teams is in this release and stays off until you add the first person on
+  the Manager's **People and access** page: until then every Mac writes
+  everywhere and nothing is logged (unless `JM_AUDIT=on`), as in 0.5.0. This
+  first version has two limits. Grants limit writing only: every Mac on the
+  volume can still read every folder, granted or not. And while grants are in
+  force, quotas work only on project folders and below (see the quotas entry
+  below).
 - The Manager has people (**People and access**). Each Mac belongs to one
   person. A person with access "all" writes everywhere; the first folder you
   grant limits that person to granted client folders or projects, in every
@@ -226,45 +250,16 @@ workers.
   both the proxy's directory and the Manager's state can rewrite both. If
   you delete the log on purpose, delete `audit-anchors.json` too.
 
-### Upgrading the Redis proxy and Manager (Teams)
-
-- Upgrade both. Do not run an older Manager against a proxy directory or a
-  principals store written by this one: an older Manager drops the people,
-  their Mac assignments and grants when it next saves the principals file
-  (and its own store), which lifts every grant.
-- Grants reach a proxy only once it advertises the new file format. For about
-  2 seconds (at most 4) after the upgraded proxy starts, the Manager still
-  writes the old format, so grants are not enforced yet; until they are, the
-  People page says the proxy has not applied the latest grants.
-- The proxy exits at start if it rejects the principals file (one edited by
-  hand, for example), and its container restarts until the file is fixed.
-  A file the proxy rejects on a reload is refused and the old one kept.
-- Do not downgrade the Redis proxy below this version while people exist. An
-  older proxy cannot read person grants, so the Manager writes it the old
-  file format without people: every grant is lifted (Macs with no person can
-  write again) and nothing is logged per person until you upgrade. The
-  Manager logs a warning and the People page says so.
-
 ### JuiceMount Link
 
-- Upgrading changes what linked devices can reach. With the embedded control
-  server and NAS node (`JM_NET_HEADSCALE=on`, `JM_NET_NAS_NODE=on`), the
-  Manager now enforces an ACL policy where earlier releases allowed all
-  traffic: Macs and farm nodes reach only ports 30151, 30179 and 30190 on the
-  NAS node and, under `subnet`, inside the route. Anything else used through
-  Link (other ports or hosts on the NAS LAN, one Mac to another) stops
-  working. `JM_NET_POLICY=off`, or a `policy:` stanza of your own in
-  `config.yaml`, keeps the previous behaviour. With `JM_NET_NAS_NODE` off
-  (your own subnet router carries the NAS) the Manager applies no policy and
-  mints untagged keys, as before.
 - Link has two ways to expose the NAS, chosen by `JM_NET_NAS_EXPOSURE`:
   - `services` serves only the JuiceMount ports (Redis proxy 30179, object
     storage 30151, Manager 30190) on the NAS node's own tailnet address. The
     node carries `tag:jm-nas`, which is how a Mac app from this release finds
-    it; the app dials that node for the NAS's ports even when some other
-    node's route covers the NAS's LAN address. Mac apps from earlier
-    releases, and remote farm nodes, cannot reach it: they follow subnet
-    routes only.
+    it; while that node is online, the app dials it for the NAS's ports even
+    when some other node's route covers the NAS's LAN address. Mac apps from
+    earlier releases, and remote farm nodes, cannot reach it: they follow
+    subnet routes only.
   - `subnet` advertises a LAN prefix through the NAS node, the only path
     Link had before. Every Mac app version and remote farm node reaches it.
     The prefix is `JM_NET_NAS_ROUTE`, or `192.168.0.0/24` when that is unset,
@@ -287,8 +282,6 @@ workers.
   on, so removing a variable later does not change the exposure. The node
   does not start until the record is written. To switch, set
   `JM_NET_NAS_EXPOSURE` and restart the Manager.
-  Before switching an existing install to `services`, update every linked
-  Mac.
 - `JM_NET_NAS_EXPOSURE=services` together with `JM_NET_NAS_ROUTE` stops only
   the NAS node, whose status names the conflict. The control server keeps
   running.
@@ -303,17 +296,9 @@ workers.
   earlier registration (same name, offline, older) is named as such.
   Remove one that is not a device of yours with
   `docker exec <Manager container> headscale nodes delete --identifier <id>`.
-  `POST /api/net/routes/approve` no longer takes `?host=`: it approves on
-  the NAS node, or on `?id=<node id>` (IDs are in `GET /api/net/paired`).
 - Remote farm node enrollment needs `subnet`: the node's JuiceFS mount reaches
   object storage at the LAN address stored in the volume. Under `services` the
   Manager refuses the remote plan and says what to set.
-- With `services` under `JM_NET_POLICY=off` or your own Headscale policy, the
-  NAS node's key carries `tag:jm-nas`. Headscale cannot add the tag to a NAS
-  node registered before this release unless the policy defines the tag
-  (`"tag:jm-nas": []` in `tagOwners`). Until then the node keeps retrying
-  and `GET /api/net/link` shows why. Route readiness under `services` now
-  also requires the control server to list the NAS node online with the tag.
 - The generated policy gives no tag an owner, so no node can tag itself (an
   untagged Mac could otherwise claim `tag:jm-nas`). Keys the Manager mints
   still get their tags.
@@ -373,6 +358,55 @@ new workers against the same Redis at the same time:
   15 seconds later. An un-upgraded worker that tries to start such a job after
   it was put back is refused the start and stops, as when a reaper recovers its
   job today, and its service manager restarts it.
+
+### Upgrading the Redis proxy and Manager
+
+- The security fix under **Server** is in the Redis proxy, so it protects a
+  volume once that volume's proxy runs this release. Macs and farm workers
+  need no update for it. `server/scripts/rollout-compose.sh` refuses a proxy
+  image built before the fix.
+- Upgrade both. Do not run an older Manager against a proxy directory or a
+  principals store written by this one: an older Manager drops the people,
+  their Mac assignments and grants when it next saves the principals file
+  (and its own store), which lifts every grant.
+- Grants reach a proxy only once it advertises the new file format. For about
+  2 seconds (at most 4) after the upgraded proxy starts, the Manager still
+  writes the old format, so grants are not enforced yet; until they are, the
+  People page says the proxy has not applied the latest grants.
+- The proxy exits at start if it rejects the principals file (one edited by
+  hand, for example), and its container restarts until the file is fixed.
+  A file the proxy rejects on a reload is refused and the old one kept.
+- Do not downgrade the Redis proxy below this version while people exist. An
+  older proxy cannot read person grants, so the Manager writes it the old
+  file format without people: every grant is lifted (Macs with no person can
+  write again) and nothing is logged per person until you upgrade. The
+  Manager logs a warning and the People page says so.
+
+### Upgrading Link
+
+- Upgrading changes what linked devices can reach. With the embedded control
+  server and NAS node (`JM_NET_HEADSCALE=on`, `JM_NET_NAS_NODE=on`), the
+  Manager now enforces an ACL policy where earlier releases allowed all
+  traffic: Macs and farm nodes reach only ports 30151, 30179 and 30190 on the
+  NAS node and, under `subnet`, inside the route. Anything else used through
+  Link (other ports or hosts on the NAS LAN, one Mac to another) stops
+  working. `JM_NET_POLICY=off`, or a `policy:` stanza of your own in
+  `config.yaml`, keeps the previous behaviour. With `JM_NET_NAS_NODE` off
+  (your own subnet router carries the NAS) the Manager applies no policy and
+  mints untagged keys, as before.
+- Unless you set `JM_NET_NAS_EXPOSURE`, an install whose NAS node already
+  ran keeps `subnet`, so every Mac and remote farm node keeps reaching it.
+  Before switching an existing install to `services`, update every linked
+  Mac: Macs with an earlier app, and remote farm nodes, reach the NAS only
+  under `subnet`.
+- With `services` under `JM_NET_POLICY=off` or your own Headscale policy, the
+  NAS node's key carries `tag:jm-nas`. Headscale cannot add the tag to a NAS
+  node registered before this release unless the policy defines the tag
+  (`"tag:jm-nas": []` in `tagOwners`). Until then the node keeps retrying
+  and `GET /api/net/link` shows why. Route readiness under `services` now
+  also requires the control server to list the NAS node online with the tag.
+- `POST /api/net/routes/approve` no longer takes `?host=`: it approves on
+  the NAS node, or on `?id=<node id>` (IDs are in `GET /api/net/paired`).
 
 ## 0.5.0 — general release (build 37)
 
