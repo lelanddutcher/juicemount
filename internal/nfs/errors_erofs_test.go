@@ -162,10 +162,10 @@ func TestWriteHandlersReturnROFSOnEROFS(t *testing.T) {
 		commitErr error
 	}{
 		{"CREATE", onCreate, func(t *testing.T) *bytes.Buffer {
-			return xdrBody(t, dirop("new.mov"), uint32(createModeUnchecked), emptySattr)
+			return xdrBody(t, dirop("new.mov"), uint32(CreateUnchecked), emptySattr)
 		}, nil, nil},
 		{"CREATE exclusive", onCreate, func(t *testing.T) *bytes.Buffer {
-			return xdrBody(t, dirop("new.mov"), uint32(createModeExclusive), [8]byte{})
+			return xdrBody(t, dirop("new.mov"), uint32(CreateExclusive), [8]byte{})
 		}, nil, nil},
 		{"MKDIR", onMkdir, func(t *testing.T) *bytes.Buffer {
 			return xdrBody(t, dirop("newdir"), emptySattr)
@@ -301,7 +301,7 @@ func TestWriteHandlersReturnROFSOnFollowUpEROFS(t *testing.T) {
 		created string
 	}{
 		{"CREATE close", onCreate, func(t *testing.T) *bytes.Buffer {
-			return xdrBody(t, dirop("new.mov"), uint32(createModeUnchecked), emptySattr)
+			return xdrBody(t, dirop("new.mov"), uint32(CreateUnchecked), emptySattr)
 		}, "f.bin/new.mov"},
 		{"LINK attrs", onLink, func(t *testing.T) *bytes.Buffer {
 			return xdrBody(t, dirop("hard"), [7]uint32(chmodSattr), []byte("f.bin/src"))

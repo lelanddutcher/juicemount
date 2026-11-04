@@ -1,11 +1,16 @@
 package nfs
 
 import (
+	"fmt"
 	"os"
+	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/go-git/go-billy/v5"
+	nfslib "github.com/lelanddutcher/juicemount/internal/nfs"
+	"github.com/lelanddutcher/juicemount/metadata"
 )
 
 // A namespace mutation that outlives the RPC mutation bound is answered
@@ -19,15 +24,18 @@ import (
 //     of the file just renamed there. With the source recreated by someone
 //     else, it replaced the file the first attempt moved.
 //   - REMOVE/RMDIR: a file or folder recreated at the name is deleted.
-//   - CREATE: unchecked (and macOS EXCLUSIVE, served as unchecked) truncates
-//     a file someone has already written to.
+//   - CREATE: unchecked truncates a file someone has already written to;
+//     GUARDED fails NFS3ERR_EXIST on the file it created. (EXCLUSIVE is also
+//     recognised by its stored verifier, which outlives a restart; see
+//     exclusiveResend.)
 //
 // completedMutations remembers each such late success briefly, so the resend
 // of exactly that request is answered success without running it again. There
 // is no XID duplicate-request cache to lean on: the macOS client gives a
 // JUKEBOX retry a new XID (NFS kext nfs_request_finish: "req->r_xid = 0; //
-// get a new XID"). The key is therefore the request itself: operation and
-// names. An entry is replayed at most once.
+// get a new XID"). The key is therefore the request itself: the procedure
+// (REMOVE and RMDIR apart), the names and, for CREATE, the mode and verifier.
+// An entry is replayed at most once.
 //
 // A replay does not depend on what the names hold now. The request is known
 // to have completed after the client last saw these names, so anything there
@@ -39,7 +47,8 @@ import (
 // resend costs silent loss of someone's unuploaded data. One-shot consumption
 // keeps the window to a request the client sent instead of its own resend,
 // which needs the first request to have been abandoned (an interrupted call
-// on an intr mount) and the same request repeated within the TTL.
+// on an intr mount) and the same request repeated within the TTL. An
+// EXCLUSIVE CREATE has no such window: every new one carries a new verifier.
 //
 // The key also carries the RPC credential, but in production that separates
 // nothing: Mount offers only AUTH_NULL and the mount options set no sec=, so
@@ -63,9 +72,10 @@ const (
 )
 
 type completedMutationKey struct {
-	op        string
+	op        string // the procedure
 	principal string
-	from, to  string
+	from, to  string // RENAME's names; REMOVE, RMDIR and CREATE use from
+	how       string // CREATE's mode and verifier
 }
 
 type completedMutations struct {
@@ -133,6 +143,14 @@ func (jfs *juiceFS) mutationKey(op, from, to string) completedMutationKey {
 	return completedMutationKey{op: op, principal: jfs.retryPrincipal, from: from, to: to}
 }
 
+// createKey also carries the mode and verifier: a resend repeats both, and a
+// different mode or a new EXCLUSIVE verifier is a different request.
+func (jfs *juiceFS) createKey(filename string, how nfslib.CreateHow) completedMutationKey {
+	key := jfs.mutationKey("create", filename, "")
+	key.how = fmt.Sprintf("%d:%x", how.Mode, how.Verifier)
+	return key
+}
+
 // replayOrRun runs inside the namespace worker, owning the request's names.
 // A remembered late success of the same request is answered without running
 // it; otherwise run executes it. Either success is remembered if this reply,
@@ -155,14 +173,25 @@ func (jfs *juiceFS) replayOrRun(op *namespaceOperation, key completedMutationKey
 // renameOnce is rename with replay of a late success.
 func (jfs *juiceFS) renameOnce(oldpath, newpath string, op *namespaceOperation) error {
 	return jfs.replayOrRun(op, jfs.mutationKey("rename", oldpath, newpath), nil, func() error {
-		return jfs.rename(oldpath, newpath, op)
+		if err := jfs.rename(oldpath, newpath, op); err != nil {
+			return err
+		}
+		jfs.handler.clearExclusiveCreate(oldpath)
+		jfs.handler.clearExclusiveCreate(newpath)
+		return nil
 	})
 }
 
-// removeOnce is remove (REMOVE and RMDIR) with replay of a late success.
-func (jfs *juiceFS) removeOnce(filename string, op *namespaceOperation) error {
-	return jfs.replayOrRun(op, jfs.mutationKey("remove", filename, ""), nil, func() error {
-		return jfs.remove(filename, op)
+// removeOnce is remove with replay of a late success. proc is "remove" or
+// "rmdir": the two share remove, but a resend repeats its own procedure, so
+// a late REMOVE must not answer an RMDIR of the same name (or the reverse).
+func (jfs *juiceFS) removeOnce(proc, filename string, op *namespaceOperation) error {
+	return jfs.replayOrRun(op, jfs.mutationKey(proc, filename, ""), nil, func() error {
+		if err := jfs.remove(filename, proc == "rmdir", op); err != nil {
+			return err
+		}
+		jfs.handler.clearExclusiveCreate(filename)
+		return nil
 	})
 }
 
@@ -170,16 +199,34 @@ func (jfs *juiceFS) removeOnce(filename string, op *namespaceOperation) error {
 // the existing file untouched instead of truncating it. If the name no longer
 // holds a file there is nothing to protect, and the create runs, so the
 // client is not handed a handle to a missing name.
-func (jfs *juiceFS) createOnce(filename string, op *namespaceOperation) (billy.File, error) {
+func (jfs *juiceFS) createOnce(filename string, how nfslib.CreateHow, op *namespaceOperation) (billy.File, error) {
 	var file billy.File
 	exists := func() bool {
 		e := jfs.handler.store.LookupByPath(filename)
 		return e != nil && !e.IsDir
 	}
-	err := jfs.replayOrRun(op, jfs.mutationKey("create", filename, ""), exists, func() error {
+	err := jfs.replayOrRun(op, jfs.createKey(filename, how), exists, func() error {
+		if how.Mode == nfslib.CreateExclusive && jfs.exclusiveResend(filename, how.Verifier) {
+			return nil // answered with the file it made, untouched
+		}
 		var err error
-		file, err = jfs.create(filename, op)
-		return err
+		file, err = jfs.create(filename, how, op)
+		if err != nil {
+			return err
+		}
+		if how.Mode != nfslib.CreateExclusive {
+			jfs.handler.clearExclusiveCreate(filename)
+		} else if e := jfs.handler.store.LookupByPath(filename); e != nil {
+			rec := metadata.ExclusiveCreate{Verifier: how.Verifier, Inode: e.Inode}
+			// The backend path knows the inode reconcile will give the row.
+			if wf, ok := file.(*writeFile); ok && wf.identity != nil {
+				if st, ok := wf.identity.Sys().(*syscall.Stat_t); ok {
+					rec.BackendInode = uint64(st.Ino)
+				}
+			}
+			jfs.handler.store.RecordExclusiveCreate(filename, rec)
+		}
+		return nil
 	})
 	if err != nil {
 		return nil, err
@@ -203,3 +250,27 @@ func (r replayedCreate) Seek(int64, int) (int64, error)    { return 0, os.ErrInv
 func (r replayedCreate) Lock() error                       { return os.ErrInvalid }
 func (r replayedCreate) Unlock() error                     { return os.ErrInvalid }
 func (r replayedCreate) Truncate(int64) error              { return os.ErrInvalid }
+
+// exclusiveResend reports whether filename holds the file an EXCLUSIVE
+// CREATE with this verifier made, unchanged since. RFC 1813 section 3.3.8:
+// such a create is the resend of one that already succeeded, after a lost
+// reply or a restart (completedMutations covers only a JUKEBOX resend, and
+// only in memory), and succeeds with that file instead of failing EEXIST.
+// The record must name the file now at filename (its inode, or the backend
+// inode it reconciles to), so another Mac's file put there since never
+// matches; a local change of the name clears it (clearExclusiveCreate).
+func (jfs *juiceFS) exclusiveResend(filename string, verifier [8]byte) bool {
+	e := jfs.handler.store.LookupByPath(filename)
+	if e == nil || e.IsDir || e.Mode&os.ModeSymlink != 0 {
+		return false
+	}
+	return jfs.handler.store.ExclusiveCreateMatches(filename, verifier, e.Inode)
+}
+
+// clearExclusiveCreate ends the resend window of an EXCLUSIVE CREATE of name:
+// any later change of the name means a create with that verifier is no
+// longer the resend of the one that made the file. Free while nothing is
+// recorded, and never waits for SQLite (it runs on every WRITE).
+func (h *JuiceMountHandler) clearExclusiveCreate(name string) {
+	h.store.ClearExclusiveCreate(strings.TrimPrefix(name, "/"))
+}

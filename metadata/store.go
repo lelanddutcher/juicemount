@@ -248,6 +248,7 @@ type Store struct {
 	inodeCache                  map[uint64]*Entry
 	pathCache                   map[string]*Entry
 	preparedCreates             map[string]PreparedCreate    // unresolved local CREATEs, guarded by mu
+	exclusive                   exclusiveCreates             // EXCLUSIVE CREATE verifiers (exclusive_create.go)
 	cacheGeneration             uint64                       // cache-only publications, guarded by mu
 	childrenIdx                 map[string]map[string]*Entry // parentPath → {path → *Entry}
 	// dirVisibilityMtime is an in-memory NFS cache-invalidation generation for
@@ -970,6 +971,10 @@ func OpenWithMaxCacheSize(dbPath string, maxCacheSize int) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("create prepared create schema: %w", err)
 	}
+	if _, err := db.Exec(exclusiveCreateSchema); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("create exclusive create schema: %w", err)
+	}
 	if pending, err := inspectPreparedCreates(db); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("inspect prepared creates at open: %w", err)
@@ -1172,6 +1177,10 @@ func OpenWithMaxCacheSize(dbPath string, maxCacheSize int) (*Store, error) {
 	s.pruneLadderGCWake = make(chan struct{}, 1)
 	go s.pruneLadderGCWorker()
 	s.wakePruneLadderGC()
+	if err := s.loadExclusiveCreates(); err != nil {
+		_ = s.Close()
+		return nil, fmt.Errorf("load exclusive creates: %w", err)
+	}
 
 	keepFileLock = true
 	return s, nil
@@ -1264,6 +1273,7 @@ func (s *Store) Close() error {
 		s.shadowSweep = nil
 	}
 	s.mu.Unlock()
+	s.stopExclusiveCreates()
 	if err := s.db.Close(); err != nil {
 		return err
 	}

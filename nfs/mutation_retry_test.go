@@ -1,6 +1,7 @@
 package nfs
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"errors"
 	"fmt"
@@ -8,8 +9,13 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
+
+	"github.com/go-git/go-billy/v5"
+	nfslib "github.com/lelanddutcher/juicemount/internal/nfs"
+	"github.com/lelanddutcher/juicemount/metadata"
 )
 
 // phaseHolds parks the first namespace worker that reaches each registered
@@ -328,7 +334,7 @@ func writeAtVia(t *testing.T, jfs *juiceFS, name string, payload []byte) {
 }
 
 // CREATE resent after another actor wrote to the file it created: an unchecked
-// create of an existing file truncates (macOS EXCLUSIVE is served unchecked).
+// create of an existing file truncates.
 func TestCreateResentAfterJukeboxKeepsWrittenBytes(t *testing.T) {
 	for _, mode := range []string{"spool", "backend"} {
 		t.Run(mode, func(t *testing.T) {
@@ -393,4 +399,493 @@ func TestCreateResentAfterRemovalCreatesAgain(t *testing.T) {
 	if _, err := jfs.Stat("dir/c.mov"); err != nil {
 		t.Fatalf("resent create left no file: %v", err)
 	}
+}
+
+// REMOVE and RMDIR share remove, but a resend repeats its own procedure. The
+// late outcome of one must not answer a new request of the other at the same
+// name, and must still answer its own resend.
+func TestRemoveAndRmdirOutcomesAreKeptApart(t *testing.T) {
+	t.Run("late remove, new rmdir", func(t *testing.T) {
+		jfs, holds, root := newRenameRetryHarness(t)
+		seedFile(t, jfs, jfs.handler.store, root, "dir/x", []byte("file"))
+		jukeboxed(t, jfs, holds, "publish", "dir/x", func() error { return jfs.Remove("dir/x") })
+		if err := jfs.MkdirAll("dir/x", 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := jfs.RemoveDirectory("dir/x"); err != nil {
+			t.Fatalf("new rmdir = %v", err)
+		}
+		if _, err := os.Lstat(filepath.Join(root, "dir/x")); !os.IsNotExist(err) {
+			t.Fatalf("new rmdir was answered from the late remove: dir/x %v", err)
+		}
+		// The remove's own resend is answered without running: a file put
+		// back at the name survives it.
+		seedFile(t, jfs, jfs.handler.store, root, "dir/x", []byte("new take"))
+		if err := jfs.Remove("dir/x"); err != nil {
+			t.Fatalf("resent remove = %v, want success", err)
+		}
+		if got, err := os.ReadFile(filepath.Join(root, "dir/x")); err != nil || string(got) != "new take" {
+			t.Fatalf("resent remove ran: dir/x = %q, %v", got, err)
+		}
+	})
+	t.Run("late rmdir, new remove", func(t *testing.T) {
+		jfs, holds, root := newRenameRetryHarness(t)
+		if err := jfs.MkdirAll("dir/x", 0o755); err != nil {
+			t.Fatal(err)
+		}
+		jukeboxed(t, jfs, holds, "publish", "dir/x", func() error { return jfs.RemoveDirectory("dir/x") })
+		seedFile(t, jfs, jfs.handler.store, root, "dir/x", []byte("file"))
+		if err := jfs.Remove("dir/x"); err != nil {
+			t.Fatalf("new remove = %v", err)
+		}
+		if _, err := os.Lstat(filepath.Join(root, "dir/x")); !os.IsNotExist(err) {
+			t.Fatalf("new remove was answered from the late rmdir: dir/x %v", err)
+		}
+		// Run again, the rmdir's resend would fail ENOENT.
+		if err := jfs.RemoveDirectory("dir/x"); err != nil {
+			t.Fatalf("resent rmdir = %v, want success", err)
+		}
+	})
+}
+
+// A resend of an EXCLUSIVE create repeats its verifier. A create with a new
+// verifier is a new O_EXCL open: it fails EEXIST and leaves the late
+// create's answer for the real resend.
+func TestExclusiveCreateReplayNeedsItsVerifier(t *testing.T) {
+	jfs, holds, _ := newRenameRetryHarness(t)
+	sent := nfslib.CreateHow{Mode: nfslib.CreateExclusive, Verifier: [8]byte{1, 2, 3}}
+	create := func(how nfslib.CreateHow) error {
+		f, err := jfs.CreateMode("dir/c.mov", how)
+		if err == nil {
+			err = f.Close()
+		}
+		return err
+	}
+	jukeboxed(t, jfs, holds, "publish", "dir/c.mov", func() error {
+		f, err := jfs.CreateMode("dir/c.mov", sent)
+		_ = closeNamespaceFile(f)
+		return err
+	})
+	if err := create(nfslib.CreateHow{Mode: nfslib.CreateExclusive, Verifier: [8]byte{9}}); !errors.Is(err, os.ErrExist) {
+		t.Fatalf("exclusive create with a new verifier = %v, want EEXIST", err)
+	}
+	if err := create(nfslib.CreateHow{Mode: nfslib.CreateGuarded}); !errors.Is(err, os.ErrExist) {
+		t.Fatalf("guarded create = %v, want EEXIST", err)
+	}
+	if err := create(sent); err != nil {
+		t.Fatalf("resent exclusive create = %v, want success", err)
+	}
+	// The one-shot JUKEBOX answer is spent, but the verifier stored with the
+	// file still answers a further resend (TestExclusiveCreateResendFindsItsVerifier).
+	if err := create(sent); err != nil {
+		t.Fatalf("second resend = %v, want success", err)
+	}
+}
+
+// createModes are the three createmode3 values a fresh CREATE can carry
+// against a name that already holds a file (RFC 1813 section 3.3.8).
+var createModes = []struct {
+	name string
+	how  nfslib.CreateHow
+	// exists: the create must fail NFS3ERR_EXIST and change nothing.
+	// Otherwise (UNCHECKED) it opens the existing file as that same file.
+	exists bool
+}{
+	{"unchecked", nfslib.CreateHow{Mode: nfslib.CreateUnchecked}, false},
+	{"guarded", nfslib.CreateHow{Mode: nfslib.CreateGuarded}, true},
+	{"exclusive", nfslib.CreateHow{Mode: nfslib.CreateExclusive, Verifier: [8]byte{4, 2}}, true},
+}
+
+func createModeOnce(t *testing.T, jfs *juiceFS, name string, how nfslib.CreateHow, exists bool) {
+	t.Helper()
+	f, err := jfs.CreateMode(name, how)
+	if exists {
+		if !errors.Is(err, os.ErrExist) {
+			_ = closeNamespaceFile(f)
+			t.Fatalf("create of an existing name = %v, want EEXIST", err)
+		}
+		return
+	}
+	if err != nil {
+		t.Fatalf("create of an existing name = %v, want success", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A genuine (not resent) CREATE of a name whose spool entry still holds
+// unsent bytes. It used to mint a new inode for the mirror row while the
+// entry kept the old one, so the reply named a different file and the
+// writer's held handle no longer resolved to its spool cohort.
+func TestCreateOfSpooledNameKeepsPendingBytes(t *testing.T) {
+	for _, mode := range createModes {
+		t.Run(mode.name, func(t *testing.T) {
+			jfs, spool, drainer, fuseRoot := newSpoolWiredHandlerNoDrain(t)
+			const name = "take.mov"
+			head := patternedPayload(64<<10, 3)
+			simulateNFSCreateThenWrite(t, jfs, name, head, 64<<10)
+			held := jfs.handler.ToHandle(jfs, []string{name})
+			entry, ok := spool.LookupActive(name)
+			if !ok {
+				t.Fatal("precondition: no spool entry")
+			}
+			bound := func(when string) billy.Filesystem {
+				t.Helper()
+				fs, _, err := jfs.handler.FromHandle(held)
+				if err != nil {
+					t.Fatalf("%s: held handle: %v", when, err)
+				}
+				if _, ok := fs.(*continuationFS); !ok {
+					t.Fatalf("%s: held handle resolves to %T, not the spool entry's cohort", when, fs)
+				}
+				return fs
+			}
+			bound("before the create")
+
+			createModeOnce(t, jfs, name, mode.how, mode.exists)
+
+			if got := jfs.handler.ToHandle(jfs, []string{name}); !bytes.Equal(got, held) {
+				t.Fatalf("the name's handle changed: %x -> %x", held, got)
+			}
+			if now, ok := spool.LookupActive(name); !ok || now != entry {
+				t.Fatal("the create replaced the spool entry")
+			}
+			if e := jfs.handler.store.LookupByPath(name); e == nil || e.Inode != entry.Inode() {
+				t.Fatalf("mirror row %+v disagrees with the spool entry's inode %d", e, entry.Inode())
+			}
+			if fi, err := jfs.Stat(name); err != nil || fi.Size() != int64(len(head)) {
+				t.Fatalf("after the create: %v, %v; want %d pending bytes", fi, err, len(head))
+			}
+
+			// The writer carries on through the handle it holds.
+			tail := patternedPayload(64<<10, 9)
+			wf, err := bound("after the create").OpenFile(name, os.O_RDWR, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := wf.(io.WriterAt).WriteAt(tail, int64(len(head))); err != nil {
+				t.Fatal(err)
+			}
+			if err := wf.Close(); err != nil {
+				t.Fatal(err)
+			}
+			awaitNamespaceIdle(t, &jfs.handler.namespace)
+			if n := spool.sweepOnce(0); n < 1 {
+				t.Fatalf("sweepOnce finalized %d entries, want >=1", n)
+			}
+			drainAllForTest(t, drainer)
+			want := append(append([]byte{}, head...), tail...)
+			got, err := os.ReadFile(filepath.Join(fuseRoot, name))
+			if err != nil || !bytes.Equal(got, want) {
+				t.Fatalf("drained %s: %d bytes, %v; want the %d bytes written", name, len(got), err, len(want))
+			}
+		})
+	}
+}
+
+// The same against a file the spool already delivered. UNCHECKED replaces
+// it through a fresh entry, as before, but as the same file (an offline
+// SETATTR size 0 does the same); GUARDED and EXCLUSIVE leave it alone.
+func TestCreateOfDrainedNameKeepsItsInode(t *testing.T) {
+	for _, mode := range createModes {
+		t.Run(mode.name, func(t *testing.T) {
+			jfs, spool, drainer, fuseRoot := newSpoolWiredHandlerNoDrain(t)
+			const name = "take.mov"
+			payload := patternedPayload(64<<10, 5)
+			simulateNFSCreateThenWrite(t, jfs, name, payload, 64<<10)
+			awaitNamespaceIdle(t, &jfs.handler.namespace)
+			if n := spool.sweepOnce(0); n < 1 {
+				t.Fatalf("sweepOnce finalized %d entries, want >=1", n)
+			}
+			drainAllForTest(t, drainer)
+			if _, ok := spool.LookupActive(name); ok {
+				t.Fatal("precondition: the entry was not delivered")
+			}
+			held := jfs.handler.ToHandle(jfs, []string{name})
+
+			createModeOnce(t, jfs, name, mode.how, mode.exists)
+
+			if got := jfs.handler.ToHandle(jfs, []string{name}); !bytes.Equal(got, held) {
+				t.Fatalf("the name's handle changed: %x -> %x", held, got)
+			}
+			entry, spooled := spool.LookupActive(name)
+			if mode.exists {
+				if spooled {
+					t.Fatal("a refused create opened a spool entry")
+				}
+				if got, err := os.ReadFile(filepath.Join(fuseRoot, name)); err != nil || !bytes.Equal(got, payload) {
+					t.Fatalf("delivered file after a refused create: %d bytes, %v", len(got), err)
+				}
+				return
+			}
+			if !spooled {
+				t.Fatal("unchecked create opened no spool entry")
+			}
+			if e := jfs.handler.store.LookupByPath(name); e == nil || e.Inode != entry.Inode() {
+				t.Fatalf("mirror row %+v disagrees with the spool entry's inode %d", e, entry.Inode())
+			}
+		})
+	}
+}
+
+// reopenBackendFixture restarts a spool-less harness on the same mirror DB
+// and backend root.
+func reopenBackendFixture(t *testing.T, old *juiceFS, fuseRoot string) *juiceFS {
+	t.Helper()
+	var seq int
+	var name, dbPath string
+	if err := old.handler.store.DB().QueryRow(`PRAGMA database_list`).Scan(&seq, &name, &dbPath); err != nil || dbPath == "" {
+		t.Fatalf("find persisted metadata DB: %q %v", dbPath, err)
+	}
+	if !old.handler.StopHandler() {
+		t.Fatal("old handler did not stop before metadata reopen")
+	}
+	if err := old.handler.store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err := metadata.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := NewHandler(store, fuseRoot)
+	t.Cleanup(func() {
+		h.StopHandler()
+		_ = store.Close()
+	})
+	return &juiceFS{handler: h}
+}
+
+// RFC 1813 section 3.3.8: the server keeps an EXCLUSIVE create's verifier
+// with the file, so a resend of that create succeeds with the file it made.
+// The resend need not follow a JUKEBOX: a reply lost with its connection, or
+// a restart mid-copy, makes the hard mount resend the same request, and the
+// file is then in the persisted mirror. A create with another verifier, or
+// after the name changed, is not that resend and fails EEXIST.
+func TestExclusiveCreateResendFindsItsVerifier(t *testing.T) {
+	sent := nfslib.CreateHow{Mode: nfslib.CreateExclusive, Verifier: [8]byte{0xc0, 0xa8, 0, 1, 0, 0, 0, 7}}
+	other := nfslib.CreateHow{Mode: nfslib.CreateExclusive, Verifier: [8]byte{0xc0, 0xa8, 0, 1, 0, 0, 0, 8}}
+	for _, path := range []string{"backend", "spool"} {
+		for _, restart := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/restart=%v", path, restart), func(t *testing.T) {
+				var jfs *juiceFS
+				var reopen func() *juiceFS
+				name := "dir/c.mov"
+				if path == "spool" {
+					var spool *SpoolStore
+					var fuseRoot string
+					jfs, spool, _, fuseRoot = newSpoolWiredHandlerNoDrain(t)
+					name = "c.mov"
+					reopen = func() *juiceFS {
+						reopened, _ := reopenRecoveryFixture(t, jfs, spool, fuseRoot)
+						return reopened
+					}
+				} else {
+					var root string
+					jfs, _, root = newRenameRetryHarness(t)
+					reopen = func() *juiceFS { return reopenBackendFixture(t, jfs, root) }
+				}
+				createModeOnce(t, jfs, name, sent, false)
+				before := jfs.handler.store.LookupByPath(name)
+				if before == nil {
+					t.Fatal("precondition: created file is not mirrored")
+				}
+				if restart {
+					jfs = reopen()
+				}
+				createModeOnce(t, jfs, name, sent, false)
+				if after := jfs.handler.store.LookupByPath(name); after == nil || after.Inode != before.Inode {
+					t.Fatalf("resend changed the file: %d -> %+v", before.Inode, after)
+				}
+				createModeOnce(t, jfs, name, other, true)
+				createModeOnce(t, jfs, name, sent, false) // still the resend
+				// The client's SETATTR after the create ends the window.
+				if err := jfs.handler.Change(jfs).Chtimes(name, time.Now(), time.Now()); err != nil {
+					t.Fatal(err)
+				}
+				createModeOnce(t, jfs, name, sent, true)
+			})
+		}
+	}
+}
+
+// The same answer for a JUKEBOX resend on the spool path, where the file has
+// no backend copy yet.
+func TestExclusiveCreateJukeboxResendOnSpool(t *testing.T) {
+	jfs, spool, _, _ := newSpoolWiredHandlerNoDrain(t)
+	holds := installPhaseHolds(jfs)
+	sent := nfslib.CreateHow{Mode: nfslib.CreateExclusive, Verifier: [8]byte{5}}
+	jukeboxed(t, jfs, holds, "publish", "c.mov", func() error {
+		f, err := jfs.CreateMode("c.mov", sent)
+		_ = closeNamespaceFile(f)
+		return err
+	})
+	entry, ok := spool.LookupActive("c.mov")
+	if !ok {
+		t.Fatal("precondition: the late create opened no spool entry")
+	}
+	createModeOnce(t, jfs, "c.mov", sent, false)
+	if now, ok := spool.LookupActive("c.mov"); !ok || now != entry {
+		t.Fatal("resend replaced the spool entry")
+	}
+	if e := jfs.handler.store.LookupByPath("c.mov"); e == nil || e.Inode != entry.Inode() {
+		t.Fatalf("resend re-keyed the mirror row: %+v, entry inode %d", e, entry.Inode())
+	}
+	createModeOnce(t, jfs, "c.mov", nfslib.CreateHow{Mode: nfslib.CreateExclusive, Verifier: [8]byte{6}}, true)
+}
+
+// A live entry whose mirror row carries another inode (left by the old
+// re-minting create): an UNCHECKED create re-keys the row to the entry, whose
+// inode is fixed, and keeps the bytes.
+func TestCreateRekeysMirrorRowToLiveEntry(t *testing.T) {
+	jfs, spool, drainer, fuseRoot := newSpoolWiredHandlerNoDrain(t)
+	const name = "take.mov"
+	payload := patternedPayload(64<<10, 6)
+	simulateNFSCreateThenWrite(t, jfs, name, payload, 64<<10)
+	entry, ok := spool.LookupActive(name)
+	if !ok {
+		t.Fatal("precondition: no spool entry")
+	}
+	stray := metadata.MakeEntry(name, false, 0, time.Now(), jfs.handler.nextSyntheticInode())
+	stray.LocalOnly = true
+	if err := jfs.handler.store.Insert(stray); err != nil {
+		t.Fatal(err)
+	}
+	createModeOnce(t, jfs, name, nfslib.CreateHow{Mode: nfslib.CreateUnchecked}, false)
+	if e := jfs.handler.store.LookupByPath(name); e == nil || e.Inode != entry.Inode() {
+		t.Fatalf("mirror row %+v, want the entry's inode %d", e, entry.Inode())
+	}
+	awaitNamespaceIdle(t, &jfs.handler.namespace)
+	if n := spool.sweepOnce(0); n < 1 {
+		t.Fatalf("sweepOnce finalized %d entries, want >=1", n)
+	}
+	drainAllForTest(t, drainer)
+	if got, err := os.ReadFile(filepath.Join(fuseRoot, name)); err != nil || !bytes.Equal(got, payload) {
+		t.Fatalf("drained %s: %d bytes, %v", name, len(got), err)
+	}
+}
+
+// An entry the sweeper finalized but the drainer has not claimed (ready):
+// an UNCHECKED create reopens that entry in place as the same file, and the
+// writer carries on; GUARDED and EXCLUSIVE refuse it.
+func TestCreateOfReadyEntryReopensIt(t *testing.T) {
+	for _, mode := range createModes {
+		t.Run(mode.name, func(t *testing.T) {
+			jfs, spool, drainer, fuseRoot := newSpoolWiredHandlerNoDrain(t)
+			const name = "take.mov"
+			head := patternedPayload(64<<10, 3)
+			simulateNFSCreateThenWrite(t, jfs, name, head, 64<<10)
+			awaitNamespaceIdle(t, &jfs.handler.namespace)
+			if n := spool.sweepOnce(0); n != 1 {
+				t.Fatalf("sweepOnce finalized %d entries, want 1", n)
+			}
+			entry, ok := spool.LookupActive(name)
+			if !ok || entry.writing.Load() {
+				t.Fatal("precondition: the entry is not ready")
+			}
+			held := jfs.handler.ToHandle(jfs, []string{name})
+
+			createModeOnce(t, jfs, name, mode.how, mode.exists)
+
+			if got := jfs.handler.ToHandle(jfs, []string{name}); !bytes.Equal(got, held) {
+				t.Fatalf("the name's handle changed: %x -> %x", held, got)
+			}
+			if now, ok := spool.LookupActive(name); !ok || now != entry {
+				t.Fatal("the create replaced the ready entry")
+			}
+			if mode.exists {
+				if entry.writing.Load() {
+					t.Fatal("a refused create reopened the entry")
+				}
+			} else if !entry.writing.Load() {
+				t.Fatal("unchecked create did not reopen the ready entry")
+			}
+			tail := patternedPayload(64<<10, 8)
+			wf, err := jfs.OpenFile(name, os.O_RDWR, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := wf.(io.WriterAt).WriteAt(tail, int64(len(head))); err != nil {
+				t.Fatal(err)
+			}
+			if err := wf.Close(); err != nil {
+				t.Fatal(err)
+			}
+			awaitNamespaceIdle(t, &jfs.handler.namespace)
+			spool.sweepOnce(0)
+			drainAllForTest(t, drainer)
+			want := append(append([]byte{}, head...), tail...)
+			if got, err := os.ReadFile(filepath.Join(fuseRoot, name)); err != nil || !bytes.Equal(got, want) {
+				t.Fatalf("drained %s: %d bytes, %v; want %d", name, len(got), err, len(want))
+			}
+		})
+	}
+}
+
+// REMOVE takes a non-directory and RMDIR a directory. A mismatch fails
+// before anything is touched, a spooled file's unsent bytes included.
+func TestRemoveKindMatchesProcedure(t *testing.T) {
+	t.Run("backend", func(t *testing.T) {
+		jfs, _, root := newRenameRetryHarness(t)
+		if err := jfs.MkdirAll("dir/d", 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := jfs.RemoveDirectory("dir/a.mov"); !errors.Is(err, syscall.ENOTDIR) {
+			t.Fatalf("rmdir of a file = %v, want ENOTDIR", err)
+		}
+		if err := jfs.Remove("dir/d"); !errors.Is(err, syscall.EISDIR) {
+			t.Fatalf("remove of a directory = %v, want EISDIR", err)
+		}
+		if _, err := os.Lstat(filepath.Join(root, "dir/a.mov")); err != nil {
+			t.Fatalf("rmdir removed the file: %v", err)
+		}
+		if fi, err := os.Lstat(filepath.Join(root, "dir/d")); err != nil || !fi.IsDir() {
+			t.Fatalf("remove removed the directory: %v", err)
+		}
+		if err := jfs.RemoveDirectory("dir/d"); err != nil {
+			t.Fatal(err)
+		}
+		if err := jfs.Remove("dir/a.mov"); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("spooled file", func(t *testing.T) {
+		jfs, spool, _, _ := newSpoolWiredHandlerNoDrain(t)
+		payload := patternedPayload(64<<10, 2)
+		simulateNFSCreateThenWrite(t, jfs, "take.mov", payload, 64<<10)
+		if err := jfs.RemoveDirectory("take.mov"); !errors.Is(err, syscall.ENOTDIR) {
+			t.Fatalf("rmdir of a spooled file = %v, want ENOTDIR", err)
+		}
+		if _, ok := spool.LookupActive("take.mov"); !ok {
+			t.Fatal("rmdir of a file cancelled its spool entry")
+		}
+		if fi, err := jfs.Stat("take.mov"); err != nil || fi.Size() != int64(len(payload)) {
+			t.Fatalf("after rmdir: %v, %v", fi, err)
+		}
+	})
+}
+
+// The record answers only for the file the create made. Reconcile swapping
+// the row's synthetic inode for the backend one keeps it the same file;
+// another Mac's file upserted at the name (a save renamed over it) does not.
+func TestExclusiveCreateRecordFollowsTheFile(t *testing.T) {
+	jfs, _, root := newRenameRetryHarness(t)
+	const name = "dir/c.mov"
+	sent := nfslib.CreateHow{Mode: nfslib.CreateExclusive, Verifier: [8]byte{7, 7}}
+	createModeOnce(t, jfs, name, sent, false)
+	fi, err := os.Lstat(filepath.Join(root, name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend := fi.Sys().(*syscall.Stat_t).Ino
+	upsert := func(inode uint64) {
+		t.Helper()
+		if err := jfs.handler.store.Insert(metadata.MakeEntry(name, false, 0, time.Now(), inode)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	upsert(uint64(backend))
+	createModeOnce(t, jfs, name, sent, false)
+	upsert(jfs.handler.nextSyntheticInode())
+	createModeOnce(t, jfs, name, sent, true)
 }

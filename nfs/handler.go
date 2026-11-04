@@ -3871,6 +3871,7 @@ func (jfs *juiceFS) openFileBound(filename string, flag int, perm os.FileMode, c
 	}
 	if flag&(os.O_WRONLY|os.O_RDWR|os.O_CREATE|os.O_TRUNC) != 0 {
 		filename = strings.TrimPrefix(filename, "/")
+		jfs.handler.clearExclusiveCreate(filename)
 		work := func(op *namespaceOperation) (billy.File, error) {
 			expected, err := jfs.handler.store.CaptureMirror(filename)
 			if err != nil {
@@ -4401,6 +4402,7 @@ func (jfs *juiceFS) TruncateFile(filename string, size int64) (bool, error) {
 		return false, nil
 	}
 	filename = strings.TrimPrefix(filename, "/")
+	jfs.handler.clearExclusiveCreate(filename)
 	spool := jfs.handler.spool.Load()
 	if spool == nil {
 		return true, pin.ErrOfflineNotAvailable
@@ -4481,18 +4483,44 @@ func (jfs *juiceFS) CommitFile(path string) error {
 }
 
 func (jfs *juiceFS) Create(filename string) (billy.File, error) {
+	return jfs.CreateMode(filename, nfslib.CreateHow{Mode: nfslib.CreateUnchecked})
+}
+
+// CreateMode implements internal/nfs.ModeCreator: CREATE with its mode.
+func (jfs *juiceFS) CreateMode(filename string, how nfslib.CreateHow) (billy.File, error) {
 	filename = strings.TrimPrefix(filename, "/")
 	return runNamespaceOperation(jfs.handler, []string{filename}, func(op *namespaceOperation) (billy.File, error) {
-		return jfs.createOnce(filename, op)
+		return jfs.createOnce(filename, how, op)
 	}, closeNamespaceFile)
 }
 
-func (jfs *juiceFS) create(filename string, op *namespaceOperation) (billy.File, error) {
-	if spool := jfs.handler.spool.Load(); spool != nil && spool.ReadFault(filename) {
+func (jfs *juiceFS) create(filename string, how nfslib.CreateHow, op *namespaceOperation) (billy.File, error) {
+	spool := jfs.handler.spool.Load()
+	if spool != nil && spool.ReadFault(filename) {
 		return nil, syscall.EIO
 	}
+	// GUARDED and EXCLUSIVE refuse an existing name (RFC 1813 section 3.3.8).
+	// The operation owns the name, so the answer holds until it publishes. A
+	// resend of an EXCLUSIVE create that already succeeded is answered by
+	// createOnce before this runs. Existing means known to this Mac: the
+	// mirror or the spool. The backend branch also refuses an unmirrored
+	// backend file, through O_EXCL. The spool branch deliberately does not ask
+	// the backend about a name the mirror lacks (another Mac's file before the
+	// keyspace push lands, online or offline): that would put a FUSE Lstat on
+	// every copied file, the cost the spool and the cache-only checks in
+	// onCreate exist to avoid. Such a create succeeds, and the drain keeps the
+	// other file and lands this one as a conflict copy (drainer probeBase).
+	if how.Mode != nfslib.CreateUnchecked {
+		taken := jfs.handler.store.LookupByPath(filename) != nil
+		if !taken && spool != nil {
+			_, taken = spool.LookupActive(filename)
+		}
+		if taken {
+			return nil, syscall.EEXIST
+		}
+	}
 	now := time.Now()
-	// Every branch below publishes one row for filename.
+	// Every branch below publishes or keeps one row for filename.
 	jfs.handler.noteSingleChildInsert(filename)
 
 	// Spool-routed create (Option 2). The CREATE RPC is the new-file entry
@@ -4504,10 +4532,16 @@ func (jfs *juiceFS) create(filename string, op *namespaceOperation) (billy.File,
 	// directory listings immediately. Stat/Lstat/READ are shadowed by the
 	// spool index (real growing size) until the drainer lands the file, at
 	// which point onSpoolDrained syncs the final size into this entry.
-	if spool := jfs.handler.spool.Load(); spool != nil {
-		inode := jfs.handler.nextSyntheticInode()
-		e := metadata.MakeEntry(filename, false, 0, now, inode)
-		e.LocalOnly = true
+	//
+	// An UNCHECKED create of an existing file must not make a new object
+	// (RFC 1813 section 3.3.8): the reply's handle is the existing file's.
+	// OpenWrite hands back a live entry (writing, or ready and reopened) with
+	// its pending bytes and inode, and that file is opened as it is. Minting
+	// a new inode for it re-keyed the mirror row away from the entry, so the
+	// writer's handle lost its binding to the entry's cohort. A fresh entry
+	// over a backend-resident file replaces it, as before, but keeps the
+	// row's inode, as an offline truncate does (TruncateFile).
+	if spool != nil {
 		// The bounded RPC waits for publication; a slow SQLite writer keeps
 		// namespace ownership after the RPC returns JUKEBOX.
 		sentry, err := spool.OpenWrite(filename)
@@ -4515,11 +4549,26 @@ func (jfs *juiceFS) create(filename string, op *namespaceOperation) (billy.File,
 			return nil, err
 		}
 		op.mutated = true
-		sentry.SetInode(inode)
-		op.checkpoint("publish", filename)
-		if err := jfs.handler.store.Insert(e); err != nil {
-			sentry.ReleaseHandle()
-			return nil, err
+		existing := jfs.handler.store.LookupByPath(filename)
+		if existing != nil && (existing.IsDir || existing.Mode&os.ModeSymlink != 0 || existing.Inode == 0) {
+			existing = nil
+		}
+		live := sentry.Inode() != 0
+		if !live {
+			inode := jfs.handler.nextSyntheticInode()
+			if existing != nil {
+				inode = existing.Inode
+			}
+			sentry.SetInode(inode)
+		}
+		if !live || existing == nil || existing.Inode != sentry.Inode() {
+			e := metadata.MakeEntry(filename, false, 0, now, sentry.Inode())
+			e.LocalOnly = true
+			op.checkpoint("publish", filename)
+			if err := jfs.handler.store.Insert(e); err != nil {
+				sentry.ReleaseHandle()
+				return nil, err
+			}
 		}
 		jfs.handler.incActiveWriterFrom(filename, "create-spool")
 		return &spoolWriteFile{name: filename, entry: sentry, handler: jfs.handler}, nil
@@ -4531,6 +4580,9 @@ func (jfs *juiceFS) create(filename string, op *namespaceOperation) (billy.File,
 	createExpected, err := jfs.handler.store.CaptureMirror(filename)
 	if err != nil {
 		return nil, err
+	}
+	if createExpected.Incarnation != "" && how.Mode != nfslib.CreateUnchecked {
+		return nil, syscall.EEXIST
 	}
 	if createExpected.Incarnation != "" {
 		file, err := jfs.openFile(filename, os.O_RDWR, 0)
@@ -4961,15 +5013,32 @@ func (jfs *juiceFS) rename(oldpath, newpath string, op *namespaceOperation) erro
 }
 
 func (jfs *juiceFS) Remove(filename string) error {
+	return jfs.removeAs("remove", filename)
+}
+
+// RemoveDirectory implements internal/nfs.DirectoryRemover: RMDIR. Unlike
+// Remove it takes only a directory, and its remembered late outcome is kept
+// apart from REMOVE's.
+func (jfs *juiceFS) RemoveDirectory(dirname string) error {
+	return jfs.removeAs("rmdir", dirname)
+}
+
+func (jfs *juiceFS) removeAs(proc, filename string) error {
 	filename = strings.TrimPrefix(filename, "/")
 	return jfs.namespaceMutation([]string{filename}, func(op *namespaceOperation) error {
-		return jfs.removeOnce(filename, op)
+		return jfs.removeOnce(proc, filename, op)
 	})
 }
 
-func (jfs *juiceFS) remove(filename string, op *namespaceOperation) error {
+func (jfs *juiceFS) remove(filename string, rmdir bool, op *namespaceOperation) error {
 	if spool := jfs.handler.spool.Load(); spool != nil && spool.ReadFaultUnder(filename) {
 		return syscall.EIO
+	}
+	// REMOVE takes a non-directory and RMDIR a directory (RFC 1813 sections
+	// 3.3.12-13). os.Remove below takes either, so check first, before the
+	// spool cancel can discard a file's unsent bytes.
+	if err := jfs.removeKind(filename, rmdir); err != nil {
+		return err
 	}
 
 	// Invalidate both read caches BEFORE the entry is evicted below (so the
@@ -5048,6 +5117,36 @@ func (jfs *juiceFS) remove(filename string, op *namespaceOperation) error {
 		jfs.handler.publishEvent(metadata.MetadataEvent{
 			Op: "delete", Path: filename, Inode: e.Inode,
 		})
+	}
+	return nil
+}
+
+// removeKind refuses REMOVE of a directory (EISDIR) and RMDIR of anything
+// else (ENOTDIR). A live spool entry is a file; otherwise the mirror says, and
+// only a name the mirror lacks costs a bounded backend Lstat, online only. A
+// name whose type is still unknown is left to the remove, as before.
+func (jfs *juiceFS) removeKind(filename string, rmdir bool) error {
+	isDir, known := false, false
+	if spool := jfs.handler.spool.Load(); spool != nil {
+		_, known = spool.LookupActive(filename)
+	}
+	if !known {
+		if e := jfs.handler.store.LookupByPath(filename); e != nil {
+			isDir, known = e.IsDir, true
+		}
+	}
+	if !known && !pin.IsOffline() {
+		if st, err, ok := lstatUnixWithTimeout(jfs.fullPath(filename), drainBaseProbeTimeout); ok && err == nil {
+			isDir, known = st.Mode&syscall.S_IFMT == syscall.S_IFDIR, true
+		}
+	}
+	switch {
+	case !known:
+		return nil
+	case rmdir && !isDir:
+		return syscall.ENOTDIR
+	case !rmdir && isDir:
+		return syscall.EISDIR
 	}
 	return nil
 }
@@ -5315,6 +5414,7 @@ func (deletedHandleChange) Chtimes(string, time.Time, time.Time) error { return 
 func (jc *juiceChange) Chmod(name string, mode os.FileMode) error {
 	h := jc.handler
 	rel := strings.TrimPrefix(name, "/")
+	h.clearExclusiveCreate(rel)
 	type chmodResult struct {
 		observed, spoolChecked, spoolPending, backendAttempted, backendApplied bool
 		backendErrno                                                           int
@@ -5394,9 +5494,22 @@ func (jc *juiceChange) Chmod(name string, mode os.FileMode) error {
 	}
 	return err
 }
-func (jc *juiceChange) Chown(name string, uid, gid int) error             { return nil }
-func (jc *juiceChange) Lchown(name string, uid, gid int) error            { return nil }
-func (jc *juiceChange) Chtimes(name string, atime, mtime time.Time) error { return nil }
+
+// Ownership and times are not stored, but a SETATTR of them is the client's
+// first change after an EXCLUSIVE CREATE (RFC 1813 section 3.3.8), so it ends
+// that create's resend window.
+func (jc *juiceChange) Chown(name string, uid, gid int) error {
+	jc.handler.clearExclusiveCreate(name)
+	return nil
+}
+func (jc *juiceChange) Lchown(name string, uid, gid int) error {
+	jc.handler.clearExclusiveCreate(name)
+	return nil
+}
+func (jc *juiceChange) Chtimes(name string, atime, mtime time.Time) error {
+	jc.handler.clearExclusiveCreate(name)
+	return nil
+}
 
 // cachedFile implements billy.File with two-tier read path:
 // 1. Direct SSD pread (bypasses FUSE) — if cache reader is available and block is cached
