@@ -36,9 +36,7 @@ func newBatchWiredHandler(t *testing.T) (*juiceFS, *SpoolStore, *Drainer, string
 func newBatchWiredHandlerNoDispatch(t *testing.T, maxOps int) (*juiceFS, *SpoolStore, *Drainer, string) {
 	t.Helper()
 	t.Setenv("JM_DRAIN_BATCH_INSERT", "1")
-	// Same as newSpoolWiredHandler: these tests drive the spool data path, not
-	// the RPC mutation bound, which local fsync load alone can exceed.
-	t.Setenv("JM_MUTATION_OP_TIMEOUT_MS", spoolFixtureMutationBoundMS)
+	useSpoolFixtureMutationBound(t)
 	fuseRoot := t.TempDir()
 	spoolDir := t.TempDir()
 	dbPath := filepath.Join(t.TempDir(), "meta.db")

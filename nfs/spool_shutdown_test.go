@@ -26,6 +26,7 @@ type shutdownFixture struct {
 
 func newShutdownFixture(t *testing.T) *shutdownFixture {
 	t.Helper()
+	useSpoolFixtureMutationBound(t)
 	f := &shutdownFixture{dbPath: filepath.Join(t.TempDir(), "mirror.db"), root: filepath.Join(t.TempDir(), "spool"), backing: t.TempDir()}
 	var err error
 	f.db, err = metadata.Open(f.dbPath)
