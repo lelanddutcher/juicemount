@@ -46,12 +46,14 @@ workers.
   longer than the mount's reply limit, it still finished, but the Mac's
   automatic resend of the same rename could discard the renamed file's
   not-yet-uploaded bytes and leave its name reporting an I/O error, while Finder
-  showed no error. The resend is now answered as the success it was, once, for
-  up to 60 seconds, but only while the source is still gone and the
-  destination still holds the renamed file. A rename whose source or
-  destination changed in between is run normally, and a rename of a missing
-  source no longer touches the destination. The Mac does not identify itself
-  on these requests, so the check is on the files, not on who sent the rename.
+  showed no error. The same resend of a delete or a file creation could delete
+  or empty a file another app had put at that name in the meantime, and a
+  resent rename could replace the moved file with a new one. A resend of a
+  rename, delete or creation that already finished is now answered as the
+  success it was, once, for up to 60 seconds, without running it again. The
+  Mac cannot tell a resend from an identical new request within that minute,
+  so such a request is also answered without running; repeat it if needed. A
+  rename of a missing source no longer touches the destination.
 
 ### Server
 

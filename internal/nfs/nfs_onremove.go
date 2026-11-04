@@ -49,6 +49,9 @@ func onRemove(ctx context.Context, w *response, userHandle Handler) error {
 	toDelete := fs.Join(append(path, string(obj.Filename))...)
 	toDeleteHandle := userHandle.ToHandle(fs, append(path, string(obj.Filename)))
 
+	if scoped, ok := fs.(MutationPrincipalSetter); ok {
+		scoped.SetMutationPrincipal(requestPrincipal(w.req))
+	}
 	err = fs.Remove(toDelete)
 	if err != nil {
 		if status, mapped := removeErrStatus(err); mapped {

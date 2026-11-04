@@ -110,6 +110,9 @@ func onCreate(ctx context.Context, w *response, userHandle Handler) error {
 		return &NFSStatusError{NFSStatusNotDir, nil}
 	}
 
+	if scoped, ok := fs.(MutationPrincipalSetter); ok {
+		scoped.SetMutationPrincipal(requestPrincipal(w.req))
+	}
 	file, err := fs.Create(newFilePath)
 	if err != nil {
 		Log.Errorf("Error Creating: %v", err)

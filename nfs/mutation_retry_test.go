@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sync"
@@ -145,7 +146,8 @@ func TestRenameResentAfterJukeboxBackendFile(t *testing.T) {
 	}
 }
 
-// A request that only resembles the late one is never answered from memory.
+// A request that only resembles the late one is never answered from memory,
+// and a remembered one is answered only once, within the TTL.
 func TestRenameReplayRequiresTheSameRequestAndState(t *testing.T) {
 	t.Run("other target", func(t *testing.T) {
 		jfs, holds, _ := newRenameRetryHarness(t)
@@ -165,33 +167,6 @@ func TestRenameReplayRequiresTheSameRequestAndState(t *testing.T) {
 		wantNoEnt(t, "same rename from another principal", other.Rename("dir/a.mov", "dir/b.mov"))
 		if err := jfs.Rename("dir/a.mov", "dir/b.mov"); err != nil {
 			t.Fatalf("resent rename = %v, want success", err)
-		}
-	})
-	t.Run("destination replaced", func(t *testing.T) {
-		jfs, holds, root := newRenameRetryHarness(t)
-		jukeboxed(t, jfs, holds, "publish", "dir/a.mov", renameCall(jfs, "dir/a.mov", "dir/b.mov"))
-		if err := jfs.Remove("dir/b.mov"); err != nil {
-			t.Fatal(err)
-		}
-		seedFile(t, jfs, jfs.handler.store, root, "dir/b.mov", []byte("someone else's"))
-		wantNoEnt(t, "resend after the destination changed", jfs.Rename("dir/a.mov", "dir/b.mov"))
-		if got, err := os.ReadFile(filepath.Join(root, "dir/b.mov")); err != nil || string(got) != "someone else's" {
-			t.Fatalf("dir/b.mov = %q, %v", got, err)
-		}
-	})
-	t.Run("source recreated", func(t *testing.T) {
-		jfs, holds, root := newRenameRetryHarness(t)
-		jukeboxed(t, jfs, holds, "publish", "dir/a.mov", renameCall(jfs, "dir/a.mov", "dir/b.mov"))
-		seedFile(t, jfs, jfs.handler.store, root, "dir/a.mov", []byte("new take"))
-		// A source exists again, so this is a new rename and must run.
-		if err := jfs.Rename("dir/a.mov", "dir/b.mov"); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := os.Lstat(filepath.Join(root, "dir/a.mov")); !os.IsNotExist(err) {
-			t.Fatalf("new source was answered from memory instead of renamed: %v", err)
-		}
-		if got, err := os.ReadFile(filepath.Join(root, "dir/b.mov")); err != nil || string(got) != "new take" {
-			t.Fatalf("dir/b.mov = %q, %v", got, err)
 		}
 	})
 	t.Run("expired", func(t *testing.T) {
@@ -242,18 +217,162 @@ func TestCompletedMutationsBounded(t *testing.T) {
 	key := func(i int) completedMutationKey { return completedMutationKey{op: "rename", from: fmt.Sprint(i)} }
 	for i := 0; i <= completedMutationCap; i++ {
 		now = base.Add(time.Duration(i) * time.Millisecond)
-		c.record(key(i), mutationIdentity{inode: uint64(i)})
+		c.record(key(i))
 	}
 	if len(c.entries) != completedMutationCap {
 		t.Fatalf("entries = %d, want cap %d", len(c.entries), completedMutationCap)
 	}
-	if _, ok := c.take(key(0)); ok {
+	if c.take(key(0)) {
 		t.Fatal("oldest entry survived past the cap")
 	}
-	if id, ok := c.take(key(completedMutationCap)); !ok || id.inode != completedMutationCap {
-		t.Fatalf("newest entry = %+v, %v", id, ok)
+	if !c.take(key(completedMutationCap)) {
+		t.Fatal("newest entry missing")
 	}
-	if _, ok := c.take(key(completedMutationCap)); ok {
+	if c.take(key(completedMutationCap)) {
 		t.Fatal("entry answered twice")
+	}
+}
+
+// Another actor changes the names between the late completion and the
+// resend. Running the resend could only act on that actor's files.
+func TestRenameResendAfterAnotherActorKeepsTheirFiles(t *testing.T) {
+	t.Run("source recreated", func(t *testing.T) {
+		jfs, holds, root := newRenameRetryHarness(t)
+		jukeboxed(t, jfs, holds, "publish", "dir/a.mov", renameCall(jfs, "dir/a.mov", "dir/b.mov"))
+		seedFile(t, jfs, jfs.handler.store, root, "dir/a.mov", []byte("new take"))
+		if err := jfs.Rename("dir/a.mov", "dir/b.mov"); err != nil {
+			t.Fatalf("resent rename = %v, want success", err)
+		}
+		if got, err := os.ReadFile(filepath.Join(root, "dir/b.mov")); err != nil || string(got) != "original" {
+			t.Fatalf("resend replaced the renamed file: dir/b.mov = %q, %v", got, err)
+		}
+		if got, err := os.ReadFile(filepath.Join(root, "dir/a.mov")); err != nil || string(got) != "new take" {
+			t.Fatalf("dir/a.mov = %q, %v", got, err)
+		}
+		// The entry is spent: renaming the new file is a new request and runs.
+		if err := jfs.Rename("dir/a.mov", "dir/b.mov"); err != nil {
+			t.Fatal(err)
+		}
+		if got, err := os.ReadFile(filepath.Join(root, "dir/b.mov")); err != nil || string(got) != "new take" {
+			t.Fatalf("dir/b.mov after a new rename = %q, %v", got, err)
+		}
+	})
+	t.Run("destination replaced", func(t *testing.T) {
+		jfs, holds, root := newRenameRetryHarness(t)
+		jukeboxed(t, jfs, holds, "publish", "dir/a.mov", renameCall(jfs, "dir/a.mov", "dir/b.mov"))
+		if err := jfs.Remove("dir/b.mov"); err != nil {
+			t.Fatal(err)
+		}
+		seedFile(t, jfs, jfs.handler.store, root, "dir/b.mov", []byte("someone else's"))
+		if err := jfs.Rename("dir/a.mov", "dir/b.mov"); err != nil {
+			t.Fatalf("resent rename = %v, want success", err)
+		}
+		if got, err := os.ReadFile(filepath.Join(root, "dir/b.mov")); err != nil || string(got) != "someone else's" {
+			t.Fatalf("dir/b.mov = %q, %v", got, err)
+		}
+	})
+}
+
+// REMOVE resent after another actor recreated the name: the resend used to
+// cancel the new file's spool entry and delete it.
+func TestRemoveResentAfterJukeboxKeepsRecreatedFile(t *testing.T) {
+	jfs, spool, _, _ := newSpoolWiredHandlerNoDrain(t)
+	holds := installPhaseHolds(jfs)
+	simulateNFSCreateThenWrite(t, jfs, "take.mov", patternedPayload(64<<10, 1), 64<<10)
+	jukeboxed(t, jfs, holds, "publish", "take.mov", func() error { return jfs.Remove("take.mov") })
+	if _, ok := spool.LookupActive("take.mov"); ok {
+		t.Fatal("precondition: the late remove did not finish")
+	}
+	payload := patternedPayload(128<<10, 7)
+	simulateNFSCreateThenWrite(t, jfs, "take.mov", payload, 64<<10)
+
+	if err := jfs.Remove("take.mov"); err != nil {
+		t.Fatalf("resent remove = %v, want success", err)
+	}
+	if _, ok := spool.LookupActive("take.mov"); !ok {
+		t.Fatal("resent remove deleted the recreated file")
+	}
+	if fi, err := jfs.Stat("take.mov"); err != nil || fi.Size() != int64(len(payload)) {
+		t.Fatalf("recreated take.mov = %v, %v", fi, err)
+	}
+	// Spent: a later remove is a new request and runs.
+	if err := jfs.Remove("take.mov"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := jfs.Stat("take.mov"); !os.IsNotExist(err) {
+		t.Fatalf("Stat after a new remove = %v, want ENOENT", err)
+	}
+}
+
+func writeAtVia(t *testing.T, jfs *juiceFS, name string, payload []byte) {
+	t.Helper()
+	f, err := jfs.OpenFile(name, os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.(io.WriterAt).WriteAt(payload, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// CREATE resent after another actor wrote to the file it created: an unchecked
+// create of an existing file truncates (macOS EXCLUSIVE is served unchecked).
+func TestCreateResentAfterJukeboxKeepsWrittenBytes(t *testing.T) {
+	for _, mode := range []string{"spool", "backend"} {
+		t.Run(mode, func(t *testing.T) {
+			var jfs *juiceFS
+			name := "dir/c.mov"
+			if mode == "spool" {
+				jfs, _, _, _ = newSpoolWiredHandlerNoDrain(t)
+				name = "c.mov"
+			} else {
+				jfs, _, _ = newRenameRetryHarness(t)
+			}
+			holds := installPhaseHolds(jfs)
+			jukeboxed(t, jfs, holds, "publish", name, func() error {
+				f, err := jfs.Create(name)
+				_ = closeNamespaceFile(f)
+				return err
+			})
+			payload := patternedPayload(64<<10, 4)
+			writeAtVia(t, jfs, name, payload)
+
+			f, err := jfs.Create(name)
+			if err != nil {
+				t.Fatalf("resent create = %v, want success", err)
+			}
+			if f.Name() != name {
+				t.Fatalf("resent create named %q", f.Name())
+			}
+			if err := f.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if fi, err := jfs.Stat(name); err != nil || fi.Size() != int64(len(payload)) {
+				t.Fatalf("after resent create: %v, %v; want %d bytes kept", fi, err, len(payload))
+			}
+		})
+	}
+}
+
+// A replayed CREATE must not hand back a name that no longer exists.
+func TestCreateResentAfterRemovalCreatesAgain(t *testing.T) {
+	jfs, holds, _ := newRenameRetryHarness(t)
+	createC := func() error {
+		f, err := jfs.Create("dir/c.mov")
+		_ = closeNamespaceFile(f)
+		return err
+	}
+	jukeboxed(t, jfs, holds, "publish", "dir/c.mov", createC)
+	if err := jfs.Remove("dir/c.mov"); err != nil {
+		t.Fatal(err)
+	}
+	if err := createC(); err != nil {
+		t.Fatalf("resent create = %v", err)
+	}
+	if _, err := jfs.Stat("dir/c.mov"); err != nil {
+		t.Fatalf("resent create left no file: %v", err)
 	}
 }

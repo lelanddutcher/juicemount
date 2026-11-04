@@ -4426,7 +4426,7 @@ func (jfs *juiceFS) CommitFile(path string) error {
 func (jfs *juiceFS) Create(filename string) (billy.File, error) {
 	filename = strings.TrimPrefix(filename, "/")
 	return runNamespaceOperation(jfs.handler, []string{filename}, func(op *namespaceOperation) (billy.File, error) {
-		return jfs.create(filename, op)
+		return jfs.createOnce(filename, op)
 	}, closeNamespaceFile)
 }
 
@@ -4899,7 +4899,7 @@ func (jfs *juiceFS) rename(oldpath, newpath string, op *namespaceOperation) erro
 func (jfs *juiceFS) Remove(filename string) error {
 	filename = strings.TrimPrefix(filename, "/")
 	return jfs.namespaceMutation([]string{filename}, func(op *namespaceOperation) error {
-		return jfs.remove(filename, op)
+		return jfs.removeOnce(filename, op)
 	})
 }
 
