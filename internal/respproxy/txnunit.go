@@ -10,8 +10,10 @@ package respproxy
 //   - every inode the unit writes is anchored to EVERY parent it has now
 //     (Attr.Parent, or all p<n> fields for a hard link), never to a parent
 //     the unit merely claims (review H8B-L2 #1/#2);
-//   - an inode that does not exist yet must be created by this unit's own
-//     dentry write, and is anchored there;
+//   - an inode that does not exist yet must be created by this unit: one
+//     dentry plus its SET i<n> of the same type with Attr.Parent = that
+//     directory, numbered from the writer's own INCRBY nextinode batch, and
+//     is anchored there;
 //   - a change of Attr.Parent must be matched by this unit's dentry writes:
 //     the inode is placed in the new parent and its entry removed from the
 //     stored one (rename, unlink into trash, restore);
@@ -19,13 +21,16 @@ package respproxy
 //     first is a hard link: files only, and all its parents must be in one
 //     project;
 //   - a trash entry must name an inode whose non-trash entry this unit
-//     removes (same-inode trash pairing).
+//     removes (same-inode trash pairing), and never replaces an entry
+//     naming another inode; entries outside the trash never name a trash
+//     inode, and the trash root is never written here.
 //
 // Edges are learned only from committed dentry writes (ancestry.go).
 
 import (
 	"bytes"
 	"strconv"
+	"strings"
 )
 
 // unitEdge is a dentry placement (parent -> child) a unit writes. It is
@@ -43,7 +48,8 @@ type dentryOp struct {
 	del   bool
 	val   []byte // HSET value; nil for HDEL
 	ino   uint64 // HSET: the inode the entry names
-	isDir bool   // HSET: the entry's type
+	typ   byte   // HSET: the entry's type
+	isDir bool   // HSET: typ == typeDir
 	trash bool   // dir is a trash directory
 }
 
@@ -262,7 +268,7 @@ func analyzeUnit(u *Unit) *unitFacts {
 						f.unresolvable = append(f.unresolvable, why+": unparsable entry")
 						continue
 					}
-					op := dentryOp{dir: dir, name: string(c.Args[i]), val: v, ino: ino, isDir: typ == typeDir, trash: w.Key.Trash}
+					op := dentryOp{dir: dir, name: string(c.Args[i]), val: v, ino: ino, typ: typ, isDir: typ == typeDir, trash: w.Key.Trash}
 					f.dentries = append(f.dentries, op)
 					f.edges = append(f.edges, unitEdge{parent: dir, child: ino, isDir: op.isDir, name: op.name})
 					touch(ino)
@@ -379,6 +385,7 @@ func analyzeUnit(u *Unit) *unitFacts {
 // placed is one directory a unit places an inode in.
 type placedIn struct {
 	dir   uint64
+	typ   byte
 	isDir bool
 	trash bool
 }
@@ -400,9 +407,11 @@ const (
 	placeGrant
 )
 
-// placeUnit checks the unit against the stored tree and returns the
-// location of every anchor (see placeMode for which refusals apply).
-func (e *LeaseEngine) placeUnit(u *Unit, f *unitFacts, mode placeMode) ([]location, *Denial) {
+// placeUnit checks the unit of principal p against the stored tree and
+// returns the location of every anchor (see placeMode for which refusals
+// apply). Admin/bg bypass policy restrictions, but an unknown location or
+// failed authority read must still refuse.
+func (e *LeaseEngine) placeUnit(p Principal, u *Unit, f *unitFacts, mode placeMode) ([]location, *Denial) {
 	a := e.anc
 	bypass := mode == placeBypass
 	var locs []location
@@ -421,6 +430,7 @@ func (e *LeaseEngine) placeUnit(u *Unit, f *unitFacts, mode placeMode) ([]locati
 	}
 
 	removed := map[uint64][]uint64{} // inode -> dirs whose entry for it the unit removes or replaces
+	delIno := map[int]uint64{}       // f.dentries index of an HDEL -> the inode its entry named
 	placed := map[uint64][]placedIn{}
 	var order []uint64
 	seen := map[uint64]bool{}
@@ -430,7 +440,21 @@ func (e *LeaseEngine) placeUnit(u *Unit, f *unitFacts, mode placeMode) ([]locati
 			order = append(order, n)
 		}
 	}
-	for _, op := range f.dentries {
+	for i, op := range f.dentries {
+		// bg's trash cleanup deletes everything below an expired entry of
+		// the trash root, so the root holds only the hourly directories
+		// checkTrash creates (the guard's KCTrashCreate, never a project
+		// write), and a trash inode is reachable only through the trash.
+		if op.dir == TrashInode {
+			if d := refuse(&Denial{Reason: ReasonBGOnly, Detail: "trash root entry " + strconv.Quote(op.name) + " outside an hourly directory create"}); d != nil {
+				return nil, d
+			}
+		}
+		if !op.del && !op.trash && isTrashIno(op.ino) {
+			if d := refuse(&Denial{Reason: ReasonBGOnly, Detail: "entry " + strconv.Quote(op.name) + " outside the trash names trash inode " + inoStr(op.ino)}); d != nil {
+				return nil, d
+			}
+		}
 		if !op.trash {
 			l, err := a.resolveDir(op.dir)
 			if err != nil {
@@ -451,11 +475,12 @@ func (e *LeaseEngine) placeUnit(u *Unit, f *unitFacts, mode placeMode) ([]locati
 			}
 			if ok {
 				removed[ino] = append(removed[ino], op.dir)
+				delIno[i] = ino
 				note(ino)
 			}
 			continue
 		}
-		placed[op.ino] = append(placed[op.ino], placedIn{dir: op.dir, isDir: op.isDir, trash: op.trash})
+		placed[op.ino] = append(placed[op.ino], placedIn{dir: op.dir, typ: op.typ, isDir: op.isDir, trash: op.trash})
 		note(op.ino)
 	}
 	for _, n := range f.inodes {
@@ -475,6 +500,28 @@ func (e *LeaseEngine) placeUnit(u *Unit, f *unitFacts, mode placeMode) ([]locati
 			continue
 		}
 		stored[n] = pl
+	}
+	// A trash entry is only ever added: juicefs names it
+	// <parent>-<inode>-<name> (trashEntry), so the one field it can find
+	// set already names the same inode (a hard link trashed again under the
+	// same name). Every trashed inode keeps its entry until bg's cleanup or
+	// a restore removes it.
+	for _, op := range f.dentries {
+		if !op.trash || op.del {
+			continue
+		}
+		cur, _, ok, err := a.entryAt(op.dir, op.name)
+		if err != nil {
+			if d := unknown("cannot read entry " + strconv.Quote(op.name)); d != nil {
+				return nil, d
+			}
+			continue
+		}
+		if ok && cur != op.ino {
+			if d := refuse(&Denial{Reason: ReasonBGOnly, Detail: "trash entry " + strconv.Quote(op.name) + " replaces the entry for inode " + inoStr(cur)}); d != nil {
+				return nil, d
+			}
+		}
 	}
 	// An existing inode set over another entry replaces that entry (rename
 	// onto an existing name, RENAME_EXCHANGE): the replaced inode leaves
@@ -577,6 +624,11 @@ func (e *LeaseEngine) placeUnit(u *Unit, f *unitFacts, mode placeMode) ([]locati
 					return nil, d
 				}
 			}
+			if !bypass {
+				if d := newInodeGate(p, u, n, newHere, f.setAttr); d != nil {
+					return nil, d
+				}
+			}
 			continue
 		}
 
@@ -668,20 +720,28 @@ func (e *LeaseEngine) placeUnit(u *Unit, f *unitFacts, mode placeMode) ([]locati
 	}
 
 	// Same-inode trash pairing: a trash entry must name an inode whose
-	// non-trash entry this unit removes or replaces.
+	// non-trash entry this unit removes or replaces, under juicefs's name
+	// for it, <directory>-<inode>-<name> (trashEntry), whose directory is
+	// one it is removed from. That name is what a restore reads back.
 	for _, op := range f.dentries {
 		if !op.trash || op.del {
 			continue
 		}
-		if !removedFromNonTrash(op.ino) {
-			if d := refuse(&Denial{Reason: ReasonBGOnly, Detail: "trash entry for inode " + inoStr(op.ino) + " that this unit does not remove"}); d != nil {
+		named := false
+		if dir, ino, ok := trashEntryOrigin(op.name); ok && ino == op.ino && !isTrashIno(dir) {
+			named = hasDir(removed[op.ino], dir)
+		}
+		if !removedFromNonTrash(op.ino) || !named {
+			if d := refuse(&Denial{Reason: ReasonBGOnly, Detail: "trash entry " + strconv.Quote(op.name) + " for inode " + inoStr(op.ino) + " is not named for an entry this unit removes"}); d != nil {
 				return nil, d
 			}
 		}
 	}
 	// A trash entry removed without placing the inode elsewhere is a purge
-	// (trash cleanup): bg only.
-	for _, op := range f.dentries {
+	// (trash cleanup): bg only. A restore places it outside the trash, and
+	// is anchored in the directory the entry was trashed from as well as
+	// its destination: the inode still belongs to that directory's project.
+	for i, op := range f.dentries {
 		if !op.trash || !op.del {
 			continue
 		}
@@ -695,9 +755,87 @@ func (e *LeaseEngine) placeUnit(u *Unit, f *unitFacts, mode placeMode) ([]locati
 			if d := refuse(&Denial{Reason: ReasonBGOnly, Detail: "removing a trash entry without restoring it"}); d != nil {
 				return nil, d
 			}
+			continue
 		}
+		if bypass {
+			continue
+		}
+		n, gone := delIno[i]
+		dir, ino, ok := trashEntryOrigin(op.name)
+		if !gone || !ok || ino != n {
+			return nil, &Denial{Reason: ReasonBGOnly, Detail: "trash entry " + strconv.Quote(op.name) + " does not name the directory it was trashed from"}
+		}
+		l, err := a.resolveDir(dir)
+		if err != nil {
+			return nil, &Denial{Reason: ReasonUnknownKey, Detail: "unresolved original directory " + inoStr(dir) + " of a trash entry: " + err.Error()}
+		}
+		locs = append(locs, l)
 	}
 	return locs, nil
+}
+
+// trashEntryOrigin parses juicefs's trash entry name
+// "<directory>-<inode>-<name>" (base.go trashEntry).
+func trashEntryOrigin(name string) (dir, ino uint64, ok bool) {
+	parts := strings.SplitN(name, "-", 3)
+	if len(parts) != 3 {
+		return 0, 0, false
+	}
+	dir, ok1 := digits(parts[0])
+	ino, ok2 := digits(parts[1])
+	return dir, ino, ok1 && ok2
+}
+
+// newInodeGate: an entry naming an inode that does not exist yet creates it,
+// as juicefs's mknod / create / mkdir / symlink and clone do (redis.go
+// doMknod, doCloneEntry): exactly one entry, the inode's SET i<n> in the same
+// unit with the entry's type and Attr.Parent = that directory, and a number
+// from p's own INCRBY nextinode batch (Unit.inodeOwner). So an entry always
+// names an inode its writer created, never a number that may be handed to
+// another principal, and what bg's trash cleanup deletes below a directory
+// is what that directory's project created or linked.
+//
+// A number at or below Unit.inodeMark with no recorded owner was handed out
+// before the proxy recorded batches; a mount still holding such a batch
+// creates from it with the structural rules alone. Each such number names
+// at most one inode, created by whoever creates it first, and every batch
+// taken after recording began is recorded.
+func newInodeGate(p Principal, u *Unit, n uint64, newHere []placedIn, attrs map[uint64]attrInfo) *Denial {
+	refuse := func(r Reason, detail string) *Denial {
+		return &Denial{Reason: r, Detail: "new inode " + inoStr(n) + ": " + detail}
+	}
+	at, ok := attrs[n]
+	switch {
+	case !ok:
+		return refuse(ReasonUnknownKey, "an entry names it but this unit does not create it")
+	case len(newHere) != 1 || at.parent != newHere[0].dir:
+		return refuse(ReasonUnknownKey, "not created in exactly one directory, its Attr.Parent")
+	case at.typ != newHere[0].typ:
+		return refuse(ReasonUnknownKey, "its attr and its entry differ in type")
+	}
+	if u.inodeOwner == nil {
+		return refuse(ReasonAdminOnly, "no inode allocation record")
+	}
+	owner, known, err := u.inodeOwner(n)
+	switch {
+	case err != nil:
+		return refuse(ReasonBGOnly, "inode allocation record: "+err.Error())
+	case known && owner != p.Name:
+		return refuse(ReasonAdminOnly, "from another principal's INCRBY nextinode")
+	case known:
+		return nil
+	}
+	if u.inodeMark == nil {
+		return refuse(ReasonAdminOnly, "no inode allocation record")
+	}
+	mark, err := u.inodeMark()
+	if err != nil {
+		return refuse(ReasonBGOnly, "inode allocation mark: "+err.Error())
+	}
+	if n > mark {
+		return refuse(ReasonAdminOnly, "not from this principal's INCRBY nextinode")
+	}
+	return nil
 }
 
 // oneProject refuses a hard link whose parents span projects (plan §1.4

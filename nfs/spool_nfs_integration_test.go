@@ -16,8 +16,20 @@ import (
 // with a temp dir standing in for the JuiceFS FUSE mount root. It returns the
 // juiceFS billy filesystem (the layer the go-nfs fork's onCreate/onWrite call
 // into), the spool, the drainer, and the FUSE root path.
+// spoolFixtureMutationBoundMS replaces the 800 ms RPC mutation bound in the
+// spool fixtures. That bound is the server's busy policy: when it expires the
+// RPC answers JUKEBOX and an NFS client retries, while the worker keeps the name
+// until it finishes. These fixtures call the handler directly, with no client
+// to retry, and test spool data paths rather than that policy (its own tests set
+// JM_MUTATION_OP_TIMEOUT_MS themselves and override this). On a loaded CI host
+// a spool CREATE's local SQLite and spool-file commits alone took over 800 ms
+// (measured 635 ms OpenWrite + 193 ms Insert), so the policy fired on a healthy
+// host and the test read the retryable answer as a failure.
+const spoolFixtureMutationBoundMS = "30000"
+
 func newSpoolWiredHandler(t *testing.T) (*juiceFS, *SpoolStore, *Drainer, string) {
 	t.Helper()
+	t.Setenv("JM_MUTATION_OP_TIMEOUT_MS", spoolFixtureMutationBoundMS)
 	fuseRoot := t.TempDir()
 	spoolDir := t.TempDir()
 	dbPath := filepath.Join(t.TempDir(), "meta.db")

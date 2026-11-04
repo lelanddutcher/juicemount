@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -18,6 +19,26 @@ var ErrResidentDigest = errors.New("resident image digest mismatch")
 // Bound memory independently of file length. At the usual 4 MiB block size
 // this permits four TiB per image; larger manifests retain their private copy.
 const maxResidentFlushBlocks = 1 << 20
+
+// A same-inode write that keeps the size and restores mtime is visible only
+// through ctime, and ctime moves only when the change lands in a later
+// timestamp tick: a kernel clock tick, or a whole second on filesystems that
+// store seconds. A block whose ctime is this close to its first observation
+// may have been edited unseen after it was hashed, so its bytes are read and
+// compared again at every final check. The window covers one-second storage
+// plus a coarse kernel tick. It assumes the cache directory's ctime comes from
+// this host's clock: a server clock skewed by more than the window (NFS, SMB)
+// or a backward clock step can hide such an edit.
+const residentRacyWindow = 2 * time.Second
+
+func residentRacy(id residentDiskIdentity, observed time.Time) bool {
+	return !time.Unix(id.ctime.Unix()).Before(observed.Add(-residentRacyWindow))
+}
+
+type residentRecheck struct {
+	length int64
+	sum    [sha256.Size]byte
+}
 
 type residentDiskIdentity struct {
 	dev, inode   uint64
@@ -41,9 +62,15 @@ func residentDiskID(f *os.File, directory bool) (residentDiskIdentity, error) {
 			return id, ErrCacheMiss
 		}
 		id.size, id.mtime, id.ctime = s.Size, s.Mtim, s.Ctim
+		if testResidentFileStat != nil {
+			testResidentFileStat(&id)
+		}
 	}
 	return id, nil
 }
+
+// Test-only: rewrites file timestamps to model a coarser filesystem clock.
+var testResidentFileStat func(*residentDiskIdentity)
 
 // walkResident opens only existing no-follow components below the retained
 // volume-container FD. Intermediate descriptors close as the walk advances.
@@ -113,7 +140,8 @@ func (r *Reader) syncResident(f *os.File, directory bool) error {
 // The existing directory containing volume UUIDs is the durable root boundary.
 // New shard/chunks/raw/volume entries are synced bottom-up. Every data CRC/hash
 // and sync uses the same descriptor; a final no-follow walk rejects substituted
-// names, parents or content metadata. Only a bounded number of FDs stay open.
+// names, parents or content metadata, and rereads blocks whose ctime is too
+// fresh to witness an edit. Only a bounded number of FDs stay open.
 func (r *Reader) FlushResidentImage(ctx context.Context, inode uint64, expected ResidentAttr, want [sha256.Size]byte) (_ ContentGraphExport, retErr error) {
 	var empty ContentGraphExport
 	if r == nil || r.stopped.Load() || !r.binding.valid() || r.blockSize != r.binding.BlockSize {
@@ -188,6 +216,7 @@ func (r *Reader) FlushResidentImage(ctx context.Context, inode uint64, expected 
 		return empty, err
 	}
 	files := make(map[string]residentDiskIdentity)
+	rechecks := make(map[string]residentRecheck)
 	digest := sha256.New()
 	buffer := r.getBuffer(int(r.blockSize))
 	defer r.putBuffer(buffer)
@@ -230,6 +259,7 @@ func (r *Reader) FlushResidentImage(ctx context.Context, inode uint64, expected 
 		if err != nil {
 			return empty, err
 		}
+		observed := time.Now()
 		before, verifyErr := residentDiskID(file, false)
 		if prior, known := files[name]; verifyErr == nil && known && before != prior {
 			verifyErr = ErrCacheMiss
@@ -245,6 +275,9 @@ func (r *Reader) FlushResidentImage(ctx context.Context, inode uint64, expected 
 		}
 		if verifyErr == nil {
 			if _, synced := files[name]; !synced {
+				if residentRacy(before, observed) {
+					rechecks[name] = residentRecheck{length: length, sum: sha256.Sum256(buffer[:length])}
+				}
 				verifyErr = r.syncResident(file, false)
 			}
 		}
@@ -314,9 +347,16 @@ func (r *Reader) FlushResidentImage(ctx context.Context, inode uint64, expected 
 				return err
 			}
 			after, statErr := residentDiskID(f, false)
+			var readErr error
+			if check, racy := rechecks[name]; racy && statErr == nil && after == before {
+				readErr = r.readVerifiedBlockFD(f, check.length, 0, buffer[:check.length])
+				if readErr == nil && sha256.Sum256(buffer[:check.length]) != check.sum {
+					readErr = ErrCacheMiss
+				}
+			}
 			closeErr := f.Close()
-			if statErr != nil || closeErr != nil || after != before {
-				return errors.Join(ErrCacheMiss, statErr, closeErr)
+			if statErr != nil || readErr != nil || closeErr != nil || after != before {
+				return errors.Join(ErrCacheMiss, statErr, readErr, closeErr)
 			}
 		}
 		// Recheck the selected volume chain after all named blocks.

@@ -35,6 +35,7 @@ import (
 // production wiring installs is replicated via SetOnDrainComplete.
 func newSpoolWiredHandlerNoDrain(t *testing.T) (*juiceFS, *SpoolStore, *Drainer, string) {
 	t.Helper()
+	t.Setenv("JM_MUTATION_OP_TIMEOUT_MS", spoolFixtureMutationBoundMS)
 	fuseRoot := t.TempDir()
 	spoolDir := t.TempDir()
 	dbPath := filepath.Join(t.TempDir(), "meta.db")

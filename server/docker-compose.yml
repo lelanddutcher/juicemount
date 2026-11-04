@@ -422,8 +422,11 @@ services:
       JM_FARM_NODE_META_URL: "${JM_FARM_NODE_META_URL:-}"
       JM_FARM_SERVER_IMAGE: "ghcr.io/lelanddutcher/juicefarm@${JM_FARM_DIGEST:?set JM_FARM_DIGEST to the release sha256 digest}"
       JM_FARM_RENDER_IMAGE: "ghcr.io/lelanddutcher/juicefarm-gpu@${JM_FARM_RENDER_DIGEST:?set JM_FARM_RENDER_DIGEST to the release sha256 digest}"
-      # 0.5 uses a user-owned system private route for remote clients. The
-      # embedded Headscale service remains an explicit advanced deployment.
+      # 0.5 uses a user-owned system private route for remote clients.
+      # JuiceMount Link (embedded Headscale + NAS tailnet node) is opt-in:
+      # apply server/docker-compose.link.yml on top of this file, which turns
+      # both on and publishes their ports (30193/tcp control, 41641/udp
+      # WireGuard). This file publishes neither while Link is off.
       JM_NET_HEADSCALE: "off"
       JM_NET_ALLOW_INSECURE: "0"
       JM_NET_ALLOW_LAN_ONLY: "0"
@@ -443,6 +446,7 @@ services:
       JM_SMART_FOLDERS_MAX_VIEWS: "${JM_SMART_FOLDERS_MAX_VIEWS:-256}"
     ports:
       - "30190:8080"                              # manager UI
+      # Link's 30193/tcp and 41641/udp: server/docker-compose.link.yml
     volumes:
       # Mount your existing-data datasets here, read-only. Each gets
       # browsed as /sources/<name> in the UI. Add as many lines as you

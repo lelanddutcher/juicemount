@@ -1,13 +1,90 @@
 # JuiceMount Changelog
 
-## Unreleased
+## 0.5.1 — unreleased
+
+A reliability update to 0.5.0. Update checks remain manual through **Check for
+Updates…** in the app. Read **Upgrading the farm** below before updating farm
+workers.
+
+### App and Link
+
+- Starting the mount after updating the app works when the previous version's
+  mount was stopped cleanly. Before, the new build refused the old build's
+  stopped owner record, so Start failed after an upgrade. A previous owner that
+  is still running, or whose stop cannot be proven, is still refused.
+- A mount started by the volume owner now uses this Mac's own object-store key.
+  Before, the key was dropped at that step, so the mount used whatever
+  object-store credentials it inherited instead of this Mac's key.
+- Over JuiceMount Link's adaptive path, a Redis reply that stops partway
+  through no longer hangs the mount. The response watchdog now stays armed until the whole reply
+  has arrived, so a stalled connection is closed after 2 seconds without
+  progress and reconnects. Before, the first byte of a reply disarmed it, and a
+  stall mid-reply could leave Finder waiting indefinitely. Waiting for a slow
+  reader on the Mac does not count as a stall.
+- A file whose stored name differs from the requested name only in Unicode
+  normalization (for example an accented name created on another system in a
+  different form) now opens instead of reporting that it does not exist.
+  Stored names are never changed. If two names in a folder match the same
+  canonical form, or the local view of the folder is incomplete, no match is
+  guessed and the lookup reports the file missing as before.
+- Support commands for a mount left behind after its processes stopped (issue
+  #4), run from a standalone build and never as root:
+  `--unmount-operation-status` reads the eject helper's progress for an
+  unmount without changing anything. `--recover-retained-generation` runs that
+  mount's ordinary retirement; with `--withdraw` it withdraws it instead, and
+  `--eject-now` ejects it, but only after a withdrawal has completed. It works only on an isolated test install (`JM_APP_ISOLATION`), only
+  after the owner and its NFS export are proven gone, and leaves queued saves
+  and local databases in place. Ordinary installs are unchanged, and packaged
+  recovery acceptance remains open.
+- Handing a resident file's cached blocks over for upload now rereads any block
+  written in the last two seconds and checks it against its recorded hash.
+  Before, an in-place edit that kept the file's size and timestamp, and landed
+  in the same timestamp tick as the block's last change, could hand over bytes
+  that no longer matched the hash. Older blocks keep the metadata check.
+
+### Server
+
+- A fresh server install creates the `zpool` bucket before it sets up the
+  object-store users. Before, setup used the restricted format key, which
+  cannot create buckets, so a first install failed. An existing bucket and its
+  data are left as they are, and setup stops unless the object store confirms
+  the bucket.
 
 ### JuiceFarm and Manager
 
+- Experimental smart folders, off by default (`JM_SMART_FOLDERS=on` to try
+  them): the Manager keeps a top-level **Recents** folder
+  (`JM_SMART_FOLDERS_ROOT`) with one view per top-level folder of the volume,
+  each listing that folder's most recently changed files as links. Every Mac
+  and every app's file picker sees the same views. The feature never deletes,
+  overwrites or adopts your files, respects project leases, and turns itself
+  off rather than stopping the Manager if it fails.
+- The first successful **Test Connection** of an SFTP destination stores the
+  server's host key. Later connections must present the same key, or they stop
+  before any password or key is sent. Sync jobs use the stored key and refuse
+  to run until the destination has been tested once. Editing a destination
+  keeps its key while the host and port are unchanged.
 - A farm worker that was partitioned past its claim lease, reaped, and replaced
   can no longer publish a legacy job's outcome, dispatch, or acknowledgement
   over the worker that now owns the job. The reaper also waits for the legacy
   delivery lease instead of releasing a claim as soon as a heartbeat lapses.
+- A legacy job claimed while the claim's reply was lost (a dropped
+  connection, a Redis restart, or a client retry after a timeout) is returned
+  by the worker's next claim, or put back in its queue if the worker has
+  stopped claiming (disabled, paused, draining, or waiting on the storage
+  permit). Before, it stayed queued in that worker's processing list, run by
+  no one, until the worker exited. The fix runs in each worker's own claim, so
+  every jmfarm worker must be upgraded to get it.
+- A legacy job claimed for a worker that never learned of the claim (a claim
+  request that reached Redis late, after the worker had moved on) is put back
+  in its queue once it has waited a minute unstarted, even while that worker
+  is alive and working on something else. Before, it waited in that worker's
+  processing list until the worker exited. A worker that starts the job at the
+  same moment either keeps it or is refused the start, so the job runs once.
+- A worker whose request to put a job back in its queue was retried after a
+  lost reply no longer stops as if it had lost the job. The retry now reports
+  that the first request succeeded. This runs in the worker's own request, so
+  an un-upgraded worker still stops.
 - A worker retries a transient Redis fault while publishing a job's outcome. If
   the outcome still cannot be published, the worker stops so another worker
   recovers the job, instead of leaving it shown as running.
@@ -155,6 +232,105 @@
   write again) and nothing is logged per person until you upgrade. The
   Manager logs a warning and the People page says so.
 
+### JuiceMount Link
+
+- Upgrading changes what linked devices can reach. With the embedded control
+  server and NAS node (`JM_NET_HEADSCALE=on`, `JM_NET_NAS_NODE=on`), the
+  Manager now enforces an ACL policy where earlier releases allowed all
+  traffic: Macs and farm nodes reach only ports 30151, 30179 and 30190 on the
+  NAS node and, under `subnet`, inside the route. Anything else used through
+  Link (other ports or hosts on the NAS LAN, one Mac to another) stops
+  working. `JM_NET_POLICY=off`, or a `policy:` stanza of your own in
+  `config.yaml`, keeps the previous behaviour. With `JM_NET_NAS_NODE` off
+  (your own subnet router carries the NAS) the Manager applies no policy and
+  mints untagged keys, as before.
+- Link has two ways to expose the NAS, chosen by `JM_NET_NAS_EXPOSURE`:
+  - `services` serves only the JuiceMount ports (Redis proxy 30179, object
+    storage 30151, Manager 30190) on the NAS node's own tailnet address. The
+    node carries `tag:jm-nas`, which is how a Mac app from this release finds
+    it; the app dials that node for the NAS's ports even when some other
+    node's route covers the NAS's LAN address. Mac apps from earlier
+    releases, and remote farm nodes, cannot reach it: they follow subnet
+    routes only.
+  - `subnet` advertises a LAN prefix through the NAS node, the only path
+    Link had before. Every Mac app version and remote farm node reaches it.
+    The prefix is `JM_NET_NAS_ROUTE`, or `192.168.0.0/24` when that is unset,
+    as before. The Manager does not tag the node, so a Mac waits for the
+    route instead of using the node's tailnet address. A NAS node that ran
+    with `services` keeps `tag:jm-nas` after a switch to `subnet` (Headscale
+    cannot take a tagged node's last tag away), so a current Mac reaches it
+    at its tailnet address, which serves the same ports, rather than through
+    the route.
+  - `JM_NET_NAS_LAN_ADDR` is the NAS's own LAN address. Under `subnet` it
+    must be inside the route, and narrows the policy to the JuiceMount ports
+    on that address instead of on every host in the route. Under `services`
+    it tells status which routes matter (see below).
+- When `JM_NET_NAS_EXPOSURE` is unset, setting `JM_NET_NAS_ROUTE` selects
+  `subnet`. Otherwise an install whose NAS node already ran
+  (`/data/headscale/nas-node` exists) keeps `subnet`, and a new install uses
+  `services`. Before the NAS node first starts, the Manager records the
+  exposure it starts with (whichever of the above chose it) in
+  `/data/headscale/nas-exposure`, and that record is the default from then
+  on, so removing a variable later does not change the exposure. The node
+  does not start until the record is written. To switch, set
+  `JM_NET_NAS_EXPOSURE` and restart the Manager.
+  Before switching an existing install to `services`, update every linked
+  Mac.
+- `JM_NET_NAS_EXPOSURE=services` together with `JM_NET_NAS_ROUTE` stops only
+  the NAS node, whose status names the conflict. The control server keeps
+  running.
+- The Manager finds its NAS node by the node's key, never by the name
+  `juicemount-nas`, which any node can register under. It tags, approves
+  routes for and reports on that node only. While another node carries
+  `tag:jm-nas`, or (under `subnet`) advertises a route overlapping the NAS
+  prefix, or (under `services`) holds an approved route over
+  `JM_NET_NAS_LAN_ADDR` (any approved route while that is unset),
+  `GET /api/net/link` reports the route not ready and the NAS node logs a
+  warning, naming each such node. After the NAS node's state is reset, its
+  earlier registration (same name, offline, older) is named as such.
+  Remove one that is not a device of yours with
+  `docker exec <Manager container> headscale nodes delete --identifier <id>`.
+  `POST /api/net/routes/approve` no longer takes `?host=`: it approves on
+  the NAS node, or on `?id=<node id>` (IDs are in `GET /api/net/paired`).
+- Remote farm node enrollment needs `subnet`: the node's JuiceFS mount reaches
+  object storage at the LAN address stored in the volume. Under `services` the
+  Manager refuses the remote plan and says what to set.
+- With `services` under `JM_NET_POLICY=off` or your own Headscale policy, the
+  NAS node's key carries `tag:jm-nas`. Headscale cannot add the tag to a NAS
+  node registered before this release unless the policy defines the tag
+  (`"tag:jm-nas": []` in `tagOwners`). Until then the node keeps retrying
+  and `GET /api/net/link` shows why. Route readiness under `services` now
+  also requires the control server to list the NAS node online with the tag.
+- The generated policy gives no tag an owner, so no node can tag itself (an
+  untagged Mac could otherwise claim `tag:jm-nas`). Keys the Manager mints
+  still get their tags.
+- Under `services`, the Manager on 30190 is served in-process on the tailnet
+  address, so its per-address enrollment limits count each Mac once, at its
+  IPv4 tailnet address, whichever of its addresses it connected from. The Redis proxy and object storage are forwarded from the Manager
+  container, as is everything through a subnet route, so they see all remote
+  clients as that one address. The Redis proxy's AUTH lockout is per address
+  and principal, and each Mac has its own principal, so one Mac's wrong secret
+  does not lock out another. An AUTH flood from one remote Mac can delay the
+  others by up to the 10 second pre-auth timeout.
+
+### Release integrity
+
+- Built with Go 1.26.10 (crypto/x509 fix GO-2026-6809), go-jose v4.1.6 and
+  x/net v0.62.0, which close the published advisories against the earlier
+  versions. CI runs Redis at the same pinned 7.4.11 build the server ships.
+- `scripts/install.sh` installs only a verified JuiceMount Developer ID signed
+  bundle and keeps its signature intact. It refuses to run while JuiceMount or
+  its serving processes are running, and never quits or kills them; Stop and
+  Quit first. It verifies a staged copy, keeps the previous bundle, and leaves
+  failed staging artifacts in place for inspection. `--source` installs an
+  existing signed release and `--destination` installs to a disposable path.
+- The Finder release battery has a strict mode (`QA_STRICT_RELEASE=1`) that
+  passes only when every category and required case completes, verifies
+  copied bytes with an independent backend read, and keeps all data and
+  failed Finder operations until their custody is reconciled. A failed
+  snappiness measurement during drain still waits for its Finder copy and
+  checks it before reporting the failure.
+
 ### Upgrading the farm
 
 Stop all old farm workers before starting new ones, and do not run v0.5.0 and
@@ -177,6 +353,13 @@ new workers against the same Redis at the same time:
 - Jobs queued by a v0.5.0 worker or Manager are not counted as new, so a new
   worker finds them only by walking the queue, which can take minutes behind
   a large backlog meant for another GPU.
+- The return of a legacy job a live worker never started runs in the
+  workers' recovery scan, so it covers an un-upgraded worker's claims too, as
+  long as one upgraded worker is running: its claims carry no claim time, so
+  the minute counts from when an upgraded worker first sees the claim, up to
+  15 seconds later. An un-upgraded worker that tries to start such a job after
+  it was put back is refused the start and stops, as when a reaper recovers its
+  job today, and its service manager restarts it.
 
 ## 0.5.0 — general release (build 37)
 

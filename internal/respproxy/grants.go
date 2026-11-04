@@ -405,7 +405,7 @@ func (e *LeaseEngine) grantCheck(p Principal, u *Unit, f *unitFacts) *Denial {
 	if f.dirStatOnly() {
 		return nil
 	}
-	locs, pd := e.placeUnit(u, f, placeGrant)
+	locs, pd := e.placeUnit(p, u, f, placeGrant)
 	if pd != nil {
 		return deny(pd.Proj, "write the proxy cannot place: "+pd.Detail)
 	}

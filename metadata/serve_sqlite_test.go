@@ -2,6 +2,7 @@ package metadata
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 )
@@ -157,39 +158,73 @@ func TestListChildrenPage_OverLimit(t *testing.T) {
 }
 
 // TestListChildrenPage_BigDirUnderBudget is the veto-mitigation REGRESSION GATE
-// (serving-layer-decision.md §Item 1): a realistic READDIR page against a
-// 10,774-child dir must stay well under the RPC budget. This guards the
-// composite idx_parent_name index — if that index is dropped (or the query
-// changes so the planner reverts to a TEMP B-TREE ORDER BY that sorts all
-// children per page), the per-page cost jumps ~7x (measured ~2.2ms without the
-// index vs ~0.3ms with it) and this test fails. Threshold is deliberately
-// loose (2ms) so it does not flake on a busy CI box while still catching the
-// index-loss regression (which lands well above 2ms on this dir size).
+// (serving-layer-decision.md §Item 1): a READDIR page against a 10,774-child
+// dir must be an O(limit) seek on the composite idx_parent_name index. If that
+// index is dropped, or the query changes so the planner reverts to a TEMP
+// B-TREE ORDER BY that sorts all children per page, each page becomes
+// O(all-children) (measured ~2.2ms without the index vs ~0.3ms with it).
+//
+// The gate asserts the cause, the query plan, rather than a wall-clock budget:
+// a fixed 2ms budget measured 6.2ms with the index present on a loaded -race CI
+// host, while the plan is a deterministic property of the schema and the SQL.
+// The negative control drops the index and requires the check to see the
+// regression, so the assertion cannot pass vacuously.
 func TestListChildrenPage_BigDirUnderBudget(t *testing.T) {
 	if testing.Short() {
-		t.Skip("skipping big-dir latency gate in -short")
+		t.Skip("skipping big-dir page gate in -short")
 	}
 	const children = 10774
 	const pageSize = 256 // realistic per-RPC READDIR page
 	s := seedStore(t, "DCIM", children)
 	defer s.Close()
 
-	// Warm the page cache + prepared stmt.
-	if _, _, err := s.ListChildrenPage("DCIM", "", pageSize); err != nil {
-		t.Fatalf("warm: %v", err)
+	if problem := childrenPagePlanProblem(t, s); problem != "" {
+		t.Fatalf("READDIR page is not an O(limit) idx_parent_name seek: %s", problem)
 	}
-	const iters = 200
-	start := time.Now()
-	for i := 0; i < iters; i++ {
-		if _, _, err := s.ListChildrenPage("DCIM", "file_005000.mov", pageSize); err != nil {
-			t.Fatalf("page: %v", err)
+	page, next, err := s.ListChildrenPage("DCIM", "file_005000.mov", pageSize)
+	if err != nil {
+		t.Fatalf("page: %v", err)
+	}
+	if len(page) != pageSize || page[0].Name != "file_005001.mov" || next != page[pageSize-1].Name {
+		t.Fatalf("page from file_005000.mov: %d rows, first %q, next %q", len(page), page[0].Name, next)
+	}
+
+	if _, err := s.db.Exec(`DROP INDEX idx_parent_name`); err != nil {
+		t.Fatalf("drop idx_parent_name: %v", err)
+	}
+	if problem := childrenPagePlanProblem(t, s); problem == "" {
+		t.Fatal("plan check passed with idx_parent_name dropped; it cannot detect the regression it guards")
+	}
+}
+
+// childrenPagePlanProblem returns why the ListChildrenPage query plan is not a
+// bounded index seek, or "" when it is.
+func childrenPagePlanProblem(t *testing.T, s *Store) string {
+	t.Helper()
+	rows, err := s.db.Query(`EXPLAIN QUERY PLAN `+childrenPageSQL, "DCIM", "file_005000.mov", 256)
+	if err != nil {
+		t.Fatalf("explain: %v", err)
+	}
+	defer rows.Close()
+	var plan []string
+	for rows.Next() {
+		var id, parent, notused int
+		var detail string
+		if err := rows.Scan(&id, &parent, &notused, &detail); err != nil {
+			t.Fatalf("explain scan: %v", err)
 		}
+		plan = append(plan, detail)
 	}
-	perPage := time.Since(start) / iters
-	t.Logf("big-dir (%d children) %d-row page: %v/page", children, pageSize, perPage)
-	budget := 2 * time.Millisecond * bigDirPageBudgetMultiplier
-	if perPage > budget {
-		t.Fatalf("page latency %v exceeds %v budget — idx_parent_name likely missing "+
-			"(temp-b-tree ORDER BY sorts all children per page)", perPage, budget)
+	if err := rows.Err(); err != nil {
+		t.Fatalf("explain rows: %v", err)
 	}
+	joined := strings.Join(plan, "; ")
+	t.Logf("ListChildrenPage plan: %s", joined)
+	switch {
+	case strings.Contains(joined, "TEMP B-TREE"):
+		return "plan sorts the whole child set per page: " + joined
+	case !strings.Contains(joined, "USING INDEX idx_parent_name (parent_path=? AND name>?)"):
+		return "plan does not seek idx_parent_name on (parent_path, name): " + joined
+	}
+	return ""
 }

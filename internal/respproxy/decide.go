@@ -469,7 +469,7 @@ func (e *LeaseEngine) Decide(p Principal, u *Unit) Verdict {
 	if bypass {
 		pm = placeBypass
 	}
-	locs, pd := e.placeUnit(u, f, pm)
+	locs, pd := e.placeUnit(p, u, f, pm)
 	if pd != nil {
 		if pd.Reason == ReasonXProject && pd.Proj != 0 {
 			hd := e.leaseDenial(ReasonXProject, pd.Proj)

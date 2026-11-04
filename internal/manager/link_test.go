@@ -25,6 +25,8 @@ func fakeHeadscale(t *testing.T, dir string, stdout string) string {
 		"case \" $* \" in\n" +
 		"  *\" nodes list-routes \"*) cat " + dir + "/routes.txt; exit 0 ;;\n" +
 		"  *\" nodes list \"*) cat " + dir + "/nodes.json; exit 0 ;;\n" +
+		"  *\" users list \"*) if test -f " + dir + "/users.json; then cat " + dir + "/users.json; else echo '[{\"id\": 1, \"name\": \"jm\"}]'; fi; exit 0 ;;\n" +
+		"  *\" nodes tag \"*) test ! -f " + dir + "/nodes-tagged.json || cp " + dir + "/nodes-tagged.json " + dir + "/nodes.json; exit 0 ;;\n" +
 		"  *\" nodes approve-routes \"*) test ! -f " + dir + "/routes-approved.txt || cp " + dir + "/routes-approved.txt " + dir + "/routes.txt; echo node updated; exit 0 ;;\n" +
 		"esac\n" +
 		"echo " + stdout + "\n"
@@ -197,10 +199,16 @@ func TestSanitizeDeviceName(t *testing.T) {
 	}
 }
 
+// Test node keys: nodeKeyNAS is the NAS node's, nodeKeyMac a Mac's.
+const (
+	nodeKeyNAS = "nodekey:0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a"
+	nodeKeyMac = "nodekey:0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b"
+)
+
 const twoNodesJSON = `[
-  {"id": 3, "name": "juicemount-nas", "given_name": "juicemount-nas",
+  {"id": 3, "node_key": "` + nodeKeyNAS + `", "name": "juicemount-nas", "given_name": "juicemount-nas",
    "available_routes": ["192.168.0.0/24"], "approved_routes": []},
-  {"id": 4, "name": "mac.fqdn.example.com", "given_name": "mac",
+  {"id": 4, "node_key": "` + nodeKeyMac + `", "name": "mac.fqdn.example.com", "given_name": "mac",
    "available_routes": [], "approved_routes": ["10.0.0.0/8"]}
 ]`
 
@@ -220,29 +228,24 @@ func TestParseHSNodes(t *testing.T) {
 	}
 }
 
-func TestNodeForHost(t *testing.T) {
-	nodes, _ := parseHSNodes([]byte(twoNodesJSON))
-	if n := nodeForHost(nodes, "juicemount-nas"); n == nil || n.ID != 3 {
-		t.Errorf("given_name match failed: %+v", n)
+// TestNodeByKeyIgnoresNames: the NAS node is the node holding its key. A
+// node that registered first under the NAS node's name is not it.
+func TestNodeByKeyIgnoresNames(t *testing.T) {
+	nodes, _ := parseHSNodes([]byte(`[
+	  {"id": 1, "node_key": "` + nodeKeyMac + `", "name": "juicemount-nas", "given_name": "juicemount-nas"},
+	  {"id": 2, "node_key": "` + nodeKeyNAS + `", "name": "juicemount-nas", "given_name": "juicemount-nas-1"}
+	]`))
+	if n := nodeByKey(nodes, nodeKeyNAS); n == nil || n.ID != 2 {
+		t.Errorf("nodeByKey(NAS) = %+v, want node 2", n)
 	}
-	if n := nodeForHost(nodes, "mac"); n == nil || n.ID != 4 {
-		t.Errorf("bare-given match failed: %+v", n)
-	}
-	// headscale's name field carries the fqdn form; prefix match must find it
-	if n := nodeForHost(nodes, "mac.fqdn.example.com"); n == nil || n.ID != 4 {
-		t.Errorf("fqdn name match failed: %+v", n)
-	}
-	if nodeForHost(nodes, "nope") != nil {
-		t.Error("unknown host should return nil")
-	}
-	if nodeForHost(nodes, "") != nil {
-		t.Error("empty host should return nil")
+	if nodeByKey(nodes, "nodekey:ffff") != nil || nodeByKey(nodes, "") != nil {
+		t.Error("an unknown or empty key matched a node")
 	}
 }
 
 func TestPendingApprovalAndMerge(t *testing.T) {
 	nodes, _ := parseHSNodes([]byte(twoNodesJSON))
-	nas := nodeForHost(nodes, "juicemount-nas")
+	nas := nodeByKey(nodes, nodeKeyNAS)
 
 	got := pendingApproval(nas, []string{"192.168.0.0/24"})
 	if len(got) != 1 || got[0] != "192.168.0.0/24" {
@@ -253,7 +256,7 @@ func TestPendingApprovalAndMerge(t *testing.T) {
 		t.Errorf("pendingApproval for un-advertised prefix = %v, want empty", got)
 	}
 	// Already approved → idempotent no-op.
-	mac := nodeForHost(nodes, "mac")
+	mac := nodeByKey(nodes, nodeKeyMac)
 	if got := pendingApproval(mac, []string{"10.0.0.0/8"}); len(got) != 0 {
 		t.Errorf("pendingApproval for approved prefix = %v, want empty", got)
 	}
@@ -294,7 +297,7 @@ func TestLinkRouteReadyRequiresRouteToBeActivelyServed(t *testing.T) {
 	bin := fakeHeadscale(t, dir, "unused")
 	setLinkEnv(t, bin, dir+"/config.yaml")
 	if err := os.WriteFile(filepath.Join(dir, "nodes.json"), []byte(`[
-      {"id": 3, "name": "juicemount-nas", "given_name": "juicemount-nas",
+      {"id": 3, "node_key": "`+nodeKeyNAS+`", "name": "juicemount-nas", "given_name": "juicemount-nas",
        "available_routes": ["192.168.0.0/24"], "approved_routes": ["192.168.0.0/24"]}
     ]`), 0o644); err != nil {
 		t.Fatal(err)
@@ -304,7 +307,7 @@ func TestLinkRouteReadyRequiresRouteToBeActivelyServed(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "routes.txt"), []byte(approvedButOffline), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if ready, err := linkRouteReady(bin, dir+"/config.yaml", "juicemount-nas", "192.168.0.0/24"); ready || err == nil || !strings.Contains(err.Error(), "not serving") {
+	if ready, err := linkRouteReady(bin, dir+"/config.yaml", nodeKeyNAS, "192.168.0.0/24"); ready || err == nil || !strings.Contains(err.Error(), "not serving") {
 		t.Fatalf("offline route readiness = (%v, %v), want false actionable error", ready, err)
 	}
 	serving := "ID | Hostname | Approved | Available | Serving (Primary)\n" +
@@ -312,8 +315,56 @@ func TestLinkRouteReadyRequiresRouteToBeActivelyServed(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "routes.txt"), []byte(serving), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if ready, err := linkRouteReady(bin, dir+"/config.yaml", "juicemount-nas", "192.168.0.0/24"); !ready || err != nil {
+	if ready, err := linkRouteReady(bin, dir+"/config.yaml", nodeKeyNAS, "192.168.0.0/24"); !ready || err != nil {
 		t.Fatalf("serving route readiness = (%v, %v), want true nil", ready, err)
+	}
+	// No embedded NAS node: the operator's router may be any node.
+	if ready, err := linkRouteReady(bin, dir+"/config.yaml", "", "192.168.0.0/24"); !ready || err != nil {
+		t.Fatalf("operator router readiness = (%v, %v), want true nil", ready, err)
+	}
+	if ready, err := linkRouteReady(bin, dir+"/config.yaml", "", "10.9.0.0/16"); ready || err == nil {
+		t.Fatalf("unserved operator route readiness = (%v, %v), want false", ready, err)
+	}
+}
+
+// TestLinkRouteReadyRefusesAnotherAdvertiser: a node registered under the
+// NAS node's name, listed first, advertising the NAS prefix (or a narrower
+// route inside it), is neither taken for the NAS node nor ignored: the route
+// is not ready and the status names it.
+func TestLinkRouteReadyRefusesAnotherAdvertiser(t *testing.T) {
+	dir := t.TempDir()
+	bin := fakeHeadscale(t, dir, "unused")
+	write := func(name, body string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("nodes.json", `[
+      {"id": 1, "node_key": "`+nodeKeyMac+`", "name": "juicemount-nas", "tags": ["tag:jm-mac"]},
+      {"id": 2, "node_key": "`+nodeKeyNAS+`", "name": "juicemount-nas"}
+    ]`)
+	const header = "ID | Hostname | Approved | Available | Serving (Primary)\n"
+	nas := "2 | juicemount-nas | 192.0.2.0/24 | 192.0.2.0/24 | 192.0.2.0/24\n"
+	for _, imp := range []string{
+		"1 | juicemount-nas |  | 192.0.2.0/24 | \n",
+		"1 | juicemount-nas | 192.0.2.7/32 | 192.0.2.7/32 | 192.0.2.7/32\n",
+	} {
+		write("routes.txt", header+imp+nas)
+		ready, err := linkRouteReady(bin, filepath.Join(dir, "config.yaml"), nodeKeyNAS, "192.0.2.0/24")
+		if ready || err == nil || !strings.Contains(err.Error(), "node 1 (\"juicemount-nas\") advertises") {
+			t.Fatalf("impostor row %q: readiness = (%v, %v)", imp, ready, err)
+		}
+	}
+	// A default route (an exit node) and an unrelated prefix are not the NAS.
+	write("routes.txt", header+"1 | juicemount-nas |  | 0.0.0.0/0, 10.1.0.0/16 | \n"+nas)
+	if ready, err := linkRouteReady(bin, filepath.Join(dir, "config.yaml"), nodeKeyNAS, "192.0.2.0/24"); !ready || err != nil {
+		t.Fatalf("unrelated routes: readiness = (%v, %v)", ready, err)
+	}
+	// The NAS node itself, registered second, is the one checked.
+	write("routes.txt", header+"1 | juicemount-nas | 192.0.2.0/24 | 192.0.2.0/24 | 192.0.2.0/24\n2 | juicemount-nas |  | 192.0.2.0/24 | \n")
+	if ready, err := linkRouteReady(bin, filepath.Join(dir, "config.yaml"), nodeKeyNAS, "192.0.2.0/24"); ready || err == nil || !strings.Contains(err.Error(), "not approved") {
+		t.Fatalf("impostor approved, NAS not: readiness = (%v, %v)", ready, err)
 	}
 }
 
@@ -326,7 +377,8 @@ func TestApproveSubnetRoutesEndToEnd(t *testing.T) {
 	setLinkEnv(t, bin, dir+"/config.yaml")
 	// operator had already approved one extra route; merge must preserve it
 	if err := os.WriteFile(filepath.Join(dir, "nodes.json"), []byte(`[
-      {"id": 3, "name": "juicemount-nas", "given_name": "juicemount-nas",
+      {"id": 2, "node_key": "`+nodeKeyMac+`", "name": "juicemount-nas", "given_name": "juicemount-nas"},
+      {"id": 3, "node_key": "`+nodeKeyNAS+`", "name": "juicemount-nas", "given_name": "juicemount-nas-1",
        "available_routes": ["192.168.0.0/24"], "approved_routes": ["172.16.5.0/24"]}
     ]`), 0o644); err != nil {
 		t.Fatal(err)
@@ -342,7 +394,7 @@ func TestApproveSubnetRoutesEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := ApproveSubnetRoutes(bin, dir+"/config.yaml", "juicemount-nas", []string{"192.168.0.0/24"}); err != nil {
+	if err := ApproveSubnetRoutes(bin, dir+"/config.yaml", nodeKeyNAS, []string{"192.168.0.0/24"}); err != nil {
 		t.Fatalf("ApproveSubnetRoutes: %v", err)
 	}
 	argv, _ := os.ReadFile(filepath.Join(dir, "argv.log"))
@@ -354,9 +406,19 @@ func TestApproveSubnetRoutesEndToEnd(t *testing.T) {
 	if !strings.Contains(s, "172.16.5.0/24") {
 		t.Errorf("merge dropped pre-existing approved route, argv log:\n%s", s)
 	}
+	if strings.Contains(s, "--identifier 2") {
+		t.Errorf("approved on node 2, which only shares the NAS node's name, argv log:\n%s", s)
+	}
 
 	// Unknown node → retriable error, not a silent success.
-	if err := ApproveSubnetRoutes(bin, dir+"/config.yaml", "ghost", []string{"192.168.0.0/24"}); err == nil {
+	if err := ApproveSubnetRoutes(bin, dir+"/config.yaml", "nodekey:ffff", []string{"192.168.0.0/24"}); err == nil {
 		t.Error("expected error for unregistered node")
+	}
+}
+
+func TestLastNonEmptyLineUsesFinalCLIValue(t *testing.T) {
+	output := "2026-08-25T12:00:00Z INFO minting key\nfirst unrelated line\ntskey-auth-final"
+	if got := lastNonEmptyLine(output); got != "tskey-auth-final" {
+		t.Errorf("lastNonEmptyLine = %q, want final key", got)
 	}
 }

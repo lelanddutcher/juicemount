@@ -4,7 +4,6 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
-	"time"
 )
 
 func TestCapabilityProbeRequiresSingleCompleteFrameAndSuccessfulJoin(t *testing.T) {
@@ -26,7 +25,7 @@ func TestCapabilityProbeRequiresSingleCompleteFrameAndSuccessfulJoin(t *testing.
 			if err != nil {
 				t.Fatal(err)
 			}
-			err = p.Wait(time.Second)
+			err = p.Wait(helperBound)
 			if (err == nil) != tc.want || !p.Settled() {
 				t.Fatalf("capability result=%v settled=%t", err, p.Settled())
 			}

@@ -104,6 +104,24 @@ type Unit struct {
 	// none). A Mac of a person whose access is "granted" may write only
 	// inside that person's grants; Decide checks it in every mode.
 	Person *Person
+	// TrashAlloc is the reply of this connection's latest INCR nextTrash
+	// since its previous EXEC, in this DB (0 = none). juicefs creates an
+	// hourly trash directory as inode TrashInode+TrashAlloc in the txn
+	// that follows that INCR (redis.go doMknod), so it is the only trash
+	// inode a non-trusted principal's txn may create.
+	TrashAlloc uint64
+
+	// inodeOwner, set by the proxy, names the principal whose bare INCRBY
+	// nextinode batch held inode n (Guard.inodes); ok is false for a number
+	// the proxy never handed out.
+	inodeOwner func(n uint64) (owner string, ok bool, err error)
+	// inodeMark, set by the proxy, returns the highest inode number handed
+	// out before the proxy began recording batches (InodeMarkKey).
+	inodeMark func() (uint64, error)
+	// upstreamID returns the CLIENT ID of the connection's upstream Redis
+	// connection (0 = not known yet). Its reply precedes every later reply on
+	// that connection, so it is known once beforeSide has returned.
+	upstreamID func() uint64
 
 	// beforeSide, set by the proxy, makes the connection's buffered WATCH
 	// reach Redis (and waits for its +OK) before the guard's first side read.

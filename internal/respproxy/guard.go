@@ -2,6 +2,7 @@ package respproxy
 
 import (
 	"bytes"
+	"errors"
 	"math"
 	"strconv"
 	"strings"
@@ -99,12 +100,19 @@ type SessionStore interface {
 // validatePushes admits a self-allocated slice only while its bit is clear
 // (review H8B-L1d #3/#5).
 type SliceStore interface {
-	Owner(id uint64) (owner string, ok bool, err error)
-	Record(lo, hi uint64, owner string) error // ids lo..hi inclusive
+	IDOwners
 	Used(id uint64) (bool, error)
 	// MarkUsed records ids as used; persist also writes Redis (when the
 	// bit was not already set by the unit's own MULTI).
 	MarkUsed(ids []uint64, persist bool) error
+}
+
+// IDOwners records which principal an allocator handed each id to, from
+// the reply of that principal's own bare INCRBY (nextchunk: slice ids;
+// nextinode: inode numbers).
+type IDOwners interface {
+	Owner(id uint64) (owner string, ok bool, err error)
+	Record(lo, hi uint64, owner string) error // ids lo..hi inclusive
 }
 
 // UsedBitKey / UsedBitOffset locate slice id's used bit: one 128 KiB bitmap
@@ -112,7 +120,7 @@ type SliceStore interface {
 func UsedBitKey(id uint64) string    { return "jmlease:v1:sused:" + strconv.FormatUint(id>>20, 10) }
 func UsedBitOffset(id uint64) uint64 { return id & (1<<20 - 1) }
 
-// MemSliceStore is an in-memory SliceStore (tests).
+// MemSliceStore is an in-memory SliceStore, and IDOwners (tests).
 type MemSliceStore struct {
 	mu     sync.Mutex
 	ranges []sliceRange
@@ -210,6 +218,10 @@ type Guard struct {
 	sessions SessionStore
 	chunks   ChunkReader
 	slices   SliceStore
+	// inodes: who received each inode number (bare INCRBY nextinode of
+	// juicefs's whole inodeBatch). Decide admits a new inode only from its
+	// creator's own batch (newInodeGate).
+	inodes IDOwners
 
 	mu sync.Mutex
 	// zeroRefs: sliceRef fields a principal set to "0" inside its own,
@@ -244,8 +256,14 @@ type Guard struct {
 	// owner), else refused and the field is left for bg gc.
 	dropped map[string]string
 
+	// side answers the guard's point reads (a trash-root field, Redis
+	// TIME). nil refuses whatever needs one (fail closed).
+	side sideDoer
+
 	// afterSideRead is a test hook run right after a side read.
 	afterSideRead func()
+	// logf, when set, reports writes admitted on a fallback.
+	logf func(format string, args ...any)
 }
 
 // NewGuard returns a guard. chunks may be nil (then compaction-style
@@ -254,7 +272,7 @@ func NewGuard(sessions SessionStore, chunks ChunkReader) *Guard {
 	if sessions == nil {
 		sessions = NewMemSessionStore()
 	}
-	return &Guard{sessions: sessions, chunks: chunks, slices: &MemSliceStore{}, zeroRefs: map[string]zeroRef{},
+	return &Guard{sessions: sessions, chunks: chunks, slices: &MemSliceStore{}, inodes: &MemSliceStore{}, zeroRefs: map[string]zeroRef{},
 		pendingDel: map[string]string{}, ctrCache: map[string]*counterCache{}, rate: map[string]*rateWindow{},
 		dropped: map[string]string{}}
 }
@@ -345,8 +363,10 @@ func serverPrincipal(p Principal) bool {
 }
 
 // Allocation reports the allocator a bare unit advances and by how much
-// (INCR/INCRBY nextsession or nextchunk), so the proxy can record from the
-// reply who received which ids. n == 0 means none.
+// (INCR/INCRBY nextsession, nextchunk, nextTrash, or nextinode by exactly
+// juicefs's inodeBatch), so the proxy can record from the reply who
+// received which ids. n == 0 means none. A smaller nextinode step grants no
+// inode numbers, so the owner table grows by at most one entry per batch.
 func Allocation(u *Unit) (counter string, n int64) {
 	if u.Kind != UnitBare || len(u.Cmds) != 1 {
 		return "", 0
@@ -356,8 +376,12 @@ func Allocation(u *Unit) (counter string, n int64) {
 		return "", 0
 	}
 	switch k := c.Info.Keys[0].Shape; k {
-	case "nextsession", "nextchunk":
+	case "nextsession", "nextchunk", "nextTrash":
 		if d, ok := counterDelta(c); ok && d > 0 && d <= maxAlloc[k] {
+			return k, d
+		}
+	case "nextinode":
+		if d, ok := counterDelta(c); ok && d == maxAlloc[k] {
 			return k, d
 		}
 	}
@@ -512,6 +536,12 @@ func (g *Guard) counterGate(p Principal, u *Unit, c Cmd, w KeyWrite) *Denial {
 		if (name == "nextsession" || name == "nextchunk") && u.Kind != UnitBare {
 			return deny(ReasonAdminOnly, name+" is allocated by a bare INCRBY so the proxy can record who received the ids")
 		}
+		// juicefs takes inodes only as allocateInodes's bare INCRBY of
+		// inodeBatch (base.go:1169), which the proxy records with its owner;
+		// so every number above the recording mark has a recorded owner.
+		if name == "nextinode" && p.Kind != KindBG && (u.Kind != UnitBare || n != maxAlloc["nextinode"]) {
+			return deny(ReasonAdminOnly, "nextinode is allocated by a bare INCRBY of exactly 1024")
+		}
 		// juicefs always takes exactly sliceIdBatch; smaller steps would
 		// grow the slice-owner table by one entry each (review H8B-L1c #3).
 		if name == "nextchunk" && n != maxAlloc["nextchunk"] {
@@ -617,6 +647,20 @@ func (g *Guard) Check(p Principal, u *Unit) (*Denial, []guardEffect) {
 			trashRootHSet = true
 		}
 	}
+	// admin and bg pass KCBG anyway; for every other principal a txn that
+	// writes the trash root must be exactly checkTrash's mknod.
+	trusted := admin || p.Kind == KindBG
+	var hourly uint64
+	if u.Kind == UnitTxn && !nonTrashDentry && trashRootHSet && !trusted {
+		if p.Kind == KindWebDAV {
+			return deny(ReasonPrincipalReadonly, "trash directory create"), nil
+		}
+		n, d := g.hourlyTrashCreate(u)
+		if d != nil {
+			return d, nil
+		}
+		hourly = n
+	}
 	for i := range u.Writes {
 		w := &u.Writes[i]
 		if !w.Key.Trash || (w.Key.Group != "inode" && w.Key.Group != "dentry") {
@@ -624,16 +668,23 @@ func (g *Guard) Check(p Principal, u *Unit) (*Denial, []guardEffect) {
 		}
 		name := u.Cmds[w.Cmd].Info.Name
 		switch {
+		case nonTrashDentry && w.Key.Shape == ShapeDentry && w.Key.Ino == TrashInode:
+			// The trash root holds only checkTrash's hourly directories
+			// (hourlyTrashCreate); no project dentry anchors a write to it.
+			w.Class = KCBG
 		case nonTrashDentry && u.Kind == UnitTxn:
 			// unlink / rename-replace into trash, or restore out of it:
 			// anchored by the non-trash dentry in the same txn (L2).
 			w.Class = KCProject
-		case u.Kind == UnitBare && name == "SETNX" && w.Key.Shape == ShapeInode:
+		case u.Kind == UnitBare && name == "SETNX" && w.Key.Shape == ShapeInode && w.Key.Ino == TrashInode:
 			w.Class = KCTrashCreate // format / first trash use (redis.go:326)
-		case u.Kind == UnitTxn && trashRootHSet &&
+		case trusted && u.Kind == UnitTxn && trashRootHSet &&
 			((w.Key.Shape == ShapeDentry && w.Key.Ino == TrashInode && isHSet(name)) ||
 				(w.Key.Shape == ShapeInode && (name == "SET" || name == "SETNX"))):
-			w.Class = KCTrashCreate // checkTrash's hourly directory mknod (base.go:2488)
+			w.Class = KCTrashCreate
+		case hourly != 0 && ((w.Key.Shape == ShapeDentry && w.Key.Ino == TrashInode) ||
+			(w.Key.Shape == ShapeInode && w.Key.Ino == hourly)):
+			w.Class = KCTrashCreate // checkTrash's hourly directory mknod (base.go:2488), checked above
 		default:
 			w.Class = KCBG // trash cleanup
 		}
@@ -728,7 +779,11 @@ func (g *Guard) Check(p Principal, u *Unit) (*Denial, []guardEffect) {
 	for _, w := range u.Writes {
 		c := u.Cmds[w.Cmd]
 		switch w.Class {
-		case KCTrashCreate, KCOwnRecord:
+		case KCOwnRecord:
+		case KCTrashCreate:
+			if p.Kind == KindWebDAV {
+				return deny(ReasonPrincipalReadonly, c.Info.Name+" "+w.Raw), nil
+			}
 		case KCCounter:
 			if !admin {
 				if d := g.counterGate(p, u, c, w); d != nil {
@@ -736,7 +791,7 @@ func (g *Guard) Check(p Principal, u *Unit) (*Denial, []guardEffect) {
 				}
 			}
 		case KCSession:
-			e, d := g.sessionGate(p, c, w)
+			e, d := g.sessionGate(p, u, c, w)
 			if d != nil {
 				return d, nil
 			}
@@ -1448,13 +1503,15 @@ func isHSet(name string) bool { return name == "HSET" || name == "HSETNX" || nam
 // CUTOVER (runbook, lane L5): a session a mount registered BEFORE the proxy
 // existed has no owner record, so every heartbeat or session write from it
 // is refused (BG_ONLY), as is any slice from a pre-proxy nextchunk batch.
+// (An inode batch taken before the proxy recorded batches stays usable:
+// newInodeGate.)
 // Every mount must remount through the proxy at cutover: restart the
 // JuiceMount app on every Mac (and the server's juicefs mounts) in the same
 // step that moves port 30179 to the proxy. Removing or rewriting another principal's session is
 // the bg principal's CleanStaleSessions job; a sid with no recorded owner is
 // bg-only too (fail closed, also after a proxy restart). Whole-key writes to
 // the session indexes (DEL allSessions, ...) are bg-only.
-func (g *Guard) sessionGate(p Principal, c Cmd, w KeyWrite) ([]guardEffect, *Denial) {
+func (g *Guard) sessionGate(p Principal, u *Unit, c Cmd, w KeyWrite) ([]guardEffect, *Denial) {
 	name := c.Info.Name
 	sids := sessionIDs(name, w.Key, c.Args)
 	var effects []guardEffect
@@ -1486,7 +1543,111 @@ func (g *Guard) sessionGate(p Principal, c Cmd, w KeyWrite) ([]guardEffect, *Den
 			return nil, deny(ReasonBGOnly, "session "+strconv.FormatUint(sid, 10)+" belongs to "+owner)
 		}
 	}
+	switch {
+	case !global:
+		if d := sessionSetGate(u, c, w); d != nil {
+			return nil, d
+		}
+	case name == "ZADD":
+		if d := g.heartbeatGate(u, c, w); d != nil {
+			return nil, d
+		}
+	}
 	return effects, nil
+}
+
+// sessionSetGate: bg's CleanStaleSessions acts on a stale session's sets
+// with bg's rights. It deletes every inode in session<sid> (the sustained
+// set; doDeleteSustainedInode queues its data for deletion whatever its
+// link count) and drops this session's owner fields from every hash named
+// in locked<sid> (doCleanStaleSession). So a principal may add a member only
+// the way juicefs does, in the txn that writes it: an open file's unlink or
+// rename-over sets i<ino> and adds <ino> (redis.go doUnlink, doRename); a
+// lock sets lockf<ino>/lockp<ino> and adds that key (redis_lock.go). Each
+// sustained inode joins Unit.RefInodes, so Decide checks the principal may
+// write it. Members may be removed; nothing else writes these sets.
+func sessionSetGate(u *Unit, c Cmd, w KeyWrite) *Denial {
+	switch c.Info.Name {
+	case "SREM":
+		return nil
+	case "SADD":
+	default:
+		return deny(ReasonBGOnly, c.Info.Name+" "+w.Raw)
+	}
+	if u.Kind != UnitTxn || len(c.Args) < 3 {
+		return deny(ReasonBGOnly, "SADD "+w.Raw+" outside the txn that writes its members")
+	}
+	for _, m := range c.Args[2:] {
+		n, ok := sessionMemberWritten(u, w.Key.Shape, string(m))
+		if !ok {
+			return deny(ReasonBGOnly, "SADD "+w.Raw+" names "+sanitizeToken(string(m))+", which this txn does not write")
+		}
+		if w.Key.Shape == ShapeSession {
+			u.RefInodes = append(u.RefInodes, n)
+		}
+	}
+	return nil
+}
+
+// sessionMemberWritten reports whether set member m of a session<sid>
+// (shape ShapeSession: an inode) or locked<sid> (a lock key) set is written
+// by u as juicefs writes it alongside the SADD, and returns the inode.
+func sessionMemberWritten(u *Unit, shape, m string) (uint64, bool) {
+	if shape == ShapeSession {
+		n, ok := digits(m)
+		if !ok || isTrashIno(n) {
+			return 0, false
+		}
+		for _, x := range u.Writes {
+			if x.Key.Shape == ShapeInode && x.Key.Ino == n && u.Cmds[x.Cmd].Info.Name == "SET" {
+				return n, true
+			}
+		}
+		return 0, false
+	}
+	k := ParseKey(m)
+	if (k.Shape != ShapeFlock && k.Shape != ShapePlock) || k.Trash {
+		return 0, false
+	}
+	for _, x := range u.Writes {
+		if x.Raw == m && u.Cmds[x.Cmd].Info.Name == "HSET" {
+			return k.Ino, true
+		}
+	}
+	return 0, false
+}
+
+// heartbeatGate: juicefs writes its own allSessions score only as a bare
+// ZADD allSessions <now + 5 x heartbeat> <sid> (doNewSession,
+// doRefreshSession; base.go expireTime), and bg's CleanStaleSessions cleans
+// every session whose score its clock has passed. A score at or before
+// Redis TIME, or below the stored one, would make a live session look stale
+// before its last heartbeat says it is. So the score must be ahead of Redis
+// TIME, and the proxy forwards it as ZADD GT, which never lowers a stored
+// score. If TIME cannot be read, the heartbeat is still forwarded as ZADD
+// GT (logged): GT alone never moves a stored expiry earlier, and refusing it
+// would let a live session's score lapse, after which bg's cleanup would
+// treat that session as stale. The legacy sessions index is bg's alone
+// (juicefs only removes from it).
+func (g *Guard) heartbeatGate(u *Unit, c Cmd, w KeyWrite) *Denial {
+	if w.Key.Shape != "allSessions" || u.Kind != UnitBare || len(c.Args) != 4 {
+		return deny(ReasonBGOnly, "ZADD "+w.Raw+" is not a session heartbeat")
+	}
+	score, ok := RedisInt(c.Args[2]) // go-redis sends juicefs's whole-second float64 as digits
+	if !ok {
+		return deny(ReasonBGOnly, "heartbeat score "+sanitizeToken(string(c.Args[2]))+" is not whole seconds")
+	}
+	now, err := g.redisNow(u.DB)
+	switch {
+	case err != nil:
+		if g.logf != nil {
+			g.logf("respproxy: heartbeat of session %s admitted as ZADD GT without the server clock: %v", sanitizeToken(string(c.Args[3])), err)
+		}
+	case score <= now:
+		return deny(ReasonBGOnly, "heartbeat score is not ahead of the server clock")
+	}
+	u.rewrite = strArgs("ZADD", w.Raw, "GT", string(c.Args[2]), string(c.Args[3]))
+	return nil
 }
 
 // linkBenchOK admits bridge/cbridge.go's link benchmark: SET with EX<=60 or
@@ -1533,4 +1694,187 @@ func safeConfigGet(args [][]byte) bool {
 		}
 	}
 	return true
+}
+
+// trashHourLayout is the name checkTrash gives an hourly trash directory
+// (base.go: time.Now().UTC().Format("2006-01-02-15")); CleanupTrashBefore
+// parses it back to decide which hours have expired.
+const trashHourLayout = "2006-01-02-15"
+
+// trashHourSkew bounds how far the hour a txn names may be from Redis
+// TIME. bg expires an hour trash-days (at least one day) after it, so an
+// hour within this bound is never expired as soon as it is created, nor
+// kept much past its time. The writer's clock names the hour: NTP-synced
+// clocks differ by far less, and a mount whose clock runs more than five
+// heartbeats (60 s by default) behind Redis has its heartbeats refused
+// already (heartbeatGate), so an hour leaves ample room for skew.
+const trashHourSkew = time.Hour
+
+// hourlyTrashCreate checks a non-trusted principal's txn that writes the
+// trash root d<TrashInode> without a non-trash dentry. The only such juicefs
+// txn is checkTrash's mknod of a new hourly directory (redis.go doMknod with
+// parent TrashInode): one HSET of a field named like trashHourLayout, for an
+// hour within trashHourSkew of Redis TIME, whose
+// entry is a directory at TrashInode+n, where n is what this connection's
+// INCR nextTrash returned (Unit.TrashAlloc), plus SET i<that inode> as a
+// directory under TrashInode. The field must not exist yet, read under the
+// txn's WATCH of the trash root, so an existing hour is never replaced.
+//
+// bg's trash cleanup removes everything below an expired hourly entry and
+// then the directory itself, so the entry names only a fresh, empty
+// directory this txn creates, under an hour that is not taken. It returns
+// the inode created.
+func (g *Guard) hourlyTrashCreate(u *Unit) (uint64, *Denial) {
+	refuse := func(detail string) (uint64, *Denial) {
+		return 0, deny(ReasonBGOnly, "trash root write is not a new hourly directory: "+detail)
+	}
+	var field string
+	var hourly uint64
+	var hourAt time.Time
+	roots := 0
+	for _, w := range u.Writes {
+		if w.Key.Shape != ShapeDentry || w.Key.Ino != TrashInode {
+			continue
+		}
+		roots++
+		c := u.Cmds[w.Cmd]
+		if (c.Info.Name != "HSET" && c.Info.Name != "HSETNX") || len(c.Args) != 4 {
+			return refuse(c.Info.Name + " of more or other than one field")
+		}
+		field = string(c.Args[2])
+		ts, err := time.Parse(trashHourLayout, field)
+		if err != nil || ts.Format(trashHourLayout) != field {
+			return refuse("name " + sanitizeToken(field))
+		}
+		hourAt = ts
+		typ, _ := entryType(c.Args[3])
+		ino, ok := entryInode(c.Args[3])
+		if !ok || typ != typeDir || ino <= TrashInode {
+			return refuse("the entry is not a trash directory")
+		}
+		hourly = ino
+	}
+	if roots != 1 {
+		return refuse(strconv.Itoa(roots) + " writes to the trash root")
+	}
+	if u.TrashAlloc == 0 || hourly-TrashInode != u.TrashAlloc {
+		return refuse("inode " + inoStr(hourly) + " is not the one this connection's INCR nextTrash allocated")
+	}
+	attrs := 0
+	for _, w := range u.Writes {
+		if !w.Key.HasIno || w.Key.Ino != hourly {
+			continue
+		}
+		c := u.Cmds[w.Cmd]
+		if w.Key.Shape != ShapeInode || c.Info.Name != "SET" || len(c.Args) != 3 {
+			return refuse(c.Info.Name + " " + w.Raw)
+		}
+		a, ok := parseAttr(c.Args[2])
+		if !ok || a.typ != typeDir || a.parent != TrashInode {
+			return refuse("the new inode's attr is not a directory in the trash root")
+		}
+		attrs++
+	}
+	if attrs != 1 {
+		return refuse("the txn does not create inode " + inoStr(hourly))
+	}
+	// The hour [hourAt, hourAt+1h) must overlap Redis TIME +- trashHourSkew.
+	now, err := g.redisNow(u.DB)
+	if err != nil {
+		return refuse("redis TIME: " + err.Error())
+	}
+	srv := time.Unix(now, 0)
+	if !hourAt.Add(time.Hour).After(srv.Add(-trashHourSkew)) || hourAt.After(srv.Add(trashHourSkew)) {
+		return refuse("hour " + sanitizeToken(field) + " is not the server's current hour")
+	}
+	root := "d" + inoStr(TrashInode)
+	watched := false
+	for _, k := range u.Watched {
+		watched = watched || k == root
+	}
+	if !watched || g.side == nil || u.beforeSide == nil {
+		return refuse("the trash root is not WATCHed")
+	}
+	if err := u.beforeSide(); err != nil {
+		return refuse("WATCH not confirmed before side read: " + err.Error())
+	}
+	v, err := g.side.Do(u.DB, strArgs("HEXISTS", root, field)...)
+	if err == nil {
+		err = v.Err()
+	}
+	if err != nil {
+		return refuse("side read: " + err.Error())
+	}
+	if v.Type != ':' {
+		return refuse("side read: unexpected HEXISTS reply")
+	}
+	if v.Int != 0 {
+		// The hour exists now. If another mount created it after this txn's
+		// WATCH (two mounts at the turn of the hour), Redis has already
+		// marked this transaction dirty: EXEC aborts and juicefs retries and
+		// finds the hour. Otherwise the txn would replace an existing hour.
+		if dirty, err := g.watchDirty(u); err != nil || !dirty {
+			return refuse("hour " + sanitizeToken(field) + " already exists")
+		}
+	}
+	if g.afterSideRead != nil {
+		g.afterSideRead()
+	}
+	return hourly, nil
+}
+
+// watchDirty reports whether Redis has flagged the unit's own upstream
+// connection (CLIENT LIST ID Unit.upstreamID: the id Redis gave that
+// connection, unique across every proxy on the server) with "d": a WATCHed
+// key changed, so its EXEC will fail. The flag stays set until EXEC or
+// DISCARD. Call it only after u.beforeSide.
+func (g *Guard) watchDirty(u *Unit) (bool, error) {
+	var n uint64
+	if u.upstreamID != nil {
+		n = u.upstreamID()
+	}
+	if n == 0 {
+		return false, errors.New("upstream client id not known")
+	}
+	id := strconv.FormatUint(n, 10)
+	v, err := g.side.Do(u.DB, strArgs("CLIENT", "LIST", "ID", id)...)
+	if err == nil {
+		err = v.Err()
+	}
+	if err != nil {
+		return false, err
+	}
+	want := "id=" + id
+	for _, line := range strings.Split(string(v.Str), "\n") {
+		fs := strings.Fields(line)
+		if len(fs) == 0 || fs[0] != want {
+			continue
+		}
+		for _, f := range fs {
+			if strings.HasPrefix(f, "flags=") {
+				return strings.Contains(f[len("flags="):], "d"), nil
+			}
+		}
+		return false, errors.New("upstream connection listed without flags")
+	}
+	return false, errors.New("upstream connection not listed")
+}
+
+// redisNow is Redis's clock (TIME, seconds), the one bg's stale-session
+// scan on the server compares heartbeat scores with.
+func (g *Guard) redisNow(db int) (int64, error) {
+	if g.side == nil {
+		return 0, errors.New("no side connection")
+	}
+	v, err := g.side.Do(db, strArgs("TIME")...)
+	if err == nil {
+		err = v.Err()
+	}
+	if err != nil {
+		return 0, err
+	}
+	if len(v.Elems) != 2 {
+		return 0, errors.New("TIME: unexpected reply")
+	}
+	return strconv.ParseInt(string(v.Elems[0].Str), 10, 64)
 }
