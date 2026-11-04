@@ -16,7 +16,7 @@ package version
 
 // Version is the public release version string (the git tag / notarized
 // release). Distinct from the wire contract_version (see internal/cplane).
-var Version = "0.5.0"
+var Version = "0.5.1"
 
 // Commit is the full source revision used to build the artifact. Development
 // builds retain "dev"; release builds must inject the exact git SHA.

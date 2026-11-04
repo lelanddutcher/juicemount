@@ -13,7 +13,7 @@
 
 > An open-source, self-hosted macOS client for media stored in JuiceFS.
 
-> **Status:** beta, macOS-only, self-hosted. Version 0.5.0 is the general release, with open Finder, offline, and multi-Mac acceptance work described in the [release notes](docs/release-0.5.md).
+> **Status:** beta, macOS-only, self-hosted. Version 0.5.1 is the current release, with open Finder, offline, and multi-Mac acceptance work described in the [release notes](docs/release-0.5.md).
 
 ---
 
@@ -98,7 +98,7 @@ brew install --cask macfuse           # approve the system extension if macOS as
 
 Then get the app:
 
-**Download.** Get 0.5.0 from [Releases](https://github.com/lelanddutcher/juicemount/releases/latest) and follow the [install and upgrade notes](docs/release-0.5.md). Unzip `JuiceMount.zip` and move `JuiceMount.app` to `/Applications`. Update checks run only when you choose **Check for Updates…** in the app.
+**Download.** Get 0.5.1 from [Releases](https://github.com/lelanddutcher/juicemount/releases/latest) and follow the [install and upgrade notes](docs/release-0.5.md). Unzip `JuiceMount.zip` and move `JuiceMount.app` to `/Applications`. Update checks run only when you choose **Check for Updates…** in the app.
 
 **Or build from source** (Intel builds are unverified):
 

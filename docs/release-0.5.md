@@ -1,6 +1,6 @@
-# JuiceMount 0.5.0 release notes
+# JuiceMount 0.5 release notes
 
-JuiceMount 0.5.0 (build 37) is a general release for Apple Silicon Macs running macOS 26 or later. Get the app from [GitHub Releases](https://github.com/lelanddutcher/juicemount/releases/latest). The app checks for updates only when you choose **Check for Updates…**; it does not check in the background.
+JuiceMount 0.5.1 (build 38) is the current release for Apple Silicon Macs running macOS 26 or later. It is a reliability update to the 0.5.0 general release (build 37); the [changelog](../CHANGELOG.md) lists what changed. Get the app from [GitHub Releases](https://github.com/lelanddutcher/juicemount/releases/latest). The app checks for updates only when you choose **Check for Updates…**; it does not check in the background.
 
 ## What 0.5 covers
 
@@ -15,11 +15,13 @@ Bounded packaged Finder checks passed for copy and directory workloads; focused 
 - A configured server built from the digest-pinned [0.5 server compose](../server/INSTALL-TrueNAS.md), using image digests from the published release manifest, with the Mac enrolled and approved in Manager. Keep Redis, MinIO, and Manager on a trusted LAN or private route.
 - Approval for JuiceMount's bundled eject helper in **System Settings → General → Login Items & Extensions**. The helper must answer before the app starts a mount. **Start at login** is a separate app preference; it is not the eject-helper approval.
 
-Download `JuiceMount.zip` and `SHA256SUMS` from the [0.5.0 release](https://github.com/lelanddutcher/juicemount/releases/tag/v0.5.0), verify the archive against the published checksum, unzip it, and move `JuiceMount.app` to `/Applications`. Start the app, finish Setup Assistant, approve the bundled helper if macOS asks, and confirm the volume appears in Finder. For source builds, see [signing and notarization](signing.md); an ad-hoc signed app cannot start a normal mount because the helper requires JuiceMount's Developer ID identity.
+Download `JuiceMount.zip` and `SHA256SUMS` from the [0.5.1 release](https://github.com/lelanddutcher/juicemount/releases/tag/v0.5.1), verify the archive against the published checksum, unzip it, and move `JuiceMount.app` to `/Applications`. Start the app, finish Setup Assistant, approve the bundled helper if macOS asks, and confirm the volume appears in Finder. For source builds, see [signing and notarization](signing.md); an ad-hoc signed app cannot start a normal mount because the helper requires JuiceMount's Developer ID identity.
 
 ## Upgrading an existing install
 
 Check **Pending uploads** in the menu bar before replacing the app. Let the queue drain to the server, or preserve the existing local spool and metadata so the same pending saves can be recovered. A completed Finder copy does not prove the background upload has finished. Use **Stop** and then **Quit** through the app; if it warns that work is active, resolve that state before replacing the bundle. Keep the previous app and a backup of the server's object data and Redis metadata. Do not delete the local spool, metadata database, or pending-upload records as part of an upgrade.
+
+Before updating the server from 0.5.0 to 0.5.1, read the upgrade sections of the [0.5.1 changelog](../CHANGELOG.md): the farm, the Redis proxy and Manager, and Link each have steps of their own.
 
 The repository's `scripts/install.sh` installs a verified JuiceMount Developer ID signed bundle after the same queue and Stop/Quit checks. It refuses running GUI or serving processes and process-query failures; it never requests Quit, sends signals or unmounts. It stages and verifies the copy on the destination filesystem before retaining the previous bundle and promoting the new one. Failed staging artifacts remain for inspection; a failed promotion restores the previous bundle only when the destination is absent. The script prints retained paths. Its default source is `build/JuiceMount.app`; `--source /absolute/JuiceMount.app` selects an existing signed release and `--destination /absolute/Test.app` supports a disposable install. `--launchd` is canonical-destination only and refuses an existing agent. A rollback to 0.4 with 0.5 local state has not been qualified; checkpoint journals may use a newer schema, so an older app must not replay them without a separately verified recovery procedure.
 

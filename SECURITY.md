@@ -4,7 +4,7 @@ JuiceMount sits in front of people's primary storage, so security reports are ta
 
 ## Supported versions
 
-JuiceMount is pre-1.0, with 0.5.0 as the current general release. Security fixes land on `main` and ship in the next tagged release. There is no long-term-support branch yet; please test against the latest release before reporting.
+JuiceMount is pre-1.0, with 0.5.1 as the current release. Security fixes land on `main` and ship in the next tagged release. There is no long-term-support branch yet; please test against the latest release before reporting.
 
 | Version | Supported |
 |---|---|
