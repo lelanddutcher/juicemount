@@ -123,7 +123,8 @@ func TestRemoveDropsDirListingRecord(t *testing.T) {
 	if err := jfs.Remove("d/a.txt"); err != nil {
 		t.Fatal(err)
 	}
-	if err := jfs.Remove("d"); err != nil {
+	// RMDIR's entry point: REMOVE of a directory is refused with EISDIR.
+	if err := jfs.RemoveDirectory("d"); err != nil {
 		t.Fatal(err)
 	}
 	if dirRecorded(jfs.handler, "d") || durablyRecorded(t, store, "d") {
