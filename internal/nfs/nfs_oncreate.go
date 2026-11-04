@@ -11,11 +11,29 @@ import (
 	"github.com/willscott/go-nfs-client/nfs/xdr"
 )
 
+// createmode3, RFC 1813 section 3.3.8.
 const (
-	createModeUnchecked = 0
-	createModeGuarded   = 1
-	createModeExclusive = 2
+	CreateUnchecked = 0
+	CreateGuarded   = 1
+	CreateExclusive = 2
 )
+
+// CreateHow is a CREATE's createhow3: its mode and, for EXCLUSIVE, the
+// client's verifier.
+type CreateHow struct {
+	Mode     uint32
+	Verifier [8]byte
+}
+
+// ModeCreator is implemented by a filesystem that serves the CREATE mode
+// itself (RFC 1813 section 3.3.8). GUARDED and EXCLUSIVE must refuse a name
+// that already exists with os.ErrExist, which is answered NFS3ERR_EXIST.
+// UNCHECKED must not replace an existing file with a new object: the reply's
+// handle is the existing file's. A filesystem without it gets Create for
+// every mode.
+type ModeCreator interface {
+	CreateMode(path string, how CreateHow) (billy.File, error)
+}
 
 // cacheStater is implemented by the filesystem (nfs.juiceFS) to expose a
 // cache-only stat that never touches FUSE. The guarded-CREATE existence/parent
@@ -38,20 +56,20 @@ func onCreate(ctx context.Context, w *response, userHandle Handler) error {
 		return &NFSStatusError{NFSStatusInval, err}
 	}
 	var attrs *SetFileAttributes
-	if how == createModeUnchecked || how == createModeGuarded {
+	createHow := CreateHow{Mode: how}
+	if how == CreateUnchecked || how == CreateGuarded {
 		sattr, err := ReadSetFileAttributes(w.req.Body)
 		if err != nil {
 			return &NFSStatusError{NFSStatusInval, err}
 		}
 		attrs = sattr
-	} else if how == createModeExclusive {
-		// [JM5] Treat exclusive create as unchecked create.
-		// macOS uses exclusive mode for atomic file creation. We read and
-		// discard the createverf3 verifier, then proceed with normal create.
-		// This eliminates the "exclusive mode not supported" error that caused
-		// macOS to retry with unchecked mode (adding latency to every create).
-		var verf [8]byte
-		if err := xdr.Read(w.req.Body, &verf); err != nil {
+	} else if how == CreateExclusive {
+		// [JM5] macOS uses exclusive mode for atomic file creation (O_EXCL).
+		// It is served here rather than refused NOTSUPP, which made macOS
+		// retry every create as unchecked. The createverf3 verifier is passed
+		// to a ModeCreator, which tells a resend of a create it already made
+		// (same verifier) from a new one.
+		if err := xdr.Read(w.req.Body, &createHow.Verifier); err != nil {
 			return &NFSStatusError{NFSStatusInval, err}
 		}
 		// No attrs to apply for exclusive creates
@@ -113,7 +131,12 @@ func onCreate(ctx context.Context, w *response, userHandle Handler) error {
 	if scoped, ok := fs.(MutationPrincipalSetter); ok {
 		scoped.SetMutationPrincipal(requestPrincipal(w.req))
 	}
-	file, err := fs.Create(newFilePath)
+	var file billy.File
+	if creator, ok := fs.(ModeCreator); ok {
+		file, err = creator.CreateMode(newFilePath, createHow)
+	} else {
+		file, err = fs.Create(newFilePath)
+	}
 	if err != nil {
 		Log.Errorf("Error Creating: %v", err)
 		// A CREATE against a full write spool (nfs.ErrSpoolFull wraps
@@ -121,6 +144,10 @@ func onCreate(ctx context.Context, w *response, userHandle Handler) error {
 		// not EACCES. Everything else keeps the legacy Access mapping.
 		if errors.Is(err, syscall.ENOSPC) {
 			return &NFSStatusError{NFSStatusNoSPC, err}
+		}
+		// GUARDED or EXCLUSIVE found the name taken.
+		if how != CreateUnchecked && errors.Is(err, os.ErrExist) {
+			return &NFSStatusError{NFSStatusExist, err}
 		}
 		return writeRefusalStatus(err, NFSStatusAccess)
 	}

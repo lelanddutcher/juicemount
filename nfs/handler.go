@@ -4424,18 +4424,38 @@ func (jfs *juiceFS) CommitFile(path string) error {
 }
 
 func (jfs *juiceFS) Create(filename string) (billy.File, error) {
+	return jfs.CreateMode(filename, nfslib.CreateHow{Mode: nfslib.CreateUnchecked})
+}
+
+// CreateMode implements internal/nfs.ModeCreator: CREATE with its mode.
+func (jfs *juiceFS) CreateMode(filename string, how nfslib.CreateHow) (billy.File, error) {
 	filename = strings.TrimPrefix(filename, "/")
 	return runNamespaceOperation(jfs.handler, []string{filename}, func(op *namespaceOperation) (billy.File, error) {
-		return jfs.createOnce(filename, op)
+		return jfs.createOnce(filename, how, op)
 	}, closeNamespaceFile)
 }
 
-func (jfs *juiceFS) create(filename string, op *namespaceOperation) (billy.File, error) {
-	if spool := jfs.handler.spool.Load(); spool != nil && spool.ReadFault(filename) {
+func (jfs *juiceFS) create(filename string, how nfslib.CreateHow, op *namespaceOperation) (billy.File, error) {
+	spool := jfs.handler.spool.Load()
+	if spool != nil && spool.ReadFault(filename) {
 		return nil, syscall.EIO
 	}
+	// GUARDED and EXCLUSIVE refuse an existing name (RFC 1813 section 3.3.8).
+	// The operation owns the name, so the answer holds until it publishes. A
+	// resend of an EXCLUSIVE create that already succeeded is answered by
+	// createOnce before this runs. The backend branch below also refuses an
+	// unmirrored backend file, through O_EXCL.
+	if how.Mode != nfslib.CreateUnchecked {
+		taken := jfs.handler.store.LookupByPath(filename) != nil
+		if !taken && spool != nil {
+			_, taken = spool.LookupActive(filename)
+		}
+		if taken {
+			return nil, syscall.EEXIST
+		}
+	}
 	now := time.Now()
-	// Every branch below publishes one row for filename.
+	// Every branch below publishes or keeps one row for filename.
 	jfs.handler.noteSingleChildInsert(filename)
 
 	// Spool-routed create (Option 2). The CREATE RPC is the new-file entry
@@ -4447,10 +4467,16 @@ func (jfs *juiceFS) create(filename string, op *namespaceOperation) (billy.File,
 	// directory listings immediately. Stat/Lstat/READ are shadowed by the
 	// spool index (real growing size) until the drainer lands the file, at
 	// which point onSpoolDrained syncs the final size into this entry.
-	if spool := jfs.handler.spool.Load(); spool != nil {
-		inode := jfs.handler.nextSyntheticInode()
-		e := metadata.MakeEntry(filename, false, 0, now, inode)
-		e.LocalOnly = true
+	//
+	// An UNCHECKED create of an existing file must not make a new object
+	// (RFC 1813 section 3.3.8): the reply's handle is the existing file's.
+	// OpenWrite hands back a live entry (writing, or ready and reopened) with
+	// its pending bytes and inode, and that file is opened as it is. Minting
+	// a new inode for it re-keyed the mirror row away from the entry, so the
+	// writer's handle lost its binding to the entry's cohort. A fresh entry
+	// over a backend-resident file replaces it, as before, but keeps the
+	// row's inode, as an offline truncate does (TruncateFile).
+	if spool != nil {
 		// The bounded RPC waits for publication; a slow SQLite writer keeps
 		// namespace ownership after the RPC returns JUKEBOX.
 		sentry, err := spool.OpenWrite(filename)
@@ -4458,11 +4484,26 @@ func (jfs *juiceFS) create(filename string, op *namespaceOperation) (billy.File,
 			return nil, err
 		}
 		op.mutated = true
-		sentry.SetInode(inode)
-		op.checkpoint("publish", filename)
-		if err := jfs.handler.store.Insert(e); err != nil {
-			sentry.ReleaseHandle()
-			return nil, err
+		existing := jfs.handler.store.LookupByPath(filename)
+		if existing != nil && (existing.IsDir || existing.Mode&os.ModeSymlink != 0 || existing.Inode == 0) {
+			existing = nil
+		}
+		live := sentry.Inode() != 0
+		if !live {
+			inode := jfs.handler.nextSyntheticInode()
+			if existing != nil {
+				inode = existing.Inode
+			}
+			sentry.SetInode(inode)
+		}
+		if !live || existing == nil || existing.Inode != sentry.Inode() {
+			e := metadata.MakeEntry(filename, false, 0, now, sentry.Inode())
+			e.LocalOnly = true
+			op.checkpoint("publish", filename)
+			if err := jfs.handler.store.Insert(e); err != nil {
+				sentry.ReleaseHandle()
+				return nil, err
+			}
 		}
 		jfs.handler.incActiveWriterFrom(filename, "create-spool")
 		return &spoolWriteFile{name: filename, entry: sentry, handler: jfs.handler}, nil
@@ -4474,6 +4515,9 @@ func (jfs *juiceFS) create(filename string, op *namespaceOperation) (billy.File,
 	createExpected, err := jfs.handler.store.CaptureMirror(filename)
 	if err != nil {
 		return nil, err
+	}
+	if createExpected.Incarnation != "" && how.Mode != nfslib.CreateUnchecked {
+		return nil, syscall.EEXIST
 	}
 	if createExpected.Incarnation != "" {
 		file, err := jfs.openFile(filename, os.O_RDWR, 0)
@@ -4897,9 +4941,19 @@ func (jfs *juiceFS) rename(oldpath, newpath string, op *namespaceOperation) erro
 }
 
 func (jfs *juiceFS) Remove(filename string) error {
+	return jfs.removeAs("remove", filename)
+}
+
+// RemoveDirectory implements internal/nfs.DirectoryRemover: RMDIR. It removes
+// exactly as Remove does; only its remembered late outcome is kept apart.
+func (jfs *juiceFS) RemoveDirectory(dirname string) error {
+	return jfs.removeAs("rmdir", dirname)
+}
+
+func (jfs *juiceFS) removeAs(proc, filename string) error {
 	filename = strings.TrimPrefix(filename, "/")
 	return jfs.namespaceMutation([]string{filename}, func(op *namespaceOperation) error {
-		return jfs.removeOnce(filename, op)
+		return jfs.removeOnce(proc, filename, op)
 	})
 }
 

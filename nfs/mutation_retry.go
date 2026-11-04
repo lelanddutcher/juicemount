@@ -1,11 +1,13 @@
 package nfs
 
 import (
+	"fmt"
 	"os"
 	"sync"
 	"time"
 
 	"github.com/go-git/go-billy/v5"
+	nfslib "github.com/lelanddutcher/juicemount/internal/nfs"
 )
 
 // A namespace mutation that outlives the RPC mutation bound is answered
@@ -19,15 +21,16 @@ import (
 //     of the file just renamed there. With the source recreated by someone
 //     else, it replaced the file the first attempt moved.
 //   - REMOVE/RMDIR: a file or folder recreated at the name is deleted.
-//   - CREATE: unchecked (and macOS EXCLUSIVE, served as unchecked) truncates
-//     a file someone has already written to.
+//   - CREATE: unchecked truncates a file someone has already written to;
+//     GUARDED and EXCLUSIVE fail NFS3ERR_EXIST on the file they created.
 //
 // completedMutations remembers each such late success briefly, so the resend
 // of exactly that request is answered success without running it again. There
 // is no XID duplicate-request cache to lean on: the macOS client gives a
 // JUKEBOX retry a new XID (NFS kext nfs_request_finish: "req->r_xid = 0; //
-// get a new XID"). The key is therefore the request itself: operation and
-// names. An entry is replayed at most once.
+// get a new XID"). The key is therefore the request itself: the procedure
+// (REMOVE and RMDIR apart), the names and, for CREATE, the mode and verifier.
+// An entry is replayed at most once.
 //
 // A replay does not depend on what the names hold now. The request is known
 // to have completed after the client last saw these names, so anything there
@@ -39,7 +42,8 @@ import (
 // resend costs silent loss of someone's unuploaded data. One-shot consumption
 // keeps the window to a request the client sent instead of its own resend,
 // which needs the first request to have been abandoned (an interrupted call
-// on an intr mount) and the same request repeated within the TTL.
+// on an intr mount) and the same request repeated within the TTL. An
+// EXCLUSIVE CREATE has no such window: every new one carries a new verifier.
 //
 // The key also carries the RPC credential, but in production that separates
 // nothing: Mount offers only AUTH_NULL and the mount options set no sec=, so
@@ -63,9 +67,10 @@ const (
 )
 
 type completedMutationKey struct {
-	op        string
+	op        string // the procedure
 	principal string
-	from, to  string
+	from, to  string // RENAME's names; REMOVE, RMDIR and CREATE use from
+	how       string // CREATE's mode and verifier
 }
 
 type completedMutations struct {
@@ -133,6 +138,14 @@ func (jfs *juiceFS) mutationKey(op, from, to string) completedMutationKey {
 	return completedMutationKey{op: op, principal: jfs.retryPrincipal, from: from, to: to}
 }
 
+// createKey also carries the mode and verifier: a resend repeats both, and a
+// different mode or a new EXCLUSIVE verifier is a different request.
+func (jfs *juiceFS) createKey(filename string, how nfslib.CreateHow) completedMutationKey {
+	key := jfs.mutationKey("create", filename, "")
+	key.how = fmt.Sprintf("%d:%x", how.Mode, how.Verifier)
+	return key
+}
+
 // replayOrRun runs inside the namespace worker, owning the request's names.
 // A remembered late success of the same request is answered without running
 // it; otherwise run executes it. Either success is remembered if this reply,
@@ -159,9 +172,11 @@ func (jfs *juiceFS) renameOnce(oldpath, newpath string, op *namespaceOperation) 
 	})
 }
 
-// removeOnce is remove (REMOVE and RMDIR) with replay of a late success.
-func (jfs *juiceFS) removeOnce(filename string, op *namespaceOperation) error {
-	return jfs.replayOrRun(op, jfs.mutationKey("remove", filename, ""), nil, func() error {
+// removeOnce is remove with replay of a late success. proc is "remove" or
+// "rmdir": the two share remove, but a resend repeats its own procedure, so
+// a late REMOVE must not answer an RMDIR of the same name (or the reverse).
+func (jfs *juiceFS) removeOnce(proc, filename string, op *namespaceOperation) error {
+	return jfs.replayOrRun(op, jfs.mutationKey(proc, filename, ""), nil, func() error {
 		return jfs.remove(filename, op)
 	})
 }
@@ -170,15 +185,15 @@ func (jfs *juiceFS) removeOnce(filename string, op *namespaceOperation) error {
 // the existing file untouched instead of truncating it. If the name no longer
 // holds a file there is nothing to protect, and the create runs, so the
 // client is not handed a handle to a missing name.
-func (jfs *juiceFS) createOnce(filename string, op *namespaceOperation) (billy.File, error) {
+func (jfs *juiceFS) createOnce(filename string, how nfslib.CreateHow, op *namespaceOperation) (billy.File, error) {
 	var file billy.File
 	exists := func() bool {
 		e := jfs.handler.store.LookupByPath(filename)
 		return e != nil && !e.IsDir
 	}
-	err := jfs.replayOrRun(op, jfs.mutationKey("create", filename, ""), exists, func() error {
+	err := jfs.replayOrRun(op, jfs.createKey(filename, how), exists, func() error {
 		var err error
-		file, err = jfs.create(filename, op)
+		file, err = jfs.create(filename, how, op)
 		return err
 	})
 	if err != nil {
