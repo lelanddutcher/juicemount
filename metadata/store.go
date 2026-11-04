@@ -1022,6 +1022,10 @@ func OpenWithMaxCacheSize(dbPath string, maxCacheSize int) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("create prune ladder schema: %w", err)
 	}
+	if _, err := db.Exec(dirListingSchema); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("create dir listing schema: %w", err)
+	}
 
 	// Drop legacy triggers (FTS is maintained manually for performance)
 	if _, err := db.Exec(dropFTSTriggers); err != nil {

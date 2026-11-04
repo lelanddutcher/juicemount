@@ -175,8 +175,13 @@ type JuiceMountHandler struct {
 	// dirIncomplete records directories whose mirror rows may be only part of
 	// the folder (see dirlisting.go). Guarded by dirRefreshMu;
 	// dirIncompleteCount mirrors its size for a lock-free READDIR fast path.
-	dirIncomplete      map[string]*dirListingState
-	dirIncompleteCount atomic.Int64
+	// dirIncompleteSpilled is set once a record left memory at the bound
+	// while staying in the DB. dirListingPersistMu orders each change with
+	// its DB write.
+	dirIncomplete        map[string]*dirListingState
+	dirIncompleteCount   atomic.Int64
+	dirIncompleteSpilled atomic.Bool
+	dirListingPersistMu  sync.Mutex
 
 	// Verifier cleanup lifecycle
 	verifierStop        chan struct{}
@@ -978,6 +983,7 @@ func NewHandler(store *metadata.Store, fusePath string, opts ...HandlerOption) *
 		store.SetOnContentInvalidated(h.onContentInvalidated)
 		store.SetOnScanContentInvalidated(h.onScanContentInvalidated)
 		store.SetOnContentReset(h.onContentReset)
+		h.loadDirListingRecords()
 	}
 
 	// L5 (2026-08-06): publish the fd pool + memory buffer so /metrics can
@@ -3322,6 +3328,9 @@ func (jfs *juiceFS) ReadDir(dirname string) ([]os.FileInfo, error) {
 		return nil, errFUSETimeout
 	}
 	if err != nil {
+		if dirListingGone(err) {
+			jfs.handler.clearDirListingIncomplete(dirname)
+		}
 		return nil, err
 	}
 	// Foreground RPC path → per-child stats draw from the shared hot-path
@@ -3699,7 +3708,11 @@ func (jfs *juiceFS) refreshUnmirroredDir(dirname, fusePath string) []os.FileInfo
 		return nil
 	}
 	if err != nil {
-		if !errors.Is(err, fs.ErrNotExist) {
+		if dirListingGone(err) {
+			// The folder is gone: a record would re-list it on every readdir
+			// of its leftover rows, forever. Pruning those is the reconcile's.
+			h.clearDirListingIncomplete(dirname)
+		} else {
 			h.markDirListingIncomplete(dirname, nil)
 		}
 		return nil
@@ -4766,6 +4779,10 @@ func (jfs *juiceFS) rename(oldpath, newpath string, op *namespaceOperation) erro
 	op.mutated = true
 	op.checkpoint("publish", oldpath)
 
+	// The backing folder now lives at newpath: its listing record (and its
+	// subfolders') moves with it, and newpath's replaced tree loses its own.
+	jfs.handler.renameDirListingTree(oldpath, newpath)
+
 	// Invalidate both read caches for both ends: the old path is gone, and a
 	// replaced destination must not serve the pre-rename bytes from the memory
 	// buffer OR the direct-SSD slice cache.
@@ -4943,6 +4960,10 @@ func (jfs *juiceFS) remove(filename string, op *namespaceOperation) error {
 	}
 	op.mutated = true
 	op.checkpoint("publish", filename)
+
+	// The backing name is gone: a folder later created here starts with no
+	// listing record.
+	jfs.handler.clearDirListingTree(filename)
 
 	// Evict the live namespace immediately AFTER the dentry is gone. The
 	// deleted shadow keeps a retained NFS handle safe without relisting the old

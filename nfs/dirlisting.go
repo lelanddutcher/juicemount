@@ -1,9 +1,14 @@
 package nfs
 
 import (
+	"errors"
+	"io/fs"
 	"path"
+	"strings"
+	"syscall"
 	"time"
 
+	"github.com/lelanddutcher/juicemount/internal/jmlog"
 	"github.com/lelanddutcher/juicemount/metadata"
 )
 
@@ -17,11 +22,19 @@ import (
 //   - a single-row insert (Stat/Lstat/ToHandle fallback, create, mkdir,
 //     symlink, rename) into a directory that had no rows at all.
 //
-// Such a directory is recorded here, in memory, and a READDIR of it re-fires
-// the bounded refresh on every link class: it is the user's own folder, not
-// speculative prefetch. A complete pass clears the record. Push reconciles
-// (HGETALL of the whole directory) and the SCAN never create partial sets, so
-// they need no record.
+// Such a directory is recorded here, and a READDIR of it re-fires the bounded
+// refresh on every link class: it is the user's own folder, not speculative
+// prefetch. A complete pass clears the record, as does a pass that finds the
+// directory gone. Push reconciles (HGETALL of the whole directory) and the
+// SCAN never create partial sets, so they need no record.
+//
+// The record is kept in the mirror DB as well (metadata/dir_listing.go) and
+// loaded at handler start, so a restart does not serve such a folder's rows
+// as the whole folder. Memory holds the retry state and, up to
+// dirListingMaxTracked, the membership; the DB holds every member. A local
+// rename carries the records of the renamed tree and a local delete drops
+// them, so neither the new path serves partial rows as complete nor a later
+// folder at the old path inherits a stale record.
 //
 // Retries are bounded two ways. A pass that ends incomplete backs off
 // exponentially. And a directory is never retried while a FUSE call from an
@@ -35,9 +48,10 @@ var (
 	dirListingRetryMax  = 30 * time.Second
 )
 
-// dirListingMaxTracked bounds the record. A record dropped at the bound only
-// loses the re-fire for that folder (the pre-record behavior).
-const dirListingMaxTracked = 8192
+// dirListingMaxTracked bounds the in-memory record. A record dropped from
+// memory at the bound stays in the DB (dirIncompleteSpilled), so its folder
+// is still re-listed; it only loses its backoff state. A var for tests.
+var dirListingMaxTracked = 8192
 
 type dirListingState struct {
 	failures int
@@ -74,23 +88,38 @@ func (h *JuiceMountHandler) dirListingRetryAllowedLocked(dirname string, now tim
 	return st.settledLocked() && !now.Before(st.retryAt)
 }
 
+// dirListingNone reports that nothing is recorded, in memory or the DB.
+func (h *JuiceMountHandler) dirListingNone() bool {
+	return h.dirIncompleteCount.Load() == 0 && !h.dirIncompleteSpilled.Load()
+}
+
 // dirListingDue is the READDIR check: the directory is recorded incomplete
-// and a refresh may run now. One atomic load when nothing is recorded.
+// and a refresh may run now. One atomic load when nothing is recorded; one
+// indexed SQLite lookup for a folder not in memory once the bound spilled.
 func (h *JuiceMountHandler) dirListingDue(dirname string) bool {
-	if h.dirIncompleteCount.Load() == 0 {
+	if h.dirListingNone() {
 		return false
 	}
 	h.dirRefreshMu.Lock()
-	defer h.dirRefreshMu.Unlock()
-	return h.dirIncomplete[dirname] != nil && h.dirListingRetryAllowedLocked(dirname, time.Now())
+	st := h.dirIncomplete[dirname]
+	due := st != nil && h.dirListingRetryAllowedLocked(dirname, time.Now())
+	h.dirRefreshMu.Unlock()
+	if st != nil || !h.dirIncompleteSpilled.Load() {
+		return due
+	}
+	has, err := h.store.HasDirListingIncomplete(dirname)
+	return err == nil && has
 }
 
-func (h *JuiceMountHandler) dirListingStateLocked(dirname string) *dirListingState {
-	st := h.dirIncomplete[dirname]
+// dirListingStateLocked returns dirname's state, creating it (created=true)
+// when absent. At the bound another record leaves memory but not the DB.
+func (h *JuiceMountHandler) dirListingStateLocked(dirname string) (st *dirListingState, created bool) {
+	st = h.dirIncomplete[dirname]
 	if st != nil {
-		return st
+		return st, false
 	}
 	if len(h.dirIncomplete) >= dirListingMaxTracked {
+		h.dirIncompleteSpilled.Store(true)
 		for k := range h.dirIncomplete {
 			delete(h.dirIncomplete, k)
 			break
@@ -99,15 +128,24 @@ func (h *JuiceMountHandler) dirListingStateLocked(dirname string) *dirListingSta
 	st = &dirListingState{}
 	h.dirIncomplete[dirname] = st
 	h.dirIncompleteCount.Store(int64(len(h.dirIncomplete)))
-	return st
+	return st, true
+}
+
+// persistDirListingMark writes a new record to the DB. Caller holds
+// dirListingPersistMu, which orders DB writes like the memory changes.
+func (h *JuiceMountHandler) persistDirListingMark(dirname string) {
+	if err := h.store.MarkDirListingIncomplete(dirname); err != nil {
+		jmlog.Warn("dir listing record not persisted", "dir", dirname, "error", err.Error())
+	}
 }
 
 // markDirListingIncomplete records a pass of dirname that did not see every
 // child, with the FUSE calls it left parked.
 func (h *JuiceMountHandler) markDirListingIncomplete(dirname string, parked []<-chan struct{}) {
+	h.dirListingPersistMu.Lock()
+	defer h.dirListingPersistMu.Unlock()
 	h.dirRefreshMu.Lock()
-	defer h.dirRefreshMu.Unlock()
-	st := h.dirListingStateLocked(dirname)
+	st, created := h.dirListingStateLocked(dirname)
 	st.failures++
 	backoff := dirListingRetryBase
 	for i := 1; i < st.failures && backoff < dirListingRetryMax; i++ {
@@ -118,32 +156,142 @@ func (h *JuiceMountHandler) markDirListingIncomplete(dirname string, parked []<-
 	}
 	st.retryAt = time.Now().Add(backoff)
 	st.parked = append(st.parked, parked...)
+	h.dirRefreshMu.Unlock()
+	if created {
+		h.persistDirListingMark(dirname)
+	}
 }
 
 // markDirListingUnknown records that dirname is about to gain a row that did
 // not come from a listing. No backoff: nothing has failed.
 func (h *JuiceMountHandler) markDirListingUnknown(dirname string) {
+	h.dirListingPersistMu.Lock()
+	defer h.dirListingPersistMu.Unlock()
 	h.dirRefreshMu.Lock()
-	defer h.dirRefreshMu.Unlock()
-	h.dirListingStateLocked(dirname)
+	_, created := h.dirListingStateLocked(dirname)
+	h.dirRefreshMu.Unlock()
+	if created {
+		h.persistDirListingMark(dirname)
+	}
 }
 
-// clearDirListingIncomplete is called after a complete pass. It reports
-// whether a record existed. Parked calls from earlier passes keep their
-// slots until they return; the record only gated retries, so dropping it is
-// safe.
+// clearDirListingIncomplete is called after a complete pass, or one that
+// found dirname gone. It reports whether a record existed. Parked calls from
+// earlier passes keep their slots until they return; the record only gated
+// retries, so dropping it is safe.
 func (h *JuiceMountHandler) clearDirListingIncomplete(dirname string) bool {
-	if h.dirIncompleteCount.Load() == 0 {
+	if h.dirListingNone() {
 		return false
+	}
+	h.dirListingPersistMu.Lock()
+	defer h.dirListingPersistMu.Unlock()
+	h.dirRefreshMu.Lock()
+	_, ok := h.dirIncomplete[dirname]
+	delete(h.dirIncomplete, dirname)
+	h.dirIncompleteCount.Store(int64(len(h.dirIncomplete)))
+	h.dirRefreshMu.Unlock()
+	if !ok && h.dirIncompleteSpilled.Load() {
+		has, err := h.store.HasDirListingIncomplete(dirname)
+		ok = err == nil && has
+	}
+	if ok {
+		if err := h.store.ClearDirListingIncomplete(dirname); err != nil {
+			jmlog.Warn("dir listing record not cleared", "dir", dirname, "error", err.Error())
+		}
+	}
+	return ok
+}
+
+// dirListingGone reports a readdir error that means the directory no longer
+// exists: removed (ENOENT) or replaced by a non-directory (ENOTDIR).
+func dirListingGone(err error) bool {
+	return errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR)
+}
+
+// inDirTree reports whether p is dir or below it.
+func inDirTree(p, dir string) bool {
+	return p == dir || (strings.HasPrefix(p, dir) && p[len(dir)] == '/')
+}
+
+// clearDirListingTree drops the records of dir and everything below it
+// after dir was removed.
+func (h *JuiceMountHandler) clearDirListingTree(dir string) {
+	if h.dirListingNone() {
+		return
+	}
+	h.dirListingPersistMu.Lock()
+	defer h.dirListingPersistMu.Unlock()
+	h.dirRefreshMu.Lock()
+	hit := false
+	for k := range h.dirIncomplete {
+		if inDirTree(k, dir) {
+			delete(h.dirIncomplete, k)
+			hit = true
+		}
+	}
+	h.dirIncompleteCount.Store(int64(len(h.dirIncomplete)))
+	h.dirRefreshMu.Unlock()
+	if hit || h.dirIncompleteSpilled.Load() {
+		if err := h.store.ClearDirListingIncompleteTree(dir); err != nil {
+			jmlog.Warn("dir listing records not cleared", "dir", dir, "error", err.Error())
+		}
+	}
+}
+
+// renameDirListingTree carries the records of oldpath and everything below
+// it to newpath, with their retry state, and drops those of the newpath tree
+// the rename replaced.
+func (h *JuiceMountHandler) renameDirListingTree(oldpath, newpath string) {
+	if h.dirListingNone() || oldpath == newpath {
+		return
+	}
+	h.dirListingPersistMu.Lock()
+	defer h.dirListingPersistMu.Unlock()
+	h.dirRefreshMu.Lock()
+	moved := make(map[string]*dirListingState)
+	hit := false
+	for k, st := range h.dirIncomplete {
+		switch {
+		case inDirTree(k, oldpath):
+			moved[newpath+k[len(oldpath):]] = st
+			delete(h.dirIncomplete, k)
+			hit = true
+		case inDirTree(k, newpath):
+			delete(h.dirIncomplete, k)
+			hit = true
+		}
+	}
+	for k, st := range moved {
+		h.dirIncomplete[k] = st
+	}
+	h.dirIncompleteCount.Store(int64(len(h.dirIncomplete)))
+	h.dirRefreshMu.Unlock()
+	if hit || h.dirIncompleteSpilled.Load() {
+		if err := h.store.RenameDirListingIncomplete(oldpath, newpath); err != nil {
+			jmlog.Warn("dir listing records not renamed", "old", oldpath, "new", newpath, "error", err.Error())
+		}
+	}
+}
+
+// loadDirListingRecords restores the DB's records at handler start. Their
+// retry state starts fresh: whatever FUSE calls an earlier process parked
+// ended with it.
+func (h *JuiceMountHandler) loadDirListingRecords() {
+	dirs, err := h.store.LoadDirListingIncomplete()
+	if err != nil {
+		jmlog.Warn("dir listing records not loaded", "error", err.Error())
+		return
 	}
 	h.dirRefreshMu.Lock()
 	defer h.dirRefreshMu.Unlock()
-	if _, ok := h.dirIncomplete[dirname]; !ok {
-		return false
+	for _, d := range dirs {
+		if len(h.dirIncomplete) >= dirListingMaxTracked {
+			h.dirIncompleteSpilled.Store(true)
+			break
+		}
+		h.dirIncomplete[d] = &dirListingState{}
 	}
-	delete(h.dirIncomplete, dirname)
 	h.dirIncompleteCount.Store(int64(len(h.dirIncomplete)))
-	return true
 }
 
 // noteSingleChildInsert must be called BEFORE inserting one row for
