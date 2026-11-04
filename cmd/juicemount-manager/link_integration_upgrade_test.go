@@ -15,7 +15,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"testing"
 	"time"
 
@@ -61,31 +60,19 @@ func startTestControl(t *testing.T, operatorPolicy string, env map[string]string
 	t.Cleanup(func() { hsBinary, hsDataDir = oldBin, oldDir })
 	hsBinary, hsDataDir = bin, c.dir
 	const publicURL = "https://link.example.com:30193"
-	c.listen = net.JoinHostPort("127.0.0.1", strconv.Itoa(freeLoopbackPort(t)))
 	derpPath := filepath.Join(c.dir, "derp.yaml")
-	writeDERPMapYAML(t, derpPath, localDERPMap(t, c.dir, c.listen))
 	c.cfgPath = filepath.Join(c.dir, "config.yaml")
-	cfg := renderHeadscaleConfig(headscaleConfigParams{
-		ServerURL:     publicURL,
-		Listen:        c.listen,
-		MetricsListen: net.JoinHostPort("127.0.0.1", strconv.Itoa(freeLoopbackPort(t))),
-		GRPCListen:    net.JoinHostPort("127.0.0.1", strconv.Itoa(freeLoopbackPort(t))),
-		DataDir:       c.dir,
-		DERPPaths:     []string{derpPath},
-	})
+	policyBlock := ""
 	if operatorPolicy != "" {
 		p := filepath.Join(c.dir, "operator.hujson")
 		if err := os.WriteFile(p, []byte(operatorPolicy), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		cfg += "policy:\n  mode: file\n  path: " + p + "\n"
-	}
-	if err := os.WriteFile(c.cfgPath, []byte(cfg), 0o600); err != nil {
-		t.Fatal(err)
+		policyBlock = "policy:\n  mode: file\n  path: " + p + "\n"
 	}
 	base := map[string]string{
 		"JM_NET_SERVER_URL": publicURL, "JM_NET_TLS_CERT": "", "JM_NET_TLS_KEY": "",
-		"JM_NET_HEADSCALE": "on", "JM_NET_NAS_NODE": "on", "JM_NET_NAS_CONTROL_URL": c.url(),
+		"JM_NET_HEADSCALE": "on", "JM_NET_NAS_NODE": "on",
 		"JM_NET_NAS_HOSTNAME": "", "JM_NET_NAS_EXPOSURE": "", "JM_NET_NAS_ROUTE": "", "JM_NET_NAS_LAN_ADDR": "",
 		"JM_NET_POLICY": "", "JM_HEADSCALE_USER": "", "JM_NET_NAS_SERVICES": "",
 	}
@@ -95,11 +82,22 @@ func startTestControl(t *testing.T, operatorPolicy string, env map[string]string
 	for k, v := range base {
 		t.Setenv(k, v)
 	}
-	c.hs = newHeadscaleSupervisor()
-	c.hs.listen = c.listen
-	c.hs.Start()
+	c.hs, c.listen = startLoopbackHeadscale(t, func(listen string) {
+		writeDERPMapYAML(t, derpPath, localDERPMap(t, c.dir, listen))
+		cfg := renderHeadscaleConfig(headscaleConfigParams{
+			ServerURL:     publicURL,
+			Listen:        listen,
+			MetricsListen: loopbackAnyPort,
+			GRPCListen:    loopbackAnyPort,
+			DataDir:       c.dir,
+			DERPPaths:     []string{derpPath},
+		})
+		if err := os.WriteFile(c.cfgPath, []byte(cfg+policyBlock), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("JM_NET_NAS_CONTROL_URL", "http://"+listen)
+	})
 	t.Cleanup(func() { c.hs.Stop() })
-	waitForState(t, "headscale", c.hs.status, 90*time.Second)
 	return c
 }
 
