@@ -97,7 +97,8 @@ func (h *JuiceMountHandler) dirListingNone() bool {
 // and a refresh may run now. One atomic load when nothing is recorded; one
 // indexed SQLite lookup for a folder not in memory once the bound spilled.
 // A DB-only hit is brought back into memory, so its re-list is tracked
-// (backoff, parked calls) like any other.
+// (backoff, parked calls) like any other, unless dirListingPersistMu is busy:
+// its holders write SQLite, and READDIR must not wait behind a bulk insert.
 func (h *JuiceMountHandler) dirListingDue(dirname string) bool {
 	if h.dirListingNone() {
 		return false
@@ -113,8 +114,14 @@ func (h *JuiceMountHandler) dirListingDue(dirname string) bool {
 	if err != nil || !has {
 		return false
 	}
-	h.dirListingPersistMu.Lock()
+	if !h.dirListingPersistMu.TryLock() {
+		return true
+	}
 	defer h.dirListingPersistMu.Unlock()
+	// A complete pass may have cleared it meanwhile: do not bring it back.
+	if has, err = h.store.HasDirListingIncomplete(dirname); err != nil || !has {
+		return false
+	}
 	h.dirRefreshMu.Lock()
 	defer h.dirRefreshMu.Unlock()
 	h.dirListingStateLocked(dirname)
@@ -122,7 +129,8 @@ func (h *JuiceMountHandler) dirListingDue(dirname string) bool {
 }
 
 // dirListingStateLocked returns dirname's state, creating it (created=true)
-// when absent. At the bound a settled record leaves memory but not the DB. A
+// when absent. At the bound a settled record leaves memory but not the DB,
+// preferably one not backing off (its state is the least worth keeping). A
 // record whose earlier FUSE call is still parked is never the one dropped:
 // without its parked calls a re-list could pin another gate slot behind the
 // same hung child. If every record is parked, memory exceeds the bound; the
@@ -134,12 +142,22 @@ func (h *JuiceMountHandler) dirListingStateLocked(dirname string) (st *dirListin
 		return st, false
 	}
 	if len(h.dirIncomplete) >= dirListingMaxTracked {
+		now, victim := time.Now(), ""
 		for k, old := range h.dirIncomplete {
-			if old.settledLocked() {
-				delete(h.dirIncomplete, k)
-				h.dirIncompleteSpilled.Store(true)
+			if !old.settledLocked() {
+				continue
+			}
+			if victim == "" {
+				victim = k
+			}
+			if !now.Before(old.retryAt) {
+				victim = k
 				break
 			}
+		}
+		if victim != "" {
+			delete(h.dirIncomplete, victim)
+			h.dirIncompleteSpilled.Store(true)
 		}
 	}
 	st = &dirListingState{}
@@ -182,8 +200,9 @@ func (h *JuiceMountHandler) markDirListingIncomplete(dirname string, parked []<-
 }
 
 // markDirListingUnknown records that dirname is about to gain a row that did
-// not come from a listing. No backoff: nothing has failed.
-func (h *JuiceMountHandler) markDirListingUnknown(dirname string) {
+// not come from a listing. No backoff: nothing has failed. It reports
+// whether the record is new in memory.
+func (h *JuiceMountHandler) markDirListingUnknown(dirname string) bool {
 	h.dirListingPersistMu.Lock()
 	defer h.dirListingPersistMu.Unlock()
 	h.dirRefreshMu.Lock()
@@ -192,6 +211,7 @@ func (h *JuiceMountHandler) markDirListingUnknown(dirname string) {
 	if created {
 		h.persistDirListingMark(dirname)
 	}
+	return created
 }
 
 // clearDirListingIncomplete is called after a complete pass, or one that
@@ -291,10 +311,11 @@ func (h *JuiceMountHandler) clearDirListingTree(dir string) {
 	if len(keys) == 0 && !spilled {
 		return
 	}
-	if err := h.store.ClearDirListingIncompleteTree(dir); err != nil {
+	dropped, err := h.store.ClearDirListingIncompleteTree(dir)
+	if err != nil {
 		jmlog.Warn("dir listing records not cleared", "dir", dir, "error", err.Error())
 	}
-	if spilled {
+	if spilled && dropped > 0 {
 		h.unspillDirListingLocked()
 	}
 }
@@ -330,10 +351,11 @@ func (h *JuiceMountHandler) renameDirListingTree(oldpath, newpath string) {
 	if len(from)+len(replaced) == 0 && !spilled {
 		return
 	}
-	if err := h.store.RenameDirListingIncomplete(oldpath, newpath); err != nil {
+	dropped, err := h.store.RenameDirListingIncomplete(oldpath, newpath)
+	if err != nil {
 		jmlog.Warn("dir listing records not renamed", "old", oldpath, "new", newpath, "error", err.Error())
 	}
-	if spilled {
+	if spilled && dropped > 0 {
 		h.unspillDirListingLocked()
 	}
 }

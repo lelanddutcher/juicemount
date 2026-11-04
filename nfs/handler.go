@@ -3345,14 +3345,29 @@ func (jfs *juiceFS) ReadDir(dirname string) ([]os.FileInfo, error) {
 		// rows, so a crash between the two cannot leave them unrecorded.
 		jfs.handler.markDirListingIncomplete(dirname, listing.parked)
 	}
+	// A complete pass whose rows take more than one batch is partial
+	// between batches too: record it first, clear it once all have landed.
+	multiBatch := listing.complete && len(listing.toInsert) > coldListingInsertBatch
+	if multiBatch {
+		jfs.handler.markDirListingUnknown(dirname)
+	}
 
 	// Bulk-insert into SQLite synchronously so subsequent Stat() calls
 	// from Finder (which follow immediately after READDIR) hit the cache
 	if len(listing.toInsert) > 0 {
-		jfs.handler.store.BulkInsert(listing.toInsert, 500)
+		if err := jfs.handler.store.BulkInsert(listing.toInsert, coldListingInsertBatch); err != nil {
+			// Some batches may have landed: the rows are partial.
+			if listing.complete {
+				jfs.handler.markDirListingIncomplete(dirname, nil)
+			}
+			return listing.infos, nil
+		}
 	}
 	if hook := coldListingPublishedHook; hook != nil {
 		hook(dirname)
+	}
+	if multiBatch {
+		jfs.handler.clearDirListingIncomplete(dirname)
 	}
 	return listing.infos, nil
 }
@@ -3565,6 +3580,9 @@ var coldListingEntriesHook func(dirname string, entries []os.DirEntry) []os.DirE
 // Nil in production; set only while no listing pass is running.
 var coldListingPublishedHook func(dirname string)
 
+// coldListingInsertBatch is the batch size a cold listing pass publishes in.
+const coldListingInsertBatch = 500
+
 // coldListFanout returns the S4 per-directory lstat fan-out width (WAVE 1,
 // RC-7), class-scaled: a fast link parallelizes wide to collapse per-child RTT,
 // a metered/slow link stays gentler. JM_COLD_LIST_FANOUT=0 is the kill-switch —
@@ -3759,8 +3777,15 @@ func (jfs *juiceFS) refreshUnmirroredDir(dirname, fusePath string) []os.FileInfo
 		// answers empty for this pass.
 		h.markDirListingIncomplete(dirname, listing.parked)
 	}
+	// A complete pass whose rows take more than one batch is partial
+	// between batches too: record it first. The clear below drops it.
+	// recorded: the folder had a record before this pass.
+	recorded := true
+	if listing.complete && len(toInsert) > coldListingInsertBatch {
+		recorded = !h.markDirListingUnknown(dirname)
+	}
 	if len(toInsert) > 0 {
-		if err := h.store.BulkInsertAbsent(toInsert, 500); err != nil {
+		if err := h.store.BulkInsertAbsent(toInsert, coldListingInsertBatch); err != nil {
 			if listing.complete {
 				h.markDirListingIncomplete(dirname, nil)
 			}
@@ -3775,7 +3800,7 @@ func (jfs *juiceFS) refreshUnmirroredDir(dirname, fusePath string) []os.FileInfo
 	if !listing.complete {
 		return nil
 	}
-	if h.clearDirListingIncomplete(dirname) && len(toInsert) > 0 {
+	if h.clearDirListingIncomplete(dirname) && recorded && len(toInsert) > 0 {
 		// The client may hold this folder's earlier, partial listing; a newer
 		// directory mtime makes it read the folder again.
 		h.store.NoteDirectoryChanged(dirname)

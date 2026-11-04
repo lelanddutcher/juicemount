@@ -41,14 +41,14 @@ func TestDirListingIncompleteTreeOps(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := s.RenameDirListingIncomplete("a", "dst"); err != nil {
-		t.Fatal(err)
+	if dropped, err := s.RenameDirListingIncomplete("a", "dst"); err != nil || dropped != 2 {
+		t.Fatalf("rename dropped %d records, %v; want 2 (dst, dst/old)", dropped, err)
 	}
 	if got, want := dirListingRecords(t, s), "a0,ab,dst,dst/b,dst/b/é"; got != want {
 		t.Fatalf("after rename = %s, want %s", got, want)
 	}
-	if err := s.ClearDirListingIncompleteTree("dst/b"); err != nil {
-		t.Fatal(err)
+	if n, err := s.ClearDirListingIncompleteTree("dst/b"); err != nil || n != 2 {
+		t.Fatalf("tree clear dropped %d records, %v; want 2", n, err)
 	}
 	if got, want := dirListingRecords(t, s), "a0,ab,dst"; got != want {
 		t.Fatalf("after tree clear = %s, want %s", got, want)

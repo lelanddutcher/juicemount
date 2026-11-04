@@ -350,3 +350,68 @@ func TestDirListingSpillResets(t *testing.T) {
 		t.Fatalf("records in memory after the reset = %d, want 1 (the remaining durable record)", n)
 	}
 }
+
+// TestDirListingDueDoesNotWaitOnPersistLock: a READDIR of a folder recorded
+// only in the DB must not wait for dirListingPersistMu, whose holders write
+// SQLite (behind a bulk insert, say). It still re-lists the folder.
+func TestDirListingDueDoesNotWaitOnPersistLock(t *testing.T) {
+	forceLinkClass(t, netprofile.ClassSlow)
+	prev := dirListingMaxTracked
+	dirListingMaxTracked = 1
+	t.Cleanup(func() { dirListingMaxTracked = prev })
+	jfs, store, fuseRoot := newDirRefreshHarness(t)
+	h := jfs.handler
+	mkFUSEDir(t, fuseRoot, "f0", clips...)
+	mkFUSEDir(t, fuseRoot, "f1", clips...)
+	recordByStat(t, jfs, store, "f0", "clip1.mov")
+	recordByStat(t, jfs, store, "f1", "clip1.mov") // f0 leaves memory
+	if dirRecorded(h, "f0") || !durablyRecorded(t, store, "f0") {
+		t.Fatal("f0 is not a DB-only record (test inconclusive)")
+	}
+
+	h.dirListingPersistMu.Lock()
+	done := make(chan error, 1)
+	go func() {
+		_, err := jfs.ReadDir("f0")
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		h.dirListingPersistMu.Unlock()
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		h.dirListingPersistMu.Unlock()
+		<-done
+		t.Fatal("READDIR of a DB-only folder waited for dirListingPersistMu")
+	}
+	if !pollUntil(t, 5*time.Second, mirrorHasNChildren(store, "f0", 3)) {
+		kids, _ := store.ListChildren("f0")
+		t.Fatalf("f0 mirror children = %d, want 3 (not re-listed)", len(kids))
+	}
+	if !pollUntil(t, 5*time.Second, inFlightEmpty(h)) {
+		t.Fatal("re-list never finished")
+	}
+}
+
+// TestDirListingEvictionPrefersIdle: at the bound, a record that is backing
+// off keeps its state; one with nothing to wait for leaves memory instead.
+func TestDirListingEvictionPrefersIdle(t *testing.T) {
+	prev := dirListingMaxTracked
+	dirListingMaxTracked = 2
+	t.Cleanup(func() { dirListingMaxTracked = prev })
+	jfs, _, _ := newDirRefreshHarness(t)
+	h := jfs.handler
+	for i := 0; i < 20; i++ {
+		h.markDirListingIncomplete("backing", nil) // retry in dirListingRetryBase
+		h.markDirListingUnknown("idle")
+		h.markDirListingUnknown("new")
+		if !dirRecorded(h, "backing") {
+			t.Fatalf("round %d: the bound dropped the record that is backing off", i)
+		}
+		for _, d := range []string{"backing", "idle", "new"} {
+			h.clearDirListingIncomplete(d)
+		}
+	}
+}

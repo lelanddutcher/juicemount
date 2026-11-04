@@ -54,38 +54,43 @@ func (s *Store) CountDirListingIncomplete() (int, error) {
 }
 
 // ClearDirListingIncompleteTree drops the records of dir and its descendants
-// (dir was deleted).
-func (s *Store) ClearDirListingIncompleteTree(dir string) error {
+// (dir was deleted) and returns how many there were.
+func (s *Store) ClearDirListingIncompleteTree(dir string) (int64, error) {
 	s.writeMu.Lock()
-	_, err := s.db.Exec(`DELETE FROM dir_listing_incomplete WHERE `+dirListingTreeWhere, dir)
+	res, err := s.db.Exec(`DELETE FROM dir_listing_incomplete WHERE `+dirListingTreeWhere, dir)
 	s.writeMu.Unlock()
 	if err != nil {
-		return fmt.Errorf("clear dir listing incomplete tree %q: %w", dir, err)
+		return 0, fmt.Errorf("clear dir listing incomplete tree %q: %w", dir, err)
 	}
-	return nil
+	return res.RowsAffected()
 }
 
 // RenameDirListingIncomplete moves the records of oldDir and its descendants
 // under newDir, dropping any records of the newDir tree it replaces, in one
-// transaction.
-func (s *Store) RenameDirListingIncomplete(oldDir, newDir string) error {
+// transaction. It returns how many records were dropped.
+func (s *Store) RenameDirListingIncomplete(oldDir, newDir string) (int64, error) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	tx, err := s.db.Begin()
 	if err != nil {
-		return fmt.Errorf("rename dir listing incomplete begin: %w", err)
+		return 0, fmt.Errorf("rename dir listing incomplete begin: %w", err)
 	}
 	defer tx.Rollback()
-	if _, err := tx.Exec(`DELETE FROM dir_listing_incomplete WHERE `+dirListingTreeWhere, newDir); err != nil {
-		return fmt.Errorf("rename dir listing incomplete clear %q: %w", newDir, err)
+	res, err := tx.Exec(`DELETE FROM dir_listing_incomplete WHERE `+dirListingTreeWhere, newDir)
+	if err != nil {
+		return 0, fmt.Errorf("rename dir listing incomplete clear %q: %w", newDir, err)
+	}
+	dropped, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
 	}
 	// substr/length count characters on both sides, so a multi-byte name
 	// is cut at the same place.
 	if _, err := tx.Exec(`UPDATE dir_listing_incomplete SET path = ?2 || substr(path, length(?1) + 1)
 		WHERE `+dirListingTreeWhere, oldDir, newDir); err != nil {
-		return fmt.Errorf("rename dir listing incomplete %q -> %q: %w", oldDir, newDir, err)
+		return 0, fmt.Errorf("rename dir listing incomplete %q -> %q: %w", oldDir, newDir, err)
 	}
-	return tx.Commit()
+	return dropped, tx.Commit()
 }
 
 // HasDirListingIncomplete reports whether dir is durably recorded.
