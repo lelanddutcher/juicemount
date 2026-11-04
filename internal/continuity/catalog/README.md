@@ -11,7 +11,8 @@ private local directory. It refuses existing destinations and orphan sidecars.
 `Open(path)` requires an existing complete catalog. Both canonicalize the existing
 parent and build an escaped file URI internally; caller-supplied SQLite URIs and
 memory databases are refused. Final symlinks, nonregular files, multiple hardlinks,
-and unsafe WAL/SHM/rollback sidecars are refused. File identity is qualified on
+and unsafe WAL/SHM/rollback sidecars are refused, as are catalog files with any
+group/other permission and a parent directory writable by group or others. File identity is qualified on
 Darwin and Linux; other platforms refuse admission. The directory's owner and
 local filesystem/hardware are deployment preconditions. This does not defend
 against privileged replacement of path ancestors.

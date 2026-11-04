@@ -13,6 +13,22 @@ func checkFileIdentity(info os.FileInfo) error {
 	if !ok || !info.Mode().IsRegular() || stat.Nlink != 1 {
 		return corrupt("catalog files must be single-link regular files")
 	}
+	if info.Mode().Perm()&0077 != 0 {
+		return corrupt("catalog files must not grant group or other access")
+	}
+	return nil
+}
+
+// checkPrivateDirectory enforces the caller-provisioned private directory:
+// another account able to write there could plant or swap WAL sidecars.
+func checkPrivateDirectory(dir string) error {
+	info, err := os.Stat(dir)
+	if err != nil {
+		return fmt.Errorf("catalog parent: %w", err)
+	}
+	if !info.IsDir() || info.Mode().Perm()&0022 != 0 {
+		return invalid("catalog directory must not be writable by group or others")
+	}
 	return nil
 }
 
