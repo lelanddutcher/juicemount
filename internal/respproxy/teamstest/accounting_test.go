@@ -283,3 +283,19 @@ func TestOversizedUnitKeepsLogReadable(t *testing.T) {
 		t.Errorf("the large unit's intent: %+v", big)
 	}
 }
+
+// TestGuardRefusalsAreAudited: a refusal of the guard (here the nextinode
+// counter gate) is logged for the person like any other refused write.
+func TestGuardRefusalsAreAudited(t *testing.T) {
+	e := newEnv(t, respproxy.ModeEnforce, johnGranted("/Clients/A"))
+	if err := e.rawClient("mac-john").IncrBy(context.Background(), "nextinode", 7).Err(); err == nil || !strings.HasPrefix(err.Error(), "JMDENY") {
+		t.Fatalf("INCRBY nextinode 7: %v, want a refusal", err)
+	}
+	found := false
+	for _, r := range e.records(auditlog.Filter{Person: "p-john", Types: []string{auditlog.TypeRefused}}) {
+		found = found || strings.Contains(r.Detail, "nextinode")
+	}
+	if !found {
+		t.Errorf("the guard's refusal is not in the audit log: %+v", e.records(auditlog.Filter{Person: "p-john"}))
+	}
+}
