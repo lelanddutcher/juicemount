@@ -571,6 +571,16 @@ func TestDrainerStopDeadlineIncludesBlockedDispatcher(t *testing.T) {
 	}
 }
 
+// blockedWorkerWait bounds the drain work around the blocked size publish in
+// TestDrainerStopDeadlineIncludesBlockedWorker: the dispatch, claim, copy
+// and drain commit before it (several SQLite statements and commits, plus
+// fsyncs) and the completion after it. It measures how fast SQLite and the
+// disk run, not the Stop contract: under -race on a loaded lane one run
+// spent 0.74 s on the test's own setup (Open and one spool write) and then
+// missed a 1 s bound for the dispatch. A drainer that never reaches the
+// hook, or a Stop that never sees the worker finish, still fails here.
+const blockedWorkerWait = 30 * time.Second
+
 func TestDrainerStopDeadlineIncludesBlockedWorker(t *testing.T) {
 	spool, d := newTestDrainer(t, DrainerConfig{})
 	writeSpoolEntry(t, spool, "/blocked-worker.bin", []byte("durable bytes"))
@@ -585,7 +595,7 @@ func TestDrainerStopDeadlineIncludesBlockedWorker(t *testing.T) {
 	d.Start()
 	select {
 	case <-entered:
-	case <-time.After(time.Second):
+	case <-time.After(blockedWorkerWait):
 		t.Fatal("worker did not enter size publish")
 	}
 	if d.Stop(30 * time.Millisecond) {
@@ -595,7 +605,7 @@ func TestDrainerStopDeadlineIncludesBlockedWorker(t *testing.T) {
 		t.Fatal("repeated Stop claimed success while worker was blocked")
 	}
 	releaseOnce.Do(func() { close(release) })
-	if !d.Stop(time.Second) {
+	if !d.Stop(blockedWorkerWait) {
 		t.Fatal("Stop did not observe worker completion after release")
 	}
 }
