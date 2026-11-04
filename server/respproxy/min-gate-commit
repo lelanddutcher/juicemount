@@ -10,7 +10,10 @@
 # restrict_unassigned) and configures the lazy, retained audit log, with
 # every dir-stat and quota row under the person-grant check, no quota above
 # the project depth while grants are in force, integer values only in the
-# accounting hashes, and audit records bounded by encoded size.
+# accounting hashes, and audit records bounded by encoded size. It also
+# includes the guard fix (trash-root and hourly-create classification, the
+# session and locked sets, the heartbeat gate, nextinode only as juicefs's
+# recorded batch step, and recorded inode batches for new inodes).
 #
 # Bump after changes to internal/respproxy or server/respproxy/entrypoint.sh.
 # TestH8BGateCoversEntrypointHandshake checks ancestry with full Git history.
