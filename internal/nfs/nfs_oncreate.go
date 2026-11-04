@@ -26,11 +26,12 @@ type CreateHow struct {
 }
 
 // ModeCreator is implemented by a filesystem that serves the CREATE mode
-// itself (RFC 1813 section 3.3.8). GUARDED and EXCLUSIVE must refuse a name
-// that already exists with os.ErrExist, which is answered NFS3ERR_EXIST.
-// UNCHECKED must not replace an existing file with a new object: the reply's
-// handle is the existing file's. A filesystem without it gets Create for
-// every mode.
+// itself (RFC 1813 section 3.3.8). GUARDED must refuse a name that already
+// exists with os.ErrExist, which is answered NFS3ERR_EXIST. EXCLUSIVE must too,
+// unless the file there is the one an EXCLUSIVE create with the same verifier
+// made: that request is its resend and succeeds. UNCHECKED must not replace an
+// existing file with a new object: the reply's handle is the existing file's.
+// A filesystem without it gets Create for every mode.
 type ModeCreator interface {
 	CreateMode(path string, how CreateHow) (billy.File, error)
 }

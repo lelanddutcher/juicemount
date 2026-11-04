@@ -111,6 +111,12 @@ func removeErrStatus(err error) (*NFSStatusError, bool) {
 		return &NFSStatusError{NFSStatusAccess, err}, true
 	case errors.Is(err, syscall.ENOTEMPTY) || errors.Is(err, syscall.EEXIST):
 		return &NFSStatusError{NFSStatusNotEmpty, err}, true
+	case errors.Is(err, syscall.ENOTDIR):
+		// RMDIR of a non-directory.
+		return &NFSStatusError{NFSStatusNotDir, err}, true
+	case errors.Is(err, syscall.EISDIR):
+		// REMOVE of a directory.
+		return &NFSStatusError{NFSStatusIsDir, err}, true
 	}
 	return nil, false
 }

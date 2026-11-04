@@ -3,10 +3,12 @@ package nfs
 import (
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/go-git/go-billy/v5"
+	"github.com/lelanddutcher/juicemount/internal/jmlog"
 	nfslib "github.com/lelanddutcher/juicemount/internal/nfs"
 )
 
@@ -22,7 +24,9 @@ import (
 //     else, it replaced the file the first attempt moved.
 //   - REMOVE/RMDIR: a file or folder recreated at the name is deleted.
 //   - CREATE: unchecked truncates a file someone has already written to;
-//     GUARDED and EXCLUSIVE fail NFS3ERR_EXIST on the file they created.
+//     GUARDED fails NFS3ERR_EXIST on the file it created. (EXCLUSIVE is also
+//     recognised by its stored verifier, which outlives a restart; see
+//     exclusiveResend.)
 //
 // completedMutations remembers each such late success briefly, so the resend
 // of exactly that request is answered success without running it again. There
@@ -168,7 +172,12 @@ func (jfs *juiceFS) replayOrRun(op *namespaceOperation, key completedMutationKey
 // renameOnce is rename with replay of a late success.
 func (jfs *juiceFS) renameOnce(oldpath, newpath string, op *namespaceOperation) error {
 	return jfs.replayOrRun(op, jfs.mutationKey("rename", oldpath, newpath), nil, func() error {
-		return jfs.rename(oldpath, newpath, op)
+		if err := jfs.rename(oldpath, newpath, op); err != nil {
+			return err
+		}
+		jfs.handler.clearExclusiveCreate(oldpath)
+		jfs.handler.clearExclusiveCreate(newpath)
+		return nil
 	})
 }
 
@@ -177,7 +186,11 @@ func (jfs *juiceFS) renameOnce(oldpath, newpath string, op *namespaceOperation) 
 // a late REMOVE must not answer an RMDIR of the same name (or the reverse).
 func (jfs *juiceFS) removeOnce(proc, filename string, op *namespaceOperation) error {
 	return jfs.replayOrRun(op, jfs.mutationKey(proc, filename, ""), nil, func() error {
-		return jfs.remove(filename, op)
+		if err := jfs.remove(filename, proc == "rmdir", op); err != nil {
+			return err
+		}
+		jfs.handler.clearExclusiveCreate(filename)
+		return nil
 	})
 }
 
@@ -192,9 +205,22 @@ func (jfs *juiceFS) createOnce(filename string, how nfslib.CreateHow, op *namesp
 		return e != nil && !e.IsDir
 	}
 	err := jfs.replayOrRun(op, jfs.createKey(filename, how), exists, func() error {
+		if how.Mode == nfslib.CreateExclusive && jfs.exclusiveResend(filename, how.Verifier) {
+			return nil // answered with the file it made, untouched
+		}
 		var err error
 		file, err = jfs.create(filename, how, op)
-		return err
+		if err != nil {
+			return err
+		}
+		if how.Mode != nfslib.CreateExclusive {
+			jfs.handler.clearExclusiveCreate(filename)
+		} else if err := jfs.handler.store.RecordExclusiveCreate(filename, how.Verifier); err != nil {
+			// The file exists; only a later resend of this create loses its
+			// answer (EEXIST).
+			jmlog.Warn("exclusive create verifier not recorded", "path", filename, "error", err.Error())
+		}
+		return nil
 	})
 	if err != nil {
 		return nil, err
@@ -218,3 +244,34 @@ func (r replayedCreate) Seek(int64, int) (int64, error)    { return 0, os.ErrInv
 func (r replayedCreate) Lock() error                       { return os.ErrInvalid }
 func (r replayedCreate) Unlock() error                     { return os.ErrInvalid }
 func (r replayedCreate) Truncate(int64) error              { return os.ErrInvalid }
+
+// exclusiveResend reports whether filename holds the file an EXCLUSIVE
+// CREATE with this verifier made, unchanged since. RFC 1813 section 3.3.8:
+// such a create is the resend of one that already succeeded, after a lost
+// reply or a restart (completedMutations covers only a JUKEBOX resend, and
+// only in memory), and succeeds with that file instead of failing EEXIST.
+// Any change of the name clears the record (clearExclusiveCreate and the
+// mirror's triggers).
+func (jfs *juiceFS) exclusiveResend(filename string, verifier [8]byte) bool {
+	e := jfs.handler.store.LookupByPath(filename)
+	if e == nil || e.IsDir || e.Mode&os.ModeSymlink != 0 {
+		return false
+	}
+	ok, err := jfs.handler.store.ExclusiveCreateMatches(filename, verifier)
+	if err != nil {
+		jmlog.Warn("exclusive create verifier unreadable", "path", filename, "error", err.Error())
+		return false
+	}
+	return ok
+}
+
+// clearExclusiveCreate ends the resend window of an EXCLUSIVE CREATE of name:
+// any later change of the name means a create with that verifier is no
+// longer the resend of the one that made the file. Free while nothing is
+// recorded.
+func (h *JuiceMountHandler) clearExclusiveCreate(name string) {
+	name = strings.TrimPrefix(name, "/")
+	if err := h.store.ClearExclusiveCreate(name); err != nil {
+		jmlog.Warn("exclusive create verifier not cleared", "path", name, "error", err.Error())
+	}
+}
