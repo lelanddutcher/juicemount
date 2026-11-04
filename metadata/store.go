@@ -1090,10 +1090,6 @@ func OpenWithMaxCacheSize(dbPath string, maxCacheSize int) (*Store, error) {
 		s.subtreeBytes = make(map[string]int64)
 		s.subtreeFiles = make(map[string]int64)
 	}
-	if err := s.loadExclusiveCreates(); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("load exclusive creates: %w", err)
-	}
 	if s.fileLock != nil {
 		if err := s.recoverOwnedPruneLadderCandidates(); err != nil {
 			db.Close()
@@ -1177,6 +1173,10 @@ func OpenWithMaxCacheSize(dbPath string, maxCacheSize int) (*Store, error) {
 	s.pruneLadderGCWake = make(chan struct{}, 1)
 	go s.pruneLadderGCWorker()
 	s.wakePruneLadderGC()
+	if err := s.loadExclusiveCreates(); err != nil {
+		_ = s.Close()
+		return nil, fmt.Errorf("load exclusive creates: %w", err)
+	}
 
 	keepFileLock = true
 	return s, nil
@@ -1269,6 +1269,7 @@ func (s *Store) Close() error {
 		s.shadowSweep = nil
 	}
 	s.mu.Unlock()
+	s.stopExclusiveCreates()
 	if err := s.db.Close(); err != nil {
 		return err
 	}

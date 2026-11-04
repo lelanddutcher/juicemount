@@ -5,11 +5,12 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/go-git/go-billy/v5"
-	"github.com/lelanddutcher/juicemount/internal/jmlog"
 	nfslib "github.com/lelanddutcher/juicemount/internal/nfs"
+	"github.com/lelanddutcher/juicemount/metadata"
 )
 
 // A namespace mutation that outlives the RPC mutation bound is answered
@@ -215,10 +216,15 @@ func (jfs *juiceFS) createOnce(filename string, how nfslib.CreateHow, op *namesp
 		}
 		if how.Mode != nfslib.CreateExclusive {
 			jfs.handler.clearExclusiveCreate(filename)
-		} else if err := jfs.handler.store.RecordExclusiveCreate(filename, how.Verifier); err != nil {
-			// The file exists; only a later resend of this create loses its
-			// answer (EEXIST).
-			jmlog.Warn("exclusive create verifier not recorded", "path", filename, "error", err.Error())
+		} else if e := jfs.handler.store.LookupByPath(filename); e != nil {
+			rec := metadata.ExclusiveCreate{Verifier: how.Verifier, Inode: e.Inode}
+			// The backend path knows the inode reconcile will give the row.
+			if wf, ok := file.(*writeFile); ok && wf.identity != nil {
+				if st, ok := wf.identity.Sys().(*syscall.Stat_t); ok {
+					rec.BackendInode = uint64(st.Ino)
+				}
+			}
+			jfs.handler.store.RecordExclusiveCreate(filename, rec)
 		}
 		return nil
 	})
@@ -250,28 +256,21 @@ func (r replayedCreate) Truncate(int64) error              { return os.ErrInvali
 // such a create is the resend of one that already succeeded, after a lost
 // reply or a restart (completedMutations covers only a JUKEBOX resend, and
 // only in memory), and succeeds with that file instead of failing EEXIST.
-// Any change of the name clears the record (clearExclusiveCreate and the
-// mirror's triggers).
+// The record must name the file now at filename (its inode, or the backend
+// inode it reconciles to), so another Mac's file put there since never
+// matches; a local change of the name clears it (clearExclusiveCreate).
 func (jfs *juiceFS) exclusiveResend(filename string, verifier [8]byte) bool {
 	e := jfs.handler.store.LookupByPath(filename)
 	if e == nil || e.IsDir || e.Mode&os.ModeSymlink != 0 {
 		return false
 	}
-	ok, err := jfs.handler.store.ExclusiveCreateMatches(filename, verifier)
-	if err != nil {
-		jmlog.Warn("exclusive create verifier unreadable", "path", filename, "error", err.Error())
-		return false
-	}
-	return ok
+	return jfs.handler.store.ExclusiveCreateMatches(filename, verifier, e.Inode)
 }
 
 // clearExclusiveCreate ends the resend window of an EXCLUSIVE CREATE of name:
 // any later change of the name means a create with that verifier is no
 // longer the resend of the one that made the file. Free while nothing is
-// recorded.
+// recorded, and never waits for SQLite (it runs on every WRITE).
 func (h *JuiceMountHandler) clearExclusiveCreate(name string) {
-	name = strings.TrimPrefix(name, "/")
-	if err := h.store.ClearExclusiveCreate(name); err != nil {
-		jmlog.Warn("exclusive create verifier not cleared", "path", name, "error", err.Error())
-	}
+	h.store.ClearExclusiveCreate(strings.TrimPrefix(name, "/"))
 }

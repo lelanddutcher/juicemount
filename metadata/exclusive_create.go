@@ -1,120 +1,237 @@
 package metadata
 
 import (
-	"bytes"
 	"database/sql"
-	"errors"
-	"fmt"
+	"log"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // exclusiveCreateSchema keeps the verifier of each file made by an NFSv3
-// EXCLUSIVE CREATE until the name next changes. RFC 1813 section 3.3.8 has
-// the server store it with the file so that a resend of that create (same
-// verifier) succeeds while any other create of the name fails EEXIST. A
-// resend can follow a restart or a lost reply, so the record is durable. It
-// cannot ride on the file's times (the knfsd convention): a spool file has
-// none on the backend yet, and the client's SETATTR after the create
-// overwrites them, which is also when the record is cleared here.
+// EXCLUSIVE CREATE. RFC 1813 section 3.3.8 has the server store it with the
+// file so that a resend of that create (same verifier) succeeds while any
+// other create of the name fails EEXIST. A resend can follow a restart or a
+// lost reply, so the record is durable. It cannot ride on the file's times
+// (the knfsd convention): a spool file has none on the backend yet, and the
+// client's SETATTR after the create overwrites them.
 //
-// The triggers drop the record when the name's row goes away or moves,
-// whoever does it (a remote delete through the keyspace included). An
-// upsert of the same path (INSERT OR REPLACE without recursive_triggers)
-// fires neither. The table and triggers are additive; a build that does not
-// know them leaves them alone, and the triggers only touch this table.
+// The table is additive; a build that does not know it leaves it alone.
 const exclusiveCreateSchema = `
-CREATE TABLE IF NOT EXISTS exclusive_creates (
+CREATE TABLE IF NOT EXISTS exclusive_create_verifiers (
  path TEXT PRIMARY KEY,
- verifier BLOB NOT NULL
+ verifier BLOB NOT NULL,
+ inode INTEGER NOT NULL,
+ backend_inode INTEGER NOT NULL,
+ created_ns INTEGER NOT NULL
 );
-CREATE TRIGGER IF NOT EXISTS exclusive_create_entry_delete AFTER DELETE ON entries
-BEGIN DELETE FROM exclusive_creates WHERE path=OLD.path; END;
-CREATE TRIGGER IF NOT EXISTS exclusive_create_entry_move AFTER UPDATE OF path ON entries
-WHEN OLD.path <> NEW.path
-BEGIN DELETE FROM exclusive_creates WHERE path=OLD.path OR path=NEW.path; END;
 `
 
-// exclusiveCreates is the in-memory superset of the table's paths, so the
-// clear on every WRITE and SETATTR costs an atomic load while nothing is
-// recorded. A trigger can drop a row behind it; the stale path only costs one
-// no-op DELETE.
+// ExclusiveCreateMaxAge bounds how long a record can answer a resend. The
+// client resends a create whose reply it lost on reconnect, so seconds after
+// it, or once the server is back after a restart. Beyond that a matching
+// verifier is more likely a new O_EXCL create after the client rebooted
+// (macOS restarts its verifier counter) against a file nobody changed since,
+// for example a lock file.
+const ExclusiveCreateMaxAge = 10 * time.Minute
+
+// ExclusiveCreate is the file an EXCLUSIVE CREATE made: its mirror inode
+// and, when the create already knew it, the backend inode the mirror row
+// takes once reconciled. A row with any other inode is another file.
+type ExclusiveCreate struct {
+	Verifier     [8]byte
+	Inode        uint64
+	BackendInode uint64
+	created      time.Time
+}
+
+// exclusiveCreates serves the records from memory, so neither a CREATE nor
+// the clear on every WRITE and SETATTR waits for SQLite: the table is written
+// behind, by one goroutine, newest operation per path, in order. A record
+// lost to a crash before it was written only costs that create's resend an
+// EEXIST.
 type exclusiveCreates struct {
-	mu    sync.Mutex
-	paths map[string]struct{}
-	count atomic.Int64
+	mu      sync.RWMutex
+	records map[string]ExclusiveCreate
+	count   atomic.Int64
+	now     func() time.Time // tests only
+
+	pendMu  sync.Mutex
+	pending map[string]*ExclusiveCreate // nil: delete
+	wake    chan struct{}
+	stop    chan struct{}
+	done    chan struct{}
+	once    sync.Once
+}
+
+func (c *exclusiveCreates) clock() time.Time {
+	if c.now != nil {
+		return c.now()
+	}
+	return time.Now()
 }
 
 func (s *Store) loadExclusiveCreates() error {
-	rows, err := s.db.Query(`SELECT path FROM exclusive_creates`)
+	c := &s.exclusive
+	c.records = make(map[string]ExclusiveCreate)
+	rows, err := s.db.Query(`SELECT path, verifier, inode, backend_inode, created_ns FROM exclusive_create_verifiers`)
 	if err != nil {
 		return err
 	}
 	defer rows.Close()
-	s.exclusive.paths = make(map[string]struct{})
+	now := c.clock()
 	for rows.Next() {
 		var p string
-		if err := rows.Scan(&p); err != nil {
+		var verifier []byte
+		var inode, backend, created int64
+		if err := rows.Scan(&p, &verifier, &inode, &backend, &created); err != nil {
 			return err
 		}
-		s.exclusive.paths[p] = struct{}{}
+		rec := ExclusiveCreate{Inode: uint64(inode), BackendInode: uint64(backend), created: time.Unix(0, created)}
+		if len(verifier) != len(rec.Verifier) || now.Sub(rec.created) >= ExclusiveCreateMaxAge {
+			c.queue(p, nil)
+			continue
+		}
+		copy(rec.Verifier[:], verifier)
+		c.records[p] = rec
 	}
-	s.exclusive.count.Store(int64(len(s.exclusive.paths)))
-	return rows.Err()
-}
-
-// RecordExclusiveCreate remembers that an EXCLUSIVE CREATE with verifier made
-// the file at path.
-func (s *Store) RecordExclusiveCreate(path string, verifier [8]byte) error {
-	c := &s.exclusive
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if _, err := s.db.Exec(`INSERT OR REPLACE INTO exclusive_creates(path, verifier) VALUES(?, ?)`, path, verifier[:]); err != nil {
-		return fmt.Errorf("record exclusive create %q: %w", path, err)
+	if err := rows.Err(); err != nil {
+		return err
 	}
-	if c.paths == nil {
-		c.paths = make(map[string]struct{})
-	}
-	if _, ok := c.paths[path]; !ok {
-		c.paths[path] = struct{}{}
-		c.count.Add(1)
-	}
+	c.count.Store(int64(len(c.records)))
+	c.wake = make(chan struct{}, 1)
+	c.stop = make(chan struct{})
+	c.done = make(chan struct{})
+	c.wake <- struct{}{} // expired rows queued above
+	go c.persist(s.db)
 	return nil
 }
 
-// ExclusiveCreateMatches reports whether the file at path was made by an
-// EXCLUSIVE CREATE with verifier and the name has not changed since.
-func (s *Store) ExclusiveCreateMatches(path string, verifier [8]byte) (bool, error) {
-	if s.exclusive.count.Load() == 0 {
-		return false, nil
+// stopExclusiveCreates writes what is still pending and stops the writer.
+func (s *Store) stopExclusiveCreates() {
+	c := &s.exclusive
+	if c.stop == nil {
+		return
 	}
-	var stored []byte
-	err := s.db.QueryRow(`SELECT verifier FROM exclusive_creates WHERE path=?`, path).Scan(&stored)
-	if errors.Is(err, sql.ErrNoRows) {
-		return false, nil
+	c.once.Do(func() { close(c.stop) })
+	<-c.done
+}
+
+func (c *exclusiveCreates) queue(path string, rec *ExclusiveCreate) {
+	c.pendMu.Lock()
+	if c.pending == nil {
+		c.pending = make(map[string]*ExclusiveCreate)
 	}
-	if err != nil {
-		return false, fmt.Errorf("read exclusive create %q: %w", path, err)
+	c.pending[path] = rec
+	c.pendMu.Unlock()
+	select {
+	case c.wake <- struct{}{}:
+	default:
 	}
-	return bytes.Equal(stored, verifier[:]), nil
+}
+
+func (c *exclusiveCreates) persist(db *sql.DB) {
+	defer close(c.done)
+	for {
+		select {
+		case <-c.wake:
+			c.flush(db)
+		case <-c.stop:
+			c.flush(db)
+			return
+		}
+	}
+}
+
+func (c *exclusiveCreates) flush(db *sql.DB) {
+	c.pendMu.Lock()
+	batch := c.pending
+	c.pending = nil
+	c.pendMu.Unlock()
+	for p, rec := range batch {
+		var err error
+		if rec == nil {
+			_, err = db.Exec(`DELETE FROM exclusive_create_verifiers WHERE path=?`, p)
+		} else {
+			_, err = db.Exec(`INSERT OR REPLACE INTO exclusive_create_verifiers(path, verifier, inode, backend_inode, created_ns) VALUES(?, ?, ?, ?, ?)`,
+				p, rec.Verifier[:], int64(rec.Inode), int64(rec.BackendInode), rec.created.UnixNano())
+		}
+		if err != nil {
+			log.Printf("metadata: exclusive create record for %q not written: %v", p, err)
+		}
+	}
+}
+
+// RecordExclusiveCreate remembers that an EXCLUSIVE CREATE made the file at
+// path. It does no I/O; the record reaches SQLite behind it.
+func (s *Store) RecordExclusiveCreate(path string, rec ExclusiveCreate) {
+	c := &s.exclusive
+	rec.created = c.clock()
+	c.mu.Lock()
+	if c.records == nil {
+		c.records = make(map[string]ExclusiveCreate)
+	}
+	if _, ok := c.records[path]; !ok {
+		c.count.Add(1)
+	}
+	c.records[path] = rec
+	// Records nobody cleared (a file never written or set) age out here, so
+	// the set does not stay non-empty for the clear's fast path.
+	for p, r := range c.records {
+		if rec.created.Sub(r.created) >= ExclusiveCreateMaxAge {
+			delete(c.records, p)
+			c.count.Add(-1)
+			c.queue(p, nil)
+		}
+	}
+	c.mu.Unlock()
+	c.queue(path, &rec)
+}
+
+// ExclusiveCreateMatches reports whether the file at path, whose mirror row
+// now has inode, is the one an EXCLUSIVE CREATE with verifier made, within
+// ExclusiveCreateMaxAge and with the name unchanged since. A record that can
+// no longer match (another file at the name, or too old) is dropped.
+func (s *Store) ExclusiveCreateMatches(path string, verifier [8]byte, inode uint64) bool {
+	c := &s.exclusive
+	if c.count.Load() == 0 {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	rec, ok := c.records[path]
+	if !ok {
+		return false
+	}
+	sameFile := inode != 0 && (inode == rec.Inode || inode == rec.BackendInode)
+	if !sameFile || c.clock().Sub(rec.created) >= ExclusiveCreateMaxAge {
+		delete(c.records, path)
+		c.count.Add(-1)
+		c.queue(path, nil)
+		return false
+	}
+	return rec.Verifier == verifier
 }
 
 // ClearExclusiveCreate forgets the record for path. Every local mutation of
-// the name calls it; without a record it does no I/O.
-func (s *Store) ClearExclusiveCreate(path string) error {
+// the name calls it, the WRITE path included, so it never waits for SQLite
+// and is a single atomic load while nothing is recorded.
+func (s *Store) ClearExclusiveCreate(path string) {
 	c := &s.exclusive
 	if c.count.Load() == 0 {
-		return nil
+		return
+	}
+	c.mu.RLock()
+	_, ok := c.records[path]
+	c.mu.RUnlock()
+	if !ok {
+		return
 	}
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	if _, ok := c.paths[path]; !ok {
-		return nil
+	if _, ok := c.records[path]; ok {
+		delete(c.records, path)
+		c.count.Add(-1)
+		c.queue(path, nil)
 	}
-	if _, err := s.db.Exec(`DELETE FROM exclusive_creates WHERE path=?`, path); err != nil {
-		return fmt.Errorf("clear exclusive create %q: %w", path, err)
-	}
-	delete(c.paths, path)
-	c.count.Add(-1)
-	return nil
+	c.mu.Unlock()
 }

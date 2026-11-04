@@ -5053,8 +5053,8 @@ func (jfs *juiceFS) remove(filename string, rmdir bool, op *namespaceOperation) 
 
 // removeKind refuses REMOVE of a directory (EISDIR) and RMDIR of anything
 // else (ENOTDIR). A live spool entry is a file; otherwise the mirror says, and
-// only a name the mirror lacks costs a backend Lstat. A name nowhere is left
-// to remove, which answers it as before.
+// only a name the mirror lacks costs a bounded backend Lstat, online only. A
+// name whose type is still unknown is left to the remove, as before.
 func (jfs *juiceFS) removeKind(filename string, rmdir bool) error {
 	isDir, known := false, false
 	if spool := jfs.handler.spool.Load(); spool != nil {
@@ -5065,9 +5065,9 @@ func (jfs *juiceFS) removeKind(filename string, rmdir bool) error {
 			isDir, known = e.IsDir, true
 		}
 	}
-	if !known {
-		if fi, err := os.Lstat(jfs.fullPath(filename)); err == nil {
-			isDir, known = fi.IsDir(), true
+	if !known && !pin.IsOffline() {
+		if st, err, ok := lstatUnixWithTimeout(jfs.fullPath(filename), drainBaseProbeTimeout); ok && err == nil {
+			isDir, known = st.Mode&syscall.S_IFMT == syscall.S_IFDIR, true
 		}
 	}
 	switch {

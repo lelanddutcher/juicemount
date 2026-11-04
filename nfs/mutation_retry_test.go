@@ -864,3 +864,28 @@ func TestRemoveKindMatchesProcedure(t *testing.T) {
 		}
 	})
 }
+
+// The record answers only for the file the create made. Reconcile swapping
+// the row's synthetic inode for the backend one keeps it the same file;
+// another Mac's file upserted at the name (a save renamed over it) does not.
+func TestExclusiveCreateRecordFollowsTheFile(t *testing.T) {
+	jfs, _, root := newRenameRetryHarness(t)
+	const name = "dir/c.mov"
+	sent := nfslib.CreateHow{Mode: nfslib.CreateExclusive, Verifier: [8]byte{7, 7}}
+	createModeOnce(t, jfs, name, sent, false)
+	fi, err := os.Lstat(filepath.Join(root, name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend := fi.Sys().(*syscall.Stat_t).Ino
+	upsert := func(inode uint64) {
+		t.Helper()
+		if err := jfs.handler.store.Insert(metadata.MakeEntry(name, false, 0, time.Now(), inode)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	upsert(uint64(backend))
+	createModeOnce(t, jfs, name, sent, false)
+	upsert(jfs.handler.nextSyntheticInode())
+	createModeOnce(t, jfs, name, sent, true)
+}
