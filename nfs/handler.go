@@ -175,9 +175,10 @@ type JuiceMountHandler struct {
 	// dirIncomplete records directories whose mirror rows may be only part of
 	// the folder (see dirlisting.go). Guarded by dirRefreshMu;
 	// dirIncompleteCount mirrors its size for a lock-free READDIR fast path.
-	// dirIncompleteSpilled is set once a record left memory at the bound
-	// while staying in the DB. dirListingPersistMu orders each change with
-	// its DB write.
+	// dirIncompleteSpilled is set while some record is in the DB only (it
+	// left memory at the bound). dirListingPersistMu orders each change with
+	// its DB write; every writer of dirIncomplete holds it as well as
+	// dirRefreshMu, so a whole-map scan needs only dirListingPersistMu.
 	dirIncomplete        map[string]*dirListingState
 	dirIncompleteCount   atomic.Int64
 	dirIncompleteSpilled atomic.Bool
@@ -3336,18 +3337,22 @@ func (jfs *juiceFS) ReadDir(dirname string) ([]os.FileInfo, error) {
 	// Foreground RPC path → per-child stats draw from the shared hot-path
 	// budget (nfsLstatGate), same as the readDirWithTimeout above.
 	listing := jfs.coldDirListing(metrics.FUSESrcForeground, dirname, dirEntries, nfsLstatGate)
+	if !listing.complete {
+		// Return what the pass reached. Failing the RPC instead (JUKEBOX)
+		// makes a hard mount retry it forever against the same hung child.
+		// The record makes the next READDIR of this now non-empty folder
+		// re-list it once the parked stats return. It is written before the
+		// rows, so a crash between the two cannot leave them unrecorded.
+		jfs.handler.markDirListingIncomplete(dirname, listing.parked)
+	}
 
 	// Bulk-insert into SQLite synchronously so subsequent Stat() calls
 	// from Finder (which follow immediately after READDIR) hit the cache
 	if len(listing.toInsert) > 0 {
 		jfs.handler.store.BulkInsert(listing.toInsert, 500)
 	}
-	if !listing.complete {
-		// Return what the pass reached. Failing the RPC instead (JUKEBOX)
-		// makes a hard mount retry it forever against the same hung child.
-		// The record makes the next READDIR of this now non-empty folder
-		// re-list it once the parked stats return.
-		jfs.handler.markDirListingIncomplete(dirname, listing.parked)
+	if hook := coldListingPublishedHook; hook != nil {
+		hook(dirname)
 	}
 	return listing.infos, nil
 }
@@ -3555,6 +3560,11 @@ func coldListGateWait() time.Duration {
 // production; set only while no listing pass is running.
 var coldListingEntriesHook func(dirname string, entries []os.DirEntry) []os.DirEntry
 
+// coldListingPublishedHook lets tests observe the durable state right after
+// a cold listing pass published its rows (the instant a crash would freeze).
+// Nil in production; set only while no listing pass is running.
+var coldListingPublishedHook func(dirname string)
+
 // coldListFanout returns the S4 per-directory lstat fan-out width (WAVE 1,
 // RC-7), class-scaled: a fast link parallelizes wide to collapse per-child RTT,
 // a metered/slow link stays gentler. JM_COLD_LIST_FANOUT=0 is the kill-switch —
@@ -3740,20 +3750,29 @@ func (jfs *juiceFS) refreshUnmirroredDir(dirname, fusePath string) []os.FileInfo
 			toInsert = append(toInsert, e)
 		}
 	}
+	if !listing.complete {
+		// Publish what the pass reached (a slow link may never finish a big
+		// folder in one pass) and record the folder, so its next READDIR
+		// re-lists it instead of serving these rows as the whole folder. The
+		// record is written before the rows, so a crash between the two
+		// cannot leave them unrecorded. The fast-link first READDIR still
+		// answers empty for this pass.
+		h.markDirListingIncomplete(dirname, listing.parked)
+	}
 	if len(toInsert) > 0 {
 		if err := h.store.BulkInsertAbsent(toInsert, 500); err != nil {
-			h.markDirListingIncomplete(dirname, listing.parked)
+			if listing.complete {
+				h.markDirListingIncomplete(dirname, nil)
+			}
 			return nil
 		}
 		jmlog.Debug("async dir refresh: mirrored directory",
 			"dir", dirname, "children", len(toInsert), "complete", listing.complete)
 	}
+	if hook := coldListingPublishedHook; hook != nil {
+		hook(dirname)
+	}
 	if !listing.complete {
-		// Publish what the pass reached (a slow link may never finish a big
-		// folder in one pass) and record the folder, so its next READDIR
-		// re-lists it instead of serving these rows as the whole folder. The
-		// fast-link first READDIR still answers empty for this pass.
-		h.markDirListingIncomplete(dirname, listing.parked)
 		return nil
 	}
 	if h.clearDirListingIncomplete(dirname) && len(toInsert) > 0 {
@@ -4781,7 +4800,10 @@ func (jfs *juiceFS) rename(oldpath, newpath string, op *namespaceOperation) erro
 
 	// The backing folder now lives at newpath: its listing record (and its
 	// subfolders') moves with it, and newpath's replaced tree loses its own.
-	jfs.handler.renameDirListingTree(oldpath, newpath)
+	// A file has no records (POSIX keeps the type at both names).
+	if oldEntry == nil || oldEntry.IsDir {
+		jfs.handler.renameDirListingTree(oldpath, newpath)
+	}
 
 	// Invalidate both read caches for both ends: the old path is gone, and a
 	// replaced destination must not serve the pre-rename bytes from the memory
@@ -4961,10 +4983,6 @@ func (jfs *juiceFS) remove(filename string, op *namespaceOperation) error {
 	op.mutated = true
 	op.checkpoint("publish", filename)
 
-	// The backing name is gone: a folder later created here starts with no
-	// listing record.
-	jfs.handler.clearDirListingTree(filename)
-
 	// Evict the live namespace immediately AFTER the dentry is gone. The
 	// deleted shadow keeps a retained NFS handle safe without relisting the old
 	// generation; the durable delete can then serialize behind a bulk insert
@@ -4972,6 +4990,12 @@ func (jfs *juiceFS) remove(filename string, op *namespaceOperation) error {
 	jfs.handler.store.DeleteFromCacheForUnlink(filename)
 	if err := jfs.handler.store.Delete(filename); err != nil {
 		return err
+	}
+
+	// The backing name is gone: a folder later created here starts with no
+	// listing record. A file has none.
+	if e == nil || e.IsDir {
+		jfs.handler.clearDirListingTree(filename)
 	}
 
 	// Drop the POOLED FDs for this path (C3, 2026-07-28). Run AFTER the FUSE

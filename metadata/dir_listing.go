@@ -33,15 +33,24 @@ func (s *Store) MarkDirListingIncomplete(dir string) error {
 	return nil
 }
 
-// ClearDirListingIncomplete drops the record of dir alone.
-func (s *Store) ClearDirListingIncomplete(dir string) error {
+// ClearDirListingIncomplete drops the record of dir alone and reports
+// whether there was one.
+func (s *Store) ClearDirListingIncomplete(dir string) (bool, error) {
 	s.writeMu.Lock()
-	_, err := s.db.Exec(`DELETE FROM dir_listing_incomplete WHERE path = ?`, dir)
+	res, err := s.db.Exec(`DELETE FROM dir_listing_incomplete WHERE path = ?`, dir)
 	s.writeMu.Unlock()
 	if err != nil {
-		return fmt.Errorf("clear dir listing incomplete %q: %w", dir, err)
+		return false, fmt.Errorf("clear dir listing incomplete %q: %w", dir, err)
 	}
-	return nil
+	n, err := res.RowsAffected()
+	return n > 0, err
+}
+
+// CountDirListingIncomplete returns the number of durable records.
+func (s *Store) CountDirListingIncomplete() (int, error) {
+	var n int
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM dir_listing_incomplete`).Scan(&n)
+	return n, err
 }
 
 // ClearDirListingIncompleteTree drops the records of dir and its descendants
@@ -98,6 +107,11 @@ func (s *Store) LoadDirListingIncomplete() ([]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("prune dir listing incomplete: %w", err)
 	}
+	return s.ListDirListingIncomplete()
+}
+
+// ListDirListingIncomplete returns the durable records.
+func (s *Store) ListDirListingIncomplete() ([]string, error) {
 	rows, err := s.db.Query(`SELECT path FROM dir_listing_incomplete`)
 	if err != nil {
 		return nil, fmt.Errorf("load dir listing incomplete: %w", err)

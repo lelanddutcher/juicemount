@@ -224,3 +224,129 @@ func TestDirListingRecordSurvivesRestart(t *testing.T) {
 		t.Fatal("the complete re-list did not clear the durable record")
 	}
 }
+
+// TestIncompletePassRecordedBeforeRows: an incomplete pass writes its record
+// before it publishes the rows it reached. Observed the instant the rows are
+// committed (where a kill would freeze the DB), the record must already be
+// durable, or a restart serves those rows as the whole folder.
+func TestIncompletePassRecordedBeforeRows(t *testing.T) {
+	for _, async := range []string{"1", "0"} {
+		t.Run("JM_ASYNC_DIR_REFRESH="+async, func(t *testing.T) {
+			forceLinkClass(t, netprofile.ClassSlow)
+			fastRetry(t)
+			wedged, _ := wedgeChild(t, "b.txt", 1)
+			jfs, store, fuseRoot := newDirRefreshHarness(t)
+			t.Setenv("JM_ASYNC_DIR_REFRESH", async)
+			mkFUSEDir(t, fuseRoot, "d", "a.txt", "b.txt", "c.txt")
+			seen := make(chan bool, 1)
+			coldListingPublishedHook = func(dir string) {
+				if dir != "d" {
+					return
+				}
+				kids, _ := store.ListChildren("d")
+				has, _ := store.HasDirListingIncomplete("d")
+				select {
+				case seen <- len(kids) == 2 && has:
+				default:
+				}
+			}
+			t.Cleanup(func() { coldListingPublishedHook = nil })
+
+			if _, err := jfs.ReadDir("d"); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case ok := <-seen:
+				if !ok {
+					t.Fatal("the partial rows were committed before the folder's record")
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("the listing pass never published")
+			}
+			if wedged() != 1 {
+				t.Fatal("the pass never listed the wedged child (test inconclusive)")
+			}
+			if !pollUntil(t, 5*time.Second, inFlightEmpty(jfs.handler)) {
+				t.Fatal("refresh never finished")
+			}
+		})
+	}
+}
+
+// TestDirListingBoundKeepsParkedRecord: at the bound, the record of a folder
+// whose earlier stat is still hung must stay in memory. Dropped to the DB
+// alone, its parked call is forgotten and every readdir re-lists it, each
+// pass pinning another of prefetchGate's two slots behind the same child.
+func TestDirListingBoundKeepsParkedRecord(t *testing.T) {
+	forceLinkClass(t, netprofile.ClassSlow)
+	fastRetry(t)
+	prev := dirListingMaxTracked
+	dirListingMaxTracked = 1
+	t.Cleanup(func() { dirListingMaxTracked = prev })
+	_, _ = wedgeChild(t, "b.txt", 1<<30) // hung for the whole test
+	jfs, store, fuseRoot := newDirRefreshHarness(t)
+	h := jfs.handler
+	mkFUSEDir(t, fuseRoot, "hung", "a.txt", "b.txt")
+	mkFUSEDir(t, fuseRoot, "other", clips...)
+
+	if _, err := jfs.ReadDir("hung"); err != nil {
+		t.Fatal(err)
+	}
+	if !pollUntil(t, 5*time.Second, inFlightEmpty(h)) {
+		t.Fatal("refresh of the hung folder never returned")
+	}
+	if !dirRecorded(h, "hung") || len(prefetchGate) != 1 {
+		t.Fatalf("hung folder recorded=%v, prefetchGate=%d (test inconclusive)", dirRecorded(h, "hung"), len(prefetchGate))
+	}
+	recordByStat(t, jfs, store, "other", "clip1.mov") // the second record meets the bound
+
+	for i := 0; i < 3; i++ {
+		time.Sleep(3 * dirListingRetryBase)
+		if _, err := jfs.ReadDir("hung"); err != nil {
+			t.Fatal(err)
+		}
+		if !pollUntil(t, 5*time.Second, inFlightEmpty(h)) {
+			t.Fatal("refresh of the hung folder never returned")
+		}
+	}
+	if n := len(prefetchGate); n != 1 {
+		t.Fatalf("prefetchGate occupancy = %d, want 1 (the hung folder was re-listed past its parked stat)", n)
+	}
+}
+
+// TestDirListingSpillResets: once the DB holds fewer records than the bound,
+// they are all back in memory and READDIR stops consulting SQLite.
+func TestDirListingSpillResets(t *testing.T) {
+	prev := dirListingMaxTracked
+	dirListingMaxTracked = 2
+	t.Cleanup(func() { dirListingMaxTracked = prev })
+	jfs, _, _ := newDirRefreshHarness(t)
+	h := jfs.handler
+	for _, d := range []string{"f0", "f1", "f2"} {
+		h.markDirListingUnknown(d)
+	}
+	if !h.dirIncompleteSpilled.Load() {
+		t.Fatal("three records under a bound of two did not spill (test inconclusive)")
+	}
+	var kept string
+	for _, d := range []string{"f0", "f1", "f2"} {
+		if dirRecorded(h, d) {
+			kept = d
+			break
+		}
+	}
+	h.clearDirListingIncomplete(kept)
+	h.clearDirListingIncomplete(map[string]string{"f0": "f1", "f1": "f2", "f2": "f0"}[kept])
+	if h.dirIncompleteSpilled.Load() {
+		t.Fatal("spilled stayed set with one durable record under a bound of two")
+	}
+	n := 0
+	for _, d := range []string{"f0", "f1", "f2"} {
+		if dirRecorded(h, d) {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Fatalf("records in memory after the reset = %d, want 1 (the remaining durable record)", n)
+	}
+}

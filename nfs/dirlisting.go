@@ -96,6 +96,8 @@ func (h *JuiceMountHandler) dirListingNone() bool {
 // dirListingDue is the READDIR check: the directory is recorded incomplete
 // and a refresh may run now. One atomic load when nothing is recorded; one
 // indexed SQLite lookup for a folder not in memory once the bound spilled.
+// A DB-only hit is brought back into memory, so its re-list is tracked
+// (backoff, parked calls) like any other.
 func (h *JuiceMountHandler) dirListingDue(dirname string) bool {
 	if h.dirListingNone() {
 		return false
@@ -108,21 +110,36 @@ func (h *JuiceMountHandler) dirListingDue(dirname string) bool {
 		return due
 	}
 	has, err := h.store.HasDirListingIncomplete(dirname)
-	return err == nil && has
+	if err != nil || !has {
+		return false
+	}
+	h.dirListingPersistMu.Lock()
+	defer h.dirListingPersistMu.Unlock()
+	h.dirRefreshMu.Lock()
+	defer h.dirRefreshMu.Unlock()
+	h.dirListingStateLocked(dirname)
+	return h.dirListingRetryAllowedLocked(dirname, time.Now())
 }
 
 // dirListingStateLocked returns dirname's state, creating it (created=true)
-// when absent. At the bound another record leaves memory but not the DB.
+// when absent. At the bound a settled record leaves memory but not the DB. A
+// record whose earlier FUSE call is still parked is never the one dropped:
+// without its parked calls a re-list could pin another gate slot behind the
+// same hung child. If every record is parked, memory exceeds the bound; the
+// parked calls each hold a gate slot, so there are few of them. Caller holds
+// dirListingPersistMu and dirRefreshMu.
 func (h *JuiceMountHandler) dirListingStateLocked(dirname string) (st *dirListingState, created bool) {
 	st = h.dirIncomplete[dirname]
 	if st != nil {
 		return st, false
 	}
 	if len(h.dirIncomplete) >= dirListingMaxTracked {
-		h.dirIncompleteSpilled.Store(true)
-		for k := range h.dirIncomplete {
-			delete(h.dirIncomplete, k)
-			break
+		for k, old := range h.dirIncomplete {
+			if old.settledLocked() {
+				delete(h.dirIncomplete, k)
+				h.dirIncompleteSpilled.Store(true)
+				break
+			}
 		}
 	}
 	st = &dirListingState{}
@@ -140,7 +157,9 @@ func (h *JuiceMountHandler) persistDirListingMark(dirname string) {
 }
 
 // markDirListingIncomplete records a pass of dirname that did not see every
-// child, with the FUSE calls it left parked.
+// child, with the FUSE calls it left parked. Call it BEFORE publishing the
+// pass's rows, so a crash between the two never leaves partial rows without
+// a durable record.
 func (h *JuiceMountHandler) markDirListingIncomplete(dirname string, parked []<-chan struct{}) {
 	h.dirListingPersistMu.Lock()
 	defer h.dirListingPersistMu.Unlock()
@@ -190,16 +209,41 @@ func (h *JuiceMountHandler) clearDirListingIncomplete(dirname string) bool {
 	delete(h.dirIncomplete, dirname)
 	h.dirIncompleteCount.Store(int64(len(h.dirIncomplete)))
 	h.dirRefreshMu.Unlock()
-	if !ok && h.dirIncompleteSpilled.Load() {
-		has, err := h.store.HasDirListingIncomplete(dirname)
-		ok = err == nil && has
+	spilled := h.dirIncompleteSpilled.Load()
+	if !ok && !spilled {
+		return false
 	}
-	if ok {
-		if err := h.store.ClearDirListingIncomplete(dirname); err != nil {
-			jmlog.Warn("dir listing record not cleared", "dir", dirname, "error", err.Error())
+	deleted, err := h.store.ClearDirListingIncomplete(dirname)
+	if err != nil {
+		jmlog.Warn("dir listing record not cleared", "dir", dirname, "error", err.Error())
+	}
+	if spilled && deleted {
+		h.unspillDirListingLocked()
+	}
+	return ok || deleted
+}
+
+// unspillDirListingLocked brings every durable record back into memory once
+// the DB holds fewer than the bound, so READDIR stops consulting SQLite.
+// Caller holds dirListingPersistMu.
+func (h *JuiceMountHandler) unspillDirListingLocked() {
+	n, err := h.store.CountDirListingIncomplete()
+	if err != nil || n >= dirListingMaxTracked {
+		return
+	}
+	dirs, err := h.store.ListDirListingIncomplete()
+	if err != nil {
+		return
+	}
+	h.dirRefreshMu.Lock()
+	defer h.dirRefreshMu.Unlock()
+	for _, d := range dirs {
+		if h.dirIncomplete[d] == nil {
+			h.dirIncomplete[d] = &dirListingState{}
 		}
 	}
-	return ok
+	h.dirIncompleteCount.Store(int64(len(h.dirIncomplete)))
+	h.dirIncompleteSpilled.Store(false)
 }
 
 // dirListingGone reports a readdir error that means the directory no longer
@@ -213,28 +257,45 @@ func inDirTree(p, dir string) bool {
 	return p == dir || (strings.HasPrefix(p, dir) && p[len(dir)] == '/')
 }
 
+// dirListingTreeKeysLocked returns the recorded keys in dir's tree. It scans
+// the whole record, so it runs under dirListingPersistMu alone: every writer
+// of the map holds that lock too, and READDIR's dirRefreshMu stays free.
+func (h *JuiceMountHandler) dirListingTreeKeysLocked(dir string) []string {
+	var keys []string
+	for k := range h.dirIncomplete {
+		if inDirTree(k, dir) {
+			keys = append(keys, k)
+		}
+	}
+	return keys
+}
+
 // clearDirListingTree drops the records of dir and everything below it
-// after dir was removed.
+// after directory dir was removed.
 func (h *JuiceMountHandler) clearDirListingTree(dir string) {
 	if h.dirListingNone() {
 		return
 	}
 	h.dirListingPersistMu.Lock()
 	defer h.dirListingPersistMu.Unlock()
-	h.dirRefreshMu.Lock()
-	hit := false
-	for k := range h.dirIncomplete {
-		if inDirTree(k, dir) {
+	keys := h.dirListingTreeKeysLocked(dir)
+	if len(keys) > 0 {
+		h.dirRefreshMu.Lock()
+		for _, k := range keys {
 			delete(h.dirIncomplete, k)
-			hit = true
 		}
+		h.dirIncompleteCount.Store(int64(len(h.dirIncomplete)))
+		h.dirRefreshMu.Unlock()
 	}
-	h.dirIncompleteCount.Store(int64(len(h.dirIncomplete)))
-	h.dirRefreshMu.Unlock()
-	if hit || h.dirIncompleteSpilled.Load() {
-		if err := h.store.ClearDirListingIncompleteTree(dir); err != nil {
-			jmlog.Warn("dir listing records not cleared", "dir", dir, "error", err.Error())
-		}
+	spilled := h.dirIncompleteSpilled.Load()
+	if len(keys) == 0 && !spilled {
+		return
+	}
+	if err := h.store.ClearDirListingIncompleteTree(dir); err != nil {
+		jmlog.Warn("dir listing records not cleared", "dir", dir, "error", err.Error())
+	}
+	if spilled {
+		h.unspillDirListingLocked()
 	}
 }
 
@@ -247,29 +308,33 @@ func (h *JuiceMountHandler) renameDirListingTree(oldpath, newpath string) {
 	}
 	h.dirListingPersistMu.Lock()
 	defer h.dirListingPersistMu.Unlock()
-	h.dirRefreshMu.Lock()
-	moved := make(map[string]*dirListingState)
-	hit := false
-	for k, st := range h.dirIncomplete {
-		switch {
-		case inDirTree(k, oldpath):
-			moved[newpath+k[len(oldpath):]] = st
+	from := h.dirListingTreeKeysLocked(oldpath)
+	replaced := h.dirListingTreeKeysLocked(newpath)
+	if len(from)+len(replaced) > 0 {
+		h.dirRefreshMu.Lock()
+		moved := make(map[string]*dirListingState, len(from))
+		for _, k := range from {
+			moved[newpath+k[len(oldpath):]] = h.dirIncomplete[k]
 			delete(h.dirIncomplete, k)
-			hit = true
-		case inDirTree(k, newpath):
+		}
+		for _, k := range replaced {
 			delete(h.dirIncomplete, k)
-			hit = true
 		}
-	}
-	for k, st := range moved {
-		h.dirIncomplete[k] = st
-	}
-	h.dirIncompleteCount.Store(int64(len(h.dirIncomplete)))
-	h.dirRefreshMu.Unlock()
-	if hit || h.dirIncompleteSpilled.Load() {
-		if err := h.store.RenameDirListingIncomplete(oldpath, newpath); err != nil {
-			jmlog.Warn("dir listing records not renamed", "old", oldpath, "new", newpath, "error", err.Error())
+		for k, st := range moved {
+			h.dirIncomplete[k] = st
 		}
+		h.dirIncompleteCount.Store(int64(len(h.dirIncomplete)))
+		h.dirRefreshMu.Unlock()
+	}
+	spilled := h.dirIncompleteSpilled.Load()
+	if len(from)+len(replaced) == 0 && !spilled {
+		return
+	}
+	if err := h.store.RenameDirListingIncomplete(oldpath, newpath); err != nil {
+		jmlog.Warn("dir listing records not renamed", "old", oldpath, "new", newpath, "error", err.Error())
+	}
+	if spilled {
+		h.unspillDirListingLocked()
 	}
 }
 
@@ -282,6 +347,8 @@ func (h *JuiceMountHandler) loadDirListingRecords() {
 		jmlog.Warn("dir listing records not loaded", "error", err.Error())
 		return
 	}
+	h.dirListingPersistMu.Lock()
+	defer h.dirListingPersistMu.Unlock()
 	h.dirRefreshMu.Lock()
 	defer h.dirRefreshMu.Unlock()
 	for _, d := range dirs {
