@@ -41,6 +41,19 @@ workers.
   Before, an in-place edit that kept the file's size and timestamp, and landed
   in the same timestamp tick as the block's last change, could hand over bytes
   that no longer matched the hash. Older blocks keep the metadata check.
+- Renaming a just-copied file while the mount is busy, for example during a
+  large copy onto it, no longer loses the file. When a rename took
+  longer than the mount's reply limit, it still finished, but the Mac's
+  automatic resend of the same rename could discard the renamed file's
+  not-yet-uploaded bytes and leave its name reporting an I/O error, while Finder
+  showed no error. The same resend of a delete or a file creation could delete
+  or empty a file another app had put at that name in the meantime, and a
+  resent rename could replace the moved file with a new one. A resend of a
+  rename, delete or creation that already finished is now answered as the
+  success it was, once, for up to 40 seconds, without running it again. The
+  Mac cannot tell a resend from an identical new request within that time,
+  so such a request is also answered without running; repeat it if needed. A
+  rename of a missing source no longer touches the destination.
 
 ### Server
 

@@ -113,6 +113,13 @@ func TestSetForTestIsTestOnly(t *testing.T) {
 	checked := 0
 	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
+			// Tests in other packages create and remove fixture directories
+			// inside the checkout while this walk runs (bridge does when the
+			// host's temp dir is /tmp); an entry that vanished mid-walk is
+			// never production code.
+			if os.IsNotExist(err) {
+				return nil
+			}
 			return err
 		}
 		if d.IsDir() {

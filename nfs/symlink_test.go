@@ -179,6 +179,7 @@ func TestSymlinkDanglingTarget(t *testing.T) {
 // materialized by the drainer on reconnect.
 func newSymlinkSpoolTestFS(t *testing.T) (*juiceFS, string, *SpoolStore, *Drainer) {
 	t.Helper()
+	useSpoolFixtureMutationBound(t)
 	fuseRoot := t.TempDir()
 
 	store, err := metadata.Open(filepath.Join(t.TempDir(), "meta.db"))

@@ -94,6 +94,7 @@ type JuiceMountHandler struct {
 	inPlaceMutationMu      sync.Mutex
 	inPlaceMutations       map[string]*inPlaceMutationLock
 	namespace              namespaceCoordinator
+	completedMutations     completedMutations
 	continuations          continuationGate
 	metadataPrepareMu      sync.Mutex
 	metadataPrepareStop    chan struct{}
@@ -2576,6 +2577,9 @@ func splitPath(p string) []string {
 // and proxying file I/O to the JuiceFS FUSE mount.
 type juiceFS struct {
 	handler *JuiceMountHandler
+	// retryPrincipal is the RPC credential of the request this value serves
+	// (defense in depth only); see SetMutationPrincipal.
+	retryPrincipal string
 }
 
 // deletedHandleFS represents a recently-unlinked AppleDouble file or removed
@@ -4422,7 +4426,7 @@ func (jfs *juiceFS) CommitFile(path string) error {
 func (jfs *juiceFS) Create(filename string) (billy.File, error) {
 	filename = strings.TrimPrefix(filename, "/")
 	return runNamespaceOperation(jfs.handler, []string{filename}, func(op *namespaceOperation) (billy.File, error) {
-		return jfs.create(filename, op)
+		return jfs.createOnce(filename, op)
 	}, closeNamespaceFile)
 }
 
@@ -4597,7 +4601,7 @@ func (jfs *juiceFS) Rename(oldpath, newpath string) error {
 	oldpath = strings.TrimPrefix(oldpath, "/")
 	newpath = strings.TrimPrefix(newpath, "/")
 	return jfs.namespaceMutation([]string{oldpath, newpath}, func(op *namespaceOperation) error {
-		return jfs.rename(oldpath, newpath, op)
+		return jfs.renameOnce(oldpath, newpath, op)
 	})
 }
 
@@ -4657,6 +4661,25 @@ func (jfs *juiceFS) rename(oldpath, newpath string, op *namespaceOperation) erro
 	// Migration failure fails the RPC: proceeding with a FUSE rename while
 	// the spool still targets the old path is exactly the silent-resurrect
 	// bug this exists to fix. The client retries cleanly.
+	//
+	// A source that is already gone must fail before step 1 touches the
+	// destination: the cancel is a delete of whatever the destination holds.
+	// A resent RENAME whose first attempt finished after a JUKEBOX reply
+	// arrives exactly like that, and cancelling then discarded the unspooled
+	// bytes of the file the first attempt had just moved there and poisoned
+	// both names, while macOS turned the RENAME ENOENT into success.
+	// renameOnce answers such a resend; this covers one it cannot match. The
+	// mirror (durable) and the spool vouch for known sources, so only an
+	// unmirrored one costs the backend probe os.Rename would make anyway.
+	if spool := jfs.handler.spool.Load(); spool != nil && oldEntry == nil && oldpath != newpath {
+		if _, ok := spool.LookupActive(oldpath); !ok {
+			if row, err := spool.meta.LookupByPath(oldpath); err != nil || row == nil {
+				if _, err := os.Lstat(jfs.fullPath(oldpath)); os.IsNotExist(err) {
+					return err
+				}
+			}
+		}
+	}
 	migrated := 0
 	if spool := jfs.handler.spool.Load(); spool != nil {
 		// Cancel any active destination entry UNCONDITIONALLY (adversarial-
@@ -4876,7 +4899,7 @@ func (jfs *juiceFS) rename(oldpath, newpath string, op *namespaceOperation) erro
 func (jfs *juiceFS) Remove(filename string) error {
 	filename = strings.TrimPrefix(filename, "/")
 	return jfs.namespaceMutation([]string{filename}, func(op *namespaceOperation) error {
-		return jfs.remove(filename, op)
+		return jfs.removeOnce(filename, op)
 	})
 }
 
