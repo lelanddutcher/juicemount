@@ -49,19 +49,22 @@ func (p *phaseHolds) hold(phase, name string) *phaseHold {
 // jukeboxed runs call past the RPC mutation bound: the worker is parked at
 // (phase, name) until the call has returned errFUSETimeout, which the RPC layer
 // answers NFS3ERR_JUKEBOX. The worker then finishes the mutation on its own.
+// The worker may reach the checkpoint before or after the bound expires; held
+// there, it cannot finish before the call has timed out either way. The bound
+// only has to outlast admission, so it is not a race against a slow worker.
 func jukeboxed(t *testing.T, jfs *juiceFS, holds *phaseHolds, phase, name string, call func() error) {
 	t.Helper()
 	h := holds.hold(phase, name)
-	t.Setenv("JM_MUTATION_OP_TIMEOUT_MS", "20")
+	t.Setenv("JM_MUTATION_OP_TIMEOUT_MS", "250")
 	done := make(chan error, 1)
 	go func() { done <- call() }()
-	select {
-	case <-h.entered:
-	case err := <-done:
-		t.Fatalf("first transmission = %v without reaching %s %s", err, phase, name)
-	}
 	if err := <-done; !errors.Is(err, errFUSETimeout) {
 		t.Fatalf("first transmission = %v, want the JUKEBOX timeout", err)
+	}
+	select {
+	case <-h.entered:
+	case <-time.After(30 * time.Second):
+		t.Fatalf("worker never reached %s %s", phase, name)
 	}
 	close(h.release)
 	awaitNamespaceIdle(t, &jfs.handler.namespace)
