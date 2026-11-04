@@ -2577,8 +2577,8 @@ func splitPath(p string) []string {
 // and proxying file I/O to the JuiceFS FUSE mount.
 type juiceFS struct {
 	handler *JuiceMountHandler
-	// retryPrincipal is the RPC credential of the request this value serves;
-	// see SetMutationPrincipal.
+	// retryPrincipal is the RPC credential of the request this value serves
+	// (defense in depth only); see SetMutationPrincipal.
 	retryPrincipal string
 }
 

@@ -63,7 +63,9 @@ func renameErrStatus(err error) NFSStatus {
 
 // requestPrincipal identifies who sent an RPC, for matching a resend to the
 // request it repeats. It is the credential flavor and body, minus the AUTH_SYS
-// stamp, which a client may change between transmissions (macOS sends 0).
+// stamp, which a client may change between transmissions (macOS sends 0). It
+// distinguishes nothing under AUTH_NONE, which is what macOS sends to the
+// production export (AUTH_NULL only, no sec= option).
 func requestPrincipal(r *request) string {
 	body := r.Header.Cred.Body
 	if r.Header.Cred.Flavor == authSysFlavor && len(body) >= 4 {

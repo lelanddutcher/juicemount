@@ -18,9 +18,16 @@ import (
 // of exactly that request is answered success without running it again. There
 // is no XID duplicate-request cache to lean on: the macOS client gives a
 // JUKEBOX retry a new XID (NFS kext nfs_request_finish: "req->r_xid = 0; //
-// get a new XID"). The key is therefore the request itself: operation, both
-// names and the RPC credential. An entry is replayed at most once, and only
-// while the namespace still shows the outcome that worker produced.
+// get a new XID"). The key is therefore the request itself: operation and
+// both names. An entry is replayed at most once, and only while the namespace
+// still shows the outcome that worker produced; that state check is what makes
+// a replay safe.
+//
+// The key also carries the RPC credential, but in production that separates
+// nothing: Mount offers only AUTH_NULL and the mount options set no sec=, so
+// macOS sends AUTH_NONE and every request shares one principal. Even under
+// AUTH_SYS, macOS sends an empty hostname, so the credential names a uid, not
+// a client. It is kept as defense in depth for an AUTH_SYS client.
 //
 // The TTL follows the same client code. It waits NFS_TRYLATERDEL (4 s) before
 // the first resend and doubles the wait up to a 30 s cap. A resend that lands
@@ -107,8 +114,11 @@ func (c *completedMutations) take(key completedMutationKey) (mutationIdentity, b
 }
 
 // SetMutationPrincipal scopes remembered late mutations to the RPC
-// credential that sent them (see completedMutations). FromHandle returns a
-// fresh filesystem value per RPC, so this never leaks across requests.
+// credential that sent them (see completedMutations; under the production
+// AUTH_NULL export every request has the same one). It writes the receiver, so
+// it relies on FromHandle returning a fresh filesystem value for every RPC. A
+// wrapper or cache that shared one value across requests would let concurrent
+// RPCs overwrite each other's principal.
 func (jfs *juiceFS) SetMutationPrincipal(principal string) {
 	jfs.retryPrincipal = principal
 }

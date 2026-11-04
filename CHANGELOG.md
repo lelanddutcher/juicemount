@@ -47,9 +47,11 @@ workers.
   automatic resend of the same rename could discard the renamed file's
   not-yet-uploaded bytes and leave its name reporting an I/O error, while Finder
   showed no error. The resend is now answered as the success it was, once, for
-  up to 60 seconds. A rename whose source or destination changed in between
-  is run normally, and a rename of a missing source no longer touches the
-  destination.
+  up to 60 seconds, but only while the source is still gone and the
+  destination still holds the renamed file. A rename whose source or
+  destination changed in between is run normally, and a rename of a missing
+  source no longer touches the destination. The Mac does not identify itself
+  on these requests, so the check is on the files, not on who sent the rename.
 
 ### Server
 
