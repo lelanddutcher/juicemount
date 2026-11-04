@@ -169,11 +169,20 @@ func TestRenameReplayRequiresTheSameRequestAndState(t *testing.T) {
 			t.Fatalf("resent rename = %v, want success", err)
 		}
 	})
+	t.Run("last resend inside the retry cap", func(t *testing.T) {
+		// macOS resends at most 30 s after the late completion.
+		jfs, holds, _ := newRenameRetryHarness(t)
+		jukeboxed(t, jfs, holds, "publish", "dir/a.mov", renameCall(jfs, "dir/a.mov", "dir/b.mov"))
+		jfs.handler.completedMutations.now = func() time.Time { return time.Now().Add(32 * time.Second) }
+		if err := jfs.Rename("dir/a.mov", "dir/b.mov"); err != nil {
+			t.Fatalf("resend 32 s after completion = %v, want success", err)
+		}
+	})
 	t.Run("expired", func(t *testing.T) {
 		jfs, holds, _ := newRenameRetryHarness(t)
 		jukeboxed(t, jfs, holds, "publish", "dir/a.mov", renameCall(jfs, "dir/a.mov", "dir/b.mov"))
-		jfs.handler.completedMutations.now = func() time.Time { return time.Now().Add(completedMutationTTL) }
-		wantNoEnt(t, "resend after the TTL", jfs.Rename("dir/a.mov", "dir/b.mov"))
+		jfs.handler.completedMutations.now = func() time.Time { return time.Now().Add(40 * time.Second) }
+		wantNoEnt(t, "resend 40 s after completion", jfs.Rename("dir/a.mov", "dir/b.mov"))
 	})
 	t.Run("answered rename", func(t *testing.T) {
 		jfs, _, _ := newRenameRetryHarness(t)
@@ -339,6 +348,10 @@ func TestCreateResentAfterJukeboxKeepsWrittenBytes(t *testing.T) {
 			})
 			payload := patternedPayload(64<<10, 4)
 			writeAtVia(t, jfs, name, payload)
+			before := jfs.handler.store.LookupByPath(name)
+			if before == nil {
+				t.Fatal("precondition: created file is not mirrored")
+			}
 
 			f, err := jfs.Create(name)
 			if err != nil {
@@ -352,6 +365,11 @@ func TestCreateResentAfterJukeboxKeepsWrittenBytes(t *testing.T) {
 			}
 			if fi, err := jfs.Stat(name); err != nil || fi.Size() != int64(len(payload)) {
 				t.Fatalf("after resent create: %v, %v; want %d bytes kept", fi, err, len(payload))
+			}
+			// The spool path never truncated; there a resend re-minted the
+			// synthetic inode, staling the handle the writer already holds.
+			if after := jfs.handler.store.LookupByPath(name); after == nil || after.Inode != before.Inode {
+				t.Fatalf("resent create changed the file's inode: %d -> %+v", before.Inode, after)
 			}
 		})
 	}

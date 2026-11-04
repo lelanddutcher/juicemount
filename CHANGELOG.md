@@ -50,8 +50,8 @@ workers.
   or empty a file another app had put at that name in the meantime, and a
   resent rename could replace the moved file with a new one. A resend of a
   rename, delete or creation that already finished is now answered as the
-  success it was, once, for up to 60 seconds, without running it again. The
-  Mac cannot tell a resend from an identical new request within that minute,
+  success it was, once, for up to 40 seconds, without running it again. The
+  Mac cannot tell a resend from an identical new request within that time,
   so such a request is also answered without running; repeat it if needed. A
   rename of a missing source no longer touches the destination.
 

@@ -51,10 +51,14 @@ import (
 // the first resend and doubles the wait up to a 30 s cap. A resend that lands
 // while the worker still owns the names is answered JUKEBOX again, so the
 // resend that finds the finished state arrives within one cap interval of the
-// worker finishing. 60 s covers that interval twice over; anything later is
-// not this client's retry of this request.
+// worker finishing (the entry is recorded at that moment). 40 s is that cap
+// plus margin for queueing and the client's one-second sleep granularity.
+// It is kept short on purpose: on an intr mount a resend can be abandoned,
+// leaving the entry live, and an app that saves atomically under a fixed
+// temporary name and is killed mid-save could otherwise have its next save's
+// identical rename answered without running.
 const (
-	completedMutationTTL = 60 * time.Second
+	completedMutationTTL = 40 * time.Second
 	completedMutationCap = 256
 )
 
