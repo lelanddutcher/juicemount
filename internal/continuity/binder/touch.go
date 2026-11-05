@@ -14,15 +14,17 @@ import (
 // not change re-puts the hint with its own value ("touch"): the catalog
 // moves the hint's UpdatedSequence, and nothing else changes.
 //
-// Coalesced so ingests do not flood the catalog: an inode bound, moved or
-// touched within TouchInterval (default 10 min) is not touched again, and
-// touches are limited to TouchRate a second (default 20, bursts of 200);
-// both skips are counted (touches_skipped). The recent-inode memory holds
-// at most defaultTouchMemory inodes.
+// Each touch is a permanent catalog event, so they are kept few: only
+// paths Config.Touch accepts (the Manager: files under some saved query's
+// folder), an inode bound, moved or touched within TouchInterval (default
+// 10 min) is not touched again, and touches are limited to TouchRate a
+// second (default 5, bursts of 50); the last two skips are counted
+// (touches_skipped). The recent-inode memory holds at most
+// defaultTouchMemory inodes.
 const (
 	defaultTouchInterval = 10 * time.Minute
-	defaultTouchRate     = 20
-	defaultTouchBurst    = 200
+	defaultTouchRate     = 5
+	defaultTouchBurst    = 50
 	defaultTouchMemory   = 65536
 )
 

@@ -202,11 +202,12 @@ counters and `complete: false`; a later rescan starts from them.
 - Recency marker (`touch.go`): an `update` event for a bound file whose
   records did not move re-puts its hint with the same value (operation kind
   `touch`), which moves the hint's `UpdatedSequence`, so "most recently
-  recorded" also covers saves in place. An inode bound, moved or touched
-  within `TouchInterval` (10 min) is not touched again, touches are limited
-  to `TouchRate` (20 a second, bursts of 200), and both skips are counted
-  (`touches_skipped`; `touched` counts the rest). Each touch is one catalog
-  event.
+  recorded" also covers saves in place. Each touch is a permanent catalog
+  event, so only paths `Config.Touch` accepts are touched (the Manager: files
+  under a saved query's folder), an inode bound, moved or touched within
+  `TouchInterval` (10 min) is not touched again, and touches are limited to
+  `TouchRate` (5 a second, bursts of 50); the last two skips are counted
+  (`touches_skipped`; `touched` counts the rest).
 
 ## API (admin key)
 

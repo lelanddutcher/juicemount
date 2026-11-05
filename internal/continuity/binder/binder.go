@@ -139,7 +139,9 @@ type Config struct {
 	Logf           func(format string, args ...any)
 	Now            func() time.Time
 	// TouchInterval, TouchRate and TouchBurst bound the recency marker on
-	// update events (touch.go; defaults 10 min, 20 a second, 200).
+	// update events (touch.go; defaults 10 min, 5 a second, 50). Touch,
+	// when set, says which paths want it (nil: every path).
+	Touch         func(path string) bool
 	TouchInterval time.Duration
 	TouchRate     float64
 	TouchBurst    int
@@ -468,11 +470,11 @@ func (b *Binder) apply(ctx context.Context, v *volume, ev Event) error {
 		}
 		old, renamed := cleanPath(ev.OldPath)
 		if !renamed || ev.Op != "rename" {
-			return b.observeTouch(ctx, v, p, ev.Op == "update")
+			return b.observeTouch(ctx, v, p, false, ev.Op == "update")
 		}
 		moved, known := b.paths.get(old)
 		b.paths.remove(old)
-		err := b.observe(ctx, v, p, true)
+		err := b.observeTouch(ctx, v, p, true, false)
 		if known && old != p && path.Dir(old) == path.Dir(p) {
 			b.noteMove(moved, old, p)
 		}
@@ -487,18 +489,19 @@ func (b *Binder) apply(ctx context.Context, v *volume, ev Event) error {
 
 // observeTouch is observe, then, for an update event of a file whose
 // records did not move, the recency marker (touch.go). Any operation the
-// observe applied already moved the sequence and counts as recent.
-func (b *Binder) observeTouch(ctx context.Context, v *volume, p string, update bool) error {
+// observe applied (a bind, a move) already moved the sequence and counts
+// as recent.
+func (b *Binder) observeTouch(ctx context.Context, v *volume, p string, renamed, update bool) error {
 	before := b.applied.Load()
 	b.observed = 0
-	if err := b.observe(ctx, v, p, false); err != nil || b.observed == 0 {
+	if err := b.observe(ctx, v, p, renamed); err != nil || b.observed == 0 {
 		return err
 	}
 	if b.applied.Load() != before {
 		b.recent.put(b.observed, b.cfg.Now(), b.cfg.TouchInterval)
 		return nil
 	}
-	if !update {
+	if !update || (b.cfg.Touch != nil && !b.cfg.Touch(p)) {
 		return nil
 	}
 	return b.touch(ctx, v, b.observed)

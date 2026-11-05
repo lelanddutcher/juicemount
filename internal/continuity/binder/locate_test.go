@@ -117,3 +117,32 @@ func TestUpdateTouchesHintSequence(t *testing.T) {
 		t.Fatalf("a create touched: %+v", f.b.Stats())
 	}
 }
+
+// Only paths Config.Touch accepts are touched, and a rename (like a bind)
+// counts as recent.
+func TestTouchFilterAndRenameIsRecent(t *testing.T) {
+	var mu sync.Mutex
+	now := time.Date(2026, 11, 5, 12, 0, 0, 0, time.UTC)
+	clock := func() time.Time { mu.Lock(); defer mu.Unlock(); return now }
+	advance := func(d time.Duration) { mu.Lock(); now = now.Add(d); mu.Unlock() }
+	f := newFixtureWith(t, Config{Now: clock, Touch: func(p string) bool { return path.Dir(p) == "Q" }}, true)
+	a := f.create("Q/a.mov")
+	o := f.create("O/o.mov")
+	f.feed(Event{Op: "create", Path: "Q/a.mov", Inode: a}, Event{Op: "create", Path: "O/o.mov", Inode: o})
+	advance(time.Hour)
+	f.feed(Event{Op: "update", Path: "O/o.mov", Inode: o})
+	if st := f.b.Stats(); st.Touched != 0 || st.TouchesSkipped != 0 {
+		t.Fatalf("a path outside the filter was touched: %+v", st)
+	}
+	f.rename("Q/a.mov", "Q/b.mov")
+	f.feed(Event{Op: "rename", Path: "Q/b.mov", OldPath: "Q/a.mov", Inode: a})
+	f.feed(Event{Op: "update", Path: "Q/b.mov", Inode: a})
+	if st := f.b.Stats(); st.Touched != 0 || st.TouchesSkipped != 1 {
+		t.Fatalf("an update right after a rename: %+v", st)
+	}
+	advance(time.Hour)
+	f.feed(Event{Op: "update", Path: "Q/b.mov", Inode: a})
+	if st := f.b.Stats(); st.Touched != 1 {
+		t.Fatalf("an update under the filter: %+v", st)
+	}
+}
