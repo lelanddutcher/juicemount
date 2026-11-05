@@ -182,7 +182,7 @@ func newTestSmartFolders(t *testing.T, o svcOpts) *smartFoldersService {
 		o.maxViews = 256
 	}
 	cfg := smartFoldersConfig{
-		Settings:  smartFoldersSettings{Root: "Recents", MaxViews: o.maxViews},
+		Settings:  smartFoldersSettings{Root: "Recents", MaxViews: o.maxViews, CollectionsRoot: "Collections"},
 		Backend:   o.backend,
 		Redis:     o.rdb,
 		StatePath: o.state,
@@ -673,11 +673,17 @@ func metaWriteFile(t *testing.T, m meta.Meta, p string) {
 // metaTree is viewTree for the metadata backend, resolving links by hand.
 func metaTree(t *testing.T, m meta.Meta) map[string]string {
 	t.Helper()
+	return metaTreeAt(t, m, "Recents")
+}
+
+// metaTreeAt is metaTree for the smart-folder root `root`.
+func metaTreeAt(t *testing.T, m meta.Meta, root string) map[string]string {
+	t.Helper()
 	ctx := meta.Background()
 	out := map[string]string{}
 	var recents meta.Ino
 	var attr meta.Attr
-	if st := m.Lookup(ctx, meta.RootInode, "Recents", &recents, &attr, false); st == syscall.ENOENT {
+	if st := m.Lookup(ctx, meta.RootInode, root, &recents, &attr, false); st == syscall.ENOENT {
 		return out
 	}
 	var views []*meta.Entry
@@ -704,7 +710,7 @@ func metaTree(t *testing.T, m meta.Meta) map[string]string {
 			if strings.HasPrefix(text, "/") {
 				t.Fatalf("absolute link %q", text)
 			}
-			target := path.Clean(path.Join("Recents", string(v.Name), text))
+			target := path.Clean(path.Join(root, string(v.Name), text))
 			cur := meta.RootInode
 			for _, c := range strings.Split(target, "/") {
 				var next meta.Ino

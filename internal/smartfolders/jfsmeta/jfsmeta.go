@@ -300,6 +300,39 @@ func (f *FS) Remove(p string) error {
 	return errno(f.m.Unlink(f.ctx, dir, leaf, true))
 }
 
+// Empty reports whether the directory p holds no entries.
+func (f *FS) Empty(p string) (bool, error) {
+	ino, attr, err := f.lookup(p)
+	if err != nil {
+		return false, err
+	}
+	if attr.Typ != meta.TypeDirectory {
+		return false, syscall.ENOTDIR
+	}
+	var entries []*meta.Entry
+	if st := f.m.Readdir(f.ctx, ino, 0, &entries); st != 0 {
+		return false, st
+	}
+	for _, e := range entries {
+		if name := string(e.Name); name != "." && name != ".." {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+// Rmdir removes the empty directory p without moving it to the trash. Like
+// Remove it works by name; the reconciler only removes a view directory
+// after moving it to a random hidden name it recorded and checking that
+// the directory there is its own.
+func (f *FS) Rmdir(p string) error {
+	dir, leaf, err := f.parent(p)
+	if err != nil {
+		return err
+	}
+	return errno(f.m.Rmdir(f.ctx, dir, leaf, true))
+}
+
 // The read-only lookups below serve the continuity binder. Each is plain
 // metadata reads (GET i<ino>, HGET/HGETALL d<dir>, HGETALL p<ino>, or the
 // allow-listed scriptLookup): reads pass the RESP proxy unchecked

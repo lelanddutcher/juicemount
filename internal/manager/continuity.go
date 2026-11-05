@@ -25,6 +25,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -62,6 +63,9 @@ type continuityService struct {
 	done     sync.WaitGroup
 	stopOnce sync.Once
 	stopWait time.Duration
+	// views shows the collections as smart folders
+	// (smartfolders_collections.go); nil while not attached.
+	views atomic.Pointer[smartFoldersService]
 }
 
 func (s *continuityService) start() {
@@ -111,8 +115,87 @@ func (a *API) startContinuity(cfg Config, getenv func(string) string) *continuit
 		svc.start()
 		library, _ := svc.store.LibraryID()
 		log.Printf("manager: continuity ON (experimental): binding volume files to catalog %s", library)
+		a.attachCollectionViews(svc)
 	}
 	return svc
+}
+
+// attachCollectionViews shows the collections as smart folders when smart
+// folders run too (JM_SMART_FOLDERS=on; started before continuity).
+func (a *API) attachCollectionViews(svc *continuityService) {
+	if a.jobs == nil {
+		return
+	}
+	a.jobs.mu.RLock()
+	sf, _ := a.jobs.smartFolders.(*smartFoldersService)
+	a.jobs.mu.RUnlock()
+	if sf != nil && sf.attachCollections(svc) {
+		svc.views.Store(sf)
+	}
+}
+
+// collectionsChanged tells the collection views a collection changed.
+func (s *continuityService) collectionsChanged() {
+	if v := s.views.Load(); v != nil {
+		v.collectionsChanged()
+	}
+}
+
+// activeCollections lists every collection that is not removed.
+func (s *continuityService) activeCollections(ctx context.Context) ([]catalog.Collection, error) {
+	library, err := s.store.LibraryID()
+	if err != nil {
+		return nil, err
+	}
+	var out []catalog.Collection
+	var after catalog.CollectionID
+	for {
+		page, err := s.store.ListCollections(ctx, library, after, catalog.MaxPageSize)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, page...)
+		if len(page) < catalog.MaxPageSize {
+			return out, nil
+		}
+		after = page[len(page)-1].ID
+	}
+}
+
+// collectionMembers lists a collection's active members (at most
+// catalog.MaxCollectionMembers), ordered by asset ID.
+func (s *continuityService) collectionMembers(ctx context.Context, id catalog.CollectionID) ([]catalog.CollectionMember, error) {
+	library, err := s.store.LibraryID()
+	if err != nil {
+		return nil, err
+	}
+	var out []catalog.CollectionMember
+	var after continuity.AssetID
+	for {
+		page, err := s.store.ListCollectionMembers(ctx, library, id, after, catalog.MaxPageSize)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, page...)
+		if len(page) < catalog.MaxPageSize {
+			return out, nil
+		}
+		after = page[len(page)-1].AssetID
+	}
+}
+
+// resolveAsset returns the asset's current path, resolved from the volume
+// by inode (never the path hint), and its state as the members API reports
+// it.
+func (s *continuityService) resolveAsset(ctx context.Context, id continuity.AssetID) (string, string, error) {
+	v, err := s.binder.AssetByID(ctx, id)
+	if errors.Is(err, catalog.ErrNotFound) {
+		return "", "missing", nil
+	}
+	if err != nil {
+		return "", "", err
+	}
+	return v.Path, memberState(v), nil
 }
 
 func buildContinuity(cfg Config, getenv func(string) string) *continuityService {
@@ -344,5 +427,9 @@ func (a *API) handleContinuityStatus(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"enabled": false})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"enabled": true, "binder": svc.binder.Stats()})
+	out := map[string]any{"enabled": true, "binder": svc.binder.Stats()}
+	if v := svc.views.Load(); v != nil {
+		out["collection_views"] = v.collectionStats()
+	}
+	writeJSON(w, http.StatusOK, out)
 }

@@ -21,6 +21,9 @@ var (
 	ErrTooManyViews = errors.New("smart-folder view limit reached")
 	// ErrBadView: the folder name cannot be a view.
 	ErrBadView = errors.New("invalid smart-folder view")
+	// ErrViewInUse: RemoveView left the view because it holds an entry
+	// the Manager did not create (a user's file). It is retried later.
+	ErrViewInUse = errors.New("view holds entries the Manager did not create")
 
 	// Per-link refusals (Result.Refused).
 	ErrBadName          = errors.New("invalid link name")
@@ -63,6 +66,9 @@ type OwnedView struct {
 	OwnedDir
 	Links map[string]*OwnedLink `json:"links,omitempty"` // by link name
 	Temps map[string]*OwnedTemp `json:"temps,omitempty"` // by temp name
+	// RemoveAs is the random hidden name in the root that RemoveView moves
+	// the (empty) view to before removing it there; set while that runs.
+	RemoveAs string `json:"remove_as,omitempty"`
 }
 
 // OwnedLink is one symlink the Manager created and placed.
@@ -107,6 +113,7 @@ func (f Refusal) TargetGone() bool {
 type Result struct {
 	CreatedRoot bool
 	CreatedView bool
+	RemovedView bool // RemoveView removed the view directory
 	Created     []string
 	Retargeted  []string
 	Removed     []string
@@ -119,7 +126,7 @@ type Result struct {
 
 // Changed reports whether the volume was modified.
 func (r Result) Changed() bool {
-	return r.CreatedRoot || r.CreatedView || len(r.Created)+len(r.Retargeted)+len(r.Removed) > 0
+	return r.CreatedRoot || r.CreatedView || r.RemovedView || len(r.Created)+len(r.Retargeted)+len(r.Removed) > 0
 }
 
 // Reconciler keeps views of relative symlinks in a volume. It is not safe
@@ -138,6 +145,10 @@ type Reconciler struct {
 	Gate func(view string) (release func(), err error)
 	// MaxViews bounds the number of view directories (0 = unbounded).
 	MaxViews int
+	// Exclude names other top-level folders no link may point into: the
+	// other smart-folder roots, so one kind of view never links into
+	// another.
+	Exclude []string
 
 	rootPerm fs.FileMode // mode of the owned root, from the last CheckRoot
 	release  []func()    // gate releases held by the running Reconcile
@@ -257,6 +268,14 @@ func droppedTemps(view string, ov *OwnedView) *DroppedTempsError {
 	return &DroppedTempsError{Names: names}
 }
 
+// droppedRemoval names the hidden name a view was being removed under.
+func (r *Reconciler) droppedRemoval(ov *OwnedView) []string {
+	if ov == nil || ov.RemoveAs == "" {
+		return nil
+	}
+	return []string{r.Root + "/" + ov.RemoveAs}
+}
+
 // dropAll forgets the root and every view, reporting their temp names.
 func (r *Reconciler) dropAll() error {
 	var names []string
@@ -264,6 +283,7 @@ func (r *Reconciler) dropAll() error {
 		if d := droppedTemps(r.Root+"/"+folder, r.Own.Views[folder]); d != nil {
 			names = append(names, d.Names...)
 		}
+		names = append(names, r.droppedRemoval(r.Own.Views[folder])...)
 	}
 	r.Own.Root, r.Own.Views = nil, map[string]*OwnedView{}
 	if names == nil {
@@ -332,7 +352,8 @@ func (r *Reconciler) PreviousNames(folder string) map[string]string {
 //     name; a link no longer wanted is moved aside to a recorded temp name
 //     and only unlinked there if it is the Manager's; an unchanged one is
 //     left alone (same inode);
-//   - an emptied view stays, empty: the Manager never removes a directory;
+//   - an emptied view stays, empty: Reconcile never removes a directory
+//     (RemoveView does, once the view is wanted no more);
 //   - anything the Manager did not create is never modified or removed:
 //     an existing root or view it did not create is ErrNotManaged, a
 //     recorded name now holding something else is dropped from the records
@@ -386,6 +407,23 @@ func (r *Reconciler) Reconcile(folder string, want []Link) (Result, error) {
 		fixPerm = append(fixPerm, r.Root)
 	}
 	ov := r.Own.Views[folder]
+	if ov != nil && ov.RemoveAs != "" && rootState == RootOwned {
+		// An interrupted RemoveView: settle it before looking at the name.
+		release, err := r.gateView(view)
+		if err != nil {
+			return res, errors.Join(append(errs, err)...)
+		}
+		removed, err := r.settleRemoval(folder, ov)
+		release()
+		res.RemovedView = removed
+		if err != nil {
+			return res, errors.Join(append(errs, err, r.persist())...)
+		}
+		if err := r.persist(); err != nil {
+			return res, err
+		}
+		ov = r.Own.Views[folder]
+	}
 	viewExists := false
 	if rootState == RootOwned {
 		info, err := r.FS.Lstat(view)
@@ -853,7 +891,7 @@ func (r *Reconciler) checkTarget(target string) error {
 	if !ok || strings.HasPrefix(target, "/") || len(parts) < 2 {
 		return fmt.Errorf("%w: %q", ErrTargetForbidden, target)
 	}
-	if parts[0] == r.Root || reservedTopLevel[parts[0]] {
+	if parts[0] == r.Root || reservedTopLevel[parts[0]] || slices.Contains(r.Exclude, parts[0]) {
 		return fmt.Errorf("%w: %q", ErrTargetForbidden, target)
 	}
 	for _, c := range parts {
@@ -873,6 +911,141 @@ func (r *Reconciler) checkTarget(target string) error {
 		return fmt.Errorf("%w: %q", ErrTargetNotRegular, target)
 	}
 	return nil
+}
+
+// RemoveView removes the view <Root>/<folder>: its links first (exactly as
+// Reconcile with no wanted links), then the directory itself, once it is
+// empty. A view that still holds an entry the Manager did not create (a
+// user's file) is left as it is, with its record, and ErrViewInUse is
+// returned; the caller retries later. A view that does not exist is
+// forgotten.
+//
+// The directory is never removed by its name: it is moved, without
+// replacing, to a random hidden name in the root recorded first
+// (OwnedView.RemoveAs), and removed there only if it is the directory the
+// Manager created (same inode); anything else found there is moved back.
+// Rmdir refuses a directory that is not empty, so a user's entry put in
+// at the last moment is never removed either: the view goes back to its
+// name. An interrupted removal is settled by the next RemoveView or
+// Reconcile of the folder.
+func (r *Reconciler) RemoveView(folder string) (Result, error) {
+	res, err := r.Reconcile(folder, nil)
+	if err != nil {
+		return res, err
+	}
+	ov := r.Own.Views[folder]
+	if ov == nil {
+		return res, nil
+	}
+	view := r.Root + "/" + folder
+	if ov.Pending || len(ov.Links)+len(ov.Temps) > 0 {
+		return res, fmt.Errorf("%s: %w", view, ErrViewInUse)
+	}
+	empty, err := r.FS.Empty(view)
+	if err != nil {
+		return res, err
+	}
+	if !empty {
+		return res, fmt.Errorf("%s: %w", view, ErrViewInUse)
+	}
+	release, err := r.gateView(view)
+	if err != nil {
+		return res, err
+	}
+	defer release()
+	ov.RemoveAs = tempPrefix + randomSuffix()
+	if err := r.persist(); err != nil {
+		ov.RemoveAs = ""
+		return res, err
+	}
+	moveErr := r.FS.Place(view, r.Root+"/"+ov.RemoveAs)
+	if errors.Is(moveErr, fs.ErrNotExist) || errors.Is(moveErr, fs.ErrExist) {
+		moveErr = nil // nothing moved (the name went away, or the random name is taken)
+	}
+	// Whatever the move did (it may also have failed only in its reply),
+	// both names are inspected now.
+	removed, err := r.settleRemoval(folder, ov)
+	if perr := r.persist(); perr != nil {
+		err = errors.Join(err, perr)
+	}
+	switch {
+	case removed || r.Own.Views[folder] == nil:
+		res.RemovedView = removed
+		return res, err
+	case err != nil:
+		return res, err
+	case moveErr != nil:
+		// Refused (e.g. the RESP proxy lets only an admin rename or remove
+		// a folder at project depth): the view stays, empty.
+		return res, fmt.Errorf("removing %s: %w", view, moveErr)
+	default:
+		return res, fmt.Errorf("%s: %w", view, ErrViewInUse)
+	}
+}
+
+// gateView runs the gate for one view; the release is never nil.
+func (r *Reconciler) gateView(view string) (func(), error) {
+	if r.Gate == nil {
+		return func() {}, nil
+	}
+	release, err := r.Gate(view)
+	if err != nil {
+		return nil, err
+	}
+	if release == nil {
+		release = func() {}
+	}
+	return release, nil
+}
+
+// settleRemoval finishes or undoes a RemoveView from what is under the
+// hidden name and the view name, reporting whether it removed the view. The
+// record is dropped only once the Manager's directory is gone; it keeps
+// RemoveAs while anything is left under the hidden name that could not go
+// back.
+func (r *Reconciler) settleRemoval(folder string, ov *OwnedView) (bool, error) {
+	view, tp := r.Root+"/"+folder, r.Root+"/"+ov.RemoveAs
+	info, err := r.FS.Lstat(tp)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		// Nothing there: the move never happened, or the directory was
+		// already removed. Whatever is at the view name is settled as usual.
+		ov.RemoveAs = ""
+		if _, err := r.FS.Lstat(view); errors.Is(err, fs.ErrNotExist) {
+			delete(r.Own.Views, folder)
+		}
+		return false, nil
+	case err != nil:
+		return false, err
+	case info.Type == TypeDir && ov.Ino != 0 && info.Ino == ov.Ino:
+		err := r.FS.Rmdir(tp)
+		if err == nil || errors.Is(err, fs.ErrNotExist) {
+			delete(r.Own.Views, folder)
+			return true, nil
+		}
+		// Someone put an entry inside, or the removal was refused: the
+		// view goes back to its name and stays. (If the rmdir did happen
+		// and only its reply was lost, nothing is left to move back.)
+		if perr := r.FS.Place(tp, view); perr != nil {
+			if _, lerr := r.FS.Lstat(tp); errors.Is(lerr, fs.ErrNotExist) {
+				delete(r.Own.Views, folder)
+				return true, nil
+			}
+			return false, fmt.Errorf("the view %s is under the hidden name %s and cannot go back: %w", view, tp, perr)
+		}
+		ov.RemoveAs = ""
+		if errors.Is(err, syscall.ENOTEMPTY) {
+			return false, nil
+		}
+		return false, fmt.Errorf("removing %s: %w", view, err)
+	}
+	// The view holding a user's entry, or (after a race) an entry the
+	// Manager did not create: back to the view name, never replacing.
+	if err := r.FS.Place(tp, view); err != nil {
+		return false, fmt.Errorf("an entry is under the hidden name %s (it belongs at %s) and cannot go back: %w", tp, view, err)
+	}
+	ov.RemoveAs = ""
+	return false, nil
 }
 
 // relTarget is the symlink text for a link `depth` directories below the

@@ -48,3 +48,8 @@ func dirHandleOp(dirfd int, leaf string, wantIno uint64, perm fs.FileMode) (Info
 	}
 	return in, nil
 }
+
+// rmdirAt removes the directory leaf in dirfd; a non-directory is ENOTDIR.
+func rmdirAt(dirfd int, leaf string) error {
+	return unix.Unlinkat(dirfd, leaf, unix.AT_REMOVEDIR)
+}
