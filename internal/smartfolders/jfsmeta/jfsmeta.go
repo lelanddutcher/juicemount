@@ -25,6 +25,7 @@ import (
 	"io/fs"
 	"net/url"
 	"path"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -280,4 +281,66 @@ func (f *FS) Remove(p string) error {
 		return syscall.EISDIR
 	}
 	return errno(f.m.Unlink(f.ctx, dir, leaf, true))
+}
+
+// The read-only lookups below serve the continuity binder. Each is plain
+// metadata reads (GET i<ino>, HGET/HGETALL d<dir>, HGETALL p<ino>, or the
+// allow-listed scriptLookup): reads pass the RESP proxy unchecked
+// (respproxy needsGate), whatever the principal.
+
+// VolumeUUID is the UUID in the volume's format, loaded by Open.
+func (f *FS) VolumeUUID() string { return f.m.GetFormat().UUID }
+
+func node(ino meta.Ino, attr *meta.Attr) Node {
+	return Node{
+		Ino:     uint64(ino),
+		Type:    info(ino, attr).Type,
+		Nlink:   attr.Nlink,
+		Parent:  uint64(attr.Parent),
+		InTrash: attr.Parent.IsTrash(),
+	}
+}
+
+// LookupIno resolves a volume-relative path to its inode without following
+// a symlink in any component (smartfolders.ErrSymlinkInPath).
+func (f *FS) LookupIno(p string) (Node, error) {
+	ino, attr, err := f.lookup(p)
+	if err != nil {
+		return Node{}, err
+	}
+	return node(ino, &attr), nil
+}
+
+// StatIno reads one inode's attributes; a removed inode is ENOENT.
+func (f *FS) StatIno(ino uint64) (Node, error) {
+	if !meta.Ino(ino).IsNormal() || ino == uint64(meta.RootInode) {
+		return Node{}, syscall.EINVAL
+	}
+	var attr meta.Attr
+	if st := f.m.GetAttr(f.ctx, meta.Ino(ino), &attr); st != 0 {
+		return Node{}, st
+	}
+	return node(meta.Ino(ino), &attr), nil
+}
+
+// GetPaths returns the volume-relative paths (no leading slash, sorted)
+// at which the inode is linked outside the trash: none for a deleted file,
+// several for a hard-linked one. It reads every directory on the way up
+// (whole listings), so it is for rare paths, not every event.
+func (f *FS) GetPaths(ino uint64) ([]string, error) {
+	if _, err := f.StatIno(ino); err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, p := range f.m.GetPaths(f.ctx, meta.Ino(ino)) {
+		// Anything not absolute is JuiceFS's "outside of the mounted
+		// root" note, not a path.
+		rel, ok := strings.CutPrefix(p, "/")
+		if !ok || rel == "" || rel == meta.TrashName || strings.HasPrefix(rel, meta.TrashName+"/") {
+			continue
+		}
+		out = append(out, rel)
+	}
+	sort.Strings(out)
+	return out, nil
 }
