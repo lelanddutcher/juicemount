@@ -568,7 +568,8 @@ What the Manager records, in the principal store:
 **A Mac leaves the list only on proof from MinIO**, never because the
 Manager's own environment changed. Every minute the Manager makes a signed
 list request to the volume's bucket (`JM_MINIO_URL`/`JM_VOL_NAME`, or
-`JM_OBJ_BUCKET_URL`) with its current client key. MinIO keeps one secret
+`JM_OBJ_BUCKET_URL`, a path-style bucket URL such as
+`http://minio:9000/zpool`) with its current client key. MinIO keeps one secret
 per user (`mc admin user add` replaces it), so when that request succeeds
 with a secret other than the one a Mac was given, that Mac's copy is
 refused. The answer must be a listing of that bucket; anything else, a
@@ -591,7 +592,8 @@ So:
   policy at every `up`. A deny on `sts:AssumeRole` would do nothing:
   MinIO does not consult policy for it.
 - The `minio` service sets `MINIO_STS_DURATION: 15m`, so a temporary
-  credential lasts at most 15 minutes whatever the requester asks for.
+  credential lasts at most 15 minutes whatever the requester asks for. It
+  also limits a MinIO Console login (port 30152) to 15 minutes.
 - The rotation below removes the `jm-client` user before it is created
   again: MinIO then deletes every service account and temporary credential
   derived from it, including any made before the deny existed.
@@ -611,18 +613,27 @@ spool, but changes to files that already exist fail. So stop the Macs first.
 2. Put a new value in `server/.env`:
    `JM_OBJ_CLIENT_SECRET_KEY=` (`openssl rand -hex 20`). Keep the old value
    at hand for the check (`read -rs` it, never on a command line).
-3. Remove the `jm-client` user, which also deletes every service account and
-   temporary credential made from it (from here nothing that used the old
-   key works, the server's own WebDAV and farm included):
+3. Stop the server's other clients of the key, so no write of theirs is
+   refused halfway: `$C -f server/docker-compose.yml stop juicefs juicefarm`,
+   and stop the enrolled farm nodes (step 4 starts the containers again).
+   Then remove the `jm-client` user, which also deletes every service
+   account and temporary credential made from it (from here nothing that
+   used the old key works). `mcroot` runs `mc` in the `minio` container as
+   the MinIO root user, with an alias in a private configuration directory
+   that is removed afterwards; `mc` prompts for the root password, so it is
+   never on a command line or in a URL (the pinned `mc` does not URL-decode
+   credentials in `MC_HOST_<alias>`, so a root password with other
+   characters than letters and digits cannot go there):
 
    ```bash
    M="$($C -f server/docker-compose.yml ps -q minio)"
-   read -rs ROOT && export ROOT        # MINIO_ROOT_PASSWORD
-   docker exec -e ROOT "$M" sh -c \
-     'MC_HOST_r="http://juicemount:$ROOT@127.0.0.1:9000" mc admin user rm r jm-client'
+   mcroot() {
+     docker exec -it "$M" bash -c 'd="$(mktemp -d)" && export MC_CONFIG_DIR="$d" &&
+       trap '"'"'rm -rf "$d"'"'"' EXIT &&
+       mc alias set r http://127.0.0.1:9000 juicemount && mc "$@"' mcroot "$@"
+   }
+   mcroot admin user rm r jm-client      # type MINIO_ROOT_PASSWORD at the prompt
    ```
-
-   (Percent-encode characters other than letters and digits in `ROOT`.)
 4. Apply the new value, MinIO first. Like every command in this guide this
    reads `server/.env`, which must hold every value the compose file
    requires (`JM_MANAGER_DIGEST`, `JM_FARM_DIGEST` and the others):
@@ -654,14 +665,17 @@ docker exec -e NEW "$M" sh -c 'MC_HOST_n="http://jm-client:$NEW@127.0.0.1:9000" 
 # The same command with the old key must fail with a signature error, not any error:
 docker exec -e OLD "$M" sh -c 'MC_HOST_o="http://jm-client:$OLD@127.0.0.1:9000" mc ls o/zpool' 2>&1 |
   grep -q 'signature we calculated does not match' && echo OLD-REFUSED
-# No service account of jm-client may exist (this prints nothing):
-docker exec -e ROOT "$M" sh -c 'MC_HOST_r="http://juicemount:$ROOT@127.0.0.1:9000" mc admin user svcacct ls r jm-client'
-unset NEW OLD ROOT
+unset NEW OLD
+# No service account of jm-client may exist (lists no access key):
+mcroot admin user svcacct ls r jm-client
 ```
+
+The client secrets are letters and digits only (`minio-keys` refuses
+anything else), so `MC_HOST_<alias>` carries them unchanged.
 
 Both `NEW-OK` and `OLD-REFUSED` must print, and the service-account list
 must be empty. If it lists any, remove each
-(`mc admin user svcacct rm r <access key>` with the same `MC_HOST_r`) and
+(`mcroot admin user svcacct rm r <access key>`) and
 find out which client made it: the policy now forbids it. Then: the Principals page's rotation list is empty
 within a minute (or shows why not); `docker ps` shows the `juicefs`
 container `healthy` (its health check covers the WebDAV server) and
@@ -770,19 +784,17 @@ environment.
    `object-key-switch.sh rollback --root`.
 
    ```bash
-   # Put the new value in server/.env (openssl rand -hex 20), then:
-   R="$($C -f server/docker-compose.yml ps -q minio)"
-   read -rs OLD && export OLD          # type the previous root password
-   docker exec -e OLD "$R" sh -c \
-     'MC_HOST_old="http://juicemount:$OLD@127.0.0.1:9000" mc admin info old'
+   # Put the new value in server/.env (openssl rand -hex 20), then, with
+   # M and mcroot as defined in "Rotating the shared object key" above:
+   mcroot admin info r                  # type the PREVIOUS root password
    ```
 
-   The password reaches the container by name, never on a command line. If
-   it contains characters other than letters and digits, percent-encode
-   them in `OLD`. That command shows the old password still working. Apply the change with
+   `mc` prompts for the password, so it is never on a command line or in a
+   URL. That command shows the old password still working. Apply the change with
    `$C -f server/docker-compose.yml up -d --no-deps minio`, then
    `$C -f server/docker-compose.yml up --no-deps minio-keys` (must exit 0).
-   **Check:** the same `docker exec` now fails with an access error, and a
+   **Check:** the same command, with the previous password typed, now fails
+   with an access error, and a
    Mac copy and readback still work (Macs do not use the root key after
    step B). **Rollback:** put the old value back in `server/.env` and
    recreate `minio`.
