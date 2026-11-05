@@ -86,6 +86,7 @@ import (
 	"github.com/lelanddutcher/juicemount/internal/continuity"
 	"github.com/lelanddutcher/juicemount/internal/continuity/binder"
 	"github.com/lelanddutcher/juicemount/internal/continuity/catalog"
+	"golang.org/x/text/unicode/norm"
 )
 
 const (
@@ -218,13 +219,18 @@ func (c collectionActor) writesAnywhere() bool {
 
 // covers: the actor may write at volumePath (volume-relative, as the
 // binder resolves it). A grant covers its folder and everything below it
-// (/Clients/A covers /Clients/A/x, not /Clients/AB/x).
+// (/Clients/A covers /Clients/A/x, not /Clients/AB/x). Both are compared
+// composed (NFC): query folders are stored NFC, and a grant may be
+// decomposed (copied from a macOS listing). Grants are stored as given.
+// Every catalog check of a path against grants (collection writes and
+// reads, query folders, find and file lookups) comes here.
 func (c collectionActor) covers(volumePath string) bool {
 	if c.person == nil || c.person.Access == personAccessAll {
 		return true
 	}
-	full := "/" + strings.TrimPrefix(volumePath, "/")
+	full := norm.NFC.String("/" + strings.TrimPrefix(volumePath, "/"))
 	for _, g := range c.person.Grants {
+		g = norm.NFC.String(g)
 		if full == g || strings.HasPrefix(full, g+"/") {
 			return true
 		}
