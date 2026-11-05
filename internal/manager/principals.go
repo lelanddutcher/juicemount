@@ -428,9 +428,6 @@ type MacPrincipal struct {
 	// before any answer carries the key; it stays after a later per-Mac key,
 	// because the Mac still knows the shared one (sharedkey.go).
 	SharedKeyIssued bool `json:"shared_key_issued,omitempty"`
-	// SharedKeyChecked: a revoke of this record has been accounted for in
-	// the shared-key holder list (sharedkey.go adoptLegacyRevokesLocked).
-	SharedKeyChecked bool `json:"shared_key_checked,omitempty"`
 	// SharedKeyHeld (Snapshot only): this Mac holds the shared jm-client
 	// key, so revoking it leaves that key working at the object store
 	// (sharedkey.go).
@@ -512,9 +509,11 @@ type principalStoreFile struct {
 	People []Person `json:"people,omitempty"`
 	// RestrictUnassigned: Macs with no person may not write (people.go).
 	RestrictUnassigned bool `json:"restrict_unassigned,omitempty"`
-	// SharedKeyHolders: revoked Macs that hold the shared object key
-	// (sharedkey.go).
-	SharedKeyHolders []sharedKeyHolder `json:"shared_key_holders,omitempty"`
+	// SharedKeyTracking: sharedkey.go adoptSharedKeyStateOnLoad has run on
+	// this store (sharedKeyTrackingVersion). SharedKeyHolders: revoked Macs
+	// that hold the shared object key (sharedkey.go).
+	SharedKeyTracking int               `json:"shared_key_tracking,omitempty"`
+	SharedKeyHolders  []sharedKeyHolder `json:"shared_key_holders,omitempty"`
 }
 
 // ProxySignaler asks the proxy to reload the principals file whose sha256
@@ -608,8 +607,9 @@ type PrincipalStore struct {
 	keepObjOrphanRemove []ObjKeyRemoval
 	// sharedHolders: revoked Macs given the shared object key; sharedProof:
 	// the object store's last answer about a rotation (sharedkey.go).
-	sharedHolders []sharedKeyHolder
-	sharedProof   sharedKeyProof
+	sharedHolders  []sharedKeyHolder
+	sharedProof    sharedKeyProof
+	sharedTracking int
 
 	// people (people.go): by ID. proxyFormat: the principals file version
 	// the proxy last advertised (0 = not yet known). peopleWritten: the
@@ -841,7 +841,7 @@ func NewPrincipalStore(opts PrincipalStoreOptions) (*PrincipalStore, error) {
 			return nil, err
 		}
 		s.restrictUnassigned = f.RestrictUnassigned
-		s.sharedHolders = f.SharedKeyHolders
+		s.sharedHolders, s.sharedTracking = f.SharedKeyHolders, f.SharedKeyTracking
 	case errors.Is(err, os.ErrNotExist):
 	default:
 		return nil, err
@@ -1505,7 +1505,6 @@ func (s *PrincipalStore) RevokeWithResult(name string) (RevokeResult, error) {
 			s.sharedHolders = s.withSharedKeyHolderLocked(cur, now)
 		}
 		next.Status = PrincipalRevoked
-		next.SharedKeyChecked = true
 		next.AutoApproved = false
 		next.AutoApprovePending = false
 		next.DecidedAt = now
@@ -1763,6 +1762,7 @@ func (s *PrincipalStore) saveStoreLocked() error {
 	}
 	f.RestrictUnassigned = s.restrictUnassigned
 	f.SharedKeyHolders = s.sharedKeyHoldersToKeepLocked()
+	f.SharedKeyTracking = s.sharedTracking
 	f.ObjKeysSeq, f.ObjKeyGens = s.keepObjSeq, s.keepObjGens
 	if s.objk != nil {
 		f.ObjKeysSeq = s.objk.seq

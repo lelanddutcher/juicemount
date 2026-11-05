@@ -53,7 +53,9 @@ Enforce: refuse writes into a project another principal holds. Step back to obse
   "Rotating the shared object key". Approved Macs get the new key from the Manager and use it after their volume restarts.
   A Mac leaves this list only when the object store itself confirms the rotation: the Manager checks every minute that the
   object store accepts its new key (it keeps one secret per user, so the old one is then refused), or that a renamed
-  access key's old user is gone. Restarting the Manager with a new key alone clears nothing.</p>
+  access key's old user is gone. Restarting the Manager with a new key alone clears nothing. This proves the user's own
+  secret changed; it does not prove that no other credential made with the old key is left (a service account or temporary
+  credential the Mac made for itself). The rotation steps say how to check for those.</p>
   <p class="note-warn" id="sharedKeyLegacy" style="display:none">Macs marked "revoked by an earlier Manager" were revoked before
   this Manager recorded who holds the shared key. Some may have been only pending requests that never had it; they stay listed
   until the key is rotated. Macs revoked and forgotten before then are not listed at all: if you ever revoked an approved Mac,

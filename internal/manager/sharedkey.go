@@ -24,9 +24,17 @@ package manager
 //   - same access key, different secret: a signed request with the
 //     Manager's current key succeeds. MinIO keeps one secret per user
 //     (`mc admin user add` replaces it), so the old secret is then refused.
-//   - a different access key (JM_OBJ_CLIENT_ACCESS_KEY renamed): the object
-//     store answers InvalidAccessKeyId for the old access key, i.e. the old
-//     user was removed. minio-keys never removes it by itself.
+//   - a different access key (JM_OBJ_CLIENT_ACCESS_KEY renamed): in the same
+//     check the current key succeeds and the object store answers
+//     InvalidAccessKeyId for the old access key, i.e. the old user was
+//     removed. minio-keys never removes it by itself.
+//
+// Either proves that the user's own secret changed (or the user is gone),
+// not that no credential made with the old key is left: MinIO lets a user
+// mint service accounts and temporary credentials for itself. The jm-client
+// policy denies service accounts (server/minio/jm-client-policy.json), the
+// compose file caps temporary credentials at 15 minutes, and the rotation
+// steps check for service accounts made before the deny.
 //
 // A holder is dropped when the Mac is approved again. Records revoked by a
 // Manager from before holder records are recorded at start-up as "legacy"
@@ -261,15 +269,37 @@ func (s *PrincipalStore) withSharedKeyHolderLocked(p *MacPrincipal, at int64) []
 	return append(out, sharedKeyHolder{Name: p.Name, Host: p.Host, RevokedAt: at, AccessKey: ak, SecretCheck: newSharedKeyCheck(sk)})
 }
 
-// adoptLegacyRevokesLocked records, once, the Macs a Manager from before
-// holder records revoked: revoked, never accounted for (SharedKeyChecked),
-// never given a per-Mac key. Such a Mac may hold the shared key (or may
-// have been only a pending request). Reports whether anything changed.
-func (s *PrincipalStore) adoptLegacyRevokesLocked() bool {
+// sharedKeyTrackingVersion is the store marker (shared_key_tracking) that
+// says adoptSharedKeyStateOnLoad has run on this store.
+const sharedKeyTrackingVersion = 1
+
+// onSharedKeyVerifierStart, when set, receives the stop function of the
+// verifier registerH8B starts (tests stop it).
+var onSharedKeyVerifierStart func(stop func())
+
+// adoptSharedKeyStateOnLoad brings a store from a Manager that did not
+// track the shared key up to date, once (the store marker), conservatively
+// and whatever the per-Mac mode: an earlier Manager may have handed the
+// shared key to any Mac it approved, including one that later got its own
+// key. So every approved Mac is marked SharedKeyIssued, and every revoked
+// Mac without a holder entry becomes a legacy holder (it may have been only
+// a pending request). Without a configured client key nothing is adopted
+// and the marker is not set. The store is saved when a record changed.
+func (s *PrincipalStore) adoptSharedKeyStateOnLoad() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.sharedTracking >= sharedKeyTrackingVersion {
+		return nil
+	}
 	ak, sk := s.opts.ObjectKey()
 	if ak == "" || sk == "" {
-		return false
+		return nil
 	}
+	before := make(map[string]*MacPrincipal, len(s.recs))
+	for k, v := range s.recs {
+		before[k] = v
+	}
+	prevHolders := s.sharedHolders
 	have := map[string]bool{}
 	for _, h := range s.sharedHolders {
 		have[h.Name] = true
@@ -277,53 +307,25 @@ func (s *PrincipalStore) adoptLegacyRevokesLocked() bool {
 	changed := false
 	for _, name := range s.sortedNamesLocked() {
 		r := s.recs[name]
-		if r.Status != PrincipalRevoked || r.SharedKeyChecked {
-			continue
-		}
-		next := *r
-		next.SharedKeyChecked = true
-		s.recs[name] = &next
-		changed = true
-		if r.ObjKeyGen > 0 || have[name] {
-			continue
-		}
-		s.sharedHolders = append(s.sharedHolders, sharedKeyHolder{Name: name, Host: r.Host, RevokedAt: r.DecidedAt,
-			AccessKey: ak, SecretCheck: newSharedKeyCheck(sk), Legacy: true})
-		log.Printf("manager: principal %s was revoked by an earlier Manager version and may still hold the shared object key; listed until the object store confirms a rotation", name)
-	}
-	return changed
-}
-
-// onSharedKeyVerifierStart, when set, receives the stop function of the
-// verifier registerH8B starts (tests stop it).
-var onSharedKeyVerifierStart func(stop func())
-
-// adoptSharedKeyStateOnLoad brings a store from an earlier Manager up to
-// date: approved Macs that this Manager hands the shared key are marked
-// SharedKeyIssued, and earlier revokes are adopted as legacy holders. The
-// store is saved when anything changed.
-func (s *PrincipalStore) adoptSharedKeyStateOnLoad() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	before := make(map[string]*MacPrincipal, len(s.recs))
-	for k, v := range s.recs {
-		before[k] = v
-	}
-	prevHolders := s.sharedHolders
-	changed := s.adoptLegacyRevokesLocked()
-	for name, r := range s.recs {
-		if r.Status == PrincipalApproved && !r.SharedKeyIssued && s.sharedKeyConfigured() {
+		switch {
+		case r.Status == PrincipalApproved && !r.SharedKeyIssued:
 			next := *r
 			next.SharedKeyIssued = true
 			s.recs[name] = &next
 			changed = true
+		case r.Status == PrincipalRevoked && !have[name]:
+			s.sharedHolders = append(s.sharedHolders, sharedKeyHolder{Name: name, Host: r.Host, RevokedAt: r.DecidedAt,
+				AccessKey: ak, SecretCheck: newSharedKeyCheck(sk), Legacy: true})
+			changed = true
+			log.Printf("manager: principal %s was revoked by an earlier Manager version and may still hold the shared object key; listed until the object store confirms a rotation", name)
 		}
 	}
+	s.sharedTracking = sharedKeyTrackingVersion
 	if !changed {
-		return nil
+		return nil // saved with the next store write
 	}
 	if err := s.saveStoreLocked(); err != nil {
-		s.recs, s.sharedHolders = before, prevHolders
+		s.recs, s.sharedHolders, s.sharedTracking = before, prevHolders, 0
 		return fmt.Errorf("record shared object key holders: %w", err)
 	}
 	return nil
@@ -381,20 +383,26 @@ func (s *PrincipalStore) VerifySharedKeyRotation(ctx context.Context) {
 	case !needCurrent && len(old) == 0:
 	case probe == nil:
 		problems = append(problems, noProbeProblem)
+	case ak == "" || sk == "":
+		problems = append(problems, "the Manager has no client key configured, so it cannot confirm a rotation")
 	default:
-		if needCurrent {
-			code, err := probeWithTimeout(ctx, probe, ak, sk)
-			switch {
-			case err != nil:
-				problems = append(problems, "the object store could not be asked whether the Manager's new key works: "+err.Error())
-			case code != "":
-				problems = append(problems, "the object store refuses the Manager's new key ("+code+"), so the old one may still work. "+
-					"Change the key at MinIO (minio-keys) as in the rotation steps")
-			default:
-				pr.ak, pr.sk, pr.ok = ak, sk, true
-			}
+		// The current key is asked first, in every cycle: an answer about
+		// an old access key counts only from the object store that just
+		// accepted the current key (the same URL and bucket).
+		code, err := probeWithTimeout(ctx, probe, ak, sk)
+		switch {
+		case err != nil:
+			problems = append(problems, "the object store could not be asked whether the Manager's key works: "+err.Error())
+		case code != "":
+			problems = append(problems, "the object store refuses the Manager's key ("+code+"), so an old one may still work. "+
+				"Change the key at MinIO (minio-keys) as in the rotation steps")
+		default:
+			pr.ak, pr.sk, pr.ok = ak, sk, true
 		}
 		for oldAK := range old {
+			if !pr.ok {
+				break
+			}
 			code, err := probeWithTimeout(ctx, probe, oldAK, newProbeSecret())
 			switch {
 			case err != nil:
@@ -462,7 +470,9 @@ func NewObjectStoreProbe(bucketURL, region string) ObjectStoreProbe {
 		region = "us-east-1"
 	}
 	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
-	target := strings.TrimRight(bucketURL, "/") + "?list-type=2&max-keys=1"
+	base := strings.TrimRight(bucketURL, "/")
+	bucket := base[strings.LastIndex(base, "/")+1:]
+	target := base + "?list-type=2&max-keys=1"
 	return func(ctx context.Context, ak, sk string) (string, error) {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
 		if err != nil {
@@ -480,6 +490,15 @@ func NewObjectStoreProbe(bucketURL, region string) ObjectStoreProbe {
 		defer resp.Body.Close()
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 		if resp.StatusCode == http.StatusOK {
+			// Only a listing of this very bucket counts: a proxy, a login
+			// page or another service answering 200 proves nothing.
+			var lr struct {
+				XMLName xml.Name
+				Name    string `xml:"Name"`
+			}
+			if xml.Unmarshal(body, &lr) != nil || lr.XMLName.Local != "ListBucketResult" || lr.Name != bucket {
+				return "", fmt.Errorf("the answer is not a listing of bucket %q", bucket)
+			}
 			return "", nil
 		}
 		var e struct {

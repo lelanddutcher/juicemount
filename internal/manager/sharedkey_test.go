@@ -262,7 +262,14 @@ func TestRevokeSharedKeyAccessKeyRename(t *testing.T) {
 	if !strings.Contains(snap.SharedKeyProblem, "old access key "+testClientAK) {
 		t.Fatalf("problem = %q", snap.SharedKeyProblem)
 	}
+	// The old user is gone, but the current key is refused too (a wrong
+	// address or a MinIO without the new user): no proof.
 	r.minio.del(testClientAK)
+	r.minio.del(r.ak)
+	if got := stillValidNames(r.verify()); len(got) != 1 {
+		t.Fatalf("old user unknown but the current key refused: page lists %v, want [%s]", got, a)
+	}
+	r.minio.set(r.ak, r.sk)
 	if got := r.verify().SharedKeyStillValid; len(got) != 0 {
 		t.Fatalf("old user removed: page lists %+v", got)
 	}
@@ -344,10 +351,13 @@ func TestRevokeSharedKeyLegacyRevokes(t *testing.T) {
 		t.Fatal(err)
 	}
 	delete(f, "shared_key_holders")
+	delete(f, "shared_key_tracking")
 	for _, p := range f["principals"].([]any) {
 		m := p.(map[string]any)
-		delete(m, "shared_key_checked")
 		delete(m, "shared_key_issued")
+		if m["name"] == b {
+			m["obj_key_gen"] = 1 // given a per-Mac key at some point: still counted
+		}
 	}
 	raw, _ = json.Marshal(f)
 	if err := os.WriteFile(r.statePath, raw, 0o600); err != nil {
@@ -404,7 +414,7 @@ func TestObjectStoreProbeSignsAndParses(t *testing.T) {
 			_, _ = w.Write([]byte(`<Error><Code>SignatureDoesNotMatch</Code></Error>`))
 			return
 		}
-		_, _ = w.Write([]byte(`<ListBucketResult></ListBucketResult>`))
+		_, _ = w.Write([]byte(`<?xml version="1.0" encoding="UTF-8"?><ListBucketResult><Name>zpool</Name></ListBucketResult>`))
 	}))
 	defer srv.Close()
 	probe := NewObjectStoreProbe(srv.URL+"/zpool", "")
@@ -420,6 +430,58 @@ func TestObjectStoreProbeSignsAndParses(t *testing.T) {
 	}
 	if _, err := NewObjectStoreProbe("http://127.0.0.1:1/zpool", "")(context.Background(), "jm-client", "x"); err == nil {
 		t.Fatal("unreachable object store: no error")
+	}
+	// A 200 that is not a listing of this bucket proves nothing.
+	for _, body := range []string{`<html>login</html>`, `<ListBucketResult><Name>other</Name></ListBucketResult>`, ``} {
+		other := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte(body)) }))
+		code, err := NewObjectStoreProbe(other.URL+"/zpool", "")(context.Background(), "jm-client", "x")
+		other.Close()
+		if err == nil {
+			t.Fatalf("200 with %q counted as accepted (code %q)", body, code)
+		}
+	}
+}
+
+// A Mac that an earlier Manager approved in shared mode and that later got
+// its own per-Mac key is still counted as holding the shared key.
+func TestSharedKeyAdoptionCountsPerMacKeyedMacs(t *testing.T) {
+	setObjectKeyEnv(t)
+	r := newObjRig(t)
+	r.keydUp()
+	name, _ := r.enroll(8)
+	if err := r.s.Approve(name); err != nil {
+		t.Fatal(err)
+	}
+	// What an earlier Manager left: an approved Mac with its own key and
+	// no shared-key tracking at all.
+	raw, err := os.ReadFile(r.statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var f map[string]any
+	if err := json.Unmarshal(raw, &f); err != nil {
+		t.Fatal(err)
+	}
+	delete(f, "shared_key_tracking")
+	raw, _ = json.Marshal(f)
+	if err := os.WriteFile(r.statePath, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	r.open()
+	if !r.rec(name).SharedKeyIssued {
+		t.Fatal("adoption did not mark the approved per-Mac-keyed Mac")
+	}
+	if res, err := r.s.RevokeWithResult(name); err != nil || res.ObjectKey != RevokeObjectKeyStillValid {
+		t.Fatalf("revoke = %+v, %v; want still_valid", res, err)
+	}
+	// Adopted once: a Mac approved now, under per-Mac keys, is not marked.
+	other, _ := r.enroll(9)
+	if err := r.s.Approve(other); err != nil {
+		t.Fatal(err)
+	}
+	r.open()
+	if r.rec(other).SharedKeyIssued {
+		t.Fatal("a Mac approved under per-Mac keys after adoption was marked")
 	}
 }
 
@@ -571,7 +633,7 @@ func TestRevokeSharedKeyHTTPAndPage(t *testing.T) {
 	}
 	for _, want := range []string{"shared_key_still_valid", "shared_key_held", "r.revoked.object_key === 'still_valid'",
 		"Its storage key will STILL WORK", "Rotate the shared storage key", "Rotating the shared object key",
-		"s.shared_key_problem", "sharedKeyLegacy", "Restarting the Manager with a new key alone clears nothing"} {
+		"s.shared_key_problem", "sharedKeyLegacy", "Restarting the Manager with a new key alone clears nothing", "does not prove that no other credential"} {
 		if !strings.Contains(string(raw), want) {
 			t.Fatalf("principals.html does not render %q", want)
 		}
