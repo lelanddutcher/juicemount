@@ -133,6 +133,9 @@ return detached records for trusted internal services. Every record
 request explicitly binds the library. Pages are 1–1000 records with exclusive
 asset-ID, revision-ID, or event-sequence cursors; empty identity/zero sequence
 starts at the beginning. Valid identity keys need not name an existing row.
+An Events page also stops early once its canonical requests reach 16 MiB, always
+returning at least one event; a short page is not the end, only an empty page is.
+Event reads select request/receipt blobs through the same length bounds as Export.
 Pages are independently current, not a multi-page snapshot. Typed error categories
 distinguish invalid input, missing records, conflicts, changed retries, closed
 stores, and invalid/corrupt format; underlying errors remain available for inspection.

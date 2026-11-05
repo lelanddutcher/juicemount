@@ -197,7 +197,7 @@ func TestCatalogExplicitUpgradePreservesLegacyIdentities(t *testing.T) {
 		}
 	}
 	for _, expected := range golden.Events {
-		raw, err := scanEvent(s.db.QueryRow(`SELECT `+eventColumns+` FROM events WHERE operation_id=?`, expected.ID))
+		raw, err := scanEvent(s.db.QueryRow(`SELECT `+boundedEventColumns+` FROM events WHERE operation_id=?`, expected.ID))
 		if err != nil || string(raw.request) != expected.Request || string(raw.receipt) != expected.Receipt || raw.digest != expected.Digest || raw.timestamp != expected.Timestamp {
 			t.Fatalf("legacy event bytes %s: %v", expected.ID, err)
 		}

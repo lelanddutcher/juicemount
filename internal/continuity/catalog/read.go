@@ -113,8 +113,6 @@ type eventRow struct {
 	receipt   []byte
 }
 
-const eventColumns = `sequence,library_id,operation_id,request,payload_sha256,recorded_unix_nano,receipt`
-
 func scanEvent(row interface{ Scan(...any) error }) (eventRow, error) {
 	var e eventRow
 	err := row.Scan(&e.sequence, &e.library, &e.id, &e.request, &e.digest, &e.timestamp, &e.receipt)
@@ -148,7 +146,7 @@ func (e eventRow) decode(library continuity.LibraryID) (Event, error) {
 }
 
 func readEvent(ctx context.Context, q queryer, library continuity.LibraryID, id string) (Event, []byte, error) {
-	raw, err := scanEvent(q.QueryRowContext(ctx, `SELECT `+eventColumns+` FROM events WHERE operation_id=?`, id))
+	raw, err := scanEvent(q.QueryRowContext(ctx, `SELECT `+boundedEventColumns+` FROM events WHERE operation_id=?`, id))
 	if errors.Is(err, sql.ErrNoRows) {
 		return Event{}, nil, ErrNotFound
 	}
@@ -279,7 +277,12 @@ func (s *Store) ListRevisions(ctx context.Context, library continuity.LibraryID,
 	return revisions, nil
 }
 
-// Events uses an exclusive sequence cursor; zero starts at the beginning.
+// eventPageBytes bounds the canonical request bytes one Events page retains.
+const eventPageBytes = 16 << 20
+
+// Events uses an exclusive sequence cursor; zero starts at the beginning. A page
+// also stops once its requests reach eventPageBytes, but always holds at least
+// one event: a short page does not mean the end, only an empty page does.
 func (s *Store) Events(ctx context.Context, library continuity.LibraryID, after int64, limit int) ([]Event, error) {
 	if err := s.enter(); err != nil {
 		return nil, err
@@ -291,21 +294,26 @@ func (s *Store) Events(ctx context.Context, library continuity.LibraryID, after 
 	if after < 0 || !validPage(limit) {
 		return nil, invalid("event page")
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT `+eventColumns+` FROM events WHERE sequence>? ORDER BY sequence LIMIT ?`, after, limit)
+	rows, err := s.db.QueryContext(ctx, `SELECT `+boundedEventColumns+` FROM events WHERE sequence>? ORDER BY sequence LIMIT ?`, after, limit)
 	if err != nil {
 		return nil, formatError(err)
 	}
 	defer rows.Close()
 	events := make([]Event, 0, limit)
+	retained := 0
 	for rows.Next() {
 		raw, err := scanEvent(rows)
 		if err != nil {
 			return nil, formatError(err)
 		}
+		if len(events) > 0 && retained+len(raw.request) > eventPageBytes {
+			break
+		}
 		event, err := raw.decode(library)
 		if err != nil {
 			return nil, err
 		}
+		retained += len(raw.request)
 		events = append(events, event)
 	}
 	if err := rows.Err(); err != nil {
