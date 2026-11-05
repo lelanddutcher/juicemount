@@ -37,8 +37,9 @@ import (
 
 // FS implements smartfolders.FS on a JuiceFS metadata client.
 type FS struct {
-	m   meta.Meta
-	ctx meta.Context
+	m        meta.Meta
+	ctx      meta.Context
+	readOnly bool
 }
 
 var _ smartfolders.FS = (*FS)(nil)
@@ -57,12 +58,23 @@ func Open(metaURL string) (*FS, error) {
 // OpenWithin is Open with an explicit bound. A connection that completes
 // after the bound is shut down in the background.
 func OpenWithin(metaURL string, limit time.Duration) (*FS, error) {
+	return open(metaURL, limit, false)
+}
+
+// OpenReadOnly opens a client that cannot write: the JuiceFS client refuses
+// every mutation (conf.ReadOnly) and Flush/Close write no usage counters.
+// It is for readers (the continuity binder), never for smart-folder views.
+func OpenReadOnly(metaURL string) (*FS, error) {
+	return open(metaURL, OpenTimeout, true)
+}
+
+func open(metaURL string, limit time.Duration, readOnly bool) (*FS, error) {
 	u, err := url.Parse(metaURL)
 	if err != nil || (u.Scheme != "redis" && u.Scheme != "rediss") || u.Host == "" {
-		return nil, errors.New("smart folders: the metadata URL must be redis:// or rediss://host")
+		return nil, errors.New("jfsmeta: the metadata URL must be redis:// or rediss://host")
 	}
 	if _, err := redis.ParseURL(metaURL); err != nil {
-		return nil, errors.New("smart folders: the metadata URL is not a valid Redis URL")
+		return nil, errors.New("jfsmeta: the metadata URL is not a valid Redis URL")
 	}
 	type opened struct {
 		fs  *FS
@@ -75,13 +87,14 @@ func OpenWithin(metaURL string, limit time.Duration) (*FS, error) {
 		conf.NoBGJob = true // cleanup jobs belong to the volume's own clients
 		conf.MaxDeletes = 0 // never deletes file data (it only unlinks symlinks)
 		conf.Retries = 1    // one retry per command, not the default ten
+		conf.ReadOnly = readOnly
 		m := meta.NewClient(metaURL, conf)
 		if _, err := m.Load(true); err != nil {
 			_ = m.Shutdown()
-			done <- opened{err: fmt.Errorf("smart folders: loading the volume format: %w", err)}
+			done <- opened{err: fmt.Errorf("jfsmeta: loading the volume format: %w", err)}
 			return
 		}
-		f := &FS{m: m, ctx: meta.Background()}
+		f := &FS{m: m, ctx: meta.Background(), readOnly: readOnly}
 		select {
 		case done <- opened{fs: f}:
 		case <-abandoned:
@@ -93,13 +106,17 @@ func OpenWithin(metaURL string, limit time.Duration) (*FS, error) {
 		return o.fs, o.err
 	case <-time.After(limit):
 		close(abandoned)
-		return nil, fmt.Errorf("smart folders: the metadata endpoint did not answer within %s", limit)
+		return nil, fmt.Errorf("jfsmeta: the metadata endpoint did not answer within %s", limit)
 	}
 }
 
 // Flush writes the usage counters (used space, inodes, directory stats)
 // the client accumulated; without a session nothing flushes them otherwise.
-func (f *FS) Flush() { f.m.FlushSession() }
+func (f *FS) Flush() {
+	if !f.readOnly {
+		f.m.FlushSession()
+	}
+}
 
 // Close flushes the counters and disconnects. There is no session to close.
 func (f *FS) Close() error {
@@ -324,15 +341,23 @@ func (f *FS) StatIno(ino uint64) (Node, error) {
 }
 
 // GetPaths returns the volume-relative paths (no leading slash, sorted)
-// at which the inode is linked outside the trash: none for a deleted file,
-// several for a hard-linked one. It reads every directory on the way up
-// (whole listings), so it is for rare paths, not every event.
+// at which the inode is linked outside the trash: none for a file only in
+// the trash, several for a hard-linked one. JuiceFS's own GetPaths skips a
+// directory it fails to read (logging only), so a list with fewer names
+// (trash ones included) than the inode's link count is EIO, never a short
+// answer. It reads every directory on the way up (whole listings), so it
+// is for rare paths, not every event.
 func (f *FS) GetPaths(ino uint64) ([]string, error) {
-	if _, err := f.StatIno(ino); err != nil {
+	n, err := f.StatIno(ino)
+	if err != nil {
 		return nil, err
 	}
+	all := f.m.GetPaths(f.ctx, meta.Ino(ino))
+	if uint64(len(all)) < uint64(n.Nlink) {
+		return nil, fmt.Errorf("inode %d: found %d of its %d names: %w", ino, len(all), n.Nlink, syscall.EIO)
+	}
 	var out []string
-	for _, p := range f.m.GetPaths(f.ctx, meta.Ino(ino)) {
+	for _, p := range all {
 		// Anything not absolute is JuiceFS's "outside of the mounted
 		// root" note, not a path.
 		rel, ok := strings.CutPrefix(p, "/")

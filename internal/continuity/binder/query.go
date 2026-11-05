@@ -17,9 +17,10 @@ var ErrNotReady = errors.New("continuity: volume not connected yet")
 // AssetView is one asset as the read-only API returns it.
 type AssetView struct {
 	AssetID      continuity.AssetID `json:"asset_id"`
-	PathHint     string             `json:"path_hint"` // last path the binder recorded
-	Path         string             `json:"path,omitempty"`
-	Paths        []string           `json:"paths,omitempty"` // every current name (hard links)
+	Label        string             `json:"label"`               // set at creation; never changed by the binder
+	PathHint     string             `json:"path_hint,omitempty"` // last path the binder recorded
+	Path         string             `json:"path,omitempty"`      // current path, resolved from the volume
+	Removed      bool               `json:"removed"`             // no live visible name when last observed
 	ResolveError string             `json:"resolve_error,omitempty"`
 	Locations    []LocationView     `json:"locations"` // active only
 }
@@ -46,7 +47,8 @@ func (b *Binder) AssetByPath(ctx context.Context, p string) (AssetView, error) {
 		return AssetView{}, catalog.ErrNotFound
 	}
 	if err != nil {
-		return AssetView{}, err
+		b.cfg.Logf("continuity: resolving %q: %v", clean, err)
+		return AssetView{}, errors.New("continuity: could not read the volume")
 	}
 	loc, err := b.cfg.Store.GetLocation(ctx, b.library, LocationID(v.uuid, n.Ino))
 	if err != nil {
@@ -68,30 +70,42 @@ func (b *Binder) view(ctx context.Context, v *volume, id continuity.AssetID) (As
 	if err != nil {
 		return AssetView{}, err
 	}
-	// The binder records one location per asset; a page of 100 is ample.
+	// The binder records two locations per asset; a page of 100 is ample.
 	locs, err := b.cfg.Store.ListLocations(ctx, b.library, id, "", 100)
 	if err != nil {
 		return AssetView{}, err
 	}
-	out := AssetView{AssetID: asset.ID, PathHint: asset.Label, Locations: []LocationView{}}
+	out := AssetView{AssetID: asset.ID, Label: asset.Label, Removed: true, Locations: []LocationView{}}
+	var ino uint64
 	for _, l := range locs {
 		out.Locations = append(out.Locations, LocationView{ID: l.ID, Source: l.Value.Source, Locator: l.Value.Locator, UpdatedSequence: l.UpdatedSequence})
 		if v == nil {
-			out.ResolveError = ErrNotReady.Error()
 			continue
 		}
-		digits, ok := strings.CutPrefix(l.Value.Locator, "ino:")
-		ino, err := strconv.ParseUint(digits, 10, 64)
-		if l.Value.Source != v.source || !ok || err != nil {
-			continue
+		switch l.Value.Source {
+		case HintSource(v.uuid):
+			out.PathHint = l.Value.Locator
+		case Source(v.uuid):
+			digits, _ := strings.CutPrefix(l.Value.Locator, "ino:")
+			if n, err := strconv.ParseUint(digits, 10, 64); err == nil {
+				ino = n
+				out.Removed = false
+			}
 		}
-		paths, err := v.GetPaths(ino)
-		if err != nil && !gone(err) {
-			out.ResolveError = err.Error()
-			continue
-		}
-		out.Paths = append(out.Paths, paths...)
 	}
-	out.Path = canonical(out.Paths)
+	if v == nil {
+		out.ResolveError = ErrNotReady.Error()
+		return out, nil
+	}
+	if ino != 0 {
+		// The hint first (two point reads); every name only if it moved.
+		live, name, err := b.where(v, ino, out.PathHint, "")
+		if err != nil {
+			b.cfg.Logf("continuity: resolving inode %d: %v", ino, err)
+			out.ResolveError = "could not resolve the current path"
+		} else if live {
+			out.Path = name
+		}
+	}
 	return out, nil
 }

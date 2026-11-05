@@ -30,8 +30,9 @@ import (
 
 // Test Redis: JM_TEST_CONTINUITY_REDIS names a disposable database of this
 // package's own (it is flushed); otherwise each test starts a private
-// redis-server (JM_TEST_REDIS_SERVER, or the Redis 7.4.11 the CI image and
-// the dev tools ship) on a free loopback port. Pub/sub uses a channel per
+// redis-server (JM_TEST_REDIS_SERVER; JM_CI_REDIS_BIN/redis-server on the
+// macOS lane; or the Redis 7.4.11 the CI image and the dev tools ship) on a
+// free loopback port. Pub/sub uses a channel per
 // test, so a shared server carries no other test's events.
 var redisServers = []string{"/opt/redis-7.4.11/bin/redis-server", "/opt/jm-ci-tools/redis/bin/redis-server"}
 
@@ -50,6 +51,9 @@ func testRedisURL(t *testing.T) string {
 		return u
 	}
 	bin := os.Getenv("JM_TEST_REDIS_SERVER")
+	if dir := os.Getenv("JM_CI_REDIS_BIN"); bin == "" && dir != "" {
+		bin = filepath.Join(dir, "redis-server")
+	}
 	for _, p := range redisServers {
 		if bin != "" {
 			break
@@ -111,6 +115,10 @@ type fixture struct {
 // newFixture formats a throwaway volume (trash on, as deployed) and starts
 // a binder over a fresh catalog. run=false leaves the worker stopped.
 func newFixture(t *testing.T, queue int, run bool) *fixture {
+	return newFixtureWith(t, Config{QueueSize: queue}, run)
+}
+
+func newFixtureWith(t *testing.T, cfg Config, run bool) *fixture {
 	t.Helper()
 	url := testRedisURL(t)
 	conf := meta.DefaultConf()
@@ -125,7 +133,9 @@ func newFixture(t *testing.T, queue int, run bool) *fixture {
 	t.Cleanup(func() { _ = admin.Shutdown() })
 	f := &fixture{t: t, url: url, admin: admin, ctx: meta.Background()}
 	f.store, f.lib = newStore(t)
-	b, err := New(Config{Store: f.store, QueueSize: queue, Connect: func() (Volume, error) { return jfsmeta.Open(url) }, Logf: t.Logf})
+	cfg.Store, cfg.Logf = f.store, t.Logf
+	cfg.Connect = func() (Volume, error) { return jfsmeta.OpenReadOnly(url) }
+	b, err := New(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -238,11 +248,11 @@ func (f *fixture) waitHandled(n uint64) {
 	}
 }
 
-func (f *fixture) location(ino uint64) catalog.Location {
+func (f *fixture) location(id string) catalog.Location {
 	f.t.Helper()
-	loc, err := f.store.GetLocation(context.Background(), f.lib, LocationID(testUUID, ino))
+	loc, err := f.store.GetLocation(context.Background(), f.lib, id)
 	if err != nil {
-		f.t.Fatalf("location of %d: %v", ino, err)
+		f.t.Fatalf("location %s: %v", id, err)
 	}
 	return loc
 }
@@ -275,25 +285,48 @@ func (f *fixture) events() int {
 	}
 }
 
-// requireBound checks the inode's asset and active location, and its hint.
-func (f *fixture) requireBound(ino uint64, hint string) continuity.AssetID {
+// requireBound checks the inode's asset, its active inode and hint
+// locations, and that the asset's label is still the one set at creation.
+func (f *fixture) requireBound(ino uint64, hint, label string) continuity.AssetID {
 	f.t.Helper()
-	loc := f.location(ino)
-	want := catalog.LocationValue{AssetID: AssetID(testUUID, ino), Source: "jfs:" + testUUID, Locator: fmt.Sprintf("ino:%d", ino)}
+	id := AssetID(testUUID, ino)
+	loc := f.location(LocationID(testUUID, ino))
+	want := catalog.LocationValue{AssetID: id, Source: "jfs:" + testUUID, Locator: fmt.Sprintf("ino:%d", ino)}
 	if loc.Removed || loc.Value != want {
 		f.t.Fatalf("location of %d = %+v, want active %+v", ino, loc, want)
 	}
-	if a := f.asset(want.AssetID); a.Label != hint {
-		f.t.Fatalf("hint of %d = %q, want %q", ino, a.Label, hint)
+	h := f.location(HintID(testUUID, ino))
+	wantHint := catalog.LocationValue{AssetID: id, Source: "jfs-path:" + testUUID, Locator: hint}
+	if h.Removed || h.Value != wantHint {
+		f.t.Fatalf("hint of %d = %+v, want active %+v", ino, h, wantHint)
 	}
-	return want.AssetID
+	if a := f.asset(id); a.Label != label {
+		f.t.Fatalf("label of %d = %q, want %q", ino, a.Label, label)
+	}
+	return id
 }
 
-func TestCreateBindsAssetAndLocation(t *testing.T) {
+func (f *fixture) requireRemoved(ino uint64) {
+	f.t.Helper()
+	for _, id := range []string{LocationID(testUUID, ino), HintID(testUUID, ino)} {
+		if l := f.location(id); !l.Removed {
+			f.t.Fatalf("%s is active: %+v", id, l)
+		}
+	}
+}
+
+func (f *fixture) requireUnbound(ino uint64) {
+	f.t.Helper()
+	if _, err := f.store.GetLocation(context.Background(), f.lib, LocationID(testUUID, ino)); !errors.Is(err, catalog.ErrNotFound) {
+		f.t.Fatalf("inode %d bound: %v", ino, err)
+	}
+}
+
+func TestCreateBindsAssetAndLocations(t *testing.T) {
 	f := newFixture(t, 0, true)
 	ino := f.create("Projects/A/clip.mov")
 	f.feed(Event{Op: "create", Path: "Projects/A/clip.mov", Inode: ino})
-	f.requireBound(ino, "Projects/A/clip.mov")
+	f.requireBound(ino, "Projects/A/clip.mov", "clip.mov")
 	if f.events() != 1 {
 		t.Fatalf("a bind is one operation, got %d", f.events())
 	}
@@ -303,9 +336,7 @@ func TestCreateBindsAssetAndLocation(t *testing.T) {
 	if f.events() != 1 {
 		t.Fatalf("an unchanged file recorded %d operations", f.events())
 	}
-	if _, err := f.store.GetLocation(context.Background(), f.lib, LocationID(testUUID, 999)); !errors.Is(err, catalog.ErrNotFound) {
-		t.Fatalf("event inode was trusted: %v", err)
-	}
+	f.requireUnbound(999)
 }
 
 func TestIgnoresWhatIsNotAVisibleRegularFile(t *testing.T) {
@@ -334,7 +365,7 @@ func TestIgnoresWhatIsNotAVisibleRegularFile(t *testing.T) {
 	}
 }
 
-func TestRenameKeepsAssetAndMovesHint(t *testing.T) {
+func TestRenameKeepsAssetMovesHintKeepsLabel(t *testing.T) {
 	f := newFixture(t, 0, true)
 	ino := f.create("Projects/A/.clip.mov.tmp")
 	f.rename("Projects/A/.clip.mov.tmp", "Projects/A/clip.mov")
@@ -342,35 +373,35 @@ func TestRenameKeepsAssetAndMovesHint(t *testing.T) {
 		Event{Op: "create", Path: "Projects/A/.clip.mov.tmp", Inode: ino},
 		Event{Op: "rename", Path: "Projects/A/clip.mov", OldPath: "Projects/A/.clip.mov.tmp", Inode: ino},
 	)
-	id := f.requireBound(ino, "Projects/A/clip.mov")
-	created := f.location(ino).CreatedSequence
+	id := f.requireBound(ino, "Projects/A/clip.mov", "clip.mov")
+	created := f.location(LocationID(testUUID, ino)).CreatedSequence
 	f.rename("Projects/A/clip.mov", "Projects/B/final.mov")
 	f.feed(Event{Op: "rename", Path: "Projects/B/final.mov", OldPath: "Projects/A/clip.mov", Inode: ino})
-	if got := f.requireBound(ino, "Projects/B/final.mov"); got != id {
+	if got := f.requireBound(ino, "Projects/B/final.mov", "clip.mov"); got != id {
 		t.Fatalf("rename changed the asset: %s -> %s", id, got)
 	}
-	if loc := f.location(ino); loc.CreatedSequence != created {
+	if loc := f.location(LocationID(testUUID, ino)); loc.CreatedSequence != created {
 		t.Fatalf("rename recreated the location: %+v", loc)
+	}
+	if a := f.asset(id); a.UpdatedSequence != a.CreatedSequence {
+		t.Fatalf("the binder changed the asset: %+v", a)
 	}
 	if n := f.events(); n != 2 {
 		t.Fatalf("bind + one hint change, got %d operations", n)
 	}
 }
 
-func TestUnlinkTombstonesLocation(t *testing.T) {
+func TestUnlinkTombstonesLocations(t *testing.T) {
 	for _, skipTrash := range []bool{false, true} {
 		t.Run(fmt.Sprintf("skipTrash=%v", skipTrash), func(t *testing.T) {
 			f := newFixture(t, 0, true)
 			ino := f.create("Projects/clip.mov")
 			f.feed(Event{Op: "create", Path: "Projects/clip.mov", Inode: ino})
-			id := f.requireBound(ino, "Projects/clip.mov")
+			id := f.requireBound(ino, "Projects/clip.mov", "clip.mov")
 			f.unlink("Projects/clip.mov", skipTrash)
 			f.feed(Event{Op: "delete", Path: "Projects/clip.mov", Inode: ino})
-			loc := f.location(ino)
-			if !loc.Removed || loc.Value.AssetID != id {
-				t.Fatalf("location after unlink = %+v", loc)
-			}
-			if a := f.asset(id); a.Label != "Projects/clip.mov" {
+			f.requireRemoved(ino)
+			if a := f.asset(id); a.Label != "clip.mov" {
 				t.Fatalf("asset after unlink = %+v", a)
 			}
 			// A delete naming no inode, for a path the binder never saw, is
@@ -383,13 +414,80 @@ func TestUnlinkTombstonesLocation(t *testing.T) {
 	}
 }
 
+// B1: a delete event can carry a client's synthetic inode (bit 63, for an
+// entry it created locally) or a stale one. The inode last seen at the path
+// is retired anyway; a delete that matches nothing is counted.
+func TestDeleteWithSyntheticInodeUsesThePath(t *testing.T) {
+	f := newFixture(t, 0, true)
+	ino := f.create("Projects/clip.mov")
+	f.feed(Event{Op: "create", Path: "Projects/clip.mov", Inode: ino})
+	f.unlink("Projects/clip.mov", true)
+	f.feed(Event{Op: "delete", Path: "Projects/clip.mov", Inode: 1<<63 | 5})
+	f.requireRemoved(ino)
+	f.feed(Event{Op: "delete", Path: "Projects/never-seen.mov", Inode: 1<<63 | 6})
+	if s := f.b.Stats(); s.Unresolved != 1 || s.Failed != 0 {
+		t.Fatalf("stats %+v", s)
+	}
+}
+
 func TestDeleteOfLiveInodeKeepsLocation(t *testing.T) {
 	f := newFixture(t, 0, true)
 	ino := f.create("Projects/clip.mov")
 	f.feed(Event{Op: "create", Path: "Projects/clip.mov", Inode: ino})
 	// A stale or forged delete for a file that is still there.
 	f.feed(Event{Op: "delete", Path: "Projects/clip.mov", Inode: ino})
-	f.requireBound(ino, "Projects/clip.mov")
+	f.requireBound(ino, "Projects/clip.mov", "clip.mov")
+}
+
+// B2: JuiceFS's GetPaths skips a directory it cannot read. A hard-linked
+// file whose names cannot all be found is unknown, never deleted.
+func TestUnreadableNamesAreUnknownNotGone(t *testing.T) {
+	saved := eventRetries
+	eventRetries = []time.Duration{time.Millisecond, time.Millisecond}
+	defer func() { eventRetries = saved }()
+	f := newFixture(t, 0, true)
+	ino := f.create("A/x.mov")
+	f.link(ino, "B/y.mov")
+	f.feed(Event{Op: "create", Path: "A/x.mov", Inode: ino})
+	f.requireBound(ino, "A/x.mov", "x.mov")
+	f.unlink("A/x.mov", true) // y.mov still names it
+	// Make B/y.mov unfindable without changing the inode (a directory read
+	// that fails the same way JuiceFS's GetPaths swallows).
+	rdb := openRedis(t, f.url)
+	defer rdb.Close()
+	if err := rdb.HDel(context.Background(), fmt.Sprintf("d%d", f.resolve("B")), "y.mov").Err(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.b.vol.Load().GetPaths(ino); !errors.Is(err, syscall.EIO) {
+		t.Fatalf("GetPaths with a name missing = %v, want EIO", err)
+	}
+	f.feed(Event{Op: "delete", Path: "A/x.mov", Inode: ino})
+	if l := f.location(LocationID(testUUID, ino)); l.Removed {
+		t.Fatal("a file whose names could not be read was tombstoned")
+	}
+	if s := f.b.Stats(); s.Failed != 1 || s.Retried != 2 {
+		t.Fatalf("stats %+v", s)
+	}
+}
+
+// S1: Finder's "move to trash" on a network volume renames into a hidden
+// .Trashes folder; a file with only hidden names leaves the catalog, and
+// comes back (same records) when it is moved out.
+func TestRenameIntoHiddenFolderTombstones(t *testing.T) {
+	f := newFixture(t, 0, true)
+	ino := f.create("Projects/clip.mov")
+	f.feed(Event{Op: "create", Path: "Projects/clip.mov", Inode: ino})
+	created := f.location(LocationID(testUUID, ino)).CreatedSequence
+	f.resolve(".Trashes/501")
+	f.rename("Projects/clip.mov", ".Trashes/501/clip.mov")
+	f.feed(Event{Op: "rename", Path: ".Trashes/501/clip.mov", OldPath: "Projects/clip.mov", Inode: ino})
+	f.requireRemoved(ino)
+	f.rename(".Trashes/501/clip.mov", "Projects/back.mov")
+	f.feed(Event{Op: "rename", Path: "Projects/back.mov", OldPath: ".Trashes/501/clip.mov", Inode: ino})
+	f.requireBound(ino, "Projects/back.mov", "clip.mov")
+	if l := f.location(LocationID(testUUID, ino)); l.CreatedSequence != created {
+		t.Fatalf("location recreated: %+v", l)
+	}
 }
 
 func TestReplayIsIdempotent(t *testing.T) {
@@ -407,10 +505,8 @@ func TestReplayIsIdempotent(t *testing.T) {
 	// The creates come after the change (the queue lags): b is already
 	// gone and a is no longer at its first name, so only a is bound.
 	f.feed(history...)
-	f.requireBound(a, "Projects/a2.mov")
-	if _, err := f.store.GetLocation(context.Background(), f.lib, LocationID(testUUID, b)); !errors.Is(err, catalog.ErrNotFound) {
-		t.Fatalf("b bound after it was gone: %v", err)
-	}
+	f.requireBound(a, "Projects/a2.mov", "a2.mov")
+	f.requireUnbound(b)
 	n := f.events()
 	f.feed(history...)
 	f.feed(history...)
@@ -421,10 +517,12 @@ func TestReplayIsIdempotent(t *testing.T) {
 	// An uncertain commit retried from the same state is the identical
 	// operation: the catalog returns the original receipt.
 	c := f.create("Projects/c.mov")
-	v := f.b.vol.Load()
-	op, err := f.b.planBind(context.Background(), v, c, "Projects/c.mov")
+	op, err := f.b.plan(context.Background(), f.b.vol.Load(), c, true, "Projects/c.mov")
 	if err != nil || op == nil {
 		t.Fatalf("plan: %v %v", op, err)
+	}
+	if op.ID != fmt.Sprintf("jfs-%s-%d-bind-0-0", testUUID, c) {
+		t.Fatalf("operation ID %q", op.ID)
 	}
 	first, err := f.store.Apply(context.Background(), *op)
 	if err != nil {
@@ -433,9 +531,6 @@ func TestReplayIsIdempotent(t *testing.T) {
 	again, err := f.store.Apply(context.Background(), *op)
 	if err != nil || again != first {
 		t.Fatalf("retry = %+v, %v; want %+v", again, err, first)
-	}
-	if op.ID != fmt.Sprintf("jfs-%s-%d-bind-0-0", testUUID, c) {
-		t.Fatalf("operation ID %q", op.ID)
 	}
 	f.feed(Event{Op: "create", Path: "Projects/c.mov", Inode: c})
 	if got := f.events(); got != n+1 {
@@ -447,11 +542,12 @@ func TestRevivesTombstonedLocation(t *testing.T) {
 	f := newFixture(t, 0, true)
 	ino := f.create("Projects/clip.mov")
 	f.feed(Event{Op: "create", Path: "Projects/clip.mov", Inode: ino})
-	created := f.location(ino).CreatedSequence
-	// Deleted into the trash (tombstoned), then restored from it: the same
-	// inode comes back, so its location is reactivated, not recreated.
+	created := f.location(LocationID(testUUID, ino)).CreatedSequence
+	// Deleted into the JuiceFS trash (tombstoned), then restored from it:
+	// the same inode comes back, so its records are reactivated.
 	f.unlink("Projects/clip.mov", false)
 	f.feed(Event{Op: "delete", Path: "Projects/clip.mov", Inode: ino})
+	f.requireRemoved(ino)
 	paths, err := f.b.vol.Load().GetPaths(ino)
 	if err != nil || len(paths) != 0 {
 		t.Fatalf("trashed file paths = %v, %v", paths, err)
@@ -459,8 +555,8 @@ func TestRevivesTombstonedLocation(t *testing.T) {
 	trashed := f.trashName(ino)
 	f.rename(trashed, "Projects/restored.mov")
 	f.feed(Event{Op: "rename", Path: "Projects/restored.mov", OldPath: trashed, Inode: ino})
-	f.requireBound(ino, "Projects/restored.mov")
-	if loc := f.location(ino); loc.CreatedSequence != created {
+	f.requireBound(ino, "Projects/restored.mov", "clip.mov")
+	if loc := f.location(LocationID(testUUID, ino)); loc.CreatedSequence != created {
 		t.Fatalf("location recreated: %+v", loc)
 	}
 }
@@ -487,30 +583,33 @@ func (f *fixture) trashName(ino uint64) string {
 	return ""
 }
 
-func TestHardLinksUseSmallestPath(t *testing.T) {
+func TestHardLinks(t *testing.T) {
 	f := newFixture(t, 0, true)
 	ino := f.create("Projects/z.mov")
 	f.link(ino, "Projects/b.mov")
 	f.link(ino, "Projects/.hidden.mov")
+	// First choice: the smallest visible name.
 	f.feed(Event{Op: "create", Path: "Projects/z.mov", Inode: ino})
-	f.requireBound(ino, "Projects/b.mov")
-	// Losing the hinted name moves the hint to the next canonical one.
+	f.requireBound(ino, "Projects/b.mov", "b.mov")
+	// A hint that still names the file is kept (no listing).
+	f.link(ino, "Projects/a.mov")
+	f.feed(Event{Op: "update", Path: "Projects/a.mov", Inode: ino})
+	f.requireBound(ino, "Projects/b.mov", "b.mov")
+	// Losing the hinted name moves the hint to the next smallest.
 	f.unlink("Projects/b.mov", false)
 	f.feed(Event{Op: "delete", Path: "Projects/b.mov", Inode: ino})
-	f.requireBound(ino, "Projects/z.mov")
+	f.requireBound(ino, "Projects/a.mov", "b.mov")
 	// Losing a name that is not the hint changes nothing.
 	n := f.events()
-	f.unlink("Projects/.hidden.mov", false)
-	f.feed(Event{Op: "delete", Path: "Projects/.hidden.mov", Inode: ino})
+	f.unlink("Projects/z.mov", false)
+	f.feed(Event{Op: "delete", Path: "Projects/z.mov", Inode: ino})
 	if f.events() != n {
 		t.Fatal("losing an unhinted name recorded an operation")
 	}
-	// The last name goes: the location is tombstoned.
-	f.unlink("Projects/z.mov", false)
-	f.feed(Event{Op: "delete", Path: "Projects/z.mov", Inode: ino})
-	if !f.location(ino).Removed {
-		t.Fatal("location of an unlinked hard-linked file is active")
-	}
+	// Only a hidden name left: out of the catalog.
+	f.unlink("Projects/a.mov", false)
+	f.feed(Event{Op: "delete", Path: "Projects/a.mov", Inode: ino})
+	f.requireRemoved(ino)
 }
 
 func TestRenameOverRetiresReplacedFile(t *testing.T) {
@@ -525,9 +624,37 @@ func TestRenameOverRetiresReplacedFile(t *testing.T) {
 		Event{Op: "create", Path: "Projects/.edit.prproj.tmp", Inode: tmp},
 		Event{Op: "rename", Path: "Projects/edit.prproj", OldPath: "Projects/.edit.prproj.tmp", Inode: tmp},
 	)
-	f.requireBound(tmp, "Projects/edit.prproj")
-	if !f.location(old).Removed {
-		t.Fatal("the replaced file's location is still active")
+	f.requireBound(tmp, "Projects/edit.prproj", "edit.prproj")
+	f.requireRemoved(old)
+}
+
+// S2: the path cache is a bounded LRU; evictions are counted, and an
+// evicted path's replacement is not noticed.
+func TestPathCacheIsLRUAndCountsEvictions(t *testing.T) {
+	c := newPathCache(2)
+	c.put("a", 1)
+	c.put("b", 2)
+	c.get("a") // b is now the least recent
+	c.put("c", 3)
+	if _, ok := c.get("b"); ok || c.evictions.Load() != 1 {
+		t.Fatalf("b kept or evictions %d", c.evictions.Load())
+	}
+	if ino, ok := c.get("a"); !ok || ino != 1 {
+		t.Fatal("a evicted")
+	}
+
+	f := newFixtureWith(t, Config{PathCacheSize: 1}, true)
+	old := f.create("P/edit.prproj")
+	other := f.create("P/other.mov")
+	f.feed(Event{Op: "create", Path: "P/edit.prproj", Inode: old}, Event{Op: "create", Path: "P/other.mov", Inode: other})
+	if s := f.b.Stats(); s.PathCacheEvictions != 1 {
+		t.Fatalf("stats %+v", s)
+	}
+	tmp := f.create("P/.tmp")
+	f.rename("P/.tmp", "P/edit.prproj")
+	f.feed(Event{Op: "rename", Path: "P/edit.prproj", OldPath: "P/.tmp", Inode: tmp})
+	if l := f.location(LocationID(testUUID, old)); l.Removed {
+		t.Fatal("an evicted path's replaced file was noticed; the test is not exercising eviction")
 	}
 }
 
@@ -555,13 +682,36 @@ func TestQueueOverflowDropsAndCounts(t *testing.T) {
 	go func() { defer close(done); f.b.Run(ctx) }()
 	defer func() { cancel(); <-done; _ = f.b.Close() }()
 	f.waitHandled(2)
-	f.requireBound(ino, "A/0.mov")
+	f.requireBound(ino, "A/0.mov", "0.mov")
 }
 
-func TestSubscribeAppliesPublishedEvents(t *testing.T) {
+func TestStopCountsDiscardedEvents(t *testing.T) {
+	f := newFixture(t, 0, false)
+	for i := 0; i < 3; i++ {
+		f.b.Offer(Event{Op: "create", Path: fmt.Sprintf("A/%d.mov", i)})
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	f.b.Run(ctx) // stops at once: the queue is discarded, not applied
+	if f.b.Offer(Event{Op: "create", Path: "A/late.mov"}) {
+		t.Fatal("queued after stop")
+	}
+	if s := f.b.Stats(); s.Discarded != 3 || s.Dropped != 1 || s.Queued != 0 {
+		t.Fatalf("stats %+v", s)
+	}
+}
+
+func TestSubscribeAppliesEventsAndCountsReconnects(t *testing.T) {
 	f := newFixture(t, 0, true)
 	channel := fmt.Sprintf("juicemount:metadata:test-%d", time.Now().UnixNano())
-	rdb := openRedis(t, f.url)
+	opts, err := redisurl.Parse(f.url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Named, so only this subscriber is dropped below: the server may be
+	// shared with other packages' subscribers.
+	opts.ClientName = fmt.Sprintf("binder-test-%d", time.Now().UnixNano())
+	rdb := redis.NewClient(opts)
 	defer rdb.Close()
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
@@ -575,21 +725,62 @@ func TestSubscribeAppliesPublishedEvents(t *testing.T) {
 	if f.b.Stats().ObservedSince.IsZero() {
 		t.Fatal("no observation start recorded")
 	}
-	ino := f.create("Projects/clip.mov")
 	pub := openRedis(t, f.url)
 	defer pub.Close()
-	payload, _ := json.Marshal(metadata.MetadataEvent{Op: "create", Path: "Projects/clip.mov", Size: 1, Mtime: 1, Inode: ino})
-	for _, p := range []string{"{garbage", string(payload)} {
+	publish := func(p string) {
+		t.Helper()
 		if err := pub.Publish(ctx, channel, p).Err(); err != nil {
 			t.Fatal(err)
 		}
 	}
+	ino := f.create("Projects/clip.mov")
+	payload, _ := json.Marshal(metadata.MetadataEvent{Op: "create", Path: "Projects/clip.mov", Size: 1, Mtime: 1, Inode: ino})
+	publish("{garbage")
+	publish(string(payload))
 	f.sent = 1 // the garbage payload is counted, never queued
 	f.waitHandled(1)
-	f.requireBound(ino, "Projects/clip.mov")
-	if s := f.b.Stats(); s.Received != 2 || s.Ignored != 1 {
+	f.requireBound(ino, "Projects/clip.mov", "clip.mov")
+	if s := f.b.Stats(); s.Received != 2 || s.Ignored != 1 || s.Resubscribes != 0 {
 		t.Fatalf("stats %+v", s)
 	}
+
+	// The server drops the subscriber: go-redis re-subscribes, which is
+	// counted (events in between are lost), and delivery resumes.
+	clients, err := pub.ClientList(ctx).Result()
+	if err != nil {
+		t.Fatal(err)
+	}
+	killed := 0
+	for _, line := range strings.Split(clients, "\n") {
+		var id string
+		for _, field := range strings.Fields(line) {
+			if v, ok := strings.CutPrefix(field, "id="); ok {
+				id = v
+			}
+		}
+		if strings.Contains(line, " name="+opts.ClientName+" ") && strings.Contains(line, " sub=1 ") {
+			if err := pub.ClientKillByFilter(ctx, "ID", id).Err(); err != nil {
+				t.Fatal(err)
+			}
+			killed++
+		}
+	}
+	if killed != 1 {
+		t.Fatalf("killed %d subscriber connections:\n%s", killed, clients)
+	}
+	deadline := time.Now().Add(15 * time.Second)
+	for f.b.Stats().Resubscribes == 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("no re-subscription counted: %+v", f.b.Stats())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	second := f.create("Projects/second.mov")
+	payload, _ = json.Marshal(metadata.MetadataEvent{Op: "create", Path: "Projects/second.mov", Inode: second})
+	publish(string(payload))
+	f.sent = 2
+	f.waitHandled(2)
+	f.requireBound(second, "Projects/second.mov", "second.mov")
 }
 
 func TestQueries(t *testing.T) {
@@ -603,11 +794,14 @@ func TestQueries(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := AssetView{
-		AssetID:   AssetID(testUUID, ino),
-		PathHint:  "Archive/clip.mov",
-		Path:      "Archive/clip.mov",
-		Paths:     []string{"Archive/clip.mov", "Projects/clip.mov"},
-		Locations: []LocationView{{ID: LocationID(testUUID, ino), Source: "jfs:" + testUUID, Locator: fmt.Sprintf("ino:%d", ino), UpdatedSequence: 1}},
+		AssetID:  AssetID(testUUID, ino),
+		Label:    "clip.mov",
+		PathHint: "Archive/clip.mov",
+		Path:     "Archive/clip.mov",
+		Locations: []LocationView{
+			{ID: LocationID(testUUID, ino), Source: "jfs:" + testUUID, Locator: fmt.Sprintf("ino:%d", ino), UpdatedSequence: 1},
+			{ID: HintID(testUUID, ino), Source: "jfs-path:" + testUUID, Locator: "Archive/clip.mov", UpdatedSequence: 1},
+		},
 	}
 	if !reflect.DeepEqual(byPath, want) {
 		t.Fatalf("by path = %+v\nwant %+v", byPath, want)
@@ -615,6 +809,11 @@ func TestQueries(t *testing.T) {
 	byID, err := f.b.AssetByID(ctx, want.AssetID)
 	if err != nil || !reflect.DeepEqual(byID, want) {
 		t.Fatalf("by id = %+v, %v", byID, err)
+	}
+	// The hint moved without an event: the view resolves the current name.
+	f.unlink("Archive/clip.mov", false)
+	if v, err := f.b.AssetByID(ctx, want.AssetID); err != nil || v.Path != "Projects/clip.mov" || v.PathHint != "Archive/clip.mov" {
+		t.Fatalf("after an unseen unlink: %+v, %v", v, err)
 	}
 	f.create("Projects/uncatalogued.mov")
 	for _, p := range []string{"Projects/uncatalogued.mov", "Projects/nope.mov"} {
@@ -669,5 +868,50 @@ func TestEventMatchesPublishedPayload(t *testing.T) {
 	}
 	if _, err := ParseEvent([]byte(`{"op":"create","path":"` + strings.Repeat("x", MaxEventBytes) + `"}`)); err == nil {
 		t.Fatal("oversized payload parsed")
+	}
+}
+
+// countingVolume counts the expensive whole-listing reads.
+type countingVolume struct {
+	Volume
+	getPaths *atomic.Int32
+}
+
+func (v countingVolume) GetPaths(ino uint64) ([]string, error) {
+	v.getPaths.Add(1)
+	return v.Volume.GetPaths(ino)
+}
+
+// S3: single-link files and API views check the hint with point reads;
+// directory listings are only for hard links or a hint that moved.
+func TestCommonPathsListNoDirectories(t *testing.T) {
+	var calls atomic.Int32
+	f := newFixture(t, 0, false)
+	f.b.cfg.Connect = func() (Volume, error) {
+		v, err := jfsmeta.OpenReadOnly(f.url)
+		if err != nil {
+			return nil, err
+		}
+		return countingVolume{v, &calls}, nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); f.b.Run(ctx) }()
+	defer func() { cancel(); <-done; _ = f.b.Close() }()
+	ino := f.create("Projects/clip.mov")
+	f.rename("Projects/clip.mov", "Projects/B/clip.mov")
+	f.feed(
+		Event{Op: "create", Path: "Projects/clip.mov", Inode: ino},
+		Event{Op: "rename", Path: "Projects/B/clip.mov", OldPath: "Projects/clip.mov", Inode: ino},
+		Event{Op: "update", Path: "Projects/B/clip.mov", Inode: ino},
+	)
+	f.requireBound(ino, "Projects/B/clip.mov", "clip.mov")
+	for i := 0; i < 3; i++ {
+		if v, err := f.b.AssetByID(context.Background(), AssetID(testUUID, ino)); err != nil || v.Path != "Projects/B/clip.mov" {
+			t.Fatalf("view %+v, %v", v, err)
+		}
+	}
+	if n := calls.Load(); n != 0 {
+		t.Fatalf("%d whole-listing reads for a single-link file", n)
 	}
 }

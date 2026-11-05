@@ -15,6 +15,11 @@ import (
 // connection are never delivered. Stats reports when observation started
 // and counts re-subscriptions, so a later rescan knows coverage is partial.
 func (b *Binder) Subscribe(ctx context.Context, rdb *redis.Client, channel string) {
+	defer func() {
+		if p := recover(); p != nil {
+			b.disable("the change-event reader", p)
+		}
+	}()
 	backoff := time.Second
 	for ctx.Err() == nil {
 		ps := rdb.Subscribe(ctx, channel)
