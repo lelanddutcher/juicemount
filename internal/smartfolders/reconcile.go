@@ -51,7 +51,15 @@ const OwnedDirPerm fs.FileMode = 0o705
 type Ownership struct {
 	Root  *OwnedDir             `json:"root,omitempty"`
 	Views map[string]*OwnedView `json:"views,omitempty"` // by top-level folder name
+	// Lost names hidden paths a view had been moved aside to (RemoveView)
+	// when its root was removed, renamed or replaced: the view directory
+	// may still be there, under the old root. Kept (at most maxLost) so it
+	// stays reported; nothing acts on them.
+	Lost []string `json:"lost,omitempty"`
 }
+
+// maxLost bounds Ownership.Lost.
+const maxLost = 64
 
 // OwnedDir is a directory the Manager created, identified by inode. JuiceFS
 // allocates inode numbers from a counter and never reuses one, so a
@@ -283,7 +291,13 @@ func (r *Reconciler) dropAll() error {
 		if d := droppedTemps(r.Root+"/"+folder, r.Own.Views[folder]); d != nil {
 			names = append(names, d.Names...)
 		}
-		names = append(names, r.droppedRemoval(r.Own.Views[folder])...)
+		removal := r.droppedRemoval(r.Own.Views[folder])
+		names = append(names, removal...)
+		for _, p := range removal {
+			if len(r.Own.Lost) < maxLost && !slices.Contains(r.Own.Lost, p) {
+				r.Own.Lost = append(r.Own.Lost, p)
+			}
+		}
 	}
 	r.Own.Root, r.Own.Views = nil, map[string]*OwnedView{}
 	if names == nil {
@@ -941,11 +955,11 @@ func (r *Reconciler) RemoveView(folder string) (Result, error) {
 	if ov.Pending || len(ov.Links)+len(ov.Temps) > 0 {
 		return res, fmt.Errorf("%s: %w", view, ErrViewInUse)
 	}
-	empty, err := r.FS.Empty(view)
+	names, err := r.FS.List(view, 2)
 	if err != nil {
 		return res, err
 	}
-	if !empty {
+	if len(names) > 0 && !r.onlyFinderFile(view, names) {
 		return res, fmt.Errorf("%s: %w", view, ErrViewInUse)
 	}
 	release, err := r.gateView(view)
@@ -965,8 +979,15 @@ func (r *Reconciler) RemoveView(folder string) (Result, error) {
 	// Whatever the move did (it may also have failed only in its reply),
 	// both names are inspected now.
 	removed, err := r.settleRemoval(folder, ov)
-	if perr := r.persist(); perr != nil {
-		err = errors.Join(err, perr)
+	// A refused move changed nothing: the records are as they were before
+	// RemoveAs was recorded, so the state file is not written again (the
+	// stale RemoveAs it holds names a hidden path that never existed, which
+	// the next settle clears).
+	unchanged := moveErr != nil && err == nil && !removed && r.Own.Views[folder] == ov && ov.RemoveAs == ""
+	if !unchanged {
+		if perr := r.persist(); perr != nil {
+			err = errors.Join(err, perr)
+		}
 	}
 	switch {
 	case removed || r.Own.Views[folder] == nil:
@@ -981,6 +1002,36 @@ func (r *Reconciler) RemoveView(folder string) (Result, error) {
 	default:
 		return res, fmt.Errorf("%s: %w", view, ErrViewInUse)
 	}
+}
+
+// StuckError: an entry the reconciler moved to a hidden name could not go
+// back to its name. It stays recorded under Hidden.
+type StuckError struct {
+	Hidden string // "<Root>/<hidden name>"
+	Name   string // where it belongs
+	Err    error
+}
+
+func (e *StuckError) Error() string {
+	return fmt.Sprintf("an entry is under the hidden name %s (it belongs at %s) and cannot go back: %v", e.Hidden, e.Name, e.Err)
+}
+
+func (e *StuckError) Unwrap() error { return e.Err }
+
+// finderFile is the one entry RemoveView removes with a view: the Finder's
+// own view settings, written into any folder a Finder window opens (and
+// written again when it is needed). Nothing else is ever removed: not
+// AppleDouble "._" files, not other dot-names.
+const finderFile = ".DS_Store"
+
+// onlyFinderFile reports whether the names (a listing of up to two
+// entries) leave the view empty but for a regular finderFile.
+func (r *Reconciler) onlyFinderFile(dir string, names []string) bool {
+	if len(names) != 1 || names[0] != finderFile {
+		return false
+	}
+	info, err := r.FS.Lstat(dir + "/" + finderFile)
+	return err == nil && info.Type == TypeRegular
 }
 
 // gateView runs the gate for one view; the release is never nil.
@@ -1018,6 +1069,13 @@ func (r *Reconciler) settleRemoval(folder string, ov *OwnedView) (bool, error) {
 	case err != nil:
 		return false, err
 	case info.Type == TypeDir && ov.Ino != 0 && info.Ino == ov.Ino:
+		// The Finder's settings file goes with the view; anything else
+		// keeps it (Rmdir refuses).
+		if names, err := r.FS.List(tp, 2); err == nil && r.onlyFinderFile(tp, names) {
+			if err := r.FS.Remove(tp + "/" + finderFile); err != nil && !errors.Is(err, fs.ErrNotExist) {
+				return false, err
+			}
+		}
 		err := r.FS.Rmdir(tp)
 		if err == nil || errors.Is(err, fs.ErrNotExist) {
 			delete(r.Own.Views, folder)
@@ -1031,7 +1089,7 @@ func (r *Reconciler) settleRemoval(folder string, ov *OwnedView) (bool, error) {
 				delete(r.Own.Views, folder)
 				return true, nil
 			}
-			return false, fmt.Errorf("the view %s is under the hidden name %s and cannot go back: %w", view, tp, perr)
+			return false, &StuckError{Hidden: tp, Name: view, Err: perr}
 		}
 		ov.RemoveAs = ""
 		if errors.Is(err, syscall.ENOTEMPTY) {
@@ -1042,7 +1100,7 @@ func (r *Reconciler) settleRemoval(folder string, ov *OwnedView) (bool, error) {
 	// The view holding a user's entry, or (after a race) an entry the
 	// Manager did not create: back to the view name, never replacing.
 	if err := r.FS.Place(tp, view); err != nil {
-		return false, fmt.Errorf("an entry is under the hidden name %s (it belongs at %s) and cannot go back: %w", tp, view, err)
+		return false, &StuckError{Hidden: tp, Name: view, Err: err}
 	}
 	ov.RemoveAs = ""
 	return false, nil

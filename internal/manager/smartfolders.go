@@ -642,9 +642,10 @@ func (s *smartFoldersService) reconcileFolder(rec *smartfolders.Reconciler, fold
 		res, err := rec.Reconcile(folder, links)
 		var gone, problems []string
 		for _, r := range res.Refused {
-			// A forbidden target is one under the collection views' root,
-			// which the tracker no longer lists once they are on.
-			if r.TargetGone() || errors.Is(r.Err, smartfolders.ErrTargetForbidden) {
+			// A target under the collection views' root (once the Manager
+			// owns it, the tracker no longer lists it) is forbidden.
+			top, _, _ := strings.Cut(r.Target, "/")
+			if r.TargetGone() || (errors.Is(r.Err, smartfolders.ErrTargetForbidden) && s.collectionsRootActive(top)) {
 				gone = append(gone, r.Target)
 			} else {
 				problems = append(problems, fmt.Sprintf("%s: %v", r.Name, r.Err))

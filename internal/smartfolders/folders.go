@@ -43,13 +43,18 @@ func FolderName(name string) string {
 
 // FolderNames assigns each folder its view folder name, by key. Folders are
 // given in order of precedence. A folder keeps the name it had (prev maps
-// key to name) while that name still derives from its display name, so a
-// path an app remembered keeps its contents. Any other folder gets
-// FolderName of its display name if no folder earlier in the order holds
-// it (compared case-insensitively, as macOS does), else the first free
-// "<name> (2)", "<name> (3)", ... A key given twice counts once. Same input,
-// same names.
-func FolderNames(folders []Folder, prev map[string]string) map[string]string {
+// key to name) while that name still derives from its display name,
+// ignoring case (a rename that only changes case keeps the folder as it
+// is), so a path an app remembered keeps its contents. Any other folder
+// gets FolderName of its display name if it is free, else the first free
+// "<name> (2)", "<name> (3)", ... A name is free unless a folder earlier
+// in the order holds it or blocked reports it (an entry already in the root
+// that is not this name's own view); names are compared case-insensitively,
+// as macOS does. A key given twice counts once. Same input, same names.
+func FolderNames(folders []Folder, prev map[string]string, blocked func(name string) bool) map[string]string {
+	if blocked == nil {
+		blocked = func(string) bool { return false }
+	}
 	out := map[string]string{}
 	used := map[string]bool{}
 	seen := map[string]bool{}
@@ -60,7 +65,7 @@ func FolderNames(folders []Folder, prev map[string]string) map[string]string {
 		}
 		seen[f.Key] = true
 		base := FolderName(f.Name)
-		if n, ok := prev[f.Key]; ok && derivesFrom(n, base) && !used[foldName(n)] {
+		if n, ok := prev[f.Key]; ok && derivesFrom(n, base) && !used[foldName(n)] && !blocked(n) {
 			used[foldName(n)] = true
 			out[f.Key] = n
 			continue
@@ -70,7 +75,7 @@ func FolderNames(folders []Folder, prev map[string]string) map[string]string {
 	for _, f := range fresh {
 		base := FolderName(f.Name)
 		name := base
-		for n := 2; used[foldName(name)]; n++ {
+		for n := 2; used[foldName(name)] || blocked(name); n++ {
 			name = base + " (" + strconv.Itoa(n) + ")"
 		}
 		used[foldName(name)] = true
@@ -79,8 +84,10 @@ func FolderNames(folders []Folder, prev map[string]string) map[string]string {
 	return out
 }
 
-// derivesFrom reports whether name is base or base numbered " (n)", n>=2.
+// derivesFrom reports whether name is base or base numbered " (n)", n>=2,
+// ignoring case.
 func derivesFrom(name, base string) bool {
+	name, base = foldName(name), foldName(base)
 	if name == base {
 		return true
 	}

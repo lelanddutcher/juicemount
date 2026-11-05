@@ -137,18 +137,23 @@ relative symlink per member file that is present, pointing at the file's
 current path (found from its inode, so it follows renames and moves). The same
 ownership rules apply, with records of their own in `smart-folders.json`
 (version 3 once they exist; an older Manager refuses that file and leaves it
-alone). A user-made `Collections` is left alone and only stops these views.
+alone). A user-made `Collections` is left alone and only stops these views (for
+`Recents` it is an ordinary folder).
 Names: `/`, `:` and control characters become `-`, leading dots are dropped;
-when two collections or two member files clash, the older one keeps the plain
-name and the newer gets `(2)` or its folder name, as in `Recents`. A member
+when two collections clash (ignoring case), the collection that already holds
+the name keeps it and the other gets `(2)`; a name a user's folder already
+takes is skipped; a rename that only changes case keeps the folder. Member
+files that clash are labelled with their folder, as in `Recents`. A member
 whose file is gone gets no link (it stays a member). A deleted or renamed
 collection's view is emptied and then removed, unless a user put something in
-it (left alone) or the volume refuses: through the RESP proxy a view folder is
-a project root, which only an admin may rename or remove, so there it stays
-empty. At most 128 views of 500 links; the rest, missing members and views
-left behind are counted in `GET /api/continuity/status` (`collection_views`).
-Views follow collection changes and member-file events within seconds, and are
-all rebuilt every 10 minutes.
+it (left alone; a lone Finder `.DS_Store` does not count and is removed with
+it) or the volume refuses: through the RESP proxy a view folder is a project
+root, which only an admin may rename or remove, so there it stays empty. A
+member whose path cannot be read keeps its link. At most 128 views of 500
+links; the rest, missing and unresolved members and views left behind are
+counted in `GET /api/continuity/status` (`collection_views`). Views follow
+collection changes and member-file events within seconds, and are all rebuilt
+every 10 minutes, paced so `Recents` is not held up.
 
 Known gaps:
 

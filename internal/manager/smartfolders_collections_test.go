@@ -480,18 +480,49 @@ func TestCollectionViewsOffCreatesNothing(t *testing.T) {
 	if e.svc.attachCollections(e.cont) || e.svc.coll.source() != nil {
 		t.Fatal("attached with no usable root")
 	}
-	// /Recents still lists a top-level Collections folder while they are off,
-	// and stops once they are on.
+	// /Recents still lists a top-level Collections folder while they are off.
 	writeVolumeFile(t, e.root, "Collections/x/user.mov")
 	e.svc.tracker.Apply(smartfolders.Event{Op: "create", Path: "Collections/x/user.mov"})
 	if got := e.svc.tracker.Folders(); !reflect.DeepEqual(got, []string{"Collections"}) {
 		t.Fatalf("tracked %v", got)
 	}
-	e.svc.cfg.Settings.CollectionsRoot = "Collections"
+}
+
+// /Recents leaves the collections root out only once the Manager owns it:
+// a user-made /Collections stays an ordinary folder for /Recents (listed,
+// linkable, its /Recents view kept); the Manager's own is not listed.
+func TestCollectionViewsRecentsAndCollectionsRoot(t *testing.T) {
+	e := newCollViewsEnv(t, "Collections/x/user.mov", "Proj/a.mov")
+	e.svc.tracker.Apply(smartfolders.Event{Op: "create", Path: "Collections/x/user.mov"})
+	e.svc.cycle(context.Background())
+	recents := map[string]string{"Collections/user.mov": "Collections/x/user.mov"}
+	if got := viewTree(t, e.root); !reflect.DeepEqual(got, recents) {
+		t.Fatalf("/Recents = %v", got)
+	}
 	e.attach()
-	e.svc.tracker.Apply(smartfolders.Event{Op: "create", Path: "Collections/y/user.mov"})
-	if got := e.svc.tracker.Recent("Collections"); len(got) != 1 {
-		t.Fatalf("tracked under the collections root: %v", got)
+	e.create(collID(1), "Shoot", "Proj/a.mov")
+	e.svc.cycle(context.Background()) // the collections root is the user's
+	writeVolumeFile(t, e.root, "Collections/x/two.mov")
+	e.svc.tracker.Apply(smartfolders.Event{Op: "create", Path: "Collections/x/two.mov"})
+	e.clk.add(time.Second)
+	e.svc.cycle(context.Background())
+	recents["Collections/two.mov"] = "Collections/x/two.mov"
+	if got := viewTree(t, e.root); !reflect.DeepEqual(got, recents) {
+		t.Fatalf("/Recents with a user-made /Collections = %v (log %v)", got, e.svc.lastLog)
+	}
+	// The user's folder goes; the Manager's root comes: no longer listed.
+	if err := os.RemoveAll(filepath.Join(e.root, "Collections")); err != nil {
+		t.Fatal(err)
+	}
+	e.clk.add(smartFoldersRootRecheck + time.Second)
+	e.pass()
+	e.want(map[string]string{"Shoot/a.mov": "Proj/a.mov"})
+	writeVolumeFile(t, e.root, "Collections/Shoot/notes.txt")
+	e.svc.tracker.Apply(smartfolders.Event{Op: "create", Path: "Collections/Shoot/notes.txt"})
+	for _, en := range e.svc.tracker.Recent("Collections") {
+		if en.Path == "Collections/Shoot/notes.txt" {
+			t.Fatal("listed a file under the Manager's collections root")
+		}
 	}
 }
 
@@ -580,36 +611,150 @@ func keys(m map[string]json.RawMessage) []string {
 	return out
 }
 
-// A view whose members cannot be resolved (the volume is not readable) is
-// left as it is, and retried without backing off.
+// One member whose path cannot be resolved keeps its link, is counted and
+// is not resolved again until its own backoff passes; the rest of the view
+// follows. A volume not connected at all leaves the view as it is.
 func TestCollectionViewsUnknownIsNotGone(t *testing.T) {
-	e := newCollViewsEnv(t, "Proj/a.mov")
+	e := newCollViewsEnv(t, "Proj/a.mov", "Proj/b.mov", "Proj/c.mov")
 	e.attach()
-	e.create(collID(1), "Shoot", "Proj/a.mov")
+	e.create(collID(1), "Shoot", "Proj/a.mov", "Proj/b.mov")
 	e.pass()
-	e.want(map[string]string{"Shoot/a.mov": "Proj/a.mov"})
-	var fail atomic.Bool
-	fail.Store(true)
-	e.svc.coll.src.Store(&collectionSourceRef{failingSource{e.cont, &fail}})
+	e.want(map[string]string{"Shoot/a.mov": "Proj/a.mov", "Shoot/b.mov": "Proj/b.mov"})
+	fs := &failingSource{continuityService: e.cont, bad: e.asset("Proj/a.mov")}
+	e.svc.coll.src.Store(&collectionSourceRef{fs})
+	e.add(collID(1), "Proj/c.mov")
+	e.pass()
+	e.want(map[string]string{"Shoot/a.mov": "Proj/a.mov", "Shoot/b.mov": "Proj/b.mov", "Shoot/c.mov": "Proj/c.mov"})
+	if st := e.svc.collectionStats(); st.UnresolvedMembers != 1 {
+		t.Fatalf("stats = %+v", st)
+	}
+	if b := e.svc.coll.backoff["Shoot"]; b != nil {
+		t.Fatalf("the view backed off: %+v", b)
+	}
+	// Backed off: the next rebuild does not ask about it again.
+	asked := fs.badCalls.Load()
 	e.svc.coll.markDirty(collID(1))
 	e.pass()
-	e.want(map[string]string{"Shoot/a.mov": "Proj/a.mov"})
-	if b := e.svc.coll.backoff["Shoot"]; b != nil {
-		t.Fatalf("backed off: %+v", b)
+	if fs.badCalls.Load() != asked {
+		t.Fatal("re-resolved a backed-off member")
 	}
-	if !e.svc.coll.dirty[collID(1)] {
-		t.Fatal("not retried")
+	e.want(map[string]string{"Shoot/a.mov": "Proj/a.mov", "Shoot/b.mov": "Proj/b.mov", "Shoot/c.mov": "Proj/c.mov"})
+	// After its backoff it is asked again.
+	e.clk.add(2 * time.Hour)
+	e.svc.coll.markDirty(collID(1))
+	e.pass()
+	if fs.badCalls.Load() == asked {
+		t.Fatal("never retried")
+	}
+	// Not connected: nothing changes, retried at the next pass, no backoff.
+	fs.notReady.Store(true)
+	e.svc.coll.markDirty(collID(1))
+	e.pass()
+	e.want(map[string]string{"Shoot/a.mov": "Proj/a.mov", "Shoot/b.mov": "Proj/b.mov", "Shoot/c.mov": "Proj/c.mov"})
+	if b := e.svc.coll.backoff["Shoot"]; b != nil || !e.svc.coll.dirty[collID(1)] {
+		t.Fatalf("backoff %+v, dirty %v", b, e.svc.coll.dirty)
 	}
 }
 
 type failingSource struct {
 	*continuityService
-	fail *atomic.Bool
+	bad      continuity.AssetID
+	badCalls atomic.Int64
+	notReady atomic.Bool
 }
 
-func (f failingSource) resolveAsset(ctx context.Context, id continuity.AssetID) (string, string, error) {
-	if f.fail.Load() {
+func (f *failingSource) resolveAsset(ctx context.Context, id continuity.AssetID) (string, string, error) {
+	if f.notReady.Load() {
+		return "", "unknown", binder.ErrNotReady
+	}
+	if id == f.bad {
+		f.badCalls.Add(1)
 		return "", "unknown", nil
 	}
 	return f.continuityService.resolveAsset(ctx, id)
+}
+
+// A view left behind (a user's file in it) does not count against the view
+// limit; a user's folder in the root, in any case, is never a view's name.
+func TestCollectionViewsLeftBehindAndUserFolders(t *testing.T) {
+	e := newCollViewsEnv(t, "P/a.mov", "P/b.mov")
+	e.svc.coll.maxViews = 1
+	e.attach()
+	e.create(collID(1), "Old", "P/a.mov")
+	e.pass()
+	writeVolumeFile(t, e.root, "Collections/Old/notes.txt")
+	writeVolumeFile(t, e.root, "Collections/SHOOT/mine.txt") // a user's folder
+	e.apply(catalog.Change{RemoveCollection: &catalog.RemoveCollection{CollectionID: collID(1)}})
+	e.create(collID(2), "Shoot", "P/b.mov")
+	e.pass()
+	e.want(map[string]string{"Old/notes.txt": "<file>", "SHOOT/mine.txt": "<file>", "Shoot (2)/b.mov": "P/b.mov"})
+}
+
+// A pass stops starting views at its budget and schedules the next; every
+// view is built in the end, changed collections before the sweep's.
+func TestCollectionViewsPassBudget(t *testing.T) {
+	e := newCollViewsEnv(t, "P/a.mov", "P/b.mov", "P/c.mov")
+	e.svc.coll.passOps = 2
+	e.svc.coll.debounce = time.Millisecond
+	e.attach()
+	<-e.svc.coll.wake // the pass attach schedules
+	for i, f := range []string{"P/a.mov", "P/b.mov", "P/c.mov"} {
+		e.create(collID(i+1), fmt.Sprintf("C%d", i+1), f)
+	}
+	counter := &countingSource{continuityService: e.cont}
+	e.svc.coll.src.Store(&collectionSourceRef{counter})
+	passes := 0
+	for len(e.tree()) < 3 {
+		if passes++; passes > 5 {
+			t.Fatalf("not done after 5 passes: %v", e.tree())
+		}
+		before := counter.calls.Load()
+		e.pass()
+		if n := counter.calls.Load() - before; n > 2 {
+			t.Fatalf("a pass resolved %d members (budget 2)", n)
+		}
+		if len(e.tree()) < 3 {
+			select { // the rest was scheduled
+			case <-e.svc.coll.wake:
+			case <-time.After(5 * time.Second):
+				t.Fatal("no follow-up pass scheduled")
+			}
+		}
+	}
+	if passes != 2 { // two views (one resolution each), then the third
+		t.Fatalf("passes = %d", passes)
+	}
+	e.want(map[string]string{"C1/a.mov": "P/a.mov", "C2/b.mov": "P/b.mov", "C3/c.mov": "P/c.mov"})
+}
+
+type countingSource struct {
+	*continuityService
+	calls atomic.Int64
+}
+
+func (c *countingSource) resolveAsset(ctx context.Context, id continuity.AssetID) (string, string, error) {
+	c.calls.Add(1)
+	return c.continuityService.resolveAsset(ctx, id)
+}
+
+// A numbered folder name is recorded as soon as it is assigned, before the
+// view is written (here the lease is refused), so it never changes hands.
+func TestCollectionViewsNamesRecordedFirst(t *testing.T) {
+	e := newCollViewsEnv(t, "P/a.mov")
+	e.attach()
+	e.create(collID(1), "Shoot")
+	e.create(collID(2), "shoot", "P/a.mov")
+	e.leaser.mu.Lock()
+	e.leaser.refuse = true
+	e.leaser.mu.Unlock()
+	e.pass()
+	e.want(map[string]string{})
+	data, err := os.ReadFile(e.svc.cfg.StatePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var st smartFoldersState
+	if err := json.Unmarshal(data, &st); err != nil || st.Collections == nil || st.Collections.Folders[collID(2)] != "shoot (2)" {
+		t.Fatalf("state = %s (%v)", data, err)
+	}
 }

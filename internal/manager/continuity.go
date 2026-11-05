@@ -186,7 +186,7 @@ func (s *continuityService) collectionMembers(ctx context.Context, id catalog.Co
 
 // resolveAsset returns the asset's current path, resolved from the volume
 // by inode (never the path hint), and its state as the members API reports
-// it.
+// it; binder.ErrNotReady while the volume is not connected.
 func (s *continuityService) resolveAsset(ctx context.Context, id continuity.AssetID) (string, string, error) {
 	v, err := s.binder.AssetByID(ctx, id)
 	if errors.Is(err, catalog.ErrNotFound) {
@@ -194,6 +194,9 @@ func (s *continuityService) resolveAsset(ctx context.Context, id continuity.Asse
 	}
 	if err != nil {
 		return "", "", err
+	}
+	if v.ResolveError == binder.ErrNotReady.Error() {
+		return "", "unknown", binder.ErrNotReady
 	}
 	return v.Path, memberState(v), nil
 }

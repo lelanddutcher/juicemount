@@ -143,21 +143,21 @@ func TestFolderNamesCollisionsAreDeterministic(t *testing.T) {
 		{Key: "c1", Name: "ignored duplicate"},
 	}
 	want := map[string]string{"c1": "Shoot", "c2": "shoot (2)", "c3": "Sh-oot", "c4": "Sh-oot (2)"}
-	if got := FolderNames(cols, nil); !reflect.DeepEqual(got, want) {
+	if got := FolderNames(cols, nil, nil); !reflect.DeepEqual(got, want) {
 		t.Fatalf("FolderNames = %v, want %v", got, want)
 	}
 	// The earlier collection is deleted: the later one keeps its folder.
-	if got := FolderNames(cols[1:2], want); got["c2"] != "shoot (2)" {
+	if got := FolderNames(cols[1:2], want, nil); got["c2"] != "shoot (2)" {
 		t.Fatalf("kept name = %v", got)
 	}
 	// A rename gives a new folder; a name freed by a rename is reused.
 	renamed := []Folder{{Key: "c1", Name: "Final"}, {Key: "c2", Name: "shoot"}, {Key: "c5", Name: "Shoot"}}
-	got := FolderNames(renamed, want)
+	got := FolderNames(renamed, want, nil)
 	if !reflect.DeepEqual(got, map[string]string{"c1": "Final", "c2": "shoot (2)", "c5": "Shoot"}) {
 		t.Fatalf("after rename = %v", got)
 	}
 	// A previous name that no longer derives from the name is dropped.
-	if got := FolderNames([]Folder{{Key: "c2", Name: "shoot"}}, map[string]string{"c2": "shoot (02)"}); got["c2"] != "shoot" {
+	if got := FolderNames([]Folder{{Key: "c2", Name: "shoot"}}, map[string]string{"c2": "shoot (02)"}, nil); got["c2"] != "shoot" {
 		t.Fatalf("stale previous name kept: %v", got)
 	}
 }
@@ -174,5 +174,19 @@ func TestLinkNamesKeepGivenPrecedence(t *testing.T) {
 	want = []Link{{Name: "clip.mov", Target: "C/clip.mov"}, {Name: "clip (A).mov", Target: "A/clip.mov"}}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("LinkNames = %v, want %v", got, want)
+	}
+}
+
+func TestFolderNamesCaseAndBlocked(t *testing.T) {
+	// A rename that only changes case keeps the folder.
+	if got := FolderNames([]Folder{{Key: "c1", Name: "SHOOT"}}, map[string]string{"c1": "Shoot"}, nil); got["c1"] != "Shoot" {
+		t.Fatalf("case-only rename = %v", got)
+	}
+	// Names taken in the root (a user's folder, another view left behind,
+	// in any case) are skipped, for newcomers and kept names alike.
+	blocked := func(n string) bool { return strings.EqualFold(n, "Shoot") || n == "Final" }
+	got := FolderNames([]Folder{{Key: "c1", Name: "shoot"}, {Key: "c2", Name: "Final"}}, map[string]string{"c2": "Final"}, blocked)
+	if !reflect.DeepEqual(got, map[string]string{"c1": "shoot (2)", "c2": "Final (2)"}) {
+		t.Fatalf("blocked = %v", got)
 	}
 }

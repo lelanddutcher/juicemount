@@ -7,6 +7,7 @@ package sftest
 import (
 	"errors"
 	"reflect"
+	"sort"
 	"strings"
 	"syscall"
 	"testing"
@@ -265,12 +266,133 @@ var viewTests = map[string]func(*testing.T, Fixture){
 		if v := g.rec.Own.Views["Shoot"]; v == nil || v.RemoveAs != "" || ino(t, fx, "Collections/Shoot") != before {
 			t.Fatalf("record = %+v", v)
 		}
+		var stuck *smartfolders.StuckError
+		if errors.As(err, &stuck) {
+			t.Fatalf("a refused move reported as stuck: %v", err)
+		}
 		// Wanted again: the same (owned) folder is used.
 		g.log.refusePlace = nil
 		g.reconcile(t, "Shoot", link("a.mov", "Proj/a.mov"))
 		assertView(t, fx, "Collections/Shoot", map[string]string{"a.mov": "Proj/a.mov"})
 		if ino(t, fx, "Collections/Shoot") != before {
 			t.Fatal("view replaced")
+		}
+	},
+	// The Finder's .DS_Store (a regular file, exactly that name) goes with
+	// the view; it does not keep it in use.
+	"ZV_RemoveViewTakesFinderFile": func(t *testing.T, fx Fixture) {
+		g := newCollectionsRig(t, fx)
+		shoot(t, fx, g)
+		fx.WriteFile(t, "Collections/Shoot/.DS_Store")
+		if res, err := g.rec.RemoveView("Shoot"); err != nil || !res.RemovedView {
+			t.Fatalf("RemoveView = %+v, %v", res, err)
+		}
+		if names := rootEntries(t, fx); len(names) != 0 {
+			t.Fatalf("root holds %v", names)
+		}
+		targetsIntact(t, fx)
+	},
+	// Nothing else counts as the Finder's: AppleDouble files, other
+	// dot-names, a .DS_Store that is not a regular file, or a .DS_Store
+	// next to anything else keep the view, untouched.
+	"ZV_RemoveViewKeepsOtherDotFiles": func(t *testing.T, fx Fixture) {
+		for i, c := range []struct{ file, dir, link string }{
+			{file: "._a.mov"}, {file: ".notes"}, {dir: ".DS_Store"}, {link: ".DS_Store"},
+			{file: ".DS_Store", dir: "sub"},
+		} {
+			if i > 0 {
+				removeTree(t, fx, "Collections")
+			}
+			g := newCollectionsRig(t, fx)
+			if i == 0 {
+				shoot(t, fx, g)
+			} else {
+				g.reconcile(t, "Shoot", link("a.mov", "Proj/a.mov"), link("b.mov", "Proj/sub/b.mov"))
+			}
+			var others []string
+			if c.file != "" {
+				fx.WriteFile(t, "Collections/Shoot/"+c.file)
+				others = append(others, c.file)
+			}
+			if c.dir != "" {
+				fx.MkdirAll(t, "Collections/Shoot/"+c.dir)
+				others = append(others, c.dir)
+			}
+			if c.link != "" {
+				fx.Symlink(t, "x", "Collections/Shoot/"+c.link)
+				others = append(others, c.link)
+			}
+			g.events = nil
+			if _, err := g.rec.RemoveView("Shoot"); !errors.Is(err, smartfolders.ErrViewInUse) {
+				t.Fatalf("%+v: err = %v", c, err)
+			}
+			sort.Strings(others)
+			if names := fx.ReadDir(t, "Collections/Shoot"); !reflect.DeepEqual(names, others) {
+				t.Fatalf("%+v: view holds %v", c, names)
+			}
+			for _, ev := range g.events {
+				for _, o := range others {
+					if strings.HasPrefix(ev, "remove Collections/Shoot/"+o) || strings.HasPrefix(ev, "place Collections/Shoot ") {
+						t.Fatalf("%+v: touched: %v", c, g.events)
+					}
+				}
+			}
+		}
+	},
+	// A refused removal writes the state file once (the intent), not
+	// again when nothing changed.
+	"ZV_RemoveViewRefusedWritesStateOnce": func(t *testing.T, fx Fixture) {
+		g := newCollectionsRig(t, fx)
+		shoot(t, fx, g)
+		g.rec.Reconcile("Shoot", nil) // links gone first
+		g.log.refusePlace = func(from, to string) error {
+			if from == "Collections/Shoot" {
+				return syscall.EROFS
+			}
+			return nil
+		}
+		before := len(g.persists)
+		if _, err := g.rec.RemoveView("Shoot"); !errors.Is(err, syscall.EROFS) {
+			t.Fatalf("err = %v", err)
+		}
+		if n := len(g.persists) - before; n != 1 {
+			t.Fatalf("persisted %d times", n)
+		}
+		// The restart from that state settles the stale intent.
+		g2 := g.restart(t)
+		if v := g2.rec.Own.Views["Shoot"]; v == nil || v.RemoveAs == "" {
+			t.Fatalf("persisted record = %+v", v)
+		}
+		g2.reconcile(t, "Shoot", link("a.mov", "Proj/a.mov"))
+		if v := g2.rec.Own.Views["Shoot"]; v == nil || v.RemoveAs != "" {
+			t.Fatalf("record = %+v", v)
+		}
+		assertView(t, fx, "Collections/Shoot", map[string]string{"a.mov": "Proj/a.mov"})
+	},
+	// The root renamed away while a view was moved aside: the hidden path
+	// is kept in Lost, never silently forgotten.
+	"ZV_RemoveViewRootGoneKeepsLost": func(t *testing.T, fx Fixture) {
+		g := newCollectionsRig(t, fx)
+		shoot(t, fx, g)
+		var hidden string
+		g.log.afterPlace = func(from, to string) error {
+			if from == "Collections/Shoot" {
+				hidden = to
+				panic(crashed{})
+			}
+			return nil
+		}
+		removeCrashing(t, g)
+		if err := fx.FS().Place("Collections", "Old"); err != nil {
+			t.Fatal(err)
+		}
+		g2 := g.restart(t)
+		_, _ = g2.rec.RemoveView("Shoot")
+		if !reflect.DeepEqual(g2.rec.Own.Lost, []string{hidden}) {
+			t.Fatalf("lost = %v, want %v", g2.rec.Own.Lost, hidden)
+		}
+		if !strings.Contains(g2.persists[len(g2.persists)-1], hidden[len("Collections/"):]) {
+			t.Fatal("lost path not persisted")
 		}
 	},
 	// The rmdir is refused after the move: the view goes back to its name.

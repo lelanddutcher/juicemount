@@ -300,25 +300,26 @@ func (f *FS) Remove(p string) error {
 	return errno(f.m.Unlink(f.ctx, dir, leaf, true))
 }
 
-// Empty reports whether the directory p holds no entries.
-func (f *FS) Empty(p string) (bool, error) {
+// List returns up to max entry names of the directory p.
+func (f *FS) List(p string, max int) ([]string, error) {
 	ino, attr, err := f.lookup(p)
 	if err != nil {
-		return false, err
+		return nil, err
 	}
 	if attr.Typ != meta.TypeDirectory {
-		return false, syscall.ENOTDIR
+		return nil, syscall.ENOTDIR
 	}
 	var entries []*meta.Entry
 	if st := f.m.Readdir(f.ctx, ino, 0, &entries); st != 0 {
-		return false, st
+		return nil, st
 	}
+	var out []string
 	for _, e := range entries {
-		if name := string(e.Name); name != "." && name != ".." {
-			return false, nil
+		if name := string(e.Name); name != "." && name != ".." && len(out) < max {
+			out = append(out, name)
 		}
 	}
-	return true, nil
+	return out, nil
 }
 
 // Rmdir removes the empty directory p without moving it to the trash. Like
