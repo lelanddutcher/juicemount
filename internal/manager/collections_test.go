@@ -5,7 +5,9 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -32,8 +34,16 @@ type lockedVolume struct {
 }
 
 func (v *lockedVolume) VolumeUUID() string { return "00000000-0000-4000-8000-0000000000d3" }
+
+// node: caller holds mu. Nlink counts the inode's names.
 func (v *lockedVolume) node(ino uint64) jfsmeta.Node {
-	return jfsmeta.Node{Ino: ino, Type: smartfolders.TypeRegular, Nlink: 1, Parent: 1}
+	var links uint32
+	for _, i := range v.files {
+		if i == ino {
+			links++
+		}
+	}
+	return jfsmeta.Node{Ino: ino, Type: smartfolders.TypeRegular, Nlink: links, Parent: 1}
 }
 func (v *lockedVolume) LookupIno(p string) (jfsmeta.Node, error) {
 	v.mu.Lock()
@@ -94,8 +104,9 @@ type collectionsEnv struct {
 	svc    *continuityService
 	vol    *lockedVolume
 	people *PrincipalStore
-	macs   map[string][2]string // person name -> instance ID, poll token
+	macs   map[string][3]string // person name -> instance ID, poll token, device digest
 	ids    map[string]string    // person name -> person ID
+	h      *collectionsAPI
 }
 
 const collectionsAdminKey = "test-admin-key"
@@ -133,16 +144,17 @@ func newCollectionsEnv(t *testing.T) *collectionsEnv {
 		t.Fatal(err)
 	}
 	startRealProxyReloader(t, proxyDir)
-	env := &collectionsEnv{t: t, svc: svc, vol: vol, people: people, macs: map[string][2]string{}, ids: map[string]string{}}
+	env := &collectionsEnv{t: t, svc: svc, vol: vol, people: people, macs: map[string][3]string{}, ids: map[string]string{}}
 	for i, spec := range []struct{ name, grant string }{
 		{"Ann", "/Clients/A"}, {"Bob", "/Clients/B"}, {"Al", ""}, {"Nia", "/Clients/N"}, {"Pending", ""}, {"Nobody", ""},
 	} {
 		instance := fmt.Sprintf("%08X-7B3D-4C1A-9E2B-0A1B2C3D4E5F", 0x5A000000+i)
-		resp, err := people.Enroll(EnrollRequest{InstanceID: instance, Host: "bay", Secret: testMacSecret}, "192.0.2.7")
+		device := fmt.Sprintf("%032x", i+1)
+		resp, err := people.Enroll(EnrollRequest{InstanceID: instance, Host: "bay", Secret: testMacSecret, DeviceDigest: device}, "192.0.2.7")
 		if err != nil {
 			t.Fatal(err)
 		}
-		env.macs[spec.name] = [2]string{instance, resp.PollToken}
+		env.macs[spec.name] = [3]string{instance, resp.PollToken, device}
 		if spec.name == "Pending" {
 			continue
 		}
@@ -172,7 +184,10 @@ func newCollectionsEnv(t *testing.T) *collectionsEnv {
 	}
 	env.a = &API{adminKey: collectionsAdminKey, continuity: svc}
 	env.mux = http.NewServeMux()
-	env.a.registerCollections(env.mux, "/manager", people)
+	env.h = newCollectionsAPI(env.a, "/manager", people)
+	env.h.macLimit = newIPLimiter(1_000_000, time.Now) // the budget has its own test
+	env.mux.HandleFunc("/manager/api/collections", env.h.serve)
+	env.mux.HandleFunc("/manager/api/collections/", env.h.serve)
 	return env
 }
 
@@ -198,6 +213,9 @@ func (e *collectionsEnv) do(who, method, path string, body any) *httptest.Respon
 		}
 		req.Header.Set("X-JuiceMount-Mac-Instance", mac[0])
 		req.Header.Set("X-JuiceMount-Mac-Token", mac[1])
+		if mac[2] != "" {
+			req.Header.Set("X-JuiceMount-Mac-Device", mac[2])
+		}
 	}
 	rec := httptest.NewRecorder()
 	e.mux.ServeHTTP(rec, req)
@@ -527,5 +545,229 @@ func TestContinuityUpgradesSliceTwoCatalog(t *testing.T) {
 	}
 	if _, err := store.GetAsset(context.Background(), library, continuity.AssetID("asset_202122232425262728292a2b2c2d2e2f")); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func (e *collectionsEnv) offer(evs ...binder.Event) {
+	e.t.Helper()
+	want := e.svc.binder.Stats().Handled + uint64(len(evs))
+	for _, ev := range evs {
+		e.svc.binder.Offer(ev)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for e.svc.binder.Stats().Handled < want {
+		if time.Now().After(deadline) {
+			e.t.Fatalf("events not handled: %+v", e.svc.binder.Stats())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func assetRefs(ids ...continuity.AssetID) []map[string]string {
+	var out []map[string]string
+	for _, id := range ids {
+		out = append(out, map[string]string{"asset_id": string(id)})
+	}
+	return out
+}
+
+// A file moved under a hidden name is still in its folder: it is not
+// missing, so A's grant does not let Ann act on a file now in B.
+func TestCollectionsHiddenNamesAndLinksNeedGrants(t *testing.T) {
+	e := newCollectionsEnv(t)
+	three := binder.AssetID(e.vol.VolumeUUID(), 44)
+	two := binder.AssetID(e.vol.VolumeUUID(), 43)
+	sel := string(e.write("admin", "/api/collections", map[string]any{"name": "Mixed", "members": pathRefs("Clients/A/one.mov", "Clients/B/three.mov")}, 200).Collection.ID)
+	only := string(e.write("admin", "/api/collections", map[string]any{"name": "B only", "members": pathRefs("Clients/B/three.mov")}, 200).Collection.ID)
+	e.vol.set(func(f map[string]uint64) {
+		delete(f, "Clients/B/three.mov")
+		f["Clients/B/.Proj-old/three.mov"] = 44
+	})
+	e.offer(binder.Event{Op: "rename", Path: "Clients/B/.Proj-old/three.mov", OldPath: "Clients/B/three.mov", Inode: 44})
+	if m := memberPaths(e.members(catalog.CollectionID(only), "")); m["three.mov"] != "missing:" {
+		t.Fatalf("listed as: %v", m)
+	}
+	rec := e.do("Ann", http.MethodPost, "/api/collections/"+sel+"/members/remove", map[string]any{"members": assetRefs(three)})
+	if rec.Code != 403 || !strings.Contains(rec.Body.String(), "/Clients/B/.Proj-old/three.mov") {
+		t.Fatalf("Ann removing a hidden B file: %d %s", rec.Code, rec.Body)
+	}
+	e.write("Ann", "/api/collections/"+only+"/delete", map[string]any{}, 403)
+	e.write("Ann", "/api/collections/"+only+"/rename", map[string]any{"name": "mine"}, 403)
+	e.write("Bob", "/api/collections/"+sel+"/members/remove", map[string]any{"members": assetRefs(three)}, 200)
+	// A hard link: a file with a name in A and one in B is both people's.
+	e.vol.set(func(f map[string]uint64) { f["Clients/B/two-link.mov"] = 43 })
+	linked := string(e.write("admin", "/api/collections", map[string]any{"name": "Linked", "members": assetRefs(two)}, 200).Collection.ID)
+	e.write("Ann", "/api/collections/"+linked+"/rename", map[string]any{"name": "Ann"}, 200)
+	e.write("Bob", "/api/collections/"+linked+"/rename", map[string]any{"name": "Bob"}, 200)
+	e.write("Nia", "/api/collections/"+linked+"/rename", map[string]any{"name": "Nia"}, 403)
+	// A grant covers its folder, not a sibling sharing its prefix.
+	e.vol.set(func(f map[string]uint64) { f["Clients/AB/x.mov"] = 46 })
+	e.offer(binder.Event{Op: "create", Path: "Clients/AB/x.mov", Inode: 46})
+	rec = e.do("Ann", http.MethodPost, "/api/collections/"+sel+"/members/add", map[string]any{"members": pathRefs("Clients/AB/x.mov")})
+	if rec.Code != 403 || !strings.Contains(rec.Body.String(), "/Clients/AB/x.mov") {
+		t.Fatalf("Ann adding a /Clients/AB file: %d %s", rec.Code, rec.Body)
+	}
+}
+
+func TestCollectionsMacDeviceAndBudget(t *testing.T) {
+	e := newCollectionsEnv(t)
+	mac := e.macs["Ann"]
+	e.macs["Ann-nodevice"] = [3]string{mac[0], mac[1], ""}
+	if rec := e.do("Ann-nodevice", http.MethodGet, "/api/collections", nil); rec.Code != 401 || !strings.Contains(rec.Body.String(), "device digest") {
+		t.Fatalf("no device digest: %d %s", rec.Code, rec.Body)
+	}
+	// Another Mac's digest with Ann's identity: flagged, then refused for good.
+	e.macs["Ann-clone"] = [3]string{mac[0], mac[1], strings.Repeat("e", 32)}
+	if rec := e.do("Ann-clone", http.MethodGet, "/api/collections", nil); rec.Code != 403 || !strings.Contains(rec.Body.String(), "two Macs") {
+		t.Fatalf("cloned Mac: %d %s", rec.Code, rec.Body)
+	}
+	if rec := e.do("Ann", http.MethodGet, "/api/collections", nil); rec.Code != 403 {
+		t.Fatalf("flagged Mac with its own digest: %d %s", rec.Code, rec.Body)
+	}
+	// The per-IP budget (as on the enrollment poll).
+	h := newCollectionsAPI(e.a, "/manager", e.people)
+	codes := map[int]int{}
+	for i := 0; i < collectionMacRequestsPerMinute+1; i++ {
+		req := httptest.NewRequest(http.MethodGet, "/manager/api/collections", nil)
+		b := e.macs["Bob"]
+		req.Header.Set("X-JuiceMount-Mac-Instance", b[0])
+		req.Header.Set("X-JuiceMount-Mac-Token", b[1])
+		req.Header.Set("X-JuiceMount-Mac-Device", b[2])
+		rec := httptest.NewRecorder()
+		h.serve(rec, req)
+		codes[rec.Code]++
+	}
+	if codes[200] != collectionMacRequestsPerMinute || codes[429] != 1 {
+		t.Fatalf("budget: %v", codes)
+	}
+}
+
+// The write carries the sequence read for its check: a membership change in
+// between makes it 409, and a fresh attempt is checked against the new
+// members.
+func TestCollectionsCheckAndWriteAreTied(t *testing.T) {
+	e := newCollectionsEnv(t)
+	ctx := context.Background()
+	library, _ := e.svc.store.LibraryID()
+	id := e.write("Ann", "/api/collections", map[string]any{"name": "Ann's", "members": pathRefs("Clients/A/one.mov")}, 200).Collection.ID
+	three := binder.AssetID(e.vol.VolumeUUID(), 44)
+	collectionBeforeApply = func() {
+		collectionBeforeApply = nil
+		if _, err := e.svc.store.Apply(ctx, catalog.Operation{Version: 1, LibraryID: library, ID: "sneak", Actor: "admin",
+			Changes: []catalog.Change{{AddCollectionMember: &catalog.AddCollectionMember{CollectionID: id, AssetID: three}}}}); err != nil {
+			t.Error(err)
+		}
+	}
+	defer func() { collectionBeforeApply = nil }()
+	rec := e.do("Ann", http.MethodPost, "/api/collections/"+string(id)+"/delete", map[string]any{})
+	if rec.Code != 409 || !strings.Contains(rec.Body.String(), "changed while") {
+		t.Fatalf("delete raced by an add: %d %s", rec.Code, rec.Body)
+	}
+	e.write("Ann", "/api/collections/"+string(id)+"/delete", map[string]any{}, 403) // now holds a B file
+	if c := e.members(id, ""); c.Collection.Removed || c.Collection.Members != 2 {
+		t.Fatalf("collection: %+v", c.Collection)
+	}
+}
+
+func TestCollectionsRetryIsNotReauthorized(t *testing.T) {
+	e := newCollectionsEnv(t)
+	id := string(e.write("Ann", "/api/collections", map[string]any{"name": "S", "members": pathRefs("Clients/A/one.mov")}, 200).Collection.ID)
+	add := map[string]any{"members": pathRefs("Clients/A/two.mov"), "operation_id": "add-1"}
+	first := e.write("Ann", "/api/collections/"+id+"/members/add", add, 200)
+	// The collection moves on (the retry's precondition is the original's)
+	// and Ann loses her grant: the committed change still answers.
+	e.write("admin", "/api/collections/"+id+"/members/add", map[string]any{"members": pathRefs("Clients/B/three.mov")}, 200)
+	if err := e.people.RemoveGrant(e.ids["Ann"], "/Clients/A"); err != nil {
+		t.Fatal(err)
+	}
+	again := e.write("Ann", "/api/collections/"+id+"/members/add", add, 200)
+	if again.Operation != first.Operation {
+		t.Fatalf("retry: %+v vs %+v", again.Operation, first.Operation)
+	}
+	e.write("Ann", "/api/collections/"+id+"/members/add", map[string]any{"members": pathRefs("Clients/A/two.mov"), "operation_id": "add-2"}, 403)
+}
+
+func TestCollectionsDeleteFormsAndOpenAdmin(t *testing.T) {
+	e := newCollectionsEnv(t)
+	a := string(e.write("admin", "/api/collections", map[string]any{"name": "a"}, 200).Collection.ID)
+	b := string(e.write("admin", "/api/collections", map[string]any{"name": "b"}, 200).Collection.ID)
+	if rec := e.do("admin", http.MethodDelete, "/api/collections/"+a, nil); rec.Code != 200 {
+		t.Fatalf("DELETE: %d %s", rec.Code, rec.Body)
+	}
+	if rec := e.do("admin", http.MethodPost, "/api/collections/"+b+"/delete", nil); rec.Code != 200 {
+		t.Fatalf("POST delete with no body: %d %s", rec.Code, rec.Body)
+	}
+	if rec := e.do("admin", http.MethodGet, "/api/collections/"+b+"/members?limit=101", nil); rec.Code != 404 {
+		t.Fatalf("members of a deleted collection: %d", rec.Code)
+	}
+	c := string(e.write("admin", "/api/collections", map[string]any{"name": "c"}, 200).Collection.ID)
+	if rec := e.do("admin", http.MethodGet, "/api/collections/"+c+"/members?limit=101", nil); rec.Code != 400 {
+		t.Fatalf("member page over 100: %d", rec.Code)
+	}
+	// No admin key while grants are in force: the open admin path reads but
+	// does not write.
+	e.a.adminKey = ""
+	if rec := e.do("", http.MethodGet, "/api/collections", nil); rec.Code != 200 {
+		t.Fatalf("open read: %d", rec.Code)
+	}
+	if rec := e.do("", http.MethodPost, "/api/collections", map[string]any{"name": "x"}); rec.Code != 403 || !strings.Contains(rec.Body.String(), "admin key") {
+		t.Fatalf("open write with grants in force: %d %s", rec.Code, rec.Body)
+	}
+	if rec := e.do("", http.MethodDelete, "/api/collections/"+c, nil); rec.Code != 403 {
+		t.Fatalf("open delete: %d", rec.Code)
+	}
+	// Persons still write with their Macs.
+	e.write("Al", "/api/collections/"+c+"/rename", map[string]any{"name": "Al"}, 200)
+}
+
+func TestCollectionsBusyAndRefusalLog(t *testing.T) {
+	e := newCollectionsEnv(t)
+	saved := collectionBusyWait
+	collectionBusyWait = 50 * time.Millisecond
+	defer func() { collectionBusyWait = saved }()
+	for i := 0; i < collectionVolumeSlots; i++ {
+		e.h.slots <- struct{}{}
+	}
+	if rec := e.do("admin", http.MethodPost, "/api/collections", map[string]any{"name": "x"}); rec.Code != 503 || !strings.Contains(rec.Body.String(), "busy") {
+		t.Fatalf("all slots taken: %d %s", rec.Code, rec.Body)
+	}
+	if rec := e.do("admin", http.MethodGet, "/api/collections", nil); rec.Code != 200 {
+		t.Fatalf("a list needs no slot: %d", rec.Code)
+	}
+	for i := 0; i < collectionVolumeSlots; i++ {
+		<-e.h.slots
+	}
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	defer log.SetOutput(os.Stderr)
+	for i := 0; i < 3; i++ {
+		e.write("Nia", "/api/collections", map[string]any{"name": "x"}, 403)
+	}
+	if n := strings.Count(buf.String(), "collections: refused"); n != 1 {
+		t.Fatalf("refusal lines: %d\n%s", n, buf.String())
+	}
+}
+
+func TestContinuityRefusesNewerCatalogAsNewer(t *testing.T) {
+	cfg := continuityTestConfig(t)
+	stateDir := filepath.Dir(cfg.StateFile)
+	store, err := openContinuityCatalog(stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(stateDir, continuityDirName, continuityCatalogName)
+	db, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, execErr := db.Exec(`PRAGMA user_version=4`)
+	if err := errors.Join(execErr, db.Close()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := openContinuityCatalog(stateDir); err == nil || !strings.Contains(err.Error(), "newer JuiceMount") {
+		t.Fatalf("newer catalog: %v", err)
 	}
 }

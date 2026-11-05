@@ -251,6 +251,8 @@ func openContinuityCatalog(stateDir string, mounts ...string) (*catalog.Store, e
 		return store, nil
 	case errors.Is(err, catalog.ErrUpgradeRequired):
 		return nil, fmt.Errorf("the catalog %s needs an explicit schema upgrade: %w", path, err)
+	case errors.Is(err, catalog.ErrNewerFormat):
+		return nil, fmt.Errorf("the catalog %s was written by a newer JuiceMount (left untouched; update this Manager): %w", path, err)
 	case errors.Is(err, catalog.ErrFormat):
 		return nil, fmt.Errorf("the catalog %s is incomplete or corrupt (left untouched): %w", path, err)
 	default:

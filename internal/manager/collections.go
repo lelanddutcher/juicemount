@@ -7,21 +7,34 @@ package manager
 // actor that made it: "admin", or the Teams person's ID.
 //
 // Who. The admin key, or a Teams person through one of their Macs: the Mac
-// sends its instance ID and the enrollment poll token it already holds for
-// the Manager (principals.go; X-JuiceMount-Mac-Instance and
-// X-JuiceMount-Mac-Token). The Mac must be approved and assigned to a
-// person, and must not be flagged as possibly cloned.
+// sends its instance ID, the enrollment poll token it already holds for the
+// Manager and its device digest, as on the enrollment poll (principals.go;
+// X-JuiceMount-Mac-Instance, -Token, -Device). The Mac must be approved and
+// assigned to a person, and not flagged as possibly cloned (a digest that
+// differs from the enrollment's flags it, here as on the poll). Mac
+// requests share a per-IP budget like the poll's. With no admin key
+// configured (LAN/dev mode) the admin path is open, so it may not write
+// while grants are in force.
 //
 // What. Reads are shared (Teams v1: any authenticated caller). A person may
-// write only where their project write grants (people.go) cover the current
-// path of every member the change touches, resolved live from the volume:
-// the members added or removed, and for a rename or delete every member of
-// the collection. A member whose file is gone needs no grant (it is in no
-// project now); one whose path cannot be read refuses the change (503),
-// since unknown is not gone. A person with no write access at all writes
-// nothing. A refusal is 403 and is logged; the Manager writes no Teams audit
-// records (the proxy's audit log has a single writer), so the catalog's
-// event history is the record of what was changed and by whom.
+// write only where their project write grants (people.go) cover the files
+// the change touches, checked live on the volume: the members added or
+// removed, and for a rename or delete every member of the collection. A
+// file passes when any of its names outside the trash is covered, hidden
+// names included, which matches writing the file through that name (so a
+// file moved into /Clients/B/.old is B's, not gone). A file whose inode is
+// gone, or that is only in the trash, needs no grant; one whose names cannot
+// be read (or with over binder.MaxLinks links and an uncovered hint)
+// refuses the change with 503, since unknown is not gone. A person with no
+// write access at all writes nothing. The check and the write are tied
+// together: the write carries the collection's sequence as read for the
+// check, so a membership change in between makes it 409. A refusal is 403
+// and is logged (at most once a minute per person); the Manager writes no
+// Teams audit records (the proxy's audit log has a single writer), so the
+// catalog's event history is the record of what was changed and by whom.
+//
+// Cost. Requests that read the volume share two slots and a 30 s deadline;
+// a member page holds at most 100 members.
 //
 // Members are asset IDs, added by ID or by a volume path the binder resolves
 // (never through a path hint). A member's path is resolved when it is read;
@@ -29,10 +42,12 @@ package manager
 //
 // Retries. A write may carry operation_id (1-64 letters, digits, - or _).
 // The catalog operation ID is derived from it and the actor, so the same
-// caller repeating the same request gets the original result, and a
+// caller repeating the same request gets the original result (without a
+// second authorization: the change was authorized when it committed), and a
 // different request under the same operation_id is 409.
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -46,6 +61,8 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/lelanddutcher/juicemount/internal/continuity"
 	"github.com/lelanddutcher/juicemount/internal/continuity/binder"
@@ -54,36 +71,55 @@ import (
 
 const (
 	collectionAdminActor = "admin"
-	// One change per member, plus one for the collection itself.
+	// One change per member, plus the precondition or the create.
 	maxCollectionRequestMembers = catalog.MaxChanges - 1
 	maxCollectionBody           = 256 << 10
-	maxMemberPage               = 500
+	maxMemberPage               = 100
+	collectionVolumeSlots       = 2
+	// collectionMacRequestsPerMinute: the poll route's per-IP budget.
+	collectionMacRequestsPerMinute = 30
+	collectionRefusalLogEvery      = time.Minute
 )
 
 var (
 	collectionKeyRe = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
 
 	errMacUnknown      = errors.New("unknown Mac or wrong token")
+	errMacDevice       = errors.New("send the Mac's device digest (X-JuiceMount-Mac-Device), as on the enrollment poll")
 	errMacNotApproved  = errors.New("this Mac is not approved")
 	errMacNoPerson     = errors.New("this Mac belongs to no person; an admin assigns it on the People page")
 	errMacDeviceClash  = errors.New("this Mac's identity may be held by two Macs; an admin must revoke and re-enroll it")
 	errCollectionInput = errors.New("invalid collection request")
+
+	// collectionBeforeApply runs between a write's authorization and the
+	// write (tests).
+	collectionBeforeApply func()
+	// Variables for tests.
+	collectionRequestTimeout = 30 * time.Second
+	collectionBusyWait       = 5 * time.Second
 )
 
 // macPerson authenticates a Mac by the enrollment poll token it holds and
-// returns a copy of its person.
-func (s *PrincipalStore) macPerson(instanceID, pollToken string) (Person, error) {
+// returns a copy of its person. The device digest is noted as on the poll,
+// so a second Mac using the same identity flags it.
+func (s *PrincipalStore) macPerson(instanceID, pollToken, device string) (Person, error) {
 	instanceID = strings.TrimSpace(instanceID)
 	if !instanceIDRe.MatchString(instanceID) || !pollTokenRe.MatchString(pollToken) {
 		return Person{}, errMacUnknown
 	}
+	if !deviceDigestRe.MatchString(device) {
+		return Person{}, errMacDevice
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	rec := s.recs[macPrincipalName(instanceID)]
+	name := macPrincipalName(instanceID)
+	rec := s.recs[name]
 	if rec == nil || rec.PollTokenSHA256 == "" || !strings.EqualFold(rec.InstanceID, instanceID) ||
 		subtle.ConstantTimeCompare([]byte(sha256Hex(pollToken)), []byte(rec.PollTokenSHA256)) != 1 {
 		return Person{}, errMacUnknown
 	}
+	s.noteDeviceLocked(rec, device)
+	rec = s.recs[name]
 	switch {
 	case rec.Status != PrincipalApproved:
 		return Person{}, errMacNotApproved
@@ -97,9 +133,18 @@ func (s *PrincipalStore) macPerson(instanceID, pollToken string) (Person, error)
 	return p, nil
 }
 
+// grantsInForce mirrors PeopleSnapshot's GrantsInForce, cheaply.
+func (s *PrincipalStore) grantsInForce() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.grantsInForceLocked()
+}
+
 // collectionActor is who is calling: the admin, or a person.
 type collectionActor struct {
 	person *Person // nil: admin
+	// open: the admin path without a key (none is configured).
+	open bool
 }
 
 func (c collectionActor) id() string {
@@ -116,7 +161,8 @@ func (c collectionActor) writesAnywhere() bool {
 }
 
 // covers: the actor may write at volumePath (volume-relative, as the
-// binder resolves it). A grant covers its folder and everything below it.
+// binder resolves it). A grant covers its folder and everything below it
+// (/Clients/A covers /Clients/A/x, not /Clients/AB/x).
 func (c collectionActor) covers(volumePath string) bool {
 	if c.person == nil || c.person.Access == personAccessAll {
 		return true
@@ -130,19 +176,54 @@ func (c collectionActor) covers(volumePath string) bool {
 	return false
 }
 
+// refusalLog logs a person's refusals at most once per interval, counting
+// the ones it held back.
+type refusalLog struct {
+	mu    sync.Mutex
+	every time.Duration
+	last  map[string]time.Time
+	held  map[string]int
+}
+
+func (l *refusalLog) note(person, line string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	now := time.Now()
+	if t, ok := l.last[person]; ok && now.Sub(t) < l.every {
+		l.held[person]++
+		return
+	}
+	if n := l.held[person]; n > 0 {
+		line += fmt.Sprintf(" (and %d more refusals of this person since the last line)", n)
+	}
+	l.last[person], l.held[person] = now, 0
+	log.Print(line)
+}
+
 type collectionsAPI struct {
-	api    *API
-	people *PrincipalStore // nil: only the admin key
-	prefix string
+	api      *API
+	people   *PrincipalStore // nil: only the admin key
+	prefix   string
+	slots    chan struct{}
+	macLimit *ipLimiter
+	refusals *refusalLog
 }
 
 // registerCollections wires /api/collections. The handlers do their own
 // authentication (admin key or a person's Mac) and read a.continuity on
 // every request, so they can be registered before the binder starts.
 func (a *API) registerCollections(mux *http.ServeMux, prefix string, people *PrincipalStore) {
-	h := &collectionsAPI{api: a, people: people, prefix: prefix}
+	h := newCollectionsAPI(a, prefix, people)
 	mux.HandleFunc(prefix+"/api/collections", h.serve)
 	mux.HandleFunc(prefix+"/api/collections/", h.serve)
+}
+
+func newCollectionsAPI(a *API, prefix string, people *PrincipalStore) *collectionsAPI {
+	return &collectionsAPI{api: a, people: people, prefix: prefix,
+		slots:    make(chan struct{}, collectionVolumeSlots),
+		macLimit: newIPLimiter(collectionMacRequestsPerMinute, time.Now),
+		refusals: &refusalLog{every: collectionRefusalLogEvery, last: map[string]time.Time{}, held: map[string]int{}},
+	}
 }
 
 // httpError is an error with its status and message for the caller.
@@ -161,8 +242,10 @@ func (h *collectionsAPI) authenticate(r *http.Request) (collectionActor, error) 
 	key := r.Header.Get("X-JuiceMount-Admin-Key")
 	instance, token := r.Header.Get("X-JuiceMount-Mac-Instance"), r.Header.Get("X-JuiceMount-Mac-Token")
 	switch {
+	case h.api.adminKey == "" && instance == "" && token == "":
+		return collectionActor{open: true}, nil // no admin key configured: LAN/dev mode, as a.auth
 	case key != "":
-		if h.api.adminKey != "" && subtle.ConstantTimeCompare([]byte(key), []byte(h.api.adminKey)) != 1 {
+		if subtle.ConstantTimeCompare([]byte(key), []byte(h.api.adminKey)) != 1 {
 			return collectionActor{}, failf(http.StatusUnauthorized, "missing or invalid X-JuiceMount-Admin-Key")
 		}
 		return collectionActor{}, nil
@@ -170,19 +253,38 @@ func (h *collectionsAPI) authenticate(r *http.Request) (collectionActor, error) 
 		if h.people == nil {
 			return collectionActor{}, failf(http.StatusUnauthorized, "Mac enrollment is not configured on this Manager")
 		}
-		p, err := h.people.macPerson(instance, token)
+		if !h.macLimit.allow(clientIP(r)) {
+			return collectionActor{}, failf(http.StatusTooManyRequests, "too many requests from this address; wait a minute")
+		}
+		p, err := h.people.macPerson(instance, token, r.Header.Get("X-JuiceMount-Mac-Device"))
 		switch {
-		case errors.Is(err, errMacUnknown):
+		case errors.Is(err, errMacUnknown), errors.Is(err, errMacDevice):
 			return collectionActor{}, failf(http.StatusUnauthorized, "%v", err)
 		case err != nil:
 			return collectionActor{}, failf(http.StatusForbidden, "%v", err)
 		}
 		return collectionActor{person: &p}, nil
-	case h.api.adminKey == "":
-		return collectionActor{}, nil // no admin key configured: LAN/dev mode, as a.auth
 	default:
 		return collectionActor{}, failf(http.StatusUnauthorized, "missing or invalid X-JuiceMount-Admin-Key")
 	}
+}
+
+// readsVolume: the request resolves files on the volume (every write, and
+// member pages), so it takes a slot.
+func readsVolume(r *http.Request) bool {
+	return r.Method != http.MethodGet || strings.HasSuffix(strings.TrimSuffix(r.URL.Path, "/"), "/members")
+}
+
+func (h *collectionsAPI) acquire(ctx context.Context) (release func(), err error) {
+	wait := time.NewTimer(collectionBusyWait)
+	defer wait.Stop()
+	select {
+	case h.slots <- struct{}{}:
+		return func() { <-h.slots }, nil
+	case <-wait.C:
+	case <-ctx.Done():
+	}
+	return nil, failf(http.StatusServiceUnavailable, "the Manager is busy checking other collection requests; try again")
 }
 
 func (h *collectionsAPI) serve(w http.ResponseWriter, r *http.Request) {
@@ -191,7 +293,16 @@ func (h *collectionsAPI) serve(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "continuity is off (JM_CONTINUITY)"})
 		return
 	}
+	ctx, cancel := context.WithTimeout(r.Context(), collectionRequestTimeout)
+	defer cancel()
+	r = r.WithContext(ctx)
 	actor, err := h.authenticate(r)
+	if err == nil && readsVolume(r) {
+		var release func()
+		if release, err = h.acquire(ctx); err == nil {
+			defer release()
+		}
+	}
 	if err == nil {
 		err = h.route(w, r, svc, actor)
 	}
@@ -200,15 +311,15 @@ func (h *collectionsAPI) serve(w http.ResponseWriter, r *http.Request) {
 	}
 	var he *httpError
 	if !errors.As(err, &he) {
-		he = catalogFailure(err)
+		he = collectionFailure(err)
 	}
 	if he.code == http.StatusForbidden && actor.person != nil {
-		log.Printf("manager: collections: refused %s %s for %s (%s): %s", r.Method, r.URL.Path, actor.person.ID, actor.person.Name, he.msg)
+		h.refusals.note(actor.person.ID, fmt.Sprintf("manager: collections: refused %s %s for %s (%s): %s", r.Method, r.URL.Path, actor.person.ID, actor.person.Name, he.msg))
 	}
 	writeJSON(w, he.code, map[string]string{"error": he.msg})
 }
 
-func catalogFailure(err error) *httpError {
+func collectionFailure(err error) *httpError {
 	switch {
 	case errors.Is(err, errCollectionInput), errors.Is(err, catalog.ErrInvalid):
 		return &httpError{http.StatusBadRequest, err.Error()}
@@ -219,9 +330,11 @@ func catalogFailure(err error) *httpError {
 	case errors.Is(err, catalog.ErrCollectionFull):
 		return &httpError{http.StatusConflict, fmt.Sprintf("a collection holds at most %d members", catalog.MaxCollectionMembers)}
 	case errors.Is(err, catalog.ErrConflict):
-		return &httpError{http.StatusConflict, "the collection changed meanwhile; try again"}
+		return &httpError{http.StatusConflict, "the collection changed while this change was being checked; read it again and retry"}
 	case errors.Is(err, binder.ErrNotReady):
 		return &httpError{http.StatusServiceUnavailable, err.Error()}
+	case errors.Is(err, context.DeadlineExceeded):
+		return &httpError{http.StatusServiceUnavailable, "checking the files took too long; try again, or with fewer members"}
 	default:
 		log.Printf("manager: collections: %v", err)
 		return &httpError{http.StatusInternalServerError, "the catalog request failed"}
@@ -230,20 +343,24 @@ func catalogFailure(err error) *httpError {
 
 // route dispatches
 //
-//	GET  /api/collections                      list (after, limit)
-//	POST /api/collections                      create {name, members?, operation_id?}
-//	GET  /api/collections/{id}                 one collection
-//	POST /api/collections/{id}/rename          {name, operation_id?}
-//	POST /api/collections/{id}/delete          {operation_id?}
-//	GET  /api/collections/{id}/members         members with current paths (after, limit)
-//	POST /api/collections/{id}/members/add     {members, operation_id?}
-//	POST /api/collections/{id}/members/remove  {members, operation_id?}
+//	GET    /api/collections                      list (after, limit)
+//	POST   /api/collections                      create {name, members?, operation_id?}
+//	GET    /api/collections/{id}                 one collection
+//	DELETE /api/collections/{id}                 delete (body optional: {operation_id})
+//	POST   /api/collections/{id}/rename          {name, operation_id?}
+//	POST   /api/collections/{id}/delete          {operation_id?} or no body
+//	GET    /api/collections/{id}/members         members with current paths (after, limit)
+//	POST   /api/collections/{id}/members/add     {members, operation_id?}
+//	POST   /api/collections/{id}/members/remove  {members, operation_id?}
 func (h *collectionsAPI) route(w http.ResponseWriter, r *http.Request, svc *continuityService, actor collectionActor) error {
 	rest := strings.TrimPrefix(r.URL.Path, h.prefix+"/api/collections")
 	rest = strings.Trim(rest, "/")
 	parts := []string{}
 	if rest != "" {
 		parts = strings.Split(rest, "/")
+	}
+	if r.Method != http.MethodGet && actor.open && h.people != nil && h.people.grantsInForce() {
+		return failf(http.StatusForbidden, "no admin key is configured while people's grants are in force; set an admin key to change collections as the admin")
 	}
 	library, err := svc.store.LibraryID()
 	if err != nil {
@@ -271,10 +388,13 @@ func (h *collectionsAPI) route(w http.ResponseWriter, r *http.Request, svc *cont
 	}
 	switch strings.Join(parts[1:], "/") {
 	case "":
-		if err := want(http.MethodGet); err != nil {
-			return err
+		switch r.Method {
+		case http.MethodGet:
+			return c.get(id)
+		case http.MethodDelete:
+			return c.remove(id)
 		}
-		return c.get(id)
+		return failf(http.StatusMethodNotAllowed, "GET or DELETE only")
 	case "rename":
 		if err := want(http.MethodPost); err != nil {
 			return err
@@ -307,6 +427,8 @@ type collectionCall struct {
 	r       *http.Request
 }
 
+func (c *collectionCall) ctx() context.Context { return c.r.Context() }
+
 // CollectionView is one collection as the API returns it.
 type CollectionView struct {
 	ID              catalog.CollectionID `json:"id"`
@@ -318,8 +440,9 @@ type CollectionView struct {
 }
 
 // MemberView is one member, its file's current path resolved from the
-// volume: state "present" (path set), "missing" (the file is gone; the
-// member stays) or "unknown" (the volume could not be read).
+// volume: state "present" (path set), "missing" (no visible name: the file
+// is gone, in the trash or under hidden names only; the member stays) or
+// "unknown" (the volume could not be read).
 type MemberView struct {
 	AssetID       continuity.AssetID `json:"asset_id"`
 	Label         string             `json:"label"`
@@ -362,7 +485,7 @@ func (c *collectionCall) list() error {
 	if err != nil {
 		return err
 	}
-	page, err := c.svc.store.ListCollections(c.r.Context(), c.library, catalog.CollectionID(after), limit)
+	page, err := c.svc.store.ListCollections(c.ctx(), c.library, catalog.CollectionID(after), limit)
 	if err != nil {
 		return err
 	}
@@ -382,7 +505,7 @@ func (c *collectionCall) list() error {
 
 // active reads a collection that has not been removed.
 func (c *collectionCall) active(id catalog.CollectionID) (catalog.Collection, error) {
-	col, err := c.svc.store.GetCollection(c.r.Context(), c.library, id)
+	col, err := c.svc.store.GetCollection(c.ctx(), c.library, id)
 	if err == nil && col.Removed {
 		err = catalog.ErrNotFound
 	}
@@ -406,11 +529,11 @@ func (c *collectionCall) members(id catalog.CollectionID) error {
 	if err != nil {
 		return err
 	}
-	after, limit, err := pageArgs(c.r, 100, maxMemberPage)
+	after, limit, err := pageArgs(c.r, 50, maxMemberPage)
 	if err != nil {
 		return err
 	}
-	page, err := c.svc.store.ListCollectionMembers(c.r.Context(), c.library, id, continuity.AssetID(after), limit)
+	page, err := c.svc.store.ListCollectionMembers(c.ctx(), c.library, id, continuity.AssetID(after), limit)
 	if err != nil {
 		return err
 	}
@@ -420,7 +543,10 @@ func (c *collectionCall) members(id catalog.CollectionID) error {
 		Next       string         `json:"next,omitempty"`
 	}{Collection: collectionView(col), Members: []MemberView{}}
 	for _, m := range page {
-		v, err := c.svc.binder.AssetByID(c.r.Context(), m.AssetID)
+		if err := c.ctx().Err(); err != nil {
+			return err
+		}
+		v, err := c.svc.binder.AssetByID(c.ctx(), m.AssetID)
 		if err != nil {
 			return err
 		}
@@ -446,11 +572,12 @@ type collectionBody struct {
 	OperationID string      `json:"operation_id"`
 }
 
+// body decodes the request body; an empty body is an empty request.
 func (c *collectionCall) body() (collectionBody, error) {
 	var b collectionBody
 	dec := json.NewDecoder(io.LimitReader(c.r.Body, maxCollectionBody))
 	dec.DisallowUnknownFields()
-	if err := dec.Decode(&b); err != nil {
+	if err := dec.Decode(&b); err != nil && err != io.EOF {
 		return b, fmt.Errorf("%w: invalid JSON", errCollectionInput)
 	}
 	if b.OperationID != "" && !collectionKeyRe.MatchString(b.OperationID) {
@@ -487,59 +614,66 @@ func (c *collectionCall) operationID(key string) (string, error) {
 	return "col-" + hex.EncodeToString(sum[:20]), nil
 }
 
-// resolve turns member references into asset views, in request order,
-// without duplicates.
-func (c *collectionCall) resolve(refs []memberRef) ([]binder.AssetView, error) {
-	out := make([]binder.AssetView, 0, len(refs))
+// resolve turns member references into asset IDs, in request order,
+// without duplicates. A path is looked up on the volume, never through a
+// path hint.
+func (c *collectionCall) resolve(refs []memberRef) ([]continuity.AssetID, error) {
+	out := make([]continuity.AssetID, 0, len(refs))
 	seen := map[continuity.AssetID]bool{}
 	for _, ref := range refs {
-		var v binder.AssetView
+		var id continuity.AssetID
 		var err error
 		switch {
 		case (ref.AssetID == "") == (ref.Path == ""):
 			return nil, fmt.Errorf("%w: a member names exactly one of asset_id or path", errCollectionInput)
 		case ref.Path != "":
-			v, err = c.svc.binder.AssetByPath(c.r.Context(), ref.Path)
+			id, err = c.svc.binder.AssetAt(c.ctx(), ref.Path)
 			if errors.Is(err, catalog.ErrNotFound) {
 				return nil, failf(http.StatusNotFound, "no catalogued file at %q", ref.Path)
 			}
 		default:
-			v, err = c.svc.binder.AssetByID(c.r.Context(), ref.AssetID)
+			id = ref.AssetID
+			_, err = c.svc.store.GetAsset(c.ctx(), c.library, id)
 			if errors.Is(err, catalog.ErrNotFound) {
 				return nil, failf(http.StatusNotFound, "asset %s is not in the catalog", ref.AssetID)
 			}
 		}
-		if errors.Is(err, catalog.ErrInvalid) {
+		switch {
+		case errors.Is(err, catalog.ErrInvalid):
 			return nil, fmt.Errorf("%w: bad asset_id or path", errCollectionInput)
-		}
-		if err != nil {
+		case errors.Is(err, binder.ErrUnresolved):
+			return nil, failf(http.StatusServiceUnavailable, "cannot read %q on the volume; try again", ref.Path)
+		case err != nil:
 			return nil, err
 		}
-		if !seen[v.AssetID] {
-			seen[v.AssetID] = true
-			out = append(out, v)
+		if !seen[id] {
+			seen[id] = true
+			out = append(out, id)
 		}
 	}
 	return out, nil
 }
 
-// authorize checks a person's grants against the current path of every
-// member view. The admin is always allowed.
-func (c *collectionCall) authorize(members []binder.AssetView) error {
+// authorize checks a person's grants against the files of the given
+// members, one at a time, stopping at the first refusal. The admin is
+// always allowed.
+func (c *collectionCall) authorize(members []continuity.AssetID) error {
 	if c.actor.person == nil {
 		return nil
 	}
 	if !c.actor.writesAnywhere() {
 		return failf(http.StatusForbidden, "%s has no write access, so may not change collections", c.actor.person.Name)
 	}
-	for _, v := range members {
-		switch memberState(v) {
-		case "unknown":
-			return failf(http.StatusServiceUnavailable, "cannot resolve the current path of %s to check grants (%s); try again", v.AssetID, v.ResolveError)
-		case "present":
-			if !c.actor.covers(v.Path) {
-				return failf(http.StatusForbidden, "%s may not write at /%s: no project grant covers it", c.actor.person.Name, v.Path)
-			}
+	for _, id := range members {
+		a, err := c.svc.binder.CheckAccess(c.ctx(), id, c.actor.covers)
+		switch {
+		case errors.Is(err, binder.ErrUnresolved):
+			return failf(http.StatusServiceUnavailable, "cannot check the names of %s against grants (%v); try again", id, err)
+		case err != nil:
+			return err
+		case a.Missing || a.Allowed:
+		default:
+			return failf(http.StatusForbidden, "%s may not write at /%s: no project grant covers it", c.actor.person.Name, a.Name)
 		}
 	}
 	return nil
@@ -550,48 +684,75 @@ func (c *collectionCall) authorizeAll(id catalog.CollectionID) error {
 	if c.actor.person == nil {
 		return nil
 	}
+	if err := c.authorize(nil); err != nil {
+		return err
+	}
 	var after continuity.AssetID
 	for {
-		page, err := c.svc.store.ListCollectionMembers(c.r.Context(), c.library, id, after, catalog.MaxPageSize)
-		if err != nil {
+		page, err := c.svc.store.ListCollectionMembers(c.ctx(), c.library, id, after, 200)
+		if err != nil || len(page) == 0 {
 			return err
 		}
-		if len(page) == 0 {
-			return c.authorize(nil) // a person with no write access, empty collection
+		ids := make([]continuity.AssetID, len(page))
+		for i, m := range page {
+			ids[i] = m.AssetID
 		}
-		views := make([]binder.AssetView, 0, len(page))
-		for _, m := range page {
-			v, err := c.svc.binder.AssetByID(c.r.Context(), m.AssetID)
-			if err != nil {
-				return err
-			}
-			views = append(views, v)
-		}
-		if err := c.authorize(views); err != nil {
+		if err := c.authorize(ids); err != nil {
 			return err
 		}
 		after = page[len(page)-1].AssetID
 	}
 }
 
-// isRetry: this operation ID is already in the catalog's history, so the
-// request may be an exact retry of a change that committed.
-func (c *collectionCall) isRetry(opID string) (bool, error) {
-	_, err := c.svc.store.GetEvent(c.r.Context(), c.library, opID)
-	if errors.Is(err, catalog.ErrNotFound) {
-		return false, nil
+// change records one write. An exact retry (its operation ID is in the
+// history) returns the original result without a second authorization: it
+// was authorized when it committed, and only its own actor can name it.
+// Otherwise a guarded change reads the collection's sequence, authorizes,
+// and writes with that sequence as a precondition (ExpectCollection), so a
+// change to the collection in between makes it 409.
+func (c *collectionCall) change(opID string, id catalog.CollectionID, guarded bool, authorize func() error, changes []catalog.Change) error {
+	expect := func(seq int64) []catalog.Change {
+		return append([]catalog.Change{{ExpectCollection: &catalog.ExpectCollection{CollectionID: id, UpdatedSequence: seq}}}, changes...)
 	}
-	return err == nil, err
+	prior, err := c.svc.store.GetEvent(c.ctx(), c.library, opID)
+	switch {
+	case err == nil:
+		if guarded {
+			for _, ch := range prior.Operation.Changes {
+				if ch.ExpectCollection != nil {
+					changes = expect(ch.ExpectCollection.UpdatedSequence)
+					break
+				}
+			}
+		}
+		return c.apply(opID, id, changes)
+	case !errors.Is(err, catalog.ErrNotFound):
+		return err
+	}
+	if guarded {
+		col, err := c.active(id)
+		if err != nil {
+			return err
+		}
+		changes = expect(col.UpdatedSequence)
+	}
+	if err := authorize(); err != nil {
+		return err
+	}
+	if collectionBeforeApply != nil {
+		collectionBeforeApply()
+	}
+	return c.apply(opID, id, changes)
 }
 
 // apply records the change and answers with the collection as it is now.
 func (c *collectionCall) apply(opID string, id catalog.CollectionID, changes []catalog.Change) error {
-	receipt, err := c.svc.store.Apply(c.r.Context(), catalog.Operation{
+	receipt, err := c.svc.store.Apply(c.ctx(), catalog.Operation{
 		Version: catalog.OperationVersion, LibraryID: c.library, ID: opID, Actor: c.actor.id(), Changes: changes})
 	if err != nil {
 		return err
 	}
-	col, err := c.svc.store.GetCollection(c.r.Context(), c.library, id)
+	col, err := c.svc.store.GetCollection(c.ctx(), c.library, id)
 	if err != nil {
 		return err
 	}
@@ -611,14 +772,8 @@ func (c *collectionCall) create() error {
 	if err != nil {
 		return err
 	}
-	if len(b.Members) > maxCollectionRequestMembers-1 {
-		return fmt.Errorf("%w: at most %d members when creating", errCollectionInput, maxCollectionRequestMembers-1)
-	}
 	members, err := c.resolve(b.Members)
 	if err != nil {
-		return err
-	}
-	if err := c.authorize(members); err != nil {
 		return err
 	}
 	opID, err := c.operationID(b.OperationID)
@@ -629,33 +784,10 @@ func (c *collectionCall) create() error {
 	sum := sha256.Sum256([]byte("juicemount.collections.id\x00" + opID))
 	id := catalog.CollectionID("col_" + hex.EncodeToString(sum[:16]))
 	changes := []catalog.Change{{CreateCollection: &catalog.CreateCollection{CollectionID: id, Name: name}}}
-	for _, v := range members {
-		changes = append(changes, catalog.Change{AddCollectionMember: &catalog.AddCollectionMember{CollectionID: id, AssetID: v.AssetID}})
+	for _, m := range members {
+		changes = append(changes, catalog.Change{AddCollectionMember: &catalog.AddCollectionMember{CollectionID: id, AssetID: m}})
 	}
-	return c.apply(opID, id, changes)
-}
-
-// existing reads the target of a change to an existing collection. A
-// removed one is gone, except for an exact retry of the change that may
-// have removed it.
-func (c *collectionCall) existing(id catalog.CollectionID, opID string) error {
-	col, err := c.svc.store.GetCollection(c.r.Context(), c.library, id)
-	if errors.Is(err, catalog.ErrNotFound) {
-		return failf(http.StatusNotFound, "no such collection")
-	}
-	if err != nil {
-		return err
-	}
-	if col.Removed {
-		retry, err := c.isRetry(opID)
-		if err != nil {
-			return err
-		}
-		if !retry {
-			return failf(http.StatusNotFound, "no such collection")
-		}
-	}
-	return nil
+	return c.change(opID, id, false, func() error { return c.authorize(members) }, changes)
 }
 
 func (c *collectionCall) rename(id catalog.CollectionID) error {
@@ -674,13 +806,8 @@ func (c *collectionCall) rename(id catalog.CollectionID) error {
 	if err != nil {
 		return err
 	}
-	if err := c.existing(id, opID); err != nil {
-		return err
-	}
-	if err := c.authorizeAll(id); err != nil {
-		return err
-	}
-	return c.apply(opID, id, []catalog.Change{{RenameCollection: &catalog.RenameCollection{CollectionID: id, Name: name}}})
+	return c.change(opID, id, true, func() error { return c.authorizeAll(id) },
+		[]catalog.Change{{RenameCollection: &catalog.RenameCollection{CollectionID: id, Name: name}}})
 }
 
 func (c *collectionCall) remove(id catalog.CollectionID) error {
@@ -695,13 +822,8 @@ func (c *collectionCall) remove(id catalog.CollectionID) error {
 	if err != nil {
 		return err
 	}
-	if err := c.existing(id, opID); err != nil {
-		return err
-	}
-	if err := c.authorizeAll(id); err != nil {
-		return err
-	}
-	return c.apply(opID, id, []catalog.Change{{RemoveCollection: &catalog.RemoveCollection{CollectionID: id}}})
+	return c.change(opID, id, true, func() error { return c.authorizeAll(id) },
+		[]catalog.Change{{RemoveCollection: &catalog.RemoveCollection{CollectionID: id}}})
 }
 
 func (c *collectionCall) editMembers(id catalog.CollectionID, add bool) error {
@@ -716,23 +838,17 @@ func (c *collectionCall) editMembers(id catalog.CollectionID, add bool) error {
 	if err != nil {
 		return err
 	}
-	if err := c.existing(id, opID); err != nil {
-		return err
-	}
 	members, err := c.resolve(b.Members)
 	if err != nil {
 		return err
 	}
-	if err := c.authorize(members); err != nil {
-		return err
-	}
 	changes := make([]catalog.Change, 0, len(members))
-	for _, v := range members {
+	for _, m := range members {
 		if add {
-			changes = append(changes, catalog.Change{AddCollectionMember: &catalog.AddCollectionMember{CollectionID: id, AssetID: v.AssetID}})
+			changes = append(changes, catalog.Change{AddCollectionMember: &catalog.AddCollectionMember{CollectionID: id, AssetID: m}})
 		} else {
-			changes = append(changes, catalog.Change{RemoveCollectionMember: &catalog.RemoveCollectionMember{CollectionID: id, AssetID: v.AssetID}})
+			changes = append(changes, catalog.Change{RemoveCollectionMember: &catalog.RemoveCollectionMember{CollectionID: id, AssetID: m}})
 		}
 	}
-	return c.apply(opID, id, changes)
+	return c.change(opID, id, true, func() error { return c.authorize(members) }, changes)
 }
