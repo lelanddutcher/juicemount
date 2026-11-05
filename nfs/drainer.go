@@ -11,6 +11,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -1664,8 +1665,11 @@ func (d *Drainer) quarantine(row *metadata.SpoolRow, reason string) {
 // HIGH-4 fix (slice B reviewer): if ctx fires before all dispatched
 // rows complete, panic rather than silently returning. Silent return
 // would race with workers and create flaky tests under heavy CI load.
-// Tests should pass generous contexts (≥2 s); a hit on the panic path
-// means a real bug or a stalled FUSE call.
+// ctx is a hang detector, not a latency budget: every drain makes several
+// fsynced SQLite and file commits, each of which can take hundreds of
+// milliseconds on a loaded CI host (see spoolFixtureMutationBoundMS), so a
+// pass of a few rows can outlast a budget of seconds with nothing wrong.
+// The panic carries every goroutine's stack, so a real stall shows where.
 //
 // Returns the number of rows processed (claimed + handed to workers).
 func (d *Drainer) DrainOnceForTest(ctx context.Context) int {
@@ -1682,7 +1686,9 @@ func (d *Drainer) DrainOnceForTest(ctx context.Context) int {
 	select {
 	case <-doneCh:
 	case <-ctx.Done():
-		panic("DrainOnceForTest: ctx expired before in-flight drains completed; pass a longer context or check for a stalled FUSE call")
+		stacks := make([]byte, 1<<20)
+		stacks = stacks[:runtime.Stack(stacks, true)]
+		panic("DrainOnceForTest: ctx expired before in-flight drains completed; pass a longer context or check for a stalled FUSE call\n\n" + string(stacks))
 	}
 	// Lever 1: workers enqueue into the coalescer instead of committing inline,
 	// so a single test scan leaves a partial batch. Flush it synchronously here
