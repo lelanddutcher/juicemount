@@ -17,6 +17,11 @@ func keychainLoadInteractive(service, slot, account string) (secret, stamp strin
 	return "", "", ErrNotFound
 }
 
-func keychainSave(service, slot, account, secret, device string) error { return ErrNoKeychain }
+// keychainAvailable: this build has no Keychain.
+const keychainAvailable = false
 
-func keychainDelete(service, slot string) error { return ErrNoKeychain }
+func keychainSave(service, slot, account, secret, device string, allowUI bool) error {
+	return ErrNoKeychain
+}
+
+func keychainDelete(service, slot string, allowUI bool) error { return ErrNoKeychain }

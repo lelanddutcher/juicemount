@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -61,6 +62,22 @@ func ParseTokenRecord(raw string) (TokenRecord, error) {
 func (r TokenRecord) Encode() string {
 	b, _ := json.Marshal(r)
 	return string(b)
+}
+
+// CleartextWarning is a warning for a Manager address over plain http to a
+// host other than this machine ("" otherwise): the token would cross the
+// network unencrypted, as the Mac's enrollment poll token does. It is not
+// refused.
+func CleartextWarning(base string) string {
+	u, err := url.Parse(base)
+	if err != nil || u.Scheme != "http" {
+		return ""
+	}
+	h := u.Hostname()
+	if ip := net.ParseIP(h); h == "localhost" || ip != nil && ip.IsLoopback() {
+		return ""
+	}
+	return fmt.Sprintf("warning: the Manager address %s is plain http, so the agent token crosses the network unencrypted (as this Mac's enrollment does); use an https address where you can", base)
 }
 
 // MacCredentialsFromState reads the app's enrollment record
@@ -153,7 +170,15 @@ func (tc *TokenCommands) Create(ctx context.Context, name string, days int, prin
 		Token      string    `json:"token"`
 		AgentToken tokenView `json:"agent_token"`
 	}
+	if w := CleartextWarning(m.ManagerURL); w != "" {
+		fmt.Fprintln(tc.Err, w)
+	}
 	if err := c.Do(ctx, http.MethodPost, "/api/agent-tokens", nil, body, &reply); err != nil {
+		var ae *APIError
+		if !errors.As(err, &ae) || ae.Status >= 500 {
+			// The Manager may have minted it and lost the answer.
+			return fmt.Errorf("%v. A token may have been created: run juicemount-mcp token list and revoke any you don't recognise", managerFailure("minting the token", err))
+		}
 		return managerFailure("minting the token", err)
 	}
 	if mm := agentTokenRe.FindStringSubmatch(reply.Token); mm == nil || mm[1] != reply.AgentToken.ID {
@@ -277,6 +302,9 @@ func (tc *TokenCommands) Import(ctx context.Context, in io.Reader, managerURL st
 	m := agentTokenRe.FindStringSubmatch(token)
 	if m == nil {
 		return errors.New("the input is not an agent token (jma_<id>_<secret>)")
+	}
+	if w := CleartextWarning(base); w != "" {
+		fmt.Fprintln(tc.Err, w)
 	}
 	err = NewAgentClient(base, token, tc.HTTP).Do(ctx, http.MethodGet, "/api/collections", url.Values{"limit": {"1"}}, nil, nil)
 	var ae *APIError

@@ -47,11 +47,24 @@ does not store it:
 
 ```sh
 juicemount-mcp token create --name "build box" --print | \
-  ssh build-box juicemount-mcp token import --manager http://nas.example:30190
+  ssh build-box juicemount-mcp token import --manager https://nas.example:30190
 ```
 
 `token revoke <id> --local-only` deletes an imported token without asking the
-Manager. The Manager stops a token at once when it expires or is revoked,
+Manager. If the Manager address is plain `http://` to another machine, `token
+create`, `token import` and `serve` warn on stderr: the token then crosses the
+network unencrypted, as the Mac's enrollment does. Use an `https://` address
+where you can.
+
+**Who can mint.** Minting reads this Mac's enrollment from the Keychain.
+macOS asks before `juicemount-mcp` may read it; once you allow it, anything
+that can run commands as you (an agent with a shell tool included) can mint
+tokens too, for as long as the Keychain lets it. Click **Allow**, not
+**Always Allow**, so each mint asks you again. After you update or rebuild
+`juicemount-mcp`, the `token` commands may ask once more before they can use
+the stored token; `serve` never asks (it runs under an agent, with no one to
+answer) and tells the agent to run `token create` again, or to allow access in
+Keychain Access. The Manager stops a token at once when it expires or is revoked,
 when you are removed, or when the Mac that minted it is revoked or reassigned.
 
 ## Add it to Claude Desktop
@@ -92,8 +105,17 @@ claude mcp add --scope user juicemount -- /usr/local/bin/juicemount-mcp serve --
 | `list_saved_queries`, `get_saved_query_results` | Saved queries (read only) and their files |
 
 Every change carries an `operation_id`, so a retried call is applied once.
-Errors come back to the agent as the tool's result: a revoked or expired token
-says to run `juicemount-mcp token create` again.
+Agents should send their own (the `create_collection` description says so);
+when a change's outcome is unknown (a lost answer, a timeout, a cancelled
+call) the error names the `operation_id` to retry with. A tool call ends
+within 55 seconds, inside the 60 seconds clients commonly wait. Errors come
+back to the agent as the tool's result: a revoked or expired token says to run
+`juicemount-mcp token create` again.
+
+The server speaks MCP 2025-06-18 (2024-11-05 too; JSON-RPC batches are
+refused). Tool calls run one at a time: a second one while one runs is told to
+wait. `ping` and cancellation are handled while a call runs, and cancelling a
+call stops it.
 
 ## What it does not do
 

@@ -5,6 +5,8 @@ import (
 	"context"
 	"errors"
 	"log"
+	"net"
+	"net/http"
 	"strings"
 	"testing"
 )
@@ -266,5 +268,49 @@ func TestMacCredentialsFromState(t *testing.T) {
 		if _, err := MacCredentialsFromState(bad, ""); err == nil || strings.Contains(err.Error(), "P\"") {
 			t.Errorf("%s: %v", bad, err)
 		}
+	}
+}
+
+func TestTokenCreateLostAnswer(t *testing.T) {
+	e := newTokenEnv(t)
+	e.f.dropNext("POST /manager/api/agent-tokens")
+	err := e.tc.Create(context.Background(), "x", 0, false)
+	if err == nil || !strings.Contains(err.Error(), "A token may have been created: run juicemount-mcp token list and revoke any you don't recognise") || e.store.rec != nil {
+		t.Fatalf("lost answer: %v", err)
+	}
+	e.f.on("POST /manager/api/agent-tokens", 502, map[string]string{"error": "bad gateway"})
+	if err := e.tc.Create(context.Background(), "x", 0, false); err == nil || !strings.Contains(err.Error(), "token list") {
+		t.Fatalf("502: %v", err)
+	}
+	// A refusal created nothing.
+	e.f.on("POST /manager/api/agent-tokens", 409, map[string]string{"error": "Ann already has 10 agent tokens"})
+	if err := e.tc.Create(context.Background(), "x", 0, false); err == nil || strings.Contains(err.Error(), "may have been created") {
+		t.Fatalf("409: %v", err)
+	}
+	e.noSecrets(t, false)
+}
+
+func TestCleartextWarning(t *testing.T) {
+	for base, warn := range map[string]bool{
+		"http://nas.example:30190": true, "http://192.0.2.7:30190": true, "https://nas.example:30190": false,
+		"http://127.0.0.1:30190": false, "http://localhost:30190": false, "http://[::1]:30190": false,
+	} {
+		if got := CleartextWarning(base) != ""; got != warn {
+			t.Errorf("%s: warning %v", base, got)
+		}
+	}
+	// token create warns on stderr (here: loopback, so not) and goes on.
+	e := newTokenEnv(t)
+	e.f.on("POST /manager/api/agent-tokens", 200, mintAnswer())
+	if err := e.tc.Create(context.Background(), "x", 0, false); err != nil || strings.Contains(e.err.String(), "plain http") {
+		t.Fatalf("loopback: %v %q", err, e.err)
+	}
+	// Import over plain http to another host warns too (no network: the
+	// dial fails at once, and the token is stored with a warning).
+	e.tc.HTTP = &http.Client{Transport: &http.Transport{DialContext: func(context.Context, string, string) (net.Conn, error) {
+		return nil, errors.New("no network in this test")
+	}}}
+	if err := e.tc.Import(context.Background(), strings.NewReader(mintedToken), "http://nas.invalid:1"); err != nil || !strings.Contains(e.err.String(), "plain http") {
+		t.Fatalf("import over http: %v %q", err, e.err)
 	}
 }

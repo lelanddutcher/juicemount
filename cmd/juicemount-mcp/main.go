@@ -109,7 +109,7 @@ func serve(ctx context.Context, args []string, stdin io.Reader, stdout, stderr i
 		// runs takes effect without a restart.
 		rec, err := store.Load()
 		if err != nil {
-			return nil, fmt.Errorf("%v: a person must mint one on this Mac with juicemount-mcp token create --name <name>", err)
+			return nil, err
 		}
 		return agentmcp.NewAgentClient(rec.ManagerURL, rec.Token, hc), nil
 	}}
@@ -117,6 +117,9 @@ func serve(ctx context.Context, args []string, stdin io.Reader, stdout, stderr i
 		logger.Printf("no usable agent token yet (%v); tool calls fail until one is created", err)
 	} else {
 		logger.Printf("serving with agent token %s for %s; mount point %s", rec.ID, rec.ManagerURL, root)
+		if w := agentmcp.CleartextWarning(rec.ManagerURL); w != "" {
+			logger.Print(w)
+		}
 	}
 	srv := &agentmcp.Server{Tools: tools, Log: logger, Version: version.Version}
 	done := make(chan error, 1)
@@ -147,6 +150,9 @@ func token(ctx context.Context, args []string, stdin io.Reader, stdout, stderr i
 		fmt.Fprint(stderr, usage)
 		return flag.ErrHelp
 	}
+	// A person runs these in a terminal: the Keychain may ask them (after a
+	// rebuild or update, before this build may use the stored token).
+	credstore.AllowAgentTokenUI()
 	tc := &agentmcp.TokenCommands{Store: keychainStore{}, Mac: macCredentials, HTTP: agentmcp.NewHTTPClient(), Out: stdout, Err: stderr}
 	fs := flag.NewFlagSet("token "+args[0], flag.ContinueOnError)
 	fs.SetOutput(stderr)

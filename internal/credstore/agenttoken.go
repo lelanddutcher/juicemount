@@ -64,18 +64,27 @@ func SaveAgentToken(record string) error {
 	} else if ok {
 		return saveFile(path, isolatedEntry{Account: agentTokenAccount, Secret: record, Device: device})
 	}
-	return keychainSave(AgentTokenService, string(AgentToken), agentTokenAccount, record, device)
+	return keychainSave(AgentTokenService, string(AgentToken), agentTokenAccount, record, device, agentTokenUI)
 }
 
-// LoadAgentToken returns the stored record (ErrNotFound when none). It
-// never shows UI. A record stamped for another Mac is ErrOtherDevice.
+// LoadAgentToken returns the stored record (ErrNotFound when none; on a Mac
+// build without cgo, ErrNoKeychain). It shows no UI unless
+// AllowAgentTokenUI was called. A record stamped for another Mac is
+// ErrOtherDevice.
 func LoadAgentToken() (string, error) {
 	if path, ok, err := agentTokenFile(); err != nil {
 		return "", err
 	} else if ok {
 		return loadIsolated(path, agentTokenAccount)
 	}
-	secret, stamp, err := keychainRead(AgentTokenService, string(AgentToken), agentTokenAccount)
+	if !keychainAvailable {
+		return "", ErrNoKeychain
+	}
+	read := keychainRead
+	if agentTokenUI {
+		read = keychainReadInteractive
+	}
+	secret, stamp, err := read(AgentTokenService, string(AgentToken), agentTokenAccount)
 	if err != nil {
 		return "", err
 	}
@@ -95,8 +104,19 @@ func DeleteAgentToken() error {
 		}
 		return nil
 	}
-	return keychainDelete(AgentTokenService, string(AgentToken))
+	return keychainDelete(AgentTokenService, string(AgentToken), agentTokenUI)
 }
+
+// agentTokenUI: the agent token's Keychain calls may ask the person.
+var agentTokenUI bool
+
+// AllowAgentTokenUI lets the agent token's Keychain calls show the
+// Keychain's prompts for the rest of the process: for juicemount-mcp's token
+// commands, which a person runs in a terminal (after a rebuild or update,
+// the Keychain asks before another build of the program may use the item).
+// juicemount-mcp serve never calls it: it runs under an agent, with no one
+// to answer.
+func AllowAgentTokenUI() { agentTokenUI = true }
 
 // LoadEnrollment returns the app's enrollment record (enrollclient.State
 // JSON). On a Mac it may show the Keychain prompt: the item trusts the app
