@@ -393,7 +393,7 @@ reads `MINIO_ACCESS_KEY` / `MINIO_SECRET_KEY` from each client's environment
 
 | User | Policy file | May | Holder |
 |---|---|---|---|
-| `jm-client` | `server/minio/jm-client-policy.json` | GetObject (and HEAD), PutObject, ListBucket | Macs (from enrollment), farm, WebDAV, enrolled farm nodes |
+| `jm-client` | `server/minio/jm-client-policy.json` | GetObject (and HEAD), PutObject, ListBucket; explicitly denied: creating service accounts, changing its own secret | Macs (from enrollment), farm, WebDAV, enrolled farm nodes |
 | `jm-gc` | `server/minio/jm-gc-policy.json` | the above plus DeleteObject and multipart cleanup | server `bg` mount, Manager (gc, compact, fsck, sync) |
 
 Neither policy has bucket or admin actions. A client delete with `jm-client`
@@ -533,6 +533,165 @@ before IDs), a new ID is minted:
 
 Losing the principal store makes every Mac request access again.
 
+### Rotating the shared object key (after a revoke)
+
+Revoking a Mac removes its Redis login at once. With `JM_OBJ_PER_MAC`
+unset (the default) it does **not** stop the shared `jm-client` key the Mac
+was given: the Mac can still read and overwrite chunk objects on MinIO
+(port 30151) directly, outside the metadata layer. The Manager cannot change
+that key. It holds no MinIO admin credential, the secret comes from
+`server/.env` (`minio-keys` sets it again at every `up`), and the server's
+WebDAV, the farm and enrolled farm nodes use the same key.
+
+So the revoke answer and the Principals page say whether the Mac's object
+key still works. `POST /api/principals/revoke` returns the principal list
+plus `revoked`: `{name, object_key, message}`, where `object_key` is
+`still_valid` (the shared key, until rotated), `removing` (its own per-Mac
+key, until minio-keyd confirms), `removed` or `none`. The revoke
+confirmation warns before it happens. The page lists every revoked Mac whose
+shared key may still work under "Rotate the shared storage key"
+(`shared_key_still_valid` in the list, with the access key each was given).
+
+What the Manager records, in the principal store:
+
+- Every Mac it approves while it hands out the shared key is marked
+  (`shared_key_issued`) in the same write as the approval, before any answer
+  carries the key. The mark stays after the Mac later gets its own per-Mac
+  key: the Mac still knows the shared one.
+- A revoke of such a Mac records the access key and a salted check value of
+  the secret (never the secret).
+- Macs revoked by an older Manager are listed once, marked "revoked by an
+  earlier Manager" (`legacy`). Some may have been only pending requests.
+  Macs revoked **and forgotten** before this version are not known at all:
+  if you ever revoked an approved Mac, rotate once.
+
+**A Mac leaves the list only on proof from MinIO**, never because the
+Manager's own environment changed. Every minute the Manager makes a signed
+list request to the volume's bucket (`JM_MINIO_URL`/`JM_VOL_NAME`, or
+`JM_OBJ_BUCKET_URL`, a path-style bucket URL such as
+`http://minio:9000/zpool`) with its current client key. MinIO keeps one secret
+per user (`mc admin user add` replaces it), so when that request succeeds
+with a secret other than the one a Mac was given, that Mac's copy is
+refused. The answer must be a listing of that bucket; anything else, a
+refusal, or no answer keeps the Mac listed and the page says why
+(`shared_key_problem`). Putting the old secret back at MinIO lists those
+Macs again.
+
+This proves that the user's own secret changed, **not** that no credential
+made with the old key is left. In the pinned MinIO release
+(RELEASE.2025-01-20T14-49-07Z) any user, and any service account or
+temporary credential of it, may create service accounts for that user, and
+set the user's own secret, unless its policy explicitly denies it; and
+`AssumeRole` hands any user temporary credentials (up to 365 days) with no
+policy check at all. Such credentials do not depend on the user's secret.
+So:
+
+- `jm-client-policy.json` explicitly denies `admin:CreateServiceAccount`
+  and `admin:CreateUser` (per-Mac keys inherit it through `jm-macs`), and
+  `minio-keys` refuses a policy file without that deny and re-applies the
+  policy at every `up`. A deny on `sts:AssumeRole` would do nothing:
+  MinIO does not consult policy for it.
+- The `minio` service sets `MINIO_STS_DURATION: 15m`, so a temporary
+  credential lasts at most 15 minutes whatever the requester asks for. It
+  also limits a MinIO Console login (port 30152) to 15 minutes.
+- The rotation below removes the `jm-client` user before it is created
+  again: MinIO then deletes every service account and temporary credential
+  derived from it, including any made before the deny existed.
+
+**Do not rename `JM_OBJ_CLIENT_ACCESS_KEY` to rotate.** `minio-keys` creates
+the new user but never removes the old one, so the old key keeps working.
+If it was renamed, remove the old user at MinIO
+(`mc admin user rm <alias> <old access key>`); the Manager clears those Macs
+once MinIO answers `InvalidAccessKeyId` for the old access key.
+
+Rotate in a maintenance window. An approved Mac uses the new key only after
+its volume restarts (juicefs reads the key when it starts). A Mac still
+running with the old key has its uploads refused: new files wait in its
+spool, but changes to files that already exist fail. So stop the Macs first.
+
+1. Ask every Mac user to Stop everything in JuiceMount.
+2. Put a new value in `server/.env`:
+   `JM_OBJ_CLIENT_SECRET_KEY=` (`openssl rand -hex 20`). Keep the old value
+   at hand for the check (`read -rs` it, never on a command line).
+3. Stop the server's other clients of the key, so no write of theirs is
+   refused halfway: `$C -f server/docker-compose.yml stop juicefs juicefarm`,
+   and stop the enrolled farm nodes (step 4 starts the containers again).
+   Then remove the `jm-client` user, which also deletes every service
+   account and temporary credential made from it (from here nothing that
+   used the old key works). `mcroot` runs `mc` in the `minio` container as
+   the MinIO root user, with an alias in a private configuration directory
+   that is removed afterwards; `mc` prompts for the root password, so it is
+   never on a command line or in a URL (the pinned `mc` does not URL-decode
+   credentials in `MC_HOST_<alias>`, so a root password with other
+   characters than letters and digits cannot go there):
+
+   ```bash
+   M="$($C -f server/docker-compose.yml ps -q minio)"
+   mcroot() {
+     docker exec -it "$M" bash -c 'd="$(mktemp -d)" && export MC_CONFIG_DIR="$d" &&
+       trap '"'"'rm -rf "$d"'"'"' EXIT &&
+       mc alias set r http://127.0.0.1:9000 juicemount && mc "$@"' mcroot "$@"
+   }
+   mcroot admin user rm r jm-client      # type MINIO_ROOT_PASSWORD at the prompt
+   ```
+4. Apply the new value, MinIO first. Like every command in this guide this
+   reads `server/.env`, which must hold every value the compose file
+   requires (`JM_MANAGER_DIGEST`, `JM_FARM_DIGEST` and the others):
+   `$C -f server/docker-compose.yml up -d minio minio-keys juicefs juicemount-manager juicefarm`.
+   `minio-keys` creates `jm-client` again with the new secret and its
+   policy; `juicefs-init` waits for it, and `juicefs` (WebDAV),
+   `juicemount-manager` and `juicefarm` wait for `juicefs-init` and are
+   recreated with the new value. The first time after this release, `minio`
+   is recreated too (the `MINIO_STS_DURATION` setting), which interrupts
+   object I/O for the restart. Check that `minio-keys` exited 0:
+   `docker logs "$($C -f server/docker-compose.yml ps -aq minio-keys)"`.
+5. Re-create enrolled farm nodes with the new `MINIO_SECRET_KEY` (the
+   Manager's node plan prints the command), and give the new secret to any
+   other client that was set up with the key by hand (a Mac or script with
+   `MINIO_ACCESS_KEY`/`MINIO_SECRET_KEY` set outside enrollment).
+6. Macs Start again. Each gets the new key from the Manager at its next
+   poll; a Mac that starts with the old key reports refused storage access,
+   asks the Manager at once, saves the new key, and one more Stop
+   everything, then Start, uses it.
+
+**Check** (all of them):
+
+```bash
+M="$($C -f server/docker-compose.yml ps -q minio)"
+read -rs NEW && export NEW          # the new client secret
+read -rs OLD && export OLD          # the previous client secret
+# The new key lists the bucket (this also proves the alias and bucket are right):
+docker exec -e NEW "$M" sh -c 'MC_HOST_n="http://jm-client:$NEW@127.0.0.1:9000" mc ls n/zpool >/dev/null && echo NEW-OK'
+# The same command with the old key must fail with a signature error, not any error:
+docker exec -e OLD "$M" sh -c 'MC_HOST_o="http://jm-client:$OLD@127.0.0.1:9000" mc ls o/zpool' 2>&1 |
+  grep -q 'signature we calculated does not match' && echo OLD-REFUSED
+unset NEW OLD
+# No service account of jm-client may exist (lists no access key):
+mcroot admin user svcacct ls r jm-client
+```
+
+The client secrets are letters and digits only (`minio-keys` refuses
+anything else), so `MC_HOST_<alias>` carries them unchanged.
+
+Both `NEW-OK` and `OLD-REFUSED` must print, and the service-account list
+must be empty. If it lists any, remove each
+(`mcroot admin user svcacct rm r <access key>`) and
+find out which client made it: the policy now forbids it. Then: the Principals page's rotation list is empty
+within a minute (or shows why not); `docker ps` shows the `juicefs`
+container `healthy` (its health check covers the WebDAV server) and
+`docker exec <juicefarm> mountpoint /jfs` succeeds; after a Mac copy, a
+WebDAV upload and a farm job, the `juicefs` and `juicefarm` logs and each
+farm node's log show no `SignatureDoesNotMatch`, `InvalidAccessKeyId` or
+`AccessDenied` (`docker logs --since 15m <container> 2>&1 | grep -E
+'SignatureDoesNotMatch|InvalidAccessKeyId|AccessDenied'` prints nothing).
+
+**Rollback:** put the old secret back in `server/.env` and repeat step 4;
+the revoked Macs' copies then work again, and the page lists them again.
+
+Per-Mac keys (below) cut off a revoked Mac that only ever had its own key.
+A Mac that was ever given the shared key still knows it, so revoking it
+still needs this rotation.
+
 ### Per-Mac object keys (not yet enabled)
 
 > **Rollout qualification pending.** Per-Mac key code exists in `minio-keyd`,
@@ -555,7 +714,8 @@ Each takes exactly `1` or `0` (unset means `0`). Any other value (`true`,
 **What this is.** Today every approved Mac gets the same `jm-client` key.
 Revoking a Mac in the Manager removes its Redis principal, but the Mac keeps
 a working object key: it can still read and write chunks on MinIO
-(port 30151) directly. With per-Mac keys, each approved Mac gets its own
+(port 30151) directly, until the shared key is rotated (see "Rotating the
+shared object key" above). With per-Mac keys, each approved Mac gets its own
 MinIO service account, and revoking the Mac deletes it.
 
 | Name | Kind | Policy | Holder |
@@ -624,19 +784,17 @@ environment.
    `object-key-switch.sh rollback --root`.
 
    ```bash
-   # Put the new value in server/.env (openssl rand -hex 20), then:
-   R="$($C -f server/docker-compose.yml ps -q minio)"
-   read -rs OLD && export OLD          # type the previous root password
-   docker exec -e OLD "$R" sh -c \
-     'MC_HOST_old="http://juicemount:$OLD@127.0.0.1:9000" mc admin info old'
+   # Put the new value in server/.env (openssl rand -hex 20), then, with
+   # M and mcroot as defined in "Rotating the shared object key" above:
+   mcroot admin info r                  # type the PREVIOUS root password
    ```
 
-   The password reaches the container by name, never on a command line. If
-   it contains characters other than letters and digits, percent-encode
-   them in `OLD`. That command shows the old password still working. Apply the change with
+   `mc` prompts for the password, so it is never on a command line or in a
+   URL. That command shows the old password still working. Apply the change with
    `$C -f server/docker-compose.yml up -d --no-deps minio`, then
    `$C -f server/docker-compose.yml up --no-deps minio-keys` (must exit 0).
-   **Check:** the same `docker exec` now fails with an access error, and a
+   **Check:** the same command, with the previous password typed, now fails
+   with an access error, and a
    Mac copy and readback still work (Macs do not use the root key after
    step B). **Rollback:** put the old value back in `server/.env` and
    recreate `minio`.
