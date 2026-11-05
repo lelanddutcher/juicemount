@@ -215,6 +215,26 @@ release() {
 }
 trap on_stop TERM INT
 
+# Once the stop trap is set, keyd runs no command substitution ($(...)).
+# Bash 5.2 parses a substitution again when it expands it and runs pending
+# traps from inside that parse, where a trap can be consumed without
+# running: a TERM that arrived then was lost, and keyd kept cycling until
+# it was killed. Helpers set a variable instead of printing.
+#
+# read_file path: RF = the file's text without its trailing newlines, the
+# value "$(<path)" gives, read with the read builtin. Status 2 if the file
+# has a NUL byte (RF holds the bytes before it), else 0.
+read_file() {
+	RF=''
+	if IFS= read -r -d '' RF <"$1"; then
+		return 2
+	fi
+	while [ "${RF: -1}" = $'\n' ]; do
+		RF="${RF%?}"
+	done
+	return 0
+}
+
 # mcq args...: run mc; MC_OUT = its output (stdout and stderr), status = mc's.
 mcq() {
 	local rc
@@ -239,7 +259,11 @@ mcq() {
 	if [ "$STOP" = 1 ] && [ "$rc" -ne 0 ] && [ "$SECONDS" -ge "$STOP_DEADLINE" ]; then
 		GAVE_UP=1
 	fi
-	[ -f "$MC_TMP" ] && MC_OUT="$(<"$MC_TMP")"
+	if [ -f "$MC_TMP" ]; then
+		read_file "$MC_TMP"
+		MC_OUT="$RF"
+		RF=''
+	fi
 	rm -f "$MC_TMP"
 	return "$rc"
 }
@@ -262,13 +286,18 @@ RE_SEQ='"seq"[[:space:]]*:[[:space:]]*([0-9]{1,15})[[:space:]]*([,}]|$)'
 
 nl=$'\n'
 has() { case "$nl$1" in *"$nl$2$nl"*) return 0 ;; esac; return 1; }
-count() {
-	local n=0 x
-	for x in $1; do n=$((n + 1)); done
-	echo "$n"
+# count, mc_msg and now_ms set a variable instead of printing (see
+# read_file: no command substitution once the stop trap is set).
+count() { # N = the number of words in $1
+	local x
+	N=0
+	for x in $1; do N=$((N + 1)); done
 }
-mc_msg() { [[ "$1" =~ $RE_MC_MSG ]] && printf '%s' "${BASH_REMATCH[1]//\\/}" || printf 'no detail'; }
-now_ms() { printf '%s000' "$(date +%s)"; }
+mc_msg() { # MSG = mc's error message in $1
+	MSG='no detail'
+	[[ "$1" =~ $RE_MC_MSG ]] && MSG="${BASH_REMATCH[1]//\\/}"
+}
+now_ms() { printf -v NOW_MS '%(%s)T000' -1; } # NOW_MS = the time in ms
 
 # write_atomic file content: 0 on success, else WA_ERR + 1. A directory at
 # the target name is refused: mv would move the file into it and report
@@ -294,7 +323,8 @@ list_keys() {
 	local rc=$?
 	out="$MC_OUT"
 	if [ "$rc" -ne 0 ] || [[ "$out" =~ $RE_MC_ERROR ]]; then
-		log "svcacct ls $PARENT failed: $(mc_msg "$out")"
+		mc_msg "$out"
+		log "svcacct ls $PARENT failed: $MSG"
 		return 1
 	fi
 	EXISTING=''
@@ -321,7 +351,8 @@ key_info() {
 	rc=$?
 	out="$MC_OUT"
 	if [ "$rc" -ne 0 ] || [[ "$out" =~ $RE_MC_ERROR ]]; then
-		log "svcacct info $1 failed: $(mc_msg "$out")"
+		mc_msg "$out"
+		log "svcacct info $1 failed: $MSG"
 		return 1
 	fi
 	[[ "$out" =~ $RE_PARENT_USER ]] && I_PARENT="${BASH_REMATCH[1]}"
@@ -345,7 +376,8 @@ remove_key() {
 		return 1
 	fi
 	if ! mcq --json admin user svcacct rm "$ALIAS" "$name"; then
-		log "svcacct rm $name failed: $(mc_msg "$MC_OUT")"
+		mc_msg "$MC_OUT"
+		log "svcacct rm $name failed: $MSG"
 		return 1
 	fi
 	log "removed $name"
@@ -376,7 +408,8 @@ create_key_held() {
 		return 1
 	fi
 	if [ "$rc" -ne 0 ] || [[ "$out" =~ $RE_MC_ERROR ]]; then
-		log "svcacct add $name failed: $(mc_msg "$out")"
+		mc_msg "$out"
+		log "svcacct add $name failed: $MSG"
 		return 1
 	fi
 	[[ "$out" =~ $RE_SK ]] && sk="${BASH_REMATCH[1]}"
@@ -388,7 +421,8 @@ create_key_held() {
 		remove_key "$name"
 		return 1
 	fi
-	if ! write_atomic "$DIR/results/$name.json" "{\"name\":\"$name\",\"secret_key\":\"$sk\",\"created_ms\":$(now_ms)}"; then
+	now_ms
+	if ! write_atomic "$DIR/results/$name.json" "{\"name\":\"$name\",\"secret_key\":\"$sk\",\"created_ms\":$NOW_MS}"; then
 		sk=''
 		log "cannot write results/$name.json ($WA_ERR); removing the undeliverable key"
 		CREATE_ERR="results/$name.json: $WA_ERR"
@@ -707,7 +741,8 @@ parse_desired() {
 
 LAST_SEQ=0
 if [ -f "$DIR/applied.json" ]; then
-	prev="$(<"$DIR/applied.json")"
+	read_file "$DIR/applied.json"
+	prev="$RF"
 	[[ "$prev" =~ $RE_SEQ ]] && LAST_SEQ="${BASH_REMATCH[1]}"
 fi
 
@@ -816,11 +851,14 @@ apply() {
 		fi
 	done
 	if [ -n "$unknown" ]; then
-		ERR="preserved $(count "$unknown") unobserved key(s); Manager must report and confirm named orphan removals"
+		count "$unknown"
+		ERR="preserved $N unobserved key(s); Manager must report and confirm named orphan removals"
 		log "$ERR"
 	fi
-	r="$(count "$remove")"
-	e="$(count "$MANAGED")"
+	count "$remove"
+	r="$N"
+	count "$MANAGED"
+	e="$N"
 	if [ "$r" -gt 0 ] && { [ "$r" -gt "$MASS_MAX" ] || { [ "$r" -gt 1 ] && [ $((r * 100)) -gt $((MASS_PCT * e)) ]; }; } &&
 		[ "${D_ALLOW:-x}" != "$D_SEQ" ]; then
 		ERR="REFUSED mass delete of $r of $e keys (set allow_mass_delete to seq $D_SEQ to confirm)"
@@ -886,12 +924,13 @@ write_applied() {
 		fi
 		sep=','
 	done
-	write_atomic "$DIR/applied.json" "{\"seq\":$LAST_SEQ,\"verified_ms\":$(now_ms),\"error\":\"$err\",\"keys\":[$entries]}" ||
+	now_ms
+	write_atomic "$DIR/applied.json" "{\"seq\":$LAST_SEQ,\"verified_ms\":$NOW_MS,\"error\":\"$err\",\"keys\":[$entries]}" ||
 		log "cannot write applied.json ($WA_ERR)"
 }
 
 cycle() {
-	local text
+	local text rc
 	ERR=''
 	SEQ_ERR=''
 	CREATE_ERR=''
@@ -900,8 +939,11 @@ cycle() {
 	list_keys || return 1
 	taken_results
 	if [ -f "$DIR/desired.json" ]; then
-		text="$(<"$DIR/desired.json")"
-		if [ "$text" != "$PD_TEXT" ] && IFS= read -r -d '' _ <"$DIR/desired.json"; then
+		read_file "$DIR/desired.json"
+		rc=$?
+		text="$RF"
+		RF=''
+		if [ "$rc" = 2 ]; then
 			D_ERR='not strict JSON: a NUL byte'
 			false
 		else

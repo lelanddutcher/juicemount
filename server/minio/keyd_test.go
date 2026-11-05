@@ -960,6 +960,7 @@ func (l *keydLoop) cycles(n int) {
 func (l *keydLoop) stop(limit time.Duration) time.Duration {
 	l.r.t.Helper()
 	start := time.Now()
+	lsAtTerm := len(l.r.calls("ls"))
 	if err := l.cmd.Process.Signal(syscall.SIGTERM); err != nil {
 		l.r.t.Fatal(err)
 	}
@@ -977,7 +978,13 @@ func (l *keydLoop) stop(limit time.Duration) time.Duration {
 		case <-l.done: // exec has copied all output
 		case <-time.After(limit):
 		}
-		l.r.t.Fatalf("keyd did not exit within %v of TERM:\n%s\nkeyd process state at the deadline:\n%s", limit, l.out.String(), state)
+		// keyd starts every cycle with svcacct ls. New cycles after the TERM
+		// mean the trap never ran (the signal was lost), not a slow exit.
+		lost := ""
+		if n := len(l.r.calls("ls")) - lsAtTerm; n > 1 {
+			lost = fmt.Sprintf("TERM LOST: keyd started %d more cycles after the TERM, so its trap never ran\n", n)
+		}
+		l.r.t.Fatalf("keyd did not exit within %v of TERM:\n%s%s\nkeyd process state at the deadline:\n%s", limit, lost, l.out.String(), state)
 	}
 	return time.Since(start)
 }
@@ -1168,6 +1175,53 @@ func TestKeydLoopNeverActsOnRefusedFile(t *testing.T) {
 	}
 	if ap := r.applied(); !strings.HasPrefix(ap.Error, "refused desired.json: not strict JSON") || ap.Seq != 3 {
 		t.Fatalf("applied = %+v", ap)
+	}
+	l.stop(10 * time.Second)
+}
+
+// Once its stop trap is set keyd runs no command substitution. Bash 5.2
+// parses a substitution again when it expands it and runs pending traps
+// from inside that parse, where a trap can be consumed without running
+// (seen for $(<file) and $(function)); a TERM lost that way left keyd
+// cycling until it was killed.
+func TestKeydRunsNoCommandSubstitutionUnderStopTrap(t *testing.T) {
+	b, err := os.ReadFile("keyd.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	trapped := false
+	for i, line := range strings.Split(string(b), "\n") {
+		code := strings.TrimSpace(line)
+		if code == "trap on_stop TERM INT" {
+			trapped = true
+			continue
+		}
+		if !trapped || strings.HasPrefix(code, "#") {
+			continue
+		}
+		if c := strings.ReplaceAll(code, "$((", ""); strings.Contains(c, "$(") || strings.Contains(c, "`") {
+			t.Errorf("keyd.sh:%d runs a command substitution under the stop trap: %s", i+1, code)
+		}
+	}
+	if !trapped {
+		t.Fatal("keyd.sh no longer sets the stop trap with: trap on_stop TERM INT")
+	}
+}
+
+// A NUL byte refuses desired.json even when the rest of the file is the
+// text keyd last accepted (the parse cache must never hold a NUL file).
+func TestKeydLoopRefusesNulAfterAcceptedFile(t *testing.T) {
+	r := newKeydRig(t)
+	a := macName(1, 1)
+	accepted := `{"seq":3,"keys":[{"name":"` + a + `","state":"active"}]}`
+	r.desired(accepted)
+	l := r.startLoop()
+	l.waitFor("the valid file to be applied", 15*time.Second, func() bool { return r.exists(a) })
+	l.cycles(1)
+	r.desired(accepted + "\x00")
+	l.cycles(2)
+	if ap := r.applied(); ap.Error != "refused desired.json: not strict JSON: a NUL byte" || ap.Seq != 3 {
+		t.Fatalf("applied after a NUL byte = %+v\n%s", ap, l.out.String())
 	}
 	l.stop(10 * time.Second)
 }
