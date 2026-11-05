@@ -106,6 +106,7 @@ created through a mount cannot be identified atomically.
 | `JM_SMART_FOLDERS_ROOT` | `Recents` | Name of the top-level folder. |
 | `JM_SMART_FOLDERS_MAX_VIEWS` | `256` | Most views (top-level folders) kept, 1 to 4096. |
 | `JM_SMART_FOLDERS_COLLECTIONS_ROOT` | `Collections` | Root of the collection views (below; they also need `JM_CONTINUITY=on`). |
+| `JM_SMART_FOLDERS_QUERIES_ROOT` | `Queries` | Root of the saved-query views (below; they also need `JM_CONTINUITY=on`). |
 
 How it behaves:
 
@@ -158,6 +159,24 @@ links; the rest, missing and unresolved members and views left behind are
 counted in `GET /api/continuity/status` (`collection_views`). Views follow
 collection changes and member-file events within seconds, and are all rebuilt
 every 10 minutes, paced so `Recents` is not held up.
+
+**Saved-query views (experimental, also need `JM_CONTINUITY=on`).** A saved
+query (`/api/queries`, created by the admin or by a person whose project
+grants cover all its folders) names one or more folders and optionally a name
+fragment, file extensions and a modified-within window; it lists up to its
+limit (default 200, at most 500) matching files, newest first. With both
+switches on, the Manager keeps `Queries/<query name>/` with one relative
+symlink per result, under the same rules as collection views (records in
+`smart-folders.json`, version 4 once they exist; names, removal, the 6-hour
+retry and the limits are the same). Candidates come from the continuity
+catalog's path hints and every result is checked on the volume by its inode,
+so a link always points at the file's current path; a folder renamed into a
+query's folder is seen only once its files' next change events arrive. Each
+query examines at most its 2,000 most recently recorded candidates. Views
+follow query changes, file events under a query's folders and catalog changes
+within seconds, and are all rebuilt every 10 minutes (files leave a
+modified-within window without any event); counts are in
+`GET /api/continuity/status` (`query_views`).
 
 Known gaps:
 

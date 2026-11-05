@@ -182,7 +182,7 @@ func newTestSmartFolders(t *testing.T, o svcOpts) *smartFoldersService {
 		o.maxViews = 256
 	}
 	cfg := smartFoldersConfig{
-		Settings:  smartFoldersSettings{Root: "Recents", MaxViews: o.maxViews, CollectionsRoot: "Collections"},
+		Settings:  smartFoldersSettings{Root: "Recents", MaxViews: o.maxViews, CollectionsRoot: "Collections", QueriesRoot: "Queries"},
 		Backend:   o.backend,
 		Redis:     o.rdb,
 		StatePath: o.state,

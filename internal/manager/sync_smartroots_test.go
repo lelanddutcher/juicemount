@@ -48,6 +48,8 @@ func TestCheckSyncSmartRoots(t *testing.T) {
 		{"into a project", recents, src, "/jfs/Clients/A", "", false},
 		{"Collections without continuity", recents, plain, "/jfs/Collections", "", false},
 		{"into Collections", withColl, plain, "/jfs/Collections/x", "", true},
+		{"Queries without continuity", recents, plain, "/jfs/Queries", "", false},
+		{"into Queries", withColl, plain, "/jfs/queries/x", "", true},
 		{"configured names", both, plain, "/jfs/Sets/x", "", true},
 		{"configured names, default not in use", both, plain, "/jfs/Recents/x", "", false},
 		{"root, entry named like a root", recents, src, "/jfs", "", true},

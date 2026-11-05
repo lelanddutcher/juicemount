@@ -34,7 +34,7 @@ func (v osVolume) Close() error       { return nil }
 
 func osNode(fi fs.FileInfo) jfsmeta.Node {
 	st := fi.Sys().(*syscall.Stat_t)
-	n := jfsmeta.Node{Ino: uint64(st.Ino), Type: smartfolders.TypeOther, Nlink: uint32(st.Nlink), Parent: 1}
+	n := jfsmeta.Node{Ino: uint64(st.Ino), Type: smartfolders.TypeOther, Nlink: uint32(st.Nlink), Parent: 1, Mtime: fi.ModTime()}
 	switch m := fi.Mode(); {
 	case m&fs.ModeSymlink != 0:
 		n.Type = smartfolders.TypeSymlink
@@ -114,11 +114,12 @@ func newCollViewsEnv(t *testing.T, files ...string) *collViewsEnv {
 	if err != nil {
 		t.Fatal(err)
 	}
-	b, err := binder.New(binder.Config{Store: store, Connect: func() (binder.Volume, error) { return osVolume{root}, nil }})
+	cont := &continuityService{store: store}
+	b, err := binder.New(binder.Config{Store: store, Applied: cont.applied, Connect: func() (binder.Volume, error) { return osVolume{root}, nil }})
 	if err != nil {
 		t.Fatal(err)
 	}
-	cont := &continuityService{binder: b, store: store}
+	cont.binder = b
 	cont.start()
 	t.Cleanup(cont.Stop)
 	library, err := store.LibraryID()
@@ -212,10 +213,13 @@ func (e *collViewsEnv) move(from, to string) {
 
 // tree maps "<view>/<name>" to the volume path a link resolves to, and a
 // non-link entry to "<file>", for every view under Collections.
-func (e *collViewsEnv) tree() map[string]string {
+func (e *collViewsEnv) tree() map[string]string { e.t.Helper(); return e.treeOf("Collections") }
+
+// treeOf is tree for the views under root.
+func (e *collViewsEnv) treeOf(root string) map[string]string {
 	e.t.Helper()
 	out := map[string]string{}
-	base := filepath.Join(e.root, "Collections")
+	base := filepath.Join(e.root, root)
 	views, err := os.ReadDir(base)
 	if errors.Is(err, os.ErrNotExist) {
 		return out
@@ -588,7 +592,7 @@ func TestSmartFoldersStateMigratesToVersion3(t *testing.T) {
 
 	// Formats this Manager does not know are refused, never rewritten; a
 	// version 2 file claiming collection records is refused too.
-	for _, bad := range []string{`{"version":4}`, `{"version":2,"collections":{}}`} {
+	for _, bad := range []string{`{"version":5}`, `{"version":2,"collections":{}}`, `{"version":3,"queries":{}}`} {
 		if err := os.WriteFile(state, []byte(bad), 0o600); err != nil {
 			t.Fatal(err)
 		}

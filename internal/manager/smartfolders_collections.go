@@ -140,14 +140,17 @@ const (
 // cycle without backing off.
 var errMembersUnresolved = errors.New("members could not be resolved on the volume")
 
-// collectionViewsState is the collection views' part of smart-folders.json
-// (version 3).
-type collectionViewsState struct {
+// catalogViewsState is one kind of catalog views' part of
+// smart-folders.json: the collection views' (version 3) or the query views'
+// (version 4).
+type catalogViewsState[K ~string] struct {
 	Ownership *smartfolders.Ownership `json:"ownership,omitempty"`
-	// Folders maps a collection to its view folder name, so the name stays
-	// put (FolderNames prev).
-	Folders map[catalog.CollectionID]string `json:"folders,omitempty"`
+	// Folders maps a collection (or query) to its view folder name, so the
+	// name stays put (FolderNames prev).
+	Folders map[K]string `json:"folders,omitempty"`
 }
+
+type collectionViewsState = catalogViewsState[catalog.CollectionID]
 
 // collectionSource is what the views read: the continuity catalog and the
 // binder (continuityService).
@@ -190,7 +193,7 @@ type CollectionViewStats struct {
 	LastPass    time.Time `json:"last_pass"`
 }
 
-// collSeen is a collection as last reconciled.
+// collSeen is a collection (or query) as last reconciled.
 type collSeen struct {
 	seq     int64
 	folder  string
@@ -202,12 +205,44 @@ type collSeen struct {
 	missing int
 	over    int
 	refused int
+	capped  int // queries: candidates left unexamined (queryMaxCandidates)
 }
 
-type collectionViews struct {
+// viewItem is one catalog object that wants a view: a collection, or a
+// saved query (with its definition).
+type viewItem[K ~string] struct {
+	ID              K
+	Name            string
+	CreatedSequence int64
+	UpdatedSequence int64
+	query           *catalog.QueryDefinition
+}
+
+// viewKind is what differs between kinds of catalog views (collections,
+// queries): the root, how the objects are listed and how one view's links
+// are worked out. The rest (naming, limits, ownership, removal, pacing) is
+// catalogViews, shared.
+type viewKind[K ~string, S any] struct {
+	noun, plural string        // "collection", "collections": messages and log keys
+	rootVar      string        // the variable that moves the root
+	debounce     time.Duration // from a change to its pass
+	root         func(s *smartFoldersService) string
+	off          func(s *smartFoldersService) string // why the root is unusable
+	// exclude: the other smart roots, whose files no view of this kind links.
+	exclude func(s *smartFoldersService) []string
+	list    func(ctx context.Context, src S) ([]viewItem[K], error)
+	// begin runs at the start of each pass (queries: drop the last pass's
+	// candidate scan).
+	begin func(s *smartFoldersService)
+	build func(s *smartFoldersService, ctx context.Context, rec *smartfolders.Reconciler, src S, item viewItem[K], folder string, prior *collSeen, now time.Time) (*collSeen, int, error)
+}
+
+// catalogViews keeps one kind of catalog views in its own root.
+type catalogViews[K ~string, S any] struct {
+	kind    viewKind[K, S]
 	own     *smartfolders.Ownership
-	folders map[catalog.CollectionID]string
-	src     atomic.Pointer[collectionSourceRef]
+	folders map[K]string
+	src     atomic.Pointer[sourceRef[S]]
 	wake    chan struct{}
 
 	maxViews, maxLinks int
@@ -217,52 +252,61 @@ type collectionViews struct {
 	rootOwned          atomic.Bool // the last root check found the Manager's root
 
 	// Reconcile-goroutine state.
-	seen          map[catalog.CollectionID]*collSeen
+	seen          map[K]*collSeen
 	sweepAt       time.Time
 	rootRetryAt   time.Time
 	backoff       map[string]*folderBackoff // by view folder
 	parked        map[string]time.Time      // view folder -> next removal try
 	parkFor       time.Duration
-	lostPasses    map[string]int       // Ownership.Lost path -> passes reported
-	cursor        catalog.CollectionID // where the last budget-limited pass stopped
-	left          map[string]string    // view folder -> why it was not removed
+	lostPasses    map[string]int    // Ownership.Lost path -> passes reported
+	cursor        K                 // where the last budget-limited pass stopped
+	left          map[string]string // view folder -> why it was not removed
 	memberBackoff map[continuity.AssetID]*folderBackoff
-	sweepPending  map[catalog.CollectionID]bool
+	sweepPending  map[K]bool
 
 	// Event-path state.
 	mu      sync.Mutex
-	dirty   map[catalog.CollectionID]bool
-	files   map[string][]catalog.CollectionID // linked path -> collections
-	dirs    map[string][]catalog.CollectionID // folder above a linked path -> collections
-	pending bool                              // a debounced pass is scheduled
+	dirty   map[K]bool
+	files   map[string][]K // linked path -> views
+	dirs    map[string][]K // folder above a linked path -> views
+	watch   map[K][]string // queries: folders any change in marks the view dirty
+	pending bool           // a debounced pass is scheduled
 
-	stats atomic.Pointer[CollectionViewStats]
+	stats  atomic.Pointer[CollectionViewStats]
+	capped atomic.Int64 // queries: candidates left unexamined in the last pass
 }
 
-type collectionSourceRef struct{ collectionSource }
+type sourceRef[S any] struct{ src S }
 
-func (c *collectionViews) init() {
+type (
+	collectionViews     = catalogViews[catalog.CollectionID, collectionSource]
+	collectionSourceRef = sourceRef[collectionSource]
+)
+
+func (c *catalogViews[K, S]) init(kind viewKind[K, S]) {
+	c.kind = kind
 	c.own = &smartfolders.Ownership{}
 	c.own.Normalize()
-	c.folders = map[catalog.CollectionID]string{}
+	c.folders = map[K]string{}
 	c.wake = make(chan struct{}, 1)
 	c.maxViews, c.maxLinks = collectionViewsMaxViews, collectionViewsMaxLinks
-	c.sweep, c.debounce = collectionViewsSweep, collectionViewsDebounce
+	c.sweep, c.debounce = collectionViewsSweep, kind.debounce
 	c.passOps, c.passTime = collectionViewsPassOps, collectionViewsPassTime
 	c.memberBackoff = map[continuity.AssetID]*folderBackoff{}
 	c.parked = map[string]time.Time{}
 	c.parkFor = collectionViewsPark
 	c.lostPasses = map[string]int{}
-	c.sweepPending = map[catalog.CollectionID]bool{}
-	c.seen = map[catalog.CollectionID]*collSeen{}
+	c.sweepPending = map[K]bool{}
+	c.seen = map[K]*collSeen{}
 	c.backoff = map[string]*folderBackoff{}
 	c.left = map[string]string{}
-	c.dirty = map[catalog.CollectionID]bool{}
-	c.files = map[string][]catalog.CollectionID{}
-	c.dirs = map[string][]catalog.CollectionID{}
+	c.dirty = map[K]bool{}
+	c.files = map[string][]K{}
+	c.dirs = map[string][]K{}
+	c.watch = map[K][]string{}
 }
 
-func (c *collectionViews) load(st *collectionViewsState) {
+func (c *catalogViews[K, S]) load(st *catalogViewsState[K]) {
 	if st == nil {
 		return
 	}
@@ -276,55 +320,71 @@ func (c *collectionViews) load(st *collectionViewsState) {
 }
 
 // state is what persist writes; nil when there is nothing to keep, so the
-// file stays version 2.
-func (c *collectionViews) state() *collectionViewsState {
+// file stays at the older version.
+func (c *catalogViews[K, S]) state() *catalogViewsState[K] {
 	if c.own.Root == nil && len(c.own.Views) == 0 && len(c.folders) == 0 {
 		return nil
 	}
-	return &collectionViewsState{Ownership: c.own, Folders: c.folders}
+	return &catalogViewsState[K]{Ownership: c.own, Folders: c.folders}
 }
 
-func (c *collectionViews) source() collectionSource {
+func (c *catalogViews[K, S]) source() S {
 	if r := c.src.Load(); r != nil {
-		return r.collectionSource
+		return r.src
 	}
-	return nil
+	var none S
+	return none
 }
 
-// collectionsRootActive reports whether top is the root of collection
-// views that are running, in a root the Manager owns (the tracker's
-// Ignore; runs on the event path). A user-made folder of that name is
-// listed by /Recents like any other.
+// rootActive reports whether top is the root of views of this kind that
+// are running, in a root the Manager owns (the tracker's Ignore; runs on
+// the event path). A user-made folder of that name is listed by /Recents
+// like any other.
+func (c *catalogViews[K, S]) rootActive(s *smartFoldersService, top string) bool {
+	return top != "" && top == c.kind.root(s) && c.src.Load() != nil && c.rootOwned.Load()
+}
+
+func (c *catalogViews[K, S]) due(now time.Time) bool {
+	return c.src.Load() != nil && !now.Before(c.rootRetryAt)
+}
+
+// attach turns the views on, reading src. It reports whether they run (a
+// bad root name keeps them off).
+func (c *catalogViews[K, S]) attach(s *smartFoldersService, src S, limits string) bool {
+	root := c.kind.root(s)
+	if root == "" {
+		log.Printf("manager: smart folders: %s views OFF: %s", c.kind.noun, c.kind.off(s))
+		return false
+	}
+	c.rootOwned.Store(c.own.Root != nil && !c.own.Root.Pending)
+	c.src.Store(&sourceRef[S]{src})
+	log.Printf("manager: smart folders: %s views ON (experimental): /%s/<%s> (%s)", c.kind.noun, root, c.kind.noun, limits)
+	c.schedule()
+	return true
+}
+
+// collectionsRootActive is rootActive for the collection views.
 func (s *smartFoldersService) collectionsRootActive(top string) bool {
-	return top != "" && top == s.cfg.Settings.CollectionsRoot && s.coll.src.Load() != nil && s.coll.rootOwned.Load()
+	return s.coll.rootActive(s, top)
 }
 
-func (s *smartFoldersService) collectionsDue(now time.Time) bool {
-	return s.coll.src.Load() != nil && !now.Before(s.coll.rootRetryAt)
-}
+func (s *smartFoldersService) collectionsDue(now time.Time) bool { return s.coll.due(now) }
 
 // attachCollections turns collection views on, reading src. It reports
 // whether they run (a bad JM_SMART_FOLDERS_COLLECTIONS_ROOT keeps them off).
 func (s *smartFoldersService) attachCollections(src collectionSource) bool {
-	if s.cfg.Settings.CollectionsRoot == "" {
-		log.Printf("manager: smart folders: collection views OFF: %s", s.cfg.Settings.CollectionsOff)
-		return false
-	}
-	s.coll.rootOwned.Store(s.coll.own.Root != nil && !s.coll.own.Root.Pending)
-	s.coll.src.Store(&collectionSourceRef{src})
-	log.Printf("manager: smart folders: collection views ON (experimental): /%s/<collection> (at most %d views of %d links)",
-		s.cfg.Settings.CollectionsRoot, s.coll.maxViews, s.coll.maxLinks)
-	s.scheduleCollections()
-	return true
+	return s.coll.attach(s, src, fmt.Sprintf("at most %d views of %d links", s.coll.maxViews, s.coll.maxLinks))
 }
 
 // collectionsChanged is called after a collection change commits.
-func (s *smartFoldersService) collectionsChanged() { s.scheduleCollections() }
+func (s *smartFoldersService) collectionsChanged() { s.coll.schedule() }
 
-// scheduleCollections runs a collections-only pass after the debounce; calls
-// in between coalesce. It never blocks.
-func (s *smartFoldersService) scheduleCollections() {
-	c := &s.coll
+// scheduleCollections runs a collections-only pass after the debounce.
+func (s *smartFoldersService) scheduleCollections() { s.coll.schedule() }
+
+// schedule runs a pass of this kind alone after the debounce; calls in
+// between coalesce. It never blocks.
+func (c *catalogViews[K, S]) schedule() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.pending {
@@ -345,56 +405,76 @@ func (s *smartFoldersService) scheduleCollections() {
 // noteCollectionEvent marks the collections linking a path an event names
 // (or a file below a folder it names) dirty. Event path: map lookups only.
 func (s *smartFoldersService) noteCollectionEvent(ev smartfolders.Event) {
-	if s.coll.src.Load() == nil {
+	s.coll.notePaths(ev.Path, ev.OldPath)
+}
+
+// notePaths marks dirty the views linking one of paths (or a file below a
+// folder it names) and, for queries, the views watching a folder at, above
+// or below one of them; then schedules a pass. Event path: map lookups and
+// one prefix check per watched folder.
+func (c *catalogViews[K, S]) notePaths(paths ...string) {
+	if c.src.Load() == nil {
 		return
 	}
-	c := &s.coll
 	c.mu.Lock()
 	hit := false
-	for _, p := range []string{ev.Path, ev.OldPath} {
+	for _, p := range paths {
 		p = strings.TrimPrefix(p, "/")
 		if p == "" {
 			continue
 		}
-		for _, ids := range [][]catalog.CollectionID{c.files[p], c.dirs[p]} {
+		for _, ids := range [][]K{c.files[p], c.dirs[p]} {
 			for _, id := range ids {
 				c.dirty[id], hit = true, true
+			}
+		}
+		for id, folders := range c.watch {
+			for _, f := range folders {
+				if underFolder(p, f) || underFolder(f, p) {
+					c.dirty[id], hit = true, true
+					break
+				}
 			}
 		}
 	}
 	c.mu.Unlock()
 	if hit {
-		s.scheduleCollections()
+		c.schedule()
 	}
 }
 
-func (c *collectionViews) takeDirty() map[catalog.CollectionID]bool {
+// underFolder: p is folder or below it.
+func underFolder(p, folder string) bool {
+	return p == folder || strings.HasPrefix(p, folder+"/")
+}
+
+func (c *catalogViews[K, S]) takeDirty() map[K]bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	d := c.dirty
-	c.dirty = map[catalog.CollectionID]bool{}
+	c.dirty = map[K]bool{}
 	return d
 }
 
-func (c *collectionViews) markDirty(id catalog.CollectionID) {
+func (c *catalogViews[K, S]) markDirty(id K) {
 	c.mu.Lock()
 	c.dirty[id] = true
 	c.mu.Unlock()
 }
 
-// index replaces a collection's entries in the event index (nil drops it).
-func (c *collectionViews) index(id catalog.CollectionID, old, targets []string) {
+// index replaces a view's entries in the event index (nil drops it).
+func (c *catalogViews[K, S]) index(id K, old, targets []string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	drop := func(m map[string][]catalog.CollectionID, k string) {
-		ids := slices.DeleteFunc(m[k], func(x catalog.CollectionID) bool { return x == id })
+	drop := func(m map[string][]K, k string) {
+		ids := slices.DeleteFunc(m[k], func(x K) bool { return x == id })
 		if len(ids) == 0 {
 			delete(m, k)
 		} else {
 			m[k] = ids
 		}
 	}
-	add := func(m map[string][]catalog.CollectionID, k string) {
+	add := func(m map[string][]K, k string) {
 		if !slices.Contains(m[k], id) {
 			m[k] = append(m[k], id)
 		}
@@ -414,13 +494,16 @@ func (c *collectionViews) index(id catalog.CollectionID, old, targets []string) 
 }
 
 // collectionsOnlyCycle is the debounced pass after a change.
-func (s *smartFoldersService) collectionsOnlyCycle(ctx context.Context) {
-	if s.disabled.Load() || !s.collectionsDue(s.cfg.Now()) {
+func (s *smartFoldersService) collectionsOnlyCycle(ctx context.Context) { s.coll.onlyCycle(s, ctx) }
+
+// onlyCycle is the debounced pass of this kind alone after a change.
+func (c *catalogViews[K, S]) onlyCycle(s *smartFoldersService, ctx context.Context) {
+	if s.disabled.Load() || !c.due(s.cfg.Now()) {
 		return
 	}
 	defer func() {
 		if p := recover(); p != nil {
-			s.disable("a collection-views pass", p)
+			s.disable("a "+c.kind.noun+"-views pass", p)
 		}
 	}()
 	fsys, release, err := s.cfg.Backend.acquire()
@@ -429,7 +512,7 @@ func (s *smartFoldersService) collectionsOnlyCycle(ctx context.Context) {
 		return
 	}
 	defer release()
-	s.collectionsCycle(ctx, fsys)
+	c.cycle(s, ctx, fsys)
 }
 
 // collectionsCycle brings the collection views up to date: views of
@@ -440,19 +523,29 @@ func (s *smartFoldersService) collectionsOnlyCycle(ctx context.Context) {
 // never held up for long. Changed collections go before the periodic
 // sweep's.
 func (s *smartFoldersService) collectionsCycle(ctx context.Context, fsys smartfolders.FS) {
-	src := s.coll.source()
-	if src == nil {
+	s.coll.cycle(s, ctx, fsys)
+}
+
+// cycle brings this kind's views up to date, as collectionsCycle says.
+func (c *catalogViews[K, S]) cycle(s *smartFoldersService, ctx context.Context, fsys smartfolders.FS) {
+	ref := c.src.Load()
+	if ref == nil {
 		return
 	}
-	c := &s.coll
+	src := ref.src
 	now := s.cfg.Now()
 	if now.Before(c.rootRetryAt) {
 		return
 	}
 	started := time.Now()
-	root := s.cfg.Settings.CollectionsRoot
+	root := c.kind.root(s)
+	logKey := c.kind.plural
 	st := &CollectionViewStats{Root: root, MaxViews: c.maxViews, MaxLinksPerView: c.maxLinks, LastPass: now}
-	defer func() { c.stats.Store(st) }()
+	capped := 0
+	defer func() { c.stats.Store(st); c.capped.Store(int64(capped)) }()
+	if c.kind.begin != nil {
+		c.kind.begin(s)
+	}
 	// Wanted views are bounded by the collection cutoff below; all recorded
 	// views, left-behind ones included, by twice that.
 	rec := &smartfolders.Reconciler{
@@ -461,7 +554,7 @@ func (s *smartFoldersService) collectionsCycle(ctx context.Context, fsys smartfo
 		Own:      c.own,
 		Persist:  s.persist,
 		Gate:     s.gate(ctx),
-		Exclude:  []string{s.cfg.Settings.Root},
+		Exclude:  c.kind.exclude(s),
 		MaxViews: 2 * c.maxViews,
 	}
 	st.MaxRecorded = rec.MaxViews
@@ -469,22 +562,22 @@ func (s *smartFoldersService) collectionsCycle(ctx context.Context, fsys smartfo
 	state, err := rec.CheckRoot()
 	if err != nil {
 		st.Problems = append(st.Problems, err.Error())
-		s.logOnce("collections", fmt.Sprintf("checking /%s: %v", root, err))
+		s.logOnce(logKey, fmt.Sprintf("checking /%s: %v", root, err))
 		return
 	}
 	if state == smartfolders.RootForeign {
 		c.rootRetryAt = now.Add(smartFoldersRootRecheck)
 		st.RootForeign = true
-		s.logOnce("collections", fmt.Sprintf("/%s exists and was not created by the Manager: collection views leave it alone (checking again every %s; rename it or set JM_SMART_FOLDERS_COLLECTIONS_ROOT)", root, smartFoldersRootRecheck))
+		s.logOnce(logKey, fmt.Sprintf("/%s exists and was not created by the Manager: %s views leave it alone (checking again every %s; rename it or set %s)", root, c.kind.noun, smartFoldersRootRecheck, c.kind.rootVar))
 		return
 	}
-	cols, err := src.activeCollections(ctx)
+	cols, err := c.kind.list(ctx, src)
 	if err != nil {
 		st.Problems = append(st.Problems, err.Error())
-		s.logOnce("collections", fmt.Sprintf("listing collections: %v", err))
+		s.logOnce(logKey, fmt.Sprintf("listing %s: %v", c.kind.plural, err))
 		return
 	}
-	s.logOnce("collections", "")
+	s.logOnce(logKey, "")
 	sort.Slice(cols, func(i, j int) bool {
 		if cols[i].CreatedSequence != cols[j].CreatedSequence {
 			return cols[i].CreatedSequence < cols[j].CreatedSequence
@@ -514,9 +607,16 @@ func (s *smartFoldersService) collectionsCycle(ctx context.Context, fsys smartfo
 	}
 	want := make([]smartfolders.Folder, len(cols))
 	prev := map[string]string{}
+	watch := map[K][]string{}
 	for i, col := range cols {
 		want[i] = smartfolders.Folder{Key: string(col.ID), Name: col.Name}
+		if col.query != nil {
+			watch[col.ID] = col.query.Prefixes
+		}
 	}
+	c.mu.Lock()
+	c.watch = watch
+	c.mu.Unlock()
 	for id, f := range c.folders {
 		prev[string(id)] = f
 	}
@@ -528,7 +628,7 @@ func (s *smartFoldersService) collectionsCycle(ctx context.Context, fsys smartfo
 	// Record the names before acting, so a numbered name stays put
 	// whatever happens next.
 	changed := false
-	active := map[catalog.CollectionID]bool{}
+	active := map[K]bool{}
 	for _, col := range cols {
 		active[col.ID] = true
 		if f := names[string(col.ID)]; c.folders[col.ID] != f {
@@ -594,7 +694,7 @@ func (s *smartFoldersService) collectionsCycle(ctx context.Context, fsys smartfo
 			continue
 		}
 		res, err := rec.RemoveView(folder)
-		s.logCollectionView(root, folder, res, err)
+		c.logView(s, folder, res, err)
 		if err != nil {
 			c.left[folder] = leftReason(err)
 			// The volume itself refused (the RESP proxy's denial reaches
@@ -613,14 +713,14 @@ func (s *smartFoldersService) collectionsCycle(ctx context.Context, fsys smartfo
 		delete(c.left, folder)
 		delete(c.backoff, folder)
 		if c.own.Views[folder] == nil {
-			delete(s.lastLog, "collections:"+folder)
+			delete(s.lastLog, logKey+":"+folder)
 		}
 	}
 
 	// 2. Rebuild what changed, then what the sweep marked, within the
 	// pass budget.
 	type job struct {
-		col   catalog.Collection
+		col   viewItem[K]
 		sweep bool
 	}
 	var urgent, swept []job
@@ -646,7 +746,7 @@ func (s *smartFoldersService) collectionsCycle(ctx context.Context, fsys smartfo
 	}
 	// Each list starts after the collection the last pass stopped at, so
 	// early collections that keep changing cannot starve later ones.
-	pos := map[catalog.CollectionID]int{}
+	pos := map[K]int{}
 	for i, col := range cols {
 		pos[col.ID] = i
 	}
@@ -683,7 +783,7 @@ func (s *smartFoldersService) collectionsCycle(ctx context.Context, fsys smartfo
 		delete(c.sweepPending, col.ID)
 		c.cursor = col.ID
 		prior := c.seen[col.ID]
-		seen, n, err := s.reconcileCollection(ctx, rec, src, col, folder, prior, now)
+		seen, n, err := c.kind.build(s, ctx, rec, src, col, folder, prior, now)
 		ops += n
 		if errors.Is(err, smartfolders.ErrTooManyViews) {
 			st.ViewsAtCap++
@@ -719,6 +819,9 @@ func (s *smartFoldersService) collectionsCycle(ctx context.Context, fsys smartfo
 		if !active[id] {
 			delete(c.sweepPending, id)
 		}
+	}
+	for _, seen := range c.seen {
+		capped += seen.capped
 	}
 	for a := range c.memberBackoff {
 		if !unknown[a] {
@@ -758,7 +861,7 @@ func (s *smartFoldersService) collectionsCycle(ctx context.Context, fsys smartfo
 		}
 	}
 	if more {
-		s.scheduleCollections()
+		c.schedule()
 	}
 
 	st.Views = len(c.own.Views)
@@ -782,6 +885,31 @@ func (s *smartFoldersService) collectionsCycle(ctx context.Context, fsys smartfo
 	c.mu.Lock()
 	st.Deferred = len(c.sweepPending) + len(c.dirty)
 	c.mu.Unlock()
+}
+
+// collectionKind is the collection views' part of catalogViews.
+func collectionKind() viewKind[catalog.CollectionID, collectionSource] {
+	return viewKind[catalog.CollectionID, collectionSource]{
+		noun: "collection", plural: "collections", rootVar: "JM_SMART_FOLDERS_COLLECTIONS_ROOT", debounce: collectionViewsDebounce,
+		root: func(s *smartFoldersService) string { return s.cfg.Settings.CollectionsRoot },
+		off:  func(s *smartFoldersService) string { return s.cfg.Settings.CollectionsOff },
+		exclude: func(s *smartFoldersService) []string {
+			out := []string{s.cfg.Settings.Root}
+			if q := s.cfg.Settings.QueriesRoot; s.queriesRootActive(q) {
+				out = append(out, q)
+			}
+			return out
+		},
+		list: func(ctx context.Context, src collectionSource) ([]viewItem[catalog.CollectionID], error) {
+			cols, err := src.activeCollections(ctx)
+			out := make([]viewItem[catalog.CollectionID], len(cols))
+			for i, col := range cols {
+				out[i] = viewItem[catalog.CollectionID]{ID: col.ID, Name: col.Name, CreatedSequence: col.CreatedSequence, UpdatedSequence: col.UpdatedSequence}
+			}
+			return out, err
+		},
+		build: (*smartFoldersService).reconcileCollection,
+	}
 }
 
 // leftReason says why a view no collection wants is still there.
@@ -816,7 +944,7 @@ func (s *smartFoldersService) backoffDelay(n int) time.Duration {
 // backoff passes, so one unresolvable member never holds up the view.
 // Only when the volume is not connected at all is the view left as it is.
 // A member found gone at the last moment is resolved once more.
-func (s *smartFoldersService) reconcileCollection(ctx context.Context, rec *smartfolders.Reconciler, src collectionSource, col catalog.Collection, folder string, prior *collSeen, now time.Time) (*collSeen, int, error) {
+func (s *smartFoldersService) reconcileCollection(ctx context.Context, rec *smartfolders.Reconciler, src collectionSource, col viewItem[catalog.CollectionID], folder string, prior *collSeen, now time.Time) (*collSeen, int, error) {
 	c := &s.coll
 	members, err := src.collectionMembers(ctx, col.ID)
 	if err != nil {
@@ -884,7 +1012,7 @@ func (s *smartFoldersService) reconcileCollection(ctx context.Context, rec *smar
 		}
 		links := smartfolders.LinkNames(targets, rec.PreviousNames(folder))
 		res, err := rec.Reconcile(folder, links)
-		s.logCollectionView(rec.Root, folder, res, err)
+		c.logView(s, folder, res, err)
 		if err != nil {
 			return nil, ops, err
 		}
@@ -924,13 +1052,14 @@ func (s *smartFoldersService) reconcileCollection(ctx context.Context, rec *smar
 	return seen, ops, nil
 }
 
-func (s *smartFoldersService) logCollectionView(root, folder string, res smartfolders.Result, err error) {
+// logView logs a view's problems once (under "<plural>:<folder>").
+func (c *catalogViews[K, S]) logView(s *smartFoldersService, folder string, res smartfolders.Result, err error) {
 	var problems []string
 	if err != nil && !errors.Is(err, smartfolders.ErrViewInUse) {
 		problems = append(problems, err.Error())
 	}
 	if errors.Is(err, smartfolders.ErrViewInUse) {
-		problems = append(problems, "no collection wants this view any more, but it holds entries the Manager did not create; it is left in place")
+		problems = append(problems, "no "+c.kind.noun+" wants this view any more, but it holds entries the Manager did not create; it is left in place")
 	}
 	for _, r := range res.Refused {
 		if !r.TargetGone() {
@@ -940,12 +1069,12 @@ func (s *smartFoldersService) logCollectionView(root, folder string, res smartfo
 	if len(res.Foreign) > 0 {
 		problems = append(problems, "replaced by entries the Manager did not create (left alone): "+strings.Join(res.Foreign, ", "))
 	}
-	key := "collections:" + folder
+	key := c.kind.plural + ":" + folder
 	if len(problems) == 0 {
 		s.logOnce(key, "")
 		return
 	}
-	s.logOnce(key, fmt.Sprintf("view %s/%s: %s", root, folder, strings.Join(problems, "; ")))
+	s.logOnce(key, fmt.Sprintf("view %s/%s: %s", c.kind.root(s), folder, strings.Join(problems, "; ")))
 }
 
 func sortedFolders(m map[string]*smartfolders.OwnedView) []string {

@@ -240,13 +240,16 @@ type collectionsAPI struct {
 	refusals  *refusalLog
 }
 
-// registerCollections wires /api/collections. The handlers do their own
+// registerCollections wires /api/collections and /api/queries (queries.go,
+// sharing the authentication, budgets and slots). The handlers do their own
 // authentication (admin key or a person's Mac) and read a.continuity on
 // every request, so they can be registered before the binder starts.
 func (a *API) registerCollections(mux *http.ServeMux, prefix string, people *PrincipalStore) {
 	h := newCollectionsAPI(a, prefix, people)
 	mux.HandleFunc(prefix+"/api/collections", h.serve)
 	mux.HandleFunc(prefix+"/api/collections/", h.serve)
+	mux.HandleFunc(prefix+"/api/queries", h.serveQueries)
+	mux.HandleFunc(prefix+"/api/queries/", h.serveQueries)
 }
 
 func newCollectionsAPI(a *API, prefix string, people *PrincipalStore) *collectionsAPI {
@@ -347,6 +350,13 @@ func (h *collectionsAPI) acquire(ctx context.Context, actor collectionActor) (re
 }
 
 func (h *collectionsAPI) serve(w http.ResponseWriter, r *http.Request) {
+	h.serveWith(w, r, readsVolume(r), h.route)
+}
+
+// serveWith authenticates, takes a volume-read slot when reads is set, and
+// routes.
+func (h *collectionsAPI) serveWith(w http.ResponseWriter, r *http.Request, reads bool,
+	route func(http.ResponseWriter, *http.Request, *continuityService, collectionActor) error) {
 	svc := h.api.continuity
 	if svc == nil {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "continuity is off (JM_CONTINUITY)"})
@@ -356,14 +366,14 @@ func (h *collectionsAPI) serve(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	r = r.WithContext(ctx)
 	actor, err := h.authenticate(r)
-	if err == nil && readsVolume(r) {
+	if err == nil && reads {
 		var release func()
 		if release, err = h.acquire(ctx, actor); err == nil {
 			defer release()
 		}
 	}
 	if err == nil {
-		err = h.route(w, r, svc, actor)
+		err = route(w, r, svc, actor)
 	}
 	if err == nil {
 		return

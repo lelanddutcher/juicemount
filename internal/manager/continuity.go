@@ -13,7 +13,8 @@ package manager
 // client are missed until a rescan, which this slice does not have;
 // GET /api/continuity/status reports what was missed.
 //
-// Collections (collections.go) live in the same catalog.
+// Collections (collections.go) and saved queries (queries.go) live in the
+// same catalog.
 
 import (
 	"context"
@@ -63,8 +64,9 @@ type continuityService struct {
 	done     sync.WaitGroup
 	stopOnce sync.Once
 	stopWait time.Duration
-	// views shows the collections as smart folders
-	// (smartfolders_collections.go); nil while not attached.
+	// views shows the collections and queries as smart folders
+	// (smartfolders_collections.go, smartfolders_queries.go); nil while not
+	// attached.
 	views atomic.Pointer[smartFoldersService]
 }
 
@@ -120,8 +122,9 @@ func (a *API) startContinuity(cfg Config, getenv func(string) string) *continuit
 	return svc
 }
 
-// attachCollectionViews shows the collections as smart folders when smart
-// folders run too (JM_SMART_FOLDERS=on; started before continuity).
+// attachCollectionViews shows the collections and saved queries as smart
+// folders when smart folders run too (JM_SMART_FOLDERS=on; started before
+// continuity).
 func (a *API) attachCollectionViews(svc *continuityService) {
 	if a.jobs == nil {
 		return
@@ -129,7 +132,11 @@ func (a *API) attachCollectionViews(svc *continuityService) {
 	a.jobs.mu.RLock()
 	sf, _ := a.jobs.smartFolders.(*smartFoldersService)
 	a.jobs.mu.RUnlock()
-	if sf != nil && sf.attachCollections(svc) {
+	if sf == nil {
+		return
+	}
+	collections := sf.attachCollections(svc)
+	if sf.attachQueries(svc) || collections {
 		svc.views.Store(sf)
 	}
 }
@@ -138,6 +145,43 @@ func (a *API) attachCollectionViews(svc *continuityService) {
 func (s *continuityService) collectionsChanged() {
 	if v := s.views.Load(); v != nil {
 		v.collectionsChanged()
+	}
+}
+
+// queriesChanged tells the query views a query changed.
+func (s *continuityService) queriesChanged() {
+	if v := s.views.Load(); v != nil {
+		v.queriesChanged()
+	}
+}
+
+// applied is the binder's Applied hook: an operation that moved a file's
+// path hint (bound, moved, gone) marks the query views watching either
+// path dirty. Binder goroutine; map lookups only.
+func (s *continuityService) applied(op catalog.Operation) {
+	v := s.views.Load()
+	if v == nil {
+		return
+	}
+	var paths []string
+	hint := func(l catalog.LocationValue) {
+		if strings.HasPrefix(l.Source, "jfs-path:") {
+			paths = append(paths, l.Locator)
+		}
+	}
+	for _, c := range op.Changes {
+		switch {
+		case c.PutLocation != nil:
+			hint(c.PutLocation.Value)
+			if c.PutLocation.Expected != nil {
+				hint(c.PutLocation.Expected.Value)
+			}
+		case c.RemoveLocation != nil && c.RemoveLocation.Expected != nil:
+			hint(c.RemoveLocation.Expected.Value)
+		}
+	}
+	if len(paths) > 0 {
+		v.qry.notePaths(paths...)
 	}
 }
 
@@ -234,7 +278,8 @@ func buildContinuity(cfg Config, getenv func(string) string) *continuityService 
 		log.Printf("manager: continuity disabled: %v", err)
 		return nil
 	}
-	b, err := binder.New(binder.Config{Store: store, Connect: func() (binder.Volume, error) {
+	svc := &continuityService{store: store}
+	b, err := binder.New(binder.Config{Store: store, Applied: svc.applied, Connect: func() (binder.Volume, error) {
 		fsys, err := jfsmeta.OpenReadOnly(metaURL)
 		if err != nil {
 			return nil, err
@@ -246,7 +291,8 @@ func buildContinuity(cfg Config, getenv func(string) string) *continuityService 
 		log.Printf("manager: continuity disabled: %v", err)
 		return nil
 	}
-	return &continuityService{binder: b, store: store, rdb: redis.NewClient(opts)}
+	svc.binder, svc.rdb = b, redis.NewClient(opts)
+	return svc
 }
 
 // openContinuityCatalog opens (creating on first use) the catalog in
@@ -325,7 +371,8 @@ func openContinuityCatalog(stateDir string, mounts ...string) (*catalog.Store, e
 	if errors.Is(err, catalog.ErrUpgradeRequired) {
 		// The Manager owns this catalog and nothing else uses it yet, so it
 		// upgrades it in place (a format 2 catalog from slice 2 gains the
-		// collection tables; nothing existing changes). A binary from
+		// collection tables, a format 3 one the query table; nothing
+		// existing changes). A binary from
 		// before the upgrade refuses the new format; it never damages it.
 		err = upgradeContinuityCatalog(path)
 		if err == nil {
@@ -433,6 +480,7 @@ func (a *API) handleContinuityStatus(w http.ResponseWriter, r *http.Request) {
 	out := map[string]any{"enabled": true, "binder": svc.binder.Stats()}
 	if v := svc.views.Load(); v != nil {
 		out["collection_views"] = v.collectionStats()
+		out["query_views"] = v.queryStats()
 	}
 	writeJSON(w, http.StatusOK, out)
 }

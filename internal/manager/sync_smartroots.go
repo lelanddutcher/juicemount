@@ -20,15 +20,20 @@ import (
 
 // smartRootsInUse lists the smart-folder roots this Manager runs, read as
 // the smart-folder and continuity services read them (none while smart
-// folders are off; the collection views root only with JM_CONTINUITY=on).
+// folders are off; the collection and query views roots only with
+// JM_CONTINUITY=on).
 func smartRootsInUse(getenv func(string) string) []string {
 	on, s, err := smartFoldersEnv(getenv)
 	if err != nil || !on {
 		return nil
 	}
 	roots := []string{s.Root}
-	if c, err := continuityEnv(getenv); err == nil && c && s.CollectionsRoot != "" {
-		roots = append(roots, s.CollectionsRoot)
+	if c, err := continuityEnv(getenv); err == nil && c {
+		for _, r := range []string{s.CollectionsRoot, s.QueriesRoot} {
+			if r != "" {
+				roots = append(roots, r)
+			}
+		}
 	}
 	return roots
 }

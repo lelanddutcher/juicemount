@@ -567,7 +567,7 @@ func TestContinuityUpgradesSliceTwoCatalog(t *testing.T) {
 	}
 	defer store.Close()
 	library, _ := store.LibraryID()
-	if _, version, err := catalog.Inspect(context.Background(), path); err != nil || version != 3 {
+	if _, version, err := catalog.Inspect(context.Background(), path); err != nil || version != 4 {
 		t.Fatalf("after open: format %d, %v", version, err)
 	}
 	if events, err := store.Events(context.Background(), library, 0, 10); err != nil || len(events) != 3 {
@@ -877,7 +877,7 @@ func TestContinuityRefusesNewerCatalogAsNewer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, execErr := db.Exec(`PRAGMA user_version=4`)
+	_, execErr := db.Exec(`PRAGMA user_version=5`)
 	if err := errors.Join(execErr, db.Close()); err != nil {
 		t.Fatal(err)
 	}
