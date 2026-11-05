@@ -213,6 +213,8 @@ func TestCatalogRefusesSymlinksHardlinksAndNonregularFiles(t *testing.T) {
 			if opened, err := Open(target); err == nil {
 				opened.Close()
 				t.Fatal("unsafe target opened")
+			} else if !errors.Is(err, ErrInvalid) {
+				t.Fatalf("unsafe target refused as %v, want ErrInvalid (a deployment problem, not corruption)", err)
 			}
 			if kind == "hardlink" {
 				if opened, err := Open(path); err == nil {
@@ -248,6 +250,8 @@ func TestCatalogRefusesSymlinksHardlinksAndNonregularFiles(t *testing.T) {
 				if opened, err := Open(path); err == nil {
 					opened.Close()
 					t.Fatal("unsafe sidecar admitted")
+				} else if !errors.Is(err, ErrInvalid) {
+					t.Fatalf("unsafe sidecar refused as %v, want ErrInvalid", err)
 				}
 				got, err := os.ReadFile(source)
 				if err != nil || string(got) != "preserve" {

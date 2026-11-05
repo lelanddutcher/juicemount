@@ -9,11 +9,12 @@ import (
 )
 
 func checkFileIdentity(info os.FileInfo) error {
+	// Deployment problems (a symlink, an extra hard link, a copy without -p,
+	// a foreign owner) are not corruption: the bytes may be intact.
 	stat, ok := info.Sys().(*syscall.Stat_t)
 	if !ok || !info.Mode().IsRegular() || stat.Nlink != 1 {
-		return corrupt("catalog files must be single-link regular files")
+		return invalid("catalog files must be single-link regular files")
 	}
-	// Permission problems (a copy without -p, a foreign owner) are not corruption.
 	if info.Mode().Perm()&0077 != 0 {
 		return invalid("catalog files must not grant group or other access")
 	}
@@ -32,7 +33,10 @@ func checkPrivateDirectory(dir string) error {
 		return fmt.Errorf("catalog parent: %w", err)
 	}
 	stat, ok := info.Sys().(*syscall.Stat_t)
-	if !ok || !info.IsDir() || info.Mode().Perm()&0022 != 0 {
+	if !ok || !info.IsDir() {
+		return invalid("catalog parent must be a directory")
+	}
+	if info.Mode().Perm()&0022 != 0 {
 		return invalid("catalog directory must not be writable by group or others")
 	}
 	if int64(stat.Uid) != int64(os.Geteuid()) {
