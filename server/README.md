@@ -172,11 +172,16 @@ retry and the limits are the same). Candidates come from the continuity
 catalog's path hints and every result is checked on the volume by its inode,
 so a link always points at the file's current path; a folder renamed into a
 query's folder is seen only once its files' next change events arrive. Each
-query examines at most its 2,000 most recently recorded candidates. Views
-follow query changes, file events under a query's folders and catalog changes
-within seconds, and are all rebuilt every 10 minutes (files leave a
-modified-within window without any event); counts are in
-`GET /api/continuity/status` (`query_views`).
+query examines at most its 2,000 most recently changed candidates (bound,
+moved or saved in place, the last noted at most every 10 minutes per file);
+a capped query is named in `GET /api/continuity/status` (`query_views`) and
+its results say `capped`, with how many were examined. Views follow query
+changes within seconds and file changes under a query's folders at most once
+a minute, and are all rebuilt every 10 minutes (files leave a
+modified-within window without any event). A library holds at most 256
+queries, a person at most 32. The continuity catalog stays at format 3 (still
+readable by a Manager from before saved queries) until the first query is
+created.
 
 Known gaps:
 

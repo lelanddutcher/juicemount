@@ -68,6 +68,8 @@ type continuityService struct {
 	// (smartfolders_collections.go, smartfolders_queries.go); nil while not
 	// attached.
 	views atomic.Pointer[smartFoldersService]
+	// results: each query's last complete evaluation (queries_eval.go).
+	results queryResultCache
 }
 
 func (s *continuityService) start() {
@@ -146,6 +148,13 @@ func (s *continuityService) collectionsChanged() {
 	if v := s.views.Load(); v != nil {
 		v.collectionsChanged()
 	}
+}
+
+// queryViewsRunning: the query views keep every query's evaluation
+// current (smart folders on, query root usable).
+func (s *continuityService) queryViewsRunning() bool {
+	v := s.views.Load()
+	return v != nil && v.qry.src.Load() != nil
 }
 
 // queriesChanged tells the query views a query changed.
@@ -370,10 +379,12 @@ func openContinuityCatalog(stateDir string, mounts ...string) (*catalog.Store, e
 	store, err := catalog.Open(path)
 	if errors.Is(err, catalog.ErrUpgradeRequired) {
 		// The Manager owns this catalog and nothing else uses it yet, so it
-		// upgrades it in place (a format 2 catalog from slice 2 gains the
-		// collection tables, a format 3 one the query table; nothing
-		// existing changes). A binary from
-		// before the upgrade refuses the new format; it never damages it.
+		// upgrades it in place, to format 3 only (a format 2 catalog from
+		// slice 2 gains the collection tables; nothing existing changes).
+		// The query table (format 4) is added when the first query is
+		// created (queries.go), so until then the Manager before saved
+		// queries still opens the catalog. A binary from before an
+		// upgrade refuses the new format; it never damages it.
 		err = upgradeContinuityCatalog(path)
 		if err == nil {
 			store, err = catalog.Open(path)
@@ -400,10 +411,10 @@ func upgradeContinuityCatalog(path string) error {
 	if err != nil {
 		return err
 	}
-	if err := catalog.Upgrade(ctx, path, library); err != nil {
+	if err := catalog.UpgradeTo(ctx, path, library, catalog.MinOperableFormat); err != nil {
 		return fmt.Errorf("upgrading the catalog %s from format %d: %w", path, version, err)
 	}
-	log.Printf("manager: continuity: upgraded the catalog %s from format %d", path, version)
+	log.Printf("manager: continuity: upgraded the catalog %s from format %d to %d", path, version, catalog.MinOperableFormat)
 	return nil
 }
 

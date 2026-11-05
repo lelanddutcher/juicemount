@@ -3,11 +3,13 @@ package manager
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/lelanddutcher/juicemount/internal/continuity/catalog"
 )
@@ -18,9 +20,7 @@ func newQueriesEnv(t *testing.T) *collectionsEnv {
 	e := newCollectionsEnv(t)
 	e.mux.HandleFunc("/manager/api/queries", e.h.serveQueries)
 	e.mux.HandleFunc("/manager/api/queries/", e.h.serveQueries)
-	saved := queryRootsInUse
-	queryRootsInUse = func() []string { return []string{"Recents", "Collections", "Queries"} }
-	t.Cleanup(func() { queryRootsInUse = saved })
+	e.h.roots = func() []string { return []string{"Recents", "Collections", "Queries"} }
 	return e
 }
 
@@ -49,10 +49,22 @@ func (e *collectionsEnv) queryWrite(who, path string, body any, want int) queryR
 }
 
 type resultsReply struct {
-	Query      QueryView         `json:"query"`
-	Results    []QueryResultView `json:"results"`
-	Unresolved int               `json:"unresolved"`
-	OverLimit  int               `json:"results_over_limit"`
+	Query       QueryView         `json:"query"`
+	Results     []QueryResultView `json:"results"`
+	EvaluatedAt time.Time         `json:"evaluated_at"`
+	AgeSeconds  int64             `json:"age_seconds"`
+	Unresolved  int               `json:"unresolved"`
+	OverLimit   int               `json:"results_over_limit"`
+	Capped      bool              `json:"capped"`
+	Examined    int               `json:"examined"`
+	Candidates  int               `json:"candidates"`
+}
+
+// expireResults ages the remembered evaluation past the one-minute reuse.
+func (e *collectionsEnv) expireResults(id catalog.QueryID) {
+	if r, ok := e.svc.results.get(id); ok {
+		e.svc.results.put(id, r.res, r.at.Add(-2*queryResultsFresh))
+	}
 }
 
 func (e *collectionsEnv) results(who string, id catalog.QueryID) resultsReply {
@@ -223,21 +235,87 @@ func TestQueriesResultsResolveLive(t *testing.T) {
 	if got := resultPaths(e.results("Ann", q.ID)); !reflect.DeepEqual(got, []string{"Clients/A/one.mov", "Clients/A/sub/four.mov", "Clients/A/two.mov", "Clients/B/three.mov"}) {
 		t.Fatalf("results: %v", got)
 	}
+	// Within a minute the results API answers from the last evaluation.
+	e.vol.set(func(f map[string]uint64) { delete(f, "Clients/B/three.mov") })
+	cached := e.results("Ann", q.ID)
+	if got := resultPaths(cached); len(got) != 4 || cached.AgeSeconds > 5 || cached.EvaluatedAt.IsZero() {
+		t.Fatalf("cached results: %+v", cached)
+	}
+	e.vol.set(func(f map[string]uint64) { f["Clients/B/three.mov"] = 44 })
 	e.vol.set(func(f map[string]uint64) {
 		f["Clients/C/sub/four.mov"] = f["Clients/A/sub/four.mov"]
 		delete(f, "Clients/A/sub/four.mov")
 		delete(f, "Clients/A/two.mov")
 	})
+	e.expireResults(q.ID)
 	r := e.results("Ann", q.ID)
 	if got := resultPaths(r); !reflect.DeepEqual(got, []string{"Clients/A/one.mov", "Clients/B/three.mov", "Clients/C/sub/four.mov"}) {
 		t.Fatalf("results after the move: %v", got)
 	}
 	e.vol.setFail(true)
+	e.expireResults(q.ID)
 	if r := e.results("Ann", q.ID); len(r.Results) != 0 || r.Unresolved != 4 {
 		t.Fatalf("results while the volume fails: %+v", r)
 	}
 	e.vol.setFail(false)
 	if rec := e.do("Ann", http.MethodGet, "/api/queries/qry_303132333435363738393a3b3c3d3e3f/results", nil); rec.Code != 404 {
 		t.Fatalf("results of a missing query: %d", rec.Code)
+	}
+}
+
+// At most queryMaxPerPerson queries per person (the admin is exempt) and
+// catalog.MaxQueries per library: 409 beyond. A folder in a smart root is
+// refused only while the Manager owns that root. Capped results say so.
+func TestQueriesLimitsRootsAndCaps(t *testing.T) {
+	e := newQueriesEnv(t)
+	for i := 0; i < queryMaxPerPerson; i++ {
+		e.queryWrite("Ann", "/api/queries", map[string]any{"name": fmt.Sprintf("q%d", i), "folders": []string{"Clients/A"}}, 200)
+	}
+	rec := e.do("Ann", http.MethodPost, "/api/queries", map[string]any{"name": "one more", "folders": []string{"Clients/A"}})
+	if rec.Code != 409 || !strings.Contains(rec.Body.String(), "32 saved queries") {
+		t.Fatalf("over the per-person limit: %d %s", rec.Code, rec.Body)
+	}
+	e.queryWrite("Al", "/api/queries", map[string]any{"name": "Al's", "folders": []string{"Clients"}}, 200)
+	first := e.queryWrite("admin", "/api/queries", map[string]any{"name": "admin", "folders": []string{"Clients"}}, 200).Query
+	// Fill the library to its limit, then even the admin gets 409.
+	library, _ := e.svc.store.LibraryID()
+	var changes []catalog.Change
+	for i := queryMaxPerPerson + 2; i < catalog.MaxQueries; i++ {
+		changes = append(changes, catalog.Change{CreateQuery: &catalog.CreateQuery{QueryID: qryID(1000 + i), Name: "x",
+			Definition: catalog.QueryDefinition{Prefixes: []string{"X"}, Limit: 1}}})
+	}
+	if _, err := e.svc.store.Apply(context.Background(), catalog.Operation{Version: catalog.OperationVersion, LibraryID: library,
+		ID: "fill", Actor: "admin", Changes: changes}); err != nil {
+		t.Fatal(err)
+	}
+	if rec := e.do("admin", http.MethodPost, "/api/queries", map[string]any{"name": "x", "folders": []string{"A"}}); rec.Code != 409 || !strings.Contains(rec.Body.String(), "at most 256") {
+		t.Fatalf("over the library limit: %d %s", rec.Code, rec.Body)
+	}
+	e.queryWrite("admin", "/api/queries/"+string(first.ID)+"/delete", map[string]any{}, 200)
+
+	// The refusal names the folder quoted; control characters are refused.
+	rec = e.do("Bob", http.MethodPost, "/api/queries", map[string]any{"name": "x", "folders": []string{"Clients/A"}})
+	if rec.Code != 403 || !strings.Contains(rec.Body.String(), `\"/Clients/A\"`) {
+		t.Fatalf("refusal text: %d %s", rec.Code, rec.Body)
+	}
+	if rec := e.do("admin", http.MethodPost, "/api/queries", map[string]any{"name": "x", "folders": []string{"A\tB"}}); rec.Code != 400 {
+		t.Fatalf("control character: %d %s", rec.Code, rec.Body)
+	}
+	// A user-made Recents (not the Manager's) is ordinary data.
+	e.h.roots = func() []string { return []string{"Collections"} }
+	e.queryWrite("admin", "/api/queries/"+string(first.ID)+"/rename", map[string]any{"name": "y"}, 404)
+	recents := e.queryWrite("admin", "/api/queries", map[string]any{"name": "user recents", "folders": []string{"Recents/A"}}, 200).Query
+	e.queryWrite("admin", "/api/queries/"+string(recents.ID)+"/delete", map[string]any{}, 200)
+	if rec := e.do("admin", http.MethodPost, "/api/queries", map[string]any{"name": "x", "folders": []string{"collections/A"}}); rec.Code != 400 {
+		t.Fatalf("the Manager's collections root: %d %s", rec.Code, rec.Body)
+	}
+
+	// Capped: more candidates than examined.
+	saved := queryCandidateCap
+	queryCandidateCap = 2
+	defer func() { queryCandidateCap = saved }()
+	capped := e.queryWrite("admin", "/api/queries", map[string]any{"name": "capped", "folders": []string{"Clients"}}, 200).Query
+	if r := e.results("Bob", capped.ID); !r.Capped || r.Examined != 2 || r.Candidates != 4 || len(r.Results) != 2 {
+		t.Fatalf("capped results: %+v", r)
 	}
 }

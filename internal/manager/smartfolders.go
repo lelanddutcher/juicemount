@@ -42,6 +42,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/lelanddutcher/juicemount/internal/continuity/catalog"
 	"github.com/lelanddutcher/juicemount/internal/redisurl"
 	"github.com/lelanddutcher/juicemount/internal/smartfolders"
 	"github.com/lelanddutcher/juicemount/internal/smartfolders/jfsmeta"
@@ -269,9 +270,10 @@ type smartFoldersService struct {
 
 	coll collectionViews // smartfolders_collections.go
 	qry  queryViews      // smartfolders_queries.go
-	// qscan is the query views' candidate scan, shared by every query
-	// rebuilt in one pass (reconcile goroutine only).
-	qscan *queryScan
+	// qstate is the query views' working state (reconcile goroutine only).
+	qstate queryState
+	// recentsOwned: the /Recents root is the Manager's (its last check).
+	recentsOwned atomic.Bool
 }
 
 type smartFoldersState struct {
@@ -311,6 +313,7 @@ func newSmartFoldersService(cfg smartFoldersConfig) (*smartFoldersService, error
 	}
 	s.coll.init(collectionKind())
 	s.qry.init(queryKind())
+	s.qstate = queryState{cands: map[catalog.QueryID]*queryCandidates{}, runs: map[catalog.QueryID]*queryRun{}}
 	tc := cfg.Tracker
 	tc.Root = cfg.Settings.Root
 	tc.MaxFolders = cfg.Settings.MaxViews
@@ -336,6 +339,7 @@ func newSmartFoldersService(cfg smartFoldersConfig) (*smartFoldersService, error
 		return nil, fmt.Errorf("reading smart-folder state: %w", err)
 	}
 	s.savedGen = tr.Generation()
+	s.recentsOwned.Store(s.own.Root != nil && !s.own.Root.Pending)
 	return s, nil
 }
 
@@ -603,6 +607,7 @@ func (s *smartFoldersService) recentsCycle(ctx context.Context, fsys smartfolder
 		rec.Exclude = append(rec.Exclude, s.cfg.Settings.QueriesRoot)
 	}
 	state, err := rec.CheckRoot()
+	s.recentsOwned.Store(s.own.Root != nil && !s.own.Root.Pending)
 	if err != nil {
 		s.logOnce("", fmt.Sprintf("checking /%s: %v", s.cfg.Settings.Root, err))
 		return
@@ -652,6 +657,23 @@ func (s *smartFoldersService) recentsCycle(ctx context.Context, fsys smartfolder
 			s.logOnce("save", "")
 		}
 	}
+}
+
+// ownedRoots lists the smart-folder roots the Manager owns now (any
+// goroutine): a query may not be defined inside one. A user-made folder of
+// such a name is left alone (decision 2), so it is not listed.
+func (s *smartFoldersService) ownedRoots() []string {
+	var out []string
+	if s.recentsOwned.Load() {
+		out = append(out, s.cfg.Settings.Root)
+	}
+	if r := s.cfg.Settings.CollectionsRoot; r != "" && s.coll.rootOwned.Load() {
+		out = append(out, r)
+	}
+	if r := s.cfg.Settings.QueriesRoot; r != "" && s.qry.rootOwned.Load() {
+		out = append(out, r)
+	}
+	return out
 }
 
 // gate checks out the view's project lease (the same gate trash restore

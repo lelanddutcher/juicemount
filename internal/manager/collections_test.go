@@ -567,11 +567,25 @@ func TestContinuityUpgradesSliceTwoCatalog(t *testing.T) {
 	}
 	defer store.Close()
 	library, _ := store.LibraryID()
-	if _, version, err := catalog.Inspect(context.Background(), path); err != nil || version != 4 {
+	// Upgraded to format 3 only: the Manager before saved queries still
+	// opens it until the first query is created.
+	if _, version, err := catalog.Inspect(context.Background(), path); err != nil || version != 3 || store.Format() != 3 {
 		t.Fatalf("after open: format %d, %v", version, err)
 	}
 	if events, err := store.Events(context.Background(), library, 0, 10); err != nil || len(events) != 3 {
 		t.Fatalf("history: %d %v", len(events), err)
+	}
+	// The first saved query adds the query table (format 4) in place.
+	h := newCollectionsAPI(&API{adminKey: collectionsAdminKey, continuity: &continuityService{store: store}}, "/manager", nil)
+	req := httptest.NewRequest(http.MethodPost, "/manager/api/queries", strings.NewReader(`{"name":"First","folders":["Projects"]}`))
+	req.Header.Set("X-JuiceMount-Admin-Key", collectionsAdminKey)
+	rec := httptest.NewRecorder()
+	h.serveQueries(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("first query: %d %s", rec.Code, rec.Body)
+	}
+	if _, version, err := catalog.Inspect(context.Background(), path); err != nil || version != 4 || store.Format() != 4 {
+		t.Fatalf("after the first query: format %d, %v", version, err)
 	}
 	if _, err := store.GetAsset(context.Background(), library, continuity.AssetID("asset_202122232425262728292a2b2c2d2e2f")); err != nil {
 		t.Fatal(err)

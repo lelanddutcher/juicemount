@@ -4,8 +4,9 @@ package manager
 // files the continuity catalog knows.
 //
 // A query is deterministic and unranked: the files under one of its
-// folders, optionally whose name contains a string (ignoring case), whose
-// extension is in a set, modified within a duration; newest first by
+// folders, optionally whose name contains a string (ignoring case; both
+// compared in Unicode NFC, so a name stored decomposed by macOS matches),
+// whose extension is in a set, modified within a duration; newest first by
 // modification time, then by path; at most its limit (default 200, at most
 // 500).
 //
@@ -23,13 +24,15 @@ package manager
 // query's folder is not seen until then. A file whose path cannot be read
 // is "unknown", never "gone".
 //
-// Bounds. The catalog scan reads every active hint once per pass (local
-// SQLite, no volume reads), shared by every query rebuilt in that pass.
-// Each query keeps at most queryMaxCandidates candidates: the most recently
-// recorded hints (a file bound or moved most recently), by catalog sequence;
-// the rest are counted (candidates_over_cap) and not examined. Each
-// examined candidate costs a few volume point reads (a stat and a lookup;
-// every name only when the hint moved), counted against the pass budget.
+// Bounds. Each query keeps at most queryMaxCandidates candidates: the most
+// recent by the hint's catalog sequence, which moves when a file is bound,
+// moved or saved in place (the binder's recency marker, coalesced to once
+// per 10 minutes per file); the rest are counted and the query reported as
+// capped (examined N of M). A catalog scan reads every active hint once
+// (local SQLite, no volume reads) for all the queries that need
+// candidates. Each examined candidate costs a few volume point reads (a
+// stat and a lookup; every name only when the hint moved), and a run
+// (queryRun) stops at its budget and resumes where it stopped.
 
 import (
 	"container/heap"
@@ -38,7 +41,10 @@ import (
 	"path"
 	"sort"
 	"strings"
+	"sync"
 	"time"
+
+	"golang.org/x/text/unicode/norm"
 
 	"github.com/lelanddutcher/juicemount/internal/continuity"
 	"github.com/lelanddutcher/juicemount/internal/continuity/binder"
@@ -50,7 +56,14 @@ const (
 	// queryMaxCandidates bounds the files one evaluation resolves on the
 	// volume: four times the largest limit.
 	queryMaxCandidates = 4 * catalog.MaxQueryLimit
+	// queryResultsFresh: the results API answers from an evaluation at
+	// most this old (or kept current by the views) instead of running the
+	// query again.
+	queryResultsFresh = time.Minute
 )
+
+// queryCandidateCap is queryMaxCandidates (a variable for tests).
+var queryCandidateCap = queryMaxCandidates
 
 // queryCandidates is one query's candidates from a catalog scan: at most
 // queryMaxCandidates hints, the most recently recorded kept.
@@ -115,11 +128,68 @@ type queryHit struct {
 
 // queryResult is one evaluation.
 type queryResult struct {
-	Hits    []queryHit           // stable order, at most the limit
-	Unknown []continuity.AssetID // candidates whose path could not be read
-	Over    int                  // matches beyond the limit
-	Capped  int                  // candidates left unexamined
-	Ops     int                  // candidates resolved on the volume
+	Hits     []queryHit           // stable order, at most the limit
+	Unknown  []continuity.AssetID // candidates whose path could not be read
+	Over     int                  // matches beyond the limit
+	Capped   int                  // candidates left unexamined
+	Examined int                  // candidates examined
+	Ops      int                  // candidates resolved on the volume
+}
+
+// queryRun is one evaluation in progress: its candidates, where it is, and
+// what it found so far. now is the time the run started (modified-within
+// is measured from it).
+type queryRun struct {
+	def     catalog.QueryDefinition
+	now     time.Time
+	cands   []binder.Hint
+	capped  int
+	next    int
+	hits    []queryHit
+	unknown []continuity.AssetID
+	seen    map[string]bool
+	stale   bool // a change arrived while it ran: run again when done
+}
+
+func newQueryRun(def catalog.QueryDefinition, cands *queryCandidates, now time.Time) *queryRun {
+	r := &queryRun{def: def, now: now, cands: cands.ordered(), seen: map[string]bool{}}
+	if cands != nil {
+		r.capped = cands.capped
+	}
+	return r
+}
+
+func (r *queryRun) done() bool { return r.next >= len(r.cands) }
+
+// hintOf returns the candidate of an asset (for a re-check).
+func (r *queryRun) hintOf(a continuity.AssetID) (binder.Hint, bool) {
+	for _, h := range r.cands {
+		if h.AssetID == a {
+			return h, true
+		}
+	}
+	return binder.Hint{}, false
+}
+
+// result sorts and cuts what the run found.
+func (r *queryRun) result(ops int) queryResult {
+	res := queryResult{Hits: append([]queryHit(nil), r.hits...), Unknown: r.unknown, Capped: r.capped, Examined: len(r.cands), Ops: ops}
+	sortHits(res.Hits)
+	if len(res.Hits) > r.def.Limit {
+		res.Over = len(res.Hits) - r.def.Limit
+		res.Hits = res.Hits[:r.def.Limit]
+	}
+	return res
+}
+
+func sortHits(hits []queryHit) {
+	sort.Slice(hits, func(i, j int) bool {
+		a, b := hits[i], hits[j]
+		if !a.Mtime.Equal(b.Mtime) {
+			return a.Mtime.After(b.Mtime)
+		}
+		return a.Path < b.Path
+	})
 }
 
 // inQueryFolders: p is under one of the query's folders and not under an
@@ -140,10 +210,10 @@ func inQueryFolders(def catalog.QueryDefinition, p string, exclude []string) boo
 }
 
 // queryNameMatches applies the name and extension filters to p's last
-// component.
+// component (NFC, lower case).
 func queryNameMatches(def catalog.QueryDefinition, p string) bool {
-	base := strings.ToLower(path.Base(p))
-	if def.NameContains != "" && !strings.Contains(base, strings.ToLower(def.NameContains)) {
+	base := strings.ToLower(norm.NFC.String(path.Base(p)))
+	if def.NameContains != "" && !strings.Contains(base, strings.ToLower(norm.NFC.String(def.NameContains))) {
 		return false
 	}
 	if len(def.Extensions) == 0 {
@@ -192,7 +262,7 @@ func (s *continuityService) scanQueries(ctx context.Context, defs map[catalog.Qu
 	err := s.binder.Hints(ctx, func(h binder.Hint) bool {
 		for id, def := range defs {
 			if inQueryFolders(def, h.Path, exclude) && queryNameMatches(def, h.Path) {
-				out[id].add(h, queryMaxCandidates)
+				out[id].add(h, queryCandidateCap)
 			}
 		}
 		return ctx.Err() == nil
@@ -203,55 +273,65 @@ func (s *continuityService) scanQueries(ctx context.Context, defs map[catalog.Qu
 	return out, err
 }
 
-// evaluateQuery resolves the candidates on the volume and applies the
-// filters to the live paths. binder.ErrNotReady while the volume is not
-// connected; a failed read of one file only makes that file unknown.
-func (s *continuityService) evaluateQuery(ctx context.Context, def catalog.QueryDefinition, cands *queryCandidates, exclude []string, now time.Time) (queryResult, error) {
-	var res queryResult
-	if cands != nil {
-		res.Capped = cands.capped
+// locateHit resolves one candidate on the volume and applies the filters
+// to its live path: the hit, or ok=false (gone, or no longer matching).
+// binder.ErrUnresolved for an unreadable file.
+func (s *continuityService) locateHit(ctx context.Context, def catalog.QueryDefinition, h binder.Hint, exclude []string, now time.Time) (queryHit, bool, error) {
+	p, mtime, err := s.binder.Locate(ctx, h.Ino, h.Path)
+	if err != nil || p == "" {
+		return queryHit{}, false, err
 	}
 	within := time.Duration(def.ModifiedWithinSeconds) * time.Second
-	seen := map[string]bool{}
-	for _, h := range cands.ordered() {
-		if err := ctx.Err(); err != nil {
-			return res, err
+	if !inQueryFolders(def, p, exclude) || !queryNameMatches(def, p) || (within > 0 && now.Sub(mtime) > within) {
+		return queryHit{}, false, nil
+	}
+	return queryHit{AssetID: h.AssetID, Path: p, Mtime: mtime}, true, nil
+}
+
+// advanceQuery resolves the run's next candidates, at most maxOps of them
+// (0: no bound) and not past until (zero: no bound). It returns how many
+// it resolved. binder.ErrNotReady while the volume is not connected; a
+// failed read of one file only makes that file unknown.
+func (s *continuityService) advanceQuery(ctx context.Context, r *queryRun, exclude []string, maxOps int, until time.Time) (int, error) {
+	ops := 0
+	for !r.done() {
+		if maxOps > 0 && ops >= maxOps || !until.IsZero() && !time.Now().Before(until) {
+			return ops, nil
 		}
-		res.Ops++
-		p, mtime, err := s.binder.Locate(ctx, h.Ino, h.Path)
+		if err := ctx.Err(); err != nil {
+			return ops, err
+		}
+		h := r.cands[r.next]
+		ops++
+		hit, ok, err := s.locateHit(ctx, r.def, h, exclude, r.now)
 		switch {
 		case errors.Is(err, binder.ErrNotReady):
-			return res, err
+			return ops, err
 		case errors.Is(err, binder.ErrUnresolved):
-			res.Unknown = append(res.Unknown, h.AssetID)
-			continue
+			r.unknown = append(r.unknown, h.AssetID)
 		case err != nil:
-			return res, err
-		case p == "" || seen[p]:
-			continue
+			return ops, err
+		case ok && !r.seen[hit.Path]:
+			r.seen[hit.Path] = true
+			r.hits = append(r.hits, hit)
 		}
-		if !inQueryFolders(def, p, exclude) || !queryNameMatches(def, p) || (within > 0 && now.Sub(mtime) > within) {
-			continue
-		}
-		seen[p] = true
-		res.Hits = append(res.Hits, queryHit{AssetID: h.AssetID, Path: p, Mtime: mtime})
+		r.next++
 	}
-	sort.Slice(res.Hits, func(i, j int) bool {
-		a, b := res.Hits[i], res.Hits[j]
-		if !a.Mtime.Equal(b.Mtime) {
-			return a.Mtime.After(b.Mtime)
-		}
-		return a.Path < b.Path
-	})
-	if len(res.Hits) > def.Limit {
-		res.Over = len(res.Hits) - def.Limit
-		res.Hits = res.Hits[:def.Limit]
+	return ops, nil
+}
+
+// evaluateQuery runs a query to the end over its candidates.
+func (s *continuityService) evaluateQuery(ctx context.Context, def catalog.QueryDefinition, cands *queryCandidates, exclude []string, now time.Time) (queryResult, error) {
+	r := newQueryRun(def, cands, now)
+	ops, err := s.advanceQuery(ctx, r, exclude, 0, time.Time{})
+	if err != nil {
+		return queryResult{Ops: ops}, err
 	}
-	return res, nil
+	return r.result(ops), nil
 }
 
 // runQuery evaluates one query on its own: a catalog scan for it alone,
-// then evaluateQuery (the results API).
+// then evaluateQuery (the results API, when no recent evaluation exists).
 func (s *continuityService) runQuery(ctx context.Context, id catalog.QueryID, def catalog.QueryDefinition, exclude []string, now time.Time) (queryResult, error) {
 	cands, err := s.scanQueries(ctx, map[catalog.QueryID]catalog.QueryDefinition{id: def}, exclude)
 	if err != nil {
@@ -259,3 +339,50 @@ func (s *continuityService) runQuery(ctx context.Context, id catalog.QueryID, de
 	}
 	return s.evaluateQuery(ctx, def, cands[id], exclude, now)
 }
+
+// queryResultCache holds each query's last complete evaluation (from the
+// views or the results API).
+type queryResultCache struct {
+	mu sync.Mutex
+	m  map[catalog.QueryID]cachedQueryResult
+}
+
+type cachedQueryResult struct {
+	res queryResult
+	at  time.Time
+}
+
+func (c *queryResultCache) put(id catalog.QueryID, res queryResult, at time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.m == nil {
+		c.m = map[catalog.QueryID]cachedQueryResult{}
+	}
+	c.m[id] = cachedQueryResult{res, at}
+}
+
+func (c *queryResultCache) get(id catalog.QueryID) (cachedQueryResult, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	r, ok := c.m[id]
+	return r, ok
+}
+
+// keep drops the entries of queries not in active.
+func (c *queryResultCache) keep(active map[catalog.QueryID]bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for id := range c.m {
+		if !active[id] {
+			delete(c.m, id)
+		}
+	}
+}
+
+// rememberQuery stores a complete evaluation for the results API.
+func (s *continuityService) rememberQuery(id catalog.QueryID, res queryResult, at time.Time) {
+	s.results.put(id, res, at)
+}
+
+// forgetQueries drops the remembered results of queries no longer active.
+func (s *continuityService) forgetQueries(active map[catalog.QueryID]bool) { s.results.keep(active) }

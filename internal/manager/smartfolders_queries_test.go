@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
+	"sort"
 	"testing"
 	"time"
 
@@ -180,6 +182,17 @@ func TestQueryViewsFollowQueries(t *testing.T) {
 	if !dirty {
 		t.Fatal("a bound file did not mark the query dirty")
 	}
+	// Changes under its folders rebuild a view at most once a minute: the
+	// view stays dirty until then.
+	e.qpass()
+	e.wantQueries(map[string]string{"Movs/a.mov": "Proj/A/a.mov", "Movs/b.mov": "Proj/A/b.mov"})
+	e.svc.qry.mu.Lock()
+	dirty = e.svc.qry.dirty[qryID(1)]
+	e.svc.qry.mu.Unlock()
+	if !dirty {
+		t.Fatal("a deferred view is no longer dirty")
+	}
+	e.clk.add(queryViewsMinInterval)
 	e.qpass()
 	e.wantQueries(map[string]string{"Movs/a.mov": "Proj/A/a.mov", "Movs/b.mov": "Proj/A/b.mov", "Movs/d.mov": "Proj/A/d.mov"})
 
@@ -189,6 +202,7 @@ func TestQueryViewsFollowQueries(t *testing.T) {
 	ev := smartfolders.Event{Op: "rename", Path: "Proj/Z", OldPath: "Proj/A", IsDir: true}
 	e.cont.binder.Offer(binder.Event{Op: ev.Op, Path: ev.Path, OldPath: ev.OldPath, IsDir: true})
 	e.svc.noteQueryEvent(ev)
+	e.clk.add(queryViewsMinInterval)
 	e.qpass()
 	e.wantQueries(map[string]string{"Movs/a.mov": "Proj/Z/a.mov", "Movs/b.mov": "Proj/Z/b.mov", "Movs/d.mov": "Proj/Z/d.mov"})
 
@@ -294,5 +308,138 @@ func TestQueryViewsOffCreatesNothing(t *testing.T) {
 	e.svc.cfg.Settings.QueriesRoot = ""
 	if e.svc.attachQueries(e.cont) || e.svc.qry.source() != nil {
 		t.Fatal("attached with no usable root")
+	}
+}
+
+// countingQuerySource records the catalog scans, the single-file re-checks
+// and can act once a run finishes (before its view is linked).
+type countingQuerySource struct {
+	*continuityService
+	scans    [][]catalog.QueryID
+	locates  int
+	ops      []int
+	finished func()
+}
+
+func (c *countingQuerySource) scanQueries(ctx context.Context, defs map[catalog.QueryID]catalog.QueryDefinition, exclude []string) (map[catalog.QueryID]*queryCandidates, error) {
+	var ids []catalog.QueryID
+	for id := range defs {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	c.scans = append(c.scans, ids)
+	return c.continuityService.scanQueries(ctx, defs, exclude)
+}
+
+func (c *countingQuerySource) advanceQuery(ctx context.Context, r *queryRun, exclude []string, maxOps int, until time.Time) (int, error) {
+	n, err := c.continuityService.advanceQuery(ctx, r, exclude, maxOps, until)
+	c.ops = append(c.ops, n)
+	if err == nil && r.done() && c.finished != nil {
+		c.finished()
+		c.finished = nil
+	}
+	return n, err
+}
+
+func (c *countingQuerySource) locateHit(ctx context.Context, def catalog.QueryDefinition, h binder.Hint, exclude []string, now time.Time) (queryHit, bool, error) {
+	c.locates++
+	return c.continuityService.locateHit(ctx, def, h, exclude, now)
+}
+
+// A rebuild stops at the pass budget and resumes where it stopped; one
+// catalog scan serves the pass's jobs and is reused until a change under a
+// query's folders (that query only) or the next sweep; a file gone between
+// the run and its link is looked up again alone; capped queries are named.
+func TestQueryViewsBudgetScansAndCaps(t *testing.T) {
+	files := []string{"P/1.mov", "P/2.mov", "P/3.mov", "P/4.mov", "P/5.mov", "P/6.mov", "O/x.mov"}
+	e := newCollViewsEnv(t, files...)
+	e.svc.qry.debounce = time.Hour
+	e.svc.qry.passOps = 4
+	e.attach()
+	cs := &countingQuerySource{continuityService: e.cont}
+	e.svc.qry.src.Store(&sourceRef[querySource]{cs})
+	e.createQuery(qryID(1), "P", catalog.QueryDefinition{Prefixes: []string{"P"}})
+	e.createQuery(qryID(2), "O", catalog.QueryDefinition{Prefixes: []string{"O"}})
+	both := []catalog.QueryID{qryID(1), qryID(2)}
+
+	e.qpass()
+	e.wantQueries(map[string]string{}) // P stopped at the budget; O waits
+	if !reflect.DeepEqual(cs.scans, [][]catalog.QueryID{both}) || !reflect.DeepEqual(cs.ops, []int{4}) {
+		t.Fatalf("first pass: scans %v, ops %v", cs.scans, cs.ops)
+	}
+	e.qpass()
+	all := map[string]string{"O/x.mov": "O/x.mov"}
+	for _, f := range files[:6] {
+		all["P/"+f[2:]] = f
+	}
+	e.wantQueries(all)
+	// O first (the pass resumes after the job it stopped at), then P's rest.
+	if len(cs.scans) != 1 || !reflect.DeepEqual(cs.ops, []int{4, 1, 2}) {
+		t.Fatalf("second pass: scans %v, ops %v", cs.scans, cs.ops)
+	}
+
+	// A change under P: P alone is scanned again (after the minimum
+	// interval). A file found gone when linking is looked up alone.
+	e.svc.noteQueryEvent(smartfolders.Event{Op: "create", Path: "P/7.mov"})
+	cs.finished = func() { e.move("P/1.mov", "P/sub/1.mov") }
+	e.clk.add(queryViewsMinInterval)
+	e.qpass()
+	e.qpass()
+	all["P/1.mov"] = "P/sub/1.mov"
+	e.wantQueries(all)
+	if !reflect.DeepEqual(cs.scans[1:], [][]catalog.QueryID{{qryID(1)}}) || cs.locates != 1 {
+		t.Fatalf("after a change: scans %v, single re-checks %d", cs.scans, cs.locates)
+	}
+
+	// A sweep scans every query again; with a cap of 3 candidates, P is
+	// named as capped (3 of 6 examined) and keeps the 3 most recent.
+	saved := queryCandidateCap
+	queryCandidateCap = 3
+	defer func() { queryCandidateCap = saved }()
+	e.clk.add(collectionViewsSweep)
+	for i := 0; i < 3; i++ {
+		e.qpass()
+	}
+	if !reflect.DeepEqual(cs.scans[2], both) {
+		t.Fatalf("sweep scans: %v", cs.scans)
+	}
+	st := e.svc.queryStats()
+	if len(st.CappedQueries) != 1 || st.CappedQueries[0] != (cappedView{ID: string(qryID(1)), Examined: 3, Candidates: 6}) {
+		t.Fatalf("capped = %+v", st.CappedQueries)
+	}
+}
+
+// The candidates kept under the cap are the most recently changed: a file
+// saved in place (an update event) moves ahead of newer, untouched ones.
+func TestQueryCapKeepsRecentlySaved(t *testing.T) {
+	e := newCollViewsEnv(t, "P/old.mov", "P/a.mov", "P/b.mov")
+	saved := queryCandidateCap
+	queryCandidateCap = 2
+	defer func() { queryCandidateCap = saved }()
+	def := catalog.QueryDefinition{Prefixes: []string{"P"}}
+	if got := hitPaths(e.run(def, time.Now())); len(got) != 2 || slices.Contains(got, "P/old.mov") {
+		t.Fatalf("before the save: %v", got)
+	}
+	e.touch("P/old.mov", time.Now())
+	before := e.cont.binder.Stats().Handled
+	e.cont.binder.Offer(binder.Event{Op: "update", Path: "P/old.mov", Inode: e.ino("P/old.mov")})
+	for deadline := time.Now().Add(10 * time.Second); e.cont.binder.Stats().Handled <= before; time.Sleep(5 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("update not handled")
+		}
+	}
+	res := e.run(def, time.Now())
+	if got := hitPaths(res); len(got) != 2 || got[0] != "P/old.mov" || res.Capped != 1 || res.Examined != 2 {
+		t.Fatalf("after the save: %v (capped %d, examined %d)", got, res.Capped, res.Examined)
+	}
+}
+
+// A name stored decomposed (as macOS writes it) matches a composed
+// fragment, and the reverse.
+func TestQueryNameMatchesUnicodeForms(t *testing.T) {
+	nfd, nfc := "Café take.mov", "café"
+	if !queryNameMatches(catalog.QueryDefinition{NameContains: nfc}, "P/"+nfd) ||
+		!queryNameMatches(catalog.QueryDefinition{NameContains: "Café"}, "P/café.mov") {
+		t.Fatal("normalization forms do not match")
 	}
 }

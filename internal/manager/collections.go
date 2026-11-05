@@ -238,6 +238,7 @@ type collectionsAPI struct {
 	ipLimit   *ipLimiter      // per source address, before the token is checked
 	macLimit  *ipLimiter      // per Mac principal, after
 	refusals  *refusalLog
+	roots     func() []string // the smart-folder roots the Manager owns (queries.go)
 }
 
 // registerCollections wires /api/collections and /api/queries (queries.go,
@@ -261,6 +262,7 @@ func newCollectionsAPI(a *API, prefix string, people *PrincipalStore) *collectio
 		macLimit: &ipLimiter{rate: collectionMacPerMinute / 60.0, burst: collectionMacBurst,
 			buckets: map[string]*ipBucket{}, now: time.Now},
 		refusals: &refusalLog{every: collectionRefusalLogEvery, last: map[string]time.Time{}, held: map[string]int{}},
+		roots:    a.ownedSmartRoots,
 	}
 }
 
@@ -396,6 +398,8 @@ func collectionFailure(err error) *httpError {
 		return &httpError{http.StatusNotFound, "no such collection or asset"}
 	case errors.Is(err, catalog.ErrChangedRequest):
 		return &httpError{http.StatusConflict, "operation_id was already used for a different request"}
+	case errors.Is(err, catalog.ErrQueryLimit):
+		return &httpError{http.StatusConflict, fmt.Sprintf("a library holds at most %d saved queries; delete one first", catalog.MaxQueries)}
 	case errors.Is(err, catalog.ErrCollectionFull):
 		return &httpError{http.StatusConflict, fmt.Sprintf("a collection holds at most %d members", catalog.MaxCollectionMembers)}
 	case errors.Is(err, catalog.ErrConflict):

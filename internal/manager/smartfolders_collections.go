@@ -195,17 +195,38 @@ type CollectionViewStats struct {
 
 // collSeen is a collection (or query) as last reconciled.
 type collSeen struct {
-	seq     int64
-	folder  string
-	hasView bool
-	targets []string                      // linked paths (for the event index)
-	assets  map[continuity.AssetID]string // member -> linked path
-	unknown []continuity.AssetID          // members whose path could not be resolved
-	links   int
-	missing int
-	over    int
-	refused int
-	capped  int // queries: candidates left unexamined (queryMaxCandidates)
+	seq      int64
+	folder   string
+	hasView  bool
+	targets  []string                      // linked paths (for the event index)
+	assets   map[continuity.AssetID]string // member -> linked path
+	unknown  []continuity.AssetID          // members whose path could not be resolved
+	links    int
+	missing  int
+	over     int
+	refused  int
+	capped   int       // queries: candidates left unexamined (queryMaxCandidates)
+	examined int       // queries: candidates examined
+	built    time.Time // when this view was last built (Now)
+}
+
+// viewBudget is what is left of a pass's budget for one view: volume
+// resolutions and time. A kind that can stop part way (queries) stops when
+// it is spent and returns errViewPartial; collections finish their view.
+type viewBudget struct {
+	ops   int
+	until time.Time
+}
+
+// errViewPartial: the view's rebuild stopped at the budget and resumes in
+// the next pass; nothing is wrong.
+var errViewPartial = errors.New("view rebuild continues in the next pass")
+
+// cappedView names a query whose candidates were capped.
+type cappedView struct {
+	ID         string `json:"id"`
+	Examined   int    `json:"examined"`
+	Candidates int    `json:"candidates"`
 }
 
 // viewItem is one catalog object that wants a view: a collection, or a
@@ -226,15 +247,23 @@ type viewKind[K ~string, S any] struct {
 	noun, plural string        // "collection", "collections": messages and log keys
 	rootVar      string        // the variable that moves the root
 	debounce     time.Duration // from a change to its pass
-	root         func(s *smartFoldersService) string
-	off          func(s *smartFoldersService) string // why the root is unusable
+	// minInterval: a view dirty only from events (its object unchanged) is
+	// rebuilt at most this often (0: no minimum).
+	minInterval time.Duration
+	root        func(s *smartFoldersService) string
+	off         func(s *smartFoldersService) string // why the root is unusable
 	// exclude: the other smart roots, whose files no view of this kind links.
 	exclude func(s *smartFoldersService) []string
 	list    func(ctx context.Context, src S) ([]viewItem[K], error)
-	// begin runs at the start of each pass (queries: drop the last pass's
-	// candidate scan).
-	begin func(s *smartFoldersService)
-	build func(s *smartFoldersService, ctx context.Context, rec *smartfolders.Reconciler, src S, item viewItem[K], folder string, prior *collSeen, now time.Time) (*collSeen, int, error)
+	// prepare, when set, runs once a pass before its jobs, with every
+	// object that has a view, the jobs (some of which the budget may leave
+	// for later), the views marked dirty and whether a sweep started
+	// (queries: one candidate scan).
+	prepare func(s *smartFoldersService, ctx context.Context, src S, all, jobs []viewItem[K], dirty map[K]bool, sweep bool)
+	// busy, when set, reports a rebuild in progress (resumed whatever the
+	// minimum interval).
+	busy  func(s *smartFoldersService, id K) bool
+	build func(s *smartFoldersService, ctx context.Context, rec *smartfolders.Reconciler, src S, item viewItem[K], folder string, prior *collSeen, now time.Time, budget viewBudget) (*collSeen, int, error)
 }
 
 // catalogViews keeps one kind of catalog views in its own root.
@@ -267,13 +296,15 @@ type catalogViews[K ~string, S any] struct {
 	// Event-path state.
 	mu      sync.Mutex
 	dirty   map[K]bool
+	requeue map[K]bool     // jobs a pass left for the next (budget, backoff), not changed
 	files   map[string][]K // linked path -> views
 	dirs    map[string][]K // folder above a linked path -> views
 	watch   map[K][]string // queries: folders any change in marks the view dirty
 	pending bool           // a debounced pass is scheduled
 
-	stats  atomic.Pointer[CollectionViewStats]
-	capped atomic.Int64 // queries: candidates left unexamined in the last pass
+	stats    atomic.Pointer[CollectionViewStats]
+	capped   atomic.Pointer[[]cappedView] // queries whose candidates were capped
+	deferred bool                         // a wake for a deferred view is scheduled (under mu)
 }
 
 type sourceRef[S any] struct{ src S }
@@ -301,6 +332,7 @@ func (c *catalogViews[K, S]) init(kind viewKind[K, S]) {
 	c.backoff = map[string]*folderBackoff{}
 	c.left = map[string]string{}
 	c.dirty = map[K]bool{}
+	c.requeue = map[K]bool{}
 	c.files = map[string][]K{}
 	c.dirs = map[string][]K{}
 	c.watch = map[K][]string{}
@@ -382,6 +414,26 @@ func (s *smartFoldersService) collectionsChanged() { s.coll.schedule() }
 // scheduleCollections runs a collections-only pass after the debounce.
 func (s *smartFoldersService) scheduleCollections() { s.coll.schedule() }
 
+// scheduleAt runs a pass of this kind after d (a view deferred by the
+// minimum interval); one such wake is pending at a time. It never blocks.
+func (c *catalogViews[K, S]) scheduleAt(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.deferred {
+		return
+	}
+	c.deferred = true
+	time.AfterFunc(max(d, c.debounce), func() {
+		c.mu.Lock()
+		c.deferred = false
+		c.mu.Unlock()
+		select {
+		case c.wake <- struct{}{}:
+		default:
+		}
+	})
+}
+
 // schedule runs a pass of this kind alone after the debounce; calls in
 // between coalesce. It never blocks.
 func (c *catalogViews[K, S]) schedule() {
@@ -448,12 +500,19 @@ func underFolder(p, folder string) bool {
 	return p == folder || strings.HasPrefix(p, folder+"/")
 }
 
-func (c *catalogViews[K, S]) takeDirty() map[K]bool {
+func (c *catalogViews[K, S]) takeDirty() (dirty, requeue map[K]bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	d := c.dirty
-	c.dirty = map[K]bool{}
-	return d
+	dirty, requeue = c.dirty, c.requeue
+	c.dirty, c.requeue = map[K]bool{}, map[K]bool{}
+	return dirty, requeue
+}
+
+// markRequeue leaves a job for the next pass without marking it changed.
+func (c *catalogViews[K, S]) markRequeue(id K) {
+	c.mu.Lock()
+	c.requeue[id] = true
+	c.mu.Unlock()
 }
 
 func (c *catalogViews[K, S]) markDirty(id K) {
@@ -541,11 +600,8 @@ func (c *catalogViews[K, S]) cycle(s *smartFoldersService, ctx context.Context, 
 	root := c.kind.root(s)
 	logKey := c.kind.plural
 	st := &CollectionViewStats{Root: root, MaxViews: c.maxViews, MaxLinksPerView: c.maxLinks, LastPass: now}
-	capped := 0
-	defer func() { c.stats.Store(st); c.capped.Store(int64(capped)) }()
-	if c.kind.begin != nil {
-		c.kind.begin(s)
-	}
+	capped := []cappedView{}
+	defer func() { c.stats.Store(st); c.capped.Store(&capped) }()
 	// Wanted views are bounded by the collection cutoff below; all recorded
 	// views, left-behind ones included, by twice that.
 	rec := &smartfolders.Reconciler{
@@ -648,13 +704,15 @@ func (c *catalogViews[K, S]) cycle(s *smartFoldersService, ctx context.Context, 
 		}
 	}
 
+	sweeping := false
 	if !now.Before(c.sweepAt) {
+		sweeping = true
 		c.sweepAt = now.Add(c.sweep)
 		for _, col := range cols {
 			c.sweepPending[col.ID] = true
 		}
 	}
-	dirty := c.takeDirty()
+	dirty, requeue := c.takeDirty()
 	failed := func(folder string, err error) {
 		if errors.Is(err, errMembersUnresolved) {
 			st.Problems = append(st.Problems, err.Error())
@@ -724,10 +782,11 @@ func (c *catalogViews[K, S]) cycle(s *smartFoldersService, ctx context.Context, 
 		sweep bool
 	}
 	var urgent, swept []job
+	var deferTo time.Time
 	for _, col := range cols {
 		folder := names[string(col.ID)]
 		prior := c.seen[col.ID]
-		need := dirty[col.ID] || prior == nil || prior.seq != col.UpdatedSequence ||
+		changed := prior == nil || prior.seq != col.UpdatedSequence ||
 			prior.folder != folder || (prior.hasView && c.own.Views[folder] == nil)
 		if _, ok := c.left[folder]; ok {
 			// A view left behind is wanted again: its removal backoff
@@ -735,7 +794,20 @@ func (c *catalogViews[K, S]) cycle(s *smartFoldersService, ctx context.Context, 
 			delete(c.left, folder)
 			delete(c.backoff, folder)
 			delete(c.parked, folder)
-			need = true
+			changed = true
+		}
+		need := changed || dirty[col.ID] || requeue[col.ID]
+		// Only events: at most once per minInterval, unless a rebuild is
+		// under way or was left for this pass. The view stays dirty and a
+		// pass is due at the end of the interval.
+		if need && !changed && !requeue[col.ID] && c.kind.minInterval > 0 && (c.kind.busy == nil || !c.kind.busy(s, col.ID)) {
+			if next := prior.built.Add(c.kind.minInterval); now.Before(next) {
+				c.markDirty(col.ID)
+				if deferTo.IsZero() || next.Before(deferTo) {
+					deferTo = next
+				}
+				continue
+			}
 		}
 		switch {
 		case need:
@@ -765,26 +837,40 @@ func (c *catalogViews[K, S]) cycle(s *smartFoldersService, ctx context.Context, 
 		}
 		return append(after, before...)
 	}
+	jobs := append(rotate(urgent), rotate(swept)...)
+	if c.kind.prepare != nil {
+		items := make([]viewItem[K], len(jobs))
+		for i, j := range jobs {
+			items[i] = j.col
+		}
+		c.kind.prepare(s, ctx, src, cols, items, dirty, sweeping)
+	}
 	ops, more := 0, false
-	for _, j := range append(rotate(urgent), rotate(swept)...) {
+	for _, j := range jobs {
 		col := j.col
 		folder := names[string(col.ID)]
 		if ops >= c.passOps || time.Since(started) >= c.passTime {
 			more = true
 			if !j.sweep {
-				c.markDirty(col.ID)
+				c.markRequeue(col.ID)
 			}
 			continue
 		}
 		if waiting(folder) {
-			c.markDirty(col.ID)
+			c.markRequeue(col.ID)
 			continue
 		}
 		delete(c.sweepPending, col.ID)
 		c.cursor = col.ID
 		prior := c.seen[col.ID]
-		seen, n, err := c.kind.build(s, ctx, rec, src, col, folder, prior, now)
+		seen, n, err := c.kind.build(s, ctx, rec, src, col, folder, prior, now,
+			viewBudget{ops: c.passOps - ops, until: started.Add(c.passTime)})
 		ops += n
+		if errors.Is(err, errViewPartial) {
+			more = true
+			c.markRequeue(col.ID)
+			continue
+		}
 		if errors.Is(err, smartfolders.ErrTooManyViews) {
 			st.ViewsAtCap++
 		}
@@ -799,8 +885,12 @@ func (c *catalogViews[K, S]) cycle(s *smartFoldersService, ctx context.Context, 
 		if prior != nil {
 			old = prior.targets
 		}
+		seen.built = now
 		c.index(col.ID, old, seen.targets)
 		c.seen[col.ID] = seen
+	}
+	if !deferTo.IsZero() {
+		c.scheduleAt(deferTo.Sub(now))
 	}
 
 	// 3. Forget collections that are gone or over the limit.
@@ -820,9 +910,12 @@ func (c *catalogViews[K, S]) cycle(s *smartFoldersService, ctx context.Context, 
 			delete(c.sweepPending, id)
 		}
 	}
-	for _, seen := range c.seen {
-		capped += seen.capped
+	for id, seen := range c.seen {
+		if seen.capped > 0 {
+			capped = append(capped, cappedView{ID: string(id), Examined: seen.examined, Candidates: seen.examined + seen.capped})
+		}
 	}
+	sort.Slice(capped, func(i, j int) bool { return capped[i].ID < capped[j].ID })
 	for a := range c.memberBackoff {
 		if !unknown[a] {
 			delete(c.memberBackoff, a)
@@ -883,7 +976,7 @@ func (c *catalogViews[K, S]) cycle(s *smartFoldersService, ctx context.Context, 
 	sort.Strings(st.ViewsLeft)
 	st.LostOverflow = c.own.LostOverflow
 	c.mu.Lock()
-	st.Deferred = len(c.sweepPending) + len(c.dirty)
+	st.Deferred = len(c.sweepPending) + len(c.dirty) + len(c.requeue)
 	c.mu.Unlock()
 }
 
@@ -944,7 +1037,7 @@ func (s *smartFoldersService) backoffDelay(n int) time.Duration {
 // backoff passes, so one unresolvable member never holds up the view.
 // Only when the volume is not connected at all is the view left as it is.
 // A member found gone at the last moment is resolved once more.
-func (s *smartFoldersService) reconcileCollection(ctx context.Context, rec *smartfolders.Reconciler, src collectionSource, col viewItem[catalog.CollectionID], folder string, prior *collSeen, now time.Time) (*collSeen, int, error) {
+func (s *smartFoldersService) reconcileCollection(ctx context.Context, rec *smartfolders.Reconciler, src collectionSource, col viewItem[catalog.CollectionID], folder string, prior *collSeen, now time.Time, _ viewBudget) (*collSeen, int, error) {
 	c := &s.coll
 	members, err := src.collectionMembers(ctx, col.ID)
 	if err != nil {

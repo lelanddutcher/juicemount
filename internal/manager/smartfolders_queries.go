@@ -22,13 +22,20 @@ package manager
 // What differs. A view holds the query's results (at most its limit), not
 // members: the files are found again at every rebuild. A file whose path
 // cannot be read keeps the link it had, if any (unknown is not gone). A
-// view is rebuilt when its query is renamed, when a change event names a
-// path at, above or below one of its folders, when the binder records a
-// change to a file's hint there (a file bound, moved or gone), after a
-// query change through the API, and every ten minutes (files age out of a
-// modified-within window without any event). Events are debounced
-// (queryViewsDebounce). The candidate scan is shared by all the queries a
-// pass rebuilds.
+// view is rebuilt when its query is created or renamed, when a change event
+// names a path at, above or below one of its folders or the binder records
+// a change to a file's hint there (bound, moved, gone, saved in place),
+// and every ten minutes (files age out of a modified-within window without
+// any event). File changes are debounced (queryViewsDebounce) and rebuild
+// a view at most once a minute (queryViewsMinInterval), so an ingest does
+// not run passes back to back.
+//
+// Pacing. A rebuild (a queryRun) resolves candidates within what is left
+// of the pass budget and resumes in the next pass where it stopped; the
+// view changes only once the run is complete. One catalog scan per pass
+// serves the queries that need candidates; a query's candidates are kept
+// until a change under its folders or the next sweep. A file found gone
+// while linking is looked up again on its own.
 
 import (
 	"context"
@@ -45,13 +52,19 @@ import (
 const (
 	smartFoldersQueriesRoot = "Queries"
 	queryViewsDebounce      = 5 * time.Second
+	// queryViewsMinInterval: a view dirty only from file events is rebuilt
+	// at most this often, so an ingest does not run passes back to back.
+	queryViewsMinInterval = time.Minute
 )
 
 // querySource is what the query views read (continuityService).
 type querySource interface {
-	activeQueries(ctx context.Context) ([]catalog.Query, error)
 	scanQueries(ctx context.Context, defs map[catalog.QueryID]catalog.QueryDefinition, exclude []string) (map[catalog.QueryID]*queryCandidates, error)
-	evaluateQuery(ctx context.Context, def catalog.QueryDefinition, cands *queryCandidates, exclude []string, now time.Time) (queryResult, error)
+	advanceQuery(ctx context.Context, r *queryRun, exclude []string, maxOps int, until time.Time) (int, error)
+	locateHit(ctx context.Context, def catalog.QueryDefinition, h binder.Hint, exclude []string, now time.Time) (queryHit, bool, error)
+	activeQueries(ctx context.Context) ([]catalog.Query, error)
+	rememberQuery(id catalog.QueryID, res queryResult, at time.Time)
+	forgetQueries(active map[catalog.QueryID]bool)
 }
 
 type (
@@ -59,44 +72,54 @@ type (
 	queryViewsState = catalogViewsState[catalog.QueryID]
 )
 
-// queryScan is one pass's catalog scan for every active query.
-type queryScan struct {
-	cands map[catalog.QueryID]*queryCandidates
-	err   error
+// queryState is the query views' working state (reconcile goroutine only):
+// each query's candidates from the last catalog scan, kept until a change
+// under its folders or the next sweep; the runs under way; and this
+// pass's scan error.
+type queryState struct {
+	cands   map[catalog.QueryID]*queryCandidates
+	runs    map[catalog.QueryID]*queryRun
+	scanErr error
 }
 
 // QueryViewStats is what the query views did in their last pass.
 type QueryViewStats struct {
-	Root              string    `json:"root"`
-	MaxViews          int       `json:"max_views"`
-	MaxLinksPerView   int       `json:"max_links_per_view"`
-	Queries           int       `json:"queries"`
-	Views             int       `json:"views"`
-	Links             int       `json:"links"`
-	OverflowQueries   int       `json:"overflow_queries"`    // beyond MaxViews: no view
-	OverLimit         int       `json:"results_over_limit"`  // matches beyond a query's limit
-	CandidatesOverCap int       `json:"candidates_over_cap"` // not examined (queryMaxCandidates)
-	GoneResults       int       `json:"gone_results"`        // found gone while linking
-	RefusedLinks      int       `json:"refused_links"`
-	UnresolvedResults int       `json:"unresolved_results"` // path unreadable: link kept as it was, or none
-	Deferred          int       `json:"deferred_queries"`
-	MaxRecorded       int       `json:"max_recorded_views"`
-	ViewsAtCap        int       `json:"views_waiting_at_cap"`
-	ViewsParked       int       `json:"views_parked"`
-	LostOverflow      int       `json:"lost_overflow,omitempty"`
-	ViewsLeft         []string  `json:"views_left,omitempty"`
-	RootForeign       bool      `json:"root_not_created_by_manager,omitempty"`
-	Problems          []string  `json:"problems,omitempty"`
-	LastPass          time.Time `json:"last_pass"`
+	Root              string       `json:"root"`
+	MaxViews          int          `json:"max_views"`
+	MaxLinksPerView   int          `json:"max_links_per_view"`
+	Queries           int          `json:"queries"`
+	Views             int          `json:"views"`
+	Links             int          `json:"links"`
+	OverflowQueries   int          `json:"overflow_queries"`   // beyond MaxViews: no view
+	OverLimit         int          `json:"results_over_limit"` // matches beyond a query's limit
+	CappedQueries     []cappedView `json:"capped_queries,omitempty"`
+	GoneResults       int          `json:"gone_results"` // found gone while linking
+	RefusedLinks      int          `json:"refused_links"`
+	UnresolvedResults int          `json:"unresolved_results"` // path unreadable: link kept as it was, or none
+	Deferred          int          `json:"deferred_queries"`
+	MaxRecorded       int          `json:"max_recorded_views"`
+	ViewsAtCap        int          `json:"views_waiting_at_cap"`
+	ViewsParked       int          `json:"views_parked"`
+	LostOverflow      int          `json:"lost_overflow,omitempty"`
+	ViewsLeft         []string     `json:"views_left,omitempty"`
+	RootForeign       bool         `json:"root_not_created_by_manager,omitempty"`
+	Problems          []string     `json:"problems,omitempty"`
+	LastPass          time.Time    `json:"last_pass"`
 }
 
 func queryKind() viewKind[catalog.QueryID, querySource] {
 	return viewKind[catalog.QueryID, querySource]{
-		noun: "query", plural: "queries", rootVar: "JM_SMART_FOLDERS_QUERIES_ROOT", debounce: queryViewsDebounce,
+		noun: "query", plural: "queries", rootVar: "JM_SMART_FOLDERS_QUERIES_ROOT",
+		debounce: queryViewsDebounce, minInterval: queryViewsMinInterval,
 		root: func(s *smartFoldersService) string { return s.cfg.Settings.QueriesRoot },
 		off:  func(s *smartFoldersService) string { return s.cfg.Settings.QueriesOff },
+		// The other roots the Manager owns: a user-made folder of one of
+		// those names is ordinary data here (decision 2).
 		exclude: func(s *smartFoldersService) []string {
-			out := []string{s.cfg.Settings.Root}
+			var out []string
+			if s.recentsOwned.Load() {
+				out = append(out, s.cfg.Settings.Root)
+			}
 			if c := s.cfg.Settings.CollectionsRoot; s.collectionsRootActive(c) {
 				out = append(out, c)
 			}
@@ -111,8 +134,9 @@ func queryKind() viewKind[catalog.QueryID, querySource] {
 			}
 			return out, err
 		},
-		begin: func(s *smartFoldersService) { s.qscan = nil },
-		build: (*smartFoldersService).reconcileQuery,
+		prepare: (*smartFoldersService).prepareQueries,
+		busy:    func(s *smartFoldersService, id catalog.QueryID) bool { return s.qstate.runs[id] != nil },
+		build:   (*smartFoldersService).reconcileQuery,
 	}
 }
 
@@ -138,58 +162,104 @@ func (s *smartFoldersService) noteQueryEvent(ev smartfolders.Event) {
 func (s *smartFoldersService) queriesOnlyCycle(ctx context.Context) { s.qry.onlyCycle(s, ctx) }
 
 // queryExclude is what a query's results never include: the other smart
-// roots and the query root itself.
+// roots the Manager owns and the query root itself.
 func queryExclude(rec *smartfolders.Reconciler) []string {
 	return append(append([]string(nil), rec.Exclude...), rec.Root)
 }
 
-// queryCandidatesFor returns one query's candidates from this pass's scan,
-// scanning the catalog once (for every active query) at the first call.
-func (s *smartFoldersService) queryCandidatesFor(ctx context.Context, src querySource, id catalog.QueryID, exclude []string) (*queryCandidates, error) {
-	if s.qscan == nil {
-		qs, err := src.activeQueries(ctx)
-		defs := map[catalog.QueryID]catalog.QueryDefinition{}
-		for _, q := range qs {
-			defs[q.ID] = q.Definition
-		}
-		var cands map[catalog.QueryID]*queryCandidates
-		if err == nil {
-			cands, err = src.scanQueries(ctx, defs, exclude)
-		}
-		s.qscan = &queryScan{cands: cands, err: err}
+// prepareQueries runs once a pass: it forgets what belongs to queries
+// gone, drops the candidates of queries changed (or all of them at a
+// sweep), marks a run under way stale when its query changed, and scans
+// the catalog once for the jobs that need candidates.
+func (s *smartFoldersService) prepareQueries(ctx context.Context, src querySource, all, jobs []viewItem[catalog.QueryID], dirty map[catalog.QueryID]bool, sweep bool) {
+	q := &s.qstate
+	q.scanErr = nil
+	active := map[catalog.QueryID]bool{}
+	for _, it := range all {
+		active[it.ID] = true
 	}
-	return s.qscan.cands[id], s.qscan.err
+	for id := range q.runs {
+		if !active[id] {
+			delete(q.runs, id)
+		}
+	}
+	for id := range q.cands {
+		if !active[id] || sweep || dirty[id] {
+			delete(q.cands, id)
+		}
+	}
+	for id := range dirty {
+		if r := q.runs[id]; r != nil {
+			r.stale = true
+		}
+	}
+	src.forgetQueries(active)
+	defs := map[catalog.QueryID]catalog.QueryDefinition{}
+	for _, it := range jobs {
+		if q.runs[it.ID] == nil && q.cands[it.ID] == nil {
+			defs[it.ID] = *it.query
+		}
+	}
+	if len(defs) == 0 {
+		return
+	}
+	rec := &smartfolders.Reconciler{Root: s.cfg.Settings.QueriesRoot, Exclude: s.qry.kind.exclude(s)}
+	cands, err := src.scanQueries(ctx, defs, queryExclude(rec))
+	if err != nil {
+		q.scanErr = err
+		return
+	}
+	for id, c := range cands {
+		q.cands[id] = c
+	}
 }
 
-// reconcileQuery makes one query's view hold a link to each file the query
-// finds, at its live path. It returns how many candidates it resolved.
-// While the volume is not connected the view is left as it is. A file found
-// gone at the last moment makes the query run once more.
-func (s *smartFoldersService) reconcileQuery(ctx context.Context, rec *smartfolders.Reconciler, src querySource, item viewItem[catalog.QueryID], folder string, prior *collSeen, now time.Time) (*collSeen, int, error) {
-	c := &s.qry
+// reconcileQuery runs a query (resuming its run) within the budget, then
+// makes its view hold a link to each file found, at its live path. It
+// returns how many candidates it resolved; errViewPartial when the budget
+// ran out first. While the volume is not connected the view is left as it
+// is. A file found gone at the last moment is looked up again, alone.
+func (s *smartFoldersService) reconcileQuery(ctx context.Context, rec *smartfolders.Reconciler, src querySource, item viewItem[catalog.QueryID], folder string, prior *collSeen, now time.Time, budget viewBudget) (*collSeen, int, error) {
+	c, q := &s.qry, &s.qstate
 	exclude := queryExclude(rec)
-	cands, err := s.queryCandidatesFor(ctx, src, item.ID, exclude)
+	notReady := func(err error) error {
+		return fmt.Errorf("%s/%s: %w (%v); view left unchanged", rec.Root, folder, errMembersUnresolved, err)
+	}
+	run := q.runs[item.ID]
+	if run == nil {
+		if errors.Is(q.scanErr, binder.ErrNotReady) {
+			return nil, 0, notReady(q.scanErr)
+		}
+		if q.scanErr != nil {
+			return nil, 0, q.scanErr
+		}
+		run = newQueryRun(*item.query, q.cands[item.ID], now)
+		q.runs[item.ID] = run
+	}
+	ops, err := src.advanceQuery(ctx, run, exclude, budget.ops, budget.until)
 	if errors.Is(err, binder.ErrNotReady) {
-		return nil, 0, fmt.Errorf("%s/%s: %w (%v); view left unchanged", rec.Root, folder, errMembersUnresolved, err)
+		return nil, ops, notReady(err)
 	}
 	if err != nil {
-		return nil, 0, err
+		delete(q.runs, item.ID)
+		return nil, ops, err
 	}
+	if !run.done() {
+		return nil, ops, errViewPartial
+	}
+	delete(q.runs, item.ID)
+	if run.stale {
+		c.markDirty(item.ID) // changed while it ran: once more, after the minimum interval
+	}
+	src.rememberQuery(item.ID, run.result(ops), run.now)
+
 	var had map[continuity.AssetID]string
 	if prior != nil && prior.folder == folder {
 		had = prior.assets
 	}
 	seen := &collSeen{seq: item.UpdatedSequence, folder: folder}
-	ops := 0
 	for pass := 0; pass < 2; pass++ {
-		res, err := src.evaluateQuery(ctx, *item.query, cands, exclude, now)
-		ops += res.Ops
-		if errors.Is(err, binder.ErrNotReady) {
-			return nil, ops, fmt.Errorf("%s/%s: %w (%v); view left unchanged", rec.Root, folder, errMembersUnresolved, err)
-		}
-		if err != nil {
-			return nil, ops, err
-		}
+		res := run.result(ops)
 		var targets []string
 		assets := map[continuity.AssetID]string{}
 		linked := map[string]bool{}
@@ -213,7 +283,7 @@ func (s *smartFoldersService) reconcileQuery(ctx context.Context, rec *smartfold
 		if err != nil {
 			return nil, ops, err
 		}
-		gone, refused := 0, 0
+		gone, refused := map[string]bool{}, 0
 		placed := map[string]bool{}
 		for _, l := range links {
 			placed[l.Target] = true
@@ -221,15 +291,35 @@ func (s *smartFoldersService) reconcileQuery(ctx context.Context, rec *smartfold
 		for _, r := range out.Refused {
 			delete(placed, r.Target)
 			if r.TargetGone() {
-				gone++
+				gone[r.Target] = true
 			} else {
 				refused++
 			}
 		}
-		if gone > 0 && pass == 0 {
-			continue // moved since it was resolved: run the query again
+		if len(gone) > 0 && pass == 0 {
+			// Moved since it was resolved: look those files up again.
+			kept := run.hits[:0]
+			for _, h := range run.hits {
+				if !gone[h.Path] {
+					kept = append(kept, h)
+					continue
+				}
+				delete(run.seen, h.Path)
+				cand, ok := run.hintOf(h.AssetID)
+				if !ok {
+					continue
+				}
+				ops++
+				hit, ok, err := src.locateHit(ctx, run.def, cand, exclude, run.now)
+				if err == nil && ok && !run.seen[hit.Path] {
+					run.seen[hit.Path] = true
+					kept = append(kept, hit)
+				}
+			}
+			run.hits = kept
+			continue
 		}
-		seen.missing, seen.refused, seen.unknown, seen.over, seen.capped = gone, refused, res.Unknown, res.Over, res.Capped
+		seen.missing, seen.refused, seen.unknown, seen.over, seen.capped, seen.examined = len(gone), refused, res.Unknown, res.Over, res.Capped, res.Examined
 		seen.assets = map[continuity.AssetID]string{}
 		for a, p := range assets {
 			if placed[p] {
@@ -255,10 +345,14 @@ func (s *smartFoldersService) queryStats() *QueryViewStats {
 	if st == nil {
 		return nil
 	}
+	var capped []cappedView
+	if p := s.qry.capped.Load(); p != nil {
+		capped = *p
+	}
 	return &QueryViewStats{
 		Root: st.Root, MaxViews: st.MaxViews, MaxLinksPerView: catalog.MaxQueryLimit,
 		Queries: st.Collections, Views: st.Views, Links: st.Links, OverflowQueries: st.OverflowCollections,
-		OverLimit: st.OverflowMembers, CandidatesOverCap: int(s.qry.capped.Load()), GoneResults: st.MissingMembers,
+		OverLimit: st.OverflowMembers, CappedQueries: capped, GoneResults: st.MissingMembers,
 		RefusedLinks: st.RefusedLinks, UnresolvedResults: st.UnresolvedMembers, Deferred: st.Deferred,
 		MaxRecorded: st.MaxRecorded, ViewsAtCap: st.ViewsAtCap, ViewsParked: st.ViewsParked, LostOverflow: st.LostOverflow,
 		ViewsLeft: st.ViewsLeft, RootForeign: st.RootForeign, Problems: st.Problems, LastPass: st.LastPass,

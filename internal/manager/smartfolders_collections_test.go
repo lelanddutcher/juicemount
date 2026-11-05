@@ -115,7 +115,8 @@ func newCollViewsEnv(t *testing.T, files ...string) *collViewsEnv {
 		t.Fatal(err)
 	}
 	cont := &continuityService{store: store}
-	b, err := binder.New(binder.Config{Store: store, Applied: cont.applied, Connect: func() (binder.Volume, error) { return osVolume{root}, nil }})
+	b, err := binder.New(binder.Config{Store: store, Applied: cont.applied, TouchInterval: time.Nanosecond,
+		Connect: func() (binder.Volume, error) { return osVolume{root}, nil }})
 	if err != nil {
 		t.Fatal(err)
 	}
