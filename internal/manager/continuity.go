@@ -74,6 +74,13 @@ type continuityService struct {
 	// queryFolders: every active query's folders (NFC), so the binder
 	// marks recency only where a query can look (wantsTouch).
 	queryFolders atomic.Pointer[[]string]
+	// foldersMu serializes refreshQueryFolders from its read to its store,
+	// so a refresh that read the queries earlier never stores over one that
+	// read them later (query changes take no common lock).
+	foldersMu sync.Mutex
+	// foldersStale: the last refresh failed; the next query view pass
+	// retries it (retryQueryFolders).
+	foldersStale atomic.Bool
 }
 
 // wantsTouch: p is under some active query's folder (binder Config.Touch;
@@ -92,19 +99,38 @@ func (s *continuityService) wantsTouch(p string) bool {
 	return false
 }
 
+// queryFoldersRead, when set, runs between a refresh's read and its store
+// (tests).
+var queryFoldersRead func()
+
 // refreshQueryFolders reads every active query's folders (at start and
-// after each query change).
+// after each query change; after a failure, at the next query view pass).
 func (s *continuityService) refreshQueryFolders(ctx context.Context) {
+	s.foldersMu.Lock()
+	defer s.foldersMu.Unlock()
 	qs, err := s.activeQueries(ctx)
 	if err != nil {
-		log.Printf("manager: continuity: reading the saved queries: %v (recency marks keep the previous folders)", err)
+		s.foldersStale.Store(true)
+		log.Printf("manager: continuity: reading the saved queries: %v (recency marks keep the previous folders until a retry)", err)
 		return
 	}
 	folders := []string{}
 	for _, q := range qs {
 		folders = append(folders, q.Definition.Prefixes...)
 	}
+	if queryFoldersRead != nil {
+		queryFoldersRead()
+	}
 	s.queryFolders.Store(&folders)
+	s.foldersStale.Store(false)
+}
+
+// retryQueryFolders refreshes the folders when the last refresh failed
+// (each query view pass).
+func (s *continuityService) retryQueryFolders(ctx context.Context) {
+	if s.foldersStale.Load() {
+		s.refreshQueryFolders(ctx)
+	}
 }
 
 func (s *continuityService) start() {

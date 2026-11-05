@@ -517,3 +517,54 @@ func TestQueryResultsCacheTrustsOnlyCurrentViews(t *testing.T) {
 		t.Fatalf("reused after the view failed: %+v", r)
 	}
 }
+
+// Two refreshes of the query folders after two query changes: the one that
+// read the queries first cannot store its older list over the newer one.
+func TestQueryFoldersRefreshKeepsTheNewest(t *testing.T) {
+	e := newCollViewsEnv(t, "P/a.mov", "O/b.mov")
+	e.createQuery(qryID(1), "P", catalog.QueryDefinition{Prefixes: []string{"P"}})
+	read, release := make(chan struct{}), make(chan struct{})
+	calls := 0
+	queryFoldersRead = func() {
+		if calls++; calls == 1 {
+			close(read)
+			<-release
+		}
+	}
+	defer func() { queryFoldersRead = nil }()
+	first := make(chan struct{})
+	go func() { defer close(first); e.cont.refreshQueryFolders(context.Background()) }()
+	<-read // the first refresh has read query 1 only
+	e.createQuery(qryID(2), "O", catalog.QueryDefinition{Prefixes: []string{"O"}})
+	second := make(chan struct{})
+	go func() { defer close(second); e.cont.refreshQueryFolders(context.Background()) }()
+	select {
+	case <-second: // (it ran past the first: what this test catches)
+	case <-time.After(200 * time.Millisecond):
+	}
+	close(release)
+	<-first
+	<-second
+	if !e.cont.wantsTouch("O/b.mov") || !e.cont.wantsTouch("P/a.mov") {
+		t.Fatalf("folders after both refreshes: %v", *e.cont.queryFolders.Load())
+	}
+}
+
+// A refresh that fails (here at start) is retried at the next query view
+// pass, not only at the next query change.
+func TestQueryFoldersRetriedAtViewPass(t *testing.T) {
+	e := newCollViewsEnv(t, "P/a.mov")
+	e.svc.qry.debounce = time.Hour
+	e.attach()
+	e.createQuery(qryID(1), "P", catalog.QueryDefinition{Prefixes: []string{"P"}})
+	failed, cancel := context.WithCancel(context.Background())
+	cancel()
+	e.cont.refreshQueryFolders(failed)
+	if e.cont.wantsTouch("P/a.mov") {
+		t.Fatal("the failed refresh stored folders")
+	}
+	e.qpass()
+	if !e.cont.wantsTouch("P/a.mov") {
+		t.Fatal("the view pass did not retry the failed refresh")
+	}
+}

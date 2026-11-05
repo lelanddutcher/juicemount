@@ -63,6 +63,7 @@ type querySource interface {
 	advanceQuery(ctx context.Context, r *queryRun, exclude []string, maxOps int, until time.Time) (int, error)
 	locateHit(ctx context.Context, def catalog.QueryDefinition, h binder.Hint, exclude []string, now time.Time) (queryHit, bool, error)
 	activeQueries(ctx context.Context) ([]catalog.Query, error)
+	retryQueryFolders(ctx context.Context)
 	rememberQuery(id catalog.QueryID, res queryResult, at time.Time, byViews bool)
 	demoteQuery(id catalog.QueryID)
 	forgetQueries(active map[catalog.QueryID]bool)
@@ -127,6 +128,7 @@ func queryKind() viewKind[catalog.QueryID, querySource] {
 			return out
 		},
 		list: func(ctx context.Context, src querySource) ([]viewItem[catalog.QueryID], error) {
+			src.retryQueryFolders(ctx)
 			qs, err := src.activeQueries(ctx)
 			out := make([]viewItem[catalog.QueryID], len(qs))
 			for i, q := range qs {
