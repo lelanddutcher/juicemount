@@ -4,8 +4,10 @@ package manager
 // files the continuity catalog knows.
 //
 // A query is deterministic and unranked: the files under one of its
-// folders, optionally whose name contains a string (ignoring case; both
-// compared in Unicode NFC, so a name stored decomposed by macOS matches),
+// folders (a path and a folder compared composed, NFC, whichever form
+// either is stored in), optionally whose name contains a string (ignoring
+// case; both compared in Unicode NFC, so a name stored decomposed by macOS
+// matches),
 // whose extension is in a set, modified within a duration; newest first by
 // modification time, then by path; at most its limit (default 200, at most
 // 500).
@@ -195,7 +197,7 @@ func sortHits(hits []queryHit) {
 // inQueryFolders: p is under one of the query's folders and not under an
 // excluded root (the smart-folder roots; compared ignoring case).
 func inQueryFolders(def catalog.QueryDefinition, p string, exclude []string) bool {
-	p = norm.NFC.String(p) // folders are stored NFC
+	p = norm.NFC.String(p) // and each folder (stored in the volume's form)
 	top, _, _ := strings.Cut(p, "/")
 	for _, r := range exclude {
 		if strings.EqualFold(top, r) {
@@ -203,7 +205,7 @@ func inQueryFolders(def catalog.QueryDefinition, p string, exclude []string) boo
 		}
 	}
 	for _, f := range def.Prefixes {
-		if underFolder(p, f) && p != f {
+		if f = norm.NFC.String(f); underFolder(p, f) && p != f {
 			return true
 		}
 	}

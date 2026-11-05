@@ -115,6 +115,7 @@ import (
 	"github.com/lelanddutcher/juicemount/internal/continuity/binder"
 	"github.com/lelanddutcher/juicemount/internal/continuity/catalog"
 	"github.com/lelanddutcher/juicemount/internal/smartfolders"
+	"golang.org/x/text/unicode/norm"
 )
 
 const (
@@ -480,9 +481,10 @@ func (c *catalogViews[K, S]) notePaths(paths ...string) {
 				c.dirty[id], hit = true, true
 			}
 		}
+		composed := norm.NFC.String(p)
 		for id, folders := range c.watch {
 			for _, f := range folders {
-				if underFolder(p, f) || underFolder(f, p) {
+				if underFolder(composed, f) || underFolder(f, composed) {
 					c.dirty[id], hit = true, true
 					break
 				}
@@ -667,7 +669,9 @@ func (c *catalogViews[K, S]) cycle(s *smartFoldersService, ctx context.Context, 
 	for i, col := range cols {
 		want[i] = smartfolders.Folder{Key: string(col.ID), Name: col.Name}
 		if col.query != nil {
-			watch[col.ID] = col.query.Prefixes
+			for _, f := range col.query.Prefixes {
+				watch[col.ID] = append(watch[col.ID], norm.NFC.String(f)) // as queries match
+			}
 		}
 	}
 	c.mu.Lock()

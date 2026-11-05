@@ -573,6 +573,9 @@ type PrincipalStoreOptions struct {
 type PrincipalStore struct {
 	mu   sync.Mutex
 	opts PrincipalStoreOptions
+	// grantForm: the form of a grant's folder the volume holds
+	// (volumeform.go); nil: grants are stored as given.
+	grantForm folderFormFunc
 	// quotaScope: quotas above the project folders (quotascope.go).
 	quotaScope quotaScopeFunc
 	recs       map[string]*MacPrincipal // by principal name

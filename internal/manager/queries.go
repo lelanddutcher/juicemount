@@ -326,8 +326,12 @@ func (c *queryCall) body() (queryBody, error) {
 
 // definition checks and normalizes a create request: folders with or
 // without a leading slash, each once; extensions lowercased, with or without
-// the dot; the default limit.
-func (b queryBody) definition(roots []string) (catalog.QueryDefinition, error) {
+// the dot; the default limit. A folder is stored in the form the volume
+// holds (form: the Manager's queryFolderForm), so the grant check, byte
+// for byte like the proxy's, compares the volume's bytes with grants
+// stored in the volume's form too (people.go AddGrant); a folder not on
+// the volume, or with form nil, is stored composed (NFC).
+func (b queryBody) definition(roots []string, form func(string) (string, error)) (catalog.QueryDefinition, error) {
 	d := catalog.QueryDefinition{NameContains: b.NameContains, ModifiedWithinSeconds: b.ModifiedWithinSeconds, Limit: b.Limit}
 	if d.Limit == 0 {
 		d.Limit = queryDefaultLimit
@@ -337,7 +341,8 @@ func (b queryBody) definition(roots []string) (catalog.QueryDefinition, error) {
 	}
 	seen := map[string]bool{}
 	for _, f := range b.Folders {
-		p := norm.NFC.String(strings.TrimSuffix(strings.TrimPrefix(f, "/"), "/"))
+		raw := strings.TrimSuffix(strings.TrimPrefix(f, "/"), "/")
+		p := norm.NFC.String(raw)
 		if !catalog.ValidQueryPrefix(p) {
 			return d, fmt.Errorf("%w: folder %q is not a volume folder path (no empty, '.', '..' or hidden components)", errCollectionInput, f)
 		}
@@ -345,6 +350,12 @@ func (b queryBody) definition(roots []string) (catalog.QueryDefinition, error) {
 		for _, r := range roots {
 			if strings.EqualFold(top, r) {
 				return d, fmt.Errorf("%w: folder %q is in the smart-folder root /%s", errCollectionInput, f, r)
+			}
+		}
+		if form != nil {
+			var err error
+			if p, err = form(raw); err != nil {
+				return d, err
 			}
 		}
 		if !seen[p] {
@@ -374,6 +385,27 @@ func (b queryBody) definition(roots []string) (catalog.QueryDefinition, error) {
 		return d, fmt.Errorf("%w: limit is 1-%d (default %d)", errCollectionInput, catalog.MaxQueryLimit, queryDefaultLimit)
 	}
 	return d, nil
+}
+
+// queryFolderForm gives a new query's folder in the form the volume holds
+// (definition), or composed when it is not on the volume. nil: the
+// volume's form is not known (folders are stored composed).
+func (s *continuityService) queryFolderForm(ctx context.Context) func(string) (string, error) {
+	if s.folderForm == nil {
+		return nil
+	}
+	return func(raw string) (string, error) {
+		f, found, err := s.folderForm(ctx, raw)
+		switch {
+		case errors.Is(err, errFolderFormAmbiguous):
+			return "", fmt.Errorf("%w: %w", errCollectionInput, err)
+		case err != nil:
+			return "", failf(http.StatusServiceUnavailable, "cannot find folder /%s on the volume; try again", raw)
+		case !found:
+			return norm.NFC.String(raw), nil
+		}
+		return f, nil
+	}
 }
 
 // authorize checks that a person's grants cover every folder of the query.
@@ -460,7 +492,7 @@ func (c *queryCall) create() error {
 	if err != nil {
 		return err
 	}
-	def, err := b.definition(c.roots())
+	def, err := b.definition(c.roots(), c.svc.queryFolderForm(c.ctx()))
 	if err != nil {
 		return err
 	}

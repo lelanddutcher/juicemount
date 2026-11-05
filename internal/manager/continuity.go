@@ -71,8 +71,9 @@ type continuityService struct {
 	views atomic.Pointer[smartFoldersService]
 	// results: each query's last complete evaluation (queries_eval.go).
 	results queryResultCache
-	// queryFolders: every active query's folders (NFC), so the binder
-	// marks recency only where a query can look (wantsTouch).
+	// queryFolders: every active query's folders (NFC, as queries match
+	// them), so the binder marks recency only where a query can look
+	// (wantsTouch).
 	queryFolders atomic.Pointer[[]string]
 	// foldersMu serializes refreshQueryFolders from its read to its store,
 	// so a refresh that read the queries earlier never stores over one that
@@ -81,6 +82,9 @@ type continuityService struct {
 	// foldersStale: the last refresh failed; the next query view pass
 	// retries it (retryQueryFolders).
 	foldersStale atomic.Bool
+	// folderForm: the form of a new query's folder the volume holds
+	// (volumeform.go); nil: folders are stored NFC.
+	folderForm folderFormFunc
 }
 
 // wantsTouch: p is under some active query's folder (binder Config.Touch;
@@ -116,7 +120,9 @@ func (s *continuityService) refreshQueryFolders(ctx context.Context) {
 	}
 	folders := []string{}
 	for _, q := range qs {
-		folders = append(folders, q.Definition.Prefixes...)
+		for _, f := range q.Definition.Prefixes {
+			folders = append(folders, norm.NFC.String(f))
+		}
 	}
 	if queryFoldersRead != nil {
 		queryFoldersRead()
@@ -368,6 +374,9 @@ func buildContinuity(cfg Config, getenv func(string) string) *continuityService 
 		return nil
 	}
 	svc.binder, svc.rdb = b, redis.NewClient(opts)
+	svc.folderForm = func(ctx context.Context, p string) (string, bool, error) {
+		return volumeForm(ctx, redisDirExists(svc.rdb), p)
+	}
 	return svc
 }
 
