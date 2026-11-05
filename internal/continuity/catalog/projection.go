@@ -53,6 +53,23 @@ type locationProjection struct {
 	Removed         bool                 `json:"removed"`
 }
 
+type collectionProjection struct {
+	LibraryID       continuity.LibraryID `json:"library_id"`
+	CollectionID    CollectionID         `json:"collection_id"`
+	Name            string               `json:"name"`
+	CreatedSequence int64                `json:"created_sequence"`
+	UpdatedSequence int64                `json:"updated_sequence"`
+	Removed         bool                 `json:"removed"`
+}
+type memberProjection struct {
+	LibraryID       continuity.LibraryID `json:"library_id"`
+	CollectionID    CollectionID         `json:"collection_id"`
+	AssetID         continuity.AssetID   `json:"asset_id"`
+	CreatedSequence int64                `json:"created_sequence"`
+	UpdatedSequence int64                `json:"updated_sequence"`
+	Removed         bool                 `json:"removed"`
+}
+
 func walkRows(ctx context.Context, q queryer, query string, fn func(*sql.Rows) error, args ...any) (resultErr error) {
 	rows, err := q.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -72,7 +89,7 @@ func walkRows(ctx context.Context, q queryer, query string, fn func(*sql.Rows) e
 
 func projectionTotal(ctx context.Context, q queryer) (int64, error) {
 	var count int64
-	err := q.QueryRowContext(ctx, `SELECT (SELECT count(*) FROM catalog)+(SELECT count(*) FROM assets)+(SELECT count(*) FROM revisions)+(SELECT count(*) FROM revision_parents)+(SELECT count(*) FROM relationships)+(SELECT count(*) FROM locations)`).Scan(&count)
+	err := q.QueryRowContext(ctx, `SELECT (SELECT count(*) FROM catalog)+(SELECT count(*) FROM assets)+(SELECT count(*) FROM revisions)+(SELECT count(*) FROM revision_parents)+(SELECT count(*) FROM relationships)+(SELECT count(*) FROM locations)+(SELECT count(*) FROM collections)+(SELECT count(*) FROM collection_members)`).Scan(&count)
 	return count, err
 }
 
@@ -181,6 +198,28 @@ func projectionDigest(ctx context.Context, q queryer, library continuity.Library
 		}
 		return emit(0x16, locationProjection{l.LibraryID, l.ID, l.Value, l.CreatedSequence, l.UpdatedSequence, l.Removed})
 	})
+	if err != nil {
+		return "", 0, err
+	}
+	// Format 3. A catalog without collections emits no such frame, so its
+	// digest is the format 2 digest of the same state.
+	err = walkRows(ctx, q, collectionSelect+` ORDER BY c.collection_id COLLATE BINARY`, func(rows *sql.Rows) error {
+		c, err := scanCollection(rows, library)
+		if err != nil {
+			return err
+		}
+		return emit(0x17, collectionProjection{c.LibraryID, c.ID, c.Name, c.CreatedSequence, c.UpdatedSequence, c.Removed})
+	})
+	if err != nil {
+		return "", 0, err
+	}
+	err = walkRows(ctx, q, memberSelect+` ORDER BY m.collection_id COLLATE BINARY,m.asset_id COLLATE BINARY`, func(rows *sql.Rows) error {
+		m, err := scanMember(rows)
+		if err != nil {
+			return err
+		}
+		return emit(0x18, memberProjection{library, m.CollectionID, m.AssetID, m.CreatedSequence, m.UpdatedSequence, m.Removed})
+	}, library)
 	if err != nil {
 		return "", 0, err
 	}

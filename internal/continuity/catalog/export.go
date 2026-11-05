@@ -119,7 +119,11 @@ func (s *Store) Export(ctx context.Context, library continuity.LibraryID, writer
 	if err := output.write([]byte(streamMagic), h); err != nil {
 		return err
 	}
-	header, _ := json.Marshal(streamHeader{1, schemaVersion, library, count})
+	format, err := streamFormat(ctx, tx)
+	if err != nil {
+		return err
+	}
+	header, _ := json.Marshal(streamHeader{1, format, library, count})
 	if err := output.frame(1, header, h); err != nil {
 		return err
 	}
@@ -159,4 +163,19 @@ func (s *Store) Export(ctx context.Context, library continuity.LibraryID, writer
 		return err
 	}
 	return s.checkPaths()
+}
+
+// streamFormat is the oldest format that holds the snapshot: 2 while the
+// catalog has no collection (every collection change needs one, and rows are
+// never deleted), so a catalog that never used collections still exports a
+// stream a format 2 reader restores, byte for byte as before.
+func streamFormat(ctx context.Context, q queryer) (int, error) {
+	var any bool
+	if err := q.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM collections)`).Scan(&any); err != nil {
+		return 0, formatError(err)
+	}
+	if any {
+		return 3, nil
+	}
+	return 2, nil
 }

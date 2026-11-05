@@ -37,6 +37,13 @@ type changeJSON struct {
 	RemoveRelationship *RemoveRelationship `json:"remove_relationship,omitempty"`
 	PutLocation        *PutLocation        `json:"put_location,omitempty"`
 	RemoveLocation     *RemoveLocation     `json:"remove_location,omitempty"`
+	// Format 3.
+	ExpectCollection       *ExpectCollection       `json:"expect_collection,omitempty"`
+	CreateCollection       *CreateCollection       `json:"create_collection,omitempty"`
+	RenameCollection       *RenameCollection       `json:"rename_collection,omitempty"`
+	RemoveCollection       *RemoveCollection       `json:"remove_collection,omitempty"`
+	AddCollectionMember    *AddCollectionMember    `json:"add_collection_member,omitempty"`
+	RemoveCollectionMember *RemoveCollectionMember `json:"remove_collection_member,omitempty"`
 }
 
 type operationJSON struct {
@@ -119,6 +126,12 @@ func freezeOperation(op Operation) (Operation, []byte, string, error) {
 		if change.RemoveLocation != nil {
 			count++
 		}
+		for _, set := range []bool{change.ExpectCollection != nil, change.CreateCollection != nil, change.RenameCollection != nil, change.RemoveCollection != nil,
+			change.AddCollectionMember != nil, change.RemoveCollectionMember != nil} {
+			if set {
+				count++
+			}
+		}
 		if count != 1 {
 			return Operation{}, nil, "", invalid("change requires exactly one variant")
 		}
@@ -198,6 +211,42 @@ func freezeOperation(op Operation) (Operation, []byte, string, error) {
 				return Operation{}, nil, "", err
 			}
 			frozen.Changes[i].RemoveLocation, wire.Changes[i].RemoveLocation = &c, &c
+		case change.ExpectCollection != nil:
+			c := *change.ExpectCollection
+			if c.CollectionID.Validate() != nil || c.UpdatedSequence <= 0 {
+				return Operation{}, nil, "", invalid("expect collection")
+			}
+			frozen.Changes[i].ExpectCollection, wire.Changes[i].ExpectCollection = &c, &c
+		case change.CreateCollection != nil:
+			c := *change.CreateCollection
+			if c.CollectionID.Validate() != nil || !validCollectionName(c.Name) {
+				return Operation{}, nil, "", invalid("create collection")
+			}
+			frozen.Changes[i].CreateCollection, wire.Changes[i].CreateCollection = &c, &c
+		case change.RenameCollection != nil:
+			c := *change.RenameCollection
+			if c.CollectionID.Validate() != nil || !validCollectionName(c.Name) {
+				return Operation{}, nil, "", invalid("rename collection")
+			}
+			frozen.Changes[i].RenameCollection, wire.Changes[i].RenameCollection = &c, &c
+		case change.RemoveCollection != nil:
+			c := *change.RemoveCollection
+			if c.CollectionID.Validate() != nil {
+				return Operation{}, nil, "", invalid("remove collection")
+			}
+			frozen.Changes[i].RemoveCollection, wire.Changes[i].RemoveCollection = &c, &c
+		case change.AddCollectionMember != nil:
+			c := *change.AddCollectionMember
+			if c.CollectionID.Validate() != nil || c.AssetID.Validate() != nil {
+				return Operation{}, nil, "", invalid("add collection member")
+			}
+			frozen.Changes[i].AddCollectionMember, wire.Changes[i].AddCollectionMember = &c, &c
+		case change.RemoveCollectionMember != nil:
+			c := *change.RemoveCollectionMember
+			if c.CollectionID.Validate() != nil || c.AssetID.Validate() != nil {
+				return Operation{}, nil, "", invalid("remove collection member")
+			}
+			frozen.Changes[i].RemoveCollectionMember, wire.Changes[i].RemoveCollectionMember = &c, &c
 		}
 	}
 	data, err := json.Marshal(wire)
@@ -242,6 +291,9 @@ func decodeOperation(data []byte) (Operation, error) {
 		op.Changes[i] = Change{CreateAsset: c.CreateAsset, RenameAsset: c.RenameAsset, AdvanceHead: c.AdvanceHead}
 		op.Changes[i].PutRelationship, op.Changes[i].RemoveRelationship = c.PutRelationship, c.RemoveRelationship
 		op.Changes[i].PutLocation, op.Changes[i].RemoveLocation = c.PutLocation, c.RemoveLocation
+		op.Changes[i].ExpectCollection = c.ExpectCollection
+		op.Changes[i].CreateCollection, op.Changes[i].RenameCollection, op.Changes[i].RemoveCollection = c.CreateCollection, c.RenameCollection, c.RemoveCollection
+		op.Changes[i].AddCollectionMember, op.Changes[i].RemoveCollectionMember = c.AddCollectionMember, c.RemoveCollectionMember
 		if c.RecordRevision != nil {
 			m := c.RecordRevision.manifest()
 			op.Changes[i].RecordRevision = &m

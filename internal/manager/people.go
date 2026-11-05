@@ -924,4 +924,7 @@ func (a *API) registerPeople(mux *http.ServeMux, prefix string, store *Principal
 	mux.HandleFunc(prefix+"/api/audit", a.auth(pa.handleAudit))
 	mux.HandleFunc(prefix+"/api/audit/verify", a.auth(pa.handleAuditVerify))
 	mux.HandleFunc(prefix+"/api/audit/status", a.auth(pa.handleAuditStatus))
+	// Continuity collections (collections.go): persons authenticate with
+	// their Macs, so the routes need this store; 404 while JM_CONTINUITY is off.
+	a.registerCollections(mux, prefix, store)
 }

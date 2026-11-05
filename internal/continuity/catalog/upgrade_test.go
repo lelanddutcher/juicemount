@@ -263,7 +263,7 @@ func TestCatalogUpgradeRetriesDirectoryBarrierAndIsIdempotent(t *testing.T) {
 		t.Fatal("idempotent upgrade changed history")
 	}
 	var entries int
-	if err := s.db.QueryRow(`SELECT count(*) FROM schema_migrations`).Scan(&entries); err != nil || entries != 2 {
+	if err := s.db.QueryRow(`SELECT count(*) FROM schema_migrations`).Scan(&entries); err != nil || entries != 3 {
 		t.Fatalf("ledger lineage: %d, %v", entries, err)
 	}
 }
@@ -327,7 +327,6 @@ func TestCatalogMigrationRollbackAndConcurrentUpgraders(t *testing.T) {
 
 func TestCatalogUpgradeRefusesWrongIncompleteAndUnsafeTargets(t *testing.T) {
 	for name, statements := range map[string][]string{
-		"unknown version":     {`PRAGMA user_version=3`},
 		"foreign application": {`PRAGMA application_id=17`},
 		"altered DDL":         {`CREATE TABLE unrelated(value TEXT)`},
 		"incomplete v1":       {`DROP TRIGGER catalog_no_update`, `UPDATE catalog SET ready=0`, triggerDDL("catalog_no_update")},
@@ -396,17 +395,19 @@ func TestCatalogUpgradeRefusesWrongIncompleteAndUnsafeTargets(t *testing.T) {
 	}
 }
 
-func TestCatalogNewV2LedgerHasExactLegacyLineage(t *testing.T) {
+func TestCatalogNewLedgerHasExactLegacyLineage(t *testing.T) {
 	s, _ := newTestStore(t)
 	var version int
-	if err := s.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 2 {
+	if err := s.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 3 {
 		t.Fatalf("new schema: %d, %v", version, err)
 	}
-	var fingerprint string
-	if err := s.db.QueryRow(`SELECT fingerprint FROM schema_migrations WHERE version=1`).Scan(&fingerprint); err != nil || fingerprint != "752faa61a0812eef6fb7cd2a3d71a2aac3cee19f660b2d129e78cfc1a1b86f26" {
-		t.Fatalf("legacy lineage: %s, %v", fingerprint, err)
+	for entry, want := range map[int]string{1: "752faa61a0812eef6fb7cd2a3d71a2aac3cee19f660b2d129e78cfc1a1b86f26", 2: v2Fingerprint} {
+		var fingerprint string
+		if err := s.db.QueryRow(`SELECT fingerprint FROM schema_migrations WHERE version=?`, entry).Scan(&fingerprint); err != nil || fingerprint != want {
+			t.Fatalf("lineage %d: %s, %v", entry, fingerprint, err)
+		}
 	}
-	if _, err := s.db.Exec(`INSERT INTO schema_migrations(version,fingerprint) VALUES(3,?)`, strings.Repeat("0", 64)); err != nil {
+	if _, err := s.db.Exec(`INSERT INTO schema_migrations(version,fingerprint) VALUES(4,?)`, strings.Repeat("0", 64)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.Apply(context.Background(), initialOperation()); !errors.Is(err, ErrFormat) {

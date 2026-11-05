@@ -17,7 +17,7 @@ import (
 )
 
 const applicationID = 0x4a4d4341 // JMCA
-const schemaVersion = 2
+const schemaVersion = 3
 
 type queryer interface {
 	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
@@ -107,7 +107,9 @@ const ledgerV2DDL = `CREATE TABLE schema_migrations (
  fingerprint TEXT NOT NULL CHECK(length(fingerprint)=64 AND fingerprint NOT GLOB '*[^0-9a-f]*')
 )`
 
-func expectedSchema() []schemaObject {
+// schemaV2 is format 2 exactly as slice 1 shipped it: format 1 with the open
+// ledger, relationships and locations.
+func schemaV2() []schemaObject {
 	objects := legacySchema()
 	for i := range objects {
 		if objects[i].Name == "schema_migrations" {
@@ -117,6 +119,25 @@ func expectedSchema() []schemaObject {
 	objects = append(objects, relationalSchema()...)
 	sort.Slice(objects, func(i, j int) bool { return objects[i].Name < objects[j].Name })
 	return objects
+}
+
+// expectedSchema is the current format (3): format 2 plus collections.
+func expectedSchema() []schemaObject {
+	objects := append(schemaV2(), collectionSchema()...)
+	sort.Slice(objects, func(i, j int) bool { return objects[i].Name < objects[j].Name })
+	return objects
+}
+
+// schemaFor is the exact object inventory of a recognized format.
+func schemaFor(version int) []schemaObject {
+	switch version {
+	case 1:
+		return legacySchema()
+	case 2:
+		return schemaV2()
+	default:
+		return expectedSchema()
+	}
 }
 
 func schemaFingerprint(objects []schemaObject) string {
@@ -132,7 +153,7 @@ func initialize(ctx context.Context, db *sql.DB, library continuity.LibraryID) e
 	}
 	defer tx.Rollback()
 	tables := append([]string{ledgerV2DDL}, v1TableDDL[1:]...)
-	for _, object := range relationalSchema() {
+	for _, object := range append(relationalSchema(), collectionSchema()...) {
 		if object.Type == "table" {
 			tables = append(tables, object.SQL)
 		}
@@ -152,10 +173,10 @@ func initialize(ctx context.Context, db *sql.DB, library continuity.LibraryID) e
 	if _, err := tx.ExecContext(ctx, `PRAGMA application_id=0x4a4d4341`); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `PRAGMA user_version=2`); err != nil {
+	if _, err := tx.ExecContext(ctx, `PRAGMA user_version=3`); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations(version,fingerprint) VALUES(1,?),(2,?)`, schemaFingerprint(legacySchema()), schemaFingerprint(expectedSchema())); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations(version,fingerprint) VALUES(1,?),(2,?),(3,?)`, schemaFingerprint(legacySchema()), schemaFingerprint(schemaV2()), schemaFingerprint(expectedSchema())); err != nil {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO catalog(singleton,library_id,ready) VALUES(1,?,0)`, library); err != nil {
@@ -170,7 +191,7 @@ func validateSchema(ctx context.Context, q queryer) (continuity.LibraryID, error
 
 func validateSchemaState(ctx context.Context, q queryer, initializing bool) (continuity.LibraryID, error) {
 	library, version, err := recognizeSchema(ctx, q, initializing)
-	if err == nil && version == 1 {
+	if err == nil && version < schemaVersion {
 		return "", ErrUpgradeRequired
 	}
 	return library, err
@@ -184,8 +205,11 @@ func recognizeSchema(ctx context.Context, q queryer, initializing bool) (continu
 	if err := q.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&version); err != nil {
 		return "", 0, formatError(err)
 	}
-	if app != applicationID || (version != 1 && version != schemaVersion) {
+	if app != applicationID || version < 1 {
 		return "", 0, corrupt("unsupported application or schema version")
+	}
+	if version > schemaVersion {
+		return "", 0, fmt.Errorf("%w: format %d, this binary reads up to %d", ErrNewerFormat, version, schemaVersion)
 	}
 	rows, err := q.QueryContext(ctx, `SELECT type,name,tbl_name,sql FROM sqlite_schema WHERE NOT(type='index' AND substr(name,1,17)='sqlite_autoindex_' AND sql IS NULL) ORDER BY name`)
 	if err != nil {
@@ -205,10 +229,7 @@ func recognizeSchema(ctx context.Context, q queryer, initializing bool) (continu
 	if err != nil {
 		return "", 0, formatError(err)
 	}
-	expected := expectedSchema()
-	if version == 1 {
-		expected = legacySchema()
-	}
+	expected := schemaFor(version)
 	if len(actual) != len(expected) {
 		return "", 0, corrupt("unexpected schema objects")
 	}
@@ -230,11 +251,7 @@ func recognizeSchema(ctx context.Context, q queryer, initializing bool) (continu
 			return "", 0, formatError(err)
 		}
 		ledgerCount++
-		want := schemaFingerprint(legacySchema())
-		if entry == 2 {
-			want = schemaFingerprint(expectedSchema())
-		}
-		if entry != ledgerCount || entry > version || fingerprint != want {
+		if entry != ledgerCount || entry > version || fingerprint != schemaFingerprint(schemaFor(entry)) {
 			rows.Close()
 			return "", 0, corrupt("migration fingerprint lineage mismatch")
 		}

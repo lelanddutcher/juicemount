@@ -51,7 +51,7 @@ func restoreCatalog(ctx context.Context, path string, library continuity.Library
 	if err := canonicalJSON(headerData, &header); err != nil {
 		return err
 	}
-	if header.Version != 1 || header.SchemaVersion != schemaVersion || header.LibraryID != library || header.EventCount < 0 {
+	if header.Version != 1 || (header.SchemaVersion != 2 && header.SchemaVersion != 3) || header.LibraryID != library || header.EventCount < 0 {
 		return corrupt("export header identity or version")
 	}
 	if header.EventCount > limits.MaxEvents {
@@ -85,6 +85,13 @@ func restoreCatalog(ctx context.Context, path string, library continuity.Library
 		event, op, err := decodeStreamEvent(payload, library, sequence)
 		if err != nil {
 			return err
+		}
+		if header.SchemaVersion < 3 {
+			for _, change := range op.Changes {
+				if isCollectionChange(change) {
+					return corrupt("collection change in a format 2 stream")
+				}
+			}
 		}
 		if batch == nil {
 			if batch, err = s.beginReplayBatch(ctx); err != nil {
@@ -156,6 +163,12 @@ func restoreCatalog(ctx context.Context, path string, library continuity.Library
 	}
 	if err := walkEvents(ctx, tx, library, header.EventCount, nil); err != nil {
 		return err
+	}
+	// The exporter names the oldest format that holds the snapshot.
+	if format, err := streamFormat(ctx, tx); err != nil {
+		return err
+	} else if format != header.SchemaVersion {
+		return corrupt("stream format does not match its contents")
 	}
 	projection, rows, err := projectionDigest(ctx, tx, library, limits.MaxProjectionRows)
 	if err != nil {
@@ -258,6 +271,9 @@ func (s *Store) replayEvent(ctx context.Context, tx *sql.Tx, event eventRow, op 
 		}
 		rows += cost
 	}
+	if err := checkCollectionLimits(ctx, tx, op); err != nil {
+		return 0, err
+	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO events(sequence,library_id,operation_id,request,payload_sha256,recorded_unix_nano,receipt) VALUES(?,?,?,?,?,?,?)`,
 		event.sequence, event.library, event.id, event.request, event.digest, event.timestamp, event.receipt); err != nil {
 		return 0, formatError(err)
@@ -275,8 +291,18 @@ func projectionInsertCost(ctx context.Context, tx *sql.Tx, change Change) (int64
 	table, column, id := "", "", ""
 	var cost int64 = 1
 	switch {
-	case change.CreateAsset != nil:
+	case change.CreateAsset != nil, change.CreateCollection != nil:
 		return 1, nil // Success necessarily inserts; existing IDs are conflicts.
+	case change.AddCollectionMember != nil:
+		var exists bool
+		v := change.AddCollectionMember
+		if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM collection_members WHERE collection_id=? AND asset_id=?)`, v.CollectionID, v.AssetID).Scan(&exists); err != nil {
+			return 0, err
+		}
+		if exists {
+			return 0, nil // Reactivation or no change.
+		}
+		return 1, nil
 	case change.RecordRevision != nil:
 		revision, err := change.RecordRevision.RevisionID()
 		if err != nil {

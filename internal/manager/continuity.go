@@ -12,6 +12,8 @@ package manager
 // the Manager is down, dropped from the bounded queue, or published by no
 // client are missed until a rescan, which this slice does not have;
 // GET /api/continuity/status reports what was missed.
+//
+// Collections (collections.go) live in the same catalog.
 
 import (
 	"context"
@@ -234,16 +236,42 @@ func openContinuityCatalog(stateDir string, mounts ...string) (*catalog.Store, e
 		return nil, err
 	}
 	store, err := catalog.Open(path)
+	if errors.Is(err, catalog.ErrUpgradeRequired) {
+		// The Manager owns this catalog and nothing else uses it yet, so it
+		// upgrades it in place (a format 2 catalog from slice 2 gains the
+		// collection tables; nothing existing changes). A binary from
+		// before the upgrade refuses the new format; it never damages it.
+		err = upgradeContinuityCatalog(path)
+		if err == nil {
+			store, err = catalog.Open(path)
+		}
+	}
 	switch {
 	case err == nil:
 		return store, nil
 	case errors.Is(err, catalog.ErrUpgradeRequired):
 		return nil, fmt.Errorf("the catalog %s needs an explicit schema upgrade: %w", path, err)
+	case errors.Is(err, catalog.ErrNewerFormat):
+		return nil, fmt.Errorf("the catalog %s was written by a newer JuiceMount (left untouched; update this Manager): %w", path, err)
 	case errors.Is(err, catalog.ErrFormat):
 		return nil, fmt.Errorf("the catalog %s is incomplete or corrupt (left untouched): %w", path, err)
 	default:
 		return nil, fmt.Errorf("opening the catalog %s: %w", path, err)
 	}
+}
+
+func upgradeContinuityCatalog(path string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	library, version, err := catalog.Inspect(ctx, path)
+	if err != nil {
+		return err
+	}
+	if err := catalog.Upgrade(ctx, path, library); err != nil {
+		return fmt.Errorf("upgrading the catalog %s from format %d: %w", path, version, err)
+	}
+	log.Printf("manager: continuity: upgraded the catalog %s from format %d", path, version)
+	return nil
 }
 
 // checkPrivateParent refuses a state directory another account could write
