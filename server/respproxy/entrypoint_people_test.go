@@ -117,9 +117,10 @@ func TestEntrypointKeepsPeopleAndConfiguresAudit(t *testing.T) {
 		{[]string{"JM_SMART_FOLDERS=off", "JM_CONTINUITY=on"}, ""},
 		{[]string{"JM_SMART_FOLDERS= On "}, "Recents"},
 		{[]string{"JM_SMART_FOLDERS=on", "JM_SMART_FOLDERS_ROOT=  ", "JM_SMART_FOLDERS_COLLECTIONS_ROOT=Sets"}, "Recents"},
-		{[]string{"JM_SMART_FOLDERS=yes", "JM_CONTINUITY=true"}, "Recents,Collections"},
-		{[]string{"JM_SMART_FOLDERS=on", "JM_CONTINUITY=on", "JM_SMART_FOLDERS_ROOT= Recent Files ", "JM_SMART_FOLDERS_COLLECTIONS_ROOT= Sets"}, "Recent Files,Sets"},
-		{[]string{"JM_SMART_FOLDERS=on", "JM_CONTINUITY=on", "JM_SMART_FOLDERS_ROOT=Views", "JM_SMART_FOLDERS_COLLECTIONS_ROOT=views"}, "Views,views"}, // the proxy folds them
+		{[]string{"JM_SMART_FOLDERS=on", "JM_SMART_FOLDERS_QUERIES_ROOT=Finds"}, "Recents"},
+		{[]string{"JM_SMART_FOLDERS=yes", "JM_CONTINUITY=true"}, "Recents,Collections,Queries"},
+		{[]string{"JM_SMART_FOLDERS=on", "JM_CONTINUITY=on", "JM_SMART_FOLDERS_ROOT= Recent Files ", "JM_SMART_FOLDERS_COLLECTIONS_ROOT= Sets", "JM_SMART_FOLDERS_QUERIES_ROOT= Saved Finds "}, "Recent Files,Sets,Saved Finds"},
+		{[]string{"JM_SMART_FOLDERS=on", "JM_CONTINUITY=on", "JM_SMART_FOLDERS_ROOT=Views", "JM_SMART_FOLDERS_COLLECTIONS_ROOT=views", "JM_SMART_FOLDERS_QUERIES_ROOT=VIEWS"}, "Views,views,VIEWS"}, // the proxy folds them
 	} {
 		if out, err := rerun(tc.env...); err != nil {
 			t.Fatalf("entrypoint %v: %v\n%s", tc.env, err, out)

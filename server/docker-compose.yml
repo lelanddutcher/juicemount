@@ -133,6 +133,7 @@ services:
       JM_CONTINUITY: "${JM_CONTINUITY:-off}"
       JM_SMART_FOLDERS_ROOT: "${JM_SMART_FOLDERS_ROOT:-Recents}"
       JM_SMART_FOLDERS_COLLECTIONS_ROOT: "${JM_SMART_FOLDERS_COLLECTIONS_ROOT:-Collections}"
+      JM_SMART_FOLDERS_QUERIES_ROOT: "${JM_SMART_FOLDERS_QUERIES_ROOT:-Queries}"
       JM_PROXY_FARM_PASSWORD: "${JM_PROXY_FARM_PASSWORD:?set JM_PROXY_FARM_PASSWORD in server/.env}"
       JM_PROXY_MANAGER_PASSWORD: "${JM_PROXY_MANAGER_PASSWORD:?set JM_PROXY_MANAGER_PASSWORD in server/.env}"
       JM_PROXY_BG_PASSWORD: "${JM_PROXY_BG_PASSWORD:?set JM_PROXY_BG_PASSWORD in server/.env}"
@@ -458,10 +459,12 @@ services:
       JM_SMART_FOLDERS_ROOT: "${JM_SMART_FOLDERS_ROOT:-Recents}"
       JM_SMART_FOLDERS_MAX_VIEWS: "${JM_SMART_FOLDERS_MAX_VIEWS:-256}"
       # Continuity (off by default) and, with smart folders also on, its
-      # collection views under JM_SMART_FOLDERS_COLLECTIONS_ROOT. respproxy
-      # reads these same variables, so the two agree on the roots.
+      # collection views under JM_SMART_FOLDERS_COLLECTIONS_ROOT and saved
+      # query views under JM_SMART_FOLDERS_QUERIES_ROOT. respproxy reads
+      # these same variables, so the two agree on the roots.
       JM_CONTINUITY: "${JM_CONTINUITY:-off}"
       JM_SMART_FOLDERS_COLLECTIONS_ROOT: "${JM_SMART_FOLDERS_COLLECTIONS_ROOT:-Collections}"
+      JM_SMART_FOLDERS_QUERIES_ROOT: "${JM_SMART_FOLDERS_QUERIES_ROOT:-Queries}"
     ports:
       - "30190:8080"                              # manager UI
       # Link's 30193/tcp and 41641/udp: server/docker-compose.link.yml

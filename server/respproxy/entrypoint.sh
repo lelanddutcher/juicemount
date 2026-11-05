@@ -20,10 +20,11 @@
 #    the variables the Manager reads, read the way it reads them: none
 #    unless JM_SMART_FOLDERS=on; then JM_SMART_FOLDERS_ROOT (default
 #    Recents), and with JM_CONTINUITY=on also
-#    JM_SMART_FOLDERS_COLLECTIONS_ROOT (default Collections; the proxy
-#    leaves it out when it is the Recents root under case folding, as the
-#    Manager does). The manager principal may remove an empty
-#    view folder it created directly under one, and nothing else at
+#    JM_SMART_FOLDERS_COLLECTIONS_ROOT (default Collections) and
+#    JM_SMART_FOLDERS_QUERIES_ROOT (default Queries), in that order (the
+#    proxy leaves out a name equal to an earlier one under case folding, as
+#    the Manager turns that root off). The manager principal may remove an
+#    empty view folder it created directly under one, and nothing else at
 #    project depth. The proxy leaves out an invalid name.
 # 3. Execs jm-respproxy with the applied-reload handshake enabled. The
 #    proxy owns polling, exact-byte validation, session revocation, applied
@@ -62,13 +63,14 @@ switch_on() { # the Manager's reading of an on/off variable
 smart_roots() { # JSON array of the smart-folder roots the Manager runs
   switch_on "${JM_SMART_FOLDERS:-}" || { echo '[]'; return; }
   r="$(trim "${JM_SMART_FOLDERS_ROOT:-}")"; [ -n "$r" ] || r=Recents
-  c=""
+  c=""; q=""
   if switch_on "${JM_CONTINUITY:-}"; then
     c="$(trim "${JM_SMART_FOLDERS_COLLECTIONS_ROOT:-}")"; [ -n "$c" ] || c=Collections
+    q="$(trim "${JM_SMART_FOLDERS_QUERIES_ROOT:-}")"; [ -n "$q" ] || q=Queries
   fi
   # The proxy drops a name equal to an earlier one under case folding
-  # (Go strings.EqualFold, as the Manager compares the two roots).
-  jq -cn --arg r "$r" --arg c "$c" '[$r] + (if $c == "" then [] else [$c] end)'
+  # (Go strings.EqualFold, as the Manager compares the roots).
+  jq -cn --arg r "$r" --arg c "$c" --arg q "$q" '[$r] + ([$c, $q] | map(select(. != "")))'
 }
 
 case "$MODE" in passthrough|observe|enforce) ;; *) die "JM_RESPPROXY_MODE must be passthrough, observe or enforce" ;; esac
