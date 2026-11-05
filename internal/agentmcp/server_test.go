@@ -276,7 +276,7 @@ func (s *session) call(name string, args any) (callResult, map[string]any) {
 func TestInitializeNegotiatesVersion(t *testing.T) {
 	f, srv := newFakeManager(t)
 	for _, c := range []struct{ ask, want string }{
-		{"2025-06-18", "2025-06-18"}, {"2025-03-26", "2025-03-26"}, {"2024-11-05", "2024-11-05"}, {"2099-01-01", "2025-06-18"},
+		{"2025-06-18", "2025-06-18"}, {"2025-03-26", "2025-06-18"}, {"2024-11-05", "2024-11-05"}, {"2099-01-01", "2025-06-18"},
 	} {
 		s := startSession(t, srv.URL)
 		// Nothing but initialize and ping before initialize.
@@ -553,13 +553,33 @@ func TestToolErrorsAreResults(t *testing.T) {
 			t.Fatal("an error carries the token")
 		}
 	}
-	// No token stored: every tool says how to get one.
-	s2 := startSession(t, srv.URL, func(tl *Tools) {
-		tl.Client = func() (*Client, error) { return nil, fmt.Errorf("%w: mint one", ErrNoToken) }
-	})
-	s2.initialize()
-	if cr, _ := s2.call("list_collections", map[string]any{}); !cr.IsError || !strings.Contains(cr.Content[0].Text, "mint one") {
-		t.Fatalf("no token: %+v", cr)
+	// No token stored, or one that cannot be read: every tool, read or
+	// write, says how to get one, and nothing reaches the Manager.
+	n := len(f.requests())
+	for _, c := range []struct {
+		err  error
+		want string
+	}{
+		{fmt.Errorf("%w here", ErrNoToken), "No agent token is stored"},
+		{io.ErrUnexpectedEOF, "cannot be read (unexpected EOF)"},
+	} {
+		s2 := startSession(t, srv.URL, func(tl *Tools) {
+			tl.Client = func() (*Client, error) { return nil, c.err }
+		})
+		s2.initialize()
+		for _, call := range []struct {
+			tool string
+			args map[string]any
+		}{{"list_collections", map[string]any{}}, {"create_collection", map[string]any{"name": "x"}}} {
+			cr, _ := s2.call(call.tool, call.args)
+			if !cr.IsError || !strings.Contains(cr.Content[0].Text, c.want) || !strings.Contains(cr.Content[0].Text, "juicemount-mcp token create") ||
+				strings.Contains(cr.Content[0].Text, "could not be reached") {
+				t.Fatalf("%v, %s: %+v", c.err, call.tool, cr)
+			}
+		}
+	}
+	if len(f.requests()) != n {
+		t.Fatal("a call without a token reached the Manager")
 	}
 	if strings.Contains(s.logs.String(), testToken) || strings.Contains(s.logs.String(), testToken[21:]) {
 		t.Fatal("the log holds the token")
@@ -592,34 +612,47 @@ func TestWriteRetriesKeepOperationID(t *testing.T) {
 	s := startSession(t, srv.URL)
 	s.initialize()
 	key := "POST /api/collections/" + col1 + "/members/add"
+	ok := map[string]any{"collection": map[string]any{"id": col1}, "operation": map[string]any{"id": "x"}}
+	// A lost answer, then a busy Manager: each is sent again, unchanged.
 	f.dropNext(key)
+	f.on(key, 200, ok)
 	f.on(key, 503, map[string]string{"error": "busy"})
-	f.on(key, 200, map[string]any{"collection": map[string]any{"id": col1}, "operation": map[string]any{"id": "x"}})
-	cr, out := s.call("add_to_collection", map[string]any{"collection_id": col1, "asset_ids": []string{asset1}})
-	got := f.requests()
-	if cr.IsError || len(got) != 3 {
-		t.Fatalf("%+v after %d requests", cr, len(got))
-	}
-	op := got[0].Body["operation_id"]
-	for _, g := range got {
-		if g.Body["operation_id"] != op {
-			t.Fatalf("a retry changed operation_id: %v", got)
+	f.on(key, 200, ok)
+	for i := range 2 {
+		cr, out := s.call("add_to_collection", map[string]any{"collection_id": col1, "asset_ids": []string{asset1}})
+		got := f.requests()[2*i:]
+		if cr.IsError || len(got) != 2 {
+			t.Fatalf("%d: %+v after %d requests", i, cr, len(got))
+		}
+		op := got[0].Body["operation_id"]
+		if got[1].Body["operation_id"] != op || out["operation_id"] != op {
+			t.Fatalf("%d: a retry changed operation_id: %v, result %v", i, got, out["operation_id"])
 		}
 	}
-	if out["operation_id"] != op {
-		t.Fatalf("result names %v, sent %v", out["operation_id"], op)
-	}
+	n := 4
 	// Every attempt lost: the agent is told the operation_id to retry with.
 	for range writeAttempts {
 		f.dropNext(key)
 	}
-	cr, _ = s.call("add_to_collection", map[string]any{"collection_id": col1, "asset_ids": []string{asset1}, "operation_id": "mine-1"})
-	if !cr.IsError || !strings.Contains(cr.Content[0].Text, `operation_id "mine-1"`) || len(f.requests()) != 3+writeAttempts {
+	cr, _ := s.call("add_to_collection", map[string]any{"collection_id": col1, "asset_ids": []string{asset1}, "operation_id": "mine-1"})
+	if !cr.IsError || !strings.Contains(cr.Content[0].Text, `operation_id "mine-1"`) || len(f.requests()) != n+writeAttempts {
 		t.Fatalf("lost answers: %+v (%d requests)", cr, len(f.requests()))
 	}
-	// A 4xx is not retried.
+	n += writeAttempts
+	// A lost answer, then a refusal: it may have been applied the first
+	// time, so the agent still gets the operation_id.
+	f.dropNext(key)
+	f.on(key, 401, map[string]string{"error": "unknown or revoked agent token"})
+	cr, _ = s.call("add_to_collection", map[string]any{"collection_id": col1, "asset_ids": []string{asset1}, "operation_id": "mine-2"})
+	if !cr.IsError || !strings.Contains(cr.Content[0].Text, `operation_id "mine-2"`) || !strings.Contains(cr.Content[0].Text, "token create") {
+		t.Fatalf("lost then 401: %+v", cr)
+	}
+	n += 2
+	// A definite refusal on the first attempt is not retried, and nothing
+	// was applied.
 	f.on(key, 403, map[string]string{"error": "no grant"})
-	if cr, _ := s.call("add_to_collection", map[string]any{"collection_id": col1, "asset_ids": []string{asset1}}); !cr.IsError || len(f.requests()) != 4+writeAttempts {
+	cr, _ = s.call("add_to_collection", map[string]any{"collection_id": col1, "asset_ids": []string{asset1}})
+	if !cr.IsError || strings.Contains(cr.Content[0].Text, "may or may not") || len(f.requests()) != n+1 {
 		t.Fatalf("403: %+v", cr)
 	}
 }
@@ -639,6 +672,9 @@ func TestMalformedMessages(t *testing.T) {
 		{`{"jsonrpc":"2.0","id":{"a":1},"method":"ping"}`, codeInvalidRequest, "null"},
 		{`{"jsonrpc":"2.0","id":null,"method":"ping"}`, codeInvalidRequest, "null"},
 		{`{"jsonrpc":"2.0","id":1.5,"method":"ping"}`, codeInvalidRequest, "null"},
+		{`{"jsonrpc":"2.0","id":1.0,"method":"ping"}`, codeInvalidRequest, "null"},
+		{`{"jsonrpc":"2.0","id":1e3,"method":"ping"}`, codeInvalidRequest, "null"},
+		{`{"jsonrpc":"2.0","id":true,"method":"ping"}`, codeInvalidRequest, "null"},
 		{`{"jsonrpc":"1.0","id":7,"method":"ping"}`, codeInvalidRequest, "7"},
 		{`{"jsonrpc":"2.0","id":8}`, codeInvalidRequest, "8"},
 		{`{"jsonrpc":"2.0","id":"s","method":"resources/list"}`, codeMethodNotFound, `"s"`},

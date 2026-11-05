@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"regexp"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -28,8 +29,11 @@ const (
 	// (internal/manager maxCollectionRequestMembers).
 	maxAssetsPerEdit = 255
 	// writeAttempts: a write whose answer was lost, or that found the
-	// Manager busy (503), is sent again with the same operation_id.
-	writeAttempts = 3
+	// Manager busy (503), is sent again with the same operation_id. Each
+	// attempt waits at most writeAttemptTimeout, so the call (two attempts
+	// and a 1 s pause) ends within toolTimeout.
+	writeAttempts       = 2
+	writeAttemptTimeout = 26 * time.Second
 )
 
 // Tools runs the MCP tools against the Manager.
@@ -160,7 +164,9 @@ var toolList = []*Tool{
 		Name:  "create_collection",
 		Title: "Create a collection",
 		Description: "Create a collection, optionally with members (asset IDs). Every member must be a file the person's project " +
-			"grants cover. Returns the collection and the operation_id used. Collections cannot be deleted through this server.",
+			"grants cover. Supply your own operation_id (any unique value, e.g. a UUID) and reuse it if you retry: a retry " +
+			"with it returns the same collection, while a retry without it may create a second one. Returns the collection " +
+			"and the operation_id used. Collections cannot be deleted through this server.",
 		InputSchema: json.RawMessage(`{
   "type": "object",
   "properties": {
@@ -362,8 +368,21 @@ func (t *Tools) noteRefused(tool string, n int) {
 
 // ---- reads -----------------------------------------------------------------
 
-func (t *Tools) get(ctx context.Context, path string, q url.Values, out any) error {
+// client is the Manager client of the stored agent token; why there is
+// none is the tool's error.
+func (t *Tools) client() (*Client, error) {
 	c, err := t.Client()
+	switch {
+	case errors.Is(err, ErrNoToken):
+		return nil, &toolError{"No agent token is stored on this Mac. A person must mint one in a terminal: juicemount-mcp token create --name <name>."}
+	case err != nil:
+		return nil, &toolError{fmt.Sprintf("The agent token on this Mac cannot be read (%v). Run juicemount-mcp token create again, or allow juicemount-mcp access to it in Keychain Access.", err)}
+	}
+	return c, nil
+}
+
+func (t *Tools) get(ctx context.Context, path string, q url.Values, out any) error {
+	c, err := t.client()
 	if err != nil {
 		return err
 	}
@@ -673,9 +692,12 @@ func assetRefs(ids []string) ([]memberRef, error) {
 
 // write sends a change with its operation_id, again with the same one when
 // the answer was lost or the Manager was busy (503): the Manager applies an
-// operation_id once and answers a repeat with the first result.
+// operation_id once and answers a repeat with the first result. Once an
+// attempt may have reached the Manager without a definite answer (lost,
+// timed out, cancelled, a 5xx), any failure tells the agent the
+// operation_id to retry with: the change may have been made.
 func (t *Tools) write(ctx context.Context, path, opID string, body any) (any, error) {
-	c, err := t.Client()
+	c, err := t.client()
 	if err != nil {
 		return nil, err
 	}
@@ -683,18 +705,30 @@ func (t *Tools) write(ctx context.Context, path, opID string, body any) (any, er
 		Collection json.RawMessage `json:"collection"`
 		Operation  json.RawMessage `json:"operation"`
 	}
+	uncertain := false
 	for attempt := 1; ; attempt++ {
-		err = c.Do(ctx, http.MethodPost, path, nil, body, &reply)
+		actx, cancel := context.WithTimeout(ctx, writeAttemptTimeout)
+		err = c.Do(actx, http.MethodPost, path, nil, body, &reply)
+		cancel()
+		if err == nil {
+			break
+		}
 		var ae *APIError
-		retry := errors.Is(err, errNoAnswer) || errors.As(err, &ae) && ae.Status == http.StatusServiceUnavailable
+		definite := errors.As(err, &ae) && ae.Status < 500
+		if !definite {
+			uncertain = true
+		}
+		retry := errors.Is(err, errNoAnswer) || errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil ||
+			ae != nil && ae.Status == http.StatusServiceUnavailable
 		if !retry || attempt == writeAttempts || ctx.Err() != nil {
 			break
 		}
 		t.Log.Printf("%s: no usable answer (attempt %d); sending the same operation again", path, attempt)
-		t.Sleep(time.Duration(attempt) * time.Second)
+		t.Sleep(time.Second)
 	}
-	if errors.Is(err, errNoAnswer) {
-		return nil, &toolError{fmt.Sprintf("%v. The change may or may not have been made: call again with operation_id %q to retry it safely", err, opID)}
+	if err != nil && uncertain {
+		return nil, &toolError{fmt.Sprintf("%s. The change may or may not have been made: call again with operation_id %q (and the same arguments) to retry it safely; it is applied at most once.",
+			strings.TrimSuffix(errorMessage(err), "."), opID)}
 	}
 	if err != nil {
 		return nil, err
