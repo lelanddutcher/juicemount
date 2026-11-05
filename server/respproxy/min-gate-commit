@@ -15,9 +15,10 @@
 # session and locked sets, the heartbeat gate, nextinode only as juicefs's
 # recorded batch step, and recorded inode batches for new inodes). It also
 # includes the Manager's removal of its own empty, recorded smart-folder
-# views and the entrypoint that renders the smart-folder roots it runs.
+# views and the entrypoint that renders the smart-folder roots it runs,
+# saved-query views' root included.
 #
 # Bump after changes to internal/respproxy or server/respproxy/entrypoint.sh.
 # TestH8BGateCoversEntrypointHandshake checks ancestry with full Git history.
 # A squash or rebase requires a new pin to the resulting release-line commit.
-2e4e145e5c1dba2540bad0c5a124b6876663ab47
+a336198d5acd09d0d4c2aaf76bcae3bff9670dcf
