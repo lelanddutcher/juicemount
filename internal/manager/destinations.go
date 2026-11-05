@@ -943,10 +943,13 @@ func resolveFileDestPath(p string) (string, error) {
 }
 
 // confineDestination applies the same root check the ad-hoc Out
-// migration uses (pathAllowed) to a file destination, on both the path
-// as given and its fully resolved form, and records the resolved form
-// under fileCheckedPathKey. Other kinds just lose any client-supplied
-// value for that key.
+// migration uses (pathAllowed) to a file destination's fully resolved
+// path (symlinks resolved through the longest existing prefix), which is
+// where a sync would write, and records it under fileCheckedPathKey.
+// The path as given is not checked separately: pathAllowed cannot resolve
+// a folder that does not exist yet, so a root reached through a symlink
+// (macOS /var -> /private/var, a symlinked dataset) would be refused.
+// Other kinds just lose any client-supplied value for that key.
 func (a *API) confineDestination(d Destination) error {
 	if d.Kind != "file" {
 		delete(d.Config, fileCheckedPathKey)
@@ -962,7 +965,7 @@ func (a *API) confineFileConfig(cfg map[string]string) error {
 	if err != nil {
 		return err
 	}
-	if !a.pathAllowed(p) || !a.pathAllowed(resolved) {
+	if !a.pathAllowed(resolved) {
 		return errFileDestOutsideRoots
 	}
 	cfg[fileCheckedPathKey] = resolved
