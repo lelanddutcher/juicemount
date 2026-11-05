@@ -762,8 +762,9 @@ func TestCollectionViewsNamesRecordedFirst(t *testing.T) {
 	}
 }
 
-// refusingBackend is the OS backend whose FS refuses (EROFS) renaming an
-// entry of the collections root, as the RESP proxy refuses the Manager.
+// refusingBackend is the OS backend whose FS refuses (EROFS) removing an
+// entry of the collections root, as the RESP proxy refuses a view it has
+// no record of.
 type refusingBackend struct {
 	osBackend
 	tries atomic.Int64
@@ -774,12 +775,12 @@ type refusingFS struct {
 	b *refusingBackend
 }
 
-func (f refusingFS) Place(from, to string) error {
-	if filepath.Dir(from) == "Collections" {
+func (f refusingFS) Rmdir(p string) error {
+	if filepath.Dir(p) == "Collections" {
 		f.b.tries.Add(1)
 		return syscall.EROFS
 	}
-	return f.FS.Place(from, to)
+	return f.FS.Rmdir(p)
 }
 
 func (b *refusingBackend) acquire() (smartfolders.FS, func(), error) {
