@@ -121,6 +121,18 @@ func (o *opLog) Swap(tmp, p string) error {
 	return err
 }
 
+// RemoveIno forwards to the backend's inode-checked unlink when it has one.
+func (o *opLog) RemoveIno(p string, ino uint64) error {
+	*o.events = append(*o.events, "remove "+p)
+	if o.beforeRemove != nil {
+		o.beforeRemove(p)
+	}
+	if ir, ok := o.FS.(smartfolders.InodeRemover); ok {
+		return ir.RemoveIno(p, ino)
+	}
+	return o.FS.Remove(p)
+}
+
 func (o *opLog) Rmdir(p string) error {
 	*o.events = append(*o.events, "rmdir "+p)
 	if o.beforeRmdir != nil {

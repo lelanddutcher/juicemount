@@ -63,8 +63,11 @@ package manager
 // project root (project depth 2), and the proxy lets only an admin rename
 // or remove one. There the old view of a renamed or deleted collection is
 // emptied but stays, recorded as the Manager's (reused if a collection
-// takes that name again), reported under views_left, and retried with
-// backoff; an admin can remove the empty folder.
+// takes that name again) and reported under views_left. A view the volume
+// refused to remove is parked: tried again only after
+// collectionViewsPark or a restart. Recorded views, left-behind ones
+// included, are capped at twice the view limit: at the cap no new view is
+// made and views left behind are not retried (both counted).
 //
 // Limits. At most collectionViewsMaxViews wanted views (collections
 // beyond it, by creation order, get none; views left behind do not count)
@@ -85,7 +88,8 @@ package manager
 // catches what events miss (a member file coming back, a change made while
 // the Manager was down). A pass starts no new view once it has resolved
 // collectionViewsPassOps members or run collectionViewsPassTime, changed
-// collections first, and schedules the next pass for the rest, so /Recents
+// collections first (each list resuming after where the last pass
+// stopped), and schedules the next pass for the rest, so /Recents
 // (same goroutine) waits at most about one pass. Nothing here is on the
 // NFS or Finder path.
 
@@ -93,6 +97,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log"
 	"path"
 	"slices"
@@ -100,6 +105,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/lelanddutcher/juicemount/internal/continuity"
@@ -119,6 +125,11 @@ const (
 	collectionViewsPassOps  = 1000
 	collectionViewsPassTime = 5 * time.Second
 	collectionViewsRootList = 4096 // root entries read for name clashes
+	// A view the volume refused to remove (not one a user's entry keeps)
+	// is parked: tried again only after this long, or after a restart.
+	collectionViewsPark = 6 * time.Hour
+	// Ownership.Lost entries are reported for this many passes at most.
+	collectionViewsLostPasses = 100
 )
 
 // errMembersUnresolved: a member's path could not be read (the volume is
@@ -161,6 +172,13 @@ type CollectionViewStats struct {
 	RefusedLinks        int    `json:"refused_links"`        // e.g. the name holds a user's entry
 	UnresolvedMembers   int    `json:"unresolved_members"`   // path unreadable: link kept as it was, or none
 	Deferred            int    `json:"deferred_collections"` // left for the next pass (budget)
+	// Recorded views (wanted and left behind) are capped at MaxRecorded:
+	// at the cap no new view is made (ViewsAtCap counts the collections
+	// waiting) and views left behind are not retried (ViewsParked).
+	MaxRecorded  int `json:"max_recorded_views"`
+	ViewsAtCap   int `json:"views_waiting_at_cap"`
+	ViewsParked  int `json:"views_parked"`
+	LostOverflow int `json:"lost_overflow,omitempty"`
 	// ViewsLeft: views no collection wants that are still there, with why:
 	// a user's entry inside, or the volume refused removing the folder.
 	ViewsLeft   []string  `json:"views_left,omitempty"`
@@ -200,7 +218,11 @@ type collectionViews struct {
 	sweepAt       time.Time
 	rootRetryAt   time.Time
 	backoff       map[string]*folderBackoff // by view folder
-	left          map[string]string         // view folder -> why it was not removed
+	parked        map[string]time.Time      // view folder -> next removal try
+	parkFor       time.Duration
+	lostPasses    map[string]int       // Ownership.Lost path -> passes reported
+	cursor        catalog.CollectionID // where the last budget-limited pass stopped
+	left          map[string]string    // view folder -> why it was not removed
 	memberBackoff map[continuity.AssetID]*folderBackoff
 	sweepPending  map[catalog.CollectionID]bool
 
@@ -225,6 +247,9 @@ func (c *collectionViews) init() {
 	c.sweep, c.debounce = collectionViewsSweep, collectionViewsDebounce
 	c.passOps, c.passTime = collectionViewsPassOps, collectionViewsPassTime
 	c.memberBackoff = map[continuity.AssetID]*folderBackoff{}
+	c.parked = map[string]time.Time{}
+	c.parkFor = collectionViewsPark
+	c.lostPasses = map[string]int{}
 	c.sweepPending = map[catalog.CollectionID]bool{}
 	c.seen = map[catalog.CollectionID]*collSeen{}
 	c.backoff = map[string]*folderBackoff{}
@@ -425,16 +450,18 @@ func (s *smartFoldersService) collectionsCycle(ctx context.Context, fsys smartfo
 	root := s.cfg.Settings.CollectionsRoot
 	st := &CollectionViewStats{Root: root, MaxViews: c.maxViews, MaxLinksPerView: c.maxLinks, LastPass: now}
 	defer func() { c.stats.Store(st) }()
-	// Wanted views are bounded by the collection cutoff below; views left
-	// behind (being removed) do not count against it.
+	// Wanted views are bounded by the collection cutoff below; all recorded
+	// views, left-behind ones included, by twice that.
 	rec := &smartfolders.Reconciler{
-		FS:      fsys,
-		Root:    root,
-		Own:     c.own,
-		Persist: s.persist,
-		Gate:    s.gate(ctx),
-		Exclude: []string{s.cfg.Settings.Root},
+		FS:       fsys,
+		Root:     root,
+		Own:      c.own,
+		Persist:  s.persist,
+		Gate:     s.gate(ctx),
+		Exclude:  []string{s.cfg.Settings.Root},
+		MaxViews: 2 * c.maxViews,
 	}
+	st.MaxRecorded = rec.MaxViews
 	defer func() { c.rootOwned.Store(c.own.Root != nil && !c.own.Root.Pending) }()
 	state, err := rec.CheckRoot()
 	if err != nil {
@@ -548,17 +575,38 @@ func (s *smartFoldersService) collectionsCycle(ctx context.Context, fsys smartfo
 
 	// 1. Views no collection wants (deleted, renamed away, over the
 	// limit) go, unless a user put something in them.
+	// A view the volume refused to remove is parked; at the cap of recorded
+	// views, every view already left behind is (until a restart).
+	atCap := len(c.own.Views) >= rec.MaxViews
 	for _, folder := range sortedFolders(c.own.Views) {
 		if wanted[folder] || waiting(folder) {
+			continue
+		}
+		if until, ok := c.parked[folder]; ok && (now.Before(until) || atCap) {
+			st.ViewsParked++
+			continue
+		}
+		if _, left := c.left[folder]; left && atCap {
+			st.ViewsParked++
 			continue
 		}
 		res, err := rec.RemoveView(folder)
 		s.logCollectionView(root, folder, res, err)
 		if err != nil {
 			c.left[folder] = leftReason(err)
+			// The volume itself refused (the RESP proxy's denial reaches
+			// the JuiceFS client as EROFS): park. A busy lease or a
+			// user's entry is only backed off.
+			if errors.Is(err, syscall.EROFS) || errors.Is(err, syscall.EPERM) || errors.Is(err, syscall.EACCES) {
+				c.parked[folder] = now.Add(c.parkFor)
+				c.left[folder] += fmt.Sprintf(" (parked: tried again after %s or a restart)", c.parkFor)
+				st.Problems = append(st.Problems, err.Error())
+				continue
+			}
 			failed(folder, err)
 			continue
 		}
+		delete(c.parked, folder)
 		delete(c.left, folder)
 		delete(c.backoff, folder)
 		if c.own.Views[folder] == nil {
@@ -583,6 +631,7 @@ func (s *smartFoldersService) collectionsCycle(ctx context.Context, fsys smartfo
 			// does not apply.
 			delete(c.left, folder)
 			delete(c.backoff, folder)
+			delete(c.parked, folder)
 			need = true
 		}
 		switch {
@@ -592,8 +641,29 @@ func (s *smartFoldersService) collectionsCycle(ctx context.Context, fsys smartfo
 			swept = append(swept, job{col: col, sweep: true})
 		}
 	}
+	// Each list starts after the collection the last pass stopped at, so
+	// early collections that keep changing cannot starve later ones.
+	pos := map[catalog.CollectionID]int{}
+	for i, col := range cols {
+		pos[col.ID] = i
+	}
+	rotate := func(js []job) []job {
+		at, ok := pos[c.cursor]
+		if !ok {
+			return js
+		}
+		var after, before []job
+		for _, j := range js {
+			if pos[j.col.ID] > at {
+				after = append(after, j)
+			} else {
+				before = append(before, j)
+			}
+		}
+		return append(after, before...)
+	}
 	ops, more := 0, false
-	for _, j := range append(urgent, swept...) {
+	for _, j := range append(rotate(urgent), rotate(swept)...) {
 		col := j.col
 		folder := names[string(col.ID)]
 		if ops >= c.passOps || time.Since(started) >= c.passTime {
@@ -608,9 +678,13 @@ func (s *smartFoldersService) collectionsCycle(ctx context.Context, fsys smartfo
 			continue
 		}
 		delete(c.sweepPending, col.ID)
+		c.cursor = col.ID
 		prior := c.seen[col.ID]
 		seen, n, err := s.reconcileCollection(ctx, rec, src, col, folder, prior, now)
 		ops += n
+		if errors.Is(err, smartfolders.ErrTooManyViews) {
+			st.ViewsAtCap++
+		}
 		if err != nil {
 			failed(folder, err)
 			c.markDirty(col.ID)
@@ -654,6 +728,32 @@ func (s *smartFoldersService) collectionsCycle(ctx context.Context, fsys smartfo
 			delete(c.left, folder)
 		}
 	}
+	for folder := range c.parked {
+		if c.own.Views[folder] == nil {
+			delete(c.parked, folder)
+			delete(c.left, folder)
+		}
+	}
+	// Hidden paths lost with an old root: dropped once the path is
+	// confirmed gone, or after being reported for collectionViewsLostPasses.
+	if state == smartfolders.RootOwned || state == smartfolders.RootAbsent {
+		kept := c.own.Lost[:0:0]
+		for _, p := range c.own.Lost {
+			_, err := fsys.Lstat(p)
+			c.lostPasses[p]++
+			if errors.Is(err, fs.ErrNotExist) || c.lostPasses[p] > collectionViewsLostPasses {
+				delete(c.lostPasses, p)
+				continue
+			}
+			kept = append(kept, p)
+		}
+		if len(kept) != len(c.own.Lost) {
+			c.own.Lost = kept
+			if err := s.persist(); err != nil {
+				s.logOnce("save", fmt.Sprintf("saving state: %v", err))
+			}
+		}
+	}
 	if more {
 		s.scheduleCollections()
 	}
@@ -675,7 +775,10 @@ func (s *smartFoldersService) collectionsCycle(ctx context.Context, fsys smartfo
 		st.ViewsLeft = append(st.ViewsLeft, p+": a view moved aside here before its root was removed, renamed or replaced")
 	}
 	sort.Strings(st.ViewsLeft)
+	st.LostOverflow = c.own.LostOverflow
+	c.mu.Lock()
 	st.Deferred = len(c.sweepPending) + len(c.dirty)
+	c.mu.Unlock()
 }
 
 // leftReason says why a view no collection wants is still there.

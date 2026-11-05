@@ -651,7 +651,10 @@ func TestCollectionViewsUnknownIsNotGone(t *testing.T) {
 	e.svc.coll.markDirty(collID(1))
 	e.pass()
 	e.want(map[string]string{"Shoot/a.mov": "Proj/a.mov", "Shoot/b.mov": "Proj/b.mov", "Shoot/c.mov": "Proj/c.mov"})
-	if b := e.svc.coll.backoff["Shoot"]; b != nil || !e.svc.coll.dirty[collID(1)] {
+	e.svc.coll.mu.Lock()
+	dirty := e.svc.coll.dirty[collID(1)]
+	e.svc.coll.mu.Unlock()
+	if b := e.svc.coll.backoff["Shoot"]; b != nil || !dirty {
 		t.Fatalf("backoff %+v, dirty %v", b, e.svc.coll.dirty)
 	}
 }
@@ -757,4 +760,135 @@ func TestCollectionViewsNamesRecordedFirst(t *testing.T) {
 	if err := json.Unmarshal(data, &st); err != nil || st.Collections == nil || st.Collections.Folders[collID(2)] != "shoot (2)" {
 		t.Fatalf("state = %s (%v)", data, err)
 	}
+}
+
+// refusingBackend is the OS backend whose FS refuses (EROFS) renaming an
+// entry of the collections root, as the RESP proxy refuses the Manager.
+type refusingBackend struct {
+	osBackend
+	tries atomic.Int64
+}
+
+type refusingFS struct {
+	smartfolders.FS
+	b *refusingBackend
+}
+
+func (f refusingFS) Place(from, to string) error {
+	if filepath.Dir(from) == "Collections" {
+		f.b.tries.Add(1)
+		return syscall.EROFS
+	}
+	return f.FS.Place(from, to)
+}
+
+func (b *refusingBackend) acquire() (smartfolders.FS, func(), error) {
+	fsys, release, err := b.osBackend.acquire()
+	if err != nil {
+		return nil, nil, err
+	}
+	return refusingFS{fsys, b}, release, nil
+}
+
+func newRefusingEnv(t *testing.T, files ...string) (*collViewsEnv, *refusingBackend) {
+	e := newCollViewsEnv(t, files...)
+	b := &refusingBackend{osBackend: osBackend{root: e.root, mountCheck: func(string) error { return nil }}}
+	e.svc.cfg.Backend = b
+	return e, b
+}
+
+// A view the volume refuses to remove is parked: not tried again at the
+// next backoff, only after the park time.
+func TestCollectionViewsRefusedRemovalIsParked(t *testing.T) {
+	e, b := newRefusingEnv(t, "P/a.mov")
+	e.attach()
+	e.create(collID(1), "Shoot", "P/a.mov")
+	e.pass()
+	e.apply(catalog.Change{RemoveCollection: &catalog.RemoveCollection{CollectionID: collID(1)}})
+	e.pass()
+	if b.tries.Load() != 1 {
+		t.Fatalf("tries = %d", b.tries.Load())
+	}
+	e.want(map[string]string{"Shoot/": "<empty>"})
+	for i := 0; i < 3; i++ {
+		e.clk.add(time.Hour) // past every ordinary backoff step so far
+		e.pass()
+	}
+	if st := e.svc.collectionStats(); b.tries.Load() != 1 || st.ViewsParked != 1 {
+		t.Fatalf("tries = %d, stats %+v", b.tries.Load(), st)
+	}
+	e.clk.add(collectionViewsPark)
+	e.pass()
+	if b.tries.Load() != 2 {
+		t.Fatalf("not tried after the park time: %d", b.tries.Load())
+	}
+}
+
+// Recorded views are capped at twice the view limit: at the cap no new
+// view is made (counted) and views left behind are not retried.
+func TestCollectionViewsRecordedCap(t *testing.T) {
+	e, b := newRefusingEnv(t, "P/a.mov", "P/b.mov", "P/c.mov")
+	e.svc.coll.maxViews = 1
+	e.attach()
+	for i, f := range []string{"P/a.mov", "P/b.mov"} {
+		e.create(collID(i+1), fmt.Sprintf("C%d", i+1), f)
+		e.pass()
+		e.apply(catalog.Change{RemoveCollection: &catalog.RemoveCollection{CollectionID: collID(i + 1)}})
+		e.pass()
+	}
+	e.create(collID(3), "C3", "P/c.mov")
+	e.pass()
+	e.want(map[string]string{"C1/": "<empty>", "C2/": "<empty>"})
+	tries := b.tries.Load()
+	e.clk.add(2 * collectionViewsPark)
+	e.pass()
+	st := e.svc.collectionStats()
+	if st.ViewsAtCap != 1 || st.ViewsParked != 2 || b.tries.Load() != tries || len(e.svc.coll.own.Views) != 2 {
+		t.Fatalf("tries %d->%d, stats %+v", tries, b.tries.Load(), st)
+	}
+}
+
+// Under a tight budget, collections that change every pass do not starve
+// a later one.
+func TestCollectionViewsBudgetRotates(t *testing.T) {
+	e := newCollViewsEnv(t, "P/a.mov", "P/b.mov", "P/c.mov")
+	e.svc.coll.passOps = 1
+	e.attach()
+	for i, f := range []string{"P/a.mov", "P/b.mov", "P/c.mov"} {
+		e.create(collID(i+1), fmt.Sprintf("C%d", i+1), f)
+	}
+	for i := 0; i < 4; i++ {
+		e.pass()
+		e.svc.coll.markDirty(collID(1)) // C1 and C2 keep changing
+		e.svc.coll.markDirty(collID(2))
+	}
+	if got := e.tree()["C3/c.mov"]; got != "P/c.mov" {
+		t.Fatalf("C3 starved: %v", e.tree())
+	}
+}
+
+// Events mark collections dirty while a pass runs (run with -race).
+func TestCollectionViewsDirtyMarkedDuringPass(t *testing.T) {
+	e := newCollViewsEnv(t, "P/a.mov")
+	e.attach()
+	e.create(collID(1), "Shoot", "P/a.mov")
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				e.svc.coll.markDirty(collID(1))
+			}
+		}
+	}()
+	for i := 0; i < 5; i++ {
+		e.pass()
+	}
+	close(stop)
+	<-done
+	e.want(map[string]string{"Shoot/a.mov": "P/a.mov"})
 }

@@ -292,6 +292,33 @@ var viewTests = map[string]func(*testing.T, Fixture){
 		}
 		targetsIntact(t, fx)
 	},
+	// The .DS_Store replaced between its check and its unlink (a new
+	// inode) is not removed: the view goes back, holding it.
+	"ZV_RemoveViewFinderFileReplacedKept": func(t *testing.T, fx Fixture) {
+		g := newCollectionsRig(t, fx)
+		shoot(t, fx, g)
+		fx.WriteFile(t, "Collections/Shoot/.DS_Store")
+		g.log.beforeRemove = func(p string) {
+			if !strings.HasSuffix(p, "/.DS_Store") {
+				return
+			}
+			dir := strings.TrimSuffix(p, "/.DS_Store")
+			fx.WriteFile(t, dir+"/new")
+			if err := fx.FS().Swap(dir+"/new", p); err != nil {
+				t.Fatal(err)
+			}
+			fx.Remove(t, dir+"/new") // the checked file is gone; the new one stays
+		}
+		if _, err := g.rec.RemoveView("Shoot"); !errors.Is(err, smartfolders.ErrViewInUse) {
+			t.Fatalf("err = %v", err)
+		}
+		if names := fx.ReadDir(t, "Collections/Shoot"); !reflect.DeepEqual(names, []string{".DS_Store"}) {
+			t.Fatalf("view holds %v", names)
+		}
+		if names := rootEntries(t, fx); !reflect.DeepEqual(names, []string{"Shoot"}) {
+			t.Fatalf("root holds %v", names)
+		}
+	},
 	// Nothing else counts as the Finder's: AppleDouble files, other
 	// dot-names, a .DS_Store that is not a regular file, or a .DS_Store
 	// next to anything else keep the view, untouched.

@@ -23,3 +23,5 @@ func dirHandleOp(int, string, uint64, fs.FileMode) (Info, error) {
 }
 
 func rmdirAt(int, string) error { return errors.ErrUnsupported }
+
+func unlinkIfIno(int, string, uint64) error { return errors.ErrUnsupported }

@@ -53,9 +53,11 @@ type Ownership struct {
 	Views map[string]*OwnedView `json:"views,omitempty"` // by top-level folder name
 	// Lost names hidden paths a view had been moved aside to (RemoveView)
 	// when its root was removed, renamed or replaced: the view directory
-	// may still be there, under the old root. Kept (at most maxLost) so it
-	// stays reported; nothing acts on them.
-	Lost []string `json:"lost,omitempty"`
+	// may still be there, under the old root. Kept (at most maxLost; the
+	// rest only counted in LostOverflow) so they are reported; the caller
+	// clears them (nothing in the volume is changed for them).
+	Lost         []string `json:"lost,omitempty"`
+	LostOverflow int      `json:"lost_overflow,omitempty"`
 }
 
 // maxLost bounds Ownership.Lost.
@@ -294,8 +296,12 @@ func (r *Reconciler) dropAll() error {
 		removal := r.droppedRemoval(r.Own.Views[folder])
 		names = append(names, removal...)
 		for _, p := range removal {
-			if len(r.Own.Lost) < maxLost && !slices.Contains(r.Own.Lost, p) {
+			switch {
+			case slices.Contains(r.Own.Lost, p):
+			case len(r.Own.Lost) < maxLost:
 				r.Own.Lost = append(r.Own.Lost, p)
+			default:
+				r.Own.LostOverflow++
 			}
 		}
 	}
@@ -959,7 +965,7 @@ func (r *Reconciler) RemoveView(folder string) (Result, error) {
 	if err != nil {
 		return res, err
 	}
-	if len(names) > 0 && !r.onlyFinderFile(view, names) {
+	if only, _ := r.onlyFinderFile(view, names); len(names) > 0 && !only {
 		return res, fmt.Errorf("%s: %w", view, ErrViewInUse)
 	}
 	release, err := r.gateView(view)
@@ -1025,13 +1031,28 @@ func (e *StuckError) Unwrap() error { return e.Err }
 const finderFile = ".DS_Store"
 
 // onlyFinderFile reports whether the names (a listing of up to two
-// entries) leave the view empty but for a regular finderFile.
-func (r *Reconciler) onlyFinderFile(dir string, names []string) bool {
+// entries) leave the view empty but for a regular finderFile, and its inode.
+func (r *Reconciler) onlyFinderFile(dir string, names []string) (bool, uint64) {
 	if len(names) != 1 || names[0] != finderFile {
-		return false
+		return false, 0
 	}
 	info, err := r.FS.Lstat(dir + "/" + finderFile)
-	return err == nil && info.Type == TypeRegular
+	return err == nil && info.Type == TypeRegular, info.Ino
+}
+
+// InodeRemover is implemented by an FS that can unlink a name only while
+// it is still the given inode (checked through the open parent directory).
+type InodeRemover interface {
+	RemoveIno(p string, ino uint64) error
+}
+
+// removeFinderFile unlinks dir's finderFile, only if it is still the file
+// with inode ino where the FS can check that.
+func (r *Reconciler) removeFinderFile(dir string, ino uint64) error {
+	if ir, ok := r.FS.(InodeRemover); ok {
+		return ir.RemoveIno(dir+"/"+finderFile, ino)
+	}
+	return r.FS.Remove(dir + "/" + finderFile)
 }
 
 // gateView runs the gate for one view; the release is never nil.
@@ -1071,9 +1092,11 @@ func (r *Reconciler) settleRemoval(folder string, ov *OwnedView) (bool, error) {
 	case info.Type == TypeDir && ov.Ino != 0 && info.Ino == ov.Ino:
 		// The Finder's settings file goes with the view; anything else
 		// keeps it (Rmdir refuses).
-		if names, err := r.FS.List(tp, 2); err == nil && r.onlyFinderFile(tp, names) {
-			if err := r.FS.Remove(tp + "/" + finderFile); err != nil && !errors.Is(err, fs.ErrNotExist) {
-				return false, err
+		if names, err := r.FS.List(tp, 2); err == nil {
+			if only, ino := r.onlyFinderFile(tp, names); only {
+				// Refused (replaced since it was looked at): Rmdir then
+				// finds the view not empty and it goes back.
+				_ = r.removeFinderFile(tp, ino)
 			}
 		}
 		err := r.FS.Rmdir(tp)

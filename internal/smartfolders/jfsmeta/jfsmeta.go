@@ -334,6 +334,27 @@ func (f *FS) Rmdir(p string) error {
 	return errno(f.m.Rmdir(f.ctx, dir, leaf, true))
 }
 
+// RemoveIno unlinks the non-directory p, bypassing the trash, only if the
+// lookup right before it finds inode ino.
+func (f *FS) RemoveIno(p string, ino uint64) error {
+	dir, leaf, err := f.parent(p)
+	if err != nil {
+		return err
+	}
+	var got meta.Ino
+	var attr meta.Attr
+	if st := f.m.Lookup(f.ctx, dir, leaf, &got, &attr, false); st != 0 {
+		return st
+	}
+	if uint64(got) != ino {
+		return fmt.Errorf("%s is no longer the entry that was checked", p)
+	}
+	if attr.Typ == meta.TypeDirectory {
+		return syscall.EISDIR
+	}
+	return errno(f.m.Unlink(f.ctx, dir, leaf, true))
+}
+
 // The read-only lookups below serve the continuity binder. Each is plain
 // metadata reads (GET i<ino>, HGET/HGETALL d<dir>, HGETALL p<ino>, or the
 // allow-listed scriptLookup): reads pass the RESP proxy unchecked

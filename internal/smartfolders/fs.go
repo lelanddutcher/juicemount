@@ -311,3 +311,19 @@ func (o *OSFS) Rmdir(p string) error {
 	defer dir.Close()
 	return rmdirAt(int(dir.Fd()), leaf)
 }
+
+// RemoveIno unlinks the non-directory p only if it is still inode ino, as
+// seen through the open parent directory right before the unlink.
+func (o *OSFS) RemoveIno(p string, ino uint64) error {
+	d, leaf, done, err := o.parent(p)
+	if err != nil {
+		return err
+	}
+	defer done()
+	dir, err := d.Open(".")
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	return unlinkIfIno(int(dir.Fd()), leaf, ino)
+}
