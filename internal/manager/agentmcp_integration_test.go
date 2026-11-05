@@ -230,6 +230,42 @@ func TestAgentMCPAgainstManager(t *testing.T) {
 		}
 	}
 
+	// Members and results outside Ann's grants are withheld from her agent,
+	// and the count reaches it.
+	mixed := e.write("admin", "/api/collections", map[string]any{"name": "Mixed",
+		"members": []map[string]string{{"asset_id": ids[0]}, {"asset_id": bAsset}}}, 200).Collection.ID
+	_, isErr, mm := c.call("get_collection_members", map[string]any{"collection_id": string(mixed)})
+	if isErr || len(mm["members"].([]any)) != 1 || mm["withheld"] != 1.0 {
+		t.Fatalf("mixed members: %v", mm)
+	}
+	wide := string(e.queryWrite("admin", "/api/queries", map[string]any{"name": "All clients", "folders": []string{"Clients"}}, 200).Query.ID)
+	_, isErr, wr := c.call("get_saved_query_results", map[string]any{"query_id": wide})
+	if isErr || wr["withheld"] == nil || wr["withheld"].(float64) < 10 {
+		t.Fatalf("wide results: %v", wr)
+	}
+	for _, r := range wr["results"].([]any) {
+		if p := r.(map[string]any)["path"].(string); !strings.HasPrefix(p, "Clients/A/") {
+			t.Fatalf("Ann's agent sees %s", p)
+		}
+	}
+	// A file moved from B into A with no event yet: its catalog hint (and
+	// first name) are B's, so the agent gets them empty.
+	rec := e.do("admin", "GET", "/api/continuity/asset/"+bAsset, nil)
+	var bFile FileView
+	if rec.Code != 200 || json.Unmarshal(rec.Body.Bytes(), &bFile) != nil {
+		t.Fatalf("admin asset: %d %s", rec.Code, rec.Body)
+	}
+	e.vol.set(func(files map[string]uint64) {
+		ino := files[strings.TrimPrefix(bFile.Path, "/")]
+		delete(files, strings.TrimPrefix(bFile.Path, "/"))
+		files["Clients/A/moved.wav"] = ino
+	})
+	movedID := bAsset
+	text, isErr, mv := c.call("get_file", map[string]any{"asset_id": movedID})
+	if isErr || mv["path"] != "/Clients/A/moved.wav" || mv["mount_path"] != "/Volumes/zpool/Clients/A/moved.wav" || mv["path_hint"] != nil || mv["label"] != "" {
+		t.Fatalf("moved file: %s", text)
+	}
+
 	// The person revokes the token from their Mac: the agent stops at once.
 	id := store.rec.ID
 	stale := *store.rec
