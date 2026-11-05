@@ -18,7 +18,12 @@ package manager
 // any authenticated caller reads whole (Teams v1, as through the mount):
 // finding files is scoped to the grants, as the agent decision asks. A file
 // outside the grants is left out of a page, and by ID it is 404, as if it
-// did not exist.
+// did not exist (also when its path cannot be read and its hint is outside
+// the grants). For a person limited to grants, path_hint is shown only
+// inside them and label only when it is the file's current name: a stale
+// hint or a first name may come from outside. Agents read collection
+// members and query results under the same rule (the rest is withheld,
+// counted without names); Macs read those whole.
 //
 // Filters (all optional, combined with AND): name (a fragment of the file
 // name, ignoring case, compared in Unicode NFC as queries do), folder (one
@@ -81,6 +86,9 @@ var (
 	// catalog, files resolved on the volume.
 	findScanBudget    = 100_000
 	findResolveBudget = 1_000
+
+	// findBeforeStat runs before each volume resolution (tests).
+	findBeforeStat func()
 
 	findCursorRe = regexp.MustCompile(`^jfs-[0-9A-Za-z-]{1,64}-[0-9]{1,20}(-g[0-9]{1,9})?-hint$`)
 
@@ -331,6 +339,9 @@ func (h *collectionsAPI) routeFind(w http.ResponseWriter, r *http.Request, svc *
 			return false
 		}
 		out.Resolved++
+		if findBeforeStat != nil {
+			findBeforeStat()
+		}
 		st, err := svc.binder.Stat(ctx, hint.Ino, hint.Path)
 		switch {
 		case errors.Is(err, binder.ErrUnresolved):
@@ -389,6 +400,16 @@ func (c *collectionCall) fileView(hint binder.Hint, st binder.FileStat) (FileVie
 	}
 	v := FileView{AssetID: hint.AssetID, Name: path.Base(st.Path), Label: asset.Label, PathHint: hint.Path,
 		Path: "/" + st.Path, Size: st.Size, Modified: st.Mtime.UTC(), Collections: []FileCollection{}}
+	if c.actor.person != nil && c.actor.person.Access != personAccessAll {
+		// The live path is inside the grants; a stale hint, or the name the
+		// file was first catalogued with, may come from outside them.
+		if !c.actor.covers(hint.Path) {
+			v.PathHint = ""
+		}
+		if v.Label != v.Name {
+			v.Label = ""
+		}
+	}
 	if len(cols) > findCollectionsPerFile {
 		cols, v.MoreCollections = cols[:findCollectionsPerFile], true
 	}
@@ -419,6 +440,8 @@ func (h *collectionsAPI) routeAsset(w http.ResponseWriter, r *http.Request, svc 
 	}
 	st, err := svc.binder.Stat(c.ctx(), hint.Ino, hint.Path)
 	switch {
+	case errors.Is(err, binder.ErrUnresolved) && !actor.covers(hint.Path):
+		return notFound // do not say a file outside the grants exists
 	case errors.Is(err, binder.ErrUnresolved):
 		return failf(http.StatusServiceUnavailable, "cannot read the file's path on the volume; try again")
 	case err != nil:

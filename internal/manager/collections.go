@@ -22,7 +22,9 @@ package manager
 // person, with the budget of the Mac that minted it, on the requests
 // agentguard.go allows.
 //
-// What. Reads are shared (Teams v1: any authenticated caller). A person may
+// What. Reads are shared (Teams v1: any authenticated caller), except that
+// an agent reads only members inside its person's grants (the rest are
+// withheld, counted without names; discovery.go). A person may
 // write only where their project write grants (people.go) cover the files
 // the change touches, checked live on the volume: the members added or
 // removed, and for a rename or delete every member of the collection. A
@@ -70,6 +72,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"path"
 	"regexp"
 	"strconv"
 	"strings"
@@ -88,6 +91,9 @@ const (
 	maxCollectionBody           = 256 << 10
 	maxMemberPage               = 100
 	collectionVolumeSlots       = 2
+	// collectionAgentSlots: every agent shares this pool, apart from the
+	// people's, so agents finding files never hold up a Mac.
+	collectionAgentSlots = 1
 	// A Mac's budget: 5 requests a second sustained, bursts of 60, enough
 	// for a person paging through members (one request per page of 100)
 	// or an agent filing a batch, while a runaway client is cut off in
@@ -250,7 +256,8 @@ type collectionsAPI struct {
 	api       *API
 	people    *PrincipalStore // nil: only the admin key
 	prefix    string
-	slots     chan struct{} // people's volume-read slots
+	slots     chan struct{} // people's volume-read slots (their Macs)
+	agentSlot chan struct{} // agents' own, so they never hold up a Mac
 	adminSlot chan struct{} // the admin's own
 	mu        sync.Mutex
 	inflight  map[string]bool // actors with a volume-reading request running
@@ -289,6 +296,7 @@ func (a *API) registerCollections(mux routeMux, prefix string, people *Principal
 func newCollectionsAPI(a *API, prefix string, people *PrincipalStore) *collectionsAPI {
 	return &collectionsAPI{api: a, people: people, prefix: prefix,
 		slots:     make(chan struct{}, collectionVolumeSlots),
+		agentSlot: make(chan struct{}, collectionAgentSlots),
 		adminSlot: make(chan struct{}, 1),
 		inflight:  map[string]bool{},
 		ipLimit:   newIPLimiter(collectionIPPerMinute, time.Now),
@@ -371,6 +379,7 @@ func (h *collectionsAPI) authenticateAgent(r *http.Request) (collectionActor, er
 		named := "a malformed or unknown token"
 		if t.ID != "" {
 			named = fmt.Sprintf("agent token %s (%q) of %s", t.ID, t.Name, t.Person)
+			h.audit.refusedToken(t, t.Mac, fmt.Sprintf("%s %s from %s: %v", r.Method, r.URL.Path, clientIP(r), err))
 		}
 		h.refusals.note("agent-tokens", fmt.Sprintf("manager: collections: refused %s %s with %s from %s: %v", r.Method, r.URL.Path, named, clientIP(r), err))
 		return collectionActor{}, failf(http.StatusUnauthorized, "%v", err)
@@ -413,11 +422,15 @@ func routeParts(p, base string) (parts []string, ok bool) {
 }
 
 // acquire takes a volume-read slot for actor: one request per actor at a
-// time; people share the common slots, the admin has its own.
+// time (a person's Macs and agents count as one actor); people's Macs share
+// the common slots, agents their own pool, the admin has its own.
 func (h *collectionsAPI) acquire(ctx context.Context, actor collectionActor) (release func(), err error) {
 	key, slots := actor.id(), h.slots
-	if actor.person == nil {
+	switch {
+	case actor.person == nil:
 		slots = h.adminSlot
+	case actor.agent != nil:
+		slots = h.agentSlot
 	}
 	h.mu.Lock()
 	if h.inflight[key] {
@@ -541,7 +554,7 @@ func (h *collectionsAPI) route(w http.ResponseWriter, r *http.Request, svc *cont
 	if err != nil {
 		return err
 	}
-	c := &collectionCall{svc: svc, actor: actor, library: library, w: w, r: r, audit: h.audit}
+	c := &collectionCall{svc: svc, actor: actor, library: library, w: w, r: r, audit: h.audit, people: h.people}
 	want := func(method string) error {
 		if r.Method != method {
 			return failf(http.StatusMethodNotAllowed, "%s only", method)
@@ -600,7 +613,8 @@ type collectionCall struct {
 	library continuity.LibraryID
 	w       http.ResponseWriter
 	r       *http.Request
-	audit   *agentAudit // records an agent's edits
+	audit   *agentAudit     // records an agent's edits
+	people  *PrincipalStore // re-checks an agent's token before an edit
 }
 
 func (c *collectionCall) ctx() context.Context { return c.r.Context() }
@@ -709,31 +723,71 @@ func (c *collectionCall) members(id catalog.CollectionID) error {
 	if err != nil {
 		return err
 	}
-	page, err := c.svc.store.ListCollectionMembers(c.ctx(), c.library, id, continuity.AssetID(after), limit)
-	if err != nil {
-		return err
-	}
+	// Withheld: members an agent may not see (agentVisible), counted
+	// without names; the page then reads on, up to findResolveBudget
+	// members, to fill itself. Macs and the admin see every member.
 	out := struct {
 		Collection CollectionView `json:"collection"`
 		Members    []MemberView   `json:"members"`
 		Next       string         `json:"next,omitempty"`
+		Withheld   int            `json:"withheld,omitempty"`
 	}{Collection: collectionView(col), Members: []MemberView{}}
-	for _, m := range page {
-		if err := c.ctx().Err(); err != nil {
-			return err
-		}
-		v, err := c.svc.binder.AssetByID(c.ctx(), m.AssetID)
+	cursor, read := continuity.AssetID(after), 0
+	for {
+		page, err := c.svc.store.ListCollectionMembers(c.ctx(), c.library, id, cursor, limit)
 		if err != nil {
 			return err
 		}
-		out.Members = append(out.Members, MemberView{AssetID: m.AssetID, Label: v.Label, Path: v.Path,
-			State: memberState(v), Error: v.ResolveError, AddedSequence: m.UpdatedSequence})
-	}
-	if len(page) == limit {
-		out.Next = string(page[len(page)-1].AssetID)
+		stopped := false
+		for _, m := range page {
+			if err := c.ctx().Err(); err != nil {
+				return err
+			}
+			if c.actor.agent != nil && read >= findResolveBudget {
+				stopped = true
+				break
+			}
+			read++
+			v, err := c.svc.binder.AssetByID(c.ctx(), m.AssetID)
+			if err != nil {
+				return err
+			}
+			cursor = m.AssetID
+			if !c.agentVisible(v.Path, v.ResolveError) {
+				out.Withheld++
+				continue
+			}
+			label := v.Label
+			if c.actor.agent != nil && label != path.Base(v.Path) {
+				label = "" // a first name from outside the grants
+			}
+			out.Members = append(out.Members, MemberView{AssetID: m.AssetID, Label: label, Path: v.Path,
+				State: memberState(v), Error: v.ResolveError, AddedSequence: m.UpdatedSequence})
+			if len(out.Members) == limit {
+				stopped = true
+				break
+			}
+		}
+		if stopped {
+			out.Next = string(cursor)
+			break
+		}
+		if len(page) < limit {
+			break
+		}
 	}
 	writeJSON(c.w, http.StatusOK, out)
 	return nil
+}
+
+// agentVisible: an agent may see a file at volumePath (its live path, read
+// without error) only inside its person's grants, as discovery does;
+// everyone else sees every file (Teams v1 reads are shared).
+func (c *collectionCall) agentVisible(volumePath, resolveError string) bool {
+	if c.actor.agent == nil {
+		return true
+	}
+	return volumePath != "" && resolveError == "" && c.actor.covers(volumePath)
 }
 
 // memberRef names a member by asset ID or by volume path (exactly one).
@@ -848,6 +902,9 @@ func (c *collectionCall) authorize(members []continuity.AssetID) error {
 		case err != nil:
 			return err
 		case a.Missing || a.Allowed:
+		case c.actor.agent != nil:
+			// An agent is not told names outside its person's grants.
+			return failf(http.StatusForbidden, "%s may not change %s: no project grant covers it", c.actor.person.Name, id)
 		default:
 			return failf(http.StatusForbidden, "%s may not write at /%s: no project grant covers it", c.actor.person.Name, a.Name)
 		}
@@ -927,6 +984,10 @@ func (c *collectionCall) change(opID string, id catalog.CollectionID, guarded bo
 func (c *collectionCall) apply(opID string, id catalog.CollectionID, changes []catalog.Change) error {
 	var unit uint64
 	if c.actor.agent != nil {
+		// The token may have been revoked since the request began.
+		if err := c.people.agentTokenWorks(c.actor.agent.ID); err != nil {
+			return failf(http.StatusUnauthorized, "%v", err)
+		}
 		rec := c.actor.auditWho()
 		rec.Action, rec.Detail = describeCollectionChange(opID, id, changes)
 		var err error

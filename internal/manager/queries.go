@@ -12,7 +12,9 @@ package manager
 // same handler serves both.
 //
 // What. Reads are shared (Teams v1: any authenticated caller), results
-// included: a query only shows names a reader can already see. A person may
+// included: a query only shows names a reader can already see. An agent
+// gets only the results inside its person's grants (the rest withheld,
+// counted without names). A person may
 // create, rename or delete a query only when their project write grants
 // cover every one of its folders (a grant covers its folder and everything
 // below), the rule collections apply to their members: a query is defined
@@ -292,9 +294,16 @@ func (c *queryCall) results(id catalog.QueryID) error {
 		Capped     bool `json:"capped,omitempty"`
 		Examined   int  `json:"examined"`
 		Candidates int  `json:"candidates"`
+		// Withheld: results an agent may not see (outside its person's
+		// grants), counted without names.
+		Withheld int `json:"withheld,omitempty"`
 	}{Query: queryView(q), Results: []QueryResultView{}, EvaluatedAt: cached.at.UTC(), AgeSeconds: int64(now.Sub(cached.at) / time.Second),
 		Unresolved: len(res.Unknown), OverLimit: res.Over, Capped: res.Capped > 0, Examined: res.Examined, Candidates: res.Examined + res.Capped}
 	for _, h := range res.Hits {
+		if !c.agentVisible(h.Path, "") {
+			out.Withheld++
+			continue
+		}
 		out.Results = append(out.Results, QueryResultView{h.AssetID, h.Path, h.Mtime.UTC()})
 	}
 	writeJSON(c.w, http.StatusOK, out)

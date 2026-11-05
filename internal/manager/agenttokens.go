@@ -22,9 +22,15 @@ package manager
 // It works only while it has not expired or been revoked, its person exists,
 // and that Mac is still approved, not flagged as cloned, assigned to that
 // person and in the same approval. Every request checks this under the
-// store lock, so any of those changes stops the token at once; and every
-// store write drops the tokens that fail it, so revoking a Mac and approving
-// it again, or reassigning it away and back, does not bring a token back.
+// store lock when it starts, and an agent's catalog edit checks it again
+// just before it is recorded (collectionCall.apply), so from the moment of
+// the change no new request and no edit not yet recorded goes through; a
+// read already running finishes. Every store write drops the tokens whose
+// Mac or person no longer fits, so revoking a Mac and approving it again, or
+// reassigning it away and back, does not bring a token back. A revoked or
+// expired token stays in the store as a tombstone until 30 days after its
+// expiry, so its use is refused by name and recorded in the audit log (at
+// most once a minute per token).
 //
 // Lists and revokes. GET /api/agent-tokens: a person (from a Mac) lists
 // their own tokens, the admin every token. POST /api/agent-tokens/{id}/revoke
@@ -67,6 +73,9 @@ const (
 	agentTokenNameBytes  = 64
 	// agentAuditDirName: the catalog audit log, beside the principal store.
 	agentAuditDirName = "catalog-audit"
+	// agentTokenTombstone: how long past its expiry a revoked or expired
+	// token is kept, to name it in refusals.
+	agentTokenTombstone = 30 * 24 * time.Hour
 )
 
 var (
@@ -75,6 +84,7 @@ var (
 
 	errAgentTokenInvalid  = errors.New("unknown or revoked agent token")
 	errAgentTokenExpired  = errors.New("this agent token has expired; mint a new one on your Mac")
+	errAgentTokenRevoked  = errors.New("this agent token was revoked")
 	errAgentTokenUnbound  = errors.New("this agent token no longer works: its Mac or its person changed")
 	errAgentTokenNotFound = errors.New("no such agent token")
 
@@ -96,6 +106,8 @@ type AgentToken struct {
 	SecretSHA256   string `json:"secret_sha256"`
 	CreatedAt      int64  `json:"created_at_ms"`
 	ExpiresAt      int64  `json:"expires_at_ms"`
+	// RevokedAt: when it was revoked (0: it was not); kept as a tombstone.
+	RevokedAt int64 `json:"revoked_at_ms,omitempty"`
 }
 
 // AgentTokenView is a token as the API lists it (no hash).
@@ -139,6 +151,9 @@ func (s *PrincipalStore) loadAgentTokens(tokens []AgentToken) {
 
 // agentTokenProblemLocked says why t no longer works (nil: it works).
 func (s *PrincipalStore) agentTokenProblemLocked(t *AgentToken, now time.Time) error {
+	if t.RevokedAt != 0 {
+		return errAgentTokenRevoked
+	}
 	if now.UnixMilli() >= t.ExpiresAt {
 		return errAgentTokenExpired
 	}
@@ -150,13 +165,17 @@ func (s *PrincipalStore) agentTokenProblemLocked(t *AgentToken, now time.Time) e
 	return nil
 }
 
-// agentTokensToKeepLocked drops the tokens that no longer work and returns
-// the rest, by ID, for the store file.
+// agentTokensToKeepLocked drops the tokens that no longer work (keeping
+// revoked and expired ones as tombstones for agentTokenTombstone past their
+// expiry) and returns the rest, by ID, for the store file.
 func (s *PrincipalStore) agentTokensToKeepLocked() []AgentToken {
 	now := s.opts.Now()
 	var out []AgentToken
 	for id, t := range s.agentTokens {
-		if err := s.agentTokenProblemLocked(t, now); err != nil {
+		err := s.agentTokenProblemLocked(t, now)
+		tomb := (errors.Is(err, errAgentTokenRevoked) || errors.Is(err, errAgentTokenExpired)) &&
+			now.Before(time.UnixMilli(t.ExpiresAt).Add(agentTokenTombstone))
+		if err != nil && !tomb {
 			log.Printf("manager: agent token %s (%q) of person %s from %s dropped: %v", t.ID, t.Name, t.Person, t.Mac, err)
 			delete(s.agentTokens, id)
 			continue
@@ -198,8 +217,22 @@ func (s *PrincipalStore) mintAgentToken(mac, personID, id, token, name string, d
 	return *t, nil
 }
 
+// agentTokenWorks checks again that the token id still works (an agent's
+// edit, just before it is recorded).
+func (s *PrincipalStore) agentTokenWorks(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	t := s.agentTokens[id]
+	if t == nil {
+		return errAgentTokenInvalid
+	}
+	return s.agentTokenProblemLocked(t, s.opts.Now())
+}
+
 // agentPerson authenticates an agent token: the Mac that minted it, a copy
-// of its person and the token. The secret is compared in constant time.
+// of its person and the token. The secret is compared in constant time. A
+// token that no longer works is returned with its error (the secret
+// matched), so the refusal can name it.
 func (s *PrincipalStore) agentPerson(token string) (string, Person, AgentToken, error) {
 	m := agentTokenRe.FindStringSubmatch(token)
 	if m == nil {
@@ -253,15 +286,17 @@ func (s *PrincipalStore) revokeAgentToken(id, personID string) (AgentToken, erro
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	t := s.agentTokens[id]
-	if t == nil || personID != "" && t.Person != personID {
+	if t == nil || t.RevokedAt != 0 || personID != "" && t.Person != personID {
 		return AgentToken{}, errAgentTokenNotFound
 	}
-	delete(s.agentTokens, id)
+	next := *t
+	next.RevokedAt = s.opts.Now().UnixMilli()
+	s.agentTokens[id] = &next
 	if err := s.saveStoreLocked(); err != nil {
 		s.agentTokens[id] = t
 		return AgentToken{}, err
 	}
-	return *t, nil
+	return next, nil
 }
 
 // ---- the catalog audit log -------------------------------------------------
@@ -281,6 +316,8 @@ type agentAudit struct {
 	dir string
 	mu  sync.Mutex
 	w   *auditlog.Writer
+	// refusedAt: when each known token's refused use was last recorded.
+	refusedAt map[string]time.Time
 }
 
 func (a *agentAudit) writer() *auditlog.Writer {
@@ -337,6 +374,24 @@ func (a *agentAudit) outcome(unit uint64, who auditlog.Record, err error) {
 	if _, aerr := w.Append(&rec); aerr != nil {
 		log.Printf("manager: catalog audit log: outcome of record %d not written: %v", unit, aerr)
 	}
+}
+
+// refusedToken records a refused use of a token the store knows (revoked,
+// expired or unbound), at most once a minute per token (best effort).
+func (a *agentAudit) refusedToken(t AgentToken, mac string, detail string) {
+	now := time.Now()
+	a.mu.Lock()
+	if a.refusedAt == nil || len(a.refusedAt) > 4096 {
+		a.refusedAt = map[string]time.Time{}
+	}
+	last, seen := a.refusedAt[t.ID]
+	if seen && now.Sub(last) < collectionRefusalLogEvery {
+		a.mu.Unlock()
+		return
+	}
+	a.refusedAt[t.ID] = now
+	a.mu.Unlock()
+	a.refused(auditlog.Record{Principal: mac, Kind: "agent", Person: t.Person, Agent: t.ID, AgentName: t.Name}, "agent-token-refused", detail)
 }
 
 // refused records a refused agent write (best effort).
