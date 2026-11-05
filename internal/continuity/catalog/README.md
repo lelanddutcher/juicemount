@@ -11,10 +11,15 @@ private local directory. It refuses existing destinations and orphan sidecars.
 `Open(path)` requires an existing complete catalog. Both canonicalize the existing
 parent and build an escaped file URI internally; caller-supplied SQLite URIs and
 memory databases are refused. Final symlinks, nonregular files, multiple hardlinks,
-and unsafe WAL/SHM/rollback sidecars are refused, as are catalog files with any
-group/other permission and a parent directory writable by group or others. File identity is qualified on
-Darwin and Linux; other platforms refuse admission. The directory's owner and
-local filesystem/hardware are deployment preconditions. This does not defend
+and unsafe WAL/SHM/rollback sidecars are refused (ErrFormat). Catalog/sidecar
+files with any group/other permission or another owner, and a parent directory
+writable by group or others or not owned by the effective user, are refused with
+ErrInvalid: a permission problem (such as a copy without `cp -p`) is not
+corruption. File identity is qualified on Darwin and Linux; other platforms
+refuse admission. Only mode bits and owners are checked: ACLs (for example NFSv4
+ACLs on TrueNAS) can still grant access and are the caller's responsibility.
+Use a dedicated directory that the process creates itself and chmods to 0700.
+Local filesystem/hardware are deployment preconditions. This does not defend
 against privileged replacement of path ancestors.
 
 Format 2 uses application ID `0x4a4d4341`, user version 2, an exact schema-object

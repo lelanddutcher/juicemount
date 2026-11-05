@@ -13,21 +13,30 @@ func checkFileIdentity(info os.FileInfo) error {
 	if !ok || !info.Mode().IsRegular() || stat.Nlink != 1 {
 		return corrupt("catalog files must be single-link regular files")
 	}
+	// Permission problems (a copy without -p, a foreign owner) are not corruption.
 	if info.Mode().Perm()&0077 != 0 {
-		return corrupt("catalog files must not grant group or other access")
+		return invalid("catalog files must not grant group or other access")
+	}
+	if int64(stat.Uid) != int64(os.Geteuid()) {
+		return invalid("catalog files must be owned by the running user")
 	}
 	return nil
 }
 
 // checkPrivateDirectory enforces the caller-provisioned private directory:
-// another account able to write there could plant or swap WAL sidecars.
+// another account able to write there could plant or swap WAL sidecars. Mode
+// bits only; ACLs (for example NFSv4 ACLs) are the caller's responsibility.
 func checkPrivateDirectory(dir string) error {
 	info, err := os.Stat(dir)
 	if err != nil {
 		return fmt.Errorf("catalog parent: %w", err)
 	}
-	if !info.IsDir() || info.Mode().Perm()&0022 != 0 {
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || !info.IsDir() || info.Mode().Perm()&0022 != 0 {
 		return invalid("catalog directory must not be writable by group or others")
+	}
+	if int64(stat.Uid) != int64(os.Geteuid()) {
+		return invalid("catalog directory must be owned by the running user")
 	}
 	return nil
 }

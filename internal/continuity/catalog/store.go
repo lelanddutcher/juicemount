@@ -29,7 +29,7 @@ type Store struct {
 }
 
 // Create reserves a new 0600 database in a caller-provisioned private directory
-// (refused when group or others can write it).
+// (refused when group or others can write it or another user owns it).
 // It never removes or replaces the reserved file. Incomplete files refuse Open;
 // a final commit/sync error may be uncertain, so recover via Open and check the
 // exact library identity. An existing destination is never adopted by Create.
