@@ -124,6 +124,13 @@ services:
       JM_AUDIT: "${JM_AUDIT:-auto}"
       JM_AUDIT_RETAIN_MB: "${JM_AUDIT_RETAIN_MB:-0}"
       JM_AUDIT_RETAIN_DAYS: "${JM_AUDIT_RETAIN_DAYS:-0}"
+      # The Manager's smart-folder roots (same variables and defaults as the
+      # manager service below): its principal may remove an empty view
+      # folder it created directly under one. Every other removal or rename
+      # of a folder at project depth stays admin-only.
+      JM_SMART_FOLDERS_ROOT: "${JM_SMART_FOLDERS_ROOT:-Recents}"
+      JM_SMART_FOLDERS_COLLECTIONS_ROOT: "${JM_SMART_FOLDERS_COLLECTIONS_ROOT:-Collections}"
+      JM_SMART_FOLDERS_QUERIES_ROOT: "${JM_SMART_FOLDERS_QUERIES_ROOT:-Queries}"
       JM_PROXY_FARM_PASSWORD: "${JM_PROXY_FARM_PASSWORD:?set JM_PROXY_FARM_PASSWORD in server/.env}"
       JM_PROXY_MANAGER_PASSWORD: "${JM_PROXY_MANAGER_PASSWORD:?set JM_PROXY_MANAGER_PASSWORD in server/.env}"
       JM_PROXY_BG_PASSWORD: "${JM_PROXY_BG_PASSWORD:?set JM_PROXY_BG_PASSWORD in server/.env}"
@@ -448,6 +455,9 @@ services:
       JM_SMART_FOLDERS: "${JM_SMART_FOLDERS:-off}"
       JM_SMART_FOLDERS_ROOT: "${JM_SMART_FOLDERS_ROOT:-Recents}"
       JM_SMART_FOLDERS_MAX_VIEWS: "${JM_SMART_FOLDERS_MAX_VIEWS:-256}"
+      # Collection views' root (with JM_CONTINUITY=on); respproxy reads the
+      # same variable, so the two agree.
+      JM_SMART_FOLDERS_COLLECTIONS_ROOT: "${JM_SMART_FOLDERS_COLLECTIONS_ROOT:-Collections}"
     ports:
       - "30190:8080"                              # manager UI
       # Link's 30193/tcp and 41641/udp: server/docker-compose.link.yml

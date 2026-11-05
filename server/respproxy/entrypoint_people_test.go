@@ -78,10 +78,11 @@ func TestEntrypointKeepsPeopleAndConfiguresAudit(t *testing.T) {
 		t.Fatalf("restrict_unassigned dropped by the re-render:\n%s", b)
 	}
 	type config struct {
-		AuditDir   string `json:"audit_dir"`
-		Audit      string `json:"audit"`
-		RetainMB   int64  `json:"audit_retain_mb"`
-		RetainDays int64  `json:"audit_retain_days"`
+		AuditDir   string   `json:"audit_dir"`
+		Audit      string   `json:"audit"`
+		RetainMB   int64    `json:"audit_retain_mb"`
+		RetainDays int64    `json:"audit_retain_days"`
+		SmartRoots []string `json:"smart_folder_roots"`
 	}
 	readCfg := func() config {
 		t.Helper()
@@ -92,7 +93,8 @@ func TestEntrypointKeepsPeopleAndConfiguresAudit(t *testing.T) {
 		}
 		return cfg
 	}
-	if cfg := readCfg(); cfg.AuditDir != filepath.Join(dir, "audit") || cfg.Audit != "auto" || cfg.RetainMB != 0 || cfg.RetainDays != 0 {
+	if cfg := readCfg(); cfg.AuditDir != filepath.Join(dir, "audit") || cfg.Audit != "auto" || cfg.RetainMB != 0 || cfg.RetainDays != 0 ||
+		strings.Join(cfg.SmartRoots, ",") != strings.Join(respproxy.DefaultSmartRoots, ",") {
 		t.Fatalf("config = %+v", cfg)
 	}
 	rerun := func(extra ...string) ([]byte, error) {
@@ -105,6 +107,13 @@ func TestEntrypointKeepsPeopleAndConfiguresAudit(t *testing.T) {
 	}
 	if cfg := readCfg(); cfg.Audit != "on" || cfg.RetainMB != 512 || cfg.RetainDays != -1 {
 		t.Fatalf("config with JM_AUDIT=on = %+v", cfg)
+	}
+	// The smart-folder roots come from the Manager's variables.
+	if out, err := rerun("JM_SMART_FOLDERS_ROOT=Recent Files", "JM_SMART_FOLDERS_COLLECTIONS_ROOT=Sets", "JM_SMART_FOLDERS_QUERIES_ROOT=Searches"); err != nil {
+		t.Fatalf("entrypoint: %v\n%s", err, out)
+	}
+	if cfg := readCfg(); strings.Join(cfg.SmartRoots, ",") != "Recent Files,Sets,Searches" {
+		t.Fatalf("config smart_folder_roots = %q", cfg.SmartRoots)
 	}
 	if out, err := rerun("JM_AUDIT=off"); err != nil {
 		t.Fatalf("entrypoint: %v\n%s", err, out)

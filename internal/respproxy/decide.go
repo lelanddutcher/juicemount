@@ -50,6 +50,11 @@ type LeaseConfig struct {
 	FenceHoldMax time.Duration
 	NoScan       bool // skip the background scan (tests of the miss path)
 	FileCache    int  // file -> parent cache entries; default 1M
+	// SmartRoots names the Manager's smart-folder roots in the volume root
+	// (smartview.go): the manager principal may remove an empty view
+	// directory it created directly under one. Empty: none (the
+	// jm-respproxy command defaults to DefaultSmartRoots).
+	SmartRoots []string
 }
 
 // LeaseEngine implements Policy and LocalHandler.
@@ -498,9 +503,10 @@ func (e *LeaseEngine) Decide(p Principal, u *Unit) Verdict {
 	}
 
 	// ns:root: creating a name is open; renaming or removing a directory
-	// there (a project root or a top-level folder) needs admin.
+	// there (a project root or a top-level folder) needs admin, except the
+	// Manager's removal of an empty smart-folder view (smartview.go).
 	if p.Kind != KindAdmin {
-		if d := e.rootEntryGate(f); d != nil {
+		if d := e.rootEntryGate(p, u, f); d != nil {
 			return deny(d)
 		}
 	}
@@ -624,8 +630,10 @@ func (e *LeaseEngine) leaseDenial(r Reason, proj uint64) *Denial {
 }
 
 // rootEntryGate refuses renaming or removing a directory entry of a
-// directory above the project depth (plan founder default 5).
-func (e *LeaseEngine) rootEntryGate(f *unitFacts) *Denial {
+// directory above the project depth (plan founder default 5). The one
+// exception is the manager principal removing an empty smart-folder view
+// it created (smartViewRemoval).
+func (e *LeaseEngine) rootEntryGate(p Principal, u *Unit, f *unitFacts) *Denial {
 	for _, op := range f.dentries {
 		if op.trash {
 			continue
@@ -647,8 +655,18 @@ func (e *LeaseEngine) rootEntryGate(f *unitFacts) *Denial {
 		}
 		if op.del || !bytes.Equal(op.val, v.Str) {
 			proj, _ := entryInode(v.Str)
-			return &Denial{Reason: ReasonAdminOnly, Proj: proj,
-				Detail: "renaming or removing directory " + strconv.Quote(op.name) + " above the project depth needs admin"}
+			detail := "renaming or removing directory " + strconv.Quote(op.name) + " above the project depth needs admin"
+			if op.del && p.Kind == KindManager {
+				root, why := e.smartViewRemoval(p, u, op, v.Str)
+				if why == "" {
+					e.queueLog(logEntry{"event", "smart_view_remove", "proj", inoStr(proj), "actor", p.Name,
+						"kind", string(p.Kind), "root", sanitizeToken(root), "view", sanitizeToken(op.name),
+						"ts_ms", strconv.FormatInt(ms(e.now()), 10)})
+					continue
+				}
+				detail += " (not an empty smart-folder view of " + p.Name + "'s: " + why + ")"
+			}
+			return &Denial{Reason: ReasonAdminOnly, Proj: proj, Detail: detail}
 		}
 	}
 	return nil

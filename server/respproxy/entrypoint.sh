@@ -16,6 +16,12 @@
 #    the first person exists, "on" logs from the start, "off" never.
 #    JM_AUDIT_RETAIN_MB / JM_AUDIT_RETAIN_DAYS bound its size and age
 #    (default 2048 MB / 400 days; -1 = no limit): the oldest segments go.
+#    smart_folder_roots names the Manager's smart-folder roots, read from
+#    the variables the Manager reads (JM_SMART_FOLDERS_ROOT, default
+#    Recents; JM_SMART_FOLDERS_COLLECTIONS_ROOT, default Collections;
+#    JM_SMART_FOLDERS_QUERIES_ROOT, default Queries): the manager principal
+#    may remove an empty view folder it created directly under one, and
+#    nothing else at project depth. The proxy leaves out an invalid name.
 # 3. Execs jm-respproxy with the applied-reload handshake enabled. The
 #    proxy owns polling, exact-byte validation, session revocation, applied
 #    receipts and heartbeat. A successful signal alone is never an ACK.
@@ -40,6 +46,9 @@ AUDIT_DIR="${JM_RESPPROXY_AUDIT_DIR:-$DIR/audit}"
 AUDIT="${JM_AUDIT:-auto}"
 AUDIT_RETAIN_MB="${JM_AUDIT_RETAIN_MB:-0}"
 AUDIT_RETAIN_DAYS="${JM_AUDIT_RETAIN_DAYS:-0}"
+SMART_ROOT="${JM_SMART_FOLDERS_ROOT:-Recents}"
+SMART_COLLECTIONS_ROOT="${JM_SMART_FOLDERS_COLLECTIONS_ROOT:-Collections}"
+SMART_QUERIES_ROOT="${JM_SMART_FOLDERS_QUERIES_ROOT:-Queries}"
 [ "$AUDIT_DIR" != off ] || AUDIT=off
 
 log() { printf '[jm-respproxy-entrypoint] %s\n' "$*" >&2; }
@@ -102,11 +111,13 @@ render_principals() {
 
 render_config() {
   jq -n --arg listen "$LISTEN" --arg up "$UPSTREAM" --arg stats "$STATS" --arg p "$PRINCIPALS" --arg mode "$MODE" --argjson stage_birth "$STAGE_BIRTH" \
-    --arg audit "$AUDIT_DIR" --arg audit_mode "$AUDIT" --argjson retain_mb "$AUDIT_RETAIN_MB" --argjson retain_days "$AUDIT_RETAIN_DAYS" '{
+    --arg audit "$AUDIT_DIR" --arg audit_mode "$AUDIT" --argjson retain_mb "$AUDIT_RETAIN_MB" --argjson retain_days "$AUDIT_RETAIN_DAYS" \
+    --arg smart "$SMART_ROOT" --arg smart_collections "$SMART_COLLECTIONS_ROOT" --arg smart_queries "$SMART_QUERIES_ROOT" '{
     listen: $listen, upstream: $up, upstream_user: "jm-proxy",
     upstream_password_env: "JM_RESPPROXY_UPSTREAM_PASSWORD",
     stats: $stats, principals: $p, mode: $mode, stage_birth: $stage_birth, reload_handshake: true,
-    audit_dir: $audit, audit: $audit_mode, audit_retain_mb: $retain_mb, audit_retain_days: $retain_days }' > "$CONFIG.tmp"
+    audit_dir: $audit, audit: $audit_mode, audit_retain_mb: $retain_mb, audit_retain_days: $retain_days,
+    smart_folder_roots: [$smart, $smart_collections, $smart_queries] }' > "$CONFIG.tmp"
   mv -f "$CONFIG.tmp" "$CONFIG"
 }
 
