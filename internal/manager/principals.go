@@ -1204,16 +1204,31 @@ var proxyBetweenAckReads func()
 // read as an image that writes only the legacy receipt, and Approve refused
 // with "update the jm-respproxy image". Read in this order, a reload.ack
 // that a current image wrote is already in reload.applied at the second
-// read; only an image that never writes reload.applied leaves it out.
+// read. A proxy that starts deletes reload.ack and then reload.applied, so
+// a start between the two reads would pair an old reload.ack with an empty
+// reload.applied; reload.ack is read again and the pair is used only when
+// it did not change meanwhile. Then only an image that never writes
+// reload.applied leaves our line out of it.
 func (s *PrincipalStore) readAcksLocked() (ack, legacy string) {
 	if s.opts.ProxyDir == "" {
 		return "", ""
 	}
-	legacy = requestLine(filepath.Join(s.opts.ProxyDir, legacyReloadAckName))
-	if proxyBetweenAckReads != nil {
-		proxyBetweenAckReads()
+	legacyPath := filepath.Join(s.opts.ProxyDir, legacyReloadAckName)
+	ackPath := filepath.Join(s.opts.ProxyDir, reloadAckName)
+	legacy = requestLine(legacyPath)
+	for attempt := 0; ; attempt++ {
+		if proxyBetweenAckReads != nil {
+			proxyBetweenAckReads()
+		}
+		ack = requestLine(ackPath)
+		again := requestLine(legacyPath)
+		if again == legacy || attempt == 2 {
+			// Still changing after three reads: report the receipts
+			// as of the last read; the next poll reads them again.
+			return ack, again
+		}
+		legacy = again
 	}
-	return requestLine(filepath.Join(s.opts.ProxyDir, reloadAckName)), legacy
 }
 
 func (s *PrincipalStore) issuedAckLocked(ack string) int {
