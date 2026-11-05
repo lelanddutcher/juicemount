@@ -643,8 +643,11 @@ func (s *PrincipalStore) StartPeopleSync() (stop func()) {
 type peopleAPI struct {
 	store    *PrincipalStore
 	auditDir string
-	watch    *auditWatch      // nil: no audit directory
-	quotas   *quotaScopeCache // nil: no volume to check
+	// catalogAuditDir: the Manager's own log of agent tokens and agents'
+	// catalog edits (agenttokens.go); "" without a principal store.
+	catalogAuditDir string
+	watch           *auditWatch      // nil: no audit directory
+	quotas          *quotaScopeCache // nil: no volume to check
 }
 
 // snapshot is the people snapshot with the audit log's state.
@@ -760,7 +763,8 @@ func parseMillis(v string) (int64, error) {
 }
 
 // handleAudit is GET /api/audit: one page of the proxy's mutation log,
-// newest first. Filters: person, principal, project (a path: that folder
+// newest first; with log=catalog, of the Manager's catalog audit log
+// (agent tokens and agents' catalog edits) instead. Filters: person, principal, project (a path: that folder
 // and below), since/until (unix ms or RFC 3339), type; paging: before (the
 // previous page's "next"), limit (default 100, at most 1000). A page reads
 // at most auditlog.QueryScanBytes of the log, so with a narrow filter it
@@ -770,11 +774,23 @@ func (p *peopleAPI) handleAudit(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "GET only", http.StatusMethodNotAllowed)
 		return
 	}
-	if p.auditDir == "" {
-		http.Error(w, "the audit log is not configured (JM_RESPPROXY_DIR or JM_AUDIT_DIR)", http.StatusServiceUnavailable)
+	q := r.URL.Query()
+	dir := p.auditDir
+	switch q.Get("log") {
+	case "":
+		if dir == "" {
+			http.Error(w, "the audit log is not configured (JM_RESPPROXY_DIR or JM_AUDIT_DIR)", http.StatusServiceUnavailable)
+			return
+		}
+	case "catalog":
+		if dir = p.catalogAuditDir; dir == "" {
+			http.Error(w, "the catalog audit log needs the principal store, which is not configured", http.StatusServiceUnavailable)
+			return
+		}
+	default:
+		http.Error(w, "log is empty (the proxy's) or catalog", http.StatusBadRequest)
 		return
 	}
-	q := r.URL.Query()
 	f := auditlog.Filter{Person: q.Get("person"), Principal: q.Get("principal"), Project: q.Get("project")}
 	if t := q.Get("type"); t != "" {
 		f.Types = strings.Split(t, ",")
@@ -795,7 +811,7 @@ func (p *peopleAPI) handleAudit(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad query: since/until are unix ms or RFC 3339, before a sequence number, limit 1-1000", http.StatusBadRequest)
 		return
 	}
-	page, err := auditlog.Query(p.auditDir, f, before, limit)
+	page, err := auditlog.Query(dir, f, before, limit)
 	if err != nil {
 		log.Printf("manager: audit query: %v", err)
 		http.Error(w, "the audit log could not be read", http.StatusInternalServerError)
@@ -860,8 +876,8 @@ func (p *peopleAPI) handleAuditStatus(w http.ResponseWriter, r *http.Request) {
 
 // registerPeople wires the people and audit routes (admin key, like every
 // other Manager route).
-func (a *API) registerPeople(mux *http.ServeMux, prefix string, store *PrincipalStore) {
-	pa := &peopleAPI{store: store, auditDir: strings.TrimSpace(os.Getenv("JM_AUDIT_DIR"))}
+func (a *API) registerPeople(mux routeMux, prefix string, store *PrincipalStore) {
+	pa := &peopleAPI{store: store, auditDir: strings.TrimSpace(os.Getenv("JM_AUDIT_DIR")), catalogAuditDir: catalogAuditDir(store)}
 	if pa.auditDir == "" {
 		if dir := strings.TrimSpace(os.Getenv("JM_RESPPROXY_DIR")); dir != "" {
 			pa.auditDir = filepath.Join(dir, "audit")

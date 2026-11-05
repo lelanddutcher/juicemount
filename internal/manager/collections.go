@@ -18,7 +18,9 @@ package manager
 // each source address a looser one before that (an office behind one NAT
 // is not starved, and fake tokens cannot drain a Mac's budget). With no admin key
 // configured (LAN/dev mode) the admin path is open, so it may not write
-// while grants are in force.
+// while grants are in force. An agent token (agenttokens.go) acts as its
+// person, with the budget of the Mac that minted it, on the requests
+// agentguard.go allows.
 //
 // What. Reads are shared (Teams v1: any authenticated caller). A person may
 // write only where their project write grants (people.go) cover the files
@@ -35,9 +37,10 @@ package manager
 // sequence as read for its check of every member, so a membership change in
 // between makes it 409; adding or removing members depends only on the
 // named members, so it carries none. A refusal is 403
-// and is logged (at most once a minute per person); the Manager writes no
-// Teams audit records (the proxy's audit log has a single writer), so the
-// catalog's event history is the record of what was changed and by whom.
+// and is logged (at most once a minute per person). The catalog's event
+// history is the record of what was changed and by whom; an agent's changes
+// are also in the Manager's catalog audit log, with its token
+// (agenttokens.go; the proxy's audit log has a single writer).
 //
 // Cost. Requests that read the volume have a 30 s deadline and take a slot:
 // people share two, the admin has one of its own, and each actor has at
@@ -167,11 +170,18 @@ func (s *PrincipalStore) grantsInForce() bool {
 	return s.grantsInForceLocked()
 }
 
-// collectionActor is who is calling: the admin, or a person.
+// collectionActor is who is calling: the admin, or a person through one of
+// their Macs or through an agent token (agenttokens.go), which acts as its
+// person.
 type collectionActor struct {
 	person *Person // nil: admin
 	// open: the admin path without a key (none is configured).
 	open bool
+	// mac: the person's Mac principal (for an agent, the Mac that minted
+	// its token).
+	mac string
+	// agent: the agent token the request came with (nil: none).
+	agent *AgentToken
 }
 
 func (c collectionActor) id() string {
@@ -179,6 +189,15 @@ func (c collectionActor) id() string {
 		return collectionAdminActor
 	}
 	return c.person.ID
+}
+
+// opKey scopes operation_id: an agent's retries are its own, never its
+// person's Mac's.
+func (c collectionActor) opKey() string {
+	if c.agent != nil {
+		return c.id() + "\x00agent\x00" + c.agent.ID
+	}
+	return c.id()
 }
 
 // writesAnywhere: the person has some write access (access "all", or at
@@ -239,21 +258,32 @@ type collectionsAPI struct {
 	macLimit  *ipLimiter      // per Mac principal, after
 	refusals  *refusalLog
 	roots     func() []string // the smart-folder roots the Manager owns (queries.go)
+	audit     *agentAudit     // the catalog audit log (agenttokens.go)
 	// queryCreate is held by a query create from its per-person count to
 	// its write (queries.go).
 	queryCreate sync.Mutex
 }
 
-// registerCollections wires /api/collections and /api/queries (queries.go,
-// sharing the authentication, budgets and slots). The handlers do their own
-// authentication (admin key or a person's Mac) and read a.continuity on
-// every request, so they can be registered before the binder starts.
-func (a *API) registerCollections(mux *http.ServeMux, prefix string, people *PrincipalStore) {
+// registerCollections wires /api/collections, /api/queries (queries.go),
+// /api/continuity/find and /api/continuity/asset/ (discovery.go) and
+// /api/agent-tokens (agenttokens.go), sharing the authentication, budgets
+// and slots. The handlers do their own authentication (admin key, a
+// person's Mac, or an agent token where agentguard.go allows one) and read
+// a.continuity on every request, so they can be registered before the
+// binder starts.
+func (a *API) registerCollections(mux routeMux, prefix string, people *PrincipalStore) {
 	h := newCollectionsAPI(a, prefix, people)
+	if a.jobs != nil {
+		a.jobs.onStopAll(h.audit.Close)
+	}
 	mux.HandleFunc(prefix+"/api/collections", h.serve)
 	mux.HandleFunc(prefix+"/api/collections/", h.serve)
 	mux.HandleFunc(prefix+"/api/queries", h.serveQueries)
 	mux.HandleFunc(prefix+"/api/queries/", h.serveQueries)
+	mux.HandleFunc(prefix+"/api/continuity/find", h.serveFind)
+	mux.HandleFunc(prefix+"/api/continuity/asset/", h.serveAsset)
+	mux.HandleFunc(prefix+"/api/agent-tokens", h.serveAgentTokens)
+	mux.HandleFunc(prefix+"/api/agent-tokens/", h.serveAgentTokens)
 }
 
 func newCollectionsAPI(a *API, prefix string, people *PrincipalStore) *collectionsAPI {
@@ -266,6 +296,7 @@ func newCollectionsAPI(a *API, prefix string, people *PrincipalStore) *collectio
 			buckets: map[string]*ipBucket{}, now: time.Now},
 		refusals: &refusalLog{every: collectionRefusalLogEvery, last: map[string]time.Time{}, held: map[string]int{}},
 		roots:    a.ownedSmartRoots,
+		audit:    &agentAudit{dir: catalogAuditDir(people)},
 	}
 }
 
@@ -285,6 +316,12 @@ func (h *collectionsAPI) authenticate(r *http.Request) (collectionActor, error) 
 	key := r.Header.Get("X-JuiceMount-Admin-Key")
 	instance, token := r.Header.Get("X-JuiceMount-Mac-Instance"), r.Header.Get("X-JuiceMount-Mac-Token")
 	switch {
+	case bearerScheme(r):
+		// First: an agent is never the open admin path.
+		if key != "" || instance != "" || token != "" {
+			return collectionActor{}, failf(http.StatusBadRequest, "send one credential: an agent token, a Mac's or the admin key")
+		}
+		return h.authenticateAgent(r)
 	case h.api.adminKey == "" && instance == "" && token == "":
 		return collectionActor{open: true}, nil // no admin key configured: LAN/dev mode, as a.auth
 	case key != "":
@@ -311,10 +348,37 @@ func (h *collectionsAPI) authenticate(r *http.Request) (collectionActor, error) 
 		if !h.macLimit.allow(mac) {
 			return collectionActor{}, failf(http.StatusTooManyRequests, "too many requests from this Mac; slow down")
 		}
-		return collectionActor{person: &p}, nil
+		return collectionActor{person: &p, mac: mac}, nil
 	default:
 		return collectionActor{}, failf(http.StatusUnauthorized, "missing or invalid X-JuiceMount-Admin-Key")
 	}
+}
+
+// authenticateAgent checks an agent token (agenttokens.go): it acts as its
+// person and spends the budget of the Mac that minted it. A refusal is
+// logged (at most once a minute) with the token's ID when it names one,
+// never the token.
+func (h *collectionsAPI) authenticateAgent(r *http.Request) (collectionActor, error) {
+	if h.people == nil {
+		return collectionActor{}, failf(http.StatusUnauthorized, "agent tokens need Mac enrollment, which is not configured on this Manager")
+	}
+	if !h.ipLimit.allow(clientIP(r)) {
+		return collectionActor{}, failf(http.StatusTooManyRequests, "too many requests from this address; wait a minute")
+	}
+	_, bearer, _ := strings.Cut(strings.TrimSpace(r.Header.Get("Authorization")), " ")
+	mac, p, t, err := h.people.agentPerson(strings.TrimSpace(bearer))
+	if err != nil {
+		named := "a malformed or unknown token"
+		if t.ID != "" {
+			named = fmt.Sprintf("agent token %s (%q) of %s", t.ID, t.Name, t.Person)
+		}
+		h.refusals.note("agent-tokens", fmt.Sprintf("manager: collections: refused %s %s with %s from %s: %v", r.Method, r.URL.Path, named, clientIP(r), err))
+		return collectionActor{}, failf(http.StatusUnauthorized, "%v", err)
+	}
+	if !h.macLimit.allow(mac) {
+		return collectionActor{}, failf(http.StatusTooManyRequests, "too many requests from this Mac; slow down")
+	}
+	return collectionActor{person: &p, mac: mac, agent: &t}, nil
 }
 
 // readsVolume: the request resolves files on the volume (every write, and
@@ -402,6 +466,9 @@ func (h *collectionsAPI) serveWith(w http.ResponseWriter, r *http.Request, base 
 	defer cancel()
 	r = r.WithContext(ctx)
 	actor, err := h.authenticate(r)
+	if err == nil && actor.agent != nil && !agentMay(r.Method, base, parts) {
+		err = failf(http.StatusForbidden, "agent tokens may not %s %s (agents read, find files and edit collections)", r.Method, strings.Join(append([]string{base}, parts...), "/"))
+	}
 	if err == nil && reads(r.Method, parts) {
 		var release func()
 		if release, err = h.acquire(ctx, actor); err == nil {
@@ -419,7 +486,14 @@ func (h *collectionsAPI) serveWith(w http.ResponseWriter, r *http.Request, base 
 		he = collectionFailure(err)
 	}
 	if he.code == http.StatusForbidden && actor.person != nil {
-		h.refusals.note(actor.person.ID, fmt.Sprintf("manager: collections: refused %s %s for %s (%s): %s", r.Method, r.URL.Path, actor.person.ID, actor.person.Name, he.msg))
+		by := ""
+		if actor.agent != nil {
+			by = fmt.Sprintf(" through agent token %s (%q)", actor.agent.ID, actor.agent.Name)
+		}
+		h.refusals.note(actor.person.ID, fmt.Sprintf("manager: collections: refused %s %s for %s (%s)%s: %s", r.Method, r.URL.Path, actor.person.ID, actor.person.Name, by, he.msg))
+	}
+	if actor.agent != nil && r.Method != http.MethodGet && (he.code == http.StatusForbidden || he.code == http.StatusNotFound) {
+		h.audit.refused(actor.auditWho(), "refused", fmt.Sprintf("%s %s: %s", r.Method, strings.TrimPrefix(r.URL.Path, h.prefix), he.msg))
 	}
 	writeJSON(w, he.code, map[string]string{"error": he.msg})
 }
@@ -467,7 +541,7 @@ func (h *collectionsAPI) route(w http.ResponseWriter, r *http.Request, svc *cont
 	if err != nil {
 		return err
 	}
-	c := &collectionCall{svc: svc, actor: actor, library: library, w: w, r: r}
+	c := &collectionCall{svc: svc, actor: actor, library: library, w: w, r: r, audit: h.audit}
 	want := func(method string) error {
 		if r.Method != method {
 			return failf(http.StatusMethodNotAllowed, "%s only", method)
@@ -526,6 +600,7 @@ type collectionCall struct {
 	library continuity.LibraryID
 	w       http.ResponseWriter
 	r       *http.Request
+	audit   *agentAudit // records an agent's edits
 }
 
 func (c *collectionCall) ctx() context.Context { return c.r.Context() }
@@ -711,7 +786,7 @@ func (c *collectionCall) operationID(key string) (string, error) {
 		}
 		key = hex.EncodeToString(b)
 	}
-	sum := sha256.Sum256([]byte("juicemount.collections.operation\x00" + c.actor.id() + "\x00" + key))
+	sum := sha256.Sum256([]byte("juicemount.collections.operation\x00" + c.actor.opKey() + "\x00" + key))
 	return "col-" + hex.EncodeToString(sum[:20]), nil
 }
 
@@ -848,9 +923,22 @@ func (c *collectionCall) change(opID string, id catalog.CollectionID, guarded bo
 }
 
 // apply records the change and answers with the collection as it is now.
+// An agent's change is in the catalog audit log first (agenttokens.go).
 func (c *collectionCall) apply(opID string, id catalog.CollectionID, changes []catalog.Change) error {
+	var unit uint64
+	if c.actor.agent != nil {
+		rec := c.actor.auditWho()
+		rec.Action, rec.Detail = describeCollectionChange(opID, id, changes)
+		var err error
+		if unit, err = c.audit.intent(rec); err != nil {
+			return err
+		}
+	}
 	receipt, err := c.svc.store.Apply(c.ctx(), catalog.Operation{
 		Version: catalog.OperationVersion, LibraryID: c.library, ID: opID, Actor: c.actor.id(), Changes: changes})
+	if c.actor.agent != nil {
+		c.audit.outcome(unit, c.actor.auditWho(), err)
+	}
 	if err != nil {
 		return err
 	}
@@ -956,4 +1044,43 @@ func (c *collectionCall) editMembers(id catalog.CollectionID, add bool) error {
 	// Only the named members' grants matter: concurrent adders do not
 	// conflict. The catalog refuses a removed collection (404).
 	return c.change(opID, id, false, func() error { return c.authorize(members) }, changes)
+}
+
+// describeCollectionChange names a collection write for the audit log: the
+// action and what it changes.
+func describeCollectionChange(opID string, id catalog.CollectionID, changes []catalog.Change) (string, string) {
+	action, name := "collection-change", ""
+	var added, removed []string
+	for _, ch := range changes {
+		switch {
+		case ch.CreateCollection != nil:
+			action, name = "collection-create", ch.CreateCollection.Name
+		case ch.RenameCollection != nil:
+			action, name = "collection-rename", ch.RenameCollection.Name
+		case ch.RemoveCollection != nil:
+			action = "collection-delete"
+		case ch.AddCollectionMember != nil:
+			added = append(added, string(ch.AddCollectionMember.AssetID))
+		case ch.RemoveCollectionMember != nil:
+			removed = append(removed, string(ch.RemoveCollectionMember.AssetID))
+		}
+	}
+	switch {
+	case action != "collection-change":
+	case len(added) > 0 && len(removed) == 0:
+		action = "collection-add-members"
+	case len(removed) > 0 && len(added) == 0:
+		action = "collection-remove-members"
+	}
+	detail := "collection " + string(id)
+	if name != "" {
+		detail += fmt.Sprintf(" name %q", name)
+	}
+	if len(added) > 0 {
+		detail += " add " + strings.Join(added, " ")
+	}
+	if len(removed) > 0 {
+		detail += " remove " + strings.Join(removed, " ")
+	}
+	return action, detail + "; operation " + opID
 }

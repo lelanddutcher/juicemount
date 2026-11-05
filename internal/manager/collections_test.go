@@ -33,6 +33,7 @@ type lockedVolume struct {
 	files map[string]uint64
 	trash map[uint64]time.Time // inode -> when it went to the trash
 	fail  bool
+	mtime map[uint64]time.Time // optional: inode -> modification time
 }
 
 func (v *lockedVolume) VolumeUUID() string { return "00000000-0000-4000-8000-0000000000d3" }
@@ -45,7 +46,7 @@ func (v *lockedVolume) node(ino uint64) jfsmeta.Node {
 			links++
 		}
 	}
-	return jfsmeta.Node{Ino: ino, Type: smartfolders.TypeRegular, Nlink: links, Parent: 1}
+	return jfsmeta.Node{Ino: ino, Type: smartfolders.TypeRegular, Nlink: links, Parent: 1, Mtime: v.mtime[ino], Size: ino * 10}
 }
 func (v *lockedVolume) LookupIno(p string) (jfsmeta.Node, error) {
 	v.mu.Lock()
@@ -208,9 +209,11 @@ func (e *collectionsEnv) do(who, method, path string, body any) *httptest.Respon
 		}
 	}
 	req := httptest.NewRequest(method, "/manager"+path, bytes.NewReader(data))
-	switch who {
-	case "":
-	case "admin":
+	switch {
+	case strings.HasPrefix(who, "jma_"):
+		req.Header.Set("Authorization", "Bearer "+who)
+	case who == "":
+	case who == "admin":
 		req.Header.Set("X-JuiceMount-Admin-Key", collectionsAdminKey)
 	default:
 		mac, ok := e.macs[who]

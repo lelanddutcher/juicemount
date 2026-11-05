@@ -514,6 +514,8 @@ type principalStoreFile struct {
 	// that hold the shared object key (sharedkey.go).
 	SharedKeyTracking int               `json:"shared_key_tracking,omitempty"`
 	SharedKeyHolders  []sharedKeyHolder `json:"shared_key_holders,omitempty"`
+	// AgentTokens: agent tokens that still work (agenttokens.go).
+	AgentTokens []AgentToken `json:"agent_tokens,omitempty"`
 }
 
 // ProxySignaler asks the proxy to reload the principals file whose sha256
@@ -620,6 +622,8 @@ type PrincipalStore struct {
 	// restrictUnassigned: Macs with no person may not write. On from the
 	// first grant until an admin turns it off (people.go).
 	restrictUnassigned bool
+	// agentTokens (agenttokens.go): by ID.
+	agentTokens map[string]*AgentToken
 }
 
 // issuedRequest is one reload.request line this process wrote and when.
@@ -808,7 +812,7 @@ func NewPrincipalStore(opts PrincipalStoreOptions) (*PrincipalStore, error) {
 	if opts.Signal == nil && opts.ProxyDir != "" {
 		opts.Signal = fileSignaler{dir: opts.ProxyDir}
 	}
-	s := &PrincipalStore{opts: opts, recs: map[string]*MacPrincipal{}, autoPerIP: map[string]int{},
+	s := &PrincipalStore{opts: opts, recs: map[string]*MacPrincipal{}, autoPerIP: map[string]int{}, agentTokens: map[string]*AgentToken{},
 		reqLimit: newIPLimiter(30, opts.Now), hashLimit: newIPLimiter(6, opts.Now),
 		hashSem: make(chan struct{}, maxConcurrentHashes)}
 	b, err := os.ReadFile(opts.StatePath)
@@ -842,6 +846,7 @@ func NewPrincipalStore(opts PrincipalStoreOptions) (*PrincipalStore, error) {
 		}
 		s.restrictUnassigned = f.RestrictUnassigned
 		s.sharedHolders, s.sharedTracking = f.SharedKeyHolders, f.SharedKeyTracking
+		s.loadAgentTokens(f.AgentTokens)
 	case errors.Is(err, os.ErrNotExist):
 	default:
 		return nil, err
@@ -1763,6 +1768,9 @@ func (s *PrincipalStore) saveStoreLocked() error {
 	f.RestrictUnassigned = s.restrictUnassigned
 	f.SharedKeyHolders = s.sharedKeyHoldersToKeepLocked()
 	f.SharedKeyTracking = s.sharedTracking
+	// Every change to a Mac or a person passes here: a token it unbound is
+	// dropped for good.
+	f.AgentTokens = s.agentTokensToKeepLocked()
 	f.ObjKeysSeq, f.ObjKeyGens = s.keepObjSeq, s.keepObjGens
 	if s.objk != nil {
 		f.ObjKeysSeq = s.objk.seq
@@ -2304,7 +2312,7 @@ func (p *principalsAPI) handleAutoApprove(w http.ResponseWriter, r *http.Request
 //	JM_META_PASSWORD         the Manager principal's secret (JM_META is user@host)
 //	JM_META_BG_PASSWORD      `bg` principal: gc, compact, fsck
 //	JM_META_ADMIN_PASSWORD   `admin` principal: lease break, mode switch, juicefs config writes
-func (a *API) registerH8B(mux *http.ServeMux, prefix string, cfg Config) {
+func (a *API) registerH8B(mux routeMux, prefix string, cfg Config) {
 	statePath := strings.TrimSpace(os.Getenv("JM_PRINCIPALS_STATE"))
 	if statePath == "" && cfg.StateFile != "" {
 		statePath = filepath.Join(filepath.Dir(cfg.StateFile), "principals-store.json")

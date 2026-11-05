@@ -173,8 +173,11 @@ type Config struct {
 // callers can attach lifecycle hooks (StopAll on shutdown).
 //
 // Static UI is served from <prefix>/, JSON API from <prefix>/api/...
-func Register(mux *http.ServeMux, prefix string, cfg Config) *JobManager {
+func Register(outer *http.ServeMux, prefix string, cfg Config) *JobManager {
 	prefix = strings.TrimSuffix(prefix, "/")
+	// Every route refuses agent tokens unless it is on their allowlist
+	// (agentguard.go).
+	mux := newAgentRouteMux(outer, prefix)
 	// H-8B: --meta carries user@host only; in-process clients get the
 	// password from JM_META_PASSWORD (principals.go, volume credentials).
 	cfg.MetaURL, cfg.OverviewMetaURL = withEnvMetaPassword(cfg.MetaURL), withEnvMetaPassword(cfg.OverviewMetaURL)
@@ -440,6 +443,9 @@ func Register(mux *http.ServeMux, prefix string, cfg Config) *JobManager {
 	// the existing handleStatic logic still works.
 	staticHandler := http.StripPrefix(prefix, http.HandlerFunc(a.handleStatic))
 	mux.Handle(prefix+"/", staticHandler)
+	if routesRegistered != nil {
+		routesRegistered(mux.patterns)
+	}
 	return mgr
 }
 
