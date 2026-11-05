@@ -1,7 +1,7 @@
 # Continuity catalog
 
 This internal package stores one library's asset identities, immutable revision
-declarations, selected heads, relationships, location observations and ordered metadata operations in a dedicated
+declarations, selected heads, relationships, location observations, collections and ordered metadata operations in a dedicated
 SQLite database. It has no routes, policy grants, media writes, filesystem rename
 operations, or verified/published/reachable states. A head selects a declaration;
 it does not certify the current contents of a filesystem path.
@@ -22,16 +22,17 @@ Use a dedicated directory that the process creates itself and chmods to 0700.
 Local filesystem/hardware are deployment preconditions. This does not defend
 against privileged replacement of path ancestors.
 
-Format 2 uses application ID `0x4a4d4341`, user version 2, an exact schema-object
-inventory, and a migration ledger containing the ordered format 1 and 2 SHA-256
-fingerprints. New format 2 catalogs record the same supported lineage; these
-entries do not claim two runtime upgrades occurred. A ledger
+Format 3 uses application ID `0x4a4d4341`, user version 3, an exact schema-object
+inventory, and a migration ledger containing the ordered format 1, 2 and 3 SHA-256
+fingerprints. New format 3 catalogs record the same supported lineage; these
+entries do not claim runtime upgrades occurred. Format 2 (slice 1) is format 1
+with the open ledger, relationships and locations; format 3 adds collections. A ledger
 alone cannot validate changed DDL. Unknown, foreign, newer, incomplete, corrupt,
 or constraint-invalid databases are refused without repair or replacement.
 Open performs version/DDL/ledger/identity/integrity preflight in one deferred
 transaction on a separate read-only connection before obtaining a write pool
 and enabling WAL. A recognized complete, integrity-valid format 1 catalog returns
-`ErrUpgradeRequired`; Open never migrates it. SQLite integrity and foreign-key checks run at admission;
+`ErrUpgradeRequired`, as does a format 2 catalog; Open never migrates either. SQLite integrity and foreign-key checks run at admission;
 individual revision/event reads also verify their canonical identities. Open does
 not rehash the complete operation history or any media.
 
@@ -67,6 +68,15 @@ and 1–256 ordered changes. Exactly one pointer variant is required per change:
   correct, reactivate or tombstone a directed relationship.
 - `PutLocation` / `RemoveLocation`: compare full expected state and correct,
   reactivate or tombstone an opaque location observation.
+- `CreateCollection` / `RenameCollection` / `RemoveCollection`: reserve a new
+  `col_` identity with a 1–256 byte name, rename an active collection, or
+  tombstone it. A removed collection accepts no change and its ID is never reused.
+- `AddCollectionMember` / `RemoveCollectionMember`: set membership of an
+  existing asset in an active collection. Membership is a set: adding an active
+  member or removing an inactive one leaves the row unchanged, so the request
+  alone decides the result. Rows are never deleted; reactivation keeps the
+  creation sequence. An operation that leaves a collection above 10,000 active
+  members fails with `ErrCollectionFull`.
 
 Changes and one event commit in a single immediate transaction. A failed change
 rolls back the entire batch without reserving an operation ID or event sequence.
@@ -157,14 +167,17 @@ Before disclosure, a permission service must constrain both endpoints, traversal
 counts and every returned field.
 
 `Upgrade(ctx,path,expectedLibraryID)` explicitly changes a recognized format 1
-catalog to format 2. It applies the same safe-file admission and read-only snapshot
+or 2 catalog to format 3, one checked format at a time in one transaction
+(1→2 as below, then 2→3, which only adds the collection tables, indexes and
+guards and the ledger's format 3 entry). `Inspect(ctx,path)` reports an existing
+catalog's library and format through the same admission, without changing it. It applies the same safe-file admission and read-only snapshot
 preflight, then repeats schema/library/integrity checks in an immediate transaction.
 The migration replaces only the constrained v1 ledger and its guards, adds the
 new projections/indexes/guards, and atomically records user version 2. Original
 library/asset/revision/parent/event DDL and data stay intact, including exact
 canonical requests, receipts, timestamps and event sequences. Format 1's exact
 DDL/fingerprint definition is retained for admission and checked-in legacy tests.
-Already-valid format 2 of the expected library succeeds without schema/event
+An already-current catalog of the expected library succeeds without schema/event
 mutation. Both migration and idempotent retry close their owners and complete a
 parent-directory sync before success, so retry after a failed final barrier
 finishes that barrier. Sync/close/commit errors surface; final outcomes may be
@@ -173,7 +186,7 @@ uncertain and must never be recovered by replacing the catalog.
 The host should drain catalog users before upgrade. SQLite serializes concurrent
 writers/upgraders; transaction revalidation accepts a second already-upgraded
 store instead of rerunning the migration. This does not claim exclusive process
-ownership. Old writers refuse format 2. Old binaries require a separately retained
+ownership. Old writers refuse a newer format. Old binaries require a separately retained
 compatible backup for rollback; there is no schema downgrade that discards history.
 
 Stored Actor strings are caller-supplied attribution, not authenticated identity
@@ -182,7 +195,7 @@ and prove no immutable source snapshot or media durability. Permissions/disclosu
 belong to the trusted service boundary. Metadata portability below preserves these
 declarations and their history; it grants no import authority or media guarantee.
 
-`Store.Export(ctx,library,writer,Limits)` captures a complete schema2 metadata
+`Store.Export(ctx,library,writer,Limits)` captures a complete metadata
 snapshot. `Restore(ctx,path,expectedLibrary,reader,Limits)` replays it into a new
 exclusive 0600 target only. Restore never merges, resumes, downgrades, overwrites
 or removes a failed target. Existing Create/Open/Upgrade behavior is preserved.
@@ -212,7 +225,7 @@ frames, sequence gaps, duplicate operation IDs and noncanonical encodings refuse
 
 | Kind | Payload |
 | --- | --- |
-| 0x01 | JSON fields `version,schema_version,library_id,event_count`, requiring 1 and 2 |
+| 0x01 | JSON fields `version,schema_version,library_id,event_count`, requiring version 1 and schema 2 or 3 |
 | 0x02 | uint32 request length, exact request bytes, uint32 receipt length, exact receipt bytes |
 | 0x03 | JSON fields `event_count,projection_rows,projection_sha256,stream_sha256` |
 
@@ -241,6 +254,13 @@ identifier ordering, including all tombstones:
 | 0x14 parent edges | `library_id,revision_id,parent_id,asset_id` |
 | 0x15 relationships | `library_id,id,value,created_sequence,updated_sequence,removed` |
 | 0x16 locations | `library_id,id,value,created_sequence,updated_sequence,removed` |
+| 0x17 collections | `library_id,collection_id,name,created_sequence,updated_sequence,removed` |
+| 0x18 collection members | `library_id,collection_id,asset_id,created_sequence,updated_sequence,removed` (by collection, then asset) |
+
+The header names the oldest format that holds the snapshot: 2 while the catalog
+has no collection (then no 0x17/0x18 frame exists and every byte is as format 2
+wrote it, so a format 2 reader restores it), 3 otherwise. Restore refuses a
+collection change under a format 2 header and a format 3 header without one.
 
 Canonical manifest hex is lowercase; manifest/value objects retain their existing
 field order and explicit empty optional revisions. Parent edges sort by child
@@ -258,7 +278,7 @@ Path/context checks precede completion. Close drains an admitted export and its
 owned pool; no detached worker or caller-I/O close is used.
 
 Restore validates magic/header/expected library and budgets before reserving a
-destination. It initializes schema2 with ready=0 and initial file/directory
+destination. It initializes the current format with ready=0 and initial file/directory
 barriers. Events replay in immediate batch transactions of up to 500 events or
 16 MiB of requests (the target stays ready=0 throughout, so a batch boundary only
 changes how much incomplete progress a failure leaves). Each event reuses the

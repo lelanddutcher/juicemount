@@ -44,6 +44,12 @@ type Change struct {
 	RemoveRelationship *RemoveRelationship
 	PutLocation        *PutLocation
 	RemoveLocation     *RemoveLocation
+	// Format 3.
+	CreateCollection       *CreateCollection
+	RenameCollection       *RenameCollection
+	RemoveCollection       *RemoveCollection
+	AddCollectionMember    *AddCollectionMember
+	RemoveCollectionMember *RemoveCollectionMember
 }
 
 type CreateAsset struct {

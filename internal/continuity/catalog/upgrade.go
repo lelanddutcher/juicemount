@@ -111,20 +111,31 @@ func upgradeCatalog(ctx context.Context, input string, expectedLibrary continuit
 	if err := checkSettings(ctx, tx); err != nil {
 		return err
 	}
-	if version == 1 {
-		if err := migrateV1(ctx, tx); err != nil {
+	// Each step is checked as the exact next format before the following one.
+	for _, step := range []struct {
+		from    int
+		migrate func(context.Context, *sql.Tx) error
+	}{{1, migrateV1}, {2, migrateV2}} {
+		if version != step.from {
+			continue
+		}
+		if err := step.migrate(ctx, tx); err != nil {
 			return err
 		}
 		actual, current, err := recognizeSchema(ctx, tx, false)
 		if err != nil {
 			return err
 		}
-		if actual != expectedLibrary || current != schemaVersion {
+		if actual != expectedLibrary || current != step.from+1 {
 			return corrupt("migration identity mismatch")
 		}
 		if err := checkIntegrity(ctx, tx); err != nil {
 			return err
 		}
+		version = current
+	}
+	if version != schemaVersion {
+		return corrupt("migration did not reach the current format")
 	}
 	if err := held.checkPaths(); err != nil {
 		return err
@@ -139,7 +150,7 @@ func upgradeCatalog(ctx context.Context, input string, expectedLibrary continuit
 	if err := errors.Join(closeDB, closeFile); err != nil {
 		return fmt.Errorf("catalog upgrade close outcome uncertain: %w", err)
 	}
-	// This barrier is required even for an already-valid-v2 retry.
+	// This barrier is required even for an already-current retry.
 	if err := directoryBarrier(path); err != nil {
 		return fmt.Errorf("catalog upgrade directory barrier uncertain: %w", err)
 	}
@@ -157,10 +168,10 @@ func migrateV1(ctx context.Context, tx *sql.Tx) error {
 			return err
 		}
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations(version,fingerprint) VALUES(1,?),(2,?)`, schemaFingerprint(legacySchema()), schemaFingerprint(expectedSchema())); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations(version,fingerprint) VALUES(1,?),(2,?)`, schemaFingerprint(legacySchema()), schemaFingerprint(schemaV2())); err != nil {
 		return err
 	}
-	for _, object := range expectedSchema() {
+	for _, object := range schemaV2() {
 		if object.Type == "trigger" && object.Table == "schema_migrations" {
 			if _, err := tx.ExecContext(ctx, object.SQL); err != nil {
 				return err
@@ -174,4 +185,44 @@ func migrateV1(ctx context.Context, tx *sql.Tx) error {
 	}
 	_, err := tx.ExecContext(ctx, `PRAGMA user_version=2`)
 	return err
+}
+
+// migrateV2 adds the collection tables, indexes and guards to a format 2
+// catalog validated inside this same immediate transaction. Nothing existing
+// is changed; the ledger gains the format 3 fingerprint.
+func migrateV2(ctx context.Context, tx *sql.Tx) error {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations(version,fingerprint) VALUES(3,?)`, schemaFingerprint(expectedSchema())); err != nil {
+		return err
+	}
+	for _, object := range collectionSchema() {
+		if _, err := tx.ExecContext(ctx, object.SQL); err != nil {
+			return err
+		}
+	}
+	_, err := tx.ExecContext(ctx, `PRAGMA user_version=3`)
+	return err
+}
+
+// Inspect reports the library and format of an existing complete catalog
+// without changing it, through the same safe-file admission and read-only
+// snapshot as Open. A host uses it to name the expected library to Upgrade.
+func Inspect(ctx context.Context, input string) (continuity.LibraryID, int, error) {
+	path, err := canonicalPath(input)
+	if err != nil {
+		return "", 0, err
+	}
+	info, err := os.Lstat(path)
+	if os.IsNotExist(err) {
+		return "", 0, fmt.Errorf("%w: catalog path: %w", ErrNotFound, err)
+	}
+	if err != nil {
+		return "", 0, err
+	}
+	if err := checkFileIdentity(info); err != nil {
+		return "", 0, err
+	}
+	if err := checkSidecars(path); err != nil {
+		return "", 0, err
+	}
+	return snapshotCatalog(ctx, path)
 }

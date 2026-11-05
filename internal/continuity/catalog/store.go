@@ -153,7 +153,7 @@ func openStoreContext(ctx context.Context, input string, library continuity.Libr
 		if err != nil {
 			return nil, err
 		}
-		if version == 1 {
+		if version < schemaVersion {
 			return nil, ErrUpgradeRequired
 		}
 	}

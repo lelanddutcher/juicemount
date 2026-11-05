@@ -66,6 +66,9 @@ func (s *Store) Apply(ctx context.Context, input Operation) (Receipt, error) {
 			return Receipt{}, fmt.Errorf("catalog change %d: %w", i, err)
 		}
 	}
+	if err := checkCollectionLimits(ctx, tx, op); err != nil {
+		return Receipt{}, err
+	}
 	receipt := Receipt{OperationVersion, s.library, op.ID, sequence, digest, time.Now().UnixNano()}
 	receiptJSON, err := json.Marshal(receipt)
 	if err != nil {
@@ -137,6 +140,8 @@ func (s *Store) applyChange(ctx context.Context, tx *sql.Tx, c Change, sequence 
 		return s.putLocation(ctx, tx, *c.PutLocation, sequence)
 	case c.RemoveLocation != nil:
 		return s.removeLocation(ctx, tx, *c.RemoveLocation, sequence)
+	case isCollectionChange(c):
+		return s.applyCollectionChange(ctx, tx, c, sequence)
 	default:
 		return invalid("unknown change")
 	}
