@@ -24,7 +24,8 @@ against privileged replacement of path ancestors.
 
 Format 4 uses application ID `0x4a4d4341`, user version 4, an exact schema-object
 inventory, and a migration ledger containing the ordered format 1, 2, 3 and 4 SHA-256
-fingerprints. New format 4 catalogs record the same supported lineage; these
+fingerprints. `Create` makes a format 3 catalog (ledger 1-3) and `Restore` the
+format its stream names; new catalogs record the same supported lineage; these
 entries do not claim runtime upgrades occurred. Format 2 (slice 1) is format 1
 with the open ledger, relationships and locations; format 3 adds collections;
 format 4 adds saved queries. A ledger
@@ -39,7 +40,9 @@ and enabling WAL. A recognized complete, integrity-valid format 1 catalog return
 A format 3 catalog opens and works (`MinOperableFormat`) except for queries:
 query reads find none and query changes return `ErrUpgradeRequired` until
 `Store.EnableQueries` adds the query table in place (the 3→4 step, in one
-immediate transaction on the open store, checked before commit), so a host
+immediate transaction on the open store, checked before commit), or
+`ApplyEnablingQueries` does so in the transaction of the operation that needs
+it (a failed operation leaves format 3), so a host
 keeps the catalog readable by a format 3 binary until queries are used.
 `UpgradeTo` upgrades a closed catalog to a given format at most. SQLite integrity and foreign-key checks run at admission;
 individual revision/event reads also verify their canonical identities. Open does
