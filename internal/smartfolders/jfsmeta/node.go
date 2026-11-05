@@ -20,4 +20,6 @@ type Node struct {
 	// or removed: a rename (both the moved and the replaced inode), and an
 	// unlink or move into the trash.
 	Ctime time.Time
+	// Mtime: the last change of the file's contents.
+	Mtime time.Time
 }

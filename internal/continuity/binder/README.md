@@ -195,6 +195,10 @@ counters and `complete: false`; a later rescan starts from them.
   first), or needs an index in a new schema version.
 - An asset's inode is its active `Source(uuid)` location, not the one derived
   from the asset ID: after a save by replacement they differ.
+- Saved queries (slice 5) list candidates with `Hints` (every active hint with
+  its inode, catalog reads only) and include one only after `Locate` resolves
+  its inode's live path and modification time on the volume. `Config.Applied`
+  sees every operation the binder commits, so a host can follow hint changes.
 
 ## API (admin key)
 

@@ -138,6 +138,9 @@ type Config struct {
 	SaveWindow     time.Duration
 	Logf           func(format string, args ...any)
 	Now            func() time.Time
+	// Applied, when set, is called (on the binder's goroutine) after each
+	// operation the binder committed to the catalog. It must not block.
+	Applied func(catalog.Operation)
 }
 
 type volume struct {
@@ -577,6 +580,11 @@ func (b *Binder) where(v *volume, ino uint64, hint, observed string) (bool, stri
 	if err != nil {
 		return false, "", unknown(err)
 	}
+	return b.whereNode(v, ino, n, hint, observed)
+}
+
+// whereNode is where for an inode already read.
+func (b *Binder) whereNode(v *volume, ino uint64, n jfsmeta.Node, hint, observed string) (bool, string, error) {
 	if n.InTrash || n.Type != smartfolders.TypeRegular {
 		return false, "", nil
 	}
@@ -691,6 +699,9 @@ func (b *Binder) converge(ctx context.Context, plan func() (*catalog.Operation, 
 		}
 		if err == nil {
 			b.applied.Add(1)
+			if b.cfg.Applied != nil {
+				b.cfg.Applied(*op)
+			}
 			return nil
 		}
 		if !conflict(err) {
