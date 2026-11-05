@@ -13,11 +13,14 @@ import sys
 import tempfile
 import unittest
 
-from importlib.machinery import SourceFileLoader
+import importlib.util
 
 
 HERE = Path(__file__).resolve().parent
-MODULE = SourceFileLoader("macos26_gate", str(HERE / "verify-macos26-artifact.py")).load_module()
+# SourceFileLoader.load_module is gone from newer Pythons (the macOS runner's).
+_SPEC = importlib.util.spec_from_file_location("macos26_gate", HERE / "verify-macos26-artifact.py")
+MODULE = importlib.util.module_from_spec(_SPEC)
+_SPEC.loader.exec_module(MODULE)
 
 
 def packed_version(major):
