@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -24,7 +26,13 @@ func (e *collViewsEnv) createQuery(id catalog.QueryID, name string, def catalog.
 	if def.Limit == 0 {
 		def.Limit = queryDefaultLimit
 	}
-	e.apply(catalog.Change{CreateQuery: &catalog.CreateQuery{QueryID: id, Name: name, Definition: def}})
+	e.ops++
+	// A new catalog is format 3: the first query adds the query table.
+	if _, err := e.cont.store.ApplyEnablingQueries(context.Background(), catalog.Operation{Version: catalog.OperationVersion,
+		LibraryID: e.library, ID: fmt.Sprintf("test-op-%d", e.ops), Actor: "admin",
+		Changes: []catalog.Change{{CreateQuery: &catalog.CreateQuery{QueryID: id, Name: name, Definition: def}}}}); err != nil {
+		e.t.Fatal(err)
+	}
 }
 
 func (e *collViewsEnv) touch(p string, at time.Time) {
@@ -441,5 +449,71 @@ func TestQueryNameMatchesUnicodeForms(t *testing.T) {
 	if !queryNameMatches(catalog.QueryDefinition{NameContains: nfc}, "P/"+nfd) ||
 		!queryNameMatches(catalog.QueryDefinition{NameContains: "Café"}, "P/café.mov") {
 		t.Fatal("normalization forms do not match")
+	}
+}
+
+// The results API reuses an evaluation up to 20 minutes old only when the
+// query views wrote it and are keeping it current (they own the query root
+// and have cycled within the last minute); otherwise one under a minute.
+func TestQueryResultsCacheTrustsOnlyCurrentViews(t *testing.T) {
+	e := newCollViewsEnv(t, "P/a.mov")
+	e.svc.qry.debounce = time.Hour
+	e.attach()
+	e.createQuery(qryID(1), "P", catalog.QueryDefinition{Prefixes: []string{"P"}})
+	e.qpass()
+	e.wantQueries(map[string]string{"P/a.mov": "P/a.mov"})
+	h := newCollectionsAPI(&API{adminKey: collectionsAdminKey, continuity: e.cont, jobs: &JobManager{smartFolders: e.svc}}, "/manager", nil)
+	get := func() resultsReply {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodGet, "/manager/api/queries/"+string(qryID(1))+"/results", nil)
+		req.Header.Set("X-JuiceMount-Admin-Key", collectionsAdminKey)
+		rec := httptest.NewRecorder()
+		h.serveQueries(rec, req)
+		var out resultsReply
+		if rec.Code != 200 || json.Unmarshal(rec.Body.Bytes(), &out) != nil {
+			t.Fatalf("results: %d %s", rec.Code, rec.Body)
+		}
+		return out
+	}
+	age := func(d time.Duration) {
+		r, ok := e.cont.results.get(qryID(1))
+		if !ok {
+			t.Fatal("nothing remembered")
+		}
+		r.at = r.at.Add(-d)
+		e.cont.results.put(qryID(1), r)
+	}
+	age(5 * time.Minute)
+	if r := get(); r.AgeSeconds < 300 {
+		t.Fatalf("the views' evaluation was not reused: %+v", r)
+	}
+	// The query root is not the Manager's: evaluated again.
+	e.svc.qry.rootOwned.Store(false)
+	if r := get(); r.AgeSeconds > 5 {
+		t.Fatalf("reused while the views do not own their root: %+v", r)
+	}
+	e.svc.qry.rootOwned.Store(true)
+	// The API's own evaluation is reused for a minute only.
+	age(5 * time.Minute)
+	if r := get(); r.AgeSeconds > 5 {
+		t.Fatalf("an API evaluation reused past a minute: %+v", r)
+	}
+	// Written by the views, but they have not cycled for two minutes.
+	e.svc.qry.markDirty(qryID(1))
+	e.clk.add(queryViewsMinInterval)
+	e.qpass()
+	e.clk.add(2 * time.Minute)
+	age(5 * time.Minute)
+	if r := get(); r.AgeSeconds > 5 {
+		t.Fatalf("reused while the views are not cycling: %+v", r)
+	}
+	// A view whose rebuild fails no longer vouches for its evaluation.
+	e.svc.qry.markDirty(qryID(1))
+	e.clk.add(queryViewsMinInterval)
+	e.qpass()
+	e.cont.demoteQuery(qryID(1))
+	age(5 * time.Minute)
+	if r := get(); r.AgeSeconds > 5 {
+		t.Fatalf("reused after the view failed: %+v", r)
 	}
 }

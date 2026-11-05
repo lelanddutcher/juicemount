@@ -63,7 +63,8 @@ type querySource interface {
 	advanceQuery(ctx context.Context, r *queryRun, exclude []string, maxOps int, until time.Time) (int, error)
 	locateHit(ctx context.Context, def catalog.QueryDefinition, h binder.Hint, exclude []string, now time.Time) (queryHit, bool, error)
 	activeQueries(ctx context.Context) ([]catalog.Query, error)
-	rememberQuery(id catalog.QueryID, res queryResult, at time.Time)
+	rememberQuery(id catalog.QueryID, res queryResult, at time.Time, byViews bool)
+	demoteQuery(id catalog.QueryID)
 	forgetQueries(active map[catalog.QueryID]bool)
 }
 
@@ -219,8 +220,13 @@ func (s *smartFoldersService) prepareQueries(ctx context.Context, src querySourc
 // returns how many candidates it resolved; errViewPartial when the budget
 // ran out first. While the volume is not connected the view is left as it
 // is. A file found gone at the last moment is looked up again, alone.
-func (s *smartFoldersService) reconcileQuery(ctx context.Context, rec *smartfolders.Reconciler, src querySource, item viewItem[catalog.QueryID], folder string, prior *collSeen, now time.Time, budget viewBudget) (*collSeen, int, error) {
+func (s *smartFoldersService) reconcileQuery(ctx context.Context, rec *smartfolders.Reconciler, src querySource, item viewItem[catalog.QueryID], folder string, prior *collSeen, now time.Time, budget viewBudget) (_ *collSeen, _ int, resultErr error) {
 	c, q := &s.qry, &s.qstate
+	defer func() {
+		if resultErr != nil && !errors.Is(resultErr, errViewPartial) {
+			src.demoteQuery(item.ID)
+		}
+	}()
 	exclude := queryExclude(rec)
 	notReady := func(err error) error {
 		return fmt.Errorf("%s/%s: %w (%v); view left unchanged", rec.Root, folder, errMembersUnresolved, err)
@@ -251,7 +257,6 @@ func (s *smartFoldersService) reconcileQuery(ctx context.Context, rec *smartfold
 	if run.stale {
 		c.markDirty(item.ID) // changed while it ran: once more, after the minimum interval
 	}
-	src.rememberQuery(item.ID, run.result(ops), run.now)
 
 	var had map[continuity.AssetID]string
 	if prior != nil && prior.folder == folder {
@@ -334,6 +339,7 @@ func (s *smartFoldersService) reconcileQuery(ctx context.Context, rec *smartfold
 		if ov := rec.Own.Views[folder]; ov != nil {
 			seen.hasView, seen.links = true, len(ov.Links)
 		}
+		src.rememberQuery(item.ID, res, time.Now(), true)
 		break
 	}
 	return seen, ops, nil

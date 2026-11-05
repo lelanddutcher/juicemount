@@ -36,6 +36,7 @@ import (
 	"github.com/lelanddutcher/juicemount/internal/redisurl"
 	"github.com/lelanddutcher/juicemount/internal/smartfolders/jfsmeta"
 	"github.com/redis/go-redis/v9"
+	"golang.org/x/text/unicode/norm"
 )
 
 const (
@@ -70,6 +71,40 @@ type continuityService struct {
 	views atomic.Pointer[smartFoldersService]
 	// results: each query's last complete evaluation (queries_eval.go).
 	results queryResultCache
+	// queryFolders: every active query's folders (NFC), so the binder
+	// marks recency only where a query can look (wantsTouch).
+	queryFolders atomic.Pointer[[]string]
+}
+
+// wantsTouch: p is under some active query's folder (binder Config.Touch;
+// the binder's goroutine).
+func (s *continuityService) wantsTouch(p string) bool {
+	f := s.queryFolders.Load()
+	if f == nil {
+		return false
+	}
+	p = norm.NFC.String(p)
+	for _, folder := range *f {
+		if underFolder(p, folder) {
+			return true
+		}
+	}
+	return false
+}
+
+// refreshQueryFolders reads every active query's folders (at start and
+// after each query change).
+func (s *continuityService) refreshQueryFolders(ctx context.Context) {
+	qs, err := s.activeQueries(ctx)
+	if err != nil {
+		log.Printf("manager: continuity: reading the saved queries: %v (recency marks keep the previous folders)", err)
+		return
+	}
+	folders := []string{}
+	for _, q := range qs {
+		folders = append(folders, q.Definition.Prefixes...)
+	}
+	s.queryFolders.Store(&folders)
 }
 
 func (s *continuityService) start() {
@@ -117,6 +152,7 @@ func (a *API) startContinuity(cfg Config, getenv func(string) string) *continuit
 	svc := buildContinuity(cfg, getenv)
 	if svc != nil {
 		svc.start()
+		svc.refreshQueryFolders(context.Background())
 		library, _ := svc.store.LibraryID()
 		log.Printf("manager: continuity ON (experimental): binding volume files to catalog %s", library)
 		a.attachCollectionViews(svc)
@@ -150,11 +186,16 @@ func (s *continuityService) collectionsChanged() {
 	}
 }
 
-// queryViewsRunning: the query views keep every query's evaluation
-// current (smart folders on, query root usable).
-func (s *continuityService) queryViewsRunning() bool {
+// queryViewsCurrent: the query views are keeping their evaluations
+// current: attached, in a query root the Manager owns, smart folders not
+// disabled, and a pass of theirs within the last minute.
+func (s *continuityService) queryViewsCurrent() bool {
 	v := s.views.Load()
-	return v != nil && v.qry.src.Load() != nil
+	if v == nil || v.qry.src.Load() == nil || !v.qry.rootOwned.Load() || v.disabled.Load() {
+		return false
+	}
+	st := v.qry.stats.Load()
+	return st != nil && v.cfg.Now().Sub(st.LastPass) < queryResultsFresh
 }
 
 // queriesChanged tells the query views a query changed.
@@ -288,7 +329,7 @@ func buildContinuity(cfg Config, getenv func(string) string) *continuityService 
 		return nil
 	}
 	svc := &continuityService{store: store}
-	b, err := binder.New(binder.Config{Store: store, Applied: svc.applied, Connect: func() (binder.Volume, error) {
+	b, err := binder.New(binder.Config{Store: store, Applied: svc.applied, Touch: svc.wantsTouch, Connect: func() (binder.Volume, error) {
 		fsys, err := jfsmeta.OpenReadOnly(metaURL)
 		if err != nil {
 			return nil, err

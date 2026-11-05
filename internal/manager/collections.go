@@ -239,6 +239,9 @@ type collectionsAPI struct {
 	macLimit  *ipLimiter      // per Mac principal, after
 	refusals  *refusalLog
 	roots     func() []string // the smart-folder roots the Manager owns (queries.go)
+	// queryCreate is held by a query create from its per-person count to
+	// its write (queries.go).
+	queryCreate sync.Mutex
 }
 
 // registerCollections wires /api/collections and /api/queries (queries.go,
@@ -316,8 +319,33 @@ func (h *collectionsAPI) authenticate(r *http.Request) (collectionActor, error) 
 
 // readsVolume: the request resolves files on the volume (every write, and
 // member pages), so it takes a slot.
-func readsVolume(r *http.Request) bool {
-	return r.Method != http.MethodGet || strings.HasSuffix(strings.TrimSuffix(r.URL.Path, "/"), "/members")
+func readsVolume(method string, parts []string) bool {
+	return method != http.MethodGet || len(parts) == 2 && parts[1] == "members"
+}
+
+// routeParts splits the request path below base into its segments, one
+// trailing slash allowed. A path with an empty, "." or ".." segment (an
+// encoded slash makes one) is refused (ok false), never cleaned: the slot
+// decision and the routing read these same parts, so they cannot disagree.
+func routeParts(p, base string) (parts []string, ok bool) {
+	rest, ok := strings.CutPrefix(p, base)
+	if !ok {
+		return nil, false
+	}
+	rest = strings.TrimSuffix(rest, "/")
+	if rest == "" {
+		return []string{}, true
+	}
+	if rest[0] != '/' {
+		return nil, false
+	}
+	parts = strings.Split(rest[1:], "/")
+	for _, s := range parts {
+		if s == "" || s == "." || s == ".." {
+			return nil, false
+		}
+	}
+	return parts, true
 }
 
 // acquire takes a volume-read slot for actor: one request per actor at a
@@ -352,30 +380,36 @@ func (h *collectionsAPI) acquire(ctx context.Context, actor collectionActor) (re
 }
 
 func (h *collectionsAPI) serve(w http.ResponseWriter, r *http.Request) {
-	h.serveWith(w, r, readsVolume(r), h.route)
+	h.serveWith(w, r, "/api/collections", readsVolume, h.route)
 }
 
-// serveWith authenticates, takes a volume-read slot when reads is set, and
-// routes.
-func (h *collectionsAPI) serveWith(w http.ResponseWriter, r *http.Request, reads bool,
-	route func(http.ResponseWriter, *http.Request, *continuityService, collectionActor) error) {
+// serveWith splits the path below base (refusing a non-canonical one),
+// authenticates, takes a volume-read slot when reads says so for these
+// parts, and routes them.
+func (h *collectionsAPI) serveWith(w http.ResponseWriter, r *http.Request, base string, reads func(method string, parts []string) bool,
+	route func(http.ResponseWriter, *http.Request, *continuityService, collectionActor, []string) error) {
 	svc := h.api.continuity
 	if svc == nil {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "continuity is off (JM_CONTINUITY)"})
+		return
+	}
+	parts, ok := routeParts(r.URL.Path, h.prefix+base)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no such route"})
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), collectionRequestTimeout)
 	defer cancel()
 	r = r.WithContext(ctx)
 	actor, err := h.authenticate(r)
-	if err == nil && reads {
+	if err == nil && reads(r.Method, parts) {
 		var release func()
 		if release, err = h.acquire(ctx, actor); err == nil {
 			defer release()
 		}
 	}
 	if err == nil {
-		err = route(w, r, svc, actor)
+		err = route(w, r, svc, actor, parts)
 	}
 	if err == nil {
 		return
@@ -425,13 +459,7 @@ func collectionFailure(err error) *httpError {
 //	GET    /api/collections/{id}/members         members with current paths (after, limit)
 //	POST   /api/collections/{id}/members/add     {members, operation_id?}
 //	POST   /api/collections/{id}/members/remove  {members, operation_id?}
-func (h *collectionsAPI) route(w http.ResponseWriter, r *http.Request, svc *continuityService, actor collectionActor) error {
-	rest := strings.TrimPrefix(r.URL.Path, h.prefix+"/api/collections")
-	rest = strings.Trim(rest, "/")
-	parts := []string{}
-	if rest != "" {
-		parts = strings.Split(rest, "/")
-	}
+func (h *collectionsAPI) route(w http.ResponseWriter, r *http.Request, svc *continuityService, actor collectionActor, parts []string) error {
 	if r.Method != http.MethodGet && actor.open && h.people != nil && h.people.grantsInForce() {
 		return failf(http.StatusForbidden, "no admin key is configured while people's grants are in force; set an admin key to change collections as the admin")
 	}

@@ -127,7 +127,7 @@ func queryViewsThroughProxy(t *testing.T, roots []string, admits bool) {
 	apply := func(changes ...catalog.Change) {
 		t.Helper()
 		ops++
-		if _, err := store.Apply(context.Background(), catalog.Operation{Version: catalog.OperationVersion,
+		if _, err := store.ApplyEnablingQueries(context.Background(), catalog.Operation{Version: catalog.OperationVersion,
 			LibraryID: library, ID: fmt.Sprintf("op-%d", ops), Actor: "admin", Changes: changes}); err != nil {
 			t.Fatal(err)
 		}

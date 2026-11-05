@@ -63,7 +63,8 @@ type resultsReply struct {
 // expireResults ages the remembered evaluation past the one-minute reuse.
 func (e *collectionsEnv) expireResults(id catalog.QueryID) {
 	if r, ok := e.svc.results.get(id); ok {
-		e.svc.results.put(id, r.res, r.at.Add(-2*queryResultsFresh))
+		r.at = r.at.Add(-2 * queryResultsFresh)
+		e.svc.results.put(id, r)
 	}
 }
 

@@ -195,6 +195,7 @@ func sortHits(hits []queryHit) {
 // inQueryFolders: p is under one of the query's folders and not under an
 // excluded root (the smart-folder roots; compared ignoring case).
 func inQueryFolders(def catalog.QueryDefinition, p string, exclude []string) bool {
+	p = norm.NFC.String(p) // folders are stored NFC
 	top, _, _ := strings.Cut(p, "/")
 	for _, r := range exclude {
 		if strings.EqualFold(top, r) {
@@ -350,15 +351,28 @@ type queryResultCache struct {
 type cachedQueryResult struct {
 	res queryResult
 	at  time.Time
+	// byViews: written by the query views after linking, so they keep it
+	// current while they run.
+	byViews bool
 }
 
-func (c *queryResultCache) put(id catalog.QueryID, res queryResult, at time.Time) {
+func (c *queryResultCache) put(id catalog.QueryID, r cachedQueryResult) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.m == nil {
 		c.m = map[catalog.QueryID]cachedQueryResult{}
 	}
-	c.m[id] = cachedQueryResult{res, at}
+	c.m[id] = r
+}
+
+// demote marks an entry as no longer kept current by the views.
+func (c *queryResultCache) demote(id catalog.QueryID) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if r, ok := c.m[id]; ok {
+		r.byViews = false
+		c.m[id] = r
+	}
 }
 
 func (c *queryResultCache) get(id catalog.QueryID) (cachedQueryResult, bool) {
@@ -379,10 +393,15 @@ func (c *queryResultCache) keep(active map[catalog.QueryID]bool) {
 	}
 }
 
-// rememberQuery stores a complete evaluation for the results API.
-func (s *continuityService) rememberQuery(id catalog.QueryID, res queryResult, at time.Time) {
-	s.results.put(id, res, at)
+// rememberQuery stores a complete evaluation for the results API, as the
+// views' (once linked) or the API's own.
+func (s *continuityService) rememberQuery(id catalog.QueryID, res queryResult, at time.Time, byViews bool) {
+	s.results.put(id, cachedQueryResult{res, at, byViews})
 }
+
+// demoteQuery: the view of the query failed to rebuild, so its remembered
+// evaluation is no longer kept current.
+func (s *continuityService) demoteQuery(id catalog.QueryID) { s.results.demote(id) }
 
 // forgetQueries drops the remembered results of queries no longer active.
 func (s *continuityService) forgetQueries(active map[catalog.QueryID]bool) { s.results.keep(active) }

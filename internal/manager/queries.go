@@ -28,19 +28,20 @@ package manager
 //
 // Limits. A library holds at most catalog.MaxQueries (256) active queries
 // and a person at most queryMaxPerPerson (32) created by them (the admin is
-// exempt from the per-person limit); beyond, 409. A create takes the
-// actor's request slot, so one person's creates are counted one at a time.
+// exempt from the per-person limit); beyond, 409. Creates hold one lock
+// from the count to the write, so the count is exact.
 //
 // Format. A catalog stays at format 3 (readable by the Manager before
 // queries, so a rollback stays possible) until the first query is
-// created: that create, once authorized, adds the query table in place
-// (catalog EnableQueries).
+// created: that create adds the query table in its own transaction
+// (catalog ApplyEnablingQueries), so a create that fails leaves format 3.
 //
 // Cost. Writes check grants against the folder names only, never the
 // volume. GET .../results answers from the query's last complete
 // evaluation when it is under a minute old, or under queryResultsKept (20
-// minutes) while the query views run (they rebuild every view at least
-// every 10 minutes); with evaluated_at and age_seconds; otherwise it runs the query (a
+// minutes) when the query views wrote it and still keep it current (they
+// own the query root, have cycled within the last minute, and its view has
+// not failed since); with evaluated_at and age_seconds; otherwise it runs the query (a
 // catalog scan and at most queryMaxCandidates volume resolutions) under a
 // volume-read slot and the 30 s deadline, and keeps the result.
 //
@@ -57,11 +58,13 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/lelanddutcher/juicemount/internal/continuity"
 	"github.com/lelanddutcher/juicemount/internal/continuity/binder"
 	"github.com/lelanddutcher/juicemount/internal/continuity/catalog"
+	"golang.org/x/text/unicode/norm"
 )
 
 // queryMaxPerPerson bounds the active queries one person created.
@@ -126,15 +129,14 @@ type queryBody struct {
 
 // serveQueries is serve for /api/queries.
 func (h *collectionsAPI) serveQueries(w http.ResponseWriter, r *http.Request) {
-	h.serveWith(w, r, queryReadsVolume(r), h.routeQueries)
+	h.serveWith(w, r, "/api/queries", queryReadsVolume, h.routeQueries)
 }
 
 // queryReadsVolume: a results request may read the volume; a create takes
-// the slot too, so a person's creates are counted one at a time.
-func queryReadsVolume(r *http.Request) bool {
-	p := strings.TrimSuffix(r.URL.Path, "/")
-	return r.Method == http.MethodGet && strings.HasSuffix(p, "/results") ||
-		r.Method == http.MethodPost && strings.HasSuffix(p, "/api/queries")
+// the slot too.
+func queryReadsVolume(method string, parts []string) bool {
+	return method == http.MethodGet && len(parts) == 2 && parts[1] == "results" ||
+		method == http.MethodPost && len(parts) == 0
 }
 
 // routeQueries dispatches
@@ -147,12 +149,7 @@ func queryReadsVolume(r *http.Request) bool {
 //	DELETE /api/queries/{id}             delete (body optional: {operation_id})
 //	POST   /api/queries/{id}/rename      {name, operation_id?}
 //	POST   /api/queries/{id}/delete      {operation_id?} or no body
-func (h *collectionsAPI) routeQueries(w http.ResponseWriter, r *http.Request, svc *continuityService, actor collectionActor) error {
-	rest := strings.Trim(strings.TrimPrefix(r.URL.Path, h.prefix+"/api/queries"), "/")
-	parts := []string{}
-	if rest != "" {
-		parts = strings.Split(rest, "/")
-	}
+func (h *collectionsAPI) routeQueries(w http.ResponseWriter, r *http.Request, svc *continuityService, actor collectionActor, parts []string) error {
 	if r.Method != http.MethodGet && actor.open && h.people != nil && h.people.grantsInForce() {
 		return failf(http.StatusForbidden, "no admin key is configured while people's grants are in force; set an admin key to change queries as the admin")
 	}
@@ -160,7 +157,7 @@ func (h *collectionsAPI) routeQueries(w http.ResponseWriter, r *http.Request, sv
 	if err != nil {
 		return err
 	}
-	c := &queryCall{collectionCall{svc: svc, actor: actor, library: library, w: w, r: r}, h.roots}
+	c := &queryCall{collectionCall{svc: svc, actor: actor, library: library, w: w, r: r}, h.roots, &h.queryCreate}
 	if len(parts) == 0 {
 		switch r.Method {
 		case http.MethodGet:
@@ -210,7 +207,8 @@ func (h *collectionsAPI) routeQueries(w http.ResponseWriter, r *http.Request, sv
 
 type queryCall struct {
 	collectionCall
-	roots func() []string // the smart-folder roots the Manager owns
+	roots    func() []string // the smart-folder roots the Manager owns
+	createMu *sync.Mutex     // held by a create from its count to its write
 }
 
 func (c *queryCall) list() error {
@@ -267,7 +265,7 @@ func (c *queryCall) results(id catalog.QueryID) error {
 	}
 	now := time.Now()
 	cached, ok := c.svc.results.get(id)
-	if age := now.Sub(cached.at); !ok || age >= queryResultsFresh && (!c.svc.queryViewsRunning() || age >= queryResultsKept) {
+	if age := now.Sub(cached.at); !ok || age >= queryResultsFresh && (!cached.byViews || !c.svc.queryViewsCurrent() || age >= queryResultsKept) {
 		res, err := c.svc.runQuery(c.ctx(), id, q.Definition, c.roots(), now)
 		if errors.Is(err, binder.ErrNotReady) {
 			return failf(http.StatusServiceUnavailable, "%v", err)
@@ -278,8 +276,8 @@ func (c *queryCall) results(id catalog.QueryID) error {
 		if err != nil {
 			return err
 		}
-		cached = cachedQueryResult{res, now}
-		c.svc.rememberQuery(id, res, now)
+		cached = cachedQueryResult{res: res, at: now}
+		c.svc.rememberQuery(id, res, now, false)
 	}
 	res := cached.res
 	out := struct {
@@ -330,7 +328,7 @@ func (b queryBody) definition(roots []string) (catalog.QueryDefinition, error) {
 	}
 	seen := map[string]bool{}
 	for _, f := range b.Folders {
-		p := strings.TrimSuffix(strings.TrimPrefix(f, "/"), "/")
+		p := norm.NFC.String(strings.TrimSuffix(strings.TrimPrefix(f, "/"), "/"))
 		if !catalog.ValidQueryPrefix(p) {
 			return d, fmt.Errorf("%w: folder %q is not a volume folder path (no empty, '.', '..' or hidden components)", errCollectionInput, f)
 		}
@@ -396,7 +394,17 @@ func (c *queryCall) operationID(key string) (string, error) {
 // change records one write. An exact retry (its operation ID is in the
 // history) returns the original result without a second authorization, as
 // for collections.
-func (c *queryCall) change(opID string, id catalog.QueryID, authorize func() error, changes []catalog.Change) error {
+//
+// A create (create set) holds the API's create lock from its check to its
+// write, so the per-person count is exact whatever path or slot the
+// request took, and is applied with ApplyEnablingQueries: on a format 3
+// catalog the first query adds the query table in the same transaction,
+// so a create that fails leaves the catalog at format 3.
+func (c *queryCall) change(opID string, id catalog.QueryID, create bool, authorize func() error, changes []catalog.Change) error {
+	if create {
+		c.createMu.Lock()
+		defer c.createMu.Unlock()
+	}
 	_, err := c.svc.store.GetEvent(c.ctx(), c.library, opID)
 	switch {
 	case errors.Is(err, catalog.ErrNotFound):
@@ -406,8 +414,15 @@ func (c *queryCall) change(opID string, id catalog.QueryID, authorize func() err
 	case err != nil:
 		return err
 	}
-	receipt, err := c.svc.store.Apply(c.ctx(), catalog.Operation{
-		Version: catalog.OperationVersion, LibraryID: c.library, ID: opID, Actor: c.actor.id(), Changes: changes})
+	op := catalog.Operation{Version: catalog.OperationVersion, LibraryID: c.library, ID: opID, Actor: c.actor.id(), Changes: changes}
+	apply, format := c.svc.store.Apply, c.svc.store.Format()
+	if create {
+		apply = c.svc.store.ApplyEnablingQueries
+	}
+	receipt, err := apply(c.ctx(), op)
+	if err == nil && format < 4 && c.svc.store.Format() >= 4 {
+		log.Printf("manager: continuity: the catalog is now format 4 (saved queries); a Manager from before saved queries no longer opens it")
+	}
 	if errors.Is(err, catalog.ErrNotFound) {
 		return failf(http.StatusNotFound, "no such query")
 	}
@@ -415,6 +430,7 @@ func (c *queryCall) change(opID string, id catalog.QueryID, authorize func() err
 		return err
 	}
 	c.svc.queriesChanged()
+	c.svc.refreshQueryFolders(c.ctx())
 	q, err := c.svc.store.GetQuery(c.ctx(), c.library, id)
 	if err != nil {
 		return err
@@ -446,21 +462,11 @@ func (c *queryCall) create() error {
 	// The identity follows from the operation, so a retry names the same one.
 	sum := sha256.Sum256([]byte("juicemount.queries.id\x00" + opID))
 	id := catalog.QueryID("qry_" + hex.EncodeToString(sum[:16]))
-	return c.change(opID, id, func() error {
+	return c.change(opID, id, true, func() error {
 		if err := c.authorize(def); err != nil {
 			return err
 		}
-		if err := c.underPersonLimit(); err != nil {
-			return err
-		}
-		// The first query: the catalog gains its query table now.
-		if c.svc.store.Format() < 4 {
-			if err := c.svc.store.EnableQueries(c.ctx()); err != nil {
-				return err
-			}
-			log.Printf("manager: continuity: the catalog is now format 4 (saved queries); a Manager from before saved queries no longer opens it")
-		}
-		return nil
+		return c.underPersonLimit()
 	}, []catalog.Change{{CreateQuery: &catalog.CreateQuery{QueryID: id, Name: name, Definition: def}}})
 }
 
@@ -522,7 +528,7 @@ func (c *queryCall) rename(id catalog.QueryID) error {
 	if err != nil {
 		return err
 	}
-	return c.change(opID, id, func() error { return c.authorize(q.Definition) },
+	return c.change(opID, id, false, func() error { return c.authorize(q.Definition) },
 		[]catalog.Change{{RenameQuery: &catalog.RenameQuery{QueryID: id, Name: name}}})
 }
 
@@ -542,6 +548,6 @@ func (c *queryCall) remove(id catalog.QueryID) error {
 	if err != nil {
 		return err
 	}
-	return c.change(opID, id, func() error { return c.authorize(q.Definition) },
+	return c.change(opID, id, false, func() error { return c.authorize(q.Definition) },
 		[]catalog.Change{{RemoveQuery: &catalog.RemoveQuery{QueryID: id}}})
 }
