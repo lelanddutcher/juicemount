@@ -3,6 +3,7 @@ package catalog
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"sort"
 )
@@ -13,7 +14,7 @@ func activeCollection(ctx context.Context, tx *sql.Tx, library string, id Collec
 	var owner string
 	var removed int
 	err := tx.QueryRowContext(ctx, `SELECT library_id,removed FROM collections WHERE collection_id=?`, id).Scan(&owner, &removed)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("%w: collection", ErrNotFound)
 	}
 	if err != nil {
