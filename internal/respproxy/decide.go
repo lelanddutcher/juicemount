@@ -164,9 +164,7 @@ func (e *LeaseEngine) Start() error {
 	if err := e.loadLeases(ms(start)); err != nil {
 		return fmt.Errorf("respproxy: load leases: %w", err)
 	}
-	if err := e.loadSmartViews(); err != nil {
-		return fmt.Errorf("respproxy: load smart-folder views: %w", err)
-	}
+	e.loadSmartViews() // never fails the start
 	t0 := time.Now()
 	n, err := e.anc.bootstrapRoots()
 	if err != nil {

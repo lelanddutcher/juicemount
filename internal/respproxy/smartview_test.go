@@ -3,6 +3,8 @@ package respproxy
 import (
 	"context"
 	"encoding/binary"
+	"errors"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -492,5 +494,58 @@ func TestSmartViewRecordPrunedAtStart(t *testing.T) {
 	defer eng.smartMu.Unlock()
 	if len(eng.smartViews) != 1 || !eng.smartViews[kept] {
 		t.Fatalf("mirror after start = %v", eng.smartViews)
+	}
+}
+
+// failingSide fails the side commands fail picks; the rest go to side.
+type failingSide struct {
+	side sideDoer
+	fail func(args [][]byte) bool
+}
+
+func (f failingSide) Do(db int, args ...[]byte) (Value, error) {
+	if f.fail(args) {
+		return Value{}, errors.New("injected side failure")
+	}
+	return f.side.Do(db, args...)
+}
+
+// A record the proxy cannot read or check at start never stops it: an
+// entry it cannot check stays in the record.
+func TestSmartViewRecordCheckNeverFailsStart(t *testing.T) {
+	r := startSmartViewRig(t, svRoots)
+	kept := r.view(t, r.recents, "Kept")
+	if err := r.db.SAdd(r.ctx, SmartViewsKey, "999998", "999999").Err(); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name string
+		fail func(args [][]byte) bool
+		want string // the record afterwards, sorted
+	}{
+		{"get", func(a [][]byte) bool { return string(a[0]) == "GET" && string(a[1]) == "i999999" }, ",999999," + inoStr(kept)},
+		{"srem", func(a [][]byte) bool { return string(a[0]) == "SREM" }, "999998,999999," + inoStr(kept)},
+		{"hmget", func(a [][]byte) bool { return string(a[0]) == "HMGET" }, "999998,999999," + inoStr(kept)},
+		{"sscan", func(a [][]byte) bool { return string(a[0]) == "SSCAN" }, "999998,999999," + inoStr(kept)},
+	} {
+		if err := r.db.SAdd(r.ctx, SmartViewsKey, "999998", "999999").Err(); err != nil {
+			t.Fatal(err)
+		}
+		eng := NewLeaseEngine(LeaseConfig{Side: failingSide{r.tp.Side(), tc.fail}, VolumeDB: testDB, NoScan: true,
+			SmartRoots: svRoots, SweepEvery: time.Hour, Logf: r.tp.logs.Logf})
+		if err := eng.Start(); err != nil {
+			t.Fatalf("%s: start failed: %v", tc.name, err)
+		}
+		eng.Close()
+		got, err := r.db.SMembers(r.ctx, SmartViewsKey).Result()
+		if err != nil {
+			t.Fatal(err)
+		}
+		sort.Strings(got)
+		want := strings.Split(strings.TrimPrefix(tc.want, ","), ",")
+		sort.Strings(want)
+		if strings.Join(got, ",") != strings.Join(want, ",") {
+			t.Fatalf("%s: record after start = %v, want %v", tc.name, got, want)
+		}
 	}
 }

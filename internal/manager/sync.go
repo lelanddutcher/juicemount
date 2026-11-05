@@ -197,7 +197,7 @@ type RunSyncSpec struct {
 func RunSync(ctx context.Context, juicefsBin string, spec RunSyncSpec, source, destination string, opts SyncOptions, extraEnv []string, progress chan<- ProgressEvent) error {
 	// Never into a smart-folder root (sync_smartroots.go), also for
 	// scheduled jobs that did not pass validateDirectionPair.
-	if err := checkSyncSmartRoots(os.Getenv, os.ReadDir, source, destination); err != nil {
+	if err := checkSyncSmartRoots(os.Getenv, os.ReadDir, source, destination, spec.FUSEMount); err != nil {
 		return err
 	}
 	// H-8B: check out every target project before the first write. A
@@ -952,7 +952,7 @@ func validateDirectionPair(dir Direction, src, dst string) error {
 		if pathUnderJFS(src) {
 			return fmt.Errorf("direction=in source must be a host path, not /jfs/... (got %q) — use direction=between for JuiceFS-to-JuiceFS", src)
 		}
-		if err := checkSyncSmartRoots(os.Getenv, os.ReadDir, src, dst); err != nil {
+		if err := checkSyncSmartRoots(os.Getenv, os.ReadDir, src, dst, ""); err != nil {
 			return err
 		}
 	case DirectionOut:

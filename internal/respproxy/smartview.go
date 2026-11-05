@@ -65,7 +65,6 @@ package respproxy
 import (
 	"bytes"
 	"encoding/binary"
-	"fmt"
 	"strconv"
 	"strings"
 	"time"
@@ -343,14 +342,23 @@ func (e *LeaseEngine) dropSmartView(n uint64) {
 // loadSmartViews reads the record into the mirror and drops (at most
 // smartPruneMax checks) every entry whose inode is gone, is not a
 // directory, or, while smart roots are configured, does not sit directly
-// in one of them.
-func (e *LeaseEngine) loadSmartViews() error {
+// in one of them. It never fails the start: an entry it cannot check stays
+// (logged and counted), and a record it cannot read in full leaves the
+// mirror partial, which only means some views are not dropped when they
+// leave (the next start checks them again).
+func (e *LeaseEngine) loadSmartViews() {
 	views := map[uint64]bool{}
+	defer func() {
+		e.smartMu.Lock()
+		e.smartViews = views
+		e.smartMu.Unlock()
+	}()
 	cursor := "0"
 	for {
 		v, err := e.side("SSCAN", SmartViewsKey, cursor, "COUNT", "1000")
 		if err != nil || len(v.Elems) != 2 {
-			return fmt.Errorf("SSCAN %s: %v", SmartViewsKey, err)
+			e.logf("respproxy: smart-folder view record: SSCAN: %v (%d entries read; not checked this start)", err, len(views))
+			return
 		}
 		for _, m := range v.Elems[1].Elems {
 			if n, ok := digits(string(m.Str)); ok {
@@ -365,7 +373,8 @@ func (e *LeaseEngine) loadSmartViews() error {
 	if len(e.cfg.SmartRoots) > 0 {
 		v, err := e.side(append([]string{"HMGET", "d" + inoStr(rootIno)}, e.cfg.SmartRoots...)...)
 		if err != nil {
-			return fmt.Errorf("read the smart-folder roots: %v", err)
+			e.logf("respproxy: smart-folder view record: reading the smart-folder roots: %v (%d entries not checked this start)", err, len(views))
+			return
 		}
 		for _, el := range v.Elems {
 			if t, ok := entryType(el.Str); ok && t == typeDir && !el.Null {
@@ -375,7 +384,7 @@ func (e *LeaseEngine) loadSmartViews() error {
 			}
 		}
 	}
-	checked, dropped := 0, 0
+	checked, dropped, failed := 0, 0, 0
 	for n := range views {
 		if checked >= smartPruneMax {
 			e.logf("respproxy: smart-folder view record: %d entries, checked %d at start", len(views), checked)
@@ -384,25 +393,23 @@ func (e *LeaseEngine) loadSmartViews() error {
 		checked++
 		v, err := e.side("GET", "i"+inoStr(n))
 		if err != nil {
-			return fmt.Errorf("GET i%d: %v", n, err)
+			failed++
+			continue
 		}
 		a, ok := parseAttr(v.Str)
 		if !v.Null && ok && a.typ == typeDir && (len(e.cfg.SmartRoots) == 0 || roots[a.parent]) {
 			continue
 		}
 		if _, err := e.side("SREM", SmartViewsKey, inoStr(n)); err != nil {
-			return fmt.Errorf("SREM %s %d: %v", SmartViewsKey, n, err)
+			failed++
+			continue
 		}
 		delete(views, n)
 		dropped++
 	}
-	if dropped > 0 {
-		e.logf("respproxy: smart-folder view record: dropped %d entries of views gone or out of their root", dropped)
+	if dropped > 0 || failed > 0 {
+		e.logf("respproxy: smart-folder view record: dropped %d entries of views gone or out of their root; %d could not be checked (kept)", dropped, failed)
 	}
-	e.smartMu.Lock()
-	e.smartViews = views
-	e.smartMu.Unlock()
-	return nil
 }
 
 // smartRootOf reports which configured smart root the directory dir is:
