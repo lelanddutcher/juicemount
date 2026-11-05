@@ -393,7 +393,7 @@ reads `MINIO_ACCESS_KEY` / `MINIO_SECRET_KEY` from each client's environment
 
 | User | Policy file | May | Holder |
 |---|---|---|---|
-| `jm-client` | `server/minio/jm-client-policy.json` | GetObject (and HEAD), PutObject, ListBucket | Macs (from enrollment), farm, WebDAV, enrolled farm nodes |
+| `jm-client` | `server/minio/jm-client-policy.json` | GetObject (and HEAD), PutObject, ListBucket; explicitly denied: creating service accounts, changing its own secret | Macs (from enrollment), farm, WebDAV, enrolled farm nodes |
 | `jm-gc` | `server/minio/jm-gc-policy.json` | the above plus DeleteObject and multipart cleanup | server `bg` mount, Manager (gc, compact, fsck, sync) |
 
 Neither policy has bucket or admin actions. A client delete with `jm-client`
@@ -571,9 +571,30 @@ list request to the volume's bucket (`JM_MINIO_URL`/`JM_VOL_NAME`, or
 `JM_OBJ_BUCKET_URL`) with its current client key. MinIO keeps one secret
 per user (`mc admin user add` replaces it), so when that request succeeds
 with a secret other than the one a Mac was given, that Mac's copy is
-refused. If the request fails, or MinIO cannot be reached, the Mac stays
-listed and the page says why (`shared_key_problem`). Putting the old secret
-back at MinIO lists those Macs again.
+refused. The answer must be a listing of that bucket; anything else, a
+refusal, or no answer keeps the Mac listed and the page says why
+(`shared_key_problem`). Putting the old secret back at MinIO lists those
+Macs again.
+
+This proves that the user's own secret changed, **not** that no credential
+made with the old key is left. In the pinned MinIO release
+(RELEASE.2025-01-20T14-49-07Z) any user, and any service account or
+temporary credential of it, may create service accounts for that user, and
+set the user's own secret, unless its policy explicitly denies it; and
+`AssumeRole` hands any user temporary credentials (up to 365 days) with no
+policy check at all. Such credentials do not depend on the user's secret.
+So:
+
+- `jm-client-policy.json` explicitly denies `admin:CreateServiceAccount`
+  and `admin:CreateUser` (per-Mac keys inherit it through `jm-macs`), and
+  `minio-keys` refuses a policy file without that deny and re-applies the
+  policy at every `up`. A deny on `sts:AssumeRole` would do nothing:
+  MinIO does not consult policy for it.
+- The `minio` service sets `MINIO_STS_DURATION: 15m`, so a temporary
+  credential lasts at most 15 minutes whatever the requester asks for.
+- The rotation below removes the `jm-client` user before it is created
+  again: MinIO then deletes every service account and temporary credential
+  derived from it, including any made before the deny existed.
 
 **Do not rename `JM_OBJ_CLIENT_ACCESS_KEY` to rotate.** `minio-keys` creates
 the new user but never removes the old one, so the old key keeps working.
@@ -590,17 +611,34 @@ spool, but changes to files that already exist fail. So stop the Macs first.
 2. Put a new value in `server/.env`:
    `JM_OBJ_CLIENT_SECRET_KEY=` (`openssl rand -hex 20`). Keep the old value
    at hand for the check (`read -rs` it, never on a command line).
-3. Apply it everywhere, MinIO first: `$C -f server/docker-compose.yml up -d`.
-   `minio-keys` runs first and sets the new secret on `jm-client` (from here
-   the old secret is refused); `juicefs-init` waits for it, and `juicefs`
-   (WebDAV), `juicemount-manager` and `juicefarm` wait for `juicefs-init` and
-   are recreated with the new value. Check that `minio-keys` exited 0:
+3. Remove the `jm-client` user, which also deletes every service account and
+   temporary credential made from it (from here nothing that used the old
+   key works, the server's own WebDAV and farm included):
+
+   ```bash
+   M="$($C -f server/docker-compose.yml ps -q minio)"
+   read -rs ROOT && export ROOT        # MINIO_ROOT_PASSWORD
+   docker exec -e ROOT "$M" sh -c \
+     'MC_HOST_r="http://juicemount:$ROOT@127.0.0.1:9000" mc admin user rm r jm-client'
+   ```
+
+   (Percent-encode characters other than letters and digits in `ROOT`.)
+4. Apply the new value, MinIO first. Like every command in this guide this
+   reads `server/.env`, which must hold every value the compose file
+   requires (`JM_MANAGER_DIGEST`, `JM_FARM_DIGEST` and the others):
+   `$C -f server/docker-compose.yml up -d minio minio-keys juicefs juicemount-manager juicefarm`.
+   `minio-keys` creates `jm-client` again with the new secret and its
+   policy; `juicefs-init` waits for it, and `juicefs` (WebDAV),
+   `juicemount-manager` and `juicefarm` wait for `juicefs-init` and are
+   recreated with the new value. The first time after this release, `minio`
+   is recreated too (the `MINIO_STS_DURATION` setting), which interrupts
+   object I/O for the restart. Check that `minio-keys` exited 0:
    `docker logs "$($C -f server/docker-compose.yml ps -aq minio-keys)"`.
-4. Re-create enrolled farm nodes with the new `MINIO_SECRET_KEY` (the
+5. Re-create enrolled farm nodes with the new `MINIO_SECRET_KEY` (the
    Manager's node plan prints the command), and give the new secret to any
    other client that was set up with the key by hand (a Mac or script with
    `MINIO_ACCESS_KEY`/`MINIO_SECRET_KEY` set outside enrollment).
-5. Macs Start again. Each gets the new key from the Manager at its next
+6. Macs Start again. Each gets the new key from the Manager at its next
    poll; a Mac that starts with the old key reports refused storage access,
    asks the Manager at once, saves the new key, and one more Stop
    everything, then Start, uses it.
@@ -616,10 +654,15 @@ docker exec -e NEW "$M" sh -c 'MC_HOST_n="http://jm-client:$NEW@127.0.0.1:9000" 
 # The same command with the old key must fail with a signature error, not any error:
 docker exec -e OLD "$M" sh -c 'MC_HOST_o="http://jm-client:$OLD@127.0.0.1:9000" mc ls o/zpool' 2>&1 |
   grep -q 'signature we calculated does not match' && echo OLD-REFUSED
-unset NEW OLD
+# No service account of jm-client may exist (this prints nothing):
+docker exec -e ROOT "$M" sh -c 'MC_HOST_r="http://juicemount:$ROOT@127.0.0.1:9000" mc admin user svcacct ls r jm-client'
+unset NEW OLD ROOT
 ```
 
-Both lines must print. Then: the Principals page's rotation list is empty
+Both `NEW-OK` and `OLD-REFUSED` must print, and the service-account list
+must be empty. If it lists any, remove each
+(`mc admin user svcacct rm r <access key>` with the same `MC_HOST_r`) and
+find out which client made it: the policy now forbids it. Then: the Principals page's rotation list is empty
 within a minute (or shows why not); `docker ps` shows the `juicefs`
 container `healthy` (its health check covers the WebDAV server) and
 `docker exec <juicefarm> mountpoint /jfs` succeeds; after a Mac copy, a
@@ -628,7 +671,7 @@ farm node's log show no `SignatureDoesNotMatch`, `InvalidAccessKeyId` or
 `AccessDenied` (`docker logs --since 15m <container> 2>&1 | grep -E
 'SignatureDoesNotMatch|InvalidAccessKeyId|AccessDenied'` prints nothing).
 
-**Rollback:** put the old secret back in `server/.env` and repeat step 3;
+**Rollback:** put the old secret back in `server/.env` and repeat step 4;
 the revoked Macs' copies then work again, and the page lists them again.
 
 Per-Mac keys (below) cut off a revoked Mac that only ever had its own key.
