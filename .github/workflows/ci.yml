@@ -161,3 +161,17 @@ jobs:
             echo 'stale-identity negative test unexpectedly passed' >&2
             exit 1
           fi
+      - name: Agent access probe and packaging verifier tests
+        run: |
+          scratch="$RUNNER_TEMP/p96"
+          mkdir -p "$scratch"
+          swiftc -parse-as-library -o "$scratch/agent-access-probe" \
+            app/JuiceMount/Tests/AgentAccessProbe.swift app/JuiceMount/Sources/JuiceMount/Core/AgentAccess.swift
+          "$scratch/agent-access-probe"
+          export P96_PRIVATE_TMPDIR="$scratch"
+          python3 scripts/test_verify_codesign_runtime.py
+          python3 scripts/test_verify_macos26_artifact.py
+          P96_SOURCE_APP=build/JuiceMount.app \
+          P96_EXPECTED_VERSION="$(awk -F'"' '/^var Version = / { print $2; exit }' internal/version/version.go)" \
+          P96_EXPECTED_COMMIT="$(git rev-parse HEAD)" \
+            python3 scripts/test_verify_build.py

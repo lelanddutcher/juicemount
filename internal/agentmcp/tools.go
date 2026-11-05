@@ -379,9 +379,9 @@ func (t *Tools) client() (*Client, error) {
 	c, err := t.Client()
 	switch {
 	case errors.Is(err, ErrNoToken):
-		return nil, &toolError{msg: "No agent token is stored on this Mac. A person must mint one in a terminal: juicemount-mcp token create --name <name>."}
+		return nil, &toolError{msg: "No agent token is stored on this Mac. A person must create one in JuiceMount's Settings (Connection, Agents, New token), or in a terminal: juicemount-mcp token create --name <name>."}
 	case err != nil:
-		return nil, &toolError{msg: fmt.Sprintf("The agent token on this Mac cannot be read (%v). Run juicemount-mcp token create again, or allow juicemount-mcp access to it in Keychain Access.", err)}
+		return nil, &toolError{msg: fmt.Sprintf("The agent token on this Mac cannot be read (%v). Create one again in JuiceMount's Settings (Connection, Agents) or with juicemount-mcp token create, or allow juicemount-mcp access to it in Keychain Access.", err)}
 	}
 	return c, nil
 }
@@ -845,7 +845,7 @@ func errorMessage(err error) string {
 	switch ae.Status {
 	case http.StatusUnauthorized:
 		return "The Manager refused this Mac's agent token (" + ae.Message + "). It was revoked or expired, or its Mac or person " +
-			"changed. A person must mint a new one on this Mac: juicemount-mcp token create --name <name>."
+			"changed. A person must create a new one on this Mac in JuiceMount's Settings (Connection, Agents), or with juicemount-mcp token create --name <name>."
 	case http.StatusForbidden:
 		return "The Manager refused this (" + ae.Message + "). An agent acts as its person: it may find files and edit " +
 			"collections only where that person's project grants allow, and may not delete collections or change saved queries."

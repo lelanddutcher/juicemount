@@ -20,9 +20,15 @@ package credstore
 //     same file inside the root.
 //
 // The app's Manager enrollment record (slot Enrollment) is what mints a
-// token: LoadEnrollment reads it. On a Mac the item's access list names the
-// app and its service, not juicemount-mcp, so the read may show the macOS
-// Keychain prompt (it is run by a person in a terminal).
+// token. The app mints from Settings (bridge agenttokens.go) and stores the
+// token with AppAgentToken: the same item, but created with an access list
+// that trusts the app and the bundled juicemount-mcp, so `serve` reads it
+// without a prompt and the enrollment item is never opened to another
+// program. `juicemount-mcp token create`, for a Mac without the app's
+// Settings at hand, reads the enrollment with LoadEnrollment instead: the
+// item's access list names the app and its service, not juicemount-mcp, so
+// the read may show the macOS Keychain prompt (it is run by a person in a
+// terminal).
 
 import (
 	"errors"
@@ -55,6 +61,14 @@ var ErrNoKeychain = errors.New("this build of juicemount-mcp has no Keychain sup
 
 // SaveAgentToken stores record (the token record JSON), replacing any.
 func SaveAgentToken(record string) error {
+	return saveAgentToken(record, func(device string) error {
+		return keychainSave(AgentTokenService, string(AgentToken), agentTokenAccount, record, device, agentTokenUI)
+	})
+}
+
+// saveAgentToken stores record in the agent token file when there is one,
+// else with keychain, given this Mac's device digest.
+func saveAgentToken(record string, keychain func(device string) error) error {
 	if record == "" {
 		return errors.New("empty agent token record")
 	}
@@ -64,7 +78,7 @@ func SaveAgentToken(record string) error {
 	} else if ok {
 		return saveFile(path, isolatedEntry{Account: agentTokenAccount, Secret: record, Device: device})
 	}
-	return keychainSave(AgentTokenService, string(AgentToken), agentTokenAccount, record, device, agentTokenUI)
+	return keychain(device)
 }
 
 // LoadAgentToken returns the stored record (ErrNotFound when none; on a Mac
@@ -77,12 +91,18 @@ func LoadAgentToken() (string, error) {
 	} else if ok {
 		return loadIsolated(path, agentTokenAccount)
 	}
-	if !keychainAvailable {
-		return "", ErrNoKeychain
-	}
 	read := keychainRead
 	if agentTokenUI {
 		read = keychainReadInteractive
+	}
+	return loadAgentTokenKeychain(read)
+}
+
+// loadAgentTokenKeychain reads the agent token item with read and checks
+// its device stamp.
+func loadAgentTokenKeychain(read func(service, slot, account string) (string, string, error)) (string, error) {
+	if !keychainAvailable {
+		return "", ErrNoKeychain
 	}
 	secret, stamp, err := read(AgentTokenService, string(AgentToken), agentTokenAccount)
 	if err != nil {
@@ -96,6 +116,12 @@ func LoadAgentToken() (string, error) {
 
 // DeleteAgentToken removes the stored record; none stored is not an error.
 func DeleteAgentToken() error {
+	return deleteAgentToken(func() error { return keychainDelete(AgentTokenService, string(AgentToken), agentTokenUI) })
+}
+
+// deleteAgentToken removes the agent token file when there is one, else
+// with keychain.
+func deleteAgentToken(keychain func() error) error {
 	if path, ok, err := agentTokenFile(); err != nil {
 		return err
 	} else if ok {
@@ -104,7 +130,50 @@ func DeleteAgentToken() error {
 		}
 		return nil
 	}
-	return keychainDelete(AgentTokenService, string(AgentToken), agentTokenUI)
+	return keychain()
+}
+
+// AppAgentToken is the agent token as the JuiceMount app keeps it (bridge
+// agenttokens.go): the item SaveAgentToken writes, with the same record and
+// device stamp, in the same file off a Mac or in an isolated root. On a Mac,
+// Save always creates the item afresh with an access list that trusts the
+// app (the calling process) and Trusted, the bundled juicemount-mcp: that is
+// the legacy keychain's access list, as the app's RedisCredentialStore makes
+// for the service, because the data-protection keychain needs a
+// keychain-access-groups entitlement, which needs a provisioning profile. A
+// Developer ID juicemount-mcp in the app's team then reads it with user
+// interaction off (`serve`); an ad-hoc build is refused (its partition is
+// its own cdhash), as the service is for the app's items.
+//
+// None of its calls changes the process's Keychain user-interaction setting:
+// it runs in the app, which may show the Keychain's prompt (for an item
+// another program made) to the person using it.
+type AppAgentToken struct {
+	// Trusted are the executables besides the calling process that may read
+	// the item without asking: the bundled juicemount-mcp.
+	Trusted []string
+}
+
+// Save stores record, replacing any.
+func (a AppAgentToken) Save(record string) error {
+	return saveAgentToken(record, func(device string) error {
+		return keychainReplaceTrusting(AgentTokenService, string(AgentToken), agentTokenAccount, record, device, a.Trusted)
+	})
+}
+
+// Load returns the stored record, as LoadAgentToken.
+func (AppAgentToken) Load() (string, error) {
+	if path, ok, err := agentTokenFile(); err != nil {
+		return "", err
+	} else if ok {
+		return loadIsolated(path, agentTokenAccount)
+	}
+	return loadAgentTokenKeychain(keychainLoadAsIs)
+}
+
+// Delete removes the stored record; none stored is not an error.
+func (AppAgentToken) Delete() error {
+	return deleteAgentToken(func() error { return keychainDeleteAsIs(AgentTokenService, string(AgentToken)) })
 }
 
 // agentTokenUI: the agent token's Keychain calls may ask the person.

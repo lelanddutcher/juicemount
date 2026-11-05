@@ -32,6 +32,13 @@ struct PreferencesWindowView: View {
     /// Last non-empty sanitized volume name — the comparison anchor for the
     /// name→mount-point derivation (see deriveMountPoint).
     @State private var derivationAnchor = ""
+    // Connection tab: Agents (agent tokens for juicemount-mcp).
+    @State private var agents = AgentTokensModel()
+    @State private var newTokenSheet = false
+    @State private var newTokenName = ""
+    @State private var newTokenDays = AgentAccess.maxDays
+    @State private var revokeCandidate: AgentAccess.Token?
+    @State private var agentCopyNote: String?
 
     enum Tab: String, CaseIterable, Identifiable {
         case general
@@ -232,6 +239,8 @@ struct PreferencesWindowView: View {
 
             serverAccessSection
 
+            agentsSection
+
             Section {
                 DisclosureGroup("Advanced addresses", isExpanded: $advancedAddressesExpanded) {
                     LabeledContent("NFS listen address") {
@@ -395,6 +404,182 @@ struct PreferencesWindowView: View {
         } footer: {
             footnote("Each Mac signs in to the server as itself. Request access sends this Mac's request to the Manager; an admin approves it on the Principals page after checking that the code matches. The approved password and object-store key are saved in the Keychain only once the server accepts them (after its proxy cutover); until then this Mac keeps its current login. They apply after Stop everything → Start. Leave the Manager URL empty to use the Redis host on port 30190.")
         }
+    }
+
+    // MARK: - Agents (juicemount-mcp)
+
+    /// AI agents on this Mac (Claude Desktop, Claude Code) reach the volume
+    /// through the bundled juicemount-mcp, as this person, with an agent
+    /// token the app mints and keeps in the Keychain (docs/agent-mcp.md). Shown
+    /// only once this Mac is approved and the Manager reports agent access
+    /// (continuity) on; otherwise a short disabled note. The token itself is
+    /// never shown or copied: the bridge stores it and juicemount-mcp reads it.
+    private var agentsSection: some View {
+        Section {
+            switch AgentAccess.visibility(enrollmentApproved: agentsApproved, list: agents.list) {
+            case .disabled(let note):
+                Label(note, systemImage: "person.badge.key")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            case .loading:
+                HStack(spacing: 6) {
+                    ProgressView().controlSize(.small)
+                    Text("Checking the Manager…")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            case .failed(let message):
+                HStack(spacing: 8) {
+                    Label(message, systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption)
+                        .foregroundStyle(MenuPopoverView.glanceAmber)
+                        .lineLimit(3)
+                        .frame(maxWidth: 360, alignment: .leading)
+                    Button("Retry") { agents.refresh() }
+                }
+            case .shown:
+                agentsContent
+            }
+        } header: {
+            Text("Agents")
+        } footer: {
+            footnote("An agent token lets an AI agent on this Mac find files and edit collections as you, through juicemount-mcp. It never reads file contents. Tokens are kept in the Keychain and never shown; revoking one stops the agent at once.")
+        }
+        .onAppear { if agentsApproved { agents.refreshIfNeeded() } }
+        .onChange(of: agentsApproved) { _, approved in if approved { agents.refresh() } }
+        .sheet(isPresented: $newTokenSheet) { newTokenForm }
+        .confirmationDialog("Revoke “\(revokeCandidate?.name ?? "")”?", isPresented: revokeDialogShown, presenting: revokeCandidate) { token in
+            Button("Revoke", role: .destructive) { agents.revoke(token) }
+            Button("Cancel", role: .cancel) {}
+        } message: { _ in
+            Text("An agent using this token stops working at once.")
+        }
+    }
+
+    @ViewBuilder
+    private var agentsContent: some View {
+        if agents.tokens.isEmpty {
+            Text("No agent tokens yet.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        ForEach(agents.tokens) { token in
+            LabeledContent {
+                HStack(spacing: 8) {
+                    Text("Created \(token.created.formatted(date: .abbreviated, time: .omitted)) · expires \(token.expires.formatted(date: .abbreviated, time: .omitted))")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Button("Revoke") { revokeCandidate = token }
+                        .disabled(agents.busy)
+                }
+            } label: {
+                HStack(spacing: 6) {
+                    Text(token.name)
+                    if token.id == agents.storedID {
+                        Text("On this Mac")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+        }
+        HStack(spacing: 10) {
+            Button("New token…") {
+                newTokenName = ""
+                newTokenDays = AgentAccess.maxDays
+                newTokenSheet = true
+            }
+            .disabled(agents.busy)
+            if agents.busy {
+                ProgressView().controlSize(.small)
+            }
+            if let status = agents.status {
+                Label(status, systemImage: agents.statusIsError ? "exclamationmark.triangle.fill" : "checkmark.circle.fill")
+                    .font(.caption)
+                    .foregroundStyle(agents.statusIsError ? MenuPopoverView.glanceAmber : .green)
+                    .lineLimit(3)
+                    .frame(maxWidth: 380, alignment: .leading)
+            }
+        }
+        if let warning = agents.warning {
+            Label("The Manager address is plain http, so the token crosses the network unencrypted. Use an https address where you can.", systemImage: "lock.open")
+                .font(.caption)
+                .foregroundStyle(MenuPopoverView.glanceAmber)
+                .help(warning)
+        }
+        LabeledContent("Connect an agent") {
+            HStack(spacing: 8) {
+                Button("Copy Claude Desktop config") {
+                    if let binary = agentBinary {
+                        copyAgentSetup(AgentAccess.claudeDesktopConfig(binary: binary, mount: agentMount), note: "Claude Desktop config copied. Paste it into claude_desktop_config.json and restart Claude.")
+                    }
+                }
+                Button("Copy Claude Code command") {
+                    if let binary = agentBinary {
+                        copyAgentSetup(AgentAccess.claudeCodeCommand(binary: binary, mount: agentMount), note: "Claude Code command copied. Run it in Terminal.")
+                    }
+                }
+            }
+            .disabled(agentBinary == nil)
+        }
+        if agentBinary == nil {
+            footnote("This build has no bundled juicemount-mcp, so there is nothing to connect. Use a release build of JuiceMount.")
+        } else if let note = agentCopyNote {
+            footnote(note)
+        }
+    }
+
+    private var newTokenForm: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("New agent token")
+                .font(.headline)
+            LabeledContent("Name") {
+                TextField("Claude Desktop", text: $newTokenName)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(width: 220)
+            }
+            Stepper(value: $newTokenDays, in: 1...AgentAccess.maxDays) {
+                Text("Expires in \(newTokenDays) days")
+            }
+            footnote("The token is saved in this Mac's Keychain for juicemount-mcp and is never shown. Creating one replaces the token agents on this Mac use now; the old one keeps working until you revoke it.")
+            HStack {
+                Spacer()
+                Button("Cancel") { newTokenSheet = false }
+                    .keyboardShortcut(.cancelAction)
+                Button("Create") {
+                    agents.create(name: newTokenName, days: newTokenDays)
+                    newTokenSheet = false
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(newTokenName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+        }
+        .padding(20)
+        .frame(width: 380)
+    }
+
+    private var agentsApproved: Bool {
+        [.approved, .approvedPendingCutover, .approvedLoginRefused, .approvedNotInUse].contains(preferences.enrollment.phase)
+    }
+
+    /// The bundled juicemount-mcp (nil in a build without it, e.g. swift run).
+    private var agentBinary: String? { AgentAccess.bundledBinary(bundleURL: Bundle.main.bundleURL) }
+
+    /// The configured mount point, which serve's --mount names.
+    private var agentMount: String {
+        let mount = preferences.mountPoint.trimmingCharacters(in: .whitespacesAndNewlines)
+        return mount.isEmpty ? "/Volumes/zpool" : mount
+    }
+
+    private var revokeDialogShown: Binding<Bool> {
+        Binding(get: { revokeCandidate != nil }, set: { if !$0 { revokeCandidate = nil } })
+    }
+
+    private func copyAgentSetup(_ text: String, note: String) {
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        pb.setString(text, forType: .string)
+        agentCopyNote = note
     }
 
     private var storageKeySymbol: String {

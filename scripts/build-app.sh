@@ -448,6 +448,17 @@ CGO_ENABLED=1 go build "${GO_BUILD_VCS_ARGS[@]}" -trimpath \
     -ldflags "$GO_BUILD_LDFLAGS" \
     -o "$APP_BIN_DIR/juicemount-mount-probe" ./cmd/juicemount-mount-probe
 
+# The MCP server AI agents start (docs/agent-mcp.md). The app mints the agent
+# token and stores it in a Keychain item whose access list trusts this
+# binary (credstore.AppAgentToken), so `juicemount-mcp serve` reads it without
+# a prompt. cgo is required: a darwin build without it has no Keychain.
+MACOSX_DEPLOYMENT_TARGET=26.0 \
+CGO_CFLAGS="${CGO_CFLAGS:-} -mmacosx-version-min=26.0" \
+CGO_LDFLAGS="${CGO_LDFLAGS:-} -mmacosx-version-min=26.0" \
+CGO_ENABLED=1 go build "${GO_BUILD_VCS_ARGS[@]}" -trimpath \
+    -ldflags "$GO_BUILD_LDFLAGS" \
+    -o "$APP_BIN_DIR/juicemount-mcp" ./cmd/juicemount-mcp
+
 # Bundled, pinned, patched JuiceFS: the only juicefs the runtime will run.
 # The helper verifies third_party/juicefs against SOURCE.json and its patches
 # (scripts/verify-juicefs-sdk.py), builds it and checks its --version.
@@ -722,6 +733,9 @@ codesign --force "${HARDEN_ARGS[@]}" --sign "$SIGN_IDENTITY" "$APP_BIN_DIR/juice
 # name) because clients pin it: client.DaemonRequirement names
 # com.juicemount.unmountd. Hardened runtime comes with any real identity.
 codesign --force "${HARDEN_ARGS[@]}" --identifier com.juicemount.unmountd --sign "$SIGN_IDENTITY" "$APP_BIN_DIR/juicemount-unmountd"
+# The agent MCP server gets its own identifier: the agent token's Keychain
+# access list names it (with the app), and an agent's MCP config runs it.
+codesign --force "${HARDEN_ARGS[@]}" --identifier com.juicemount.mcp --sign "$SIGN_IDENTITY" "$APP_BIN_DIR/juicemount-mcp"
 
 # --- Inside-out codesign of the embedded Sparkle.framework ------------------
 # We do NOT rely on `codesign --deep`: Apple deprecated it for signing and it

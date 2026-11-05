@@ -78,6 +78,20 @@ class VerifyMacOS26Artifact(unittest.TestCase):
                     self.assertIn(relative, result.stderr)
                     path.write_bytes(fat())
 
+    def test_bundled_agent_mcp_server_is_checked(self):
+        # The app bundles juicemount-mcp for AI agents: a missing one, or one
+        # built for an older macOS, is refused like the other executables.
+        relative = "Contents/MacOS/juicemount-mcp"
+        path = self.app / relative
+        path.write_bytes(macho(14))
+        result = self.run_gate()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn(relative, result.stderr)
+        path.unlink()
+        result = self.run_gate()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn(relative, result.stderr)
+
     def test_missing_metadata_and_missing_binary_are_refused(self):
         relative = MODULE.EXECUTABLES[1]
         path = self.app / relative

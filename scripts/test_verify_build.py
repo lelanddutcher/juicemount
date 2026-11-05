@@ -41,6 +41,7 @@ class VerifySplitService(unittest.TestCase):
                 cls.source / "Contents/MacOS/juicemount-mount-probe",
                 cls.source / "Contents/MacOS/juicefs",
                 cls.source / "Contents/MacOS/juicemount-unmountd",
+                cls.source / "Contents/MacOS/juicemount-mcp",
                 cls.source / "Contents/Library/LaunchDaemons/com.juicemount.unmountd.plist",
                 cls.source / "Contents/Info.plist",
                 cls.source / "Contents/PlugIns/JuiceMountThumbnails.appex/Contents/Info.plist",
@@ -65,6 +66,7 @@ class VerifySplitService(unittest.TestCase):
             "Contents/MacOS/juicemount-mount-probe",
             "Contents/MacOS/juicefs",
             "Contents/MacOS/juicemount-unmountd",
+            "Contents/MacOS/juicemount-mcp",
             "Contents/Library/LaunchDaemons/com.juicemount.unmountd.plist",
             "Contents/Info.plist",
             "Contents/PlugIns/JuiceMountThumbnails.appex/Contents/Info.plist",
@@ -108,6 +110,10 @@ class VerifySplitService(unittest.TestCase):
         self.assertIn("bundled juicefs version: juicefs version 1.3.1+", result.stdout)
         self.assertIn("Info.plist bundled juicefs version: juicefs version 1.3.1+", result.stdout)
         self.assertIn("service has no jmdevjuicefs dev override", result.stdout)
+        self.assertIn("agent MCP server is signed with the bundle identity", result.stdout)
+        self.assertIn("agent MCP server signing identifier: com.juicemount.mcp", result.stdout)
+        self.assertIn("agent MCP server is built from cmd/juicemount-mcp", result.stdout)
+        self.assertIn("agent MCP server is built with cgo (Keychain)", result.stdout)
 
     def test_required_executables_missing_or_nonexecutable(self):
         for rel in ("Contents/MacOS/JuiceMount", "Contents/MacOS/juicemount-service", "Contents/MacOS/juicemount-mount-probe"):
@@ -139,6 +145,31 @@ class VerifySplitService(unittest.TestCase):
         self.assertIn("bundled juicefs version: got 'juicefs version 1.3.1+2025-12-02.e0032b2ae5e9'", unpinned.stdout)
         juicefs.unlink()
         juicefs.symlink_to(self.source / "Contents/MacOS/juicefs")
+
+    def test_agent_mcp_server_gate(self):
+        # The agent token's Keychain item trusts the bundled juicemount-mcp:
+        # it must be there, be a cgo build of cmd/juicemount-mcp, and carry
+        # its own identifier with the bundle identity.
+        mcp = self.app / "Contents/MacOS/juicemount-mcp"
+        mcp.unlink()
+        missing = self.run_verifier()
+        self.assertEqual(missing.returncode, 1, missing.stdout)
+        self.assertIn("agent MCP server is missing or not executable", missing.stdout)
+        subprocess.run(["go", "build", "-o", str(mcp), "./cmd/juicemount-mount-probe"],
+                       cwd=HERE.parent, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        other = self.run_verifier()
+        self.assertEqual(other.returncode, 1, other.stdout)
+        self.assertIn("agent MCP server is not a build of cmd/juicemount-mcp", other.stdout)
+        self.assertIn("agent MCP server signing identifier: got", other.stdout)
+        mcp.unlink()
+        env = dict(os.environ, CGO_ENABLED="0")
+        subprocess.run(["go", "build", "-o", str(mcp), "./cmd/juicemount-mcp"],
+                       cwd=HERE.parent, env=env, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        nocgo = self.run_verifier()
+        self.assertEqual(nocgo.returncode, 1, nocgo.stdout)
+        self.assertIn("agent MCP server is built without cgo", nocgo.stdout)
+        mcp.unlink()
+        mcp.symlink_to(self.source / "Contents/MacOS/juicemount-mcp")
 
     def test_dev_juicefs_override_build_is_refused(self):
         # A jmdevjuicefs build admits any configured juicefs; it must not ship.

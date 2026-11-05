@@ -102,3 +102,47 @@ func TestLoadEnrollmentChecksDevice(t *testing.T) {
 		t.Fatalf("other device: %v", err)
 	}
 }
+
+// The app's store is the item juicemount-mcp reads: what the app saves,
+// LoadAgentToken (serve) returns, with the same device binding, and the
+// other way round.
+func TestAppAgentTokenIsTheCLIItem(t *testing.T) {
+	uuid := "11111111-2222-3333-4444-555555555555"
+	path := agentTokenEnv(t, &uuid)
+	app := AppAgentToken{Trusted: []string{"/Applications/JuiceMount.app/Contents/MacOS/juicemount-mcp"}}
+	if _, err := app.Load(); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("nothing stored: %v", err)
+	}
+	if err := app.Save(`{"token":"from-app"}`); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := LoadAgentToken(); err != nil || got != `{"token":"from-app"}` {
+		t.Fatalf("serve's read: %q %v", got, err)
+	}
+	if st, err := os.Stat(path); err != nil || st.Mode().Perm() != 0o600 {
+		t.Fatalf("file: %v", err)
+	}
+	if err := SaveAgentToken(`{"token":"from-cli"}`); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := app.Load(); err != nil || got != `{"token":"from-cli"}` {
+		t.Fatalf("app's read: %q %v", got, err)
+	}
+	uuid = "99999999-2222-3333-4444-555555555555"
+	if _, err := app.Load(); !errors.Is(err, ErrOtherDevice) {
+		t.Fatalf("other device: %v", err)
+	}
+	uuid = "11111111-2222-3333-4444-555555555555"
+	if err := app.Delete(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadAgentToken(); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("after the app's delete: %v", err)
+	}
+	if err := app.Delete(); err != nil {
+		t.Fatalf("deleting nothing: %v", err)
+	}
+	if err := app.Save(""); err == nil {
+		t.Fatal("an empty record was saved")
+	}
+}

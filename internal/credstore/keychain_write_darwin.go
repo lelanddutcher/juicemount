@@ -21,13 +21,15 @@ static char *jm_agent_copy_data(CFDataRef data, int *len) {
 }
 
 // jm_keychain_read_ui is jm_keychain_read (keychain_darwin.go) for a person's
-// command: it allows the Keychain's access prompt. It turns user interaction
-// back on for the process (Load turns it off), so it is called only from a
-// command a person runs (juicemount-mcp token), never from a service.
+// command or the app. With ui 1 it allows the Keychain's access prompt: it
+// turns user interaction back on for the process (Load turns it off), which
+// only a command a person runs (juicemount-mcp token) may do, never a
+// service. With ui -1 it leaves the process's setting as it is (the app,
+// whose setting is its own).
 static OSStatus jm_keychain_read_ui(const char *service, const char *account,
                                     char **generic, int *genericLen, char **secret, int *secretLen,
-                                    char **comment) {
-	SecKeychainSetUserInteractionAllowed(true);
+                                    char **comment, int ui) {
+	if (ui >= 0) SecKeychainSetUserInteractionAllowed(ui ? true : false);
 	CFStringRef svc = CFStringCreateWithCString(NULL, service, kCFStringEncodingUTF8);
 	CFStringRef acct = CFStringCreateWithCString(NULL, account, kCFStringEncodingUTF8);
 	const void *keys[] = { kSecClass, kSecAttrService, kSecAttrAccount, kSecReturnData,
@@ -113,9 +115,9 @@ static void jm_keychain_allow_ui(int allow_ui) {
 }
 
 // jm_keychain_delete removes the item (service, account); UI only with
-// allow_ui.
+// allow_ui (-1: the process's setting is left as it is).
 static OSStatus jm_keychain_delete(const char *service, const char *account, int allow_ui) {
-	SecKeychainSetUserInteractionAllowed(allow_ui ? true : false);
+	if (allow_ui >= 0) SecKeychainSetUserInteractionAllowed(allow_ui ? true : false);
 	CFStringRef svc = CFStringCreateWithCString(NULL, service, kCFStringEncodingUTF8);
 	CFStringRef acct = CFStringCreateWithCString(NULL, account, kCFStringEncodingUTF8);
 	const void *keys[] = { kSecClass, kSecAttrService, kSecAttrAccount };
@@ -124,6 +126,57 @@ static OSStatus jm_keychain_delete(const char *service, const char *account, int
 	                                       &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
 	OSStatus st = SecItemDelete(q);
 	CFRelease(q); CFRelease(svc); CFRelease(acct);
+	return st;
+}
+
+// jm_keychain_add_trusting adds the item (service, account) with an access
+// list that trusts this process and each of the npaths executables in
+// paths: the legacy (file-based) keychain's SecAccess, as the app's
+// RedisCredentialStore makes for the service. It leaves the process's
+// user-interaction setting as it is.
+static OSStatus jm_keychain_add_trusting(const char *service, const char *account, const char *label,
+                                         const char *generic, int genericLen,
+                                         const char *secret, int secretLen, const char *comment,
+                                         const char **paths, int npaths) {
+	CFMutableArrayRef apps = CFArrayCreateMutable(NULL, 0, &kCFTypeArrayCallBacks);
+	if (apps == NULL) return errSecAllocate;
+	SecTrustedApplicationRef app = NULL;
+	OSStatus st = SecTrustedApplicationCreateFromPath(NULL, &app);
+	if (st == errSecSuccess) { CFArrayAppendValue(apps, app); CFRelease(app); }
+	for (int i = 0; st == errSecSuccess && i < npaths; i++) {
+		app = NULL;
+		st = SecTrustedApplicationCreateFromPath(paths[i], &app);
+		if (st == errSecSuccess) { CFArrayAppendValue(apps, app); CFRelease(app); }
+	}
+	CFStringRef lbl = CFStringCreateWithCString(NULL, label, kCFStringEncodingUTF8);
+	SecAccessRef access = NULL;
+	if (st == errSecSuccess) st = lbl != NULL ? SecAccessCreate(lbl, apps, &access) : errSecAllocate;
+	CFRelease(apps);
+	CFStringRef svc = CFStringCreateWithCString(NULL, service, kCFStringEncodingUTF8);
+	CFStringRef acct = CFStringCreateWithCString(NULL, account, kCFStringEncodingUTF8);
+	CFStringRef cmt = CFStringCreateWithCString(NULL, comment, kCFStringEncodingUTF8);
+	CFDataRef gen = CFDataCreate(NULL, (const UInt8 *)generic, genericLen);
+	CFDataRef val = CFDataCreate(NULL, (const UInt8 *)secret, secretLen);
+	if (st == errSecSuccess) {
+		if (svc != NULL && acct != NULL && lbl != NULL && cmt != NULL && gen != NULL && val != NULL) {
+			const void *akeys[] = { kSecClass, kSecAttrService, kSecAttrAccount, kSecAttrLabel,
+			                        kSecValueData, kSecAttrGeneric, kSecAttrComment, kSecAttrAccess };
+			const void *avals[] = { kSecClassGenericPassword, svc, acct, lbl, val, gen, cmt, access };
+			CFDictionaryRef a = CFDictionaryCreate(NULL, akeys, avals, 8,
+			                                       &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+			st = a != NULL ? SecItemAdd(a, NULL) : errSecAllocate;
+			if (a) CFRelease(a);
+		} else {
+			st = errSecAllocate;
+		}
+	}
+	if (access) CFRelease(access);
+	if (svc) CFRelease(svc);
+	if (acct) CFRelease(acct);
+	if (lbl) CFRelease(lbl);
+	if (cmt) CFRelease(cmt);
+	if (gen) CFRelease(gen);
+	if (val) CFRelease(val);
 	return st;
 }
 */
@@ -145,12 +198,23 @@ func cBool(b bool) C.int {
 }
 
 func keychainLoadInteractive(service, slot, account string) (secret, stamp string, err error) {
+	return keychainLoadUI(service, slot, account, 1)
+}
+
+// keychainLoadAsIs reads like keychainLoadInteractive but leaves the
+// process's user-interaction setting as it is: for the app (bridge), whose
+// setting is its own.
+func keychainLoadAsIs(service, slot, account string) (secret, stamp string, err error) {
+	return keychainLoadUI(service, slot, account, -1)
+}
+
+func keychainLoadUI(service, slot, account string, ui C.int) (secret, stamp string, err error) {
 	cs, cslot := C.CString(service), C.CString(slot)
 	defer C.free(unsafe.Pointer(cs))
 	defer C.free(unsafe.Pointer(cslot))
 	var generic, csecret, comment *C.char
 	var genericLen, secretLen C.int
-	st := C.jm_keychain_read_ui(cs, cslot, &generic, &genericLen, &csecret, &secretLen, &comment)
+	st := C.jm_keychain_read_ui(cs, cslot, &generic, &genericLen, &csecret, &secretLen, &comment, ui)
 	defer C.free(unsafe.Pointer(generic))
 	defer C.free(unsafe.Pointer(csecret))
 	defer C.free(unsafe.Pointer(comment))
@@ -220,13 +284,70 @@ func keychainSave(service, slot, account, secret, device string, allowUI bool) e
 }
 
 func keychainDelete(service, slot string, allowUI bool) error {
+	return keychainDeleteUI(service, slot, cBool(allowUI))
+}
+
+// keychainDeleteAsIs deletes like keychainDelete but leaves the process's
+// user-interaction setting as it is (the app).
+func keychainDeleteAsIs(service, slot string) error { return keychainDeleteUI(service, slot, -1) }
+
+func keychainDeleteUI(service, slot string, ui C.int) error {
 	cs, cslot := C.CString(service), C.CString(slot)
 	defer C.free(unsafe.Pointer(cs))
 	defer C.free(unsafe.Pointer(cslot))
-	switch st := C.jm_keychain_delete(cs, cslot, cBool(allowUI)); st {
+	switch st := C.jm_keychain_delete(cs, cslot, ui); st {
 	case C.errSecSuccess, C.errSecItemNotFound:
 		return nil
 	default:
 		return fmt.Errorf("keychain delete refused (OSStatus %d)", int(st))
 	}
+}
+
+// keychainReplaceTrusting stores secret in the item (service, slot) like
+// keychainSave, but always as a new item whose access list trusts this
+// process and the executables in trusted: any item stored before is deleted
+// first, because an update keeps the old item's access list (one made by
+// `juicemount-mcp token create` trusts only that build of the CLI). It leaves
+// the process's user-interaction setting as it is: the app, where a person
+// can answer the Keychain's prompt for an item another program made.
+func keychainReplaceTrusting(service, slot, account, secret, device string, trusted []string) error {
+	cs, cslot := C.CString(service), C.CString(slot)
+	clabel := C.CString("JuiceMount agent token (juicemount-mcp)")
+	cgen, csecret := C.CString(account), C.CString(secret)
+	ccomment := C.CString("")
+	if device != "" {
+		C.free(unsafe.Pointer(ccomment))
+		ccomment = C.CString(DeviceStampPrefix + device)
+	}
+	paths := C.malloc(C.size_t(len(trusted)+1) * C.size_t(unsafe.Sizeof(uintptr(0))))
+	cpaths := unsafe.Slice((**C.char)(paths), len(trusted)+1)
+	for i, p := range trusted {
+		cpaths[i] = C.CString(p)
+	}
+	defer func() {
+		for _, p := range []*C.char{cs, cslot, clabel, cgen, csecret, ccomment} {
+			C.free(unsafe.Pointer(p))
+		}
+		for _, p := range cpaths[:len(trusted)] {
+			C.free(unsafe.Pointer(p))
+		}
+		C.free(paths)
+	}()
+	removed := false
+	switch del := int(C.jm_keychain_delete(cs, cslot, -1)); del {
+	case C.errSecSuccess:
+		removed = true
+	case C.errSecItemNotFound:
+	default:
+		return fmt.Errorf("the agent token stored before could not be replaced (OSStatus %d)", del)
+	}
+	st := int(C.jm_keychain_add_trusting(cs, cslot, clabel, cgen, C.int(len(account)), csecret, C.int(len(secret)),
+		ccomment, (**C.char)(paths), C.int(len(trusted))))
+	switch {
+	case st == C.errSecSuccess:
+		return nil
+	case removed:
+		return fmt.Errorf("%w; storing the new one failed (OSStatus %d)", ErrStoredRecordRemoved, st)
+	}
+	return fmt.Errorf("keychain write refused (OSStatus %d; is the login Keychain unlocked?)", st)
 }

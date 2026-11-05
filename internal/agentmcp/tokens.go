@@ -123,16 +123,6 @@ type TokenCommands struct {
 	Err  io.Writer
 }
 
-type tokenView struct {
-	ID         string `json:"id"`
-	Name       string `json:"name"`
-	Person     string `json:"person"`
-	PersonName string `json:"person_name"`
-	Mac        string `json:"mac"`
-	CreatedAt  int64  `json:"created_at_ms"`
-	ExpiresAt  int64  `json:"expires_at_ms"`
-}
-
 func msTime(ms int64) string { return time.UnixMilli(ms).Local().Format("2006-01-02 15:04") }
 
 func (tc *TokenCommands) macClient() (*Client, error) {
@@ -162,11 +152,10 @@ func managerFailure(what string, err error) error {
 // before, which stays valid on the Manager until revoked), or with print
 // written to Out instead, for a machine that imports it.
 func (tc *TokenCommands) Create(ctx context.Context, name string, days int, print bool) error {
-	name = strings.TrimSpace(name)
-	if name == "" {
+	switch _, err := CheckMint(name, days); {
+	case errors.Is(err, ErrTokenName):
 		return errors.New("name the token (--name), e.g. the agent that will use it")
-	}
-	if days < 0 || days > 90 {
+	case err != nil:
 		return errors.New("--days is 1-90 (default 90)")
 	}
 	m, err := tc.Mac()
@@ -174,48 +163,40 @@ func (tc *TokenCommands) Create(ctx context.Context, name string, days int, prin
 		return err
 	}
 	c := NewMacClient(m, tc.HTTP)
-	body := map[string]any{"name": name}
-	if days > 0 {
-		body["expires_in_days"] = days
-	}
-	var reply struct {
-		Token      string    `json:"token"`
-		AgentToken tokenView `json:"agent_token"`
-	}
 	if w := CleartextWarning(m.ManagerURL); w != "" {
 		fmt.Fprintln(tc.Err, w)
 	}
-	if err := c.Do(ctx, http.MethodPost, "/api/agent-tokens", nil, body, &reply); err != nil {
-		var ae *APIError
-		if !errors.As(err, &ae) || ae.Status >= 500 {
-			// The Manager may have minted it and lost the answer.
-			return fmt.Errorf("%v. A token may have been created: run juicemount-mcp token list and revoke any you don't recognise", managerFailure("minting the token", err))
-		}
+	minted, err := MintToken(ctx, c, name, days)
+	switch {
+	case errors.Is(err, errMalformedMint):
+		return err
+	case MayHaveMinted(err):
+		return fmt.Errorf("%v. A token may have been created: run juicemount-mcp token list and revoke any you don't recognise", managerFailure("minting the token", err))
+	case err != nil:
 		return managerFailure("minting the token", err)
 	}
-	if mm := agentTokenRe.FindStringSubmatch(reply.Token); mm == nil || mm[1] != reply.AgentToken.ID {
-		return errors.New("the Manager's answer did not carry a well-formed agent token")
-	}
-	v := reply.AgentToken
+	v := minted.View
 	if print {
 		fmt.Fprintf(tc.Err, "Minted agent token %s (%q) for %s; it expires %s. It is not stored on this Mac.\n", v.ID, v.Name, v.PersonName, msTime(v.ExpiresAt))
-		_, err := fmt.Fprintln(tc.Out, reply.Token)
+		_, err := fmt.Fprintln(tc.Out, minted.Token)
 		return err
 	}
-	prev, perr := tc.Store.Load()
-	rec := TokenRecord{ManagerURL: m.ManagerURL, Token: reply.Token, ID: v.ID, Name: v.Name, ExpiresAt: v.ExpiresAt}
-	if err := tc.Store.Save(rec); err != nil {
-		// Do not leave a live token nobody holds.
-		rerr := c.Do(ctx, http.MethodPost, "/api/agent-tokens/"+v.ID+"/revoke", nil, nil, nil)
-		note := removedNote(err, prev, perr == nil)
-		if rerr != nil {
-			return fmt.Errorf("the token could not be stored (%v), and revoking it failed too (%v): revoke %s with juicemount-mcp token revoke %s.%s", err, rerr, v.ID, v.ID, note)
+	replaced, err := StoreMinted(ctx, c, tc.Store, m.ManagerURL, minted)
+	var se *StoreError
+	if errors.As(err, &se) {
+		// The minted token was revoked (or that failed): nobody holds it.
+		note := removedNote(se.Err, se.Prev, se.PrevStored)
+		if se.RevokeErr != nil {
+			return fmt.Errorf("the token could not be stored (%v), and revoking it failed too (%v): revoke %s with juicemount-mcp token revoke %s.%s", se.Err, se.RevokeErr, v.ID, v.ID, note)
 		}
-		return fmt.Errorf("the token could not be stored (%v); it was revoked on the Manager.%s", err, note)
+		return fmt.Errorf("the token could not be stored (%v); it was revoked on the Manager.%s", se.Err, note)
+	}
+	if err != nil {
+		return err
 	}
 	fmt.Fprintf(tc.Out, "Minted agent token %s (%q) for %s; it expires %s. It is stored on this Mac for juicemount-mcp serve.\n", v.ID, v.Name, v.PersonName, msTime(v.ExpiresAt))
-	if perr == nil && prev.ID != v.ID {
-		fmt.Fprintf(tc.Out, "It replaces token %s here, which still works on the Manager until you run: juicemount-mcp token revoke %s\n", prev.ID, prev.ID)
+	if replaced != nil {
+		fmt.Fprintf(tc.Out, "It replaces token %s here, which still works on the Manager until you run: juicemount-mcp token revoke %s\n", replaced.ID, replaced.ID)
 	}
 	return nil
 }
@@ -226,23 +207,18 @@ func (tc *TokenCommands) List(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	var reply struct {
-		Tokens []tokenView `json:"agent_tokens"`
-	}
-	if err := c.Do(ctx, http.MethodGet, "/api/agent-tokens", nil, nil, &reply); err != nil {
+	tokens, err := ListTokens(ctx, c)
+	if err != nil {
 		return managerFailure("listing tokens", err)
 	}
-	local := ""
-	if r, err := tc.Store.Load(); err == nil {
-		local = r.ID
-	}
-	if len(reply.Tokens) == 0 {
+	local := StoredTokenID(tc.Store)
+	if len(tokens) == 0 {
 		_, err := fmt.Fprintln(tc.Out, "No agent tokens.")
 		return err
 	}
 	w := tabwriter.NewWriter(tc.Out, 0, 4, 2, ' ', 0)
 	fmt.Fprintln(w, "\tID\tNAME\tPERSON\tCREATED\tEXPIRES")
-	for _, v := range reply.Tokens {
+	for _, v := range tokens {
 		mark := ""
 		if v.ID == local {
 			mark = "*"
@@ -269,30 +245,23 @@ func (tc *TokenCommands) Revoke(ctx context.Context, id string, localOnly bool) 
 		if err != nil {
 			return fmt.Errorf("%v (use --local-only to delete the token from this machine without the Manager)", err)
 		}
-		err = c.Do(ctx, http.MethodPost, "/api/agent-tokens/"+id+"/revoke", nil, nil, nil)
-		var ae *APIError
+		gone, err := RevokeToken(ctx, c, id)
 		switch {
-		case errors.As(err, &ae) && ae.Status == http.StatusNotFound:
-			fmt.Fprintf(tc.Out, "Token %s is not on the Manager (already revoked or expired).\n", id)
 		case err != nil:
 			return managerFailure("revoking the token", err)
+		case gone:
+			fmt.Fprintf(tc.Out, "Token %s is not on the Manager (already revoked or expired).\n", id)
 		default:
 			fmt.Fprintf(tc.Out, "Revoked token %s on the Manager.\n", id)
 		}
 	}
-	r, err := tc.Store.Load()
-	switch {
-	case errors.Is(err, ErrNoToken):
-		return nil
-	case err != nil:
-		return fmt.Errorf("reading the stored token: %v", err)
-	case r.ID != id:
-		return nil
+	deleted, err := ForgetStored(tc.Store, id)
+	if err != nil {
+		return err
 	}
-	if err := tc.Store.Delete(); err != nil {
-		return fmt.Errorf("deleting the stored token: %v", err)
+	if deleted {
+		_, err = fmt.Fprintf(tc.Out, "Deleted token %s from this machine.\n", id)
 	}
-	_, err = fmt.Fprintf(tc.Out, "Deleted token %s from this machine.\n", id)
 	return err
 }
 

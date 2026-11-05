@@ -415,6 +415,53 @@ else
 fi
 echo ""
 
+# --- Agent MCP server (docs/agent-mcp.md) ---
+# The app stores the agent token in a Keychain item whose access list trusts
+# this binary (credstore.AppAgentToken), and agents' MCP configs run it. It
+# must be a build of cmd/juicemount-mcp with the bundle identity, its own
+# identifier, the hardened runtime with a real identity, and cgo (a darwin
+# build without it has no Keychain).
+MCP="$APP_PATH/Contents/MacOS/juicemount-mcp"
+MCP_IDENTIFIER="com.juicemount.mcp"
+mcp_fail() { fail "$*"; FAILURES=$((FAILURES + 1)); }
+if [[ ! -f "$MCP" || ! -x "$MCP" ]]; then
+    mcp_fail "agent MCP server is missing or not executable: $MCP"
+else
+    if codesign --verify --strict "$MCP" >/dev/null 2>&1; then
+        MCP_SIGNER="$(signing_identity "$MCP")"
+        if [[ -n "$MCP_SIGNER" && "$MCP_SIGNER" == "$(signing_identity "$BINARY")" ]]; then
+            pass "agent MCP server is signed with the bundle identity"
+        else
+            mcp_fail "agent MCP server signer differs from the bundle: '${MCP_SIGNER:-<none>}'"
+        fi
+        check_equal "agent MCP server signing identifier" "$(signing_identifier "$MCP")" "$MCP_IDENTIFIER"
+        if grep -q '^Signature=adhoc$' <<< "$MCP_SIGNER"; then
+            info "agent MCP server is ad-hoc signed: no hardened runtime (dev build)"
+        elif /bin/bash "$PROJECT_ROOT/scripts/verify-codesign-runtime.sh" "$MCP" "$MCP_IDENTIFIER"; then
+            pass "agent MCP server has the hardened runtime"
+        else
+            mcp_fail "agent MCP server is Developer-ID signed without the hardened runtime"
+        fi
+    else
+        mcp_fail "agent MCP server signature is invalid"
+    fi
+    if MCP_BUILD_INFO="$(go version -m "$MCP" 2>/dev/null)" && [[ -n "$MCP_BUILD_INFO" ]]; then
+        if grep -Eq '^[[:space:]]+path[[:space:]]+github\.com/lelanddutcher/juicemount/cmd/juicemount-mcp$' <<< "$MCP_BUILD_INFO"; then
+            pass "agent MCP server is built from cmd/juicemount-mcp"
+        else
+            mcp_fail "agent MCP server is not a build of cmd/juicemount-mcp"
+        fi
+        if grep -Eq '^[[:space:]]+build[[:space:]]+CGO_ENABLED=1$' <<< "$MCP_BUILD_INFO"; then
+            pass "agent MCP server is built with cgo (Keychain)"
+        else
+            mcp_fail "agent MCP server is built without cgo, so it cannot read the Keychain"
+        fi
+    else
+        mcp_fail "agent MCP server build information is unreadable"
+    fi
+fi
+echo ""
+
 # --- Fix manifest ---
 # Each entry: SYMBOL_PATTERN | HUMAN_DESCRIPTION
 # A fix is considered present if the service's symbol table (`nm -a`)

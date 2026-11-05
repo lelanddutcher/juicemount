@@ -536,9 +536,9 @@ func TestToolErrorsAreResults(t *testing.T) {
 		args   map[string]any
 		want   string
 	}{
-		{401, "GET /api/continuity/find", "find_files", map[string]any{}, "juicemount-mcp token create"},
+		{401, "GET /api/continuity/find", "find_files", map[string]any{}, "in JuiceMount's Settings (Connection, Agents), or with juicemount-mcp token create"},
 		// A token revoked while an edit runs is refused the same way.
-		{401, "POST /api/collections/" + col1 + "/members/add", "add_to_collection", map[string]any{"collection_id": col1, "asset_ids": []string{asset1}}, "juicemount-mcp token create"},
+		{401, "POST /api/collections/" + col1 + "/members/add", "add_to_collection", map[string]any{"collection_id": col1, "asset_ids": []string{asset1}}, "in JuiceMount's Settings (Connection, Agents), or with juicemount-mcp token create"},
 		{403, "POST /api/collections/" + col1 + "/rename", "rename_collection", map[string]any{"collection_id": col1, "name": "x"}, "project grants"},
 		{404, "GET /api/continuity/asset/" + asset1, "get_file", map[string]any{"asset_id": asset1}, "not visible"},
 		{409, "POST /api/collections", "create_collection", map[string]any{"name": "x"}, "Conflict"},
@@ -572,7 +572,10 @@ func TestToolErrorsAreResults(t *testing.T) {
 			args map[string]any
 		}{{"list_collections", map[string]any{}}, {"create_collection", map[string]any{"name": "x"}}} {
 			cr, _ := s2.call(call.tool, call.args)
+			// The app's Settings is the normal way to get one; the CLI is for
+			// a machine without it.
 			if !cr.IsError || !strings.Contains(cr.Content[0].Text, c.want) || !strings.Contains(cr.Content[0].Text, "juicemount-mcp token create") ||
+				!strings.Contains(cr.Content[0].Text, "JuiceMount's Settings (Connection, Agents") ||
 				strings.Contains(cr.Content[0].Text, "could not be reached") {
 				t.Fatalf("%v, %s: %+v", c.err, call.tool, cr)
 			}
