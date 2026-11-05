@@ -43,6 +43,9 @@ func (s *Store) GetQuery(ctx context.Context, library continuity.LibraryID, id Q
 	if err := id.Validate(); err != nil {
 		return Query{}, err
 	}
+	if s.format.Load() < 4 {
+		return Query{}, ErrNotFound // format 3: no query yet
+	}
 	return scanQuery(s.db.QueryRowContext(ctx, querySelect+` WHERE q.query_id=?`, id), library)
 }
 
@@ -58,6 +61,9 @@ func (s *Store) ListQueries(ctx context.Context, library continuity.LibraryID, a
 	}
 	if !validPage(limit) || (after != "" && after.Validate() != nil) {
 		return nil, invalid("query page")
+	}
+	if s.format.Load() < 4 {
+		return []Query{}, nil
 	}
 	rows, err := s.db.QueryContext(ctx, querySelect+` WHERE q.removed=0 AND q.query_id>? ORDER BY q.query_id LIMIT ?`, after, limit)
 	if err != nil {

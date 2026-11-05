@@ -172,8 +172,15 @@ func (s *Store) Export(ctx context.Context, library continuity.LibraryID, writer
 // restores, byte for byte as before.
 func streamFormat(ctx context.Context, q queryer) (int, error) {
 	var collections, queries bool
-	if err := q.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM collections),EXISTS(SELECT 1 FROM queries)`).Scan(&collections, &queries); err != nil {
+	if err := q.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM collections)`).Scan(&collections); err != nil {
 		return 0, formatError(err)
+	}
+	if table, err := hasQueries(ctx, q); err != nil {
+		return 0, err
+	} else if table {
+		if err := q.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM queries)`).Scan(&queries); err != nil {
+			return 0, formatError(err)
+		}
 	}
 	switch {
 	case queries:

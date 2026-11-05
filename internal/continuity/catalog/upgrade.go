@@ -40,10 +40,21 @@ func snapshotCatalog(ctx context.Context, path string) (library continuity.Libra
 // library. It never creates a destination and never changes an event's identity.
 // Drain catalog users before calling; SQLite serialization is not process ownership.
 func Upgrade(ctx context.Context, input string, expectedLibrary continuity.LibraryID) (resultErr error) {
-	return upgradeCatalog(ctx, input, expectedLibrary, syncParent)
+	return upgradeCatalog(ctx, input, expectedLibrary, schemaVersion, syncParent)
 }
 
-func upgradeCatalog(ctx context.Context, input string, expectedLibrary continuity.LibraryID, directoryBarrier func(string) error) (resultErr error) {
+// UpgradeTo is Upgrade to format target (MinOperableFormat up to the
+// current one) at most: a catalog already at or past it is left as it is.
+// A host that wants to stay readable by an older binary upgrades only to
+// MinOperableFormat and later enables queries in place (EnableQueries).
+func UpgradeTo(ctx context.Context, input string, expectedLibrary continuity.LibraryID, target int) error {
+	if target < MinOperableFormat || target > schemaVersion {
+		return invalid("upgrade target format")
+	}
+	return upgradeCatalog(ctx, input, expectedLibrary, target, syncParent)
+}
+
+func upgradeCatalog(ctx context.Context, input string, expectedLibrary continuity.LibraryID, target int, directoryBarrier func(string) error) (resultErr error) {
 	if expectedLibrary.Validate() != nil {
 		return invalid("expected library identity")
 	}
@@ -116,7 +127,7 @@ func upgradeCatalog(ctx context.Context, input string, expectedLibrary continuit
 		from    int
 		migrate func(context.Context, *sql.Tx) error
 	}{{1, migrateV1}, {2, migrateV2}, {3, migrateV3}} {
-		if version != step.from {
+		if version != step.from || version >= target {
 			continue
 		}
 		if err := step.migrate(ctx, tx); err != nil {
@@ -134,8 +145,8 @@ func upgradeCatalog(ctx context.Context, input string, expectedLibrary continuit
 		}
 		version = current
 	}
-	if version != schemaVersion {
-		return corrupt("migration did not reach the current format")
+	if version < target {
+		return corrupt("migration did not reach the target format")
 	}
 	if err := held.checkPaths(); err != nil {
 		return err

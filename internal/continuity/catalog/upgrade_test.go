@@ -237,7 +237,7 @@ func TestCatalogUpgradeRetriesDirectoryBarrierAndIsIdempotent(t *testing.T) {
 		}
 		return syncParent(path)
 	}
-	if err := upgradeCatalog(context.Background(), path, testLibrary, barrier); !errors.Is(err, barrierErr) {
+	if err := upgradeCatalog(context.Background(), path, testLibrary, schemaVersion, barrier); !errors.Is(err, barrierErr) {
 		t.Fatalf("final barrier error: %v", err)
 	}
 	s, err := Open(path)
@@ -248,7 +248,7 @@ func TestCatalogUpgradeRetriesDirectoryBarrierAndIsIdempotent(t *testing.T) {
 	if err := s.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if err := upgradeCatalog(context.Background(), path, testLibrary, barrier); err != nil {
+	if err := upgradeCatalog(context.Background(), path, testLibrary, schemaVersion, barrier); err != nil {
 		t.Fatal(err)
 	}
 	if calls != 2 {

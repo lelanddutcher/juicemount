@@ -35,7 +35,13 @@ catalog with this application ID and a newer user version returns
 Open performs version/DDL/ledger/identity/integrity preflight in one deferred
 transaction on a separate read-only connection before obtaining a write pool
 and enabling WAL. A recognized complete, integrity-valid format 1 catalog returns
-`ErrUpgradeRequired`, as does a format 2 or 3 catalog; Open never migrates any. SQLite integrity and foreign-key checks run at admission;
+`ErrUpgradeRequired`, as does a format 2 catalog; Open never migrates either.
+A format 3 catalog opens and works (`MinOperableFormat`) except for queries:
+query reads find none and query changes return `ErrUpgradeRequired` until
+`Store.EnableQueries` adds the query table in place (the 3→4 step, in one
+immediate transaction on the open store, checked before commit), so a host
+keeps the catalog readable by a format 3 binary until queries are used.
+`UpgradeTo` upgrades a closed catalog to a given format at most. SQLite integrity and foreign-key checks run at admission;
 individual revision/event reads also verify their canonical identities. Open does
 not rehash the complete operation history or any media.
 
@@ -89,8 +95,9 @@ and 1–256 ordered changes. Exactly one pointer variant is required per change:
   window of 0 to ten years in seconds, a limit of 1–500) is stored as its
   canonical JSON (lists sorted, duplicates refused, wire order `prefixes`,
   `name_contains`, `extensions`, `modified_within_seconds`, `limit`) and never
-  changes; a guard refuses changing it in place. The catalog never evaluates
-  a query.
+  changes; a guard refuses changing it in place. Control characters are
+  refused in folders and the name fragment. A library holds at most 256
+  active queries (`ErrQueryLimit`). The catalog never evaluates a query.
 - `ExpectCollection`: changes nothing; conflicts unless the collection is
   active at the given updated sequence. A host that authorized a change
   against that state puts it first, so the change fails if the collection or

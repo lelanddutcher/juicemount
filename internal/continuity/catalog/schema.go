@@ -19,6 +19,12 @@ import (
 const applicationID = 0x4a4d4341 // JMCA
 const schemaVersion = 4
 
+// MinOperableFormat is the oldest format a Store opens and writes: format 3
+// lacks only the query table, so queries are refused (ErrUpgradeRequired)
+// until EnableQueries adds it in place. Keeping a catalog at format 3 until
+// queries are used leaves it readable by the binary before format 4.
+const MinOperableFormat = 3
+
 type queryer interface {
 	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
 	QueryRowContext(context.Context, string, ...any) *sql.Row
@@ -200,11 +206,24 @@ func validateSchema(ctx context.Context, q queryer) (continuity.LibraryID, error
 }
 
 func validateSchemaState(ctx context.Context, q queryer, initializing bool) (continuity.LibraryID, error) {
-	library, version, err := recognizeSchema(ctx, q, initializing)
-	if err == nil && version < schemaVersion {
-		return "", ErrUpgradeRequired
-	}
+	library, _, err := validateSchemaVersion(ctx, q, initializing)
 	return library, err
+}
+
+// validateSchemaVersion also returns the format (MinOperableFormat or later).
+func validateSchemaVersion(ctx context.Context, q queryer, initializing bool) (continuity.LibraryID, int, error) {
+	library, version, err := recognizeSchema(ctx, q, initializing)
+	if err == nil && version < MinOperableFormat {
+		return "", 0, ErrUpgradeRequired
+	}
+	return library, version, err
+}
+
+// hasQueries: the catalog holds the format 4 query table.
+func hasQueries(ctx context.Context, q queryer) (bool, error) {
+	var ok bool
+	err := q.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='queries')`).Scan(&ok)
+	return ok, formatError(err)
 }
 
 func recognizeSchema(ctx context.Context, q queryer, initializing bool) (continuity.LibraryID, int, error) {

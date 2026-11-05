@@ -275,6 +275,9 @@ func (s *Store) replayEvent(ctx context.Context, tx *sql.Tx, event eventRow, op 
 	if err := checkCollectionLimits(ctx, tx, op); err != nil {
 		return 0, err
 	}
+	if err := checkQueryLimits(ctx, tx, op); err != nil {
+		return 0, err
+	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO events(sequence,library_id,operation_id,request,payload_sha256,recorded_unix_nano,receipt) VALUES(?,?,?,?,?,?,?)`,
 		event.sequence, event.library, event.id, event.request, event.digest, event.timestamp, event.receipt); err != nil {
 		return 0, formatError(err)

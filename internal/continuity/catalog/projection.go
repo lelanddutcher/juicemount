@@ -97,9 +97,16 @@ func walkRows(ctx context.Context, q queryer, query string, fn func(*sql.Rows) e
 }
 
 func projectionTotal(ctx context.Context, q queryer) (int64, error) {
-	var count int64
-	err := q.QueryRowContext(ctx, `SELECT (SELECT count(*) FROM catalog)+(SELECT count(*) FROM assets)+(SELECT count(*) FROM revisions)+(SELECT count(*) FROM revision_parents)+(SELECT count(*) FROM relationships)+(SELECT count(*) FROM locations)+(SELECT count(*) FROM collections)+(SELECT count(*) FROM collection_members)+(SELECT count(*) FROM queries)`).Scan(&count)
-	return count, err
+	var count, queries int64
+	err := q.QueryRowContext(ctx, `SELECT (SELECT count(*) FROM catalog)+(SELECT count(*) FROM assets)+(SELECT count(*) FROM revisions)+(SELECT count(*) FROM revision_parents)+(SELECT count(*) FROM relationships)+(SELECT count(*) FROM locations)+(SELECT count(*) FROM collections)+(SELECT count(*) FROM collection_members)`).Scan(&count)
+	if err != nil {
+		return 0, err
+	}
+	if table, err := hasQueries(ctx, q); err != nil || !table {
+		return count, err
+	}
+	err = q.QueryRowContext(ctx, `SELECT count(*) FROM queries`).Scan(&queries)
+	return count + queries, err
 }
 
 // projectionDigest scans all logical state, including tombstones, without
@@ -232,7 +239,11 @@ func projectionDigest(ctx context.Context, q queryer, library continuity.Library
 	if err != nil {
 		return "", 0, err
 	}
-	// Format 4, likewise: no query, no frame.
+	// Format 4, likewise: no query, no frame (and a format 3 catalog has no
+	// query table).
+	if table, err := hasQueries(ctx, q); err != nil || !table {
+		return hex.EncodeToString(h.Sum(nil)), count, err
+	}
 	err = walkRows(ctx, q, querySelect+` ORDER BY q.query_id COLLATE BINARY`, func(rows *sql.Rows) error {
 		v, err := scanQuery(rows, library)
 		if err != nil {

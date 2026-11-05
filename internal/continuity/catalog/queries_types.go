@@ -3,6 +3,7 @@ package catalog
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"path"
 	"sort"
 	"strings"
@@ -22,7 +23,13 @@ const (
 	MaxQueryWithinSeconds  = 10 * 366 * 24 * 3600
 	MaxQueryLimit          = 500
 	maxQueryDefinition     = 128 << 10
+	// MaxQueries bounds a library's active queries.
+	MaxQueries = 256
 )
+
+// ErrQueryLimit: the operation would leave more than MaxQueries active
+// queries. Nothing was applied.
+var ErrQueryLimit = errors.New("catalog query limit reached")
 
 // QueryID is `qry_` and 32 lowercase hex digits, not all zero.
 type QueryID string
@@ -64,9 +71,9 @@ type QueryDefinition struct {
 }
 
 // ValidQueryPrefix: a canonical volume-relative folder path with no
-// hidden (dot) component.
+// hidden (dot) component and no control character.
 func ValidQueryPrefix(p string) bool {
-	if p == "" || len(p) > MaxQueryPrefixBytes || !utf8.ValidString(p) || strings.ContainsRune(p, 0) || path.Clean(p) != p {
+	if p == "" || len(p) > MaxQueryPrefixBytes || !utf8.ValidString(p) || hasControl(p) || path.Clean(p) != p {
 		return false
 	}
 	for _, c := range strings.Split(p, "/") {
@@ -75,6 +82,11 @@ func ValidQueryPrefix(p string) bool {
 		}
 	}
 	return true
+}
+
+// hasControl: a C0 control character or DEL (NUL included).
+func hasControl(s string) bool {
+	return strings.IndexFunc(s, func(r rune) bool { return r < 0x20 || r == 0x7f }) >= 0
 }
 
 // ValidQueryExtension: 1-16 lowercase ASCII letters or digits.
@@ -99,7 +111,7 @@ func (d QueryDefinition) canonical() (QueryDefinition, bool) {
 	sort.Strings(out.Prefixes)
 	sort.Strings(out.Extensions)
 	if len(out.Prefixes) < 1 || len(out.Prefixes) > MaxQueryPrefixes || len(out.Extensions) > MaxQueryExtensions ||
-		!validText(out.NameContains, MaxQueryNameContains, false) || strings.ContainsRune(out.NameContains, '/') ||
+		!validText(out.NameContains, MaxQueryNameContains, false) || strings.ContainsRune(out.NameContains, '/') || hasControl(out.NameContains) ||
 		out.ModifiedWithinSeconds < 0 || out.ModifiedWithinSeconds > MaxQueryWithinSeconds || out.Limit < 1 || out.Limit > MaxQueryLimit {
 		return QueryDefinition{}, false
 	}

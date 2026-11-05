@@ -33,12 +33,19 @@ func (s *Store) Apply(ctx context.Context, input Operation) (Receipt, error) {
 		return Receipt{}, err
 	}
 	defer tx.Rollback()
-	library, err := validateSchema(ctx, tx)
+	library, format, err := validateSchemaVersion(ctx, tx, false)
 	if err != nil {
 		return Receipt{}, err
 	}
 	if library != s.library {
 		return Receipt{}, corrupt("library identity changed")
+	}
+	if format < 4 {
+		for _, c := range op.Changes {
+			if isQueryChange(c) {
+				return Receipt{}, fmt.Errorf("%w: queries need catalog format 4 (EnableQueries)", ErrUpgradeRequired)
+			}
+		}
 	}
 	if err := checkSettings(ctx, tx); err != nil {
 		return Receipt{}, err
@@ -67,6 +74,9 @@ func (s *Store) Apply(ctx context.Context, input Operation) (Receipt, error) {
 		}
 	}
 	if err := checkCollectionLimits(ctx, tx, op); err != nil {
+		return Receipt{}, err
+	}
+	if err := checkQueryLimits(ctx, tx, op); err != nil {
 		return Receipt{}, err
 	}
 	receipt := Receipt{OperationVersion, s.library, op.ID, sequence, digest, time.Now().UnixNano()}

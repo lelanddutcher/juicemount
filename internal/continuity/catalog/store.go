@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/lelanddutcher/juicemount/internal/continuity"
@@ -26,6 +27,7 @@ type Store struct {
 	library  continuity.LibraryID
 	closed   bool
 	closeErr error
+	format   atomic.Int32 // MinOperableFormat or later (EnableQueries moves it)
 }
 
 // Create reserves a new 0600 database in a caller-provisioned private directory
@@ -153,7 +155,7 @@ func openStoreContext(ctx context.Context, input string, library continuity.Libr
 		if err != nil {
 			return nil, err
 		}
-		if version < schemaVersion {
+		if version < MinOperableFormat {
 			return nil, ErrUpgradeRequired
 		}
 	}
@@ -171,7 +173,7 @@ func openStoreContext(ctx context.Context, input string, library continuity.Libr
 			return nil, err
 		}
 	}
-	actual, err := validateSchemaState(ctx, db, create)
+	actual, format, err := validateSchemaVersion(ctx, db, create)
 	if err != nil {
 		return nil, err
 	}
@@ -192,6 +194,7 @@ func openStoreContext(ctx context.Context, input string, library continuity.Libr
 		return nil, corrupt("WAL unavailable")
 	}
 	store := &Store{db: db, file: file, path: path, library: library}
+	store.format.Store(int32(format))
 	if err := store.checkPaths(); err != nil {
 		return nil, err
 	}

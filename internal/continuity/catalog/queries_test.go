@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -103,27 +104,48 @@ func TestQueryUpgradeFromSliceThreeCatalog(t *testing.T) {
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if s, err := Open(path); !errors.Is(err, ErrUpgradeRequired) {
-		if s != nil {
-			s.Close()
-		}
-		t.Fatalf("format 3 Open: %v", err)
-	}
-	if err := Upgrade(ctx, path, testLibrary); err != nil {
-		t.Fatal(err)
-	}
-	if lib, version, err := Inspect(ctx, path); err != nil || version != 4 || lib != testLibrary {
-		t.Fatalf("after upgrade: %s %d %v", lib, version, err)
-	}
+	// Format 3 opens and works, without queries: the catalog stays
+	// readable by the slice-3 binary until queries are used.
 	s, err := Open(path)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("format 3 Open: %v", err)
 	}
 	defer s.Close()
-	// The ledger gains exactly the format 4 entry; nothing else changes.
+	if s.Format() != 3 {
+		t.Fatalf("format %d", s.Format())
+	}
+	if page, err := s.ListQueries(ctx, testLibrary, "", 10); err != nil || len(page) != 0 {
+		t.Fatalf("queries of a format 3 catalog: %v %v", page, err)
+	}
+	if _, err := s.GetQuery(ctx, testLibrary, testQuery); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("get: %v", err)
+	}
+	create := testOperation("qry-after-upgrade", Change{CreateQuery: &CreateQuery{QueryID: testQuery, Name: "Recent",
+		Definition: QueryDefinition{Prefixes: []string{"Projects"}, Limit: 200}}})
+	if _, err := s.Apply(ctx, create); !errors.Is(err, ErrUpgradeRequired) {
+		t.Fatalf("query on format 3: %v", err)
+	}
+	var stream bytes.Buffer
+	if err := s.Export(ctx, testLibrary, &stream, Limits{MaxBytes: 1 << 20, MaxEvents: 100, MaxProjectionRows: 100}); err != nil || !bytes.Contains(stream.Bytes(), []byte(`"schema_version":3`)) {
+		t.Fatalf("format 3 export: %v", err)
+	}
+	if got := string(v3Records(t, s.db)); got != string(before) {
+		t.Fatalf("a refused query changed the catalog:\n%s\n%s", before, got)
+	}
+	// Enabled in place, on the open store: the ledger gains exactly the
+	// format 4 entry; nothing else changes.
+	if err := s.EnableQueries(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.EnableQueries(ctx); err != nil || s.Format() != 4 {
+		t.Fatalf("again: %v, format %d", err, s.Format())
+	}
+	if lib, version, err := Inspect(ctx, path); err != nil || version != 4 || lib != testLibrary {
+		t.Fatalf("after enabling: %s %d %v", lib, version, err)
+	}
 	want := strings.Replace(string(before), `"catalog"`, `"schema_migrations",[4,"`+schemaFingerprint(expectedSchema())+`"],"catalog"`, 1)
 	if got := string(v3Records(t, s.db)); got != want {
-		t.Fatalf("upgrade changed format 3 rows:\n%s\n%s", before, got)
+		t.Fatalf("enabling changed format 3 rows:\n%s\n%s", before, got)
 	}
 	for _, object := range schemaV3() {
 		var ddl string
@@ -134,11 +156,55 @@ func TestQueryUpgradeFromSliceThreeCatalog(t *testing.T) {
 	if c := getCollection(t, s, testCollection); c.Name != "Selects" || c.Members != 1 {
 		t.Fatalf("collection after upgrade: %+v", c)
 	}
-	applyTest(t, s, testOperation("qry-after-upgrade", Change{CreateQuery: &CreateQuery{QueryID: testQuery, Name: "Recent",
-		Definition: QueryDefinition{Prefixes: []string{"Projects"}, Limit: 200}}}))
+	applyTest(t, s, create)
 	if q := getQuery(t, s, testQuery); q.Name != "Recent" || q.Definition.Prefixes[0] != "Projects" {
 		t.Fatalf("query after upgrade: %+v", q)
 	}
+}
+
+// Upgrade takes format 3 to 4 too; UpgradeTo stops at a target.
+func TestQueryUpgradeAndUpgradeTo(t *testing.T) {
+	ctx := context.Background()
+	path := v3Fixture(t)
+	if err := Upgrade(ctx, path, testLibrary); err != nil {
+		t.Fatal(err)
+	}
+	if _, version, err := Inspect(ctx, path); err != nil || version != 4 {
+		t.Fatalf("Upgrade: %d %v", version, err)
+	}
+	if err := UpgradeTo(ctx, path, testLibrary, 3); err != nil {
+		t.Fatalf("UpgradeTo an older format of a newer catalog: %v", err)
+	}
+	old := v2Fixture(t)
+	if err := UpgradeTo(ctx, old, testLibrary, 3); err != nil {
+		t.Fatal(err)
+	}
+	if _, version, err := Inspect(ctx, old); err != nil || version != 3 {
+		t.Fatalf("UpgradeTo 3: %d %v", version, err)
+	}
+	for _, target := range []int{2, 5} {
+		if err := UpgradeTo(ctx, old, testLibrary, target); !errors.Is(err, ErrInvalid) {
+			t.Fatalf("target %d: %v", target, err)
+		}
+	}
+}
+
+// At most MaxQueries active queries per library.
+func TestQueryLibraryLimit(t *testing.T) {
+	ctx := context.Background()
+	s, _ := newTestStore(t)
+	def := QueryDefinition{Prefixes: []string{"A"}, Limit: 1}
+	var changes []Change
+	for i := 1; i <= MaxQueries; i++ {
+		changes = append(changes, Change{CreateQuery: &CreateQuery{QueryID: QueryID(fmt.Sprintf("qry_%032x", i)), Name: "q", Definition: def}})
+	}
+	applyTest(t, s, testOperation("many", changes...))
+	over := testOperation("over", Change{CreateQuery: &CreateQuery{QueryID: QueryID(fmt.Sprintf("qry_%032x", MaxQueries+1)), Name: "q", Definition: def}})
+	if _, err := s.Apply(ctx, over); !errors.Is(err, ErrQueryLimit) {
+		t.Fatalf("over the limit: %v", err)
+	}
+	applyTest(t, s, testOperation("drop", Change{RemoveQuery: &RemoveQuery{QueryID: QueryID(fmt.Sprintf("qry_%032x", 1))}}))
+	applyTest(t, s, over)
 }
 
 // A failed format 4 step leaves the format 3 catalog exactly as it was.
@@ -249,6 +315,9 @@ func TestQueryDefinitionValidation(t *testing.T) {
 		"long prefix":      with(func(d *QueryDefinition) { d.Prefixes = []string{strings.Repeat("a", MaxQueryPrefixBytes+1)} }),
 		"slash in name":    with(func(d *QueryDefinition) { d.NameContains = "a/b" }),
 		"nul in name":      with(func(d *QueryDefinition) { d.NameContains = "a\x00" }),
+		"control in name":  with(func(d *QueryDefinition) { d.NameContains = "a\tb" }),
+		"control in path":  with(func(d *QueryDefinition) { d.Prefixes = []string{"A/b\nc"} }),
+		"DEL in path":      with(func(d *QueryDefinition) { d.Prefixes = []string{"A\x7f"} }),
 		"upper extension":  with(func(d *QueryDefinition) { d.Extensions = []string{"MOV"} }),
 		"dotted extension": with(func(d *QueryDefinition) { d.Extensions = []string{".mov"} }),
 		"dup extension":    with(func(d *QueryDefinition) { d.Extensions = []string{"mov", "mov"} }),
