@@ -39,7 +39,12 @@ type Stats struct {
 	NotContinued         uint64 `json:"not_continued"`
 	NotContinuedNoRename uint64 `json:"not_continued_no_rename"`
 	PairsExhausted       uint64 `json:"pairs_exhausted"`
-	Complete             bool   `json:"complete"`
+	// Touched: update events that moved a file's hint sequence (its
+	// recency marker, touch.go); TouchesSkipped: coalesced or over the
+	// rate limit.
+	Touched        uint64 `json:"touched"`
+	TouchesSkipped uint64 `json:"touches_skipped"`
+	Complete       bool   `json:"complete"`
 }
 
 func (b *Binder) Stats() Stats {
@@ -66,6 +71,8 @@ func (b *Binder) Stats() Stats {
 		NotContinued:         b.notContinued.Load(),
 		NotContinuedNoRename: b.noRename.Load(),
 		PairsExhausted:       b.pairsExhausted.Load(),
+		Touched:              b.touched.Load(),
+		TouchesSkipped:       b.touchSkipped.Load(),
 	}
 	if ns := b.observedSince.Load(); ns != 0 {
 		s.ObservedSince = time.Unix(0, ns).UTC()

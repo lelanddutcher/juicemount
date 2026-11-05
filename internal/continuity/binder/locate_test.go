@@ -77,3 +77,43 @@ func TestHintsLocateAndApplied(t *testing.T) {
 		t.Fatalf("Locate of a directory = %q %v", p, err)
 	}
 }
+
+// An update event moves the hint's sequence (the recency marker queries
+// pick candidates by), coalesced per inode and rate limited; the value and
+// every other record stay as they were.
+func TestUpdateTouchesHintSequence(t *testing.T) {
+	var mu sync.Mutex
+	now := time.Date(2026, 11, 5, 12, 0, 0, 0, time.UTC)
+	clock := func() time.Time { mu.Lock(); defer mu.Unlock(); return now }
+	advance := func(d time.Duration) { mu.Lock(); now = now.Add(d); mu.Unlock() }
+	f := newFixtureWith(t, Config{Now: clock, TouchRate: 0.001, TouchBurst: 1}, true)
+	a := f.create("P/a.mov")
+	b := f.create("P/b.mov")
+	f.feed(Event{Op: "create", Path: "P/a.mov", Inode: a}, Event{Op: "create", Path: "P/b.mov", Inode: b})
+	hint := func(ino uint64) catalog.Location { return f.location(HintID(testUUID, ino)) }
+	bound := hint(a)
+	// Just bound: an update is coalesced.
+	f.feed(Event{Op: "update", Path: "P/a.mov", Inode: a})
+	if h := hint(a); h.UpdatedSequence != bound.UpdatedSequence || f.b.Stats().TouchesSkipped != 1 {
+		t.Fatalf("touched right after the bind: %+v %+v", h, f.b.Stats())
+	}
+	advance(11 * time.Minute)
+	events := f.events()
+	f.feed(Event{Op: "update", Path: "P/a.mov", Inode: a})
+	h := hint(a)
+	if h.UpdatedSequence <= bound.UpdatedSequence || h.Value != bound.Value || h.Removed || f.events() != events+1 || f.b.Stats().Touched != 1 {
+		t.Fatalf("after an update: %+v (was %+v), %+v", h, bound, f.b.Stats())
+	}
+	f.requireBound(a, "P/a.mov", "a.mov")
+	// Again within the interval: coalesced. Another file: over the rate.
+	f.feed(Event{Op: "update", Path: "P/a.mov", Inode: a}, Event{Op: "update", Path: "P/b.mov", Inode: b})
+	if hint(a).UpdatedSequence != h.UpdatedSequence || hint(b).UpdatedSequence >= h.UpdatedSequence || f.b.Stats().TouchesSkipped != 3 {
+		t.Fatalf("coalescing and rate: %+v %+v", hint(b), f.b.Stats())
+	}
+	// A create event (or rename) never touches.
+	advance(time.Hour)
+	f.feed(Event{Op: "create", Path: "P/b.mov", Inode: b})
+	if f.b.Stats().Touched != 1 {
+		t.Fatalf("a create touched: %+v", f.b.Stats())
+	}
+}

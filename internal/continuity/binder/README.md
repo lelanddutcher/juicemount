@@ -199,6 +199,14 @@ counters and `complete: false`; a later rescan starts from them.
   its inode, catalog reads only) and include one only after `Locate` resolves
   its inode's live path and modification time on the volume. `Config.Applied`
   sees every operation the binder commits, so a host can follow hint changes.
+- Recency marker (`touch.go`): an `update` event for a bound file whose
+  records did not move re-puts its hint with the same value (operation kind
+  `touch`), which moves the hint's `UpdatedSequence`, so "most recently
+  recorded" also covers saves in place. An inode bound, moved or touched
+  within `TouchInterval` (10 min) is not touched again, touches are limited
+  to `TouchRate` (20 a second, bursts of 200), and both skips are counted
+  (`touches_skipped`; `touched` counts the rest). Each touch is one catalog
+  event.
 
 ## API (admin key)
 

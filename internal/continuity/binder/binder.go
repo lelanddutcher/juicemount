@@ -138,6 +138,11 @@ type Config struct {
 	SaveWindow     time.Duration
 	Logf           func(format string, args ...any)
 	Now            func() time.Time
+	// TouchInterval, TouchRate and TouchBurst bound the recency marker on
+	// update events (touch.go; defaults 10 min, 20 a second, 200).
+	TouchInterval time.Duration
+	TouchRate     float64
+	TouchBurst    int
 	// Applied, when set, is called (on the binder's goroutine) after each
 	// operation the binder committed to the catalog. It must not block.
 	Applied func(catalog.Operation)
@@ -169,9 +174,15 @@ type Binder struct {
 	moves map[uint64]move
 	// Worker-only: when Offer received the event being handled.
 	receivedAt time.Time
+	// Worker-only: inodes whose hint sequence moved recently, and the
+	// touch budget (touch.go).
+	recent      recentInodes
+	observed    uint64 // the visible file the last observe synced (0: none)
+	touchTokens float64
+	touchAt     time.Time
 
 	received, handled, dropped, discarded, applied, ignored, failed, retried, unresolved, tooManyLinks, resubscribes atomic.Uint64
-	continued, merged, notContinued, noRename, pairsExhausted                                                        atomic.Uint64
+	continued, merged, notContinued, noRename, pairsExhausted, touched, touchSkipped                                 atomic.Uint64
 
 	observedSince atomic.Int64 // unix nanoseconds
 
@@ -202,6 +213,15 @@ func New(cfg Config) (*Binder, error) {
 	if cfg.SaveWindow <= 0 {
 		cfg.SaveWindow = defaultSaveWindow
 	}
+	if cfg.TouchInterval <= 0 {
+		cfg.TouchInterval = defaultTouchInterval
+	}
+	if cfg.TouchRate <= 0 {
+		cfg.TouchRate = defaultTouchRate
+	}
+	if cfg.TouchBurst <= 0 {
+		cfg.TouchBurst = defaultTouchBurst
+	}
 	if cfg.Logf == nil {
 		cfg.Logf = log.Printf
 	}
@@ -220,6 +240,9 @@ func New(cfg Config) (*Binder, error) {
 		paths:   newPathCache(cfg.PathCacheSize),
 		moves:   map[uint64]move{},
 		lastLog: map[string]time.Time{},
+		recent:  recentInodes{at: map[uint64]time.Time{}, max: defaultTouchMemory},
+
+		touchTokens: float64(cfg.TouchBurst),
 	}, nil
 }
 
@@ -445,7 +468,7 @@ func (b *Binder) apply(ctx context.Context, v *volume, ev Event) error {
 		}
 		old, renamed := cleanPath(ev.OldPath)
 		if !renamed || ev.Op != "rename" {
-			return b.observe(ctx, v, p, false)
+			return b.observeTouch(ctx, v, p, ev.Op == "update")
 		}
 		moved, known := b.paths.get(old)
 		b.paths.remove(old)
@@ -460,6 +483,25 @@ func (b *Binder) apply(ctx context.Context, v *volume, ev Event) error {
 		b.ignored.Add(1)
 		return nil
 	}
+}
+
+// observeTouch is observe, then, for an update event of a file whose
+// records did not move, the recency marker (touch.go). Any operation the
+// observe applied already moved the sequence and counts as recent.
+func (b *Binder) observeTouch(ctx context.Context, v *volume, p string, update bool) error {
+	before := b.applied.Load()
+	b.observed = 0
+	if err := b.observe(ctx, v, p, false); err != nil || b.observed == 0 {
+		return err
+	}
+	if b.applied.Load() != before {
+		b.recent.put(b.observed, b.cfg.Now(), b.cfg.TouchInterval)
+		return nil
+	}
+	if !update {
+		return nil
+	}
+	return b.touch(ctx, v, b.observed)
 }
 
 // observe syncs the regular file now at p: binding it when p is visible,
@@ -501,6 +543,7 @@ func (b *Binder) observe(ctx context.Context, v *volume, p string, renamed bool)
 	}
 	b.paths.put(p, n.Ino)
 	_, err = b.sync(ctx, v, n.Ino, p)
+	b.observed = n.Ino
 	return err
 }
 
