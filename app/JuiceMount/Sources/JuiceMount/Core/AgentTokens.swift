@@ -20,6 +20,9 @@ final class AgentTokensModel {
     var statusIsError = false
     /// The Manager address is plain http to another host.
     var warning: String?
+    /// A token a failed create removed from this Mac, still live on the
+    /// Manager (its row says so, so it can be revoked).
+    var removedHereID = ""
     /// A list call is running.
     private var listing = false
 
@@ -30,6 +33,11 @@ final class AgentTokensModel {
     /// This Mac's enrollment record (Keychain); a probe substitutes it.
     static var enrollmentRecord: () -> EnrollmentRecord? = {
         EnrollmentRecord.load(Preferences.enrollmentStore.password(for: EnrollmentRecord.account))
+    }
+
+    /// What the bridge needs of the enrollment record (never its secret).
+    private static func macState(_ r: EnrollmentRecord) -> AgentAccess.MacState {
+        AgentAccess.MacState(managerURL: r.managerURL, instanceID: r.instanceID, pollToken: r.pollToken, status: r.status)
     }
 
     /// Bridge calls make Manager requests: never on the main thread.
@@ -45,7 +53,7 @@ final class AgentTokensModel {
     }
 
     private struct Input: Encodable {
-        let state: EnrollmentRecord
+        let state: AgentAccess.MacState
         var name: String?
         var days: Int?
         var id: String?
@@ -59,7 +67,7 @@ final class AgentTokensModel {
             var out: AgentAccess.Output?
             var code: String?
             if let record = Self.enrollmentRecord(),
-               let data = try? JSONEncoder().encode(Input(state: record, name: name, days: days, id: id)),
+               let data = try? JSONEncoder().encode(Input(state: Self.macState(record), name: name, days: days, id: id)),
                let json = String(data: data, encoding: .utf8) {
                 out = AgentAccess.Output.decode(export(json))
                 if out == nil { code = "" }
@@ -112,9 +120,18 @@ final class AgentTokensModel {
             guard let self else { return }
             self.busy = false
             if let out, out.ok {
+                self.removedHereID = ""
                 self.finish(AgentAccess.createdMessage(name: out.token?.name ?? name, replacedID: out.replacedID), error: false)
             } else {
-                self.finish(AgentAccess.message(code: out?.error ?? code, detail: out?.detail), error: true)
+                let removed = out?.previousRemoved ?? false
+                let replaced = out?.replacedID ?? ""
+                if removed {
+                    self.storedID = ""
+                    self.removedHereID = replaced
+                }
+                let replacedName = replaced.isEmpty ? nil : self.tokens.first(where: { $0.id == replaced })?.name
+                self.finish(AgentAccess.createFailedMessage(code: out?.error ?? code, detail: out?.detail,
+                                                            previousRemoved: removed, replacedName: replacedName), error: true)
             }
             if let w = out?.warning { self.warning = w }
             self.refresh()
@@ -131,6 +148,7 @@ final class AgentTokensModel {
             guard let self else { return }
             self.busy = false
             if let out, out.ok {
+                if token.id == self.removedHereID { self.removedHereID = "" }
                 self.finish(AgentAccess.revokedMessage(name: token.name, gone: out.gone, deleted: out.deleted), error: false)
             } else {
                 self.finish(AgentAccess.message(code: out?.error ?? code, detail: out?.detail), error: true)

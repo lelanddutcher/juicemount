@@ -114,6 +114,7 @@ class VerifySplitService(unittest.TestCase):
         self.assertIn("agent MCP server signing identifier: com.juicemount.mcp", result.stdout)
         self.assertIn("agent MCP server is built from cmd/juicemount-mcp", result.stdout)
         self.assertIn("agent MCP server is built with cgo (Keychain)", result.stdout)
+        self.assertIn("agent MCP server Version/Commit symbols match expected source", result.stdout)
 
     def test_required_executables_missing_or_nonexecutable(self):
         for rel in ("Contents/MacOS/JuiceMount", "Contents/MacOS/juicemount-service", "Contents/MacOS/juicemount-mount-probe"):
@@ -161,6 +162,7 @@ class VerifySplitService(unittest.TestCase):
         self.assertEqual(other.returncode, 1, other.stdout)
         self.assertIn("agent MCP server is not a build of cmd/juicemount-mcp", other.stdout)
         self.assertIn("agent MCP server signing identifier: got", other.stdout)
+        self.assertIn("agent MCP server Version/Commit symbols do not match expected source", other.stdout)
         mcp.unlink()
         env = dict(os.environ, CGO_ENABLED="0")
         subprocess.run(["go", "build", "-o", str(mcp), "./cmd/juicemount-mcp"],

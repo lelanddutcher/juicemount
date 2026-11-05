@@ -31,8 +31,11 @@ var ErrPreviousTokenRemoved = errors.New("the agent token stored before was remo
 
 // removedNote tells the person what a failed Save that removed prev means.
 func removedNote(err error, prev TokenRecord, havePrev bool) string {
-	if !errors.Is(err, ErrPreviousTokenRemoved) || !havePrev {
+	if !errors.Is(err, ErrPreviousTokenRemoved) {
 		return ""
+	}
+	if !havePrev || prev.ID == "" {
+		return " A token stored here before was removed from this machine and may still be live on the Manager: run juicemount-mcp token list, and juicemount-mcp token revoke <id> for any you no longer need."
 	}
 	return fmt.Sprintf(" The token stored here before (%s) was removed from this machine but is still live on the Manager: run juicemount-mcp token list, and juicemount-mcp token revoke %s if you no longer need it.", prev.ID, prev.ID)
 }

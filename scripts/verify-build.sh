@@ -418,7 +418,8 @@ echo ""
 # --- Agent MCP server (docs/agent-mcp.md) ---
 # The app stores the agent token in a Keychain item whose access list trusts
 # this binary (credstore.AppAgentToken), and agents' MCP configs run it. It
-# must be a build of cmd/juicemount-mcp with the bundle identity, its own
+# must be this source's build of cmd/juicemount-mcp (its Version/Commit
+# stamp, which serverInfo reports) with the bundle identity, its own
 # identifier, the hardened runtime with a real identity, and cgo (a darwin
 # build without it has no Keychain).
 MCP="$APP_PATH/Contents/MacOS/juicemount-mcp"
@@ -458,6 +459,11 @@ else
         fi
     else
         mcp_fail "agent MCP server build information is unreadable"
+    fi
+    if python3 "$PROJECT_ROOT/scripts/verify-service-stamp.py" "$MCP" "$EXPECTED_VERSION" "$EXPECTED_COMMIT" >/dev/null 2>&1; then
+        pass "agent MCP server Version/Commit symbols match expected source"
+    else
+        mcp_fail "agent MCP server Version/Commit symbols do not match expected source"
     fi
 fi
 echo ""

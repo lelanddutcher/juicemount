@@ -35,7 +35,7 @@ enum AgentAccess {
         init(from decoder: Decoder) throws {
             let c = try decoder.container(keyedBy: CodingKeys.self)
             id = try c.decode(String.self, forKey: .id)
-            name = try c.decodeIfPresent(String.self, forKey: .name) ?? ""
+            name = AgentAccess.cleanText(try c.decodeIfPresent(String.self, forKey: .name) ?? "")
             createdAtMS = try c.decodeIfPresent(Int64.self, forKey: .createdAtMS) ?? 0
             expiresAtMS = try c.decodeIfPresent(Int64.self, forKey: .expiresAtMS) ?? 0
         }
@@ -52,6 +52,9 @@ enum AgentAccess {
         /// The token stored on this Mac for juicemount-mcp ("" = none).
         var storedID: String
         var replacedID: String
+        /// A failed create removed the token stored here before: agents on
+        /// this Mac have none now, and that token is still live.
+        var previousRemoved: Bool
         var gone: Bool
         var deleted: Bool
         var warning: String?
@@ -60,7 +63,7 @@ enum AgentAccess {
 
         enum CodingKeys: String, CodingKey {
             case ok, continuity, tokens, token, gone, deleted, warning, error, detail
-            case storedID = "stored_id", replacedID = "replaced_id"
+            case storedID = "stored_id", replacedID = "replaced_id", previousRemoved = "previous_removed"
         }
 
         init(from decoder: Decoder) throws {
@@ -71,17 +74,47 @@ enum AgentAccess {
             token = try c.decodeIfPresent(Token.self, forKey: .token)
             storedID = try c.decodeIfPresent(String.self, forKey: .storedID) ?? ""
             replacedID = try c.decodeIfPresent(String.self, forKey: .replacedID) ?? ""
+            previousRemoved = try c.decodeIfPresent(Bool.self, forKey: .previousRemoved) ?? false
             gone = try c.decodeIfPresent(Bool.self, forKey: .gone) ?? false
             deleted = try c.decodeIfPresent(Bool.self, forKey: .deleted) ?? false
-            warning = try c.decodeIfPresent(String.self, forKey: .warning)
+            warning = try c.decodeIfPresent(String.self, forKey: .warning).map(AgentAccess.cleanText)
             error = try c.decodeIfPresent(String.self, forKey: .error)
-            detail = try c.decodeIfPresent(String.self, forKey: .detail)
+            detail = try c.decodeIfPresent(String.self, forKey: .detail).map(AgentAccess.cleanText)
         }
 
         static func decode(_ raw: String?) -> Output? {
             guard let raw, let data = raw.data(using: .utf8) else { return nil }
             return try? JSONDecoder().decode(Output.self, from: data)
         }
+    }
+
+    /// What the bridge needs of this Mac's enrollment record to act as this
+    /// Mac: never the enrollment secret.
+    struct MacState: Encodable, Equatable {
+        var managerURL: String
+        var instanceID: String
+        var pollToken: String
+        var status: String
+
+        enum CodingKeys: String, CodingKey {
+            case managerURL = "manager_url", instanceID = "instance_id", pollToken = "poll_token", status
+        }
+    }
+
+    /// Text the Manager supplies, for display: control characters become
+    /// spaces and format characters (Unicode Cf: bidi overrides, zero-width
+    /// characters) are dropped, so a name cannot reorder or hide what is
+    /// shown around it. The bridge cleans it too.
+    static func cleanText(_ s: String) -> String {
+        var out = String.UnicodeScalarView()
+        for u in s.unicodeScalars {
+            switch u.properties.generalCategory {
+            case .format: continue
+            case .control: out.append(" ")
+            default: out.append(u)
+            }
+        }
+        return String(out)
     }
 
     /// Where the token list stands.
@@ -166,6 +199,16 @@ enum AgentAccess {
         return replacedID.isEmpty ? base : base + " The token it replaces here still works until you revoke it."
     }
 
+    /// What a failed create says. previousRemoved: storing the new token
+    /// removed the one stored here before (replacedName when known), which is
+    /// still live on the Manager.
+    static func createFailedMessage(code: String?, detail: String?, previousRemoved: Bool, replacedName: String?) -> String {
+        let base = message(code: code, detail: detail)
+        guard previousRemoved else { return base }
+        let which = replacedName.map { "The token “\($0)” that was stored here" } ?? "The token that was stored here"
+        return base + " Agents on this Mac no longer have a token. \(which) is still active on the Manager; revoke it below if you don't need it."
+    }
+
     /// What a successful revoke says.
     static func revokedMessage(name: String, gone: Bool, deleted: Bool) -> String {
         var s = gone ? "“\(name)” was already revoked or expired." : "Revoked “\(name)”."
@@ -181,6 +224,29 @@ enum AgentAccess {
                               isExecutable: (String) -> Bool = { FileManager.default.isExecutableFile(atPath: $0) }) -> String? {
         let path = bundleURL.appendingPathComponent("Contents/MacOS/\(binaryName)").path
         return isExecutable(path) ? path : nil
+    }
+
+    /// The mount point an agent's config names: absolute, with `~`
+    /// expanded and the path standardized; nil when it is not absolute.
+    static func resolvedMount(_ raw: String, home: String = NSHomeDirectory()) -> String? {
+        var path = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if path.isEmpty { path = "/Volumes/zpool" }
+        if path == "~" {
+            path = home
+        } else if path.hasPrefix("~/") {
+            path = home + path.dropFirst(1)
+        }
+        guard path.hasPrefix("/") else { return nil }
+        let standard = (path as NSString).standardizingPath
+        return standard.hasPrefix("/") ? standard : nil
+    }
+
+    /// Whether the app runs translocated (Gatekeeper App Translocation: a
+    /// quarantined app opened from Downloads runs from a temporary,
+    /// randomized path). A config naming that path stops working, so the
+    /// person is asked to move the app to Applications first.
+    static func isTranslocated(bundlePath: String) -> Bool {
+        bundlePath.contains("/AppTranslocation/")
     }
 
     /// Claude Desktop's config (claude_desktop_config.json) running the

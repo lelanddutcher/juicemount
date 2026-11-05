@@ -267,8 +267,111 @@ func TestAgentTokenCreateUnstoredIsRevoked(t *testing.T) {
 	f.on("POST /api/agent-tokens", mintedAnswer(agentTestID, agentTestToken))
 	f.on("POST /api/agent-tokens/"+agentTestID+"/revoke", agentAnswer{status: 500, body: map[string]string{"error": "boom"}})
 	out = decodeAgentOutput(t, agentTokenCreate(agentInput(t, f, "approved", map[string]any{"name": "x"})))
-	if out.OK || out.Error != agentErrStoreLive || out.Token == nil || out.Token.ID != agentTestID || out.ReplacedID != prev.ID {
+	if out.OK || out.Error != agentErrStoreLive || out.Token == nil || out.Token.ID != agentTestID || out.ReplacedID != prev.ID || !out.PreviousRemoved {
 		t.Fatalf("revoke failed too: %+v", out)
+	}
+	// The previous token could not be read first (the person denied the
+	// prompt) but the store removed it: the output still says so.
+	agentTokenStore = func() agentmcp.TokenStore { return unreadableRemovingStore{} }
+	f.on("POST /api/agent-tokens", mintedAnswer(agentTestID, agentTestToken))
+	f.on("POST /api/agent-tokens/"+agentTestID+"/revoke", agentAnswer{status: 200, body: map[string]string{"revoked": agentTestID}})
+	out = decodeAgentOutput(t, agentTokenCreate(agentInput(t, f, "approved", map[string]any{"name": "x"})))
+	if out.OK || out.Error != agentErrStoreFailed || !out.PreviousRemoved || out.ReplacedID != "" {
+		t.Fatalf("unread previous removed: %+v", out)
+	}
+}
+
+// unreadableRemovingStore could not read the token it held, then removed
+// it and failed to store the new one.
+type unreadableRemovingStore struct{}
+
+func (unreadableRemovingStore) Save(agentmcp.TokenRecord) error {
+	return agentmcp.ErrPreviousTokenRemoved
+}
+func (unreadableRemovingStore) Load() (agentmcp.TokenRecord, error) {
+	return agentmcp.TokenRecord{}, errors.New("keychain read refused (OSStatus -128)")
+}
+func (unreadableRemovingStore) Delete() error { return nil }
+
+// unreadStore is the app's store with reading the token made a failure:
+// the app tells the stored token by the ID kept beside it, so listing,
+// creating and revoking never read it (no Keychain prompt).
+type unreadStore struct {
+	appTokenStore
+	t *testing.T
+}
+
+func (s unreadStore) Load() (agentmcp.TokenRecord, error) {
+	s.t.Error("the stored token was read")
+	return agentmcp.TokenRecord{}, errors.New("read")
+}
+
+func TestAgentTokenAppNeverReadsTheToken(t *testing.T) {
+	f := agentTokenEnv(t)
+	prevStore := agentTokenStore
+	t.Cleanup(func() { agentTokenStore = prevStore })
+	agentTokenStore = func() agentmcp.TokenStore { return unreadStore{appTokenStore{credstore.AppAgentToken{}}, t} }
+	f.on("POST /api/agent-tokens", mintedAnswer(agentTestID, agentTestToken))
+	if out := decodeAgentOutput(t, agentTokenCreate(agentInput(t, f, "approved", map[string]any{"name": "x"}))); !out.OK || out.StoredID != agentTestID {
+		t.Fatalf("create %+v", out)
+	}
+	const id2 = "0123456789abcdef"
+	f.on("POST /api/agent-tokens", mintedAnswer(id2, "jma_"+id2+"_"+strings.Repeat("ab", 32)))
+	if out := decodeAgentOutput(t, agentTokenCreate(agentInput(t, f, "approved", map[string]any{"name": "y"}))); !out.OK || out.ReplacedID != agentTestID {
+		t.Fatalf("second create %+v", out)
+	}
+	f.on("GET /api/agent-tokens", agentAnswer{status: 200, body: map[string]any{"agent_tokens": []any{}}})
+	if out := decodeAgentOutput(t, agentTokenList(agentInput(t, f, "approved", nil))); !out.OK || out.StoredID != id2 {
+		t.Fatalf("list %+v", out)
+	}
+	f.on("POST /api/agent-tokens/"+id2+"/revoke", agentAnswer{status: 200, body: map[string]string{"revoked": id2}})
+	if out := decodeAgentOutput(t, agentTokenRevoke(agentInput(t, f, "approved", map[string]any{"id": id2}))); !out.OK || !out.Deleted {
+		t.Fatalf("revoke %+v", out)
+	}
+	if _, err := storedRecord(t); !errors.Is(err, credstore.ErrNotFound) {
+		t.Fatalf("still stored: %v", err)
+	}
+	// A token stored before its ID was kept beside it is unknown: listed as
+	// not on this Mac, never read, and not deleted on a guess.
+	if err := credstore.SaveAgentToken(agentmcp.TokenRecord{ManagerURL: f.srv.URL, Token: agentTestToken, ID: agentTestID}.Encode(), ""); err != nil {
+		t.Fatal(err)
+	}
+	f.on("GET /api/agent-tokens", agentAnswer{status: 200, body: map[string]any{"agent_tokens": []any{}}})
+	if out := decodeAgentOutput(t, agentTokenList(agentInput(t, f, "approved", nil))); !out.OK || out.StoredID != "" {
+		t.Fatalf("legacy list %+v", out)
+	}
+	f.on("POST /api/agent-tokens/"+agentTestID+"/revoke", agentAnswer{status: 200, body: map[string]string{"revoked": agentTestID}})
+	if out := decodeAgentOutput(t, agentTokenRevoke(agentInput(t, f, "approved", map[string]any{"id": agentTestID}))); !out.OK || out.Deleted {
+		t.Fatalf("legacy revoke %+v", out)
+	}
+}
+
+// Names and errors the Manager supplies reach the app without control or
+// format characters (bidi overrides, zero-width).
+func TestAgentTokenOutputCleansManagerText(t *testing.T) {
+	f := agentTokenEnv(t)
+	f.on("GET /api/agent-tokens", agentAnswer{status: 200, body: map[string]any{"agent_tokens": []any{
+		map[string]any{"id": "aaaaaaaaaaaaaaaa", "name": "cl\u202eaude\u200b\u0007", "person_name": "A\u2066nn"},
+	}}})
+	raw := agentTokenList(agentInput(t, f, "approved", nil))
+	out := decodeAgentOutput(t, raw)
+	if !out.OK || len(out.Tokens) != 1 || out.Tokens[0].Name != "claude " || out.Tokens[0].PersonName != "Ann" {
+		t.Fatalf("list %q", raw)
+	}
+	f.on("POST /api/agent-tokens", agentAnswer{status: 409, body: map[string]string{"error": "too \u202emany"}})
+	if out := decodeAgentOutput(t, agentTokenCreate(agentInput(t, f, "approved", map[string]any{"name": "x"}))); out.Detail != "too many" {
+		t.Fatalf("detail %q", out.Detail)
+	}
+}
+
+// Only what minting needs of the enrollment record is used: a record
+// without its secret mints.
+func TestAgentTokenStateNeedsNoSecret(t *testing.T) {
+	f := agentTokenEnv(t)
+	f.on("POST /api/agent-tokens", mintedAnswer(agentTestID, agentTestToken))
+	in := `{"name":"x","state":{"manager_url":"` + f.srv.URL + `","instance_id":"I","poll_token":"` + agentTestPoll + `","status":"approved"}}`
+	if out := decodeAgentOutput(t, agentTokenCreate(in)); !out.OK {
+		t.Fatalf("create %+v", out)
 	}
 }
 

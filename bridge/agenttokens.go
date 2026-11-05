@@ -38,8 +38,10 @@ import (
 
 // agentTokenInput is the input of every agent-token export.
 type agentTokenInput struct {
-	// State is the enrollment record (enrollclient.State JSON) the app keeps
-	// in its Keychain slot "enrollment". Only an approved one can mint.
+	// State is this Mac's enrollment as the app keeps it in its Keychain
+	// slot "enrollment" (enrollclient.State JSON). The app sends only what
+	// minting needs (macState); anything else, the enrollment secret
+	// included, is dropped unread. Only an approved one can mint.
 	State json.RawMessage `json:"state"`
 	// Create: the token's name and lifetime (0: 90 days).
 	Name string `json:"name,omitempty"`
@@ -76,9 +78,14 @@ type agentTokenOutput struct {
 	// StoredID is the token stored on this Mac for juicemount-mcp serve
 	// (list, create).
 	StoredID string `json:"stored_id,omitempty"`
-	// ReplacedID (create) was stored here before; it stays valid on the
-	// Manager until revoked.
+	// ReplacedID (create) was stored here before, when its ID is known; it
+	// stays valid on the Manager until revoked.
 	ReplacedID string `json:"replaced_id,omitempty"`
+	// PreviousRemoved (a failed create): storing the new token removed the
+	// one stored here before, so agents on this Mac have none now, and that
+	// token (ReplacedID, when known) is still live on the Manager. Set
+	// whenever an item was removed, whether or not its ID could be told.
+	PreviousRemoved bool `json:"previous_removed,omitempty"`
 	// Gone (revoke): the Manager no longer had the token. Deleted: it was
 	// the one stored here and was deleted.
 	Gone    bool `json:"gone,omitempty"`
@@ -118,7 +125,7 @@ func bundledMCP() []string {
 type appTokenStore struct{ item credstore.AppAgentToken }
 
 func (s appTokenStore) Save(r agentmcp.TokenRecord) error {
-	err := s.item.Save(r.Encode())
+	err := s.item.Save(r.Encode(), r.ID)
 	if errors.Is(err, credstore.ErrStoredRecordRemoved) {
 		return fmt.Errorf("%w (%v)", agentmcp.ErrPreviousTokenRemoved, err)
 	}
@@ -137,6 +144,15 @@ func (s appTokenStore) Load() (agentmcp.TokenRecord, error) {
 }
 
 func (s appTokenStore) Delete() error { return s.item.Delete() }
+
+// StoredID tells the stored token's ID from the item's label, never from
+// the token (agentmcp.TokenIDReader): listing, replacing and revoking never
+// show the Keychain's prompt, even for an item another program made. An
+// item labelled before IDs were kept there is unknown.
+func (s appTokenStore) StoredID() (string, bool) {
+	id, err := s.item.StoredID()
+	return id, err == nil && id != ""
+}
 
 //export NFSServerAgentTokenCreate
 func NFSServerAgentTokenCreate(input *C.char) *C.char {
@@ -157,17 +173,29 @@ func NFSServerAgentTokenRevoke(input *C.char) *C.char {
 // and then revoke).
 const agentTokenCall = 2 * time.Minute
 
+// macState is what minting needs of the enrollment record: no secret but
+// the poll token the Mac authenticates with.
+type macState struct {
+	ManagerURL string `json:"manager_url"`
+	InstanceID string `json:"instance_id"`
+	PollToken  string `json:"poll_token"`
+	Status     string `json:"status"`
+}
+
 // agentTokenClient reads the input and makes a Manager client as this Mac.
 func agentTokenClient(raw string) (agentTokenInput, agentmcp.MacCredentials, *agentmcp.Client, *agentTokenOutput) {
 	var in agentTokenInput
 	if err := json.Unmarshal([]byte(raw), &in); err != nil {
 		return in, agentmcp.MacCredentials{}, nil, &agentTokenOutput{Error: agentErrInvalid, Detail: "invalid agent token input"}
 	}
-	if len(in.State) == 0 || string(in.State) == "null" {
+	var st macState
+	if len(in.State) == 0 || string(in.State) == "null" || json.Unmarshal(in.State, &st) != nil {
 		return in, agentmcp.MacCredentials{}, nil, &agentTokenOutput{Error: agentErrNotEnrolled, Detail: "this Mac has no Manager enrollment"}
 	}
+	in.State = nil // the rest of the record, if the app sent it, goes no further
+	state, _ := json.Marshal(st)
 	device, _ := deviceid.Fingerprint()
-	m, err := agentmcp.MacCredentialsFromState(string(in.State), device)
+	m, err := agentmcp.MacCredentialsFromState(string(state), device)
 	if err != nil {
 		return in, m, nil, &agentTokenOutput{Error: agentErrNotEnrolled, Detail: err.Error()}
 	}
@@ -190,7 +218,21 @@ func agentTokenFailure(err error) agentTokenOutput {
 	return agentTokenOutput{Error: agentErrUnreachable, Detail: err.Error()}
 }
 
+// agentTokenJSON encodes out with every Manager-supplied text cleaned
+// (agentmcp.CleanText) for display.
 func agentTokenJSON(out agentTokenOutput) string {
+	clean := func(v *agentmcp.TokenView) {
+		v.Name, v.PersonName = agentmcp.CleanText(v.Name), agentmcp.CleanText(v.PersonName)
+	}
+	for i := range out.Tokens {
+		clean(&out.Tokens[i])
+	}
+	if out.Token != nil {
+		v := *out.Token
+		clean(&v)
+		out.Token = &v
+	}
+	out.Detail, out.Warning = agentmcp.CleanText(out.Detail), agentmcp.CleanText(out.Warning)
 	b, err := json.Marshal(out)
 	if err != nil {
 		return `{"ok":false,"error":"invalid","detail":"could not encode the result"}`
@@ -230,7 +272,10 @@ func agentTokenCreate(raw string) string {
 			out.Token = &v
 		}
 		if se.PrevRemoved() {
-			out.ReplacedID = se.Prev.ID
+			out.PreviousRemoved = true
+			if se.PrevStored {
+				out.ReplacedID = se.Prev.ID
+			}
 		}
 		jmlog.Warn("agent token: minted but not stored", "id", v.ID, "revoked", se.RevokeErr == nil, "error", se.Err.Error())
 		return agentTokenJSON(out)

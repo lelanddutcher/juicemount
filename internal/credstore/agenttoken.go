@@ -7,7 +7,9 @@ package credstore
 // AgentTokenService), so it never touches the items the app owns.
 //
 //   - darwin with cgo: one generic-password item in the login Keychain,
-//     stamped with this Mac's device digest like the app's items. It is
+//     stamped with this Mac's device digest like the app's items, its label
+//     naming the token's ID (AgentTokenLabel) so StoredAgentTokenID tells it
+//     from the item's attributes, never its data. It is
 //     created with the default access list, which trusts the creating
 //     program (juicemount-mcp), so `serve` reads it with user interaction
 //     disabled.
@@ -34,6 +36,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"regexp"
 
 	"github.com/lelanddutcher/juicemount/internal/appisolation"
 	"github.com/lelanddutcher/juicemount/internal/deviceid"
@@ -59,16 +62,17 @@ const (
 // (a darwin build without cgo).
 var ErrNoKeychain = errors.New("this build of juicemount-mcp has no Keychain support (built without cgo); use a release build")
 
-// SaveAgentToken stores record (the token record JSON), replacing any.
-func SaveAgentToken(record string) error {
-	return saveAgentToken(record, func(device string) error {
-		return keychainSave(AgentTokenService, string(AgentToken), agentTokenAccount, record, device, agentTokenUI)
+// SaveAgentToken stores record (the token record JSON) for token id,
+// replacing any.
+func SaveAgentToken(record, id string) error {
+	return saveAgentToken(record, id, func(device string) error {
+		return keychainSave(AgentTokenService, string(AgentToken), agentTokenAccount, AgentTokenLabel(id), record, device, agentTokenUI)
 	})
 }
 
 // saveAgentToken stores record in the agent token file when there is one,
 // else with keychain, given this Mac's device digest.
-func saveAgentToken(record string, keychain func(device string) error) error {
+func saveAgentToken(record, id string, keychain func(device string) error) error {
 	if record == "" {
 		return errors.New("empty agent token record")
 	}
@@ -76,9 +80,73 @@ func saveAgentToken(record string, keychain func(device string) error) error {
 	if path, ok, err := agentTokenFile(); err != nil {
 		return err
 	} else if ok {
-		return saveFile(path, isolatedEntry{Account: agentTokenAccount, Secret: record, Device: device})
+		if !agentTokenIDRe.MatchString(id) {
+			id = ""
+		}
+		return saveFile(path, isolatedEntry{Account: agentTokenAccount, Secret: record, Device: device, ID: id})
 	}
 	return keychain(device)
+}
+
+// agentTokenIDRe is an agent token's ID; agentTokenLabelRe the label that
+// names one.
+var (
+	agentTokenIDRe    = regexp.MustCompile(`^[0-9a-f]{16}$`)
+	agentTokenLabelRe = regexp.MustCompile(`^JuiceMount agent token ([0-9a-f]{16}) \(juicemount-mcp\)$`)
+)
+
+// AgentTokenLabel is the Keychain label of the item holding token id. It is
+// not secret: it lets the ID be told (StoredAgentTokenID) without reading the
+// token, which for an item another program made shows the Keychain's prompt.
+func AgentTokenLabel(id string) string {
+	if !agentTokenIDRe.MatchString(id) {
+		return "JuiceMount agent token (juicemount-mcp)"
+	}
+	return "JuiceMount agent token " + id + " (juicemount-mcp)"
+}
+
+// agentTokenIDFromLabel is the ID a label names ("" for an item labelled
+// before IDs were kept there).
+func agentTokenIDFromLabel(label string) string {
+	if m := agentTokenLabelRe.FindStringSubmatch(label); m != nil {
+		return m[1]
+	}
+	return ""
+}
+
+// StoredAgentTokenID is the ID of the stored agent token, told from what is
+// kept beside it (the Keychain item's label, the file's id), never from the
+// token: on a Mac it reads the item's attributes only, which shows no
+// prompt. "" with a nil error: none stored, or one stored before IDs were
+// kept beside it (unknown). A token stamped for another Mac is
+// ErrOtherDevice.
+func StoredAgentTokenID() (string, error) {
+	if path, ok, err := agentTokenFile(); err != nil {
+		return "", err
+	} else if ok {
+		e, err := loadIsolatedEntry(path, agentTokenAccount)
+		if errors.Is(err, ErrNotFound) {
+			return "", nil
+		}
+		if err != nil {
+			return "", err
+		}
+		return e.ID, nil
+	}
+	if !keychainAvailable {
+		return "", ErrNoKeychain
+	}
+	label, stamp, err := keychainReadAttributes(AgentTokenService, string(AgentToken), agentTokenAccount)
+	if errors.Is(err, ErrNotFound) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	if err := checkDevice(deviceFromComment(stamp)); err != nil {
+		return "", err
+	}
+	return agentTokenIDFromLabel(label), nil
 }
 
 // LoadAgentToken returns the stored record (ErrNotFound when none; on a Mac
@@ -154,12 +222,15 @@ type AppAgentToken struct {
 	Trusted []string
 }
 
-// Save stores record, replacing any.
-func (a AppAgentToken) Save(record string) error {
-	return saveAgentToken(record, func(device string) error {
-		return keychainReplaceTrusting(AgentTokenService, string(AgentToken), agentTokenAccount, record, device, a.Trusted)
+// Save stores record for token id, replacing any.
+func (a AppAgentToken) Save(record, id string) error {
+	return saveAgentToken(record, id, func(device string) error {
+		return keychainReplaceTrusting(AgentTokenService, string(AgentToken), agentTokenAccount, AgentTokenLabel(id), record, device, a.Trusted)
 	})
 }
+
+// StoredID is StoredAgentTokenID: it never reads the token.
+func (AppAgentToken) StoredID() (string, error) { return StoredAgentTokenID() }
 
 // Load returns the stored record, as LoadAgentToken.
 func (AppAgentToken) Load() (string, error) {

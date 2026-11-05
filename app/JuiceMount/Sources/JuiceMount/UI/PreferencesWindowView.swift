@@ -479,6 +479,10 @@ struct PreferencesWindowView: View {
                         Text("On this Mac")
                             .font(.caption2)
                             .foregroundStyle(.secondary)
+                    } else if token.id == agents.removedHereID {
+                        Text("Removed from this Mac, still active")
+                            .font(.caption2)
+                            .foregroundStyle(MenuPopoverView.glanceAmber)
                     }
                 }
             }
@@ -510,20 +514,24 @@ struct PreferencesWindowView: View {
         LabeledContent("Connect an agent") {
             HStack(spacing: 8) {
                 Button("Copy Claude Desktop config") {
-                    if let binary = agentBinary {
-                        copyAgentSetup(AgentAccess.claudeDesktopConfig(binary: binary, mount: agentMount), note: "Claude Desktop config copied. Paste it into claude_desktop_config.json and restart Claude.")
+                    if let binary = agentBinary, let mount = agentMount {
+                        copyAgentSetup(AgentAccess.claudeDesktopConfig(binary: binary, mount: mount), note: "Claude Desktop config copied. Paste it into claude_desktop_config.json and restart Claude.")
                     }
                 }
                 Button("Copy Claude Code command") {
-                    if let binary = agentBinary {
-                        copyAgentSetup(AgentAccess.claudeCodeCommand(binary: binary, mount: agentMount), note: "Claude Code command copied. Run it in Terminal.")
+                    if let binary = agentBinary, let mount = agentMount {
+                        copyAgentSetup(AgentAccess.claudeCodeCommand(binary: binary, mount: mount), note: "Claude Code command copied. Run it in Terminal.")
                     }
                 }
             }
-            .disabled(agentBinary == nil)
+            .disabled(agentBinary == nil || agentMount == nil || agentTranslocated)
         }
-        if agentBinary == nil {
+        if agentTranslocated {
+            footnote("JuiceMount is running from a temporary location macOS chose for it. Move JuiceMount to the Applications folder and open it again, then copy the setup; a copied path would stop working.")
+        } else if agentBinary == nil {
             footnote("This build has no bundled juicemount-mcp, so there is nothing to connect. Use a release build of JuiceMount.")
+        } else if agentMount == nil {
+            footnote("The mount point is not an absolute path. Set it under Volume above, then copy the setup.")
         } else if let note = agentCopyNote {
             footnote(note)
         }
@@ -565,11 +573,12 @@ struct PreferencesWindowView: View {
     /// The bundled juicemount-mcp (nil in a build without it, e.g. swift run).
     private var agentBinary: String? { AgentAccess.bundledBinary(bundleURL: Bundle.main.bundleURL) }
 
-    /// The configured mount point, which serve's --mount names.
-    private var agentMount: String {
-        let mount = preferences.mountPoint.trimmingCharacters(in: .whitespacesAndNewlines)
-        return mount.isEmpty ? "/Volumes/zpool" : mount
-    }
+    /// The configured mount point, resolved for serve's --mount (nil when it
+    /// is not an absolute path).
+    private var agentMount: String? { AgentAccess.resolvedMount(preferences.mountPoint) }
+
+    /// The app runs from a temporary App Translocation path.
+    private var agentTranslocated: Bool { AgentAccess.isTranslocated(bundlePath: Bundle.main.bundlePath) }
 
     private var revokeDialogShown: Binding<Bool> {
         Binding(get: { revokeCandidate != nil }, set: { if !$0 { revokeCandidate = nil } })

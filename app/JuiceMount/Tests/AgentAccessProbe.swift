@@ -29,6 +29,7 @@ struct AgentAccessProbe {
         visibilityRules()
         errorMapping()
         bridgeOutput()
+        reviewFixes()
         guard failures == 0 else {
             FileHandle.standardError.write(Data("AgentAccessProbe: \(failures) failure(s)\n".utf8))
             exit(1)
@@ -136,5 +137,43 @@ struct AgentAccessProbe {
         let failed = AgentAccess.Output.decode(#"{"ok":false,"continuity":false,"error":"refused","detail":"this Mac belongs to no person"}"#)
         check(failed?.error == "refused" && failed?.detail == "this Mac belongs to no person", "failure output")
         check(AgentAccess.Output.decode("not json") == nil && AgentAccess.Output.decode(nil) == nil, "garbage is no output")
+    }
+
+    static func reviewFixes() {
+        // Only what minting needs of the enrollment record goes to the
+        // bridge: never the enrollment secret.
+        let state = AgentAccess.MacState(managerURL: "http://nas.example:30190", instanceID: "I", pollToken: "P", status: "approved")
+        let encoded = (try? JSONEncoder().encode(state)).flatMap { try? JSONSerialization.jsonObject(with: $0) } as? [String: String]
+        check(encoded == ["manager_url": "http://nas.example:30190", "instance_id": "I", "poll_token": "P", "status": "approved"],
+              "mac state keys: \(String(describing: encoded))")
+
+        // Manager text loses control and format characters before display.
+        check(AgentAccess.cleanText("cl\u{202E}aude\u{200B}\u{2066}x\u{07}y") == "claudex y", "cleanText: \(AgentAccess.cleanText("cl\u{202E}aude\u{200B}\u{2066}x\u{07}y"))")
+        let named = AgentAccess.Output.decode(#"{"ok":true,"continuity":true,"tokens":[{"id":"aaaaaaaaaaaaaaaa","name":"evil\u202eexe.txt"}],"detail":"a\u200bb"}"#)
+        check(named?.tokens.first?.name == "evilexe.txt" && named?.detail == "ab", "decoded names and details are cleaned: \(String(describing: named?.tokens))")
+
+        // A failed create that removed the token stored here says so, and
+        // that the removed token is still active on the Manager.
+        let removed = AgentAccess.Output.decode(#"{"ok":false,"continuity":false,"error":"store_failed","previous_removed":true,"replaced_id":"1111111111111111"}"#)
+        check(removed?.previousRemoved == true && removed?.replacedID == "1111111111111111", "previous_removed decodes")
+        let m1 = AgentAccess.createFailedMessage(code: "store_failed", detail: nil, previousRemoved: true, replacedName: "Claude")
+        check(m1.contains("no longer have a token") && m1.contains("“Claude”") && m1.contains("still active on the Manager"), "removed, named: \(m1)")
+        let m2 = AgentAccess.createFailedMessage(code: "store_failed", detail: nil, previousRemoved: true, replacedName: nil)
+        check(m2.contains("no longer have a token") && m2.contains("The token that was stored here is still active"), "removed, unknown: \(m2)")
+        check(AgentAccess.createFailedMessage(code: "manager", detail: "x", previousRemoved: false, replacedName: "Claude") ==
+              AgentAccess.message(code: "manager", detail: "x"), "nothing removed, nothing added")
+
+        // The copied config names a resolved, absolute mount point.
+        check(AgentAccess.resolvedMount("~/Media", home: "/Users/ann") == "/Users/ann/Media", "tilde: \(String(describing: AgentAccess.resolvedMount("~/Media", home: "/Users/ann")))")
+        check(AgentAccess.resolvedMount("~", home: "/Users/ann") == "/Users/ann", "bare tilde")
+        check(AgentAccess.resolvedMount(" /Volumes/zpool/ ", home: "/Users/ann") == "/Volumes/zpool", "trailing slash and spaces")
+        check(AgentAccess.resolvedMount("/Volumes/a/../zpool", home: "/Users/ann") == "/Volumes/zpool", "dot-dot")
+        check(AgentAccess.resolvedMount("", home: "/Users/ann") == "/Volumes/zpool", "empty is the default")
+        check(AgentAccess.resolvedMount("Volumes/zpool", home: "/Users/ann") == nil, "relative is refused")
+        check(AgentAccess.resolvedMount("~bob/x", home: "/Users/ann") == nil, "another user's tilde is refused")
+
+        // A translocated app is told to move to Applications first.
+        check(AgentAccess.isTranslocated(bundlePath: "/private/var/folders/xy/T/AppTranslocation/0A1B-2C3D/d/JuiceMount.app"), "translocated")
+        check(!AgentAccess.isTranslocated(bundlePath: "/Applications/JuiceMount.app"), "installed")
     }
 }

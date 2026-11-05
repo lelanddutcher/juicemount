@@ -12,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/lelanddutcher/juicemount/internal/version"
 )
 
 const (
@@ -91,6 +93,15 @@ func TestImportThenServe(t *testing.T) {
 	}
 	if len(lines) != 2 {
 		t.Fatalf("stdout carries %d lines: %q", len(lines), sout.String())
+	}
+	// serverInfo names the release and the source commit.
+	var init struct {
+		Result struct {
+			ServerInfo struct{ Version string } `json:"serverInfo"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal([]byte(lines[0]), &init); err != nil || init.Result.ServerInfo.Version != version.Version+"+"+version.Commit {
+		t.Fatalf("initialize: %s", lines[0])
 	}
 	var resp struct {
 		Result struct {

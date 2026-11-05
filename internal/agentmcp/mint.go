@@ -104,7 +104,8 @@ type StoreError struct {
 	// RevokeErr is nil when the token was revoked on the Manager (so no
 	// live token is left that nobody holds).
 	RevokeErr error
-	// Prev is the record stored before; PrevStored says there was one.
+	// Prev is the record stored before, when PrevStored: its ID at least
+	// (a TokenIDReader store says only that).
 	Prev       TokenRecord
 	PrevStored bool
 }
@@ -118,10 +119,11 @@ func (e *StoreError) Error() string {
 
 func (e *StoreError) Unwrap() error { return e.Err }
 
-// PrevRemoved reports whether the store removed the record it held before
-// it failed: that token is no longer here but still live on the Manager.
+// PrevRemoved reports whether the store removed a record it held before it
+// failed: that token is no longer here but still live on the Manager. It
+// holds whether or not the record could be read first (Prev may be empty).
 func (e *StoreError) PrevRemoved() bool {
-	return e.PrevStored && errors.Is(e.Err, ErrPreviousTokenRemoved)
+	return errors.Is(e.Err, ErrPreviousTokenRemoved)
 }
 
 // StoreMinted stores m, minted on the Manager at base, in store, replacing
@@ -129,16 +131,36 @@ func (e *StoreError) PrevRemoved() bool {
 // token (it stays valid on the Manager until revoked). When m cannot be
 // stored it is revoked with c, and the error is a *StoreError.
 func StoreMinted(ctx context.Context, c *Client, store TokenStore, base string, m Minted) (replaced *TokenRecord, err error) {
-	prev, perr := store.Load()
+	prev, havePrev := storedRecord(store)
 	rec := TokenRecord{ManagerURL: base, Token: m.Token, ID: m.View.ID, Name: m.View.Name, ExpiresAt: m.View.ExpiresAt}
 	if err := store.Save(rec); err != nil {
 		rerr := c.Do(ctx, http.MethodPost, "/api/agent-tokens/"+m.View.ID+"/revoke", nil, nil, nil)
-		return nil, &StoreError{ID: m.View.ID, Err: err, RevokeErr: rerr, Prev: prev, PrevStored: perr == nil}
+		return nil, &StoreError{ID: m.View.ID, Err: err, RevokeErr: rerr, Prev: prev, PrevStored: havePrev}
 	}
-	if perr == nil && prev.ID != m.View.ID {
+	if havePrev && prev.ID != m.View.ID {
 		return &prev, nil
 	}
 	return nil, nil
+}
+
+// TokenIDReader is a TokenStore that tells the stored token's ID without
+// reading the token: for the app, where reading the token of an item
+// another program made would show the Keychain's prompt. known is false
+// when the ID cannot be told that way (an item stored before IDs were kept
+// beside it); such a store is then never read for it.
+type TokenIDReader interface {
+	StoredID() (id string, known bool)
+}
+
+// storedRecord is the record stored in store, as far as it is known: a
+// TokenIDReader's ID alone, else the record Load reads.
+func storedRecord(store TokenStore) (TokenRecord, bool) {
+	if r, ok := store.(TokenIDReader); ok {
+		id, known := r.StoredID()
+		return TokenRecord{ID: id}, known && id != ""
+	}
+	rec, err := store.Load()
+	return rec, err == nil
 }
 
 // ListTokens lists this person's tokens with c, a Mac client.
@@ -167,17 +189,25 @@ func RevokeToken(ctx context.Context, c *Client, id string) (gone bool, err erro
 }
 
 // StoredTokenID is the ID of the token stored in store ("" when none, or
-// when it cannot be read).
+// when it cannot be told).
 func StoredTokenID(store TokenStore) string {
-	if r, err := store.Load(); err == nil {
-		return r.ID
-	}
-	return ""
+	r, _ := storedRecord(store)
+	return r.ID
 }
 
 // ForgetStored deletes the record in store when it is token id; deleted
-// reports whether it was.
+// reports whether it was. A TokenIDReader store whose ID is unknown is
+// left alone (its token is not read to find out).
 func ForgetStored(store TokenStore, id string) (deleted bool, err error) {
+	if ir, ok := store.(TokenIDReader); ok {
+		if stored, known := ir.StoredID(); !known || stored != id {
+			return false, nil
+		}
+		if err := store.Delete(); err != nil {
+			return false, fmt.Errorf("deleting the stored token: %w", err)
+		}
+		return true, nil
+	}
 	r, err := store.Load()
 	switch {
 	case errors.Is(err, ErrNoToken):

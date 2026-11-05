@@ -167,8 +167,24 @@ func (c *Client) Do(ctx context.Context, method, path string, q url.Values, body
 	return nil
 }
 
-// errorText is the Manager's {"error": ...} text, bounded and without
-// control characters, or the status text.
+// CleanText makes text the Manager supplies (an error, a token's or a
+// person's name) safe to show: control characters become spaces, and
+// format characters (Unicode Cf: bidi overrides, zero-width characters) are
+// dropped, so a name cannot reorder or hide what is shown around it.
+func CleanText(s string) string {
+	return strings.Map(func(r rune) rune {
+		switch {
+		case unicode.IsControl(r):
+			return ' '
+		case unicode.Is(unicode.Cf, r):
+			return -1
+		}
+		return r
+	}, s)
+}
+
+// errorText is the Manager's {"error": ...} text, bounded and cleaned
+// (CleanText), or the status text.
 func errorText(status int, raw []byte) string {
 	var e struct {
 		Error string `json:"error"`
@@ -177,12 +193,7 @@ func errorText(status int, raw []byte) string {
 	if json.Unmarshal(raw, &e) == nil {
 		msg = e.Error
 	}
-	msg = strings.Map(func(r rune) rune {
-		if unicode.IsControl(r) {
-			return ' '
-		}
-		return r
-	}, strings.TrimSpace(msg))
+	msg = strings.TrimSpace(CleanText(strings.TrimSpace(msg)))
 	if len(msg) > maxErrorText {
 		msg = strings.ToValidUTF8(msg[:maxErrorText], "") + "..."
 	}

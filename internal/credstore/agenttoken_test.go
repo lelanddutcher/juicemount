@@ -32,10 +32,10 @@ func TestAgentTokenFileRoundTrip(t *testing.T) {
 	if _, err := LoadAgentToken(); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("nothing stored: %v", err)
 	}
-	if err := SaveAgentToken(`{"token":"one"}`); err != nil {
+	if err := SaveAgentToken(`{"token":"one"}`, "1111111111111111"); err != nil {
 		t.Fatal(err)
 	}
-	if err := SaveAgentToken(`{"token":"two"}`); err != nil {
+	if err := SaveAgentToken(`{"token":"two"}`, "2222222222222222"); err != nil {
 		t.Fatal(err)
 	}
 	if got, err := LoadAgentToken(); err != nil || got != `{"token":"two"}` {
@@ -73,7 +73,7 @@ func TestAgentTokenFileRoundTrip(t *testing.T) {
 	if err := DeleteAgentToken(); err != nil {
 		t.Fatalf("deleting nothing: %v", err)
 	}
-	if err := SaveAgentToken(""); err == nil {
+	if err := SaveAgentToken("", ""); err == nil {
 		t.Fatal("an empty record was saved")
 	}
 }
@@ -113,7 +113,7 @@ func TestAppAgentTokenIsTheCLIItem(t *testing.T) {
 	if _, err := app.Load(); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("nothing stored: %v", err)
 	}
-	if err := app.Save(`{"token":"from-app"}`); err != nil {
+	if err := app.Save(`{"token":"from-app"}`, "aaaaaaaaaaaaaaaa"); err != nil {
 		t.Fatal(err)
 	}
 	if got, err := LoadAgentToken(); err != nil || got != `{"token":"from-app"}` {
@@ -122,7 +122,7 @@ func TestAppAgentTokenIsTheCLIItem(t *testing.T) {
 	if st, err := os.Stat(path); err != nil || st.Mode().Perm() != 0o600 {
 		t.Fatalf("file: %v", err)
 	}
-	if err := SaveAgentToken(`{"token":"from-cli"}`); err != nil {
+	if err := SaveAgentToken(`{"token":"from-cli"}`, "cccccccccccccccc"); err != nil {
 		t.Fatal(err)
 	}
 	if got, err := app.Load(); err != nil || got != `{"token":"from-cli"}` {
@@ -142,7 +142,59 @@ func TestAppAgentTokenIsTheCLIItem(t *testing.T) {
 	if err := app.Delete(); err != nil {
 		t.Fatalf("deleting nothing: %v", err)
 	}
-	if err := app.Save(""); err == nil {
+	if err := app.Save("", ""); err == nil {
 		t.Fatal("an empty record was saved")
+	}
+}
+
+// The stored token's ID is kept beside it (the Keychain label, the file's
+// id) and told without reading the token; an item from before has none and
+// reads as unknown ("").
+func TestStoredAgentTokenID(t *testing.T) {
+	uuid := "11111111-2222-3333-4444-555555555555"
+	path := agentTokenEnv(t, &uuid)
+	if id, err := StoredAgentTokenID(); err != nil || id != "" {
+		t.Fatalf("nothing stored: %q %v", id, err)
+	}
+	if err := (AppAgentToken{}).Save(`{"token":"t"}`, "fedcba9876543210"); err != nil {
+		t.Fatal(err)
+	}
+	if id, err := (AppAgentToken{}).StoredID(); err != nil || id != "fedcba9876543210" {
+		t.Fatalf("app's: %q %v", id, err)
+	}
+	if err := SaveAgentToken(`{"token":"t"}`, "0123456789abcdef"); err != nil {
+		t.Fatal(err)
+	}
+	if id, err := StoredAgentTokenID(); err != nil || id != "0123456789abcdef" {
+		t.Fatalf("CLI's: %q %v", id, err)
+	}
+	// An entry written before the ID was kept: unknown, not an error.
+	if err := saveFile(path, isolatedEntry{Account: agentTokenAccount, Secret: `{"token":"old"}`}); err != nil {
+		t.Fatal(err)
+	}
+	if id, err := StoredAgentTokenID(); err != nil || id != "" {
+		t.Fatalf("legacy: %q %v", id, err)
+	}
+	// Not an ID: not kept.
+	if err := SaveAgentToken(`{"token":"t"}`, "../x"); err != nil {
+		t.Fatal(err)
+	}
+	if id, _ := StoredAgentTokenID(); id != "" {
+		t.Fatalf("a bad ID was kept: %q", id)
+	}
+	uuid = "99999999-2222-3333-4444-555555555555"
+	if _, err := StoredAgentTokenID(); !errors.Is(err, ErrOtherDevice) {
+		t.Fatalf("other device: %v", err)
+	}
+}
+
+func TestAgentTokenLabel(t *testing.T) {
+	if l := AgentTokenLabel("fedcba9876543210"); l != "JuiceMount agent token fedcba9876543210 (juicemount-mcp)" || agentTokenIDFromLabel(l) != "fedcba9876543210" {
+		t.Fatalf("label %q", l)
+	}
+	for _, l := range []string{AgentTokenLabel(""), AgentTokenLabel("x y"), "JuiceMount agent token (juicemount-mcp)", "JuiceMount agent token FEDCBA9876543210 (juicemount-mcp)", ""} {
+		if id := agentTokenIDFromLabel(l); id != "" {
+			t.Errorf("%q names %q", l, id)
+		}
 	}
 }

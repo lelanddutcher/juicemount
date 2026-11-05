@@ -334,6 +334,14 @@ func TestStoreFailureAfterRemovingPrevious(t *testing.T) {
 	if err := e.tc.Create(context.Background(), "x", 0, false); err == nil || !strings.Contains(err.Error(), want) || !strings.Contains(err.Error(), "revoked on the Manager") {
 		t.Fatalf("create: %v", err)
 	}
+	// A store that removed a token it could not read first still says one
+	// may be live on the Manager.
+	e.store.rec = nil
+	e.store.saveErr = fmt.Errorf("%w (keychain add refused)", ErrPreviousTokenRemoved)
+	if err := e.tc.Import(context.Background(), strings.NewReader(mintedToken), e.mustMac(t).ManagerURL); err == nil ||
+		!strings.Contains(err.Error(), "A token stored here before was removed from this machine and may still be live on the Manager") {
+		t.Fatalf("import, unknown previous: %v", err)
+	}
 	// Another store failure removed nothing and says nothing about it.
 	e.store.saveErr = errors.New("keychain locked")
 	if err := e.tc.Import(context.Background(), strings.NewReader(mintedToken), e.mustMac(t).ManagerURL); err == nil || strings.Contains(err.Error(), "was removed") {

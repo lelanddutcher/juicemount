@@ -65,8 +65,8 @@ static OSStatus jm_keychain_read_ui(const char *service, const char *account,
 _Static_assert(errSecInteractionNotAllowed == -25308, "errSecInteractionNotAllowed");
 _Static_assert(errSecNoAccessForItem == -25243, "errSecNoAccessForItem");
 
-// jm_keychain_write updates the value, generic attribute and comment of the
-// item (service, account), or with add creates it. An added item gets the
+// jm_keychain_write updates the value, generic attribute, comment and label
+// of the item (service, account), or with add creates it. An added item gets the
 // default access list: the creating program only. The caller has set user
 // interaction (SecKeychainSetUserInteractionAllowed).
 static OSStatus jm_keychain_write(const char *service, const char *account, const char *label,
@@ -85,9 +85,9 @@ static OSStatus jm_keychain_write(const char *service, const char *account, cons
 			const void *qvals[] = { kSecClassGenericPassword, svc, acct };
 			CFDictionaryRef q = CFDictionaryCreate(NULL, qkeys, qvals, 3,
 			                                       &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
-			const void *ukeys[] = { kSecValueData, kSecAttrGeneric, kSecAttrComment };
-			const void *uvals[] = { val, gen, cmt };
-			CFDictionaryRef u = CFDictionaryCreate(NULL, ukeys, uvals, 3,
+			const void *ukeys[] = { kSecValueData, kSecAttrGeneric, kSecAttrComment, kSecAttrLabel };
+			const void *uvals[] = { val, gen, cmt, lbl };
+			CFDictionaryRef u = CFDictionaryCreate(NULL, ukeys, uvals, 4,
 			                                       &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
 			st = SecItemUpdate(q, u);
 			CFRelease(q); CFRelease(u);
@@ -127,6 +127,49 @@ static OSStatus jm_keychain_delete(const char *service, const char *account, int
 	OSStatus st = SecItemDelete(q);
 	CFRelease(q); CFRelease(svc); CFRelease(acct);
 	return st;
+}
+
+static char *jm_agent_copy_string(CFTypeRef v) {
+	if (v == NULL || CFGetTypeID(v) != CFStringGetTypeID()) return NULL;
+	CFIndex max = CFStringGetMaximumSizeForEncoding(CFStringGetLength((CFStringRef)v), kCFStringEncodingUTF8) + 1;
+	char *buf = malloc(max);
+	if (buf != NULL && CFStringGetCString((CFStringRef)v, buf, max, kCFStringEncodingUTF8)) return buf;
+	free(buf);
+	return NULL;
+}
+
+// jm_keychain_read_attrs reads the generic attribute, label and comment of
+// the item (service, account), never its data: the legacy keychain checks
+// an item's access list only to hand out its data, so this shows no prompt.
+// It leaves the process's user-interaction setting as it is.
+static OSStatus jm_keychain_read_attrs(const char *service, const char *account,
+                                       char **generic, int *genericLen, char **label, char **comment) {
+	CFStringRef svc = CFStringCreateWithCString(NULL, service, kCFStringEncodingUTF8);
+	CFStringRef acct = CFStringCreateWithCString(NULL, account, kCFStringEncodingUTF8);
+	*generic = NULL; *genericLen = -1; *label = NULL; *comment = NULL;
+	if (svc == NULL || acct == NULL) {
+		if (svc) CFRelease(svc);
+		if (acct) CFRelease(acct);
+		return errSecAllocate;
+	}
+	const void *keys[] = { kSecClass, kSecAttrService, kSecAttrAccount, kSecReturnAttributes, kSecMatchLimit };
+	const void *vals[] = { kSecClassGenericPassword, svc, acct, kCFBooleanTrue, kSecMatchLimitOne };
+	CFDictionaryRef q = CFDictionaryCreate(NULL, keys, vals, 5,
+	                                       &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+	CFTypeRef result = NULL;
+	OSStatus st = SecItemCopyMatching(q, &result);
+	CFRelease(q); CFRelease(svc); CFRelease(acct);
+	if (st != errSecSuccess) return st;
+	if (result == NULL || CFGetTypeID(result) != CFDictionaryGetTypeID()) {
+		if (result) CFRelease(result);
+		return errSecDecode;
+	}
+	CFDictionaryRef d = (CFDictionaryRef)result;
+	*generic = jm_agent_copy_data((CFDataRef)CFDictionaryGetValue(d, kSecAttrGeneric), genericLen);
+	*label = jm_agent_copy_string(CFDictionaryGetValue(d, kSecAttrLabel));
+	*comment = jm_agent_copy_string(CFDictionaryGetValue(d, kSecAttrComment));
+	CFRelease(result);
+	return errSecSuccess;
 }
 
 // jm_keychain_add_trusting adds the item (service, account) with an access
@@ -208,6 +251,37 @@ func keychainLoadAsIs(service, slot, account string) (secret, stamp string, err 
 	return keychainLoadUI(service, slot, account, -1)
 }
 
+// keychainReadAttributes returns the label and comment of the item
+// (service, slot) bound to account, without its data (no prompt).
+func keychainReadAttributes(service, slot, account string) (label, comment string, err error) {
+	cs, cslot := C.CString(service), C.CString(slot)
+	defer C.free(unsafe.Pointer(cs))
+	defer C.free(unsafe.Pointer(cslot))
+	var generic, clabel, ccomment *C.char
+	var genericLen C.int
+	st := C.jm_keychain_read_attrs(cs, cslot, &generic, &genericLen, &clabel, &ccomment)
+	defer C.free(unsafe.Pointer(generic))
+	defer C.free(unsafe.Pointer(clabel))
+	defer C.free(unsafe.Pointer(ccomment))
+	switch st {
+	case C.errSecSuccess:
+	case C.errSecItemNotFound:
+		return "", "", ErrNotFound
+	default:
+		return "", "", fmt.Errorf("keychain attribute read refused (OSStatus %d)", int(st))
+	}
+	if generic == nil || genericLen < 0 || C.GoStringN(generic, genericLen) != account {
+		return "", "", ErrNotFound
+	}
+	if clabel != nil {
+		label = C.GoString(clabel)
+	}
+	if ccomment != nil {
+		comment = C.GoString(ccomment)
+	}
+	return label, comment, nil
+}
+
 func keychainLoadUI(service, slot, account string, ui C.int) (secret, stamp string, err error) {
 	cs, cslot := C.CString(service), C.CString(slot)
 	defer C.free(unsafe.Pointer(cs))
@@ -242,9 +316,9 @@ func keychainLoadUI(service, slot, account string, ui C.int) (secret, stamp stri
 // lets the Keychain ask the person; an item this build may not update (one
 // another build made) is then deleted and added again, but only for the
 // statuses keychainFallback names, never after the person denied access.
-func keychainSave(service, slot, account, secret, device string, allowUI bool) error {
+func keychainSave(service, slot, account, label, secret, device string, allowUI bool) error {
 	cs, cslot := C.CString(service), C.CString(slot)
-	clabel := C.CString("JuiceMount agent token (juicemount-mcp)")
+	clabel := C.CString(label)
 	cgen, csecret := C.CString(account), C.CString(secret)
 	ccomment := C.CString("")
 	if device != "" {
@@ -310,9 +384,9 @@ func keychainDeleteUI(service, slot string, ui C.int) error {
 // `juicemount-mcp token create` trusts only that build of the CLI). It leaves
 // the process's user-interaction setting as it is: the app, where a person
 // can answer the Keychain's prompt for an item another program made.
-func keychainReplaceTrusting(service, slot, account, secret, device string, trusted []string) error {
+func keychainReplaceTrusting(service, slot, account, label, secret, device string, trusted []string) error {
 	cs, cslot := C.CString(service), C.CString(slot)
-	clabel := C.CString("JuiceMount agent token (juicemount-mcp)")
+	clabel := C.CString(label)
 	cgen, csecret := C.CString(account), C.CString(secret)
 	ccomment := C.CString("")
 	if device != "" {

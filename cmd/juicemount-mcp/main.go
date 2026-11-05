@@ -124,7 +124,7 @@ func serve(ctx context.Context, args []string, stdin io.Reader, stdout, stderr i
 			logger.Print(w)
 		}
 	}
-	srv := &agentmcp.Server{Tools: tools, Log: logger, Version: version.Version}
+	srv := &agentmcp.Server{Tools: tools, Log: logger, Version: serverVersion()}
 	done := make(chan error, 1)
 	go func() { done <- srv.Serve(ctx, stdin, stdout) }()
 	select {
@@ -142,6 +142,11 @@ func serve(ctx context.Context, args []string, stdin io.Reader, stdout, stderr i
 		return nil
 	}
 }
+
+// serverVersion is serverInfo.version: the release and the source commit it
+// was built from (both stamped by build-app.sh, and checked in the bundle by
+// verify-build.sh).
+func serverVersion() string { return version.Version + "+" + version.Commit }
 
 // sleepCtx waits d, or until ctx ends.
 func sleepCtx(ctx context.Context) func(time.Duration) {
@@ -238,7 +243,7 @@ func macCredentials() (agentmcp.MacCredentials, error) {
 type keychainStore struct{}
 
 func (keychainStore) Save(r agentmcp.TokenRecord) error {
-	err := credstore.SaveAgentToken(r.Encode())
+	err := credstore.SaveAgentToken(r.Encode(), r.ID)
 	if errors.Is(err, credstore.ErrStoredRecordRemoved) {
 		return fmt.Errorf("%w (%v)", agentmcp.ErrPreviousTokenRemoved, err)
 	}

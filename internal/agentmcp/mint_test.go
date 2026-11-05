@@ -60,3 +60,80 @@ func TestMintSharedPieces(t *testing.T) {
 	}
 	e.noSecrets(t, false)
 }
+
+// idStore is a TokenIDReader: its token is never read.
+type idStore struct {
+	t       *testing.T
+	id      string
+	known   bool
+	saveErr error
+	deleted bool
+}
+
+func (s *idStore) Save(r TokenRecord) error {
+	if s.saveErr != nil {
+		return s.saveErr
+	}
+	s.id, s.known = r.ID, true
+	return nil
+}
+
+func (s *idStore) Load() (TokenRecord, error) {
+	s.t.Error("the stored token was read; its ID is beside it")
+	return TokenRecord{}, errors.New("read")
+}
+
+func (s *idStore) Delete() error { s.deleted = true; return nil }
+
+func (s *idStore) StoredID() (string, bool) { return s.id, s.known }
+
+// A store that tells the stored token's ID without reading it (the app,
+// where reading an item another program made prompts) is never read: not to
+// list, not to replace, not to forget.
+func TestTokenIDReaderNeverRead(t *testing.T) {
+	e := newTokenEnv(t)
+	c := NewMacClient(e.mustMac(t), e.tc.HTTP)
+	m := Minted{Token: mintedToken, View: TokenView{ID: mintedID, Name: "x"}}
+	s := &idStore{t: t, id: "1111111111111111", known: true}
+	if got := StoredTokenID(s); got != "1111111111111111" {
+		t.Fatalf("stored ID %q", got)
+	}
+	replaced, err := StoreMinted(context.Background(), c, s, "http://nas.example:30190", m)
+	if err != nil || replaced == nil || replaced.ID != "1111111111111111" || s.id != mintedID {
+		t.Fatalf("store: %+v %v", replaced, err)
+	}
+	if deleted, err := ForgetStored(s, "aaaaaaaaaaaaaaaa"); err != nil || deleted || s.deleted {
+		t.Fatalf("forget another: %v %v", deleted, err)
+	}
+	if deleted, err := ForgetStored(s, mintedID); err != nil || !deleted || !s.deleted {
+		t.Fatalf("forget stored: %v %v", deleted, err)
+	}
+	// An item without a known ID (stored before IDs were kept beside it) is
+	// unknown, never read, and never deleted on a guess.
+	legacy := &idStore{t: t, known: false}
+	if got := StoredTokenID(legacy); got != "" {
+		t.Fatalf("legacy stored ID %q", got)
+	}
+	if deleted, err := ForgetStored(legacy, mintedID); err != nil || deleted || legacy.deleted {
+		t.Fatalf("forget legacy: %v %v", deleted, err)
+	}
+	// A failed store that removed the unknown item before it says so.
+	legacy.saveErr = fmt.Errorf("%w (keychain)", ErrPreviousTokenRemoved)
+	e.f.on("POST /manager/api/agent-tokens/"+mintedID+"/revoke", 200, map[string]string{"revoked": mintedID})
+	_, err = StoreMinted(context.Background(), c, legacy, "http://nas.example:30190", m)
+	var se *StoreError
+	if !errors.As(err, &se) || !se.PrevRemoved() || se.PrevStored {
+		t.Fatalf("removed unknown: %v %+v", err, se)
+	}
+}
+
+// Text the Manager supplies loses control and format characters (bidi
+// overrides, zero-width), so it cannot reorder or hide what is around it.
+func TestCleanText(t *testing.T) {
+	if got := CleanText("Ann‮⁦gpj.exe​⁩\x07x"); got != "Anngpj.exe x" {
+		t.Fatalf("CleanText = %q", got)
+	}
+	if got := errorText(400, []byte("{\"error\":\" name‮ too long‍ \"}")); got != "name too long" {
+		t.Fatalf("errorText = %q", got)
+	}
+}

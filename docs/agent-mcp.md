@@ -29,11 +29,18 @@ on; otherwise it says why not.
   and expires; **On this Mac** marks the one stored here. **Revoke** stops a
   token at once, and deletes it here when it is the stored one.
 - **Copy Claude Desktop config** and **Copy Claude Code command** put the setup
-  for the bundled server and your mount point on the clipboard (below).
+  for the bundled server and your mount point (made absolute, `~` expanded) on
+  the clipboard (below). If macOS runs JuiceMount from a temporary location
+  (an app opened from Downloads), they ask you to move it to Applications
+  first: a copied temporary path would stop working.
 
 The app keeps the token in a Keychain item whose access list trusts the app
 and the bundled `juicemount-mcp`, so `serve` reads it without asking, and the
-app's own enrollment record is never opened to another program. This needs
+app's own enrollment record is never opened to another program. The item's
+label names the token's ID (not secret), so Settings tells which token is on
+this Mac without reading the token itself, and never prompts for it; an item
+stored before this release shows no token as on this Mac until you create
+one. This needs
 the release build (Developer ID): for an ad-hoc build macOS refuses even a
 listed program, and `serve` cannot read the token.
 
