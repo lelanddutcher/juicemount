@@ -633,6 +633,10 @@ func TestCollectionsMacDeviceAndBudget(t *testing.T) {
 	// not starve another Mac at the same address; an address has a looser
 	// one before the token is checked.
 	h := newCollectionsAPI(e.a, "/manager", e.people)
+	// A stopped clock: no tokens refill while the test runs (slow under -race).
+	frozen := time.Now()
+	h.macLimit.now = func() time.Time { return frozen }
+	h.ipLimit.now = h.macLimit.now
 	send := func(who, token string) int {
 		m := e.macs[who]
 		if token == "" {
@@ -659,7 +663,7 @@ func TestCollectionsMacDeviceAndBudget(t *testing.T) {
 	if code := send("Al", ""); code != 200 {
 		t.Fatalf("another Mac at the same address: %d", code)
 	}
-	h.ipLimit = newIPLimiter(2, time.Now)
+	h.ipLimit = newIPLimiter(2, h.macLimit.now)
 	if a, b, c := send("Al", ""), send("Al", ""), send("Al", strings.Repeat("0", 64)); a != 200 || b != 200 || c != 429 {
 		t.Fatalf("address budget: %d %d %d", a, b, c)
 	}
