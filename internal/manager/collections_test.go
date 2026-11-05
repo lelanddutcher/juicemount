@@ -437,6 +437,27 @@ func TestCollectionsMembersResolveLive(t *testing.T) {
 	e.write("admin", "/api/collections/"+string(id)+"/members/add", map[string]any{"members": []map[string]string{{"asset_id": string(asset), "path": "Clients/A/sub/four.mov"}}}, 400)
 }
 
+// A save that writes a temp file and renames it over the document gives
+// the file a new inode; the member is the same asset, still present, and
+// the grant check follows the new inode.
+func TestCollectionsMemberSurvivesAtomicSave(t *testing.T) {
+	e := newCollectionsEnv(t)
+	one := binder.AssetID(e.vol.VolumeUUID(), 42)
+	id := e.write("admin", "/api/collections", map[string]any{"name": "Cut", "members": pathRefs("Clients/A/one.mov")}, 200).Collection.ID
+	e.vol.set(func(f map[string]uint64) { f["Clients/A/one.mov"] = 50 })
+	e.offer(binder.Event{Op: "rename", Path: "Clients/A/one.mov", OldPath: "Clients/A/.one.mov.tmp", Inode: 50})
+	got := e.members(id, "")
+	if len(got.Members) != 1 || got.Members[0].AssetID != one || got.Members[0].State != "present" || got.Members[0].Path != "Clients/A/one.mov" {
+		t.Fatalf("after an atomic save: %+v", got)
+	}
+	// Adding by path finds the same asset: nothing is added.
+	if r := e.write("admin", "/api/collections/"+string(id)+"/members/add", map[string]any{"members": pathRefs("Clients/A/one.mov")}, 200); r.Collection.Members != 1 {
+		t.Fatalf("re-add by path: %+v", r)
+	}
+	e.write("Bob", "/api/collections/"+string(id)+"/members/remove", map[string]any{"members": assetRefs(one)}, 403)
+	e.write("Ann", "/api/collections/"+string(id)+"/members/remove", map[string]any{"members": assetRefs(one)}, 200)
+}
+
 func TestCollectionsRetriesAreIdempotent(t *testing.T) {
 	e := newCollectionsEnv(t)
 	ctx := context.Background()

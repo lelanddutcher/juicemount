@@ -42,11 +42,23 @@ const (
 	// and the event counts as too_many_links, without retries.
 	MaxLinks = 64
 
+	// MergedInto is the predicate of the relationship a merge records from
+	// the retired provisional asset to the asset that continued (README.md).
+	MergedInto = "continuity:merged-into"
+
 	maxHintBytes     = 4096 // longer paths are not catalogued
 	maxAttempts      = 3    // plan/apply rounds before a conflict counts as a failure
 	defaultPathCache = 1 << 16
 	defaultRetryMax  = time.Minute
 	logEvery         = time.Minute
+
+	// defaultSafeSaveWindow: how long a rename to a sibling name stays a
+	// candidate backup of a safe save (the save deletes it within it).
+	defaultSafeSaveWindow = 30 * time.Second
+	// defaultProvisionalAge: a file bound this recently, under its own
+	// asset, may be merged into the asset of the file it replaced.
+	defaultProvisionalAge = time.Hour
+	maxMoves              = 1024
 )
 
 // eventRetries are the pauses before re-running an event whose volume reads
@@ -105,8 +117,13 @@ type Config struct {
 	QueueSize     int
 	PathCacheSize int           // recent path -> inode entries (default 65,536)
 	RetryMax      time.Duration // connect backoff cap (default 1 min)
-	Logf          func(format string, args ...any)
-	Now           func() time.Time
+	// SafeSaveWindow bounds a safe save's rename-away, rename-in and delete
+	// (default 30 s); ProvisionalAge is how recently a replacing file must
+	// have been bound for its asset to be merged (default 1 h). README.md.
+	SafeSaveWindow time.Duration
+	ProvisionalAge time.Duration
+	Logf           func(format string, args ...any)
+	Now            func() time.Time
 }
 
 type volume struct {
@@ -130,8 +147,12 @@ type Binder struct {
 	// Worker-only: recently observed path -> inode, to notice a file that
 	// a rename (or a create) replaced, which publishes no delete event.
 	paths *pathCache
+	// Worker-only: files just renamed to a sibling name (a safe save's
+	// backup), by inode.
+	moves map[uint64]move
 
 	received, handled, dropped, discarded, applied, ignored, failed, retried, unresolved, tooManyLinks, resubscribes atomic.Uint64
+	continued, merged, notContinued                                                                                  atomic.Uint64
 
 	observedSince atomic.Int64 // unix nanoseconds
 
@@ -153,6 +174,12 @@ func New(cfg Config) (*Binder, error) {
 	if cfg.RetryMax <= 0 {
 		cfg.RetryMax = defaultRetryMax
 	}
+	if cfg.SafeSaveWindow <= 0 {
+		cfg.SafeSaveWindow = defaultSafeSaveWindow
+	}
+	if cfg.ProvisionalAge <= 0 {
+		cfg.ProvisionalAge = defaultProvisionalAge
+	}
 	if cfg.Logf == nil {
 		cfg.Logf = log.Printf
 	}
@@ -169,6 +196,7 @@ func New(cfg Config) (*Binder, error) {
 		queue:   make(chan Event, cfg.QueueSize),
 		ready:   make(chan struct{}),
 		paths:   newPathCache(cfg.PathCacheSize),
+		moves:   map[uint64]move{},
 		lastLog: map[string]time.Time{},
 	}, nil
 }
@@ -207,6 +235,7 @@ func (b *Binder) Run(ctx context.Context) {
 	if v == nil {
 		return
 	}
+	b.warm(ctx, v)
 	for {
 		select {
 		case <-ctx.Done():
@@ -307,6 +336,20 @@ func LocationID(volumeUUID string, ino uint64) string {
 // HintID names the path-hint location record of an inode of a volume.
 func HintID(volumeUUID string, ino uint64) string { return LocationID(volumeUUID, ino) + "-hint" }
 
+// ContinuationID names the inode location an inode gets when a merge gives
+// it another asset than the one its LocationID record already holds (a
+// location's asset never changes); ContinuationHintID its hint. Once it
+// exists, this pair is the inode's binding.
+func ContinuationID(volumeUUID string, ino uint64) string {
+	return LocationID(volumeUUID, ino) + "-c"
+}
+func ContinuationHintID(volumeUUID string, ino uint64) string {
+	return ContinuationID(volumeUUID, ino) + "-hint"
+}
+
+// mergeID names the relationship a merge onto an inode records.
+func mergeID(volumeUUID string, ino uint64) string { return LocationID(volumeUUID, ino) + "-merge" }
+
 // Source is the inode locations' source; HintSource the path hints'.
 func Source(volumeUUID string) string     { return "jfs:" + volumeUUID }
 func HintSource(volumeUUID string) string { return "jfs-path:" + volumeUUID }
@@ -357,10 +400,17 @@ func (b *Binder) apply(ctx context.Context, v *volume, ev Event) error {
 			b.ignored.Add(1)
 			return nil
 		}
-		if old, ok := cleanPath(ev.OldPath); ok && ev.Op == "rename" {
-			b.paths.remove(old)
+		old, renamed := cleanPath(ev.OldPath)
+		if !renamed || ev.Op != "rename" {
+			return b.observe(ctx, v, p)
 		}
-		return b.observe(ctx, v, p)
+		moved, known := b.paths.get(old)
+		b.paths.remove(old)
+		err := b.observe(ctx, v, p)
+		if known && old != p && path.Dir(old) == path.Dir(p) {
+			b.noteMove(moved, old, p)
+		}
+		return err
 	case "delete":
 		return b.unlinked(ctx, v, ev)
 	default:
@@ -394,8 +444,15 @@ func (b *Binder) observe(ctx context.Context, v *volume, p string) error {
 		return err
 	}
 	if prev, ok := b.paths.get(p); ok && prev != n.Ino {
-		if _, err := b.sync(ctx, v, prev, ""); err != nil {
+		// p named prev and no event said prev left: a rename over it.
+		cont, err := b.replaced(ctx, v, prev, n.Ino, p)
+		if err != nil {
 			return err
+		}
+		if !cont {
+			if _, err := b.sync(ctx, v, prev, ""); err != nil {
+				return err
+			}
 		}
 	}
 	b.paths.put(p, n.Ino)
@@ -423,6 +480,14 @@ func (b *Binder) unlinked(ctx context.Context, v *volume, ev Event) error {
 	}
 	found := false
 	for _, ino := range candidates {
+		cont, err := b.safeSave(ctx, v, ino)
+		if err != nil {
+			return err
+		}
+		if cont {
+			found = true
+			continue
+		}
 		f, err := b.sync(ctx, v, ino, "")
 		if err != nil {
 			return err
@@ -442,18 +507,15 @@ func (b *Binder) unlinked(ctx context.Context, v *volume, ev Event) error {
 // only updates an inode that already has a location (found reports that);
 // with observed (a visible path just resolved to it) it may also bind.
 func (b *Binder) sync(ctx context.Context, v *volume, ino uint64, observed string) (found bool, err error) {
-	inoLoc, hintLoc, err := b.records(ctx, v, ino)
+	s, err := b.records(ctx, v, ino)
 	if err != nil {
 		return false, err
 	}
-	found = inoLoc != nil
+	found = s.ino != nil
 	if !found && observed == "" {
 		return false, nil
 	}
-	hint := ""
-	if hintLoc != nil && !hintLoc.Removed {
-		hint = hintLoc.Value.Locator
-	}
+	hint := s.activeHint()
 	live, name, err := b.where(v, ino, hint, observed)
 	if err != nil {
 		return found, err
@@ -513,7 +575,34 @@ func names(v *volume, p string, ino uint64) (bool, error) {
 	return n.Ino == ino, nil
 }
 
-func (b *Binder) records(ctx context.Context, v *volume, ino uint64) (inoLoc, hintLoc *catalog.Location, err error) {
+// slot is the pair of location records that binds an inode: its inode
+// location and its hint. It is the LocationID pair, or the ContinuationID
+// pair once a merge created it.
+type slot struct {
+	inoID, hintID string
+	cont          bool
+	ino, hint     *catalog.Location // nil when absent
+}
+
+func (s slot) activeHint() string {
+	if s.hint != nil && !s.hint.Removed {
+		return s.hint.Value.Locator
+	}
+	return ""
+}
+
+// kind prefixes an operation kind on the continuation pair, so its
+// operation IDs never meet the first pair's.
+func (s slot) kind(k string) string {
+	if s.cont {
+		return "cont-" + k
+	}
+	return k
+}
+
+// records reads the slot binding an inode: the continuation pair if it
+// exists, else the first pair (records absent when never bound).
+func (b *Binder) records(ctx context.Context, v *volume, ino uint64) (slot, error) {
 	get := func(id string) (*catalog.Location, error) {
 		l, err := b.cfg.Store.GetLocation(ctx, b.library, id)
 		if errors.Is(err, catalog.ErrNotFound) {
@@ -524,11 +613,19 @@ func (b *Binder) records(ctx context.Context, v *volume, ino uint64) (inoLoc, hi
 		}
 		return &l, nil
 	}
-	if inoLoc, err = get(LocationID(v.uuid, ino)); err != nil {
-		return nil, nil, err
+	s := slot{inoID: ContinuationID(v.uuid, ino), hintID: ContinuationHintID(v.uuid, ino), cont: true}
+	var err error
+	if s.ino, err = get(s.inoID); err != nil {
+		return slot{}, err
 	}
-	hintLoc, err = get(HintID(v.uuid, ino))
-	return inoLoc, hintLoc, err
+	if s.ino == nil {
+		s = slot{inoID: LocationID(v.uuid, ino), hintID: HintID(v.uuid, ino)}
+		if s.ino, err = get(s.inoID); err != nil {
+			return slot{}, err
+		}
+	}
+	s.hint, err = get(s.hintID)
+	return s, err
 }
 
 // converge plans from the current catalog state and applies, re-planning
@@ -577,10 +674,11 @@ func expected(l *catalog.Location) *catalog.LocationExpected {
 // The asset is created once (labelled with the file name) and never
 // renamed: its label belongs to people.
 func (b *Binder) plan(ctx context.Context, v *volume, ino uint64, live bool, name string) (*catalog.Operation, error) {
-	inoLoc, hintLoc, err := b.records(ctx, v, ino)
+	s, err := b.records(ctx, v, ino)
 	if err != nil {
 		return nil, err
 	}
+	inoLoc, hintLoc := s.ino, s.hint
 	var changes []catalog.Change
 	kind := "unlink"
 	if !live {
@@ -604,7 +702,7 @@ func (b *Binder) plan(ctx context.Context, v *volume, ino uint64, live bool, nam
 			} else if err != nil {
 				return nil, err
 			}
-			changes = append(changes, catalog.Change{PutLocation: &catalog.PutLocation{ID: LocationID(v.uuid, ino), Value: value}})
+			changes = append(changes, catalog.Change{PutLocation: &catalog.PutLocation{ID: s.inoID, Value: value}})
 		case inoLoc.Removed:
 			kind = "revive"
 			changes = append(changes, catalog.Change{PutLocation: &catalog.PutLocation{ID: inoLoc.ID, Expected: expected(inoLoc), Value: inoLoc.Value}})
@@ -613,7 +711,7 @@ func (b *Binder) plan(ctx context.Context, v *volume, ino uint64, live bool, nam
 		}
 		switch {
 		case hintLoc == nil:
-			changes = append(changes, catalog.Change{PutLocation: &catalog.PutLocation{ID: HintID(v.uuid, ino), Value: hintValue}})
+			changes = append(changes, catalog.Change{PutLocation: &catalog.PutLocation{ID: s.hintID, Value: hintValue}})
 		case hintLoc.Removed || hintLoc.Value != hintValue:
 			changes = append(changes, catalog.Change{PutLocation: &catalog.PutLocation{ID: hintLoc.ID, Expected: expected(hintLoc), Value: hintValue}})
 		}
@@ -624,7 +722,7 @@ func (b *Binder) plan(ctx context.Context, v *volume, ino uint64, live bool, nam
 	return &catalog.Operation{
 		Version:   catalog.OperationVersion,
 		LibraryID: b.library,
-		ID:        operationID(v, ino, kind, seq(inoLoc), seq(hintLoc)),
+		ID:        operationID(v, ino, s.kind(kind), seq(inoLoc), seq(hintLoc)),
 		Actor:     Actor,
 		Changes:   changes,
 	}, nil

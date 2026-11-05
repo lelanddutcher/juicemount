@@ -195,3 +195,37 @@ func (s *Store) ListLocationRecords(ctx context.Context, library continuity.Libr
 	}
 	return result, nil
 }
+
+// ListSourceLocations lists the active locations of one source across all
+// assets, in location ID order. The source is not indexed: each page walks
+// the locations in ID order, so callers page through it rarely (the volume
+// binder does once at start).
+func (s *Store) ListSourceLocations(ctx context.Context, library continuity.LibraryID, source string, afterID string, limit int) ([]Location, error) {
+	if err := s.enter(); err != nil {
+		return nil, err
+	}
+	defer s.leave()
+	if err := s.requireLibrary(library); err != nil {
+		return nil, err
+	}
+	if !validText(source, 256, true) || !validPage(limit) || (afterID != "" && !validOperationID(afterID)) {
+		return nil, invalid("location page")
+	}
+	rows, err := s.db.QueryContext(ctx, locationSelect+` WHERE l.removed=0 AND l.source=? AND l.location_id>? ORDER BY l.location_id LIMIT ?`, source, afterID, limit)
+	if err != nil {
+		return nil, formatError(err)
+	}
+	defer rows.Close()
+	result := make([]Location, 0, limit)
+	for rows.Next() {
+		l, err := scanLocation(rows, library)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, l)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, formatError(err)
+	}
+	return result, nil
+}

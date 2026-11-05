@@ -27,7 +27,14 @@ type Stats struct {
 	// PathCacheEvictions: recent paths forgotten, so a file later replaced
 	// at one of them (rename over it) is not noticed.
 	PathCacheEvictions uint64 `json:"path_cache_evictions"`
-	Complete           bool   `json:"complete"`
+	// Continued: replaced files whose asset the new file continued (a save
+	// by rename); Merged: of those, the new file's provisional asset was
+	// retired into it. NotContinued: replacements left as two assets (the
+	// new file is hard-linked or has an established asset of its own).
+	Continued    uint64 `json:"continued"`
+	Merged       uint64 `json:"merged"`
+	NotContinued uint64 `json:"not_continued"`
+	Complete     bool   `json:"complete"`
 }
 
 func (b *Binder) Stats() Stats {
@@ -49,6 +56,9 @@ func (b *Binder) Stats() Stats {
 		Resubscribes: b.resubscribes.Load(),
 
 		PathCacheEvictions: b.paths.evictions.Load(),
+		Continued:          b.continued.Load(),
+		Merged:             b.merged.Load(),
+		NotContinued:       b.notContinued.Load(),
 	}
 	if ns := b.observedSince.Load(); ns != 0 {
 		s.ObservedSince = time.Unix(0, ns).UTC()

@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -108,6 +109,7 @@ type fixture struct {
 	store *catalog.Store
 	lib   continuity.LibraryID
 	b     *Binder
+	cfg   Config
 	stop  func()
 	sent  int
 }
@@ -135,19 +137,36 @@ func newFixtureWith(t *testing.T, cfg Config, run bool) *fixture {
 	f.store, f.lib = newStore(t)
 	cfg.Store, cfg.Logf = f.store, t.Logf
 	cfg.Connect = func() (Volume, error) { return jfsmeta.OpenReadOnly(url) }
-	b, err := New(cfg)
+	f.cfg = cfg
+	f.start(run)
+	return f
+}
+
+// start builds a binder from f.cfg (a fresh one: empty path cache, zero
+// counters) and runs it unless run is false.
+func (f *fixture) start(run bool) {
+	f.t.Helper()
+	b, err := New(f.cfg)
 	if err != nil {
-		t.Fatal(err)
+		f.t.Fatal(err)
 	}
-	f.b = b
+	f.b, f.sent = b, 0
 	if run {
 		ctx, cancel := context.WithCancel(context.Background())
 		done := make(chan struct{})
 		go func() { defer close(done); b.Run(ctx) }()
-		f.stop = func() { cancel(); <-done; _ = b.Close() }
-		t.Cleanup(f.stop)
+		var once sync.Once
+		f.stop = func() { once.Do(func() { cancel(); <-done; _ = b.Close() }) }
+		f.t.Cleanup(f.stop)
 	}
-	return f
+}
+
+// restart stops the binder and starts another over the same catalog and
+// volume, as a Manager restart does.
+func (f *fixture) restart() {
+	f.t.Helper()
+	f.stop()
+	f.start(true)
 }
 
 func newStore(t *testing.T) (*catalog.Store, continuity.LibraryID) {
@@ -612,22 +631,6 @@ func TestHardLinks(t *testing.T) {
 	f.requireRemoved(ino)
 }
 
-func TestRenameOverRetiresReplacedFile(t *testing.T) {
-	f := newFixture(t, 0, true)
-	old := f.create("Projects/edit.prproj")
-	f.feed(Event{Op: "create", Path: "Projects/edit.prproj", Inode: old})
-	// The usual save: write a temp file, rename it over the original. No
-	// delete event is published for the replaced file.
-	tmp := f.create("Projects/.edit.prproj.tmp")
-	f.rename("Projects/.edit.prproj.tmp", "Projects/edit.prproj")
-	f.feed(
-		Event{Op: "create", Path: "Projects/.edit.prproj.tmp", Inode: tmp},
-		Event{Op: "rename", Path: "Projects/edit.prproj", OldPath: "Projects/.edit.prproj.tmp", Inode: tmp},
-	)
-	f.requireBound(tmp, "Projects/edit.prproj", "edit.prproj")
-	f.requireRemoved(old)
-}
-
 // S2: the path cache is a bounded LRU; evictions are counted, and an
 // evicted path's replacement is not noticed.
 func TestPathCacheIsLRUAndCountsEvictions(t *testing.T) {
@@ -655,6 +658,12 @@ func TestPathCacheIsLRUAndCountsEvictions(t *testing.T) {
 	f.feed(Event{Op: "rename", Path: "P/edit.prproj", OldPath: "P/.tmp", Inode: tmp})
 	if l := f.location(LocationID(testUUID, old)); l.Removed {
 		t.Fatal("an evicted path's replaced file was noticed; the test is not exercising eviction")
+	}
+	// The fallback: the new file gets an asset of its own (the replaced
+	// one's stays active until a rescan); the eviction is what is counted.
+	f.requireBound(tmp, "P/edit.prproj", "edit.prproj")
+	if s := f.stats(); s["continued"] != 0 || s["path_cache_evictions"] != 2 {
+		t.Fatalf("stats %v", s)
 	}
 }
 
