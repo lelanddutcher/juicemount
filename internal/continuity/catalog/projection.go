@@ -61,6 +61,15 @@ type collectionProjection struct {
 	UpdatedSequence int64                `json:"updated_sequence"`
 	Removed         bool                 `json:"removed"`
 }
+type queryProjection struct {
+	LibraryID       continuity.LibraryID `json:"library_id"`
+	QueryID         QueryID              `json:"query_id"`
+	Name            string               `json:"name"`
+	Definition      QueryDefinition      `json:"definition"`
+	CreatedSequence int64                `json:"created_sequence"`
+	UpdatedSequence int64                `json:"updated_sequence"`
+	Removed         bool                 `json:"removed"`
+}
 type memberProjection struct {
 	LibraryID       continuity.LibraryID `json:"library_id"`
 	CollectionID    CollectionID         `json:"collection_id"`
@@ -89,7 +98,7 @@ func walkRows(ctx context.Context, q queryer, query string, fn func(*sql.Rows) e
 
 func projectionTotal(ctx context.Context, q queryer) (int64, error) {
 	var count int64
-	err := q.QueryRowContext(ctx, `SELECT (SELECT count(*) FROM catalog)+(SELECT count(*) FROM assets)+(SELECT count(*) FROM revisions)+(SELECT count(*) FROM revision_parents)+(SELECT count(*) FROM relationships)+(SELECT count(*) FROM locations)+(SELECT count(*) FROM collections)+(SELECT count(*) FROM collection_members)`).Scan(&count)
+	err := q.QueryRowContext(ctx, `SELECT (SELECT count(*) FROM catalog)+(SELECT count(*) FROM assets)+(SELECT count(*) FROM revisions)+(SELECT count(*) FROM revision_parents)+(SELECT count(*) FROM relationships)+(SELECT count(*) FROM locations)+(SELECT count(*) FROM collections)+(SELECT count(*) FROM collection_members)+(SELECT count(*) FROM queries)`).Scan(&count)
 	return count, err
 }
 
@@ -220,6 +229,17 @@ func projectionDigest(ctx context.Context, q queryer, library continuity.Library
 		}
 		return emit(0x18, memberProjection{library, m.CollectionID, m.AssetID, m.CreatedSequence, m.UpdatedSequence, m.Removed})
 	}, library)
+	if err != nil {
+		return "", 0, err
+	}
+	// Format 4, likewise: no query, no frame.
+	err = walkRows(ctx, q, querySelect+` ORDER BY q.query_id COLLATE BINARY`, func(rows *sql.Rows) error {
+		v, err := scanQuery(rows, library)
+		if err != nil {
+			return err
+		}
+		return emit(0x19, queryProjection{v.LibraryID, v.ID, v.Name, v.Definition, v.CreatedSequence, v.UpdatedSequence, v.Removed})
+	})
 	if err != nil {
 		return "", 0, err
 	}

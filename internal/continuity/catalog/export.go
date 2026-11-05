@@ -166,15 +166,19 @@ func (s *Store) Export(ctx context.Context, library continuity.LibraryID, writer
 }
 
 // streamFormat is the oldest format that holds the snapshot: 2 while the
-// catalog has no collection (every collection change needs one, and rows are
-// never deleted), so a catalog that never used collections still exports a
-// stream a format 2 reader restores, byte for byte as before.
+// catalog has no collection and no query, 3 while it has no query (every
+// collection or query change needs one, and rows are never deleted), so a
+// catalog that never used them still exports a stream an older reader
+// restores, byte for byte as before.
 func streamFormat(ctx context.Context, q queryer) (int, error) {
-	var any bool
-	if err := q.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM collections)`).Scan(&any); err != nil {
+	var collections, queries bool
+	if err := q.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM collections),EXISTS(SELECT 1 FROM queries)`).Scan(&collections, &queries); err != nil {
 		return 0, formatError(err)
 	}
-	if any {
+	switch {
+	case queries:
+		return 4, nil
+	case collections:
 		return 3, nil
 	}
 	return 2, nil

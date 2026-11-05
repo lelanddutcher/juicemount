@@ -1,7 +1,7 @@
 # Continuity catalog
 
 This internal package stores one library's asset identities, immutable revision
-declarations, selected heads, relationships, location observations, collections and ordered metadata operations in a dedicated
+declarations, selected heads, relationships, location observations, collections, saved queries and ordered metadata operations in a dedicated
 SQLite database. It has no routes, policy grants, media writes, filesystem rename
 operations, or verified/published/reachable states. A head selects a declaration;
 it does not certify the current contents of a filesystem path.
@@ -22,11 +22,12 @@ Use a dedicated directory that the process creates itself and chmods to 0700.
 Local filesystem/hardware are deployment preconditions. This does not defend
 against privileged replacement of path ancestors.
 
-Format 3 uses application ID `0x4a4d4341`, user version 3, an exact schema-object
-inventory, and a migration ledger containing the ordered format 1, 2 and 3 SHA-256
-fingerprints. New format 3 catalogs record the same supported lineage; these
+Format 4 uses application ID `0x4a4d4341`, user version 4, an exact schema-object
+inventory, and a migration ledger containing the ordered format 1, 2, 3 and 4 SHA-256
+fingerprints. New format 4 catalogs record the same supported lineage; these
 entries do not claim runtime upgrades occurred. Format 2 (slice 1) is format 1
-with the open ledger, relationships and locations; format 3 adds collections. A ledger
+with the open ledger, relationships and locations; format 3 adds collections;
+format 4 adds saved queries. A ledger
 alone cannot validate changed DDL. Unknown, foreign, newer, incomplete, corrupt,
 or constraint-invalid databases are refused without repair or replacement. A
 catalog with this application ID and a newer user version returns
@@ -34,7 +35,7 @@ catalog with this application ID and a newer user version returns
 Open performs version/DDL/ledger/identity/integrity preflight in one deferred
 transaction on a separate read-only connection before obtaining a write pool
 and enabling WAL. A recognized complete, integrity-valid format 1 catalog returns
-`ErrUpgradeRequired`, as does a format 2 catalog; Open never migrates either. SQLite integrity and foreign-key checks run at admission;
+`ErrUpgradeRequired`, as does a format 2 or 3 catalog; Open never migrates any. SQLite integrity and foreign-key checks run at admission;
 individual revision/event reads also verify their canonical identities. Open does
 not rehash the complete operation history or any media.
 
@@ -80,6 +81,16 @@ and 1–256 ordered changes. Exactly one pointer variant is required per change:
   creation sequence. An operation that leaves a collection above 10,000 active
   members fails with `ErrCollectionFull`. A member change that alters a row
   also moves the collection's updated sequence.
+- `CreateQuery` / `RenameQuery` / `RemoveQuery`: reserve a new `qry_` identity
+  with a 1–256 byte name and a definition, rename an active query, or
+  tombstone it. A definition (1–16 canonical volume-relative folders without
+  hidden components, an optional name fragment of up to 256 bytes without `/`,
+  0–32 lowercase alphanumeric extensions of up to 16 bytes, a modified-within
+  window of 0 to ten years in seconds, a limit of 1–500) is stored as its
+  canonical JSON (lists sorted, duplicates refused, wire order `prefixes`,
+  `name_contains`, `extensions`, `modified_within_seconds`, `limit`) and never
+  changes; a guard refuses changing it in place. The catalog never evaluates
+  a query.
 - `ExpectCollection`: changes nothing; conflicts unless the collection is
   active at the given updated sequence. A host that authorized a change
   against that state puts it first, so the change fails if the collection or
@@ -174,10 +185,11 @@ Their one-statement joins verify endpoints and optional revision membership.
 Before disclosure, a permission service must constrain both endpoints, traversal,
 counts and every returned field.
 
-`Upgrade(ctx,path,expectedLibraryID)` explicitly changes a recognized format 1
-or 2 catalog to format 3, one checked format at a time in one transaction
+`Upgrade(ctx,path,expectedLibraryID)` explicitly changes a recognized format 1,
+2 or 3 catalog to format 4, one checked format at a time in one transaction
 (1→2 as below, then 2→3, which only adds the collection tables, indexes and
-guards and the ledger's format 3 entry). `Inspect(ctx,path)` reports an existing
+guards and the ledger's format 3 entry, then 3→4, which only adds the query
+table and guards and the format 4 entry). `Inspect(ctx,path)` reports an existing
 catalog's library and format through the same admission, without changing it. It applies the same safe-file admission and read-only snapshot
 preflight, then repeats schema/library/integrity checks in an immediate transaction.
 The migration replaces only the constrained v1 ledger and its guards, adds the
@@ -264,11 +276,14 @@ identifier ordering, including all tombstones:
 | 0x16 locations | `library_id,id,value,created_sequence,updated_sequence,removed` |
 | 0x17 collections | `library_id,collection_id,name,created_sequence,updated_sequence,removed` |
 | 0x18 collection members | `library_id,collection_id,asset_id,created_sequence,updated_sequence,removed` (by collection, then asset) |
+| 0x19 queries | `library_id,query_id,name,definition,created_sequence,updated_sequence,removed` |
 
 The header names the oldest format that holds the snapshot: 2 while the catalog
-has no collection (then no 0x17/0x18 frame exists and every byte is as format 2
-wrote it, so a format 2 reader restores it), 3 otherwise. Restore refuses a
-collection change under a format 2 header and a format 3 header without one.
+has no collection and no query (then no 0x17-0x19 frame exists and every byte is
+as format 2 wrote it, so a format 2 reader restores it), 3 while it has no query,
+4 otherwise. Restore refuses a collection change under a format 2 header, a query
+change under a format 2 or 3 header, and a header naming a newer format than
+its contents need.
 
 Canonical manifest hex is lowercase; manifest/value objects retain their existing
 field order and explicit empty optional revisions. Parent edges sort by child

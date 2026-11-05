@@ -115,7 +115,7 @@ func upgradeCatalog(ctx context.Context, input string, expectedLibrary continuit
 	for _, step := range []struct {
 		from    int
 		migrate func(context.Context, *sql.Tx) error
-	}{{1, migrateV1}, {2, migrateV2}} {
+	}{{1, migrateV1}, {2, migrateV2}, {3, migrateV3}} {
 		if version != step.from {
 			continue
 		}
@@ -191,7 +191,7 @@ func migrateV1(ctx context.Context, tx *sql.Tx) error {
 // catalog validated inside this same immediate transaction. Nothing existing
 // is changed; the ledger gains the format 3 fingerprint.
 func migrateV2(ctx context.Context, tx *sql.Tx) error {
-	if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations(version,fingerprint) VALUES(3,?)`, schemaFingerprint(expectedSchema())); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations(version,fingerprint) VALUES(3,?)`, schemaFingerprint(schemaV3())); err != nil {
 		return err
 	}
 	for _, object := range collectionSchema() {
@@ -200,6 +200,22 @@ func migrateV2(ctx context.Context, tx *sql.Tx) error {
 		}
 	}
 	_, err := tx.ExecContext(ctx, `PRAGMA user_version=3`)
+	return err
+}
+
+// migrateV3 adds the query table and its guards to a format 3 catalog
+// validated inside this same immediate transaction. Nothing existing is
+// changed; the ledger gains the format 4 fingerprint.
+func migrateV3(ctx context.Context, tx *sql.Tx) error {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations(version,fingerprint) VALUES(4,?)`, schemaFingerprint(expectedSchema())); err != nil {
+		return err
+	}
+	for _, object := range querySchema() {
+		if _, err := tx.ExecContext(ctx, object.SQL); err != nil {
+			return err
+		}
+	}
+	_, err := tx.ExecContext(ctx, `PRAGMA user_version=4`)
 	return err
 }
 

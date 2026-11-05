@@ -55,6 +55,10 @@ type Change struct {
 	RemoveCollection       *RemoveCollection
 	AddCollectionMember    *AddCollectionMember
 	RemoveCollectionMember *RemoveCollectionMember
+	// Format 4.
+	CreateQuery *CreateQuery
+	RenameQuery *RenameQuery
+	RemoveQuery *RemoveQuery
 }
 
 type CreateAsset struct {

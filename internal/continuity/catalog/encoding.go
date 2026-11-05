@@ -44,6 +44,10 @@ type changeJSON struct {
 	RemoveCollection       *RemoveCollection       `json:"remove_collection,omitempty"`
 	AddCollectionMember    *AddCollectionMember    `json:"add_collection_member,omitempty"`
 	RemoveCollectionMember *RemoveCollectionMember `json:"remove_collection_member,omitempty"`
+	// Format 4.
+	CreateQuery *CreateQuery `json:"create_query,omitempty"`
+	RenameQuery *RenameQuery `json:"rename_query,omitempty"`
+	RemoveQuery *RemoveQuery `json:"remove_query,omitempty"`
 }
 
 type operationJSON struct {
@@ -127,7 +131,8 @@ func freezeOperation(op Operation) (Operation, []byte, string, error) {
 			count++
 		}
 		for _, set := range []bool{change.ExpectCollection != nil, change.CreateCollection != nil, change.RenameCollection != nil, change.RemoveCollection != nil,
-			change.AddCollectionMember != nil, change.RemoveCollectionMember != nil} {
+			change.AddCollectionMember != nil, change.RemoveCollectionMember != nil,
+			change.CreateQuery != nil, change.RenameQuery != nil, change.RemoveQuery != nil} {
 			if set {
 				count++
 			}
@@ -247,6 +252,26 @@ func freezeOperation(op Operation) (Operation, []byte, string, error) {
 				return Operation{}, nil, "", invalid("remove collection member")
 			}
 			frozen.Changes[i].RemoveCollectionMember, wire.Changes[i].RemoveCollectionMember = &c, &c
+		case change.CreateQuery != nil:
+			c := *change.CreateQuery
+			def, ok := c.Definition.canonical()
+			if c.QueryID.Validate() != nil || !validCollectionName(c.Name) || !ok {
+				return Operation{}, nil, "", invalid("create query")
+			}
+			c.Definition = def
+			frozen.Changes[i].CreateQuery, wire.Changes[i].CreateQuery = &c, &c
+		case change.RenameQuery != nil:
+			c := *change.RenameQuery
+			if c.QueryID.Validate() != nil || !validCollectionName(c.Name) {
+				return Operation{}, nil, "", invalid("rename query")
+			}
+			frozen.Changes[i].RenameQuery, wire.Changes[i].RenameQuery = &c, &c
+		case change.RemoveQuery != nil:
+			c := *change.RemoveQuery
+			if c.QueryID.Validate() != nil {
+				return Operation{}, nil, "", invalid("remove query")
+			}
+			frozen.Changes[i].RemoveQuery, wire.Changes[i].RemoveQuery = &c, &c
 		}
 	}
 	data, err := json.Marshal(wire)
@@ -294,6 +319,7 @@ func decodeOperation(data []byte) (Operation, error) {
 		op.Changes[i].ExpectCollection = c.ExpectCollection
 		op.Changes[i].CreateCollection, op.Changes[i].RenameCollection, op.Changes[i].RemoveCollection = c.CreateCollection, c.RenameCollection, c.RemoveCollection
 		op.Changes[i].AddCollectionMember, op.Changes[i].RemoveCollectionMember = c.AddCollectionMember, c.RemoveCollectionMember
+		op.Changes[i].CreateQuery, op.Changes[i].RenameQuery, op.Changes[i].RemoveQuery = c.CreateQuery, c.RenameQuery, c.RemoveQuery
 		if c.RecordRevision != nil {
 			m := c.RecordRevision.manifest()
 			op.Changes[i].RecordRevision = &m

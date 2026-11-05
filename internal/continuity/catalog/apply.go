@@ -142,6 +142,8 @@ func (s *Store) applyChange(ctx context.Context, tx *sql.Tx, c Change, sequence 
 		return s.removeLocation(ctx, tx, *c.RemoveLocation, sequence)
 	case isCollectionChange(c):
 		return s.applyCollectionChange(ctx, tx, c, sequence)
+	case isQueryChange(c):
+		return s.applyQueryChange(ctx, tx, c, sequence)
 	default:
 		return invalid("unknown change")
 	}

@@ -55,7 +55,7 @@ func TestPortabilityMalformedFramesAndStrictJSON(t *testing.T) {
 			return joinFrames(f)
 		},
 		"schema version": func(f [][]byte) []byte {
-			f[0] = testFrame(1, bytes.Replace(f[0][5:], []byte(`"schema_version":2`), []byte(`"schema_version":4`), 1))
+			f[0] = testFrame(1, bytes.Replace(f[0][5:], []byte(`"schema_version":2`), []byte(`"schema_version":5`), 1))
 			return joinFrames(f)
 		},
 		"header library": func(f [][]byte) []byte {

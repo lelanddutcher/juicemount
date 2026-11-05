@@ -124,7 +124,7 @@ func TestCollectionUpgradeFromSliceOneCatalog(t *testing.T) {
 	if err := Upgrade(ctx, path, testLibrary); err != nil {
 		t.Fatal(err)
 	}
-	if lib, version, err := Inspect(ctx, path); err != nil || version != 3 || lib != testLibrary {
+	if lib, version, err := Inspect(ctx, path); err != nil || version != schemaVersion || lib != testLibrary {
 		t.Fatalf("after upgrade: %s %d %v", lib, version, err)
 	}
 	s, err := Open(path)
@@ -132,8 +132,9 @@ func TestCollectionUpgradeFromSliceOneCatalog(t *testing.T) {
 		t.Fatal(err)
 	}
 	after := v2Records(t, s.db)
-	// The ledger gains exactly the format 3 entry; nothing else changes.
-	want := strings.Replace(string(before), `"catalog"`, `"schema_migrations",[3,"`+schemaFingerprint(expectedSchema())+`"],"catalog"`, 1)
+	// The ledger gains exactly the format 3 and 4 entries; nothing else
+	// changes.
+	want := strings.Replace(string(before), `"catalog"`, `"schema_migrations",[3,"`+v3Fingerprint+`"],"schema_migrations",[4,"`+schemaFingerprint(expectedSchema())+`"],"catalog"`, 1)
 	if string(after) != want {
 		t.Fatalf("upgrade changed format 2 rows:\n%s\n%s", before, after)
 	}
@@ -564,7 +565,7 @@ func TestCatalogRefusesNewerFormatAsNewer(t *testing.T) {
 	if err := s.Close(); err != nil {
 		t.Fatal(err)
 	}
-	editFixture(t, path, `PRAGMA user_version=4`)
+	editFixture(t, path, `PRAGMA user_version=5`)
 	before, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)

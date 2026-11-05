@@ -17,7 +17,7 @@ import (
 )
 
 const applicationID = 0x4a4d4341 // JMCA
-const schemaVersion = 3
+const schemaVersion = 4
 
 type queryer interface {
 	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
@@ -121,9 +121,17 @@ func schemaV2() []schemaObject {
 	return objects
 }
 
-// expectedSchema is the current format (3): format 2 plus collections.
-func expectedSchema() []schemaObject {
+// schemaV3 is format 3 exactly as slice 3 shipped it: format 2 plus
+// collections.
+func schemaV3() []schemaObject {
 	objects := append(schemaV2(), collectionSchema()...)
+	sort.Slice(objects, func(i, j int) bool { return objects[i].Name < objects[j].Name })
+	return objects
+}
+
+// expectedSchema is the current format (4): format 3 plus saved queries.
+func expectedSchema() []schemaObject {
+	objects := append(schemaV3(), querySchema()...)
 	sort.Slice(objects, func(i, j int) bool { return objects[i].Name < objects[j].Name })
 	return objects
 }
@@ -135,6 +143,8 @@ func schemaFor(version int) []schemaObject {
 		return legacySchema()
 	case 2:
 		return schemaV2()
+	case 3:
+		return schemaV3()
 	default:
 		return expectedSchema()
 	}
@@ -153,7 +163,7 @@ func initialize(ctx context.Context, db *sql.DB, library continuity.LibraryID) e
 	}
 	defer tx.Rollback()
 	tables := append([]string{ledgerV2DDL}, v1TableDDL[1:]...)
-	for _, object := range append(relationalSchema(), collectionSchema()...) {
+	for _, object := range append(append(relationalSchema(), collectionSchema()...), querySchema()...) {
 		if object.Type == "table" {
 			tables = append(tables, object.SQL)
 		}
@@ -173,10 +183,10 @@ func initialize(ctx context.Context, db *sql.DB, library continuity.LibraryID) e
 	if _, err := tx.ExecContext(ctx, `PRAGMA application_id=0x4a4d4341`); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `PRAGMA user_version=3`); err != nil {
+	if _, err := tx.ExecContext(ctx, `PRAGMA user_version=4`); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations(version,fingerprint) VALUES(1,?),(2,?),(3,?)`, schemaFingerprint(legacySchema()), schemaFingerprint(schemaV2()), schemaFingerprint(expectedSchema())); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations(version,fingerprint) VALUES(1,?),(2,?),(3,?),(4,?)`, schemaFingerprint(legacySchema()), schemaFingerprint(schemaV2()), schemaFingerprint(schemaV3()), schemaFingerprint(expectedSchema())); err != nil {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO catalog(singleton,library_id,ready) VALUES(1,?,0)`, library); err != nil {

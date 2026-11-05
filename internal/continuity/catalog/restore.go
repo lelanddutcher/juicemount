@@ -51,7 +51,7 @@ func restoreCatalog(ctx context.Context, path string, library continuity.Library
 	if err := canonicalJSON(headerData, &header); err != nil {
 		return err
 	}
-	if header.Version != 1 || (header.SchemaVersion != 2 && header.SchemaVersion != 3) || header.LibraryID != library || header.EventCount < 0 {
+	if header.Version != 1 || header.SchemaVersion < 2 || header.SchemaVersion > schemaVersion || header.LibraryID != library || header.EventCount < 0 {
 		return corrupt("export header identity or version")
 	}
 	if header.EventCount > limits.MaxEvents {
@@ -86,11 +86,12 @@ func restoreCatalog(ctx context.Context, path string, library continuity.Library
 		if err != nil {
 			return err
 		}
-		if header.SchemaVersion < 3 {
-			for _, change := range op.Changes {
-				if isCollectionChange(change) {
-					return corrupt("collection change in a format 2 stream")
-				}
+		for _, change := range op.Changes {
+			if header.SchemaVersion < 3 && isCollectionChange(change) {
+				return corrupt("collection change in a format 2 stream")
+			}
+			if header.SchemaVersion < 4 && isQueryChange(change) {
+				return corrupt("query change in a format 2 or 3 stream")
 			}
 		}
 		if batch == nil {
@@ -291,7 +292,7 @@ func projectionInsertCost(ctx context.Context, tx *sql.Tx, change Change) (int64
 	table, column, id := "", "", ""
 	var cost int64 = 1
 	switch {
-	case change.CreateAsset != nil, change.CreateCollection != nil:
+	case change.CreateAsset != nil, change.CreateCollection != nil, change.CreateQuery != nil:
 		return 1, nil // Success necessarily inserts; existing IDs are conflicts.
 	case change.AddCollectionMember != nil:
 		var exists bool
