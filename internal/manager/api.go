@@ -360,17 +360,8 @@ func Register(mux *http.ServeMux, prefix string, cfg Config) *JobManager {
 	// under /jfs. Without this a backup schedule could juicefs-sync an
 	// arbitrary host path (e.g. /etc) to a remote destination as root.
 	sched.SetSourceGate(func(path string, dir Direction) error {
-		switch dir {
-		case DirectionOut:
-			if !a.jfsPathAllowed(path) {
-				return fmt.Errorf("source outside /jfs (FUSE mount)")
-			}
-		default: // In / "" (default)
-			if !a.pathAllowed(path) {
-				return fmt.Errorf("source outside permitted source roots")
-			}
-		}
-		return nil
+		_, err := a.checkSyncSource(path, dir)
+		return err
 	})
 	sched.Start(context.Background())
 	mux.HandleFunc(prefix+"/api/schedules", a.auth(a.handleSchedules))
@@ -682,6 +673,10 @@ func (a *API) handleMigrate(w http.ResponseWriter, r *http.Request) {
 		// later logic that switches on dir from needing the same check.
 		dir = DirectionIn
 	}
+	if !validDirection(dir) {
+		http.Error(w, fmt.Sprintf("unknown direction %q (expected in|out|between)", dir), http.StatusBadRequest)
+		return
+	}
 
 	source := strings.TrimSpace(req.Source)
 	dest := strings.TrimSpace(req.Destination)
@@ -834,17 +829,9 @@ func (a *API) submitSavedDestination(w http.ResponseWriter, source, name string,
 		return
 	}
 	cleaned := filepath.Clean(source)
-	switch dir {
-	case DirectionIn, "":
-		if !a.pathAllowed(cleaned) {
-			http.Error(w, "source outside permitted source roots", http.StatusForbidden)
-			return
-		}
-	case DirectionOut, DirectionBetween:
-		if !a.jfsPathAllowed(cleaned) {
-			http.Error(w, "source outside /jfs (FUSE mount)", http.StatusForbidden)
-			return
-		}
+	if code, err := a.checkSyncSource(cleaned, dir); err != nil {
+		http.Error(w, err.Error(), code)
+		return
 	}
 	d, err := a.dests.getPlaintext(name)
 	if err != nil {
@@ -896,17 +883,9 @@ func (a *API) resolveSavedDestination(w http.ResponseWriter, source, name string
 		return
 	}
 	cleaned := filepath.Clean(source)
-	switch dir {
-	case DirectionIn, "":
-		if !a.pathAllowed(cleaned) {
-			http.Error(w, "source outside permitted source roots", http.StatusForbidden)
-			return
-		}
-	case DirectionOut, DirectionBetween:
-		if !a.jfsPathAllowed(cleaned) {
-			http.Error(w, "source outside /jfs (FUSE mount)", http.StatusForbidden)
-			return
-		}
+	if code, err := a.checkSyncSource(cleaned, dir); err != nil {
+		http.Error(w, err.Error(), code)
+		return
 	}
 	if !a.dests.exists(name) {
 		http.Error(w, "destination not found: "+name, http.StatusNotFound)
@@ -1120,6 +1099,10 @@ func (a *API) handleResolveDestination(w http.ResponseWriter, r *http.Request) {
 	dir := req.Direction
 	if dir == "" {
 		dir = DirectionIn
+	}
+	if !validDirection(dir) {
+		http.Error(w, fmt.Sprintf("unknown direction %q (expected in|out|between)", dir), http.StatusBadRequest)
+		return
 	}
 	source := strings.TrimSpace(req.Source)
 	dest := strings.TrimSpace(req.Destination)
@@ -1462,6 +1445,37 @@ func (a *API) jfsPathAllowed(p string) bool {
 	cleaned := filepath.Clean(p)
 	dm := filepath.Clean(a.destMount)
 	return cleaned == dm || strings.HasPrefix(cleaned, dm+"/")
+}
+
+// validDirection reports whether dir is one of the recognized sync
+// directions ("" is the pre-SLICE-1 default and means In).
+func validDirection(dir Direction) bool {
+	switch dir {
+	case "", DirectionIn, DirectionOut, DirectionBetween:
+		return true
+	}
+	return false
+}
+
+// checkSyncSource is the single default-deny source gate shared by
+// handleMigrate, submitSavedDestination, resolveSavedDestination and the
+// schedule gate. In (or "") sources must be under sourceRoots; Out and
+// Between sources must be under /jfs; any other direction is refused.
+// It returns the HTTP status to use alongside the error.
+func (a *API) checkSyncSource(path string, dir Direction) (int, error) {
+	switch dir {
+	case DirectionIn, "":
+		if !a.pathAllowed(path) {
+			return http.StatusForbidden, fmt.Errorf("source outside permitted source roots")
+		}
+	case DirectionOut, DirectionBetween:
+		if !a.jfsPathAllowed(path) {
+			return http.StatusForbidden, fmt.Errorf("source outside /jfs (FUSE mount)")
+		}
+	default:
+		return http.StatusBadRequest, fmt.Errorf("unknown direction %q (expected in|out|between)", dir)
+	}
+	return 0, nil
 }
 
 // pathAllowed returns true iff `p` is under one of the configured
