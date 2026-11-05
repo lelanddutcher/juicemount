@@ -22,4 +22,6 @@ type Node struct {
 	Ctime time.Time
 	// Mtime: the last change of the file's contents.
 	Mtime time.Time
+	// Size: the file's length in bytes.
+	Size uint64
 }

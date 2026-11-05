@@ -39,6 +39,11 @@
 // (running retention first, so a log that filled its disk can recover) and
 // writes a "gap" record that counts the records lost meanwhile.
 //
+// The Manager keeps a second log in this format, in its own state
+// directory, for agent tokens and the catalog edits agents make
+// (manager/agenttokens.go): intent and outcome records with Action naming
+// the change and Detail what it changed. Each log has its single writer.
+//
 // A Lazy writer touches nothing on disk until Activate: the proxy keeps the
 // log off until the first person exists. With Options.HealthPath the writer
 // keeps a small JSON health file (Health) there for the Manager, from the
@@ -100,6 +105,11 @@ type Record struct {
 	Host       string `json:"host,omitempty"`
 	Person     string `json:"person,omitempty"` // stable person ID, "" = no person
 	PersonName string `json:"person_name,omitempty"`
+	// Agent, AgentName: the agent token (its ID and name) a record of the
+	// Manager's catalog log was made with; Principal is then the Mac that
+	// minted it.
+	Agent     string `json:"agent,omitempty"`
+	AgentName string `json:"agent_name,omitempty"`
 
 	// Action summarizes a namespace unit: create, remove, rename, trash,
 	// restore, link, setattr, quota (a quota or its usage, nothing else),
@@ -960,7 +970,7 @@ func stubOf(r *Record, line []byte) *Record {
 	}
 	return &Record{Seq: r.Seq, TS: r.TS, Type: r.Type, Unit: r.Unit, Outcome: r.Outcome, Reason: clip(r.Reason),
 		Principal: clip(r.Principal), Kind: clip(r.Kind), Host: clip(r.Host), Person: clip(r.Person),
-		PersonName: clip(r.PersonName), Action: clip(r.Action), Prev: r.Prev,
+		PersonName: clip(r.PersonName), Agent: clip(r.Agent), AgentName: clip(r.AgentName), Action: clip(r.Action), Prev: r.Prev,
 		Omitted: max(1, len(r.Ops)+len(r.Rows)+len(r.Inodes)+len(r.Attrs)+len(r.Projects)), Digest: clip(r.Digest),
 		Detail: fmt.Sprintf("record not written: it encoded to %d bytes, more than the limit of %d", len(line), MaxRecordBytes)}
 }

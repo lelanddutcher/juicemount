@@ -146,3 +146,37 @@ func (s *Store) GetCollectionMember(ctx context.Context, library continuity.Libr
 	}
 	return scanMember(s.db.QueryRowContext(ctx, memberSelect+` WHERE m.collection_id=? AND m.asset_id=?`, library, id, asset))
 }
+
+// ListAssetCollections returns the active collections an asset is an active
+// member of, after an exclusive ID cursor ("" starts at the beginning),
+// ordered by ID (collection_members_asset index).
+func (s *Store) ListAssetCollections(ctx context.Context, library continuity.LibraryID, asset continuity.AssetID, after CollectionID, limit int) ([]Collection, error) {
+	if err := s.enter(); err != nil {
+		return nil, err
+	}
+	defer s.leave()
+	if err := s.requireLibrary(library); err != nil {
+		return nil, err
+	}
+	if asset.Validate() != nil || !validPage(limit) || (after != "" && after.Validate() != nil) {
+		return nil, invalid("asset collection page")
+	}
+	rows, err := s.db.QueryContext(ctx, collectionSelect+` WHERE c.removed=0 AND c.collection_id>? AND c.collection_id IN
+ (SELECT m.collection_id FROM collection_members m WHERE m.asset_id=? AND m.removed=0) ORDER BY c.collection_id LIMIT ?`, after, asset, limit)
+	if err != nil {
+		return nil, formatError(err)
+	}
+	defer rows.Close()
+	result := make([]Collection, 0, limit)
+	for rows.Next() {
+		c, err := scanCollection(rows, library)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, formatError(err)
+	}
+	return result, nil
+}

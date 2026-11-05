@@ -615,3 +615,51 @@ func TestListLocationRecordsIncludesTombstones(t *testing.T) {
 		t.Fatalf("cursor: %+v %v", page, err)
 	}
 }
+
+// ListAssetCollections lists the active collections an asset is an active
+// member of, by ID, with a cursor.
+func TestCollectionsOfAsset(t *testing.T) {
+	ctx := context.Background()
+	s := collectionStore(t)
+	third := CollectionID("col_00000000000000000000000000000003")
+	applyTest(t, s, testOperation("make",
+		Change{CreateCollection: &CreateCollection{CollectionID: testCollection, Name: "A"}},
+		Change{CreateCollection: &CreateCollection{CollectionID: otherCollection, Name: "B"}},
+		Change{CreateCollection: &CreateCollection{CollectionID: third, Name: "C"}},
+		Change{AddCollectionMember: &AddCollectionMember{CollectionID: testCollection, AssetID: testAsset}},
+		Change{AddCollectionMember: &AddCollectionMember{CollectionID: otherCollection, AssetID: testAsset}},
+		Change{AddCollectionMember: &AddCollectionMember{CollectionID: third, AssetID: testAsset}},
+		Change{AddCollectionMember: &AddCollectionMember{CollectionID: third, AssetID: otherAsset}}))
+	ids := func(after CollectionID, limit int) []CollectionID {
+		t.Helper()
+		page, err := s.ListAssetCollections(ctx, testLibrary, testAsset, after, limit)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out []CollectionID
+		for _, c := range page {
+			out = append(out, c.ID)
+		}
+		return out
+	}
+	all := ids("", 10)
+	if len(all) != 3 {
+		t.Fatalf("collections of the asset: %v", all)
+	}
+	if p := ids("", 2); len(p) != 2 || p[0] != all[0] || p[1] != all[1] {
+		t.Fatalf("first page: %v of %v", p, all)
+	}
+	if p := ids(all[1], 2); len(p) != 1 || p[0] != all[2] {
+		t.Fatalf("second page: %v of %v", p, all)
+	}
+	// A removed member and a removed collection drop out.
+	applyTest(t, s, testOperation("drop",
+		Change{RemoveCollectionMember: &RemoveCollectionMember{CollectionID: testCollection, AssetID: testAsset}},
+		Change{RemoveCollection: &RemoveCollection{CollectionID: otherCollection}}))
+	if p := ids("", 10); len(p) != 1 || p[0] != third {
+		t.Fatalf("after removals: %v", p)
+	}
+	if _, err := s.ListAssetCollections(ctx, testLibrary, "nope", "", 10); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("bad asset: %v", err)
+	}
+}
