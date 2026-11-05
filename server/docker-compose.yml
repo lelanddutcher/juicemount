@@ -149,6 +149,10 @@ services:
       MINIO_ROOT_USER: juicemount
       MINIO_ROOT_PASSWORD: "${MINIO_ROOT_PASSWORD:?set a strong existing MinIO root password before deploying}"
       MINIO_API_REQUESTS_DEADLINE: 10m
+      # Temporary (STS AssumeRole) credentials last at most 15 minutes, so
+      # none a client made for itself outlives a key rotation for long.
+      # MinIO issues them to any user without a policy check.
+      MINIO_STS_DURATION: 15m
     ports:
       - "30151:9000"                # Mac client connects here
       - "30152:9001"                # MinIO console — web UI
