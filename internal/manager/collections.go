@@ -11,8 +11,12 @@ package manager
 // Manager and its device digest, as on the enrollment poll (principals.go;
 // X-JuiceMount-Mac-Instance, -Token, -Device). The Mac must be approved and
 // assigned to a person, and not flagged as possibly cloned (a digest that
-// differs from the enrollment's flags it, here as on the poll). Mac
-// requests share a per-IP budget like the poll's. With no admin key
+// differs from the enrollment's flags it, here as on the poll; a Mac
+// enrolled before digests existed has none, so the first digest seen here
+// is recorded and any later different one flags it: trust on first use).
+// Each Mac has a request budget, charged once its token is verified, and
+// each source address a looser one before that (an office behind one NAT
+// is not starved, and fake tokens cannot drain a Mac's budget). With no admin key
 // configured (LAN/dev mode) the admin path is open, so it may not write
 // while grants are in force.
 //
@@ -20,21 +24,26 @@ package manager
 // write only where their project write grants (people.go) cover the files
 // the change touches, checked live on the volume: the members added or
 // removed, and for a rename or delete every member of the collection. A
-// file passes when any of its names outside the trash is covered, hidden
-// names included, which matches writing the file through that name (so a
-// file moved into /Clients/B/.old is B's, not gone). A file whose inode is
-// gone, or that is only in the trash, needs no grant; one whose names cannot
-// be read (or with over binder.MaxLinks links and an uncovered hint)
-// refuses the change with 503, since unknown is not gone. A person with no
-// write access at all writes nothing. The check and the write are tied
-// together: the write carries the collection's sequence as read for the
-// check, so a membership change in between makes it 409. A refusal is 403
+// file passes only when every one of its names outside the trash is
+// covered, hidden names included: the proxy ties a write to a hard-linked
+// file to all its parents (respproxy/txnunit.go), and a file moved into
+// /Clients/B/.old is B's, not gone. A file whose inode is gone, or that is
+// only in the trash, needs no grant; one whose names cannot be read (or
+// with over binder.MaxLinks links, unless a name already fails) refuses the
+// change with 503, since unknown is not gone. A person with no write access
+// at all writes nothing. A rename or delete carries the collection's
+// sequence as read for its check of every member, so a membership change in
+// between makes it 409; adding or removing members depends only on the
+// named members, so it carries none. A refusal is 403
 // and is logged (at most once a minute per person); the Manager writes no
 // Teams audit records (the proxy's audit log has a single writer), so the
 // catalog's event history is the record of what was changed and by whom.
 //
-// Cost. Requests that read the volume share two slots and a 30 s deadline;
-// a member page holds at most 100 members.
+// Cost. Requests that read the volume have a 30 s deadline and take a slot:
+// people share two, the admin has one of its own, and each actor has at
+// most one such request at a time (a second gets 503). A member page holds
+// at most 100 members. Residual: jfsmeta reads take no context, so a hung
+// volume read holds its slot past the deadline until it returns.
 //
 // Members are asset IDs, added by ID or by a volume path the binder resolves
 // (never through a path hint). A member's path is resolved when it is read;
@@ -76,9 +85,15 @@ const (
 	maxCollectionBody           = 256 << 10
 	maxMemberPage               = 100
 	collectionVolumeSlots       = 2
-	// collectionMacRequestsPerMinute: the poll route's per-IP budget.
-	collectionMacRequestsPerMinute = 30
-	collectionRefusalLogEvery      = time.Minute
+	// A Mac's budget: 5 requests a second sustained, bursts of 60, enough
+	// for a person paging through members (one request per page of 100)
+	// or an agent filing a batch, while a runaway client is cut off in
+	// seconds. Before the token is checked an address gets 600 a minute:
+	// an office of Macs behind one NAT, but not an unbounded token guess.
+	collectionMacPerMinute    = 300
+	collectionMacBurst        = 60
+	collectionIPPerMinute     = 600
+	collectionRefusalLogEvery = time.Minute
 )
 
 var (
@@ -100,15 +115,16 @@ var (
 )
 
 // macPerson authenticates a Mac by the enrollment poll token it holds and
-// returns a copy of its person. The device digest is noted as on the poll,
-// so a second Mac using the same identity flags it.
-func (s *PrincipalStore) macPerson(instanceID, pollToken, device string) (Person, error) {
+// returns its principal name and a copy of its person. The device digest is
+// noted as on the poll, so a second Mac using the same identity flags it;
+// a Mac with no recorded digest gets this one (trust on first use).
+func (s *PrincipalStore) macPerson(instanceID, pollToken, device string) (string, Person, error) {
 	instanceID = strings.TrimSpace(instanceID)
 	if !instanceIDRe.MatchString(instanceID) || !pollTokenRe.MatchString(pollToken) {
-		return Person{}, errMacUnknown
+		return "", Person{}, errMacUnknown
 	}
 	if !deviceDigestRe.MatchString(device) {
-		return Person{}, errMacDevice
+		return "", Person{}, errMacDevice
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -116,21 +132,32 @@ func (s *PrincipalStore) macPerson(instanceID, pollToken, device string) (Person
 	rec := s.recs[name]
 	if rec == nil || rec.PollTokenSHA256 == "" || !strings.EqualFold(rec.InstanceID, instanceID) ||
 		subtle.ConstantTimeCompare([]byte(sha256Hex(pollToken)), []byte(rec.PollTokenSHA256)) != 1 {
-		return Person{}, errMacUnknown
+		return "", Person{}, errMacUnknown
 	}
-	s.noteDeviceLocked(rec, device)
+	if rec.DeviceDigest == "" {
+		next := *rec
+		next.DeviceDigest = device
+		s.recs[name] = &next
+		if err := s.saveStoreLocked(); err != nil {
+			s.recs[name] = rec
+			return "", Person{}, fmt.Errorf("recording the Mac's device digest: %w", err)
+		}
+		log.Printf("manager: principal %s had no device digest; recorded the first one seen (collections API)", name)
+	} else {
+		s.noteDeviceLocked(rec, device)
+	}
 	rec = s.recs[name]
 	switch {
 	case rec.Status != PrincipalApproved:
-		return Person{}, errMacNotApproved
+		return "", Person{}, errMacNotApproved
 	case rec.DeviceMismatch:
-		return Person{}, errMacDeviceClash
+		return "", Person{}, errMacDeviceClash
 	case rec.Person == "" || s.people[rec.Person] == nil:
-		return Person{}, errMacNoPerson
+		return "", Person{}, errMacNoPerson
 	}
 	p := *s.people[rec.Person]
 	p.Grants = append([]string(nil), p.Grants...)
-	return p, nil
+	return name, p, nil
 }
 
 // grantsInForce mirrors PeopleSnapshot's GrantsInForce, cheaply.
@@ -201,12 +228,16 @@ func (l *refusalLog) note(person, line string) {
 }
 
 type collectionsAPI struct {
-	api      *API
-	people   *PrincipalStore // nil: only the admin key
-	prefix   string
-	slots    chan struct{}
-	macLimit *ipLimiter
-	refusals *refusalLog
+	api       *API
+	people    *PrincipalStore // nil: only the admin key
+	prefix    string
+	slots     chan struct{} // people's volume-read slots
+	adminSlot chan struct{} // the admin's own
+	mu        sync.Mutex
+	inflight  map[string]bool // actors with a volume-reading request running
+	ipLimit   *ipLimiter      // per source address, before the token is checked
+	macLimit  *ipLimiter      // per Mac principal, after
+	refusals  *refusalLog
 }
 
 // registerCollections wires /api/collections. The handlers do their own
@@ -220,8 +251,12 @@ func (a *API) registerCollections(mux *http.ServeMux, prefix string, people *Pri
 
 func newCollectionsAPI(a *API, prefix string, people *PrincipalStore) *collectionsAPI {
 	return &collectionsAPI{api: a, people: people, prefix: prefix,
-		slots:    make(chan struct{}, collectionVolumeSlots),
-		macLimit: newIPLimiter(collectionMacRequestsPerMinute, time.Now),
+		slots:     make(chan struct{}, collectionVolumeSlots),
+		adminSlot: make(chan struct{}, 1),
+		inflight:  map[string]bool{},
+		ipLimit:   newIPLimiter(collectionIPPerMinute, time.Now),
+		macLimit: &ipLimiter{rate: collectionMacPerMinute / 60.0, burst: collectionMacBurst,
+			buckets: map[string]*ipBucket{}, now: time.Now},
 		refusals: &refusalLog{every: collectionRefusalLogEvery, last: map[string]time.Time{}, held: map[string]int{}},
 	}
 }
@@ -253,15 +288,20 @@ func (h *collectionsAPI) authenticate(r *http.Request) (collectionActor, error) 
 		if h.people == nil {
 			return collectionActor{}, failf(http.StatusUnauthorized, "Mac enrollment is not configured on this Manager")
 		}
-		if !h.macLimit.allow(clientIP(r)) {
+		if !h.ipLimit.allow(clientIP(r)) {
 			return collectionActor{}, failf(http.StatusTooManyRequests, "too many requests from this address; wait a minute")
 		}
-		p, err := h.people.macPerson(instance, token, r.Header.Get("X-JuiceMount-Mac-Device"))
+		mac, p, err := h.people.macPerson(instance, token, r.Header.Get("X-JuiceMount-Mac-Device"))
 		switch {
 		case errors.Is(err, errMacUnknown), errors.Is(err, errMacDevice):
 			return collectionActor{}, failf(http.StatusUnauthorized, "%v", err)
-		case err != nil:
+		case errors.Is(err, errMacNotApproved), errors.Is(err, errMacDeviceClash), errors.Is(err, errMacNoPerson):
 			return collectionActor{}, failf(http.StatusForbidden, "%v", err)
+		case err != nil:
+			return collectionActor{}, err
+		}
+		if !h.macLimit.allow(mac) {
+			return collectionActor{}, failf(http.StatusTooManyRequests, "too many requests from this Mac; slow down")
 		}
 		return collectionActor{person: &p}, nil
 	default:
@@ -275,15 +315,34 @@ func readsVolume(r *http.Request) bool {
 	return r.Method != http.MethodGet || strings.HasSuffix(strings.TrimSuffix(r.URL.Path, "/"), "/members")
 }
 
-func (h *collectionsAPI) acquire(ctx context.Context) (release func(), err error) {
+// acquire takes a volume-read slot for actor: one request per actor at a
+// time; people share the common slots, the admin has its own.
+func (h *collectionsAPI) acquire(ctx context.Context, actor collectionActor) (release func(), err error) {
+	key, slots := actor.id(), h.slots
+	if actor.person == nil {
+		slots = h.adminSlot
+	}
+	h.mu.Lock()
+	if h.inflight[key] {
+		h.mu.Unlock()
+		return nil, failf(http.StatusServiceUnavailable, "a previous collection request of yours is still being checked; try again when it finishes")
+	}
+	h.inflight[key] = true
+	h.mu.Unlock()
+	done := func() {
+		h.mu.Lock()
+		delete(h.inflight, key)
+		h.mu.Unlock()
+	}
 	wait := time.NewTimer(collectionBusyWait)
 	defer wait.Stop()
 	select {
-	case h.slots <- struct{}{}:
-		return func() { <-h.slots }, nil
+	case slots <- struct{}{}:
+		return func() { <-slots; done() }, nil
 	case <-wait.C:
 	case <-ctx.Done():
 	}
+	done()
 	return nil, failf(http.StatusServiceUnavailable, "the Manager is busy checking other collection requests; try again")
 }
 
@@ -299,7 +358,7 @@ func (h *collectionsAPI) serve(w http.ResponseWriter, r *http.Request) {
 	actor, err := h.authenticate(r)
 	if err == nil && readsVolume(r) {
 		var release func()
-		if release, err = h.acquire(ctx); err == nil {
+		if release, err = h.acquire(ctx, actor); err == nil {
 			defer release()
 		}
 	}
@@ -707,9 +766,10 @@ func (c *collectionCall) authorizeAll(id catalog.CollectionID) error {
 // change records one write. An exact retry (its operation ID is in the
 // history) returns the original result without a second authorization: it
 // was authorized when it committed, and only its own actor can name it.
-// Otherwise a guarded change reads the collection's sequence, authorizes,
-// and writes with that sequence as a precondition (ExpectCollection), so a
-// change to the collection in between makes it 409.
+// Otherwise a guarded change (rename, delete: authorized against every
+// member) reads the collection's sequence, authorizes, and writes with that
+// sequence as a precondition (ExpectCollection), so a change to the
+// collection in between makes it 409.
 func (c *collectionCall) change(opID string, id catalog.CollectionID, guarded bool, authorize func() error, changes []catalog.Change) error {
 	expect := func(seq int64) []catalog.Change {
 		return append([]catalog.Change{{ExpectCollection: &catalog.ExpectCollection{CollectionID: id, UpdatedSequence: seq}}}, changes...)
@@ -850,5 +910,7 @@ func (c *collectionCall) editMembers(id catalog.CollectionID, add bool) error {
 			changes = append(changes, catalog.Change{RemoveCollectionMember: &catalog.RemoveCollectionMember{CollectionID: id, AssetID: m}})
 		}
 	}
-	return c.change(opID, id, true, func() error { return c.authorize(members) }, changes)
+	// Only the named members' grants matter: concurrent adders do not
+	// conflict. The catalog refuses a removed collection (404).
+	return c.change(opID, id, false, func() error { return c.authorize(members) }, changes)
 }

@@ -50,17 +50,19 @@ func TestCheckAccessSeesHiddenNamesAndLinks(t *testing.T) {
 	if a, err := f.access(y, under("Clients/B")); err != nil || !a.Missing {
 		t.Fatalf("deleted: %+v %v", a, err)
 	}
-	// A hard link: any name decides, whichever the hint is.
+	// A hard link: every name must pass (the proxy's rule), whichever the
+	// hint is.
 	h := f.create("Clients/A/h.mov")
 	f.feed(Event{Op: "create", Path: "Clients/A/h.mov", Inode: h})
 	f.link(h, "Clients/B/h2.mov")
-	for _, dir := range []string{"Clients/A", "Clients/B"} {
-		if a, err := f.access(h, under(dir)); err != nil || !a.Allowed {
-			t.Fatalf("linked file for %s: %+v %v", dir, a, err)
-		}
+	if a, err := f.access(h, under("Clients/A")); err != nil || a.Allowed || a.Missing || a.Name != "Clients/B/h2.mov" {
+		t.Fatalf("linked file for A: %+v %v", a, err)
 	}
-	if a, err := f.access(h, under("Clients/C")); err != nil || a.Allowed || a.Missing {
-		t.Fatalf("linked file for C: %+v %v", a, err)
+	if a, err := f.access(h, under("Clients/B")); err != nil || a.Allowed || a.Name != "Clients/A/h.mov" {
+		t.Fatalf("linked file for B: %+v %v", a, err)
+	}
+	if a, err := f.access(h, under("Clients")); err != nil || !a.Allowed {
+		t.Fatalf("linked file for both: %+v %v", a, err)
 	}
 	// A name that cannot be read is unknown, never missing or denied.
 	rdb := openRedis(t, f.url)
@@ -68,20 +70,21 @@ func TestCheckAccessSeesHiddenNamesAndLinks(t *testing.T) {
 	if err := rdb.HDel(context.Background(), fmt.Sprintf("d%d", f.resolve("Clients/B")), "h2.mov").Err(); err != nil {
 		t.Fatal(err)
 	}
-	if a, err := f.access(h, under("Clients/C")); !errors.Is(err, ErrUnresolved) {
+	if a, err := f.access(h, under("Clients")); !errors.Is(err, ErrUnresolved) {
 		t.Fatalf("unreadable name: %+v %v", a, err)
 	}
-	// Over MaxLinks: the hint can still allow, but nothing else is listed.
+	// Over MaxLinks: a refused hint still refuses, but passing needs every
+	// name, which is not listed.
 	m := f.create("Clients/A/m.mov")
 	f.feed(Event{Op: "create", Path: "Clients/A/m.mov", Inode: m})
 	for i := 0; i < MaxLinks; i++ {
 		f.link(m, fmt.Sprintf("Clients/B/m%d.mov", i))
 	}
-	if a, err := f.access(m, under("Clients/A")); err != nil || !a.Allowed {
-		t.Fatalf("many links, hint allowed: %+v %v", a, err)
-	}
-	if a, err := f.access(m, under("Clients/B")); !errors.Is(err, ErrUnresolved) || !strings.Contains(err.Error(), "hard links") {
+	if a, err := f.access(m, under("Clients/B")); err != nil || a.Allowed || a.Name != "Clients/A/m.mov" {
 		t.Fatalf("many links, hint refused: %+v %v", a, err)
+	}
+	if a, err := f.access(m, under("Clients")); !errors.Is(err, ErrUnresolved) || !strings.Contains(err.Error(), "hard links") {
+		t.Fatalf("many links, hint allowed: %+v %v", a, err)
 	}
 	// A canceled request reads nothing more.
 	ctx, cancel := context.WithCancel(context.Background())

@@ -185,7 +185,8 @@ func newCollectionsEnv(t *testing.T) *collectionsEnv {
 	env.a = &API{adminKey: collectionsAdminKey, continuity: svc}
 	env.mux = http.NewServeMux()
 	env.h = newCollectionsAPI(env.a, "/manager", people)
-	env.h.macLimit = newIPLimiter(1_000_000, time.Now) // the budget has its own test
+	// The budgets have their own test.
+	env.h.ipLimit, env.h.macLimit = newIPLimiter(1_000_000, time.Now), newIPLimiter(1_000_000, time.Now)
 	env.mux.HandleFunc("/manager/api/collections", env.h.serve)
 	env.mux.HandleFunc("/manager/api/collections/", env.h.serve)
 	return env
@@ -594,12 +595,16 @@ func TestCollectionsHiddenNamesAndLinksNeedGrants(t *testing.T) {
 	e.write("Ann", "/api/collections/"+only+"/delete", map[string]any{}, 403)
 	e.write("Ann", "/api/collections/"+only+"/rename", map[string]any{"name": "mine"}, 403)
 	e.write("Bob", "/api/collections/"+sel+"/members/remove", map[string]any{"members": assetRefs(three)}, 200)
-	// A hard link: a file with a name in A and one in B is both people's.
+	// A hard link into A and B needs both grants, as a write through the
+	// proxy does: neither Ann nor Bob alone, but access "all".
 	e.vol.set(func(f map[string]uint64) { f["Clients/B/two-link.mov"] = 43 })
 	linked := string(e.write("admin", "/api/collections", map[string]any{"name": "Linked", "members": assetRefs(two)}, 200).Collection.ID)
-	e.write("Ann", "/api/collections/"+linked+"/rename", map[string]any{"name": "Ann"}, 200)
-	e.write("Bob", "/api/collections/"+linked+"/rename", map[string]any{"name": "Bob"}, 200)
-	e.write("Nia", "/api/collections/"+linked+"/rename", map[string]any{"name": "Nia"}, 403)
+	rec = e.do("Ann", http.MethodPost, "/api/collections/"+linked+"/rename", map[string]any{"name": "Ann"})
+	if rec.Code != 403 || !strings.Contains(rec.Body.String(), "/Clients/B/two-link.mov") {
+		t.Fatalf("Ann renaming a collection of a file linked into B: %d %s", rec.Code, rec.Body)
+	}
+	e.write("Bob", "/api/collections/"+linked+"/rename", map[string]any{"name": "Bob"}, 403)
+	e.write("Al", "/api/collections/"+linked+"/rename", map[string]any{"name": "Al"}, 200)
 	// A grant covers its folder, not a sibling sharing its prefix.
 	e.vol.set(func(f map[string]uint64) { f["Clients/AB/x.mov"] = 46 })
 	e.offer(binder.Event{Op: "create", Path: "Clients/AB/x.mov", Inode: 46})
@@ -624,21 +629,86 @@ func TestCollectionsMacDeviceAndBudget(t *testing.T) {
 	if rec := e.do("Ann", http.MethodGet, "/api/collections", nil); rec.Code != 403 {
 		t.Fatalf("flagged Mac with its own digest: %d %s", rec.Code, rec.Body)
 	}
-	// The per-IP budget (as on the enrollment poll).
+	// Budgets: fake tokens do not drain a Mac's budget; a Mac's budget does
+	// not starve another Mac at the same address; an address has a looser
+	// one before the token is checked.
 	h := newCollectionsAPI(e.a, "/manager", e.people)
-	codes := map[int]int{}
-	for i := 0; i < collectionMacRequestsPerMinute+1; i++ {
+	send := func(who, token string) int {
+		m := e.macs[who]
+		if token == "" {
+			token = m[1]
+		}
 		req := httptest.NewRequest(http.MethodGet, "/manager/api/collections", nil)
-		b := e.macs["Bob"]
-		req.Header.Set("X-JuiceMount-Mac-Instance", b[0])
-		req.Header.Set("X-JuiceMount-Mac-Token", b[1])
-		req.Header.Set("X-JuiceMount-Mac-Device", b[2])
+		req.Header.Set("X-JuiceMount-Mac-Instance", m[0])
+		req.Header.Set("X-JuiceMount-Mac-Token", token)
+		req.Header.Set("X-JuiceMount-Mac-Device", m[2])
 		rec := httptest.NewRecorder()
 		h.serve(rec, req)
-		codes[rec.Code]++
+		return rec.Code
 	}
-	if codes[200] != collectionMacRequestsPerMinute || codes[429] != 1 {
-		t.Fatalf("budget: %v", codes)
+	codes := map[int]int{}
+	for i := 0; i < 100; i++ {
+		codes[send("Bob", strings.Repeat("0", 64))]++
+	}
+	for i := 0; i < collectionMacBurst+1; i++ {
+		codes[send("Bob", "")]++
+	}
+	if codes[401] != 100 || codes[200] != collectionMacBurst || codes[429] != 1 {
+		t.Fatalf("Mac budget: %v", codes)
+	}
+	if code := send("Al", ""); code != 200 {
+		t.Fatalf("another Mac at the same address: %d", code)
+	}
+	h.ipLimit = newIPLimiter(2, time.Now)
+	if a, b, c := send("Al", ""), send("Al", ""), send("Al", strings.Repeat("0", 64)); a != 200 || b != 200 || c != 429 {
+		t.Fatalf("address budget: %d %d %d", a, b, c)
+	}
+}
+
+// A Mac enrolled before device digests: the first digest seen is recorded,
+// a different one later flags it.
+func TestCollectionsMacWithoutDigestTrustsFirstUse(t *testing.T) {
+	e := newCollectionsEnv(t)
+	instance := "5B000000-7B3D-4C1A-9E2B-0A1B2C3D4E5F"
+	resp, err := e.people.Enroll(EnrollRequest{InstanceID: instance, Host: "old", Secret: testMacSecret}, "192.0.2.8")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.people.Approve(macPrincipalName(instance)); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.people.AssignDevice(macPrincipalName(instance), e.ids["Al"]); err != nil {
+		t.Fatal(err)
+	}
+	e.macs["Old"] = [3]string{instance, resp.PollToken, strings.Repeat("a", 32)}
+	for i := 0; i < 2; i++ {
+		if rec := e.do("Old", http.MethodGet, "/api/collections", nil); rec.Code != 200 {
+			t.Fatalf("first use %d: %d %s", i, rec.Code, rec.Body)
+		}
+	}
+	e.macs["Old"] = [3]string{instance, resp.PollToken, strings.Repeat("b", 32)}
+	if rec := e.do("Old", http.MethodGet, "/api/collections", nil); rec.Code != 403 {
+		t.Fatalf("a second device: %d %s", rec.Code, rec.Body)
+	}
+}
+
+// Adding members depends only on the added members: a concurrent change
+// to the collection does not make it a conflict.
+func TestCollectionsConcurrentAddersDoNotConflict(t *testing.T) {
+	e := newCollectionsEnv(t)
+	ctx := context.Background()
+	library, _ := e.svc.store.LibraryID()
+	id := e.write("Ann", "/api/collections", map[string]any{"name": "Ann's", "members": pathRefs("Clients/A/one.mov")}, 200).Collection.ID
+	collectionBeforeApply = func() {
+		collectionBeforeApply = nil
+		if _, err := e.svc.store.Apply(ctx, catalog.Operation{Version: 1, LibraryID: library, ID: "other-adder", Actor: "admin",
+			Changes: []catalog.Change{{AddCollectionMember: &catalog.AddCollectionMember{CollectionID: id, AssetID: binder.AssetID(e.vol.VolumeUUID(), 44)}}}}); err != nil {
+			t.Error(err)
+		}
+	}
+	defer func() { collectionBeforeApply = nil }()
+	if r := e.write("Ann", "/api/collections/"+string(id)+"/members/add", map[string]any{"members": pathRefs("Clients/A/two.mov")}, 200); r.Collection.Members != 3 {
+		t.Fatalf("add beside a concurrent add: %+v", r.Collection)
 	}
 }
 
@@ -728,15 +798,26 @@ func TestCollectionsBusyAndRefusalLog(t *testing.T) {
 	for i := 0; i < collectionVolumeSlots; i++ {
 		e.h.slots <- struct{}{}
 	}
-	if rec := e.do("admin", http.MethodPost, "/api/collections", map[string]any{"name": "x"}); rec.Code != 503 || !strings.Contains(rec.Body.String(), "busy") {
-		t.Fatalf("all slots taken: %d %s", rec.Code, rec.Body)
+	if rec := e.do("Bob", http.MethodPost, "/api/collections", map[string]any{"name": "x"}); rec.Code != 503 || !strings.Contains(rec.Body.String(), "busy") {
+		t.Fatalf("all people's slots taken: %d %s", rec.Code, rec.Body)
 	}
-	if rec := e.do("admin", http.MethodGet, "/api/collections", nil); rec.Code != 200 {
+	if rec := e.do("Bob", http.MethodGet, "/api/collections", nil); rec.Code != 200 {
 		t.Fatalf("a list needs no slot: %d", rec.Code)
+	}
+	if rec := e.do("admin", http.MethodPost, "/api/collections", map[string]any{"name": "x"}); rec.Code != 200 {
+		t.Fatalf("the admin's own slot: %d %s", rec.Code, rec.Body)
 	}
 	for i := 0; i < collectionVolumeSlots; i++ {
 		<-e.h.slots
 	}
+	// One volume-reading request per actor at a time.
+	e.h.inflight[e.ids["Ann"]] = true
+	if rec := e.do("Ann", http.MethodPost, "/api/collections", map[string]any{"name": "x"}); rec.Code != 503 || !strings.Contains(rec.Body.String(), "still being checked") {
+		t.Fatalf("Ann's second request: %d %s", rec.Code, rec.Body)
+	}
+	e.write("Bob", "/api/collections", map[string]any{"name": "y"}, 200)
+	delete(e.h.inflight, e.ids["Ann"])
+	e.write("Ann", "/api/collections", map[string]any{"name": "x"}, 200)
 	var buf bytes.Buffer
 	log.SetOutput(&buf)
 	defer log.SetOutput(os.Stderr)
