@@ -27,6 +27,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log"
 	"net"
 	"net/http"
@@ -72,11 +73,13 @@ const maxDestinationNameLen = 64
 // stores Config encrypted as a single AES-GCM blob.
 //
 // Config keys vary by kind:
-//   - file:   {"path": "/external/backups"}
+//   - file:   {"path": "/external/backups"} (must resolve inside a source
+//     root; the API stores the checked location under fileCheckedPathKey)
 //   - s3/b2:  {"endpoint", "bucket", "access_key", "secret_key", "region" (optional)}
 //   - sftp:   {"host", "port", "user", "password" OR "private_key", "path" (optional),
-//     "host_key" (pinned server key in authorized_keys form; set by the
-//     first successful Test Connection, see sftpHostKeyCallback)}
+//     "host_key" (pinned server key in authorized_keys form; stored when
+//     the operator confirms the fingerprint Test Connection reports, see
+//     handleDestinationHostKey)}
 //   - webdav: {"endpoint", "user" (optional), "password" (optional)}
 //   - jfs:    {"meta_url", "volume" (optional, defaults to "jfs")}
 //
@@ -226,6 +229,10 @@ func (s *destinationStoreImpl) listRedacted() ([]Destination, error) {
 		}
 		redacted := make(map[string]string, len(cfg))
 		for k, v := range cfg {
+			if k == fileCheckedPathKey {
+				// Server-maintained, not an operator field.
+				continue
+			}
 			if v == "" {
 				redacted[k] = ""
 			} else {
@@ -373,6 +380,67 @@ func (s *destinationStoreImpl) removeLocked(name string) bool {
 	return false
 }
 
+// mutateConfig decrypts one destination's config, lets fn change it and
+// stores the result, all under s.mu, so a concurrent PUT is never
+// overwritten with a stale copy. fn's error aborts without writing.
+func (s *destinationStoreImpl) mutateConfig(name string, fn func(kind string, cfg map[string]string) error) error {
+	mutated, err := s.mutateConfigLocked(name, fn)
+	if mutated {
+		s.notifyChange()
+	}
+	return err
+}
+
+func (s *destinationStoreImpl) mutateConfigLocked(name string, fn func(kind string, cfg map[string]string) error) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.key) != credKeyLen {
+		return false, errors.New("destinations are unavailable: set JM_ADMIN_KEY to enable encrypted credential storage")
+	}
+	for i, r := range s.rows {
+		if r.Name != name {
+			continue
+		}
+		blob, err := base64.StdEncoding.DecodeString(r.EncryptedConfig)
+		if err != nil {
+			return false, fmt.Errorf("base64 decode: %w", err)
+		}
+		plaintext, err := decryptSecret(blob, s.key)
+		if err != nil {
+			return false, err
+		}
+		var cfg map[string]string
+		err = json.Unmarshal(plaintext, &cfg)
+		for j := range plaintext {
+			plaintext[j] = 0
+		}
+		if err != nil {
+			return false, fmt.Errorf("config unmarshal: %w", err)
+		}
+		if cfg == nil {
+			cfg = map[string]string{}
+		}
+		if err := fn(r.Kind, cfg); err != nil {
+			return false, err
+		}
+		plaintext, err = json.Marshal(cfg)
+		if err != nil {
+			return false, fmt.Errorf("marshal config: %w", err)
+		}
+		blob, err = encryptSecret(plaintext, s.key)
+		for j := range plaintext {
+			plaintext[j] = 0
+		}
+		if err != nil {
+			return false, err
+		}
+		s.rows[i].EncryptedConfig = base64.StdEncoding.EncodeToString(blob)
+		s.rows[i].UpdatedAt = time.Now().UnixMilli()
+		return true, nil
+	}
+	return false, errDestinationNotFound
+}
+
 // exists reports whether a destination with the given name is currently
 // stored. Used by PUT handlers that want to enforce update-only semantics
 // (return 404 on missing name instead of silently creating).
@@ -457,6 +525,9 @@ func validateConfig(kind string, cfg map[string]string) error {
 	if len(missing) > 0 {
 		return fmt.Errorf("missing required config keys for kind %q: %s", kind, strings.Join(missing, ", "))
 	}
+	if kind == "file" && !filepath.IsAbs(strings.TrimSpace(cfg["path"])) {
+		return errors.New("file path must be absolute")
+	}
 	// sftp must have either password or private_key
 	if kind == "sftp" {
 		if cfg["password"] == "" && cfg["private_key"] == "" {
@@ -524,6 +595,8 @@ func (a *API) handleDestinationItem(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case sub == "test" && r.Method == http.MethodPost:
 		a.handleDestinationTest(w, r, name)
+	case sub == "host-key" && r.Method == http.MethodPost:
+		a.handleDestinationHostKey(w, r, name)
 	case sub == "" && r.Method == http.MethodPut:
 		a.handleDestinationUpdate(w, r, name)
 	case sub == "" && r.Method == http.MethodDelete:
@@ -564,6 +637,10 @@ func (a *API) handleDestinationsCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := validateConfig(d.Kind, d.Config); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := a.confineDestination(d); err != nil {
+		http.Error(w, err.Error(), http.StatusForbidden)
 		return
 	}
 	if err := a.dests.upsert(d, false); err != nil {
@@ -614,6 +691,10 @@ func (a *API) handleDestinationUpdate(w http.ResponseWriter, r *http.Request, na
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	if err := a.confineDestination(d); err != nil {
+		http.Error(w, err.Error(), http.StatusForbidden)
+		return
+	}
 	// PUT is replace-only — a 404 here surfaces a client typo faster
 	// than silently creating a duplicate. POST is the create path.
 	if !a.dests.exists(name) {
@@ -621,8 +702,9 @@ func (a *API) handleDestinationUpdate(w http.ResponseWriter, r *http.Request, na
 		return
 	}
 	// The edit form never sends host_key, so keep the pinned SFTP key
-	// while the edit still points at the same server. Dropping it would
-	// silently re-trust whatever answers on the next test.
+	// while the edit still points at the same server. A new host or port
+	// drops it, and the next Test Connection asks the operator to
+	// confirm the new server's fingerprint before anything authenticates.
 	if d.Kind == "sftp" && d.Config["host_key"] == "" {
 		if old, err := a.dests.getPlaintext(name); err == nil && old.Kind == "sftp" &&
 			sftpAddr(old.Config) == sftpAddr(d.Config) && old.Config["host_key"] != "" {
@@ -667,8 +749,12 @@ func (a *API) handleDestinationTest(w http.ResponseWriter, r *http.Request, name
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
-	if d.Kind == "sftp" {
+	switch d.Kind {
+	case "sftp":
 		a.handleDestinationTestSFTP(ctx, w, d)
+		return
+	case "file":
+		a.handleDestinationTestFile(w, d)
 		return
 	}
 	if err := testConnection(ctx, d); err != nil {
@@ -695,13 +781,14 @@ func (a *API) handleDestinationTest(w http.ResponseWriter, r *http.Request, name
 // destination. Probes are intentionally minimal — we want to confirm
 // credentials work without copying or mutating data:
 //
-//   - file:   os.Stat the path; verify directory + writable.
+//   - file:   os.Stat the checked path; verify directory + writable.
 //   - s3/b2:  HEAD <endpoint>/<bucket>. We use raw HTTP rather than an
 //     SDK to keep the dependency surface small; the response
 //     code distinguishes 200 (ok), 403 (auth), 404 (bucket not
 //     found), 0 (network).
-//   - sftp:   SSH dial + handshake + close. Does not open a session;
-//     the auth handshake is enough.
+//   - sftp:   SSH dial + handshake + close against the pinned host key.
+//     Does not open a session; the auth handshake is enough.
+//     Refuses when no key is pinned yet.
 //   - webdav: PROPFIND on the root with Depth: 0. Servers return 207
 //     Multi-Status on success.
 //   - jfs:    Redis PING against the meta_url.
@@ -716,8 +803,7 @@ func testConnection(ctx context.Context, d Destination) error {
 	case "s3", "b2":
 		return testConnectionS3(ctx, d.Config)
 	case "sftp":
-		_, err := testConnectionSFTP(ctx, d.Config)
-		return err
+		return testConnectionSFTP(ctx, d.Config)
 	case "webdav":
 		return testConnectionWebDAV(ctx, d.Config)
 	case "jfs":
@@ -727,13 +813,126 @@ func testConnection(ctx context.Context, d Destination) error {
 	}
 }
 
-func testConnectionFile(cfg map[string]string) error {
-	p := strings.TrimSpace(cfg["path"])
-	if p == "" {
-		return errors.New("path is empty")
-	}
+// fileCheckedPathKey is the config key under which the API records where
+// a file destination's path resolved when it was checked against the
+// source roots. It travels inside the encrypted config, so it cannot be
+// set without the admin key, and the API overwrites any client value.
+// ToSyncURI refuses a file destination without it, so a row saved by an
+// older build (or edited on disk) is not used until it is checked again.
+const fileCheckedPathKey = "checked_path"
+
+var errFileDestOutsideRoots = errors.New("destination outside permitted roots (a file destination must be inside a configured source-root mount)")
+
+// resolveFileDestPath cleans an absolute path and resolves symlinks in
+// the longest prefix that exists, so a not-yet-created leaf under a
+// symlinked directory still resolves to where it will really be
+// written. A dangling symlink is refused: its target is unknown.
+func resolveFileDestPath(p string) (string, error) {
+	p = strings.TrimSpace(p)
 	if !filepath.IsAbs(p) {
-		return errors.New("path must be absolute")
+		return "", errors.New("file path must be absolute")
+	}
+	existing := filepath.Clean(p)
+	rest := ""
+	for {
+		resolved, err := filepath.EvalSymlinks(existing)
+		if err == nil {
+			return filepath.Join(resolved, rest), nil
+		}
+		if !errors.Is(err, fs.ErrNotExist) {
+			return "", fmt.Errorf("resolve path: %w", err)
+		}
+		if _, lerr := os.Lstat(existing); lerr == nil {
+			return "", fmt.Errorf("path contains a dangling symlink at %s", existing)
+		}
+		parent := filepath.Dir(existing)
+		if parent == existing {
+			return filepath.Join(existing, rest), nil
+		}
+		rest = filepath.Join(filepath.Base(existing), rest)
+		existing = parent
+	}
+}
+
+// confineDestination applies the same root check the ad-hoc Out
+// migration uses (pathAllowed) to a file destination, on both the path
+// as given and its fully resolved form, and records the resolved form
+// under fileCheckedPathKey. Other kinds just lose any client-supplied
+// value for that key.
+func (a *API) confineDestination(d Destination) error {
+	if d.Kind != "file" {
+		delete(d.Config, fileCheckedPathKey)
+		return nil
+	}
+	return a.confineFileConfig(d.Config)
+}
+
+func (a *API) confineFileConfig(cfg map[string]string) error {
+	delete(cfg, fileCheckedPathKey)
+	p := strings.TrimSpace(cfg["path"])
+	resolved, err := resolveFileDestPath(p)
+	if err != nil {
+		return err
+	}
+	if !a.pathAllowed(p) || !a.pathAllowed(resolved) {
+		return errFileDestOutsideRoots
+	}
+	cfg[fileCheckedPathKey] = resolved
+	return nil
+}
+
+// checkedFileDestPath returns the path a file destination may be used
+// at: the current resolution of its path, which must still equal the
+// location the API checked against the source roots.
+func checkedFileDestPath(cfg map[string]string) (string, error) {
+	checked := cfg[fileCheckedPathKey]
+	if checked == "" {
+		return "", errors.New("file: path has not been checked against the permitted roots; run Test Connection on this destination (or save it again)")
+	}
+	resolved, err := resolveFileDestPath(cfg["path"])
+	if err != nil {
+		return "", fmt.Errorf("file: %w", err)
+	}
+	if resolved != checked {
+		return "", errors.New("file: path no longer resolves to the location checked when it was saved; save the destination again")
+	}
+	return resolved, nil
+}
+
+// handleDestinationTestFile checks the path against the current source
+// roots before the write probe touches it. A destination that passes
+// but was saved without (or with an outdated) checked location gets it
+// recorded, which is how rows from older builds become usable again.
+func (a *API) handleDestinationTestFile(w http.ResponseWriter, d Destination) {
+	stored := d.Config[fileCheckedPathKey]
+	if err := a.confineFileConfig(d.Config); err != nil {
+		http.Error(w, err.Error(), http.StatusForbidden)
+		return
+	}
+	if err := testConnectionFile(d.Config); err != nil {
+		http.Error(w, "connection test failed: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+	if d.Config[fileCheckedPathKey] != stored {
+		path := d.Config["path"]
+		err := a.dests.mutateConfig(d.Name, func(kind string, cfg map[string]string) error {
+			if kind != "file" || cfg["path"] != path {
+				return errors.New("destination changed during the test; run it again")
+			}
+			return a.confineFileConfig(cfg)
+		})
+		if err != nil {
+			http.Error(w, "connection test passed but recording the checked path failed: "+err.Error(), http.StatusConflict)
+			return
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func testConnectionFile(cfg map[string]string) error {
+	p, err := checkedFileDestPath(cfg)
+	if err != nil {
+		return err
 	}
 	info, err := os.Stat(p)
 	if err != nil {
@@ -813,33 +1012,99 @@ func testConnectionS3(ctx context.Context, cfg map[string]string) error {
 	}
 }
 
-// handleDestinationTestSFTP runs the SFTP probe and, on the first
-// successful test of an unpinned destination, stores the server's key
-// so every later connection (tests and sync jobs) must present it.
+// handleDestinationTestSFTP tests a destination whose server key is
+// pinned. For one that is not pinned (new, or its host or port changed)
+// it only reads the key the server presents, sending no credentials,
+// and returns it for the operator to compare with the server's real key
+// and confirm through handleDestinationHostKey. Nothing is pinned here.
 func (a *API) handleDestinationTestSFTP(ctx context.Context, w http.ResponseWriter, d Destination) {
 	defer func() {
 		for k := range d.Config {
 			d.Config[k] = ""
 		}
 	}()
-	newKey, err := testConnectionSFTP(ctx, d.Config)
-	if err != nil {
+	if strings.TrimSpace(d.Config["host_key"]) == "" {
+		key, err := fetchSFTPHostKey(ctx, d.Config)
+		if err != nil {
+			http.Error(w, "connection test failed: "+err.Error(), http.StatusBadGateway)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":                             false,
+			"host_key_confirmation_required": true,
+			"host_key":                       strings.TrimSpace(string(ssh.MarshalAuthorizedKey(key))),
+			"host_key_type":                  key.Type(),
+			"host_key_fingerprint":           ssh.FingerprintSHA256(key),
+		})
+		return
+	}
+	if err := testConnectionSFTP(ctx, d.Config); err != nil {
 		http.Error(w, "connection test failed: "+err.Error(), http.StatusBadGateway)
 		return
 	}
 	resp := map[string]any{"ok": true}
-	if newKey != "" {
-		d.Config["host_key"] = newKey
-		if err := a.dests.upsert(d, true); err != nil {
-			http.Error(w, "connection test passed but pinning the host key failed: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
-		resp["host_key_pinned"] = true
-	}
 	if pub, _, _, _, err := ssh.ParseAuthorizedKey([]byte(d.Config["host_key"])); err == nil {
 		resp["host_key_fingerprint"] = ssh.FingerprintSHA256(pub)
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// hostKeyConfirmRequest is the body of POST /api/destinations/{name}/host-key.
+// Fingerprint is the SHA256 fingerprint the operator compared; it must
+// match HostKey, so a confirmation always names the key it trusts.
+type hostKeyConfirmRequest struct {
+	HostKey     string `json:"host_key"`
+	Fingerprint string `json:"fingerprint"`
+}
+
+var errHostKeyAlreadyPinned = errors.New("a different host key is already pinned for this destination; to trust a rebuilt server, save the destination with its new host")
+
+// handleDestinationHostKey pins the server key an operator confirmed.
+// It refuses to replace a different existing pin.
+func (a *API) handleDestinationHostKey(w http.ResponseWriter, r *http.Request, name string) {
+	if !a.dests.encryptedReady() {
+		http.Error(w, "destinations are unavailable: set JM_ADMIN_KEY to enable encrypted credential storage", http.StatusServiceUnavailable)
+		return
+	}
+	var req hostKeyConfirmRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	pub, _, _, _, err := ssh.ParseAuthorizedKey([]byte(req.HostKey))
+	if err != nil {
+		http.Error(w, "host_key is not a valid public key", http.StatusBadRequest)
+		return
+	}
+	fp := ssh.FingerprintSHA256(pub)
+	if strings.TrimSpace(req.Fingerprint) != fp {
+		http.Error(w, "fingerprint does not match host_key", http.StatusBadRequest)
+		return
+	}
+	line := strings.TrimSpace(string(ssh.MarshalAuthorizedKey(pub)))
+	errNotSFTP := errors.New("only sftp destinations have a host key")
+	err = a.dests.mutateConfig(name, func(kind string, cfg map[string]string) error {
+		if kind != "sftp" {
+			return errNotSFTP
+		}
+		if old := strings.TrimSpace(cfg["host_key"]); old != "" && old != line {
+			return errHostKeyAlreadyPinned
+		}
+		cfg["host_key"] = line
+		return nil
+	})
+	switch {
+	case errors.Is(err, errDestinationNotFound):
+		http.Error(w, err.Error(), http.StatusNotFound)
+	case errors.Is(err, errNotSFTP):
+		http.Error(w, err.Error(), http.StatusBadRequest)
+	case errors.Is(err, errHostKeyAlreadyPinned):
+		http.Error(w, err.Error(), http.StatusConflict)
+	case err != nil:
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	default:
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "host_key_fingerprint": fp})
+	}
 }
 
 // sftpAddr is the host:port a destination connects to.
@@ -852,16 +1117,12 @@ func sftpAddr(cfg map[string]string) string {
 }
 
 // sftpHostKeyCallback checks the server key against the pinned key.
-// With no pin it trusts the presented key (trust on first use) and
-// records it in *seen for the caller to store. With a pin, any other
-// key fails the handshake before authentication, so no password or
-// key signature is sent to an impostor.
-func sftpHostKeyCallback(pinned string, seen *string) (ssh.HostKeyCallback, error) {
-	if pinned == "" {
-		return func(_ string, _ net.Addr, key ssh.PublicKey) error {
-			*seen = strings.TrimSpace(string(ssh.MarshalAuthorizedKey(key)))
-			return nil
-		}, nil
+// Any other key fails the handshake before authentication, so no
+// password or key signature is sent to an impostor. There is no
+// trust-on-first-use path: without a pin it refuses.
+func sftpHostKeyCallback(pinned string) (ssh.HostKeyCallback, error) {
+	if strings.TrimSpace(pinned) == "" {
+		return nil, errors.New("sftp: host key not confirmed; run Test Connection and confirm the server's fingerprint first")
 	}
 	want, _, _, _, err := ssh.ParseAuthorizedKey([]byte(pinned))
 	if err != nil {
@@ -876,14 +1137,58 @@ func sftpHostKeyCallback(pinned string, seen *string) (ssh.HostKeyCallback, erro
 	}, nil
 }
 
-// testConnectionSFTP dials, verifies the host key and authenticates.
-// It returns the server key in authorized_keys form when the
-// destination had no pin yet, so the caller can store it.
-func testConnectionSFTP(ctx context.Context, cfg map[string]string) (string, error) {
+// errSFTPHostKeyRead stops fetchSFTPHostKey's handshake once the key is
+// in hand, before the client reaches authentication.
+var errSFTPHostKeyRead = errors.New("host key read")
+
+// fetchSFTPHostKey returns the key the server presents. The handshake is
+// abandoned inside key exchange, so the server never sees a user name,
+// an auth method, a password or a key signature.
+func fetchSFTPHostKey(ctx context.Context, cfg map[string]string) (ssh.PublicKey, error) {
+	if strings.TrimSpace(cfg["host"]) == "" {
+		return nil, errors.New("host is required")
+	}
+	var seen ssh.PublicKey
+	ccfg := &ssh.ClientConfig{
+		HostKeyCallback: func(_ string, _ net.Addr, key ssh.PublicKey) error {
+			seen = key
+			return errSFTPHostKeyRead
+		},
+		Timeout: 4 * time.Second,
+	}
+	addr := sftpAddr(cfg)
+	dialer := &net.Dialer{Timeout: 4 * time.Second}
+	conn, err := dialer.DialContext(ctx, "tcp", addr)
+	if err != nil {
+		return nil, fmt.Errorf("tcp dial: %w", err)
+	}
+	defer conn.Close()
+	if dl, ok := ctx.Deadline(); ok {
+		_ = conn.SetDeadline(dl)
+	}
+	sshConn, chans, reqs, err := ssh.NewClientConn(conn, addr, ccfg)
+	if err == nil {
+		// Unreachable: the callback always fails the handshake.
+		_ = ssh.NewClient(sshConn, chans, reqs).Close()
+		return nil, errors.New("ssh handshake completed without a host key check")
+	}
+	if seen == nil {
+		return nil, fmt.Errorf("ssh handshake: %w", err)
+	}
+	return seen, nil
+}
+
+// testConnectionSFTP dials, verifies the pinned host key and
+// authenticates. It refuses when no key is pinned.
+func testConnectionSFTP(ctx context.Context, cfg map[string]string) error {
 	host := strings.TrimSpace(cfg["host"])
 	user := strings.TrimSpace(cfg["user"])
 	if host == "" || user == "" {
-		return "", errors.New("host and user are required")
+		return errors.New("host and user are required")
+	}
+	hostKeyCallback, err := sftpHostKeyCallback(cfg["host_key"])
+	if err != nil {
+		return err
 	}
 	authMethods := []ssh.AuthMethod{}
 	if pw := cfg["password"]; pw != "" {
@@ -896,17 +1201,12 @@ func testConnectionSFTP(ctx context.Context, cfg map[string]string) (string, err
 		// explicit so the operator knows what's missing.
 		signer, err := ssh.ParsePrivateKey([]byte(key))
 		if err != nil {
-			return "", fmt.Errorf("parse private_key: %w", err)
+			return fmt.Errorf("parse private_key: %w", err)
 		}
 		authMethods = append(authMethods, ssh.PublicKeys(signer))
 	}
 	if len(authMethods) == 0 {
-		return "", errors.New("no auth method (set password or private_key)")
-	}
-	var seen string
-	hostKeyCallback, err := sftpHostKeyCallback(cfg["host_key"], &seen)
-	if err != nil {
-		return "", err
+		return errors.New("no auth method (set password or private_key)")
 	}
 	cfg2 := &ssh.ClientConfig{
 		User:            user,
@@ -920,16 +1220,16 @@ func testConnectionSFTP(ctx context.Context, cfg map[string]string) (string, err
 	dialer := &net.Dialer{Timeout: 4 * time.Second}
 	conn, err := dialer.DialContext(ctx, "tcp", addr)
 	if err != nil {
-		return "", fmt.Errorf("tcp dial: %w", err)
+		return fmt.Errorf("tcp dial: %w", err)
 	}
 	defer conn.Close()
 	sshConn, chans, reqs, err := ssh.NewClientConn(conn, addr, cfg2)
 	if err != nil {
-		return "", fmt.Errorf("ssh handshake: %w", err)
+		return fmt.Errorf("ssh handshake: %w", err)
 	}
 	client := ssh.NewClient(sshConn, chans, reqs)
 	_ = client.Close()
-	return seen, nil
+	return nil
 }
 
 func testConnectionWebDAV(ctx context.Context, cfg map[string]string) error {
@@ -1030,9 +1330,12 @@ func (d Destination) ToSyncURI(preserveStructure bool) (string, []string, error)
 	var env []string
 	switch d.Kind {
 	case "file":
-		p := d.Config["path"]
-		if p == "" {
-			return "", nil, errors.New("file: path required")
+		// The one place a saved file destination becomes a sync
+		// target: refuse anything not inside the location the API
+		// checked against the source roots.
+		p, err := checkedFileDestPath(d.Config)
+		if err != nil {
+			return "", nil, err
 		}
 		uri = "file://" + p
 	case "s3", "b2":
@@ -1129,7 +1432,7 @@ func (d Destination) ToSyncURI(preserveStructure bool) (string, []string, error)
 func sftpKnownHostsFile(cfg map[string]string) (string, error) {
 	hk := strings.TrimSpace(cfg["host_key"])
 	if hk == "" {
-		return "", errors.New("sftp: host key not pinned; run Test Connection on this destination once to pin it")
+		return "", errors.New("sftp: host key not confirmed; run Test Connection on this destination and confirm the server's fingerprint")
 	}
 	pub, _, _, _, err := ssh.ParseAuthorizedKey([]byte(hk))
 	if err != nil {
