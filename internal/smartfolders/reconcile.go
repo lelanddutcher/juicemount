@@ -76,8 +76,9 @@ type OwnedView struct {
 	OwnedDir
 	Links map[string]*OwnedLink `json:"links,omitempty"` // by link name
 	Temps map[string]*OwnedTemp `json:"temps,omitempty"` // by temp name
-	// RemoveAs is the random hidden name in the root that RemoveView moves
-	// the (empty) view to before removing it there; set while that runs.
+	// RemoveAs is the random hidden name in the root an older Manager's
+	// RemoveView moved the (empty) view to before removing it there; set
+	// while that ran. Only read (settled) now; never written.
 	RemoveAs string `json:"remove_as,omitempty"`
 }
 
@@ -940,14 +941,25 @@ func (r *Reconciler) checkTarget(target string) error {
 // returned; the caller retries later. A view that does not exist is
 // forgotten.
 //
-// The directory is never removed by its name: it is moved, without
-// replacing, to a random hidden name in the root recorded first
-// (OwnedView.RemoveAs), and removed there only if it is the directory the
-// Manager created (same inode); anything else found there is moved back.
-// Rmdir refuses a directory that is not empty, so a user's entry put in
-// at the last moment is never removed either: the view goes back to its
-// name. An interrupted removal is settled by the next RemoveView or
-// Reconcile of the folder.
+// The directory is removed directly, by name, with the trash bypassed:
+// the one removal of a project root the RESP proxy lets the Manager make,
+// and only for an empty view it saw the Manager create directly in a
+// smart root. A refusal (EROFS from an older proxy, or for a view made
+// before the proxy kept that record) leaves the view as it is and is
+// returned. Right before the rmdir the name is checked to still be the
+// recorded directory (same inode), so a folder recreated under that name
+// is not removed; through the proxy, which only removes recorded views,
+// that holds without a window. Rmdir refuses a directory that is not
+// empty, so a user's entry put in at the last moment is never removed
+// either (ErrViewInUse). The only entry that may go with the view is a
+// lone regular ".DS_Store" (the Finder's), unlinked only if it is still the
+// file that was checked.
+//
+// Nothing is recorded first: a removal interrupted after the rmdir leaves
+// a record of a view that no longer exists, which Reconcile drops. Records
+// of an interrupted removal by an older Manager (OwnedView.RemoveAs, a view
+// moved aside to a hidden name) are settled by Reconcile, called first;
+// none are written any more.
 func (r *Reconciler) RemoveView(folder string) (Result, error) {
 	res, err := r.Reconcile(folder, nil)
 	if err != nil {
@@ -958,14 +970,15 @@ func (r *Reconciler) RemoveView(folder string) (Result, error) {
 		return res, nil
 	}
 	view := r.Root + "/" + folder
-	if ov.Pending || len(ov.Links)+len(ov.Temps) > 0 {
+	if ov.Pending || len(ov.Links)+len(ov.Temps) > 0 || ov.RemoveAs != "" {
 		return res, fmt.Errorf("%s: %w", view, ErrViewInUse)
 	}
 	names, err := r.FS.List(view, 2)
 	if err != nil {
 		return res, err
 	}
-	if only, _ := r.onlyFinderFile(view, names); len(names) > 0 && !only {
+	finder, finderIno := r.onlyFinderFile(view, names)
+	if len(names) > 0 && !finder {
 		return res, fmt.Errorf("%s: %w", view, ErrViewInUse)
 	}
 	release, err := r.gateView(view)
@@ -973,40 +986,32 @@ func (r *Reconciler) RemoveView(folder string) (Result, error) {
 		return res, err
 	}
 	defer release()
-	ov.RemoveAs = tempPrefix + randomSuffix()
-	if err := r.persist(); err != nil {
-		ov.RemoveAs = ""
-		return res, err
-	}
-	moveErr := r.FS.Place(view, r.Root+"/"+ov.RemoveAs)
-	if errors.Is(moveErr, fs.ErrNotExist) || errors.Is(moveErr, fs.ErrExist) {
-		moveErr = nil // nothing moved (the name went away, or the random name is taken)
-	}
-	// Whatever the move did (it may also have failed only in its reply),
-	// both names are inspected now.
-	removed, err := r.settleRemoval(folder, ov)
-	// A refused move changed nothing: the records are as they were before
-	// RemoveAs was recorded, so the state file is not written again (the
-	// stale RemoveAs it holds names a hidden path that never existed, which
-	// the next settle clears).
-	unchanged := moveErr != nil && err == nil && !removed && r.Own.Views[folder] == ov && ov.RemoveAs == ""
-	if !unchanged {
-		if perr := r.persist(); perr != nil {
-			err = errors.Join(err, perr)
-		}
-	}
+	info, err := r.FS.Lstat(view)
 	switch {
-	case removed || r.Own.Views[folder] == nil:
-		res.RemovedView = removed
-		return res, err
+	case errors.Is(err, fs.ErrNotExist):
+		delete(r.Own.Views, folder)
+		return res, r.persist()
 	case err != nil:
 		return res, err
-	case moveErr != nil:
-		// Refused (e.g. the RESP proxy lets only an admin rename or remove
-		// a folder at project depth): the view stays, empty.
-		return res, fmt.Errorf("removing %s: %w", view, moveErr)
-	default:
+	case info.Type != TypeDir || info.Ino != ov.Ino:
+		// Replaced since it was checked: someone else's, never removed.
+		delete(r.Own.Views, folder)
+		return res, errors.Join(fmt.Errorf("%s: %w", view, ErrNotManaged), r.persist())
+	}
+	if finder {
+		// Refused (replaced since it was looked at): Rmdir then finds the
+		// view not empty.
+		_ = r.removeFinderFile(view, finderIno)
+	}
+	switch err := r.FS.Rmdir(view); {
+	case err == nil || errors.Is(err, fs.ErrNotExist):
+		delete(r.Own.Views, folder)
+		res.RemovedView = true
+		return res, r.persist()
+	case errors.Is(err, syscall.ENOTEMPTY):
 		return res, fmt.Errorf("%s: %w", view, ErrViewInUse)
+	default:
+		return res, fmt.Errorf("removing %s: %w", view, err)
 	}
 }
 
