@@ -3175,6 +3175,15 @@
       kind.textContent = d.kind;
       head.appendChild(nm);
       head.appendChild(kind);
+      if (d.needs_check) {
+        // Saved by an older build: syncs and backups to it are refused
+        // until its path is checked against the source roots.
+        const badge = document.createElement('span');
+        badge.className = 'dest-kind-pill';
+        badge.textContent = 'needs Test';
+        badge.title = 'Run Test (or save again) to check this path against the source roots; syncs and backups to it are refused until then.';
+        head.appendChild(badge);
+      }
       li.appendChild(head);
       // Show the redacted config keys so the operator sees what's set
       // without revealing values.

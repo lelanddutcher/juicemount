@@ -4,12 +4,14 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 const destTestAdminKey = "dest-test-admin-key-not-for-production"
@@ -203,5 +205,123 @@ func TestFileDestinationRefusedWhenPathMovesOutsideAfterSave(t *testing.T) {
 	}
 	if uri, _, err := d.ToSyncURI(false); err == nil {
 		t.Errorf("ToSyncURI followed the swapped symlink to %q", uri)
+	}
+}
+
+func TestFileDestinationSubPathStaysInside(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	bk := filepath.Join(root, "bk")
+	if err := os.MkdirAll(filepath.Join(bk, "nested"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(bk, "link")); err != nil {
+		t.Fatal(err)
+	}
+	mux, store := registerDestTest(t, root, "")
+	if w := destRequest(t, mux, http.MethodPost, "/api/destinations", fileDestBody("bk", bk)); w.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", w.Code, w.Body.String())
+	}
+	d, err := store.getPlaintext("bk")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, sub := range []string{"../../etc", "nested/../../..", "link", "link/new", "/etc", "a\x00b"} {
+		if uri, _, err := d.ToSyncURIWithSub(sub, false); err == nil {
+			t.Errorf("sub-path %q accepted as %q", sub, uri)
+		}
+	}
+	resolved, _ := filepath.EvalSymlinks(bk)
+	for _, tc := range []struct {
+		sub      string
+		preserve bool
+		want     string
+	}{
+		{"", false, "file://" + resolved},
+		{"nested", false, "file://" + resolved + "/nested"},
+		{"nested/new/", false, "file://" + resolved + "/nested/new"},
+		{"nested", true, "file://" + resolved + "/nested"},
+	} {
+		uri, _, err := d.ToSyncURIWithSub(tc.sub, tc.preserve)
+		if err != nil {
+			t.Errorf("sub %q: %v", tc.sub, err)
+			continue
+		}
+		base, _, _ := d.ToSyncURI(tc.preserve)
+		if want := appendDestPath(base, tc.sub, tc.preserve); uri != want {
+			t.Errorf("sub %q preserve=%v: uri %q, appendDestPath gives %q", tc.sub, tc.preserve, uri, want)
+		}
+		if strings.TrimSuffix(uri, "/") != tc.want {
+			t.Errorf("sub %q: uri %q, want %q", tc.sub, uri, tc.want)
+		}
+	}
+
+	s3 := Destination{Name: "s", Kind: "s3", Config: map[string]string{
+		"endpoint": "https://s3.example.com", "bucket": "b", "access_key": "a", "secret_key": "k",
+	}}
+	base, _, _ := s3.ToSyncURI(true)
+	if uri, _, err := s3.ToSyncURIWithSub("/daily/", true); err != nil || uri != appendDestPath(base, "/daily/", true) {
+		t.Errorf("s3 sub-path: uri %q err %v, want %q", uri, err, appendDestPath(base, "/daily/", true))
+	}
+}
+
+func TestLegacyFileDestinationFlaggedInListingAndLog(t *testing.T) {
+	root := t.TempDir()
+	inside := filepath.Join(root, "backups")
+	if err := os.Mkdir(inside, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	statePath := filepath.Join(t.TempDir(), "state.json")
+	writeLegacyFileDestState(t, statePath, "legacy", inside)
+
+	var logs strings.Builder
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+	mux, _ := registerDestTest(t, root, statePath)
+	log.SetOutput(os.Stderr)
+	if !strings.Contains(logs.String(), "WARN") || !strings.Contains(logs.String(), "legacy") {
+		t.Errorf("startup log has no warning naming the unchecked destination:\n%s", logs.String())
+	}
+
+	needsCheck := func() bool {
+		w := destRequest(t, mux, http.MethodGet, "/api/destinations", "")
+		var out struct {
+			Destinations []struct {
+				Name       string `json:"name"`
+				NeedsCheck bool   `json:"needs_check"`
+			} `json:"destinations"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil || len(out.Destinations) != 1 {
+			t.Fatalf("list: %s (%v)", w.Body.String(), err)
+		}
+		return out.Destinations[0].NeedsCheck
+	}
+	if !needsCheck() {
+		t.Error("unchecked file destination not flagged needs_check")
+	}
+	if w := destRequest(t, mux, http.MethodPost, "/api/destinations/legacy/test", ""); w.Code != http.StatusOK {
+		t.Fatalf("test: %d %s", w.Code, w.Body.String())
+	}
+	if needsCheck() {
+		t.Error("checked destination still flagged needs_check")
+	}
+}
+
+func TestFileDestinationResolveIsBounded(t *testing.T) {
+	block := make(chan struct{})
+	t.Cleanup(func() { close(block) })
+	prevFn, prevTimeout := resolveFileDestPathFn, fileResolveTimeout
+	resolveFileDestPathFn = func(string) (string, error) { <-block; return "", nil }
+	fileResolveTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { resolveFileDestPathFn, fileResolveTimeout = prevFn, prevTimeout })
+
+	d := Destination{Name: "n", Kind: "file", Config: map[string]string{"path": "/srv/x", fileCheckedPathKey: "/srv/x"}}
+	start := time.Now()
+	_, _, err := d.ToSyncURI(false)
+	if err == nil || !strings.Contains(err.Error(), "timed out") {
+		t.Fatalf("err = %v, want a timeout", err)
+	}
+	if el := time.Since(start); el > 2*time.Second {
+		t.Errorf("ToSyncURI took %v on a hung path", el)
 	}
 }

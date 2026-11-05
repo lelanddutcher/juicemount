@@ -91,6 +91,11 @@ type Destination struct {
 	Config    map[string]string `json:"config,omitempty"`
 	CreatedAt int64             `json:"created_at,omitempty"`
 	UpdatedAt int64             `json:"updated_at,omitempty"`
+	// NeedsCheck marks a file destination whose path has not been
+	// checked against the source roots (saved by an older build). Syncs
+	// to it are refused until Test Connection or a re-save checks it.
+	// Listing only; never stored.
+	NeedsCheck bool `json:"needs_check,omitempty"`
 }
 
 // destinationStoreImpl owns the encrypted destinations slice in memory
@@ -168,6 +173,40 @@ func (s *destinationStoreImpl) load(rows []destinationsState) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.rows = append([]destinationsState(nil), rows...)
+	var unchecked []string
+	for _, r := range s.rows {
+		if r.Kind != "file" || len(s.key) != credKeyLen {
+			continue
+		}
+		if cfg, err := decryptRowConfig(r, s.key); err == nil && cfg[fileCheckedPathKey] == "" {
+			unchecked = append(unchecked, r.Name)
+		}
+	}
+	if len(unchecked) > 0 {
+		log.Printf("manager: WARN file destinations not yet checked against the source roots; syncs and backups to them are refused until each is tested or saved again on the Destinations page: %s",
+			strings.Join(unchecked, ", "))
+	}
+}
+
+// decryptRowConfig decrypts one stored row's config map.
+func decryptRowConfig(r destinationsState, key []byte) (map[string]string, error) {
+	blob, err := base64.StdEncoding.DecodeString(r.EncryptedConfig)
+	if err != nil {
+		return nil, fmt.Errorf("base64 decode: %w", err)
+	}
+	plaintext, err := decryptSecret(blob, key)
+	if err != nil {
+		return nil, err
+	}
+	var cfg map[string]string
+	err = json.Unmarshal(plaintext, &cfg)
+	for i := range plaintext {
+		plaintext[i] = 0
+	}
+	if err != nil {
+		return nil, fmt.Errorf("config unmarshal: %w", err)
+	}
+	return cfg, nil
 }
 
 // SetOnChange wires the persistence callback. Pulled out of the
@@ -245,11 +284,12 @@ func (s *destinationStoreImpl) listRedacted() ([]Destination, error) {
 			}
 		}
 		out = append(out, Destination{
-			Name:      r.Name,
-			Kind:      r.Kind,
-			Config:    redacted,
-			CreatedAt: r.CreatedAt,
-			UpdatedAt: r.UpdatedAt,
+			Name:       r.Name,
+			Kind:       r.Kind,
+			Config:     redacted,
+			CreatedAt:  r.CreatedAt,
+			UpdatedAt:  r.UpdatedAt,
+			NeedsCheck: r.Kind == "file" && cfg[fileCheckedPathKey] == "",
 		})
 	}
 	// Sort by name so the UI list ordering is stable across reloads.
@@ -705,10 +745,18 @@ func (a *API) handleDestinationUpdate(w http.ResponseWriter, r *http.Request, na
 	// while the edit still points at the same server. A new host or port
 	// drops it, and the next Test Connection asks the operator to
 	// confirm the new server's fingerprint before anything authenticates.
-	if d.Kind == "sftp" && d.Config["host_key"] == "" {
+	// A different key for the same server is refused here as it is on
+	// the host-key endpoint: replacing a pin means a new host or port.
+	if d.Kind == "sftp" {
 		if old, err := a.dests.getPlaintext(name); err == nil && old.Kind == "sftp" &&
 			sftpAddr(old.Config) == sftpAddr(d.Config) && old.Config["host_key"] != "" {
-			d.Config["host_key"] = old.Config["host_key"]
+			switch {
+			case d.Config["host_key"] == "":
+				d.Config["host_key"] = old.Config["host_key"]
+			case !sameAuthorizedKey(d.Config["host_key"], old.Config["host_key"]):
+				http.Error(w, errHostKeyAlreadyPinned.Error(), http.StatusConflict)
+				return
+			}
 		}
 	}
 	if err := a.dests.upsert(d, true); err != nil {
@@ -823,6 +871,46 @@ const fileCheckedPathKey = "checked_path"
 
 var errFileDestOutsideRoots = errors.New("destination outside permitted roots (a file destination must be inside a configured source-root mount)")
 
+// fileResolveTimeout bounds resolving a file destination's path, so a
+// stale network mount cannot hang a request or a scheduled backup.
+// resolveFileDestPathFn is the resolver; tests replace it.
+var (
+	fileResolveTimeout    = 5 * time.Second
+	resolveFileDestPathFn = resolveFileDestPath
+)
+
+// resolveFileDestPathBounded runs the resolver with fileResolveTimeout.
+// On timeout it refuses; the stuck lookup finishes (or not) in the
+// background without holding anything.
+func resolveFileDestPathBounded(p string) (string, error) {
+	type result struct {
+		path string
+		err  error
+	}
+	resolve, timeout := resolveFileDestPathFn, fileResolveTimeout
+	ch := make(chan result, 1)
+	go func() {
+		r, err := resolve(p)
+		ch <- result{r, err}
+	}()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case r := <-ch:
+		return r.path, r.err
+	case <-timer.C:
+		return "", fmt.Errorf("timed out after %v resolving the path (is its mount responding?)", timeout)
+	}
+}
+
+// pathWithin reports whether p is root or inside it. Both are clean.
+func pathWithin(p, root string) bool {
+	if p == root {
+		return true
+	}
+	return strings.HasPrefix(p, strings.TrimSuffix(root, string(filepath.Separator))+string(filepath.Separator))
+}
+
 // resolveFileDestPath cleans an absolute path and resolves symlinks in
 // the longest prefix that exists, so a not-yet-created leaf under a
 // symlinked directory still resolves to where it will really be
@@ -870,7 +958,7 @@ func (a *API) confineDestination(d Destination) error {
 func (a *API) confineFileConfig(cfg map[string]string) error {
 	delete(cfg, fileCheckedPathKey)
 	p := strings.TrimSpace(cfg["path"])
-	resolved, err := resolveFileDestPath(p)
+	resolved, err := resolveFileDestPathBounded(p)
 	if err != nil {
 		return err
 	}
@@ -889,7 +977,7 @@ func checkedFileDestPath(cfg map[string]string) (string, error) {
 	if checked == "" {
 		return "", errors.New("file: path has not been checked against the permitted roots; run Test Connection on this destination (or save it again)")
 	}
-	resolved, err := resolveFileDestPath(cfg["path"])
+	resolved, err := resolveFileDestPathBounded(cfg["path"])
 	if err != nil {
 		return "", fmt.Errorf("file: %w", err)
 	}
@@ -1105,6 +1193,14 @@ func (a *API) handleDestinationHostKey(w http.ResponseWriter, r *http.Request, n
 	default:
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "host_key_fingerprint": fp})
 	}
+}
+
+// sameAuthorizedKey reports whether two authorized_keys lines name the
+// same public key (comments and spacing aside).
+func sameAuthorizedKey(a, b string) bool {
+	ka, _, _, _, errA := ssh.ParseAuthorizedKey([]byte(a))
+	kb, _, _, _, errB := ssh.ParseAuthorizedKey([]byte(b))
+	return errA == nil && errB == nil && ka.Type() == kb.Type() && string(ka.Marshal()) == string(kb.Marshal())
 }
 
 // sftpAddr is the host:port a destination connects to.
@@ -1424,6 +1520,45 @@ func (d Destination) ToSyncURI(preserveStructure bool) (string, []string, error)
 	}
 	uri = matchSlash(uri, preserveStructure)
 	return uri, env, nil
+}
+
+// ToSyncURIWithSub is ToSyncURI plus an optional sub-path inside the
+// destination (a schedule's destination.path), with appendDestPath's
+// trimming and trailing-slash rules. For a file destination the sub-path
+// is joined onto the checked location and resolved, and must stay at or
+// below it: ".." segments and symlinks that lead out are refused, as is
+// an absolute sub-path. A NUL byte is refused for every kind.
+func (d Destination) ToSyncURIWithSub(sub string, preserveStructure bool) (string, []string, error) {
+	if strings.ContainsRune(sub, 0) {
+		return "", nil, errors.New("destination sub-path contains a NUL byte")
+	}
+	if d.Kind != "file" {
+		uri, env, err := d.ToSyncURI(preserveStructure)
+		if err != nil {
+			return "", nil, err
+		}
+		return appendDestPath(uri, sub, preserveStructure), env, nil
+	}
+	base, err := checkedFileDestPath(d.Config)
+	if err != nil {
+		return "", nil, err
+	}
+	sub = strings.TrimSpace(sub)
+	if filepath.IsAbs(sub) {
+		return "", nil, errors.New("file: destination sub-path must be relative to the destination")
+	}
+	target := base
+	if sub = strings.Trim(sub, "/"); sub != "" {
+		resolved, err := resolveFileDestPathBounded(filepath.Join(base, sub))
+		if err != nil {
+			return "", nil, fmt.Errorf("file: sub-path: %w", err)
+		}
+		if !pathWithin(resolved, base) {
+			return "", nil, errors.New("file: destination sub-path leads outside the destination")
+		}
+		target = resolved
+	}
+	return matchSlash("file://"+target, preserveStructure), nil, nil
 }
 
 // sftpKnownHostsFile writes the destination's pinned host key as a

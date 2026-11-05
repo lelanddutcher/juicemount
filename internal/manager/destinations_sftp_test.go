@@ -270,3 +270,32 @@ func TestValidateConfigRejectsBadSFTPHostKey(t *testing.T) {
 		t.Fatal("invalid host_key accepted")
 	}
 }
+
+// A PUT for the same server must not swap the pinned key; replacing a
+// pin goes through the confirmation endpoint (which refuses a
+// different key) or a change of host/port.
+func TestSFTPUpdateRefusesDifferentPinForSameServer(t *testing.T) {
+	mux, store := registerDestTest(t, t.TempDir(), "")
+	pinA, pinB := testHostKeyLine(t), testHostKeyLine(t)
+	body := func(port, hk string) string {
+		b, _ := json.Marshal(map[string]any{"name": "s", "kind": "sftp", "config": map[string]string{
+			"host": "h.example.com", "port": port, "user": "u", "password": "pw", "host_key": hk,
+		}})
+		return string(b)
+	}
+	if w := destRequest(t, mux, http.MethodPost, "/api/destinations", body("22", pinA)); w.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", w.Code, w.Body.String())
+	}
+	if w := destRequest(t, mux, http.MethodPut, "/api/destinations/s", body("22", pinB)); w.Code != http.StatusConflict {
+		t.Errorf("PUT with a different pin for the same server: %d, want 409", w.Code)
+	}
+	if d, _ := store.getPlaintext("s"); d.Config["host_key"] != pinA {
+		t.Fatalf("pin replaced by PUT")
+	}
+	if w := destRequest(t, mux, http.MethodPut, "/api/destinations/s", body("22", pinA)); w.Code != http.StatusOK {
+		t.Errorf("PUT with the same pin: %d", w.Code)
+	}
+	if w := destRequest(t, mux, http.MethodPut, "/api/destinations/s", body("2222", pinB)); w.Code != http.StatusOK {
+		t.Errorf("PUT with a new port and its own pin: %d", w.Code)
+	}
+}
