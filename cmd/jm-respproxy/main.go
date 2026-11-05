@@ -56,6 +56,18 @@ type fileConfig struct {
 	// removed); 0 = the auditlog defaults, -1 = no limit.
 	AuditRetainMB   int64 `json:"audit_retain_mb"`
 	AuditRetainDays int64 `json:"audit_retain_days"`
+	// SmartFolderRoots names the Manager's smart-folder roots in the
+	// volume root: the manager principal may remove an empty view folder
+	// it created directly under one (internal/respproxy smartview.go).
+	// Absent or empty: none. They must be the roots the Manager runs; the
+	// entrypoint renders them from the Manager's variables.
+	SmartFolderRoots []string `json:"smart_folder_roots"`
+}
+
+// smartRoots resolves smart_folder_roots; invalid names are left out and
+// reported.
+func (fc fileConfig) smartRoots() ([]string, []error) {
+	return respproxy.CleanSmartRoots(fc.SmartFolderRoots)
 }
 
 // auditOptions maps the config to the audit writer's options.
@@ -201,7 +213,11 @@ func main() {
 		closeJoined()
 		log.Fatal("proxy closed before lease engine startup")
 	}
-	leases = respproxy.NewLeaseEngine(respproxy.LeaseConfig{Side: p.Side(), VolumeDB: proxyCfg.VolumeDB})
+	smartRoots, badRoots := fc.smartRoots()
+	for _, err := range badRoots {
+		log.Printf("smart_folder_roots: left out: %v", err)
+	}
+	leases = respproxy.NewLeaseEngine(respproxy.LeaseConfig{Side: p.Side(), VolumeDB: proxyCfg.VolumeDB, SmartRoots: smartRoots})
 	err = leases.Start()
 	if err == nil {
 		p.SetPolicy(leases)
@@ -271,8 +287,8 @@ func main() {
 			return
 		}
 	}()
-	log.Printf("jm-respproxy: %s -> %s mode=%s principals=%d singleton=%v incarnation=%s",
-		fc.Listen, fc.Upstream, p.Mode(), ps.Len(), proxyCfg.Singleton, p.Incarnation())
+	log.Printf("jm-respproxy: %s -> %s mode=%s principals=%d singleton=%v incarnation=%s smart_folder_roots=%q",
+		fc.Listen, fc.Upstream, p.Mode(), ps.Len(), proxyCfg.Singleton, p.Incarnation(), smartRoots)
 	err = p.Serve(ln)
 	closeJoined()
 	<-controlDone

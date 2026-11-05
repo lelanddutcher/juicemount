@@ -60,11 +60,14 @@ package manager
 // real path.
 //
 // Through the RESP proxy (the default deployment) a view folder is a
-// project root (project depth 2), and the proxy lets only an admin rename
-// or remove one. There the old view of a renamed or deleted collection is
-// emptied but stays, recorded as the Manager's (reused if a collection
-// takes that name again) and reported under views_left. A view the volume
-// refused to remove is parked: tried again only after
+// project root (project depth 2). The proxy lets the Manager remove one
+// only by a direct rmdir without the trash, and only a view it recorded the
+// Manager creating directly in a smart root (respproxy/smartview.go);
+// renaming one stays admin-only. A view it refuses (an older proxy, a view
+// made before that record existed) is emptied but stays, recorded as the
+// Manager's (reused if a collection takes that name again) and reported
+// under views_left. A view the volume refused to remove is parked: tried
+// again only after
 // collectionViewsPark or a restart. Recorded views, left-behind ones
 // included, are capped at twice the view limit: at the cap no new view is
 // made and views left behind are not retried (both counted).

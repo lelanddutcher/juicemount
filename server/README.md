@@ -147,10 +147,12 @@ files that clash are labelled with their folder, as in `Recents`. A member
 whose file is gone gets no link (it stays a member). A deleted or renamed
 collection's view is emptied and then removed, unless a user put something in
 it (left alone; a lone Finder `.DS_Store` does not count and is removed with
-it) or the volume refuses: through the RESP proxy a view folder is a project
-root, which only an admin may rename or remove, so there it stays empty and
-is tried again only every 6 hours or after a restart (at most 256 views are
-recorded, left-behind ones included; beyond that none is made). A
+it) or the volume refuses. A view folder is a project root; the RESP proxy
+lets the Manager remove one only directly (no rename, no trash) and only when
+it saw the Manager create it in a smart root. A view it refuses (an older
+proxy, or a view made before it kept that record) stays empty and is tried
+again only every 6 hours or after a restart (at most 256 views are recorded,
+left-behind ones included; beyond that none is made). A
 member whose path cannot be read keeps its link. At most 128 views of 500
 links; the rest, missing and unresolved members and views left behind are
 counted in `GET /api/continuity/status` (`collection_views`). Views follow

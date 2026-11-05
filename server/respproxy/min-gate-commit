@@ -13,9 +13,11 @@
 # accounting hashes, and audit records bounded by encoded size. It also
 # includes the guard fix (trash-root and hourly-create classification, the
 # session and locked sets, the heartbeat gate, nextinode only as juicefs's
-# recorded batch step, and recorded inode batches for new inodes).
+# recorded batch step, and recorded inode batches for new inodes). It also
+# includes the Manager's removal of its own empty, recorded smart-folder
+# views and the entrypoint that renders the smart-folder roots it runs.
 #
 # Bump after changes to internal/respproxy or server/respproxy/entrypoint.sh.
 # TestH8BGateCoversEntrypointHandshake checks ancestry with full Git history.
 # A squash or rebase requires a new pin to the resulting release-line commit.
-c96836a23cbde2b3632728f4f49900bdb04652eb
+2e4e145e5c1dba2540bad0c5a124b6876663ab47
