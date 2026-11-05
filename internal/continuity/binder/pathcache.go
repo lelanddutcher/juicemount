@@ -48,6 +48,8 @@ func (c *pathCache) put(p string, ino uint64) {
 	}
 }
 
+func (c *pathCache) len() int { return c.order.Len() }
+
 func (c *pathCache) remove(p string) {
 	if e, ok := c.entries[p]; ok {
 		c.order.Remove(e)

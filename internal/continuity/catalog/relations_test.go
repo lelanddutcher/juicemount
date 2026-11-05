@@ -363,3 +363,37 @@ func TestRelationalSQLIdentityAndDeleteGuards(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// ListSourceLocations pages one source's active locations across assets.
+func TestListSourceLocations(t *testing.T) {
+	s, _ := relationalStore(t)
+	mine, other := testLocationValue(), testLocationValue()
+	mine.Source, other.Source = "hint:v1", "elsewhere"
+	onOther := mine
+	onOther.AssetID, onOther.Revision = otherAsset, ""
+	applyTest(t, s, testOperation("locations",
+		Change{PutLocation: &PutLocation{ID: "a", Value: mine}}, Change{PutLocation: &PutLocation{ID: "b", Value: other}},
+		Change{PutLocation: &PutLocation{ID: "c", Value: onOther}}, Change{PutLocation: &PutLocation{ID: "d", Value: mine}}))
+	d := getLocation(t, s, "d")
+	applyTest(t, s, testOperation("retire-d", Change{RemoveLocation: &RemoveLocation{ID: "d", Expected: locationState(d)}}))
+	ctx := context.Background()
+	all, err := s.ListSourceLocations(ctx, testLibrary, "hint:v1", "", 10)
+	if err != nil || len(all) != 2 || all[0].ID != "a" || all[1].ID != "c" || all[1].Value.AssetID != otherAsset {
+		t.Fatalf("source list: %+v, %v", all, err)
+	}
+	page, err := s.ListSourceLocations(ctx, testLibrary, "hint:v1", "a", 1)
+	if err != nil || len(page) != 1 || page[0].ID != "c" {
+		t.Fatalf("second page: %+v, %v", page, err)
+	}
+	for name, args := range map[string]struct {
+		source, after string
+		limit         int
+	}{"empty source": {"", "", 1}, "zero page": {"hint:v1", "", 0}, "bad cursor": {"hint:v1", "bad/key", 1}} {
+		if _, err := s.ListSourceLocations(ctx, testLibrary, args.source, args.after, args.limit); !errors.Is(err, ErrInvalid) {
+			t.Fatalf("%s: %v", name, err)
+		}
+	}
+	if _, err := s.ListSourceLocations(ctx, otherLibrary, "hint:v1", "", 1); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("wrong library: %v", err)
+	}
+}

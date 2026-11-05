@@ -50,11 +50,14 @@ func (b *Binder) AssetByPath(ctx context.Context, p string) (AssetView, error) {
 		b.cfg.Logf("continuity: resolving %q: %v", clean, err)
 		return AssetView{}, errors.New("continuity: could not read the volume")
 	}
-	loc, err := b.cfg.Store.GetLocation(ctx, b.library, LocationID(v.uuid, n.Ino))
+	s, err := b.records(ctx, v, n.Ino)
 	if err != nil {
 		return AssetView{}, err
 	}
-	return b.view(ctx, v, loc.Value.AssetID)
+	if s.ino == nil {
+		return AssetView{}, catalog.ErrNotFound
+	}
+	return b.view(ctx, v, s.ino.Value.AssetID)
 }
 
 // AssetByID returns one asset; paths resolve only once the volume is open.

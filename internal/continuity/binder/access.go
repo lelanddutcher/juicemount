@@ -5,8 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"sort"
-	"strconv"
-	"strings"
 	"syscall"
 
 	"github.com/lelanddutcher/juicemount/internal/continuity"
@@ -34,7 +32,7 @@ type Access struct {
 // if every name passes: the RESP proxy ties a write to a hard-linked inode
 // to all of its parents (respproxy/txnunit.go), so a person who could not
 // write the file may not act on it either. The inode comes from the asset's inode location,
-// including one the binder retired, so a file that left the catalog by a
+// else the latest one the binder retired, so a file that left the catalog by a
 // rename to a hidden name is still found; only a file whose inode is gone,
 // or that is only in the trash, is Missing. ctx is checked between volume
 // reads (they take no context of their own).
@@ -46,27 +44,27 @@ func (b *Binder) CheckAccess(ctx context.Context, id continuity.AssetID, allow f
 	if id.Validate() != nil {
 		return Access{}, fmt.Errorf("%w: asset id", catalog.ErrInvalid)
 	}
-	// The binder keeps two location records per asset; 100 is ample.
-	locs, err := b.cfg.Store.ListLocationRecords(ctx, b.library, id, "", 100)
+	refs, err := b.assetInodes(ctx, v, id)
 	if err != nil {
 		return Access{}, err
 	}
-	var ino uint64
-	hint := ""
-	for _, l := range locs {
-		switch l.Value.Source {
-		case Source(v.uuid):
-			digits, _ := strings.CutPrefix(l.Value.Locator, "ino:")
-			if n, err := strconv.ParseUint(digits, 10, 64); err == nil {
-				ino = n
-			}
-		case HintSource(v.uuid):
-			hint = l.Value.Locator
+	// Normally one inode. Should two live files ever carry the asset, every
+	// one must pass, as every name of a hard-linked file must.
+	out := Access{Missing: true} // never bound to a file of this volume, or all gone
+	for _, r := range refs {
+		a, err := b.checkInode(ctx, v, r.ino, r.hint, allow)
+		if err != nil || (!a.Missing && !a.Allowed) {
+			return a, err
+		}
+		if out.Missing && !a.Missing {
+			out = a
 		}
 	}
-	if ino == 0 {
-		return Access{Missing: true}, nil // never bound to a file of this volume
-	}
+	return out, nil
+}
+
+// checkInode is CheckAccess for one inode of the asset.
+func (b *Binder) checkInode(ctx context.Context, v *volume, ino uint64, hint string, allow func(volumePath string) bool) (Access, error) {
 	if err := ctx.Err(); err != nil {
 		return Access{}, err
 	}
@@ -143,12 +141,12 @@ func (b *Binder) AssetAt(ctx context.Context, p string) (continuity.AssetID, err
 	if err != nil {
 		return "", fmt.Errorf("%w: %v", ErrUnresolved, err)
 	}
-	loc, err := b.cfg.Store.GetLocation(ctx, b.library, LocationID(v.uuid, n.Ino))
+	s, err := b.records(ctx, v, n.Ino)
 	if err != nil {
 		return "", err
 	}
-	if loc.Removed {
+	if s.ino == nil || s.ino.Removed {
 		return "", catalog.ErrNotFound
 	}
-	return loc.Value.AssetID, nil
+	return s.ino.Value.AssetID, nil
 }

@@ -27,7 +27,19 @@ type Stats struct {
 	// PathCacheEvictions: recent paths forgotten, so a file later replaced
 	// at one of them (rename over it) is not noticed.
 	PathCacheEvictions uint64 `json:"path_cache_evictions"`
-	Complete           bool   `json:"complete"`
+	// Continued: replaced files whose asset the new file continued (a save
+	// by rename); Merged: of those, the new file's provisional asset was
+	// retired into it. NotContinued: replacements left as two assets (the
+	// new file is hard-linked or has an established asset of its own).
+	// NotContinuedNoRename: of those, no rename onto the path was seen (a
+	// new file where one vanished). PairsExhausted: restored files left
+	// out of the catalog, their inode having used all MaxGenerations pairs.
+	Continued            uint64 `json:"continued"`
+	Merged               uint64 `json:"merged"`
+	NotContinued         uint64 `json:"not_continued"`
+	NotContinuedNoRename uint64 `json:"not_continued_no_rename"`
+	PairsExhausted       uint64 `json:"pairs_exhausted"`
+	Complete             bool   `json:"complete"`
 }
 
 func (b *Binder) Stats() Stats {
@@ -48,7 +60,12 @@ func (b *Binder) Stats() Stats {
 		TooManyLinks: b.tooManyLinks.Load(),
 		Resubscribes: b.resubscribes.Load(),
 
-		PathCacheEvictions: b.paths.evictions.Load(),
+		PathCacheEvictions:   b.paths.evictions.Load(),
+		Continued:            b.continued.Load(),
+		Merged:               b.merged.Load(),
+		NotContinued:         b.notContinued.Load(),
+		NotContinuedNoRename: b.noRename.Load(),
+		PairsExhausted:       b.pairsExhausted.Load(),
 	}
 	if ns := b.observedSince.Load(); ns != 0 {
 		s.ObservedSince = time.Unix(0, ns).UTC()

@@ -370,6 +370,7 @@ func node(ino meta.Ino, attr *meta.Attr) Node {
 		Nlink:   attr.Nlink,
 		Parent:  uint64(attr.Parent),
 		InTrash: attr.Parent.IsTrash(),
+		Ctime:   time.Unix(attr.Ctime, int64(attr.Ctimensec)),
 	}
 }
 

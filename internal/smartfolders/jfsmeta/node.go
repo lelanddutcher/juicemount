@@ -1,6 +1,10 @@
 package jfsmeta
 
-import "github.com/lelanddutcher/juicemount/internal/smartfolders"
+import (
+	"time"
+
+	"github.com/lelanddutcher/juicemount/internal/smartfolders"
+)
 
 // Node is one inode as the continuity binder reads it: its number (the
 // file's identity in the volume), kind and link count.
@@ -12,4 +16,8 @@ type Node struct {
 	// InTrash: the only parent is a JuiceFS trash directory, so the
 	// file was deleted and is kept only for the trash's retention.
 	InTrash bool
+	// Ctime: the inode's last change. JuiceFS sets it when a name is added
+	// or removed: a rename (both the moved and the replaced inode), and an
+	// unlink or move into the trash.
+	Ctime time.Time
 }
