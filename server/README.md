@@ -234,7 +234,9 @@ volume; a page cut short says `budget_exhausted` and its `next` (always
 past the cursor given) continues it; with no `next` the scan is complete. A
 request that could not examine a single file in time answers 503 with
 `Retry-After`; retry it with the same cursor. `GET /api/continuity/asset/{asset_id}` returns one file (404 when it is
-gone or outside the caller's grants).
+gone or outside the caller's grants). The Mac side, `juicemount-mcp` (minting a
+token and adding the server to Claude Desktop or Claude Code), is described in
+`docs/agent-mcp.md`.
 
 Known gaps:
 
