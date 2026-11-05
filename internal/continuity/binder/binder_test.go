@@ -934,17 +934,19 @@ func TestCommonPathsListNoDirectories(t *testing.T) {
 // A file with more than MaxLinks names is left alone at once: no retries
 // holding up the single worker, its own counter.
 func TestTooManyLinksIsItsOwnOutcome(t *testing.T) {
+	// A retry would hold the worker for an hour, so feed returning within
+	// its deadline shows that nothing paused it. Timing the two events
+	// against the real 200 ms pause measured the machine's load instead.
+	saved := eventRetries
+	eventRetries = []time.Duration{time.Hour, time.Hour}
+	t.Cleanup(func() { eventRetries = saved }) // after the fixture stops its worker
 	f := newFixture(t, 0, true)
 	ino := f.create("Many/0.mov")
 	for i := 1; i <= MaxLinks; i++ {
 		f.link(ino, fmt.Sprintf("Many/%d.mov", i))
 	}
 	other := f.create("Projects/clip.mov")
-	start := time.Now()
 	f.feed(Event{Op: "create", Path: "Many/0.mov", Inode: ino}, Event{Op: "create", Path: "Projects/clip.mov", Inode: other})
-	if d := time.Since(start); d > eventRetries[0] {
-		t.Fatalf("two events took %s", d)
-	}
 	f.requireUnbound(ino)
 	f.requireBound(other, "Projects/clip.mov", "clip.mov")
 	if s := f.b.Stats(); s.TooManyLinks != 1 || s.Failed != 0 || s.Retried != 0 {
