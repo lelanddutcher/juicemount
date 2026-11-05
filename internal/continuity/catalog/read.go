@@ -63,6 +63,9 @@ func readRevision(ctx context.Context, q queryer, library continuity.LibraryID, 
 	}
 	a, err := readAsset(ctx, q, library, asset)
 	if err != nil {
+		if operationalError(err) {
+			return Revision{}, err
+		}
 		return Revision{}, fmt.Errorf("%w: revision asset: %v", ErrFormat, err)
 	}
 	if a.CreatedSequence > r.CreatedSequence {

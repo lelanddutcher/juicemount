@@ -136,6 +136,10 @@ starts at the beginning. Valid identity keys need not name an existing row.
 Pages are independently current, not a multi-page snapshot. Typed error categories
 distinguish invalid input, missing records, conflicts, changed retries, closed
 stores, and invalid/corrupt format; underlying errors remain available for inspection.
+ErrFormat is reserved for stored bytes or schema that fail decoding or validation.
+Context cancellation/deadlines and SQLite busy, locked, interrupt, out-of-memory,
+read-only, I/O, full and cannot-open failures are returned unwrapped, without
+ErrFormat: they say nothing about the catalog's contents and may be retried.
 
 Relationship lists select active inbound/outbound edges for an existing asset,
 with self edges once. Location lists select active observations for their owner.

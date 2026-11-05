@@ -6,11 +6,14 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
 
 	"github.com/lelanddutcher/juicemount/internal/continuity"
+	"modernc.org/sqlite"
+	sqlite3 "modernc.org/sqlite/lib"
 )
 
 const applicationID = 0x4a4d4341 // JMCA
@@ -298,9 +301,28 @@ func checkIntegrity(ctx context.Context, q queryer) error {
 	return formatError(rows.Err())
 }
 
+// formatError classifies a read failure as ErrFormat unless it is operational:
+// cancellation, lock contention, interruption or an I/O/resource failure says
+// nothing about the stored bytes and is returned unchanged for retry.
 func formatError(err error) error {
-	if err == nil {
-		return nil
+	if err == nil || operationalError(err) {
+		return err
 	}
 	return fmt.Errorf("%w: %w", ErrFormat, err)
+}
+
+func operationalError(err error) bool {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var se *sqlite.Error
+	if !errors.As(err, &se) {
+		return false
+	}
+	switch se.Code() & 0xff {
+	case sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED, sqlite3.SQLITE_NOMEM, sqlite3.SQLITE_READONLY,
+		sqlite3.SQLITE_INTERRUPT, sqlite3.SQLITE_IOERR, sqlite3.SQLITE_FULL, sqlite3.SQLITE_CANTOPEN:
+		return true
+	}
+	return false
 }
