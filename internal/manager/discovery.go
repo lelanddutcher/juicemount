@@ -47,7 +47,9 @@ package manager
 //
 // Pages. At most limit results (default 50, at most 200), and per request
 // at most findScanBudget hints read and findResolveBudget files resolved,
-// within the 30 s request deadline. The answer's next is the cursor to
+// within the 30 s request deadline; for an agent 20,000 hints, 250 files and
+// 10 s, so its one shared slot turns over. A request stops early, with a
+// cursor, as its deadline nears. The answer's next is the cursor to
 // continue from (the last hint examined); a page cut short by the budget
 // says budget_exhausted and may hold fewer results than limit, even none,
 // and still have a next. Without next the scan is complete. The order is
@@ -86,6 +88,11 @@ var (
 	// catalog, files resolved on the volume.
 	findScanBudget    = 100_000
 	findResolveBudget = 1_000
+	// An agent's request is smaller, so it fits its deadline
+	// (agentRequestTimeout) and the one agent slot turns over.
+	agentFindScanBudget    = 20_000
+	agentFindResolveBudget = 250
+	agentRequestTimeout    = 10 * time.Second
 
 	// findBeforeStat runs before each volume resolution (tests).
 	findBeforeStat func()
@@ -321,10 +328,20 @@ func (h *collectionsAPI) routeFind(w http.ResponseWriter, r *http.Request, svc *
 		return nil
 	}
 	ctx := c.ctx()
+	scanBudget, resolveBudget := findScanBudget, findResolveBudget
+	if actor.agent != nil {
+		scanBudget, resolveBudget = agentFindScanBudget, agentFindResolveBudget
+	}
+	// Stop with a cursor a fifth of the time before the deadline, so the
+	// answer is a page, not a timeout.
+	var softStop time.Time
+	if dl, ok := ctx.Deadline(); ok {
+		softStop = dl.Add(-time.Until(dl) / 5)
+	}
 	last, stopped := cursor, false
 	var stepErr error
 	scanErr := svc.binder.HintsAfter(ctx, cursor, func(hint binder.Hint) bool {
-		if out.Scanned >= findScanBudget || ctx.Err() != nil {
+		if out.Scanned >= scanBudget || ctx.Err() != nil || !softStop.IsZero() && time.Now().After(softStop) {
 			out.Budget, stopped = true, true
 			return false
 		}
@@ -333,7 +350,7 @@ func (h *collectionsAPI) routeFind(w http.ResponseWriter, r *http.Request, svc *
 			last = hint.ID
 			return true
 		}
-		if out.Resolved >= findResolveBudget {
+		if out.Resolved >= resolveBudget {
 			out.Scanned--
 			out.Budget, stopped = true, true
 			return false

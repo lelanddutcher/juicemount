@@ -267,3 +267,199 @@ func TestAgentRefusedTokenAudited(t *testing.T) {
 		t.Fatalf("revoked token listed: %+v", got)
 	}
 }
+
+// Revoked and expired tokens are kept as tombstones only up to
+// agentTombstonesPerPerson per person and agentTombstonesTotal in all, the
+// newest kept; a dropped tombstone's token stays refused, as unknown.
+func TestAgentTokenTombstonesBounded(t *testing.T) {
+	e := newAgentEnv(t)
+	savedTotal := agentTombstonesTotal
+	defer func() { agentTombstonesTotal = savedTotal }()
+	var first mintReply
+	for i := 0; i < 60; i++ {
+		m := e.mint("Ann", map[string]any{"name": "churn"})
+		if i == 0 {
+			first = m
+		}
+		if rec := e.do("Ann", http.MethodDelete, "/api/agent-tokens/"+m.AgentToken.ID, nil); rec.Code != 200 {
+			t.Fatalf("revoke %d: %d", i, rec.Code)
+		}
+	}
+	stored := func() map[string]int {
+		t.Helper()
+		disk, err := os.ReadFile(e.people.opts.StatePath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var f struct {
+			AgentTokens []AgentToken `json:"agent_tokens"`
+		}
+		if err := json.Unmarshal(disk, &f); err != nil {
+			t.Fatal(err)
+		}
+		out := map[string]int{}
+		for _, tk := range f.AgentTokens {
+			out[tk.Person]++
+		}
+		return out
+	}
+	if n := stored()[e.ids["Ann"]]; n != agentTombstonesPerPerson {
+		t.Fatalf("Ann's tombstones: %d, want %d", n, agentTombstonesPerPerson)
+	}
+	// The oldest was dropped: its token is unknown now, still refused, and
+	// the refusal names no token.
+	rec := e.do(first.Token, http.MethodGet, "/api/collections", nil)
+	if rec.Code != 401 || !strings.Contains(rec.Body.String(), "unknown or revoked") {
+		t.Fatalf("dropped tombstone's token: %d %s", rec.Code, rec.Body)
+	}
+	for _, r := range e.auditRecords() {
+		if r.Type == auditlog.TypeRefused && r.Agent == first.AgentToken.ID {
+			t.Fatalf("refusal recorded for an unknown token: %+v", r)
+		}
+	}
+	// The bound across everyone: Bob's newer tombstones push out Ann's.
+	agentTombstonesTotal = 25
+	for i := 0; i < 10; i++ {
+		m := e.mint("Bob", map[string]any{"name": "churn"})
+		e.do("Bob", http.MethodDelete, "/api/agent-tokens/"+m.AgentToken.ID, nil)
+	}
+	got := stored()
+	if got[e.ids["Bob"]] != 10 || got[e.ids["Ann"]] != 15 {
+		t.Fatalf("after Bob's churn: %v", got)
+	}
+	// A live token is never dropped for a tombstone.
+	live := e.mint("Ann", map[string]any{"name": "live"})
+	if rec := e.do(live.Token, http.MethodGet, "/api/collections", nil); rec.Code != 200 {
+		t.Fatalf("live token: %d", rec.Code)
+	}
+}
+
+// A revoke that lands while the edit's intent is being written stops the
+// edit: refused outcome, 401, nothing changed.
+func TestAgentRevokeDuringIntentStopsEdit(t *testing.T) {
+	e := newAgentEnv(t)
+	m := e.mint("Ann", map[string]any{"name": "agent"})
+	col := string(e.write("Ann", "/api/collections", map[string]any{"name": "Picks"}, 200).Collection.ID)
+	e.h.audit.Close()
+	var armed atomic.Bool
+	dir := t.TempDir()
+	w, err := auditlog.Open(dir, auditlog.Options{BeforeWrite: func() error {
+		if armed.CompareAndSwap(true, false) {
+			if _, err := e.people.revokeAgentToken(m.AgentToken.ID, ""); err != nil {
+				t.Errorf("revoke: %v", err)
+			}
+		}
+		return nil
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.h.audit.mu.Lock()
+	e.h.audit.w = w
+	e.h.audit.mu.Unlock()
+	armed.Store(true)
+	rec := e.do(m.Token, http.MethodPost, "/api/collections/"+col+"/members/add", map[string]any{"members": pathRefs("Clients/A/one.mov")})
+	if armed.Load() {
+		t.Fatal("the revoke did not run")
+	}
+	if rec.Code != 401 {
+		t.Fatalf("edit revoked during its intent: %d %s", rec.Code, rec.Body)
+	}
+	if n := len(e.members(catalog.CollectionID(col), "").Members); n != 0 {
+		t.Fatalf("members: %d", n)
+	}
+	if err := w.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	page, err := auditlog.Query(dir, auditlog.Filter{}, 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	outcomes := map[uint64]string{}
+	for _, r := range page.Records {
+		if r.Type == auditlog.TypeOutcome {
+			outcomes[r.Unit] = r.Outcome
+		}
+	}
+	intents := 0
+	for _, r := range page.Records {
+		if r.Type == auditlog.TypeIntent && r.Action == "collection-add-members" {
+			intents++
+			if outcomes[r.Seq] != auditlog.OutcomeRefused {
+				t.Fatalf("outcome of the revoked edit: %q", outcomes[r.Seq])
+			}
+		}
+	}
+	if intents != 1 {
+		t.Fatalf("intents: %d", intents)
+	}
+}
+
+// Agents' finds are cut to an agent-sized budget and deadline, so two agents
+// alternating long finds through the one agent slot both make progress, and
+// neither is ever turned away for a busy pool.
+func TestAgentFindsShareTheAgentSlot(t *testing.T) {
+	e := newDiscoveryEnv(t)
+	savedWait, savedResolve := collectionBusyWait, agentFindResolveBudget
+	collectionBusyWait, agentFindResolveBudget = 300*time.Millisecond, 4
+	defer func() { collectionBusyWait, agentFindResolveBudget = savedWait, savedResolve }()
+	findBeforeStat = func() { time.Sleep(15 * time.Millisecond) }
+	defer func() { findBeforeStat = nil }()
+	toks := []string{e.mint("Ann", map[string]any{"name": "a"}).Token, e.mint("Al", map[string]any{"name": "b"}).Token}
+	found := make([]int, 2)
+	busy := make([]int, 2)
+	var wg sync.WaitGroup
+	for i, tok := range toks {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			cursor := ""
+			for n := 0; n < 200; n++ {
+				q := url.Values{"limit": {"200"}}
+				if cursor != "" {
+					q.Set("cursor", cursor)
+				}
+				rec := e.do(tok, http.MethodGet, "/api/continuity/find?"+q.Encode(), nil)
+				if rec.Code == 503 {
+					busy[i]++
+					continue
+				}
+				var r findReply
+				if rec.Code != 200 || json.Unmarshal(rec.Body.Bytes(), &r) != nil {
+					t.Errorf("agent %d: %d %s", i, rec.Code, rec.Body)
+					return
+				}
+				found[i] += len(r.Files)
+				if cursor = r.Next; cursor == "" {
+					return
+				}
+			}
+			t.Errorf("agent %d made no end", i)
+		}()
+	}
+	wg.Wait()
+	if found[0] != 24 || found[1] != 35 || busy[0]+busy[1] != 0 {
+		t.Fatalf("found %v, turned away %v", found, busy)
+	}
+}
+
+// An agent's request has its own, shorter deadline: a find that would run
+// past it stops early with a cursor.
+func TestAgentFindStopsAtItsDeadline(t *testing.T) {
+	e := newDiscoveryEnv(t)
+	saved := agentRequestTimeout
+	agentRequestTimeout = 200 * time.Millisecond
+	defer func() { agentRequestTimeout = saved }()
+	findBeforeStat = func() { time.Sleep(20 * time.Millisecond) }
+	defer func() { findBeforeStat = nil }()
+	tok := e.mint("Al", map[string]any{"name": "a"}).Token
+	start := time.Now()
+	r := e.find(tok, url.Values{"limit": {"200"}})
+	if took := time.Since(start); took > 400*time.Millisecond || !r.Budget || r.Next == "" || len(r.Files) == 0 || len(r.Files) >= 35 {
+		t.Fatalf("agent find took %v: %d files, budget %v, next %q", took, len(r.Files), r.Budget, r.Next)
+	}
+	// A Mac's request is not cut by the agent deadline.
+	if r := e.find("Al", url.Values{"limit": {"200"}}); len(r.Files) != 35 || r.Budget {
+		t.Fatalf("Mac find: %d files, budget %v", len(r.Files), r.Budget)
+	}
+}

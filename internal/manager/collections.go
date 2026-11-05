@@ -44,8 +44,9 @@ package manager
 // are also in the Manager's catalog audit log, with its token
 // (agenttokens.go; the proxy's audit log has a single writer).
 //
-// Cost. Requests that read the volume have a 30 s deadline and take a slot:
-// people share two, the admin has one of its own, and each actor has at
+// Cost. Requests that read the volume have a 30 s deadline (an agent's,
+// 10 s) and take a slot: people's Macs share two, agents one of their own,
+// the admin has one, and each actor (a person with their agents) has at
 // most one such request at a time (a second gets 503). A member page holds
 // at most 100 members. Residual: jfsmeta reads take no context, so a hung
 // volume read holds its slot past the deadline until it returns.
@@ -475,10 +476,15 @@ func (h *collectionsAPI) serveWith(w http.ResponseWriter, r *http.Request, base 
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no such route"})
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), collectionRequestTimeout)
+	actor, err := h.authenticate(r)
+	// An agent's request is shorter, so the one agent slot turns over.
+	timeout := collectionRequestTimeout
+	if actor.agent != nil {
+		timeout = agentRequestTimeout
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), timeout)
 	defer cancel()
 	r = r.WithContext(ctx)
-	actor, err := h.authenticate(r)
 	if err == nil && actor.agent != nil && !agentMay(r.Method, base, parts) {
 		err = failf(http.StatusForbidden, "agent tokens may not %s %s (agents read, find files and edit collections)", r.Method, strings.Join(append([]string{base}, parts...), "/"))
 	}
@@ -724,7 +730,7 @@ func (c *collectionCall) members(id catalog.CollectionID) error {
 		return err
 	}
 	// Withheld: members an agent may not see (agentVisible), counted
-	// without names; the page then reads on, up to findResolveBudget
+	// without names; the page then reads on, up to agentFindResolveBudget
 	// members, to fill itself. Macs and the admin see every member.
 	out := struct {
 		Collection CollectionView `json:"collection"`
@@ -743,7 +749,7 @@ func (c *collectionCall) members(id catalog.CollectionID) error {
 			if err := c.ctx().Err(); err != nil {
 				return err
 			}
-			if c.actor.agent != nil && read >= findResolveBudget {
+			if c.actor.agent != nil && read >= agentFindResolveBudget {
 				stopped = true
 				break
 			}
@@ -993,6 +999,12 @@ func (c *collectionCall) apply(opID string, id catalog.CollectionID, changes []c
 		var err error
 		if unit, err = c.audit.intent(rec); err != nil {
 			return err
+		}
+		// And again once the intent is on disk (the write can take a while).
+		if err := c.people.agentTokenWorks(c.actor.agent.ID); err != nil {
+			refused := failf(http.StatusUnauthorized, "%v", err)
+			c.audit.outcome(unit, c.actor.auditWho(), refused)
+			return refused
 		}
 	}
 	receipt, err := c.svc.store.Apply(c.ctx(), catalog.Operation{

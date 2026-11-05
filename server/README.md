@@ -224,7 +224,9 @@ ignoring case), `folder` (repeatable), `collection`, `modified_after` (RFC
 most 200) and `cursor` (the previous answer's `next`). Each result has the
 asset ID, current name, first label, the catalog's path hint, the current
 path under the mount root, size, modification time and its collections. A
-person (or their agent) sees only files their grants cover; for them
+person (or their agent) sees only files their grants cover (an agent's
+request reads at most 20,000 hints and resolves 250 files within 10 s, so
+agents, which share one request slot, take turns); for them
 `path_hint` is shown only inside their grants and `label` only when it is
 the file's current name. A request reads
 at most 100,000 catalog hints and resolves at most 1,000 files on the

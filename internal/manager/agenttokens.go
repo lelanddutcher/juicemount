@@ -29,8 +29,9 @@ package manager
 // Mac or person no longer fits, so revoking a Mac and approving it again, or
 // reassigning it away and back, does not bring a token back. A revoked or
 // expired token stays in the store as a tombstone until 30 days after its
-// expiry, so its use is refused by name and recorded in the audit log (at
-// most once a minute per token).
+// expiry (the newest 20 a person and 2,000 in all), so its use is refused
+// by name and recorded in the audit log (at most once a minute per token);
+// a token whose tombstone is gone is unknown, refused without a name.
 //
 // Lists and revokes. GET /api/agent-tokens: a person (from a Mac) lists
 // their own tokens, the admin every token. POST /api/agent-tokens/{id}/revoke
@@ -91,6 +92,10 @@ var (
 	// agentAuditTimeout bounds the wait for an intent record to reach the
 	// disk (a variable for tests).
 	agentAuditTimeout = 5 * time.Second
+
+	// Tombstones kept: per person and in all (variables for tests).
+	agentTombstonesPerPerson = 20
+	agentTombstonesTotal     = 2000
 )
 
 // AgentToken is one agent token as the principal store keeps it.
@@ -170,17 +175,46 @@ func (s *PrincipalStore) agentTokenProblemLocked(t *AgentToken, now time.Time) e
 // expiry) and returns the rest, by ID, for the store file.
 func (s *PrincipalStore) agentTokensToKeepLocked() []AgentToken {
 	now := s.opts.Now()
-	var out []AgentToken
+	var out, tombs []AgentToken
 	for id, t := range s.agentTokens {
 		err := s.agentTokenProblemLocked(t, now)
 		tomb := (errors.Is(err, errAgentTokenRevoked) || errors.Is(err, errAgentTokenExpired)) &&
 			now.Before(time.UnixMilli(t.ExpiresAt).Add(agentTokenTombstone))
-		if err != nil && !tomb {
+		switch {
+		case err == nil:
+			out = append(out, *t)
+		case tomb:
+			tombs = append(tombs, *t)
+		default:
 			log.Printf("manager: agent token %s (%q) of person %s from %s dropped: %v", t.ID, t.Name, t.Person, t.Mac, err)
 			delete(s.agentTokens, id)
+		}
+	}
+	// The newest tombstones (by when the token stopped), at most
+	// agentTombstonesPerPerson a person and agentTombstonesTotal in all. A
+	// dropped one's token is unknown from then on: still refused.
+	ended := func(t AgentToken) int64 {
+		if t.RevokedAt != 0 && t.RevokedAt < t.ExpiresAt {
+			return t.RevokedAt
+		}
+		return t.ExpiresAt
+	}
+	sort.Slice(tombs, func(i, j int) bool {
+		if a, b := ended(tombs[i]), ended(tombs[j]); a != b {
+			return a > b
+		}
+		return tombs[i].ID > tombs[j].ID
+	})
+	perPerson := map[string]int{}
+	kept := 0
+	for _, t := range tombs {
+		if perPerson[t.Person] >= agentTombstonesPerPerson || kept >= agentTombstonesTotal {
+			delete(s.agentTokens, t.ID)
 			continue
 		}
-		out = append(out, *t)
+		perPerson[t.Person]++
+		kept++
+		out = append(out, t)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out
