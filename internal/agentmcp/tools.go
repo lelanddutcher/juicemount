@@ -67,11 +67,16 @@ type ToolAnnotations struct {
 }
 
 // toolError is a failure the agent sees as the tool's result (isError).
-type toolError struct{ msg string }
+type toolError struct {
+	msg string
+	// opID: a write whose outcome is unknown, and the operation_id that
+	// retries it.
+	opID string
+}
 
 func (e *toolError) Error() string { return e.msg }
 
-func argErr(format string, a ...any) error { return &toolError{fmt.Sprintf(format, a...)} }
+func argErr(format string, a ...any) error { return &toolError{msg: fmt.Sprintf(format, a...)} }
 
 var readOnly = ToolAnnotations{ReadOnly: true, Idempotent: true}
 
@@ -374,9 +379,9 @@ func (t *Tools) client() (*Client, error) {
 	c, err := t.Client()
 	switch {
 	case errors.Is(err, ErrNoToken):
-		return nil, &toolError{"No agent token is stored on this Mac. A person must mint one in a terminal: juicemount-mcp token create --name <name>."}
+		return nil, &toolError{msg: "No agent token is stored on this Mac. A person must mint one in a terminal: juicemount-mcp token create --name <name>."}
 	case err != nil:
-		return nil, &toolError{fmt.Sprintf("The agent token on this Mac cannot be read (%v). Run juicemount-mcp token create again, or allow juicemount-mcp access to it in Keychain Access.", err)}
+		return nil, &toolError{msg: fmt.Sprintf("The agent token on this Mac cannot be read (%v). Run juicemount-mcp token create again, or allow juicemount-mcp access to it in Keychain Access.", err)}
 	}
 	return c, nil
 }
@@ -487,7 +492,7 @@ func (t *Tools) getFile(ctx context.Context, raw json.RawMessage) (any, error) {
 	v, ok := t.fileOut(f)
 	if !ok {
 		t.noteRefused("get_file", 1)
-		return nil, &toolError{"the Manager returned a path for this file that would leave the mount root; it was refused"}
+		return nil, &toolError{msg: "the Manager returned a path for this file that would leave the mount root; it was refused"}
 	}
 	return v, nil
 }
@@ -690,6 +695,13 @@ func assetRefs(ids []string) ([]memberRef, error) {
 	return out, nil
 }
 
+// writeResult is a change's answer.
+type writeResult struct {
+	Collection  json.RawMessage `json:"collection"`
+	Operation   json.RawMessage `json:"operation"`
+	OperationID string          `json:"operation_id"`
+}
+
 // write sends a change with its operation_id, again with the same one when
 // the answer was lost or the Manager was busy (503): the Manager applies an
 // operation_id once and answers a repeat with the first result. Once an
@@ -728,16 +740,12 @@ func (t *Tools) write(ctx context.Context, path, opID string, body any) (any, er
 	}
 	if err != nil && uncertain {
 		return nil, &toolError{fmt.Sprintf("%s. The change may or may not have been made: call again with operation_id %q (and the same arguments) to retry it safely; it is applied at most once.",
-			strings.TrimSuffix(errorMessage(err), "."), opID)}
+			strings.TrimSuffix(errorMessage(err), "."), opID), opID}
 	}
 	if err != nil {
 		return nil, err
 	}
-	return struct {
-		Collection  json.RawMessage `json:"collection"`
-		Operation   json.RawMessage `json:"operation"`
-		OperationID string          `json:"operation_id"`
-	}{reply.Collection, reply.Operation, opID}, nil
+	return writeResult{reply.Collection, reply.Operation, opID}, nil
 }
 
 func (t *Tools) createCollection(ctx context.Context, raw json.RawMessage) (any, error) {

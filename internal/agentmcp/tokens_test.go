@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
@@ -313,4 +314,30 @@ func TestCleartextWarning(t *testing.T) {
 	if err := e.tc.Import(context.Background(), strings.NewReader(mintedToken), "http://nas.invalid:1"); err != nil || !strings.Contains(e.err.String(), "plain http") {
 		t.Fatalf("import over http: %v %q", err, e.err)
 	}
+}
+
+// A store that removed the token it held and then failed to store the new
+// one says so, and says the old token is still live on the Manager.
+func TestStoreFailureAfterRemovingPrevious(t *testing.T) {
+	e := newTokenEnv(t)
+	old := TokenRecord{ID: "1111111111111111", Token: "jma_1111111111111111_" + strings.Repeat("1", 64), ManagerURL: "http://nas.example"}
+	e.store.rec = &old
+	e.store.saveErr = fmt.Errorf("%w (keychain add refused)", ErrPreviousTokenRemoved)
+	e.f.on("GET /manager/api/collections", 200, map[string]any{"collections": []any{}})
+	err := e.tc.Import(context.Background(), strings.NewReader(mintedToken), e.mustMac(t).ManagerURL)
+	want := "The token stored here before (1111111111111111) was removed from this machine but is still live on the Manager: run juicemount-mcp token list, and juicemount-mcp token revoke 1111111111111111"
+	if err == nil || !strings.Contains(err.Error(), want) {
+		t.Fatalf("import: %v", err)
+	}
+	e.f.on("POST /manager/api/agent-tokens", 200, mintAnswer())
+	e.f.on("POST /manager/api/agent-tokens/"+mintedID+"/revoke", 200, map[string]string{"revoked": mintedID})
+	if err := e.tc.Create(context.Background(), "x", 0, false); err == nil || !strings.Contains(err.Error(), want) || !strings.Contains(err.Error(), "revoked on the Manager") {
+		t.Fatalf("create: %v", err)
+	}
+	// Another store failure removed nothing and says nothing about it.
+	e.store.saveErr = errors.New("keychain locked")
+	if err := e.tc.Import(context.Background(), strings.NewReader(mintedToken), e.mustMac(t).ManagerURL); err == nil || strings.Contains(err.Error(), "was removed") {
+		t.Fatalf("plain failure: %v", err)
+	}
+	e.noSecrets(t, false)
 }

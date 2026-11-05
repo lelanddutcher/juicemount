@@ -36,6 +36,9 @@ import (
 
 const defaultMount = "/Volumes/zpool"
 
+// shutdownWait bounds the wait for Serve after a signal.
+const shutdownWait = 2 * time.Second
+
 func main() {
 	os.Exit(run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr))
 }
@@ -128,7 +131,14 @@ func serve(ctx context.Context, args []string, stdin io.Reader, stdout, stderr i
 	case err := <-done:
 		return err
 	case <-ctx.Done():
+		// Serve cancels the running call and logs what it leaves (a write's
+		// operation_id); give it a moment to do so.
 		logger.Printf("signalled; shutting down")
+		select {
+		case <-done:
+		case <-time.After(shutdownWait):
+			logger.Printf("the running tool call did not end within %v", shutdownWait)
+		}
 		return nil
 	}
 }
@@ -227,7 +237,13 @@ func macCredentials() (agentmcp.MacCredentials, error) {
 // keychainStore keeps the token record with internal/credstore.
 type keychainStore struct{}
 
-func (keychainStore) Save(r agentmcp.TokenRecord) error { return credstore.SaveAgentToken(r.Encode()) }
+func (keychainStore) Save(r agentmcp.TokenRecord) error {
+	err := credstore.SaveAgentToken(r.Encode())
+	if errors.Is(err, credstore.ErrStoredRecordRemoved) {
+		return fmt.Errorf("%w (%v)", agentmcp.ErrPreviousTokenRemoved, err)
+	}
+	return err
+}
 
 func (keychainStore) Load() (agentmcp.TokenRecord, error) {
 	raw, err := credstore.LoadAgentToken()

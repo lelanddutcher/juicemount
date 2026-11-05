@@ -44,6 +44,10 @@ func slowManager(t *testing.T) (srv *httptest.Server, hits *atomic.Int32, arrive
 
 var opIDInText = regexp.MustCompile(`operation_id "(mcp-[0-9a-f]{24})"`)
 
+var opIDInLog = regexp.MustCompile(`operation_id mcp-[0-9a-f]{24} retries it safely`)
+
+func opIDLogged(logs string) bool { return opIDInLog.MatchString(logs) }
+
 // A write whose answers never come before the deadline still tells the agent
 // the operation_id it was sent with, whether each attempt timed out on its
 // own or the whole call ran out of time.
@@ -165,18 +169,29 @@ func TestCancelAndBusyWhileToolRuns(t *testing.T) {
 		t.Fatalf("expected the ping's answer first: %+v", r)
 	}
 	s.sendRaw(`{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":"w1","reason":"user"}}`)
-	r = s.recv()
-	var res callResult
-	if string(r.ID) != `"w1"` || json.Unmarshal(r.Result, &res) != nil || !res.IsError || opIDInText.FindString(res.Content[0].Text) == "" {
-		t.Fatalf("cancelled write: %s %s", r.ID, r.Result)
+	// The cancelled call gets no answer; its operation_id goes to the log.
+	deadline := time.Now().Add(5 * time.Second)
+	for !opIDLogged(s.logs.String()) {
+		if time.Now().After(deadline) {
+			t.Fatalf("no operation_id logged: %s", s.logs)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !strings.Contains(s.logs.String(), "cancelled by the client, not answered") {
+		t.Fatalf("log: %s", s.logs)
 	}
 	if hits.Load() != 1 {
 		t.Fatalf("a cancelled write was sent again: %d requests", hits.Load())
 	}
-	// The next call runs.
+	// The next message read is the ping's answer: nothing for w1.
 	s.sendRaw(`{"jsonrpc":"2.0","id":"p3","method":"ping"}`)
 	if r := s.recv(); string(r.ID) != `"p3"` {
 		t.Fatalf("after cancel: %+v", r)
+	}
+	select {
+	case l := <-s.lines:
+		t.Fatalf("extra line: %s", l)
+	case <-time.After(100 * time.Millisecond):
 	}
 	if !strings.Contains(s.logs.String(), "cancelled the running tool call") {
 		t.Fatalf("log: %s", s.logs)
@@ -239,5 +254,39 @@ func TestShutdownDuringToolCall(t *testing.T) {
 	}
 	if opIDInText.FindString(strings.ReplaceAll(out.String(), `\"`, `"`)) == "" {
 		t.Fatalf("output: %s", out)
+	}
+	if !opIDLogged(logs.String()) {
+		t.Fatalf("stderr: %s", logs)
+	}
+}
+
+// Cancellations that name no running call change nothing: one for an
+// unknown id, a malformed one, or one after the call was answered.
+func TestCancelEdgeCases(t *testing.T) {
+	f, srv := newFakeManager(t)
+	f.on("GET /api/collections", 200, map[string]any{"collections": []any{}})
+	s := startSession(t, srv.URL)
+	s.initialize()
+	for _, l := range []string{
+		`{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":"nope"}}`,
+		`{"jsonrpc":"2.0","method":"notifications/cancelled","params":"x"}`,
+		`{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":{"a":1}}}`,
+		`{"jsonrpc":"2.0","method":"notifications/cancelled"}`,
+	} {
+		s.sendRaw(l)
+	}
+	s.sendRaw(`{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"list_collections","arguments":{}}}`)
+	if r := s.recv(); string(r.ID) != "5" || r.Error != nil {
+		t.Fatalf("%+v", r)
+	}
+	s.sendRaw(`{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":5}}`)
+	s.sendRaw(`{"jsonrpc":"2.0","id":6,"method":"ping"}`)
+	if r := s.recv(); string(r.ID) != "6" {
+		t.Fatalf("after a late cancel: %+v", r)
+	}
+	select {
+	case l := <-s.lines:
+		t.Fatalf("extra line: %s", l)
+	case <-time.After(200 * time.Millisecond):
 	}
 }

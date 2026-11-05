@@ -59,22 +59,17 @@ static OSStatus jm_keychain_read_ui(const char *service, const char *account,
 	return errSecSuccess;
 }
 
-// jm_access_refused: the Keychain refused this program the item (another
-// build of it created the item, or the person denied it).
-static int jm_access_refused(OSStatus st) {
-	return st == errSecAuthFailed || st == errSecInteractionNotAllowed || st == errSecNoAccessForItem;
-}
+// The OSStatus values keychainFallback (keychain_fallback.go) names.
+_Static_assert(errSecInteractionNotAllowed == -25308, "errSecInteractionNotAllowed");
+_Static_assert(errSecNoAccessForItem == -25243, "errSecNoAccessForItem");
 
-// jm_keychain_upsert replaces the value, generic attribute and comment of the
-// item (service, account), adding it when there is none. An added item gets
-// the default access list: the creating program only. With allow_ui the
-// Keychain may ask the person (a command they run); an item this program may
-// not update (one an earlier build created) is then deleted and added again.
-// Without it no UI is shown.
-static OSStatus jm_keychain_upsert(const char *service, const char *account, const char *label,
-                                   const char *generic, int genericLen,
-                                   const char *secret, int secretLen, const char *comment, int allow_ui) {
-	SecKeychainSetUserInteractionAllowed(allow_ui ? true : false);
+// jm_keychain_write updates the value, generic attribute and comment of the
+// item (service, account), or with add creates it. An added item gets the
+// default access list: the creating program only. The caller has set user
+// interaction (SecKeychainSetUserInteractionAllowed).
+static OSStatus jm_keychain_write(const char *service, const char *account, const char *label,
+                                  const char *generic, int genericLen,
+                                  const char *secret, int secretLen, const char *comment, int add) {
 	CFStringRef svc = CFStringCreateWithCString(NULL, service, kCFStringEncodingUTF8);
 	CFStringRef acct = CFStringCreateWithCString(NULL, account, kCFStringEncodingUTF8);
 	CFStringRef lbl = CFStringCreateWithCString(NULL, label, kCFStringEncodingUTF8);
@@ -83,21 +78,18 @@ static OSStatus jm_keychain_upsert(const char *service, const char *account, con
 	CFDataRef val = CFDataCreate(NULL, (const UInt8 *)secret, secretLen);
 	OSStatus st = errSecAllocate;
 	if (svc != NULL && acct != NULL && lbl != NULL && cmt != NULL && gen != NULL && val != NULL) {
-		const void *qkeys[] = { kSecClass, kSecAttrService, kSecAttrAccount };
-		const void *qvals[] = { kSecClassGenericPassword, svc, acct };
-		CFDictionaryRef q = CFDictionaryCreate(NULL, qkeys, qvals, 3,
-		                                       &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
-		const void *ukeys[] = { kSecValueData, kSecAttrGeneric, kSecAttrComment };
-		const void *uvals[] = { val, gen, cmt };
-		CFDictionaryRef u = CFDictionaryCreate(NULL, ukeys, uvals, 3,
-		                                       &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
-		st = SecItemUpdate(q, u);
-		if (allow_ui && jm_access_refused(st)) {
-			OSStatus del = SecItemDelete(q);
-			st = (del == errSecSuccess || del == errSecItemNotFound) ? errSecItemNotFound : del;
-		}
-		CFRelease(q); CFRelease(u);
-		if (st == errSecItemNotFound) {
+		if (!add) {
+			const void *qkeys[] = { kSecClass, kSecAttrService, kSecAttrAccount };
+			const void *qvals[] = { kSecClassGenericPassword, svc, acct };
+			CFDictionaryRef q = CFDictionaryCreate(NULL, qkeys, qvals, 3,
+			                                       &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+			const void *ukeys[] = { kSecValueData, kSecAttrGeneric, kSecAttrComment };
+			const void *uvals[] = { val, gen, cmt };
+			CFDictionaryRef u = CFDictionaryCreate(NULL, ukeys, uvals, 3,
+			                                       &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+			st = SecItemUpdate(q, u);
+			CFRelease(q); CFRelease(u);
+		} else {
 			const void *akeys[] = { kSecClass, kSecAttrService, kSecAttrAccount, kSecAttrLabel,
 			                        kSecValueData, kSecAttrGeneric, kSecAttrComment };
 			const void *avals[] = { kSecClassGenericPassword, svc, acct, lbl, val, gen, cmt };
@@ -114,6 +106,10 @@ static OSStatus jm_keychain_upsert(const char *service, const char *account, con
 	if (gen) CFRelease(gen);
 	if (val) CFRelease(val);
 	return st;
+}
+
+static void jm_keychain_allow_ui(int allow_ui) {
+	SecKeychainSetUserInteractionAllowed(allow_ui ? true : false);
 }
 
 // jm_keychain_delete removes the item (service, account); UI only with
@@ -179,7 +175,9 @@ func keychainLoadInteractive(service, slot, account string) (secret, stamp strin
 
 // keychainSave stores secret in the item (service, slot), bound to account
 // (generic attribute) and stamped with device (comment attribute). allowUI
-// lets the Keychain ask the person.
+// lets the Keychain ask the person; an item this build may not update (one
+// another build made) is then deleted and added again, but only for the
+// statuses keychainFallback names, never after the person denied access.
 func keychainSave(service, slot, account, secret, device string, allowUI bool) error {
 	cs, cslot := C.CString(service), C.CString(slot)
 	clabel := C.CString("JuiceMount agent token (juicemount-mcp)")
@@ -194,11 +192,31 @@ func keychainSave(service, slot, account, secret, device string, allowUI bool) e
 			C.free(unsafe.Pointer(p))
 		}
 	}()
-	st := C.jm_keychain_upsert(cs, cslot, clabel, cgen, C.int(len(account)), csecret, C.int(len(secret)), ccomment, cBool(allowUI))
-	if st != C.errSecSuccess {
-		return fmt.Errorf("keychain write refused (OSStatus %d; is the login Keychain unlocked?)", int(st))
+	write := func(add bool) int {
+		return int(C.jm_keychain_write(cs, cslot, clabel, cgen, C.int(len(account)), csecret, C.int(len(secret)), ccomment, cBool(add)))
 	}
-	return nil
+	C.jm_keychain_allow_ui(cBool(allowUI))
+	st, removed := write(false), false
+	if allowUI && keychainFallback(st) {
+		switch del := int(C.jm_keychain_delete(cs, cslot, cBool(allowUI))); del {
+		case C.errSecSuccess:
+			removed, st = true, C.errSecItemNotFound
+		case C.errSecItemNotFound:
+			st = C.errSecItemNotFound
+		default:
+			return fmt.Errorf("keychain write refused (OSStatus %d), and the stored item could not be replaced (OSStatus %d)", st, del)
+		}
+	}
+	if st == C.errSecItemNotFound {
+		st = write(true)
+	}
+	switch {
+	case st == C.errSecSuccess:
+		return nil
+	case removed:
+		return fmt.Errorf("%w; storing the new one failed (OSStatus %d)", ErrStoredRecordRemoved, st)
+	}
+	return fmt.Errorf("keychain write refused (OSStatus %d; is the login Keychain unlocked?)", st)
 }
 
 func keychainDelete(service, slot string, allowUI bool) error {

@@ -25,6 +25,18 @@ var (
 // ErrNoToken means no agent token is stored on this Mac.
 var ErrNoToken = errors.New("no agent token is stored on this Mac")
 
+// ErrPreviousTokenRemoved: a TokenStore's Save deleted the record stored
+// before it and then failed, so no token is stored.
+var ErrPreviousTokenRemoved = errors.New("the agent token stored before was removed, and the new one could not be stored")
+
+// removedNote tells the person what a failed Save that removed prev means.
+func removedNote(err error, prev TokenRecord, havePrev bool) string {
+	if !errors.Is(err, ErrPreviousTokenRemoved) || !havePrev {
+		return ""
+	}
+	return fmt.Sprintf(" The token stored here before (%s) was removed from this machine but is still live on the Manager: run juicemount-mcp token list, and juicemount-mcp token revoke %s if you no longer need it.", prev.ID, prev.ID)
+}
+
 // TokenRecord is the stored agent token: the secret and the Manager it was
 // minted on (it is sent nowhere else).
 type TokenRecord struct {
@@ -195,10 +207,11 @@ func (tc *TokenCommands) Create(ctx context.Context, name string, days int, prin
 	if err := tc.Store.Save(rec); err != nil {
 		// Do not leave a live token nobody holds.
 		rerr := c.Do(ctx, http.MethodPost, "/api/agent-tokens/"+v.ID+"/revoke", nil, nil, nil)
+		note := removedNote(err, prev, perr == nil)
 		if rerr != nil {
-			return fmt.Errorf("the token could not be stored (%v), and revoking it failed too (%v): revoke %s with juicemount-mcp token revoke %s", err, rerr, v.ID, v.ID)
+			return fmt.Errorf("the token could not be stored (%v), and revoking it failed too (%v): revoke %s with juicemount-mcp token revoke %s.%s", err, rerr, v.ID, v.ID, note)
 		}
-		return fmt.Errorf("the token could not be stored (%v); it was revoked on the Manager", err)
+		return fmt.Errorf("the token could not be stored (%v); it was revoked on the Manager.%s", err, note)
 	}
 	fmt.Fprintf(tc.Out, "Minted agent token %s (%q) for %s; it expires %s. It is stored on this Mac for juicemount-mcp serve.\n", v.ID, v.Name, v.PersonName, msTime(v.ExpiresAt))
 	if perr == nil && prev.ID != v.ID {
@@ -314,8 +327,9 @@ func (tc *TokenCommands) Import(ctx context.Context, in io.Reader, managerURL st
 	case err != nil:
 		fmt.Fprintf(tc.Err, "warning: token %s could not be checked with the Manager (%v); storing it anyway\n", m[1], errorMessage(err))
 	}
+	prev, perr := tc.Store.Load()
 	if err := tc.Store.Save(TokenRecord{ManagerURL: base, Token: token, ID: m[1], Name: "imported"}); err != nil {
-		return fmt.Errorf("storing the token: %v", err)
+		return fmt.Errorf("storing the token: %v.%s", err, removedNote(err, prev, perr == nil))
 	}
 	_, err = fmt.Fprintf(tc.Out, "Stored agent token %s for %s.\n", m[1], base)
 	return err

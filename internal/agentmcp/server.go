@@ -22,9 +22,9 @@ import (
 // Concurrency. stdin is read on its own goroutine, so ping, tools/list and
 // notifications/cancelled are answered while a tool call runs. Tool calls
 // run one at a time: a second tools/call while one runs gets a busy tool
-// error. notifications/cancelled for the running call cancels its context;
-// its answer is still sent (a write that was sent then says which
-// operation_id retries it safely).
+// error. notifications/cancelled for the running call cancels its context,
+// and the call is not answered (MCP: a cancelled request SHOULD NOT be);
+// a write that was sent is logged with its operation_id instead.
 
 const (
 	// ProtocolVersion is the MCP version this server speaks.
@@ -77,6 +77,9 @@ type Server struct {
 type runningCall struct {
 	id     json.RawMessage
 	cancel context.CancelFunc
+	// byClient: the client cancelled it (notifications/cancelled), so it
+	// gets no answer.
+	byClient bool
 }
 
 type rpcError struct {
@@ -315,6 +318,7 @@ func (s *Server) cancelled(params json.RawMessage) {
 	defer s.mu.Unlock()
 	if s.running != nil && bytes.Equal(compactJSON(s.running.id), compactJSON(p.RequestID)) {
 		s.Log.Printf("the client cancelled the running tool call")
+		s.running.byClient = true
 		s.running.cancel()
 	}
 }
@@ -416,25 +420,52 @@ func (s *Server) startTool(ctx context.Context, id, params json.RawMessage) *rpc
 		cancel()
 		return &rpcResponse{ID: id, Result: errorResult("Another tool call of this session is still running; this server runs one at a time. Wait for it, then call again.")}
 	}
-	s.running = &runningCall{id: id, cancel: cancel}
+	call := &runningCall{id: id, cancel: cancel}
+	s.running = call
 	s.wg.Add(1)
 	s.mu.Unlock()
 	protocol := s.protocol
 	go func() {
 		defer s.wg.Done()
-		res := s.runTool(ctx, tool, p.Arguments, protocol)
+		res, opID := s.runTool(ctx, tool, p.Arguments, protocol)
 		cancel()
 		s.mu.Lock()
 		s.running = nil
+		byClient := call.byClient
 		s.mu.Unlock()
+		unanswered := ""
+		if byClient {
+			unanswered = ", cancelled by the client, not answered"
+		}
+		switch {
+		case opID != "" && res.IsError:
+			// Also when answered: the log keeps it if the client goes.
+			s.Log.Printf("tools/call %s%s: the change may or may not have been made; operation_id %s retries it safely", tool.Name, unanswered, opID)
+		case opID != "" && byClient:
+			s.Log.Printf("tools/call %s%s: the change was made (operation_id %s)", tool.Name, unanswered, opID)
+		case byClient:
+			s.Log.Printf("tools/call %s%s", tool.Name, unanswered)
+		}
+		if byClient {
+			return
+		}
 		s.send(&rpcResponse{ID: id, Result: res})
 	}()
 	return nil
 }
 
-func (s *Server) runTool(ctx context.Context, tool *Tool, args json.RawMessage, protocol string) toolResult {
+// runTool runs a tool; opID is the operation_id of a write that was made,
+// or whose outcome is unknown ("" otherwise).
+func (s *Server) runTool(ctx context.Context, tool *Tool, args json.RawMessage, protocol string) (res toolResult, opID string) {
 	start := time.Now()
 	out, err := tool.run(s.Tools, ctx, args)
+	var te *toolError
+	if errors.As(err, &te) {
+		opID = te.opID
+	}
+	if w, ok := out.(writeResult); ok {
+		opID = w.OperationID
+	}
 	if err != nil {
 		var ae *APIError
 		status := "error"
@@ -442,7 +473,7 @@ func (s *Server) runTool(ctx context.Context, tool *Tool, args json.RawMessage, 
 			status = fmt.Sprintf("HTTP %d", ae.Status)
 		}
 		s.Log.Printf("tools/call %s: %s (%v)", tool.Name, status, time.Since(start).Round(time.Millisecond))
-		return errorResult(errorMessage(err))
+		return errorResult(errorMessage(err)), opID
 	}
 	s.Log.Printf("tools/call %s: ok (%v)", tool.Name, time.Since(start).Round(time.Millisecond))
 	b, err := json.Marshal(out)
@@ -452,11 +483,11 @@ func (s *Server) runTool(ctx context.Context, tool *Tool, args json.RawMessage, 
 		b, err = validUTF8JSON(b)
 	}
 	if err != nil {
-		return errorResult("the result could not be encoded")
+		return errorResult("the result could not be encoded"), opID
 	}
-	res := toolResult{Content: []textContent{{"text", string(b)}}}
+	res = toolResult{Content: []textContent{{"text", string(b)}}}
 	if protocol == "2025-06-18" {
 		res.StructuredContent = json.RawMessage(b)
 	}
-	return res
+	return res, opID
 }

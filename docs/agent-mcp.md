@@ -62,7 +62,8 @@ that can run commands as you (an agent with a shell tool included) can mint
 tokens too, for as long as the Keychain lets it. Click **Allow**, not
 **Always Allow**, so each mint asks you again. After you update or rebuild
 `juicemount-mcp`, the `token` commands may ask once more before they can use
-the stored token; `serve` never asks (it runs under an agent, with no one to
+the stored token (if this build may not update it at all, they replace it;
+clicking Deny never deletes it); `serve` never asks (it runs under an agent, with no one to
 answer) and tells the agent to run `token create` again, or to allow access in
 Keychain Access. The Manager stops a token at once when it expires or is revoked,
 when you are removed, or when the Mac that minted it is revoked or reassigned.
@@ -114,8 +115,9 @@ back to the agent as the tool's result: a revoked or expired token says to run
 
 The server speaks MCP 2025-06-18 (2024-11-05 too; JSON-RPC batches are
 refused). Tool calls run one at a time: a second one while one runs is told to
-wait. `ping` and cancellation are handled while a call runs, and cancelling a
-call stops it.
+wait. `ping` and cancellation are handled while a call runs; a cancelled call
+stops and gets no answer, and a cancelled change's `operation_id` is written
+to the server's log (stderr).
 
 ## What it does not do
 
