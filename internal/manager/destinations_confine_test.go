@@ -325,3 +325,32 @@ func TestFileDestinationResolveIsBounded(t *testing.T) {
 		t.Errorf("ToSyncURI took %v on a hung path", el)
 	}
 }
+
+// TestScheduleSubPathStaysInsideFileDestination: a schedule's sub-path on a
+// checked file destination must not resolve outside it, by ".." or through
+// a symlink under the destination.
+func TestScheduleSubPathStaysInsideFileDestination(t *testing.T) {
+	root := t.TempDir()
+	inside := filepath.Join(root, "backups")
+	if err := os.Mkdir(inside, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	outside := t.TempDir()
+	if err := os.Symlink(outside, filepath.Join(inside, "link")); err != nil {
+		t.Fatal(err)
+	}
+	mux, store := registerDestTest(t, root, filepath.Join(t.TempDir(), "state.json"))
+	if w := destRequest(t, mux, http.MethodPost, "/api/destinations", fileDestBody("bk", inside)); w.Code/100 != 2 {
+		t.Fatalf("create: %d %s", w.Code, w.Body.String())
+	}
+	for _, sub := range []string{"../../etc", "nested/../../..", "link", "link/new"} {
+		sched := scheduleState{Destination: DestinationRef{Name: "bk", Path: sub}}
+		if _, uri, _, msg := resolveScheduleSpec(sched, store, ""); msg == "" {
+			t.Errorf("schedule sub-path %q resolved outside the destination to %q", sub, uri)
+		}
+	}
+	sched := scheduleState{Destination: DestinationRef{Name: "bk", Path: "daily"}}
+	if _, uri, _, msg := resolveScheduleSpec(sched, store, ""); msg != "" || !strings.Contains(uri, "/backups/daily") {
+		t.Errorf("normal sub-path: uri %q, msg %q", uri, msg)
+	}
+}
