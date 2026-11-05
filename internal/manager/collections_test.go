@@ -851,6 +851,36 @@ func TestCollectionsRetryAfterMemberLeft(t *testing.T) {
 	e.write("Ann", "/api/collections/"+id+"/members/remove", map[string]any{"members": pathRefs("Clients/A/two.mov"), "operation_id": "remove-2"}, 404)
 }
 
+// A retry whose paths still resolve is held to the members it named: a
+// path to a file the operation did not name is 409, not the original
+// result with that file silently left out. So is the key reused on
+// another collection or route.
+func TestCollectionsRetryNamesOnlyItsMembers(t *testing.T) {
+	e := newCollectionsEnv(t)
+	first := e.write("Ann", "/api/collections", map[string]any{"name": "R", "members": pathRefs("Clients/A/one.mov"), "operation_id": "k1"}, 200)
+	col := string(first.Collection.ID)
+	for name, members := range map[string]any{
+		"an extra path":   pathRefs("Clients/A/one.mov", "Clients/A/two.mov"),
+		"another path":    pathRefs("Clients/A/sub/four.mov"),
+		"one gone, other": pathRefs("Clients/A/gone.mov", "Clients/A/two.mov"),
+	} {
+		if rec := e.do("Ann", http.MethodPost, "/api/collections", map[string]any{"name": "R", "members": members, "operation_id": "k1"}); rec.Code != 409 {
+			t.Errorf("%s: %d %s, want 409", name, rec.Code, rec.Body)
+		}
+	}
+	if got := e.members(first.Collection.ID, ""); len(got.Members) != 1 {
+		t.Fatalf("members after refused retries: %+v", got.Members)
+	}
+	if again := e.write("Ann", "/api/collections", map[string]any{"name": "R", "members": pathRefs("Clients/A/one.mov"), "operation_id": "k1"}, 200); again.Operation != first.Operation {
+		t.Fatalf("exact retry: %+v vs %+v", again.Operation, first.Operation)
+	}
+	other := string(e.write("Ann", "/api/collections", map[string]any{"name": "O"}, 200).Collection.ID)
+	e.write("Ann", "/api/collections/"+col+"/members/add", map[string]any{"members": pathRefs("Clients/A/two.mov"), "operation_id": "k2"}, 200)
+	e.write("Ann", "/api/collections/"+other+"/members/add", map[string]any{"members": pathRefs("Clients/A/two.mov"), "operation_id": "k2"}, 409)
+	e.write("Ann", "/api/collections/"+col+"/members/remove", map[string]any{"members": pathRefs("Clients/A/two.mov"), "operation_id": "k2"}, 409)
+	e.write("Ann", "/api/collections/"+col+"/rename", map[string]any{"name": "x", "operation_id": "k2"}, 409)
+}
+
 func TestCollectionsDeleteFormsAndOpenAdmin(t *testing.T) {
 	e := newCollectionsEnv(t)
 	a := string(e.write("admin", "/api/collections", map[string]any{"name": "a"}, 200).Collection.ID)

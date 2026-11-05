@@ -60,9 +60,10 @@ package manager
 // caller repeating the same request gets the original result (without a
 // second authorization: the change was authorized when it committed), and a
 // different request under the same operation_id is 409. A retry is matched
-// against the recorded operation before anything is looked up: a member
-// path names what it named then and is not resolved again, so a file that
-// has gone since does not make a committed change 404 (replayMembers).
+// against the recorded operation before its members must resolve: a member
+// path that no longer names a catalogued file is not held against it, so a
+// file that has gone since does not make a committed change 404, while a
+// path that names a file the operation did not is 409 (replayMembers).
 
 import (
 	"context"
@@ -978,31 +979,45 @@ func recordedMembers(op *catalog.Operation) []continuity.AssetID {
 	return out
 }
 
-// replayMembers gives a retry's members from the operation it repeats,
-// without reading the volume or the catalog, so a member whose file has
-// gone since does not make the retry 404. A member named by asset ID must be
-// one the operation named; a path names what it named then and is not
-// looked up again. With no paths the members are the request's, in order
-// (the catalog compares them with the recorded ones); with paths, they must
-// be enough to account for the recorded members the IDs do not, and the
-// recorded members are replayed. A request that cannot be the original is
-// ErrChangedRequest (409).
-func replayMembers(refs []memberRef, recorded []continuity.AssetID) ([]continuity.AssetID, error) {
+// replayMembers gives a retry's members from the operation it repeats, so
+// a member whose file has gone since does not make the retry 404. A member
+// named by asset ID is taken as given; a path is looked up on the volume,
+// and one that no longer names a catalogued file is left out (gone). With
+// none gone the members are the request's, in order, as resolve gives them
+// (the catalog compares them with the recorded ones). Otherwise every member
+// found must be one the operation named, and the gone paths must be enough
+// to account for the rest; the recorded members are replayed. A request
+// that cannot be the original is ErrChangedRequest (409).
+func (c *collectionCall) replayMembers(refs []memberRef, recorded []continuity.AssetID) ([]continuity.AssetID, error) {
 	var ids []continuity.AssetID
 	seen := map[continuity.AssetID]bool{}
-	paths := 0
+	gone := 0
 	for _, ref := range refs {
+		id := ref.AssetID
 		switch {
 		case (ref.AssetID == "") == (ref.Path == ""):
 			return nil, fmt.Errorf("%w: a member names exactly one of asset_id or path", errCollectionInput)
 		case ref.Path != "":
-			paths++
-		case !seen[ref.AssetID]:
-			seen[ref.AssetID] = true
-			ids = append(ids, ref.AssetID)
+			var err error
+			id, err = c.svc.binder.AssetAt(c.ctx(), ref.Path)
+			switch {
+			case errors.Is(err, catalog.ErrNotFound):
+				gone++
+				continue
+			case errors.Is(err, catalog.ErrInvalid):
+				return nil, fmt.Errorf("%w: bad asset_id or path", errCollectionInput)
+			case errors.Is(err, binder.ErrUnresolved):
+				return nil, failf(http.StatusServiceUnavailable, "cannot read %q on the volume; try again", ref.Path)
+			case err != nil:
+				return nil, err
+			}
+		}
+		if !seen[id] {
+			seen[id] = true
+			ids = append(ids, id)
 		}
 	}
-	if paths == 0 {
+	if gone == 0 {
 		return ids, nil
 	}
 	named := make(map[continuity.AssetID]bool, len(recorded))
@@ -1014,7 +1029,7 @@ func replayMembers(refs []memberRef, recorded []continuity.AssetID) ([]continuit
 			return nil, catalog.ErrChangedRequest
 		}
 	}
-	if len(ids)+paths < len(recorded) {
+	if len(ids)+gone < len(recorded) {
 		return nil, catalog.ErrChangedRequest
 	}
 	return recorded, nil
@@ -1202,8 +1217,8 @@ func (c *collectionCall) editMembers(id catalog.CollectionID, add bool) error {
 }
 
 // memberWrite is a member write's recorded operation (nil: a new request)
-// and its members: for a retry, from the operation it repeats; otherwise
-// resolved on the volume.
+// and its members: for a retry, checked against the operation it repeats
+// (replayMembers); otherwise resolved on the volume.
 type memberWrite struct {
 	op      *catalog.Operation
 	members []continuity.AssetID
@@ -1216,7 +1231,7 @@ func (c *collectionCall) writeMembers(opID string, refs []memberRef) (memberWrit
 	}
 	var members []continuity.AssetID
 	if op != nil {
-		members, err = replayMembers(refs, recordedMembers(op))
+		members, err = c.replayMembers(refs, recordedMembers(op))
 	} else {
 		members, err = c.resolve(refs)
 	}
