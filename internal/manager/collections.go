@@ -59,7 +59,10 @@ package manager
 // The catalog operation ID is derived from it and the actor, so the same
 // caller repeating the same request gets the original result (without a
 // second authorization: the change was authorized when it committed), and a
-// different request under the same operation_id is 409.
+// different request under the same operation_id is 409. A retry is matched
+// against the recorded operation before anything is looked up: a member
+// path names what it named then and is not resolved again, so a file that
+// has gone since does not make a committed change 404 (replayMembers).
 
 import (
 	"context"
@@ -943,22 +946,88 @@ func (c *collectionCall) authorizeAll(id catalog.CollectionID) error {
 	}
 }
 
-// change records one write. An exact retry (its operation ID is in the
-// history) returns the original result without a second authorization: it
-// was authorized when it committed, and only its own actor can name it.
+// recorded is the operation already recorded under opID (nil: none).
+func (c *collectionCall) recorded(opID string) (*catalog.Operation, error) {
+	ev, err := c.svc.store.GetEvent(c.ctx(), c.library, opID)
+	switch {
+	case errors.Is(err, catalog.ErrNotFound):
+		return nil, nil
+	case err != nil:
+		return nil, err
+	}
+	return &ev.Operation, nil
+}
+
+// recordedMembers: the members an operation added or removed, in order.
+func recordedMembers(op *catalog.Operation) []continuity.AssetID {
+	var out []continuity.AssetID
+	for _, ch := range op.Changes {
+		switch {
+		case ch.AddCollectionMember != nil:
+			out = append(out, ch.AddCollectionMember.AssetID)
+		case ch.RemoveCollectionMember != nil:
+			out = append(out, ch.RemoveCollectionMember.AssetID)
+		}
+	}
+	return out
+}
+
+// replayMembers gives a retry's members from the operation it repeats,
+// without reading the volume or the catalog, so a member whose file has
+// gone since does not make the retry 404. A member named by asset ID must be
+// one the operation named; a path names what it named then and is not
+// looked up again. With no paths the members are the request's, in order
+// (the catalog compares them with the recorded ones); with paths, they must
+// be enough to account for the recorded members the IDs do not, and the
+// recorded members are replayed. A request that cannot be the original is
+// ErrChangedRequest (409).
+func replayMembers(refs []memberRef, recorded []continuity.AssetID) ([]continuity.AssetID, error) {
+	var ids []continuity.AssetID
+	seen := map[continuity.AssetID]bool{}
+	paths := 0
+	for _, ref := range refs {
+		switch {
+		case (ref.AssetID == "") == (ref.Path == ""):
+			return nil, fmt.Errorf("%w: a member names exactly one of asset_id or path", errCollectionInput)
+		case ref.Path != "":
+			paths++
+		case !seen[ref.AssetID]:
+			seen[ref.AssetID] = true
+			ids = append(ids, ref.AssetID)
+		}
+	}
+	if paths == 0 {
+		return ids, nil
+	}
+	named := make(map[continuity.AssetID]bool, len(recorded))
+	for _, id := range recorded {
+		named[id] = true
+	}
+	for _, id := range ids {
+		if !named[id] {
+			return nil, catalog.ErrChangedRequest
+		}
+	}
+	if len(ids)+paths < len(recorded) {
+		return nil, catalog.ErrChangedRequest
+	}
+	return recorded, nil
+}
+
+// change records one write. An exact retry (prior: its operation ID is in
+// the history) returns the original result without a second authorization:
+// it was authorized when it committed, and only its own actor can name it.
 // Otherwise a guarded change (rename, delete: authorized against every
 // member) reads the collection's sequence, authorizes, and writes with that
 // sequence as a precondition (ExpectCollection), so a change to the
 // collection in between makes it 409.
-func (c *collectionCall) change(opID string, id catalog.CollectionID, guarded bool, authorize func() error, changes []catalog.Change) error {
+func (c *collectionCall) change(opID string, prior *catalog.Operation, id catalog.CollectionID, guarded bool, authorize func() error, changes []catalog.Change) error {
 	expect := func(seq int64) []catalog.Change {
 		return append([]catalog.Change{{ExpectCollection: &catalog.ExpectCollection{CollectionID: id, UpdatedSequence: seq}}}, changes...)
 	}
-	prior, err := c.svc.store.GetEvent(c.ctx(), c.library, opID)
-	switch {
-	case err == nil:
+	if prior != nil {
 		if guarded {
-			for _, ch := range prior.Operation.Changes {
+			for _, ch := range prior.Changes {
 				if ch.ExpectCollection != nil {
 					changes = expect(ch.ExpectCollection.UpdatedSequence)
 					break
@@ -966,8 +1035,6 @@ func (c *collectionCall) change(opID string, id catalog.CollectionID, guarded bo
 			}
 		}
 		return c.apply(opID, id, changes)
-	case !errors.Is(err, catalog.ErrNotFound):
-		return err
 	}
 	if guarded {
 		col, err := c.active(id)
@@ -1036,11 +1103,11 @@ func (c *collectionCall) create() error {
 	if err != nil {
 		return err
 	}
-	members, err := c.resolve(b.Members)
+	opID, err := c.operationID(b.OperationID)
 	if err != nil {
 		return err
 	}
-	opID, err := c.operationID(b.OperationID)
+	w, err := c.writeMembers(opID, b.Members)
 	if err != nil {
 		return err
 	}
@@ -1048,10 +1115,10 @@ func (c *collectionCall) create() error {
 	sum := sha256.Sum256([]byte("juicemount.collections.id\x00" + opID))
 	id := catalog.CollectionID("col_" + hex.EncodeToString(sum[:16]))
 	changes := []catalog.Change{{CreateCollection: &catalog.CreateCollection{CollectionID: id, Name: name}}}
-	for _, m := range members {
+	for _, m := range w.members {
 		changes = append(changes, catalog.Change{AddCollectionMember: &catalog.AddCollectionMember{CollectionID: id, AssetID: m}})
 	}
-	return c.change(opID, id, false, func() error { return c.authorize(members) }, changes)
+	return c.change(opID, w.op, id, false, func() error { return c.authorize(w.members) }, changes)
 }
 
 func (c *collectionCall) rename(id catalog.CollectionID) error {
@@ -1070,7 +1137,11 @@ func (c *collectionCall) rename(id catalog.CollectionID) error {
 	if err != nil {
 		return err
 	}
-	return c.change(opID, id, true, func() error { return c.authorizeAll(id) },
+	prior, err := c.recorded(opID)
+	if err != nil {
+		return err
+	}
+	return c.change(opID, prior, id, true, func() error { return c.authorizeAll(id) },
 		[]catalog.Change{{RenameCollection: &catalog.RenameCollection{CollectionID: id, Name: name}}})
 }
 
@@ -1086,7 +1157,11 @@ func (c *collectionCall) remove(id catalog.CollectionID) error {
 	if err != nil {
 		return err
 	}
-	return c.change(opID, id, true, func() error { return c.authorizeAll(id) },
+	prior, err := c.recorded(opID)
+	if err != nil {
+		return err
+	}
+	return c.change(opID, prior, id, true, func() error { return c.authorizeAll(id) },
 		[]catalog.Change{{RemoveCollection: &catalog.RemoveCollection{CollectionID: id}}})
 }
 
@@ -1102,10 +1177,11 @@ func (c *collectionCall) editMembers(id catalog.CollectionID, add bool) error {
 	if err != nil {
 		return err
 	}
-	members, err := c.resolve(b.Members)
+	w, err := c.writeMembers(opID, b.Members)
 	if err != nil {
 		return err
 	}
+	members := w.members
 	changes := make([]catalog.Change, 0, len(members))
 	for _, m := range members {
 		if add {
@@ -1116,7 +1192,29 @@ func (c *collectionCall) editMembers(id catalog.CollectionID, add bool) error {
 	}
 	// Only the named members' grants matter: concurrent adders do not
 	// conflict. The catalog refuses a removed collection (404).
-	return c.change(opID, id, false, func() error { return c.authorize(members) }, changes)
+	return c.change(opID, w.op, id, false, func() error { return c.authorize(members) }, changes)
+}
+
+// memberWrite is a member write's recorded operation (nil: a new request)
+// and its members: for a retry, from the operation it repeats; otherwise
+// resolved on the volume.
+type memberWrite struct {
+	op      *catalog.Operation
+	members []continuity.AssetID
+}
+
+func (c *collectionCall) writeMembers(opID string, refs []memberRef) (memberWrite, error) {
+	op, err := c.recorded(opID)
+	if err != nil {
+		return memberWrite{}, err
+	}
+	var members []continuity.AssetID
+	if op != nil {
+		members, err = replayMembers(refs, recordedMembers(op))
+	} else {
+		members, err = c.resolve(refs)
+	}
+	return memberWrite{op, members}, err
 }
 
 // describeCollectionChange names a collection write for the audit log: the

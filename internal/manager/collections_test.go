@@ -807,6 +807,50 @@ func TestCollectionsRetryIsNotReauthorized(t *testing.T) {
 	e.write("Ann", "/api/collections/"+id+"/members/add", map[string]any{"members": pathRefs("Clients/A/two.mov"), "operation_id": "add-2"}, 403)
 }
 
+// A retry is answered from the operation it repeats before its members are
+// looked up: a member's file that has gone since does not turn a committed
+// create, add or remove into 404. A request that cannot be the original is
+// still 409.
+func TestCollectionsRetryAfterMemberLeft(t *testing.T) {
+	e := newCollectionsEnv(t)
+	four := binder.AssetID(e.vol.VolumeUUID(), 45)
+	create := map[string]any{"name": "Gone", "members": append(pathRefs("Clients/A/one.mov", "Clients/A/two.mov"), map[string]string{"asset_id": string(four)}), "operation_id": "create-1"}
+	first := e.write("Ann", "/api/collections", create, 200)
+	id := string(first.Collection.ID)
+	add := map[string]any{"members": pathRefs("Clients/B/three.mov"), "operation_id": "add-1"}
+	added := e.write("admin", "/api/collections/"+id+"/members/add", add, 200)
+	remove := map[string]any{"members": pathRefs("Clients/A/one.mov"), "operation_id": "remove-1"}
+	removed := e.write("Ann", "/api/collections/"+id+"/members/remove", remove, 200)
+	e.vol.set(func(f map[string]uint64) {
+		delete(f, "Clients/A/one.mov")
+		delete(f, "Clients/A/two.mov")
+		delete(f, "Clients/B/three.mov")
+	})
+	if again := e.write("Ann", "/api/collections", create, 200); again.Operation != first.Operation || string(again.Collection.ID) != id {
+		t.Fatalf("create retry: %+v vs %+v", again, first)
+	}
+	if again := e.write("admin", "/api/collections/"+id+"/members/add", add, 200); again.Operation != added.Operation {
+		t.Fatalf("add retry: %+v vs %+v", again.Operation, added.Operation)
+	}
+	if again := e.write("Ann", "/api/collections/"+id+"/members/remove", remove, 200); again.Operation != removed.Operation {
+		t.Fatalf("remove retry: %+v vs %+v", again.Operation, removed.Operation)
+	}
+	// Not the original: another name, an asset it did not name, too few
+	// members, or add for remove.
+	for name, b := range map[string]map[string]any{
+		"name":  {"name": "Other", "members": create["members"], "operation_id": "create-1"},
+		"asset": {"name": "Gone", "members": append(pathRefs("Clients/A/one.mov", "Clients/A/two.mov"), map[string]string{"asset_id": string(binder.AssetID(e.vol.VolumeUUID(), 44))}), "operation_id": "create-1"},
+		"fewer": {"name": "Gone", "members": append(pathRefs("Clients/A/one.mov"), map[string]string{"asset_id": string(four)}), "operation_id": "create-1"},
+	} {
+		if rec := e.do("Ann", http.MethodPost, "/api/collections", b); rec.Code != 409 {
+			t.Fatalf("%s: %d %s, want 409", name, rec.Code, rec.Body)
+		}
+	}
+	e.write("Ann", "/api/collections/"+id+"/members/add", map[string]any{"members": pathRefs("Clients/A/one.mov"), "operation_id": "remove-1"}, 409)
+	// A new request still resolves its members: 404.
+	e.write("Ann", "/api/collections/"+id+"/members/remove", map[string]any{"members": pathRefs("Clients/A/two.mov"), "operation_id": "remove-2"}, 404)
+}
+
 func TestCollectionsDeleteFormsAndOpenAdmin(t *testing.T) {
 	e := newCollectionsEnv(t)
 	a := string(e.write("admin", "/api/collections", map[string]any{"name": "a"}, 200).Collection.ID)
