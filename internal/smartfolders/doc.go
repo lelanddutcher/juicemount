@@ -5,6 +5,9 @@
 //
 // The first view is <Root>/<top-level folder>/ (Root defaults to "Recents"):
 // the most recently changed files under each top-level folder of the volume.
+// A second root ("Collections", in the Manager) holds one view per
+// collection, named by FolderNames; those views are removed (RemoveView)
+// when their collection goes.
 //
 // The package knows nothing about Redis or the Manager. It has four parts:
 //

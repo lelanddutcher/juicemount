@@ -69,6 +69,10 @@ type TrackerConfig struct {
 	// the first time: events can come from any client, so only a folder that
 	// really exists at the volume root (a cached lookup) gets a list.
 	FolderOK func(folder string) bool
+	// Ignore, when set, names other top-level folders whose subtree is not
+	// listed (another smart-folder root). It must be cheap: it runs on the
+	// event path.
+	Ignore func(folder string) bool
 }
 
 // Tracker keeps, per top-level folder of the volume, a bounded list of the
@@ -89,6 +93,7 @@ type Tracker struct {
 	maxAge  time.Duration
 	now     func() time.Time
 	ok      func(string) bool
+	ignore  func(string) bool
 	folders map[string]map[string]time.Time // top-level folder -> path -> changed
 	dirty   map[string]struct{}
 	gen     uint64 // bumped on every state change (persistence)
@@ -119,6 +124,7 @@ func NewTracker(cfg TrackerConfig) (*Tracker, error) {
 		max:     cfg.MaxPerFolder,
 		maxDirs: cfg.MaxFolders,
 		ok:      cfg.FolderOK,
+		ignore:  cfg.Ignore,
 		maxAge:  cfg.MaxAge,
 		now:     cfg.Now,
 		folders: map[string]map[string]time.Time{},
@@ -129,10 +135,14 @@ func NewTracker(cfg TrackerConfig) (*Tracker, error) {
 // trackable validates p and reports its top-level folder when p is a path
 // the tracker may list: inside a top-level folder (not at the volume root),
 // with no hidden component (so never under .trash or .juicemount, never an
-// AppleDouble or .DS_Store file), and not under the smart-folder root.
+// AppleDouble or .DS_Store file), and not under the smart-folder root or a
+// folder Ignore names.
 func (t *Tracker) trackable(p string) (clean, folder string, ok bool) {
 	parts, ok := cleanVolumePath(p)
 	if !ok || len(parts) < 2 || parts[0] == t.root || len(p) > maxTrackedPathBytes {
+		return "", "", false
+	}
+	if t.ignore != nil && t.ignore(parts[0]) {
 		return "", "", false
 	}
 	for _, c := range parts {

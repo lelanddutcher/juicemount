@@ -16,7 +16,8 @@ package manager
 //
 // What the Manager created (the root, each view, each link, each temp name)
 // is recorded in its state file before it is created; nothing else in the
-// volume is ever modified, and no directory is ever removed.
+// volume is ever modified, and no /Recents directory is ever removed (a
+// collection view goes with its collection: smartfolders_collections.go).
 //
 // Known gaps (documented in server/README.md):
 //   - pub/sub is fire-and-forget: changes while the Manager is down are
@@ -52,8 +53,15 @@ const (
 	// smartfolders contract test; the Manager does not import metadata).
 	metadataEventChannel = "juicemount:metadata"
 
-	smartFoldersStateName       = "smart-folders.json"
-	smartFoldersStateVersion    = 2
+	smartFoldersStateName = "smart-folders.json"
+	// smartFoldersStateVersion is the format written while the file holds
+	// collection-view records (smartfolders_collections.go). Without them
+	// it is written as version 2, which a Manager from before collection
+	// views still reads. That older Manager refuses version 3 (unsupported
+	// version: smart folders stay off and the file is never rewritten), so
+	// it cannot drop the collection records it does not know.
+	smartFoldersStateVersion    = 3
+	smartFoldersStateVersionV2  = 2
 	defaultSmartFoldersInterval = 30 * time.Second
 	smartFoldersLeaseTimeout    = 30 * time.Second
 	smartFoldersMaxBackoff      = 30 * time.Minute
@@ -68,10 +76,16 @@ const (
 type smartFoldersSettings struct {
 	Root     string
 	MaxViews int
+	// CollectionsRoot is the root of the collection views (they also need
+	// JM_CONTINUITY=on); "" when JM_SMART_FOLDERS_COLLECTIONS_ROOT is
+	// unusable, with the reason in CollectionsOff. A bad value turns only
+	// collection views off, never /Recents.
+	CollectionsRoot string
+	CollectionsOff  string
 }
 
-// smartFoldersEnv reads JM_SMART_FOLDERS, JM_SMART_FOLDERS_ROOT and
-// JM_SMART_FOLDERS_MAX_VIEWS.
+// smartFoldersEnv reads JM_SMART_FOLDERS, JM_SMART_FOLDERS_ROOT,
+// JM_SMART_FOLDERS_MAX_VIEWS and JM_SMART_FOLDERS_COLLECTIONS_ROOT.
 func smartFoldersEnv(getenv func(string) string) (bool, smartFoldersSettings, error) {
 	var s smartFoldersSettings
 	switch strings.ToLower(strings.TrimSpace(getenv("JM_SMART_FOLDERS"))) {
@@ -95,6 +109,16 @@ func smartFoldersEnv(getenv func(string) string) (bool, smartFoldersSettings, er
 			return false, s, fmt.Errorf("JM_SMART_FOLDERS_MAX_VIEWS=%q: use 1..%d", v, maxSmartFoldersMaxViews)
 		}
 		s.MaxViews = n
+	}
+	s.CollectionsRoot = strings.TrimSpace(getenv("JM_SMART_FOLDERS_COLLECTIONS_ROOT"))
+	if s.CollectionsRoot == "" {
+		s.CollectionsRoot = smartFoldersCollectionsRoot
+	}
+	if err := smartfolders.ValidateRootName(s.CollectionsRoot); err != nil {
+		s.CollectionsRoot, s.CollectionsOff = "", "JM_SMART_FOLDERS_COLLECTIONS_ROOT: "+err.Error()
+	} else if strings.EqualFold(s.CollectionsRoot, s.Root) {
+		s.CollectionsOff = fmt.Sprintf("the collection views root %q is the /Recents root (JM_SMART_FOLDERS_ROOT); set JM_SMART_FOLDERS_COLLECTIONS_ROOT to another name", s.CollectionsRoot)
+		s.CollectionsRoot = ""
 	}
 	return true, s, nil
 }
@@ -221,12 +245,16 @@ type smartFoldersService struct {
 
 	cacheMu sync.Mutex
 	cache   map[string]folderCacheEntry
+
+	coll collectionViews // smartfolders_collections.go
 }
 
 type smartFoldersState struct {
 	Version   int                     `json:"version"`
 	Tracker   json.RawMessage         `json:"tracker,omitempty"`
 	Ownership *smartfolders.Ownership `json:"ownership,omitempty"`
+	// Version 3: the collection views' own records.
+	Collections *collectionViewsState `json:"collections,omitempty"`
 }
 
 func newSmartFoldersService(cfg smartFoldersConfig) (*smartFoldersService, error) {
@@ -254,10 +282,12 @@ func newSmartFoldersService(cfg smartFoldersConfig) (*smartFoldersService, error
 		lastLog: map[string]string{},
 		cache:   map[string]folderCacheEntry{},
 	}
+	s.coll.init()
 	tc := cfg.Tracker
 	tc.Root = cfg.Settings.Root
 	tc.MaxFolders = cfg.Settings.MaxViews
 	tc.FolderOK = s.folderOK
+	tc.Ignore = s.collectionsRootActive
 	if tc.Now == nil {
 		tc.Now = cfg.Now
 	}
@@ -289,7 +319,12 @@ func (s *smartFoldersService) load(data []byte) error {
 	switch st.Version {
 	case 1: // round-1 format: the tracker state alone, no ownership records
 		return s.tracker.LoadState(data)
+	case smartFoldersStateVersionV2:
+		if st.Collections != nil {
+			return errors.New("version 2 with collection-view records")
+		}
 	case smartFoldersStateVersion:
+		s.coll.load(st.Collections)
 	default:
 		return fmt.Errorf("unsupported version %d", st.Version)
 	}
@@ -309,7 +344,11 @@ func (s *smartFoldersService) persist() error {
 	if err != nil {
 		return err
 	}
-	data, err := json.MarshalIndent(smartFoldersState{Version: smartFoldersStateVersion, Tracker: tracker, Ownership: s.own}, "", "  ")
+	st := smartFoldersState{Version: smartFoldersStateVersionV2, Tracker: tracker, Ownership: s.own}
+	if c := s.coll.state(); c != nil {
+		st.Version, st.Collections = smartFoldersStateVersion, c
+	}
+	data, err := json.MarshalIndent(st, "", "  ")
 	if err != nil {
 		return err
 	}
@@ -427,6 +466,7 @@ func (s *smartFoldersService) subscribeLoop(ctx context.Context) {
 				}
 				if ev, err := smartfolders.ParseEvent([]byte(msg.Payload)); err == nil {
 					s.tracker.Apply(ev)
+					s.noteCollectionEvent(ev)
 				}
 			}
 		}
@@ -444,6 +484,9 @@ func (s *smartFoldersService) reconcileLoop(ctx context.Context) {
 			return
 		case <-t.C:
 		case <-s.wake:
+		case <-s.coll.wake:
+			s.collectionsOnlyCycle(ctx)
+			continue
 		}
 		s.cycle(ctx)
 	}
@@ -464,9 +507,10 @@ func (s *smartFoldersService) kick() {
 	}
 }
 
-// cycle reconciles every dirty view whose backoff has passed. A root the
-// Manager did not create stops everything (no lease is checked out) until
-// it is looked at again ten minutes later.
+// cycle reconciles every dirty view whose backoff has passed, /Recents
+// then the collection views. A root the Manager did not create stops its
+// own kind of view (no lease is checked out) until it is looked at again
+// ten minutes later.
 func (s *smartFoldersService) cycle(ctx context.Context) {
 	if s.disabled.Load() {
 		return
@@ -480,7 +524,8 @@ func (s *smartFoldersService) cycle(ctx context.Context) {
 		}
 	}()
 	now := s.cfg.Now()
-	if now.Before(s.rootRetryAt) {
+	recents := !now.Before(s.rootRetryAt)
+	if !recents && !s.collectionsDue(now) {
 		return
 	}
 	fsys, release, err := s.cfg.Backend.acquire()
@@ -489,6 +534,17 @@ func (s *smartFoldersService) cycle(ctx context.Context) {
 		return
 	}
 	defer release()
+	if recents {
+		s.recentsCycle(ctx, fsys, now)
+	}
+	// Collection views run in the same cycle, after /Recents (and on their
+	// own when a collection changes): one goroutine writes the volume.
+	s.collectionsCycle(ctx, fsys)
+}
+
+// recentsCycle reconciles every dirty /Recents view whose backoff has
+// passed.
+func (s *smartFoldersService) recentsCycle(ctx context.Context, fsys smartfolders.FS, now time.Time) {
 	rec := &smartfolders.Reconciler{
 		FS:       fsys,
 		Root:     s.cfg.Settings.Root,
@@ -496,6 +552,9 @@ func (s *smartFoldersService) cycle(ctx context.Context) {
 		Persist:  s.persist,
 		Gate:     s.gate(ctx),
 		MaxViews: s.cfg.Settings.MaxViews,
+	}
+	if s.collectionsRootActive(s.cfg.Settings.CollectionsRoot) {
+		rec.Exclude = []string{s.cfg.Settings.CollectionsRoot}
 	}
 	state, err := rec.CheckRoot()
 	if err != nil {
@@ -583,7 +642,10 @@ func (s *smartFoldersService) reconcileFolder(rec *smartfolders.Reconciler, fold
 		res, err := rec.Reconcile(folder, links)
 		var gone, problems []string
 		for _, r := range res.Refused {
-			if r.TargetGone() {
+			// A target under the collection views' root (once the Manager
+			// owns it, the tracker no longer lists it) is forbidden.
+			top, _, _ := strings.Cut(r.Target, "/")
+			if r.TargetGone() || (errors.Is(r.Err, smartfolders.ErrTargetForbidden) && s.collectionsRootActive(top)) {
 				gone = append(gone, r.Target)
 			} else {
 				problems = append(problems, fmt.Sprintf("%s: %v", r.Name, r.Err))

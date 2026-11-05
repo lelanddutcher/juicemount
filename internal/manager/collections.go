@@ -812,6 +812,7 @@ func (c *collectionCall) apply(opID string, id catalog.CollectionID, changes []c
 	if err != nil {
 		return err
 	}
+	c.svc.collectionsChanged()
 	col, err := c.svc.store.GetCollection(c.ctx(), c.library, id)
 	if err != nil {
 		return err

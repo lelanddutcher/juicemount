@@ -24,27 +24,38 @@ type Link struct {
 func Names(entries []Entry, prev map[string]string) []Link {
 	es := append([]Entry(nil), entries...)
 	sortEntries(es)
+	targets := make([]string, len(es))
+	for i, e := range es {
+		targets[i] = e.Path
+	}
+	return LinkNames(targets, prev)
+}
+
+// LinkNames is Names for targets already in order of precedence (the
+// first newcomer with a base name gets it plain): the same rules, the same
+// determinism, the links in the order given.
+func LinkNames(targets []string, prev map[string]string) []Link {
 	used := map[string]bool{}
 	named := map[string]string{} // target -> name
 	seen := map[string]bool{}
-	var fresh []Entry
-	for _, e := range es {
-		if seen[e.Path] || !validName(path.Base(e.Path)) {
+	var fresh []string
+	for _, t := range targets {
+		if seen[t] || !validName(path.Base(t)) {
 			continue
 		}
-		seen[e.Path] = true
-		if n, ok := prev[e.Path]; ok && validName(n) && !strings.HasPrefix(n, tempPrefix) && !used[foldName(n)] {
+		seen[t] = true
+		if n, ok := prev[t]; ok && validName(n) && !strings.HasPrefix(n, tempPrefix) && !used[foldName(n)] {
 			used[foldName(n)] = true
-			named[e.Path] = n
+			named[t] = n
 			continue
 		}
-		fresh = append(fresh, e)
+		fresh = append(fresh, t)
 	}
-	for _, e := range fresh {
-		base := path.Base(e.Path)
+	for _, t := range fresh {
+		base := path.Base(t)
 		name := base
 		if used[foldName(name)] {
-			label := truncateRunes(path.Base(path.Dir(e.Path)), maxLabelBytes)
+			label := truncateRunes(path.Base(path.Dir(t)), maxLabelBytes)
 			stem, ext := splitExt(base)
 			name = ""
 			for n := 1; name == "" || used[foldName(name)]; n++ {
@@ -56,13 +67,13 @@ func Names(entries []Entry, prev map[string]string) []Link {
 			}
 		}
 		used[foldName(name)] = true
-		named[e.Path] = name
+		named[t] = name
 	}
 	out := make([]Link, 0, len(named))
-	for _, e := range es {
-		if n, ok := named[e.Path]; ok {
-			out = append(out, Link{Name: n, Target: e.Path})
-			delete(named, e.Path)
+	for _, t := range targets {
+		if n, ok := named[t]; ok {
+			out = append(out, Link{Name: n, Target: t})
+			delete(named, t)
 		}
 	}
 	return out

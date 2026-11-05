@@ -105,6 +105,7 @@ created through a mount cannot be identified atomically.
 | `JM_SMART_FOLDERS` | `off` | `on` enables smart folders. |
 | `JM_SMART_FOLDERS_ROOT` | `Recents` | Name of the top-level folder. |
 | `JM_SMART_FOLDERS_MAX_VIEWS` | `256` | Most views (top-level folders) kept, 1 to 4096. |
+| `JM_SMART_FOLDERS_COLLECTIONS_ROOT` | `Collections` | Root of the collection views (below; they also need `JM_CONTINUITY=on`). |
 
 How it behaves:
 
@@ -118,8 +119,8 @@ How it behaves:
   anything else got there first. It never modifies anything else: an
   existing `Recents` it did not create (even an empty one) is left alone and
   looked at again every 10 minutes, and a file someone drops into a view is
-  never touched. It never removes a directory: a view whose files all age
-  out stays, empty. Without a state file the feature stays off.
+  never touched. It never removes a `Recents` directory: a view whose files
+  all age out stays, empty. Without a state file the feature stays off.
 - **Only real folders get views.** A top-level folder must exist on the
   volume before it is tracked, so change events naming made-up folders cost
   nothing. The state file is bounded (at most `MAX_VIEWS` x 100 entries).
@@ -129,6 +130,32 @@ How it behaves:
   (`/Recents/<folder>`) as trash restore does, and only when the view needs
   to change. A refused checkout or failed write backs off (30 s doubling to
   30 min) and is logged once.
+
+**Collection views (experimental, also need `JM_CONTINUITY=on`).** With
+both switches on, the Manager also keeps `Collections/<collection name>/`: one
+relative symlink per member file that is present, pointing at the file's
+current path (found from its inode, so it follows renames and moves). The same
+ownership rules apply, with records of their own in `smart-folders.json`
+(version 3 once they exist; an older Manager refuses that file and leaves it
+alone). A user-made `Collections` is left alone and only stops these views (for
+`Recents` it is an ordinary folder).
+Names: `/`, `:` and control characters become `-`, leading dots are dropped;
+when two collections clash (ignoring case), the collection that already holds
+the name keeps it and the other gets `(2)`; a name a user's folder already
+takes is skipped; a rename that only changes case keeps the folder. Member
+files that clash are labelled with their folder, as in `Recents`. A member
+whose file is gone gets no link (it stays a member). A deleted or renamed
+collection's view is emptied and then removed, unless a user put something in
+it (left alone; a lone Finder `.DS_Store` does not count and is removed with
+it) or the volume refuses: through the RESP proxy a view folder is a project
+root, which only an admin may rename or remove, so there it stays empty and
+is tried again only every 6 hours or after a restart (at most 256 views are
+recorded, left-behind ones included; beyond that none is made). A
+member whose path cannot be read keeps its link. At most 128 views of 500
+links; the rest, missing and unresolved members and views left behind are
+counted in `GET /api/continuity/status` (`collection_views`). Views follow
+collection changes and member-file events within seconds, and are all rebuilt
+every 10 minutes, paced so `Recents` is not held up.
 
 Known gaps:
 

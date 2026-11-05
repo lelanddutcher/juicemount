@@ -300,6 +300,61 @@ func (f *FS) Remove(p string) error {
 	return errno(f.m.Unlink(f.ctx, dir, leaf, true))
 }
 
+// List returns up to max entry names of the directory p.
+func (f *FS) List(p string, max int) ([]string, error) {
+	ino, attr, err := f.lookup(p)
+	if err != nil {
+		return nil, err
+	}
+	if attr.Typ != meta.TypeDirectory {
+		return nil, syscall.ENOTDIR
+	}
+	var entries []*meta.Entry
+	if st := f.m.Readdir(f.ctx, ino, 0, &entries); st != 0 {
+		return nil, st
+	}
+	var out []string
+	for _, e := range entries {
+		if name := string(e.Name); name != "." && name != ".." && len(out) < max {
+			out = append(out, name)
+		}
+	}
+	return out, nil
+}
+
+// Rmdir removes the empty directory p without moving it to the trash. Like
+// Remove it works by name; the reconciler only removes a view directory
+// after moving it to a random hidden name it recorded and checking that
+// the directory there is its own.
+func (f *FS) Rmdir(p string) error {
+	dir, leaf, err := f.parent(p)
+	if err != nil {
+		return err
+	}
+	return errno(f.m.Rmdir(f.ctx, dir, leaf, true))
+}
+
+// RemoveIno unlinks the non-directory p, bypassing the trash, only if the
+// lookup right before it finds inode ino.
+func (f *FS) RemoveIno(p string, ino uint64) error {
+	dir, leaf, err := f.parent(p)
+	if err != nil {
+		return err
+	}
+	var got meta.Ino
+	var attr meta.Attr
+	if st := f.m.Lookup(f.ctx, dir, leaf, &got, &attr, false); st != 0 {
+		return st
+	}
+	if uint64(got) != ino {
+		return fmt.Errorf("%s is no longer the entry that was checked", p)
+	}
+	if attr.Typ == meta.TypeDirectory {
+		return syscall.EISDIR
+	}
+	return errno(f.m.Unlink(f.ctx, dir, leaf, true))
+}
+
 // The read-only lookups below serve the continuity binder. Each is plain
 // metadata reads (GET i<ino>, HGET/HGETALL d<dir>, HGETALL p<ino>, or the
 // allow-listed scriptLookup): reads pass the RESP proxy unchecked

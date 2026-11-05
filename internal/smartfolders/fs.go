@@ -3,6 +3,7 @@ package smartfolders
 import (
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path"
@@ -60,6 +61,13 @@ type FS interface {
 	Swap(tmp, p string) error
 	// Remove unlinks a non-directory, bypassing the JuiceFS trash.
 	Remove(p string) error
+	// List returns the names of up to max entries of the directory p (never
+	// "." or ".."), in no particular order.
+	List(p string, max int) ([]string, error)
+	// Rmdir removes the directory p (never anything else); an error
+	// satisfying errors.Is(err, syscall.ENOTEMPTY) if it holds anything.
+	// On JuiceFS it bypasses the trash.
+	Rmdir(p string) error
 }
 
 func splitPath(p string) ([]string, error) {
@@ -268,4 +276,54 @@ func (o *OSFS) Remove(p string) error {
 		return syscall.EISDIR
 	}
 	return d.Remove(leaf)
+}
+
+func (o *OSFS) List(p string, max int) ([]string, error) {
+	// The parent walk of a path one level down opens p itself, checked
+	// like every other component (a real directory, not a symlink).
+	d, _, done, err := o.parent(p + "/.probe")
+	if err != nil {
+		return nil, err
+	}
+	defer done()
+	f, err := d.Open(".")
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	names, err := f.Readdirnames(max)
+	if errors.Is(err, io.EOF) {
+		err = nil
+	}
+	return names, err
+}
+
+func (o *OSFS) Rmdir(p string) error {
+	d, leaf, done, err := o.parent(p)
+	if err != nil {
+		return err
+	}
+	defer done()
+	dir, err := d.Open(".")
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	return rmdirAt(int(dir.Fd()), leaf)
+}
+
+// RemoveIno unlinks the non-directory p only if it is still inode ino, as
+// seen through the open parent directory right before the unlink.
+func (o *OSFS) RemoveIno(p string, ino uint64) error {
+	d, leaf, done, err := o.parent(p)
+	if err != nil {
+		return err
+	}
+	defer done()
+	dir, err := d.Open(".")
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	return unlinkIfIno(int(dir.Fd()), leaf, ino)
 }
