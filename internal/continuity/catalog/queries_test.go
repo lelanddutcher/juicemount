@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	_ "embed"
 	"encoding/hex"
 	"encoding/json"
@@ -266,6 +267,44 @@ func TestQueryNewCatalogStaysFormat3UntilAQueryCommits(t *testing.T) {
 	}
 	if q := getQuery(t, s, testQuery); q.Name != "q" {
 		t.Fatalf("query: %+v", q)
+	}
+}
+
+// The first query's commit reports an error but did commit: the Store
+// reads the format the catalog holds, so the query is listed at once (not
+// after a restart), and the retry gets the original receipt.
+func TestQueryUncertainFirstCommitReadsTheFormat(t *testing.T) {
+	ctx := context.Background()
+	s, _ := newTestStore(t)
+	injected := errors.New("injected: commit reported as failed")
+	commitTx = func(tx *sql.Tx) error {
+		if err := tx.Commit(); err != nil {
+			return err
+		}
+		return injected
+	}
+	defer func() { commitTx = (*sql.Tx).Commit }()
+	def := QueryDefinition{Prefixes: []string{"A"}, Limit: 1}
+	op := testOperation("first", Change{CreateQuery: &CreateQuery{QueryID: testQuery, Name: "q", Definition: def}})
+	if _, err := s.ApplyEnablingQueries(ctx, op); !errors.Is(err, injected) {
+		t.Fatalf("first query: %v", err)
+	}
+	commitTx = (*sql.Tx).Commit
+	if s.Format() != 4 {
+		t.Fatalf("format after a commit that happened: %d", s.Format())
+	}
+	if list, err := s.ListQueries(ctx, testLibrary, "", 10); err != nil || len(list) != 1 {
+		t.Fatalf("listed: %v %v", list, err)
+	}
+	getQuery(t, s, testQuery)
+	if _, err := s.ApplyEnablingQueries(ctx, op); err != nil {
+		t.Fatal("retry:", err)
+	}
+	// A Store that missed the move (its reread failed too) learns the
+	// format from its next write.
+	s.format.Store(3)
+	if _, err := s.Apply(ctx, op); err != nil || s.Format() != 4 {
+		t.Fatalf("a write on a format 4 catalog: format %d, %v", s.Format(), err)
 	}
 }
 

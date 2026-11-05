@@ -28,7 +28,7 @@ func (s *Store) ApplyEnablingQueries(ctx context.Context, input Operation) (Rece
 	return s.apply(ctx, input, true)
 }
 
-func (s *Store) apply(ctx context.Context, input Operation, enable bool) (_ Receipt, resultErr error) {
+func (s *Store) apply(ctx context.Context, input Operation, enable bool) (Receipt, error) {
 	if err := s.enter(); err != nil {
 		return Receipt{}, err
 	}
@@ -52,6 +52,9 @@ func (s *Store) apply(ctx context.Context, input Operation, enable bool) (_ Rece
 	if library != s.library {
 		return Receipt{}, corrupt("library identity changed")
 	}
+	// The catalog may already be at a later format than this Store saw (a
+	// commit reported as failed that did commit).
+	s.raiseFormat(format)
 	if err := checkSettings(ctx, tx); err != nil {
 		return Receipt{}, err
 	}
@@ -70,16 +73,6 @@ func (s *Store) apply(ctx context.Context, input Operation, enable bool) (_ Rece
 			migrated = true
 			break
 		}
-	}
-	if migrated {
-		defer func() {
-			if resultErr == nil {
-				if err := syncParent(s.path); err != nil {
-					resultErr = fmt.Errorf("catalog upgrade directory barrier uncertain: %w", err)
-				}
-				s.format.Store(4)
-			}
-		}()
 	}
 	prior, priorRequest, err := readEvent(ctx, tx, s.library, op.ID)
 	if err == nil {
@@ -119,8 +112,17 @@ func (s *Store) apply(ctx context.Context, input Operation, enable bool) (_ Rece
 		sequence, s.library, op.ID, request, digest, receipt.RecordedUnixNano, receiptJSON); err != nil {
 		return Receipt{}, err
 	}
-	if err := tx.Commit(); err != nil {
+	if err := commitTx(tx); err != nil {
+		if migrated {
+			s.reloadFormat(ctx)
+		}
 		return Receipt{}, fmt.Errorf("catalog commit outcome uncertain: %w", err)
+	}
+	if migrated {
+		s.raiseFormat(4)
+		if err := syncParent(s.path); err != nil {
+			return Receipt{}, fmt.Errorf("catalog upgrade directory barrier uncertain: %w", err)
+		}
 	}
 	return receipt, nil
 }

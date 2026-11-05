@@ -121,13 +121,14 @@ func (s *Store) EnableQueries(ctx context.Context) (resultErr error) {
 	if err := s.checkPaths(); err != nil {
 		return err
 	}
-	if err := tx.Commit(); err != nil {
+	if err := commitTx(tx); err != nil {
+		s.reloadFormat(ctx)
 		return fmt.Errorf("catalog upgrade commit outcome uncertain: %w", err)
 	}
+	s.raiseFormat(4)
 	if err := syncParent(s.path); err != nil {
 		return fmt.Errorf("catalog upgrade directory barrier uncertain: %w", err)
 	}
-	s.format.Store(4)
 	return nil
 }
 
@@ -148,3 +149,29 @@ func (s *Store) migrateQueries(ctx context.Context, tx *sql.Tx) error {
 
 // Format is the catalog's format as this Store last saw it.
 func (s *Store) Format() int { return int(s.format.Load()) }
+
+// commitTx commits a write transaction (a test may report a commit that
+// happened as failed).
+var commitTx = (*sql.Tx).Commit
+
+// raiseFormat records that the catalog holds format f. A format only moves
+// forward, so a Store never goes back to one it has left.
+func (s *Store) raiseFormat(f int) {
+	for {
+		old := s.format.Load()
+		if int32(f) <= old || s.format.CompareAndSwap(old, int32(f)) {
+			return
+		}
+	}
+}
+
+// reloadFormat reads the format the catalog holds after a commit whose
+// outcome is uncertain, so the queries a commit that did happen added are
+// read (they are hidden while the Store thinks it is format 3). A read
+// that fails leaves the format as it was: the next write sees it (apply).
+func (s *Store) reloadFormat(ctx context.Context) {
+	var version int
+	if err := s.db.QueryRowContext(context.WithoutCancel(ctx), `PRAGMA user_version`).Scan(&version); err == nil && version <= schemaVersion {
+		s.raiseFormat(version)
+	}
+}
