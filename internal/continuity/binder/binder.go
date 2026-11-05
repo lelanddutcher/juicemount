@@ -38,7 +38,8 @@ const (
 	// Actor attributes the binder's catalog operations. It is not an identity.
 	Actor = "manager:volume-binder"
 	// MaxLinks: an inode with more names is not enumerated (each name
-	// costs whole directory listings); its state stays unknown.
+	// costs whole directory listings). Its records are left as they are
+	// and the event counts as too_many_links, without retries.
 	MaxLinks = 64
 
 	maxHintBytes     = 4096 // longer paths are not catalogued
@@ -57,6 +58,10 @@ var eventRetries = []time.Duration{200 * time.Millisecond, time.Second}
 var errUnknown = errors.New("continuity: volume state unknown")
 
 func unknown(err error) error { return fmt.Errorf("%w: %w", errUnknown, err) }
+
+// errTooManyLinks: the inode's names would have to be listed but it has
+// more than MaxLinks. Retrying cannot help, so it is its own outcome.
+var errTooManyLinks = errors.New("continuity: too many links to list")
 
 // Event is the part of a juicemount:metadata payload the binder uses. Field
 // names match metadata.MetadataEvent (pinned by the contract test).
@@ -126,7 +131,7 @@ type Binder struct {
 	// a rename (or a create) replaced, which publishes no delete event.
 	paths *pathCache
 
-	received, handled, dropped, discarded, applied, ignored, failed, retried, unresolved, resubscribes atomic.Uint64
+	received, handled, dropped, discarded, applied, ignored, failed, retried, unresolved, tooManyLinks, resubscribes atomic.Uint64
 
 	observedSince atomic.Int64 // unix nanoseconds
 
@@ -331,6 +336,11 @@ func (b *Binder) handle(ctx context.Context, v *volume, ev Event) {
 		case <-time.After(eventRetries[attempt]):
 		}
 	}
+	if errors.Is(err, errTooManyLinks) {
+		n := b.tooManyLinks.Add(1)
+		b.logEvery("links", "continuity: %d change events left unrecorded in total for files with over %d hard links; latest (%s %q): %v", n, MaxLinks, ev.Op, ev.Path, err)
+		return
+	}
 	if err != nil {
 		n := b.failed.Add(1)
 		b.logEvery("failed", "continuity: %d change events not recorded in total; latest (%s %q): %v", n, ev.Op, ev.Path, err)
@@ -478,7 +488,7 @@ func (b *Binder) where(v *volume, ino uint64, hint, observed string) (bool, stri
 		}
 	}
 	if n.Nlink > MaxLinks {
-		return false, "", unknown(fmt.Errorf("inode %d has %d links (over %d)", ino, n.Nlink, MaxLinks))
+		return false, "", fmt.Errorf("%w: inode %d has %d", errTooManyLinks, ino, n.Nlink)
 	}
 	paths, err := v.GetPaths(ino)
 	if gone(err) {

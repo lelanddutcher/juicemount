@@ -4,7 +4,8 @@ import "time"
 
 // Stats is the binder's observation state. Complete is always false in
 // this slice: changes made before ObservedSince (the Manager was down) or
-// lost to Dropped, Discarded, Failed, Unresolved or Resubscribes are missing
+// lost to Dropped, Discarded, Failed, Unresolved, TooManyLinks or
+// Resubscribes are missing
 // from the catalog, and only a rescan (a later slice) can find them.
 type Stats struct {
 	ObservedSince time.Time `json:"observed_since,omitzero"` // first subscription acknowledged
@@ -13,14 +14,15 @@ type Stats struct {
 	Queued        int       `json:"queued"`
 	QueueSize     int       `json:"queue_size"`
 	Received      uint64    `json:"received"`
-	Handled       uint64    `json:"handled"`    // taken off the queue and finished
-	Applied       uint64    `json:"applied"`    // catalog operations committed
-	Ignored       uint64    `json:"ignored"`    // not a visible regular file, malformed, or gone again
-	Dropped       uint64    `json:"dropped"`    // queue full or stopped: change missed
-	Discarded     uint64    `json:"discarded"`  // still queued at stop: change missed
-	Failed        uint64    `json:"failed"`     // volume or catalog error: change missed
-	Retried       uint64    `json:"retried"`    // events re-run after an unknown volume state
-	Unresolved    uint64    `json:"unresolved"` // delete naming no inode the binder knew
+	Handled       uint64    `json:"handled"`        // taken off the queue and finished
+	Applied       uint64    `json:"applied"`        // catalog operations committed
+	Ignored       uint64    `json:"ignored"`        // not a visible regular file, malformed, or gone again
+	Dropped       uint64    `json:"dropped"`        // queue full or stopped: change missed
+	Discarded     uint64    `json:"discarded"`      // still queued at stop: change missed
+	Failed        uint64    `json:"failed"`         // volume or catalog error: change missed
+	Retried       uint64    `json:"retried"`        // events re-run after an unknown volume state
+	Unresolved    uint64    `json:"unresolved"`     // delete naming no inode the binder knew
+	TooManyLinks  uint64    `json:"too_many_links"` // over MaxLinks names to list: left unrecorded
 	Resubscribes  uint64    `json:"resubscribes"`
 	// PathCacheEvictions: recent paths forgotten, so a file later replaced
 	// at one of them (rename over it) is not noticed.
@@ -43,6 +45,7 @@ func (b *Binder) Stats() Stats {
 		Retried:      b.retried.Load(),
 		Failed:       b.failed.Load(),
 		Unresolved:   b.unresolved.Load(),
+		TooManyLinks: b.tooManyLinks.Load(),
 		Resubscribes: b.resubscribes.Load(),
 
 		PathCacheEvictions: b.paths.evictions.Load(),

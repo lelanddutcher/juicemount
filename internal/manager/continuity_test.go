@@ -116,6 +116,20 @@ func TestContinuityRefusesStateDirReachedThroughTheMount(t *testing.T) {
 	}
 }
 
+func TestContinuityRefusesSharedStateDirectory(t *testing.T) {
+	cfg := continuityTestConfig(t)
+	if err := os.Chmod(filepath.Dir(cfg.StateFile), 0o775); err != nil {
+		t.Fatal(err)
+	}
+	if svc := buildContinuity(cfg, envOf(map[string]string{"JM_CONTINUITY": "on"})); svc != nil {
+		svc.Stop()
+		t.Fatal("catalog opened under a group-writable state directory")
+	}
+	if _, err := os.Lstat(filepath.Join(filepath.Dir(cfg.StateFile), continuityDirName)); !os.IsNotExist(err) {
+		t.Fatalf("catalog directory created: %v", err)
+	}
+}
+
 func TestContinuityRefusesSymlinkedDirectory(t *testing.T) {
 	cfg := continuityTestConfig(t)
 	elsewhere := t.TempDir()

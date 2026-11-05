@@ -178,6 +178,11 @@ func openContinuityCatalog(stateDir string, mounts ...string) (*catalog.Store, e
 	if base, err = filepath.Abs(base); err != nil {
 		return nil, err
 	}
+	// Create and Open reach the catalog by path again, so the state
+	// directory holding continuity/ must not let another account swap it.
+	if err := checkPrivateParent(base); err != nil {
+		return nil, err
+	}
 	dir := filepath.Join(base, continuityDirName)
 	for _, m := range mounts {
 		if m == "" {
@@ -239,6 +244,24 @@ func openContinuityCatalog(stateDir string, mounts ...string) (*catalog.Store, e
 	default:
 		return nil, fmt.Errorf("opening the catalog %s: %w", path, err)
 	}
+}
+
+// checkPrivateParent refuses a state directory another account could write
+// to (or that another account owns).
+func checkPrivateParent(dir string) error {
+	fd, err := syscall.Open(dir, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
+	if err != nil {
+		return fmt.Errorf("state directory %s: %w", dir, err)
+	}
+	defer syscall.Close(fd)
+	var st syscall.Stat_t
+	if err := syscall.Fstat(fd, &st); err != nil {
+		return fmt.Errorf("state directory %s: %w", dir, err)
+	}
+	if int(st.Uid) != os.Geteuid() || st.Mode&0o022 != 0 {
+		return fmt.Errorf("state directory %s must be owned by this process (uid %d) and not writable by group or others (owner %d, mode %o)", dir, os.Geteuid(), st.Uid, st.Mode&0o7777)
+	}
+	return nil
 }
 
 // handleContinuityAssets: GET ?path=<volume path> or ?id=<asset id> returns

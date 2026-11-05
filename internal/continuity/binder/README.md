@@ -54,7 +54,8 @@ original receipt.
 - **Hint:** the current hint is kept while it still names the inode (two point
   reads). Otherwise it is the observed path (one link) or the bytewise-smallest
   visible name. Listing every name reads whole directories up to the root, so it
-  happens only for hard links or a hint that moved, and not above 64 links.
+  happens only for hard links or a hint that moved. Above 64 links the records
+  are left as they are and the event counts as `too_many_links` (no retry).
 - **Unknown is not gone.** JuiceFS's `GetPaths` skips directories it fails to read;
   `jfsmeta.GetPaths` returns EIO when it finds fewer names (trash ones included)
   than the link count. Any failed volume read leaves the records unchanged; the
@@ -82,13 +83,26 @@ queue drops and counts. Changes are missed when:
 - go-redis re-subscribes after a dropped connection (`resubscribes`);
 - the queue is full or stopped (`dropped`), or still queued at stop (`discarded`);
 - volume reads keep failing or the catalog refuses (`failed`);
-- a delete names no inode the binder knows (`unresolved`), or the replaced file's
-  path was evicted (`path_cache_evictions`);
+- a delete names no inode the binder knows (`unresolved`), the replaced file's
+  path was evicted (`path_cache_evictions`), or the file has over 64 links
+  (`too_many_links`);
 - no client publishes them: writes by Manager sync, the farm or the WebDAV/S3
   gateway, and renames of files a client had not mirrored.
 
 There is no rescan in this slice. `GET /api/continuity/status` reports these
 counters and `complete: false`; a later rescan starts from them.
+
+## For later slices
+
+- `jfs-path:` hint locations are hints only: stale after a folder rename, and two
+  assets can hold the same path (a file replaced before its old record was
+  retired). Never use them as identity or to deduplicate; resolve the current
+  path from the volume (`AssetView.Path`).
+- Tell the records apart by source: `Source(uuid)` for the inode, `HintSource(uuid)`
+  for the hint.
+- The catalog has no index on locators, so path → asset goes through the volume
+  (`LookupIno`, then the derived location ID), or needs an index in a new schema
+  version.
 
 ## API (admin key)
 
