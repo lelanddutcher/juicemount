@@ -230,8 +230,10 @@ agents, which share one request slot, take turns); for them
 `path_hint` is shown only inside their grants and `label` only when it is
 the file's current name. A request reads
 at most 100,000 catalog hints and resolves at most 1,000 files on the
-volume; a page cut short says `budget_exhausted` and its `next` continues
-it. `GET /api/continuity/asset/{asset_id}` returns one file (404 when it is
+volume; a page cut short says `budget_exhausted` and its `next` (always
+past the cursor given) continues it; with no `next` the scan is complete. A
+request that could not examine a single file in time answers 503 with
+`Retry-After`; retry it with the same cursor. `GET /api/continuity/asset/{asset_id}` returns one file (404 when it is
 gone or outside the caller's grants).
 
 Known gaps:

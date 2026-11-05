@@ -52,7 +52,9 @@ package manager
 // cursor, as its deadline nears. The answer's next is the cursor to
 // continue from (the last hint examined); a page cut short by the budget
 // says budget_exhausted and may hold fewer results than limit, even none,
-// and still have a next. Without next the scan is complete. The order is
+// and still have a next, always past the cursor it was given. Without next
+// the scan is complete. A request that stops before it examines a single
+// hint answers 503 (Retry-After), never a page. The order is
 // the catalog's and never changes, so paging neither repeats nor skips a
 // file that stays put; a file bound or moved while paging may appear on a
 // later page or be missed until the next scan from the start.
@@ -397,6 +399,12 @@ func (h *collectionsAPI) routeFind(w http.ResponseWriter, r *http.Request, svc *
 	}
 	if scanErr != nil {
 		return scanErr
+	}
+	if stopped && last == cursor {
+		// Stopped before it examined a hint (its budget or deadline): no
+		// page, which would read as complete or repeat its cursor.
+		w.Header().Set("Retry-After", "1")
+		return failf(http.StatusServiceUnavailable, "the Manager could not start this search in time; try again with the same cursor")
 	}
 	if stopped {
 		out.Next = last

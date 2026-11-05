@@ -297,3 +297,48 @@ func mustLibrary(t *testing.T, e *collectionsEnv) continuity.LibraryID {
 	}
 	return l
 }
+
+// A find stopped before it examined any hint answers 503 (try again), never
+// a page that reads as complete or repeats its cursor; a page cut short by
+// its budget always moves past its cursor.
+func TestFindNeverStopsWithoutProgress(t *testing.T) {
+	e := newDiscoveryEnv(t)
+	tok := e.mint("Al", map[string]any{"name": "agent"}).Token
+	saved := agentFindScanBudget
+	defer func() { agentFindScanBudget = saved }()
+	agentFindScanBudget = 1
+	first := e.find(tok, url.Values{})
+	if !first.Budget || first.Next == "" || first.Scanned != 1 {
+		t.Fatalf("one-hint page: %+v", first)
+	}
+	agentFindScanBudget = 0 // as if the deadline passed before the first hint
+	for _, q := range []string{"", "?cursor=" + url.QueryEscape(first.Next)} {
+		rec := e.do(tok, http.MethodGet, "/api/continuity/find"+q, nil)
+		if rec.Code != 503 || rec.Header().Get("Retry-After") == "" || strings.Contains(rec.Body.String(), "budget_exhausted") {
+			t.Fatalf("stopped before any hint (%q): %d %v %s", q, rec.Code, rec.Header(), rec.Body)
+		}
+	}
+	// Paging one hint at a time: every cursor moves on, to the end.
+	agentFindScanBudget = 1
+	seen := map[string]bool{}
+	files := 0
+	for cursor := ""; ; {
+		q := url.Values{}
+		if cursor != "" {
+			q.Set("cursor", cursor)
+		}
+		r := e.find(tok, q)
+		files += len(r.Files)
+		if r.Next == "" {
+			break
+		}
+		if r.Next <= cursor || seen[r.Next] {
+			t.Fatalf("cursor %q did not move past %q", r.Next, cursor)
+		}
+		seen[r.Next] = true
+		cursor = r.Next
+	}
+	if files != 35 {
+		t.Fatalf("files: %d", files)
+	}
+}
