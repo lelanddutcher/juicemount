@@ -25,9 +25,13 @@ package respproxy
 // created N, a new directory placed directly in a smart root P owned by
 // that principal, committed (smartViewCreation). A directory moved into a
 // smart root, or created there before this record existed, is never in it
-// and is never removable this way. The record is dropped when the removal
-// commits; an entry left by a lost reply names an inode number that is
-// never reused.
+// and is never removable this way. A view leaves the record when any unit
+// (of any principal) that removes or replaces its entry, or deletes its
+// inode, committed or may have (forgetSmartViews): a removal, a rename out
+// of the root or within it, a move to the trash. A view renamed out and
+// moved back is not a view again. At start the proxy drops records whose
+// inode is gone or no longer a directory directly in a smart root
+// (loadSmartViews, at most smartPruneMax checks).
 //
 // The removal unit must be exactly juicefs's rmdir without the trash
 // (redis.go doRmdir with skipCheckTrash, which the Manager's metadata
@@ -61,7 +65,9 @@ package respproxy
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/lelanddutcher/juicemount/internal/smartfolders"
@@ -71,25 +77,33 @@ import (
 // the manager principal created (a set of inode numbers).
 const SmartViewsKey = "jmlease:v1:smartviews"
 
+// smartPruneMax bounds the records loadSmartViews checks at start.
+const smartPruneMax = 4096
+
 // smartViewSkew bounds how far the times rmdir writes into a smart root
 // may be from Redis TIME (the writer's clock names them).
 const smartViewSkew = time.Hour
 
 // CleanSmartRoots returns the valid smart-folder root names among names,
 // checked as the Manager checks them (one visible path component, not a
-// reserved namespace), each once, and an error for each invalid one. An
-// invalid name is left out: it only narrows the exception.
+// reserved namespace), and an error for each invalid one. An invalid name
+// is left out: it only narrows the exception. A name equal to an earlier
+// one under case folding (strings.EqualFold, as the Manager compares the
+// collection views root with the Recents root, turning the later one off)
+// is left out too.
 func CleanSmartRoots(names []string) ([]string, []error) {
 	var ok []string
 	var bad []error
-	seen := map[string]bool{}
 	for _, n := range names {
 		if err := smartfolders.ValidateRootName(n); err != nil {
 			bad = append(bad, err)
 			continue
 		}
-		if !seen[n] {
-			seen[n] = true
+		dup := false
+		for _, o := range ok {
+			dup = dup || strings.EqualFold(n, o)
+		}
+		if !dup {
 			ok = append(ok, n)
 		}
 	}
@@ -233,9 +247,7 @@ func (e *LeaseEngine) smartViewRemoval(p Principal, u *Unit, op dentryOp, stored
 	}
 	name := op.name
 	return func() {
-		if _, err := e.side("SREM", SmartViewsKey, nd); err != nil {
-			e.logf("respproxy: smart-folder view record: SREM %s: %v", nd, err)
-		}
+		e.dropSmartView(n)
 		e.queueLog(logEntry{"event", "smart_view_remove", "proj", nd, "actor", p.Name,
 			"kind", string(p.Kind), "root", sanitizeToken(root), "view", sanitizeToken(name),
 			"ts_ms", strconv.FormatInt(ms(e.now()), 10)})
@@ -277,10 +289,120 @@ func (e *LeaseEngine) smartViewCreation(p Principal, u *Unit, f *unitFacts) func
 			e.logf("respproxy: smart-folder view record: SADD %s: %v (the view cannot be removed by the Manager)", nd, err)
 			return
 		}
+		e.smartMu.Lock()
+		e.smartViews[op.ino] = true
+		e.smartMu.Unlock()
 		e.queueLog(logEntry{"event", "smart_view_create", "proj", nd, "actor", p.Name,
 			"kind", string(p.Kind), "root", sanitizeToken(root), "view", sanitizeToken(name),
 			"ts_ms", strconv.FormatInt(ms(e.now()), 10)})
 	}
+}
+
+// forgetSmartViews drops from the record every view whose entry the unit
+// removes or replaces, or whose inode it deletes. Called once the unit
+// committed or may have.
+func (e *LeaseEngine) forgetSmartViews(u *Unit, f *unitFacts) {
+	cand := f.unlinked
+	for _, w := range u.Project {
+		if w.Key.Shape == ShapeInode && w.Key.HasIno {
+			switch u.Cmds[w.Cmd].Info.Name {
+			case "DEL", "UNLINK", "GETDEL":
+				cand = append(cand, w.Key.Ino)
+			}
+		}
+	}
+	if len(cand) == 0 {
+		return
+	}
+	var drop []uint64
+	e.smartMu.Lock()
+	for _, n := range cand {
+		if e.smartViews[n] {
+			drop = append(drop, n)
+		}
+	}
+	e.smartMu.Unlock()
+	for _, n := range drop {
+		e.dropSmartView(n)
+	}
+}
+
+// dropSmartView removes n from the record. If Redis refuses, the entry
+// stays in the mirror and the next start's check drops it once the view
+// is gone or out of its root.
+func (e *LeaseEngine) dropSmartView(n uint64) {
+	if _, err := e.side("SREM", SmartViewsKey, inoStr(n)); err != nil {
+		e.logf("respproxy: smart-folder view record: SREM %d: %v", n, err)
+		return
+	}
+	e.smartMu.Lock()
+	delete(e.smartViews, n)
+	e.smartMu.Unlock()
+}
+
+// loadSmartViews reads the record into the mirror and drops (at most
+// smartPruneMax checks) every entry whose inode is gone, is not a
+// directory, or, while smart roots are configured, does not sit directly
+// in one of them.
+func (e *LeaseEngine) loadSmartViews() error {
+	views := map[uint64]bool{}
+	cursor := "0"
+	for {
+		v, err := e.side("SSCAN", SmartViewsKey, cursor, "COUNT", "1000")
+		if err != nil || len(v.Elems) != 2 {
+			return fmt.Errorf("SSCAN %s: %v", SmartViewsKey, err)
+		}
+		for _, m := range v.Elems[1].Elems {
+			if n, ok := digits(string(m.Str)); ok {
+				views[n] = true
+			}
+		}
+		if cursor = string(v.Elems[0].Str); cursor == "0" {
+			break
+		}
+	}
+	roots := map[uint64]bool{}
+	if len(e.cfg.SmartRoots) > 0 {
+		v, err := e.side(append([]string{"HMGET", "d" + inoStr(rootIno)}, e.cfg.SmartRoots...)...)
+		if err != nil {
+			return fmt.Errorf("read the smart-folder roots: %v", err)
+		}
+		for _, el := range v.Elems {
+			if t, ok := entryType(el.Str); ok && t == typeDir && !el.Null {
+				if ino, ok := entryInode(el.Str); ok {
+					roots[ino] = true
+				}
+			}
+		}
+	}
+	checked, dropped := 0, 0
+	for n := range views {
+		if checked >= smartPruneMax {
+			e.logf("respproxy: smart-folder view record: %d entries, checked %d at start", len(views), checked)
+			break
+		}
+		checked++
+		v, err := e.side("GET", "i"+inoStr(n))
+		if err != nil {
+			return fmt.Errorf("GET i%d: %v", n, err)
+		}
+		a, ok := parseAttr(v.Str)
+		if !v.Null && ok && a.typ == typeDir && (len(e.cfg.SmartRoots) == 0 || roots[a.parent]) {
+			continue
+		}
+		if _, err := e.side("SREM", SmartViewsKey, inoStr(n)); err != nil {
+			return fmt.Errorf("SREM %s %d: %v", SmartViewsKey, n, err)
+		}
+		delete(views, n)
+		dropped++
+	}
+	if dropped > 0 {
+		e.logf("respproxy: smart-folder view record: dropped %d entries of views gone or out of their root", dropped)
+	}
+	e.smartMu.Lock()
+	e.smartViews = views
+	e.smartMu.Unlock()
+	return nil
 }
 
 // smartRootOf reports which configured smart root the directory dir is:

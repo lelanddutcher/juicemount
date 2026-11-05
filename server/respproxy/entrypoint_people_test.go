@@ -119,7 +119,7 @@ func TestEntrypointKeepsPeopleAndConfiguresAudit(t *testing.T) {
 		{[]string{"JM_SMART_FOLDERS=on", "JM_SMART_FOLDERS_ROOT=  ", "JM_SMART_FOLDERS_COLLECTIONS_ROOT=Sets"}, "Recents"},
 		{[]string{"JM_SMART_FOLDERS=yes", "JM_CONTINUITY=true"}, "Recents,Collections"},
 		{[]string{"JM_SMART_FOLDERS=on", "JM_CONTINUITY=on", "JM_SMART_FOLDERS_ROOT= Recent Files ", "JM_SMART_FOLDERS_COLLECTIONS_ROOT= Sets"}, "Recent Files,Sets"},
-		{[]string{"JM_SMART_FOLDERS=on", "JM_CONTINUITY=on", "JM_SMART_FOLDERS_ROOT=Views", "JM_SMART_FOLDERS_COLLECTIONS_ROOT=views"}, "Views"},
+		{[]string{"JM_SMART_FOLDERS=on", "JM_CONTINUITY=on", "JM_SMART_FOLDERS_ROOT=Views", "JM_SMART_FOLDERS_COLLECTIONS_ROOT=views"}, "Views,views"}, // the proxy folds them
 	} {
 		if out, err := rerun(tc.env...); err != nil {
 			t.Fatalf("entrypoint %v: %v\n%s", tc.env, err, out)

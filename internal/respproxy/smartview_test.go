@@ -430,3 +430,67 @@ func TestCleanSmartRoots(t *testing.T) {
 		t.Fatalf("CleanSmartRoots = %q, %v", ok, bad)
 	}
 }
+
+// A view leaves the record however it leaves its root.
+func TestSmartViewRecordFollowsTheView(t *testing.T) {
+	r := startSmartViewRig(t, svRoots)
+	admin := r.conn(t, "admin1")
+	t.Run("admin_rmdir", func(t *testing.T) {
+		n := r.view(t, r.recents, "Gone")
+		mustOK(t, r.rmdir(t, "admin1", r.recents, n, "Gone", r.rmdirCmds(t, r.recents, n, "Gone")), "admin rmdir of a view")
+		if r.recorded(t, n, false) {
+			t.Fatal("a view the admin removed is still recorded")
+		}
+	})
+	t.Run("rename_out_and_back", func(t *testing.T) {
+		n := r.view(t, r.colls, "Away")
+		move := func(from, to uint64) {
+			t.Helper()
+			mustOK(t, txn(admin,
+				[]string{"HDEL", "d" + inoStr(from), "Away"},
+				[]string{"HSET", "d" + inoStr(to), "Away", mkEntry(typeDir, n)},
+				[]string{"SET", "i" + inoStr(n), svAttr(typeDir, to, 2)},
+				[]string{"SET", "i" + inoStr(from), svBump(r.get(t, "i"+inoStr(from)), -1)},
+				[]string{"SET", "i" + inoStr(to), svBump(r.get(t, "i"+inoStr(to)), 1)}), "admin moves the view")
+		}
+		move(r.colls, r.other)
+		if r.recorded(t, n, false) {
+			t.Fatal("a view moved out of its root is still recorded")
+		}
+		move(r.other, r.colls)
+		r.wantRefused(t, r.rmdir(t, "mgr1", r.colls, n, "Away", r.rmdirCmds(t, r.colls, n, "Away")), r.colls, n, "Away", "rmdir of a view moved out and back", "is not a recorded smart-folder view")
+	})
+	t.Run("inode_deleted", func(t *testing.T) {
+		n := r.view(t, r.recents, "Deleted")
+		mustOK(t, admin.do("DEL", "i"+inoStr(n)), "admin deletes the view's inode")
+		if r.recorded(t, n, false) {
+			t.Fatal("a view whose inode was deleted is still recorded")
+		}
+	})
+}
+
+// At start the proxy drops records of views that are gone or out of their
+// root, and keeps the others.
+func TestSmartViewRecordPrunedAtStart(t *testing.T) {
+	r := startSmartViewRig(t, svRoots)
+	kept := r.view(t, r.recents, "Kept")
+	out := r.mkdir(t, r.mgr, r.other, "Out")
+	if err := r.db.SAdd(r.ctx, SmartViewsKey, "999999", inoStr(out)).Err(); err != nil {
+		t.Fatal(err)
+	}
+	eng := NewLeaseEngine(LeaseConfig{Side: r.tp.Side(), VolumeDB: testDB, NoScan: true, SmartRoots: svRoots,
+		SweepEvery: time.Hour, Logf: r.tp.logs.Logf})
+	if err := eng.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+	got, err := r.db.SMembers(r.ctx, SmartViewsKey).Result()
+	if err != nil || strings.Join(got, ",") != inoStr(kept) {
+		t.Fatalf("record after start = %v (%v), want only %d", got, err, kept)
+	}
+	eng.smartMu.Lock()
+	defer eng.smartMu.Unlock()
+	if len(eng.smartViews) != 1 || !eng.smartViews[kept] {
+		t.Fatalf("mirror after start = %v", eng.smartViews)
+	}
+}

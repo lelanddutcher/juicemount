@@ -80,6 +80,10 @@ type LeaseEngine struct {
 
 	boot bootstrapState
 
+	// smartViews mirrors SmartViewsKey (smartview.go).
+	smartMu    sync.Mutex
+	smartViews map[uint64]bool
+
 	stop      chan struct{}
 	wg        sync.WaitGroup
 	closeOnce sync.Once
@@ -126,14 +130,15 @@ func NewLeaseEngine(cfg LeaseConfig) *LeaseEngine {
 		cfg.FileCache = 1 << 20
 	}
 	e := &LeaseEngine{
-		cfg:      cfg,
-		now:      cfg.Now,
-		leases:   map[uint64]*lease{},
-		fences:   map[uint64]*sync.RWMutex{},
-		denyLast: map[string]int64{},
-		lcfg:     defaultLeaseCfg(),
-		logCh:    make(chan logEntry, 4096),
-		stop:     make(chan struct{}),
+		cfg:        cfg,
+		now:        cfg.Now,
+		leases:     map[uint64]*lease{},
+		fences:     map[uint64]*sync.RWMutex{},
+		denyLast:   map[string]int64{},
+		lcfg:       defaultLeaseCfg(),
+		smartViews: map[uint64]bool{},
+		logCh:      make(chan logEntry, 4096),
+		stop:       make(chan struct{}),
 	}
 	e.anc = newAncestry(cfg.Side, cfg.VolumeDB, 2, cfg.FileCache)
 	e.boot.doneC = make(chan struct{})
@@ -158,6 +163,9 @@ func (e *LeaseEngine) Start() error {
 	e.anc = newAncestry(e.cfg.Side, e.cfg.VolumeDB, c.depth, e.cfg.FileCache)
 	if err := e.loadLeases(ms(start)); err != nil {
 		return fmt.Errorf("respproxy: load leases: %w", err)
+	}
+	if err := e.loadSmartViews(); err != nil {
+		return fmt.Errorf("respproxy: load smart-folder views: %w", err)
 	}
 	t0 := time.Now()
 	n, err := e.anc.bootstrapRoots()
@@ -345,6 +353,9 @@ func (e *LeaseEngine) Decide(p Principal, u *Unit) Verdict {
 			for _, fn := range onCommit {
 				fn()
 			}
+		}
+		if timedOut || o.Lost || o.Committed {
+			e.forgetSmartViews(u, f) // applied, or may have been
 		}
 		if rootTouch && !timedOut && (o.Lost || o.Committed) {
 			e.grants.epoch.Add(1)

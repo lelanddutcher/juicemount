@@ -17,6 +17,10 @@ func TestSmartFolderRootsConfig(t *testing.T) {
 		{`{"smart_folder_roots":[]}`, "", 0},
 		{`{"smart_folder_roots":["Recents","Kollektionen","Recents"]}`, "Recents,Kollektionen", 0},
 		{`{"smart_folder_roots":["Recents",".trash","a/b"]}`, "Recents", 2},
+		// The Manager turns a collection views root equal to the Recents
+		// root under case folding off; so does the proxy.
+		{`{"smart_folder_roots":["Views","views"]}`, "Views", 0},
+		{`{"smart_folder_roots":["Straße","STRASSE","ǅ","ǆ"]}`, "Straße,STRASSE,ǅ", 0},
 	} {
 		var fc fileConfig
 		dec := json.NewDecoder(strings.NewReader(tc.json))

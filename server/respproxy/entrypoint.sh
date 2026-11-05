@@ -20,8 +20,9 @@
 #    the variables the Manager reads, read the way it reads them: none
 #    unless JM_SMART_FOLDERS=on; then JM_SMART_FOLDERS_ROOT (default
 #    Recents), and with JM_CONTINUITY=on also
-#    JM_SMART_FOLDERS_COLLECTIONS_ROOT (default Collections; left out when
-#    it is the Recents root). The manager principal may remove an empty
+#    JM_SMART_FOLDERS_COLLECTIONS_ROOT (default Collections; the proxy
+#    leaves it out when it is the Recents root under case folding, as the
+#    Manager does). The manager principal may remove an empty
 #    view folder it created directly under one, and nothing else at
 #    project depth. The proxy leaves out an invalid name.
 # 3. Execs jm-respproxy with the applied-reload handshake enabled. The
@@ -65,7 +66,9 @@ smart_roots() { # JSON array of the smart-folder roots the Manager runs
   if switch_on "${JM_CONTINUITY:-}"; then
     c="$(trim "${JM_SMART_FOLDERS_COLLECTIONS_ROOT:-}")"; [ -n "$c" ] || c=Collections
   fi
-  jq -cn --arg r "$r" --arg c "$c" '[$r] + (if $c == "" or ($c | ascii_downcase) == ($r | ascii_downcase) then [] else [$c] end)'
+  # The proxy drops a name equal to an earlier one under case folding
+  # (Go strings.EqualFold, as the Manager compares the two roots).
+  jq -cn --arg r "$r" --arg c "$c" '[$r] + (if $c == "" then [] else [$c] end)'
 }
 
 case "$MODE" in passthrough|observe|enforce) ;; *) die "JM_RESPPROXY_MODE must be passthrough, observe or enforce" ;; esac
