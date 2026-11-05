@@ -549,53 +549,91 @@ plus `revoked`: `{name, object_key, message}`, where `object_key` is
 `still_valid` (the shared key, until rotated), `removing` (its own per-Mac
 key, until minio-keyd confirms), `removed` or `none`. The revoke
 confirmation warns before it happens. The page lists every revoked Mac whose
-shared key still works under "Rotate the shared storage key"
-(`shared_key_still_valid` in the list). The list is kept in the principal
-store as a salted check value of the key, never the key, and clears once the
-Manager runs with a different `JM_OBJ_CLIENT_SECRET_KEY`; putting the old
-secret back lists those Macs again. A Mac approved again leaves the list.
-Macs revoked by an older Manager are not listed: if you have ever revoked a
-Mac that had been approved, rotate once.
+shared key may still work under "Rotate the shared storage key"
+(`shared_key_still_valid` in the list, with the access key each was given).
+
+What the Manager records, in the principal store:
+
+- Every Mac it approves while it hands out the shared key is marked
+  (`shared_key_issued`) in the same write as the approval, before any answer
+  carries the key. The mark stays after the Mac later gets its own per-Mac
+  key: the Mac still knows the shared one.
+- A revoke of such a Mac records the access key and a salted check value of
+  the secret (never the secret).
+- Macs revoked by an older Manager are listed once, marked "revoked by an
+  earlier Manager" (`legacy`). Some may have been only pending requests.
+  Macs revoked **and forgotten** before this version are not known at all:
+  if you ever revoked an approved Mac, rotate once.
+
+**A Mac leaves the list only on proof from MinIO**, never because the
+Manager's own environment changed. Every minute the Manager makes a signed
+list request to the volume's bucket (`JM_MINIO_URL`/`JM_VOL_NAME`, or
+`JM_OBJ_BUCKET_URL`) with its current client key. MinIO keeps one secret
+per user (`mc admin user add` replaces it), so when that request succeeds
+with a secret other than the one a Mac was given, that Mac's copy is
+refused. If the request fails, or MinIO cannot be reached, the Mac stays
+listed and the page says why (`shared_key_problem`). Putting the old secret
+back at MinIO lists those Macs again.
+
+**Do not rename `JM_OBJ_CLIENT_ACCESS_KEY` to rotate.** `minio-keys` creates
+the new user but never removes the old one, so the old key keeps working.
+If it was renamed, remove the old user at MinIO
+(`mc admin user rm <alias> <old access key>`); the Manager clears those Macs
+once MinIO answers `InvalidAccessKeyId` for the old access key.
 
 Rotate in a maintenance window. An approved Mac uses the new key only after
-its volume restarts (juicefs reads the key when it starts). Until then the
-object store refuses its uploads: new files wait in the Mac's spool, but
-changes to files that already exist fail.
+its volume restarts (juicefs reads the key when it starts). A Mac still
+running with the old key has its uploads refused: new files wait in its
+spool, but changes to files that already exist fail. So stop the Macs first.
 
-1. Put a new value in `server/.env`:
-   `JM_OBJ_CLIENT_SECRET_KEY=` (`openssl rand -hex 20`).
-2. Recreate the Manager so it hands out the new key:
-   `$C -f server/docker-compose.yml up -d --no-deps juicemount-manager`.
-   Approved Macs fetch it at their next poll (every 30 minutes, or within
-   about a minute of a refused upload); the revoked Mac gets nothing. The
-   Principals page's rotation list clears.
-3. Ask every Mac user to Stop everything in JuiceMount.
-4. Change the key at MinIO (from here the old secret is refused):
-   `$C -f server/docker-compose.yml up --no-deps minio-keys` (must exit 0).
-5. Recreate the server's other clients of the key:
-   `$C -f server/docker-compose.yml up -d --no-deps juicefs juicefarm`,
-   and re-create enrolled farm nodes with the new `MINIO_SECRET_KEY` (the
-   Manager's node plan prints the command).
-6. Macs Start again. A Mac that had not polled since step 2 reports refused
-   storage access; JuiceMount then asks the Manager at once and saves the
-   new key, and one more Stop everything, then Start, uses it.
+1. Ask every Mac user to Stop everything in JuiceMount.
+2. Put a new value in `server/.env`:
+   `JM_OBJ_CLIENT_SECRET_KEY=` (`openssl rand -hex 20`). Keep the old value
+   at hand for the check (`read -rs` it, never on a command line).
+3. Apply it everywhere, MinIO first: `$C -f server/docker-compose.yml up -d`.
+   `minio-keys` runs first and sets the new secret on `jm-client` (from here
+   the old secret is refused); `juicefs-init` waits for it, and `juicefs`
+   (WebDAV), `juicemount-manager` and `juicefarm` wait for `juicefs-init` and
+   are recreated with the new value. Check that `minio-keys` exited 0:
+   `docker logs "$($C -f server/docker-compose.yml ps -aq minio-keys)"`.
+4. Re-create enrolled farm nodes with the new `MINIO_SECRET_KEY` (the
+   Manager's node plan prints the command), and give the new secret to any
+   other client that was set up with the key by hand (a Mac or script with
+   `MINIO_ACCESS_KEY`/`MINIO_SECRET_KEY` set outside enrollment).
+5. Macs Start again. Each gets the new key from the Manager at its next
+   poll; a Mac that starts with the old key reports refused storage access,
+   asks the Manager at once, saves the new key, and one more Stop
+   everything, then Start, uses it.
 
-**Check:** the old secret is refused and a Mac copy and readback work:
+**Check** (all of them):
 
 ```bash
 M="$($C -f server/docker-compose.yml ps -q minio)"
-read -rs OLD && export OLD          # type the previous client secret
-docker exec -e OLD "$M" sh -c \
-  'MC_HOST_old="http://jm-client:$OLD@127.0.0.1:9000" mc ls old/zpool'   # must fail with an access error
+read -rs NEW && export NEW          # the new client secret
+read -rs OLD && export OLD          # the previous client secret
+# The new key lists the bucket (this also proves the alias and bucket are right):
+docker exec -e NEW "$M" sh -c 'MC_HOST_n="http://jm-client:$NEW@127.0.0.1:9000" mc ls n/zpool >/dev/null && echo NEW-OK'
+# The same command with the old key must fail with a signature error, not any error:
+docker exec -e OLD "$M" sh -c 'MC_HOST_o="http://jm-client:$OLD@127.0.0.1:9000" mc ls o/zpool' 2>&1 |
+  grep -q 'signature we calculated does not match' && echo OLD-REFUSED
+unset NEW OLD
 ```
 
-**Rollback:**
-put the old secret back in `server/.env` and repeat steps 2 to 5; the
-revoked Mac's copy then works again.
+Both lines must print. Then: the Principals page's rotation list is empty
+within a minute (or shows why not); `docker ps` shows the `juicefs`
+container `healthy` (its health check covers the WebDAV server) and
+`docker exec <juicefarm> mountpoint /jfs` succeeds; after a Mac copy, a
+WebDAV upload and a farm job, the `juicefs` and `juicefarm` logs and each
+farm node's log show no `SignatureDoesNotMatch`, `InvalidAccessKeyId` or
+`AccessDenied` (`docker logs --since 15m <container> 2>&1 | grep -E
+'SignatureDoesNotMatch|InvalidAccessKeyId|AccessDenied'` prints nothing).
 
-Per-Mac keys (below) remove the need for this rotation for Macs approved
-after the switch; Macs approved before it still hold the shared key until it
-is rotated once.
+**Rollback:** put the old secret back in `server/.env` and repeat step 3;
+the revoked Macs' copies then work again, and the page lists them again.
+
+Per-Mac keys (below) cut off a revoked Mac that only ever had its own key.
+A Mac that was ever given the shared key still knows it, so revoking it
+still needs this rotation.
 
 ### Per-Mac object keys (not yet enabled)
 
