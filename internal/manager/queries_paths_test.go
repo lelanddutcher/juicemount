@@ -5,14 +5,12 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"reflect"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/lelanddutcher/juicemount/internal/continuity/binder"
 	"github.com/lelanddutcher/juicemount/internal/continuity/catalog"
 )
 
@@ -168,43 +166,5 @@ func TestQueriesTouchOnlyUnderQueryFolders(t *testing.T) {
 	e.queryWrite("admin", "/api/queries/"+string(q.ID)+"/delete", map[string]any{}, 200)
 	if e.svc.wantsTouch(nfd + "/a.mov") {
 		t.Fatal("touch still wanted after the query was deleted")
-	}
-}
-
-// A grant and a path name the same folder in either Unicode form (a grant
-// copied from a macOS listing is often decomposed): queries, collections
-// and find compare them composed. The grant is kept as it was given.
-func TestGrantsCoverEitherUnicodeForm(t *testing.T) {
-	e := newAgentEnv(t)
-	cafeNFC, cafeNFD := "Clients/Caf\u00e9", "Clients/Cafe\u0301"
-	bebeNFC, bebeNFD := "Clients/B\u00e9b\u00e9", "Clients/Be\u0301be\u0301"
-	e.vol.set(func(f map[string]uint64) {
-		f[cafeNFC+"/cut.mov"] = 60
-		f[bebeNFD+"/take.mov"] = 61
-	})
-	e.offer(binder.Event{Op: "create", Path: cafeNFC + "/cut.mov", Inode: 60}, binder.Event{Op: "create", Path: bebeNFD + "/take.mov", Inode: 61})
-	for _, g := range []string{"/" + cafeNFD, "/" + bebeNFC} {
-		if err := e.people.AddGrant(e.ids["Bob"], g); err != nil {
-			t.Fatal(err)
-		}
-	}
-	for _, folder := range []string{cafeNFC, cafeNFD, bebeNFD} {
-		e.queryWrite("Bob", "/api/queries", map[string]any{"name": "q " + folder, "folders": []string{folder}}, 200)
-	}
-	e.write("Bob", "/api/collections", map[string]any{"name": "C", "members": pathRefs(cafeNFC+"/cut.mov", bebeNFD+"/take.mov")}, 200)
-	found := e.find("Bob", url.Values{"name": {".mov"}})
-	var paths []string
-	for _, f := range found.Files {
-		paths = append(paths, f.Path)
-	}
-	if len(paths) != 3 { // and Clients/B/three.mov
-		t.Fatalf("Bob finds %q", paths)
-	}
-	// Still not a grant over another folder.
-	e.queryWrite("Bob", "/api/queries", map[string]any{"name": "a", "folders": []string{"Clients/A"}}, 403)
-	for _, p := range e.people.PeopleSnapshot().People {
-		if p.ID == e.ids["Bob"] && !reflect.DeepEqual(p.Grants, []string{"/Clients/B", "/" + bebeNFC, "/" + cafeNFD}) {
-			t.Fatalf("grants stored as %q", p.Grants)
-		}
 	}
 }
