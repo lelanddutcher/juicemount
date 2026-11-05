@@ -109,10 +109,12 @@ client_policy="$(<"$POLICY_DIR/jm-client-policy.json")"
 # MinIO lets any user mint service accounts for itself, and set its own
 # secret, unless its policy explicitly denies it. Such a credential would
 # outlive a rotation of the user's secret, so the deny must be there.
-for a in admin:CreateServiceAccount admin:CreateUser; do
-	[[ "$client_policy" == *'"Effect": "Deny"'* && "$client_policy" == *"\"$a\""* ]] ||
-		die "jm-client-policy.json does not deny $a; refusing"
-done
+# Structural, without jq (the minio image has none): with all whitespace
+# removed, the policy must hold this exact statement, so both actions sit in
+# a Deny statement with no resource or condition to narrow it.
+client_deny='{"Sid":"JuiceMountClientNoSelfCredentials","Effect":"Deny","Action":["admin:CreateServiceAccount","admin:CreateUser"]}'
+[[ "${client_policy//[[:space:]]/}" == *"$client_deny"* ]] ||
+	die "jm-client-policy.json does not deny admin:CreateServiceAccount and admin:CreateUser in one plain Deny statement; refusing"
 # per_mac_check: the per-Mac inputs, before any mc call. Prints why not.
 per_mac_check() {
 	[[ "$KEYADMIN_SK" =~ ^[A-Za-z0-9]{32,40}$ ]] ||

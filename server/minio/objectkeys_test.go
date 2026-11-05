@@ -740,15 +740,30 @@ func TestProvisionRefusesClientPolicyWithoutSelfDeny(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "jm-gc-policy.json"), []byte(mustRead(t, "jm-gc-policy.json")), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	for _, drop := range []string{"admin:CreateServiceAccount", "admin:CreateUser"} {
-		bad := strings.Replace(mustRead(t, "jm-client-policy.json"), `"`+drop+`"`, `"admin:ListServiceAccounts"`, 1)
+	good := mustRead(t, "jm-client-policy.json")
+	for name, bad := range map[string]string{
+		"no CreateServiceAccount": strings.Replace(good, `"admin:CreateServiceAccount"`, `"admin:ListServiceAccounts"`, 1),
+		"no CreateUser":           strings.Replace(good, `"admin:CreateUser"`, `"admin:ListServiceAccounts"`, 1),
+		// The actions present, but in an Allow statement (substring-only
+		// checks would pass this).
+		"allow, not deny": strings.Replace(good, `"Effect": "Deny"`, `"Effect": "Allow"`, 1),
+		// A resource narrows the deny.
+		"narrowed": strings.Replace(good, `"admin:CreateUser"
+      ]`, `"admin:CreateUser"
+      ],
+      "Resource": ["arn:aws:s3:::nothing"]`, 1),
+	} {
+		if bad == good {
+			t.Fatalf("%s: the fixture did not change the policy", name)
+		}
 		if err := os.WriteFile(filepath.Join(dir, "jm-client-policy.json"), []byte(bad), 0o644); err != nil {
 			t.Fatal(err)
 		}
 		state := t.TempDir()
 		out, err := runProvision(t, state, "JM_MINIO_POLICY_DIR="+dir)
-		if err == nil || !strings.Contains(out, "does not deny "+drop) || readOpt(filepath.Join(state, "argv")) != "" {
-			t.Fatalf("%s: err=%v out=%s argv=%q", drop, err, out, readOpt(filepath.Join(state, "argv")))
+		if err == nil || !strings.Contains(out, "does not deny admin:CreateServiceAccount and admin:CreateUser") ||
+			readOpt(filepath.Join(state, "argv")) != "" {
+			t.Fatalf("%s: err=%v out=%s argv=%q", name, err, out, readOpt(filepath.Join(state, "argv")))
 		}
 	}
 }
