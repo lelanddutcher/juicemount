@@ -196,9 +196,18 @@ adding or removing members (within the person's grants, as for their Mac),
 listing saved queries and their results, and the two discovery routes below.
 Every other route answers 403, including deleting a collection, query
 changes, people, enrollment and anything that moves or returns file bytes.
-A token stops working at once when it expires or is revoked, its person is
-removed, or the Mac that minted it is revoked, flagged as cloned, unassigned
-or given to someone else (it does not come back if that is undone). The
+A token stops working when it expires or is revoked, its person is removed,
+or the Mac that minted it is revoked, flagged as cloned, unassigned or given
+to someone else (it does not come back if that is undone): from then on
+every new request is refused, and an edit already under way is checked again
+just before it is written and refused; a read already running finishes. An
+agent sees collection members and saved-query results only inside its
+person's grants; the rest are counted in `withheld`, without names (Macs and
+the admin see them whole). A refused use of a revoked or expired token is
+recorded in the audit log (once a minute per token). Note: the Manager
+treats any request carrying `Authorization: Bearer` as an agent, so a
+reverse proxy in front of it must not forward its own bearer credentials
+to the Manager (they would be refused, 401 or 403). The
 person lists and revokes their tokens from a Mac (`GET /api/agent-tokens`,
 `POST /api/agent-tokens/{id}/revoke`); the admin lists and revokes any (the
 same routes with the admin key, and the People page). Mints, revokes and
@@ -215,7 +224,9 @@ ignoring case), `folder` (repeatable), `collection`, `modified_after` (RFC
 most 200) and `cursor` (the previous answer's `next`). Each result has the
 asset ID, current name, first label, the catalog's path hint, the current
 path under the mount root, size, modification time and its collections. A
-person (or their agent) sees only files their grants cover. A request reads
+person (or their agent) sees only files their grants cover; for them
+`path_hint` is shown only inside their grants and `label` only when it is
+the file's current name. A request reads
 at most 100,000 catalog hints and resolves at most 1,000 files on the
 volume; a page cut short says `budget_exhausted` and its `next` continues
 it. `GET /api/continuity/asset/{asset_id}` returns one file (404 when it is

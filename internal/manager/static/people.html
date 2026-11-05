@@ -48,7 +48,8 @@ Refused writes fail on the Mac as a read-only error. Reading is not limited.</p>
 <h2>Agent tokens</h2>
 <p class="note">A person mints an agent token on their own Mac for an AI agent (the JuiceMount MCP server). It finds files
 and edits collections as that person, within their grants, and never reads file contents. It stops working when it
-expires, is revoked, or its Mac is revoked or given to someone else, or its person is removed.</p>
+expires, is revoked, or its Mac is revoked or given to someone else, or its person is removed: from then on every new
+request is refused and no change it has not yet made is applied (a read already running may finish).</p>
 <table>
   <thead><tr><th>Token</th><th>Person</th><th>Minted on</th><th>Created</th><th>Expires</th><th></th></tr></thead>
   <tbody id="agentTokens"></tbody>
@@ -171,7 +172,7 @@ summarized per file and 10-second window.</p>
     if (d.ungrant) change('ungrant', { id: d.ungrant, path: d.path });
     if (d.rename) { var n = window.prompt('New name', nameOf(d.rename)); if (n) change('update', { id: d.rename, name: n }); }
     if (d['delete'] && window.confirm('Remove ' + nameOf(d['delete']) + '? Their Macs are left with no person: while grants are in force they can read but not write until you assign them.')) change('delete', { id: d['delete'] });
-    if (d.revokeToken && window.confirm('Revoke agent token ' + d.revokeToken + '? The agent using it stops at once.')) {
+    if (d.revokeToken && window.confirm('Revoke agent token ' + d.revokeToken + '? Its new requests are refused from now on, and so is any change not yet made.')) {
       errBox.textContent = '';
       api('POST', 'agent-tokens/' + d.revokeToken + '/revoke').then(loadTokens, fail);
     }
