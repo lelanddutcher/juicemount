@@ -164,13 +164,6 @@ func TestDrainBatchDisabledIsByteIdentical(t *testing.T) {
 	}
 }
 
-// drainPassDeadline bounds one DrainOnceForTest pass as a hang detector. Eight
-// drains make dozens of fsynced commits; at 200 ms an fsync (the race lane has
-// measured a single spool commit at over 600 ms) a 5 s budget ran out with
-// every drain still progressing, and the panic took the rest of the package
-// with it.
-const drainPassDeadline = time.Minute
-
 // TestDrainBatchFlushesOnSizeThreshold drives MORE than one batch worth of
 // small files through a single DrainOnceForTest scan and asserts every one
 // drains — the op-count threshold flushing mid-stream (at 3 and 6), not only at
@@ -300,7 +293,7 @@ func TestDrainBatchCachesMetadataBeforeEviction(t *testing.T) {
 	simulateNFSCreateThenWrite(t, jfs, name, payload, 1024)
 	spool.sweepOnce(0)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), drainPassDeadline)
 	defer cancel()
 	if got := drainer.DrainOnceForTest(ctx); got != 1 {
 		t.Fatalf("DrainOnceForTest processed %d rows, want 1", got)

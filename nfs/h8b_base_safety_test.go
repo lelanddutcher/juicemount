@@ -418,7 +418,7 @@ func TestH8BWaitHonouredWithLeaseClient(t *testing.T) {
 	e := writeSpoolEntry(t, spool, "Film/ProjA/x.mov", []byte("x"))
 	spool.Meta().MarkDraining(e.ID())
 	spool.Meta().HoldForProject(e.ID(), "Film/ProjA", "busy")
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), drainPassDeadline)
 	defer cancel()
 	if n := d.DrainOnceForTest(ctx); n != 0 {
 		t.Fatalf("waiting row dispatched while a lease client exists: %d", n)

@@ -498,7 +498,7 @@ func TestFailPermanentReleasesCapacity(t *testing.T) {
 		t.Fatalf("pre: row=(%+v, %v), want 5 attempts and size 256", row, err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), drainPassDeadline)
 	defer cancel()
 	// With completion wired, the exhausted budget reaches failPermanent.
 	if got := d.DrainOnceForTest(ctx); got != 1 {

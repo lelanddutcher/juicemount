@@ -19,6 +19,16 @@ import (
 // newTestDrainer wires up a SpoolStore + Drainer with a temp dir
 // playing the role of the FUSE root. drainOne's "copy to FUSE" lands
 // in that temp dir.
+
+// drainPassDeadline is every DrainOnceForTest pass's context: a hang detector,
+// not a latency budget. A drain makes fsynced file and SQLite commits and,
+// with leases wired, round trips to the lease server whose own timeout is 2 s;
+// on the race lane a single spool commit has taken over 600 ms. Budgets of
+// 1 to 5 s ran out there with every drain still progressing, and the panic
+// took the rest of the package with it. A test that needs a drain to finish
+// within some bound must measure that bound itself.
+const drainPassDeadline = time.Minute
+
 func newTestDrainer(t *testing.T, cfg DrainerConfig) (*SpoolStore, *Drainer) {
 	t.Helper()
 	store, err := metadata.Open(filepath.Join(t.TempDir(), "meta.db"))
@@ -86,7 +96,7 @@ func TestDrainerHappyPath(t *testing.T) {
 	payload := []byte("a sample file's worth of bytes")
 	e := writeSpoolEntry(t, spool, "/Films/clip.mov", payload)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), drainPassDeadline)
 	defer cancel()
 	n := d.DrainOnceForTest(ctx)
 	if n != 1 {
@@ -152,7 +162,7 @@ func TestDrainNeverWritesThroughDestinationSymlink(t *testing.T) {
 		t.Fatal(err)
 	}
 	writeSpoolEntry(t, spool, "/destination", []byte("drained-bytes"))
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), drainPassDeadline)
 	defer cancel()
 	if n := d.DrainOnceForTest(ctx); n != 1 {
 		t.Fatalf("processed=%d, want 1", n)
@@ -180,7 +190,7 @@ func TestDrainerLastDrainSuccessStamp(t *testing.T) {
 	writeSpoolEntry(t, spool, "/Films/clip.mov", []byte("a sample file's worth of bytes"))
 
 	before := time.Now()
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), drainPassDeadline)
 	defer cancel()
 	if n := d.DrainOnceForTest(ctx); n != 1 {
 		t.Fatalf("expected 1 row processed, got %d", n)
@@ -231,7 +241,7 @@ func TestDrainerWorkerPoolBounded(t *testing.T) {
 		}
 	}()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), drainPassDeadline)
 	defer cancel()
 	_ = d.DrainOnceForTest(ctx)
 	close(stop)
@@ -260,7 +270,7 @@ func TestDrainerTransientFailureRetries(t *testing.T) {
 		t.Fatalf("chmod: %v", err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), drainPassDeadline)
 	defer cancel()
 	_ = d.DrainOnceForTest(ctx)
 
@@ -303,7 +313,7 @@ func TestDrainerExhaustsRetries(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = os.Chmod(d.fuseRoot, 0o755) })
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), drainPassDeadline)
 	defer cancel()
 	// Drain twice — first attempt retries, second hits MaxAttempts.
 	_ = d.DrainOnceForTest(ctx)
@@ -393,7 +403,7 @@ func TestDrainerMissingSpoolFileMarksFailed(t *testing.T) {
 		t.Fatalf("rm: %v", err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), drainPassDeadline)
 	defer cancel()
 	_ = d.DrainOnceForTest(ctx)
 
@@ -423,7 +433,7 @@ func TestDrainerSHAMismatchQuarantines(t *testing.T) {
 		t.Fatalf("corrupt: %v", err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), drainPassDeadline)
 	defer cancel()
 	_ = d.DrainOnceForTest(ctx)
 
@@ -473,7 +483,7 @@ func TestDrainerOutOfOrderWritesVerifiedViaDiskSHA(t *testing.T) {
 		t.Fatal("SQL sha should be the disk-derived reference for out-of-order writes (drainer must verify)")
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), drainPassDeadline)
 	defer cancel()
 	_ = d.DrainOnceForTest(ctx)
 

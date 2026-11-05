@@ -174,7 +174,7 @@ func TestH8BDrainRefusalHoldsRowNotifies(t *testing.T) {
 			snap.Projects[0].HolderHost != "Edit-Bay-2" || snap.Projects[0].WaitingRows != 1 {
 			t.Fatalf("H8B: menu bar not told who holds the project: %+v", snap)
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), drainPassDeadline)
 		defer cancel()
 		if n := d.DrainOnceForTest(ctx); n != 0 {
 			t.Fatalf("H8B: held row dispatched again while the project is held (%d)", n)

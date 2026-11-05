@@ -102,7 +102,7 @@ func drainAllForTest(t *testing.T, d *Drainer) {
 			time.Sleep(wait + time.Millisecond)
 		}
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), drainPassDeadline)
 	defer cancel()
 	d.DrainOnceForTest(ctx)
 }
