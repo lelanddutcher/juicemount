@@ -417,6 +417,10 @@ type MacPrincipal struct {
 	// the store does not know (a restored store). They work at MinIO until
 	// the admin removes them.
 	ObjKeyOrphans []string `json:"obj_key_orphans,omitempty"`
+	// SharedKeyHeld (Snapshot only): this Mac holds the shared jm-client
+	// key, so revoking it leaves that key working at the object store
+	// (sharedkey.go).
+	SharedKeyHeld bool `json:"shared_key_held,omitempty"`
 }
 
 // PrincipalsSnapshot is the admin view (no hashes).
@@ -448,6 +452,13 @@ type PrincipalsSnapshot struct {
 	// still records (current, being removed, orphan). With the mode off the
 	// Manager does not remove them, so a revoked Mac's key keeps working.
 	PerMacKeysLeft int `json:"per_mac_keys_left,omitempty"`
+	// SharedKeyStillValid: revoked Macs that were given the shared jm-client
+	// key, which still works for them at the object store until it is
+	// rotated on the server (the pending "rotate the shared storage key"
+	// action; sharedkey.go).
+	SharedKeyStillValid []SharedKeyHolder `json:"shared_key_still_valid,omitempty"`
+	// Revoked: set only in the answer to a revoke.
+	Revoked *RevokeResult `json:"revoked,omitempty"`
 }
 
 func (s PrincipalsSnapshot) byName(name string) *MacPrincipal {
@@ -483,6 +494,9 @@ type principalStoreFile struct {
 	People []Person `json:"people,omitempty"`
 	// RestrictUnassigned: Macs with no person may not write (people.go).
 	RestrictUnassigned bool `json:"restrict_unassigned,omitempty"`
+	// SharedKeyHolders: revoked Macs that hold the shared object key
+	// (sharedkey.go).
+	SharedKeyHolders []sharedKeyHolder `json:"shared_key_holders,omitempty"`
 }
 
 // ProxySignaler asks the proxy to reload the principals file whose sha256
@@ -570,6 +584,8 @@ type PrincipalStore struct {
 	keepObjGens         map[string]int
 	keepObjOrphans      []string
 	keepObjOrphanRemove []ObjKeyRemoval
+	// sharedHolders: revoked Macs given the shared object key (sharedkey.go).
+	sharedHolders []sharedKeyHolder
 
 	// people (people.go): by ID. proxyFormat: the principals file version
 	// the proxy last advertised (0 = not yet known). peopleWritten: the
@@ -801,6 +817,7 @@ func NewPrincipalStore(opts PrincipalStoreOptions) (*PrincipalStore, error) {
 			return nil, err
 		}
 		s.restrictUnassigned = f.RestrictUnassigned
+		s.sharedHolders = f.SharedKeyHolders
 	case errors.Is(err, os.ErrNotExist):
 	default:
 		return nil, err
@@ -1427,33 +1444,63 @@ func (s *PrincipalStore) Approve(name string) error {
 // rejected the same way). The record stays so the same secret cannot
 // silently re-enroll; Forget deletes it.
 func (s *PrincipalStore) Revoke(name string) error {
-	err := s.transition(name, func(p *MacPrincipal) (bool, error) {
-		if p.Status == PrincipalRevoked {
-			// A refused re-approval may have left a key being minted for a
-			// revoked Mac: revoking again retires it.
-			retireObjKey(p)
-			return false, nil
+	_, err := s.RevokeWithResult(name)
+	return err
+}
+
+// RevokeWithResult is Revoke, and says what is left of the Mac's
+// object-store access: its own per-Mac key is removed in the background,
+// but a shared jm-client key it was given keeps working until it is
+// rotated on the server (sharedkey.go). Such a Mac is recorded, in the same
+// store write as the revoke, for the Principals page.
+func (s *PrincipalStore) RevokeWithResult(name string) (RevokeResult, error) {
+	s.mu.Lock()
+	cur, ok := s.recs[name]
+	if !ok {
+		s.mu.Unlock()
+		return RevokeResult{}, ErrPrincipalNotFound
+	}
+	next := *cur
+	prevHolders := s.sharedHolders
+	proxyChanged := false
+	if cur.Status == PrincipalRevoked {
+		// A refused re-approval may have left a key being minted for a
+		// revoked Mac: revoking again retires it.
+		retireObjKey(&next)
+	} else {
+		now := s.opts.Now().UnixMilli()
+		if s.heldSharedKeyLocked(cur) {
+			s.sharedHolders = s.withSharedKeyHolderLocked(cur, now)
 		}
-		was := p.Status
-		p.Status = PrincipalRevoked
-		p.AutoApproved = false
-		p.AutoApprovePending = false
-		p.DecidedAt = s.opts.Now().UnixMilli()
+		next.Status = PrincipalRevoked
+		next.AutoApproved = false
+		next.AutoApprovePending = false
+		next.DecidedAt = now
 		// The storage key goes after the Redis login (which this commit
 		// removes at once): keyd deletes it in the background, and Forget
 		// waits for keyd to confirm.
-		retireObjKey(p)
-		return was == PrincipalApproved, nil
-	})
-	if err == nil {
-		log.Printf("manager: principal %s revoked", name)
-		if kerr := s.syncObjKeys(); kerr != nil {
-			// The revoke and the key's removal are in the store; the
-			// reconciler writes desired.json until it is on disk.
-			log.Printf("manager: principal %s revoked, but desired.json could not be rewritten (retried by the reconciler): %v", name, kerr)
-		}
+		retireObjKey(&next)
+		proxyChanged = cur.Status == PrincipalApproved
 	}
-	return err
+	s.recs[name] = &next
+	if err := s.commitLocked(proxyChanged); err != nil {
+		s.recs[name] = cur
+		s.sharedHolders = prevHolders
+		s.mu.Unlock()
+		return RevokeResult{}, err
+	}
+	res := s.revokeResultLocked(&next)
+	s.mu.Unlock()
+	log.Printf("manager: principal %s revoked", name)
+	if res.ObjectKey == RevokeObjectKeyStillValid {
+		log.Printf("manager: WARNING: principal %s holds the shared object key, which still works at the object store until JM_OBJ_CLIENT_SECRET_KEY is rotated on the server", name)
+	}
+	if kerr := s.syncObjKeys(); kerr != nil {
+		// The revoke and the key's removal are in the store; the
+		// reconciler writes desired.json until it is on disk.
+		log.Printf("manager: principal %s revoked, but desired.json could not be rewritten (retried by the reconciler): %v", name, kerr)
+	}
+	return res, nil
 }
 
 // Forget deletes a revoked record so that Mac may enroll afresh.
@@ -1579,6 +1626,7 @@ func (s *PrincipalStore) snapshotLocked(withSecrets bool) PrincipalsSnapshot {
 			c.ObjKeySecret = ""
 			c.ObjKeyStatus = s.objKeyStatusLocked(r)
 			c.ObjKeyOrphans = orphansOf[r.Name]
+			c.SharedKeyHeld = s.heldSharedKeyLocked(r)
 		}
 		if c.AutoApproved && c.Status == PrincipalApproved {
 			out.NeedsReview++
@@ -1602,6 +1650,9 @@ func (s *PrincipalStore) snapshotLocked(withSecrets bool) PrincipalsSnapshot {
 		if !out.ProxyLive {
 			out.ProxyProblem = proxyProblemText(st)
 		}
+	}
+	if !withSecrets {
+		out.SharedKeyStillValid = s.sharedKeyHolderViewLocked()
 	}
 	if s.objk != nil && !withSecrets {
 		out.PerMacKeys = true
@@ -1677,6 +1728,7 @@ func (s *PrincipalStore) saveStoreLocked() error {
 		f.People = append(f.People, *p)
 	}
 	f.RestrictUnassigned = s.restrictUnassigned
+	f.SharedKeyHolders = s.sharedKeyHoldersToKeepLocked()
 	f.ObjKeysSeq, f.ObjKeyGens = s.keepObjSeq, s.keepObjGens
 	if s.objk != nil {
 		f.ObjKeysSeq = s.objk.seq
@@ -2083,6 +2135,18 @@ func objectKeyRefusal(err error) string {
 }
 
 func (p *principalsAPI) handleDecision(op func(string) error) http.HandlerFunc {
+	return p.handleDecisionResult(func(name string) (*RevokeResult, error) { return nil, op(name) })
+}
+
+// handleRevoke answers with the snapshot and the revoke's object-key result.
+func (p *principalsAPI) handleRevoke(w http.ResponseWriter, r *http.Request) {
+	p.handleDecisionResult(func(name string) (*RevokeResult, error) {
+		res, err := p.store.RevokeWithResult(name)
+		return &res, err
+	})(w, r)
+}
+
+func (p *principalsAPI) handleDecisionResult(op func(string) (*RevokeResult, error)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "POST only", http.StatusMethodNotAllowed)
@@ -2098,7 +2162,8 @@ func (p *principalsAPI) handleDecision(op func(string) error) http.HandlerFunc {
 			http.Error(w, "name must be a Mac principal (mac-<12 hex>)", http.StatusBadRequest)
 			return
 		}
-		switch err := op(body.Name); {
+		res, err := op(body.Name)
+		switch {
 		case errors.Is(err, ErrProxyNotLive):
 			http.Error(w, proxyRefusal(err), http.StatusConflict)
 		case errors.Is(err, ErrObjectKeyNotReady):
@@ -2114,7 +2179,9 @@ func (p *principalsAPI) handleDecision(op func(string) error) http.HandlerFunc {
 			log.Printf("manager: principal %s update failed: %v", body.Name, err)
 			http.Error(w, "the proxy principals file could not be written; nothing changed", http.StatusInternalServerError)
 		default:
-			writeJSON(w, http.StatusOK, p.store.Snapshot())
+			snap := p.store.Snapshot()
+			snap.Revoked = res
+			writeJSON(w, http.StatusOK, snap)
 		}
 	}
 }
@@ -2244,7 +2311,7 @@ func (a *API) registerH8B(mux *http.ServeMux, prefix string, cfg Config) {
 	mux.HandleFunc(prefix+"/api/principals", a.auth(pa.handleList))
 	if pa.store != nil {
 		mux.HandleFunc(prefix+"/api/principals/approve", a.auth(pa.handleDecision(pa.store.Approve)))
-		mux.HandleFunc(prefix+"/api/principals/revoke", a.auth(pa.handleDecision(pa.store.Revoke)))
+		mux.HandleFunc(prefix+"/api/principals/revoke", a.auth(pa.handleRevoke))
 		mux.HandleFunc(prefix+"/api/principals/forget", a.auth(pa.handleDecision(pa.store.Forget)))
 		mux.HandleFunc(prefix+"/api/principals/orphan-keys/remove", a.auth(pa.handleOrphanKeysRemove))
 	} else {

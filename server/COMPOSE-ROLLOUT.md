@@ -533,6 +533,70 @@ before IDs), a new ID is minted:
 
 Losing the principal store makes every Mac request access again.
 
+### Rotating the shared object key (after a revoke)
+
+Revoking a Mac removes its Redis login at once. With `JM_OBJ_PER_MAC`
+unset (the default) it does **not** stop the shared `jm-client` key the Mac
+was given: the Mac can still read and overwrite chunk objects on MinIO
+(port 30151) directly, outside the metadata layer. The Manager cannot change
+that key. It holds no MinIO admin credential, the secret comes from
+`server/.env` (`minio-keys` sets it again at every `up`), and the server's
+WebDAV, the farm and enrolled farm nodes use the same key.
+
+So the revoke answer and the Principals page say whether the Mac's object
+key still works. `POST /api/principals/revoke` returns the principal list
+plus `revoked`: `{name, object_key, message}`, where `object_key` is
+`still_valid` (the shared key, until rotated), `removing` (its own per-Mac
+key, until minio-keyd confirms), `removed` or `none`. The revoke
+confirmation warns before it happens. The page lists every revoked Mac whose
+shared key still works under "Rotate the shared storage key"
+(`shared_key_still_valid` in the list). The list is kept in the principal
+store as a salted check value of the key, never the key, and clears once the
+Manager runs with a different `JM_OBJ_CLIENT_SECRET_KEY`; putting the old
+secret back lists those Macs again. A Mac approved again leaves the list.
+Macs revoked by an older Manager are not listed: if you have ever revoked a
+Mac that had been approved, rotate once.
+
+Rotate in a maintenance window. An approved Mac uses the new key only after
+its volume restarts (juicefs reads the key when it starts). Until then the
+object store refuses its uploads: new files wait in the Mac's spool, but
+changes to files that already exist fail.
+
+1. Put a new value in `server/.env`:
+   `JM_OBJ_CLIENT_SECRET_KEY=` (`openssl rand -hex 20`).
+2. Recreate the Manager so it hands out the new key:
+   `$C -f server/docker-compose.yml up -d --no-deps juicemount-manager`.
+   Approved Macs fetch it at their next poll (every 30 minutes, or within
+   about a minute of a refused upload); the revoked Mac gets nothing. The
+   Principals page's rotation list clears.
+3. Ask every Mac user to Stop everything in JuiceMount.
+4. Change the key at MinIO (from here the old secret is refused):
+   `$C -f server/docker-compose.yml up --no-deps minio-keys` (must exit 0).
+5. Recreate the server's other clients of the key:
+   `$C -f server/docker-compose.yml up -d --no-deps juicefs juicefarm`,
+   and re-create enrolled farm nodes with the new `MINIO_SECRET_KEY` (the
+   Manager's node plan prints the command).
+6. Macs Start again. A Mac that had not polled since step 2 reports refused
+   storage access; JuiceMount then asks the Manager at once and saves the
+   new key, and one more Stop everything, then Start, uses it.
+
+**Check:** the old secret is refused and a Mac copy and readback work:
+
+```bash
+M="$($C -f server/docker-compose.yml ps -q minio)"
+read -rs OLD && export OLD          # type the previous client secret
+docker exec -e OLD "$M" sh -c \
+  'MC_HOST_old="http://jm-client:$OLD@127.0.0.1:9000" mc ls old/zpool'   # must fail with an access error
+```
+
+**Rollback:**
+put the old secret back in `server/.env` and repeat steps 2 to 5; the
+revoked Mac's copy then works again.
+
+Per-Mac keys (below) remove the need for this rotation for Macs approved
+after the switch; Macs approved before it still hold the shared key until it
+is rotated once.
+
 ### Per-Mac object keys (not yet enabled)
 
 > **Rollout qualification pending.** Per-Mac key code exists in `minio-keyd`,
@@ -555,7 +619,8 @@ Each takes exactly `1` or `0` (unset means `0`). Any other value (`true`,
 **What this is.** Today every approved Mac gets the same `jm-client` key.
 Revoking a Mac in the Manager removes its Redis principal, but the Mac keeps
 a working object key: it can still read and write chunks on MinIO
-(port 30151) directly. With per-Mac keys, each approved Mac gets its own
+(port 30151) directly, until the shared key is rotated (see "Rotating the
+shared object key" above). With per-Mac keys, each approved Mac gets its own
 MinIO service account, and revoking the Mac deletes it.
 
 | Name | Kind | Policy | Holder |
