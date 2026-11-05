@@ -9,9 +9,9 @@ const fuseSuperMagic = 0x65735546
 
 // refuseFUSEDir refuses a catalog directory on a FUSE filesystem: the
 // JuiceFS mount is one, and the catalog must never live in the volume.
-func refuseFUSEDir(dir string) error {
+func refuseFUSEDir(fd int, dir string) error {
 	var st syscall.Statfs_t
-	if err := syscall.Statfs(dir, &st); err != nil {
+	if err := syscall.Fstatfs(fd, &st); err != nil {
 		return fmt.Errorf("catalog directory: %w", err)
 	}
 	if st.Type == fuseSuperMagic {

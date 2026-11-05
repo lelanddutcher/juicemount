@@ -101,6 +101,21 @@ func TestContinuityRefusesCatalogInsideTheVolume(t *testing.T) {
 	}
 }
 
+func TestContinuityRefusesStateDirReachedThroughTheMount(t *testing.T) {
+	cfg := continuityTestConfig(t)
+	// The mount is configured by another name (a symlink) for the
+	// directory that holds the state.
+	alias := filepath.Join(t.TempDir(), "jfs")
+	if err := os.Symlink(filepath.Dir(cfg.StateFile), alias); err != nil {
+		t.Fatal(err)
+	}
+	cfg.FUSEMount = alias
+	if svc := buildContinuity(cfg, envOf(map[string]string{"JM_CONTINUITY": "on"})); svc != nil {
+		svc.Stop()
+		t.Fatal("catalog opened inside the mount (named through a symlink)")
+	}
+}
+
 func TestContinuityRefusesSymlinkedDirectory(t *testing.T) {
 	cfg := continuityTestConfig(t)
 	elsewhere := t.TempDir()
@@ -183,7 +198,7 @@ func TestContinuityAssetsAPI(t *testing.T) {
 		t.Fatalf("by path: %d %s", rec.Code, rec.Body)
 	}
 	want := binder.AssetID(vol.VolumeUUID(), 42)
-	if view.AssetID != want || view.Path != "Projects/clip.mov" || len(view.Locations) != 1 || view.Locations[0].Locator != "ino:42" {
+	if view.AssetID != want || view.Path != "Projects/clip.mov" || view.Label != "clip.mov" || len(view.Locations) != 2 || view.Locations[0].Locator != "ino:42" {
 		t.Fatalf("by path: %+v", view)
 	}
 	if rec := get("/api/continuity/assets?id="+string(want), true); rec.Code != http.StatusOK {

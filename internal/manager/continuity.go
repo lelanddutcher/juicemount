@@ -147,7 +147,7 @@ func buildContinuity(cfg Config, getenv func(string) string) *continuityService 
 		return nil
 	}
 	b, err := binder.New(binder.Config{Store: store, Connect: func() (binder.Volume, error) {
-		fsys, err := jfsmeta.Open(metaURL)
+		fsys, err := jfsmeta.OpenReadOnly(metaURL)
 		if err != nil {
 			return nil, err
 		}
@@ -165,39 +165,53 @@ func buildContinuity(cfg Config, getenv func(string) string) *continuityService 
 // <stateDir>/continuity: a directory of its own, mode 0700 and owned by this
 // process, so no other account can plant or swap the catalog's files, and
 // never inside the volume (a mount path, or any FUSE filesystem on Linux).
-// A catalog it cannot open is left untouched: never repaired or replaced.
+// The directory is checked and narrowed through one no-follow handle. A
+// catalog it cannot open is left untouched: never repaired or replaced.
 func openContinuityCatalog(stateDir string, mounts ...string) (*catalog.Store, error) {
-	dir, err := filepath.Abs(filepath.Join(stateDir, continuityDirName))
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		return nil, fmt.Errorf("state directory: %w", err)
+	}
+	base, err := filepath.EvalSymlinks(stateDir)
 	if err != nil {
+		return nil, fmt.Errorf("state directory: %w", err)
+	}
+	if base, err = filepath.Abs(base); err != nil {
 		return nil, err
 	}
+	dir := filepath.Join(base, continuityDirName)
 	for _, m := range mounts {
 		if m == "" {
 			continue
 		}
-		if mount, err := filepath.Abs(m); err == nil && (dir == mount || strings.HasPrefix(dir, mount+string(filepath.Separator))) {
+		mount, err := filepath.EvalSymlinks(m)
+		if err != nil {
+			mount = m // not mounted (yet): compare the configured path
+		}
+		if mount, err = filepath.Abs(mount); err == nil && (dir == mount || strings.HasPrefix(dir, mount+string(filepath.Separator)) || mount == "/") {
 			return nil, fmt.Errorf("the catalog directory %s is inside the volume mount %s", dir, mount)
 		}
 	}
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	if err := os.Mkdir(dir, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
 		return nil, fmt.Errorf("catalog directory: %w", err)
 	}
-	info, err := os.Lstat(dir)
+	fd, err := syscall.Open(dir, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
 	if err != nil {
-		return nil, fmt.Errorf("catalog directory: %w", err)
+		return nil, fmt.Errorf("catalog directory %s (must be a real directory, not a symlink): %w", dir, err)
 	}
-	st, ok := info.Sys().(*syscall.Stat_t)
-	if !info.IsDir() || !ok {
-		return nil, fmt.Errorf("catalog directory %s is not a directory", dir)
+	handle := os.NewFile(uintptr(fd), dir)
+	defer handle.Close()
+	var st syscall.Stat_t
+	if err := syscall.Fstat(fd, &st); err != nil {
+		return nil, fmt.Errorf("catalog directory: %w", err)
 	}
 	if int(st.Uid) != os.Geteuid() {
 		return nil, fmt.Errorf("catalog directory %s is owned by uid %d, not this process (%d)", dir, st.Uid, os.Geteuid())
 	}
-	// MkdirAll leaves an existing directory's mode as it was.
-	if err := os.Chmod(dir, 0o700); err != nil {
+	// An existing directory keeps its mode through Mkdir: narrow it.
+	if err := syscall.Fchmod(fd, 0o700); err != nil {
 		return nil, fmt.Errorf("catalog directory: %w", err)
 	}
-	if err := refuseFUSEDir(dir); err != nil {
+	if err := refuseFUSEDir(fd, dir); err != nil {
 		return nil, err
 	}
 	path := filepath.Join(dir, continuityCatalogName)
