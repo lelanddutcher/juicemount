@@ -104,10 +104,10 @@ func openDB(path string, readonly bool) (*sql.DB, error) {
 func openStore(input string, library continuity.LibraryID, create bool) (_ *Store, resultErr error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	return openStoreContext(ctx, input, library, create, true)
+	return openStoreContext(ctx, input, library, create, true, MinOperableFormat)
 }
 
-func openStoreContext(ctx context.Context, input string, library continuity.LibraryID, create, complete bool) (_ *Store, resultErr error) {
+func openStoreContext(ctx context.Context, input string, library continuity.LibraryID, create, complete bool, format int) (_ *Store, resultErr error) {
 	path, err := canonicalPath(input)
 	if err != nil {
 		return nil, err
@@ -169,7 +169,7 @@ func openStoreContext(ctx context.Context, input string, library continuity.Libr
 		}
 	}()
 	if create {
-		if err := initialize(ctx, db, library); err != nil {
+		if err := initialize(ctx, db, library, format); err != nil {
 			return nil, err
 		}
 	}

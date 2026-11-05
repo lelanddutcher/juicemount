@@ -90,7 +90,7 @@ func TestCatalogRefusesUnrecognizedAndChangedFormats(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = initialize(context.Background(), db, testLibrary) // ready=0, never completed.
+	err = initialize(context.Background(), db, testLibrary, MinOperableFormat) // ready=0, never completed.
 	closeErr := db.Close()
 	if err != nil || closeErr != nil {
 		t.Fatalf("incomplete fixture: %v, %v", err, closeErr)

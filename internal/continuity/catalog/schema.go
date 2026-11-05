@@ -162,14 +162,29 @@ func schemaFingerprint(objects []schemaObject) string {
 	return hex.EncodeToString(digest[:])
 }
 
-func initialize(ctx context.Context, db *sql.DB, library continuity.LibraryID) error {
+// initialize writes a new catalog at format (MinOperableFormat or the
+// current one): Create makes format 3, so a catalog stays readable by the
+// binary before queries until EnableQueries; Restore makes the format its
+// stream names.
+func initialize(ctx context.Context, db *sql.DB, library continuity.LibraryID, format int) error {
+	if format != MinOperableFormat && format != schemaVersion {
+		return invalid("initial format")
+	}
+	objects := expectedSchema()
+	if format == MinOperableFormat {
+		objects = schemaV3()
+	}
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
 	tables := append([]string{ledgerV2DDL}, v1TableDDL[1:]...)
-	for _, object := range append(append(relationalSchema(), collectionSchema()...), querySchema()...) {
+	extra := append(relationalSchema(), collectionSchema()...)
+	if format == schemaVersion {
+		extra = append(extra, querySchema()...)
+	}
+	for _, object := range extra {
 		if object.Type == "table" {
 			tables = append(tables, object.SQL)
 		}
@@ -179,7 +194,7 @@ func initialize(ctx context.Context, db *sql.DB, library continuity.LibraryID) e
 			return err
 		}
 	}
-	for _, object := range expectedSchema() {
+	for _, object := range objects {
 		if object.Type != "table" {
 			if _, err := tx.ExecContext(ctx, object.SQL); err != nil {
 				return err
@@ -189,11 +204,16 @@ func initialize(ctx context.Context, db *sql.DB, library continuity.LibraryID) e
 	if _, err := tx.ExecContext(ctx, `PRAGMA application_id=0x4a4d4341`); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `PRAGMA user_version=4`); err != nil {
+	if _, err := tx.ExecContext(ctx, fmt.Sprintf(`PRAGMA user_version=%d`, format)); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations(version,fingerprint) VALUES(1,?),(2,?),(3,?),(4,?)`, schemaFingerprint(legacySchema()), schemaFingerprint(schemaV2()), schemaFingerprint(schemaV3()), schemaFingerprint(expectedSchema())); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations(version,fingerprint) VALUES(1,?),(2,?),(3,?)`, schemaFingerprint(legacySchema()), schemaFingerprint(schemaV2()), schemaFingerprint(schemaV3())); err != nil {
 		return err
+	}
+	if format == schemaVersion {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations(version,fingerprint) VALUES(4,?)`, schemaFingerprint(expectedSchema())); err != nil {
+			return err
+		}
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO catalog(singleton,library_id,ready) VALUES(1,?,0)`, library); err != nil {
 		return err

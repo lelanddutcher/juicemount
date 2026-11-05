@@ -398,7 +398,7 @@ func TestCatalogUpgradeRefusesWrongIncompleteAndUnsafeTargets(t *testing.T) {
 func TestCatalogNewLedgerHasExactLegacyLineage(t *testing.T) {
 	s, _ := newTestStore(t)
 	var version int
-	if err := s.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 4 {
+	if err := s.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 3 {
 		t.Fatalf("new schema: %d, %v", version, err)
 	}
 	for entry, want := range map[int]string{1: "752faa61a0812eef6fb7cd2a3d71a2aac3cee19f660b2d129e78cfc1a1b86f26", 2: v2Fingerprint, 3: v3Fingerprint} {

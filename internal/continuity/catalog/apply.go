@@ -17,6 +17,18 @@ import (
 // successful new request appends one event, even if a revision already exists.
 // A commit error has an uncertain outcome; retry only this exact ID and payload.
 func (s *Store) Apply(ctx context.Context, input Operation) (Receipt, error) {
+	return s.apply(ctx, input, false)
+}
+
+// ApplyEnablingQueries is Apply that, on a format 3 catalog and for an
+// operation with a query change, first adds the query table (the 3→4 step
+// EnableQueries takes) in the same immediate transaction: the catalog
+// becomes format 4 only if the operation commits.
+func (s *Store) ApplyEnablingQueries(ctx context.Context, input Operation) (Receipt, error) {
+	return s.apply(ctx, input, true)
+}
+
+func (s *Store) apply(ctx context.Context, input Operation, enable bool) (_ Receipt, resultErr error) {
 	if err := s.enter(); err != nil {
 		return Receipt{}, err
 	}
@@ -40,15 +52,34 @@ func (s *Store) Apply(ctx context.Context, input Operation) (Receipt, error) {
 	if library != s.library {
 		return Receipt{}, corrupt("library identity changed")
 	}
-	if format < 4 {
-		for _, c := range op.Changes {
-			if isQueryChange(c) {
-				return Receipt{}, fmt.Errorf("%w: queries need catalog format 4 (EnableQueries)", ErrUpgradeRequired)
-			}
-		}
-	}
 	if err := checkSettings(ctx, tx); err != nil {
 		return Receipt{}, err
+	}
+	migrated := false
+	if format < 4 {
+		for _, c := range op.Changes {
+			if !isQueryChange(c) {
+				continue
+			}
+			if !enable {
+				return Receipt{}, fmt.Errorf("%w: queries need catalog format 4 (EnableQueries)", ErrUpgradeRequired)
+			}
+			if err := s.migrateQueries(ctx, tx); err != nil {
+				return Receipt{}, err
+			}
+			migrated = true
+			break
+		}
+	}
+	if migrated {
+		defer func() {
+			if resultErr == nil {
+				if err := syncParent(s.path); err != nil {
+					resultErr = fmt.Errorf("catalog upgrade directory barrier uncertain: %w", err)
+				}
+				s.format.Store(4)
+			}
+		}()
 	}
 	prior, priorRequest, err := readEvent(ctx, tx, s.library, op.ID)
 	if err == nil {

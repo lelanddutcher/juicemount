@@ -60,7 +60,13 @@ func restoreCatalog(ctx context.Context, path string, library continuity.Library
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	s, err := openStoreContext(ctx, path, library, true, false)
+	// The restored catalog is at the format the stream names: format 3
+	// unless the stream holds queries.
+	format := MinOperableFormat
+	if header.SchemaVersion > format {
+		format = header.SchemaVersion
+	}
+	s, err := openStoreContext(ctx, path, library, true, false, format)
 	if err != nil {
 		return err
 	}

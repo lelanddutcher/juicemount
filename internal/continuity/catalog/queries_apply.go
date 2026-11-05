@@ -114,17 +114,7 @@ func (s *Store) EnableQueries(ctx context.Context) (resultErr error) {
 		if err := checkSettings(ctx, tx); err != nil {
 			return err
 		}
-		if err := migrateV3(ctx, tx); err != nil {
-			return err
-		}
-		actual, current, err := recognizeSchema(ctx, tx, false)
-		if err != nil {
-			return err
-		}
-		if actual != s.library || current != 4 {
-			return corrupt("migration identity mismatch")
-		}
-		if err := checkIntegrity(ctx, tx); err != nil {
+		if err := s.migrateQueries(ctx, tx); err != nil {
 			return err
 		}
 	}
@@ -139,6 +129,21 @@ func (s *Store) EnableQueries(ctx context.Context) (resultErr error) {
 	}
 	s.format.Store(4)
 	return nil
+}
+
+// migrateQueries is the 3→4 step inside tx, checked as format 4.
+func (s *Store) migrateQueries(ctx context.Context, tx *sql.Tx) error {
+	if err := migrateV3(ctx, tx); err != nil {
+		return err
+	}
+	actual, current, err := recognizeSchema(ctx, tx, false)
+	if err != nil {
+		return err
+	}
+	if actual != s.library || current != 4 {
+		return corrupt("migration identity mismatch")
+	}
+	return checkIntegrity(ctx, tx)
 }
 
 // Format is the catalog's format as this Store last saw it.

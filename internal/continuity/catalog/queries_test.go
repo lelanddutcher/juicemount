@@ -192,7 +192,7 @@ func TestQueryUpgradeAndUpgradeTo(t *testing.T) {
 // At most MaxQueries active queries per library.
 func TestQueryLibraryLimit(t *testing.T) {
 	ctx := context.Background()
-	s, _ := newTestStore(t)
+	s := queryStore(t)
 	def := QueryDefinition{Prefixes: []string{"A"}, Limit: 1}
 	var changes []Change
 	for i := 1; i <= MaxQueries; i++ {
@@ -224,6 +224,51 @@ func TestQueryUpgradeRollsBackAFailedStep(t *testing.T) {
 	}
 }
 
+// queryStore is a new catalog with the query table.
+func queryStore(t *testing.T) *Store {
+	t.Helper()
+	s, _ := newTestStore(t)
+	if err := s.EnableQueries(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	return s
+}
+
+// A new catalog is format 3; the first query added through
+// ApplyEnablingQueries makes it format 4 only if that operation commits.
+func TestQueryNewCatalogStaysFormat3UntilAQueryCommits(t *testing.T) {
+	ctx := context.Background()
+	s, path := newTestStore(t)
+	if s.Format() != 3 {
+		t.Fatalf("new catalog format %d", s.Format())
+	}
+	if _, version, err := Inspect(ctx, path); err != nil || version != 3 {
+		t.Fatalf("new catalog: %d %v", version, err)
+	}
+	def := QueryDefinition{Prefixes: []string{"A"}, Limit: 1}
+	create := Change{CreateQuery: &CreateQuery{QueryID: testQuery, Name: "q", Definition: def}}
+	if _, err := s.Apply(ctx, testOperation("plain", create)); !errors.Is(err, ErrUpgradeRequired) {
+		t.Fatalf("plain Apply: %v", err)
+	}
+	// A failing operation (its second change conflicts) leaves format 3.
+	failing := testOperation("fails", create, Change{RenameQuery: &RenameQuery{QueryID: otherQuery, Name: "x"}})
+	if _, err := s.ApplyEnablingQueries(ctx, failing); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("failing create: %v", err)
+	}
+	if _, version, err := Inspect(ctx, path); err != nil || version != 3 || s.Format() != 3 {
+		t.Fatalf("after a failed create: %d %v", version, err)
+	}
+	if _, err := s.ApplyEnablingQueries(ctx, testOperation("works", create)); err != nil {
+		t.Fatal(err)
+	}
+	if _, version, err := Inspect(ctx, path); err != nil || version != 4 || s.Format() != 4 {
+		t.Fatalf("after the first query: %d %v", version, err)
+	}
+	if q := getQuery(t, s, testQuery); q.Name != "q" {
+		t.Fatalf("query: %+v", q)
+	}
+}
+
 func getQuery(t *testing.T, s *Store, id QueryID) Query {
 	t.Helper()
 	q, err := s.GetQuery(context.Background(), testLibrary, id)
@@ -235,7 +280,7 @@ func getQuery(t *testing.T, s *Store, id QueryID) Query {
 
 func TestQueryLifecycleAndCanonicalForm(t *testing.T) {
 	ctx := context.Background()
-	s, _ := newTestStore(t)
+	s := queryStore(t)
 	def := QueryDefinition{Prefixes: []string{"Projects/B", "Projects/A"}, NameContains: "Take <1>", Extensions: []string{"mov", "braw"},
 		ModifiedWithinSeconds: 3600, Limit: 50}
 	op := testOperation("q1", Change{CreateQuery: &CreateQuery{QueryID: testQuery, Name: "Takes", Definition: def}})
@@ -295,7 +340,7 @@ func TestQueryLifecycleAndCanonicalForm(t *testing.T) {
 
 func TestQueryDefinitionValidation(t *testing.T) {
 	ctx := context.Background()
-	s, _ := newTestStore(t)
+	s := queryStore(t)
 	ok := QueryDefinition{Prefixes: []string{"A"}, Limit: 200}
 	with := func(f func(*QueryDefinition)) QueryDefinition {
 		d := ok
@@ -375,6 +420,9 @@ func triggerDDLFor(t *testing.T, name string) string {
 func TestQueryPortability(t *testing.T) {
 	ctx := context.Background()
 	s := collectionStore(t)
+	if err := s.EnableQueries(ctx); err != nil {
+		t.Fatal(err)
+	}
 	limits := Limits{MaxBytes: 1 << 20, MaxEvents: 100, MaxProjectionRows: 100}
 	applyTest(t, s, testOperation("col", Change{CreateCollection: &CreateCollection{CollectionID: testCollection, Name: "Selects"}}))
 	var collections bytes.Buffer
