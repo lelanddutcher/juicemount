@@ -26,10 +26,12 @@ import (
 )
 
 // lockedVolume is a fake volume (path -> inode) the test changes while the
-// binder reads it. fail makes every read an I/O error.
+// binder reads it. fail makes every read an I/O error. An inode in trash
+// with no name left is in the JuiceFS trash (its attributes remain).
 type lockedVolume struct {
 	mu    sync.Mutex
 	files map[string]uint64
+	trash map[uint64]bool
 	fail  bool
 }
 
@@ -66,6 +68,9 @@ func (v *lockedVolume) StatIno(ino uint64) (jfsmeta.Node, error) {
 		if i == ino {
 			return v.node(ino), nil
 		}
+	}
+	if v.trash[ino] {
+		return jfsmeta.Node{Ino: ino, Type: smartfolders.TypeRegular, Nlink: 1, InTrash: true}, nil
 	}
 	return jfsmeta.Node{}, syscall.ENOENT
 }
@@ -445,6 +450,9 @@ func TestCollectionsMemberSurvivesAtomicSave(t *testing.T) {
 	one := binder.AssetID(e.vol.VolumeUUID(), 42)
 	id := e.write("admin", "/api/collections", map[string]any{"name": "Cut", "members": pathRefs("Clients/A/one.mov")}, 200).Collection.ID
 	e.vol.set(func(f map[string]uint64) { f["Clients/A/one.mov"] = 50 })
+	e.vol.mu.Lock()
+	e.vol.trash = map[uint64]bool{42: true} // the rename over sent it to the trash
+	e.vol.mu.Unlock()
 	e.offer(binder.Event{Op: "rename", Path: "Clients/A/one.mov", OldPath: "Clients/A/.one.mov.tmp", Inode: 50})
 	got := e.members(id, "")
 	if len(got.Members) != 1 || got.Members[0].AssetID != one || got.Members[0].State != "present" || got.Members[0].Path != "Clients/A/one.mov" {

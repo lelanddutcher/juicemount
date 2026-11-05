@@ -25,8 +25,9 @@ For volume UUID `U` and inode `I`:
 | Asset | ID `asset_` + first 16 bytes of SHA-256(`juicemount.continuity.jfs-asset` NUL `U` NUL decimal `I`); label = the file name at creation, never changed by the binder |
 | Inode location `jfs-U-I` | `{source: "jfs:U", locator: "ino:I"}` |
 | Hint location `jfs-U-I-hint` | `{source: "jfs-path:U", locator: <volume-relative path>}` |
-| Continuation pair `jfs-U-I-c`, `jfs-U-I-c-hint` | as above, for an inode that a merge gave another asset (below) |
-| Merge relationship `jfs-U-I-merge` | `{source asset: retired provisional asset, target: continued asset, predicate: "continuity:merged-into", provenance: observed, source: "jfs:U"}` |
+| Later pair `jfs-U-I-g<n>`, `jfs-U-I-g<n>-hint` (n = 1…8) | as above, for an inode that must carry another asset than its current pair holds: a merge, or a restore (below) |
+| Relationship `jfs-U-I-g<n>-merge` | `{source asset: retired provisional asset, target: continued asset, predicate: "continuity:merged-into", provenance: observed, source: "jfs:U"}` |
+| Relationship `jfs-U-I-g<n>-restored` | `{source asset: the restored file's new asset, target: the asset it had, predicate: "continuity:restored-from", …}` |
 
 A file is its inode until it is saved by replacement: then the new inode
 continues the old one's asset (below), so an asset's ID is derived from the
@@ -50,11 +51,14 @@ tombstoned otherwise.
 | `revive` | tombstoned but visible again | put both locations (expecting the tombstones) |
 | `unlink` | gone, only in the trash, or only hidden names | remove both locations |
 | `continue` | a replaced file's asset moves to its unbound replacement | remove the old inode's pair, put the new inode's pair with the old asset |
-| `merge` | as `continue`, the replacement having a provisional asset | also remove the replacement's own pair, put its continuation pair, put the merge relationship |
+| `merge` | as `continue`, the replacement having a provisional asset | also remove the replacement's own pair, put its next pair, put the merge relationship |
+| `restore` | tombstoned but visible again while its asset is live on another inode | create an asset of its own (`AssetID` of U, I and n), put its next pair, put the restore relationship |
 
-An inode's binding is its continuation pair once that exists, else its
-first pair; `bind`, `hint`, `revive` and `unlink` act on that pair (kinds
-prefixed `cont-` on the continuation pair).
+A location's asset never changes, so an inode that must carry another asset
+gets its next pair. An inode's binding is its highest pair; `bind`, `hint`,
+`revive` and `unlink` act on that pair (kinds prefixed `g<n>-` on pair n).
+Two live inodes never share an asset; `CheckAccess` requires every live
+inode of an asset to pass, should that ever not hold.
 
 The operation ID is `jfs-U-I-<kind>-<inode seq>-<hint seq>`, the sequences being
 the `UpdatedSequence` of the two records the plan starts from (0 when absent). A
@@ -97,19 +101,28 @@ history. Tested in `continue_test.go`.
 - **When.** An event shows path `p` naming inode `Y` while the path cache says
   `p` last named a bound `X` (any event kind: the volume, not the event, is
   the evidence, so events handled out of order or late still work). `X` must
-  have no visible name left (a rename over sends it to the trash). One
+  have no visible name left, and the change must look like a save: JuiceFS
+  sets `X`'s ctime when a rename over `p` (or an unlink) sends it to the
+  trash, and `Y`'s when the rename brings it in, so the two must be within
+  `SaveWindow` (2 min). A file deleted unseen and a different one created
+  at its path later (camera clip names repeat) is not continued, nor is an
+  `X` whose attributes are gone (deleted for good: so a volume without a
+  trash never continues a save). Both count as `not_continued`. One
   operation (`continue`, ID `jfs-U-Y-continue-<X's seq>-0`) retires `X`'s
   pair and puts `Y`'s with `X`'s asset and hint `p`. No asset is created for `Y`.
 - **The temp file was bound first** (its create event came before the rename;
   also a temp file written in another folder): `merge`. A location's asset
-  never changes, so `Y`'s own pair is retired and its continuation pair
+  never changes, so `Y`'s own pair is retired and its next pair
   carries `X`'s asset; the relationship records which asset was retired into
   which. Only a *provisional* asset is merged: `Y`'s own derived asset, bound
   within `ProvisionalAge` (1 h, by its bind's receipt time). An older file
   moved over another (Finder's replace of one document by another) keeps its
   own asset and the replaced one is retired, as before: a heuristic never
-  ends an established identity. `Y` can be merged once; a second merge onto it
-  falls back.
+  ends an established identity.
+- **A replaced file restored** from the volume trash (or moved back from a
+  hidden name) while its asset lives on in the document: `restore`, not
+  `revive`. It gets an asset of its own, related to the one it had; the
+  document keeps the asset, its access check and its collections.
 - **Safe save** (some Mac apps: write a temp file, rename the original to a
   backup name, rename the temp file to the original name, delete the backup)
   has no rename over. A rename of a known file to a sibling name is
@@ -117,17 +130,20 @@ history. Tested in `continue_test.go`.
   file's delete comes within the window and another regular file now holds
   the name it left, that file continues its asset (`continue`, usually
   `merge`). A visible or hidden backup name both work, and so does a client's
-  synthetic inode on the delete.
+  synthetic inode on the delete. False positive: rename `clip.mov` to
+  `clip_old.mov`, copy a new `clip.mov` in, delete `clip_old.mov` within 30 s:
+  the new clip continues the old one's asset.
 - **Restart.** At start the path cache is seeded from the catalog's active
   hints (`ListSourceLocations`, up to the cache size, no evictions), so a save
   replaced across a restart is still continued. Hints can be stale: a stale
-  entry only costs the check that its inode is gone, but a file deleted while
-  the Manager was down is continued by the next file created at its path.
+  entry only costs the check that its inode is gone; the ctime check keeps a
+  file deleted long ago from being continued by a new one at its path. A
+  delete still in the trash within 2 minutes of the new file is continued.
 - **Falls back** (the old behaviour: `X` retired, `Y` bound on its own, counted
-  as `not_continued`): `Y` has other names (hard links), `Y` has an
-  established asset or already a continuation pair, or `X`'s asset is bound to
-  another live inode. Not a replacement at all, so not counted: `X` still has a
-  visible name (a hard link elsewhere keeps its asset and hint), or `X` was
+  as `not_continued`): no evidence of a save (above), `Y` has other names
+  (hard links), `Y` has an established asset or no pair left, or `X`'s asset
+  is bound to another live inode. Not a replacement at all, so not counted:
+  `X` still has a visible name (a hard link elsewhere keeps its asset and hint), or `X` was
   never bound.
 - **Residual.** Missed, with `Y` getting a new asset and `X`'s records staying
   active until a rescan: the path was evicted from the cache
@@ -135,8 +151,10 @@ history. Tested in `continue_test.go`.
   missed across a restart (the remembered renames are not persisted), when
   the backup goes to another folder (NSDocument's "(A Document Being Saved
   By …)" folder), or when the backup is kept (an Emacs-style `doc~`): the
-  backup keeps the asset. A replaced file restored from the volume trash is
-  revived on its old asset, which its replacement also carries. Each save
+  backup keeps the asset. The ctimes are the volume's, so queue lag does
+  not matter, but a new file changed again (renamed, written) over 2 minutes
+  after the replacement, before its event is handled, is not continued; nor
+  is a safe save whose steps span over 2 minutes. Each save
   leaves one retired pair on the asset (and, for a merge, a retired asset);
   `CheckAccess` finds the live inode first and pages the retired ones only
   when none is live.

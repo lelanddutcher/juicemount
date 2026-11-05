@@ -45,6 +45,13 @@ const (
 	// MergedInto is the predicate of the relationship a merge records from
 	// the retired provisional asset to the asset that continued (README.md).
 	MergedInto = "continuity:merged-into"
+	// RestoredFrom is the predicate of the relationship from the asset a
+	// file restored from the trash gets to the asset it had, which another
+	// file carries on (README.md).
+	RestoredFrom = "continuity:restored-from"
+	// MaxGenerations bounds an inode's record pairs after its first
+	// (GenerationID); a change needing another is counted as failed.
+	MaxGenerations = 8
 
 	maxHintBytes     = 4096 // longer paths are not catalogued
 	maxAttempts      = 3    // plan/apply rounds before a conflict counts as a failure
@@ -58,7 +65,10 @@ const (
 	// defaultProvisionalAge: a file bound this recently, under its own
 	// asset, may be merged into the asset of the file it replaced.
 	defaultProvisionalAge = time.Hour
-	maxMoves              = 1024
+	// defaultSaveWindow: a replaced file's and its replacement's change
+	// times must be this close for the replacement to continue its asset.
+	defaultSaveWindow = 2 * time.Minute
+	maxMoves          = 1024
 )
 
 // eventRetries are the pauses before re-running an event whose volume reads
@@ -119,9 +129,12 @@ type Config struct {
 	RetryMax      time.Duration // connect backoff cap (default 1 min)
 	// SafeSaveWindow bounds a safe save's rename-away, rename-in and delete
 	// (default 30 s); ProvisionalAge is how recently a replacing file must
-	// have been bound for its asset to be merged (default 1 h). README.md.
+	// have been bound for its asset to be merged (default 1 h); SaveWindow
+	// is how close the replaced and the new file's change times must be
+	// (default 2 min). README.md.
 	SafeSaveWindow time.Duration
 	ProvisionalAge time.Duration
+	SaveWindow     time.Duration
 	Logf           func(format string, args ...any)
 	Now            func() time.Time
 }
@@ -179,6 +192,9 @@ func New(cfg Config) (*Binder, error) {
 	}
 	if cfg.ProvisionalAge <= 0 {
 		cfg.ProvisionalAge = defaultProvisionalAge
+	}
+	if cfg.SaveWindow <= 0 {
+		cfg.SaveWindow = defaultSaveWindow
 	}
 	if cfg.Logf == nil {
 		cfg.Logf = log.Printf
@@ -336,19 +352,32 @@ func LocationID(volumeUUID string, ino uint64) string {
 // HintID names the path-hint location record of an inode of a volume.
 func HintID(volumeUUID string, ino uint64) string { return LocationID(volumeUUID, ino) + "-hint" }
 
-// ContinuationID names the inode location an inode gets when a merge gives
-// it another asset than the one its LocationID record already holds (a
-// location's asset never changes); ContinuationHintID its hint. Once it
-// exists, this pair is the inode's binding.
-func ContinuationID(volumeUUID string, ino uint64) string {
-	return LocationID(volumeUUID, ino) + "-c"
+// GenerationID names the inode location of an inode's record pair gen:
+// gen 0 is LocationID. A location's asset never changes, so an inode that
+// must carry another asset than its current pair holds gets the next pair
+// (a merge, or a restore from the trash after its asset moved on). The
+// highest pair that exists is the inode's binding. GenerationHintID names
+// the pair's hint; a relationship the new pair records takes the pair's ID
+// plus "-merge" or "-restored".
+func GenerationID(volumeUUID string, ino uint64, gen int) string {
+	if gen == 0 {
+		return LocationID(volumeUUID, ino)
+	}
+	return LocationID(volumeUUID, ino) + "-g" + strconv.Itoa(gen)
 }
-func ContinuationHintID(volumeUUID string, ino uint64) string {
-	return ContinuationID(volumeUUID, ino) + "-hint"
+func GenerationHintID(volumeUUID string, ino uint64, gen int) string {
+	return GenerationID(volumeUUID, ino, gen) + "-hint"
 }
 
-// mergeID names the relationship a merge onto an inode records.
-func mergeID(volumeUUID string, ino uint64) string { return LocationID(volumeUUID, ino) + "-merge" }
+// generationAsset is the asset a pair binds its inode to on its own: the
+// inode's AssetID for pair 0, a derived one for a restored file's pair.
+func generationAsset(volumeUUID string, ino uint64, gen int) continuity.AssetID {
+	if gen == 0 {
+		return AssetID(volumeUUID, ino)
+	}
+	sum := sha256.Sum256([]byte("juicemount.continuity.jfs-asset\x00" + volumeUUID + "\x00" + strconv.FormatUint(ino, 10) + "\x00" + strconv.Itoa(gen)))
+	return continuity.AssetID("asset_" + hex.EncodeToString(sum[:16]))
+}
 
 // Source is the inode locations' source; HintSource the path hints'.
 func Source(volumeUUID string) string     { return "jfs:" + volumeUUID }
@@ -576,11 +605,10 @@ func names(v *volume, p string, ino uint64) (bool, error) {
 }
 
 // slot is the pair of location records that binds an inode: its inode
-// location and its hint. It is the LocationID pair, or the ContinuationID
-// pair once a merge created it.
+// location and its hint, of the highest generation that exists.
 type slot struct {
 	inoID, hintID string
-	cont          bool
+	gen           int
 	ino, hint     *catalog.Location // nil when absent
 }
 
@@ -591,17 +619,17 @@ func (s slot) activeHint() string {
 	return ""
 }
 
-// kind prefixes an operation kind on the continuation pair, so its
-// operation IDs never meet the first pair's.
+// kind prefixes an operation kind on a later pair, so its operation IDs
+// never meet another pair's.
 func (s slot) kind(k string) string {
-	if s.cont {
-		return "cont-" + k
+	if s.gen > 0 {
+		return fmt.Sprintf("g%d-%s", s.gen, k)
 	}
 	return k
 }
 
-// records reads the slot binding an inode: the continuation pair if it
-// exists, else the first pair (records absent when never bound).
+// records reads the slot binding an inode: its highest pair (pairs are
+// created in order), else pair 0 with its records absent when never bound.
 func (b *Binder) records(ctx context.Context, v *volume, ino uint64) (slot, error) {
 	get := func(id string) (*catalog.Location, error) {
 		l, err := b.cfg.Store.GetLocation(ctx, b.library, id)
@@ -613,13 +641,19 @@ func (b *Binder) records(ctx context.Context, v *volume, ino uint64) (slot, erro
 		}
 		return &l, nil
 	}
-	s := slot{inoID: ContinuationID(v.uuid, ino), hintID: ContinuationHintID(v.uuid, ino), cont: true}
-	var err error
-	if s.ino, err = get(s.inoID); err != nil {
-		return slot{}, err
+	s := slot{inoID: LocationID(v.uuid, ino), hintID: HintID(v.uuid, ino)}
+	for gen := 1; gen <= MaxGenerations; gen++ {
+		l, err := get(GenerationID(v.uuid, ino, gen))
+		if err != nil {
+			return slot{}, err
+		}
+		if l == nil {
+			break
+		}
+		s = slot{inoID: l.ID, hintID: GenerationHintID(v.uuid, ino, gen), gen: gen, ino: l}
 	}
+	var err error
 	if s.ino == nil {
-		s = slot{inoID: LocationID(v.uuid, ino), hintID: HintID(v.uuid, ino)}
 		if s.ino, err = get(s.inoID); err != nil {
 			return slot{}, err
 		}
@@ -691,6 +725,15 @@ func (b *Binder) plan(ctx context.Context, v *volume, ino uint64, live bool, nam
 		asset := AssetID(v.uuid, ino)
 		if inoLoc != nil {
 			asset = inoLoc.Value.AssetID
+		}
+		if inoLoc != nil && inoLoc.Removed {
+			elsewhere, err := b.liveElsewhere(ctx, v, asset, inoLoc.ID)
+			if err != nil {
+				return nil, err
+			}
+			if elsewhere {
+				return b.planRestore(ctx, v, ino, s, name)
+			}
 		}
 		value := catalog.LocationValue{AssetID: asset, Source: Source(v.uuid), Locator: Locator(ino)}
 		hintValue := catalog.LocationValue{AssetID: asset, Source: HintSource(v.uuid), Locator: name}

@@ -44,13 +44,27 @@ func (b *Binder) CheckAccess(ctx context.Context, id continuity.AssetID, allow f
 	if id.Validate() != nil {
 		return Access{}, fmt.Errorf("%w: asset id", catalog.ErrInvalid)
 	}
-	ino, hint, err := b.lastInode(ctx, v, id)
+	refs, err := b.assetInodes(ctx, v, id)
 	if err != nil {
 		return Access{}, err
 	}
-	if ino == 0 {
-		return Access{Missing: true}, nil // never bound to a file of this volume
+	// Normally one inode. Should two live files ever carry the asset, every
+	// one must pass, as every name of a hard-linked file must.
+	out := Access{Missing: true} // never bound to a file of this volume, or all gone
+	for _, r := range refs {
+		a, err := b.checkInode(ctx, v, r.ino, r.hint, allow)
+		if err != nil || (!a.Missing && !a.Allowed) {
+			return a, err
+		}
+		if out.Missing && !a.Missing {
+			out = a
+		}
 	}
+	return out, nil
+}
+
+// checkInode is CheckAccess for one inode of the asset.
+func (b *Binder) checkInode(ctx context.Context, v *volume, ino uint64, hint string, allow func(volumePath string) bool) (Access, error) {
 	if err := ctx.Err(); err != nil {
 		return Access{}, err
 	}

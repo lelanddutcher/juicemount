@@ -37,7 +37,7 @@ func (f *fixture) stats() map[string]uint64 {
 }
 
 // requireCarries checks that inode ino carries asset id through the given
-// pair of records (LocationID's, or the continuation pair "-c"), hinting p.
+// pair of records (LocationID's "", or a later pair such as "-g1"), hinting p.
 func (f *fixture) requireCarries(ino uint64, pair string, id continuity.AssetID, p string) {
 	f.t.Helper()
 	base := LocationID(testUUID, ino) + pair
@@ -175,7 +175,7 @@ func TestAtomicSaveNoticedOutOfOrder(t *testing.T) {
 
 // The temp file was bound first (its create event came before the rename,
 // so it got a provisional asset). The rename merges: the temp file's
-// records are retired, its continuation pair carries the document's asset,
+// records are retired, its next pair carries the document's asset,
 // and a relationship records the merge. Also for a temp file written in
 // another folder and moved over.
 func TestAtomicSaveMergesProvisionalAsset(t *testing.T) {
@@ -193,11 +193,11 @@ func TestAtomicSaveMergesProvisionalAsset(t *testing.T) {
 			f.rename(tmpPath, doc)
 			f.feed(Event{Op: "rename", Path: doc, OldPath: tmpPath, Inode: tmp})
 
-			f.requireCarries(tmp, "-c", id, doc)
+			f.requireCarries(tmp, "-g1", id, doc)
 			f.requireRemoved(old)
 			f.requireRemoved(tmp) // the provisional pair
 			f.requireMember(col, id, doc)
-			rel, err := f.store.GetRelationship(context.Background(), f.lib, LocationID(testUUID, tmp)+"-merge")
+			rel, err := f.store.GetRelationship(context.Background(), f.lib, LocationID(testUUID, tmp)+"-g1-merge")
 			if err != nil || rel.Removed || rel.Value.SourceAssetID != provisional || rel.Value.TargetAssetID != id ||
 				rel.Value.Predicate != "continuity:merged-into" || rel.Value.Provenance != catalog.Observed {
 				t.Fatalf("merge relationship %+v, %v", rel, err)
@@ -206,28 +206,28 @@ func TestAtomicSaveMergesProvisionalAsset(t *testing.T) {
 				t.Fatalf("stats %v", s)
 			}
 
-			// The continuation pair is the inode's binding from now on: a
+			// The next pair is the inode's binding from now on: a
 			// rename moves its hint, a trip through .Trashes retires and
 			// revives it, and the next save continues the asset again.
 			f.rename(doc, "Projects/final.prproj")
 			f.feed(Event{Op: "rename", Path: "Projects/final.prproj", OldPath: doc, Inode: tmp})
-			f.requireCarries(tmp, "-c", id, "Projects/final.prproj")
+			f.requireCarries(tmp, "-g1", id, "Projects/final.prproj")
 			f.resolve(".Trashes/501")
 			f.rename("Projects/final.prproj", ".Trashes/501/final.prproj")
 			f.feed(Event{Op: "rename", Path: ".Trashes/501/final.prproj", OldPath: "Projects/final.prproj", Inode: tmp})
-			if l := f.location(LocationID(testUUID, tmp) + "-c"); !l.Removed {
+			if l := f.location(LocationID(testUUID, tmp) + "-g1"); !l.Removed {
 				t.Fatalf("trashed file still active: %+v", l)
 			}
 			f.rename(".Trashes/501/final.prproj", doc)
 			f.feed(Event{Op: "rename", Path: doc, OldPath: ".Trashes/501/final.prproj", Inode: tmp})
-			f.requireCarries(tmp, "-c", id, doc)
+			f.requireCarries(tmp, "-g1", id, doc)
 			f.requireRemoved(tmp)
 			next := f.create("Projects/.edit.tmp")
 			f.rename("Projects/.edit.tmp", doc)
 			f.feed(Event{Op: "rename", Path: doc, OldPath: "Projects/.edit.tmp", Inode: next})
 			f.requireCarries(next, "", id, doc)
-			if l := f.location(LocationID(testUUID, tmp) + "-c"); !l.Removed {
-				t.Fatalf("replaced continuation pair still active: %+v", l)
+			if l := f.location(LocationID(testUUID, tmp) + "-g1"); !l.Removed {
+				t.Fatalf("replaced next pair still active: %+v", l)
 			}
 			f.requireMember(col, id, doc)
 		})
@@ -303,7 +303,7 @@ func TestAtomicSaveAcrossRestart(t *testing.T) {
 	f.restart()
 	f.rename("Projects/edit.prproj.sb-77", doc)
 	f.feed(Event{Op: "rename", Path: doc, OldPath: "Projects/edit.prproj.sb-77", Inode: tmp})
-	f.requireCarries(tmp, "-c", id, doc)
+	f.requireCarries(tmp, "-g1", id, doc)
 	f.requireRemoved(old)
 	f.requireMember(col, id, doc)
 	if s := f.stats(); s["merged"] != 1 {
@@ -356,8 +356,8 @@ func TestSafeSaveContinuesAsset(t *testing.T) {
 					f.feed(s.ev())
 				}
 			}
-			pair := "-c" // the temp file was bound on its way
-			if _, err := f.store.GetLocation(context.Background(), f.lib, LocationID(testUUID, tmp)+"-c"); errors.Is(err, catalog.ErrNotFound) {
+			pair := "-g1" // the temp file was bound on its way
+			if _, err := f.store.GetLocation(context.Background(), f.lib, LocationID(testUUID, tmp)+"-g1"); errors.Is(err, catalog.ErrNotFound) {
 				pair = ""
 			}
 			f.requireCarries(tmp, pair, id, doc)
@@ -434,4 +434,98 @@ func (f *fixture) waitConnected() {
 	// Run seeds the cache before it takes the first event: one handled
 	// event (of a path that does not exist) proves the seed finished.
 	f.feed(Event{Op: "reconcile", Path: "Sync/missing.mov"})
+}
+
+// Review 1: only a save is continued. A file deleted without its event
+// being seen (it went to the trash) and a different file created at its
+// path later is not: camera clip names repeat. Nor is a replaced file
+// whose attributes are gone (deleted for good), or one seen only through
+// the paths seeded after a restart, long gone.
+func TestReplacementNeedsTimingEvidence(t *testing.T) {
+	for _, tc := range []struct {
+		name               string
+		skipTrash, restart bool
+		gap                time.Duration
+	}{
+		{"in the trash, created later", false, false, 400 * time.Millisecond},
+		{"deleted for good", true, false, 0},
+		{"after a restart, created later", false, true, 400 * time.Millisecond},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixtureWith(t, Config{SaveWindow: 200 * time.Millisecond}, true)
+			const clip = "Cards/A001C001.mov"
+			old := f.create(clip)
+			f.feed(Event{Op: "create", Path: clip, Inode: old})
+			id := f.requireBound(old, clip, "A001C001.mov")
+			f.collect(id)
+			f.unlink(clip, tc.skipTrash) // its delete event is lost
+			if tc.restart {
+				f.restart()
+			}
+			time.Sleep(tc.gap)
+			other := f.create(clip)
+			f.feed(Event{Op: "create", Path: clip, Inode: other})
+			f.requireBound(other, clip, "A001C001.mov")
+			f.requireRemoved(old)
+			if s := f.stats(); s["continued"] != 0 || s["not_continued"] != 1 {
+				t.Fatalf("stats %v", s)
+			}
+		})
+	}
+}
+
+// Review 2: a replaced file restored from the trash after a save does not
+// share the document's asset. It gets a record pair and an asset of its
+// own, related to the asset it had; the document keeps the asset, its
+// access check and its next save.
+func TestRestoredReplacedFileGetsItsOwnAsset(t *testing.T) {
+	f := newFixture(t, 0, true)
+	const doc = "Projects/edit.prproj"
+	old := f.create(doc)
+	f.feed(Event{Op: "create", Path: doc, Inode: old})
+	id := f.requireBound(old, doc, "edit.prproj")
+	col := f.collect(id)
+	tmp := f.create("Projects/.edit.tmp")
+	f.rename("Projects/.edit.tmp", doc)
+	f.feed(Event{Op: "rename", Path: doc, OldPath: "Projects/.edit.tmp", Inode: tmp})
+	f.requireCarries(tmp, "", id, doc)
+
+	trashed := f.trashName(old)
+	f.rename(trashed, "Restored/edit.prproj")
+	f.feed(Event{Op: "rename", Path: "Restored/edit.prproj", OldPath: trashed, Inode: old})
+	restored := generationAsset(testUUID, old, 1)
+	if restored == id {
+		t.Fatal("the restored file's asset is the document's")
+	}
+	f.requireCarries(old, "-g1", restored, "Restored/edit.prproj")
+	f.requireRemoved(old) // the first pair stays retired on the document's asset
+	rel, err := f.store.GetRelationship(context.Background(), f.lib, LocationID(testUUID, old)+"-g1-restored")
+	if err != nil || rel.Value.SourceAssetID != restored || rel.Value.TargetAssetID != id || rel.Value.Predicate != "continuity:restored-from" {
+		t.Fatalf("restore relationship %+v, %v", rel, err)
+	}
+	f.requireCarries(tmp, "", id, doc)
+	f.requireMember(col, id, doc)
+	projects := func(p string) bool { return path.Dir(p) == "Projects" }
+	if a, err := f.b.CheckAccess(context.Background(), id, projects); err != nil || !a.Allowed || a.Name != doc {
+		t.Fatalf("access to the document decided by %+v, %v", a, err)
+	}
+	next := f.create("Projects/.edit.tmp")
+	f.rename("Projects/.edit.tmp", doc)
+	f.feed(Event{Op: "rename", Path: doc, OldPath: "Projects/.edit.tmp", Inode: next})
+	f.requireCarries(next, "", id, doc)
+	if s := f.stats(); s["continued"] != 2 || s["not_continued"] != 0 || s["failed"] != 0 {
+		t.Fatalf("stats %v", s)
+	}
+
+	// Backstop: should two live files ever carry one asset, every one of
+	// them must pass the access check.
+	other := f.create("Other/x.mov")
+	if _, err := f.store.Apply(context.Background(), catalog.Operation{Version: catalog.OperationVersion, LibraryID: f.lib, ID: "test-second-inode", Actor: "test",
+		Changes: []catalog.Change{{PutLocation: &catalog.PutLocation{ID: "test-second-inode", Value: catalog.LocationValue{AssetID: id, Source: Source(testUUID), Locator: Locator(other)}}}}}); err != nil {
+		t.Fatal(err)
+	}
+	onlyOther := func(p string) bool { return path.Dir(p) == "Other" }
+	if a, err := f.b.CheckAccess(context.Background(), id, onlyOther); err != nil || a.Allowed || a.Name != doc {
+		t.Fatalf("one inode of two decided access: %+v, %v", a, err)
+	}
 }
