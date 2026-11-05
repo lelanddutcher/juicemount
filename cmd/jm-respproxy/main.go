@@ -59,19 +59,15 @@ type fileConfig struct {
 	// SmartFolderRoots names the Manager's smart-folder roots in the
 	// volume root: the manager principal may remove an empty view folder
 	// it created directly under one (internal/respproxy smartview.go).
-	// Absent: respproxy.DefaultSmartRoots; [] = none. They must match the
-	// Manager's JM_SMART_FOLDERS_ROOT / _COLLECTIONS_ROOT / _QUERIES_ROOT;
-	// the entrypoint renders them from those variables.
-	SmartFolderRoots *[]string `json:"smart_folder_roots"`
+	// Absent or empty: none. They must be the roots the Manager runs; the
+	// entrypoint renders them from the Manager's variables.
+	SmartFolderRoots []string `json:"smart_folder_roots"`
 }
 
 // smartRoots resolves smart_folder_roots; invalid names are left out and
 // reported.
 func (fc fileConfig) smartRoots() ([]string, []error) {
-	if fc.SmartFolderRoots == nil {
-		return respproxy.CleanSmartRoots(respproxy.DefaultSmartRoots)
-	}
-	return respproxy.CleanSmartRoots(*fc.SmartFolderRoots)
+	return respproxy.CleanSmartRoots(fc.SmartFolderRoots)
 }
 
 // auditOptions maps the config to the audit writer's options.

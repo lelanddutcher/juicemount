@@ -16,12 +16,14 @@
 #    the first person exists, "on" logs from the start, "off" never.
 #    JM_AUDIT_RETAIN_MB / JM_AUDIT_RETAIN_DAYS bound its size and age
 #    (default 2048 MB / 400 days; -1 = no limit): the oldest segments go.
-#    smart_folder_roots names the Manager's smart-folder roots, read from
-#    the variables the Manager reads (JM_SMART_FOLDERS_ROOT, default
-#    Recents; JM_SMART_FOLDERS_COLLECTIONS_ROOT, default Collections;
-#    JM_SMART_FOLDERS_QUERIES_ROOT, default Queries): the manager principal
-#    may remove an empty view folder it created directly under one, and
-#    nothing else at project depth. The proxy leaves out an invalid name.
+#    smart_folder_roots names the smart-folder roots the Manager runs, from
+#    the variables the Manager reads, read the way it reads them: none
+#    unless JM_SMART_FOLDERS=on; then JM_SMART_FOLDERS_ROOT (default
+#    Recents), and with JM_CONTINUITY=on also
+#    JM_SMART_FOLDERS_COLLECTIONS_ROOT (default Collections; left out when
+#    it is the Recents root). The manager principal may remove an empty
+#    view folder it created directly under one, and nothing else at
+#    project depth. The proxy leaves out an invalid name.
 # 3. Execs jm-respproxy with the applied-reload handshake enabled. The
 #    proxy owns polling, exact-byte validation, session revocation, applied
 #    receipts and heartbeat. A successful signal alone is never an ACK.
@@ -46,13 +48,25 @@ AUDIT_DIR="${JM_RESPPROXY_AUDIT_DIR:-$DIR/audit}"
 AUDIT="${JM_AUDIT:-auto}"
 AUDIT_RETAIN_MB="${JM_AUDIT_RETAIN_MB:-0}"
 AUDIT_RETAIN_DAYS="${JM_AUDIT_RETAIN_DAYS:-0}"
-SMART_ROOT="${JM_SMART_FOLDERS_ROOT:-Recents}"
-SMART_COLLECTIONS_ROOT="${JM_SMART_FOLDERS_COLLECTIONS_ROOT:-Collections}"
-SMART_QUERIES_ROOT="${JM_SMART_FOLDERS_QUERIES_ROOT:-Queries}"
 [ "$AUDIT_DIR" != off ] || AUDIT=off
 
 log() { printf '[jm-respproxy-entrypoint] %s\n' "$*" >&2; }
 die() { log "$*"; exit 2; }
+
+trim() { printf '%s' "$1" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'; }
+switch_on() { # the Manager's reading of an on/off variable
+  case "$(trim "$1" | tr '[:upper:]' '[:lower:]')" in on|1|true|yes) return 0 ;; esac
+  return 1
+}
+smart_roots() { # JSON array of the smart-folder roots the Manager runs
+  switch_on "${JM_SMART_FOLDERS:-}" || { echo '[]'; return; }
+  r="$(trim "${JM_SMART_FOLDERS_ROOT:-}")"; [ -n "$r" ] || r=Recents
+  c=""
+  if switch_on "${JM_CONTINUITY:-}"; then
+    c="$(trim "${JM_SMART_FOLDERS_COLLECTIONS_ROOT:-}")"; [ -n "$c" ] || c=Collections
+  fi
+  jq -cn --arg r "$r" --arg c "$c" '[$r] + (if $c == "" or ($c | ascii_downcase) == ($r | ascii_downcase) then [] else [$c] end)'
+}
 
 case "$MODE" in passthrough|observe|enforce) ;; *) die "JM_RESPPROXY_MODE must be passthrough, observe or enforce" ;; esac
 case "$AUDIT" in auto|on) ;; off) AUDIT_DIR="" ;; *) die "JM_AUDIT must be auto, on or off" ;; esac
@@ -112,12 +126,12 @@ render_principals() {
 render_config() {
   jq -n --arg listen "$LISTEN" --arg up "$UPSTREAM" --arg stats "$STATS" --arg p "$PRINCIPALS" --arg mode "$MODE" --argjson stage_birth "$STAGE_BIRTH" \
     --arg audit "$AUDIT_DIR" --arg audit_mode "$AUDIT" --argjson retain_mb "$AUDIT_RETAIN_MB" --argjson retain_days "$AUDIT_RETAIN_DAYS" \
-    --arg smart "$SMART_ROOT" --arg smart_collections "$SMART_COLLECTIONS_ROOT" --arg smart_queries "$SMART_QUERIES_ROOT" '{
+    --argjson smart_roots "$(smart_roots)" '{
     listen: $listen, upstream: $up, upstream_user: "jm-proxy",
     upstream_password_env: "JM_RESPPROXY_UPSTREAM_PASSWORD",
     stats: $stats, principals: $p, mode: $mode, stage_birth: $stage_birth, reload_handshake: true,
     audit_dir: $audit, audit: $audit_mode, audit_retain_mb: $retain_mb, audit_retain_days: $retain_days,
-    smart_folder_roots: [$smart, $smart_collections, $smart_queries] }' > "$CONFIG.tmp"
+    smart_folder_roots: $smart_roots }' > "$CONFIG.tmp"
   mv -f "$CONFIG.tmp" "$CONFIG"
 }
 

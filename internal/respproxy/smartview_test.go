@@ -10,12 +10,11 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// Smart-folder roots added to buildTree's volume root: Recents (20),
-// Collections (21), Queries (22), and Other (23), a top-level folder that
-// is not a smart root.
-const (
-	svRecents, svCollections, svQueries, svOther = 20, 21, 22, 23
-)
+// svRoots are the smart roots the tests configure. The rig adds to
+// buildTree's volume root, through the proxy: Recents and Collections made
+// by the manager principal, Queries made by a Mac, and Other, a top-level
+// folder of the Manager's that is not a smart root.
+var svRoots = []string{"Recents", "Collections", "Queries"}
 
 // svAttr is a 72-byte juicefs directory attr (mode 0755) with a link count.
 func svAttr(typ byte, parent uint64, nlink uint32) string {
@@ -46,6 +45,11 @@ type svRig struct {
 	db   *redis.Client
 	ctx  context.Context
 	mark string // the lease log's last id before the latest attempt
+
+	mgr, mac       *rawConn
+	next, macNext  uint64 // the next unused inode of mgr1's and mac1's batches
+	recents, colls uint64
+	queries, other uint64
 }
 
 // markLog records where the lease log is, and moves the clock past the
@@ -63,19 +67,63 @@ func startSmartViewRig(t *testing.T, roots []string) *svRig {
 	addr := redisAddr(t, false)
 	db := direct2(addr)
 	t.Cleanup(func() { db.Close() })
-	ctx := context.Background()
-	r := startLeaseRigP(t, ModeEnforce, func(*Config) {
-		// After buildTree, before the proxy and the engine start.
-		pipe := db.Pipeline()
-		for ino, name := range map[uint64]string{svRecents: "Recents", svCollections: "Collections", svQueries: "Queries", svOther: "Other"} {
-			pipe.Set(ctx, "i"+inoStr(ino), svAttr(typeDir, 1, 2), 0)
-			pipe.HSet(ctx, "d1", name, mkEntry(typeDir, ino))
-		}
-		if _, err := pipe.Exec(ctx); err != nil {
+	r := &svRig{leaseRig: startLeaseRig(t, ModeEnforce, func(lc *LeaseConfig) { lc.SmartRoots = roots }),
+		db: db, ctx: context.Background()}
+	r.mgr, r.mac = r.conn(t, "mgr1"), r.conn(t, "mac1")
+	first, _ := allocInodes(t, r.mgr)
+	macFirst, _ := allocInodes(t, r.mac)
+	r.next, r.macNext = first+100, macFirst+100 // clear of buildTree's inodes
+	r.recents = r.mkdir(t, r.mgr, 1, "Recents")
+	r.colls = r.mkdir(t, r.mgr, 1, "Collections")
+	r.queries = r.mkdir(t, r.mac, 1, "Queries")
+	r.other = r.mkdir(t, r.mgr, 1, "Other")
+	return r
+}
+
+// recorded reports whether n is in the view record, waiting up to 2 s for
+// want (the record is written once the creating unit's reply arrived).
+func (r *svRig) recorded(t *testing.T, n uint64, want bool) bool {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		got, err := r.db.SIsMember(r.ctx, SmartViewsKey, inoStr(n)).Result()
+		if err != nil {
 			t.Fatal(err)
 		}
-	}, func(lc *LeaseConfig) { lc.SmartRoots = roots })
-	return &svRig{leaseRig: r, db: db, ctx: ctx}
+		if got == want || time.Now().After(deadline) {
+			return got
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// logged counts lease-log events of type event for inode n.
+func (r *svRig) logged(t *testing.T, event string, n uint64) int {
+	t.Helper()
+	ents, err := r.db.XRange(r.ctx, LeaseLogKey, "-", "+").Result()
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := 0
+	for _, e := range ents {
+		if e.Values["event"] == event && e.Values["proj"] == inoStr(n) {
+			c++
+		}
+	}
+	return c
+}
+
+// view makes a view directory of the Manager's in root and waits for its
+// record when root is one of the Manager's smart roots.
+func (r *svRig) view(t *testing.T, root uint64, name string) uint64 {
+	t.Helper()
+	n := r.mkdir(t, r.mgr, root, name)
+	if root == r.recents || root == r.colls {
+		if !r.recorded(t, n, true) {
+			t.Fatalf("view %s (%d) not recorded", name, n)
+		}
+	}
+	return n
 }
 
 func (r *svRig) get(t *testing.T, key string) string {
@@ -87,26 +135,25 @@ func (r *svRig) get(t *testing.T, key string) string {
 	return v
 }
 
-// mkdir creates directory ino named name in parent through the proxy as
-// rc's principal, shaped like juicefs's doMknod of a directory.
-func (r *svRig) mkdir(t *testing.T, rc *rawConn, parent, ino uint64, name string) {
+// mkdir creates a directory named name in parent through the proxy as
+// rc's principal (an inode of its own batch), shaped like juicefs's
+// doMknod of a directory, and returns its inode.
+func (r *svRig) mkdir(t *testing.T, rc *rawConn, parent uint64, name string) uint64 {
 	t.Helper()
-	defer func() {
-		if t.Failed() {
-			r.tp.logs.mu.Lock()
-			for _, l := range r.tp.logs.lines {
-				t.Log(l)
-			}
-			r.tp.logs.mu.Unlock()
-		}
-	}()
+	ino := &r.next
+	if rc == r.mac {
+		ino = &r.macNext
+	}
+	*ino++
+	n := *ino
 	mustOK(t, txn(rc,
-		[]string{"SET", "i" + inoStr(ino), svAttr(typeDir, parent, 2)},
+		[]string{"SET", "i" + inoStr(n), svAttr(typeDir, parent, 2)},
 		[]string{"SET", "i" + inoStr(parent), svBump(r.get(t, "i"+inoStr(parent)), 1)},
-		[]string{"HSET", "d" + inoStr(parent), name, mkEntry(typeDir, ino)},
+		[]string{"HSET", "d" + inoStr(parent), name, mkEntry(typeDir, n)},
 		[]string{"INCRBY", "usedSpace", "4096"},
 		[]string{"INCR", "totalInodes"},
-		[]string{"HSET", "dirUsedInodes", inoStr(ino), "0"}), "mkdir "+name)
+		[]string{"HSET", "dirUsedInodes", inoStr(n), "0"}), "mkdir "+name)
+	return n
 }
 
 // rmdirCmds is juicefs's rmdir txn body (redis.go doRmdir, no trash) for
@@ -178,152 +225,205 @@ func (r *svRig) wantRefused(t *testing.T, v Value, p, n uint64, name, what, why 
 }
 
 func TestSmartViewRemovalAllowedUnderEachRoot(t *testing.T) {
-	r := startSmartViewRig(t, DefaultSmartRoots)
-	mgr := r.conn(t, "mgr1")
-	first, _ := allocInodes(t, mgr)
-	for i, root := range []uint64{svRecents, svCollections, svQueries} {
-		ino := first + 200 + uint64(i)
-		r.mkdir(t, mgr, root, ino, "Shoot")
-		mustOK(t, r.rmdir(t, "mgr1", root, ino, "Shoot", r.rmdirCmds(t, root, ino, "Shoot")), "manager rmdir of an empty view")
+	r := startSmartViewRig(t, svRoots)
+	for _, root := range []uint64{r.recents, r.colls} {
+		n := r.view(t, root, "Shoot")
+		if r.logged(t, "smart_view_create", n) != 1 {
+			// queued with the record; give the log writer a moment
+			time.Sleep(200 * time.Millisecond)
+			if r.logged(t, "smart_view_create", n) != 1 {
+				t.Fatalf("root %d: no smart_view_create event", root)
+			}
+		}
+		mustOK(t, r.rmdir(t, "mgr1", root, n, "Shoot", r.rmdirCmds(t, root, n, "Shoot")), "manager rmdir of an empty view")
 		if r.entryExists(t, root, "Shoot") {
 			t.Fatalf("root %d: the view is still there", root)
 		}
-		if n, _ := r.db.Exists(r.ctx, "i"+inoStr(ino)).Result(); n != 0 {
+		if c, _ := r.db.Exists(r.ctx, "i"+inoStr(n)).Result(); c != 0 {
 			t.Fatalf("root %d: the view's inode is still there", root)
 		}
-		// The root's attr is rmdir's: link count back to 2.
 		if a := r.get(t, "i"+inoStr(root)); binary.BigEndian.Uint32([]byte(a)[47:51]) != 2 {
 			t.Fatalf("root %d link count after rmdir = %d", root, binary.BigEndian.Uint32([]byte(a)[47:51]))
 		}
-	}
-	// Each admitted removal is in the lease log.
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		ents, _ := r.db.XRange(r.ctx, LeaseLogKey, "-", "+").Result()
-		n := 0
-		for _, e := range ents {
-			if e.Values["event"] == "smart_view_remove" && e.Values["actor"] == "mgr1" && e.Values["view"] == "Shoot" {
-				n++
+		if r.recorded(t, n, false) {
+			t.Fatalf("root %d: the removed view is still recorded", root)
+		}
+		deadline := time.Now().Add(2 * time.Second)
+		for r.logged(t, "smart_view_remove", n) != 1 {
+			if time.Now().After(deadline) {
+				t.Fatalf("root %d: no smart_view_remove event", root)
 			}
+			time.Sleep(20 * time.Millisecond)
 		}
-		if n == 3 {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("lease log has %d smart_view_remove events, want 3", n)
-		}
-		time.Sleep(20 * time.Millisecond)
 	}
 }
 
+// The removal is logged, and its record dropped, only once it committed.
+func TestSmartViewRemovalLoggedOnlyWhenCommitted(t *testing.T) {
+	r := startSmartViewRig(t, svRoots)
+	t.Run("lease_held", func(t *testing.T) {
+		n := r.view(t, r.colls, "Held")
+		// The Mac takes the view's project with a write that changes nothing.
+		mustOK(t, r.mac.do("SET", "i"+inoStr(n), r.get(t, "i"+inoStr(n))), "mac1 takes the view's lease")
+		mustDeny(t, r.rmdir(t, "mgr1", r.colls, n, "Held", r.rmdirCmds(t, r.colls, n, "Held")), ReasonLeaseHeld, "rmdir of a view a Mac holds")
+		time.Sleep(200 * time.Millisecond)
+		if !r.entryExists(t, r.colls, "Held") || r.logged(t, "smart_view_remove", n) != 0 || !r.recorded(t, n, true) {
+			t.Fatal("a refused removal was logged or dropped the record")
+		}
+	})
+	t.Run("watch_abort", func(t *testing.T) {
+		n := r.view(t, r.recents, "Abort")
+		rc := r.conn(t, "mgr1")
+		p := inoStr(r.recents)
+		mustOK(t, rc.do("WATCH", "i"+p, "d"+p), "WATCH parent")
+		mustOK(t, rc.do("WATCH", "i"+inoStr(n), "d"+inoStr(n)), "WATCH dir")
+		cmds := r.rmdirCmds(t, r.recents, n, "Abort")
+		// Another client rewrites the root's attr unchanged: the WATCH fires.
+		if err := r.db.Set(r.ctx, "i"+p, r.get(t, "i"+p), 0).Err(); err != nil {
+			t.Fatal(err)
+		}
+		if v := txn(rc, cmds...); v.Type == '-' || !v.Null {
+			t.Fatalf("EXEC after the WATCH fired: %c %q null=%v, want a nil reply", v.Type, v.Str, v.Null)
+		}
+		time.Sleep(200 * time.Millisecond)
+		if !r.entryExists(t, r.recents, "Abort") || r.logged(t, "smart_view_remove", n) != 0 || !r.recorded(t, n, true) {
+			t.Fatal("an aborted removal was logged or dropped the record")
+		}
+		mustOK(t, r.rmdir(t, "mgr1", r.recents, n, "Abort", r.rmdirCmds(t, r.recents, n, "Abort")), "retry")
+		if r.entryExists(t, r.recents, "Abort") || r.recorded(t, n, false) {
+			t.Fatal("the retried removal did not commit or kept the record")
+		}
+	})
+}
+
 func TestSmartViewRemovalRefusals(t *testing.T) {
-	r := startSmartViewRig(t, DefaultSmartRoots)
-	mgr, mac := r.conn(t, "mgr1"), r.conn(t, "mac1")
-	first, _ := allocInodes(t, mgr)
-	macFirst, _ := allocInodes(t, mac)
-	next := first + 300
-	view := func(root uint64, name string) uint64 {
-		t.Helper()
-		next++
-		r.mkdir(t, mgr, root, next, name)
-		return next
-	}
+	r := startSmartViewRig(t, svRoots)
+	mgr := r.mgr
 
 	t.Run("not_empty", func(t *testing.T) {
-		n := view(svRecents, "Full")
-		f := inoStr(first + 900)
+		n := r.view(t, r.recents, "Full")
+		f := r.next + 500
 		mustOK(t, txn(mgr,
-			[]string{"SET", "i" + f, mkAttr(typeFile, n)},
+			[]string{"SET", "i" + inoStr(f), mkAttr(typeFile, n)},
 			[]string{"SET", "i" + inoStr(n), svBump(r.get(t, "i"+inoStr(n)), 0)},
-			[]string{"HSET", "d" + inoStr(n), "clip.mov", mkEntry(typeFile, first+900)},
+			[]string{"HSET", "d" + inoStr(n), "clip.mov", mkEntry(typeFile, f)},
 			[]string{"INCRBY", "usedSpace", "0"},
 			[]string{"INCR", "totalInodes"}), "file in the view")
-		r.wantRefused(t, r.rmdir(t, "mgr1", svRecents, n, "Full", r.rmdirCmds(t, svRecents, n, "Full")), svRecents, n, "Full", "non-empty view", "directory "+inoStr(n)+" is not empty")
+		r.wantRefused(t, r.rmdir(t, "mgr1", r.recents, n, "Full", r.rmdirCmds(t, r.recents, n, "Full")), r.recents, n, "Full", "non-empty view", "directory "+inoStr(n)+" is not empty")
 	})
 	t.Run("smart_root_itself", func(t *testing.T) {
 		// The root is directly under the volume root, not under a smart root.
-		cmds := r.rmdirCmds(t, 1, svQueries, "Queries")
-		r.wantRefused(t, r.rmdir(t, "mgr1", 1, svQueries, "Queries", cmds), 1, svQueries, "Queries", "removing a smart root", "directory 1 is not a smart-folder root")
+		r.wantRefused(t, r.rmdir(t, "mgr1", 1, r.recents, "Recents", r.rmdirCmds(t, 1, r.recents, "Recents")), 1, r.recents, "Recents", "removing a smart root", "directory 1 is not a smart-folder root")
 	})
 	t.Run("not_a_smart_root", func(t *testing.T) {
-		n := view(svOther, "Shoot")
-		r.wantRefused(t, r.rmdir(t, "mgr1", svOther, n, "Shoot", r.rmdirCmds(t, svOther, n, "Shoot")), svOther, n, "Shoot", "view under a non-smart root", "directory 23 is not a smart-folder root")
+		n := r.view(t, r.other, "Shoot")
+		r.wantRefused(t, r.rmdir(t, "mgr1", r.other, n, "Shoot", r.rmdirCmds(t, r.other, n, "Shoot")), r.other, n, "Shoot", "view under a non-smart root", "is not a smart-folder root")
+	})
+	t.Run("mac_made_root", func(t *testing.T) {
+		// A top-level Queries made by a Mac is not the Manager's root: a
+		// folder the Manager makes there is no view.
+		n := r.view(t, r.queries, "Shoot")
+		if r.recorded(t, n, false) {
+			t.Fatal("a folder under a Mac's root was recorded as a view")
+		}
+		r.wantRefused(t, r.rmdir(t, "mgr1", r.queries, n, "Shoot", r.rmdirCmds(t, r.queries, n, "Shoot")), r.queries, n, "Shoot", "rmdir under a Mac-made root", "smart-folder root Queries: inode "+inoStr(r.queries)+" was not created by mgr1")
+	})
+	t.Run("moved_in", func(t *testing.T) {
+		// An empty folder the manager principal made elsewhere (as a
+		// migration does), moved into the Manager's root and given the
+		// view mode: not a recorded view.
+		n := r.mkdir(t, mgr, 3, "migrated")
+		a := []byte(svAttr(typeDir, r.colls, 2))
+		binary.BigEndian.PutUint16(a[1:3], uint16(typeDir)<<12|0o705)
+		mustOK(t, txn(mgr,
+			[]string{"HDEL", "d3", "migrated"},
+			[]string{"HSET", "d" + inoStr(r.colls), "migrated", mkEntry(typeDir, n)},
+			[]string{"SET", "i" + inoStr(n), string(a)},
+			[]string{"SET", "i3", svBump(mkAttr(typeDir, 2), 0)},
+			[]string{"SET", "i" + inoStr(r.colls), svBump(r.get(t, "i"+inoStr(r.colls)), 1)}), "move the folder into Collections")
+		if r.recorded(t, n, false) {
+			t.Fatal("a moved-in folder was recorded as a view")
+		}
+		r.wantRefused(t, r.rmdir(t, "mgr1", r.colls, n, "migrated", r.rmdirCmds(t, r.colls, n, "migrated")), r.colls, n, "migrated", "rmdir of a moved-in folder", "is not a recorded smart-folder view")
 	})
 	t.Run("not_the_manager", func(t *testing.T) {
-		n := view(svRecents, "Theirs")
+		n := r.view(t, r.recents, "Theirs")
 		for _, who := range []string{"mac1", "farm1"} {
-			r.wantRefused(t, r.rmdir(t, who, svRecents, n, "Theirs", r.rmdirCmds(t, svRecents, n, "Theirs")), svRecents, n, "Theirs", who+" rmdir of a view", "above the project depth needs admin")
+			r.wantRefused(t, r.rmdir(t, who, r.recents, n, "Theirs", r.rmdirCmds(t, r.recents, n, "Theirs")), r.recents, n, "Theirs", who+" rmdir of a view", "above the project depth needs admin")
 		}
 	})
 	t.Run("not_created_by_the_manager", func(t *testing.T) {
-		n := macFirst + 50
-		r.mkdir(t, mac, svCollections, n, "MacMade")
-		r.wantRefused(t, r.rmdir(t, "mgr1", svCollections, n, "MacMade", r.rmdirCmds(t, svCollections, n, "MacMade")), svCollections, n, "MacMade", "rmdir of a Mac's empty folder", "was not created by mgr1")
+		n := r.mkdir(t, r.mac, r.colls, "MacMade")
+		r.wantRefused(t, r.rmdir(t, "mgr1", r.colls, n, "MacMade", r.rmdirCmds(t, r.colls, n, "MacMade")), r.colls, n, "MacMade", "rmdir of a Mac's empty folder", "was not created by mgr1")
 	})
 	t.Run("touches_other_keys", func(t *testing.T) {
-		n := view(svCollections, "Extra")
+		n := r.view(t, r.colls, "Extra")
 		for _, extra := range [][]string{
 			{"HSET", "x10", "user.k", "v"},                          // another project's key
-			{"SET", "i" + inoStr(svRecents), svAttr(typeDir, 1, 2)}, // another root's attr
+			{"SET", "i" + inoStr(r.recents), svAttr(typeDir, 1, 2)}, // another root's attr
 			{"DEL", "x" + inoStr(n)},                                // a command twice
 		} {
-			cmds := append(r.rmdirCmds(t, svCollections, n, "Extra"), extra)
-			r.wantRefused(t, r.rmdir(t, "mgr1", svCollections, n, "Extra", cmds), svCollections, n, "Extra", "rmdir plus "+strings.Join(extra[:2], " "), "is not exactly an rmdir")
+			cmds := append(r.rmdirCmds(t, r.colls, n, "Extra"), extra)
+			r.wantRefused(t, r.rmdir(t, "mgr1", r.colls, n, "Extra", cmds), r.colls, n, "Extra", "rmdir plus "+strings.Join(extra[:2], " "), "is not exactly an rmdir")
 		}
-		// A command missing (no counter update) is not juicefs's rmdir either.
-		cmds := r.rmdirCmds(t, svCollections, n, "Extra")
+		cmds := r.rmdirCmds(t, r.colls, n, "Extra")
 		cmds = append(cmds[:5:5], cmds[6:]...)
-		r.wantRefused(t, r.rmdir(t, "mgr1", svCollections, n, "Extra", cmds), svCollections, n, "Extra", "rmdir without DECR totalInodes", "is not exactly an rmdir")
-		// The parent attr changes more than the link count and times.
-		cmds = r.rmdirCmds(t, svCollections, n, "Extra")
+		r.wantRefused(t, r.rmdir(t, "mgr1", r.colls, n, "Extra", cmds), r.colls, n, "Extra", "rmdir without DECR totalInodes", "is not exactly an rmdir")
+		cmds = r.rmdirCmds(t, r.colls, n, "Extra")
 		b := []byte(cmds[1][2])
 		b[2] ^= 0o002 // mode
 		cmds[1][2] = string(b)
-		r.wantRefused(t, r.rmdir(t, "mgr1", svCollections, n, "Extra", cmds), svCollections, n, "Extra", "rmdir that changes the root's mode", "changes more than its link count and times")
+		r.wantRefused(t, r.rmdir(t, "mgr1", r.colls, n, "Extra", cmds), r.colls, n, "Extra", "rmdir that changes the root's mode", "changes more than its link count and times")
+		// Times far from the server's clock.
+		cmds = r.rmdirCmds(t, r.colls, n, "Extra")
+		b = []byte(cmds[1][2])
+		binary.BigEndian.PutUint64(b[23:31], 1700000000)
+		cmds[1][2] = string(b)
+		r.wantRefused(t, r.rmdir(t, "mgr1", r.colls, n, "Extra", cmds), r.colls, n, "Extra", "rmdir with a stale mtime", "its times are not the server's current time")
 	})
 	t.Run("not_watched", func(t *testing.T) {
-		n := view(svRecents, "NoWatch")
+		n := r.view(t, r.recents, "NoWatch")
 		r.markLog(t)
 		rc := r.conn(t, "mgr1")
-		mustOK(t, rc.do("WATCH", "i"+inoStr(svRecents), "d"+inoStr(svRecents)), "WATCH parent")
-		r.wantRefused(t, txn(rc, r.rmdirCmds(t, svRecents, n, "NoWatch")...), svRecents, n, "NoWatch", "rmdir without WATCH of the directory", "is not WATCHed")
-	})
-	t.Run("renamed_away_root", func(t *testing.T) {
-		n := view(svQueries, "Moved")
-		admin := r.conn(t, "admin1")
-		mustOK(t, txn(admin, []string{"HDEL", "d1", "Queries"}, []string{"HSET", "d1", "OldQueries", mkEntry(typeDir, svQueries)}), "admin renames the root")
-		r.wantRefused(t, r.rmdir(t, "mgr1", svQueries, n, "Moved", r.rmdirCmds(t, svQueries, n, "Moved")), svQueries, n, "Moved", "rmdir under a renamed-away smart root", "directory 22 is not a smart-folder root")
+		mustOK(t, rc.do("WATCH", "i"+inoStr(r.recents), "d"+inoStr(r.recents)), "WATCH parent")
+		r.wantRefused(t, txn(rc, r.rmdirCmds(t, r.recents, n, "NoWatch")...), r.recents, n, "NoWatch", "rmdir without WATCH of the directory", "is not WATCHed")
 	})
 	t.Run("file_attr", func(t *testing.T) {
 		// The entry says directory, the inode is a file.
-		n := view(svRecents, "Odd")
-		if err := r.db.Set(r.ctx, "i"+inoStr(n), svAttr(typeFile, svRecents, 1), 0).Err(); err != nil {
+		n := r.view(t, r.recents, "Odd")
+		if err := r.db.Set(r.ctx, "i"+inoStr(n), svAttr(typeFile, r.recents, 1), 0).Err(); err != nil {
 			t.Fatal(err)
 		}
-		r.wantRefused(t, r.rmdir(t, "mgr1", svRecents, n, "Odd", r.rmdirCmds(t, svRecents, n, "Odd")), svRecents, n, "Odd", "rmdir of an inode that is not a directory", "is not a directory in 20")
+		r.wantRefused(t, r.rmdir(t, "mgr1", r.recents, n, "Odd", r.rmdirCmds(t, r.recents, n, "Odd")), r.recents, n, "Odd", "rmdir of an inode that is not a directory", "is not a directory in "+inoStr(r.recents))
 	})
 	t.Run("rename_aside", func(t *testing.T) {
 		// Moving the view to a hidden name stays admin-only.
-		n := view(svCollections, "Aside")
+		n := r.view(t, r.colls, "Aside")
 		r.markLog(t)
-		v := txn(mgr, []string{"HDEL", "d" + inoStr(svCollections), "Aside"},
-			[]string{"HSET", "d" + inoStr(svCollections), ".juicemount-smart-folder.tmp-1", mkEntry(typeDir, n)})
-		r.wantRefused(t, v, svCollections, n, "Aside", "rename of a view to a hidden name", "is not exactly an rmdir")
+		v := txn(mgr, []string{"HDEL", "d" + inoStr(r.colls), "Aside"},
+			[]string{"HSET", "d" + inoStr(r.colls), ".juicemount-smart-folder.tmp-1", mkEntry(typeDir, n)})
+		r.wantRefused(t, v, r.colls, n, "Aside", "rename of a view to a hidden name", "is not exactly an rmdir")
+	})
+	t.Run("renamed_away_root", func(t *testing.T) {
+		n := r.view(t, r.colls, "Moved")
+		admin := r.conn(t, "admin1")
+		mustOK(t, txn(admin, []string{"HDEL", "d1", "Collections"}, []string{"HSET", "d1", "OldCollections", mkEntry(typeDir, r.colls)}), "admin renames the root")
+		r.wantRefused(t, r.rmdir(t, "mgr1", r.colls, n, "Moved", r.rmdirCmds(t, r.colls, n, "Moved")), r.colls, n, "Moved", "rmdir under a renamed-away smart root", "directory "+inoStr(r.colls)+" is not a smart-folder root")
 	})
 }
 
 func TestSmartViewRemovalOffWithoutRoots(t *testing.T) {
 	r := startSmartViewRig(t, nil)
-	mgr := r.conn(t, "mgr1")
-	first, _ := allocInodes(t, mgr)
-	n := first + 200
-	r.mkdir(t, mgr, svRecents, n, "Shoot")
-	r.wantRefused(t, r.rmdir(t, "mgr1", svRecents, n, "Shoot", r.rmdirCmds(t, svRecents, n, "Shoot")), svRecents, n, "Shoot", "rmdir with no smart roots configured", "no smart-folder roots configured")
+	n := r.mkdir(t, r.mgr, r.recents, "Shoot")
+	if r.recorded(t, n, false) {
+		t.Fatal("recorded a view with no smart roots configured")
+	}
+	r.wantRefused(t, r.rmdir(t, "mgr1", r.recents, n, "Shoot", r.rmdirCmds(t, r.recents, n, "Shoot")), r.recents, n, "Shoot", "rmdir with no smart roots configured", "no smart-folder roots configured")
 }
 
 func TestCleanSmartRoots(t *testing.T) {
-	if ok, bad := CleanSmartRoots(DefaultSmartRoots); len(bad) != 0 || strings.Join(ok, ",") != "Recents,Collections,Queries" {
-		t.Fatalf("defaults: %q %v", ok, bad)
+	if ok, bad := CleanSmartRoots(svRoots); len(bad) != 0 || strings.Join(ok, ",") != "Recents,Collections,Queries" {
+		t.Fatalf("roots: %q %v", ok, bad)
 	}
 	ok, bad := CleanSmartRoots([]string{"", "a/b", ".trash", ".hidden", "..", "Recents", "Recents", "Views"})
 	if len(bad) != 5 || strings.Join(ok, ",") != "Recents,Views" {

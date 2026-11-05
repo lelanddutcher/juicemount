@@ -3,15 +3,35 @@ package respproxy
 // smartview.go is the one exception to the root-entry gate (decide.go
 // rootEntryGate) that is not the admin: the Manager's server principal may
 // remove an EMPTY view directory it created directly under one of its
-// smart-folder roots (/Recents/<view>, /Collections/<view>,
-// /Queries/<view>; LeaseConfig.SmartRoots). Such a view is a project root,
-// so without this only an admin could remove it, and the Manager would
-// leave every emptied view behind. Every other removal or rename of a
-// directory above the project depth stays admin-only.
+// smart-folder roots (/Recents/<view>, /Collections/<view>;
+// LeaseConfig.SmartRoots). Such a view is a project root, so without this
+// only an admin could remove it, and the Manager would leave every emptied
+// view behind. Every other removal or rename of a directory above the
+// project depth stays admin-only.
 //
-// The unit must be exactly juicefs's rmdir without the trash (redis.go
-// doRmdir with skipCheckTrash, which the Manager's metadata client uses),
-// and nothing else:
+// Smart roots. P is a smart root while a configured name names it in the
+// volume root and its inode came from the manager principal's own INCRBY
+// nextinode batch (Guard.inodes): a top-level folder of that name made by
+// anyone else never qualifies. d1 is not WATCHed by these units, so the
+// name is read as it is at decision time; that is sound because renaming
+// or removing an entry of the volume root is itself admin-only here.
+//
+// The view record. The inode-batch owner alone is not enough to tell a
+// view: everything the Manager's principal creates counts (migration sync
+// jobs run under it too), and a lease holder can move an empty folder into
+// a smart root and give it any mode. So the proxy keeps its own record,
+// SmartViewsKey (a set of inodes, under jmlease:, which only the admin may
+// write), and adds N to it when a unit of the manager principal that
+// created N, a new directory placed directly in a smart root P owned by
+// that principal, committed (smartViewCreation). A directory moved into a
+// smart root, or created there before this record existed, is never in it
+// and is never removable this way. The record is dropped when the removal
+// commits; an entry left by a lost reply names an inode number that is
+// never reused.
+//
+// The removal unit must be exactly juicefs's rmdir without the trash
+// (redis.go doRmdir with skipCheckTrash, which the Manager's metadata
+// client uses), and nothing else:
 //
 //	WATCH i<P> d<P> ... WATCH i<N> d<N> ... MULTI
 //	HDEL d<P> <name>; SET i<P> <attr>; DEL i<N>; DEL x<N>;
@@ -23,32 +43,37 @@ package respproxy
 // and, read through the side connection once the connection's WATCH has
 // reached Redis (Unit.beforeSide), so any change before EXEC aborts it:
 //
-//   - P is the directory a configured smart-root name names in the volume
-//     root now (a root renamed away no longer qualifies);
+//   - P is a smart root (above);
 //   - <name> in P names the directory N, whose Attr.Parent is P;
 //   - d<N> is empty (juicefs's own ENOTEMPTY check, HLEN, repeated here);
 //   - the new attr of P is the stored one with only its link count one
-//     lower and its change and modify times new;
-//   - N came from the Manager principal's own INCRBY nextinode batch
-//     (Guard.inodes): a directory it created. A number handed out before
-//     the proxy recorded batches has no recorded owner and is refused.
+//     lower and its change and modify times new, within smartViewSkew of
+//     Redis TIME;
+//   - N came from the manager principal's own inode batch and is in the
+//     view record.
 //
-// The admitted removal is logged to jmlease:v1:log (event
+// A removal that committed is logged to jmlease:v1:log (event
 // smart_view_remove) and, like every admitted namespace unit, to the
-// per-person audit log.
+// per-person audit log. Like any write in a free project, the removal
+// grants the manager principal the view's lease (implicitly); that lease
+// on a directory that no longer exists stays until it expires idle.
 
 import (
 	"bytes"
 	"encoding/binary"
 	"strconv"
+	"time"
 
 	"github.com/lelanddutcher/juicemount/internal/smartfolders"
 )
 
-// DefaultSmartRoots are the smart-folder root names the proxy uses when its
-// config names none: the Manager's defaults for JM_SMART_FOLDERS_ROOT,
-// JM_SMART_FOLDERS_COLLECTIONS_ROOT and JM_SMART_FOLDERS_QUERIES_ROOT.
-var DefaultSmartRoots = []string{"Recents", "Collections", "Queries"}
+// SmartViewsKey is the proxy's record of the smart-folder view directories
+// the manager principal created (a set of inode numbers).
+const SmartViewsKey = "jmlease:v1:smartviews"
+
+// smartViewSkew bounds how far the times rmdir writes into a smart root
+// may be from Redis TIME (the writer's clock names them).
+const smartViewSkew = time.Hour
 
 // CleanSmartRoots returns the valid smart-folder root names among names,
 // checked as the Manager checks them (one visible path component, not a
@@ -88,20 +113,20 @@ const (
 // smartViewRemoval checks that the unit of p removing entry op (stored
 // value stored, a directory) of a directory above the project depth is the
 // Manager's rmdir of an empty smart-folder view (see the file comment). It
-// returns the smart root's name, or why not.
-func (e *LeaseEngine) smartViewRemoval(p Principal, u *Unit, op dentryOp, stored []byte) (string, string) {
+// returns what to run once the removal committed, or why not.
+func (e *LeaseEngine) smartViewRemoval(p Principal, u *Unit, op dentryOp, stored []byte) (func(), string) {
 	if p.Kind != KindManager {
-		return "", "not the manager principal"
+		return nil, "not the manager principal"
 	}
 	if len(e.cfg.SmartRoots) == 0 {
-		return "", "no smart-folder roots configured"
+		return nil, "no smart-folder roots configured"
 	}
 	if u.Kind != UnitTxn || u.DB != e.cfg.VolumeDB {
-		return "", "not a transaction on the volume"
+		return nil, "not a transaction on the volume"
 	}
 	n, ok := entryInode(stored)
 	if !ok || !op.del || op.trash {
-		return "", "not the removal of a directory entry"
+		return nil, "not the removal of a directory entry"
 	}
 	pd, nd := inoStr(op.dir), inoStr(n)
 
@@ -128,17 +153,17 @@ func (e *LeaseEngine) smartViewRemoval(p Principal, u *Unit, op dentryOp, stored
 		}
 		k := rmdirCmdKey(c.Info.Name, args...)
 		if want[k] == 0 {
-			return "", "the unit is not exactly an rmdir: " + sanitizeToken(c.Info.Name)
+			return nil, "the unit is not exactly an rmdir: " + sanitizeToken(c.Info.Name)
 		}
 		want[k]--
 	}
 	for _, left := range want {
 		if left != 0 {
-			return "", "the unit is not exactly an rmdir"
+			return nil, "the unit is not exactly an rmdir"
 		}
 	}
 	if newAttr == nil {
-		return "", "the unit is not exactly an rmdir: no SET i" + pd
+		return nil, "the unit is not exactly an rmdir: no SET i" + pd
 	}
 
 	// The reads below are covered by the WATCH juicefs's rmdir takes.
@@ -148,23 +173,123 @@ func (e *LeaseEngine) smartViewRemoval(p Principal, u *Unit, op dentryOp, stored
 	}
 	for _, k := range []string{"i" + pd, "d" + pd, "i" + nd, "d" + nd} {
 		if !watched[k] {
-			return "", k + " is not WATCHed"
+			return nil, k + " is not WATCHed"
 		}
 	}
 	if u.beforeSide == nil {
-		return "", "no WATCH on the connection"
+		return nil, "no WATCH on the connection"
 	}
 	if err := u.beforeSide(); err != nil {
-		return "", "WATCH not confirmed before side read: " + err.Error()
+		return nil, "WATCH not confirmed before side read: " + err.Error()
 	}
 	read := func(args ...string) (Value, error) {
 		e.anc.sideReads.Add(1)
 		return e.side(args...)
 	}
 
-	// P is what a configured smart-root name names in the volume root now.
-	hm := append([]string{"HMGET", "d" + inoStr(rootIno)}, e.cfg.SmartRoots...)
-	v, err := read(hm...)
+	root, why := e.smartRootOf(p, u, op.dir)
+	if why != "" {
+		return nil, why
+	}
+
+	// <name> names the directory N, placed in P.
+	v, err := read("HGET", "d"+pd, op.name)
+	if err != nil || v.Null || !bytes.Equal(v.Str, stored) {
+		return nil, "the entry changed"
+	}
+	if v, err = read("GET", "i"+nd); err != nil || v.Null {
+		return nil, "cannot read inode " + nd
+	}
+	if a, ok := parseAttr(v.Str); !ok || a.typ != typeDir || a.parent != op.dir {
+		return nil, "inode " + nd + " is not a directory in " + pd
+	}
+	// Empty.
+	if v, err = read("HLEN", "d"+nd); err != nil || v.Type != ':' {
+		return nil, "cannot read directory " + nd
+	}
+	if v.Int != 0 {
+		return nil, "directory " + nd + " is not empty"
+	}
+	// P's attr changes only as rmdir changes it.
+	if v, err = read("GET", "i"+pd); err != nil || v.Null {
+		return nil, "cannot read inode " + pd
+	}
+	if !rmdirParentAttr(v.Str, newAttr) {
+		return nil, "the new attr of " + pd + " changes more than its link count and times"
+	}
+	if why := e.attrTimesNow(newAttr); why != "" {
+		return nil, "the new attr of " + pd + ": " + why
+	}
+
+	// Created by this principal, as a view.
+	if why := ownedBy(p, u, n); why != "" {
+		return nil, why
+	}
+	if v, err = read("SISMEMBER", SmartViewsKey, nd); err != nil || v.Type != ':' {
+		return nil, "cannot read the view record"
+	}
+	if v.Int != 1 {
+		return nil, "directory " + nd + " is not a recorded smart-folder view"
+	}
+	name := op.name
+	return func() {
+		if _, err := e.side("SREM", SmartViewsKey, nd); err != nil {
+			e.logf("respproxy: smart-folder view record: SREM %s: %v", nd, err)
+		}
+		e.queueLog(logEntry{"event", "smart_view_remove", "proj", nd, "actor", p.Name,
+			"kind", string(p.Kind), "root", sanitizeToken(root), "view", sanitizeToken(name),
+			"ts_ms", strconv.FormatInt(ms(e.now()), 10)})
+	}, ""
+}
+
+// smartViewCreation recognises a unit of the manager principal that
+// creates a view: a new directory N (an inode from p's own batch that does
+// not exist yet, its SET i<N> a directory under P) placed by the unit's
+// only entry write directly in a smart root P (smartRootOf). It returns
+// what to run once the unit committed: add N to the view record. Any other
+// unit returns nil.
+func (e *LeaseEngine) smartViewCreation(p Principal, u *Unit, f *unitFacts) func() {
+	if len(e.cfg.SmartRoots) == 0 || u.DB != e.cfg.VolumeDB || len(f.dentries) != 1 {
+		return nil
+	}
+	op := f.dentries[0]
+	if op.del || op.trash || !op.isDir {
+		return nil
+	}
+	if a, ok := f.setAttr[op.ino]; !ok || a.typ != typeDir || a.parent != op.dir {
+		return nil
+	}
+	if loc, err := e.anc.resolveDir(op.dir); err != nil || loc.kind != nsRoot || loc.depth != 1 {
+		return nil
+	}
+	root, why := e.smartRootOf(p, u, op.dir)
+	if why != "" || ownedBy(p, u, op.ino) != "" {
+		return nil
+	}
+	nd := inoStr(op.ino)
+	e.anc.sideReads.Add(1)
+	if v, err := e.side("EXISTS", "i"+nd); err != nil || v.Int != 0 {
+		return nil // not a new directory
+	}
+	name := op.name
+	return func() {
+		if _, err := e.side("SADD", SmartViewsKey, nd); err != nil {
+			e.logf("respproxy: smart-folder view record: SADD %s: %v (the view cannot be removed by the Manager)", nd, err)
+			return
+		}
+		e.queueLog(logEntry{"event", "smart_view_create", "proj", nd, "actor", p.Name,
+			"kind", string(p.Kind), "root", sanitizeToken(root), "view", sanitizeToken(name),
+			"ts_ms", strconv.FormatInt(ms(e.now()), 10)})
+	}
+}
+
+// smartRootOf reports which configured smart root the directory dir is:
+// the one a configured name names in the volume root now, with an inode
+// from p's own batch. d1 is not WATCHed; renaming or removing a root entry
+// is admin-only, so only the admin can change what a name names.
+func (e *LeaseEngine) smartRootOf(p Principal, u *Unit, dir uint64) (string, string) {
+	e.anc.sideReads.Add(1)
+	v, err := e.side(append([]string{"HMGET", "d" + inoStr(rootIno)}, e.cfg.SmartRoots...)...)
 	if err != nil || len(v.Elems) != len(e.cfg.SmartRoots) {
 		return "", "cannot read the smart-folder roots"
 	}
@@ -175,54 +300,57 @@ func (e *LeaseEngine) smartViewRemoval(p Principal, u *Unit, op dentryOp, stored
 		}
 		t, tok := entryType(el.Str)
 		ino, iok := entryInode(el.Str)
-		if tok && iok && t == typeDir && ino == op.dir {
+		if tok && iok && t == typeDir && ino == dir {
 			root = e.cfg.SmartRoots[i]
 			break
 		}
 	}
 	if root == "" {
-		return "", "directory " + pd + " is not a smart-folder root"
+		return "", "directory " + inoStr(dir) + " is not a smart-folder root"
 	}
+	if why := ownedBy(p, u, dir); why != "" {
+		return "", "smart-folder root " + root + ": " + why
+	}
+	return root, ""
+}
 
-	// <name> names the directory N, placed in P.
-	if v, err = read("HGET", "d"+pd, op.name); err != nil || v.Null || !bytes.Equal(v.Str, stored) {
-		return "", "the entry changed"
-	}
-	if v, err = read("GET", "i"+nd); err != nil || v.Null {
-		return "", "cannot read inode " + nd
-	}
-	if a, ok := parseAttr(v.Str); !ok || a.typ != typeDir || a.parent != op.dir {
-		return "", "inode " + nd + " is not a directory in " + pd
-	}
-	// Empty.
-	if v, err = read("HLEN", "d"+nd); err != nil || v.Type != ':' {
-		return "", "cannot read directory " + nd
-	}
-	if v.Int != 0 {
-		return "", "directory " + nd + " is not empty"
-	}
-	// P's attr changes only as rmdir changes it.
-	if v, err = read("GET", "i"+pd); err != nil || v.Null {
-		return "", "cannot read inode " + pd
-	}
-	if !rmdirParentAttr(v.Str, newAttr) {
-		return "", "the new attr of " + pd + " changes more than its link count and times"
-	}
-
-	// Created by this principal.
+// ownedBy: inode n came from p's own INCRBY nextinode batch. A number
+// handed out before the proxy recorded batches has no recorded owner.
+func ownedBy(p Principal, u *Unit, n uint64) string {
 	if u.inodeOwner == nil {
-		return "", "no inode allocation record"
+		return "no inode allocation record"
 	}
 	owner, known, err := u.inodeOwner(n)
 	switch {
 	case err != nil:
-		return "", "inode allocation record: " + err.Error()
+		return "inode allocation record: " + err.Error()
 	case !known:
-		return "", "inode " + nd + " has no recorded creator"
+		return "inode " + inoStr(n) + " has no recorded creator"
 	case owner != p.Name:
-		return "", "inode " + nd + " was not created by " + p.Name
+		return "inode " + inoStr(n) + " was not created by " + p.Name
 	}
-	return root, ""
+	return ""
+}
+
+// attrTimesNow: the modify and change times of attr a are within
+// smartViewSkew of Redis TIME.
+func (e *LeaseEngine) attrTimesNow(a []byte) string {
+	v, err := e.side("TIME")
+	if err != nil || len(v.Elems) != 2 {
+		return "cannot read Redis TIME"
+	}
+	now, err := strconv.ParseInt(string(v.Elems[0].Str), 10, 64)
+	if err != nil {
+		return "cannot read Redis TIME"
+	}
+	srv := time.Unix(now, 0)
+	for _, at := range []int{attrTimesFrom, attrTimesFrom + 12} { // mtime, ctime
+		t := time.Unix(int64(binary.BigEndian.Uint64(a[at:at+8])), 0)
+		if t.Before(srv.Add(-smartViewSkew)) || t.After(srv.Add(smartViewSkew)) {
+			return "its times are not the server's current time"
+		}
+	}
+	return ""
 }
 
 // rmdirParentAttr: next is old with the link count one lower and new modify

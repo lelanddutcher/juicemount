@@ -94,7 +94,7 @@ func TestEntrypointKeepsPeopleAndConfiguresAudit(t *testing.T) {
 		return cfg
 	}
 	if cfg := readCfg(); cfg.AuditDir != filepath.Join(dir, "audit") || cfg.Audit != "auto" || cfg.RetainMB != 0 || cfg.RetainDays != 0 ||
-		strings.Join(cfg.SmartRoots, ",") != strings.Join(respproxy.DefaultSmartRoots, ",") {
+		cfg.SmartRoots == nil || len(cfg.SmartRoots) != 0 {
 		t.Fatalf("config = %+v", cfg)
 	}
 	rerun := func(extra ...string) ([]byte, error) {
@@ -108,12 +108,25 @@ func TestEntrypointKeepsPeopleAndConfiguresAudit(t *testing.T) {
 	if cfg := readCfg(); cfg.Audit != "on" || cfg.RetainMB != 512 || cfg.RetainDays != -1 {
 		t.Fatalf("config with JM_AUDIT=on = %+v", cfg)
 	}
-	// The smart-folder roots come from the Manager's variables.
-	if out, err := rerun("JM_SMART_FOLDERS_ROOT=Recent Files", "JM_SMART_FOLDERS_COLLECTIONS_ROOT=Sets", "JM_SMART_FOLDERS_QUERIES_ROOT=Searches"); err != nil {
-		t.Fatalf("entrypoint: %v\n%s", err, out)
-	}
-	if cfg := readCfg(); strings.Join(cfg.SmartRoots, ",") != "Recent Files,Sets,Searches" {
-		t.Fatalf("config smart_folder_roots = %q", cfg.SmartRoots)
+	// The smart-folder roots are the ones the Manager runs, read from its
+	// variables the way it reads them.
+	for _, tc := range []struct {
+		env  []string
+		want string
+	}{
+		{[]string{"JM_SMART_FOLDERS=off", "JM_CONTINUITY=on"}, ""},
+		{[]string{"JM_SMART_FOLDERS= On "}, "Recents"},
+		{[]string{"JM_SMART_FOLDERS=on", "JM_SMART_FOLDERS_ROOT=  ", "JM_SMART_FOLDERS_COLLECTIONS_ROOT=Sets"}, "Recents"},
+		{[]string{"JM_SMART_FOLDERS=yes", "JM_CONTINUITY=true"}, "Recents,Collections"},
+		{[]string{"JM_SMART_FOLDERS=on", "JM_CONTINUITY=on", "JM_SMART_FOLDERS_ROOT= Recent Files ", "JM_SMART_FOLDERS_COLLECTIONS_ROOT= Sets"}, "Recent Files,Sets"},
+		{[]string{"JM_SMART_FOLDERS=on", "JM_CONTINUITY=on", "JM_SMART_FOLDERS_ROOT=Views", "JM_SMART_FOLDERS_COLLECTIONS_ROOT=views"}, "Views"},
+	} {
+		if out, err := rerun(tc.env...); err != nil {
+			t.Fatalf("entrypoint %v: %v\n%s", tc.env, err, out)
+		}
+		if cfg := readCfg(); cfg.SmartRoots == nil || strings.Join(cfg.SmartRoots, ",") != tc.want {
+			t.Fatalf("%v: smart_folder_roots = %q, want %q", tc.env, cfg.SmartRoots, tc.want)
+		}
 	}
 	if out, err := rerun("JM_AUDIT=off"); err != nil {
 		t.Fatalf("entrypoint: %v\n%s", err, out)

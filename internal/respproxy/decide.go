@@ -52,8 +52,7 @@ type LeaseConfig struct {
 	FileCache    int  // file -> parent cache entries; default 1M
 	// SmartRoots names the Manager's smart-folder roots in the volume root
 	// (smartview.go): the manager principal may remove an empty view
-	// directory it created directly under one. Empty: none (the
-	// jm-respproxy command defaults to DefaultSmartRoots).
+	// directory it created directly under one it owns. Empty: none.
 	SmartRoots []string
 }
 
@@ -312,6 +311,9 @@ func (e *LeaseEngine) Decide(p Principal, u *Unit) Verdict {
 	// rootTouch: the unit changes an entry above the project depth; once it
 	// committed (or may have), grant paths are looked up again.
 	rootTouch := false
+	// onCommit: the smart-folder view bookkeeping (smartview.go) of a unit
+	// admitted here, run only once Redis applied it.
+	var onCommit []func()
 	done := func(o Outcome) {
 		relMu.Lock()
 		defer relMu.Unlock()
@@ -340,6 +342,9 @@ func (e *LeaseEngine) Decide(p Principal, u *Unit) Verdict {
 			e.anc.forget(f) // outcome unknown: re-resolve from Redis
 		case o.Committed:
 			e.anc.learnCommitted(f)
+			for _, fn := range onCommit {
+				fn()
+			}
 		}
 		if rootTouch && !timedOut && (o.Lost || o.Committed) {
 			e.grants.epoch.Add(1)
@@ -392,6 +397,7 @@ func (e *LeaseEngine) Decide(p Principal, u *Unit) Verdict {
 		return arm(Verdict{Done: done})
 	}
 	deny := func(d *Denial) Verdict {
+		onCommit = nil
 		for i := len(fences) - 1; i >= 0; i-- {
 			fences[i].RUnlock()
 		}
@@ -506,8 +512,17 @@ func (e *LeaseEngine) Decide(p Principal, u *Unit) Verdict {
 	// there (a project root or a top-level folder) needs admin, except the
 	// Manager's removal of an empty smart-folder view (smartview.go).
 	if p.Kind != KindAdmin {
-		if d := e.rootEntryGate(p, u, f); d != nil {
+		d, removal := e.rootEntryGate(p, u, f)
+		if d != nil {
 			return deny(d)
+		}
+		if removal != nil {
+			onCommit = append(onCommit, removal)
+		}
+	}
+	if p.Kind == KindManager {
+		if created := e.smartViewCreation(p, u, f); created != nil {
+			onCommit = append(onCommit, created)
 		}
 	}
 
@@ -632,8 +647,10 @@ func (e *LeaseEngine) leaseDenial(r Reason, proj uint64) *Denial {
 // rootEntryGate refuses renaming or removing a directory entry of a
 // directory above the project depth (plan founder default 5). The one
 // exception is the manager principal removing an empty smart-folder view
-// it created (smartViewRemoval).
-func (e *LeaseEngine) rootEntryGate(p Principal, u *Unit, f *unitFacts) *Denial {
+// it created (smartViewRemoval); for that unit it also returns what to
+// run once the removal committed.
+func (e *LeaseEngine) rootEntryGate(p Principal, u *Unit, f *unitFacts) (*Denial, func()) {
+	var removed func()
 	for _, op := range f.dentries {
 		if op.trash {
 			continue
@@ -645,7 +662,7 @@ func (e *LeaseEngine) rootEntryGate(p Principal, u *Unit, f *unitFacts) *Denial 
 		e.anc.sideReads.Add(1)
 		v, err := e.cfg.Side.Do(e.cfg.VolumeDB, []byte("HGET"), []byte("d"+strconv.FormatUint(op.dir, 10)), []byte(op.name))
 		if err != nil || v.Err() != nil {
-			return &Denial{Reason: ReasonUnknownKey, Detail: "cannot read root entry " + op.name}
+			return &Denial{Reason: ReasonUnknownKey, Detail: "cannot read root entry " + op.name}, nil
 		}
 		if v.Null {
 			continue // a new name: open to every writer
@@ -657,19 +674,17 @@ func (e *LeaseEngine) rootEntryGate(p Principal, u *Unit, f *unitFacts) *Denial 
 			proj, _ := entryInode(v.Str)
 			detail := "renaming or removing directory " + strconv.Quote(op.name) + " above the project depth needs admin"
 			if op.del && p.Kind == KindManager {
-				root, why := e.smartViewRemoval(p, u, op, v.Str)
+				fn, why := e.smartViewRemoval(p, u, op, v.Str)
 				if why == "" {
-					e.queueLog(logEntry{"event", "smart_view_remove", "proj", inoStr(proj), "actor", p.Name,
-						"kind", string(p.Kind), "root", sanitizeToken(root), "view", sanitizeToken(op.name),
-						"ts_ms", strconv.FormatInt(ms(e.now()), 10)})
+					removed = fn
 					continue
 				}
 				detail += " (not an empty smart-folder view of " + p.Name + "'s: " + why + ")"
 			}
-			return &Denial{Reason: ReasonAdminOnly, Proj: proj, Detail: detail}
+			return &Denial{Reason: ReasonAdminOnly, Proj: proj, Detail: detail}, nil
 		}
 	}
-	return nil
+	return nil, removed
 }
 
 // Stats is a snapshot of the engine's counters.

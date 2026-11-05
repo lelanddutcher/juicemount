@@ -6,14 +6,14 @@ import (
 	"testing"
 )
 
-// smart_folder_roots: absent means the defaults, [] means none, and an
-// invalid name is left out (reported), never fatal.
+// smart_folder_roots: absent or [] means none, and an invalid name is left
+// out (reported), never fatal.
 func TestSmartFolderRootsConfig(t *testing.T) {
 	for _, tc := range []struct {
 		json, want string
 		bad        int
 	}{
-		{`{}`, "Recents,Collections,Queries", 0},
+		{`{}`, "", 0},
 		{`{"smart_folder_roots":[]}`, "", 0},
 		{`{"smart_folder_roots":["Recents","Kollektionen","Recents"]}`, "Recents,Kollektionen", 0},
 		{`{"smart_folder_roots":["Recents",".trash","a/b"]}`, "Recents", 2},
