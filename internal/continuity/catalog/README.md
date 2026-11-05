@@ -259,14 +259,17 @@ owned pool; no detached worker or caller-I/O close is used.
 
 Restore validates magic/header/expected library and budgets before reserving a
 destination. It initializes schema2 with ready=0 and initial file/directory
-barriers. Each event reuses the mutation invariants in an immediate transaction,
-inserts its original canonical request/digest/timestamp/receipt, and preserves
-sequence exactly. It does not call public Apply or sample time. Incremental
-projection-row accounting observes actual existing identities inside the same
-transaction. New assets/revisions/parent edges/relationships/locations add rows;
-repeated revisions, corrections, removals and reactivations do not. An event
-exceeding the row budget rolls back before consuming further input or committing;
-the running count advances only after commit, without growing-table rescans.
+barriers. Events replay in immediate batch transactions of up to 500 events or
+16 MiB of requests (the target stays ready=0 throughout, so a batch boundary only
+changes how much incomplete progress a failure leaves). Each event reuses the
+mutation invariants, inserts its original canonical request/digest/timestamp/
+receipt, and preserves sequence exactly. It does not call public Apply or sample
+time. Incremental projection-row accounting observes actual existing identities,
+including the open batch's uncommitted rows, inside the same transaction. New
+assets/revisions/parent edges/relationships/locations add rows; repeated
+revisions, corrections, removals and reactivations do not. An event exceeding
+the row budget rolls back its whole batch before consuming further input or
+committing, without growing-table rescans.
 
 After a valid footer and EOF, a final immediate transaction independently scans
 target history/projections, compares counts/P, and validates schema/integrity/path

@@ -13,6 +13,7 @@ import (
 )
 
 func TestPortabilityIncrementalRowsRejectBeforeReadingFooter(t *testing.T) {
+	withRestoreBatch(t, 1)
 	_, stream := loadPortabilityVector(t, "legacy")
 	frames := streamFrames(t, stream)
 	for _, tc := range []struct {
@@ -167,6 +168,7 @@ func TestPortabilitySnapshotAllowsWriterAndCloseDrainsExport(t *testing.T) {
 }
 
 func TestPortabilityCancellationRetainsIncompleteReplay(t *testing.T) {
+	withRestoreBatch(t, 1)
 	_, stream := loadPortabilityVector(t, "legacy")
 	frames := streamFrames(t, stream)
 	prefix := bytes.NewReader(joinFrames(frames[:2]))

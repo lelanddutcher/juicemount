@@ -10,6 +10,16 @@ import (
 	"github.com/lelanddutcher/juicemount/internal/continuity"
 )
 
+// Replayed events commit in batches: the target stays ready=0 until the final
+// verification transaction, so a batch boundary only changes how much
+// incomplete progress a failed restore leaves behind, not what Open admits.
+var (
+	restoreBatchEvents = 500
+	restoreBatchBytes  = 16 << 20
+	// restoreBatchCommitted observes replay batch commits in tests.
+	restoreBatchCommitted func()
+)
+
 // Restore admits a complete metadata stream into a newly reserved, incomplete
 // target only. It never resumes, merges, overwrites or removes a failed target.
 func Restore(ctx context.Context, path string, library continuity.LibraryID, reader io.Reader, limits Limits) error {
@@ -59,6 +69,13 @@ func restoreCatalog(ctx context.Context, path string, library continuity.Library
 			resultErr = errors.Join(resultErr, s.Close())
 		}
 	}()
+	var batch *sql.Tx
+	defer func() {
+		if batch != nil {
+			batch.Rollback()
+		}
+	}()
+	batchEvents, batchBytes := 0, 0
 	projectionRows := int64(1)
 	for sequence := int64(1); sequence <= header.EventCount; sequence++ {
 		payload, err := input.frame(2, h)
@@ -69,11 +86,28 @@ func restoreCatalog(ctx context.Context, path string, library continuity.Library
 		if err != nil {
 			return err
 		}
-		nextRows, err := s.replayEvent(ctx, event, op, projectionRows, limits.MaxProjectionRows)
+		if batch == nil {
+			if batch, err = s.beginReplayBatch(ctx); err != nil {
+				return protocolError("restore replay", err)
+			}
+		}
+		// Row accounting includes the open batch's uncommitted inserts; a
+		// failure rolls the whole batch back and the restore stops.
+		nextRows, err := s.replayEvent(ctx, batch, event, op, projectionRows, limits.MaxProjectionRows)
 		if err != nil {
 			return protocolError("restore replay", err)
 		}
 		projectionRows = nextRows
+		batchEvents++
+		batchBytes += len(event.request)
+		if batchEvents >= restoreBatchEvents || batchBytes >= restoreBatchBytes || sequence == header.EventCount {
+			err := commitReplayBatch(ctx, batch)
+			batch = nil
+			if err != nil {
+				return protocolError("restore replay", err)
+			}
+			batchEvents, batchBytes = 0, 0
+		}
 	}
 	footerData, err := input.frame(3, nil)
 	if err != nil {
@@ -172,18 +206,38 @@ func requireIncomplete(ctx context.Context, q queryer) error {
 	return nil
 }
 
-func (s *Store) replayEvent(ctx context.Context, event eventRow, op Operation, rows, maxRows int64) (int64, error) {
+func (s *Store) beginReplayBatch(ctx context.Context) (*sql.Tx, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
-	defer tx.Rollback()
 	if err := requireIncomplete(ctx, tx); err != nil {
-		return 0, err
+		tx.Rollback()
+		return nil, err
 	}
 	if err := s.checkPaths(); err != nil {
-		return 0, err
+		tx.Rollback()
+		return nil, err
 	}
+	return tx, nil
+}
+
+func commitReplayBatch(ctx context.Context, tx *sql.Tx) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("incomplete restore batch commit uncertain: %w", err)
+	}
+	if restoreBatchCommitted != nil {
+		restoreBatchCommitted()
+	}
+	return nil
+}
+
+// replayEvent applies one event inside the open batch transaction with the same
+// per-change invariants as Apply, returning the updated projection-row count.
+func (s *Store) replayEvent(ctx context.Context, tx *sql.Tx, event eventRow, op Operation, rows, maxRows int64) (int64, error) {
 	var exists bool
 	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM events WHERE operation_id=?)`, event.id).Scan(&exists); err != nil {
 		return 0, err
@@ -210,9 +264,6 @@ func (s *Store) replayEvent(ctx context.Context, event eventRow, op Operation, r
 	}
 	if err := ctx.Err(); err != nil {
 		return 0, err
-	}
-	if err := tx.Commit(); err != nil {
-		return 0, fmt.Errorf("incomplete restore batch commit uncertain: %w", err)
 	}
 	return rows, nil
 }

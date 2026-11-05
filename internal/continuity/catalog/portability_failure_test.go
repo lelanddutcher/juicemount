@@ -174,6 +174,7 @@ func TestPortabilityMalformedFramesAndStrictJSON(t *testing.T) {
 }
 
 func TestPortabilityDuplicateOperationAndFailedBatchRemainIncomplete(t *testing.T) {
+	withRestoreBatch(t, 1)
 	_, stream := loadPortabilityVector(t, "legacy")
 	frames := streamFrames(t, stream)
 	event, _, err := decodeStreamEvent(frames[1][5:], testLibrary, 1)
