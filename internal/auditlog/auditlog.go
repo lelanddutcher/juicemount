@@ -816,7 +816,10 @@ func (w *Writer) fail(err error, batch []*Record) {
 
 // recover reopens the log after a failure, writes the records queued
 // before the failure was seen (batch, all numbered below the gap) and the
-// gap record. False: still failing (batch is not written).
+// gap record. False: still failing (batch is not written). True: batch is
+// written; the writer is healthy again unless the gap record for Appends
+// refused while it was being written could not be written (failed stays
+// set and the next attempt's gap counts them).
 //
 // Retention runs here too: a log that filled its disk past its size or age
 // limit would otherwise stay failed (and, while grants are in force, keep
@@ -881,15 +884,42 @@ func (w *Writer) recover(batch []*Record) bool {
 	w.mu.Lock()
 	w.note = ""
 	w.dropped -= gap.Dropped
-	w.failed = nil
 	w.durable = gap.Seq
 	w.lastFsync = w.opts.Now().UnixMilli()
 	for _, r := range all {
 		r.st = stDurable
 	}
+	lost := gap.Dropped
+	// The writer stays failed until the gap record is on disk, so Appends
+	// refused meanwhile are not in it. Another gap record counts them
+	// before the writer takes records again; the one that finds none left
+	// clears the failure in the same critical section, so no refusal goes
+	// uncounted (or into the gap of a later failure).
+	for w.dropped > 0 {
+		more := &Record{Seq: w.nextSeq, TS: w.opts.Now().UnixMilli(), Type: TypeGap, Dropped: w.dropped,
+			Detail: gap.Detail + "; refused while the log was recovering"}
+		w.nextSeq++
+		w.mu.Unlock()
+		err := w.writeBatch([]*Record{more})
+		w.mu.Lock()
+		if err != nil {
+			// Still failed; the next attempt's gap record counts these.
+			w.cond.Broadcast()
+			w.mu.Unlock()
+			w.closeFile()
+			w.setNote(w.stuckNote(err))
+			return true
+		}
+		w.dropped -= more.Dropped
+		w.durable = more.Seq
+		w.lastFsync = w.opts.Now().UnixMilli()
+		more.st = stDurable
+		lost += more.Dropped
+	}
+	w.failed = nil
 	w.cond.Broadcast()
 	w.mu.Unlock()
-	w.opts.Logf("auditlog: recovered; %d records were lost", gap.Dropped)
+	w.opts.Logf("auditlog: recovered; %d records were lost", lost)
 	return true
 }
 

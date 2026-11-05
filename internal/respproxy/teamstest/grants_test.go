@@ -329,14 +329,26 @@ func TestAuditSinkFailure(t *testing.T) {
 		if e.exists(e.ino["/Clients/A"], "j1") || e.exists(e.ino["/Clients/C"], "a1") {
 			t.Fatal("a refused write committed")
 		}
-		e.failSink.Store(false)
+		e.healSink.Store(true)
 		waitHealthy(t, e.audit)
 		if st := john.Mkdir(ctx, e.ino["/Clients/A"], "j2", 0o755, 0o022, 0, &ino, &attr); st != 0 {
 			t.Fatalf("john mkdir after recovery: %v", st)
 		}
+		// One gap record counts the failure. A record the proxy's flush
+		// appends while that gap is being written is refused too, and a
+		// second gap record, written right after, counts it.
 		gaps := e.records(auditlog.Filter{Types: []string{auditlog.TypeGap}})
-		if len(gaps) != 1 || gaps[0].Dropped == 0 {
-			t.Fatalf("gap records = %+v", gaps)
+		failures := 0
+		for _, g := range gaps {
+			if g.Dropped == 0 {
+				t.Fatalf("empty gap record: %+v", gaps)
+			}
+			if !strings.HasSuffix(g.Detail, "; refused while the log was recovering") {
+				failures++
+			}
+		}
+		if failures != 1 {
+			t.Fatalf("gap records = %+v, want one for the failure", gaps)
 		}
 		if rep, err := auditlog.Verify(e.auditDir); err != nil || !rep.OK {
 			t.Fatalf("verify: %+v %v", rep, err)

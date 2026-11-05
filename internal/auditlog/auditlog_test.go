@@ -149,9 +149,17 @@ func TestReopenCutsTornTailAndContinuesChain(t *testing.T) {
 // then a gap record counts what was lost and the chain still verifies.
 func TestSinkFailureRefusesThenRecordsGap(t *testing.T) {
 	dir := t.TempDir()
-	var broken atomic.Bool
+	// heal ends the failure from inside a failing attempt, so the attempt
+	// that succeeds starts after every refusal below. Clearing broken from
+	// the test instead could let an attempt already past its gap count
+	// write it, and the refused Append would go in a second gap record
+	// (TestRecoveryCountsRecordsRefusedWhileItsGapIsWritten).
+	var broken, heal atomic.Bool
 	w := mustOpen(t, dir, Options{RetryEvery: 20 * time.Millisecond, BeforeWrite: func() error {
 		if broken.Load() {
+			if heal.Load() {
+				broken.Store(false)
+			}
 			return errors.New("disk full (injected)")
 		}
 		return nil
@@ -173,7 +181,7 @@ func TestSinkFailureRefusesThenRecordsGap(t *testing.T) {
 	if _, err := w.Append(&Record{Type: TypeIntent}); !errors.Is(err, ErrUnavailable) {
 		t.Fatalf("Append while failed = %v, want ErrUnavailable", err)
 	}
-	broken.Store(false)
+	heal.Store(true)
 	deadline := time.Now().Add(5 * time.Second)
 	for !w.Healthy() && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
@@ -190,6 +198,56 @@ func TestSinkFailureRefusesThenRecordsGap(t *testing.T) {
 	p, _ := Query(dir, Filter{Types: []string{TypeGap}}, 0, 10)
 	if len(p.Records) != 1 || p.Records[0].Dropped != 2 {
 		t.Fatalf("gap records = %+v, want one gap of 2 lost records", p.Records)
+	}
+}
+
+// An Append refused while the recovery's gap record is being written (the
+// writer is still failed until that record is on disk) is lost like any
+// other: a second gap record counts it before the writer takes records
+// again, instead of leaving it to the gap of a later failure, or to none.
+func TestRecoveryCountsRecordsRefusedWhileItsGapIsWritten(t *testing.T) {
+	dir := t.TempDir()
+	var w *Writer
+	var broken, refuseInGapWrite atomic.Bool
+	var refused error // set on the writer goroutine; read after Close
+	w = mustOpen(t, dir, Options{RetryEvery: 20 * time.Millisecond, BeforeWrite: func() error {
+		if broken.Load() {
+			return errors.New("disk full (injected)")
+		}
+		if refuseInGapWrite.CompareAndSwap(true, false) {
+			// The first write after the sink heals carries the gap record.
+			_, refused = w.Append(&Record{Type: TypeIntent})
+		}
+		return nil
+	}})
+	appendN(t, w, 2, "p-1")
+	if err := w.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	broken.Store(true)
+	if _, err := w.Append(&Record{Type: TypeIntent}); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Sync(); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("Sync during failure = %v, want ErrUnavailable", err)
+	}
+	refuseInGapWrite.Store(true)
+	broken.Store(false)
+	deadline := time.Now().Add(5 * time.Second)
+	for !w.Healthy() && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !w.Healthy() {
+		t.Fatal("writer did not recover")
+	}
+	w.Close()
+	if !errors.Is(refused, ErrUnavailable) {
+		t.Fatalf("Append during the gap write = %v, want ErrUnavailable", refused)
+	}
+	mustVerify(t, dir)
+	p, _ := Query(dir, Filter{Types: []string{TypeGap}}, 0, 10)
+	if len(p.Records) != 2 || p.Records[0].Dropped != 1 || p.Records[1].Dropped != 1 {
+		t.Fatalf("gap records = %+v, want two gaps of 1: the lost batch, then the Append refused during recovery", p.Records)
 	}
 }
 
