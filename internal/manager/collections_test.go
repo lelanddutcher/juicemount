@@ -31,7 +31,7 @@ import (
 type lockedVolume struct {
 	mu    sync.Mutex
 	files map[string]uint64
-	trash map[uint64]bool
+	trash map[uint64]time.Time // inode -> when it went to the trash
 	fail  bool
 }
 
@@ -69,8 +69,8 @@ func (v *lockedVolume) StatIno(ino uint64) (jfsmeta.Node, error) {
 			return v.node(ino), nil
 		}
 	}
-	if v.trash[ino] {
-		return jfsmeta.Node{Ino: ino, Type: smartfolders.TypeRegular, Nlink: 1, InTrash: true}, nil
+	if at, ok := v.trash[ino]; ok {
+		return jfsmeta.Node{Ino: ino, Type: smartfolders.TypeRegular, Nlink: 1, InTrash: true, Ctime: at}, nil
 	}
 	return jfsmeta.Node{}, syscall.ENOENT
 }
@@ -451,7 +451,7 @@ func TestCollectionsMemberSurvivesAtomicSave(t *testing.T) {
 	id := e.write("admin", "/api/collections", map[string]any{"name": "Cut", "members": pathRefs("Clients/A/one.mov")}, 200).Collection.ID
 	e.vol.set(func(f map[string]uint64) { f["Clients/A/one.mov"] = 50 })
 	e.vol.mu.Lock()
-	e.vol.trash = map[uint64]bool{42: true} // the rename over sent it to the trash
+	e.vol.trash = map[uint64]time.Time{42: time.Now()} // the rename over sent it to the trash
 	e.vol.mu.Unlock()
 	e.offer(binder.Event{Op: "rename", Path: "Clients/A/one.mov", OldPath: "Clients/A/.one.mov.tmp", Inode: 50})
 	got := e.members(id, "")

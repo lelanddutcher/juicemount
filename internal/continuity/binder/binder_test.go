@@ -152,13 +152,19 @@ func (f *fixture) start(run bool) {
 	}
 	f.b, f.sent = b, 0
 	if run {
-		ctx, cancel := context.WithCancel(context.Background())
-		done := make(chan struct{})
-		go func() { defer close(done); b.Run(ctx) }()
-		var once sync.Once
-		f.stop = func() { once.Do(func() { cancel(); <-done; _ = b.Close() }) }
-		f.t.Cleanup(f.stop)
+		f.run()
 	}
+}
+
+// run starts the worker of a binder built with run=false.
+func (f *fixture) run() {
+	b := f.b
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); b.Run(ctx) }()
+	var once sync.Once
+	f.stop = func() { once.Do(func() { cancel(); <-done; _ = b.Close() }) }
+	f.t.Cleanup(f.stop)
 }
 
 // restart stops the binder and starts another over the same catalog and

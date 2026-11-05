@@ -71,7 +71,7 @@ func (b *Binder) safeSave(ctx context.Context, v *volume, x uint64) (bool, error
 	if err != nil || n.Type != smartfolders.TypeRegular || n.Ino == x {
 		return false, nil
 	}
-	cont, err := b.replaced(ctx, v, x, n.Ino, m.from)
+	cont, err := b.replaced(ctx, v, x, n.Ino, m.from, true)
 	if err != nil || !cont {
 		return false, err
 	}
@@ -82,17 +82,19 @@ func (b *Binder) safeSave(ctx context.Context, v *volume, x uint64) (bool, error
 
 // replaced handles path p, last seen naming inode x and now naming y with
 // no event saying x left. If x is bound, has no visible name left, and was
-// replaced by a save, y continues x's asset. The evidence of a save is
-// timing: a rename over p, or the delete of a safe save's backup, sets x's
-// change time (JuiceFS keeps x's attributes in the trash), and the rename
-// that brings y in sets y's, so the two are within SaveWindow. A file
-// deleted unseen and a new one created at its path later (camera clip
-// names repeat) has no such evidence; nor has an x whose attributes are
-// gone (deleted for good, or a volume without a trash). Reports whether y
-// now carries x's asset; false leaves both to the usual handling: x's
-// records are retired and y is bound on its own. A replacement that is
-// not continued is counted (not_continued).
-func (b *Binder) replaced(ctx context.Context, v *volume, x, y uint64, p string) (bool, error) {
+// replaced by a save, y continues x's asset. A save is a rename onto p
+// (renamed: the event being handled is one, or the delete that completes
+// a safe save) received within SaveWindow of x's change time: JuiceFS sets
+// it at the rename over p, or at the backup's unlink, and keeps x's
+// attributes in the trash. y's own change time is not used: writes
+// committed after the rename (client write-back) move it. A file deleted
+// unseen and another created at its path (camera clip names repeat) is
+// not a save (not_continued_no_rename); nor is a rename long after x left,
+// or an x whose attributes are gone (deleted for good, or a volume without
+// a trash). Reports whether y now carries x's asset; false leaves both to
+// the usual handling: x's records are retired and y is bound on its own.
+// A replacement that is not continued is counted (not_continued).
+func (b *Binder) replaced(ctx context.Context, v *volume, x, y uint64, p string, renamed bool) (bool, error) {
 	xs, err := b.records(ctx, v, x)
 	if err != nil || xs.ino == nil {
 		return false, err
@@ -115,6 +117,11 @@ func (b *Binder) replaced(ctx context.Context, v *volume, x, y uint64, p string)
 		b.notContinue(p, "the new file has other names")
 		return false, nil
 	}
+	if !renamed {
+		b.noRename.Add(1)
+		b.notContinue(p, "no rename onto the path: a new file, not a save")
+		return false, nil
+	}
 	old, err := v.StatIno(x)
 	if gone(err) || errors.Is(err, syscall.EINVAL) {
 		b.notContinue(p, "the replaced file was deleted for good: no evidence of a save")
@@ -123,8 +130,8 @@ func (b *Binder) replaced(ctx context.Context, v *volume, x, y uint64, p string)
 	if err != nil {
 		return false, unknown(err)
 	}
-	if d := n.Ctime.Sub(old.Ctime).Abs(); d > b.cfg.SaveWindow {
-		b.notContinue(p, fmt.Sprintf("the replaced and the new file changed %s apart: not a save", d.Round(time.Second)))
+	if d := b.receivedAt.Sub(old.Ctime).Abs(); d > b.cfg.SaveWindow {
+		b.notContinue(p, fmt.Sprintf("the rename came %s after the replaced file left: not a save", d.Round(time.Second)))
 		return false, nil
 	}
 	var kind, blocked string
@@ -308,7 +315,10 @@ func (b *Binder) liveElsewhere(ctx context.Context, v *volume, asset continuity.
 func (b *Binder) planRestore(ctx context.Context, v *volume, ino uint64, s slot, name string) (*catalog.Operation, error) {
 	gen := s.gen + 1
 	if gen > MaxGenerations {
-		return nil, fmt.Errorf("continuity: inode %d has used all %d record pairs", ino, MaxGenerations)
+		// Left tombstoned, counted, no retry.
+		n := b.pairsExhausted.Add(1)
+		b.logEvery("pairs", "continuity: %d restored files left out of the catalog in total: inode %d has used all %d record pairs", n, ino, MaxGenerations)
+		return nil, nil
 	}
 	asset := generationAsset(v.uuid, ino, gen)
 	var changes []catalog.Change

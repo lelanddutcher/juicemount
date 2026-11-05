@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/juicedata/juicefs/pkg/meta"
 	"github.com/lelanddutcher/juicemount/internal/continuity"
 	"github.com/lelanddutcher/juicemount/internal/continuity/catalog"
 )
@@ -153,23 +154,55 @@ func TestAtomicSaveContinuesAsset(t *testing.T) {
 	}
 }
 
-// The replacement is noticed from the volume's state, not the event kind:
-// an update of the path handled before the rename (another client's event,
-// or a lagging queue) continues the asset, and the rename then changes
-// nothing.
-func TestAtomicSaveNoticedOutOfOrder(t *testing.T) {
+// Only a rename onto the path is a save. An update of the path handled
+// before the rename (another client's event) sees a new file where the old
+// one vanished: not continued, its own counter; the late rename then
+// changes nothing. (One client's events arrive in order.)
+func TestReplacementSeenWithoutRenameIsNotContinued(t *testing.T) {
 	f := newFixture(t, 0, true)
 	old := f.create("A/clip.mov")
 	f.feed(Event{Op: "create", Path: "A/clip.mov", Inode: old})
-	id := f.requireBound(old, "A/clip.mov", "clip.mov")
+	f.requireBound(old, "A/clip.mov", "clip.mov")
 	tmp := f.create("A/.clip.tmp")
 	f.rename("A/.clip.tmp", "A/clip.mov")
 	f.feed(Event{Op: "update", Path: "A/clip.mov", Inode: tmp})
-	f.requireCarries(tmp, "", id, "A/clip.mov")
+	f.requireRemoved(old)
+	f.requireBound(tmp, "A/clip.mov", "clip.mov")
 	n := f.events()
 	f.feed(Event{Op: "rename", Path: "A/clip.mov", OldPath: "A/.clip.tmp", Inode: tmp})
-	if f.events() != n || f.stats()["continued"] != 1 {
-		t.Fatalf("the late rename recorded %d operations: %v", f.events()-n, f.stats())
+	if s := f.stats(); f.events() != n || s["continued"] != 0 || s["not_continued"] != 1 || s["not_continued_no_rename"] != 1 {
+		t.Fatalf("the late rename recorded %d operations: %v", f.events()-n, s)
+	}
+}
+
+// Slow write-back: writes committed after the rename move the new file's
+// change time; the window runs from the replaced file's change time (set
+// by the rename) to when the rename's event was received.
+func TestAtomicSaveSurvivesWriteBack(t *testing.T) {
+	f := newFixtureWith(t, Config{SaveWindow: 200 * time.Millisecond}, true)
+	const doc = "A/edit.prproj"
+	old := f.create(doc)
+	f.feed(Event{Op: "create", Path: doc, Inode: old})
+	id := f.requireBound(old, doc, "edit.prproj")
+	// A worker that is not running yet holds the event once received.
+	f.stop()
+	f.start(false)
+	tmp := f.create("A/.edit.tmp")
+	f.rename("A/.edit.tmp", doc)
+	if !f.b.Offer(Event{Op: "rename", Path: doc, OldPath: "A/.edit.tmp", Inode: tmp}) {
+		t.Fatal("dropped")
+	}
+	time.Sleep(400 * time.Millisecond)
+	var attr meta.Attr // the write-back lands after the window
+	if st := f.admin.Truncate(f.ctx, meta.Ino(tmp), 0, 1<<20, &attr, true); st != 0 {
+		t.Fatal(st)
+	}
+	f.run()
+	f.waitHandled(1)
+	f.requireCarries(tmp, "", id, doc)
+	f.requireRemoved(old)
+	if s := f.stats(); s["continued"] != 1 || s["not_continued"] != 0 {
+		t.Fatalf("stats %v", s)
 	}
 }
 
@@ -238,13 +271,12 @@ func TestAtomicSaveMergesProvisionalAsset(t *testing.T) {
 // (Finder's replace), it keeps its own asset and the replaced file's is
 // retired, as before. Counted.
 func TestEstablishedFileMovedOverKeepsItsAsset(t *testing.T) {
-	var offset atomic.Int64
-	f := newFixtureWith(t, Config{Now: func() time.Time { return time.Now().Add(time.Duration(offset.Load())) }}, true)
+	f := newFixtureWith(t, Config{ProvisionalAge: 200 * time.Millisecond}, true)
 	old := f.create("A/clip.mov")
 	mine := f.create("B/clip.mov")
 	f.feed(Event{Op: "create", Path: "A/clip.mov", Inode: old}, Event{Op: "create", Path: "B/clip.mov", Inode: mine})
 	f.requireBound(old, "A/clip.mov", "clip.mov")
-	offset.Store(int64(2 * time.Hour))
+	time.Sleep(300 * time.Millisecond)
 	f.rename("B/clip.mov", "A/clip.mov")
 	f.feed(Event{Op: "rename", Path: "A/clip.mov", OldPath: "B/clip.mov", Inode: mine})
 	f.requireBound(mine, "A/clip.mov", "clip.mov")
@@ -437,19 +469,19 @@ func (f *fixture) waitConnected() {
 }
 
 // Review 1: only a save is continued. A file deleted without its event
-// being seen (it went to the trash) and a different file created at its
-// path later is not: camera clip names repeat. Nor is a replaced file
-// whose attributes are gone (deleted for good), or one seen only through
-// the paths seeded after a restart, long gone.
+// being seen and a different file created at its path (camera clip names
+// repeat) is not, however soon; nor a file renamed in long after the old
+// one left, after a restart too, or over a file deleted for good.
 func TestReplacementNeedsTimingEvidence(t *testing.T) {
 	for _, tc := range []struct {
-		name               string
-		skipTrash, restart bool
-		gap                time.Duration
+		name                       string
+		skipTrash, restart, rename bool
+		gap                        time.Duration
 	}{
-		{"in the trash, created later", false, false, 400 * time.Millisecond},
-		{"deleted for good", true, false, 0},
-		{"after a restart, created later", false, true, 400 * time.Millisecond},
+		{"created at once", false, false, false, 0},
+		{"renamed in later", false, false, true, 400 * time.Millisecond},
+		{"deleted for good, renamed in", true, false, true, 0},
+		{"after a restart, renamed in later", false, true, true, 400 * time.Millisecond},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newFixtureWith(t, Config{SaveWindow: 200 * time.Millisecond}, true)
@@ -463,11 +495,22 @@ func TestReplacementNeedsTimingEvidence(t *testing.T) {
 				f.restart()
 			}
 			time.Sleep(tc.gap)
-			other := f.create(clip)
-			f.feed(Event{Op: "create", Path: clip, Inode: other})
+			var other uint64
+			if tc.rename {
+				other = f.create("Cards/.A001C001.mov.part")
+				f.rename("Cards/.A001C001.mov.part", clip)
+				f.feed(Event{Op: "rename", Path: clip, OldPath: "Cards/.A001C001.mov.part", Inode: other})
+			} else {
+				other = f.create(clip)
+				f.feed(Event{Op: "create", Path: clip, Inode: other})
+			}
 			f.requireBound(other, clip, "A001C001.mov")
 			f.requireRemoved(old)
-			if s := f.stats(); s["continued"] != 0 || s["not_continued"] != 1 {
+			noRename := uint64(1)
+			if tc.rename {
+				noRename = 0
+			}
+			if s := f.stats(); s["continued"] != 0 || s["not_continued"] != 1 || s["not_continued_no_rename"] != noRename {
 				t.Fatalf("stats %v", s)
 			}
 		})
@@ -527,5 +570,22 @@ func TestRestoredReplacedFileGetsItsOwnAsset(t *testing.T) {
 	onlyOther := func(p string) bool { return path.Dir(p) == "Other" }
 	if a, err := f.b.CheckAccess(context.Background(), id, onlyOther); err != nil || a.Allowed || a.Name != doc {
 		t.Fatalf("one inode of two decided access: %+v, %v", a, err)
+	}
+}
+
+// A restore needing a pair past MaxGenerations plans nothing and is
+// counted once per event, not failed (and retried) on every event.
+func TestRestorePastLastPairIsCounted(t *testing.T) {
+	f := newFixture(t, 0, true)
+	ino := f.create("A/x.mov")
+	f.feed(Event{Op: "create", Path: "A/x.mov", Inode: ino})
+	s, err := f.b.records(context.Background(), f.b.vol.Load(), ino)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.gen = MaxGenerations
+	op, err := f.b.planRestore(context.Background(), f.b.vol.Load(), ino, s, "A/x.mov")
+	if op != nil || err != nil || f.stats()["pairs_exhausted"] != 1 {
+		t.Fatalf("plan %+v, %v; stats %v", op, err, f.stats())
 	}
 }

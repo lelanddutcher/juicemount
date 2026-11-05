@@ -50,7 +50,8 @@ const (
 	// file carries on (README.md).
 	RestoredFrom = "continuity:restored-from"
 	// MaxGenerations bounds an inode's record pairs after its first
-	// (GenerationID); a change needing another is counted as failed.
+	// (GenerationID): a merge needing another falls back (not_continued), a
+	// restore leaves the file out of the catalog (pairs_exhausted).
 	MaxGenerations = 8
 
 	maxHintBytes     = 4096 // longer paths are not catalogued
@@ -65,8 +66,8 @@ const (
 	// defaultProvisionalAge: a file bound this recently, under its own
 	// asset, may be merged into the asset of the file it replaced.
 	defaultProvisionalAge = time.Hour
-	// defaultSaveWindow: a replaced file's and its replacement's change
-	// times must be this close for the replacement to continue its asset.
+	// defaultSaveWindow: the rename onto a path must be received this close
+	// to the replaced file's change time for the new file to continue it.
 	defaultSaveWindow = 2 * time.Minute
 	maxMoves          = 1024
 )
@@ -130,8 +131,8 @@ type Config struct {
 	// SafeSaveWindow bounds a safe save's rename-away, rename-in and delete
 	// (default 30 s); ProvisionalAge is how recently a replacing file must
 	// have been bound for its asset to be merged (default 1 h); SaveWindow
-	// is how close the replaced and the new file's change times must be
-	// (default 2 min). README.md.
+	// is how close to the replaced file's change time the rename onto its
+	// path must be received (default 2 min). README.md.
 	SafeSaveWindow time.Duration
 	ProvisionalAge time.Duration
 	SaveWindow     time.Duration
@@ -149,7 +150,7 @@ type volume struct {
 type Binder struct {
 	cfg     Config
 	library continuity.LibraryID
-	queue   chan Event
+	queue   chan queued
 	vol     atomic.Pointer[volume]
 	ready   chan struct{} // closed when the first SUBSCRIBE is acknowledged
 
@@ -163,9 +164,11 @@ type Binder struct {
 	// Worker-only: files just renamed to a sibling name (a safe save's
 	// backup), by inode.
 	moves map[uint64]move
+	// Worker-only: when Offer received the event being handled.
+	receivedAt time.Time
 
 	received, handled, dropped, discarded, applied, ignored, failed, retried, unresolved, tooManyLinks, resubscribes atomic.Uint64
-	continued, merged, notContinued                                                                                  atomic.Uint64
+	continued, merged, notContinued, noRename, pairsExhausted                                                        atomic.Uint64
 
 	observedSince atomic.Int64 // unix nanoseconds
 
@@ -209,7 +212,7 @@ func New(cfg Config) (*Binder, error) {
 	return &Binder{
 		cfg:     cfg,
 		library: library,
-		queue:   make(chan Event, cfg.QueueSize),
+		queue:   make(chan queued, cfg.QueueSize),
 		ready:   make(chan struct{}),
 		paths:   newPathCache(cfg.PathCacheSize),
 		moves:   map[uint64]move{},
@@ -227,7 +230,7 @@ func (b *Binder) Offer(ev Event) bool {
 	b.received.Add(1)
 	if !b.disabled.Load() && !b.stopped.Load() {
 		select {
-		case b.queue <- ev:
+		case b.queue <- queued{ev, b.cfg.Now()}:
 			return true
 		default:
 		}
@@ -256,8 +259,8 @@ func (b *Binder) Run(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
-		case ev := <-b.queue:
-			b.handle(ctx, v, ev)
+		case q := <-b.queue:
+			b.handle(ctx, v, q)
 		}
 	}
 }
@@ -394,8 +397,16 @@ func operationID(v *volume, ino uint64, kind string, inoSeq, hintSeq int64) stri
 	return fmt.Sprintf("jfs-%s-%d-%s-%d-%d", v.uuid, ino, kind, inoSeq, hintSeq)
 }
 
-func (b *Binder) handle(ctx context.Context, v *volume, ev Event) {
+// queued is an event and when Offer received it.
+type queued struct {
+	ev Event
+	at time.Time
+}
+
+func (b *Binder) handle(ctx context.Context, v *volume, q queued) {
 	defer b.handled.Add(1)
+	ev := q.ev
+	b.receivedAt = q.at
 	var err error
 	for attempt := 0; ; attempt++ {
 		if err = b.apply(ctx, v, ev); !errors.Is(err, errUnknown) || attempt == len(eventRetries) {
@@ -431,11 +442,11 @@ func (b *Binder) apply(ctx context.Context, v *volume, ev Event) error {
 		}
 		old, renamed := cleanPath(ev.OldPath)
 		if !renamed || ev.Op != "rename" {
-			return b.observe(ctx, v, p)
+			return b.observe(ctx, v, p, false)
 		}
 		moved, known := b.paths.get(old)
 		b.paths.remove(old)
-		err := b.observe(ctx, v, p)
+		err := b.observe(ctx, v, p, true)
 		if known && old != p && path.Dir(old) == path.Dir(p) {
 			b.noteMove(moved, old, p)
 		}
@@ -450,8 +461,9 @@ func (b *Binder) apply(ctx context.Context, v *volume, ev Event) error {
 
 // observe syncs the regular file now at p: binding it when p is visible,
 // and updating (or retiring) an already bound file that moved to a hidden
-// name, such as a Finder .Trashes folder.
-func (b *Binder) observe(ctx context.Context, v *volume, p string) error {
+// name, such as a Finder .Trashes folder. renamed: the event is a rename
+// onto p.
+func (b *Binder) observe(ctx context.Context, v *volume, p string, renamed bool) error {
 	n, err := v.LookupIno(p)
 	if gone(err) {
 		// Changed again since the event: a later event names it.
@@ -474,7 +486,7 @@ func (b *Binder) observe(ctx context.Context, v *volume, p string) error {
 	}
 	if prev, ok := b.paths.get(p); ok && prev != n.Ino {
 		// p named prev and no event said prev left: a rename over it.
-		cont, err := b.replaced(ctx, v, prev, n.Ino, p)
+		cont, err := b.replaced(ctx, v, prev, n.Ino, p, renamed)
 		if err != nil {
 			return err
 		}
