@@ -175,7 +175,13 @@ func TestCatalogCanonicalParentAndEscapedPath(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if s.path != filepath.Join(real, filepath.Base(path)) {
+	// The temporary directory itself may sit behind a symlink (macOS
+	// /var -> /private/var), so the expectation is resolved too.
+	canonicalReal, err := filepath.EvalSymlinks(real)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.path != filepath.Join(canonicalReal, filepath.Base(path)) {
 		t.Fatalf("parent not canonical: %s", s.path)
 	}
 	if err := s.Close(); err != nil {
