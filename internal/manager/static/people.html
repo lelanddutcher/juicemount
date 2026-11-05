@@ -44,11 +44,23 @@ Refused writes fail on the Mac as a read-only error. Reading is not limited.</p>
   <tbody id="devices"></tbody>
 </table>
 
+<div id="agentSection" style="display:none">
+<h2>Agent tokens</h2>
+<p class="note">A person mints an agent token on their own Mac for an AI agent (the JuiceMount MCP server). It finds files
+and edits collections as that person, within their grants, and never reads file contents. It stops working when it
+expires, is revoked, or its Mac is revoked or given to someone else, or its person is removed.</p>
+<table>
+  <thead><tr><th>Token</th><th>Person</th><th>Minted on</th><th>Created</th><th>Expires</th><th></th></tr></thead>
+  <tbody id="agentTokens"></tbody>
+</table>
+</div>
+
 <h2>Who changed what</h2>
 <p class="note">The proxy's audit log, newest first. It starts when the first person is added. File contents are
 summarized per file and 10-second window.</p>
 <p class="note" id="auditState"></p>
 <div class="row">
+  <select id="fLog"><option value="">Files (the proxy's log)</option><option value="catalog">Agent tokens and agents' catalog edits</option></select>
   <select id="fPerson"><option value="">Everyone</option></select>
   <input id="fProject" placeholder="Folder, e.g. /Clients/A">
   <button id="search">Show</button><button id="verify">Verify log</button><span id="verifyOut"></span>
@@ -131,7 +143,23 @@ summarized per file and 10-second window.</p>
     f.innerHTML = '<option value="">Everyone</option>' + people.map(function (p) { return '<option value="' + esc(p.id) + '">' + esc(p.name) + '</option>'; }).join('');
     f.value = cur;
   }
-  function load() { api('GET', 'people').then(render, fail); }
+  function load() { api('GET', 'people').then(render, fail); loadTokens(); }
+  function loadTokens() {
+    // 404 while continuity (JM_CONTINUITY) is off: no section.
+    var h = { 'Content-Type': 'application/json' };
+    if (key) h['X-JuiceMount-Admin-Key'] = key;
+    fetch('api/agent-tokens', { headers: h }).then(function (r) {
+      if (!r.ok) { document.getElementById('agentSection').style.display = 'none'; return; }
+      return r.json().then(function (body) {
+        document.getElementById('agentSection').style.display = '';
+        document.getElementById('agentTokens').innerHTML = (body.agent_tokens || []).map(function (t) {
+          return '<tr><td>' + esc(t.name) + '<br><code>' + esc(t.id) + '</code></td><td>' + esc(t.person_name || t.person) + '</td>' +
+            '<td><code>' + esc(t.mac) + '</code></td><td>' + when(t.created_at_ms) + '</td><td>' + when(t.expires_at_ms) + '</td>' +
+            '<td><button class="danger" data-revoke-token="' + esc(t.id) + '">Revoke</button></td></tr>';
+        }).join('') || '<tr><td colspan="6" class="note">No agent tokens.</td></tr>';
+      });
+    }, function () {});
+  }
 
   document.getElementById('add').onclick = function () {
     var n = document.getElementById('newName');
@@ -143,6 +171,10 @@ summarized per file and 10-second window.</p>
     if (d.ungrant) change('ungrant', { id: d.ungrant, path: d.path });
     if (d.rename) { var n = window.prompt('New name', nameOf(d.rename)); if (n) change('update', { id: d.rename, name: n }); }
     if (d['delete'] && window.confirm('Remove ' + nameOf(d['delete']) + '? Their Macs are left with no person: while grants are in force they can read but not write until you assign them.')) change('delete', { id: d['delete'] });
+    if (d.revokeToken && window.confirm('Revoke agent token ' + d.revokeToken + '? The agent using it stops at once.')) {
+      errBox.textContent = '';
+      api('POST', 'agent-tokens/' + d.revokeToken + '/revoke').then(loadTokens, fail);
+    }
     if (d.policy && window.confirm('Let Macs that belong to no person write everywhere again? This has an effect only while no person is limited to grants.')) change('policy', { restrict_unassigned: false });
   });
   document.body.addEventListener('change', function (ev) {
@@ -156,6 +188,7 @@ summarized per file and 10-second window.</p>
     if (r.type === 'gap') return 'log gap: ' + esc(r.dropped) + ' records lost';
     if (r.type === 'open') return 'log opened';
     if (r.type === 'retention') return 'older records removed: ' + esc(r.detail);
+    if (r.detail) return esc(r.action || '') + '<br>' + esc(r.detail);
     var ops = (r.ops || []).filter(function (o) { return !o.trash; }).map(function (o) {
       return esc(o.op) + ' <code>' + esc(o.path || (o.parent + '/' + o.name)) + '</code>';
     }).join('<br>');
@@ -167,6 +200,8 @@ summarized per file and 10-second window.</p>
   function audit(reset) {
     if (reset) { next = 0; outcomes = {}; document.getElementById('audit').innerHTML = ''; }
     var q = 'audit?limit=100&type=intent,outcome,refused,modified,gap,retention';
+    var lg = document.getElementById('fLog').value;
+    if (lg) q += '&log=' + encodeURIComponent(lg);
     var p = document.getElementById('fPerson').value, f = document.getElementById('fProject').value.trim();
     if (p) q += '&person=' + encodeURIComponent(p);
     if (f) q += '&project=' + encodeURIComponent(f);
@@ -179,7 +214,8 @@ summarized per file and 10-second window.</p>
         if (r.type === 'outcome') return;
         var res = r.type === 'refused' ? '<span class="note-bad">refused ' + esc(r.reason) + '</span>'
           : r.type === 'intent' ? (outcomes[r.seq] ? esc(outcomes[r.seq].outcome) : 'no outcome recorded') : '';
-        rows += '<tr><td>' + when(r.ts_ms) + '</td><td>' + esc(r.person_name || r.person || '') + ' <code>' + esc(r.principal || '') + '</code></td>' +
+        var agent = r.agent ? ' via agent ' + esc(r.agent_name) + ' <code>' + esc(r.agent) + '</code>' : '';
+        rows += '<tr><td>' + when(r.ts_ms) + '</td><td>' + esc(r.person_name || r.person || '') + ' <code>' + esc(r.principal || '') + '</code>' + agent + '</td>' +
           '<td>' + what(r) + '</td><td>' + (r.projects || []).map(function (x) { return '<code>' + esc(x.path || x.ino) + '</code>'; }).join(' ') + '</td><td>' + res + '</td></tr>';
       });
       document.getElementById('audit').insertAdjacentHTML('beforeend', rows);
@@ -188,6 +224,7 @@ summarized per file and 10-second window.</p>
     }, fail);
   }
   document.getElementById('search').onclick = function () { audit(true); };
+  document.getElementById('fLog').onchange = function () { audit(true); };
   document.getElementById('older').onclick = function () { audit(false); };
   document.getElementById('verify').onclick = function () {
     api('GET', 'audit/verify?full=1').then(function (r) {

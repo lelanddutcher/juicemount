@@ -183,6 +183,44 @@ queries, a person at most 32. The continuity catalog stays at format 3 (still
 readable by a Manager from before saved queries) until the first query is
 created.
 
+**Agent discovery (experimental, needs `JM_CONTINUITY=on`; smart folders
+not required).** A person can let an AI agent (the JuiceMount MCP server on
+their Mac) find files and edit collections as them. They mint an agent token
+from one of their own approved Macs (`POST /api/agent-tokens` with the Mac's
+collection credentials, `{name, expires_in_days}`; at most 90 days, the
+default, and 10 live tokens a person). The token (`jma_...`) is shown once;
+the principal store keeps only its hash. It is sent as
+`Authorization: Bearer jma_...` and works only on an allowlist: listing and
+reading collections and their members, creating and renaming collections and
+adding or removing members (within the person's grants, as for their Mac),
+listing saved queries and their results, and the two discovery routes below.
+Every other route answers 403, including deleting a collection, query
+changes, people, enrollment and anything that moves or returns file bytes.
+A token stops working at once when it expires or is revoked, its person is
+removed, or the Mac that minted it is revoked, flagged as cloned, unassigned
+or given to someone else (it does not come back if that is undone). The
+person lists and revokes their tokens from a Mac (`GET /api/agent-tokens`,
+`POST /api/agent-tokens/{id}/revoke`); the admin lists and revokes any (the
+same routes with the admin key, and the People page). Mints, revokes and
+every agent edit are recorded in the catalog audit log (`catalog-audit/`
+beside the principal store; `GET /api/audit?log=catalog`) with the person,
+the minting Mac and the token; a mint or an agent edit is refused if the log
+cannot record it first.
+
+`GET /api/continuity/find` pages through the catalogued files (admin key, a
+Mac's credentials or an agent token) with filters `name` (a fragment,
+ignoring case), `folder` (repeatable), `collection`, `modified_after` (RFC
+3339 or unix ms), `seen_after` (a catalog sequence), `ext` and `kind`
+(`video`, `audio`, `image`, `project`, `document`), `limit` (default 50, at
+most 200) and `cursor` (the previous answer's `next`). Each result has the
+asset ID, current name, first label, the catalog's path hint, the current
+path under the mount root, size, modification time and its collections. A
+person (or their agent) sees only files their grants cover. A request reads
+at most 100,000 catalog hints and resolves at most 1,000 files on the
+volume; a page cut short says `budget_exhausted` and its `next` continues
+it. `GET /api/continuity/asset/{asset_id}` returns one file (404 when it is
+gone or outside the caller's grants).
+
 Known gaps:
 
 - Recency comes from the Macs' change events on the `juicemount:metadata`
