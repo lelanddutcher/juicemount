@@ -16,6 +16,10 @@ var (
 	ErrClosed          = errors.New("catalog closed")
 	ErrFormat          = errors.New("invalid or corrupt catalog format")
 	ErrUpgradeRequired = errors.New("catalog requires explicit schema upgrade")
+	// ErrNewerFormat: the catalog is ours (application ID) but a newer format
+	// than this binary knows; a newer JuiceMount wrote it. Not ErrFormat:
+	// nothing says it is damaged, and it is refused unchanged.
+	ErrNewerFormat = errors.New("catalog was written in a newer format")
 )
 
 const (
@@ -45,6 +49,7 @@ type Change struct {
 	PutLocation        *PutLocation
 	RemoveLocation     *RemoveLocation
 	// Format 3.
+	ExpectCollection       *ExpectCollection
 	CreateCollection       *CreateCollection
 	RenameCollection       *RenameCollection
 	RemoveCollection       *RemoveCollection

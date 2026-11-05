@@ -72,6 +72,16 @@ type RemoveCollectionMember struct {
 	AssetID      continuity.AssetID `json:"asset_id"`
 }
 
+// ExpectCollection changes nothing: it requires the collection to be active
+// at UpdatedSequence. A host that authorized a change against that state puts
+// it first, so the operation fails (ErrConflict) if the collection or its
+// membership moved since. Every member change that alters a row moves the
+// collection's UpdatedSequence.
+type ExpectCollection struct {
+	CollectionID    CollectionID `json:"collection_id"`
+	UpdatedSequence int64        `json:"updated_sequence"`
+}
+
 // Collection includes tombstones; Members counts active members.
 type Collection struct {
 	LibraryID       continuity.LibraryID

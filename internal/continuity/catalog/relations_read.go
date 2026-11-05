@@ -160,3 +160,38 @@ func (s *Store) ListLocations(ctx context.Context, library continuity.LibraryID,
 	}
 	return result, nil
 }
+
+// ListLocationRecords is ListLocations including tombstones: the last
+// recorded value of every location the asset ever had.
+func (s *Store) ListLocationRecords(ctx context.Context, library continuity.LibraryID, asset continuity.AssetID, afterID string, limit int) ([]Location, error) {
+	if err := s.enter(); err != nil {
+		return nil, err
+	}
+	defer s.leave()
+	if err := s.requireLibrary(library); err != nil {
+		return nil, err
+	}
+	if asset.Validate() != nil || !validPage(limit) || (afterID != "" && !validOperationID(afterID)) {
+		return nil, invalid("location page")
+	}
+	if _, err := readAsset(ctx, s.db, library, asset); err != nil {
+		return nil, err
+	}
+	rows, err := s.db.QueryContext(ctx, locationSelect+` WHERE l.asset_id=? AND l.location_id>? ORDER BY l.location_id LIMIT ?`, asset, afterID, limit)
+	if err != nil {
+		return nil, formatError(err)
+	}
+	defer rows.Close()
+	result := make([]Location, 0, limit)
+	for rows.Next() {
+		l, err := scanLocation(rows, library)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, l)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, formatError(err)
+	}
+	return result, nil
+}

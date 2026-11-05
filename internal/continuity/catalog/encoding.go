@@ -38,6 +38,7 @@ type changeJSON struct {
 	PutLocation        *PutLocation        `json:"put_location,omitempty"`
 	RemoveLocation     *RemoveLocation     `json:"remove_location,omitempty"`
 	// Format 3.
+	ExpectCollection       *ExpectCollection       `json:"expect_collection,omitempty"`
 	CreateCollection       *CreateCollection       `json:"create_collection,omitempty"`
 	RenameCollection       *RenameCollection       `json:"rename_collection,omitempty"`
 	RemoveCollection       *RemoveCollection       `json:"remove_collection,omitempty"`
@@ -125,7 +126,7 @@ func freezeOperation(op Operation) (Operation, []byte, string, error) {
 		if change.RemoveLocation != nil {
 			count++
 		}
-		for _, set := range []bool{change.CreateCollection != nil, change.RenameCollection != nil, change.RemoveCollection != nil,
+		for _, set := range []bool{change.ExpectCollection != nil, change.CreateCollection != nil, change.RenameCollection != nil, change.RemoveCollection != nil,
 			change.AddCollectionMember != nil, change.RemoveCollectionMember != nil} {
 			if set {
 				count++
@@ -210,6 +211,12 @@ func freezeOperation(op Operation) (Operation, []byte, string, error) {
 				return Operation{}, nil, "", err
 			}
 			frozen.Changes[i].RemoveLocation, wire.Changes[i].RemoveLocation = &c, &c
+		case change.ExpectCollection != nil:
+			c := *change.ExpectCollection
+			if c.CollectionID.Validate() != nil || c.UpdatedSequence <= 0 {
+				return Operation{}, nil, "", invalid("expect collection")
+			}
+			frozen.Changes[i].ExpectCollection, wire.Changes[i].ExpectCollection = &c, &c
 		case change.CreateCollection != nil:
 			c := *change.CreateCollection
 			if c.CollectionID.Validate() != nil || !validCollectionName(c.Name) {
@@ -284,6 +291,7 @@ func decodeOperation(data []byte) (Operation, error) {
 		op.Changes[i] = Change{CreateAsset: c.CreateAsset, RenameAsset: c.RenameAsset, AdvanceHead: c.AdvanceHead}
 		op.Changes[i].PutRelationship, op.Changes[i].RemoveRelationship = c.PutRelationship, c.RemoveRelationship
 		op.Changes[i].PutLocation, op.Changes[i].RemoveLocation = c.PutLocation, c.RemoveLocation
+		op.Changes[i].ExpectCollection = c.ExpectCollection
 		op.Changes[i].CreateCollection, op.Changes[i].RenameCollection, op.Changes[i].RemoveCollection = c.CreateCollection, c.RenameCollection, c.RemoveCollection
 		op.Changes[i].AddCollectionMember, op.Changes[i].RemoveCollectionMember = c.AddCollectionMember, c.RemoveCollectionMember
 		if c.RecordRevision != nil {

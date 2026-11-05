@@ -36,7 +36,6 @@ func triggerDDL(name string) string {
 func TestCatalogRefusesUnrecognizedAndChangedFormats(t *testing.T) {
 	for name, statements := range map[string][]string{
 		"foreign app":                  {`PRAGMA application_id=42`},
-		"newer schema":                 {`PRAGMA user_version=4`},
 		"missing table":                {`DROP TABLE revision_parents`},
 		"missing immutable trigger":    {`DROP TRIGGER events_no_update`},
 		"extra table":                  {`CREATE TABLE unrelated(value TEXT)`},

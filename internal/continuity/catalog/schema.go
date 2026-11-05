@@ -205,8 +205,11 @@ func recognizeSchema(ctx context.Context, q queryer, initializing bool) (continu
 	if err := q.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&version); err != nil {
 		return "", 0, formatError(err)
 	}
-	if app != applicationID || version < 1 || version > schemaVersion {
+	if app != applicationID || version < 1 {
 		return "", 0, corrupt("unsupported application or schema version")
+	}
+	if version > schemaVersion {
+		return "", 0, fmt.Errorf("%w: format %d, this binary reads up to %d", ErrNewerFormat, version, schemaVersion)
 	}
 	rows, err := q.QueryContext(ctx, `SELECT type,name,tbl_name,sql FROM sqlite_schema WHERE NOT(type='index' AND substr(name,1,17)='sqlite_autoindex_' AND sql IS NULL) ORDER BY name`)
 	if err != nil {

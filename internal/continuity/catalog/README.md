@@ -28,7 +28,9 @@ fingerprints. New format 3 catalogs record the same supported lineage; these
 entries do not claim runtime upgrades occurred. Format 2 (slice 1) is format 1
 with the open ledger, relationships and locations; format 3 adds collections. A ledger
 alone cannot validate changed DDL. Unknown, foreign, newer, incomplete, corrupt,
-or constraint-invalid databases are refused without repair or replacement.
+or constraint-invalid databases are refused without repair or replacement. A
+catalog with this application ID and a newer user version returns
+`ErrNewerFormat` (not `ErrFormat`: nothing says it is damaged).
 Open performs version/DDL/ledger/identity/integrity preflight in one deferred
 transaction on a separate read-only connection before obtaining a write pool
 and enabling WAL. A recognized complete, integrity-valid format 1 catalog returns
@@ -76,7 +78,12 @@ and 1–256 ordered changes. Exactly one pointer variant is required per change:
   member or removing an inactive one leaves the row unchanged, so the request
   alone decides the result. Rows are never deleted; reactivation keeps the
   creation sequence. An operation that leaves a collection above 10,000 active
-  members fails with `ErrCollectionFull`.
+  members fails with `ErrCollectionFull`. A member change that alters a row
+  also moves the collection's updated sequence.
+- `ExpectCollection`: changes nothing; conflicts unless the collection is
+  active at the given updated sequence. A host that authorized a change
+  against that state puts it first, so the change fails if the collection or
+  its membership moved meanwhile.
 
 Changes and one event commit in a single immediate transaction. A failed change
 rolls back the entire batch without reserving an operation ID or event sequence.
@@ -160,7 +167,8 @@ read-only, I/O, full and cannot-open failures are returned unwrapped, without
 ErrFormat: they say nothing about the catalog's contents and may be retried.
 
 Relationship lists select active inbound/outbound edges for an existing asset,
-with self edges once. Location lists select active observations for their owner.
+with self edges once. Location lists select active observations for their owner;
+`ListLocationRecords` also returns tombstones with their last values.
 Both use exclusive lexicographic ID cursors and the same 1–1000 page bound.
 Their one-statement joins verify endpoints and optional revision membership.
 Before disclosure, a permission service must constrain both endpoints, traversal,

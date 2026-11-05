@@ -512,3 +512,105 @@ func TestCollectionPortability(t *testing.T) {
 		t.Fatalf("format 3 header without collections: %v", err)
 	}
 }
+
+func TestCollectionExpectSequenceGuardsMembership(t *testing.T) {
+	ctx := context.Background()
+	s := collectionStore(t)
+	created := applyTest(t, s, testOperation("c", Change{CreateCollection: &CreateCollection{CollectionID: testCollection, Name: "A"}},
+		Change{AddCollectionMember: &AddCollectionMember{CollectionID: testCollection, AssetID: testAsset}}))
+	seen := getCollection(t, s, testCollection).UpdatedSequence
+	if seen != created.Sequence {
+		t.Fatalf("sequence after create: %d", seen)
+	}
+	expect := Change{ExpectCollection: &ExpectCollection{CollectionID: testCollection, UpdatedSequence: seen}}
+	// A no-op member change moves nothing, so the expectation still holds.
+	applyTest(t, s, testOperation("noop", Change{AddCollectionMember: &AddCollectionMember{CollectionID: testCollection, AssetID: testAsset}},
+		Change{RemoveCollectionMember: &RemoveCollectionMember{CollectionID: testCollection, AssetID: otherAsset}}))
+	if got := getCollection(t, s, testCollection).UpdatedSequence; got != seen {
+		t.Fatalf("no-op member change moved the sequence: %d", got)
+	}
+	// A real membership change moves it: a rename authorized before it fails.
+	added := applyTest(t, s, testOperation("add", Change{AddCollectionMember: &AddCollectionMember{CollectionID: testCollection, AssetID: otherAsset}}))
+	if got := getCollection(t, s, testCollection).UpdatedSequence; got != added.Sequence {
+		t.Fatalf("membership change: sequence %d, want %d", got, added.Sequence)
+	}
+	rename := testOperation("rename", expect, Change{RenameCollection: &RenameCollection{CollectionID: testCollection, Name: "B"}})
+	if _, err := s.Apply(ctx, rename); !errors.Is(err, ErrConflict) || getCollection(t, s, testCollection).Name != "A" {
+		t.Fatalf("stale expectation: %v", err)
+	}
+	removed := applyTest(t, s, testOperation("remove", Change{RemoveCollectionMember: &RemoveCollectionMember{CollectionID: testCollection, AssetID: otherAsset}}))
+	if got := getCollection(t, s, testCollection).UpdatedSequence; got != removed.Sequence {
+		t.Fatalf("member removal: sequence %d, want %d", got, removed.Sequence)
+	}
+	rename.ID = "rename-2"
+	rename.Changes[0].ExpectCollection.UpdatedSequence = removed.Sequence
+	first := applyTest(t, s, rename)
+	// An exact retry still returns the original receipt after the state moved.
+	if again := applyTest(t, s, rename); again != first {
+		t.Fatalf("retry: %+v", again)
+	}
+	if _, err := s.Apply(ctx, testOperation("bad", Change{ExpectCollection: &ExpectCollection{CollectionID: testCollection}})); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("zero expectation: %v", err)
+	}
+	gone := testOperation("gone", Change{ExpectCollection: &ExpectCollection{CollectionID: otherCollection, UpdatedSequence: 1}})
+	if _, err := s.Apply(ctx, gone); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("missing collection: %v", err)
+	}
+}
+
+func TestCatalogRefusesNewerFormatAsNewer(t *testing.T) {
+	ctx := context.Background()
+	s, path := newTestStore(t)
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	editFixture(t, path, `PRAGMA user_version=4`)
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if opened, err := Open(path); !errors.Is(err, ErrNewerFormat) || errors.Is(err, ErrFormat) {
+		if opened != nil {
+			opened.Close()
+		}
+		t.Fatalf("Open: %v", err)
+	}
+	if _, _, err := Inspect(ctx, path); !errors.Is(err, ErrNewerFormat) {
+		t.Fatalf("Inspect: %v", err)
+	}
+	if err := Upgrade(ctx, path, testLibrary); !errors.Is(err, ErrNewerFormat) {
+		t.Fatalf("Upgrade: %v", err)
+	}
+	if after, err := os.ReadFile(path); err != nil || !bytes.Equal(before, after) {
+		t.Fatalf("newer catalog changed: %v", err)
+	}
+	// Another application's file is still a format error.
+	editFixture(t, path, `PRAGMA application_id=42`)
+	if _, _, err := Inspect(ctx, path); !errors.Is(err, ErrFormat) || errors.Is(err, ErrNewerFormat) {
+		t.Fatalf("foreign file: %v", err)
+	}
+}
+
+func TestListLocationRecordsIncludesTombstones(t *testing.T) {
+	ctx := context.Background()
+	path := v2Fixture(t)
+	if err := Upgrade(ctx, path, testLibrary); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	active, err := s.ListLocations(ctx, testLibrary, otherAsset, "", 10)
+	if err != nil || len(active) != 1 {
+		t.Fatalf("active: %+v %v", active, err)
+	}
+	all, err := s.ListLocationRecords(ctx, testLibrary, otherAsset, "", 10)
+	if err != nil || len(all) != 2 || all[0].ID != "jfs-clip" || all[1].ID != "jfs-clip-hint" || !all[1].Removed || all[1].Value.Locator != "Clients/A/clip.mov" {
+		t.Fatalf("records: %+v %v", all, err)
+	}
+	if page, err := s.ListLocationRecords(ctx, testLibrary, otherAsset, "jfs-clip", 1); err != nil || len(page) != 1 || page[0].ID != "jfs-clip-hint" {
+		t.Fatalf("cursor: %+v %v", page, err)
+	}
+}

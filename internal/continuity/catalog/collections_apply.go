@@ -32,6 +32,19 @@ func activeCollection(ctx context.Context, tx *sql.Tx, library string, id Collec
 func (s *Store) applyCollectionChange(ctx context.Context, tx *sql.Tx, c Change, sequence int64) error {
 	library := string(s.library)
 	switch {
+	case c.ExpectCollection != nil:
+		v := c.ExpectCollection
+		if err := activeCollection(ctx, tx, library, v.CollectionID); err != nil {
+			return err
+		}
+		var current int64
+		if err := tx.QueryRowContext(ctx, `SELECT updated_sequence FROM collections WHERE collection_id=?`, v.CollectionID).Scan(&current); err != nil {
+			return formatError(err)
+		}
+		if current != v.UpdatedSequence {
+			return fmt.Errorf("%w: collection changed at sequence %d", ErrConflict, current)
+		}
+		return nil
 	case c.CreateCollection != nil:
 		v := c.CreateCollection
 		result, err := tx.ExecContext(ctx, `INSERT INTO collections(collection_id,library_id,name,created_sequence,updated_sequence,removed) VALUES(?,?,?,?,?,0) ON CONFLICT(collection_id) DO NOTHING`,
@@ -61,21 +74,35 @@ func (s *Store) applyCollectionChange(ctx context.Context, tx *sql.Tx, c Change,
 		if _, err := readAsset(ctx, tx, s.library, v.AssetID); err != nil {
 			return err
 		}
-		_, err := tx.ExecContext(ctx, `INSERT INTO collection_members(collection_id,asset_id,created_sequence,updated_sequence,removed) VALUES(?,?,?,?,0)
+		result, err := tx.ExecContext(ctx, `INSERT INTO collection_members(collection_id,asset_id,created_sequence,updated_sequence,removed) VALUES(?,?,?,?,0)
  ON CONFLICT(collection_id,asset_id) DO UPDATE SET removed=0,updated_sequence=excluded.updated_sequence WHERE removed=1`,
 			v.CollectionID, v.AssetID, sequence, sequence)
-		return err
+		return touchCollection(ctx, tx, v.CollectionID, sequence, result, err)
 	case c.RemoveCollectionMember != nil:
 		v := c.RemoveCollectionMember
 		if err := activeCollection(ctx, tx, library, v.CollectionID); err != nil {
 			return err
 		}
-		_, err := tx.ExecContext(ctx, `UPDATE collection_members SET removed=1,updated_sequence=? WHERE collection_id=? AND asset_id=? AND removed=0`,
+		result, err := tx.ExecContext(ctx, `UPDATE collection_members SET removed=1,updated_sequence=? WHERE collection_id=? AND asset_id=? AND removed=0`,
 			sequence, v.CollectionID, v.AssetID)
-		return err
+		return touchCollection(ctx, tx, v.CollectionID, sequence, result, err)
 	default:
 		return invalid("unknown change")
 	}
+}
+
+// touchCollection moves the collection's UpdatedSequence when a member row
+// changed, so a membership change is visible to ExpectCollection.
+func touchCollection(ctx context.Context, tx *sql.Tx, id CollectionID, sequence int64, result sql.Result, err error) error {
+	if err != nil {
+		return err
+	}
+	n, err := result.RowsAffected()
+	if err != nil || n == 0 {
+		return err
+	}
+	result, err = tx.ExecContext(ctx, `UPDATE collections SET updated_sequence=? WHERE collection_id=? AND removed=0`, sequence, id)
+	return changedOne(result, err)
 }
 
 // checkCollectionLimits runs once per operation, after every change, on the
@@ -106,6 +133,6 @@ func checkCollectionLimits(ctx context.Context, tx *sql.Tx, op Operation) error 
 }
 
 func isCollectionChange(c Change) bool {
-	return c.CreateCollection != nil || c.RenameCollection != nil || c.RemoveCollection != nil ||
+	return c.ExpectCollection != nil || c.CreateCollection != nil || c.RenameCollection != nil || c.RemoveCollection != nil ||
 		c.AddCollectionMember != nil || c.RemoveCollectionMember != nil
 }

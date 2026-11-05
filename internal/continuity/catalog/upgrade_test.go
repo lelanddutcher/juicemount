@@ -327,7 +327,6 @@ func TestCatalogMigrationRollbackAndConcurrentUpgraders(t *testing.T) {
 
 func TestCatalogUpgradeRefusesWrongIncompleteAndUnsafeTargets(t *testing.T) {
 	for name, statements := range map[string][]string{
-		"unknown version":     {`PRAGMA user_version=4`},
 		"foreign application": {`PRAGMA application_id=17`},
 		"altered DDL":         {`CREATE TABLE unrelated(value TEXT)`},
 		"incomplete v1":       {`DROP TRIGGER catalog_no_update`, `UPDATE catalog SET ready=0`, triggerDDL("catalog_no_update")},
