@@ -1687,7 +1687,13 @@ func (d *Drainer) DrainOnceForTest(ctx context.Context) int {
 	case <-doneCh:
 	case <-ctx.Done():
 		stacks := make([]byte, 1<<20)
-		stacks = stacks[:runtime.Stack(stacks, true)]
+		for n := runtime.Stack(stacks, true); ; n = runtime.Stack(stacks, true) {
+			if n < len(stacks) {
+				stacks = stacks[:n]
+				break
+			}
+			stacks = make([]byte, 2*len(stacks)) // a full buffer may have cut the dump short
+		}
 		panic("DrainOnceForTest: ctx expired before in-flight drains completed; pass a longer context or check for a stalled FUSE call\n\n" + string(stacks))
 	}
 	// Lever 1: workers enqueue into the coalescer instead of committing inline,

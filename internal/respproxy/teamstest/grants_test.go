@@ -313,6 +313,7 @@ func TestAuditSinkFailure(t *testing.T) {
 		ctx := meta.Background()
 		var ino meta.Ino
 		var attr meta.Attr
+		errsBefore := e.proxy.AuditErrors()
 		e.failSink.Store(true)
 		// The first record after the failure is the one that finds it.
 		admin.Mkdir(ctx, e.ino["/Clients/D"], "probe", 0o755, 0o022, 0, &ino, &attr)
@@ -331,14 +332,18 @@ func TestAuditSinkFailure(t *testing.T) {
 		}
 		e.healSink.Store(true)
 		waitHealthy(t, e.audit)
+		refused := e.proxy.AuditErrors() - errsBefore
 		if st := john.Mkdir(ctx, e.ino["/Clients/A"], "j2", 0o755, 0o022, 0, &ino, &attr); st != 0 {
 			t.Fatalf("john mkdir after recovery: %v", st)
 		}
 		// One gap record counts the failure. A record the proxy's flush
-		// appends while that gap is being written is refused too, and a
-		// second gap record, written right after, counts it.
+		// appends while that gap is being written is refused too, and at
+		// most one more gap record, written right after, counts it. Every
+		// record the proxy saw refused is counted; the gaps count more only
+		// for records the log took without a wait and then lost.
 		gaps := e.records(auditlog.Filter{Types: []string{auditlog.TypeGap}})
 		failures := 0
+		var dropped uint64
 		for _, g := range gaps {
 			if g.Dropped == 0 {
 				t.Fatalf("empty gap record: %+v", gaps)
@@ -346,9 +351,10 @@ func TestAuditSinkFailure(t *testing.T) {
 			if !strings.HasSuffix(g.Detail, "; refused while the log was recovering") {
 				failures++
 			}
+			dropped += g.Dropped
 		}
-		if failures != 1 {
-			t.Fatalf("gap records = %+v, want one for the failure", gaps)
+		if failures != 1 || len(gaps) > 2 || refused <= 0 || dropped < uint64(refused) {
+			t.Fatalf("gap records = %+v (counting %d), want one for the failure and at most one more, counting at least the %d refused records", gaps, dropped, refused)
 		}
 		if rep, err := auditlog.Verify(e.auditDir); err != nil || !rep.OK {
 			t.Fatalf("verify: %+v %v", rep, err)

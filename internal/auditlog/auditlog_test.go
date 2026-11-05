@@ -251,6 +251,157 @@ func TestRecoveryCountsRecordsRefusedWhileItsGapIsWritten(t *testing.T) {
 	}
 }
 
+// Appends that keep arriving while the sink heals do not keep the writer
+// recovering: it takes records again after one gap write, every refusal is
+// counted exactly once, and at most two gap records cover the failure.
+func TestRecoveryEndsUnderSteadyAppends(t *testing.T) {
+	dir := t.TempDir()
+	var broken atomic.Bool
+	w := mustOpen(t, dir, Options{RetryEvery: 20 * time.Millisecond, BeforeWrite: func() error {
+		if broken.Load() {
+			return errors.New("disk full (injected)")
+		}
+		time.Sleep(2 * time.Millisecond) // a modest fsync
+		return nil
+	}})
+	appendN(t, w, 2, "p-1")
+	if err := w.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	broken.Store(true)
+	if _, err := w.Append(&Record{Type: TypeIntent}); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Sync(); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("Sync during failure = %v, want ErrUnavailable", err)
+	}
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	var refused atomic.Uint64
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				if _, err := w.Append(&Record{Type: TypeIntent}); errors.Is(err, ErrUnavailable) {
+					refused.Add(1)
+				} else if err != nil {
+					t.Error(err)
+					return
+				}
+				time.Sleep(200 * time.Microsecond)
+			}
+		}()
+	}
+	time.Sleep(50 * time.Millisecond)
+	broken.Store(false)
+	deadline := time.Now().Add(5 * time.Second)
+	for !w.Healthy() && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	healthy := w.Healthy()
+	close(stop)
+	wg.Wait()
+	w.Close()
+	if !healthy {
+		t.Fatalf("writer still failed 5 s after the sink healed, with %d Appends refused", refused.Load())
+	}
+	mustVerify(t, dir)
+	p, err := Query(dir, Filter{Types: []string{TypeGap}}, 0, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sum uint64
+	for _, g := range p.Records {
+		sum += g.Dropped
+	}
+	// The record queued when the sink failed, and every refusal.
+	if want := refused.Load() + 1; len(p.Records) == 0 || len(p.Records) > 2 || sum != want {
+		t.Fatalf("%d gap records counting %d lost, want 1 or 2 counting %d", len(p.Records), sum, want)
+	}
+}
+
+// The gap record queued for Appends refused during recovery is lost when
+// its own write fails: its count goes to the next gap record, not one lost
+// record, and an Append the healthy writer took meanwhile is still written.
+func TestRecoveryGapSurvivesItsOwnFailedWrite(t *testing.T) {
+	dir := t.TempDir()
+	var w *Writer
+	var broken, heal atomic.Bool
+	var healed, refused atomic.Int32 // writes since the sink healed; refusals then
+	var kept atomic.Uint64
+	w = mustOpen(t, dir, Options{RetryEvery: 20 * time.Millisecond, BeforeWrite: func() error {
+		if broken.Load() {
+			if heal.Load() { // the next attempt starts after every refusal
+				broken.Store(false)
+			}
+			return errors.New("disk full (injected)")
+		}
+		if !heal.Load() {
+			return nil
+		}
+		switch healed.Add(1) {
+		case 1: // the recovery's gap record, written while still failed
+			for i := 0; i < 2; i++ {
+				if _, err := w.Append(&Record{Type: TypeIntent}); errors.Is(err, ErrUnavailable) {
+					refused.Add(1)
+				}
+			}
+		case 2: // the gap record for those two, queued once healthy
+			if seq, err := w.Append(&Record{Type: TypeIntent}); err == nil {
+				kept.Store(seq)
+			}
+			return errors.New("disk full again (injected)")
+		}
+		return nil
+	}})
+	appendN(t, w, 2, "p-1")
+	if err := w.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	broken.Store(true)
+	if _, err := w.Append(&Record{Type: TypeIntent}); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Sync(); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("Sync during failure = %v, want ErrUnavailable", err)
+	}
+	heal.Store(true)
+	deadline := time.Now().Add(5 * time.Second)
+	for (!w.Healthy() || healed.Load() < 3) && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !w.Healthy() || healed.Load() < 3 {
+		t.Fatalf("writer did not recover twice (healthy=%v, writes since healing=%d)", w.Healthy(), healed.Load())
+	}
+	w.Close()
+	mustVerify(t, dir)
+	if refused.Load() != 2 || kept.Load() == 0 {
+		t.Fatalf("refused %d (want 2), kept seq %d (want one)", refused.Load(), kept.Load())
+	}
+	p, _ := Query(dir, Filter{Types: []string{TypeGap}}, 0, 10)
+	var sum uint64
+	for _, g := range p.Records {
+		sum += g.Dropped
+	}
+	if len(p.Records) != 2 || sum != 3 {
+		t.Fatalf("gap records = %+v, want two counting 3 (the lost record and both refusals)", p.Records)
+	}
+	q, _ := Query(dir, Filter{Types: []string{TypeIntent}}, 0, 100)
+	found := false
+	for _, r := range q.Records {
+		found = found || r.Seq == kept.Load()
+	}
+	if !found {
+		t.Fatalf("the Append taken during the failed gap write (seq %d) is not in the log", kept.Load())
+	}
+}
+
 // Open on a directory that cannot be created still returns a Writer: it
 // starts failed and recovers once the directory can be made.
 func TestOpenFailureStartsFailedAndRecovers(t *testing.T) {
