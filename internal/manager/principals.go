@@ -273,6 +273,12 @@ func (s *PrincipalStore) withObjectKey(r EnrollResponse, rec *MacPrincipal) Enro
 	}
 	ak, sk := s.opts.ObjectKey()
 	if ak != "" && sk != "" {
+		if !rec.SharedKeyIssued {
+			// Never hand out the shared key unrecorded: a later revoke must
+			// know this Mac holds it (sharedkey.go). The Mac asks again.
+			log.Printf("manager: principal %s: shared object key withheld: its issue could not be recorded", rec.Name)
+			return r
+		}
 		r.ObjectAccessKey, r.ObjectSecretKey = ak, sk
 	}
 	return r
@@ -417,6 +423,14 @@ type MacPrincipal struct {
 	// the store does not know (a restored store). They work at MinIO until
 	// the admin removes them.
 	ObjKeyOrphans []string `json:"obj_key_orphans,omitempty"`
+	// SharedKeyIssued: this Manager handed (or, approved, will hand) this Mac
+	// the shared jm-client key. Set in the same store write as the approval,
+	// before any answer carries the key; it stays after a later per-Mac key,
+	// because the Mac still knows the shared one (sharedkey.go).
+	SharedKeyIssued bool `json:"shared_key_issued,omitempty"`
+	// SharedKeyChecked: a revoke of this record has been accounted for in
+	// the shared-key holder list (sharedkey.go adoptLegacyRevokesLocked).
+	SharedKeyChecked bool `json:"shared_key_checked,omitempty"`
 	// SharedKeyHeld (Snapshot only): this Mac holds the shared jm-client
 	// key, so revoking it leaves that key working at the object store
 	// (sharedkey.go).
@@ -457,6 +471,10 @@ type PrincipalsSnapshot struct {
 	// rotated on the server (the pending "rotate the shared storage key"
 	// action; sharedkey.go).
 	SharedKeyStillValid []SharedKeyHolder `json:"shared_key_still_valid,omitempty"`
+	// SharedKeyProblem: why listed Macs are not cleared although the
+	// Manager's shared key has changed (the object store has not confirmed
+	// the rotation).
+	SharedKeyProblem string `json:"shared_key_problem,omitempty"`
 	// Revoked: set only in the answer to a revoke.
 	Revoked *RevokeResult `json:"revoked,omitempty"`
 }
@@ -544,6 +562,10 @@ type PrincipalStoreOptions struct {
 	// ObjectKey is never handed out.
 	PerMacKeys bool
 	ObjKeysDir string
+	// ObjectStoreProbe asks the object store whether a key works; it is the
+	// only proof that clears a revoked Mac's shared key (sharedkey.go). nil
+	// = no proof: such Macs stay listed.
+	ObjectStoreProbe ObjectStoreProbe
 }
 
 // PrincipalStore holds Mac enrollments and renders the proxy's files.
@@ -584,8 +606,10 @@ type PrincipalStore struct {
 	keepObjGens         map[string]int
 	keepObjOrphans      []string
 	keepObjOrphanRemove []ObjKeyRemoval
-	// sharedHolders: revoked Macs given the shared object key (sharedkey.go).
+	// sharedHolders: revoked Macs given the shared object key; sharedProof:
+	// the object store's last answer about a rotation (sharedkey.go).
 	sharedHolders []sharedKeyHolder
+	sharedProof   sharedKeyProof
 
 	// people (people.go): by ID. proxyFormat: the principals file version
 	// the proxy last advertised (0 = not yet known). peopleWritten: the
@@ -845,6 +869,9 @@ func NewPrincipalStore(opts PrincipalStoreOptions) (*PrincipalStore, error) {
 	if err := s.loadManagerID(); err != nil {
 		return nil, err
 	}
+	if err := s.adoptSharedKeyStateOnLoad(); err != nil {
+		return nil, err
+	}
 	if opts.ProxyDir != "" {
 		s.mu.Lock()
 		err := s.writeProxyFilesLocked()
@@ -936,6 +963,7 @@ func (s *PrincipalStore) Enroll(req EnrollRequest, sourceIP string) (EnrollRespo
 		}
 		s.noteDeviceLocked(rec, req.DeviceDigest)
 		s.noteInUseLocked(s.recs[name], req.ObjectKeyInUse)
+		s.noteSharedKeyIssuedLocked(s.recs[name])
 		return s.withObjectKey(EnrollResponse{Status: rec.Status, Principal: name, Fingerprint: rec.Fingerprint}, s.recs[name]), nil
 	}
 
@@ -984,6 +1012,7 @@ func (s *PrincipalStore) Enroll(req EnrollRequest, sourceIP string) (EnrollRespo
 			if s.objk != nil && req.ObjectKeyInUse != "" {
 				p.ObjKeyInUse = req.ObjectKeyInUse
 			}
+			s.markSharedKeyIssuedLocked(p)
 			resp = s.withObjectKey(EnrollResponse{Status: p.Status, Principal: name, Fingerprint: p.Fingerprint, PollToken: token}, p)
 			return false, nil
 		})
@@ -1032,6 +1061,7 @@ func (s *PrincipalStore) Enroll(req EnrollRequest, sourceIP string) (EnrollRespo
 		rec.Status = PrincipalApproved
 		rec.DecidedAt = now.UnixMilli()
 		rec.AutoApproved = true
+		s.markSharedKeyIssuedLocked(rec)
 		s.autoUsed++
 		s.autoPerIP[sourceIP]++
 	} else if s.pendingCountLocked() >= s.opts.MaxPending || s.pendingFromIPLocked(sourceIP) >= maxPendingPerIP {
@@ -1420,6 +1450,7 @@ func (s *PrincipalStore) Approve(name string) error {
 		if p.Status == PrincipalApproved {
 			// Confirming an auto-approved Mac clears it from the review list.
 			p.AutoApproved = false
+			s.markSharedKeyIssuedLocked(p)
 			return s.inheritPersonLocked(p), nil
 		}
 		if s.objk != nil && !objKeyDeliverable(p) {
@@ -1431,6 +1462,7 @@ func (s *PrincipalStore) Approve(name string) error {
 		p.Status = PrincipalApproved
 		p.DecidedAt = s.opts.Now().UnixMilli()
 		p.AutoApproved = false
+		s.markSharedKeyIssuedLocked(p)
 		s.inheritPersonLocked(p)
 		return true, nil
 	})
@@ -1473,6 +1505,7 @@ func (s *PrincipalStore) RevokeWithResult(name string) (RevokeResult, error) {
 			s.sharedHolders = s.withSharedKeyHolderLocked(cur, now)
 		}
 		next.Status = PrincipalRevoked
+		next.SharedKeyChecked = true
 		next.AutoApproved = false
 		next.AutoApprovePending = false
 		next.DecidedAt = now
@@ -1653,6 +1686,7 @@ func (s *PrincipalStore) snapshotLocked(withSecrets bool) PrincipalsSnapshot {
 	}
 	if !withSecrets {
 		out.SharedKeyStillValid = s.sharedKeyHolderViewLocked()
+		out.SharedKeyProblem = s.sharedKeyProblemLocked(s.sharedKeyHoldersLocked())
 	}
 	if s.objk != nil && !withSecrets {
 		out.PerMacKeys = true
@@ -2287,17 +2321,30 @@ func (a *API) registerH8B(mux *http.ServeMux, prefix string, cfg Config) {
 				log.Printf("manager: ERROR: JM_OBJ_PER_MAC=1 but JM_OBJKEYS_DIR is not set; no Mac can be approved until it is")
 			}
 		}
+		var probe ObjectStoreProbe
+		if u := objectStoreBucketURL(); u != "" {
+			probe = NewObjectStoreProbe(u, "")
+		}
 		st, err := NewPrincipalStore(PrincipalStoreOptions{
-			StatePath:  statePath,
-			ProxyDir:   strings.TrimSpace(os.Getenv("JM_RESPPROXY_DIR")),
-			ObjectKey:  clientObjectKey,
-			PerMacKeys: perMac,
-			ObjKeysDir: objDir,
+			StatePath:        statePath,
+			ProxyDir:         strings.TrimSpace(os.Getenv("JM_RESPPROXY_DIR")),
+			ObjectKey:        clientObjectKey,
+			PerMacKeys:       perMac,
+			ObjKeysDir:       objDir,
+			ObjectStoreProbe: probe,
 		})
 		if err != nil {
 			log.Printf("manager: principal enrollment unavailable: %v", err)
 		} else {
 			pa.store = st
+			if probe != nil {
+				stopVerify := st.StartSharedKeyVerifier()
+				if onSharedKeyVerifierStart != nil {
+					onSharedKeyVerifierStart(stopVerify)
+				}
+			} else {
+				log.Printf("manager: no object-store address (JM_MINIO_URL and JM_VOL_NAME, or JM_OBJ_BUCKET_URL): a revoked Mac's shared object key cannot be confirmed rotated, so it stays listed")
+			}
 			if perMac {
 				log.Printf("manager: per-Mac object keys ON (minio-keyd directory %q)", objDir)
 				stop := st.StartObjKeyReconciler()
@@ -2458,6 +2505,20 @@ func objectStoreEnv() []string {
 		return nil
 	}
 	return []string{"MINIO_ACCESS_KEY=" + ak, "MINIO_SECRET_KEY=" + sk}
+}
+
+// objectStoreBucketURL is the volume's bucket for the shared-key rotation
+// check: JM_OBJ_BUCKET_URL, else JM_MINIO_URL/JM_VOL_NAME (the canonical
+// compose formats the volume into the bucket of its name). "" = none.
+func objectStoreBucketURL() string {
+	if u := strings.TrimSpace(os.Getenv("JM_OBJ_BUCKET_URL")); u != "" {
+		return u
+	}
+	base, vol := strings.TrimSpace(os.Getenv("JM_MINIO_URL")), strings.TrimSpace(os.Getenv("JM_VOL_NAME"))
+	if base == "" || vol == "" {
+		return ""
+	}
+	return strings.TrimRight(base, "/") + "/" + vol
 }
 
 // clientObjectKey is the no-delete jm-client key handed to approved Macs.

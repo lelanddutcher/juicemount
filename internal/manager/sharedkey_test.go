@@ -1,13 +1,47 @@
 package manager
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 )
+
+// fakeMinIO answers ObjectStoreProbe like MinIO: one secret per user.
+type fakeMinIO struct {
+	mu    sync.Mutex
+	users map[string]string
+	down  bool
+}
+
+func (m *fakeMinIO) set(ak, sk string) { m.mu.Lock(); m.users[ak] = sk; m.mu.Unlock() }
+func (m *fakeMinIO) del(ak string)     { m.mu.Lock(); delete(m.users, ak); m.mu.Unlock() }
+
+func (m *fakeMinIO) probe(_ context.Context, ak, sk string) (string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.down {
+		return "", errors.New("connection refused")
+	}
+	want, ok := m.users[ak]
+	switch {
+	case !ok:
+		return "InvalidAccessKeyId", nil
+	case want != sk:
+		return "SignatureDoesNotMatch", nil
+	}
+	return "", nil
+}
 
 // sharedKeyRig is a shared-key-mode store (JM_OBJ_PER_MAC off) whose
 // configured jm-client key the test can change, as a Manager recreated
@@ -17,6 +51,7 @@ type sharedKeyRig struct {
 	statePath string
 	proxyDir  string
 	ak, sk    string
+	minio     *fakeMinIO
 	s         *PrincipalStore
 }
 
@@ -24,7 +59,8 @@ func newSharedKeyRig(t *testing.T) *sharedKeyRig {
 	t.Helper()
 	dir := t.TempDir()
 	r := &sharedKeyRig{t: t, statePath: filepath.Join(dir, "store", "principals-store.json"),
-		proxyDir: filepath.Join(dir, "respproxy"), ak: testClientAK, sk: testClientSK}
+		proxyDir: filepath.Join(dir, "respproxy"), ak: testClientAK, sk: testClientSK,
+		minio: &fakeMinIO{users: map[string]string{testClientAK: testClientSK}}}
 	if err := os.MkdirAll(r.proxyDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -33,16 +69,23 @@ func newSharedKeyRig(t *testing.T) *sharedKeyRig {
 	return r
 }
 
-// open (re)starts the Manager's store with the key configured now.
+// open (re)starts the Manager's store. Its key is the rig's ak/sk (the
+// Manager's environment; changing it without open is a test shortcut).
 func (r *sharedKeyRig) open() {
 	r.t.Helper()
-	ak, sk := r.ak, r.sk
 	s, err := NewPrincipalStore(PrincipalStoreOptions{StatePath: r.statePath, ProxyDir: r.proxyDir,
-		ObjectKey: func() (string, string) { return ak, sk }})
+		ObjectKey: func() (string, string) { return r.ak, r.sk }, ObjectStoreProbe: r.minio.probe})
 	if err != nil {
 		r.t.Fatal(err)
 	}
 	r.s = s
+}
+
+// verify runs one rotation check and returns the page's list.
+func (r *sharedKeyRig) verify() PrincipalsSnapshot {
+	r.t.Helper()
+	r.s.VerifySharedKeyRotation(context.Background())
+	return r.s.Snapshot()
 }
 
 // approved enrolls Mac i and approves it; it returns its name and poll token.
@@ -152,25 +195,40 @@ func TestRevokeSharedKeyReportsStillValid(t *testing.T) {
 	}
 }
 
-// After the operator rotates JM_OBJ_CLIENT_SECRET_KEY and recreates the
-// Manager, the pending rotation clears, a remaining approved Mac gets the
-// new key at its next poll, and the revoked Mac gets nothing.
-func TestRevokeSharedKeyClearsAfterRotation(t *testing.T) {
+// A new secret in the Manager's environment clears nothing: only the object
+// store's own answer does (a signed request with the new key succeeds, so
+// its one secret for the user is no longer the old one). A remaining
+// approved Mac gets the new key at its next poll; the revoked Mac nothing.
+func TestRevokeSharedKeyClearsOnlyOnObjectStoreProof(t *testing.T) {
 	r := newSharedKeyRig(t)
 	a, aTok := r.approved(1)
 	b, bTok := r.approved(2)
 	if _, err := r.s.RevokeWithResult(a); err != nil {
 		t.Fatal(err)
 	}
-	if got := stillValidNames(r.s.Snapshot()); len(got) != 1 {
-		t.Fatalf("pending rotation lists %v", got)
-	}
 
+	// Step order gone wrong: the Manager runs with the new secret, MinIO
+	// still has the old one.
 	const rotated = "rotatedsecret0123456789abcdef0123456789"
 	r.sk = rotated
 	r.open()
-	if got := r.s.Snapshot().SharedKeyStillValid; len(got) != 0 {
-		t.Fatalf("after rotation the page still lists %+v", got)
+	snap := r.verify()
+	if got := stillValidNames(snap); len(got) != 1 || got[0] != a {
+		t.Fatalf("Manager key changed, MinIO not: page lists %v, want [%s]", got, a)
+	}
+	if !strings.Contains(snap.SharedKeyProblem, "SignatureDoesNotMatch") {
+		t.Fatalf("problem = %q, want the object store's refusal", snap.SharedKeyProblem)
+	}
+	// MinIO changed but unreachable: still no proof.
+	r.minio.set(testClientAK, rotated)
+	r.minio.down = true
+	if got := stillValidNames(r.verify()); len(got) != 1 {
+		t.Fatalf("object store unreachable: page lists %v, want [%s]", got, a)
+	}
+	r.minio.down = false
+	snap = r.verify()
+	if len(snap.SharedKeyStillValid) != 0 || snap.SharedKeyProblem != "" {
+		t.Fatalf("after a confirmed rotation the page lists %+v (%q)", snap.SharedKeyStillValid, snap.SharedKeyProblem)
 	}
 	if got := r.poll(2, bTok); got.Status != PrincipalApproved || got.ObjectAccessKey != testClientAK || got.ObjectSecretKey != rotated {
 		t.Fatalf("remaining Mac %s poll = %+v, want the rotated key", b, got)
@@ -178,21 +236,190 @@ func TestRevokeSharedKeyClearsAfterRotation(t *testing.T) {
 	if got := r.poll(1, aTok); got.ObjectAccessKey != "" || got.ObjectSecretKey != "" {
 		t.Fatalf("revoked Mac poll = %+v, want no key", got)
 	}
-	// A revoke after the rotation reports the rotated key as still valid
-	// for that Mac (it was given the new one).
-	if res, err := r.s.RevokeWithResult(b); err != nil || res.ObjectKey != RevokeObjectKeyStillValid {
-		t.Fatalf("revoke after rotation = %+v, %v; want still_valid", res, err)
+	// The old secret put back at MinIO only: a's copy works again.
+	r.minio.set(testClientAK, testClientSK)
+	if got := stillValidNames(r.verify()); len(got) != 1 || got[0] != a {
+		t.Fatalf("old secret back at MinIO: page lists %v, want [%s]", got, a)
 	}
-	if got := stillValidNames(r.s.Snapshot()); len(got) != 1 || got[0] != b {
-		t.Fatalf("pending rotation lists %v, want [%s]", got, b)
+}
+
+// Renaming the shared access key proves nothing (minio-keys keeps the old
+// user): the Mac stays listed until the object store reports the old access
+// key unknown.
+func TestRevokeSharedKeyAccessKeyRename(t *testing.T) {
+	r := newSharedKeyRig(t)
+	a, _ := r.approved(1)
+	if _, err := r.s.RevokeWithResult(a); err != nil {
+		t.Fatal(err)
 	}
-	// Back to the old key (an older server/.env restored, so minio-keys
-	// sets the old secret again): a's copy works again and is listed again;
-	// b was given only the rotated key, which no longer works.
-	r.sk = testClientSK
+	r.ak, r.sk = "jm-client2", "renamedsecret0123456789abcdef0123456789"
+	r.minio.set(r.ak, r.sk)
 	r.open()
-	if got := stillValidNames(r.s.Snapshot()); len(got) != 1 || got[0] != a {
-		t.Fatalf("under the old key the page lists %v, want [%s]", got, a)
+	snap := r.verify()
+	if got := stillValidNames(snap); len(got) != 1 || got[0] != a || snap.SharedKeyStillValid[0].AccessKey != testClientAK {
+		t.Fatalf("renamed key: page lists %+v, want %s on %s", snap.SharedKeyStillValid, a, testClientAK)
+	}
+	if !strings.Contains(snap.SharedKeyProblem, "old access key "+testClientAK) {
+		t.Fatalf("problem = %q", snap.SharedKeyProblem)
+	}
+	r.minio.del(testClientAK)
+	if got := r.verify().SharedKeyStillValid; len(got) != 0 {
+		t.Fatalf("old user removed: page lists %+v", got)
+	}
+}
+
+// A Mac approved while the Manager handed out the shared key still knows it
+// after it got its own per-Mac key.
+func TestRevokeSharedKeyIssuedSurvivesPerMacKey(t *testing.T) {
+	setObjectKeyEnv(t)
+	r := newObjRig(t)
+	off, err := NewPrincipalStore(PrincipalStoreOptions{StatePath: r.statePath, ProxyDir: r.proxyDir, ObjectKey: clientObjectKey})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.s = off
+	name, tok := r.enroll(7)
+	if err := off.Approve(name); err != nil {
+		t.Fatal(err)
+	}
+	if got := r.poll(7, tok); got.ObjectAccessKey != testClientAK {
+		t.Fatalf("shared mode poll = %+v", got)
+	}
+	r.open()
+	r.keydUp()
+	r.waitFor("backfill", func() bool { return r.rec(name).ObjKeyState == ObjKeyActive })
+	res, err := r.s.RevokeWithResult(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.ObjectKey != RevokeObjectKeyStillValid {
+		t.Fatalf("revoke of a Mac given the shared key, now on its own key = %+v, want still_valid", res)
+	}
+}
+
+// The shared key is never handed out before its issue is recorded.
+func TestSharedKeyNotHandedOutUnrecorded(t *testing.T) {
+	r := newSharedKeyRig(t)
+	r.ak, r.sk = "", ""
+	a, tok := r.approved(1)
+	r.ak, r.sk = testClientAK, testClientSK // configured without a restart
+	if err := os.Remove(r.statePath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(r.statePath, "x"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if got := r.poll(1, tok); got.ObjectAccessKey != "" || got.ObjectSecretKey != "" {
+		t.Fatalf("poll with an unwritable store = %+v, want no key", got)
+	}
+	if err := os.RemoveAll(r.statePath); err != nil {
+		t.Fatal(err)
+	}
+	if got := r.poll(1, tok); got.ObjectSecretKey != testClientSK {
+		t.Fatalf("poll = %+v, want the key once recorded", got)
+	}
+	if res, err := r.s.RevokeWithResult(a); err != nil || res.ObjectKey != RevokeObjectKeyStillValid {
+		t.Fatalf("revoke = %+v, %v; want still_valid", res, err)
+	}
+}
+
+// Macs revoked by an earlier Manager (no holder records) are listed once,
+// as legacy entries; later revokes of pending requests are not.
+func TestRevokeSharedKeyLegacyRevokes(t *testing.T) {
+	r := newSharedKeyRig(t)
+	a, _ := r.approved(1)
+	b, _ := r.enroll(2)
+	for _, n := range []string{a, b} {
+		if err := r.s.Revoke(n); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// What an earlier Manager would have stored: no holders, no marks.
+	raw, err := os.ReadFile(r.statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var f map[string]any
+	if err := json.Unmarshal(raw, &f); err != nil {
+		t.Fatal(err)
+	}
+	delete(f, "shared_key_holders")
+	for _, p := range f["principals"].([]any) {
+		m := p.(map[string]any)
+		delete(m, "shared_key_checked")
+		delete(m, "shared_key_issued")
+	}
+	raw, _ = json.Marshal(f)
+	if err := os.WriteFile(r.statePath, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	r.open()
+	snap := r.s.Snapshot()
+	if len(snap.SharedKeyStillValid) != 2 || !snap.SharedKeyStillValid[0].Legacy || !snap.SharedKeyStillValid[1].Legacy {
+		t.Fatalf("legacy revokes: page lists %+v, want both as legacy", snap.SharedKeyStillValid)
+	}
+	r.open()
+	if got := r.s.Snapshot().SharedKeyStillValid; len(got) != 2 {
+		t.Fatalf("after a second start: %+v, want the same two", got)
+	}
+	// A pending request rejected by this Manager is accounted for: not listed.
+	c, _ := r.enroll(3)
+	if err := r.s.Revoke(c); err != nil {
+		t.Fatal(err)
+	}
+	r.open()
+	if got := r.s.Snapshot().SharedKeyStillValid; len(got) != 2 {
+		t.Fatalf("a rejected request was listed: %+v", got)
+	}
+}
+
+// The probe signs with AWS signature V4 and reports the S3 error code.
+func TestObjectStoreProbeSignsAndParses(t *testing.T) {
+	users := map[string]string{"jm-client": "probesecret0123456789abcdef0123456789ab"}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		auth := req.Header.Get("Authorization")
+		_, rest, _ := strings.Cut(auth, "Credential=")
+		ak, _, _ := strings.Cut(rest, "/")
+		sk, ok := users[ak]
+		if req.URL.Path != "/zpool" || req.URL.Query().Get("list-type") != "2" {
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`<Error><Code>NoSuchBucket</Code></Error>`))
+			return
+		}
+		if !ok {
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`<?xml version="1.0"?><Error><Code>InvalidAccessKeyId</Code></Error>`))
+			return
+		}
+		at, err := time.Parse("20060102T150405Z", req.Header.Get("X-Amz-Date"))
+		if err != nil {
+			t.Errorf("X-Amz-Date: %v", err)
+		}
+		again, _ := http.NewRequest(req.Method, "http://"+req.Host+req.URL.RequestURI(), nil)
+		again.Header.Set("X-Amz-Content-Sha256", req.Header.Get("X-Amz-Content-Sha256"))
+		_ = v4.NewSigner().SignHTTP(context.Background(), aws.Credentials{AccessKeyID: ak, SecretAccessKey: sk}, again,
+			emptyPayloadSHA256, "s3", "us-east-1", at)
+		if again.Header.Get("Authorization") != auth {
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`<Error><Code>SignatureDoesNotMatch</Code></Error>`))
+			return
+		}
+		_, _ = w.Write([]byte(`<ListBucketResult></ListBucketResult>`))
+	}))
+	defer srv.Close()
+	probe := NewObjectStoreProbe(srv.URL+"/zpool", "")
+	for _, c := range []struct{ ak, sk, want string }{
+		{"jm-client", users["jm-client"], ""},
+		{"jm-client", "wrongsecret0123456789abcdef0123456789ab", "SignatureDoesNotMatch"},
+		{"jm-gone", "x", "InvalidAccessKeyId"},
+	} {
+		code, err := probe(context.Background(), c.ak, c.sk)
+		if err != nil || code != c.want {
+			t.Fatalf("probe(%s) = %q, %v; want %q", c.ak, code, err, c.want)
+		}
+	}
+	if _, err := NewObjectStoreProbe("http://127.0.0.1:1/zpool", "")(context.Background(), "jm-client", "x"); err == nil {
+		t.Fatal("unreachable object store: no error")
 	}
 }
 
@@ -330,7 +557,7 @@ func TestRevokeSharedKeyHTTPAndPage(t *testing.T) {
 	if got := stillValidNames(snap); len(got) != 1 || got[0] != name {
 		t.Fatalf("revoke answer lists %v", got)
 	}
-	if strings.Contains(rr.Body.String(), testClientSK) || strings.Contains(rr.Body.String(), "key_check") {
+	if strings.Contains(rr.Body.String(), testClientSK) || strings.Contains(rr.Body.String(), "secret_check") {
 		t.Fatalf("revoke answer leaks the key or its check value: %s", rr.Body)
 	}
 	rr = doJSON(t, mux, http.MethodGet, "/api/principals", h8bTestAdminKey, nil)
@@ -343,9 +570,56 @@ func TestRevokeSharedKeyHTTPAndPage(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, want := range []string{"shared_key_still_valid", "shared_key_held", "r.revoked.object_key === 'still_valid'",
-		"Its storage key will STILL WORK", "Rotate the shared storage key", "Rotating the shared object key"} {
+		"Its storage key will STILL WORK", "Rotate the shared storage key", "Rotating the shared object key",
+		"s.shared_key_problem", "sharedKeyLegacy", "Restarting the Manager with a new key alone clears nothing"} {
 		if !strings.Contains(string(raw), want) {
 			t.Fatalf("principals.html does not render %q", want)
 		}
+	}
+}
+
+// The background verifier confirms a rotation without an admin action; a
+// Manager without an object-store address says why nothing clears.
+func TestSharedKeyVerifierAndWiring(t *testing.T) {
+	r := newSharedKeyRig(t)
+	a, _ := r.approved(1)
+	if err := r.s.Revoke(a); err != nil {
+		t.Fatal(err)
+	}
+	const rotated = "rotatedsecret0123456789abcdef0123456789"
+	r.sk = rotated
+	r.minio.set(testClientAK, rotated)
+	r.open()
+	stop := r.s.StartSharedKeyVerifier()
+	defer stop()
+	deadline := time.Now().Add(5 * time.Second)
+	for len(r.s.Snapshot().SharedKeyStillValid) != 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("the verifier did not confirm the rotation")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	noProbe, err := NewPrincipalStore(PrincipalStoreOptions{StatePath: filepath.Join(t.TempDir(), "s.json"),
+		ObjectKey: func() (string, string) { return r.ak, r.sk }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	noProbe.mu.Lock()
+	noProbe.sharedHolders = []sharedKeyHolder{{Name: a, AccessKey: testClientAK, SecretCheck: newSharedKeyCheck(testClientSK)}}
+	noProbe.mu.Unlock()
+	if snap := noProbe.Snapshot(); len(snap.SharedKeyStillValid) != 1 || snap.SharedKeyProblem != noProbeProblem {
+		t.Fatalf("no probe: %+v %q", snap.SharedKeyStillValid, snap.SharedKeyProblem)
+	}
+
+	t.Setenv("JM_OBJ_BUCKET_URL", "")
+	t.Setenv("JM_MINIO_URL", "http://minio:9000/")
+	t.Setenv("JM_VOL_NAME", "zpool")
+	if got := objectStoreBucketURL(); got != "http://minio:9000/zpool" {
+		t.Fatalf("bucket URL = %q", got)
+	}
+	t.Setenv("JM_OBJ_BUCKET_URL", "http://s3.example/bucket")
+	if got := objectStoreBucketURL(); got != "http://s3.example/bucket" {
+		t.Fatalf("override = %q", got)
 	}
 }

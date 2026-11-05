@@ -3,6 +3,7 @@ module github.com/lelanddutcher/juicemount
 go 1.26.10
 
 require (
+	github.com/aws/aws-sdk-go-v2 v1.42.1
 	github.com/go-git/go-billy/v5 v5.9.0
 	github.com/google/uuid v1.6.0
 	github.com/hashicorp/golang-lru/v2 v2.0.7
@@ -49,7 +50,6 @@ require (
 	github.com/andybalholm/brotli v1.1.0 // indirect
 	github.com/apple/foundationdb/bindings/go v0.0.0-20211207225159-47b9a81d1c10 // indirect
 	github.com/asaskevich/govalidator v0.0.0-20230301143203-a9d515a09cc2 // indirect
-	github.com/aws/aws-sdk-go-v2 v1.42.1 // indirect
 	github.com/aws/aws-sdk-go-v2/aws/protocol/eventstream v1.7.8 // indirect
 	github.com/aws/aws-sdk-go-v2/config v1.32.17 // indirect
 	github.com/aws/aws-sdk-go-v2/credentials v1.19.16 // indirect
