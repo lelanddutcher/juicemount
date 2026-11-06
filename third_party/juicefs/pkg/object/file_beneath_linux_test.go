@@ -181,11 +181,26 @@ func TestFileBeneathListDoesNotFollowOutside(t *testing.T) {
 	if o, ok := got["inlink/"]; !ok || !o.IsDir() {
 		t.Errorf("in-root link to a folder not listed as a folder: %v", got)
 	}
-	if _, ok := got["esc/"]; ok {
-		t.Errorf("escaping link listed as a folder: it was followed")
+	// Links the backend will not follow (absolute, or leaving the root)
+	// are skipped, like dangling links: neither followed nor listed.
+	for _, k := range []string{"esc", "esc/", "abslink", "abslink/", "updown", "updown/"} {
+		if _, ok := got[k]; ok {
+			t.Errorf("link %q that leads outside (or is absolute) was listed", k)
+		}
 	}
-	if o, ok := got["esc"]; !ok || !o.IsSymlink() {
-		t.Errorf("escaping link not listed as a broken link: %v", got)
+	// Without following, every link is listed as a link (--links).
+	objs, _, _, err = s.List("", "", "", "/", 1000, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	links := 0
+	for _, o := range objs {
+		if o.IsSymlink() {
+			links++
+		}
+	}
+	if links != 5 { // inlink, abslink, updown, esc, x
+		t.Errorf("listing without following: %d links, want 5", links)
 	}
 	if _, ok := got["x/"]; !ok {
 		t.Errorf("in-root relative link x not listed as a folder: %v", got)
@@ -196,8 +211,8 @@ func TestFileBeneathListDoesNotFollowOutside(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, o := range objs {
-		if o.Key() == "x/y/" || o.Key() == "x/z/" {
-			t.Errorf("second hop listed as a folder: it was followed")
+		if strings.HasPrefix(o.Key(), "x/y") || strings.HasPrefix(o.Key(), "x/z") {
+			t.Errorf("second hop %q listed: it leads outside", o.Key())
 		}
 	}
 }

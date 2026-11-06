@@ -32,7 +32,7 @@ PATCH_FILES = {
     "patches/0014-literal-fatal-error.patch": ["pkg/meta/interface.go"],
     "patches/0015-klauspost-compress-security-update.patch": ["go.mod", "go.sum"],
     "patches/0016-file-backend-beneath-root.patch": [
-        "cmd/sync.go", "pkg/object/file.go", "pkg/object/file_unix.go"],
+        "cmd/object.go", "cmd/sync.go", "pkg/object/file.go", "pkg/object/file_unix.go"],
 }
 VERSION_PACKAGE = "github.com/juicedata/juicefs/pkg/version"
 

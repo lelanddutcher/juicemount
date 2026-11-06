@@ -298,24 +298,28 @@ func (j *juiceFS) readDirSorted(dirname string, followLink bool) ([]*mEntry, sys
 	if err != 0 {
 		return nil, err
 	}
-	mEntries := make([]*mEntry, len(entries))
-	for i, e := range entries {
+	mEntries := make([]*mEntry, 0, len(entries))
+	for _, e := range entries {
 		fi := fs.AttrToFileInfo(e.Inode, e.Attr)
 		if fi.IsDir() {
-			mEntries[i] = &mEntry{fi, string(e.Name) + dirSuffix, false}
+			mEntries = append(mEntries, &mEntry{fi, string(e.Name) + dirSuffix, false})
 		} else if fi.IsSymlink() && followLink {
 			fi2, err := j.jfs.Stat(ctx, path.Join(dirname, string(e.Name)))
 			if err != 0 {
-				mEntries[i] = &mEntry{fi, string(e.Name), true}
+				// JuiceMount: a link that cannot be followed in the volume
+				// (dangling, such as an absolute macOS path) is skipped
+				// with a warning instead of failing the copy of the whole
+				// tree. The Manager counts this line.
+				logger.Warnf("skipped symlink %q that cannot be followed in the volume: %s", path.Join(dirname, string(e.Name)), err)
 				continue
 			}
 			name := string(e.Name)
 			if fi2.IsDir() {
 				name += dirSuffix
 			}
-			mEntries[i] = &mEntry{fi2, name, false}
+			mEntries = append(mEntries, &mEntry{fi2, name, false})
 		} else {
-			mEntries[i] = &mEntry{fi, string(e.Name), fi.IsSymlink()}
+			mEntries = append(mEntries, &mEntry{fi, string(e.Name), fi.IsSymlink()})
 		}
 	}
 	sort.Slice(mEntries, func(i, j int) bool { return mEntries[i].name < mEntries[j].name })

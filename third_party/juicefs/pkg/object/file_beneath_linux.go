@@ -44,16 +44,6 @@ type beneathOps struct {
 	rootFd int // -1 until opened
 }
 
-// errOutsideRoot is returned when a path resolves outside the root.
-var errOutsideRoot = &outsideRootError{}
-
-type outsideRootError struct{}
-
-func (*outsideRootError) Error() string {
-	return "refused: path resolves outside the file storage root (symlink or ..)"
-}
-func (*outsideRootError) Unwrap() error { return syscall.EXDEV }
-
 // errNoOpenat2 is returned when the kernel cannot confine paths.
 var errNoOpenat2 = errors.New("refused: openat2 is unavailable (Linux 5.6 or later is required to confine file storage to its root)")
 

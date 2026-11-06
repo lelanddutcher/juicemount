@@ -7,6 +7,7 @@ package object
 import (
 	"os"
 	"path/filepath"
+	"syscall"
 	"time"
 )
 
@@ -35,6 +36,17 @@ type fileOps interface {
 	// SyncDir fsyncs the folder p.
 	SyncDir(p string) error
 }
+
+// errOutsideRoot is returned (inside an *os.PathError) when a path
+// resolves outside the root (file_beneath_linux.go). It unwraps to EXDEV.
+var errOutsideRoot = &outsideRootError{}
+
+type outsideRootError struct{}
+
+func (*outsideRootError) Error() string {
+	return "refused: path resolves outside the file storage root (symlink or ..)"
+}
+func (*outsideRootError) Unwrap() error { return syscall.EXDEV }
 
 // pathOps resolves paths the ordinary way: symlinks anywhere are followed.
 type pathOps struct{}
