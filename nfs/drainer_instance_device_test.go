@@ -44,7 +44,7 @@ func reopenDrainer(t *testing.T, first *Drainer) *Drainer {
 
 func drainCount(t *testing.T, d *Drainer) int {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), drainPassDeadline)
 	defer cancel()
 	return d.DrainOnceForTest(ctx)
 }

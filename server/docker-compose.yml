@@ -124,6 +124,16 @@ services:
       JM_AUDIT: "${JM_AUDIT:-auto}"
       JM_AUDIT_RETAIN_MB: "${JM_AUDIT_RETAIN_MB:-0}"
       JM_AUDIT_RETAIN_DAYS: "${JM_AUDIT_RETAIN_DAYS:-0}"
+      # The smart folders the Manager runs (the same variables and defaults
+      # as the manager service below): its principal may remove an empty
+      # view folder it created directly under one of their roots. Every
+      # other removal or rename of a folder at project depth stays
+      # admin-only.
+      JM_SMART_FOLDERS: "${JM_SMART_FOLDERS:-off}"
+      JM_CONTINUITY: "${JM_CONTINUITY:-off}"
+      JM_SMART_FOLDERS_ROOT: "${JM_SMART_FOLDERS_ROOT:-Recents}"
+      JM_SMART_FOLDERS_COLLECTIONS_ROOT: "${JM_SMART_FOLDERS_COLLECTIONS_ROOT:-Collections}"
+      JM_SMART_FOLDERS_QUERIES_ROOT: "${JM_SMART_FOLDERS_QUERIES_ROOT:-Queries}"
       JM_PROXY_FARM_PASSWORD: "${JM_PROXY_FARM_PASSWORD:?set JM_PROXY_FARM_PASSWORD in server/.env}"
       JM_PROXY_MANAGER_PASSWORD: "${JM_PROXY_MANAGER_PASSWORD:?set JM_PROXY_MANAGER_PASSWORD in server/.env}"
       JM_PROXY_BG_PASSWORD: "${JM_PROXY_BG_PASSWORD:?set JM_PROXY_BG_PASSWORD in server/.env}"
@@ -149,6 +159,10 @@ services:
       MINIO_ROOT_USER: juicemount
       MINIO_ROOT_PASSWORD: "${MINIO_ROOT_PASSWORD:?set a strong existing MinIO root password before deploying}"
       MINIO_API_REQUESTS_DEADLINE: 10m
+      # Temporary (STS AssumeRole) credentials last at most 15 minutes, so
+      # none a client made for itself outlives a key rotation for long.
+      # MinIO issues them to any user without a policy check.
+      MINIO_STS_DURATION: 15m
     ports:
       - "30151:9000"                # Mac client connects here
       - "30152:9001"                # MinIO console — web UI
@@ -444,6 +458,13 @@ services:
       JM_SMART_FOLDERS: "${JM_SMART_FOLDERS:-off}"
       JM_SMART_FOLDERS_ROOT: "${JM_SMART_FOLDERS_ROOT:-Recents}"
       JM_SMART_FOLDERS_MAX_VIEWS: "${JM_SMART_FOLDERS_MAX_VIEWS:-256}"
+      # Continuity (off by default) and, with smart folders also on, its
+      # collection views under JM_SMART_FOLDERS_COLLECTIONS_ROOT and saved
+      # query views under JM_SMART_FOLDERS_QUERIES_ROOT. respproxy reads
+      # these same variables, so the two agree on the roots.
+      JM_CONTINUITY: "${JM_CONTINUITY:-off}"
+      JM_SMART_FOLDERS_COLLECTIONS_ROOT: "${JM_SMART_FOLDERS_COLLECTIONS_ROOT:-Collections}"
+      JM_SMART_FOLDERS_QUERIES_ROOT: "${JM_SMART_FOLDERS_QUERIES_ROOT:-Queries}"
     ports:
       - "30190:8080"                              # manager UI
       # Link's 30193/tcp and 41641/udp: server/docker-compose.link.yml

@@ -78,10 +78,11 @@ func TestEntrypointKeepsPeopleAndConfiguresAudit(t *testing.T) {
 		t.Fatalf("restrict_unassigned dropped by the re-render:\n%s", b)
 	}
 	type config struct {
-		AuditDir   string `json:"audit_dir"`
-		Audit      string `json:"audit"`
-		RetainMB   int64  `json:"audit_retain_mb"`
-		RetainDays int64  `json:"audit_retain_days"`
+		AuditDir   string   `json:"audit_dir"`
+		Audit      string   `json:"audit"`
+		RetainMB   int64    `json:"audit_retain_mb"`
+		RetainDays int64    `json:"audit_retain_days"`
+		SmartRoots []string `json:"smart_folder_roots"`
 	}
 	readCfg := func() config {
 		t.Helper()
@@ -92,7 +93,8 @@ func TestEntrypointKeepsPeopleAndConfiguresAudit(t *testing.T) {
 		}
 		return cfg
 	}
-	if cfg := readCfg(); cfg.AuditDir != filepath.Join(dir, "audit") || cfg.Audit != "auto" || cfg.RetainMB != 0 || cfg.RetainDays != 0 {
+	if cfg := readCfg(); cfg.AuditDir != filepath.Join(dir, "audit") || cfg.Audit != "auto" || cfg.RetainMB != 0 || cfg.RetainDays != 0 ||
+		cfg.SmartRoots == nil || len(cfg.SmartRoots) != 0 {
 		t.Fatalf("config = %+v", cfg)
 	}
 	rerun := func(extra ...string) ([]byte, error) {
@@ -105,6 +107,27 @@ func TestEntrypointKeepsPeopleAndConfiguresAudit(t *testing.T) {
 	}
 	if cfg := readCfg(); cfg.Audit != "on" || cfg.RetainMB != 512 || cfg.RetainDays != -1 {
 		t.Fatalf("config with JM_AUDIT=on = %+v", cfg)
+	}
+	// The smart-folder roots are the ones the Manager runs, read from its
+	// variables the way it reads them.
+	for _, tc := range []struct {
+		env  []string
+		want string
+	}{
+		{[]string{"JM_SMART_FOLDERS=off", "JM_CONTINUITY=on"}, ""},
+		{[]string{"JM_SMART_FOLDERS= On "}, "Recents"},
+		{[]string{"JM_SMART_FOLDERS=on", "JM_SMART_FOLDERS_ROOT=  ", "JM_SMART_FOLDERS_COLLECTIONS_ROOT=Sets"}, "Recents"},
+		{[]string{"JM_SMART_FOLDERS=on", "JM_SMART_FOLDERS_QUERIES_ROOT=Finds"}, "Recents"},
+		{[]string{"JM_SMART_FOLDERS=yes", "JM_CONTINUITY=true"}, "Recents,Collections,Queries"},
+		{[]string{"JM_SMART_FOLDERS=on", "JM_CONTINUITY=on", "JM_SMART_FOLDERS_ROOT= Recent Files ", "JM_SMART_FOLDERS_COLLECTIONS_ROOT= Sets", "JM_SMART_FOLDERS_QUERIES_ROOT= Saved Finds "}, "Recent Files,Sets,Saved Finds"},
+		{[]string{"JM_SMART_FOLDERS=on", "JM_CONTINUITY=on", "JM_SMART_FOLDERS_ROOT=Views", "JM_SMART_FOLDERS_COLLECTIONS_ROOT=views", "JM_SMART_FOLDERS_QUERIES_ROOT=VIEWS"}, "Views,views,VIEWS"}, // the proxy folds them
+	} {
+		if out, err := rerun(tc.env...); err != nil {
+			t.Fatalf("entrypoint %v: %v\n%s", tc.env, err, out)
+		}
+		if cfg := readCfg(); cfg.SmartRoots == nil || strings.Join(cfg.SmartRoots, ",") != tc.want {
+			t.Fatalf("%v: smart_folder_roots = %q, want %q", tc.env, cfg.SmartRoots, tc.want)
+		}
 	}
 	if out, err := rerun("JM_AUDIT=off"); err != nil {
 		t.Fatalf("entrypoint: %v\n%s", err, out)

@@ -44,6 +44,28 @@ Enforce: refuse writes into a project another principal holds. Step back to obse
 </div>
 <p class="note" id="reload"></p>
 <p class="note-bad" id="keyd"></p>
+<div id="sharedKey" style="display:none">
+  <h2>Rotate the shared storage key</h2>
+  <p class="note-bad">These revoked Macs were given the shared storage key (<code>jm-client</code>). Revoking removed their Redis
+  login, but that key STILL WORKS at the object store: each of them can still read file data and overwrite stored data there
+  directly. The Manager cannot change the key (it holds no object-store admin credential, and the server's WebDAV and farm use
+  the same key). Rotate <code>JM_OBJ_CLIENT_SECRET_KEY</code> on the server as described in server/COMPOSE-ROLLOUT.md,
+  "Rotating the shared object key". Approved Macs get the new key from the Manager and use it after their volume restarts.
+  A Mac leaves this list only when the object store itself confirms the rotation: the Manager checks every minute that the
+  object store accepts its new key (it keeps one secret per user, so the old one is then refused), or that a renamed
+  access key's old user is gone. Restarting the Manager with a new key alone clears nothing. This proves the user's own
+  secret changed; it does not prove that no other credential made with the old key is left (a service account or temporary
+  credential the Mac made for itself). The rotation steps say how to check for those.</p>
+  <p class="note-warn" id="sharedKeyLegacy" style="display:none">Macs marked "revoked by an earlier Manager" were revoked before
+  this Manager recorded who holds the shared key. Some may have been only pending requests that never had it; they stay listed
+  until the key is rotated. Macs revoked and forgotten before then are not listed at all: if you ever revoked an approved Mac,
+  rotate once.</p>
+  <p class="note-bad" id="sharedKeyProblem"></p>
+  <table>
+    <thead><tr><th>Principal</th><th>Host</th><th>Key</th><th>Revoked</th></tr></thead>
+    <tbody id="sharedKeyRows"></tbody>
+  </table>
+</div>
 <div id="orphans" style="display:none">
   <h2>Orphan storage keys</h2>
   <p class="note-bad">minio-keyd reports these per-Mac storage keys, but this Manager's records do not know them (the Manager's
@@ -175,6 +197,38 @@ Mac and published as conflict copies.</p>
     document.getElementById('removeOrphans').disabled = !orphanNames.length;
   }
 
+  // Revoked Macs whose shared storage key still works (pending rotation).
+  function renderSharedKey(s) {
+    var list = s.shared_key_still_valid || [];
+    document.getElementById('sharedKey').style.display = list.length ? '' : 'none';
+    var tb = document.getElementById('sharedKeyRows'); tb.innerHTML = '';
+    var legacy = false;
+    list.forEach(function (h) {
+      if (h.legacy) legacy = true;
+      var tr = document.createElement('tr');
+      tr.innerHTML = '<td><code>' + esc(h.name) + '</code></td><td>' + esc(h.host) + '</td><td><code>' + esc(h.access_key) +
+        '</code></td><td>' + esc(when(h.revoked_at_ms)) + (h.legacy ? ' (revoked by an earlier Manager)' : '') +
+        ' <span class="badge badge-bad">storage key still valid</span></td>';
+      tb.appendChild(tr);
+    });
+    document.getElementById('sharedKeyLegacy').style.display = legacy ? '' : 'none';
+    document.getElementById('sharedKeyProblem').textContent = list.length && s.shared_key_problem
+      ? 'Rotation not confirmed: ' + s.shared_key_problem + '.' : '';
+  }
+
+  // The revoke confirmation says whether the Mac's storage key stops working.
+  function revokeConfirm(p) {
+    var text = (p.status === 'pending' ? 'Reject ' : 'Revoke ') + p.name + '? Its connections are refused after the proxy reloads.';
+    if (p.shared_key_held) {
+      text += '\n\nIts storage key will STILL WORK: this Mac holds the shared storage key (jm-client), and revoking does not change ' +
+        'that key. Until it is rotated on the server, this Mac can still read file data and overwrite stored data at the object ' +
+        'store directly. This page then lists the rotation as a pending action.';
+    } else if (p.obj_key_status === 'active' || p.obj_key_status === 'minting' || p.obj_key_status === 'recreating') {
+      text += '\n\nIts own storage key is removed by minio-keyd.';
+    }
+    return text;
+  }
+
   function loadPrincipals() {
     api('GET', 'principals').then(function (s) {
       var until = s.auto_approve_until_ms;
@@ -198,6 +252,7 @@ Mac and published as conflict copies.</p>
             'To remove them, set JM_OBJ_PER_MAC=1 again and restart the Manager.'
           : '');
       renderOrphans(s);
+      renderSharedKey(s);
       var showKeys = !!s.per_mac_keys || !!s.per_mac_keys_left || (s.principals || []).some(function (p) { return !!p.obj_key_status; });
       Array.prototype.forEach.call(document.querySelectorAll('.keycol'), function (el) { el.style.display = showKeys ? '' : 'none'; });
       var tb = document.getElementById('principals'); tb.innerHTML = '';
@@ -213,13 +268,17 @@ Mac and published as conflict copies.</p>
           var b = document.createElement('button'); b.textContent = label; if (cls) b.className = cls;
           b.onclick = function () {
             if (confirmText && !window.confirm(confirmText)) return;
-            api('POST', 'principals/' + op, { name: p.name }).then(loadPrincipals, fail);
+            api('POST', 'principals/' + op, { name: p.name }).then(function (r) {
+              // After a revoke: say plainly whether its storage key still works.
+              if (r && r.revoked && r.revoked.object_key === 'still_valid') window.alert(r.revoked.message);
+              loadPrincipals();
+            }, fail);
           };
           actions.appendChild(b);
         }
         if (p.status === 'approved' && p.auto_approved) add('Confirm', 'approve', 'primary', 'Confirm ' + p.host + ' (fingerprint ' + p.fingerprint + ', from ' + p.source_ip + ')?');
         if (p.status !== 'approved') add('Approve', 'approve', 'primary', p.status === 'pending' ? 'Approve ' + p.host + '? Check that the Mac shows fingerprint ' + p.fingerprint + '.' : null);
-        if (p.status !== 'revoked') add(p.status === 'pending' ? 'Reject' : 'Revoke', 'revoke', 'danger', 'Revoke ' + p.name + '? Its connections are refused after the proxy reloads.');
+        if (p.status !== 'revoked') add(p.status === 'pending' ? 'Reject' : 'Revoke', 'revoke', 'danger', revokeConfirm(p));
         if (p.status === 'revoked') add('Forget', 'forget', '', p.obj_key_status === 'removing'
           ? 'Forget ' + p.name + '? Its storage key is not yet confirmed removed, so the Manager will refuse until minio-keyd confirms it.'
           : 'Forget ' + p.name + '? The Mac can then enroll again.');

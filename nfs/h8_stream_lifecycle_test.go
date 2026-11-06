@@ -58,7 +58,7 @@ func TestH8AcceptanceDefaultStreamRetiresPublishedEntry(t *testing.T) {
 	if err != nil || !bytes.Equal(got, want) {
 		t.Fatalf("published stream differs from source: bytes=%d err=%v", len(got), err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), drainPassDeadline)
 	defer cancel()
 	d.DrainOnceForTest(ctx) // Exercise the production ListReady/MarkDraining dispatch path.
 

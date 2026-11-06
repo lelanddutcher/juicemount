@@ -4,9 +4,13 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/json"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -37,18 +41,42 @@ func testHostKeyLine(t *testing.T) string {
 	return authorizedLine(newTestHostSigner(t).PublicKey())
 }
 
+// testSSHServer records what a client offered during authentication.
+type testSSHServer struct {
+	addr     string
+	attempts int32 // password attempts
+	mu       sync.Mutex
+	methods  []string // every auth method the client tried, "none" included
+}
+
+func (s *testSSHServer) offered() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.methods...)
+}
+
 // startTestSSHServer accepts SSH handshakes with the given host key and
-// password, counting every password attempt it receives.
+// password, recording every authentication attempt it receives.
 func startTestSSHServer(t *testing.T, host ssh.Signer, password string) (string, *int32) {
+	srv := startRecordingSSHServer(t, host, password)
+	return srv.addr, &srv.attempts
+}
+
+func startRecordingSSHServer(t *testing.T, host ssh.Signer, password string) *testSSHServer {
 	t.Helper()
-	var attempts int32
+	srv := &testSSHServer{}
 	cfg := &ssh.ServerConfig{
 		PasswordCallback: func(_ ssh.ConnMetadata, pw []byte) (*ssh.Permissions, error) {
-			atomic.AddInt32(&attempts, 1)
+			atomic.AddInt32(&srv.attempts, 1)
 			if string(pw) == password {
 				return nil, nil
 			}
 			return nil, ssh.ErrNoAuth
+		},
+		AuthLogCallback: func(_ ssh.ConnMetadata, method string, _ error) {
+			srv.mu.Lock()
+			srv.methods = append(srv.methods, method)
+			srv.mu.Unlock()
 		},
 	}
 	cfg.AddHostKey(host)
@@ -78,7 +106,8 @@ func startTestSSHServer(t *testing.T, host ssh.Signer, password string) (string,
 			}(c)
 		}
 	}()
-	return ln.Addr().String(), &attempts
+	srv.addr = ln.Addr().String()
+	return srv
 }
 
 func sftpTestConfig(t *testing.T, addr, password, hostKey string) map[string]string {
@@ -93,25 +122,91 @@ func sftpTestConfig(t *testing.T, addr, password, hostKey string) map[string]str
 	}
 }
 
-func TestSFTPTestConnectionPinsHostKeyOnFirstUse(t *testing.T) {
+// An unpinned destination must not authenticate to whatever answers:
+// Test Connection only reads the server key and hands its fingerprint
+// to the operator, sending the server no credentials at all. The pin
+// is stored only when the operator confirms that fingerprint.
+func TestSFTPUnpinnedTestOffersNoAuthAndConfirmPins(t *testing.T) {
 	host := newTestHostSigner(t)
-	addr, _ := startTestSSHServer(t, host, "pw")
+	srv := startRecordingSSHServer(t, host, "pw")
+	mux, store := registerDestTest(t, t.TempDir(), "")
+	cfg := sftpTestConfig(t, srv.addr, "pw", "")
+	delete(cfg, "host_key")
+	body, _ := json.Marshal(map[string]any{"name": "s", "kind": "sftp", "config": cfg})
+	if w := destRequest(t, mux, http.MethodPost, "/api/destinations", string(body)); w.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", w.Code, w.Body.String())
+	}
+
+	w := destRequest(t, mux, http.MethodPost, "/api/destinations/s/test", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("unpinned test: %d %s", w.Code, w.Body.String())
+	}
+	var got struct {
+		OK          bool   `json:"ok"`
+		NeedConfirm bool   `json:"host_key_confirmation_required"`
+		HostKey     string `json:"host_key"`
+		Fingerprint string `json:"host_key_fingerprint"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode %s: %v", w.Body.String(), err)
+	}
+	wantFP := ssh.FingerprintSHA256(host.PublicKey())
+	if got.OK || !got.NeedConfirm || got.Fingerprint != wantFP || got.HostKey != authorizedLine(host.PublicKey()) {
+		t.Fatalf("unpinned test response = %+v, want confirmation request for %s", got, wantFP)
+	}
+	if m := srv.offered(); len(m) != 0 {
+		t.Errorf("unpinned test offered auth methods %v to the server, want none", m)
+	}
+	if d, _ := store.getPlaintext("s"); d.Config["host_key"] != "" {
+		t.Fatalf("unconfirmed key was pinned")
+	}
+
+	confirm := func(fp string) *httptest.ResponseRecorder {
+		b, _ := json.Marshal(map[string]string{"host_key": got.HostKey, "fingerprint": fp})
+		return destRequest(t, mux, http.MethodPost, "/api/destinations/s/host-key", string(b))
+	}
+	if w := confirm(ssh.FingerprintSHA256(newTestHostSigner(t).PublicKey())); w.Code != http.StatusBadRequest {
+		t.Errorf("confirm with wrong fingerprint: %d, want 400", w.Code)
+	}
+	if d, _ := store.getPlaintext("s"); d.Config["host_key"] != "" {
+		t.Fatalf("key pinned despite fingerprint mismatch")
+	}
+	if w := confirm(wantFP); w.Code != http.StatusOK {
+		t.Fatalf("confirm: %d %s", w.Code, w.Body.String())
+	}
+	if d, _ := store.getPlaintext("s"); d.Config["host_key"] != got.HostKey {
+		t.Fatalf("confirmed key not pinned: %q", d.Config["host_key"])
+	}
+
+	w = destRequest(t, mux, http.MethodPost, "/api/destinations/s/test", "")
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"ok": true`) {
+		t.Fatalf("pinned test: %d %s", w.Code, w.Body.String())
+	}
+	if n := atomic.LoadInt32(&srv.attempts); n != 1 {
+		t.Errorf("pinned test sent %d password attempts, want 1", n)
+	}
+}
+
+func TestSFTPFetchHostKeySendsNoCredentials(t *testing.T) {
+	host := newTestHostSigner(t)
+	srv := startRecordingSSHServer(t, host, "pw")
 	ctx := context.Background()
 
-	got, err := testConnectionSFTP(ctx, sftpTestConfig(t, addr, "pw", ""))
+	key, err := fetchSFTPHostKey(ctx, sftpTestConfig(t, srv.addr, "pw", ""))
 	if err != nil {
-		t.Fatalf("first use: %v", err)
+		t.Fatalf("fetch: %v", err)
 	}
-	if want := authorizedLine(host.PublicKey()); got != want {
-		t.Fatalf("pinned key = %q, want %q", got, want)
+	if authorizedLine(key) != authorizedLine(host.PublicKey()) {
+		t.Fatalf("fetched key %q, want %q", authorizedLine(key), authorizedLine(host.PublicKey()))
 	}
-
-	again, err := testConnectionSFTP(ctx, sftpTestConfig(t, addr, "pw", got))
-	if err != nil {
-		t.Fatalf("pinned, same server: %v", err)
+	if err := testConnectionSFTP(ctx, sftpTestConfig(t, srv.addr, "pw", "")); err == nil {
+		t.Fatal("authenticated test ran without a pinned key")
 	}
-	if again != "" {
-		t.Errorf("already pinned: got new key %q, want none", again)
+	if m := srv.offered(); len(m) != 0 {
+		t.Errorf("server saw auth methods %v, want none", m)
+	}
+	if err := testConnectionSFTP(ctx, sftpTestConfig(t, srv.addr, "pw", authorizedLine(key))); err != nil {
+		t.Fatalf("pinned test: %v", err)
 	}
 }
 
@@ -119,7 +214,7 @@ func TestSFTPTestConnectionRefusesChangedHostKeyBeforeAuth(t *testing.T) {
 	impostor := newTestHostSigner(t)
 	addr, attempts := startTestSSHServer(t, impostor, "pw")
 
-	_, err := testConnectionSFTP(context.Background(), sftpTestConfig(t, addr, "pw", testHostKeyLine(t)))
+	err := testConnectionSFTP(context.Background(), sftpTestConfig(t, addr, "pw", testHostKeyLine(t)))
 	if err == nil || !strings.Contains(err.Error(), "host key mismatch") {
 		t.Fatalf("err = %v, want host key mismatch", err)
 	}
@@ -173,5 +268,34 @@ func TestValidateConfigRejectsBadSFTPHostKey(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("invalid host_key accepted")
+	}
+}
+
+// A PUT for the same server must not swap the pinned key; replacing a
+// pin goes through the confirmation endpoint (which refuses a
+// different key) or a change of host/port.
+func TestSFTPUpdateRefusesDifferentPinForSameServer(t *testing.T) {
+	mux, store := registerDestTest(t, t.TempDir(), "")
+	pinA, pinB := testHostKeyLine(t), testHostKeyLine(t)
+	body := func(port, hk string) string {
+		b, _ := json.Marshal(map[string]any{"name": "s", "kind": "sftp", "config": map[string]string{
+			"host": "h.example.com", "port": port, "user": "u", "password": "pw", "host_key": hk,
+		}})
+		return string(b)
+	}
+	if w := destRequest(t, mux, http.MethodPost, "/api/destinations", body("22", pinA)); w.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", w.Code, w.Body.String())
+	}
+	if w := destRequest(t, mux, http.MethodPut, "/api/destinations/s", body("22", pinB)); w.Code != http.StatusConflict {
+		t.Errorf("PUT with a different pin for the same server: %d, want 409", w.Code)
+	}
+	if d, _ := store.getPlaintext("s"); d.Config["host_key"] != pinA {
+		t.Fatalf("pin replaced by PUT")
+	}
+	if w := destRequest(t, mux, http.MethodPut, "/api/destinations/s", body("22", pinA)); w.Code != http.StatusOK {
+		t.Errorf("PUT with the same pin: %d", w.Code)
+	}
+	if w := destRequest(t, mux, http.MethodPut, "/api/destinations/s", body("2222", pinB)); w.Code != http.StatusOK {
+		t.Errorf("PUT with a new port and its own pin: %d", w.Code)
 	}
 }

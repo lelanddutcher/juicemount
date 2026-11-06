@@ -190,12 +190,20 @@ func TestCapacityStallParkedWriterNotEscalated(t *testing.T) {
 // capacity-free the parked write completes with the FULL content.
 func TestCapacityStallParkedWriterNotEscalatedOnline(t *testing.T) {
 	old := capacityWaitDeadline
-	capacityWaitDeadline = 300 * time.Millisecond // long enough to sweep during the online park
+	capacityWaitDeadline = 2 * time.Second // never reached: capacity frees after the sweep below
 	t.Cleanup(func() { capacityWaitDeadline = old })
 	// Stays ONLINE — no SetOffline — so sweepOnce actually runs against the entry.
 
+	// The window bounds the gap between two touches, which is the poll plus
+	// however late the parked goroutine runs. At 30 ms it also had to cover
+	// the goroutine's start, as the sweep began before the write parked: a
+	// start 35 ms late (macOS timer slack, a loaded runner) escalated a
+	// correctly touched write. Now the sweep starts once the write is parked
+	// and touching, and a frozen handle still escalates three times over
+	// during it.
+	const window = 100 * time.Millisecond
 	s := newTestSpoolStore(t, 100)
-	s.SetStuckEscalationWindow(30 * time.Millisecond) // a frozen handle would escalate fast
+	s.SetStuckEscalationWindow(window)
 
 	e, err := s.OpenWrite("/parked_online.bin")
 	if err != nil {
@@ -205,13 +213,26 @@ func TestCapacityStallParkedWriterNotEscalatedOnline(t *testing.T) {
 		t.Fatalf("fill: %v", err)
 	}
 
+	filled := e.lastWrite.Load()
 	done := make(chan error, 1)
 	go func() { _, werr := e.WriteAt(make([]byte, 60), 100); done <- werr }()
+	for s.stallWaiters.Load() == 0 {
+		select {
+		case err := <-done:
+			t.Fatalf("the write did not park in the capacity stall: %v", err)
+		case <-time.After(time.Millisecond):
+		}
+	}
+	for parked := time.Now(); e.lastWrite.Load() == filled; time.Sleep(time.Millisecond) {
+		if time.Since(parked) > window {
+			t.Fatal("the parked write never refreshed lastWrite — touch mechanic broken")
+		}
+	}
 
 	// Sweep repeatedly while the write is parked ONLINE, well past the escalation
 	// window. The parked write's touch keeps lastWrite fresh → escalation must
 	// NEVER fire (sweepOnce returns 0).
-	deadline := time.Now().Add(150 * time.Millisecond)
+	deadline := time.Now().Add(3 * window)
 	for time.Now().Before(deadline) {
 		if n := s.sweepOnce(0); n != 0 {
 			t.Fatalf("ONLINE sweeper escalated a write PARKED in the capacity stall (finalized %d) — touch mechanic broken", n)
@@ -219,7 +240,7 @@ func TestCapacityStallParkedWriterNotEscalatedOnline(t *testing.T) {
 		time.Sleep(15 * time.Millisecond)
 	}
 
-	// Free capacity (within the 300ms deadline): the parked write resumes FULLY.
+	// Free capacity (within the wedge deadline): the parked write resumes FULLY.
 	s.releaseCapacity(60)
 	select {
 	case err := <-done:

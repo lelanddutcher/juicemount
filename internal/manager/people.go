@@ -31,6 +31,7 @@ package manager
 // exists the file is exactly the version-1 file of before.
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -41,12 +42,14 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/lelanddutcher/juicemount/internal/auditlog"
+	"golang.org/x/text/unicode/norm"
 )
 
 // Person is one member of the team (Manager store).
@@ -422,12 +425,43 @@ func (s *PrincipalStore) AssignDevice(device, personID string) error {
 	})
 }
 
+// SetGrantForm sets how AddGrant finds the form of a folder the volume
+// holds (nil: grants are stored as given).
+func (s *PrincipalStore) SetGrantForm(fn folderFormFunc) {
+	s.mu.Lock()
+	s.grantForm = fn
+	s.mu.Unlock()
+}
+
+// grantLookupTimeout bounds AddGrant's read of the volume.
+const grantLookupTimeout = 10 * time.Second
+
 // AddGrant lets a person write in path; the first grant limits the person
-// to its grants.
+// to its grants. The proxy resolves a grant byte for byte, so a folder
+// name given composed for one the volume holds decomposed (or the other
+// way round) is stored in the volume's form (volumeform.go); a path that
+// does not exist yet is stored as given. A name the volume holds in both
+// forms must be given exactly.
 func (s *PrincipalStore) AddGrant(id, path string) error {
 	c, err := cleanGrantPath(path)
 	if err != nil {
 		return err
+	}
+	s.mu.Lock()
+	form := s.grantForm
+	s.mu.Unlock()
+	if form != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), grantLookupTimeout)
+		f, found, err := form(ctx, strings.TrimPrefix(c, "/"))
+		cancel()
+		switch {
+		case errors.Is(err, errFolderFormAmbiguous):
+			return fmt.Errorf("%w: %w", ErrPersonInvalid, err)
+		case err != nil:
+			return fmt.Errorf("%w: finding %s on the volume: %v", errVolumeUnread, c, err)
+		case found:
+			c = "/" + f
+		}
 	}
 	return s.changePeople(func() error {
 		p, err := s.person(id)
@@ -451,6 +485,8 @@ func (s *PrincipalStore) AddGrant(id, path string) error {
 }
 
 // RemoveGrant takes a grant away. The person stays limited to its grants.
+// A path that matches no grant exactly names the one grant equal to it
+// composed, if there is just one (AddGrant may have stored another form).
 func (s *PrincipalStore) RemoveGrant(id, path string) error {
 	c, err := cleanGrantPath(path)
 	if err != nil {
@@ -460,6 +496,17 @@ func (s *PrincipalStore) RemoveGrant(id, path string) error {
 		p, err := s.person(id)
 		if err != nil {
 			return err
+		}
+		if !slices.Contains(p.Grants, c) {
+			var same []string
+			for _, g := range p.Grants {
+				if norm.NFC.String(g) == norm.NFC.String(c) {
+					same = append(same, g)
+				}
+			}
+			if len(same) == 1 {
+				c = same[0]
+			}
 		}
 		kept := p.Grants[:0:0]
 		for _, g := range p.Grants {
@@ -643,8 +690,11 @@ func (s *PrincipalStore) StartPeopleSync() (stop func()) {
 type peopleAPI struct {
 	store    *PrincipalStore
 	auditDir string
-	watch    *auditWatch      // nil: no audit directory
-	quotas   *quotaScopeCache // nil: no volume to check
+	// catalogAuditDir: the Manager's own log of agent tokens and agents'
+	// catalog edits (agenttokens.go); "" without a principal store.
+	catalogAuditDir string
+	watch           *auditWatch      // nil: no audit directory
+	quotas          *quotaScopeCache // nil: no volume to check
 }
 
 // snapshot is the people snapshot with the audit log's state.
@@ -732,6 +782,8 @@ func (p *peopleAPI) handleChange(op func(peopleRequest) error) http.HandlerFunc 
 		switch err := op(body); {
 		case errors.Is(err, ErrPersonInvalid):
 			http.Error(w, err.Error(), http.StatusBadRequest)
+		case errors.Is(err, errVolumeUnread):
+			http.Error(w, err.Error()+"; try again", http.StatusServiceUnavailable)
 		case errors.Is(err, ErrPersonNotFound):
 			http.Error(w, "no such person", http.StatusNotFound)
 		case errors.Is(err, ErrPrincipalNotFound):
@@ -760,7 +812,8 @@ func parseMillis(v string) (int64, error) {
 }
 
 // handleAudit is GET /api/audit: one page of the proxy's mutation log,
-// newest first. Filters: person, principal, project (a path: that folder
+// newest first; with log=catalog, of the Manager's catalog audit log
+// (agent tokens and agents' catalog edits) instead. Filters: person, principal, project (a path: that folder
 // and below), since/until (unix ms or RFC 3339), type; paging: before (the
 // previous page's "next"), limit (default 100, at most 1000). A page reads
 // at most auditlog.QueryScanBytes of the log, so with a narrow filter it
@@ -770,11 +823,23 @@ func (p *peopleAPI) handleAudit(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "GET only", http.StatusMethodNotAllowed)
 		return
 	}
-	if p.auditDir == "" {
-		http.Error(w, "the audit log is not configured (JM_RESPPROXY_DIR or JM_AUDIT_DIR)", http.StatusServiceUnavailable)
+	q := r.URL.Query()
+	dir := p.auditDir
+	switch q.Get("log") {
+	case "":
+		if dir == "" {
+			http.Error(w, "the audit log is not configured (JM_RESPPROXY_DIR or JM_AUDIT_DIR)", http.StatusServiceUnavailable)
+			return
+		}
+	case "catalog":
+		if dir = p.catalogAuditDir; dir == "" {
+			http.Error(w, "the catalog audit log needs the principal store, which is not configured", http.StatusServiceUnavailable)
+			return
+		}
+	default:
+		http.Error(w, "log is empty (the proxy's) or catalog", http.StatusBadRequest)
 		return
 	}
-	q := r.URL.Query()
 	f := auditlog.Filter{Person: q.Get("person"), Principal: q.Get("principal"), Project: q.Get("project")}
 	if t := q.Get("type"); t != "" {
 		f.Types = strings.Split(t, ",")
@@ -795,7 +860,7 @@ func (p *peopleAPI) handleAudit(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad query: since/until are unix ms or RFC 3339, before a sequence number, limit 1-1000", http.StatusBadRequest)
 		return
 	}
-	page, err := auditlog.Query(p.auditDir, f, before, limit)
+	page, err := auditlog.Query(dir, f, before, limit)
 	if err != nil {
 		log.Printf("manager: audit query: %v", err)
 		http.Error(w, "the audit log could not be read", http.StatusInternalServerError)
@@ -860,8 +925,8 @@ func (p *peopleAPI) handleAuditStatus(w http.ResponseWriter, r *http.Request) {
 
 // registerPeople wires the people and audit routes (admin key, like every
 // other Manager route).
-func (a *API) registerPeople(mux *http.ServeMux, prefix string, store *PrincipalStore) {
-	pa := &peopleAPI{store: store, auditDir: strings.TrimSpace(os.Getenv("JM_AUDIT_DIR"))}
+func (a *API) registerPeople(mux routeMux, prefix string, store *PrincipalStore) {
+	pa := &peopleAPI{store: store, auditDir: strings.TrimSpace(os.Getenv("JM_AUDIT_DIR")), catalogAuditDir: catalogAuditDir(store)}
 	if pa.auditDir == "" {
 		if dir := strings.TrimSpace(os.Getenv("JM_RESPPROXY_DIR")); dir != "" {
 			pa.auditDir = filepath.Join(dir, "audit")
@@ -879,6 +944,9 @@ func (a *API) registerPeople(mux *http.ServeMux, prefix string, store *Principal
 		}
 		store.SetQuotaScope(fn)
 		pa.quotas = &quotaScopeCache{fn: fn}
+		if a.linkMetaURL != "" {
+			store.SetGrantForm(redisFolderForm(a.linkMetaURL))
+		}
 	}
 	if pa.auditDir != "" {
 		anchors := ""
@@ -924,4 +992,7 @@ func (a *API) registerPeople(mux *http.ServeMux, prefix string, store *Principal
 	mux.HandleFunc(prefix+"/api/audit", a.auth(pa.handleAudit))
 	mux.HandleFunc(prefix+"/api/audit/verify", a.auth(pa.handleAuditVerify))
 	mux.HandleFunc(prefix+"/api/audit/status", a.auth(pa.handleAuditStatus))
+	// Continuity collections (collections.go): persons authenticate with
+	// their Macs, so the routes need this store; 404 while JM_CONTINUITY is off.
+	a.registerCollections(mux, prefix, store)
 }

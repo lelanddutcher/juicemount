@@ -194,6 +194,12 @@ type env struct {
 	auditDir string
 	paddr    string
 	failSink atomic.Bool
+	// healSink ends an injected failure from inside the next failing write,
+	// so the write that succeeds starts after every refusal made before it
+	// was set (see auditlog TestSinkFailureRefusesThenRecordsGap).
+	healSink atomic.Bool
+	// smartRoots: LeaseConfig.SmartRoots (none unless a test sets it).
+	smartRoots []string
 }
 
 func newEnv(t testing.TB, mode respproxy.Mode, people []respproxy.PersonEntry, mut ...func(*respproxy.Config)) *env {
@@ -218,6 +224,9 @@ func (e *env) startProxy(people []respproxy.PersonEntry, mut ...func(*respproxy.
 	e.audit, err = auditlog.Open(e.auditDir, auditlog.Options{Logf: logf, RetryEvery: 20 * time.Millisecond,
 		BeforeWrite: func() error {
 			if e.failSink.Load() {
+				if e.healSink.CompareAndSwap(true, false) {
+					e.failSink.Store(false)
+				}
 				return errors.New("injected sink failure")
 			}
 			return nil
@@ -241,7 +250,7 @@ func (e *env) startProxy(people []respproxy.PersonEntry, mut ...func(*respproxy.
 		t.Fatal(err)
 	}
 	eng = respproxy.NewLeaseEngine(respproxy.LeaseConfig{Side: p.Side(), VolumeDB: testDB, Logf: logf,
-		SweepEvery: time.Hour, FlushEvery: 50 * time.Millisecond})
+		SweepEvery: time.Hour, FlushEvery: 50 * time.Millisecond, SmartRoots: e.smartRoots})
 	if err := eng.Start(); err != nil {
 		t.Fatal(err)
 	}

@@ -39,6 +39,11 @@
 // (running retention first, so a log that filled its disk can recover) and
 // writes a "gap" record that counts the records lost meanwhile.
 //
+// The Manager keeps a second log in this format, in its own state
+// directory, for agent tokens and the catalog edits agents make
+// (manager/agenttokens.go): intent and outcome records with Action naming
+// the change and Detail what it changed. Each log has its single writer.
+//
 // A Lazy writer touches nothing on disk until Activate: the proxy keeps the
 // log off until the first person exists. With Options.HealthPath the writer
 // keeps a small JSON health file (Health) there for the Manager, from the
@@ -100,6 +105,11 @@ type Record struct {
 	Host       string `json:"host,omitempty"`
 	Person     string `json:"person,omitempty"` // stable person ID, "" = no person
 	PersonName string `json:"person_name,omitempty"`
+	// Agent, AgentName: the agent token (its ID and name) a record of the
+	// Manager's catalog log was made with; Principal is then the Mac that
+	// minted it.
+	Agent     string `json:"agent,omitempty"`
+	AgentName string `json:"agent_name,omitempty"`
 
 	// Action summarizes a namespace unit: create, remove, rename, trash,
 	// restore, link, setattr, quota (a quota or its usage, nothing else),
@@ -155,6 +165,9 @@ type Record struct {
 	// tooLarge: the writer wrote a stub in place of the record (it encoded
 	// to more than MaxRecordBytes). Set before st becomes stDurable.
 	tooLarge bool
+	// carried: a gap record recover queued for Appends refused while it
+	// wrote its own. Losing it loses its count, not a record.
+	carried bool
 }
 
 // MaxRecordBytes bounds one line of the log. The writer never writes a
@@ -780,13 +793,23 @@ func (w *Writer) lose(batch []*Record) {
 		return
 	}
 	w.mu.Lock()
-	w.dropped += uint64(len(batch))
-	w.lost += uint64(len(batch))
-	for _, r := range batch {
-		r.st = stLost
-	}
+	w.countLost(batch)
 	w.cond.Broadcast()
 	w.mu.Unlock()
+}
+
+// countLost counts batch as lost (under mu). A carried gap record is not a
+// record of its own: what it counted goes back into dropped.
+func (w *Writer) countLost(batch []*Record) {
+	for _, r := range batch {
+		if r.carried {
+			w.dropped += r.Dropped
+		} else {
+			w.dropped++
+			w.lost++
+		}
+		r.st = stLost
+	}
 }
 
 func (w *Writer) fail(err error, batch []*Record) {
@@ -795,11 +818,7 @@ func (w *Writer) fail(err error, batch []*Record) {
 	w.mu.Lock()
 	w.failed = err
 	w.lastErr = err.Error()
-	w.dropped += uint64(len(batch))
-	w.lost += uint64(len(batch))
-	for _, r := range batch {
-		r.st = stLost
-	}
+	w.countLost(batch)
 	w.cond.Broadcast()
 	w.mu.Unlock()
 }
@@ -871,12 +890,25 @@ func (w *Writer) recover(batch []*Record) bool {
 	w.mu.Lock()
 	w.note = ""
 	w.dropped -= gap.Dropped
-	w.failed = nil
 	w.durable = gap.Seq
 	w.lastFsync = w.opts.Now().UnixMilli()
 	for _, r := range all {
 		r.st = stDurable
 	}
+	// The writer stays failed until the gap record is on disk, so Appends
+	// refused meanwhile are not in it. A second gap record counts them; it
+	// goes at the head of the queue in the critical section that clears the
+	// failure, so no refusal goes uncounted and Appends from here on queue
+	// behind it. Writing it here, still failed, would let a steady stream
+	// of refusals keep the writer recovering forever. If its batch fails,
+	// fail() carries its count into the next gap record.
+	if w.dropped > 0 {
+		w.queue = append([]*Record{{Seq: w.nextSeq, TS: w.opts.Now().UnixMilli(), Type: TypeGap, Dropped: w.dropped,
+			Detail: gap.Detail + "; refused while the log was recovering", carried: true}}, w.queue...)
+		w.nextSeq++
+		w.dropped = 0
+	}
+	w.failed = nil
 	w.cond.Broadcast()
 	w.mu.Unlock()
 	w.opts.Logf("auditlog: recovered; %d records were lost", gap.Dropped)
@@ -960,7 +992,7 @@ func stubOf(r *Record, line []byte) *Record {
 	}
 	return &Record{Seq: r.Seq, TS: r.TS, Type: r.Type, Unit: r.Unit, Outcome: r.Outcome, Reason: clip(r.Reason),
 		Principal: clip(r.Principal), Kind: clip(r.Kind), Host: clip(r.Host), Person: clip(r.Person),
-		PersonName: clip(r.PersonName), Action: clip(r.Action), Prev: r.Prev,
+		PersonName: clip(r.PersonName), Agent: clip(r.Agent), AgentName: clip(r.AgentName), Action: clip(r.Action), Prev: r.Prev,
 		Omitted: max(1, len(r.Ops)+len(r.Rows)+len(r.Inodes)+len(r.Attrs)+len(r.Projects)), Digest: clip(r.Digest),
 		Detail: fmt.Sprintf("record not written: it encoded to %d bytes, more than the limit of %d", len(line), MaxRecordBytes)}
 }

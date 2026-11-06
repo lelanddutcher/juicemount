@@ -1245,3 +1245,105 @@ func TestPrefetchChildrenSkipsFilteredNamespace(t *testing.T) {
 		t.Fatalf("root fan-out descended into .juicemount (%d children mirrored)", len(kids))
 	}
 }
+
+// A prefetch whose rows take more than one batch publishes them a batch (and
+// a cache chunk) at a time. The folder is recorded before the first batch,
+// so a READDIR in between re-lists it instead of serving part of it as the
+// whole folder, and the record this pass made is cleared once all landed.
+func TestPrefetchChildrenRecordsMultiBatchPublication(t *testing.T) {
+	jfs, store, fuseRoot := newDirRefreshHarness(t)
+	h := jfs.handler
+	names := make([]string, coldListingInsertBatch+1)
+	for i := range names {
+		names[i] = fmt.Sprintf("f%04d.mov", i)
+	}
+	mkFUSEDir(t, fuseRoot, "big", names...)
+	recorded := false
+	called := false
+	prefetchPublishHook = func(dir string) {
+		if dir != "big" {
+			return
+		}
+		called = true
+		recorded, _ = store.HasDirListingIncomplete("big")
+	}
+	t.Cleanup(func() { prefetchPublishHook = nil })
+
+	h.prefetchChildren("big")
+	if !called {
+		t.Fatal("the prefetch never published (test inconclusive)")
+	}
+	if !recorded {
+		t.Fatal("a multi-batch prefetch published without recording the folder first")
+	}
+	if kids, _ := store.ListChildren("big"); len(kids) != len(names) {
+		t.Fatalf("prefetch mirrored %d of %d children", len(kids), len(names))
+	}
+	if has, _ := store.HasDirListingIncomplete("big"); has {
+		t.Fatal("the prefetch left its own record after every row landed")
+	}
+}
+
+// bigPrefetchFolder makes a FUSE folder whose prefetch takes more than one
+// batch, so the pass records it.
+func bigPrefetchFolder(t *testing.T, fuseRoot string) int {
+	t.Helper()
+	names := make([]string, coldListingInsertBatch+1)
+	for i := range names {
+		names[i] = fmt.Sprintf("f%04d.mov", i)
+	}
+	mkFUSEDir(t, fuseRoot, "big", names...)
+	return len(names)
+}
+
+// The incomplete record is shared by every listing path. A mark another
+// pass makes while a multi-batch prefetch publishes (here a cold listing
+// that left a stat parked) must survive the prefetch's own clear.
+func TestPrefetchChildrenKeepsAConcurrentMark(t *testing.T) {
+	jfs, store, fuseRoot := newDirRefreshHarness(t)
+	h := jfs.handler
+	n := bigPrefetchFolder(t, fuseRoot)
+	prefetchPublishHook = func(dir string) {
+		if dir == "big" {
+			h.markDirListingIncomplete("big", nil)
+		}
+	}
+	t.Cleanup(func() { prefetchPublishHook = nil })
+
+	h.prefetchChildren("big")
+	if kids, _ := store.ListChildren("big"); len(kids) != n {
+		t.Fatalf("prefetch mirrored %d of %d children (test inconclusive)", len(kids), n)
+	}
+	if has, _ := store.HasDirListingIncomplete("big"); !has {
+		t.Fatal("the prefetch cleared a record another pass made after its own mark")
+	}
+	h.dirRefreshMu.Lock()
+	st := h.dirIncomplete["big"]
+	h.dirRefreshMu.Unlock()
+	if st == nil {
+		t.Fatal("the record left memory, so READDIR would not re-list the folder")
+	}
+}
+
+// A prefetch that skipped a child (its stat failed) is a partial pass: it
+// must not clear the record it made before publishing.
+func TestPrefetchChildrenWithFailedStatKeepsItsRecord(t *testing.T) {
+	jfs, store, fuseRoot := newDirRefreshHarness(t)
+	h := jfs.handler
+	n := bigPrefetchFolder(t, fuseRoot)
+	prefetchEntriesHook = func(dir string, entries []os.DirEntry) []os.DirEntry {
+		if dir != "big" {
+			return entries
+		}
+		return append(entries, errDirEntry{name: "lost.mov", err: syscall.EIO})
+	}
+	t.Cleanup(func() { prefetchEntriesHook = nil })
+
+	h.prefetchChildren("big")
+	if kids, _ := store.ListChildren("big"); len(kids) != n {
+		t.Fatalf("prefetch mirrored %d of %d children (test inconclusive)", len(kids), n)
+	}
+	if has, _ := store.HasDirListingIncomplete("big"); !has {
+		t.Fatal("a prefetch that skipped a child cleared the folder's record")
+	}
+}

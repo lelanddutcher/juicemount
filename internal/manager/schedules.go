@@ -469,15 +469,13 @@ func resolveScheduleSpec(r scheduleState, dests *destinationStoreImpl, fuseRoot 
 	if err != nil {
 		return "", "", nil, fmt.Sprintf("resolve destination %q: %v", r.Destination.Name, err)
 	}
-	baseURI, env, err := d.ToSyncURI(r.Options.PreserveStructure)
+	// The optional sub-path from DestinationRef.Path is stitched in with
+	// appendDestPath's trailing-slash convention; for a file destination
+	// the result must still resolve inside the checked destination.
+	destURI, env, err = d.ToSyncURIWithSub(r.Destination.Path, r.Options.PreserveStructure)
 	if err != nil {
 		return "", "", nil, fmt.Sprintf("destination ToSyncURI: %v", err)
 	}
-	// Append the optional sub-path from DestinationRef.Path. We're
-	// careful with trailing slashes — matchSlash already applied the
-	// preserveStructure convention to baseURI, so we keep that suffix
-	// intact and stitch the path in BEFORE the trailing slash.
-	destURI = appendDestPath(baseURI, r.Destination.Path, r.Options.PreserveStructure)
 	// Source is passed through raw; RunSync calls normalizeAnyURI on
 	// it (sync.go line 138) using spec.FUSEMount, so /jfs/... sources
 	// get rewritten to file:///<fuseRoot>/... at exec time. Code

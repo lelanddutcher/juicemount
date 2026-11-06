@@ -105,6 +105,8 @@ created through a mount cannot be identified atomically.
 | `JM_SMART_FOLDERS` | `off` | `on` enables smart folders. |
 | `JM_SMART_FOLDERS_ROOT` | `Recents` | Name of the top-level folder. |
 | `JM_SMART_FOLDERS_MAX_VIEWS` | `256` | Most views (top-level folders) kept, 1 to 4096. |
+| `JM_SMART_FOLDERS_COLLECTIONS_ROOT` | `Collections` | Root of the collection views (below; they also need `JM_CONTINUITY=on`). |
+| `JM_SMART_FOLDERS_QUERIES_ROOT` | `Queries` | Root of the saved-query views (below; they also need `JM_CONTINUITY=on`). |
 
 How it behaves:
 
@@ -118,8 +120,8 @@ How it behaves:
   anything else got there first. It never modifies anything else: an
   existing `Recents` it did not create (even an empty one) is left alone and
   looked at again every 10 minutes, and a file someone drops into a view is
-  never touched. It never removes a directory: a view whose files all age
-  out stays, empty. Without a state file the feature stays off.
+  never touched. It never removes a `Recents` directory: a view whose files
+  all age out stays, empty. Without a state file the feature stays off.
 - **Only real folders get views.** A top-level folder must exist on the
   volume before it is tracked, so change events naming made-up folders cost
   nothing. The state file is bounded (at most `MAX_VIEWS` x 100 entries).
@@ -129,6 +131,112 @@ How it behaves:
   (`/Recents/<folder>`) as trash restore does, and only when the view needs
   to change. A refused checkout or failed write backs off (30 s doubling to
   30 min) and is logged once.
+
+**Collection views (experimental, also need `JM_CONTINUITY=on`).** With
+both switches on, the Manager also keeps `Collections/<collection name>/`: one
+relative symlink per member file that is present, pointing at the file's
+current path (found from its inode, so it follows renames and moves). The same
+ownership rules apply, with records of their own in `smart-folders.json`
+(version 3 once they exist; an older Manager refuses that file and leaves it
+alone). A user-made `Collections` is left alone and only stops these views (for
+`Recents` it is an ordinary folder).
+Names: `/`, `:` and control characters become `-`, leading dots are dropped;
+when two collections clash (ignoring case), the collection that already holds
+the name keeps it and the other gets `(2)`; a name a user's folder already
+takes is skipped; a rename that only changes case keeps the folder. Member
+files that clash are labelled with their folder, as in `Recents`. A member
+whose file is gone gets no link (it stays a member). A deleted or renamed
+collection's view is emptied and then removed, unless a user put something in
+it (left alone; a lone Finder `.DS_Store` does not count and is removed with
+it) or the volume refuses. A view folder is a project root; the RESP proxy
+lets the Manager remove one only directly (no rename, no trash) and only when
+it saw the Manager create it in a smart root. A view it refuses (an older
+proxy, or a view made before it kept that record) stays empty and is tried
+again only every 6 hours or after a restart (at most 256 views are recorded,
+left-behind ones included; beyond that none is made). A
+member whose path cannot be read keeps its link. At most 128 views of 500
+links; the rest, missing and unresolved members and views left behind are
+counted in `GET /api/continuity/status` (`collection_views`). Views follow
+collection changes and member-file events within seconds, and are all rebuilt
+every 10 minutes, paced so `Recents` is not held up.
+
+**Saved-query views (experimental, also need `JM_CONTINUITY=on`).** A saved
+query (`/api/queries`, created by the admin or by a person whose project
+grants cover all its folders) names one or more folders and optionally a name
+fragment, file extensions and a modified-within window; it lists up to its
+limit (default 200, at most 500) matching files, newest first. With both
+switches on, the Manager keeps `Queries/<query name>/` with one relative
+symlink per result, under the same rules as collection views (records in
+`smart-folders.json`, version 4 once they exist; names, removal, the 6-hour
+retry and the limits are the same). Candidates come from the continuity
+catalog's path hints and every result is checked on the volume by its inode,
+so a link always points at the file's current path; a folder renamed into a
+query's folder is seen only once its files' next change events arrive. Each
+query examines at most its 2,000 most recently changed candidates (bound,
+moved or saved in place, the last noted at most every 10 minutes per file);
+a capped query is named in `GET /api/continuity/status` (`query_views`) and
+its results say `capped`, with how many were examined. Views follow query
+changes within seconds and file changes under a query's folders at most once
+a minute, and are all rebuilt every 10 minutes (files leave a
+modified-within window without any event). A library holds at most 256
+queries, a person at most 32. The continuity catalog stays at format 3 (still
+readable by a Manager from before saved queries) until the first query is
+created.
+
+**Agent discovery (experimental, needs `JM_CONTINUITY=on`; smart folders
+not required).** A person can let an AI agent (the JuiceMount MCP server on
+their Mac) find files and edit collections as them. They mint an agent token
+from one of their own approved Macs (`POST /api/agent-tokens` with the Mac's
+collection credentials, `{name, expires_in_days}`; at most 90 days, the
+default, and 10 live tokens a person). The token (`jma_...`) is shown once;
+the principal store keeps only its hash. It is sent as
+`Authorization: Bearer jma_...` and works only on an allowlist: listing and
+reading collections and their members, creating and renaming collections and
+adding or removing members (within the person's grants, as for their Mac),
+listing saved queries and their results, and the two discovery routes below.
+Every other route answers 403, including deleting a collection, query
+changes, people, enrollment and anything that moves or returns file bytes.
+A token stops working when it expires or is revoked, its person is removed,
+or the Mac that minted it is revoked, flagged as cloned, unassigned or given
+to someone else (it does not come back if that is undone): from then on
+every new request is refused, and an edit already under way is checked again
+just before it is written and refused; a read already running finishes. An
+agent sees collection members and saved-query results only inside its
+person's grants; the rest are counted in `withheld`, without names (Macs and
+the admin see them whole). A refused use of a revoked or expired token is
+recorded in the audit log (once a minute per token). Note: the Manager
+treats any request carrying `Authorization: Bearer` as an agent, so a
+reverse proxy in front of it must not forward its own bearer credentials
+to the Manager (they would be refused, 401 or 403). The
+person lists and revokes their tokens from a Mac (`GET /api/agent-tokens`,
+`POST /api/agent-tokens/{id}/revoke`); the admin lists and revokes any (the
+same routes with the admin key, and the People page). Mints, revokes and
+every agent edit are recorded in the catalog audit log (`catalog-audit/`
+beside the principal store; `GET /api/audit?log=catalog`) with the person,
+the minting Mac and the token; a mint or an agent edit is refused if the log
+cannot record it first.
+
+`GET /api/continuity/find` pages through the catalogued files (admin key, a
+Mac's credentials or an agent token) with filters `name` (a fragment,
+ignoring case), `folder` (repeatable), `collection`, `modified_after` (RFC
+3339 or unix ms), `seen_after` (a catalog sequence), `ext` and `kind`
+(`video`, `audio`, `image`, `project`, `document`), `limit` (default 50, at
+most 200) and `cursor` (the previous answer's `next`). Each result has the
+asset ID, current name, first label, the catalog's path hint, the current
+path under the mount root, size, modification time and its collections. A
+person (or their agent) sees only files their grants cover (an agent's
+request reads at most 20,000 hints and resolves 250 files within 10 s, so
+agents, which share one request slot, take turns); for them
+`path_hint` is shown only inside their grants and `label` only when it is
+the file's current name. A request reads
+at most 100,000 catalog hints and resolves at most 1,000 files on the
+volume; a page cut short says `budget_exhausted` and its `next` (always
+past the cursor given) continues it; with no `next` the scan is complete. A
+request that could not examine a single file in time answers 503 with
+`Retry-After`; retry it with the same cursor. `GET /api/continuity/asset/{asset_id}` returns one file (404 when it is
+gone or outside the caller's grants). The Mac side, `juicemount-mcp` (minting a
+token and adding the server to Claude Desktop or Claude Code), is described in
+`docs/agent-mcp.md`.
 
 Known gaps:
 

@@ -21,6 +21,14 @@
       "Resource": [
         "arn:aws:s3:::zpool"
       ]
+    },
+    {
+      "Sid": "JuiceMountClientNoSelfCredentials",
+      "Effect": "Deny",
+      "Action": [
+        "admin:CreateServiceAccount",
+        "admin:CreateUser"
+      ]
     }
   ]
 }

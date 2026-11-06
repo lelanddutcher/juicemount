@@ -54,6 +54,7 @@ var (
 var dirListingMaxTracked = 8192
 
 type dirListingState struct {
+	mark     uint64 // token of the latest mark (h.dirListingMarks); 0 if loaded
 	failures int
 	retryAt  time.Time
 	parked   []<-chan struct{} // closed when that earlier FUSE call returns
@@ -183,6 +184,8 @@ func (h *JuiceMountHandler) markDirListingIncomplete(dirname string, parked []<-
 	defer h.dirListingPersistMu.Unlock()
 	h.dirRefreshMu.Lock()
 	st, created := h.dirListingStateLocked(dirname)
+	h.dirListingMarks++
+	st.mark = h.dirListingMarks
 	st.failures++
 	backoff := dirListingRetryBase
 	for i := 1; i < st.failures && backoff < dirListingRetryMax; i++ {
@@ -206,12 +209,59 @@ func (h *JuiceMountHandler) markDirListingUnknown(dirname string) bool {
 	h.dirListingPersistMu.Lock()
 	defer h.dirListingPersistMu.Unlock()
 	h.dirRefreshMu.Lock()
-	_, created := h.dirListingStateLocked(dirname)
+	st, created := h.dirListingStateLocked(dirname)
+	h.dirListingMarks++
+	st.mark = h.dirListingMarks
 	h.dirRefreshMu.Unlock()
 	if created {
 		h.persistDirListingMark(dirname)
 	}
 	return created
+}
+
+// markDirListingOwned is markDirListingUnknown for a pass that will clear
+// its own record. It returns the mark's token, or 0 when dirname was
+// already recorded: that record is not the pass's to clear.
+func (h *JuiceMountHandler) markDirListingOwned(dirname string) uint64 {
+	h.dirListingPersistMu.Lock()
+	defer h.dirListingPersistMu.Unlock()
+	h.dirRefreshMu.Lock()
+	st, created := h.dirListingStateLocked(dirname)
+	h.dirListingMarks++
+	st.mark = h.dirListingMarks
+	token := st.mark
+	h.dirRefreshMu.Unlock()
+	if !created {
+		return 0
+	}
+	h.persistDirListingMark(dirname)
+	return token
+}
+
+// clearDirListingOwned clears dirname's record only while its latest mark
+// is still token: a mark any other path made since then keeps the record.
+// It reports whether it cleared. dirListingPersistMu is held from the check
+// through the DB delete, so no mark lands in between.
+func (h *JuiceMountHandler) clearDirListingOwned(dirname string, token uint64) bool {
+	h.dirListingPersistMu.Lock()
+	defer h.dirListingPersistMu.Unlock()
+	h.dirRefreshMu.Lock()
+	st := h.dirIncomplete[dirname]
+	if st == nil || st.mark != token {
+		h.dirRefreshMu.Unlock()
+		return false
+	}
+	delete(h.dirIncomplete, dirname)
+	h.dirIncompleteCount.Store(int64(len(h.dirIncomplete)))
+	h.dirRefreshMu.Unlock()
+	deleted, err := h.store.ClearDirListingIncomplete(dirname)
+	if err != nil {
+		jmlog.Warn("dir listing record not cleared", "dir", dirname, "error", err.Error())
+	}
+	if h.dirIncompleteSpilled.Load() && deleted {
+		h.unspillDirListingLocked()
+	}
+	return true
 }
 
 // clearDirListingIncomplete is called after a complete pass, or one that

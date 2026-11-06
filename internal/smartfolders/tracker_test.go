@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -120,6 +121,26 @@ func TestTrackerIgnoredPaths(t *testing.T) {
 	tr.Apply(Event{Op: "reconcile", Path: "A/two.mov"})
 	if got := paths(tr.Recent("A")); !reflect.DeepEqual(got, []string{"A/two.mov", "A/one.mov"}) {
 		t.Fatalf("Recent = %v", got)
+	}
+}
+
+// Ignore drops another smart root's subtree, on create and rename alike.
+func TestTrackerIgnoreOtherRoot(t *testing.T) {
+	var on atomic.Bool
+	tr, err := NewTracker(TrackerConfig{Ignore: func(top string) bool { return on.Load() && top == "Collections" }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	on.Store(true)
+	tr.Apply(Event{Op: "create", Path: "Collections/Shoot/notes.txt"})
+	tr.Apply(Event{Op: "rename", OldPath: "A/x.mov", Path: "Collections/Shoot/x.mov"})
+	if got := tr.Folders(); len(got) != 0 {
+		t.Fatalf("tracked %v", got)
+	}
+	on.Store(false)
+	tr.Apply(Event{Op: "create", Path: "Collections/Shoot/notes.txt"})
+	if got := tr.Folders(); !reflect.DeepEqual(got, []string{"Collections"}) {
+		t.Fatalf("tracked %v", got)
 	}
 }
 

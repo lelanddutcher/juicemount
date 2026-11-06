@@ -182,6 +182,7 @@ type JuiceMountHandler struct {
 	dirIncomplete        map[string]*dirListingState
 	dirIncompleteCount   atomic.Int64
 	dirIncompleteSpilled atomic.Bool
+	dirListingMarks      uint64 // last mark token (dirlisting.go), guarded by dirRefreshMu
 	dirListingPersistMu  sync.Mutex
 
 	// Verifier cleanup lifecycle
@@ -1639,7 +1640,11 @@ func (h *JuiceMountHandler) prefetchChildren(dirname string) {
 		entry  *metadata.Entry // non-nil ⇒ needs mirror insert
 		subdir string          // non-empty ⇒ a subdirectory to one-level pre-warm
 	}
+	if hook := prefetchEntriesHook; hook != nil {
+		dirEntries = hook(dirname, dirEntries)
+	}
 	results := make([]prefetchResult, len(dirEntries))
+	var statFailed atomic.Bool // a child skipped: the pass is partial
 	fanout := coldListFanout(netprofile.Default().Class())
 	sem := make(chan struct{}, fanout)
 	var wg sync.WaitGroup
@@ -1659,6 +1664,7 @@ func (h *JuiceMountHandler) prefetchChildren(dirname string) {
 			defer func() { <-sem }()
 			info, err := de.Info()
 			if err != nil {
+				statFailed.Store(true)
 				// Don't fail the scan on one bad entry. This only skips ADDING a
 				// new mirror row; a child already in the mirror is untouched (we
 				// never delete here), so a transient stat failure can't erase a
@@ -1713,13 +1719,30 @@ func (h *JuiceMountHandler) prefetchChildren(dirname string) {
 		}
 	}
 
+	// Rows that take more than one batch are visible a batch (SQLite) or a
+	// cache chunk at a time, and a READDIR serves a folder's rows as the
+	// whole folder: record it first, as the cold listing does. The pass
+	// clears only its own mark, and only if it skipped no child: an earlier
+	// record, or a mark another pass made meanwhile, stays.
+	var mark uint64
+	if len(toInsert) > coldListingInsertBatch {
+		mark = h.markDirListingOwned(dirname)
+	}
+	if hook := prefetchPublishHook; hook != nil {
+		hook(dirname)
+	}
 	if len(toInsert) > 0 {
 		// Batch-3 adversarial review #1: insert-if-absent, checked inside the
 		// store's own critical sections — a fresher row (push event/CREATE/
 		// reconcile) landing between the LookupByPath filter above and this
 		// batch must never be overwritten by our older FUSE snapshot. Same
 		// TOCTOU (and fix) as refreshUnmirroredDir.
-		h.store.BulkInsertAbsent(toInsert, 500)
+		err := h.store.BulkInsertAbsent(toInsert, coldListingInsertBatch)
+		// On an error some batches may have landed: keep the record.
+		if err == nil && mark != 0 && !statFailed.Load() && h.clearDirListingOwned(dirname, mark) {
+			// A READDIR in between may hold part of the folder.
+			h.store.NoteDirectoryChanged(dirname)
+		}
 	}
 
 	// Gate the recursive subdir fan-out (remote folder-nav perf fix). The
@@ -3579,6 +3602,14 @@ var coldListingEntriesHook func(dirname string, entries []os.DirEntry) []os.DirE
 // a cold listing pass published its rows (the instant a crash would freeze).
 // Nil in production; set only while no listing pass is running.
 var coldListingPublishedHook func(dirname string)
+
+// prefetchEntriesHook lets tests substitute the FUSE readdir result that
+// prefetchChildren stats. Nil in production; set only while no prefetch runs.
+var prefetchEntriesHook func(dirname string, entries []os.DirEntry) []os.DirEntry
+
+// prefetchPublishHook lets tests observe a prefetch pass just before it
+// publishes its rows. Nil in production; set only while no prefetch runs.
+var prefetchPublishHook func(dirname string)
 
 // coldListingInsertBatch is the batch size a cold listing pass publishes in.
 const coldListingInsertBatch = 500

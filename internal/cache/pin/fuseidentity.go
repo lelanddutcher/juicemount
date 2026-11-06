@@ -133,8 +133,12 @@ func checkFUSEIdentity(path string) (bool, string) {
 	}
 	ch := make(chan res, 1)
 	go func() {
-		defer func() { <-fuseIdentityProbeGate }()
 		ok, reason := statfsIdentityOK(path)
+		// Free the slot before handing over the result: released after the
+		// send, the caller could return and consult again while this
+		// goroutine still held it, and that consult read "already in
+		// flight" (a wedge) for a mount whose statfs had just returned.
+		<-fuseIdentityProbeGate
 		ch <- res{ok: ok, reason: reason}
 	}()
 	select {

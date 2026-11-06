@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"syscall"
@@ -36,6 +37,7 @@ err() { printf '{"status":"error","error":{"message":"%s"}}\n' "$1"; exit 1; }
 case "$op" in
 ls)
   [ -n "${FAKE_MC_FAIL_LS:-}" ] && err "connection refused"
+  [ -n "${FAKE_MC_LS_NUL:-}" ] && printf '{"status":"success","accessKey":"%s"}\n\0' "$FAKE_MC_LS_NUL"
   for f in "$st"/sa.*; do
     [ -e "$f" ] || continue
     read -r p s < "$f"
@@ -960,6 +962,7 @@ func (l *keydLoop) cycles(n int) {
 func (l *keydLoop) stop(limit time.Duration) time.Duration {
 	l.r.t.Helper()
 	start := time.Now()
+	lsAtTerm := len(l.r.calls("ls"))
 	if err := l.cmd.Process.Signal(syscall.SIGTERM); err != nil {
 		l.r.t.Fatal(err)
 	}
@@ -977,7 +980,13 @@ func (l *keydLoop) stop(limit time.Duration) time.Duration {
 		case <-l.done: // exec has copied all output
 		case <-time.After(limit):
 		}
-		l.r.t.Fatalf("keyd did not exit within %v of TERM:\n%s\nkeyd process state at the deadline:\n%s", limit, l.out.String(), state)
+		// keyd starts every cycle with svcacct ls. New cycles after the TERM
+		// mean the trap never ran (the signal was lost), not a slow exit.
+		lost := ""
+		if n := len(l.r.calls("ls")) - lsAtTerm; n > 1 {
+			lost = fmt.Sprintf("TERM LOST: keyd started %d more cycles after the TERM, so its trap never ran\n", n)
+		}
+		l.r.t.Fatalf("keyd did not exit within %v of TERM:\n%s%s\nkeyd process state at the deadline:\n%s", limit, lost, l.out.String(), state)
 	}
 	return time.Since(start)
 }
@@ -1168,6 +1177,146 @@ func TestKeydLoopNeverActsOnRefusedFile(t *testing.T) {
 	}
 	if ap := r.applied(); !strings.HasPrefix(ap.Error, "refused desired.json: not strict JSON") || ap.Seq != 3 {
 		t.Fatalf("applied = %+v", ap)
+	}
+	l.stop(10 * time.Second)
+}
+
+// keyd runs no command substitution or process substitution after its
+// stop trap is set. Bash 5.2 parses a substitution again when it expands it
+// and runs pending traps from inside that parse, where a trap can be
+// consumed without running (seen for $(<file) and $(function)); a TERM lost
+// that way left keyd cycling until it was killed. The whole script is
+// scanned, helper bodies defined above the trap included, except the
+// key admin URL encoding, which runs once before the trap is set.
+func TestKeydRunsNoCommandSubstitutionUnderStopTrap(t *testing.T) {
+	b, err := os.ReadFile("keyd.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(string(b), "\n")
+	trap, allowFrom, allowTo := -1, -1, -1
+	for i, line := range lines {
+		switch code := strings.TrimSpace(line); {
+		case code == "trap on_stop TERM INT":
+			trap = i
+		case code == "urlenc() {":
+			allowFrom = i
+		case strings.HasPrefix(code, "export MC_HOST_jmkeyd="):
+			allowTo = i
+		}
+	}
+	if trap < 0 || allowFrom < 0 || allowTo < allowFrom || allowTo > trap {
+		t.Fatalf("keyd.sh layout changed: trap line %d, pre-trap URL encoding lines %d-%d", trap+1, allowFrom+1, allowTo+1)
+	}
+	for i, line := range lines {
+		code := strings.TrimSpace(line)
+		if strings.HasPrefix(code, "#") || (i >= allowFrom && i <= allowTo) {
+			continue
+		}
+		c := strings.ReplaceAll(code, "$((", "")
+		for _, bad := range []string{"$(", "`", "<(", ">("} {
+			if strings.Contains(c, bad) {
+				t.Errorf("keyd.sh:%d has %q, which keyd may run under the stop trap: %s", i+1, bad, code)
+			}
+		}
+	}
+}
+
+// keyd runs under every Bash from 3.2 (macOS's /bin/bash, which the Mac
+// CI and developers use) to 5.3. This flags the Bash 4+ features most
+// likely to slip in; printf's %(...)T (4.2) did, and every keyd test
+// failed on the Mac.
+func TestKeydUsesOnlyBash32Features(t *testing.T) {
+	b, err := os.ReadFile("keyd.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bad := map[string]string{
+		"%(":           "printf %(...)T (Bash 4.2)",
+		",,}":          "${var,,} (Bash 4)",
+		"^^}":          "${var^^} (Bash 4)",
+		"declare -A":   "associative arrays (Bash 4)",
+		"local -A":     "associative arrays (Bash 4)",
+		"declare -n":   "namerefs (Bash 4.3)",
+		"local -n":     "namerefs (Bash 4.3)",
+		"mapfile":      "mapfile (Bash 4)",
+		"readarray":    "readarray (Bash 4)",
+		"[[ -v":        "[[ -v ]] (Bash 4.2)",
+		"|&":           "|& (Bash 4)",
+		"&>>":          "&>> (Bash 4)",
+		"coproc":       "coproc (Bash 4)",
+		"wait -n":      "wait -n (Bash 4.3)",
+		";;&":          ";;& (Bash 4)",
+		"EPOCHSECONDS": "EPOCHSECONDS (Bash 5)",
+	}
+	transform := regexp.MustCompile(`\$\{[A-Za-z_][A-Za-z_0-9]*@`)
+	for i, line := range strings.Split(string(b), "\n") {
+		code := strings.TrimSpace(line)
+		if strings.HasPrefix(code, "#") {
+			continue
+		}
+		for pat, what := range bad {
+			if strings.Contains(code, pat) {
+				t.Errorf("keyd.sh:%d uses %s: %s", i+1, what, code)
+			}
+		}
+		if transform.MatchString(code) {
+			t.Errorf("keyd.sh:%d uses ${var@op} (Bash 4.4): %s", i+1, code)
+		}
+		if strings.Contains(strings.ReplaceAll(code, "${EPOCHREALTIME:-}", ""), "EPOCHREALTIME") {
+			t.Errorf("keyd.sh:%d reads EPOCHREALTIME (Bash 5) without a fallback: %s", i+1, code)
+		}
+	}
+}
+
+// mc never writes a NUL byte; a reply with one is a failed call, not a
+// listing cut short at the NUL that keyd would act on.
+func TestKeydRefusesMcOutputWithNul(t *testing.T) {
+	r := newKeydRig(t)
+	a := macName(1, 1)
+	r.desired(desiredJSON(1, "", a))
+	out, err := r.run("FAKE_MC_LS_NUL=" + macName(9, 1))
+	if err == nil {
+		t.Fatalf("keyd treated a NUL reply as a listing:\n%s", out)
+	}
+	if !strings.Contains(out, "mc svcacct ls output has a NUL byte; treating the call as failed") {
+		t.Fatalf("no log line for the NUL reply:\n%s", out)
+	}
+	if c := append(r.calls("add"), r.calls("rm")...); len(c) != 0 {
+		t.Fatalf("keyd acted on a NUL reply: %q", c)
+	}
+}
+
+// read_file strips a long run of trailing newlines in linear time: one
+// newline per pass took over 10 s a cycle for 50,000 of them.
+func TestKeydReadsLongTrailingNewlinesQuickly(t *testing.T) {
+	r := newKeydRig(t)
+	a := macName(1, 1)
+	r.desired(desiredJSON(1, "", a) + strings.Repeat("\n", 50000))
+	start := time.Now()
+	out := r.mustRun()
+	if took := time.Since(start); took > 5*time.Second {
+		t.Fatalf("one keyd cycle took %v with 50,000 trailing newlines", took)
+	}
+	if ap := r.applied(); ap.Error != "" || ap.Seq != 1 || !r.exists(a) {
+		t.Fatalf("applied = %+v\n%s", ap, out)
+	}
+}
+
+// A NUL byte refuses desired.json even when the rest of the file is the
+// text keyd last accepted (the parse cache must never hold a NUL file).
+func TestKeydLoopRefusesNulAfterAcceptedFile(t *testing.T) {
+	r := newKeydRig(t)
+	a := macName(1, 1)
+	accepted := `{"seq":3,"keys":[{"name":"` + a + `","state":"active"}]}`
+	r.desired(accepted)
+	l := r.startLoop()
+	l.waitFor("the valid file to be applied", 15*time.Second, func() bool { return r.exists(a) })
+	l.cycles(1)
+	r.desired(accepted + "\x00")
+	l.cycles(2)
+	if ap := r.applied(); ap.Error != "refused desired.json: not strict JSON: a NUL byte" || ap.Seq != 3 {
+		t.Fatalf("applied after a NUL byte = %+v\n%s", ap, l.out.String())
 	}
 	l.stop(10 * time.Second)
 }

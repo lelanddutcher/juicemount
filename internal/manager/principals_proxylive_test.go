@@ -464,3 +464,68 @@ func TestH8BManagerIDPersistedAndSent(t *testing.T) {
 		}
 	}
 }
+
+// TestH8BReceiptsWrittenBetweenReadsAreCurrent: the proxy writes
+// reload.applied and then reload.ack in one tick. A tick that lands between
+// the Manager's two receipt reads must not make a current image look like
+// one that writes only the legacy reload.ack (the 409 "update the
+// jm-respproxy image" on the first approval after a start).
+func TestH8BReceiptsWrittenBetweenReadsAreCurrent(t *testing.T) {
+	dir := t.TempDir()
+	s, err := NewPrincipalStore(PrincipalStoreOptions{StatePath: filepath.Join(dir, "state.json"), ProxyDir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fakeProxyWrite(dir, reloadHeartbeatName, "1")
+	req := requestLine(filepath.Join(dir, reloadRequestName))
+	ticked := false
+	proxyBetweenAckReads = func() {
+		if !ticked {
+			ticked = true
+			fakeProxyWrite(dir, reloadAckName, req)
+			fakeProxyWrite(dir, legacyReloadAckName, req)
+		}
+	}
+	t.Cleanup(func() { proxyBetweenAckReads = nil })
+	snap := s.Snapshot()
+	if !ticked {
+		t.Fatal("the receipt reads did not run the hook")
+	}
+	if !snap.ProxyLive || snap.ProxyProblem != "" {
+		t.Fatalf("a current proxy's first ack, written between the receipt reads, read as live=%v problem=%q",
+			snap.ProxyLive, snap.ProxyProblem)
+	}
+}
+
+// TestH8BProxyStartBetweenReadsIsNotOutdated: a starting proxy deletes
+// reload.ack and then reload.applied. A start that lands between the
+// Manager's two receipt reads pairs the old reload.ack with an empty
+// reload.applied, which must not read as an image that writes only the
+// legacy receipt (a false 409 "update the jm-respproxy image").
+func TestH8BProxyStartBetweenReadsIsNotOutdated(t *testing.T) {
+	dir := t.TempDir()
+	s, err := NewPrincipalStore(PrincipalStoreOptions{StatePath: filepath.Join(dir, "state.json"), ProxyDir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fakeProxyWrite(dir, reloadHeartbeatName, "1")
+	req := requestLine(filepath.Join(dir, reloadRequestName))
+	fakeProxyWrite(dir, reloadAckName, req)
+	fakeProxyWrite(dir, legacyReloadAckName, req)
+	started := false
+	proxyBetweenAckReads = func() {
+		if !started {
+			started = true
+			os.Remove(filepath.Join(dir, legacyReloadAckName))
+			os.Remove(filepath.Join(dir, reloadAckName))
+		}
+	}
+	t.Cleanup(func() { proxyBetweenAckReads = nil })
+	snap := s.Snapshot()
+	if !started {
+		t.Fatal("the receipt reads did not run the hook")
+	}
+	if snap.ProxyProblem == proxyProblemText(proxyOutdated) {
+		t.Fatalf("a proxy start between the receipt reads read as an outdated image: %q", snap.ProxyProblem)
+	}
+}

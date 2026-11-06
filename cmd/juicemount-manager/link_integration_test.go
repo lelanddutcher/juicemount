@@ -35,6 +35,7 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -47,14 +48,106 @@ import (
 	"tailscale.com/tsnet"
 )
 
-func freeLoopbackPort(t *testing.T) int {
+// loopbackAnyPort is a listen address for a Headscale listener the test
+// never dials (metrics, gRPC): the kernel picks the port when Headscale
+// binds, so nothing can take it first.
+const loopbackAnyPort = "127.0.0.1:0"
+
+// startLoopbackHeadscale starts Headscale the way the Manager does, on a
+// free loopback port, and returns it serving with that address. prepare
+// writes everything that names the address (config.yaml, the DERP map with
+// its STUN port, the control URL) and runs again for each new address.
+//
+// Headscale is another process, so the test cannot hand it a listener: it
+// finds a free port, closes it, and Headscale binds it moments later.
+// Another socket can take the port in between (a test in another package,
+// an outgoing connection's ephemeral port). Headscale then exits with
+// "address already in use" and its supervisor restarts it on the same
+// port, which heals when the other socket was brief and never when it
+// stays. So a start that fails while the port (or the STUN port) is bound
+// by another socket is retried on new ports; any other failure is fatal as
+// before.
+func startLoopbackHeadscale(t *testing.T, prepare func(listen string)) (*headscaleSupervisor, string) {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
+	const attempts = 3
+	for attempt := 1; ; attempt++ {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		listen := ln.Addr().String()
+		_ = ln.Close()
+		prepare(listen)
+		stun := os.Getenv("HEADSCALE_DERP_SERVER_STUN_LISTEN_ADDR")
+		hs := newHeadscaleSupervisor()
+		hs.listen = listen
+		hs.Start()
+		taken, err := waitHeadscaleServing(hs, listen, stun, 90*time.Second)
+		if err == nil {
+			return hs, listen
+		}
+		hs.Stop()
+		if taken == "" || attempt == attempts {
+			t.Fatalf("headscale did not reach running: %v", err)
+		}
+		t.Logf("headscale: %s was bound by another socket before Headscale could bind it; retrying on new ports", taken)
 	}
-	defer ln.Close()
-	return ln.Addr().(*net.TCPAddr).Port
+}
+
+// waitHeadscaleServing waits until hs runs and Headscale itself answers
+// /health on listen (a listener someone else holds there also accepts the
+// supervisor's readiness dial). While hs is in backoff it checks whether
+// another socket holds listen or stun, and returns that address if so.
+func waitHeadscaleServing(hs *headscaleSupervisor, listen, stun string, timeout time.Duration) (taken string, err error) {
+	deadline := time.Now().Add(timeout)
+	client := &http.Client{Timeout: time.Second}
+	for {
+		st := hs.status.snapshot()
+		if st.State == "running" && headscaleHealthy(client, listen) {
+			return "", nil
+		}
+		if st.State == "backoff" {
+			if addrBound("tcp", listen) {
+				return listen, fmt.Errorf("%s is bound by another socket: %+v", listen, st)
+			}
+			if stun != "" && addrBound("udp", stun) {
+				return stun, fmt.Errorf("STUN %s is bound by another socket: %+v", stun, st)
+			}
+		}
+		if time.Now().After(deadline) {
+			return "", fmt.Errorf("%+v", st)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+func headscaleHealthy(client *http.Client, listen string) bool {
+	resp, err := client.Get("http://" + listen + "/health")
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+	return resp.StatusCode == http.StatusOK && strings.Contains(string(b), `"pass"`)
+}
+
+// addrBound reports whether binding addr fails with EADDRINUSE: another
+// socket holds it. Headscale is not running while its supervisor backs off,
+// so the holder is not Headscale.
+func addrBound(network, addr string) bool {
+	var err error
+	if network == "udp" {
+		var c net.PacketConn
+		if c, err = net.ListenPacket("udp4", addr); err == nil {
+			_ = c.Close()
+		}
+	} else {
+		var ln net.Listener
+		if ln, err = net.Listen("tcp", addr); err == nil {
+			_ = ln.Close()
+		}
+	}
+	return errors.Is(err, syscall.EADDRINUSE)
 }
 
 // localDERPMap turns on the test Headscale's embedded DERP relay and STUN
@@ -265,21 +358,9 @@ func runLinkIntegration(t *testing.T, tc linkIntegrationCase) {
 	// The public URL is deliberately unreachable: the NAS node must register
 	// through the local listener, and Macs here use loopback too.
 	const publicURL = "https://link.example.com:30193"
-	hsPort := freeLoopbackPort(t)
-	listen := net.JoinHostPort("127.0.0.1", strconv.Itoa(hsPort))
-	localControl := "http://" + listen
 	derpPath := filepath.Join(dir, "derp.yaml")
-	writeDERPMapYAML(t, derpPath, localDERPMap(t, dir, listen))
 	cfgPath := filepath.Join(dir, "config.yaml")
-	cfg := renderHeadscaleConfig(headscaleConfigParams{
-		ServerURL:     publicURL,
-		Listen:        listen,
-		MetricsListen: net.JoinHostPort("127.0.0.1", strconv.Itoa(freeLoopbackPort(t))),
-		GRPCListen:    net.JoinHostPort("127.0.0.1", strconv.Itoa(freeLoopbackPort(t))),
-		DataDir:       dir,
-		DERPPaths:     []string{derpPath},
-	})
-	policyEnv := ""
+	policyEnv, policyBlock := "", ""
 	switch tc.policy {
 	case "managed":
 	case "off":
@@ -289,10 +370,7 @@ func runLinkIntegration(t *testing.T, tc linkIntegrationCase) {
 		if err := os.WriteFile(operatorPolicy, []byte(tc.policy), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		cfg += "policy:\n  mode: file\n  path: " + operatorPolicy + "\n"
-	}
-	if err := os.WriteFile(cfgPath, []byte(cfg), 0o600); err != nil {
-		t.Fatal(err)
+		policyBlock = "policy:\n  mode: file\n  path: " + operatorPolicy + "\n"
 	}
 
 	// The NAS's "LAN": a documentation prefix that no interface of this host
@@ -310,7 +388,6 @@ func runLinkIntegration(t *testing.T, tc linkIntegrationCase) {
 	t.Setenv("JM_NET_TLS_KEY", "")
 	t.Setenv("JM_NET_HEADSCALE", "on")
 	t.Setenv("JM_NET_NAS_NODE", "on")
-	t.Setenv("JM_NET_NAS_CONTROL_URL", localControl)
 	t.Setenv("JM_NET_NAS_HOSTNAME", "")
 	t.Setenv("JM_NET_NAS_EXPOSURE", "")
 	t.Setenv("JM_NET_NAS_ROUTE", subnet)
@@ -319,15 +396,27 @@ func runLinkIntegration(t *testing.T, tc linkIntegrationCase) {
 	// The policy allows 30179 and the Manager's 30190; the NAS node below
 	// also serves 30199, which no rule allows.
 	t.Setenv("JM_NET_NAS_SERVICES", "30179="+echoAddr+",30190=manager")
-	if _, err := manager.RecordLinkExposureDefault(cfgPath); err != nil {
-		t.Fatal(err)
-	}
 
-	hs := newHeadscaleSupervisor()
-	hs.listen = listen
-	hs.Start()
+	hs, listen := startLoopbackHeadscale(t, func(listen string) {
+		writeDERPMapYAML(t, derpPath, localDERPMap(t, dir, listen))
+		cfg := renderHeadscaleConfig(headscaleConfigParams{
+			ServerURL:     publicURL,
+			Listen:        listen,
+			MetricsListen: loopbackAnyPort,
+			GRPCListen:    loopbackAnyPort,
+			DataDir:       dir,
+			DERPPaths:     []string{derpPath},
+		})
+		if err := os.WriteFile(cfgPath, []byte(cfg+policyBlock), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("JM_NET_NAS_CONTROL_URL", "http://"+listen)
+		if _, err := manager.RecordLinkExposureDefault(cfgPath); err != nil {
+			t.Fatal(err)
+		}
+	})
 	defer hs.Stop()
-	waitForState(t, "headscale", hs.status, 90*time.Second)
+	localControl := "http://" + listen
 
 	impostorKey := ""
 	if tc.impostorFirst {

@@ -82,6 +82,9 @@ type unitFacts struct {
 	unresolvable []string
 	// touched: every inode the unit names (invalidated after it ends).
 	touched []uint64
+	// unlinked (placeUnit): inodes whose entry the unit removes or
+	// replaces (smartview.go forgets them as views once it committed).
+	unlinked []uint64
 }
 
 // statRow is one field of a volume-wide accounting hash: a dir-stat or
@@ -477,6 +480,7 @@ func (e *LeaseEngine) placeUnit(p Principal, u *Unit, f *unitFacts, mode placeMo
 				removed[ino] = append(removed[ino], op.dir)
 				delIno[i] = ino
 				note(ino)
+				f.unlinked = append(f.unlinked, ino)
 			}
 			continue
 		}
@@ -539,6 +543,7 @@ func (e *LeaseEngine) placeUnit(p Principal, u *Unit, f *unitFacts, mode placeMo
 		}
 		if ok && cur != op.ino {
 			removed[cur] = append(removed[cur], op.dir)
+			f.unlinked = append(f.unlinked, cur)
 			if !seen[cur] {
 				seen[cur] = true
 				order = append(order, cur)

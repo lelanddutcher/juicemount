@@ -48,3 +48,24 @@ func dirHandleOp(dirfd int, leaf string, wantIno uint64, perm fs.FileMode) (Info
 	}
 	return in, nil
 }
+
+// rmdirAt removes the directory leaf in dirfd; a non-directory is ENOTDIR.
+func rmdirAt(dirfd int, leaf string) error {
+	return unix.Unlinkat(dirfd, leaf, unix.AT_REMOVEDIR)
+}
+
+// unlinkIfIno unlinks the non-directory leaf in dirfd only if it is inode
+// ino (fstatat right before the unlink, without following a symlink).
+func unlinkIfIno(dirfd int, leaf string, ino uint64) error {
+	var st unix.Stat_t
+	if err := unix.Fstatat(dirfd, leaf, &st, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		return err
+	}
+	if uint64(st.Ino) != ino {
+		return fmt.Errorf("%s is no longer the entry that was checked", leaf)
+	}
+	if st.Mode&unix.S_IFMT == unix.S_IFDIR {
+		return unix.EISDIR
+	}
+	return unix.Unlinkat(dirfd, leaf, 0)
+}

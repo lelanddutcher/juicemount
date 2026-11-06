@@ -45,7 +45,7 @@ func TestRotateAdminKeySuccess(t *testing.T) {
 	bodies := []string{
 		`{"name":"dest-a","kind":"s3","config":{"endpoint":"https://s3.example.com","bucket":"a","access_key":"AK-A","secret_key":"SECRET-A"}}`,
 		`{"name":"dest-b","kind":"s3","config":{"endpoint":"https://s3.example.com","bucket":"b","access_key":"AK-B","secret_key":"SECRET-B"}}`,
-		`{"name":"dest-c","kind":"file","config":{"path":"/tmp/dest-c"}}`,
+		`{"name":"dest-c","kind":"file","config":{"path":"/sources/dest-c"}}`,
 	}
 	for i, body := range bodies {
 		req := httptest.NewRequest(http.MethodPost, "/api/destinations", strings.NewReader(body))

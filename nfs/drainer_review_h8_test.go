@@ -147,7 +147,7 @@ func TestProbeOwnReadOnlySidecarRewrite(t *testing.T) {
 // pass latency.
 func probeDrainLoop(d *Drainer) {
 	for i := 0; i < 40; i++ {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), drainPassDeadline)
 		d.DrainOnceForTest(ctx)
 		cancel()
 		time.Sleep(20 * time.Millisecond)
