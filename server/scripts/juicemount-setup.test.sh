@@ -111,7 +111,7 @@ case "$1" in
   *) exit 0 ;;
 esac
 shift
-[ "$1" = version ] && exit 0
+if [ "$1" = version ]; then [ "${2:-}" != --short ] || echo "${FAKE_COMPOSE_VERSION:-5.0.0}"; exit 0; fi
 for v in JM_ADMIN_KEY COMPOSE_PROFILES COMPOSE_FILE JM_RESPPROXY_MODE JM_AUDIT JM_OBJ_PER_MAC_SERVER JM_SMART_FOLDERS; do
   [ -z "${!v+x}" ] || echo "LEAK $v" >> "$FAKE_LOG"
 done
@@ -143,7 +143,7 @@ case "$cmd $*" in
       case "$s" in ./*) s="$dir/${s#./}" ;; esac
       echo "        source: $s"
     done
-    echo "        published: \"${FAKE_PORT:-1}\"" ;;
+    printf '      - mode: ingress\n        target: 80\n        published: "%s"\n        protocol: %s\n' "${FAKE_PORT:-1}" "${FAKE_PORT_PROTO:-tcp}" ;;
   "pull --quiet") [ "${FAKE_FAIL:-}" = pull ] && { echo 'pull denied' >&2; exit 1; }; exit 0 ;;
   "up -d")
     [ "${FAKE_FAIL:-}" = up ] && { echo 'juicefs-init did not complete successfully' >&2; exit 1; }
@@ -155,6 +155,14 @@ esac
 exit 0
 SH
 
+# Setup needs root for ZFS; the fake root lives in its own folder so a test
+# can leave it out.
+mkdir -p "$WORK/bin-root"
+cat > "$WORK/bin-root/id" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = -u ]; then echo 0; else exec /usr/bin/id "$@"; fi
+SH
+chmod +x "$WORK/bin-root/id"
 cat > "$WORK/bin/midclt" <<'SH'
 #!/usr/bin/env bash
 exit 0
@@ -210,7 +218,7 @@ save_fakes() { export -p | grep -E '^declare -x FAKE_' > "$WORK/fake.env" || tru
 run() {
   save_fakes
   set +e
-  PATH="$WORK/bin:$PATH" setsid bash "$SCRIPT" --host nas.example "$@" > "$WORK/out" 2> "$WORK/err" < /dev/null
+  PATH="$WORK/bin-root:$WORK/bin:$PATH" setsid bash "$SCRIPT" --host nas.example "$@" > "$WORK/out" 2> "$WORK/err" < /dev/null
   rc=$?
   set -e
 }
@@ -223,7 +231,7 @@ run_plain() {
 }
 reset() {
   rm -rf "$FAKE_DIR" "$WORK/data"; mkdir -p "$FAKE_DIR"; : > "$FAKE_LOG"; write_release a b
-  unset FAKE_FAIL FAKE_HTTP FAKE_INIT_EXIT FAKE_OLD_RELEASE FAKE_OTHER FAKE_PORT FAKE_HAVE_HASH FAKE_UNMOUNTED FAKE_LOCKED
+  unset FAKE_FAIL FAKE_HTTP FAKE_INIT_EXIT FAKE_OLD_RELEASE FAKE_OTHER FAKE_PORT FAKE_PORT_PROTO FAKE_HAVE_HASH FAKE_UNMOUNTED FAKE_LOCKED FAKE_COMPOSE_VERSION
 }
 envval() { sed -n "s/^$2=//p" "$1"; }
 secrets_of() { grep -E '^(JM_ADMIN_KEY|MINIO_ROOT_PASSWORD|JM_[A-Z_]*_PASSWORD|JM_OBJ_[A-Z]*_SECRET_KEY)=' "$1"; }
@@ -273,6 +281,10 @@ diff <(grep -v '^[[:space:]]*-.*:/' "$SERVER/docker-compose.yml" | grep -v '/mnt
      <(grep -v '^[[:space:]]*-.*:/' "$C" | grep -v "$D") > /dev/null || fail "only host paths differ from the canonical compose"
 for s in bucket redis cache manager-state respproxy objkeys headscale juicefarm-state import compose/overlays; do [ -d "$D/$s" ] || fail "$s created"; done
 [ -x "$D/compose/jm-compose" ] || fail "compose wrapper installed"
+grep -q SSH_AUTH_SOCK "$D/compose/jm-compose" || fail "wrapper keeps SSH_AUTH_SOCK for ssh:// Docker hosts"
+[ "$(stat -c %a "$D")" = 700 ] || fail "data root is 0700 (was $(stat -c %a "$D"))"
+[ "$(envval "$E" JM_SETUP_COMPOSE_VERSION)" = 5.0.0 ] || fail "compose version recorded"
+grep -q '^  Ports:     1/tcp $' "$WORK/err" || fail "plan shows the ports the compose publishes"
 ok "compose rendered (only host paths change), mounted files copied, folders and wrapper created"
 
 # 2. Re-runs: nothing regenerated, same key, nothing downloaded.
@@ -286,7 +298,11 @@ run_plain --dir "$D"
 : > "$FAKE_LOG"
 run_plain
 [ "$rc" = 0 ] && [ "$(cd "$D/compose" && sha256sum .env docker-compose.yml redis.conf minio/*)" = "$sum" ] || fail "re-run without options finds the install"
-ok "re-runs (with --dir, and with no options) change nothing and print the same two lines"
+chmod 755 "$D"
+run_plain --dir "$D" --release v9.9.9
+[ "$rc" = 0 ] && [ "$(stat -c %a "$D")" = 700 ] && grep -q "was mode 755; it is now 700" "$WORK/err" || fail "re-run with --release of the installed release, root made private again"
+[ "$(cd "$D/compose" && sha256sum .env docker-compose.yml redis.conf minio/*)" = "$sum" ] || fail "that re-run changes no file"
+ok "re-runs (with --dir, with no options, with --release of the installed release) change nothing; a loosened root is made 0700 again"
 
 # 3. Started install: identical options accepted, other options refused.
 run_plain --dir "$D" --release v1.2.3
@@ -305,9 +321,37 @@ ok "a re-run keeps overlays from compose/overlays/ (e.g. Link)"
 
 # 5. Drift: a service made from other files is never recreated.
 FAKE_HAVE_HASH=hash-by-hand run_plain --dir "$D"
-[ "$rc" = 1 ] && grep -q 'running services juicemount-manager differ' "$WORK/err" || fail "drift refused"
+[ "$rc" = 1 ] && grep -q 'running services juicemount-manager do not match' "$WORK/err" && grep -q 'Docker Compose was upgraded' "$WORK/err" &&
+  ! grep -q 'cause 2 is likely' "$WORK/err" || fail "drift refused, naming both causes"
+FAKE_HAVE_HASH=hash-by-hand FAKE_COMPOSE_VERSION=6.1.0 run_plain --dir "$D"
+[ "$rc" = 1 ] && grep -q 'Docker Compose was 5.0.0 when this install was made and is 6.1.0 now, so cause 2 is likely' "$WORK/err" || fail "drift names a changed compose version"
 ok "a re-run refuses when a running service differs from the install's files"
 rm "$D/compose/overlays/docker-compose.link.yml"
+
+# 5b. Another folder with the same project name: never taken over, either
+#     by a fresh install or by a re-run of an install in another folder.
+mkdir -p "$WORK/new-empty"
+run_plain --yes --dir "$WORK/new-empty"
+[ "$rc" = 1 ] && grep -q "Compose project 'juicemount' already runs from $D/compose, not $WORK/new-empty/compose" "$WORK/err" &&
+  [ -z "$(ls -A "$WORK/new-empty")" ] || fail "fresh install over a running project of the same name refused"
+cp -a "$D" "$WORK/copy"
+run_plain --dir "$WORK/copy"
+[ "$rc" = 1 ] && grep -q 'already runs from' "$WORK/err" || fail "re-run of another folder's install refused"
+rm -rf "$WORK/copy" "$WORK/new-empty"
+ok "a project name already running from another folder is never taken over"
+
+# 5c. Not root: a private compose folder is reported as such.
+if [ "$(id -u)" != 0 ]; then
+  chmod 000 "$D/compose"
+  run_plain --dir "$D"
+  chmod 700 "$D/compose"
+  [ "$rc" = 1 ] && grep -q 'cannot read it (it is private to root): run this command as root' "$WORK/err" || fail "unreadable compose folder: run as root"
+  set +e
+  PATH="$WORK/bin:$PATH" setsid bash "$SCRIPT" --host nas.example --yes --pool tank > "$WORK/out" 2> "$WORK/err" < /dev/null; rc=$?
+  set -e
+  [ "$rc" = 1 ] && grep -q 'ZFS datasets needs root' "$WORK/err" || fail "ZFS without root refused"
+  ok "without root: an unreadable install folder and ZFS mode say to run as root"
+fi
 
 # 6. A lost secret is refused, never regenerated.
 cp "$E" "$WORK/env.bak"
@@ -344,9 +388,11 @@ run_plain --yes --dir "$D"
 run_plain --yes --dir "$D"
 [ "$rc" = 1 ] && grep -q 'not KEY=sha256' "$WORK/err" && nothing_written "$D" || fail "malformed digest refused"
 reset
+run_plain --yes --dir "$D" --release v9.9.8
+[ "$rc" = 1 ] && grep -q 'release v9.9.8 has a release-manifest.json for version 9.9.9' "$WORK/err" && nothing_written "$D" || fail "manifest version must match --release"
 FAKE_OLD_RELEASE=1 run_plain --yes --dir "$D"
 [ "$rc" = 1 ] && grep -q 'predates juicemount-setup' "$WORK/err" && nothing_written "$D" || fail "old release refused"
-ok "swapped digests, a file not in SHA256SUMS, a malformed digest and a pre-setup release are refused"
+ok "swapped digests, a file not in SHA256SUMS, a malformed digest, a version other than --release and a pre-setup release are refused"
 
 # 9. Without a terminal, --yes is required.
 reset
@@ -369,10 +415,19 @@ s=socket.socket(); s.bind(("127.0.0.1",0)); s.listen(); print(s.getsockname()[1]
   LISTENER=$!
   for _ in 1 2 3 4 5 6 7 8 9 10; do [ -s "$WORK/port" ] && break; sleep 0.2; done
   FAKE_PORT="$(cat "$WORK/port")" run_plain --dry-run --dir "$D"
-  [ "$rc" = 1 ] && grep -q "port $(cat "$WORK/port") is already in use" "$WORK/err" || fail "dry run refuses a port in use"
+  [ "$rc" = 1 ] && grep -q "port $(cat "$WORK/port")/tcp is already in use" "$WORK/err" || fail "dry run refuses a port in use"
   FAKE_PORT="$(cat "$WORK/port")" run_plain --yes --dir "$D"
   [ "$rc" = 1 ] && nothing_written "$D" || fail "port in use: nothing written"
   kill "$LISTENER"; LISTENER=""
+  if command -v ss >/dev/null 2>&1; then
+    python3 -c 'import socket,time
+s=socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.bind(("0.0.0.0",0)); print(s.getsockname()[1], flush=True); time.sleep(120)' > "$WORK/uport" &
+    LISTENER=$!
+    for _ in 1 2 3 4 5 6 7 8 9 10; do [ -s "$WORK/uport" ] && break; sleep 0.2; done
+    FAKE_PORT="$(cat "$WORK/uport")" FAKE_PORT_PROTO=udp run_plain --dry-run --dir "$D"
+    [ "$rc" = 1 ] && grep -q "port $(cat "$WORK/uport")/udp is already in use" "$WORK/err" || fail "a UDP port in use on any address is refused"
+    kill "$LISTENER"; LISTENER=""
+  fi
 fi
 ok "another JuiceMount (ix-juicemount, loose containers) and a port in use are refused before any write, also in a dry run"
 
@@ -408,6 +463,10 @@ FAKE_UNMOUNTED=tank/juicemount run --pool tank --yes
 printf 'tank/juicemount/redis\n' >> "$FAKE_DIR/datasets"
 FAKE_LOCKED=tank/juicemount/redis run --pool tank --yes
 [ "$rc" = 1 ] && grep -q 'dataset tank/juicemount/redis is locked' "$WORK/err" || fail "locked child dataset refused"
+reset
+printf 'tank/juicemount\n' > "$FAKE_DIR/datasets"
+FAKE_LOCKED=tank/juicemount run --yes
+[ "$rc" = 1 ] && grep -q 'tank/juicemount exists but is locked or not mounted' "$WORK/err" && ! grep -q 'zfs create' "$FAKE_LOG" || fail "locked install on another pool stops the scan"
 reset
 FAKE_LOCKED=tank run --pool tank --yes
 [ "$rc" = 1 ] && grep -q 'pool tank is locked' "$WORK/err" || fail "locked pool refused"

@@ -10,12 +10,16 @@
 #   1. Finds the storage. TrueNAS (midclt present) or --pool: a dataset
 #      <pool>/juicemount with one child dataset per data folder, on the pool
 #      with the most free space. Otherwise a folder, /srv/juicemount.
-#   2. Reads the latest release's release-manifest.json and server-images.env
-#      (both checked against the release's SHA256SUMS). Each image digest must
-#      match the manifest's digest for the same key. The compose file and every
-#      file it mounts come from the manifest's commit, so files and images
-#      always belong to the same release. A release made before this script
-#      existed is refused.
+#   2. Reads the latest release's release-manifest.json and server-images.env.
+#      Their hashes must match the release's SHA256SUMS, the manifest version
+#      must match --release, and each image digest must match the manifest's
+#      digest for the same key. The compose file and every file it mounts come
+#      from the manifest's commit, so files and images belong to the same
+#      release. A release made before this script existed is refused.
+#      Trust: these checks catch a damaged or mismatched download, not a
+#      tampered one. SHA256SUMS is unsigned and arrives over the same HTTPS
+#      connection. What runs is whatever the GitHub repository holds: main
+#      (this script) and the release (its assets and the commit it names).
 #   3. Renders that docker-compose.yml with the chosen host paths. Every other
 #      image (Redis, the object store, JuiceFS) comes from that compose file
 #      or an --override file; this script names no image.
@@ -84,7 +88,8 @@ Run it as root (TrueNAS: in System > Shell). Options, all optional:
   --import PATH     folder the Manager may copy from, read-only (repeatable)
   --project NAME    Docker Compose project name (default juicemount)
   --host ADDR       address printed in the Manager URL (default: LAN address)
-A started install accepts only the options it was installed with.
+A started install accepts only the options it was installed with, and
+--release of the release it runs.
 Guide: server/INSTALL-TrueNAS.md
 HELP
   exit 2
@@ -191,6 +196,7 @@ env_get() { # file key -> last plain assignment
 }
 
 sha_of() { sha256sum "$1" | cut -d' ' -f1; }
+compose_version() { docker compose version --short 2>/dev/null || echo unknown; }
 
 # ---- where the install lives ------------------------------------------------
 
@@ -227,9 +233,14 @@ locate_install() {
     need zpool "zpool is not installed; use --dir instead of --pool."
     need zfs "zfs is not installed; use --dir instead of --pool."
     if [ -z "$POOL" ]; then
-      local p mp
+      local p mp mounted key
       while read -r p; do
         case "$p" in boot-pool|freenas-boot) continue ;; esac
+        zfs_exists "$p/juicemount" || continue
+        read -r _ mounted key < <(zfs list -H -o name,mounted,keystatus -d 0 "$p/juicemount") || true
+        if [ "${key:-}" = unavailable ] || [ "${mounted:-}" != yes ]; then
+          die "$p/juicemount exists but is locked or not mounted, so this command cannot see whether JuiceMount is installed there. Unlock or mount it first, or pass --pool or --dir; nothing was changed."
+        fi
         mp="$(zfs_mountpoint "$p/juicemount")" || continue
         [ -f "$mp/compose/.env" ] && { POOL="$p"; break; }
       done < <(zpool list -H -o name 2>/dev/null)
@@ -293,6 +304,8 @@ stage_release() {
     RELEASE_NAME="$(sed -n 's/^[[:space:]]*"version":[[:space:]]*"\([^"]*\)".*/\1/p' "$man" | sed -n 1p)"
     COMMIT="$(sed -n 's/^[[:space:]]*"commit":[[:space:]]*"\([0-9a-f]\{40\}\)".*/\1/p' "$man" | sed -n 1p)"
     [ -n "$RELEASE_NAME" ] && [ -n "$COMMIT" ] || die "release-manifest.json has no version or commit."
+    [ "$RELEASE" = latest ] || [ "v$RELEASE_NAME" = "$RELEASE" ] ||
+      die "release $RELEASE has a release-manifest.json for version $RELEASE_NAME; refusing the mismatch."
     # key=digest pairs inside "server_images", one per key.
     awk '
       /"server_images"[[:space:]]*:/ { s = 1; next }
@@ -381,7 +394,8 @@ render_compose() { # staged compose -> project compose with host paths
 # The compose wrapper. Setup runs every compose command through it, and it is
 # kept in the install so a person runs exactly the same project. Values reach
 # compose only from .env: the environment is cleared except what reaches the
-# Docker daemon.
+# Docker daemon (DOCKER_*, XDG_RUNTIME_DIR for rootless Docker, SSH_AUTH_SOCK
+# for DOCKER_HOST=ssh://).
 write_wrapper() { # path, project folder
   cat > "$1" <<WRAP
 #!/usr/bin/env bash
@@ -394,7 +408,7 @@ files=(-f "\$d/docker-compose.yml")
 [ ! -f "\$d/docker-compose.override.yml" ] || files+=(-f "\$d/docker-compose.override.yml")
 for f in \$(LC_ALL=C ls -1 "\$d/overlays" 2>/dev/null | grep -E '[.]ya?ml\$' || true); do files+=(-f "\$d/overlays/\$f"); done
 keep=("PATH=\$PATH" "HOME=\${HOME:-/root}")
-for v in DOCKER_HOST DOCKER_CONTEXT DOCKER_CONFIG DOCKER_CERT_PATH DOCKER_TLS_VERIFY XDG_RUNTIME_DIR; do
+for v in DOCKER_HOST DOCKER_CONTEXT DOCKER_CONFIG DOCKER_CERT_PATH DOCKER_TLS_VERIFY XDG_RUNTIME_DIR SSH_AUTH_SOCK; do
   [ -z "\${!v:-}" ] || keep+=("\$v=\${!v}")
 done
 exec env -i "\${keep[@]}" docker compose --project-name '$PROJECT' --project-directory "\$d" --env-file "\$d/.env" "\${files[@]}" "\$@"
@@ -426,6 +440,10 @@ write_check_env() { # path [existing .env]
   } > "$1"
 }
 
+# JM_FARM_STORAGE_CAPACITY_BYTES follows the compose contract: the physical
+# pool size, `zpool list -Hp -o size`. That is raw size, before RAID-Z parity,
+# so on RAID-Z it is larger than the usable space; the farm uses it only for
+# total-capacity reporting and to scale its default 1% reserve.
 storage_capacity() {
   local p
   if [ "$MODE" = zfs ]; then
@@ -446,18 +464,19 @@ detect_host() {
   printf '%s' "${a:-127.0.0.1}"
 }
 
-# The options that decide what is installed. A started install accepts a
-# re-run with none of them, or with exactly the same ones.
+# The options that decide what is installed, apart from the release. A started
+# install accepts a re-run with none of them, or with exactly the same ones,
+# and a --release equal to the release it runs.
 options_signature() {
   local o
-  o="release=$RELEASE source=$SOURCE"
+  o="source=$SOURCE"
   [ -z "$IMAGES_ENV" ] || o="$o images=$(sha_of "$IMAGES_ENV")"
   [ -z "$OVERRIDE" ] || o="$o override=$(sha_of "$OVERRIDE")"
   [ ${#IMPORTS[@]} -eq 0 ] || o="$o import=${IMPORTS[*]}"
   printf '%s' "$o" | sha256sum | cut -d' ' -f1
 }
 no_content_options() {
-  [ "$RELEASE" = latest ] && [ -z "$SOURCE$IMAGES_ENV$OVERRIDE" ] && [ ${#IMPORTS[@]} -eq 0 ]
+  [ -z "$SOURCE$IMAGES_ENV$OVERRIDE" ] && [ ${#IMPORTS[@]} -eq 0 ]
 }
 
 write_env() { # path: a new .env, never over an existing one
@@ -479,6 +498,7 @@ write_env() { # path: a new .env, never over an existing one
       printf '# and back it up with the data. juicemount-setup never changes a secret here.\n'
       printf '# Template and meaning of each value: server/release.env.example.\n'
       printf 'JM_SETUP_RELEASE=%s\nJM_SETUP_COMMIT=%s\nJM_SETUP_OPTIONS=%s\n' "$RELEASE_NAME" "$COMMIT" "$sig"
+      printf 'JM_SETUP_COMPOSE_VERSION=%s\n' "$(compose_version)"
       for k in "${DIGESTS[@]}"; do v="DIG_$k"; printf '%s=%s\n' "$k" "${!v}"; done
       printf '%s\n' "${lines[@]}"
       printf 'JM_FARM_STORAGE_CAPACITY_BYTES=%s\n' "$CAPACITY"
@@ -504,6 +524,7 @@ update_env_release() { # path
         JM_SETUP_RELEASE) line="$k=$RELEASE_NAME" ;;
         JM_SETUP_COMMIT) line="$k=$COMMIT" ;;
         JM_SETUP_OPTIONS) line="$k=$sig" ;;
+        JM_SETUP_COMPOSE_VERSION) line="$k=$(compose_version)" ;;
         JM_MANAGER_DIGEST|JM_FARM_DIGEST|JM_FARM_RENDER_DIGEST|JM_RESPPROXY_DIGEST) v="DIG_$k"; line="$k=${!v}" ;;
       esac
       printf '%s\n' "$line"
@@ -534,6 +555,46 @@ check_env() { # path: every key present and plausible
 # ---- checks (read only) -----------------------------------------------------
 
 project_containers() { docker ps -aq --filter "label=com.docker.compose.project=$PROJECT"; }
+
+# A Compose project name belongs to one folder. Containers of $PROJECT that
+# run from another folder belong to another install: never take them over.
+check_project_owner() {
+  local id wd
+  while read -r id; do
+    [ -n "$id" ] || continue
+    wd="$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project.working_dir"}}' "$id")"
+    [ "$wd" = "$CDIR" ] || die "Compose project '$PROJECT' already runs from $wd, not $CDIR. juicemount-setup never takes over another install. To check that install, run this command without --dir and --pool; to make a separate one, pass another --project. Nothing was changed."
+  done < <(project_containers)
+}
+
+# Root is needed for datasets and for a root-owned install; a non-root user
+# with Docker access may install into a folder it can write.
+check_access() {
+  local p
+  if [ -e "$CDIR" ] && [ ! -r "$CDIR" ]; then
+    die "$CDIR exists but this user cannot read it (it is private to root): run this command as root."
+  fi
+  [ "$(id -u)" != 0 ] || return 0
+  [ "$MODE" != zfs ] || die "creating and checking ZFS datasets needs root: run this command as root."
+  p="$ROOT"
+  while [ ! -e "$p" ]; do p="$(dirname "$p")"; done
+  [ -w "$p" ] || die "$p is not writable by this user: run this command as root, or pass a --dir you can write."
+}
+
+# The data root is private (0700): below it are the object store (with its
+# IAM file holding the jm-gc secret), the metadata and the settings. Containers
+# reach their folders through bind mounts and never cross the root itself.
+secure_root() { # fix|check
+  local m
+  m="$(stat -c %a "$ROOT")"
+  [ $((8#$m & 8#077)) -ne 0 ] || return 0
+  if [ "$1" = check ]; then
+    say "Note: $ROOT is mode $m (other users can enter it); a real run makes it 700."
+    return 0
+  fi
+  chmod 700 "$ROOT" || die "could not make $ROOT private (chmod 700); on TrueNAS check the dataset's ACL mode. Nothing else was changed."
+  say "Note: $ROOT was mode $m; it is now 700 (private to its owner)."
+}
 
 validate_compose() { # root under which missing mount sources will be created ("" = none)
   local img src
@@ -571,14 +632,38 @@ check_no_other_juicemount() {
   done < <(docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}|{{.Config.Image}}|{{.Name}}' "${ids[@]}")
 }
 
+# "proto port host_ip" for each published port of the rendered compose.
+published_ports() {
+  dc config | awk '
+    function flush() { if (pub != "") print (proto == "" ? "tcp" : proto), pub, (hip == "" ? "*" : hip); pub = proto = hip = "" }
+    /^[[:space:]]*- / || /^[^[:space:]]/ || /^  [^[:space:]]/ { flush() }
+    /^[[:space:]]*(- )?published:/ { v = $0; sub(/.*published:[[:space:]]*/, "", v); gsub(/"/, "", v); pub = v }
+    /^[[:space:]]*(- )?protocol:/ { v = $0; sub(/.*protocol:[[:space:]]*/, "", v); proto = v }
+    /^[[:space:]]*(- )?host_ip:/ { v = $0; sub(/.*host_ip:[[:space:]]*/, "", v); hip = v }
+    END { flush() }' | sort -u
+}
+
+port_in_use() { # proto port: a listener on any address
+  if command -v ss >/dev/null 2>&1; then
+    if [ "$1" = udp ]; then [ -n "$(ss -Hlun "sport = :$2" 2>/dev/null)" ]; else [ -n "$(ss -Hltn "sport = :$2" 2>/dev/null)" ]; fi
+  else
+    # Without ss only TCP on this host's loopback can be tested.
+    [ "$1" = tcp ] && (exec 3<>"/dev/tcp/127.0.0.1/$2") 2>/dev/null
+  fi
+}
+
 check_ports_free() {
-  local p
-  while read -r p; do
+  local proto p
+  while read -r proto p _; do
     [ -n "$p" ] || continue
-    if (exec 3<>"/dev/tcp/127.0.0.1/$p") 2>/dev/null; then
-      die "port $p is already in use on this host. Stop that service first; nothing was changed."
+    if port_in_use "$proto" "$p"; then
+      die "port $p/$proto is already in use on this host. Stop that service first; nothing was changed."
     fi
-  done < <(dc config | sed -n 's/^[[:space:]]*published:[[:space:]]*"\{0,1\}\([0-9]*\)"\{0,1\}$/\1/p' | sort -u)
+  done < <(published_ports)
+}
+
+ports_summary() {
+  published_ports | awk '{ printf "%s%s/%s ", ($3 == "*" ? "" : $3 ":"), $2, $1 }'
 }
 
 # A started install is never recreated: if a service's container was made
@@ -593,7 +678,11 @@ check_no_drift() {
     have="$(docker inspect -f '{{index .Config.Labels "com.docker.compose.config-hash"}}' "$id")"
     [ "$have" = "$want" ] || drift="$drift $svc"
   done < <(dc config --hash '*')
-  [ -z "$drift" ] || die "the running services$drift differ from the files in $CDIR (an overlay applied by hand, or an edited .env). juicemount-setup never recreates a started install. Keep overlays in $CDIR/overlays/ and apply changes with $CDIR/jm-compose; nothing was changed."
+  [ -z "$drift" ] && return 0
+  local was now note=""
+  was="$(env_get "$CDIR/.env" JM_SETUP_COMPOSE_VERSION)"; now="$(compose_version)"
+  [ -z "$was" ] || [ "$was" = "$now" ] || note=" Docker Compose was $was when this install was made and is $now now, so cause 2 is likely."
+  die "the running services$drift do not match what this install's files would start, and juicemount-setup never recreates a started install. Two causes are possible: 1) the files changed after the services started (an overlay applied by hand and not kept in $CDIR/overlays/, or an edited .env or compose file); 2) Docker Compose was upgraded and computes its configuration hash differently.$note Check whether a file in $CDIR (overlays/, .env, docker-compose*.yml) changed since the services started; 'docker compose up --dry-run' is no help here, as it reports every pull_policy: always service as changed. If the files are as intended, '$CDIR/jm-compose up -d' recreates those services from them and keeps the data. Nothing was changed."
 }
 
 # ---- start ------------------------------------------------------------------
@@ -680,6 +769,8 @@ main() {
   locate_install
   CDIR="$ROOT/compose"
   [ -n "$HOST" ] || HOST="$(detect_host)"
+  check_access
+  check_project_owner
   STAGE="$(mktemp -d)"
   check_zfs_state
 
@@ -697,7 +788,8 @@ main() {
 
   if [ "$started" = 1 ]; then
     # A started install is never changed, and never upgraded.
-    if ! no_content_options && [ "$(options_signature)" != "$(env_get "$CDIR/.env" JM_SETUP_OPTIONS)" ]; then
+    if { [ "$RELEASE" != latest ] && [ "$RELEASE" != "v$(env_get "$CDIR/.env" JM_SETUP_RELEASE)" ]; } ||
+       { ! no_content_options && [ "$(options_signature)" != "$(env_get "$CDIR/.env" JM_SETUP_OPTIONS)" ]; }; then
       die "$ROOT is a started install. juicemount-setup never changes it, and upgrading a setup-made install is not supported yet. Run it again with no options, or with exactly the options of the first install; nothing was changed."
     fi
     DC="$CDIR/jm-compose"
@@ -705,8 +797,12 @@ main() {
     check_env "$CDIR/.env"
     validate_compose ""
     check_no_drift
-    [ "$DRY" = 0 ] || { say "Dry run: $ROOT is a started install; a re-run starts what is stopped and changes nothing."; exit 0; }
+    if [ "$DRY" = 1 ]; then
+      secure_root check
+      say "Dry run: $ROOT is a started install; a re-run starts what is stopped and changes nothing."; exit 0
+    fi
     take_lock
+    secure_root fix
     say "JuiceMount is installed in $ROOT; checking it and starting what is stopped."
     start_and_report
     return
@@ -773,7 +869,7 @@ main() {
   fi
   [ -z "$OVERRIDE" ] || say "  Override:  $OVERRIDE"
   say "  Import:    $(import_lines | sed 's/:ro$//' | tr '\n' ' ')(read-only)"
-  say "  Ports:     30179 (Redis proxy), 30151/30152 (object store), 30190 (Manager), 127.0.0.1:30180 (WebDAV)"
+  say "  Ports:     $(ports_summary)"
   say "  Manager:   http://$HOST:30190"
   [ "$MODE" != zfs ] || say "  Note:      exclude $ROOT_DS/bucket from recursive snapshot tasks (INSTALL-TrueNAS.md)."
   say ""
@@ -786,6 +882,8 @@ main() {
     [ "$(zfs_mountpoint "$ROOT_DS")" = "$ROOT" ] || die "dataset $ROOT_DS is not mounted at $ROOT."
   fi
   mkdir -p "$ROOT" || die "could not create $ROOT (run this command as root, or pass --dir)."
+  chmod 700 "$ROOT" || die "could not make $ROOT private (chmod 700); on TrueNAS check the dataset's ACL mode."
+  [ "$(stat -c %a "$ROOT")" = 700 ] || die "$ROOT is mode $(stat -c %a "$ROOT") after chmod 700; check its ACL."
   for sub in $subs; do mkdir -p "$ROOT/$sub"; done
   [ ${#IMPORTS[@]} -gt 0 ] || mkdir -p "$ROOT/import"
   mkdir -p "$CDIR/minio" "$CDIR/overlays"

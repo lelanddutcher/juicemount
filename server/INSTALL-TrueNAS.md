@@ -10,8 +10,14 @@ in this repository.
   Apps set up: **Apps → Configuration → Choose Pool**. This starts Docker.
   Or **any Linux host** with Docker Engine and Docker Compose v2
   (`docker compose version` answers).
-- These host ports are free: 30179 (Redis proxy), 30151 and 30152 (object
-  store), 30190 (Manager), and 30180 on 127.0.0.1 (WebDAV).
+- These host ports are free on every address: TCP 30179 (Redis proxy), 30151
+  and 30152 (object store), 30190 (Manager) and 30180 (WebDAV, published on
+  127.0.0.1 only). With Link also TCP 30193 and UDP 41641. The command checks
+  each published port, TCP and UDP, with `ss` when the host has it.
+- Run it as root (on TrueNAS: the System → Shell, through `sudo`). Root is
+  needed for datasets and for the private install folder. On a plain Docker
+  host, a user with Docker access may install into a folder it can write
+  (`--dir`).
 - The host can reach `github.com`, `raw.githubusercontent.com`, `ghcr.io`
   and the registries named in `server/docker-compose.yml`.
 
@@ -60,9 +66,12 @@ prints it again.
    - On another host it uses the folder `/srv/juicemount`. `--dir PATH`
      chooses another folder (on TrueNAS too: then it creates no dataset).
 2. **Reads the release** (the latest one, or `--release vX.Y.Z`). It
-   downloads the release's `release-manifest.json` and `server-images.env`
-   and checks both against the release's `SHA256SUMS`. Each image digest must
-   be the one the manifest gives for the same image.
+   downloads the release's `release-manifest.json` and `server-images.env`.
+   Their hashes must match the release's `SHA256SUMS`, the manifest's version
+   must match `--release`, and each image digest must be the one the manifest
+   gives for the same image. These checks catch a damaged or mismatched
+   download; they do not prove who made the release (see "What the command
+   trusts").
 3. **Takes the compose file** `server/docker-compose.yml` and the files it
    mounts (`redis.conf`, `redis.acl`, `minio/`) from the commit the release
    manifest names, so the files and the images always belong to the same
@@ -89,16 +98,32 @@ prints it again.
 8. **Waits until the Manager answers** with the new key, then prints the two
    lines.
 
+### What the command trusts
+
+The command runs what the GitHub repository `lelanddutcher/juicemount` holds:
+the script itself from its `main` branch, and the release's assets
+(`release-manifest.json`, `server-images.env`, `SHA256SUMS`) with the files of
+the commit the release names. `SHA256SUMS` is not signed and arrives over the
+same HTTPS connection as the files it lists, so it detects a damaged download,
+not a tampered one. Anyone who can write to the repository's `main` branch or
+its releases decides what is installed. The images are pulled by `@sha256:`
+digest, so a registry cannot swap them, but the digests come from that same
+release. Releases are not signed yet.
+
 ### Where everything is
 
 `<data>` is `/mnt/<pool>/juicemount` on TrueNAS, `/srv/juicemount` otherwise.
+`<data>` itself is mode `0700`: no other user of the host can enter it. The
+command sets that when it creates `<data>`, and sets it again on a re-run if
+the mode was loosened. The containers reach their folders through bind mounts
+and are not affected.
 
 | Path | Holds | Mode |
 |---|---|---|
 | `<data>/compose/` | Compose project folder: `docker-compose.yml`, `redis.conf`, `redis.acl`, `minio/`, optional `docker-compose.override.yml` | `0700` |
 | `<data>/compose/overlays/` | Extra compose files you add (such as Link); always applied, in name order | |
 | `<data>/compose/jm-compose` | Runs `docker compose` for this install with exactly the files and settings setup uses | |
-| `<data>/compose/.env` | **Every secret of this server**, the image digests, the storage size | `0600` |
+| `<data>/compose/.env` | **Every secret of this server**, the image digests, the storage size, and the release, commit and Compose version used at install | `0600` |
 | `<data>/bucket` | Object store: every byte of your files | |
 | `<data>/redis` | JuiceFS metadata (Redis AOF/RDB) | |
 | `<data>/cache` | JuiceFS chunk cache | |
@@ -134,12 +159,24 @@ Running the same command again is safe:
   service (`docker compose up -d`), waits for the Manager and prints the same
   two lines. It always applies the files in `<data>/compose/overlays/`.
 - It refuses, and changes nothing, when:
-  - a running service was made from other files than the install's (for
-    example an overlay applied by hand but not kept in `overlays/`, or an
-    edited `.env`). Setup never recreates a started service;
+  - a running service does not match what the install's files would start.
+    Setup never recreates a started service. There are two possible causes:
+    the files changed after the services started (an overlay applied by hand
+    but not kept in `overlays/`, or an edited `.env` or compose file), or
+    Docker Compose was upgraded and computes its configuration hash
+    differently. The message names the Compose version recorded at install
+    when it differs. Check whether a file in `<data>/compose` (`overlays/`,
+    `.env`, `docker-compose*.yml`) changed since the services started
+    (`docker compose up --dry-run` does not help: it reports every service
+    with `pull_policy: always` as changed). If the files are as intended,
+    `<data>/compose/jm-compose up -d` recreates those services from them and
+    keeps the data;
   - a started install is given options other than the ones it was installed
-    with (`--release`, `--source`, `--images-env`, `--override`, `--import`).
-    Run it with no options, or with exactly the same ones;
+    with (`--source`, `--images-env`, `--override`, `--import`, or a
+    `--release` other than the one it runs). Run it with no options, or with
+    exactly the same ones;
+  - the Compose project name already runs from another folder: setup never
+    takes over another install;
   - a data folder already holds data but `.env` is missing, or `.env` lacks a
     secret.
 - It finds the install through the running Compose project or, on TrueNAS,
@@ -381,6 +418,11 @@ openssl rand -hex 32      # JM_ADMIN_KEY and each JM_*_PASSWORD (separately)
 openssl rand -hex 20      # MINIO_ROOT_PASSWORD, JM_OBJ_CLIENT_SECRET_KEY, JM_OBJ_GC_SECRET_KEY
 zpool list -Hp -o size <pool>   # JM_FARM_STORAGE_CAPACITY_BYTES
 ```
+
+`zpool list` reports the raw pool size, before RAID-Z parity, so on RAID-Z
+this value is larger than the usable space. The farm uses it only to report
+total capacity and to scale its default 1% reserve; the setup command uses the
+same value.
 
 Take the four image digests from the release's `server-images.env` (also in
 its `release-manifest.json`); never replace them with mutable tags. The MinIO
