@@ -3,7 +3,9 @@ package manager
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 )
 
 // TestPathAllowedResolvesLikeTheKernel checks pathAllowed against where
@@ -101,5 +103,41 @@ func TestBrowseRefusesDotDotAfterEscapingSymlink(t *testing.T) {
 	w = destRequest(t, f.mux, "GET", "/api/browse?path="+f.root, "")
 	if w.Code != 200 {
 		t.Errorf("browse root: %d, want 200 (%s)", w.Code, w.Body.String())
+	}
+}
+
+// TestPathAllowedRefusesOverlongPathQuickly: the resolver walks back one
+// component at a time, so an input past PATH_MAX (the kernel refuses it
+// with ENAMETOOLONG, which is not "missing") must be refused up front, not
+// walked: 100,000 components took about 45 s before.
+func TestPathAllowedRefusesOverlongPathQuickly(t *testing.T) {
+	root := t.TempDir()
+	a := &API{sourceRoots: []string{root}, destMount: "/jfs"}
+	long := root + "/x" + strings.Repeat("/a", 100000)
+	start := time.Now()
+	if a.pathAllowed(long) {
+		t.Fatal("an overlong path was allowed")
+	}
+	if d := time.Since(start); d > time.Second {
+		t.Fatalf("refusing a %d-byte path took %v", len(long), d)
+	}
+	// A long but legal missing path under the root is still allowed (kept
+	// under macOS's 1024-byte PATH_MAX, since CI also runs there).
+	ok := root + "/x" + strings.Repeat("/a", (900-len(root))/2)
+	if !a.pathAllowed(ok) {
+		t.Fatalf("a %d-byte missing path under the root was refused", len(ok))
+	}
+}
+
+// TestResolveFileDestPathRefusesOverlongPathQuickly: the file-destination
+// resolver walks back the same way, so it has the same bound.
+func TestResolveFileDestPathRefusesOverlongPathQuickly(t *testing.T) {
+	long := t.TempDir() + "/x" + strings.Repeat("/a", 100000)
+	start := time.Now()
+	if _, err := resolveFileDestPath(long); err == nil {
+		t.Fatal("an overlong file destination path resolved")
+	}
+	if d := time.Since(start); d > time.Second {
+		t.Fatalf("refusing a %d-byte path took %v", len(long), d)
 	}
 }

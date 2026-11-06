@@ -1529,9 +1529,18 @@ func (a *API) pathAllowed(p string) bool {
 // holds no symlinks yet. Refused: a dangling symlink (its target is
 // unknown) and ".." inside the missing remainder. A relative p is taken
 // against the working directory.
+// maxResolvePathBytes bounds resolvePhysicalPath's input (Linux PATH_MAX).
+const maxResolvePathBytes = 4096
+
 func resolvePhysicalPath(p string) (string, error) {
 	if p == "" {
 		return "", errors.New("empty path")
+	}
+	// PATH_MAX on Linux. The loop below costs time in the path's length
+	// squared, so a longer input (which the kernel would refuse anyway)
+	// must not reach it.
+	if len(p) > maxResolvePathBytes {
+		return "", fmt.Errorf("path longer than %d bytes", maxResolvePathBytes)
 	}
 	if !filepath.IsAbs(p) {
 		wd, err := os.Getwd()
@@ -1551,6 +1560,9 @@ func resolvePhysicalPath(p string) (string, error) {
 		}
 		if _, lerr := os.Lstat(existing); lerr == nil {
 			return "", fmt.Errorf("dangling symlink at %s", existing)
+		} else if !errors.Is(lerr, fs.ErrNotExist) {
+			// ENAMETOOLONG, EACCES, ...: not "missing", so stop here.
+			return "", lerr
 		}
 		i := strings.LastIndexByte(existing, filepath.Separator)
 		if i <= 0 {
