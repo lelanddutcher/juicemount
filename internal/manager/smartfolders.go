@@ -226,7 +226,8 @@ func redactMetaURL(raw string) string {
 type smartFoldersConfig struct {
 	Settings  smartFoldersSettings
 	Backend   smartFoldersBackend
-	Redis     *redis.Client        // subscribed to juicemount:metadata; closed by Stop
+	Redis     *redis.Client        // subscribed to Channel; closed by Stop
+	Channel   string               // tests only: change-event channel (default juicemount:metadata, the only one clients publish on and respproxy admits)
 	StatePath string               // required: ownership must be persisted
 	Leaser    func() ProjectLeaser // nil or returning nil = no checkout
 	Interval  time.Duration        // reconcile debounce (default 30s)
@@ -292,6 +293,9 @@ func newSmartFoldersService(cfg smartFoldersConfig) (*smartFoldersService, error
 	}
 	if cfg.StatePath == "" {
 		return nil, errors.New("smart folders need a state file (JM_STATE_FILE) to record what they create")
+	}
+	if cfg.Channel == "" {
+		cfg.Channel = metadataEventChannel
 	}
 	if cfg.Interval <= 0 {
 		cfg.Interval = defaultSmartFoldersInterval
@@ -478,11 +482,11 @@ func (s *smartFoldersService) subscribeLoop(ctx context.Context) {
 	}()
 	backoff := time.Second
 	for ctx.Err() == nil {
-		ps := s.cfg.Redis.Subscribe(ctx, metadataEventChannel)
+		ps := s.cfg.Redis.Subscribe(ctx, s.cfg.Channel)
 		if _, err := ps.Receive(ctx); err != nil {
 			_ = ps.Close()
 			if ctx.Err() == nil {
-				log.Printf("manager: smart folders: subscribe %s: %v (retrying in %s)", metadataEventChannel, err, backoff)
+				log.Printf("manager: smart folders: subscribe %s: %v (retrying in %s)", s.cfg.Channel, err, backoff)
 				select {
 				case <-ctx.Done():
 				case <-time.After(backoff):
