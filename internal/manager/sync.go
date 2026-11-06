@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"os"
@@ -454,7 +455,18 @@ func RunSync(ctx context.Context, juicefsBin string, spec RunSyncSpec, source, d
 		defer close(metricsDone)
 		pollJuicefsMetrics(metricsCtx, metricsAddr, progress)
 	}()
-	parseSyncProgress(teed, progress)
+	volURI := spec.Mode == ModeStandalone && (strings.HasPrefix(src, "jfs://"+spec.VolName+"/") || strings.HasPrefix(dst, "jfs://"+spec.VolName+"/"))
+	report := parseSyncProgressReport(teed, progress, func(p string) string {
+		for fdPath, label := range fdLabels {
+			if p == fdPath || strings.HasPrefix(p, fdPath+"/") {
+				return label + p[len(fdPath):]
+			}
+		}
+		if volURI && strings.HasPrefix(p, "/") && !strings.HasPrefix(p, "/proc/self/fd/") {
+			return volumeUserPrefix + p // a path inside the volume (jfs://)
+		}
+		return p
+	})
 	stopMetrics()
 	<-metricsDone
 
@@ -471,6 +483,12 @@ func RunSync(ctx context.Context, juicefsBin string, spec RunSyncSpec, source, d
 			return fmt.Errorf("juicefs sync exited: %w (no stderr output)", err)
 		}
 		return fmt.Errorf("juicefs sync exited: %w — last stderr:\n%s", err, tail)
+	}
+	if report.SkippedLinks > 0 {
+		// The job's progress carries the count and the first names
+		// (skipped_links, skipped_link_sample); the log names them too.
+		log.Printf("manager: sync %s -> %s skipped %d symlink(s) that lead outside the sync root or cannot be followed (not copied); first: %s",
+			source, destination, report.SkippedLinks, strings.Join(report.SkippedLinkSample, ", "))
 	}
 
 	// Post-sync writability fix. Source datasets sometimes carry odd
@@ -796,6 +814,22 @@ var progressRegex = regexp.MustCompile(
 // counters, and emits ProgressEvent. Closes nothing — caller owns
 // the `progress` channel lifecycle.
 func parseSyncProgress(r io.Reader, progress chan<- ProgressEvent) {
+	parseSyncProgressReport(r, progress, func(p string) string { return p })
+}
+
+// skippedLinkLine matches juicefs's warning for a symlink it skipped while
+// listing with links followed (third_party/juicefs patch 0016): the
+// confined file backend skips one that would leave the root, and the jfs://
+// backend one that cannot be followed in the volume (dangling).
+var skippedLinkLine = regexp.MustCompile(`skipped symlink "((?:[^"\\]|\\.)*)" that (?:leads outside the file storage root|cannot be followed in the volume)`)
+
+// maxSkippedLinkSample bounds the skipped-link names kept in a job.
+const maxSkippedLinkSample = 5
+
+// parseSyncProgressReport is parseSyncProgress that also counts skipped
+// symlinks (naming the first few, through rename, which maps fd paths
+// back to the user's paths) and returns the final state.
+func parseSyncProgressReport(r io.Reader, progress chan<- ProgressEvent, rename func(string) string) ProgressEvent {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024) // 1 MiB max line
 	lastEmit := time.Now()
@@ -803,6 +837,17 @@ func parseSyncProgress(r io.Reader, progress chan<- ProgressEvent) {
 	for scanner.Scan() {
 		line := scanner.Text()
 		updated := false
+		if m := skippedLinkLine.FindStringSubmatch(line); m != nil {
+			p := m[1]
+			if u, err := strconv.Unquote(`"` + m[1] + `"`); err == nil {
+				p = u
+			}
+			current.SkippedLinks++
+			if len(current.SkippedLinkSample) < maxSkippedLinkSample {
+				current.SkippedLinkSample = append(current.SkippedLinkSample, rename(p))
+			}
+			updated = true
+		}
 		matches := progressRegex.FindAllStringSubmatch(line, -1)
 		for _, m := range matches {
 			label := strings.ToLower(extractLabel(m[0]))
@@ -857,9 +902,11 @@ func parseSyncProgress(r io.Reader, progress chan<- ProgressEvent) {
 			// progress lines doesn't overwhelm SSE consumers.
 			if now.Sub(lastEmit) >= 200*time.Millisecond {
 				current.UpdatedAt = now.UnixMilli()
+				ev := current
+				ev.SkippedLinkSample = append([]string(nil), current.SkippedLinkSample...)
 				// Best-effort send; drop if buffer is full.
 				select {
-				case progress <- current:
+				case progress <- ev:
 				default:
 				}
 				lastEmit = now
@@ -872,14 +919,17 @@ func parseSyncProgress(r io.Reader, progress chan<- ProgressEvent) {
 	// we emit a zeroed event after it stopped, last-write-wins in jobs.go
 	// would clobber the accurate metrics-derived final state and the UI
 	// would show 0 files / 0 bytes for a successful copy.
-	if current.Files == 0 && current.Bytes == 0 && current.Errors == 0 && current.Current == "" {
-		return
+	if current.Files == 0 && current.Bytes == 0 && current.Errors == 0 && current.Current == "" && current.SkippedLinks == 0 {
+		return current
 	}
 	current.UpdatedAt = time.Now().UnixMilli()
+	ev := current
+	ev.SkippedLinkSample = append([]string(nil), current.SkippedLinkSample...)
 	select {
-	case progress <- current:
+	case progress <- ev:
 	default:
 	}
+	return current
 }
 
 // extractLabel returns the label part of a match like "copied: 50"

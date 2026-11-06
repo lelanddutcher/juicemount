@@ -53,43 +53,70 @@ const confiningJuicefsMin = 2
 var jmSuffix = regexp.MustCompile(`-jm([0-9]+)\s*$`)
 
 var (
-	juicefsCapsMu sync.Mutex
-	juicefsCaps   = map[string]bool{}
-	// juicefsVersionTimeout bounds `juicefs --version`; tests shorten it.
-	juicefsVersionTimeout = 10 * time.Second
+	// juicefsCapsMu guards the two maps only; no probe runs under it.
+	juicefsCapsMu         sync.Mutex
+	juicefsCaps           = map[string]bool{}          // parsed answers, per binary path
+	juicefsInflight       = map[string]*juicefsProbe{} // probes running now
+	juicefsVersionTimeout = 10 * time.Second           // tests shorten it
 )
 
+// juicefsProbe is one `juicefs --version` run that concurrent syncs share.
+type juicefsProbe struct {
+	done     chan struct{} // closed when the probe has finished
+	confined bool
+	err      error
+}
+
 // juicefsConfinesFileRoots reports whether bin is a confining juicefs on
-// this platform. Only an answer from a version string that parsed is
-// cached, per binary path. When `juicefs --version` fails or times out
-// (a slow boot, a broken binary), the status is unknown: it returns an
-// error, so the sync fails with a clear message instead of running
-// unconfined, and the next sync probes again. A binary that answers with
-// a stock version (no -jmN suffix, or N < 2) gets the previous behaviour
-// and one warning.
+// this platform.
+//
+// Only an answer from a version line that parsed is cached, per binary
+// path. When `juicefs --version` fails, times out or prints anything but
+// one version line, the status is unknown: the sync fails with a message
+// that says what was found, nothing is cached, and the next sync asks
+// again. Concurrent syncs share one running probe (single flight) instead
+// of each queuing behind it. A binary that answers with a stock version
+// (no -jmN suffix, or N < 2) gets the previous behaviour and one warning.
 func juicefsConfinesFileRoots(bin string) (bool, error) {
 	if runtime.GOOS != "linux" {
 		return false, nil // the patch confines file roots on Linux only
 	}
 	juicefsCapsMu.Lock()
-	defer juicefsCapsMu.Unlock()
 	if v, ok := juicefsCaps[bin]; ok {
+		juicefsCapsMu.Unlock()
 		return v, nil
 	}
+	if p, ok := juicefsInflight[bin]; ok {
+		juicefsCapsMu.Unlock()
+		<-p.done
+		return p.confined, p.err
+	}
+	p := &juicefsProbe{done: make(chan struct{})}
+	juicefsInflight[bin] = p
+	juicefsCapsMu.Unlock()
+
 	version, err := probeJuicefsVersion(bin)
 	if err != nil {
-		return false, fmt.Errorf("cannot tell whether %q confines sync roots: `juicefs --version` failed (%v); the sync was not started, try again", bin, err)
+		p.err = fmt.Errorf("sync not started: %w", err)
+	} else {
+		p.confined = versionConfines(version)
 	}
-	ok := versionConfines(version)
-	juicefsCaps[bin] = ok
-	if !ok {
+	juicefsCapsMu.Lock()
+	delete(juicefsInflight, bin)
+	if p.err == nil {
+		juicefsCaps[bin] = p.confined
+	}
+	juicefsCapsMu.Unlock()
+	close(p.done)
+	if p.err == nil && !p.confined {
 		log.Printf("manager: WARNING: %q (version %q) does not confine file:// sync roots; syncs run without --links and pass roots by path. Install the juicefs built from third_party/juicefs (version suffix -jm%d or later).", bin, version, confiningJuicefsMin)
 	}
-	return ok, nil
+	return p.confined, p.err
 }
 
 // probeJuicefsVersion runs `bin --version` and returns its version line.
-// Output that is not a juicefs version line is an error.
+// Anything but exactly one line starting with "juicefs version " is an
+// error that says what was found and what to fix.
 func probeJuicefsVersion(bin string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), juicefsVersionTimeout)
 	defer cancel()
@@ -99,16 +126,20 @@ func probeJuicefsVersion(bin string) (string, error) {
 	cmd.WaitDelay = time.Second
 	out, err := cmd.Output()
 	if ctx.Err() != nil {
-		return "", fmt.Errorf("timed out after %v", juicefsVersionTimeout)
+		return "", fmt.Errorf("`%s --version` did not answer within %v; if the host is busy, start the job again, otherwise check that %q is a working juicefs", bin, juicefsVersionTimeout, bin)
 	}
 	if err != nil {
-		return "", err
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			return "", fmt.Errorf("`%s --version` failed (%v); check that %q is a working juicefs", bin, err, bin)
+		}
+		return "", fmt.Errorf("cannot run %q (%v); point the Manager's juicefs setting (--juicefs, or JM_SYNC_JUICEFS for jm5) at the juicefs built from third_party/juicefs", bin, err)
 	}
-	version := strings.TrimSpace(string(out))
-	if !strings.HasPrefix(version, "juicefs version ") {
-		return "", fmt.Errorf("unexpected output %q", version)
+	text := strings.TrimSpace(string(out))
+	if strings.Contains(text, "\n") || !strings.HasPrefix(text, "juicefs version ") {
+		return "", fmt.Errorf("`%s --version` printed %q, not a single \"juicefs version ...\" line, so the Manager cannot tell whether it confines sync roots; run the juicefs binary directly, not through a wrapper that adds output", bin, text)
 	}
-	return version, nil
+	return text, nil
 }
 
 // versionConfines reports whether a version line names a build with the

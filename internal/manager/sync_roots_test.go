@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -288,28 +289,49 @@ func TestJuicefsRootSwapRace(t *testing.T) {
 	noRegularFile(t, "source swap", filepath.Join(l.host, "out"), "secret.txt")
 }
 
-// A failed or slow `juicefs --version` is not cached as "not confined":
-// the sync fails with a clear message, and the next sync asks again.
-func TestJuicefsVersionProbeRetriesAfterFailure(t *testing.T) {
+// probeFake writes a stand-in juicefs whose first --version answer runs
+// first (a shell snippet); later answers print the -jm2 line. Every
+// --version call is recorded in calls; a sync records its arguments.
+func probeFake(t *testing.T, first string) (bin, argsFile, calls string) {
+	t.Helper()
+	dir := t.TempDir()
+	bin, argsFile, calls = filepath.Join(dir, "juicefs"), filepath.Join(dir, "args"), filepath.Join(dir, "calls")
+	count := filepath.Join(dir, "count")
+	script := "#!/bin/sh\nif [ \"$1\" = --version ]; then\n  echo x >> '" + calls + "'\n" +
+		"  if [ ! -e '" + count + "' ]; then touch '" + count + "'; " + first + "; fi\n" +
+		"  echo '" + jm2Version + "'; exit 0\nfi\n" +
+		"printf '%s\\n' \"$@\" > '" + argsFile + "'\nexit 0\n"
+	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return bin, argsFile, calls
+}
+
+func shortProbeTimeout(t *testing.T) {
 	prev := juicefsVersionTimeout
 	juicefsVersionTimeout = 500 * time.Millisecond
 	t.Cleanup(func() { juicefsVersionTimeout = prev })
+}
+
+// A failed, slow or noisy `juicefs --version` is not cached as "not
+// confined": the sync fails with a message that says what was found, and
+// the next sync asks again. A -jm2 line followed by any other output is
+// unknown too (it used to parse as stock and run unconfined).
+func TestJuicefsVersionProbeRetriesAfterFailure(t *testing.T) {
+	shortProbeTimeout(t)
 	l := newSyncLayout(t)
 	mustWrite(t, filepath.Join(l.fuse, "proj/a.txt"), "a")
-	for _, first := range []string{"exit 3", "sleep 3", "echo garbage; exit 0"} {
-		t.Run(first, func(t *testing.T) {
-			dir := t.TempDir()
-			bin, argsFile, count := filepath.Join(dir, "juicefs"), filepath.Join(dir, "args"), filepath.Join(dir, "count")
-			script := "#!/bin/sh\nif [ \"$1\" = --version ]; then\n" +
-				"  if [ ! -e '" + count + "' ]; then touch '" + count + "'; " + first + "; fi\n" +
-				"  echo '" + jm2Version + "'; exit 0\nfi\n" +
-				"printf '%s\\n' \"$@\" > '" + argsFile + "'\nexit 0\n"
-			if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
-				t.Fatal(err)
-			}
+	for _, c := range []struct{ first, want string }{
+		{"exit 3", "failed (exit status 3)"},
+		{"sleep 3", "did not answer within"},
+		{"echo garbage; exit 0", `printed "garbage"`},
+		{"echo '" + jm2Version + "'; echo 'note: wrapper'; exit 0", "not a single"},
+	} {
+		t.Run(c.first, func(t *testing.T) {
+			bin, argsFile, _ := probeFake(t, c.first)
 			err := RunSync(context.Background(), bin, l.spec(), "/jfs/proj", filepath.Join(l.host, "out"), DefaultSyncOptions(), nil, nil)
-			if err == nil || !strings.Contains(err.Error(), "cannot tell whether") {
-				t.Fatalf("first sync with a failing version probe: %v, want a refusal", err)
+			if err == nil || !strings.Contains(err.Error(), "sync not started") || !strings.Contains(err.Error(), c.want) {
+				t.Fatalf("first sync: %v, want a refusal containing %q", err, c.want)
 			}
 			if _, err := os.Stat(argsFile); err == nil {
 				t.Fatalf("juicefs sync ran while its version was unknown")
@@ -321,6 +343,54 @@ func TestJuicefsVersionProbeRetriesAfterFailure(t *testing.T) {
 				t.Errorf("second sync did not use the confined mode: %v", args)
 			}
 		})
+	}
+	// A binary that cannot run at all names the setting to fix.
+	err := RunSync(context.Background(), filepath.Join(t.TempDir(), "missing-juicefs"), l.spec(), "/jfs/proj", filepath.Join(l.host, "out"), DefaultSyncOptions(), nil, nil)
+	if err == nil || !strings.Contains(err.Error(), "cannot run") || !strings.Contains(err.Error(), "--juicefs") {
+		t.Errorf("missing binary: %v", err)
+	}
+}
+
+// A probe whose grandchild keeps stdout open still returns within the
+// timeout plus the 1 s WaitDelay (bounded here at timeout + 2 s).
+func TestJuicefsVersionProbeBoundedWhenStdoutHeld(t *testing.T) {
+	shortProbeTimeout(t)
+	l := newSyncLayout(t)
+	mustWrite(t, filepath.Join(l.fuse, "proj/a.txt"), "a")
+	bin, _, _ := probeFake(t, "sh -c 'sleep 30' & sleep 30")
+	start := time.Now()
+	err := RunSync(context.Background(), bin, l.spec(), "/jfs/proj", filepath.Join(l.host, "out"), DefaultSyncOptions(), nil, nil)
+	if d := time.Since(start); d > juicefsVersionTimeout+2*time.Second {
+		t.Errorf("probe with a grandchild holding stdout took %v, want under %v", d, juicefsVersionTimeout+2*time.Second)
+	}
+	if err == nil || !strings.Contains(err.Error(), "did not answer within") {
+		t.Errorf("held stdout: %v", err)
+	}
+}
+
+// Concurrent syncs share one running probe instead of each waiting their
+// turn behind a lock.
+func TestJuicefsVersionProbeSingleFlight(t *testing.T) {
+	l := newSyncLayout(t)
+	mustWrite(t, filepath.Join(l.fuse, "proj/a.txt"), "a")
+	bin, _, calls := probeFake(t, "sleep 1")
+	start := time.Now()
+	errs := make(chan error, 6)
+	for i := 0; i < 6; i++ {
+		go func(i int) {
+			errs <- RunSync(context.Background(), bin, l.spec(), "/jfs/proj", filepath.Join(l.host, "out", strconv.Itoa(i)), DefaultSyncOptions(), nil, nil)
+		}(i)
+	}
+	for i := 0; i < 6; i++ {
+		if err := <-errs; err != nil {
+			t.Errorf("sync: %v", err)
+		}
+	}
+	if d := time.Since(start); d > 3*time.Second {
+		t.Errorf("6 concurrent syncs took %v; the probe should run once", d)
+	}
+	if n := len(lines(t, calls)); n != 1 {
+		t.Errorf("--version ran %d times, want 1", n)
 	}
 }
 

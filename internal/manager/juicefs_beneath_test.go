@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -114,10 +115,55 @@ func (l syncLayout) run(t *testing.T, bin, src, dst string, opts SyncOptions) er
 	return RunSync(ctx, bin, l.spec(), src, dst, opts, nil, nil)
 }
 
+// runReport runs RunSync like run and also returns the merged progress
+// (the job's view: copied counts and skipped symlinks).
+func (l syncLayout) runReport(t *testing.T, bin, src, dst string, opts SyncOptions) (ProgressEvent, error) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	ch := make(chan ProgressEvent, 1024)
+	err := RunSync(ctx, bin, l.spec(), src, dst, opts, nil, ch)
+	close(ch)
+	var last ProgressEvent
+	for ev := range ch {
+		last = mergeProgress(last, ev)
+	}
+	return last, err
+}
+
+// tree lists everything under root, relative, sorted: folders end in
+// "/", symlinks in "@" (not followed).
+func tree(t *testing.T, root string) []string {
+	t.Helper()
+	var out []string
+	_ = filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if err != nil || p == root {
+			return nil
+		}
+		rel, _ := filepath.Rel(root, p)
+		switch {
+		case d.Type()&fs.ModeSymlink != 0:
+			rel += "@"
+		case d.IsDir():
+			rel += "/"
+		}
+		out = append(out, rel)
+		return nil
+	})
+	sort.Strings(out)
+	return out
+}
+
+func sameList(got, want []string) bool {
+	sort.Strings(want)
+	return strings.Join(got, "|") == strings.Join(want, "|")
+}
+
 // Single hop, Out: a symlink deep in a volume tree that points outside the
-// volume is neither followed nor copied verbatim to the host root (Out
-// runs without --links, and the confined source root refuses to follow
-// it). A relative link that stays inside the source is copied as a file.
+// volume is neither followed nor copied (Out runs without --links, and the
+// confined source root skips a link it will not follow, with a report). A
+// relative link that stays inside the source is copied as a file. The job
+// succeeds.
 func TestJuicefsOutSingleHopNeitherFollowsNorCopiesLink(t *testing.T) {
 	bin := realJuicefsBin(t)
 	l := newSyncLayout(t)
@@ -125,16 +171,16 @@ func TestJuicefsOutSingleHopNeitherFollowsNorCopiesLink(t *testing.T) {
 	mustLink(t, l.outside, filepath.Join(l.fuse, "proj/deep/a/b/evil"))
 	mustLink(t, "real.txt", filepath.Join(l.fuse, "proj/deep/a/b/alias.txt"))
 	out := filepath.Join(l.host, "out")
-	_ = l.run(t, bin, "/jfs/proj", out, DefaultSyncOptions())
-	if _, err := os.Stat(filepath.Join(out, "deep/a/b/real.txt")); err != nil {
-		t.Errorf("the in-volume file was not copied: %v", err)
+	report, err := l.runReport(t, bin, "/jfs/proj", out, DefaultSyncOptions())
+	if err != nil {
+		t.Fatalf("RunSync: %v", err)
 	}
-	noRegularFile(t, "out", out, "secret.txt")
-	if fi, err := os.Lstat(filepath.Join(out, "deep/a/b/evil")); err == nil && fi.Mode()&fs.ModeSymlink != 0 {
-		t.Errorf("the escaping link was copied verbatim to the host root")
+	want := []string{"deep/", "deep/a/", "deep/a/b/", "deep/a/b/alias.txt", "deep/a/b/real.txt"}
+	if got := tree(t, out); !sameList(got, want) {
+		t.Errorf("copied %v, want %v", got, want)
 	}
-	if fi, err := os.Lstat(filepath.Join(out, "deep/a/b/alias.txt")); err != nil || !fi.Mode().IsRegular() {
-		t.Errorf("an in-source link was not copied as a file: %v", err)
+	if report.SkippedLinks != 1 || len(report.SkippedLinkSample) != 1 || report.SkippedLinkSample[0] != "/jfs/proj/deep/a/b/evil" {
+		t.Errorf("skipped report: %d %v, want 1 [/jfs/proj/deep/a/b/evil]", report.SkippedLinks, report.SkippedLinkSample)
 	}
 }
 
@@ -203,35 +249,51 @@ func TestJuicefsLinklessDestinationDoesNotReadThroughSourceChain(t *testing.T) {
 	mustWrite(t, filepath.Join(src, "plain.txt"), "plain")
 	mustLink(t, "other", filepath.Join(src, "x"))
 	mustLink(t, l.outside, filepath.Join(src, "other/y"))
-	err := l.run(t, bin, "/jfs/srcb", "mem://bucket/b/", DefaultSyncOptions())
-	if err == nil || !strings.Contains(err.Error(), "outside the file storage root") {
-		t.Errorf("sync to a link-less destination: err = %v; want the chain refused (outside the file storage root)", err)
+	// The chain's second hop is reached twice (as x/y and other/y); both
+	// are skipped and reported, and the job succeeds.
+	report, err := l.runReport(t, bin, "/jfs/srcb", "mem://bucket/b/", DefaultSyncOptions())
+	if err != nil {
+		t.Fatalf("sync to a link-less destination: %v", err)
 	}
-	// The same listing path without mem://: run juicefs with no --links
-	// between two folders, and check nothing from outside arrives.
+	if report.SkippedLinks != 2 {
+		t.Errorf("skipped %d links, want 2: %v", report.SkippedLinks, report.SkippedLinkSample)
+	}
+	// The same listing path into a folder: juicefs with no --links, run
+	// directly; it exits 0 and only the plain file arrives.
 	out := filepath.Join(l.host, "nolinks")
 	cmd := exec.Command(bin, "sync", "file://"+src+"/", "file://"+out+"/")
-	_ = cmd.Run()
-	noRegularFile(t, "no --links", out, "secret.txt")
-	if _, err := os.Stat(filepath.Join(out, "plain.txt")); err != nil {
-		t.Errorf("the plain file was not copied: %v", err)
+	if outb, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("juicefs sync without --links: %v\n%s", err, outb)
+	}
+	if got := tree(t, out); !sameList(got, []string{"plain.txt"}) {
+		t.Errorf("copied %v, want [plain.txt]", got)
 	}
 }
 
 // Probe C: job 1 would copy a link into a host root, job 2 then writes a
 // tree whose folder has the link's name. Out runs without --links, so job
-// 1 stores no link, and job 2 cannot write through one.
+// 1 stores no link (it skips it, and succeeds), and job 2 writes a real
+// folder.
 func TestJuicefsCopiedLinkIsNotWrittenThrough(t *testing.T) {
 	bin := realJuicefsBin(t)
 	l := newSyncLayout(t)
 	root := filepath.Join(l.host, "croot")
 	mustLink(t, l.victim, filepath.Join(l.fuse, "c1/d"))
+	mustWrite(t, filepath.Join(l.fuse, "c1/keep.txt"), "keep")
 	mustWrite(t, filepath.Join(l.fuse, "c2/d/payload.txt"), "payload")
-	_ = l.run(t, bin, "/jfs/c1", root, DefaultSyncOptions())
-	if fi, err := os.Lstat(filepath.Join(root, "d")); err == nil && fi.Mode()&fs.ModeSymlink != 0 {
-		t.Errorf("job 1 copied the link into the host root")
+	report, err := l.runReport(t, bin, "/jfs/c1", root, DefaultSyncOptions())
+	if err != nil {
+		t.Fatalf("job 1: %v", err)
 	}
-	_ = l.run(t, bin, "/jfs/c2", root, DefaultSyncOptions())
+	if got := tree(t, root); !sameList(got, []string{"keep.txt"}) || report.SkippedLinks != 1 {
+		t.Errorf("job 1 copied %v, skipped %d; want [keep.txt], 1", got, report.SkippedLinks)
+	}
+	if err := l.run(t, bin, "/jfs/c2", root, DefaultSyncOptions()); err != nil {
+		t.Fatalf("job 2: %v", err)
+	}
+	if got := tree(t, root); !sameList(got, []string{"d/", "d/payload.txt", "keep.txt"}) {
+		t.Errorf("after job 2: %v", got)
+	}
 	emptyDir(t, "job 2", l.victim)
 }
 
@@ -346,13 +408,25 @@ func TestJuicefsStandaloneAbsoluteLinksStayInVolume(t *testing.T) {
 	// Out through RunSync (standalone): the /jfs source is read as jfs://,
 	// not as a host path.
 	out2 := filepath.Join(l.host, "out2")
-	if err := RunSync(ctx, bin, spec, "/jfs/proj", out2, DefaultSyncOptions(), nil, nil); err != nil {
-		t.Logf("standalone out: %v", err)
+	// evil names a path inside the volume that does not exist there: a
+	// dangling link, which the jfs:// backend skips and reports; the job
+	// succeeds.
+	ch := make(chan ProgressEvent, 1024)
+	err := RunSync(ctx, bin, spec, "/jfs/proj", out2, DefaultSyncOptions(), nil, ch)
+	close(ch)
+	var report ProgressEvent
+	for ev := range ch {
+		report = mergeProgress(report, ev)
 	}
-	if _, err := os.Stat(filepath.Join(out2, "real.txt")); err != nil {
-		t.Errorf("standalone out: the in-volume file was not copied: %v", err)
+	if err != nil {
+		t.Errorf("standalone out: %v", err)
 	}
-	noRegularFile(t, "standalone out via RunSync", out2, "secret.txt")
+	if got := tree(t, out2); !sameList(got, []string{"real.txt"}) {
+		t.Errorf("standalone out copied %v, want [real.txt]", got)
+	}
+	if report.SkippedLinks != 1 || len(report.SkippedLinkSample) != 1 || report.SkippedLinkSample[0] != "/jfs/proj/evil" {
+		t.Errorf("standalone out: skipped %d links %v, want 1 [/jfs/proj/evil]", report.SkippedLinks, report.SkippedLinkSample)
+	}
 }
 
 // flushRedisDB empties the Redis database named by a redis://host:port/db
@@ -382,5 +456,74 @@ func flushRedisDB(t *testing.T, meta string) {
 		if err != nil || !strings.HasPrefix(line, "+OK") {
 			t.Fatalf("redis FLUSHDB: %q %v", line, err)
 		}
+	}
+}
+
+// Out of a volume tree holding the kinds of links a Mac leaves behind: an
+// absolute Mac path, an absolute link back into the volume, links to an
+// outside folder and file, and a relative link inside. The job succeeds;
+// the four links the confined backend will not follow are skipped and
+// reported; in-root content is copied; nothing outside is read.
+func TestJuicefsOutSkipsLinksItWillNotFollow(t *testing.T) {
+	bin := realJuicefsBin(t)
+	l := newSyncLayout(t)
+	proj := filepath.Join(l.fuse, "proj")
+	mustWrite(t, filepath.Join(proj, "real.txt"), "r")
+	mustWrite(t, filepath.Join(proj, "sub/in.txt"), "i")
+	mustLink(t, "/Volumes/Media/clip.mov", filepath.Join(proj, "clip.mov"))
+	mustLink(t, filepath.Join(proj, "sub"), filepath.Join(proj, "absin"))
+	mustLink(t, l.outside, filepath.Join(proj, "outdir"))
+	mustLink(t, filepath.Join(l.outside, "secret.txt"), filepath.Join(proj, "outfile"))
+	mustLink(t, "sub/in.txt", filepath.Join(proj, "rel.txt"))
+	out := filepath.Join(l.host, "out")
+	start := time.Now()
+	report, err := l.runReport(t, bin, "/jfs/proj", out, DefaultSyncOptions())
+	if err != nil {
+		t.Fatalf("RunSync: %v", err)
+	}
+	if d := time.Since(start); d > 30*time.Second {
+		t.Errorf("sync took %v (retries per skipped link?)", d)
+	}
+	if got := tree(t, out); !sameList(got, []string{"real.txt", "rel.txt", "sub/", "sub/in.txt"}) {
+		t.Errorf("copied %v", got)
+	}
+	if b, _ := os.ReadFile(filepath.Join(out, "rel.txt")); string(b) != "i" {
+		t.Errorf("relative link copied as %q, want the file it names", b)
+	}
+	if report.SkippedLinks != 4 {
+		t.Errorf("skipped %d links, want 4: %v", report.SkippedLinks, report.SkippedLinkSample)
+	}
+	for _, n := range []string{"/jfs/proj/clip.mov", "/jfs/proj/absin", "/jfs/proj/outdir", "/jfs/proj/outfile"} {
+		found := false
+		for _, s := range report.SkippedLinkSample {
+			found = found || s == n
+		}
+		if !found {
+			t.Errorf("skipped sample %v does not name %s", report.SkippedLinkSample, n)
+		}
+	}
+	noRegularFile(t, "out", out, "secret.txt")
+}
+
+// A link to "." inside the tree loops until the kernel's ELOOP limit, as
+// before this change. The sync must still finish.
+func TestJuicefsLoopLinkDoesNotHang(t *testing.T) {
+	bin := realJuicefsBin(t)
+	l := newSyncLayout(t)
+	mustWrite(t, filepath.Join(l.fuse, "proj/real.txt"), "r")
+	mustLink(t, ".", filepath.Join(l.fuse, "proj/loop"))
+	done := make(chan error, 1)
+	go func() {
+		_, err := l.runReport(t, bin, "/jfs/proj", filepath.Join(l.host, "out"), DefaultSyncOptions())
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		t.Logf("loop link: sync finished: %v", err)
+	case <-time.After(3 * time.Minute):
+		t.Fatal("a sync of a tree with a loop link did not finish")
+	}
+	if _, err := os.Stat(filepath.Join(l.host, "out", "real.txt")); err != nil {
+		t.Errorf("real.txt not copied: %v", err)
 	}
 }
