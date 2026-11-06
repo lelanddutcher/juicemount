@@ -175,3 +175,56 @@ jobs:
           P96_EXPECTED_VERSION="$(awk -F'"' '/^var Version = / { print $2; exit }' internal/version/version.go)" \
           P96_EXPECTED_COMMIT="$(git rev-parse HEAD)" \
             python3 scripts/test_verify_build.py
+
+  # juicemount-setup end to end against real Docker: install from this
+  # checkout's server/ with the latest release's image digests, wait until the
+  # Manager answers, then run it again and prove nothing changed.
+  setup-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Offline setup tests
+        run: bash server/scripts/juicemount-setup.test.sh
+      - name: First run installs and starts the stack
+        run: |
+          out="$RUNNER_TEMP/run1.out"
+          bash server/scripts/juicemount-setup.sh --yes --source server \
+            --dir "$RUNNER_TEMP/juicemount" --project jm-ci > "$out"
+          env_file="$RUNNER_TEMP/juicemount/compose/.env"
+          sed -n 's/^[A-Z_]*=\(.\{20,\}\)$/::add-mask::\1/p' "$env_file"
+          sed 's/^\(Sign-in key:  \).*/\1(hidden)/' "$out"
+          test "$(wc -l < "$out")" = 2
+          grep -Eqx 'Manager URL:  http://[^ ]+:30190' "$out"
+          grep -Eqx 'Sign-in key:  [0-9a-f]{32}' "$out"
+          test "$(stat -c %a "$env_file")" = 600
+          test "$(stat -c %a "$(dirname "$env_file")")" = 700
+      - name: The Manager answers with the printed key, and only with it
+        run: |
+          key="$(sed -n 's/^Sign-in key:  //p' "$RUNNER_TEMP/run1.out")"
+          printf 'X-JuiceMount-Admin-Key: %s\n' "$key" |
+            curl -fsS -H @- -o "$RUNNER_TEMP/principals.json" http://127.0.0.1:30190/api/principals
+          grep -Eq '"proxy_live": *true' "$RUNNER_TEMP/principals.json"
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:30190/api/overview)" = 401
+      - name: Second run changes nothing
+        run: |
+          d="$RUNNER_TEMP/juicemount/compose"
+          snap() {
+            (cd "$d" && sha256sum .env docker-compose.yml redis.conf redis.acl minio/*)
+            docker ps -aq --filter label=com.docker.compose.project=jm-ci | sort
+          }
+          before="$(snap)"
+          bash server/scripts/juicemount-setup.sh --yes --source server \
+            --dir "$RUNNER_TEMP/juicemount" --project jm-ci > "$RUNNER_TEMP/run2.out"
+          test "$(snap)" = "$before"
+          cmp "$RUNNER_TEMP/run1.out" "$RUNNER_TEMP/run2.out"
+      - name: Stack state after a failure
+        if: failure()
+        run: |
+          d="$RUNNER_TEMP/juicemount/compose"
+          [ -f "$d/.env" ] || exit 0
+          dc() { docker compose --project-name jm-ci --project-directory "$d" --env-file "$d/.env" -f "$d/docker-compose.yml" "$@"; }
+          dc ps -a
+          dc logs --no-color --tail 60
