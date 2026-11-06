@@ -84,7 +84,10 @@ or farm workers.
   the folder tree.
 - Server scripts that recreate Redis first make it rewrite its append-only
   file, and stop with nothing changed if that rewrite does not finish. So
-  the restart replays no transaction that an earlier start refused.
+  the restart replays no transaction that an earlier start refused. A
+  release rollout does not restart Redis. But while the running Redis still
+  has the 0.5.0 ACL, the rollout makes Redis rewrite the file while it keeps
+  running, so a later NAS reboot is safe too.
 - A fresh server install creates the `zpool` bucket before it sets up the
   object-store users. Before, setup used the restricted format key, which
   cannot create buckets, so a first install failed. An existing bucket and its
@@ -399,18 +402,33 @@ new workers against the same Redis at the same time:
   Changes lost at an earlier 0.5.0 restart are not recovered by these steps.
   Recovering them from the copy in step 2 is a manual restore, not a
   replay.
-- `server/scripts/rollout-compose.sh` now does step 3 itself whenever it
-  recreates Redis (`--cutover-proxy`, `--proxy-rollback`, `--proxy-restore`
-  and their automatic rollbacks). It runs the rewrite and waits for all three
-  fields before it stops anything. If the rewrite fails or does not finish
-  within 10 minutes (`JM_REDIS_COMPACT_TIMEOUT`, in seconds), the script
-  stops and the stack is unchanged. If Redis is already down, nothing can be
-  rewritten. The script then says that the start replays the whole file. It
-  refuses to start Redis while `server/redis.acl` still has the 0.5.0
-  `user default ... -@all` line, unless you pass `--allow-aof-replay`. A
-  release rollout and `server/scripts/update-server.sh` never restart Redis.
-  Steps 1 to 4 still apply to every other restart: by hand, by the NAS app,
-  or by a NAS reboot.
+- If you update through `server/scripts/rollout-compose.sh`, the script does
+  step 3 for you. Update its checkout to 0.5.1 and run the release rollout
+  right away, with no reboot or Redis restart in between. Once the rollout
+  succeeds, a later NAS reboot or Redis restart is safe. In detail:
+  - A release rollout never restarts Redis. Before it changes anything, it
+    reads the ACL that the running Redis loaded at its start
+    (`/run/jm-redis/users.acl` in the Redis container). If that ACL still has
+    the 0.5.0 `user default ... -@all` line, or cannot be read, the rollout
+    makes Redis rewrite its append-only file now, with no restart. Every
+    re-run checks again. After the rewrite, the file holds only the live
+    state and later writes. The next start, a NAS reboot included, renders
+    the fixed ACL from the checkout and replays only those writes, which it
+    accepts.
+  - If that rewrite fails or does not finish within 10 minutes
+    (`JM_REDIS_COMPACT_TIMEOUT`, in seconds), the rollout stops with nothing
+    changed. Do not reboot the NAS or restart Redis until a re-run of the
+    rollout (or step 3 by hand) succeeds.
+  - `--cutover-proxy`, `--proxy-rollback`, `--proxy-restore` and their
+    automatic rollbacks recreate Redis. They run the rewrite before they
+    stop anything, and stop with the stack unchanged if it does not finish.
+    If Redis is already down, nothing can be rewritten. The script then says
+    that the start replays the whole file. It refuses to start Redis while
+    `server/redis.acl` still has the 0.5.0 default line, unless you pass
+    `--allow-aof-replay`.
+  - `server/scripts/update-server.sh` never restarts Redis and does not do
+    this check. If you update by hand (pull the checkout, then restart Redis
+    or reboot the NAS yourself), follow steps 1 to 4 above.
 - The security fix under **Server** is in the Redis proxy, so it protects a
   volume once that volume's proxy runs this release. Macs and farm workers
   need no update for it. `server/scripts/rollout-compose.sh` refuses a proxy

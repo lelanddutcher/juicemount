@@ -23,6 +23,9 @@
 # rewrite does not finish. --allow-aof-replay matters only when Redis is
 # already down and server/redis.acl still has the 0.5.0 default line: it
 # accepts that the start drops every replayed transaction.
+# A release never restarts Redis. It rewrites the AOF online, before any
+# change, while the running Redis still has the 0.5.0 ACL, so that a later
+# start under the staged fixed ACL (a NAS reboot) replays nothing old.
 set -euo pipefail
 # shellcheck source=lib/redis-compact.sh
 . "$(cd "$(dirname "$0")" && pwd)/lib/redis-compact.sh"
@@ -152,6 +155,7 @@ if [ "$DRY_RUN" = 1 ]; then
   printf 'rollout-compose dry run: mode=%s project=%s source=%s (%s)\n' "$MODE" "$PROJECT" "$SOURCE_VERSION" "$SOURCE_COMMIT"
   case "$MODE" in
     release)
+      echo 'running Redis still on the 0.5.0 ACL (/run/jm-redis/users.acl): rewrite its AOF online (no restart) or stop with nothing changed'
       printf 'pull and verify: %s %s %s\n' "$NEW_MANAGER" "$NEW_FARM" "$NEW_RENDER"
       echo 'preflight live Compose labels, config hashes, credentials, old local images, and protected container IDs'
       echo 'recreate only juicemount-manager and juicefarm with --no-deps --no-build --pull never'
@@ -710,6 +714,19 @@ verify_running "$OLD_MANAGER" "$OLD_FARM" "$OLD_MANAGER_IDENTITY" "$OLD_FARM_IDE
 
 case "$MODE" in
   release|cutover)
+    if [ "$MODE" = release ]; then
+      # A release never restarts Redis, but this checkout stages the
+      # server/redis.acl that Redis renders at its next start, a NAS reboot
+      # included. If the running Redis still has the 0.5.0 default line, its
+      # AOF may hold transactions an earlier start refused; that next start
+      # would replay them over newer writes. Rewrite the AOF now, online,
+      # before anything changes. Every re-run checks again.
+      log 'checking the ACL the running Redis loaded (/run/jm-redis/users.acl)'
+      jm_redis_compact_if_old_acl "$PROJECT" || {
+        log 'CRITICAL: the running Redis still uses the 0.5.0 ACL and its AOF rewrite did not finish. Do NOT reboot the NAS or restart Redis until a rewrite succeeds: its next start would replay transactions an earlier start refused, which can corrupt the folder tree. Nothing was changed. Fix the cause (see the redis-compact message above and the Redis log), then re-run this rollout.'
+        exit 1
+      }
+    fi
     if [ "$MODE" = cutover ]; then
       require_proxy_env || exit 1
       rp_digest="$(respproxy_digest)" || { log 'server/.env needs exactly one JM_RESPPROXY_DIGEST=sha256:... assignment'; exit 1; }

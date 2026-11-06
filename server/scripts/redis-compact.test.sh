@@ -16,6 +16,13 @@
 #      B and the plain SET survive, A stays gone, no AOF-loading-client lines.
 #   5. Control: the copy, restarted under the fixed ACL without the helper,
 #      brings A back. This proves step 4 tests the helper.
+#   6. Release rollout (no restart): a 0.5.0 Redis that already had a lossy
+#      restart (refused transaction R0 is still in its AOF), then writes. The
+#      release's online rewrite (jm_redis_compact_if_old_acl) runs because
+#      the rendered ACL is old; more writes follow; then a restart under the
+#      fixed ACL keeps everything, does not bring R0 back, and logs no
+#      AOF-loading-client lines. On that fixed Redis the check skips the
+#      rewrite.
 #
 # Usage: server/scripts/redis-compact.test.sh
 # Needs Docker. Uses the compose's digest-pinned Redis image.
@@ -38,8 +45,8 @@ esac
 
 project=jm-redis-compact-test-$$
 work=$(mktemp -d "${TMPDIR:-/tmp}/jm-redis-compact.XXXXXX")
-mkdir "$work/data" "$work/control"
-chmod 777 "$work/data" "$work/control" # the image runs redis as uid 999
+mkdir "$work/data" "$work/control" "$work/release"
+chmod 777 "$work/data" "$work/control" "$work/release" # the image runs redis as uid 999
 
 # Render both ACLs the way the redis service does (docker-compose.yml).
 proxy_pw=compact-test-proxy-0123456789abcdef
@@ -67,9 +74,9 @@ start() { # step, data folder, acl
 	name=jm-redis-compact-$$-$1
 	docker run -d --rm --name "$name" \
 		--label "com.docker.compose.project=$project" --label com.docker.compose.service=redis \
-		-v "$2:/data" -v "$3:/users.acl:ro" -v "$work/admin.pass:/run/jm-redis/admin.pass:ro" \
+		-v "$2:/data" -v "$3:/run/jm-redis/users.acl:ro" -v "$work/admin.pass:/run/jm-redis/admin.pass:ro" \
 		"$image" redis-server --appendonly yes --appendfsync always \
-		--aclfile /users.acl >/dev/null
+		--aclfile /run/jm-redis/users.acl >/dev/null
 	for _ in $(seq 1 50); do
 		if docker exec "$name" redis-cli --user jm-proxy --pass "$proxy_pw" --no-auth-warning PING 2>/dev/null | grep -q PONG; then
 			return 0
@@ -85,7 +92,7 @@ cleanup() {
 	stop
 	# The data folders belong to the image's redis user: remove them as root
 	# inside a throwaway container of the same image.
-	docker run --rm -v "$work:/w" --entrypoint sh "$image" -c 'rm -rf /w/data /w/control' >/dev/null 2>&1 || true
+	docker run --rm -v "$work:/w" --entrypoint sh "$image" -c 'rm -rf /w/data /w/control /w/release' >/dev/null 2>&1 || true
 	rm -rf "$work" 2>/dev/null || true
 }
 trap cleanup EXIT
@@ -134,9 +141,37 @@ if [ "$(cli LLEN q)" != 1 ]; then
 	fail=1
 fi
 stop
+
+# 6. The release rollout's online rewrite.
+rewrites() { docker exec "$name" sh -c 'redis-cli --user jm-admin --pass "$(cat /run/jm-redis/admin.pass)" --no-auth-warning INFO persistence' | tr -d '\r' | sed -n 's/^aof_rewrites://p'; }
+start 6 "$work/release" "$work/old.acl"
+raw "AUTH jm-proxy $proxy_pw\r\nMULTI\r\nSET r0 stale\r\nLPUSH rq0 stale\r\nEXEC\r\n"
+stop
+start 6b "$work/release" "$work/old.acl"
+[ "$(cli LLEN rq0)" = 0 ] || { echo 'redis-compact: precondition failed: the 0.5.0 restart kept transaction R0' >&2; exit 1; }
+raw "AUTH jm-proxy $proxy_pw\r\nMULTI\r\nHSET r1 name ino\r\nSET r2 attr\r\nEXEC\r\nSET rplain 1\r\nSELECT 1\r\nMULTI\r\nSET rdb1 a\r\nEXEC\r\n"
+jm_redis_compact_if_old_acl "$project" || { echo 'redis-compact: the release rewrite failed on a running 0.5.0 Redis' >&2; exit 1; }
+[ "$(rewrites)" = 1 ] || { echo 'redis-compact: the release check did not rewrite the AOF under the 0.5.0 ACL' >&2; fail=1; }
+# Writes after the rewrite, still under the 0.5.0 ACL.
+raw "AUTH jm-proxy $proxy_pw\r\nMULTI\r\nSET r3 after\r\nLPUSH rq job\r\nEXEC\r\nSELECT 1\r\nMULTI\r\nSET rdb1b b\r\nEXEC\r\n"
+stop
+start 7 "$work/release" "$work/fixed.acl"
+[ "$(cli HGET r1 name)$(cli GET r2)$(cli GET rplain)" = inoattr1 ] || { echo 'redis-compact: writes from before the release rewrite were lost on the restart' >&2; fail=1; }
+[ "$(cli GET r3)$(cli LLEN rq)" = after1 ] || { echo 'redis-compact: the transaction written after the release rewrite was lost on the restart' >&2; fail=1; }
+[ "$(cli -n 1 GET rdb1)$(cli -n 1 GET rdb1b)" = ab ] || { echo 'redis-compact: a database-1 transaction was lost across the release rewrite and restart' >&2; fail=1; }
+[ "$(cli LLEN rq0)" = 0 ] && [ -z "$(cli GET r0)" ] || { echo 'redis-compact: the refused transaction R0 came back after the release rewrite' >&2; fail=1; }
+if [ "$(refusals)" != 0 ]; then
+	echo 'redis-compact: redis refused a command while loading the AOF after the release rewrite:' >&2
+	docker logs "$name" 2>&1 | grep -m3 'AOF-loading-client' >&2
+	fail=1
+fi
+jm_redis_compact_if_old_acl "$project" || { echo 'redis-compact: the release check failed on a fixed-ACL Redis' >&2; fail=1; }
+[ "$(rewrites)" = 0 ] || { echo 'redis-compact: the release check rewrote the AOF although the running ACL is fixed' >&2; fail=1; }
+stop
 name=
 
 if [ "$fail" = 0 ]; then
 	echo 'redis-compact: after the helper, a fixed-ACL restart keeps every write and replays no refused transaction'
+	echo 'redis-compact: the release rewrite runs only under the 0.5.0 ACL, and a later fixed-ACL restart keeps every write'
 fi
 exit "$fail"

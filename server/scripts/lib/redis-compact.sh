@@ -25,6 +25,15 @@
 #     Redis not running: nothing can be compacted, so say that the next start
 #       replays the whole AOF. Refuse when ACL_FILE would still refuse
 #       replayed transactions, unless ALLOW_REPLAY=1.
+#
+#   jm_redis_compact_if_old_acl PROJECT
+#     For a script that does NOT restart Redis but stages the fixed ACL that
+#     its next start (a NAS reboot included) renders. When the running Redis
+#     still loaded the 0.5.0 default line (/run/jm-redis/users.acl), or that
+#     file cannot be read, rewrite the AOF now, online. Afterwards the base
+#     holds the live state and the AOF only writes made after it, which the
+#     fixed ACL replays. Returns 0 when the rewrite finished or was not
+#     needed, 1 otherwise (Redis not running included).
 
 jm_redis_compact_log() { printf 'redis-compact: %s\n' "$*" >&2; }
 
@@ -67,10 +76,15 @@ jm_redis_info_field() { # info text, field
 # Rewrite the AOF of the running Redis and wait for the rewrite to finish.
 # Returns 0 when it finished, 3 when Redis is not running, 1 on any failure.
 jm_redis_compact() { # project
-  local project="$1" c rc info reply before failures_before sched prog status count failures i
+  local c rc
+  c="$(jm_redis_find "$1")" || { rc=$?; return "$rc"; }
+  jm_redis_compact_container "$c"
+}
+
+jm_redis_compact_container() { # running redis container
+  local c="$1" info reply before failures_before sched prog status count failures i
   local timeout="${JM_REDIS_COMPACT_TIMEOUT:-600}"
   [[ "$timeout" =~ ^[1-9][0-9]*$ ]] || { jm_redis_compact_log "JM_REDIS_COMPACT_TIMEOUT must be a whole number of seconds"; return 1; }
-  c="$(jm_redis_find "$project")" || { rc=$?; return "$rc"; }
   info="$(jm_redis_cli "$c" INFO persistence)" || { jm_redis_compact_log "cannot read INFO persistence from Redis $c as jm-admin"; return 1; }
   before="$(jm_redis_info_field "$info" aof_rewrites)"
   failures_before="$(jm_redis_info_field "$info" aof_rewrites_consecutive_failures)"
@@ -113,6 +127,9 @@ jm_redis_compact() { # project
 # side.
 jm_redis_acl_replay_safe() { # acl file
   [ -f "$1" ] || { jm_redis_compact_log "ACL file $1 is missing"; return 1; }
+  jm_redis_acl_text_replay_safe < "$1"
+}
+jm_redis_acl_text_replay_safe() { # acl text on stdin
   awk '
     /^[[:space:]]*#/ { next }
     $1 == "user" && $2 == "default" {
@@ -128,7 +145,31 @@ jm_redis_acl_replay_safe() { # acl file
       if (!cmds || !keys) bad = 1
     }
     END { exit bad }
-  ' "$1"
+  '
+}
+
+# 0 when the ACL the running Redis rendered at its start replays
+# transactions. An unreadable or empty file counts as not safe.
+jm_redis_running_acl_safe() { # running redis container
+  local acl
+  acl="$(docker exec "$1" cat /run/jm-redis/users.acl 2>/dev/null)" || return 1
+  [ -n "$acl" ] || return 1
+  printf '%s\n' "$acl" | jm_redis_acl_text_replay_safe
+}
+
+jm_redis_compact_if_old_acl() { # project
+  local c rc
+  c="$(jm_redis_find "$1")" || {
+    rc=$?
+    [ "$rc" != 3 ] || jm_redis_compact_log "Redis of project $1 is not running"
+    return 1
+  }
+  if jm_redis_running_acl_safe "$c"; then
+    jm_redis_compact_log "the running Redis already loaded an ACL that replays transactions; no AOF rewrite needed"
+    return 0
+  fi
+  jm_redis_compact_log "the running Redis still has the 0.5.0 'user default ... -@all' line (or its /run/jm-redis/users.acl is unreadable): rewriting its AOF now, without a restart"
+  jm_redis_compact_container "$c"
 }
 
 jm_redis_before_restart() { # project, acl file (may be empty), allow replay (0|1)

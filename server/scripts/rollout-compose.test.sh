@@ -27,6 +27,11 @@ export FAKE_LOG="$WORK/docker.log"
 export FAKE_STATE="$WORK/state"
 export FAKE_FAIL=""
 export FAKE_TARGET_PIDFILE="$WORK/target.pid"
+# The ACL the running Redis rendered at its start: fixed | old | unreadable.
+export FAKE_RUNNING_ACL=fixed
+# The AOF rewrite: ok | refused | hang | err.
+export FAKE_AOF=ok
+export FAKE_AOF_DIR="$WORK/aof"
 printf old > "$FAKE_STATE"
 : > "$FAKE_LOG"
 
@@ -87,6 +92,11 @@ if [ "$1" = compose ]; then
   exit 0
 fi
 case "$1" in
+  ps)
+    case "$*" in
+      *label=com.docker.compose.project=testproject*label=com.docker.compose.service=redis*status=running*) echo redis-id ;;
+      *) echo "unexpected ps: $*" >&2; exit 1 ;;
+    esac ;;
   inspect)
     shift
     if [ "${1:-}" = -f ]; then
@@ -128,6 +138,30 @@ case "$1" in
   exec)
     id="$2"
     case "$*" in
+      *'cat /run/jm-redis/users.acl'*)
+        [ "$id" = redis-id ] || { echo "ACL read from $id" >&2; exit 1; }
+        printf 'user default off resetpass resetkeys resetchannels '
+        case "$FAKE_RUNNING_ACL" in
+          fixed) echo '~* &* +@all' ;;
+          old) echo -- '-@all' ;;
+          *) echo 'cat: no such file' >&2; exit 1 ;;
+        esac
+        echo 'user jm-proxy on #0000 ~* &* +@all' ;;
+      *jm-redis-cli*BGREWRITEAOF*)
+        [ "$id" = redis-id ] || { echo "BGREWRITEAOF sent to $id" >&2; exit 1; }
+        case "$FAKE_AOF" in
+          refused) echo 'ERR Background append only file rewriting failed to start'; exit 0 ;;
+          hang) : > "$FAKE_AOF_DIR/busy" ;;
+          err) : > "$FAKE_AOF_DIR/err" ;;
+          *) n="$(cat "$FAKE_AOF_DIR/count")"; echo $((n + 1)) > "$FAKE_AOF_DIR/count" ;;
+        esac
+        echo 'Background append only file rewriting started' ;;
+      *jm-redis-cli*'INFO persistence'*)
+        busy=0; status=ok; fails=0
+        [ -e "$FAKE_AOF_DIR/busy" ] && busy=1
+        [ -e "$FAKE_AOF_DIR/err" ] && status=err && fails=1
+        printf 'aof_rewrite_in_progress:%s\r\naof_rewrite_scheduled:0\r\naof_last_bgrewrite_status:%s\r\naof_rewrites:%s\r\naof_rewrites_consecutive_failures:%s\r\n' \
+          "$busy" "$status" "$(cat "$FAKE_AOF_DIR/count")" "$fails" ;;
       *--build-info*)
         if [ "$id" = manager-id ]; then binary=juicemount-manager; else binary=jmfarm; fi
         if [ "$state" = new ]; then echo "$binary 0.5.0 ($FAKE_COMMIT)"; else echo "$binary 0.4.9 (0000000000000000000000000000000000000000)"; fi ;;
@@ -155,6 +189,8 @@ args=(--repo "$REPO" --project testproject --manager-digest "$NEW_M" --farm-dige
 
 reset_case() {
   printf old > "$FAKE_STATE"
+  rm -rf "$FAKE_AOF_DIR"; mkdir -p "$FAKE_AOF_DIR"; echo 3 > "$FAKE_AOF_DIR/count"
+  export FAKE_RUNNING_ACL=fixed FAKE_AOF=ok
   : > "$FAKE_LOG"
   rm -rf "$REPO/.update-lock"
   rm -f "$FAKE_TARGET_PIDFILE"
@@ -166,11 +202,8 @@ assert_no_infra_mutation() {
     grep -E 'docker compose .* (up|rm) .* (redis|minio|respproxy|juicefs)( |$)' "$FAKE_LOG" >/dev/null; then
     echo 'FAIL: protected service mutation' >&2; exit 1
   fi
-  # A release never stops Redis, so it has no AOF to compact.
-  if grep -E 'BGREWRITEAOF|^docker ps ' "$FAKE_LOG" >/dev/null; then
-    echo 'FAIL: release rollout touched Redis' >&2; exit 1
-  fi
 }
+rewrites() { grep -c 'jm-redis-cli BGREWRITEAOF' "$FAKE_LOG" || true; }
 reset_case
 bash "$SCRIPT" "${args[@]}" --dry-run > "$WORK/out"
 [ ! -s "$FAKE_LOG" ] && [ ! -e "$REPO/.update-lock" ]
@@ -182,7 +215,7 @@ grep -q 'never restarts Redis' "$WORK/out" && [ ! -s "$FAKE_LOG" ] && [ ! -e "$R
 echo 'ok: release rollout refuses the AOF replay override (it never restarts Redis)'
 
 reset_case
-bash "$SCRIPT" "${args[@]}" > "$WORK/out"
+bash "$SCRIPT" "${args[@]}" > "$WORK/out" 2>&1
 [ "$(cat "$FAKE_STATE")" = new ] && [ ! -e "$REPO/.update-lock" ]
 grep -Fx "JM_MANAGER_DIGEST=$NEW_M" "$REPO/server/.env" >/dev/null
 grep -Fx "JM_FARM_DIGEST=$NEW_F" "$REPO/server/.env" >/dev/null
@@ -192,7 +225,48 @@ grep -Fx 'JM_ADMIN_KEY=0123456789abcdef0123456789abcdef' "$REPO/server/.env" >/d
 [ "$(grep -c 'docker compose .* up ' "$FAKE_LOG")" = 1 ]
 grep -F -- '--no-deps --no-build --pull never --force-recreate juicemount-manager juicefarm' "$FAKE_LOG" >/dev/null
 assert_no_infra_mutation
+[ "$(rewrites)" = 0 ] || { echo 'FAIL: AOF rewritten although the running Redis has the fixed ACL' >&2; exit 1; }
+grep -q 'no AOF rewrite needed' "$WORK/out" || { echo 'FAIL: the running ACL was not checked' >&2; exit 1; }
 echo 'ok: only the two requested services are recreated after immutable preflight'
+
+# The running Redis still has the 0.5.0 default line (or its rendered ACL
+# cannot be read): the release rewrites the AOF online before any change,
+# never restarts Redis, and does so again on a re-run.
+for acl in old unreadable; do
+  reset_case
+  export FAKE_RUNNING_ACL="$acl"
+  bash "$SCRIPT" "${args[@]}" > "$WORK/out" 2>&1 || { cat "$WORK/out"; echo "FAIL: release failed with a $acl running ACL" >&2; exit 1; }
+  [ "$(cat "$FAKE_STATE")" = new ] && [ ! -e "$REPO/.update-lock" ]
+  [ "$(rewrites)" = 1 ] && [ "$(cat "$FAKE_AOF_DIR/count")" = 4 ] || { echo "FAIL: no AOF rewrite with a $acl running ACL" >&2; exit 1; }
+  c="$(grep -n 'jm-redis-cli BGREWRITEAOF' "$FAKE_LOG" | head -1 | cut -d: -f1)"
+  first="$(grep -nE '^docker (pull|compose .* up )' "$FAKE_LOG" | head -1 | cut -d: -f1)"
+  [ -n "$first" ] && [ "$c" -lt "$first" ] || { echo 'FAIL: AOF rewritten after the release started changing things' >&2; exit 1; }
+  grep -q 'aof_last_bgrewrite_status:ok' "$WORK/out"
+  assert_no_infra_mutation
+  echo "ok: a release rewrites the AOF online when the running Redis ACL is $acl, and never restarts Redis"
+done
+# Run the release again on the same Redis (its ACL is still old; the fake
+# keeps the rewrite count and resets only the services and .env).
+cp -R "$FAKE_AOF_DIR" "$WORK/aof.keep"; reset_case; rm -rf "$FAKE_AOF_DIR"; mv "$WORK/aof.keep" "$FAKE_AOF_DIR"
+export FAKE_RUNNING_ACL=old
+bash "$SCRIPT" "${args[@]}" > "$WORK/out" 2>&1 || { cat "$WORK/out"; echo 'FAIL: release re-run failed' >&2; exit 1; }
+[ "$(rewrites)" = 1 ] && [ "$(cat "$FAKE_AOF_DIR/count")" = 5 ] || { echo 'FAIL: a release re-run did not rewrite the AOF again' >&2; exit 1; }
+assert_no_infra_mutation
+echo 'ok: a release re-run rewrites the AOF again while the running ACL is still old'
+
+# A rewrite that is refused, fails or times out stops the release before
+# any pull or mutation, and tells the operator not to restart Redis.
+for aof in refused err hang; do
+  reset_case
+  export FAKE_RUNNING_ACL=old FAKE_AOF="$aof"
+  if JM_REDIS_COMPACT_TIMEOUT=3 bash "$SCRIPT" "${args[@]}" > "$WORK/out" 2>&1; then echo "FAIL: release went on after a $aof rewrite" >&2; exit 1; fi
+  [ "$(cat "$FAKE_STATE")" = old ] && [ ! -e "$REPO/.update-lock" ]
+  grep -Fx "JM_MANAGER_DIGEST=$OLD_M" "$REPO/server/.env" >/dev/null
+  ! grep -qE '^docker (pull|compose .* up )' "$FAKE_LOG" || { echo "FAIL: release changed something after a $aof rewrite" >&2; exit 1; }
+  grep -q 'Do NOT reboot the NAS or restart Redis until a rewrite succeeds' "$WORK/out" || { cat "$WORK/out"; echo "FAIL: $aof rewrite did not warn the operator" >&2; exit 1; }
+  assert_no_infra_mutation
+done
+echo 'ok: a failed release rewrite stops before any change and warns against a restart'
 
 for failure in bad_hash bad_key old_unhealthy; do
   reset_case
