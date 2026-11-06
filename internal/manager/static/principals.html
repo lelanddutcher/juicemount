@@ -235,7 +235,8 @@ Mac and published as conflict copies.</p>
       document.getElementById('window').textContent = (until
         ? 'Auto-approve is OPEN until ' + when(until) + ' (' + s.auto_approve_used + ' of ' + s.auto_approve_max + ' approvals used, at most 2 per address).'
         : 'Auto-approve is closed: new Macs wait for approval.') +
-        (s.needs_review ? ' ' + s.needs_review + ' auto-approved Mac(s) need review: confirm or revoke each.' : '');
+        (s.needs_review ? ' ' + s.needs_review + ' auto-approved Mac(s) need review: confirm or revoke each.' : '') +
+        (s.auto_approve_problem ? ' Admitted Macs wait: ' + s.auto_approve_problem + '.' : '');
       var rel = s.proxy_configured
         ? (s.proxy_live
           ? (s.reload_applied
@@ -260,7 +261,7 @@ Mac and published as conflict copies.</p>
         var tr = document.createElement('tr');
         tr.innerHTML = '<td><code>' + esc(p.name) + '</code><br>' + esc(p.label) + '</td><td>' + esc(p.host) + '</td><td><code>' +
           esc(p.fingerprint) + '</code></td><td class="status-' + esc(p.status) + '">' + esc(p.status) +
-          (p.auto_approved ? ' (auto, needs review)' : '') + (p.auto_approve_pending ? ' (auto-approved when its storage key is ready)' : '')
+          (p.auto_approved ? ' (auto, needs review)' : '') + (p.auto_approve_pending ? ' (admitted by auto-approve; approved once the proxy is proven live' + (s.per_mac_keys ? ' and its storage key is ready)' : ')') : '')
           + identityNotes(p) + '</td><td class="keycol"' + (showKeys ? '' : ' style="display:none"') + '>' + keyCell(p) + '</td><td>' +
           esc(when(p.requested_at_ms)) + '</td><td>' + esc(p.source_ip) + '</td><td class="row"></td>';
         var actions = tr.lastChild;

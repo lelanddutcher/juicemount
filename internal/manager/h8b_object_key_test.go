@@ -98,8 +98,9 @@ func TestH8BEnrollObjectKeyOnlyAfterApproval(t *testing.T) {
 	assertNoObjectKey(t, "revoked poll", rr.Body.Bytes())
 }
 
-// Auto-approved enrollment returns the key at once (same trust as the
-// principal itself); with no client key configured, nothing is added.
+// An auto-approved Mac gets the key in the poll answer that reports it
+// approved (same trust as the principal itself); with no client key
+// configured, nothing is added.
 func TestH8BEnrollObjectKeyAutoApproveAndUnset(t *testing.T) {
 	setObjectKeyEnv(t)
 	mux, _, _, _ := newH8BAPI(t)
@@ -107,8 +108,12 @@ func TestH8BEnrollObjectKeyAutoApproveAndUnset(t *testing.T) {
 		t.Fatalf("auto-approve: %d %s", rr.Code, rr.Body)
 	}
 	rr := doJSON(t, mux, http.MethodPost, "/api/principals/enroll", "", map[string]string{"instance_id": testInstanceID, "host": "Laptop", "secret": testMacSecret})
-	if got := decodeEnroll(t, rr.Body.Bytes()); got.Status != PrincipalApproved || got.ObjectSecretKey != testClientSK {
-		t.Fatalf("auto-approved enroll = %+v", got)
+	er := decodeEnroll(t, rr.Body.Bytes())
+	if er.Status != PrincipalPending || er.ObjectSecretKey != "" {
+		t.Fatalf("enroll in the window = %+v, want pending until an auto-approve pass proves the proxy", er)
+	}
+	if _, got := pollUntilApproved(t, mux, testInstanceID, er.PollToken); got.ObjectSecretKey != testClientSK {
+		t.Fatalf("auto-approved poll = %+v", got)
 	}
 
 	t.Setenv("JM_OBJ_CLIENT_SECRET_KEY", "")

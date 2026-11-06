@@ -64,6 +64,7 @@ func TestRotatedMacGetsItsPersonOnApproval(t *testing.T) {
 				t.Fatalf("before approval: %+v", d)
 			}
 			if auto {
+				waitStatus(t, s, mac, PrincipalApproved)
 				d := device()
 				if d.Status != PrincipalApproved || !d.ReadOnly {
 					t.Fatalf("auto-approved rotated Mac: %+v, want approved, no person, read-only", d)

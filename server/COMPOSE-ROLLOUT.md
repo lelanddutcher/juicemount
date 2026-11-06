@@ -187,8 +187,11 @@ proxy:
   to one 2 s proxy tick. Before the cutover it answers 409 "the
   Redis proxy is not live yet"; a stopped proxy gets "the Redis proxy has
   stopped"; a proxy image older than the heartbeat or than `reload.applied`
-  gets "Update the jm-respproxy image". A Mac approved early does not switch
-  anyway: the app logs in as
+  gets "Update the jm-respproxy image". This check proves only that the
+  running proxy speaks the `reload.applied` protocol (0.5 and later), not
+  that its image is at or after `server/respproxy/min-gate-commit`:
+  `rollout-compose.sh` enforces that pin. A Mac approved early does not
+  switch anyway: the app logs in as
   its principal first and keeps its current login, showing "Approved —
   waiting for the server cutover", until the server accepts the new one.
 - The server mounts (`juicefs`, farm, Manager) were recreated by stages 4 and
@@ -236,9 +239,12 @@ per source address, 7 days) only when both are true: the deployed proxy
 contains the every-mode gate (prerequisite 2), and you are present to review.
 Do not open it on a proxy without that gate (the script already refuses to
 start a proxy image whose revision does not descend from
-`server/respproxy/min-gate-commit`). Everything the window approves is
-listed as "needs review" until you confirm or revoke it. Close the window as
-soon as the named Macs are in.
+`server/respproxy/min-gate-commit`). A Mac the window admits stays pending
+until a background pass has proved the proxy live the same way Approve does
+(a few seconds); while that proof fails, the Principals page says why and
+the Mac waits. Everything the window approves is listed as "needs review"
+until you confirm or revoke it. Close the window as soon as the named Macs
+are in.
 
 The per-address limits count the source address the Manager sees. Remote
 Macs behind a Tailscale subnet router (or any NAT) all arrive from the

@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -566,24 +567,7 @@ func TestH8BDowngradedProxyStaleReceiptRefused(t *testing.T) {
 			}
 			stop()
 
-			oldStop, oldDone := make(chan struct{}), make(chan struct{})
-			go func() { // the older image: starts from the current request, never writes reload.applied
-				defer close(oldDone)
-				last := readStringOK(filepath.Join(dir, reloadRequestName))
-				for {
-					select {
-					case <-oldStop:
-						return
-					case <-time.After(5 * time.Millisecond):
-					}
-					if req := readStringOK(filepath.Join(dir, reloadRequestName)); tc.legacyAck && req != last && req != "" {
-						fakeProxyWrite(dir, legacyReloadAckName, strings.TrimSpace(req))
-						last = req
-					}
-					fakeProxyWrite(dir, reloadHeartbeatName, "1")
-				}
-			}()
-			stopOld := func() { close(oldStop); <-oldDone }
+			stopOld := startOlderProxyImage(t, dir, tc.legacyAck)
 			time.Sleep(50 * time.Millisecond)
 
 			if err := s.Approve(b); !errors.Is(err, tc.want) {
@@ -597,17 +581,218 @@ func TestH8BDowngradedProxyStaleReceiptRefused(t *testing.T) {
 			}
 			stopOld()
 
-			// A current image again: it deletes both receipts as it starts
-			// (respproxy.NewPrincipalReloader).
-			for _, n := range []string{legacyReloadAckName, reloadAckName} {
-				if err := os.Remove(filepath.Join(dir, n)); err != nil && !os.IsNotExist(err) {
-					t.Fatal(err)
-				}
-			}
-			startFakeProxyAck(t, dir)
+			startCurrentProxyImage(t, dir)
 			if err := s.Approve(c); err != nil {
 				t.Fatalf("Approve after a current proxy image started again: %v", err)
 			}
 		})
 	}
+}
+
+// waitStatus waits for an auto-approve pass to decide name.
+func waitStatus(t *testing.T, s *PrincipalStore, name string, want PrincipalStatus) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		p := s.Snapshot().byName(name)
+		if p != nil && p.Status == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s: status %+v, want %s", name, p, want)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// pollUntilApproved polls the enroll route with the Mac's poll token until
+// an auto-approve pass approved it, and returns that answer.
+func pollUntilApproved(t *testing.T, mux http.Handler, instanceID, token string) (*httptest.ResponseRecorder, EnrollResponse) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		rr := doJSON(t, mux, http.MethodPost, "/api/principals/enroll", "", map[string]string{"instance_id": instanceID, "poll_token": token})
+		got := decodeEnroll(t, rr.Body.Bytes())
+		if got.Status == PrincipalApproved {
+			return rr, got
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("poll: %d %+v, want approved", rr.Code, got)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+// startOlderProxyImage plays an image from before reload.applied: it starts
+// from the request already in the file, keeps reload.heartbeat fresh and
+// never touches reload.applied (a receipt a current image left stays). With
+// legacyAck it answers new requests in reload.ack only.
+func startOlderProxyImage(t *testing.T, dir string, legacyAck bool) (stop func()) {
+	t.Helper()
+	quit, done := make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(done)
+		last := readStringOK(filepath.Join(dir, reloadRequestName))
+		for {
+			select {
+			case <-quit:
+				return
+			case <-time.After(5 * time.Millisecond):
+			}
+			if req := readStringOK(filepath.Join(dir, reloadRequestName)); legacyAck && req != last && req != "" {
+				fakeProxyWrite(dir, legacyReloadAckName, strings.TrimSpace(req))
+				last = req
+			}
+			fakeProxyWrite(dir, reloadHeartbeatName, "1")
+		}
+	}()
+	var once sync.Once
+	stop = func() { once.Do(func() { close(quit); <-done }) }
+	t.Cleanup(stop)
+	return stop
+}
+
+// startCurrentProxyImage starts a current image: it deletes both receipts
+// as it starts (respproxy.NewPrincipalReloader), then acknowledges.
+func startCurrentProxyImage(t *testing.T, dir string) (stop func()) {
+	t.Helper()
+	for _, n := range []string{legacyReloadAckName, reloadAckName} {
+		if err := os.Remove(filepath.Join(dir, n)); err != nil && !os.IsNotExist(err) {
+			t.Fatal(err)
+		}
+	}
+	return startFakeProxyAck(t, dir)
+}
+
+func shortAutoApproveRetry(t *testing.T) {
+	t.Helper()
+	old := autoApproveRetry
+	autoApproveRetry = 50 * time.Millisecond
+	t.Cleanup(func() { autoApproveRetry = old })
+}
+
+// pollMac answers one poll of the Mac enrolled as r (what asks for an
+// auto-approve pass while it waits).
+func pollMac(t *testing.T, s *PrincipalStore, instanceID string, r EnrollResponse) {
+	t.Helper()
+	if _, err := s.Enroll(EnrollRequest{InstanceID: instanceID, PollToken: r.PollToken}, "192.0.2.200"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestH8BAutoApproveNeedsFreshProof: the auto-approve window was opened
+// against a current proxy, then the image was replaced by one from before
+// reload.applied while the Manager kept running. Macs enrolling in the
+// window must stay pending (the window admitted them), with the reason in
+// the snapshot, and be approved once a current image runs again.
+func TestH8BAutoApproveNeedsFreshProof(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		legacyAck bool
+		problem   string
+	}{
+		{"signal-only-image", true, "update the jm-respproxy image"},
+		{"silent-image", false, "does not acknowledge"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			shortProxyAckWait(t)
+			shortAutoApproveRetry(t)
+			dir := t.TempDir()
+			s, err := NewPrincipalStore(PrincipalStoreOptions{StatePath: filepath.Join(dir, "store.json"), ProxyDir: dir})
+			if err != nil {
+				t.Fatal(err)
+			}
+			stop := startCurrentProxyImage(t, dir)
+			if _, err := s.SetAutoApproveWindow(time.Hour); err != nil {
+				t.Fatal(err)
+			}
+			stop()
+			startOlderProxyImage(t, dir, tc.legacyAck)
+			time.Sleep(50 * time.Millisecond)
+
+			ids := []string{instanceN(1), instanceN(2)}
+			var macs []EnrollResponse
+			for i, id := range ids {
+				r, err := s.Enroll(EnrollRequest{InstanceID: id, Host: "h", Secret: testMacSecret}, fmt.Sprintf("192.0.2.%d", i+1))
+				if err != nil {
+					t.Fatal(err)
+				}
+				macs = append(macs, r)
+			}
+			time.Sleep(4 * proxyAckWait)
+			snap := s.Snapshot()
+			for _, r := range macs {
+				if p := snap.byName(r.Principal); p.Status != PrincipalPending || !p.AutoApprovePending {
+					t.Fatalf("%s auto-approved against the older image: %+v", r.Principal, p)
+				}
+			}
+			if !strings.Contains(snap.AutoApproveProblem, tc.problem) {
+				t.Fatalf("auto_approve_problem = %q, want it to say %q", snap.AutoApproveProblem, tc.problem)
+			}
+			if snap.AutoApproveUsed != 2 {
+				t.Fatalf("auto_approve_used = %d, want 2 (counted at admission)", snap.AutoApproveUsed)
+			}
+
+			startCurrentProxyImage(t, dir)
+			for i, r := range macs {
+				pollMac(t, s, ids[i], r)
+				waitStatus(t, s, r.Principal, PrincipalApproved)
+			}
+			snap = s.Snapshot()
+			if snap.AutoApproveProblem != "" || snap.AutoApproveUsed != 2 || snap.NeedsReview != 2 {
+				t.Fatalf("after a current image: problem=%q used=%d review=%d", snap.AutoApproveProblem, snap.AutoApproveUsed, snap.NeedsReview)
+			}
+		})
+	}
+}
+
+// TestH8BAutoApproveAfterManagerRestartNeedsProof: the window was opened
+// against a current proxy, which then stopped and was replaced by an image
+// from before reload.applied; the Manager restarts and reopens the window
+// from its store. Its first auto-approval needs a fresh proof like any
+// other: the Macs stay pending until a current image runs.
+func TestH8BAutoApproveAfterManagerRestartNeedsProof(t *testing.T) {
+	shortProxyAckWait(t)
+	shortAutoApproveRetry(t)
+	dir := t.TempDir()
+	state := filepath.Join(dir, "store.json")
+	s, err := NewPrincipalStore(PrincipalStoreOptions{StatePath: state, ProxyDir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stop := startCurrentProxyImage(t, dir)
+	if _, err := s.SetAutoApproveWindow(time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	a, err := s.Enroll(EnrollRequest{InstanceID: instanceN(1), Host: "h", Secret: testMacSecret}, "192.0.2.1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitStatus(t, s, a.Principal, PrincipalApproved)
+	stop()
+	startOlderProxyImage(t, dir, true)
+
+	s2, err := NewPrincipalStore(PrincipalStoreOptions{StatePath: state, ProxyDir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s2.Snapshot().AutoApproveUntil == 0 {
+		t.Fatal("setup: the restarted Manager did not reopen the window")
+	}
+	b, err := s2.Enroll(EnrollRequest{InstanceID: instanceN(2), Host: "h", Secret: testMacSecret}, "192.0.2.2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(4 * proxyAckWait)
+	pollMac(t, s2, instanceN(2), b)
+	time.Sleep(4 * proxyAckWait)
+	if p := s2.Snapshot().byName(b.Principal); p.Status != PrincipalPending || !p.AutoApprovePending {
+		t.Fatalf("auto-approved after a Manager restart against the older image: %+v", p)
+	}
+	if prob := s2.Snapshot().AutoApproveProblem; !strings.Contains(prob, "update the jm-respproxy image") {
+		t.Fatalf("auto_approve_problem = %q", prob)
+	}
+	startCurrentProxyImage(t, dir)
+	pollMac(t, s2, instanceN(2), b)
+	waitStatus(t, s2, b.Principal, PrincipalApproved)
 }

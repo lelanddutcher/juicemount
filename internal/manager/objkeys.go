@@ -27,7 +27,8 @@ package manager
 // Invariant (per-Mac mode on): a Mac the Manager approves has an active key.
 // Approve waits for the key and refuses (409) when keyd does not deliver.
 // Auto-approval cannot wait (Enroll holds the store lock), so the record
-// stays pending with AutoApprovePending until the reconciler sees the key.
+// stays pending with AutoApprovePending until the reconciler sees the key
+// and an auto-approve pass (autoApprovePass) proves the proxy live.
 // Macs approved before the switch keep the shared jm-client key they
 // already hold (their poll answers carry no key) until their own key is
 // active (rollout step M2 backfill).
@@ -744,13 +745,14 @@ func (s *PrincipalStore) sortedNamesLocked() []string {
 // reconcileObjKeysLocked reads keyd's files and advances every record:
 // stores delivered secrets, asks keyd to re-create a key whose secret never
 // arrived, marks verified keys active, approves auto-approved Macs whose key
-// is active, mints for approved Macs that have no key (backfill), and drops
+// is active (through an auto-approve pass, which proves the proxy live
+// first), mints for approved Macs that have no key (backfill), and drops
 // removals keyd confirmed. forceDesired rewrites desired.json even when
 // nothing changed (start-up: the store is the source of truth).
 //
-// Order of writes: proxy files (an auto-approval), store, desired.json, and
-// only then the deletion of consumed results/ files. A failure before the
-// deletion leaves the result to be read again.
+// Order of writes: store, desired.json, and only then the deletion of
+// consumed results/ files. A failure before the deletion leaves the result
+// to be read again.
 func (s *PrincipalStore) reconcileObjKeysLocked(forceDesired bool) error {
 	c := s.objk
 	if c == nil {
@@ -775,7 +777,7 @@ func (s *PrincipalStore) reconcileObjKeysLocked(forceDesired bool) error {
 		before[k] = v
 	}
 	prevOrphans, prevOrphanRemoving := c.orphans, c.orphanRemoving
-	storeDirty, desiredDirty, proxyChanged := false, forceDesired, false
+	storeDirty, desiredDirty, autoReady := false, forceDesired, false
 	// A desired.json the store says it wrote is not on disk (the write
 	// failed after the store was saved): write it again.
 	if diskSeq < c.seq {
@@ -897,12 +899,7 @@ func (s *PrincipalStore) reconcileObjKeysLocked(forceDesired bool) error {
 		}
 		// (A closed or expired window cleared AutoApprovePending above.)
 		if next.Status == PrincipalPending && next.AutoApprovePending && objKeyDeliverable(&next) {
-			next.Status = PrincipalApproved
-			next.AutoApproved = true
-			next.AutoApprovePending = false
-			next.DecidedAt = now.UnixMilli()
-			changed, proxyChanged = true, true
-			log.Printf("manager: principal %s auto-approved (storage key %s active)", name, next.ObjKeyName)
+			autoReady = true // approved by autoApprovePass once the proxy proves live
 		}
 		if len(next.ObjKeyRemoving) > 0 && app != nil {
 			var keep []ObjKeyRemoval
@@ -951,12 +948,7 @@ func (s *PrincipalStore) reconcileObjKeysLocked(forceDesired bool) error {
 		// writeGensFile may already have durably recorded them.
 		c.orphans, c.orphanRemoving = prevOrphans, prevOrphanRemoving
 	}
-	if proxyChanged {
-		if err := s.commitLocked(true); err != nil {
-			undo()
-			return err
-		}
-	} else if storeDirty && !desiredDirty {
+	if storeDirty && !desiredDirty {
 		if err := s.saveStoreLocked(); err != nil {
 			undo()
 			return err
@@ -965,8 +957,8 @@ func (s *PrincipalStore) reconcileObjKeysLocked(forceDesired bool) error {
 	if desiredDirty {
 		if err := s.writeObjKeysDesiredLocked(app); err != nil {
 			var dw *objKeysDesiredWriteError
-			if proxyChanged || errors.As(err, &dw) {
-				// The decisions are in the store (and the proxy); only
+			if errors.As(err, &dw) {
+				// The decisions are in the store; only
 				// desired.json is behind, and the next cycle rewrites it.
 				// The results are kept until then.
 				return err
@@ -980,6 +972,9 @@ func (s *PrincipalStore) reconcileObjKeysLocked(forceDesired bool) error {
 		if err := os.Remove(rf.path); err != nil && !errors.Is(err, os.ErrNotExist) {
 			log.Printf("manager: objkeys: cannot delete %s: %v", rf.path, err)
 		}
+	}
+	if autoReady {
+		s.kickAutoApproveLocked()
 	}
 	return nil
 }

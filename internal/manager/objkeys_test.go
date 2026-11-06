@@ -298,6 +298,7 @@ type objRig struct {
 	objDir    string
 	kd        *fakeKeyd
 	s         *PrincipalStore
+	proxyStop func()
 
 	kdMu   sync.Mutex
 	kdStop chan struct{}
@@ -323,7 +324,7 @@ func newObjRig(t *testing.T) *objRig {
 		}
 	}
 	r.kd = newFakeKeyd(t, r.objDir)
-	startFakeProxyAck(t, r.proxyDir)
+	r.proxyStop = startFakeProxyAck(t, r.proxyDir)
 	r.open()
 	t.Cleanup(r.keydDown)
 	return r
@@ -741,6 +742,48 @@ func TestObjKeysAutoApproveWaitsForKey(t *testing.T) {
 		t.Fatalf("poll after auto-approval = %+v", got)
 	}
 	r.checkInvariant("auto")
+}
+
+// Auto-approve with per-Mac keys after the proxy image was replaced by one
+// from before reload.applied (the Manager kept running): the active key is
+// not enough, the Mac stays pending until a current image proves itself.
+func TestObjKeysAutoApproveNeedsProxyProof(t *testing.T) {
+	shortProxyAckWait(t)
+	shortAutoApproveRetry(t)
+	r := newObjRig(t)
+	if _, err := r.s.SetAutoApproveWindow(time.Hour, 5); err != nil {
+		t.Fatal(err)
+	}
+	name, tok := r.enroll(4)
+	r.proxyStop()
+	startOlderProxyImage(t, r.proxyDir, true)
+	r.keydUp()
+	r.waitFor("the storage key", func() bool { return r.rec(name).ObjKeyState == ObjKeyActive })
+	deadline := time.Now().Add(4 * proxyAckWait)
+	for time.Now().Before(deadline) {
+		if err := r.s.ReconcileObjKeys(); err != nil {
+			t.Logf("reconcile: %v", err)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if p := r.rec(name); p.Status != PrincipalPending || !p.AutoApprovePending {
+		t.Fatalf("auto-approved against the older proxy image: status=%s pending=%v", p.Status, p.AutoApprovePending)
+	}
+	if r.proxyHas(name) {
+		t.Fatal("the Mac reached the proxy file without a proxy proof")
+	}
+	if got := r.poll(4, tok); got.Status != PrincipalPending || got.ObjectAccessKey != "" {
+		t.Fatalf("poll while waiting for a proof = %+v", got)
+	}
+	if prob := r.s.Snapshot().AutoApproveProblem; !strings.Contains(prob, "update the jm-respproxy image") {
+		t.Fatalf("auto_approve_problem = %q", prob)
+	}
+	startCurrentProxyImage(t, r.proxyDir)
+	r.waitFor("auto-approval", func() bool { return r.rec(name).Status == PrincipalApproved })
+	if !r.proxyHas(name) {
+		t.Fatal("approved Mac missing from the proxy file")
+	}
+	r.checkInvariant("auto after proof")
 }
 
 // ---- U3 --------------------------------------------------------------------
