@@ -168,7 +168,8 @@ KA_SK=''
 unset JM_OBJ_KEYADMIN_SECRET_KEY
 export MC_CONFIG_DIR="${TMPDIR:-/tmp}/jm-keyd-mc-$$"
 MC_TMP="$DIR/.keyd-mc"
-trap 'rm -rf "$MC_CONFIG_DIR"; rm -f "$MC_TMP"' EXIT
+NOW_TMP="$DIR/.keyd-now"
+trap 'rm -rf "$MC_CONFIG_DIR"; rm -f "$MC_TMP" "$NOW_TMP"' EXIT
 
 # A stop that arrives while a key is being created is held until its
 # secret is in results/, for HOLD_MAX seconds at most. mc runs in the
@@ -289,7 +290,8 @@ umask 077
 mkdir -p "$DIR/results" || die "cannot create $DIR/results"
 chmod 0700 "$DIR" "$DIR/results" || die "cannot set mode 0700 on $DIR"
 [ -d "$MC_TMP" ] && die "$MC_TMP is a directory; remove it"
-rm -f "$MC_TMP"
+[ -d "$NOW_TMP" ] && die "$NOW_TMP is a directory; remove it"
+rm -f "$MC_TMP" "$NOW_TMP"
 
 # mc --json reply patterns. Values keyd uses from mc never contain quotes.
 RE_AK='"accessKey"[[:space:]]*:[[:space:]]*"([^"]*)"'
@@ -314,7 +316,24 @@ mc_msg() { # MSG = mc's error message in $1
 	MSG='no detail'
 	[[ "$1" =~ $RE_MC_MSG ]] && MSG="${BASH_REMATCH[1]//\\/}"
 }
-now_ms() { printf -v NOW_MS '%(%s)T000' -1; } # NOW_MS = the time in ms
+# now_ms: NOW_MS = the time in ms. Bash 5 has EPOCHREALTIME (ms precision);
+# older Bash (macOS ships 3.2) runs date into a file, with second precision
+# as keyd always had ("<seconds>000"). The stamps are only reported; keyd's
+# own deadlines use SECONDS. 0 if no clock could be read.
+RE_EPOCH='^([0-9]+)[.,]([0-9]{3})'
+now_ms() {
+	NOW_MS=0
+	if [[ "${EPOCHREALTIME:-}" =~ $RE_EPOCH ]]; then
+		NOW_MS="${BASH_REMATCH[1]}${BASH_REMATCH[2]}"
+		return 0
+	fi
+	date +%s >"$NOW_TMP" 2>/dev/null || return 0
+	read_file "$NOW_TMP"
+	[[ "$RF" =~ ^[0-9]+$ ]] && NOW_MS="${RF}000"
+	RF=''
+	rm -f "$NOW_TMP"
+	return 0
+}
 
 # write_atomic file content: 0 on success, else WA_ERR + 1. A directory at
 # the target name is refused: mv would move the file into it and report

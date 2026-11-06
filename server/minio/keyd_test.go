@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"syscall"
@@ -1217,6 +1218,53 @@ func TestKeydRunsNoCommandSubstitutionUnderStopTrap(t *testing.T) {
 			if strings.Contains(c, bad) {
 				t.Errorf("keyd.sh:%d has %q, which keyd may run under the stop trap: %s", i+1, bad, code)
 			}
+		}
+	}
+}
+
+// keyd runs under every Bash from 3.2 (macOS's /bin/bash, which the Mac
+// CI and developers use) to 5.3. This flags the Bash 4+ features most
+// likely to slip in; printf's %(...)T (4.2) did, and every keyd test
+// failed on the Mac.
+func TestKeydUsesOnlyBash32Features(t *testing.T) {
+	b, err := os.ReadFile("keyd.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bad := map[string]string{
+		"%(":           "printf %(...)T (Bash 4.2)",
+		",,}":          "${var,,} (Bash 4)",
+		"^^}":          "${var^^} (Bash 4)",
+		"declare -A":   "associative arrays (Bash 4)",
+		"local -A":     "associative arrays (Bash 4)",
+		"declare -n":   "namerefs (Bash 4.3)",
+		"local -n":     "namerefs (Bash 4.3)",
+		"mapfile":      "mapfile (Bash 4)",
+		"readarray":    "readarray (Bash 4)",
+		"[[ -v":        "[[ -v ]] (Bash 4.2)",
+		"|&":           "|& (Bash 4)",
+		"&>>":          "&>> (Bash 4)",
+		"coproc":       "coproc (Bash 4)",
+		"wait -n":      "wait -n (Bash 4.3)",
+		";;&":          ";;& (Bash 4)",
+		"EPOCHSECONDS": "EPOCHSECONDS (Bash 5)",
+	}
+	transform := regexp.MustCompile(`\$\{[A-Za-z_][A-Za-z_0-9]*@`)
+	for i, line := range strings.Split(string(b), "\n") {
+		code := strings.TrimSpace(line)
+		if strings.HasPrefix(code, "#") {
+			continue
+		}
+		for pat, what := range bad {
+			if strings.Contains(code, pat) {
+				t.Errorf("keyd.sh:%d uses %s: %s", i+1, what, code)
+			}
+		}
+		if transform.MatchString(code) {
+			t.Errorf("keyd.sh:%d uses ${var@op} (Bash 4.4): %s", i+1, code)
+		}
+		if strings.Contains(strings.ReplaceAll(code, "${EPOCHREALTIME:-}", ""), "EPOCHREALTIME") {
+			t.Errorf("keyd.sh:%d reads EPOCHREALTIME (Bash 5) without a fallback: %s", i+1, code)
 		}
 	}
 }
