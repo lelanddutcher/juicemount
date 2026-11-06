@@ -88,7 +88,7 @@ or farm workers.
 - A sync request with an unknown direction is refused. Before, a request
   naming a saved destination skipped the source check.
 - These checks need Linux 5.6 or later, and a Docker seccomp profile that
-  allows `openat2` (Docker 20.10.6 or later). On an older kernel or profile,
+  allows `openat2` (Docker 20.10 or later). On an older kernel or profile,
   every migration or backup between local folders fails with a message
   saying so, and none runs unconfined.
 - A fresh server install creates the `zpool` bucket before it sets up the
