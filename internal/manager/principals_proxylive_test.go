@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -671,6 +672,25 @@ func shortAutoApproveRetry(t *testing.T) {
 	t.Cleanup(func() { autoApproveRetry = old })
 }
 
+// pollUntilStatus polls as the waiting Mac until it reaches want, as the
+// app does at the server's retry_after. One poll is not enough: a pass asked
+// for while another pass runs, or within autoApproveRetry of a failed proof,
+// is dropped, and the Mac's next poll asks again.
+func pollUntilStatus(t *testing.T, s *PrincipalStore, instanceID string, r EnrollResponse, want PrincipalStatus) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		pollMac(t, s, instanceID, r)
+		if p := s.Snapshot().byName(r.Principal); p != nil && p.Status == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s: status %+v, want %s after polling", r.Principal, s.Snapshot().byName(r.Principal), want)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
 // pollMac answers one poll of the Mac enrolled as r (what asks for an
 // auto-approve pass while it waits).
 func pollMac(t *testing.T, s *PrincipalStore, instanceID string, r EnrollResponse) {
@@ -735,8 +755,7 @@ func TestH8BAutoApproveNeedsFreshProof(t *testing.T) {
 
 			startCurrentProxyImage(t, dir)
 			for i, r := range macs {
-				pollMac(t, s, ids[i], r)
-				waitStatus(t, s, r.Principal, PrincipalApproved)
+				pollUntilStatus(t, s, ids[i], r, PrincipalApproved)
 			}
 			snap = s.Snapshot()
 			if snap.AutoApproveProblem != "" || snap.AutoApproveUsed != 2 || snap.NeedsReview != 2 {
@@ -793,26 +812,34 @@ func TestH8BAutoApproveAfterManagerRestartNeedsProof(t *testing.T) {
 		t.Fatalf("auto_approve_problem = %q", prob)
 	}
 	startCurrentProxyImage(t, dir)
-	pollMac(t, s2, instanceN(2), b)
-	waitStatus(t, s2, b.Principal, PrincipalApproved)
+	pollUntilStatus(t, s2, instanceN(2), b, PrincipalApproved)
 }
 
 // waitAutoIdleAtCleanup makes the test wait, at cleanup and before the
 // timers it shortened are restored, for any auto-approve pass to finish.
 func waitAutoIdleAtCleanup(t *testing.T, s *PrincipalStore) {
 	t.Helper()
-	t.Cleanup(func() {
-		deadline := time.Now().Add(10 * time.Second)
-		for {
-			s.mu.Lock()
-			running := s.autoRunning
-			s.mu.Unlock()
-			if !running || time.Now().After(deadline) {
-				return
-			}
-			time.Sleep(10 * time.Millisecond)
+	t.Cleanup(func() { waitAutoIdle(t, s) })
+}
+
+// waitAutoIdle waits until s runs no auto-approve pass. A pass starts only
+// when the store is asked for one, so a store nothing calls stays idle.
+func waitAutoIdle(t *testing.T, s *PrincipalStore) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		s.mu.Lock()
+		running := s.autoRunning
+		s.mu.Unlock()
+		if !running {
+			return
 		}
-	})
+		if time.Now().After(deadline) {
+			t.Errorf("an auto-approve pass still runs after 10 s")
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 // TestH8BAutoApproveReplacedRecordWaitsForItsOwnProof: while a pass waits
@@ -896,8 +923,7 @@ func TestH8BAutoApproveReplacedRecordWaitsForItsOwnProof(t *testing.T) {
 	s.mu.Lock()
 	s.autoFailedAt = time.Time{} // end the retry wait
 	s.mu.Unlock()
-	pollMac(t, s, id, second)
-	waitStatus(t, s, second.Principal, PrincipalApproved)
+	pollUntilStatus(t, s, id, second, PrincipalApproved)
 }
 
 // TestH8BAutoApproveWindowChangeHandsWaitingMacsToAdmin: Macs a window
@@ -982,5 +1008,129 @@ func TestH8BAutoApproveWindowChangeHandsWaitingMacsToAdmin(t *testing.T) {
 				t.Fatalf("used=%d review=%d, want 2/2 (the new window's cap)", snap.AutoApproveUsed, snap.NeedsReview)
 			}
 		})
+	}
+}
+
+// TestH8BAutoApproveWindowExpiresDuringProof: the auto-approve window
+// expires while a pass waits for its proxy proof, and the proof then
+// succeeds. Expiry clears no AutoApprovePending flag, so only the pass's
+// check of the window after the proof keeps the Mac from being approved by
+// a window that has ended. The Mac stays pending; the next poll clears the
+// lapsed flag and the Mac waits for an admin, whose Approve still works.
+func TestH8BAutoApproveWindowExpiresDuringProof(t *testing.T) {
+	old := proxyAckWait
+	proxyAckWait = 5 * time.Second // the proof waits for the release below
+	t.Cleanup(func() { proxyAckWait = old })
+	dir := t.TempDir()
+	var clockMu sync.Mutex
+	clock := time.Now()
+	now := func() time.Time { clockMu.Lock(); defer clockMu.Unlock(); return clock }
+	s, err := NewPrincipalStore(PrincipalStoreOptions{StatePath: filepath.Join(dir, "store.json"), ProxyDir: dir, Now: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitAutoIdleAtCleanup(t, s)
+
+	// A current proxy that applies new requests only while released; held,
+	// it keeps the heartbeat fresh and leaves the request it has not
+	// applied waiting.
+	var released atomic.Bool
+	released.Store(true)
+	quit, done := make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(done)
+		last := ""
+		for {
+			select {
+			case <-quit:
+				return
+			case <-time.After(5 * time.Millisecond):
+			}
+			if released.Load() {
+				if req, ok := fakeProxyAckOnce(dir, last); ok {
+					last = req
+				}
+			}
+			fakeProxyWrite(dir, reloadHeartbeatName, "1")
+		}
+	}()
+	t.Cleanup(func() { close(quit); <-done })
+
+	if _, err := s.SetAutoApproveWindow(time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	released.Store(false)
+	type autoState struct {
+		running bool
+		seq     uint64
+		problem string
+		flag    bool
+	}
+	state := func(name string) autoState {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		st := autoState{running: s.autoRunning, seq: s.issuedSeq, problem: s.autoProblem}
+		if r := s.recs[name]; r != nil {
+			st.flag = r.AutoApprovePending
+		}
+		return st
+	}
+	waitUntil := func(what string, ok func() bool) {
+		t.Helper()
+		deadline := time.Now().Add(10 * time.Second)
+		for !ok() {
+			if time.Now().After(deadline) {
+				t.Fatalf("timed out waiting for %s", what)
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+
+	seqBefore := state("").seq
+	r, err := s.Enroll(EnrollRequest{InstanceID: instanceN(1), Host: "h", Secret: testMacSecret}, "192.0.2.1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Status != PrincipalPending {
+		t.Fatalf("enroll in the window = %+v, want pending", r)
+	}
+	// The pass has written its proof request and waits for the proxy.
+	waitUntil("the pass to wait for its proof", func() bool { st := state(r.Principal); return st.running && st.seq > seqBefore })
+
+	clockMu.Lock()
+	clock = clock.Add(2 * time.Hour) // the window ends during the proof
+	clockMu.Unlock()
+	released.Store(true)
+	waitUntil("the pass to finish", func() bool { return !state(r.Principal).running })
+
+	st := state(r.Principal)
+	if st.problem != "" {
+		t.Fatalf("setup: the proof failed (%q); the pass must reach the window check with a proof", st.problem)
+	}
+	p := s.Snapshot().byName(r.Principal)
+	if p.Status != PrincipalPending || p.AutoApproved {
+		t.Fatalf("approved by a window that expired during its proof: %+v", p)
+	}
+	if p.AutoApprovePending {
+		t.Fatal("snapshot shows the expired window's admission as auto-approve pending")
+	}
+	if !st.flag {
+		t.Fatal("setup: the lapsed flag was cleared before the next poll")
+	}
+	if _, ok := findProxyPrincipal(readProxyPrincipals(t, filepath.Join(dir, proxyPrincipalsName)), r.Principal); ok {
+		t.Fatal("a Mac the expired window admitted reached the proxy principals file")
+	}
+
+	// The next poll asks for a pass, which hands the Mac to an admin.
+	pollMac(t, s, instanceN(1), r)
+	waitUntil("the poll's pass to clear the lapsed flag", func() bool { st := state(r.Principal); return !st.running && !st.flag })
+	if p := s.Snapshot().byName(r.Principal); p.Status != PrincipalPending {
+		t.Fatalf("after the poll: %+v, want pending for an admin", p)
+	}
+	if err := s.Approve(r.Principal); err != nil {
+		t.Fatalf("admin Approve of the handed-over Mac: %v", err)
+	}
+	if p := s.Snapshot().byName(r.Principal); p.Status != PrincipalApproved || p.AutoApproved {
+		t.Fatalf("after admin Approve: %+v, want approved, not auto", p)
 	}
 }
