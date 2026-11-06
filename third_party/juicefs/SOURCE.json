@@ -159,7 +159,7 @@
       "upstream_sha256": "d829c61f2b9782092311232952cf26d2169ffbded9da41c5464ed815132c499c"
     },
     "cmd/object.go": {
-      "sha256": "89d9c87fc11c5c4a90fd8c736c09323878ee72a4d34bf62df47db479ed6af4f3",
+      "sha256": "a42a3646ce65f42ed1eb0bcbea34a84f26e73d2014eeea586b8cfabbda041b96",
       "upstream_sha256": "21d42fa16a32422b07ae89127a08da9acc36102d4ac8b14087acab62f5f314ed"
     },
     "cmd/object_test.go": {
@@ -1151,7 +1151,7 @@
     "patches/0013-security-dependencies-and-etcd-transport.patch": "de7b2dfc19c7bdb1b69e7efb1af689a9b0190afd28117927e78e3393ae6486de",
     "patches/0014-literal-fatal-error.patch": "ba84e7c4d2690c1ee2d377263f6d1dcc6793217378809b109bebf32c45964d1d",
     "patches/0015-klauspost-compress-security-update.patch": "c46fdf7add95ff74c673421238ccbc00e6e110fe49ae327167f78f747292b640",
-    "patches/0016-file-backend-beneath-root.patch": "ce372ba807923e00d5b3ca8f750e2e44e65f3e71e9dd9b2992aea431ab55280d"
+    "patches/0016-file-backend-beneath-root.patch": "75a58ef1ce5fb69d91135bc3bb91dd19e6e5cb93e2155af5f0693fd0d5844576"
   },
   "scope": "All pkg/ and cmd/ files plus main.go, LICENSE, go.mod and go.sum from the verified module ZIP. Documentation, integration tests and SDK examples are not included. local_files are JuiceMount-owned source with no upstream counterpart.",
   "upstream_url": "https://github.com/juicedata/juicefs/tree/v1.3.1",

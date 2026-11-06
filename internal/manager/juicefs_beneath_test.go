@@ -383,8 +383,14 @@ func TestJuicefsStandaloneAbsoluteLinksStayInVolume(t *testing.T) {
 	// Seed the volume with absolute links to host folders outside it.
 	seed := filepath.Join(l.base, "seed")
 	mustWrite(t, filepath.Join(seed, "proj/real.txt"), "in volume")
-	mustLink(t, l.outside, filepath.Join(seed, "proj/evil"))
+	mustLink(t, l.outside, filepath.Join(seed, "proj/evil"))     // absolute: never followed (ENOTSUP)
+	mustLink(t, "missing.txt", filepath.Join(seed, "proj/gone")) // relative, no target (ENOENT)
 	mustLink(t, l.victim, filepath.Join(seed, "dest/sub"))
+	// A loop (ELOOP when followed): not a missing target, so it is not
+	// skipped; it must still fail the sync.
+	mustWrite(t, filepath.Join(seed, "proj2/real.txt"), "in volume")
+	mustLink(t, "lb", filepath.Join(seed, "proj2/la"))
+	mustLink(t, "la", filepath.Join(seed, "proj2/lb"))
 	if out, err := jfs("sync", "--links", "file://"+seed+"/", "jfs://"+vol+"/"); err != nil {
 		t.Fatalf("seed: %v\n%s", err, out)
 	}
@@ -408,9 +414,8 @@ func TestJuicefsStandaloneAbsoluteLinksStayInVolume(t *testing.T) {
 	// Out through RunSync (standalone): the /jfs source is read as jfs://,
 	// not as a host path.
 	out2 := filepath.Join(l.host, "out2")
-	// evil names a path inside the volume that does not exist there: a
-	// dangling link, which the jfs:// backend skips and reports; the job
-	// succeeds.
+	// evil is absolute (the jfs:// backend never follows it) and gone has
+	// no target: both are skipped and reported, and the job succeeds.
 	ch := make(chan ProgressEvent, 1024)
 	err := RunSync(ctx, bin, spec, "/jfs/proj", out2, DefaultSyncOptions(), nil, ch)
 	close(ch)
@@ -424,8 +429,24 @@ func TestJuicefsStandaloneAbsoluteLinksStayInVolume(t *testing.T) {
 	if got := tree(t, out2); !sameList(got, []string{"real.txt"}) {
 		t.Errorf("standalone out copied %v, want [real.txt]", got)
 	}
-	if report.SkippedLinks != 1 || len(report.SkippedLinkSample) != 1 || report.SkippedLinkSample[0] != "/jfs/proj/evil" {
-		t.Errorf("standalone out: skipped %d links %v, want 1 [/jfs/proj/evil]", report.SkippedLinks, report.SkippedLinkSample)
+	sort.Strings(report.SkippedLinkSample)
+	if report.SkippedLinks != 2 || strings.Join(report.SkippedLinkSample, " ") != "/jfs/proj/evil /jfs/proj/gone" {
+		t.Errorf("standalone out: skipped %d links %v, want 2 [/jfs/proj/evil /jfs/proj/gone]", report.SkippedLinks, report.SkippedLinkSample)
+	}
+	// Only a missing target is skipped. A link that fails any other way
+	// (here ELOOP) is not dropped silently: the sync fails.
+	ch = make(chan ProgressEvent, 1024)
+	err = RunSync(ctx, bin, spec, "/jfs/proj2", filepath.Join(l.host, "out3"), DefaultSyncOptions(), nil, ch)
+	close(ch)
+	report = ProgressEvent{}
+	for ev := range ch {
+		report = mergeProgress(report, ev)
+	}
+	if err == nil {
+		t.Errorf("standalone out of a tree with a link loop: the sync succeeded; an ELOOP link must fail it")
+	}
+	if report.SkippedLinks != 0 {
+		t.Errorf("standalone out of a link loop: %d links skipped %v, want none", report.SkippedLinks, report.SkippedLinkSample)
 	}
 }
 
