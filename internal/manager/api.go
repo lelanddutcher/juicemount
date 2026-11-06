@@ -1518,8 +1518,10 @@ func (a *API) checkSyncSource(path string, dir Direction) (int, error) {
 // pathAllowed returns true iff `p` is under one of the configured
 // source roots, judged where the kernel would land when opening `p`.
 //
-// `p` is resolved with resolvePhysicalPath: symlinks are followed
-// segment by segment, and ".." is applied after the symlink before it,
+// `p` is resolved with walkPhysicalPath (pathresolve.go), the resolver
+// shared with the volume side and file destinations: symlinks are
+// followed segment by segment, and ".." is applied after the symlink
+// before it,
 // the same way the kernel does it. ".." is NOT collapsed as text
 // first: "<root>/link/../x" lands under link's target, not at
 // "<root>/x". Roots are resolved the same way, so a root reached
@@ -1530,12 +1532,12 @@ func (a *API) checkSyncSource(path string, dir Direction) (int, error) {
 // The check is not atomic with the later open: a symlink swapped in
 // after the check is not caught.
 func (a *API) pathAllowed(p string) bool {
-	resolved, err := resolvePhysicalPath(p)
+	resolved, err := walkPhysicalPath(p, false)
 	if err != nil {
 		return false
 	}
 	for _, root := range a.sourceRoots {
-		rootResolved, err := resolvePhysicalPath(root)
+		rootResolved, err := walkPhysicalPath(root, false)
 		if err != nil {
 			continue
 		}
@@ -1544,64 +1546,6 @@ func (a *API) pathAllowed(p string) bool {
 		}
 	}
 	return false
-}
-
-// resolvePhysicalPath returns where the kernel would land when opening
-// p, without collapsing ".." as text first. The longest existing prefix
-// of the path text, cut at a separator, is resolved with
-// filepath.EvalSymlinks; it handles "link/.." after resolving the link.
-// The missing remainder is then appended. It does not exist, so it
-// holds no symlinks yet. Refused: a dangling symlink (its target is
-// unknown) and ".." inside the missing remainder. A relative p is taken
-// against the working directory.
-// maxResolvePathBytes bounds resolvePhysicalPath's input (Linux PATH_MAX).
-const maxResolvePathBytes = 4096
-
-func resolvePhysicalPath(p string) (string, error) {
-	if p == "" {
-		return "", errors.New("empty path")
-	}
-	// PATH_MAX on Linux. The loop below costs time in the path's length
-	// squared, so a longer input (which the kernel would refuse anyway)
-	// must not reach it.
-	if len(p) > maxResolvePathBytes {
-		return "", fmt.Errorf("path longer than %d bytes", maxResolvePathBytes)
-	}
-	if !filepath.IsAbs(p) {
-		wd, err := os.Getwd()
-		if err != nil {
-			return "", err
-		}
-		p = wd + string(filepath.Separator) + p
-	}
-	existing, rest := p, ""
-	for {
-		resolved, err := filepath.EvalSymlinks(existing)
-		if err == nil {
-			return filepath.Join(resolved, rest), nil
-		}
-		if !errors.Is(err, fs.ErrNotExist) {
-			return "", err
-		}
-		if _, lerr := os.Lstat(existing); lerr == nil {
-			return "", fmt.Errorf("dangling symlink at %s", existing)
-		} else if !errors.Is(lerr, fs.ErrNotExist) {
-			// ENAMETOOLONG, EACCES, ...: not "missing", so stop here.
-			return "", lerr
-		}
-		i := strings.LastIndexByte(existing, filepath.Separator)
-		if i <= 0 {
-			// Nothing under "/" exists on this path; it is plain text.
-			return filepath.Join("/", existing, rest), nil
-		}
-		if existing[i+1:] == ".." {
-			// "missing/.." cannot be opened today, and collapsing it as
-			// text could land on an existing symlink. Refuse it.
-			return "", fmt.Errorf("path climbs out of a missing folder: %s", p)
-		}
-		rest = filepath.Join(existing[i+1:], rest)
-		existing = existing[:i]
-	}
 }
 
 func writeJSON(w http.ResponseWriter, status int, body any) {

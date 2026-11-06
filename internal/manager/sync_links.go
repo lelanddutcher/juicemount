@@ -114,7 +114,7 @@ func findEscapingSymlink(ctx context.Context, root, mountReal string) (string, e
 			return nil
 		}
 		target, rerr := walkPhysicalPath(p, true)
-		if rerr != nil || !pathWithinRoot(target, mountReal) {
+		if rerr != nil || !pathWithin(target, mountReal) {
 			found = volumeUserPrefix + strings.TrimPrefix(p, strings.TrimSuffix(mountReal, "/"))
 			return filepath.SkipAll
 		}

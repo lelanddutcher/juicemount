@@ -428,36 +428,74 @@ func TestVolumePrefixIsOneCheck(t *testing.T) {
 	}
 }
 
-// TestResolverIsLinearInDepth: 950 nested real folders. The old
-// resolvers called EvalSymlinks once per missing component and took
-// seconds; the forward walk must stay well under a second.
+// TestResolverIsLinearInDepth: 950 nested real folders, through every
+// path check that shares walkPhysicalPath: the volume side
+// (confineVolumePath, browse-jfs), the host side (pathAllowed) and file
+// destinations (resolveFileDestPath, and saving one). The resolvers they
+// replaced called EvalSymlinks once per missing component and took
+// seconds (3.0 s for 475 existing plus 475 missing); each check must stay
+// well under a second. Two shapes: all 950 levels exist, and 475 exist
+// with 475 missing below them.
 func TestResolverIsLinearInDepth(t *testing.T) {
 	f := newConfineFixture(t)
-	existing := strings.Repeat("/abc", 475)
-	if err := os.MkdirAll(f.fuse+existing, 0o755); err != nil {
-		t.Fatal(err)
+	const limit = 500 * time.Millisecond
+	timed := func(label string, fn func()) {
+		t.Helper()
+		start := time.Now()
+		fn()
+		if d := time.Since(start); d > limit {
+			t.Errorf("%s took %v, want under %v", label, d, limit)
+		}
 	}
-	deep := "/jfs" + existing + strings.Repeat("/xyz", 475)
-	if len(f.fuse+existing+strings.Repeat("/xyz", 475)) > maxResolvePathInput {
-		t.Fatalf("fixture path too long")
+	shapes := []struct{ name, existing, missing string }{
+		{"950 existing", strings.Repeat("/abc", 950), ""},
+		{"475 existing + 475 missing", strings.Repeat("/abd", 475), strings.Repeat("/xyz", 475)},
 	}
-	start := time.Now()
-	vp, err := confineVolumePath(deep, "/jfs", f.fuse, true)
-	if err != nil {
-		t.Fatalf("confineVolumePath: %v", err)
-	}
-	if d := time.Since(start); d > 500*time.Millisecond {
-		t.Errorf("confineVolumePath took %v for 950 components, want well under 1s", d)
-	}
-	if !strings.HasSuffix(vp.Real, existing+strings.Repeat("/xyz", 475)) {
-		t.Errorf("resolved %q", vp.Real)
-	}
-	start = time.Now()
-	if w := f.do(t, "GET", "/api/browse-jfs?path="+q(deep), ""); w.Code == http.StatusForbidden {
-		t.Errorf("browse-jfs of a deep in-volume path: 403")
-	}
-	if d := time.Since(start); d > 500*time.Millisecond {
-		t.Errorf("browse-jfs took %v", d)
+	for _, sh := range shapes {
+		t.Run(sh.name, func(t *testing.T) {
+			// Volume side.
+			if err := os.MkdirAll(f.fuse+sh.existing, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if len(f.fuse+sh.existing+sh.missing) > maxResolvePathBytes || len(f.src+sh.existing+sh.missing) > maxResolvePathBytes {
+				t.Skipf("temp folder too long for a %d-component path", 950)
+			}
+			jfs := "/jfs" + sh.existing + sh.missing
+			timed("confineVolumePath", func() {
+				vp, err := confineVolumePath(jfs, "/jfs", f.fuse, true)
+				if err != nil || !strings.HasSuffix(vp.Real, sh.existing+sh.missing) {
+					t.Errorf("confineVolumePath: %+v, %v", vp, err)
+				}
+			})
+			timed("browse-jfs", func() {
+				if w := f.do(t, http.MethodGet, "/api/browse-jfs?path="+q(jfs), ""); w.Code == http.StatusForbidden {
+					t.Errorf("browse-jfs of a deep in-volume path: 403")
+				}
+			})
+			// Host side and file destinations, under the source root.
+			if err := os.MkdirAll(f.src+sh.existing, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			host := f.src + sh.existing + sh.missing
+			a := &API{sourceRoots: []string{f.src}}
+			timed("pathAllowed", func() {
+				if !a.pathAllowed(host) {
+					t.Errorf("pathAllowed refused a deep path under the root")
+				}
+			})
+			timed("resolveFileDestPath", func() {
+				got, err := resolveFileDestPath(host)
+				if err != nil || !strings.HasSuffix(got, sh.existing+sh.missing) {
+					t.Errorf("resolveFileDestPath: %q, %v", got, err)
+				}
+			})
+			name := "deep" + strings.ReplaceAll(strings.ToLower(sh.name[:3]), " ", "")
+			timed("save file destination", func() {
+				if w := f.do(t, http.MethodPost, "/api/destinations", fileDestBody(name, host)); w.Code != http.StatusCreated {
+					t.Errorf("save deep file destination: %d %s", w.Code, w.Body.String())
+				}
+			})
+		})
 	}
 }
 

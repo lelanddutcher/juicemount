@@ -97,7 +97,7 @@ func confineVolumePath(userPath, destMount, fuseMount string, followFinal bool) 
 		// it is not passed on to API replies or job errors.
 		return confinedPath{}, errOutsideVolume
 	}
-	if !pathWithinRoot(real, mountReal) {
+	if !pathWithin(real, mountReal) {
 		return confinedPath{}, errOutsideVolume
 	}
 	return confinedPath{User: clean, Fuse: fuse, Real: real, MountReal: mountReal}, nil

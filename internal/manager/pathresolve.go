@@ -10,15 +10,18 @@ import (
 	"syscall"
 )
 
-// Shared kernel-like path resolver.
+// Shared kernel-like path resolver, used by every path check: the host
+// side (pathAllowed), file destinations (resolveFileDestPath) and the
+// volume side (confineVolumePath).
 //
 // walkPhysicalPath returns where the kernel lands when it opens p. It walks
 // forward one component at a time: Lstat each component, and Readlink and
 // splice in the target of a symlink. ".." is applied to the resolved
 // prefix, after the symlink before it, as the kernel does. The cost is one
 // Lstat per component (plus the components of every symlink target), so it
-// is linear in the path length. The older resolvers called
-// filepath.EvalSymlinks once per missing component and were quadratic.
+// is linear in the path length. The resolvers it replaces called
+// filepath.EvalSymlinks once per missing component, which re-walked the
+// whole existing prefix each time.
 //
 // A path whose tail does not exist yet resolves to the resolved existing
 // prefix plus the missing remainder as text: that is where a create would
@@ -26,8 +29,8 @@ import (
 // today, and collapsing it as text could land on an existing symlink.
 
 const (
-	// maxResolvePathInput bounds the input (Linux PATH_MAX).
-	maxResolvePathInput = 4096
+	// maxResolvePathBytes bounds the input (Linux PATH_MAX).
+	maxResolvePathBytes = 4096
 	// maxSymlinkHops matches Linux's MAXSYMLINKS (40), after which the
 	// kernel returns ELOOP.
 	maxSymlinkHops = 40
@@ -48,8 +51,8 @@ func walkPhysicalPath(p string, allowDangling bool) (string, error) {
 	if p == "" {
 		return "", errors.New("empty path")
 	}
-	if len(p) > maxResolvePathInput {
-		return "", fmt.Errorf("path longer than %d bytes", maxResolvePathInput)
+	if len(p) > maxResolvePathBytes {
+		return "", fmt.Errorf("path longer than %d bytes", maxResolvePathBytes)
 	}
 	if !filepath.IsAbs(p) {
 		wd, err := os.Getwd()
@@ -145,13 +148,4 @@ func splitPathComponents(p string) []string {
 		}
 	}
 	return out
-}
-
-// pathWithinRoot reports whether p is root or under it. Both must be
-// resolved, clean absolute paths.
-func pathWithinRoot(p, root string) bool {
-	if p == root {
-		return true
-	}
-	return strings.HasPrefix(p, strings.TrimSuffix(root, string(filepath.Separator))+string(filepath.Separator))
 }
