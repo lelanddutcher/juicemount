@@ -204,6 +204,7 @@ func TestReviewLostAbortedMoveLearned(t *testing.T) {
 	mustOK(t, mac1.do("HSET", "x11", "k", "v"), "mac1 takes B")
 	mustOK(t, mac1.do("HSET", "x12", "k", "v"), "mac1 takes A (A/sub/h)")
 	lost := 0
+	allocInodes(t, mac1) // 1..1024
 	for i := 0; i < 20; i++ {
 		// Fresh connections each round.
 		mac1 = r.conn(t, "mac1")

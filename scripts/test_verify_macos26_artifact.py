@@ -13,11 +13,14 @@ import sys
 import tempfile
 import unittest
 
-from importlib.machinery import SourceFileLoader
+import importlib.util
 
 
 HERE = Path(__file__).resolve().parent
-MODULE = SourceFileLoader("macos26_gate", str(HERE / "verify-macos26-artifact.py")).load_module()
+# SourceFileLoader.load_module is gone from newer Pythons (the macOS runner's).
+_SPEC = importlib.util.spec_from_file_location("macos26_gate", HERE / "verify-macos26-artifact.py")
+MODULE = importlib.util.module_from_spec(_SPEC)
+_SPEC.loader.exec_module(MODULE)
 
 
 def packed_version(major):
@@ -77,6 +80,20 @@ class VerifyMacOS26Artifact(unittest.TestCase):
                     self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
                     self.assertIn(relative, result.stderr)
                     path.write_bytes(fat())
+
+    def test_bundled_agent_mcp_server_is_checked(self):
+        # The app bundles juicemount-mcp for AI agents: a missing one, or one
+        # built for an older macOS, is refused like the other executables.
+        relative = "Contents/MacOS/juicemount-mcp"
+        path = self.app / relative
+        path.write_bytes(macho(14))
+        result = self.run_gate()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn(relative, result.stderr)
+        path.unlink()
+        result = self.run_gate()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn(relative, result.stderr)
 
     def test_missing_metadata_and_missing_binary_are_refused(self):
         relative = MODULE.EXECUTABLES[1]

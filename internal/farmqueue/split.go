@@ -122,6 +122,7 @@ end
 if protocol == '1' then
   redis.call('HSET', KEYS[6], 'open_count', redis.call('ZCOUNT', KEYS[7], 0, 0))
 end
+-- No TTL for a legacy child: retention starts at its terminal write.
 for field, value in pairs(statusFields) do
   redis.call('HSET', KEYS[1], field, value)
 end
@@ -129,10 +130,9 @@ redis.call('HSET', KEYS[1], 'payload', ARGV[1])
 if ARGV[4] ~= '' then
   redis.call('HSET', KEYS[1], 'tracked_epoch', ARGV[4])
   if protocol == '1' then redis.call('HSET', KEYS[1], 'coverage_protocol', '1') end
-else
-  redis.call('EXPIRE', KEYS[1], tonumber(ARGV[5]))
 end
 redis.call('LPUSH', KEYS[2], ARGV[1])
+redis.call('INCR', KEYS[2] .. ':seq')
 redis.call('ZADD', KEYS[3], tonumber(ARGV[3]), statusFields.id)
 redis.call('HSET', KEYS[1], 'cpu_fallback_published', '1')
 return {1, ARGV[1]}
@@ -190,6 +190,8 @@ func (c *Client) enqueueCPUFallbackSubset(ctx context.Context, claim Claim, pare
 			coverageLedgerKey(child.CoverageParentID), coverageMembersKey(child.CoverageParentID),
 			watchEpochKey(child.Path))
 	}
+	// ARGV[5] (JobTTL) is no longer read: legacy retention starts at the
+	// child's terminal write. It stays to keep the argument positions stable.
 	result, err := c.rdb.Eval(ctx, enqueueCPUFallbackSubsetScript, keys,
 		raw, statusJSON, time.Now().UnixMicro(), child.TrackedEpoch, int64(JobTTL/time.Second),
 		claim.Token, claim.WorkerID, claim.Generation, claim.Raw,

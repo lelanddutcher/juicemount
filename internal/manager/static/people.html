@@ -1,0 +1,240 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>JuiceMount Manager: People and access</title>
+<style>
+  :root { --bg: #fff; --fg: #1d1d1f; --muted: #6e6e73; --line: #e5e5ea; --accent: #0a84ff; --warn: #b25000; --bad: #c62828; --ok: #1b7f3b; }
+  @media (prefers-color-scheme: dark) { :root { --bg: #1c1c1e; --fg: #f2f2f7; --muted: #a1a1a6; --line: #3a3a3c; --accent: #64a8ff; --warn: #ffb340; --bad: #ff6961; --ok: #5cd67a; } }
+  body { margin: 0; padding: 24px; background: var(--bg); color: var(--fg); font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  h1 { font-size: 20px; margin: 0 0 4px; } h2 { font-size: 16px; margin: 28px 0 8px; }
+  p.note { color: var(--muted); margin: 4px 0 12px; max-width: 70ch; }
+  table { border-collapse: collapse; width: 100%; } th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; font-size: 12px; }
+  button, input, select { font: inherit; padding: 4px 10px; border-radius: 6px; border: 1px solid var(--line); background: transparent; color: var(--fg); }
+  button { cursor: pointer; } button.primary { background: var(--accent); border-color: var(--accent); color: #fff; } button.danger { color: var(--bad); border-color: var(--bad); }
+  .note-bad { color: var(--bad); } .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; } code { font-size: 12px; }
+  .grant { display: inline-flex; gap: 4px; align-items: center; margin: 0 6px 4px 0; }
+  #err { color: var(--bad); white-space: pre-wrap; } a { color: var(--accent); }
+</style>
+</head>
+<body>
+<p><a href="./">&larr; Manager</a> &middot; <a href="principals.html">Principals and leases</a></p>
+<h1>People and access</h1>
+<p class="note">Give each Mac to the person who uses it. A person with access <b>all</b> writes everywhere. The first
+folder you grant limits that person to granted folders: a client folder (<code>/Clients</code>, every project in it, and
+creating projects there) or one project (<code>/Clients/A</code>). From then on grants are in force: a Mac that belongs
+to no person (a new Mac, or the Macs of a removed person) can read but not write until you assign it.
+Refused writes fail on the Mac as a read-only error. Reading is not limited.</p>
+<div id="err" role="alert"></div>
+<p class="note-bad" id="problem"></p>
+<p class="row" id="policy"></p>
+
+<h2>People</h2>
+<div class="row"><input id="newName" placeholder="Name" maxlength="128"><button class="primary" id="add">Add person</button></div>
+<table>
+  <thead><tr><th>Person</th><th>Access</th><th>Write grants</th><th>Macs</th><th></th></tr></thead>
+  <tbody id="people"></tbody>
+</table>
+
+<h2>Macs</h2>
+<table>
+  <thead><tr><th>Mac</th><th>Host</th><th>Status</th><th>Person</th></tr></thead>
+  <tbody id="devices"></tbody>
+</table>
+
+<div id="agentSection" style="display:none">
+<h2>Agent tokens</h2>
+<p class="note">A person mints an agent token on their own Mac for an AI agent (the JuiceMount MCP server). It finds files
+and edits collections as that person, within their grants, and never reads file contents. It stops working when it
+expires, is revoked, or its Mac is revoked or given to someone else, or its person is removed: from then on every new
+request is refused and no change it has not yet made is applied (a read already running may finish).</p>
+<table>
+  <thead><tr><th>Token</th><th>Person</th><th>Minted on</th><th>Created</th><th>Expires</th><th></th></tr></thead>
+  <tbody id="agentTokens"></tbody>
+</table>
+</div>
+
+<h2>Who changed what</h2>
+<p class="note">The proxy's audit log, newest first. It starts when the first person is added. File contents are
+summarized per file and 10-second window.</p>
+<p class="note" id="auditState"></p>
+<div class="row">
+  <select id="fLog"><option value="">Files (the proxy's log)</option><option value="catalog">Agent tokens and agents' catalog edits</option></select>
+  <select id="fPerson"><option value="">Everyone</option></select>
+  <input id="fProject" placeholder="Folder, e.g. /Clients/A">
+  <button id="search">Show</button><button id="verify">Verify log</button><span id="verifyOut"></span>
+</div>
+<table>
+  <thead><tr><th>Time</th><th>Who</th><th>What</th><th>Where</th><th>Result</th></tr></thead>
+  <tbody id="audit"></tbody>
+</table>
+<p class="row"><button id="older" style="display:none">Older</button></p>
+
+<script>
+(function () {
+  'use strict';
+  var key = '';
+  try { key = localStorage.getItem('jm-admin-key') || ''; } catch (_) {}
+  var errBox = document.getElementById('err');
+  var people = [], next = 0, outcomes = {};
+  function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) { return '&#' + c.charCodeAt(0) + ';'; }); }
+  function when(ms) { return ms ? new Date(ms).toLocaleString() : ''; }
+  function api(method, path, body) {
+    var h = { 'Content-Type': 'application/json' };
+    if (key) h['X-JuiceMount-Admin-Key'] = key;
+    return fetch('api/' + path, { method: method, headers: h, body: body ? JSON.stringify(body) : undefined })
+      .then(function (r) {
+        if (r.status === 401) {
+          var k = window.prompt('Manager admin key');
+          if (k) { key = k; try { localStorage.setItem('jm-admin-key', k); } catch (_) {} return api(method, path, body); }
+        }
+        return r.text().then(function (t) {
+          if (!r.ok) throw new Error(path + ': ' + r.status + ' ' + t.trim());
+          return t ? JSON.parse(t) : {};
+        });
+      });
+  }
+  function fail(e) { errBox.textContent = e.message; }
+  function change(path, body) { errBox.textContent = ''; return api('POST', 'people/' + path, body).then(render, fail); }
+  function nameOf(id) { for (var i = 0; i < people.length; i++) if (people[i].id === id) return people[i].name; return id; }
+
+  function mb(n) { return (n / 1048576).toFixed(1) + ' MB'; }
+  function auditLine(a) {
+    if (!a || !a.configured) return 'The audit log is not configured.';
+    if (!a.enabled) return 'The audit log is off: it starts when the first person is added.' + (a.error ? ' ' + a.error : '');
+    var t = (a.healthy ? 'Recording' : 'NOT recording') + ': ' + mb(a.bytes) + ' in ' + a.segments + ' segment(s)';
+    if (a.retain_bytes) t += ', kept up to ' + mb(a.retain_bytes);
+    if (a.free_bytes) t += ', ' + mb(a.free_bytes) + ' free on disk';
+    if (a.last_fsync_ms) t += '; last written ' + when(a.last_fsync_ms);
+    if (a.lost) t += '; ' + a.lost + ' record(s) lost since the proxy started';
+    t += a.chain_ok ? '; chain checked' + (a.anchor_at_ms ? ' up to ' + when(a.anchor_at_ms) : '') : '; CHAIN PROBLEM: ' + a.chain_problem;
+    return t + '.';
+  }
+  function render(s) {
+    people = s.people || [];
+    document.getElementById('problem').textContent = s.problem || '';
+    document.getElementById('auditState').textContent = auditLine(s.audit);
+    document.getElementById('policy').innerHTML = s.grants_in_force
+      ? 'Grants are in force: Macs with no person are read-only (' + esc(s.unassigned_macs) + ' now).' +
+        (s.restrict_unassigned ? ' <button data-policy="off">Let Macs with no person write again</button>' : '')
+      : (s.unassigned_macs ? esc(s.unassigned_macs) + ' Mac(s) belong to no person; they write everywhere until grants are in force.' : '');
+    var rows = '';
+    people.forEach(function (p) {
+      var grants = (p.grants || []).map(function (g) {
+        return '<span class="grant"><code>' + esc(g) + '</code><button data-ungrant="' + esc(p.id) + '" data-path="' + esc(g) + '">&times;</button></span>';
+      }).join('') || (p.access === 'granted' ? '<span class="note-bad">none: no write access</span>' : '');
+      rows += '<tr><td>' + esc(p.name) + '<br><code>' + esc(p.id) + '</code></td>' +
+        '<td><select data-access="' + esc(p.id) + '"><option value="all"' + (p.access === 'all' ? ' selected' : '') + '>all</option>' +
+        '<option value="granted"' + (p.access === 'granted' ? ' selected' : '') + '>granted folders only</option></select></td>' +
+        '<td>' + grants + '<div class="row"><input data-path-for="' + esc(p.id) + '" placeholder="/Clients/A"><button data-grant="' + esc(p.id) + '">Grant</button></div></td>' +
+        '<td>' + (p.devices || []).map(esc).join('<br>') + '</td>' +
+        '<td><button data-rename="' + esc(p.id) + '">Rename</button> <button class="danger" data-delete="' + esc(p.id) + '">Remove</button></td></tr>';
+    });
+    document.getElementById('people').innerHTML = rows;
+    var opts = '<option value="">(none)</option>' + people.map(function (p) { return '<option value="' + esc(p.id) + '">' + esc(p.name) + '</option>'; }).join('');
+    document.getElementById('devices').innerHTML = (s.devices || []).map(function (d) {
+      var note = d.read_only ? ' <span class="note-bad">no person: read only</span>' : '';
+      if (d.person_from_previous) note += ' <span class="note">approving it makes it ' + esc(nameOf(d.person_from_previous)) + '\'s (previous Mac)</span>';
+      return '<tr><td><code>' + esc(d.name) + '</code>' + (d.label ? ' ' + esc(d.label) : '') + '</td><td>' + esc(d.host) + '</td><td>' + esc(d.status) + '</td>' +
+        '<td><select data-device="' + esc(d.name) + '">' + opts.replace('value="' + esc(d.person || '') + '"', 'value="' + esc(d.person || '') + '" selected') + '</select>' + note + '</td></tr>';
+    }).join('');
+    var f = document.getElementById('fPerson'), cur = f.value;
+    f.innerHTML = '<option value="">Everyone</option>' + people.map(function (p) { return '<option value="' + esc(p.id) + '">' + esc(p.name) + '</option>'; }).join('');
+    f.value = cur;
+  }
+  function load() { api('GET', 'people').then(render, fail); loadTokens(); }
+  function loadTokens() {
+    // 404 while continuity (JM_CONTINUITY) is off: no section.
+    var h = { 'Content-Type': 'application/json' };
+    if (key) h['X-JuiceMount-Admin-Key'] = key;
+    fetch('api/agent-tokens', { headers: h }).then(function (r) {
+      if (!r.ok) { document.getElementById('agentSection').style.display = 'none'; return; }
+      return r.json().then(function (body) {
+        document.getElementById('agentSection').style.display = '';
+        document.getElementById('agentTokens').innerHTML = (body.agent_tokens || []).map(function (t) {
+          return '<tr><td>' + esc(t.name) + '<br><code>' + esc(t.id) + '</code></td><td>' + esc(t.person_name || t.person) + '</td>' +
+            '<td><code>' + esc(t.mac) + '</code></td><td>' + when(t.created_at_ms) + '</td><td>' + when(t.expires_at_ms) + '</td>' +
+            '<td><button class="danger" data-revoke-token="' + esc(t.id) + '">Revoke</button></td></tr>';
+        }).join('') || '<tr><td colspan="6" class="note">No agent tokens.</td></tr>';
+      });
+    }, function () {});
+  }
+
+  document.getElementById('add').onclick = function () {
+    var n = document.getElementById('newName');
+    change('create', { name: n.value }).then(function () { n.value = ''; });
+  };
+  document.body.addEventListener('click', function (ev) {
+    var t = ev.target, d = t.dataset || {};
+    if (d.grant) change('grant', { id: d.grant, path: document.querySelector('[data-path-for="' + d.grant + '"]').value });
+    if (d.ungrant) change('ungrant', { id: d.ungrant, path: d.path });
+    if (d.rename) { var n = window.prompt('New name', nameOf(d.rename)); if (n) change('update', { id: d.rename, name: n }); }
+    if (d['delete'] && window.confirm('Remove ' + nameOf(d['delete']) + '? Their Macs are left with no person: while grants are in force they can read but not write until you assign them.')) change('delete', { id: d['delete'] });
+    if (d.revokeToken && window.confirm('Revoke agent token ' + d.revokeToken + '? Its new requests are refused from now on, and so is any change not yet made.')) {
+      errBox.textContent = '';
+      api('POST', 'agent-tokens/' + d.revokeToken + '/revoke').then(loadTokens, fail);
+    }
+    if (d.policy && window.confirm('Let Macs that belong to no person write everywhere again? This has an effect only while no person is limited to grants.')) change('policy', { restrict_unassigned: false });
+  });
+  document.body.addEventListener('change', function (ev) {
+    var d = ev.target.dataset || {};
+    if (d.access) change('update', { id: d.access, access: ev.target.value });
+    if (d.device) change('assign', { device: d.device, person: ev.target.value });
+  });
+
+  function what(r) {
+    if (r.type === 'modified') return 'wrote file ' + esc(r.inode) + ' ' + esc(r.count) + 'x';
+    if (r.type === 'gap') return 'log gap: ' + esc(r.dropped) + ' records lost';
+    if (r.type === 'open') return 'log opened';
+    if (r.type === 'retention') return 'older records removed: ' + esc(r.detail);
+    if (r.detail) return esc(r.action || '') + '<br>' + esc(r.detail);
+    var ops = (r.ops || []).filter(function (o) { return !o.trash; }).map(function (o) {
+      return esc(o.op) + ' <code>' + esc(o.path || (o.parent + '/' + o.name)) + '</code>';
+    }).join('<br>');
+    var attrs = (r.attrs || []).map(function (a) {
+      return 'inode ' + esc(a.ino) + ' ' + esc(a.field) + (a.old ? ' ' + esc(a.old) : '') + ' &rarr; ' + esc(a.new);
+    }).join('<br>');
+    return esc(r.action || '') + (ops ? '<br>' + ops : '') + (r.inodes ? ' inode ' + r.inodes.map(esc).join(', ') : '') + (attrs ? '<br>' + attrs : '');
+  }
+  function audit(reset) {
+    if (reset) { next = 0; outcomes = {}; document.getElementById('audit').innerHTML = ''; }
+    var q = 'audit?limit=100&type=intent,outcome,refused,modified,gap,retention';
+    var lg = document.getElementById('fLog').value;
+    if (lg) q += '&log=' + encodeURIComponent(lg);
+    var p = document.getElementById('fPerson').value, f = document.getElementById('fProject').value.trim();
+    if (p) q += '&person=' + encodeURIComponent(p);
+    if (f) q += '&project=' + encodeURIComponent(f);
+    if (next) q += '&before=' + next;
+    api('GET', q).then(function (page) {
+      var recs = page.records || [];
+      recs.forEach(function (r) { if (r.type === 'outcome') outcomes[r.unit] = r; });
+      var rows = '';
+      recs.forEach(function (r) {
+        if (r.type === 'outcome') return;
+        var res = r.type === 'refused' ? '<span class="note-bad">refused ' + esc(r.reason) + '</span>'
+          : r.type === 'intent' ? (outcomes[r.seq] ? esc(outcomes[r.seq].outcome) : 'no outcome recorded') : '';
+        var agent = r.agent ? ' via agent ' + esc(r.agent_name) + ' <code>' + esc(r.agent) + '</code>' : '';
+        rows += '<tr><td>' + when(r.ts_ms) + '</td><td>' + esc(r.person_name || r.person || '') + ' <code>' + esc(r.principal || '') + '</code>' + agent + '</td>' +
+          '<td>' + what(r) + '</td><td>' + (r.projects || []).map(function (x) { return '<code>' + esc(x.path || x.ino) + '</code>'; }).join(' ') + '</td><td>' + res + '</td></tr>';
+      });
+      document.getElementById('audit').insertAdjacentHTML('beforeend', rows);
+      next = page.next || 0;
+      document.getElementById('older').style.display = next ? '' : 'none';
+    }, fail);
+  }
+  document.getElementById('search').onclick = function () { audit(true); };
+  document.getElementById('fLog').onchange = function () { audit(true); };
+  document.getElementById('older').onclick = function () { audit(false); };
+  document.getElementById('verify').onclick = function () {
+    api('GET', 'audit/verify?full=1').then(function (r) {
+      document.getElementById('verifyOut').textContent = r.ok ? 'chain intact (' + r.records + ' records, ' + (r.anchors_checked || 0) + ' anchors)' : 'BROKEN: ' + r.problem;
+    }, fail);
+  };
+  load();
+  audit(true);
+})();
+</script>
+</body>
+</html>

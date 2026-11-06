@@ -19,7 +19,7 @@ import (
 
 func drainOnce(t *testing.T, d *Drainer) {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), drainPassDeadline)
 	defer cancel()
 	if n := d.DrainOnceForTest(ctx); n != 1 {
 		t.Fatalf("processed=%d, want 1", n)

@@ -39,6 +39,10 @@ func newTestSpoolStoreWithDB(t *testing.T, capacity int64) (*SpoolStore, *sql.DB
 	if err != nil {
 		t.Fatalf("new spool store: %v", err)
 	}
+	// Pin the live disk ceiling, as newTestSpoolStoreTB does: otherwise these
+	// tests fail as "capacity full" on any machine with less than
+	// SpoolFreeFloorBytes free, which a GitHub runner can be.
+	store.capCeiling.Store(int64(1) << 50)
 	return store, db
 }
 
@@ -494,7 +498,7 @@ func TestFailPermanentReleasesCapacity(t *testing.T) {
 		t.Fatalf("pre: row=(%+v, %v), want 5 attempts and size 256", row, err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), drainPassDeadline)
 	defer cancel()
 	// With completion wired, the exhausted budget reaches failPermanent.
 	if got := d.DrainOnceForTest(ctx); got != 1 {

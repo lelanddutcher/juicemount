@@ -20,6 +20,13 @@ char* NFSServerLinkTest(char* configJSON);
 // enrollment. Input and output are JSON (bridge/enrollment.go); the output
 // carries secrets for the Keychain and must never be logged.
 char* NFSServerEnrollStep(char* inputJSON);
+// Agent tokens (bridge/agenttokens.go): mint (and store in the Keychain item
+// the bundled juicemount-mcp reads), list and revoke this person's tokens as
+// this Mac. Input carries the enrollment record; output JSON never carries a
+// token.
+char* NFSServerAgentTokenCreate(char* inputJSON);
+char* NFSServerAgentTokenList(char* inputJSON);
+char* NFSServerAgentTokenRevoke(char* inputJSON);
 // Soft stop: tears down server/sync/cache/monitor/metrics, but leaves
 // FUSE and NFS mounted so the next Start is fast and prompt-free.
 int NFSServerStop(void);

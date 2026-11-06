@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -47,6 +48,12 @@ type Claim struct {
 	Token          string
 	Generation     int64
 	LeaseExpiresAt time.Time
+	// reapExpired marks a reaper-built legacy claim: requeue only while Redis
+	// agrees the delivery lease has expired.
+	reapExpired bool
+	// reapUnstarted marks a reaper-built legacy claim of a live worker: requeue
+	// only a delivery that never started (see legacyUnstartedClaimGrace).
+	reapUnstarted bool
 }
 
 func claimProcessingKey(claim Claim) string {
@@ -63,7 +70,37 @@ func claimProcessingIndex(claim Claim) string {
 	return ProcessingIndexKey
 }
 
-const claimForWorkerScript = `
+// legacyClaimReplayLua defines replayLegacyClaim, which finds the legacy
+// receipt an earlier run of the claim script made with this token in the
+// worker's processing list. A legacy claim has no lease, and the reaper
+// returns a live worker's unstarted legacy receipt only after
+// legacyUnstartedClaimGrace, so a claim whose reply was lost (go-redis resends
+// the EVAL after EOF or a timeout; ClaimForWorker reuses the token of an EVAL
+// that failed) must come back to the next run with that token, or it waits in
+// that list until then. A token belongs to one ClaimForWorker caller until a
+// claim is returned to it.
+const legacyClaimReplayLua = `
+local function replayLegacyClaim(processing, token)
+  for _, held in ipairs(redis.call('LRANGE', processing, 0, -1)) do
+    local ok, job = pcall(cjson.decode, held)
+    if ok and type(job) == 'table' and type(job.id) == 'string' and
+       redis.call('HGET', 'juicefarm:job:' .. job.id, 'delivery_token') == token then
+      return held
+    end
+  end
+  return nil
+end
+`
+
+const claimForWorkerScript = legacyClaimReplayLua + `
+local replayed = replayLegacyClaim(KEYS[4], ARGV[7])
+if replayed then
+  -- The worker learns of this delivery only now: its grace starts here.
+  local job = cjson.decode(replayed)
+  redis.call('HSET', 'juicefarm:job:' .. job.id,
+    'delivery_claimed', ARGV[7] .. ':' .. redis.call('TIME')[1])
+  return {'', replayed, '', KEYS[4]}
+end
 local controlRaw = redis.call('GET', KEYS[1])
 if controlRaw then
   local controlOK, control = pcall(cjson.decode, controlRaw)
@@ -204,13 +241,87 @@ if authoritativeRenderProfile then
     end
   end
 end
+-- Bounded, read-only scan. This Redis also serves every editor's filesystem
+-- metadata, so one poll inspects at most ARGV[11] entries per lane from the
+-- caller's per-lane cursor in ARGV[12] (positions counted from the claim
+-- end), and reports where the next poll should continue. Skipped entries are not
+-- rotated: a backlog no worker can serve costs no writes.
+--
+-- Enqueue pushes to the far end, so the cursor alone would reach new work only
+-- after walking the backlog. Every enqueue path increments <lane>:seq with its
+-- push and claims never touch it, so seq minus the caller's last seen value
+-- (ARGV[13], -1 unknown) is exactly how many entries arrived. They join the
+-- caller's owed count (ARGV[14]): the newest entries of the lane not yet
+-- inspected. After the cursor window, so older eligible work in it wins, each
+-- poll inspects the oldest owed entries, up to the same limit again; the rest
+-- stay owed for the next poll. A claim found deep in a lane costs up to half a
+-- lane walk to remove (see toClaimEnd), more than a poll's inspection.
+local scanLimit = tonumber(ARGV[11]) or 64
+local function csvNumbers(text, default)
+  local values = {}
+  for value in string.gmatch(text or '', '[^,]+') do
+    table.insert(values, tonumber(value) or default)
+  end
+  return values
+end
+local cursors = csvNumbers(ARGV[12], 0)
+local seenSeqs = csvNumbers(ARGV[13], -1)
+local owedCounts = csvNumbers(ARGV[14], 0)
+local scanState = {}
+-- A candidate found deeper in its lane moves to the claim end first, so the
+-- claim takes it with the same single-command transfer as the lane's head. The
+-- lane is a list (checked or written as one above), so nothing between LREM and
+-- RPUSH can fail and leave the raw outside every list. LREM walks from the
+-- nearer end (up to half the lane); the values are identical, so removing
+-- either copy is equivalent.
+local function toClaimEnd(key, position, count, value)
+  if position == 0 then return true end
+  local direction = -1
+  if position > count / 2 then direction = 1 end
+  if redis.call('LREM', key, direction, value) ~= 1 then return false end
+  redis.call('RPUSH', key, value)
+  return true
+end
 for i = 8, #KEYS do
   local count = redis.call('LLEN', KEYS[i])
-  for n = 1, count do
-    -- Inspect the next candidate without removing it. Tracked execution claims
+  local seq = tonumber(redis.call('GET', KEYS[i] .. ':seq') or '0') or 0
+  local first = cursors[i - 7] or 0
+  if first < 0 or first >= count or math.floor(first) ~= first then first = 0 end
+  local last = math.min(count, first + scanLimit) - 1
+  local owed = owedCounts[i - 7] or 0
+  if owed < 0 or math.floor(owed) ~= owed then owed = 0 end
+  local seen = seenSeqs[i - 7] or -1
+  if seen >= 0 and seq > seen then owed = owed + seq - seen end
+  if owed > count then owed = count end
+  local candidates, positions, owedTaken = {}, {}, {}
+  if last >= first then
+    local window = redis.call('LRANGE', KEYS[i], -(last + 1), -(first + 1))
+    for n = #window, 1, -1 do
+      table.insert(candidates, window[n])
+      table.insert(positions, first + #window - n)
+      table.insert(owedTaken, 0)
+    end
+  end
+  local regionSize = math.min(owed, scanLimit)
+  if regionSize > 0 then
+    -- Head indices owed-regionSize .. owed-1, inspected oldest first. An entry
+    -- the window already covered is not inspected twice.
+    local region = redis.call('LRANGE', KEYS[i], owed - regionSize, owed - 1)
+    for j = #region, 1, -1 do
+      local position = count - (owed - regionSize + j)
+      if position < first or position > last then
+        table.insert(candidates, region[j])
+        table.insert(positions, position)
+        table.insert(owedTaken, #region - j + 1)
+      end
+    end
+  end
+  for c = 1, #candidates do
+    -- Inspect the candidate without removing it. Tracked execution claims
     -- must transfer directly from ready to processing after the worker index
     -- is durable, so a Lua runtime error cannot strand an unindexed raw.
-    local raw = redis.call('LINDEX', KEYS[i], -1)
+    local position = positions[c]
+    local raw = candidates[c]
     if raw then
       local sourceRaw = raw
       local eligible = true
@@ -368,6 +479,9 @@ for i = 8, #KEYS do
               'claim_generation', generation, 'claim_token', ARGV[7],
               'lease_owner', ARGV[1], 'custody_source', KEYS[i],
               'custody_raw', sourceRaw, 'custody_processing_raw', custodyRaw)
+            if not toClaimEnd(KEYS[i], position, count, sourceRaw) then
+              return redis.error_reply('tracked ready claim disappeared')
+            end
             local moved = redis.call('LMOVE', KEYS[i], processing, 'RIGHT', 'LEFT')
             if not moved then return redis.error_reply('tracked ready claim disappeared') end
             if moved ~= sourceRaw then return redis.error_reply('tracked ready claim changed') end
@@ -377,11 +491,44 @@ for i = 8, #KEYS do
                 'payload', raw)
             end
           else
+            if not toClaimEnd(KEYS[i], position, count, sourceRaw) then
+              return redis.error_reply('ready claim disappeared')
+            end
             redis.call('RPOP', KEYS[i])
             redis.call('LPUSH', processing, raw)
             redis.call('SADD', processingIndex, ARGV[1])
             if job and job.id then
-              redis.call('HSET', 'juicefarm:job:' .. job.id, 'delivery_token', ARGV[7])
+              local statusKey = 'juicefarm:job:' .. job.id
+              -- Legacy status retention starts at a terminal state. Records from
+              -- older producers still carry an enqueue-time TTL; never let one
+              -- expire under a live delivery. A record that already expired (or
+              -- only holds maintenance markers) is rebuilt and re-indexed so the
+              -- delivery stays visible and later receives its terminal TTL.
+              redis.call('PERSIST', statusKey)
+              if redis.call('HEXISTS', statusKey, 'id') == 0 then
+                local function text(v) if type(v) == 'string' then return v end return '' end
+                local kinds = ''
+                if type(job.kinds) == 'table' then
+                  for n, kind in ipairs(job.kinds) do
+                    if n > 1 then kinds = kinds .. ',' end
+                    kinds = kinds .. text(kind)
+                  end
+                end
+                redis.call('HSET', statusKey, 'id', text(job.id), 'path', text(job.path), 'kinds', kinds,
+                  'producer', text(job.producer), 'enqueued_at', text(job.enqueued_at), 'payload', raw)
+                redis.call('HSETNX', statusKey, 'status', 'queued')
+                local now = redis.call('TIME')
+                redis.call('ZADD', 'juicefarm:jobs', 'NX',
+                  string.format('%.0f', tonumber(now[1]) * 1000000 + tonumber(now[2])), job.id)
+              end
+              -- The claim time, bound to its token, lets the reaper return a
+              -- delivery a live worker never starts (legacyUnstartedClaimGrace).
+              -- A new delivery: an earlier one's requeue marker no longer
+              -- answers for this token.
+              local claimedAt = redis.call('TIME')
+              redis.call('HSET', statusKey, 'delivery_token', ARGV[7],
+                'delivery_claimed', ARGV[7] .. ':' .. claimedAt[1])
+              redis.call('HDEL', statusKey, 'requeued_by')
             end
           end
         end
@@ -412,23 +559,54 @@ for i = 8, #KEYS do
               redis.call('SREM', KEYS[5], reclaimedOwner)
             end
           end
-          if job and job.tracked_epoch then
-            return {raw, KEYS[i], processing, redis.call('HGET', 'juicefarm:job:' .. job.id, 'claim_generation'), tostring(leaseExpires)}
+          -- The claimed entry is gone. Within the window its position is the
+          -- next unseen one; nearer the claim end it shifts the cursor down by
+          -- one. A claim among the owed entries means the whole window was
+          -- inspected first and held nothing eligible, so the cursor moves past
+          -- it; otherwise steady new work would park the cursor and the older
+          -- work beyond the window would never be reached.
+          local nextCursor = first
+          if owedTaken[c] > 0 then
+            nextCursor = last + 1
+            if position < first then nextCursor = last end
+            if nextCursor >= count - 1 then nextCursor = 0 end
+          elseif position < first then
+            nextCursor = first - 1
+          elseif position <= last then
+            nextCursor = position
           end
-          return {raw, KEYS[i], processing}
+          -- Owed entries newer than a claimed one stay owed. A window claim of
+          -- an owed entry (the lane is short, or the cursor reached the
+          -- newest entries) takes one off what is owed.
+          local owedAfter = owed
+          if owedTaken[c] > 0 then
+            owedAfter = owed - owedTaken[c]
+          elseif count - 1 - position < owed then
+            owedAfter = owed - 1
+          end
+          table.insert(scanState, string.format('%d:%d:%d:%d', nextCursor, count - 1, seq, owedAfter))
+          local state = table.concat(scanState, ',')
+          if job and job.tracked_epoch then
+            return {state, raw, KEYS[i], processing, redis.call('HGET', 'juicefarm:job:' .. job.id, 'claim_generation'), tostring(leaseExpires)}
+          end
+          return {state, raw, KEYS[i], processing}
         end
       end
-      -- Rotate skipped candidates without ever making a tracked raw absent
-      -- from both its ready lane and a recoverable processing lane.
-      redis.call('RPOPLPUSH', KEYS[i], KEYS[i])
     end
   end
+  local nextCursor = last + 1
+  if nextCursor >= count then nextCursor = 0 end
+  table.insert(scanState, string.format('%d:%d:%d:%d', nextCursor, count, seq, owed - regionSize))
 end
-return {}`
+return {table.concat(scanState, ',')}`
 
 // ClaimForWorker polls the worker's eligible lanes and atomically moves one raw
 // job into its processing list. Unlike BRPOP, a worker crash cannot lose the
 // entry: RecoverAbandonedWorkers can see and requeue the durable receipt.
+//
+// Callers must not run ClaimForWorker concurrently for the same worker: the
+// worker keeps one unconfirmed claim token, and a second concurrent call's
+// unconfirmed token would be dropped.
 func (c *Client) ClaimForWorker(ctx context.Context, timeout time.Duration, w Worker) (Claim, bool, error) {
 	if w.AdmissionBlocked {
 		return Claim{}, false, nil
@@ -451,17 +629,44 @@ func (c *Client) ClaimForWorker(ctx context.Context, timeout time.Duration, w Wo
 	if w.RequireStoragePermit {
 		requireStoragePermit = "1"
 	}
+	scan := c.claimScanFor(w.ID)
+	if timeout <= 0 {
+		// A single poll covers every lane once from the claim end, as the
+		// unbounded scan did, in bounded steps.
+		scan.restart()
+	}
+	steps, maxSteps := 0, 0
+	// Every poll of this call sends the same token, and until a claim is
+	// returned the next call sends it again, so a run whose reply was lost is
+	// replayed rather than left behind (see legacyClaimReplayLua).
+	token, unconfirmed, spent := scan.takeToken(), false, false
+	defer func() {
+		if !spent {
+			scan.keepToken(token, unconfirmed)
+		}
+	}()
 	for {
-		token := NewID()
 		requestStart := time.Now()
 		expires := time.Now().Add(claimLeaseTTL)
+		cursors, seqs, owed := scan.scanArgs(keys)
 		res, err := c.rdb.Eval(ctx, claimForWorkerScript, scriptKeys, w.ID, string(capabilities), string(decodeLimits),
 			workerPinCapability(w), workerDisplayName(w), requireStoragePermit,
-			token, expires.UTC().Format(time.RFC3339), expires.Unix(), w.Role).StringSlice()
+			token, expires.UTC().Format(time.RFC3339), expires.Unix(), w.Role,
+			claimScanBatch, cursors, seqs, owed).StringSlice()
 		if err != nil && err != redis.Nil {
+			// The script may have claimed a job before the reply was lost.
+			unconfirmed = true
 			return Claim{}, false, err
 		}
-		if len(res) >= 3 {
+		unconfirmed = false
+		cycleDone := true
+		if len(res) >= 1 {
+			cycleDone = scan.observe(keys, res[0])
+		}
+		if len(res) >= 4 {
+			spent = true
+			scan.claimed()
+			res = res[1:]
 			var job Job
 			if err := json.Unmarshal([]byte(res[0]), &job); err != nil {
 				_ = c.rdb.LRem(ctx, res[2], 1, res[0]).Err()
@@ -475,6 +680,9 @@ func (c *Client) ClaimForWorker(ctx context.Context, timeout time.Duration, w Wo
 				}
 			}
 			claim := Claim{Job: job, Raw: res[0], QueueKey: res[1], WorkerID: w.ID, Token: token, Generation: generation}
+			if claim.QueueKey == "" {
+				claim.QueueKey = QueueKeyFor(&job) // a replayed receipt does not record its lane
+			}
 			if len(res) >= 5 {
 				_, parseErr := strconv.ParseInt(res[4], 10, 64)
 				if parseErr != nil {
@@ -486,15 +694,301 @@ func (c *Client) ClaimForWorker(ctx context.Context, timeout time.Duration, w Wo
 			}
 			return claim, true, nil
 		}
-		if timeout <= 0 || time.Now().After(deadline) {
+		if timeout <= 0 {
+			// The step cap ends the pass if lanes grow faster than one step reads.
+			steps++
+			if maxSteps == 0 {
+				maxSteps = scan.stepsToCover(keys)
+			}
+			if cycleDone || steps >= maxSteps {
+				return Claim{}, false, nil
+			}
+			continue
+		}
+		// One poll covers at most claimScanBatch entries per lane. Until every
+		// lane has been covered, continue from the cursors; a covered backlog
+		// with nothing eligible backs off instead of rescanning.
+		delay := scan.stepDelay()
+		if cycleDone {
+			delay = scan.idleDelay()
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
 			return Claim{}, false, nil
+		}
+		if delay > remaining {
+			delay = remaining
 		}
 		select {
 		case <-ctx.Done():
 			return Claim{}, false, ctx.Err()
-		case <-time.After(250 * time.Millisecond):
+		case <-time.After(delay):
 		}
 	}
+}
+
+const findLegacyClaimReplayScript = legacyClaimReplayLua + `
+return replayLegacyClaim(KEYS[1], ARGV[1]) or false`
+
+// ReleaseUnconfirmedClaim returns to its lane a legacy job that this worker's
+// last failed claim may have taken without the reply reaching it. The next
+// ClaimForWorker call would return that job; a worker that stops claiming
+// while it lives (disabled, paused, draining, blocked) calls this instead, so
+// the job does not wait for it. It reports whether a job was released.
+func (c *Client) ReleaseUnconfirmedClaim(ctx context.Context, w Worker) (bool, error) {
+	scan := c.claimScanFor(w.ID)
+	token := scan.takeUnconfirmedToken()
+	if token == "" {
+		return false, nil
+	}
+	released, err := c.releaseLegacyClaimByToken(ctx, w.ID, token)
+	scan.keepToken(token, err != nil)
+	return released, err
+}
+
+func (c *Client) releaseLegacyClaimByToken(ctx context.Context, workerID, token string) (bool, error) {
+	raw, err := c.rdb.Eval(ctx, findLegacyClaimReplayScript, []string{ProcessingPrefix + workerID}, token).Text()
+	if err == redis.Nil {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	var job Job
+	if err := json.Unmarshal([]byte(raw), &job); err != nil {
+		return false, fmt.Errorf("decode unconfirmed claim: %w", err)
+	}
+	// The job never ran: keep its route, attempts and routing note.
+	note, err := c.rdb.HGet(ctx, JobHashPrefix+job.ID, "error").Result()
+	if err != nil && err != redis.Nil {
+		return false, err
+	}
+	claim := Claim{Job: job, Raw: raw, WorkerID: workerID, Token: token}
+	if err := c.RequeueClaimSameRoute(ctx, claim, note); err != nil {
+		if errors.Is(err, ErrClaimLost) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+const (
+	// claimScanBatch bounds the ready entries one claim poll inspects per lane,
+	// once in the cursor window and once among newly enqueued entries. The claim
+	// script runs inside the metadata Redis, so a poll's cost must not grow with
+	// a backlog this worker cannot serve.
+	claimScanBatch = 64
+	// The polls that continue a partly covered backlog start claimScanStepDelay
+	// apart and double with each poll that claims nothing, up to
+	// claimScanStepMax, so a backlog this worker cannot serve costs Redis about
+	// four short scripts a second however much ineligible work keeps arriving.
+	// New entries do not speed it up: the next poll inspects them anyway.
+	claimScanStepDelay = 25 * time.Millisecond
+	claimScanStepMax   = 250 * time.Millisecond
+	// An idle worker polls at claimIdleBase after a full fruitless pass, doubling
+	// to claimIdleMax. Only a claim resets the pacing.
+	claimIdleBase = 250 * time.Millisecond
+	claimIdleMax  = 2 * time.Second
+)
+
+// claimScanState is one worker's position in its ready lanes. It lives in the
+// process, not in Redis: a poll that claims nothing then writes nothing, and a
+// restart only restarts the scan from the claim end.
+type claimScanState struct {
+	mu      sync.Mutex
+	cursors map[string]int64
+	lengths map[string]int64
+	// seqs is each lane's LaneSeqKey value at the last poll; owed is how many
+	// of the lane's newest entries have arrived since and are not inspected.
+	seqs    map[string]int64
+	owed    map[string]int64
+	covered map[string]bool
+	idle    time.Duration
+	// fruitless counts consecutive polls that claimed nothing.
+	fruitless int
+	// token is the claim token the next ClaimForWorker call sends; while a
+	// call holds it, it is empty. unconfirmed says the last EVAL that sent it
+	// failed, so it may have claimed a job this process has not seen.
+	token       string
+	unconfirmed bool
+}
+
+// takeToken hands the caller the pending claim token, or a new one.
+func (s *claimScanState) takeToken() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	token := s.token
+	s.token, s.unconfirmed = "", false
+	if token == "" {
+		token = NewID()
+	}
+	return token
+}
+
+// keepToken returns a token no claim was returned for, so the next call can
+// replay a claim whose reply was lost. An unconfirmed token wins over a
+// confirmed one; only one is kept, which is why callers must not claim
+// concurrently for one worker.
+func (s *claimScanState) keepToken(token string, unconfirmed bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.token == "" || unconfirmed && !s.unconfirmed {
+		s.token, s.unconfirmed = token, unconfirmed
+	}
+}
+
+// takeUnconfirmedToken hands the caller the pending token only if it is
+// unconfirmed.
+func (s *claimScanState) takeUnconfirmedToken() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.unconfirmed {
+		return ""
+	}
+	token := s.token
+	s.token, s.unconfirmed = "", false
+	return token
+}
+
+func newClaimScanState() *claimScanState {
+	return &claimScanState{cursors: map[string]int64{}, lengths: map[string]int64{},
+		seqs: map[string]int64{}, owed: map[string]int64{}, covered: map[string]bool{}}
+}
+
+func (c *Client) claimScanFor(workerID string) *claimScanState {
+	c.scanMu.Lock()
+	defer c.scanMu.Unlock()
+	if c.scans == nil {
+		c.scans = make(map[string]*claimScanState)
+	}
+	scan := c.scans[workerID]
+	if scan == nil {
+		scan = newClaimScanState()
+		c.scans[workerID] = scan
+	}
+	return scan
+}
+
+// laneArg renders one per-lane value for the script, missing for unknown.
+func laneArg(keys []string, values map[string]int64, missing int64) string {
+	parts := make([]string, len(keys))
+	for i, key := range keys {
+		value, ok := values[key]
+		if !ok {
+			value = missing
+		}
+		parts[i] = strconv.FormatInt(value, 10)
+	}
+	return strings.Join(parts, ",")
+}
+
+// scanArgs returns the cursors, last seen sequences (-1 unknown) and owed
+// counts the claim script reads as ARGV[12..14].
+func (s *claimScanState) scanArgs(keys []string) (cursors, seqs, owed string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return laneArg(keys, s.cursors, 0), laneArg(keys, s.seqs, -1), laneArg(keys, s.owed, 0)
+}
+
+// observe records the script's per-lane "next:length:seq:owed" report and
+// says whether every lane has been covered since the last full pass. A lane is
+// covered when its cursor returns to the claim end with nothing owed.
+func (s *claimScanState) observe(keys []string, report string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if report != "" {
+		for i, entry := range strings.Split(report, ",") {
+			if i >= len(keys) {
+				break
+			}
+			fields := strings.Split(entry, ":")
+			if len(fields) != 4 {
+				continue
+			}
+			var values [4]int64
+			valid := true
+			for f, field := range fields {
+				v, err := strconv.ParseInt(field, 10, 64)
+				if err != nil {
+					valid = false
+					break
+				}
+				values[f] = v
+			}
+			if !valid {
+				continue
+			}
+			key := keys[i]
+			cursor, size, seq, owed := values[0], values[1], values[2], values[3]
+			s.cursors[key] = cursor
+			s.lengths[key] = size
+			s.seqs[key] = seq
+			s.owed[key] = owed
+			if owed > 0 {
+				s.covered[key] = false
+			} else if cursor == 0 {
+				s.covered[key] = true
+			}
+		}
+	}
+	for _, key := range keys {
+		if !s.covered[key] {
+			return false
+		}
+	}
+	clear(s.covered)
+	return true
+}
+
+func (s *claimScanState) restart() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	clear(s.cursors)
+	clear(s.covered)
+}
+
+func (s *claimScanState) claimed() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.idle = 0
+	s.fruitless = 0
+}
+
+// stepDelay records a poll that claimed nothing and returns the pause before
+// the next one while a pass is still in progress.
+func (s *claimScanState) stepDelay() time.Duration {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.fruitless++
+	delay := claimScanStepDelay
+	for i := 1; i < s.fruitless && delay < claimScanStepMax; i++ {
+		delay *= 2
+	}
+	return min(delay, claimScanStepMax)
+}
+
+func (s *claimScanState) idleDelay() time.Duration {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.idle <= 0 {
+		s.idle = claimIdleBase
+	} else if s.idle < claimIdleMax {
+		s.idle = min(2*s.idle, claimIdleMax)
+	}
+	return s.idle
+}
+
+// stepsToCover is how many bounded polls one pass over the longest lane needs,
+// plus one for a lane the first poll found mid-cycle.
+func (s *claimScanState) stepsToCover(keys []string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var longest int64
+	for _, key := range keys {
+		longest = max(longest, s.lengths[key])
+	}
+	return int(longest/claimScanBatch) + 2
 }
 
 // RecoverUnserviceableReady demotes queued render jobs when no active render
@@ -623,6 +1117,7 @@ func (c *Client) RecoverUnserviceableReady(ctx context.Context) (int, error) {
 if redis.call('HEXISTS', KEYS[3], 'held_token') == 1 then return 0 end
 if redis.call('LREM', KEYS[1], 1, ARGV[1]) == 1 then
   redis.call('LPUSH', KEYS[2], ARGV[2])
+  redis.call('INCR', KEYS[2] .. ':seq')
   redis.call('HSET', KEYS[3], 'status', 'queued', 'backend', ARGV[3],
 	'target_worker', ARGV[4], 'queue_class', ARGV[5], 'attempts', ARGV[6],
 	'hardware_failures', ARGV[7], 'error', ARGV[8], 'payload', ARGV[2])
@@ -745,6 +1240,7 @@ func (c *Client) PromoteServiceableReady(ctx context.Context) (int, error) {
 if redis.call('HEXISTS', KEYS[3], 'held_token') == 1 then return 0 end
 if redis.call('LREM', KEYS[1], 1, ARGV[1]) == 1 then
   redis.call('LPUSH', KEYS[2], ARGV[2])
+  redis.call('INCR', KEYS[2] .. ':seq')
   redis.call('HSET', KEYS[3], 'status', 'queued', 'worker', '',
 	'backend', ARGV[3], 'target_worker', ARGV[4], 'queue_class', ARGV[5],
 	'error', ARGV[6], 'payload', ARGV[2])
@@ -1039,12 +1535,13 @@ func (c *Client) CompleteClaim(ctx context.Context, claim Claim, status string, 
 	if claim.Job.TrackedEpoch == "" {
 		switch status {
 		case StatusDone:
-			return c.MarkDone(ctx, claim.Job.ID, processed, failed)
+			errMsg = "" // success keeps the routing note already on the record
 		case StatusCanceled:
-			return c.MarkCanceled(ctx, claim.Job.ID, processed, failed)
-		default:
-			return c.MarkFailedWithCounts(ctx, claim.Job.ID, processed, failed, errMsg)
+			if errMsg == "" {
+				errMsg = "canceled by operator"
+			}
 		}
+		return c.completeLegacyClaim(ctx, claim, status, nowISO(), strconv.Itoa(processed), strconv.Itoa(failed), errMsg)
 	}
 	if claim.Job.ParentID == "" {
 		return fmt.Errorf("tracked planner %s requires coverage publication", claim.Job.ID)
@@ -1082,6 +1579,53 @@ return 1`
 		return fmt.Errorf("%w: tracked child %s cannot complete", ErrClaimLost, claim.Job.ID)
 	}
 	return c.retireTrackedTerminal(ctx, claim.Job.ID)
+}
+
+// legacyTerminalScript commits a legacy outcome only for the delivery the
+// caller still holds: its token, its started lease owner and its processing
+// receipt. A worker that was partitioned, reaped and replaced must not publish
+// over the new owner. Retrying the same outcome after a lost reply is allowed.
+// Retention starts here, not at enqueue, so a long backlog cannot expire a
+// record that is still queued or running.
+const legacyTerminalScript = `
+if redis.call('HEXISTS', KEYS[1], 'held_token') == 1 or
+   (redis.call('HGET', KEYS[1], 'tracked_epoch') or '') ~= '' or
+   redis.call('HGET', KEYS[1], 'delivery_token') ~= ARGV[1] or
+   redis.call('HGET', KEYS[1], 'lease_owner') ~= ARGV[2] or
+   not redis.call('LPOS', KEYS[2], ARGV[3]) then return 0 end
+local status = redis.call('HGET', KEYS[1], 'status')
+if status ~= 'running' and status ~= ARGV[4] then return 0 end
+redis.call('HSET', KEYS[1], 'status', ARGV[4])
+if ARGV[5] ~= '' then
+  redis.call('HSET', KEYS[1], 'finished_at', ARGV[5], 'processed', ARGV[6], 'failed', ARGV[7])
+end
+if ARGV[8] ~= '' then redis.call('HSET', KEYS[1], 'error', ARGV[8]) end
+redis.call('EXPIRE', KEYS[1], ARGV[9])
+return 1`
+
+func (c *Client) completeLegacyClaim(ctx context.Context, claim Claim, status, finishedAt, processed, failed, errMsg string) error {
+	if claim.Token == "" || claim.WorkerID == "" || claim.Raw == "" {
+		return fmt.Errorf("%w: legacy job %s has no delivery to complete", ErrClaimLost, claim.Job.ID)
+	}
+	n, err := c.rdb.Eval(ctx, legacyTerminalScript, []string{JobHashPrefix + claim.Job.ID, claimProcessingKey(claim)},
+		claim.Token, claim.WorkerID, claim.Raw, status, finishedAt, processed, failed, errMsg,
+		int64(JobTTL/time.Second)).Int()
+	if err != nil {
+		return err
+	}
+	if n != 1 {
+		return fmt.Errorf("%w: legacy job %s is no longer delivered to worker %s", ErrClaimLost, claim.Job.ID, claim.WorkerID)
+	}
+	return nil
+}
+
+// MarkClaimDispatched records a dispatched parent for the delivery the caller
+// holds. Tracked jobs keep MarkDispatched's existing contract.
+func (c *Client) MarkClaimDispatched(ctx context.Context, claim Claim) error {
+	if claim.Job.TrackedEpoch != "" {
+		return c.MarkDispatched(ctx, claim.Job.ID)
+	}
+	return c.completeLegacyClaim(ctx, claim, StatusDispatched, "", "", "", "")
 }
 
 func (c *Client) AckClaim(ctx context.Context, claim Claim) error {
@@ -1220,19 +1764,40 @@ return 1`
 		}
 		return nil
 	}
+	// Release only the caller's own delivery. A stale worker must not strip the
+	// token and lease of the worker that now owns the job.
+	//
+	// A missing token is not a foreign owner. With no receipt left it is an ACK
+	// retried after its reply was lost. With the receipt still in this worker's
+	// processing list, the record lost its token after the terminal write (the
+	// Manager's "Clear finished" deleted it): the receipt can only be this
+	// delivery's, because every hand-off (requeue, reaper, hold, ACK) removes
+	// the receipt from this list before anyone else can claim the job.
 	const script = `
 if redis.call('HEXISTS', KEYS[3], 'held_token') == 1 then return 1 end
+local token = redis.call('HGET', KEYS[3], 'delivery_token') or ''
+if token ~= ARGV[4] then
+  if token ~= '' then return 0 end
+  if not redis.call('LPOS', KEYS[1], ARGV[1]) then return 1 end
+end
 redis.call('LREM', KEYS[1], 1, ARGV[1])
 redis.call('ZREM', KEYS[2], ARGV[2])
 redis.call('HDEL', KEYS[3], 'lease_owner', 'lease_expires_at', 'lease_expires_unix',
-  'claim_token', 'claim_phase', 'delivery_token', 'delivery_expires_unix')
+  'claim_token', 'claim_phase', 'delivery_token', 'delivery_expires_unix', 'delivery_claimed')
 if redis.call('LLEN', KEYS[1]) == 0 then
   redis.call('SREM', KEYS[4], ARGV[3])
 end
 return 1`
-	return c.rdb.Eval(ctx, script, []string{
+	n, err := c.rdb.Eval(ctx, script, []string{
 		processingKey, LeaseIndexKey, JobHashPrefix + claim.Job.ID, claimProcessingIndex(claim),
-	}, claim.Raw, claim.Job.ID, claim.WorkerID).Err()
+	}, claim.Raw, claim.Job.ID, claim.WorkerID, claim.Token).Int()
+	if err != nil {
+		return err
+	}
+	if n != 1 {
+		return fmt.Errorf("%w: legacy job %s is no longer delivered to worker %s", ErrClaimLost, claim.Job.ID, claim.WorkerID)
+	}
+	return nil
 }
 
 // RequeueClaim atomically acknowledges a claim and publishes its next delivery.
@@ -1327,6 +1892,7 @@ if (status ~= 'running' and status ~= 'queued') or
    not redis.call('LPOS', KEYS[1], ARGV[1]) then return 0 end
 redis.call('LREM', KEYS[1], 1, ARGV[1])
 redis.call('LPUSH', KEYS[2], ARGV[2])
+redis.call('INCR', KEYS[2] .. ':seq')
 redis.call('ZREM', KEYS[3], ARGV[3])
 redis.call('HSET', KEYS[4],
   'status', 'queued', 'worker', '', 'backend', ARGV[4],
@@ -1351,12 +1917,51 @@ return 1`
 		}
 		return nil
 	}
+	// A legacy requeue is fenced like its terminal write: the delivery token the
+	// caller holds (empty only for records that predate tokens), no committed
+	// outcome to rerun, and for the reaper a delivery lease Redis agrees has
+	// expired, so a renewal racing the scan keeps its owner. A reaper returning
+	// a live worker's unstarted delivery (ARGV[14] '2') also needs the job never
+	// started, the token's claim older than ARGV[15] seconds, and the worker's
+	// heartbeat not naming the job: MarkClaimRunning checks the same token in
+	// one script, so exactly one of the start and this requeue lands.
+	//
+	// requeued_by makes the requeue idempotent per delivery: go-redis resends an
+	// EVAL whose reply was lost, and the resend must report the requeue that
+	// already landed, not a lost claim. It names the caller (worker or reaper
+	// mode), and the next claim of the job clears it, so it never answers for
+	// a requeue by someone else or for a later delivery under the same token.
 	const script = `
+local token = redis.call('HGET', KEYS[4], 'delivery_token') or ''
+if ARGV[13] ~= '' and token ~= ARGV[13] and
+   redis.call('HGET', KEYS[4], 'requeued_by') == ARGV[13] .. ':' .. ARGV[14] then
+  return 1
+end
 if redis.call('HEXISTS', KEYS[4], 'held_token') == 1 then return 0 end
+if token ~= ARGV[13] then return 0 end
+local status = redis.call('HGET', KEYS[4], 'status')
+if status == 'done' or status == 'failed' or status == 'canceled' or status == 'dispatched' then
+  return 0
+end
+if ARGV[14] == '1' then
+  local expires = math.max(tonumber(redis.call('HGET', KEYS[4], 'delivery_expires_unix') or '0') or 0,
+    tonumber(redis.call('HGET', KEYS[4], 'lease_expires_unix') or '0') or 0)
+  if expires > tonumber(redis.call('TIME')[1]) then return 0 end
+elseif ARGV[14] == '2' then
+  if ARGV[13] == '' or status ~= 'queued' then return 0 end
+  local stampToken, claimedAt = string.match(redis.call('HGET', KEYS[4], 'delivery_claimed') or '', '^(.*):(%d+)$')
+  if stampToken ~= ARGV[13] or
+     tonumber(claimedAt) + tonumber(ARGV[15]) > tonumber(redis.call('TIME')[1]) then return 0 end
+  local beat = redis.call('GET', KEYS[6])
+  if not beat then return 0 end
+  local ok, worker = pcall(cjson.decode, beat)
+  if not ok or type(worker) ~= 'table' or worker.current_job == ARGV[3] then return 0 end
+end
 if redis.call('LREM', KEYS[1], 1, ARGV[1]) == 0 then
   return 0
 end
 redis.call('LPUSH', KEYS[2], ARGV[2])
+redis.call('INCR', KEYS[2] .. ':seq')
 redis.call('ZREM', KEYS[3], ARGV[3])
 redis.call('HSET', KEYS[4],
   'status', 'queued', 'worker', '', 'backend', ARGV[4],
@@ -1364,16 +1969,27 @@ redis.call('HSET', KEYS[4],
   'hardware_failures', ARGV[8], 'error', ARGV[9], 'processed', ARGV[11], 'failed', '0',
   'payload', ARGV[12])
 redis.call('HDEL', KEYS[4], 'lease_owner', 'lease_expires_at', 'lease_expires_unix',
-  'claim_token', 'claim_phase', 'finished_at', 'delivery_token', 'delivery_expires_unix')
+  'claim_token', 'claim_phase', 'finished_at', 'delivery_token', 'delivery_expires_unix',
+  'delivery_claimed', 'requeued_by')
+if ARGV[13] ~= '' then redis.call('HSET', KEYS[4], 'requeued_by', ARGV[13] .. ':' .. ARGV[14]) end
 if redis.call('LLEN', KEYS[1]) == 0 then
   redis.call('SREM', KEYS[5], ARGV[10])
 end
 return 1`
+	mode := "0"
+	switch {
+	case claim.reapExpired:
+		mode = "1"
+	case claim.reapUnstarted:
+		mode = "2"
+	}
 	n, err := c.rdb.Eval(ctx, script, []string{
 		processingKey, target, LeaseIndexKey, JobHashPrefix + job.ID, claimProcessingIndex(claim),
+		WorkerPrefix + claim.WorkerID,
 	}, claim.Raw, string(raw), job.ID, job.SelectedBackend, job.SelectedWorker, job.QueueClass,
 		strconv.Itoa(job.Attempts), strconv.Itoa(job.HardwareFailures), reason,
-		claim.WorkerID, strconv.Itoa(job.ProcessedOffset), string(raw)).Int()
+		claim.WorkerID, strconv.Itoa(job.ProcessedOffset), string(raw), claim.Token, mode,
+		int64(legacyUnstartedClaimGrace/time.Second)).Int()
 	if err != nil {
 		return err
 	}
@@ -1423,7 +2039,10 @@ if not inReady and not inProcessing then
   return redis.error_reply('tracked transfer has no exact custody raw')
 end
 if inProcessing then
-  if not inReady then redis.call('LPUSH', source, sourceRaw) end
+  if not inReady then
+    redis.call('LPUSH', source, sourceRaw)
+    redis.call('INCR', source .. ':seq')
+  end
   if redis.call('LREM', processing, 1, actualProcessingRaw) ~= 1 then
     return redis.error_reply('tracked transfer processing receipt changed')
   end
@@ -1479,6 +2098,11 @@ func (c *Client) RecoverAbandonedWorkers(ctx context.Context) (int, error) {
 				return total, err
 			}
 			if alive > 0 && !group.tracked {
+				n, err := c.recoverUnstartedLegacyClaims(ctx, workerID)
+				total += n
+				if err != nil {
+					return total, err
+				}
 				continue
 			}
 			lock := "juicefarm:reaper:" + group.prefix + workerID
@@ -1592,20 +2216,35 @@ func (c *Client) RecoverAbandonedWorkers(ctx context.Context) (int, error) {
 						_ = c.rdb.Del(ctx, lock).Err()
 						return total, expiryErr
 					}
-					nowUnix := time.Now().Unix()
-					if group.tracked {
-						redisNow, timeErr := c.rdb.Time(ctx).Result()
-						if timeErr != nil {
+					if !group.tracked {
+						// Legacy start and renew write delivery_expires_unix. Honour it
+						// (and any lease_expires_unix) so a worker whose heartbeat lapsed
+						// keeps a delivery it is still renewing.
+						delivery, deliveryErr := c.rdb.HGet(ctx, JobHashPrefix+job.ID, "delivery_expires_unix").Int64()
+						if deliveryErr != nil && deliveryErr != redis.Nil {
 							_ = c.rdb.Del(ctx, lock).Err()
-							return total, timeErr
+							return total, deliveryErr
 						}
-						nowUnix = redisNow.Unix()
+						if delivery > expires {
+							expires = delivery
+						}
 					}
-					if expires > nowUnix {
+					// Both lease deadlines are stamped from Redis TIME.
+					redisNow, timeErr := c.rdb.Time(ctx).Result()
+					if timeErr != nil {
+						_ = c.rdb.Del(ctx, lock).Err()
+						return total, timeErr
+					}
+					if expires > redisNow.Unix() {
 						continue
 					}
 				}
 				claim := Claim{Job: job, Raw: raw, WorkerID: workerID}
+				if !group.tracked {
+					// Fence the ACK or requeue below on the delivery observed here.
+					claim.Token = held["delivery_token"]
+					claim.reapExpired = true
+				}
 				if job.TrackedEpoch != "" {
 					claim.Token, err = c.rdb.HGet(ctx, JobHashPrefix+job.ID, "claim_token").Result()
 					if err != nil {
@@ -1629,6 +2268,9 @@ func (c *Client) RecoverAbandonedWorkers(ctx context.Context) (int, error) {
 					// durable execution proof; requeueing this receipt would run or
 					// recount already-completed work. Finish only the orphaned ACK.
 					if err := c.AckClaim(ctx, claim); err != nil {
+						if !group.tracked && errors.Is(err, ErrClaimLost) {
+							continue // the delivery moved on since this scan read it
+						}
 						_ = c.rdb.Del(ctx, lock).Err()
 						return total, err
 					}
@@ -1683,10 +2325,16 @@ func (c *Client) RecoverAbandonedWorkers(ctx context.Context) (int, error) {
 							" disappeared; preserved explicit CPU route"
 					}
 					if err := c.requeueClaimAs(ctx, claim, job, reason); err != nil {
+						if !group.tracked && errors.Is(err, ErrClaimLost) {
+							continue // renewed, completed or re-delivered since the scan
+						}
 						_ = c.rdb.Del(ctx, lock).Err()
 						return total, err
 					}
 				} else if err := c.RequeueClaim(ctx, claim, false, reason); err != nil {
+					if !group.tracked && errors.Is(err, ErrClaimLost) {
+						continue // renewed, completed or re-delivered since the scan
+					}
 					_ = c.rdb.Del(ctx, lock).Err()
 					return total, err
 				}
@@ -1694,6 +2342,85 @@ func (c *Client) RecoverAbandonedWorkers(ctx context.Context) (int, error) {
 			}
 			_ = c.rdb.Del(ctx, lock).Err()
 		}
+	}
+	return total, nil
+}
+
+// legacyUnstartedClaimGrace is how long a live worker may hold a legacy
+// delivery it has not started before the reaper returns it to its lane. A
+// legacy claim has no lease and the reaper otherwise leaves a live worker's
+// legacy receipts alone, so a claim the worker never learned of (a claim EVAL
+// that reached Redis after the worker gave up on it and spent its token) would
+// wait for as long as the worker lives. Between the claim reply and
+// MarkClaimRunning, jmfarm makes at most a reroute requeue (which releases the
+// receipt itself) and a heartbeat that names the job as current_job, which
+// this reaper respects. A worker that cannot finish those within WorkerTTL has
+// lost its heartbeat, and the dead-worker path already requeues its unstarted
+// receipt at once, so two TTLs is more patient than the reaper already is.
+// The requeue is fenced on the delivery token and the queued status that
+// MarkClaimRunning checks and changes in one script: if the bound is ever
+// wrong, the start fails with ErrClaimLost and the job runs once, elsewhere.
+const legacyUnstartedClaimGrace = 2 * WorkerTTL
+
+// stampLegacyClaimScript records when the reaper first saw an unstarted
+// delivery whose claim carries no claim time (a claim script from before
+// delivery_claimed), so the grace runs from then.
+const stampLegacyClaimScript = `
+local token = redis.call('HGET', KEYS[1], 'delivery_token')
+if not token or token ~= ARGV[1] or redis.call('HGET', KEYS[1], 'status') ~= 'queued' or
+   redis.call('HEXISTS', KEYS[1], 'held_token') == 1 or not redis.call('LPOS', KEYS[2], ARGV[2]) then
+  return 0
+end
+if string.match(redis.call('HGET', KEYS[1], 'delivery_claimed') or '', '^(.*):%d+$') == token then return 0 end
+redis.call('HSET', KEYS[1], 'delivery_claimed', token .. ':' .. redis.call('TIME')[1])
+return 1`
+
+// recoverUnstartedLegacyClaims returns to their lanes the legacy deliveries a
+// live worker has held unstarted for longer than legacyUnstartedClaimGrace.
+func (c *Client) recoverUnstartedLegacyClaims(ctx context.Context, workerID string) (int, error) {
+	lock := "juicefarm:reaper:" + ProcessingPrefix + workerID
+	got, err := c.rdb.SetNX(ctx, lock, "1", 15*time.Second).Result()
+	if err != nil || !got {
+		return 0, nil
+	}
+	defer func() { _ = c.rdb.Del(ctx, lock).Err() }()
+	processingKey := ProcessingPrefix + workerID
+	raws, err := c.rdb.LRange(ctx, processingKey, 0, -1).Result()
+	if err != nil {
+		return 0, err
+	}
+	total := 0
+	for _, raw := range raws {
+		var job Job
+		if err := json.Unmarshal([]byte(raw), &job); err != nil || job.ID == "" || job.TrackedEpoch != "" {
+			continue
+		}
+		fields, err := c.rdb.HMGet(ctx, JobHashPrefix+job.ID, "status", "delivery_token", "delivery_claimed",
+			"held_token", "error").Result()
+		if err != nil {
+			return total, err
+		}
+		text := func(i int) string { value, _ := fields[i].(string); return value }
+		token := text(1)
+		if text(0) != StatusQueued || token == "" || text(3) != "" {
+			continue // started, finished, held, or a record from before tokens
+		}
+		if stamped := text(2); !strings.HasPrefix(stamped, token+":") {
+			if err := c.rdb.Eval(ctx, stampLegacyClaimScript, []string{JobHashPrefix + job.ID, processingKey},
+				token, raw).Err(); err != nil {
+				return total, err
+			}
+			continue
+		}
+		// The job never ran: keep its route, attempts and routing note.
+		claim := Claim{Job: job, Raw: raw, WorkerID: workerID, Token: token, reapUnstarted: true}
+		if err := c.RequeueClaimSameRoute(ctx, claim, text(4)); err != nil {
+			if errors.Is(err, ErrClaimLost) {
+				continue // started, still within the grace, or current on the heartbeat
+			}
+			return total, err
+		}
+		total++
 	}
 	return total, nil
 }
@@ -1748,7 +2475,10 @@ end
 if not redis.call('LPOS', KEYS[1], ARGV[1]) then return 0 end
 redis.call('HSET', KEYS[3], 'claim_phase', 'reclaiming', 'lease_owner', ARGV[2], 'error',
   'recovering tracked child before reservation')
-if not redis.call('LPOS', KEYS[2], ARGV[1]) then redis.call('LPUSH', KEYS[2], ARGV[1]) end
+if not redis.call('LPOS', KEYS[2], ARGV[1]) then
+  redis.call('LPUSH', KEYS[2], ARGV[1])
+  redis.call('INCR', KEYS[2] .. ':seq')
+end
 if redis.call('LREM', KEYS[1], 1, ARGV[1]) ~= 1 then return 0 end
 if redis.call('LLEN', KEYS[1]) == 0 then redis.call('SREM', KEYS[4], ARGV[2]) end
 redis.call('HDEL', KEYS[3], 'claim_phase', 'lease_owner')
@@ -1784,6 +2514,7 @@ redis.call('HSET', KEYS[3], 'claim_phase', 'reclaiming', 'error',
   'recovering expired reservation before execution')
 redis.call('LREM', KEYS[2], 0, ARGV[3])
 redis.call('LPUSH', KEYS[2], ARGV[3])
+redis.call('INCR', KEYS[2] .. ':seq')
 redis.call('ZREM', KEYS[4], ARGV[5])
 if redis.call('LREM', KEYS[1], 1, ARGV[3]) ~= 1 then return 0 end
 redis.call('HSET', KEYS[3], 'status', 'queued')
@@ -1796,6 +2527,7 @@ func (c *Client) requeueMalformedClaim(ctx context.Context, processingKey, worke
 	const script = `
 redis.call('LREM', KEYS[1], 1, ARGV[1])
 redis.call('LPUSH', KEYS[2], ARGV[1])
+redis.call('INCR', KEYS[2] .. ':seq')
 if redis.call('LLEN', KEYS[1]) == 0 then
   redis.call('SREM', KEYS[3], ARGV[2])
 end

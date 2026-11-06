@@ -205,7 +205,7 @@ func TestFUSEAttributionDirEntryInfo(t *testing.T) {
 		{metrics.FUSESrcDirRefresh, prefetchGate, "dir_refresh/direntry_info"},
 	} {
 		before := fuseCellCounts(t)
-		if _, _, ok := infoWithTimeout(src.src, ents[0], 2*time.Second, src.gate); !ok {
+		if _, _, ok, _ := infoWithTimeout(src.src, ents[0], 2*time.Second, 2*time.Second, src.gate); !ok {
 			t.Fatalf("%s: infoWithTimeout unexpected timeout", src.key)
 		}
 		after := fuseCellCounts(t)
@@ -225,7 +225,7 @@ func TestFUSEAttributionSyscallTimeout(t *testing.T) {
 	defer close(de.release)
 
 	before := fuseCellCounts(t)
-	if _, _, ok := infoWithTimeout(metrics.FUSESrcSidecarWarm, de, 50*time.Millisecond, gate); ok {
+	if _, _, ok, _ := infoWithTimeout(metrics.FUSESrcSidecarWarm, de, 50*time.Millisecond, 50*time.Millisecond, gate); ok {
 		t.Fatal("wedged Info() must report ok=false")
 	}
 	after := fuseCellCounts(t)

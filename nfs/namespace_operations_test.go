@@ -45,10 +45,12 @@ func TestNamespaceTimedOutRemoveOwnsNameUntilPublication(t *testing.T) {
 	if err := <-done; !errors.Is(err, errFUSETimeout) {
 		t.Fatalf("Remove = %v, want timeout", err)
 	}
-	// The short deadline forces only the stalled Remove to return. Conflicting
-	// names must still refuse admission; normal durable creates use the
-	// production budget instead of becoming an unrelated 20 ms latency test.
-	t.Setenv("JM_MUTATION_OP_TIMEOUT_MS", "")
+	// The short deadline forces only the stalled Remove to return. What
+	// follows checks admission, not latency (see
+	// TestNamespaceRenameRetainsBothTreesThroughPublication): conflicting
+	// names are refused without waiting; unrelated and later creates are
+	// admitted, however long a loaded runner takes to commit them.
+	t.Setenv("JM_MUTATION_OP_TIMEOUT_MS", "60000")
 	for name, attempt := range map[string]func() error{
 		"create": func() error { f, err := jfs.Create("dir/take.mov"); _ = closeNamespaceFile(f); return err },
 		"open create": func() error {
@@ -121,10 +123,13 @@ func TestNamespaceRenameRetainsBothTreesThroughPublication(t *testing.T) {
 	if err := <-done; !errors.Is(err, errFUSETimeout) {
 		t.Fatalf("Rename = %v", err)
 	}
-	// Only the held Rename needs the short deadline. Conflicting creates must
-	// still refuse admission, while post-publication creates use the normal
-	// durable-operation budget instead of an unrelated 20 ms latency bound.
-	t.Setenv("JM_MUTATION_OP_TIMEOUT_MS", "")
+	// Only the held Rename needs the short deadline. What follows checks
+	// admission, not latency: conflicting creates are refused without
+	// waiting, and after publication the names are admitted again. A long
+	// budget keeps a stall on a loaded runner (a SQLite commit, the race
+	// detector) from turning the healthy mkdir below into errFUSETimeout,
+	// and keeps an admitted but slow create from passing as a refusal.
+	t.Setenv("JM_MUTATION_OP_TIMEOUT_MS", "60000")
 	for _, name := range []string{"original", "original/take.mov", "renamed/take.mov"} {
 		if f, err := jfs.Create(name); !errors.Is(err, errFUSETimeout) {
 			_ = closeNamespaceFile(f)

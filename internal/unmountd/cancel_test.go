@@ -251,6 +251,17 @@ func TestJoinAfterJobEndedStartsFreshJob(t *testing.T) {
 	}
 }
 
+// stressRetireWait bounds one Dead Retire in TestDeadRetireVersusCancelStress.
+// A Cancel that swallowed the request ends the job CANCELLED, which fails at
+// once; the bound only catches a request never answered. It was 5 s, and a
+// lane run spent that after the forced unmount had already succeeded: the
+// job sat in VERIFY_ABSENT "unmount returned success", which only the receipt
+// delete (Store.Delete, a directory fsync behind the store lock that the
+// withdrawn-mark writes also take with their fsyncs) can hold that long, as
+// the post-unmount snapshot gives up after SnapshotWatch (1 s here). A 5.5 s
+// delete reproduces that failure exactly, so 5 s measured the disk.
+const stressRetireWait = 60 * time.Second
+
 // Stress: a Dead-proof Retire racing a Cancel always retires (forced). The
 // Cancel may land first (job withdrawn, then a fresh or revived job) or
 // second (refused: force requested); never may it swallow the request.
@@ -286,7 +297,7 @@ func TestDeadRetireVersusCancelStress(t *testing.T) {
 		var rerr error
 		go func() {
 			defer wg.Done()
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			ctx, cancel := context.WithTimeout(context.Background(), stressRetireWait)
 			defer cancel()
 			out, rerr = svc.Retire(ctx, service(), "op-s", RetireRequest{Liveness: LivenessDead})
 		}()

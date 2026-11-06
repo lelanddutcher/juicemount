@@ -26,6 +26,7 @@ type shutdownFixture struct {
 
 func newShutdownFixture(t *testing.T) *shutdownFixture {
 	t.Helper()
+	useSpoolFixtureMutationBound(t)
 	f := &shutdownFixture{dbPath: filepath.Join(t.TempDir(), "mirror.db"), root: filepath.Join(t.TempDir(), "spool"), backing: t.TempDir()}
 	var err error
 	f.db, err = metadata.Open(f.dbPath)
@@ -99,7 +100,7 @@ func TestOfflineShutdownPreservesReceivedImages(t *testing.T) {
 				t.Fatalf("offline sweep finalized %d", n)
 			}
 			used := f.spool.used.Load()
-			if !f.h.stopHandlerWithDeadline(time.Second) {
+			if !f.h.stopHandlerWithDeadline(stopHandlerDeadline) {
 				t.Fatal("shutdown incomplete")
 			}
 			row, err := f.spool.meta.Get(e.id)
@@ -240,7 +241,10 @@ func TestShutdownImageCoverageAndCustody(t *testing.T) {
 				}
 			}
 			used := f.spool.used.Load()
-			if !f.h.stopHandlerWithDeadline(time.Second) {
+			// Qualifying an image fsyncs, hashes and commits SQL; on a loaded
+			// -race host that took over a second, so completion is judged by
+			// the deadline production shutdown uses.
+			if !f.h.stopHandlerWithDeadline(stopHandlerDeadline) {
 				t.Fatal("shutdown incomplete")
 			}
 			row, err := f.spool.meta.Get(e.id)
@@ -322,7 +326,7 @@ func TestShutdownFinalizationTimeoutRetainsSingleWorker(t *testing.T) {
 		t.Fatal("sealed image writable")
 	}
 	close(release)
-	if !f.h.stopHandlerWithDeadline(time.Second) {
+	if !f.h.stopHandlerWithDeadline(stopHandlerDeadline) {
 		t.Fatal("retry failed to join original worker")
 	}
 	row, err := f.spool.meta.Get(e.id)
@@ -371,7 +375,7 @@ func TestShutdownRefusesCoverageLostBeforeReopen(t *testing.T) {
 				t.Fatal(err)
 			}
 			used := f.spool.used.Load()
-			if !f.h.stopHandlerWithDeadline(time.Second) {
+			if !f.h.stopHandlerWithDeadline(stopHandlerDeadline) {
 				t.Fatal("shutdown incomplete")
 			}
 			row, err := f.spool.meta.Get(e.id)

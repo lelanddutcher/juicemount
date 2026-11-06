@@ -40,6 +40,10 @@ type location struct {
 	kind  nsKind
 	proj  uint64 // project root inode (nsProject, nsDerivatives)
 	depth int    // the directory's depth (root = 0); -1 when unknown
+	// dir (nsRoot only): the directory above the project depth that the
+	// place belongs to: the directory itself, or the parent of an inode
+	// placed in it (grants.go).
+	dir uint64
 }
 
 type memoEnt struct {

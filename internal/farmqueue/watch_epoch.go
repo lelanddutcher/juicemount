@@ -27,7 +27,12 @@ func coverageMembersKey(parentID string) string {
 // WatchEpoch is the nonexpiring custody record for one logical mount root.
 // The legacy cursor is deliberately ignored until this v2 record exists.
 type WatchEpoch struct {
-	Cursor     time.Time
+	Cursor time.Time
+	// PrevCursor is the cursor the last committed epoch replaced, zero when
+	// unknown. Idle advances leave it alone, and an older worker never writes
+	// it, so a stale value only lowers the floor it sets. The backstop's
+	// clock-skew look-back stops here.
+	PrevCursor time.Time
 	Active     string
 	Cutoff     time.Time
 	Pending    int
@@ -64,6 +69,9 @@ func (c *Client) GetWatchEpoch(ctx context.Context, root string) (WatchEpoch, er
 	}
 	if state.Cursor, err = parseWatchTime(m["cursor"]); err != nil {
 		return WatchEpoch{}, fmt.Errorf("watch epoch cursor: %w", err)
+	}
+	if state.PrevCursor, err = parseWatchTime(m["prev_cursor"]); err != nil {
+		return WatchEpoch{}, fmt.Errorf("watch epoch previous cursor: %w", err)
 	}
 	if state.Cutoff, err = parseWatchTime(m["cutoff"]); err != nil {
 		return WatchEpoch{}, fmt.Errorf("watch epoch cutoff: %w", err)
@@ -162,6 +170,7 @@ for i = 1, tonumber(ARGV[4]) do
   local key = 4 + (i-1)*2
   local arg = 8 + (i-1)*4
   redis.call('LPUSH', KEYS[key+1], ARGV[arg-1])
+  redis.call('INCR', KEYS[key+1] .. ':seq')
   redis.call('HSET', KEYS[key],
     'id', ARGV[arg], 'status', 'queued', 'path', cjson.decode(ARGV[arg-1]).path,
     'kinds', ARGV[arg+1], 'producer', 'farm-watch-catchup',
@@ -203,6 +212,7 @@ if indexType ~= 'zset' and indexType ~= 'none' then
 end
 if not redis.call('LPOS', KEYS[3], ARGV[3]) then
   redis.call('LPUSH', KEYS[3], ARGV[3])
+  redis.call('INCR', KEYS[3] .. ':seq')
 end
 redis.call('HSET', KEYS[2], 'id', ARGV[2], 'status', 'queued',
   'path', ARGV[4], 'kinds', ARGV[5], 'producer', 'farm-watch-catchup',
@@ -275,7 +285,7 @@ for kind in string.gmatch(kinds, '([^,]+)') do
 end
 local cutoff = redis.call('HGET', KEYS[2], 'cutoff')
 if not cutoff or cutoff == '' then return redis.error_reply('watch commit has no cutoff') end
-local rootUpdates = {'cursor', cutoff, 'active_epoch', '',
+local rootUpdates = {'prev_cursor', redis.call('HGET', KEYS[2], 'cursor') or '', 'cursor', cutoff, 'active_epoch', '',
   'status', 'complete', 'last_error', '', 'next_retry_at', '', 'pending', '0'}
 for kind in string.gmatch(kinds, '([^,]+)') do
   table.insert(rootUpdates, 'committed:watch-v2-' .. ARGV[2] .. '-' .. kind)
@@ -406,6 +416,7 @@ if queueType ~= 'list' and queueType ~= 'none' then
   return redis.error_reply('invalid tracked retry lane')
 end
 redis.call('LPUSH', KEYS[3], raw)
+redis.call('INCR', KEYS[3] .. ':seq')
 redis.call('HSET', KEYS[1], 'status', 'queued', 'next_retry_at', '')
 redis.call('ZREM', KEYS[2], ARGV[1])
 redis.call('HSET', KEYS[4], 'status', 'planning', 'next_retry_at', '')

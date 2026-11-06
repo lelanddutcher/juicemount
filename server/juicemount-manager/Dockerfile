@@ -14,7 +14,7 @@
 # ----- Stage 1: builder -----
 ARG JM_VERSION
 ARG JM_COMMIT
-FROM golang:1.26.9-alpine AS builder
+FROM golang:1.26.10-alpine AS builder
 ARG JM_VERSION
 ARG JM_COMMIT
 
@@ -33,10 +33,12 @@ RUN go mod download
 COPY . .
 
 # CGO not required (no sqlite, no FUSE in this binary). Fully static.
+# The JuiceFS metadata client (smart folders in standalone mode) speaks Redis
+# only: the tags drop the other metadata engines, which sqlite would need CGO.
 # No cache mounts — stale Go build cache served old binaries even with
 # --no-cache (BuildKit cache mounts persist independently of layer cache).
 RUN CGO_ENABLED=0 GOOS=linux \
-    go build -ldflags="-s -w -X github.com/lelanddutcher/juicemount/internal/version.Version=${JM_VERSION} -X github.com/lelanddutcher/juicemount/internal/version.Commit=${JM_COMMIT}" \
+    go build -tags nosqlite,nomysql,nopg,notikv,nobadger,noetcd -ldflags="-s -w -X github.com/lelanddutcher/juicemount/internal/version.Version=${JM_VERSION} -X github.com/lelanddutcher/juicemount/internal/version.Commit=${JM_COMMIT}" \
       -o /out/juicemount-manager ./cmd/juicemount-manager
 
 # ----- Stage 2: runtime -----

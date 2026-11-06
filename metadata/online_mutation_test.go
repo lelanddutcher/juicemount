@@ -238,7 +238,9 @@ func TestOnlineMutationCompletionFailuresRetainIntentAndMirror(t *testing.T) {
 				_, err = conn.ExecContext(t.Context(), `PRAGMA busy_timeout=1`)
 				conn.Close()
 				if err == nil {
-					other, err = sql.Open("sqlite", file+"?_txlock=immediate")
+					// The lock holder waits out the store's own transient writers
+					// (busy_timeout); only the store's completion must hit SQLITE_BUSY.
+					other, err = sql.Open("sqlite", file+"?_txlock=immediate&_pragma=busy_timeout(10000)")
 				}
 				if err == nil {
 					lock, err = other.Begin()

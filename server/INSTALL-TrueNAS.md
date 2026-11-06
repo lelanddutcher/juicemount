@@ -135,7 +135,9 @@ Embedded Headscale remains an advanced, explicit option for operators who run
 its public HTTPS control plane. Preserve any existing Headscale state directory
 when moving to the system private route; disabling the embedded service does
 not require deleting paired identities. The default 0.5 release manifest does
-not publish a Headscale listener or require a Headscale URL. Do not enable
+not publish a Headscale listener or require a Headscale URL. To enable it,
+render `server/docker-compose.link.yml` on top of the canonical compose; its
+header lists the ports it publishes and what it exposes. Do not enable
 `JM_NET_ALLOW_INSECURE` or `JM_NET_ALLOW_LAN_ONLY` in a release deployment.
 
 ### The RESP proxy (H-8B)

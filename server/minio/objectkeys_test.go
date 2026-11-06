@@ -45,8 +45,11 @@ func allowedActions(t *testing.T, p policyDoc) map[string][]string {
 	t.Helper()
 	out := map[string][]string{}
 	for _, s := range p.Statement {
+		if s.Effect == "Deny" {
+			continue // deniedActions
+		}
 		if s.Effect != "Allow" {
-			t.Fatalf("unexpected effect %q: these policies are allow-lists only", s.Effect)
+			t.Fatalf("unexpected effect %q", s.Effect)
 		}
 		if len(s.Condition) != 0 {
 			t.Fatalf("unexpected condition %v", s.Condition)
@@ -56,6 +59,32 @@ func allowedActions(t *testing.T, p policyDoc) map[string][]string {
 		}
 	}
 	return out
+}
+
+func deniedActions(p policyDoc) map[string]bool {
+	out := map[string]bool{}
+	for _, s := range p.Statement {
+		if s.Effect == "Deny" && len(s.Resource) == 0 && len(s.Condition) == 0 {
+			for _, a := range s.Action {
+				out[a] = true
+			}
+		}
+	}
+	return out
+}
+
+// MinIO (the pinned release) lets a user create service accounts for itself
+// and set its own secret unless its policy explicitly denies it
+// (AddServiceAccount and AddUser check only for a deny when the target is
+// the caller or its parent). A service account made with jm-client, or with
+// a per-Mac key (parent jm-macs, same policy), would outlive a rotation.
+func TestClientPolicyDeniesSelfCredentials(t *testing.T) {
+	denied := deniedActions(loadPolicy(t, "jm-client-policy.json"))
+	for _, a := range []string{"admin:CreateServiceAccount", "admin:CreateUser"} {
+		if !denied[a] {
+			t.Errorf("jm-client policy does not deny %s", a)
+		}
+	}
 }
 
 // The S3 calls juicefs 1.3.1 made against a recording S3 endpoint
@@ -130,6 +159,20 @@ printf '%s\n' "$*" >> "$st/argv"
 json=0
 [ "$1" = --json ] && { json=1; shift; }
 case "$1 $2 $3" in
+"mb --ignore-existing jmkeys/zpool")
+  [ "$json" = 1 ] || exit 8
+  case "${FAKE_MC_BUCKET_RESULT:-success}" in
+  denied) echo '{"status":"error","error":{"message":"Access Denied"}}'; exit 1 ;;
+  error-zero) echo '{"status":"error","error":{"message":"not ready"}}'; exit 0 ;;
+  wrong-bucket) echo '{"status":"success","bucket":"jmkeys/other","region":""}'; exit 0 ;;
+  malformed) echo '{"status":"success","bucket":"jmkeys/zpool","region":""'; exit 0 ;;
+  extra-error) printf '%s\n' '{"status":"success","bucket":"jmkeys/zpool","region":""}' '{"status":"error"}'; exit 0 ;;
+  duplicate-status) echo '{"status":"error","status":"success","bucket":"jmkeys/zpool","region":""}'; exit 0 ;;
+  empty) exit 0 ;;
+  esac
+  # An existing bucket's bytes must never be truncated by provisioning.
+  [ -f "$st/bucket.zpool" ] || printf '%s' 'fresh bucket' > "$st/bucket.zpool"
+  printf '{\n "status": "success",\n "bucket": "jmkeys/zpool",\n "region": ""\n}\n' ;;
 "admin policy create") cp "$6" "$st/policy.$5" ;;
 "admin user add")
   [ -n "$6" ] && { echo "secret on argv" >&2; exit 8; }
@@ -274,6 +317,64 @@ func TestProvisionCreatesExactlyTwoUsersIdempotently(t *testing.T) {
 	assertPrivateMCConfigRetired(t, state)
 	if strings.Contains(argv, "juicefs") || strings.Contains(argv, "config") {
 		t.Errorf("provisioning touched the volume setting:\n%s", argv)
+	}
+}
+
+// This is setup before restricted-role format, not a new privilege for either
+// role. The original script had no mb call, so the fresh case detects the gap.
+func TestProvisionEnsuresFixedBucketBeforeUsers(t *testing.T) {
+	for _, existing := range []bool{false, true} {
+		name := "fresh"
+		if existing {
+			name = "existing"
+		}
+		t.Run(name, func(t *testing.T) {
+			state := t.TempDir()
+			bucket := filepath.Join(state, "bucket.zpool")
+			want := "fresh bucket"
+			if existing {
+				want = "existing objects must remain"
+				if err := os.WriteFile(bucket, []byte(want), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for run := 0; run < 2; run++ {
+				out, err := runProvision(t, state)
+				if err != nil {
+					t.Fatalf("run %d: %v\n%s", run, err, out)
+				}
+				got, err := os.ReadFile(bucket)
+				if err != nil || string(got) != want {
+					t.Fatalf("bucket bytes = %q, %v; want %q", got, err, want)
+				}
+			}
+			argv := readOpt(filepath.Join(state, "argv"))
+			call := "--json mb --ignore-existing jmkeys/zpool\n"
+			if !strings.HasPrefix(argv, call) || strings.Count(argv, call) != 2 {
+				t.Fatalf("fixed bucket was not ensured first on both runs: %s", argv)
+			}
+			assertPrivateMCConfigRetired(t, state)
+		})
+	}
+}
+
+func TestProvisionRefusesUnverifiedBucketBeforeUsers(t *testing.T) {
+	for _, result := range []string{"denied", "error-zero", "wrong-bucket", "malformed", "extra-error", "duplicate-status", "empty"} {
+		t.Run(result, func(t *testing.T) {
+			state := t.TempDir()
+			out, err := runProvision(t, state, "FAKE_MC_BUCKET_RESULT="+result)
+			if err == nil || !strings.Contains(out, "zpool bucket") {
+				t.Fatalf("unverified bucket accepted: %v\n%s", err, out)
+			}
+			argv := readOpt(filepath.Join(state, "argv"))
+			if argv != "--json mb --ignore-existing jmkeys/zpool\n" {
+				t.Fatalf("continued after unverified bucket: %s", argv)
+			}
+			if _, err := os.Stat(filepath.Join(state, "user.jm-gc")); !os.IsNotExist(err) {
+				t.Fatalf("restricted user created before bucket proof: %v", err)
+			}
+			assertPrivateMCConfigRetired(t, state)
+		})
 	}
 }
 
@@ -628,5 +729,41 @@ func TestProvisionRefusesKeyAdminPolicyWithS3(t *testing.T) {
 	if err != nil || !strings.Contains(out, "grants an S3 or wildcard action") ||
 		strings.Contains(readOpt(filepath.Join(state, "argv")), "jm-keyadmin") {
 		t.Fatalf("err=%v out=%s", err, out)
+	}
+}
+
+// A jm-client policy without the self-credential deny is refused before any
+// mc call: a client could otherwise mint a credential that survives a
+// rotation of the shared secret.
+func TestProvisionRefusesClientPolicyWithoutSelfDeny(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "jm-gc-policy.json"), []byte(mustRead(t, "jm-gc-policy.json")), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	good := mustRead(t, "jm-client-policy.json")
+	for name, bad := range map[string]string{
+		"no CreateServiceAccount": strings.Replace(good, `"admin:CreateServiceAccount"`, `"admin:ListServiceAccounts"`, 1),
+		"no CreateUser":           strings.Replace(good, `"admin:CreateUser"`, `"admin:ListServiceAccounts"`, 1),
+		// The actions present, but in an Allow statement (substring-only
+		// checks would pass this).
+		"allow, not deny": strings.Replace(good, `"Effect": "Deny"`, `"Effect": "Allow"`, 1),
+		// A resource narrows the deny.
+		"narrowed": strings.Replace(good, `"admin:CreateUser"
+      ]`, `"admin:CreateUser"
+      ],
+      "Resource": ["arn:aws:s3:::nothing"]`, 1),
+	} {
+		if bad == good {
+			t.Fatalf("%s: the fixture did not change the policy", name)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "jm-client-policy.json"), []byte(bad), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		state := t.TempDir()
+		out, err := runProvision(t, state, "JM_MINIO_POLICY_DIR="+dir)
+		if err == nil || !strings.Contains(out, "does not deny admin:CreateServiceAccount and admin:CreateUser") ||
+			readOpt(filepath.Join(state, "argv")) != "" {
+			t.Fatalf("%s: err=%v out=%s argv=%q", name, err, out, readOpt(filepath.Join(state, "argv")))
+		}
 	}
 }

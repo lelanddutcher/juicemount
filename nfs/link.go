@@ -10,10 +10,13 @@ package nfs
 // juicefs process use the host network stack, so they cannot dial a tailnet
 // route directly. Link therefore exposes short-lived loopback TCP proxies:
 // local clients dial 127.0.0.1 and the proxy's outbound leg dials through
-// tsnet. The NAS node advertises the existing LAN subnet, so the original
-// Redis and S3 endpoint addresses remain the route targets.
+// tsnet. The NAS node either serves the JuiceMount ports on its own tailnet
+// address (the default; the outbound leg keeps the endpoint's port and swaps
+// the host) or advertises the LAN subnet (legacy), where the original Redis
+// and S3 endpoint addresses remain the route targets.
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -31,6 +34,7 @@ import (
 	"time"
 
 	"github.com/lelanddutcher/juicemount/internal/jmlog"
+	"github.com/lelanddutcher/juicemount/internal/respproxy"
 
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnstate"
@@ -41,6 +45,7 @@ import (
 type LinkNode struct {
 	srv             *tsnet.Server
 	mu              sync.Mutex
+	peerStatus      peerStatusCache
 	hostname        string
 	recoverNoState  linkRecoveryFunc
 	proxies         []*tcpProxy
@@ -666,9 +671,9 @@ func (l *LinkNode) DialContext(ctx context.Context, network, address string) (ne
 	// dial the resolved address from that plan.
 	dialer := s.Sys().Dialer.Get()
 	planned, err := waitForTailscaleDialPlan(ctx, network, address,
-		func(ctx context.Context, network, address string) (netip.AddrPort, bool, error) {
-			return dialer.UserDialPlan(ctx, network, address)
-		})
+		linkDialPlanner(dialer.UserDialPlan, func(ctx context.Context, address string) (netip.AddrPort, bool) {
+			return l.nasServiceDialTarget(ctx, s, address)
+		}))
 	if err != nil {
 		return nil, err
 	}
@@ -681,6 +686,73 @@ func (l *LinkNode) DialContext(ctx context.Context, network, address string) (ne
 		return nil, fmt.Errorf("link: refused non-tailnet connection to %s", address)
 	}
 	return conn, nil
+}
+
+// linkDialPlanner plans a Link dial. A NAS that serves the JuiceMount ports
+// on its own tailnet address (an online tag:jm-nas peer: service exposure)
+// is reached there, on the same port, ahead of any route. The NAS node never
+// needs a route for these ports, and a route from another node that covers
+// the NAS's LAN address (approved by mistake, or by someone who should not)
+// would otherwise carry the volume's traffic, Redis AUTH included, to that
+// node. Without such a peer online the dial follows the tailnet route
+// (subnet exposure, or a stale tagged record of a reset NAS node).
+func linkDialPlanner(route tailscaleDialPlanner, service func(context.Context, string) (netip.AddrPort, bool)) tailscaleDialPlanner {
+	return func(ctx context.Context, network, address string) (netip.AddrPort, bool, error) {
+		if target, ok := service(ctx, address); ok {
+			return target, true, nil
+		}
+		return route(ctx, network, address)
+	}
+}
+
+func (l *LinkNode) nasServiceDialTarget(ctx context.Context, s *tsnet.Server, address string) (netip.AddrPort, bool) {
+	status := l.peerStatus.get(ctx, s, func(ctx context.Context) (*ipnstate.Status, error) {
+		lc, err := s.LocalClient()
+		if err != nil {
+			return nil, err
+		}
+		return lc.Status(ctx)
+	})
+	if status == nil {
+		return netip.AddrPort{}, false
+	}
+	return linkServiceDialTarget(status, address)
+}
+
+// linkPeerStatusTTL is how long the dial path reuses a peer status. Every
+// dial attempt consults it, every 100 ms while a dial waits for a route.
+const linkPeerStatusTTL = time.Second
+
+// peerStatusCache keeps one tsnet peer status for linkPeerStatusTTL. The
+// status is shared read-only between callers. A fetch error is not cached.
+type peerStatusCache struct {
+	mu     sync.Mutex
+	owner  any // the tsnet server the status came from
+	status *ipnstate.Status
+	at     time.Time
+	now    func() time.Time // tests
+}
+
+func (c *peerStatusCache) get(ctx context.Context, owner any, fetch func(context.Context) (*ipnstate.Status, error)) *ipnstate.Status {
+	now := time.Now
+	if c.now != nil {
+		now = c.now
+	}
+	c.mu.Lock()
+	if c.status != nil && c.owner == owner && now().Sub(c.at) < linkPeerStatusTTL {
+		st := c.status
+		c.mu.Unlock()
+		return st
+	}
+	c.mu.Unlock()
+	st, err := fetch(ctx)
+	if err != nil {
+		return nil
+	}
+	c.mu.Lock()
+	c.owner, c.status, c.at = owner, st, now()
+	c.mu.Unlock()
+	return st
 }
 
 const (
@@ -1163,6 +1235,7 @@ func (p *tcpProxy) forward(local net.Conn) {
 	localWriter := io.Writer(local)
 	var watchdogStop chan struct{}
 	var responseWatchdogStop chan struct{}
+	var responseActivity *proxyResponseActivity
 	if p.idleTimeout > 0 {
 		// tsnet connections can remain blocked past a socket deadline while a
 		// userspace path is wedged. Track byte-level progress and close both legs
@@ -1180,14 +1253,21 @@ func (p *tcpProxy) forward(local net.Conn) {
 	}
 	if p.responseTimeout > 0 {
 		activity := &proxyResponseActivity{}
+		responseActivity = activity
 		localReader = &requestActivityReader{Reader: localReader, activity: activity}
-		remoteReader = &responseActivityReader{Reader: remoteReader, activity: activity}
 		responseWatchdogStop = make(chan struct{})
 		go closeProxyAfterResponseStall(local, remote, activity, p.responseTimeout, responseWatchdogStop)
 	}
 	done := make(chan struct{}, 2)
 	go func() { _, _ = io.Copy(remoteWriter, localReader); done <- struct{}{} }()
-	go func() { _, _ = io.Copy(localWriter, remoteReader); done <- struct{}{} }()
+	go func() {
+		if responseActivity != nil {
+			_ = copyRedisProxyResponses(localWriter, remoteReader, responseActivity)
+		} else {
+			_, _ = io.Copy(localWriter, remoteReader)
+		}
+		done <- struct{}{}
+	}()
 	<-done
 	if watchdogStop != nil {
 		close(watchdogStop)
@@ -1202,11 +1282,15 @@ func (p *tcpProxy) forward(local net.Conn) {
 
 // proxyResponseActivity uses monotonically increasing request generations so
 // a backend byte acknowledges precisely the request bytes observed before it.
-// An idle connection has requestGen == responseGen and is never timed out.
+// Completed idle replies remain unarmed. Separately, an incomplete RESP frame
+// must continue making backend progress, regardless of new client requests.
 type proxyResponseActivity struct {
-	requestGen  atomic.Uint64
-	responseGen atomic.Uint64
-	lastRequest atomic.Int64
+	requestGen   atomic.Uint64
+	responseGen  atomic.Uint64
+	lastRequest  atomic.Int64
+	lastResponse atomic.Int64
+	incomplete   atomic.Bool
+	forwarding   atomic.Bool
 }
 
 type requestActivityReader struct {
@@ -1232,8 +1316,45 @@ func (r *responseActivityReader) Read(p []byte) (int, error) {
 	n, err := r.Reader.Read(p)
 	if n > 0 {
 		r.activity.responseGen.Store(r.activity.requestGen.Load())
+		r.activity.lastResponse.Store(time.Now().UnixNano())
+		r.activity.incomplete.Store(true)
 	}
 	return n, err
+}
+
+type responseForwardWriter struct {
+	io.Writer
+	activity *proxyResponseActivity
+}
+
+func (w *responseForwardWriter) Write(p []byte) (int, error) {
+	w.activity.forwarding.Store(true)
+	n, err := w.Writer.Write(p)
+	// Waiting for the local consumer is not stalled backend progress. Give
+	// the next backend read a fresh interval after client backpressure ends.
+	w.activity.lastResponse.Store(time.Now().UnixNano())
+	w.activity.forwarding.Store(false)
+	return n, err
+}
+
+func copyRedisProxyResponses(dst io.Writer, src io.Reader, activity *proxyResponseActivity) error {
+	observed := &responseActivityReader{Reader: src, activity: activity}
+	forwarded := &responseForwardWriter{Writer: dst, activity: activity}
+	// Tee forwards exact bytes immediately; CopyFrame consumes only a bounded
+	// reader/writer window and streams bulk bodies to discard, never retaining
+	// an entire response. Reuse its existing fixed-length RESP2/RESP3 grammar.
+	r := bufio.NewReader(io.TeeReader(observed, forwarded))
+	w := bufio.NewWriter(io.Discard)
+	for {
+		if _, err := respproxy.CopyFrame(r, w); err != nil {
+			return err
+		}
+		// The same read may contain a complete reply and a partial next frame.
+		// Do not disarm until all bytes already observed have been consumed.
+		if r.Buffered() == 0 {
+			activity.incomplete.Store(false)
+		}
+	}
 }
 
 type proxyActivity struct {
@@ -1311,6 +1432,14 @@ func closeProxyAfterResponseStall(local, remote net.Conn, activity *proxyRespons
 		case <-stop:
 			return
 		case now := <-ticker.C:
+			if activity.forwarding.Load() {
+				continue
+			}
+			if activity.incomplete.Load() && now.Sub(time.Unix(0, activity.lastResponse.Load())) >= timeout {
+				_ = local.Close()
+				_ = remote.Close()
+				return
+			}
 			requestGen := activity.requestGen.Load()
 			if requestGen == 0 || activity.responseGen.Load() >= requestGen {
 				continue

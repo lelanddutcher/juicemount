@@ -65,6 +65,15 @@ type DerivRow struct {
 	// "" == not from a sidecar, which is correct both for rows written directly by
 	// the farm/register route and for legacy rows predating the column.
 	Provenance string `json:"-"`
+	// PendingAttempts counts consecutive environment faults behind a local
+	// "pending" row for this producer generation, so a fault that never clears
+	// becomes a failure for the build instead of a decode on every sweep.
+	// Local-only (json:"-"), persisted in the `extra` column like the
+	// kind-specific fields; a pending row is never mirrored to a manifest.
+	PendingAttempts int `json:"-"`
+	// PendingSince is when (unix seconds) the first of those faults was
+	// recorded; local-only like PendingAttempts.
+	PendingSince int64 `json:"-"`
 	// Filmstrip is the sprite-sheet geometry (JM-16), present ONLY for
 	// kind=="filmstrip". Persisted in the row's kind-specific `extra` JSON
 	// column. omitempty so every other kind omits it on the wire.
@@ -621,6 +630,9 @@ type extraEnvelope struct {
 	Width       *int          `json:"width,omitempty"`
 	Height      *int          `json:"height,omitempty"`
 	BitrateBPS  *int64        `json:"bitrate_bps,omitempty"`
+	// PendingAttempts is DerivRow.PendingAttempts; it applies to any kind.
+	PendingAttempts *int   `json:"pending_attempts,omitempty"`
+	PendingSince    *int64 `json:"pending_since,omitempty"`
 }
 
 // dimensionedKinds are the kinds for which pixel width/height are meaningful.
@@ -652,6 +664,16 @@ func extraJSON(d DerivRow) any {
 		env.Width, env.Height, env.BitrateBPS = d.Width, d.Height, d.BitrateBPS
 		has = true
 	}
+	if d.PendingAttempts > 0 {
+		attempts := d.PendingAttempts
+		env.PendingAttempts = &attempts
+		has = true
+	}
+	if d.PendingSince > 0 {
+		since := d.PendingSince
+		env.PendingSince = &since
+		has = true
+	}
 	if !has {
 		return nil
 	}
@@ -673,7 +695,13 @@ func decodeExtra(d *DerivRow, extra sql.NullString) {
 	var env extraEnvelope
 	if json.Unmarshal([]byte(extra.String), &env) == nil &&
 		(env.Filmstrip != nil || env.Codec != nil || env.CodecString != nil || env.BlobSize != nil ||
-			env.Width != nil || env.Height != nil || env.BitrateBPS != nil) {
+			env.Width != nil || env.Height != nil || env.BitrateBPS != nil || env.PendingAttempts != nil || env.PendingSince != nil) {
+		if env.PendingAttempts != nil {
+			d.PendingAttempts = *env.PendingAttempts
+		}
+		if env.PendingSince != nil {
+			d.PendingSince = *env.PendingSince
+		}
 		if d.Kind == "filmstrip" {
 			d.Filmstrip = env.Filmstrip
 		}

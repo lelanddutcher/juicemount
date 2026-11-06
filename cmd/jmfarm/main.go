@@ -1551,9 +1551,22 @@ func runQueue(cfg queueConfig) (exitCode int) {
 			} else if promoted > 0 {
 				fmt.Printf("jmfarm queue: promoted %d temporary CPU fallback job(s) to verified hardware\n", promoted)
 			}
+			// The Manager also prunes on its status refresh, but only while
+			// someone has the page open. Workers keep the shared sweep moving;
+			// a lock lets one process sweep per interval.
+			if _, err := q.PruneExpiredJobIndex(ctx, jobIndexPruneBatch); err != nil {
+				fmt.Fprintf(os.Stderr, "jmfarm queue: job-index prune: %v\n", err)
+			}
 			nextReap = time.Now().Add(15 * time.Second)
 		}
 		if nodeDisabled.Load() || nodePaused.Load() || nodeDrain.Load() || ctl.Paused || !storagePermitReady || worker.AdmissionBlocked {
+			// A claim that failed just before may have taken a job; while this
+			// worker is not claiming, give it back rather than hold it.
+			if released, err := q.ReleaseUnconfirmedClaim(ctx, worker); err != nil {
+				fmt.Fprintf(os.Stderr, "jmfarm queue: release unconfirmed claim: %v\n", err)
+			} else if released {
+				fmt.Println("jmfarm queue: released a job claimed while its reply was lost")
+			}
 			select {
 			case <-ctx.Done():
 			case <-time.After(time.Second):
@@ -1745,20 +1758,9 @@ func runQueue(cfg queueConfig) (exitCode int) {
 				leaseGuard.Stop()
 				continue
 			}
-			var finishErr error
-			if job.TrackedEpoch != "" {
-				finishErr = q.CompleteClaim(context.Background(), claim, farmqueue.StatusCanceled,
-					job.ProcessedOffset+processed, failed, "canceled by operator")
-			} else {
-				finishErr = q.MarkCanceled(context.Background(), job.ID, job.ProcessedOffset+processed, failed)
-			}
-			if err := finishErr; err != nil {
-				fmt.Fprintf(os.Stderr, "jmfarm queue: mark-canceled %s: %v\n", job.ID, err)
-				leaseGuard.Stop()
-				return
-			}
-			if err := q.AckClaim(context.Background(), claim); err != nil {
-				fmt.Fprintf(os.Stderr, "jmfarm queue: ack canceled %s: %v\n", job.ID, err)
+			if err := publishClaimOutcome(context.Background(), q, claim, defaultClaimPublishRetry,
+				farmqueue.StatusCanceled, job.ProcessedOffset+processed, failed, "canceled by operator"); err != nil {
+				fmt.Fprintf(os.Stderr, "jmfarm queue: publish canceled %s: %v; %s\n", job.ID, err, claimPublishStopReason(err))
 				leaseGuard.Stop()
 				return
 			}
@@ -1790,18 +1792,13 @@ func runQueue(cfg queueConfig) (exitCode int) {
 			continue
 		}
 		if errors.Is(runErr, errJobDispatched) {
-			if job.TrackedEpoch == "" || job.ParentID != "" {
-				if err := q.MarkDispatched(context.Background(), job.ID); err != nil {
-					// Children are idempotently durable, but the parent receipt is our
-					// recovery proof until its truthful state is committed. Stop and let
-					// another worker replay the claim instead of acknowledging ambiguity.
-					fmt.Fprintf(os.Stderr, "jmfarm queue: mark-dispatched %s: %v; stopping with durable claim intact\n", job.ID, err)
-					leaseGuard.Stop()
-					return
-				}
-			}
-			if err := q.AckClaim(context.Background(), claim); err != nil {
-				fmt.Fprintf(os.Stderr, "jmfarm queue: ack dispatched parent %s: %v; stopping with durable claim intact\n", job.ID, err)
+			// Children are idempotently durable, but the parent receipt is our
+			// recovery proof until its truthful state is committed. If that cannot
+			// be published, stop and let another worker replay the claim instead
+			// of acknowledging ambiguity.
+			if err := publishClaimDispatched(context.Background(), q, claim, defaultClaimPublishRetry,
+				job.TrackedEpoch == "" || job.ParentID != ""); err != nil {
+				fmt.Fprintf(os.Stderr, "jmfarm queue: publish dispatched %s: %v; %s\n", job.ID, err, claimPublishStopReason(err))
 				leaseGuard.Stop()
 				return
 			}
@@ -1843,20 +1840,9 @@ func runQueue(cfg queueConfig) (exitCode int) {
 				// while leaving the global safety pause engaged. Requeueing an empty
 				// retry set would re-walk the directory and double-count freshness
 				// skips after the operator restores headroom.
-				var finishErr error
-				if job.TrackedEpoch != "" {
-					finishErr = q.CompleteClaim(context.Background(), claim, farmqueue.StatusDone,
-						job.ProcessedOffset+processed, failed, "")
-				} else {
-					finishErr = q.MarkDone(context.Background(), job.ID, job.ProcessedOffset+processed, failed)
-				}
-				if err := finishErr; err != nil {
-					fmt.Fprintf(os.Stderr, "jmfarm queue: mark storage-complete %s: %v; stopping with durable claim intact\n", job.ID, err)
-					leaseGuard.Stop()
-					return
-				}
-				if err := q.AckClaim(context.Background(), claim); err != nil {
-					fmt.Fprintf(os.Stderr, "jmfarm queue: ack storage-complete %s: %v; stopping with durable claim intact\n", job.ID, err)
+				if err := publishClaimOutcome(context.Background(), q, claim, defaultClaimPublishRetry,
+					farmqueue.StatusDone, job.ProcessedOffset+processed, failed, ""); err != nil {
+					fmt.Fprintf(os.Stderr, "jmfarm queue: publish storage-complete %s: %v; %s\n", job.ID, err, claimPublishStopReason(err))
 					leaseGuard.Stop()
 					return
 				}
@@ -1895,50 +1881,24 @@ func runQueue(cfg queueConfig) (exitCode int) {
 			leaseGuard.Stop()
 			continue
 		}
-		terminalWritten := false
+		// A failed or lost publication must not leave the job behind this live
+		// worker: the reaper skips legacy receipts while the heartbeat is fresh.
+		status, errMsg := farmqueue.StatusDone, ""
 		if runErr != nil {
 			fmt.Fprintf(os.Stderr, "jmfarm queue: job %s failed: %v\n", job.ID, runErr)
-			var finishErr error
-			if job.TrackedEpoch != "" {
-				finishErr = q.CompleteClaim(context.Background(), claim, farmqueue.StatusFailed,
-					job.ProcessedOffset+processed, failed, runErr.Error())
-			} else {
-				finishErr = q.MarkFailedWithCounts(context.Background(), job.ID, job.ProcessedOffset+processed, failed, runErr.Error())
-			}
-			if err := finishErr; err != nil {
-				fmt.Fprintf(os.Stderr, "jmfarm queue: mark-failed %s: %v\n", job.ID, err)
-			} else {
-				terminalWritten = true
-			}
-		} else {
-			var finishErr error
-			if job.TrackedEpoch != "" {
-				status := farmqueue.StatusDone
-				if failed > 0 && job.ProcessedOffset+processed == 0 {
-					status = farmqueue.StatusFailed
-				}
-				finishErr = q.CompleteClaim(context.Background(), claim, status,
-					job.ProcessedOffset+processed, failed, "")
-			} else {
-				finishErr = q.MarkDone(context.Background(), job.ID, job.ProcessedOffset+processed, failed)
-			}
-			if err := finishErr; err != nil {
-				fmt.Fprintf(os.Stderr, "jmfarm queue: mark-done %s: %v\n", job.ID, err)
-			} else {
-				terminalWritten = true
-			}
+			status, errMsg = farmqueue.StatusFailed, runErr.Error()
 		}
-		if terminalWritten {
-			if err := q.AckClaim(context.Background(), claim); err != nil {
-				fmt.Fprintf(os.Stderr, "jmfarm queue: ack %s: %v\n", job.ID, err)
-			} else {
-				state := "done"
-				if runErr != nil {
-					state = "failed"
-				}
-				_ = q.AppendWorkerLog(context.Background(), worker.ID, fmt.Sprintf("job %s %s processed=%d failed=%d", job.ID, state, job.ProcessedOffset+processed, failed))
-			}
+		if err := publishClaimOutcome(context.Background(), q, claim, defaultClaimPublishRetry,
+			status, job.ProcessedOffset+processed, failed, errMsg); err != nil {
+			fmt.Fprintf(os.Stderr, "jmfarm queue: publish %s: %v; %s\n", job.ID, err, claimPublishStopReason(err))
+			leaseGuard.Stop()
+			return
 		}
+		state := "done"
+		if runErr != nil {
+			state = "failed"
+		}
+		_ = q.AppendWorkerLog(context.Background(), worker.ID, fmt.Sprintf("job %s %s processed=%d failed=%d", job.ID, state, job.ProcessedOffset+processed, failed))
 		leaseGuard.Stop()
 	}
 
@@ -2364,6 +2324,10 @@ func targetShardSize(job farmqueue.Job) int {
 }
 
 const renderHardwareRetries = 1
+
+// jobIndexPruneBatch bounds the job-index members one sweep inspects, in a
+// single cached script call. Only one process farm-wide sweeps per interval.
+const jobIndexPruneBatch = 100
 
 // renderFailureDisposition keeps CPU fallback visible and deliberate. A
 // transient accelerator admission failure first gets one newly routed hardware

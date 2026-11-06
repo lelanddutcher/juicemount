@@ -2,6 +2,8 @@ package farmqueue
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"sort"
@@ -65,7 +67,10 @@ func (c *Client) enqueuePlannedChildren(ctx context.Context, planner Claim, chil
 // EnqueueTargetShards replaces one directory-sized ownership unit with
 // deterministic, bounded children. It is idempotent across worker crashes:
 // replaying the durable parent claim observes each existing child status and
-// publishes only children that were not committed before the crash.
+// publishes only children that were not committed before the crash. A legacy
+// child is named by its targets, so a replay whose walk found different files
+// publishes every changed shard; targets shared with an earlier shard may run
+// twice, which the generators' freshness gates make cheap.
 //
 // Render children retain the verified backend but release the exact worker
 // pin, allowing any online worker with that same proven encoder/transcript
@@ -140,6 +145,7 @@ func newTargetShards(parent Job, targets []string, maxTargets int) ([]Job, error
 	if parent.TrackedEpoch != "" {
 		enqueuedAt = parent.EnqueuedAt
 	}
+	seenIDs := make(map[string]bool, count)
 	for i, start := 0, 0; start < len(targets); i, start = i+1, start+maxTargets {
 		end := start + maxTargets
 		if end > len(targets) {
@@ -147,6 +153,20 @@ func newTargetShards(parent Job, targets []string, maxTargets int) ([]Job, error
 		}
 		child := parent
 		child.ID = fmt.Sprintf("%s-shard-%04d", parent.ID, i+1)
+		if parent.TrackedEpoch == "" {
+			// A legacy parent that crashes before it is marked dispatched is
+			// replayed, re-walks its directory, and publishes only the children
+			// whose status hash is missing. An index ID let a file added between
+			// the two walks shift every later target into an existing ID, so it
+			// was never queued. Naming a child by its targets makes a replay
+			// queue exactly the shards whose contents changed.
+			child.ID = fmt.Sprintf("%s-shard-%s", parent.ID, targetShardDigest(targets[start:end]))
+			if seenIDs[child.ID] {
+				// Only a target list with duplicates repeats a shard.
+				child.ID = fmt.Sprintf("%s-%04d", child.ID, i+1)
+			}
+			seenIDs[child.ID] = true
+		}
 		child.ParentID = parent.ID
 		child.EnqueuedAt = enqueuedAt
 		// Preserve both delivery history and the parent's hardware-failure budget.
@@ -181,6 +201,16 @@ func newTargetShards(parent Job, targets []string, maxTargets int) ([]Job, error
 		children = append(children, child)
 	}
 	return children, nil
+}
+
+// targetShardDigest names a legacy shard by its exact, ordered target list.
+func targetShardDigest(targets []string) string {
+	h := sha256.New()
+	for _, target := range targets {
+		_, _ = h.Write([]byte(target))
+		_, _ = h.Write([]byte{0})
+	}
+	return hex.EncodeToString(h.Sum(nil)[:8])
 }
 
 func (c *Client) enqueueTargetShardsAtomic(ctx context.Context, planner Claim, children []Job) (int, error) {
@@ -233,8 +263,9 @@ func (c *Client) enqueueTargetShardsAtomic(ctx context.Context, planner Claim, c
 						continue
 					}
 					pipe.LPush(ctx, QueueKeyFor(&child), raws[i])
+					pipe.Incr(ctx, LaneSeqKey(QueueKeyFor(&child)))
+					// No TTL while queued: retention starts at the terminal write.
 					pipe.HSet(ctx, statusKeys[i], statuses[i].toMap())
-					pipe.Expire(ctx, statusKeys[i], JobTTL)
 					pipe.ZAdd(ctx, JobIndexKey, redis.Z{Score: float64(score + int64(i)), Member: child.ID})
 				}
 				return nil
@@ -453,6 +484,7 @@ for i = 1, tonumber(ARGV[5]) do
     if status == 'queued' then
       if fresh or not redis.call('LPOS', route, payload) then
         redis.call('LPUSH', route, payload)
+        redis.call('INCR', route .. ':seq')
       end
     end
     redis.call('HSET', KEYS[key], 'published', '1')

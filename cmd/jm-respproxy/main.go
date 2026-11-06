@@ -26,6 +26,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/lelanddutcher/juicemount/internal/auditlog"
 	"github.com/lelanddutcher/juicemount/internal/respproxy"
 )
 
@@ -43,6 +44,56 @@ type fileConfig struct {
 	TrackAnchors        bool   `json:"track_anchors"`
 	StageBirth          bool   `json:"stage_birth"`
 	ReloadHandshake     bool   `json:"reload_handshake"`
+	// AuditDir holds the per-person mutation log (internal/auditlog);
+	// empty = no log. The entrypoint sets <principals dir>/audit, which
+	// the Manager reads; the writer's health file is AuditDir + ".health".
+	AuditDir string `json:"audit_dir"`
+	// Audit: "auto" (or empty) opens the log lazily: nothing is written
+	// until the principals table names a person (or grants are in force).
+	// "on" logs from the start.
+	Audit string `json:"audit"`
+	// AuditRetainMB / AuditRetainDays bound the log (oldest segments are
+	// removed); 0 = the auditlog defaults, -1 = no limit.
+	AuditRetainMB   int64 `json:"audit_retain_mb"`
+	AuditRetainDays int64 `json:"audit_retain_days"`
+	// SmartFolderRoots names the Manager's smart-folder roots in the
+	// volume root: the manager principal may remove an empty view folder
+	// it created directly under one (internal/respproxy smartview.go).
+	// Absent or empty: none. They must be the roots the Manager runs; the
+	// entrypoint renders them from the Manager's variables.
+	SmartFolderRoots []string `json:"smart_folder_roots"`
+}
+
+// smartRoots resolves smart_folder_roots; invalid names are left out and
+// reported.
+func (fc fileConfig) smartRoots() ([]string, []error) {
+	return respproxy.CleanSmartRoots(fc.SmartFolderRoots)
+}
+
+// auditOptions maps the config to the audit writer's options.
+func (fc fileConfig) auditOptions() (auditlog.Options, error) {
+	o := auditlog.Options{HealthPath: fc.AuditDir + ".health"}
+	switch fc.Audit {
+	case "", "auto":
+		o.Lazy = true
+	case "on":
+	default:
+		return o, fmt.Errorf("audit must be \"auto\" or \"on\", not %q", fc.Audit)
+	}
+	switch {
+	case fc.AuditRetainMB < -1 || fc.AuditRetainDays < -1:
+		return o, fmt.Errorf("audit_retain_mb and audit_retain_days must be -1, 0 or positive")
+	case fc.AuditRetainMB == -1:
+		o.RetainBytes = -1
+	default:
+		o.RetainBytes = fc.AuditRetainMB << 20
+	}
+	if fc.AuditRetainDays == -1 {
+		o.RetainAge = -1
+	} else {
+		o.RetainAge = time.Duration(fc.AuditRetainDays) * 24 * time.Hour
+	}
+	return o, nil
 }
 
 // Resolve the same effective defaults used by the CLI before constructing a
@@ -119,6 +170,22 @@ func main() {
 	}
 	proxyCfg.Principals = ps
 	proxyCfg.UpstreamPassword = os.Getenv(fc.UpstreamPasswordEnv)
+	var audit *auditlog.Writer
+	if fc.AuditDir != "" {
+		// A log that cannot open does not stop the proxy: the writer starts
+		// failed and retries, and Mac writes are refused only while grants
+		// are in force (fail closed); otherwise they go ahead unlogged.
+		opts, err := fc.auditOptions()
+		if err != nil {
+			log.Fatalf("config %s: %v", *cfgPath, err)
+		}
+		audit, err = auditlog.Open(fc.AuditDir, opts)
+		if err != nil {
+			log.Printf("audit log %s unavailable (retrying): %v", fc.AuditDir, err)
+		}
+		defer audit.Close() // after the proxy joined: every outcome is queued
+		proxyCfg.Audit = audit
+	}
 	p, err := respproxy.New(proxyCfg)
 	if err != nil {
 		log.Fatal(err)
@@ -146,7 +213,11 @@ func main() {
 		closeJoined()
 		log.Fatal("proxy closed before lease engine startup")
 	}
-	leases = respproxy.NewLeaseEngine(respproxy.LeaseConfig{Side: p.Side(), VolumeDB: proxyCfg.VolumeDB})
+	smartRoots, badRoots := fc.smartRoots()
+	for _, err := range badRoots {
+		log.Printf("smart_folder_roots: left out: %v", err)
+	}
+	leases = respproxy.NewLeaseEngine(respproxy.LeaseConfig{Side: p.Side(), VolumeDB: proxyCfg.VolumeDB, SmartRoots: smartRoots})
 	err = leases.Start()
 	if err == nil {
 		p.SetPolicy(leases)
@@ -216,11 +287,14 @@ func main() {
 			return
 		}
 	}()
-	log.Printf("jm-respproxy: %s -> %s mode=%s principals=%d singleton=%v incarnation=%s",
-		fc.Listen, fc.Upstream, p.Mode(), ps.Len(), proxyCfg.Singleton, p.Incarnation())
+	log.Printf("jm-respproxy: %s -> %s mode=%s principals=%d singleton=%v incarnation=%s smart_folder_roots=%q",
+		fc.Listen, fc.Upstream, p.Mode(), ps.Len(), proxyCfg.Singleton, p.Incarnation(), smartRoots)
 	err = p.Serve(ln)
 	closeJoined()
 	<-controlDone
+	if audit != nil {
+		audit.Close() // log.Fatalf below skips deferred calls
+	}
 	if err != nil {
 		log.Fatalf("serve: %v", err)
 	}

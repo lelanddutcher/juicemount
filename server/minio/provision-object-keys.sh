@@ -4,8 +4,10 @@
 # current secret, and the end state is verified, not assumed.
 #
 #   jm-client  jm-client-policy.json  GetObject, PutObject, ListBucket.
-#              No DeleteObject, no bucket or admin actions. Macs and the
-#              farm get this key.
+#              No DeleteObject, no bucket or admin actions, and an explicit
+#              deny of creating service accounts and of changing its own
+#              secret (MinIO allows both for oneself unless denied). Macs
+#              and the farm get this key; per-Mac keys inherit the policy.
 #   jm-gc      jm-gc-policy.json      adds DeleteObject and multipart
 #              cleanup. Server bg mount and Manager only.
 #
@@ -104,6 +106,15 @@ for f in jm-client-policy.json jm-gc-policy.json; do
 done
 client_policy="$(<"$POLICY_DIR/jm-client-policy.json")"
 [[ "$client_policy" != *Delete* ]] || die "jm-client-policy.json grants a Delete action; refusing"
+# MinIO lets any user mint service accounts for itself, and set its own
+# secret, unless its policy explicitly denies it. Such a credential would
+# outlive a rotation of the user's secret, so the deny must be there.
+# Structural, without jq (the minio image has none): with all whitespace
+# removed, the policy must hold this exact statement, so both actions sit in
+# a Deny statement with no resource or condition to narrow it.
+client_deny='{"Sid":"JuiceMountClientNoSelfCredentials","Effect":"Deny","Action":["admin:CreateServiceAccount","admin:CreateUser"]}'
+[[ "${client_policy//[[:space:]]/}" == *"$client_deny"* ]] ||
+	die "jm-client-policy.json does not deny admin:CreateServiceAccount and admin:CreateUser in one plain Deny statement; refusing"
 # per_mac_check: the per-Mac inputs, before any mc call. Prints why not.
 per_mac_check() {
 	[[ "$KEYADMIN_SK" =~ ^[A-Za-z0-9]{32,40}$ ]] ||
@@ -229,6 +240,22 @@ ensure_parent() {
 	verify_user "$ak" "$pol"
 }
 
+# The restricted format credential cannot create buckets. Bootstrap only the
+# fixed policy bucket with the root alias; --ignore-existing preserves its data.
+# mc's makeBucketMessage is status/bucket/region (region is empty). Match the
+# entire response: exit 0 alone, a success substring, or another target is not
+# proof. Keep errors private: mc diagnostics may contain endpoint details.
+ensure_bucket() {
+	local reply success
+	reply="$("$MC" --json mb --ignore-existing "$ALIAS/zpool" 2>"$owned_config_dir/bucket.err")" ||
+		die "cannot ensure zpool bucket; check root access and storage availability before retrying setup"
+	success='^[[:space:]]*\{[[:space:]]*"status"[[:space:]]*:[[:space:]]*"success"[[:space:]]*,[[:space:]]*"bucket"[[:space:]]*:[[:space:]]*"jmkeys/zpool"[[:space:]]*,[[:space:]]*"region"[[:space:]]*:[[:space:]]*""[[:space:]]*\}[[:space:]]*$'
+	[[ "$reply" =~ $success ]] ||
+		die "zpool bucket was not verified by mc; check root access, storage readiness and supported mc version"
+	echo "[object-keys] zpool: bucket ready"
+}
+
+ensure_bucket
 ensure_user "$CLIENT_AK" CLIENT_SK jm-client
 ensure_user "$GC_AK" GC_SK jm-gc
 if [ "$PER_MAC" = 1 ]; then

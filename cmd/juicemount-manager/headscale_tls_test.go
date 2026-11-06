@@ -140,38 +140,44 @@ func TestEnsureConfigRefusesPersistedTransportDrift(t *testing.T) {
 	}
 }
 
-// T2.2 helpers: where the embedded NAS node dials coordination.
+// T2.2 helpers: where the embedded NAS node dials coordination. It runs in
+// the same process as Headscale, so it must use the in-container listener
+// even when a public URL is set: the public name needs router hairpin NAT.
 func TestNasNodeControlURL(t *testing.T) {
-	oldURL, oldCert := os.Getenv("JM_NET_SERVER_URL"), os.Getenv("JM_NET_TLS_CERT")
-	defer func() {
-		os.Setenv("JM_NET_SERVER_URL", oldURL)
-		os.Setenv("JM_NET_TLS_CERT", oldCert)
-	}()
-
-	os.Unsetenv("JM_NET_SERVER_URL")
-	os.Unsetenv("JM_NET_TLS_CERT")
+	t.Setenv("JM_NET_NAS_CONTROL_URL", "")
+	t.Setenv("JM_NET_SERVER_URL", "")
+	t.Setenv("JM_NET_TLS_CERT", "")
+	t.Setenv("JM_NET_TLS_KEY", "")
 	url, err := nasNodeControlURL()
 	if err != nil || url != "http://127.0.0.1:8091" {
 		t.Errorf("loopback fallback = (%q,%v), want loopback listener", url, err)
 	}
 
+	t.Setenv("JM_NET_SERVER_URL", "https://nas.example:30193")
+	url, err = nasNodeControlURL()
+	if err != nil || url != "http://127.0.0.1:8091" {
+		t.Errorf("plain listener with public URL = (%q,%v), want local listener", url, err)
+	}
+
 	// TLS on without an external URL must REFUSE: tsnet cannot verify a
 	// self-referenced certificate against 127.0.0.1.
-	os.Setenv("JM_NET_TLS_CERT", "/data/tls/c.pem")
+	t.Setenv("JM_NET_SERVER_URL", "")
+	t.Setenv("JM_NET_TLS_CERT", "/data/tls/c.pem")
 	if _, err := nasNodeControlURL(); err == nil {
 		t.Error("expected refusal when TLS configured but no external URL")
 	}
 
-	os.Setenv("JM_NET_SERVER_URL", "https://nas.example:30193")
+	// Headscale's own TLS certificate names the public host, so the node
+	// must use that name.
+	t.Setenv("JM_NET_SERVER_URL", "https://nas.example:30193")
 	url, err = nasNodeControlURL()
 	if err != nil || url != "https://nas.example:30193" {
 		t.Errorf("external URL preferred under TLS = (%q,%v)", url, err)
 	}
-}
 
-func TestLastKeyLineUsesFinalCLIValue(t *testing.T) {
-	output := "2026-08-25T12:00:00Z INFO minting key\nfirst unrelated line\ntskey-auth-final"
-	if got := lastKeyLine(output); got != "tskey-auth-final" {
-		t.Errorf("lastKeyLine = %q, want final key", got)
+	t.Setenv("JM_NET_NAS_CONTROL_URL", "https://nas.lan.example:8091/")
+	url, err = nasNodeControlURL()
+	if err != nil || url != "https://nas.lan.example:8091" {
+		t.Errorf("explicit node control URL = (%q,%v)", url, err)
 	}
 }

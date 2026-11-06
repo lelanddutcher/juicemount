@@ -5,6 +5,8 @@ import (
 	"context"
 	"errors"
 	"os"
+	"strings"
+	"unicode/utf8"
 
 	"github.com/go-git/go-billy/v5"
 	"github.com/willscott/go-nfs-client/nfs/xdr"
@@ -12,6 +14,49 @@ import (
 	"github.com/lelanddutcher/juicemount/internal/cache/pin"
 	"github.com/lelanddutcher/juicemount/internal/metrics"
 )
+
+// LookupAlias binds an original stored name, handle and local attributes in one
+// lookup-only resolution. It avoids the ordinary ToHandle synthetic/FUSE fallback
+// if the candidate disappears after enumeration. Mutations never use this API.
+type LookupAlias struct {
+	Name   string
+	Handle []byte
+	Info   os.FileInfo
+}
+
+type lookupAliasResolver interface {
+	ResolveLookupAlias(parent, name string) (*LookupAlias, error)
+}
+
+func unicodeLookupName(name string) bool {
+	return utf8.ValidString(name) && strings.IndexFunc(name, func(r rune) bool { return r > 127 }) >= 0 &&
+		!strings.ContainsAny(name, "/\x00") && name != "." && name != ".."
+}
+
+func lookupAliasResponse(alias *LookupAlias, dirPath []string, fs billy.Filesystem) ([]byte, error) {
+	writer := new(bytes.Buffer)
+	if err := xdr.Write(writer, uint32(NFSStatusOk)); err != nil {
+		return nil, err
+	}
+	if err := xdr.Write(writer, alias.Handle); err != nil {
+		return nil, err
+	}
+	if err := WritePostOpAttrs(writer, ToFileAttribute(alias.Info, fs.Join(append(append([]string(nil), dirPath...), alias.Name)...))); err != nil {
+		return nil, err
+	}
+	// Parent attrs are optional. Do not turn an alias response into a FUSE
+	// lookup when the parent has left the local cache.
+	var parentAttrs *FileAttribute
+	if cs, ok := fs.(cacheStater); ok {
+		if info, found := cs.StatCacheOnly(fs.Join(dirPath...)); found && info != nil {
+			parentAttrs = ToFileAttribute(info, fs.Join(dirPath...))
+		}
+	}
+	if err := WritePostOpAttrs(writer, parentAttrs); err != nil {
+		return nil, err
+	}
+	return writer.Bytes(), nil
+}
 
 func lookupSuccessResponse(handle []byte, entPath, dirPath []string, fs billy.Filesystem) ([]byte, error) {
 	writer := bytes.NewBuffer([]byte{})
@@ -117,6 +162,23 @@ func onLookup(ctx context.Context, w *response, userHandle Handler) error {
 	// only for filesystems without the cache-only stat).
 	if cs, ok := fs.(cacheStater); ok {
 		if _, found := cs.StatCacheOnly(fs.Join(reqPath...)); !found {
+			if resolver, ok := fs.(lookupAliasResolver); ok && unicodeLookupName(string(obj.Filename)) {
+				alias, resolveErr := resolver.ResolveLookupAlias(fs.Join(p...), string(obj.Filename))
+				if resolveErr != nil && !errors.Is(resolveErr, os.ErrNotExist) {
+					return nfsStatusErrorFrom(resolveErr)
+				}
+				if resolveErr == nil && alias != nil && alias.Name != "" && alias.Name != "." && alias.Name != ".." && utf8.ValidString(alias.Name) && !strings.ContainsAny(alias.Name, "/\x00") && len(alias.Handle) != 0 && alias.Info != nil {
+					resp, err := lookupAliasResponse(alias, p, fs)
+					if err != nil {
+						return &NFSStatusError{NFSStatusServerFault, err}
+					}
+					metrics.Default().IncLookupHit()
+					if err := w.Write(resp); err != nil {
+						return &NFSStatusError{NFSStatusServerFault, err}
+					}
+					return nil
+				}
+			}
 			metrics.Default().IncLookupNoent()
 			return &NFSStatusError{NFSStatusNoEnt, os.ErrNotExist}
 		}

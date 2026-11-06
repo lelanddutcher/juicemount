@@ -4,7 +4,7 @@ JuiceMount sits in front of people's primary storage, so security reports are ta
 
 ## Supported versions
 
-JuiceMount is pre-1.0, with 0.5.0 as the current general release. Security fixes land on `main` and ship in the next tagged release. There is no long-term-support branch yet; please test against the latest release before reporting.
+JuiceMount is pre-1.0, with 0.5.1 as the current release. Security fixes land on `main` and ship in the next tagged release. There is no long-term-support branch yet; please test against the latest release before reporting.
 
 | Version | Supported |
 |---|---|
@@ -33,7 +33,7 @@ In scope: the macOS app, the server stack in [`server/`](server/), the control p
 
 Out of scope, and worth knowing before you deploy:
 
-- **Keep the server on a trusted network.** The canonical 0.5 compose does not publish Redis directly. An authenticated RESP proxy listens on port 30179 and requires named client principals; it starts in passthrough lease mode with stage births off. MinIO listens on port 30151 and requires an object key. The default client key is shared by approved Macs and can read, write, and list objects without delete rights; separate per-Mac object keys are not enabled by default. RESP authentication and Manager enrollment use plaintext on the wire unless you provide a trusted private route or a separate TLS layer. Do not expose the proxy, MinIO, or Manager to the public Internet. See [`server/README.md`](server/README.md#security-notes).
+- **Keep the server on a trusted network.** The canonical 0.5 compose does not publish Redis directly. An authenticated RESP proxy listens on port 30179 and requires named client principals; it starts in passthrough lease mode with stage births off. MinIO listens on port 30151 and requires an object key. The default client key is shared by approved Macs and can read, write, and list objects without delete rights; separate per-Mac object keys are not enabled by default. Revoking a Mac does not change the shared key: the Manager says so and lists the revoked Macs that still hold it, and you rotate it on the server (see [`server/COMPOSE-ROLLOUT.md`](server/COMPOSE-ROLLOUT.md), "Rotating the shared object key"). RESP authentication and Manager enrollment use plaintext on the wire unless you provide a trusted private route or a separate TLS layer. Do not expose the proxy, MinIO, or Manager to the public Internet. See [`server/README.md`](server/README.md#security-notes).
 - **You own your keys.** Keep MinIO root, client, GC, proxy, and Manager credentials in your private deployment state. The current volume format metadata does not hold the client object key; each JuiceFS client supplies its key. Preserve and rotate credentials deliberately, and keep both object data and Redis metadata backed up.
 
 ## What JuiceMount does not do

@@ -6,7 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
+	"strconv"
+	"strings"
 	"syscall"
+	"time"
 
 	"github.com/lelanddutcher/juicemount/internal/derivatives"
 )
@@ -116,6 +120,8 @@ func optionContextErr(opt Options) error {
 // HARD failure (the asset was not published). BlobErr is non-fatal: the tech row
 // is published, but a requested poster/filmstrip couldn't be rendered — the
 // manifest carries a status:"failed" blob row and the consumer regenerates it.
+// A blob lost to an environment fault gets a local status:"pending" row instead,
+// which the next attempt regenerates (see blobFailure).
 type Result struct {
 	Path       string
 	Inode      uint64
@@ -156,7 +162,7 @@ type Result struct {
 // records as a blob error — never as a silent skip.
 func stageUnder(dir *os.File, name string) (staged, absPath string, err error) {
 	if dir == nil {
-		return "", "", fmt.Errorf("no safe derivative directory")
+		return "", "", errNoDerivDir
 	}
 	return derivatives.StageNameAt(dir, name)
 }
@@ -166,10 +172,169 @@ func stageUnder(dir *os.File, name string) (staged, absPath string, err error) {
 // wrote by path.
 func commitStaged(dir *os.File, staged, final string) error {
 	if dir == nil {
-		return fmt.Errorf("no safe derivative directory")
+		return errNoDerivDir
 	}
 	return derivatives.CommitStagedAt(dir, staged, final)
 }
+
+// errNoDerivDir is the blob error for a pass whose derivative directory could
+// not be opened safely. It says nothing about the source, so it is retryable;
+// maxPendingBlobAttempts bounds it when the cause never clears.
+var errNoDerivDir = errors.New("no safe derivative directory")
+
+// transientErrnos are environment faults that clear on their own: the storage
+// or the host, never the bytes of the source. An error in the derivative tree
+// is retryable only for one of these. EACCES and EPERM are here too, bounded
+// by the retry window: a worker running as the wrong user, or as root on a
+// root-squashed mount (see the ownership note in derivatives/openat.go), is
+// fixed by redeploying it, and failing at once would publish failed rows that
+// count as complete farm-wide until the next build.
+var transientErrnos = []syscall.Errno{
+	syscall.ENOSPC, syscall.EDQUOT, syscall.EROFS, syscall.EIO, syscall.ESTALE,
+	syscall.ENOTCONN, syscall.ENXIO, syscall.ENODEV, syscall.ETIMEDOUT,
+	syscall.EAGAIN, syscall.EINTR, syscall.EBUSY, syscall.EMFILE, syscall.ENFILE,
+	syscall.ENOMEM, syscall.EACCES, syscall.EPERM,
+}
+
+// transientToolMarkers are the same faults as ffmpeg reports them: its exit
+// error carries only stderr text, never an errno.
+var transientToolMarkers = []string{
+	"no space left on device",
+	"disk quota exceeded",
+	"read-only file system",
+	"input/output error",
+	"stale file handle",
+	"transport endpoint is not connected",
+	"too many open files",
+}
+
+// toolFailure is a media tool's failed run. The message keeps its historical
+// form, but classification reads only what the tool printed, with the paths it
+// was given removed: a source in a folder named "Input/Output Error" must not
+// turn a decode failure into a retryable one.
+type toolFailure struct {
+	msg    string
+	err    error
+	stderr string
+}
+
+func (e *toolFailure) Error() string { return e.msg }
+func (e *toolFailure) Unwrap() error { return e.err }
+
+func newToolFailure(msg string, err error, stderr []byte, paths ...string) error {
+	text := string(stderr)
+	for _, path := range paths {
+		if path != "" {
+			text = strings.ReplaceAll(text, path, "")
+		}
+	}
+	return &toolFailure{msg: msg, err: err, stderr: text}
+}
+
+// permanentErrnos say the derivative tree itself is wrong in a way that does
+// not clear on its own: a symlinked or non-directory component, a directory at
+// a blob's name, a name too long. They decide even when the derivative
+// directory could not be opened at all.
+var permanentErrnos = []syscall.Errno{
+	syscall.ELOOP, syscall.ENOTDIR, syscall.EISDIR, syscall.ENAMETOOLONG,
+}
+
+// transientBlobFailure reports whether a blob error was caused by the
+// environment rather than by the source.
+//
+// The distinction decides whether a failure may be remembered. A `failed` row
+// of this producer generation satisfies kindsComplete, so it is a negative cache
+// that lasts until the next build. That is right for a source ffmpeg cannot
+// decode, and wrong for a full disk, a read-only remount, or a derivative tree
+// that was briefly unmounted: the retry would skip the asset as fresh and the
+// poster would stay missing for no reason the media can fix. Unknown errors stay
+// permanent, because the cost of the other direction is re-decoding a broken
+// source on every sweep.
+func transientBlobFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	for _, errno := range permanentErrnos {
+		if errors.Is(err, errno) {
+			return false
+		}
+	}
+	if errors.Is(err, errNoDerivDir) || errors.Is(err, exec.ErrNotFound) {
+		return true
+	}
+	for _, errno := range transientErrnos {
+		if errors.Is(err, errno) {
+			return true
+		}
+	}
+	var tool *toolFailure
+	if errors.As(err, &tool) {
+		stderr := strings.ToLower(tool.stderr)
+		for _, marker := range transientToolMarkers {
+			if strings.Contains(stderr, marker) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// maxPendingBlobAttempts and blobRetryWindow bound how long one producer
+// generation retries an environment fault for the same kind and source: it
+// records a failure for the build only after at least this many consecutive
+// attempts AND this long since the first. A failure is published in the shared
+// manifest and holds until the next build, so a short outage (a remount, a
+// full disk freed within the hour) must not become one; a fault that does not
+// clear must still stop costing a decode on every sweep.
+const maxPendingBlobAttempts = 3
+
+// blobRetryWindow is JM_FARM_BLOB_RETRY_WINDOW_SEC, 6 hours by default.
+func blobRetryWindow() time.Duration {
+	if raw := strings.TrimSpace(os.Getenv("JM_FARM_BLOB_RETRY_WINDOW_SEC")); raw != "" {
+		if seconds, err := strconv.ParseInt(raw, 10, 64); err == nil && seconds >= 0 {
+			return time.Duration(seconds) * time.Second
+		}
+	}
+	return 6 * time.Hour
+}
+
+// blobRetryNow is the clock for the retry window; tests move it.
+var blobRetryNow = time.Now
+
+// blobFailure is the row status for a blob that could not be produced, and
+// the retry bookkeeping a pending row carries. A fault in the source is
+// `failed`. A fault in the environment is `pending` until it has recurred
+// maxPendingBlobAttempts times for this build and source over at least
+// blobRetryWindow, then `failed`.
+//
+// A pending row still replaces a stale ready row, so the manifest never vouches
+// for bytes this pass could not write, but it does not satisfy kindsComplete
+// and is not mirrored into the shared sidecar, so a retry regenerates the blob.
+func blobFailure(prior map[string]derivatives.DerivRow, kind, hash string, err error, opt Options) (status string, attempts int, since int64) {
+	if !transientBlobFailure(err) {
+		return "failed", 0, 0
+	}
+	now := blobRetryNow().Unix()
+	attempts, since = 1, now
+	if row, ok := prior[kind]; ok && row.Status == "pending" && row.Producer == opt.Producer &&
+		row.Version == opt.Version && row.Hash != nil && *row.Hash == hash {
+		attempts = row.PendingAttempts + 1
+		// A first-fault time in the future came from a clock that was wrong
+		// then (a host that booted before its clock was set); keeping it would
+		// hold the window open forever, so the window restarts now.
+		if row.PendingSince > 0 && row.PendingSince <= now {
+			since = row.PendingSince
+		}
+	}
+	if attempts >= maxPendingBlobAttempts && time.Duration(now-since)*time.Second >= blobRetryWindow() {
+		return "failed", 0, 0
+	}
+	return "pending", attempts, since
+}
+
+// openDerivDir opens an asset's derivative directory; tests replace it to
+// stand in for storage faults a test cannot cause.
+var openDerivDir = derivDirFor
 
 func derivDirFor(mount string, inode uint64) (*os.File, error) {
 	rel := derivatives.DerivDirRel(inode)
@@ -302,6 +467,10 @@ func skipIfFresh(store *derivatives.Store, path string, inode uint64, hash strin
 // 4.3 to 7.1 and gained Sony ipcm decoding, but 852 version-1 waveform failures
 // remained skipped forever because the old gate treated every historical failure
 // as a timeless fact. The media was decodable; only the negative cache was stale.
+//
+// A `pending` row never satisfies a kind. It records a blob that an environment
+// fault (full or read-only storage, an unmounted derivative tree) stopped this
+// build from writing, so the next attempt must regenerate it.
 func kindsComplete(store *derivatives.Store, inode uint64, rows []derivatives.DerivRow, size int64, opt Options) bool {
 	meta, err := store.Metadata(inode, "tech")
 	if err != nil || meta == nil {
@@ -355,10 +524,10 @@ func expectedKinds(tech *Tech, size int64, opt Options) []string {
 }
 
 // absentIfPreviouslyFailed returns an explicit tombstone only when an older
-// probe/generator left a failed row for a kind the current probe proves is not
-// applicable. The tombstone matters because manifest sidecars are a cross-host
-// union: merely omitting the row would let another worker carry the stale
-// failure forward forever. Ready contributor data is never replaced.
+// probe/generator left a failed or pending row for a kind the current probe
+// proves is not applicable. The tombstone matters because manifest sidecars are
+// a cross-host union: merely omitting the row would let another worker carry the
+// stale failure forward forever. Ready contributor data is never replaced.
 func absentIfPreviouslyFailed(store *derivatives.Store, inode uint64, kind, producer string, version int, hash string) (derivatives.DerivRow, bool) {
 	if store == nil {
 		return derivatives.DerivRow{}, false
@@ -368,7 +537,7 @@ func absentIfPreviouslyFailed(store *derivatives.Store, inode uint64, kind, prod
 		return derivatives.DerivRow{}, false
 	}
 	for _, row := range rows {
-		if row.Kind == kind && row.Status == "failed" {
+		if row.Kind == kind && (row.Status == "failed" || row.Status == "pending") {
 			return derivatives.DerivRow{
 				Kind: kind, Status: "absent", Producer: producer, Version: version, Hash: &hash,
 			}, true
@@ -511,6 +680,14 @@ func Process(store *derivatives.Store, path string, opt Options) Result {
 			rows = append(rows, row)
 		}
 	}
+	// The rows already held for this asset carry the pending-attempt count of a
+	// blob that hits an environment fault again (see blobFailure).
+	priorRows := map[string]derivatives.DerivRow{}
+	if manifest, err := store.Manifest(inode); err == nil {
+		for _, row := range manifest {
+			priorRows[row.Kind] = row
+		}
+	}
 	var blobErrs []error
 	// Blob size gate: a sub-threshold clip keeps its tech row above but skips
 	// the decode-heavy poster/filmstrip/waveform. 0 = generate for everything.
@@ -533,9 +710,20 @@ func Process(store *derivatives.Store, path string, opt Options) Result {
 	// including the cheap `tech` row that a -blobs=false run exists to publish.
 	// A directory we cannot safely open means no BLOBS, not no result.
 	var derivDir *os.File
+	// withDirCause attaches the reason the directory could not be opened to a
+	// blob's "no safe derivative directory" error, so a symlinked or
+	// non-directory component is classified as permanent at once.
+	var dirErr error
+	withDirCause := func(err error) error {
+		if dirErr != nil && errors.Is(err, errNoDerivDir) {
+			return fmt.Errorf("%w: %w", errNoDerivDir, dirErr)
+		}
+		return err
+	}
 	if opt.Mount != "" {
-		d, derr := derivDirFor(opt.Mount, inode)
+		d, derr := openDerivDir(opt.Mount, inode)
 		if derr != nil {
+			dirErr = derr
 			blobErrs = append(blobErrs, fmt.Errorf("derivative dir: %w", derr))
 		} else {
 			derivDir = d
@@ -550,7 +738,7 @@ func Process(store *derivatives.Store, path string, opt Options) Result {
 		rel := "poster.jpg"
 		mt := "image/jpeg"
 		staged, out, stErr := stageUnder(derivDir, rel)
-		err := stErr
+		err := withDirCause(stErr)
 		if err == nil {
 			if err = ThumbnailDecodeContext(ctx, opt.FFmpegBin, opt.VideoDecoder, opt.VideoDecodeBitDepth, path, out, opt.ThumbMaxDim, tech.DurationMS); err == nil {
 				err = commitStaged(derivDir, staged, rel)
@@ -564,8 +752,9 @@ func Process(store *derivatives.Store, path string, opt Options) Result {
 		if err != nil {
 			derivatives.DiscardStagedAt(derivDir, staged)
 			blobErrs = append(blobErrs, fmt.Errorf("thumbnail: %w", err))
+			status, attempts, since := blobFailure(priorRows, "thumbnail", hash, err, opt)
 			rows = append(rows, derivatives.DerivRow{
-				Kind: "thumbnail", Status: "failed", Producer: opt.Producer, Version: opt.Version,
+				Kind: "thumbnail", Status: status, PendingAttempts: attempts, PendingSince: since, Producer: opt.Producer, Version: opt.Version,
 				Hash: &hash, BlobRelPath: &rel, MediaType: &mt,
 			})
 		} else {
@@ -582,7 +771,7 @@ func Process(store *derivatives.Store, path string, opt Options) Result {
 		mt := "image/jpeg"
 		staged, out, stErr := stageUnder(derivDir, rel)
 		var geo *derivatives.FilmstripGeo
-		err := stErr
+		err := withDirCause(stErr)
 		if err == nil {
 			if geo, err = FilmstripDecodeContext(ctx, opt.FFmpegBin, opt.VideoDecoder, opt.VideoDecodeBitDepth, path, out, tech.DurationMS, tech.Video.Width, tech.Video.Height, opt.FilmstripCell, tech.Video.FPS); err == nil {
 				err = commitStaged(derivDir, staged, rel)
@@ -596,8 +785,9 @@ func Process(store *derivatives.Store, path string, opt Options) Result {
 		if err != nil {
 			derivatives.DiscardStagedAt(derivDir, staged)
 			blobErrs = append(blobErrs, fmt.Errorf("filmstrip: %w", err))
+			status, attempts, since := blobFailure(priorRows, "filmstrip", hash, err, opt)
 			rows = append(rows, derivatives.DerivRow{
-				Kind: "filmstrip", Status: "failed", Producer: opt.Producer, Version: opt.Version,
+				Kind: "filmstrip", Status: status, PendingAttempts: attempts, PendingSince: since, Producer: opt.Producer, Version: opt.Version,
 				Hash: &hash, BlobRelPath: &rel, MediaType: &mt,
 			})
 		} else {
@@ -616,7 +806,7 @@ func Process(store *derivatives.Store, path string, opt Options) Result {
 		// through the descriptor and commits atomically inside WriteFileAt.
 		err := error(nil)
 		if derivDir == nil {
-			err = fmt.Errorf("no safe derivative directory")
+			err = withDirCause(errNoDerivDir)
 		}
 		wrote := false
 		if err == nil {
@@ -657,8 +847,9 @@ func Process(store *derivatives.Store, path string, opt Options) Result {
 			})
 		} else if err != nil {
 			blobErrs = append(blobErrs, fmt.Errorf("waveform: %w", err))
+			status, attempts, since := blobFailure(priorRows, "waveform", hash, err, opt)
 			rows = append(rows, derivatives.DerivRow{
-				Kind: "waveform", Status: "failed", Producer: opt.Producer, Version: opt.Version,
+				Kind: "waveform", Status: status, PendingAttempts: attempts, PendingSince: since, Producer: opt.Producer, Version: opt.Version,
 				Hash: &hash, BlobRelPath: &rel, MediaType: &mt,
 			})
 		} else {

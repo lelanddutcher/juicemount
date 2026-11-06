@@ -46,6 +46,7 @@ source "$HERE/lib.sh"
 COC_SRC=""
 COC_DEST=""
 _coc_cleanup() {
+    [ "${QA_KEEP_DATA:-0}" = 1 ] && return 0
     # Always leave the box ONLINE (08 never toggles offline, but the convention +
     # spec require restoring online state defensively even on interrupt).
     qa_offline off >/dev/null 2>&1 || true
@@ -108,21 +109,34 @@ main() {
         "corpus staging produced an empty manifest"
 
     # --- clean start: spool idle before the chain begins ---
-    qa_wait_drain 120 >/dev/null 2>&1
+    qa_wait_drain 120 >/dev/null 2>&1 || { qa_fail "initial spool quiescence unproved"; return 1; }
 
     # --- REAL Finder copy + observe the spool RISE (proof of transit) ---
     qa_sec "real Finder copy -> $DEST (observing spool transit)"
     local MARK; MARK="$(qa_log_mark)"
-    ( qa_finder_copy "$SRC" "$QA_DEST_ROOT" "$COC_DRAIN_CEIL" > "$QA_CAT_DIR/$TAG.finder" 2>&1 ) &
-    local cppid=$! peak=0 s pend
+    local cppid peak=0 s pend
+    if [ "${QA_STRICT_RELEASE:-0}" = 1 ]; then
+        qa_release_custody_init
+        qa_release_start_copy custody "$SRC" "$QA_DEST_ROOT" "$MAN"
+        cppid="$SNAP_LAST_PID"
+    else
+        ( qa_finder_copy "$SRC" "$QA_DEST_ROOT" "$COC_DRAIN_CEIL" > "$QA_CAT_DIR/$TAG.finder" 2>&1 ) &
+        cppid=$!
+    fi
     for s in $(seq 1 300); do
         pend="$(qa_spool_pending)"
         [ "$pend" -gt "$peak" ] 2>/dev/null && peak="$pend"
         kill -0 "$cppid" 2>/dev/null || break
         perl -e 'select undef,undef,undef,1'
     done
-    wait "$cppid" 2>/dev/null
-    local fres; fres="$(cat "$QA_CAT_DIR/$TAG.finder" 2>/dev/null)"
+    local fres
+    if [ "${QA_STRICT_RELEASE:-0}" = 1 ]; then
+        qa_release_join_copy custody "$cppid" "$COC_DRAIN_CEIL"
+        fres="$(cat "$SNAP_TMP/custody.out")"
+    else
+        wait "$cppid" 2>/dev/null
+        fres="$(cat "$QA_CAT_DIR/$TAG.finder" 2>/dev/null)"
+    fi
     qa_info "Finder result: $(printf '%s' "$fres" | head -c 120)"
     qa_assert $(qa_finder_result_clean "$fres"; echo $?) \
         "Finder copy returned clean (no -48/-36/-5000/permission)" \
@@ -145,11 +159,11 @@ main() {
         "custody sweep #1: every file present + md5-identical to source" \
         "custody sweep #1 found MISSING/WRONG files (offending paths in [FAIL] lines above)"
 
-    qa_sec "custody readback sweep #2 (independent re-read; must agree)"
-    local rc2; qa_verify_custody "$MAN" "$DEST"; rc2=$?
+    qa_sec "custody readback sweep #2 (repeat mounted read; strict mode also requires independent SDK proof)"
+    local rc2; _qa_verify_mounted_custody "$MAN" "$DEST"; rc2=$?
     qa_assert "$rc2" \
-        "custody sweep #2: at-rest readback stable + identical to source" \
-        "custody sweep #2 diverged from source/#1 — inconsistent read (cache vs backend)"
+        "custody sweep #2: mounted bytes stable + identical; independent backend receipt required in strict mode" \
+        "custody sweep #2 diverged from source/#1 — inconsistent repeated read"
 
     # Capture the offending path NOW, before qa_end cleans the dest.
     local COC_BAD=""

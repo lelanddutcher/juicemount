@@ -243,11 +243,11 @@
       "upstream_sha256": "f3917760c69e88f4b958998500d08a958f5d708a798900ee8a4b32ece1c9b1bb"
     },
     "go.mod": {
-      "sha256": "3d1705f7f3db3d38d8b553a4aa339fce8b326ffc3d36976d057abe5ebdf4f117",
+      "sha256": "13005661f1c42a4e91e1c3d23be0caafddb081532ee846a887e900cac6c94f9f",
       "upstream_sha256": "ad4015469cb99c85fc6305bd8afacb352170ee459eb8205114bf657775773da8"
     },
     "go.sum": {
-      "sha256": "2ab515a75930ec1b4423de92d8efe43d93f91acdd09a91974b6965e4b36cd940",
+      "sha256": "75500cc9728a0096b85ea811c82fe29d8cf9f3d0601960931975420ac94756f5",
       "upstream_sha256": "584598cd0a595f99adc850ffa085dfa5f3b9a0490c7c1d94a0582470738c4bad"
     },
     "main.go": {
@@ -1143,7 +1143,8 @@
     "patches/0011-stage-birth-create-watch.patch": "9848480d00a6cde1fb0eccd3bd9bb3c29d4e052b32f379dead83fd245a7dbfbc",
     "patches/0012-born-stage-upload-watch.patch": "d8dc17b58bbee31cec0bb2522c15477b7721c67e89f263ab0ff086407fb2cb5f",
     "patches/0013-security-dependencies-and-etcd-transport.patch": "de7b2dfc19c7bdb1b69e7efb1af689a9b0190afd28117927e78e3393ae6486de",
-    "patches/0014-literal-fatal-error.patch": "ba84e7c4d2690c1ee2d377263f6d1dcc6793217378809b109bebf32c45964d1d"
+    "patches/0014-literal-fatal-error.patch": "ba84e7c4d2690c1ee2d377263f6d1dcc6793217378809b109bebf32c45964d1d",
+    "patches/0015-klauspost-compress-security-update.patch": "c46fdf7add95ff74c673421238ccbc00e6e110fe49ae327167f78f747292b640"
   },
   "scope": "All pkg/ and cmd/ files plus main.go, LICENSE, go.mod and go.sum from the verified module ZIP. Documentation, integration tests and SDK examples are not included. local_files are JuiceMount-owned source with no upstream counterpart.",
   "upstream_url": "https://github.com/juicedata/juicefs/tree/v1.3.1",

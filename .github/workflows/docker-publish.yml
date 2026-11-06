@@ -40,7 +40,7 @@ jobs:
     runs-on: ubuntu-latest
     services:
       redis:
-        image: redis:7.4-alpine
+        image: redis:7.4-alpine@sha256:ff02b58f971e7d7d156a1267e283fcbbeee91773b6aa36c49dac28ecfe28eadf  # same digest as server/docker-compose.yml; the acceptance tests require Redis 7.4.11
         ports:
           - 6379:6379
         options: >-
@@ -49,7 +49,7 @@ jobs:
           --health-timeout 3s
           --health-retries 10
       respproxy-redis:
-        image: redis:7.4-alpine
+        image: redis:7.4-alpine@sha256:ff02b58f971e7d7d156a1267e283fcbbeee91773b6aa36c49dac28ecfe28eadf  # same digest as server/docker-compose.yml; the acceptance tests require Redis 7.4.11
         ports:
           - 6380:6379
         options: >-
@@ -74,6 +74,10 @@ jobs:
           JM_REQUIRE_GATE_HISTORY: '1'
           JM_TEST_LINK_REDIS: redis://127.0.0.1:6379/13
           JM_TEST_MANAGER_REDIS: redis://127.0.0.1:6379/12
+          # Smart folders format throwaway JuiceFS volumes (each DB is flushed;
+          # one per package, since packages run in parallel).
+          JM_TEST_SMARTFOLDERS_META_REDIS: redis://127.0.0.1:6379/10
+          JM_TEST_SMARTFOLDERS_JFS_REDIS: redis://127.0.0.1:6379/9
           JM_TEST_METADATA_REDIS: redis://127.0.0.1:6379/14
           JM_TEST_REDIS: redis://127.0.0.1:6379/15
           JM_RESPPROXY_TEST_REDIS: 127.0.0.1:6380
@@ -112,6 +116,7 @@ jobs:
           find scripts server/scripts test -type f -name '*.sh' -print0 | xargs -0 -n1 bash -n
           node --check internal/manager/static/app.js
           docker compose -f server/docker-compose.yml config --quiet
+          docker compose -f server/docker-compose.yml -f server/docker-compose.link.yml config --quiet
           bash server/scripts/update-server.test.sh
 
   mac-app:

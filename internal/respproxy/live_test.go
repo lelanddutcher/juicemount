@@ -346,8 +346,8 @@ func TestLivePolicySeam(t *testing.T) {
 	rc := tp.raw(t)
 	rc.login("mac1")
 
-	mustOK(t, rc.do("GET", "i1"), "read")        // no Decide
-	mustOK(t, rc.do("INCR", "nextinode"), "ctr") // no Decide
+	mustOK(t, rc.do("GET", "i1"), "read")                  // no Decide
+	mustOK(t, rc.do("INCRBY", "nextinode", "1024"), "ctr") // no Decide
 	mustOK(t, rc.do("SET", "i5", "a"), "bare project write")
 	v := rc.do("SET", "i666", "a")
 	if string(v.Str) != "JMDENY LEASE_HELD proj=42 holder=mac2@mac2-host epoch=7" {

@@ -363,8 +363,9 @@ func sanitizeSidecarRow(row derivatives.DerivRow) (derivatives.DerivRow, bool) {
 }
 
 // rowContentEqual compares everything that MEANS something to a reader, and
-// deliberately ignores UpdatedAt (it is the thing being decided) and Provenance
-// (set by us, identical for any two sidecar-sourced rows).
+// deliberately ignores UpdatedAt (it is the thing being decided), Provenance
+// (set by us, identical for any two sidecar-sourced rows) and PendingAttempts
+// and PendingSince (local retry bookkeeping that no manifest row carries).
 func rowContentEqual(a, b derivatives.DerivRow) bool {
 	eqs := func(x, y *string) bool {
 		if x == nil || y == nil {
@@ -830,9 +831,17 @@ func writeManifestSidecarWithPostMerge(store *derivatives.Store, mount string, i
 	if err != nil {
 		return err
 	}
-	if rows == nil {
-		rows = []derivatives.DerivRow{}
+	// A pending row is this host's note that an environment fault stopped a
+	// blob. It is not a result, and sanitizeSidecarRow refuses it on read, so
+	// leave it out and let the union keep any current row another worker
+	// published for the same source.
+	published := make([]derivatives.DerivRow, 0, len(rows))
+	for _, row := range rows {
+		if row.Status != "pending" {
+			published = append(published, row)
+		}
 	}
+	rows = published
 	sc := ManifestSidecar{
 		Inode:       inode,
 		SourceHash:  srcHash,

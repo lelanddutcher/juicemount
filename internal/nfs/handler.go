@@ -48,6 +48,17 @@ type ParentObservedRenamer interface {
 	RenameWithParentObservations(oldpath, newpath string, from, to ParentRenameObservation) error
 }
 
+// MutationPrincipalSetter is implemented by a filesystem that remembers a
+// namespace mutation which finished after its RPC was answered JUKEBOX, so it
+// can answer the client's resend instead of running it again. The resend
+// carries a new XID, so the request is matched by its contents and, as
+// defense in depth for AUTH_SYS clients, this principal (see requestPrincipal).
+// Under AUTH_NONE every client shares one principal; safety must not depend on
+// it. The filesystem value must be per-RPC.
+type MutationPrincipalSetter interface {
+	SetMutationPrincipal(principal string)
+}
+
 // UnixChange extends the billy `Change` interface with support for special files.
 type UnixChange interface {
 	billy.Change

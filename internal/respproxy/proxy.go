@@ -15,6 +15,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/lelanddutcher/juicemount/internal/auditlog"
 )
 
 // Proxy-owned keys in the volume DB (plan §1.2).
@@ -89,6 +91,16 @@ type Config struct {
 	// It runs once and must not wait for this proxy's Close or Done.
 	BeforeSideClose func()
 	Logf            func(format string, args ...any)
+	// Audit, if set, receives the per-person mutation log (audit.go). The
+	// caller owns it and closes it after Done.
+	Audit *auditlog.Writer
+	// AuditWindow is how long content writes of one inode by one principal
+	// are collapsed into one record; default 10 s.
+	AuditWindow time.Duration
+	// AuditSyncTimeout bounds the wait for a Mac's intent to be on disk
+	// while grants are in force (audit.go); the unit is refused after it.
+	// Default 2 s.
+	AuditSyncTimeout time.Duration
 }
 
 // Proxy is the enforcing RESP proxy. One upstream connection per client.
@@ -103,6 +115,14 @@ type Proxy struct {
 	policy     Policy
 	mode       atomic.Value // Mode
 	side       *SidePool
+	audit      *auditSink // nil: no audit log
+
+	// inodeOwners is Guard.inodes; inodeMark caches InodeMarkKey once read
+	// (it is set once and never changes).
+	inodeOwners *redisRanges
+	inodeMarkMu sync.Mutex
+	inodeMarkV  uint64
+	inodeMarkOK bool
 
 	mu           sync.Mutex
 	preAuth      map[string]*ipGate // client IP -> unauthenticated connections
@@ -190,10 +210,20 @@ func New(cfg Config) (*Proxy, error) {
 	}
 	p.side = &SidePool{dial: p.dialUpstream, max: 8}
 	p.Guard = NewGuard(&redisSessions{p: p, cache: map[uint64]string{}}, sideChunks{p})
-	p.Guard.slices = &redisSlices{p: p}
+	p.Guard.slices = &redisSlices{redisRanges: redisRanges{p: p, key: SliceOwnersKey}}
+	p.inodeOwners = &redisRanges{p: p, key: InodeOwnersKey}
+	p.Guard.inodes = p.inodeOwners
+	p.Guard.logf = p.Logf
 	p.Guard.counters = sideCounters{p}
+	p.Guard.side = p.side
 	p.stageBirth.Store(cfg.StageBirth)
 	p.setMode(cfg.Mode, "config")
+	if cfg.Audit != nil {
+		p.audit = newAuditSink(cfg.Audit, cfg.AuditWindow, cfg.AuditSyncTimeout, func() bool {
+			t := p.Auth.table.Load()
+			return t.HasPeople() || t.GrantsInForce()
+		}, cfg.Logf)
+	}
 	return p, nil
 }
 
@@ -453,6 +483,9 @@ func (p *Proxy) Close() error {
 	p.mu.Unlock()
 	p.wg.Wait()
 	p.bgwg.Wait()
+	if p.audit != nil {
+		p.audit.close() // every connection ended: no Done is still to come
+	}
 	if p.cfg.BeforeSideClose != nil {
 		p.cfg.BeforeSideClose()
 	}
@@ -591,6 +624,20 @@ type conn struct {
 	txn         *txnState
 	watched     []string
 	watchAck    chan struct{} // closed when the last WATCH's reply was read
+
+	// upID: the CLIENT ID of the upstream connection, stored by the reply
+	// goroutine (Unit.upstreamID).
+	upID atomic.Uint64
+
+	// trashAlloc: the reply of this connection's latest INCR nextTrash,
+	// stored by the reply goroutine before the client sees it and taken by
+	// the next EXEC (Unit.TrashAlloc).
+	trashAlloc atomic.Pointer[trashAlloc]
+}
+
+type trashAlloc struct {
+	db int
+	n  uint64
 }
 
 var errClose = errors.New("respproxy: closing connection")
@@ -1324,10 +1371,21 @@ func UpstreamName(principal string, connID uint64) string {
 func (c *conn) upstreamName() string { return UpstreamName(c.principal.Name, c.id) }
 
 func (c *conn) newUnit(kind UnitKind, cmds []Cmd) *Unit {
-	u := &Unit{Kind: kind, DB: c.db, Cmds: cmds, Mode: c.p.Mode(), ConnID: c.id, Remote: c.remote}
+	u := &Unit{Kind: kind, DB: c.db, Cmds: cmds, Mode: c.p.Mode(), ConnID: c.id, Remote: c.remote,
+		wantAudit: c.p.auditOn() != nil} // no description while the log is off (a single-user volume)
 	if c.principal != nil {
 		u.UpstreamName = c.upstreamName()
+		if c.principal.Kind == KindMac {
+			// The current table, not the one of the AUTH: a grant change
+			// applies to the next unit without a reconnect.
+			t := c.p.Auth.table.Load()
+			u.Person = t.PersonOf(c.principal.Name)
+			u.unassigned = u.Person == nil && t.GrantsInForce()
+		}
 	}
+	u.upstreamID = c.upID.Load
+	u.inodeOwner = c.p.Guard.inodes.Owner
+	u.inodeMark = c.p.inodeMark
 	if kind == UnitTxn {
 		u.beforeSide = c.confirmWatch
 	}
@@ -1383,6 +1441,12 @@ func (c *conn) decide(u *Unit) (*Denial, Verdict, []guardEffect) {
 	// (L5 review: in observe/passthrough a webdav principal ran FLUSHDB and
 	// a Mac rewrote jmlease:v1:cfg).
 	d, effects := c.p.Guard.Check(pr, u)
+	if d == nil {
+		d = accountingValueDenial(pr, u) // also every mode (accounting.go)
+	}
+	if e, ok := c.p.policy.(*LeaseEngine); ok && d == nil && c.p.Auth.table.Load().GrantsInForce() {
+		d = e.quotaScopeDenial(pr, u)
+	}
 	if d != nil {
 		c.p.Stats.recordDecision(DecDeny, d, pr, u)
 		return d, Verdict{}, nil
@@ -1399,7 +1463,7 @@ func (c *conn) decide(u *Unit) (*Denial, Verdict, []guardEffect) {
 	switch {
 	case d == nil:
 		c.cs.allow(pr)
-	case u.Mode == ModeObserve || u.Mode == ModePassthrough:
+	case (u.Mode == ModeObserve || u.Mode == ModePassthrough) && !enforcedInEveryMode(d.Reason):
 		c.p.Stats.recordDecision(DecWouldDeny, d, pr, u)
 		d = nil
 	default:
@@ -1419,19 +1483,44 @@ func (c *conn) gateBare(args [][]byte, info Command) error {
 	c.p.Stats.analyse("bare", writesOf(cmds))
 	u := c.newUnit(UnitBare, cmds)
 	d, v, effects := c.decide(u)
+	done := v.Done
+	if d == nil {
+		if done, d = c.auditStart(u, v.Done); d != nil {
+			c.p.Stats.recordDecision(DecDeny, d, *c.principal, u)
+		}
+	}
 	if d != nil {
 		if v.Done != nil {
 			v.Done(Outcome{ConnID: c.id})
 		}
+		c.auditRefused(u, d)
 		c.reply(d.Reply())
 		return nil
 	}
-	s := slot{done: c.p.commitOnSuccess(effects, v.Done)}
+	s := slot{done: c.p.commitOnSuccess(effects, done)}
 	switch counter, n := Allocation(u); counter {
 	case "nextsession":
 		s.hook = c.p.sessionHook(c.principal.Name, n)
 	case "nextchunk":
-		s.hook = c.p.sliceHook(c.principal.Name, n)
+		s.hook = c.p.idHook(c.p.Guard.slices, "slice ids", c.principal.Name, n)
+	case "nextinode":
+		// The batch and its owner record are one script, so Redis (and its
+		// AOF) holds both or neither. The reply is INCRBY's.
+		args = strArgs("EVAL", inodeAllocLua, "3", string(args[1]), InodeOwnersKey, InodeMarkKey,
+			strconv.FormatInt(n, 10), c.principal.Name)
+		owner := c.principal.Name
+		s.hook = func(v Value) {
+			if v.Type == ':' && v.Int >= n {
+				c.p.inodeOwners.remember(sliceRange{uint64(v.Int - n + 1), uint64(v.Int), owner})
+			}
+		}
+	case "nextTrash":
+		db := c.db
+		s.hook = func(v Value) {
+			if v.Type == ':' && v.Int > 0 {
+				c.trashAlloc.Store(&trashAlloc{db: db, n: uint64(v.Int)})
+			}
+		}
 	}
 	if u.rewrite != nil {
 		args = u.rewrite
@@ -1457,15 +1546,17 @@ func (p *Proxy) commitOnSuccess(effects []guardEffect, done func(Outcome)) func(
 	}
 }
 
-// sliceHook records the slice ids a principal's own INCRBY nextchunk
-// allocated: (R-n, R] for reply R (juicefs base.go:1658-1663).
-func (p *Proxy) sliceHook(owner string, n int64) func(Value) {
+// idHook records the ids a principal's own INCRBY nextchunk or nextinode
+// allocated: (R-n, R] for reply R (juicefs base.go:1658-1663 for slices;
+// allocateInodes, base.go:1168, with incrCounter's +1, redis.go:419, for
+// inodes).
+func (p *Proxy) idHook(store IDOwners, what, owner string, n int64) func(Value) {
 	return func(v Value) {
 		if v.Type != ':' || v.Int < n {
 			return
 		}
-		if err := p.Guard.slices.Record(uint64(v.Int-n+1), uint64(v.Int), owner); err != nil {
-			p.Logf("respproxy: slice ids %d..%d owner record for %s failed: %v", v.Int-n+1, v.Int, owner, err)
+		if err := store.Record(uint64(v.Int-n+1), uint64(v.Int), owner); err != nil {
+			p.Logf("respproxy: %s %d..%d owner record for %s failed: %v", what, v.Int-n+1, v.Int, owner, err)
 		}
 	}
 }
@@ -1503,6 +1594,9 @@ func (c *conn) exec() error {
 	c.p.Stats.analyse("txn", writesOf(t.cmds))
 	u := c.newUnit(UnitTxn, t.cmds)
 	u.Watched = watched
+	if a := c.trashAlloc.Swap(nil); a != nil && a.db == c.db {
+		u.TrashAlloc = a.n // one txn only: the next trash directory needs a new INCR
+	}
 
 	var d *Denial
 	var v Verdict
@@ -1513,10 +1607,17 @@ func (c *conn) exec() error {
 	} else {
 		d, v, effects = c.decide(u)
 	}
+	done := v.Done
+	if d == nil {
+		if done, d = c.auditStart(u, v.Done); d != nil {
+			c.p.Stats.recordDecision(DecDeny, d, *c.principal, u)
+		}
+	}
 	if d != nil {
 		if v.Done != nil {
 			v.Done(Outcome{ConnID: c.id})
 		}
+		c.auditRefused(u, d)
 		c.p.Stats.discards.Add(1)
 		if err := c.forward(strArgs("DISCARD"), slot{drop: true}); err != nil {
 			return err
@@ -1538,14 +1639,14 @@ func (c *conn) exec() error {
 	}
 	if u.replacementReceipt != nil {
 		if err := c.forward(u.replacementReceipt, slot{drop: true}); err != nil {
-			if v.Done != nil {
-				v.Done(Outcome{Forwarded: true, Lost: true, ConnID: c.id})
+			if done != nil {
+				done(Outcome{Forwarded: true, Lost: true, ConnID: c.id})
 			}
 			return err
 		}
 		extra++
 	}
-	es := slot{exec: true, strip: extra, done: c.p.commitOnSuccess(effects, v.Done)}
+	es := slot{exec: true, strip: extra, done: c.p.commitOnSuccess(effects, done)}
 	if u.replacementReceipt != nil {
 		es.execCount = len(u.Cmds) + extra
 	}
@@ -1616,7 +1717,13 @@ func (c *conn) ensureUpstream() bool {
 		c.cw.Flush()
 		return false
 	}
-	return true
+	// Its reply precedes every later reply on this connection, so it is
+	// stored before any WATCH the client sends is confirmed (beforeSide).
+	return c.forward(strArgs("CLIENT", "ID"), slot{drop: true, hook: func(v Value) {
+		if v.Type == ':' && v.Int > 0 {
+			c.upID.Store(uint64(v.Int))
+		}
+	}}) == nil
 }
 
 // authenticate checks credentials and, on failure, replies WRONGPASS. A
@@ -1858,13 +1965,80 @@ func (s *redisSessions) Release(sids []uint64) error {
 // because nextchunk only increases. One entry per 4096 slices written.
 const SliceOwnersKey = "jmlease:v1:slices"
 
-// redisSlices persists slice-id ownership; memory holds only a bounded
-// cache of recent ranges (a principal writes from its current batch).
-type redisSlices struct {
+// InodeOwnersKey is the same for inode numbers (nextinode batches).
+const InodeOwnersKey = "jmlease:v1:inodes"
+
+// InodeMarkKey holds nextinode as it was when the proxy began recording
+// inode batches. It is set once, before the first recorded batch, and never
+// changed: every number at or below it was handed out before recording
+// began, every number above it by a recorded INCRBY.
+const InodeMarkKey = "jmlease:v1:inodes:mark"
+
+// inodeMarkLua: KEYS nextinode, mark. Sets the mark from nextinode if it is
+// not set yet, and returns it.
+const inodeMarkLua = `if redis.call('EXISTS', KEYS[2]) == 0 then
+  redis.call('SET', KEYS[2], redis.call('GET', KEYS[1]) or '0')
+end
+return redis.call('GET', KEYS[2])`
+
+// inodeAllocLua: KEYS nextinode, owners, mark; ARGV n, owner. A juicefs
+// inode batch (INCRBY nextinode n) recorded as owner's in the same script,
+// merged with owner's range ending just below it; the mark is set first if
+// it is not set yet. Returns the INCRBY reply.
+const inodeAllocLua = `if redis.call('EXISTS', KEYS[3]) == 0 then
+  redis.call('SET', KEYS[3], redis.call('GET', KEYS[1]) or '0')
+end
+local hi = redis.call('INCRBY', KEYS[1], ARGV[1])
+local lo = hi - tonumber(ARGV[1]) + 1
+local owner = ARGV[2]
+local prev = redis.call('ZRANGE', KEYS[2], lo - 1, lo - 1, 'BYSCORE')
+for _, m in ipairs(prev) do
+  local plo, phi, pown = string.match(m, '^(%d+):(%d+):(.+)$')
+  if pown == owner and tonumber(phi) + 1 == lo then
+    redis.call('ZREM', KEYS[2], m)
+    lo = tonumber(plo)
+  end
+end
+redis.call('ZADD', KEYS[2], hi, string.format('%.0f', lo) .. ':' .. string.format('%.0f', hi) .. ':' .. owner)
+return hi`
+
+// inodeMark returns InodeMarkKey, setting it from nextinode if this is the
+// first time recording needs it.
+func (p *Proxy) inodeMark() (uint64, error) {
+	p.inodeMarkMu.Lock()
+	defer p.inodeMarkMu.Unlock()
+	if p.inodeMarkOK {
+		return p.inodeMarkV, nil
+	}
+	v, err := p.side.Do(p.cfg.VolumeDB, strArgs("EVAL", inodeMarkLua, "2", "nextinode", InodeMarkKey)...)
+	if err == nil {
+		err = v.Err()
+	}
+	if err != nil {
+		return 0, err
+	}
+	n, err := strconv.ParseUint(string(v.Str), 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("%s: %q", InodeMarkKey, v.Str)
+	}
+	p.inodeMarkV, p.inodeMarkOK = n, true
+	return n, nil
+}
+
+// redisRanges persists id-range ownership in a ZSET shaped like
+// SliceOwnersKey; memory holds only a bounded cache of recent ranges (a
+// principal writes from its current batch).
+type redisRanges struct {
 	p     *Proxy
+	key   string
 	mu    sync.Mutex
 	cache []sliceRange // most recent last; bounded
-	used  map[uint64]bool
+}
+
+// redisSlices is slice-id ownership plus each slice's used bit.
+type redisSlices struct {
+	redisRanges
+	used map[uint64]bool // guarded by mu
 }
 
 const sliceCacheMax = 1024
@@ -1882,7 +2056,7 @@ for _, m in ipairs(prev) do
 end
 return redis.call('ZADD', KEYS[1], hi, lo .. ':' .. hi .. ':' .. owner)`
 
-func (s *redisSlices) remember(r sliceRange) {
+func (s *redisRanges) remember(r sliceRange) {
 	s.mu.Lock()
 	if len(s.cache) >= sliceCacheMax {
 		s.cache = append(s.cache[:0], s.cache[len(s.cache)/2:]...)
@@ -1891,7 +2065,7 @@ func (s *redisSlices) remember(r sliceRange) {
 	s.mu.Unlock()
 }
 
-func (s *redisSlices) Owner(id uint64) (string, bool, error) {
+func (s *redisRanges) Owner(id uint64) (string, bool, error) {
 	s.mu.Lock()
 	for i := len(s.cache) - 1; i >= 0; i-- {
 		if r := s.cache[i]; id >= r.lo && id <= r.hi {
@@ -1900,7 +2074,7 @@ func (s *redisSlices) Owner(id uint64) (string, bool, error) {
 		}
 	}
 	s.mu.Unlock()
-	v, err := s.p.side.Do(s.p.cfg.VolumeDB, strArgs("ZRANGE", SliceOwnersKey, strconv.FormatUint(id, 10), "+inf", "BYSCORE", "LIMIT", "0", "1")...)
+	v, err := s.p.side.Do(s.p.cfg.VolumeDB, strArgs("ZRANGE", s.key, strconv.FormatUint(id, 10), "+inf", "BYSCORE", "LIMIT", "0", "1")...)
 	if err == nil {
 		err = v.Err()
 	}
@@ -1912,7 +2086,7 @@ func (s *redisSlices) Owner(id uint64) (string, bool, error) {
 	}
 	parts := strings.SplitN(string(v.Elems[0].Str), ":", 3)
 	if len(parts) != 3 {
-		return "", false, fmt.Errorf("bad %s member %q", SliceOwnersKey, v.Elems[0].Str)
+		return "", false, fmt.Errorf("bad %s member %q", s.key, v.Elems[0].Str)
 	}
 	lo, e1 := strconv.ParseUint(parts[0], 10, 64)
 	hi, e2 := strconv.ParseUint(parts[1], 10, 64)
@@ -1923,11 +2097,11 @@ func (s *redisSlices) Owner(id uint64) (string, bool, error) {
 	return parts[2], true, nil
 }
 
-func (s *redisSlices) Record(lo, hi uint64, owner string) error {
+func (s *redisRanges) Record(lo, hi uint64, owner string) error {
 	s.remember(sliceRange{lo, hi, owner})
 	// Merge with the owner's range ending at lo-1 (consecutive batches of
 	// one writer), so a busy single-writer volume stays one entry.
-	v, err := s.p.side.Do(s.p.cfg.VolumeDB, strArgs("EVAL", mergeRangeLua, "1", SliceOwnersKey,
+	v, err := s.p.side.Do(s.p.cfg.VolumeDB, strArgs("EVAL", mergeRangeLua, "1", s.key,
 		strconv.FormatUint(lo, 10), strconv.FormatUint(hi, 10), owner)...)
 	if err == nil {
 		err = v.Err()

@@ -53,7 +53,7 @@ redis.call('ZADD', KEYS[5], ARGV[9], ARGV[6])
 redis.call('LREM', KEYS[2], 1, ARGV[3])
 redis.call('ZREM', KEYS[3], ARGV[6])
 redis.call('HDEL', KEYS[1], 'lease_owner', 'lease_expires_at', 'lease_expires_unix',
-  'claim_token', 'claim_phase', 'delivery_token', 'delivery_expires_unix')
+  'claim_token', 'claim_phase', 'delivery_token', 'delivery_expires_unix', 'delivery_claimed')
 if redis.call('LLEN', KEYS[2]) == 0 then redis.call('SREM', KEYS[4], ARGV[2]) end
 if ARGV[7] ~= '' then redis.call('SREM', KEYS[6], ARGV[6]) end
 return 1`
@@ -96,20 +96,33 @@ func (c *Client) HoldClaim(ctx context.Context, claim Claim, reason string) erro
 
 // updateUnheldJob keeps legacy ID-only status writers from overwriting custody
 // retained by HoldClaim. The check and update must share a Redis operation.
+// A missing record is a lost job: recreating it would leave a bare hash outside
+// the job index with no retention. Terminal writes start the JobTTL clock;
+// other status writes clear any enqueue-time TTL from an older producer.
 func (c *Client) updateUnheldJob(ctx context.Context, id string, fields map[string]any) error {
 	raw, err := json.Marshal(fields)
 	if err != nil {
 		return err
 	}
 	const script = `
+if redis.call('EXISTS', KEYS[1]) == 0 then return -1 end
 if redis.call('HEXISTS', KEYS[1], 'held_token') == 1 or
    (redis.call('HGET', KEYS[1], 'tracked_epoch') or '') ~= '' then return 0 end
 local fields = cjson.decode(ARGV[1])
 for k, v in pairs(fields) do redis.call('HSET', KEYS[1], k, tostring(v)) end
+local st = fields.status
+if st == 'done' or st == 'failed' or st == 'canceled' or st == 'dispatched' then
+  redis.call('EXPIRE', KEYS[1], ARGV[2])
+elseif st then
+  redis.call('PERSIST', KEYS[1])
+end
 return 1`
-	n, err := c.rdb.Eval(ctx, script, []string{JobHashPrefix + id}, raw).Int()
+	n, err := c.rdb.Eval(ctx, script, []string{JobHashPrefix + id}, raw, int64(JobTTL/time.Second)).Int()
 	if err != nil {
 		return err
+	}
+	if n == -1 {
+		return fmt.Errorf("%w: job %s status record is missing", ErrClaimLost, id)
 	}
 	if n != 1 {
 		return fmt.Errorf("%w: job %s is held", ErrClaimLost, id)

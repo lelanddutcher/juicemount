@@ -126,7 +126,7 @@ func TestSweeperEscalationEndToEndDrains(t *testing.T) {
 		t.Fatal("escalation did not finalize the leaked entry")
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), drainPassDeadline)
 	defer cancel()
 	d.DrainOnceForTest(ctx)
 

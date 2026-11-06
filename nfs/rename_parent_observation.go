@@ -40,6 +40,6 @@ func (jfs *juiceFS) RenameWithParentObservations(oldpath, newpath string, from, 
 		if !matched {
 			return fmt.Errorf("rename parent changed after validation: %w", syscall.EAGAIN)
 		}
-		return jfs.rename(oldpath, newpath, op)
+		return jfs.renameOnce(oldpath, newpath, op)
 	})
 }

@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Build a private Bash for Linux keyd tests. Bash 5.2.21 has an upstream
-# trap/command-substitution parser defect; this does not establish the cause
-# of any particular keyd TERM failure.
+# trap/command-substitution parser defect: a trapped signal that arrives
+# while it parses a $(...) at expansion time can be consumed without its
+# trap running. keyd.sh runs no command substitution under its stop trap,
+# so it no longer depends on this Bash; 5.3 is kept to test a current one.
 set -euo pipefail
 
 : "${RUNNER_TEMP:?RUNNER_TEMP must be set by GitHub Actions}"

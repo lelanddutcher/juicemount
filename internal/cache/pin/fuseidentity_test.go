@@ -2,6 +2,7 @@ package pin
 
 import (
 	"os"
+	"strings"
 	"testing"
 	"time"
 )
@@ -79,5 +80,19 @@ func TestFUSEIdentityCacheAndInvalidate(t *testing.T) {
 	SetFUSEIdentityPath("/dev")
 	if ok3, reason := FUSEIdentityState(); !ok3 {
 		t.Fatalf("cache not invalidated on SetFUSEIdentityPath: %s", reason)
+	}
+}
+
+// A probe whose statfs returned has freed the single-flight slot by the time
+// its caller has the answer, so the next consult runs its own probe instead
+// of reading "already in flight" (a wedge). Under -race the old order (slot
+// freed after the result was sent) failed a few dozen of 2000 consults.
+func TestFUSEIdentitySequentialProbesNotInFlight(t *testing.T) {
+	t.Cleanup(ResetFUSEIdentityForTest)
+	SetFUSEIdentityPath(t.TempDir())
+	for i := 0; i < 2000; i++ {
+		if _, reason := FUSEIdentityFresh(); strings.Contains(reason, "in flight") {
+			t.Fatalf("consult %d: %s, though every earlier probe had returned", i, reason)
+		}
 	}
 }

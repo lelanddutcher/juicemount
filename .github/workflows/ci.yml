@@ -16,7 +16,7 @@ jobs:
     runs-on: ubuntu-latest
     services:
       redis:
-        image: redis:7.4-alpine
+        image: redis:7.4-alpine@sha256:ff02b58f971e7d7d156a1267e283fcbbeee91773b6aa36c49dac28ecfe28eadf  # same digest as server/docker-compose.yml; the acceptance tests require Redis 7.4.11
         ports:
           - 6379:6379
         options: >-
@@ -25,7 +25,7 @@ jobs:
           --health-timeout 3s
           --health-retries 10
       respproxy-redis:
-        image: redis:7.4-alpine
+        image: redis:7.4-alpine@sha256:ff02b58f971e7d7d156a1267e283fcbbeee91773b6aa36c49dac28ecfe28eadf  # same digest as server/docker-compose.yml; the acceptance tests require Redis 7.4.11
         ports:
           - 6380:6379
         options: >-
@@ -43,11 +43,24 @@ jobs:
           cache: true
       - name: Prepare private Bash for keyd tests
         run: bash scripts/prepare-ci-bash.sh
+      - name: Fetch pinned Headscale for the Link integration test
+        # Same release the manager image ships (server/juicemount-manager/Dockerfile).
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/headscale" https://github.com/juanfont/headscale/releases/download/v0.29.3/headscale_0.29.3_linux_amd64
+          echo "8dc183758024ed7095cf610fedea0790233613c71353bc8be2715d82ba29b92c  $RUNNER_TEMP/headscale" | sha256sum -c -
+          chmod +x "$RUNNER_TEMP/headscale"
       - name: Unit and integration-safe tests
         env:
           JM_REQUIRE_GATE_HISTORY: '1'
+          JM_TEST_HEADSCALE_BIN: ${{ runner.temp }}/headscale
           JM_TEST_LINK_REDIS: redis://127.0.0.1:6379/13
           JM_TEST_MANAGER_REDIS: redis://127.0.0.1:6379/12
+          # Smart folders format throwaway JuiceFS volumes (each DB is flushed;
+          # one per package, since packages run in parallel).
+          JM_TEST_SMARTFOLDERS_META_REDIS: redis://127.0.0.1:6379/10
+          JM_TEST_SMARTFOLDERS_JFS_REDIS: redis://127.0.0.1:6379/9
+          # The continuity binder formats throwaway volumes too (flushed).
+          JM_TEST_CONTINUITY_REDIS: redis://127.0.0.1:6379/11
           JM_TEST_METADATA_REDIS: redis://127.0.0.1:6379/14
           JM_TEST_REDIS: redis://127.0.0.1:6379/15
           JM_RESPPROXY_TEST_REDIS: 127.0.0.1:6380
@@ -86,6 +99,7 @@ jobs:
           find scripts server/scripts test -type f -name '*.sh' -print0 | xargs -0 -n1 bash -n
           node --check internal/manager/static/app.js
           docker compose -f server/docker-compose.yml config --quiet
+          docker compose -f server/docker-compose.yml -f server/docker-compose.link.yml config --quiet
           bash server/scripts/update-server.test.sh
 
   mac-app:
@@ -147,3 +161,17 @@ jobs:
             echo 'stale-identity negative test unexpectedly passed' >&2
             exit 1
           fi
+      - name: Agent access probe and packaging verifier tests
+        run: |
+          scratch="$RUNNER_TEMP/p96"
+          mkdir -p "$scratch"
+          swiftc -parse-as-library -o "$scratch/agent-access-probe" \
+            app/JuiceMount/Tests/AgentAccessProbe.swift app/JuiceMount/Sources/JuiceMount/Core/AgentAccess.swift
+          "$scratch/agent-access-probe"
+          export P96_PRIVATE_TMPDIR="$scratch"
+          python3 scripts/test_verify_codesign_runtime.py
+          python3 scripts/test_verify_macos26_artifact.py
+          P96_SOURCE_APP=build/JuiceMount.app \
+          P96_EXPECTED_VERSION="$(awk -F'"' '/^var Version = / { print $2; exit }' internal/version/version.go)" \
+          P96_EXPECTED_COMMIT="$(git rev-parse HEAD)" \
+            python3 scripts/test_verify_build.py

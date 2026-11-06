@@ -18,8 +18,10 @@ import (
 func TestRowContentEqualComparesEveryMeaningfulField(t *testing.T) {
 	// Fields deliberately excluded from the comparison, with the reason.
 	excluded := map[string]string{
-		"UpdatedAt":  "it is the value being decided; comparing it would make every row differ",
-		"Provenance": "set by us, identical for any two sidecar-sourced rows",
+		"UpdatedAt":       "it is the value being decided; comparing it would make every row differ",
+		"Provenance":      "set by us, identical for any two sidecar-sourced rows",
+		"PendingAttempts": "local retry bookkeeping (json:\"-\"); a manifest row never carries it",
+		"PendingSince":    "local retry bookkeeping (json:\"-\"); a manifest row never carries it",
 	}
 
 	base := derivatives.DerivRow{

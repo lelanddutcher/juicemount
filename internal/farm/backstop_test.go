@@ -2,6 +2,7 @@ package farm
 
 import (
 	"context"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"testing"
@@ -28,7 +29,7 @@ func TestDiscoverModifiedRecursesAndExcludesFarmOutputs(t *testing.T) {
 	_ = os.Chtimes(filepath.Join(root, ".juicemount"), newer, newer)
 	_ = os.Chtimes(rootClip, newer, newer)
 
-	got, saturated, err := DiscoverModified(context.Background(), root, cursor, 20)
+	got, saturated, err := discoverByMtime(root, cursor, 20)
 	if err != nil || saturated {
 		t.Fatalf("discover: saturated=%v err=%v", saturated, err)
 	}
@@ -66,7 +67,7 @@ func TestDiscoverModifiedFindsEditedNestedFileWithUnchangedDirectoryMtime(t *tes
 		t.Fatal(err)
 	}
 
-	got, saturated, err := DiscoverModified(context.Background(), root, cursor, 20)
+	got, saturated, err := discoverByMtime(root, cursor, 20)
 	if err != nil || saturated {
 		t.Fatalf("discover: saturated=%v err=%v", saturated, err)
 	}
@@ -102,11 +103,19 @@ func TestDiscoverModifiedDeduplicatesNestedJobsBeforeCandidateCap(t *testing.T) 
 		}
 	}
 
-	got, saturated, err := DiscoverModified(context.Background(), root, cursor, 2)
+	got, saturated, err := discoverByMtime(root, cursor, 2)
 	if err != nil || !saturated {
 		t.Fatalf("discover: saturated=%v err=%v", saturated, err)
 	}
 	if len(got) != 2 || got[0] != "a" || got[1] != "b" {
 		t.Fatalf("expected one candidate per changed parent, got %v", got)
 	}
+}
+
+// discoverByMtime runs the walk as if every entry had been created at its
+// mtime. A test cannot set ctime, and these fixtures are about the mtime walk;
+// the ctime rule has its own tests in backstop_root_test.go.
+func discoverByMtime(root string, cursor time.Time, maxCandidates int) ([]string, bool, error) {
+	return discoverModified(context.Background(), root, cursor, maxCandidates,
+		func(info fs.FileInfo) time.Time { return info.ModTime() })
 }

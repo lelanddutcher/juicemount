@@ -71,7 +71,7 @@ func ThumbnailDecodeContext(ctx context.Context, ffmpegBin, decoder string, bitD
 	}
 	cmd := commandContext(ctx, ffmpegBin, args...)
 	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("ffmpeg thumbnail %q: %w: %s", srcPath, err, out)
+		return newToolFailure(fmt.Sprintf("ffmpeg thumbnail %q: %v: %s", srcPath, err, out), err, out, srcPath, outPath)
 	}
 	return nil
 }

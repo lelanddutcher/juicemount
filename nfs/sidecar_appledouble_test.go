@@ -9,7 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
-	"time"
 
 	"github.com/lelanddutcher/juicemount/metadata"
 )
@@ -179,7 +178,7 @@ func TestDrainerEmptySidecarRequiresAcknowledgedCompletion(t *testing.T) {
 	d.SetOnSidecarSkip(func(string) bool { skipped++; return true })
 	body := mustFixture(t, adEmptyReal)
 	e := writeSpoolEntry(t, spool, "/Films/._clip.mov", body)
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), drainPassDeadline)
 	defer cancel()
 	if n := d.DrainOnceForTest(ctx); n != 1 {
 		t.Fatalf("rows processed=%d", n)
@@ -222,7 +221,7 @@ func TestDrainerMaterialisesRealSidecar(t *testing.T) {
 	body := mustFixture(t, adFinderInfoReal)
 	writeSpoolEntry(t, spool, "/Films/._tagged", body)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), drainPassDeadline)
 	defer cancel()
 	if n := d.DrainOnceForTest(ctx); n != 1 {
 		t.Fatalf("rows processed = %d, want 1", n)
@@ -248,7 +247,7 @@ func TestDrainerKillSwitchMaterialisesEverything(t *testing.T) {
 	})
 
 	writeSpoolEntry(t, spool, "/Films/._clip.mov", mustFixture(t, adEmptyReal))
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), drainPassDeadline)
 	defer cancel()
 	d.DrainOnceForTest(ctx)
 	if _, err := os.Stat(filepath.Join(d.fuseRoot, "Films/._clip.mov")); err != nil {
@@ -266,7 +265,7 @@ func TestDrainerSkipVetoFallsBackToNormalDrain(t *testing.T) {
 
 	body := mustFixture(t, adEmptyReal)
 	writeSpoolEntry(t, spool, "/Films/._clip.mov", body)
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), drainPassDeadline)
 	defer cancel()
 	d.DrainOnceForTest(ctx)
 
@@ -291,7 +290,7 @@ func TestDrainerNonSidecarNeverElided(t *testing.T) {
 	})
 
 	writeSpoolEntry(t, spool, "/Films/clip.mov", mustFixture(t, adEmptyReal))
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), drainPassDeadline)
 	defer cancel()
 	d.DrainOnceForTest(ctx)
 	if _, err := os.Stat(filepath.Join(d.fuseRoot, "Films/clip.mov")); err != nil {

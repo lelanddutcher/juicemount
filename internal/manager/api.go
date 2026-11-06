@@ -95,6 +95,10 @@ type API struct {
 	// farmQueue interface (farm.go) so tests can fake the queue; the
 	// production value is always a *farmqueue.Client.
 	farmQ farmQueue
+
+	// continuity is the experimental volume binder (continuity.go), nil
+	// unless JM_CONTINUITY=on. Set in Register before serving.
+	continuity *continuityService
 }
 
 // Config bundles the fields needed to construct + register the API.
@@ -169,8 +173,11 @@ type Config struct {
 // callers can attach lifecycle hooks (StopAll on shutdown).
 //
 // Static UI is served from <prefix>/, JSON API from <prefix>/api/...
-func Register(mux *http.ServeMux, prefix string, cfg Config) *JobManager {
+func Register(outer *http.ServeMux, prefix string, cfg Config) *JobManager {
 	prefix = strings.TrimSuffix(prefix, "/")
+	// Every route refuses agent tokens unless it is on their allowlist
+	// (agentguard.go).
+	mux := newAgentRouteMux(outer, prefix)
 	// H-8B: --meta carries user@host only; in-process clients get the
 	// password from JM_META_PASSWORD (principals.go, volume credentials).
 	cfg.MetaURL, cfg.OverviewMetaURL = withEnvMetaPassword(cfg.MetaURL), withEnvMetaPassword(cfg.OverviewMetaURL)
@@ -407,10 +414,29 @@ func Register(mux *http.ServeMux, prefix string, cfg Config) *JobManager {
 	// H-8B: Mac principal enrollment, leases admin, mode switch, and the
 	// project checkout for sync/trash restore (principals.go).
 	a.registerH8B(mux, prefix, cfg)
+	// Experimental smart folders (JM_SMART_FOLDERS=on, standalone mode only).
+	// Started after registerH8B so view writes check out their project
+	// with the same leaser trash restore uses.
+	if svc := a.startSmartFolders(cfg, os.Getenv); svc != nil {
+		mgr.mu.Lock()
+		mgr.smartFolders = svc
+		mgr.mu.Unlock()
+	}
+	// Experimental continuity volume binder (JM_CONTINUITY=on): read-only
+	// lookups by path or asset id, and what the binder observed or missed.
+	if svc := a.startContinuity(cfg, os.Getenv); svc != nil {
+		a.continuity = svc
+		mgr.onStopAll(svc.Stop)
+	}
+	mux.HandleFunc(prefix+"/api/continuity/assets", a.auth(a.handleContinuityAssets))
+	mux.HandleFunc(prefix+"/api/continuity/status", a.auth(a.handleContinuityStatus))
 	// Static UI: serve <prefix>/ and <prefix>/<file>. Strip prefix so
 	// the existing handleStatic logic still works.
 	staticHandler := http.StripPrefix(prefix, http.HandlerFunc(a.handleStatic))
 	mux.Handle(prefix+"/", staticHandler)
+	if routesRegistered != nil {
+		routesRegistered(mux.patterns)
+	}
 	return mgr
 }
 

@@ -222,6 +222,7 @@ func replacementNestedFixtureBodyVolume(t *testing.T, body []byte, uuid string) 
 // seedReplacementNestedFixtureBody uses a caller-owned spool root when needed.
 func seedReplacementNestedFixtureBody(t *testing.T, x *boundCacheFixture, body []byte, spoolRoot string) (*boundCacheFixture, *SpoolStore, *Drainer, *metadata.SpoolRow, *metadata.SpoolReplacementWitness, []byte) {
 	t.Helper()
+	useSpoolFixtureMutationBound(t)
 	format := &jfsmeta.Format{Name: "selected-volume", UUID: x.volumeUUID, Storage: "mem", BlockSize: 4096, Compression: "none"}
 	bootstrap := jfsmeta.NewClient(x.raw, jfsmeta.DefaultConf())
 	defer bootstrap.Shutdown()

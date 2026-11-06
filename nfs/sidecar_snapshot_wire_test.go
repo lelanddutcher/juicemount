@@ -547,6 +547,7 @@ func TestP79LiveSnapshotOnlineWriteOfflineContinuation(t *testing.T) {
 }
 
 func TestP79RestoredReadSnapshotCannotSeedOfflineWrite(t *testing.T) {
+	useSpoolFixtureMutationBound(t)
 	wasOffline := pin.IsOffline()
 	pin.SetOffline(false)
 	t.Cleanup(func() { pin.SetOffline(wasOffline) })

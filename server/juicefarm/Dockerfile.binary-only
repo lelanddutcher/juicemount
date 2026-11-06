@@ -9,7 +9,7 @@
 ARG BASE_IMAGE=juicefarm:stream-exclusion
 ARG JM_VERSION
 ARG JM_COMMIT
-FROM golang:1.26.9-bookworm AS gobuild
+FROM golang:1.26.10-bookworm AS gobuild
 ARG JM_VERSION
 ARG JM_COMMIT
 WORKDIR /src

@@ -81,6 +81,7 @@ _OFFLINE_FORCED=0   # 1 once we have forced offline and must restore off
 # ---------------------------------------------------------------------------
 # Cleanup trap — ALWAYS restore connectivity + offline=off, then lib cleanup.
 cleanup_07() {
+    [ "${QA_KEEP_DATA:-0}" = 1 ] && return 0
     local rc=$?
     # 1) Restore network FIRST (so the drainer/health can recover for any
     #    later category and so we never leave the user offline).
@@ -166,6 +167,13 @@ _derive_nas_ip() {
 # its lifetime here), but the WHOLE case is bounded by qa_timeout elsewhere.
 _kick_finder_bg() {
     local src="$1" destp="$2"
+    if [ "${QA_STRICT_RELEASE:-0}" = 1 ]; then
+        local id="offline-${#C07_PIDS[@]}"
+        qa_release_start_copy "$id" "$src" "$destp" ''
+        C07_LAST_PID="$SNAP_LAST_PID"
+        C07_PIDS+=("$C07_LAST_PID"); C07_IDS+=("$id")
+        return 0
+    fi
     osascript \
         -e 'on run argv' \
         -e '  set s to POSIX file (item 1 of argv) as alias' \
@@ -180,6 +188,16 @@ _kick_finder_bg() {
 # exited, 1 on timeout (PID still alive). Polls 1s; bounded; no GNU timeout.
 _wait_pid_or_timeout() {
     local pid="$1" secs="$2" waited=0
+    if [ "${QA_STRICT_RELEASE:-0}" = 1 ]; then
+        local i
+        for ((i=0;i<${#C07_PIDS[@]};i++)); do
+            if [ "${C07_PIDS[$i]}" = "$pid" ]; then
+                qa_release_join_copy "${C07_IDS[$i]}" "$pid" "$secs"
+                return 0
+            fi
+        done
+        qa_release_hold 'original Finder PID absent from owned registry'
+    fi
     while [ "$waited" -lt "$secs" ]; do
         kill -0 "$pid" 2>/dev/null || return 0
         perl -e 'select undef,undef,undef,1'
@@ -191,6 +209,11 @@ _wait_pid_or_timeout() {
 
 # ===========================================================================
 qa_begin 07-offline-spool
+if [ "${QA_STRICT_RELEASE:-0}" = 1 ]; then
+    qa_release_hook preflight 07 || qa_release_hold 'owned transport hook not admitted'
+    qa_release_custody_init
+    C07_PIDS=(); C07_IDS=()
+fi
 
 qa_preflight || { qa_fail "preflight failed — skipping 07-offline-spool"; qa_end; \
     echo "VERDICT: FAIL 07-offline-spool: preflight (control plane/mount not ready)"; exit 0; }
@@ -215,7 +238,11 @@ if [ "$(_spool_offline_flag)" = "1" ]; then
 fi
 
 qa_info "A: launching REAL Finder duplicate of $A_SRC -> $A_DEST in background"
-A_PID="$(_kick_finder_bg "$A_SRC" "$A_DEST")"
+if [ "${QA_STRICT_RELEASE:-0}" = 1 ]; then
+    _kick_finder_bg "$A_SRC" "$A_DEST"; A_PID="$C07_LAST_PID"
+else
+    A_PID="$(_kick_finder_bg "$A_SRC" "$A_DEST")"
+fi
 # Let a handful of files commit while ONLINE, then flip offline mid-flight.
 perl -e 'select undef,undef,undef,1.5'
 
@@ -245,6 +272,7 @@ while [ "$i" -lt 30 ]; do
     p="$(qa_spool_pending)"
     [ "$p" -gt "$A_MAX_PENDING" ] 2>/dev/null && A_MAX_PENDING="$p"
     f="$(qa_spool_actionable_failed)"; q="$(qa_spool_field quarantined)"
+    if [ "${QA_STRICT_RELEASE:-0}" = 1 ]; then [ "$f" = 0 ] && [ "$q" = 0 ] || qa_release_hold "unknown or failed offline spool observation"; fi
     if [ "$f" != "0" ] && [ "$f" != "-1" ]; then
         qa_fail "A: spool reported failed_files=$f while buffering offline (dest $A_DEST)"
         break
@@ -277,7 +305,7 @@ if [ "$A_MAX_PENDING" -gt 0 ] 2>/dev/null; then
 else
     # Small fast tree may fully buffer before our first poll; not a hard fail,
     # but flag it so a human can grow OFFLINE_* if the buffer phase was missed.
-    qa_warn "A: never observed pending_files>0 while offline (tree may have buffered between polls; consider larger OFFLINE_FPD/SIZE) dest $A_DEST"
+    qa_fail "A: never observed pending_files>0 while offline (tree may have buffered between polls; consider larger OFFLINE_FPD/SIZE) dest $A_DEST"
 fi
 
 # Let the background Finder copy finish writing (into the spool) before draining.
@@ -319,7 +347,31 @@ fi
 # CASE B — REAL network disconnect (gated). Drop the NAS route, copy, restore.
 # ---------------------------------------------------------------------------
 qa_sec "CASE B: REAL network-interruption variant (REQUIRE_REAL_DISCONNECT=$REQUIRE_REAL_DISCONNECT)"
-if [ "$REQUIRE_REAL_DISCONNECT" != "1" ]; then
+if [ "${QA_STRICT_RELEASE:-0}" = 1 ]; then
+    qa_release_hook transport verify-on || qa_release_hold 'owned transport initial online proof failed'
+    B_DEST="$QA_DEST_ROOT/$(qa_unique_tag QA)"; mkdir -p "$B_DEST"
+    B_SRC="$QA_STAGE/offline_B"
+    B_MANIFEST="$(qa_stage_tree "$B_SRC" 2 60 "$OFFLINE_SIZE" 0)"
+    mark_b=$(qa_log_mark)
+    _kick_finder_bg "$B_SRC" "$B_DEST"; B_PID="$C07_LAST_PID"
+    qa_release_hook transport off || qa_release_hold 'owned transport disconnection unknown'
+    qa_release_hook transport verify-off || qa_release_hold 'real owned transport loss unproved'
+    B_PENDING=0
+    for ((j=0;j<25;j++)); do
+        p="$(qa_spool_pending)"; f="$(qa_spool_actionable_failed)"; q="$(qa_spool_field quarantined)"
+        [ "$p" -ge 0 ] 2>/dev/null && [ "$f" = 0 ] && [ "$q" = 0 ] || qa_release_hold 'unknown or failed spool during actual transport outage'
+        [ "$p" -gt 0 ] && B_PENDING=1
+        sleep 1
+    done
+    [ "$B_PENDING" = 1 ] || qa_release_hold 'no accepted buffered writes observed during transport loss'
+    qa_release_hook transport on || qa_release_hold 'owned transport restoration unknown'
+    qa_release_hook transport verify-on || qa_release_hold 'owned transport reconnect unproved'
+    _wait_pid_or_timeout "$B_PID" 600
+    qa_wait_drain || qa_release_hold 'spool did not settle after real reconnect'
+    qa_verify_custody "$B_MANIFEST" "$B_DEST/$(basename "$B_SRC")" || qa_release_hold 'reconnected custody failed'
+    qa_error_scan "$mark_b" B-real-disconnect || qa_release_hold 'Finder error during real reconnect'
+    qa_pass 'B: real owned transport loss, buffered writes, reconnect, original Finder reply and independent backend custody'
+elif [ "$REQUIRE_REAL_DISCONNECT" != "1" ]; then
     qa_info "B: SKIPPED — set REQUIRE_REAL_DISCONNECT=1 to run the destructive real-disconnect variant."
     qa_info "B: it will temporarily block the single NAS IP (pfctl, or 'route delete'), NOT all networking, and restore it in the EXIT trap."
 else
@@ -392,6 +444,7 @@ WARN
             j=0
             while [ "$j" -lt 25 ]; do
                 f="$(qa_spool_actionable_failed)"; q="$(qa_spool_field quarantined)"
+    if [ "${QA_STRICT_RELEASE:-0}" = 1 ]; then [ "$f" = 0 ] && [ "$q" = 0 ] || qa_release_hold "unknown or failed offline spool observation"; fi
                 if { [ "$f" != "0" ] && [ "$f" != "-1" ]; } || { [ "$q" != "0" ] && [ "$q" != "-1" ]; }; then
                     qa_fail "B: spool failed_files=$f quarantined=$q during real outage (dest $B_DEST)"
                     B_OUTAGE_CLEAN=0; break
@@ -473,12 +526,16 @@ C_FILE_LIMIT="$STALL_MAX_FILES"
 C_CAP_REACHABLE=1
 _c_cap_total="$(qa_spool_field capacity_total)"
 _c_cap_used="$(qa_spool_field capacity_used)"
+if [ "${QA_STRICT_RELEASE:-0}" = 1 ]; then
+    [ "$_c_cap_total" -gt 0 ] 2>/dev/null && [ "$_c_cap_used" -ge 0 ] 2>/dev/null || qa_release_hold "spool capacity observation unknown"
+fi
 if [ "$_c_cap_total" -gt 0 ] 2>/dev/null && [ "$_c_cap_used" -ge 0 ] 2>/dev/null; then
     _c_remaining=$((_c_cap_total - _c_cap_used))
     _c_max_stage=$((STALL_MAX_FILES * STALL_FILE_SIZE))
     if [ "$_c_max_stage" -le "$_c_remaining" ] 2>/dev/null; then
         C_CAP_REACHABLE=0
         C_FILE_LIMIT=3
+        [ "${QA_STRICT_RELEASE:-0}" != 1 ] || qa_release_hold "bounded workload cannot reach admitted spool capacity"
         qa_warn "C: live spool headroom is ${_c_remaining}B, but this bounded fixture can stage only ${_c_max_stage}B; a cap stall is impossible in this run. Running three offline custody samples instead of writing all $STALL_MAX_FILES files."
     fi
 fi
@@ -486,7 +543,11 @@ n=1
 while [ "$n" -le "$C_FILE_LIMIT" ]; do
     cf="$C_SRC/stall_$n.dat"
     cmd5="$(qa_stage_file "$cf" "$STALL_FILE_SIZE")"
+    if [ "${QA_STRICT_RELEASE:-0}" = 1 ]; then
+    _kick_finder_bg "$cf" "$C_DEST"; pid="$C07_LAST_PID"
+else
     pid="$(_kick_finder_bg "$cf" "$C_DEST")"
+fi
     # Record the manifest entry up front; we only custody-verify landed files.
     printf '%s\t%s\n' "stall_$n.dat" "$cmd5" >> "$C_MANIFEST"
     # Watch briefly: did the spool report a stall, or did this copy park?
@@ -501,6 +562,7 @@ while [ "$n" -le "$C_FILE_LIMIT" ]; do
         fi
         # Hard gate: a spool-full condition must NEVER surface as failed/quarantined.
         f="$(qa_spool_actionable_failed)"; q="$(qa_spool_field quarantined)"
+    if [ "${QA_STRICT_RELEASE:-0}" = 1 ]; then [ "$f" = 0 ] && [ "$q" = 0 ] || qa_release_hold "unknown or failed offline spool observation"; fi
         if { [ "$f" != "0" ] && [ "$f" != "-1" ]; } || { [ "$q" != "0" ] && [ "$q" != "-1" ]; }; then
             qa_fail "C: spool-full produced failed_files=$f quarantined=$q (must STALL, not fail; dest $C_DEST)"
             C_STALL_SEEN=2  # sentinel: errored, stop
@@ -512,10 +574,12 @@ while [ "$n" -le "$C_FILE_LIMIT" ]; do
     done
     [ "$C_STALL_SEEN" != "0" ] && break
     kill -0 "$pid" 2>/dev/null && C_PARKED_PID="$pid"
+    if [ "${QA_STRICT_RELEASE:-0}" = 1 ]; then _wait_pid_or_timeout "$pid" 120; C_PARKED_PID=""; fi
     C_COPIED=$((C_COPIED+1))
     n=$((n+1))
 done
 
+[ "${QA_STRICT_RELEASE:-0}" != 1 ] || [ "$C_STALL_SEEN" = 1 ] || qa_release_hold "actual spool-cap stall was not observed"
 if [ "$C_STALL_SEEN" = "1" ]; then
     qa_pass "C: spool-full STALLED gracefully (stall_waiters/offline_buffer_full observed) — copy parked, did NOT error"
 elif [ "$C_STALL_SEEN" = "2" ]; then
@@ -559,11 +623,15 @@ cf2="$(qa_spool_actionable_failed)"; cq2="$(qa_spool_field quarantined)"
 # Custody: only assert files that actually landed (a parked-then-cancelled write
 # may not have committed). Build a landed-only manifest, then verify it.
 C_LANDED_MANIFEST="$QA_CAT_DIR/offline_C.landed.manifest"
+if [ "${QA_STRICT_RELEASE:-0}" = 1 ]; then
+    C_LANDED_MANIFEST="$C_MANIFEST"
+else
 : > "$C_LANDED_MANIFEST"
 while IFS="$(printf '\t')" read -r rel md; do
     [ -z "$rel" ] && continue
     [ -f "$C_DEST/$rel" ] && printf '%s\t%s\n' "$rel" "$md" >> "$C_LANDED_MANIFEST"
 done < "$C_MANIFEST"
+fi
 if [ -s "$C_LANDED_MANIFEST" ]; then
     if qa_verify_custody "$C_LANDED_MANIFEST" "$C_DEST"; then
         qa_pass "C: every landed file is byte-identical (no corruption from the stall)"

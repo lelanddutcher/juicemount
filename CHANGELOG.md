@@ -1,5 +1,409 @@
 # JuiceMount Changelog
 
+## 0.5.1 — 2026-11-04 (build 38)
+
+A reliability update to 0.5.0, with a security fix in the Redis proxy, the
+first part of Teams (off until you add a person) and changes to JuiceMount
+Link. Update checks remain manual through **Check for Updates…** in the app.
+Read the **Upgrading** sections at the end before updating the server, Link
+or farm workers.
+
+### App and Link
+
+- Starting the mount after updating the app works when the previous version's
+  mount was stopped cleanly. Before, the new build refused the old build's
+  stopped owner record, so Start failed after an upgrade. A previous owner that
+  is still running, or whose stop cannot be proven, is still refused.
+- A mount started by the volume owner now uses this Mac's own object-store key.
+  Before, the key was dropped at that step, so the mount used whatever
+  object-store credentials it inherited instead of this Mac's key.
+- Over JuiceMount Link's adaptive path, a Redis reply that stops partway
+  through no longer hangs the mount. The response watchdog now stays armed until the whole reply
+  has arrived, so a stalled connection is closed after 2 seconds without
+  progress and reconnects. Before, the first byte of a reply disarmed it, and a
+  stall mid-reply could leave Finder waiting indefinitely. Waiting for a slow
+  reader on the Mac does not count as a stall.
+- A file whose stored name differs from the requested name only in Unicode
+  normalization (for example an accented name created on another system in a
+  different form) now opens instead of reporting that it does not exist.
+  Stored names are never changed. If two names in a folder match the same
+  canonical form, or the local view of the folder is incomplete, no match is
+  guessed and the lookup reports the file missing as before.
+- Support commands for a mount left behind after its processes stopped (issue
+  #4), run from a standalone build and never as root:
+  `--unmount-operation-status` reads the eject helper's progress for an
+  unmount without changing anything. `--recover-retained-generation` runs that
+  mount's ordinary retirement; with `--withdraw` it withdraws it instead, and
+  `--eject-now` ejects it, but only after a withdrawal has completed. It works only on an isolated test install (`JM_APP_ISOLATION`), only
+  after the owner and its NFS export are proven gone, and leaves queued saves
+  and local databases in place. Ordinary installs are unchanged, and packaged
+  recovery acceptance remains open.
+- Handing a resident file's cached blocks over for upload now rereads any block
+  written in the last two seconds and checks it against its recorded hash.
+  Before, an in-place edit that kept the file's size and timestamp, and landed
+  in the same timestamp tick as the block's last change, could hand over bytes
+  that no longer matched the hash. Older blocks keep the metadata check.
+- A rename, delete or file creation that the Mac sent again because the
+  mount was busy, for example during a large copy onto it, no longer loses
+  data. The first request had already finished, and running it a second time
+  could discard a just-copied file's not-yet-uploaded bytes and leave its
+  name reporting an I/O error while Finder showed no error, delete or empty
+  a file another app had just put at that name, or replace a moved file with
+  a new one. A resent request that already finished is now answered as the
+  success it was, once, for up to 40 seconds, without running it again. The
+  Mac cannot tell a resend from an identical new request within that time,
+  so such a request is also answered without running; repeat it if needed.
+  A rename of a missing source no longer touches the destination.
+- A folder the Mac had listed only in part now lists again until it is
+  complete. Before, a listing cut short by a slow reply (most often on a slow
+  or metered link), or a folder the Mac knew only from a file it had opened,
+  created or renamed there, could stay short of files until the server
+  reported a change in that folder or the daily rescan ran. Retries back off,
+  and a stuck one no longer holds up other folders. On a slow link a folder
+  of a few dozen files also lists completely now: before, time spent waiting
+  its turn counted against the listing's own time limit, so every attempt ran
+  out.
+
+### Server
+
+- A fresh server install creates the `zpool` bucket before it sets up the
+  object-store users. Before, setup used the restricted format key, which
+  cannot create buckets, so a first install failed. An existing bucket and its
+  data are left as they are, and setup stops unless the object store confirms
+  the bucket.
+- The Redis proxy applies tightened checks to records that the server's own
+  background cleanup acts on. JuiceFS clients on Macs and farm workers write
+  these records as before. The details are in this
+  repository's GitHub security advisories.
+
+### JuiceFarm and Manager
+
+- Experimental smart folders, off by default (`JM_SMART_FOLDERS=on` to try
+  them): the Manager keeps a top-level **Recents** folder
+  (`JM_SMART_FOLDERS_ROOT`) with one view per top-level folder of the volume,
+  each listing that folder's most recently changed files as links. Every Mac
+  and every app's file picker sees the same views. The feature never deletes,
+  overwrites or adopts your files, respects project leases, and turns itself
+  off rather than stopping the Manager if it fails.
+- The first successful **Test Connection** of an SFTP destination stores the
+  server's host key. Later connections must present the same key, or they stop
+  before any password or key is sent. Sync jobs use the stored key and refuse
+  to run until the destination has been tested once. Editing a destination
+  keeps its key while the host and port are unchanged.
+- A farm worker that was partitioned past its claim lease, reaped, and replaced
+  can no longer publish a legacy job's outcome, dispatch, or acknowledgement
+  over the worker that now owns the job. The reaper also waits for the legacy
+  delivery lease instead of releasing a claim as soon as a heartbeat lapses.
+- A legacy job claimed while the claim's reply was lost (a dropped
+  connection, a Redis restart, or a client retry after a timeout) is returned
+  by the worker's next claim, or put back in its queue if the worker has
+  stopped claiming (disabled, paused, draining, or waiting on the storage
+  permit). Before, it stayed queued in that worker's processing list, run by
+  no one, until the worker exited. The fix runs in each worker's own claim, so
+  every jmfarm worker must be upgraded to get it.
+- A legacy job claimed for a worker that never learned of the claim (a claim
+  request that reached Redis late, after the worker had moved on) is put back
+  in its queue once it has waited a minute unstarted, even while that worker
+  is alive and working on something else. Before, it waited in that worker's
+  processing list until the worker exited. A worker that starts the job at the
+  same moment either keeps it or is refused the start, so the job runs once.
+- A worker whose request to put a job back in its queue was retried after a
+  lost reply no longer stops as if it had lost the job. The retry now reports
+  that the first request succeeded. This runs in the worker's own request, so
+  an un-upgraded worker still stops.
+- A worker retries a transient Redis fault while publishing a job's outcome. If
+  the outcome still cannot be published, the worker stops so another worker
+  recovers the job, instead of leaving it shown as running.
+- Legacy job records no longer expire while queued or running. The 7-day
+  retention starts when a job finishes or is dispatched.
+- The job-index cleanup now walks the whole index from a shared cursor, runs
+  from the workers as well as the Manager status page, sweeps at most once per
+  15 seconds across the farm, and skips index entries that are not job records.
+- Known limit: a queued or running legacy record whose job is no longer in any
+  queue or worker receipt now stays in the jobs list until it is removed by
+  hand. Before, it expired 7 days after it was queued.
+- A poster, filmstrip, or waveform that could not be written because the
+  derivative storage was full, read-only, or unmounted is retried. Before, it
+  was recorded as a failure for the build, so the retry skipped the file as
+  done and the preview stayed missing until the next farm update. A fault
+  that has not cleared after three tries over 6 hours
+  (`JM_FARM_BLOB_RETRY_WINDOW_SEC`; permission faults count as faults that may
+  clear), a broken derivative folder (a symlink or a file where a folder
+  belongs), and media that ffmpeg cannot decode are
+  recorded as failed and tried again only after the next farm update.
+- A worker's claim poll inspects at most 64 queued jobs per queue and continues
+  where it stopped on the next poll, so an idle worker behind a large backlog
+  meant for another GPU no longer holds the shared Redis for up to 0.3 s on
+  every poll. Each poll also checks up to 64 jobs queued since the worker's
+  last poll, after older jobs, so new work behind such a backlog is claimed
+  within a poll or two once the worker is polling. An idle worker polls less
+  often, up to every 2 seconds, so new work can wait up to that long, and it
+  walks a backlog it cannot serve at up to 4 polls a second; a claim speeds it
+  up again. Claiming a job found deep in a long queue costs more than a poll:
+  up to about 2 ms in the middle of 100,000 jobs.
+- The backend storage permit is timed by the Redis clock. A server whose clock
+  ran a few seconds ahead of Redis blocked every render claim.
+- A directory job replayed after a worker crash queues every file it finds. A
+  file added between the crash and the replay could be left without a job.
+- The watch backstop finds a folder copied to the top of the volume with its
+  original dates (rsync -a, cp -p, Finder), and looks back up to 2 minutes
+  before its cursor (`JM_FARM_WATCH_BACKSTOP_SKEW_SEC`) to catch files from
+  editors whose clocks are behind the farm's. A change just before a scan can
+  start one extra catch-up pass, which finds its previews current. To keep it
+  to one, the look-back never reaches before the previous catch-up pass: with
+  the default 15-minute interval that is the full 2 minutes, but when the
+  backstop scans again soon after a catch-up pass (a restarted farm, or a short
+  `JM_FARM_WATCH_BACKSTOP_SEC`) it can be shorter.
+
+### Teams: people, write grants and the audit log
+
+- Teams is in this release and stays off until you add the first person on
+  the Manager's **People and access** page: until then every Mac writes
+  everywhere and nothing is logged (unless `JM_AUDIT=on`), as in 0.5.0. This
+  first version has two limits. Grants limit writing only: every Mac on the
+  volume can still read every folder, granted or not. And while grants are in
+  force, quotas work only on project folders and below (see the quotas entry
+  below).
+- The Manager has people (**People and access**). Each Mac belongs to one
+  person. A person with access "all" writes everywhere; the first folder you
+  grant limits that person to granted client folders or projects, in every
+  proxy mode, also passthrough. Refused writes fail on the Mac as read-only.
+- Once any grant exists, grants are in force: a Mac that belongs to no person
+  (a new or auto-approved Mac, or the Macs of a person you removed) can read
+  but not write until you assign it. Removing the last limited person does
+  not lift this; **Let Macs with no person write again** on the People page
+  does. A Mac that enrolls as a rotated copy of another Mac gets that Mac's
+  person when you approve or confirm it, never from the auto-approve window.
+- A limited person can no longer write into, change, or restore a file
+  deleted from a project they have no grant on, can no longer remove the
+  quota of a folder above their projects, and can no longer change another
+  project's quota usage or folder statistics, also not inside a transaction
+  that writes their own files (that let them make another project refuse
+  every new file with "disk quota exceeded").
+- Quotas and grants: quotas on project folders and below work as before.
+  Quotas above the project folders (on the volume or on a client folder
+  such as `/Clients`) are not supported while per-person grants are in
+  force: such a quota adds up every project below it, so a limited person's
+  Mac could not report its usage without being able to change it for the
+  other projects. The Manager does not put grants in force while one exists
+  and says which and how to remove it (`juicefs quota delete <META-URL>
+  --path /Clients`), and it cannot put grants in force without a metadata
+  URL to check with. While grants are in force the proxy refuses to create
+  one, including through the admin's juicefs, and refuses writing the quota
+  hashes as a whole; the admin's raw maintenance commands that name no key
+  (FLUSHDB, SWAPDB, scripts) can still rewrite them, as any key. The
+  Manager reads the project depth the proxy uses. If one exists anyway
+  (made directly in Redis), the People page names it: until it is removed,
+  the quota usage of limited people's writes does not update, because
+  JuiceFS sends all quotas in one update and the proxy refuses it. Before, a limited person could add or
+  subtract any amount to such a quota's usage, which made every other
+  project in the folder refuse new files or lifted the folder's quota.
+- No writer but the background jobs can store a value other than a whole
+  number in the folder statistics or quota usage (for example with
+  HINCRBYFLOAT), with or without people, in every proxy mode. One such value
+  stopped every JuiceFS client that started afterwards from loading quotas,
+  so no quota was enforced, and made the running clients count other
+  folders' usage several times.
+- The Redis proxy keeps a hash-chained audit log of who changed what in
+  `respproxy/audit` beside the principals file. It starts when the first
+  person is added (`JM_AUDIT=on` logs from the start, `off` never) and keeps
+  at most 2 GB and 400 days (`JM_AUDIT_RETAIN_MB`, `JM_AUDIT_RETAIN_DAYS`;
+  the oldest segments are removed with a record that keeps the chain
+  verifiable). While grants are in force, a Mac's change reaches Redis only
+  after its record is on disk, and Mac writes are refused when the log cannot
+  write (a full disk, for example); the People page says so and why. On this
+  test machine that wait added about 1.3 ms to a create. Content writes are
+  summarized per file and 10 seconds and are not waited for. Refused writes
+  are logged one by one up to 20 per Mac and minute, and after that the first
+  refusal in each project (up to 64 more), and counted per project after
+  that, so a Mac retrying a refused write in a loop cannot push the history
+  out through the size limit, nor hide an attempt on another project behind
+  it. A change with very many entries (a transaction that adds thousands of
+  names) lists its first entries (at most 256, and at most 1 MB in all), how
+  many it leaves out, and a SHA-256 of the change's commands as the Mac sent
+  them, which matches a capture of its traffic (and Redis's AOF when every
+  command of the change wrote something). The log never
+  writes a line longer than 4 MB; one longer line once made the whole log
+  unreadable. A log that fills its disk past its size limit
+  removes its oldest segments and recovers; under the limit it stays failed
+  and the People page says to free space or lower the limit.
+- A volume with no person writes nothing for the log, not even its health
+  file, as before.
+- The Manager checks the log every minute and records its head in its own
+  state (`audit-anchors.json`), so a rewritten log, one cut back to before
+  the last check, or a removed audit directory is reported. It also checks
+  every retention record against the size and age limits: a cut of the oldest
+  records that the limits do not explain is reported, and a retention that
+  removes records less than a week old is a warning (a flood of records, or
+  a size limit too small for the volume), as is a size limit that, at the
+  rate the log grows, will keep less than a week. A log the Manager cannot
+  read in two checks in a row is reported until a read succeeds; before, its
+  check stopped there and the page said the chain was fine. The full read
+  the check sometimes needs no longer holds up the People page, and a
+  failure of that read is reported as such, not as removed records. What it cannot catch: records
+  written after the last check can be cut unnoticed, a cut of the oldest
+  records that the limits could have made passes, and someone who can write
+  both the proxy's directory and the Manager's state can rewrite both. If
+  you delete the log on purpose, delete `audit-anchors.json` too.
+
+### JuiceMount Link
+
+- Link has two ways to expose the NAS, chosen by `JM_NET_NAS_EXPOSURE`:
+  - `services` serves only the JuiceMount ports (Redis proxy 30179, object
+    storage 30151, Manager 30190) on the NAS node's own tailnet address. The
+    node carries `tag:jm-nas`, which is how a Mac app from this release finds
+    it; while that node is online, the app dials it for the NAS's ports even
+    when some other node's route covers the NAS's LAN address. Mac apps from
+    earlier releases, and remote farm nodes, cannot reach it: they follow
+    subnet routes only.
+  - `subnet` advertises a LAN prefix through the NAS node, the only path
+    Link had before. Every Mac app version and remote farm node reaches it.
+    The prefix is `JM_NET_NAS_ROUTE`, or `192.168.0.0/24` when that is unset,
+    as before. The Manager does not tag the node, so a Mac waits for the
+    route instead of using the node's tailnet address. A NAS node that ran
+    with `services` keeps `tag:jm-nas` after a switch to `subnet` (Headscale
+    cannot take a tagged node's last tag away), so a current Mac reaches it
+    at its tailnet address, which serves the same ports, rather than through
+    the route.
+  - `JM_NET_NAS_LAN_ADDR` is the NAS's own LAN address. Under `subnet` it
+    must be inside the route, and narrows the policy to the JuiceMount ports
+    on that address instead of on every host in the route. Under `services`
+    it tells status which routes matter (see below).
+- When `JM_NET_NAS_EXPOSURE` is unset, setting `JM_NET_NAS_ROUTE` selects
+  `subnet`. Otherwise an install whose NAS node already ran
+  (`/data/headscale/nas-node` exists) keeps `subnet`, and a new install uses
+  `services`. Before the NAS node first starts, the Manager records the
+  exposure it starts with (whichever of the above chose it) in
+  `/data/headscale/nas-exposure`, and that record is the default from then
+  on, so removing a variable later does not change the exposure. The node
+  does not start until the record is written. To switch, set
+  `JM_NET_NAS_EXPOSURE` and restart the Manager.
+- `JM_NET_NAS_EXPOSURE=services` together with `JM_NET_NAS_ROUTE` stops only
+  the NAS node, whose status names the conflict. The control server keeps
+  running.
+- The Manager finds its NAS node by the node's key, never by the name
+  `juicemount-nas`, which any node can register under. It tags, approves
+  routes for and reports on that node only. While another node carries
+  `tag:jm-nas`, or (under `subnet`) advertises a route overlapping the NAS
+  prefix, or (under `services`) holds an approved route over
+  `JM_NET_NAS_LAN_ADDR` (any approved route while that is unset),
+  `GET /api/net/link` reports the route not ready and the NAS node logs a
+  warning, naming each such node. After the NAS node's state is reset, its
+  earlier registration (same name, offline, older) is named as such.
+  Remove one that is not a device of yours with
+  `docker exec <Manager container> headscale nodes delete --identifier <id>`.
+- Remote farm node enrollment needs `subnet`: the node's JuiceFS mount reaches
+  object storage at the LAN address stored in the volume. Under `services` the
+  Manager refuses the remote plan and says what to set.
+- The generated policy gives no tag an owner, so no node can tag itself (an
+  untagged Mac could otherwise claim `tag:jm-nas`). Keys the Manager mints
+  still get their tags.
+- Under `services`, the Manager on 30190 is served in-process on the tailnet
+  address, so its per-address enrollment limits count each Mac once, at its
+  IPv4 tailnet address, whichever of its addresses it connected from. The Redis proxy and object storage are forwarded from the Manager
+  container, as is everything through a subnet route, so they see all remote
+  clients as that one address. The Redis proxy's AUTH lockout is per address
+  and principal, and each Mac has its own principal, so one Mac's wrong secret
+  does not lock out another. An AUTH flood from one remote Mac can delay the
+  others by up to the 10 second pre-auth timeout.
+
+### Release integrity
+
+- Built with Go 1.26.10 (crypto/x509 fix GO-2026-6809), go-jose v4.1.6 and
+  x/net v0.62.0, which close the published advisories against the earlier
+  versions. CI runs Redis at the same pinned 7.4.11 build the server ships.
+- `scripts/install.sh` installs only a verified JuiceMount Developer ID signed
+  bundle and keeps its signature intact. It refuses to run while JuiceMount or
+  its serving processes are running, and never quits or kills them; Stop and
+  Quit first. It verifies a staged copy, keeps the previous bundle, and leaves
+  failed staging artifacts in place for inspection. `--source` installs an
+  existing signed release and `--destination` installs to a disposable path.
+- The Finder release battery has a strict mode (`QA_STRICT_RELEASE=1`) that
+  passes only when every category and required case completes, verifies
+  copied bytes with an independent backend read, and keeps all data and
+  failed Finder operations until their custody is reconciled. A failed
+  snappiness measurement during drain still waits for its Finder copy and
+  checks it before reporting the failure.
+
+### Upgrading the farm
+
+Stop all old farm workers before starting new ones, and do not run v0.5.0 and
+new workers against the same Redis at the same time:
+
+- A stale v0.5.0 worker still writes outcomes by job ID alone, so it can
+  overwrite the outcome of a job that a new worker now owns.
+- v0.5.0 reapers ignore the delivery lease and release a legacy claim as soon
+  as its worker's heartbeat lapses, so a live job can be run twice.
+- Rolling the farm back to v0.5.0 leaves records written by the new version
+  without a TTL: v0.5.0 sets retention only when a job is queued. Remove
+  finished records with **Clear finished**.
+- A v0.5.0 server publishes the storage permit by its own clock, so render
+  claims still depend on that server's clock until it is upgraded.
+- A v0.5.0 render worker still judges the storage permit by its own clock
+  before it tries to claim, so a render host whose clock is off may wait or try
+  claims that Redis refuses until it is upgraded.
+- A directory job split by one version and replayed by the other queues its
+  files a second time. The repeat finds the previews current and skips them.
+- Jobs queued by a v0.5.0 worker or Manager are not counted as new, so a new
+  worker finds them only by walking the queue, which can take minutes behind
+  a large backlog meant for another GPU.
+- The return of a legacy job a live worker never started runs in the
+  workers' recovery scan, so it covers an un-upgraded worker's claims too, as
+  long as one upgraded worker is running: its claims carry no claim time, so
+  the minute counts from when an upgraded worker first sees the claim, up to
+  15 seconds later. An un-upgraded worker that tries to start such a job after
+  it was put back is refused the start and stops, as when a reaper recovers its
+  job today, and its service manager restarts it.
+
+### Upgrading the Redis proxy and Manager
+
+- The security fix under **Server** is in the Redis proxy, so it protects a
+  volume once that volume's proxy runs this release. Macs and farm workers
+  need no update for it. `server/scripts/rollout-compose.sh` refuses a proxy
+  image built before the fix.
+- Upgrade both. Do not run an older Manager against a proxy directory or a
+  principals store written by this one: an older Manager drops the people,
+  their Mac assignments and grants when it next saves the principals file
+  (and its own store), which lifts every grant.
+- Grants reach a proxy only once it advertises the new file format. For about
+  2 seconds (at most 4) after the upgraded proxy starts, the Manager still
+  writes the old format, so grants are not enforced yet; until they are, the
+  People page says the proxy has not applied the latest grants.
+- The proxy exits at start if it rejects the principals file (one edited by
+  hand, for example), and its container restarts until the file is fixed.
+  A file the proxy rejects on a reload is refused and the old one kept.
+- Do not downgrade the Redis proxy below this version while people exist. An
+  older proxy cannot read person grants, so the Manager writes it the old
+  file format without people: every grant is lifted (Macs with no person can
+  write again) and nothing is logged per person until you upgrade. The
+  Manager logs a warning and the People page says so.
+
+### Upgrading Link
+
+- Upgrading changes what linked devices can reach. With the embedded control
+  server and NAS node (`JM_NET_HEADSCALE=on`, `JM_NET_NAS_NODE=on`), the
+  Manager now enforces an ACL policy where earlier releases allowed all
+  traffic: Macs and farm nodes reach only ports 30151, 30179 and 30190 on the
+  NAS node and, under `subnet`, inside the route. Anything else used through
+  Link (other ports or hosts on the NAS LAN, one Mac to another) stops
+  working. `JM_NET_POLICY=off`, or a `policy:` stanza of your own in
+  `config.yaml`, keeps the previous behaviour. With `JM_NET_NAS_NODE` off
+  (your own subnet router carries the NAS) the Manager applies no policy and
+  mints untagged keys, as before.
+- Unless you set `JM_NET_NAS_EXPOSURE`, an install whose NAS node already
+  ran keeps `subnet`, so every Mac and remote farm node keeps reaching it.
+  Before switching an existing install to `services`, update every linked
+  Mac: Macs with an earlier app, and remote farm nodes, reach the NAS only
+  under `subnet`.
+- With `services` under `JM_NET_POLICY=off` or your own Headscale policy, the
+  NAS node's key carries `tag:jm-nas`. Headscale cannot add the tag to a NAS
+  node registered before this release unless the policy defines the tag
+  (`"tag:jm-nas": []` in `tagOwners`). Until then the node keeps retrying
+  and `GET /api/net/link` shows why. Route readiness under `services` now
+  also requires the control server to list the NAS node online with the tag.
+- `POST /api/net/routes/approve` no longer takes `?host=`: it approves on
+  the NAS node, or on `?id=<node id>` (IDs are in `GET /api/net/paired`).
+
 ## 0.5.0 — general release (build 37)
 
 Update checks remain manual through **Check for Updates…** in the app.

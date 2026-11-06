@@ -140,7 +140,7 @@ func WaveformContext(ctx context.Context, ffmpegBin, srcPath string, dir *os.Fil
 	// was path-addressed for no reason, and os.MkdirAll + a path-addressed
 	// atomic write followed a symlinked component straight out of the volume.
 	if dir == nil {
-		return 0, fmt.Errorf("waveform: no safe derivative directory")
+		return 0, fmt.Errorf("waveform: %w", errNoDerivDir)
 	}
 	if err := derivatives.WriteFileAt(dir, outName, payload, 0o644); err != nil {
 		return 0, err
