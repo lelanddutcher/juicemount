@@ -1,16 +1,16 @@
 # JuiceMount server-side stack
 
-The 0.5 server stack needs release image digests, persistent credentials,
-storage paths, and a rendered Compose file before it can start. Use the
-[TrueNAS install guide](INSTALL-TrueNAS.md) or follow the same render process
-on a Docker host. Obtain the release image digests from its published manifest;
-do not replace them with mutable tags.
+Install the 0.5 server stack with one command, in the TrueNAS SCALE shell or
+on any Linux host with Docker Compose v2:
 
-## Production install (TrueNAS Scale)
+```sh
+curl -fsSL https://raw.githubusercontent.com/lelanddutcher/juicemount/main/server/scripts/juicemount-setup.sh | sudo bash
+```
 
-Use **TrueNAS Apps → Discover → ⋮ → Install via YAML** with the rendered,
-digest-pinned release compose. The setup and upgrade steps are in
-[INSTALL-TrueNAS.md](INSTALL-TrueNAS.md).
+It generates every secret, reads the image digests from the release manifest,
+starts the stack and prints the Manager URL and sign-in key.
+[INSTALL-TrueNAS.md](INSTALL-TrueNAS.md) explains what it does, where it keeps
+its files, how to connect a Mac, and the manual install (appendix).
 
 The stack:
 
@@ -36,21 +36,11 @@ Keep these endpoints on a trusted LAN or private route.
 
 ## Plain Docker host (Ubuntu / Synology / laptop)
 
-Use the canonical `docker-compose.yml`, adjusting its TrueNAS-flavored bind
-paths for your host. Copy `release.env.example` outside the repository, fill
-every required credential and digest from the accepted release manifest, and
-keep that file private. Render and inspect it before starting containers:
-
-```sh
-docker compose --env-file /secure/path/juicemount-release.env \
-  -f server/docker-compose.yml config > /secure/path/juicemount-rendered.yml
-docker compose --env-file /secure/path/juicemount-release.env \
-  -f server/docker-compose.yml up -d
-docker compose --env-file /secure/path/juicemount-release.env \
-  -f server/docker-compose.yml ps
-docker compose --env-file /secure/path/juicemount-release.env \
-  -f server/docker-compose.yml logs juicefs-init
-```
+Use the same setup command. It keeps all data under `/srv/juicemount`
+(`--dir PATH` to choose another folder). The settings, with every secret, are
+in `<data>/compose/.env` (mode 0600); back it up with the data. To install by
+hand instead, follow the appendix of [INSTALL-TrueNAS.md](INSTALL-TrueNAS.md)
+with `release.env.example` as the settings template.
 
 ## Migrating existing data
 
@@ -278,8 +268,8 @@ or use a full-stack reapply as a substitute for a rehearsed TrueNAS rollout.
   principals; keep the port on a trusted LAN or private route because RESP
   authentication is plaintext without a separate TLS layer.
 - **MinIO console (30152) is HTTP-only.** Don't expose to public IPs.
-- **`MINIO_ROOT_PASSWORD` is the master key.** Generate via
-  `openssl rand -base64 24`. Anyone with this password can read every
+- **`MINIO_ROOT_PASSWORD` is the master key.** The setup command generates
+  it; by hand, use `openssl rand -hex 20`. Anyone with this password can read every
   byte in the volume.
 - **Manager admin key (`JM_ADMIN_KEY`)** gates write access to the
   manager's HTTP API. The production compose requires a 32+ character value
