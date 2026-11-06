@@ -3,8 +3,6 @@ package manager
 import (
 	"errors"
 	"fmt"
-	"io/fs"
-	"os"
 	"path/filepath"
 	"strings"
 )
@@ -19,8 +17,8 @@ import (
 //
 // confineVolumePath is the single gate for every caller that turns a /jfs
 // path into a FUSE path. It cleans the input once, maps it, resolves it the
-// way the kernel would, and requires the result to stay under the resolved
-// FUSE mount. Callers must use only the values it returns.
+// way the kernel would (walkPhysicalPath), and requires the result to stay
+// under the resolved FUSE mount. Callers must use only the values it returns.
 //
 // Symlinks that stay inside the volume keep working. The check is not
 // atomic with the later open: a symlink swapped in between is not caught.
@@ -32,6 +30,13 @@ var errOutsideVolume = errors.New("path outside the JuiceFS volume")
 // volumeUserPrefix is the user-facing prefix RunSync and normalizeAnyURI
 // map onto the FUSE mount.
 const volumeUserPrefix = "/jfs"
+
+// isVolumeUserPath reports whether p (already trimmed) is the volume
+// prefix or under it. "/jfsx/..." is not. RunSync's confinement and its
+// destination rewrite both use this one check, so they cannot disagree.
+func isVolumeUserPath(p string) bool {
+	return p == volumeUserPrefix || strings.HasPrefix(p, volumeUserPrefix+"/")
+}
 
 // confinedPath is a volume path that passed confineVolumePath.
 type confinedPath struct {
@@ -71,7 +76,7 @@ func confineVolumePath(userPath, destMount, fuseMount string, followFinal bool) 
 	}
 	mount := filepath.Clean(fuseMount)
 	fuse := filepath.Join(mount, strings.TrimPrefix(clean, dm))
-	mountReal, err := resolveCleanPhysical(mount)
+	mountReal, err := walkPhysicalPath(mount, false)
 	if err != nil {
 		return confinedPath{}, errors.New("cannot resolve the FUSE mount")
 	}
@@ -80,10 +85,10 @@ func confineVolumePath(userPath, destMount, fuseMount string, followFinal bool) 
 	case fuse == mount:
 		real = mountReal
 	case followFinal:
-		real, err = resolveCleanPhysical(fuse)
+		real, err = walkPhysicalPath(fuse, false)
 	default:
 		var parent string
-		parent, err = resolveCleanPhysical(filepath.Dir(fuse))
+		parent, err = walkPhysicalPath(filepath.Dir(fuse), false)
 		real = filepath.Join(parent, filepath.Base(fuse))
 	}
 	if err != nil {
@@ -92,7 +97,7 @@ func confineVolumePath(userPath, destMount, fuseMount string, followFinal bool) 
 		// it is not passed on to API replies or job errors.
 		return confinedPath{}, errOutsideVolume
 	}
-	if real != mountReal && !strings.HasPrefix(real, strings.TrimSuffix(mountReal, "/")+"/") {
+	if !pathWithinRoot(real, mountReal) {
 		return confinedPath{}, errOutsideVolume
 	}
 	return confinedPath{User: clean, Fuse: fuse, Real: real, MountReal: mountReal}, nil
@@ -103,49 +108,12 @@ func (a *API) confineVolume(userPath string, followFinal bool) (confinedPath, er
 	return confineVolumePath(userPath, a.destMount, a.fuseMount, followFinal)
 }
 
-// resolveCleanPhysical returns where the kernel lands when opening p, an
-// absolute path that holds no "..". It is the same approach as
-// resolvePhysicalPath (PR #41) for that narrower input: the longest
-// existing prefix is resolved with filepath.EvalSymlinks and the missing
-// remainder, which holds no symlinks yet, is appended. A dangling symlink
-// is refused, because its target is unknown.
-func resolveCleanPhysical(p string) (string, error) {
-	if !filepath.IsAbs(p) || filepath.Clean(p) != p {
-		return "", fmt.Errorf("not a clean absolute path: %q", p)
-	}
-	if len(p) > 4096 {
-		return "", errors.New("path longer than 4096 bytes")
-	}
-	existing, rest := p, ""
-	for {
-		resolved, err := filepath.EvalSymlinks(existing)
-		if err == nil {
-			return filepath.Join(resolved, rest), nil
-		}
-		if !errors.Is(err, fs.ErrNotExist) {
-			return "", err
-		}
-		if _, lerr := os.Lstat(existing); lerr == nil {
-			return "", fmt.Errorf("dangling symlink at %s", existing)
-		} else if !errors.Is(lerr, fs.ErrNotExist) {
-			return "", lerr
-		}
-		parent := filepath.Dir(existing)
-		if parent == existing {
-			// Nothing on this path exists; it is plain text.
-			return p, nil
-		}
-		rest = filepath.Join(filepath.Base(existing), rest)
-		existing = parent
-	}
-}
-
 // confineSyncVolumePath is RunSync's point-of-use check. A plain /jfs path
 // (not a URL) in embedded mode is cleaned and confined, and the cleaned
 // path is returned for the sync to use. Other values pass through.
 func confineSyncVolumePath(p, fuseMount string) (string, error) {
 	t := strings.TrimSpace(p)
-	if fuseMount == "" || (t != volumeUserPrefix && !strings.HasPrefix(t, volumeUserPrefix+"/")) {
+	if fuseMount == "" || !isVolumeUserPath(t) {
 		return p, nil
 	}
 	vp, err := confineVolumePath(t, volumeUserPrefix, fuseMount, true)
