@@ -23,7 +23,6 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"os/exec"
 	"os/user"
 	"strconv"
 	"strings"
@@ -193,10 +192,8 @@ func (a *API) handlePermissionsFix(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "path outside the JuiceFS volume", http.StatusForbidden)
 		return
 	}
-	// chmod and chown get the RESOLVED path, so neither follows a
-	// symlink named on the command line. While recursing, GNU chmod -R
-	// skips symlinks and chown -R -h changes the link itself, so a
-	// symlink found mid-walk is never followed out of the volume.
+	// The walk starts at the RESOLVED path, so the named entry is never
+	// a symlink, and it follows no symlink found while recursing.
 	real := vp.Real
 	if vp.Fuse == strings.TrimSuffix(a.fuseMount, "/") || real == vp.MountReal {
 		http.Error(w, "refusing to fix the entire volume root — name a subpath", http.StatusBadRequest)
@@ -223,26 +220,18 @@ func (a *API) handlePermissionsFix(w http.ResponseWriter, r *http.Request) {
 	if req.GID != nil {
 		gid = *req.GID
 	}
-	// chownArgs returns nil for uid<=0 — our guarantee we never chown to root.
-	cargs := chownArgs(uid, gid, real)
-	if cargs == nil {
+	// Refuse uid <= 0: never chown to root.
+	if chownArgs(uid, gid, real) == nil {
 		http.Error(w, "refusing to chown: owner uid must be a non-root client uid (>0). Set the default owner first.", http.StatusBadRequest)
 		return
 	}
-	chmodArgs := []string{"-R", "u+rwX,g+rwX,o+rX", real}
-	if !req.Recursive {
-		chmodArgs = chmodArgs[1:]                         // drop -R
-		cargs = []string{"-h", chownSpec(uid, gid), real} // non-recursive chown
-	}
-	ctx := r.Context()
-	if out, err := exec.CommandContext(ctx, "chmod", chmodArgs...).CombinedOutput(); err != nil {
-		log.Printf("manager: permissions fix chmod %v: %v\n%s", chmodArgs, err, out)
-		http.Error(w, "chmod failed: "+firstLine(out), http.StatusInternalServerError)
-		return
-	}
-	if out, err := exec.CommandContext(ctx, "chown", cargs...).CombinedOutput(); err != nil {
-		log.Printf("manager: permissions fix chown %v: %v\n%s", cargs, err, out)
-		http.Error(w, "chown failed: "+firstLine(out), http.StatusInternalServerError)
+	// applyPermsBeneath opens the resolved path component by component
+	// from the mount with O_NOFOLLOW and changes entries through their
+	// fds, never following a symlink (see permwalk_linux.go).
+	rel := strings.TrimPrefix(real, vp.MountReal)
+	if err := applyPermsBeneath(r.Context(), vp.MountReal, rel, uid, gid, req.Recursive); err != nil {
+		log.Printf("manager: permissions fix %q: %v", vp.User, err)
+		http.Error(w, "permissions fix incomplete; see the Manager log", http.StatusInternalServerError)
 		return
 	}
 	scope := "recursively"

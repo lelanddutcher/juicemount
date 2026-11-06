@@ -745,6 +745,13 @@ func (a *API) handleTrashRestore(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	fuseTarget := tp.Fuse
+	// The volume root is not a restore target: there is nothing to
+	// rename onto, and a collision rename would name a sibling of the
+	// mount.
+	if fuseTarget == strings.TrimSuffix(a.fuseMount, "/") || tp.Real == tp.MountReal {
+		http.Error(w, "restore target must name a path inside "+a.destMount, http.StatusBadRequest)
+		return
+	}
 	// Refuse to restore over the .trash subtree itself.
 	if isInsideTrash(fuseTarget, a.fuseMount) || isInsideTrash(tp.Real, tp.MountReal) {
 		http.Error(w, "target cannot be inside .trash/", http.StatusBadRequest)
@@ -913,8 +920,8 @@ func (a *API) handleTrashConfig(w http.ResponseWriter, r *http.Request) {
 // a link). Writes the HTTP error and returns false on refusal.
 func (a *API) trashEntryPath(w http.ResponseWriter, userPath string) (string, bool) {
 	vp, err := a.confineVolume(userPath, false)
-	if err != nil || !isInsideTrash(vp.Fuse, a.fuseMount) || !isInsideTrash(vp.Real, vp.MountReal) {
-		http.Error(w, "path is not under the trash subtree", http.StatusBadRequest)
+	if err != nil || !isTrashEntry(vp.Fuse, a.fuseMount) || !isTrashEntry(vp.Real, vp.MountReal) {
+		http.Error(w, "path is not a trash entry", http.StatusBadRequest)
 		return "", false
 	}
 	return vp.Fuse, true
@@ -933,6 +940,19 @@ func trashEntryExists(w http.ResponseWriter, entryPath string) bool {
 		return false
 	}
 	return true
+}
+
+// isTrashEntry reports whether p is an entry inside a trash bucket:
+// <fuseMount>/.trash/<bucket>/<entry>[/...]. The trash root and a bucket
+// folder are not entries; deleting either would purge many entries
+// without the Empty-Trash confirmation.
+func isTrashEntry(p, fuseMount string) bool {
+	if fuseMount == "" {
+		return false
+	}
+	trashRoot := filepath.Join(strings.TrimSuffix(fuseMount, "/"), trashDir)
+	rel, ok := strings.CutPrefix(filepath.Clean(p), trashRoot+string(filepath.Separator))
+	return ok && strings.Contains(rel, string(filepath.Separator))
 }
 
 // isInsideTrash returns true iff `p` is under <fuseMount>/.trash/ —
