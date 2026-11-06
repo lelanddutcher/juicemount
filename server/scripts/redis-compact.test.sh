@@ -29,6 +29,9 @@
 #      baseline read during the running one could never be passed.
 #   9. A BGSAVE runs, so the helper's rewrite is only scheduled: it returns
 #      only after the scheduled rewrite forked and ended.
+#  10. The helper's rewrite child is stopped with SIGUSR1: the status stays
+#      ok and the count rose, but no new base file exists, so the old files
+#      remain. The helper must report a failure.
 #
 # Usage: server/scripts/redis-compact.test.sh
 # Needs Docker. Uses the compose's digest-pinned Redis image.
@@ -210,6 +213,26 @@ else
 	echo 'redis-compact: the helper failed while its rewrite waited behind a BGSAVE' >&2
 	fail=1
 fi
+(
+	rc=0
+	JM_REDIS_COMPACT_TIMEOUT=60 jm_redis_compact "$project" >"$work/killed.out" 2>&1 || rc=$?
+	echo "$rc" >"$work/killed.rc"
+) &
+helper=$!
+for _ in $(seq 1 50); do
+	[ "$(field aof_rewrite_in_progress)" = 1 ] && break
+	sleep 0.2
+done
+# Anchored: an unanchored pattern also matches this sh -c, which would
+# signal itself.
+docker exec "$name" sh -c 'kill -USR1 $(pgrep -f "^redis-aof-rewrite")'
+wait "$helper"
+if [ "$(cat "$work/killed.rc")" = 0 ] || ! grep -q 'ended without a new base file' "$work/killed.out"; then
+	echo 'redis-compact: the helper did not report a rewrite whose child was stopped:' >&2
+	cat "$work/killed.out" >&2
+	fail=1
+fi
+[ "$(field aof_last_bgrewrite_status)" = ok ] || { echo 'redis-compact: setup: a stopped rewrite child no longer leaves the status ok; revisit this case' >&2; fail=1; }
 stop
 name=
 
@@ -217,5 +240,6 @@ if [ "$fail" = 0 ]; then
 	echo 'redis-compact: after the helper, a fixed-ACL restart keeps every write and replays no refused transaction'
 	echo 'redis-compact: the release rewrite runs only under the 0.5.0 ACL, and a later fixed-ACL restart keeps every write'
 	echo 'redis-compact: the helper waits out a running rewrite and a BGSAVE, and returns only after its own rewrite ended'
+	echo 'redis-compact: a rewrite whose child was stopped is a failure, not a success'
 fi
 exit "$fail"

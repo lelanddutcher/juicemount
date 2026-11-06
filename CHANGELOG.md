@@ -406,47 +406,66 @@ new workers against the same Redis at the same time:
   Changes lost at an earlier 0.5.0 restart are not recovered by these steps.
   Recovering them from the copy in step 2 is a manual restore, not a
   replay.
-- If you update through `server/scripts/rollout-compose.sh`, do steps 1
-  and 2 first. The script then does step 3. For this path, step 1 means: you
-  may update the checkout to 0.5.1 (a running Redis does not read the new
-  `server/redis.acl`), but do not reboot the NAS or restart Redis until the
-  release rollout has finished its rewrite. Then run the release rollout
-  with `--ack-redis-aof-backup`, which confirms that you did step 2. Once
-  the rewrite succeeds, a later NAS reboot or Redis restart is safe. In
-  detail:
+- If you update through `server/scripts/rollout-compose.sh`, the script can
+  do step 3 for you, but not always in time:
+  - First check whether Redis already had a lossy start: `docker logs <redis
+    container> 2>&1 | grep -c AOF-loading-client`. If the count is not 0, or
+    you cannot tell (for example, the log was rotated), do steps 1 to 3 by
+    hand before you update the checkout. Redis restarts by itself if it
+    crashes (`restart: unless-stopped`). A crash after the checkout is
+    updated, but before the script's rewrite, would start Redis under the
+    new ACL with no script involved. Then update the checkout and run the
+    release rollout with `--ack-redis-aof-backup`. Its rewrite is then a
+    second one, and harmless.
+  - If the count is 0, do step 2, update the checkout, and run the release
+    rollout right away with `--ack-redis-aof-backup`, which confirms that
+    you did step 2. Do not reboot the NAS or restart Redis in between. A
+    running Redis does not read the new `server/redis.acl`.
+  - Once the rollout's rewrite succeeds, a later NAS reboot or Redis restart
+    is safe. In detail:
+  - The script acts only on this checkout's Redis: the redis container of
+    the `--project` you name whose Compose working directory is this
+    checkout's `server/` folder.
   - A release rollout never restarts Redis. Right after it takes its lock,
     before any other check, it reads the ACL that the running Redis loaded
     at its start (`/run/jm-redis/users.acl` in the Redis container). If that
     ACL still has the 0.5.0 `user default ... -@all` line, the rollout
-    refuses without `--ack-redis-aof-backup`: the rewrite deletes the old
-    files, the only copy of changes lost at an earlier 0.5.0 restart. With
-    the flag, it makes Redis rewrite its append-only file now, with no
-    restart. A Redis whose ACL file cannot be read is rewritten too, with no
-    flag needed. Every re-run checks again. After the rewrite, the file
-    holds only the live state and later writes. The next start, a NAS
+    refuses without `--ack-redis-aof-backup`, and names the host folder to
+    copy: the rewrite deletes the old files, the only copy of changes lost
+    at an earlier 0.5.0 restart. With the flag, it makes Redis rewrite its
+    append-only file now, with no restart. A Redis whose ACL cannot be read
+    is rewritten too, with no flag needed. A Redis that runs without an ACL
+    file needs no rewrite. Every re-run checks again. After the rewrite, the
+    file holds only the live state and later writes. The next start, a NAS
     reboot included, renders the fixed ACL from the checkout and replays
     only those writes, which it accepts.
-  - The rewrite runs before the rollout's other checks. So it has run even
-    if the rollout then stops, for example for an unhealthy service. If a
-    release stops in any way while the running Redis still has the 0.5.0
-    ACL and no rewrite succeeded, it prints a warning: do not reboot the NAS
-    or restart Redis until a rewrite succeeds. That includes a refused
-    rewrite, a rewrite that does not finish within 10 minutes
-    (`JM_REDIS_COMPACT_TIMEOUT`, in seconds), a held lock, a missing flag,
-    and a dry run (which only reads the ACL).
+  - The script counts a rewrite as done only when Redis reports it finished
+    with no error and wrote a new base file. A rewrite that was stopped
+    halfway leaves the old files, so it counts as failed.
+  - Every exit, in every mode, warns while the running Redis may still have
+    the 0.5.0 ACL and no rewrite succeeded in this run: do not reboot the
+    NAS or restart Redis until a rewrite succeeds. That includes a usage
+    error (a mistyped flag), a held lock, a missing flag, a refused rewrite,
+    a rewrite that does not finish within 10 minutes
+    (`JM_REDIS_COMPACT_TIMEOUT`, in seconds), and a dry run (which only reads
+    the ACL). The rewrite runs before the release's other checks, so it has
+    run even if the release then stops, for example for an unhealthy
+    service.
   - `--cutover-proxy`, `--proxy-rollback` and `--proxy-restore` recreate
     Redis. They run the rewrite before they stop anything, and stop with
-    the stack unchanged if it does not finish. They need
+    the stack unchanged if it does not finish. They also stop unchanged if
+    Redis is down by then and the script read the 0.5.0 ACL (or could not
+    read it) and has not finished a rewrite. They need
     `--ack-redis-aof-backup` too while the running Redis has the 0.5.0 ACL.
   - Their automatic rollback, after a failure later in the change, also
     asks for a rewrite before it recreates Redis. Services are already
-    stopped at that point, so a failed rewrite there does not stop the
-    rollback: it warns and goes on. The forward rewrite already removed
-    every refused transaction. If Redis is down at that point, the script
-    says that the start replays the whole file. It refuses to start Redis
-    while `server/redis.acl` still has the 0.5.0 default line, unless you
-    pass `--allow-aof-replay`. Only the automatic rollback can reach that
-    refusal or use the flag: a forward change needs a running, healthy
+    stopped at that point. A failed rewrite there does not stop the
+    rollback: it warns and goes on, because this run already finished a
+    rewrite or read the fixed ACL. If Redis is down at that point, the
+    script says that the start replays the whole file. It refuses to start
+    Redis while `server/redis.acl` still has the 0.5.0 default line, unless
+    you pass `--allow-aof-replay`. Only the automatic rollback can reach
+    that refusal or use the flag: a forward change needs a running, healthy
     Redis, and a release never restarts Redis. If the rollback stops there,
     the services the change had stopped stay stopped, and the script keeps
     its lock.
