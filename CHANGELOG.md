@@ -66,6 +66,22 @@ or farm workers.
 
 ### Server
 
+- Restarting the metadata Redis no longer loses recent file changes. Redis
+  rebuilds its data at start by replaying its append-only file. In 0.5.0 the
+  Redis ACL made it refuse every replayed transaction, and JuiceFS writes
+  almost all file metadata in transactions. So each restart of Redis (a
+  container recreate, a server update or a NAS reboot) dropped the file
+  changes made since Redis last compacted that file: new and renamed files
+  could disappear or point at missing data. Redis logged each refusal as
+  `CRITICAL ... AOF-loading-client: '-NOPERM ACLs rules changed`. The fix is
+  one line in `server/redis.acl`: the `default` user stays off, so nobody
+  can log in as it and unauthenticated clients are still refused, but it now
+  holds the permissions the replay needs. Transactions were not the only
+  loss: Redis records JuiceFS's switch to its database inside a transaction,
+  so after a refused one, plain writes could replay into the wrong database.
+  Update a 0.5.0 server only in the order under **Upgrading the Redis proxy
+  and Manager** below: in the wrong order, the update itself can corrupt
+  the folder tree.
 - A fresh server install creates the `zpool` bucket before it sets up the
   object-store users. Before, setup used the restricted format key, which
   cannot create buckets, so a first install failed. An existing bucket and its
@@ -357,6 +373,29 @@ new workers against the same Redis at the same time:
 
 ### Upgrading the Redis proxy and Manager
 
+- Update a 0.5.0 server's Redis in this order. The order matters: on a
+  server whose Redis was already restarted under 0.5.0, starting Redis with
+  the new `server/redis.acl` before step 3 replays the transactions refused
+  at that earlier start on top of everything written since, which silently
+  corrupts the folder tree (`juicefs fsck` does not report it). A NAS reboot
+  after the new file is in place counts as such a start.
+  1. Keep the 0.5.0 Redis running. Do not pull the new `server/redis.acl`
+     yet.
+  2. Copy Redis's data folder (its `appendonlydir`) somewhere safe. If Redis
+     was restarted under 0.5.0 since its last rewrite, that copy is the only
+     place the changes lost at that restart still exist.
+  3. Make Redis rewrite its append-only file from what it holds now:
+     `docker exec <redis container> sh -c 'redis-cli --user jm-admin --pass
+     "$(cat /run/jm-redis/admin.pass)" --no-auth-warning BGREWRITEAOF'`.
+     Wait until `INFO persistence` (same login) shows
+     `aof_rewrite_scheduled:0`, `aof_rewrite_in_progress:0` and
+     `aof_last_bgrewrite_status:ok`. A rewrite requested while a background
+     save runs is only scheduled, so check all three.
+  4. Now update `server/redis.acl` and restart Redis. The rewritten file
+     holds no transactions to refuse, so nothing is lost or replayed twice.
+  Changes lost at an earlier 0.5.0 restart are not recovered by these steps.
+  Recovering them from the copy in step 2 is a manual restore, not a
+  replay.
 - The security fix under **Server** is in the Redis proxy, so it protects a
   volume once that volume's proxy runs this release. Macs and farm workers
   need no update for it. `server/scripts/rollout-compose.sh` refuses a proxy

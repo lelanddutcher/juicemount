@@ -207,8 +207,8 @@ func TestH8BEnrollRequiresApproval(t *testing.T) {
 		}
 	}
 
-	// 5. The auto-approve window (admin-only) approves new Macs at once,
-	// and only while it is open.
+	// 5. The auto-approve window (admin-only) approves new Macs once an
+	// auto-approve pass proves the proxy live, and only while it is open.
 	rr = doJSON(t, mux, http.MethodPost, "/api/principals/auto-approve", "", map[string]int{"hours": 24})
 	if rr.Code != http.StatusUnauthorized {
 		t.Fatalf("auto-approve without admin key: got %d, want 401", rr.Code)
@@ -221,8 +221,11 @@ func TestH8BEnrollRequiresApproval(t *testing.T) {
 	rr = doJSON(t, mux, http.MethodPost, "/api/principals/enroll", "", second)
 	var er2 EnrollResponse
 	_ = json.Unmarshal(rr.Body.Bytes(), &er2)
-	if rr.Code != http.StatusOK || er2.Status != PrincipalApproved {
-		t.Fatalf("enroll inside the window: %d %+v, want approved", rr.Code, er2)
+	if er2.Status != PrincipalPending {
+		t.Fatalf("enroll inside the window: %d %+v, want pending until the pass", rr.Code, er2)
+	}
+	if rr, er2 = pollUntilApproved(t, mux, second["instance_id"], er2.PollToken); rr.Code != http.StatusOK {
+		t.Fatalf("approved poll inside the window: %d %+v", rr.Code, er2)
 	}
 	if _, ok := findProxyPrincipal(readProxyPrincipals(t, principalsPath), er2.Principal); !ok {
 		t.Fatal("auto-approved Mac missing from the proxy principals file")
@@ -284,29 +287,28 @@ func TestH8BPrincipalsFileWrittenAtomically0600(t *testing.T) {
 	old := syscall.Umask(0)
 	defer syscall.Umask(old)
 
-	// The proxy is live: it acknowledged a request of this Manager and its
-	// heartbeat is fresh (this test's signaler writes no files, so the
-	// handshake is written directly and the line recorded as issued below).
-	for _, f := range []string{reloadRequestName, reloadAckName, reloadHeartbeatName} {
-		if err := os.WriteFile(filepath.Join(dir, f), []byte("live 1\n"), 0o600); err != nil {
-			t.Fatal(err)
-		}
-	}
-	sig := &recordingSignaler{}
-	s, err := NewPrincipalStore(PrincipalStoreOptions{
-		StatePath: filepath.Join(dir, "store.json"),
-		ProxyDir:  dir,
-		Signal:    sig,
-	})
+	s, err := NewPrincipalStore(PrincipalStoreOptions{StatePath: filepath.Join(dir, "store.json"), ProxyDir: dir})
 	if err != nil {
 		t.Fatal(err)
 	}
-	s.issued = append(s.issued, issuedRequest{line: "live 1", at: time.Now().Add(-time.Minute)}) // written before the heartbeat
 	r, err := s.Enroll(EnrollRequest{InstanceID: testInstanceID, Host: "Edit-Bay-2", Secret: testMacSecret}, "192.0.2.1")
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Approve needs a live proxy that applies the request it writes, so it
+	// runs with the reload.request signaler; this test's signaler records
+	// the writes after it.
+	stopProxy := startFakeProxyAck(t, dir)
 	if err := s.Approve(r.Principal); err != nil {
+		t.Fatal(err)
+	}
+	stopProxy()
+	sig := &recordingSignaler{}
+	s.mu.Lock()
+	s.opts.Signal = sig
+	err = s.writeProxyFilesLocked()
+	s.mu.Unlock()
+	if err != nil {
 		t.Fatal(err)
 	}
 	st, err := os.Stat(path)
@@ -548,24 +550,34 @@ func TestH8BAutoApproveWindowCapped(t *testing.T) {
 	if _, err := s.SetAutoApproveWindow(time.Hour, 3); err != nil {
 		t.Fatal(err)
 	}
-	status := func(i int, ip string) PrincipalStatus {
+	// Enroll answers pending; an auto-approve pass approves the Macs the
+	// window admitted. The caps count at admission.
+	admitted := func(i int, ip string) bool {
 		r, err := s.Enroll(EnrollRequest{InstanceID: instanceN(i), Host: "h", Secret: testMacSecret}, ip)
-		if err != nil {
-			t.Fatal(err)
+		if err != nil || r.Status != PrincipalPending {
+			t.Fatalf("enroll %d: %+v %v", i, r, err)
 		}
-		return r.Status
+		return s.Snapshot().byName(r.Principal).AutoApprovePending || s.Snapshot().byName(r.Principal).Status == PrincipalApproved
 	}
-	if status(1, "192.0.2.1") != PrincipalApproved || status(2, "192.0.2.1") != PrincipalApproved {
-		t.Fatal("first two from one address not auto-approved")
+	if !admitted(1, "192.0.2.1") || !admitted(2, "192.0.2.1") {
+		t.Fatal("first two from one address not admitted")
 	}
-	if got := status(3, "192.0.2.1"); got != PrincipalPending {
-		t.Fatalf("third from one address = %s, want pending (per-address cap)", got)
+	if admitted(3, "192.0.2.1") {
+		t.Fatal("third from one address admitted (per-address cap)")
 	}
-	if status(4, "192.0.2.2") != PrincipalApproved {
-		t.Fatal("first from a second address not auto-approved")
+	if !admitted(4, "192.0.2.2") {
+		t.Fatal("first from a second address not admitted")
 	}
-	if got := status(5, "192.0.2.3"); got != PrincipalPending {
-		t.Fatalf("fourth approval = %s, want pending (window cap 3)", got)
+	if admitted(5, "192.0.2.3") {
+		t.Fatal("fourth admission (window cap 3)")
+	}
+	for _, i := range []int{1, 2, 4} {
+		waitStatus(t, s, macPrincipalName(instanceN(i)), PrincipalApproved)
+	}
+	for _, i := range []int{3, 5} {
+		if p := s.Snapshot().byName(macPrincipalName(instanceN(i))); p.Status != PrincipalPending || p.AutoApprovePending {
+			t.Fatalf("Mac %d over the caps: %+v, want pending for an admin", i, p)
+		}
 	}
 	snap := s.Snapshot()
 	if snap.AutoApproveUsed != 3 || snap.AutoApproveMax != 3 || snap.NeedsReview != 3 {

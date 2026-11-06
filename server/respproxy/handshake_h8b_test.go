@@ -375,3 +375,34 @@ func TestH8BRequireGateHistoryTurnsSkipIntoFail(t *testing.T) {
 		t.Fatalf("JM_REQUIRE_GATE_HISTORY=1 did not turn the missing-history skip into a failure:\n%s", out)
 	}
 }
+
+// TestH8BHandshakeDowngradeKeepsStaleReceipt: the jm-respproxy image is
+// replaced by one from before reload.applied while the Manager keeps
+// running. The current proxy's receipt stays behind (the older entrypoint
+// never deletes it) and repeats the Manager's newest request, and the older
+// entrypoint keeps the heartbeat fresh. Approve must be refused, and must
+// pass again once a current image runs.
+func TestH8BHandshakeDowngradeKeepsStaleReceipt(t *testing.T) {
+	s, proxyDir := newHandshakeStore(t)
+	stop := startEntrypointHandshake(t, proxyDir)
+	a, b := hsEnroll(t, s, 1), hsEnroll(t, s, 2)
+	if err := s.Approve(a); err != nil {
+		t.Fatalf("Approve with the proxy live: %v", err)
+	}
+	waitFor(t, 8*time.Second, "the proxy to apply the approval's reload", func() bool {
+		return s.Snapshot().ReloadApplied
+	})
+	stop()
+	stopOld := startHandshakeBlock(t, proxyDir, readFile(t, "testdata/handshake-before-applied.sh.txt"))
+	time.Sleep(500 * time.Millisecond) // its first tick has rewritten the heartbeat
+	start := time.Now()
+	if err := s.Approve(b); !errors.Is(err, manager.ErrProxyImageOutdated) {
+		t.Fatalf("Approve against the older image with a stale receipt = %v after %v, want ErrProxyImageOutdated",
+			err, time.Since(start).Round(time.Millisecond))
+	}
+	stopOld()
+	startEntrypointHandshake(t, proxyDir)
+	if err := s.Approve(b); err != nil {
+		t.Fatalf("Approve after a current image started again: %v", err)
+	}
+}

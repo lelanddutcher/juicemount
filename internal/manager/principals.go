@@ -452,6 +452,9 @@ type PrincipalsSnapshot struct {
 	ProxyLive bool `json:"proxy_live"`
 	// ProxyProblem explains ProxyLive=false ("" when live or unconfigured).
 	ProxyProblem string `json:"proxy_problem,omitempty"`
+	// AutoApproveProblem: Macs the window admitted wait because the last
+	// auto-approve pass could not prove the proxy live; this is why.
+	AutoApproveProblem string `json:"auto_approve_problem,omitempty"`
 	// PerMacKeys: JM_OBJ_PER_MAC=1. KeydProblem explains why minio-keyd is
 	// not delivering keys ("" when it looks healthy or the mode is off).
 	PerMacKeys  bool   `json:"per_mac_keys,omitempty"`
@@ -597,11 +600,20 @@ type PrincipalStore struct {
 	// issued: the reload.request lines this process wrote (newest last,
 	// bounded). An ack counts only when it repeats one of them, so an ack
 	// left by a proxy before this Manager started never counts (F1).
-	issued []issuedRequest
+	// issuedSeq numbers them (issuedRequest.seq).
+	issued    []issuedRequest
+	issuedSeq uint64
 	// ackSeen, ackSeenAt: the reload.applied line last read, and when this
 	// process first read it (proxyOutdatedGrace).
 	ackSeen   string
 	ackSeenAt time.Time
+	// autoRunning, autoAgain: an auto-approve pass is running, and another
+	// was asked for meanwhile (kickAutoApproveLocked). autoProblem,
+	// autoFailedAt: why the last pass's proxy proof failed, and when ("" once
+	// a proof succeeds).
+	autoRunning, autoAgain bool
+	autoProblem            string
+	autoFailedAt           time.Time
 
 	// objk: per-Mac object keys (nil = off). keepObjSeq/keepObjGens carry
 	// the stored values through a run with the mode off.
@@ -629,10 +641,12 @@ type PrincipalStore struct {
 	agentTokens map[string]*AgentToken
 }
 
-// issuedRequest is one reload.request line this process wrote and when.
+// issuedRequest is one reload.request line this process wrote, when, and
+// its number in write order (1, 2, ...).
 type issuedRequest struct {
 	line string
 	at   time.Time
+	seq  uint64
 }
 
 // maxIssuedRequests bounds PrincipalStore.issued.
@@ -902,12 +916,20 @@ func NewPrincipalStore(opts PrincipalStoreOptions) (*PrincipalStore, error) {
 	return s, nil
 }
 
-// An auto-admitted Mac waiting for its storage key (AutoApprovePending)
-// counts toward the window's caps, not the pending caps.
+// autoAdmittedLocked: r was admitted by the auto-approve window that is
+// open now and waits for an auto-approve pass. A flag left by a window that
+// has expired counts for nothing, even before a pass or the reconciler
+// clears it: that Mac waits for an admin.
+func (s *PrincipalStore) autoAdmittedLocked(r *MacPrincipal, now time.Time) bool {
+	return r.Status == PrincipalPending && r.AutoApprovePending && now.Before(s.autoUntil)
+}
+
+// An auto-admitted Mac waiting for its storage key or a proxy proof
+// (autoAdmittedLocked) counts toward the window's caps, not the pending caps.
 func (s *PrincipalStore) pendingCountLocked() int {
-	n := 0
+	n, now := 0, s.opts.Now()
 	for _, r := range s.recs {
-		if r.Status == PrincipalPending && !r.AutoApprovePending {
+		if r.Status == PrincipalPending && !s.autoAdmittedLocked(r, now) {
 			n++
 		}
 	}
@@ -915,9 +937,9 @@ func (s *PrincipalStore) pendingCountLocked() int {
 }
 
 func (s *PrincipalStore) pendingFromIPLocked(ip string) int {
-	n := 0
+	n, now := 0, s.opts.Now()
 	for _, r := range s.recs {
-		if r.Status == PrincipalPending && !r.AutoApprovePending && r.SourceIP == ip {
+		if r.Status == PrincipalPending && !s.autoAdmittedLocked(r, now) && r.SourceIP == ip {
 			n++
 		}
 	}
@@ -972,6 +994,9 @@ func (s *PrincipalStore) Enroll(req EnrollRequest, sourceIP string) (EnrollRespo
 		s.noteDeviceLocked(rec, req.DeviceDigest)
 		s.noteInUseLocked(s.recs[name], req.ObjectKeyInUse)
 		s.noteSharedKeyIssuedLocked(s.recs[name])
+		if r := s.recs[name]; r.Status == PrincipalPending && r.AutoApprovePending {
+			s.kickAutoApproveLocked() // admitted, or a lapsed flag a pass clears
+		}
 		return s.withObjectKey(EnrollResponse{Status: rec.Status, Principal: name, Fingerprint: rec.Fingerprint}, s.recs[name]), nil
 	}
 
@@ -1056,28 +1081,25 @@ func (s *PrincipalStore) Enroll(req EnrollRequest, sourceIP string) (EnrollRespo
 		}
 	}
 	auto := s.autoApprovableLocked(now, sourceIP)
-	if auto && s.objk != nil {
-		// Enroll holds s.mu and must not wait for keyd: the Mac stays
-		// pending, and the reconciler approves it once its key is active.
-		if err := s.startObjKeyMintLocked(rec); err != nil {
-			return EnrollResponse{}, err
+	if auto {
+		// Enroll holds s.mu on an unauthenticated route and must wait
+		// neither for keyd nor for the proxy: the Mac stays pending, counted
+		// against the window, and an auto-approve pass approves it once the
+		// proxy proves itself live (and, per-Mac keys on, its key is active).
+		if s.objk != nil {
+			if err := s.startObjKeyMintLocked(rec); err != nil {
+				return EnrollResponse{}, err
+			}
 		}
 		rec.AutoApprovePending = true
-		s.autoUsed++
-		s.autoPerIP[sourceIP]++
-	} else if auto {
-		rec.Status = PrincipalApproved
-		rec.DecidedAt = now.UnixMilli()
-		rec.AutoApproved = true
-		s.markSharedKeyIssuedLocked(rec)
 		s.autoUsed++
 		s.autoPerIP[sourceIP]++
 	} else if s.pendingCountLocked() >= s.opts.MaxPending || s.pendingFromIPLocked(sourceIP) >= maxPendingPerIP {
 		return EnrollResponse{}, ErrEnrollTooMany
 	}
 	s.recs[name] = rec
-	err = s.commitLocked(rec.Status == PrincipalApproved)
-	if err == nil && rec.AutoApprovePending {
+	err = s.commitLocked(false)
+	if err == nil && rec.AutoApprovePending && s.objk != nil {
 		app, _ := s.objk.readApplied()
 		err = s.writeObjKeysDesiredLocked(app)
 	}
@@ -1087,7 +1109,7 @@ func (s *PrincipalStore) Enroll(req EnrollRequest, sourceIP string) (EnrollRespo
 			s.autoUsed--
 			s.autoPerIP[sourceIP]--
 		}
-		if rec.AutoApprovePending {
+		if rec.AutoApprovePending && s.objk != nil {
 			// Preserve the skipped generation: its write-ahead floor may
 			// already be durable even if enrollment rolls back.
 			// The store may already hold the record (desired.json failed
@@ -1103,7 +1125,12 @@ func (s *PrincipalStore) Enroll(req EnrollRequest, sourceIP string) (EnrollRespo
 	}
 	log.Printf("manager: principal enrollment %s host=%q from %s: %s (auto=%v)", name, host, sourceIP, rec.Status, auto)
 	if rec.AutoApprovePending {
-		log.Printf("manager: principal %s admitted by the auto-approve window; approved once storage key %s is active", name, rec.ObjKeyName)
+		if s.objk != nil {
+			log.Printf("manager: principal %s admitted by the auto-approve window; approved once storage key %s is active and the proxy is live", name, rec.ObjKeyName)
+		} else {
+			log.Printf("manager: principal %s admitted by the auto-approve window; approved once the proxy is live", name)
+		}
+		s.kickAutoApproveLocked()
 	}
 	return s.withObjectKey(EnrollResponse{Status: rec.Status, Principal: name, Fingerprint: fp, PollToken: token}, rec), nil
 }
@@ -1302,8 +1329,14 @@ func (s *PrincipalStore) proxyStateForAckLocked(ack, legacy string) proxyState {
 	}
 	acked := s.issuedAckLocked(ack)
 	ours := acked >= 0
-	if !ours && (s.issuedAckLocked(legacy) >= 0 || s.oldStyleAckLocked(legacy)) {
-		return proxyOutdated // signal-only receipts never prove applied credentials
+	if s.issuedAckLocked(legacy) > acked || (!ours && s.oldStyleAckLocked(legacy)) {
+		// Signal-only receipts never prove applied credentials. A current
+		// image writes reload.applied before reload.ack, and readAcksLocked
+		// reads them so that its reload.ack is never the newer of the two:
+		// a newer reload.ack comes from an image that writes no
+		// reload.applied, also one started after a current image left its
+		// receipt behind.
+		return proxyOutdated
 	}
 	hb, err := os.Stat(filepath.Join(s.opts.ProxyDir, reloadHeartbeatName))
 	if !ours && s.oldStyleAckLocked(ack) {
@@ -1388,38 +1421,207 @@ func proxyStateErr(st proxyState) error {
 	return ErrProxyNotLive
 }
 
-// requireProxyLive returns nil when the proxy is live. Otherwise it rewrites
-// the proxy files (the same idempotent write NewPrincipalStore does, which
-// also writes a fresh reload.request: a proxy started after the last request
-// never answers that one) and waits up to proxyAckWait for the ack. An
-// outdated proxy image is reported as soon as it answers.
+// requireProxyLive returns nil once the proxy files read live AND the proxy
+// has applied a reload.request this call wrote, or a later one. A receipt
+// for an earlier request proves only the proxy that wrote it: an image from
+// before reload.applied, started since, never deletes that receipt and
+// keeps the heartbeat fresh, so a receipt that already stood when the call
+// began could vouch for a proxy without the applied-reload guarantees. Each
+// call therefore rewrites the proxy files (the same idempotent write
+// NewPrincipalStore does, with a fresh reload.request) and waits up to
+// proxyAckWait for the proxy's next tick. Calls that overlap share a tick:
+// the receipt for a later request covers an earlier one. An outdated proxy
+// image is reported as soon as it answers.
 func (s *PrincipalStore) requireProxyLive() error {
 	s.mu.Lock()
-	if s.proxyLiveLocked() {
-		s.mu.Unlock()
-		return nil
-	}
 	if s.opts.ProxyDir == "" {
 		s.mu.Unlock()
 		return fmt.Errorf("%w; no proxy directory is configured (JM_RESPPROXY_DIR)", ErrProxyNotLive)
 	}
+	from := s.issuedSeq + 1
 	err := s.writeProxyFilesLocked()
+	if err == nil && s.issuedSeq < from {
+		err = errors.New("no reload.request was written")
+	}
 	s.mu.Unlock()
 	if err != nil {
-		return fmt.Errorf("%w; re-requesting a reload failed: %v", ErrProxyNotLive, err)
+		return fmt.Errorf("%w; requesting a reload failed: %v", ErrProxyNotLive, err)
 	}
 	deadline := time.Now().Add(proxyAckWait)
 	for {
 		s.mu.Lock()
-		st := s.proxyStateLocked()
+		ack, legacy := s.readAcksLocked()
+		st := s.proxyStateForAckLocked(ack, legacy)
+		fresh := false
+		if i := s.issuedAckLocked(ack); i >= 0 {
+			fresh = s.issued[i].seq >= from
+		}
 		s.mu.Unlock()
-		if st == proxyLive {
+		if st == proxyLive && fresh {
 			return nil
 		}
 		if st == proxyOutdated || !time.Now().Before(deadline) {
+			if st == proxyLive {
+				// Live only by a receipt older than this call.
+				st = proxyStalled
+			}
 			return proxyStateErr(st)
 		}
 		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// autoCandidate is an admitted Mac in an auto-approve pass's batch, with
+// what identifies its record: a record enrolled again under the same name
+// has a new request time and a new (salted) credential hash.
+type autoCandidate struct {
+	name        string
+	requestedAt int64
+	argon2id    string
+}
+
+// autoApproveRetry: after a pass whose proxy proof failed, passes asked for
+// within this long do nothing (a Mac's polls ask for one each). A variable
+// for tests.
+var autoApproveRetry = 5 * time.Second
+
+// kickAutoApproveLocked asks for an auto-approve pass in the background. At
+// most one runs at a time; a request while one runs makes it run again.
+func (s *PrincipalStore) kickAutoApproveLocked() {
+	if s.autoRunning {
+		s.autoAgain = true
+		return
+	}
+	s.autoRunning = true
+	go func() {
+		for {
+			s.autoApprovePass()
+			s.mu.Lock()
+			if !s.autoAgain {
+				s.autoRunning = false
+				s.mu.Unlock()
+				return
+			}
+			s.autoAgain = false
+			s.mu.Unlock()
+		}
+	}()
+}
+
+// autoApprovePass approves the Macs the auto-approve window admitted
+// (AutoApprovePending) with the same proof Approve needs: it takes the batch
+// of Macs ready now (per-Mac keys on: whose key is active), then
+// requireProxyLive writes a reload.request after all of them enrolled and
+// waits for the proxy to apply it. One proof covers the batch. A failed
+// proof leaves them pending and is shown as AutoApproveProblem. A Mac whose
+// window closed or expired first loses AutoApprovePending and waits for an
+// admin. Nothing carries over a Manager restart: the requests a proof can
+// match are only those this process wrote.
+func (s *PrincipalStore) autoApprovePass() {
+	s.mu.Lock()
+	if s.autoProblem != "" && time.Since(s.autoFailedAt) < autoApproveRetry {
+		s.mu.Unlock()
+		return
+	}
+	open := s.opts.Now().Before(s.autoUntil)
+	// batch: the admitted Macs ready now, each with the record as taken
+	// here. The proof below covers only these records: one that is replaced
+	// while it runs (forgotten and enrolled again under the same name) waits
+	// for a proof of its own.
+	var batch []autoCandidate
+	var lapsed map[string]*MacPrincipal // originals
+	for _, name := range s.sortedNamesLocked() {
+		r := s.recs[name]
+		if r.Status != PrincipalPending || !r.AutoApprovePending {
+			continue
+		}
+		if !open {
+			if lapsed == nil {
+				lapsed = map[string]*MacPrincipal{}
+			}
+			lapsed[name] = r
+			next := *r
+			next.AutoApprovePending = false
+			s.recs[name] = &next
+			continue
+		}
+		if s.objk == nil || objKeyDeliverable(r) {
+			batch = append(batch, autoCandidate{name: name, requestedAt: r.RequestedAt, argon2id: r.Argon2id})
+		}
+	}
+	if lapsed != nil {
+		if err := s.saveStoreLocked(); err != nil {
+			for name, r := range lapsed {
+				s.recs[name] = r
+			}
+			log.Printf("manager: auto-approve: %v", err)
+		} else {
+			for name := range lapsed {
+				log.Printf("manager: principal %s: the auto-approve window closed before it was approved; it now waits for an admin", name)
+			}
+		}
+	}
+	s.mu.Unlock()
+	if len(batch) == 0 {
+		return
+	}
+	err := s.requireProxyLive()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err != nil {
+		if msg := err.Error(); msg != s.autoProblem {
+			log.Printf("manager: auto-approve: %d Mac(s) wait: %v", len(batch), err)
+			s.autoProblem = msg
+		}
+		s.autoFailedAt = time.Now()
+		return
+	}
+	s.autoProblem = ""
+	now := s.opts.Now()
+	if !now.Before(s.autoUntil) {
+		return // closed meanwhile; the next pass hands them to an admin
+	}
+	orig := map[string]*MacPrincipal{}
+	for _, c := range batch {
+		name := c.name
+		r := s.recs[name]
+		if r == nil || r.Status != PrincipalPending || !r.AutoApprovePending || (s.objk != nil && !objKeyDeliverable(r)) {
+			continue // decided, closed or re-keyed meanwhile
+		}
+		if r.RequestedAt != c.requestedAt || r.Argon2id != c.argon2id {
+			// Enrolled again during the proof: its own proof must be
+			// written after it.
+			s.autoAgain = true
+			continue
+		}
+		orig[name] = r
+		next := *r
+		next.Status = PrincipalApproved
+		next.AutoApproved = true
+		next.AutoApprovePending = false
+		next.DecidedAt = now.UnixMilli()
+		s.markSharedKeyIssuedLocked(&next)
+		s.recs[name] = &next
+	}
+	if len(orig) == 0 {
+		return
+	}
+	if err := s.commitLocked(true); err != nil {
+		for name, r := range orig {
+			s.recs[name] = r
+		}
+		log.Printf("manager: auto-approve: %v", err)
+		return
+	}
+	for _, c := range batch {
+		name := c.name
+		if r := orig[name]; r != nil {
+			if s.objk != nil {
+				log.Printf("manager: principal %s auto-approved (storage key %s active)", name, r.ObjKeyName)
+			} else {
+				log.Printf("manager: principal %s auto-approved", name)
+			}
+		}
 	}
 }
 
@@ -1596,21 +1798,23 @@ func (s *PrincipalStore) SetAutoApproveWindow(d time.Duration, maxApprovals ...i
 	defer s.mu.Unlock()
 	prevUntil, prevMax, prevUsed, prevPerIP := s.autoUntil, s.autoMax, s.autoUsed, s.autoPerIP
 	var unPended map[string]*MacPrincipal // originals of the records changed below
+	// Macs the current (or an expired) window admitted that still wait (for
+	// their storage key or a proxy proof) are not auto-approved by a later
+	// window: closing, reopening or extending hands them to an admin. The
+	// counters a new window starts from would otherwise not count them.
+	for name, r := range s.recs {
+		if r.Status == PrincipalPending && r.AutoApprovePending {
+			if unPended == nil {
+				unPended = map[string]*MacPrincipal{}
+			}
+			unPended[name] = r
+			next := *r
+			next.AutoApprovePending = false
+			s.recs[name] = &next
+		}
+	}
 	if d <= 0 {
 		s.autoUntil = time.Time{}
-		// Macs the window admitted that still wait for their storage key are
-		// not auto-approved later: they wait for an admin.
-		for name, r := range s.recs {
-			if r.Status == PrincipalPending && r.AutoApprovePending {
-				if unPended == nil {
-					unPended = map[string]*MacPrincipal{}
-				}
-				unPended[name] = r
-				next := *r
-				next.AutoApprovePending = false
-				s.recs[name] = &next
-			}
-		}
 	} else {
 		s.autoUntil = s.opts.Now().Add(d)
 		s.autoMax, s.autoUsed, s.autoPerIP = limit, 0, map[string]int{}
@@ -1623,7 +1827,7 @@ func (s *PrincipalStore) SetAutoApproveWindow(d time.Duration, maxApprovals ...i
 		return prevUntil, err
 	}
 	for name := range unPended {
-		log.Printf("manager: principal %s: auto-approve closed before its storage key was ready; it now waits for an admin", name)
+		log.Printf("manager: principal %s: the auto-approve window changed before it was approved; it now waits for an admin", name)
 	}
 	log.Printf("manager: principal auto-approve window until %v (max %d approvals, %d per address)", s.autoUntil, s.autoMax, maxAutoApprovePerIP)
 	return s.autoUntil, nil
@@ -1638,6 +1842,7 @@ func (s *PrincipalStore) Snapshot() PrincipalsSnapshot {
 
 func (s *PrincipalStore) snapshotLocked(withSecrets bool) PrincipalsSnapshot {
 	out := PrincipalsSnapshot{ProxyDir: s.opts.ProxyDir != "", AutoApproveMax: s.autoMax, AutoApproveUsed: s.autoUsed}
+	now := s.opts.Now()
 	var orphansOf map[string][]string
 	if !withSecrets {
 		orphans, orphanRemoving := s.keepObjOrphans, s.keepObjOrphanRemove
@@ -1656,7 +1861,7 @@ func (s *PrincipalStore) snapshotLocked(withSecrets bool) PrincipalsSnapshot {
 			}
 		}
 	}
-	if s.opts.Now().Before(s.autoUntil) {
+	if now.Before(s.autoUntil) {
 		out.AutoApproveUntil = s.autoUntil.UnixMilli()
 	}
 	for _, r := range s.recs {
@@ -1667,6 +1872,7 @@ func (s *PrincipalStore) snapshotLocked(withSecrets bool) PrincipalsSnapshot {
 			c.ObjKeyStatus = s.objKeyStatusLocked(r)
 			c.ObjKeyOrphans = orphansOf[r.Name]
 			c.SharedKeyHeld = s.heldSharedKeyLocked(r)
+			c.AutoApprovePending = s.autoAdmittedLocked(r, now) // a lapsed flag shows as plain pending
 		}
 		if c.AutoApproved && c.Status == PrincipalApproved {
 			out.NeedsReview++
@@ -1689,6 +1895,14 @@ func (s *PrincipalStore) snapshotLocked(withSecrets bool) PrincipalsSnapshot {
 		out.ReloadApplied = out.ProxyLive && acked == len(s.issued)-1 && acked >= 0 && ack == request
 		if !out.ProxyLive {
 			out.ProxyProblem = proxyProblemText(st)
+		}
+	}
+	if s.autoProblem != "" {
+		for _, r := range s.recs {
+			if s.autoAdmittedLocked(r, now) {
+				out.AutoApproveProblem = s.autoProblem
+				break
+			}
 		}
 	}
 	if !withSecrets {
@@ -1886,7 +2100,8 @@ func (s *PrincipalStore) writeProxyFilesLocked() error {
 			// Only a line this process wrote can prove the proxy live.
 			var line string
 			if line, err = fs.reloadLine(sha); err == nil {
-				s.issued = append(s.issued, issuedRequest{line: line, at: time.Now()})
+				s.issuedSeq++
+				s.issued = append(s.issued, issuedRequest{line: line, at: time.Now(), seq: s.issuedSeq})
 				if len(s.issued) > maxIssuedRequests {
 					s.issued = append([]issuedRequest(nil), s.issued[len(s.issued)-maxIssuedRequests:]...)
 				}
