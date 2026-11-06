@@ -276,15 +276,6 @@ func RunSync(ctx context.Context, juicefsBin string, spec RunSyncSpec, source, d
 		}
 	}
 
-	// Symlinks inside the tree (sync_links.go): copy them as links, or
-	// refuse a tree whose symlinks lead outside the volume.
-	links := false
-	if spec.Mode == ModeEmbedded && spec.FUSEMount != "" {
-		if links, err = guardSyncSymlinks(ctx, spec.FUSEMount, source, destination, src, dst); err != nil {
-			return err
-		}
-	}
-
 	threads := opts.Threads
 	if threads <= 0 {
 		threads = 10
@@ -302,9 +293,6 @@ func RunSync(ctx context.Context, juicefsBin string, spec RunSyncSpec, source, d
 		// counters (juicefs's stderr progress bar is TTY-only; non-TTY
 		// stderr emits sparse logs that the regex parser barely catches).
 		"--metrics", metricsAddr,
-	}
-	if links {
-		args = append(args, "--links")
 	}
 	if opts.PreserveTimes {
 		// juicefs sync 1.3.1 only exposes --perms (mode bits). mtime

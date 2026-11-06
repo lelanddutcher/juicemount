@@ -3,7 +3,6 @@ package manager
 import (
 	"context"
 	"errors"
-	"io/fs"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -13,10 +12,11 @@ import (
 	"time"
 )
 
-// Tests for the second round of volume-boundary hardening: symlinks deep
-// inside a sync tree, the post-sync permissions step, the trash root, a
-// restore onto the volume root, the shared /jfs prefix check, and the
-// linear-time resolver. Fixture layout: see newConfineFixture.
+// Tests for the second round of volume-boundary hardening: the post-sync
+// permissions step, the trash root, a restore onto the volume root, the
+// shared /jfs prefix check, and the linear-time resolver. Fixture layout:
+// see newConfineFixture. Symlinks inside a sync tree are handled in the
+// juicefs file backend (follow-up PR), not here.
 
 // recordingJuicefs writes an executable stand-in for juicefs. It records its
 // arguments, one per line, in the returned file, runs body, and exits 0.
@@ -39,229 +39,6 @@ func readArgs(t *testing.T, argsFile string) []string {
 		t.Fatalf("juicefs was not run: %v", err)
 	}
 	return strings.Split(strings.TrimSpace(string(b)), "\n")
-}
-
-func hasArg(args []string, want string) bool {
-	for _, a := range args {
-		if a == want {
-			return true
-		}
-	}
-	return false
-}
-
-// addDeepEscape stores fuse/proj/deep/a/b/evil -> outside, next to a real
-// file, so a sync of /jfs/proj meets the symlink four levels down.
-func (f *confineFixture) addDeepEscape(t *testing.T) {
-	t.Helper()
-	d := filepath.Join(f.fuse, "proj", "deep", "a", "b")
-	if err := os.MkdirAll(d, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(d, "real.txt"), []byte("in volume"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink(f.outside, filepath.Join(d, "evil")); err != nil {
-		t.Fatal(err)
-	}
-}
-
-// TestSyncCopiesVolumeSymlinksAsLinks: a sync that reads or writes the
-// FUSE mount passes --links when both ends can store symlinks, so juicefs
-// copies a symlink as a link instead of following it.
-func TestSyncCopiesVolumeSymlinksAsLinks(t *testing.T) {
-	f := newConfineFixture(t)
-	f.addDeepEscape(t)
-	if err := os.MkdirAll(filepath.Join(f.fuse, "dest"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	spec := RunSyncSpec{Mode: ModeEmbedded, FUSEMount: f.fuse}
-	cases := []struct {
-		name, src, dst string
-		links          bool
-	}{
-		{"out to a host root", "/jfs/proj", filepath.Join(f.src, "out"), true},
-		{"out to a saved file destination", "/jfs/proj", "file://" + filepath.Join(f.src, "bk") + "/", true},
-		{"out to a saved jfs destination", "/jfs/proj", "jfs://other/", true},
-		{"in into a volume destination", f.src, "/jfs/dest", true},
-		{"host to host does not touch the volume", f.src, filepath.Join(f.src, "copy"), false},
-	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			bin, argsFile := recordingJuicefs(t, "")
-			if err := RunSync(context.Background(), bin, spec, c.src, c.dst, DefaultSyncOptions(), nil, nil); err != nil {
-				t.Fatalf("RunSync: %v", err)
-			}
-			if got := hasArg(readArgs(t, argsFile), "--links"); got != c.links {
-				t.Errorf("--links passed = %v, want %v; args %v", got, c.links, readArgs(t, argsFile))
-			}
-		})
-	}
-}
-
-// TestSyncRefusesEscapingSourceForLinklessDestination: an object store
-// cannot hold a symlink, and juicefs then drops --links and follows
-// symlinks. A volume source holding a symlink that leads outside the
-// volume is refused before juicefs runs. In-volume symlinks are fine.
-func TestSyncRefusesEscapingSourceForLinklessDestination(t *testing.T) {
-	f := newConfineFixture(t)
-	f.addDeepEscape(t)
-	spec := RunSyncSpec{Mode: ModeEmbedded, FUSEMount: f.fuse}
-	for _, dst := range []string{"s3://bucket/backups/", "b2://bucket/", "webdav://dav.example/x/"} {
-		bin, argsFile := recordingJuicefs(t, "")
-		err := RunSync(context.Background(), bin, spec, "/jfs/proj", dst, DefaultSyncOptions(), nil, nil)
-		if err == nil || !strings.Contains(err.Error(), "/jfs/proj/deep/a/b/evil") || !strings.Contains(err.Error(), "cannot store symlinks") {
-			t.Errorf("Out to %s: err = %v, want a refusal naming /jfs/proj/deep/a/b/evil", dst, err)
-		}
-		if _, statErr := os.Stat(argsFile); statErr == nil {
-			t.Errorf("Out to %s: juicefs ran despite the refusal", dst)
-		}
-	}
-	// A tree whose symlinks stay inside the volume still syncs (followed,
-	// as before; juicefs would ignore --links here anyway).
-	if err := os.Symlink(filepath.Join(f.fuse, "real", "a.txt"), filepath.Join(f.fuse, "real", "alias.txt")); err != nil {
-		t.Fatal(err)
-	}
-	bin, argsFile := recordingJuicefs(t, "")
-	if err := RunSync(context.Background(), bin, spec, "/jfs/real", "s3://bucket/x/", DefaultSyncOptions(), nil, nil); err != nil {
-		t.Fatalf("Out of an in-volume-only tree to s3: %v", err)
-	}
-	if hasArg(readArgs(t, argsFile), "--links") {
-		t.Errorf("--links passed for an s3 destination")
-	}
-}
-
-// TestSyncRefusesVolumeDestinationWithEscapingSymlink: juicefs writes
-// through a symlink already in the destination, even with --links. A
-// volume destination holding one that leads outside is refused.
-func TestSyncRefusesVolumeDestinationWithEscapingSymlink(t *testing.T) {
-	f := newConfineFixture(t)
-	victim := filepath.Join(f.base, "victim")
-	if err := os.MkdirAll(victim, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.MkdirAll(filepath.Join(f.fuse, "dest", "x"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink(victim, filepath.Join(f.fuse, "dest", "x", "sub")); err != nil {
-		t.Fatal(err)
-	}
-	bin, argsFile := recordingJuicefs(t, "")
-	spec := RunSyncSpec{Mode: ModeEmbedded, FUSEMount: f.fuse}
-	err := RunSync(context.Background(), bin, spec, f.src, "/jfs/dest", DefaultSyncOptions(), nil, nil)
-	if err == nil || !strings.Contains(err.Error(), "/jfs/dest/x/sub") {
-		t.Fatalf("In into a destination holding an escaping symlink: err = %v, want a refusal naming /jfs/dest/x/sub", err)
-	}
-	if _, statErr := os.Stat(argsFile); statErr == nil {
-		t.Errorf("juicefs ran despite the refusal")
-	}
-}
-
-// realJuicefs returns the juicefs binary named by JM_TEST_JUICEFS_BIN
-// (build it from third_party/juicefs), or skips.
-func realJuicefs(t *testing.T) string {
-	t.Helper()
-	bin := os.Getenv("JM_TEST_JUICEFS_BIN")
-	if bin == "" {
-		t.Skip("JM_TEST_JUICEFS_BIN not set; build juicefs from third_party/juicefs to run this test")
-	}
-	return bin
-}
-
-// useRealSync makes the fixture's jobs run the real RunSync with bin.
-func (f *confineFixture) useRealSync(bin string) {
-	f.mgr.SetRunner(func(ctx context.Context, _ string, spec RunSyncSpec, src, dst string, opts SyncOptions, env []string, progress chan<- ProgressEvent) error {
-		return RunSync(ctx, bin, spec, src, dst, opts, env, progress)
-	})
-}
-
-// regularFilesNamed lists regular files named name under root (no
-// symlinks followed).
-func regularFilesNamed(t *testing.T, root, name string) []string {
-	t.Helper()
-	var out []string
-	_ = filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
-		if err == nil && d.Type().IsRegular() && d.Name() == name {
-			out = append(out, p)
-		}
-		return nil
-	})
-	return out
-}
-
-// TestRealJuicefsOutCopiesDeepSymlinkAsLink runs the vendored juicefs
-// through /api/migrate: an Out job of a tree holding a deep symlink to a
-// folder outside the volume must copy the link, not the folder's files,
-// both to a host root and to a saved file destination.
-func TestRealJuicefsOutCopiesDeepSymlinkAsLink(t *testing.T) {
-	bin := realJuicefs(t)
-	f := newConfineFixture(t)
-	f.addDeepEscape(t)
-	f.useRealSync(bin)
-	bk := filepath.Join(f.src, "bk")
-	if err := os.MkdirAll(bk, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if w := f.do(t, http.MethodPost, "/api/destinations", fileDestBody("bk", bk)); w.Code != http.StatusCreated {
-		t.Fatalf("destination create: %d %s", w.Code, w.Body.String())
-	}
-	hostOut := filepath.Join(f.src, "hostout")
-	for _, c := range []struct{ dest, root string }{{hostOut, hostOut}, {"file://bk", bk}} {
-		body := jsonBody(t, map[string]any{"source": "/jfs/proj", "destination": c.dest, "direction": "out"})
-		if w := f.do(t, http.MethodPost, "/api/migrate", body); w.Code != http.StatusAccepted {
-			t.Fatalf("migrate out to %s: %d %s", c.dest, w.Code, w.Body.String())
-		}
-		waitJobsSettled(t, f.mgr)
-		if got := regularFilesNamed(t, c.root, "real.txt"); len(got) != 1 {
-			t.Errorf("out to %s: the sync did not copy the in-volume file (found %v)", c.dest, got)
-		}
-		if got := regularFilesNamed(t, c.root, "secret.txt"); len(got) != 0 {
-			t.Errorf("out to %s: content from outside the volume was copied: %v", c.dest, got)
-		}
-		fi, err := os.Lstat(filepath.Join(c.root, "deep", "a", "b", "evil"))
-		if err != nil || fi.Mode()&fs.ModeSymlink == 0 {
-			t.Errorf("out to %s: deep symlink not copied as a link (err %v)", c.dest, err)
-		}
-	}
-	for _, j := range f.mgr.List() {
-		if s := j.GetSnapshot(); s.State != JobDone {
-			t.Errorf("job %s -> %s: state %s, error %q", s.Source, s.Destination, s.State, s.Error)
-		}
-	}
-}
-
-// TestRealJuicefsInRefusesDestinationSymlink runs the vendored juicefs
-// through /api/migrate: an In job into a volume folder that holds a
-// symlink to a folder outside the volume must write nothing there.
-func TestRealJuicefsInRefusesDestinationSymlink(t *testing.T) {
-	bin := realJuicefs(t)
-	f := newConfineFixture(t)
-	f.useRealSync(bin)
-	victim := filepath.Join(f.base, "victim")
-	for _, d := range []string{victim, filepath.Join(f.fuse, "dest", "x"), filepath.Join(f.src, "in", "x", "sub")} {
-		if err := os.MkdirAll(d, 0o755); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := os.Symlink(victim, filepath.Join(f.fuse, "dest", "x", "sub")); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(f.src, "in", "x", "sub", "payload.txt"), []byte("payload"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	body := jsonBody(t, map[string]any{"source": filepath.Join(f.src, "in"), "destination": "/jfs/dest", "direction": "in"})
-	if w := f.do(t, http.MethodPost, "/api/migrate", body); w.Code != http.StatusAccepted {
-		t.Fatalf("migrate in: %d %s", w.Code, w.Body.String())
-	}
-	waitJobsSettled(t, f.mgr)
-	if _, err := os.Lstat(filepath.Join(victim, "payload.txt")); err == nil {
-		t.Errorf("the sync wrote through the destination symlink into a folder outside the volume")
-	}
-	for _, j := range f.mgr.List() {
-		if s := j.GetSnapshot(); s.State != JobError || !strings.Contains(s.Error, "/jfs/dest/x/sub") {
-			t.Errorf("job state %s, error %q; want failed naming /jfs/dest/x/sub", s.State, s.Error)
-		}
-	}
 }
 
 // TestPostSyncPermissionsSurviveDestinationSwap: the post-sync mode and
