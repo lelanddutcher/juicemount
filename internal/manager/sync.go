@@ -294,6 +294,16 @@ func RunSync(ctx context.Context, juicefsBin string, spec RunSyncSpec, source, d
 		// stderr emits sparse logs that the regex parser barely catches).
 		"--metrics", metricsAddr,
 	}
+	// Copy symlinks as links when both ends can store them. The file://
+	// backend of the juicefs the Manager ships resolves every path beneath
+	// its root (third_party/juicefs patch 0016), so a link copied into a
+	// root cannot lead a later write outside it. A destination that cannot
+	// store links (s3, b2, webdav) makes juicefs follow source links; the
+	// confined file backend then follows only those that stay beneath the
+	// source root.
+	if syncURISupportsSymlinks(src) && syncURISupportsSymlinks(dst) {
+		args = append(args, "--links")
+	}
 	if opts.PreserveTimes {
 		// juicefs sync 1.3.1 only exposes --perms (mode bits). mtime
 		// is preserved by default for file:// → file:// transfers but
@@ -452,6 +462,21 @@ func applyPostSyncPermissions(ctx context.Context, destination, fuseMount string
 	if err := applyPermsBeneath(ctx, vp.MountReal, rel, ownerUID, ownerGID, true); err != nil {
 		fmt.Fprintf(os.Stderr, "manager: post-sync permissions (mode, owner %s) on %q incomplete (job stays successful): %v\n", chownSpec(ownerUID, ownerGID), destination, err)
 	}
+}
+
+// syncURISupportsSymlinks reports whether juicefs sync can store a symlink
+// at uri: pkg/object SupportSymlink is implemented by file, nfs, sftp and
+// jfs volumes.
+func syncURISupportsSymlinks(uri string) bool {
+	i := strings.Index(uri, "://")
+	if i <= 0 {
+		return false
+	}
+	switch strings.ToLower(uri[:i]) {
+	case "file", "nfs", "sftp", "jfs":
+		return true
+	}
+	return false
 }
 
 // chownSpec renders the "uid[:gid]" argument for chown; gid < 0 leaves the
