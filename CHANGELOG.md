@@ -391,7 +391,9 @@ new workers against the same Redis at the same time:
   2. Copy Redis's data folder (its `appendonlydir`) somewhere safe. If Redis
      was restarted under 0.5.0 since its last rewrite, that copy is the only
      place the changes lost at that restart still exist.
-  3. Make Redis rewrite its append-only file from what it holds now:
+  3. Make Redis rewrite its append-only file from what it holds now. First
+     note the number in the name of the `.base.` file in `appendonlydir`
+     (for example `appendonly.aof.3.base.rdb`). Then run
      `docker exec <redis container> sh -c 'REDISCLI_AUTH="$(cat
      /run/jm-redis/admin.pass)" redis-cli --user jm-admin BGREWRITEAOF'`
      (the password stays in the environment, out of `ps`).
@@ -400,7 +402,11 @@ new workers against the same Redis at the same time:
      `aof_last_bgrewrite_status:ok`. A rewrite requested while a background
      save runs is only scheduled, so check all three. If Redis answers that a
      rewrite is already in progress, wait for it to finish, then ask again:
-     only a rewrite started after step 2 counts.
+     only a rewrite started after step 2 counts. Then check that the
+     `.base.` file in `appendonlydir` has a higher number than the one you
+     noted. A rewrite that was stopped halfway passes the three checks
+     above but leaves the old files in place; if the number did not rise,
+     ask again.
   4. Now update `server/redis.acl` and restart Redis. The rewritten file
      holds no transactions to refuse, so nothing is lost or replayed twice.
   Changes lost at an earlier 0.5.0 restart are not recovered by these steps.
@@ -408,24 +414,33 @@ new workers against the same Redis at the same time:
   replay.
 - If you update through `server/scripts/rollout-compose.sh`, the script can
   do step 3 for you, but not always in time:
-  - First check whether Redis already had a lossy start: `docker logs <redis
-    container> 2>&1 | grep -c AOF-loading-client`. If the count is not 0, or
-    you cannot tell (for example, the log was rotated), do steps 1 to 3 by
-    hand before you update the checkout. Redis restarts by itself if it
-    crashes (`restart: unless-stopped`). A crash after the checkout is
-    updated, but before the script's rewrite, would start Redis under the
-    new ACL with no script involved. Then update the checkout and run the
-    release rollout with `--ack-redis-aof-backup`. Its rewrite is then a
-    second one, and harmless.
-  - If the count is 0, do step 2, update the checkout, and run the release
-    rollout right away with `--ack-redis-aof-backup`, which confirms that
-    you did step 2. Do not reboot the NAS or restart Redis in between. A
-    running Redis does not read the new `server/redis.acl`.
+  - First check whether Redis already had a lossy start. Run
+    `docker logs <redis container> > redis.log 2>&1; echo $?`, then
+    `grep -c 'Ready to accept connections' redis.log` and
+    `grep -c AOF-loading-client redis.log`. You can tell only if the first
+    command printed 0 (it read the log) and the log shows the current start
+    (the `Ready to accept connections` count is at least 1). Otherwise you
+    cannot tell, for example with a logging driver that cannot be read, or
+    after log rotation dropped the start. `grep -c` prints 0 in both of
+    those cases too, so 0 alone proves nothing.
+  - If you cannot tell, or the `AOF-loading-client` count is not 0, take the
+    manual path: do steps 1 to 3 by hand before you update the checkout.
+    Redis restarts by itself if it crashes (`restart: unless-stopped`). A
+    crash after the checkout is updated, but before the script's rewrite,
+    would start Redis under the new ACL with no script involved. Then update
+    the checkout and run the release rollout with `--ack-redis-aof-backup`.
+    Its rewrite is then a second one, and harmless.
+  - Only if you can tell and the `AOF-loading-client` count is 0: do step 2,
+    update the checkout, and run the release rollout right away with
+    `--ack-redis-aof-backup`, which confirms that you did step 2. Do not
+    reboot the NAS or restart Redis in between. A running Redis does not
+    read the new `server/redis.acl`.
   - Once the rollout's rewrite succeeds, a later NAS reboot or Redis restart
     is safe. In detail:
   - The script acts only on this checkout's Redis: the redis container of
     the `--project` you name whose Compose working directory is this
-    checkout's `server/` folder.
+    checkout's `server/` folder. If a redis container of that project runs
+    from another directory, the script names that directory and refuses.
   - A release rollout never restarts Redis. Right after it takes its lock,
     before any other check, it reads the ACL that the running Redis loaded
     at its start (`/run/jm-redis/users.acl` in the Redis container). If that

@@ -39,6 +39,8 @@ cat > "$WORK/bin/docker" <<'DOCKER'
 #!/usr/bin/env bash
 set -euo pipefail
 printf '%s\n' "docker $*" >> "$FAKE_LOG"
+# A hung daemon.
+[ "${FAKE_DOCKER_HANG:-}" != 1 ] || exec /bin/sleep 60
 state="$(cat "$FAKE_STATE")"
 manager='ghcr.io/lelanddutcher/juicemount-manager'
 farm='ghcr.io/lelanddutcher/juicefarm'
@@ -97,7 +99,12 @@ case "$1" in
       *label=com.docker.compose.project=testproject*label=com.docker.compose.service=redis*status=running*)
         # The redis container's working directory label: this checkout's
         # unless FAKE_REDIS_WORKDIR names another deployment.
-        case "$*" in *"label=com.docker.compose.project.working_dir=${FAKE_REDIS_WORKDIR:-$FAKE_REPO/server}"*) ;; *) exit 0 ;; esac
+        # A lookup without that filter (the other-directory probe) finds it
+        # wherever it runs.
+        case "$*" in
+          *"label=com.docker.compose.project.working_dir=${FAKE_REDIS_WORKDIR:-$FAKE_REPO/server}"*) ;;
+          *label=com.docker.compose.project.working_dir=*) exit 0 ;;
+        esac
         [ "${FAKE_REDIS_DOWN:-}" = 1 ] || echo redis-id ;;
       *) echo "unexpected ps: $*" >&2; exit 1 ;;
     esac ;;
@@ -106,7 +113,8 @@ case "$1" in
     if [ "${1:-}" = -f ]; then
       template="$2"; id="$3"
       case "$template" in
-        *com.docker.compose.project.working_dir*) echo "$FAKE_REPO/server" ;;
+        *com.docker.compose.project.working_dir*)
+          if [ "$id" = redis-id ]; then echo "${FAKE_REDIS_WORKDIR:-$FAKE_REPO/server}"; else echo "$FAKE_REPO/server"; fi ;;
         *com.docker.compose.project.config_files*) echo "$FAKE_REPO/server/docker-compose.yml" ;;
         *com.docker.compose.project*) echo testproject ;;
         *com.docker.compose.service*)
@@ -193,6 +201,14 @@ fi
 exec /bin/mv "$@"
 MV
 chmod +x "$WORK/bin/mv"
+cat > "$WORK/bin/rm" <<'RM'
+#!/usr/bin/env bash
+if [ "${FAKE_FAIL:-}" = rm_lock_owner ] && [ "${!#}" = "$FAKE_REPO/.update-lock/owner" ]; then
+  exit 1
+fi
+exec /bin/rm "$@"
+RM
+chmod +x "$WORK/bin/rm"
 printf '#!/usr/bin/env bash\nexit 0\n' > "$WORK/bin/sleep"
 chmod +x "$WORK/bin/sleep"
 export PATH="$WORK/bin:$PATH"
@@ -201,7 +217,7 @@ args=(--repo "$REPO" --project testproject --manager-digest "$NEW_M" --farm-dige
 reset_case() {
   printf old > "$FAKE_STATE"
   rm -rf "$FAKE_AOF_DIR"; mkdir -p "$FAKE_AOF_DIR"; echo 3 > "$FAKE_AOF_DIR/count"; echo 2 > "$FAKE_AOF_DIR/base"
-  export FAKE_RUNNING_ACL=fixed FAKE_AOF=ok FAKE_REDIS_DOWN="" FAKE_REDIS_WORKDIR=""
+  export FAKE_RUNNING_ACL=fixed FAKE_AOF=ok FAKE_REDIS_DOWN="" FAKE_REDIS_WORKDIR="" FAKE_DOCKER_HANG=""
   : > "$FAKE_LOG"
   rm -rf "$REPO/.update-lock"
   rm -f "$FAKE_TARGET_PIDFILE"
@@ -285,13 +301,58 @@ for bad in '--ack-redis-aof-backpu' '--manager-digest sha256:bad' '--proxy-rollb
 done
 echo 'ok: usage errors warn while the running Redis has the 0.5.0 ACL'
 
+# The early scan: a bad flag before --project, --project=NAME, --repo with
+# no value, and a --repo that does not exist all warn. --help never does.
+reset_case
+export FAKE_RUNNING_ACL=old
+rest=(--manager-digest "$NEW_M" --farm-digest "$NEW_F" --render-digest "$NEW_R" --ack-worker-quiesced)
+for argv in "--bogus --project testproject --repo $REPO" "--bogus --project=testproject --repo $REPO" \
+  "--project testproject --repo=$REPO --bogus" "--project testproject --repo /nonexistent/checkout" "--project testproject --repo"; do
+  : > "$FAKE_LOG"
+  # shellcheck disable=SC2086 # word splitting is the point
+  if bash "$SCRIPT" $argv "${rest[@]}" > "$WORK/out" 2>&1; then echo "FAIL: accepted: $argv" >&2; exit 1; fi
+  warned || { cat "$WORK/out"; echo "FAIL: no warning for: $argv" >&2; exit 1; }
+  [ "$(rewrites)" = 0 ] || { echo "FAIL: rewrote on a usage error: $argv" >&2; exit 1; }
+done
+# A --repo that does not exist is named, and the warning comes from the
+# project's running Redis (the 0.5.0 ACL), not from the current directory.
+if bash "$SCRIPT" --project testproject --repo /nonexistent/checkout "${rest[@]}" > "$WORK/out" 2>&1; then echo 'FAIL: accepted a missing --repo' >&2; exit 1; fi
+grep -q 'rollout-compose: --repo is not a directory: /nonexistent/checkout' "$WORK/out" &&
+  grep -q 'WARNING: the running Redis still has the 0.5.0 ACL' "$WORK/out" || { cat "$WORK/out"; echo 'FAIL: a missing --repo was not named, or its warning was not about the project Redis' >&2; exit 1; }
+: > "$FAKE_LOG"
+bash "$SCRIPT" --help --project testproject > "$WORK/out" 2>&1 || true
+! warned && [ ! -s "$FAKE_LOG" ] || { cat "$WORK/out"; echo 'FAIL: --help warned or called docker' >&2; exit 1; }
+# A Redis without an ACL file: a usage error does not warn.
+export FAKE_RUNNING_ACL=noacl
+if bash "$SCRIPT" --bogus --project testproject --repo "$REPO" > "$WORK/out" 2>&1; then echo 'FAIL: accepted --bogus' >&2; exit 1; fi
+! grep -q WARNING "$WORK/out" || { cat "$WORK/out"; echo 'FAIL: warned about a Redis without an ACL file' >&2; exit 1; }
+# A hung Docker daemon cannot hang a usage error: the exit check is bounded,
+# and then it warns that it could not tell.
+export FAKE_RUNNING_ACL=old FAKE_DOCKER_HANG=1
+start=$SECONDS
+if JM_REDIS_EXIT_CHECK_TIMEOUT=2 bash "$SCRIPT" --bogus --project testproject --repo "$REPO" > "$WORK/out" 2>&1; then echo 'FAIL: accepted --bogus' >&2; exit 1; fi
+export FAKE_DOCKER_HANG=""
+[ $((SECONDS - start)) -lt 20 ] || { echo "FAIL: a hung daemon held a usage error for $((SECONDS - start)) s" >&2; exit 1; }
+grep -q 'may still have the 0.5.0 ACL (could not read users.acl)' "$WORK/out" || { cat "$WORK/out"; echo 'FAIL: no warning after a hung exit check' >&2; exit 1; }
+# A lock that cannot be removed at exit must not skip the warning.
+reset_case
+export FAKE_RUNNING_ACL=old FAKE_FAIL=rm_lock_owner
+if bash "$SCRIPT" "${args[@]}" > "$WORK/out" 2>&1; then echo 'FAIL: rewrote without the acknowledgement' >&2; exit 1; fi
+export FAKE_FAIL=""
+grep -q 'CRITICAL: could not remove the lock' "$WORK/out" && warned || { cat "$WORK/out"; echo 'FAIL: a failed lock removal skipped the warning' >&2; exit 1; }
+/bin/rm -rf "$REPO/.update-lock"
+echo 'ok: the early scan finds --project anywhere, --project=NAME and a bad --repo still warn, --help does not, and a hung daemon cannot hang the exit'
+
 # Only this checkout's Redis: a Redis of the same project name from another
-# checkout is neither read nor rewritten.
+# checkout is neither read nor rewritten, and is named, not called "not
+# running".
 reset_case
 export FAKE_RUNNING_ACL=unreadable FAKE_REDIS_WORKDIR=/srv/other-checkout/server
 if bash "$SCRIPT" "${args[@]}" > "$WORK/out" 2>&1; then echo "FAIL: release ran without this checkout's Redis" >&2; exit 1; fi
-[ "$(rewrites)" = 0 ] && grep -q 'Redis of project testproject is not running' "$WORK/out" || { cat "$WORK/out"; echo "FAIL: touched another checkout's Redis" >&2; exit 1; }
-grep 'docker ps ' "$FAKE_LOG" | grep -qv "working_dir=$REPO/server" && { echo 'FAIL: a Redis lookup without the working_dir filter' >&2; exit 1; }
+[ "$(rewrites)" = 0 ] && grep -q "refusing: a redis container of Compose project testproject runs from another directory (/srv/other-checkout/server), not from $REPO/server" "$WORK/out" &&
+  ! grep -q 'is not running' "$WORK/out" || { cat "$WORK/out"; echo "FAIL: another checkout's Redis touched or misreported" >&2; exit 1; }
+grep 'docker ps ' "$FAKE_LOG" | head -1 | grep -q "working_dir=$REPO/server" || { echo "FAIL: the Redis lookup did not filter on this checkout" >&2; exit 1; }
+! grep -q '^docker exec redis-id' "$FAKE_LOG" || { echo "FAIL: exec into another checkout's Redis" >&2; exit 1; }
 echo "ok: the release reads and rewrites only this checkout's Redis"
 
 # Wording: an unreadable users.acl is "may still have"; no ACL file at all

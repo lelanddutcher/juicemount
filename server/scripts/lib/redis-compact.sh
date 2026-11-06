@@ -51,9 +51,12 @@
 jm_redis_compact_log() { printf 'redis-compact: %s\n' "$*" >&2; }
 
 # The running redis container of a Compose project. Prints its ID. Returns 3
-# when no such container is running.
+# when no such container is running. With JM_REDIS_WORKING_DIR set, a redis
+# container of the same project that runs from another directory is an
+# error (1), not "not running": it is another deployment, and nothing here
+# may act on it or conclude anything from it.
 jm_redis_find() { # project
-  local ids n
+  local ids n other
   local -a filters=(--filter "label=com.docker.compose.project=$1"
     --filter label=com.docker.compose.service=redis --filter status=running)
   [ -z "${JM_REDIS_WORKING_DIR:-}" ] ||
@@ -62,6 +65,13 @@ jm_redis_find() { # project
     jm_redis_compact_log "cannot list the containers of Compose project $1"; return 1;
   }
   n="$(printf '%s\n' "$ids" | sed '/^$/d' | wc -l | tr -d ' ')"
+  if [ "$n" = 0 ] && [ -n "${JM_REDIS_WORKING_DIR:-}" ]; then
+    other="$(docker ps -q --no-trunc "${filters[@]:0:6}" | sed '/^$/d' | head -1)" || other=""
+    if [ -n "$other" ]; then
+      jm_redis_compact_log "refusing: a redis container of Compose project $1 runs from another directory ($(docker inspect -f '{{ index .Config.Labels "com.docker.compose.project.working_dir" }}' "$other" 2>/dev/null || echo unknown)), not from $JM_REDIS_WORKING_DIR. Check --project and --repo."
+      return 1
+    fi
+  fi
   case "$n" in
     0) return 3 ;;
     1) printf '%s\n' "$ids" ;;
@@ -96,7 +106,9 @@ jm_redis_snapshot() { # container
     rcli INFO persistence || exit 1
     dir="$(rcli CONFIG GET dir | sed -n 2p)"
     adir="$(rcli CONFIG GET appenddirname | sed -n 2p)"
-    base="$(cat "$dir/$adir"/*.manifest 2>/dev/null |
+    afile="$(rcli CONFIG GET appendfilename | sed -n 2p)"
+    # Only the live manifest: a crash can leave temp-<name>.manifest behind.
+    base="$(cat "$dir/$adir/$afile.manifest" 2>/dev/null |
       awk "{ s = \"\"; for (i = 1; i < NF; i++) if (\$i == \"seq\") s = \$(i + 1); if (\$NF == \"b\") print s }" | tail -1)"
     printf "jm_base_seq:%s\n" "$base"' jm-redis-snapshot
 }

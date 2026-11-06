@@ -42,8 +42,9 @@
 #   replayed transaction. A forward topology change needs a running, healthy
 #   Redis, and a release never restarts Redis.
 set -euo pipefail
+JM_LIB="$(cd "$(dirname "$0")" && pwd)/lib/redis-compact.sh"
 # shellcheck source=lib/redis-compact.sh
-. "$(cd "$(dirname "$0")" && pwd)/lib/redis-compact.sh"
+. "$JM_LIB"
 
 usage() {
   echo 'usage: rollout-compose.sh --project NAME --manager-digest sha256:HEX --farm-digest sha256:HEX --render-digest sha256:HEX --ack-worker-quiesced [--ack-redis-aof-backup] [--repo PATH] [--dry-run]' >&2
@@ -79,12 +80,24 @@ REDIS_ACL_STATE=unknown
 # replay refused transactions. The trap is set before the arguments are
 # parsed, so usage errors warn too; it only reads /run/jm-redis/users.acl
 # from this checkout's running Redis.
+# The ACL state for the exit warning, bounded in time: a hung Docker daemon
+# must not hang a usage error. Without a usable --repo, any redis container
+# of the project counts (this only decides whether to warn).
+redis_state_bounded() { # project, working dir ('' = any)
+  local limit="${JM_REDIS_EXIT_CHECK_TIMEOUT:-20}"
+  if command -v timeout >/dev/null 2>&1; then
+    JM_REDIS_WORKING_DIR="$2" timeout "$limit" bash -c '. "$1"; jm_redis_running_acl_state "$2"' jm-redis-state "$JM_LIB" "$1" 2>/dev/null
+  else
+    JM_REDIS_WORKING_DIR="$2" jm_redis_running_acl_state "$1" 2>/dev/null
+  fi
+}
 redis_reboot_warning() {
   local state dir
-  [ "$REDIS_AOF_SAFE" = 0 ] && [ "$JM_REDIS_REWROTE" != 1 ] || return 0
+  [ "$REDIS_AOF_SAFE" = 0 ] && [ "$JM_REDIS_REWROTE" != 1 ] && [ "$SHOW_HELP" = 0 ] || return 0
   [[ "$PROJECT" =~ ^[a-z][a-z0-9_-]*$ ]] && command -v docker >/dev/null 2>&1 || return 0
-  dir="$(cd "$REPO" 2>/dev/null && pwd)" || return 0
-  state="$(JM_REDIS_WORKING_DIR="$dir/server" jm_redis_running_acl_state "$PROJECT" 2>/dev/null)" || state=unknown
+  # (An empty REPO would cd to the current directory; treat it as unknown.)
+  [ -n "$REPO" ] && dir="$(cd "$REPO" 2>/dev/null && pwd)/server" || dir=""
+  state="$(redis_state_bounded "$PROJECT" "$dir")" || state=unknown
   case "$state" in
     fixed|noacl) ;;
     down)
@@ -95,28 +108,36 @@ redis_reboot_warning() {
       echo "rollout-compose: WARNING: the running Redis may still have the 0.5.0 ACL (could not read users.acl), and this run did not rewrite its AOF. Do NOT reboot the NAS or restart Redis until a rewrite succeeds (re-run this rollout, or CHANGELOG 0.5.1 steps 2-3 by hand): its next start could replay transactions an earlier start refused, which can corrupt the folder tree." >&2 ;;
   esac
 }
-# --project and --repo first, so even a usage error can check Redis.
+SHOW_HELP=0
+# --project, --repo and --help first, wherever they are, so even a usage
+# error can check Redis (and --help never warns).
 prescan=("$@")
-for ((i = 0; i < ${#prescan[@]} - 1; i++)); do
+for ((i = 0; i < ${#prescan[@]}; i++)); do
   case "${prescan[i]}" in
-    --project) PROJECT="${prescan[i + 1]}" ;;
-    --repo) REPO="${prescan[i + 1]}" ;;
+    --project) [ $((i + 1)) -lt ${#prescan[@]} ] && PROJECT="${prescan[i + 1]}" ;;
+    --project=*) PROJECT="${prescan[i]#*=}" ;;
+    --repo) [ $((i + 1)) -lt ${#prescan[@]} ] && REPO="${prescan[i + 1]}" ;;
+    --repo=*) REPO="${prescan[i]#*=}" ;;
+    -h|--help) SHOW_HELP=1 ;;
   esac
 done
 unset prescan i
 trap redis_reboot_warning EXIT
 set_mode() { [ "$MODE" = release ] || usage 2; MODE="$1"; }
+value() { [ "$1" -ge 2 ] || usage 2; } # an option that takes a value got one
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --repo) REPO="$2"; shift 2 ;;
+    --repo) value "$#"; REPO="$2"; shift 2 ;;
+    --repo=*) REPO="${1#*=}"; shift ;;
     --cutover-proxy) set_mode cutover; shift ;;
     --proxy-rollback) set_mode proxy-rollback; shift ;;
     --proxy-restore) set_mode proxy-restore; shift ;;
-    --previous-ref) PREVIOUS_REF="$2"; shift 2 ;;
-    --project) PROJECT="$2"; shift 2 ;;
-    --manager-digest) MANAGER_DIGEST="$2"; shift 2 ;;
-    --farm-digest) FARM_DIGEST="$2"; shift 2 ;;
-    --render-digest) RENDER_DIGEST="$2"; shift 2 ;;
+    --previous-ref) value "$#"; PREVIOUS_REF="$2"; shift 2 ;;
+    --project) value "$#"; PROJECT="$2"; shift 2 ;;
+    --project=*) PROJECT="${1#*=}"; shift ;;
+    --manager-digest) value "$#"; MANAGER_DIGEST="$2"; shift 2 ;;
+    --farm-digest) value "$#"; FARM_DIGEST="$2"; shift 2 ;;
+    --render-digest) value "$#"; RENDER_DIGEST="$2"; shift 2 ;;
     --ack-worker-quiesced) ACK_QUIESCED=1; shift ;;
     --ack-macs-drained) ACK_MACS=1; shift ;;
     --allow-aof-replay) ALLOW_AOF_REPLAY=1; shift ;;
@@ -127,7 +148,11 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
-REPO="$(cd "$REPO" && pwd)"
+# Assigned only on success: a failed cd must not empty REPO (the message
+# names it, and the exit warning must not look up the current directory).
+repo_abs="$(cd "$REPO" 2>/dev/null && pwd)" || { echo "rollout-compose: --repo is not a directory: $REPO" >&2; exit 2; }
+REPO="$repo_abs"
+unset repo_abs
 # Only this checkout's Redis (lib/redis-compact.sh).
 export JM_REDIS_WORKING_DIR="$REPO/server"
 COMPOSE_FILE="$REPO/server/docker-compose.yml"
@@ -310,9 +335,7 @@ with_digests_topo() { # topology, manager, farm, render digests, compose args...
 }
 release_lock() {
   if [ "$LOCK_HELD" = 1 ]; then
-    rm -f "$LOCK/protected-ids" "$LOCK/env.backup"
-    rm "$LOCK/owner"
-    rmdir "$LOCK"
+    rm -f "$LOCK/protected-ids" "$LOCK/env.backup" && rm "$LOCK/owner" && rmdir "$LOCK" || return 1
     LOCK_HELD=0
   fi
 }
@@ -364,7 +387,8 @@ on_exit() {
     fi
   fi
   if [ "$rollback_failed" = 0 ]; then
-    release_lock
+    # Not fatal here: a failed rm must not skip the warning below.
+    release_lock || log "CRITICAL: could not remove the lock at $LOCK; remove it by hand after checking the stack"
   else
     log "CRITICAL: lock retained at $LOCK for operator recovery"
   fi

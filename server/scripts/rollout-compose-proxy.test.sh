@@ -136,7 +136,12 @@ case "$1" in
     case "$*" in
       *label=com.docker.compose.project=testproject*label=com.docker.compose.service=redis*status=running*)
         # Only this checkout's Redis: the working directory filter must name it.
-        case "$*" in *"label=com.docker.compose.project.working_dir=$FAKE_REPO/server"*) ;; *) echo "ps without this checkout's working_dir filter: $*" >&2; exit 1 ;; esac
+        # A filtered lookup must name this checkout; an unfiltered one is the
+        # other-directory probe.
+        case "$*" in
+          *"label=com.docker.compose.project.working_dir=$FAKE_REPO/server"*) ;;
+          *label=com.docker.compose.project.working_dir=*) echo "ps for another checkout: $*" >&2; exit 1 ;;
+        esac
         # FAKE_REDIS_PS_LIMIT=N: Redis is found by the first N lookups only
         # (it stops after the preflight read).
         # (The counter lives outside FAKE_STATE, which tests compare.)
@@ -694,6 +699,9 @@ export FAKE_FAIL=""
 : > "$FAKE_LOG"
 if bash "$SCRIPT" "${rb[@]}" --ack-redis-aof-backpu > "$WORK/out" 2>&1; then echo 'FAIL: accepted a mistyped flag' >&2; exit 1; fi
 grep -q '^usage:' "$WORK/out" && grep -q 'Do NOT reboot the NAS or restart Redis until a rewrite succeeds' "$WORK/out" || { cat "$WORK/out"; echo 'FAIL: a usage error did not warn' >&2; exit 1; }
+# The bad flag before --project: the early scan still finds the project.
+if bash "$SCRIPT" --bogus --project testproject --repo "$REPO" --proxy-rollback > "$WORK/out" 2>&1; then echo 'FAIL: accepted --bogus' >&2; exit 1; fi
+grep -q 'Do NOT reboot the NAS or restart Redis until a rewrite succeeds' "$WORK/out" || { cat "$WORK/out"; echo 'FAIL: a bad flag before --project did not warn' >&2; exit 1; }
 ! grep -qvE '^docker ps |^docker exec redis-id cat /run/jm-redis/users.acl$' "$FAKE_LOG" || { cat "$FAKE_LOG"; echo 'FAIL: a usage error did more than read the ACL' >&2; exit 1; }
 if bash "$SCRIPT" --project testproject --repo "$REPO" --proxy-rollback --manager-digest sha256:bad > "$WORK/out" 2>&1; then echo 'FAIL: accepted digests in a topology mode' >&2; exit 1; fi
 grep -q 'do not pass digests' "$WORK/out" && grep -q 'Do NOT reboot' "$WORK/out" || { cat "$WORK/out"; echo 'FAIL: a mode/digest mismatch did not warn' >&2; exit 1; }

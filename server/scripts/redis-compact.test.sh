@@ -207,6 +207,12 @@ fi
 base=$(field aof_rewrites)
 cli BGSAVE >/dev/null
 [ "$(field rdb_bgsave_in_progress)" = 1 ] || { echo 'redis-compact: setup failed: the BGSAVE was not still running' >&2; exit 1; }
+# A leftover temp manifest (a crash between writing and renaming it) must
+# not be read as the base file: only <appendfilename>.manifest counts. A
+# BGSAVE leaves the manifest alone, so the file is still there when the
+# helper reads its baseline. Written as the redis user: Redis must be able
+# to replace it.
+docker exec -u redis "$name" sh -c 'printf "file appendonly.aof.99.base.rdb seq 99 type b\n" > /data/appendonlydir/temp-appendonly.aof.manifest'
 if JM_REDIS_COMPACT_TIMEOUT=60 jm_redis_compact "$project"; then
 	settled $((base + 1)) || { echo "redis-compact: the helper returned before its scheduled rewrite ended: $(persist | grep -E '^aof_rew|^aof_last_bg|^rdb_bgsave_in' | tr '\n' ' ')" >&2; fail=1; }
 else
