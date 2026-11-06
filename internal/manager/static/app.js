@@ -3275,6 +3275,9 @@
     const orig = btn.textContent;
     btn.disabled = true;
     btn.textContent = 'Testing…';
+    // A "host key verified" line from an earlier Test must not outlive a
+    // Test that fails, for example after the server's key changed.
+    $('#dest-flash').hidden = true;
     const testPath = `/api/destinations/${encodeURIComponent(name)}/test`;
     try {
       let res = await api('POST', testPath);
