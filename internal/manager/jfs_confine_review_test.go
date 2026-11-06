@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"testing"
@@ -230,12 +231,18 @@ func TestResolverIsLinearInDepth(t *testing.T) {
 	}
 	for _, sh := range shapes {
 		t.Run(sh.name, func(t *testing.T) {
+			// The OS must allow the path: Linux PATH_MAX is 4096, macOS 1024.
+			// Linear time does not depend on the OS, so a shorter limit skips.
+			pathMax := maxResolvePathBytes
+			if runtime.GOOS != "linux" {
+				pathMax = 1023
+			}
+			if len(f.fuse+sh.existing+sh.missing) > pathMax || len(f.src+sh.existing+sh.missing) > pathMax {
+				t.Skipf("a %d-component path is longer than this OS allows (%d bytes)", 950, pathMax)
+			}
 			// Volume side.
 			if err := os.MkdirAll(f.fuse+sh.existing, 0o755); err != nil {
 				t.Fatal(err)
-			}
-			if len(f.fuse+sh.existing+sh.missing) > maxResolvePathBytes || len(f.src+sh.existing+sh.missing) > maxResolvePathBytes {
-				t.Skipf("temp folder too long for a %d-component path", 950)
 			}
 			jfs := "/jfs" + sh.existing + sh.missing
 			timed("confineVolumePath", func() {
