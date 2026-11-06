@@ -21,8 +21,8 @@ func TestChownArgs(t *testing.T) {
 		{"negative uid → skip", -1, -1, "/mnt/x", nil},
 		{"root uid → skip (never chown migrated data to root)", 0, 0, "/mnt/x", nil},
 		{"empty target → skip", 501, 20, "", nil},
-		{"uid+gid", 501, 20, "/mnt/x", []string{"-R", "501:20", "/mnt/x"}},
-		{"uid only, gid<0 leaves group", 501, -1, "/mnt/x", []string{"-R", "501", "/mnt/x"}},
+		{"uid+gid", 501, 20, "/mnt/x", []string{"-R", "-h", "501:20", "/mnt/x"}},
+		{"uid only, gid<0 leaves group", 501, -1, "/mnt/x", []string{"-R", "-h", "501", "/mnt/x"}},
 	}
 	for _, c := range cases {
 		got := chownArgs(c.uid, c.gid, c.target)

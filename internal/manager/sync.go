@@ -195,6 +195,20 @@ type RunSyncSpec struct {
 // Emits ProgressEvent on `progress` each time juicefs writes a
 // recognized progress line. Blocks until juicefs exits or ctx cancels.
 func RunSync(ctx context.Context, juicefsBin string, spec RunSyncSpec, source, destination string, opts SyncOptions, extraEnv []string, progress chan<- ProgressEvent) error {
+	// Point-of-use volume boundary: a /jfs source or destination is
+	// cleaned, and refused if it resolves outside the FUSE mount (a
+	// symlink stored in the volume). The cleaned value is used from here
+	// on. This also covers jobs that did not come through an API gate
+	// (stored schedules, resumed jobs).
+	var err error
+	if spec.Mode == ModeEmbedded {
+		if source, err = confineSyncVolumePath(source, spec.FUSEMount); err != nil {
+			return err
+		}
+		if destination, err = confineSyncVolumePath(destination, spec.FUSEMount); err != nil {
+			return err
+		}
+	}
 	// Never into a smart-folder root (sync_smartroots.go), also for
 	// scheduled jobs that did not pass validateDirectionPair.
 	if err := checkSyncSmartRoots(os.Getenv, os.ReadDir, source, destination, spec.FUSEMount); err != nil {
@@ -233,7 +247,7 @@ func RunSync(ctx context.Context, juicefsBin string, spec RunSyncSpec, source, d
 		// (which standalone mode does not set) — so the helper falls
 		// through to file:// for /external/... paths, and we keep
 		// the explicit jfs:// helper for /jfs/... destinations.
-		if strings.HasPrefix(strings.TrimSpace(destination), "/jfs") {
+		if isVolumeUserPath(strings.TrimSpace(destination)) {
 			dst = normalizeDestURIJFS(destination, spec.VolName, opts.PreserveStructure)
 			// juicefs sync's URL syntax: env var name = URL alias. So
 			// for jfs://zpool/... we set zpool=redis://...
@@ -255,7 +269,7 @@ func RunSync(ctx context.Context, juicefsBin string, spec RunSyncSpec, source, d
 		// mount to an Out-direction destination like /external/foo
 		// and silently write outside the intended target.
 		trimmed := strings.TrimSpace(destination)
-		if strings.HasPrefix(trimmed, "/jfs") {
+		if isVolumeUserPath(trimmed) {
 			dst = normalizeDestURIEmbedded(destination, spec.FUSEMount, opts.PreserveStructure)
 		} else {
 			dst = normalizeAnyURI(destination, "", opts.PreserveStructure)
@@ -394,8 +408,12 @@ func RunSync(ctx context.Context, juicefsBin string, spec RunSyncSpec, source, d
 	// A future POSIX-ACL slice will replace this with a configurable
 	// policy; for now, "every migrated file is read+write in the
 	// mount" is the contract.
-	if spec.Mode == ModeEmbedded && spec.FUSEMount != "" {
-		applyPostSyncPermissions(ctx, destination, spec.OwnerUID, spec.OwnerGID)
+	//
+	// Only a volume destination gets the fixup: its purpose is to let the
+	// mount client write migrated data. A host destination (Out) is not
+	// changed.
+	if spec.Mode == ModeEmbedded && spec.FUSEMount != "" && isVolumeUserPath(strings.TrimSpace(destination)) {
+		applyPostSyncPermissions(ctx, destination, spec.FUSEMount, spec.OwnerUID, spec.OwnerGID)
 	}
 	return nil
 }
@@ -419,25 +437,20 @@ func RunSync(ctx context.Context, juicefsBin string, spec RunSyncSpec, source, d
 // Errors are logged but never propagated — the sync itself already
 // succeeded, and a perms fixup on a single file shouldn't flip the job to
 // failed in the UI.
-func applyPostSyncPermissions(ctx context.Context, destination string, ownerUID, ownerGID int) {
-	// destination is a juicefs sync URI (file:///<mount>/...). Rewrite to a
-	// local path by stripping the file:// prefix.
-	target := strings.TrimPrefix(destination, "file://")
-	target = strings.TrimSuffix(target, "/")
-	if target == "" {
+func applyPostSyncPermissions(ctx context.Context, destination, fuseMount string, ownerUID, ownerGID int) {
+	// destination is the user-facing volume path (/jfs/...). The sync may
+	// have run for hours, so confine it again now: a folder swapped for a
+	// symlink during the sync is refused here. applyPermsBeneath then
+	// opens it component by component with O_NOFOLLOW from the mount, so
+	// a swap after this check is refused too.
+	vp, err := confineVolumePath(destination, volumeUserPrefix, fuseMount, true)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "manager: post-sync permissions on %q skipped (job stays successful): %v\n", destination, err)
 		return
 	}
-	// (1) mode
-	cmd := exec.CommandContext(ctx, "chmod", "-R", "u+rwX,g+rwX,o+rX", target)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		fmt.Fprintf(os.Stderr, "manager: post-sync chmod on %q failed (job stays successful): %v\noutput:\n%s\n", target, err, string(out))
-	}
-	// (2) ownership — hand the tree to the mounting client so it can WRITE.
-	if args := chownArgs(ownerUID, ownerGID, target); args != nil {
-		cmd := exec.CommandContext(ctx, "chown", args...)
-		if out, err := cmd.CombinedOutput(); err != nil {
-			fmt.Fprintf(os.Stderr, "manager: post-sync chown %s on %q failed (job stays successful): %v\noutput:\n%s\n", chownSpec(ownerUID, ownerGID), target, err, string(out))
-		}
+	rel := strings.TrimPrefix(vp.Real, vp.MountReal)
+	if err := applyPermsBeneath(ctx, vp.MountReal, rel, ownerUID, ownerGID, true); err != nil {
+		fmt.Fprintf(os.Stderr, "manager: post-sync permissions (mode, owner %s) on %q incomplete (job stays successful): %v\n", chownSpec(ownerUID, ownerGID), destination, err)
 	}
 }
 
@@ -450,7 +463,7 @@ func chownSpec(uid, gid int) string {
 	return strconv.Itoa(uid)
 }
 
-// chownArgs builds the `chown -R <uid[:gid]> <target>` argument vector, or
+// chownArgs builds the `chown -R -h <uid[:gid]> <target>` argument vector, or
 // nil when no chown should run — uid <= 0 (unset / root: never a valid
 // client owner, and root-owned is exactly the bug we're fixing) or an empty
 // target. Split out for testability so we can assert the exact argv without
@@ -459,7 +472,10 @@ func chownArgs(uid, gid int, target string) []string {
 	if uid <= 0 || target == "" {
 		return nil
 	}
-	return []string{"-R", chownSpec(uid, gid), target}
+	// -h: change a symlink itself, never its target, so a symlink in the
+	// tree cannot lead the chown outside it. GNU chown -R already does
+	// this by default (-P); -h makes it explicit.
+	return []string{"-R", "-h", chownSpec(uid, gid), target}
 }
 
 // pollJuicefsMetrics scrapes the juicefs sync Prometheus endpoint every

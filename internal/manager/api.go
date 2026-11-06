@@ -547,8 +547,9 @@ func (a *API) handleSources(w http.ResponseWriter, r *http.Request) {
 // standalone mode (no FUSE mount), browsing the JuiceFS tree from
 // inside the manager isn't supported and the handler returns 501.
 //
-// Path traversal: jfsPathAllowed is the gate; same pattern as
-// handleBrowse uses pathAllowed.
+// Path traversal: confineVolumePath is the gate. It cleans the path,
+// and refuses one whose kernel resolution leaves the FUSE mount (a
+// symlink stored in the volume that points outside it).
 //
 // Hidden entries are filtered out — matches handleBrowse's policy
 // and avoids surfacing the .trash/ subtree here (that's SLICE 3's
@@ -566,23 +567,15 @@ func (a *API) handleBrowseJFS(w http.ResponseWriter, r *http.Request) {
 		// "default to root" behavior /api/sources clients use.
 		path = a.destMount
 	}
-	if !a.jfsPathAllowed(path) {
+	// Clean, map to the FUSE mount and confine where the kernel lands:
+	// client sees /jfs/foo, server lists /<FUSEMount>/foo. A symlink
+	// stored in the volume that leads outside it is refused.
+	vp, err := a.confineVolume(path, true)
+	if err != nil {
 		http.Error(w, "path outside the JuiceFS volume", http.StatusForbidden)
 		return
 	}
-	// Rewrite the /jfs/... user-facing prefix to the on-disk FUSE
-	// mount path before stat'ing. Inverse of what the UI does when
-	// the user clicks an entry: client sees /jfs/foo, server stats
-	// /<FUSEMount>/foo.
-	dmClean := filepath.Clean(a.destMount)
-	cleaned := filepath.Clean(path)
-	rel := strings.TrimPrefix(cleaned, dmClean)
-	rel = strings.TrimPrefix(rel, "/")
-	fuse := strings.TrimSuffix(a.fuseMount, "/")
-	real := fuse
-	if rel != "" {
-		real = fuse + "/" + rel
-	}
+	cleaned, real := vp.User, vp.Fuse
 	entries, err := os.ReadDir(real)
 	if err != nil {
 		// Don't echo err.Error() — it contains the FUSE-resolved
@@ -771,9 +764,18 @@ func (a *API) handleMigrate(w http.ResponseWriter, r *http.Request) {
 		if dest == dmClean {
 			dest = filepath.Join(dmClean, "imported", time.Now().UTC().Format("20060102-150405"))
 		}
+		// The destination is written through the FUSE mount; a symlink
+		// in the volume must not lead the write outside it.
+		if a.fuseMount != "" {
+			if _, err := a.confineVolume(dest, true); err != nil {
+				http.Error(w, "destination outside the JuiceFS volume", http.StatusForbidden)
+				return
+			}
+		}
 	case DirectionOut:
-		// Source is /jfs/... — validate against the FUSE mount root.
-		if !a.jfsPathAllowed(source) {
+		// Source is /jfs/... — confine it to the FUSE mount, judged
+		// where the kernel lands.
+		if !a.jfsVolumeSourceAllowed(source) {
 			http.Error(w, "source outside /jfs (FUSE mount)", http.StatusForbidden)
 			return
 		}
@@ -990,9 +992,12 @@ func (a *API) handlePreview(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "previewing /jfs requires embedded mode (FUSE mount)", http.StatusNotImplemented)
 			return
 		}
-		dmClean := filepath.Clean(a.destMount)
-		rel := strings.TrimPrefix(filepath.Clean(path), dmClean)
-		statPath = strings.TrimSuffix(a.fuseMount, "/") + rel
+		vp, err := a.confineVolume(path, true)
+		if err != nil {
+			http.Error(w, "path outside the JuiceFS volume", http.StatusForbidden)
+			return
+		}
+		statPath = vp.Fuse
 	} else if !a.pathAllowed(path) {
 		http.Error(w, "path outside permitted source roots", http.StatusForbidden)
 		return
@@ -1178,8 +1183,14 @@ func (a *API) handleResolveDestination(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "destination must be under "+a.destMount, http.StatusForbidden)
 			return
 		}
+		if a.fuseMount != "" {
+			if _, err := a.confineVolume(dest, true); err != nil {
+				http.Error(w, "destination outside the JuiceFS volume", http.StatusForbidden)
+				return
+			}
+		}
 	case DirectionOut:
-		if !a.jfsPathAllowed(source) {
+		if !a.jfsVolumeSourceAllowed(source) {
 			http.Error(w, "source outside /jfs (FUSE mount)", http.StatusForbidden)
 			return
 		}
@@ -1458,15 +1469,11 @@ func (a *API) handleStatic(w http.ResponseWriter, r *http.Request) {
 // — both need to confirm a user-supplied path resolves inside the
 // JuiceFS volume rather than escaping to the host filesystem.
 //
-// Implementation note: we deliberately do NOT EvalSymlinks here.
-// The JuiceFS FUSE mount exposes a virtual tree managed by the
-// kernel + juicefs daemon; any symlinks inside it are user data,
-// not host-filesystem links. The traversal protection comes from
-// the filepath.Clean+prefix check, same pattern handleMigrate uses
-// for its destination guard. The /jfs prefix itself is a fixed
-// virtual path; nothing on the host filesystem owns it, so symlink
-// resolution outside the kernel mount can't change what /jfs
-// refers to.
+// This is a text check only. The volume holds user data, including
+// symlinks any client can write, and the kernel follows them when the
+// Manager opens a path under the FUSE mount. A caller that opens the
+// path must also pass confineVolumePath (jfspath.go), which resolves
+// it the way the kernel does.
 func (a *API) jfsPathAllowed(p string) bool {
 	cleaned := filepath.Clean(p)
 	dm := filepath.Clean(a.destMount)
@@ -1486,7 +1493,8 @@ func validDirection(dir Direction) bool {
 // checkSyncSource is the single default-deny source gate shared by
 // handleMigrate, submitSavedDestination, resolveSavedDestination and the
 // schedule gate. In (or "") sources must be under sourceRoots; Out and
-// Between sources must be under /jfs; any other direction is refused.
+// Between sources must be under /jfs and must resolve inside the FUSE
+// mount; any other direction is refused.
 // It returns the HTTP status to use alongside the error.
 func (a *API) checkSyncSource(path string, dir Direction) (int, error) {
 	switch dir {
@@ -1495,7 +1503,10 @@ func (a *API) checkSyncSource(path string, dir Direction) (int, error) {
 			return http.StatusForbidden, fmt.Errorf("source outside permitted source roots")
 		}
 	case DirectionOut, DirectionBetween:
-		if !a.jfsPathAllowed(path) {
+		// Text check plus, in embedded mode, where the kernel lands
+		// (confineVolumePath): a symlink stored in the volume must not
+		// lead the source outside it.
+		if !a.jfsVolumeSourceAllowed(path) {
 			return http.StatusForbidden, fmt.Errorf("source outside /jfs (FUSE mount)")
 		}
 	default:
@@ -1507,8 +1518,10 @@ func (a *API) checkSyncSource(path string, dir Direction) (int, error) {
 // pathAllowed returns true iff `p` is under one of the configured
 // source roots, judged where the kernel would land when opening `p`.
 //
-// `p` is resolved with resolvePhysicalPath: symlinks are followed
-// segment by segment, and ".." is applied after the symlink before it,
+// `p` is resolved with walkPhysicalPath (pathresolve.go), the resolver
+// shared with the volume side and file destinations: symlinks are
+// followed segment by segment, and ".." is applied after the symlink
+// before it,
 // the same way the kernel does it. ".." is NOT collapsed as text
 // first: "<root>/link/../x" lands under link's target, not at
 // "<root>/x". Roots are resolved the same way, so a root reached
@@ -1519,12 +1532,12 @@ func (a *API) checkSyncSource(path string, dir Direction) (int, error) {
 // The check is not atomic with the later open: a symlink swapped in
 // after the check is not caught.
 func (a *API) pathAllowed(p string) bool {
-	resolved, err := resolvePhysicalPath(p)
+	resolved, err := walkPhysicalPath(p, false)
 	if err != nil {
 		return false
 	}
 	for _, root := range a.sourceRoots {
-		rootResolved, err := resolvePhysicalPath(root)
+		rootResolved, err := walkPhysicalPath(root, false)
 		if err != nil {
 			continue
 		}
@@ -1533,64 +1546,6 @@ func (a *API) pathAllowed(p string) bool {
 		}
 	}
 	return false
-}
-
-// resolvePhysicalPath returns where the kernel would land when opening
-// p, without collapsing ".." as text first. The longest existing prefix
-// of the path text, cut at a separator, is resolved with
-// filepath.EvalSymlinks; it handles "link/.." after resolving the link.
-// The missing remainder is then appended. It does not exist, so it
-// holds no symlinks yet. Refused: a dangling symlink (its target is
-// unknown) and ".." inside the missing remainder. A relative p is taken
-// against the working directory.
-// maxResolvePathBytes bounds resolvePhysicalPath's input (Linux PATH_MAX).
-const maxResolvePathBytes = 4096
-
-func resolvePhysicalPath(p string) (string, error) {
-	if p == "" {
-		return "", errors.New("empty path")
-	}
-	// PATH_MAX on Linux. The loop below costs time in the path's length
-	// squared, so a longer input (which the kernel would refuse anyway)
-	// must not reach it.
-	if len(p) > maxResolvePathBytes {
-		return "", fmt.Errorf("path longer than %d bytes", maxResolvePathBytes)
-	}
-	if !filepath.IsAbs(p) {
-		wd, err := os.Getwd()
-		if err != nil {
-			return "", err
-		}
-		p = wd + string(filepath.Separator) + p
-	}
-	existing, rest := p, ""
-	for {
-		resolved, err := filepath.EvalSymlinks(existing)
-		if err == nil {
-			return filepath.Join(resolved, rest), nil
-		}
-		if !errors.Is(err, fs.ErrNotExist) {
-			return "", err
-		}
-		if _, lerr := os.Lstat(existing); lerr == nil {
-			return "", fmt.Errorf("dangling symlink at %s", existing)
-		} else if !errors.Is(lerr, fs.ErrNotExist) {
-			// ENAMETOOLONG, EACCES, ...: not "missing", so stop here.
-			return "", lerr
-		}
-		i := strings.LastIndexByte(existing, filepath.Separator)
-		if i <= 0 {
-			// Nothing under "/" exists on this path; it is plain text.
-			return filepath.Join("/", existing, rest), nil
-		}
-		if existing[i+1:] == ".." {
-			// "missing/.." cannot be opened today, and collapsing it as
-			// text could land on an existing symlink. Refuse it.
-			return "", fmt.Errorf("path climbs out of a missing folder: %s", p)
-		}
-		rest = filepath.Join(existing[i+1:], rest)
-		existing = existing[:i]
-	}
 }
 
 func writeJSON(w http.ResponseWriter, status int, body any) {
