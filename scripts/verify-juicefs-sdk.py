@@ -30,6 +30,7 @@ PATCH_FILES = {
     "patches/0013-security-dependencies-and-etcd-transport.patch": [
         "go.mod", "go.sum", "pkg/meta/tkv_etcd.go", "pkg/object/etcd.go"],
     "patches/0014-literal-fatal-error.patch": ["pkg/meta/interface.go"],
+    "patches/0015-klauspost-compress-security-update.patch": ["go.mod", "go.sum"],
 }
 VERSION_PACKAGE = "github.com/juicedata/juicefs/pkg/version"
 
