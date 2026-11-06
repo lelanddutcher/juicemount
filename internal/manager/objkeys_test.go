@@ -332,12 +332,21 @@ func newObjRig(t *testing.T) *objRig {
 
 func (r *objRig) open() {
 	r.t.Helper()
+	// A real restart ends the old process and any auto-approve pass it was
+	// running. Here the old store lives on in this process, so wait until it
+	// runs no pass: one still waiting for its proxy proof would otherwise
+	// write principals.json from the old store's view after the new store
+	// has loaded the state file.
+	if r.s != nil {
+		waitAutoIdle(r.t, r.s)
+	}
 	s, err := NewPrincipalStore(PrincipalStoreOptions{StatePath: r.statePath, ProxyDir: r.proxyDir,
 		PerMacKeys: true, ObjKeysDir: r.objDir, ObjectKey: clientObjectKey})
 	if err != nil {
 		r.t.Fatal(err)
 	}
 	r.s = s
+	waitAutoIdleAtCleanup(r.t, s)
 }
 
 // keydUp runs the fake keyd every 5 ms until keydDown.

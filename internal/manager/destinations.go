@@ -920,6 +920,9 @@ func resolveFileDestPath(p string) (string, error) {
 	if !filepath.IsAbs(p) {
 		return "", errors.New("file path must be absolute")
 	}
+	if len(p) > maxResolvePathBytes {
+		return "", fmt.Errorf("file path longer than %d bytes", maxResolvePathBytes)
+	}
 	existing := filepath.Clean(p)
 	rest := ""
 	for {
@@ -932,6 +935,8 @@ func resolveFileDestPath(p string) (string, error) {
 		}
 		if _, lerr := os.Lstat(existing); lerr == nil {
 			return "", fmt.Errorf("path contains a dangling symlink at %s", existing)
+		} else if !errors.Is(lerr, fs.ErrNotExist) {
+			return "", fmt.Errorf("resolve path: %w", lerr)
 		}
 		parent := filepath.Dir(existing)
 		if parent == existing {
