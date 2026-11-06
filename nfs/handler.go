@@ -1713,13 +1713,29 @@ func (h *JuiceMountHandler) prefetchChildren(dirname string) {
 		}
 	}
 
+	// Rows that take more than one batch are visible a batch (SQLite) or a
+	// cache chunk at a time, and a READDIR serves a folder's rows as the
+	// whole folder: record it first, as the cold listing does. Only a record
+	// this pass made is cleared; an earlier one stays for a complete pass.
+	ownRecord := false
+	if len(toInsert) > coldListingInsertBatch {
+		ownRecord = h.markDirListingUnknown(dirname)
+	}
+	if hook := prefetchPublishHook; hook != nil {
+		hook(dirname)
+	}
 	if len(toInsert) > 0 {
 		// Batch-3 adversarial review #1: insert-if-absent, checked inside the
 		// store's own critical sections — a fresher row (push event/CREATE/
 		// reconcile) landing between the LookupByPath filter above and this
 		// batch must never be overwritten by our older FUSE snapshot. Same
 		// TOCTOU (and fix) as refreshUnmirroredDir.
-		h.store.BulkInsertAbsent(toInsert, 500)
+		err := h.store.BulkInsertAbsent(toInsert, coldListingInsertBatch)
+		// On an error some batches may have landed: keep the record.
+		if err == nil && ownRecord && h.clearDirListingIncomplete(dirname) {
+			// A READDIR in between may hold part of the folder.
+			h.store.NoteDirectoryChanged(dirname)
+		}
 	}
 
 	// Gate the recursive subdir fan-out (remote folder-nav perf fix). The
@@ -3579,6 +3595,10 @@ var coldListingEntriesHook func(dirname string, entries []os.DirEntry) []os.DirE
 // a cold listing pass published its rows (the instant a crash would freeze).
 // Nil in production; set only while no listing pass is running.
 var coldListingPublishedHook func(dirname string)
+
+// prefetchPublishHook lets tests observe a prefetch pass just before it
+// publishes its rows. Nil in production; set only while no prefetch runs.
+var prefetchPublishHook func(dirname string)
 
 // coldListingInsertBatch is the batch size a cold listing pass publishes in.
 const coldListingInsertBatch = 500

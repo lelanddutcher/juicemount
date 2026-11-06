@@ -225,12 +225,23 @@ trap on_stop TERM INT
 # value "$(<path)" gives, read with the read builtin. Status 2 if the file
 # has a NUL byte (RF holds the bytes before it), else 0.
 read_file() {
+	local nl=$'\n'
 	RF=''
 	if IFS= read -r -d '' RF <"$1"; then
 		return 2
 	fi
-	while [ "${RF: -1}" = $'\n' ]; do
-		RF="${RF%?}"
+	# Strip the trailing newlines in O(log k) passes: runs of 1, 2, 4, ...
+	# newlines while they match, then the halves back down (the binary
+	# digits of what is left). One newline per pass was quadratic.
+	while [ "${RF: -${#nl}}" = "$nl" ]; do
+		RF="${RF:0:${#RF}-${#nl}}"
+		nl+="$nl"
+	done
+	while [ "${#nl}" -gt 1 ]; do
+		nl="${nl:0:${#nl}/2}"
+		if [ "${RF: -${#nl}}" = "$nl" ]; then
+			RF="${RF:0:${#RF}-${#nl}}"
+		fi
 	done
 	return 0
 }
@@ -260,7 +271,13 @@ mcq() {
 		GAVE_UP=1
 	fi
 	if [ -f "$MC_TMP" ]; then
-		read_file "$MC_TMP"
+		if ! read_file "$MC_TMP"; then
+			# mc never writes a NUL byte. Its reply is refused as a failed
+			# call rather than acted on cut short at the NUL.
+			log "mc svcacct $5 output has a NUL byte; treating the call as failed"
+			RF=''
+			[ "$rc" -eq 0 ] && rc=1
+		fi
 		MC_OUT="$RF"
 		RF=''
 	fi

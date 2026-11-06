@@ -36,6 +36,7 @@ err() { printf '{"status":"error","error":{"message":"%s"}}\n' "$1"; exit 1; }
 case "$op" in
 ls)
   [ -n "${FAKE_MC_FAIL_LS:-}" ] && err "connection refused"
+  [ -n "${FAKE_MC_LS_NUL:-}" ] && printf '{"status":"success","accessKey":"%s"}\n\0' "$FAKE_MC_LS_NUL"
   for f in "$st"/sa.*; do
     [ -e "$f" ] || continue
     read -r p s < "$f"
@@ -1179,32 +1180,78 @@ func TestKeydLoopNeverActsOnRefusedFile(t *testing.T) {
 	l.stop(10 * time.Second)
 }
 
-// Once its stop trap is set keyd runs no command substitution. Bash 5.2
-// parses a substitution again when it expands it and runs pending traps
-// from inside that parse, where a trap can be consumed without running
-// (seen for $(<file) and $(function)); a TERM lost that way left keyd
-// cycling until it was killed.
+// keyd runs no command substitution or process substitution after its
+// stop trap is set. Bash 5.2 parses a substitution again when it expands it
+// and runs pending traps from inside that parse, where a trap can be
+// consumed without running (seen for $(<file) and $(function)); a TERM lost
+// that way left keyd cycling until it was killed. The whole script is
+// scanned, helper bodies defined above the trap included, except the
+// key admin URL encoding, which runs once before the trap is set.
 func TestKeydRunsNoCommandSubstitutionUnderStopTrap(t *testing.T) {
 	b, err := os.ReadFile("keyd.sh")
 	if err != nil {
 		t.Fatal(err)
 	}
-	trapped := false
-	for i, line := range strings.Split(string(b), "\n") {
-		code := strings.TrimSpace(line)
-		if code == "trap on_stop TERM INT" {
-			trapped = true
-			continue
-		}
-		if !trapped || strings.HasPrefix(code, "#") {
-			continue
-		}
-		if c := strings.ReplaceAll(code, "$((", ""); strings.Contains(c, "$(") || strings.Contains(c, "`") {
-			t.Errorf("keyd.sh:%d runs a command substitution under the stop trap: %s", i+1, code)
+	lines := strings.Split(string(b), "\n")
+	trap, allowFrom, allowTo := -1, -1, -1
+	for i, line := range lines {
+		switch code := strings.TrimSpace(line); {
+		case code == "trap on_stop TERM INT":
+			trap = i
+		case code == "urlenc() {":
+			allowFrom = i
+		case strings.HasPrefix(code, "export MC_HOST_jmkeyd="):
+			allowTo = i
 		}
 	}
-	if !trapped {
-		t.Fatal("keyd.sh no longer sets the stop trap with: trap on_stop TERM INT")
+	if trap < 0 || allowFrom < 0 || allowTo < allowFrom || allowTo > trap {
+		t.Fatalf("keyd.sh layout changed: trap line %d, pre-trap URL encoding lines %d-%d", trap+1, allowFrom+1, allowTo+1)
+	}
+	for i, line := range lines {
+		code := strings.TrimSpace(line)
+		if strings.HasPrefix(code, "#") || (i >= allowFrom && i <= allowTo) {
+			continue
+		}
+		c := strings.ReplaceAll(code, "$((", "")
+		for _, bad := range []string{"$(", "`", "<(", ">("} {
+			if strings.Contains(c, bad) {
+				t.Errorf("keyd.sh:%d has %q, which keyd may run under the stop trap: %s", i+1, bad, code)
+			}
+		}
+	}
+}
+
+// mc never writes a NUL byte; a reply with one is a failed call, not a
+// listing cut short at the NUL that keyd would act on.
+func TestKeydRefusesMcOutputWithNul(t *testing.T) {
+	r := newKeydRig(t)
+	a := macName(1, 1)
+	r.desired(desiredJSON(1, "", a))
+	out, err := r.run("FAKE_MC_LS_NUL=" + macName(9, 1))
+	if err == nil {
+		t.Fatalf("keyd treated a NUL reply as a listing:\n%s", out)
+	}
+	if !strings.Contains(out, "mc svcacct ls output has a NUL byte; treating the call as failed") {
+		t.Fatalf("no log line for the NUL reply:\n%s", out)
+	}
+	if c := append(r.calls("add"), r.calls("rm")...); len(c) != 0 {
+		t.Fatalf("keyd acted on a NUL reply: %q", c)
+	}
+}
+
+// read_file strips a long run of trailing newlines in linear time: one
+// newline per pass took over 10 s a cycle for 50,000 of them.
+func TestKeydReadsLongTrailingNewlinesQuickly(t *testing.T) {
+	r := newKeydRig(t)
+	a := macName(1, 1)
+	r.desired(desiredJSON(1, "", a) + strings.Repeat("\n", 50000))
+	start := time.Now()
+	out := r.mustRun()
+	if took := time.Since(start); took > 5*time.Second {
+		t.Fatalf("one keyd cycle took %v with 50,000 trailing newlines", took)
+	}
+	if ap := r.applied(); ap.Error != "" || ap.Seq != 1 || !r.exists(a) {
+		t.Fatalf("applied = %+v\n%s", ap, out)
 	}
 }
 

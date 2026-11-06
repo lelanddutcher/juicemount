@@ -1245,3 +1245,41 @@ func TestPrefetchChildrenSkipsFilteredNamespace(t *testing.T) {
 		t.Fatalf("root fan-out descended into .juicemount (%d children mirrored)", len(kids))
 	}
 }
+
+// A prefetch whose rows take more than one batch publishes them a batch (and
+// a cache chunk) at a time. The folder is recorded before the first batch,
+// so a READDIR in between re-lists it instead of serving part of it as the
+// whole folder, and the record this pass made is cleared once all landed.
+func TestPrefetchChildrenRecordsMultiBatchPublication(t *testing.T) {
+	jfs, store, fuseRoot := newDirRefreshHarness(t)
+	h := jfs.handler
+	names := make([]string, coldListingInsertBatch+1)
+	for i := range names {
+		names[i] = fmt.Sprintf("f%04d.mov", i)
+	}
+	mkFUSEDir(t, fuseRoot, "big", names...)
+	recorded := false
+	called := false
+	prefetchPublishHook = func(dir string) {
+		if dir != "big" {
+			return
+		}
+		called = true
+		recorded, _ = store.HasDirListingIncomplete("big")
+	}
+	t.Cleanup(func() { prefetchPublishHook = nil })
+
+	h.prefetchChildren("big")
+	if !called {
+		t.Fatal("the prefetch never published (test inconclusive)")
+	}
+	if !recorded {
+		t.Fatal("a multi-batch prefetch published without recording the folder first")
+	}
+	if kids, _ := store.ListChildren("big"); len(kids) != len(names) {
+		t.Fatalf("prefetch mirrored %d of %d children", len(kids), len(names))
+	}
+	if has, _ := store.HasDirListingIncomplete("big"); has {
+		t.Fatal("the prefetch left its own record after every row landed")
+	}
+}
