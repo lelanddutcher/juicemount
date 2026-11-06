@@ -385,12 +385,15 @@ new workers against the same Redis at the same time:
      was restarted under 0.5.0 since its last rewrite, that copy is the only
      place the changes lost at that restart still exist.
   3. Make Redis rewrite its append-only file from what it holds now:
-     `docker exec <redis container> sh -c 'redis-cli --user jm-admin --pass
-     "$(cat /run/jm-redis/admin.pass)" --no-auth-warning BGREWRITEAOF'`.
+     `docker exec <redis container> sh -c 'REDISCLI_AUTH="$(cat
+     /run/jm-redis/admin.pass)" redis-cli --user jm-admin BGREWRITEAOF'`
+     (the password stays in the environment, out of `ps`).
      Wait until `INFO persistence` (same login) shows
      `aof_rewrite_scheduled:0`, `aof_rewrite_in_progress:0` and
      `aof_last_bgrewrite_status:ok`. A rewrite requested while a background
-     save runs is only scheduled, so check all three.
+     save runs is only scheduled, so check all three. If Redis answers that a
+     rewrite is already in progress, wait for it to finish, then ask again:
+     only a rewrite started after step 2 counts.
   4. Now update `server/redis.acl` and restart Redis. The rewritten file
      holds no transactions to refuse, so nothing is lost or replayed twice.
   Changes lost at an earlier 0.5.0 restart are not recovered by these steps.
