@@ -48,8 +48,9 @@ if grep -q '#@' "$work/users.acl"; then
 	exit 1
 fi
 
-name=jm-redis-aof-acl-$$
+name=
 start() {
+	name=jm-redis-aof-acl-$$-$1
 	docker run -d --rm --name "$name" \
 		-v "$work/data:/data" -v "$work/users.acl:/users.acl:ro" \
 		"$image" redis-server --appendonly yes --appendfsync always \
@@ -68,19 +69,24 @@ stop() { docker stop "$name" >/dev/null 2>&1 || true; }
 trap stop EXIT
 cli() { docker exec "$name" redis-cli --user jm-proxy --pass "$proxy_pw" --no-auth-warning "$@"; }
 
-start
-# One WATCHed transaction shaped like a JuiceFS metadata write, plus a
-# plain command as the control.
-docker exec "$name" sh -c "printf 'AUTH jm-proxy $proxy_pw\r\nWATCH i1\r\nMULTI\r\nHSET d1 name ino\r\nSET i1 attr\r\nLPUSH q job\r\nEXEC\r\nSET plain 1\r\n' | redis-cli" >/dev/null
+start 1
+# Shaped like JuiceFS metadata writes: a WATCHed transaction in database 0,
+# then database 1 (JuiceFS's; Redis logs the SELECT inside the next MULTI),
+# a two-write Lua script, and a plain write after the transaction, which
+# must replay into database 1, not 0. A plain SET is the control.
+docker exec "$name" sh -c "printf 'AUTH jm-proxy $proxy_pw\r\nWATCH i1\r\nMULTI\r\nHSET d1 name ino\r\nSET i1 attr\r\nLPUSH q job\r\nEXEC\r\nSET plain 1\r\nSELECT 1\r\nMULTI\r\nSET db1a 1\r\nSET db1b 2\r\nEXEC\r\nEVAL \"redis.call(\x27SET\x27,\x27lua2a\x27,\x27x\x27); redis.call(\x27SET\x27,\x27lua2b\x27,\x271\x27)\" 0\r\nINCRBY nextchunk 4096\r\n' | redis-cli" >/dev/null
 stop
-sleep 1
-start
+start 2
 
 fail=0
 [ "$(cli GET plain)" = 1 ] || { echo "redis-aof-acl: the plain SET did not survive the restart" >&2; fail=1; }
 [ "$(cli GET i1)" = attr ] || { echo "redis-aof-acl: the transaction's SET was lost on restart" >&2; fail=1; }
 [ "$(cli HGET d1 name)" = ino ] || { echo "redis-aof-acl: the transaction's HSET was lost on restart" >&2; fail=1; }
 [ "$(cli LLEN q)" = 1 ] || { echo "redis-aof-acl: the transaction's LPUSH was lost on restart" >&2; fail=1; }
+[ "$(cli -n 1 GET db1a)$(cli -n 1 GET db1b)" = 12 ] || { echo "redis-aof-acl: the database-1 transaction was lost on restart" >&2; fail=1; }
+[ "$(cli -n 1 GET lua2a)$(cli -n 1 GET lua2b)" = x1 ] || { echo "redis-aof-acl: the two-write Lua script was lost on restart" >&2; fail=1; }
+[ "$(cli -n 1 GET nextchunk)" = 4096 ] || { echo "redis-aof-acl: the plain write after the transaction left database 1" >&2; fail=1; }
+[ -z "$(cli -n 0 GET nextchunk)" ] || { echo "redis-aof-acl: the plain write after the transaction replayed into database 0" >&2; fail=1; }
 if docker logs "$name" 2>&1 | grep -q 'AOF-loading-client'; then
 	echo "redis-aof-acl: redis refused a command while loading the AOF:" >&2
 	docker logs "$name" 2>&1 | grep -m3 'AOF-loading-client' >&2
