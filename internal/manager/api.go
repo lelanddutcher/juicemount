@@ -810,7 +810,7 @@ func (a *API) handleMigrate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	writeJSON(w, http.StatusAccepted, job)
+	writeJSON(w, http.StatusAccepted, job.GetSnapshot())
 }
 
 // parseSavedDestRef recognizes the "<kind>://<name>" form the SLICE-4
@@ -895,7 +895,7 @@ func (a *API) submitSavedDestination(w http.ResponseWriter, source, name string,
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	writeJSON(w, http.StatusAccepted, job)
+	writeJSON(w, http.StatusAccepted, job.GetSnapshot())
 	// Best-effort scrub of the in-memory plaintext config now that we've
 	// pulled out the URI + env. Go's GC doesn't promise prompt zeroing;
 	// this limits incidental exposure from a coredump captured mid-
