@@ -184,7 +184,7 @@ func Register(outer *http.ServeMux, prefix string, cfg Config) *JobManager {
 	// Derive the RunSync spec from the Config's destination-mode fields.
 	// Embedded (FUSEMount) takes precedence; falls back to standalone
 	// (MetaURL+VolName) if FUSEMount is unset.
-	spec := RunSyncSpec{OwnerUID: cfg.MountOwnerUID, OwnerGID: cfg.MountOwnerGID}
+	spec := RunSyncSpec{OwnerUID: cfg.MountOwnerUID, OwnerGID: cfg.MountOwnerGID, SourceRoots: cfg.SourceRoots}
 	if cfg.FUSEMount != "" {
 		spec.Mode = ModeEmbedded
 		spec.FUSEMount = cfg.FUSEMount

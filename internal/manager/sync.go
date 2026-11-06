@@ -177,6 +177,10 @@ type RunSyncSpec struct {
 	// Leases (H-8B): checkout leases on the target projects before any
 	// write into the volume (see leases_admin.go). Nil = no lease client.
 	Leases ProjectLeaser
+
+	// SourceRoots are the configured host roots: the trusted anchors a
+	// host-side sync root is opened beneath (sync_roots.go).
+	SourceRoots []string
 }
 
 // RunSync invokes `juicefs sync` against the given source and
@@ -200,6 +204,15 @@ func RunSync(ctx context.Context, juicefsBin string, spec RunSyncSpec, source, d
 	// symlink stored in the volume). The cleaned value is used from here
 	// on. This also covers jobs that did not come through an API gate
 	// (stored schedules, resumed jobs).
+	//
+	// preserve_structure=false copies the source folder itself:
+	// <destination>/<basename of source>/. The Manager names that
+	// subfolder, so juicefs always gets roots with a trailing slash
+	// (sync_roots.go, withSourceBasename).
+	if !opts.PreserveStructure {
+		destination = withSourceBasename(source, destination)
+		opts.PreserveStructure = true
+	}
 	var err error
 	if spec.Mode == ModeEmbedded {
 		if source, err = confineSyncVolumePath(source, spec.FUSEMount); err != nil {
@@ -276,6 +289,35 @@ func RunSync(ctx context.Context, juicefsBin string, spec RunSyncSpec, source, d
 		}
 	}
 
+	// With a juicefs that confines file:// roots, open every local root
+	// beneath its trusted anchor and hand juicefs the open folder
+	// (sync_roots.go). Otherwise keep paths by name and no --links.
+	confined := juicefsConfinesFileRoots(juicefsBin)
+	var extraFiles []*os.File
+	fdLabels := map[string]string{}
+	if confined {
+		sr, dr, err := openSyncRoots(spec, source, destination, src, dst)
+		if err != nil {
+			return err
+		}
+		for _, r := range []*syncRoot{&sr, &dr} {
+			if r.file == nil {
+				continue
+			}
+			extraFiles = append(extraFiles, r.file)
+			fdPath := "/proc/self/fd/" + strconv.Itoa(2+len(extraFiles))
+			r.uri = "file://" + fdPath + "/"
+			fdLabels[fdPath] = r.label
+		}
+		defer func() {
+			for _, f := range extraFiles {
+				f.Close()
+			}
+		}()
+		src, dst = sr.uri, dr.uri
+	}
+	links := confined && syncURIKeepsLinksConfined(src) && syncURIKeepsLinksConfined(dst)
+
 	threads := opts.Threads
 	if threads <= 0 {
 		threads = 10
@@ -294,14 +336,15 @@ func RunSync(ctx context.Context, juicefsBin string, spec RunSyncSpec, source, d
 		// stderr emits sparse logs that the regex parser barely catches).
 		"--metrics", metricsAddr,
 	}
-	// Copy symlinks as links when both ends can store them. The file://
-	// backend of the juicefs the Manager ships resolves every path beneath
-	// its root (third_party/juicefs patch 0016), so a link copied into a
-	// root cannot lead a later write outside it. A destination that cannot
-	// store links (s3, b2, webdav) makes juicefs follow source links; the
-	// confined file backend then follows only those that stay beneath the
-	// source root.
-	if syncURISupportsSymlinks(src) && syncURISupportsSymlinks(dst) {
+	// Copy symlinks as links only when both ends keep them confined: a
+	// file:// root opened by the Manager (the patched backend resolves
+	// beneath it) or a jfs:// volume (links resolve in the volume's own
+	// namespace). sftp:// and nfs:// are not confined, so a stored link
+	// there could lead a later write on that server outside its folder;
+	// those keep the previous behaviour. Without --links juicefs follows
+	// source links, and the confined source root refuses any that leave
+	// it.
+	if links {
 		args = append(args, "--links")
 	}
 	if opts.PreserveTimes {
@@ -347,6 +390,9 @@ func RunSync(ctx context.Context, juicefsBin string, spec RunSyncSpec, source, d
 	// outright would leave juicefs without PATH for its child processes
 	// (e.g. the temp-dir resolution it does on macOS).
 	cmd.Env = append(os.Environ(), modeEnv...)
+	// Confined roots: ExtraFiles[i] is fd 3+i in juicefs, matching the
+	// file:///proc/self/fd/N/ URIs built above.
+	cmd.ExtraFiles = extraFiles
 
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
@@ -393,6 +439,10 @@ func RunSync(ctx context.Context, juicefsBin string, spec RunSyncSpec, source, d
 			return context.Canceled
 		}
 		tail := stderrTail.String()
+		// Name the user's paths instead of the fd paths juicefs saw.
+		for fdPath, label := range fdLabels {
+			tail = strings.ReplaceAll(tail, fdPath, label)
+		}
 		if tail == "" {
 			return fmt.Errorf("juicefs sync exited: %w (no stderr output)", err)
 		}
@@ -464,19 +514,11 @@ func applyPostSyncPermissions(ctx context.Context, destination, fuseMount string
 	}
 }
 
-// syncURISupportsSymlinks reports whether juicefs sync can store a symlink
-// at uri: pkg/object SupportSymlink is implemented by file, nfs, sftp and
-// jfs volumes.
-func syncURISupportsSymlinks(uri string) bool {
-	i := strings.Index(uri, "://")
-	if i <= 0 {
-		return false
-	}
-	switch strings.ToLower(uri[:i]) {
-	case "file", "nfs", "sftp", "jfs":
-		return true
-	}
-	return false
+// syncURIKeepsLinksConfined reports whether a stored symlink at uri stays
+// harmless: a file:// root the Manager opened (/proc/self/fd/N, resolved
+// beneath its root by the patched backend) or a jfs:// volume.
+func syncURIKeepsLinksConfined(uri string) bool {
+	return strings.HasPrefix(uri, "file:///proc/self/fd/") || strings.HasPrefix(uri, "jfs://")
 }
 
 // chownSpec renders the "uid[:gid]" argument for chown; gid < 0 leaves the

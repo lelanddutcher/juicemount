@@ -1,3 +1,5 @@
+//go:build linux
+
 package manager
 
 import (
@@ -100,7 +102,9 @@ func noRegularFile(t *testing.T, label, root, name string) {
 	})
 }
 
-func (l syncLayout) spec() RunSyncSpec { return RunSyncSpec{Mode: ModeEmbedded, FUSEMount: l.fuse} }
+func (l syncLayout) spec() RunSyncSpec {
+	return RunSyncSpec{Mode: ModeEmbedded, FUSEMount: l.fuse, SourceRoots: []string{l.host}}
+}
 
 func (l syncLayout) run(t *testing.T, bin, src, dst string, opts SyncOptions) error {
 	t.Helper()
@@ -331,7 +335,7 @@ func TestJuicefsStandaloneAbsoluteLinksStayInVolume(t *testing.T) {
 	// volume.
 	src := filepath.Join(l.host, "in")
 	mustWrite(t, filepath.Join(src, "sub/payload.txt"), "payload")
-	spec := RunSyncSpec{Mode: ModeStandalone, MetaURL: meta, VolName: vol}
+	spec := RunSyncSpec{Mode: ModeStandalone, MetaURL: meta, VolName: vol, SourceRoots: []string{l.host}}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 	_ = RunSync(ctx, bin, spec, src, "/jfs/dest", DefaultSyncOptions(), nil, nil)
