@@ -317,6 +317,9 @@ func extractToken(uri string) (string, string) {
 	return uri, ""
 }
 
+// fdRootPattern matches a file:// root passed as an open folder.
+var fdRootPattern = regexp.MustCompile(`^/proc/self/fd/[0-9]+/?$`)
+
 func createSyncStorage(uri string, conf *sync.Config) (object.ObjectStorage, error) {
 	// nolint:staticcheck
 	uri = strings.TrimPrefix(uri, "sftp://")
@@ -367,6 +370,12 @@ func createSyncStorage(uri string, conf *sync.Config) (object.ObjectStorage, err
 	var endpoint string
 	if name == "file" {
 		endpoint = u.Path
+		// JuiceMount: with JM_FILE_ROOT_FD_ONLY=1 the caller hands every
+		// file:// root over as an open folder; a root named by path would
+		// be resolved by path, so it is refused.
+		if os.Getenv("JM_FILE_ROOT_FD_ONLY") == "1" && !fdRootPattern.MatchString(endpoint) {
+			return nil, fmt.Errorf("refused: file:// root %s must be an open folder (/proc/self/fd/N/) when JM_FILE_ROOT_FD_ONLY=1", endpoint)
+		}
 	} else if name == "hdfs" {
 		endpoint = u.Host
 	} else if name == "jfs" {
