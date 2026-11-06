@@ -182,6 +182,13 @@ func TestSFTPUnpinnedTestOffersNoAuthAndConfirmPins(t *testing.T) {
 	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"ok": true`) {
 		t.Fatalf("pinned test: %d %s", w.Code, w.Body.String())
 	}
+	// The Destinations tab shows this fingerprint as the verified key.
+	var pinned struct {
+		Fingerprint string `json:"host_key_fingerprint"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &pinned); err != nil || pinned.Fingerprint != wantFP {
+		t.Errorf("pinned test fingerprint = %q (err %v), want %s", pinned.Fingerprint, err, wantFP)
+	}
 	if n := atomic.LoadInt32(&srv.attempts); n != 1 {
 		t.Errorf("pinned test sent %d password attempts, want 1", n)
 	}

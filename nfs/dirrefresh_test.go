@@ -41,6 +41,11 @@ func newDirRefreshHarness(t *testing.T) (*juiceFS, *metadata.Store, string) {
 		pin.ResetFUSEIdentityForTest()
 	})
 	t.Setenv("JM_ASYNC_DIR_REFRESH", "1")
+	// A zero-row ReadDir takes the synchronous populate on a Fast link and
+	// the async empty-then-pop-in path on any other class. The measured
+	// class is process-wide and moves with real reads in earlier tests, so
+	// pin the class a lone run sees unless this test already chose one.
+	pinUnforcedLinkClass(t, netprofile.ClassMedium)
 
 	// The refresh draws its readdir and child stats from these process-wide
 	// gates. A slot still held by an earlier test's background goroutine
@@ -603,10 +608,30 @@ func (e errDirEntry) IsDir() bool                { return false }
 func (e errDirEntry) Type() os.FileMode          { return 0 }
 func (e errDirEntry) Info() (os.FileInfo, error) { return nil, e.err }
 
+// forceLinkClass pins the process-wide link class for this test and restores
+// the override that was in place before it (often the harness pin).
 func forceLinkClass(t *testing.T, c netprofile.LinkClass) {
 	t.Helper()
-	netprofile.Default().ForceClass(&c)
-	t.Cleanup(func() { netprofile.Default().ForceClass(nil) })
+	p := netprofile.Default()
+	prev, had := p.ForcedClass()
+	p.ForceClass(&c)
+	t.Cleanup(func() {
+		if had {
+			p.ForceClass(&prev)
+		} else {
+			p.ForceClass(nil)
+		}
+	})
+}
+
+// pinUnforcedLinkClass pins c only when no class is forced yet, so a test that
+// forced one before building its harness keeps it.
+func pinUnforcedLinkClass(t *testing.T, c netprofile.LinkClass) {
+	t.Helper()
+	if _, forced := netprofile.Default().ForcedClass(); forced {
+		return
+	}
+	forceLinkClass(t, c)
 }
 
 // fastRetry shortens the incomplete-listing backoff. Call before the harness.
