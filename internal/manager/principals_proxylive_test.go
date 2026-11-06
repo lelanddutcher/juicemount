@@ -802,18 +802,27 @@ func TestH8BAutoApproveAfterManagerRestartNeedsProof(t *testing.T) {
 // timers it shortened are restored, for any auto-approve pass to finish.
 func waitAutoIdleAtCleanup(t *testing.T, s *PrincipalStore) {
 	t.Helper()
-	t.Cleanup(func() {
-		deadline := time.Now().Add(10 * time.Second)
-		for {
-			s.mu.Lock()
-			running := s.autoRunning
-			s.mu.Unlock()
-			if !running || time.Now().After(deadline) {
-				return
-			}
-			time.Sleep(10 * time.Millisecond)
+	t.Cleanup(func() { waitAutoIdle(t, s) })
+}
+
+// waitAutoIdle waits until s runs no auto-approve pass. A pass starts only
+// when the store is asked for one, so a store nothing calls stays idle.
+func waitAutoIdle(t *testing.T, s *PrincipalStore) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		s.mu.Lock()
+		running := s.autoRunning
+		s.mu.Unlock()
+		if !running {
+			return
 		}
-	})
+		if time.Now().After(deadline) {
+			t.Errorf("an auto-approve pass still runs after 10 s")
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 // TestH8BAutoApproveReplacedRecordWaitsForItsOwnProof: while a pass waits
