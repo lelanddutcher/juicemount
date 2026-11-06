@@ -23,6 +23,12 @@
 #      fixed ACL keeps everything, does not bring R0 back, and logs no
 #      AOF-loading-client lines. On that fixed Redis the check skips the
 #      rewrite.
+#   8. A slow rewrite (rdb-key-save-delay) is already running when the
+#      helper starts: it waits for it, asks for its own, and returns only
+#      after that one ended. Redis counts a rewrite when it forks, so a
+#      baseline read during the running one could never be passed.
+#   9. A BGSAVE runs, so the helper's rewrite is only scheduled: it returns
+#      only after the scheduled rewrite forked and ended.
 #
 # Usage: server/scripts/redis-compact.test.sh
 # Needs Docker. Uses the compose's digest-pinned Redis image.
@@ -45,8 +51,8 @@ esac
 
 project=jm-redis-compact-test-$$
 work=$(mktemp -d "${TMPDIR:-/tmp}/jm-redis-compact.XXXXXX")
-mkdir "$work/data" "$work/control" "$work/release"
-chmod 777 "$work/data" "$work/control" "$work/release" # the image runs redis as uid 999
+mkdir "$work/data" "$work/control" "$work/release" "$work/busy"
+chmod 777 "$work/data" "$work/control" "$work/release" "$work/busy" # the image runs redis as uid 999
 
 # Render both ACLs the way the redis service does (docker-compose.yml).
 proxy_pw=compact-test-proxy-0123456789abcdef
@@ -92,7 +98,7 @@ cleanup() {
 	stop
 	# The data folders belong to the image's redis user: remove them as root
 	# inside a throwaway container of the same image.
-	docker run --rm -v "$work:/w" --entrypoint sh "$image" -c 'rm -rf /w/data /w/control /w/release' >/dev/null 2>&1 || true
+	docker run --rm -v "$work:/w" --entrypoint sh "$image" -c 'rm -rf /w/data /w/control /w/release /w/busy' >/dev/null 2>&1 || true
 	rm -rf "$work" 2>/dev/null || true
 }
 trap cleanup EXIT
@@ -150,7 +156,10 @@ stop
 start 6b "$work/release" "$work/old.acl"
 [ "$(cli LLEN rq0)" = 0 ] || { echo 'redis-compact: precondition failed: the 0.5.0 restart kept transaction R0' >&2; exit 1; }
 raw "AUTH jm-proxy $proxy_pw\r\nMULTI\r\nHSET r1 name ino\r\nSET r2 attr\r\nEXEC\r\nSET rplain 1\r\nSELECT 1\r\nMULTI\r\nSET rdb1 a\r\nEXEC\r\n"
-jm_redis_compact_if_old_acl "$project" || { echo 'redis-compact: the release rewrite failed on a running 0.5.0 Redis' >&2; exit 1; }
+# Without the backup acknowledgement nothing happens (status 4).
+rc=0; jm_redis_compact_if_old_acl "$project" 0 || rc=$?
+[ "$rc" = 4 ] && [ "$(rewrites)" = 0 ] || { echo "redis-compact: without the backup acknowledgement the release check returned $rc after $(rewrites) rewrites" >&2; exit 1; }
+jm_redis_compact_if_old_acl "$project" 1 || { echo 'redis-compact: the release rewrite failed on a running 0.5.0 Redis' >&2; exit 1; }
 [ "$(rewrites)" = 1 ] || { echo 'redis-compact: the release check did not rewrite the AOF under the 0.5.0 ACL' >&2; fail=1; }
 # Writes after the rewrite, still under the 0.5.0 ACL.
 raw "AUTH jm-proxy $proxy_pw\r\nMULTI\r\nSET r3 after\r\nLPUSH rq job\r\nEXEC\r\nSELECT 1\r\nMULTI\r\nSET rdb1b b\r\nEXEC\r\n"
@@ -165,13 +174,48 @@ if [ "$(refusals)" != 0 ]; then
 	docker logs "$name" 2>&1 | grep -m3 'AOF-loading-client' >&2
 	fail=1
 fi
-jm_redis_compact_if_old_acl "$project" || { echo 'redis-compact: the release check failed on a fixed-ACL Redis' >&2; fail=1; }
+jm_redis_compact_if_old_acl "$project" 0 || { echo 'redis-compact: the release check failed on a fixed-ACL Redis' >&2; fail=1; }
 [ "$(rewrites)" = 0 ] || { echo 'redis-compact: the release check rewrote the AOF although the running ACL is fixed' >&2; fail=1; }
+stop
+
+# 8 and 9. Each child (a rewrite or a BGSAVE) takes about 4 s here.
+persist() { docker exec "$name" sh -c 'redis-cli --user jm-admin --pass "$(cat /run/jm-redis/admin.pass)" --no-auth-warning INFO persistence' | tr -d '\r'; }
+field() { persist | sed -n "s/^$1://p"; }
+settled() { # rewrites expected: done, ok, nothing scheduled or running
+	local p
+	p=$(persist)
+	printf '%s\n' "$p" | grep -qx 'aof_rewrite_in_progress:0' &&
+		printf '%s\n' "$p" | grep -qx 'aof_rewrite_scheduled:0' &&
+		printf '%s\n' "$p" | grep -qx 'aof_last_bgrewrite_status:ok' &&
+		printf '%s\n' "$p" | grep -qx "aof_rewrites:$1"
+}
+start 8 "$work/busy" "$work/fixed.acl"
+docker exec "$name" sh -c "i=0; while [ \$i -lt 2000 ]; do echo \"SET k\$i v\"; i=\$((i+1)); done | redis-cli --user jm-proxy --pass $proxy_pw --no-auth-warning >/dev/null"
+cli CONFIG SET rdb-key-save-delay 2000 >/dev/null
+base=$(field aof_rewrites)
+cli BGREWRITEAOF >/dev/null
+[ "$(field aof_rewrite_in_progress)" = 1 ] || { echo 'redis-compact: setup failed: the first rewrite was not still running' >&2; exit 1; }
+if JM_REDIS_COMPACT_TIMEOUT=60 jm_redis_compact "$project"; then
+	settled $((base + 2)) || { echo "redis-compact: the helper returned before its own rewrite ended (an earlier one was running): $(persist | grep -E '^aof_rew|^aof_last_bg' | tr '\n' ' ')" >&2; fail=1; }
+else
+	echo 'redis-compact: the helper failed while an earlier rewrite was running' >&2
+	fail=1
+fi
+base=$(field aof_rewrites)
+cli BGSAVE >/dev/null
+[ "$(field rdb_bgsave_in_progress)" = 1 ] || { echo 'redis-compact: setup failed: the BGSAVE was not still running' >&2; exit 1; }
+if JM_REDIS_COMPACT_TIMEOUT=60 jm_redis_compact "$project"; then
+	settled $((base + 1)) || { echo "redis-compact: the helper returned before its scheduled rewrite ended: $(persist | grep -E '^aof_rew|^aof_last_bg|^rdb_bgsave_in' | tr '\n' ' ')" >&2; fail=1; }
+else
+	echo 'redis-compact: the helper failed while its rewrite waited behind a BGSAVE' >&2
+	fail=1
+fi
 stop
 name=
 
 if [ "$fail" = 0 ]; then
 	echo 'redis-compact: after the helper, a fixed-ACL restart keeps every write and replays no refused transaction'
 	echo 'redis-compact: the release rewrite runs only under the 0.5.0 ACL, and a later fixed-ACL restart keeps every write'
+	echo 'redis-compact: the helper waits out a running rewrite and a BGSAVE, and returns only after its own rewrite ended'
 fi
 exit "$fail"

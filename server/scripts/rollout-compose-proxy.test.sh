@@ -189,13 +189,24 @@ case "$1" in
         if [ "$(st "$svc.img")" = new ]; then echo "$b 0.5.0 ($FAKE_COMMIT)"; else echo "$b 0.4.9 (0000000000000000000000000000000000000000)"; fi ;;
       *jm-redis-cli*BGREWRITEAOF*)
         [ "$svc" = redis ] || { echo "BGREWRITEAOF sent to $svc" >&2; exit 1; }
+        calls="$(st aof-calls)"; calls=$(( ${calls:-0} + 1 )); printf '%s' "$calls" > "$FAKE_STATE/aof-calls"
+        # FAKE_AOF_REFUSE_FROM=N: the Nth and later requests are refused
+        # (2: the forward rewrite works, the rollback's is refused).
+        if [ "$FAKE_FAIL" = bgrewrite_refused ] || { [ -n "${FAKE_AOF_REFUSE_FROM:-}" ] && [ "$calls" -ge "$FAKE_AOF_REFUSE_FROM" ]; }; then
+          echo 'ERR Background append only file rewriting failed to start'; exit 0
+        fi
+        # Redis counts a rewrite when it forks (aof.c), so before it ends.
+        n="$(st aof-rewrites)"; printf '%s' "$(( ${n:-0} + 1 ))" > "$FAKE_STATE/aof-rewrites"
         case "$FAKE_FAIL" in
-          bgrewrite_refused) echo 'ERR Background append only file rewriting failed to start'; exit 0 ;;
           rewrite_hang) printf 1 > "$FAKE_STATE/aof-busy" ;;
           rewrite_err) printf err > "$FAKE_STATE/aof-status" ;;
-          *) n="$(st aof-rewrites)"; printf '%s' "$(( ${n:-0} + 1 ))" > "$FAKE_STATE/aof-rewrites" ;;
         esac
         echo 'Background append only file rewriting started' ;;
+      *'cat /run/jm-redis/users.acl'*)
+        # The pre-proxy compose runs Redis without an ACL file.
+        [ "$(st redis)" != pre ] || { echo 'cat: no such file' >&2; exit 1; }
+        if [ "${FAKE_RUNNING_ACL:-fixed}" = old ]; then echo 'user default off resetpass resetkeys resetchannels -@all'
+        else echo 'user default off resetpass resetkeys resetchannels ~* &* +@all'; fi ;;
       *jm-redis-cli*'INFO persistence'*)
         [ "$FAKE_FAIL" = info_fail ] && exit 1
         busy="$(st aof-busy)"; status="$(st aof-status)"; n="$(st aof-rewrites)"
@@ -242,7 +253,7 @@ set_topology() { # topology for every service; respproxy only in proxy
   [ "$1" = proxy ] && printf proxy > "$FAKE_STATE/respproxy"
   : > "$FAKE_LOG"; rm -f "$FAKE_ACL"
   rm -rf "$REPO/.update-lock"
-  export FAKE_FAIL="" FAKE_REDIS_DIES=""
+  export FAKE_FAIL="" FAKE_REDIS_DIES="" FAKE_AOF_REFUSE_FROM="" FAKE_RUNNING_ACL=fixed
 }
 assert_topology() { # expected topology for redis + dependents, expected respproxy presence
   local want="$1" s
@@ -485,9 +496,12 @@ for mode in cutover proxy-rollback proxy-restore; do
     if grep -E '^docker compose .* (stop|rm|up)( |$)|HSET jmlease:v1:cfg' "$FAKE_LOG" >/dev/null; then
       cat "$FAKE_LOG"; echo "FAIL: $mode stopped or recreated a service after $failure" >&2; exit 1
     fi
-    grep -q 'Nothing was stopped' "$WORK/out" || { cat "$WORK/out"; echo "FAIL: $mode $failure lacked the refusal message" >&2; exit 1; }
+    grep -q 'refusing to stop or recreate Redis: its AOF rewrite did not finish' "$WORK/out" &&
+      grep -q 'topology change refused before any service stopped; the stack is unchanged' "$WORK/out" || {
+        cat "$WORK/out"; echo "FAIL: $mode $failure lacked an accurate refusal message" >&2; exit 1;
+      }
     if [ "$failure" = rewrite_hang ]; then
-      grep -q 'did not finish within 3 s' "$WORK/out" || { cat "$WORK/out"; echo 'FAIL: timeout not reported' >&2; exit 1; }
+      grep -q 'did not end within 3 s' "$WORK/out" || { cat "$WORK/out"; echo 'FAIL: timeout not reported' >&2; exit 1; }
     fi
     cmp -s "$WORK/env.before" "$REPO/server/.env" || { echo "FAIL: $mode $failure left .env changed" >&2; exit 1; }
     [ ! -e "$REPO/.update-lock" ] || { cat "$WORK/out"; echo "FAIL: $mode $failure kept the lock" >&2; exit 1; }
@@ -504,7 +518,7 @@ set_topology pre; write_env "$OLD_M" "$OLD_F" "$OLD_R"
 export FAKE_REDIS_DIES=proxy
 if bash "$SCRIPT" "${cut[@]}" > "$WORK/out" 2>&1; then echo 'FAIL: cutover accepted a Redis that never came up' >&2; exit 1; fi
 assert_topology pre
-grep -q 'is not running, so its AOF was not compacted' "$WORK/out" || { cat "$WORK/out"; echo 'FAIL: skipped compaction not reported' >&2; exit 1; }
+grep -q 'is not running, so its AOF was not rewritten' "$WORK/out" || { cat "$WORK/out"; echo 'FAIL: skipped compaction not reported' >&2; exit 1; }
 [ ! -e "$REPO/.update-lock" ]
 echo 'ok: a rollback over a stopped Redis says the start replays the AOF'
 
@@ -527,4 +541,100 @@ grep -q 'WARNING: .*Starting anyway (--allow-aof-replay)' "$WORK/out" || { cat "
 assert_topology direct
 [ ! -e "$REPO/.update-lock" ]
 git -C "$REPO" revert --no-edit HEAD >/dev/null
+# The fixture HEAD moved: the images report the new release commit.
+FAKE_COMMIT="$(git -C "$REPO" rev-parse HEAD)"
+FAKE_RP_REV="$FAKE_COMMIT"
+export FAKE_COMMIT FAKE_RP_REV
 echo 'ok: Redis does not start under the 0.5.0 ACL after a skipped compaction unless --allow-aof-replay is given'
+
+# 11. The forward rewrite works, then the forward change fails and the
+# rollback's own rewrite is refused. The forward rewrite already removed
+# every refused transaction, so the rollback warns and still restores the
+# stack; it must not stop half done.
+set_topology pre; write_env "$OLD_M" "$OLD_F" "$OLD_R"
+export FAKE_FAIL=respproxy_unhealthy FAKE_AOF_REFUSE_FROM=2
+if bash "$SCRIPT" "${cut[@]}" > "$WORK/out" 2>&1; then echo 'FAIL: cutover accepted an unhealthy proxy' >&2; exit 1; fi
+assert_topology pre
+[ "$(grep -c 'jm-redis-cli BGREWRITEAOF' "$FAKE_LOG")" = 2 ] || { echo 'FAIL: the rollback did not try its own rewrite' >&2; exit 1; }
+grep -q 'WARNING: this AOF rewrite did not finish. Going on' "$WORK/out" || { cat "$WORK/out"; echo 'FAIL: the rollback did not say it went on without a rewrite' >&2; exit 1; }
+! grep -q 'CRITICAL' "$WORK/out" || { cat "$WORK/out"; echo 'FAIL: the rollback stopped half done' >&2; exit 1; }
+[ ! -e "$REPO/.update-lock" ]
+echo 'ok: a refused rewrite in the rollback warns and the rollback still restores the stack'
+
+# 12. While the running Redis has the 0.5.0 ACL, a topology change needs
+# --ack-redis-aof-backup (the rewrite deletes the only copy of earlier
+# losses), and refuses before anything otherwise.
+set_topology proxy; write_env "$OLD_M" "$OLD_F" "$OLD_R"
+export FAKE_RUNNING_ACL=old
+rb=(--repo "$REPO" --project testproject --proxy-rollback --ack-worker-quiesced --ack-macs-drained)
+if bash "$SCRIPT" "${rb[@]}" > "$WORK/out" 2>&1; then echo 'FAIL: rewrite of a 0.5.0 Redis without the backup acknowledgement' >&2; exit 1; fi
+grep -q 'then re-run with --ack-redis-aof-backup. Nothing was changed.' "$WORK/out" || { cat "$WORK/out"; echo 'FAIL: no backup reminder' >&2; exit 1; }
+! grep -qE 'BGREWRITEAOF|^docker compose .* (stop|rm|up)( |$)' "$FAKE_LOG" || { echo 'FAIL: acted before the backup acknowledgement' >&2; exit 1; }
+[ ! -e "$FAKE_ACL" ] && [ ! -e "$REPO/.update-lock" ] || { echo 'FAIL: wrote the rollback ACL or kept the lock before the acknowledgement' >&2; exit 1; }
+bash "$SCRIPT" "${rb[@]}" --ack-redis-aof-backup > "$WORK/out" 2>&1 || { cat "$WORK/out"; echo 'FAIL: acknowledged rollback failed' >&2; exit 1; }
+assert_topology direct
+assert_compacted_first
+echo 'ok: a topology change on a 0.5.0 Redis needs --ack-redis-aof-backup'
+
+# 13. The helper's wait, against scripted INFO persistence answers that
+# follow Redis 7.4 (aof.c): aof_rewrites rises when a rewrite forks,
+# aof_rewrite_scheduled clears only on that fork, the status changes only
+# when a rewrite ends. One line per INFO read: scheduled in_progress status
+# count. Each case fails if the helper skips the check it names.
+SEQ="$WORK/seq"; mkdir -p "$SEQ/bin"
+cat > "$SEQ/bin/docker" <<'SEQDOCKER'
+#!/usr/bin/env bash
+set -euo pipefail
+case "$*" in
+  ps\ *) echo redis-id ;;
+  *jm-redis-cli*BGREWRITEAOF*)
+    echo BGREWRITEAOF >> "$SEQ/log"
+    n=$(( $(grep -c BGREWRITEAOF "$SEQ/log") ))
+    sed -n "${n}p" "$SEQ/replies" ;;
+  *jm-redis-cli*'INFO persistence'*)
+    echo INFO >> "$SEQ/log"
+    n=$(( $(grep -c INFO "$SEQ/log") ))
+    last=$(wc -l < "$SEQ/info" | tr -d ' ')
+    [ "$n" -le "$last" ] || n="$last"
+    read -r sched prog status count < <(sed -n "${n}p" "$SEQ/info")
+    printf 'aof_rewrite_in_progress:%s\r\naof_rewrite_scheduled:%s\r\naof_last_bgrewrite_status:%s\r\naof_rewrites:%s\r\naof_rewrites_consecutive_failures:0\r\n' "$prog" "$sched" "$status" "$count" ;;
+  *) echo "unexpected: $*" >&2; exit 1 ;;
+esac
+SEQDOCKER
+chmod +x "$SEQ/bin/docker"
+seq_case() { # name, want (ok|fail), replies (|-separated), info lines...
+  local name="$1" want="$2" replies="$3" got=ok
+  shift 3
+  : > "$SEQ/log"
+  printf '%s\n' "$replies" | tr '|' '\n' > "$SEQ/replies"
+  printf '%s\n' "$@" > "$SEQ/info"
+  if ! (export SEQ PATH="$SEQ/bin:$PATH"; . "$(dirname "$SCRIPT")/lib/redis-compact.sh"; JM_REDIS_COMPACT_TIMEOUT=20 jm_redis_compact testproject) > "$WORK/seq.out" 2>&1; then got=fail; fi
+  [ "$got" = "$want" ] || { cat "$WORK/seq.out"; echo "FAIL: helper case '$name': want $want, got $got" >&2; exit 1; }
+  # Every scripted answer was read: the helper did not stop early.
+  [ "$(grep -c INFO "$SEQ/log")" -ge "$#" ] || { cat "$SEQ/log"; echo "FAIL: helper case '$name' returned after $(grep -c INFO "$SEQ/log") of $# INFO reads" >&2; exit 1; }
+}
+started='Background append only file rewriting started'
+scheduled='Background append only file rewriting scheduled'
+busy='ERR Background append only file rewriting already in progress'
+# A BGSAVE runs, so the rewrite is only scheduled; it forks, then ends.
+seq_case scheduled-behind-bgsave ok "$scheduled" '0 0 ok 5' '1 0 ok 5' '1 0 ok 5' '0 1 ok 6' '0 0 ok 6'
+# The scheduled flag cleared with no fork (stopAppendOnly, server.c): only
+# the counter shows that no rewrite ran yet.
+seq_case scheduled-cleared-without-fork ok "$scheduled" '0 0 ok 5' '0 0 ok 5' '0 0 ok 5' '0 1 ok 6' '0 0 ok 6'
+# An automatic rewrite forked and ended after the baseline while ours is
+# still scheduled: only the scheduled flag shows ours has not run.
+seq_case auto-rewrite-while-scheduled ok "$scheduled" '0 0 ok 5' '1 0 ok 6' '1 0 ok 6' '0 1 ok 7' '0 0 ok 7'
+# A rewrite is already running when the helper starts (its count already
+# rose): wait for it to end, then ask for a new one.
+seq_case already-running ok "$started" '0 1 ok 6' '0 1 ok 6' '0 0 ok 6' '0 1 ok 7' '0 0 ok 7'
+[ "$(grep -c BGREWRITEAOF "$SEQ/log")" = 1 ] && [ "$(sed -n 4p "$SEQ/log")" = BGREWRITEAOF ] || { cat "$SEQ/log"; echo 'FAIL: asked for a rewrite while another was running' >&2; exit 1; }
+# A rewrite forked between the helper's read and its request.
+seq_case already-in-progress-reply ok "$busy|$started" '0 0 ok 5' '0 1 ok 6' '0 0 ok 6' '0 1 ok 7' '0 0 ok 7'
+[ "$(grep -c BGREWRITEAOF "$SEQ/log")" = 2 ] || { echo 'FAIL: did not ask again after "already in progress"' >&2; exit 1; }
+# A scheduled rewrite that then fails, after earlier failures (the
+# scheduled request reset Redis's consecutive-failure counter): fail now,
+# not at the timeout.
+seq_case scheduled-then-failed fail "$scheduled" '0 0 err 5' '1 0 err 5' '0 1 err 6' '0 0 err 6'
+grep -q 'the AOF rewrite failed (aof_last_bgrewrite_status:err)' "$WORK/seq.out" || { cat "$WORK/seq.out"; echo 'FAIL: failed rewrite not reported as such' >&2; exit 1; }
+[ "$(grep -c INFO "$SEQ/log")" -le 5 ] || { echo 'FAIL: a failed rewrite was only noticed at the timeout' >&2; exit 1; }
+echo 'ok: the helper waits for a scheduled, already-running or raced rewrite, and reports a failed one at once'

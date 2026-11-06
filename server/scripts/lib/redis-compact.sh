@@ -1,39 +1,51 @@
 # shellcheck shell=bash
-# Compact the metadata Redis's append-only file (AOF) before anything stops
-# or recreates Redis. Source this file; it defines functions only.
+# Rewrite (compact) the metadata Redis's append-only file (AOF) before
+# anything stops or recreates Redis, or before a release leaves a fixed ACL
+# staged for its next start. Source this file; it defines functions only.
 #
 # Redis rebuilds its data at every start by replaying the AOF. Under the
 # 0.5.0 ACL (`user default off ... -@all`), Redis 7.4 refuses every replayed
 # MULTI/EXEC and multi-write script, so a restart loses JuiceFS metadata.
-# On a server that already had such a lossy start, the first start under the
-# fixed ACL replays those refused transactions over newer writes and corrupts
-# the folder tree. BGREWRITEAOF under the still-running Redis replaces the
-# AOF with what Redis holds now, so the next start replays nothing old.
+# The refused transactions stay in the AOF. The first start under the fixed
+# ACL replays them over newer writes and corrupts the folder tree.
+# BGREWRITEAOF under the running Redis replaces the AOF with what Redis
+# holds now, so the next start replays nothing old. The rewrite also deletes
+# the old AOF files, the only copy of the changes lost at that earlier start
+# (CHANGELOG 0.5.1, step 2: copy appendonlydir first).
 #
-#   jm_redis_before_restart PROJECT ACL_FILE ALLOW_REPLAY
+#   jm_redis_before_restart PROJECT ACL_FILE ALLOW_REPLAY [ON_FAIL]
 #     Call immediately before a script stops or recreates Redis. Returns 0
-#     when it is safe to go on, 1 when the caller must stop without touching
-#     anything. ACL_FILE is the template the next Redis start renders (empty:
-#     that Redis runs without an ACL file). ALLOW_REPLAY=1 is the operator's
-#     explicit override for the one refusal below.
+#     when it is safe to go on, 1 when the caller must not stop or recreate
+#     Redis. It never says what the caller already stopped; the caller does.
+#     ACL_FILE is the template the next Redis start renders (empty: that
+#     Redis runs without an ACL file).
+#     Redis running: rewrite (jm_redis_compact_container). If that fails:
+#       ON_FAIL=refuse (default) returns 1. ON_FAIL=warn is for a caller
+#       that already rewrote the AOF earlier in this run (rollout-compose's
+#       automatic rollback): it warns and goes on to the ACL check below.
+#     Redis not running, or ON_FAIL=warn after a failed rewrite: the start
+#       replays the AOF as it is. Refuse while ACL_FILE still has the 0.5.0
+#       default line, unless ALLOW_REPLAY=1 (the operator accepts that the
+#       start drops every replayed transaction).
 #
-#     Redis running: BGREWRITEAOF as jm-admin (no login on a Redis without an
-#       ACL file), then wait until INFO persistence shows
-#       aof_rewrite_scheduled:0, aof_rewrite_in_progress:0,
-#       aof_last_bgrewrite_status:ok and a higher aof_rewrites count.
-#       Any error or JM_REDIS_COMPACT_TIMEOUT seconds (default 600): fail.
-#     Redis not running: nothing can be compacted, so say that the next start
-#       replays the whole AOF. Refuse when ACL_FILE would still refuse
-#       replayed transactions, unless ALLOW_REPLAY=1.
+#   jm_redis_running_acl_state PROJECT
+#     Prints what the running Redis loaded at its start
+#     (/run/jm-redis/users.acl): fixed, old (the 0.5.0 default line),
+#     unreadable, or down (no running redis). Returns 1 when it cannot tell.
 #
-#   jm_redis_compact_if_old_acl PROJECT
-#     For a script that does NOT restart Redis but stages the fixed ACL that
-#     its next start (a NAS reboot included) renders. When the running Redis
-#     still loaded the 0.5.0 default line (/run/jm-redis/users.acl), or that
-#     file cannot be read, rewrite the AOF now, online. Afterwards the base
-#     holds the live state and the AOF only writes made after it, which the
-#     fixed ACL replays. Returns 0 when the rewrite finished or was not
-#     needed, 1 otherwise (Redis not running included).
+#   jm_redis_compact_if_old_acl PROJECT ACK_BACKUP
+#     For a release, which never restarts Redis but leaves the fixed ACL
+#     staged for its next start (a NAS reboot included). Returns
+#       0  the running ACL is fixed (no rewrite needed), or the rewrite
+#          finished. Afterwards the base holds the live state and the AOF
+#          only later writes, which the fixed ACL replays.
+#       4  the running ACL is old and ACK_BACKUP is not 1: nothing was done,
+#          because the rewrite would delete the only copy of earlier losses.
+#       3  Redis is not running.  1  the rewrite failed, or no answer.
+#     An unreadable users.acl gets a rewrite with no acknowledgement: a
+#     Redis without an ACL file (the pre-proxy compose) never refused a
+#     replayed transaction, and for any other Redis rewriting is the safe
+#     side. Such a Redis is rewritten on every release; that is harmless.
 
 jm_redis_compact_log() { printf 'redis-compact: %s\n' "$*" >&2; }
 
@@ -81,41 +93,80 @@ jm_redis_compact() { # project
   jm_redis_compact_container "$c"
 }
 
+# One INFO persistence read into _jm_sched, _jm_prog, _jm_status, _jm_count.
+_jm_redis_poll() { # container
+  local info
+  info="$(jm_redis_cli "$1" INFO persistence)" || return 1
+  _jm_sched="$(jm_redis_info_field "$info" aof_rewrite_scheduled)"
+  _jm_prog="$(jm_redis_info_field "$info" aof_rewrite_in_progress)"
+  _jm_status="$(jm_redis_info_field "$info" aof_last_bgrewrite_status)"
+  _jm_count="$(jm_redis_info_field "$info" aof_rewrites)"
+  [[ "$_jm_sched$_jm_prog" =~ ^[01][01]$ && "$_jm_count" =~ ^[0-9]+$ ]] || {
+    jm_redis_compact_log "Redis $1 did not report aof_rewrite_scheduled, aof_rewrite_in_progress and aof_rewrites"
+    return 1
+  }
+}
+
+# How Redis 7.4 reports a rewrite (aof.c): aof_rewrites rises when the
+# rewrite forks, not when it ends. aof_rewrite_scheduled clears only on that
+# fork. aof_last_bgrewrite_status changes only when a rewrite ends. A
+# scheduled BGREWRITEAOF resets aof_rewrites_consecutive_failures, so that
+# counter is not used. So:
+#   1. While another rewrite runs (in progress, or a BGREWRITEAOF answered
+#      "already in progress"), wait for it to end, then ask again: it may
+#      have started before the changes this rewrite must cover.
+#   2. Baseline: aof_rewrites right before our BGREWRITEAOF.
+#   3. Done when aof_rewrite_scheduled:0, aof_rewrite_in_progress:0 and
+#      aof_rewrites above the baseline (a rewrite forked after our request
+#      and ended): aof_last_bgrewrite_status:ok is success, err a failure.
+# One deadline of JM_REDIS_COMPACT_TIMEOUT seconds (default 600) covers all.
 jm_redis_compact_container() { # running redis container
-  local c="$1" info reply before failures_before sched prog status count failures i
+  local c="$1" reply baseline="" ticks=0 waited=0
   local timeout="${JM_REDIS_COMPACT_TIMEOUT:-600}"
   [[ "$timeout" =~ ^[1-9][0-9]*$ ]] || { jm_redis_compact_log "JM_REDIS_COMPACT_TIMEOUT must be a whole number of seconds"; return 1; }
-  info="$(jm_redis_cli "$c" INFO persistence)" || { jm_redis_compact_log "cannot read INFO persistence from Redis $c as jm-admin"; return 1; }
-  before="$(jm_redis_info_field "$info" aof_rewrites)"
-  failures_before="$(jm_redis_info_field "$info" aof_rewrites_consecutive_failures)"
-  [[ "$before" =~ ^[0-9]+$ ]] || { jm_redis_compact_log "Redis $c did not report aof_rewrites in INFO persistence"; return 1; }
-  [[ "$failures_before" =~ ^[0-9]+$ ]] || failures_before=0
-  reply="$(jm_redis_cli "$c" BGREWRITEAOF 2>&1)" || true
-  case "$reply" in
-    *'rewriting started'*|*'rewriting scheduled'*|*'already in progress'*) ;;
-    *)
-      jm_redis_compact_log "Redis refused BGREWRITEAOF: $(printf '%s' "$reply" | tr -d '\r' | head -1)"
-      return 1 ;;
-  esac
-  for ((i = 0; i <= timeout; i++)); do
-    [ "$i" = 0 ] || sleep 1
-    info="$(jm_redis_cli "$c" INFO persistence)" || continue
-    sched="$(jm_redis_info_field "$info" aof_rewrite_scheduled)"
-    prog="$(jm_redis_info_field "$info" aof_rewrite_in_progress)"
-    status="$(jm_redis_info_field "$info" aof_last_bgrewrite_status)"
-    count="$(jm_redis_info_field "$info" aof_rewrites)"
-    failures="$(jm_redis_info_field "$info" aof_rewrites_consecutive_failures)"
-    [ "$sched" = 0 ] && [ "$prog" = 0 ] || continue
-    if [ "$status" = ok ] && [[ "$count" =~ ^[0-9]+$ ]] && [ "$count" -gt "$before" ]; then
-      jm_redis_compact_log "AOF rewritten (aof_rewrite_scheduled:0, aof_rewrite_in_progress:0, aof_last_bgrewrite_status:ok)"
-      return 0
+  _jm_sched="" _jm_prog="" _jm_status="" _jm_count=""
+  while [ "$ticks" -le "$timeout" ]; do
+    [ "$ticks" = 0 ] || sleep 1
+    ticks=$((ticks + 1))
+    _jm_redis_poll "$c" || continue
+    if [ -z "$baseline" ]; then
+      if [ "$_jm_prog" = 1 ]; then
+        [ "$waited" = 1 ] || jm_redis_compact_log "a rewrite is already running; waiting for it to end, then asking for a new one"
+        waited=1
+        continue
+      fi
+      baseline="$_jm_count"
+      reply="$(jm_redis_cli "$c" BGREWRITEAOF 2>&1)" || true
+      case "$reply" in
+        *'rewriting started'*|*'rewriting scheduled'*) ;;
+        *'already in progress'*)
+          baseline=""
+          [ "$waited" = 1 ] || jm_redis_compact_log "a rewrite started just before ours; waiting for it to end, then asking again"
+          waited=1
+          continue ;;
+        *)
+          jm_redis_compact_log "Redis refused BGREWRITEAOF: $(printf '%s' "$reply" | tr -d '\r' | head -1)"
+          return 1 ;;
+      esac
+      continue
     fi
-    if [ "$status" = err ] && [[ "$failures" =~ ^[0-9]+$ ]] && [ "$failures" -gt "$failures_before" ]; then
-      jm_redis_compact_log "the AOF rewrite failed (aof_last_bgrewrite_status:err); see the Redis log"
-      return 1
-    fi
+    [ "$_jm_sched" = 0 ] && [ "$_jm_prog" = 0 ] && [ "$_jm_count" -gt "$baseline" ] || continue
+    case "$_jm_status" in
+      ok)
+        jm_redis_compact_log "AOF rewritten (aof_rewrite_scheduled:0, aof_rewrite_in_progress:0, aof_last_bgrewrite_status:ok)"
+        return 0 ;;
+      *)
+        jm_redis_compact_log "the AOF rewrite failed (aof_last_bgrewrite_status:${_jm_status:-?}); see the Redis log"
+        return 1 ;;
+    esac
   done
-  jm_redis_compact_log "the AOF rewrite did not finish within ${timeout} s (aof_rewrite_scheduled:${sched:-?}, aof_rewrite_in_progress:${prog:-?}, aof_last_bgrewrite_status:${status:-?}); raise JM_REDIS_COMPACT_TIMEOUT for a large keyspace"
+  if [ -z "$baseline" ]; then
+    jm_redis_compact_log "no AOF rewrite could be started within ${timeout} s: another rewrite was still running (aof_rewrite_in_progress:${_jm_prog:-?}), or INFO persistence could not be read. See the Redis log; raise JM_REDIS_COMPACT_TIMEOUT if a large rewrite is simply slow."
+  elif [ "$_jm_sched" = 1 ]; then
+    jm_redis_compact_log "the AOF rewrite was still only scheduled after ${timeout} s (aof_rewrite_scheduled:1, aof_last_bgrewrite_status:${_jm_status:-?}): Redis waits for a background save to end, or retries a rewrite that could not start. See the Redis log."
+  else
+    jm_redis_compact_log "the AOF rewrite did not end within ${timeout} s (aof_rewrite_in_progress:${_jm_prog:-?}); raise JM_REDIS_COMPACT_TIMEOUT for a large keyspace, or see the Redis log"
+  fi
   return 1
 }
 
@@ -148,39 +199,49 @@ jm_redis_acl_text_replay_safe() { # acl text on stdin
   '
 }
 
-# 0 when the ACL the running Redis rendered at its start replays
-# transactions. An unreadable or empty file counts as not safe.
-jm_redis_running_acl_safe() { # running redis container
-  local acl
-  acl="$(docker exec "$1" cat /run/jm-redis/users.acl 2>/dev/null)" || return 1
-  [ -n "$acl" ] || return 1
-  printf '%s\n' "$acl" | jm_redis_acl_text_replay_safe
-}
-
-jm_redis_compact_if_old_acl() { # project
-  local c rc
+jm_redis_running_acl_state() { # project
+  local c rc acl
   c="$(jm_redis_find "$1")" || {
     rc=$?
-    [ "$rc" != 3 ] || jm_redis_compact_log "Redis of project $1 is not running"
-    return 1
-  }
-  if jm_redis_running_acl_safe "$c"; then
-    jm_redis_compact_log "the running Redis already loaded an ACL that replays transactions; no AOF rewrite needed"
+    [ "$rc" = 3 ] || return 1
+    echo down
     return 0
-  fi
-  jm_redis_compact_log "the running Redis still has the 0.5.0 'user default ... -@all' line (or its /run/jm-redis/users.acl is unreadable): rewriting its AOF now, without a restart"
+  }
+  acl="$(docker exec "$c" cat /run/jm-redis/users.acl 2>/dev/null)" || { echo unreadable; return 0; }
+  [ -n "$acl" ] || { echo unreadable; return 0; }
+  if printf '%s\n' "$acl" | jm_redis_acl_text_replay_safe; then echo fixed; else echo old; fi
+}
+
+jm_redis_compact_if_old_acl() { # project, ack backup (0|1)
+  local state c
+  state="$(jm_redis_running_acl_state "$1")" || return 1
+  case "$state" in
+    fixed)
+      jm_redis_compact_log "the running Redis loaded an ACL that replays transactions; no AOF rewrite needed"
+      return 0 ;;
+    down) return 3 ;;
+    old)
+      [ "${2:-0}" = 1 ] || return 4
+      jm_redis_compact_log "the running Redis still has the 0.5.0 'user default ... -@all' line: rewriting its AOF now, without a restart" ;;
+    unreadable)
+      jm_redis_compact_log "the running Redis has no readable /run/jm-redis/users.acl: rewriting its AOF now, without a restart" ;;
+  esac
+  c="$(jm_redis_find "$1")" || return 1
   jm_redis_compact_container "$c"
 }
 
-jm_redis_before_restart() { # project, acl file (may be empty), allow replay (0|1)
-  local project="$1" acl="$2" allow="${3:-0}" rc
+jm_redis_before_restart() { # project, acl file (may be empty), allow replay (0|1), on fail (refuse|warn)
+  local project="$1" acl="$2" allow="${3:-0}" on_fail="${4:-refuse}" rc
   jm_redis_compact "$project" && return 0
   rc=$?
-  if [ "$rc" != 3 ]; then
-    jm_redis_compact_log "refusing to stop or recreate Redis: the AOF was not compacted. Nothing was stopped."
+  if [ "$rc" = 3 ]; then
+    jm_redis_compact_log "Redis of project $project is not running, so its AOF was not rewritten. Its next start replays the whole AOF as it is."
+  elif [ "$on_fail" = warn ]; then
+    jm_redis_compact_log "WARNING: this AOF rewrite did not finish. Going on: a rewrite earlier in this run already removed every transaction an older start refused, so the start replays only writes made since."
+  else
+    jm_redis_compact_log "refusing to stop or recreate Redis: its AOF rewrite did not finish"
     return 1
   fi
-  jm_redis_compact_log "Redis of project $project is not running, so its AOF was not compacted. Its next start replays the whole AOF, including any transactions an earlier start refused."
   [ -n "$acl" ] || return 0
   jm_redis_acl_replay_safe "$acl" && return 0
   if [ "$allow" = 1 ]; then
