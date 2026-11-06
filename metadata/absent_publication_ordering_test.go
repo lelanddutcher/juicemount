@@ -278,3 +278,57 @@ func TestAbsentPublicationMissingRowKeepsPublishedPrefixAndUnlocks(t *testing.T)
 		t.Fatalf("locks not reusable or tail not committed: %+v", tail)
 	}
 }
+
+// A chunk is published to the serving caches as one unit. Between two rows'
+// committed-row SELECTs no reader may see the first row in the cache while
+// the second is still missing: a READDIR there would list a partial directory.
+func TestAbsentPublicationChunkBecomesVisibleAtOnce(t *testing.T) {
+	t.Setenv("JM_FTS_DEFER", "0")
+	t.Setenv("JM_SERVE_FROM_SQLITE", "0")
+	s := newTestStore(t)
+	stamp := time.Unix(1700000000, 0)
+	if err := s.BulkInsert([]*Entry{
+		MakeEntry("d", true, 0, stamp, 10),
+		MakeEntry("d/a.mov", false, 1, stamp, 100),
+		MakeEntry("d/b.mov", false, 2, stamp, 101),
+	}, 500); err != nil {
+		t.Fatal(err)
+	}
+	s.DeleteFromCache("d/a.mov")
+	s.DeleteFromCache("d/b.mov")
+	selects := 0
+	var observed []string
+	s.absentBeforeSelectHook = func() {
+		selects++
+		if selects != 2 {
+			return
+		}
+		// A concurrent reader at this point, between the two SELECTs.
+		children, err := s.listChildrenRAM("d")
+		if err != nil {
+			t.Errorf("list between SELECTs: %v", err)
+		}
+		for _, c := range children {
+			observed = append(observed, c.Path)
+		}
+		if s.lookupByPathRAM("d/a.mov") != nil {
+			observed = append(observed, "lookup:d/a.mov")
+		}
+	}
+	if err := s.publishAbsentEntries([]*Entry{
+		MakeEntry("d/a.mov", false, 1, stamp, 100),
+		MakeEntry("d/b.mov", false, 2, stamp, 101),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if selects != 2 {
+		t.Fatalf("committed-row SELECTs = %d, want 2", selects)
+	}
+	if len(observed) != 0 {
+		t.Fatalf("reader saw a partially published chunk: %v", observed)
+	}
+	children, err := s.listChildrenRAM("d")
+	if err != nil || len(children) != 2 || s.lookupByPathRAM("d/a.mov") == nil || s.lookupByPathRAM("d/b.mov") == nil {
+		t.Fatalf("chunk not fully published: children=%+v err=%v", children, err)
+	}
+}

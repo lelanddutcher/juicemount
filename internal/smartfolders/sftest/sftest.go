@@ -53,6 +53,11 @@ type opLog struct {
 	afterSymlink func(p string) error
 	afterRemove  func(p string) error
 	afterMkdir   func(p string) error
+	beforeRmdir  func(p string)
+	// refusePlace / refuseRmdir, when they return an error, refuse the
+	// operation without it reaching the volume (a policy refusal).
+	refusePlace func(from, to string) error
+	refuseRmdir func(p string) error
 	// lostMkdirReply makes Mkdir succeed on the volume but report an error,
 	// as when the reply is lost.
 	lostMkdirReply bool
@@ -88,6 +93,11 @@ func (o *opLog) Place(tmp, p string) error {
 	if o.beforePlace != nil {
 		o.beforePlace(tmp, p)
 	}
+	if o.refusePlace != nil {
+		if err := o.refusePlace(tmp, p); err != nil {
+			return err
+		}
+	}
 	err := o.FS.Place(tmp, p)
 	if err == nil && o.afterPlace != nil {
 		if e := o.afterPlace(tmp, p); e != nil {
@@ -109,6 +119,31 @@ func (o *opLog) Swap(tmp, p string) error {
 		}
 	}
 	return err
+}
+
+// RemoveIno forwards to the backend's inode-checked unlink when it has one.
+func (o *opLog) RemoveIno(p string, ino uint64) error {
+	*o.events = append(*o.events, "remove "+p)
+	if o.beforeRemove != nil {
+		o.beforeRemove(p)
+	}
+	if ir, ok := o.FS.(smartfolders.InodeRemover); ok {
+		return ir.RemoveIno(p, ino)
+	}
+	return o.FS.Remove(p)
+}
+
+func (o *opLog) Rmdir(p string) error {
+	*o.events = append(*o.events, "rmdir "+p)
+	if o.beforeRmdir != nil {
+		o.beforeRmdir(p)
+	}
+	if o.refuseRmdir != nil {
+		if err := o.refuseRmdir(p); err != nil {
+			return err
+		}
+	}
+	return o.FS.Rmdir(p)
 }
 
 func (o *opLog) Chmod(p string, ino uint64, perm fs.FileMode) error {
@@ -144,12 +179,15 @@ type rig struct {
 	failGate error
 }
 
-func newRig(t *testing.T, fx Fixture) *rig {
+func newRig(t *testing.T, fx Fixture) *rig { return newRigAt(t, fx, "Recents") }
+
+// newRigAt is newRig for another smart-folder root.
+func newRigAt(t *testing.T, fx Fixture, root string) *rig {
 	g := &rig{fx: fx}
 	g.log = &opLog{FS: fx.FS(), events: &g.events}
 	g.rec = &smartfolders.Reconciler{
 		FS:   g.log,
-		Root: "Recents",
+		Root: root,
 		Own:  &smartfolders.Ownership{},
 		Persist: func() error {
 			b, err := json.Marshal(g.rec.Own)
@@ -281,6 +319,9 @@ func Run(t *testing.T, newFixture func(t *testing.T) Fixture) {
 		"SymlinkedParentsNeverWritten":        testSymlinkedParents,
 	}
 	for k, v := range reviewTests {
+		tests[k] = v
+	}
+	for k, v := range viewTests {
 		tests[k] = v
 	}
 	names := make([]string, 0, len(tests))
@@ -872,7 +913,8 @@ func (g *rig) runCrashing(t *testing.T, want ...smartfolders.Link) {
 // are the last ones persisted (decoded from JSON, as the Manager loads them).
 func (g *rig) restart(t *testing.T) *rig {
 	t.Helper()
-	n := newRig(t, g.fx)
+	n := newRigAt(t, g.fx, g.rec.Root)
+	n.rec.Exclude = g.rec.Exclude
 	if len(g.persists) > 0 {
 		own := &smartfolders.Ownership{}
 		if err := json.Unmarshal([]byte(g.persists[len(g.persists)-1]), own); err != nil {

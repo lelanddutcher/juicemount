@@ -545,7 +545,10 @@ func (s *Store) pruneLadderGCWorker() {
 // must not be used by the reconciler after activation. Upserts and deletes
 // (paths pruned or reappeared) are chunked at pruneLadderTxChunk rows
 // per transaction, each chunk its own writeMu acquisition, so even the 120k
-// initial diff never holds the store's write lock long.
+// initial diff never holds the store's write lock long. Rows go in path
+// order, as the staged writer's do: map order scatters each chunk across the
+// whole primary-key index, so every commit rewrote most of its pages (3x the
+// WAL writes for the 120k initial diff).
 //
 // Chunk-failure semantics: a failed chunk leaves earlier chunks committed and
 // returns the error; the caller (persistPruneLadderDiff) then does NOT update
@@ -568,6 +571,7 @@ func (s *Store) PersistPruneLadderDelta(upserts map[string]int, deletes []string
 		for p, c := range upserts {
 			rows = append(rows, ladderRow{path: p, count: c})
 		}
+		sort.Slice(rows, func(i, j int) bool { return rows[i].path < rows[j].path })
 		for start := 0; start < len(rows); start += pruneLadderTxChunk {
 			end := min(start+pruneLadderTxChunk, len(rows))
 			chunk := rows[start:end]
@@ -605,6 +609,8 @@ func (s *Store) PersistPruneLadderDelta(upserts map[string]int, deletes []string
 		}
 	}
 
+	deletes = append([]string(nil), deletes...)
+	sort.Strings(deletes)
 	for start := 0; start < len(deletes); start += pruneLadderTxChunk {
 		end := min(start+pruneLadderTxChunk, len(deletes))
 		chunk := deletes[start:end]

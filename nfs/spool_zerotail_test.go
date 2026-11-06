@@ -382,7 +382,7 @@ func TestZeroTailFlaggedEntryStillDrains(t *testing.T) {
 		t.Fatalf("precondition failed: entry not flagged")
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), drainPassDeadline)
 	defer cancel()
 	if n := d.DrainOnceForTest(ctx); n != 1 {
 		t.Fatalf("expected 1 row drained, got %d", n)

@@ -21,6 +21,9 @@ var (
 	ErrTooManyViews = errors.New("smart-folder view limit reached")
 	// ErrBadView: the folder name cannot be a view.
 	ErrBadView = errors.New("invalid smart-folder view")
+	// ErrViewInUse: RemoveView left the view because it holds an entry
+	// the Manager did not create (a user's file). It is retried later.
+	ErrViewInUse = errors.New("view holds entries the Manager did not create")
 
 	// Per-link refusals (Result.Refused).
 	ErrBadName          = errors.New("invalid link name")
@@ -48,7 +51,17 @@ const OwnedDirPerm fs.FileMode = 0o705
 type Ownership struct {
 	Root  *OwnedDir             `json:"root,omitempty"`
 	Views map[string]*OwnedView `json:"views,omitempty"` // by top-level folder name
+	// Lost names hidden paths a view had been moved aside to (RemoveView)
+	// when its root was removed, renamed or replaced: the view directory
+	// may still be there, under the old root. Kept (at most maxLost; the
+	// rest only counted in LostOverflow) so they are reported; the caller
+	// clears them (nothing in the volume is changed for them).
+	Lost         []string `json:"lost,omitempty"`
+	LostOverflow int      `json:"lost_overflow,omitempty"`
 }
+
+// maxLost bounds Ownership.Lost.
+const maxLost = 64
 
 // OwnedDir is a directory the Manager created, identified by inode. JuiceFS
 // allocates inode numbers from a counter and never reuses one, so a
@@ -63,6 +76,10 @@ type OwnedView struct {
 	OwnedDir
 	Links map[string]*OwnedLink `json:"links,omitempty"` // by link name
 	Temps map[string]*OwnedTemp `json:"temps,omitempty"` // by temp name
+	// RemoveAs is the random hidden name in the root an older Manager's
+	// RemoveView moved the (empty) view to before removing it there; set
+	// while that ran. Only read (settled) now; never written.
+	RemoveAs string `json:"remove_as,omitempty"`
 }
 
 // OwnedLink is one symlink the Manager created and placed.
@@ -107,6 +124,7 @@ func (f Refusal) TargetGone() bool {
 type Result struct {
 	CreatedRoot bool
 	CreatedView bool
+	RemovedView bool // RemoveView removed the view directory
 	Created     []string
 	Retargeted  []string
 	Removed     []string
@@ -119,7 +137,7 @@ type Result struct {
 
 // Changed reports whether the volume was modified.
 func (r Result) Changed() bool {
-	return r.CreatedRoot || r.CreatedView || len(r.Created)+len(r.Retargeted)+len(r.Removed) > 0
+	return r.CreatedRoot || r.CreatedView || r.RemovedView || len(r.Created)+len(r.Retargeted)+len(r.Removed) > 0
 }
 
 // Reconciler keeps views of relative symlinks in a volume. It is not safe
@@ -138,6 +156,10 @@ type Reconciler struct {
 	Gate func(view string) (release func(), err error)
 	// MaxViews bounds the number of view directories (0 = unbounded).
 	MaxViews int
+	// Exclude names other top-level folders no link may point into: the
+	// other smart-folder roots, so one kind of view never links into
+	// another.
+	Exclude []string
 
 	rootPerm fs.FileMode // mode of the owned root, from the last CheckRoot
 	release  []func()    // gate releases held by the running Reconcile
@@ -257,12 +279,31 @@ func droppedTemps(view string, ov *OwnedView) *DroppedTempsError {
 	return &DroppedTempsError{Names: names}
 }
 
+// droppedRemoval names the hidden name a view was being removed under.
+func (r *Reconciler) droppedRemoval(ov *OwnedView) []string {
+	if ov == nil || ov.RemoveAs == "" {
+		return nil
+	}
+	return []string{r.Root + "/" + ov.RemoveAs}
+}
+
 // dropAll forgets the root and every view, reporting their temp names.
 func (r *Reconciler) dropAll() error {
 	var names []string
 	for _, folder := range sortedKeys(r.Own.Views) {
 		if d := droppedTemps(r.Root+"/"+folder, r.Own.Views[folder]); d != nil {
 			names = append(names, d.Names...)
+		}
+		removal := r.droppedRemoval(r.Own.Views[folder])
+		names = append(names, removal...)
+		for _, p := range removal {
+			switch {
+			case slices.Contains(r.Own.Lost, p):
+			case len(r.Own.Lost) < maxLost:
+				r.Own.Lost = append(r.Own.Lost, p)
+			default:
+				r.Own.LostOverflow++
+			}
 		}
 	}
 	r.Own.Root, r.Own.Views = nil, map[string]*OwnedView{}
@@ -332,7 +373,8 @@ func (r *Reconciler) PreviousNames(folder string) map[string]string {
 //     name; a link no longer wanted is moved aside to a recorded temp name
 //     and only unlinked there if it is the Manager's; an unchanged one is
 //     left alone (same inode);
-//   - an emptied view stays, empty: the Manager never removes a directory;
+//   - an emptied view stays, empty: Reconcile never removes a directory
+//     (RemoveView does, once the view is wanted no more);
 //   - anything the Manager did not create is never modified or removed:
 //     an existing root or view it did not create is ErrNotManaged, a
 //     recorded name now holding something else is dropped from the records
@@ -386,6 +428,23 @@ func (r *Reconciler) Reconcile(folder string, want []Link) (Result, error) {
 		fixPerm = append(fixPerm, r.Root)
 	}
 	ov := r.Own.Views[folder]
+	if ov != nil && ov.RemoveAs != "" && rootState == RootOwned {
+		// An interrupted RemoveView: settle it before looking at the name.
+		release, err := r.gateView(view)
+		if err != nil {
+			return res, errors.Join(append(errs, err)...)
+		}
+		removed, err := r.settleRemoval(folder, ov)
+		release()
+		res.RemovedView = removed
+		if err != nil {
+			return res, errors.Join(append(errs, err, r.persist())...)
+		}
+		if err := r.persist(); err != nil {
+			return res, err
+		}
+		ov = r.Own.Views[folder]
+	}
 	viewExists := false
 	if rootState == RootOwned {
 		info, err := r.FS.Lstat(view)
@@ -853,7 +912,7 @@ func (r *Reconciler) checkTarget(target string) error {
 	if !ok || strings.HasPrefix(target, "/") || len(parts) < 2 {
 		return fmt.Errorf("%w: %q", ErrTargetForbidden, target)
 	}
-	if parts[0] == r.Root || reservedTopLevel[parts[0]] {
+	if parts[0] == r.Root || reservedTopLevel[parts[0]] || slices.Contains(r.Exclude, parts[0]) {
 		return fmt.Errorf("%w: %q", ErrTargetForbidden, target)
 	}
 	for _, c := range parts {
@@ -873,6 +932,206 @@ func (r *Reconciler) checkTarget(target string) error {
 		return fmt.Errorf("%w: %q", ErrTargetNotRegular, target)
 	}
 	return nil
+}
+
+// RemoveView removes the view <Root>/<folder>: its links first (exactly as
+// Reconcile with no wanted links), then the directory itself, once it is
+// empty. A view that still holds an entry the Manager did not create (a
+// user's file) is left as it is, with its record, and ErrViewInUse is
+// returned; the caller retries later. A view that does not exist is
+// forgotten.
+//
+// The directory is removed directly, by name, with the trash bypassed:
+// the one removal of a project root the RESP proxy lets the Manager make,
+// and only for an empty view it saw the Manager create directly in a
+// smart root. A refusal (EROFS from an older proxy, or for a view made
+// before the proxy kept that record) leaves the view as it is and is
+// returned. Right before the rmdir the name is checked to still be the
+// recorded directory (same inode), so a folder recreated under that name
+// is not removed; through the proxy, which only removes recorded views,
+// that holds without a window. Rmdir refuses a directory that is not
+// empty, so a user's entry put in at the last moment is never removed
+// either (ErrViewInUse). The only entry that may go with the view is a
+// lone regular ".DS_Store" (the Finder's), unlinked only if it is still the
+// file that was checked.
+//
+// Nothing is recorded first: a removal interrupted after the rmdir leaves
+// a record of a view that no longer exists, which Reconcile drops. Records
+// of an interrupted removal by an older Manager (OwnedView.RemoveAs, a view
+// moved aside to a hidden name) are settled by Reconcile, called first;
+// none are written any more.
+func (r *Reconciler) RemoveView(folder string) (Result, error) {
+	res, err := r.Reconcile(folder, nil)
+	if err != nil {
+		return res, err
+	}
+	ov := r.Own.Views[folder]
+	if ov == nil {
+		return res, nil
+	}
+	view := r.Root + "/" + folder
+	if ov.Pending || len(ov.Links)+len(ov.Temps) > 0 || ov.RemoveAs != "" {
+		return res, fmt.Errorf("%s: %w", view, ErrViewInUse)
+	}
+	names, err := r.FS.List(view, 2)
+	if err != nil {
+		return res, err
+	}
+	finder, finderIno := r.onlyFinderFile(view, names)
+	if len(names) > 0 && !finder {
+		return res, fmt.Errorf("%s: %w", view, ErrViewInUse)
+	}
+	release, err := r.gateView(view)
+	if err != nil {
+		return res, err
+	}
+	defer release()
+	info, err := r.FS.Lstat(view)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		delete(r.Own.Views, folder)
+		return res, r.persist()
+	case err != nil:
+		return res, err
+	case info.Type != TypeDir || info.Ino != ov.Ino:
+		// Replaced since it was checked: someone else's, never removed.
+		delete(r.Own.Views, folder)
+		return res, errors.Join(fmt.Errorf("%s: %w", view, ErrNotManaged), r.persist())
+	}
+	if finder {
+		// Refused (replaced since it was looked at): Rmdir then finds the
+		// view not empty.
+		_ = r.removeFinderFile(view, finderIno)
+	}
+	switch err := r.FS.Rmdir(view); {
+	case err == nil || errors.Is(err, fs.ErrNotExist):
+		delete(r.Own.Views, folder)
+		res.RemovedView = true
+		return res, r.persist()
+	case errors.Is(err, syscall.ENOTEMPTY):
+		return res, fmt.Errorf("%s: %w", view, ErrViewInUse)
+	default:
+		return res, fmt.Errorf("removing %s: %w", view, err)
+	}
+}
+
+// StuckError: an entry the reconciler moved to a hidden name could not go
+// back to its name. It stays recorded under Hidden.
+type StuckError struct {
+	Hidden string // "<Root>/<hidden name>"
+	Name   string // where it belongs
+	Err    error
+}
+
+func (e *StuckError) Error() string {
+	return fmt.Sprintf("an entry is under the hidden name %s (it belongs at %s) and cannot go back: %v", e.Hidden, e.Name, e.Err)
+}
+
+func (e *StuckError) Unwrap() error { return e.Err }
+
+// finderFile is the one entry RemoveView removes with a view: the Finder's
+// own view settings, written into any folder a Finder window opens (and
+// written again when it is needed). Nothing else is ever removed: not
+// AppleDouble "._" files, not other dot-names.
+const finderFile = ".DS_Store"
+
+// onlyFinderFile reports whether the names (a listing of up to two
+// entries) leave the view empty but for a regular finderFile, and its inode.
+func (r *Reconciler) onlyFinderFile(dir string, names []string) (bool, uint64) {
+	if len(names) != 1 || names[0] != finderFile {
+		return false, 0
+	}
+	info, err := r.FS.Lstat(dir + "/" + finderFile)
+	return err == nil && info.Type == TypeRegular, info.Ino
+}
+
+// InodeRemover is implemented by an FS that can unlink a name only while
+// it is still the given inode (checked through the open parent directory).
+type InodeRemover interface {
+	RemoveIno(p string, ino uint64) error
+}
+
+// removeFinderFile unlinks dir's finderFile, only if it is still the file
+// with inode ino where the FS can check that.
+func (r *Reconciler) removeFinderFile(dir string, ino uint64) error {
+	if ir, ok := r.FS.(InodeRemover); ok {
+		return ir.RemoveIno(dir+"/"+finderFile, ino)
+	}
+	return r.FS.Remove(dir + "/" + finderFile)
+}
+
+// gateView runs the gate for one view; the release is never nil.
+func (r *Reconciler) gateView(view string) (func(), error) {
+	if r.Gate == nil {
+		return func() {}, nil
+	}
+	release, err := r.Gate(view)
+	if err != nil {
+		return nil, err
+	}
+	if release == nil {
+		release = func() {}
+	}
+	return release, nil
+}
+
+// settleRemoval finishes or undoes a RemoveView from what is under the
+// hidden name and the view name, reporting whether it removed the view. The
+// record is dropped only once the Manager's directory is gone; it keeps
+// RemoveAs while anything is left under the hidden name that could not go
+// back.
+func (r *Reconciler) settleRemoval(folder string, ov *OwnedView) (bool, error) {
+	view, tp := r.Root+"/"+folder, r.Root+"/"+ov.RemoveAs
+	info, err := r.FS.Lstat(tp)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		// Nothing there: the move never happened, or the directory was
+		// already removed. Whatever is at the view name is settled as usual.
+		ov.RemoveAs = ""
+		if _, err := r.FS.Lstat(view); errors.Is(err, fs.ErrNotExist) {
+			delete(r.Own.Views, folder)
+		}
+		return false, nil
+	case err != nil:
+		return false, err
+	case info.Type == TypeDir && ov.Ino != 0 && info.Ino == ov.Ino:
+		// The Finder's settings file goes with the view; anything else
+		// keeps it (Rmdir refuses).
+		if names, err := r.FS.List(tp, 2); err == nil {
+			if only, ino := r.onlyFinderFile(tp, names); only {
+				// Refused (replaced since it was looked at): Rmdir then
+				// finds the view not empty and it goes back.
+				_ = r.removeFinderFile(tp, ino)
+			}
+		}
+		err := r.FS.Rmdir(tp)
+		if err == nil || errors.Is(err, fs.ErrNotExist) {
+			delete(r.Own.Views, folder)
+			return true, nil
+		}
+		// Someone put an entry inside, or the removal was refused: the
+		// view goes back to its name and stays. (If the rmdir did happen
+		// and only its reply was lost, nothing is left to move back.)
+		if perr := r.FS.Place(tp, view); perr != nil {
+			if _, lerr := r.FS.Lstat(tp); errors.Is(lerr, fs.ErrNotExist) {
+				delete(r.Own.Views, folder)
+				return true, nil
+			}
+			return false, &StuckError{Hidden: tp, Name: view, Err: perr}
+		}
+		ov.RemoveAs = ""
+		if errors.Is(err, syscall.ENOTEMPTY) {
+			return false, nil
+		}
+		return false, fmt.Errorf("removing %s: %w", view, err)
+	}
+	// The view holding a user's entry, or (after a race) an entry the
+	// Manager did not create: back to the view name, never replacing.
+	if err := r.FS.Place(tp, view); err != nil {
+		return false, &StuckError{Hidden: tp, Name: view, Err: err}
+	}
+	ov.RemoveAs = ""
+	return false, nil
 }
 
 // relTarget is the symlink text for a link `depth` directories below the

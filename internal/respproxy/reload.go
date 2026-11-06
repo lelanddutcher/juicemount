@@ -11,6 +11,10 @@ import (
 	"time"
 )
 
+// HeartbeatFormatToken prefixes the principals file version in
+// reload.heartbeat.
+const HeartbeatFormatToken = "principals-format="
+
 // PrincipalReloader publishes an applied receipt only for a request whose
 // exact principals-file bytes were validated and installed by this process.
 // The caller owns Tick serialization and invokes the constructor only after
@@ -41,7 +45,11 @@ func NewPrincipalReloader(principalsPath string, auth *Authenticator) (*Principa
 // the captured line. Heartbeat is refreshed even when validation fails.
 func (r *PrincipalReloader) Tick() (err error) {
 	defer func() {
-		heartbeat := []byte(strconv.FormatInt(time.Now().Unix(), 10) + "\n")
+		// "<unix seconds> principals-format=<n>": the Manager reads the
+		// token to learn which principals file versions this proxy reads
+		// (it writes version 2 only while a fresh heartbeat names it). A
+		// proxy built before version 2 writes the time alone.
+		heartbeat := []byte(strconv.FormatInt(time.Now().Unix(), 10) + " " + HeartbeatFormatToken + strconv.Itoa(PrincipalsFormat) + "\n")
 		if e := writeReloadFile(filepath.Join(r.dir, "reload.heartbeat"), heartbeat); e != nil {
 			err = errors.Join(err, fmt.Errorf("refresh reload heartbeat: %w", e))
 		}

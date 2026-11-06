@@ -13,7 +13,7 @@
 
 > An open-source, self-hosted macOS client for media stored in JuiceFS.
 
-> **Status:** beta, macOS-only, self-hosted. Version 0.5.0 is the general release, with open Finder, offline, and multi-Mac acceptance work described in the [release notes](docs/release-0.5.md).
+> **Status:** beta, macOS-only, self-hosted. Version 0.5.1 is the current release, with open Finder, offline, and multi-Mac acceptance work described in the [release notes](docs/release-0.5.md).
 
 ---
 
@@ -98,7 +98,7 @@ brew install --cask macfuse           # approve the system extension if macOS as
 
 Then get the app:
 
-**Download.** Get 0.5.0 from [Releases](https://github.com/lelanddutcher/juicemount/releases/latest) and follow the [install and upgrade notes](docs/release-0.5.md). Unzip `JuiceMount.zip` and move `JuiceMount.app` to `/Applications`. Update checks run only when you choose **Check for Updates…** in the app.
+**Download.** Get 0.5.1 from [Releases](https://github.com/lelanddutcher/juicemount/releases/latest) and follow the [install and upgrade notes](docs/release-0.5.md). Unzip `JuiceMount.zip` and move `JuiceMount.app` to `/Applications`. Update checks run only when you choose **Check for Updates…** in the app.
 
 **Or build from source** (Intel builds are unverified):
 
@@ -109,7 +109,7 @@ cd juicemount
 ./scripts/install.sh                  # → /Applications; --launchd is optional
 ```
 
-A locally built app may launch without download quarantine, but an ad-hoc signed build cannot Start a mount: the eject helper requires a JuiceMount Developer ID signature and must be enabled. The install script replaces the app bundle and can quit a running copy, so [check pending uploads and Stop/Quit safely](docs/release-0.5.md#upgrading-an-existing-install) before using it for an upgrade. See [signing and notarization](docs/signing.md) for distribution requirements.
+A locally built app may launch without download quarantine, but an ad-hoc signed build cannot Start a mount: the eject helper requires a JuiceMount Developer ID signature and must be enabled. The install script requires a JuiceMount Developer ID signed bundle and refuses installation while the GUI or serving processes are running. [Check pending uploads and Stop/Quit safely](docs/release-0.5.md#upgrading-an-existing-install) first. It verifies a staged copy, retains the previous bundle and preserves failed staging artifacts; it never quits or kills processes. Use `--source /absolute/JuiceMount.app` for an existing signed release, or `--destination /absolute/Test.app` for a disposable install; `--launchd` is limited to `/Applications/JuiceMount.app`. See [signing and notarization](docs/signing.md) for distribution requirements.
 
 On first launch the **Setup Assistant** opens automatically: it checks the bundled JuiceFS engine, macFUSE, and backend reachability, and walks you through pointing the app at your box (also reachable later via menu-bar icon → Setup Assistant…, or **Preferences → Connection**):
 

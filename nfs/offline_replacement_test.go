@@ -27,6 +27,7 @@ const replacementOriginalSize = int64(cache.ChunkSize + 12)
 // backing stays small: graph preparation transfers metadata, not 64 MiB.
 func newOfflineReplacementFixture(t *testing.T, prepareSecondChunk bool) (*boundCacheFixture, *SpoolStore, string) {
 	t.Helper()
+	useSpoolFixtureMutationBound(t)
 	x := newBoundCacheFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

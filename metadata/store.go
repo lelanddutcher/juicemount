@@ -245,9 +245,11 @@ type Store struct {
 	deletePathsAfterCommitHook  func()       // test-only synchronization point; nil in production
 	evictionAfterSelectHook     func()       // deterministic interleavings; nil in production
 	evictionAfterApplyChunkHook func()       // called without serving locks; nil in production
+	absentBeforeSelectHook      func()       // before each absent-publication SELECT, without mu; nil in production
 	inodeCache                  map[uint64]*Entry
 	pathCache                   map[string]*Entry
 	preparedCreates             map[string]PreparedCreate    // unresolved local CREATEs, guarded by mu
+	exclusive                   exclusiveCreates             // EXCLUSIVE CREATE verifiers (exclusive_create.go)
 	cacheGeneration             uint64                       // cache-only publications, guarded by mu
 	childrenIdx                 map[string]map[string]*Entry // parentPath → {path → *Entry}
 	// dirVisibilityMtime is an in-memory NFS cache-invalidation generation for
@@ -970,6 +972,10 @@ func OpenWithMaxCacheSize(dbPath string, maxCacheSize int) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("create prepared create schema: %w", err)
 	}
+	if _, err := db.Exec(exclusiveCreateSchema); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("create exclusive create schema: %w", err)
+	}
 	if pending, err := inspectPreparedCreates(db); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("inspect prepared creates at open: %w", err)
@@ -1021,6 +1027,10 @@ func OpenWithMaxCacheSize(dbPath string, maxCacheSize int) (*Store, error) {
 	if _, err := db.Exec(pruneLadderSchema); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("create prune ladder schema: %w", err)
+	}
+	if _, err := db.Exec(dirListingSchema); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("create dir listing schema: %w", err)
 	}
 
 	// Drop legacy triggers (FTS is maintained manually for performance)
@@ -1168,6 +1178,10 @@ func OpenWithMaxCacheSize(dbPath string, maxCacheSize int) (*Store, error) {
 	s.pruneLadderGCWake = make(chan struct{}, 1)
 	go s.pruneLadderGCWorker()
 	s.wakePruneLadderGC()
+	if err := s.loadExclusiveCreates(); err != nil {
+		_ = s.Close()
+		return nil, fmt.Errorf("load exclusive creates: %w", err)
+	}
 
 	keepFileLock = true
 	return s, nil
@@ -1260,6 +1274,7 @@ func (s *Store) Close() error {
 		s.shadowSweep = nil
 	}
 	s.mu.Unlock()
+	s.stopExclusiveCreates()
 	if err := s.db.Close(); err != nil {
 		return err
 	}
@@ -2303,11 +2318,16 @@ func (s *Store) publishAbsentEntries(entries []*Entry) error {
 }
 
 // publishAbsentChunk fences one bounded interval against cache-only namespace
-// successors. It never holds mu over the committed-row SELECT, so unrelated
-// cached readers continue while SQLite waits. The caller owns writeMu.
+// successors. It never holds mu over the committed-row SELECTs, so unrelated
+// cached readers continue while SQLite waits: every row is looked up first,
+// then the whole chunk is published under one mu hold, so a reader sees all
+// of the chunk's rows or none of them (a READDIR never lists a half-published
+// interval). The caller owns writeMu. Lock order is unchanged:
+// writeMu -> cachePublicationMu -> mu.
 func (s *Store) publishAbsentChunk(entries []*Entry) error {
 	s.cachePublicationMu.Lock()
 	defer s.cachePublicationMu.Unlock()
+	committed := make([]*Entry, 0, len(entries))
 	for _, input := range entries {
 		// A cached winner skips SQL entirely, even if the durable row has since
 		// disappeared. This is the original fresh-wins admission check.
@@ -2317,27 +2337,49 @@ func (s *Store) publishAbsentChunk(entries []*Entry) error {
 		if present {
 			continue
 		}
+		if s.absentBeforeSelectHook != nil {
+			s.absentBeforeSelectHook()
+		}
 		// Read the actual committed row and its version, never the warmer's
 		// potentially stale input. writeMu and the publication gate keep it
 		// stable until the final cache checks and publication below.
 		e, err := scanEntry(s.db.QueryRow(`SELECT `+serveColumns+` FROM entries WHERE path=?`, input.Path))
 		if err != nil {
+			// The rows already read are still committed winners: publish
+			// them together, and nothing from the failed row on.
+			s.publishAbsentRows(committed)
 			return err
 		}
-		s.mu.Lock()
-		if _, present := s.pathCache[e.Path]; !present {
-			if _, taken := s.inodeCache[e.Inode]; !taken {
-				// Do not displace an inode's fresher cached owner (rename race).
-				s.subtreeUpsertLocked(nil, e)
-				s.inodeCache[e.Inode] = e
-				s.markCachePublicationLocked(e)
-				s.pathCache[e.Path] = e
-				s.addToChildrenIdx(e)
-			}
-		}
-		s.mu.Unlock()
+		committed = append(committed, e)
 	}
+	s.publishAbsentRows(committed)
 	return nil
+}
+
+// publishAbsentRows publishes committed rows under one mu hold. The caller
+// holds writeMu and cachePublicationMu.
+func (s *Store) publishAbsentRows(committed []*Entry) {
+	if len(committed) == 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, e := range committed {
+		// Re-check under mu: a mu-only cache writer may have filled the path
+		// since the lookup, and an earlier row of this chunk may own the path
+		// or inode already.
+		if _, present := s.pathCache[e.Path]; present {
+			continue
+		}
+		if _, taken := s.inodeCache[e.Inode]; taken {
+			continue // do not displace an inode's fresher cached owner (rename race)
+		}
+		s.subtreeUpsertLocked(nil, e)
+		s.inodeCache[e.Inode] = e
+		s.markCachePublicationLocked(e)
+		s.pathCache[e.Path] = e
+		s.addToChildrenIdx(e)
+	}
 }
 
 // ftsExternalInsertAbsent is the insert-if-absent sibling of

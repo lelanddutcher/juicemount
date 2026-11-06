@@ -50,6 +50,10 @@ type LeaseConfig struct {
 	FenceHoldMax time.Duration
 	NoScan       bool // skip the background scan (tests of the miss path)
 	FileCache    int  // file -> parent cache entries; default 1M
+	// SmartRoots names the Manager's smart-folder roots in the volume root
+	// (smartview.go): the manager principal may remove an empty view
+	// directory it created directly under one it owns. Empty: none.
+	SmartRoots []string
 }
 
 // LeaseEngine implements Policy and LocalHandler.
@@ -59,6 +63,8 @@ type LeaseEngine struct {
 	anc *ancestry
 
 	topo sync.RWMutex
+
+	grants grantCache // person grant paths -> directories (grants.go)
 
 	mu       sync.Mutex
 	leases   map[uint64]*lease
@@ -73,6 +79,10 @@ type LeaseEngine struct {
 	logDropped atomic.Int64
 
 	boot bootstrapState
+
+	// smartViews mirrors SmartViewsKey (smartview.go).
+	smartMu    sync.Mutex
+	smartViews map[uint64]bool
 
 	stop      chan struct{}
 	wg        sync.WaitGroup
@@ -120,14 +130,15 @@ func NewLeaseEngine(cfg LeaseConfig) *LeaseEngine {
 		cfg.FileCache = 1 << 20
 	}
 	e := &LeaseEngine{
-		cfg:      cfg,
-		now:      cfg.Now,
-		leases:   map[uint64]*lease{},
-		fences:   map[uint64]*sync.RWMutex{},
-		denyLast: map[string]int64{},
-		lcfg:     defaultLeaseCfg(),
-		logCh:    make(chan logEntry, 4096),
-		stop:     make(chan struct{}),
+		cfg:        cfg,
+		now:        cfg.Now,
+		leases:     map[uint64]*lease{},
+		fences:     map[uint64]*sync.RWMutex{},
+		denyLast:   map[string]int64{},
+		lcfg:       defaultLeaseCfg(),
+		smartViews: map[uint64]bool{},
+		logCh:      make(chan logEntry, 4096),
+		stop:       make(chan struct{}),
 	}
 	e.anc = newAncestry(cfg.Side, cfg.VolumeDB, 2, cfg.FileCache)
 	e.boot.doneC = make(chan struct{})
@@ -153,6 +164,7 @@ func (e *LeaseEngine) Start() error {
 	if err := e.loadLeases(ms(start)); err != nil {
 		return fmt.Errorf("respproxy: load leases: %w", err)
 	}
+	e.loadSmartViews() // never fails the start
 	t0 := time.Now()
 	n, err := e.anc.bootstrapRoots()
 	if err != nil {
@@ -302,6 +314,12 @@ func (e *LeaseEngine) Decide(p Principal, u *Unit) Verdict {
 		}
 	}
 	var onTimeout func()
+	// rootTouch: the unit changes an entry above the project depth; once it
+	// committed (or may have), grant paths are looked up again.
+	rootTouch := false
+	// onCommit: the smart-folder view bookkeeping (smartview.go) of a unit
+	// admitted here, run only once Redis applied it.
+	var onCommit []func()
 	done := func(o Outcome) {
 		relMu.Lock()
 		defer relMu.Unlock()
@@ -330,6 +348,15 @@ func (e *LeaseEngine) Decide(p Principal, u *Unit) Verdict {
 			e.anc.forget(f) // outcome unknown: re-resolve from Redis
 		case o.Committed:
 			e.anc.learnCommitted(f)
+			for _, fn := range onCommit {
+				fn()
+			}
+		}
+		if timedOut || o.Lost || o.Committed {
+			e.forgetSmartViews(u, f) // applied, or may have been
+		}
+		if rootTouch && !timedOut && (o.Lost || o.Committed) {
+			e.grants.epoch.Add(1)
 		}
 		if hooks != nil && hooks.done != nil && !released {
 			hooks.done(p, u, o, epochs)
@@ -357,6 +384,9 @@ func (e *LeaseEngine) Decide(p Principal, u *Unit) Verdict {
 		e.queueLog(logEntry{"event", "fence_timeout", "actor", p.Name, "unit", summarizeUnit(u),
 			"ts_ms", strconv.FormatInt(ms(e.now()), 10)})
 		e.anc.forget(f) // outcome unknown: drop its edges, re-resolve from Redis
+		if rootTouch {
+			e.grants.epoch.Add(1)
+		}
 		timedOut = true
 		releaseLocked()
 	}
@@ -376,6 +406,7 @@ func (e *LeaseEngine) Decide(p Principal, u *Unit) Verdict {
 		return arm(Verdict{Done: done})
 	}
 	deny := func(d *Denial) Verdict {
+		onCommit = nil
 		for i := len(fences) - 1; i >= 0; i-- {
 			fences[i].RUnlock()
 		}
@@ -383,6 +414,14 @@ func (e *LeaseEngine) Decide(p Principal, u *Unit) Verdict {
 		e.nDeny.Add(1)
 		e.logDeny(p, d, u.Mode, u)
 		return arm(Verdict{Deny: d, Done: done})
+	}
+
+	// Person grants come first and hold in every mode, also for a unit the
+	// lease rules below would only log (grants.go).
+	if grantsApply(p, u) {
+		if d := e.grantCheck(p, u, f); d != nil {
+			return deny(d)
+		}
 	}
 
 	if len(f.unresolvable) > 0 {
@@ -446,7 +485,11 @@ func (e *LeaseEngine) Decide(p Principal, u *Unit) Verdict {
 	}
 
 	// Place the unit against the stored tree (txnunit.go).
-	locs, pd := e.placeUnit(u, f, bypass)
+	pm := placeStrict
+	if bypass {
+		pm = placeBypass
+	}
+	locs, pd := e.placeUnit(p, u, f, pm)
 	if pd != nil {
 		if pd.Reason == ReasonXProject && pd.Proj != 0 {
 			hd := e.leaseDenial(ReasonXProject, pd.Proj)
@@ -454,6 +497,10 @@ func (e *LeaseEngine) Decide(p Principal, u *Unit) Verdict {
 			pd = hd
 		}
 		return deny(pd)
+	}
+	rootTouch = e.touchesRoot(f)
+	if u.wantAudit {
+		u.audit = e.describe(f, locs)
 	}
 	projSet := map[uint64]bool{}
 	for _, l := range locs {
@@ -471,10 +518,20 @@ func (e *LeaseEngine) Decide(p Principal, u *Unit) Verdict {
 	}
 
 	// ns:root: creating a name is open; renaming or removing a directory
-	// there (a project root or a top-level folder) needs admin.
+	// there (a project root or a top-level folder) needs admin, except the
+	// Manager's removal of an empty smart-folder view (smartview.go).
 	if p.Kind != KindAdmin {
-		if d := e.rootEntryGate(f); d != nil {
+		d, removal := e.rootEntryGate(p, u, f)
+		if d != nil {
 			return deny(d)
+		}
+		if removal != nil {
+			onCommit = append(onCommit, removal)
+		}
+	}
+	if p.Kind == KindManager {
+		if created := e.smartViewCreation(p, u, f); created != nil {
+			onCommit = append(onCommit, created)
 		}
 	}
 
@@ -597,8 +654,12 @@ func (e *LeaseEngine) leaseDenial(r Reason, proj uint64) *Denial {
 }
 
 // rootEntryGate refuses renaming or removing a directory entry of a
-// directory above the project depth (plan founder default 5).
-func (e *LeaseEngine) rootEntryGate(f *unitFacts) *Denial {
+// directory above the project depth (plan founder default 5). The one
+// exception is the manager principal removing an empty smart-folder view
+// it created (smartViewRemoval); for that unit it also returns what to
+// run once the removal committed.
+func (e *LeaseEngine) rootEntryGate(p Principal, u *Unit, f *unitFacts) (*Denial, func()) {
+	var removed func()
 	for _, op := range f.dentries {
 		if op.trash {
 			continue
@@ -610,7 +671,7 @@ func (e *LeaseEngine) rootEntryGate(f *unitFacts) *Denial {
 		e.anc.sideReads.Add(1)
 		v, err := e.cfg.Side.Do(e.cfg.VolumeDB, []byte("HGET"), []byte("d"+strconv.FormatUint(op.dir, 10)), []byte(op.name))
 		if err != nil || v.Err() != nil {
-			return &Denial{Reason: ReasonUnknownKey, Detail: "cannot read root entry " + op.name}
+			return &Denial{Reason: ReasonUnknownKey, Detail: "cannot read root entry " + op.name}, nil
 		}
 		if v.Null {
 			continue // a new name: open to every writer
@@ -620,11 +681,19 @@ func (e *LeaseEngine) rootEntryGate(f *unitFacts) *Denial {
 		}
 		if op.del || !bytes.Equal(op.val, v.Str) {
 			proj, _ := entryInode(v.Str)
-			return &Denial{Reason: ReasonAdminOnly, Proj: proj,
-				Detail: "renaming or removing directory " + strconv.Quote(op.name) + " above the project depth needs admin"}
+			detail := "renaming or removing directory " + strconv.Quote(op.name) + " above the project depth needs admin"
+			if op.del && p.Kind == KindManager {
+				fn, why := e.smartViewRemoval(p, u, op, v.Str)
+				if why == "" {
+					removed = fn
+					continue
+				}
+				detail += " (not an empty smart-folder view of " + p.Name + "'s: " + why + ")"
+			}
+			return &Denial{Reason: ReasonAdminOnly, Proj: proj, Detail: detail}, nil
 		}
 	}
-	return nil
+	return nil, removed
 }
 
 // Stats is a snapshot of the engine's counters.

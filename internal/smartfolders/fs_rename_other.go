@@ -21,3 +21,7 @@ func renameAt(int, string, string, renameOp) error { return errors.ErrUnsupporte
 func dirHandleOp(int, string, uint64, fs.FileMode) (Info, error) {
 	return Info{}, errors.ErrUnsupported
 }
+
+func rmdirAt(int, string) error { return errors.ErrUnsupported }
+
+func unlinkIfIno(int, string, uint64) error { return errors.ErrUnsupported }

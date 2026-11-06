@@ -66,6 +66,7 @@ STAGE_DIR="$QA_STAGE/deepwide-$$"
 # and local staging, and we force the offline toggle back OFF in case a case
 # left it on (this category never goes offline, but the guard is cheap).
 _cleanup_03() {
+    [ "${QA_KEEP_DATA:-0}" = 1 ] && return 0
     # Never leave the mount stuck offline.
     qa_offline off >/dev/null 2>&1 || true
     # Remove our unique dest subtree (guard: must be under the battery root).
@@ -372,9 +373,9 @@ if [ "$C_PROBE_FAILS" -gt 0 ]; then
 elif [ "$C_NAV_SEEN" -eq 0 ]; then
     # Copy finished before any intermediate dir was observable — not a failure
     # of navigability, but we couldn't prove it. Warn (don't false-green).
-    qa_warn "[C] no intermediate dest dir was observable mid-copy (copy too fast); navigability unproven — consider raising QA_MIXED_DIRS/QA_MIXED_FPD"
+    if [ "${QA_STRICT_RELEASE:-0}" = 1 ]; then qa_fail "[C] no intermediate dest dir was observable mid-copy (copy too fast); navigability unproven — consider raising QA_MIXED_DIRS/QA_MIXED_FPD"; else qa_warn "[C] no intermediate dest dir was observable mid-copy (copy too fast); navigability unproven — consider raising QA_MIXED_DIRS/QA_MIXED_FPD"; fi
 elif [ "$C_P99" = "-1" ] || [ "$C_MAXMS" = "-1" ]; then
-    qa_warn "[C] mid-copy probes ran but recorded no valid timing"
+    if [ "${QA_STRICT_RELEASE:-0}" = 1 ]; then qa_fail "[C] mid-copy probes ran but recorded no valid timing"; else qa_warn "[C] mid-copy probes ran but recorded no valid timing"; fi
 elif [ "$C_MAXMS" -ge "$QA_HARD_STALL_MS" ]; then
     qa_fail "[C] mid-copy listing HARD STALL: worst ${C_MAXMS}ms (>=${QA_HARD_STALL_MS}ms) under $C_LEAF"
     _note_fail "mixed mid-copy hard stall ${C_MAXMS}ms ($C_LEAF)"

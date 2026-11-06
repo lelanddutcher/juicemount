@@ -195,6 +195,11 @@ type RunSyncSpec struct {
 // Emits ProgressEvent on `progress` each time juicefs writes a
 // recognized progress line. Blocks until juicefs exits or ctx cancels.
 func RunSync(ctx context.Context, juicefsBin string, spec RunSyncSpec, source, destination string, opts SyncOptions, extraEnv []string, progress chan<- ProgressEvent) error {
+	// Never into a smart-folder root (sync_smartroots.go), also for
+	// scheduled jobs that did not pass validateDirectionPair.
+	if err := checkSyncSmartRoots(os.Getenv, os.ReadDir, source, destination, spec.FUSEMount); err != nil {
+		return err
+	}
 	// H-8B: check out every target project before the first write. A
 	// project another principal holds refuses the whole job here, instead
 	// of the proxy refusing it file by file half way through.
@@ -927,7 +932,8 @@ func normalizeAnyURI(s string, fuseMount string, preserveStructure bool) string 
 // Path-traversal guards (filepath.Clean check against `..` segments)
 // are applied by the caller via the same logic that already protects
 // /api/migrate's destination — that's not in scope for this helper,
-// which only enforces *direction* shape.
+// which enforces *direction* shape, and for DirectionIn that nothing is
+// copied directly into a smart-folder root (checkSyncSmartRoots).
 func validateDirectionPair(dir Direction, src, dst string) error {
 	src = strings.TrimSpace(src)
 	dst = strings.TrimSpace(dst)
@@ -945,6 +951,9 @@ func validateDirectionPair(dir Direction, src, dst string) error {
 		}
 		if pathUnderJFS(src) {
 			return fmt.Errorf("direction=in source must be a host path, not /jfs/... (got %q) — use direction=between for JuiceFS-to-JuiceFS", src)
+		}
+		if err := checkSyncSmartRoots(os.Getenv, os.ReadDir, src, dst, ""); err != nil {
+			return err
 		}
 	case DirectionOut:
 		if !pathUnderJFS(src) {

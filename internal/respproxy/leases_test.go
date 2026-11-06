@@ -130,6 +130,19 @@ func txn(rc *rawConn, cmds ...[]string) Value {
 // treeParent is buildTree's directory -> parent map.
 var treeParent = map[uint64]uint64{1: 1, 2: 1, 3: 2, 4: 2, 5: 3}
 
+// allocInodes takes a juicefs-sized inode batch on rc (bare INCRBY
+// nextinode 1024), as juicefs's allocateInodes does before it creates
+// anything; the proxy records the batch as rc's principal's. It returns the
+// batch's first and last inode.
+func allocInodes(t *testing.T, rc *rawConn) (uint64, uint64) {
+	t.Helper()
+	v := rc.do("INCRBY", "nextinode", "1024")
+	if v.Type != ':' {
+		t.Fatalf("INCRBY nextinode: %c %q", v.Type, v.Str)
+	}
+	return uint64(v.Int - 1023), uint64(v.Int)
+}
+
 // create mimics juicefs doMknod of a file.
 func create(rc *rawConn, parent, ino uint64, name string) Value {
 	return txn(rc,
@@ -329,6 +342,7 @@ func TestLeaseCrossProjectAllOrNone(t *testing.T) {
 		r := startLeaseRig(t, ModeEnforce)
 		mac1, mac2 := r.conn(t, "mac1"), r.conn(t, "mac2")
 		// B held by mac2: the move needs both, so it is refused and grants nothing.
+		allocInodes(t, mac2) // 1..1024
 		mustOK(t, create(mac2, 4, 20, "mine"), "mac2 create in B")
 		mustDeny(t, txn(mac1, move...), ReasonXProject, "cross-project move")
 		if h := r.eng.holderOf(3); h != "" {
@@ -356,6 +370,7 @@ func TestLeaseRootEntryGate(t *testing.T) {
 	v := txn(mac1, []string{"HDEL", "d2", "A"}, []string{"HSET", "d2", "A2", mkEntry(typeDir, 3)})
 	mustDeny(t, v, ReasonAdminOnly, "rename of a project root")
 	// Creating a new project folder is open, and does not grant it.
+	allocInodes(t, mac1) // 1..1024
 	v = txn(mac1,
 		[]string{"SET", "i30", mkAttr(typeDir, 2)},
 		[]string{"SET", "i2", mkAttr(typeDir, 1)},

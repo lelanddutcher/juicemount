@@ -3175,6 +3175,15 @@
       kind.textContent = d.kind;
       head.appendChild(nm);
       head.appendChild(kind);
+      if (d.needs_check) {
+        // Saved by an older build: syncs and backups to it are refused
+        // until its path is checked against the source roots.
+        const badge = document.createElement('span');
+        badge.className = 'dest-kind-pill';
+        badge.textContent = 'needs Test';
+        badge.title = 'Run Test (or save again) to check this path against the source roots; syncs and backups to it are refused until then.';
+        head.appendChild(badge);
+      }
       li.appendChild(head);
       // Show the redacted config keys so the operator sees what's set
       // without revealing values.
@@ -3266,16 +3275,35 @@
     const orig = btn.textContent;
     btn.disabled = true;
     btn.textContent = 'Testing…';
+    const testPath = `/api/destinations/${encodeURIComponent(name)}/test`;
     try {
-      const res = await api('POST', `/api/destinations/${encodeURIComponent(name)}/test`);
+      let res = await api('POST', testPath);
+      // An SFTP destination with no pinned server key: the server was only
+      // asked for its key, no credentials were sent. Pin it only after the
+      // operator compares the fingerprint with the server's real key.
+      if (res && res.host_key_confirmation_required) {
+        const trusted = confirm(
+          `Destination "${name}": the server presented this ${res.host_key_type || 'SSH'} host key:\n\n` +
+          `${res.host_key_fingerprint}\n\n` +
+          'Compare it with the key on the server itself (for example, run ssh-keygen -lf on its host key .pub file). ' +
+          'Trust this key? Your password or private key is sent only to a server that presents it.');
+        if (!trusted) {
+          btn.textContent = 'Not trusted';
+          setTimeout(() => { btn.textContent = orig; btn.disabled = false; }, 3000);
+          return;
+        }
+        await api('POST', `/api/destinations/${encodeURIComponent(name)}/host-key`, {
+          host_key: res.host_key, fingerprint: res.host_key_fingerprint,
+        });
+        res = await api('POST', testPath);
+      }
+      if (!res || !res.ok) throw new Error('test did not complete');
       btn.textContent = 'OK';
-      // SFTP: show the server's host key fingerprint. The first
-      // successful test pins it; later connections must present it.
-      if (res && res.host_key_fingerprint) {
+      // SFTP: a passing test means the server presented the pinned key.
+      // Show its fingerprint so the operator sees which key was verified.
+      if (res.host_key_fingerprint) {
         const f = $('#dest-flash');
-        f.textContent = res.host_key_pinned
-          ? `${name}: host key recorded (${res.host_key_fingerprint}). Future connections must present this key.`
-          : `${name}: host key verified (${res.host_key_fingerprint}).`;
+        f.textContent = `${name}: host key verified (${res.host_key_fingerprint}).`;
         f.hidden = false;
       }
       setTimeout(() => { btn.textContent = orig; btn.disabled = false; }, 2000);

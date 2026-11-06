@@ -11,7 +11,18 @@ import (
 	"github.com/willscott/go-nfs-client/nfs/xdr"
 )
 
+// DirectoryRemover is implemented by a filesystem that tells RMDIR from
+// REMOVE, for example to remember a late outcome per procedure. A filesystem
+// without it gets Remove for both.
+type DirectoryRemover interface {
+	RemoveDirectory(path string) error
+}
+
 func onRemove(ctx context.Context, w *response, userHandle Handler) error {
+	return removeEntry(w, userHandle, false)
+}
+
+func removeEntry(w *response, userHandle Handler, rmdir bool) error {
 	w.errorFmt = wccDataErrorFormatter
 	obj := DirOpArg{}
 	if err := xdr.Read(w.req.Body, &obj); err != nil {
@@ -49,7 +60,14 @@ func onRemove(ctx context.Context, w *response, userHandle Handler) error {
 	toDelete := fs.Join(append(path, string(obj.Filename))...)
 	toDeleteHandle := userHandle.ToHandle(fs, append(path, string(obj.Filename)))
 
-	err = fs.Remove(toDelete)
+	if scoped, ok := fs.(MutationPrincipalSetter); ok {
+		scoped.SetMutationPrincipal(requestPrincipal(w.req))
+	}
+	if remover, ok := fs.(DirectoryRemover); ok && rmdir {
+		err = remover.RemoveDirectory(toDelete)
+	} else {
+		err = fs.Remove(toDelete)
+	}
 	if err != nil {
 		if status, mapped := removeErrStatus(err); mapped {
 			return status
@@ -93,6 +111,12 @@ func removeErrStatus(err error) (*NFSStatusError, bool) {
 		return &NFSStatusError{NFSStatusAccess, err}, true
 	case errors.Is(err, syscall.ENOTEMPTY) || errors.Is(err, syscall.EEXIST):
 		return &NFSStatusError{NFSStatusNotEmpty, err}, true
+	case errors.Is(err, syscall.ENOTDIR):
+		// RMDIR of a non-directory.
+		return &NFSStatusError{NFSStatusNotDir, err}, true
+	case errors.Is(err, syscall.EISDIR):
+		// REMOVE of a directory.
+		return &NFSStatusError{NFSStatusIsDir, err}, true
 	}
 	return nil, false
 }

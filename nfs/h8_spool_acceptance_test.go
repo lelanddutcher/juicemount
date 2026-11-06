@@ -152,7 +152,7 @@ func TestH8AcceptanceCancelledInlinePreservesReplacement(t *testing.T) {
 		// Preserve the production transaction, not a test-only row check.
 		return store.DrainComplete(item)
 	})
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), drainPassDeadline)
 	defer cancel()
 	if n := d.DrainOnceForTest(ctx); n != 1 {
 		t.Fatalf("processed %d rows, want 1", n)

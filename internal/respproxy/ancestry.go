@@ -238,7 +238,7 @@ func (a *ancestry) resolveDir(d uint64) (location, error) {
 		return location{kind: nsTrash, depth: -1}, nil
 	}
 	if d == rootIno {
-		return location{kind: nsRoot, depth: 0}, nil
+		return location{kind: nsRoot, depth: 0, dir: rootIno}, nil
 	}
 	if loc, ok := a.memo.get(d); ok {
 		return loc, nil
@@ -264,7 +264,7 @@ func (a *ancestry) resolveDir(d uint64) (location, error) {
 	}
 	depth := len(chain) - 1
 	if depth < a.depth {
-		loc := location{kind: nsRoot, depth: depth}
+		loc := location{kind: nsRoot, depth: depth, dir: d}
 		a.memo.put(d, loc, gen)
 		return loc, nil
 	}
@@ -296,7 +296,7 @@ func (a *ancestry) childLocP(dir, child uint64, isDir, placed bool) (location, e
 		if isDir && lp.depth == a.depth-1 && !placed {
 			return a.projectLoc(child, lp.depth+1), nil
 		}
-		return location{kind: nsRoot, depth: lp.depth + 1}, nil
+		return location{kind: nsRoot, depth: lp.depth + 1, dir: dir}, nil
 	case nsProject, nsDerivatives:
 		lp.depth++
 		return lp, nil

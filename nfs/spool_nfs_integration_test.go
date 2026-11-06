@@ -11,6 +11,28 @@ import (
 	"github.com/lelanddutcher/juicemount/metadata"
 )
 
+// spoolFixtureMutationBoundMS replaces the 800 ms RPC mutation bound in the
+// spool fixtures. That bound is the server's busy policy: when it expires the
+// RPC answers JUKEBOX and an NFS client retries, while the worker keeps the name
+// until it finishes. These fixtures call the handler directly, with no client
+// to retry, and test spool data paths rather than that policy (its own tests set
+// JM_MUTATION_OP_TIMEOUT_MS themselves and override this). On a loaded CI host
+// a spool CREATE's local SQLite and spool-file commits alone took over 800 ms
+// (measured 635 ms OpenWrite + 193 ms Insert), so the policy fired on a healthy
+// host and the test read the retryable answer as a failure.
+const spoolFixtureMutationBoundMS = "30000"
+
+// useSpoolFixtureMutationBound applies spoolFixtureMutationBoundMS for the rest
+// of the test. Call it from every fixture or test that drives a create, write,
+// mkdir, rename, remove, symlink or setattr through a handler with a spool
+// attached, unless the test asserts the bound itself. Such a test sets
+// JM_MUTATION_OP_TIMEOUT_MS after the fixture, which overrides this. It is not
+// a package default: tests without a spool keep the production bound.
+func useSpoolFixtureMutationBound(t testing.TB) {
+	t.Helper()
+	t.Setenv("JM_MUTATION_OP_TIMEOUT_MS", spoolFixtureMutationBoundMS)
+}
+
 // newSpoolWiredHandler builds a JuiceMountHandler with the spool + drainer
 // wired exactly as cmd/jm5/main.go and bridge/cbridge.go do in production,
 // with a temp dir standing in for the JuiceFS FUSE mount root. It returns the
@@ -18,6 +40,7 @@ import (
 // into), the spool, the drainer, and the FUSE root path.
 func newSpoolWiredHandler(t *testing.T) (*juiceFS, *SpoolStore, *Drainer, string) {
 	t.Helper()
+	useSpoolFixtureMutationBound(t)
 	fuseRoot := t.TempDir()
 	spoolDir := t.TempDir()
 	dbPath := filepath.Join(t.TempDir(), "meta.db")

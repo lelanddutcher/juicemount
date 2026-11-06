@@ -129,6 +129,10 @@ type namespaceOperation struct {
 	poison      bool
 	failed      bool // guarded by owner.mu
 	blocksReads bool // guarded by owner.mu
+	// completed, set by a successful work function, runs only when the RPC
+	// already returned JUKEBOX, while the names are still owned. It lets the
+	// operation remember the outcome for the client's resend.
+	completed func()
 }
 
 func (op *namespaceOperation) blockReads() {
@@ -273,6 +277,9 @@ func runNamespaceOperationUntil[T any](h *JuiceMountHandler, names []string, dea
 				if closeErr := abandon(value); closeErr != nil {
 					op.poison = true
 				}
+			}
+			if err == nil && !op.poison && op.completed != nil {
+				op.completed()
 			}
 		}
 		op.finish(err)

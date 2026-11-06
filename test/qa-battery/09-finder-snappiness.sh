@@ -81,6 +81,15 @@ snap_settled() {
         snap_evidence settled "$prefix.spool.json"
 }
 
+# Only a measurement-only under-drain failure may defer strict qa_fail.
+# Keep RED/data now, then join the SAME original Finder worker and prove drain
+# plus mounted/backend custody before the caller reports the terminal failure.
+snap_measurement_fail() {
+    QA_KEEP_DATA=1
+    printf '[FAIL] %s\n' "$*"
+    QA_FAIL=$((QA_FAIL+1))
+}
+
 snap_measure() {
     local phase="$1" label="$2" dir="$3" expected="$4" prefix observation rc
     SNAP_SEQ=$((SNAP_SEQ+1))
@@ -99,7 +108,11 @@ snap_measure() {
     # Invalid schemas/names/overlap emit no timing. Valid but slow/error samples
     # remain in result.json and the table as FAIL, never a false PASS.
     if [ "$rc" != 0 ]; then
-        qa_fail "enumeration invalid/slow/error [$phase/$label]; see $prefix"
+        if [ "$phase" = under-drain ]; then
+            snap_measurement_fail "enumeration invalid/slow/error [$phase/$label]; see $prefix"
+        else
+            qa_fail "enumeration invalid/slow/error [$phase/$label]; see $prefix"
+        fi
         [ -z "$observation" ] || printf '%s\t%s\t%s\tFAIL\n' "$phase" "$label" "$(printf '%s' "$observation" | cut -f1,2)" >> "$QA_CAT_DIR/latency-table.tsv"
         return 1
     fi
@@ -128,7 +141,7 @@ snap_drain_phase() {
         snap_measure under-drain "flat_$SNAP_BIG_N" "$SNAP_BIG_LEAF" "$SNAP_BIG_NAMES"
         measured=$?
     else
-        qa_fail 'under-drain phase uncovered: no active drain; no retry or larger copy'
+        snap_measurement_fail 'under-drain phase uncovered: no active drain; no retry or larger copy'
     fi
     # Even an invalid observation must join the SAME original Finder worker.
     snap_join_positive drain "$pid" "$deadline"

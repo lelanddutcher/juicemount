@@ -306,7 +306,7 @@ func TestP96WireContinuationAdmission(t *testing.T) {
 	if err := entry.Finalize(); err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel = context.WithTimeout(context.Background(), drainPassDeadline)
 	n := d.DrainOnceForTest(ctx)
 	cancel()
 	if n != 1 {

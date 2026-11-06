@@ -36,6 +36,7 @@ func newBatchWiredHandler(t *testing.T) (*juiceFS, *SpoolStore, *Drainer, string
 func newBatchWiredHandlerNoDispatch(t *testing.T, maxOps int) (*juiceFS, *SpoolStore, *Drainer, string) {
 	t.Helper()
 	t.Setenv("JM_DRAIN_BATCH_INSERT", "1")
+	useSpoolFixtureMutationBound(t)
 	fuseRoot := t.TempDir()
 	spoolDir := t.TempDir()
 	dbPath := filepath.Join(t.TempDir(), "meta.db")
@@ -186,7 +187,7 @@ func TestDrainBatchFlushesOnSizeThreshold(t *testing.T) {
 	}
 	spool.sweepOnce(0)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), drainPassDeadline)
 	defer cancel()
 	got := drainer.DrainOnceForTest(ctx)
 	if got != n {
@@ -292,7 +293,7 @@ func TestDrainBatchCachesMetadataBeforeEviction(t *testing.T) {
 	simulateNFSCreateThenWrite(t, jfs, name, payload, 1024)
 	spool.sweepOnce(0)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), drainPassDeadline)
 	defer cancel()
 	if got := drainer.DrainOnceForTest(ctx); got != 1 {
 		t.Fatalf("DrainOnceForTest processed %d rows, want 1", got)

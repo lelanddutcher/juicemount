@@ -58,7 +58,7 @@ Fixture: [`../fixtures/whoami/gui.json`](../fixtures/whoami/gui.json),
 ```json
 {
   "app": "JuiceMount",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "contract_version": 3,
   "instance_id": "5C7E0E2A-…",
   "volume_name": "zpool",
@@ -80,7 +80,7 @@ Fixture: [`../fixtures/whoami/gui.json`](../fixtures/whoami/gui.json),
 - `device_digest` (optional, additive): a 32-hex-character digest of the serving Mac's hardware UUID (never
   the UUID). Absent when unavailable. One `instance_id` seen with two `device_digest` values means a copied
   install. Runtime-volatile: conformance compares it by presence and type, not value.
-- `version`: the **target public release version** string (`0.5.0` for this release candidate; not yet
+- `version`: the **target public release version** string (`0.5.1` for this release candidate; not yet
   tagged or notarized). Source it from the release build's version-of-record; Info.plist must match.
   Distinct from `contract_version`.
 - `contract_version`: integer from this repo's `VERSION`.
@@ -248,7 +248,7 @@ clean choice and is filed as JM-3 high.)
   so nobody greps the wrong file. Served by **both** the GUI and `jm5`.
 - **The cbridge control-plane route table is at `bridge/cbridge.go:733-789`** on main (the new `/whoami`,
   `/residency`, `/lookup` handlers register there).
-- **`/whoami` is the public version surface.** The release candidate reports `0.5.0`;
+- **`/whoami` is the public version surface.** The release candidate reports `0.5.1`;
   release artifacts also embed the immutable source commit outside this strict wire schema.
 - **No `nas_rel_path` column exists.** Paths are mount-anchored; `nas_rel_path` is *defined* by this contract
   as `path − mount_point` and must be computed.

@@ -14,6 +14,7 @@ import (
 
 	"github.com/lelanddutcher/juicemount/internal/cache/pin"
 	"github.com/lelanddutcher/juicemount/internal/metrics"
+	"github.com/lelanddutcher/juicemount/internal/testguard"
 )
 
 // This gate runs the real consumer transport/decoder against the real provider
@@ -24,17 +25,36 @@ func TestConsumerContractProductionClient(t *testing.T) {
 	if !filepath.IsAbs(probe) {
 		t.Fatal("consumer acceptance requires absolute JM_CONSUMER_PROBE from scripts/build-consumer-contract-probe.sh")
 	}
+	t.Setenv(testguard.RefuseFUSEContentReadsEnv, "1")
 	defer seedControlPlane(t)()
 	globalMu.Lock()
 	oldSpool, oldDrainer, oldRC, oldPrefetcher := globalSpool, globalDrainer, globalRC, globalPrefetcher
 	globalSpool, globalDrainer, globalRC, globalPrefetcher = nil, nil, nil, nil
-	fuseRoot := globalFUSEPath
+	fuseRoot, mountPath, pinStore := globalFUSEPath, globalMountPath, globalPinStore
 	globalMu.Unlock()
 	defer func() {
 		globalMu.Lock()
 		globalSpool, globalDrainer, globalRC, globalPrefetcher = oldSpool, oldDrainer, oldRC, oldPrefetcher
 		globalMu.Unlock()
 	}()
+	// NewPrefetcher starts one owned worker; TryGo tracks the real async pin
+	// registry walk. No PullPending loop or Ready authority is admitted here.
+	ownedPrefetcher := pin.NewPrefetcher(pinStore, fuseRoot, mountPath, 1)
+	defer func() {
+		// The later HTTP stop defer runs first. Keep the same join and seeded
+		// stores alive on timeout; cancellation is not proof of completion.
+		if !ownedPrefetcher.StopWithin(5 * time.Second) {
+			t.Error("consumer prefetcher did not join; retaining fixture until completion")
+			for !ownedPrefetcher.StopWithin(time.Second) {
+			}
+		}
+		if len(pin.ScanningRoots()) != 0 {
+			t.Error("consumer pin scanning roots remain after prefetcher join")
+		}
+	}()
+	globalMu.Lock()
+	globalPrefetcher = ownedPrefetcher
+	globalMu.Unlock()
 	fixture := filepath.Join(fuseRoot, "consumer-fixture")
 	if err := os.MkdirAll(fixture, 0700); err != nil {
 		t.Fatal(err)
@@ -69,16 +89,6 @@ func TestConsumerContractProductionClient(t *testing.T) {
 			}
 		}
 	})
-	// Any admitted pin walk must stop using the temporary stores before restore.
-	defer func() {
-		deadline := time.Now().Add(5 * time.Second)
-		for len(pin.ScanningRoots()) != 0 && time.Now().Before(deadline) {
-			time.Sleep(10 * time.Millisecond)
-		}
-		if len(pin.ScanningRoots()) != 0 {
-			t.Error("consumer pin walk did not settle")
-		}
-	}()
 	for _, mode := range []string{"reads", "pin-unpin"} {
 		t.Run(mode, func(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)

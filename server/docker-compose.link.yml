@@ -1,0 +1,52 @@
+# JuiceMount Link opt-in overlay: built-in remote access without a VPN app.
+#
+# The base server/docker-compose.yml keeps Link OFF and publishes neither of
+# its ports, so a NAS that does not use Link never has host ports 30193 or
+# 41641 claimed (a host Tailscale install usually owns UDP 41641). Apply this
+# file on top of it to turn Link on:
+#
+#   docker compose -f server/docker-compose.yml -f server/docker-compose.link.yml up -d
+#
+# For TrueNAS "Install via YAML", render the pair with `docker compose ... config`
+# and paste the result.
+#
+# What it enables in the Manager container:
+#   - embedded Headscale (control server) on container port 8091, published as
+#     host 30193. JM_NET_SERVER_URL is the address Macs use to reach it, e.g.
+#     https://<public-name>:30193 (a TLS-terminating proxy in front of 30193,
+#     or JM_NET_TLS_CERT/JM_NET_TLS_KEY for Headscale's own TLS).
+#   - the NAS tailnet node, which joins over the in-container address (no
+#     router hairpin NAT). With JM_NET_NAS_EXPOSURE=services (a new install's
+#     default) it serves only the JuiceMount ports on its tailnet address:
+#     30179 -> respproxy:6379, 30151 -> minio:9000, 30190 -> Manager. A Mac
+#     dials the same port it uses on the LAN; nothing else on the LAN is
+#     reachable through Link. Mac apps older than this, and remote farm
+#     nodes, need JM_NET_NAS_EXPOSURE=subnet (an existing install's default):
+#     the node advertises JM_NET_NAS_ROUTE (default 192.168.0.0/24) instead.
+#   - its WireGuard UDP port, published 1:1 so peers can reach it directly
+#     instead of through a relay. Forward this UDP port on the router for a
+#     direct path from outside the LAN.
+#   - an ACL policy (/data/headscale/policy.hujson, regenerated each start):
+#     tag:jm-mac and tag:jm-farm nodes may reach those ports on tag:jm-nas,
+#     and in subnet exposure the same ports inside the route (on
+#     JM_NET_NAS_LAN_ADDR only, when set to the NAS's LAN address), only.
+#
+# CHANGELOG.md (JuiceMount Link) says how the exposure default is chosen and
+# how to switch. To relay through your own DERP servers instead of
+# Tailscale's public map, pass HEADSCALE_DERP_URLS or HEADSCALE_DERP_PATHS to
+# the Manager.
+services:
+  juicemount-manager:
+    environment:
+      JM_NET_HEADSCALE: "on"
+      JM_NET_NAS_NODE: "on"
+      JM_NET_SERVER_URL: "${JM_NET_SERVER_URL:?set JM_NET_SERVER_URL to the https URL Macs use to reach this NAS on port 30193}"
+      JM_NET_NAS_UDP_PORT: "${JM_NET_NAS_UDP_PORT:-41641}"
+      JM_NET_NAS_EXPOSURE: "${JM_NET_NAS_EXPOSURE:-}"
+      JM_NET_NAS_ROUTE: "${JM_NET_NAS_ROUTE:-}"
+      JM_NET_NAS_LAN_ADDR: "${JM_NET_NAS_LAN_ADDR:-}"
+      JM_NET_TLS_CERT: "${JM_NET_TLS_CERT:-}"
+      JM_NET_TLS_KEY: "${JM_NET_TLS_KEY:-}"
+    ports:
+      - "30193:8091"                                                    # Headscale control server
+      - "${JM_NET_NAS_UDP_PORT:-41641}:${JM_NET_NAS_UDP_PORT:-41641}/udp" # NAS node WireGuard

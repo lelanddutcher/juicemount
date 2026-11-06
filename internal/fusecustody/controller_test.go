@@ -27,6 +27,14 @@ func (sigpipeWitnessWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
+// helperBound bounds waits for an event the helper process is expected to
+// produce: its admission frame, a response, its exit. Each helper is a re-exec
+// of this test binary, and on a loaded -race CI host starting one has taken
+// over a second, so a tight bound here fails on host load rather than on the
+// controller. The waits return as soon as the event arrives; bounds that are
+// themselves under test (an expected pending result) stay short.
+const helperBound = 30 * time.Second
+
 func startTestSession(t *testing.T, mode string) *Session {
 	t.Helper()
 	cmd := exec.Command(os.Args[0], "-test.run=TestCustodyTransportProcess")
@@ -47,7 +55,7 @@ func startTestSession(t *testing.T, mode string) *Session {
 		_ = cmd.Process.Kill()
 		select {
 		case <-s.waitDone:
-		case <-time.After(3 * time.Second):
+		case <-time.After(helperBound):
 			t.Error("test helper did not join")
 		}
 	})
@@ -97,11 +105,6 @@ func TestCustodyTransportProcess(t *testing.T) {
 		}
 		os.Exit(0)
 	}
-	if mode == "stdout_close" {
-		_ = os.Stdout.Close()
-		time.Sleep(time.Second)
-		os.Exit(0)
-	}
 	if mode == "closed_stdin" {
 		_ = os.Stdin.Close()
 		time.Sleep(time.Second)
@@ -144,25 +147,25 @@ func TestSessionDelayedAdmissionAndSinglePendingDetach(t *testing.T) {
 	if err := s.WaitReady(time.Millisecond); err == nil {
 		t.Fatal("delayed admission looked ready")
 	}
-	if err := s.WaitReady(time.Second); err != nil {
+	if err := s.WaitReady(helperBound); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Detach(time.Millisecond); err == nil || !s.PendingDetach() {
 		t.Fatalf("detach should remain pending: %v", err)
 	}
-	if err := s.ReconcileDetach(time.Second); err != nil || !s.Detached() {
+	if err := s.ReconcileDetach(helperBound); err != nil || !s.Detached() {
 		t.Fatalf("late response not reconciled: %v", err)
 	}
-	if err := s.Release(3 * time.Second); err != nil || !s.Settled() {
+	if err := s.Release(helperBound); err != nil || !s.Settled() {
 		t.Fatalf("release/join incomplete: %v", err)
 	}
 }
 func TestSessionNeverAdmittedVersusUnknownOutput(t *testing.T) {
 	refused := startTestSession(t, "refused")
-	if err := refused.WaitReady(time.Second); err == nil {
+	if err := refused.WaitReady(helperBound); err == nil {
 		t.Fatal("refusal admitted")
 	}
-	deadline := time.After(3 * time.Second)
+	deadline := time.After(helperBound)
 	for !refused.NeverAdmittedSettled() {
 		select {
 		case <-deadline:
@@ -172,11 +175,11 @@ func TestSessionNeverAdmittedVersusUnknownOutput(t *testing.T) {
 		}
 	}
 	eof := startTestSession(t, "eof")
-	if err := eof.WaitReady(time.Second); err == nil || eof.NeverAdmittedSettled() {
+	if err := eof.WaitReady(helperBound); err == nil || eof.NeverAdmittedSettled() {
 		t.Fatalf("EOF misclassified: %v", err)
 	}
 	malformed := startTestSession(t, "bad")
-	if err := malformed.WaitReady(time.Second); err == nil || malformed.NeverAdmittedSettled() {
+	if err := malformed.WaitReady(helperBound); err == nil || malformed.NeverAdmittedSettled() {
 		t.Fatalf("malformed output misclassified: %v", err)
 	}
 }
@@ -213,7 +216,7 @@ func TestCustodianKeepsDescriptorWhenStdoutCloses(t *testing.T) {
 		if line != "EPIPE_WITNESSED\n" {
 			t.Fatalf("no EPIPE witness: %q", line)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(helperBound):
 		t.Fatal("helper did not attempt broken stdout write")
 	}
 	if err := cmd.Process.Signal(syscall.Signal(0)); err != nil {
@@ -222,7 +225,7 @@ func TestCustodianKeepsDescriptorWhenStdoutCloses(t *testing.T) {
 }
 func TestSessionClosedInputRetainsUncertainOperation(t *testing.T) {
 	s := startTestSession(t, "closed_stdin")
-	if err := s.WaitReady(time.Second); err != nil {
+	if err := s.WaitReady(helperBound); err != nil {
 		t.Fatal(err)
 	}
 	err := s.Detach(50 * time.Millisecond)
@@ -231,16 +234,35 @@ func TestSessionClosedInputRetainsUncertainOperation(t *testing.T) {
 	}
 }
 func TestSessionClosedOutputLiveHelperDoesNotLockState(t *testing.T) {
-	s := startTestSession(t, "stdout_close")
-	if err := s.WaitReady(time.Second); err != nil {
-		t.Fatal(err)
-	}
-	done := make(chan struct{})
-	go func() { _, _, _, _ = s.Identity(); _ = s.Settled(); _ = s.PendingDetach(); close(done) }()
+	// The helper closes stdout after admission and then stays alive until a
+	// line arrives on stdin, so the accessors below run while it is certainly
+	// live. Accessors that waited on the helper's exit would block until the
+	// cleanup kill; they run in a goroutine so the bound reports that instead
+	// of hanging the test, however slow the host is.
+	s := startTestSession(t, "stdout_close_hold")
+	done := make(chan error, 1)
+	go func() {
+		if err := s.WaitReady(helperBound); err != nil {
+			done <- err
+			return
+		}
+		_, _, _, _ = s.Identity()
+		_ = s.Settled()
+		_ = s.PendingDetach()
+		done <- nil
+	}()
 	select {
-	case <-done:
-	case <-time.After(100 * time.Millisecond):
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * helperBound):
 		t.Fatal("state access blocked on live helper Wait")
+	}
+	select {
+	case <-s.waitDone:
+		t.Fatal("helper exited before detach; state access was not checked against a live helper")
+	default:
 	}
 	if err := s.Detach(100 * time.Millisecond); err == nil || !s.PendingDetach() {
 		t.Fatalf("lost output settled detach: %v", err)
@@ -273,19 +295,19 @@ func TestSessionStateAccessAfterOriginalWaitEntered(t *testing.T) {
 		}
 		select {
 		case <-s.waitDone:
-		case <-time.After(3 * time.Second):
+		case <-time.After(helperBound):
 			_ = cmd.Process.Kill()
 			<-s.waitDone
 		}
 	}()
 	select {
 	case <-waitEntered:
-	case <-time.After(3 * time.Second):
+	case <-time.After(helperBound):
 		t.Fatal("fixture never entered original Wait")
 	}
 	caseDone := make(chan error, 1)
 	go func() {
-		if err := s.WaitReady(time.Second); err != nil {
+		if err := s.WaitReady(helperBound); err != nil {
 			caseDone <- err
 			return
 		}
@@ -303,7 +325,7 @@ func TestSessionStateAccessAfterOriginalWaitEntered(t *testing.T) {
 	select {
 	case caseErr = <-caseDone:
 		callerDone = true
-	case <-time.After(2 * time.Second):
+	case <-time.After(helperBound):
 		caseErr = errors.New("bounded session access blocked while original Wait held")
 	}
 	select {
@@ -317,7 +339,7 @@ func TestSessionStateAccessAfterOriginalWaitEntered(t *testing.T) {
 	released = true
 	select {
 	case <-s.waitDone:
-	case <-time.After(3 * time.Second):
+	case <-time.After(helperBound):
 		_ = cmd.Process.Kill()
 		<-s.waitDone
 		if caseErr == nil {
@@ -336,7 +358,7 @@ func TestSessionStateAccessAfterOriginalWaitEntered(t *testing.T) {
 		if !callerDone {
 			select {
 			case <-caseDone:
-			case <-time.After(3 * time.Second):
+			case <-time.After(helperBound):
 				t.Fatal("fixture caller failed to join after child release")
 			}
 		}
@@ -346,24 +368,24 @@ func TestSessionStateAccessAfterOriginalWaitEntered(t *testing.T) {
 
 func TestSessionWrongResponseIDKeepsPendingDetach(t *testing.T) {
 	s := startTestSession(t, "wrong_id")
-	if err := s.WaitReady(time.Second); err != nil {
+	if err := s.WaitReady(helperBound); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Detach(time.Second); err == nil || !s.PendingDetach() || s.Detached() {
+	if err := s.Detach(helperBound); err == nil || !s.PendingDetach() || s.Detached() {
 		t.Fatalf("mismatched response cleared custody: %v", err)
 	}
 }
 
 func TestSessionTypesPermissionDeniedAndPendingAdmission(t *testing.T) {
 	denied := startTestSession(t, "permission_denied")
-	if err := denied.WaitReady(time.Second); !errors.Is(err, ErrAdmissionPermissionDenied) {
+	if err := denied.WaitReady(helperBound); !errors.Is(err, ErrAdmissionPermissionDenied) {
 		t.Fatalf("denied root open not typed: %v", err)
 	}
 	// The cached refusal keeps its type on every later call.
 	if err := denied.WaitReady(time.Millisecond); !errors.Is(err, ErrAdmissionPermissionDenied) {
 		t.Fatalf("repeated denial lost its type: %v", err)
 	}
-	deadline := time.After(3 * time.Second)
+	deadline := time.After(helperBound)
 	for !denied.NeverAdmittedSettled() {
 		select {
 		case <-deadline:
@@ -385,7 +407,7 @@ func TestSessionTypesPermissionDeniedAndPendingAdmission(t *testing.T) {
 		t.Fatal("a still-running custodian was reported settled")
 	}
 	refused := startTestSession(t, "refused")
-	if err := refused.WaitReady(time.Second); !errors.Is(err, ErrAdmissionRefused) || errors.Is(err, ErrAdmissionPermissionDenied) {
+	if err := refused.WaitReady(helperBound); !errors.Is(err, ErrAdmissionRefused) || errors.Is(err, ErrAdmissionPermissionDenied) {
 		t.Fatalf("ordinary refusal mistyped: %v", err)
 	}
 }

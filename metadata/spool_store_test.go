@@ -357,7 +357,12 @@ func TestSpoolStoreDeleteDone(t *testing.T) {
 	_ = s.MarkReady(idOldReady, 10, nil)
 	_, _ = db.Exec(`UPDATE spool_entries SET updated_at=0 WHERE id=?`, idOldReady)
 
-	n, err := s.DeleteDone(time.Now())
+	// updated_at has one-second resolution and new-done was written just
+	// before this call, so a cutoff of now deletes it whenever the clock
+	// crosses a second in between (it is older than now). A cutoff an hour
+	// back, like the sweeper's retention, separates the epoch-old rows from
+	// the fresh one at any timing.
+	n, err := s.DeleteDone(time.Now().Add(-time.Hour))
 	if err != nil {
 		t.Fatalf("delete done: %v", err)
 	}

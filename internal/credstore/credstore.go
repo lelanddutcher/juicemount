@@ -287,33 +287,45 @@ type isolatedEntry struct {
 	Account string `json:"account"`
 	Secret  string `json:"secret"`
 	Device  string `json:"device,omitempty"` // deviceid digest of the saving Mac
+	// ID is the agent token's ID (AgentToken only), kept beside the secret
+	// so it can be told without reading the secret.
+	ID string `json:"id,omitempty"`
 }
 
 func loadIsolated(path string, account string) (string, error) {
-	st, err := os.Lstat(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return "", ErrNotFound
-	}
+	e, err := loadIsolatedEntry(path, account)
 	if err != nil {
-		return "", err
-	}
-	sys, ok := st.Sys().(*syscall.Stat_t)
-	if !st.Mode().IsRegular() || st.Mode().Perm() != 0600 || !ok || int(sys.Uid) != os.Geteuid() || sys.Nlink != 1 {
-		return "", fmt.Errorf("isolated credential file must be a private 0600 file")
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return "", err
-	}
-	var e isolatedEntry
-	if err := json.Unmarshal(data, &e); err != nil {
-		return "", fmt.Errorf("isolated credential file unreadable")
-	}
-	if e.Account != account || e.Secret == "" {
-		return "", ErrNotFound
-	}
-	if err := checkDevice(e.Device); err != nil {
 		return "", err
 	}
 	return e.Secret, nil
+}
+
+// loadIsolatedEntry reads and checks an isolated-format entry for account.
+func loadIsolatedEntry(path string, account string) (isolatedEntry, error) {
+	st, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return isolatedEntry{}, ErrNotFound
+	}
+	if err != nil {
+		return isolatedEntry{}, err
+	}
+	sys, ok := st.Sys().(*syscall.Stat_t)
+	if !st.Mode().IsRegular() || st.Mode().Perm() != 0600 || !ok || int(sys.Uid) != os.Geteuid() || sys.Nlink != 1 {
+		return isolatedEntry{}, fmt.Errorf("isolated credential file must be a private 0600 file")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return isolatedEntry{}, err
+	}
+	var e isolatedEntry
+	if err := json.Unmarshal(data, &e); err != nil {
+		return isolatedEntry{}, fmt.Errorf("isolated credential file unreadable")
+	}
+	if e.Account != account || e.Secret == "" {
+		return isolatedEntry{}, ErrNotFound
+	}
+	if err := checkDevice(e.Device); err != nil {
+		return isolatedEntry{}, err
+	}
+	return e, nil
 }

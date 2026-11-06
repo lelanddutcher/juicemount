@@ -4,9 +4,14 @@ import (
 	"fmt"
 	"path"
 	"path/filepath"
+	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"modernc.org/sqlite"
 )
 
 // INSTANT-NAV #10 (task #73, second half): the prune ladder must be DURABLE.
@@ -227,27 +232,145 @@ func TestDurableLadderReappearanceAndDegradedCycles(t *testing.T) {
 	}
 }
 
+// ladderCommitCounts maps a store's database path to the number of write
+// transactions committed on any of its pooled connections.
+var ladderCommitCounts struct {
+	once sync.Once
+	mu   sync.Mutex
+	byDB map[string]*atomic.Int64
+}
+
+// countStoreCommits must run before the store at dbPath opens: the driver
+// hook attaches a commit hook to every connection the pool later opens.
+func countStoreCommits(t *testing.T, dbPath string) *atomic.Int64 {
+	t.Helper()
+	ladderCommitCounts.once.Do(func() {
+		ladderCommitCounts.byDB = make(map[string]*atomic.Int64)
+		sqlite.RegisterConnectionHook(func(conn sqlite.ExecQuerierContext, dsn string) error {
+			name, _, _ := strings.Cut(dsn, "?")
+			ladderCommitCounts.mu.Lock()
+			commits := ladderCommitCounts.byDB[name]
+			ladderCommitCounts.mu.Unlock()
+			if hooks, ok := conn.(sqlite.HookRegisterer); ok && commits != nil {
+				hooks.RegisterCommitHook(func() int32 { commits.Add(1); return 0 })
+			}
+			return nil
+		})
+	})
+	// The store opens the symlink-resolved path (canonicalStorePath), so key
+	// the count by that: on macOS t.TempDir() is under /var, a link to
+	// /private/var, and the raw path never matches the DSN.
+	abs, err := filepath.Abs(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir, err := filepath.EvalSymlinks(filepath.Dir(abs))
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := filepath.Join(dir, filepath.Base(abs))
+	commits := new(atomic.Int64)
+	ladderCommitCounts.mu.Lock()
+	ladderCommitCounts.byDB[key] = commits
+	ladderCommitCounts.mu.Unlock()
+	t.Cleanup(func() {
+		ladderCommitCounts.mu.Lock()
+		delete(ladderCommitCounts.byDB, key)
+		ladderCommitCounts.mu.Unlock()
+	})
+	return commits
+}
+
+// ladderScaleCalibration writes the same rows, in path order and one
+// transaction, to a scratch table of a store in dir and reads them back: the
+// same work without chunking, on the same disk. The caller times it before and
+// after the run and keeps the slower, which absorbs most transient load.
+func ladderScaleCalibration(t *testing.T, dir string, rows map[string]int) time.Duration {
+	t.Helper()
+	s := durableLadderStore(t, filepath.Join(dir, fmt.Sprintf("calibration-%d.db", time.Now().UnixNano())))
+	paths := make([]string, 0, len(rows))
+	for p := range rows {
+		paths = append(paths, p)
+	}
+	sort.Strings(paths)
+	db := s.DB()
+	start := time.Now()
+	if _, err := db.Exec(`CREATE TABLE calibration (path TEXT PRIMARY KEY, absent_cycles INTEGER NOT NULL, updated_ns INTEGER NOT NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	stmt, err := tx.Prepare(`INSERT INTO calibration (path, absent_cycles, updated_ns) VALUES (?, ?, ?)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range paths {
+		if _, err := stmt.Exec(p, rows[p], int64(1)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := stmt.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	read, err := db.Query(`SELECT path, absent_cycles FROM calibration`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer read.Close()
+	back := make(map[string]int, len(rows))
+	for read.Next() {
+		var p string
+		var c int
+		if err := read.Scan(&p, &c); err != nil {
+			t.Fatal(err)
+		}
+		back[p] = c
+	}
+	if err := read.Err(); err != nil || len(back) != len(rows) {
+		t.Fatalf("calibration read %d rows, want %d: %v", len(back), len(rows), err)
+	}
+	return time.Since(start)
+}
+
 // TestDurableLadderScale120k sizes the mechanism at the motivating scale: the
-// initial full diff of a 120k-path mass delete must persist, and a restart
-// must load it back, in bounded time (< 5s combined) — this runs at every
-// 30s reconcile tail, so it must be cheap.
+// initial full diff of a 120k-path mass delete must persist in chunked
+// transactions, and a restart must load it back, at a small multiple of a
+// single-transaction write and read of the same rows. This runs at
+// every 30s reconcile tail, so it must be cheap. The cost is judged against a
+// calibration measured on the same disk around the run, not a fixed wall
+// clock, so a slow or shared machine slows both sides alike.
 func TestDurableLadderScale120k(t *testing.T) {
 	durableLadderEnv(t)
 	const n = 120000
-	s := durableLadderStore(t, filepath.Join(t.TempDir(), "mirror.db"))
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "mirror.db")
+	commits := countStoreCommits(t, dbPath)
+	s := durableLadderStore(t, dbPath)
 	rc := durableLadderClient(t, s)
 	for i := 0; i < n; i++ {
 		rc.pruneAbsent[fmt.Sprintf("SFX/Massive/dir%03d/f%06d.wav", i%512, i)] = 1 + i%PruneThreshold
 	}
+	calibrationBefore := ladderScaleCalibration(t, dir, rc.pruneAbsent)
 
+	commitsBefore := commits.Load()
 	persistStart := time.Now()
-	rc.persistPruneLadderDiff()
+	if err := rc.persistPruneLadderDiff(); err != nil {
+		t.Fatalf("persist: %v", err)
+	}
 	persistDur := time.Since(persistStart)
+	persistCommits := commits.Load() - commitsBefore
 
 	rc2 := durableLadderClient(t, s)
 	loadStart := time.Now()
 	rc2.loadDurablePruneLadder()
 	loadDur := time.Since(loadStart)
+	calibration := max(calibrationBefore, ladderScaleCalibration(t, dir, rc.pruneAbsent))
 
 	if len(rc2.pruneAbsent) != n {
 		t.Fatalf("loaded %d ladder rows, want %d (persist silently failed?)", len(rc2.pruneAbsent), n)
@@ -259,10 +382,17 @@ func TestDurableLadderScale120k(t *testing.T) {
 		}
 	}
 	total := persistDur + loadDur
-	budget := 5 * time.Second * pruneLadderScaleBudgetMultiplier // 5s; scaled under -race (see race_on_test.go)
-	t.Logf("scale(120k): persist=%v load=%v total=%v (budget %v)", persistDur, loadDur, total, budget)
-	if total > budget {
-		t.Fatalf("120k persist+load took %v (persist %v, load %v), budget %v", total, persistDur, loadDur, budget)
+	const maxRatio = 6
+	t.Logf("scale(120k): persist=%v (%d commits) load=%v total=%v calibration=%v ratio=%.2f (max %d)",
+		persistDur, persistCommits, loadDur, total, calibration, float64(total)/float64(calibration), maxRatio)
+	// One commit per chunk: a per-row or per-small-batch commit multiplies
+	// this however fast the disk is.
+	if want := int64((n + pruneLadderTxChunk - 1) / pruneLadderTxChunk); persistCommits != want {
+		t.Fatalf("120k persist committed %d transactions, want %d (one per %d-row chunk)", persistCommits, want, pruneLadderTxChunk)
+	}
+	if total > maxRatio*calibration {
+		t.Fatalf("120k persist+load took %v (persist %v, load %v), over %dx the %v single-transaction calibration",
+			total, persistDur, loadDur, maxRatio, calibration)
 	}
 }
 

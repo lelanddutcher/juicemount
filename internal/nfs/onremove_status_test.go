@@ -23,6 +23,8 @@ func TestRemoveErrStatus(t *testing.T) {
 		{"notempty", syscall.ENOTEMPTY, NFSStatusNotEmpty, true},
 		// wrapped in a foreign error type to prove errors.Is unwrapping
 		{"wrapped-notempty", &os.PathError{Op: "remove", Path: "/x", Err: syscall.ENOTEMPTY}, NFSStatusNotEmpty, true},
+		{"rmdir of a file", syscall.ENOTDIR, NFSStatusNotDir, true},
+		{"remove of a directory", syscall.EISDIR, NFSStatusIsDir, true},
 		{"io", errors.New("boom"), 0, false},
 	}
 

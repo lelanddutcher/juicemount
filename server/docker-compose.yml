@@ -96,7 +96,11 @@ services:
   # applies the lease mode from jmlease:v1:cfg (passthrough → observe →
   # enforce, switched in the Manager). Unauthenticated connections are
   # refused. Principals file and reload handshake live in the shared
-  # directory below (the Manager writes Mac principals there, 0600).
+  # directory below (the Manager writes Mac principals there, 0600), and
+  # so does the per-person audit log (audit/, append-only, hash-chained;
+  # the Manager reads it). The log starts when the first person is added
+  # (JM_AUDIT=on: from the start; off: never) and keeps at most
+  # JM_AUDIT_RETAIN_MB (2048) / JM_AUDIT_RETAIN_DAYS (400) of segments.
   respproxy:
     image: ghcr.io/lelanddutcher/jm-respproxy@${JM_RESPPROXY_DIGEST:?set JM_RESPPROXY_DIGEST to the release sha256 digest}
     pull_policy: always
@@ -115,6 +119,21 @@ services:
       # Stage births require initial enforce mode. A later effective mode
       # override away from enforce makes stage operations HOLD; default off.
       JM_RESPPROXY_STAGE_BIRTH: "${JM_RESPPROXY_STAGE_BIRTH:-false}"
+      # Per-person audit log (see above): auto | on | off; retention in MB
+      # and days (0 = default, -1 = no limit).
+      JM_AUDIT: "${JM_AUDIT:-auto}"
+      JM_AUDIT_RETAIN_MB: "${JM_AUDIT_RETAIN_MB:-0}"
+      JM_AUDIT_RETAIN_DAYS: "${JM_AUDIT_RETAIN_DAYS:-0}"
+      # The smart folders the Manager runs (the same variables and defaults
+      # as the manager service below): its principal may remove an empty
+      # view folder it created directly under one of their roots. Every
+      # other removal or rename of a folder at project depth stays
+      # admin-only.
+      JM_SMART_FOLDERS: "${JM_SMART_FOLDERS:-off}"
+      JM_CONTINUITY: "${JM_CONTINUITY:-off}"
+      JM_SMART_FOLDERS_ROOT: "${JM_SMART_FOLDERS_ROOT:-Recents}"
+      JM_SMART_FOLDERS_COLLECTIONS_ROOT: "${JM_SMART_FOLDERS_COLLECTIONS_ROOT:-Collections}"
+      JM_SMART_FOLDERS_QUERIES_ROOT: "${JM_SMART_FOLDERS_QUERIES_ROOT:-Queries}"
       JM_PROXY_FARM_PASSWORD: "${JM_PROXY_FARM_PASSWORD:?set JM_PROXY_FARM_PASSWORD in server/.env}"
       JM_PROXY_MANAGER_PASSWORD: "${JM_PROXY_MANAGER_PASSWORD:?set JM_PROXY_MANAGER_PASSWORD in server/.env}"
       JM_PROXY_BG_PASSWORD: "${JM_PROXY_BG_PASSWORD:?set JM_PROXY_BG_PASSWORD in server/.env}"
@@ -124,6 +143,14 @@ services:
       - /mnt/zSSD/juicemount/respproxy:/etc/jm-respproxy   # EDIT — shared with Manager
 
   # ── MinIO: S3 object store for chunks ────────────────────────────
+  # Bucket versioning and MinIO audit logging are deliberately NOT enabled
+  # here (Teams slice 1). Versioning cannot be turned off once on (only
+  # suspended), and juicefs gc deletes without a version id, so every
+  # deleted or compacted object would stay on disk as a noncurrent version
+  # until an ILM expiry rule and MinIO's scanner remove it: space freed by
+  # gc would come back days later, on a NAS that may already be full.
+  # MinIO's audit log has no file target (webhook or Kafka only), so it
+  # needs a receiver this compose does not ship.
   minio:
     image: minio/minio:RELEASE.2025-01-20T14-49-07Z@sha256:ed9be66eb5f2636c18289c34c3b725ddf57815f2777c77b5938543b78a44f144
     restart: unless-stopped
@@ -132,6 +159,10 @@ services:
       MINIO_ROOT_USER: juicemount
       MINIO_ROOT_PASSWORD: "${MINIO_ROOT_PASSWORD:?set a strong existing MinIO root password before deploying}"
       MINIO_API_REQUESTS_DEADLINE: 10m
+      # Temporary (STS AssumeRole) credentials last at most 15 minutes, so
+      # none a client made for itself outlives a key rotation for long.
+      # MinIO issues them to any user without a policy check.
+      MINIO_STS_DURATION: 15m
     ports:
       - "30151:9000"                # Mac client connects here
       - "30152:9001"                # MinIO console — web UI
@@ -405,8 +436,11 @@ services:
       JM_FARM_NODE_META_URL: "${JM_FARM_NODE_META_URL:-}"
       JM_FARM_SERVER_IMAGE: "ghcr.io/lelanddutcher/juicefarm@${JM_FARM_DIGEST:?set JM_FARM_DIGEST to the release sha256 digest}"
       JM_FARM_RENDER_IMAGE: "ghcr.io/lelanddutcher/juicefarm-gpu@${JM_FARM_RENDER_DIGEST:?set JM_FARM_RENDER_DIGEST to the release sha256 digest}"
-      # 0.5 uses a user-owned system private route for remote clients. The
-      # embedded Headscale service remains an explicit advanced deployment.
+      # 0.5 uses a user-owned system private route for remote clients.
+      # JuiceMount Link (embedded Headscale + NAS tailnet node) is opt-in:
+      # apply server/docker-compose.link.yml on top of this file, which turns
+      # both on and publishes their ports (30193/tcp control, 41641/udp
+      # WireGuard). This file publishes neither while Link is off.
       JM_NET_HEADSCALE: "off"
       JM_NET_ALLOW_INSECURE: "0"
       JM_NET_ALLOW_LAN_ONLY: "0"
@@ -424,8 +458,16 @@ services:
       JM_SMART_FOLDERS: "${JM_SMART_FOLDERS:-off}"
       JM_SMART_FOLDERS_ROOT: "${JM_SMART_FOLDERS_ROOT:-Recents}"
       JM_SMART_FOLDERS_MAX_VIEWS: "${JM_SMART_FOLDERS_MAX_VIEWS:-256}"
+      # Continuity (off by default) and, with smart folders also on, its
+      # collection views under JM_SMART_FOLDERS_COLLECTIONS_ROOT and saved
+      # query views under JM_SMART_FOLDERS_QUERIES_ROOT. respproxy reads
+      # these same variables, so the two agree on the roots.
+      JM_CONTINUITY: "${JM_CONTINUITY:-off}"
+      JM_SMART_FOLDERS_COLLECTIONS_ROOT: "${JM_SMART_FOLDERS_COLLECTIONS_ROOT:-Collections}"
+      JM_SMART_FOLDERS_QUERIES_ROOT: "${JM_SMART_FOLDERS_QUERIES_ROOT:-Queries}"
     ports:
       - "30190:8080"                              # manager UI
+      # Link's 30193/tcp and 41641/udp: server/docker-compose.link.yml
     volumes:
       # Mount your existing-data datasets here, read-only. Each gets
       # browsed as /sources/<name> in the UI. Add as many lines as you

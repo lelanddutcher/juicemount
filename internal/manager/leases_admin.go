@@ -31,6 +31,7 @@ import (
 	"time"
 
 	"github.com/lelanddutcher/juicemount/internal/redisurl"
+	"github.com/lelanddutcher/juicemount/internal/respproxy"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -45,7 +46,7 @@ var (
 
 // projectDepth is jmlease:v1:cfg depth: a project is the directory two
 // levels below the volume root (/data/<Project>).
-const projectDepth = 2
+const projectDepth = respproxy.DefaultProjectDepth
 
 // LeaseGrant is a JM.LEASE ACQUIRE reply.
 type LeaseGrant struct {

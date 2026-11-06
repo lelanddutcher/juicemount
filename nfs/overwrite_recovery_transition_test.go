@@ -177,6 +177,14 @@ func TestStaleQuarantineCannotMoveRenameSuccessorSource(t *testing.T) {
 	}
 }
 
+// claimedFailureLockBound is how long the test below waits for failure cleanup
+// and continuation inspection while it holds entry.mu. The hold never ends on
+// its own, so an implementation that needs entry.mu blocks until this bound
+// whatever its value; the bound only has to exceed the legitimate SQLite
+// commits and quarantine move, which took over a second under -race on a
+// loaded CI host.
+const claimedFailureLockBound = 30 * time.Second
+
 func TestClaimedFailureCleanupDoesNotReverseEntryAndMetadataLocks(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
@@ -209,9 +217,9 @@ func TestClaimedFailureCleanupDoesNotReverseEntryAndMetadataLocks(t *testing.T) 
 			inspectDone := make(chan error, 1)
 			startedInspect := false
 			failureFinished, inspectFinished := false, false
-			deadline := time.NewTimer(time.Second)
+			deadline := time.NewTimer(claimedFailureLockBound)
 			defer deadline.Stop()
-			stopAt := time.Now().Add(time.Second)
+			stopAt := time.Now().Add(claimedFailureLockBound)
 			var waitErr string
 			for !failureFinished || !inspectFinished {
 				if !startedInspect {
@@ -228,7 +236,7 @@ func TestClaimedFailureCleanupDoesNotReverseEntryAndMetadataLocks(t *testing.T) 
 						}()
 					} else {
 						if time.Now().After(stopAt) {
-							waitErr = "claimed failure did not commit within one second"
+							waitErr = "claimed failure did not commit while entry.mu was held"
 							break
 						}
 						time.Sleep(time.Millisecond)
@@ -259,14 +267,14 @@ func TestClaimedFailureCleanupDoesNotReverseEntryAndMetadataLocks(t *testing.T) 
 			if !failureFinished {
 				select {
 				case <-failureDone:
-				case <-time.After(time.Second):
+				case <-time.After(claimedFailureLockBound):
 					t.Fatal("failure worker did not stop")
 				}
 			}
 			if startedInspect && !inspectFinished {
 				select {
 				case <-inspectDone:
-				case <-time.After(time.Second):
+				case <-time.After(claimedFailureLockBound):
 					t.Fatal("inspection worker did not stop")
 				}
 			}

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/go-git/go-billy/v5"
+	nfslib "github.com/lelanddutcher/juicemount/internal/nfs"
 	"github.com/lelanddutcher/juicemount/metadata"
 	"golang.org/x/sys/unix"
 )
@@ -387,6 +388,12 @@ func (fs *conflictHandleFS) Remove(string) error                         { retur
 func (fs *conflictHandleFS) MkdirAll(string, os.FileMode) error          { return syscall.EROFS }
 func (fs *conflictHandleFS) TempFile(string, string) (billy.File, error) { return nil, syscall.EROFS }
 func (fs *conflictHandleFS) Symlink(string, string) error                { return syscall.EROFS }
+
+// The mode-aware CREATE and RMDIR entry points refuse like Create and Remove.
+func (fs *conflictHandleFS) CreateMode(string, nfslib.CreateHow) (billy.File, error) {
+	return nil, syscall.EROFS
+}
+func (fs *conflictHandleFS) RemoveDirectory(string) error { return syscall.EROFS }
 
 // Mutations through a held conflict handle must not touch the old backend.
 type conflictHandleChange struct{}

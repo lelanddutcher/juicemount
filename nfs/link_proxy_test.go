@@ -532,12 +532,12 @@ func TestRedisResponseWatchdogDisarmsAfterReply(t *testing.T) {
 	}
 	defer conn.Close()
 	for i := 0; i < 2; i++ {
-		if _, err := conn.Write([]byte("PONG")); err != nil {
+		if _, err := conn.Write([]byte("+PONG\r\n")); err != nil {
 			t.Fatal(err)
 		}
-		got := make([]byte, 4)
+		got := make([]byte, len("+PONG\r\n"))
 		_ = conn.SetReadDeadline(time.Now().Add(time.Second))
-		if _, err := io.ReadFull(conn, got); err != nil || string(got) != "PONG" {
+		if _, err := io.ReadFull(conn, got); err != nil || string(got) != "+PONG\r\n" {
 			t.Fatalf("reply %d = %q, %v", i, got, err)
 		}
 		// A completed response disarms the watchdog until the next request.

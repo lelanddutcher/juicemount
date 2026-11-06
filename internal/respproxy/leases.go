@@ -128,7 +128,7 @@ type leaseCfg struct {
 }
 
 func defaultLeaseCfg() leaseCfg {
-	return leaseCfg{idle: defaultIdle, orphan: defaultOrphan, checkoutMax: defaultCheckoutMax, depth: 2}
+	return leaseCfg{idle: defaultIdle, orphan: defaultOrphan, checkoutMax: defaultCheckoutMax, depth: DefaultProjectDepth}
 }
 
 func ms(t time.Time) int64 { return t.UnixMilli() }
@@ -459,9 +459,7 @@ func (e *LeaseEngine) loadCfg() {
 		case "checkout_max_s":
 			c.checkoutMax = time.Duration(n) * time.Second
 		case "depth":
-			if n <= 16 {
-				c.depth = int(n)
-			}
+			c.depth = ProjectDepth(string(v.Elems[i+1].Str))
 		}
 	}
 	e.cfgMu.Lock()

@@ -99,6 +99,10 @@ func rawBirth(t *testing.T, r *replacementRig) (replaceguard.Birth, [][]string) 
 	attr := (&meta.Attr{Typ: meta.TypeFile, Mode: 0600, Nlink: 1, Parent: 3, Mtime: 10, Mtimensec: 1, Ctime: 10, Ctimensec: 2}).Marshal()
 	hash := sha256.Sum256(attr)
 	op := strings.Repeat("d", 32)
+	// mac1's juicefs took 101 from its own nextinode batch.
+	if err := r.tp.Guard.inodes.Record(101, 101, "mac1"); err != nil {
+		t.Fatal(err)
+	}
 	b := replaceguard.Birth{Version: 1, OperationID: op, Owner: "mac1", Proxy: r.tp.Incarnation(), Database: testDB, BackendUUID: "12345678-1234-1234-1234-123456789abc", Project: 3, Epoch: 1, Parents: []replaceguard.Parent{{Inode: 1}, {Inode: 2, Name: "Projects"}, {Inode: 3, Name: "A"}}, Stage: replaceguard.File{Inode: 101, Parent: 3, Name: replaceguard.BirthStageName(op), MtimeNS: 10000000001, CtimeNS: 10000000002}, Type: 1, Nlink: 1, Mode: 0600, AttrSHA256: hex.EncodeToString(hash[:])}
 	return b, [][]string{{"SET", "i101", string(attr)}, {"HSET", "d3", b.Stage.Name, mkEntry(typeFile, 101)}, {"INCRBY", "usedSpace", "4096"}, {"INCR", "totalInodes"}}
 }
