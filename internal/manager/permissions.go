@@ -8,8 +8,9 @@
 //	                                           recursive chown+chmod remedy
 //	GET/PUT /api/permissions/default-owner     the default migration owner (rule #0)
 //
-// Everything is confined to the JuiceFS volume via jfsPathAllowed BEFORE any
-// path rewrite, and every endpoint requires embedded mode (a.fuseMount != "")
+// Everything is confined to the JuiceFS volume via confineVolumePath, which
+// cleans the path once, rewrites it, and refuses one that resolves outside
+// the FUSE mount. Every endpoint requires embedded mode (a.fuseMount != "")
 // because chown/chmod need a real filesystem to touch — standalone returns 501.
 // Today's single default owner is rule #0 of a future per-path ACL list.
 package manager
@@ -116,11 +117,15 @@ func (a *API) handlePermissionsInspect(w http.ResponseWriter, r *http.Request) {
 	if userPath == "" {
 		userPath = a.destMount
 	}
-	if !a.jfsPathAllowed(userPath) { // GATE before rewrite
+	// GATE: clean once, rewrite, and confine where the kernel lands. A
+	// symlink that leads out of the volume is refused. Only the cleaned
+	// values are used below.
+	vp, err := a.confineVolume(userPath, true)
+	if err != nil {
 		http.Error(w, "path outside the JuiceFS volume", http.StatusForbidden)
 		return
 	}
-	real := userToFusePath(userPath, a.fuseMount, a.destMount)
+	userPath, real := vp.User, vp.Fuse
 	ownerUID, ownerGID := a.jobs.MountOwner()
 
 	fi, err := os.Lstat(real)
@@ -181,17 +186,33 @@ func (a *API) handlePermissionsFix(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "path is required", http.StatusBadRequest)
 		return
 	}
-	if !a.jfsPathAllowed(req.Path) { // GATE before rewrite
+	// GATE: clean once, rewrite, and confine where the kernel lands. A
+	// symlink that leads out of the volume is refused.
+	vp, err := a.confineVolume(req.Path, true)
+	if err != nil {
 		http.Error(w, "path outside the JuiceFS volume", http.StatusForbidden)
 		return
 	}
-	real := userToFusePath(req.Path, a.fuseMount, a.destMount)
-	if real == strings.TrimSuffix(a.fuseMount, "/") {
+	// chmod and chown get the RESOLVED path, so neither follows a
+	// symlink named on the command line. While recursing, GNU chmod -R
+	// skips symlinks and chown -R -h changes the link itself, so a
+	// symlink found mid-walk is never followed out of the volume.
+	real := vp.Real
+	if vp.Fuse == strings.TrimSuffix(a.fuseMount, "/") || real == vp.MountReal {
 		http.Error(w, "refusing to fix the entire volume root — name a subpath", http.StatusBadRequest)
 		return
 	}
-	if isInsideTrash(real, a.fuseMount) {
+	if isInsideTrash(vp.Fuse, a.fuseMount) || isInsideTrash(real, vp.MountReal) {
 		http.Error(w, "refusing to fix inside .trash", http.StatusBadRequest)
+		return
+	}
+	if _, err := os.Lstat(real); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			http.Error(w, "path not found", http.StatusNotFound)
+			return
+		}
+		log.Printf("manager: permissions fix Lstat(%q): %v", real, err) // don't echo real path
+		http.Error(w, "cannot stat path", http.StatusBadRequest)
 		return
 	}
 
@@ -210,8 +231,8 @@ func (a *API) handlePermissionsFix(w http.ResponseWriter, r *http.Request) {
 	}
 	chmodArgs := []string{"-R", "u+rwX,g+rwX,o+rX", real}
 	if !req.Recursive {
-		chmodArgs = chmodArgs[1:]                   // drop -R
-		cargs = []string{chownSpec(uid, gid), real} // non-recursive chown
+		chmodArgs = chmodArgs[1:]                         // drop -R
+		cargs = []string{"-h", chownSpec(uid, gid), real} // non-recursive chown
 	}
 	ctx := r.Context()
 	if out, err := exec.CommandContext(ctx, "chmod", chmodArgs...).CombinedOutput(); err != nil {
@@ -229,7 +250,7 @@ func (a *API) handlePermissionsFix(w http.ResponseWriter, r *http.Request) {
 		scope = "on the named path only"
 	}
 	writeJSON(w, http.StatusOK, permFixResponse{
-		Path: req.Path, UID: uid, GID: gid,
+		Path: vp.User, UID: uid, GID: gid,
 		Note: fmt.Sprintf("chmod u+rwX,g+rwX,o+rX + chown %s applied %s", chownSpec(uid, gid), scope),
 	})
 }

@@ -195,6 +195,20 @@ type RunSyncSpec struct {
 // Emits ProgressEvent on `progress` each time juicefs writes a
 // recognized progress line. Blocks until juicefs exits or ctx cancels.
 func RunSync(ctx context.Context, juicefsBin string, spec RunSyncSpec, source, destination string, opts SyncOptions, extraEnv []string, progress chan<- ProgressEvent) error {
+	// Point-of-use volume boundary: a /jfs source or destination is
+	// cleaned, and refused if it resolves outside the FUSE mount (a
+	// symlink stored in the volume). The cleaned value is used from here
+	// on. This also covers jobs that did not come through an API gate
+	// (stored schedules, resumed jobs).
+	var err error
+	if spec.Mode == ModeEmbedded {
+		if source, err = confineSyncVolumePath(source, spec.FUSEMount); err != nil {
+			return err
+		}
+		if destination, err = confineSyncVolumePath(destination, spec.FUSEMount); err != nil {
+			return err
+		}
+	}
 	// Never into a smart-folder root (sync_smartroots.go), also for
 	// scheduled jobs that did not pass validateDirectionPair.
 	if err := checkSyncSmartRoots(os.Getenv, os.ReadDir, source, destination, spec.FUSEMount); err != nil {
@@ -450,7 +464,7 @@ func chownSpec(uid, gid int) string {
 	return strconv.Itoa(uid)
 }
 
-// chownArgs builds the `chown -R <uid[:gid]> <target>` argument vector, or
+// chownArgs builds the `chown -R -h <uid[:gid]> <target>` argument vector, or
 // nil when no chown should run — uid <= 0 (unset / root: never a valid
 // client owner, and root-owned is exactly the bug we're fixing) or an empty
 // target. Split out for testability so we can assert the exact argv without
@@ -459,7 +473,10 @@ func chownArgs(uid, gid int, target string) []string {
 	if uid <= 0 || target == "" {
 		return nil
 	}
-	return []string{"-R", chownSpec(uid, gid), target}
+	// -h: change a symlink itself, never its target, so a symlink in the
+	// tree cannot lead the chown outside it. GNU chown -R already does
+	// this by default (-P); -h makes it explicit.
+	return []string{"-R", "-h", chownSpec(uid, gid), target}
 }
 
 // pollJuicefsMetrics scrapes the juicefs sync Prometheus endpoint every
