@@ -178,14 +178,17 @@ proxy:
   each Mac on `http://<nas>:30190/principals.html` after checking that the
   fingerprint the Mac shows matches the list. The Manager refuses Approve,
   and refuses to open the auto-approve window, unless the proxy is live:
-  `reload.ack` repeats a whole `reload.request` line this Manager process
-  wrote (sha256, time and nonce, so an ack left from before a Manager restart
-  never counts), AND `reload.heartbeat`, which the entrypoint rewrites every
-  2 s, is less than 6 s old (so a proxy that stopped while the Manager kept
-  running stops counting within 6 s). Before the cutover it answers 409 "the
+  each Approve (and each opening of the window) writes a fresh
+  `reload.request` line (sha256, time and nonce) and waits, up to 6 s, until
+  `reload.applied` repeats that line or a later one this Manager process
+  wrote, AND `reload.heartbeat`, which the proxy rewrites every 2 s, is less
+  than 6 s old. A receipt written before the Approve never counts, so one
+  left behind by an earlier proxy or Manager proves nothing; Approve takes up
+  to one 2 s proxy tick. Before the cutover it answers 409 "the
   Redis proxy is not live yet"; a stopped proxy gets "the Redis proxy has
-  stopped"; a proxy image older than the heartbeat gets "Update the
-  jm-respproxy image". A Mac approved early does not switch anyway: the app logs in as
+  stopped"; a proxy image older than the heartbeat or than `reload.applied`
+  gets "Update the jm-respproxy image". A Mac approved early does not switch
+  anyway: the app logs in as
   its principal first and keeps its current login, showing "Approved —
   waiting for the server cutover", until the server accepts the new one.
 - The server mounts (`juicefs`, farm, Manager) were recreated by stages 4 and

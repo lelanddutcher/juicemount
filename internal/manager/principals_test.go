@@ -284,29 +284,28 @@ func TestH8BPrincipalsFileWrittenAtomically0600(t *testing.T) {
 	old := syscall.Umask(0)
 	defer syscall.Umask(old)
 
-	// The proxy is live: it acknowledged a request of this Manager and its
-	// heartbeat is fresh (this test's signaler writes no files, so the
-	// handshake is written directly and the line recorded as issued below).
-	for _, f := range []string{reloadRequestName, reloadAckName, reloadHeartbeatName} {
-		if err := os.WriteFile(filepath.Join(dir, f), []byte("live 1\n"), 0o600); err != nil {
-			t.Fatal(err)
-		}
-	}
-	sig := &recordingSignaler{}
-	s, err := NewPrincipalStore(PrincipalStoreOptions{
-		StatePath: filepath.Join(dir, "store.json"),
-		ProxyDir:  dir,
-		Signal:    sig,
-	})
+	s, err := NewPrincipalStore(PrincipalStoreOptions{StatePath: filepath.Join(dir, "store.json"), ProxyDir: dir})
 	if err != nil {
 		t.Fatal(err)
 	}
-	s.issued = append(s.issued, issuedRequest{line: "live 1", at: time.Now().Add(-time.Minute)}) // written before the heartbeat
 	r, err := s.Enroll(EnrollRequest{InstanceID: testInstanceID, Host: "Edit-Bay-2", Secret: testMacSecret}, "192.0.2.1")
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Approve needs a live proxy that applies the request it writes, so it
+	// runs with the reload.request signaler; this test's signaler records
+	// the writes after it.
+	stopProxy := startFakeProxyAck(t, dir)
 	if err := s.Approve(r.Principal); err != nil {
+		t.Fatal(err)
+	}
+	stopProxy()
+	sig := &recordingSignaler{}
+	s.mu.Lock()
+	s.opts.Signal = sig
+	err = s.writeProxyFilesLocked()
+	s.mu.Unlock()
+	if err != nil {
 		t.Fatal(err)
 	}
 	st, err := os.Stat(path)

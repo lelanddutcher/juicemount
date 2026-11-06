@@ -597,7 +597,9 @@ type PrincipalStore struct {
 	// issued: the reload.request lines this process wrote (newest last,
 	// bounded). An ack counts only when it repeats one of them, so an ack
 	// left by a proxy before this Manager started never counts (F1).
-	issued []issuedRequest
+	// issuedSeq numbers them (issuedRequest.seq).
+	issued    []issuedRequest
+	issuedSeq uint64
 	// ackSeen, ackSeenAt: the reload.applied line last read, and when this
 	// process first read it (proxyOutdatedGrace).
 	ackSeen   string
@@ -629,10 +631,12 @@ type PrincipalStore struct {
 	agentTokens map[string]*AgentToken
 }
 
-// issuedRequest is one reload.request line this process wrote and when.
+// issuedRequest is one reload.request line this process wrote, when, and
+// its number in write order (1, 2, ...).
 type issuedRequest struct {
 	line string
 	at   time.Time
+	seq  uint64
 }
 
 // maxIssuedRequests bounds PrincipalStore.issued.
@@ -1302,8 +1306,14 @@ func (s *PrincipalStore) proxyStateForAckLocked(ack, legacy string) proxyState {
 	}
 	acked := s.issuedAckLocked(ack)
 	ours := acked >= 0
-	if !ours && (s.issuedAckLocked(legacy) >= 0 || s.oldStyleAckLocked(legacy)) {
-		return proxyOutdated // signal-only receipts never prove applied credentials
+	if s.issuedAckLocked(legacy) > acked || (!ours && s.oldStyleAckLocked(legacy)) {
+		// Signal-only receipts never prove applied credentials. A current
+		// image writes reload.applied before reload.ack, and readAcksLocked
+		// reads them so that its reload.ack is never the newer of the two:
+		// a newer reload.ack comes from an image that writes no
+		// reload.applied, also one started after a current image left its
+		// receipt behind.
+		return proxyOutdated
 	}
 	hb, err := os.Stat(filepath.Join(s.opts.ProxyDir, reloadHeartbeatName))
 	if !ours && s.oldStyleAckLocked(ack) {
@@ -1388,35 +1398,50 @@ func proxyStateErr(st proxyState) error {
 	return ErrProxyNotLive
 }
 
-// requireProxyLive returns nil when the proxy is live. Otherwise it rewrites
-// the proxy files (the same idempotent write NewPrincipalStore does, which
-// also writes a fresh reload.request: a proxy started after the last request
-// never answers that one) and waits up to proxyAckWait for the ack. An
-// outdated proxy image is reported as soon as it answers.
+// requireProxyLive returns nil once the proxy files read live AND the proxy
+// has applied a reload.request this call wrote, or a later one. A receipt
+// for an earlier request proves only the proxy that wrote it: an image from
+// before reload.applied, started since, never deletes that receipt and
+// keeps the heartbeat fresh, so a receipt that already stood when the call
+// began could vouch for a proxy without the applied-reload guarantees. Each
+// call therefore rewrites the proxy files (the same idempotent write
+// NewPrincipalStore does, with a fresh reload.request) and waits up to
+// proxyAckWait for the proxy's next tick. Calls that overlap share a tick:
+// the receipt for a later request covers an earlier one. An outdated proxy
+// image is reported as soon as it answers.
 func (s *PrincipalStore) requireProxyLive() error {
 	s.mu.Lock()
-	if s.proxyLiveLocked() {
-		s.mu.Unlock()
-		return nil
-	}
 	if s.opts.ProxyDir == "" {
 		s.mu.Unlock()
 		return fmt.Errorf("%w; no proxy directory is configured (JM_RESPPROXY_DIR)", ErrProxyNotLive)
 	}
+	from := s.issuedSeq + 1
 	err := s.writeProxyFilesLocked()
+	if err == nil && s.issuedSeq < from {
+		err = errors.New("no reload.request was written")
+	}
 	s.mu.Unlock()
 	if err != nil {
-		return fmt.Errorf("%w; re-requesting a reload failed: %v", ErrProxyNotLive, err)
+		return fmt.Errorf("%w; requesting a reload failed: %v", ErrProxyNotLive, err)
 	}
 	deadline := time.Now().Add(proxyAckWait)
 	for {
 		s.mu.Lock()
-		st := s.proxyStateLocked()
+		ack, legacy := s.readAcksLocked()
+		st := s.proxyStateForAckLocked(ack, legacy)
+		fresh := false
+		if i := s.issuedAckLocked(ack); i >= 0 {
+			fresh = s.issued[i].seq >= from
+		}
 		s.mu.Unlock()
-		if st == proxyLive {
+		if st == proxyLive && fresh {
 			return nil
 		}
 		if st == proxyOutdated || !time.Now().Before(deadline) {
+			if st == proxyLive {
+				// Live only by a receipt older than this call.
+				st = proxyStalled
+			}
 			return proxyStateErr(st)
 		}
 		time.Sleep(50 * time.Millisecond)
@@ -1886,7 +1911,8 @@ func (s *PrincipalStore) writeProxyFilesLocked() error {
 			// Only a line this process wrote can prove the proxy live.
 			var line string
 			if line, err = fs.reloadLine(sha); err == nil {
-				s.issued = append(s.issued, issuedRequest{line: line, at: time.Now()})
+				s.issuedSeq++
+				s.issued = append(s.issued, issuedRequest{line: line, at: time.Now(), seq: s.issuedSeq})
 				if len(s.issued) > maxIssuedRequests {
 					s.issued = append([]issuedRequest(nil), s.issued[len(s.issued)-maxIssuedRequests:]...)
 				}

@@ -83,9 +83,8 @@ func fakeProxyWrite(dir, name, line string) {
 }
 
 // approveIssuedRequests runs Approve and returns how many reload requests it
-// wrote. A live proxy lets Approve through at once, so it writes exactly one,
-// for its own change. Approve that found the proxy not live first re-requests
-// a reload and waits for the acknowledgement, so it writes two.
+// wrote: one that the proxy must apply before Approve proceeds
+// (requireProxyLive), and one for its own change.
 func approveIssuedRequests(s *PrincipalStore, name string) (int, error) {
 	count := func() int {
 		s.mu.Lock()
@@ -352,10 +351,12 @@ func readStringOK(path string) string {
 // writes a new reload.request; when liveness required the ack of the newest
 // request, an approval less than one entrypoint tick after another was
 // refused. The fake proxy here answers on a 2 s tick, like the entrypoint.
-// Eight approvals 400 ms apart span two ticks, so the stall rule (review 4
-// A2: requests left unacknowledged for longer than proxyAckWait) is
-// exercised against a live proxy too: none may be refused, and none may
-// re-request a reload and wait for the proxy's next tick.
+// Eight approvals 400 ms apart span several ticks, so the stall rule (review
+// 4 A2: requests left unacknowledged for longer than proxyAckWait) is
+// exercised against a live proxy too: none may be refused. Each waits for
+// the proxy to apply the request it wrote first (a receipt older than the
+// call proves nothing about the proxy running now), and writes exactly that
+// one besides its change's.
 func TestH8BSerialApprovalsWithLiveProxy(t *testing.T) {
 	dir := t.TempDir()
 	s, err := NewPrincipalStore(PrincipalStoreOptions{StatePath: filepath.Join(dir, "store.json"), ProxyDir: dir})
@@ -396,8 +397,8 @@ func TestH8BSerialApprovalsWithLiveProxy(t *testing.T) {
 			t.Errorf("approve %d, 400 ms after the previous one: %v", i+1, err)
 			continue
 		}
-		if issued != 1 {
-			t.Errorf("approve %d wrote %d reload requests: it re-requested a reload and waited for a proxy that is live", i+1, issued)
+		if issued != 2 {
+			t.Errorf("approve %d wrote %d reload requests, want 2 (its proof request and its change)", i+1, issued)
 		}
 	}
 	t.Logf("serial approvals 400 ms apart: %d/%d refused", refused, len(names)-1)
@@ -527,5 +528,86 @@ func TestH8BProxyStartBetweenReadsIsNotOutdated(t *testing.T) {
 	}
 	if snap.ProxyProblem == proxyProblemText(proxyOutdated) {
 		t.Fatalf("a proxy start between the receipt reads read as an outdated image: %q", snap.ProxyProblem)
+	}
+}
+
+// TestH8BDowngradedProxyStaleReceiptRefused: the proxy image is replaced,
+// while the Manager keeps running, by one that predates reload.applied. The
+// current proxy's last receipt stays on disk (an older image never deletes
+// it) and repeats the newest request of this Manager, and the older image
+// keeps reload.heartbeat fresh. That receipt proves nothing about the proxy
+// running now: Approve and the auto-approve window must be refused, whether
+// the older image answers in reload.ack only or not at all. A current image
+// started again passes.
+func TestH8BDowngradedProxyStaleReceiptRefused(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		legacyAck bool // the older image answers in reload.ack
+		want      error
+	}{
+		{"signal-only-image", true, ErrProxyImageOutdated},
+		{"silent-image", false, ErrProxyStalled},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			shortProxyAckWait(t)
+			dir := t.TempDir()
+			s, err := NewPrincipalStore(PrincipalStoreOptions{StatePath: filepath.Join(dir, "store.json"), ProxyDir: dir})
+			if err != nil {
+				t.Fatal(err)
+			}
+			a, b, c := enrollTestMac(t, s, 0), enrollTestMac(t, s, 1), enrollTestMac(t, s, 2)
+			stop := approvedWithLiveProxy(t, s, dir, a)
+			deadline := time.Now().Add(2 * time.Second)
+			for !s.Snapshot().ReloadApplied && time.Now().Before(deadline) {
+				time.Sleep(10 * time.Millisecond)
+			}
+			if !s.Snapshot().ReloadApplied {
+				t.Fatal("setup: the proxy never applied the newest request")
+			}
+			stop()
+
+			oldStop, oldDone := make(chan struct{}), make(chan struct{})
+			go func() { // the older image: starts from the current request, never writes reload.applied
+				defer close(oldDone)
+				last := readStringOK(filepath.Join(dir, reloadRequestName))
+				for {
+					select {
+					case <-oldStop:
+						return
+					case <-time.After(5 * time.Millisecond):
+					}
+					if req := readStringOK(filepath.Join(dir, reloadRequestName)); tc.legacyAck && req != last && req != "" {
+						fakeProxyWrite(dir, legacyReloadAckName, strings.TrimSpace(req))
+						last = req
+					}
+					fakeProxyWrite(dir, reloadHeartbeatName, "1")
+				}
+			}()
+			stopOld := func() { close(oldStop); <-oldDone }
+			time.Sleep(50 * time.Millisecond)
+
+			if err := s.Approve(b); !errors.Is(err, tc.want) {
+				t.Fatalf("Approve with the older proxy image and a stale receipt = %v, want %v", err, tc.want)
+			}
+			if got := s.Snapshot().byName(b); got == nil || got.Status != PrincipalPending {
+				t.Fatalf("refused approve changed the record: %+v", got)
+			}
+			if _, err := s.SetAutoApproveWindow(time.Hour); !errors.Is(err, tc.want) {
+				t.Fatalf("auto-approve window with the older proxy image = %v, want %v", err, tc.want)
+			}
+			stopOld()
+
+			// A current image again: it deletes both receipts as it starts
+			// (respproxy.NewPrincipalReloader).
+			for _, n := range []string{legacyReloadAckName, reloadAckName} {
+				if err := os.Remove(filepath.Join(dir, n)); err != nil && !os.IsNotExist(err) {
+					t.Fatal(err)
+				}
+			}
+			startFakeProxyAck(t, dir)
+			if err := s.Approve(c); err != nil {
+				t.Fatalf("Approve after a current proxy image started again: %v", err)
+			}
+		})
 	}
 }
