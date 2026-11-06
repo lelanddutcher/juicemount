@@ -16,12 +16,21 @@
 #                       Redis back on 30179 with every principal mirrored as a
 #                       plain ACL user. Images unchanged.
 #   --proxy-restore     undo --proxy-rollback: the proxy takes 30179 again.
+#
+# Every topology mode recreates Redis, and so does its automatic rollback.
+# Each time, before anything stops, the running Redis rewrites its
+# append-only file (lib/redis-compact.sh), and the change stops if that
+# rewrite does not finish. --allow-aof-replay matters only when Redis is
+# already down and server/redis.acl still has the 0.5.0 default line: it
+# accepts that the start drops every replayed transaction.
 set -euo pipefail
+# shellcheck source=lib/redis-compact.sh
+. "$(cd "$(dirname "$0")" && pwd)/lib/redis-compact.sh"
 
 usage() {
   echo 'usage: rollout-compose.sh --project NAME --manager-digest sha256:HEX --farm-digest sha256:HEX --render-digest sha256:HEX --ack-worker-quiesced [--repo PATH] [--dry-run]' >&2
-  echo '       rollout-compose.sh --project NAME --cutover-proxy --previous-ref GIT_REF --manager-digest ... --farm-digest ... --render-digest ... --ack-worker-quiesced --ack-macs-drained [--repo PATH] [--dry-run]' >&2
-  echo '       rollout-compose.sh --project NAME (--proxy-rollback | --proxy-restore) --ack-worker-quiesced --ack-macs-drained [--repo PATH] [--dry-run]' >&2
+  echo '       rollout-compose.sh --project NAME --cutover-proxy --previous-ref GIT_REF --manager-digest ... --farm-digest ... --render-digest ... --ack-worker-quiesced --ack-macs-drained [--allow-aof-replay] [--repo PATH] [--dry-run]' >&2
+  echo '       rollout-compose.sh --project NAME (--proxy-rollback | --proxy-restore) --ack-worker-quiesced --ack-macs-drained [--allow-aof-replay] [--repo PATH] [--dry-run]' >&2
   exit "${1:-2}"
 }
 
@@ -35,6 +44,7 @@ ACK_MACS=0
 DRY_RUN=0
 MODE=release
 PREVIOUS_REF=""
+ALLOW_AOF_REPLAY=0
 set_mode() { [ "$MODE" = release ] || usage 2; MODE="$1"; }
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -49,6 +59,7 @@ while [ "$#" -gt 0 ]; do
     --render-digest) RENDER_DIGEST="$2"; shift 2 ;;
     --ack-worker-quiesced) ACK_QUIESCED=1; shift ;;
     --ack-macs-drained) ACK_MACS=1; shift ;;
+    --allow-aof-replay) ALLOW_AOF_REPLAY=1; shift ;;
     --dry-run) DRY_RUN=1; shift ;;
     -h|--help) usage 0 ;;
     *) usage 2 ;;
@@ -83,6 +94,9 @@ case "$MODE" in
   *)
     [ -z "$MANAGER_DIGEST$FARM_DIGEST$RENDER_DIGEST" ] || { echo "rollout-compose: --$MODE keeps the running images; do not pass digests" >&2; exit 2; } ;;
 esac
+if [ "$MODE" = release ] && [ "$ALLOW_AOF_REPLAY" = 1 ]; then
+  echo 'rollout-compose: a release rollout never restarts Redis; --allow-aof-replay is for the topology modes' >&2; exit 2
+fi
 if [ "$MODE" != release ] && [ "$ACK_MACS" != 1 ]; then
   # Redis restarts: a Mac still writing loses its session and, after a swap,
   # owns no session record at the proxy (BG_ONLY/ADMIN_ONLY refusals).
@@ -149,15 +163,18 @@ if [ "$DRY_RUN" = 1 ]; then
       echo 'refuse a respproxy image whose org.opencontainers.image.revision does not descend from server/respproxy/min-gate-commit'
       echo 'require JM_REDIS_PROXY_PASSWORD and JM_PROXY_{FARM,MANAGER,BG,WEBDAV,ADMIN}_PASSWORD in server/.env'
       echo 'operator: every Mac drained its spool to zero and quit JuiceMount (--ack-macs-drained)'
+      echo 'before stage 0: running Redis rewrites its AOF (BGREWRITEAOF as jm-admin); refuse with nothing stopped unless it finishes'
       echo 'stage 0: stop farm, Manager, juicefs (quiesce; Redis gets a 120 s SIGTERM grace for its RDB save)'
       echo 'stage 1: recreate redis (no host port, ACL default off); force jmlease:v1:cfg mode=passthrough; stage 2: start respproxy on 30179'
       echo 'stage 3: rerun juicefs-init through the proxy; stage 4: juicefs; stage 5: Manager + farm on new digests'
       echo 'any failure: remove respproxy, recreate every stage from the pre-proxy compose with the previous digests' ;;
     proxy-rollback)
       echo 'build the rollback ACL: server principals from server/.env + enrolled Macs from the Manager (sha256 only)'
-      echo 'write it to the Redis data dir; remove respproxy; recreate redis on 30179 with the rollback ACL'
+      echo 'write it to the Redis data dir; running Redis rewrites its AOF (refuse unless it finishes)'
+      echo 'remove respproxy; recreate redis on 30179 with the rollback ACL'
       echo 'recreate juicefs-init, juicefs, Manager and farm pointing straight at Redis; on failure restore the proxy' ;;
     proxy-restore)
+      echo 'running Redis rewrites its AOF (refuse unless it finishes)'
       echo 'stop farm, Manager, juicefs; recreate redis without a host port; force mode=passthrough; start respproxy on 30179'
       echo 'recreate juicefs-init, juicefs, Manager, farm'
       echo 'on failure return to the rollback topology' ;;
@@ -178,6 +195,9 @@ fi
 printf '%s %s\n' "$$" "$SOURCE_COMMIT" > "$LOCK/owner"
 LOCK_HELD=1
 ROLLBACK_ARMED=0
+# Set once apply_topology has compacted Redis and may stop services. Until
+# then a failed topology change has nothing to roll back.
+STACK_TOUCHED=0
 FALLBACK_TOPO=""
 ENV_STAGED=0
 ENV_TEMP=""
@@ -244,7 +264,9 @@ on_exit() {
       log 'CRITICAL: private .env could not be restored; backup retained under lock'
     fi
   fi
-  if [ "$status" -ne 0 ] && [ "$ROLLBACK_ARMED" = 1 ] && [ "$MODE" != release ]; then
+  if [ "$status" -ne 0 ] && [ "$ROLLBACK_ARMED" = 1 ] && [ "$MODE" != release ] && [ "$STACK_TOUCHED" = 0 ]; then
+    log 'topology change refused before any service stopped; the stack is unchanged'
+  elif [ "$status" -ne 0 ] && [ "$ROLLBACK_ARMED" = 1 ] && [ "$MODE" != release ]; then
     log "topology change failed; restoring the $FALLBACK_TOPO topology with the previous images"
     if ! apply_topology "$FALLBACK_TOPO" "${OLD_MANAGER##*@}" "${OLD_FARM##*@}" "$OLD_RENDER_DIGEST"; then
       rollback_failed=1
@@ -559,6 +581,11 @@ recreate_topo() { # topology, manager, farm, render digests, services...
 # handover: exactly one service holds host port 30179 at any time.
 apply_topology() { # topology, manager, farm, render digests
   local topo="$1" m="$2" f="$3" r="$4" id
+  # Compact first, under the Redis that is still running and before anything
+  # stops: a failure here leaves the stack exactly as it was.
+  log 'stage: compact the Redis AOF (BGREWRITEAOF) before anything stops'
+  jm_redis_before_restart "$PROJECT" "$(redis_acl_for "$topo")" "$ALLOW_AOF_REPLAY" || return 1
+  STACK_TOUCHED=1
   # Quiesce: stop every server-side volume client first, so nothing writes
   # while Redis restarts and its SIGTERM RDB save (120 s grace) completes.
   log 'stage: quiesce server volume clients (farm, Manager, juicefs)'
@@ -593,6 +620,15 @@ apply_topology() { # topology, manager, farm, render digests
   wait_healthy juicefs || return 1
   log 'stage: Manager and farm'
   recreate_topo "$topo" "$m" "$f" "$r" juicemount-manager juicefarm || return 1
+}
+# The ACL template a Redis started in this topology renders. The pre-proxy
+# compose normally runs Redis without one (empty); if it mounts the
+# template, that is the same server/redis.acl.
+redis_acl_for() { # topology
+  if [ "$1" = pre ] && ! grep -Eq 'redis\.acl|aclfile' "$PRE_COMPOSE"; then
+    return 0
+  fi
+  printf '%s\n' "$REPO/server/redis.acl"
 }
 force_passthrough() { # redis container id: HSET through the loopback-only jm-admin
   local out

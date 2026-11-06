@@ -82,6 +82,9 @@ or farm workers.
   Update a 0.5.0 server only in the order under **Upgrading the Redis proxy
   and Manager** below: in the wrong order, the update itself can corrupt
   the folder tree.
+- Server scripts that recreate Redis first make it rewrite its append-only
+  file, and stop with nothing changed if that rewrite does not finish. So
+  the restart replays no transaction that an earlier start refused.
 - A fresh server install creates the `zpool` bucket before it sets up the
   object-store users. Before, setup used the restricted format key, which
   cannot create buckets, so a first install failed. An existing bucket and its
@@ -396,6 +399,18 @@ new workers against the same Redis at the same time:
   Changes lost at an earlier 0.5.0 restart are not recovered by these steps.
   Recovering them from the copy in step 2 is a manual restore, not a
   replay.
+- `server/scripts/rollout-compose.sh` now does step 3 itself whenever it
+  recreates Redis (`--cutover-proxy`, `--proxy-rollback`, `--proxy-restore`
+  and their automatic rollbacks). It runs the rewrite and waits for all three
+  fields before it stops anything. If the rewrite fails or does not finish
+  within 10 minutes (`JM_REDIS_COMPACT_TIMEOUT`, in seconds), the script
+  stops and the stack is unchanged. If Redis is already down, nothing can be
+  rewritten. The script then says that the start replays the whole file. It
+  refuses to start Redis while `server/redis.acl` still has the 0.5.0
+  `user default ... -@all` line, unless you pass `--allow-aof-replay`. A
+  release rollout and `server/scripts/update-server.sh` never restart Redis.
+  Steps 1 to 4 still apply to every other restart: by hand, by the NAS app,
+  or by a NAS reboot.
 - The security fix under **Server** is in the Redis proxy, so it protects a
   volume once that volume's proxy runs this release. Macs and farm workers
   need no update for it. `server/scripts/rollout-compose.sh` refuses a proxy

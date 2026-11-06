@@ -166,11 +166,20 @@ assert_no_infra_mutation() {
     grep -E 'docker compose .* (up|rm) .* (redis|minio|respproxy|juicefs)( |$)' "$FAKE_LOG" >/dev/null; then
     echo 'FAIL: protected service mutation' >&2; exit 1
   fi
+  # A release never stops Redis, so it has no AOF to compact.
+  if grep -E 'BGREWRITEAOF|^docker ps ' "$FAKE_LOG" >/dev/null; then
+    echo 'FAIL: release rollout touched Redis' >&2; exit 1
+  fi
 }
 reset_case
 bash "$SCRIPT" "${args[@]}" --dry-run > "$WORK/out"
 [ ! -s "$FAKE_LOG" ] && [ ! -e "$REPO/.update-lock" ]
 echo 'ok: dry run has no side effects'
+
+reset_case
+if bash "$SCRIPT" "${args[@]}" --allow-aof-replay > "$WORK/out" 2>&1; then echo 'FAIL: release accepted --allow-aof-replay' >&2; exit 1; fi
+grep -q 'never restarts Redis' "$WORK/out" && [ ! -s "$FAKE_LOG" ] && [ ! -e "$REPO/.update-lock" ]
+echo 'ok: release rollout refuses the AOF replay override (it never restarts Redis)'
 
 reset_case
 bash "$SCRIPT" "${args[@]}" > "$WORK/out"

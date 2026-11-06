@@ -117,6 +117,11 @@ if [ "$1" = compose ]; then
         fi
         [ "$topo" = proxy ] && [ "$s" = respproxy ] && [ "$FAKE_FAIL" = respproxy_start ] && exit 1
         printf '%s' "$topo" > "$FAKE_STATE/$s"
+        # A Redis that exits right after its recreate (crash loop).
+        if [ "$s" = redis ]; then
+          rm -f "$FAKE_STATE/redis.down"
+          [ "$topo" = "${FAKE_REDIS_DIES:-}" ] && : > "$FAKE_STATE/redis.down"
+        fi
         if [ "$s" = juicemount-manager ] || [ "$s" = juicefarm ]; then
           if [ "${JM_MANAGER_DIGEST:-}" = "$NEW_M" ]; then printf new > "$FAKE_STATE/$s.img"; else printf old > "$FAKE_STATE/$s.img"; fi
         fi
@@ -126,6 +131,14 @@ if [ "$1" = compose ]; then
   exit 0
 fi
 case "$1" in
+  ps)
+    # Only the running redis of the project (lib/redis-compact.sh).
+    case "$*" in
+      *label=com.docker.compose.project=testproject*label=com.docker.compose.service=redis*status=running*)
+        [ -n "$(st redis)" ] && [ ! -e "$FAKE_STATE/redis.down" ] && echo redis-id
+        exit 0 ;;
+    esac
+    echo "unexpected ps: $*" >&2; exit 1 ;;
   inspect)
     shift
     [ "${1:-}" = -f ] || exit 0
@@ -136,9 +149,10 @@ case "$1" in
       *com.docker.compose.project*) echo testproject ;;
       *com.docker.compose.service*) echo "$svc" ;;
       *com.docker.compose.config-hash*) printf 'a%.0s' {1..64}; echo ;;
-      *State.Running*) [ -n "$(st "$svc")" ] && echo true || echo false ;;
+      *State.Running*)
+        if [ -n "$(st "$svc")" ] && { [ "$svc" != redis ] || [ ! -e "$FAKE_STATE/redis.down" ]; }; then echo true; else echo false; fi ;;
       *State.Health.Status*)
-        if [ "$svc" = respproxy ] && [ "$FAKE_FAIL" = respproxy_unhealthy ]; then echo unhealthy; else echo healthy; fi ;;
+        if [ "$svc" = redis ] && [ -e "$FAKE_STATE/redis.down" ]; then echo unhealthy; elif [ "$svc" = respproxy ] && [ "$FAKE_FAIL" = respproxy_unhealthy ]; then echo unhealthy; else echo healthy; fi ;;
       *State.Status*) echo exited ;;
       *State.ExitCode*) echo 0 ;;
       *PortBindings*)
@@ -173,6 +187,21 @@ case "$1" in
       *--build-info*)
         if [ "$svc" = juicemount-manager ]; then b=juicemount-manager; else b=jmfarm; fi
         if [ "$(st "$svc.img")" = new ]; then echo "$b 0.5.0 ($FAKE_COMMIT)"; else echo "$b 0.4.9 (0000000000000000000000000000000000000000)"; fi ;;
+      *jm-redis-cli*BGREWRITEAOF*)
+        [ "$svc" = redis ] || { echo "BGREWRITEAOF sent to $svc" >&2; exit 1; }
+        case "$FAKE_FAIL" in
+          bgrewrite_refused) echo 'ERR Background append only file rewriting failed to start'; exit 0 ;;
+          rewrite_hang) printf 1 > "$FAKE_STATE/aof-busy" ;;
+          rewrite_err) printf err > "$FAKE_STATE/aof-status" ;;
+          *) n="$(st aof-rewrites)"; printf '%s' "$(( ${n:-0} + 1 ))" > "$FAKE_STATE/aof-rewrites" ;;
+        esac
+        echo 'Background append only file rewriting started' ;;
+      *jm-redis-cli*'INFO persistence'*)
+        [ "$FAKE_FAIL" = info_fail ] && exit 1
+        busy="$(st aof-busy)"; status="$(st aof-status)"; n="$(st aof-rewrites)"
+        fails=0; [ "$status" = err ] && fails=1
+        printf 'aof_enabled:1\r\naof_rewrite_in_progress:%s\r\naof_rewrite_scheduled:0\r\naof_last_bgrewrite_status:%s\r\naof_rewrites:%s\r\naof_rewrites_consecutive_failures:%s\r\n' \
+          "${busy:-0}" "${status:-ok}" "${n:-0}" "$fails" ;;
       *'HSET jmlease:v1:cfg mode passthrough'*)
         [ "$svc" = redis ] || { echo "mode reset sent to $svc" >&2; exit 1; }
         printf passthrough > "$FAKE_STATE/cfg-mode"; echo 0 ;;
@@ -209,10 +238,11 @@ set_topology() { # topology for every service; respproxy only in proxy
   rm -rf "$FAKE_STATE"; mkdir -p "$FAKE_STATE"
   for s in redis juicefs-init juicefs juicemount-manager juicefarm minio; do printf '%s' "$1" > "$FAKE_STATE/$s"; done
   printf old > "$FAKE_STATE/juicemount-manager.img"; printf old > "$FAKE_STATE/juicefarm.img"
+  printf 7 > "$FAKE_STATE/aof-rewrites"
   [ "$1" = proxy ] && printf proxy > "$FAKE_STATE/respproxy"
   : > "$FAKE_LOG"; rm -f "$FAKE_ACL"
   rm -rf "$REPO/.update-lock"
-  export FAKE_FAIL=""
+  export FAKE_FAIL="" FAKE_REDIS_DIES=""
 }
 assert_topology() { # expected topology for redis + dependents, expected respproxy presence
   local want="$1" s
@@ -228,6 +258,22 @@ assert_topology() { # expected topology for redis + dependents, expected resppro
   ! grep -E 'docker compose .* up .* minio( |$)' "$FAKE_LOG" >/dev/null || { echo 'FAIL: minio recreated' >&2; exit 1; }
 }
 line_of() { { grep -n -E "$1" "$FAKE_LOG" || true; } | head -1 | cut -d: -f1; }
+# The Redis AOF is rewritten, and the rewrite confirmed, before the first
+# service stop and before every Redis recreate.
+assert_compacted_first() {
+  local c i s u
+  c="$(line_of 'jm-redis-cli BGREWRITEAOF')"; i="$(line_of 'jm-redis-cli INFO persistence')"
+  s="$(line_of '^docker compose .* (stop|rm|up) ')"; u="$(line_of 'compose .* up .* redis$')"
+  [ -n "$c" ] && [ -n "$s" ] && [ -n "$u" ] && [ "$c" -lt "$s" ] && [ "$c" -lt "$u" ] || {
+    cat "$FAKE_LOG"; echo 'FAIL: Redis stopped or recreated before its AOF was rewritten' >&2; exit 1;
+  }
+  [ "$(awk -v c="$c" 'NR > c && /jm-redis-cli INFO persistence/' "$FAKE_LOG" | wc -l | tr -d ' ')" -ge 1 ] && [ "$i" -lt "$c" ] || {
+    echo 'FAIL: the rewrite was not confirmed through INFO persistence' >&2; exit 1;
+  }
+  [ "$(grep -c 'jm-redis-cli BGREWRITEAOF' "$FAKE_LOG")" -ge "$(grep -cE 'compose .* up .* redis$' "$FAKE_LOG")" ] || {
+    echo 'FAIL: a Redis recreate had no AOF rewrite of its own' >&2; exit 1;
+  }
+}
 
 cut=(--repo "$REPO" --project testproject --cutover-proxy --previous-ref "$PRE_REF"
   --manager-digest "$NEW_M" --farm-digest "$NEW_F" --render-digest "$NEW_R" --ack-worker-quiesced --ack-macs-drained)
@@ -241,6 +287,8 @@ r="$(line_of 'compose .* up .* redis$')"; p="$(line_of 'compose .* up .* resppro
 q="$(line_of 'compose .* stop .*juicefarm juicemount-manager juicefs$')"; m="$(line_of 'HSET jmlease:v1:cfg mode passthrough')"
 [ -n "$q" ] && [ "$q" -lt "$r" ] || { echo 'FAIL: volume clients not quiesced before Redis restarted' >&2; exit 1; }
 [ -n "$m" ] && [ "$r" -lt "$m" ] && [ "$m" -lt "$p" ] || { echo 'FAIL: mode not forced to passthrough between Redis and proxy start' >&2; exit 1; }
+assert_compacted_first
+grep -q 'aof_last_bgrewrite_status:ok' "$WORK/out" || { echo 'FAIL: cutover did not report the finished AOF rewrite' >&2; exit 1; }
 grep -Fx "JM_MANAGER_DIGEST=$NEW_M" "$REPO/server/.env" >/dev/null
 [ ! -e "$REPO/.update-lock" ]
 ! grep -q 'secret-0123456789' "$WORK/out"
@@ -258,6 +306,13 @@ for failure in respproxy_unhealthy respproxy_start; do
   [ ! -e "$REPO/.update-lock" ] || { cat "$WORK/out"; echo 'FAIL: lock kept after a successful rollback' >&2; exit 1; }
   rm_line="$(line_of 'compose .* rm .*respproxy')"; redis_back="$(line_of 'compose .*pre-proxy.* up .* redis$')"
   [ -n "$rm_line" ] && [ -n "$redis_back" ] && [ "$rm_line" -lt "$redis_back" ] || { echo 'FAIL: rollback re-published Redis before freeing 30179' >&2; exit 1; }
+  assert_compacted_first
+  # The rollback compacts the new Redis again before it recreates the old one.
+  second="$(grep -n 'jm-redis-cli BGREWRITEAOF' "$FAKE_LOG" | sed -n 2p | cut -d: -f1)"
+  forward_redis="$(line_of 'compose .* up .* redis$')"
+  [ -n "$second" ] && [ "$forward_redis" -lt "$second" ] && [ "$second" -lt "$rm_line" ] || {
+    echo 'FAIL: rollback recreated Redis without rewriting the AOF first' >&2; exit 1;
+  }
   echo "ok: $failure rolls the port swap back to the pre-proxy compose"
 done
 
@@ -294,6 +349,7 @@ grep -Fx "$FAKE_MAC_LINE" "$FAKE_ACL" >/dev/null || { echo 'FAIL: enrolled Mac n
 rm_line="$(line_of 'compose .* rm .*respproxy')"; redis_line="$(line_of 'compose .*rollback.yml.* up .* redis$')"
 [ -n "$rm_line" ] && [ -n "$redis_line" ] && [ "$rm_line" -lt "$redis_line" ]
 [ ! -e "$REPO/.update-lock" ]
+assert_compacted_first
 echo 'ok: proxy rollback publishes Redis on 30179 with the mirrored principal ACL'
 
 # 5. ...and back to the proxy. The stored mode (enforce before the
@@ -304,6 +360,7 @@ assert_topology proxy
 [ "$(cat "$FAKE_STATE/cfg-mode")" = passthrough ] || { echo 'FAIL: --proxy-restore resumed the stored enforce mode' >&2; exit 1; }
 m="$(line_of 'HSET jmlease:v1:cfg mode passthrough')"; p="$(line_of 'compose .* up .* respproxy$')"
 [ -n "$m" ] && [ "$m" -lt "$p" ] || { echo 'FAIL: proxy started before the mode reset' >&2; exit 1; }
+assert_compacted_first
 echo 'ok: proxy restore moves 30179 back to the proxy in passthrough'
 
 # A transition may enter the proxy topology on either the forward path or
@@ -409,3 +466,65 @@ fi
 ! grep -q 'compose .* up ' "$FAKE_LOG"
 export FAKE_FAIL=""
 echo 'ok: proxy rollback refuses when the Manager fragment cannot be read'
+
+# 8. The AOF rewrite gates every topology change: refused, timed out,
+# failed, or unreadable, the change stops with nothing stopped or recreated.
+for mode in cutover proxy-rollback proxy-restore; do
+  case "$mode" in
+    cutover) initial=pre; args=("${cut[@]}") ;;
+    proxy-rollback) initial=proxy; args=(--repo "$REPO" --project testproject --proxy-rollback --ack-worker-quiesced --ack-macs-drained) ;;
+    proxy-restore) initial=direct; args=(--repo "$REPO" --project testproject --proxy-restore --ack-worker-quiesced --ack-macs-drained) ;;
+  esac
+  for failure in bgrewrite_refused rewrite_hang rewrite_err info_fail; do
+    set_topology "$initial"; write_env "$OLD_M" "$OLD_F" "$OLD_R"
+    cp "$REPO/server/.env" "$WORK/env.before"
+    export FAKE_FAIL="$failure"
+    if JM_REDIS_COMPACT_TIMEOUT=3 bash "$SCRIPT" "${args[@]}" > "$WORK/out" 2>&1; then
+      echo "FAIL: $mode went on after $failure" >&2; exit 1
+    fi
+    if grep -E '^docker compose .* (stop|rm|up)( |$)|HSET jmlease:v1:cfg' "$FAKE_LOG" >/dev/null; then
+      cat "$FAKE_LOG"; echo "FAIL: $mode stopped or recreated a service after $failure" >&2; exit 1
+    fi
+    grep -q 'Nothing was stopped' "$WORK/out" || { cat "$WORK/out"; echo "FAIL: $mode $failure lacked the refusal message" >&2; exit 1; }
+    if [ "$failure" = rewrite_hang ]; then
+      grep -q 'did not finish within 3 s' "$WORK/out" || { cat "$WORK/out"; echo 'FAIL: timeout not reported' >&2; exit 1; }
+    fi
+    cmp -s "$WORK/env.before" "$REPO/server/.env" || { echo "FAIL: $mode $failure left .env changed" >&2; exit 1; }
+    [ ! -e "$REPO/.update-lock" ] || { cat "$WORK/out"; echo "FAIL: $mode $failure kept the lock" >&2; exit 1; }
+    ! grep -q CRITICAL "$WORK/out" || { cat "$WORK/out"; echo "FAIL: $mode $failure attempted a rollback" >&2; exit 1; }
+    assert_topology "$initial"
+  done
+  echo "ok: $mode stops with nothing stopped when the AOF rewrite is refused, times out, fails or cannot be confirmed"
+done
+export FAKE_FAIL=""
+
+# 9. Redis already down at the rollback: nothing to compact, so the script
+# says the start replays the AOF. The pre-proxy compose has no ACL file.
+set_topology pre; write_env "$OLD_M" "$OLD_F" "$OLD_R"
+export FAKE_REDIS_DIES=proxy
+if bash "$SCRIPT" "${cut[@]}" > "$WORK/out" 2>&1; then echo 'FAIL: cutover accepted a Redis that never came up' >&2; exit 1; fi
+assert_topology pre
+grep -q 'is not running, so its AOF was not compacted' "$WORK/out" || { cat "$WORK/out"; echo 'FAIL: skipped compaction not reported' >&2; exit 1; }
+[ ! -e "$REPO/.update-lock" ]
+echo 'ok: a rollback over a stopped Redis says the start replays the AOF'
+
+# 10. ...and refuses to start Redis while server/redis.acl still has the
+# 0.5.0 default line, unless --allow-aof-replay is given.
+sed -i.bak 's/^user default .*/user default off resetpass resetkeys resetchannels -@all/' "$REPO/server/redis.acl"
+rm -f "$REPO/server/redis.acl.bak"
+git -C "$REPO" commit -qam 'the 0.5.0 default line'
+restore=(--repo "$REPO" --project testproject --proxy-restore --ack-worker-quiesced --ack-macs-drained)
+set_topology direct; rm -f "$FAKE_STATE/respproxy"; write_env "$OLD_M" "$OLD_F" "$OLD_R"
+export FAKE_REDIS_DIES=proxy
+if bash "$SCRIPT" "${restore[@]}" > "$WORK/out" 2>&1; then echo 'FAIL: proxy restore accepted a Redis that never came up' >&2; exit 1; fi
+grep -q "refusing to start Redis: .*redis.acl still has the 0.5.0" "$WORK/out" || { cat "$WORK/out"; echo 'FAIL: old ACL not refused' >&2; exit 1; }
+! grep -E 'compose .*rollback.yml.* up .* redis$' "$FAKE_LOG" >/dev/null || { echo 'FAIL: Redis started under the 0.5.0 ACL without the override' >&2; exit 1; }
+[ -e "$REPO/.update-lock" ] || { echo 'FAIL: refused rollback released the lock' >&2; exit 1; }
+set_topology direct; rm -f "$FAKE_STATE/respproxy"; write_env "$OLD_M" "$OLD_F" "$OLD_R"
+export FAKE_REDIS_DIES=proxy
+if bash "$SCRIPT" "${restore[@]}" --allow-aof-replay > "$WORK/out" 2>&1; then echo 'FAIL: proxy restore accepted a Redis that never came up' >&2; exit 1; fi
+grep -q 'WARNING: .*Starting anyway (--allow-aof-replay)' "$WORK/out" || { cat "$WORK/out"; echo 'FAIL: override not reported' >&2; exit 1; }
+assert_topology direct
+[ ! -e "$REPO/.update-lock" ]
+git -C "$REPO" revert --no-edit HEAD >/dev/null
+echo 'ok: Redis does not start under the 0.5.0 ACL after a skipped compaction unless --allow-aof-replay is given'
