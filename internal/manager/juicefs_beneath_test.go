@@ -20,8 +20,9 @@ import (
 // These tests run the real juicefs built from third_party/juicefs (set
 // JM_TEST_JUICEFS_BIN; CI builds it). They pin that a sync cannot read or
 // write outside its roots through a symlink in the tree: juicefs's file://
-// backend resolves every path beneath its root (patch 0016), and RunSync
-// passes --links when both ends can store links.
+// backend resolves every path beneath its root (patch 0016), the Manager
+// hands it the roots as open folders, and RunSync passes --links only
+// into the volume.
 //
 // The volume is a plain folder standing in for the FUSE mount (embedded
 // mode, file:///<FUSEMount>/...). The jfs:// variants (standalone mode)
@@ -114,22 +115,26 @@ func (l syncLayout) run(t *testing.T, bin, src, dst string, opts SyncOptions) er
 }
 
 // Single hop, Out: a symlink deep in a volume tree that points outside the
-// volume is copied as a link; the folder it points at is not copied.
-func TestJuicefsOutSingleHopCopiesLinkNotTarget(t *testing.T) {
+// volume is neither followed nor copied verbatim to the host root (Out
+// runs without --links, and the confined source root refuses to follow
+// it). A relative link that stays inside the source is copied as a file.
+func TestJuicefsOutSingleHopNeitherFollowsNorCopiesLink(t *testing.T) {
 	bin := realJuicefsBin(t)
 	l := newSyncLayout(t)
 	mustWrite(t, filepath.Join(l.fuse, "proj/deep/a/b/real.txt"), "in volume")
 	mustLink(t, l.outside, filepath.Join(l.fuse, "proj/deep/a/b/evil"))
+	mustLink(t, "real.txt", filepath.Join(l.fuse, "proj/deep/a/b/alias.txt"))
 	out := filepath.Join(l.host, "out")
-	if err := l.run(t, bin, "/jfs/proj", out, DefaultSyncOptions()); err != nil {
-		t.Fatalf("RunSync: %v", err)
-	}
+	_ = l.run(t, bin, "/jfs/proj", out, DefaultSyncOptions())
 	if _, err := os.Stat(filepath.Join(out, "deep/a/b/real.txt")); err != nil {
 		t.Errorf("the in-volume file was not copied: %v", err)
 	}
 	noRegularFile(t, "out", out, "secret.txt")
-	if fi, err := os.Lstat(filepath.Join(out, "deep/a/b/evil")); err != nil || fi.Mode()&fs.ModeSymlink == 0 {
-		t.Errorf("deep symlink not copied as a link: %v", err)
+	if fi, err := os.Lstat(filepath.Join(out, "deep/a/b/evil")); err == nil && fi.Mode()&fs.ModeSymlink != 0 {
+		t.Errorf("the escaping link was copied verbatim to the host root")
+	}
+	if fi, err := os.Lstat(filepath.Join(out, "deep/a/b/alias.txt")); err != nil || !fi.Mode().IsRegular() {
+		t.Errorf("an in-source link was not copied as a file: %v", err)
 	}
 }
 
@@ -213,23 +218,21 @@ func TestJuicefsLinklessDestinationDoesNotReadThroughSourceChain(t *testing.T) {
 	}
 }
 
-// Probe C: Out job 1 copies a link into a host root; Out job 2 then
-// writes a tree whose folder has the link's name. The second job must not
-// write through the copied link.
+// Probe C: job 1 would copy a link into a host root, job 2 then writes a
+// tree whose folder has the link's name. Out runs without --links, so job
+// 1 stores no link, and job 2 cannot write through one.
 func TestJuicefsCopiedLinkIsNotWrittenThrough(t *testing.T) {
 	bin := realJuicefsBin(t)
 	l := newSyncLayout(t)
 	root := filepath.Join(l.host, "croot")
 	mustLink(t, l.victim, filepath.Join(l.fuse, "c1/d"))
 	mustWrite(t, filepath.Join(l.fuse, "c2/d/payload.txt"), "payload")
-	if err := l.run(t, bin, "/jfs/c1", root, DefaultSyncOptions()); err != nil {
-		t.Fatalf("job 1: %v", err)
+	_ = l.run(t, bin, "/jfs/c1", root, DefaultSyncOptions())
+	if fi, err := os.Lstat(filepath.Join(root, "d")); err == nil && fi.Mode()&fs.ModeSymlink != 0 {
+		t.Errorf("job 1 copied the link into the host root")
 	}
-	err := l.run(t, bin, "/jfs/c2", root, DefaultSyncOptions())
+	_ = l.run(t, bin, "/jfs/c2", root, DefaultSyncOptions())
 	emptyDir(t, "job 2", l.victim)
-	if err == nil {
-		t.Errorf("job 2 reported success")
-	}
 }
 
 // Probe D: a destination folder swapped for a symlink while juicefs is
@@ -269,8 +272,8 @@ func TestJuicefsSwapDuringCopyIsRefused(t *testing.T) {
 }
 
 // In-volume links that stay beneath the root keep working: a relative
-// link in the destination is written through, and one in the source is
-// copied as a link.
+// link in the destination is written through, and one in an In source is
+// copied as a link (--links into the volume).
 func TestJuicefsLinksInsideTheRootKeepWorking(t *testing.T) {
 	bin := realJuicefsBin(t)
 	l := newSyncLayout(t)
@@ -340,6 +343,16 @@ func TestJuicefsStandaloneAbsoluteLinksStayInVolume(t *testing.T) {
 	defer cancel()
 	_ = RunSync(ctx, bin, spec, src, "/jfs/dest", DefaultSyncOptions(), nil, nil)
 	emptyDir(t, "standalone in", l.victim)
+	// Out through RunSync (standalone): the /jfs source is read as jfs://,
+	// not as a host path.
+	out2 := filepath.Join(l.host, "out2")
+	if err := RunSync(ctx, bin, spec, "/jfs/proj", out2, DefaultSyncOptions(), nil, nil); err != nil {
+		t.Logf("standalone out: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(out2, "real.txt")); err != nil {
+		t.Errorf("standalone out: the in-volume file was not copied: %v", err)
+	}
+	noRegularFile(t, "standalone out via RunSync", out2, "secret.txt")
 }
 
 // flushRedisDB empties the Redis database named by a redis://host:port/db

@@ -7,6 +7,7 @@ import (
 	"context"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -24,7 +25,8 @@ func versionedJuicefs(t *testing.T, version string) (bin, argsFile, fdsFile stri
 	bin = filepath.Join(dir, "juicefs")
 	script := "#!/bin/sh\nif [ \"$1\" = --version ]; then echo '" + version + "'; exit 0; fi\n" +
 		"printf '%s\\n' \"$@\" > '" + argsFile + "'\n" +
-		"for n in 3 4; do readlink /proc/$$/fd/$n; done > '" + fdsFile + "' 2>/dev/null\nexit 0\n"
+		"for n in 3 4; do readlink /proc/$$/fd/$n; done > '" + fdsFile + "' 2>/dev/null\n" +
+		"env > '" + fdsFile + ".env'\nexit 0\n"
 	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -54,8 +56,10 @@ func contains(list []string, want string) bool {
 	return false
 }
 
-// With a confining juicefs, local roots are passed as open folders and
-// --links is used only when both ends are confined file:// or jfs://.
+// With a confining juicefs, local roots are passed as open folders, with
+// JM_FILE_ROOT_FD_ONLY=1, and --links is used only when the destination is
+// the volume (In, Between). Out to a host root, sftp, nfs and s3 get no
+// --links. In standalone mode a /jfs source is read as jfs://.
 func TestRunSyncPassesOpenRootsAndLinksOnlyBetweenConfinedEnds(t *testing.T) {
 	l := newSyncLayout(t)
 	mustWrite(t, filepath.Join(l.fuse, "proj/a.txt"), "a")
@@ -70,12 +74,13 @@ func TestRunSyncPassesOpenRootsAndLinksOnlyBetweenConfinedEnds(t *testing.T) {
 		srcFd, dstFd   string // expected folder behind the fd, "" = not an fd
 		srcArg, dstArg string
 	}{
-		{"out to a host root", embedded, "/jfs/proj", filepath.Join(l.host, "out"), true, filepath.Join(l.fuse, "proj"), filepath.Join(l.host, "out"), "file:///proc/self/fd/3/", "file:///proc/self/fd/4/"},
+		{"out to a host root", embedded, "/jfs/proj", filepath.Join(l.host, "out"), false, filepath.Join(l.fuse, "proj"), filepath.Join(l.host, "out"), "file:///proc/self/fd/3/", "file:///proc/self/fd/4/"},
 		{"in to the volume", embedded, filepath.Join(l.host, "in"), "/jfs/dest", true, filepath.Join(l.host, "in"), filepath.Join(l.fuse, "dest"), "file:///proc/self/fd/3/", "file:///proc/self/fd/4/"},
 		{"out to sftp", embedded, "/jfs/proj", "sftp://u@h:22/backup/", false, filepath.Join(l.fuse, "proj"), "", "file:///proc/self/fd/3/", "sftp://u@h:22/backup/"},
 		{"out to nfs", embedded, "/jfs/proj", "nfs://h/export/", false, filepath.Join(l.fuse, "proj"), "", "file:///proc/self/fd/3/", "nfs://h/export/"},
 		{"out to s3", embedded, "/jfs/proj", "s3://bucket/x/", false, filepath.Join(l.fuse, "proj"), "", "file:///proc/self/fd/3/", "s3://bucket/x/"},
 		{"standalone in to jfs://", standalone, filepath.Join(l.host, "in"), "/jfs/dest", true, filepath.Join(l.host, "in"), "", "file:///proc/self/fd/3/", "jfs://vol/dest/"},
+		{"standalone out from jfs://", standalone, "/jfs/proj", filepath.Join(l.host, "out2"), false, "", filepath.Join(l.host, "out2"), "jfs://vol/proj/", "file:///proc/self/fd/3/"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -94,11 +99,19 @@ func TestRunSyncPassesOpenRootsAndLinksOnlyBetweenConfinedEnds(t *testing.T) {
 				t.Errorf("destination arg %q, want %q", got, c.dstArg)
 			}
 			fds := lines(t, fdsFile)
-			if c.srcFd != "" && (len(fds) < 1 || fds[0] != c.srcFd) {
-				t.Errorf("fd 3 -> %v, want %s", fds, c.srcFd)
+			want := []string{}
+			for _, f := range []string{c.srcFd, c.dstFd} {
+				if f != "" {
+					want = append(want, f)
+				}
 			}
-			if c.dstFd != "" && (len(fds) < 2 || fds[1] != c.dstFd) {
-				t.Errorf("fd 4 -> %v, want %s", fds, c.dstFd)
+			for i, w := range want {
+				if len(fds) <= i || fds[i] != w {
+					t.Errorf("fd %d -> %v, want %s", 3+i, fds, w)
+				}
+			}
+			if env := strings.Join(lines(t, fdsFile+".env"), "\n"); !strings.Contains(env, "JM_FILE_ROOT_FD_ONLY=1") {
+				t.Errorf("JM_FILE_ROOT_FD_ONLY=1 not set for juicefs")
 			}
 		})
 	}
@@ -137,48 +150,53 @@ func TestRunSyncOlderJuicefsKeepsPathRoots(t *testing.T) {
 	}
 }
 
-// preserve_structure=false copies the source folder itself, as
-// <destination>/<basename>/; juicefs gets roots with a trailing slash.
-func TestPreserveStructureOffNamesTheBasenameFolder(t *testing.T) {
+// preserve_structure=false keeps its old meaning: the source's contents
+// go into the destination itself. Both roots keep a trailing slash, so no
+// same-prefix sibling of the source is included.
+func TestPreserveStructureOffCopiesContentsIntoDestination(t *testing.T) {
 	l := newSyncLayout(t)
 	mustWrite(t, filepath.Join(l.fuse, "proj/a.txt"), "a")
 	mustWrite(t, filepath.Join(l.host, "photos/b.txt"), "b")
 	opts := DefaultSyncOptions()
 	opts.PreserveStructure = false
-	for _, c := range []struct{ src, dst, wantDst string }{
-		{"/jfs/proj", l.host, "file://" + filepath.Join(l.host, "proj") + "/"},
-		{"/jfs/proj", filepath.Join(l.host, "sub"), "file://" + filepath.Join(l.host, "sub", "proj") + "/"},
-		{filepath.Join(l.host, "photos"), "/jfs", "file://" + filepath.Join(l.fuse, "photos") + "/"},
-		{filepath.Join(l.host, "photos"), "/jfs/sub", "file://" + filepath.Join(l.fuse, "sub", "photos") + "/"},
+	for _, c := range []struct{ src, dst, wantSrc, wantDst string }{
+		{"/jfs/proj", l.host, "file://" + filepath.Join(l.fuse, "proj") + "/", "file://" + l.host + "/"},
+		{"/jfs/proj", filepath.Join(l.host, "sub"), "file://" + filepath.Join(l.fuse, "proj") + "/", "file://" + filepath.Join(l.host, "sub") + "/"},
+		{filepath.Join(l.host, "photos"), "/jfs", "file://" + filepath.Join(l.host, "photos") + "/", "file://" + l.fuse + "/"},
+		{filepath.Join(l.host, "photos"), "/jfs/sub", "file://" + filepath.Join(l.host, "photos") + "/", "file://" + filepath.Join(l.fuse, "sub") + "/"},
 	} {
 		bin, argsFile, _ := versionedJuicefs(t, jm1Version) // paths by name, so the args show them
 		if err := RunSync(context.Background(), bin, l.spec(), c.src, c.dst, opts, nil, nil); err != nil {
 			t.Fatalf("RunSync(%s -> %s): %v", c.src, c.dst, err)
 		}
 		args := lines(t, argsFile)
+		if got := args[len(args)-2]; got != c.wantSrc {
+			t.Errorf("%s -> %s: source arg %q, want %q", c.src, c.dst, got, c.wantSrc)
+		}
 		if got := args[len(args)-1]; got != c.wantDst {
 			t.Errorf("%s -> %s: destination arg %q, want %q", c.src, c.dst, got, c.wantDst)
-		}
-		if got := args[len(args)-2]; !strings.HasSuffix(got, "/") {
-			t.Errorf("%s -> %s: source arg %q has no trailing slash", c.src, c.dst, got)
 		}
 	}
 }
 
 // Real juicefs, preserve_structure=false, both directions, at a root and
-// below one: the source folder lands as <destination>/<basename>/, and a
+// below one: the source's contents land in the destination itself (the
+// old meaning, so existing schedules keep writing where they did), and a
 // same-prefix sibling of the source is not copied.
 func TestJuicefsPreserveStructureOff(t *testing.T) {
 	bin := realJuicefsBin(t)
 	opts := DefaultSyncOptions()
 	opts.PreserveStructure = false
 	for _, c := range []struct {
-		name, src, dst, want, sibling string
+		name, src, dst string
+		want           string // the source's file, in the destination itself
+		basename       string // where a basename folder would be
+		sibling        string // where the old slash-less form put projX/photosX
 	}{
-		{"out to a host root", "/jfs/proj", "", "host/proj/a.txt", "host/projX"},
-		{"out below a host root", "/jfs/proj", "sub", "host/sub/proj/a.txt", "host/sub/projX"},
-		{"in to the volume root", "photos", "/jfs", "fuse/photos/b.txt", "fuse/photosX"},
-		{"in below the volume root", "photos", "/jfs/sub", "fuse/sub/photos/b.txt", "fuse/sub/photosX"},
+		{"out to a host root", "/jfs/proj", "", "host/a.txt", "host/proj", "hostX"},
+		{"out below a host root", "/jfs/proj", "sub", "host/sub/a.txt", "host/sub/proj", "host/subX"},
+		{"in to the volume root", "photos", "/jfs", "fuse/b.txt", "fuse/photos", "fuseX"},
+		{"in below the volume root", "photos", "/jfs/sub", "fuse/sub/b.txt", "fuse/sub/photos", "fuse/subX"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			l := newSyncLayout(t)
@@ -197,10 +215,16 @@ func TestJuicefsPreserveStructureOff(t *testing.T) {
 				t.Fatalf("RunSync: %v", err)
 			}
 			if _, err := os.Stat(filepath.Join(l.base, c.want)); err != nil {
-				t.Errorf("source folder not copied as %s: %v", c.want, err)
+				t.Errorf("source contents not copied into the destination (%s): %v", c.want, err)
+			}
+			if _, err := os.Stat(filepath.Join(l.base, c.basename)); err == nil {
+				t.Errorf("a basename folder %s was created", c.basename)
 			}
 			if _, err := os.Stat(filepath.Join(l.base, c.sibling)); err == nil {
-				t.Errorf("same-prefix sibling copied to %s", c.sibling)
+				t.Errorf("a same-prefix sibling was copied to %s", c.sibling)
+			}
+			if _, err := os.Stat(filepath.Join(l.base, filepath.Dir(c.want), "x.txt")); err == nil {
+				t.Errorf("a same-prefix sibling's contents landed in the destination")
 			}
 		})
 	}
@@ -262,4 +286,89 @@ func TestJuicefsRootSwapRace(t *testing.T) {
 	<-done
 	emptyDir(t, "destination swap", l.victim)
 	noRegularFile(t, "source swap", filepath.Join(l.host, "out"), "secret.txt")
+}
+
+// A failed or slow `juicefs --version` is not cached as "not confined":
+// the sync fails with a clear message, and the next sync asks again.
+func TestJuicefsVersionProbeRetriesAfterFailure(t *testing.T) {
+	prev := juicefsVersionTimeout
+	juicefsVersionTimeout = 500 * time.Millisecond
+	t.Cleanup(func() { juicefsVersionTimeout = prev })
+	l := newSyncLayout(t)
+	mustWrite(t, filepath.Join(l.fuse, "proj/a.txt"), "a")
+	for _, first := range []string{"exit 3", "sleep 3", "echo garbage; exit 0"} {
+		t.Run(first, func(t *testing.T) {
+			dir := t.TempDir()
+			bin, argsFile, count := filepath.Join(dir, "juicefs"), filepath.Join(dir, "args"), filepath.Join(dir, "count")
+			script := "#!/bin/sh\nif [ \"$1\" = --version ]; then\n" +
+				"  if [ ! -e '" + count + "' ]; then touch '" + count + "'; " + first + "; fi\n" +
+				"  echo '" + jm2Version + "'; exit 0\nfi\n" +
+				"printf '%s\\n' \"$@\" > '" + argsFile + "'\nexit 0\n"
+			if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			err := RunSync(context.Background(), bin, l.spec(), "/jfs/proj", filepath.Join(l.host, "out"), DefaultSyncOptions(), nil, nil)
+			if err == nil || !strings.Contains(err.Error(), "cannot tell whether") {
+				t.Fatalf("first sync with a failing version probe: %v, want a refusal", err)
+			}
+			if _, err := os.Stat(argsFile); err == nil {
+				t.Fatalf("juicefs sync ran while its version was unknown")
+			}
+			if err := RunSync(context.Background(), bin, l.spec(), "/jfs/proj", filepath.Join(l.host, "out"), DefaultSyncOptions(), nil, nil); err != nil {
+				t.Fatalf("second sync: %v", err)
+			}
+			if args := lines(t, argsFile); args[len(args)-2] != "file:///proc/self/fd/3/" {
+				t.Errorf("second sync did not use the confined mode: %v", args)
+			}
+		})
+	}
+}
+
+// With JM_FILE_ROOT_FD_ONLY=1 the patched juicefs sync refuses a file://
+// root named by path.
+func TestJuicefsRefusesPathRootWhenFdOnly(t *testing.T) {
+	bin := realJuicefsBin(t)
+	l := newSyncLayout(t)
+	mustWrite(t, filepath.Join(l.host, "in/a.txt"), "a")
+	cmd := exec.Command(bin, "sync", "file://"+filepath.Join(l.host, "in")+"/", "file://"+filepath.Join(l.host, "out")+"/")
+	cmd.Env = append(os.Environ(), "JM_FILE_ROOT_FD_ONLY=1")
+	out, err := cmd.CombinedOutput()
+	if err == nil || !strings.Contains(string(out), "must be an open folder") {
+		t.Errorf("path root with JM_FILE_ROOT_FD_ONLY=1: err %v, output %s", err, out)
+	}
+	if _, err := os.Stat(filepath.Join(l.host, "out")); err == nil {
+		t.Errorf("the refused sync created its destination")
+	}
+}
+
+// A dry run changes nothing on disk: a missing destination is not
+// created, and an existing one is not touched (no post-sync fixup).
+func TestJuicefsDryRunCreatesNothing(t *testing.T) {
+	bin := realJuicefsBin(t)
+	l := newSyncLayout(t)
+	mustWrite(t, filepath.Join(l.host, "in/sub/a.txt"), "a")
+	opts := DefaultSyncOptions()
+	opts.DryRun = true
+	spec := l.spec()
+	spec.OwnerUID, spec.OwnerGID = os.Getuid(), os.Getgid()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	if err := RunSync(ctx, bin, spec, filepath.Join(l.host, "in"), "/jfs/new/deeper", opts, nil, nil); err != nil {
+		t.Fatalf("dry run into a missing destination: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(l.fuse, "new")); err == nil {
+		t.Errorf("a dry run created the destination")
+	}
+	existing := filepath.Join(l.fuse, "exists")
+	if err := os.MkdirAll(existing, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := RunSync(ctx, bin, spec, filepath.Join(l.host, "in"), "/jfs/exists", opts, nil, nil); err != nil {
+		t.Fatalf("dry run into an existing destination: %v", err)
+	}
+	entries, _ := os.ReadDir(existing)
+	fi, _ := os.Stat(existing)
+	if len(entries) != 0 || fi.Mode().Perm() != 0o700 {
+		t.Errorf("a dry run changed the destination: %d entries, mode %v", len(entries), fi.Mode().Perm())
+	}
 }

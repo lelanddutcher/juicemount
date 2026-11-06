@@ -106,7 +106,7 @@ const (
 // SyncOptions controls per-job behavior. Tier-1/2/3 features in the
 // foolproofing roadmap map directly onto these fields.
 type SyncOptions struct {
-	PreserveStructure bool     `json:"preserve_structure"` // if false, copy flat (basename only) [tier-1]
+	PreserveStructure bool     `json:"preserve_structure"` // kept for stored jobs and the UI; both values copy the source's contents into the destination
 	PreserveTimes     bool     `json:"preserve_times"`     // --preserve mtime,uid,gid [tier-1]
 	DryRun            bool     `json:"dry_run"`            // --dry [tier-1]
 	SkipJunk          bool     `json:"skip_junk"`          // auto-exclude .DS_Store, Thumbs.db, ._* [tier-1]
@@ -205,14 +205,13 @@ func RunSync(ctx context.Context, juicefsBin string, spec RunSyncSpec, source, d
 	// on. This also covers jobs that did not come through an API gate
 	// (stored schedules, resumed jobs).
 	//
-	// preserve_structure=false copies the source folder itself:
-	// <destination>/<basename of source>/. The Manager names that
-	// subfolder, so juicefs always gets roots with a trailing slash
-	// (sync_roots.go, withSourceBasename).
-	if !opts.PreserveStructure {
-		destination = withSourceBasename(source, destination)
-		opts.PreserveStructure = true
-	}
+	// Both preserve_structure settings copy the source folder's contents
+	// into the destination itself. juicefs gets both roots with a trailing
+	// slash: its slash-less form (what preserve_structure=false used to
+	// send) treats each root as a name prefix, which also copied
+	// same-prefix siblings (photosX/ next to photos/) into sibling
+	// destinations.
+	opts.PreserveStructure = true
 	var err error
 	if spec.Mode == ModeEmbedded {
 		if source, err = confineSyncVolumePath(source, spec.FUSEMount); err != nil {
@@ -260,8 +259,19 @@ func RunSync(ctx context.Context, juicefsBin string, spec RunSyncSpec, source, d
 		// (which standalone mode does not set) — so the helper falls
 		// through to file:// for /external/... paths, and we keep
 		// the explicit jfs:// helper for /jfs/... destinations.
-		if isVolumeUserPath(strings.TrimSpace(destination)) {
+		srcVol := isVolumeUserPath(strings.TrimSpace(source))
+		dstVol := isVolumeUserPath(strings.TrimSpace(destination))
+		if srcVol {
+			// No FUSE mount here: a /jfs source is read through the
+			// volume (jfs://), never as a host file:// path.
+			src = normalizeDestURIJFS(source, spec.VolName, opts.PreserveStructure)
+		}
+		if dstVol {
 			dst = normalizeDestURIJFS(destination, spec.VolName, opts.PreserveStructure)
+		} else {
+			dst = normalizeAnyURI(destination, "", opts.PreserveStructure)
+		}
+		if srcVol || dstVol {
 			// juicefs sync's URL syntax: env var name = URL alias. So
 			// for jfs://zpool/... we set zpool=redis://...
 			modeEnv = append(modeEnv, spec.VolName+"="+spec.MetaURL)
@@ -270,8 +280,6 @@ func RunSync(ctx context.Context, juicefsBin string, spec RunSyncSpec, source, d
 			// set when the volume is an endpoint, so a user-configured
 			// minio destination without its own key never sees it.
 			modeEnv = append(modeEnv, objectStoreEnv()...)
-		} else {
-			dst = normalizeAnyURI(destination, "", opts.PreserveStructure)
 		}
 	default: // ModeEmbedded
 		// SLICE 1 split: /jfs/... destinations go through the FUSE-
@@ -292,14 +300,20 @@ func RunSync(ctx context.Context, juicefsBin string, spec RunSyncSpec, source, d
 	// With a juicefs that confines file:// roots, open every local root
 	// beneath its trusted anchor and hand juicefs the open folder
 	// (sync_roots.go). Otherwise keep paths by name and no --links.
-	confined := juicefsConfinesFileRoots(juicefsBin)
+	confined, err := juicefsConfinesFileRoots(juicefsBin)
+	if err != nil {
+		return err
+	}
 	var extraFiles []*os.File
 	fdLabels := map[string]string{}
+	var sr, dr syncRoot
 	if confined {
-		sr, dr, err := openSyncRoots(spec, source, destination, src, dst)
+		var cleanup func()
+		sr, dr, cleanup, err = openSyncRoots(spec, source, destination, src, dst, opts.DryRun)
 		if err != nil {
 			return err
 		}
+		defer cleanup()
 		for _, r := range []*syncRoot{&sr, &dr} {
 			if r.file == nil {
 				continue
@@ -315,8 +329,18 @@ func RunSync(ctx context.Context, juicefsBin string, spec RunSyncSpec, source, d
 			}
 		}()
 		src, dst = sr.uri, dr.uri
+		// The patched juicefs then refuses any file:// root it would
+		// have to open by path (third_party/juicefs patch 0016).
+		modeEnv = append(modeEnv, "JM_FILE_ROOT_FD_ONLY=1")
 	}
-	links := confined && syncURIKeepsLinksConfined(src) && syncURIKeepsLinksConfined(dst)
+	// --links only into the volume (In, Between): the destination is a
+	// confined volume root or a jfs:// volume, so a stored link resolves
+	// beneath it or in the volume's own namespace. Out to a host root
+	// stays without --links: a link made on a Mac must not land verbatim
+	// where other software (SMB, backup tools) may follow it. There the
+	// confined source root refuses to follow a link that leaves it, and a
+	// link inside it is copied as a file.
+	links := confined && dr.volume && (sr.file != nil || strings.HasPrefix(src, "jfs://"))
 
 	threads := opts.Threads
 	if threads <= 0 {
@@ -471,8 +495,8 @@ func RunSync(ctx context.Context, juicefsBin string, spec RunSyncSpec, source, d
 	//
 	// Only a volume destination gets the fixup: its purpose is to let the
 	// mount client write migrated data. A host destination (Out) is not
-	// changed.
-	if spec.Mode == ModeEmbedded && spec.FUSEMount != "" && isVolumeUserPath(strings.TrimSpace(destination)) {
+	// changed. A dry run changes nothing on disk, so it is skipped then.
+	if !opts.DryRun && spec.Mode == ModeEmbedded && spec.FUSEMount != "" && isVolumeUserPath(strings.TrimSpace(destination)) {
 		applyPostSyncPermissions(ctx, destination, spec.FUSEMount, spec.OwnerUID, spec.OwnerGID)
 	}
 	return nil
@@ -512,13 +536,6 @@ func applyPostSyncPermissions(ctx context.Context, destination, fuseMount string
 	if err := applyPermsBeneath(ctx, vp.MountReal, rel, ownerUID, ownerGID, true); err != nil {
 		fmt.Fprintf(os.Stderr, "manager: post-sync permissions (mode, owner %s) on %q incomplete (job stays successful): %v\n", chownSpec(ownerUID, ownerGID), destination, err)
 	}
-}
-
-// syncURIKeepsLinksConfined reports whether a stored symlink at uri stays
-// harmless: a file:// root the Manager opened (/proc/self/fd/N, resolved
-// beneath its root by the patched backend) or a jfs:// volume.
-func syncURIKeepsLinksConfined(uri string) bool {
-	return strings.HasPrefix(uri, "file:///proc/self/fd/") || strings.HasPrefix(uri, "jfs://")
 }
 
 // chownSpec renders the "uid[:gid]" argument for chown; gid < 0 leaves the

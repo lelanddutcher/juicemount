@@ -26,7 +26,10 @@ func recordingJuicefs(t *testing.T, body string) (bin, argsFile string) {
 	dir := t.TempDir()
 	argsFile = filepath.Join(dir, "args")
 	bin = filepath.Join(dir, "juicefs")
-	script := "#!/bin/sh\nprintf '%s\\n' \"$@\" > '" + argsFile + "'\n" + body + "\nexit 0\n"
+	// Answers --version like a stock juicefs, so RunSync keeps roots by
+	// path (sync_roots.go) and the recorded arguments show them.
+	script := "#!/bin/sh\n" + stockVersionAnswer +
+		"printf '%s\\n' \"$@\" > '" + argsFile + "'\n" + body + "\nexit 0\n"
 	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -338,3 +341,7 @@ func TestWalkPhysicalPath(t *testing.T) {
 		}
 	}
 }
+
+// stockVersionAnswer makes a stand-in juicefs answer --version like the
+// stock juicefs (no -jmN suffix), as RunSync asks before every sync.
+const stockVersionAnswer = "if [ \"$1\" = --version ]; then echo 'juicefs version 1.3.1+2025-12-02.e0032b2a'; exit 0; fi\n"

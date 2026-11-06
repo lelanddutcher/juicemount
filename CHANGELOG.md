@@ -66,6 +66,11 @@ or farm workers.
 
 ### Server
 
+- A Manager migration or backup with **Preserve folder structure** off no
+  longer copies sibling folders whose names start with the source folder's
+  name (for example `photos-old/` next to `photos/`) into folders next to the
+  destination. Both settings copy the source folder's contents into the
+  destination, as before.
 - A fresh server install creates the `zpool` bucket before it sets up the
   object-store users. Before, setup used the restricted format key, which
   cannot create buckets, so a first install failed. An existing bucket and its
