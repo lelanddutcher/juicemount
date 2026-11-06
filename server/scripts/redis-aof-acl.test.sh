@@ -66,7 +66,14 @@ start() {
 	return 1
 }
 stop() { docker stop "$name" >/dev/null 2>&1 || true; }
-trap stop EXIT
+cleanup() {
+	stop
+	# The data folder belongs to the image's redis user, so empty it from a
+	# container before removing the work folder.
+	docker run --rm -v "$work:/w" --entrypoint sh "$image" -c 'rm -rf /w/data' >/dev/null 2>&1 || true
+	rm -rf "$work"
+}
+trap cleanup EXIT
 cli() { docker exec "$name" redis-cli --user jm-proxy --pass "$proxy_pw" --no-auth-warning "$@"; }
 
 start 1
