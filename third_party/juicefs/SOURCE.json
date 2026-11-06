@@ -2,12 +2,12 @@
   "archive_sha256": "9351a0655185f4a48accae2ae3af70db932de1ee38acfa4f153e3050b817806d",
   "binary": {
     "bundle_path": "Contents/MacOS/juicefs",
-    "ldflags": "-s -w -X github.com/juicedata/juicefs/pkg/version.revision=e0032b2ae5e9-jm1 -X github.com/juicedata/juicefs/pkg/version.revisionDate=2025-12-02",
+    "ldflags": "-s -w -X github.com/juicedata/juicefs/pkg/version.revision=e0032b2ae5e9-jm2 -X github.com/juicedata/juicefs/pkg/version.revisionDate=2025-12-02",
     "package": ".",
     "tags": "nogateway,nowebdav,nocos,nobos,nohdfs,noibmcos,noobs,nooss,noqingstor,nosftp,noswift,noazure,nogs,noufile,nob2,nonfs,nodragonfly,nosqlite,nomysql,nopg,notikv,nobadger,noetcd",
     "upstream_commit": "e0032b2ae5e9603403ca955eed7d05426f6f2f8c",
     "upstream_tag": "v1.3.1",
-    "version_output": "juicefs version 1.3.1+2025-12-02.e0032b2ae5e9-jm1"
+    "version_output": "juicefs version 1.3.1+2025-12-02.e0032b2ae5e9-jm2"
   },
   "files": {
     "LICENSE": {
@@ -675,7 +675,7 @@
       "upstream_sha256": "d6ba9251e0b79cf4decc3f07149d27eb75ee716af6a31712f167710b5880eb9d"
     },
     "pkg/object/file.go": {
-      "sha256": "ea4e745b69a9781e8152805ba9b0d0fc0fafce0b0dac281c1b73c07cca7cde47",
+      "sha256": "527586a53f711d66ca51725bbefb124b9a3bc572c6de1a70ac2669aede5c2cef",
       "upstream_sha256": "44eaf9edda70c93abb361eb2a5bc0a2e8731526d96315a9c65e59a3bbabaebec"
     },
     "pkg/object/file_darwin.go": {
@@ -687,7 +687,7 @@
       "upstream_sha256": "936e6bec43b744e822e9c426798cd968c90a17f33dcc8677c6edd67947d15f78"
     },
     "pkg/object/file_unix.go": {
-      "sha256": "a579ed71c2b11b9444e7a934ad5ca2e3ad4a0909446fa4be7bdccfbfa2f0eb9f",
+      "sha256": "0ab82e68c2b7390157b55d29d7671ef46853b6f2ad41ebacbdeef0a95af8c24d",
       "upstream_sha256": "a579ed71c2b11b9444e7a934ad5ca2e3ad4a0909446fa4be7bdccfbfa2f0eb9f"
     },
     "pkg/object/file_unix_test.go": {
@@ -1120,6 +1120,12 @@
     "pkg/meta/redis_replace_test.go": "ccbc7af2182cc73932ee5b3a07471ab029c511e5373d07433d41f7b4d06672de",
     "pkg/meta/tkv_etcd_test.go": "0070b8e58277ff857119b266b39521abafd6cca6640082232b58fe163640886f",
     "pkg/object/etcd_test.go": "6aee01c0cb921f1ae314b91d212126401aae62747d2c751c302f4aabcf3ed0d6",
+    "pkg/object/file_beneath_linux.go": "9d46cef4423323871d56dafb77c06dd9d76f8865a3a295f5323fbb851e8eafc9",
+    "pkg/object/file_beneath_linux_test.go": "e26d25dc17dcba7d0943f90b6d1e2ccf9c90df72229e120a847dfa4cb55ee671",
+    "pkg/object/file_beneath_other.go": "8d755a1938976822cbcc325d6da18786862c8425dc335a3a4d185f705a877ee8",
+    "pkg/object/file_ops.go": "425c2d026919ab132a3e19ed6adb7c35ef8f752efa00810403afc7f07994d2ad",
+    "pkg/object/file_ops_unix.go": "30c8a125d4124eea6c14dd4ec8eb942f3997dfb316f083a64097940e4ca03ec6",
+    "pkg/object/file_ops_windows.go": "6e6e96c6471276485464ea73dd90db804a3a72c0a516bab8a15e02857af46f48",
     "pkg/replaceguard/birth.go": "5de9a31975c4c706276f036f47e7d24b33abc60b587793c0f23b199014b7e17a",
     "pkg/replaceguard/birth_test.go": "0945903fc2cb8dba42dfcf0ed9f54eeca54f78d972bcd445b4172bb5eeab0c5d",
     "pkg/replaceguard/record.go": "5732bc2f69fdfa959023942c7eb5320f940bd28dba154c5c75138603a2a81113",
@@ -1144,7 +1150,8 @@
     "patches/0012-born-stage-upload-watch.patch": "d8dc17b58bbee31cec0bb2522c15477b7721c67e89f263ab0ff086407fb2cb5f",
     "patches/0013-security-dependencies-and-etcd-transport.patch": "de7b2dfc19c7bdb1b69e7efb1af689a9b0190afd28117927e78e3393ae6486de",
     "patches/0014-literal-fatal-error.patch": "ba84e7c4d2690c1ee2d377263f6d1dcc6793217378809b109bebf32c45964d1d",
-    "patches/0015-klauspost-compress-security-update.patch": "c46fdf7add95ff74c673421238ccbc00e6e110fe49ae327167f78f747292b640"
+    "patches/0015-klauspost-compress-security-update.patch": "c46fdf7add95ff74c673421238ccbc00e6e110fe49ae327167f78f747292b640",
+    "patches/0016-file-backend-beneath-root.patch": "9d7b06e9fda04a5d06a27f7b93fa30b120999eaed63b9fd3a74cb7651bcfeff1"
   },
   "scope": "All pkg/ and cmd/ files plus main.go, LICENSE, go.mod and go.sum from the verified module ZIP. Documentation, integration tests and SDK examples are not included. local_files are JuiceMount-owned source with no upstream counterpart.",
   "upstream_url": "https://github.com/juicedata/juicefs/tree/v1.3.1",

@@ -43,22 +43,25 @@ var PutInplace bool
 type filestore struct {
 	DefaultObjectStorage
 	root string
+	// ops performs every filesystem operation. On Linux it resolves each
+	// path beneath the root (file_beneath_linux.go).
+	ops fileOps
 }
 
 func (d *filestore) Symlink(oldName, newName string) error {
 	p := d.path(newName)
-	if _, err := os.Stat(filepath.Dir(p)); err != nil && os.IsNotExist(err) {
-		if err := os.MkdirAll(filepath.Dir(p), os.FileMode(0777)); err != nil {
+	if _, err := d.ops.Stat(filepath.Dir(p)); err != nil && os.IsNotExist(err) {
+		if err := d.ops.MkdirAll(filepath.Dir(p), os.FileMode(0777)); err != nil {
 			return err
 		}
 	} else if err != nil && !os.IsNotExist(err) {
 		return err
 	}
-	return os.Symlink(oldName, p)
+	return d.ops.Symlink(oldName, p)
 }
 
 func (d *filestore) Readlink(name string) (string, error) {
-	return os.Readlink(d.path(name))
+	return d.ops.Readlink(d.path(name))
 }
 
 func (d *filestore) String() string {
@@ -77,13 +80,13 @@ func (d *filestore) path(key string) string {
 
 func (d *filestore) Head(key string) (Object, error) {
 	p := d.path(key)
-	fi, err := os.Lstat(p)
+	fi, err := d.ops.Lstat(p)
 	if err != nil {
 		return nil, err
 	}
 	isSymlink := fi.Mode()&os.ModeSymlink != 0
 	if isSymlink {
-		fi, err = os.Stat(p)
+		fi, err = d.ops.Stat(p)
 		if err != nil {
 			return nil, err
 		}
@@ -120,7 +123,7 @@ type SectionReaderCloser struct {
 func (d *filestore) Get(key string, off, limit int64, getters ...AttrGetter) (io.ReadCloser, error) {
 	p := d.path(key)
 
-	f, err := os.Open(p)
+	f, err := d.ops.Open(p)
 	if err != nil {
 		return nil, err
 	}
@@ -148,7 +151,7 @@ func (d *filestore) Put(key string, in io.Reader, getters ...AttrGetter) (err er
 	p := d.path(key)
 
 	if strings.HasSuffix(key, dirSuffix) || key == "" && strings.HasSuffix(d.root, dirSuffix) {
-		return os.MkdirAll(p, os.FileMode(0777))
+		return d.ops.MkdirAll(p, os.FileMode(0777))
 	}
 
 	var tmp string
@@ -162,16 +165,16 @@ func (d *filestore) Put(key string, in io.Reader, getters ...AttrGetter) (err er
 		tmp = filepath.Join(filepath.Dir(p), "."+name+".tmp"+strconv.Itoa(rand.Int()))
 		defer func() {
 			if err != nil {
-				_ = os.Remove(tmp)
+				_ = d.ops.Remove(tmp)
 			}
 		}()
 	}
-	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0666)
+	f, err := d.ops.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0666)
 	if err != nil && os.IsNotExist(err) {
-		if err := os.MkdirAll(filepath.Dir(p), os.FileMode(0777)); err != nil {
+		if err := d.ops.MkdirAll(filepath.Dir(p), os.FileMode(0777)); err != nil {
 			return err
 		}
-		f, err = os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0666)
+		f, err = d.ops.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0666)
 	}
 	if err != nil {
 		return err
@@ -193,7 +196,7 @@ func (d *filestore) Put(key string, in io.Reader, getters ...AttrGetter) (err er
 		return err
 	}
 	if !PutInplace {
-		err = os.Rename(tmp, p)
+		err = d.ops.Rename(tmp, p)
 	}
 	return err
 }
@@ -208,24 +211,31 @@ func (d *filestore) PutIfAbsent(key string, in io.Reader, getters ...AttrGetter)
 	}
 	p := d.path(key)
 	parent := filepath.Dir(p)
-	if err := os.MkdirAll(parent, 0777); err != nil {
+	if err := d.ops.MkdirAll(parent, 0777); err != nil {
 		return err
 	}
 	// Sync the complete chain, including directories left by an interrupted
 	// earlier attempt. Syncing only the leaf would not establish its parents.
+	// Folders inside the root go through d.ops; the root's own ancestors
+	// are the configured, trusted path.
+	base := storageBaseDir(d.root)
 	for dir := parent; ; dir = filepath.Dir(dir) {
-		if err := syncObjectDirectory(dir); err != nil {
+		syncDir := d.ops.SyncDir
+		if !strings.HasPrefix(dir+"/", strings.TrimSuffix(base, "/")+"/") {
+			syncDir = syncObjectDirectory
+		}
+		if err := syncDir(dir); err != nil {
 			return err
 		}
 		if filepath.Dir(dir) == dir {
 			break
 		}
 	}
-	f, err := os.CreateTemp(parent, ".juicemount-create-*")
+	f, err := d.ops.CreateTemp(parent, ".juicemount-create-")
 	if err != nil {
 		return err
 	}
-	defer os.Remove(f.Name()) // Only this attempt's private name, never p.
+	defer d.ops.Remove(f.Name()) // Only this attempt's private name, never p.
 	if _, err := io.Copy(f, in); err != nil {
 		_ = f.Close()
 		return err
@@ -237,10 +247,10 @@ func (d *filestore) PutIfAbsent(key string, in io.Reader, getters ...AttrGetter)
 	if err := f.Close(); err != nil {
 		return err
 	}
-	if err := os.Link(f.Name(), p); err != nil {
+	if err := d.ops.Link(f.Name(), p); err != nil {
 		return err
 	}
-	return syncObjectDirectory(parent)
+	return d.ops.SyncDir(parent)
 }
 
 func syncObjectDirectory(name string) error {
@@ -266,7 +276,7 @@ func (d *filestore) Copy(dst, src string) error {
 }
 
 func (d *filestore) Delete(key string, getters ...AttrGetter) error {
-	err := os.Remove(d.path(key))
+	err := d.ops.Remove(d.path(key))
 	if err != nil && os.IsNotExist(err) {
 		err = nil
 	}
@@ -300,13 +310,12 @@ func (m *mEntry) IsDir() bool {
 
 // readDirSorted reads the directory named by dir and returns
 // a sorted list of directory entries.
-func readDirSorted(dir string, followLink bool) ([]*mEntry, error) {
-	f, err := os.Open(dir)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	entries, err := f.Readdir(-1)
+//
+// Listing and a followed symlink's stat go through ops, so on Linux a
+// symlink is followed only beneath the root; one that leads outside is
+// listed as a broken link.
+func readDirSortedOps(ops fileOps, dir string, followLink bool) ([]*mEntry, error) {
+	entries, err := ops.ReadDir(dir)
 	if err != nil {
 		return nil, err
 	}
@@ -317,7 +326,7 @@ func readDirSorted(dir string, followLink bool) ([]*mEntry, error) {
 		if e.IsDir() {
 			mEntries[i] = &mEntry{e, e.Name() + dirSuffix, nil, false}
 		} else if isSymlink && followLink {
-			fi, err := os.Stat(filepath.Join(dir, e.Name()))
+			fi, err := ops.Stat(filepath.Join(dir, e.Name()))
 			if err != nil {
 				mEntries[i] = &mEntry{e, e.Name(), nil, true}
 				continue
@@ -356,7 +365,7 @@ func (d *filestore) List(prefix, marker, token, delimiter string, limit int64, f
 		}
 		objs = append(objs, obj)
 	}
-	entries, err := readDirSorted(dir, followLink)
+	entries, err := readDirSortedOps(d.ops, dir, followLink)
 	if err != nil {
 		if os.IsPermission(err) {
 			logger.Warnf("skip %s: %s", dir, err)
@@ -392,7 +401,7 @@ func (d *filestore) List(prefix, marker, token, delimiter string, limit int64, f
 
 func (d *filestore) Chmod(key string, mode os.FileMode) error {
 	p := d.path(key)
-	return os.Chmod(p, mode)
+	return d.ops.Chmod(p, mode)
 }
 
 func (d *filestore) Chown(key string, owner, group string) error {
@@ -402,7 +411,7 @@ func (d *filestore) Chown(key string, owner, group string) error {
 	if uid == -1 || gid == -1 {
 		return fmt.Errorf("user(%s):group(%s) not found", owner, group)
 	}
-	return os.Lchown(p, uid, gid)
+	return d.ops.Lchown(p, uid, gid)
 }
 
 func newDisk(root, accesskey, secretkey, token string) (ObjectStorage, error) {
@@ -410,7 +419,7 @@ func newDisk(root, accesskey, secretkey, token string) (ObjectStorage, error) {
 	if runtime.GOOS == "windows" {
 		root = strings.TrimPrefix(root, "/")
 	}
-	return &filestore{root: root}, nil
+	return &filestore{root: root, ops: newFileOps(root)}, nil
 }
 
 func init() {

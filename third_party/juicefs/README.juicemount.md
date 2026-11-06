@@ -66,3 +66,16 @@ In the pinned `github.com/juicedata/go-fuse/v2` fork, `Server.Shutdown` does not
 `patches/0014-literal-fatal-error.patch` passes an already formatted metadata configuration error to `Fatal`, preserving fatal exit behavior while treating the message as literal text. This resolves the newer Go checker's rejection of a nonconstant, zero-argument `Fatalf` call; the checker remains enabled.
 
 `patches/0015-klauspost-compress-security-update.patch` updates `github.com/klauspost/compress` from v1.17.11 to v1.20.2 in this module's `go.mod` and `go.sum` for GO-2026-6865 (GHSA-fpmh-frq8-7rj8), a panic on two-block frames in the `fse` and `huff0` packages that `zstd` uses; the bundled CLI reaches the affected symbols. No other dependency changes. The root module takes the same version.
+
+`patches/0016-file-backend-beneath-root.patch` confines the `file://` object backend to its root folder on Linux. The root is the folder named in the URI, or, without a trailing slash, its parent folder: that form is a name prefix in the parent.
+- **How.** Every filesystem operation of the backend goes through a `fileOps` value (`pkg/object/file_ops.go`).
+  - On Linux, `beneathOps` (`pkg/object/file_beneath_linux.go`) opens the root once. It then resolves every path relative to that folder with `openat2(RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS)`, or with an `*at` call on a parent folder opened that way: open, create, mkdir, stat, lstat, readdir, rename, link, unlink, chmod, chown, chtimes, symlink and readlink.
+  - The kernel refuses, atomically per call, any resolution that would leave the root. That covers an absolute symlink, a `..` above the root, a chain of symlinks, and a symlink swapped in between calls.
+- **Links.** A symlink is still stored and read as a link (`--links`). Following one is allowed only when the kernel can prove the result stays beneath the root, so relative links inside the root work. Absolute links and links that climb above the root are not followed, even when their host path points back inside.
+  - When listing with links followed, such a link shows as a broken link, and copying its content fails.
+  - A refusal is an `os.PathError` that wraps `EXDEV`, with the text "path resolves outside the file storage root".
+- **Old kernels.** Without `openat2` (Linux before 5.6, or a seccomp policy that refuses it) every operation fails closed with a message naming the requirement.
+- **Root path.** The root path itself is trusted. A missing root is created on the first write.
+- **Other platforms.** Non-Linux builds keep the upstream path-based behaviour (`pathOps`, `file_beneath_other.go`). The macOS app bundles juicefs for mounting and does not run sync.
+- **Gates.** `pkg/object/file_beneath_linux_test.go`, and the real-binary sync tests in `internal/manager/juicefs_beneath_test.go`, which CI runs with this module's build.
+- **Version.** The build suffix moved to `-jm2`.
