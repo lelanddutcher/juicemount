@@ -1058,3 +1058,23 @@ func TestSmartFoldersEventPathPanicDisablesFeature(t *testing.T) {
 	publisher(t, ctx, pub, svc.cfg.Channel)(metadata.MetadataEvent{Op: "create", Path: "NewFolder/x.mov"})
 	waitFor(t, "smart folders to disable themselves", svc.disabled.Load)
 }
+
+// TestSmartFoldersDefaultChannelIsMetadataChannel pins the one link between
+// the Manager and the channel JuiceFS clients publish on. The integration
+// tests give each service its own channel, so without this a wrong default
+// would leave production smart folders deaf while every test passes.
+func TestSmartFoldersDefaultChannelIsMetadataChannel(t *testing.T) {
+	rdb := redis.NewClient(&redis.Options{Addr: "127.0.0.1:1", MaxRetries: -1})
+	defer rdb.Close()
+	svc, err := newSmartFoldersService(smartFoldersConfig{
+		Backend:   &panickingBackend{},
+		Redis:     rdb,
+		StatePath: filepath.Join(t.TempDir(), "smartfolders.json"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if svc.cfg.Channel != metadata.SubscribeChannel {
+		t.Fatalf("default channel = %q, want metadata.SubscribeChannel %q", svc.cfg.Channel, metadata.SubscribeChannel)
+	}
+}

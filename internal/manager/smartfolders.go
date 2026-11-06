@@ -227,7 +227,7 @@ type smartFoldersConfig struct {
 	Settings  smartFoldersSettings
 	Backend   smartFoldersBackend
 	Redis     *redis.Client        // subscribed to Channel; closed by Stop
-	Channel   string               // change-event channel (default juicemount:metadata)
+	Channel   string               // tests only: change-event channel (default juicemount:metadata, the only one clients publish on and respproxy admits)
 	StatePath string               // required: ownership must be persisted
 	Leaser    func() ProjectLeaser // nil or returning nil = no checkout
 	Interval  time.Duration        // reconcile debounce (default 30s)
