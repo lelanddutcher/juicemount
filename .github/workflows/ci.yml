@@ -55,9 +55,24 @@ jobs:
           curl -fsSL -o "$RUNNER_TEMP/headscale" https://github.com/juanfont/headscale/releases/download/v0.29.3/headscale_0.29.3_linux_amd64
           echo "8dc183758024ed7095cf610fedea0790233613c71353bc8be2715d82ba29b92c  $RUNNER_TEMP/headscale" | sha256sum -c -
           chmod +x "$RUNNER_TEMP/headscale"
+      - name: Build the vendored juicefs for the sync tests
+        # The module and patches the manager image ships (third_party/juicefs),
+        # so the real-binary sync tests in internal/manager run instead of
+        # skipping.
+        working-directory: third_party/juicefs
+        run: |
+          go build -tags nocos,nobos,nohdfs,noibmcos,noobs,nooss,noqingstor,noswift,noazure,nogs,noufile,nodragonfly,nosqlite,nomysql,nopg,notikv,nobadger,noetcd \
+            -o "$RUNNER_TEMP/juicefs" .
+          "$RUNNER_TEMP/juicefs" --version
+      - name: Vendored juicefs object-backend tests
+        working-directory: third_party/juicefs
+        run: go test -count=1 ./pkg/object
       - name: Unit and integration-safe tests
         env:
           JM_REQUIRE_GATE_HISTORY: '1'
+          # Real juicefs for the sync tests; DB 8 is flushed by the jfs:// test.
+          JM_TEST_JUICEFS_BIN: ${{ runner.temp }}/juicefs
+          JM_TEST_JFS_META: redis://127.0.0.1:6379/8
           JM_TEST_HEADSCALE_BIN: ${{ runner.temp }}/headscale
           JM_TEST_LINK_REDIS: redis://127.0.0.1:6379/13
           JM_TEST_MANAGER_REDIS: redis://127.0.0.1:6379/12
