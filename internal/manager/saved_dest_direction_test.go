@@ -79,6 +79,12 @@ func TestSavedDestinationRejectsUnknownDirection(t *testing.T) {
 // /api/migrate, the saved-destination branches and the schedule gate.
 func TestCheckSyncSource(t *testing.T) {
 	root := t.TempDir()
+	// The source must exist: on macOS t.TempDir sits under /var, a symlink
+	// to /private/var, and pathAllowed resolves symlinks only on paths
+	// that exist, so a missing path under the root would not match it.
+	if err := os.MkdirAll(filepath.Join(root, "a"), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	a := &API{sourceRoots: []string{root}, destMount: "/jfs"}
 	cases := []struct {
 		path string
