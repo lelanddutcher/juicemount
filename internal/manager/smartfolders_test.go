@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -165,6 +166,7 @@ type svcOpts struct {
 	rdb      *redis.Client
 	backend  smartFoldersBackend
 	maxViews int
+	channel  string
 }
 
 func newTestSmartFolders(t *testing.T, o svcOpts) *smartFoldersService {
@@ -178,6 +180,11 @@ func newTestSmartFolders(t *testing.T, o svcOpts) *smartFoldersService {
 	if o.state == "" {
 		o.state = filepath.Join(t.TempDir(), smartFoldersStateName)
 	}
+	if o.channel == "" {
+		// Pub/sub channels span every database on a Redis server: another
+		// test run on the same server must not feed this service events.
+		o.channel = testEventChannel()
+	}
 	if o.maxViews == 0 {
 		o.maxViews = 256
 	}
@@ -185,6 +192,7 @@ func newTestSmartFolders(t *testing.T, o svcOpts) *smartFoldersService {
 		Settings:  smartFoldersSettings{Root: "Recents", MaxViews: o.maxViews, CollectionsRoot: "Collections", QueriesRoot: "Queries"},
 		Backend:   o.backend,
 		Redis:     o.rdb,
+		Channel:   o.channel,
 		StatePath: o.state,
 		Leaser:    func() ProjectLeaser { return o.leaser },
 		Interval:  time.Hour, // cycles are driven by kick() or called directly
@@ -432,7 +440,28 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 	t.Fatalf("timed out waiting for %s", what)
 }
 
-func publisher(t *testing.T, ctx context.Context, rdb *redis.Client) func(...metadata.MetadataEvent) {
+// cycleCounter counts finished reconcile cycles: each cycle acquires the
+// backend once and releases it at its end.
+type cycleCounter struct {
+	smartFoldersBackend
+	cycles atomic.Int64
+}
+
+func (b *cycleCounter) acquire() (smartfolders.FS, func(), error) {
+	fsys, release, err := b.smartFoldersBackend.acquire()
+	if err != nil {
+		return nil, nil, err
+	}
+	return fsys, func() { release(); b.cycles.Add(1) }, nil
+}
+
+// testEventChannel is a change-event channel of the production name's
+// shape that no other test or run publishes on.
+func testEventChannel() string {
+	return fmt.Sprintf("%s:test-%d", metadataEventChannel, time.Now().UnixNano())
+}
+
+func publisher(t *testing.T, ctx context.Context, rdb *redis.Client, channel string) func(...metadata.MetadataEvent) {
 	return func(evs ...metadata.MetadataEvent) {
 		t.Helper()
 		for _, ev := range evs {
@@ -440,7 +469,7 @@ func publisher(t *testing.T, ctx context.Context, rdb *redis.Client) func(...met
 			if err != nil {
 				t.Fatal(err)
 			}
-			if err := rdb.Publish(ctx, metadata.SubscribeChannel, string(payload)).Err(); err != nil {
+			if err := rdb.Publish(ctx, channel, string(payload)).Err(); err != nil {
 				t.Fatal(err)
 			}
 			time.Sleep(5 * time.Millisecond) // distinct receipt times
@@ -475,8 +504,10 @@ func TestSmartFoldersRedisIntegration(t *testing.T) {
 		writeVolumeFile(t, root, f)
 	}
 	state := filepath.Join(t.TempDir(), smartFoldersStateName)
+	channel := testEventChannel()
 	leaser := &fakeLeaser{}
-	svc := newTestSmartFolders(t, svcOpts{root: root, leaser: leaser, state: state, rdb: openTestRedis(t, metaURL)})
+	backend := &cycleCounter{smartFoldersBackend: &osBackend{root: root, mountCheck: func(string) error { return nil }}}
+	svc := newTestSmartFolders(t, svcOpts{root: root, leaser: leaser, state: state, rdb: openTestRedis(t, metaURL), backend: backend, channel: channel})
 	svc.Start()
 	stopped := false
 	defer func() {
@@ -491,9 +522,14 @@ func TestSmartFoldersRedisIntegration(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatal("subscription never became ready")
 	}
+	// Start runs a cycle at once. One that overlaps the events below sees
+	// only some of them, and the names it gives stay put: an early
+	// Interviews/clip.mov keeps "clip.mov". Publish only after it, so the
+	// first cycle that sees any event sees them all.
+	waitFor(t, "the startup cycle", func() bool { return backend.cycles.Load() >= 1 })
 	pub := openTestRedis(t, metaURL)
 	defer pub.Close()
-	publish := publisher(t, ctx, pub)
+	publish := publisher(t, ctx, pub, channel)
 	publish(
 		metadata.MetadataEvent{Op: "create", Path: "Projects", IsDir: true},
 		metadata.MetadataEvent{Op: "create", Path: "Projects/old.mov", Size: 1, Mtime: 1, Inode: 10},
@@ -562,13 +598,19 @@ func TestSmartFoldersRedisIntegration(t *testing.T) {
 
 	svc.Stop()
 	stopped = true
+	// Stop gives up waiting after StopWait; the second service must not
+	// share the tree with a cycle of the first.
+	svc.done.Wait()
 	// Restart: unchanged views are not touched (no checkout at all).
 	leaser2 := &fakeLeaser{}
-	svc2 := newTestSmartFolders(t, svcOpts{root: root, leaser: leaser2, state: state, rdb: openTestRedis(t, metaURL)})
+	backend2 := &cycleCounter{smartFoldersBackend: &osBackend{root: root, mountCheck: func(string) error { return nil }}}
+	svc2 := newTestSmartFolders(t, svcOpts{root: root, leaser: leaser2, state: state, rdb: openTestRedis(t, metaURL), backend: backend2, channel: channel})
 	svc2.Start()
 	defer svc2.Stop()
 	svc2.kick()
-	time.Sleep(300 * time.Millisecond)
+	// The startup cycle, then the kicked one (the kick waits in the wake
+	// channel): both have run to the end before the checks.
+	waitFor(t, "two cycles after the restart", func() bool { return backend2.cycles.Load() >= 2 })
 	if got := viewTree(t, root); !reflect.DeepEqual(got, want) {
 		t.Fatalf("after restart: %v", got)
 	}
@@ -756,7 +798,7 @@ func TestSmartFoldersStandaloneMetadataBackend(t *testing.T) {
 	defer pub.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	publisher(t, ctx, pub)(
+	publisher(t, ctx, pub, svc.cfg.Channel)(
 		metadata.MetadataEvent{Op: "create", Path: "Projects/a.mov", Inode: 1},
 		metadata.MetadataEvent{Op: "create", Path: "Projects/sub/b.mov", Inode: 2},
 		metadata.MetadataEvent{Op: "create", Path: "Music/x.wav", Inode: 3},
@@ -1013,6 +1055,6 @@ func TestSmartFoldersEventPathPanicDisablesFeature(t *testing.T) {
 	defer pub.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	publisher(t, ctx, pub)(metadata.MetadataEvent{Op: "create", Path: "NewFolder/x.mov"})
+	publisher(t, ctx, pub, svc.cfg.Channel)(metadata.MetadataEvent{Op: "create", Path: "NewFolder/x.mov"})
 	waitFor(t, "smart folders to disable themselves", svc.disabled.Load)
 }
