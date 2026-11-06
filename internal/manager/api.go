@@ -1491,30 +1491,80 @@ func (a *API) jfsPathAllowed(p string) bool {
 }
 
 // pathAllowed returns true iff `p` is under one of the configured
-// source roots after symlink resolution. Prevents path-traversal
-// attacks via "../" segments.
+// source roots, judged where the kernel would land when opening `p`.
+//
+// `p` is resolved with resolvePhysicalPath: symlinks are followed
+// segment by segment, and ".." is applied after the symlink before it,
+// the same way the kernel does it. ".." is NOT collapsed as text
+// first: "<root>/link/../x" lands under link's target, not at
+// "<root>/x". Roots are resolved the same way, so a root reached
+// through a symlink (macOS /var -> /private/var) still matches a path
+// that does not exist yet.
+//
+// A caller that checks a path must use exactly that text afterwards.
+// The check is not atomic with the later open: a symlink swapped in
+// after the check is not caught.
 func (a *API) pathAllowed(p string) bool {
-	clean, err := filepath.Abs(p)
+	resolved, err := resolvePhysicalPath(p)
 	if err != nil {
 		return false
 	}
-	resolved, err := filepath.EvalSymlinks(clean)
-	if err != nil {
-		// If the path doesn't exist yet (legal for browse fallback),
-		// fall back to the cleaned absolute path.
-		resolved = clean
-	}
 	for _, root := range a.sourceRoots {
-		rootAbs, _ := filepath.Abs(root)
-		rootResolved, err := filepath.EvalSymlinks(rootAbs)
+		rootResolved, err := resolvePhysicalPath(root)
 		if err != nil {
-			rootResolved = rootAbs
+			continue
 		}
-		if resolved == rootResolved || strings.HasPrefix(resolved, rootResolved+string(filepath.Separator)) {
+		if pathWithin(resolved, rootResolved) {
 			return true
 		}
 	}
 	return false
+}
+
+// resolvePhysicalPath returns where the kernel would land when opening
+// p, without collapsing ".." as text first. The longest existing prefix
+// of the path text, cut at a separator, is resolved with
+// filepath.EvalSymlinks; it handles "link/.." after resolving the link.
+// The missing remainder is then appended. It does not exist, so it
+// holds no symlinks yet. Refused: a dangling symlink (its target is
+// unknown) and ".." inside the missing remainder. A relative p is taken
+// against the working directory.
+func resolvePhysicalPath(p string) (string, error) {
+	if p == "" {
+		return "", errors.New("empty path")
+	}
+	if !filepath.IsAbs(p) {
+		wd, err := os.Getwd()
+		if err != nil {
+			return "", err
+		}
+		p = wd + string(filepath.Separator) + p
+	}
+	existing, rest := p, ""
+	for {
+		resolved, err := filepath.EvalSymlinks(existing)
+		if err == nil {
+			return filepath.Join(resolved, rest), nil
+		}
+		if !errors.Is(err, fs.ErrNotExist) {
+			return "", err
+		}
+		if _, lerr := os.Lstat(existing); lerr == nil {
+			return "", fmt.Errorf("dangling symlink at %s", existing)
+		}
+		i := strings.LastIndexByte(existing, filepath.Separator)
+		if i <= 0 {
+			// Nothing under "/" exists on this path; it is plain text.
+			return filepath.Join("/", existing, rest), nil
+		}
+		if existing[i+1:] == ".." {
+			// "missing/.." cannot be opened today, and collapsing it as
+			// text could land on an existing symlink. Refuse it.
+			return "", fmt.Errorf("path climbs out of a missing folder: %s", p)
+		}
+		rest = filepath.Join(existing[i+1:], rest)
+		existing = existing[:i]
+	}
 }
 
 func writeJSON(w http.ResponseWriter, status int, body any) {
