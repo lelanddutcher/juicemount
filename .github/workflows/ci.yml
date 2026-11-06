@@ -107,6 +107,8 @@ jobs:
           docker compose -f server/docker-compose.yml config --quiet
           docker compose -f server/docker-compose.yml -f server/docker-compose.link.yml config --quiet
           bash server/scripts/update-server.test.sh
+      - name: Redis replays transactions from its AOF under the shipped ACL
+        run: bash server/scripts/redis-aof-acl.test.sh
 
   mac-app:
     runs-on: macos-26
@@ -181,3 +183,79 @@ jobs:
           P96_EXPECTED_VERSION="$(awk -F'"' '/^var Version = / { print $2; exit }' internal/version/version.go)" \
           P96_EXPECTED_COMMIT="$(git rev-parse HEAD)" \
             python3 scripts/test_verify_build.py
+
+  # juicemount-setup end to end against real Docker: install from this
+  # checkout's server/ with the latest release's image digests, wait until the
+  # Manager answers, then run it again and prove nothing changed.
+  setup-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Offline setup tests
+        run: bash server/scripts/juicemount-setup.test.sh
+      - name: First run installs and starts the stack
+        run: |
+          out="$RUNNER_TEMP/run1.out"
+          bash server/scripts/juicemount-setup.sh --yes --source server \
+            --dir "$RUNNER_TEMP/juicemount" --project jm-ci > "$out"
+          env_file="$RUNNER_TEMP/juicemount/compose/.env"
+          sed -n 's/^[A-Z_][A-Z0-9_]*=\(.\{8,\}\)$/::add-mask::\1/p' "$env_file"
+          sed 's/^\(Sign-in key:  \).*/\1(hidden)/' "$out"
+          test "$(wc -l < "$out")" = 2
+          grep -Eqx 'Manager URL:  http://[^ ]+:30190' "$out"
+          grep -Eqx 'Sign-in key:  [0-9a-f]{32}' "$out"
+          test "$(stat -c %a "$env_file")" = 600
+          test "$(stat -c %a "$(dirname "$env_file")")" = 700
+      - name: The Manager answers with the printed key, and only with it
+        run: |
+          key="$(sed -n 's/^Sign-in key:  //p' "$RUNNER_TEMP/run1.out")"
+          printf 'X-JuiceMount-Admin-Key: %s\n' "$key" |
+            curl -fsS -H @- -o "$RUNNER_TEMP/principals.json" http://127.0.0.1:30190/api/principals
+          grep -Eq '"proxy_live": *true' "$RUNNER_TEMP/principals.json"
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:30190/api/overview)" = 401
+      - name: Second run changes nothing
+        run: |
+          d="$RUNNER_TEMP/juicemount/compose"
+          snap() {
+            (cd "$d" && sha256sum .env docker-compose.yml redis.conf redis.acl minio/*)
+            docker ps -aq --filter label=com.docker.compose.project=jm-ci | sort
+          }
+          before="$(snap)"
+          bash server/scripts/juicemount-setup.sh --yes --source server \
+            --dir "$RUNNER_TEMP/juicemount" --project jm-ci > "$RUNNER_TEMP/run2.out"
+          test "$(snap)" = "$before"
+          cmp "$RUNNER_TEMP/run1.out" "$RUNNER_TEMP/run2.out"
+      - name: A transaction survives a Redis stop and a setup re-run
+        run: |
+          d="$RUNNER_TEMP/juicemount/compose"
+          pass="$(sed -n 's/^JM_PROXY_ADMIN_PASSWORD=//p' "$d/.env")"
+          # Through the proxy as principal admin; the password goes on stdin.
+          proxy() {
+            { printf 'AUTH admin %s\nSELECT 1\n' "$pass"; cat; } |
+              docker exec -i "$("$d/jm-compose" ps -q redis)" redis-cli -h respproxy -p 6379 --no-auth-warning
+          }
+          # A transaction with an LPUSH: the 0.5.0 ACL refused exactly these
+          # when Redis replayed its append-only file.
+          printf 'MULTI\nSET jmsetup:e2e:tx survived\nLPUSH jmsetup:e2e:list a\nEXEC\n' | proxy
+          sleep 2   # appendfsync everysec
+          "$d/jm-compose" stop redis
+          bash server/scripts/juicemount-setup.sh --yes --source server \
+            --dir "$RUNNER_TEMP/juicemount" --project jm-ci > /dev/null
+          test "$(printf 'GET jmsetup:e2e:tx\n' | proxy | tail -n 1)" = survived
+          test "$(printf 'LLEN jmsetup:e2e:list\n' | proxy | tail -n 1)" = 1
+          if docker logs "$("$d/jm-compose" ps -q redis)" 2>&1 | grep -q 'AOF-loading-client'; then
+            echo "Redis refused replayed commands:"; exit 1
+          fi
+      - name: Stack state after a failure
+        if: failure()
+        run: |
+          d="$RUNNER_TEMP/juicemount/compose"
+          [ -f "$d/.env" ] || exit 0
+          # Mask every value of the install's .env before anything prints:
+          # the first-run step may have failed before it added its masks.
+          sed -n 's/^[A-Z_][A-Z0-9_]*=\(.\{8,\}\)$/::add-mask::\1/p' "$d/.env"
+          "$d/jm-compose" ps -a
+          "$d/jm-compose" logs --no-color --tail 60

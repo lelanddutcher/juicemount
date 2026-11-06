@@ -1,6 +1,12 @@
-# JuiceMount server-side stack — TrueNAS Scale "Install via YAML" reference.
+# JuiceMount server-side stack: the canonical 0.5 server compose.
 #
-# This is the production-tested compose for the JuiceMount NAS app:
+# Install it with server/scripts/juicemount-setup.sh (one command, in the
+# TrueNAS SCALE shell or on any Docker host; see server/INSTALL-TrueNAS.md).
+# The setup command copies this file, replaces the sample host paths below,
+# generates every secret into a private .env, reads the first-party image
+# digests from the release manifest, and starts the stack.
+#
+# Services:
 #
 #   redis                — JuiceFS metadata authority (AOF persistence).
 #                          Internal only: no published port, `default off`.
@@ -19,12 +25,19 @@
 #                          juicemount-migrator image tag is still published
 #                          from CI for one release as a backward-compat alias)
 #
-# The bind-mount paths are TrueNAS-flavored (`/mnt/<pool>/juicemount/*`).
-# On a plain Linux/Synology host, edit the `volumes:` paths and the
-# `MINIO_ROOT_PASSWORD` value, then `docker compose up -d`.
+# Host paths: every data mount below uses the sample prefix
+# /mnt/zSSD/juicemount/, and the Manager's import mount is
+# /mnt/storage0/zpool. The setup command replaces both. By hand, edit them
+# in the `volumes:` entries.
 #
-# Pre-flight (juicefs-init) returns named exit codes — see
-# server/INSTALL-TrueNAS.md for the table.
+# Settings and secrets: nothing secret is in this file. Every credential,
+# image digest and the storage size come from the environment, and each
+# required one has a ${VAR:?} guard, so `docker compose config` refuses to
+# render while one is missing. The template, with what each value means, is
+# server/release.env.example.
+#
+# Pre-flight (juicefs-init) returns named exit codes; the table is in
+# server/INSTALL-TrueNAS.md.
 
 services:
 
