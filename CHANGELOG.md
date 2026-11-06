@@ -71,6 +71,26 @@ or farm workers.
   name (for example `photos-old/` next to `photos/`) into folders next to the
   destination. Both settings copy the source folder's contents into the
   destination, as before.
+- The Manager keeps every path it works on inside the volume or inside the
+  configured source folders, also when the volume holds symlinks that Macs
+  wrote. Folder browsing, previews, migrations and backups, schedules,
+  permission fixes and the trash all check a path the way the kernel will
+  open it, and refuse a path that leads outside. Details are in this
+  repository's GitHub security advisories.
+- Migrations and backups run the JuiceFS copy confined to the folders they
+  copy between. The Manager image ships a JuiceFS build (`-jm2`) whose local
+  folder backend cannot open anything outside the folder it was given.
+  Symlinks are copied as symlinks only into the volume. A symlink that cannot
+  be followed inside the folder being copied (for example an absolute macOS
+  path such as `/Volumes/Media/clip.mov`) is skipped, and the job reports how
+  many it skipped and names the first few. Before, such a link could make a
+  backup copy files from outside the volume, or fail the whole job.
+- A sync request with an unknown direction is refused. Before, a request
+  naming a saved destination skipped the source check.
+- These checks need Linux 5.6 or later, and a Docker seccomp profile that
+  allows `openat2` (Docker 20.10 or later). On an older kernel or profile,
+  every migration or backup between local folders fails with a message
+  saying so, and none runs unconfined.
 - A fresh server install creates the `zpool` bucket before it sets up the
   object-store users. Before, setup used the restricted format key, which
   cannot create buckets, so a first install failed. An existing bucket and its
