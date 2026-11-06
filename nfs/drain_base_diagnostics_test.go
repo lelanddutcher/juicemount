@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -15,6 +16,27 @@ import (
 	"github.com/lelanddutcher/juicemount/metadata"
 	"golang.org/x/sys/unix"
 )
+
+// lockedLog is the jmlog sink these tests read. jmlog is process-wide, so a
+// goroutine that outlived an earlier test (a spool sweeper whose handler
+// refused to stop, for example) can write here while the test reads; a bare
+// bytes.Buffer would race. Bytes returns a copy taken under the same lock.
+type lockedLog struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (l *lockedLog) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.buf.Write(p)
+}
+
+func (l *lockedLog) Bytes() []byte {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return bytes.Clone(l.buf.Bytes())
+}
 
 type exactBaseLog struct {
 	Message            string `json:"msg"`
@@ -54,7 +76,7 @@ func TestDrainBaseDiagnosticSidecarChmodResult(t *testing.T) {
 		{name: "missing", wantErrno: int(unix.ENOENT)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			var logs bytes.Buffer
+			var logs lockedLog
 			if err := jmlog.Init(jmlog.Config{Stderr: &logs}); err != nil {
 				t.Fatal(err)
 			}
@@ -205,7 +227,7 @@ func TestDrainBaseDiagnosticRefusalPreservesConflict(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			var logs bytes.Buffer
+			var logs lockedLog
 			if err := jmlog.Init(jmlog.Config{Stderr: &logs}); err != nil {
 				t.Fatal(err)
 			}

@@ -459,6 +459,18 @@ func (p *Profile) ForceClass(c *LinkClass) {
 	p.mu.Unlock()
 }
 
+// ForcedClass reports the explicit ForceClass override, if one is set. It is
+// read-only: tests use it to pin a class and then restore the caller's prior
+// override instead of clearing it.
+func (p *Profile) ForcedClass() (LinkClass, bool) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if p.forcedClass == nil {
+		return 0, false
+	}
+	return *p.forcedClass, true
+}
+
 // SetNetworkCostClass records the host OS's expensive/constrained path signal
 // without sharing the explicit-operator ForceClass slot. Explicit force keeps
 // precedence; in automatic mode a positive cost signal is authoritative until

@@ -225,7 +225,13 @@ func TestForceClass(t *testing.T) {
 	p := New()
 	sampleFor(p, 800*1024*1024, 8) // would be fast
 	c := ClassMetered
+	if _, forced := p.ForcedClass(); forced {
+		t.Fatal("ForcedClass reports an override before ForceClass")
+	}
 	p.ForceClass(&c)
+	if got, forced := p.ForcedClass(); !forced || got != ClassMetered {
+		t.Fatalf("ForcedClass() = %v, %v; want metered, true", got, forced)
+	}
 	if got := p.Class(); got != ClassMetered {
 		t.Fatalf("ForceClass(metered) → %v, want metered despite fast bandwidth", got)
 	}
@@ -233,6 +239,9 @@ func TestForceClass(t *testing.T) {
 		t.Fatalf("forced metered must retain bounded readahead, got %+v", got)
 	}
 	p.ForceClass(nil)
+	if _, forced := p.ForcedClass(); forced {
+		t.Fatal("ForcedClass still reports an override after ForceClass(nil)")
+	}
 	if got := p.Class(); got != ClassFast {
 		t.Fatalf("after ForceClass(nil) → %v, want fast (auto resumes)", got)
 	}
