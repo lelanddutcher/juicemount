@@ -8,8 +8,10 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 SCRIPT="$HERE/juicemount-setup.sh"
 SERVER="$(cd "$HERE/.." && pwd)"
 WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT
+LISTENER=""
+trap '[ -z "$LISTENER" ] || kill "$LISTENER" 2>/dev/null; rm -rf "$WORK"' EXIT
 export FAKE_LOG="$WORK/calls.log" FAKE_DIR="$WORK/fake" FAKE_SERVER="$SERVER"
+export FAKE_COMMIT=1111111111111111111111111111111111111111
 mkdir -p "$WORK/bin" "$FAKE_DIR"
 
 pass=0
@@ -18,48 +20,64 @@ fail() { printf 'not ok - %s\n' "$1" >&2; [ -f "$WORK/err" ] && sed 's/^/# /' "$
 
 # ---- fixtures -----------------------------------------------------------
 hex64() { printf "$1%.0s" {1..64}; }
-write_release() { # manager-digest-char
+write_release() { # env-manager-char env-farm-char version
   {
     echo "JM_MANAGER_DIGEST=sha256:$(hex64 "$1")"
-    echo "JM_FARM_DIGEST=sha256:$(hex64 b)"
+    echo "JM_FARM_DIGEST=sha256:$(hex64 "$2")"
     echo "JM_FARM_RENDER_DIGEST=sha256:$(hex64 c)"
     echo "JM_RESPPROXY_DIGEST=sha256:$(hex64 d)"
   } > "$FAKE_DIR/server-images.env"
   cat > "$FAKE_DIR/release-manifest.json" <<JSON
 {
+  "build_number": "99",
+  "commit": "$FAKE_COMMIT",
   "server_images": {
-    "JM_FARM_DIGEST": { "digest": "sha256:$(hex64 b)" },
-    "JM_FARM_RENDER_DIGEST": { "digest": "sha256:$(hex64 c)" },
-    "JM_MANAGER_DIGEST": { "digest": "sha256:$(hex64 a)" },
-    "JM_RESPPROXY_DIGEST": { "digest": "sha256:$(hex64 d)" }
+    "JM_FARM_DIGEST": {
+      "digest": "sha256:$(hex64 b)",
+      "source_commit": "$FAKE_COMMIT"
+    },
+    "JM_FARM_RENDER_DIGEST": {
+      "digest": "sha256:$(hex64 c)"
+    },
+    "JM_MANAGER_DIGEST": {
+      "digest": "sha256:$(hex64 a)"
+    },
+    "JM_RESPPROXY_DIGEST": {
+      "digest": "sha256:$(hex64 d)"
+    }
   },
-  "version": "9.9.9"
+  "version": "${3:-9.9.9}"
 }
 JSON
+  (cd "$FAKE_DIR" && sha256sum release-manifest.json server-images.env > SHA256SUMS)
 }
 
 # ---- fakes --------------------------------------------------------------
 cat > "$WORK/bin/curl" <<'SH'
 #!/usr/bin/env bash
-# Fake curl: release assets from $FAKE_DIR, repository files from
-# $FAKE_SERVER, the Manager probe answers $FAKE_HTTP (default 200).
+# Fake curl: release assets from $FAKE_DIR, repository files at
+# $FAKE_COMMIT from $FAKE_SERVER, the Manager probe answers $FAKE_HTTP.
 printf 'curl %s\n' "$*" >> "$FAKE_LOG"
-out="" url=""
+out="" url="" fmt=""
 while [ $# -gt 0 ]; do
   case "$1" in
     -o) out="$2"; shift 2 ;;
-    -w|-m|-H|--proto|--retry) shift 2 ;;
+    -w) fmt="$2"; shift 2 ;;
+    -m|-H|--proto|--retry) shift 2 ;;
     -*) shift ;;
     *) url="$1"; shift ;;
   esac
 done
+raw="https://raw.githubusercontent.com/lelanddutcher/juicemount/$FAKE_COMMIT/"
 case "$url" in
   http://127.0.0.1:*) cat >/dev/null; printf '%s' "${FAKE_HTTP:-200}"; exit 0 ;;
+  */releases/*/SHA256SUMS) src="$FAKE_DIR/SHA256SUMS" ;;
   */releases/*/server-images.env) src="$FAKE_DIR/server-images.env" ;;
   */releases/*/release-manifest.json) src="$FAKE_DIR/release-manifest.json" ;;
-  https://raw.githubusercontent.com/lelanddutcher/juicemount/main/server/*)
-    src="$FAKE_SERVER/${url#https://raw.githubusercontent.com/lelanddutcher/juicemount/main/server/}" ;;
-  *) echo "fake curl: unexpected $url" >&2; exit 22 ;;
+  "${raw}server/scripts/juicemount-setup.sh")
+    if [ -n "${FAKE_OLD_RELEASE:-}" ]; then printf 404; else printf 200; fi; exit 0 ;;
+  "${raw}server/"*) src="$FAKE_SERVER/${url#"${raw}server/"}" ;;
+  *) echo "fake curl: unexpected $url" >&2; [ -z "$fmt" ] || printf 000; exit 22 ;;
 esac
 [ -f "$src" ] || exit 22
 cp "$src" "$out"
@@ -67,14 +85,25 @@ SH
 
 cat > "$WORK/bin/docker" <<'SH'
 #!/usr/bin/env bash
-# Fake docker. State: $FAKE_DIR/running (containers exist once `up` ran).
+# Fake docker. $FAKE_DIR/running holds the project folder once `up` ran.
 printf 'docker %s\n' "$*" >> "$FAKE_LOG"
 case "$1" in
   info) exit 0 ;;
-  ps) [ -f "$FAKE_DIR/running" ] && echo cid-1; exit 0 ;;
+  ps)
+    [ -f "$FAKE_DIR/running" ] && echo cid-1
+    [ "$*" != "ps -aq" ] || [ -z "${FAKE_OTHER:-}" ] || echo cid-other
+    exit 0 ;;
   inspect)
     case "$*" in
       *working_dir*) cat "$FAKE_DIR/running" ;;
+      *config-hash*) echo "${FAKE_HAVE_HASH:-hash-1}" ;;
+      *Config.Image*)
+        for id in "${@:4}"; do
+          case "$id" in
+            cid-1) echo 'juicemount|ghcr.io/lelanddutcher/juicemount-manager@sha256:x|/ours' ;;
+            cid-other) printf '%s\n' "$FAKE_OTHER" ;;
+          esac
+        done ;;
       *ExitCode*) [ "${*: -1}" = cid-juicefs-init ] && echo "${FAKE_INIT_EXIT:-0}" || echo 0 ;;
     esac
     exit 0 ;;
@@ -83,7 +112,9 @@ case "$1" in
 esac
 shift
 [ "$1" = version ] && exit 0
-[ -z "${JM_ADMIN_KEY+x}" ] || echo "LEAK JM_ADMIN_KEY" >> "$FAKE_LOG"
+for v in JM_ADMIN_KEY COMPOSE_PROFILES COMPOSE_FILE JM_RESPPROXY_MODE JM_AUDIT JM_OBJ_PER_MAC_SERVER JM_SMART_FOLDERS; do
+  [ -z "${!v+x}" ] || echo "LEAK $v" >> "$FAKE_LOG"
+done
 files=() dir="" envf=""
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -106,6 +137,7 @@ case "$cmd $*" in
         esac
         echo "$img"
       done ;;
+  "config --hash *") echo "juicemount-manager hash-1" ;;
   "config ")
     grep -v '^[[:space:]]*#' "${files[0]}" | sed -n 's/^[[:space:]]*- \([./][^:]*\):.*/\1/p' | while read -r s; do
       case "$s" in ./*) s="$dir/${s#./}" ;; esac
@@ -142,49 +174,80 @@ esac
 SH
 cat > "$WORK/bin/zfs" <<'SH'
 #!/usr/bin/env bash
-# Fake datasets in $FAKE_DIR/datasets; pool P is mounted at $FAKE_DIR/mnt/P.
+# Fake datasets in $FAKE_DIR/datasets; dataset N is mounted at
+# $FAKE_DIR/mnt/N. $FAKE_UNMOUNTED / $FAKE_LOCKED name one dataset.
 printf 'zfs %s\n' "$*" >> "$FAKE_LOG"
 db="$FAKE_DIR/datasets"; touch "$db"
 known() { case "$1" in boot-pool|tank|big) return 0 ;; esac; grep -qx "$1" "$db"; }
-case "$1" in
-  get) known "${*: -1}" && echo "$FAKE_DIR/mnt/${*: -1}" ;;
-  list) known "${*: -1}" ;;
-  create) n="${*: -1}"; echo "$n" >> "$db"; mkdir -p "$FAKE_DIR/mnt/$n" ;;
+state() {
+  local m=yes k=-
+  [ "$1" != "${FAKE_UNMOUNTED:-}" ] || m=no
+  [ "$1" != "${FAKE_LOCKED:-}" ] || { m=no; k=unavailable; }
+  printf '%s\t%s\t%s\n' "$1" "$m" "$k"
+}
+n="${*: -1}"
+case "$*" in
+  "get -H -o value mountpoint "*) known "$n" && echo "$FAKE_DIR/mnt/$n" ;;
+  "list -H -o name "*) known "$n" ;;
+  "list -H -o name,mounted,keystatus -d 0 "*) known "$n" && state "$n" ;;
+  "list -H -o name,mounted,keystatus -r "*)
+    known "$n" || exit 1
+    state "$n"; grep "^$n/" "$db" | while read -r c; do state "$c"; done ;;
+  "create -p "*) echo "$n" >> "$db"; mkdir -p "$FAKE_DIR/mnt/$n" ;;
   *) exit 1 ;;
 esac
 SH
+# docker runs under the setup's `env -i`, so every fake reads its settings
+# from a file the run helpers write (the FAKE_* variables of that run).
+for f in "$WORK/bin/"*; do sed -i "2i . '$WORK/fake.env'" "$f"; done
 chmod +x "$WORK/bin/"*
+PLAIN="$WORK/bin-plain"
+mkdir -p "$PLAIN"
+for t in curl docker; do ln -sf "$WORK/bin/$t" "$PLAIN/$t"; done
 
-run() { # args... ; sets rc, stdout in $WORK/out, stderr in $WORK/err
+# run: TrueNAS fakes on PATH. run_plain: a plain Docker host.
+save_fakes() { export -p | grep -E '^declare -x FAKE_' > "$WORK/fake.env" || true; }
+run() {
+  save_fakes
   set +e
   PATH="$WORK/bin:$PATH" setsid bash "$SCRIPT" --host nas.example "$@" > "$WORK/out" 2> "$WORK/err" < /dev/null
   rc=$?
   set -e
 }
-reset() { rm -rf "$FAKE_DIR" "$WORK/data"; mkdir -p "$FAKE_DIR"; : > "$FAKE_LOG"; write_release a; unset FAKE_FAIL FAKE_HTTP FAKE_INIT_EXIT; }
-envval() { sed -n "s/^$2=//p" "$1"; }
-NO_TRUENAS_PATH="$WORK/bin-plain"
-mkdir -p "$NO_TRUENAS_PATH"
-for t in curl docker; do ln -sf "$WORK/bin/$t" "$NO_TRUENAS_PATH/$t"; done
-run_plain() { # like run, but without the TrueNAS/ZFS fakes on PATH
+run_plain() {
+  save_fakes
   set +e
-  PATH="$NO_TRUENAS_PATH:$PATH" setsid bash "$SCRIPT" --host nas.example "$@" > "$WORK/out" 2> "$WORK/err" < /dev/null
+  PATH="$PLAIN:$PATH" setsid bash "$SCRIPT" --host nas.example "$@" > "$WORK/out" 2> "$WORK/err" < /dev/null
   rc=$?
   set -e
 }
-
+reset() {
+  rm -rf "$FAKE_DIR" "$WORK/data"; mkdir -p "$FAKE_DIR"; : > "$FAKE_LOG"; write_release a b
+  unset FAKE_FAIL FAKE_HTTP FAKE_INIT_EXIT FAKE_OLD_RELEASE FAKE_OTHER FAKE_PORT FAKE_HAVE_HASH FAKE_UNMOUNTED FAKE_LOCKED
+}
+envval() { sed -n "s/^$2=//p" "$1"; }
+secrets_of() { grep -E '^(JM_ADMIN_KEY|MINIO_ROOT_PASSWORD|JM_[A-Z_]*_PASSWORD|JM_OBJ_[A-Z]*_SECRET_KEY)=' "$1"; }
+nothing_written() { [ ! -e "$1" ] && ! grep -q 'compose .* up\|zfs create' "$FAKE_LOG"; }
 D="$WORK/data"
 
-# 1. Fresh install in a folder, files from GitHub main (fake), digests from
-#    the release.
+# 1. Fresh install in a folder: files from the release's commit, digests
+#    from its manifest; a caller's compose variables never reach compose.
 reset
-JM_ADMIN_KEY=caller-shell-value-must-not-reach-compose-0000 run_plain --yes --dir "$D"
+JM_ADMIN_KEY=caller-value-must-not-reach-compose-000000 COMPOSE_PROFILES=per-mac COMPOSE_FILE=/x.yml \
+  JM_RESPPROXY_MODE=enforce JM_AUDIT=on JM_OBJ_PER_MAC_SERVER=1 JM_SMART_FOLDERS=on run_plain --yes --dir "$D"
 [ "$rc" = 0 ] || fail "fresh install exits 0 (rc=$rc)"
 [ "$(wc -l < "$WORK/out")" = 2 ] || fail "stdout is exactly two lines"
 grep -qx 'Manager URL:  http://nas.example:30190' "$WORK/out" || fail "Manager URL line"
 key="$(sed -n 's/^Sign-in key:  //p' "$WORK/out")"
 [[ "$key" =~ ^[0-9a-f]{32}$ ]] || fail "sign-in key is 32 hex characters"
 ok "fresh install prints exactly the Manager URL and the sign-in key"
+
+grep -q "raw.githubusercontent.com/lelanddutcher/juicemount/$FAKE_COMMIT/server/docker-compose.yml" "$FAKE_LOG" &&
+  ! grep -q 'juicemount/main/' "$FAKE_LOG" || fail "files come from the release commit, not main"
+ok "compose and every mounted file come from the manifest's commit"
+
+! grep -q LEAK "$FAKE_LOG" || fail "a caller variable reached docker compose: $(grep LEAK "$FAKE_LOG" | sort -u | tr '\n' ' ')"
+ok "the caller's environment (COMPOSE_*, JM_*) never reaches docker compose"
 
 E="$D/compose/.env"
 [ "$(stat -c %a "$D/compose")" = 700 ] && [ "$(stat -c %a "$E")" = 600 ] || fail "compose dir 0700, .env 0600"
@@ -194,28 +257,25 @@ for kv in MINIO_ROOT_PASSWORD:40 JM_REDIS_PROXY_PASSWORD:64 JM_PROXY_FARM_PASSWO
   v="$(envval "$E" "${kv%%:*}")"
   [[ "$v" =~ ^[0-9a-f]+$ ]] && [ ${#v} = "${kv##*:}" ] || fail "${kv%%:*} is ${kv##*:} hex characters"
 done
-[ "$(grep -E '^(JM_|MINIO_)[A-Z_]*(PASSWORD|SECRET_KEY|ADMIN_KEY)=' "$E" | cut -d= -f2 | sort | uniq -d)" = "" ] || fail "every secret is distinct"
-[ "$(envval "$E" JM_MANAGER_DIGEST)" = "sha256:$(hex64 a)" ] && [ "$(envval "$E" JM_RESPPROXY_DIGEST)" = "sha256:$(hex64 d)" ] || fail "digests from the release"
-[ "$(envval "$E" JM_SETUP_RELEASE)" = 9.9.9 ] || fail "release version recorded"
+[ "$(secrets_of "$E" | cut -d= -f2 | sort | uniq -d)" = "" ] || fail "every secret is distinct"
+[ "$(envval "$E" JM_MANAGER_DIGEST)" = "sha256:$(hex64 a)" ] && [ "$(envval "$E" JM_FARM_DIGEST)" = "sha256:$(hex64 b)" ] || fail "digests from the release"
+[ "$(envval "$E" JM_SETUP_RELEASE)" = 9.9.9 ] && [ "$(envval "$E" JM_SETUP_COMMIT)" = "$FAKE_COMMIT" ] || fail "release and commit recorded"
 [[ "$(envval "$E" JM_FARM_STORAGE_CAPACITY_BYTES)" =~ ^[1-9][0-9]*$ ]] || fail "capacity is a positive integer"
 [ "$(envval "$E" JM_FARM_NODE_META_URL)" = 'redis://farm@nas.example:30179/1' ] || fail "farm node URL is user@host only"
-ok "secrets generated with the lengths the stack requires, digests from the release, file modes"
+ok "secrets have the lengths the stack requires; digests, release and commit recorded; file modes"
 
 C="$D/compose/docker-compose.yml"
 grep -v '^[[:space:]]*#' "$C" > "$WORK/active.yml"
-! grep -q '/mnt/zSSD\|/mnt/storage0' "$WORK/active.yml" || fail "no TrueNAS sample path left"
+! grep -q '/mnt/zSSD\|/mnt/storage0' "$WORK/active.yml" || fail "no sample path left"
 grep -q -- "- $D/redis:/data" "$C" && grep -q -- "- $D/import:/sources/import:ro" "$C" || fail "paths rendered into the data folder"
 for f in redis.conf redis.acl minio/provision-object-keys.sh minio/jm-gc-policy.json; do cmp -s "$SERVER/$f" "$D/compose/$f" || fail "$f copied"; done
 diff <(grep -v '^[[:space:]]*-.*:/' "$SERVER/docker-compose.yml" | grep -v '/mnt/zSSD') \
      <(grep -v '^[[:space:]]*-.*:/' "$C" | grep -v "$D") > /dev/null || fail "only host paths differ from the canonical compose"
-for s in bucket redis cache manager-state respproxy objkeys headscale juicefarm-state import; do [ -d "$D/$s" ] || fail "$s created"; done
-ok "compose rendered: only host paths changed, files it mounts copied, data folders created"
+for s in bucket redis cache manager-state respproxy objkeys headscale juicefarm-state import compose/overlays; do [ -d "$D/$s" ] || fail "$s created"; done
+[ -x "$D/compose/jm-compose" ] || fail "compose wrapper installed"
+ok "compose rendered (only host paths change), mounted files copied, folders and wrapper created"
 
-grep -q 'docker compose --project-name juicemount .* pull --quiet' "$FAKE_LOG" && grep -q 'up -d' "$FAKE_LOG" || fail "pull and up ran"
-! grep -q LEAK "$FAKE_LOG" || fail "a caller's JM_ADMIN_KEY reached docker compose"
-ok "values reach compose only from .env (caller shell variables are unset)"
-
-# 2. Re-run: nothing regenerated, same key printed, no prompt needed.
+# 2. Re-runs: nothing regenerated, same key, nothing downloaded.
 sum="$(cd "$D/compose" && sha256sum .env docker-compose.yml redis.conf minio/*)"
 : > "$FAKE_LOG"
 run_plain --dir "$D"
@@ -223,55 +283,100 @@ run_plain --dir "$D"
 [ "$(cd "$D/compose" && sha256sum .env docker-compose.yml redis.conf minio/*)" = "$sum" ] || fail "re-run leaves every file unchanged"
 [ "$(sed -n 's/^Sign-in key:  //p' "$WORK/out")" = "$key" ] || fail "re-run prints the same key"
 ! grep -q 'raw.githubusercontent\|releases/' "$FAKE_LOG" || fail "re-run downloads nothing"
-ok "re-run changes nothing and prints the same two lines"
-
-# 2b. Re-run found through Docker labels alone (no --dir).
 : > "$FAKE_LOG"
 run_plain
-[ "$rc" = 0 ] && [ "$(cd "$D/compose" && sha256sum .env docker-compose.yml redis.conf minio/*)" = "$sum" ] || fail "re-run without --dir finds the install"
-ok "re-run without options finds the install from the running project"
+[ "$rc" = 0 ] && [ "$(cd "$D/compose" && sha256sum .env docker-compose.yml redis.conf minio/*)" = "$sum" ] || fail "re-run without options finds the install"
+ok "re-runs (with --dir, and with no options) change nothing and print the same two lines"
 
-# 3. An install whose .env lost a secret is refused, not regenerated.
+# 3. Started install: identical options accepted, other options refused.
+run_plain --dir "$D" --release v1.2.3
+[ "$rc" = 1 ] && grep -q 'upgrading a setup-made install is not supported yet' "$WORK/err" || fail "--release on a started install refused"
+run_plain --dir "$D" --override "$SERVER/docker-compose.link.yml"
+[ "$rc" = 1 ] && grep -q 'never changes it' "$WORK/err" || fail "--override on a started install refused"
+[ "$(cd "$D/compose" && sha256sum .env docker-compose.yml redis.conf minio/*)" = "$sum" ] || fail "refusals change nothing"
+ok "a started install refuses options that would change or upgrade it"
+
+# 4. Overlays in compose/overlays are always applied.
+cp "$SERVER/docker-compose.link.yml" "$D/compose/overlays/docker-compose.link.yml"
+: > "$FAKE_LOG"
+run_plain --dir "$D"
+[ "$rc" = 0 ] && grep -q -- "-f $D/compose/overlays/docker-compose.link.yml up -d" "$FAKE_LOG" || fail "overlay applied on re-run"
+ok "a re-run keeps overlays from compose/overlays/ (e.g. Link)"
+
+# 5. Drift: a service made from other files is never recreated.
+FAKE_HAVE_HASH=hash-by-hand run_plain --dir "$D"
+[ "$rc" = 1 ] && grep -q 'running services juicemount-manager differ' "$WORK/err" || fail "drift refused"
+ok "a re-run refuses when a running service differs from the install's files"
+rm "$D/compose/overlays/docker-compose.link.yml"
+
+# 6. A lost secret is refused, never regenerated.
 cp "$E" "$WORK/env.bak"
 sed -i '/^JM_PROXY_BG_PASSWORD=/d' "$E"
 run_plain --dir "$D"
-[ "$rc" = 1 ] && grep -q 'lacks a usable JM_PROXY_BG_PASSWORD' "$WORK/err" || fail "missing secret refused"
-! grep -q '^JM_PROXY_BG_PASSWORD=' "$E" || fail "missing secret not regenerated"
+[ "$rc" = 1 ] && grep -q 'lacks a usable JM_PROXY_BG_PASSWORD' "$WORK/err" && ! grep -q '^JM_PROXY_BG_PASSWORD=' "$E" || fail "missing secret refused, not regenerated"
 cp "$WORK/env.bak" "$E"
 ok "an install missing a secret is refused, never regenerated"
 
-# 4. Data without its .env: refused before anything is written.
+# 7. Data without its .env: refused before anything is written.
 reset
 mkdir -p "$D/redis"; echo x > "$D/redis/appendonly.aof"
 run_plain --yes --dir "$D"
-[ "$rc" = 1 ] && grep -q 'already holds data' "$WORK/err" || fail "existing data without .env refused"
-[ ! -e "$D/compose" ] && ! grep -q 'compose .* up' "$FAKE_LOG" || fail "nothing written or started over existing data"
-ok "existing data without its secrets is refused before anything is written"
+[ "$rc" = 1 ] && grep -q 'already holds data' "$WORK/err" && nothing_written "$D/compose" || fail "existing data without .env refused"
+reset
+mkdir -p "$D/empty-skeleton"; echo notes > "$D/notes.txt"
+run_plain --yes --dir "$D"
+[ "$rc" = 1 ] && grep -q 'already holds files but no JuiceMount settings' "$WORK/err" && nothing_written "$D/compose" || fail "non-empty root folder refused"
+rm "$D/notes.txt"
+run_plain --dry-run --dir "$D"
+[ "$rc" = 0 ] || fail "a root folder with only empty folders is accepted"
+ok "existing data, or any file in the root folder, without its secrets is refused before anything is written"
 
-# 5. Release digests are validated.
+# 8. Release checks: each digest tied to its own key, SHA256SUMS, age.
+reset
+write_release b a
+run_plain --yes --dir "$D"
+[ "$rc" = 1 ] && grep -q 'JM_MANAGER_DIGEST in server-images.env is not the digest release-manifest.json gives' "$WORK/err" && nothing_written "$D" || fail "swapped digests refused"
 reset
 sed -i 's/^JM_FARM_DIGEST=.*/JM_FARM_DIGEST=latest/' "$FAKE_DIR/server-images.env"
 run_plain --yes --dir "$D"
-[ "$rc" = 1 ] && grep -q 'not KEY=sha256' "$WORK/err" && [ ! -e "$D" ] || fail "malformed digest refused"
-reset
-write_release e
+[ "$rc" = 1 ] && grep -q 'does not match the release.s SHA256SUMS' "$WORK/err" && nothing_written "$D" || fail "file not matching SHA256SUMS refused"
+(cd "$FAKE_DIR" && sha256sum release-manifest.json server-images.env > SHA256SUMS)
 run_plain --yes --dir "$D"
-[ "$rc" = 1 ] && grep -q 'does not match release-manifest.json' "$WORK/err" && [ ! -e "$D" ] || fail "digest not in manifest refused"
-ok "a digest that is malformed or absent from release-manifest.json is refused"
+[ "$rc" = 1 ] && grep -q 'not KEY=sha256' "$WORK/err" && nothing_written "$D" || fail "malformed digest refused"
+reset
+FAKE_OLD_RELEASE=1 run_plain --yes --dir "$D"
+[ "$rc" = 1 ] && grep -q 'predates juicemount-setup' "$WORK/err" && nothing_written "$D" || fail "old release refused"
+ok "swapped digests, a file not in SHA256SUMS, a malformed digest and a pre-setup release are refused"
 
-# 6. Without a terminal, --yes is required; nothing is written.
+# 9. Without a terminal, --yes is required.
 reset
 run_plain --dir "$D"
-[ "$rc" = 1 ] && grep -q 're-run with --yes' "$WORK/err" && [ ! -e "$D" ] || fail "no terminal without --yes refused"
+[ "$rc" = 1 ] && grep -q 're-run with --yes' "$WORK/err" && nothing_written "$D" || fail "no terminal without --yes refused"
 ok "without a terminal and --yes it stops before changing anything"
 
-# 7. Dry run changes nothing.
+# 10. Every check runs before the first write, also in a dry run.
 reset
 run_plain --dry-run --dir "$D"
-[ "$rc" = 0 ] && grep -q 'Dry run: nothing was changed' "$WORK/err" && [ ! -e "$D" ] || fail "dry run writes nothing"
-ok "dry run shows the plan and writes nothing"
+[ "$rc" = 0 ] && grep -q 'every check passed; nothing was changed' "$WORK/err" && nothing_written "$D" || fail "dry run writes nothing"
+reset
+FAKE_OTHER='ix-juicemount|ghcr.io/lelanddutcher/juicemount-manager@sha256:x|/ix-juicemount-juicemount-manager-1' run_plain --dry-run --dir "$D"
+[ "$rc" = 1 ] && grep -q 'another JuiceMount is on this host' "$WORK/err" && nothing_written "$D" || fail "dry run refuses another JuiceMount"
+FAKE_OTHER='|ghcr.io/lelanddutcher/jm-respproxy@sha256:x|/loose-proxy' run_plain --yes --dir "$D"
+[ "$rc" = 1 ] && grep -q 'container /loose-proxy' "$WORK/err" && nothing_written "$D" || fail "loose JuiceMount container refused"
+if command -v python3 >/dev/null 2>&1; then
+  python3 -c 'import socket,sys,time
+s=socket.socket(); s.bind(("127.0.0.1",0)); s.listen(); print(s.getsockname()[1], flush=True); time.sleep(120)' > "$WORK/port" &
+  LISTENER=$!
+  for _ in 1 2 3 4 5 6 7 8 9 10; do [ -s "$WORK/port" ] && break; sleep 0.2; done
+  FAKE_PORT="$(cat "$WORK/port")" run_plain --dry-run --dir "$D"
+  [ "$rc" = 1 ] && grep -q "port $(cat "$WORK/port") is already in use" "$WORK/err" || fail "dry run refuses a port in use"
+  FAKE_PORT="$(cat "$WORK/port")" run_plain --yes --dir "$D"
+  [ "$rc" = 1 ] && nothing_written "$D" || fail "port in use: nothing written"
+  kill "$LISTENER"; LISTENER=""
+fi
+ok "another JuiceMount (ix-juicemount, loose containers) and a port in use are refused before any write, also in a dry run"
 
-# 8. TrueNAS: datasets on the pool with most free space, never boot-pool.
+# 11. TrueNAS: datasets on the pool with most free space, never boot-pool.
 reset
 run --yes
 [ "$rc" = 0 ] || fail "TrueNAS install exits 0 (rc=$rc)"
@@ -280,56 +385,108 @@ grep -qx 'zfs create -p big/juicemount' "$FAKE_LOG" && grep -qx 'zfs create -p b
 ! grep -q 'boot-pool/' "$FAKE_LOG" || fail "boot-pool untouched"
 TE="$FAKE_DIR/mnt/big/juicemount/compose/.env"
 [ "$(envval "$TE" JM_FARM_STORAGE_CAPACITY_BYTES)" = 7000000000000 ] || fail "capacity from zpool size"
-grep -q -- "- $FAKE_DIR/mnt/big/juicemount/bucket:/data" "$FAKE_DIR/mnt/big/juicemount/compose/docker-compose.yml" || fail "bucket on the dataset"
-ok "TrueNAS: datasets under <pool>/juicemount on the pool with most free space; capacity from zpool"
-
 : > "$FAKE_LOG"; rm -f "$FAKE_DIR/running"
 run --pool tank --yes
 [ "$rc" = 0 ] && grep -qx 'zfs create -p tank/juicemount' "$FAKE_LOG" || fail "--pool selects the pool"
-ok "--pool selects another pool"
+ok "TrueNAS: datasets on the pool with most free space (or --pool); capacity from zpool"
 
-# 9. A folder with content where a dataset would go is refused.
+# 12. A non-empty root folder that the new dataset would hide.
 reset
-mkdir -p "$FAKE_DIR/mnt/tank/juicemount/cache"; echo x > "$FAKE_DIR/mnt/tank/juicemount/cache/chunk"
+mkdir -p "$FAKE_DIR/mnt/tank/juicemount"; echo notes > "$FAKE_DIR/mnt/tank/juicemount/notes.txt"
 run --pool tank --yes
-[ "$rc" = 1 ] && grep -q 'already holds data' "$WORK/err" && ! grep -q 'zfs create' "$FAKE_LOG" || fail "dataset over existing content refused"
-ok "a non-empty folder that a new dataset would hide is refused"
+[ "$rc" = 1 ] && grep -q 'juicemount is a folder with content, not a dataset; a new dataset tank/juicemount would hide it' "$WORK/err" &&
+  ! grep -q 'zfs create' "$FAKE_LOG" || fail "non-empty root folder refused"
+run --pool tank --dry-run
+[ "$rc" = 1 ] && grep -q 'would hide it' "$WORK/err" || fail "dry run refuses the non-empty root folder"
+ok "a non-empty root folder that a new dataset would hide is refused (also in a dry run)"
 
-# 10. Failures name their cause and keep the settings.
+# 13. Unmounted or locked datasets look empty: refused.
+reset
+printf 'tank/juicemount\n' > "$FAKE_DIR/datasets"; mkdir -p "$FAKE_DIR/mnt/tank/juicemount"
+FAKE_UNMOUNTED=tank/juicemount run --pool tank --yes
+[ "$rc" = 1 ] && grep -q 'dataset tank/juicemount is not mounted' "$WORK/err" && ! grep -q 'zfs create' "$FAKE_LOG" || fail "unmounted dataset refused"
+printf 'tank/juicemount/redis\n' >> "$FAKE_DIR/datasets"
+FAKE_LOCKED=tank/juicemount/redis run --pool tank --yes
+[ "$rc" = 1 ] && grep -q 'dataset tank/juicemount/redis is locked' "$WORK/err" || fail "locked child dataset refused"
+reset
+FAKE_LOCKED=tank run --pool tank --yes
+[ "$rc" = 1 ] && grep -q 'pool tank is locked' "$WORK/err" || fail "locked pool refused"
+ok "an unmounted or locked dataset or pool is refused, not taken for empty"
+
+# 14. Failures name their cause and keep the settings.
 reset
 FAKE_FAIL=pull run_plain --yes --dir "$D"
 [ "$rc" = 1 ] && grep -q 'could not download an image' "$WORK/err" && [ -f "$D/compose/.env" ] || fail "pull failure explained"
-ok "an image that cannot be pulled stops before start and keeps the settings"
 key1="$(envval "$D/compose/.env" JM_ADMIN_KEY)"
 FAKE_FAIL=up FAKE_INIT_EXIT=4 run_plain --yes --dir "$D"
-[ "$rc" = 1 ] && grep -q 'juicefs-init exit 4' "$WORK/err" || fail "juicefs-init exit code named"
-[ "$(envval "$D/compose/.env" JM_ADMIN_KEY)" = "$key1" ] || fail "settings kept after failed start"
-ok "a failed juicefs-init is named by its exit code; the settings are kept"
+[ "$rc" = 1 ] && grep -q 'juicefs-init exit 4' "$WORK/err" && [ "$(envval "$D/compose/.env" JM_ADMIN_KEY)" = "$key1" ] || fail "juicefs-init exit code named, settings kept"
+ok "an image that cannot be pulled, or a failed juicefs-init, stops with the cause and keeps the settings"
 
-# 11. An install that never started can take a new compose (and override).
+# 15. An install that never started takes a newer release and an override,
+#     keeping every secret byte for byte.
+rm -f "$FAKE_DIR/running"
+secrets_before="$(secrets_of "$D/compose/.env")"
+write_release e b 9.9.10
+sed -i "s/sha256:$(hex64 a)/sha256:$(hex64 e)/" "$FAKE_DIR/release-manifest.json"
+(cd "$FAKE_DIR" && sha256sum release-manifest.json server-images.env > SHA256SUMS)
 printf 'services:\n  minio:\n    image: example.invalid/store@sha256:%s\n' "$(hex64 f)" > "$WORK/override.yml"
-run_plain --yes --dir "$D" --override "$WORK/override.yml"
-[ "$rc" = 0 ] && cmp -s "$WORK/override.yml" "$D/compose/docker-compose.override.yml" || fail "override installed on a never-started install"
-[ "$(envval "$D/compose/.env" JM_ADMIN_KEY)" = "$key1" ] || fail "secrets kept when the compose is refreshed"
-grep -q -- "-f $D/compose/docker-compose.override.yml" "$FAKE_LOG" || fail "override passed to compose"
-ok "a never-started install takes a new compose and --override, keeping its secrets"
-# Once started, the same option is ignored.
-sum="$(cd "$D/compose" && sha256sum .env docker-compose.yml docker-compose.override.yml)"
-run_plain --dir "$D" --override "$SERVER/docker-compose.link.yml"
-[ "$rc" = 0 ] && grep -q 'options are ignored' "$WORK/err" &&
-  [ "$(cd "$D/compose" && sha256sum .env docker-compose.yml docker-compose.override.yml)" = "$sum" ] || fail "started install keeps its files"
-ok "a started install ignores options that would change it"
+: > "$FAKE_LOG"
+run_plain --yes --dir "$D" --release v9.9.10 --override "$WORK/override.yml"
+[ "$rc" = 0 ] || fail "never-started install re-run exits 0 (rc=$rc)"
+[ "$(secrets_of "$D/compose/.env")" = "$secrets_before" ] || fail "secrets unchanged"
+[ "$(envval "$D/compose/.env" JM_MANAGER_DIGEST)" = "sha256:$(hex64 e)" ] && [ "$(envval "$D/compose/.env" JM_SETUP_RELEASE)" = 9.9.10 ] || fail "--release applied"
+grep -q 'releases/download/v9.9.10/' "$FAKE_LOG" || fail "the requested release was read"
+cmp -s "$WORK/override.yml" "$D/compose/docker-compose.override.yml" && grep -q -- "-f $D/compose/docker-compose.override.yml" "$FAKE_LOG" || fail "override installed and used"
+[ "$(stat -c %a "$D/compose/.env")" = 600 ] || fail ".env stays 0600"
+ok "a never-started install takes --release and --override; every secret stays byte for byte"
 
-# 12. A Manager that refuses the key is reported.
+# 16. A Manager that refuses the key is reported.
 FAKE_HTTP=401 run_plain --dir "$D"
 [ "$rc" = 1 ] && grep -q "refuses this install's key" "$WORK/err" || fail "401 reported"
 ok "a Manager that refuses the key is reported"
 
-# 13. A project of the same name not made by setup is left alone.
+# 17. A project of the same name not made by setup is left alone.
 reset
 mkdir -p "$WORK/other"; echo "$WORK/other" > "$FAKE_DIR/running"
 run_plain --yes
 [ "$rc" = 1 ] && grep -q 'was not made by juicemount-setup' "$WORK/err" || fail "foreign project refused"
 ok "a Compose project of the same name made by hand is refused"
+
+# 18. Paths: .. is resolved; / and system folders are refused.
+reset
+for bad in /srv/.. /tmp/a/../.. /etc/juicemount /mnt/tank /usr; do
+  run_plain --yes --dir "$bad"
+  [ "$rc" = 1 ] && grep -q 'system folder\|root of a pool' "$WORK/err" || fail "--dir $bad refused"
+done
+run_plain --yes --images-env "$FAKE_DIR/server-images.env" --dir "$D"
+[ "$rc" = 1 ] && grep -q -- '--images-env needs --source' "$WORK/err" || fail "--images-env alone refused"
+nothing_written "$D" || fail "path refusals write nothing"
+ok "--dir resolves .. and refuses / and system folders; --images-env needs --source"
+
+# 19. A failed random read never writes an empty secret.
+reset
+mkdir -p "$WORK/bin-od"; printf '#!/bin/sh\nexit 1\n' > "$WORK/bin-od/od"; chmod +x "$WORK/bin-od/od"
+save_fakes
+set +e
+PATH="$WORK/bin-od:$PLAIN:$PATH" setsid bash "$SCRIPT" --host nas.example --yes --dir "$D" > "$WORK/out" 2> "$WORK/err" < /dev/null
+rc=$?
+set -e
+[ "$rc" = 1 ] && grep -q 'could not read random bytes' "$WORK/err" && [ ! -e "$D/compose/.env" ] || fail "random failure writes no .env"
+ok "a failed random read stops before .env is written"
+
+# 20. Piped: --help prints the options; a download cut short runs nothing.
+set +e
+bash -s -- --help < "$SCRIPT" > /dev/null 2> "$WORK/err"; rc=$?
+set -e
+[ "$rc" = 2 ] && grep -q -- '--dry-run' "$WORK/err" || fail "piped --help prints the options"
+save_fakes
+for cut in 2 4 8; do
+  : > "$FAKE_LOG"
+  set +e
+  head -c "-$cut" "$SCRIPT" | PATH="$PLAIN:$PATH" bash -s -- --yes --dir "$D" > /dev/null 2> "$WORK/err"; rc=$?
+  set -e
+  [ "$rc" != 0 ] && [ ! -s "$FAKE_LOG" ] || fail "a download cut by $cut bytes runs nothing"
+done
+ok "piped --help prints the options; a truncated download runs nothing"
 
 echo "juicemount-setup tests: $pass passed"

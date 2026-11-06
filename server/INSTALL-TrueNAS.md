@@ -15,11 +15,18 @@ in this repository.
 - The host can reach `github.com`, `raw.githubusercontent.com`, `ghcr.io`
   and the registries named in `server/docker-compose.yml`.
 
+**Known limit (release).** The command installs a release made after it was
+added to this repository. The latest release today, 0.5.0, predates it, so
+the command refuses it with a message and changes nothing. **The setup command
+works from the next release on.** For 0.5.0, use the manual install in the
+appendix.
+
 **Known limit (object store image).** The MinIO image pinned in
 `server/docker-compose.yml` cannot be downloaded anonymously any more: Docker
-Hub and Quay answer 401. Until a replacement image is chosen and pinned, the
+Hub and Quay answer 401. Until a release pins a replacement image, the
 setup command stops at "could not download an image" and starts nothing. It
-keeps the generated settings, so running it again later continues from there.
+keeps the generated settings, so running it again later (with
+`--release vX.Y.Z` for the release that fixes it) continues from there.
 An operator who already has a qualified image can apply it with
 `--override FILE` (a compose file that sets the `image:` of `minio`,
 `minio-keys` and `minio-keyd`, pinned by `@sha256:` digest).
@@ -52,23 +59,31 @@ prints it again.
      boot pool). `--pool NAME` chooses the pool.
    - On another host it uses the folder `/srv/juicemount`. `--dir PATH`
      chooses another folder (on TrueNAS too: then it creates no dataset).
-2. **Reads the image digests** of the latest release from its published
-   `server-images.env`, and checks each one against the release's
-   `release-manifest.json`. `--release vX.Y.Z` chooses a release.
+2. **Reads the release** (the latest one, or `--release vX.Y.Z`). It
+   downloads the release's `release-manifest.json` and `server-images.env`
+   and checks both against the release's `SHA256SUMS`. Each image digest must
+   be the one the manifest gives for the same image.
 3. **Takes the compose file** `server/docker-compose.yml` and the files it
-   mounts (`redis.conf`, `redis.acl`, `minio/`) from this repository's `main`
-   branch, and replaces the sample host paths with the chosen storage. Every
+   mounts (`redis.conf`, `redis.acl`, `minio/`) from the commit the release
+   manifest names, so the files and the images always belong to the same
+   release. It replaces the sample host paths with the chosen storage. Every
    other image (Redis, the object store, JuiceFS) comes from that compose
-   file. `--source DIR` uses a local checkout's `server/` folder instead.
-4. **Shows the plan and asks once.** `--yes` skips the question (needed when
-   no terminal is attached). `--dry-run` shows the plan and changes nothing.
-5. **Generates every secret** from `/dev/urandom`: the Manager sign-in key,
+   file.
+4. **Checks everything before it writes anything:** the storage (an
+   unmounted or locked dataset, or a folder with content where a new dataset
+   would go, is refused), other JuiceMount installs on the host (a TrueNAS
+   app such as `ix-juicemount`, a Compose project or loose containers), the
+   rendered compose (`docker compose config` must render: every required value
+   has a `${VAR:?}` guard; every image must be pinned by `@sha256:` digest;
+   every mounted path must exist) and free ports.
+5. **Shows the plan and asks once.** `--yes` skips the question (needed when
+   no terminal is attached). `--dry-run` runs every check, shows the plan and
+   changes nothing.
+6. **Generates every secret** from `/dev/urandom`: the Manager sign-in key,
    the MinIO root password, the six Redis proxy passwords and the two object
    keys. It writes them, with the digests and the storage size, to the
-   settings file. Values reach Docker Compose only from that file.
-6. **Validates before starting.** `docker compose config` must render (every
-   required value has a `${VAR:?}` guard), every image must be pinned by
-   `@sha256:` digest, every mounted path must exist, and no port may be in use.
+   settings file. Values reach Docker Compose only from that file: the command
+   clears its environment, except what reaches the Docker daemon.
 7. **Pulls the images and starts the stack.** If the one-shot `juicefs-init`
    fails, the command prints its exit code and meaning (table below).
 8. **Waits until the Manager answers** with the new key, then prints the two
@@ -81,6 +96,8 @@ prints it again.
 | Path | Holds | Mode |
 |---|---|---|
 | `<data>/compose/` | Compose project folder: `docker-compose.yml`, `redis.conf`, `redis.acl`, `minio/`, optional `docker-compose.override.yml` | `0700` |
+| `<data>/compose/overlays/` | Extra compose files you add (such as Link); always applied, in name order | |
+| `<data>/compose/jm-compose` | Runs `docker compose` for this install with exactly the files and settings setup uses | |
 | `<data>/compose/.env` | **Every secret of this server**, the image digests, the storage size | `0600` |
 | `<data>/bucket` | Object store: every byte of your files | |
 | `<data>/redis` | JuiceFS metadata (Redis AOF/RDB) | |
@@ -100,48 +117,77 @@ snapshot.
 
 The Compose project is named `juicemount` (`--project NAME` changes it). It
 runs as a plain Docker Compose project, not as a TrueNAS catalog app: the
-TrueNAS Apps page may list it as an external app. To see it:
+TrueNAS Apps page may list it as an external app. To see it, or to run any
+other `docker compose` command for it, use the wrapper:
 
 ```sh
-sudo docker compose --project-name juicemount --project-directory <data>/compose --env-file <data>/compose/.env ps
+sudo <data>/compose/jm-compose ps
+sudo <data>/compose/jm-compose logs juicemount-manager
 ```
 
 ### Running it again
 
 Running the same command again is safe:
 
-- It never rewrites `<data>/compose/.env`, so no secret changes.
-- It never changes or deletes data. It starts any stopped service
-  (`docker compose up -d`), waits for the Manager and prints the same two lines.
+- It never changes a secret, and never changes or deletes data.
+- On a started install it changes nothing at all: it starts any stopped
+  service (`docker compose up -d`), waits for the Manager and prints the same
+  two lines. It always applies the files in `<data>/compose/overlays/`.
+- It refuses, and changes nothing, when:
+  - a running service was made from other files than the install's (for
+    example an overlay applied by hand but not kept in `overlays/`, or an
+    edited `.env`). Setup never recreates a started service;
+  - a started install is given options other than the ones it was installed
+    with (`--release`, `--source`, `--images-env`, `--override`, `--import`).
+    Run it with no options, or with exactly the same ones;
+  - a data folder already holds data but `.env` is missing, or `.env` lacks a
+    secret.
 - It finds the install through the running Compose project or, on TrueNAS,
   through `<pool>/juicemount`.
-- It refuses, and changes nothing, if a data folder already holds data but
-  `.env` is missing, if `.env` lacks a secret, or if a folder with content is
-  where a new dataset would go.
-- Options that would change a started install (`--source`, `--override`,
-  `--release`, `--import`) are ignored with a note. An install that has never
-  started takes them.
+- An install that has never started (no containers, empty data folders, for
+  example after an image could not be downloaded) takes new options: another
+  `--release` (new compose files and digests), `--override` or `--import`.
+  Its secrets stay as they are.
 
-The command does not upgrade a running server. To upgrade, follow
-[COMPOSE-ROLLOUT.md](COMPOSE-ROLLOUT.md).
+**Upgrading a setup-made install is not supported yet.** The command never
+upgrades a started install. Do not use `server/scripts/rollout-compose.sh` or
+`update-server.sh` on it: they expect a git checkout and would recreate
+services from the unrendered compose, with its sample paths. Keep the install
+on its release until an upgrade path for setup-made installs exists.
 
 ### All options
 
 | Option | Effect |
 |---|---|
 | `--yes` | Do not ask for confirmation. |
-| `--dry-run` | Show the plan; change nothing. |
+| `--dry-run` | Run every check and show the plan; change nothing. |
 | `--pool NAME` | ZFS: create the datasets on this pool. |
 | `--dir PATH` | Keep all data in this folder; create no dataset. |
-| `--release vX.Y.Z` | Read image digests from this release instead of the latest. |
-| `--images-env FILE` | Read image digests from a local `server-images.env`. |
-| `--source DIR` | Take the compose and its files from this `server/` folder. |
+| `--release vX.Y.Z` | Install this release (compose files and image digests) instead of the latest. |
+| `--source DIR` | Developer: take the compose and its files from this `server/` folder; digests still come from the release. |
+| `--images-env FILE` | Developer, needs `--source`: take the digests from this `server-images.env`. |
 | `--override FILE` | Apply this compose file on top (kept as `docker-compose.override.yml`). |
 | `--import PATH` | Mount this existing folder read-only for migration (repeatable). |
 | `--project NAME` | Docker Compose project name (default `juicemount`). |
 | `--host ADDR` | Address printed in the Manager URL (default: this host's LAN address). |
 
 To pass options through the pipe: `... | sudo bash -s -- --pool tank`.
+`... | bash -s -- --help` lists them.
+
+### Turning on JuiceMount Link
+
+Link (embedded Headscale) is off by default. On a setup-made install:
+
+1. Add `JM_NET_SERVER_URL=https://<public-name>:30193` (and any other
+   `JM_NET_*` value from the header of `server/docker-compose.link.yml`) to
+   `<data>/compose/.env`.
+2. Copy `server/docker-compose.link.yml` from the same release into
+   `<data>/compose/overlays/`.
+3. Recreate only the Manager: `sudo <data>/compose/jm-compose up -d --no-deps juicemount-manager`.
+
+Re-running the setup command keeps Link on, because it always applies
+`overlays/`. To turn Link off, remove the file from `overlays/` and repeat
+step 3.
 
 ## Connect a Mac
 
@@ -238,18 +284,24 @@ it:
 | Code | Meaning |
 |---|---|
 | 2 | MinIO unreachable from inside the container network |
-| 3 | Redis PING failed |
 | 4 | Credentials empty, whitespace, or placeholder pattern |
 | 5 | `JM_BUCKET_URL` missing the `http://` scheme |
 | 6 | `juicefs format` itself errored (read the log line above for the JuiceFS-side reason) |
 
 Each precheck logs `[precheck-N]` prefix lines you can grep for in the
-container log.
+container log. Code 3 (Redis PING failed) belonged to composes before the
+Redis proxy; today an unreachable proxy shows as code 6.
 
 If the Manager refuses to start with an admin-key error, the persisted
 `JM_ADMIN_KEY` is empty, shorter than 32 characters, or still a placeholder.
 Restore the same durable key used by the prior deployment before recreating the
 service.
+
+## Upgrading installs made by hand
+
+The sections below apply to installs made by hand (appendix) or before the
+setup command existed. They do not upgrade a setup-made install; upgrading
+those is not supported yet (see "Running it again").
 
 ## Upgrading from --trash-days 0 (SLICE 3 trash retention)
 

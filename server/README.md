@@ -7,8 +7,10 @@ on any Linux host with Docker Compose v2:
 curl -fsSL https://raw.githubusercontent.com/lelanddutcher/juicemount/main/server/scripts/juicemount-setup.sh | sudo bash
 ```
 
-It generates every secret, reads the image digests from the release manifest,
-starts the stack and prints the Manager URL and sign-in key.
+It generates every secret, takes the compose files and image digests from the
+same release, starts the stack and prints the Manager URL and sign-in key. It
+installs releases made after it was added: today's latest release, 0.5.0,
+predates it, so for 0.5.0 use the manual install (appendix of the guide).
 [INSTALL-TrueNAS.md](INSTALL-TrueNAS.md) explains what it does, where it keeps
 its files, how to connect a Mac, and the manual install (appendix).
 
@@ -257,6 +259,10 @@ live Mac clients. For a canonical Compose project owned by this checkout,
 use the service-scoped [Compose rollout procedure](COMPOSE-ROLLOUT.md).
 It verifies the previous configuration and digest-pinned images, updates only
 Manager and farm, and restores previous images on failed verification.
+
+An install made by `juicemount-setup` is **not** covered by that script
+either: it is not a git checkout, and the script would recreate services from
+the unrendered compose. Upgrading a setup-made install is not supported yet.
 
 TrueNAS Apps-generated Compose projects are **not** covered by that script.
 Do not run the standalone `update-server.sh` against Compose-owned services

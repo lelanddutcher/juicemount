@@ -194,7 +194,7 @@ jobs:
           bash server/scripts/juicemount-setup.sh --yes --source server \
             --dir "$RUNNER_TEMP/juicemount" --project jm-ci > "$out"
           env_file="$RUNNER_TEMP/juicemount/compose/.env"
-          sed -n 's/^[A-Z_]*=\(.\{20,\}\)$/::add-mask::\1/p' "$env_file"
+          sed -n 's/^[A-Z_][A-Z0-9_]*=\(.\{8,\}\)$/::add-mask::\1/p' "$env_file"
           sed 's/^\(Sign-in key:  \).*/\1(hidden)/' "$out"
           test "$(wc -l < "$out")" = 2
           grep -Eqx 'Manager URL:  http://[^ ]+:30190' "$out"
@@ -225,6 +225,8 @@ jobs:
         run: |
           d="$RUNNER_TEMP/juicemount/compose"
           [ -f "$d/.env" ] || exit 0
-          dc() { docker compose --project-name jm-ci --project-directory "$d" --env-file "$d/.env" -f "$d/docker-compose.yml" "$@"; }
-          dc ps -a
-          dc logs --no-color --tail 60
+          # Mask every value of the install's .env before anything prints:
+          # the first-run step may have failed before it added its masks.
+          sed -n 's/^[A-Z_][A-Z0-9_]*=\(.\{8,\}\)$/::add-mask::\1/p' "$d/.env"
+          "$d/jm-compose" ps -a
+          "$d/jm-compose" logs --no-color --tail 60
