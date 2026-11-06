@@ -242,9 +242,10 @@ start a proxy image whose revision does not descend from
 `server/respproxy/min-gate-commit`). A Mac the window admits stays pending
 until a background pass has proved the proxy live the same way Approve does
 (a few seconds); while that proof fails, the Principals page says why and
-the Mac waits. Everything the window approves is listed as "needs review"
-until you confirm or revoke it. Close the window as soon as the named Macs
-are in.
+the Mac waits. Closing, reopening or extending the window, or its expiry,
+hands the Macs still waiting to you for approval. Everything the window
+approves is listed as "needs review" until you confirm or revoke it. Close
+the window as soon as the named Macs are in.
 
 The per-address limits count the source address the Manager sees. Remote
 Macs behind a Tailscale subnet router (or any NAT) all arrive from the

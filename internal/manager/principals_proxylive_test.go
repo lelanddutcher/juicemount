@@ -796,3 +796,191 @@ func TestH8BAutoApproveAfterManagerRestartNeedsProof(t *testing.T) {
 	pollMac(t, s2, instanceN(2), b)
 	waitStatus(t, s2, b.Principal, PrincipalApproved)
 }
+
+// waitAutoIdleAtCleanup makes the test wait, at cleanup and before the
+// timers it shortened are restored, for any auto-approve pass to finish.
+func waitAutoIdleAtCleanup(t *testing.T, s *PrincipalStore) {
+	t.Helper()
+	t.Cleanup(func() {
+		deadline := time.Now().Add(10 * time.Second)
+		for {
+			s.mu.Lock()
+			running := s.autoRunning
+			s.mu.Unlock()
+			if !running || time.Now().After(deadline) {
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	})
+}
+
+// TestH8BAutoApproveReplacedRecordWaitsForItsOwnProof: while a pass waits
+// for its proof, the admitted Mac is revoked and forgotten, and the same
+// instance ID enrolls again with another secret. The proof was written
+// before the new record existed and must not approve it; the new record
+// waits for a proof written after it.
+func TestH8BAutoApproveReplacedRecordWaitsForItsOwnProof(t *testing.T) {
+	shortAutoApproveRetry(t)
+	dir := t.TempDir()
+	s, err := NewPrincipalStore(PrincipalStoreOptions{StatePath: filepath.Join(dir, "store.json"), ProxyDir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitAutoIdleAtCleanup(t, s)
+	stop := startCurrentProxyImage(t, dir)
+	if _, err := s.SetAutoApproveWindow(time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	stop()
+	// A current proxy that applies a request only 1 s after it first sees
+	// it, and, until release, only requests first seen before cutoff.
+	var mu sync.Mutex
+	var cutoff time.Time
+	release := false
+	quit, done := make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(done)
+		seen := map[string]time.Time{}
+		for {
+			select {
+			case <-quit:
+				return
+			case <-time.After(5 * time.Millisecond):
+			}
+			req := strings.TrimSpace(readStringOK(filepath.Join(dir, reloadRequestName)))
+			if req != "" {
+				if _, ok := seen[req]; !ok {
+					seen[req] = time.Now()
+				}
+				mu.Lock()
+				ok := release || cutoff.IsZero() || seen[req].Before(cutoff)
+				mu.Unlock()
+				body, err := os.ReadFile(filepath.Join(dir, proxyPrincipalsName))
+				if ok && err == nil && time.Since(seen[req]) > time.Second && sha256Hex(string(body)) == strings.Fields(req)[0] {
+					fakeProxyWrite(dir, reloadAckName, req)
+					fakeProxyWrite(dir, legacyReloadAckName, req)
+				}
+			}
+			fakeProxyWrite(dir, reloadHeartbeatName, "1")
+		}
+	}()
+	t.Cleanup(func() { close(quit); <-done })
+
+	id := instanceN(4)
+	first, err := s.Enroll(EnrollRequest{InstanceID: id, Host: "h", Secret: strings.Repeat("q", 40)}, "192.0.2.50")
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(300 * time.Millisecond) // the pass has written its request and waits
+	if err := s.Revoke(first.Principal); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Forget(first.Principal); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	cutoff = time.Now()
+	mu.Unlock()
+	second, err := s.Enroll(EnrollRequest{InstanceID: id, Host: "other", Secret: strings.Repeat("z", 40)}, "192.0.2.51")
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(3 * time.Second) // the first proof has been applied
+	if p := s.Snapshot().byName(second.Principal); p.Status != PrincipalPending || p.Host != "other" {
+		t.Fatalf("the record enrolled during the proof: %+v, want pending", p)
+	}
+	mu.Lock()
+	release = true
+	mu.Unlock()
+	s.mu.Lock()
+	s.autoFailedAt = time.Time{} // end the retry wait
+	s.mu.Unlock()
+	pollMac(t, s, id, second)
+	waitStatus(t, s, second.Principal, PrincipalApproved)
+}
+
+// TestH8BAutoApproveWindowChangeHandsWaitingMacsToAdmin: Macs a window
+// admitted that still wait for a proof when the window is reopened (or had
+// expired) are not auto-approved by the new window, whose counters do not
+// count them: they wait for an admin. An expired window's admission counts
+// for nothing even before any pass runs.
+func TestH8BAutoApproveWindowChangeHandsWaitingMacsToAdmin(t *testing.T) {
+	for _, expire := range []bool{false, true} {
+		t.Run(map[bool]string{false: "reopened", true: "expired-then-reopened"}[expire], func(t *testing.T) {
+			shortProxyAckWait(t)
+			dir := t.TempDir()
+			var clockMu sync.Mutex
+			clock := time.Now()
+			now := func() time.Time { clockMu.Lock(); defer clockMu.Unlock(); return clock }
+			s, err := NewPrincipalStore(PrincipalStoreOptions{StatePath: filepath.Join(dir, "store.json"), ProxyDir: dir, Now: now})
+			if err != nil {
+				t.Fatal(err)
+			}
+			waitAutoIdleAtCleanup(t, s)
+			stop := startCurrentProxyImage(t, dir)
+			if _, err := s.SetAutoApproveWindow(time.Hour, 2); err != nil {
+				t.Fatal(err)
+			}
+			stop()
+			stopOld := startOlderProxyImage(t, dir, false)
+			var waiting []EnrollResponse
+			for i := 1; i <= 2; i++ {
+				r, err := s.Enroll(EnrollRequest{InstanceID: instanceN(i), Host: "h", Secret: testMacSecret}, fmt.Sprintf("192.0.2.%d", i))
+				if err != nil {
+					t.Fatal(err)
+				}
+				waiting = append(waiting, r)
+			}
+			deadline := time.Now().Add(3 * time.Second)
+			for s.Snapshot().AutoApproveProblem == "" && time.Now().Before(deadline) {
+				time.Sleep(10 * time.Millisecond)
+			}
+			if s.Snapshot().AutoApproveProblem == "" {
+				t.Fatal("setup: the first pass did not fail")
+			}
+			if expire {
+				clockMu.Lock()
+				clock = clock.Add(2 * time.Hour)
+				clockMu.Unlock()
+				for _, r := range waiting {
+					if p := s.Snapshot().byName(r.Principal); p.Status != PrincipalPending || p.AutoApprovePending {
+						t.Fatalf("after the window expired (no pass yet): %+v, want plain pending", p)
+					}
+				}
+			}
+			stopOld()
+			startCurrentProxyImage(t, dir)
+			if _, err := s.SetAutoApproveWindow(time.Hour, 2); err != nil {
+				t.Fatal(err)
+			}
+			s.mu.Lock()
+			s.autoFailedAt = time.Time{} // end the retry wait
+			s.mu.Unlock()
+			var fresh []EnrollResponse
+			for i := 3; i <= 4; i++ {
+				r, err := s.Enroll(EnrollRequest{InstanceID: instanceN(i), Host: "h", Secret: testMacSecret}, fmt.Sprintf("192.0.2.%d", i))
+				if err != nil {
+					t.Fatal(err)
+				}
+				fresh = append(fresh, r)
+			}
+			for i, r := range waiting {
+				pollMac(t, s, instanceN(i+1), r)
+			}
+			for _, r := range fresh {
+				waitStatus(t, s, r.Principal, PrincipalApproved)
+			}
+			time.Sleep(300 * time.Millisecond)
+			snap := s.Snapshot()
+			for _, r := range waiting {
+				if p := snap.byName(r.Principal); p.Status != PrincipalPending || p.AutoApprovePending {
+					t.Fatalf("a Mac the earlier window admitted: %+v, want pending for an admin", p)
+				}
+			}
+			if snap.AutoApproveUsed != 2 || snap.NeedsReview != 2 {
+				t.Fatalf("used=%d review=%d, want 2/2 (the new window's cap)", snap.AutoApproveUsed, snap.NeedsReview)
+			}
+		})
+	}
+}
