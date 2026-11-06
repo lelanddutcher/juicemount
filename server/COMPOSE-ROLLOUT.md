@@ -178,14 +178,20 @@ proxy:
   each Mac on `http://<nas>:30190/principals.html` after checking that the
   fingerprint the Mac shows matches the list. The Manager refuses Approve,
   and refuses to open the auto-approve window, unless the proxy is live:
-  `reload.ack` repeats a whole `reload.request` line this Manager process
-  wrote (sha256, time and nonce, so an ack left from before a Manager restart
-  never counts), AND `reload.heartbeat`, which the entrypoint rewrites every
-  2 s, is less than 6 s old (so a proxy that stopped while the Manager kept
-  running stops counting within 6 s). Before the cutover it answers 409 "the
+  each Approve (and each opening of the window) writes a fresh
+  `reload.request` line (sha256, time and nonce) and waits, up to 6 s, until
+  `reload.applied` repeats that line or a later one this Manager process
+  wrote, AND `reload.heartbeat`, which the proxy rewrites every 2 s, is less
+  than 6 s old. A receipt written before the Approve never counts, so one
+  left behind by an earlier proxy or Manager proves nothing; Approve takes up
+  to one 2 s proxy tick. Before the cutover it answers 409 "the
   Redis proxy is not live yet"; a stopped proxy gets "the Redis proxy has
-  stopped"; a proxy image older than the heartbeat gets "Update the
-  jm-respproxy image". A Mac approved early does not switch anyway: the app logs in as
+  stopped"; a proxy image older than the heartbeat or than `reload.applied`
+  gets "Update the jm-respproxy image". This check proves only that the
+  running proxy speaks the `reload.applied` protocol (0.5 and later), not
+  that its image is at or after `server/respproxy/min-gate-commit`:
+  `rollout-compose.sh` enforces that pin. A Mac approved early does not
+  switch anyway: the app logs in as
   its principal first and keeps its current login, showing "Approved —
   waiting for the server cutover", until the server accepts the new one.
 - The server mounts (`juicefs`, farm, Manager) were recreated by stages 4 and
@@ -233,9 +239,13 @@ per source address, 7 days) only when both are true: the deployed proxy
 contains the every-mode gate (prerequisite 2), and you are present to review.
 Do not open it on a proxy without that gate (the script already refuses to
 start a proxy image whose revision does not descend from
-`server/respproxy/min-gate-commit`). Everything the window approves is
-listed as "needs review" until you confirm or revoke it. Close the window as
-soon as the named Macs are in.
+`server/respproxy/min-gate-commit`). A Mac the window admits stays pending
+until a background pass has proved the proxy live the same way Approve does
+(a few seconds); while that proof fails, the Principals page says why and
+the Mac waits. Closing, reopening or extending the window, or its expiry,
+hands the Macs still waiting to you for approval. Everything the window
+approves is listed as "needs review" until you confirm or revoke it. Close
+the window as soon as the named Macs are in.
 
 The per-address limits count the source address the Manager sees. Remote
 Macs behind a Tailscale subnet router (or any NAT) all arrive from the
