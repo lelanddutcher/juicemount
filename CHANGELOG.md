@@ -66,6 +66,18 @@ or farm workers.
 
 ### Server
 
+- Restarting the metadata Redis no longer loses recent file changes. Redis
+  rebuilds its data at start by replaying its append-only file. In 0.5.0 the
+  Redis ACL made it refuse every replayed transaction, and JuiceFS writes
+  almost all file metadata in transactions. So each restart of Redis (a
+  container recreate, a server update or a NAS reboot) dropped the file
+  changes made since Redis last compacted that file: new and renamed files
+  could disappear or point at missing data. Redis logged each refusal as
+  `CRITICAL ... AOF-loading-client: '-NOPERM ACLs rules changed`. The fix is
+  one line in `server/redis.acl`: the `default` user stays off, so nobody
+  can log in as it and unauthenticated clients are still refused, but it now
+  holds the permissions the replay needs. Before you restart Redis on a 0.5.0
+  server, see **Upgrading the Redis proxy and Manager** below.
 - A fresh server install creates the `zpool` bucket before it sets up the
   object-store users. Before, setup used the restricted format key, which
   cannot create buckets, so a first install failed. An existing bucket and its
@@ -357,6 +369,16 @@ new workers against the same Redis at the same time:
 
 ### Upgrading the Redis proxy and Manager
 
+- Before the first restart of Redis on a 0.5.0 server, make Redis compact its
+  append-only file, so the restart replays no transactions at all. Run
+  `docker exec <redis container> sh -c 'redis-cli --user jm-admin --pass
+  "$(cat /run/jm-redis/admin.pass)" --no-auth-warning BGREWRITEAOF'`, then
+  wait until `INFO persistence` (same login) shows
+  `aof_rewrite_in_progress:0` and `aof_last_bgrewrite_status:ok`. Only then
+  update `server/redis.acl` and restart. If Redis on that server was already
+  restarted under 0.5.0, its log from that start shows `AOF-loading-client`
+  lines: copy Redis's data folder before anything else, and do not compact
+  it, because the refused transactions are still in that file.
 - The security fix under **Server** is in the Redis proxy, so it protects a
   volume once that volume's proxy runs this release. Macs and farm workers
   need no update for it. `server/scripts/rollout-compose.sh` refuses a proxy
