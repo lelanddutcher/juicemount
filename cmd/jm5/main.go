@@ -532,7 +532,11 @@ func main() {
 		// /manager/ to it.
 		mgrMux := http.NewServeMux()
 		mgrJobMgr = manager.Register(mgrMux, "/manager", manager.Config{
-			JuiceFSBin:  "juicefs", // PATH lookup
+			// The image installs the confining juicefs build for sync at
+			// JM_SYNC_JUICEFS; the FUSE mount keeps the stock binary on
+			// PATH. Unset = PATH lookup (the Manager then detects an
+			// older juicefs and keeps the previous sync behaviour).
+			JuiceFSBin:  syncJuicefsBin(),
 			FUSEMount:   *fusePath, // embedded mode: write via in-process FUSE mount
 			SourceRoots: roots,
 			DestMount:   "/jfs",
@@ -941,4 +945,13 @@ func jm5WhoAmI(instanceID, mountPoint, addr, dbPath string, served []string) cpl
 		WireTerms:       cplane.WireTerms,
 		Capabilities:    cplane.DeriveCapabilities(served),
 	}
+}
+
+// syncJuicefsBin is the juicefs the embedded Manager runs for sync and
+// maintenance: $JM_SYNC_JUICEFS, or "juicefs" from PATH.
+func syncJuicefsBin() string {
+	if p := os.Getenv("JM_SYNC_JUICEFS"); p != "" {
+		return p
+	}
+	return "juicefs"
 }

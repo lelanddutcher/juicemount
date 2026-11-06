@@ -184,7 +184,7 @@ func Register(outer *http.ServeMux, prefix string, cfg Config) *JobManager {
 	// Derive the RunSync spec from the Config's destination-mode fields.
 	// Embedded (FUSEMount) takes precedence; falls back to standalone
 	// (MetaURL+VolName) if FUSEMount is unset.
-	spec := RunSyncSpec{OwnerUID: cfg.MountOwnerUID, OwnerGID: cfg.MountOwnerGID}
+	spec := RunSyncSpec{OwnerUID: cfg.MountOwnerUID, OwnerGID: cfg.MountOwnerGID, SourceRoots: cfg.SourceRoots}
 	if cfg.FUSEMount != "" {
 		spec.Mode = ModeEmbedded
 		spec.FUSEMount = cfg.FUSEMount
@@ -1256,25 +1256,16 @@ func (a *API) handleResolveDestination(w http.ResponseWriter, r *http.Request) {
 		// basename, so the destination gains an extra path segment.
 		rel := strings.TrimPrefix(s, walkRoot)
 		rel = strings.TrimPrefix(rel, "/")
-		var destPath string
-		if req.PreserveStructure {
-			destPath = filepath.Join(dest, rel)
-		} else {
-			// flatten-by-basename: juicefs sync without trailing slash
-			// puts contents at <dst>/<basename-of-src>/<rel>.
-			base := filepath.Base(source)
-			destPath = filepath.Join(dest, base, rel)
-		}
+		// Both preserve_structure settings copy the source's contents
+		// into the destination itself (RunSync).
+		destPath := filepath.Join(dest, rel)
 		mappings = append(mappings, exampleMapping{
 			SourcePath: displayPath,
 			DestPath:   destPath,
 		})
 	}
 
-	info := "Files will be copied 1:1, preserving the folder structure under the source."
-	if !req.PreserveStructure {
-		info = "Files will be placed under " + dest + "/" + filepath.Base(source) + "/ — juicefs sync adds the source's basename as a parent directory in this mode."
-	}
+	info := "Files will be copied 1:1: the contents of the source folder go into the destination, preserving the folder structure under the source."
 
 	writeJSON(w, http.StatusOK, resolveDestResponse{
 		SourceURL:       srcURL,

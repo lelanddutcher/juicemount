@@ -40,6 +40,11 @@ type ProgressEvent struct {
 	ETASec    int64   `json:"eta_sec"`    // juicefs's ETA in seconds (-1 = unknown)
 	BPS       float64 `json:"bps"`        // throughput, bytes per second
 	UpdatedAt int64   `json:"updated_at"` // unix-ms
+	// SkippedLinks counts symlinks the sync skipped because following
+	// them would leave the sync root (absolute links, links out of the
+	// tree); SkippedLinkSample names the first few.
+	SkippedLinks      int64    `json:"skipped_links,omitempty"`
+	SkippedLinkSample []string `json:"skipped_link_sample,omitempty"`
 }
 
 // Job tracks the lifecycle of one sync invocation.
@@ -972,6 +977,12 @@ func mergeProgress(prev, next ProgressEvent) ProgressEvent {
 	}
 	if next.UpdatedAt > out.UpdatedAt {
 		out.UpdatedAt = next.UpdatedAt
+	}
+	if next.SkippedLinks > out.SkippedLinks {
+		out.SkippedLinks = next.SkippedLinks
+	}
+	if len(next.SkippedLinkSample) > len(out.SkippedLinkSample) {
+		out.SkippedLinkSample = append([]string(nil), next.SkippedLinkSample...)
 	}
 	return out
 }

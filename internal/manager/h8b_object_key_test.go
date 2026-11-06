@@ -174,7 +174,7 @@ func TestH8BSyncIntoVolumeGetsGCKeyInEnv(t *testing.T) {
 	envOut := filepath.Join(dir, "env.txt")
 	argOut := filepath.Join(dir, "args.txt")
 	fake := filepath.Join(dir, "juicefs")
-	script := "#!/bin/sh\nenv > '" + envOut + "'\nprintf '%s\\n' \"$@\" > '" + argOut + "'\nexit 0\n"
+	script := "#!/bin/sh\n" + stockVersionAnswer + "env > '" + envOut + "'\nprintf '%s\\n' \"$@\" > '" + argOut + "'\nexit 0\n"
 	if err := os.WriteFile(fake, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
