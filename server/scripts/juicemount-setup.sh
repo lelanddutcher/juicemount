@@ -220,9 +220,17 @@ locate_install() {
     if [ -n "$id" ]; then
       wd="$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project.working_dir"}}' "$id")"
       case "$wd" in
-        */compose) [ -f "$wd/.env" ] && DIR="${wd%/compose}" ;;
+        */compose)
+          if [ -f "$wd/.env" ]; then DIR="${wd%/compose}"
+          elif cannot_enter "$wd"; then
+            die "Compose project '$PROJECT' runs from $wd, which this user cannot enter (it is private to root): run this command as root."
+          fi ;;
       esac
       [ -n "$DIR" ] || die "Compose project '$PROJECT' already exists ($wd) and was not made by juicemount-setup. Use --project with another name, or manage it by hand."
+      # The same checks as for --dir: this folder is about to be checked,
+      # started and made private.
+      [[ "$DIR" =~ $SAFE_PATH_RE ]] || die "Compose project '$PROJECT' runs from $wd, a path with characters juicemount-setup does not handle; manage it by hand."
+      refuse_system_dir "$DIR" "the install folder of project '$PROJECT',"
     fi
   fi
   if [ -n "$DIR" ]; then
@@ -233,14 +241,16 @@ locate_install() {
     need zpool "zpool is not installed; use --dir instead of --pool."
     need zfs "zfs is not installed; use --dir instead of --pool."
     if [ -z "$POOL" ]; then
-      local p mp mounted key
+      local p mp name mounted key
       while read -r p; do
         case "$p" in boot-pool|freenas-boot) continue ;; esac
         zfs_exists "$p/juicemount" || continue
-        read -r _ mounted key < <(zfs list -H -o name,mounted,keystatus -d 0 "$p/juicemount") || true
-        if [ "${key:-}" = unavailable ] || [ "${mounted:-}" != yes ]; then
-          die "$p/juicemount exists but is locked or not mounted, so this command cannot see whether JuiceMount is installed there. Unlock or mount it first, or pass --pool or --dir; nothing was changed."
-        fi
+        while read -r name mounted key; do
+          [ -n "$name" ] || continue
+          if [ "$key" = unavailable ] || [ "$mounted" != yes ]; then
+            die "$name exists but is locked or not mounted, so this command cannot see whether JuiceMount is installed there. Unlock or mount it first, or pass --pool or --dir; nothing was changed."
+          fi
+        done < <(zfs list -H -o name,mounted,keystatus -r "$p/juicemount")
         mp="$(zfs_mountpoint "$p/juicemount")" || continue
         [ -f "$mp/compose/.env" ] && { POOL="$p"; break; }
       done < <(zpool list -H -o name 2>/dev/null)
@@ -257,6 +267,16 @@ locate_install() {
 }
 
 has_content() { [ -d "$1" ] && [ -n "$(ls -A "$1" 2>/dev/null)" ]; }
+
+# A path this (non-root) user cannot enter: it exists but is not readable, or
+# its nearest visible parent cannot be searched (a 0700 root owned by root).
+cannot_enter() {
+  local p="$1"
+  [ "$(id -u)" != 0 ] || return 1
+  if [ -e "$p" ]; then [ ! -r "$p" ] || [ ! -x "$p" ]; return; fi
+  while [ ! -e "$p" ] && [ "$p" != / ]; do p="$(dirname "$p")"; done
+  [ ! -x "$p" ] || [ ! -r "$p" ]
+}
 # Files anywhere below (empty folders do not count).
 holds_files() { [ -d "$1" ] && [ -n "$(find "$1" -mindepth 1 ! -type d -print -quit 2>/dev/null)" ]; }
 
@@ -264,14 +284,17 @@ holds_files() { [ -d "$1" ] && [ -n "$(find "$1" -mindepth 1 ! -type d -print -q
 # taking that folder for an empty install. A folder with content where a
 # new dataset would be mounted would be hidden by it; refuse that too.
 check_zfs_state() {
-  local name mounted key
+  local name mounted key acl
   [ "$MODE" = zfs ] || return 0
   if zfs_exists "$ROOT_DS"; then
-    while read -r name mounted key; do
+    while read -r name mounted key acl; do
       [ -n "$name" ] || continue
       [ "$key" != unavailable ] || die "dataset $name is locked (encrypted, key not loaded). Unlock it in Datasets first; nothing was changed."
       [ "$mounted" = yes ] || die "dataset $name is not mounted, so its contents cannot be checked. Mount it first; nothing was changed."
-    done < <(zfs list -H -o name,mounted,keystatus -r "$ROOT_DS")
+      # NFSv4 ACLs (the TrueNAS SMB preset) can grant access that mode 0700
+      # does not show, and with aclmode=restricted chmod fails.
+      [ "$acl" != nfsv4 ] || die "dataset $name uses NFSv4 ACLs (the SMB preset), so juicemount-setup cannot make it private. In Datasets, set its ACL Type to POSIX and ACL Mode to Discard (or remove it and let juicemount-setup create the datasets); nothing was changed."
+    done < <(zfs list -H -o name,mounted,keystatus,acltype -r "$ROOT_DS")
   else
     read -r name mounted key < <(zfs list -H -o name,mounted,keystatus -d 0 "$POOL") || true
     [ "${key:-}" != unavailable ] || die "pool $POOL is locked (encrypted, key not loaded). Unlock it first; nothing was changed."
@@ -352,6 +375,8 @@ stage_files() {
   done
   grep -Eq "^[[:space:]]*[^#[:space:]][^#]*$COMPOSE_DATA_PREFIX" "$STAGE/src/docker-compose.yml" ||
     die "docker-compose.yml no longer uses $COMPOSE_DATA_PREFIX host paths; this setup script does not know its layout."
+  acl_replay_ok "$STAGE/src/redis.acl" ||
+    die "this redis.acl (${SOURCE:-release $RELEASE_NAME}) has the 0.5.0 default user line, which makes Redis drop its transactions when it replays its append-only file at a restart. juicemount-setup will not install it: use a release with the fixed server/redis.acl ($REDIS_SAFE_ORDER). Nothing was changed."
 }
 
 # Data folder names (first path element below the prefix) the compose
@@ -424,7 +449,7 @@ dc() { "$DC" "$@"; }
 # never started, its other lines (such as JM_NET_SERVER_URL) are kept.
 write_check_env() { # path [existing .env]
   local spec k n v skip
-  skip="^($(printf '%s|' "${DIGESTS[@]}" "${SECRETS[@]%%:*}")JM_SETUP_[A-Z]*)="
+  skip="^($(printf '%s|' "${DIGESTS[@]}" "${SECRETS[@]%%:*}")JM_SETUP_[A-Z_]*)="
   {
     if [ -n "${2:-}" ]; then
       grep -vE "$skip" "$2" || true
@@ -529,6 +554,11 @@ update_env_release() { # path
       esac
       printf '%s\n' "$line"
     done < "$1" > "$tmp"
+    # An .env from an older setup may lack a record: add it.
+    grep -q '^JM_SETUP_RELEASE=' "$tmp" || printf 'JM_SETUP_RELEASE=%s\n' "$RELEASE_NAME" >> "$tmp"
+    grep -q '^JM_SETUP_COMMIT=' "$tmp" || printf 'JM_SETUP_COMMIT=%s\n' "$COMMIT" >> "$tmp"
+    grep -q '^JM_SETUP_OPTIONS=' "$tmp" || printf 'JM_SETUP_OPTIONS=%s\n' "$sig" >> "$tmp"
+    grep -q '^JM_SETUP_COMPOSE_VERSION=' "$tmp" || printf 'JM_SETUP_COMPOSE_VERSION=%s\n' "$(compose_version)" >> "$tmp"
   )
   for k in "${DIGESTS[@]}"; do
     v="DIG_$k"
@@ -552,6 +582,72 @@ check_env() { # path: every key present and plausible
   [[ "$(env_get "$1" JM_FARM_STORAGE_CAPACITY_BYTES)" =~ ^[0-9]+$ ]] || die "$1 lacks JM_FARM_STORAGE_CAPACITY_BYTES."
 }
 
+# ---- Redis append-only file and its ACL ---------------------------------------
+
+# Redis rebuilds its data at start by replaying its append-only file (AOF),
+# and checks each replayed transaction against the ACL's `default` user. With
+# the 0.5.0 line (`user default off ... -@all`) it refuses them all, so a
+# restart drops the metadata written since the last AOF rewrite
+# (CHANGELOG.md, 0.5.1). True when the `default` line of the ACL in $1 ("-"
+# for stdin) grants what the replay needs: every key, and every command or
+# the write commands plus SELECT. Rules apply left to right, as in Redis.
+acl_replay_ok() {
+  awk '
+    $1 == "user" && $2 == "default" {
+      found = 1; keys = 0; all = 0; w = 0; sel = 0
+      for (i = 3; i <= NF; i++) {
+        t = $i
+        if (t == "~*" || t == "allkeys") keys = 1
+        else if (t == "resetkeys") keys = 0
+        else if (t == "+@all" || t == "allcommands") { all = 1; w = 1; sel = 1 }
+        else if (t == "-@all" || t == "nocommands") { all = 0; w = 0; sel = 0 }
+        else if (t == "+@write") w = 1
+        else if (t == "-@write") { w = 0; all = 0 }
+        else if (t == "+select") sel = 1
+        else if (t == "-select") { sel = 0; all = 0 }
+      }
+      ok = keys && (all || (w && sel))
+    }
+    END { exit (found && ok) ? 0 : 1 }' "$1"
+}
+
+REDIS_SAFE_ORDER="CHANGELOG.md, 0.5.1, \"Upgrading the Redis proxy and Manager\""
+
+# Started install: never let setup start or recreate a Redis that would
+# replay its AOF under the 0.5.0 ACL. Setup never replaces the ACL itself.
+check_redis_acl() {
+  local id running=false rendered="" file_old=0 last_old=0
+  acl_replay_ok "$CDIR/redis.acl" || file_old=1
+  id="$(docker ps -aq --filter "label=com.docker.compose.project=$PROJECT" --filter "label=com.docker.compose.service=redis" | sed -n 1p)"
+  if [ -n "$id" ]; then
+    running="$(docker inspect -f '{{.State.Running}}' "$id" 2>/dev/null || echo false)"
+    # The ACL the container last rendered at its start (also when stopped).
+    rendered="$(docker cp "$id:/run/jm-redis/users.acl" - 2>/dev/null | tar -xO 2>/dev/null || true)"
+    if [ -n "$rendered" ] && ! printf '%s\n' "$rendered" | acl_replay_ok -; then last_old=1; fi
+  fi
+  [ "$file_old$last_old" != 00 ] || return 0
+  if [ "$running" = true ]; then
+    if [ "$last_old" = 1 ]; then
+      say "WARNING: Redis is running with the 0.5.0 ACL. This run leaves it alone, but its next restart (a NAS reboot counts) will drop recent metadata."
+    else
+      say "WARNING: $CDIR/redis.acl has the 0.5.0 ACL, and Redis will use it at its next start (a NAS reboot counts), which will drop recent metadata. This run leaves the running Redis alone."
+    fi
+    say "Update it in the order of $REDIS_SAFE_ORDER: keep Redis running; copy $ROOT/redis somewhere safe; run BGREWRITEAOF and wait until INFO persistence shows aof_rewrite_scheduled:0, aof_rewrite_in_progress:0 and aof_last_bgrewrite_status:ok; only then update $CDIR/redis.acl and restart Redis."
+    return 0
+  fi
+  if [ "$file_old" = 1 ]; then
+    say "Redis is not running, and $CDIR/redis.acl has the 0.5.0 ACL. Starting Redis would replay its append-only file under that ACL and drop every transaction since its last rewrite, so juicemount-setup will not start or recreate it."
+  else
+    say "Redis is not running, and it was last started with the 0.5.0 ACL. That start may already have dropped transactions, and starting it now with the fixed ACL would replay them over newer writes, so juicemount-setup will not start or recreate it."
+  fi
+  say "What to do ($REDIS_SAFE_ORDER):"
+  say "  1. Copy $ROOT/redis (its appendonlydir) somewhere safe. It may be the only complete record."
+  say "  2. If this Redis was never started under the 0.5.0 ACL since its append-only file was last rewritten, put the fixed server/redis.acl in $CDIR and start it alone: $CDIR/jm-compose up -d redis. Then run this command again."
+  say "  3. Otherwise do not start it with either ACL: restarting it under 0.5.0 already lost changes, and starting it with the new ACL now would replay them over newer writes. Recovering is a manual restore from the copy."
+  say "  For a Redis that is running under the 0.5.0 ACL: keep it running, copy $ROOT/redis, run BGREWRITEAOF and wait until INFO persistence shows aof_rewrite_scheduled:0, aof_rewrite_in_progress:0 and aof_last_bgrewrite_status:ok, then update the ACL and restart it."
+  die "nothing was started or changed."
+}
+
 # ---- checks (read only) -----------------------------------------------------
 
 project_containers() { docker ps -aq --filter "label=com.docker.compose.project=$PROJECT"; }
@@ -571,7 +667,7 @@ check_project_owner() {
 # with Docker access may install into a folder it can write.
 check_access() {
   local p
-  if [ -e "$CDIR" ] && [ ! -r "$CDIR" ]; then
+  if { [ -e "$CDIR" ] && [ ! -r "$CDIR" ]; } || { [ ! -e "$CDIR" ] && cannot_enter "$CDIR" && [ -e "$ROOT" ]; }; then
     die "$CDIR exists but this user cannot read it (it is private to root): run this command as root."
   fi
   [ "$(id -u)" != 0 ] || return 0
@@ -592,7 +688,7 @@ secure_root() { # fix|check
     say "Note: $ROOT is mode $m (other users can enter it); a real run makes it 700."
     return 0
   fi
-  chmod 700 "$ROOT" || die "could not make $ROOT private (chmod 700); on TrueNAS check the dataset's ACL mode. Nothing else was changed."
+  chmod 00700 "$ROOT" || die "could not make $ROOT private (chmod 00700); on TrueNAS check the dataset's ACL mode. Nothing else was changed."
   say "Note: $ROOT was mode $m; it is now 700 (private to its owner)."
 }
 
@@ -682,7 +778,13 @@ check_no_drift() {
   local was now note=""
   was="$(env_get "$CDIR/.env" JM_SETUP_COMPOSE_VERSION)"; now="$(compose_version)"
   [ -z "$was" ] || [ "$was" = "$now" ] || note=" Docker Compose was $was when this install was made and is $now now, so cause 2 is likely."
-  die "the running services$drift do not match what this install's files would start, and juicemount-setup never recreates a started install. Two causes are possible: 1) the files changed after the services started (an overlay applied by hand and not kept in $CDIR/overlays/, or an edited .env or compose file); 2) Docker Compose was upgraded and computes its configuration hash differently.$note Check whether a file in $CDIR (overlays/, .env, docker-compose*.yml) changed since the services started; 'docker compose up --dry-run' is no help here, as it reports every pull_policy: always service as changed. If the files are as intended, '$CDIR/jm-compose up -d' recreates those services from them and keeps the data. Nothing was changed."
+  local advice="If the files are as intended, '$CDIR/jm-compose up -d' recreates those services from them and keeps the data."
+  case " $drift " in *" redis "*)
+    local others
+    others="$(printf '%s\n' $drift | grep -vx redis | tr '\n' ' ')"
+    advice="Redis is among them: do not run a bare '$CDIR/jm-compose up -d', which would restart it and replay its append-only file. ${others:+Recreate the others with '$CDIR/jm-compose up -d --no-deps ${others% }'. }Restart Redis only in the order of $REDIS_SAFE_ORDER: keep it running, copy $ROOT/redis, run BGREWRITEAOF and wait until INFO persistence shows aof_rewrite_scheduled:0, aof_rewrite_in_progress:0 and aof_last_bgrewrite_status:ok, then recreate it with '$CDIR/jm-compose up -d --no-deps redis'." ;;
+  esac
+  die "the running services$drift do not match what this install's files would start, and juicemount-setup never recreates a started install. Two causes are possible: 1) the files changed after the services started (an overlay applied by hand and not kept in $CDIR/overlays/, or an edited .env or compose file); 2) Docker Compose was upgraded and computes its configuration hash differently.$note Check whether a file in $CDIR (overlays/, .env, docker-compose*.yml) changed since the services started; 'docker compose up --dry-run' is no help here, as it reports every pull_policy: always service as changed. $advice Nothing was changed."
 }
 
 # ---- start ------------------------------------------------------------------
@@ -797,12 +899,14 @@ main() {
     check_env "$CDIR/.env"
     validate_compose ""
     check_no_drift
+    check_redis_acl
     if [ "$DRY" = 1 ]; then
-      secure_root check
+      [ -z "$(env_get "$CDIR/.env" JM_SETUP_RELEASE)" ] || secure_root check
       say "Dry run: $ROOT is a started install; a re-run starts what is stopped and changes nothing."; exit 0
     fi
     take_lock
-    secure_root fix
+    # Only a folder whose .env setup wrote is made private.
+    [ -z "$(env_get "$CDIR/.env" JM_SETUP_RELEASE)" ] || secure_root fix
     say "JuiceMount is installed in $ROOT; checking it and starting what is stopped."
     start_and_report
     return
@@ -878,12 +982,18 @@ main() {
 
   # ---- first write ----
   if [ "$MODE" = zfs ]; then
-    for s in $datasets; do zfs create -p "$s" || die "could not create dataset $s."; done
+    # POSIX ACLs with aclmode=discard (the TrueNAS "Generic" preset): an
+    # NFSv4/SMB parent must not pass on ACL entries that mode 0700 hides.
+    local -a zopts=(-o acltype=posixacl)
+    if zfs get -H -o value aclmode "$POOL" >/dev/null 2>&1; then zopts+=(-o aclmode=discard); fi
+    for s in $datasets; do zfs create -p "${zopts[@]}" "$s" || die "could not create dataset $s."; done
     [ "$(zfs_mountpoint "$ROOT_DS")" = "$ROOT" ] || die "dataset $ROOT_DS is not mounted at $ROOT."
   fi
   mkdir -p "$ROOT" || die "could not create $ROOT (run this command as root, or pass --dir)."
-  chmod 700 "$ROOT" || die "could not make $ROOT private (chmod 700); on TrueNAS check the dataset's ACL mode."
-  [ "$(stat -c %a "$ROOT")" = 700 ] || die "$ROOT is mode $(stat -c %a "$ROOT") after chmod 700; check its ACL."
+  # 00700, not 700: chmod keeps a directory's setgid bit (inherited from a
+  # setgid parent) unless the mode has a fifth digit.
+  chmod 00700 "$ROOT" || die "could not make $ROOT private (chmod 00700); on TrueNAS check the dataset's ACL mode."
+  [ $((8#$(stat -c %a "$ROOT") & 8#077)) -eq 0 ] || die "$ROOT is mode $(stat -c %a "$ROOT") after chmod 00700, so other users can still enter it; check its ACL."
   for sub in $subs; do mkdir -p "$ROOT/$sub"; done
   [ ${#IMPORTS[@]} -gt 0 ] || mkdir -p "$ROOT/import"
   mkdir -p "$CDIR/minio" "$CDIR/overlays"

@@ -62,7 +62,11 @@ prints it again.
 1. **Finds the storage.**
    - On TrueNAS it creates the dataset `<pool>/juicemount` with one child
      dataset per data folder, on the pool with the most free space (never the
-     boot pool). `--pool NAME` chooses the pool.
+     boot pool). `--pool NAME` chooses the pool. The datasets get ACL type
+     POSIX and ACL mode Discard (the "Generic" preset), so an SMB parent with
+     NFSv4 ACLs passes no access entries down. An existing dataset with NFSv4
+     ACLs is refused. A locked or unmounted dataset is refused, not taken for
+     an empty one.
    - On another host it uses the folder `/srv/juicemount`. `--dir PATH`
      chooses another folder (on TrueNAS too: then it creates no dataset).
 2. **Reads the release** (the latest one, or `--release vX.Y.Z`). It
@@ -155,9 +159,22 @@ sudo <data>/compose/jm-compose logs juicemount-manager
 Running the same command again is safe:
 
 - It never changes a secret, and never changes or deletes data.
-- On a started install it changes nothing at all: it starts any stopped
-  service (`docker compose up -d`), waits for the Manager and prints the same
-  two lines. It always applies the files in `<data>/compose/overlays/`.
+- On a started install it changes no file and recreates no service. It makes
+  `<data>` private (0700) again if its mode was loosened. It runs
+  `docker compose up -d`, which starts any stopped service and runs the
+  one-shot services again (`minio-keys` and `juicefs-init`; both change
+  nothing when everything is already set up). It waits for the Manager and
+  prints the same two lines. It always applies the files in
+  `<data>/compose/overlays/`.
+- It never starts a stopped Redis that would replay its append-only file
+  under the 0.5.0 ACL. 0.5.0's `server/redis.acl` made Redis drop every
+  transaction when it replayed that file at a start, so each restart lost
+  recent metadata. If `<data>/compose/redis.acl`, or the ACL a stopped Redis
+  was last started with, still has the 0.5.0 line, the command refuses and
+  prints the steps from CHANGELOG.md (0.5.1, "Upgrading the Redis proxy and
+  Manager"). A running Redis is left alone, with a warning. The command never
+  replaces that file on a started install. A new install refuses a release
+  whose `redis.acl` has the 0.5.0 line.
 - It refuses, and changes nothing, when:
   - a running service does not match what the install's files would start.
     Setup never recreates a started service. There are two possible causes:
@@ -170,7 +187,10 @@ Running the same command again is safe:
     (`docker compose up --dry-run` does not help: it reports every service
     with `pull_policy: always` as changed). If the files are as intended,
     `<data>/compose/jm-compose up -d` recreates those services from them and
-    keeps the data;
+    keeps the data. If Redis is among them, do not run a bare `up -d`:
+    recreate the others with `up -d --no-deps <services>`, and restart Redis
+    only in the order of CHANGELOG.md (0.5.1, "Upgrading the Redis proxy and
+    Manager");
   - a started install is given options other than the ones it was installed
     with (`--source`, `--images-env`, `--override`, `--import`, or a
     `--release` other than the one it runs). Run it with no options, or with

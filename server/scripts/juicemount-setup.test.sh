@@ -90,13 +90,23 @@ printf 'docker %s\n' "$*" >> "$FAKE_LOG"
 case "$1" in
   info) exit 0 ;;
   ps)
-    [ -f "$FAKE_DIR/running" ] && echo cid-1
+    case "$*" in
+      *com.docker.compose.service=redis*) [ ! -f "$FAKE_DIR/running" ] || [ -n "${FAKE_NO_REDIS:-}" ] || echo cid-redis ;;
+      *) [ -f "$FAKE_DIR/running" ] && echo cid-1 ;;
+    esac
     [ "$*" != "ps -aq" ] || [ -z "${FAKE_OTHER:-}" ] || echo cid-other
     exit 0 ;;
+  cp)
+    # docker cp <id>:/run/jm-redis/users.acl -  -> a tar stream of the file
+    [ -n "${FAKE_RENDERED_ACL:-}" ] || exit 1
+    t="$(mktemp -d)"; printf '%s\n' "$FAKE_RENDERED_ACL" > "$t/users.acl"
+    tar -cf - -C "$t" users.acl; rm -rf "$t"; exit 0 ;;
   inspect)
     case "$*" in
       *working_dir*) cat "$FAKE_DIR/running" ;;
-      *config-hash*) echo "${FAKE_HAVE_HASH:-hash-1}" ;;
+      *config-hash*)
+        if [ "${*: -1}" = cid-redis ]; then echo "${FAKE_HAVE_HASH_REDIS:-hash-1}"; else echo "${FAKE_HAVE_HASH:-hash-1}"; fi ;;
+      *State.Running*) echo "${FAKE_REDIS_RUNNING:-true}" ;;
       *Config.Image*)
         for id in "${@:4}"; do
           case "$id" in
@@ -137,7 +147,7 @@ case "$cmd $*" in
         esac
         echo "$img"
       done ;;
-  "config --hash *") echo "juicemount-manager hash-1" ;;
+  "config --hash *") printf 'juicemount-manager hash-1\nredis hash-1\n' ;;
   "config ")
     grep -v '^[[:space:]]*#' "${files[0]}" | sed -n 's/^[[:space:]]*- \([./][^:]*\):.*/\1/p' | while read -r s; do
       case "$s" in ./*) s="$dir/${s#./}" ;; esac
@@ -187,21 +197,26 @@ cat > "$WORK/bin/zfs" <<'SH'
 printf 'zfs %s\n' "$*" >> "$FAKE_LOG"
 db="$FAKE_DIR/datasets"; touch "$db"
 known() { case "$1" in boot-pool|tank|big) return 0 ;; esac; grep -qx "$1" "$db"; }
-state() {
-  local m=yes k=-
+state() { # name [with acltype]
+  local m=yes k=- a=posix
   [ "$1" != "${FAKE_UNMOUNTED:-}" ] || m=no
   [ "$1" != "${FAKE_LOCKED:-}" ] || { m=no; k=unavailable; }
-  printf '%s\t%s\t%s\n' "$1" "$m" "$k"
+  [ "$1" != "${FAKE_NFSV4:-}" ] || a=nfsv4
+  if [ -n "${2:-}" ]; then printf '%s\t%s\t%s\t%s\n' "$1" "$m" "$k" "$a"; else printf '%s\t%s\t%s\n' "$1" "$m" "$k"; fi
 }
 n="${*: -1}"
 case "$*" in
   "get -H -o value mountpoint "*) known "$n" && echo "$FAKE_DIR/mnt/$n" ;;
   "list -H -o name "*) known "$n" ;;
   "list -H -o name,mounted,keystatus -d 0 "*) known "$n" && state "$n" ;;
+  "get -H -o value aclmode "*) [ -z "${FAKE_NO_ACLMODE:-}" ] && known "$n" && echo discard ;;
+  "list -H -o name,mounted,keystatus,acltype -r "*)
+    known "$n" || exit 1
+    state "$n" a; grep "^$n/" "$db" | while read -r c; do state "$c" a; done ;;
   "list -H -o name,mounted,keystatus -r "*)
     known "$n" || exit 1
     state "$n"; grep "^$n/" "$db" | while read -r c; do state "$c"; done ;;
-  "create -p "*) echo "$n" >> "$db"; mkdir -p "$FAKE_DIR/mnt/$n" ;;
+  "create -p "*) echo "$n" >> "$db"; mkdir -p "$FAKE_DIR/mnt/$n"; chmod g+s "$FAKE_DIR/mnt/$n" ;;
   *) exit 1 ;;
 esac
 SH
@@ -232,6 +247,7 @@ run_plain() {
 reset() {
   rm -rf "$FAKE_DIR" "$WORK/data"; mkdir -p "$FAKE_DIR"; : > "$FAKE_LOG"; write_release a b
   unset FAKE_FAIL FAKE_HTTP FAKE_INIT_EXIT FAKE_OLD_RELEASE FAKE_OTHER FAKE_PORT FAKE_PORT_PROTO FAKE_HAVE_HASH FAKE_UNMOUNTED FAKE_LOCKED FAKE_COMPOSE_VERSION
+  unset FAKE_NO_REDIS FAKE_RENDERED_ACL FAKE_HAVE_HASH_REDIS FAKE_REDIS_RUNNING FAKE_NFSV4 FAKE_NO_ACLMODE
 }
 envval() { sed -n "s/^$2=//p" "$1"; }
 secrets_of() { grep -E '^(JM_ADMIN_KEY|MINIO_ROOT_PASSWORD|JM_[A-Z_]*_PASSWORD|JM_OBJ_[A-Z]*_SECRET_KEY)=' "$1"; }
@@ -327,6 +343,39 @@ FAKE_HAVE_HASH=hash-by-hand FAKE_COMPOSE_VERSION=6.1.0 run_plain --dir "$D"
 [ "$rc" = 1 ] && grep -q 'Docker Compose was 5.0.0 when this install was made and is 6.1.0 now, so cause 2 is likely' "$WORK/err" || fail "drift names a changed compose version"
 ok "a re-run refuses when a running service differs from the install's files"
 rm "$D/compose/overlays/docker-compose.link.yml"
+FAKE_HAVE_HASH_REDIS=hash-by-hand FAKE_HAVE_HASH=hash-by-hand run_plain --dir "$D"
+[ "$rc" = 1 ] && grep -q 'Redis is among them: do not run a bare' "$WORK/err" &&
+  grep -q -- "jm-compose up -d --no-deps juicemount-manager'" "$WORK/err" && grep -q 'aof_last_bgrewrite_status:ok' "$WORK/err" &&
+  ! grep -q "If the files are as intended, '$D/compose/jm-compose up -d' recreates" "$WORK/err" || fail "drift including Redis names the safe order"
+ok "when Redis drifted, the advice is the safe order, never a bare up -d"
+
+# 9b. A started install never starts a Redis that would replay under the
+#     0.5.0 ACL; a running one is left alone with a warning.
+OLD_ACL='user default off resetpass resetkeys resetchannels -@all'
+NEW_ACL='user default off resetpass resetkeys resetchannels ~* &* +@all'
+cp "$D/compose/redis.acl" "$WORK/redis.acl.new"
+sed -i "s/^user default .*/$OLD_ACL/" "$D/compose/redis.acl"
+sum_acl="$(cd "$D/compose" && sha256sum redis.acl .env)"
+: > "$FAKE_LOG"
+FAKE_REDIS_RUNNING=false run_plain --dir "$D"
+[ "$rc" = 1 ] && grep -q 'Redis is not running, and .*redis.acl has the 0.5.0 ACL' "$WORK/err" && grep -q 'Copy .*/redis (its appendonlydir)' "$WORK/err" &&
+  grep -q 'aof_rewrite_scheduled:0, aof_rewrite_in_progress:0 and aof_last_bgrewrite_status:ok' "$WORK/err" &&
+  ! grep -q ' up -d' "$FAKE_LOG" || fail "stopped Redis with the 0.5.0 ACL file is not started"
+FAKE_REDIS_RUNNING=false FAKE_NO_REDIS=1 run_plain --dir "$D"
+[ "$rc" = 1 ] && grep -q 'Redis is not running' "$WORK/err" || fail "no Redis container and the 0.5.0 ACL file: refused"
+FAKE_REDIS_RUNNING=true run_plain --dir "$D"
+[ "$rc" = 0 ] && grep -q 'WARNING: .*redis.acl has the 0.5.0 ACL, and Redis will use it at its next start' "$WORK/err" || fail "running Redis with the 0.5.0 ACL: warning, no refusal"
+[ "$(cd "$D/compose" && sha256sum redis.acl .env)" = "$sum_acl" ] || fail "setup never replaces the ACL on a started install"
+cp "$WORK/redis.acl.new" "$D/compose/redis.acl"
+: > "$FAKE_LOG"
+FAKE_REDIS_RUNNING=false FAKE_RENDERED_ACL="$OLD_ACL" run_plain --dir "$D"
+[ "$rc" = 1 ] && grep -q 'it was last started with the 0.5.0 ACL. That start may already have dropped transactions' "$WORK/err" && ! grep -q ' up -d' "$FAKE_LOG" || fail "stopped Redis last started with the 0.5.0 ACL is not started"
+FAKE_REDIS_RUNNING=true FAKE_RENDERED_ACL="$OLD_ACL" run_plain --dir "$D"
+[ "$rc" = 0 ] && grep -q 'WARNING: Redis is running with the 0.5.0 ACL' "$WORK/err" || fail "Redis running with the 0.5.0 ACL: warning"
+: > "$FAKE_LOG"
+FAKE_REDIS_RUNNING=false FAKE_RENDERED_ACL="$NEW_ACL" run_plain --dir "$D"
+[ "$rc" = 0 ] && grep -q ' up -d' "$FAKE_LOG" || fail "stopped Redis with the fixed ACL is started"
+ok "a stopped Redis under the 0.5.0 ACL (file or last start) is never started; a running one gets a warning; the ACL file is never replaced"
 
 # 5b. Another folder with the same project name: never taken over, either
 #     by a fresh install or by a re-run of an install in another folder.
@@ -352,6 +401,25 @@ if [ "$(id -u)" != 0 ]; then
   [ "$rc" = 1 ] && grep -q 'ZFS datasets needs root' "$WORK/err" || fail "ZFS without root refused"
   ok "without root: an unreadable install folder and ZFS mode say to run as root"
 fi
+
+# 5d. Found through the Docker label: checked like --dir; made private only
+#     when setup wrote its .env.
+if [ "$(id -u)" != 0 ]; then
+  chmod 000 "$D"
+  run_plain
+  chmod 700 "$D"
+  [ "$rc" = 1 ] && grep -q 'which this user cannot enter (it is private to root): run this command as root' "$WORK/err" || fail "label folder behind a private root: run as root"
+fi
+mkdir -p "$WORK/my data/compose"; touch "$WORK/my data/compose/.env"; cp "$FAKE_DIR/running" "$WORK/running.bak"
+echo "$WORK/my data/compose" > "$FAKE_DIR/running"
+run_plain
+[ "$rc" = 1 ] && grep -q 'a path with characters juicemount-setup does not handle' "$WORK/err" || fail "label folder with unsafe characters refused"
+cp "$WORK/running.bak" "$FAKE_DIR/running"; rm -rf "$WORK/my data"
+cp "$E" "$WORK/env.bak2"; sed -i '/^JM_SETUP_RELEASE=/d' "$E"; chmod 755 "$D"
+run_plain --dir "$D"
+[ "$rc" = 0 ] && [ "$(stat -c %a "$D")" = 755 ] || fail "a folder whose .env setup did not write is not chmodded (rc=$rc)"
+cp "$WORK/env.bak2" "$E"; chmod 700 "$D"
+ok "a folder found by its Docker label is checked like --dir, says 'run as root' when private, and is chmodded only when setup wrote its .env"
 
 # 6. A lost secret is refused, never regenerated.
 cp "$E" "$WORK/env.bak"
@@ -394,6 +462,26 @@ FAKE_OLD_RELEASE=1 run_plain --yes --dir "$D"
 [ "$rc" = 1 ] && grep -q 'predates juicemount-setup' "$WORK/err" && nothing_written "$D" || fail "old release refused"
 ok "swapped digests, a file not in SHA256SUMS, a malformed digest, a version other than --release and a pre-setup release are refused"
 
+# 8b. A release (or source) whose redis.acl has the 0.5.0 line is refused
+#     before anything is written.
+reset
+cp -a "$SERVER" "$WORK/oldsrc"
+sed -i "s/^user default .*/user default off resetpass resetkeys resetchannels -@all/" "$WORK/oldsrc/redis.acl"
+run_plain --yes --dir "$D" --source "$WORK/oldsrc"
+[ "$rc" = 1 ] && grep -q 'has the 0.5.0 default user line' "$WORK/err" && nothing_written "$D" || fail "0.5.0 redis.acl refused before writing"
+run_plain --dry-run --dir "$D" --source "$WORK/oldsrc"
+[ "$rc" = 1 ] && grep -q 'has the 0.5.0 default user line' "$WORK/err" || fail "dry run refuses the 0.5.0 redis.acl"
+rm -rf "$WORK/oldsrc"
+ok "a redis.acl with the 0.5.0 default line is refused before any write, also in a dry run"
+
+# 8c. Under a setgid parent the root still ends up private.
+reset
+mkdir -p "$WORK/sgid"; chmod g+s "$WORK/sgid"
+run_plain --yes --dir "$WORK/sgid/data"
+[ "$rc" = 0 ] && [ "$(stat -c %a "$WORK/sgid/data")" = 700 ] || fail "install under a setgid parent (rc=$rc, mode $(stat -c %a "$WORK/sgid/data" 2>/dev/null))"
+rm -f "$FAKE_DIR/running"; rm -rf "$WORK/sgid"
+ok "under a setgid parent the root is created 0700 (setgid cleared)"
+
 # 9. Without a terminal, --yes is required.
 reset
 run_plain --dir "$D"
@@ -435,15 +523,24 @@ ok "another JuiceMount (ix-juicemount, loose containers) and a port in use are r
 reset
 run --yes
 [ "$rc" = 0 ] || fail "TrueNAS install exits 0 (rc=$rc)"
-grep -qx 'zfs create -p big/juicemount' "$FAKE_LOG" && grep -qx 'zfs create -p big/juicemount/bucket' "$FAKE_LOG" &&
-  grep -qx 'zfs create -p big/juicemount/compose' "$FAKE_LOG" || fail "datasets created on pool big"
+grep -qx 'zfs create -p .* big/juicemount' "$FAKE_LOG" && grep -qx 'zfs create -p .* big/juicemount/bucket' "$FAKE_LOG" &&
+  grep -qx 'zfs create -p .* big/juicemount/compose' "$FAKE_LOG" || fail "datasets created on pool big"
 ! grep -q 'boot-pool/' "$FAKE_LOG" || fail "boot-pool untouched"
 TE="$FAKE_DIR/mnt/big/juicemount/compose/.env"
 [ "$(envval "$TE" JM_FARM_STORAGE_CAPACITY_BYTES)" = 7000000000000 ] || fail "capacity from zpool size"
 : > "$FAKE_LOG"; rm -f "$FAKE_DIR/running"
 run --pool tank --yes
-[ "$rc" = 0 ] && grep -qx 'zfs create -p tank/juicemount' "$FAKE_LOG" || fail "--pool selects the pool"
-ok "TrueNAS: datasets on the pool with most free space (or --pool); capacity from zpool"
+[ "$rc" = 0 ] && grep -qx 'zfs create -p .* tank/juicemount' "$FAKE_LOG" || fail "--pool selects the pool"
+grep -qx 'zfs create -p -o acltype=posixacl -o aclmode=discard tank/juicemount' "$FAKE_LOG" || fail "datasets created with POSIX ACLs and aclmode=discard"
+[ "$(stat -c %a "$FAKE_DIR/mnt/tank/juicemount")" = 700 ] || fail "setgid dataset root made 0700"
+reset
+FAKE_NO_ACLMODE=1 run --pool tank --yes
+[ "$rc" = 0 ] && grep -qx 'zfs create -p -o acltype=posixacl tank/juicemount' "$FAKE_LOG" || fail "without the aclmode property only acltype is set"
+reset
+printf 'tank/juicemount\n' > "$FAKE_DIR/datasets"; mkdir -p "$FAKE_DIR/mnt/tank/juicemount"
+FAKE_NFSV4=tank/juicemount run --pool tank --yes
+[ "$rc" = 1 ] && grep -q 'dataset tank/juicemount uses NFSv4 ACLs' "$WORK/err" && ! grep -q 'zfs create' "$FAKE_LOG" || fail "NFSv4 ACL dataset refused"
+ok "TrueNAS: datasets on the pool with most free space (or --pool), POSIX ACLs and aclmode=discard, 0700 root; an NFSv4-ACL dataset is refused; capacity from zpool"
 
 # 12. A non-empty root folder that the new dataset would hide.
 reset
@@ -467,6 +564,9 @@ reset
 printf 'tank/juicemount\n' > "$FAKE_DIR/datasets"
 FAKE_LOCKED=tank/juicemount run --yes
 [ "$rc" = 1 ] && grep -q 'tank/juicemount exists but is locked or not mounted' "$WORK/err" && ! grep -q 'zfs create' "$FAKE_LOG" || fail "locked install on another pool stops the scan"
+printf 'tank/juicemount/redis\n' >> "$FAKE_DIR/datasets"; mkdir -p "$FAKE_DIR/mnt/tank/juicemount/redis"
+FAKE_LOCKED=tank/juicemount/redis run --yes
+[ "$rc" = 1 ] && grep -q 'tank/juicemount/redis exists but is locked or not mounted' "$WORK/err" || fail "locked child dataset stops the scan"
 reset
 FAKE_LOCKED=tank run --pool tank --yes
 [ "$rc" = 1 ] && grep -q 'pool tank is locked' "$WORK/err" || fail "locked pool refused"
@@ -485,6 +585,7 @@ ok "an image that cannot be pulled, or a failed juicefs-init, stops with the cau
 #     keeping every secret byte for byte.
 rm -f "$FAKE_DIR/running"
 secrets_before="$(secrets_of "$D/compose/.env")"
+sed -i '/^JM_SETUP_COMPOSE_VERSION=/d' "$D/compose/.env"
 write_release e b 9.9.10
 sed -i "s/sha256:$(hex64 a)/sha256:$(hex64 e)/" "$FAKE_DIR/release-manifest.json"
 (cd "$FAKE_DIR" && sha256sum release-manifest.json server-images.env > SHA256SUMS)
@@ -497,6 +598,7 @@ run_plain --yes --dir "$D" --release v9.9.10 --override "$WORK/override.yml"
 grep -q 'releases/download/v9.9.10/' "$FAKE_LOG" || fail "the requested release was read"
 cmp -s "$WORK/override.yml" "$D/compose/docker-compose.override.yml" && grep -q -- "-f $D/compose/docker-compose.override.yml" "$FAKE_LOG" || fail "override installed and used"
 [ "$(stat -c %a "$D/compose/.env")" = 600 ] || fail ".env stays 0600"
+[ "$(envval "$D/compose/.env" JM_SETUP_COMPOSE_VERSION)" = 5.0.0 ] || fail "a missing JM_SETUP_COMPOSE_VERSION is added"
 ok "a never-started install takes --release and --override; every secret stays byte for byte"
 
 # 16. A Manager that refuses the key is reported.

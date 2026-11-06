@@ -228,6 +228,27 @@ jobs:
             --dir "$RUNNER_TEMP/juicemount" --project jm-ci > "$RUNNER_TEMP/run2.out"
           test "$(snap)" = "$before"
           cmp "$RUNNER_TEMP/run1.out" "$RUNNER_TEMP/run2.out"
+      - name: A transaction survives a Redis stop and a setup re-run
+        run: |
+          d="$RUNNER_TEMP/juicemount/compose"
+          pass="$(sed -n 's/^JM_PROXY_ADMIN_PASSWORD=//p' "$d/.env")"
+          # Through the proxy as principal admin; the password goes on stdin.
+          proxy() {
+            { printf 'AUTH admin %s\nSELECT 1\n' "$pass"; cat; } |
+              docker exec -i "$("$d/jm-compose" ps -q redis)" redis-cli -h respproxy -p 6379 --no-auth-warning
+          }
+          # A transaction with an LPUSH: the 0.5.0 ACL refused exactly these
+          # when Redis replayed its append-only file.
+          printf 'MULTI\nSET jmsetup:e2e:tx survived\nLPUSH jmsetup:e2e:list a\nEXEC\n' | proxy
+          sleep 2   # appendfsync everysec
+          "$d/jm-compose" stop redis
+          bash server/scripts/juicemount-setup.sh --yes --source server \
+            --dir "$RUNNER_TEMP/juicemount" --project jm-ci > /dev/null
+          test "$(printf 'GET jmsetup:e2e:tx\n' | proxy | tail -n 1)" = survived
+          test "$(printf 'LLEN jmsetup:e2e:list\n' | proxy | tail -n 1)" = 1
+          if docker logs "$("$d/jm-compose" ps -q redis)" 2>&1 | grep -q 'AOF-loading-client'; then
+            echo "Redis refused replayed commands:"; exit 1
+          fi
       - name: Stack state after a failure
         if: failure()
         run: |
