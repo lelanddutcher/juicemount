@@ -672,6 +672,25 @@ func shortAutoApproveRetry(t *testing.T) {
 	t.Cleanup(func() { autoApproveRetry = old })
 }
 
+// pollUntilStatus polls as the waiting Mac until it reaches want, as the
+// app does at the server's retry_after. One poll is not enough: a pass asked
+// for while another pass runs, or within autoApproveRetry of a failed proof,
+// is dropped, and the Mac's next poll asks again.
+func pollUntilStatus(t *testing.T, s *PrincipalStore, instanceID string, r EnrollResponse, want PrincipalStatus) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		pollMac(t, s, instanceID, r)
+		if p := s.Snapshot().byName(r.Principal); p != nil && p.Status == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s: status %+v, want %s after polling", r.Principal, s.Snapshot().byName(r.Principal), want)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
 // pollMac answers one poll of the Mac enrolled as r (what asks for an
 // auto-approve pass while it waits).
 func pollMac(t *testing.T, s *PrincipalStore, instanceID string, r EnrollResponse) {
@@ -736,8 +755,7 @@ func TestH8BAutoApproveNeedsFreshProof(t *testing.T) {
 
 			startCurrentProxyImage(t, dir)
 			for i, r := range macs {
-				pollMac(t, s, ids[i], r)
-				waitStatus(t, s, r.Principal, PrincipalApproved)
+				pollUntilStatus(t, s, ids[i], r, PrincipalApproved)
 			}
 			snap = s.Snapshot()
 			if snap.AutoApproveProblem != "" || snap.AutoApproveUsed != 2 || snap.NeedsReview != 2 {
@@ -794,8 +812,7 @@ func TestH8BAutoApproveAfterManagerRestartNeedsProof(t *testing.T) {
 		t.Fatalf("auto_approve_problem = %q", prob)
 	}
 	startCurrentProxyImage(t, dir)
-	pollMac(t, s2, instanceN(2), b)
-	waitStatus(t, s2, b.Principal, PrincipalApproved)
+	pollUntilStatus(t, s2, instanceN(2), b, PrincipalApproved)
 }
 
 // waitAutoIdleAtCleanup makes the test wait, at cleanup and before the
@@ -897,8 +914,7 @@ func TestH8BAutoApproveReplacedRecordWaitsForItsOwnProof(t *testing.T) {
 	s.mu.Lock()
 	s.autoFailedAt = time.Time{} // end the retry wait
 	s.mu.Unlock()
-	pollMac(t, s, id, second)
-	waitStatus(t, s, second.Principal, PrincipalApproved)
+	pollUntilStatus(t, s, id, second, PrincipalApproved)
 }
 
 // TestH8BAutoApproveWindowChangeHandsWaitingMacsToAdmin: Macs a window
