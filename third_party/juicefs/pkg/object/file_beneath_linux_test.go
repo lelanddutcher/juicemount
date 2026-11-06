@@ -12,6 +12,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -234,13 +235,24 @@ func TestFileBeneathCreatesMissingRoot(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(root, "a", "b.txt")); err != nil {
 		t.Error(err)
 	}
-	// A root without a trailing slash is a name prefix in its parent.
-	p, _ := newDisk(filepath.Join(base, "new", "de"), "", "", "")
-	if err := p.Put("st/a/c.txt", bytes.NewReader([]byte("y"))); err != nil {
-		t.Fatalf("Put under a prefix root: %v", err)
+	// A root without a trailing slash confines to the named folder, not
+	// to its parent: keys beneath it work, a same-prefix sibling and a
+	// listing of the parent are refused.
+	p, _ := newDisk(root, "", "", "")
+	if err := p.Put("/a/c.txt", bytes.NewReader([]byte("y"))); err != nil {
+		t.Fatalf("Put under a root without a slash: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(root, "a", "c.txt")); err != nil {
 		t.Error(err)
+	}
+	if err := p.Put("X/sib.txt", bytes.NewReader([]byte("y"))); !isOutsideRoot(err) {
+		t.Errorf("Put into a same-prefix sibling: %v, want an outside-root refusal", err)
+	}
+	if _, err := os.Stat(root + "X"); err == nil {
+		t.Errorf("same-prefix sibling created")
+	}
+	if _, _, _, err := p.List("", "", "", "/", 10, true); !isOutsideRoot(err) {
+		t.Errorf("List of a root without a slash: %v, want an outside-root refusal (it lists the parent)", err)
 	}
 }
 
@@ -257,5 +269,46 @@ func TestFileBeneathFailsClosedWithoutOpenat2(t *testing.T) {
 	}
 	if _, _, _, err := s.List("", "", "", "/", 10, true); !errors.Is(err, errNoOpenat2) {
 		t.Errorf("List without openat2: %v, want errNoOpenat2", err)
+	}
+}
+
+func TestFileBeneathBoundsRetries(t *testing.T) {
+	_, _, s := beneathFixture(t)
+	if _, err := s.Head("sub"); err != nil { // open the root first
+		t.Fatal(err)
+	}
+	calls := 0
+	prev := openat2Func
+	openat2Func = func(int, string, *unix.OpenHow) (int, error) { calls++; return -1, unix.EAGAIN }
+	t.Cleanup(func() { openat2Func = prev })
+	if _, err := s.Get("sub/in.txt", 0, -1); !errors.Is(err, unix.EAGAIN) {
+		t.Errorf("Get with endless EAGAIN: %v, want EAGAIN after the retries", err)
+	}
+	if calls != maxOpenat2Tries {
+		t.Errorf("openat2 called %d times, want %d", calls, maxOpenat2Tries)
+	}
+}
+
+// A root handed over as an open folder (/proc/self/fd/N), as the Manager
+// does, is confined like a root opened by path.
+func TestFileBeneathRootFromFd(t *testing.T) {
+	base, root, _ := beneathFixture(t)
+	f, err := os.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	s, _ := newDisk("/proc/self/fd/"+strconv.Itoa(int(f.Fd()))+"/", "", "", "")
+	if err := s.Put("sub/viafd.txt", bytes.NewReader([]byte("x"))); err != nil {
+		t.Fatalf("Put through an fd root: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "sub", "viafd.txt")); err != nil {
+		t.Error(err)
+	}
+	if err := s.Put("x/y/new.txt", bytes.NewReader([]byte("x"))); !isOutsideRoot(err) {
+		t.Errorf("escape through an fd root: %v", err)
+	}
+	if entries, _ := os.ReadDir(filepath.Join(base, "victim")); len(entries) != 0 {
+		t.Errorf("victim written: %v", entries)
 	}
 }

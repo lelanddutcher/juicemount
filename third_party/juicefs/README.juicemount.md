@@ -67,7 +67,7 @@ In the pinned `github.com/juicedata/go-fuse/v2` fork, `Server.Shutdown` does not
 
 `patches/0015-klauspost-compress-security-update.patch` updates `github.com/klauspost/compress` from v1.17.11 to v1.20.2 in this module's `go.mod` and `go.sum` for GO-2026-6865 (GHSA-fpmh-frq8-7rj8), a panic on two-block frames in the `fse` and `huff0` packages that `zstd` uses; the bundled CLI reaches the affected symbols. No other dependency changes. The root module takes the same version.
 
-`patches/0016-file-backend-beneath-root.patch` confines the `file://` object backend to its root folder on Linux. The root is the folder named in the URI, or, without a trailing slash, its parent folder: that form is a name prefix in the parent.
+`patches/0016-file-backend-beneath-root.patch` confines the `file://` object backend to its root folder on Linux.
 - **How.** Every filesystem operation of the backend goes through a `fileOps` value (`pkg/object/file_ops.go`).
   - On Linux, `beneathOps` (`pkg/object/file_beneath_linux.go`) opens the root once. It then resolves every path relative to that folder with `openat2(RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS)`, or with an `*at` call on a parent folder opened that way: open, create, mkdir, stat, lstat, readdir, rename, link, unlink, chmod, chown, chtimes, symlink and readlink.
   - The kernel refuses, atomically per call, any resolution that would leave the root. That covers an absolute symlink, a `..` above the root, a chain of symlinks, and a symlink swapped in between calls.
@@ -75,7 +75,9 @@ In the pinned `github.com/juicedata/go-fuse/v2` fork, `Server.Shutdown` does not
   - When listing with links followed, such a link shows as a broken link, and copying its content fails.
   - A refusal is an `os.PathError` that wraps `EXDEV`, with the text "path resolves outside the file storage root".
 - **Old kernels.** Without `openat2` (Linux before 5.6, or a seccomp policy that refuses it) every operation fails closed with a message naming the requirement.
-- **Root path.** The root path itself is trusted. A missing root is created on the first write.
+- **Root.** The root is the folder the URI names, also without a trailing slash. Upstream treats a slash-less root as a name prefix in its parent folder; confining to that parent would widen the root, so a slash-less root can address keys beneath it but not its parent or a same-prefix sibling. Every in-tree caller (format, load, metadata backup) passes a root ending in `/`.
+- **Root path.** A root given by path is opened by path: the caller must trust it. The JuiceMount Manager therefore opens each sync root itself, beneath its configured anchor with `openat2(RESOLVE_BENEATH)`, and passes it as `file:///proc/self/fd/N/` (the root fd is the inherited folder). A missing root given by path is created on the first write.
+- **Retries.** EAGAIN or EINTR from `openat2` (a rename racing a lookup) is retried at most 64 times, then the call fails.
 - **Other platforms.** Non-Linux builds keep the upstream path-based behaviour (`pathOps`, `file_beneath_other.go`). The macOS app bundles juicefs for mounting and does not run sync.
 - **Gates.** `pkg/object/file_beneath_linux_test.go`, and the real-binary sync tests in `internal/manager/juicefs_beneath_test.go`, which CI runs with this module's build.
 - **Version.** The build suffix moved to `-jm2`.

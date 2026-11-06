@@ -57,6 +57,10 @@ func (*outsideRootError) Unwrap() error { return syscall.EXDEV }
 // errNoOpenat2 is returned when the kernel cannot confine paths.
 var errNoOpenat2 = errors.New("refused: openat2 is unavailable (Linux 5.6 or later is required to confine file storage to its root)")
 
+// maxOpenat2Tries bounds retries when openat2 reports EAGAIN (a rename
+// raced a RESOLVE_BENEATH lookup) or EINTR. After that the call fails.
+const maxOpenat2Tries = 64
+
 // openat2Func is unix.Openat2; tests replace it to simulate an old kernel.
 var openat2Func = unix.Openat2
 
@@ -144,13 +148,13 @@ func (b *beneathOps) openat2(op, p string, flags uint64, mode uint32, create boo
 	if err != nil {
 		return -1, err
 	}
-	for {
+	for try := 1; ; try++ {
 		fd, err := openat2Func(rootFd, r, &unix.OpenHow{
 			Flags:   flags | unix.O_CLOEXEC,
 			Mode:    uint64(mode),
 			Resolve: unix.RESOLVE_BENEATH | unix.RESOLVE_NO_MAGICLINKS,
 		})
-		if errors.Is(err, unix.EAGAIN) || errors.Is(err, unix.EINTR) {
+		if (errors.Is(err, unix.EAGAIN) || errors.Is(err, unix.EINTR)) && try < maxOpenat2Tries {
 			continue // a concurrent rename raced the lookup; retry
 		}
 		if err != nil {

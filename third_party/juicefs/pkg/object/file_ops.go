@@ -67,12 +67,13 @@ func (pathOps) ReadDir(p string) ([]os.FileInfo, error) {
 	return f.Readdir(-1)
 }
 
-// storageBaseDir is the folder a file:// root confines to: the root itself
-// when it ends with a separator, otherwise its parent (a root without a
-// trailing separator is a name prefix inside that folder).
+// storageBaseDir is the folder a file:// root confines to: the named
+// path itself. Upstream treats a root without a trailing separator as a
+// name prefix inside its parent folder; confining to that parent would
+// widen the root (at "/sources" it is "/"). With the named path as the
+// base, such a root can still address keys beneath it ("<root>/x"), but
+// listing its parent or a same-prefix sibling is refused. Every in-tree
+// caller (format, load, metadata backup) passes a root ending in "/".
 func storageBaseDir(root string) string {
-	if len(root) > 0 && os.IsPathSeparator(root[len(root)-1]) {
-		return filepath.Clean(root)
-	}
-	return filepath.Dir(filepath.Clean(root))
+	return filepath.Clean(root)
 }
