@@ -54,7 +54,7 @@ RUN cd third_party/juicefs \
     && sed -n 's/^ *"version_output": "\(.*\)",*$/\1/p' SOURCE.json > /out/juicefs.version \
     && test -n "$ldflags" && test -s /out/juicefs.version \
     && CGO_ENABLED=1 GOOS=linux \
-       go build -tags nocos,nobos,nohdfs,noibmcos,noobs,nooss,noqingstor,noswift,noazure,nogs,noufile,nodragonfly,nosqlite,nomysql,nopg,notikv,nobadger,noetcd \
+       go build -trimpath -tags nocos,nobos,nohdfs,noibmcos,noobs,nooss,noqingstor,noswift,noazure,nogs,noufile,nodragonfly,nosqlite,nomysql,nopg,notikv,nobadger,noetcd \
          -ldflags="$ldflags -linkmode external -extldflags '-static'" -o /out/juicefs .
 
 # ----- Stage 2: runtime -----

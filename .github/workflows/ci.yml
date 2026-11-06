@@ -60,10 +60,13 @@ jobs:
         # so the real-binary sync tests in internal/manager run instead of
         # skipping.
         working-directory: third_party/juicefs
+        # The pinned ldflags give it the -jmN version the Manager checks
+        # before it hands juicefs open roots and --links.
         run: |
-          go build -tags nocos,nobos,nohdfs,noibmcos,noobs,nooss,noqingstor,noswift,noazure,nogs,noufile,nodragonfly,nosqlite,nomysql,nopg,notikv,nobadger,noetcd \
-            -o "$RUNNER_TEMP/juicefs" .
-          "$RUNNER_TEMP/juicefs" --version
+          ldflags="$(sed -n 's/^ *"ldflags": "\(.*\)",*$/\1/p' SOURCE.json)"
+          go build -trimpath -tags nocos,nobos,nohdfs,noibmcos,noobs,nooss,noqingstor,noswift,noazure,nogs,noufile,nodragonfly,nosqlite,nomysql,nopg,notikv,nobadger,noetcd \
+            -ldflags="$ldflags" -o "$RUNNER_TEMP/juicefs" .
+          test "$("$RUNNER_TEMP/juicefs" --version)" = "$(sed -n 's/^ *"version_output": "\(.*\)",*$/\1/p' SOURCE.json)"
       - name: Vendored juicefs object-backend tests
         working-directory: third_party/juicefs
         run: go test -count=1 ./pkg/object

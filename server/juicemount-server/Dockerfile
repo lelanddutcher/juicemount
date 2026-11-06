@@ -61,6 +61,20 @@ RUN --mount=type=cache,target=/go/pkg/mod \
       -ldflags="-s -w -linkmode external -extldflags '-static' -X github.com/lelanddutcher/juicemount/internal/version.Version=${JM_VERSION} -X github.com/lelanddutcher/juicemount/internal/version.Commit=${JM_COMMIT}" \
       -o /out/jm5 ./cmd/jm5
 
+# The juicefs the embedded Manager runs for sync: this repository's patched
+# build of third_party/juicefs, whose file:// backend confines every sync
+# root (patch 0016). Installed beside, not over, the base image's juicefs:
+# the FUSE mount keeps the stock binary, because the patch series also
+# changes mount behaviour for the macOS app. Same build as the manager
+# image (server/juicemount-manager/Dockerfile).
+RUN cd third_party/juicefs \
+    && ldflags="$(sed -n 's/^ *"ldflags": "\(.*\)",*$/\1/p' SOURCE.json)" \
+    && sed -n 's/^ *"version_output": "\(.*\)",*$/\1/p' SOURCE.json > /out/juicefs.version \
+    && test -n "$ldflags" && test -s /out/juicefs.version \
+    && CGO_ENABLED=1 GOOS=linux \
+       go build -trimpath -tags nocos,nobos,nohdfs,noibmcos,noobs,nooss,noqingstor,noswift,noazure,nogs,noufile,nodragonfly,nosqlite,nomysql,nopg,notikv,nobadger,noetcd \
+         -ldflags="$ldflags -linkmode external -extldflags '-static'" -o /out/juicefs-sync .
+
 # ----- Stage 2: runtime -----
 # Pin to a specific JuiceFS release for CI reproducibility. JuiceFS
 # changed its tag scheme in mid-2025: the old `v1.2.3` form is gone,
@@ -87,6 +101,10 @@ RUN command -v curl >/dev/null \
 # on PATH; juicefs lives there too so PATH lookups inside the
 # FUSEManager just work.
 COPY --from=builder /out/jm5 /usr/local/bin/jm5
+COPY --from=builder /out/juicefs-sync /usr/local/libexec/juicemount/juicefs
+COPY --from=builder /out/juicefs.version /usr/local/share/juicemount/juicefs.version
+RUN test "$(/usr/local/libexec/juicemount/juicefs --version)" = "$(cat /usr/local/share/juicemount/juicefs.version)"
+ENV JM_SYNC_JUICEFS=/usr/local/libexec/juicemount/juicefs
 
 # Container-level regression gate: execute the binary in the ACTUAL runtime
 # stage and verify its embedded release identity. This catches loader/ABI and
