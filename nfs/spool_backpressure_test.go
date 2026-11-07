@@ -1,6 +1,7 @@
 package nfs
 
 import (
+	"fmt"
 	"os"
 	"testing"
 	"time"
@@ -14,7 +15,15 @@ import (
 func TestMain(m *testing.M) {
 	capacityWaitDeadline = 80 * time.Millisecond
 	capacityWaitPoll = 5 * time.Millisecond
-	os.Exit(m.Run())
+	code := m.Run()
+	if code == 0 {
+		if n, stacks := leakedSpoolSweepers(2 * time.Second); n > 0 {
+			fmt.Fprintf(os.Stderr, "FAIL: %d spool sweeper goroutine(s) still running after all tests; "+
+				"a test started one and never stopped it (re-attaching a spool? use reattachSpoolForTest)\n\n%s\n", n, stacks)
+			code = 1
+		}
+	}
+	os.Exit(code)
 }
 
 // TestSpoolBackpressureWaitsThenSucceeds proves the core flow-control contract:
