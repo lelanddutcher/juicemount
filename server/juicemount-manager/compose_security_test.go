@@ -50,7 +50,7 @@ func TestProductionComposeUsesOnlyImmutableReleaseImages(t *testing.T) {
 		"juicefarm@${JM_FARM_DIGEST:?",
 		"juicefarm-gpu@${JM_FARM_RENDER_DIGEST:?",
 		"redis:7.4-alpine@sha256:",
-		"minio/minio:RELEASE.2025-01-20T14-49-07Z@sha256:",
+		"pgsty/silo:RELEASE.2026-09-16T00-00-00Z@sha256:",
 		"juicedata/mount:ce-v1.3.1@sha256:",
 	} {
 		if !strings.Contains(compose, required) {
