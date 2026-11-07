@@ -305,6 +305,12 @@ func RunSync(ctx context.Context, juicefsBin string, spec RunSyncSpec, source, d
 	if err != nil {
 		return err
 	}
+	// Into the volume only with the project fence (leases are per
+	// project): an older or stock juicefs would follow a symlink in one
+	// project into another. Fail closed, also for a custom --juicefs.
+	if !confined && isVolumeUserPath(strings.TrimSpace(destination)) {
+		return fmt.Errorf("sync into the volume refused: %q is not the juicefs built from third_party/juicefs (version suffix -jm%d or later, on Linux), which keeps writes inside their project; point the Manager's juicefs setting (--juicefs, or JM_SYNC_JUICEFS for jm5) at that build", juicefsBin, confiningJuicefsMin)
+	}
 	var extraFiles []*os.File
 	fdLabels := map[string]string{}
 	var sr, dr syncRoot

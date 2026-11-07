@@ -174,7 +174,7 @@ func TestH8BSyncIntoVolumeGetsGCKeyInEnv(t *testing.T) {
 	envOut := filepath.Join(dir, "env.txt")
 	argOut := filepath.Join(dir, "args.txt")
 	fake := filepath.Join(dir, "juicefs")
-	script := "#!/bin/sh\n" + stockVersionAnswer + "env > '" + envOut + "'\nprintf '%s\\n' \"$@\" > '" + argOut + "'\nexit 0\n"
+	script := "#!/bin/sh\n" + fencedVersionAnswer + "env > '" + envOut + "'\nprintf '%s\\n' \"$@\" > '" + argOut + "'\nexit 0\n"
 	if err := os.WriteFile(fake, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -183,7 +183,7 @@ func TestH8BSyncIntoVolumeGetsGCKeyInEnv(t *testing.T) {
 		t.Fatal(err)
 	}
 	progress := make(chan ProgressEvent, 1024)
-	spec := RunSyncSpec{Mode: ModeStandalone, MetaURL: "redis://manager@respproxy:6379/1", VolName: "zpool"}
+	spec := RunSyncSpec{Mode: ModeStandalone, MetaURL: "redis://manager@respproxy:6379/1", VolName: "zpool", SourceRoots: []string{dir}}
 	if err := RunSync(context.Background(), fake, spec, src, "/jfs/Project", DefaultSyncOptions(), nil, progress); err != nil {
 		t.Fatalf("RunSync: %v", err)
 	}

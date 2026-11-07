@@ -211,7 +211,7 @@
       "upstream_sha256": "495166e0c6ecaa74dbaf14c5497483c88fcd520e6407f97e49321ac8bcdd5237"
     },
     "cmd/sync.go": {
-      "sha256": "8a651dde9a62867ed0738d7a5134589af0b9d864c105e6b0821e9ea576968682",
+      "sha256": "7d061e60084570522a06ab8697faccc7ab9a231af050684390a5115e26ccbbd2",
       "upstream_sha256": "db046886b0143822ee2e116989b6d141882e8c4980860545e7b8a79f126e07c4"
     },
     "cmd/sync_test.go": {
@@ -1108,7 +1108,7 @@
     }
   },
   "local_files": {
-    "cmd/jm_fence.go": "c8b30686e653a76ca9c9835c7cab7df1878dd7428996b9425f12c5b26556692f",
+    "cmd/jm_fence.go": "11959cce13a1e10985fed61e172cff969bd04c1d8200ab79e723d611b9210b33",
     "pkg/chunk/upload_cache_ownership_test.go": "ebb66944296ae43b5579e12a8688d5a4c03e9ef8eecb61107d0ef0427429d791",
     "pkg/fuse/rename_flags_darwin.go": "37e49f30f2017a7ea05d47154cedaf6a90ecdab24d3c5d3639af53b4de6d6abd",
     "pkg/fuse/rename_flags_darwin_test.go": "7e0310f26eefc94f8cf34d6a70d966887284da82b10500bef1660a16d0ff61db",
@@ -1135,8 +1135,8 @@
     "pkg/replaceguard/record_test.go": "cf87f0e47884f5239119c1f16f40bf81841b75ca7c169fb64721d98d14969e4c",
     "pkg/slicegraph/graph.go": "9d80bab37f9f8cead356d02163011ac3636393335dfcbd6b6717aedf9fdc7b1a",
     "pkg/slicegraph/graph_test.go": "f244affc0540fcf1778f4580852bd143cb2acbf72895a39d6049ea27b28dc7f2",
-    "pkg/sync/jm_fence.go": "15b6479f8e23eae371494881b50ad5cca0d070f567208fa0661b2b01869b4ef2",
-    "pkg/sync/jm_fence_test.go": "ebddcb17fabb06aef547c126e65c1a550450622205ac3d05fbcc3efaaaf403b3"
+    "pkg/sync/jm_fence.go": "312751b9dd0fd6f155a022b043fd49f3f526103accd39cc89bce32c2c74c8f62",
+    "pkg/sync/jm_fence_test.go": "8b6808af1d3b5ea7623b9a13c19f31c1d133edfa1cb940fb54cc1b13dab4fcf1"
   },
   "module": "github.com/juicedata/juicefs",
   "module_sum": "h1:xB2I2vnOEMS77XpZuOm/Cl9SqSfUWohw+U0Wsw4N5C0=",
@@ -1157,7 +1157,7 @@
     "patches/0014-literal-fatal-error.patch": "ba84e7c4d2690c1ee2d377263f6d1dcc6793217378809b109bebf32c45964d1d",
     "patches/0015-klauspost-compress-security-update.patch": "c46fdf7add95ff74c673421238ccbc00e6e110fe49ae327167f78f747292b640",
     "patches/0016-file-backend-beneath-root.patch": "75a58ef1ce5fb69d91135bc3bb91dd19e6e5cb93e2155af5f0693fd0d5844576",
-    "patches/0017-project-fence.patch": "67eebbcfc977c6c058c09e5f76f8fea987c41f2d082373dd7898cdc15e87eb3c"
+    "patches/0017-project-fence.patch": "a228f339d6e45cfb4b4c3f69b1b67cf4a157162006788498b62b65e00e9b6cae"
   },
   "scope": "All pkg/ and cmd/ files plus main.go, LICENSE, go.mod and go.sum from the verified module ZIP. Documentation, integration tests and SDK examples are not included. local_files are JuiceMount-owned source with no upstream counterpart.",
   "upstream_url": "https://github.com/juicedata/juicefs/tree/v1.3.1",

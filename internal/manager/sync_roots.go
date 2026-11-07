@@ -42,8 +42,9 @@ import (
 //
 // --links is passed only into the volume (RunSync).
 //
-// With an older juicefs (no -jmN suffix, or N < 3), the Manager keeps the
-// previous behaviour: paths by name, no --links. It logs a warning once.
+// With an older juicefs (no -jmN suffix, or N < 3), the Manager refuses a
+// sync into the volume (RunSync). Other syncs keep the previous behaviour:
+// paths by name, no --links. It logs a warning once.
 // When the version cannot be read at all, the sync fails and the next one
 // asks again (juicefsConfinesFileRoots).
 
@@ -77,7 +78,8 @@ type juicefsProbe struct {
 // that says what was found, nothing is cached, and the next sync asks
 // again. Concurrent syncs share one running probe (single flight) instead
 // of each queuing behind it. A binary that answers with a stock version
-// (no -jmN suffix, or N < 3) gets the previous behaviour and one warning.
+// (no -jmN suffix, or N < 3) gets the previous behaviour, except that a
+// sync into the volume is refused (RunSync), and one warning.
 func juicefsConfinesFileRoots(bin string) (bool, error) {
 	if runtime.GOOS != "linux" {
 		return false, nil // the patch confines file roots on Linux only
@@ -110,7 +112,7 @@ func juicefsConfinesFileRoots(bin string) (bool, error) {
 	juicefsCapsMu.Unlock()
 	close(p.done)
 	if p.err == nil && !p.confined {
-		log.Printf("manager: WARNING: %q (version %q) does not confine file:// sync roots; syncs run without --links and pass roots by path. Install the juicefs built from third_party/juicefs (version suffix -jm%d or later).", bin, version, confiningJuicefsMin)
+		log.Printf("manager: WARNING: %q (version %q) does not confine file:// sync roots or keep writes inside a project; syncs into the volume are refused, other syncs run without --links and pass roots by path. Install the juicefs built from third_party/juicefs (version suffix -jm%d or later).", bin, version, confiningJuicefsMin)
 	}
 	return p.confined, p.err
 }

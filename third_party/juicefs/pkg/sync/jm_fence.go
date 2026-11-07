@@ -32,7 +32,9 @@ func JMSetProjectDepth(depth int) {
 // jmLinkLeavesProject reports whether a relative symlink stored at key
 // (relative to the destination root) with this target resolves outside the
 // project folder it is stored in. The check is by name: the backend stores
-// the link through real folders only, so key is the link's real place. An
+// the link through real folders only, so key is the link's real place.
+// ".." counts only before the first name in the target: after a name it
+// climbs from wherever that name leads, which may be another link. An
 // absolute target is not resolved here (the confined backends never follow
 // one), so it is not refused. A link stored above the project level (its
 // folder is not inside a project) is refused.
@@ -53,15 +55,23 @@ func jmLinkLeavesProject(key, target string, depth int) bool {
 	if level < 0 {
 		return true
 	}
+	named := false // a normal component came before
 	for _, c := range strings.Split(target, "/") {
 		switch c {
 		case "", ".":
 		case "..":
+			// After a name, ".." climbs from wherever that name leads
+			// (it may itself be a link, such as y -> .), not from the
+			// name: refused, since the check cannot know the place.
+			if named {
+				return true
+			}
 			level--
 			if level < 0 {
 				return true
 			}
 		default:
+			named = true
 			level++
 		}
 	}

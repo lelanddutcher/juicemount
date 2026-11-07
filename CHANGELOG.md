@@ -113,7 +113,9 @@ or farm workers.
   skipped and reported like the other skipped links. A destination that
   leads into another project through a symlink is refused. A symlink at the
   project level itself, or above it, is neither followed nor copied.
-  Symlinks that stay inside one project work as before. Details are in this repository's
+  Symlinks that stay inside one project work as before. A migration into
+  the volume now needs the JuiceFS build the Manager image ships (`-jm3`);
+  with any other `juicefs` it is refused. Details are in this repository's
   GitHub security advisories.
 - A sync request with an unknown direction is refused. Before, a request
   naming a saved destination skipped the source check.

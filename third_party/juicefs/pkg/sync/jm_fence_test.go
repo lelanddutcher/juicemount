@@ -20,6 +20,11 @@ func TestJMLinkLeavesProject(t *testing.T) {
 		{"A/s/l", "../../B", 1, true},
 		{"A/s/l", "./.././x", 1, false},
 		{"A/s/l", "a/../../..", 1, true},
+		// ".." after a name: the name may be a link (y -> .).
+		{"A/x", "y/../B", 1, true},
+		{"A/s/x", "y/../z", 1, true},
+		{"A/s/x", "../../A/z", 1, true},
+		{"A/s/x", "../z/./w", 1, false},
 		{"l", "A/x", 1, true}, // stored above the project level
 		{"A/l", "/abs/path", 1, false},
 		// The root is the project (depth 0) or inside it (depth -1).

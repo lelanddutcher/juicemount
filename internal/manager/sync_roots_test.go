@@ -168,11 +168,24 @@ func TestPreserveStructureOffCopiesContentsIntoDestination(t *testing.T) {
 		{filepath.Join(l.host, "photos"), "/jfs", "file://" + filepath.Join(l.host, "photos") + "/", "file://" + l.fuse + "/"},
 		{filepath.Join(l.host, "photos"), "/jfs/sub", "file://" + filepath.Join(l.host, "photos") + "/", "file://" + filepath.Join(l.fuse, "sub") + "/"},
 	} {
-		bin, argsFile, _ := versionedJuicefs(t, jm1Version) // paths by name, so the args show them
+		// Out: an older juicefs gets paths by name, so the args show them.
+		// Into the volume only -jm3 runs; its roots are open folders, so
+		// the args are where those folders are (fd 3 and 4).
+		version := jm1Version
+		if strings.HasPrefix(c.dst, "/jfs") {
+			version = jm3Version
+		}
+		bin, argsFile, fdsFile := versionedJuicefs(t, version)
 		if err := RunSync(context.Background(), bin, l.spec(), c.src, c.dst, opts, nil, nil); err != nil {
 			t.Fatalf("RunSync(%s -> %s): %v", c.src, c.dst, err)
 		}
 		args := lines(t, argsFile)
+		if version == jm3Version {
+			args = nil
+			for _, fd := range lines(t, fdsFile) {
+				args = append(args, "file://"+fd+"/")
+			}
+		}
 		if got := args[len(args)-2]; got != c.wantSrc {
 			t.Errorf("%s -> %s: source arg %q, want %q", c.src, c.dst, got, c.wantSrc)
 		}
