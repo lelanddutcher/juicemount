@@ -140,7 +140,7 @@ func TestMissingDigestCannotPublishAfterRecoveryOrRetry(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	jfs.handler.SetSpool(recovered, dr)
+	reattachSpoolForTest(t, jfs.handler, recovered, dr)
 	drainAllForTest(t, dr)
 	got, err := os.ReadFile(dest)
 	if err != nil || !bytes.Equal(got, old) {
