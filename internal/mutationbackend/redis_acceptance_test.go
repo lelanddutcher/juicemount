@@ -290,6 +290,9 @@ type backendFixture struct {
 	dir    string
 	cfg    RedisConfig
 	secret string
+	binary string
+	cmd    *exec.Cmd
+	done   chan error
 }
 
 func backendSecret(t *testing.T) string {
@@ -354,38 +357,182 @@ func newBackendFixture(t *testing.T) *backendFixture {
 	}
 	f.restoreFiles()
 	config := fmt.Sprintf("port 0\nunixsocket %q\nunixsocketperm 700\ndir %q\naclfile %q\nsave \"\"\nappendonly yes\nappendfsync always\nloglevel warning\n", f.cfg.Socket, dir, f.cfg.ACLFile)
-	configPath := filepath.Join(dir, "redis.conf")
-	if err := os.WriteFile(configPath, []byte(config), 0600); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "redis.conf"), []byte(config), 0600); err != nil {
 		t.Fatal(err)
 	}
-	cmd := exec.Command(binary, configPath)
-	var output bytes.Buffer
-	cmd.Stdout, cmd.Stderr = &output, &output
+	f.binary = binary
+	t.Cleanup(f.stop)
+	f.start()
+	return f
+}
+
+// start runs the owned Redis on the fixture's config and data folder and
+// waits for its socket.
+func (f *backendFixture) start() {
+	f.t.Helper()
+	log, err := os.OpenFile(filepath.Join(f.dir, "server.log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	cmd := exec.Command(f.binary, filepath.Join(f.dir, "redis.conf"))
+	cmd.Stdout, cmd.Stderr = log, log
 	if err := cmd.Start(); err != nil {
-		t.Fatal(err)
+		_ = log.Close()
+		f.t.Fatal(err)
 	}
 	done := make(chan error, 1)
-	go func() { done <- cmd.Wait() }()
-	t.Cleanup(func() {
-		_ = cmd.Process.Kill()
-		select {
-		case <-done:
-			t.Logf("owned Redis pid=%d reaped", cmd.Process.Pid)
-		case <-time.After(3 * time.Second):
-			t.Error("owned Redis did not terminate")
-		}
-	})
+	go func() { err := cmd.Wait(); _ = log.Close(); done <- err }()
+	f.cmd, f.done = cmd, done
 	for {
 		connection, err := net.DialTimeout("unix", f.cfg.Socket, 50*time.Millisecond)
 		if err == nil {
 			_ = connection.Close()
-			break
+			return
 		}
 		select {
-		case <-ctx.Done():
-			t.Fatal("fixture Redis startup timed out")
+		case <-f.ctx.Done():
+			f.t.Fatal("fixture Redis startup timed out")
 		case <-time.After(5 * time.Millisecond):
 		}
 	}
-	return f
+}
+
+// stop kills the owned Redis (a crash: nothing is flushed beyond what
+// appendfsync always already wrote) and reaps it.
+func (f *backendFixture) stop() {
+	if f.cmd == nil {
+		return
+	}
+	_ = f.cmd.Process.Kill()
+	select {
+	case <-f.done:
+		f.t.Logf("owned Redis pid=%d reaped", f.cmd.Process.Pid)
+	case <-time.After(3 * time.Second):
+		f.t.Error("owned Redis did not terminate")
+	}
+	f.cmd = nil
+	// A killed server leaves its socket file behind; the next start binds
+	// a fresh one.
+	_ = os.Remove(f.cfg.Socket)
+}
+
+// TestBackendAOFReplayKeepsTransactions: Redis replays its append-only file
+// at every start and checks each replayed MULTI/EXEC against the default
+// user. Under a default user with -@all it refused every replayed
+// transaction ("NOPERM ... AOF-loading-client"), so a restart dropped all
+// metadata JuiceFS wrote in transactions since the last AOF rewrite. The
+// worker this package provisions writes such transactions, a Lua script
+// and plain commands; all of them must survive a restart under StaticACL,
+// and the default user must still refuse to log in.
+func TestBackendAOFReplayKeepsTransactions(t *testing.T) {
+	f := newBackendFixture(t)
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.CommandContext(f.ctx, binary, "-test.run=^TestBackendProcessChild$", "-test.v")
+	cmd.Env = append(os.Environ(), "JM_BACKEND_CASE=seed", "JM_BACKEND_DIR="+f.dir)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("owned seed process: %v\n%s", err, output)
+	}
+	uri, err := os.ReadFile(filepath.Join(f.dir, "worker.url"))
+	if err != nil {
+		t.Fatal("fixture worker credential unavailable")
+	}
+	options, err := redis.ParseURL(string(uri))
+	if err != nil {
+		t.Fatal("invalid worker metadata URL")
+	}
+	options.MaxRetries, options.DisableIdentity, options.PoolSize = -1, true, 1
+	worker := redis.NewClient(options)
+	// Shaped like JuiceFS metadata writes: a WATCHed transaction, a
+	// transaction in database 1 (Redis logs the SELECT inside the MULTI),
+	// a two-write Lua script, and a plain write after them.
+	err = worker.Watch(f.ctx, func(tx *redis.Tx) error {
+		_, err := tx.TxPipelined(f.ctx, func(p redis.Pipeliner) error {
+			p.HSet(f.ctx, "d1", "name", "ino")
+			p.Set(f.ctx, "i1", "attr", 0)
+			p.LPush(f.ctx, "q", "job")
+			return nil
+		})
+		return err
+	}, "i1")
+	if err != nil {
+		t.Fatalf("worker transaction: %v", err)
+	}
+	if err := worker.Set(f.ctx, "plain", "1", 0).Err(); err != nil {
+		t.Fatalf("worker SET: %v", err)
+	}
+	db1 := *options
+	db1.DB = 1
+	worker1 := redis.NewClient(&db1)
+	if _, err := worker1.TxPipelined(f.ctx, func(p redis.Pipeliner) error {
+		p.Set(f.ctx, "db1a", "1", 0)
+		p.Set(f.ctx, "db1b", "2", 0)
+		return nil
+	}); err != nil {
+		t.Fatalf("worker database-1 transaction: %v", err)
+	}
+	if err := worker1.Eval(f.ctx, "redis.call('SET','lua2a','x'); redis.call('SET','lua2b','1')", nil).Err(); err != nil && err != redis.Nil {
+		t.Fatalf("worker Lua script: %v", err)
+	}
+	if err := worker1.IncrBy(f.ctx, "nextchunk", 4096).Err(); err != nil {
+		t.Fatalf("worker INCRBY: %v", err)
+	}
+	_ = worker.Close()
+	_ = worker1.Close()
+
+	f.stop()
+	f.start()
+
+	admin := f.admin()
+	defer admin.Close()
+	admin1 := redis.NewClient(&redis.Options{Network: "unix", Addr: f.cfg.Socket, Username: ControlUser, Password: f.secret, DB: 1,
+		MaxRetries: -1, Protocol: 2, DisableIdentity: true, ContextTimeoutEnabled: true, ReadTimeout: time.Second, WriteTimeout: time.Second})
+	defer admin1.Close()
+	for _, c := range []struct {
+		client    *redis.Client
+		key, want string
+	}{
+		{admin, "plain", "1"}, {admin, "i1", "attr"}, {admin1, "db1a", "1"}, {admin1, "db1b", "2"},
+		{admin1, "lua2a", "x"}, {admin1, "lua2b", "1"}, {admin1, "nextchunk", "4096"},
+	} {
+		if got, err := c.client.Get(f.ctx, c.key).Result(); err != nil || got != c.want {
+			t.Errorf("%s after restart = %q (%v), want %q", c.key, got, err, c.want)
+		}
+	}
+	if got, err := admin.HGet(f.ctx, "d1", "name").Result(); err != nil || got != "ino" {
+		t.Errorf("transaction HSET lost on restart: %q (%v)", got, err)
+	}
+	if n, err := admin.LLen(f.ctx, "q").Result(); err != nil || n != 1 {
+		t.Errorf("transaction LPUSH lost on restart: %d (%v)", n, err)
+	}
+	if n, err := admin.Exists(f.ctx, "nextchunk").Result(); err != nil || n != 0 {
+		t.Errorf("plain write after a database-1 transaction replayed into database 0")
+	}
+	if log, _ := os.ReadFile(filepath.Join(f.dir, "server.log")); bytes.Contains(log, []byte("AOF-loading-client")) {
+		t.Errorf("Redis refused a command while loading the AOF:\n%s", log)
+	}
+
+	// The default user is off: no unauthenticated command and no login.
+	anon := redis.NewClient(&redis.Options{Network: "unix", Addr: f.cfg.Socket, MaxRetries: -1, Protocol: 2, DisableIdentity: true})
+	defer anon.Close()
+	if err := anon.Ping(f.ctx).Err(); err == nil || !strings.Contains(err.Error(), "NOAUTH") {
+		t.Errorf("unauthenticated PING = %v, want NOAUTH", err)
+	}
+	asDefault := redis.NewClient(&redis.Options{Network: "unix", Addr: f.cfg.Socket, Username: "default", Password: "x", MaxRetries: -1, Protocol: 2, DisableIdentity: true})
+	defer asDefault.Close()
+	if err := asDefault.Ping(f.ctx).Err(); err == nil {
+		t.Error("logging in as default succeeded")
+	}
+	// The fence's own check of the default user accepts the restarted
+	// server's effective ACL.
+	fence := &Fence{cfg: f.cfg}
+	fence.client = redis.NewClient(&redis.Options{Network: "unix", Addr: f.cfg.Socket, Username: ControlUser, Password: f.secret,
+		MaxRetries: -1, Protocol: 2, DisableIdentity: true, PoolSize: 1})
+	fence.conn = fence.client.Conn()
+	defer fence.Freeze()
+	if err := fence.acl(f.ctx, "default", false, "", defaultCommands); err != nil {
+		t.Error("fence rejects the default user StaticACL loads")
+	}
 }
