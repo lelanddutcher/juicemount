@@ -27,7 +27,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/fs"
 	"log"
 	"net"
 	"net/http"
@@ -911,35 +910,25 @@ func pathWithin(p, root string) bool {
 	return strings.HasPrefix(p, strings.TrimSuffix(root, string(filepath.Separator))+string(filepath.Separator))
 }
 
-// resolveFileDestPath cleans an absolute path and resolves symlinks in
-// the longest prefix that exists, so a not-yet-created leaf under a
-// symlinked directory still resolves to where it will really be
-// written. A dangling symlink is refused: its target is unknown.
+// resolveFileDestPath cleans an absolute path, then resolves it with
+// walkPhysicalPath, the shared resolver: symlinks are followed, and a
+// not-yet-created leaf under a symlinked directory resolves to where it
+// will really be written. A dangling symlink is refused: its target is
+// unknown. The text is cleaned first (unlike pathAllowed), because the
+// stored destination path is the cleaned one.
 func resolveFileDestPath(p string) (string, error) {
 	p = strings.TrimSpace(p)
 	if !filepath.IsAbs(p) {
 		return "", errors.New("file path must be absolute")
 	}
-	existing := filepath.Clean(p)
-	rest := ""
-	for {
-		resolved, err := filepath.EvalSymlinks(existing)
-		if err == nil {
-			return filepath.Join(resolved, rest), nil
-		}
-		if !errors.Is(err, fs.ErrNotExist) {
-			return "", fmt.Errorf("resolve path: %w", err)
-		}
-		if _, lerr := os.Lstat(existing); lerr == nil {
-			return "", fmt.Errorf("path contains a dangling symlink at %s", existing)
-		}
-		parent := filepath.Dir(existing)
-		if parent == existing {
-			return filepath.Join(existing, rest), nil
-		}
-		rest = filepath.Join(filepath.Base(existing), rest)
-		existing = parent
+	if len(p) > maxResolvePathBytes {
+		return "", fmt.Errorf("file path longer than %d bytes", maxResolvePathBytes)
 	}
+	resolved, err := walkPhysicalPath(filepath.Clean(p), false)
+	if err != nil {
+		return "", fmt.Errorf("resolve path: %w", err)
+	}
+	return resolved, nil
 }
 
 // confineDestination applies the same root check the ad-hoc Out

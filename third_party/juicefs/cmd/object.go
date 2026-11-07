@@ -288,6 +288,24 @@ type mEntry struct {
 
 // readDirSorted reads the directory named by dirname and returns
 // a sorted list of directory entries.
+// jmSkippableLink reports whether a followed link failed for a reason that
+// is permanent and means "no target in this volume": the target does not
+// exist (ENOENT, ENOTDIR), or it is absolute or a URL, which this backend
+// never follows (pkg/fs doResolve returns ENOTSUP; confirmed here by
+// reading the link). Any other error (EIO, ELOOP, ...) is not skippable:
+// it keeps upstream's handling and fails the sync.
+func jmSkippableLink(j *juiceFS, p string, err syscall.Errno) bool {
+	switch err {
+	case syscall.ENOENT, syscall.ENOTDIR:
+		return true
+	case syscall.ENOTSUP:
+		target, rerr := j.jfs.Readlink(ctx, p)
+		t := string(target)
+		return rerr == 0 && (strings.HasPrefix(t, "/") || strings.Contains(t, "://"))
+	}
+	return false
+}
+
 func (j *juiceFS) readDirSorted(dirname string, followLink bool) ([]*mEntry, syscall.Errno) {
 	f, err := j.jfs.Open(ctx, dirname, 0)
 	if err != 0 {
@@ -298,24 +316,31 @@ func (j *juiceFS) readDirSorted(dirname string, followLink bool) ([]*mEntry, sys
 	if err != 0 {
 		return nil, err
 	}
-	mEntries := make([]*mEntry, len(entries))
-	for i, e := range entries {
+	mEntries := make([]*mEntry, 0, len(entries))
+	for _, e := range entries {
 		fi := fs.AttrToFileInfo(e.Inode, e.Attr)
 		if fi.IsDir() {
-			mEntries[i] = &mEntry{fi, string(e.Name) + dirSuffix, false}
+			mEntries = append(mEntries, &mEntry{fi, string(e.Name) + dirSuffix, false})
 		} else if fi.IsSymlink() && followLink {
 			fi2, err := j.jfs.Stat(ctx, path.Join(dirname, string(e.Name)))
+			if err != 0 && jmSkippableLink(j, path.Join(dirname, string(e.Name)), err) {
+				// JuiceMount: a link that can never be followed in the
+				// volume is skipped with a warning instead of failing the
+				// copy of the whole tree. The Manager counts this line.
+				logger.Warnf("skipped symlink %q that cannot be followed in the volume: %s", path.Join(dirname, string(e.Name)), err)
+				continue
+			}
 			if err != 0 {
-				mEntries[i] = &mEntry{fi, string(e.Name), true}
+				mEntries = append(mEntries, &mEntry{fi, string(e.Name), true})
 				continue
 			}
 			name := string(e.Name)
 			if fi2.IsDir() {
 				name += dirSuffix
 			}
-			mEntries[i] = &mEntry{fi2, name, false}
+			mEntries = append(mEntries, &mEntry{fi2, name, false})
 		} else {
-			mEntries[i] = &mEntry{fi, string(e.Name), fi.IsSymlink()}
+			mEntries = append(mEntries, &mEntry{fi, string(e.Name), fi.IsSymlink()})
 		}
 	}
 	sort.Slice(mEntries, func(i, j int) bool { return mEntries[i].name < mEntries[j].name })
