@@ -125,6 +125,16 @@ jobs:
           docker compose -f server/docker-compose.yml config --quiet
           docker compose -f server/docker-compose.yml -f server/docker-compose.link.yml config --quiet
           bash server/scripts/update-server.test.sh
+      - name: Redis replays transactions from its AOF under the shipped ACL
+        run: bash server/scripts/redis-aof-acl.test.sh
+      - name: Redis AOF is compacted before a restart, so no refused transaction replays
+        run: bash server/scripts/redis-compact.test.sh
+      # No JM_*_DIGEST in this step's environment: rollout-compose.sh refuses
+      # shell digest overrides.
+      - name: Compose rollout and topology tests (fake docker)
+        run: |
+          bash server/scripts/rollout-compose.test.sh
+          bash server/scripts/rollout-compose-proxy.test.sh
 
   mac-app:
     runs-on: macos-26
