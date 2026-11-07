@@ -66,6 +66,11 @@ or farm workers.
 
 ### Server
 
+- The object store image is now SILO (`pgsty/silo`, multi-arch, pinned by
+  digest), a maintained community fork of MinIO. The `minio/minio` image that
+  0.5.0 pinned can no longer be pulled, so fresh installs failed. SILO keeps
+  the S3 API, the `MINIO_*` settings, `mc` and the on-disk format: an existing
+  server keeps its bucket data, and the service is still named `minio`.
 - Restarting the metadata Redis no longer loses recent file changes. Redis
   rebuilds its data at start by replaying its append-only file. In 0.5.0 the
   Redis ACL made it refuse every replayed transaction, and JuiceFS writes
@@ -106,13 +111,24 @@ or farm workers.
   open it, and refuse a path that leads outside. Details are in this
   repository's GitHub security advisories.
 - Migrations and backups run the JuiceFS copy confined to the folders they
-  copy between. The Manager image ships a JuiceFS build (`-jm2`) whose local
+  copy between. The Manager image ships a JuiceFS build (`-jm3`) whose local
   folder backend cannot open anything outside the folder it was given.
   Symlinks are copied as symlinks only into the volume. A symlink that cannot
   be followed inside the folder being copied (for example an absolute macOS
   path such as `/Volumes/Media/clip.mov`) is skipped, and the job reports how
   many it skipped and names the first few. Before, such a link could make a
   backup copy files from outside the volume, or fail the whole job.
+- A migration into the volume stays inside the projects it has checked out.
+  Before, a symlink in one project could lead the copy into another project
+  without that project's lease. Now such a write is refused and the job
+  fails. A symlink whose target leaves its project is not copied: it is
+  skipped and reported like the other skipped links. A destination that
+  leads into another project through a symlink is refused. A symlink at the
+  project level itself, or above it, is neither followed nor copied.
+  Symlinks that stay inside one project work as before. A migration into
+  the volume now needs the JuiceFS build the Manager image ships (`-jm3`);
+  with any other `juicefs` it is refused. Details are in this repository's
+  GitHub security advisories.
 - A sync request with an unknown direction is refused. Before, a request
   naming a saved destination skipped the source check.
 - These checks need Linux 5.6 or later, and a Docker seccomp profile that

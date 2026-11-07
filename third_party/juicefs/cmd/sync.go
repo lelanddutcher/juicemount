@@ -489,6 +489,11 @@ func doSync(c *cli.Context) error {
 	if err != nil {
 		return err
 	}
+	// JuiceMount: keep the destination's writes inside their project
+	// (patch 0017, jm_fence.go).
+	if dst, err = jmProjectFence(dst); err != nil {
+		return err
+	}
 	defer func() {
 		object.Shutdown(src)
 		object.Shutdown(dst)

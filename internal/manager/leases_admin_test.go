@@ -117,7 +117,7 @@ func fakeJuicefs(t *testing.T) (bin, marker string) {
 	dir := t.TempDir()
 	marker = filepath.Join(dir, "juicefs-ran")
 	bin = filepath.Join(dir, "juicefs")
-	script := "#!/bin/sh\n" + stockVersionAnswer + "touch '" + marker + "'\nexit 0\n"
+	script := "#!/bin/sh\n" + fencedVersionAnswer + "touch '" + marker + "'\nexit 0\n"
 	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -129,6 +129,7 @@ func fakeJuicefs(t *testing.T) (bin, marker string) {
 // writes anything. A project another principal holds refuses the whole
 // operation: no juicefs sync process starts, no file moves.
 func TestH8BManagerSyncRefusedOnLeasedProject(t *testing.T) {
+	skipUnlessVolumeSyncPlatform(t)
 	t.Run("sync into a held project", func(t *testing.T) {
 		bin, marker := fakeJuicefs(t)
 		fake := &fakeLeaseClient{held: map[string]string{"path:/data/Scott Adams": "edit-bay-2@Edit-Bay-2"}}
@@ -178,7 +179,7 @@ func TestH8BManagerSyncRefusedOnLeasedProject(t *testing.T) {
 	t.Run("sync into a free project checks out, runs, releases", func(t *testing.T) {
 		bin, marker := fakeJuicefs(t)
 		fake := &fakeLeaseClient{held: map[string]string{}}
-		spec := RunSyncSpec{Mode: ModeStandalone, MetaURL: "redis://m@p:6379/1", VolName: "zpool", Leases: NewProjectLeaser(fake)}
+		spec := RunSyncSpec{Mode: ModeStandalone, MetaURL: "redis://m@p:6379/1", VolName: "zpool", Leases: NewProjectLeaser(fake), SourceRoots: []string{os.TempDir()}}
 		_ = RunSync(context.Background(), bin, spec, t.TempDir(), "/jfs/data/Free/x", DefaultSyncOptions(), nil, make(chan ProgressEvent, 64))
 		if _, err := os.Stat(marker); err != nil {
 			t.Fatal("juicefs sync did not run for a free project")
@@ -225,9 +226,10 @@ func TestH8BManagerSyncRefusedOnLeasedProject(t *testing.T) {
 // deployed, the proxy answers JM.LEASE with "unknown command". Sync must
 // still run then (passthrough), not wedge every migration.
 func TestH8BLeaseUnsupportedProceeds(t *testing.T) {
+	skipUnlessVolumeSyncPlatform(t)
 	bin, marker := fakeJuicefs(t)
 	spec := RunSyncSpec{Mode: ModeStandalone, MetaURL: "redis://m@p:6379/1", VolName: "zpool",
-		Leases: NewProjectLeaser(&unsupportedLeases{})}
+		Leases: NewProjectLeaser(&unsupportedLeases{}), SourceRoots: []string{os.TempDir()}}
 	_ = RunSync(context.Background(), bin, spec, t.TempDir(), "/jfs/data/P/x", DefaultSyncOptions(), nil, make(chan ProgressEvent, 64))
 	if _, err := os.Stat(marker); err != nil {
 		t.Fatal("sync did not run when the proxy has no lease service")

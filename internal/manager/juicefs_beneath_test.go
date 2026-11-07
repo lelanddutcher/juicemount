@@ -335,17 +335,19 @@ func TestJuicefsSwapDuringCopyIsRefused(t *testing.T) {
 
 // In-volume links that stay beneath the root keep working: a relative
 // link in the destination is written through, and one in an In source is
-// copied as a link (--links into the volume).
+// copied as a link (--links into the volume). The destination is a project
+// folder (/data/<P>): above project depth a symlink is never followed and
+// a link is not stored (lease_links_test.go).
 func TestJuicefsLinksInsideTheRootKeepWorking(t *testing.T) {
 	bin := realJuicefsBin(t)
 	l := newSyncLayout(t)
-	dest := filepath.Join(l.fuse, "dest")
+	dest := filepath.Join(l.fuse, "data", "dest")
 	mustMkdir(t, filepath.Join(dest, "real"))
 	mustLink(t, "real", filepath.Join(dest, "alias"))
 	src := filepath.Join(l.host, "in")
 	mustWrite(t, filepath.Join(src, "alias/payload.txt"), "payload")
 	mustLink(t, "alias/payload.txt", filepath.Join(src, "rel-link"))
-	if err := l.run(t, bin, src, "/jfs/dest", DefaultSyncOptions()); err != nil {
+	if err := l.run(t, bin, src, "/jfs/data/dest", DefaultSyncOptions()); err != nil {
 		t.Fatalf("RunSync: %v", err)
 	}
 	if b, err := os.ReadFile(filepath.Join(dest, "real/payload.txt")); err != nil || string(b) != "payload" {

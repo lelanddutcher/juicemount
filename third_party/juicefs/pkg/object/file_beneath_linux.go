@@ -37,11 +37,62 @@ import (
 // errNoOpenat2.
 //
 // The root path itself is trusted: it is the folder the caller named.
+//
+// With a project depth d > 0 (patch 0017, JMSetProjectDepth), the first d
+// components of every path name its project folder. They are resolved from
+// the root with RESOLVE_NO_SYMLINKS (real folders only), and the rest of
+// the path is resolved beneath that project folder, so a symlink inside one
+// project cannot lead a write into another. A path of d components or
+// fewer is resolved with RESOLVE_NO_SYMLINKS throughout. A refusal unwraps
+// to EXDEV (ErrOutsideProject).
 type beneathOps struct {
 	base string // clean absolute root folder
 
 	mu     sync.Mutex
 	rootFd int // -1 until opened
+
+	projOn    bool // the project fence is set (patch 0017)
+	projDepth int  // > 0: project folders are this many levels below the root
+}
+
+func (b *beneathOps) setProjectDepth(d int) {
+	b.mu.Lock()
+	b.projOn, b.projDepth = true, d
+	b.mu.Unlock()
+}
+
+func (b *beneathOps) projectOn() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.projOn
+}
+
+// parentNoLinks is parent for a new symlink under the project fence: the
+// parent folder is resolved from the root through real folders only, so
+// the link's place in the tree is the one its key names (the caller
+// checked the link's target against that place).
+func (b *beneathOps) parentNoLinks(op, p string) (int, string, error) {
+	r, err := b.rel(op, p)
+	if err != nil {
+		return -1, "", err
+	}
+	rootFd, err := b.root(true)
+	if err != nil {
+		return -1, "", err
+	}
+	if r == "." {
+		return -1, "", &os.PathError{Op: op, Path: p, Err: unix.EEXIST}
+	}
+	dir, name := filepath.Split(r)
+	dir = strings.TrimSuffix(dir, "/")
+	if dir == "" {
+		dir = "."
+	}
+	fd, err := b.resolveAt(op, p, rootFd, dir, unix.O_PATH|unix.O_DIRECTORY, 0, unix.RESOLVE_NO_SYMLINKS)
+	if err != nil {
+		return -1, "", err
+	}
+	return fd, name, nil
 }
 
 // errNoOpenat2 is returned when the kernel cannot confine paths.
@@ -138,20 +189,56 @@ func (b *beneathOps) openat2(op, p string, flags uint64, mode uint32, create boo
 	if err != nil {
 		return -1, err
 	}
+	b.mu.Lock()
+	depth := b.projDepth
+	b.mu.Unlock()
+	if depth <= 0 || r == "." {
+		return b.resolveAt(op, p, rootFd, r, flags, mode, 0)
+	}
+	parts := strings.Split(r, "/")
+	if len(parts) <= depth {
+		return b.resolveAt(op, p, rootFd, r, flags, mode, unix.RESOLVE_NO_SYMLINKS)
+	}
+	projFd, err := b.resolveAt(op, p, rootFd, strings.Join(parts[:depth], "/"), unix.O_PATH|unix.O_DIRECTORY, 0, unix.RESOLVE_NO_SYMLINKS)
+	if err != nil {
+		return -1, err
+	}
+	defer unix.Close(projFd)
+	return b.resolveAt(op, p, projFd, strings.Join(parts[depth:], "/"), flags, mode, 0)
+}
+
+// resolveAt is one openat2 beneath dirFd, retried on EAGAIN/EINTR. With
+// extra (project fence), a symlink the kernel refuses (ELOOP) or a ".."
+// above dirFd is reported as ErrOutsideProject.
+func (b *beneathOps) resolveAt(op, p string, dirFd int, r string, flags uint64, mode uint32, extra uint64) (int, error) {
 	for try := 1; ; try++ {
-		fd, err := openat2Func(rootFd, r, &unix.OpenHow{
+		fd, err := openat2Func(dirFd, r, &unix.OpenHow{
 			Flags:   flags | unix.O_CLOEXEC,
 			Mode:    uint64(mode),
-			Resolve: unix.RESOLVE_BENEATH | unix.RESOLVE_NO_MAGICLINKS,
+			Resolve: unix.RESOLVE_BENEATH | unix.RESOLVE_NO_MAGICLINKS | extra,
 		})
 		if (errors.Is(err, unix.EAGAIN) || errors.Is(err, unix.EINTR)) && try < maxOpenat2Tries {
 			continue // a concurrent rename raced the lookup; retry
 		}
 		if err != nil {
+			if b.fenced(dirFd, extra) && (errors.Is(err, unix.EXDEV) || (extra != 0 && errors.Is(err, unix.ELOOP))) {
+				return -1, &os.PathError{Op: op, Path: p, Err: ErrOutsideProject}
+			}
 			return -1, b.pathErr(op, p, err)
 		}
 		return fd, nil
 	}
+}
+
+// fenced reports whether a resolution is one of the project fence's: from
+// a project folder, or with RESOLVE_NO_SYMLINKS added.
+func (b *beneathOps) fenced(dirFd int, extra uint64) bool {
+	if extra != 0 {
+		return true
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.projDepth > 0 && dirFd != b.rootFd
 }
 
 // parent opens the parent folder of p beneath the root and returns its fd
@@ -383,8 +470,18 @@ func (b *beneathOps) Lchtimes(p string, mtime time.Time) error {
 
 // Symlink stores a symlink with the given target text. The link is not
 // followed here; any later access through it is resolved beneath the root.
+//
+// Under the project fence its parent must be reached through real folders
+// only (parentNoLinks).
 func (b *beneathOps) Symlink(target, p string) error {
-	pfd, name, err := b.parent("symlink", p, true)
+	var pfd int
+	var name string
+	var err error
+	if b.projectOn() {
+		pfd, name, err = b.parentNoLinks("symlink", p)
+	} else {
+		pfd, name, err = b.parent("symlink", p, true)
+	}
 	if err != nil {
 		return err
 	}

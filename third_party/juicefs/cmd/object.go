@@ -122,6 +122,9 @@ func (j *juiceFS) Put(key string, in io.Reader, getters ...object.AttrGetter) (e
 		return fmt.Errorf("skip special file %s for jfs: %w", key, utils.ErrSkipped)
 	}
 	p := j.path(key)
+	if err := j.jmCheck("put", p, strings.HasSuffix(p, "/"), false); err != nil {
+		return err
+	}
 	if strings.HasSuffix(p, "/") {
 		eno := j.jfs.MkdirAll(ctx, p, 0777, j.umask)
 		return toError(eno)
@@ -184,6 +187,9 @@ func (j *juiceFS) Delete(key string, getters ...object.AttrGetter) error {
 		return nil
 	}
 	p := strings.TrimSuffix(j.path(key), dirSuffix)
+	if err := j.jmCheck("delete", p, false, false); err != nil {
+		return err
+	}
 	eno := j.jfs.Delete(ctx, p)
 	if eno == syscall.ENOENT {
 		eno = 0
@@ -348,6 +354,9 @@ func (j *juiceFS) readDirSorted(dirname string, followLink bool) ([]*mEntry, sys
 }
 
 func (j *juiceFS) Chtimes(key string, mtime time.Time) error {
+	if err := j.jmCheck("chtimes", j.path(key), false, false); err != nil {
+		return err
+	}
 	f, err := j.jfs.Lopen(ctx, j.path(key), 0)
 	if err != 0 {
 		return err
@@ -373,6 +382,9 @@ func syscallMode(i os.FileMode) (o uint32) {
 }
 
 func (j *juiceFS) Chmod(key string, mode os.FileMode) error {
+	if err := j.jmCheck("chmod", j.path(key), true, false); err != nil {
+		return err
+	}
 	f, err := j.jfs.Open(ctx, j.path(key), 0)
 	if err != 0 {
 		return err
@@ -387,6 +399,9 @@ func (j *juiceFS) Chown(key string, owner, group string) error {
 	if uid == -1 || gid == -1 {
 		return fmt.Errorf("user(%s):group(%s) not found", owner, group)
 	}
+	if err := j.jmCheck("chown", j.path(key), false, false); err != nil {
+		return err
+	}
 	f, err := j.jfs.Lopen(ctx, j.path(key), 0)
 	if err != 0 {
 		return err
@@ -397,6 +412,9 @@ func (j *juiceFS) Chown(key string, owner, group string) error {
 
 func (j *juiceFS) Symlink(oldName, newName string) error {
 	p := j.path(newName)
+	if err := j.jmCheck("symlink", p, false, true); err != nil {
+		return err
+	}
 	err := j.jfs.Symlink(ctx, oldName, p)
 	if err == syscall.ENOENT {
 		if err = j.jfs.MkdirAll(ctx, path.Dir(p), 0777, j.umask); err != 0 {

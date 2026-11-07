@@ -19,9 +19,10 @@ import (
 
 // Sync roots handed to juicefs.
 //
-// The juicefs the Manager ships (third_party/juicefs, patch 0016, version
-// suffix -jm2 or later) confines its file:// backend to the root folder it
-// is given. That only protects a root the backend opens itself. A root
+// The juicefs the Manager ships (third_party/juicefs, patches 0016 and
+// 0017, version suffix -jm3 or later) confines its file:// backend to the
+// root folder it is given, and keeps a volume destination's writes inside
+// their project folders (syncProjectDepth). That only protects a root the backend opens itself. A root
 // named by path is resolved by path, and every folder below the FUSE mount
 // is writable by Mac clients, so a folder on the way could be swapped for
 // a symlink between the Manager's check and juicefs's open.
@@ -41,14 +42,15 @@ import (
 //
 // --links is passed only into the volume (RunSync).
 //
-// With an older juicefs (no -jmN suffix, or N < 2), the Manager keeps the
-// previous behaviour: paths by name, no --links. It logs a warning once.
+// With an older juicefs (no -jmN suffix, or N < 3), the Manager refuses a
+// sync into the volume (RunSync). Other syncs keep the previous behaviour:
+// paths by name, no --links. It logs a warning once.
 // When the version cannot be read at all, the sync fails and the next one
 // asks again (juicefsConfinesFileRoots).
 
 // confiningJuicefsMin is the first build whose file:// backend resolves
-// beneath its root.
-const confiningJuicefsMin = 2
+// beneath its root (-jm2) and that has the project fence (-jm3).
+const confiningJuicefsMin = 3
 
 var jmSuffix = regexp.MustCompile(`-jm([0-9]+)\s*$`)
 
@@ -76,7 +78,8 @@ type juicefsProbe struct {
 // that says what was found, nothing is cached, and the next sync asks
 // again. Concurrent syncs share one running probe (single flight) instead
 // of each queuing behind it. A binary that answers with a stock version
-// (no -jmN suffix, or N < 2) gets the previous behaviour and one warning.
+// (no -jmN suffix, or N < 3) gets the previous behaviour, except that a
+// sync into the volume is refused (RunSync), and one warning.
 func juicefsConfinesFileRoots(bin string) (bool, error) {
 	if runtime.GOOS != "linux" {
 		return false, nil // the patch confines file roots on Linux only
@@ -109,7 +112,7 @@ func juicefsConfinesFileRoots(bin string) (bool, error) {
 	juicefsCapsMu.Unlock()
 	close(p.done)
 	if p.err == nil && !p.confined {
-		log.Printf("manager: WARNING: %q (version %q) does not confine file:// sync roots; syncs run without --links and pass roots by path. Install the juicefs built from third_party/juicefs (version suffix -jm%d or later).", bin, version, confiningJuicefsMin)
+		log.Printf("manager: WARNING: %q (version %q) does not confine file:// sync roots or keep writes inside a project; syncs into the volume are refused, other syncs run without --links and pass roots by path. Install the juicefs built from third_party/juicefs (version suffix -jm%d or later).", bin, version, confiningJuicefsMin)
 	}
 	return p.confined, p.err
 }
@@ -250,3 +253,57 @@ func openSyncRoots(spec RunSyncSpec, source, destination, srcURI, dstURI string,
 
 // errRootNotBeneath is returned when a root resolves outside its anchor.
 var errRootNotBeneath = errors.New("sync root resolves outside its permitted root (symlink)")
+
+// syncProjectDepth returns JM_SYNC_PROJECT_DEPTH for a sync into the
+// volume: the number of key components below the destination root that
+// name a project folder (projectDepth below the volume root). Zero or less
+// means the root is a project folder or inside one. The patched juicefs
+// then refuses a write that a symlink would carry into another project and
+// skips a link whose target leaves its project. Leases are taken per
+// project (checkoutForSync), so without this a symlink in one project could
+// lead the sync into a project it holds no lease on.
+//
+// In embedded mode the destination is the folder juicefs was handed (dst,
+// opened beneath the FUSE mount): its real place is read back from the open
+// fd, so a destination reached through a symlink is measured where it
+// really is. Its project folder must be the one the leases were taken for
+// (the destination's project by name), and above project depth it must be
+// the folder its name says; otherwise the sync is refused. In standalone
+// mode juicefs resolves the jfs:// path itself, including its prefix, and
+// checks the project of the path by name.
+//
+// fence is false only for a dry run into a missing destination, which
+// juicefs gets as an empty private folder outside the volume.
+func syncProjectDepth(spec RunSyncSpec, destination string, dst *os.File, dry bool) (depth int, fence bool, err error) {
+	named := strings.FieldsFunc(filepath.Clean("/"+strings.TrimPrefix(strings.TrimSpace(destination), volumeUserPrefix)), func(r rune) bool { return r == '/' })
+	if dst == nil {
+		return projectDepth - len(named), true, nil
+	}
+	real, err := os.Readlink("/proc/self/fd/" + strconv.Itoa(int(dst.Fd())))
+	if err != nil {
+		return 0, false, fmt.Errorf("read back the destination folder: %w", err)
+	}
+	mount, err := walkPhysicalPath(spec.FUSEMount, false)
+	if err != nil {
+		return 0, false, errors.New("cannot resolve the FUSE mount")
+	}
+	if !pathWithin(real, mount) {
+		if dry {
+			return 0, false, nil
+		}
+		return 0, false, fmt.Errorf("destination %s: %w", destination, errRootNotBeneath)
+	}
+	at := strings.FieldsFunc(strings.TrimPrefix(real, mount), func(r rune) bool { return r == '/' })
+	n := projectDepth
+	if len(named) < n {
+		n = len(named)
+	}
+	same := len(at) >= n
+	for i := 0; same && i < n; i++ {
+		same = at[i] == named[i]
+	}
+	if !same || (len(named) < projectDepth && len(at) != len(named)) {
+		return 0, false, fmt.Errorf("destination %s resolves (through a symlink) into a different project folder than its name; refused, because the sync holds only the leases of the named project", destination)
+	}
+	return projectDepth - len(at), true, nil
+}

@@ -35,7 +35,7 @@ func versionedJuicefs(t *testing.T, version string) (bin, argsFile, fdsFile stri
 }
 
 const (
-	jm2Version = "juicefs version 1.3.1+2025-12-02.e0032b2ae5e9-jm2"
+	jm3Version = "juicefs version 1.3.1+2025-12-02.e0032b2ae5e9-jm3"
 	jm1Version = "juicefs version 1.3.1+2025-12-02.e0032b2ae5e9-jm1"
 )
 
@@ -85,7 +85,7 @@ func TestRunSyncPassesOpenRootsAndLinksOnlyBetweenConfinedEnds(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			bin, argsFile, fdsFile := versionedJuicefs(t, jm2Version)
+			bin, argsFile, fdsFile := versionedJuicefs(t, jm3Version)
 			if err := RunSync(context.Background(), bin, c.spec, c.src, c.dst, DefaultSyncOptions(), nil, nil); err != nil {
 				t.Fatalf("RunSync: %v", err)
 			}
@@ -117,21 +117,23 @@ func TestRunSyncPassesOpenRootsAndLinksOnlyBetweenConfinedEnds(t *testing.T) {
 		})
 	}
 	// A host root outside every configured source root is refused.
-	bin, _, _ := versionedJuicefs(t, jm2Version)
+	bin, _, _ := versionedJuicefs(t, jm3Version)
 	if err := RunSync(context.Background(), bin, embedded, "/jfs/proj", l.outside, DefaultSyncOptions(), nil, nil); err == nil || !strings.Contains(err.Error(), "not under a configured source root") {
 		t.Errorf("Out to a folder outside the source roots: %v", err)
 	}
 }
 
-// An older juicefs (-jm1, or no suffix) keeps the previous behaviour:
-// roots by path, no --links, and one warning.
+// An older juicefs (-jm1 or -jm2, or no suffix) keeps the previous
+// behaviour: roots by path, no --links, and one warning. -jm2 confines
+// file:// roots but has no project fence (patch 0017), so it is not used
+// as a confining build.
 func TestRunSyncOlderJuicefsKeepsPathRoots(t *testing.T) {
 	l := newSyncLayout(t)
 	mustWrite(t, filepath.Join(l.fuse, "proj/a.txt"), "a")
 	var buf bytes.Buffer
 	log.SetOutput(&buf)
 	t.Cleanup(func() { log.SetOutput(os.Stderr) })
-	for _, v := range []string{jm1Version, "juicefs version 1.3.1+2025-12-02.e0032b2ae5e9"} {
+	for _, v := range []string{jm1Version, "juicefs version 1.3.1+2025-12-02.e0032b2ae5e9-jm2", "juicefs version 1.3.1+2025-12-02.e0032b2ae5e9"} {
 		bin, argsFile, _ := versionedJuicefs(t, v)
 		for i := 0; i < 2; i++ {
 			if err := RunSync(context.Background(), bin, l.spec(), "/jfs/proj", filepath.Join(l.host, "out"), DefaultSyncOptions(), nil, nil); err != nil {
@@ -166,11 +168,24 @@ func TestPreserveStructureOffCopiesContentsIntoDestination(t *testing.T) {
 		{filepath.Join(l.host, "photos"), "/jfs", "file://" + filepath.Join(l.host, "photos") + "/", "file://" + l.fuse + "/"},
 		{filepath.Join(l.host, "photos"), "/jfs/sub", "file://" + filepath.Join(l.host, "photos") + "/", "file://" + filepath.Join(l.fuse, "sub") + "/"},
 	} {
-		bin, argsFile, _ := versionedJuicefs(t, jm1Version) // paths by name, so the args show them
+		// Out: an older juicefs gets paths by name, so the args show them.
+		// Into the volume only -jm3 runs; its roots are open folders, so
+		// the args are where those folders are (fd 3 and 4).
+		version := jm1Version
+		if strings.HasPrefix(c.dst, "/jfs") {
+			version = jm3Version
+		}
+		bin, argsFile, fdsFile := versionedJuicefs(t, version)
 		if err := RunSync(context.Background(), bin, l.spec(), c.src, c.dst, opts, nil, nil); err != nil {
 			t.Fatalf("RunSync(%s -> %s): %v", c.src, c.dst, err)
 		}
 		args := lines(t, argsFile)
+		if version == jm3Version {
+			args = nil
+			for _, fd := range lines(t, fdsFile) {
+				args = append(args, "file://"+fd+"/")
+			}
+		}
 		if got := args[len(args)-2]; got != c.wantSrc {
 			t.Errorf("%s -> %s: source arg %q, want %q", c.src, c.dst, got, c.wantSrc)
 		}
@@ -290,7 +305,7 @@ func TestJuicefsRootSwapRace(t *testing.T) {
 }
 
 // probeFake writes a stand-in juicefs whose first --version answer runs
-// first (a shell snippet); later answers print the -jm2 line. Every
+// first (a shell snippet); later answers print the -jm3 line. Every
 // --version call is recorded in calls; a sync records its arguments.
 func probeFake(t *testing.T, first string) (bin, argsFile, calls string) {
 	t.Helper()
@@ -299,7 +314,7 @@ func probeFake(t *testing.T, first string) (bin, argsFile, calls string) {
 	count := filepath.Join(dir, "count")
 	script := "#!/bin/sh\nif [ \"$1\" = --version ]; then\n  echo x >> '" + calls + "'\n" +
 		"  if [ ! -e '" + count + "' ]; then touch '" + count + "'; " + first + "; fi\n" +
-		"  echo '" + jm2Version + "'; exit 0\nfi\n" +
+		"  echo '" + jm3Version + "'; exit 0\nfi\n" +
 		"printf '%s\\n' \"$@\" > '" + argsFile + "'\nexit 0\n"
 	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
@@ -315,7 +330,7 @@ func shortProbeTimeout(t *testing.T) {
 
 // A failed, slow or noisy `juicefs --version` is not cached as "not
 // confined": the sync fails with a message that says what was found, and
-// the next sync asks again. A -jm2 line followed by any other output is
+// the next sync asks again. A -jm3 line followed by any other output is
 // unknown too (it used to parse as stock and run unconfined).
 func TestJuicefsVersionProbeRetriesAfterFailure(t *testing.T) {
 	shortProbeTimeout(t)
@@ -325,7 +340,7 @@ func TestJuicefsVersionProbeRetriesAfterFailure(t *testing.T) {
 		{"exit 3", "failed (exit status 3)"},
 		{"sleep 3", "did not answer within"},
 		{"echo garbage; exit 0", `printed "garbage"`},
-		{"echo '" + jm2Version + "'; echo 'note: wrapper'; exit 0", "not a single"},
+		{"echo '" + jm3Version + "'; echo 'note: wrapper'; exit 0", "not a single"},
 	} {
 		t.Run(c.first, func(t *testing.T) {
 			bin, argsFile, _ := probeFake(t, c.first)

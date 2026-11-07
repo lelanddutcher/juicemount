@@ -878,7 +878,7 @@ func worker(tasks <-chan object.Object, src, dst object.ObjectStorage, config *C
 			var srcChksum uint32
 
 			if config.Links && obj.IsSymlink() {
-				if err = copyLink(src, dst, key); err != nil {
+				if err = copyLink(src, dst, key); err != nil && !errors.Is(err, utils.ErrSkipped) {
 					logger.Errorf("copy link failed: %s", err)
 				}
 			} else {
@@ -953,6 +953,9 @@ func copyLink(src object.ObjectStorage, dst object.ObjectStorage, key string) er
 	if p, err := src.(object.SupportSymlink).Readlink(key); err != nil {
 		return err
 	} else {
+		if err := jmCheckLink(src, key, p); err != nil {
+			return err
+		}
 		if err := dst.Delete(key); err != nil {
 			logger.Debugf("Deleted %s from %s ", key, dst)
 			return err

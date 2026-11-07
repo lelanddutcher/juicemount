@@ -23,12 +23,18 @@ import (
 // arguments, one per line, in the returned file, runs body, and exits 0.
 func recordingJuicefs(t *testing.T, body string) (bin, argsFile string) {
 	t.Helper()
+	return recordingJuicefsAs(t, stockVersionAnswer, body)
+}
+
+// recordingJuicefsAs is recordingJuicefs with a chosen --version answer.
+func recordingJuicefsAs(t *testing.T, versionAnswer, body string) (bin, argsFile string) {
+	t.Helper()
 	dir := t.TempDir()
 	argsFile = filepath.Join(dir, "args")
 	bin = filepath.Join(dir, "juicefs")
 	// Answers --version like a stock juicefs, so RunSync keeps roots by
 	// path (sync_roots.go) and the recorded arguments show them.
-	script := "#!/bin/sh\n" + stockVersionAnswer +
+	script := "#!/bin/sh\n" + versionAnswer +
 		"printf '%s\\n' \"$@\" > '" + argsFile + "'\n" + body + "\nexit 0\n"
 	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
@@ -50,13 +56,14 @@ func readArgs(t *testing.T, argsFile string) []string {
 // swapped for a symlink during the sync must not lead it outside the
 // volume, and a normal destination must still get the client mode.
 func TestPostSyncPermissionsSurviveDestinationSwap(t *testing.T) {
+	skipUnlessVolumeSyncPlatform(t)
 	f := newConfineFixture(t)
 	outRoot := filepath.Join(f.outside, "root")
 	outFile := filepath.Join(outRoot, "inner.txt")
 	if err := os.Chmod(outFile, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	spec := RunSyncSpec{Mode: ModeEmbedded, FUSEMount: f.fuse, OwnerUID: os.Getuid(), OwnerGID: os.Getgid()}
+	spec := RunSyncSpec{Mode: ModeEmbedded, FUSEMount: f.fuse, OwnerUID: os.Getuid(), OwnerGID: os.Getgid(), SourceRoots: []string{f.src}}
 	unchanged := func(when string) {
 		t.Helper()
 		for p, want := range map[string]os.FileMode{outRoot: 0o700, outFile: 0o600} {
@@ -70,7 +77,11 @@ func TestPostSyncPermissionsSurviveDestinationSwap(t *testing.T) {
 		if err := os.MkdirAll(folder, 0o755); err != nil {
 			t.Fatal(err)
 		}
-		bin, _ := recordingJuicefs(t, "rm -rf '"+folder+"' && ln -s '"+outRoot+"' '"+folder+"'")
+		answer := fencedVersionAnswer // into the volume
+		if strings.HasPrefix(dest, "file://") {
+			answer = stockVersionAnswer
+		}
+		bin, _ := recordingJuicefsAs(t, answer, "rm -rf '"+folder+"' && ln -s '"+outRoot+"' '"+folder+"'")
 		if err := RunSync(context.Background(), bin, spec, f.src, dest, DefaultSyncOptions(), nil, nil); err != nil {
 			t.Fatalf("RunSync to %s: %v", dest, err)
 		}
@@ -84,7 +95,7 @@ func TestPostSyncPermissionsSurviveDestinationSwap(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(good, "f.txt"), []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	bin, _ := recordingJuicefs(t, "")
+	bin, _ := recordingJuicefsAs(t, fencedVersionAnswer, "")
 	if err := RunSync(context.Background(), bin, spec, f.src, "/jfs/good", DefaultSyncOptions(), nil, nil); err != nil {
 		t.Fatalf("RunSync to /jfs/good: %v", err)
 	}
@@ -345,3 +356,8 @@ func TestWalkPhysicalPath(t *testing.T) {
 // stockVersionAnswer makes a stand-in juicefs answer --version like the
 // stock juicefs (no -jmN suffix), as RunSync asks before every sync.
 const stockVersionAnswer = "if [ \"$1\" = --version ]; then echo 'juicefs version 1.3.1+2025-12-02.e0032b2a'; exit 0; fi\n"
+
+// fencedVersionAnswer answers like the juicefs built from third_party/juicefs
+// (-jm3): RunSync then hands it open roots and the project fence. A sync
+// into the volume needs it; an older juicefs is refused there.
+const fencedVersionAnswer = "if [ \"$1\" = --version ]; then echo 'juicefs version 1.3.1+2025-12-02.e0032b2ae5e9-jm3'; exit 0; fi\n"
