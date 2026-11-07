@@ -5,7 +5,12 @@
 # of the secret. Plaintext secrets never appear in this file, in argv, or in
 # the rendered file.
 #
-#   default   off: no unauthenticated access at all.
+#   default   off: no unauthenticated access at all, and no one can log in
+#             as it. It still holds every permission, because Redis checks a
+#             transaction replayed from the append-only file at start against
+#             this user: with -@all it refused every replayed MULTI/EXEC, so a
+#             restart dropped the metadata written since the last AOF rewrite.
+#             server/scripts/redis-aof-acl.test.sh pins this.
 #   jm-proxy  the RESP proxy's upstream login. All commands, all keys and all
 #             channels: Redis 7 defaults to resetchannels, and the Mac's
 #             keyspace push (PSUBSCRIBE) passes through the proxy.
@@ -15,6 +20,6 @@
 #
 # Severity-3 rollback (rollout-compose.sh --proxy-rollback) appends one plain
 # user per proxy principal after these lines.
-user default off resetpass resetkeys resetchannels -@all
+user default off resetpass resetkeys resetchannels ~* &* +@all
 user jm-proxy on #@JM_REDIS_PROXY_PASSWORD_SHA256@ ~* &* +@all
 user jm-admin on #@JM_ADMIN_LOOPBACK_SHA256@ ~* &* +@all

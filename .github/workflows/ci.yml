@@ -43,7 +43,7 @@ jobs:
              | grep -vE "@[0-9a-f]{40}['\"]?([[:space:]]|$)" | grep -v 'docker://'; then
             echo "::error::pin the actions above to a full commit SHA"; exit 1
           fi
-      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
           cache: true
@@ -125,12 +125,14 @@ jobs:
           docker compose -f server/docker-compose.yml config --quiet
           docker compose -f server/docker-compose.yml -f server/docker-compose.link.yml config --quiet
           bash server/scripts/update-server.test.sh
+      - name: Redis replays transactions from its AOF under the shipped ACL
+        run: bash server/scripts/redis-aof-acl.test.sh
 
   mac-app:
     runs-on: macos-26
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
           cache: true
