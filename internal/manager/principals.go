@@ -634,6 +634,11 @@ type PrincipalStore struct {
 	people        map[string]*Person
 	proxyFormat   int
 	peopleWritten bool
+	// proxyDirty: the proxy files or the reload signal may not match the
+	// store (a restore after a failed save failed, or the signal failed).
+	// The next commit rewrites and re-signals even if it changes nothing
+	// the proxy enforces.
+	proxyDirty bool
 	// restrictUnassigned: Macs with no person may not write. On from the
 	// first grant until an admin turns it off (people.go).
 	restrictUnassigned bool
@@ -1957,7 +1962,7 @@ func firstField(path string) string {
 // save puts the proxy files back, so the proxy never enforces a change the
 // store (on disk and, through the callers' undo, in memory) does not hold.
 func (s *PrincipalStore) commitLocked(proxyChanged bool) error {
-	if s.opts.ProxyDir != "" && proxyChanged {
+	if s.opts.ProxyDir != "" && (proxyChanged || s.proxyDirty) {
 		return s.writeProxyFilesThenLocked(s.saveStoreLocked)
 	}
 	return s.saveStoreLocked()
@@ -2098,6 +2103,7 @@ func (s *PrincipalStore) writeProxyFilesThenLocked(then func() error) error {
 				undo = nil
 			}
 			if undo != nil {
+				s.proxyDirty = true
 				log.Printf("manager: CRITICAL: %s could not be restored after %s: %v", p, why, undo)
 			}
 		}
@@ -2122,6 +2128,9 @@ func (s *PrincipalStore) writeProxyFilesThenLocked(then func() error) error {
 			return err
 		}
 	}
+	// Files and store now agree; only a failed signal below can leave the
+	// proxy behind.
+	s.proxyDirty = false
 	if s.opts.Signal != nil {
 		sum := sha256.Sum256(body)
 		sha := hex.EncodeToString(sum[:])
@@ -2142,6 +2151,7 @@ func (s *PrincipalStore) writeProxyFilesThenLocked(then func() error) error {
 		if err != nil {
 			// The file is already correct; the proxy picks it up at its next
 			// signal or restart. Report, do not undo.
+			s.proxyDirty = true
 			log.Printf("manager: principals written but proxy reload signal failed: %v", err)
 		}
 	}
