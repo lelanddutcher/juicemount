@@ -241,6 +241,20 @@ else
   pass "remote script never stops/rms/restarts redis/minio/juicefs"
 fi
 
+# Scripts that stop or recreate Redis must first compact its AOF
+# (server/scripts/lib/redis-compact.sh). This one needs no compaction only
+# because Redis is never among its targets: every stop, rm, restart, kill,
+# rename or start acts on a guarded farm/Manager name or its backup, and it
+# never runs Compose, which could recreate Redis as a dependency.
+UNGUARDED="$(cat "$SSH_STDIN" "$WORK/ssh-acquire" "$WORK/ssh-release" |
+  grep -E 'docker (stop|rm|restart|kill|rename|start|compose|run .*--restart)' |
+  grep -vE 'docker (stop|rm|start) "\$(name|backup)"|docker rename "\$(backup|name)" "\$(name|backup_name)"|^ *log ' || true)"
+if [ -z "$UNGUARDED" ]; then
+  pass "remote program never stops, recreates or composes Redis, so it needs no AOF compaction"
+else
+  fail "remote program has a container command that could reach Redis; route it through lib/redis-compact.sh:"$'\n'"$UNGUARDED"
+fi
+
 # =============================================================================
 echo "== test 3: local guard refuses protected container names =="
 : > "$CALLS"
