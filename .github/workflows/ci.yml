@@ -238,9 +238,19 @@ jobs:
       - name: The Manager answers with the printed key, and only with it
         run: |
           key="$(sed -n 's/^Sign-in key:  //p' "$RUNNER_TEMP/run1.out")"
-          printf 'X-JuiceMount-Admin-Key: %s\n' "$key" |
-            curl -fsS -H @- -o "$RUNNER_TEMP/principals.json" http://127.0.0.1:30190/api/principals
-          grep -Eq '"proxy_live": *true' "$RUNNER_TEMP/principals.json"
+          # The proxy acknowledges the Manager's first reload request at its
+          # next 2-second poll, so proxy_live turns true shortly after start.
+          live=0
+          for _ in $(seq 30); do
+            printf 'X-JuiceMount-Admin-Key: %s\n' "$key" |
+              curl -fsS -H @- -o "$RUNNER_TEMP/principals.json" http://127.0.0.1:30190/api/principals
+            if grep -Eq '"proxy_live": *true' "$RUNNER_TEMP/principals.json"; then live=1; break; fi
+            sleep 2
+          done
+          if [ "$live" != 1 ]; then
+            grep -Eo '"proxy_(live|problem)": *("[^"]*"|true|false)' "$RUNNER_TEMP/principals.json" || true
+            echo "::error::the Redis proxy never acknowledged the Manager"; exit 1
+          fi
           test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:30190/api/overview)" = 401
       - name: Second run changes nothing
         run: |
