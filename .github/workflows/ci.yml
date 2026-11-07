@@ -69,7 +69,7 @@ jobs:
           test "$("$RUNNER_TEMP/juicefs" --version)" = "$(sed -n 's/^ *"version_output": "\(.*\)",*$/\1/p' SOURCE.json)"
       - name: Vendored juicefs object-backend tests
         working-directory: third_party/juicefs
-        run: go test -count=1 ./pkg/object
+        run: go test -count=1 ./pkg/object && go test -count=1 -run TestJM ./pkg/sync
       - name: Unit and integration-safe tests
         env:
           JM_REQUIRE_GATE_HISTORY: '1'

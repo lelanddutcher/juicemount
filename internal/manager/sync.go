@@ -333,6 +333,17 @@ func RunSync(ctx context.Context, juicefsBin string, spec RunSyncSpec, source, d
 		// The patched juicefs then refuses any file:// root it would
 		// have to open by path (third_party/juicefs patch 0016).
 		modeEnv = append(modeEnv, "JM_FILE_ROOT_FD_ONLY=1")
+		// Into the volume: keep every write, and every link stored, inside
+		// its project folder (patch 0017; leases are per project).
+		if dr.volume {
+			depth, fence, err := syncProjectDepth(spec, destination, dr.file, opts.DryRun)
+			if err != nil {
+				return err
+			}
+			if fence {
+				modeEnv = append(modeEnv, "JM_SYNC_PROJECT_DEPTH="+strconv.Itoa(depth))
+			}
+		}
 	}
 	// --links only into the volume (In, Between): the destination is a
 	// confined volume root or a jfs:// volume, so a stored link resolves
@@ -487,7 +498,7 @@ func RunSync(ctx context.Context, juicefsBin string, spec RunSyncSpec, source, d
 	if report.SkippedLinks > 0 {
 		// The job's progress carries the count and the first names
 		// (skipped_links, skipped_link_sample); the log names them too.
-		log.Printf("manager: sync %s -> %s skipped %d symlink(s) that lead outside the sync root or cannot be followed (not copied); first: %s",
+		log.Printf("manager: sync %s -> %s skipped %d symlink(s) that lead outside the sync root or their project, or cannot be followed (not copied); first: %s",
 			source, destination, report.SkippedLinks, strings.Join(report.SkippedLinkSample, ", "))
 	}
 
@@ -820,8 +831,10 @@ func parseSyncProgress(r io.Reader, progress chan<- ProgressEvent) {
 // skippedLinkLine matches juicefs's warning for a symlink it skipped while
 // listing with links followed (third_party/juicefs patch 0016): the
 // confined file backend skips one that would leave the root, and the jfs://
-// backend one that cannot be followed in the volume (dangling).
-var skippedLinkLine = regexp.MustCompile(`skipped symlink "((?:[^"\\]|\\.)*)" that (?:leads outside the file storage root|cannot be followed in the volume)`)
+// backend one that cannot be followed in the volume (dangling). With
+// --links into the volume, a link whose target leaves the project it would
+// be stored in is skipped too (patch 0017).
+var skippedLinkLine = regexp.MustCompile(`skipped symlink "((?:[^"\\]|\\.)*)" that (?:leads outside the file storage root|cannot be followed in the volume|leads outside its project)`)
 
 // maxSkippedLinkSample bounds the skipped-link names kept in a job.
 const maxSkippedLinkSample = 5

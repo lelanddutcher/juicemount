@@ -33,6 +33,7 @@ PATCH_FILES = {
     "patches/0015-klauspost-compress-security-update.patch": ["go.mod", "go.sum"],
     "patches/0016-file-backend-beneath-root.patch": [
         "cmd/object.go", "cmd/sync.go", "pkg/object/file.go", "pkg/object/file_unix.go"],
+    "patches/0017-project-fence.patch": ["cmd/object.go", "cmd/sync.go", "pkg/sync/sync.go"],
 }
 VERSION_PACKAGE = "github.com/juicedata/juicefs/pkg/version"
 

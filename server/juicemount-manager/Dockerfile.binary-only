@@ -30,13 +30,14 @@ LABEL org.opencontainers.image.version="${JM_VERSION}" \
       org.opencontainers.image.revision="${JM_COMMIT}"
 COPY --from=gobuild /out/juicemount-manager /usr/local/bin/juicemount-manager
 # This Manager passes sync roots as open folders and uses --links only with
-# a juicefs whose file:// backend confines them (third_party/juicefs patch
-# 0016, version suffix -jm2 or later). It falls back safely with an older
-# one, but a base image that predates the patch should be rebuilt with
+# a juicefs whose file:// backend confines them and that keeps writes into
+# the volume inside their project (third_party/juicefs patches 0016 and
+# 0017, version suffix -jm3 or later). It falls back safely with an older
+# one, but a base image that predates the patches should be rebuilt with
 # server/juicemount-manager/Dockerfile instead of layered over.
 RUN v="$(juicefs --version)" \
-    && printf '%s\n' "$v" | grep -Eq -- '-jm([2-9]|[1-9][0-9]+)$' \
-    || { echo "base image juicefs ($v) predates the confined file backend (-jm2); rebuild the base with server/juicemount-manager/Dockerfile" >&2; exit 1; }
+    && printf '%s\n' "$v" | grep -Eq -- '-jm([3-9]|[1-9][0-9]+)$' \
+    || { echo "base image juicefs ($v) predates the confined file backend and project fence (-jm3); rebuild the base with server/juicemount-manager/Dockerfile" >&2; exit 1; }
 RUN test "$(/usr/local/bin/juicemount-manager --build-info)" = "juicemount-manager ${JM_VERSION} (${JM_COMMIT})"
 
 # Override any older base-image probe that placed the expanded admin key in
