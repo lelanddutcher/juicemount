@@ -1,5 +1,10 @@
 # Canonical Compose rollout (0.5)
 
+**Not for setup-made installs.** An install made by
+`server/scripts/juicemount-setup.sh` is not a git checkout; this procedure
+would recreate services from the unrendered compose with its sample paths.
+Upgrading a setup-made install is not supported yet.
+
 `server/scripts/rollout-compose.sh` updates **only** `juicemount-manager` and
 `juicefarm` in a project started from this repository's
 `server/docker-compose.yml`. It is a host-local command, not the standalone
