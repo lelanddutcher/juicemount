@@ -1951,13 +1951,14 @@ func firstField(path string) string {
 	return f[0]
 }
 
-// commitLocked persists the store and, when the proxy-visible set changed
-// (or always, cheaply, to self-heal), the proxy files.
+// commitLocked persists the store and, when the proxy-visible set changed,
+// the proxy files. It is all or nothing: the store is saved after the proxy
+// files are written and before the proxy is signalled, and a failed store
+// save puts the proxy files back, so the proxy never enforces a change the
+// store (on disk and, through the callers' undo, in memory) does not hold.
 func (s *PrincipalStore) commitLocked(proxyChanged bool) error {
 	if s.opts.ProxyDir != "" && proxyChanged {
-		if err := s.writeProxyFilesLocked(); err != nil {
-			return err
-		}
+		return s.writeProxyFilesThenLocked(s.saveStoreLocked)
 	}
 	return s.saveStoreLocked()
 }
@@ -2024,6 +2025,14 @@ func (s *PrincipalStore) approvedLocked() []*MacPrincipal {
 // verbatim, Mac entries = approved set) and rollback-macs.acl, then signals
 // the proxy. It holds the shared flock the respproxy entrypoint also takes.
 func (s *PrincipalStore) writeProxyFilesLocked() error {
+	return s.writeProxyFilesThenLocked(nil)
+}
+
+// writeProxyFilesThenLocked is writeProxyFilesLocked with a step that runs
+// after both files are written and before the proxy is signalled. If then
+// fails, both files are put back to their previous bytes, the proxy is not
+// signalled, and its error is returned.
+func (s *PrincipalStore) writeProxyFilesThenLocked(then func() error) error {
 	dir := s.opts.ProxyDir
 	lf, err := os.OpenFile(filepath.Join(dir, principalsLockName), os.O_RDWR|os.O_CREATE, 0o600)
 	if err != nil {
@@ -2071,6 +2080,28 @@ func (s *PrincipalStore) writeProxyFilesLocked() error {
 		return err
 	}
 	body = append(body, '\n')
+	aclPath := filepath.Join(dir, rollbackMacsName)
+	prevACL, err := os.ReadFile(aclPath)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	// restore puts back each file this call replaced (nil = it did not
+	// exist), most recent first.
+	restore := func(why string, files ...string) {
+		defer func() { s.peopleWritten = fileFormat(dir) >= 2 }()
+		olds := map[string][]byte{path: prev, aclPath: prevACL}
+		for _, p := range files {
+			var undo error
+			if olds[p] != nil {
+				undo = writeFileAtomic0600(p, olds[p])
+			} else if undo = os.Remove(p); errors.Is(undo, os.ErrNotExist) {
+				undo = nil
+			}
+			if undo != nil {
+				log.Printf("manager: CRITICAL: %s could not be restored after %s: %v", p, why, undo)
+			}
+		}
+	}
 	// principals.json first: it is what the proxy enforces. The rollback
 	// fragment must never disagree with it, so if the fragment cannot be
 	// written the principals file is put back and the change fails as a
@@ -2078,20 +2109,19 @@ func (s *PrincipalStore) writeProxyFilesLocked() error {
 	if err := writeFileAtomic0600(path, body); err != nil {
 		return err
 	}
-	if err := writeFileAtomic0600(filepath.Join(dir, rollbackMacsName), []byte(acl.String())); err != nil {
-		defer func() { s.peopleWritten = fileFormat(dir) >= 2 }()
-		var undo error
-		if prev != nil {
-			undo = writeFileAtomic0600(path, prev)
-		} else {
-			undo = os.Remove(path)
-		}
-		if undo != nil {
-			log.Printf("manager: CRITICAL: %s could not be restored after a failed rollback-fragment write: %v", path, undo)
-		}
+	if err := writeFileAtomic0600(aclPath, []byte(acl.String())); err != nil {
+		restore("a failed rollback-fragment write", path)
 		return err
 	}
 	s.peopleWritten = next.Version == 2
+	if then != nil {
+		// The proxy reloads only when signalled, so until then it still
+		// enforces the previous table.
+		if err := then(); err != nil {
+			restore("a failed store save", aclPath, path)
+			return err
+		}
+	}
 	if s.opts.Signal != nil {
 		sum := sha256.Sum256(body)
 		sha := hex.EncodeToString(sum[:])
