@@ -66,6 +66,11 @@ or farm workers.
 
 ### Server
 
+- The object store image is now SILO (`pgsty/silo`, multi-arch, pinned by
+  digest), a maintained community fork of MinIO. The `minio/minio` image that
+  0.5.0 pinned can no longer be pulled, so fresh installs failed. SILO keeps
+  the S3 API, the `MINIO_*` settings, `mc` and the on-disk format: an existing
+  server keeps its bucket data, and the service is still named `minio`.
 - A Manager migration or backup with **Preserve folder structure** off no
   longer copies sibling folders whose names start with the source folder's
   name (for example `photos-old/` next to `photos/`) into folders next to the

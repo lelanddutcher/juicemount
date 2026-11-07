@@ -83,16 +83,16 @@ digests from the published release manifest. This render step prevents an
 edited TrueNAS form from silently dropping a credential or reverting to a
 mutable image.
 
-Fresh 0.5 stack installation has not been qualified. During the release check,
-an anonymous pull of the compose-pinned MinIO image
-(`sha256:ed9be66eb5f2636c18289c34c3b725ddf57815f2777c77b5938543b78a44f144`)
-was unavailable: Docker Hub returned 401 for its manifest after issuing a token
-without pull scope, and Quay's anonymous request also returned 401. This does
-not establish whether authenticated accounts can pull it or whether an existing
-image cache works. Before a fresh install or replacing a working stack, verify
-that the deployment host can access that exact MinIO image and every matching
-server and base image digest. Keep the working stack and its data in place until
-the image access and rendered configuration are verified.
+The object store is SILO (`pgsty/silo`), a maintained community fork of
+MinIO with the same S3 API, settings and on-disk format. Releases up to 0.5.0
+pinned `minio/minio`
+(`sha256:ed9be66eb5f2636c18289c34c3b725ddf57815f2777c77b5938543b78a44f144`),
+which can no longer be pulled anonymously: Docker Hub and Quay return 401.
+An existing stack keeps its bucket data when the `minio` service switches to
+SILO. Before a fresh install or replacing a working stack, verify that the
+deployment host can pull every compose-pinned image digest, and keep the
+working stack and its data in place until the image access and rendered
+configuration are verified.
 
 1. Copy `server/release.env.example` outside the repository and replace every
    placeholder. Obtain `JM_FARM_STORAGE_CAPACITY_BYTES` from
