@@ -394,6 +394,182 @@ func TestH8BPrincipalsFileWrittenAtomically0600(t *testing.T) {
 	}
 }
 
+// TestPrincipalSaveFailureKeepsProxyFilesStoreAndMemoryInStep: a change that
+// alters the proxy's table writes principals.json and rollback-macs.acl
+// first, then the Manager's own store. When the store save fails after the
+// proxy files are on disk, the change fails as a whole: both proxy files
+// return to their previous bytes, the proxy is not signalled, and the store
+// file and the in-memory record both still show the Mac approved.
+func TestPrincipalSaveFailureKeepsProxyFilesStoreAndMemoryInStep(t *testing.T) {
+	dir := t.TempDir()
+	storePath := filepath.Join(dir, "store.json")
+	path := filepath.Join(dir, "principals.json")
+	aclPath := filepath.Join(dir, "rollback-macs.acl")
+	s, err := NewPrincipalStore(PrincipalStoreOptions{StatePath: storePath, ProxyDir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := s.Enroll(EnrollRequest{InstanceID: testInstanceID, Host: "Edit-Bay-2", Secret: testMacSecret}, "192.0.2.1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stopProxy := startFakeProxyAck(t, dir)
+	if err := s.Approve(r.Principal); err != nil {
+		t.Fatal(err)
+	}
+	stopProxy()
+	sig := &recordingSignaler{}
+	s.mu.Lock()
+	s.opts.Signal = sig
+	s.mu.Unlock()
+
+	read := func(p string) []byte {
+		t.Helper()
+		b, err := os.ReadFile(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return b
+	}
+	beforeTable, beforeACL, beforeStore := read(path), read(aclPath), read(storePath)
+	if _, ok := findProxyPrincipal(readProxyPrincipals(t, path), r.Principal); !ok {
+		t.Fatal("approved Mac missing from the proxy table")
+	}
+
+	// Fail the store save, which runs after both proxy files are written.
+	proxyFilesWritten := 0
+	atomicWriteHook = func(f *os.File, data []byte) error {
+		switch base := filepath.Base(f.Name()); {
+		case strings.Contains(base, "store.json"):
+			return errors.New("injected: store save failed")
+		case strings.Contains(base, "principals.json"), strings.Contains(base, "rollback-macs.acl"):
+			proxyFilesWritten++
+		}
+		_, err := f.Write(data)
+		return err
+	}
+	defer func() { atomicWriteHook = nil }()
+	if err := s.Revoke(r.Principal); err == nil {
+		t.Fatal("revoke reported success although the store save failed")
+	}
+	// Both proxy files were replaced and then put back (2 writes + 2 restores).
+	if proxyFilesWritten != 4 {
+		t.Fatalf("proxy file writes = %d, want 4 (the failure must come after the proxy files are written)", proxyFilesWritten)
+	}
+	atomicWriteHook = nil
+
+	if got := read(path); !bytes.Equal(got, beforeTable) {
+		t.Fatalf("principals.json changed by a failed save:\nbefore %s\nafter  %s", beforeTable, got)
+	}
+	if got := read(aclPath); !bytes.Equal(got, beforeACL) {
+		t.Fatalf("rollback-macs.acl changed by a failed save:\nbefore %s\nafter  %s", beforeACL, got)
+	}
+	if got := read(storePath); !bytes.Equal(got, beforeStore) {
+		t.Fatal("store file changed by a failed save")
+	}
+	if len(sig.shas) != 0 {
+		t.Fatalf("proxy was signalled for a change that failed: %v", sig.shas)
+	}
+	if got := s.Snapshot().byName(r.Principal); got == nil || got.Status != PrincipalApproved {
+		t.Fatalf("in-memory record after failed save = %+v, want still approved", got)
+	}
+	// A fresh store from disk agrees with memory and the proxy table.
+	s2, err := NewPrincipalStore(PrincipalStoreOptions{StatePath: storePath, ProxyDir: dir, Signal: &recordingSignaler{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := s2.Snapshot().byName(r.Principal); got == nil || got.Status != PrincipalApproved {
+		t.Fatalf("store file after failed save = %+v, want still approved", got)
+	}
+	if got := read(path); !bytes.Equal(got, beforeTable) {
+		t.Fatal("reloading the store changed the proxy table: store and proxy disagreed")
+	}
+
+	// The retry succeeds and all three move together.
+	if err := s.Revoke(r.Principal); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := findProxyPrincipal(readProxyPrincipals(t, path), r.Principal); ok {
+		t.Fatal("retried revoke left the Mac in the proxy table")
+	}
+	if len(sig.shas) != 1 || sig.shas[0] != sha256File(t, path) {
+		t.Fatalf("retried revoke signals = %v, want one for the written table", sig.shas)
+	}
+}
+
+// TestPrincipalFailedRestoreIsRewrittenByTheNextCommit: when the store save
+// fails and putting the proxy files back fails too, the proxy files hold a
+// change the store does not. The next commit must rewrite them from the
+// store and signal, even a commit that changes nothing the proxy enforces.
+func TestPrincipalFailedRestoreIsRewrittenByTheNextCommit(t *testing.T) {
+	dir := t.TempDir()
+	storePath := filepath.Join(dir, "store.json")
+	path := filepath.Join(dir, "principals.json")
+	s, err := NewPrincipalStore(PrincipalStoreOptions{StatePath: storePath, ProxyDir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := s.Enroll(EnrollRequest{InstanceID: testInstanceID, Host: "Edit-Bay-2", Secret: testMacSecret}, "192.0.2.1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stopProxy := startFakeProxyAck(t, dir)
+	if err := s.Approve(r.Principal); err != nil {
+		t.Fatal(err)
+	}
+	stopProxy()
+	sig := &recordingSignaler{}
+	s.mu.Lock()
+	s.opts.Signal = sig
+	s.mu.Unlock()
+
+	// Fail the store save, then fail the restore of principals.json (its
+	// second write in this call).
+	tableWrites := 0
+	atomicWriteHook = func(f *os.File, data []byte) error {
+		switch base := filepath.Base(f.Name()); {
+		case strings.Contains(base, "store.json"):
+			return errors.New("injected: store save failed")
+		case strings.Contains(base, "principals.json"):
+			tableWrites++
+			if tableWrites == 2 {
+				return errors.New("injected: restore failed")
+			}
+		}
+		_, err := f.Write(data)
+		return err
+	}
+	defer func() { atomicWriteHook = nil }()
+	if err := s.Revoke(r.Principal); err == nil {
+		t.Fatal("revoke reported success although the store save failed")
+	}
+	atomicWriteHook = nil
+	if _, ok := findProxyPrincipal(readProxyPrincipals(t, path), r.Principal); ok {
+		t.Fatal("test setup: expected the failed restore to leave the revoked table in place")
+	}
+	if len(sig.shas) != 0 {
+		t.Fatalf("proxy was signalled for a change that failed: %v", sig.shas)
+	}
+
+	// A commit that changes nothing the proxy enforces still repairs it.
+	s.mu.Lock()
+	err = s.commitLocked(false)
+	dirty := s.proxyDirty
+	s.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := findProxyPrincipal(readProxyPrincipals(t, path), r.Principal); !ok {
+		t.Fatal("next commit did not put the still-approved Mac back in the proxy table")
+	}
+	if len(sig.shas) != 1 || sig.shas[0] != sha256File(t, path) {
+		t.Fatalf("repair signals = %v, want one for the rewritten table", sig.shas)
+	}
+	if dirty {
+		t.Fatal("proxyDirty still set after a successful rewrite")
+	}
+}
+
 // TestH8BRollbackACLMirrorsPrincipals: plan §3 rollback step 3 loads plain
 // Redis ACL users with the same names and secrets as the proxy principals.
 func TestH8BRollbackACLMirrorsPrincipals(t *testing.T) {

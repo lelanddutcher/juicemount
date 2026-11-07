@@ -123,6 +123,13 @@ or farm workers.
   background cleanup acts on. JuiceFS clients on Macs and farm workers write
   these records as before. The details are in this
   repository's GitHub security advisories.
+- Approving, revoking or forgetting a Mac, and changing people or grants, now
+  either takes effect everywhere or nowhere. The Manager writes the Redis
+  proxy's login table first and its own record second. Before, if the second
+  write failed (for example on a full disk), the change was reported as failed
+  but the proxy already enforced it: a revoked Mac was locked out while the
+  Manager still showed it approved, or the reverse. Now the proxy's table is
+  put back and the proxy is not told to reload.
 
 ### JuiceFarm and Manager
 
