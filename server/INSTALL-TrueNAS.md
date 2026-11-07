@@ -102,6 +102,14 @@ prints it again.
 8. **Waits until the Manager answers** with the new key, then prints the two
    lines.
 
+The object store is SILO (`pgsty/silo`), a maintained community fork of
+MinIO with the same S3 API, settings and on-disk format. Releases up to 0.5.0
+pinned `minio/minio`
+(`sha256:ed9be66eb5f2636c18289c34c3b725ddf57815f2777c77b5938543b78a44f144`),
+which can no longer be pulled anonymously: Docker Hub and Quay return 401.
+An existing stack keeps its bucket data when the `minio` service switches to
+SILO.
+
 ### What the command trusts
 
 The command runs what the GitHub repository `lelanddutcher/juicemount` holds:

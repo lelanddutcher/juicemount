@@ -43,7 +43,7 @@ jobs:
              | grep -vE "@[0-9a-f]{40}['\"]?([[:space:]]|$)" | grep -v 'docker://'; then
             echo "::error::pin the actions above to a full commit SHA"; exit 1
           fi
-      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
           cache: true
@@ -55,9 +55,27 @@ jobs:
           curl -fsSL -o "$RUNNER_TEMP/headscale" https://github.com/juanfont/headscale/releases/download/v0.29.3/headscale_0.29.3_linux_amd64
           echo "8dc183758024ed7095cf610fedea0790233613c71353bc8be2715d82ba29b92c  $RUNNER_TEMP/headscale" | sha256sum -c -
           chmod +x "$RUNNER_TEMP/headscale"
+      - name: Build the vendored juicefs for the sync tests
+        # The module and patches the manager image ships (third_party/juicefs),
+        # so the real-binary sync tests in internal/manager run instead of
+        # skipping.
+        working-directory: third_party/juicefs
+        # The pinned ldflags give it the -jmN version the Manager checks
+        # before it hands juicefs open roots and --links.
+        run: |
+          ldflags="$(sed -n 's/^ *"ldflags": "\(.*\)",*$/\1/p' SOURCE.json)"
+          go build -trimpath -tags nocos,nobos,nohdfs,noibmcos,noobs,nooss,noqingstor,noswift,noazure,nogs,noufile,nodragonfly,nosqlite,nomysql,nopg,notikv,nobadger,noetcd \
+            -ldflags="$ldflags" -o "$RUNNER_TEMP/juicefs" .
+          test "$("$RUNNER_TEMP/juicefs" --version)" = "$(sed -n 's/^ *"version_output": "\(.*\)",*$/\1/p' SOURCE.json)"
+      - name: Vendored juicefs object-backend tests
+        working-directory: third_party/juicefs
+        run: go test -count=1 ./pkg/object
       - name: Unit and integration-safe tests
         env:
           JM_REQUIRE_GATE_HISTORY: '1'
+          # Real juicefs for the sync tests; DB 8 is flushed by the jfs:// test.
+          JM_TEST_JUICEFS_BIN: ${{ runner.temp }}/juicefs
+          JM_TEST_JFS_META: redis://127.0.0.1:6379/8
           JM_TEST_HEADSCALE_BIN: ${{ runner.temp }}/headscale
           JM_TEST_LINK_REDIS: redis://127.0.0.1:6379/13
           JM_TEST_MANAGER_REDIS: redis://127.0.0.1:6379/12
@@ -109,12 +127,20 @@ jobs:
           bash server/scripts/update-server.test.sh
       - name: Redis replays transactions from its AOF under the shipped ACL
         run: bash server/scripts/redis-aof-acl.test.sh
+      - name: Redis AOF is compacted before a restart, so no refused transaction replays
+        run: bash server/scripts/redis-compact.test.sh
+      # No JM_*_DIGEST in this step's environment: rollout-compose.sh refuses
+      # shell digest overrides.
+      - name: Compose rollout and topology tests (fake docker)
+        run: |
+          bash server/scripts/rollout-compose.test.sh
+          bash server/scripts/rollout-compose-proxy.test.sh
 
   mac-app:
     runs-on: macos-26
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
           cache: true

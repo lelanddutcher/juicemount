@@ -165,7 +165,11 @@ services:
   # MinIO's audit log has no file target (webhook or Kafka only), so it
   # needs a receiver this compose does not ship.
   minio:
-    image: minio/minio:RELEASE.2025-01-20T14-49-07Z@sha256:ed9be66eb5f2636c18289c34c3b725ddf57815f2777c77b5938543b78a44f144
+    # SILO is a maintained community fork of MinIO: same S3 API, settings,
+    # mc client and on-disk format. The old minio/minio pin can no longer be
+    # pulled (Docker Hub and Quay refuse it; MinIO stopped publishing
+    # community images). Multi-arch index digest (amd64 + arm64).
+    image: pgsty/silo:RELEASE.2026-09-16T00-00-00Z@sha256:635197cb9f36d01bee221d34d1c7d7960f6a95c48b0b6c01d99cd13bdae51a46
     restart: unless-stopped
     command: server /data --console-address ":9001"
     environment:
@@ -197,7 +201,7 @@ services:
   #   jm-gc      adds DeleteObject          the bg mount and Manager gc/compact
   # Idempotent; runs at every `up`. Secrets reach mc via env and stdin only.
   minio-keys:
-    image: minio/minio:RELEASE.2025-01-20T14-49-07Z@sha256:ed9be66eb5f2636c18289c34c3b725ddf57815f2777c77b5938543b78a44f144
+    image: pgsty/silo:RELEASE.2026-09-16T00-00-00Z@sha256:635197cb9f36d01bee221d34d1c7d7960f6a95c48b0b6c01d99cd13bdae51a46
     restart: "no"
     depends_on:
       minio:
@@ -235,7 +239,7 @@ services:
   # (naming the service enables its profile) after JM_OBJ_PER_MAC_SERVER=1
   # (step M1). The Manager's own switch, JM_OBJ_PER_MAC, is step M2.
   minio-keyd:
-    image: minio/minio:RELEASE.2025-01-20T14-49-07Z@sha256:ed9be66eb5f2636c18289c34c3b725ddf57815f2777c77b5938543b78a44f144
+    image: pgsty/silo:RELEASE.2026-09-16T00-00-00Z@sha256:635197cb9f36d01bee221d34d1c7d7960f6a95c48b0b6c01d99cd13bdae51a46
     profiles: ["per-mac"]
     restart: unless-stopped
     # A stop during a key create waits for MinIO's reply so the new secret

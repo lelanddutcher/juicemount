@@ -82,6 +82,43 @@ or farm workers.
   Update a 0.5.0 server only in the order under **Upgrading the Redis proxy
   and Manager** below: in the wrong order, the update itself can corrupt
   the folder tree.
+- Server scripts that recreate Redis first make it rewrite its append-only
+  file, and stop before anything stops if that rewrite does not finish. So
+  the restart replays no transaction that an earlier start refused. A
+  release rollout does not restart Redis. But while the running Redis still
+  has the 0.5.0 ACL, the rollout makes Redis rewrite the file while it keeps
+  running, so a later NAS reboot is safe too. Before such a rewrite, the
+  scripts ask you to confirm that you copied Redis's data folder.
+- The object store image is now SILO (`pgsty/silo`, multi-arch, pinned by
+  digest), a maintained community fork of MinIO. The `minio/minio` image that
+  0.5.0 pinned can no longer be pulled, so fresh installs failed. SILO keeps
+  the S3 API, the `MINIO_*` settings, `mc` and the on-disk format: an existing
+  server keeps its bucket data, and the service is still named `minio`.
+- A Manager migration or backup with **Preserve folder structure** off no
+  longer copies sibling folders whose names start with the source folder's
+  name (for example `photos-old/` next to `photos/`) into folders next to the
+  destination. Both settings copy the source folder's contents into the
+  destination, as before.
+- The Manager keeps every path it works on inside the volume or inside the
+  configured source folders, also when the volume holds symlinks that Macs
+  wrote. Folder browsing, previews, migrations and backups, schedules,
+  permission fixes and the trash all check a path the way the kernel will
+  open it, and refuse a path that leads outside. Details are in this
+  repository's GitHub security advisories.
+- Migrations and backups run the JuiceFS copy confined to the folders they
+  copy between. The Manager image ships a JuiceFS build (`-jm2`) whose local
+  folder backend cannot open anything outside the folder it was given.
+  Symlinks are copied as symlinks only into the volume. A symlink that cannot
+  be followed inside the folder being copied (for example an absolute macOS
+  path such as `/Volumes/Media/clip.mov`) is skipped, and the job reports how
+  many it skipped and names the first few. Before, such a link could make a
+  backup copy files from outside the volume, or fail the whole job.
+- A sync request with an unknown direction is refused. Before, a request
+  naming a saved destination skipped the source check.
+- These checks need Linux 5.6 or later, and a Docker seccomp profile that
+  allows `openat2` (Docker 20.10 or later). On an older kernel or profile,
+  every migration or backup between local folders fails with a message
+  saying so, and none runs unconfined.
 - A fresh server install creates the `zpool` bucket before it sets up the
   object-store users. Before, setup used the restricted format key, which
   cannot create buckets, so a first install failed. An existing bucket and its
@@ -91,6 +128,13 @@ or farm workers.
   background cleanup acts on. JuiceFS clients on Macs and farm workers write
   these records as before. The details are in this
   repository's GitHub security advisories.
+- Approving, revoking or forgetting a Mac, and changing people or grants, now
+  either takes effect everywhere or nowhere. The Manager writes the Redis
+  proxy's login table first and its own record second. Before, if the second
+  write failed (for example on a full disk), the change was reported as failed
+  but the proxy already enforced it: a revoked Mac was locked out while the
+  Manager still showed it approved, or the reverse. Now the proxy's table is
+  put back and the proxy is not told to reload.
 
 ### JuiceFarm and Manager
 
@@ -384,18 +428,102 @@ new workers against the same Redis at the same time:
   2. Copy Redis's data folder (its `appendonlydir`) somewhere safe. If Redis
      was restarted under 0.5.0 since its last rewrite, that copy is the only
      place the changes lost at that restart still exist.
-  3. Make Redis rewrite its append-only file from what it holds now:
-     `docker exec <redis container> sh -c 'redis-cli --user jm-admin --pass
-     "$(cat /run/jm-redis/admin.pass)" --no-auth-warning BGREWRITEAOF'`.
+  3. Make Redis rewrite its append-only file from what it holds now. First
+     note the number in the name of the `.base.` file in `appendonlydir`
+     (for example `appendonly.aof.3.base.rdb`). Then run
+     `docker exec <redis container> sh -c 'REDISCLI_AUTH="$(cat
+     /run/jm-redis/admin.pass)" redis-cli --user jm-admin BGREWRITEAOF'`
+     (the password stays in the environment, out of `ps`).
      Wait until `INFO persistence` (same login) shows
      `aof_rewrite_scheduled:0`, `aof_rewrite_in_progress:0` and
      `aof_last_bgrewrite_status:ok`. A rewrite requested while a background
-     save runs is only scheduled, so check all three.
+     save runs is only scheduled, so check all three. If Redis answers that a
+     rewrite is already in progress, wait for it to finish, then ask again:
+     only a rewrite started after step 2 counts. Then check that the
+     `.base.` file in `appendonlydir` has a higher number than the one you
+     noted. A rewrite that was stopped halfway passes the three checks
+     above but leaves the old files in place; if the number did not rise,
+     ask again.
   4. Now update `server/redis.acl` and restart Redis. The rewritten file
      holds no transactions to refuse, so nothing is lost or replayed twice.
   Changes lost at an earlier 0.5.0 restart are not recovered by these steps.
   Recovering them from the copy in step 2 is a manual restore, not a
   replay.
+- If you update through `server/scripts/rollout-compose.sh`, the script can
+  do step 3 for you, but not always in time:
+  - First check whether Redis already had a lossy start. Run
+    `docker logs <redis container> > redis.log 2>&1; echo $?`, then
+    `grep -c 'Ready to accept connections' redis.log` and
+    `grep -c AOF-loading-client redis.log`. You can tell only if the first
+    command printed 0 (it read the log) and the log shows the current start
+    (the `Ready to accept connections` count is at least 1). Otherwise you
+    cannot tell, for example with a logging driver that cannot be read, or
+    after log rotation dropped the start. `grep -c` prints 0 in both of
+    those cases too, so 0 alone proves nothing.
+  - If you cannot tell, or the `AOF-loading-client` count is not 0, take the
+    manual path: do steps 1 to 3 by hand before you update the checkout.
+    Redis restarts by itself if it crashes (`restart: unless-stopped`). A
+    crash after the checkout is updated, but before the script's rewrite,
+    would start Redis under the new ACL with no script involved. Then update
+    the checkout and run the release rollout with `--ack-redis-aof-backup`.
+    Its rewrite is then a second one, and harmless.
+  - Only if you can tell and the `AOF-loading-client` count is 0: do step 2,
+    update the checkout, and run the release rollout right away with
+    `--ack-redis-aof-backup`, which confirms that you did step 2. Do not
+    reboot the NAS or restart Redis in between. A running Redis does not
+    read the new `server/redis.acl`.
+  - Once the rollout's rewrite succeeds, a later NAS reboot or Redis restart
+    is safe. In detail:
+  - The script acts only on this checkout's Redis: the redis container of
+    the `--project` you name whose Compose working directory is this
+    checkout's `server/` folder. If a redis container of that project runs
+    from another directory, the script names that directory and refuses.
+  - A release rollout never restarts Redis. Right after it takes its lock,
+    before any other check, it reads the ACL that the running Redis loaded
+    at its start (`/run/jm-redis/users.acl` in the Redis container). If that
+    ACL still has the 0.5.0 `user default ... -@all` line, the rollout
+    refuses without `--ack-redis-aof-backup`, and names the host folder to
+    copy: the rewrite deletes the old files, the only copy of changes lost
+    at an earlier 0.5.0 restart. With the flag, it makes Redis rewrite its
+    append-only file now, with no restart. A Redis whose ACL cannot be read
+    is rewritten too, with no flag needed. A Redis that runs without an ACL
+    file needs no rewrite. Every re-run checks again. After the rewrite, the
+    file holds only the live state and later writes. The next start, a NAS
+    reboot included, renders the fixed ACL from the checkout and replays
+    only those writes, which it accepts.
+  - The script counts a rewrite as done only when Redis reports it finished
+    with no error and wrote a new base file. A rewrite that was stopped
+    halfway leaves the old files, so it counts as failed.
+  - Every exit, in every mode, warns while the running Redis may still have
+    the 0.5.0 ACL and no rewrite succeeded in this run: do not reboot the
+    NAS or restart Redis until a rewrite succeeds. That includes a usage
+    error (a mistyped flag), a held lock, a missing flag, a refused rewrite,
+    a rewrite that does not finish within 10 minutes
+    (`JM_REDIS_COMPACT_TIMEOUT`, in seconds), and a dry run (which only reads
+    the ACL). The rewrite runs before the release's other checks, so it has
+    run even if the release then stops, for example for an unhealthy
+    service.
+  - `--cutover-proxy`, `--proxy-rollback` and `--proxy-restore` recreate
+    Redis. They run the rewrite before they stop anything, and stop with
+    the stack unchanged if it does not finish. They also stop unchanged if
+    Redis is down by then and the script read the 0.5.0 ACL (or could not
+    read it) and has not finished a rewrite. They need
+    `--ack-redis-aof-backup` too while the running Redis has the 0.5.0 ACL.
+  - Their automatic rollback, after a failure later in the change, also
+    asks for a rewrite before it recreates Redis. Services are already
+    stopped at that point. A failed rewrite there does not stop the
+    rollback: it warns and goes on, because this run already finished a
+    rewrite or read the fixed ACL. If Redis is down at that point, the
+    script says that the start replays the whole file. It refuses to start
+    Redis while `server/redis.acl` still has the 0.5.0 default line, unless
+    you pass `--allow-aof-replay`. Only the automatic rollback can reach
+    that refusal or use the flag: a forward change needs a running, healthy
+    Redis, and a release never restarts Redis. If the rollback stops there,
+    the services the change had stopped stay stopped, and the script keeps
+    its lock.
+  - `server/scripts/update-server.sh` never restarts Redis and does not do
+    this check. If you update by hand (pull the checkout, then restart Redis
+    or reboot the NAS yourself), follow steps 1 to 4 above.
 - The security fix under **Server** is in the Redis proxy, so it protects a
   volume once that volume's proxy runs this release. Macs and farm workers
   need no update for it. `server/scripts/rollout-compose.sh` refuses a proxy

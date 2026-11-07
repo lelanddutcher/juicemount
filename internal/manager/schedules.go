@@ -28,6 +28,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -372,8 +373,10 @@ func (s *scheduleStoreImpl) fire(name string) {
 	// SECURITY (defense-in-depth): re-check the source gate at fire time
 	// so a row that predates the gate (or a hand-edited state file) can't
 	// exfiltrate an out-of-bounds host path. Records the block in history.
+	// The gate checks, and the job receives, the same cleaned path.
+	source := scheduleSourcePath(r)
 	if gate != nil {
-		if err := gate(r.Source.Path, r.Source.Direction); err != nil {
+		if err := gate(source, r.Source.Direction); err != nil {
 			s.recordHistory(name, scheduleHistoryRow{
 				State:      "error",
 				StartedAt:  now,
@@ -388,7 +391,7 @@ func (s *scheduleStoreImpl) fire(name string) {
 		}
 	}
 
-	source, destURI, env, errMsg := resolveScheduleSpec(r, dests, fuseRoot)
+	destURI, env, errMsg := resolveScheduleSpec(r, dests, fuseRoot)
 	if errMsg != "" {
 		s.recordHistory(name, scheduleHistoryRow{
 			State:      "error",
@@ -453,38 +456,46 @@ func (s *scheduleStoreImpl) recordHistory(name string, row scheduleHistoryRow) {
 	s.rows[idx].History = hist
 }
 
+// scheduleSourcePath is the one source path a schedule both checks and
+// submits: the stored path with ".." and "." collapsed. The gate decides
+// on this text (pathAllowed also follows symlinks in it), so the job
+// must receive exactly this text. Handing juicefs sync the raw text
+// instead would let the kernel resolve "<root>/link/../x" through the
+// symlink's target rather than the textual parent. Rows saved before
+// this rule keep their raw text on disk; cleaning here covers them too.
+func scheduleSourcePath(r scheduleState) string {
+	return filepath.Clean(r.Source.Path)
+}
+
 // resolveScheduleSpec turns a persisted schedule row into the concrete
-// (source, destination URI, env) tuple Submit needs. Pure function —
-// no side effects, no log spam, easy to unit-test.
+// (destination URI, env) pair Submit needs. The source is not part of
+// it: callers take scheduleSourcePath, gate it, and submit that value.
+// Pure function — no side effects, no log spam, easy to unit-test.
 //
 // Returns errMsg (non-empty) on failure; the caller logs and records
 // the failure in history. We use a string error for the history
 // payload (it round-trips through JSON cleanly) rather than wrapping
 // in an error type the persistence layer would have to special-case.
-func resolveScheduleSpec(r scheduleState, dests *destinationStoreImpl, fuseRoot string) (source, destURI string, env []string, errMsg string) {
+func resolveScheduleSpec(r scheduleState, dests *destinationStoreImpl, fuseRoot string) (destURI string, env []string, errMsg string) {
 	if dests == nil {
-		return "", "", nil, "destinations store unavailable (set JM_ADMIN_KEY)"
+		return "", nil, "destinations store unavailable (set JM_ADMIN_KEY)"
 	}
 	d, err := dests.getPlaintext(r.Destination.Name)
 	if err != nil {
-		return "", "", nil, fmt.Sprintf("resolve destination %q: %v", r.Destination.Name, err)
+		return "", nil, fmt.Sprintf("resolve destination %q: %v", r.Destination.Name, err)
 	}
 	// The optional sub-path from DestinationRef.Path is stitched in with
 	// appendDestPath's trailing-slash convention; for a file destination
 	// the result must still resolve inside the checked destination.
 	destURI, env, err = d.ToSyncURIWithSub(r.Destination.Path, r.Options.PreserveStructure)
 	if err != nil {
-		return "", "", nil, fmt.Sprintf("destination ToSyncURI: %v", err)
+		return "", nil, fmt.Sprintf("destination ToSyncURI: %v", err)
 	}
-	// Source is passed through raw; RunSync calls normalizeAnyURI on
-	// it (sync.go line 138) using spec.FUSEMount, so /jfs/... sources
-	// get rewritten to file:///<fuseRoot>/... at exec time. Code
-	// reviewer thought fuseRoot needed to be used here — confirmed
-	// the downstream normalization handles all directions including
-	// Out, so this layer stays a pure resolution step.
+	// RunSync calls normalizeAnyURI on the submitted source using
+	// spec.FUSEMount, so /jfs/... sources get rewritten to
+	// file:///<fuseRoot>/... at exec time; fuseRoot is not needed here.
 	_ = fuseRoot
-	source = r.Source.Path
-	return source, destURI, env, ""
+	return destURI, env, ""
 }
 
 // appendDestPath splices a destination sub-path into a sync URI while
@@ -526,7 +537,7 @@ func (s *scheduleStoreImpl) validateSchedule(sched Schedule) error {
 	// could sync an arbitrary host path (e.g. /etc, /root) to a remote
 	// destination as root. sourceGate is nil in unit tests (no-op).
 	if s.sourceGate != nil {
-		if err := s.sourceGate(sched.Source.Path, sched.Source.Direction); err != nil {
+		if err := s.sourceGate(filepath.Clean(sched.Source.Path), sched.Source.Direction); err != nil {
 			return err
 		}
 	}
@@ -693,14 +704,16 @@ func (s *scheduleStoreImpl) runNow(name string) (string, error) {
 	s.mu.RUnlock()
 
 	// SECURITY (defense-in-depth): same source gate as fire(), for the
-	// POST /api/schedules/{name}/run immediate-trigger path.
+	// POST /api/schedules/{name}/run immediate-trigger path. The gate
+	// checks, and the job receives, the same cleaned path.
+	source := scheduleSourcePath(r)
 	if gate != nil {
-		if err := gate(r.Source.Path, r.Source.Direction); err != nil {
+		if err := gate(source, r.Source.Direction); err != nil {
 			return "", err
 		}
 	}
 
-	source, destURI, env, errMsg := resolveScheduleSpec(r, dests, fuseRoot)
+	destURI, env, errMsg := resolveScheduleSpec(r, dests, fuseRoot)
 	if errMsg != "" {
 		return "", errors.New(errMsg)
 	}

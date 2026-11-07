@@ -68,7 +68,19 @@ func newSpoolWiredHandlerNoDrain(t *testing.T) (*juiceFS, *SpoolStore, *Drainer,
 	drainer.SetOnDrainAdmission(func(name string) *namespaceOperation { return handler.namespace.begin([]string{name}) })
 	drainer.SetOnDrainEffects(handler.applyLegacyDrainEffects)
 	t.Cleanup(func() {
-		handler.StopHandler()
+		if !handler.StopHandler() {
+			// A test that leaves a failed namespace operation (H8) makes
+			// StopHandler retain every resource, including the idle sweeper.
+			// Join the sweeper before closing the store under it: left
+			// running, its done-row GC logs "spool done-GC failed" into
+			// whatever jmlog sink a later test installed.
+			handler.spoolLifecycleMu.Lock()
+			stopSweeper := handler.spoolSweeperStop
+			handler.spoolLifecycleMu.Unlock()
+			if stopSweeper != nil {
+				stopSweeper()
+			}
+		}
 		_ = store.Close()
 	})
 
