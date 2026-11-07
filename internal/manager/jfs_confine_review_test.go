@@ -56,6 +56,7 @@ func readArgs(t *testing.T, argsFile string) []string {
 // swapped for a symlink during the sync must not lead it outside the
 // volume, and a normal destination must still get the client mode.
 func TestPostSyncPermissionsSurviveDestinationSwap(t *testing.T) {
+	skipUnlessVolumeSyncPlatform(t)
 	f := newConfineFixture(t)
 	outRoot := filepath.Join(f.outside, "root")
 	outFile := filepath.Join(outRoot, "inner.txt")

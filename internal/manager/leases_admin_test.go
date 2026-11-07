@@ -129,6 +129,7 @@ func fakeJuicefs(t *testing.T) (bin, marker string) {
 // writes anything. A project another principal holds refuses the whole
 // operation: no juicefs sync process starts, no file moves.
 func TestH8BManagerSyncRefusedOnLeasedProject(t *testing.T) {
+	skipUnlessVolumeSyncPlatform(t)
 	t.Run("sync into a held project", func(t *testing.T) {
 		bin, marker := fakeJuicefs(t)
 		fake := &fakeLeaseClient{held: map[string]string{"path:/data/Scott Adams": "edit-bay-2@Edit-Bay-2"}}
@@ -225,6 +226,7 @@ func TestH8BManagerSyncRefusedOnLeasedProject(t *testing.T) {
 // deployed, the proxy answers JM.LEASE with "unknown command". Sync must
 // still run then (passthrough), not wedge every migration.
 func TestH8BLeaseUnsupportedProceeds(t *testing.T) {
+	skipUnlessVolumeSyncPlatform(t)
 	bin, marker := fakeJuicefs(t)
 	spec := RunSyncSpec{Mode: ModeStandalone, MetaURL: "redis://m@p:6379/1", VolName: "zpool",
 		Leases: NewProjectLeaser(&unsupportedLeases{}), SourceRoots: []string{os.TempDir()}}

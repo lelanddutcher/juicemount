@@ -169,6 +169,7 @@ func redactEnv(env []string) []string {
 // RunSync into the volume (standalone mode, jfs:// destination) hands the
 // jm-gc key to juicefs sync through its environment, not argv.
 func TestH8BSyncIntoVolumeGetsGCKeyInEnv(t *testing.T) {
+	skipUnlessVolumeSyncPlatform(t)
 	setObjectKeyEnv(t)
 	dir := t.TempDir()
 	envOut := filepath.Join(dir, "env.txt")
