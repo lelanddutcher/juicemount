@@ -59,7 +59,7 @@ func TestH8BMaintenanceThroughProxyEnforce(t *testing.T) {
 	}
 
 	// Redis with the production ACL shape.
-	acl := "user default off resetpass resetkeys resetchannels -@all\n" +
+	acl := "user default off resetpass resetkeys resetchannels ~* &* +@all\n" +
 		"user jm-proxy on #" + sha256Hex(pw["jm-proxy"]) + " ~* &* +@all\n"
 	if err := os.WriteFile(filepath.Join(dir, "users.acl"), []byte(acl), 0o600); err != nil {
 		t.Fatal(err)
