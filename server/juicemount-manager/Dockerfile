@@ -41,8 +41,25 @@ RUN CGO_ENABLED=0 GOOS=linux \
     go build -tags nosqlite,nomysql,nopg,notikv,nobadger,noetcd -ldflags="-s -w -X github.com/lelanddutcher/juicemount/internal/version.Version=${JM_VERSION} -X github.com/lelanddutcher/juicemount/internal/version.Commit=${JM_COMMIT}" \
       -o /out/juicemount-manager ./cmd/juicemount-manager
 
+# The juicefs the Manager runs (sync, warmup, gc, fsck, status): this
+# repository's patched build of third_party/juicefs, not the base image's.
+# Patch 0016 confines its file:// backend to the root folder of each sync.
+# Built in the module's own directory so its go.mod/go.sum choose the
+# dependencies; version pin and ldflags come from SOURCE.json. Object
+# backends the destinations use (s3, b2, sftp, webdav, nfs) stay in. cgo is
+# required (zstd, lz4); the musl build is linked statically so it runs on
+# the Debian runtime below.
+RUN cd third_party/juicefs \
+    && ldflags="$(sed -n 's/^ *"ldflags": "\(.*\)",*$/\1/p' SOURCE.json)" \
+    && sed -n 's/^ *"version_output": "\(.*\)",*$/\1/p' SOURCE.json > /out/juicefs.version \
+    && test -n "$ldflags" && test -s /out/juicefs.version \
+    && CGO_ENABLED=1 GOOS=linux \
+       go build -trimpath -tags nocos,nobos,nohdfs,noibmcos,noobs,nooss,noqingstor,noswift,noazure,nogs,noufile,nodragonfly,nosqlite,nomysql,nopg,notikv,nobadger,noetcd \
+         -ldflags="$ldflags -linkmode external -extldflags '-static'" -o /out/juicefs .
+
 # ----- Stage 2: runtime -----
-# juicedata/mount gives us /usr/local/bin/juicefs for the sync subprocess.
+# juicedata/mount supplies the runtime (fuse, curl, CA bundle). Its
+# /usr/local/bin/juicefs is replaced below by the patched build.
 FROM juicedata/mount:ce-v1.3.1
 ARG JM_VERSION
 ARG JM_COMMIT
@@ -69,6 +86,10 @@ RUN case "$TARGETARCH" in amd64|arm64) ;; *) echo "unsupported Headscale archite
       -o /usr/local/bin/headscale && chmod +x /usr/local/bin/headscale
 
 COPY --from=builder /out/juicemount-manager /usr/local/bin/juicemount-manager
+COPY --from=builder /out/juicefs /usr/local/bin/juicefs
+COPY --from=builder /out/juicefs.version /usr/local/share/juicemount/juicefs.version
+
+RUN test "$(/usr/local/bin/juicefs --version)" = "$(cat /usr/local/share/juicemount/juicefs.version)"
 
 RUN test "$(/usr/local/bin/juicemount-manager --build-info)" = "juicemount-manager ${JM_VERSION} (${JM_COMMIT})"
 

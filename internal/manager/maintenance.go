@@ -30,7 +30,6 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -513,9 +512,9 @@ func (a *API) handleMaintenanceFSCK(w http.ResponseWriter, r *http.Request) {
 
 // handleMaintenanceWarmup is POST /api/maintenance/warmup. Accepts
 // ?path=<user-facing path inside /jfs>; defaults to the volume root
-// (a.destMount). Validates with jfsPathAllowed — the same gate the
+// (a.destMount). Validates with confineVolumePath — the same gate the
 // browse and migration handlers use — so the user cannot pass a
-// path outside the FUSE mount.
+// path outside the FUSE mount, by text or through a symlink.
 //
 // Warmup requires the FUSE mount (juicefs warmup operates on the
 // kernel mount path, not the metaURL). Standalone mode returns 501.
@@ -539,21 +538,16 @@ func (a *API) handleMaintenanceWarmup(w http.ResponseWriter, r *http.Request) {
 		// root" requirement in the SLICE-6 spec.
 		userPath = a.destMount
 	}
-	if !a.jfsPathAllowed(userPath) {
+	// Rewrite the user-facing /jfs/... path to the on-disk FUSE
+	// mount path before exec. juicefs warmup expects a path on the
+	// local filesystem, not a /jfs/... virtual. confineVolume cleans
+	// it once and refuses a path that resolves outside the mount.
+	vp, err := a.confineVolume(userPath, true)
+	if err != nil {
 		http.Error(w, "warmup path outside the JuiceFS volume", http.StatusForbidden)
 		return
 	}
-	// Rewrite the user-facing /jfs/... path to the on-disk FUSE
-	// mount path before exec. juicefs warmup expects a path on the
-	// local filesystem, not a /jfs/... virtual.
-	dmClean := filepath.Clean(a.destMount)
-	rel := strings.TrimPrefix(filepath.Clean(userPath), dmClean)
-	rel = strings.TrimPrefix(rel, "/")
-	fuse := strings.TrimSuffix(a.fuseMount, "/")
-	realPath := fuse
-	if rel != "" {
-		realPath = fuse + "/" + rel
-	}
+	realPath := vp.Fuse
 	argv := []string{a.maintenance.binOrDefault(), "warmup", realPath}
 	op, err := a.maintenance.tryStart(MaintenanceWarmup, argv)
 	if err != nil {

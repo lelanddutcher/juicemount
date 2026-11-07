@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"os"
@@ -106,7 +107,7 @@ const (
 // SyncOptions controls per-job behavior. Tier-1/2/3 features in the
 // foolproofing roadmap map directly onto these fields.
 type SyncOptions struct {
-	PreserveStructure bool     `json:"preserve_structure"` // if false, copy flat (basename only) [tier-1]
+	PreserveStructure bool     `json:"preserve_structure"` // kept for stored jobs and the UI; both values copy the source's contents into the destination
 	PreserveTimes     bool     `json:"preserve_times"`     // --preserve mtime,uid,gid [tier-1]
 	DryRun            bool     `json:"dry_run"`            // --dry [tier-1]
 	SkipJunk          bool     `json:"skip_junk"`          // auto-exclude .DS_Store, Thumbs.db, ._* [tier-1]
@@ -177,6 +178,10 @@ type RunSyncSpec struct {
 	// Leases (H-8B): checkout leases on the target projects before any
 	// write into the volume (see leases_admin.go). Nil = no lease client.
 	Leases ProjectLeaser
+
+	// SourceRoots are the configured host roots: the trusted anchors a
+	// host-side sync root is opened beneath (sync_roots.go).
+	SourceRoots []string
 }
 
 // RunSync invokes `juicefs sync` against the given source and
@@ -195,6 +200,28 @@ type RunSyncSpec struct {
 // Emits ProgressEvent on `progress` each time juicefs writes a
 // recognized progress line. Blocks until juicefs exits or ctx cancels.
 func RunSync(ctx context.Context, juicefsBin string, spec RunSyncSpec, source, destination string, opts SyncOptions, extraEnv []string, progress chan<- ProgressEvent) error {
+	// Point-of-use volume boundary: a /jfs source or destination is
+	// cleaned, and refused if it resolves outside the FUSE mount (a
+	// symlink stored in the volume). The cleaned value is used from here
+	// on. This also covers jobs that did not come through an API gate
+	// (stored schedules, resumed jobs).
+	//
+	// Both preserve_structure settings copy the source folder's contents
+	// into the destination itself. juicefs gets both roots with a trailing
+	// slash: its slash-less form (what preserve_structure=false used to
+	// send) treats each root as a name prefix, which also copied
+	// same-prefix siblings (photosX/ next to photos/) into sibling
+	// destinations.
+	opts.PreserveStructure = true
+	var err error
+	if spec.Mode == ModeEmbedded {
+		if source, err = confineSyncVolumePath(source, spec.FUSEMount); err != nil {
+			return err
+		}
+		if destination, err = confineSyncVolumePath(destination, spec.FUSEMount); err != nil {
+			return err
+		}
+	}
 	// Never into a smart-folder root (sync_smartroots.go), also for
 	// scheduled jobs that did not pass validateDirectionPair.
 	if err := checkSyncSmartRoots(os.Getenv, os.ReadDir, source, destination, spec.FUSEMount); err != nil {
@@ -233,8 +260,19 @@ func RunSync(ctx context.Context, juicefsBin string, spec RunSyncSpec, source, d
 		// (which standalone mode does not set) — so the helper falls
 		// through to file:// for /external/... paths, and we keep
 		// the explicit jfs:// helper for /jfs/... destinations.
-		if strings.HasPrefix(strings.TrimSpace(destination), "/jfs") {
+		srcVol := isVolumeUserPath(strings.TrimSpace(source))
+		dstVol := isVolumeUserPath(strings.TrimSpace(destination))
+		if srcVol {
+			// No FUSE mount here: a /jfs source is read through the
+			// volume (jfs://), never as a host file:// path.
+			src = normalizeDestURIJFS(source, spec.VolName, opts.PreserveStructure)
+		}
+		if dstVol {
 			dst = normalizeDestURIJFS(destination, spec.VolName, opts.PreserveStructure)
+		} else {
+			dst = normalizeAnyURI(destination, "", opts.PreserveStructure)
+		}
+		if srcVol || dstVol {
 			// juicefs sync's URL syntax: env var name = URL alias. So
 			// for jfs://zpool/... we set zpool=redis://...
 			modeEnv = append(modeEnv, spec.VolName+"="+spec.MetaURL)
@@ -243,8 +281,6 @@ func RunSync(ctx context.Context, juicefsBin string, spec RunSyncSpec, source, d
 			// set when the volume is an endpoint, so a user-configured
 			// minio destination without its own key never sees it.
 			modeEnv = append(modeEnv, objectStoreEnv()...)
-		} else {
-			dst = normalizeAnyURI(destination, "", opts.PreserveStructure)
 		}
 	default: // ModeEmbedded
 		// SLICE 1 split: /jfs/... destinations go through the FUSE-
@@ -255,12 +291,57 @@ func RunSync(ctx context.Context, juicefsBin string, spec RunSyncSpec, source, d
 		// mount to an Out-direction destination like /external/foo
 		// and silently write outside the intended target.
 		trimmed := strings.TrimSpace(destination)
-		if strings.HasPrefix(trimmed, "/jfs") {
+		if isVolumeUserPath(trimmed) {
 			dst = normalizeDestURIEmbedded(destination, spec.FUSEMount, opts.PreserveStructure)
 		} else {
 			dst = normalizeAnyURI(destination, "", opts.PreserveStructure)
 		}
 	}
+
+	// With a juicefs that confines file:// roots, open every local root
+	// beneath its trusted anchor and hand juicefs the open folder
+	// (sync_roots.go). Otherwise keep paths by name and no --links.
+	confined, err := juicefsConfinesFileRoots(juicefsBin)
+	if err != nil {
+		return err
+	}
+	var extraFiles []*os.File
+	fdLabels := map[string]string{}
+	var sr, dr syncRoot
+	if confined {
+		var cleanup func()
+		sr, dr, cleanup, err = openSyncRoots(spec, source, destination, src, dst, opts.DryRun)
+		if err != nil {
+			return err
+		}
+		defer cleanup()
+		for _, r := range []*syncRoot{&sr, &dr} {
+			if r.file == nil {
+				continue
+			}
+			extraFiles = append(extraFiles, r.file)
+			fdPath := "/proc/self/fd/" + strconv.Itoa(2+len(extraFiles))
+			r.uri = "file://" + fdPath + "/"
+			fdLabels[fdPath] = r.label
+		}
+		defer func() {
+			for _, f := range extraFiles {
+				f.Close()
+			}
+		}()
+		src, dst = sr.uri, dr.uri
+		// The patched juicefs then refuses any file:// root it would
+		// have to open by path (third_party/juicefs patch 0016).
+		modeEnv = append(modeEnv, "JM_FILE_ROOT_FD_ONLY=1")
+	}
+	// --links only into the volume (In, Between): the destination is a
+	// confined volume root or a jfs:// volume, so a stored link resolves
+	// beneath it or in the volume's own namespace. Out to a host root
+	// stays without --links: a link made on a Mac must not land verbatim
+	// where other software (SMB, backup tools) may follow it. There the
+	// confined source root refuses to follow a link that leaves it, and a
+	// link inside it is copied as a file.
+	links := confined && dr.volume && (sr.file != nil || strings.HasPrefix(src, "jfs://"))
 
 	threads := opts.Threads
 	if threads <= 0 {
@@ -279,6 +360,17 @@ func RunSync(ctx context.Context, juicefsBin string, spec RunSyncSpec, source, d
 		// counters (juicefs's stderr progress bar is TTY-only; non-TTY
 		// stderr emits sparse logs that the regex parser barely catches).
 		"--metrics", metricsAddr,
+	}
+	// Copy symlinks as links only when both ends keep them confined: a
+	// file:// root opened by the Manager (the patched backend resolves
+	// beneath it) or a jfs:// volume (links resolve in the volume's own
+	// namespace). sftp:// and nfs:// are not confined, so a stored link
+	// there could lead a later write on that server outside its folder;
+	// those keep the previous behaviour. Without --links juicefs follows
+	// source links, and the confined source root refuses any that leave
+	// it.
+	if links {
+		args = append(args, "--links")
 	}
 	if opts.PreserveTimes {
 		// juicefs sync 1.3.1 only exposes --perms (mode bits). mtime
@@ -323,6 +415,9 @@ func RunSync(ctx context.Context, juicefsBin string, spec RunSyncSpec, source, d
 	// outright would leave juicefs without PATH for its child processes
 	// (e.g. the temp-dir resolution it does on macOS).
 	cmd.Env = append(os.Environ(), modeEnv...)
+	// Confined roots: ExtraFiles[i] is fd 3+i in juicefs, matching the
+	// file:///proc/self/fd/N/ URIs built above.
+	cmd.ExtraFiles = extraFiles
 
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
@@ -360,7 +455,18 @@ func RunSync(ctx context.Context, juicefsBin string, spec RunSyncSpec, source, d
 		defer close(metricsDone)
 		pollJuicefsMetrics(metricsCtx, metricsAddr, progress)
 	}()
-	parseSyncProgress(teed, progress)
+	volURI := spec.Mode == ModeStandalone && (strings.HasPrefix(src, "jfs://"+spec.VolName+"/") || strings.HasPrefix(dst, "jfs://"+spec.VolName+"/"))
+	report := parseSyncProgressReport(teed, progress, func(p string) string {
+		for fdPath, label := range fdLabels {
+			if p == fdPath || strings.HasPrefix(p, fdPath+"/") {
+				return label + p[len(fdPath):]
+			}
+		}
+		if volURI && strings.HasPrefix(p, "/") && !strings.HasPrefix(p, "/proc/self/fd/") {
+			return volumeUserPrefix + p // a path inside the volume (jfs://)
+		}
+		return p
+	})
 	stopMetrics()
 	<-metricsDone
 
@@ -369,10 +475,20 @@ func RunSync(ctx context.Context, juicefsBin string, spec RunSyncSpec, source, d
 			return context.Canceled
 		}
 		tail := stderrTail.String()
+		// Name the user's paths instead of the fd paths juicefs saw.
+		for fdPath, label := range fdLabels {
+			tail = strings.ReplaceAll(tail, fdPath, label)
+		}
 		if tail == "" {
 			return fmt.Errorf("juicefs sync exited: %w (no stderr output)", err)
 		}
 		return fmt.Errorf("juicefs sync exited: %w — last stderr:\n%s", err, tail)
+	}
+	if report.SkippedLinks > 0 {
+		// The job's progress carries the count and the first names
+		// (skipped_links, skipped_link_sample); the log names them too.
+		log.Printf("manager: sync %s -> %s skipped %d symlink(s) that lead outside the sync root or cannot be followed (not copied); first: %s",
+			source, destination, report.SkippedLinks, strings.Join(report.SkippedLinkSample, ", "))
 	}
 
 	// Post-sync writability fix. Source datasets sometimes carry odd
@@ -394,8 +510,12 @@ func RunSync(ctx context.Context, juicefsBin string, spec RunSyncSpec, source, d
 	// A future POSIX-ACL slice will replace this with a configurable
 	// policy; for now, "every migrated file is read+write in the
 	// mount" is the contract.
-	if spec.Mode == ModeEmbedded && spec.FUSEMount != "" {
-		applyPostSyncPermissions(ctx, destination, spec.OwnerUID, spec.OwnerGID)
+	//
+	// Only a volume destination gets the fixup: its purpose is to let the
+	// mount client write migrated data. A host destination (Out) is not
+	// changed. A dry run changes nothing on disk, so it is skipped then.
+	if !opts.DryRun && spec.Mode == ModeEmbedded && spec.FUSEMount != "" && isVolumeUserPath(strings.TrimSpace(destination)) {
+		applyPostSyncPermissions(ctx, destination, spec.FUSEMount, spec.OwnerUID, spec.OwnerGID)
 	}
 	return nil
 }
@@ -419,25 +539,20 @@ func RunSync(ctx context.Context, juicefsBin string, spec RunSyncSpec, source, d
 // Errors are logged but never propagated — the sync itself already
 // succeeded, and a perms fixup on a single file shouldn't flip the job to
 // failed in the UI.
-func applyPostSyncPermissions(ctx context.Context, destination string, ownerUID, ownerGID int) {
-	// destination is a juicefs sync URI (file:///<mount>/...). Rewrite to a
-	// local path by stripping the file:// prefix.
-	target := strings.TrimPrefix(destination, "file://")
-	target = strings.TrimSuffix(target, "/")
-	if target == "" {
+func applyPostSyncPermissions(ctx context.Context, destination, fuseMount string, ownerUID, ownerGID int) {
+	// destination is the user-facing volume path (/jfs/...). The sync may
+	// have run for hours, so confine it again now: a folder swapped for a
+	// symlink during the sync is refused here. applyPermsBeneath then
+	// opens it component by component with O_NOFOLLOW from the mount, so
+	// a swap after this check is refused too.
+	vp, err := confineVolumePath(destination, volumeUserPrefix, fuseMount, true)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "manager: post-sync permissions on %q skipped (job stays successful): %v\n", destination, err)
 		return
 	}
-	// (1) mode
-	cmd := exec.CommandContext(ctx, "chmod", "-R", "u+rwX,g+rwX,o+rX", target)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		fmt.Fprintf(os.Stderr, "manager: post-sync chmod on %q failed (job stays successful): %v\noutput:\n%s\n", target, err, string(out))
-	}
-	// (2) ownership — hand the tree to the mounting client so it can WRITE.
-	if args := chownArgs(ownerUID, ownerGID, target); args != nil {
-		cmd := exec.CommandContext(ctx, "chown", args...)
-		if out, err := cmd.CombinedOutput(); err != nil {
-			fmt.Fprintf(os.Stderr, "manager: post-sync chown %s on %q failed (job stays successful): %v\noutput:\n%s\n", chownSpec(ownerUID, ownerGID), target, err, string(out))
-		}
+	rel := strings.TrimPrefix(vp.Real, vp.MountReal)
+	if err := applyPermsBeneath(ctx, vp.MountReal, rel, ownerUID, ownerGID, true); err != nil {
+		fmt.Fprintf(os.Stderr, "manager: post-sync permissions (mode, owner %s) on %q incomplete (job stays successful): %v\n", chownSpec(ownerUID, ownerGID), destination, err)
 	}
 }
 
@@ -450,7 +565,7 @@ func chownSpec(uid, gid int) string {
 	return strconv.Itoa(uid)
 }
 
-// chownArgs builds the `chown -R <uid[:gid]> <target>` argument vector, or
+// chownArgs builds the `chown -R -h <uid[:gid]> <target>` argument vector, or
 // nil when no chown should run — uid <= 0 (unset / root: never a valid
 // client owner, and root-owned is exactly the bug we're fixing) or an empty
 // target. Split out for testability so we can assert the exact argv without
@@ -459,7 +574,10 @@ func chownArgs(uid, gid int, target string) []string {
 	if uid <= 0 || target == "" {
 		return nil
 	}
-	return []string{"-R", chownSpec(uid, gid), target}
+	// -h: change a symlink itself, never its target, so a symlink in the
+	// tree cannot lead the chown outside it. GNU chown -R already does
+	// this by default (-P); -h makes it explicit.
+	return []string{"-R", "-h", chownSpec(uid, gid), target}
 }
 
 // pollJuicefsMetrics scrapes the juicefs sync Prometheus endpoint every
@@ -696,6 +814,22 @@ var progressRegex = regexp.MustCompile(
 // counters, and emits ProgressEvent. Closes nothing — caller owns
 // the `progress` channel lifecycle.
 func parseSyncProgress(r io.Reader, progress chan<- ProgressEvent) {
+	parseSyncProgressReport(r, progress, func(p string) string { return p })
+}
+
+// skippedLinkLine matches juicefs's warning for a symlink it skipped while
+// listing with links followed (third_party/juicefs patch 0016): the
+// confined file backend skips one that would leave the root, and the jfs://
+// backend one that cannot be followed in the volume (dangling).
+var skippedLinkLine = regexp.MustCompile(`skipped symlink "((?:[^"\\]|\\.)*)" that (?:leads outside the file storage root|cannot be followed in the volume)`)
+
+// maxSkippedLinkSample bounds the skipped-link names kept in a job.
+const maxSkippedLinkSample = 5
+
+// parseSyncProgressReport is parseSyncProgress that also counts skipped
+// symlinks (naming the first few, through rename, which maps fd paths
+// back to the user's paths) and returns the final state.
+func parseSyncProgressReport(r io.Reader, progress chan<- ProgressEvent, rename func(string) string) ProgressEvent {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024) // 1 MiB max line
 	lastEmit := time.Now()
@@ -703,6 +837,17 @@ func parseSyncProgress(r io.Reader, progress chan<- ProgressEvent) {
 	for scanner.Scan() {
 		line := scanner.Text()
 		updated := false
+		if m := skippedLinkLine.FindStringSubmatch(line); m != nil {
+			p := m[1]
+			if u, err := strconv.Unquote(`"` + m[1] + `"`); err == nil {
+				p = u
+			}
+			current.SkippedLinks++
+			if len(current.SkippedLinkSample) < maxSkippedLinkSample {
+				current.SkippedLinkSample = append(current.SkippedLinkSample, rename(p))
+			}
+			updated = true
+		}
 		matches := progressRegex.FindAllStringSubmatch(line, -1)
 		for _, m := range matches {
 			label := strings.ToLower(extractLabel(m[0]))
@@ -757,9 +902,11 @@ func parseSyncProgress(r io.Reader, progress chan<- ProgressEvent) {
 			// progress lines doesn't overwhelm SSE consumers.
 			if now.Sub(lastEmit) >= 200*time.Millisecond {
 				current.UpdatedAt = now.UnixMilli()
+				ev := current
+				ev.SkippedLinkSample = append([]string(nil), current.SkippedLinkSample...)
 				// Best-effort send; drop if buffer is full.
 				select {
-				case progress <- current:
+				case progress <- ev:
 				default:
 				}
 				lastEmit = now
@@ -772,14 +919,17 @@ func parseSyncProgress(r io.Reader, progress chan<- ProgressEvent) {
 	// we emit a zeroed event after it stopped, last-write-wins in jobs.go
 	// would clobber the accurate metrics-derived final state and the UI
 	// would show 0 files / 0 bytes for a successful copy.
-	if current.Files == 0 && current.Bytes == 0 && current.Errors == 0 && current.Current == "" {
-		return
+	if current.Files == 0 && current.Bytes == 0 && current.Errors == 0 && current.Current == "" && current.SkippedLinks == 0 {
+		return current
 	}
 	current.UpdatedAt = time.Now().UnixMilli()
+	ev := current
+	ev.SkippedLinkSample = append([]string(nil), current.SkippedLinkSample...)
 	select {
-	case progress <- current:
+	case progress <- ev:
 	default:
 	}
+	return current
 }
 
 // extractLabel returns the label part of a match like "copied: 50"

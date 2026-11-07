@@ -117,7 +117,7 @@ func fakeJuicefs(t *testing.T) (bin, marker string) {
 	dir := t.TempDir()
 	marker = filepath.Join(dir, "juicefs-ran")
 	bin = filepath.Join(dir, "juicefs")
-	script := "#!/bin/sh\ntouch '" + marker + "'\nexit 0\n"
+	script := "#!/bin/sh\n" + stockVersionAnswer + "touch '" + marker + "'\nexit 0\n"
 	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -253,11 +253,11 @@ func TestH8BProjectsForSync(t *testing.T) {
 		{"/jfs/data/P/sub/deeper", true, []string{"path:/data/P"}},
 		{"/jfs/data/P", true, []string{"path:/data/P"}},
 		{"/jfs/data", true, []string{"path:/data/A", "path:/data/B"}},
-		{"/jfs/data", false, []string{"path:/data/" + filepath.Base(src)}},
+		{"/jfs/data", false, []string{"path:/data/A", "path:/data/B"}}, // contents either way
 		{"/external/backup", true, nil},
 	}
 	for _, c := range cases {
-		got, err := projectsForSync(src, c.dest, c.preserve)
+		got, err := projectsForSync(src, c.dest)
 		if err != nil {
 			t.Fatal(err)
 		}

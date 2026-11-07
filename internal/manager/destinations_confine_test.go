@@ -139,7 +139,7 @@ func TestStoredUnconfinedFileDestinationRefusedAtUseAndTest(t *testing.T) {
 		t.Errorf("ToSyncURI accepted unconfined path, uri %q", uri)
 	}
 	sched := scheduleState{Destination: DestinationRef{Name: "legacy"}}
-	if _, uri, _, msg := resolveScheduleSpec(sched, store, ""); msg == "" {
+	if uri, _, msg := resolveScheduleSpec(sched, store, ""); msg == "" {
 		t.Errorf("schedule resolved unconfined destination to %q", uri)
 	}
 }
@@ -345,12 +345,12 @@ func TestScheduleSubPathStaysInsideFileDestination(t *testing.T) {
 	}
 	for _, sub := range []string{"../../etc", "nested/../../..", "link", "link/new"} {
 		sched := scheduleState{Destination: DestinationRef{Name: "bk", Path: sub}}
-		if _, uri, _, msg := resolveScheduleSpec(sched, store, ""); msg == "" {
+		if uri, _, msg := resolveScheduleSpec(sched, store, ""); msg == "" {
 			t.Errorf("schedule sub-path %q resolved outside the destination to %q", sub, uri)
 		}
 	}
 	sched := scheduleState{Destination: DestinationRef{Name: "bk", Path: "daily"}}
-	if _, uri, _, msg := resolveScheduleSpec(sched, store, ""); msg != "" || !strings.Contains(uri, "/backups/daily") {
+	if uri, _, msg := resolveScheduleSpec(sched, store, ""); msg != "" || !strings.Contains(uri, "/backups/daily") {
 		t.Errorf("normal sub-path: uri %q, msg %q", uri, msg)
 	}
 }

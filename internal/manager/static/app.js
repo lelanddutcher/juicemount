@@ -3275,6 +3275,9 @@
     const orig = btn.textContent;
     btn.disabled = true;
     btn.textContent = 'Testing…';
+    // A "host key verified" line from an earlier Test must not outlive a
+    // Test that fails, for example after the server's key changed.
+    $('#dest-flash').hidden = true;
     const testPath = `/api/destinations/${encodeURIComponent(name)}/test`;
     try {
       let res = await api('POST', testPath);
@@ -3299,6 +3302,13 @@
       }
       if (!res || !res.ok) throw new Error('test did not complete');
       btn.textContent = 'OK';
+      // SFTP: a passing test means the server presented the pinned key.
+      // Show its fingerprint so the operator sees which key was verified.
+      if (res.host_key_fingerprint) {
+        const f = $('#dest-flash');
+        f.textContent = `${name}: host key verified (${res.host_key_fingerprint}).`;
+        f.hidden = false;
+      }
       setTimeout(() => { btn.textContent = orig; btn.disabled = false; }, 2000);
     } catch (e) {
       btn.textContent = 'Failed';

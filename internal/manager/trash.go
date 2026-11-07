@@ -709,9 +709,8 @@ func (a *API) handleTrashRestore(w http.ResponseWriter, r *http.Request) {
 	// AND verify it points inside the .trash subtree — without this
 	// gate a malicious caller could POST {"path":"/jfs/important.mp4"}
 	// and rename a live file via the restore handler.
-	entryPath := userToFusePath(req.Path, a.fuseMount, a.destMount)
-	if !isInsideTrash(entryPath, a.fuseMount) {
-		http.Error(w, "path is not under the trash subtree", http.StatusBadRequest)
+	entryPath, ok := a.trashEntryPath(w, req.Path)
+	if !ok {
 		return
 	}
 	// Default target = the decoded original path under the volume,
@@ -732,23 +731,38 @@ func (a *API) handleTrashRestore(w http.ResponseWriter, r *http.Request) {
 	// could pass target_path="/etc/cron.d/pwn", which userToFusePath
 	// passes through unchanged (not under destMount), and restoreTrash
 	// would os.MkdirAll+os.Rename a caller-controlled file there as root.
-	// jfsPathAllowed filepath.Clean's first, so "/jfs/../etc" is rejected
-	// too. Mirrors the gate handleMigrate / handlePermissionsFix use.
-	if !a.jfsPathAllowed(target) {
+	// Mirrors the gate handleMigrate / handlePermissionsFix use.
+	//
+	// confineVolume cleans the target once (so "/jfs/../etc" is
+	// rejected) and resolves its parent the way the kernel will for
+	// MkdirAll and Rename, so a symlink stored in the volume cannot lead
+	// the restore outside it. The final component is not followed:
+	// Rename does not write through it, and restoreTrash picks a new
+	// name when it already exists.
+	tp, err := a.confineVolume(target, false)
+	if err != nil {
 		http.Error(w, "restore target must be under "+a.destMount, http.StatusForbidden)
 		return
 	}
-	fuseTarget := userToFusePath(target, a.fuseMount, a.destMount)
+	fuseTarget := tp.Fuse
+	// The volume root is not a restore target: there is nothing to
+	// rename onto, and a collision rename would name a sibling of the
+	// mount.
+	if fuseTarget == strings.TrimSuffix(a.fuseMount, "/") || tp.Real == tp.MountReal {
+		http.Error(w, "restore target must name a path inside "+a.destMount, http.StatusBadRequest)
+		return
+	}
 	// Refuse to restore over the .trash subtree itself.
-	if isInsideTrash(fuseTarget, a.fuseMount) {
+	if isInsideTrash(fuseTarget, a.fuseMount) || isInsideTrash(tp.Real, tp.MountReal) {
 		http.Error(w, "target cannot be inside .trash/", http.StatusBadRequest)
 		return
 	}
 	// H-8B: the restore writes into the target's project; check it out
 	// first so a project another principal holds is refused before the
-	// rename, not by the proxy after it.
+	// rename, not by the proxy after it. The project is judged where
+	// the rename lands, after symlinks in the volume.
 	if leaser := a.jobs.projectLeaser(); leaser != nil {
-		if proj := projectOfVolumePath(strings.TrimPrefix(fuseTarget, strings.TrimSuffix(a.fuseMount, "/"))); proj != "" {
+		if proj := projectOfVolumePath(strings.TrimPrefix(tp.Real, strings.TrimSuffix(tp.MountReal, "/"))); proj != "" {
 			release, _, lerr := leaser.Checkout(r.Context(), []string{proj})
 			var leased *ProjectLeasedError
 			switch {
@@ -764,6 +778,9 @@ func (a *API) handleTrashRestore(w http.ResponseWriter, r *http.Request) {
 				defer release()
 			}
 		}
+	}
+	if !trashEntryExists(w, entryPath) {
+		return
 	}
 	final, err := restoreTrash(entryPath, fuseTarget)
 	if err != nil {
@@ -798,9 +815,8 @@ func (a *API) handleTrashDelete(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "path is required", http.StatusBadRequest)
 		return
 	}
-	entryPath := userToFusePath(req.Path, a.fuseMount, a.destMount)
-	if !isInsideTrash(entryPath, a.fuseMount) {
-		http.Error(w, "path is not under the trash subtree", http.StatusBadRequest)
+	entryPath, ok := a.trashEntryPath(w, req.Path)
+	if !ok || !trashEntryExists(w, entryPath) {
 		return
 	}
 	if err := deleteTrash(entryPath); err != nil {
@@ -893,6 +909,50 @@ func (a *API) handleTrashConfig(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "GET or PUT", http.StatusMethodNotAllowed)
 	}
+}
+
+// trashEntryPath maps a trash entry's user-facing path to the FUSE path
+// restore and delete act on. The path is cleaned once and its parent is
+// resolved the way the kernel will: the cleaned text AND the resolved
+// location must both be under .trash, so neither ".." nor a trashed
+// symlink can make the handler rename or delete something else. The
+// entry itself is not followed (a trashed symlink is moved or removed as
+// a link). Writes the HTTP error and returns false on refusal.
+func (a *API) trashEntryPath(w http.ResponseWriter, userPath string) (string, bool) {
+	vp, err := a.confineVolume(userPath, false)
+	if err != nil || !isTrashEntry(vp.Fuse, a.fuseMount) || !isTrashEntry(vp.Real, vp.MountReal) {
+		http.Error(w, "path is not a trash entry", http.StatusBadRequest)
+		return "", false
+	}
+	return vp.Fuse, true
+}
+
+// trashEntryExists answers 404 for a missing entry, so restore and delete
+// never act on (or create folders for) an entry that is not there.
+func trashEntryExists(w http.ResponseWriter, entryPath string) bool {
+	if _, err := os.Lstat(entryPath); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			http.Error(w, "trash entry not found", http.StatusNotFound)
+		} else {
+			log.Printf("manager: trash entry Lstat(%q): %v", entryPath, err)
+			http.Error(w, "cannot stat trash entry", http.StatusBadRequest)
+		}
+		return false
+	}
+	return true
+}
+
+// isTrashEntry reports whether p is an entry inside a trash bucket:
+// <fuseMount>/.trash/<bucket>/<entry>[/...]. The trash root and a bucket
+// folder are not entries; deleting either would purge many entries
+// without the Empty-Trash confirmation.
+func isTrashEntry(p, fuseMount string) bool {
+	if fuseMount == "" {
+		return false
+	}
+	trashRoot := filepath.Join(strings.TrimSuffix(fuseMount, "/"), trashDir)
+	rel, ok := strings.CutPrefix(filepath.Clean(p), trashRoot+string(filepath.Separator))
+	return ok && strings.Contains(rel, string(filepath.Separator))
 }
 
 // isInsideTrash returns true iff `p` is under <fuseMount>/.trash/ —

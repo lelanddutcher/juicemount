@@ -425,12 +425,13 @@ func projectOfVolumePath(p string) string {
 // projectsForSync lists the projects a sync of source into destination
 // (user-facing /jfs/... path) writes. A destination inside a project is that
 // project. A destination above project depth spreads the source's top-level
-// entries (or the source itself without preserve-structure) into projects
-// one level down. A destination outside /jfs writes no project.
+// entries into projects one level down (RunSync copies the source's
+// contents into the destination with either preserve_structure setting).
+// A destination outside /jfs writes no project.
 //
 // An unreadable source above project depth is an error, not "no projects":
 // the sync would still write, so it must not run without its checkouts.
-func projectsForSync(source, destination string, preserveStructure bool) ([]string, error) {
+func projectsForSync(source, destination string) ([]string, error) {
 	dest := strings.TrimSpace(destination)
 	if dest != "/jfs" && !strings.HasPrefix(dest, "/jfs/") {
 		return nil, nil
@@ -447,18 +448,14 @@ func projectsForSync(source, destination string, preserveStructure bool) ([]stri
 	}
 	var names []string
 	src := strings.TrimSpace(source)
-	if preserveStructure {
-		ents, err := os.ReadDir(src)
-		if err != nil {
-			return nil, fmt.Errorf("listing the sync source to find its target projects: %w", err)
+	ents, err := os.ReadDir(src)
+	if err != nil {
+		return nil, fmt.Errorf("listing the sync source to find its target projects: %w", err)
+	}
+	for _, e := range ents {
+		if e.IsDir() {
+			names = append(names, e.Name())
 		}
-		for _, e := range ents {
-			if e.IsDir() {
-				names = append(names, e.Name())
-			}
-		}
-	} else {
-		names = []string{filepath.Base(filepath.Clean(src))}
 	}
 	out := make([]string, 0, len(names))
 	for _, n := range names {
@@ -474,7 +471,7 @@ func checkoutForSync(ctx context.Context, spec RunSyncSpec, source, destination 
 	if spec.Leases == nil {
 		return ctx, func() {}, nil
 	}
-	projects, err := projectsForSync(source, destination, opts.PreserveStructure)
+	projects, err := projectsForSync(source, destination)
 	if err != nil {
 		return ctx, nil, err
 	}

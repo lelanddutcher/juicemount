@@ -43,5 +43,5 @@ func getOwnerGroup(info os.FileInfo) (string, string) {
 
 func (d *filestore) Chtimes(key string, mtime time.Time) error {
 	p := d.path(key)
-	return lchtimes(p, time.Time{}, mtime)
+	return d.ops.Lchtimes(p, mtime)
 }

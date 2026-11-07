@@ -1,0 +1,359 @@
+--- a/cmd/object.go
++++ b/cmd/object.go
+@@ -288,6 +288,24 @@
+ 
+ // readDirSorted reads the directory named by dirname and returns
+ // a sorted list of directory entries.
++// jmSkippableLink reports whether a followed link failed for a reason that
++// is permanent and means "no target in this volume": the target does not
++// exist (ENOENT, ENOTDIR), or it is absolute or a URL, which this backend
++// never follows (pkg/fs doResolve returns ENOTSUP; confirmed here by
++// reading the link). Any other error (EIO, ELOOP, ...) is not skippable:
++// it keeps upstream's handling and fails the sync.
++func jmSkippableLink(j *juiceFS, p string, err syscall.Errno) bool {
++	switch err {
++	case syscall.ENOENT, syscall.ENOTDIR:
++		return true
++	case syscall.ENOTSUP:
++		target, rerr := j.jfs.Readlink(ctx, p)
++		t := string(target)
++		return rerr == 0 && (strings.HasPrefix(t, "/") || strings.Contains(t, "://"))
++	}
++	return false
++}
++
+ func (j *juiceFS) readDirSorted(dirname string, followLink bool) ([]*mEntry, syscall.Errno) {
+ 	f, err := j.jfs.Open(ctx, dirname, 0)
+ 	if err != 0 {
+@@ -298,24 +316,31 @@
+ 	if err != 0 {
+ 		return nil, err
+ 	}
+-	mEntries := make([]*mEntry, len(entries))
+-	for i, e := range entries {
++	mEntries := make([]*mEntry, 0, len(entries))
++	for _, e := range entries {
+ 		fi := fs.AttrToFileInfo(e.Inode, e.Attr)
+ 		if fi.IsDir() {
+-			mEntries[i] = &mEntry{fi, string(e.Name) + dirSuffix, false}
++			mEntries = append(mEntries, &mEntry{fi, string(e.Name) + dirSuffix, false})
+ 		} else if fi.IsSymlink() && followLink {
+ 			fi2, err := j.jfs.Stat(ctx, path.Join(dirname, string(e.Name)))
++			if err != 0 && jmSkippableLink(j, path.Join(dirname, string(e.Name)), err) {
++				// JuiceMount: a link that can never be followed in the
++				// volume is skipped with a warning instead of failing the
++				// copy of the whole tree. The Manager counts this line.
++				logger.Warnf("skipped symlink %q that cannot be followed in the volume: %s", path.Join(dirname, string(e.Name)), err)
++				continue
++			}
+ 			if err != 0 {
+-				mEntries[i] = &mEntry{fi, string(e.Name), true}
++				mEntries = append(mEntries, &mEntry{fi, string(e.Name), true})
+ 				continue
+ 			}
+ 			name := string(e.Name)
+ 			if fi2.IsDir() {
+ 				name += dirSuffix
+ 			}
+-			mEntries[i] = &mEntry{fi2, name, false}
++			mEntries = append(mEntries, &mEntry{fi2, name, false})
+ 		} else {
+-			mEntries[i] = &mEntry{fi, string(e.Name), fi.IsSymlink()}
++			mEntries = append(mEntries, &mEntry{fi, string(e.Name), fi.IsSymlink()})
+ 		}
+ 	}
+ 	sort.Slice(mEntries, func(i, j int) bool { return mEntries[i].name < mEntries[j].name })
+--- a/cmd/sync.go
++++ b/cmd/sync.go
+@@ -317,6 +317,9 @@
+ 	return uri, ""
+ }
+ 
++// fdRootPattern matches a file:// root passed as an open folder.
++var fdRootPattern = regexp.MustCompile(`^/proc/self/fd/[0-9]+/?$`)
++
+ func createSyncStorage(uri string, conf *sync.Config) (object.ObjectStorage, error) {
+ 	// nolint:staticcheck
+ 	uri = strings.TrimPrefix(uri, "sftp://")
+@@ -367,6 +370,12 @@
+ 	var endpoint string
+ 	if name == "file" {
+ 		endpoint = u.Path
++		// JuiceMount: with JM_FILE_ROOT_FD_ONLY=1 the caller hands every
++		// file:// root over as an open folder; a root named by path would
++		// be resolved by path, so it is refused.
++		if os.Getenv("JM_FILE_ROOT_FD_ONLY") == "1" && !fdRootPattern.MatchString(endpoint) {
++			return nil, fmt.Errorf("refused: file:// root %s must be an open folder (/proc/self/fd/N/) when JM_FILE_ROOT_FD_ONLY=1", endpoint)
++		}
+ 	} else if name == "hdfs" {
+ 		endpoint = u.Host
+ 	} else if name == "jfs" {
+--- a/pkg/object/file.go
++++ b/pkg/object/file.go
+@@ -18,6 +18,7 @@
+ 
+ import (
+ 	"bytes"
++	"errors"
+ 	"fmt"
+ 	"io"
+ 	"io/fs"
+@@ -43,22 +44,25 @@
+ type filestore struct {
+ 	DefaultObjectStorage
+ 	root string
++	// ops performs every filesystem operation. On Linux it resolves each
++	// path beneath the root (file_beneath_linux.go).
++	ops fileOps
+ }
+ 
+ func (d *filestore) Symlink(oldName, newName string) error {
+ 	p := d.path(newName)
+-	if _, err := os.Stat(filepath.Dir(p)); err != nil && os.IsNotExist(err) {
+-		if err := os.MkdirAll(filepath.Dir(p), os.FileMode(0777)); err != nil {
++	if _, err := d.ops.Stat(filepath.Dir(p)); err != nil && os.IsNotExist(err) {
++		if err := d.ops.MkdirAll(filepath.Dir(p), os.FileMode(0777)); err != nil {
+ 			return err
+ 		}
+ 	} else if err != nil && !os.IsNotExist(err) {
+ 		return err
+ 	}
+-	return os.Symlink(oldName, p)
++	return d.ops.Symlink(oldName, p)
+ }
+ 
+ func (d *filestore) Readlink(name string) (string, error) {
+-	return os.Readlink(d.path(name))
++	return d.ops.Readlink(d.path(name))
+ }
+ 
+ func (d *filestore) String() string {
+@@ -77,13 +81,13 @@
+ 
+ func (d *filestore) Head(key string) (Object, error) {
+ 	p := d.path(key)
+-	fi, err := os.Lstat(p)
++	fi, err := d.ops.Lstat(p)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+ 	isSymlink := fi.Mode()&os.ModeSymlink != 0
+ 	if isSymlink {
+-		fi, err = os.Stat(p)
++		fi, err = d.ops.Stat(p)
+ 		if err != nil {
+ 			return nil, err
+ 		}
+@@ -120,7 +124,7 @@
+ func (d *filestore) Get(key string, off, limit int64, getters ...AttrGetter) (io.ReadCloser, error) {
+ 	p := d.path(key)
+ 
+-	f, err := os.Open(p)
++	f, err := d.ops.Open(p)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -148,7 +152,7 @@
+ 	p := d.path(key)
+ 
+ 	if strings.HasSuffix(key, dirSuffix) || key == "" && strings.HasSuffix(d.root, dirSuffix) {
+-		return os.MkdirAll(p, os.FileMode(0777))
++		return d.ops.MkdirAll(p, os.FileMode(0777))
+ 	}
+ 
+ 	var tmp string
+@@ -162,16 +166,16 @@
+ 		tmp = filepath.Join(filepath.Dir(p), "."+name+".tmp"+strconv.Itoa(rand.Int()))
+ 		defer func() {
+ 			if err != nil {
+-				_ = os.Remove(tmp)
++				_ = d.ops.Remove(tmp)
+ 			}
+ 		}()
+ 	}
+-	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0666)
++	f, err := d.ops.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0666)
+ 	if err != nil && os.IsNotExist(err) {
+-		if err := os.MkdirAll(filepath.Dir(p), os.FileMode(0777)); err != nil {
++		if err := d.ops.MkdirAll(filepath.Dir(p), os.FileMode(0777)); err != nil {
+ 			return err
+ 		}
+-		f, err = os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0666)
++		f, err = d.ops.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0666)
+ 	}
+ 	if err != nil {
+ 		return err
+@@ -193,7 +197,7 @@
+ 		return err
+ 	}
+ 	if !PutInplace {
+-		err = os.Rename(tmp, p)
++		err = d.ops.Rename(tmp, p)
+ 	}
+ 	return err
+ }
+@@ -208,24 +212,31 @@
+ 	}
+ 	p := d.path(key)
+ 	parent := filepath.Dir(p)
+-	if err := os.MkdirAll(parent, 0777); err != nil {
++	if err := d.ops.MkdirAll(parent, 0777); err != nil {
+ 		return err
+ 	}
+ 	// Sync the complete chain, including directories left by an interrupted
+ 	// earlier attempt. Syncing only the leaf would not establish its parents.
++	// Folders inside the root go through d.ops; the root's own ancestors
++	// are the configured, trusted path.
++	base := storageBaseDir(d.root)
+ 	for dir := parent; ; dir = filepath.Dir(dir) {
+-		if err := syncObjectDirectory(dir); err != nil {
++		syncDir := d.ops.SyncDir
++		if !strings.HasPrefix(dir+"/", strings.TrimSuffix(base, "/")+"/") {
++			syncDir = syncObjectDirectory
++		}
++		if err := syncDir(dir); err != nil {
+ 			return err
+ 		}
+ 		if filepath.Dir(dir) == dir {
+ 			break
+ 		}
+ 	}
+-	f, err := os.CreateTemp(parent, ".juicemount-create-*")
+-	if err != nil {
+-		return err
+-	}
+-	defer os.Remove(f.Name()) // Only this attempt's private name, never p.
++	f, err := d.ops.CreateTemp(parent, ".juicemount-create-")
++	if err != nil {
++		return err
++	}
++	defer d.ops.Remove(f.Name()) // Only this attempt's private name, never p.
+ 	if _, err := io.Copy(f, in); err != nil {
+ 		_ = f.Close()
+ 		return err
+@@ -237,10 +248,10 @@
+ 	if err := f.Close(); err != nil {
+ 		return err
+ 	}
+-	if err := os.Link(f.Name(), p); err != nil {
+-		return err
+-	}
+-	return syncObjectDirectory(parent)
++	if err := d.ops.Link(f.Name(), p); err != nil {
++		return err
++	}
++	return d.ops.SyncDir(parent)
+ }
+ 
+ func syncObjectDirectory(name string) error {
+@@ -266,7 +277,7 @@
+ }
+ 
+ func (d *filestore) Delete(key string, getters ...AttrGetter) error {
+-	err := os.Remove(d.path(key))
++	err := d.ops.Remove(d.path(key))
+ 	if err != nil && os.IsNotExist(err) {
+ 		err = nil
+ 	}
+@@ -300,35 +311,41 @@
+ 
+ // readDirSorted reads the directory named by dir and returns
+ // a sorted list of directory entries.
+-func readDirSorted(dir string, followLink bool) ([]*mEntry, error) {
+-	f, err := os.Open(dir)
++//
++// Listing and a followed symlink's stat go through ops, so on Linux a
++// symlink is followed only beneath the root; one that leads outside is
++// listed as a broken link.
++func readDirSortedOps(ops fileOps, dir string, followLink bool) ([]*mEntry, error) {
++	entries, err := ops.ReadDir(dir)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	defer f.Close()
+-	entries, err := f.Readdir(-1)
+-	if err != nil {
+-		return nil, err
+-	}
+-
+-	mEntries := make([]*mEntry, len(entries))
+-	for i, e := range entries {
++
++	mEntries := make([]*mEntry, 0, len(entries))
++	for _, e := range entries {
+ 		isSymlink := e.Mode()&os.ModeSymlink != 0
+ 		if e.IsDir() {
+-			mEntries[i] = &mEntry{e, e.Name() + dirSuffix, nil, false}
++			mEntries = append(mEntries, &mEntry{e, e.Name() + dirSuffix, nil, false})
+ 		} else if isSymlink && followLink {
+-			fi, err := os.Stat(filepath.Join(dir, e.Name()))
++			fi, err := ops.Stat(filepath.Join(dir, e.Name()))
++			if errors.Is(err, errOutsideRoot) {
++				// A link the confined backend will not follow (absolute,
++				// or leaving the root): skip it like a dangling link,
++				// without failing the sync. The Manager counts this line.
++				logger.Warnf("skipped symlink %q that leads outside the file storage root", filepath.Join(dir, e.Name()))
++				continue
++			}
+ 			if err != nil {
+-				mEntries[i] = &mEntry{e, e.Name(), nil, true}
++				mEntries = append(mEntries, &mEntry{e, e.Name(), nil, true})
+ 				continue
+ 			}
+ 			name := e.Name()
+ 			if fi.IsDir() {
+ 				name = e.Name() + dirSuffix
+ 			}
+-			mEntries[i] = &mEntry{e, name, fi, false}
++			mEntries = append(mEntries, &mEntry{e, name, fi, false})
+ 		} else {
+-			mEntries[i] = &mEntry{e, e.Name(), nil, isSymlink}
++			mEntries = append(mEntries, &mEntry{e, e.Name(), nil, isSymlink})
+ 		}
+ 	}
+ 	sort.Slice(mEntries, func(i, j int) bool { return mEntries[i].Name() < mEntries[j].Name() })
+@@ -356,7 +373,7 @@
+ 		}
+ 		objs = append(objs, obj)
+ 	}
+-	entries, err := readDirSorted(dir, followLink)
++	entries, err := readDirSortedOps(d.ops, dir, followLink)
+ 	if err != nil {
+ 		if os.IsPermission(err) {
+ 			logger.Warnf("skip %s: %s", dir, err)
+@@ -392,7 +409,7 @@
+ 
+ func (d *filestore) Chmod(key string, mode os.FileMode) error {
+ 	p := d.path(key)
+-	return os.Chmod(p, mode)
++	return d.ops.Chmod(p, mode)
+ }
+ 
+ func (d *filestore) Chown(key string, owner, group string) error {
+@@ -402,7 +419,7 @@
+ 	if uid == -1 || gid == -1 {
+ 		return fmt.Errorf("user(%s):group(%s) not found", owner, group)
+ 	}
+-	return os.Lchown(p, uid, gid)
++	return d.ops.Lchown(p, uid, gid)
+ }
+ 
+ func newDisk(root, accesskey, secretkey, token string) (ObjectStorage, error) {
+@@ -410,7 +427,7 @@
+ 	if runtime.GOOS == "windows" {
+ 		root = strings.TrimPrefix(root, "/")
+ 	}
+-	return &filestore{root: root}, nil
++	return &filestore{root: root, ops: newFileOps(root)}, nil
+ }
+ 
+ func init() {
+--- a/pkg/object/file_unix.go
++++ b/pkg/object/file_unix.go
+@@ -43,5 +43,5 @@
+ 
+ func (d *filestore) Chtimes(key string, mtime time.Time) error {
+ 	p := d.path(key)
+-	return lchtimes(p, time.Time{}, mtime)
++	return d.ops.Lchtimes(p, mtime)
+ }
