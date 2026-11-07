@@ -73,6 +73,16 @@ type Fence struct {
 	failed      bool
 }
 
+// defaultCommands is the default user's command grant in StaticACL. The
+// default user is off with no password, so no client can log in as it or run
+// a command unauthenticated. It still holds every command because Redis 7.4
+// checks each MULTI/EXEC it replays from the append-only file at start
+// against the default user: under -@all it refused every replayed
+// transaction (and every Lua script, logged as one), so a restart silently
+// dropped the metadata written since the last AOF rewrite.
+// TestBackendAOFReplayKeepsTransactions pins this.
+const defaultCommands = "+@all"
+
 // StaticACL is the only accepted startup ACL file. Runtime worker identities
 // must never be persisted into it. Provisioning it belongs to deployment setup,
 // not to startup recovery; startup refuses changed content instead of repairing.
@@ -81,7 +91,7 @@ func StaticACL(secret string) (string, error) {
 		return "", mutationauthority.ErrInvalid
 	}
 	h := sha256.Sum256([]byte(secret))
-	return fmt.Sprintf("user default reset off -@all\nuser %s reset on #%x ~* &* +@all\n", ControlUser, h), nil
+	return fmt.Sprintf("user default reset off ~* &* %s\nuser %s reset on #%x ~* &* +@all\n", defaultCommands, ControlUser, h), nil
 }
 
 // Open first irreversibly pins the SAME ownership journal, then fences old
@@ -142,7 +152,7 @@ func Open(ctx context.Context, j *mutationauthority.Journal, volume string, cfg 
 	if err := f.server(ctx); err != nil {
 		return nil, Credentials{}, ErrUnavailable
 	}
-	if err := f.acl(ctx, "default", false, "", "-@all"); err != nil {
+	if err := f.acl(ctx, "default", false, "", defaultCommands); err != nil {
 		return nil, Credentials{}, ErrUnavailable
 	}
 	if err := f.acl(ctx, ControlUser, true, f.controlHash, "+@all"); err != nil {
@@ -184,7 +194,7 @@ func Open(ctx context.Context, j *mutationauthority.Journal, volume string, cfg 
 	if err := f.effectiveACLFile(ctx); err != nil {
 		return nil, Credentials{}, ErrUnavailable
 	}
-	if err := f.acl(ctx, "default", false, "", "-@all"); err != nil {
+	if err := f.acl(ctx, "default", false, "", defaultCommands); err != nil {
 		return nil, Credentials{}, ErrUnavailable
 	}
 	if err := f.acl(ctx, ControlUser, true, f.controlHash, "+@all"); err != nil {
@@ -222,7 +232,7 @@ func Open(ctx context.Context, j *mutationauthority.Journal, volume string, cfg 
 	if err := f.server(ctx); err != nil {
 		return nil, Credentials{}, ErrUnavailable
 	}
-	if err := f.acl(ctx, "default", false, "", "-@all"); err != nil {
+	if err := f.acl(ctx, "default", false, "", defaultCommands); err != nil {
 		return nil, Credentials{}, ErrUnavailable
 	}
 	var random [64]byte
@@ -308,7 +318,7 @@ func (f *Fence) check(ctx context.Context, baseline string) error {
 	if err := f.users(ctx, map[string]bool{"default": true, ControlUser: true, f.username: true}); err != nil {
 		return err
 	}
-	if err := f.acl(ctx, "default", false, "", "-@all"); err != nil {
+	if err := f.acl(ctx, "default", false, "", defaultCommands); err != nil {
 		return err
 	}
 	if err := f.acl(ctx, ControlUser, true, f.controlHash, "+@all"); err != nil {

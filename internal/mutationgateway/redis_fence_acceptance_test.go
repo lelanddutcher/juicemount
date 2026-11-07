@@ -74,7 +74,9 @@ func newFenceRedis(t *testing.T) *fenceRedisFixture {
 		t.Fatal("fixture Unix socket path exceeds platform limit")
 	}
 	adminHash := sha256.Sum256([]byte(f.adminSecret))
-	acl := fmt.Sprintf("user default reset off -@all\nuser control on #%x ~* &* +@all\n", adminHash)
+	// The default user mirrors mutationbackend.StaticACL: off with no
+	// password, but +@all so Redis can replay MULTI/EXEC from the AOF.
+	acl := fmt.Sprintf("user default reset off ~* &* +@all\nuser control on #%x ~* &* +@all\n", adminHash)
 	if err := os.WriteFile(filepath.Join(dir, "users.acl"), []byte(acl), 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -198,7 +200,7 @@ func (f *fenceRedisFixture) requireDefaultDenied() {
 	if !ok || len(row)%2 != 0 {
 		f.t.Fatal("unrecognized default ACL response")
 	}
-	off, noCommands := false, false
+	off, replayable := false, false
 	for i := 0; i < len(row); i += 2 {
 		switch row[i] {
 		case "flags":
@@ -213,11 +215,13 @@ func (f *fenceRedisFixture) requireDefaultDenied() {
 				off = off || flag == "off"
 			}
 		case "commands":
-			noCommands = row[i+1] == "-@all"
+			// +@all lets Redis replay transactions from the AOF; off with
+			// no password keeps every client from using it.
+			replayable = row[i+1] == "+@all"
 		}
 	}
-	if !off || !noCommands {
-		f.t.Fatal("default user is not explicitly off with all commands denied")
+	if !off || !replayable {
+		f.t.Fatal("default user is not off with the AOF-replay grant")
 	}
 }
 

@@ -22,7 +22,11 @@ external controller, or leaked administrative secret violates that requirement;
 
 Deployment supplies a private 64-character lowercase hexadecimal control secret
 and the exact mode-0600 ACL file returned by `StaticACL`. The default user is
-denied; only the control user is persisted. Startup refuses a changed baseline,
+off with no password, so no client can log in as it or run a command
+unauthenticated. It keeps every command because Redis checks transactions it
+replays from the append-only file at start against it; with no commands, a
+restart dropped every transaction since the last AOF rewrite. Only the control
+user is persisted. Startup refuses a changed baseline,
 unknown users, and a Redis run ID different from any retained process record.
 It never repairs unexpected state or persists runtime worker credentials.
 
