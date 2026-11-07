@@ -340,8 +340,10 @@ func RunSync(ctx context.Context, juicefsBin string, spec RunSyncSpec, source, d
 		// have to open by path (third_party/juicefs patch 0016).
 		modeEnv = append(modeEnv, "JM_FILE_ROOT_FD_ONLY=1")
 		// Into the volume: keep every write, and every link stored, inside
-		// its project folder (patch 0017; leases are per project).
-		if dr.volume {
+		// its project folder (patch 0017; leases are per project). Only
+		// for the primary volume's user path: a saved jfs:// destination
+		// is another volume, with no projects or leases of ours.
+		if dr.volume && isVolumeUserPath(strings.TrimSpace(destination)) {
 			depth, fence, err := syncProjectDepth(spec, destination, dr.file, opts.DryRun)
 			if err != nil {
 				return err
