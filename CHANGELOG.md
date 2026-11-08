@@ -1,6 +1,6 @@
 # JuiceMount Changelog
 
-## 0.5.1 — 2026-11-04 (build 38)
+## 0.5.1 — 2026-11-07 (build 38)
 
 A reliability update to 0.5.0, with a security fix in the Redis proxy, the
 first part of Teams (off until you add a person) and changes to JuiceMount
