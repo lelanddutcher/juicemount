@@ -254,6 +254,43 @@ Re-running the setup command keeps Link on, because it always applies
 `overlays/`. To turn Link off, remove the file from `overlays/` and repeat
 step 3.
 
+### Faster downloads to remote Macs (TCP BBR)
+
+A Mac far from the server, on a link that loses some packets, downloads much
+faster when the server sends with BBR congestion control instead of the
+kernel default, cubic. Cubic slows down at every lost packet; BBR does not.
+On a LAN it makes no difference. It is off by default. On a setup-made
+install:
+
+1. Load the kernel module on the host. Check first:
+   `cat /proc/sys/net/ipv4/tcp_available_congestion_control`. If `bbr` is not
+   listed, run `sudo modprobe tcp_bbr`. On TrueNAS, also add `modprobe
+   tcp_bbr` as a **Pre Init** command in **System > Advanced >
+   Init/Shutdown Scripts**, so it is loaded after every reboot. This loads a
+   module; it changes no setting of the host.
+2. Copy `server/docker-compose.tcp-bbr.yml` from the same release into
+   `<data>/compose/overlays/`.
+3. Start its two helpers: `sudo <data>/compose/jm-compose up -d --no-deps
+   tcp-bbr-minio tcp-bbr-respproxy`. The object store and the proxy keep
+   running.
+4. Check: `sudo <data>/compose/jm-compose logs tcp-bbr-minio
+   tcp-bbr-respproxy` shows `now sends with bbr` for both.
+
+Each helper sets BBR inside the network namespace of one service (the object
+store or the proxy). The host and the other containers keep cubic. If BBR is
+not available, for example after a reboot without the module, the helper
+logs a warning and the service runs with cubic as before: this file never
+stops the server from starting. The header of
+`server/docker-compose.tcp-bbr.yml` explains how, and what the helpers are
+allowed to do.
+
+It speeds up downloads to Macs (reads). Uploads (saves) are sent by the Mac,
+and macOS has no BBR.
+
+To turn it off, remove the file from `overlays/` and run `sudo
+<data>/compose/jm-compose rm -sf tcp-bbr-minio tcp-bbr-respproxy`. The
+services return to cubic at their next restart.
+
 ## Connect a Mac
 
 1. Open the **Manager URL** in a browser and enter the **sign-in key**.
