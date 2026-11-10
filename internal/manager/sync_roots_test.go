@@ -457,3 +457,17 @@ func TestJuicefsDryRunCreatesNothing(t *testing.T) {
 		t.Errorf("a dry run changed the destination: %d entries, mode %v", len(entries), fi.Mode().Perm())
 	}
 }
+
+// The Manager's minimum stays -jm3: later builds (the shipped -jm4 adds
+// ranged first reads, patch 0018) are accepted, older ones are not.
+func TestVersionConfinesLaterBuilds(t *testing.T) {
+	base := "juicefs version 1.3.1+2025-12-02.e0032b2ae5e9"
+	for v, want := range map[string]bool{
+		base + "-jm3": true, base + "-jm4": true, base + "-jm12": true,
+		base + "-jm2": false, base + "-jm1": false, base: false,
+	} {
+		if got := versionConfines(v); got != want {
+			t.Errorf("versionConfines(%q) = %v, want %v", v, got, want)
+		}
+	}
+}

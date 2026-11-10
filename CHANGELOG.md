@@ -2,8 +2,20 @@
 
 ## Unreleased
 
+### App
+
+- Over a slow or distant link, a file that is not in the local cache starts
+  to play or open sooner. JuiceFS stores files in 4 MiB blocks. Before, the
+  first read of a block waited until the whole block had downloaded. Now a
+  small first read fetches only the bytes it needs, and the rest of the block
+  downloads in the background into the cache. This applies when JuiceFS
+  prefetch is on (every link class except metered) and the volume is not
+  encrypted. The bundled JuiceFS is now build `-jm4`.
+
 ### Server
 
+- The Manager image ships the same JuiceFS build (`-jm4`). The Manager still
+  accepts `-jm3` or later.
 - New opt-in file `server/docker-compose.tcp-bbr.yml`: the object store and
   the Redis proxy send with TCP BBR instead of cubic. Downloads to a Mac on a
   distant link that loses packets become much faster. Nothing changes on a

@@ -23,6 +23,7 @@ type prefetcher struct {
 	pending chan string
 	busy    map[string]bool
 	op      func(key string)
+	workers int
 }
 
 func newPrefetcher(parallel int, fetch func(string)) *prefetcher {
@@ -30,6 +31,7 @@ func newPrefetcher(parallel int, fetch func(string)) *prefetcher {
 		pending: make(chan string, 10),
 		busy:    make(map[string]bool),
 		op:      fetch,
+		workers: max(parallel, 0),
 	}
 	for i := 0; i < parallel; i++ {
 		go p.do()

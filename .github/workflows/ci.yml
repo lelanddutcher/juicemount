@@ -67,9 +67,17 @@ jobs:
           go build -trimpath -tags nocos,nobos,nohdfs,noibmcos,noobs,nooss,noqingstor,noswift,noazure,nogs,noufile,nodragonfly,nosqlite,nomysql,nopg,notikv,nobadger,noetcd \
             -ldflags="$ldflags" -o "$RUNNER_TEMP/juicefs" .
           test "$("$RUNNER_TEMP/juicefs" --version)" = "$(sed -n 's/^ *"version_output": "\(.*\)",*$/\1/p' SOURCE.json)"
-      - name: Vendored juicefs object-backend tests
+      - name: Vendored juicefs object-backend, sync and block-store tests
         working-directory: third_party/juicefs
-        run: go test -count=1 ./pkg/object && go test -count=1 -run TestJM ./pkg/sync
+        # pkg/chunk: upstream's disk_cache_test.go uses mockey, which does
+        # not link with this Go, so an overlay leaves that one file out.
+        run: |
+          go test -count=1 ./pkg/object && go test -count=1 -run TestJM ./pkg/sync
+          printf '{"Replace":{"%s":""}}' "$PWD/pkg/chunk/disk_cache_test.go" > "$RUNNER_TEMP/chunk-overlay.json"
+          go test -count=1 -race -overlay "$RUNNER_TEMP/chunk-overlay.json" -run TestJM ./pkg/chunk
+          # The whole package without -race: upstream disk-cache tests race
+          # in their background goroutines.
+          go test -count=1 -overlay "$RUNNER_TEMP/chunk-overlay.json" ./pkg/chunk
       - name: Unit and integration-safe tests
         env:
           JM_REQUIRE_GATE_HISTORY: '1'
