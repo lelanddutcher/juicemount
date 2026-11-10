@@ -98,20 +98,49 @@ func (m *redisMeta) prepareBirthCreate(ctx Context, tx *redis.Tx, operationID st
 // inode read. A birth is custody evidence only: the proxy checks the current
 // authenticated lease and supported transaction shape independently.
 func (m *redisMeta) prepareBirthMutation(ctx Context, tx *redis.Tx, inode Ino) (*replaceguard.Birth, error) {
+	b, _, err := m.prepareBirthMutationAttr(ctx, tx, inode)
+	return b, err
+}
+
+// prepareBirthMutationAttr is prepareBirthMutation that also reads the
+// inode's attribute key in the same round trip as the two lookup records.
+// The caller's transaction must already WATCH that inode key (doWrite and
+// doSetAttr do), so the early read is as current as a later one: any change
+// after it aborts EXEC. The returned command is nil when nothing was read
+// (prefixed volumes, reserved inodes); the caller then reads the attribute
+// itself.
+func (m *redisMeta) prepareBirthMutationAttr(ctx Context, tx *redis.Tx, inode Ino) (*replaceguard.Birth, *redis.StringCmd, error) {
 	// Reserved birth creation is unsupported in prefixed/cluster volumes.
 	// Ordinary inode writes must not WATCH another hash slot.
 	if m.prefix != "" {
-		return nil, nil
+		return nil, nil, nil
 	}
 	if inode <= RootInode || inode >= TrashInode {
-		return nil, nil
+		return nil, nil, nil
 	}
 	birthKey, finalKey := replaceguard.BirthInodeKey(uint64(inode)), replaceguard.Key(uint64(inode))
 	if err := tx.Watch(ctx, birthKey, finalKey).Err(); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	birthRaw, birthErr := tx.Get(ctx, birthKey).Bytes()
-	finalRaw, finalErr := tx.Get(ctx, finalKey).Bytes()
+	// One pipeline: with the WATCH batch (redis_watch_batch.go) the WATCH
+	// above is sent first in this same round trip. A failed WATCH fails
+	// every command here, and txn returns the WATCH error.
+	var birthCmd, finalCmd, attrCmd *redis.StringCmd
+	if _, err := tx.Pipelined(ctx, func(p redis.Pipeliner) error {
+		birthCmd = p.Get(ctx, birthKey)
+		finalCmd = p.Get(ctx, finalKey)
+		attrCmd = p.Get(ctx, m.inodeKey(inode))
+		return nil
+	}); err != nil && !isReplyError(err) {
+		return nil, nil, err
+	}
+	b, err := m.checkBirthMutation(ctx, tx, inode, birthCmd, finalCmd)
+	return b, attrCmd, err
+}
+
+func (m *redisMeta) checkBirthMutation(ctx Context, tx *redis.Tx, inode Ino, birthCmd, finalCmd *redis.StringCmd) (*replaceguard.Birth, error) {
+	birthRaw, birthErr := birthCmd.Bytes()
+	finalRaw, finalErr := finalCmd.Bytes()
 	if birthErr != nil && birthErr != redis.Nil || finalErr != nil && finalErr != redis.Nil {
 		return nil, syscall.EIO
 	}

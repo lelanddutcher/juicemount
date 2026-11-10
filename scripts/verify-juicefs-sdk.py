@@ -36,6 +36,7 @@ PATCH_FILES = {
     "patches/0017-project-fence.patch": ["cmd/object.go", "cmd/sync.go", "pkg/sync/sync.go"],
     "patches/0018-ranged-first-read.patch": [
         "cmd/mount.go", "cmd/object.go", "pkg/chunk/cached_store.go", "pkg/chunk/prefetch.go"],
+    "patches/0019-batched-watch-round-trips.patch": ["pkg/meta/redis.go"],
 }
 VERSION_PACKAGE = "github.com/juicedata/juicefs/pkg/version"
 

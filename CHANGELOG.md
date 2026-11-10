@@ -10,7 +10,7 @@
   small first read fetches only the bytes it needs, and the rest of the block
   downloads in the background into the cache. This applies when JuiceFS
   prefetch is on (every link class except metered) and the volume is not
-  encrypted. The bundled JuiceFS is now build `-jm4`.
+  encrypted.
 - On an encrypted volume, a small read inside a block now downloads that
   block once. Before, it downloaded the block twice: an encrypted object
   must be fetched whole to be decrypted, so the partial read fetched the
@@ -28,10 +28,20 @@
   when the reader stops or seeks, at the end of the file, and when the link
   becomes metered. Metered (cellular) links and fast or LAN links behave as
   before.
+- Saving many small files over a distant link is about twice as fast. Each
+  change to the folder tree is a Redis transaction, and JuiceFS waited for a
+  separate reply to every WATCH (the command that makes a transaction fail if
+  another client changes the same data first) and to a final UNWATCH. Now
+  each WATCH travels with the read that follows it, and the needless UNWATCH
+  is not sent. Creating a small file and committing its data on close takes
+  4 round trips to Redis instead of 12. In the remote lab, writing a 64 KiB
+  file took 1.8 s instead of 3.4 s at 200 ms round-trip time, and 0.17 s
+  instead of 0.36 s at 20 ms. Transactions watch, read and write the same
+  keys as before. The bundled JuiceFS is now build `-jm5`.
 
 ### Server
 
-- The Manager image ships the same JuiceFS build (`-jm4`). The Manager still
+- The Manager image ships the same JuiceFS build (`-jm5`). The Manager still
   accepts `-jm3` or later.
 - New opt-in file `server/docker-compose.tcp-bbr.yml`: the object store and
   the Redis proxy send with TCP BBR instead of cubic. Downloads to a Mac on a
