@@ -133,10 +133,10 @@ services:
   # does, with Headscale's own TLS (a lab-CA certificate for the public
   # name). The NAS node dials control on the in-container listener under the
   # certificate's name (JM_NET_NAS_CONTROL_URL + a hosts entry), so it needs
-  # no hairpin. The DERP map is the lab's: Headscale must fetch a map URL at
-  # start (the generated config lists Tailscale's public one, which the lab
-  # cannot reach), so HEADSCALE_DERP_URLS points at a copy that nas-host
-  # serves on the NAS network (lib/derp/derpmap.json).
+  # no hairpin. The DERP map is the lab's (lib/derp/derpmap.json): the relay
+  # serves it on the core network, the lab's stand-in for Tailscale's public
+  # map, and the Manager fetches it across the WAN (JM_NET_DERP_MAP_URL) and
+  # keeps a copy for Headscale, as it does with the public map.
   # lab.sh sets its default route (bridge mode: via nas-host, the NAS's
   # Docker NAT; host mode: on the home LAN via home-router), so the Manager
   # itself runs without NET_ADMIN.
@@ -166,7 +166,8 @@ services:
       JM_NET_TLS_CERT: /lab-pki/link.lab.example.crt
       JM_NET_TLS_KEY: /lab-pki/link.lab.example.key
       JM_NET_NAS_CONTROL_URL: "https://link.lab.example:8091"
-      HEADSCALE_DERP_URLS: http://10.232.11.2:8088/derpmap.json
+      JM_NET_DERP_MAP_URL: http://10.232.3.10:8088/derpmap.json
+      JM_NET_DERP_MAP_ALLOW_HTTP: "1"   # the lab map is plain http, on the lab network only
       SSL_CERT_FILE: /lab-pki/ca.crt
       TS_NO_LOGS_NO_SUPPORT: "true"
     extra_hosts:
@@ -183,8 +184,7 @@ services:
 
   # The NAS host's Docker NAT: what Docker does for the Manager's published
   # ports (30193 -> 8091, 41641/udp) and its outbound traffic. Its home
-  # address is the NAS's LAN address. It also serves the lab DERP map to the
-  # Manager on the NAS network.
+  # address is the NAS's LAN address.
   nas-host:
     <<: *tools
     command: ["/lab/lib/router.sh", "run"]

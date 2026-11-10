@@ -16,6 +16,12 @@
 #   portmap    the home router answers NAT-PMP port-mapping requests: on | off
 #   expect     the path we expect: direct | derp | fail (no connection)
 #
+# wan-down-boot is a sequence, not one setup (measure.py, run_wan_down_boot):
+# the home's internet link goes down, the Manager restarts (a NAS booting
+# after a power cut before the router has internet), the Mac at home
+# connects, then the internet comes back and the Mac away connects. Its
+# columns are the routers' switches; "expect" is the away Mac's path.
+#
 # name              site home_nat fwd_ctrl fwd_udp hairpin split_dns away_nat cgnat nas_net portmap expect
 direct-forward      away easy     on       on      off     off       easy     off   bridge  off     direct
 hole-punch          away easy     on       off     off     off       easy     off   bridge  off     direct
@@ -28,3 +34,4 @@ home-local-dns      home easy     on       on      off     on        easy     of
 home-no-hairpin     home easy     on       on      off     off       easy     off   bridge  off     fail
 portmap-bridge      away hard     on       off     off     off       hard     off   bridge  on      derp
 portmap-host        away hard     on       off     off     off       hard     off   host    on      direct
+wan-down-boot       away easy     on       on      off     on        easy     off   bridge  off     direct

@@ -4,6 +4,8 @@
 #   run     apply the saved switches (/etc/lab/router.conf, kept across a
 #           container restart), then stay up (the container's command)
 #   apply   re-apply the switches now (lab.sh writes router.conf first)
+#   uplink-down   take the internet-side link down, as when the internet
+#           provider's line is down; "apply" brings it back
 #
 # The container's role ($ROUTER) fixes its addresses. router.conf sets the
 # switches a case changes:
@@ -112,12 +114,14 @@ apply() {
 case "${1:-}" in
   run)
     apply
-    if [ "$ROUTER" = nas-host ]; then
-      # The lab DERP map for Headscale (compose.yml, HEADSCALE_DERP_URLS).
-      python3 -m http.server 8088 --bind "$LAN_IP" --directory /lab/lib/derp >/var/log/derpmap.log 2>&1 &
-    fi
     touch /run/router.ready
     exec sleep infinity ;;
   apply) apply ;;
-  *) echo "usage: router.sh run|apply" >&2; exit 2 ;;
+  uplink-down)
+    wan_if="$(iface_for "$WAN_IP")"
+    [ -n "$wan_if" ] || { log "uplink interface not found"; exit 2; }
+    ip link set "$wan_if" down
+    conntrack -F >/dev/null 2>&1 || true
+    log "uplink down ($wan_if)" ;;
+  *) echo "usage: router.sh run|apply|uplink-down" >&2; exit 2 ;;
 esac
