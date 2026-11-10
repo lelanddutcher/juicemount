@@ -16,10 +16,15 @@
 #
 # Everything lives in Docker project "${JMLAB_PROJECT:-jmlab}". The secrets
 # are throwaway, generated into .state/lab.env (git-ignored, mode 600).
+# JMLAB_STATE_DIR names another state directory next to this script (for
+# example .state-mac), so a second lab in the same checkout keeps its own.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-STATE="$HERE/.state"
+STATE_NAME="${JMLAB_STATE_DIR:-.state}"
+case "$STATE_NAME" in .state*) ;; *) printf '[lab] JMLAB_STATE_DIR must start with .state\n' >&2; exit 2 ;; esac
+case "$STATE_NAME" in */*) printf '[lab] JMLAB_STATE_DIR must be a plain name\n' >&2; exit 2 ;; esac
+STATE="$HERE/$STATE_NAME"
 ENV_FILE="$STATE/lab.env"
 export JMLAB_PROJECT="${JMLAB_PROJECT:-jmlab}"
 PROXY_IP="${JMLAB_PROXY_IP:-10.231.10.20}"
@@ -35,6 +40,9 @@ dc() {
   # JMLAB_BBR=1 at setup: the server's BBR overlay (compose.bbr.yml). The
   # choice is kept in .state so every later command uses the same files.
   [ ! -f "$STATE/bbr" ] || files+=(-f "$HERE/compose.bbr.yml")
+  # JMLAB_MAC=1 at setup: the WireGuard gateway for a macOS VM (compose.mac.yml,
+  # driven by mac-lab.sh).
+  [ ! -f "$STATE/mac" ] || files+=(-f "$HERE/compose.mac.yml")
   JMLAB_COMMIT="$(git -C "$HERE" rev-parse HEAD 2>/dev/null || printf '%040d' 0)" \
     docker compose "${files[@]}" --env-file "$ENV_FILE" "$@"
 }
@@ -91,13 +99,13 @@ format_volume() {
   fi
   local _ enc=()
   # JMLAB_ENCRYPT=1: an encrypted volume (aes256gcm-rsa) with a throwaway
-  # RSA key in .state, which the client sees at /lab/.state.
+  # RSA key in the state directory, which the client sees under /lab.
   if [ "${JMLAB_ENCRYPT:-0}" = 1 ]; then
     command -v openssl >/dev/null || die "JMLAB_ENCRYPT=1 needs openssl on this host"
     [ -f "$STATE/encrypt.pem" ] || (umask 077 && openssl genrsa -out "$STATE/encrypt.pem" 2048 2>/dev/null) \
       || die "openssl genrsa failed"
     chmod 644 "$STATE/encrypt.pem" # read by the client container's root; .state itself is 700
-    enc=(--encrypt-rsa-key /lab/.state/encrypt.pem)
+    enc=(--encrypt-rsa-key "/lab/$STATE_NAME/encrypt.pem")
     log "formatting an encrypted volume"
   fi
   for _ in $(seq 30); do
@@ -158,6 +166,7 @@ case "$cmd" in
     command -v docker >/dev/null || die "docker is required"
     gen_env
     if [ "${JMLAB_BBR:-0}" = 1 ]; then : > "$STATE/bbr"; log "server sends with BBR (compose.bbr.yml)"; fi
+    if [ "${JMLAB_MAC:-0}" = 1 ]; then : > "$STATE/mac"; log "with the macOS VM gateway (compose.mac.yml)"; fi
     log "building images and starting project $JMLAB_PROJECT"
     dc up -d --build --wait --quiet-pull >&2
     nas_offloads_off
@@ -188,6 +197,9 @@ case "$cmd" in
     dc ps
     dc exec -T wan tc qdisc show
     ;;
+  _cid) # internal: the container id of one service (mac-lab.sh)
+    [ $# -eq 1 ] || die "usage: lab.sh _cid SERVICE"
+    dc ps -q "$1" ;;
   down)
     if [ -f "$ENV_FILE" ]; then
       do_umount 2>/dev/null || true

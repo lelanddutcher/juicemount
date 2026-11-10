@@ -1,5 +1,6 @@
 # Remote lab image: the vendored juicefs client plus the network tools the
-# lab needs (tc, ethtool, iptables, ping, iperf3) and python3 for the probe.
+# lab needs (tc, ethtool, iptables, ping, iperf3, and userspace WireGuard for
+# the macOS VM gateway) and python3 for the probe.
 # The wan router, the remote client and the iperf3 server all run this one
 # image. Built from the repository root:
 #
@@ -23,5 +24,6 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     && test "$(/out/juicefs --version)" = "$(sed -n 's/^ *"version_output": "\(.*\)",*$/\1/p' SOURCE.json)"
 
 FROM alpine:3.22@sha256:49340b346798875b5592e5d420241f2f9cfba5f47e62ebb1446a1b34734e898f
-RUN apk add --no-cache iproute2 iproute2-tc ethtool iptables iputils iperf3 python3 fuse3 coreutils
+RUN apk add --no-cache iproute2 iproute2-tc ethtool iptables iputils iperf3 python3 fuse3 coreutils \
+      wireguard-go wireguard-tools-wg
 COPY --from=juicefs /out/juicefs /usr/local/bin/juicefs

@@ -1,0 +1,43 @@
+# The macOS VM gateway (mac-lab.sh). lab.sh adds this file when the lab was
+# set up with JMLAB_MAC=1.
+#
+#   macOS VM --WireGuard (UDP)--> gateway --> wan (tc netem) --> nas network
+#
+# The gateway sits on the remote network, exactly where the Linux client
+# sits, so every packet between the VM and the server stack crosses the wan
+# container and gets the current profile, in both directions. The VM routes
+# only the nas subnet into the tunnel; the rest of its traffic is untouched.
+#
+# WireGuard runs in userspace (wireguard-go on /dev/net/tun): no host kernel
+# module. The gateway gets NET_ADMIN for its own network namespace only. The
+# one host-visible change is the published UDP port.
+services:
+  gateway:
+    image: jmlab:local
+    init: true
+    depends_on:
+      wan:
+        condition: service_healthy
+    cap_add: [NET_ADMIN]
+    devices:
+      - /dev/net/tun
+    sysctls:
+      net.ipv4.ip_forward: "1"
+    environment:
+      NAS_SUBNET: ${JMLAB_NAS_SUBNET:-10.231.10.0/24}
+      WAN_REMOTE_IP: ${JMLAB_WAN_REMOTE_IP:-10.231.20.2}
+      TUNNEL_SUBNET: ${JMLAB_TUNNEL_SUBNET:-10.231.30.0/24}
+      TUNNEL_GW_IP: ${JMLAB_TUNNEL_GW_IP:-10.231.30.1}
+      WG_CONF: /lab/${JMLAB_STATE_DIR:-.state}/gateway.conf
+    entrypoint: ["/lab/lib/gateway.sh"]
+    healthcheck:
+      test: ["CMD", "test", "-f", "/run/gateway.ready"]
+      interval: 1s
+      retries: 30
+    ports:
+      - "${JMLAB_MAC_BIND:-0.0.0.0}:${JMLAB_MAC_WG_PORT:-51820}:51820/udp"
+    volumes:
+      - ./:/lab:ro
+    networks:
+      remote:
+        ipv4_address: ${JMLAB_GATEWAY_IP:-10.231.20.20}
