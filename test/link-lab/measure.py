@@ -15,6 +15,10 @@ Mac node with a fresh pairing code, then measures:
   recovery  time until a Redis PING answers again after the home router
             restarts, then after the Manager (Headscale + NAS node) restarts
 
+wan-down-boot runs a sequence instead (run_wan_down_boot): home internet
+down, Manager restart, the Mac at home connects, the Mac away cannot,
+internet back, the Mac away connects.
+
 It exits 2 only when the lab breaks: the lab does not come up, a case
 cannot be applied, or a case that should connect does not. A path other
 than the expected one is reported, never a failure.
@@ -81,6 +85,8 @@ def recover(case, site, service):
 
 
 def run_case(name, a):
+    if name == "wan-down-boot":
+        return run_wan_down_boot(name, a)
     res = {"case": name, "started": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")}
     res["config"] = lab_json("case", name)
     site, expect = res["config"]["site"], res["config"]["expect"]
@@ -113,6 +119,52 @@ def run_case(name, a):
         res["outcome"] = "unexpected (connected)"
     else:
         res["outcome"] = "expected" if res["path"] == expect else f"unexpected ({res['path']})"
+    return res
+
+
+def connect(site, name, up_timeout, direct_wait):
+    host = f"{site}-mac-{name}"[:60]
+    c = lab_json("probe", site, "connect", "--server", SERVER, "--hostname", host,
+                 "--up-timeout", str(up_timeout), "--direct-wait", str(direct_wait),
+                 timeout=up_timeout + 240)
+    if "error" not in c:
+        c["path_probe"] = lab_json("probe", site, "path", "--count", "3", timeout=120)
+    lab("exec", f"{site}-mac", "/lab/lib/mac.sh", "stop", check=False)
+    return c
+
+
+def run_wan_down_boot(name, a):
+    """The NAS boots while the home has no internet, then the internet returns.
+
+    Before the Manager kept its own DERP map file, Headscale exited when it
+    could not fetch the map URL at start, so Link (and LAN access through
+    Link) stayed down until the internet came back.
+    """
+    res = {"case": name, "started": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")}
+    res["config"] = lab_json("case", name)
+    steps = res["wan_down_boot"] = {}
+    lab("uplink", "home", "down")
+    try:
+        t0 = time.monotonic()
+        lab("restart", "manager")
+        w = lab("wait-link", check=False, timeout=200)
+        steps["link_ready"] = w.returncode == 0
+        steps["link_ready_ms"] = round((time.monotonic() - t0) * 1000) if w.returncode == 0 else None
+        steps["home_while_down"] = connect("home", name + "-down", 60, a.direct_wait)
+        steps["away_while_down"] = connect("away", name + "-down", 20, 0)
+    finally:
+        t1 = time.monotonic()
+        lab("uplink", "home", "up")
+    c = connect("away", name + "-up", 90, a.direct_wait)
+    c["since_wan_up_ms"] = round((time.monotonic() - t1) * 1000)
+    steps["away_after_up"] = c
+    res["connect"] = c
+    res["path"] = c.get("path_probe", {}).get("path", "none") if "error" not in c else "none"
+    ok = (steps["link_ready"]
+          and "error" not in steps["home_while_down"]
+          and "error" in steps["away_while_down"]
+          and "error" not in c)
+    res["outcome"] = "expected" if ok else "broken"
     return res
 
 
@@ -159,6 +211,23 @@ def scoreboard(run, results):
             str(b.get("s3_get", {}).get("mbit_s", "–")), str(b.get("s3_put", {}).get("mbit_s", "–")),
             "–" if "relay_cpu_pct" not in b else f"{b['relay_cpu_pct']}%",
             rc("home-router"), rc("manager")]) + " |")
+    for r in results:
+        s = r.get("wan_down_boot")
+        if not s:
+            continue
+        hd, ad, au = s.get("home_while_down", {}), s.get("away_while_down", {}), s.get("away_after_up", {})
+        lines += ["", f"`{r['case']}`: home internet down while the Manager restarts, then back.", "",
+                  "| Step | Result |", "|---|---|",
+                  f"| Link ready after Manager restart, internet down | "
+                  + ("yes, " + fmt_s(s.get("link_ready_ms")) + " s" if s.get("link_ready") else "no") + " |",
+                  "| Mac at home connects, internet down | "
+                  + (f"yes: first PING {fmt_s(hd.get('first_ping_ms'))} s, path {hd.get('path_probe', {}).get('path', '?')}"
+                     if "error" not in hd else f"no: {hd['error']}") + " |",
+                  "| Mac away connects, internet down (should not) | "
+                  + ("no (as expected)" if "error" in ad else "yes (unexpected)") + " |",
+                  "| Mac away connects after the internet returns | "
+                  + (f"yes: first PING {fmt_s(au.get('first_ping_ms'))} s after its start, path {au.get('path_probe', {}).get('path', '?')}"
+                     if "error" not in au else f"no: {au['error']}") + " |"]
     errs = [(r["case"], r.get("connect", {}).get("error") or r.get("error")) for r in results
             if r.get("connect", {}).get("error") or r.get("error")]
     if errs:

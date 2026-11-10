@@ -51,7 +51,7 @@ network is internal: no container reaches the real internet.
 | `home-router` | home, homeup | The home router: NAT, port forwards, hairpin, a LAN resolver with an optional local DNS entry, optional NAT-PMP. |
 | `home-mac` | home | A Mac at home: the stock Tailscale client (v1.102.3, the version the app uses) on Linux. |
 | `wan` | homeup, awayup, core | The emulated internet. It routes between the sites and shapes both access links with the remote lab's profiles (`../remote-lab/profiles.tsv`, `../remote-lab/lib/shape.sh`). |
-| `relay` | core | Tailscale's `derper` (same version): DERP over HTTPS on 443 and STUN on 3478/udp, on a "public" address. |
+| `relay` | core | Tailscale's `derper` (same version): DERP over HTTPS on 443 and STUN on 3478/udp, on a "public" address. It also serves the lab DERP map (`lib/derp/derpmap.json`) on port 8088, the lab's stand-in for Tailscale's public map. |
 | `dns` | core | The lab DNS. Only two names resolve: `link.lab.example` (the home's public address) and `derp.lab.example` (the relay). |
 | `away-router` | away, awayup, carrier | The router where the Mac is away from home. |
 | `cgn` | carrier, awayup | A carrier-grade NAT, used when a case puts the away site behind it. |
@@ -98,6 +98,7 @@ Mac node with a fresh pairing code, then measures.
 | `home-no-hairpin` | Mac at home; no hairpin, no local DNS entry. | no connection |
 | `portmap-bridge` | Hard NAT both ends, no forward, the router answers NAT-PMP; the NAS node behind the NAS's Docker NAT (today's setup). | relay |
 | `portmap-host` | The same, with the NAS node directly on the home LAN (host networking). | direct |
+| `wan-down-boot` | A sequence. The home's internet link goes down and the Manager restarts, as when the NAS boots after a power cut before the router has internet. Link must become ready. The Mac at home (local DNS entry) must connect; the Mac away must not. Then the internet comes back and the Mac away must connect. | direct |
 
 The control port (TCP 30193) is forwarded in every case: without it a Mac
 away from home cannot reach the control server at all.
@@ -143,6 +144,7 @@ To explore by hand:
 ./lab.sh probe away connect --server https://link.lab.example:30193 --hostname try1
 ./lab.sh probe away path                   # direct or derp, and tailscale ping
 ./lab.sh exec away-mac tailscale --socket=/run/tailscale/tailscaled.sock status
+./lab.sh uplink home down                  # the home's internet link down (up: back)
 ./lab.sh status                            # router rules and WAN qdiscs
 ./lab.sh down
 ```
@@ -199,10 +201,12 @@ these differences:
   for that name, so the NAS node reaches its own control server under the
   certificate's name without hairpin NAT. This is one of the documented ways
   to run Headscale's own TLS.
-- `HEADSCALE_DERP_URLS` points at the lab DERP map (`lib/derp/derpmap.json`,
-  served by `nas-host` on the NAS network). The Manager's generated Headscale
-  config always lists Tailscale's public DERP map. Headscale does not start
-  when it cannot fetch a listed map, and the lab has no internet.
+- `JM_NET_DERP_MAP_URL` points at the lab DERP map (`lib/derp/derpmap.json`),
+  which the relay serves across the WAN. The Manager fetches it as it fetches
+  Tailscale's public map by default, and keeps a copy for Headscale. This
+  needs the Manager change that keeps the DERP map as a local file (PR #65
+  or later); an older Manager ignores the setting and does not start Link
+  here, because the lab has no internet.
 - The Manager image (`image/manager.Dockerfile`) is the same `juicemount-manager`
   binary and Headscale release on a smaller base, without the patched JuiceFS
   the lab does not use.

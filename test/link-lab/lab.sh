@@ -11,6 +11,9 @@
 #                              (SITE: home|away); a pairing code is minted
 #                              for "connect"
 #   lab.sh restart SERVICE     restart a container (home-router, manager...)
+#   lab.sh uplink SITE up|down take a site's internet link down or bring it
+#                              back (SITE: home|away)
+#   lab.sh wait-link           wait until Link is ready on the Manager
 #   lab.sh relay-cpu           the relay's CPU time so far, microseconds
 #   lab.sh exec SERVICE CMD... run a command in a lab container
 #   lab.sh status              containers, router rules, wan qdiscs
@@ -224,6 +227,16 @@ case "$cmd" in
     docker restart -t 2 "$(cid "$1")" >/dev/null
     if [ "$1" = manager ]; then nas_net "$(cat "$STATE/nas_net" 2>/dev/null || echo bridge)"; fi
     ;;
+  uplink)
+    [ $# -eq 2 ] || die "usage: lab.sh uplink home|away up|down"
+    case "$1" in home|away) ;; *) die "uplink SITE must be home or away" ;; esac
+    case "$2" in
+      down) docker exec "$(cid "$1-router")" /lab/lib/router.sh uplink-down ;;
+      up) docker exec "$(cid "$1-router")" /lab/lib/router.sh apply ;;
+      *) die "uplink STATE must be up or down" ;;
+    esac
+    ;;
+  wait-link) wait_link ;;
   relay-cpu) docker exec "$(cid relay)" awk '$1 == "usage_usec" { print $2 }' /sys/fs/cgroup/cpu.stat ;;
   exec) [ $# -ge 2 ] || die "usage: lab.sh exec SERVICE CMD..."; s=$1; shift; docker exec "$(cid "$s")" "$@" ;;
   status)
@@ -238,5 +251,5 @@ case "$cmd" in
     rm -rf "$STATE"
     log "down: project $JMLINK_PROJECT removed"
     ;;
-  *) sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+  *) sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac
