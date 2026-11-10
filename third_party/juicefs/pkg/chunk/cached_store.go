@@ -151,7 +151,10 @@ func (s *rSlice) ReadAt(ctx context.Context, page *Page, off int) (n int, err er
 	s.store.cacheMiss.Add(1)
 	s.store.cacheMissBytes.Add(float64(len(p)))
 
-	if s.store.seekable && boff > 0 && len(p) <= blockSize/4 {
+	// A small read at the start of a block also takes the ranged path when
+	// the prefetcher can fill the rest of the block in the background, so
+	// the first byte does not wait for the whole block (JuiceMount).
+	if s.store.seekable && len(p) <= blockSize/4 && (boff > 0 || s.store.fetcher != nil && s.store.fetcher.workers > 0) {
 		if s.store.downLimit != nil {
 			s.store.downLimit.Wait(int64(len(p)))
 		}
@@ -845,6 +848,9 @@ func NewCachedStore(storage object.ObjectStorage, config Config, reg prometheus.
 		size := parseObjOrigSize(key)
 		if size == 0 || size > store.conf.BlockSize {
 			return
+		}
+		if _, ok := store.bcache.exist(key); ok {
+			return // another read already filled it
 		}
 		p := NewOffPage(size)
 		defer p.Release()

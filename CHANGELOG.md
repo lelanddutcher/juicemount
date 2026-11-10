@@ -1,5 +1,22 @@
 # JuiceMount Changelog
 
+## Unreleased
+
+### App
+
+- Over a slow or distant link, a file that is not in the local cache starts
+  to play or open sooner. JuiceFS stores files in 4 MiB blocks. Before, the
+  first read of a block waited until the whole block had downloaded. Now a
+  small first read fetches only the bytes it needs, and the rest of the block
+  downloads in the background into the cache. This applies when JuiceFS
+  prefetch is on (every link class except metered). The bundled JuiceFS is
+  now build `-jm4`.
+
+### Server
+
+- The Manager image ships the same JuiceFS build (`-jm4`). The Manager still
+  accepts `-jm3` or later.
+
 ## 0.5.1 — 2026-11-07 (build 38)
 
 A reliability update to 0.5.0, with a security fix in the Redis proxy, the

@@ -2,12 +2,12 @@
   "archive_sha256": "9351a0655185f4a48accae2ae3af70db932de1ee38acfa4f153e3050b817806d",
   "binary": {
     "bundle_path": "Contents/MacOS/juicefs",
-    "ldflags": "-s -w -X github.com/juicedata/juicefs/pkg/version.revision=e0032b2ae5e9-jm3 -X github.com/juicedata/juicefs/pkg/version.revisionDate=2025-12-02",
+    "ldflags": "-s -w -X github.com/juicedata/juicefs/pkg/version.revision=e0032b2ae5e9-jm4 -X github.com/juicedata/juicefs/pkg/version.revisionDate=2025-12-02",
     "package": ".",
     "tags": "nogateway,nowebdav,nocos,nobos,nohdfs,noibmcos,noobs,nooss,noqingstor,nosftp,noswift,noazure,nogs,noufile,nob2,nonfs,nodragonfly,nosqlite,nomysql,nopg,notikv,nobadger,noetcd",
     "upstream_commit": "e0032b2ae5e9603403ca955eed7d05426f6f2f8c",
     "upstream_tag": "v1.3.1",
-    "version_output": "juicefs version 1.3.1+2025-12-02.e0032b2ae5e9-jm3"
+    "version_output": "juicefs version 1.3.1+2025-12-02.e0032b2ae5e9-jm4"
   },
   "files": {
     "LICENSE": {
@@ -267,7 +267,7 @@
       "upstream_sha256": "6ab77a5713c65761e6227fcfe622031258875afb095ef04d873ae00ce8193e31"
     },
     "pkg/chunk/cached_store.go": {
-      "sha256": "f40757b5e3a6ad6012a826c2359d6e9dbba5433255a8c87efc19ac4af0b0616b",
+      "sha256": "542af22bed3a7effa3a366137292d93f9853f2c621c0df6ab4f528b2da708b1c",
       "upstream_sha256": "9f7a408ad17392705751c58e4e56767ad4ba8db4b0d60bffbd32844ebf496d1a"
     },
     "pkg/chunk/cached_store_test.go": {
@@ -311,7 +311,7 @@
       "upstream_sha256": "e9e563160782255e70baaa2450af3cfcdbc475fd3e4f8bd103fb2bf0868623e0"
     },
     "pkg/chunk/prefetch.go": {
-      "sha256": "8ec67f39a151c033168a2b43589aac8bdc661a0abc6d1a262a0873f5c335ed07",
+      "sha256": "3ee3ad4d29c5bcc1fae6bf3eaabe47e23fc6f974cde05d3c95d06d6e77a155c9",
       "upstream_sha256": "8ec67f39a151c033168a2b43589aac8bdc661a0abc6d1a262a0873f5c335ed07"
     },
     "pkg/chunk/prefetch_test.go": {
@@ -1109,6 +1109,7 @@
   },
   "local_files": {
     "cmd/jm_fence.go": "11959cce13a1e10985fed61e172cff969bd04c1d8200ab79e723d611b9210b33",
+    "pkg/chunk/ranged_first_read_test.go": "3206ddfe8171c0cffa48922adbf7a86fedd716f60ec076d5e99214176f6a7507",
     "pkg/chunk/upload_cache_ownership_test.go": "ebb66944296ae43b5579e12a8688d5a4c03e9ef8eecb61107d0ef0427429d791",
     "pkg/fuse/rename_flags_darwin.go": "37e49f30f2017a7ea05d47154cedaf6a90ecdab24d3c5d3639af53b4de6d6abd",
     "pkg/fuse/rename_flags_darwin_test.go": "7e0310f26eefc94f8cf34d6a70d966887284da82b10500bef1660a16d0ff61db",
@@ -1157,7 +1158,8 @@
     "patches/0014-literal-fatal-error.patch": "ba84e7c4d2690c1ee2d377263f6d1dcc6793217378809b109bebf32c45964d1d",
     "patches/0015-klauspost-compress-security-update.patch": "c46fdf7add95ff74c673421238ccbc00e6e110fe49ae327167f78f747292b640",
     "patches/0016-file-backend-beneath-root.patch": "75a58ef1ce5fb69d91135bc3bb91dd19e6e5cb93e2155af5f0693fd0d5844576",
-    "patches/0017-project-fence.patch": "a228f339d6e45cfb4b4c3f69b1b67cf4a157162006788498b62b65e00e9b6cae"
+    "patches/0017-project-fence.patch": "a228f339d6e45cfb4b4c3f69b1b67cf4a157162006788498b62b65e00e9b6cae",
+    "patches/0018-ranged-first-read.patch": "756edc54613b6a29c1b2a90c48a1a08cbdeec436eb16dd455865dcb1eb7d008c"
   },
   "scope": "All pkg/ and cmd/ files plus main.go, LICENSE, go.mod and go.sum from the verified module ZIP. Documentation, integration tests and SDK examples are not included. local_files are JuiceMount-owned source with no upstream counterpart.",
   "upstream_url": "https://github.com/juicedata/juicefs/tree/v1.3.1",
