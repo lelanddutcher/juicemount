@@ -81,10 +81,11 @@ func TestBackgroundIsCappedAtHalfTheCeiling(t *testing.T) {
 				t.Errorf("background width 0 at ceiling %d — warming can never "+
 					"run, which is a different bug", w)
 			}
-			// The narrow case is the one that broke; state it explicitly.
-			if w == 4 && bg != 2 {
-				t.Errorf("at the slow-link ceiling of 4, background width = %d, "+
-					"want 2 (foreground guaranteed 2)", bg)
+			// The slow-link ceiling (8) must give foreground a reserved 4 while
+			// background, including readahead, can reach 4 blocks in flight.
+			if tc.cls == netprofile.ClassSlow && w == 8 && bg != 4 {
+				t.Errorf("at the slow-link ceiling of 8, background width = %d, "+
+					"want 4 (foreground guaranteed 4)", bg)
 			}
 		})
 	}
