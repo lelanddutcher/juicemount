@@ -87,6 +87,7 @@ def probe(*args, timeout=900):
 def iperf(*args, timeout=60):
     """iperf3 client against the NAS-side server; retries while the server
     is still finishing the previous test."""
+    failures, last = 0, ""
     for _ in range(20):
         p = run(["docker", "compose", "-p", PROJECT, "exec", "-T", "client",
                  "iperf3", "-c", IPERF, "-J", *args], timeout=timeout, check=False)
@@ -98,9 +99,16 @@ def iperf(*args, timeout=60):
             time.sleep(2)
             continue
         if "error" in d or p.returncode != 0:
-            raise LabError(f"iperf3 {' '.join(args)}: {d.get('error') or p.stderr[-500:]}")
+            # iperf3's control connection can time out on a lossy link
+            # ("Resource temporarily unavailable"): retry it a few times.
+            failures += 1
+            last = d.get("error") or p.stderr[-500:]
+            if failures >= 3:
+                raise LabError(f"iperf3 {' '.join(args)} failed 3 times: {last}")
+            time.sleep(3)
+            continue
         return d
-    raise LabError("iperf3 server stayed busy")
+    raise LabError(f"iperf3 server stayed busy {last}")
 
 
 def check_link(name, prof):
