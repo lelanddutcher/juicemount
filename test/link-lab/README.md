@@ -195,10 +195,15 @@ not prove how real networks behave.
 
 - **Hole punching with Linux's NAT.** `hole-punch` (easy NAT at both ends,
   no forward) ends on the relay, with the node container as before. The
-  cause is the race described under "Easy NAT is Linux's NAT": the away
-  Mac's first packet reaches the home router before the NAS node's, so the
-  router maps the node's packets to another port. Moving the node out of
-  Docker's NAT removes one NAT, not this race.
+  likely cause, not yet confirmed from the routers' connection tables, is
+  the race described under "Easy NAT is Linux's NAT". Moving the node out of
+  Docker's NAT removes one NAT, not that race.
+- **Port mapping after a restart.** In `portmap-host` the path is direct
+  through the NAT-PMP mapping, but after a restart of the home router, the
+  Manager or the node container the probe finds the relay path, as it did
+  before the node container. The lab's NAT-PMP responder forgets its
+  mappings when the router restarts, and the node does not ask again within
+  the probe's wait.
 - **Before the node container, Mac at home.** With the NAS node inside the
   Manager (`bridge`), the Mac at home in `wan-down-boot` could not reach it
   while the home had no internet: the node advertised only its container
