@@ -45,7 +45,7 @@ func TestFUSEDataGateNarrowsOnSlowLinks(t *testing.T) {
 		want  int
 	}{
 		{"metered", netprofile.ClassMetered, 2},
-		{"slow", netprofile.ClassSlow, 4},
+		{"slow", netprofile.ClassSlow, 8},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			restore := forceNetClassForTest(t, tc.class)

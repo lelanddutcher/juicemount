@@ -1,8 +1,11 @@
 package nfs
 
 import (
+	"errors"
+	"io"
 	"log"
 	"os"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -45,6 +48,23 @@ const (
 	wanBulkSubreadMax  = 256 << 10
 )
 
+// windowIdleStop ends a windowed prefetch (ParallelFetch policies) when its
+// reader has not read for this long. The window already limits how far ahead
+// it can run; this also stops refills for an abandoned stream. Five seconds is
+// longer than one cold 4 MB block on a 30 Mbit/s link with four blocks sharing
+// it, so a reader that is merely waiting is not dropped.
+const windowIdleStop = 5 * time.Second
+
+// errPrefetchStopped marks a windowed block that gave its gate back because
+// offline or Stop won after admission.
+var errPrefetchStopped = errors.New("readahead: stopped")
+
+// windowBufPool recycles 4 MB block buffers between windowed block reads.
+var windowBufPool = sync.Pool{New: func() any {
+	b := make([]byte, readaheadBlockSize)
+	return &b
+}}
+
 // ReadaheadManager detects sequential read patterns and triggers
 // background prefetch to warm the JuiceFS SSD cache.
 type ReadaheadManager struct {
@@ -61,6 +81,13 @@ type ReadaheadManager struct {
 	afterPrefetchAcquire func(*os.File)
 	afterPrefetchGate    func()
 	prefetchReadAt       func(*os.File, []byte, int64) (int, error)
+	// policyOverride replaces the profile's readahead policy (tests and the
+	// before/after simulation only).
+	policyOverride func() netprofile.ReadaheadPolicy
+	// windowIdle is windowIdleStop; tests shorten it before reading.
+	windowIdle time.Duration
+	// sizeHintTTL is sizeHintTTL; tests shorten it before reading.
+	sizeHintTTL time.Duration
 	// Installed by the handler before serving. It captures local authority for
 	// the scheduled inode before this worker opens/reads its source descriptor.
 	mappingCapture func(uint64, string) *readaheadMappingJob
@@ -100,6 +127,13 @@ type ReadaheadManager struct {
 	// activePrefetch is the live count of in-flight prefetch goroutines, gated
 	// against the current policy's Workers so a slow link stays gentle.
 	activePrefetch atomic.Int64
+	// windowInflight counts windowed prefetch blocks in flight across every
+	// stream. It is capped below the background gate share (windowBlockCap)
+	// so one background slot always stays free for the drainer, membuf, the
+	// sidecar warmer and metadata preparation.
+	windowInflight atomic.Int64
+	// windowCapOverride replaces windowBlockCap when > 0 (simulation only).
+	windowCapOverride int
 
 	// Stats
 	statsMu    sync.Mutex
@@ -110,6 +144,9 @@ type ReadaheadManager struct {
 // effectivePolicy returns the link-aware readahead policy, falling back to the
 // historical hard-coded defaults when no profile is wired (nil-safe).
 func (rm *ReadaheadManager) effectivePolicy() netprofile.ReadaheadPolicy {
+	if rm.policyOverride != nil {
+		return rm.policyOverride()
+	}
 	if rm.profile == nil {
 		return netprofile.ReadaheadPolicy{
 			Enabled:      true,
@@ -128,6 +165,36 @@ type readTracker struct {
 	wanSubreadRun   bool
 	lastAccess      time.Time
 	prefetchedTo    int64 // highest offset we've already prefetched to
+
+	// Windowed prefetch (ParallelFetch policies). All fields are block
+	// aligned and guarded by ReadaheadManager.mu. windowNext is the next block
+	// to fetch; windowEnd is the end of the window the reader has earned.
+	// pumping is true while one pumpWindow goroutine serves this tracker.
+	windowNext int64
+	windowEnd  int64
+	pumping    bool
+	// windowEOF is where a windowed block read hit end of file (0 = not
+	// seen). The window does not extend past it unless the reader reads
+	// past it (the file grew).
+	windowEOF int64
+	// roundGen identifies the round that owns pumping; a round clears
+	// pumping only while it still owns it.
+	roundGen uint64
+	// sizeHint is the file size a round last saw with fstat, at sizeHintAt.
+	// It is a hint, not an EOF: within sizeHintTTL no new round starts for
+	// blocks at or past it, and after that a round re-checks, so a file that
+	// grows while it is read keeps its prefetch.
+	sizeHint   int64
+	sizeHintAt time.Time
+}
+
+// sizeHintTTL is how long a round's fstat size holds back new rounds at the
+// end of a file.
+const sizeHintTTL = time.Second
+
+// alignUpBlock rounds off up to the next readahead block boundary.
+func alignUpBlock(off int64) int64 {
+	return (off + readaheadBlockSize - 1) / readaheadBlockSize * readaheadBlockSize
 }
 
 func NewReadaheadManager(fusePath string, fdPool *FDPool, profile *netprofile.Profile, previewOptIn ...bool) *ReadaheadManager {
@@ -143,6 +210,8 @@ func NewReadaheadManager(fusePath string, fdPool *FDPool, profile *netprofile.Pr
 		previewCursors: make(map[previewCursorKey]previewCursor),
 		previewStop:    make(chan struct{}),
 		previewDone:    make(chan struct{}),
+		windowIdle:     windowIdleStop,
+		sizeHintTTL:    sizeHintTTL,
 	}
 	if len(previewOptIn) != 0 {
 		rm.previewOptInSet = true
@@ -240,6 +309,12 @@ func (rm *ReadaheadManager) OnRead(inode uint64, offset int64, size int, filePat
 			tracker.sequentialBytes = int64(size)
 			tracker.wanSubreadRun = size > 0 && size <= wanBulkSubreadMax
 		}
+		// A real seek ends the windowed prefetch: a running pump stops
+		// claiming blocks for the old position. A small reorder of concurrent
+		// subreads (within one block back) keeps the window.
+		if offset+readaheadBlockSize < tracker.lastOffset || offset > expectedOffset+readaheadBlockSize {
+			tracker.windowNext, tracker.windowEnd, tracker.windowEOF = 0, 0, 0
+		}
 	}
 	tracker.lastOffset = offset
 
@@ -278,6 +353,10 @@ func (rm *ReadaheadManager) OnRead(inode uint64, offset int64, size int, filePat
 		// Offline may have engaged while this read updated its tracker.
 		// Admission and WaitGroup registration stay serialized with Stop.
 		if pin.IsOffline() {
+			return
+		}
+		if policy.ParallelFetch {
+			rm.extendWindowLocked(inode, tracker, offset+int64(size), policy, filePath)
 			return
 		}
 		// Calculate the range to prefetch (depth scales with the link).
@@ -330,6 +409,16 @@ func (rm *ReadaheadManager) prefetch(filePath string, start, end int64, maxWorke
 }
 
 func (rm *ReadaheadManager) prefetchWithInode(inode uint64, filePath string, start, end int64, maxWorkers int) {
+	rm.runRound(inode, filePath, maxWorkers, func(fd *os.File, mapping *readaheadMappingJob) {
+		rm.serialBlocks(fd, mapping, start, end)
+	})
+}
+
+// runRound admits one prefetch round and runs body with an open source
+// descriptor. It returns false when the round was shed before body ran.
+// Admission order: lifecycle, the per-link round budget, the global worker
+// semaphore, then one Read-QoS bulk token held for the whole round.
+func (rm *ReadaheadManager) runRound(inode uint64, filePath string, maxWorkers int, body func(*os.File, *readaheadMappingJob)) bool {
 	if rm.prefetchWorkerExit != nil {
 		defer rm.prefetchWorkerExit()
 	}
@@ -338,7 +427,7 @@ func (rm *ReadaheadManager) prefetchWithInode(inode uint64, filePath string, sta
 		rm.prefetchWorkerEntry()
 	}
 	if rm.refuseFUSEContentReads || !rm.prefetchAllowed() {
-		return
+		return false
 	}
 	// Gate against the link-aware worker budget BEFORE taking a semaphore slot.
 	if maxWorkers < 1 {
@@ -346,7 +435,7 @@ func (rm *ReadaheadManager) prefetchWithInode(inode uint64, filePath string, sta
 	}
 	if rm.activePrefetch.Add(1) > int64(maxWorkers) {
 		rm.activePrefetch.Add(-1)
-		return // over the per-link worker budget — shed this round
+		return false // over the per-link worker budget — shed this round
 	}
 	defer rm.activePrefetch.Add(-1)
 
@@ -354,25 +443,27 @@ func (rm *ReadaheadManager) prefetchWithInode(inode uint64, filePath string, sta
 	case rm.sem <- struct{}{}:
 		defer func() { <-rm.sem }()
 	default:
-		return // all workers busy, skip this round
+		return false // all workers busy, skip this round
 	}
 
 	if !rm.prefetchAllowed() {
-		return
+		return false
 	}
 
 	// Read-QoS (#4, INSTANT-NAV): prefetch is the LOWEST read class. On
 	// slow/metered links it only runs when the bulk lane has a free token,
-	// and holds it for the whole block loop below — a contended lane sheds
+	// and holds it for the whole round below — a contended lane sheds
 	// the round entirely (it re-triggers on the next sequential read),
 	// handing the bandwidth back to interactive reads. Inert on medium/fast.
-	qosRelease, qosOK := defaultReadQoS.tryAcquireBulk()
+	// A windowed round holds ONE token for all its parallel blocks, so the
+	// lane keeps the rest of its width for foreground reads.
+	qosRelease, qosOK := defaultReadQoS.tryAcquireBulkPrefetch()
 	if !qosOK {
-		return
+		return false
 	}
 	if !rm.prefetchAllowed() {
 		qosRelease()
-		return
+		return false
 	}
 	var mapping *readaheadMappingJob
 	if inode != 0 && rm.mappingCapture != nil {
@@ -383,6 +474,7 @@ func (rm *ReadaheadManager) prefetchWithInode(inode uint64, filePath string, sta
 	}
 
 	fusePath := rm.fusePath + "/" + filePath
+	ran := false
 	// Scope the descriptor before mapping preparation. Metadata traffic must
 	// not retain a FUSE source fd or any per-read FUSE data gate.
 	func() {
@@ -418,68 +510,374 @@ func (rm *ReadaheadManager) prefetchWithInode(inode uint64, filePath string, sta
 		if !rm.prefetchAllowed() {
 			return
 		}
-
-		buf := make([]byte, readaheadBlockSize)
-		for off := start; off < end; off += readaheadBlockSize {
-			if !rm.prefetchAllowed() {
-				return
-			}
-
-			// FUSE data ceiling (2026-08-05 double kernel panic). Prefetch adds up
-			// to 8 concurrent readers on a fast link — a third of the 16-wide
-			// ceiling — spent entirely on work nobody asked for yet. Use the
-			// NON-BLOCKING background acquire: a foreground acquireFUSEData would
-			// let speculative reads sit in the 250ms admission window ahead of a
-			// user's actual read, inverting the priority this prefetcher exists to
-			// serve. If there is no room, drop the block; the next real read will
-			// fetch it.
-			gateRelease, gateOK := tryAcquireFUSEDataBackground()
-			if !gateOK {
-				metrics.Default().IncReadQoSPrefetchShed()
-				continue
-			}
-			if rm.afterPrefetchGate != nil {
-				rm.afterPrefetchGate()
-			}
-			// The nonblocking gate is owned even when offline/Stop wins after
-			// acquisition. Keep it through an admitted ReadAt and release it once.
-			if !rm.prefetchAllowed() {
-				gateRelease()
-				return
-			}
-			t0 := time.Now()
-			var n int
-			var err error
-			if rm.prefetchReadAt != nil {
-				n, err = rm.prefetchReadAt(fd, buf, off)
-			} else {
-				n, err = fd.ReadAt(buf, off)
-			}
-			gateRelease()
-			if n > 0 {
-				if mapping != nil {
-					mapping.record(off, n)
-				}
-				rm.statsMu.Lock()
-				rm.prefetched++
-				rm.statsMu.Unlock()
-				// WAVE 0 (grades S2): accumulate blocks actually prefetched.
-				metrics.Default().AddReadaheadPrefetchedBlocks(1)
-				// Feed the link estimator. A cold block is a real backend transfer
-				// (slow); a cache hit is sub-ms and gets filtered out inside
-				// ObserveThroughput, so only wire-speed samples move the estimate.
-				if rm.profile != nil {
-					rm.profile.ObserveThroughput(int64(n), time.Since(t0))
-				}
-			}
-			if err != nil {
-				break // EOF or error
-			}
-		}
+		ran = true
+		body(fd, mapping)
 	}()
 	if mapping != nil {
 		mapping.prepare()
 	}
+	return ran
+}
+
+// readBlock issues one prefetch ReadAt through the test hook when set.
+func (rm *ReadaheadManager) readBlock(fd *os.File, buf []byte, off int64) (int, error) {
+	if rm.prefetchReadAt != nil {
+		return rm.prefetchReadAt(fd, buf, off)
+	}
+	return fd.ReadAt(buf, off)
+}
+
+// noteBlockRead records one completed prefetch block in stats, metrics and
+// the link estimator.
+func (rm *ReadaheadManager) noteBlockRead(n int, dur time.Duration) {
+	rm.statsMu.Lock()
+	rm.prefetched++
+	rm.statsMu.Unlock()
+	// WAVE 0 (grades S2): accumulate blocks actually prefetched.
+	metrics.Default().AddReadaheadPrefetchedBlocks(1)
+	// Feed the link estimator. A cold block is a real backend transfer
+	// (slow); a cache hit is sub-ms and gets filtered out inside
+	// ObserveThroughput, so only wire-speed samples move the estimate.
+	// Overlapping windowed blocks are fine: the estimator divides by the
+	// union of active transfer time.
+	if rm.profile != nil {
+		rm.profile.ObserveThroughput(int64(n), dur)
+	}
+}
+
+// serialBlocks is the historical round: one 4 MB buffer, one ReadAt at a time
+// over [start, end). Fast, Medium and Metered use it unchanged.
+func (rm *ReadaheadManager) serialBlocks(fd *os.File, mapping *readaheadMappingJob, start, end int64) {
+	buf := make([]byte, readaheadBlockSize)
+	for off := start; off < end; off += readaheadBlockSize {
+		if !rm.prefetchAllowed() {
+			return
+		}
+
+		// FUSE data ceiling (2026-08-05 double kernel panic). Prefetch adds up
+		// to 8 concurrent readers on a fast link — a third of the 16-wide
+		// ceiling — spent entirely on work nobody asked for yet. Use the
+		// NON-BLOCKING background acquire: a foreground acquireFUSEData would
+		// let speculative reads sit in the 250ms admission window ahead of a
+		// user's actual read, inverting the priority this prefetcher exists to
+		// serve. If there is no room, drop the block; the next real read will
+		// fetch it.
+		gateRelease, gateOK := tryAcquireFUSEDataBackground()
+		if !gateOK {
+			metrics.Default().IncReadQoSPrefetchShed()
+			continue
+		}
+		if rm.afterPrefetchGate != nil {
+			rm.afterPrefetchGate()
+		}
+		// The nonblocking gate is owned even when offline/Stop wins after
+		// acquisition. Keep it through an admitted ReadAt and release it once.
+		if !rm.prefetchAllowed() {
+			gateRelease()
+			return
+		}
+		t0 := time.Now()
+		n, err := rm.readBlock(fd, buf, off)
+		gateRelease()
+		if n > 0 {
+			if mapping != nil {
+				mapping.record(off, n)
+			}
+			rm.noteBlockRead(n, time.Since(t0))
+		}
+		if err != nil {
+			break // EOF or error
+		}
+	}
+}
+
+// extendWindowLocked moves the windowed prefetch (ParallelFetch policies)
+// forward after a qualifying sequential read that ended at readEnd. The window
+// is whole blocks: it starts at the first block boundary at or after readEnd
+// (the reader's own block is left to the reader) and covers policy.Blocks
+// blocks, but not past a known end of file. Each block is claimed once, so no
+// byte is fetched twice. If no round serves this tracker, one starts. Caller
+// holds rm.mu.
+func (rm *ReadaheadManager) extendWindowLocked(inode uint64, tracker *readTracker, readEnd int64, policy netprofile.ReadaheadPolicy, filePath string) {
+	if tracker.windowEOF > 0 && readEnd > tracker.windowEOF {
+		tracker.windowEOF = 0 // the file grew
+	}
+	start := alignUpBlock(readEnd)
+	end := start + int64(policy.Blocks)*readaheadBlockSize
+	if tracker.windowEOF > 0 {
+		if limit := alignUpBlock(tracker.windowEOF); end > limit {
+			end = limit
+		}
+	}
+	if tracker.windowNext < start {
+		// The reader passed blocks the window had not fetched yet; skip them.
+		tracker.windowNext = start
+	}
+	if end > tracker.windowEnd {
+		tracker.windowEnd = end
+	}
+	if tracker.pumping || tracker.windowNext >= tracker.windowEnd {
+		return
+	}
+	if !tracker.sizeHintAt.IsZero() && time.Since(tracker.sizeHintAt) < rm.sizeHintTTL && tracker.windowNext >= tracker.sizeHint {
+		return // at the end of the file as of a moment ago
+	}
+	tracker.pumping = true
+	tracker.roundGen++
+	gen := tracker.roundGen
+	rm.statsMu.Lock()
+	rm.triggered++
+	rm.statsMu.Unlock()
+	metrics.Default().IncReadaheadTriggered()
+	rm.wg.Add(1)
+	go func() {
+		defer rm.wg.Done()
+		rm.pumpWindow(inode, tracker, filePath, policy, gen)
+	}()
+}
+
+// releaseRoundLocked clears pumping if round gen still owns it. Caller holds
+// rm.mu.
+func releaseRoundLocked(tr *readTracker, gen uint64) {
+	if tr.pumping && tr.roundGen == gen {
+		tr.pumping = false
+	}
+}
+
+// clampWindowEOFLocked records an end of file at eof and stops the window
+// there. Caller holds rm.mu.
+func (rm *ReadaheadManager) clampWindowEOFLocked(tr *readTracker, eof int64) {
+	tr.windowEOF = eof
+	if limit := alignUpBlock(eof); tr.windowEnd > limit {
+		tr.windowEnd = limit
+	}
+}
+
+// windowBlockCap is the manager-wide limit on windowed blocks in flight: the
+// policy's Workers, but at most one below the background gate share. On Slow
+// that is min(4, 4-1) = 3. The gate admission (acquireWindowGate) enforces the
+// same bound against everything in flight, foreground included.
+func (rm *ReadaheadManager) windowBlockCap(pol netprofile.ReadaheadPolicy) int64 {
+	if rm.windowCapOverride > 0 {
+		return int64(rm.windowCapOverride)
+	}
+	limit := int64(pol.Workers)
+	if bg := backgroundFUSEDataWidth() - 1; fuseDataGateEnabled && bg < limit {
+		limit = bg
+	}
+	if limit > maxReadaheadWorkers {
+		limit = maxReadaheadWorkers
+	}
+	if limit < 1 {
+		limit = 1
+	}
+	return limit
+}
+
+// admitWindowBlock reserves one manager-wide windowed block slot.
+func (rm *ReadaheadManager) admitWindowBlock(limit int64) bool {
+	for {
+		cur := rm.windowInflight.Load()
+		if cur >= limit {
+			return false
+		}
+		if rm.windowInflight.CompareAndSwap(cur, cur+1) {
+			return true
+		}
+	}
+}
+
+type windowResult struct {
+	off int64
+	n   int
+	err error
+	dur time.Duration
+}
+
+// acquireWindowGate admits one windowed block through the FUSE data gate.
+// Background admission compares the TOTAL in flight (foreground included)
+// against the background width; a windowed block is admitted only below that
+// width minus one, so with any mix of foreground reads and readahead the last
+// background-admissible slot stays free for the spool drainer, membuf, the
+// sidecar warmer and metadata preparation, which poll for it.
+func acquireWindowGate() (release func(), ok bool) {
+	if !fuseDataGateEnabled {
+		return func() {}, true
+	}
+	limit := backgroundFUSEDataWidth() - 1
+	if limit < 1 {
+		return nil, false
+	}
+	if tryAdmitFUSEData(limit) {
+		return releaseFUSEData, true
+	}
+	return nil, false
+}
+
+// pumpWindow runs one bounded windowed round for a tracker. A round claims
+// at most policy.Blocks blocks, then ends; the next qualifying read starts a
+// new round. Bounding the round returns its Read-QoS bulk token and lets
+// mapping preparation run for each round's chunks. The round gives up
+// pumping as soon as it stops claiming, before it waits out its last blocks
+// and before mapping preparation, so the next read can start the next round.
+func (rm *ReadaheadManager) pumpWindow(inode uint64, tr *readTracker, filePath string, policy netprofile.ReadaheadPolicy, gen uint64) {
+	defer func() {
+		rm.mu.Lock()
+		releaseRoundLocked(tr, gen)
+		rm.mu.Unlock()
+	}()
+	rm.runRound(inode, filePath, policy.Workers, func(fd *os.File, mapping *readaheadMappingJob) {
+		rm.windowBlocks(inode, tr, gen, fd, mapping, policy.Blocks)
+	})
+}
+
+// windowBlocks runs the parallel block loop of one round. It keeps up to
+// windowBlockCap blocks in flight (manager-wide), each a whole aligned block
+// read with its own FUSE data slot (acquireWindowGate). It stops claiming
+// when the round has claimed maxBlocks, the window is fetched, the reader
+// seeks or goes idle (windowIdle), the file ends, the link leaves a
+// ParallelFetch class, the cache binding shuts down, the gate is full, or
+// offline/Stop. When it stops claiming it releases pumping in the same
+// critical section as that decision where the decision depends on the
+// window, so a read that extends the window right then starts a new round.
+func (rm *ReadaheadManager) windowBlocks(inode uint64, tr *readTracker, gen uint64, fd *os.File, mapping *readaheadMappingJob, maxBlocks int) {
+	done := make(chan windowResult, maxReadaheadWorkers)
+	inflight, claimedTotal := 0, 0
+	stopClaims := false
+	sizeLimit := int64(-1) // fstat size, after the first admitted claim
+	stop := func() {
+		if !stopClaims {
+			stopClaims = true
+			rm.mu.Lock()
+			releaseRoundLocked(tr, gen)
+			rm.mu.Unlock()
+		}
+	}
+	type span struct {
+		off int64
+		n   int
+	}
+	var spans []span
+	defer func() {
+		if mapping == nil {
+			return
+		}
+		// Blocks finish out of order; record them in file order.
+		sort.Slice(spans, func(i, j int) bool { return spans[i].off < spans[j].off })
+		for _, sp := range spans {
+			mapping.record(sp.off, sp.n)
+		}
+	}()
+	for {
+		claimed, off := false, int64(0)
+		if !stopClaims {
+			pol := rm.effectivePolicy()
+			if !rm.prefetchAllowed() || !pol.ParallelFetch || claimedTotal >= maxBlocks || (mapping != nil && mapping.b.workCtx.Err() != nil) {
+				stop()
+			} else {
+				limit := rm.windowBlockCap(pol)
+				rm.mu.Lock()
+				live := !rm.stopped && rm.trackers[inode] == tr && time.Since(tr.lastAccess) <= rm.windowIdle
+				inFile := sizeLimit < 0 || tr.windowNext < sizeLimit
+				switch {
+				case live && inFile && tr.windowNext < tr.windowEnd && rm.admitWindowBlock(limit):
+					off = tr.windowNext
+					tr.windowNext += readaheadBlockSize
+					claimed = true
+					claimedTotal++
+				case inflight == 0:
+					// Nothing to claim (window fetched, end of file, reader
+					// gone, or every windowed slot is taken by other streams):
+					// end the round.
+					stopClaims = true
+					releaseRoundLocked(tr, gen)
+				}
+				rm.mu.Unlock()
+			}
+		}
+		if stopClaims && inflight == 0 {
+			return
+		}
+
+		if claimed {
+			gateRelease, ok := acquireWindowGate()
+			if ok && sizeLimit < 0 {
+				// One fstat per round, after the first admitted claim, so a
+				// gate-full round costs no metadata call. It bounds this
+				// round only; the tracker keeps it as a short-lived hint.
+				if fi, err := fd.Stat(); err == nil && fi.Mode().IsRegular() {
+					sizeLimit = fi.Size()
+					rm.mu.Lock()
+					tr.sizeHint, tr.sizeHintAt = sizeLimit, time.Now()
+					rm.mu.Unlock()
+				}
+				if sizeLimit >= 0 && off >= sizeLimit {
+					gateRelease()
+					ok = false
+				}
+			}
+			if ok {
+				inflight++
+				go rm.windowBlock(fd, off, gateRelease, done)
+				continue
+			}
+			// Gate full or past the end of file: give the block back so a
+			// later round fetches it rather than skipping it, unless the
+			// reader moved past it, and stop claiming.
+			rm.windowInflight.Add(-1)
+			claimedTotal--
+			metrics.Default().IncReadQoSPrefetchShed()
+			rm.mu.Lock()
+			if tr.windowNext == off+readaheadBlockSize {
+				tr.windowNext = off
+			}
+			stopClaims = true
+			releaseRoundLocked(tr, gen)
+			rm.mu.Unlock()
+			if inflight == 0 {
+				return
+			}
+		}
+
+		r := <-done
+		inflight--
+		rm.windowInflight.Add(-1)
+		if r.n > 0 {
+			spans = append(spans, span{r.off, r.n})
+			rm.noteBlockRead(r.n, r.dur)
+		}
+		if r.err != nil {
+			if errors.Is(r.err, io.EOF) {
+				rm.mu.Lock()
+				rm.clampWindowEOFLocked(tr, r.off+int64(r.n))
+				rm.mu.Unlock()
+			}
+			stop() // EOF, error, or offline/Stop after admission
+		}
+	}
+}
+
+// windowBlock reads one aligned block while holding a background gate slot,
+// and releases the slot exactly once.
+func (rm *ReadaheadManager) windowBlock(fd *os.File, off int64, gateRelease func(), done chan<- windowResult) {
+	if rm.afterPrefetchGate != nil {
+		rm.afterPrefetchGate()
+	}
+	if !rm.prefetchAllowed() {
+		gateRelease()
+		done <- windowResult{off: off, err: errPrefetchStopped}
+		return
+	}
+	bp := windowBufPool.Get().(*[]byte)
+	t0 := time.Now()
+	n, err := rm.readBlock(fd, *bp, off)
+	dur := time.Since(t0)
+	gateRelease()
+	windowBufPool.Put(bp)
+	if err == nil && n < readaheadBlockSize {
+		err = io.EOF
+	}
+	done <- windowResult{off: off, n: n, err: err, dur: dur}
 }
 
 // Stats returns readahead statistics.
