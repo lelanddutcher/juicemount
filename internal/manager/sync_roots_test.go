@@ -458,12 +458,13 @@ func TestJuicefsDryRunCreatesNothing(t *testing.T) {
 	}
 }
 
-// The Manager's minimum stays -jm3: later builds (the shipped -jm4 adds
-// ranged first reads, patch 0018) are accepted, older ones are not.
+// The Manager's minimum stays -jm3: later builds (-jm4 added ranged first
+// reads, patch 0018; the shipped -jm5 batches Redis WATCH round trips, patch
+// 0019) are accepted, older ones are not.
 func TestVersionConfinesLaterBuilds(t *testing.T) {
 	base := "juicefs version 1.3.1+2025-12-02.e0032b2ae5e9"
 	for v, want := range map[string]bool{
-		base + "-jm3": true, base + "-jm4": true, base + "-jm12": true,
+		base + "-jm3": true, base + "-jm4": true, base + "-jm5": true, base + "-jm12": true,
 		base + "-jm2": false, base + "-jm1": false, base: false,
 	} {
 		if got := versionConfines(v); got != want {

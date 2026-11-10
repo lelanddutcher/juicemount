@@ -1052,7 +1052,7 @@ func (m *redisMeta) txn(ctx Context, txf func(tx *redis.Tx) error, keys ...strin
 		if ctx.Canceled() {
 			return syscall.EINTR
 		}
-		err := m.rdb.Watch(ctx, replaceErrno(txf), keys...)
+		err := m.watchTxn(ctx, replaceErrno(txf), keys)
 		if eno, ok := err.(errNo); ok {
 			if eno == 0 {
 				err = nil
@@ -1239,12 +1239,15 @@ func (m *redisMeta) doFallocate(ctx Context, inode Ino, mode uint8, off uint64, 
 
 func (m *redisMeta) doSetAttr(ctx Context, inode Ino, set uint16, sugidclearmode uint8, attr *Attr) syscall.Errno {
 	return errno(m.txn(ctx, func(tx *redis.Tx) error {
-		birth, err := m.prepareBirthMutation(ctx, tx, inode)
+		birth, attrCmd, err := m.prepareBirthMutationAttr(ctx, tx, inode)
 		if err != nil {
 			return err
 		}
+		if attrCmd == nil {
+			attrCmd = tx.Get(ctx, m.inodeKey(inode))
+		}
 		var cur Attr
-		a, err := tx.Get(ctx, m.inodeKey(inode)).Bytes()
+		a, err := attrCmd.Bytes()
 		if err != nil {
 			return err
 		}
@@ -1351,8 +1354,17 @@ func (m *redisMeta) doMknod(ctx Context, parent Ino, name string, _type uint8, m
 				return err
 			}
 		}
+		// JuiceMount: read the parent and its entry in one round trip. Both
+		// keys are WATCHed by this txn, so reading the entry before the
+		// parent checks below changes no outcome.
+		var pcmd, ecmd *redis.StringCmd
+		_, _ = tx.Pipelined(ctx, func(p redis.Pipeliner) error {
+			pcmd = p.Get(ctx, m.inodeKey(parent))
+			ecmd = p.HGet(ctx, m.entryKey(parent), name)
+			return nil
+		})
 		var pattr Attr
-		a, err := tx.Get(ctx, m.inodeKey(parent)).Bytes()
+		a, err := pcmd.Bytes()
 		if err != nil {
 			return err
 		}
@@ -1374,7 +1386,7 @@ func (m *redisMeta) doMknod(ctx Context, parent Ino, name string, _type uint8, m
 			return syscall.ENOTSUP
 		}
 
-		buf, err := tx.HGet(ctx, m.entryKey(parent), name).Bytes()
+		buf, err := ecmd.Bytes()
 		if err != nil && err != redis.Nil {
 			return err
 		}
@@ -2707,7 +2719,7 @@ func (m *redisMeta) doRead(ctx Context, inode Ino, indx uint32) ([]*slice, sysca
 
 func (m *redisMeta) doWrite(ctx Context, inode Ino, indx uint32, off uint32, slice Slice, mtime time.Time, numSlices *int, delta *dirStat, attr *Attr) syscall.Errno {
 	return errno(m.txn(ctx, func(tx *redis.Tx) error {
-		birth, err := m.prepareBirthMutation(ctx, tx, inode)
+		birth, attrCmd, err := m.prepareBirthMutationAttr(ctx, tx, inode)
 		if err != nil {
 			return err
 		}
@@ -2721,7 +2733,10 @@ func (m *redisMeta) doWrite(ctx Context, inode Ino, indx uint32, off uint32, sli
 		}
 		*delta = dirStat{}
 		*attr = Attr{}
-		a, err := tx.Get(ctx, m.inodeKey(inode)).Bytes()
+		if attrCmd == nil {
+			attrCmd = tx.Get(ctx, m.inodeKey(inode))
+		}
+		a, err := attrCmd.Bytes()
 		if err != nil {
 			return err
 		}

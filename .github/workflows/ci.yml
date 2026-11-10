@@ -78,6 +78,18 @@ jobs:
           # The whole package without -race: upstream disk-cache tests race
           # in their background goroutines.
           go test -count=1 -overlay "$RUNNER_TEMP/chunk-overlay.json" ./pkg/chunk
+      - name: Vendored juicefs Redis metadata tests
+        working-directory: third_party/juicefs
+        # Patch 0019 (batched WATCH) and the birth/replace guards, with
+        # -race; then upstream's whole Redis metadata suite, which uses DB 10
+        # (the smart-folder tests below flush it before use).
+        env:
+          JM_WATCH_BATCH_TEST_REDIS_URL: redis://127.0.0.1:6379/6
+          JM_WATCH_BATCH_STRESS_REDIS_URL: redis://127.0.0.1:6379/5
+          JM_REPLACE_TEST_REDIS_URL: redis://127.0.0.1:6379/7
+        run: |
+          go test -count=1 -race -run 'TestJMWatchBatch|TestBirth|Rename|TestCommittedRecord' ./pkg/meta
+          go test -count=1 -run 'TestRedisClient$' ./pkg/meta
       - name: Unit and integration-safe tests
         env:
           JM_REQUIRE_GATE_HISTORY: '1'
