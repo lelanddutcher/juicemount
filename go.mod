@@ -17,6 +17,7 @@ require (
 	github.com/zeebo/xxh3 v1.0.2
 	golang.org/x/crypto v0.58.0
 	golang.org/x/sys v0.49.0
+	gopkg.in/yaml.v3 v3.0.1
 	modernc.org/sqlite v1.47.0
 	tailscale.com v1.102.3
 )

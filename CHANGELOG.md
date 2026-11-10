@@ -52,6 +52,30 @@
   store and the proxy. The setup command refuses the file on such a kernel.
   See "Faster downloads to remote Macs" in `server/INSTALL-TrueNAS.md`.
 
+### Server: Link
+
+- Link now starts when the NAS has no internet. Before, a NAS that booted
+  before its router had a WAN link (for example after a power cut) had no
+  Link until the internet came back. Macs at home that reach the NAS through
+  Link lost access too. The cause: Headscale, Link's control server, must
+  load a relay (DERP) map before it serves. The Manager's generated config
+  told it to download Tailscale's public map, and Headscale exits when that
+  download fails. Clearing `HEADSCALE_DERP_URLS` did not remove it.
+- Now the Manager downloads the map itself and keeps it in
+  `/data/headscale/derpmap.yaml`. Headscale reads only that file. Without
+  internet, the Manager uses the copy from its last download, or on a first
+  start the copy built into the Manager. It downloads the map again every
+  minute until that works, then every hour. Headscale reads the file again
+  every 5 minutes. With internet, the public relays are used as before.
+- On start, the Manager rewrites the relay section of an existing
+  `/data/headscale/config.yaml` only if it is exactly what an older Manager
+  generated. A relay section you edited stays as it is.
+- New setting `JM_NET_DERP_MAP_URL` (in `server/docker-compose.link.yml`).
+  Unset: Tailscale's public relays, as before. A URL: only the relays in the
+  DERP map at that URL, such as your own relay's; the public relays are not
+  used. `off`: no downloaded map; list your own map file in `config.yaml`
+  (`derp.paths`) or `HEADSCALE_DERP_PATHS`.
+
 ## 0.5.1 — 2026-11-07 (build 38)
 
 A reliability update to 0.5.0, with a security fix in the Redis proxy, the

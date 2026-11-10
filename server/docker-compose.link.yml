@@ -32,9 +32,16 @@
 #     JM_NET_NAS_LAN_ADDR only, when set to the NAS's LAN address), only.
 #
 # CHANGELOG.md (JuiceMount Link) says how the exposure default is chosen and
-# how to switch. To relay through your own DERP servers instead of
-# Tailscale's public map, pass HEADSCALE_DERP_URLS or HEADSCALE_DERP_PATHS to
-# the Manager.
+# how to switch.
+#
+# Relays (DERP): when no direct path forms, Link relays through Tailscale's
+# public relays. The Manager keeps their map in /data/headscale/derpmap.yaml
+# (fetched again every hour; the last copy is kept), so Link starts even when
+# the NAS has no internet. To use only your own relay, set
+# JM_NET_DERP_MAP_URL to your relay's DERP map URL (JSON). JM_NET_DERP_MAP_URL=off
+# drops the fetched map; then list your map file in config.yaml derp.paths or
+# HEADSCALE_DERP_PATHS. HEADSCALE_DERP_URLS also still works, but Headscale
+# does not start while it cannot fetch that URL.
 services:
   juicemount-manager:
     environment:
@@ -47,6 +54,7 @@ services:
       JM_NET_NAS_LAN_ADDR: "${JM_NET_NAS_LAN_ADDR:-}"
       JM_NET_TLS_CERT: "${JM_NET_TLS_CERT:-}"
       JM_NET_TLS_KEY: "${JM_NET_TLS_KEY:-}"
+      JM_NET_DERP_MAP_URL: "${JM_NET_DERP_MAP_URL:-}"
     ports:
       - "30193:8091"                                                    # Headscale control server
       - "${JM_NET_NAS_UDP_PORT:-41641}:${JM_NET_NAS_UDP_PORT:-41641}/udp" # NAS node WireGuard

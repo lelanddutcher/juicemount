@@ -31,7 +31,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
-	"sort"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -200,24 +199,11 @@ func localDERPMap(t *testing.T, dir, listen string) *tailcfg.DERPMap {
 
 // writeDERPMapYAML renders a DERP map in the YAML shape Headscale's
 // derp.paths loader reads (lower-cased tailcfg field names).
+// writeDERPMapYAML writes m as the Manager writes its DERP map file
+// (derpmap.go), so every integration test proves the real Headscale reads it.
 func writeDERPMapYAML(t *testing.T, path string, m *tailcfg.DERPMap) {
 	t.Helper()
-	var b strings.Builder
-	b.WriteString("regions:\n")
-	ids := make([]int, 0, len(m.Regions))
-	for id := range m.Regions {
-		ids = append(ids, id)
-	}
-	sort.Ints(ids)
-	for _, id := range ids {
-		r := m.Regions[id]
-		fmt.Fprintf(&b, "  %d:\n    regionid: %d\n    regioncode: %s\n    regionname: test\n    nodes:\n", id, r.RegionID, r.RegionCode)
-		for _, n := range r.Nodes {
-			fmt.Fprintf(&b, "      - name: %q\n        regionid: %d\n        hostname: %s\n        ipv4: %s\n        ipv6: %s\n        stunport: %d\n        derpport: %d\n        insecurefortests: %t\n        stuntestip: %s\n",
-				n.Name, n.RegionID, n.HostName, n.IPv4, n.IPv6, n.STUNPort, n.DERPPort, n.InsecureForTests, n.STUNTestIP)
-		}
-	}
-	if err := os.WriteFile(path, []byte(b.String()), 0o600); err != nil {
+	if _, err := writeDERPMapFile(path, m); err != nil {
 		t.Fatal(err)
 	}
 }
