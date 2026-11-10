@@ -97,9 +97,14 @@ const (
 	// linkNodeLeaseFile, in the Manager's identity directory, is touched
 	// every linkNodeLeaseEvery while a node container reports, and removed
 	// when it reports that it stopped. JM_NET_NAS_NODE=on waits until it is
-	// older than linkNodeOrphanAfter + linkNodeLeaseEvery.
+	// older than linkNodeRollbackWait.
 	linkNodeLeaseFile  = "node-container.lease"
 	linkNodeLeaseEvery = 30 * time.Second
+	// linkNodeRollbackWait covers the worst case: the node's last answer up
+	// to linkNodeLeaseEvery after the lease was written, then
+	// linkNodeOrphanAfter, then up to one watch interval (linkNodeWatchEvery,
+	// 5 s) before it notices, plus time for tsnet to close.
+	linkNodeRollbackWait = linkNodeOrphanAfter + linkNodeLeaseEvery + 5*time.Second + 15*time.Second
 	// linkNodeMintedFile, next to Headscale's config, lists the IDs of the
 	// last linkNodeMintedKeep pre-auth keys the broker minted for the node.
 	linkNodeMintedFile = "nas-node-keys.json"
@@ -333,6 +338,23 @@ func isLinkNodePath(p string) bool {
 	return c == "/link-node" || strings.HasPrefix(c, "/link-node/")
 }
 
+// tailnetPrefixes are the address ranges Headscale assigns: the CGNAT
+// range and Tailscale's ULA. The relay accepts no other peer address.
+var tailnetPrefixes = []netip.Prefix{
+	netip.MustParsePrefix("100.64.0.0/10"),
+	netip.MustParsePrefix("fd7a:115c:a1e0::/48"),
+}
+
+func isTailnetAddr(a netip.Addr) bool {
+	a = a.Unmap()
+	for _, p := range tailnetPrefixes {
+		if p.Contains(a) {
+			return true
+		}
+	}
+	return false
+}
+
 // relayHandler serves relay.sock: the Manager's own API for tailnet peers,
 // never the node's control API.
 func (b *linkNodeBroker) relayHandler() http.Handler {
@@ -342,7 +364,7 @@ func (b *linkNodeBroker) relayHandler() http.Handler {
 			return
 		}
 		peer, err := netip.ParseAddrPort(r.Header.Get(linkNodePeerHeader))
-		if err != nil || !peer.Addr().IsValid() {
+		if err != nil || !peer.Addr().IsValid() || !isTailnetAddr(peer.Addr()) {
 			http.Error(w, "the Link node did not name the tailnet peer", http.StatusBadRequest)
 			return
 		}
@@ -765,7 +787,7 @@ func (g *linkNodeGuard) blocked() string {
 		return "a Link node container (juicemount-link) is still running and holds the NAS node's identity; stop and remove it"
 	}
 	if fi, err := os.Stat(filepath.Join(g.identityDir, linkNodeLeaseFile)); err == nil {
-		if age := now.Sub(fi.ModTime()); age < linkNodeOrphanAfter+linkNodeLeaseEvery {
+		if age := now.Sub(fi.ModTime()); age < linkNodeRollbackWait {
 			return fmt.Sprintf("a Link node container (juicemount-link) reported %s ago and may still hold the NAS node's identity; waiting until it has stopped its node (remove juicemount-link if it still runs)", age.Round(time.Second))
 		}
 	}

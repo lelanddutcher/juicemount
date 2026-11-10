@@ -156,9 +156,11 @@
   `JM_NET_NAS_NODE=on` that still shares `juicemount-link-run` with a node
   container tells it to stop its node, and does not start its own node
   while that container still calls it (`GET /api/net/link` says why). With
-  the previous overlay (no shared volume), the Manager waits up to 2.5
-  minutes after the node container's last report, unless it stopped
-  cleanly. A node container that has not reached the Manager for 2 minutes
+  the previous overlay (no shared volume), the Manager waits up to 2 minutes
+  50 seconds after the node container's last report, unless it stopped
+  cleanly. That wait needs this release or later: an older Manager image
+  does not check, so with an older image always stop and remove
+  `juicemount-link` first. A node container that has not reached the Manager for 2 minutes
   stops its node. `docker compose up` with the previous overlay leaves the
   container running: remove it (`docker compose rm -sf juicemount-link`
   before switching, or `up -d --remove-orphans`).

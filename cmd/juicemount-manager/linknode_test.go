@@ -760,6 +760,10 @@ func TestLinkNodeRollbackGuard(t *testing.T) {
 		t.Fatalf("not blocked by a fresh lease: %q", why)
 	}
 	now = now.Add(linkNodeOrphanAfter + linkNodeLeaseEvery)
+	if why := g.blocked(); why == "" {
+		t.Fatal("unblocked before the rollback wait")
+	}
+	now = now.Add(linkNodeRollbackWait - linkNodeOrphanAfter - linkNodeLeaseEvery)
 	if why := g.blocked(); why != "" {
 		t.Fatalf("blocked by an old lease: %s", why)
 	}
