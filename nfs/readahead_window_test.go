@@ -21,6 +21,10 @@ import (
 
 const windowTestSubread = 256 << 10
 
+// slowWindowCap is the windowed blocks in flight on Slow: Workers 4, but one
+// below the background gate share (8/2 = 4), so 3.
+const slowWindowCap = 3
+
 // windowTestFile makes a sparse file of n blocks in a fresh directory.
 func windowTestFile(t *testing.T, blocks int) (string, string) {
 	t.Helper()
@@ -168,6 +172,7 @@ func TestSlowWindowReadsAlignedBlocksOnce(t *testing.T) {
 // blockingReads holds every prefetch ReadAt until released and tracks the
 // peak number held at once.
 type blockingReads struct {
+	once     sync.Once
 	release  chan struct{}
 	started  chan int64
 	inflight atomic.Int32
@@ -177,6 +182,10 @@ type blockingReads struct {
 func newBlockingReads() *blockingReads {
 	return &blockingReads{release: make(chan struct{}), started: make(chan int64, 64)}
 }
+
+// unblock releases every held read; safe to call more than once. Defer it
+// after rm.Stop so it runs first and Stop can join the readers.
+func (b *blockingReads) unblock() { b.once.Do(func() { close(b.release) }) }
 
 func (b *blockingReads) readAt(fd *os.File, buf []byte, off int64) (int, error) {
 	n := b.inflight.Add(1)
@@ -205,24 +214,25 @@ func TestSlowWindowFetchesInParallelUpToWorkers(t *testing.T) {
 	defer rm.Stop()
 	br := newBlockingReads()
 	rm.prefetchReadAt = br.readAt
+	defer br.unblock()
 
 	const inode = 502
 	readSequential(rm, inode, name, 0, readaheadBlockSize)
-	for i := 0; i < 4; i++ {
+	for i := 0; i < slowWindowCap; i++ {
 		awaitPrefetchSignal(t, br.started)
 	}
-	// Give an over-eager pump time to start a fifth read.
+	// Give an over-eager pump time to start another read.
 	time.Sleep(50 * time.Millisecond)
-	if got := br.inflight.Load(); got != 4 {
-		t.Fatalf("blocks in flight = %d, want 4 (the slow Workers bound)", got)
+	if got := br.inflight.Load(); got != slowWindowCap {
+		t.Fatalf("blocks in flight = %d, want %d (background share minus one)", got, slowWindowCap)
 	}
-	if inUse, _ := fuseDataGateDepth(); inUse != 4 {
-		t.Fatalf("FUSE data gate holds %d slots, want one per block in flight (4)", inUse)
+	if inUse, _ := fuseDataGateDepth(); inUse != slowWindowCap {
+		t.Fatalf("FUSE data gate holds %d slots, want one per block in flight (%d)", inUse, slowWindowCap)
 	}
-	close(br.release)
+	br.unblock()
 	waitWindowIdle(t, rm, inode)
-	if p := br.peak.Load(); p != 4 {
-		t.Fatalf("peak blocks in flight = %d, want 4", p)
+	if p := br.peak.Load(); p != slowWindowCap {
+		t.Fatalf("peak blocks in flight = %d, want %d", p, slowWindowCap)
 	}
 	if _, prefetched := rm.Stats(); prefetched != 6 {
 		t.Fatalf("prefetched %d blocks, want the 6-block window", prefetched)
@@ -249,21 +259,27 @@ func TestSlowWindowLeavesForegroundReserve(t *testing.T) {
 	defer rm.Stop()
 	br := newBlockingReads()
 	rm.prefetchReadAt = br.readAt
-	defer close(br.release)
+	defer br.unblock()
 
 	readSequential(rm, 503, name, 0, readaheadBlockSize)
-	for i := 0; i < 4; i++ {
+	for i := 0; i < slowWindowCap; i++ {
 		awaitPrefetchSignal(t, br.started)
 	}
 	width := effectiveFUSEDataWidth()
 	if width != 8 {
 		t.Fatalf("slow-link gate width = %d, want 8", width)
 	}
-	// Background is full: another speculative read is refused.
+	// Prefetch leaves one background slot for the drainer and friends;
+	// past that, background is full.
+	spare, ok := tryAcquireFUSEDataBackground()
+	if !ok {
+		t.Fatal("prefetch filled the whole background share; the drainer has no slot")
+	}
 	if rel, ok := tryAcquireFUSEDataBackground(); ok {
 		rel()
 		t.Fatal("background admitted past its half of the gate")
 	}
+	spare()
 	// Foreground gets the reserved half immediately.
 	var rels []func()
 	t0 := time.Now()
@@ -344,20 +360,21 @@ func TestSlowWindowStopsForAbandonedReader(t *testing.T) {
 	rm.windowIdle = 20 * time.Millisecond
 	br := newBlockingReads()
 	rm.prefetchReadAt = br.readAt
+	defer br.unblock()
 
 	const inode = 505
 	readSequential(rm, inode, name, 0, readaheadBlockSize)
-	for i := 0; i < 4; i++ {
+	for i := 0; i < slowWindowCap; i++ {
 		awaitPrefetchSignal(t, br.started)
 	}
 	// The reader walks away. Let the idle limit pass, then finish the reads.
 	time.Sleep(3 * rm.windowIdle)
-	close(br.release)
+	br.unblock()
 	waitWindowIdle(t, rm, inode)
-	if _, prefetched := rm.Stats(); prefetched != 4 {
-		t.Fatalf("abandoned stream prefetched %d blocks, want only the 4 already in flight", prefetched)
+	if _, prefetched := rm.Stats(); prefetched != slowWindowCap {
+		t.Fatalf("abandoned stream prefetched %d blocks, want only the %d already in flight", prefetched, slowWindowCap)
 	}
-	if p := br.peak.Load(); p > 4 {
+	if p := br.peak.Load(); p > slowWindowCap {
 		t.Fatalf("peak in flight %d exceeds Workers", p)
 	}
 }
@@ -375,19 +392,20 @@ func TestSlowWindowSeekStopsOldWindow(t *testing.T) {
 	defer rm.Stop()
 	br := newBlockingReads()
 	rm.prefetchReadAt = br.readAt
+	defer br.unblock()
 
 	const inode = 506
 	readSequential(rm, inode, name, 0, readaheadBlockSize)
-	for i := 0; i < 4; i++ {
+	for i := 0; i < slowWindowCap; i++ {
 		awaitPrefetchSignal(t, br.started)
 	}
 	// Seek far back; a single read does not qualify for a new window.
 	rm.OnRead(inode, 40*readaheadBlockSize, windowTestSubread, name)
 	rm.OnRead(inode, 0, windowTestSubread, name)
-	close(br.release)
+	br.unblock()
 	waitWindowIdle(t, rm, inode)
-	if _, prefetched := rm.Stats(); prefetched != 4 {
-		t.Fatalf("prefetched %d blocks after the seek, want only the 4 in flight", prefetched)
+	if _, prefetched := rm.Stats(); prefetched != slowWindowCap {
+		t.Fatalf("prefetched %d blocks after the seek, want only the %d in flight", prefetched, slowWindowCap)
 	}
 }
 
@@ -402,18 +420,19 @@ func TestSlowWindowOfflineReleasesGate(t *testing.T) {
 	rm := NewReadaheadManager(dir, nil, slowProfile(t))
 	br := newBlockingReads()
 	rm.prefetchReadAt = br.readAt
+	defer br.unblock()
 
 	readSequential(rm, 507, name, 0, readaheadBlockSize)
-	for i := 0; i < 4; i++ {
+	for i := 0; i < slowWindowCap; i++ {
 		awaitPrefetchSignal(t, br.started)
 	}
 	pin.SetOffline(true)
-	close(br.release)
+	br.unblock()
 	rm.Stop()
 	if inUse, _ := fuseDataGateDepth(); inUse != 0 {
 		t.Fatalf("gate leaked %d slots after offline", inUse)
 	}
-	if _, prefetched := rm.Stats(); prefetched != 4 {
-		t.Fatalf("prefetched %d blocks, want only the 4 admitted before offline", prefetched)
+	if _, prefetched := rm.Stats(); prefetched != slowWindowCap {
+		t.Fatalf("prefetched %d blocks, want only the %d admitted before offline", prefetched, slowWindowCap)
 	}
 }

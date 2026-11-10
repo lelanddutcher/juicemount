@@ -3,6 +3,8 @@ package nfs
 import (
 	"fmt"
 	"os"
+	"path/filepath"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -114,34 +116,75 @@ func (c *simCache) fetch(link *simLink, off int64, n int, prefetch bool) {
 }
 
 type simResult struct {
-	mbps         float64
+	mbps         float64 // all readers together, real-link units
 	avgInflight  float64
 	peakInflight int32
 	prefetched   int64
+	fgP50        time.Duration // foreground subread latency, real-link units
+	fgP99        time.Duration
+	fgMax        time.Duration
+	jukebox      int64         // foreground gate refusals (JUKEBOX retries)
+	drainMax     time.Duration // longest drain wait for a background slot
 }
 
-func runReadaheadSim(t *testing.T, scale float64, rateMbit float64, latency time.Duration, fileMiB int, override *netprofile.ReadaheadPolicy) simResult {
+type simVariant struct {
+	name     string
+	policy   *netprofile.ReadaheadPolicy // nil = the product's Slow policy
+	gate     string                      // JM_FUSE_DATA_GATE
+	windowCp int                         // windowCapOverride (0 = product)
+}
+
+func percentile(d []time.Duration, p float64) time.Duration {
+	if len(d) == 0 {
+		return 0
+	}
+	sort.Slice(d, func(i, j int) bool { return d[i] < d[j] })
+	return d[int(float64(len(d)-1)*p)]
+}
+
+// runReadaheadSim reads `readers` files of fileMiB each at the same time.
+// Each foreground subread goes through the Read-QoS bulk lane and the FUSE
+// data gate as the handler's does. With drainer set, a spool drain polls the
+// background gate every 10 ms (1 ms scaled) and holds a slot 50 ms (5 ms).
+func runReadaheadSim(t *testing.T, scale float64, rateMbit float64, latency time.Duration, fileMiB, readers int, drainer bool, v simVariant) simResult {
 	t.Helper()
-	dir, name := windowTestFile(t, fileMiB/4)
+	t.Setenv("JM_FUSE_DATA_GATE", v.gate)
+	fuseDataInFlight.Store(0)
+	dir := t.TempDir()
+	caches := map[string]*simCache{}
+	names := make([]string, readers)
+	for r := range names {
+		names[r] = fmt.Sprintf("reel%d.mov", r)
+		f, err := os.Create(filepath.Join(dir, names[r]))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := f.Truncate(int64(fileMiB) << 20); err != nil {
+			t.Fatal(err)
+		}
+		f.Close()
+		caches[filepath.Join(dir, names[r])] = newSimCache()
+	}
 	link := &simLink{rate: rateMbit * 1e6 / 8 * scale, latency: time.Duration(float64(latency) / scale)}
-	cache := newSimCache()
 	rm := NewReadaheadManager(dir, nil, slowProfile(t))
 	defer rm.Stop()
-	if override != nil {
-		pol := *override
+	if v.policy != nil {
+		pol := *v.policy
 		rm.policyOverride = func() netprofile.ReadaheadPolicy { return pol }
 	}
+	rm.windowCapOverride = v.windowCp
 	rm.prefetchReadAt = func(fd *os.File, buf []byte, off int64) (int, error) {
-		cache.fetch(link, off, len(buf), true)
+		caches[fd.Name()].fetch(link, off, len(buf), true)
 		return len(buf), nil
 	}
 
 	var samples, sum int64
 	var peak int32
 	stop := make(chan struct{})
-	sampled := make(chan struct{})
+	var bg sync.WaitGroup
+	bg.Add(1)
 	go func() {
-		defer close(sampled)
+		defer bg.Done()
 		tick := time.NewTicker(time.Millisecond)
 		defer tick.Stop()
 		for {
@@ -158,22 +201,81 @@ func runReadaheadSim(t *testing.T, scale float64, rateMbit float64, latency time
 			}
 		}
 	}()
+	var drainMax time.Duration
+	if drainer {
+		bg.Add(1)
+		go func() {
+			defer bg.Done()
+			for {
+				t0 := time.Now()
+				for {
+					select {
+					case <-stop:
+						return
+					default:
+					}
+					if rel, ok := tryAcquireFUSEDataBackground(); ok {
+						if w := time.Since(t0); w > drainMax {
+							drainMax = w
+						}
+						time.Sleep(5 * time.Millisecond)
+						rel()
+						break
+					}
+					time.Sleep(time.Millisecond)
+				}
+			}
+		}()
+	}
 
 	size := int64(fileMiB) << 20
+	var mu sync.Mutex
+	var lat []time.Duration
+	var jukebox atomic.Int64
+	var rw sync.WaitGroup
 	t0 := time.Now()
-	for off := int64(0); off < size; off += simUnit {
-		cache.fetch(link, off, simUnit, false)
-		rm.OnRead(600, off, simUnit, name)
+	for r := 0; r < readers; r++ {
+		rw.Add(1)
+		go func(r int) {
+			defer rw.Done()
+			cache := caches[filepath.Join(dir, names[r])]
+			var mine []time.Duration
+			for off := int64(0); off < size; off += simUnit {
+				s0 := time.Now()
+				qos := defaultReadQoS.acquire(off, simUnit)
+				for {
+					rel, ok := acquireFUSEData()
+					if ok {
+						cache.fetch(link, off, simUnit, false)
+						rel()
+						break
+					}
+					jukebox.Add(1) // the client retries the READ
+				}
+				qos()
+				mine = append(mine, time.Duration(float64(time.Since(s0))*scale))
+				rm.OnRead(uint64(600+r), off, simUnit, names[r])
+			}
+			mu.Lock()
+			lat = append(lat, mine...)
+			mu.Unlock()
+		}(r)
 	}
+	rw.Wait()
 	elapsed := time.Since(t0)
 	close(stop)
-	<-sampled
+	bg.Wait()
 	_, prefetched := rm.Stats()
 	return simResult{
-		mbps:         float64(size*8) / 1e6 / (elapsed.Seconds() * scale),
+		mbps:         float64(int64(readers)*size*8) / 1e6 / (elapsed.Seconds() * scale),
 		avgInflight:  float64(sum) / float64(samples),
 		peakInflight: peak,
 		prefetched:   prefetched,
+		fgP50:        percentile(lat, 0.5),
+		fgP99:        percentile(lat, 0.99),
+		fgMax:        percentile(lat, 1),
+		jukebox:      jukebox.Load(),
+		drainMax:     time.Duration(float64(drainMax) * scale),
 	}
 }
 
@@ -184,10 +286,16 @@ func TestReadaheadSlowLinkSimulation(t *testing.T) {
 	t.Setenv("JM_SERVER_READAHEAD", "")
 	resetPrefetchOfflineState(t)
 	forceDefaultClass(t, netprofile.ClassSlow)
+	t.Cleanup(func() { fuseDataInFlight.Store(0) })
 
 	// The old slow policy and its gate: 2 blocks, 2 rounds, serial buffer,
 	// FUSE data gate 4 (background 2).
 	old := netprofile.ReadaheadPolicy{Enabled: true, SeqThreshold: 4, Blocks: 2, Workers: 2}
+	variants := []simVariant{
+		{name: "before", policy: &old, gate: "4"},
+		{name: "after, 4 in flight", windowCp: 4},
+		{name: "after, 3 in flight (shipped)"},
+	}
 	const scale = 10 // run 10x faster than the real link; results are rescaled
 	for _, sc := range []struct {
 		name     string
@@ -203,15 +311,21 @@ func TestReadaheadSlowLinkSimulation(t *testing.T) {
 		{"cellular (120 ms RTT, 20 Mbit/s) as Slow", 20, 240 * time.Millisecond},
 		{"same-city (20 ms RTT, 200 Mbit/s)", 200, 40 * time.Millisecond},
 	} {
-		var before, after simResult
-		func() {
-			t.Setenv("JM_FUSE_DATA_GATE", "4")
-			before = runReadaheadSim(t, scale, sc.rateMbit, sc.latency, 96, &old)
-		}()
-		t.Setenv("JM_FUSE_DATA_GATE", "")
-		after = runReadaheadSim(t, scale, sc.rateMbit, sc.latency, 96, nil)
-		t.Log(fmt.Sprintf("%-40s before: %5.1f Mbit/s, prefetch requests in flight avg %.2f peak %d (%d ReadAt calls) | after: %5.1f Mbit/s, avg %.2f peak %d (%d blocks)",
-			sc.name, before.mbps, before.avgInflight, before.peakInflight, before.prefetched,
-			after.mbps, after.avgInflight, after.peakInflight, after.prefetched))
+		for _, load := range []struct {
+			name    string
+			readers int
+			drainer bool
+		}{
+			{"1 reader", 1, false},
+			{"2 readers + drain", 2, true},
+		} {
+			for _, v := range variants {
+				r := runReadaheadSim(t, scale, sc.rateMbit, sc.latency, 96, load.readers, load.drainer, v)
+				t.Logf("| %s | %s | %s | %.1f | %.2f / %d | %v / %v / %v | %d | %v |",
+					sc.name, load.name, v.name, r.mbps, r.avgInflight, r.peakInflight,
+					r.fgP50.Round(time.Millisecond), r.fgP99.Round(time.Millisecond), r.fgMax.Round(time.Millisecond),
+					r.jukebox, r.drainMax.Round(time.Millisecond))
+			}
+		}
 	}
 }

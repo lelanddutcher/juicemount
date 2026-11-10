@@ -3,6 +3,7 @@ package nfs
 import (
 	"os"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"github.com/lelanddutcher/juicemount/internal/metrics"
@@ -74,6 +75,10 @@ type readQoS struct {
 	// wait bounds — fields (not consts) so tests can shrink them.
 	intWait  time.Duration
 	bulkWait time.Duration
+	// prefetchHeld counts bulk tokens held by prefetch rounds. Prefetch may
+	// hold at most half the lane (at least one), so foreground bulk reads
+	// always find free tokens however many streams are prefetching.
+	prefetchHeld atomic.Int32
 }
 
 func newReadQoS(bulkWidth, intWidth int, classFn func() netprofile.LinkClass) *readQoS {
@@ -165,11 +170,43 @@ func (q *readQoS) tryAcquireBulk() (release func(), ok bool) {
 	if !q.active() {
 		return readQoSNoop, true
 	}
-	select {
-	case q.bulk <- struct{}{}:
-		return func() { <-q.bulk }, true
-	default:
+	if !q.admitPrefetch() {
 		metrics.Default().IncReadQoSPrefetchShed()
 		return nil, false
+	}
+	select {
+	case q.bulk <- struct{}{}:
+		return func() {
+			<-q.bulk
+			q.prefetchHeld.Add(-1)
+		}, true
+	default:
+		q.prefetchHeld.Add(-1)
+		metrics.Default().IncReadQoSPrefetchShed()
+		return nil, false
+	}
+}
+
+// prefetchBulkShare is how many bulk tokens prefetch may hold at once.
+func (q *readQoS) prefetchBulkShare() int32 {
+	share := int32(cap(q.bulk) / 2)
+	if share < 1 {
+		share = 1
+	}
+	return share
+}
+
+// admitPrefetch reserves one unit of the prefetch share (CAS, so concurrent
+// rounds cannot overshoot it). The caller undoes it when the lane is full.
+func (q *readQoS) admitPrefetch() bool {
+	share := q.prefetchBulkShare()
+	for {
+		cur := q.prefetchHeld.Load()
+		if cur >= share {
+			return false
+		}
+		if q.prefetchHeld.CompareAndSwap(cur, cur+1) {
+			return true
+		}
 	}
 }

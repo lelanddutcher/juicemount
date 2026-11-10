@@ -18,14 +18,16 @@
 - On a slow or distant link, a long file read that is not in the cache uses
   more of the link. Before, the app fetched about one 4 MiB block ahead at a
   time, so most of each block's request time left the link idle. Now it
-  fetches up to four whole blocks ahead in parallel, keeps a window of six
+  fetches up to three whole blocks ahead in parallel, keeps a window of six
   blocks (24 MiB) ahead of the reader, and never fetches a block twice. In a
   simulation of a 200 ms, 30 Mbit/s link, a cold sequential read went from
-  about 13 to about 25 Mbit/s. The app still keeps half of its concurrent
-  file reads for what you open, so browsing and opening files are not held
-  behind the prefetch. Short reads (Finder previews) still do not start it,
-  and it stops when the reader stops or seeks. Metered (cellular) links and
-  fast or LAN links behave as before.
+  about 11 to about 25 Mbit/s. The app still keeps half of its concurrent
+  file reads and bulk-read slots for what you open, and leaves room for
+  uploads and the background cache warmers, so they are not held behind the
+  prefetch. Short reads (Finder previews) still do not start it, and it stops
+  when the reader stops or seeks, at the end of the file, and when the link
+  becomes metered. Metered (cellular) links and fast or LAN links behave as
+  before.
 
 ### Server
 

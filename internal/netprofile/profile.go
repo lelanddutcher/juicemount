@@ -618,9 +618,11 @@ func (p *Profile) Readahead() ReadaheadPolicy {
 		// Distant or mid-rate WAN (the RTT ceiling puts every far link here).
 		// One serial 4 MB block in flight used about half of a 30 Mbit/s,
 		// 200 ms link: each block paid a full request round trip before its
-		// bytes moved. Four blocks in flight cover that idle time; a six-block
-		// (24 MiB) window keeps two queued behind them. The short-run guard in
-		// the NFS layer still holds back preview-sized runs.
+		// bytes moved. Several blocks in flight cover that idle time: Workers
+		// 4, which the NFS layer caps one below the background FUSE share, so
+		// 3 in practice. A six-block (24 MiB) window keeps more queued behind
+		// them. The short-run guard in the NFS layer still holds back
+		// preview-sized runs.
 		return ReadaheadPolicy{Enabled: true, SeqThreshold: 4, Blocks: 6, Workers: 4, ParallelFetch: true}
 	case ClassFast:
 		// 10GbE / LAN: go deep + wide to keep enough 4 MB blocks in flight to
