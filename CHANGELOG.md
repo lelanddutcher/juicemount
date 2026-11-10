@@ -8,10 +8,10 @@
   the Redis proxy send with TCP BBR instead of cubic. Downloads to a Mac on a
   distant link that loses packets become much faster. Nothing changes on a
   LAN, for uploads from a Mac (macOS has no BBR), or for the host's own
-  settings. The host must have the `tcp_bbr` kernel module loaded. If BBR is
-  not available, the server starts and runs as before and logs a warning.
-  To turn it on, see "Faster downloads to remote Macs" in
-  `server/INSTALL-TrueNAS.md`.
+  settings. Use it only on a kernel that has BBR (`modinfo tcp_bbr`
+  succeeds): on a kernel without it, Docker refuses to start the object
+  store and the proxy. The setup command refuses the file on such a kernel.
+  See "Faster downloads to remote Macs" in `server/INSTALL-TrueNAS.md`.
 
 ## 0.5.1 — 2026-11-07 (build 38)
 

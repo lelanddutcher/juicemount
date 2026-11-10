@@ -1,0 +1,12 @@
+# The server's opt-in BBR overlay (server/docker-compose.tcp-bbr.yml) for the
+# lab: the object store (silo here, minio in the server compose) and the RESP
+# proxy send with BBR, set by Docker in their own network namespaces. The
+# client keeps the kernel default. lab.sh applies this file when the lab was
+# set up with JMLAB_BBR=1 (measure.py --bbr).
+services:
+  silo:
+    sysctls:
+      net.ipv4.tcp_congestion_control: bbr
+  respproxy:
+    sysctls:
+      net.ipv4.tcp_congestion_control: bbr

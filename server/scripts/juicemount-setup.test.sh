@@ -222,11 +222,19 @@ esac
 SH
 # docker runs under the setup's `env -i`, so every fake reads its settings
 # from a file the run helpers write (the FAKE_* variables of that run).
+cat > "$WORK/bin/modinfo" <<'SH'
+#!/usr/bin/env bash
+# Fake modinfo: the modules named in $FAKE_MODULES exist.
+printf 'modinfo %s\n' "$*" >> "$FAKE_LOG"
+case " ${FAKE_MODULES:-} " in *" $1 "*) echo "filename: /lib/modules/$1.ko"; exit 0 ;; esac
+echo "modinfo: ERROR: Module $1 not found." >&2; exit 1
+SH
+
 for f in "$WORK/bin/"*; do sed -i "2i . '$WORK/fake.env'" "$f"; done
 chmod +x "$WORK/bin/"*
 PLAIN="$WORK/bin-plain"
 mkdir -p "$PLAIN"
-for t in curl docker; do ln -sf "$WORK/bin/$t" "$PLAIN/$t"; done
+for t in curl docker modinfo; do ln -sf "$WORK/bin/$t" "$PLAIN/$t"; done
 
 # run: TrueNAS fakes on PATH. run_plain: a plain Docker host.
 save_fakes() { export -p | grep -E '^declare -x FAKE_' > "$WORK/fake.env" || true; }
@@ -334,6 +342,20 @@ cp "$SERVER/docker-compose.link.yml" "$D/compose/overlays/docker-compose.link.ym
 run_plain --dir "$D"
 [ "$rc" = 0 ] && grep -q -- "-f $D/compose/overlays/docker-compose.link.yml up -d" "$FAKE_LOG" || fail "overlay applied on re-run"
 ok "a re-run keeps overlays from compose/overlays/ (e.g. Link)"
+
+# 4b. An overlay that sets a TCP congestion control the kernel lacks is
+# refused before anything starts (Docker would refuse minio and respproxy).
+sed 's/tcp_congestion_control: bbr/tcp_congestion_control: nosuchcc/' "$SERVER/docker-compose.tcp-bbr.yml" > "$D/compose/overlays/docker-compose.tcp-bbr.yml"
+: > "$FAKE_LOG"
+run_plain --dir "$D"
+[ "$rc" = 1 ] && grep -q "overlays/docker-compose.tcp-bbr.yml sets TCP congestion control 'nosuchcc'" "$WORK/err" &&
+  grep -q 'modinfo tcp_nosuchcc' "$FAKE_LOG" && ! grep -q -- ' up -d' "$FAKE_LOG" || fail "an overlay with a missing algorithm refused"
+cp "$SERVER/docker-compose.tcp-bbr.yml" "$D/compose/overlays/docker-compose.tcp-bbr.yml"
+: > "$FAKE_LOG"
+FAKE_MODULES=tcp_bbr run_plain --dir "$D"
+[ "$rc" = 0 ] && grep -q -- "-f $D/compose/overlays/docker-compose.tcp-bbr.yml up -d" "$FAKE_LOG" || fail "the BBR overlay applied when tcp_bbr exists"
+rm "$D/compose/overlays/docker-compose.tcp-bbr.yml"
+ok "the BBR overlay is refused on a kernel without the algorithm and applied when the module exists"
 
 # 5. Drift: a service made from other files is never recreated.
 FAKE_HAVE_HASH=hash-by-hand run_plain --dir "$D"

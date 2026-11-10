@@ -9,6 +9,7 @@
 #   lab.sh umount             unmount the client
 #   lab.sh exec CMD...        run a command in the client container
 #   lab.sh proxy-counter      the RESP proxy's command/flush counters (JSON)
+#   lab.sh cc                 TCP congestion control of silo, respproxy, client
 #   lab.sh status             containers and the current wan qdiscs
 #   lab.sh down               stop and remove every container, network and
 #                             volume of the lab, and its .state directory
@@ -30,8 +31,12 @@ die() { log "$*"; exit 2; }
 
 dc() {
   [ -f "$ENV_FILE" ] || die "the lab is not set up: run lab.sh up"
+  local files=(-f "$HERE/compose.yml")
+  # JMLAB_BBR=1 at setup: the server's BBR overlay (compose.bbr.yml). The
+  # choice is kept in .state so every later command uses the same files.
+  [ ! -f "$STATE/bbr" ] || files+=(-f "$HERE/compose.bbr.yml")
   JMLAB_COMMIT="$(git -C "$HERE" rev-parse HEAD 2>/dev/null || printf '%040d' 0)" \
-    docker compose -f "$HERE/compose.yml" --env-file "$ENV_FILE" "$@"
+    docker compose "${files[@]}" --env-file "$ENV_FILE" "$@"
 }
 in_client() { dc exec -T client "$@"; }
 
@@ -142,6 +147,7 @@ case "$cmd" in
   up)
     command -v docker >/dev/null || die "docker is required"
     gen_env
+    if [ "${JMLAB_BBR:-0}" = 1 ]; then : > "$STATE/bbr"; log "server sends with BBR (compose.bbr.yml)"; fi
     log "building images and starting project $JMLAB_PROJECT"
     dc up -d --build --wait --quiet-pull >&2
     nas_offloads_off
@@ -161,6 +167,12 @@ case "$cmd" in
   exec) in_client "$@" ;;
   proxy-counter)
     docker exec "$(dc ps -q respproxy)" wget -q -O - http://127.0.0.1:9180/counter
+    ;;
+  cc)
+    # The TCP congestion control each service uses for new connections.
+    for svc in silo respproxy client; do
+      printf '%s %s\n' "$svc" "$(docker exec "$(dc ps -q "$svc")" cat /proc/sys/net/ipv4/tcp_congestion_control)"
+    done
     ;;
   status)
     dc ps

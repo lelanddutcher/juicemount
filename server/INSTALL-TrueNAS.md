@@ -259,37 +259,41 @@ step 3.
 A Mac far from the server, on a link that loses some packets, downloads much
 faster when the server sends with BBR congestion control instead of the
 kernel default, cubic. Cubic slows down at every lost packet; BBR does not.
-On a LAN it makes no difference. It is off by default. On a setup-made
-install:
+On a LAN it makes no difference. It is off by default.
 
-1. Load the kernel module on the host. Check first:
-   `cat /proc/sys/net/ipv4/tcp_available_congestion_control`. If `bbr` is not
-   listed, run `sudo modprobe tcp_bbr`. On TrueNAS, also add `modprobe
-   tcp_bbr` as a **Pre Init** command in **System > Advanced >
-   Init/Shutdown Scripts**, so it is loaded after every reboot. This loads a
-   module; it changes no setting of the host.
-2. Copy `server/docker-compose.tcp-bbr.yml` from the same release into
+The overlay `server/docker-compose.tcp-bbr.yml` asks Docker to set BBR
+inside the object store (`minio`) and the proxy (`respproxy`) containers.
+The host and the other containers keep cubic, and no host setting changes.
+
+**Check the kernel first.** On the host, one of these must succeed:
+
+- `modinfo tcp_bbr` (BBR is a kernel module; it does not need to be
+  loaded, because Docker loads it when it starts the containers), or
+- `grep -w bbr /proc/sys/net/ipv4/tcp_available_congestion_control`
+  (BBR is already loaded or built in).
+
+If neither succeeds, do not use the overlay: on a kernel without BBR,
+Docker refuses to start `minio` and `respproxy`, and the server is down.
+The setup command checks this and refuses such an overlay.
+
+On a setup-made install:
+
+1. Copy `server/docker-compose.tcp-bbr.yml` from the same release into
    `<data>/compose/overlays/`.
-3. Start its two helpers: `sudo <data>/compose/jm-compose up -d --no-deps
-   tcp-bbr-minio tcp-bbr-respproxy`. The object store and the proxy keep
-   running.
-4. Check: `sudo <data>/compose/jm-compose logs tcp-bbr-minio
-   tcp-bbr-respproxy` shows `now sends with bbr` for both.
+2. Restart the two services: `sudo <data>/compose/jm-compose up -d --no-deps
+   minio respproxy`. This interrupts the Macs' open connections, so do it
+   when no Mac is reading or saving.
+3. Check: `sudo <data>/compose/jm-compose exec minio cat
+   /proc/sys/net/ipv4/tcp_congestion_control` prints `bbr`.
 
-Each helper sets BBR inside the network namespace of one service (the object
-store or the proxy). The host and the other containers keep cubic. If BBR is
-not available, for example after a reboot without the module, the helper
-logs a warning and the service runs with cubic as before: this file never
-stops the server from starting. The header of
-`server/docker-compose.tcp-bbr.yml` explains how, and what the helpers are
-allowed to do.
+Optional: to have the module loaded before Docker starts, add `modprobe
+tcp_bbr` as a **Pre Init** command in **System > Advanced > Init/Shutdown
+Scripts**. Docker loads it on demand, so this is not required.
+
+To turn it off, remove the file from `overlays/` and repeat step 2.
 
 It speeds up downloads to Macs (reads). Uploads (saves) are sent by the Mac,
 and macOS has no BBR.
-
-To turn it off, remove the file from `overlays/` and run `sudo
-<data>/compose/jm-compose rm -sf tcp-bbr-minio tcp-bbr-respproxy`. The
-services return to cubic at their next restart.
 
 ## Connect a Mac
 

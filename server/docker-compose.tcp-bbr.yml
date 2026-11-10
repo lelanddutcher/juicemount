@@ -1,96 +1,39 @@
 # JuiceMount TCP BBR opt-in overlay: the object store (minio) and the RESP
 # proxy (respproxy) send with BBR congestion control instead of the kernel
-# default (cubic). BBR keeps a download fast on a long link that loses some
-# packets, where cubic slows down at every loss. It changes nothing on a LAN.
+# default (cubic). BBR keeps a download fast on a distant link that loses
+# some packets, where cubic slows down at every loss. It changes nothing on a
+# LAN.
+#
+# The setting is per network namespace: Docker writes it inside each of the
+# two containers when it starts them. The host and every other container
+# keep their own algorithm. The host's sysctls are not changed.
+#
+# Use it only on a kernel that has BBR. Check on the host:
+#
+#   modinfo tcp_bbr      succeeds (BBR is a module), or
+#   grep -w bbr /proc/sys/net/ipv4/tcp_available_congestion_control
+#                        prints a line (BBR is loaded or built in).
+#
+# The module does not need to be loaded: Docker loads it when it starts the
+# container. But on a kernel without BBR at all, Docker refuses to start
+# minio and respproxy ("failed to write sysctl net.ipv4.tcp_congestion_control").
+# juicemount-setup refuses an overlay like this one on such a kernel.
 #
 # Turn it on (a setup-made install; see server/INSTALL-TrueNAS.md):
-#
-#   1. Load the module on the host, once per boot: modprobe tcp_bbr
-#      (TrueNAS: System > Advanced > Init/Shutdown Scripts, a Pre Init
-#      command). Check: /proc/sys/net/ipv4/tcp_available_congestion_control
-#      lists bbr.
-#   2. Copy this file into <data>/compose/overlays/.
-#   3. <data>/compose/jm-compose up -d --no-deps tcp-bbr-minio tcp-bbr-respproxy
-#      This starts the two helpers only. minio and respproxy keep running.
-#
-# How it works, and why it cannot stop the stack from starting:
-#
-#   - Each helper joins the network namespace of one service
-#     (network_mode: service:...) and writes net.ipv4.tcp_congestion_control
-#     there. The setting is per network namespace: the host and every other
-#     container keep their own. The host's sysctls are never changed.
-#   - The services themselves are unchanged. A compose `sysctls:` entry on
-#     minio would make Docker refuse to start minio whenever the kernel cannot
-#     select bbr (for example after a reboot, before the module is loaded).
-#     Here a helper that cannot select it logs a warning and the service runs
-#     with cubic, as without this file. Nothing depends on the helpers.
-#   - A helper has no Linux capabilities (cap_drop: ALL), so it cannot load a
-#     kernel module or change anything but this one value. It needs Docker's
-#     AppArmor profile and /proc/sys mask lifted for itself only, because both
-#     make /proc/sys read-only in a container. It runs one fixed shell script
-#     from the pinned SILO image (already on the host for minio).
-#   - The helper stays up and checks every 30 seconds that its network
-#     namespace still has its interface. When minio or respproxy restarts,
-#     the service gets a new namespace (with cubic); the helper then exits
-#     and Docker restarts it into the new one. After a reboot Docker starts
-#     it again too. If it starts before its service, it exits and Docker
-#     retries. If it gives up, `jm-compose up -d --no-deps tcp-bbr-minio
-#     tcp-bbr-respproxy` starts it again.
-#   - No fq queueing discipline: setting one needs NET_ADMIN and the tc tool.
-#     BBR paces its own sending without fq (Linux 4.13 and later).
-#
-# Check: <data>/compose/jm-compose logs tcp-bbr-minio tcp-bbr-respproxy
-# shows "sends with bbr" or a warning that says why not.
-#
-# Turn it off: remove this file from overlays/ and run
-#   <data>/compose/jm-compose rm -sf tcp-bbr-minio tcp-bbr-respproxy
-# minio and respproxy go back to cubic at their next restart.
-#
-# JM_TCP_CC (optional, in .env) selects another algorithm. It exists for
-# testing; leave it unset.
+#   copy this file into <data>/compose/overlays/, then
+#   <data>/compose/jm-compose up -d --no-deps minio respproxy
+# Turn it off: remove the file from overlays/ and run the same command.
+# Either way, minio and respproxy restart, which interrupts every Mac's open
+# connections. Do it when no Mac is reading or saving.
 #
 # Uploads from a Mac are sent by the Mac. macOS has no BBR, so this file
 # speeds up downloads to Macs (reads), not uploads (saves).
 
-x-tcp-bbr-helper: &tcp-bbr-helper
-  image: pgsty/silo:RELEASE.2026-09-16T00-00-00Z@sha256:635197cb9f36d01bee221d34d1c7d7960f6a95c48b0b6c01d99cd13bdae51a46
-  restart: unless-stopped
-  read_only: true
-  cap_drop: [ALL]
-  security_opt:
-    - no-new-privileges:true
-    - apparmor=unconfined
-    - systempaths=unconfined
-  stop_grace_period: 2s
-  entrypoint: ["/bin/sh", "-c"]
-  command:
-    - |
-      cc="$${JM_TCP_CC:-bbr}"
-      f=/proc/sys/net/ipv4/tcp_congestion_control
-      if err="$$( { echo "$$cc" > "$$f"; } 2>&1 )"; then
-        echo "tcp-bbr: $$JM_TCP_SERVICE now sends with $$cc"
-      else
-        echo "tcp-bbr: WARNING: $$JM_TCP_SERVICE could not select $$cc ($${err##*: }); it keeps sending with $$(cat "$$f")." \
-          "Available: $$(cat /proc/sys/net/ipv4/tcp_available_congestion_control). Load the module on the host (modprobe tcp_$$cc)," \
-          "then run: jm-compose up -d --no-deps tcp-bbr-minio tcp-bbr-respproxy"
-      fi
-      trap 'exit 0' TERM INT
-      has_eth0() { while read -r n _; do [ "$$n" = eth0: ] && return 0; done < /proc/net/dev; return 1; }
-      while has_eth0; do sleep 30 & wait $$!; done
-      echo "tcp-bbr: $$JM_TCP_SERVICE restarted; applying again in its new network namespace"
-      exit 1
-
 services:
-  tcp-bbr-minio:
-    <<: *tcp-bbr-helper
-    network_mode: "service:minio"
-    environment:
-      JM_TCP_SERVICE: minio
-      JM_TCP_CC: "${JM_TCP_CC:-bbr}"
+  minio:
+    sysctls:
+      net.ipv4.tcp_congestion_control: bbr
 
-  tcp-bbr-respproxy:
-    <<: *tcp-bbr-helper
-    network_mode: "service:respproxy"
-    environment:
-      JM_TCP_SERVICE: respproxy
-      JM_TCP_CC: "${JM_TCP_CC:-bbr}"
+  respproxy:
+    sysctls:
+      net.ipv4.tcp_congestion_control: bbr
