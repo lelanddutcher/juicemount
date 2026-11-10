@@ -1121,7 +1121,7 @@
     "pkg/meta/redis_replace.go": "e5448c51d27fc74581b6cef09a41e2d189863b0e4deaa0b12a7244f4987ec6f5",
     "pkg/meta/redis_replace_test.go": "ccbc7af2182cc73932ee5b3a07471ab029c511e5373d07433d41f7b4d06672de",
     "pkg/meta/redis_watch_batch.go": "fc95d9187f0c8530a3534eb972a82bd6e1a02390dbba830bbfc6d71818b5bd0a",
-    "pkg/meta/redis_watch_batch_chaos_test.go": "f615d0f1224fbf3398a9c07bc2141979237d1e763e362edbf7cba60d08e4e8d2",
+    "pkg/meta/redis_watch_batch_chaos_test.go": "e39b862ae24be81f78f0c867c20856261bd2f8b08d5f613642bc951397cb7186",
     "pkg/meta/redis_watch_batch_stress_test.go": "bffcc9bb5472189a966f0caab3dd7dc7e6b4779d381b34369bc0537ceb8bcb78",
     "pkg/meta/redis_watch_batch_test.go": "2d0429f6563fb21bd8c0ac12ad2d70d4f6ee6b1df4c7eaa10937835005fb927d",
     "pkg/meta/tkv_etcd_test.go": "0070b8e58277ff857119b266b39521abafd6cca6640082232b58fe163640886f",
