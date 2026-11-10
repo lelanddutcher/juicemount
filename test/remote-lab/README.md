@@ -155,6 +155,77 @@ send with BBR, set by Docker in their own network namespaces. The client
 keeps the host's default. `./lab.sh cc` prints what each one uses, and
 `run.json` records it. The host kernel needs BBR (`modinfo tcp_bbr`).
 
+## macOS VM
+
+`mac-lab.sh` puts a macOS virtual machine (VM) behind the same emulated WAN,
+so the real Mac app can be measured on every profile. The Mac that hosts the
+VM keeps its own network as it is.
+
+```
+macOS VM --WireGuard over UDP--> gateway --> wan (tc) --> nas network
+                                 (remote network, next to the Linux client)
+```
+
+- `gateway` (`compose.mac.yml`, `lib/gateway.sh`) is a WireGuard endpoint
+  on the remote network. WireGuard runs in userspace (`wireguard-go` on
+  `/dev/net/tun`), so the host kernel loads no WireGuard module.
+- The VM routes only the nas subnet into the tunnel. Every packet between
+  the VM and the server stack crosses the wan container, in both
+  directions, on every port: the RESP proxy, the object store and any
+  service added to the nas network later.
+- The gateway masquerades the tunnel as its own remote address, so the wan
+  treats it like the Linux client.
+- The one change visible on the host is a published UDP port (default
+  51820). `mac-lab.sh profile NAME` switches the profile with no restart.
+- It uses its own Docker project (`jmmac`), its own state directory
+  (`.state-mac`) and its own subnets (`10.231.110.0/24`, `.120`, `.130`), so it
+  can run next to a `measure.py` lab.
+
+The VM host must give SSH access with one key. Its SSH command accepts
+`start` (start the VM and print its IP address on the last line), `stop`
+and `status`. It also allows a jump (`ssh -W`) to the VM's SSH port. The VM
+user needs sudo without a password and Homebrew; `up` installs
+`wireguard-tools` and `iperf3` with it. Set these variables. There are no
+defaults:
+
+```sh
+export JMLAB_MAC_HOST=user@vm-host          # the VM host's SSH destination
+export JMLAB_MAC_KEY=~/.ssh/lab_key         # key for the VM host and the VM
+export JMLAB_MAC_USER=admin                 # user in the VM
+export JMLAB_MAC_ENDPOINT=192.0.2.10        # this Docker host, as the VM reaches it
+
+./mac-lab.sh up               # VM on, lab up (add JMLAB_BBR=1 for server BBR), tunnel in
+./mac-lab.sh profile abroad   # switch the link
+./mac-lab.sh smoke lan abroad # link smoke test, results in results/mac-<time>/
+./mac-lab.sh guest ping -c 3 10.231.110.30
+./mac-lab.sh down             # tunnel out, lab removed, VM stopped (JMLAB_MAC_KEEP_VM=1 keeps it)
+```
+
+The smoke test runs in the VM. For each profile it measures:
+
+- the RTT, with 20 pings;
+- a TCP connection to the RESP proxy and one `PING`; the reply is an auth
+  error because no password is sent;
+- `GET /minio/health/live` on the object store;
+- the link rate in each direction with iperf3: UDP at the profile's cap, or
+  TCP on `lan`;
+- one 100 MB download and one 20 MB upload with curl, each on one TCP
+  stream (`JMLAB_MAC_SMOKE_MB`, `JMLAB_MAC_SMOKE_MAX`).
+
+The iperf3 column checks the path. The curl columns show what one stream
+gets. On `abroad`, the 1% random loss holds one stream far below the cap
+(see "How to read the scoreboard").
+
+**Its limits:**
+
+- The tunnel adds about 0.7 ms RTT on `lan`.
+- The macOS TCP stack sends the VM's uploads, as on a real Mac. macOS has no
+  BBR.
+- There is no Manager in the lab yet. The tunnel already routes the whole
+  nas subnet, so a Manager container added there is reachable.
+- Before the app can mount in the VM, someone at the VM's screen must allow
+  the macFUSE system extension.
+
 ## Addresses
 
 The lab uses `10.231.10.0/24` (nas) and `10.231.20.0/24` (remote). If those
