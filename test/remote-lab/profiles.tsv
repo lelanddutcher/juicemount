@@ -1,0 +1,17 @@
+# Remote lab link profiles. One line per profile, whitespace separated.
+#
+#   rtt_ms     round-trip time. The wan container adds half of it in each
+#              direction.
+#   jitter_ms  round-trip jitter (+/-). Half of it in each direction, uniform.
+#   loss_pct   random packet loss, applied in EACH direction.
+#   down_mbit  rate toward the client (the NAS uplink). 0 = no limit.
+#   up_mbit    rate toward the NAS (the client uplink). 0 = no limit.
+#
+# name      rtt_ms  jitter_ms  loss_pct  down_mbit  up_mbit
+lan         0       0          0         0          0
+same-city   20      0          0         200        200
+abroad      200     0          1         30         30
+# abroad without the loss: tells the cost of distance from the cost of loss.
+abroad-noloss 200   0          0         30         30
+hotel       300     0          2         10         10
+cellular    120     60         0         20         20

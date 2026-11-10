@@ -12,6 +12,9 @@
 credentials.md
 **/.env
 .env
+# Remote lab: throwaway secrets and run output (test/remote-lab).
+test/remote-lab/.state/
+test/remote-lab/results/
 
 # --- VCS ---
 .git/

@@ -1,0 +1,150 @@
+# Remote lab
+
+The remote lab measures how the JuiceMount server and the JuiceFS client
+behave over a slow, distant network link. It runs on one Linux machine with
+Docker, or in GitHub Actions. It needs no second site and no phone, and it
+changes nothing outside its own containers.
+
+**Its limit:** it tests JuiceFS and the server. It does not test the Mac app,
+its NFS server, or its local mirror (the database that lets the Finder list a
+folder without asking the server). A number here is what JuiceFS alone costs
+on that link. The Mac app may hide some of that cost, but it cannot make it
+smaller.
+
+## The parts
+
+The lab is a set of containers on two private Docker networks. Nothing
+publishes a port. Nothing changes a host interface or the host firewall.
+
+| Part | Network | What it is |
+|---|---|---|
+| `redis` | nas | The metadata store: Redis 7.4 with the server's own `redis.conf` and ACL. It holds the folder tree. |
+| `respproxy` | nas | The RESP proxy (the server's only door to Redis), built from this checkout. Its counters show how many Redis commands and round trips each operation costs. |
+| `silo` | nas | The object store (SILO, a maintained MinIO fork; the same image and digest as `server/docker-compose.yml`). It holds the file bytes. |
+| `iperf` | nas | An iperf3 server, used to check the link before measuring. |
+| `wan` | nas and remote | The emulated internet. It is the only route between the two networks. It adds delay, jitter and loss with `tc netem` and caps the rate with `tc htb`, separately in each direction. |
+| `client` | remote | The "remote Mac": the vendored JuiceFS (`third_party/juicefs`, built as CI builds it) mounted at `/jfs`, with a block cache (local copies of file chunks) in `/var/jfscache`. It mounts with the flags the Mac app uses on a slow link. |
+
+The `wan` and `client` containers get `NET_ADMIN` for their own network
+namespace only. The client also gets `/dev/fuse` and `SYS_ADMIN` so it can
+mount. The lab generates throwaway passwords into `.state/lab.env`
+(git-ignored, mode 600) and deletes them at teardown.
+
+The first use of `tc` loads the kernel's `sch_netem` and `sch_htb` modules,
+if they are not loaded already. That is the only effect on the host kernel.
+
+## Profiles
+
+`profiles.tsv` defines the links. RTT (round-trip time) is the time for a
+packet to reach the server and come back. The wan adds half of it in each
+direction. Loss applies in each direction, so a 1% profile loses about 2% of
+pings (a ping crosses the link twice).
+
+| Profile | RTT | Loss | Rate toward client / toward NAS |
+|---|---|---|---|
+| `lan` | none | none | no cap |
+| `same-city` | 20 ms | none | 200 / 200 Mbit/s |
+| `abroad` | 200 ms | 1% | 30 / 30 Mbit/s |
+| `abroad-noloss` | 200 ms | none | 30 / 30 Mbit/s (diagnostic: separates the cost of distance from the cost of loss) |
+| `hotel` | 300 ms | 2% | 10 / 10 Mbit/s |
+| `cellular` | 120 ms ± 60 ms jitter | none | 20 / 20 Mbit/s |
+
+Before it measures a profile, `measure.py` checks it. 60 pings must average
+within about 10% of the RTT. A UDP iperf3 probe in each direction must arrive
+at 80–105% of the rate cap. If either fails, the run stops and says why.
+
+## Run it
+
+You need Docker with Compose v2, Python 3, and a Linux kernel with FUSE.
+
+```sh
+cd test/remote-lab
+./measure.py --profiles lan,abroad --fixture small   # about 10 minutes
+./measure.py                                         # every profile, full fixture (about an hour)
+```
+
+`measure.py` starts the lab, writes the fixture on the `lan` profile, runs
+each profile, prints the scoreboard and tears the lab down. Add `--keep` to
+leave the lab running and `--no-up` to reuse a running lab.
+
+To explore by hand:
+
+```sh
+./lab.sh up                 # build, start, format, mount (lan)
+./lab.sh shape hotel        # switch the link
+./lab.sh mount --cold       # remount with an empty block cache
+./lab.sh exec ls -l /jfs/fixture/bigdir | head
+./lab.sh proxy-counter      # Redis commands and round trips so far
+./lab.sh down               # remove every container, network and volume
+```
+
+The fixture is deterministic (seeded). `small`: 300 small files in 6
+folders, one folder of 400 entries, and two 64 and 96 MiB "videos" of random
+bytes. `full`: 3000 small files in 20 folders, one folder of 1000 entries,
+and 1 GiB, 512 MiB and 256 MiB videos.
+
+## What it measures
+
+Each profile runs twice. **Cold:** the client remounts with an empty block
+cache. **Warm:** the client remounts and keeps the block cache from the cold
+pass. A remount empties the metadata caches both times, as after an app
+restart.
+
+| Column | Operation |
+|---|---|
+| Mount | `juicefs mount` until the mount answers. |
+| List 1 folder | Read the 400- or 1000-entry folder, with every file's attributes (what a Finder list view needs). |
+| Walk tree | Visit every folder and stat every small file. |
+| Stat, Open | First `stat()`, then first `open()`, of sample files across the tree (median). |
+| TTFB | Time to first byte: open a large file and read its first 64 KiB. |
+| Seq read | Read that file from the start for a time budget (default 60 s) and report the rate. If the budget ends first, the cell shows how much it read. |
+| Scrub read | Up to 50 reads of 1–4 MiB at random offsets in another large file, like dragging a playhead. It stops at its time budget. It shows the median and the 90th percentile per read. |
+| Write files | Write and close N new 64 KiB files. Without `--writeback`, `close()` returns only after the data and its metadata reached the server. |
+| Round trips | From the RESP proxy: reply batches it sent back to the client during the mount and the list probe, per file during the stat/open/read probe, and per file written. Pipelined commands share one batch, so a batch is close to one round trip. |
+
+One time budget can be exceeded by a single read that is already in flight.
+JuiceFS fetches whole 4 MiB blocks, and the run waits for that block.
+
+Each run writes `results/<run id>/`:
+
+- `<profile>.json`: everything, including the link check and, for every
+  probe, the change in the JuiceFS client's own counters (`/jfs/.stats`:
+  metadata operations, FUSE operations, block cache hits and misses).
+- `run.json`: the commit, the JuiceFS version, the fixture, and an error if
+  the lab broke.
+- `scoreboard.md`: the tables.
+
+## How to read the scoreboard
+
+- Divide a time by the profile's RTT. The result is the number of round
+  trips the operation waits for one after the other. A number that grows
+  with the folder size or the file count means an operation pays one round
+  trip per item. That is the cost a remote user feels.
+- Compare `abroad` with `abroad-noloss`. Random loss slows one TCP stream far
+  more than distance does. A loss-based TCP stream at 200 ms and 1% loss
+  carries about 1 Mbit/s, whatever the link rate. Real links often lose
+  packets in bursts and less often, so `abroad` is a pessimistic case for
+  bulk reads. It is still a fair case for round-trip counts.
+- Compare cold with warm. Warm reads come from the local block cache. Warm
+  listing and opening still cross the link, because the metadata caches are
+  empty after a remount.
+- The CI job (`.github/workflows/remote-lab.yml`) runs `lan` and `abroad` on
+  the small fixture with short budgets. It fails only when the lab breaks.
+  It never fails on a number. The scoreboard is in the job summary and the
+  JSON is the `remote-lab-results` artifact.
+
+## Change the client flags
+
+`lab.sh` mounts with the flags the Mac app passes to JuiceFS on a slow link
+(`health/fuse.go`, `internal/netprofile`). They are copied, not shared: if
+the app's flags change, update `MOUNT_FLAGS` in `lab.sh`. To try other flags
+without editing, set `JMLAB_MOUNT_OPTS`, for example
+`JMLAB_MOUNT_OPTS="--prefetch 3" ./measure.py --profiles abroad`.
+
+## Addresses
+
+The lab uses `10.231.10.0/24` (nas) and `10.231.20.0/24` (remote). If those
+collide with a network you already have, set `JMLAB_NAS_SUBNET`,
+`JMLAB_REMOTE_SUBNET` and the fixed addresses in `compose.yml` (the
+`JMLAB_*_IP` variables). To run two labs at once, also give each a different
+`JMLAB_PROJECT`.
