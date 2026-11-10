@@ -1,0 +1,282 @@
+# JuiceMount Link lab. Start and stop it with lab.sh, not by hand: lab.sh
+# generates the throwaway secrets and the lab CA (.state/), builds the
+# images, routes the Manager and applies each case's router switches.
+#
+#   nas       the NAS's Docker network: redis, respproxy, silo, manager,
+#             and nas-host (the NAS's own Docker NAT and published ports)
+#   home      the home LAN: nas-host, home-router, home-mac
+#   homeup    the home's internet link: home-router <-> wan
+#   away      the away LAN: away-router, away-mac
+#   carrier   a carrier network for carrier-grade NAT: away-router <-> cgn
+#   awayup    the away site's internet link: away-router or cgn <-> wan
+#   core      "the internet": wan, relay (DERP), dns
+#
+# Every network is internal: nothing reaches the real internet, nothing
+# publishes a port, no host interface changes. Only the lab's own
+# containers get NET_ADMIN, for their own network namespaces.
+name: ${JMLINK_PROJECT:-jmlinklab}
+
+x-tools: &tools
+  image: jmlinklab:local
+  build:
+    context: ../..
+    dockerfile: test/link-lab/image/Dockerfile
+  init: true
+  cap_add: [NET_ADMIN]
+  sysctls:
+    net.ipv4.ip_forward: "1"
+    net.ipv4.conf.all.send_redirects: "0"
+    net.ipv4.conf.default.send_redirects: "0"
+  volumes:
+    - ./:/lab:ro
+    - ../remote-lab:/remote-lab:ro
+
+# Fixed addresses sit in the lower half of each subnet; Docker hands out the
+# dynamic ones (redis) from the upper half only.
+networks:
+  nas:
+    internal: true
+    ipam: {config: [{subnet: 10.232.11.0/24, ip_range: 10.232.11.128/25}]}
+  home:
+    internal: true
+    ipam: {config: [{subnet: 10.232.10.0/24, ip_range: 10.232.10.128/25}]}
+  homeup:
+    internal: true
+    ipam: {config: [{subnet: 10.232.1.0/24, ip_range: 10.232.1.128/25}]}
+  away:
+    internal: true
+    ipam: {config: [{subnet: 10.232.20.0/24, ip_range: 10.232.20.128/25}]}
+  carrier:
+    internal: true
+    ipam: {config: [{subnet: 10.232.21.0/24, ip_range: 10.232.21.128/25}]}
+  awayup:
+    internal: true
+    ipam: {config: [{subnet: 10.232.2.0/24, ip_range: 10.232.2.128/25}]}
+  core:
+    internal: true
+    ipam: {config: [{subnet: 10.232.3.0/24, ip_range: 10.232.3.128/25}]}
+
+services:
+  # --- the NAS stack (as server/docker-compose.yml + the Link overlay) ----
+
+  redis:
+    image: redis:7.4-alpine@sha256:ff02b58f971e7d7d156a1267e283fcbbeee91773b6aa36c49dac28ecfe28eadf
+    environment:
+      JM_REDIS_PROXY_PASSWORD: ${JM_REDIS_PROXY_PASSWORD:?run lab.sh up}
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        umask 077
+        sha() { printf '%s' "$$1" | sha256sum | cut -d' ' -f1; }
+        mkdir -p /run/jm-redis
+        head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > /run/jm-redis/admin.pass
+        sed -e '/^[[:space:]]*#/d' -e '/^[[:space:]]*$$/d' \
+            -e "s/#@JM_REDIS_PROXY_PASSWORD_SHA256@/#$$(sha "$$JM_REDIS_PROXY_PASSWORD")/" \
+            -e "s/#@JM_ADMIN_LOOPBACK_SHA256@/#$$(sha "$$(cat /run/jm-redis/admin.pass)")/" \
+            /usr/local/etc/redis/redis.acl > /run/jm-redis/users.acl
+        chown -R redis:redis /run/jm-redis
+        unset JM_REDIS_PROXY_PASSWORD
+        exec docker-entrypoint.sh redis-server /usr/local/etc/redis/redis.conf --aclfile /run/jm-redis/users.acl
+    healthcheck:
+      test: ["CMD-SHELL", "REDISCLI_AUTH=\"$$(cat /run/jm-redis/admin.pass)\" redis-cli --no-auth-warning --user jm-admin ping | grep -qx PONG"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    volumes:
+      - ../../server/redis.conf:/usr/local/etc/redis/redis.conf:ro
+      - ../../server/redis.acl:/usr/local/etc/redis/redis.acl:ro
+    tmpfs: [/data]
+    networks:
+      nas: {}
+
+  respproxy:
+    image: jmlinklab-respproxy:local
+    build:
+      context: ../..
+      dockerfile: server/respproxy/Dockerfile
+      args:
+        JM_VERSION: 0.0.0-linklab
+        JM_COMMIT: ${JMLINK_COMMIT:?run lab.sh up}
+    depends_on:
+      redis: {condition: service_healthy}
+    environment:
+      JM_RESPPROXY_UPSTREAM: "redis:6379"
+      JM_RESPPROXY_UPSTREAM_PASSWORD: ${JM_REDIS_PROXY_PASSWORD}
+      JM_RESPPROXY_MODE: passthrough
+      JM_AUDIT: "off"
+      JM_PROXY_FARM_PASSWORD: ${JM_PROXY_FARM_PASSWORD:?run lab.sh up}
+      JM_PROXY_MANAGER_PASSWORD: ${JM_PROXY_MANAGER_PASSWORD:?run lab.sh up}
+      JM_PROXY_BG_PASSWORD: ${JM_PROXY_BG_PASSWORD:?run lab.sh up}
+      JM_PROXY_WEBDAV_PASSWORD: ${JM_PROXY_WEBDAV_PASSWORD:?run lab.sh up}
+      JM_PROXY_ADMIN_PASSWORD: ${JM_PROXY_ADMIN_PASSWORD:?run lab.sh up}
+    tmpfs: [/etc/jm-respproxy]
+    networks:
+      nas:
+        ipv4_address: 10.232.11.20
+
+  # Object store: the same SILO image and digest as server/docker-compose.yml,
+  # reachable as "minio" like there (the NAS node forwards 30151 to it).
+  silo:
+    image: pgsty/silo:RELEASE.2026-09-16T00-00-00Z@sha256:635197cb9f36d01bee221d34d1c7d7960f6a95c48b0b6c01d99cd13bdae51a46
+    command: server /data
+    environment:
+      MINIO_ROOT_USER: ${JMLINK_S3_USER:?run lab.sh up}
+      MINIO_ROOT_PASSWORD: ${JMLINK_S3_PASSWORD:?run lab.sh up}
+      MINIO_BROWSER: "off"
+    tmpfs: [/data]
+    networks:
+      nas:
+        ipv4_address: 10.232.11.30
+        aliases: [minio]
+
+  # The Manager with Link on, configured as server/docker-compose.link.yml
+  # does, with Headscale's own TLS (a lab-CA certificate for the public
+  # name). The NAS node dials control on the in-container listener under the
+  # certificate's name (JM_NET_NAS_CONTROL_URL + a hosts entry), so it needs
+  # no hairpin. The DERP map is the lab's: Headscale must fetch a map URL at
+  # start (the generated config lists Tailscale's public one, which the lab
+  # cannot reach), so HEADSCALE_DERP_URLS points at a copy that nas-host
+  # serves on the NAS network (lib/derp/derpmap.json).
+  # lab.sh sets its default route (bridge mode: via nas-host, the NAS's
+  # Docker NAT; host mode: on the home LAN via home-router), so the Manager
+  # itself runs without NET_ADMIN.
+  manager:
+    image: jmlinklab-manager:local
+    build:
+      context: ../..
+      dockerfile: test/link-lab/image/manager.Dockerfile
+      args:
+        JM_COMMIT: ${JMLINK_COMMIT}
+    depends_on:
+      respproxy: {condition: service_started}
+    command:
+      - --listen=0.0.0.0:8080
+      - --meta=redis://manager@respproxy:6379/1
+      - --vol-name=zpool
+      - --source-roots=/sources
+      - --dest-mount=/jfs
+    environment:
+      JM_META_PASSWORD: ${JM_PROXY_MANAGER_PASSWORD}
+      JM_ADMIN_KEY: ${JMLINK_ADMIN_KEY:?run lab.sh up}
+      JM_MINIO_URL: "http://minio:9000"
+      JM_NET_HEADSCALE: "on"
+      JM_NET_NAS_NODE: "on"
+      JM_NET_SERVER_URL: "https://link.lab.example:30193"
+      JM_NET_NAS_UDP_PORT: "41641"
+      JM_NET_TLS_CERT: /lab-pki/link.lab.example.crt
+      JM_NET_TLS_KEY: /lab-pki/link.lab.example.key
+      JM_NET_NAS_CONTROL_URL: "https://link.lab.example:8091"
+      HEADSCALE_DERP_URLS: http://10.232.11.2:8088/derpmap.json
+      SSL_CERT_FILE: /lab-pki/ca.crt
+      TS_NO_LOGS_NO_SUPPORT: "true"
+    extra_hosts:
+      - "link.lab.example:127.0.0.1"
+    volumes:
+      - manager-data:/data
+      - ./.state/pki:/lab-pki:ro
+      - ./lib:/lab/lib:ro
+    networks:
+      nas:
+        ipv4_address: 10.232.11.10
+      home:
+        ipv4_address: 10.232.10.6
+
+  # The NAS host's Docker NAT: what Docker does for the Manager's published
+  # ports (30193 -> 8091, 41641/udp) and its outbound traffic. Its home
+  # address is the NAS's LAN address. It also serves the lab DERP map to the
+  # Manager on the NAS network.
+  nas-host:
+    <<: *tools
+    command: ["/lab/lib/router.sh", "run"]
+    environment: {ROUTER: nas-host}
+    networks:
+      nas: {ipv4_address: 10.232.11.2}
+      home: {ipv4_address: 10.232.10.5}
+
+  # --- the home ---------------------------------------------------------
+
+  home-router:
+    <<: *tools
+    command: ["/lab/lib/router.sh", "run"]
+    environment: {ROUTER: home-router}
+    networks:
+      home: {ipv4_address: 10.232.10.2}
+      homeup: {ipv4_address: 10.232.1.10}
+
+  home-mac:
+    <<: *tools
+    command: ["/lab/lib/mac.sh", "run"]
+    environment: {MAC_GW: 10.232.10.2}
+    networks:
+      home: {ipv4_address: 10.232.10.50}
+
+  # --- the internet -----------------------------------------------------
+
+  # Routes between the three internet-side networks and shapes the two
+  # access links with the remote lab's profiles (../remote-lab/lib/shape.sh):
+  # traffic toward the away site gets the NAS uplink rate, traffic toward
+  # the home gets the away uplink rate. It routes no private LAN.
+  wan:
+    <<: *tools
+    command: ["/lab/lib/wan.sh"]
+    environment:
+      WAN_NAS_IP: 10.232.1.2
+      WAN_REMOTE_IP: 10.232.2.2
+      JMLAB_PROFILES: /remote-lab/profiles.tsv
+    healthcheck:
+      test: ["CMD", "test", "-f", "/run/wan.ready"]
+      interval: 1s
+      retries: 30
+    networks:
+      homeup: {ipv4_address: 10.232.1.2}
+      awayup: {ipv4_address: 10.232.2.2}
+      core: {ipv4_address: 10.232.3.2}
+
+  # The lab DNS: the only names that resolve are the lab's.
+  dns:
+    <<: *tools
+    command: ["/lab/lib/dns.sh"]
+    networks:
+      core: {ipv4_address: 10.232.3.53}
+
+  # The relay: Tailscale's derper (DERP over TLS on 443, STUN on 3478/udp)
+  # with a lab-CA certificate for derp.lab.example, on a public address.
+  relay:
+    <<: *tools
+    command: ["/lab/lib/relay.sh"]
+    volumes:
+      - ./:/lab:ro
+      - ./.state/pki:/lab-pki:ro
+    networks:
+      core: {ipv4_address: 10.232.3.10}
+
+  # --- the away site ----------------------------------------------------
+
+  away-router:
+    <<: *tools
+    command: ["/lab/lib/router.sh", "run"]
+    environment: {ROUTER: away-router}
+    networks:
+      away: {ipv4_address: 10.232.20.2}
+      awayup: {ipv4_address: 10.232.2.10}
+      carrier: {ipv4_address: 10.232.21.10}
+
+  # Carrier-grade NAT: a second NAT between the away router and the
+  # internet, used only when a case sets CGNAT=on.
+  cgn:
+    <<: *tools
+    command: ["/lab/lib/router.sh", "run"]
+    environment: {ROUTER: cgn}
+    networks:
+      carrier: {ipv4_address: 10.232.21.2}
+      awayup: {ipv4_address: 10.232.2.20}
+
+  away-mac:
+    <<: *tools
+    command: ["/lab/lib/mac.sh", "run"]
+    environment: {MAC_GW: 10.232.20.2}
+    networks:
+      away: {ipv4_address: 10.232.20.50}
+
+volumes:
+  manager-data: {}
