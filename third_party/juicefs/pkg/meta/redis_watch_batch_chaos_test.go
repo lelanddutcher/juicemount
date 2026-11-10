@@ -6,9 +6,11 @@ package meta
 // of this database's connections while three sessions of eight workers
 // create, link, rename, unlink, write, truncate and chmod in six shared
 // folders. Before the fix a held WATCH could be lost with a connection, and
-// 5 of 5 runs panicked on an empty dentry read. Afterwards no connection may
-// still hold a WATCH, and every dentry, inode, link count and parent must
-// agree.
+// some runs panicked on an empty dentry read (in review: from 1 of 11 runs to
+// 5 of 5, depending on the machine). This test is a broad, supplementary
+// check; TestJMWatchBatchDialFailureKeepsWatch is the reliable regression
+// test for that bug. Afterwards no connection may still hold a WATCH, and
+// every dentry, inode, link count and parent must agree.
 //
 // JM_WATCH_BATCH_CHAOS_REDIS_URL=redis://host:port/db names a disposable
 // database (it is flushed). The test kills connections in that database and
