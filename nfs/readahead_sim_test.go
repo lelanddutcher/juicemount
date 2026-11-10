@@ -317,7 +317,10 @@ func TestReadaheadSlowLinkSimulation(t *testing.T) {
 			drainer bool
 		}{
 			{"1 reader", 1, false},
-			{"2 readers + drain", 2, true},
+			{"2 readers", 2, false},
+			// The drain here always has work: it polls every 10 ms and holds
+			// a slot 50 ms, back to back. A real drain is idle most of the time.
+			{"2 readers + busy drain", 2, true},
 		} {
 			for _, v := range variants {
 				r := runReadaheadSim(t, scale, sc.rateMbit, sc.latency, 96, load.readers, load.drainer, v)

@@ -17,8 +17,29 @@ import (
 
 // A spool drain polls the background gate every 10 ms (acquireDrainFUSESlot).
 // While a slow-link stream prefetches at full depth, the drain must still get
-// a slot within a few polls.
+// a slot within a few polls, also while a foreground read holds a slot
+// (background admission counts foreground reads too).
 func TestSlowWindowLeavesDrainerASlot(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		fgHeld int
+		fgLate bool
+	}{
+		{"no-foreground", 0, false},
+		{"one-foreground-read", 1, false},
+		{"two-foreground-reads", 2, false},
+		// The foreground read arrives while 3 blocks are already in flight.
+		// An admitted block cannot be pre-empted, so the first poll may wait
+		// for one block (300 ms here); prefetch must not refill after that.
+		{"one-foreground-read-arrives-late", 1, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			testSlowWindowLeavesDrainerASlot(t, tc.fgHeld, tc.fgLate)
+		})
+	}
+}
+
+func testSlowWindowLeavesDrainerASlot(t *testing.T, fgHeld int, fgLate bool) {
 	t.Setenv("JM_SERVER_READAHEAD", "")
 	resetPrefetchOfflineState(t)
 	forceDefaultClass(t, netprofile.ClassSlow)
@@ -43,6 +64,19 @@ func TestSlowWindowLeavesDrainerASlot(t *testing.T) {
 		inflight.Add(-1)
 		return len(buf), nil
 	}
+	// Foreground reads in flight (cold reads waiting on the link).
+	holdForeground := func() {
+		for i := 0; i < fgHeld; i++ {
+			rel, ok := acquireFUSEData()
+			if !ok {
+				t.Fatal("foreground read refused")
+			}
+			t.Cleanup(rel)
+		}
+	}
+	if !fgLate {
+		holdForeground()
+	}
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -60,6 +94,9 @@ func TestSlowWindowLeavesDrainerASlot(t *testing.T) {
 	}()
 	defer func() { close(stop); wg.Wait() }()
 	time.Sleep(200 * time.Millisecond)
+	if fgLate {
+		holdForeground()
+	}
 
 	const bound = 100 * time.Millisecond
 	for i := 0; i < 10; i++ {
@@ -75,11 +112,15 @@ func TestSlowWindowLeavesDrainerASlot(t *testing.T) {
 			}
 			time.Sleep(10 * time.Millisecond)
 		}
-		if waited := time.Since(t0); waited > bound+20*time.Millisecond {
-			t.Fatalf("drain poll %d waited %v for a background slot, want under %v", i, waited, bound)
+		limit := bound
+		if fgLate && i == 0 {
+			limit = 300*time.Millisecond + bound // one in-flight block
+		}
+		if waited := time.Since(t0); waited > limit+20*time.Millisecond {
+			t.Fatalf("drain poll %d waited %v for a background slot, want under %v", i, waited, limit)
 		}
 	}
-	if p := peak.Load(); p < 2 {
+	if p := peak.Load(); (fgHeld < 2 || fgLate) && p < 2 {
 		t.Fatalf("prefetch never ran in parallel (peak %d); the drain test proved nothing", p)
 	}
 }
@@ -327,5 +368,117 @@ func TestSlowWindowStopsAtEOF(t *testing.T) {
 	if n := pastEOF.Load(); n != 0 {
 		offs, _ := log.snapshot()
 		t.Fatalf("%d prefetch reads past EOF (want 0): %v", n, offs)
+	}
+}
+
+// The readahead share of the bulk lane applies to readahead rounds only: the
+// thumbnail, preview and QuickLook warmers (tryAcquireBulk) still get the
+// rest of the lane while readahead holds its full share.
+func TestReadaheadBulkShareDoesNotLimitWarmers(t *testing.T) {
+	forceDefaultClass(t, netprofile.ClassSlow)
+	if !defaultReadQoS.active() {
+		t.Skip("Read-QoS disabled")
+	}
+	var rels []func()
+	defer func() {
+		for _, r := range rels {
+			r()
+		}
+	}()
+	for i := int32(0); i < defaultReadQoS.prefetchBulkShare(); i++ {
+		rel, ok := defaultReadQoS.tryAcquireBulkPrefetch()
+		if !ok {
+			t.Fatalf("readahead round %d refused inside its share", i+1)
+		}
+		rels = append(rels, rel)
+	}
+	if rel, ok := defaultReadQoS.tryAcquireBulkPrefetch(); ok {
+		rel()
+		t.Fatal("readahead admitted past its share of the bulk lane")
+	}
+	rel, ok := defaultReadQoS.tryAcquireBulk()
+	if !ok {
+		t.Fatal("a warmer was refused while only readahead held tokens; the share must not apply to it")
+	}
+	rel()
+}
+
+// A round gives up pumping as soon as it stops claiming, before its last
+// blocks finish (and before mapping preparation), so the next read starts
+// the next round while the old one drains.
+func TestSlowWindowNextRoundStartsWhileLastBlocksDrain(t *testing.T) {
+	t.Setenv("JM_SERVER_READAHEAD", "")
+	resetPrefetchOfflineState(t)
+	forceDefaultClass(t, netprofile.ClassSlow)
+	fuseDataInFlight.Store(0)
+	t.Cleanup(func() { fuseDataInFlight.Store(0) })
+	dir, name := windowTestFile(t, 32)
+	rm := NewReadaheadManager(dir, nil, slowProfile(t))
+	defer rm.Stop()
+	rm.policyOverride = func() netprofile.ReadaheadPolicy {
+		return netprofile.ReadaheadPolicy{Enabled: true, SeqThreshold: 4, Blocks: 2, Workers: 4, ParallelFetch: true}
+	}
+	var captures atomic.Int32
+	rm.mappingCapture = func(uint64, string) *readaheadMappingJob {
+		captures.Add(1)
+		return nil
+	}
+	br := newBlockingReads()
+	rm.prefetchReadAt = br.readAt
+	defer br.unblock()
+
+	const inode = 515
+	readSequential(rm, inode, name, 0, readaheadBlockSize)
+	// Round 1 claims its 2 blocks; both stay in flight.
+	awaitPrefetchSignal(t, br.started)
+	awaitPrefetchSignal(t, br.started)
+	// The reader moves on: the window grows by a block.
+	readSequential(rm, inode, name, readaheadBlockSize, 2*readaheadBlockSize)
+	select {
+	case <-br.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("no new round started while the old round's blocks were in flight")
+	}
+	if c := captures.Load(); c < 2 {
+		t.Fatalf("rounds started = %d, want 2", c)
+	}
+}
+
+// A file that grows while it is read keeps its prefetch: the fstat size only
+// bounds one round and holds back new rounds briefly.
+func TestSlowWindowFollowsAGrowingFile(t *testing.T) {
+	t.Setenv("JM_SERVER_READAHEAD", "")
+	resetPrefetchOfflineState(t)
+	forceDefaultClass(t, netprofile.ClassSlow)
+	dir, name := windowTestFile(t, 5)
+	rm := NewReadaheadManager(dir, nil, slowProfile(t))
+	defer rm.Stop()
+	rm.sizeHintTTL = 20 * time.Millisecond
+	var pastOldEnd atomic.Int32
+	rm.prefetchReadAt = func(fd *os.File, buf []byte, off int64) (int, error) {
+		if off >= 5*readaheadBlockSize {
+			pastOldEnd.Add(1)
+		}
+		return fd.ReadAt(buf, off)
+	}
+	const inode = 516
+	for off := int64(0); off < 3*readaheadBlockSize; off += windowTestSubread {
+		rm.OnRead(inode, off, windowTestSubread, name)
+		waitWindowIdle(t, rm, inode)
+	}
+	if n := pastOldEnd.Load(); n != 0 {
+		t.Fatalf("%d reads past the end before the file grew", n)
+	}
+	if err := os.Truncate(dir+"/"+name, 12*readaheadBlockSize); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(3 * rm.sizeHintTTL)
+	// The reader is still before the old end.
+	for off := int64(3 * readaheadBlockSize); off < 4*readaheadBlockSize; off += windowTestSubread {
+		rm.OnRead(inode, off, windowTestSubread, name)
+		waitWindowIdle(t, rm, inode)
+	}
+	if pastOldEnd.Load() == 0 {
+		t.Fatal("prefetch stopped at the old file size after the file grew")
 	}
 }

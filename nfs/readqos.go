@@ -75,9 +75,10 @@ type readQoS struct {
 	// wait bounds — fields (not consts) so tests can shrink them.
 	intWait  time.Duration
 	bulkWait time.Duration
-	// prefetchHeld counts bulk tokens held by prefetch rounds. Prefetch may
-	// hold at most half the lane (at least one), so foreground bulk reads
-	// always find free tokens however many streams are prefetching.
+	// prefetchHeld counts bulk tokens held by readahead rounds
+	// (tryAcquireBulkPrefetch). They may hold at most half the lane (at least
+	// one), so foreground bulk reads always find free tokens however many
+	// streams are prefetching.
 	prefetchHeld atomic.Int32
 }
 
@@ -167,6 +168,23 @@ func (q *readQoS) acquire(off int64, n int) func() {
 // entirely (it re-triggers on the next sequential read). When the gate is
 // inactive it admits without a token.
 func (q *readQoS) tryAcquireBulk() (release func(), ok bool) {
+	if !q.active() {
+		return readQoSNoop, true
+	}
+	select {
+	case q.bulk <- struct{}{}:
+		return func() { <-q.bulk }, true
+	default:
+		metrics.Default().IncReadQoSPrefetchShed()
+		return nil, false
+	}
+}
+
+// tryAcquireBulkPrefetch is tryAcquireBulk for ReadaheadManager rounds only.
+// Readahead rounds together may hold at most half the bulk lane, so however
+// many streams are playing, foreground bulk reads find free tokens. The
+// share does not apply to the thumbnail, preview and QuickLook warmers.
+func (q *readQoS) tryAcquireBulkPrefetch() (release func(), ok bool) {
 	if !q.active() {
 		return readQoSNoop, true
 	}
