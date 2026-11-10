@@ -712,18 +712,41 @@ validate_compose() { # root under which missing mount sources will be created ("
 # A service that sets net.ipv4.tcp_congestion_control (such as the overlay
 # server/docker-compose.tcp-bbr.yml) does not start on a kernel without that
 # algorithm: Docker refuses the container. Docker loads a module itself, so a
-# module that exists is enough. Reads the project's own compose files.
-check_tcp_congestion() { # project folder
-  local f cc
-  for f in "$1/docker-compose.yml" "$1/docker-compose.override.yml" "$1"/overlays/*.yml "$1"/overlays/*.yaml; do
-    [ -f "$f" ] || continue
-    while read -r cc; do
-      [ -n "$cc" ] || continue
-      if grep -qw -- "$cc" /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null \
-         || modinfo "tcp_$cc" >/dev/null 2>&1; then continue; fi
-      die "${f#"$1"/} sets TCP congestion control '$cc', but this kernel has no tcp_$cc module and does not list it in /proc/sys/net/ipv4/tcp_available_congestion_control, so Docker would refuse to start those services. Remove that file (for BBR: overlays/docker-compose.tcp-bbr.yml) and run this command again. Nothing was changed."
-    done < <(grep -v '^[[:space:]]*#' "$f" | sed -n 's/^[[:space:]]*-\{0,1\}[[:space:]]*["'"'"']\{0,1\}net\.ipv4\.tcp_congestion_control["'"'"']\{0,1\}[[:space:]]*[:=][[:space:]]*["'"'"']\{0,1\}\([A-Za-z0-9_]*\).*/\1/p')
-  done
+# module that exists is enough. The values come from the merged configuration
+# (`docker compose config`: the main file, the override and overlays/), where
+# Compose has already resolved variables and rewritten every sysctl form into
+# `key: value` lines under `sysctls:`.
+tcp_cc_from_config() { # stdin: docker compose config -> one value per line
+  awk '
+    function indent(s) { match(s, /^[[:space:]]*/); return RLENGTH }
+    in_s && $0 !~ /^[[:space:]]*$/ && indent($0) <= ind { in_s = 0 }
+    in_s {
+      line = substr($0, indent($0) + 1); key = line; sub(/:.*/, "", key)
+      gsub(/["\047]/, "", key); gsub(/\//, ".", key)
+      if (key == "net.ipv4.tcp_congestion_control") {
+        v = line; sub(/^[^:]*:[[:space:]]*/, "", v)
+        gsub(/^["\047]|["\047]$/, "", v); gsub(/^[[:space:]]+|[[:space:]]+$/, "", v)
+        print v
+      }
+      next
+    }
+    /^[[:space:]]*sysctls:[[:space:]]*$/ { in_s = 1; ind = indent($0) }'
+}
+
+check_tcp_congestion() {
+  local cc a found
+  while IFS= read -r cc; do
+    found=0
+    for a in $(cat /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null); do
+      [ "$a" != "$cc" ] || found=1
+    done
+    [ "$found" = 0 ] || continue
+    if [ -n "$cc" ] && command -v modinfo >/dev/null 2>&1 && modinfo "tcp_$cc" >/dev/null 2>&1; then continue; fi
+    if [ -n "$cc" ] && ! command -v modinfo >/dev/null 2>&1; then
+      die "the compose configuration sets TCP congestion control '$cc', which this kernel does not list in /proc/sys/net/ipv4/tcp_available_congestion_control, and modinfo was not found, so whether a tcp_$cc module exists cannot be checked. Docker would refuse to start those services on a kernel without it. Install modinfo (kmod), or remove the file that sets it (for BBR: overlays/docker-compose.tcp-bbr.yml), and run this command again. Nothing was changed."
+    fi
+    die "the compose configuration sets TCP congestion control '$cc', but this kernel has no tcp_$cc module and does not list it in /proc/sys/net/ipv4/tcp_available_congestion_control, so Docker would refuse to start those services. Remove the file that sets it (for BBR: overlays/docker-compose.tcp-bbr.yml) and run this command again. Nothing was changed."
+  done < <(dc config | tcp_cc_from_config | sort -u)
 }
 
 # Another JuiceMount on this host (a TrueNAS app such as ix-juicemount, a
@@ -915,7 +938,7 @@ main() {
     if [ ! -x "$DC" ]; then DC="$STAGE/jm-compose"; write_wrapper "$DC" "$CDIR"; fi
     check_env "$CDIR/.env"
     validate_compose ""
-    check_tcp_congestion "$CDIR"
+    check_tcp_congestion
     check_no_drift
     check_redis_acl
     if [ "$DRY" = 1 ]; then
@@ -970,7 +993,7 @@ main() {
   DC="$P/jm-compose"
   write_wrapper "$DC" "$P"
   validate_compose "$ROOT"
-  check_tcp_congestion "$P"
+  check_tcp_congestion
   check_no_other_juicemount
   [ -n "$(project_containers)" ] || check_ports_free
 

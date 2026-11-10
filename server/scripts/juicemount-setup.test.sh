@@ -153,7 +153,9 @@ case "$cmd $*" in
       case "$s" in ./*) s="$dir/${s#./}" ;; esac
       echo "        source: $s"
     done
-    printf '      - mode: ingress\n        target: 80\n        published: "%s"\n        protocol: %s\n' "${FAKE_PORT:-1}" "${FAKE_PORT_PROTO:-tcp}" ;;
+    printf '      - mode: ingress\n        target: 80\n        published: "%s"\n        protocol: %s\n' "${FAKE_PORT:-1}" "${FAKE_PORT_PROTO:-tcp}"
+    # What Compose renders from sysctls/environment in the files (test 4b).
+    [ -z "${FAKE_CONFIG_EXTRA:-}" ] || printf '%b\n' "$FAKE_CONFIG_EXTRA" ;;
   "pull --quiet") [ "${FAKE_FAIL:-}" = pull ] && { echo 'pull denied' >&2; exit 1; }; exit 0 ;;
   "up -d")
     [ "${FAKE_FAIL:-}" = up ] && { echo 'juicefs-init did not complete successfully' >&2; exit 1; }
@@ -343,19 +345,45 @@ run_plain --dir "$D"
 [ "$rc" = 0 ] && grep -q -- "-f $D/compose/overlays/docker-compose.link.yml up -d" "$FAKE_LOG" || fail "overlay applied on re-run"
 ok "a re-run keeps overlays from compose/overlays/ (e.g. Link)"
 
-# 4b. An overlay that sets a TCP congestion control the kernel lacks is
-# refused before anything starts (Docker would refuse minio and respproxy).
-sed 's/tcp_congestion_control: bbr/tcp_congestion_control: nosuchcc/' "$SERVER/docker-compose.tcp-bbr.yml" > "$D/compose/overlays/docker-compose.tcp-bbr.yml"
-: > "$FAKE_LOG"
-run_plain --dir "$D"
-[ "$rc" = 1 ] && grep -q "overlays/docker-compose.tcp-bbr.yml sets TCP congestion control 'nosuchcc'" "$WORK/err" &&
-  grep -q 'modinfo tcp_nosuchcc' "$FAKE_LOG" && ! grep -q -- ' up -d' "$FAKE_LOG" || fail "an overlay with a missing algorithm refused"
+# 4b. A TCP congestion control the kernel lacks, in the merged configuration
+# (`docker compose config`), is refused before anything starts: Docker would
+# refuse minio and respproxy. An environment value naming the key is not.
 cp "$SERVER/docker-compose.tcp-bbr.yml" "$D/compose/overlays/docker-compose.tcp-bbr.yml"
+render='  minio:\n    environment:\n      X: net.ipv4.tcp_congestion_control=nosuchcc\n    sysctls:\n      net.ipv4.tcp_congestion_control: %s\n  respproxy:\n    image: x'
 : > "$FAKE_LOG"
-FAKE_MODULES=tcp_bbr run_plain --dir "$D"
-[ "$rc" = 0 ] && grep -q -- "-f $D/compose/overlays/docker-compose.tcp-bbr.yml up -d" "$FAKE_LOG" || fail "the BBR overlay applied when tcp_bbr exists"
+FAKE_CONFIG_EXTRA="$(printf "$render" nosuchcc)" run_plain --dir "$D"
+[ "$rc" = 1 ] && grep -q "sets TCP congestion control 'nosuchcc', but this kernel has no tcp_nosuchcc module" "$WORK/err" &&
+  grep -q 'modinfo tcp_nosuchcc' "$FAKE_LOG" && ! grep -q -- ' up -d' "$FAKE_LOG" || fail "a missing algorithm refused"
+: > "$FAKE_LOG"
+FAKE_CONFIG_EXTRA="$(printf "$render" bbr-x)" FAKE_MODULES=tcp_bbr run_plain --dir "$D"
+[ "$rc" = 1 ] && grep -q "'bbr-x'" "$WORK/err" || fail "bbr-x is not taken for bbr"
+: > "$FAKE_LOG"
+FAKE_CONFIG_EXTRA="$(printf "$render" bbr)" FAKE_MODULES=tcp_bbr run_plain --dir "$D"
+[ "$rc" = 0 ] && grep -q -- "-f $D/compose/overlays/docker-compose.tcp-bbr.yml up -d" "$FAKE_LOG" &&
+  ! grep -q 'modinfo tcp_nosuchcc' "$FAKE_LOG" || fail "the BBR overlay applied when tcp_bbr exists; the environment entry ignored"
 rm "$D/compose/overlays/docker-compose.tcp-bbr.yml"
-ok "the BBR overlay is refused on a kernel without the algorithm and applied when the module exists"
+ok "a TCP congestion control the kernel lacks is refused; bbr with its module applies; an environment entry is ignored"
+
+# 4c. The parser reads every sysctl form as the real Compose renders it.
+if docker compose version >/dev/null 2>&1; then
+  eval "$(sed -n '/^tcp_cc_from_config()/,/^}/p' "$SCRIPT")"
+  mkdir -p "$WORK/forms"
+  form() { printf 'services:\n  a:\n    image: alpine\n%b\n' "$2" > "$WORK/forms/$1.yml"; }
+  form map '    sysctls:\n      net.ipv4.tcp_congestion_control: m1'
+  form inline '    sysctls: {net.ipv4.tcp_congestion_control: m2}'
+  form list '    sysctls: ["net.ipv4.tcp_congestion_control=m3"]'
+  form var '    sysctls:\n      net.ipv4.tcp_congestion_control: ${JM_TEST_CC:-m4}'
+  form nextline '    sysctls:\n      net.ipv4.tcp_congestion_control:\n        m5'
+  form slash '    sysctls:\n      net/ipv4/tcp_congestion_control: m6'
+  form env '    environment:\n      X: net.ipv4.tcp_congestion_control=no'
+  for f in map:m1 inline:m2 list:m3 var:m4 nextline:m5 slash:m6 env:; do
+    got="$(env -u JM_TEST_CC docker compose -f "$WORK/forms/${f%%:*}.yml" config | tcp_cc_from_config)"
+    [ "$got" = "${f#*:}" ] || fail "sysctl form ${f%%:*} read as '$got', want '${f#*:}'"
+  done
+  ok "every sysctl form (map, inline map, list, \${} default, next line, slash key) is read; environment is not"
+else
+  ok "# SKIP docker compose not installed: sysctl forms not checked against Compose"
+fi
 
 # 5. Drift: a service made from other files is never recreated.
 FAKE_HAVE_HASH=hash-by-hand run_plain --dir "$D"

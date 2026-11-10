@@ -23,6 +23,10 @@
 #   copy this file into <data>/compose/overlays/, then
 #   <data>/compose/jm-compose up -d --no-deps minio respproxy
 # Turn it off: remove the file from overlays/ and run the same command.
+# Overlays apply to setup-made installs, through jm-compose only.
+# rollout-compose.sh and update-server.sh do not apply them: after
+# rollout-compose.sh --cutover-proxy, --proxy-rollback or --proxy-restore,
+# respproxy sends with the kernel default again.
 # Either way, minio and respproxy restart, which interrupts every Mac's open
 # connections. Do it when no Mac is reading or saving.
 #

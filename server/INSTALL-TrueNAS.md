@@ -292,6 +292,11 @@ Scripts**. Docker loads it on demand, so this is not required.
 
 To turn it off, remove the file from `overlays/` and repeat step 2.
 
+Overlays apply to setup-made installs, through `jm-compose` only.
+`rollout-compose.sh` and `update-server.sh` do not apply them: after
+`rollout-compose.sh --cutover-proxy`, `--proxy-rollback` or
+`--proxy-restore`, the proxy sends with the kernel default again.
+
 It speeds up downloads to Macs (reads). Uploads (saves) are sent by the Mac,
 and macOS has no BBR.
 
