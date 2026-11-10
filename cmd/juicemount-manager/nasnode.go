@@ -29,6 +29,8 @@ package main
 //     node a Mac could take for this one (manager.LinkNASConflicts).
 //
 // Off unless JM_NET_NAS_NODE=on; never takes the manager down on failure.
+// JM_NET_NAS_NODE=container runs the same node in its own container instead
+// (linknode.go).
 
 import (
 	"context"
@@ -62,8 +64,6 @@ const (
 	// nasNodeConflictTimeout bounds one such look.
 	nasNodeConflictTimeout = 10 * time.Second
 )
-
-func nasNodeEnabled() bool { return os.Getenv("JM_NET_NAS_NODE") == "on" }
 
 // nasNodeHostname is this node's name in the tailnet directory.
 func nasNodeHostname() string { return envOr("JM_NET_NAS_HOSTNAME", manager.DefaultNasHostname) }
@@ -181,13 +181,7 @@ func nasNodeConfigFromEnv(cfgPath string, handler http.Handler) (nasNodeConfig, 
 		// instead of dialing the node's tailnet address before the route
 		// converges.
 		tags = []string{manager.LinkTagNAS}
-		ensureTags = func(nodeKey string) (bool, error) {
-			changed, err := manager.EnsureNodeTags(hsBinary, cfgPath, nodeKey, tags)
-			if err != nil {
-				return false, fmt.Errorf("%w (Headscale tags a node registered before tagged keys only when its ACL policy defines the tag: use the Manager's policy instead of JM_NET_POLICY=off, add %q: [] to your own policy's tagOwners, or set JM_NET_NAS_EXPOSURE=subnet)", err, manager.LinkTagNAS)
-			}
-			return changed, nil
-		}
+		ensureTags = func(nodeKey string) (bool, error) { return ensureNASNodeTags(cfgPath, nodeKey, tags) }
 	}
 	dialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
 	return nasNodeConfig{
@@ -214,6 +208,16 @@ func nasNodeConfigFromEnv(cfgPath string, handler http.Handler) (nasNodeConfig, 
 		HealthEvery: 10 * time.Second,
 		Logf:        func(string, ...any) {},
 	}, nil
+}
+
+// ensureNASNodeTags tags the NAS node (nodeKey) server-side when its key did
+// not, and reports whether it did.
+func ensureNASNodeTags(cfgPath, nodeKey string, tags []string) (bool, error) {
+	changed, err := manager.EnsureNodeTags(hsBinary, cfgPath, nodeKey, tags)
+	if err != nil {
+		return false, fmt.Errorf("%w (Headscale tags a node registered before tagged keys only when its ACL policy defines the tag: use the Manager's policy instead of JM_NET_POLICY=off, add %q: [] to your own policy's tagOwners, or set JM_NET_NAS_EXPOSURE=subnet)", err, manager.LinkTagNAS)
+	}
+	return changed, nil
 }
 
 // newNASNodeSupervisor supervises the NAS node. It waits for control to be

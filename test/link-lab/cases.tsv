@@ -11,8 +11,10 @@
 #              NAS's LAN address (a "local DNS" entry): on | off
 #   away_nat   away router mapping: easy | hard
 #   cgnat      a carrier NAT behind the away router: off | easy | hard
-#   nas_net    bridge (today: the Manager behind the NAS's Docker NAT) |
-#              host (the NAS node directly on the home LAN)
+#   nas_net    host (the NAS node in its own container on the NAS host's
+#              network: JM_NET_NAS_NODE=container, server/docker-compose.link.yml)
+#              | bridge (the NAS node in the Manager, behind the NAS's
+#              Docker NAT: JM_NET_NAS_NODE=on, the layout before)
 #   portmap    the home router answers NAT-PMP port-mapping requests: on | off
 #   expect     the path we expect: direct | derp | fail (no connection)
 #
@@ -20,18 +22,19 @@
 # the home's internet link goes down, the Manager restarts (a NAS booting
 # after a power cut before the router has internet), the Mac at home
 # connects, then the internet comes back and the Mac away connects. Its
-# columns are the routers' switches; "expect" is the away Mac's path.
+# columns are the routers' switches; "expect" is the away Mac's path. With
+# the node container (host) the Mac at home must connect directly.
 #
 # name              site home_nat fwd_ctrl fwd_udp hairpin split_dns away_nat cgnat nas_net portmap expect
-direct-forward      away easy     on       on      off     off       easy     off   bridge  off     direct
-hole-punch          away easy     on       off     off     off       easy     off   bridge  off     direct
-hard-nat-relay      away hard     on       off     off     off       hard     off   bridge  off     derp
-forward-hard-away   away easy     on       on      off     off       hard     off   bridge  off     direct
-cgnat-away          away easy     on       off     off     off       easy     hard  bridge  off     derp
-cgnat-away-forward  away easy     on       on      off     off       easy     hard  bridge  off     direct
-home-hairpin        home easy     on       on      on      off       easy     off   bridge  off     direct
-home-local-dns      home easy     on       on      off     on        easy     off   bridge  off     direct
-home-no-hairpin     home easy     on       on      off     off       easy     off   bridge  off     fail
+direct-forward      away easy     on       on      off     off       easy     off   host    off     direct
+hole-punch          away easy     on       off     off     off       easy     off   host    off     direct
+hard-nat-relay      away hard     on       off     off     off       hard     off   host    off     derp
+forward-hard-away   away easy     on       on      off     off       hard     off   host    off     direct
+cgnat-away          away easy     on       off     off     off       easy     hard  host    off     derp
+cgnat-away-forward  away easy     on       on      off     off       easy     hard  host    off     direct
+home-hairpin        home easy     on       on      on      off       easy     off   host    off     direct
+home-local-dns      home easy     on       on      off     on        easy     off   host    off     direct
+home-no-hairpin     home easy     on       on      off     off       easy     off   host    off     fail
 portmap-bridge      away hard     on       off     off     off       hard     off   bridge  on      derp
 portmap-host        away hard     on       off     off     off       hard     off   host    on      direct
-wan-down-boot       away easy     on       on      off     on        easy     off   bridge  off     direct
+wan-down-boot       away easy     on       on      off     on        easy     off   host    off     direct

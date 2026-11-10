@@ -4,7 +4,8 @@
 #
 #   nas       the NAS's Docker network: redis, respproxy, silo, manager,
 #             and nas-host (the NAS's own Docker NAT and published ports)
-#   home      the home LAN: nas-host, home-router, home-mac
+#   home      the home LAN: nas-host (with link-node in its namespace, as
+#             host networking), home-router, home-mac
 #   homeup    the home's internet link: home-router <-> wan
 #   away      the away LAN: away-router, away-mac
 #   carrier   a carrier network for carrier-grade NAT: away-router <-> cgn
@@ -131,14 +132,20 @@ services:
 
   # The Manager with Link on, configured as server/docker-compose.link.yml
   # does, with Headscale's own TLS (a lab-CA certificate for the public
-  # name). The NAS node dials control on the in-container listener under the
-  # certificate's name (JM_NET_NAS_CONTROL_URL + a hosts entry), so it needs
-  # no hairpin. The DERP map is the lab's (lib/derp/derpmap.json): the relay
+  # name). The DERP map is the lab's (lib/derp/derpmap.json): the relay
   # serves it on the core network, the lab's stand-in for Tailscale's public
   # map, and the Manager fetches it across the WAN (JM_NET_DERP_MAP_URL) and
   # keeps a copy for Headscale, as it does with the public map.
-  # lab.sh sets its default route (bridge mode: via nas-host, the NAS's
-  # Docker NAT; host mode: on the home LAN via home-router), so the Manager
+  #
+  # Where the NAS node runs is the case's nas_net (lab.sh sets
+  # JMLINK_NAS_NODE):
+  #   host    JM_NET_NAS_NODE=container: the node runs in link-node, on the
+  #           NAS host's network (nas-host), as the Link overlay runs it
+  #   bridge  JM_NET_NAS_NODE=on: the node runs in the Manager, behind the
+  #           NAS's Docker NAT (the layout before the node container)
+  # In bridge mode the node dials control on the in-container listener under
+  # the certificate's name (JM_NET_NAS_CONTROL_URL + a hosts entry).
+  # lab.sh sets the Manager's default route via nas-host, so the Manager
   # itself runs without NET_ADMIN.
   manager:
     image: jmlinklab-manager:local
@@ -160,7 +167,7 @@ services:
       JM_ADMIN_KEY: ${JMLINK_ADMIN_KEY:?run lab.sh up}
       JM_MINIO_URL: "http://minio:9000"
       JM_NET_HEADSCALE: "on"
-      JM_NET_NAS_NODE: "on"
+      JM_NET_NAS_NODE: ${JMLINK_NAS_NODE:-container}
       JM_NET_SERVER_URL: "https://link.lab.example:30193"
       JM_NET_NAS_UDP_PORT: "41641"
       JM_NET_TLS_CERT: /lab-pki/link.lab.example.crt
@@ -174,21 +181,57 @@ services:
       - "link.lab.example:127.0.0.1"
     volumes:
       - manager-data:/data
+      - link-run:/run/juicemount-link
       - ./.state/pki:/lab-pki:ro
       - ./lib:/lab/lib:ro
     networks:
       nas:
         ipv4_address: 10.232.11.10
-      home:
-        ipv4_address: 10.232.10.6
 
-  # The NAS host's Docker NAT: what Docker does for the Manager's published
-  # ports (30193 -> 8091, 41641/udp) and its outbound traffic. Its home
-  # address is the NAS's LAN address.
+  # The NAS node in its own container, as server/docker-compose.link.yml runs
+  # it: on the NAS host's network (here nas-host's namespace; host
+  # networking on a real NAS), no capabilities, read-only root, its identity
+  # in its own volume, the Manager reached over the socket in link-run. It
+  # dials control at the public name, which nas-host's hosts file points at
+  # 127.0.0.1 (the published port), and the NAS services at the published
+  # ports on 127.0.0.1. lab.sh stops it in bridge mode.
+  link-node:
+    image: jmlinklab-manager:local
+    network_mode: "service:nas-host"
+    depends_on:
+      nas-host: {condition: service_started}
+      manager: {condition: service_started}
+    entrypoint: ["/usr/local/bin/juicemount-manager", "--link-node"]
+    environment:
+      JM_NET_NAS_UDP_PORT: "41641"
+      SSL_CERT_FILE: /lab-pki/ca.crt
+      TS_NO_LOGS_NO_SUPPORT: "true"
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/juicemount-manager", "--link-node-health"]
+      interval: 5s
+      retries: 3
+      start_period: 120s
+    volumes:
+      - link-run:/run/juicemount-link
+      - link-node-state:/var/lib/juicemount-link
+      - ./.state/pki:/lab-pki:ro
+
+  # The NAS host: its LAN address is the NAS's LAN address. It does what
+  # Docker does for the published ports: DNAT from the LAN (30193 to the
+  # Manager's 8091; 41641/udp to the Manager in bridge mode) and a listener
+  # on 127.0.0.1 for each published port (as docker-proxy does), which the
+  # node container uses. Its hosts file (shared with link-node) points the
+  # control name at 127.0.0.1.
   nas-host:
     <<: *tools
     command: ["/lab/lib/router.sh", "run"]
     environment: {ROUTER: nas-host}
+    extra_hosts:
+      - "link.lab.example:127.0.0.1"
     networks:
       nas: {ipv4_address: 10.232.11.2}
       home: {ipv4_address: 10.232.10.5}
@@ -280,3 +323,5 @@ services:
 
 volumes:
   manager-data: {}
+  link-run: {}
+  link-node-state: {}

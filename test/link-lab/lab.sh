@@ -10,7 +10,8 @@
 #   lab.sh probe SITE ARGS...  run lib/probe.py in home-mac or away-mac
 #                              (SITE: home|away); a pairing code is minted
 #                              for "connect"
-#   lab.sh restart SERVICE     restart a container (home-router, manager...)
+#   lab.sh restart SERVICE     restart a container (home-router, manager,
+#                              link-node...)
 #   lab.sh uplink SITE up|down take a site's internet link down or bring it
 #                              back (SITE: home|away)
 #   lab.sh wait-link           wait until Link is ready on the Manager
@@ -33,9 +34,16 @@ SERVER_URL="https://link.lab.example:30193"
 log() { printf '[link-lab] %s\n' "$*" >&2; }
 die() { log "$*"; exit 2; }
 
+# Where the NAS node runs (cases.tsv nas_net): host (the node container on
+# the NAS host's network, JM_NET_NAS_NODE=container) or bridge (in the
+# Manager, JM_NET_NAS_NODE=on).
+nas_mode() { cat "$STATE/nas_net" 2>/dev/null || echo host; }
+
 dc() {
   [ -f "$ENV_FILE" ] || die "the lab is not set up: run lab.sh up"
-  JMLINK_COMMIT="$(git -C "$HERE" rev-parse HEAD 2>/dev/null || printf '%040d' 0)" \
+  local node=container
+  [ "$(nas_mode)" = host ] || node=on
+  JMLINK_COMMIT="$(git -C "$HERE" rev-parse HEAD 2>/dev/null || printf '%040d' 0)" JMLINK_NAS_NODE="$node" \
     docker compose -f "$HERE/compose.yml" --env-file "$ENV_FILE" "$@"
 }
 cid() { local c; c="$(dc ps -q "$1")"; [ -n "$c" ] || die "service $1 is not running"; printf '%s' "$c"; }
@@ -82,25 +90,42 @@ gen_pki() {
     chmod 644 *.crt; chmod 600 *.key'
 }
 
-# The Manager's default route, set from a throwaway helper in its network
-# namespace so the Manager itself needs no NET_ADMIN.
-#   bridge  as today: the Manager sits behind the NAS's Docker NAT (nas-host)
-#           and has no address of its own on the home LAN
-#   host    the NAS node on the home LAN directly (host networking)
-nas_net() {
-  local mode=$1
+# The Manager's default route (via nas-host, the NAS's Docker NAT), set from
+# a throwaway helper in its network namespace so the Manager itself needs no
+# NET_ADMIN. Again after each Manager (re)start.
+manager_route() {
   docker run --rm --network "container:$(cid manager)" --cap-add NET_ADMIN --entrypoint /bin/sh \
     jmlinklab:local -ec '
-      home_if=$(ip -o -4 addr show | awk "/ 10\.232\.10\.6\// { sub(/@.*/, \"\", \$2); print \$2 }")
       for d in /sys/class/net/*; do d=${d##*/}; [ "$d" = lo ] || ethtool -K "$d" tso off gso off gro off >/dev/null 2>&1 || true; done
-      if [ "$1" = host ]; then
-        ip link set "$home_if" up
-        ip route replace default via 10.232.10.2 dev "$home_if"
-      else
-        ip link set "$home_if" down
-        ip route replace default via 10.232.11.2
-      fi' sh "$mode"
+      ip route replace default via 10.232.11.2'
+}
+
+# Where the NAS node runs:
+#   host    the node container (link-node) in nas-host's namespace: on the
+#           home LAN at the NAS's address, as host networking on a NAS
+#   bridge  the node in the Manager, behind the NAS's Docker NAT (the layout
+#           before the node container)
+# A change recreates the Manager (JM_NET_NAS_NODE) and waits for Link. The
+# node container is stopped before the in-Manager node starts: the two hold
+# the same identity and must not run at once.
+nas_net() {
+  local mode=$1 was
+  was="$(nas_mode)"
   printf '%s\n' "$mode" > "$STATE/nas_net"
+  router_conf nas-host "NAS_NODE=$mode"
+  if [ "$mode" = host ]; then
+    dc up -d --no-deps manager link-node >&2
+  else
+    dc stop link-node >&2
+    dc up -d --no-deps manager >&2
+  fi
+  manager_route
+  if [ "$was" = "$mode" ] && [ "$mode" = host ]; then
+    # A fresh node per case, so a port mapping or endpoint from the previous
+    # case's router does not carry over.
+    docker restart -t 2 "$(cid link-node)" >/dev/null
+  fi
+  wait_link
 }
 
 # NAS-side containers send through routers that shape and drop: turn off
@@ -158,9 +183,8 @@ apply_case() {
   set -- $line
   local name=$1 site=$2 home_nat=$3 fwd_ctrl=$4 fwd_udp=$5 hairpin=$6 split=$7 \
         away_nat=$8 cgnat=$9 nasnet=${10} portmap=${11} expect=${12}
-  local nas_ip=10.232.10.5 ctrl_port=30193 tcp="" udp="" dns=""
-  if [ "$nasnet" = host ]; then nas_ip=10.232.10.6 ctrl_port=8091; fi
-  [ "$fwd_ctrl" = off ] || tcp="30193>$nas_ip:$ctrl_port"
+  local nas_ip=10.232.10.5 tcp="" udp="" dns=""
+  [ "$fwd_ctrl" = off ] || tcp="30193>$nas_ip:30193"
   [ "$fwd_udp" = off ] || udp="41641>$nas_ip:41641"
   [ "$split" = off ] || dns="link.lab.example/$nas_ip"
   router_conf home-router "NAT=$home_nat
@@ -174,7 +198,6 @@ PORTMAP=$portmap"
   router_conf away-router "NAT=$away_nat
 UPLINK=$uplink"
   router_conf cgn "NAT=$cgn_nat"
-  router_conf nas-host ""
   # The NAS networking last: a port mapping the NAS node asks for must come
   # from this case's router, not the previous one's.
   nas_net "$nasnet"
@@ -211,8 +234,13 @@ case "$cmd" in
     dc build --quiet >&2
     gen_pki
     log "starting the lab"
-    dc up -d --wait --quiet-pull >&2
-    nas_net bridge
+    # The node container last (nas_net): it is healthy only once Link runs,
+    # which needs the Manager's route.
+    printf 'host\n' > "$STATE/nas_net"
+    # shellcheck disable=SC2046
+    dc up -d --wait --quiet-pull $(dc config --services | grep -vx link-node) >&2
+    manager_route
+    nas_net host
     nas_offloads_off
     wait_link
     seed_s3
@@ -225,7 +253,7 @@ case "$cmd" in
   restart)
     [ $# -eq 1 ] || die "usage: lab.sh restart SERVICE"
     docker restart -t 2 "$(cid "$1")" >/dev/null
-    if [ "$1" = manager ]; then nas_net "$(cat "$STATE/nas_net" 2>/dev/null || echo bridge)"; fi
+    if [ "$1" = manager ]; then manager_route; fi
     ;;
   uplink)
     [ $# -eq 2 ] || die "usage: lab.sh uplink home|away up|down"
@@ -241,6 +269,7 @@ case "$cmd" in
   exec) [ $# -ge 2 ] || die "usage: lab.sh exec SERVICE CMD..."; s=$1; shift; docker exec "$(cid "$s")" "$@" ;;
   status)
     dc ps
+    echo "NAS node: $(nas_mode)"
     for r in nas-host home-router away-router cgn; do
       echo "== $r"; docker exec "$(cid "$r")" iptables -t nat -S
     done

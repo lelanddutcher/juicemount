@@ -12,8 +12,11 @@ in this repository.
   (`docker compose version` answers).
 - These host ports are free on every address: TCP 30179 (Redis proxy), 30151
   and 30152 (object store), 30190 (Manager) and 30180 (WebDAV, published on
-  127.0.0.1 only). With Link also TCP 30193 and UDP 41641. The command checks
-  each published port, TCP and UDP, with `ss` when the host has it.
+  127.0.0.1 only). With Link also TCP 30193. The command checks each
+  published port, TCP and UDP, with `ss` when the host has it. Link's node
+  container also binds UDP 41641 on the host (host networking, not a
+  published port, so not checked); if another program holds it, see
+  `JM_NET_NAS_UDP_PORT` in `server/docker-compose.link.yml`.
 - Run it as root (on TrueNAS: the System → Shell, through `sudo`). Root is
   needed for datasets and for the private install folder. On a plain Docker
   host, a user with Docker access may install into a folder it can write
@@ -248,11 +251,17 @@ Link (embedded Headscale) is off by default. On a setup-made install:
    `<data>/compose/.env`.
 2. Copy `server/docker-compose.link.yml` from the same release into
    `<data>/compose/overlays/`.
-3. Recreate only the Manager: `sudo <data>/compose/jm-compose up -d --no-deps juicemount-manager`.
+3. Recreate the Manager and start the Link node container:
+   `sudo <data>/compose/jm-compose up -d --no-deps juicemount-manager juicemount-link`.
+
+The Link node container (`juicemount-link`) uses host networking, so it is on
+the NAS's LAN; the overlay's header says why and what it may do.
 
 Re-running the setup command keeps Link on, because it always applies
-`overlays/`. To turn Link off, remove the file from `overlays/` and repeat
-step 3.
+`overlays/`. To turn Link off, stop and remove the node container
+(`sudo <data>/compose/jm-compose rm -sf juicemount-link`), remove the file
+from `overlays/`, and recreate the Manager:
+`sudo <data>/compose/jm-compose up -d --no-deps juicemount-manager`.
 
 ### Faster downloads to remote Macs (TCP BBR)
 
@@ -337,7 +346,8 @@ Macs at once, is described in `server/COMPOSE-ROLLOUT.md`.
   127.0.0.1 only. Do not re-expose it without an authenticating proxy.
 - **Embedded Link** (Headscale) stays off. To enable it, apply
   `server/docker-compose.link.yml` on top of the compose; its header lists
-  what it publishes. Do not enable `JM_NET_ALLOW_INSECURE` or
+  what it publishes and what its node container (host networking, no
+  capabilities) may do. Do not enable `JM_NET_ALLOW_INSECURE` or
   `JM_NET_ALLOW_LAN_ONLY` in a release deployment.
 - **Redis administration** uses the `jm-admin` user, whose password is minted
   inside the Redis container at every start and never leaves it:

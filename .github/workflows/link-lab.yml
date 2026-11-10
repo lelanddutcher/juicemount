@@ -2,9 +2,10 @@ name: link-lab
 
 # The Link lab (test/link-lab): the NAS stack with Link on, home and away
 # NAT routers, an emulated WAN, a relay and Mac stand-ins, all in private
-# Docker networks. This job runs two cases (a direct path through a port
-# forward, and hard NAT on both ends, which needs the relay) and uploads the
-# JSON. It fails only when the lab breaks (the lab does not come up, or a
+# Docker networks. This job runs four cases (a direct path through a port
+# forward; hard NAT on both ends, which needs the relay; NAT-PMP port mapping
+# by the NAS node container; the home's internet down while the NAS boots)
+# and uploads the JSON. It fails only when the lab breaks (the lab does not come up, or a
 # case that should connect does not), never on the numbers or the path.
 on:
   workflow_dispatch:
@@ -35,7 +36,7 @@ concurrency:
 jobs:
   lab:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Traffic shaping is available
@@ -44,9 +45,9 @@ jobs:
         run: |
           sudo modprobe sch_netem && sudo modprobe sch_htb || {
             sudo apt-get install -y -q "linux-modules-extra-$(uname -r)" && sudo modprobe sch_netem && sudo modprobe sch_htb; }
-      - name: Run direct-forward and hard-nat-relay
+      - name: Run direct-forward, hard-nat-relay, portmap-host and wan-down-boot
         working-directory: test/link-lab
-        run: ./measure.py --cases direct-forward,hard-nat-relay --profile same-city --put-mib 8
+        run: ./measure.py --cases direct-forward,hard-nat-relay,portmap-host,wan-down-boot --profile same-city --put-mib 8
       - name: Scoreboard
         if: always()
         working-directory: test/link-lab

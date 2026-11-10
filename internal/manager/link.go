@@ -124,9 +124,30 @@ const (
 // does not change once the node's own state exists.
 const linkExposureFile = "nas-exposure"
 
-// NASNodeEmbedded reports whether this Manager runs the NAS tailnet node.
+// NAS node placements (JM_NET_NAS_NODE).
+const (
+	// NASNodeInManager runs the NAS node inside the Manager's process, on
+	// the Manager's container network.
+	NASNodeInManager = "on"
+	// NASNodeInContainer runs the NAS node in its own container
+	// (juicemount-manager --link-node, host networking). The Manager mints
+	// its keys, tags it and reports its state over a Unix socket.
+	NASNodeInContainer = "container"
+)
+
+// NASNodeEmbedded reports whether this Manager manages the NAS tailnet node:
+// it runs it in-process (JM_NET_NAS_NODE=on) or serves the separate node
+// container (JM_NET_NAS_NODE=container). Either way the node, its keys, its
+// tags and its exposure belong to this Manager's Headscale.
 func NASNodeEmbedded() bool {
-	return os.Getenv("JM_NET_HEADSCALE") == "on" && os.Getenv("JM_NET_NAS_NODE") == "on"
+	if os.Getenv("JM_NET_HEADSCALE") != "on" {
+		return false
+	}
+	switch os.Getenv("JM_NET_NAS_NODE") {
+	case NASNodeInManager, NASNodeInContainer:
+		return true
+	}
+	return false
 }
 
 // LinkExposure resolves the NAS node's exposure and, for subnet exposure,
@@ -364,7 +385,7 @@ func (a *API) handleLinkStatus(w http.ResponseWriter, r *http.Request) {
 		// applies a policy to it (LinkPolicyManaged), as before Link
 		// exposure existed.
 	case !NASNodeEmbedded() && exposure == LinkExposureServices:
-		routeErr(errors.New("Link service exposure is served by the embedded NAS node: set JM_NET_NAS_NODE=on"))
+		routeErr(errors.New("Link service exposure is served by the NAS node: set JM_NET_NAS_NODE=container (or on)"))
 	case !NASNodeEmbedded():
 		// The operator's own subnet router carries JM_NET_NAS_ROUTE. The
 		// Manager approves nothing for it, so the route is ready when the
