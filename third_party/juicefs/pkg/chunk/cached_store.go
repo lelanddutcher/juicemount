@@ -153,10 +153,11 @@ func (s *rSlice) ReadAt(ctx context.Context, page *Page, off int) (n int, err er
 
 	// A small read at the start of a block also takes the ranged path when
 	// the prefetcher can fill the rest of the block in the background, so
-	// the first byte does not wait for the whole block (JuiceMount). Not on
-	// an encrypted volume: its Get downloads and decrypts the whole object
-	// for any range, so the ranged read would download the block twice.
-	if s.store.seekable && len(p) <= blockSize/4 && (boff > 0 || !s.store.conf.Encrypted && s.store.fetcher != nil && s.store.fetcher.workers > 0) {
+	// the first byte does not wait for the whole block (JuiceMount). No
+	// ranged read on an encrypted volume, at any offset: its Get downloads
+	// and decrypts the whole object for any range, and the prefetch after a
+	// ranged read would download the block a second time.
+	if s.store.seekable && !s.store.conf.Encrypted && len(p) <= blockSize/4 && (boff > 0 || s.store.fetcher != nil && s.store.fetcher.workers > 0) {
 		if s.store.downLimit != nil {
 			s.store.downLimit.Wait(int64(len(p)))
 		}
@@ -849,36 +850,7 @@ func NewCachedStore(storage object.ObjectStorage, config Config, reg prometheus.
 	if !config.CacheEnabled() {
 		config.Prefetch = 0 // disable prefetch if cache is disabled
 	}
-	store.fetcher = newPrefetcher(config.Prefetch, func(key string) {
-		size := parseObjOrigSize(key)
-		if size == 0 || size > store.conf.BlockSize {
-			return
-		}
-		if _, ok := store.bcache.exist(key); ok {
-			return // another read already filled it
-		}
-		p := NewOffPage(size)
-		defer p.Release()
-		var cached bool
-		block, err := store.group.Execute(key, func() (*Page, error) { // dedup requests with full read
-			p.Acquire()
-			// A read may have cached the block since the check above.
-			if r, err := store.bcache.load(key); err == nil {
-				n, err := r.ReadAt(p.Data, 0)
-				_ = r.Close()
-				if err == nil && n == len(p.Data) {
-					cached = true
-					return p, nil
-				}
-			}
-			err := store.load(key, p, false, false) // delay writing cache until singleflight ends to prevent blocking waiters
-			return p, err
-		})
-		defer block.Release()
-		if err == nil && block == p && !cached {
-			store.bcache.cache(key, block, true, !store.conf.OSCache)
-		}
-	})
+	store.fetcher = newPrefetcher(config.Prefetch, func(key string) { store.fillBlock(key, store.bcache) })
 
 	if store.conf.CacheDir != "memory" && store.conf.Writeback {
 		for i := 0; i < store.conf.MaxUpload; i++ {
@@ -989,6 +961,40 @@ func (store *cachedStore) regMetrics(reg prometheus.Registerer) {
 		func() float64 {
 			return float64(len(store.currentUpload))
 		}))
+}
+
+// fillBlock is the prefetcher's work: download the whole block once and
+// cache it, unless bcache already holds it (JuiceMount: checked before the
+// download and again inside the single flight).
+func (store *cachedStore) fillBlock(key string, bcache CacheManager) {
+	size := parseObjOrigSize(key)
+	if size == 0 || size > store.conf.BlockSize {
+		return
+	}
+	if _, ok := bcache.exist(key); ok {
+		return // another read already filled it
+	}
+	p := NewOffPage(size)
+	defer p.Release()
+	var cached bool
+	block, err := store.group.Execute(key, func() (*Page, error) { // dedup requests with full read
+		p.Acquire()
+		// A read may have cached the block since the check above.
+		if r, err := bcache.load(key); err == nil {
+			n, err := r.ReadAt(p.Data, 0)
+			_ = r.Close()
+			if err == nil && n == len(p.Data) {
+				cached = true
+				return p, nil
+			}
+		}
+		err := store.load(key, p, false, false) // delay writing cache until singleflight ends to prevent blocking waiters
+		return p, err
+	})
+	defer block.Release()
+	if err == nil && block == p && !cached {
+		bcache.cache(key, block, true, !store.conf.OSCache)
+	}
 }
 
 func (store *cachedStore) shouldCache(size int) bool {

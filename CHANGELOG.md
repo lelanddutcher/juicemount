@@ -11,6 +11,10 @@
   downloads in the background into the cache. This applies when JuiceFS
   prefetch is on (every link class except metered) and the volume is not
   encrypted. The bundled JuiceFS is now build `-jm4`.
+- On an encrypted volume, a small read inside a block now downloads that
+  block once. Before, it downloaded the block twice: an encrypted object
+  must be fetched whole to be decrypted, so the partial read fetched the
+  block, and the background fill fetched it again.
 
 ### Server
 

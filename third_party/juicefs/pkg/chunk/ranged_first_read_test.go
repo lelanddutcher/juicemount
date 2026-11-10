@@ -9,6 +9,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
+	"errors"
 	"io"
 	mrand "math/rand"
 	"sync"
@@ -274,5 +275,87 @@ func TestJMEncryptedVolumeKeepsWholeBlockFirstRead(t *testing.T) {
 	}
 	if got := readAt(t, r, 512<<10, 64<<10); !bytes.Equal(got, data[512<<10:576<<10]) || g.full.Load() != 1 {
 		t.Fatal("a later read went to the object store again")
+	}
+}
+
+func encryptedStore(t *testing.T, id uint64) (*cachedStore, *gatedStorage, []byte) {
+	t.Helper()
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	enc, err := object.NewDataEncryptor(object.NewRSAEncryptor(key), object.AES256GCM_RSA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mem, _ := object.CreateStorage("mem", "", "", "", "")
+	data := writeBlocks(t, object.NewEncrypted(mem, enc), id, 1)
+	g := &gatedStorage{ObjectStorage: mem, gate: make(chan struct{})}
+	close(g.gate)
+	conf := rangedConf(t, 1)
+	conf.Encrypted = true
+	return NewCachedStore(object.NewEncrypted(g, enc), conf, nil).(*cachedStore), g, data
+}
+
+// A small read inside a block (boff > 0) on an encrypted volume is one
+// whole-object GET too: no ranged read, so no second download by the
+// prefetcher.
+func TestJMEncryptedInBlockReadIsOneWholeGET(t *testing.T) {
+	store, g, data := encryptedStore(t, 106)
+	r := store.NewReader(106, len(data))
+	if got := readAt(t, r, 64<<10, 64<<10); !bytes.Equal(got, data[64<<10:128<<10]) {
+		t.Fatal("wrong bytes")
+	}
+	waitCached(t, store, sliceForRead(106, len(data), store).key(0))
+	time.Sleep(50 * time.Millisecond) // a stray prefetch would show up here
+	if n := g.full.Load(); n != 1 || len(g.rangedGets()) != 0 {
+		t.Fatalf("whole-object GETs %d, ranged %v for one read inside a block, want 1 and none", n, g.rangedGets())
+	}
+}
+
+// hidingCache hides a cached block from one of the prefetcher's two checks:
+// exist() (the check before the download is queued) or load() (the check
+// inside the single-flight download).
+type hidingCache struct {
+	CacheManager
+	hideExist, hideLoad atomic.Bool
+}
+
+func (c *hidingCache) exist(key string) (string, bool) {
+	if c.hideExist.Load() {
+		return "", false
+	}
+	return c.CacheManager.exist(key)
+}
+
+func (c *hidingCache) load(key string) (ReadCloser, error) {
+	if c.hideLoad.Load() {
+		return nil, errors.New("hidden")
+	}
+	return c.CacheManager.load(key)
+}
+
+// Each of the prefetcher's cache checks alone stops a second download of a
+// block that is already cached.
+func TestJMPrefetchEachCacheCheckAlone(t *testing.T) {
+	for _, hide := range []string{"exist", "load"} {
+		t.Run("only the "+map[string]string{"exist": "check inside the download", "load": "check before queueing"}[hide], func(t *testing.T) {
+			mem, _ := object.CreateStorage("mem", "", "", "", "")
+			data := writeBlocks(t, mem, 107, 1)
+			g := &gatedStorage{ObjectStorage: mem, gate: make(chan struct{})}
+			close(g.gate)
+			store := NewCachedStore(g, rangedConf(t, 1), nil).(*cachedStore)
+			r := store.NewReader(107, len(data))
+			readAt(t, r, 0, len(data)) // whole block, cached by the read
+			key := sliceForRead(107, len(data), store).key(0)
+			waitCached(t, store, key)
+			hc := &hidingCache{CacheManager: store.bcache}
+			hc.hideExist.Store(hide == "exist")
+			hc.hideLoad.Store(hide == "load")
+			store.fillBlock(key, hc) // the prefetcher's work, run here
+			if n := g.full.Load(); n != 1 {
+				t.Fatalf("whole-block GETs %d with the %s check hidden, want 1", n, hide)
+			}
+		})
 	}
 }
