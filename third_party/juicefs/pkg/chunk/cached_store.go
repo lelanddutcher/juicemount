@@ -153,8 +153,10 @@ func (s *rSlice) ReadAt(ctx context.Context, page *Page, off int) (n int, err er
 
 	// A small read at the start of a block also takes the ranged path when
 	// the prefetcher can fill the rest of the block in the background, so
-	// the first byte does not wait for the whole block (JuiceMount).
-	if s.store.seekable && len(p) <= blockSize/4 && (boff > 0 || s.store.fetcher != nil && s.store.fetcher.workers > 0) {
+	// the first byte does not wait for the whole block (JuiceMount). Not on
+	// an encrypted volume: its Get downloads and decrypts the whole object
+	// for any range, so the ranged read would download the block twice.
+	if s.store.seekable && len(p) <= blockSize/4 && (boff > 0 || !s.store.conf.Encrypted && s.store.fetcher != nil && s.store.fetcher.workers > 0) {
 		if s.store.downLimit != nil {
 			s.store.downLimit.Wait(int64(len(p)))
 		}
@@ -591,6 +593,9 @@ type Config struct {
 	BufferSize        uint64
 	Readahead         int
 	Prefetch          int
+	// Encrypted: the object store decrypts whole objects, so a ranged GET
+	// costs a whole-block download (JuiceMount).
+	Encrypted bool
 }
 
 func (c *Config) SelfCheck(uuid string) {
@@ -854,13 +859,23 @@ func NewCachedStore(storage object.ObjectStorage, config Config, reg prometheus.
 		}
 		p := NewOffPage(size)
 		defer p.Release()
+		var cached bool
 		block, err := store.group.Execute(key, func() (*Page, error) { // dedup requests with full read
 			p.Acquire()
+			// A read may have cached the block since the check above.
+			if r, err := store.bcache.load(key); err == nil {
+				n, err := r.ReadAt(p.Data, 0)
+				_ = r.Close()
+				if err == nil && n == len(p.Data) {
+					cached = true
+					return p, nil
+				}
+			}
 			err := store.load(key, p, false, false) // delay writing cache until singleflight ends to prevent blocking waiters
 			return p, err
 		})
 		defer block.Release()
-		if err == nil && block == p {
+		if err == nil && block == p && !cached {
 			store.bcache.cache(key, block, true, !store.conf.OSCache)
 		}
 	})

@@ -141,6 +141,11 @@ the app's flags change, update `MOUNT_FLAGS` in `lab.sh`. To try other flags
 without editing, set `JMLAB_MOUNT_OPTS`, for example
 `JMLAB_MOUNT_OPTS="--prefetch 3" ./measure.py --profiles abroad`.
 
+To measure an encrypted volume (`aes256gcm-rsa`), set `JMLAB_ENCRYPT=1`
+when the lab is set up (`./lab.sh up` or `./measure.py`). The lab then
+formats the volume with a throwaway RSA key in `.state/encrypt.pem`, which
+`./lab.sh down` deletes with the rest of `.state`.
+
 ## Addresses
 
 The lab uses `10.231.10.0/24` (nas) and `10.231.20.0/24` (remote). If those

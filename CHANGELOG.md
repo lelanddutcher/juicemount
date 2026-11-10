@@ -9,8 +9,8 @@
   first read of a block waited until the whole block had downloaded. Now a
   small first read fetches only the bytes it needs, and the rest of the block
   downloads in the background into the cache. This applies when JuiceFS
-  prefetch is on (every link class except metered). The bundled JuiceFS is
-  now build `-jm4`.
+  prefetch is on (every link class except metered) and the volume is not
+  encrypted. The bundled JuiceFS is now build `-jm4`.
 
 ### Server
 

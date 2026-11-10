@@ -75,6 +75,9 @@ jobs:
           go test -count=1 ./pkg/object && go test -count=1 -run TestJM ./pkg/sync
           printf '{"Replace":{"%s":""}}' "$PWD/pkg/chunk/disk_cache_test.go" > "$RUNNER_TEMP/chunk-overlay.json"
           go test -count=1 -race -overlay "$RUNNER_TEMP/chunk-overlay.json" -run TestJM ./pkg/chunk
+          # The whole package without -race: upstream disk-cache tests race
+          # in their background goroutines.
+          go test -count=1 -overlay "$RUNNER_TEMP/chunk-overlay.json" ./pkg/chunk
       - name: Unit and integration-safe tests
         env:
           JM_REQUIRE_GATE_HISTORY: '1'

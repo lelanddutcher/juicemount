@@ -7,8 +7,10 @@ package chunk
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
 	"io"
-	"math/rand"
+	mrand "math/rand"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -64,7 +66,7 @@ func writeBlocks(t *testing.T, mem object.ObjectStorage, id uint64, n int) []byt
 	conf.CacheSize = 0 // nothing cached by the writer
 	w := NewCachedStore(mem, conf, nil)
 	data := make([]byte, n*conf.BlockSize)
-	rand.New(rand.NewSource(int64(id))).Read(data)
+	mrand.New(mrand.NewSource(int64(id))).Read(data)
 	sw := w.NewWriter(id)
 	if _, err := sw.WriteAt(data, 0); err != nil {
 		t.Fatal(err)
@@ -240,5 +242,37 @@ func TestJMConcurrentReadersOfOneColdBlock(t *testing.T) {
 	r := store.NewReader(104, len(data))
 	if got := readAt(t, r, 0, 2*bs); !bytes.Equal(got, data) {
 		t.Fatal("cached blocks differ from the object")
+	}
+}
+
+// An encrypted volume decrypts whole objects, so its Get downloads the whole
+// block for any range. A cold first read must stay one whole-block GET there.
+func TestJMEncryptedVolumeKeepsWholeBlockFirstRead(t *testing.T) {
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	enc, err := object.NewDataEncryptor(object.NewRSAEncryptor(key), object.AES256GCM_RSA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mem, _ := object.CreateStorage("mem", "", "", "", "")
+	data := writeBlocks(t, object.NewEncrypted(mem, enc), 105, 1)
+	g := &gatedStorage{ObjectStorage: mem, gate: make(chan struct{})}
+	close(g.gate)
+	conf := rangedConf(t, 1)
+	conf.Encrypted = true
+	store := NewCachedStore(object.NewEncrypted(g, enc), conf, nil).(*cachedStore)
+	r := store.NewReader(105, len(data))
+	if got := readAt(t, r, 0, 64<<10); !bytes.Equal(got, data[:64<<10]) {
+		t.Fatal("wrong bytes")
+	}
+	waitCached(t, store, sliceForRead(105, len(data), store).key(0))
+	time.Sleep(50 * time.Millisecond) // a stray prefetch would show up here
+	if n := g.full.Load(); n != 1 {
+		t.Fatalf("whole-object GETs %d for a cold first read, want 1", n)
+	}
+	if got := readAt(t, r, 512<<10, 64<<10); !bytes.Equal(got, data[512<<10:576<<10]) || g.full.Load() != 1 {
+		t.Fatal("a later read went to the object store again")
 	}
 }
