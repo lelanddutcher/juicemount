@@ -87,6 +87,9 @@ jobs:
           JM_WATCH_BATCH_TEST_REDIS_URL: redis://127.0.0.1:6379/6
           JM_WATCH_BATCH_STRESS_REDIS_URL: redis://127.0.0.1:6379/5
           JM_REPLACE_TEST_REDIS_URL: redis://127.0.0.1:6379/7
+          # Kills connections in DB 4 and in DB 0 (handshakes): nothing else
+          # uses this Redis while the step runs.
+          JM_WATCH_BATCH_CHAOS_REDIS_URL: redis://127.0.0.1:6379/4
         run: |
           go test -count=1 -race -run 'TestJMWatchBatch|TestBirth|Rename|TestCommittedRecord' ./pkg/meta
           go test -count=1 -run 'TestRedisClient$' ./pkg/meta

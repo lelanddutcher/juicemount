@@ -22,10 +22,23 @@ package meta
 // example resolveCase or Access without a full attribute). Such a read only
 // happens after a read on tx, which sends the pending WATCH first.
 //
+// A held WATCH travels only with commands that read (readOnly). Before a
+// command that writes (doSetXattr sends a bare HSETNX) or MULTI/EXEC, the
+// WATCH is sent alone and its reply awaited, so a refused WATCH never lets
+// a write run.
+//
 // Failure rules:
-//   - A WATCH that fails (an error reply or a connection error) fails every
-//     later command of the transaction without sending it, so no EXEC runs
-//     without its watches. txn returns the WATCH error, as upstream does.
+//   - A WATCH that fails fails every later command of the transaction
+//     without sending it, so no EXEC runs without its watches. txn returns
+//     the WATCH error, as upstream does. Failing includes an error reply and
+//     any connection failure: a connection that broke, and one that could
+//     not be had at all. go-redis sets no error on the commands in the last
+//     case, so the pipeline's own error is put on every command that has
+//     none. Otherwise the Tx would dial a fresh connection, with no WATCH,
+//     for the next command. The read pipelines this patch adds to doMknod
+//     and prepareBirthMutationAttr likewise return any pipeline error that
+//     is not a Redis reply, with or without this hook: a read that never
+//     reached Redis has an empty value and no error of its own.
 //   - UNWATCH is dropped only when no WATCH reached Redis since the last
 //     EXEC, or when the last EXEC certainly dropped the watches: it
 //     committed, it was aborted by a watched change (nil reply), Redis
@@ -101,9 +114,20 @@ func (w *watchBatch) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
 		if len(w.pending) == 0 {
 			return next(ctx, cmd)
 		}
-		_, _ = w.tx.Pipelined(ctx, func(p redis.Pipeliner) error {
+		if !readOnly(cmd) {
+			// A write must not run unless its WATCH succeeded.
+			if err := w.sendWatches(ctx); err != nil {
+				cmd.SetErr(err)
+				return err
+			}
+			return next(ctx, cmd)
+		}
+		_, err := w.tx.Pipelined(ctx, func(p redis.Pipeliner) error {
 			return p.Process(ctx, cmd)
 		})
+		if err != nil && cmd.Err() == nil {
+			cmd.SetErr(err) // go-redis leaves cmds unset when no connection was had
+		}
 		return cmd.Err()
 	}
 }
@@ -117,24 +141,9 @@ func (w *watchBatch) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.P
 		if len(cmds) > 0 && cmds[0].Name() == "multi" {
 			// go-redis reads a MULTI/EXEC pipeline by position, so a held
 			// WATCH goes first in its own round trip (as upstream).
-			if len(w.pending) > 0 {
-				watches := w.pending
-				w.pending = nil
-				w.live = true
-				// A plain pipeline: next here reads MULTI/EXEC replies.
-				_, _ = w.tx.Pipelined(ctx, func(p redis.Pipeliner) error {
-					for _, c := range watches {
-						_ = p.Process(ctx, c)
-					}
-					return nil
-				})
-				for _, c := range watches {
-					if e := c.Err(); e != nil {
-						w.err = e
-						setErrs(cmds, e)
-						return e
-					}
-				}
+			if err := w.sendWatches(ctx); err != nil {
+				setErrs(cmds, err)
+				return err
 			}
 			err := next(ctx, cmds)
 			if execDroppedWatches(cmds[len(cmds)-1].Err()) {
@@ -150,10 +159,63 @@ func (w *watchBatch) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.P
 		if len(w.pending) == 0 {
 			return next(ctx, cmds)
 		}
+		for _, c := range cmds {
+			if !readOnly(c) {
+				if err := w.sendWatches(ctx); err != nil {
+					setErrs(cmds, err)
+					return err
+				}
+				return next(ctx, cmds)
+			}
+		}
 		watches := w.pending
 		w.pending = nil
 		return w.send(ctx, next, watches, cmds)
 	}
+}
+
+// sendWatches sends the held WATCH commands alone, as a plain pipeline,
+// and waits for their replies. Any failure, a connection that could not be
+// had or broke as well as an error reply, is the transaction's WATCH error.
+func (w *watchBatch) sendWatches(ctx context.Context) error {
+	if len(w.pending) == 0 {
+		return nil
+	}
+	watches := w.pending
+	w.pending = nil
+	w.live = true
+	_, err := w.tx.Pipelined(ctx, func(p redis.Pipeliner) error {
+		for _, c := range watches {
+			_ = p.Process(ctx, c)
+		}
+		return nil
+	})
+	if err != nil && !isReplyError(err) {
+		w.err = err
+		return err
+	}
+	for _, c := range watches {
+		if e := c.Err(); e != nil {
+			w.err = e
+			return e
+		}
+	}
+	return nil
+}
+
+// readOnly reports whether a held WATCH may travel in the same pipeline as
+// cmd: cmd only reads, so if Redis refuses the WATCH nothing was changed.
+// Anything else (for example doSetXattr's bare HSETNX, or an unknown
+// command) waits for the WATCH reply first, as upstream does.
+func readOnly(cmd redis.Cmder) bool {
+	switch cmd.Name() {
+	case "get", "mget", "strlen", "getrange", "exists", "type", "ttl", "pttl",
+		"hget", "hmget", "hgetall", "hkeys", "hvals", "hlen", "hexists",
+		"lrange", "llen", "lindex", "smembers", "sismember", "scard",
+		"zscore", "zrange", "zcard", "zrangebyscore":
+		return true
+	}
+	return false
 }
 
 // send runs watches followed by cmds as one pipeline.
@@ -162,6 +224,16 @@ func (w *watchBatch) send(ctx context.Context, next redis.ProcessPipelineHook, w
 	all = append(append(all, watches...), cmds...)
 	w.live = true // sent, whatever the reply
 	err := next(ctx, all)
+	if err != nil && !isReplyError(err) {
+		// No connection, or it broke: the watches may not be in force.
+		w.err = err
+		for _, c := range all {
+			if c.Err() == nil {
+				c.SetErr(err)
+			}
+		}
+		return err
+	}
 	for _, c := range watches {
 		if e := c.Err(); e != nil {
 			w.err = e

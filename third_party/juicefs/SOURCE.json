@@ -507,7 +507,7 @@
       "upstream_sha256": "95c7c7ce661adcff3e77bb9ae28a3e421503f13c1a3dd86150babd60e606a04e"
     },
     "pkg/meta/redis.go": {
-      "sha256": "e0f54f23ceb0beb1393fe3e807659e49246787952a8110eb50f9350820357bf0",
+      "sha256": "42e3982498a906b24f5915e4a27526d88a046394ba4ed0412860bf9b57fe2854",
       "upstream_sha256": "2aa585ced13b1385adbe0bbcfb5a11f603d9f7cab3a017d827cf1148d0860456"
     },
     "pkg/meta/redis_bak.go": {
@@ -1116,13 +1116,14 @@
     "pkg/fuse/rename_flags_other.go": "f3a884c000c11d5d2df8436accbf1fb0f14f2ee134f0e72a705961595fa93233",
     "pkg/fuse/rename_flags_other_test.go": "9bd48e6423b2c88e37f9217eee5f0697afff8935c266fb18c81fd9dee65dcb8d",
     "pkg/jmsignal/jmsignal.go": "f06bc817d1e03cd66d10159ad282057ce22aa64ce0fa89562c6e3b06b37d3348",
-    "pkg/meta/redis_birth.go": "edfe6b6d00d576afdf60fb0ca1dc6ba53bde10f4ed8e9e793537e06c9cba38c9",
+    "pkg/meta/redis_birth.go": "2f1bc40448c3aa7a8eca1d580e78242d87957695d9f3c41db77a978dca9a2d8b",
     "pkg/meta/redis_birth_test.go": "0b14d67d11963426e82ddb1812e4e14206ff4413b1b0d4b02cceff020c68c2b6",
     "pkg/meta/redis_replace.go": "e5448c51d27fc74581b6cef09a41e2d189863b0e4deaa0b12a7244f4987ec6f5",
     "pkg/meta/redis_replace_test.go": "ccbc7af2182cc73932ee5b3a07471ab029c511e5373d07433d41f7b4d06672de",
-    "pkg/meta/redis_watch_batch.go": "9ae8f98ae0e2384249b8a3273ed49769737a9d53b03e4e67ea7771d57414a461",
+    "pkg/meta/redis_watch_batch.go": "fc95d9187f0c8530a3534eb972a82bd6e1a02390dbba830bbfc6d71818b5bd0a",
+    "pkg/meta/redis_watch_batch_chaos_test.go": "f615d0f1224fbf3398a9c07bc2141979237d1e763e362edbf7cba60d08e4e8d2",
     "pkg/meta/redis_watch_batch_stress_test.go": "bffcc9bb5472189a966f0caab3dd7dc7e6b4779d381b34369bc0537ceb8bcb78",
-    "pkg/meta/redis_watch_batch_test.go": "52baec6c16987cb247c4436214a46c27221ca2a887e831729ffff41735e7b47f",
+    "pkg/meta/redis_watch_batch_test.go": "2d0429f6563fb21bd8c0ac12ad2d70d4f6ee6b1df4c7eaa10937835005fb927d",
     "pkg/meta/tkv_etcd_test.go": "0070b8e58277ff857119b266b39521abafd6cca6640082232b58fe163640886f",
     "pkg/object/etcd_test.go": "6aee01c0cb921f1ae314b91d212126401aae62747d2c751c302f4aabcf3ed0d6",
     "pkg/object/file_beneath_linux.go": "6e34e0c643f03a88a286bb55c8225dab4f792dc99039d23a7df5fbff6be7f793",
@@ -1163,7 +1164,7 @@
     "patches/0016-file-backend-beneath-root.patch": "75a58ef1ce5fb69d91135bc3bb91dd19e6e5cb93e2155af5f0693fd0d5844576",
     "patches/0017-project-fence.patch": "a228f339d6e45cfb4b4c3f69b1b67cf4a157162006788498b62b65e00e9b6cae",
     "patches/0018-ranged-first-read.patch": "100a019fa68c2996b8af5c663b8670343d88cf63d936871bb6a302e2833f4d98",
-    "patches/0019-batched-watch-round-trips.patch": "3f2d1be476ac5e7ac7b1930ce1eb8b45863223fe44416259b52ad9b05a4c7380"
+    "patches/0019-batched-watch-round-trips.patch": "7ce67985994a8ec4618b0f13b88fb919ca8bf9ed45df60cea098cc0e74fc7be3"
   },
   "scope": "All pkg/ and cmd/ files plus main.go, LICENSE, go.mod and go.sum from the verified module ZIP. Documentation, integration tests and SDK examples are not included. local_files are JuiceMount-owned source with no upstream counterpart.",
   "upstream_url": "https://github.com/juicedata/juicefs/tree/v1.3.1",

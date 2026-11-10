@@ -326,4 +326,83 @@ func TestJMWatchBatchFailedWatchStopsTheTransaction(t *testing.T) {
 	if n, _ := m.rdb.Exists(ctx, k).Result(); n != 0 {
 		t.Fatal("a transaction whose WATCH failed wrote its key")
 	}
+	// A bare write first (doSetXattr's HSETNX): the held WATCH is sent
+	// alone, so its refusal stops the write.
+	k2 := m.prefix + "wb:x"
+	err = nw.watchTxn(ctx, func(tx *redis.Tx) error {
+		return tx.HSetNX(ctx, k2, "name", "value").Err()
+	}, []string{k2})
+	if err == nil || !strings.Contains(err.Error(), "NOPERM") {
+		t.Fatalf("bare write: transaction error %v, want the WATCH's NOPERM", err)
+	}
+	if n, _ := m.rdb.Exists(ctx, k2).Result(); n != 0 {
+		t.Fatal("a bare write ran although its WATCH was refused")
+	}
+}
+
+// The first command of a transaction cannot get a connection (a dial or
+// handshake fails once). Upstream, the WATCH fails and txn returns the error.
+// The batch must do the same: before the fix the held WATCH was dropped
+// silently, the read returned an empty value with no error, the next command
+// dialled a fresh connection without the WATCH, and EXEC committed over a
+// concurrent change (found in review).
+func TestJMWatchBatchDialFailureKeepsWatch(t *testing.T) {
+	addr := strings.TrimPrefix(watchBatchURL(t), "redis://")
+	for _, on := range []bool{false, true} {
+		store, err := newRedisMeta("redis", addr, testConfig())
+		if err != nil {
+			t.Fatal(err)
+		}
+		base := store.(*redisMeta)
+		opt := *base.rdb.(*redis.Client).Options()
+		_ = base.rdb.Close()
+		var failDials atomic.Int64
+		var d net.Dialer
+		opt.Dialer = func(ctx context.Context, network, a string) (net.Conn, error) {
+			if failDials.Add(-1) >= 0 {
+				return nil, errors.New("injected dial failure")
+			}
+			return d.DialContext(ctx, network, a)
+		}
+		m := &redisMeta{rdb: redis.NewClient(&opt)}
+		other := redis.NewClient(&redis.Options{Addr: opt.Addr, DB: opt.DB})
+		ctx := Background()
+		k := "jm:watchbatch:dial"
+		other.Set(ctx, k, "0", 0)
+
+		prev := watchBatchOff
+		watchBatchOff = !on
+		failDials.Store(1) // a non-retryable dial error: only the first connection attempt fails
+		var firstVal string
+		var firstErr error
+		ran := false
+		err = m.watchTxn(ctx, func(tx *redis.Tx) error {
+			ran = true
+			firstVal, firstErr = tx.Get(ctx, k).Result()
+			if firstErr != nil {
+				return firstErr
+			}
+			n, err := tx.Get(ctx, k).Int()
+			if err != nil {
+				return err
+			}
+			other.Set(ctx, k, "100", 0) // concurrent writer after our read
+			_, err = tx.TxPipelined(ctx, func(p redis.Pipeliner) error {
+				p.Set(ctx, k, n+1, 0)
+				return nil
+			})
+			return err
+		}, []string{k})
+		watchBatchOff = prev
+		final := other.Get(ctx, k).Val()
+		t.Logf("batch=%v: first read (%q, %v); txn err=%v; final k=%s", on, firstVal, firstErr, err, final)
+		if err == nil && final == "1" {
+			t.Errorf("batch=%v: EXEC committed without WATCH: concurrent write of 100 lost", on)
+		}
+		if ran && firstErr == nil && !strings.Contains(firstVal, "0") {
+			t.Errorf("batch=%v: failed read returned %q with no error", on, firstVal)
+		}
+		other.Close()
+		m.rdb.Close()
+	}
 }

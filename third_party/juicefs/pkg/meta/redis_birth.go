@@ -126,12 +126,14 @@ func (m *redisMeta) prepareBirthMutationAttr(ctx Context, tx *redis.Tx, inode In
 	// above is sent first in this same round trip. A failed WATCH fails
 	// every command here, and txn returns the WATCH error.
 	var birthCmd, finalCmd, attrCmd *redis.StringCmd
-	_, _ = tx.Pipelined(ctx, func(p redis.Pipeliner) error {
+	if _, err := tx.Pipelined(ctx, func(p redis.Pipeliner) error {
 		birthCmd = p.Get(ctx, birthKey)
 		finalCmd = p.Get(ctx, finalKey)
 		attrCmd = p.Get(ctx, m.inodeKey(inode))
 		return nil
-	})
+	}); err != nil && !isReplyError(err) {
+		return nil, nil, err
+	}
 	b, err := m.checkBirthMutation(ctx, tx, inode, birthCmd, finalCmd)
 	return b, attrCmd, err
 }

@@ -29,7 +29,7 @@
  		if err != nil {
  			return err
  		}
-@@ -1351,8 +1354,17 @@
+@@ -1351,8 +1354,19 @@
  				return err
  			}
  		}
@@ -37,18 +37,20 @@
 +		// keys are WATCHed by this txn, so reading the entry before the
 +		// parent checks below changes no outcome.
 +		var pcmd, ecmd *redis.StringCmd
-+		_, _ = tx.Pipelined(ctx, func(p redis.Pipeliner) error {
++		if _, err := tx.Pipelined(ctx, func(p redis.Pipeliner) error {
 +			pcmd = p.Get(ctx, m.inodeKey(parent))
 +			ecmd = p.HGet(ctx, m.entryKey(parent), name)
 +			return nil
-+		})
++		}); err != nil && !isReplyError(err) {
++			return err
++		}
  		var pattr Attr
 -		a, err := tx.Get(ctx, m.inodeKey(parent)).Bytes()
 +		a, err := pcmd.Bytes()
  		if err != nil {
  			return err
  		}
-@@ -1374,7 +1386,7 @@
+@@ -1374,7 +1388,7 @@
  			return syscall.ENOTSUP
  		}
  
@@ -57,7 +59,7 @@
  		if err != nil && err != redis.Nil {
  			return err
  		}
-@@ -2707,7 +2719,7 @@
+@@ -2707,7 +2721,7 @@
  
  func (m *redisMeta) doWrite(ctx Context, inode Ino, indx uint32, off uint32, slice Slice, mtime time.Time, numSlices *int, delta *dirStat, attr *Attr) syscall.Errno {
  	return errno(m.txn(ctx, func(tx *redis.Tx) error {
@@ -66,7 +68,7 @@
  		if err != nil {
  			return err
  		}
-@@ -2721,7 +2733,10 @@
+@@ -2721,7 +2735,10 @@
  		}
  		*delta = dirStat{}
  		*attr = Attr{}

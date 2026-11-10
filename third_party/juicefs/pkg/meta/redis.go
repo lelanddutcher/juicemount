@@ -1358,11 +1358,13 @@ func (m *redisMeta) doMknod(ctx Context, parent Ino, name string, _type uint8, m
 		// keys are WATCHed by this txn, so reading the entry before the
 		// parent checks below changes no outcome.
 		var pcmd, ecmd *redis.StringCmd
-		_, _ = tx.Pipelined(ctx, func(p redis.Pipeliner) error {
+		if _, err := tx.Pipelined(ctx, func(p redis.Pipeliner) error {
 			pcmd = p.Get(ctx, m.inodeKey(parent))
 			ecmd = p.HGet(ctx, m.entryKey(parent), name)
 			return nil
-		})
+		}); err != nil && !isReplyError(err) {
+			return err
+		}
 		var pattr Attr
 		a, err := pcmd.Bytes()
 		if err != nil {
