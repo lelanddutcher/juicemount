@@ -38,7 +38,7 @@
 # public relays. The Manager keeps their map in /data/headscale/derpmap.yaml
 # (fetched again every hour; the last copy is kept), so Link starts even when
 # the NAS has no internet. To use only your own relay, set
-# JM_NET_DERP_MAP_URL to your relay's DERP map URL (JSON). JM_NET_DERP_MAP_URL=off
+# JM_NET_DERP_MAP_URL to your relay's DERP map https URL (JSON). JM_NET_DERP_MAP_URL=off
 # drops the fetched map; then list your map file in config.yaml derp.paths or
 # HEADSCALE_DERP_PATHS. HEADSCALE_DERP_URLS also still works, but Headscale
 # does not start while it cannot fetch that URL.

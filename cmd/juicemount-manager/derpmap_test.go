@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -37,6 +39,7 @@ func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { retu
 // mapServer serves labMapJSON while up is true.
 func mapServer(t *testing.T, up *atomic.Bool) string {
 	t.Helper()
+	t.Setenv("JM_NET_DERP_MAP_ALLOW_HTTP", "1") // httptest serves plain http
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !up.Load() {
 			http.Error(w, "down", http.StatusBadGateway)
@@ -50,7 +53,7 @@ func mapServer(t *testing.T, up *atomic.Bool) string {
 
 func regionIDs(t *testing.T, path string) []int {
 	t.Helper()
-	m, err := readDERPMapFile(path)
+	m, _, err := readDERPMapFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -113,18 +116,21 @@ func TestDERPMapFileRoundTrip(t *testing.T) {
 		t.Fatalf("built-in snapshot has %d regions", len(want.Regions))
 	}
 	path := filepath.Join(t.TempDir(), "derpmap.yaml")
-	changed, err := writeDERPMapFile(path, want)
+	changed, err := writeDERPMapFile(path, want, defaultDERPMapURL)
 	if err != nil || !changed {
 		t.Fatalf("write: changed=%v err=%v", changed, err)
 	}
-	got, err := readDERPMapFile(path)
+	got, source, err := readDERPMapFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatal("DERP map changed through the file")
 	}
-	if changed, err := writeDERPMapFile(path, want); err != nil || changed {
+	if source != defaultDERPMapURL {
+		t.Fatalf("source = %q", source)
+	}
+	if changed, err := writeDERPMapFile(path, want, defaultDERPMapURL); err != nil || changed {
 		t.Fatalf("rewrite of the same map: changed=%v err=%v", changed, err)
 	}
 	if fi, err := os.Stat(path); err != nil || fi.Mode().Perm() != 0o644 {
@@ -154,9 +160,12 @@ func TestPrepareDERPMap(t *testing.T) {
 		if err != nil || fresh {
 			t.Fatalf("fresh=%v err=%v", fresh, err)
 		}
-		m, err := readDERPMapFile(path)
+		m, source, err := readDERPMapFile(path)
 		if err != nil {
 			t.Fatal(err)
+		}
+		if source != derpMapSourceBuiltin {
+			t.Fatalf("source = %q", source)
 		}
 		snap, _ := parseDERPMapJSON(publicDERPMapSnapshot)
 		if !reflect.DeepEqual(m, snap) {
@@ -185,7 +194,7 @@ func TestPrepareDERPMap(t *testing.T) {
 		offlineClient(t)
 		path := filepath.Join(t.TempDir(), "derpmap.yaml")
 		lab, _ := parseDERPMapJSON([]byte(labMapJSON))
-		if _, err := writeDERPMapFile(path, lab); err != nil {
+		if _, err := writeDERPMapFile(path, lab, defaultDERPMapURL); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := prepareDERPMap(context.Background(), path); err != nil {
@@ -193,6 +202,52 @@ func TestPrepareDERPMap(t *testing.T) {
 		}
 		if ids := regionIDs(t, path); !reflect.DeepEqual(ids, []int{900}) {
 			t.Fatalf("regions = %v", ids)
+		}
+	})
+	t.Run("public copy, then a self-hosted URL offline: no public relays", func(t *testing.T) {
+		t.Setenv("JM_NET_DERP_MAP_URL", "https://relay.example/derpmap.json")
+		offlineClient(t)
+		path := filepath.Join(t.TempDir(), "derpmap.yaml")
+		snap, _ := parseDERPMapJSON(publicDERPMapSnapshot)
+		if _, err := writeDERPMapFile(path, snap, defaultDERPMapURL); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := prepareDERPMap(context.Background(), path); err != nil {
+			t.Fatal(err)
+		}
+		if ids := regionIDs(t, path); len(ids) != 0 {
+			t.Fatalf("regions = %v, want none: the public copy was reused for a self-hosted URL", ids)
+		}
+	})
+	t.Run("self-hosted copy, then the default URL offline: built-in public map", func(t *testing.T) {
+		t.Setenv("JM_NET_DERP_MAP_URL", "")
+		offlineClient(t)
+		path := filepath.Join(t.TempDir(), "derpmap.yaml")
+		lab, _ := parseDERPMapJSON([]byte(labMapJSON))
+		if _, err := writeDERPMapFile(path, lab, "https://relay.example/derpmap.json"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := prepareDERPMap(context.Background(), path); err != nil {
+			t.Fatal(err)
+		}
+		snap, _ := parseDERPMapJSON(publicDERPMapSnapshot)
+		if ids := regionIDs(t, path); len(ids) != len(snap.Regions) {
+			t.Fatalf("regions = %v, want the built-in public map", ids)
+		}
+	})
+	t.Run("leftover temp files are removed", func(t *testing.T) {
+		t.Setenv("JM_NET_DERP_MAP_URL", "")
+		offlineClient(t)
+		dir := t.TempDir()
+		left := filepath.Join(dir, ".derpmap-123.yaml")
+		if err := os.WriteFile(left, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := prepareDERPMap(context.Background(), filepath.Join(dir, "derpmap.yaml")); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := os.Stat(left); !os.IsNotExist(err) {
+			t.Fatalf("leftover temp file still there: %v", err)
 		}
 	})
 	t.Run("self-hosted URL offline, no copy: empty map, no public relays", func(t *testing.T) {
@@ -225,16 +280,66 @@ func TestPrepareDERPMap(t *testing.T) {
 }
 
 func TestDERPMapSource(t *testing.T) {
-	for in, want := range map[string]string{
-		"":                       defaultDERPMapURL,
-		"off":                    "",
-		"OFF":                    "",
-		"https://r.example/m.js": "https://r.example/m.js",
+	for _, tc := range []struct {
+		in, allowHTTP, want string
+		wantErr             bool
+	}{
+		{"", "", defaultDERPMapURL, false},
+		{"off", "", "", false},
+		{"OFF", "", "", false},
+		{"https://r.example/m.json", "", "https://r.example/m.json", false},
+		{"http://r.example/m.json", "", "", true},
+		{"http://r.example/m.json", "1", "http://r.example/m.json", false},
+		{"ftp://r.example/m.json", "1", "", true},
+		{"r.example/m.json", "", "", true},
+		{"https://", "", "", true},
+		{"::not a url", "", "", true},
 	} {
-		t.Setenv("JM_NET_DERP_MAP_URL", in)
-		if got := derpMapSource(); got != want {
-			t.Errorf("JM_NET_DERP_MAP_URL=%q: source %q, want %q", in, got, want)
+		t.Setenv("JM_NET_DERP_MAP_URL", tc.in)
+		t.Setenv("JM_NET_DERP_MAP_ALLOW_HTTP", tc.allowHTTP)
+		got, err := derpMapSource()
+		if (err != nil) != tc.wantErr || got != tc.want {
+			t.Errorf("JM_NET_DERP_MAP_URL=%q allow_http=%q: (%q, %v), want (%q, err=%v)", tc.in, tc.allowHTTP, got, err, tc.want, tc.wantErr)
 		}
+	}
+}
+
+// An invalid URL is a start error (shown in the Link status), not a
+// silent fallback.
+func TestPrepareDERPMapRejectsInvalidURL(t *testing.T) {
+	t.Setenv("JM_NET_DERP_MAP_URL", "http://relay.example/derpmap.json")
+	t.Setenv("JM_NET_DERP_MAP_ALLOW_HTTP", "")
+	if _, err := prepareDERPMap(context.Background(), filepath.Join(t.TempDir(), "derpmap.yaml")); err == nil ||
+		!strings.Contains(err.Error(), "https") {
+		t.Fatalf("err = %v, want an https error", err)
+	}
+}
+
+func TestCheckDERPOff(t *testing.T) {
+	const mapPath = "/data/headscale/derpmap.yaml"
+	own := "derp:\n  server:\n    enabled: false\n  urls: []\n  paths:\n    - " + mapPath + "\n"
+	for _, k := range []string{"HEADSCALE_DERP_PATHS", "HEADSCALE_DERP_URLS", "HEADSCALE_DERP_SERVER_ENABLED"} {
+		t.Setenv(k, "")
+	}
+	t.Setenv("JM_NET_DERP_MAP_URL", "")
+	if err := checkDERPOff(own, mapPath); err != nil {
+		t.Fatalf("default source: %v", err)
+	}
+	t.Setenv("JM_NET_DERP_MAP_URL", "off")
+	if err := checkDERPOff(own, mapPath); err == nil || !strings.Contains(err.Error(), "no other DERP map") {
+		t.Fatalf("off with only the Manager's file: err = %v", err)
+	}
+	withOwn := strings.Replace(own, "    - "+mapPath+"\n", "    - "+mapPath+"\n    - /data/relay.yaml\n", 1)
+	if err := checkDERPOff(withOwn, mapPath); err != nil {
+		t.Fatalf("off with another derp.paths entry: %v", err)
+	}
+	embedded := strings.Replace(own, "enabled: false", "enabled: true", 1)
+	if err := checkDERPOff(embedded, mapPath); err != nil {
+		t.Fatalf("off with the embedded DERP server: %v", err)
+	}
+	t.Setenv("HEADSCALE_DERP_PATHS", "/data/relay.yaml")
+	if err := checkDERPOff(own, mapPath); err != nil {
+		t.Fatalf("off with HEADSCALE_DERP_PATHS: %v", err)
 	}
 }
 
@@ -376,5 +481,34 @@ func TestLinkIntegrationHeadscaleStartsOffline(t *testing.T) {
 	snap, _ := parseDERPMapJSON(publicDERPMapSnapshot)
 	if ids := regionIDs(t, derpMapPath()); len(ids) != len(snap.Regions) {
 		t.Fatalf("derpmap.yaml has %d regions, want the built-in %d", len(ids), len(snap.Regions))
+	}
+}
+
+// A derp stanza the operator edited is not migrated; if it still lists a
+// URL, the Manager says why Headscale may not start offline and how to fix it.
+func TestMigrateLogsEditedDERPURLs(t *testing.T) {
+	oldDir := hsDataDir
+	t.Cleanup(func() { hsDataDir = oldDir })
+	hsDataDir = t.TempDir()
+	cfgPath := filepath.Join(hsDataDir, "config.yaml")
+	edited := "server_url: https://nas.example:30193\nderp:\n  server:\n    enabled: false\n  urls:\n    - https://relay.example/map.json\n  auto_update_enabled: true\n"
+	if err := os.WriteFile(cfgPath, []byte(edited), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+	if err := migratePersistedDERPConfig(cfgPath); err != nil {
+		t.Fatal(err)
+	}
+	if after, _ := os.ReadFile(cfgPath); string(after) != edited {
+		t.Fatal("edited config changed")
+	}
+	out := buf.String()
+	if !strings.Contains(out, "will not start without internet") || !strings.Contains(out, "- "+derpMapPath()) {
+		t.Fatalf("log = %q", out)
+	}
+	if strings.Count(out, "\n") != 1 {
+		t.Fatalf("want one log line, got %q", out)
 	}
 }

@@ -70,11 +70,19 @@
 - On start, the Manager rewrites the relay section of an existing
   `/data/headscale/config.yaml` only if it is exactly what an older Manager
   generated. A relay section you edited stays as it is.
+  If you edited that section and it still lists a map URL, the Manager logs
+  that Headscale will not start without internet, and how to fix it.
 - New setting `JM_NET_DERP_MAP_URL` (in `server/docker-compose.link.yml`).
-  Unset: Tailscale's public relays, as before. A URL: only the relays in the
-  DERP map at that URL, such as your own relay's; the public relays are not
-  used. `off`: no downloaded map; list your own map file in `config.yaml`
-  (`derp.paths`) or `HEADSCALE_DERP_PATHS`.
+  Unset: Tailscale's public relays, as before. An https URL: only the relays
+  in the DERP map at that URL, such as your own relay's; the public relays
+  are not used, and a saved copy of the public map is not reused for it.
+  Plain http needs `JM_NET_DERP_MAP_ALLOW_HTTP=1`, because anyone on the path
+  could add relays. Any other value stops Link with an error in the Link
+  status. `off`: no downloaded map; list your own map file in `config.yaml`
+  (`derp.paths`) or `HEADSCALE_DERP_PATHS`. With `off` and no other map, Link
+  stops with an error that says so.
+- If you go back to an older Manager after this one, it keeps
+  `derpmap.yaml` as last written and never updates it.
 
 ## 0.5.1 — 2026-11-07 (build 38)
 

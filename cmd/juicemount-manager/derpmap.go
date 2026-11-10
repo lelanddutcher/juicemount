@@ -18,9 +18,10 @@ package main
 //
 //  1. the map just fetched from JM_NET_DERP_MAP_URL (default: Tailscale's
 //     public map);
-//  2. the copy kept from the last successful fetch;
+//  2. the copy kept from the last successful fetch from that same URL (the
+//     file's "# source:" line names the URL it came from);
 //  3. for the default URL only, the copy built into the Manager
-//     (derpmap_public_snapshot.json).
+//     (derpmap_public_snapshot.json); for any other URL, an empty map.
 //
 // While Headscale runs, the Manager fetches the map again (every minute
 // while the fetch fails, every hour once it works) and rewrites the file
@@ -33,8 +34,17 @@ package main
 //	https://relay.example/map.json  only the map at that URL, such as a
 //	                                self-hosted relay's; no public relays
 //	off                             no fetched map: the relays come only
-//	                                from derp.paths in config.yaml or
-//	                                HEADSCALE_DERP_PATHS
+//	                                from derp.paths in config.yaml,
+//	                                HEADSCALE_DERP_PATHS, or Headscale's
+//	                                embedded DERP server
+//
+// The URL must be https. Anyone on the path of a plain-http fetch could
+// list their own relays, so http needs JM_NET_DERP_MAP_ALLOW_HTTP=1 (for a
+// test lab) and logs a warning.
+//
+// Refresh the built-in copy of the public map before a release:
+//
+//go:generate curl -fsSL -o derpmap_public_snapshot.json https://controlplane.tailscale.com/derpmap/default
 
 import (
 	"bytes"
@@ -46,6 +56,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -73,17 +84,43 @@ var publicDERPMapSnapshot []byte
 // derpMapFetchClient is a var so tests can point fetches at a test server.
 var derpMapFetchClient = &http.Client{Timeout: derpMapFetchTimeout}
 
+// derpMapSourceOff is what the file's source line says when
+// JM_NET_DERP_MAP_URL=off.
+const derpMapSourceOff = "off"
+
 // derpMapSource returns the URL the Manager fetches the DERP map from, or ""
-// when JM_NET_DERP_MAP_URL=off.
-func derpMapSource() string {
+// when JM_NET_DERP_MAP_URL=off. An unusable value is an error, which the
+// Link status shows.
+func derpMapSource() (string, error) {
 	v := strings.TrimSpace(os.Getenv("JM_NET_DERP_MAP_URL"))
 	switch strings.ToLower(v) {
 	case "":
-		return defaultDERPMapURL
+		return defaultDERPMapURL, nil
 	case "off", "none":
-		return ""
+		return "", nil
 	}
-	return v
+	u, err := url.Parse(v)
+	if err != nil || u.Host == "" {
+		return "", fmt.Errorf("JM_NET_DERP_MAP_URL %q is not a URL (use an https URL or off)", v)
+	}
+	switch u.Scheme {
+	case "https":
+		return v, nil
+	case "http":
+		if os.Getenv("JM_NET_DERP_MAP_ALLOW_HTTP") != "1" {
+			return "", fmt.Errorf("JM_NET_DERP_MAP_URL %q is plain http: anyone on the path could add relays; use https (JM_NET_DERP_MAP_ALLOW_HTTP=1 allows http for a test lab)", v)
+		}
+		return v, nil
+	}
+	return "", fmt.Errorf("JM_NET_DERP_MAP_URL %q must be an https URL or off", v)
+}
+
+// sourceLabel is what the file's source line records for src.
+func sourceLabel(src string) string {
+	if src == "" {
+		return derpMapSourceOff
+	}
+	return src
 }
 
 func derpMapPath() string { return filepath.Join(hsDataDir, derpMapFileName) }
@@ -121,10 +158,15 @@ func parseDERPMapJSON(b []byte) (*tailcfg.DERPMap, error) {
 	return &m, nil
 }
 
+const derpMapSourcePrefix = "# source: "
+
 // marshalDERPMapYAML renders m in the form Headscale's derp.paths loader
-// reads: yaml.v3 with its default (lower-case field name) keys.
-func marshalDERPMapYAML(m *tailcfg.DERPMap) ([]byte, error) {
+// reads: yaml.v3 with its default (lower-case field name) keys. The first
+// line records where the map came from (a URL, "off", or
+// derpMapSourceBuiltin), so a copy is reused only for the same source.
+func marshalDERPMapYAML(m *tailcfg.DERPMap, source string) ([]byte, error) {
 	var buf bytes.Buffer
+	buf.WriteString(derpMapSourcePrefix + source + "\n")
 	buf.WriteString("# Written by juicemount-manager; rewritten when the DERP map changes.\n")
 	enc := yaml.NewEncoder(&buf)
 	enc.SetIndent(2)
@@ -137,22 +179,34 @@ func marshalDERPMapYAML(m *tailcfg.DERPMap) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-// readDERPMapFile loads a map written by writeDERPMapFile.
-func readDERPMapFile(path string) (*tailcfg.DERPMap, error) {
+// derpMapSourceBuiltin marks the built-in copy of the public map. It is
+// not a fetched copy, so it is never reused in place of a fetch: each start
+// without internet writes it again from the binary.
+const derpMapSourceBuiltin = "built-in copy of " + defaultDERPMapURL
+
+// readDERPMapFile loads a map written by writeDERPMapFile and the source
+// its first line records ("" when the file has no source line).
+func readDERPMapFile(path string) (*tailcfg.DERPMap, string, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	var m tailcfg.DERPMap
 	if err := yaml.Unmarshal(b, &m); err != nil {
-		return nil, fmt.Errorf("parse %s: %w", path, err)
+		return nil, "", fmt.Errorf("parse %s: %w", path, err)
 	}
-	return &m, nil
+	first, _, _ := strings.Cut(string(b), "\n")
+	source, _ := strings.CutPrefix(first, derpMapSourcePrefix)
+	if source == first {
+		source = ""
+	}
+	return &m, source, nil
 }
 
-// writeDERPMapFile writes m atomically. It reports whether the file changed.
-func writeDERPMapFile(path string, m *tailcfg.DERPMap) (bool, error) {
-	b, err := marshalDERPMapYAML(m)
+// writeDERPMapFile writes m from source atomically. It reports whether the
+// file changed.
+func writeDERPMapFile(path string, m *tailcfg.DERPMap, source string) (bool, error) {
+	b, err := marshalDERPMapYAML(m, source)
 	if err != nil {
 		return false, err
 	}
@@ -168,6 +222,10 @@ func writeDERPMapFile(path string, m *tailcfg.DERPMap) (bool, error) {
 		tmp.Close()
 		return false, err
 	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return false, err
+	}
 	if err := tmp.Chmod(0o644); err != nil {
 		tmp.Close()
 		return false, err
@@ -178,23 +236,42 @@ func writeDERPMapFile(path string, m *tailcfg.DERPMap) (bool, error) {
 	return true, os.Rename(tmp.Name(), path)
 }
 
+// removeDERPMapTemps removes temporary files a crash left behind.
+func removeDERPMapTemps(dir string) {
+	left, _ := filepath.Glob(filepath.Join(dir, ".derpmap-*.yaml"))
+	for _, f := range left {
+		_ = os.Remove(f)
+	}
+}
+
 // prepareDERPMap makes sure derpmap.yaml exists before Headscale starts. It
 // never fails for lack of internet. It reports whether the file holds a
 // freshly fetched map, so the caller knows how soon to fetch again.
 func prepareDERPMap(ctx context.Context, path string) (fresh bool, err error) {
-	src := derpMapSource()
-	if src == "" {
-		_, err := writeDERPMapFile(path, &tailcfg.DERPMap{Regions: map[int]*tailcfg.DERPRegion{}})
+	removeDERPMapTemps(filepath.Dir(path))
+	src, err := derpMapSource()
+	if err != nil {
 		return false, err
+	}
+	empty := &tailcfg.DERPMap{Regions: map[int]*tailcfg.DERPRegion{}}
+	if src == "" {
+		_, err := writeDERPMapFile(path, empty, derpMapSourceOff)
+		return false, err
+	}
+	if strings.HasPrefix(src, "http://") {
+		log.Printf("JuiceMount Link: WARNING: the DERP map comes from plain http (%s); anyone on that path can add relays (JM_NET_DERP_MAP_ALLOW_HTTP=1)", src)
 	}
 	fctx, cancel := context.WithTimeout(ctx, derpMapFetchTimeout)
 	m, fetchErr := fetchDERPMap(fctx, src)
 	cancel()
 	if fetchErr == nil {
-		_, err := writeDERPMapFile(path, m)
+		_, err := writeDERPMapFile(path, m, src)
 		return err == nil, err
 	}
-	if cached, err := readDERPMapFile(path); err == nil && len(cached.Regions) > 0 {
+	// A saved copy counts only if it came from this same URL: after a
+	// switch between the public map and a self-hosted one, the old copy
+	// would list the relays the operator turned away from.
+	if cached, from, err := readDERPMapFile(path); err == nil && from == src && len(cached.Regions) > 0 {
 		log.Printf("JuiceMount Link: DERP map fetch failed (%v); using the copy from the last fetch", fetchErr)
 		return false, nil
 	}
@@ -204,14 +281,14 @@ func prepareDERPMap(ctx context.Context, path string) (fresh bool, err error) {
 			return false, fmt.Errorf("built-in DERP map: %w", err)
 		}
 		log.Printf("JuiceMount Link: DERP map fetch failed (%v); using the built-in copy of the public map", fetchErr)
-		_, err = writeDERPMapFile(path, snap)
+		_, err = writeDERPMapFile(path, snap, derpMapSourceBuiltin)
 		return false, err
 	}
-	// A custom map with no copy yet: Headscale still starts if config.yaml
-	// lists other relays; otherwise it reports an empty DERP map and the
-	// supervisor retries, with this fetch, until the URL answers.
-	log.Printf("JuiceMount Link: DERP map fetch from %s failed (%v) and no copy exists yet", src, fetchErr)
-	_, err = writeDERPMapFile(path, &tailcfg.DERPMap{Regions: map[int]*tailcfg.DERPRegion{}})
+	// A custom map with no copy from it yet: Headscale still starts if
+	// config.yaml lists other relays; otherwise it reports an empty DERP
+	// map and the supervisor retries, with this fetch, until the URL answers.
+	log.Printf("JuiceMount Link: DERP map fetch from %s failed (%v) and no copy from it exists yet", src, fetchErr)
+	_, err = writeDERPMapFile(path, empty, src)
 	return false, err
 }
 
@@ -219,8 +296,8 @@ func prepareDERPMap(ctx context.Context, path string) (fresh bool, err error) {
 // derpMapRetryInterval while the last fetch failed, every
 // derpMapRefreshEvery after one worked.
 func refreshDERPMap(stop <-chan struct{}, path string, fresh bool, retry, every time.Duration) {
-	src := derpMapSource()
-	if src == "" {
+	src, err := derpMapSource()
+	if err != nil || src == "" {
 		return
 	}
 	for {
@@ -243,7 +320,7 @@ func refreshDERPMap(stop <-chan struct{}, path string, fresh bool, retry, every 
 			fresh = false
 			continue
 		}
-		changed, err := writeDERPMapFile(path, m)
+		changed, err := writeDERPMapFile(path, m, src)
 		if err != nil {
 			log.Printf("JuiceMount Link: write DERP map: %v", err)
 			continue
@@ -281,4 +358,61 @@ func migrateDERPConfig(cfg, mapPath string) (string, bool) {
 // derp.paths. Without it, the operator chose their own DERP sources.
 func derpPathsConfigured(cfg, mapPath string) bool {
 	return hasExactConfigLine(cfg, "- "+mapPath)
+}
+
+// headscaleDERPConfig is the part of config.yaml that names DERP sources.
+type headscaleDERPConfig struct {
+	DERP struct {
+		Server struct {
+			Enabled bool `yaml:"enabled"`
+		} `yaml:"server"`
+		URLs  []string `yaml:"urls"`
+		Paths []string `yaml:"paths"`
+	} `yaml:"derp"`
+}
+
+func parseHeadscaleDERPConfig(cfg string) (headscaleDERPConfig, error) {
+	var c headscaleDERPConfig
+	err := yaml.Unmarshal([]byte(cfg), &c)
+	return c, err
+}
+
+// otherDERPSource reports whether Headscale has a DERP source besides the
+// Manager's map file: another derp.paths entry, a derp.urls entry, its
+// embedded DERP server, or the same through HEADSCALE_DERP_* variables.
+func otherDERPSource(cfg, mapPath string) bool {
+	for _, k := range []string{"HEADSCALE_DERP_PATHS", "HEADSCALE_DERP_URLS"} {
+		if strings.TrimSpace(os.Getenv(k)) != "" {
+			return true
+		}
+	}
+	if strings.EqualFold(strings.TrimSpace(os.Getenv("HEADSCALE_DERP_SERVER_ENABLED")), "true") {
+		return true
+	}
+	c, err := parseHeadscaleDERPConfig(cfg)
+	if err != nil {
+		return false
+	}
+	if c.DERP.Server.Enabled || len(c.DERP.URLs) > 0 {
+		return true
+	}
+	for _, p := range c.DERP.Paths {
+		if p != mapPath {
+			return true
+		}
+	}
+	return false
+}
+
+// checkDERPOff refuses JM_NET_DERP_MAP_URL=off when nothing else gives
+// Headscale a relay: Headscale would exit "initial DERPMap is empty" and
+// restart forever with no hint why.
+func checkDERPOff(cfg, mapPath string) error {
+	if src, err := derpMapSource(); err != nil || src != "" {
+		return err
+	}
+	if otherDERPSource(cfg, mapPath) {
+		return nil
+	}
+	return errors.New("JM_NET_DERP_MAP_URL=off but no other DERP map is configured: add your relay's map file under derp.paths in config.yaml (or HEADSCALE_DERP_PATHS), or unset JM_NET_DERP_MAP_URL to use the public relays")
 }

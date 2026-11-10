@@ -203,7 +203,7 @@ func localDERPMap(t *testing.T, dir, listen string) *tailcfg.DERPMap {
 // (derpmap.go), so every integration test proves the real Headscale reads it.
 func writeDERPMapYAML(t *testing.T, path string, m *tailcfg.DERPMap) {
 	t.Helper()
-	if _, err := writeDERPMapFile(path, m); err != nil {
+	if _, err := writeDERPMapFile(path, m, "integration test"); err != nil {
 		t.Fatal(err)
 	}
 }

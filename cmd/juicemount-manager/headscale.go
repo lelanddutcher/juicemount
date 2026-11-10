@@ -226,17 +226,43 @@ func migratePersistedDERPConfig(cfgPath string) error {
 	}
 	cfg, changed := migrateDERPConfig(string(raw), derpMapPath())
 	if !changed {
+		if c, err := parseHeadscaleDERPConfig(cfg); err == nil && len(c.DERP.URLs) > 0 &&
+			!derpPathsConfigured(cfg, derpMapPath()) {
+			log.Printf("JuiceMount Link: %s lists derp.urls %v: Headscale will not start without internet while it must fetch them. Add \"- %s\" under derp.paths (and remove the URLs) to use the Manager's local copy of the map", cfgPath, c.DERP.URLs, derpMapPath())
+		}
 		return nil
 	}
-	tmp := cfgPath + ".new"
-	if err := os.WriteFile(tmp, []byte(cfg), 0o600); err != nil {
+	if err := writeFileSynced(cfgPath+".new", []byte(cfg), 0o600); err != nil {
 		return err
 	}
-	if err := os.Rename(tmp, cfgPath); err != nil {
+	if err := os.Rename(cfgPath+".new", cfgPath); err != nil {
 		return err
 	}
 	log.Printf("JuiceMount Link: %s now reads the DERP map from %s instead of fetching it at start", cfgPath, derpMapPath())
 	return nil
+}
+
+// writeFileSynced writes b to path with mode perm (set explicitly, whatever
+// the umask) and flushes it to disk, so a rename after it never exposes an
+// empty file after a power cut.
+func writeFileSynced(path string, b []byte, perm os.FileMode) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(b); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Chmod(perm); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	return f.Close()
 }
 
 // headscaleServeEnv returns the extra environment for `headscale serve`.
@@ -336,6 +362,9 @@ func (h *headscaleSupervisor) runOnce(stop <-chan struct{}, ready func(string)) 
 	defer close(derpStop)
 	if raw, err := os.ReadFile(cfg); err == nil && derpPathsConfigured(string(raw), derpMapPath()) {
 		mapPath := derpMapPath()
+		if err := checkDERPOff(string(raw), mapPath); err != nil {
+			return err
+		}
 		fresh, err := prepareDERPMap(context.Background(), mapPath)
 		if err != nil {
 			return fmt.Errorf("prepare DERP map: %w", err)
