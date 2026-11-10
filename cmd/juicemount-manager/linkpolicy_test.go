@@ -8,6 +8,8 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/lelanddutcher/juicemount/internal/manager"
 )
 
 func TestParseNASServices(t *testing.T) {
@@ -106,8 +108,10 @@ func TestLinkPolicyAllowsOnlyServicePorts(t *testing.T) {
 }
 
 // TestLinkComposeOverlayMatchesCodeDefaults: the opt-in overlay publishes
-// exactly the listener and WireGuard port the code uses, and the base
-// compose keeps Link off without claiming either host port.
+// the listener the code uses, runs the NAS node in its own host-network
+// container with the code's socket, state directory and WireGuard port (and
+// publishes no UDP port for it), and the base compose keeps Link off without
+// claiming either host port.
 func TestLinkComposeOverlayMatchesCodeDefaults(t *testing.T) {
 	overlay, err := os.ReadFile("../../server/docker-compose.link.yml")
 	if err != nil {
@@ -117,15 +121,23 @@ func TestLinkComposeOverlayMatchesCodeDefaults(t *testing.T) {
 	udp := strconv.Itoa(defaultNASUDPPort)
 	for _, want := range []string{
 		`- "30193:` + hsPort + `"`,
-		`- "${JM_NET_NAS_UDP_PORT:-` + udp + `}:${JM_NET_NAS_UDP_PORT:-` + udp + `}/udp"`,
 		`JM_NET_NAS_UDP_PORT: "${JM_NET_NAS_UDP_PORT:-` + udp + `}"`,
 		`JM_NET_HEADSCALE: "on"`,
-		`JM_NET_NAS_NODE: "on"`,
+		`JM_NET_NAS_NODE: "` + manager.NASNodeInContainer + `"`,
 		`JM_NET_SERVER_URL: "${JM_NET_SERVER_URL:?`,
+		`network_mode: host`,
+		`entrypoint: ["/usr/local/bin/juicemount-manager", "--link-node"]`,
+		`juicemount-link-run:` + defaultLinkNodeDir,
+		`juicemount-link-state:` + defaultLinkNodeStateDir,
+		`- ALL`,
+		`read_only: true`,
 	} {
 		if !strings.Contains(string(overlay), want) {
 			t.Errorf("docker-compose.link.yml lacks %s", want)
 		}
+	}
+	if strings.Contains(string(overlay), "/udp") || strings.Contains(string(overlay), "cap_add") {
+		t.Error("docker-compose.link.yml publishes a UDP port or adds a capability")
 	}
 	base, err := os.ReadFile("../../server/docker-compose.yml")
 	if err != nil {

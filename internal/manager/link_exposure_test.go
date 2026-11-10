@@ -256,7 +256,7 @@ func TestLinkStatusWithoutEmbeddedNASNode(t *testing.T) {
 	}
 	t.Setenv("JM_NET_NAS_ROUTE", "")
 	t.Setenv("JM_NET_NAS_EXPOSURE", "services")
-	if got := linkStatusFor(t); got.RouteReady || !strings.Contains(got.Error, "JM_NET_NAS_NODE=on") {
+	if got := linkStatusFor(t); got.RouteReady || !strings.Contains(got.Error, "JM_NET_NAS_NODE=container") {
 		t.Fatalf("service exposure without the NAS node: status = %+v", got)
 	}
 	t.Setenv("JM_NET_NAS_NODE", "on")
@@ -416,5 +416,27 @@ func TestRouteApproveTargetsNASNodeByKey(t *testing.T) {
 	write("routes.txt", header+"2 | juicemount-nas |  | 192.0.2.0/24 | \n")
 	if _, got := post("?id=1"); got["ok"] != false {
 		t.Fatalf("?id=1 (not advertising, no row) approved: %v", got)
+	}
+}
+
+// The NAS node in its own container belongs to this Manager as much as the
+// in-process one: exposure defaults, the policy and status apply to both.
+func TestNASNodeEmbeddedPlacements(t *testing.T) {
+	for _, tc := range []struct {
+		headscale, node string
+		want            bool
+	}{
+		{"on", NASNodeInManager, true},
+		{"on", NASNodeInContainer, true},
+		{"on", "off", false},
+		{"on", "", false},
+		{"on", "yes", false},
+		{"off", NASNodeInContainer, false},
+	} {
+		t.Setenv("JM_NET_HEADSCALE", tc.headscale)
+		t.Setenv("JM_NET_NAS_NODE", tc.node)
+		if got := NASNodeEmbedded(); got != tc.want {
+			t.Errorf("JM_NET_HEADSCALE=%s JM_NET_NAS_NODE=%s: NASNodeEmbedded = %v, want %v", tc.headscale, tc.node, got, tc.want)
+		}
 	}
 }

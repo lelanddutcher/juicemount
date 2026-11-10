@@ -124,9 +124,30 @@ const (
 // does not change once the node's own state exists.
 const linkExposureFile = "nas-exposure"
 
-// NASNodeEmbedded reports whether this Manager runs the NAS tailnet node.
+// NAS node placements (JM_NET_NAS_NODE).
+const (
+	// NASNodeInManager runs the NAS node inside the Manager's process, on
+	// the Manager's container network.
+	NASNodeInManager = "on"
+	// NASNodeInContainer runs the NAS node in its own container
+	// (juicemount-manager --link-node, host networking). The Manager mints
+	// its keys, tags it and reports its state over a Unix socket.
+	NASNodeInContainer = "container"
+)
+
+// NASNodeEmbedded reports whether this Manager manages the NAS tailnet node:
+// it runs it in-process (JM_NET_NAS_NODE=on) or serves the separate node
+// container (JM_NET_NAS_NODE=container). Either way the node, its keys, its
+// tags and its exposure belong to this Manager's Headscale.
 func NASNodeEmbedded() bool {
-	return os.Getenv("JM_NET_HEADSCALE") == "on" && os.Getenv("JM_NET_NAS_NODE") == "on"
+	if os.Getenv("JM_NET_HEADSCALE") != "on" {
+		return false
+	}
+	switch os.Getenv("JM_NET_NAS_NODE") {
+	case NASNodeInManager, NASNodeInContainer:
+		return true
+	}
+	return false
 }
 
 // LinkExposure resolves the NAS node's exposure and, for subnet exposure,
@@ -364,7 +385,7 @@ func (a *API) handleLinkStatus(w http.ResponseWriter, r *http.Request) {
 		// applies a policy to it (LinkPolicyManaged), as before Link
 		// exposure existed.
 	case !NASNodeEmbedded() && exposure == LinkExposureServices:
-		routeErr(errors.New("Link service exposure is served by the embedded NAS node: set JM_NET_NAS_NODE=on"))
+		routeErr(errors.New("Link service exposure is served by the NAS node: set JM_NET_NAS_NODE=container (or on)"))
 	case !NASNodeEmbedded():
 		// The operator's own subnet router carries JM_NET_NAS_ROUTE. The
 		// Manager approves nothing for it, so the route is ready when the
@@ -767,6 +788,74 @@ type HSNode struct {
 	ApprovedRoutes  []string `json:"approved_routes"`
 	Tags            []string `json:"tags"`
 	Online          bool     `json:"online"`
+	// PreAuthKey is the pre-auth key the node registered with, if any.
+	PreAuthKey *HSPreAuthKey `json:"pre_auth_key,omitempty"`
+}
+
+// HSPreAuthKey is a pre-auth key as the control server lists it (the key
+// itself masked).
+type HSPreAuthKey struct {
+	ID   uint64 `json:"id"`
+	Used bool   `json:"used"`
+}
+
+// LookupNode returns the control server's record of the node with nodeKey,
+// or nil when there is none.
+func LookupNode(ctx context.Context, bin, config, nodeKey string) (*HSNode, error) {
+	nodes, err := listHSNodes(ctx, bin, config)
+	if err != nil {
+		return nil, err
+	}
+	return nodeByKey(nodes, nodeKey), nil
+}
+
+// MintPreauthKeyID mints one pre-auth key for the Link user, as
+// MintPreauthKey does, and also returns its ID on the control server.
+func MintPreauthKeyID(bin, config string, reusable bool, tags []string) (string, uint64, error) {
+	userID, err := HeadscaleUserID(bin, config, LinkUserName())
+	if err != nil {
+		return "", 0, err
+	}
+	args := append([]string{"--config", config, "-o", "json"}, PreauthKeyArgs(userID, reusable, tags)...)
+	args = append(args, "--expiration", "1h")
+	out, err := hsOutput(context.Background(), false, bin, args...)
+	if err != nil {
+		return "", 0, fmt.Errorf("preauthkeys create: %v", err)
+	}
+	var created struct {
+		ID  uint64 `json:"id"`
+		Key string `json:"key"`
+	}
+	if err := json.Unmarshal(out, &created); err != nil || created.Key == "" || created.ID == 0 {
+		return "", 0, fmt.Errorf("headscale returned no pre-auth key")
+	}
+	return created.Key, created.ID, nil
+}
+
+// ExpireUnusedPreauthKey expires the pre-auth key with id unless a node
+// registered with it (or it is gone). A used key stays as it is.
+func ExpireUnusedPreauthKey(bin, config string, id uint64) error {
+	out, err := hsOutput(context.Background(), false, bin, "--config", config, "preauthkeys", "list", "-o", "json")
+	if err != nil {
+		return fmt.Errorf("preauthkeys list: %v", err)
+	}
+	var keys []HSPreAuthKey
+	if err := json.Unmarshal(out, &keys); err != nil {
+		return fmt.Errorf("preauthkeys list: %w", err)
+	}
+	for _, k := range keys {
+		if k.ID != id {
+			continue
+		}
+		if k.Used {
+			return nil
+		}
+		if out, err := hsOutput(context.Background(), true, bin, "--config", config, "preauthkeys", "expire", "--id", strconv.FormatUint(id, 10), "--force"); err != nil {
+			return fmt.Errorf("preauthkeys expire %d: %v: %s", id, err, strings.TrimSpace(string(out)))
+		}
+		return nil
+	}
+	return nil
 }
 
 // The NAS node is found by its node key: the WireGuard public key the

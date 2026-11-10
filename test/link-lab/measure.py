@@ -13,7 +13,9 @@ Mac node with a fresh pairing code, then measures:
   bench     Redis PING round trip and pipelined rate, object GET and PUT
             through the NAS node's service ports; relay CPU meanwhile
   recovery  time until a Redis PING answers again after the home router
-            restarts, then after the Manager (Headscale + NAS node) restarts
+            restarts, then after the Manager restarts (Headscale, and the
+            NAS node in bridge mode), then, in host mode, after the node
+            container restarts
 
 wan-down-boot runs a sequence instead (run_wan_down_boot): home internet
 down, Manager restart, the Mac at home connects, the Mac away cannot,
@@ -84,6 +86,33 @@ def recover(case, site, service):
     return out
 
 
+NODE_API_PATHS = ["/link-node/v1/identity", "/link-node/v1/key", "/link-node/v1/config",
+                  "/link-node/v1/ensure-tags", "/link-node/v1/approve-route",
+                  "/link-node/v1/conflicts", "/link-node/v1/status", "/link-node/",
+                  "/x/../link-node/v1/identity", "/%6cink-node/v1/identity"]
+
+
+def node_api_from_mac(site):
+    """From the Mac, through Link, call every path of the node container's
+    control API on the NAS node's tailnet port 30190. Each must be a 404:
+    the node relays only the Manager's own API."""
+    st = json.loads(lab("exec", f"{site}-mac", "tailscale", "--socket=/run/tailscale/tailscaled.sock",
+                        "status", "--json").stdout)
+    ips = [p["TailscaleIPs"][0] for p in (st.get("Peer") or {}).values()
+           if p.get("HostName") == "juicemount-nas" and p.get("TailscaleIPs")]
+    if not ips:
+        return {"error": "the Mac does not see the NAS node"}
+    codes = {}
+    for path in NODE_API_PATHS:
+        for m in ("GET", "POST"):
+            r = lab("exec", f"{site}-mac", "curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
+                    "--path-as-is", "--max-time", "20", "--socks5-hostname", "127.0.0.1:1055",
+                    "-X", m, "-H", "Content-Type: application/json", "-d", '{"node_key":"x"}',
+                    f"http://{ips[0]}:30190{path}", check=False, timeout=60)
+            codes[f"{m} {path}"] = r.stdout.strip() or "none"
+    return {"nas": ips[0], "codes": codes, "all_404": all(c == "404" for c in codes.values())}
+
+
 def run_case(name, a):
     if name == "wan-down-boot":
         return run_wan_down_boot(name, a)
@@ -103,6 +132,8 @@ def run_case(name, a):
     p = lab_json("probe", site, "path", timeout=120)
     res["path_probe"] = p
     res["path"] = p.get("path")
+    if site == "away" and res["config"].get("nas_net") == "host":
+        res["node_api_from_mac"] = node_api_from_mac(site)
     u0, t0 = relay_cpu_usec(), time.monotonic()
     b = lab_json("probe", site, "bench", "--put-mib", str(a.put_mib), timeout=900)
     u1, t1 = relay_cpu_usec(), time.monotonic()
@@ -111,8 +142,13 @@ def run_case(name, a):
     res["bench"] = b
     if a.recovery:
         res["recovery"] = [recover(name, site, "home-router"), recover(name, site, "manager")]
+        if res["config"].get("nas_net") == "host":
+            res["recovery"].append(recover(name, site, "link-node"))
     lab("exec", f"{site}-mac", "/lab/lib/mac.sh", "stop", check=False)
     broken = "error" in b or any("error" in r for r in res.get("recovery", []))
+    api = res.get("node_api_from_mac")
+    if api is not None and not api.get("all_404"):
+        broken = True
     if broken:
         res["outcome"] = "broken"
     elif expect == "fail":
@@ -147,6 +183,8 @@ def run_wan_down_boot(name, a):
     try:
         t0 = time.monotonic()
         lab("restart", "manager")
+        if res["config"].get("nas_net") == "host":
+            lab("restart", "link-node")
         w = lab("wait-link", check=False, timeout=200)
         steps["link_ready"] = w.returncode == 0
         steps["link_ready_ms"] = round((time.monotonic() - t0) * 1000) if w.returncode == 0 else None
@@ -164,15 +202,18 @@ def run_wan_down_boot(name, a):
     # without internet, the away Mac connects while the home has no internet
     # (the uplink switch did not work), or the away Mac does not connect once
     # it is back. The home Mac's result is reported. Without a relay it
-    # connects only if the NAS node advertises an address the LAN can reach;
-    # in bridge mode the NAS node knows only its container address.
+    # connects only if the NAS node advertises an address the LAN can reach:
+    # in bridge mode the NAS node knows only its container address; the node
+    # container (host) has the NAS's LAN address, so there it must connect.
     ok = (steps["link_ready"]
           and "error" in steps["away_while_down"]
           and "error" not in c)
+    host = res["config"].get("nas_net") == "host"
     if not ok:
         res["outcome"] = "broken"
     elif "error" in steps["home_while_down"]:
-        res["outcome"] = "expected; home Mac: no LAN path without a relay"
+        res["outcome"] = ("unexpected; home Mac: no LAN path" if host
+                          else "expected; home Mac: no LAN path without a relay")
     else:
         res["outcome"] = "expected"
     return res
@@ -188,8 +229,8 @@ def scoreboard(run, results):
              "Times in seconds. Throughput in Mbit/s through the tunnel to the NAS node's ports "
              "(GET: 64 MiB object store read toward the Mac; PUT: upload). Relay CPU: the relay "
              "container's CPU during the bench, % of one core.", "",
-             "| Case | Site | NAT home / away | Forward ctrl / UDP | Expect | Path | Outcome | Control | First PING | Direct at | Redis PING ms | GET | PUT | Relay CPU | Router restart → PING | Node restart → PING |",
-             "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
+             "| Case | Site | NAS node | NAT home / away | Forward ctrl / UDP | Expect | Path | Outcome | Control | First PING | Direct at | Redis PING ms | GET | PUT | Relay CPU | Router restart → PING | Manager restart → PING | Node container restart → PING |",
+             "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
     for r in results:
         c = r.get("config", {})
         cn = r.get("connect", {})
@@ -198,8 +239,6 @@ def scoreboard(run, results):
         nat = f"{c.get('home_nat', '?')} / {c.get('away_nat', '?')}"
         if c.get("cgnat", "off") != "off":
             nat += f" + CGNAT ({c['cgnat']})"
-        if c.get("nas_net") == "host":
-            nat += ", NAS on LAN"
         if c.get("portmap") == "on":
             nat += ", NAT-PMP"
         if c.get("site") == "home":
@@ -214,19 +253,20 @@ def scoreboard(run, results):
             return f"{fmt_s(x['ms'])} ({x.get('path_after', '?')})"
 
         lines.append("| " + " | ".join([
-            r["case"], c.get("site", "?"), nat, f"{c.get('fwd_ctrl')} / {c.get('fwd_udp')}",
+            r["case"], c.get("site", "?"),
+            {"host": "own container, host network", "bridge": "in Manager, bridge"}.get(c.get("nas_net"), "?"), nat, f"{c.get('fwd_ctrl')} / {c.get('fwd_udp')}",
             c.get("expect", "?"), r.get("path", "?"), r.get("outcome", "?"),
             fmt_s(cn.get("control_ms")), fmt_s(cn.get("first_ping_ms")), fmt_s(cn.get("direct_ms")),
             str(b.get("redis_ping_ms", {}).get("median", "–")),
             str(b.get("s3_get", {}).get("mbit_s", "–")), str(b.get("s3_put", {}).get("mbit_s", "–")),
             "–" if "relay_cpu_pct" not in b else f"{b['relay_cpu_pct']}%",
-            rc("home-router"), rc("manager")]) + " |")
+            rc("home-router"), rc("manager"), rc("link-node")]) + " |")
     for r in results:
         s = r.get("wan_down_boot")
         if not s:
             continue
         hd, ad, au = s.get("home_while_down", {}), s.get("away_while_down", {}), s.get("away_after_up", {})
-        lines += ["", f"`{r['case']}`: home internet down while the Manager restarts, then back.", "",
+        lines += ["", f"`{r['case']}`: home internet down while the Manager (and the node container) restart, then back.", "",
                   "| Step | Result |", "|---|---|",
                   f"| Link ready after Manager restart, internet down | "
                   + ("yes, " + fmt_s(s.get("link_ready_ms")) + " s" if s.get("link_ready") else "no") + " |",
@@ -238,6 +278,16 @@ def scoreboard(run, results):
                   "| Mac away connects after the internet returns | "
                   + (f"yes: first PING {fmt_s(au.get('first_ping_ms'))} s after its start, path {au.get('path_probe', {}).get('path', '?')}"
                      if "error" not in au else f"no: {au['error']}") + " |"]
+    apis = [(r["case"], r["node_api_from_mac"]) for r in results if "node_api_from_mac" in r]
+    if apis:
+        lines += ["", "Node control API (`/link-node/v1/*`, "
+                  f"{len(NODE_API_PATHS) * 2} GET/POST calls) from the away Mac through Link to the NAS node's port 30190:", ""]
+        for n, x in apis:
+            if "error" in x:
+                lines.append(f"- `{n}`: {x['error']}")
+            else:
+                other = {k: v for k, v in x["codes"].items() if v != "404"}
+                lines.append(f"- `{n}`: " + ("every call 404" if x["all_404"] else f"NOT refused: {other}"))
     errs = [(r["case"], r.get("connect", {}).get("error") or r.get("error")) for r in results
             if r.get("connect", {}).get("error") or r.get("error")]
     if errs:

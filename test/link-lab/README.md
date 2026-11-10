@@ -11,9 +11,12 @@ internet. It changes nothing outside its own containers.
 - **Control server**: the server that tells nodes about each other. Link uses
   Headscale (an open-source Tailscale control server), which the Manager runs
   as a child process. It carries no file data.
-- **NAS node**: the Link member inside the Manager. Macs reach the NAS's
-  Redis proxy (port 30179), object store (30151) and Manager (30190) through
-  it.
+- **NAS node**: the Link member that Macs reach the NAS's Redis proxy (port
+  30179), object store (30151) and Manager (30190) through. It runs in its
+  own container (`link-node`) on the NAS host's network, as
+  `server/docker-compose.link.yml` runs it. A case can run it inside the
+  Manager instead, behind the NAS's Docker NAT (the layout before; `bridge`
+  in `cases.tsv`).
 - **NAT**: what a router does so many devices share one public address. It
   rewrites each outgoing connection's address and port (a **mapping**).
   - **Easy NAT** keeps one mapping per device port, whatever the
@@ -46,8 +49,9 @@ network is internal: no container reaches the real internet.
 | Part | Networks | What it is |
 |---|---|---|
 | `redis`, `respproxy`, `silo` | nas | The NAS stack, as in `test/remote-lab`: Redis with the server's config and ACL, the RESP proxy built from this checkout, the SILO object store (also named `minio`). |
-| `manager` | nas (+ home) | The Manager built from this checkout, with Link on as `server/docker-compose.link.yml` turns it on: Headscale v0.29.3 with its own TLS, the NAS node, the Manager's ACL policy, pairing through `POST /api/net/pair`. |
-| `nas-host` | nas, home | The NAS's own Docker NAT: what Docker does for the Manager's published ports (30193 to 8091, 41641/udp). Its home address is "the NAS's LAN address". |
+| `manager` | nas | The Manager built from this checkout, with Link on as `server/docker-compose.link.yml` turns it on: Headscale v0.29.3 with its own TLS, the Manager's ACL policy, pairing through `POST /api/net/pair`, the NAS node's sockets (or, in `bridge` cases, the NAS node itself). |
+| `link-node` | nas-host's | The NAS node container: the same image, started as `juicemount-manager --link-node`, in `nas-host`'s network namespace (host networking on a real NAS). No capabilities, read-only root, its identity in its own volume, the Manager reached through the sockets in the volume `link-run`. Stopped in `bridge` cases. `lab.sh up` fails if the NAS host then listens on TCP anywhere but loopback (`lab.sh listeners`), so no peer API reaches the LAN. |
+| `nas-host` | nas, home | The NAS host. Its home address is "the NAS's LAN address". It does what Docker does for the published ports: DNAT from the LAN (30193 to the Manager's 8091; 41641/udp to the Manager in `bridge` cases) and a listener on 127.0.0.1 for 30193, 30190, 30179 and 30151 (as docker-proxy does), which `link-node` uses. Its hosts file, which `link-node` shares, points `link.lab.example` at 127.0.0.1. |
 | `home-router` | home, homeup | The home router: NAT, port forwards, hairpin, a LAN resolver with an optional local DNS entry, optional NAT-PMP. |
 | `home-mac` | home | A Mac at home: the stock Tailscale client (v1.102.3, the version the app uses) on Linux. |
 | `wan` | homeup, awayup, core | The emulated internet. It routes between the sites and shapes both access links with the remote lab's profiles (`../remote-lab/profiles.tsv`, `../remote-lab/lib/shape.sh`). |
@@ -74,7 +78,8 @@ loopback proxies reach it through its node.
   firewall change.
 - The routers, the wan, the relay and the Mac stand-ins get `NET_ADMIN` for
   their own network namespaces only. The Manager gets none: `lab.sh` sets its
-  route from a throwaway helper in its namespace.
+  route from a throwaway helper in its namespace. The NAS node container
+  gets no capabilities at all.
 - The first `tc` use loads the kernel's `sch_netem` and `sch_htb` modules if
   they are not loaded already, as in the remote lab. The routers use
   nf_tables iptables, which Docker already uses.
@@ -96,9 +101,15 @@ Mac node with a fresh pairing code, then measures.
 | `home-hairpin` | Mac at home; the router does hairpin NAT. | direct |
 | `home-local-dns` | Mac at home; no hairpin; a local DNS entry for the control name. | direct |
 | `home-no-hairpin` | Mac at home; no hairpin, no local DNS entry. | no connection |
-| `portmap-bridge` | Hard NAT both ends, no forward, the router answers NAT-PMP; the NAS node behind the NAS's Docker NAT (today's setup). | relay |
-| `portmap-host` | The same, with the NAS node directly on the home LAN (host networking). | direct |
-| `wan-down-boot` | A sequence. The home's internet link goes down and the Manager restarts, as when the NAS boots after a power cut before the router has internet. Link must become ready, and the Mac away must not connect. Then the internet comes back and the Mac away must connect. The Mac at home (local DNS entry) tries to connect while the internet is down; its result is reported (see Limits). | direct |
+| `portmap-bridge` | Hard NAT both ends, no forward, the router answers NAT-PMP; the NAS node inside the Manager, behind the NAS's Docker NAT (the layout before the node container). | relay |
+| `portmap-host` | The same, with the NAS node container on the home LAN. | direct |
+| `wan-down-boot` | A sequence. The home's internet link goes down and the Manager and the node container restart, as when the NAS boots after a power cut before the router has internet. Link must become ready, and the Mac away must not connect. Then the internet comes back and the Mac away must connect. The Mac at home (local DNS entry) connects while the internet is down; with the node container it must (its outcome says so if not). | direct |
+
+Every case but `portmap-bridge` runs the NAS node container. Changing
+between the two layouts recreates the Manager; the node container is stopped
+first, because both hold the same identity. In the node container's cases
+`lab.sh case` restarts it, so no port mapping carries over from the previous
+case.
 
 The control port (TCP 30193) is forwarded in every case: without it a Mac
 away from home cannot reach the control server at all.
@@ -115,7 +126,13 @@ away from home cannot reach the control server at all.
 | GET, PUT | Object store throughput through Link: a 64 MiB read toward the Mac, a 16 MiB write. |
 | Relay CPU | The relay container's CPU while the bench runs, in % of one core. |
 | Router restart → PING | Restart the home router (its NAT mappings are lost), then time until a Redis PING through Link answers again. The path after it is in brackets. |
-| Node restart → PING | The same after the Manager restarts (Headscale and the NAS node). |
+| Manager restart → PING | The same after the Manager restarts (Headscale; in `bridge` cases also the NAS node). |
+| Node container restart → PING | The same after the NAS node container restarts. |
+
+In every away case with the node container, the Mac also calls each path of
+the node's control API (`/link-node/v1/*`, GET and POST, plus `..` and
+percent-encoded variants) on the NAS node's tailnet port 30190. Each must
+answer 404; anything else marks the case broken.
 
 Each run writes `results/<run id>/`: one JSON file per case, `results.json`,
 `run.json` (commit, versions, profile, errors) and `scoreboard.md`.
@@ -149,8 +166,8 @@ To explore by hand:
 ./lab.sh down
 ```
 
-The CI job (`.github/workflows/link-lab.yml`) runs `direct-forward` and
-`hard-nat-relay`. It fails only when the lab breaks: the lab does not come
+The CI job (`.github/workflows/link-lab.yml`) runs `direct-forward`,
+`hard-nat-relay`, `portmap-host` and `wan-down-boot`. It fails only when the lab breaks: the lab does not come
 up, or a case that should connect does not. A different path or a slow
 number never fails it. The scoreboard is in the job summary and the JSON is
 the `link-lab-results` artifact.
@@ -181,15 +198,23 @@ not prove how real networks behave.
   store through Link, not a JuiceFS client mounted through it. The remote
   lab (`test/remote-lab`) measures JuiceFS over a link.
 
-- **No relay, Mac at home.** In `wan-down-boot` the Mac at home registers
-  with the control server but cannot reach the NAS node while the home has
-  no internet. The NAS node sits behind the NAS's Docker NAT and advertises
-  only its container address (`10.232.11.10:41641`), which the LAN cannot
-  reach. With a relay, the two nodes swap addresses through it; without
-  one, they cannot. Advertising the NAS's LAN address and UDP port as an
-  extra endpoint fixes it: with `TS_DEBUG_PRETENDPOINT=10.232.10.5:41641`
-  on the Manager (lab only, a Tailscale debug setting) the Mac at home
-  connected directly 17 s after its start.
+- **Hole punching with Linux's NAT.** `hole-punch` (easy NAT at both ends,
+  no forward) ends on the relay, with the node container as before. The
+  likely cause, not yet confirmed from the routers' connection tables, is
+  the race described under "Easy NAT is Linux's NAT". Moving the node out of
+  Docker's NAT removes one NAT, not that race.
+- **Port mapping after a restart.** In `portmap-host` the path is direct
+  through the NAT-PMP mapping, but after a restart of the home router, the
+  Manager or the node container the probe finds the relay path, as it did
+  before the node container. The lab's NAT-PMP responder forgets its
+  mappings when the router restarts, and the node does not ask again within
+  the probe's wait.
+- **Before the node container, Mac at home.** With the NAS node inside the
+  Manager (`bridge`), the Mac at home in `wan-down-boot` could not reach it
+  while the home had no internet: the node advertised only its container
+  address, which the LAN cannot reach, and without a relay the two nodes
+  cannot swap addresses. The node container advertises the NAS's LAN
+  address.
 
 ### Not in the lab yet
 
@@ -207,10 +232,12 @@ not prove how real networks behave.
 The lab runs the Manager as `server/docker-compose.link.yml` does, with
 these differences:
 
-- `JM_NET_NAS_CONTROL_URL=https://link.lab.example:8091` and a hosts entry
-  for that name, so the NAS node reaches its own control server under the
-  certificate's name without hairpin NAT. This is one of the documented ways
-  to run Headscale's own TLS.
+- The node container dials the public control URL; `nas-host`'s hosts file
+  points that name at 127.0.0.1, its published port (the overlay's
+  `extra_hosts` advice for Headscale's own TLS). In `bridge` cases the
+  in-Manager node uses `JM_NET_NAS_CONTROL_URL=https://link.lab.example:8091`
+  and a hosts entry for that name, so it reaches its own control server
+  under the certificate's name without hairpin NAT.
 - `JM_NET_DERP_MAP_URL` points at the lab DERP map (`lib/derp/derpmap.json`),
   which the relay serves across the WAN. The Manager fetches it as it fetches
   Tailscale's public map by default, and keeps a copy for Headscale. The

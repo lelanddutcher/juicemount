@@ -456,8 +456,9 @@ services:
       # 0.5 uses a user-owned system private route for remote clients.
       # JuiceMount Link (embedded Headscale + NAS tailnet node) is opt-in:
       # apply server/docker-compose.link.yml on top of this file, which turns
-      # both on and publishes their ports (30193/tcp control, 41641/udp
-      # WireGuard). This file publishes neither while Link is off.
+      # both on, publishes 30193/tcp (control) and adds the NAS node's own
+      # container (host networking, WireGuard on UDP 41641). This file
+      # publishes and binds neither while Link is off.
       JM_NET_HEADSCALE: "off"
       JM_NET_ALLOW_INSECURE: "0"
       JM_NET_ALLOW_LAN_ONLY: "0"
@@ -484,7 +485,7 @@ services:
       JM_SMART_FOLDERS_QUERIES_ROOT: "${JM_SMART_FOLDERS_QUERIES_ROOT:-Queries}"
     ports:
       - "30190:8080"                              # manager UI
-      # Link's 30193/tcp and 41641/udp: server/docker-compose.link.yml
+      # Link's 30193/tcp (and its node's UDP 41641): server/docker-compose.link.yml
     volumes:
       # Mount your existing-data datasets here, read-only. Each gets
       # browsed as /sources/<name> in the UI. Add as many lines as you

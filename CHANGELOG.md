@@ -83,6 +83,87 @@
   stops with an error that says so.
 - If you go back to an older Manager after this one, it keeps
   `derpmap.yaml` as last written and never updates it.
+- The NAS node now runs in its own container, `juicemount-link`, with host
+  networking. The NAS node is the Link member that Macs reach the NAS
+  through. Before, it ran inside the Manager's container, behind Docker's
+  NAT and then the router's NAT. There it could not ask the router for a
+  port (NAT-PMP, UPnP, PCP), usually had no IPv6, and told other nodes only
+  its container address. Result: a Mac at home could not reach it while the
+  internet (and so the relay) was down, and paths from away fell back to the
+  relay more often. Now it sits on the NAS's LAN: it maps a port on a router
+  that allows it, uses IPv6, and tells other nodes the NAS's LAN address.
+  The Manager, Headscale and every other service stay on the bridge network.
+- The node container gets only what it needs: no Linux capabilities, a
+  read-only root, userspace networking (no TUN device), its identity in its
+  own volume (`juicemount-link-state`). It reaches the Redis proxy and the
+  object store at the ports this host publishes on 127.0.0.1 (30179, 30151),
+  and Headscale at 127.0.0.1:30193. It reaches the Manager only through two
+  Unix sockets in the volume `juicemount-link-run`, which only the Manager
+  and the node container mount. On the control socket the Manager mints the
+  node's keys, tags it, approves its route, keeps a copy of its identity and
+  reports its state in `GET /api/net/link`. Only the node uses it: nothing a
+  Mac sends over Link reaches it. The Manager acts there only on the NAS
+  node's own node key (the one in its copy of the identity, or a node with
+  the NAS node's name that registered with a key it minted), and keeps at
+  most one unused key outstanding. A posted identity must be a valid tsnet
+  state file of that node. Requests to the Manager's port 30190 over Link
+  go through the relay socket, which serves only the Manager's own API, so
+  the Manager still sees each Mac's own tailnet address. The node restarts
+  after a failure with the same backoff as before (1 s, doubling to 60 s).
+- The Manager image is built without Tailscale's peer API server
+  (`ts_omit_peerapiserver`). In userspace networking it listened on every
+  host address; with host networking that would be the NAS's LAN. Link does
+  not use it.
+- `server/docker-compose.link.yml` sets `JM_NET_NAS_NODE=container` and adds
+  the `juicemount-link` service. It no longer publishes UDP 41641: the node
+  binds `JM_NET_NAS_UDP_PORT` (default 41641) on the host itself. If another
+  program (for example a Tailscale install on the NAS) holds that port, the
+  node uses a random port, and a router forward to 41641 then does not reach
+  it: set `JM_NET_NAS_UDP_PORT` to a free port and forward that one.
+  `JM_NET_NAS_NODE=on` still runs the node inside the Manager.
+- The NAS node no longer sends logs to Tailscale's log server
+  (`TS_NO_LOGS_NO_SUPPORT` on the node container and, in the overlay, on the
+  Manager).
+- With Headscale's own TLS (`JM_NET_TLS_CERT`), the node dials
+  `JM_NET_SERVER_URL`, which needs hairpin NAT or a local DNS entry, as
+  before. To avoid both, set `JM_NET_NAS_CONTROL_URL` to that URL and add
+  `extra_hosts: ["<public-name>:127.0.0.1"]` to `juicemount-link`.
+- In the Link lab (`test/link-lab`), with the node container: a Mac at home
+  connects directly while the home has no internet; a Mac away connects
+  directly through NAT-PMP port mapping with hard NAT at both ends.
+  Details in the lab README.
+
+### Upgrading to the Link node container
+
+- An install with Link on moves to the new layout without pairing any Mac
+  again. Update the overlay file with the rest of the release and run
+  `docker compose -f server/docker-compose.yml -f server/docker-compose.link.yml up -d`
+  (on a setup-made install, copy the new overlay into
+  `<data>/compose/overlays/` and run `<data>/compose/jm-compose up -d`; on
+  TrueNAS, render with `config` and paste). On its first start the node
+  container takes the NAS node's identity (`/data/headscale/nas-node/tailscaled.state`)
+  from the Manager over the socket. The node keeps its node key and tailnet
+  address. The Manager keeps a copy, and the node container sends it the
+  identity again whenever it changes, so the copy stays current also on an
+  install that started with the node container.
+- To go back: put back the previous overlay (or set `JM_NET_NAS_NODE=on`,
+  publish `${JM_NET_NAS_UDP_PORT:-41641}:${JM_NET_NAS_UDP_PORT:-41641}/udp`
+  on the Manager again and remove `juicemount-link`), stop `juicemount-link`
+  first, then recreate the Manager. The Manager's node starts from its copy
+  of the identity, so it is the same node. The volumes
+  `juicemount-link-state` and `juicemount-link-run` can stay.
+- Never run both: they hold the same identity. A Manager with
+  `JM_NET_NAS_NODE=on` that still shares `juicemount-link-run` with a node
+  container tells it to stop its node, and does not start its own node
+  while that container still calls it (`GET /api/net/link` says why). With
+  the previous overlay (no shared volume), the Manager waits up to 2 minutes
+  50 seconds after the node container's last report, unless it stopped
+  cleanly. That wait needs this release or later: an older Manager image
+  does not check, so with an older image always stop and remove
+  `juicemount-link` first. A node container that has not reached the Manager for 2 minutes
+  stops its node. `docker compose up` with the previous overlay leaves the
+  container running: remove it (`docker compose rm -sf juicemount-link`
+  before switching, or `up -d --remove-orphans`).
 
 ## 0.5.1 — 2026-11-07 (build 38)
 

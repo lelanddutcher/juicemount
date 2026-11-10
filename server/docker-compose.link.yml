@@ -1,9 +1,9 @@
 # JuiceMount Link opt-in overlay: built-in remote access without a VPN app.
 #
-# The base server/docker-compose.yml keeps Link OFF and publishes neither of
-# its ports, so a NAS that does not use Link never has host ports 30193 or
-# 41641 claimed (a host Tailscale install usually owns UDP 41641). Apply this
-# file on top of it to turn Link on:
+# The base server/docker-compose.yml keeps Link OFF and publishes none of its
+# ports, so a NAS that does not use Link never has host port 30193 claimed or
+# UDP 41641 bound (a host Tailscale install usually owns UDP 41641). Apply
+# this file on top of it to turn Link on:
 #
 #   docker compose -f server/docker-compose.yml -f server/docker-compose.link.yml up -d
 #
@@ -15,24 +15,56 @@
 #     host 30193. JM_NET_SERVER_URL is the address Macs use to reach it, e.g.
 #     https://<public-name>:30193 (a TLS-terminating proxy in front of 30193,
 #     or JM_NET_TLS_CERT/JM_NET_TLS_KEY for Headscale's own TLS).
-#   - the NAS tailnet node, which joins over the in-container address (no
-#     router hairpin NAT). With JM_NET_NAS_EXPOSURE=services (a new install's
-#     default) it serves only the JuiceMount ports on its tailnet address:
-#     30179 -> respproxy:6379, 30151 -> minio:9000, 30190 -> Manager. A Mac
-#     dials the same port it uses on the LAN; nothing else on the LAN is
-#     reachable through Link. Mac apps older than this, and remote farm
-#     nodes, need JM_NET_NAS_EXPOSURE=subnet (an existing install's default):
-#     the node advertises JM_NET_NAS_ROUTE (default 192.168.0.0/24) instead.
-#   - its WireGuard UDP port, published 1:1 so peers can reach it directly
-#     instead of through a relay. Forward this UDP port on the router for a
-#     direct path from outside the LAN.
 #   - an ACL policy (/data/headscale/policy.hujson, regenerated each start):
-#     tag:jm-mac and tag:jm-farm nodes may reach those ports on tag:jm-nas,
-#     and in subnet exposure the same ports inside the route (on
+#     tag:jm-mac and tag:jm-farm nodes may reach the JuiceMount ports on
+#     tag:jm-nas, and in subnet exposure the same ports inside the route (on
 #     JM_NET_NAS_LAN_ADDR only, when set to the NAS's LAN address), only.
 #
-# CHANGELOG.md (JuiceMount Link) says how the exposure default is chosen and
-# how to switch.
+# The NAS node: the Link member Macs reach the NAS through. It runs in its own
+# container, juicemount-link (JM_NET_NAS_NODE=container), with host
+# networking, so it sits on the NAS's LAN instead of behind Docker's NAT:
+#   - it asks the router for a port (NAT-PMP, UPnP, PCP) when the router
+#     allows it, uses IPv6 when the NAS has it, and tells peers the NAS's own
+#     LAN address. A Mac at home then reaches it directly, even while the
+#     internet is down, and Macs away from home get direct paths more often.
+#   - its WireGuard port is JM_NET_NAS_UDP_PORT (default 41641) on the host.
+#     Nothing is published for it. Forward this UDP port on the router when
+#     the router does no port mapping.
+#   - with JM_NET_NAS_EXPOSURE=services (a new install's default) it serves
+#     only the JuiceMount ports on its tailnet address: 30179 (Redis proxy) and
+#     30151 (object store), forwarded to the same ports published on this
+#     host's 127.0.0.1, and 30190 (Manager), passed to the Manager over its
+#     relay socket. A Mac dials the same port it uses on the LAN; nothing else on the
+#     LAN is reachable through Link. Mac apps older than 0.5.1, and remote farm
+#     nodes, need JM_NET_NAS_EXPOSURE=subnet (an existing install's default):
+#     the node advertises JM_NET_NAS_ROUTE (default 192.168.0.0/24) instead.
+#   - it has no Linux capabilities and a read-only root. It runs in userspace
+#     networking mode (no TUN device, no NET_ADMIN). It joins no other
+#     container's network. It opens no TCP port on the host: the image is
+#     built without Tailscale's peer API, which would otherwise listen on
+#     every host address.
+#   - it talks to the Manager only through two Unix sockets in the volume
+#     juicemount-link-run, which only these two containers mount. On
+#     control.sock the Manager mints the node's keys (one outstanding at a
+#     time), tags it, approves its route, keeps a copy of its identity and
+#     reports its state in GET /api/net/link; it acts only on the NAS node's
+#     own node key. relay.sock carries only the Manager's API for Macs
+#     (tailnet port 30190); nothing a Mac sends reaches control.sock. Its
+#     identity is in the volume juicemount-link-state.
+#   - never run it beside JM_NET_NAS_NODE=on: both would hold the NAS node's
+#     identity. A Manager with JM_NET_NAS_NODE=on tells a node container it
+#     still reaches to stop, and does not start its own node while one may
+#     still run; a node container that has not reached the Manager for 2
+#     minutes stops its node.
+#   - it dials Headscale at http://127.0.0.1:30193. With Headscale's own TLS
+#     it dials JM_NET_SERVER_URL instead, which needs hairpin NAT or a local
+#     DNS entry on the router, unless you set JM_NET_NAS_CONTROL_URL to that
+#     URL and add `extra_hosts: ["<public-name>:127.0.0.1"]` to
+#     juicemount-link.
+#
+# CHANGELOG.md (JuiceMount Link) says how the exposure default is chosen, how
+# an existing Link install moves to this layout without pairing Macs again,
+# and how to go back.
 #
 # Relays (DERP): when no direct path forms, Link relays through Tailscale's
 # public relays. The Manager keeps their map in /data/headscale/derpmap.yaml
@@ -46,15 +78,56 @@ services:
   juicemount-manager:
     environment:
       JM_NET_HEADSCALE: "on"
-      JM_NET_NAS_NODE: "on"
+      JM_NET_NAS_NODE: "container"
       JM_NET_SERVER_URL: "${JM_NET_SERVER_URL:?set JM_NET_SERVER_URL to the https URL Macs use to reach this NAS on port 30193}"
-      JM_NET_NAS_UDP_PORT: "${JM_NET_NAS_UDP_PORT:-41641}"
       JM_NET_NAS_EXPOSURE: "${JM_NET_NAS_EXPOSURE:-}"
       JM_NET_NAS_ROUTE: "${JM_NET_NAS_ROUTE:-}"
       JM_NET_NAS_LAN_ADDR: "${JM_NET_NAS_LAN_ADDR:-}"
       JM_NET_TLS_CERT: "${JM_NET_TLS_CERT:-}"
       JM_NET_TLS_KEY: "${JM_NET_TLS_KEY:-}"
       JM_NET_DERP_MAP_URL: "${JM_NET_DERP_MAP_URL:-}"
+      # No logs to Tailscale's log server, also when JM_NET_NAS_NODE=on runs
+      # the node in the Manager.
+      TS_NO_LOGS_NO_SUPPORT: "true"
     ports:
       - "30193:8091"                                                    # Headscale control server
-      - "${JM_NET_NAS_UDP_PORT:-41641}:${JM_NET_NAS_UDP_PORT:-41641}/udp" # NAS node WireGuard
+    volumes:
+      - juicemount-link-run:/run/juicemount-link
+
+  # The NAS node alone: the Manager image, started as `juicemount-manager
+  # --link-node`.
+  juicemount-link:
+    image: ghcr.io/lelanddutcher/juicemount-manager@${JM_MANAGER_DIGEST:?set JM_MANAGER_DIGEST to the release sha256 digest}
+    pull_policy: always
+    restart: unless-stopped
+    network_mode: host
+    depends_on:
+      juicemount-manager:
+        condition: service_started
+    entrypoint: ["/usr/local/bin/juicemount-manager", "--link-node"]
+    environment:
+      JM_NET_NAS_UDP_PORT: "${JM_NET_NAS_UDP_PORT:-41641}"
+      JM_NET_NAS_CONTROL_URL: "${JM_NET_NAS_CONTROL_URL:-}"
+      TS_NO_LOGS_NO_SUPPORT: "true"
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/juicemount-manager", "--link-node-health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 120s
+      retries: 3
+    volumes:
+      - juicemount-link-run:/run/juicemount-link
+      # The NAS node's identity. Removing it makes the node register again as
+      # a new node (Macs need no new pairing, but its tailnet address changes).
+      - juicemount-link-state:/var/lib/juicemount-link
+
+volumes:
+  juicemount-link-run: {}
+  juicemount-link-state: {}
