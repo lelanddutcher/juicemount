@@ -84,11 +84,21 @@ format_volume() {
     log "volume already formatted"
     return 0
   fi
-  local _
+  local _ enc=()
+  # JMLAB_ENCRYPT=1: an encrypted volume (aes256gcm-rsa) with a throwaway
+  # RSA key in .state, which the client sees at /lab/.state.
+  if [ "${JMLAB_ENCRYPT:-0}" = 1 ]; then
+    command -v openssl >/dev/null || die "JMLAB_ENCRYPT=1 needs openssl on this host"
+    [ -f "$STATE/encrypt.pem" ] || (umask 077 && openssl genrsa -out "$STATE/encrypt.pem" 2048 2>/dev/null) \
+      || die "openssl genrsa failed"
+    chmod 644 "$STATE/encrypt.pem" # read by the client container's root; .state itself is 700
+    enc=(--encrypt-rsa-key /lab/.state/encrypt.pem)
+    log "formatting an encrypted volume"
+  fi
   for _ in $(seq 30); do
     if dc exec -T -e ACCESS_KEY="$(env_get JMLAB_S3_USER)" -e SECRET_KEY="$(env_get JMLAB_S3_PASSWORD)" client \
          juicefs format --storage minio --bucket "http://$SILO_IP:9000/jmlab" --trash-days 0 \
-         --no-update "$META_URL" jmlab >/dev/null 2>"$STATE/format.err"; then
+         "${enc[@]}" --no-update "$META_URL" jmlab >/dev/null 2>"$STATE/format.err"; then
       log "volume formatted"
       return 0
     fi

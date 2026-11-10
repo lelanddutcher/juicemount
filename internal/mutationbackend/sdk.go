@@ -189,6 +189,7 @@ func OpenSDK(ctx context.Context, j *mutationauthority.Journal, volume string, c
 	}
 	cconf := chunk.Config{CacheDir: "memory", CacheSize: 0, Writeback: false,
 		BlockSize: format.BlockSize * 1024, Compress: format.Compression, HashPrefix: format.HashPrefix,
+		Encrypted: format.EncryptKey != "",
 		MaxUpload: 4, MaxRetries: 1, BufferSize: 64 << 20,
 		GetTimeout: 10 * time.Second, PutTimeout: 10 * time.Second,
 		UploadLimit: format.UploadLimit * 1_000_000 / 8, DownloadLimit: format.DownloadLimit * 1_000_000 / 8}

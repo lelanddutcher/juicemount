@@ -1,0 +1,94 @@
+--- a/cmd/mount.go
++++ b/cmd/mount.go
+@@ -351,6 +351,7 @@
+ 		BlockSize:  format.BlockSize * 1024,
+ 		Compress:   format.Compression,
+ 		HashPrefix: format.HashPrefix,
++		Encrypted:  format.EncryptKey != "",
+ 
+ 		GetTimeout:    utils.Duration(c.String("get-timeout")),
+ 		PutTimeout:    utils.Duration(c.String("put-timeout")),
+--- a/cmd/object.go
++++ b/cmd/object.go
+@@ -435,6 +435,7 @@
+ 		BlockSize:  format.BlockSize * 1024,
+ 		Compress:   format.Compression,
+ 		HashPrefix: format.HashPrefix,
++		Encrypted:  format.EncryptKey != "",
+ 		GetTimeout: time.Minute,
+ 		PutTimeout: time.Minute,
+ 		MaxUpload:  50,
+--- a/pkg/chunk/cached_store.go
++++ b/pkg/chunk/cached_store.go
+@@ -151,7 +151,12 @@
+ 	s.store.cacheMiss.Add(1)
+ 	s.store.cacheMissBytes.Add(float64(len(p)))
+ 
+-	if s.store.seekable && boff > 0 && len(p) <= blockSize/4 {
++	// A small read at the start of a block also takes the ranged path when
++	// the prefetcher can fill the rest of the block in the background, so
++	// the first byte does not wait for the whole block (JuiceMount). Not on
++	// an encrypted volume: its Get downloads and decrypts the whole object
++	// for any range, so the ranged read would download the block twice.
++	if s.store.seekable && len(p) <= blockSize/4 && (boff > 0 || !s.store.conf.Encrypted && s.store.fetcher != nil && s.store.fetcher.workers > 0) {
+ 		if s.store.downLimit != nil {
+ 			s.store.downLimit.Wait(int64(len(p)))
+ 		}
+@@ -588,6 +593,9 @@
+ 	BufferSize        uint64
+ 	Readahead         int
+ 	Prefetch          int
++	// Encrypted: the object store decrypts whole objects, so a ranged GET
++	// costs a whole-block download (JuiceMount).
++	Encrypted bool
+ }
+ 
+ func (c *Config) SelfCheck(uuid string) {
+@@ -846,15 +854,28 @@
+ 		if size == 0 || size > store.conf.BlockSize {
+ 			return
+ 		}
++		if _, ok := store.bcache.exist(key); ok {
++			return // another read already filled it
++		}
+ 		p := NewOffPage(size)
+ 		defer p.Release()
++		var cached bool
+ 		block, err := store.group.Execute(key, func() (*Page, error) { // dedup requests with full read
+ 			p.Acquire()
++			// A read may have cached the block since the check above.
++			if r, err := store.bcache.load(key); err == nil {
++				n, err := r.ReadAt(p.Data, 0)
++				_ = r.Close()
++				if err == nil && n == len(p.Data) {
++					cached = true
++					return p, nil
++				}
++			}
+ 			err := store.load(key, p, false, false) // delay writing cache until singleflight ends to prevent blocking waiters
+ 			return p, err
+ 		})
+ 		defer block.Release()
+-		if err == nil && block == p {
++		if err == nil && block == p && !cached {
+ 			store.bcache.cache(key, block, true, !store.conf.OSCache)
+ 		}
+ 	})
+--- a/pkg/chunk/prefetch.go
++++ b/pkg/chunk/prefetch.go
+@@ -23,6 +23,7 @@
+ 	pending chan string
+ 	busy    map[string]bool
+ 	op      func(key string)
++	workers int
+ }
+ 
+ func newPrefetcher(parallel int, fetch func(string)) *prefetcher {
+@@ -30,6 +31,7 @@
+ 		pending: make(chan string, 10),
+ 		busy:    make(map[string]bool),
+ 		op:      fetch,
++		workers: max(parallel, 0),
+ 	}
+ 	for i := 0; i < parallel; i++ {
+ 		go p.do()

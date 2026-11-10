@@ -435,6 +435,7 @@ func getDefaultChunkConf(format *meta.Format) *chunk.Config {
 		BlockSize:  format.BlockSize * 1024,
 		Compress:   format.Compression,
 		HashPrefix: format.HashPrefix,
+		Encrypted:  format.EncryptKey != "",
 		GetTimeout: time.Minute,
 		PutTimeout: time.Minute,
 		MaxUpload:  50,

@@ -351,6 +351,7 @@ func getChunkConf(c *cli.Context, format *meta.Format) *chunk.Config {
 		BlockSize:  format.BlockSize * 1024,
 		Compress:   format.Compression,
 		HashPrefix: format.HashPrefix,
+		Encrypted:  format.EncryptKey != "",
 
 		GetTimeout:    utils.Duration(c.String("get-timeout")),
 		PutTimeout:    utils.Duration(c.String("put-timeout")),
