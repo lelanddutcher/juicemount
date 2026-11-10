@@ -167,6 +167,7 @@ services:
       JM_NET_TLS_KEY: /lab-pki/link.lab.example.key
       JM_NET_NAS_CONTROL_URL: "https://link.lab.example:8091"
       JM_NET_DERP_MAP_URL: http://10.232.3.10:8088/derpmap.json
+      JM_NET_DERP_MAP_ALLOW_HTTP: "1"   # the lab map is plain http, on the lab network only
       SSL_CERT_FILE: /lab-pki/ca.crt
       TS_NO_LOGS_NO_SUPPORT: "true"
     extra_hosts:

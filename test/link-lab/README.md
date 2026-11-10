@@ -213,7 +213,8 @@ these differences:
   to run Headscale's own TLS.
 - `JM_NET_DERP_MAP_URL` points at the lab DERP map (`lib/derp/derpmap.json`),
   which the relay serves across the WAN. The Manager fetches it as it fetches
-  Tailscale's public map by default, and keeps a copy for Headscale. This
+  Tailscale's public map by default, and keeps a copy for Headscale. The
+  lab map is plain http, so the lab sets `JM_NET_DERP_MAP_ALLOW_HTTP=1`. This
   needs the Manager change that keeps the DERP map as a local file (PR #65
   or later); an older Manager ignores the setting and does not start Link
   here, because the lab has no internet.
