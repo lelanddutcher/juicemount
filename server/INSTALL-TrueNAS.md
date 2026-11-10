@@ -254,6 +254,52 @@ Re-running the setup command keeps Link on, because it always applies
 `overlays/`. To turn Link off, remove the file from `overlays/` and repeat
 step 3.
 
+### Faster downloads to remote Macs (TCP BBR)
+
+A Mac far from the server, on a link that loses some packets, downloads much
+faster when the server sends with BBR congestion control instead of the
+kernel default, cubic. Cubic slows down at every lost packet; BBR does not.
+On a LAN it makes no difference. It is off by default.
+
+The overlay `server/docker-compose.tcp-bbr.yml` asks Docker to set BBR
+inside the object store (`minio`) and the proxy (`respproxy`) containers.
+The host and the other containers keep cubic, and no host setting changes.
+
+**Check the kernel first.** On the host, one of these must succeed:
+
+- `modinfo tcp_bbr` (BBR is a kernel module; it does not need to be
+  loaded, because Docker loads it when it starts the containers), or
+- `grep -w bbr /proc/sys/net/ipv4/tcp_available_congestion_control`
+  (BBR is already loaded or built in).
+
+If neither succeeds, do not use the overlay: on a kernel without BBR,
+Docker refuses to start `minio` and `respproxy`, and the server is down.
+The setup command checks this and refuses such an overlay.
+
+On a setup-made install:
+
+1. Copy `server/docker-compose.tcp-bbr.yml` from the same release into
+   `<data>/compose/overlays/`.
+2. Restart the two services: `sudo <data>/compose/jm-compose up -d --no-deps
+   minio respproxy`. This interrupts the Macs' open connections, so do it
+   when no Mac is reading or saving.
+3. Check: `sudo <data>/compose/jm-compose exec minio cat
+   /proc/sys/net/ipv4/tcp_congestion_control` prints `bbr`.
+
+Optional: to have the module loaded before Docker starts, add `modprobe
+tcp_bbr` as a **Pre Init** command in **System > Advanced > Init/Shutdown
+Scripts**. Docker loads it on demand, so this is not required.
+
+To turn it off, remove the file from `overlays/` and repeat step 2.
+
+Overlays apply to setup-made installs, through `jm-compose` only.
+`rollout-compose.sh` and `update-server.sh` do not apply them: after
+`rollout-compose.sh --cutover-proxy`, `--proxy-rollback` or
+`--proxy-restore`, the proxy sends with the kernel default again.
+
+It speeds up downloads to Macs (reads). Uploads (saves) are sent by the Mac,
+and macOS has no BBR.
+
 ## Connect a Mac
 
 1. Open the **Manager URL** in a browser and enter the **sign-in key**.

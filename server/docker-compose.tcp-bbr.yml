@@ -1,0 +1,43 @@
+# JuiceMount TCP BBR opt-in overlay: the object store (minio) and the RESP
+# proxy (respproxy) send with BBR congestion control instead of the kernel
+# default (cubic). BBR keeps a download fast on a distant link that loses
+# some packets, where cubic slows down at every loss. It changes nothing on a
+# LAN.
+#
+# The setting is per network namespace: Docker writes it inside each of the
+# two containers when it starts them. The host and every other container
+# keep their own algorithm. The host's sysctls are not changed.
+#
+# Use it only on a kernel that has BBR. Check on the host:
+#
+#   modinfo tcp_bbr      succeeds (BBR is a module), or
+#   grep -w bbr /proc/sys/net/ipv4/tcp_available_congestion_control
+#                        prints a line (BBR is loaded or built in).
+#
+# The module does not need to be loaded: Docker loads it when it starts the
+# container. But on a kernel without BBR at all, Docker refuses to start
+# minio and respproxy ("failed to write sysctl net.ipv4.tcp_congestion_control").
+# juicemount-setup refuses an overlay like this one on such a kernel.
+#
+# Turn it on (a setup-made install; see server/INSTALL-TrueNAS.md):
+#   copy this file into <data>/compose/overlays/, then
+#   <data>/compose/jm-compose up -d --no-deps minio respproxy
+# Turn it off: remove the file from overlays/ and run the same command.
+# Overlays apply to setup-made installs, through jm-compose only.
+# rollout-compose.sh and update-server.sh do not apply them: after
+# rollout-compose.sh --cutover-proxy, --proxy-rollback or --proxy-restore,
+# respproxy sends with the kernel default again.
+# Either way, minio and respproxy restart, which interrupts every Mac's open
+# connections. Do it when no Mac is reading or saving.
+#
+# Uploads from a Mac are sent by the Mac. macOS has no BBR, so this file
+# speeds up downloads to Macs (reads), not uploads (saves).
+
+services:
+  minio:
+    sysctls:
+      net.ipv4.tcp_congestion_control: bbr
+
+  respproxy:
+    sysctls:
+      net.ipv4.tcp_congestion_control: bbr

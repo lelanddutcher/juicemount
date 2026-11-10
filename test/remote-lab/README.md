@@ -146,6 +146,15 @@ when the lab is set up (`./lab.sh up` or `./measure.py`). The lab then
 formats the volume with a throwaway RSA key in `.state/encrypt.pem`, which
 `./lab.sh down` deletes with the rest of `.state`.
 
+## Server BBR
+
+`./measure.py --bbr` (or `JMLAB_BBR=1 ./lab.sh up`) sets the lab up with
+`compose.bbr.yml`, the lab copy of the server's opt-in overlay
+`server/docker-compose.tcp-bbr.yml`: the object store and the RESP proxy
+send with BBR, set by Docker in their own network namespaces. The client
+keeps the host's default. `./lab.sh cc` prints what each one uses, and
+`run.json` records it. The host kernel needs BBR (`modinfo tcp_bbr`).
+
 ## Addresses
 
 The lab uses `10.231.10.0/24` (nas) and `10.231.20.0/24` (remote). If those

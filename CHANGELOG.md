@@ -16,6 +16,14 @@
 
 - The Manager image ships the same JuiceFS build (`-jm4`). The Manager still
   accepts `-jm3` or later.
+- New opt-in file `server/docker-compose.tcp-bbr.yml`: the object store and
+  the Redis proxy send with TCP BBR instead of cubic. Downloads to a Mac on a
+  distant link that loses packets become much faster. Nothing changes on a
+  LAN, for uploads from a Mac (macOS has no BBR), or for the host's own
+  settings. Use it only on a kernel that has BBR (`modinfo tcp_bbr`
+  succeeds): on a kernel without it, Docker refuses to start the object
+  store and the proxy. The setup command refuses the file on such a kernel.
+  See "Faster downloads to remote Macs" in `server/INSTALL-TrueNAS.md`.
 
 ## 0.5.1 — 2026-11-07 (build 38)
 

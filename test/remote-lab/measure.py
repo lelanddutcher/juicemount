@@ -232,6 +232,9 @@ def scoreboard(recs, meta):
                      f"{l['ping']['loss_pct']}% | {udp} | {l['tcp_down_1stream_mbit']} Mbit/s |")
     head = (f"# Remote lab scoreboard\n\nRun {meta['run_id']}, commit {meta['commit'][:12]}, "
             f"fixture `{meta['fixture']}`, juicefs `{meta['juicefs']}`.\n")
+    cc = meta.get("congestion_control")
+    if cc:
+        head += "TCP congestion control: " + ", ".join(f"{k} {v}" for k, v in cc.items()) + ".\n"
     return "\n".join([head, "## Links (checked before measuring)", "", *links, "",
                       "## Operations", "", *rows, ""])
 
@@ -249,7 +252,11 @@ def main():
     ap.add_argument("--write-budget", type=float, default=90)
     ap.add_argument("--no-up", action="store_true", help="the lab is already up")
     ap.add_argument("--keep", action="store_true", help="leave the lab running")
+    ap.add_argument("--bbr", action="store_true",
+                    help="the server sends with BBR (server/docker-compose.tcp-bbr.yml; applied at lab up)")
     a = ap.parse_args()
+    if a.bbr:
+        os.environ["JMLAB_BBR"] = "1"
 
     allp = profiles()
     names = [n.strip() for n in a.profiles.split(",") if n.strip()]
@@ -269,6 +276,7 @@ def main():
             print("== lab up", file=sys.stderr, flush=True)
             lab("up", timeout=1800)
         meta["juicefs"] = in_client("juicefs", "--version").strip()
+        meta["congestion_control"] = dict(l.split() for l in lab("cc").splitlines() if l.strip())
         lab("shape", "lan")
         lab("mount")
         print(f"== seed ({a.fixture}) on lan", file=sys.stderr, flush=True)
