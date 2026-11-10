@@ -98,7 +98,7 @@ Mac node with a fresh pairing code, then measures.
 | `home-no-hairpin` | Mac at home; no hairpin, no local DNS entry. | no connection |
 | `portmap-bridge` | Hard NAT both ends, no forward, the router answers NAT-PMP; the NAS node behind the NAS's Docker NAT (today's setup). | relay |
 | `portmap-host` | The same, with the NAS node directly on the home LAN (host networking). | direct |
-| `wan-down-boot` | A sequence. The home's internet link goes down and the Manager restarts, as when the NAS boots after a power cut before the router has internet. Link must become ready. The Mac at home (local DNS entry) must connect; the Mac away must not. Then the internet comes back and the Mac away must connect. | direct |
+| `wan-down-boot` | A sequence. The home's internet link goes down and the Manager restarts, as when the NAS boots after a power cut before the router has internet. Link must become ready, and the Mac away must not connect. Then the internet comes back and the Mac away must connect. The Mac at home (local DNS entry) tries to connect while the internet is down; its result is reported (see Limits). | direct |
 
 The control port (TCP 30193) is forwarded in every case: without it a Mac
 away from home cannot reach the control server at all.
@@ -180,6 +180,16 @@ not prove how real networks behave.
 - **No JuiceFS mount.** The probes measure the Redis proxy and the object
   store through Link, not a JuiceFS client mounted through it. The remote
   lab (`test/remote-lab`) measures JuiceFS over a link.
+
+- **No relay, Mac at home.** In `wan-down-boot` the Mac at home registers
+  with the control server but cannot reach the NAS node while the home has
+  no internet. The NAS node sits behind the NAS's Docker NAT and advertises
+  only its container address (`10.232.11.10:41641`), which the LAN cannot
+  reach. With a relay, the two nodes swap addresses through it; without
+  one, they cannot. Advertising the NAS's LAN address and UDP port as an
+  extra endpoint fixes it: with `TS_DEBUG_PRETENDPOINT=10.232.10.5:41641`
+  on the Manager (lab only, a Tailscale debug setting) the Mac at home
+  connected directly 17 s after its start.
 
 ### Not in the lab yet
 

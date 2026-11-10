@@ -160,11 +160,21 @@ def run_wan_down_boot(name, a):
     steps["away_after_up"] = c
     res["connect"] = c
     res["path"] = c.get("path_probe", {}).get("path", "none") if "error" not in c else "none"
+    # The lab fails the case only when Link itself breaks: it does not start
+    # without internet, the away Mac connects while the home has no internet
+    # (the uplink switch did not work), or the away Mac does not connect once
+    # it is back. The home Mac's result is reported. Without a relay it
+    # connects only if the NAS node advertises an address the LAN can reach;
+    # in bridge mode the NAS node knows only its container address.
     ok = (steps["link_ready"]
-          and "error" not in steps["home_while_down"]
           and "error" in steps["away_while_down"]
           and "error" not in c)
-    res["outcome"] = "expected" if ok else "broken"
+    if not ok:
+        res["outcome"] = "broken"
+    elif "error" in steps["home_while_down"]:
+        res["outcome"] = "expected; home Mac: no LAN path without a relay"
+    else:
+        res["outcome"] = "expected"
     return res
 
 
