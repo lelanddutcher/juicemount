@@ -1,0 +1,65 @@
+name: link-lab
+
+# The Link lab (test/link-lab): the NAS stack with Link on, home and away
+# NAT routers, an emulated WAN, a relay and Mac stand-ins, all in private
+# Docker networks. This job runs two cases (a direct path through a port
+# forward, and hard NAT on both ends, which needs the relay) and uploads the
+# JSON. It fails only when the lab breaks (the lab does not come up, or a
+# case that should connect does not), never on the numbers or the path.
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'test/link-lab/**'
+      - 'test/remote-lab/lib/shape.sh'
+      - 'test/remote-lab/profiles.tsv'
+      - 'cmd/juicemount-manager/**'
+      - 'internal/manager/link*.go'
+      - 'internal/linkconfig/**'
+      - 'cmd/jm-respproxy/**'
+      - 'internal/respproxy/**'
+      - 'server/respproxy/**'
+      - 'server/docker-compose.link.yml'
+      - 'server/juicemount-manager/Dockerfile'
+      - 'go.mod'
+      - 'go.sum'
+      - '.github/workflows/link-lab.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: link-lab-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lab:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Traffic shaping is available
+        # tc in the wan container needs the netem and htb qdiscs (as in the
+        # remote lab). Load them up front so a missing module fails here.
+        run: |
+          sudo modprobe sch_netem && sudo modprobe sch_htb || {
+            sudo apt-get install -y -q "linux-modules-extra-$(uname -r)" && sudo modprobe sch_netem && sudo modprobe sch_htb; }
+      - name: Run direct-forward and hard-nat-relay
+        working-directory: test/link-lab
+        run: ./measure.py --cases direct-forward,hard-nat-relay --profile same-city --put-mib 8
+      - name: Scoreboard
+        if: always()
+        working-directory: test/link-lab
+        run: |
+          for f in results/*/scoreboard.md; do [ -f "$f" ] && cat "$f" >> "$GITHUB_STEP_SUMMARY"; done
+          for f in results/*/run.json; do [ -f "$f" ] && cat "$f"; done
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: link-lab-results
+          path: test/link-lab/results/
+          if-no-files-found: warn
+      - name: Tear down
+        if: always()
+        working-directory: test/link-lab
+        run: ./lab.sh down || true

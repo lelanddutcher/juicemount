@@ -1,0 +1,19 @@
+{
+  "Regions": {
+    "900": {
+      "RegionID": 900,
+      "RegionCode": "lab",
+      "RegionName": "Link lab relay",
+      "Nodes": [
+        {
+          "Name": "900a",
+          "RegionID": 900,
+          "HostName": "derp.lab.example",
+          "IPv4": "10.232.3.10",
+          "STUNPort": 3478,
+          "DERPPort": 443
+        }
+      ]
+    }
+  }
+}

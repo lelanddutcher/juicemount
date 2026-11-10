@@ -1,0 +1,30 @@
+# Link lab cases. One line per case, whitespace separated.
+#
+#   site       where the Mac stand-in is: away (behind away-router, across
+#              the wan) or home (on the home LAN with the NAS)
+#   home_nat   home router mapping: easy (endpoint-independent) | hard
+#              (endpoint-dependent, random port per destination)
+#   fwd_ctrl   home router forwards TCP 30193 (the control URL): on | off
+#   fwd_udp    home router forwards UDP 41641 (the NAS node): on | off
+#   hairpin    home router loops LAN -> public address back in: on | off
+#   split_dns  home router's resolver answers the control name with the
+#              NAS's LAN address (a "local DNS" entry): on | off
+#   away_nat   away router mapping: easy | hard
+#   cgnat      a carrier NAT behind the away router: off | easy | hard
+#   nas_net    bridge (today: the Manager behind the NAS's Docker NAT) |
+#              host (the NAS node directly on the home LAN)
+#   portmap    the home router answers NAT-PMP port-mapping requests: on | off
+#   expect     the path we expect: direct | derp | fail (no connection)
+#
+# name              site home_nat fwd_ctrl fwd_udp hairpin split_dns away_nat cgnat nas_net portmap expect
+direct-forward      away easy     on       on      off     off       easy     off   bridge  off     direct
+hole-punch          away easy     on       off     off     off       easy     off   bridge  off     direct
+hard-nat-relay      away hard     on       off     off     off       hard     off   bridge  off     derp
+forward-hard-away   away easy     on       on      off     off       hard     off   bridge  off     direct
+cgnat-away          away easy     on       off     off     off       easy     hard  bridge  off     derp
+cgnat-away-forward  away easy     on       on      off     off       easy     hard  bridge  off     direct
+home-hairpin        home easy     on       on      on      off       easy     off   bridge  off     direct
+home-local-dns      home easy     on       on      off     on        easy     off   bridge  off     direct
+home-no-hairpin     home easy     on       on      off     off       easy     off   bridge  off     fail
+portmap-bridge      away hard     on       off     off     off       hard     off   bridge  on      derp
+portmap-host        away hard     on       off     off     off       hard     off   host    on      direct
