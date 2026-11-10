@@ -1,0 +1,188 @@
+# JuiceMount remote lab. Start and stop it with lab.sh, not by hand: lab.sh
+# generates the throwaway secrets (.state/lab.env), builds the images, formats
+# the volume and mounts the client.
+#
+#   nas network      redis, respproxy, silo, iperf  (the "server" side)
+#   remote network   client                         (the "remote Mac" side)
+#   wan              the only path between the two; it shapes both
+#                    directions with tc (shape.sh)
+#
+# Nothing here publishes a port or touches a host interface. The wan and
+# client containers get NET_ADMIN for their OWN network namespaces only.
+name: ${JMLAB_PROJECT:-jmlab}
+
+x-lab-image: &lab-image
+  image: jmlab:local
+  build:
+    context: ../..
+    dockerfile: test/remote-lab/image/Dockerfile
+
+# Fixed addresses sit in the lower half of each subnet; Docker hands out the
+# dynamic ones (redis) from the upper half only, so they never collide.
+networks:
+  nas:
+    ipam:
+      config:
+        - subnet: ${JMLAB_NAS_SUBNET:-10.231.10.0/24}
+          ip_range: ${JMLAB_NAS_DYNAMIC:-10.231.10.128/25}
+  remote:
+    ipam:
+      config:
+        - subnet: ${JMLAB_REMOTE_SUBNET:-10.231.20.0/24}
+          ip_range: ${JMLAB_REMOTE_DYNAMIC:-10.231.20.128/25}
+
+services:
+  # JuiceFS metadata: the server's Redis 7.4 with the server's redis.conf and
+  # ACL template, rendered the way server/docker-compose.yml renders it.
+  redis:
+    image: redis:7.4-alpine@sha256:ff02b58f971e7d7d156a1267e283fcbbeee91773b6aa36c49dac28ecfe28eadf
+    environment:
+      JM_REDIS_PROXY_PASSWORD: ${JM_REDIS_PROXY_PASSWORD:?run lab.sh up}
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        umask 077
+        sha() { printf '%s' "$$1" | sha256sum | cut -d' ' -f1; }
+        mkdir -p /run/jm-redis
+        head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > /run/jm-redis/admin.pass
+        sed -e '/^[[:space:]]*#/d' -e '/^[[:space:]]*$$/d' \
+            -e "s/#@JM_REDIS_PROXY_PASSWORD_SHA256@/#$$(sha "$$JM_REDIS_PROXY_PASSWORD")/" \
+            -e "s/#@JM_ADMIN_LOOPBACK_SHA256@/#$$(sha "$$(cat /run/jm-redis/admin.pass)")/" \
+            /usr/local/etc/redis/redis.acl > /run/jm-redis/users.acl
+        chown -R redis:redis /run/jm-redis
+        unset JM_REDIS_PROXY_PASSWORD
+        exec docker-entrypoint.sh redis-server /usr/local/etc/redis/redis.conf --aclfile /run/jm-redis/users.acl
+    healthcheck:
+      test: ["CMD-SHELL", "REDISCLI_AUTH=\"$$(cat /run/jm-redis/admin.pass)\" redis-cli --no-auth-warning --user jm-admin ping | grep -qx PONG"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    volumes:
+      - ../../server/redis.conf:/usr/local/etc/redis/redis.conf:ro
+      - ../../server/redis.acl:/usr/local/etc/redis/redis.acl:ro
+    tmpfs:
+      - /data
+    networks:
+      nas: {}
+
+  # The RESP proxy, built from this checkout (cmd/jm-respproxy), so a change
+  # to the proxy is measured by the lab that tests it.
+  respproxy:
+    image: jmlab-respproxy:local
+    build:
+      context: ../..
+      dockerfile: server/respproxy/Dockerfile
+      args:
+        JM_VERSION: 0.0.0-lab
+        JM_COMMIT: ${JMLAB_COMMIT:?run lab.sh up}
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      JM_RESPPROXY_UPSTREAM: "redis:6379"
+      JM_RESPPROXY_UPSTREAM_PASSWORD: ${JM_REDIS_PROXY_PASSWORD}
+      JM_RESPPROXY_MODE: passthrough
+      JM_AUDIT: "off"
+      JM_PROXY_FARM_PASSWORD: ${JM_PROXY_FARM_PASSWORD:?run lab.sh up}
+      JM_PROXY_MANAGER_PASSWORD: ${JM_PROXY_MANAGER_PASSWORD:?run lab.sh up}
+      JM_PROXY_BG_PASSWORD: ${JM_PROXY_BG_PASSWORD:?run lab.sh up}
+      JM_PROXY_WEBDAV_PASSWORD: ${JM_PROXY_WEBDAV_PASSWORD:?run lab.sh up}
+      JM_PROXY_ADMIN_PASSWORD: ${JM_PROXY_ADMIN_PASSWORD:?run lab.sh up}
+    tmpfs:
+      - /etc/jm-respproxy
+    networks:
+      nas:
+        ipv4_address: ${JMLAB_PROXY_IP:-10.231.10.20}
+
+  # Object store: the same SILO image and digest as server/docker-compose.yml.
+  silo:
+    image: pgsty/silo:RELEASE.2026-09-16T00-00-00Z@sha256:635197cb9f36d01bee221d34d1c7d7960f6a95c48b0b6c01d99cd13bdae51a46
+    command: server /data
+    environment:
+      MINIO_ROOT_USER: ${JMLAB_S3_USER:?run lab.sh up}
+      MINIO_ROOT_PASSWORD: ${JMLAB_S3_PASSWORD:?run lab.sh up}
+      MINIO_BROWSER: "off"
+    volumes:
+      - silo-data:/data
+    networks:
+      nas:
+        ipv4_address: ${JMLAB_SILO_IP:-10.231.10.30}
+
+  # iperf3 server on the NAS side: the throughput probe that checks a
+  # profile before anything is measured.
+  iperf:
+    <<: *lab-image
+    command: ["iperf3", "-s"]
+    networks:
+      nas:
+        ipv4_address: ${JMLAB_IPERF_IP:-10.231.10.40}
+
+  # The emulated WAN: routes between the two networks and shapes both
+  # directions (lib/shape.sh). It masquerades remote traffic as its own nas
+  # address, so the NAS-side containers need no route back.
+  wan:
+    <<: *lab-image
+    init: true
+    cap_add: [NET_ADMIN]
+    sysctls:
+      net.ipv4.ip_forward: "1"
+    environment:
+      WAN_NAS_IP: ${JMLAB_WAN_NAS_IP:-10.231.10.2}
+      WAN_REMOTE_IP: ${JMLAB_WAN_REMOTE_IP:-10.231.20.2}
+      REMOTE_SUBNET: ${JMLAB_REMOTE_SUBNET:-10.231.20.0/24}
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        for dev in $$(ls /sys/class/net | grep -v '^lo$$'); do
+          ethtool -K "$$dev" tso off gso off gro off 2>/dev/null || true
+        done
+        iptables -t nat -A POSTROUTING -s "$$REMOTE_SUBNET" -j MASQUERADE
+        /lab/lib/shape.sh lan
+        touch /run/wan.ready
+        exec sleep infinity
+    healthcheck:
+      test: ["CMD", "test", "-f", "/run/wan.ready"]
+      interval: 1s
+      retries: 30
+    volumes:
+      - ./:/lab:ro
+    networks:
+      nas:
+        ipv4_address: ${JMLAB_WAN_NAS_IP:-10.231.10.2}
+      remote:
+        ipv4_address: ${JMLAB_WAN_REMOTE_IP:-10.231.20.2}
+
+  # The remote client: the vendored juicefs, mounted at /jfs through the
+  # wan, with its block cache in /var/jfscache. It reaches the NAS subnet
+  # only through the wan container.
+  client:
+    <<: *lab-image
+    # An init as PID 1 reaps the juicefs processes each remount leaves.
+    init: true
+    depends_on:
+      wan:
+        condition: service_healthy
+    cap_add: [NET_ADMIN, SYS_ADMIN]
+    devices:
+      - /dev/fuse
+    security_opt:
+      - apparmor:unconfined
+    environment:
+      NAS_SUBNET: ${JMLAB_NAS_SUBNET:-10.231.10.0/24}
+      WAN_REMOTE_IP: ${JMLAB_WAN_REMOTE_IP:-10.231.20.2}
+      META_PASSWORD: ${JM_PROXY_ADMIN_PASSWORD}
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        ethtool -K eth0 tso off gso off gro off 2>/dev/null || true
+        ip route replace "$$NAS_SUBNET" via "$$WAN_REMOTE_IP"
+        mkdir -p /jfs /var/jfscache
+        exec sleep infinity
+    volumes:
+      - ./:/lab:ro
+    networks:
+      remote:
+        ipv4_address: ${JMLAB_CLIENT_IP:-10.231.20.10}
+
+volumes:
+  silo-data: {}
