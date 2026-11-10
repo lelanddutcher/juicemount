@@ -15,6 +15,8 @@
 #   lab.sh uplink SITE up|down take a site's internet link down or bring it
 #                              back (SITE: home|away)
 #   lab.sh wait-link           wait until Link is ready on the Manager
+#   lab.sh listeners           check that the NAS host listens on TCP only
+#                              on loopback (no peer API on the LAN)
 #   lab.sh relay-cpu           the relay's CPU time so far, microseconds
 #   lab.sh exec SERVICE CMD... run a command in a lab container
 #   lab.sh status              containers, router rules, wan qdiscs
@@ -126,6 +128,21 @@ nas_net() {
     docker restart -t 2 "$(cid link-node)" >/dev/null
   fi
   wait_link
+}
+
+# The NAS host's TCP listeners must all be on loopback (the published-port
+# relays, Docker's DNS on 127.0.0.11): the node container, on the host network, must open nothing on the
+# LAN (no Tailscale peer API: the Manager is built with
+# ts_omit_peerapiserver). Fails the lab otherwise.
+check_host_listeners() {
+  local out bad
+  out="$(docker exec "$(cid nas-host)" ss -ltnH)"
+  bad="$(printf '%s\n' "$out" | awk '$4 !~ /^127\./ && $4 !~ /^\[::1\]:/ && NF' || true)"
+  if [ -n "$bad" ]; then
+    printf '%s\n' "$bad" >&2
+    die "the NAS host has TCP listeners beyond loopback (see above)"
+  fi
+  log "NAS host TCP listeners: loopback only"
 }
 
 # NAS-side containers send through routers that shape and drop: turn off
@@ -241,6 +258,7 @@ case "$cmd" in
     dc up -d --wait --quiet-pull $(dc config --services | grep -vx link-node) >&2
     manager_route
     nas_net host
+    check_host_listeners
     nas_offloads_off
     wait_link
     seed_s3
@@ -265,6 +283,7 @@ case "$cmd" in
     esac
     ;;
   wait-link) wait_link ;;
+  listeners) check_host_listeners ;;
   relay-cpu) docker exec "$(cid relay)" awk '$1 == "usage_usec" { print $2 }' /sys/fs/cgroup/cpu.stat ;;
   exec) [ $# -ge 2 ] || die "usage: lab.sh exec SERVICE CMD..."; s=$1; shift; docker exec "$(cid "$s")" "$@" ;;
   status)

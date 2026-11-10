@@ -16,6 +16,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -164,14 +165,13 @@ func TestLinkIntegrationNodeContainer(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer os.RemoveAll(sockDir)
-	sock := filepath.Join(sockDir, "manager.sock")
 	broker := newLinkNodeBroker(cfgPath, hs, handler)
 	stopBroker := make(chan struct{})
 	brokerDone := make(chan struct{})
-	go func() { defer close(brokerDone); serveLinkNodeSocket(sock, broker, stopBroker) }()
+	go func() { defer close(brokerDone); serveLinkNodeSockets(sockDir, broker, stopBroker) }()
 	defer func() { close(stopBroker); <-brokerDone }()
 
-	client := newLinkNodeClient(sock)
+	client := newLinkNodeClient(sockDir)
 	nodeDir := filepath.Join(dir, "link-node-state")
 	node := newLinkNodeSupervisor(client, nodeDir)
 	node.Start()
@@ -241,6 +241,46 @@ func TestLinkIntegrationNodeContainer(t *testing.T) {
 	resp.Body.Close()
 	if string(seen) != macV4 {
 		t.Fatalf("the Manager saw %q, want the Mac's tailnet address %s", seen, macV4)
+	}
+
+	// The node's control API is not reachable from the Mac: every
+	// /link-node/ path through tailnet port 30190 is a 404, and no key is
+	// minted or identity handed out.
+	keysBefore, _ := exec.Command(bin, "--config", cfgPath, "preauthkeys", "list", "-o", "json").Output()
+	for _, p := range []string{"/link-node/v1/identity", "/link-node/v1/key", "/link-node/v1/config", "/link-node/v1/ensure-tags", "/link-node/v1/approve-route", "/link-node/v1/conflicts", "/link-node/v1/status"} {
+		for _, m := range []string{http.MethodGet, http.MethodPost} {
+			req, _ := http.NewRequest(m, "http://"+net.JoinHostPort(nasLAN, "30190")+p, strings.NewReader(`{"node_key":"x"}`))
+			resp, err := hc.Do(req)
+			if err != nil {
+				t.Fatalf("%s %s from the Mac: %v", m, p, err)
+			}
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusNotFound || strings.Contains(string(body), "tailscaled_state") || strings.Contains(string(body), "hskey") {
+				t.Fatalf("%s %s from the Mac: %d %q, want 404", m, p, resp.StatusCode, body)
+			}
+		}
+	}
+	if keysAfter, _ := exec.Command(bin, "--config", cfgPath, "preauthkeys", "list", "-o", "json").Output(); string(keysAfter) != string(keysBefore) {
+		t.Fatal("a request from the Mac changed the pre-auth keys")
+	}
+	// Even on the control socket, the Mac's node key is not the NAS node's.
+	macNode := ""
+	if out, err := exec.Command(bin, "--config", cfgPath, "nodes", "list", "-o", "json").Output(); err == nil {
+		var nodes []manager.HSNode
+		_ = json.Unmarshal(out, &nodes)
+		for _, n := range nodes {
+			if n.Name == "test-mac" {
+				macNode = n.NodeKey
+			}
+		}
+	}
+	if macNode == "" {
+		t.Fatal("the Mac is not listed")
+	}
+	err = client.call(context.Background(), http.MethodPost, "ensure-tags", linkNodeKeyRequest{NodeKey: macNode}, &linkNodeTagsResponse{})
+	if he := (*linkNodeHTTPError)(nil); !errors.As(err, &he) || he.Code != http.StatusForbidden {
+		t.Fatalf("ensure-tags for the Mac's key: %v, want 403", err)
 	}
 
 	node.Stop()

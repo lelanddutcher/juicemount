@@ -21,6 +21,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -34,7 +35,7 @@ const (
 	defaultLinkNodeHealthFile = "/tmp/juicemount-link-node.json"
 	// defaultLinkNodeServices are the NAS host's published ports: with host
 	// networking the node reaches the Redis proxy and the object store
-	// there, and proxies the Manager's API over the socket.
+	// there, and proxies the Manager's API over the relay socket.
 	defaultLinkNodeServices = "30179=127.0.0.1:30179,30151=127.0.0.1:30151,30190=" + nasManagerTarget
 	// defaultLinkNodeControl is Headscale's published port on the NAS host.
 	defaultLinkNodeControl = "http://127.0.0.1:30193"
@@ -43,6 +44,10 @@ const (
 // errLinkNodeWait is a Manager answer meaning "not yet": Headscale is not
 // running.
 var errLinkNodeWait = errors.New("waiting for headscale")
+
+// errLinkNodeOwnedByManager: the Manager runs the NAS node itself
+// (JM_NET_NAS_NODE=on), so this container must not.
+var errLinkNodeOwnedByManager = errors.New("the Manager runs the NAS node itself (JM_NET_NAS_NODE=on); stop and remove this Link node container")
 
 // linkNodeHTTPError is a non-success answer from the Manager.
 type linkNodeHTTPError struct {
@@ -54,10 +59,17 @@ func (e *linkNodeHTTPError) Error() string {
 	return fmt.Sprintf("Manager answered %d: %s", e.Code, e.Msg)
 }
 
-// linkNodeClient calls the Manager over the node socket.
+// linkNodeClient calls the Manager over the control socket and tracks when
+// it last answered.
 type linkNodeClient struct {
-	sock string
-	http *http.Client
+	control string // control.sock
+	relay   string // relay.sock
+	http    *http.Client
+	now     func() time.Time
+
+	mu           sync.Mutex
+	lastAnswer   time.Time
+	ownedByOther bool
 }
 
 func unixTransport(sock string) *http.Transport {
@@ -71,8 +83,34 @@ func unixTransport(sock string) *http.Transport {
 	}
 }
 
-func newLinkNodeClient(sock string) *linkNodeClient {
-	return &linkNodeClient{sock: sock, http: &http.Client{Transport: unixTransport(sock), Timeout: 30 * time.Second}}
+// newLinkNodeClient talks to the Manager's sockets in dir.
+func newLinkNodeClient(dir string) *linkNodeClient {
+	control := filepath.Join(dir, linkNodeControlSocket)
+	return &linkNodeClient{
+		control: control,
+		relay:   filepath.Join(dir, linkNodeRelaySocket),
+		http:    &http.Client{Transport: unixTransport(control), Timeout: 30 * time.Second},
+		now:     time.Now,
+	}
+}
+
+// orphaned reports why this container must not run the node now: the
+// Manager runs it itself, or has not answered for linkNodeOrphanAfter
+// (since since, when it never answered).
+func (c *linkNodeClient) orphaned(since time.Time) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.ownedByOther {
+		return errLinkNodeOwnedByManager
+	}
+	last := c.lastAnswer
+	if last.Before(since) {
+		last = since
+	}
+	if age := c.now().Sub(last); age >= linkNodeOrphanAfter {
+		return fmt.Errorf("the Manager has not answered on %s for %s; stopped the NAS node so it never runs beside the Manager's own", c.control, age.Round(time.Second))
+	}
+	return nil
 }
 
 func (c *linkNodeClient) call(ctx context.Context, method, op string, in, out any) error {
@@ -93,21 +131,27 @@ func (c *linkNodeClient) call(ctx context.Context, method, op string, in, out an
 	}
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return fmt.Errorf("Manager unreachable on %s: %w", c.sock, err)
+		return fmt.Errorf("Manager unreachable on %s: %w", c.control, err)
 	}
 	defer resp.Body.Close()
 	data, _ := io.ReadAll(io.LimitReader(resp.Body, linkNodeMaxState*2))
-	if resp.StatusCode == http.StatusServiceUnavailable {
+	var e linkNodeError
+	if resp.StatusCode/100 != 2 && (json.Unmarshal(data, &e) != nil || e.Error == "") {
+		e.Error = strings.TrimSpace(string(data))
+	}
+	c.mu.Lock()
+	c.lastAnswer = c.now()
+	c.ownedByOther = resp.StatusCode == http.StatusConflict && e.Code == linkNodeOwnedByManager
+	owned := c.ownedByOther
+	c.mu.Unlock()
+	switch {
+	case owned:
+		return errLinkNodeOwnedByManager
+	case resp.StatusCode == http.StatusServiceUnavailable:
 		return errLinkNodeWait
-	}
-	if resp.StatusCode/100 != 2 {
-		var e linkNodeError
-		if json.Unmarshal(data, &e) != nil || e.Error == "" {
-			e.Error = strings.TrimSpace(string(data))
-		}
+	case resp.StatusCode/100 != 2:
 		return &linkNodeHTTPError{Code: resp.StatusCode, Msg: e.Error}
-	}
-	if out == nil || resp.StatusCode == http.StatusNoContent {
+	case out == nil || resp.StatusCode == http.StatusNoContent:
 		return nil
 	}
 	return json.Unmarshal(data, out)
@@ -136,25 +180,33 @@ func linkNodeControlURL(s linkNodeSettings) (string, error) {
 }
 
 // linkNodeManagerProxy serves the Manager's API to tailnet peers through
-// the socket, naming each peer in linkNodePeerHeader. runNASNode has already
-// set RemoteAddr to the peer's canonical tailnet address
-// (nasPeerAddrHandler). No X-Forwarded-For is added.
-func linkNodeManagerProxy(sock string) http.Handler {
+// the relay socket, naming each peer in linkNodePeerHeader. runNASNode has
+// already set RemoteAddr to the peer's canonical tailnet address
+// (nasPeerAddrHandler). No X-Forwarded-For is added. The node's control API
+// is never relayed (the relay socket refuses it too).
+func linkNodeManagerProxy(relaySock string) http.Handler {
 	target := &url.URL{Scheme: "http", Host: "juicemount-manager"}
-	return &httputil.ReverseProxy{
+	proxy := &httputil.ReverseProxy{
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			pr.SetURL(target)
 			pr.Out.Host = pr.In.Host
 			pr.Out.Header.Del(linkNodePeerHeader)
 			pr.Out.Header.Set(linkNodePeerHeader, pr.In.RemoteAddr)
 		},
-		Transport:     unixTransport(sock),
+		Transport:     unixTransport(relaySock),
 		FlushInterval: -1, // server-sent events (job progress)
 		ErrorLog:      log.New(io.Discard, "", 0),
 		ErrorHandler: func(w http.ResponseWriter, _ *http.Request, err error) {
 			http.Error(w, "the JuiceMount Manager is not reachable from the Link node", http.StatusBadGateway)
 		},
 	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if isLinkNodePath(r.URL.Path) || isLinkNodePath(r.URL.RawPath) {
+			http.NotFound(w, r)
+			return
+		}
+		proxy.ServeHTTP(w, r)
+	})
 }
 
 // migrateLegacyNodeState gives a node container with no identity yet the
@@ -178,6 +230,9 @@ func migrateLegacyNodeState(c *linkNodeClient, dir string) error {
 	}
 	if len(id.State) == 0 {
 		return nil
+	}
+	if _, err := identityNodeKey(id.State); err != nil {
+		return fmt.Errorf("the Manager's copy of the NAS node's identity is unusable: %w", err)
 	}
 	if err := writeNodeIdentity(dir, id.State); err != nil {
 		return err
@@ -248,7 +303,7 @@ func linkNodeConfig(c *linkNodeClient, s linkNodeSettings, dir string) (nasNodeC
 		UDPPort:    udpPort,
 		Services:   services,
 		Subnet:     s.Subnet,
-		Handler:    linkNodeManagerProxy(c.sock),
+		Handler:    linkNodeManagerProxy(c.relay),
 		Tags:       s.Tags,
 		MintKey: func() (string, error) {
 			ctx, cancel := callCtx()
@@ -317,8 +372,13 @@ func waitLinkNodeSettings(c *linkNodeClient, status *componentStatus, stop <-cha
 	}
 }
 
+// linkNodeWatchEvery is how often a running node checks that it is not
+// orphaned (a var for tests).
+var linkNodeWatchEvery = 5 * time.Second
+
 // newLinkNodeSupervisor supervises the node in the node container, with
-// the same backoff as the in-Manager node.
+// the same backoff as the in-Manager node. A running node stops when the
+// container is orphaned (linkNodeClient.orphaned).
 func newLinkNodeSupervisor(c *linkNodeClient, dir string) *supervisor {
 	var sup *supervisor
 	sup = newSupervisor("nas node", func(stop <-chan struct{}, ready func(string)) error {
@@ -335,7 +395,40 @@ func newLinkNodeSupervisor(c *linkNodeClient, dir string) *supervisor {
 		}
 		cfg.Identity = sup.status.setNodeKey
 		log.Printf("JuiceMount Link: nas node dials control at %s", cfg.ControlURL)
-		return runNASNode(cfg, stop, ready)
+
+		nodeStop := make(chan struct{})
+		nodeDone := make(chan struct{})
+		watchDone := make(chan struct{})
+		var orphan error // set by the watcher before it closes nodeStop
+		started := c.now()
+		go func() {
+			defer close(watchDone)
+			t := time.NewTicker(linkNodeWatchEvery)
+			defer t.Stop()
+			for {
+				select {
+				case <-stop:
+					close(nodeStop)
+					return
+				case <-nodeDone:
+					return
+				case <-t.C:
+					if err := c.orphaned(started); err != nil {
+						orphan = err
+						log.Printf("JuiceMount Link: stopping the NAS node: %v", err)
+						close(nodeStop)
+						return
+					}
+				}
+			}
+		}()
+		err = runNASNode(cfg, nodeStop, ready)
+		close(nodeDone)
+		<-watchDone
+		if orphan != nil {
+			return orphan
+		}
+		return err
 	})
 	return sup
 }
@@ -411,14 +504,14 @@ func linkNodeHealthy(path string, now time.Time) error {
 
 // runLinkNodeMain is juicemount-manager --link-node: the NAS node alone.
 func runLinkNodeMain() {
-	sock := linkNodeSocketPath()
+	sockDir := linkNodeDir()
 	dir := envOr("JM_NET_NODE_STATE_DIR", defaultLinkNodeStateDir)
 	health := envOr("JM_NET_NODE_HEALTH_FILE", defaultLinkNodeHealthFile)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		log.Fatalf("JuiceMount Link node: state directory %s: %v", dir, err)
 	}
-	log.Printf("JuiceMount Link node starting: Manager socket %s, state %s", sock, dir)
-	c := newLinkNodeClient(sock)
+	log.Printf("JuiceMount Link node starting: Manager sockets in %s, state %s", sockDir, dir)
+	c := newLinkNodeClient(sockDir)
 	sup := newLinkNodeSupervisor(c, dir)
 	sup.Start()
 	stopReport := make(chan struct{})

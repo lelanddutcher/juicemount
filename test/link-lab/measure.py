@@ -86,6 +86,33 @@ def recover(case, site, service):
     return out
 
 
+NODE_API_PATHS = ["/link-node/v1/identity", "/link-node/v1/key", "/link-node/v1/config",
+                  "/link-node/v1/ensure-tags", "/link-node/v1/approve-route",
+                  "/link-node/v1/conflicts", "/link-node/v1/status", "/link-node/",
+                  "/x/../link-node/v1/identity", "/%6cink-node/v1/identity"]
+
+
+def node_api_from_mac(site):
+    """From the Mac, through Link, call every path of the node container's
+    control API on the NAS node's tailnet port 30190. Each must be a 404:
+    the node relays only the Manager's own API."""
+    st = json.loads(lab("exec", f"{site}-mac", "tailscale", "--socket=/run/tailscale/tailscaled.sock",
+                        "status", "--json").stdout)
+    ips = [p["TailscaleIPs"][0] for p in (st.get("Peer") or {}).values()
+           if p.get("HostName") == "juicemount-nas" and p.get("TailscaleIPs")]
+    if not ips:
+        return {"error": "the Mac does not see the NAS node"}
+    codes = {}
+    for path in NODE_API_PATHS:
+        for m in ("GET", "POST"):
+            r = lab("exec", f"{site}-mac", "curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
+                    "--path-as-is", "--max-time", "20", "--socks5-hostname", "127.0.0.1:1055",
+                    "-X", m, "-H", "Content-Type: application/json", "-d", '{"node_key":"x"}',
+                    f"http://{ips[0]}:30190{path}", check=False, timeout=60)
+            codes[f"{m} {path}"] = r.stdout.strip() or "none"
+    return {"nas": ips[0], "codes": codes, "all_404": all(c == "404" for c in codes.values())}
+
+
 def run_case(name, a):
     if name == "wan-down-boot":
         return run_wan_down_boot(name, a)
@@ -105,6 +132,8 @@ def run_case(name, a):
     p = lab_json("probe", site, "path", timeout=120)
     res["path_probe"] = p
     res["path"] = p.get("path")
+    if site == "away" and res["config"].get("nas_net") == "host":
+        res["node_api_from_mac"] = node_api_from_mac(site)
     u0, t0 = relay_cpu_usec(), time.monotonic()
     b = lab_json("probe", site, "bench", "--put-mib", str(a.put_mib), timeout=900)
     u1, t1 = relay_cpu_usec(), time.monotonic()
@@ -117,6 +146,9 @@ def run_case(name, a):
             res["recovery"].append(recover(name, site, "link-node"))
     lab("exec", f"{site}-mac", "/lab/lib/mac.sh", "stop", check=False)
     broken = "error" in b or any("error" in r for r in res.get("recovery", []))
+    api = res.get("node_api_from_mac")
+    if api is not None and not api.get("all_404"):
+        broken = True
     if broken:
         res["outcome"] = "broken"
     elif expect == "fail":
@@ -246,6 +278,16 @@ def scoreboard(run, results):
                   "| Mac away connects after the internet returns | "
                   + (f"yes: first PING {fmt_s(au.get('first_ping_ms'))} s after its start, path {au.get('path_probe', {}).get('path', '?')}"
                      if "error" not in au else f"no: {au['error']}") + " |"]
+    apis = [(r["case"], r["node_api_from_mac"]) for r in results if "node_api_from_mac" in r]
+    if apis:
+        lines += ["", "Node control API (`/link-node/v1/*`, "
+                  f"{len(NODE_API_PATHS) * 2} GET/POST calls) from the away Mac through Link to the NAS node's port 30190:", ""]
+        for n, x in apis:
+            if "error" in x:
+                lines.append(f"- `{n}`: {x['error']}")
+            else:
+                other = {k: v for k, v in x["codes"].items() if v != "404"}
+                lines.append(f"- `{n}`: " + ("every call 404" if x["all_404"] else f"NOT refused: {other}"))
     errs = [(r["case"], r.get("connect", {}).get("error") or r.get("error")) for r in results
             if r.get("connect", {}).get("error") or r.get("error")]
     if errs:

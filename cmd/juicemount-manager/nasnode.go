@@ -223,11 +223,26 @@ func ensureNASNodeTags(cfgPath, nodeKey string, tags []string) (bool, error) {
 // newNASNodeSupervisor supervises the NAS node. It waits for control to be
 // running before each attempt, so a slow Headscale start is not counted as a
 // NAS node failure.
-func newNASNodeSupervisor(cfgPath string, control *headscaleSupervisor, handler http.Handler) *supervisor {
+//
+// blocked, when set, returns why the node must not start yet (a Link node
+// container may still hold its identity); the supervisor waits meanwhile,
+// and checks again before the node starts.
+func newNASNodeSupervisor(cfgPath string, control *headscaleSupervisor, handler http.Handler, blocked func() string) *supervisor {
 	var sup *supervisor
 	sup = newSupervisor("nas node", func(stop <-chan struct{}, ready func(string)) error {
-		for control != nil && !control.status.running() {
-			sup.status.set("starting", "waiting for headscale")
+		for {
+			why := ""
+			if blocked != nil {
+				why = blocked()
+			}
+			if why == "" && (control == nil || control.status.running()) {
+				break
+			}
+			if why != "" {
+				sup.status.set("starting", why)
+			} else {
+				sup.status.set("starting", "waiting for headscale")
+			}
 			select {
 			case <-stop:
 				return errStopped

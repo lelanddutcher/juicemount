@@ -7,7 +7,7 @@
 # It differs from server/juicemount-manager/Dockerfile only where the lab
 # does not need the product image's parts: no patched juicefs (the lab
 # formats no volume and runs no sync), no juicedata/mount base. The manager
-# binary is built with the same tags, and Headscale is the same release
+# binary is built with the same tags (ts_omit_peerapiserver included), and Headscale is the same release
 # (v0.29.3), here also checked against its published sha256.
 
 FROM golang:1.26.10-alpine AS builder
@@ -19,7 +19,7 @@ RUN --mount=type=cache,target=/go/pkg/mod go mod download
 COPY . .
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
-    CGO_ENABLED=0 GOOS=linux go build -tags nosqlite,nomysql,nopg,notikv,nobadger,noetcd \
+    CGO_ENABLED=0 GOOS=linux go build -tags nosqlite,nomysql,nopg,notikv,nobadger,noetcd,ts_omit_peerapiserver \
       -ldflags="-s -w -X github.com/lelanddutcher/juicemount/internal/version.Version=0.0.0-linklab -X github.com/lelanddutcher/juicemount/internal/version.Commit=${JM_COMMIT}" \
       -o /out/juicemount-manager ./cmd/juicemount-manager
 

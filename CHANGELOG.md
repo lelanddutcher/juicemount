@@ -97,14 +97,23 @@
   read-only root, userspace networking (no TUN device), its identity in its
   own volume (`juicemount-link-state`). It reaches the Redis proxy and the
   object store at the ports this host publishes on 127.0.0.1 (30179, 30151),
-  and Headscale at 127.0.0.1:30193. It reaches the Manager only through a
-  Unix socket in the volume `juicemount-link-run`, which only the Manager and
-  the node container mount. Through that socket the Manager mints the node's
-  keys, tags it, approves its route and reports its state in
-  `GET /api/net/link`. Requests to the Manager's port 30190 over Link go
-  through the socket too, so the Manager still sees each Mac's own tailnet
-  address. The node restarts after a failure with the same backoff as
-  before (1 s, doubling to 60 s).
+  and Headscale at 127.0.0.1:30193. It reaches the Manager only through two
+  Unix sockets in the volume `juicemount-link-run`, which only the Manager
+  and the node container mount. On the control socket the Manager mints the
+  node's keys, tags it, approves its route, keeps a copy of its identity and
+  reports its state in `GET /api/net/link`. Only the node uses it: nothing a
+  Mac sends over Link reaches it. The Manager acts there only on the NAS
+  node's own node key (the one in its copy of the identity, or a node with
+  the NAS node's name that registered with a key it minted), and keeps at
+  most one unused key outstanding. A posted identity must be a valid tsnet
+  state file of that node. Requests to the Manager's port 30190 over Link
+  go through the relay socket, which serves only the Manager's own API, so
+  the Manager still sees each Mac's own tailnet address. The node restarts
+  after a failure with the same backoff as before (1 s, doubling to 60 s).
+- The Manager image is built without Tailscale's peer API server
+  (`ts_omit_peerapiserver`). In userspace networking it listened on every
+  host address; with host networking that would be the NAS's LAN. Link does
+  not use it.
 - `server/docker-compose.link.yml` sets `JM_NET_NAS_NODE=container` and adds
   the `juicemount-link` service. It no longer publishes UDP 41641: the node
   binds `JM_NET_NAS_UDP_PORT` (default 41641) on the host itself. If another
@@ -112,8 +121,9 @@
   node uses a random port, and a router forward to 41641 then does not reach
   it: set `JM_NET_NAS_UDP_PORT` to a free port and forward that one.
   `JM_NET_NAS_NODE=on` still runs the node inside the Manager.
-- The node container does not send logs to Tailscale's log server
-  (`TS_NO_LOGS_NO_SUPPORT`).
+- The NAS node no longer sends logs to Tailscale's log server
+  (`TS_NO_LOGS_NO_SUPPORT` on the node container and, in the overlay, on the
+  Manager).
 - With Headscale's own TLS (`JM_NET_TLS_CERT`), the node dials
   `JM_NET_SERVER_URL`, which needs hairpin NAT or a local DNS entry, as
   before. To avoid both, set `JM_NET_NAS_CONTROL_URL` to that URL and add
@@ -140,8 +150,18 @@
   publish `${JM_NET_NAS_UDP_PORT:-41641}:${JM_NET_NAS_UDP_PORT:-41641}/udp`
   on the Manager again and remove `juicemount-link`), stop `juicemount-link`
   first, then recreate the Manager. The Manager's node starts from its copy
-  of the identity, so it is the same node. Never run both: they hold the same identity. The
-  volumes `juicemount-link-state` and `juicemount-link-run` can stay.
+  of the identity, so it is the same node. The volumes
+  `juicemount-link-state` and `juicemount-link-run` can stay.
+- Never run both: they hold the same identity. A Manager with
+  `JM_NET_NAS_NODE=on` that still shares `juicemount-link-run` with a node
+  container tells it to stop its node, and does not start its own node
+  while that container still calls it (`GET /api/net/link` says why). With
+  the previous overlay (no shared volume), the Manager waits up to 2.5
+  minutes after the node container's last report, unless it stopped
+  cleanly. A node container that has not reached the Manager for 2 minutes
+  stops its node. `docker compose up` with the previous overlay leaves the
+  container running: remove it (`docker compose rm -sf juicemount-link`
+  before switching, or `up -d --remove-orphans`).
 
 ## 0.5.1 — 2026-11-07 (build 38)
 

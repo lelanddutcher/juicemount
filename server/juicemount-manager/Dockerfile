@@ -37,8 +37,12 @@ COPY . .
 # only: the tags drop the other metadata engines, which sqlite would need CGO.
 # No cache mounts — stale Go build cache served old binaries even with
 # --no-cache (BuildKit cache mounts persist independently of layer cache).
+# ts_omit_peerapiserver: Link's NAS node (in userspace networking) would
+# otherwise open Tailscale's peer API on every host address, which the Link
+# node container's host networking puts on the NAS's LAN. Link does not use
+# it (no Taildrop, no exit-node DNS).
 RUN CGO_ENABLED=0 GOOS=linux \
-    go build -tags nosqlite,nomysql,nopg,notikv,nobadger,noetcd -ldflags="-s -w -X github.com/lelanddutcher/juicemount/internal/version.Version=${JM_VERSION} -X github.com/lelanddutcher/juicemount/internal/version.Commit=${JM_COMMIT}" \
+    go build -tags nosqlite,nomysql,nopg,notikv,nobadger,noetcd,ts_omit_peerapiserver -ldflags="-s -w -X github.com/lelanddutcher/juicemount/internal/version.Version=${JM_VERSION} -X github.com/lelanddutcher/juicemount/internal/version.Commit=${JM_COMMIT}" \
       -o /out/juicemount-manager ./cmd/juicemount-manager
 
 # The juicefs the Manager runs (sync, warmup, gc, fsck, status): this

@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"net"
 	"os"
-	"path/filepath"
 	"reflect"
 	"strconv"
 	"strings"
@@ -128,7 +127,7 @@ func TestLinkComposeOverlayMatchesCodeDefaults(t *testing.T) {
 		`JM_NET_SERVER_URL: "${JM_NET_SERVER_URL:?`,
 		`network_mode: host`,
 		`entrypoint: ["/usr/local/bin/juicemount-manager", "--link-node"]`,
-		`juicemount-link-run:` + filepath.Dir(defaultLinkNodeSocket),
+		`juicemount-link-run:` + defaultLinkNodeDir,
 		`juicemount-link-state:` + defaultLinkNodeStateDir,
 		`- ALL`,
 		`read_only: true`,

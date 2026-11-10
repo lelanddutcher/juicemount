@@ -32,6 +32,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -39,6 +40,7 @@ import (
 
 	"github.com/lelanddutcher/juicemount/internal/manager"
 	"github.com/lelanddutcher/juicemount/internal/version"
+	"tailscale.com/feature/buildfeatures"
 )
 
 func main() {
@@ -59,7 +61,7 @@ func main() {
 	farmStorageCapacity := flag.Uint64("farm-storage-capacity-bytes", envUint64Or("JM_FARM_STORAGE_CAPACITY_BYTES", 0), "Physical backend-pool capacity for correct reporting and the default 1% reserve. Set this on ZFS because statfs is dataset-scoped; zero falls back to statfs.")
 	mountOwner := flag.String("mount-owner", envOr("JM_MOUNT_OWNER", ""), "POSIX owner (uid[:gid], e.g. 501:20) that migrated data is chowned to after an embedded-mode sync, so the CLIENT mounting the volume can WRITE it — not just read it. The manager runs as root on the NAS, so without this, `juicefs sync` leaves migrated files root:wheel and a uid-501 Mac client can only read them. Empty = leave raw sync ownership. Set to the uid your Mac client mounts as (usually 501:20).")
 	overviewMeta := flag.String("overview-meta", envOr("JM_OVERVIEW_META", ""), "Redis URL for the Overview tab's `juicefs status` + Redis INFO probes. Use this in EMBEDDED mode (--fuse-mount), where --meta is unavailable (mutually exclusive), so Overview still works. In standalone mode --meta already serves both and this can stay empty.")
-	linkNode := flag.Bool("link-node", false, "Run only JuiceMount Link's NAS node, in its own container (JM_NET_NAS_NODE=container on the Manager). It talks to the Manager over the socket JM_NET_NODE_SOCKET and keeps its identity in JM_NET_NODE_STATE_DIR. Every other flag is ignored.")
+	linkNode := flag.Bool("link-node", false, "Run only JuiceMount Link's NAS node, in its own container (JM_NET_NAS_NODE=container on the Manager). It talks to the Manager over the sockets in JM_NET_NODE_DIR (default /run/juicemount-link) and keeps its identity in JM_NET_NODE_STATE_DIR. Every other flag is ignored.")
 	linkNodeHealth := flag.Bool("link-node-health", false, "Health check for --link-node: exit 0 when the NAS node runs.")
 	flag.Parse()
 	if *buildInfo {
@@ -71,6 +73,7 @@ func main() {
 	}
 	if *linkNode {
 		log.Printf("juicemount-manager %s (%s): Link node only", version.Version, version.Commit)
+		warnPeerAPIServer()
 		runLinkNodeMain()
 		return
 	}
@@ -149,7 +152,21 @@ func main() {
 		// in this process, or in the Link node container (linknode.go).
 		switch nasNodeMode() {
 		case manager.NASNodeInManager:
-			nas := newNASNodeSupervisor(hsConfig, hs, mux)
+			// A Link node container left from JM_NET_NAS_NODE=container
+			// holds the same identity: answer its control socket (when its
+			// volume is still mounted) so it stops, and wait while one may
+			// still run.
+			guard := &linkNodeGuard{identityDir: filepath.Join(hsDataDir, "nas-node"), now: time.Now}
+			if fi, err := os.Stat(linkNodeDir()); err == nil && fi.IsDir() {
+				stopGuard := make(chan struct{})
+				guardDone := make(chan struct{})
+				go func() {
+					defer close(guardDone)
+					serveLinkNodeSocket(filepath.Join(linkNodeDir(), linkNodeControlSocket), guard, stopGuard)
+				}()
+				defer func() { close(stopGuard); <-guardDone }()
+			}
+			nas := newNASNodeSupervisor(hsConfig, hs, mux, guard.blocked)
 			nas.Start()
 			defer nas.Stop()
 			nasStatus = nas.status.snapshot
@@ -159,11 +176,12 @@ func main() {
 			brokerDone := make(chan struct{})
 			go func() {
 				defer close(brokerDone)
-				serveLinkNodeSocket(linkNodeSocketPath(), broker, stopBroker)
+				serveLinkNodeSockets(linkNodeDir(), broker, stopBroker)
 			}()
 			defer func() { close(stopBroker); <-brokerDone }()
 			nasStatus = broker.snapshot
 		}
+		warnPeerAPIServer()
 		manager.SetLinkRuntimeStatus(func() manager.LinkRuntimeStatus {
 			st := manager.LinkRuntimeStatus{Headscale: hs.status.snapshot()}
 			if nasStatus != nil {
@@ -284,4 +302,15 @@ func splitNonEmpty(s, sep string) []string {
 		}
 	}
 	return out
+}
+
+// warnPeerAPIServer logs when this binary was built with Tailscale's peer
+// API server. In userspace networking it listens on every host address
+// (0.0.0.0) for each tailnet address; with host networking that is on the
+// NAS's LAN. Link does not use it: release images are built with
+// -tags ts_omit_peerapiserver.
+func warnPeerAPIServer() {
+	if buildfeatures.HasPeerAPIServer {
+		log.Printf("JuiceMount Link: WARNING this build includes Tailscale's peer API server, which listens on every host address; build with -tags ts_omit_peerapiserver")
+	}
 }

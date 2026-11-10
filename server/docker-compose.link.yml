@@ -34,18 +34,28 @@
 #     only the JuiceMount ports on its tailnet address: 30179 (Redis proxy) and
 #     30151 (object store), forwarded to the same ports published on this
 #     host's 127.0.0.1, and 30190 (Manager), passed to the Manager over its
-#     socket. A Mac dials the same port it uses on the LAN; nothing else on the
+#     relay socket. A Mac dials the same port it uses on the LAN; nothing else on the
 #     LAN is reachable through Link. Mac apps older than 0.5.1, and remote farm
 #     nodes, need JM_NET_NAS_EXPOSURE=subnet (an existing install's default):
 #     the node advertises JM_NET_NAS_ROUTE (default 192.168.0.0/24) instead.
 #   - it has no Linux capabilities and a read-only root. It runs in userspace
 #     networking mode (no TUN device, no NET_ADMIN). It joins no other
-#     container's network.
-#   - it talks to the Manager only through a Unix socket in the volume
-#     juicemount-link-run, which only these two containers mount. Through it
-#     the Manager mints the node's keys, tags it, approves its route and
-#     reports its state in GET /api/net/link. Its identity is in the volume
-#     juicemount-link-state.
+#     container's network. It opens no TCP port on the host: the image is
+#     built without Tailscale's peer API, which would otherwise listen on
+#     every host address.
+#   - it talks to the Manager only through two Unix sockets in the volume
+#     juicemount-link-run, which only these two containers mount. On
+#     control.sock the Manager mints the node's keys (one outstanding at a
+#     time), tags it, approves its route, keeps a copy of its identity and
+#     reports its state in GET /api/net/link; it acts only on the NAS node's
+#     own node key. relay.sock carries only the Manager's API for Macs
+#     (tailnet port 30190); nothing a Mac sends reaches control.sock. Its
+#     identity is in the volume juicemount-link-state.
+#   - never run it beside JM_NET_NAS_NODE=on: both would hold the NAS node's
+#     identity. A Manager with JM_NET_NAS_NODE=on tells a node container it
+#     still reaches to stop, and does not start its own node while one may
+#     still run; a node container that has not reached the Manager for 2
+#     minutes stops its node.
 #   - it dials Headscale at http://127.0.0.1:30193. With Headscale's own TLS
 #     it dials JM_NET_SERVER_URL instead, which needs hairpin NAT or a local
 #     DNS entry on the router, unless you set JM_NET_NAS_CONTROL_URL to that
@@ -76,6 +86,9 @@ services:
       JM_NET_TLS_CERT: "${JM_NET_TLS_CERT:-}"
       JM_NET_TLS_KEY: "${JM_NET_TLS_KEY:-}"
       JM_NET_DERP_MAP_URL: "${JM_NET_DERP_MAP_URL:-}"
+      # No logs to Tailscale's log server, also when JM_NET_NAS_NODE=on runs
+      # the node in the Manager.
+      TS_NO_LOGS_NO_SUPPORT: "true"
     ports:
       - "30193:8091"                                                    # Headscale control server
     volumes:

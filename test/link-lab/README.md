@@ -49,8 +49,8 @@ network is internal: no container reaches the real internet.
 | Part | Networks | What it is |
 |---|---|---|
 | `redis`, `respproxy`, `silo` | nas | The NAS stack, as in `test/remote-lab`: Redis with the server's config and ACL, the RESP proxy built from this checkout, the SILO object store (also named `minio`). |
-| `manager` | nas | The Manager built from this checkout, with Link on as `server/docker-compose.link.yml` turns it on: Headscale v0.29.3 with its own TLS, the Manager's ACL policy, pairing through `POST /api/net/pair`, the NAS node's socket (or, in `bridge` cases, the NAS node itself). |
-| `link-node` | nas-host's | The NAS node container: the same image, started as `juicemount-manager --link-node`, in `nas-host`'s network namespace (host networking on a real NAS). No capabilities, read-only root, its identity in its own volume, the Manager reached through the socket volume `link-run`. Stopped in `bridge` cases. |
+| `manager` | nas | The Manager built from this checkout, with Link on as `server/docker-compose.link.yml` turns it on: Headscale v0.29.3 with its own TLS, the Manager's ACL policy, pairing through `POST /api/net/pair`, the NAS node's sockets (or, in `bridge` cases, the NAS node itself). |
+| `link-node` | nas-host's | The NAS node container: the same image, started as `juicemount-manager --link-node`, in `nas-host`'s network namespace (host networking on a real NAS). No capabilities, read-only root, its identity in its own volume, the Manager reached through the sockets in the volume `link-run`. Stopped in `bridge` cases. `lab.sh up` fails if the NAS host then listens on TCP anywhere but loopback (`lab.sh listeners`), so no peer API reaches the LAN. |
 | `nas-host` | nas, home | The NAS host. Its home address is "the NAS's LAN address". It does what Docker does for the published ports: DNAT from the LAN (30193 to the Manager's 8091; 41641/udp to the Manager in `bridge` cases) and a listener on 127.0.0.1 for 30193, 30190, 30179 and 30151 (as docker-proxy does), which `link-node` uses. Its hosts file, which `link-node` shares, points `link.lab.example` at 127.0.0.1. |
 | `home-router` | home, homeup | The home router: NAT, port forwards, hairpin, a LAN resolver with an optional local DNS entry, optional NAT-PMP. |
 | `home-mac` | home | A Mac at home: the stock Tailscale client (v1.102.3, the version the app uses) on Linux. |
@@ -128,6 +128,11 @@ away from home cannot reach the control server at all.
 | Router restart → PING | Restart the home router (its NAT mappings are lost), then time until a Redis PING through Link answers again. The path after it is in brackets. |
 | Manager restart → PING | The same after the Manager restarts (Headscale; in `bridge` cases also the NAS node). |
 | Node container restart → PING | The same after the NAS node container restarts. |
+
+In every away case with the node container, the Mac also calls each path of
+the node's control API (`/link-node/v1/*`, GET and POST, plus `..` and
+percent-encoded variants) on the NAS node's tailnet port 30190. Each must
+answer 404; anything else marks the case broken.
 
 Each run writes `results/<run id>/`: one JSON file per case, `results.json`,
 `run.json` (commit, versions, profile, errors) and `scoreboard.md`.
