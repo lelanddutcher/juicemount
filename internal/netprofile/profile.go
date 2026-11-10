@@ -65,6 +65,10 @@ type ReadaheadPolicy struct {
 	SeqThreshold int  // consecutive sequential reads before triggering
 	Blocks       int  // 4 MB blocks to prefetch ahead once triggered
 	Workers      int  // max concurrent prefetch goroutines
+	// ParallelFetch selects the windowed prefetch: block-aligned, each block
+	// fetched once, up to Workers blocks of one stream in flight together.
+	// false keeps the historical serial round (one 4 MB buffer at a time).
+	ParallelFetch bool
 }
 
 // JuiceFSPolicy is the juicefs MOUNT-time flag set. These are dominant
@@ -611,7 +615,13 @@ func (p *Profile) Readahead() ReadaheadPolicy {
 		// whole-file pull; the six-block guard below still has to be crossed.
 		return ReadaheadPolicy{Enabled: true, SeqThreshold: 6, Blocks: 1, Workers: 1}
 	case ClassSlow:
-		return ReadaheadPolicy{Enabled: true, SeqThreshold: 4, Blocks: 2, Workers: 2}
+		// Distant or mid-rate WAN (the RTT ceiling puts every far link here).
+		// One serial 4 MB block in flight used about half of a 30 Mbit/s,
+		// 200 ms link: each block paid a full request round trip before its
+		// bytes moved. Four blocks in flight cover that idle time; a six-block
+		// (24 MiB) window keeps two queued behind them. The short-run guard in
+		// the NFS layer still holds back preview-sized runs.
+		return ReadaheadPolicy{Enabled: true, SeqThreshold: 4, Blocks: 6, Workers: 4, ParallelFetch: true}
 	case ClassFast:
 		// 10GbE / LAN: go deep + wide to keep enough 4 MB blocks in flight to
 		// MinIO to actually fill the pipe (addresses the ~3 Gbit/s-of-10 starve).

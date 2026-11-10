@@ -87,8 +87,11 @@ func effectiveFUSEDataWidth() int64 {
 			return 2
 		}
 	case netprofile.ClassSlow:
-		if base > 4 {
-			return 4
+		// 8, not 4: the slow-link readahead keeps up to four blocks in flight,
+		// and background work may use only half the ceiling. At 4 the
+		// prefetcher got two slots. Foreground keeps a reserved four.
+		if base > 8 {
+			return 8
 		}
 	}
 	return base
