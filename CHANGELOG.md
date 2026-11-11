@@ -46,18 +46,28 @@
   block, and the app's own read-ahead started several more blocks after a
   single 1 MB scrub read. On a lossy link one block takes about 50 s, so the
   app's 8 s read limit expired and the Mac retried, and each retry started
-  another read. Now, on a slow or metered link: a small read fetches its own
-  bytes unless the block download is nearly done; the JuiceFS prefetcher and
-  the app's read-ahead wait (at most 10 s and 8 s) while a read you are
-  waiting for is in flight; read-ahead starts with one block in flight and
-  grows as you keep reading in order; a waiting read-ahead block is dropped
-  when you seek away; and a retry joins the read already running instead of
-  starting a new one. In the remote lab at 200 ms with 1% loss, a random
-  1 MiB read took 7.2 s (p50) and 11.7 s (p95) instead of 38 s and 54 s.
-  Without loss, the p95 went from 3.8 s to 1.8 s. The cost: a read that does
-  not wait for a block download fetches its bytes twice (at most 1 MiB), and
-  a cold sequential read without loss went from 8.9 to 7.9 Mbit/s in one lab
-  run. Fast and medium links and encrypted volumes behave as before. Field
+  another read. Now, on a slow or metered link:
+  - a small read fetches its own bytes unless the block download is nearly
+    done, up to a quarter block of such reads per download;
+  - the JuiceFS prefetcher waits (at most 10 s) while reads of other blocks
+    are in flight, and the app's read-ahead waits (at most 8 s) while a read
+    you are waiting for is in flight;
+  - read-ahead starts with one block in flight and grows as you keep reading
+    in order, and it claims nothing for a position you have left;
+  - a retry joins the read that is still running for the same bytes of the
+    same file instead of starting another one. A finished read is never kept
+    for later reads.
+
+  In the remote lab at 200 ms with 1% loss, a random 1 MiB read took 8.0 s
+  (p50) and 10.6 s (p95) instead of 36 s and 57 s. Without loss, the p95 went
+  from 3.8 s to 1.9 s, and a cold sequential read went from 8.95 to
+  8.65 Mbit/s. The time to the first byte did not change in the lab (2.2 s,
+  mostly metadata round trips); the lab has no NFS layer, so the Mac must
+  confirm the first-byte fix. Limits: the JuiceFS part is chosen when the
+  volume mounts, so a volume mounted on a fast link keeps the old behavior
+  after the Mac moves to a slow link (and the reverse) until the next mount.
+  Encrypted volumes still download whole blocks; only the app's read-ahead
+  rules apply to them. Fast and medium links behave as before. Field
   switches: `JM_JFS_DEMAND_FIRST=0`, `JM_DEMAND_FIRST=0`,
   `JM_FUSE_READ_JOIN=0`. The bundled JuiceFS is now build `-jm6`.
 

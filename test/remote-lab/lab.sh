@@ -130,11 +130,14 @@ format_volume() {
 MOUNT_FLAGS=(
   --no-usage-report --no-bgjob --max-deletes 0
   --heartbeat 60s --max-uploads 4 --max-readahead 1M
-  --buffer-size 512 --prefetch 1 --demand-first
+  --buffer-size 512 --prefetch 1
   --get-timeout 2m --put-timeout 3m --io-retries 3
   --attr-cache 10 --entry-cache 60 --dir-entry-cache 60 --negative-entry-cache 5
   --cache-dir /var/jfscache --cache-size 20480
 )
+# JMLAB_DEMAND_FIRST=0 mounts without --demand-first, for a before/after
+# comparison (the app's own rollback switch is JM_JFS_DEMAND_FIRST=0).
+[ "${JMLAB_DEMAND_FIRST:-1}" = 0 ] || MOUNT_FLAGS+=(--demand-first)
 
 do_umount() {
   # shellcheck disable=SC2016

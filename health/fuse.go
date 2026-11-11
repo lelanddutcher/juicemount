@@ -163,9 +163,11 @@ func desktopJuiceFSObjectIOArgs(class netprofile.LinkClass) []string {
 // the flag, that read sends its own ranged GET, and the prefetcher waits while
 // demand reads are in flight.
 //
-// The flag is fixed for the mount's life, like the other JuiceFS flags. The
-// NFS layer's own demand-first rules (nfs/demand_first.go) follow the live
-// class. Fast and medium links keep the upstream behavior.
+// The flag is fixed for the mount's life, like the other JuiceFS flags: a
+// mount made on a fast link that later moves to a slow one runs without it
+// until the next remount, and the reverse. The NFS layer's own demand-first
+// rules (nfs/demand_first.go) follow the live class. Fast and medium links
+// keep the upstream behavior.
 // JM_JFS_DEMAND_FIRST=0 is the field rollback switch.
 func desktopJuiceFSDemandFirstArgs(class netprofile.LinkClass) []string {
 	if os.Getenv("JM_JFS_DEMAND_FIRST") == "0" {

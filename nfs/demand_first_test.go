@@ -204,16 +204,19 @@ func TestMediumReadaheadDoesNotWaitForDemand(t *testing.T) {
 	}
 }
 
-// fakePread is a pread that blocks until released, then returns its bytes.
+// fakePread is a pread that blocks until released, then returns the file's
+// content at that moment (content can change, like a file replaced on disk).
 type fakePread struct {
 	calls   atomic.Int32
 	release chan struct{}
 	once    sync.Once
-	data    byte
+	content atomic.Value // byte
 }
 
 func newFakePread(data byte) *fakePread {
-	return &fakePread{release: make(chan struct{}), data: data}
+	f := &fakePread{release: make(chan struct{})}
+	f.content.Store(data)
+	return f
 }
 
 func (f *fakePread) unblock() { f.once.Do(func() { close(f.release) }) }
@@ -221,36 +224,55 @@ func (f *fakePread) unblock() { f.once.Do(func() { close(f.release) }) }
 func (f *fakePread) read(p []byte, _ int64) (int, error) {
 	f.calls.Add(1)
 	<-f.release
+	b := f.content.Load().(byte)
 	for i := range p {
-		p[i] = f.data
+		p[i] = b
 	}
 	return len(p), nil
 }
 
+// resetPendingReads gives the test its own registry, a slow link (the join
+// applies on slow and metered links only) and an empty data gate.
 func resetPendingReads(t *testing.T) {
 	t.Helper()
 	t.Setenv("JM_FUSE_READ_JOIN", "")
+	t.Setenv("JM_DEMAND_FIRST", "")
 	prior := pendingFUSEReadResults
-	pendingFUSEReadResults = newPendingFUSEReads(time.Minute, 64)
+	pendingFUSEReadResults = newPendingFUSEReads(64)
+	priorClass := demandFirstClass
+	demandFirstClass = func() netprofile.LinkClass { return netprofile.ClassSlow }
 	fuseDataInFlight.Store(0)
 	t.Cleanup(func() {
 		pendingFUSEReadResults = prior
+		demandFirstClass = priorClass
 		fuseDataInFlight.Store(0)
 	})
 }
 
+var testFD = new(os.File)
+
+func readKey(name string, inode uint64, mtime int64, off int64, n int) *pendingReadKey {
+	return &pendingReadKey{name: name, inode: inode, size: 64 << 20, mtime: mtime, fd: testFD, off: off, n: n}
+}
+
+func waitPreadsDone(t *testing.T) {
+	t.Helper()
+	waitUntil(t, "preads to end", func() bool { return foregroundDemand.inflight() == 0 && pendingFUSEReadResults.len() == 0 })
+}
+
 // The lab's retry loop: a pread passes its bound (JUKEBOX); the client
 // retries the same read. The retry joins the running pread, takes no new data
-// slot and starts no new pread; when the pread ends, the next retry gets its
-// bytes; later reads read normally again.
+// slot and starts no new pread; a retry waiting when the pread ends gets its
+// bytes.
 func TestJUKEBOXRetryJoinsRunningPread(t *testing.T) {
 	resetPendingReads(t)
 	fp := newFakePread(0xAB)
 	defer fp.unblock()
-	const path, off, bound = "/fuse/reel.mov", int64(1 << 20), 40 * time.Millisecond
+	const off, bound = int64(1 << 20), 40 * time.Millisecond
+	key := readKey("reel.mov", 7, 1, off, 256<<10)
 	p := make([]byte, 256<<10)
 
-	if _, err := joinOrReadFUSE(fp.read, path, "reel.mov", p, off, bound); !errors.Is(err, errFUSETimeout) {
+	if _, err := joinOrReadFUSE(fp.read, key, "reel.mov", p, off, bound); !errors.Is(err, errFUSETimeout) {
 		t.Fatalf("first read err %v, want the JUKEBOX timeout", err)
 	}
 	if foregroundDemand.inflight() != 1 {
@@ -258,7 +280,7 @@ func TestJUKEBOXRetryJoinsRunningPread(t *testing.T) {
 	}
 	inUse, _ := fuseDataGateDepth()
 	for i := 0; i < 3; i++ {
-		if _, err := joinOrReadFUSE(fp.read, path, "reel.mov", p, off, bound); !errors.Is(err, errFUSETimeout) {
+		if _, err := joinOrReadFUSE(fp.read, key, "reel.mov", p, off, bound); !errors.Is(err, errFUSETimeout) {
 			t.Fatalf("retry %d err %v, want JUKEBOX while the pread runs", i, err)
 		}
 	}
@@ -268,88 +290,162 @@ func TestJUKEBOXRetryJoinsRunningPread(t *testing.T) {
 	if now, _ := fuseDataGateDepth(); now != inUse {
 		t.Fatalf("retries took data slots: %d -> %d", inUse, now)
 	}
-
-	fp.unblock()
-	waitUntil(t, "the pread to end", func() bool { return foregroundDemand.inflight() == 0 })
+	go func() { time.Sleep(30 * time.Millisecond); fp.unblock() }()
 	for i := range p {
 		p[i] = 0
 	}
-	n, err := joinOrReadFUSE(fp.read, path, "reel.mov", p, off, bound)
+	n, err := joinOrReadFUSE(fp.read, key, "reel.mov", p, off, 5*time.Second)
 	if err != nil || n != len(p) || p[0] != 0xAB || p[len(p)-1] != 0xAB {
-		t.Fatalf("retry after the pread ended: n=%d err=%v first=%x", n, err, p[0])
+		t.Fatalf("waiting retry: n=%d err=%v first=%x", n, err, p[0])
 	}
-	if c := fp.calls.Load(); c != 1 || pendingFUSEReadResults.len() != 0 {
-		t.Fatalf("served retry: preads %d (want 1), registry %d (want 0)", c, pendingFUSEReadResults.len())
+	waitPreadsDone(t)
+	if c := fp.calls.Load(); c != 1 {
+		t.Fatalf("preads %d, want 1", c)
 	}
 	if inUse, _ := fuseDataGateDepth(); inUse != 0 {
 		t.Fatalf("data gate leaked %d slots", inUse)
 	}
-	// The result answers one retry only; the next read is a new pread.
-	if _, err := joinOrReadFUSE(fp.read, path, "reel.mov", p, off, bound); err != nil {
-		t.Fatalf("fresh read: %v", err)
-	}
-	if c := fp.calls.Load(); c != 2 {
-		t.Fatalf("preads %d, want 2 after the served result was consumed", c)
-	}
 }
 
-// A retry that waits on the joined pread returns its bytes as soon as the
-// pread ends, not at the next bound.
-func TestJUKEBOXRetryReturnsWhenJoinedPreadEnds(t *testing.T) {
+// The review's probe (C1): a pread times out, ends with nobody waiting, and
+// the file changes. A later read must get the new bytes, not the old result.
+func TestJUKEBOXFinishedResultIsNotKept(t *testing.T) {
 	resetPendingReads(t)
-	fp := newFakePread(0x11)
-	defer fp.unblock()
-	p := make([]byte, 4096)
-	if _, err := joinOrReadFUSE(fp.read, "/fuse/a", "a", p, 0, 20*time.Millisecond); !errors.Is(err, errFUSETimeout) {
+	fp := newFakePread('O')
+	key := readKey("reel.mov", 7, 1, 0, 4)
+	p := make([]byte, 4)
+	if _, err := joinOrReadFUSE(fp.read, key, "reel.mov", p, 0, 20*time.Millisecond); !errors.Is(err, errFUSETimeout) {
 		t.Fatalf("err %v, want timeout", err)
 	}
-	go func() { time.Sleep(30 * time.Millisecond); fp.unblock() }()
-	start := time.Now()
-	n, err := joinOrReadFUSE(fp.read, "/fuse/a", "a", p, 0, 5*time.Second)
-	if err != nil || n != len(p) || p[0] != 0x11 {
-		t.Fatalf("joined retry: n=%d err=%v", n, err)
+	fp.unblock() // the old pread ends, nobody waits for it
+	waitPreadsDone(t)
+	fp.content.Store(byte('N')) // the range is rewritten (same open identity)
+	n, err := joinOrReadFUSE(fp.read, key, "reel.mov", p, 0, time.Second)
+	if err != nil || n != 4 || string(p) != "NNNN" {
+		t.Fatalf("read after the old pread ended = %q, %v; want the new bytes", p[:n], err)
 	}
-	if waited := time.Since(start); waited > 2*time.Second {
-		t.Fatalf("joined retry waited %s", waited)
+	if c := fp.calls.Load(); c != 2 {
+		t.Fatalf("preads %d, want 2 (a fresh pread)", c)
 	}
 }
 
-// Only the same file, offset and length join. Another read starts its own
-// pread.
+// A replacement by rename is a new inode, an in-place write a new mtime:
+// neither joins a pread of the old content, even while it still runs.
+func TestJUKEBOXReplacedFileNeverJoins(t *testing.T) {
+	resetPendingReads(t)
+	fp := newFakePread('O')
+	p := make([]byte, 4)
+	for _, k := range []*pendingReadKey{
+		readKey("reel.mov", 7, 1, 0, 4), // original
+		readKey("reel.mov", 8, 1, 0, 4), // renamed over: new inode
+		readKey("reel.mov", 7, 2, 0, 4), // written in place: new mtime
+	} {
+		if _, err := joinOrReadFUSE(fp.read, k, "reel.mov", p, 0, 10*time.Millisecond); !errors.Is(err, errFUSETimeout) {
+			t.Fatalf("err %v, want timeout", err)
+		}
+	}
+	if c := fp.calls.Load(); c != 3 {
+		t.Fatalf("preads %d, want 3: a changed file must not join the old pread", c)
+	}
+	fp.unblock()
+	waitPreadsDone(t)
+}
+
+// Invalidating a path (write, rename, remove, remote event) drops its
+// entries; a retry already waiting gets JUKEBOX, never the old bytes, and
+// the next retry reads afresh. A directory invalidation covers its subtree.
+func TestJUKEBOXInvalidationDropsJoin(t *testing.T) {
+	for _, tc := range []struct {
+		name, forget string
+		tree         bool
+	}{{"file", "dir/reel.mov", false}, {"tree", "dir", true}} {
+		t.Run(tc.name, func(t *testing.T) {
+			resetPendingReads(t)
+			fp := newFakePread('O')
+			key := readKey("dir/reel.mov", 7, 1, 0, 4)
+			p := make([]byte, 4)
+			joinOrReadFUSE(fp.read, key, "dir/reel.mov", p, 0, 10*time.Millisecond)
+			got := make(chan error, 1)
+			go func() {
+				q := make([]byte, 4)
+				_, err := joinOrReadFUSE(fp.read, key, "dir/reel.mov", q, 0, 5*time.Second)
+				got <- err
+			}()
+			time.Sleep(20 * time.Millisecond) // the retry is waiting on the pread
+			pendingFUSEReadResults.forget(tc.forget, tc.tree)
+			if pendingFUSEReadResults.len() != 0 {
+				t.Fatal("forget left the entry")
+			}
+			fp.unblock()
+			if err := <-got; !errors.Is(err, errFUSETimeout) {
+				t.Fatalf("waiting retry err %v, want JUKEBOX after invalidation", err)
+			}
+			waitPreadsDone(t)
+		})
+	}
+	resetPendingReads(t)
+	pendingFUSEReadResults.forget("dir", true) // other names are untouched
+}
+
+// A pread older than a few bounds is presumed wedged (a dead mount): a retry
+// starts its own instead of joining it for ever.
+func TestJUKEBOXDoesNotJoinWedgedPread(t *testing.T) {
+	resetPendingReads(t)
+	fp := newFakePread('O')
+	defer fp.unblock()
+	key := readKey("reel.mov", 7, 1, 0, 4)
+	p := make([]byte, 4)
+	const bound = 10 * time.Millisecond
+	joinOrReadFUSE(fp.read, key, "reel.mov", p, 0, bound)
+	time.Sleep((pendingReadJoinMaxAge + 1) * bound)
+	joinOrReadFUSE(fp.read, key, "reel.mov", p, 0, bound)
+	if c := fp.calls.Load(); c != 2 {
+		t.Fatalf("preads %d, want 2: a wedged pread must not be joined", c)
+	}
+}
+
+// Only the same file, descriptor, offset and length join.
 func TestJUKEBOXJoinNeedsSameRead(t *testing.T) {
 	resetPendingReads(t)
 	fp := newFakePread(0x22)
-	defer fp.unblock()
 	p := make([]byte, 4096)
-	joinOrReadFUSE(fp.read, "/fuse/a", "a", p, 0, 10*time.Millisecond)
-	joinOrReadFUSE(fp.read, "/fuse/a", "a", p, 4096, 10*time.Millisecond)
-	joinOrReadFUSE(fp.read, "/fuse/b", "b", p, 0, 10*time.Millisecond)
-	joinOrReadFUSE(fp.read, "/fuse/a", "a", p[:1024], 0, 10*time.Millisecond)
-	if c := fp.calls.Load(); c != 4 {
-		t.Fatalf("preads %d, want 4 distinct reads", c)
+	other := *readKey("a", 1, 1, 0, 4096)
+	other.fd = new(os.File) // after a remount: a new descriptor
+	for _, k := range []*pendingReadKey{
+		readKey("a", 1, 1, 0, 4096), readKey("a", 1, 1, 4096, 4096),
+		readKey("b", 2, 1, 0, 4096), readKey("a", 1, 1, 0, 1024), &other,
+	} {
+		joinOrReadFUSE(fp.read, k, k.name, p[:k.n], k.off, 10*time.Millisecond)
 	}
-	if pendingFUSEReadResults.len() != 4 {
-		t.Fatalf("registry holds %d, want 4", pendingFUSEReadResults.len())
+	if c := fp.calls.Load(); c != 5 {
+		t.Fatalf("preads %d, want 5 distinct reads", c)
 	}
 	fp.unblock()
-	waitUntil(t, "preads to end", func() bool { return foregroundDemand.inflight() == 0 })
+	waitPreadsDone(t)
 }
 
-// JM_FUSE_READ_JOIN=0 restores the old behavior: every retry is a new pread.
-// A full registry falls back the same way.
-func TestJUKEBOXJoinRollbackAndBound(t *testing.T) {
-	for _, mode := range []string{"rollback", "full"} {
+// The join is off on medium and fast links, with JM_FUSE_READ_JOIN=0, for a
+// read without identity, and when the registry is full: every retry is a new
+// pread, as before.
+func TestJUKEBOXJoinOffCases(t *testing.T) {
+	for _, mode := range []string{"medium", "rollback", "full", "no-key"} {
 		t.Run(mode, func(t *testing.T) {
 			resetPendingReads(t)
-			if mode == "rollback" {
+			key := readKey("a", 1, 1, 0, 4096)
+			switch mode {
+			case "medium":
+				demandFirstClass = func() netprofile.LinkClass { return netprofile.ClassMedium }
+			case "rollback":
 				t.Setenv("JM_FUSE_READ_JOIN", "0")
-			} else {
-				pendingFUSEReadResults = newPendingFUSEReads(time.Minute, 0)
+			case "full":
+				pendingFUSEReadResults = newPendingFUSEReads(0)
+			case "no-key":
+				key = nil
 			}
 			fp := newFakePread(0x33)
 			p := make([]byte, 4096)
 			for i := 0; i < 2; i++ {
-				joinOrReadFUSE(fp.read, "/fuse/a", "a", p, 0, 10*time.Millisecond)
+				joinOrReadFUSE(fp.read, key, "a", p, 0, 10*time.Millisecond)
 			}
 			if c := fp.calls.Load(); c != 2 {
 				t.Fatalf("preads %d, want 2 (no join)", c)
@@ -363,15 +459,22 @@ func TestJUKEBOXJoinRollbackAndBound(t *testing.T) {
 	}
 }
 
-// A finished result that no retry claims is dropped after the TTL.
-func TestPendingReadExpires(t *testing.T) {
-	resetPendingReads(t)
-	pendingFUSEReadResults = newPendingFUSEReads(30*time.Millisecond, 64)
-	fp := newFakePread(0x44)
-	p := make([]byte, 4096)
-	joinOrReadFUSE(fp.read, "/fuse/a", "a", p, 0, 10*time.Millisecond)
-	fp.unblock()
-	waitUntil(t, "the result to expire", func() bool { return pendingFUSEReadResults.len() == 0 })
+// cachedFile names its reads by open-time identity; AppleDouble sidecars and
+// files without identity never join (a sidecar read seeds the shared cache).
+func TestCachedFilePendingReadKey(t *testing.T) {
+	mt := time.Unix(100, 5)
+	f := &cachedFile{name: "dir/reel.mov", inode: 9, fuseFD: testFD, cachedInfo: &snapshotFileInfo{size: 77, mtime: mt}}
+	k := f.pendingReadKey(4096, 512)
+	if k == nil || k.name != "dir/reel.mov" || k.inode != 9 || k.size != 77 || k.mtime != mt.UnixNano() ||
+		k.fd != testFD || k.off != 4096 || k.n != 512 {
+		t.Fatalf("key = %+v", k)
+	}
+	if (&cachedFile{name: "dir/._reel.mov", fuseFD: testFD, cachedInfo: &snapshotFileInfo{}}).pendingReadKey(0, 1) != nil {
+		t.Fatal("an AppleDouble sidecar must not join")
+	}
+	if (&cachedFile{name: "x", fuseFD: testFD}).pendingReadKey(0, 1) != nil {
+		t.Fatal("a file without open-time identity must not join")
+	}
 }
 
 func waitUntil(t *testing.T, what string, cond func() bool) {

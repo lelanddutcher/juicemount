@@ -163,7 +163,7 @@ func (s *rSlice) ReadAt(ctx context.Context, page *Page, off int) (n int, err er
 		}
 		var fullPage *Page
 		var err error
-		if s.store.demand.piggyback(key) { // JuiceMount: --demand-first
+		if s.store.demand.piggyback(key, len(p)) { // JuiceMount: --demand-first
 			fullPage, err = s.store.group.TryPiggyback(key)
 		}
 		if fullPage != nil {
@@ -180,7 +180,7 @@ func (s *rSlice) ReadAt(ctx context.Context, page *Page, off int) (n int, err er
 			sc    = object.DefaultStorageClass
 		)
 		page.Acquire()
-		endDemand := s.store.demand.beginDemand()
+		endDemand := s.store.demand.beginDemand(key)
 		err = utils.WithTimeout(func() error {
 			defer page.Release()
 			in, err := s.store.storage.Get(key, int64(boff), int64(len(p)), object.WithRequestID(&reqID), object.WithStorageClass(&sc))
@@ -193,7 +193,7 @@ func (s *rSlice) ReadAt(ctx context.Context, page *Page, off int) (n int, err er
 		used := time.Since(st)
 		endDemand()
 		if err == nil {
-			s.store.demand.observeRanged(used)
+			s.store.demand.observeRanged(used, len(p))
 		}
 		logRequest("GET", key, fmt.Sprintf("RANGE(%d,%d) ", boff, len(p)), reqID, err, used)
 		s.store.objectDataBytes.WithLabelValues("GET", sc).Add(float64(n))
@@ -865,7 +865,7 @@ func NewCachedStore(storage object.ObjectStorage, config Config, reg prometheus.
 	if !config.CacheEnabled() {
 		config.Prefetch = 0 // disable prefetch if cache is disabled
 	}
-	store.demand = newDemandFirst(config.DemandFirst)
+	store.demand = newDemandFirst(config.DemandFirst, config.BlockSize)
 	store.fetcher = newPrefetcher(config.Prefetch, func(key string) { store.fillBlock(key, store.bcache) })
 
 	if store.conf.CacheDir != "memory" && store.conf.Writeback {
@@ -990,9 +990,9 @@ func (store *cachedStore) fillBlock(key string, bcache CacheManager) {
 	if _, ok := bcache.exist(key); ok {
 		return // another read already filled it
 	}
-	// --demand-first: let ranged demand reads finish before this download
-	// shares the link with them, then check the cache again.
-	if store.demand.waitIdle() > 0 {
+	// --demand-first: let ranged demand reads of other blocks finish before
+	// this download shares the link with them, then check the cache again.
+	if store.demand.waitIdle(key) > 0 {
 		if _, ok := bcache.exist(key); ok {
 			return
 		}

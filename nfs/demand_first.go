@@ -2,7 +2,9 @@ package nfs
 
 import (
 	"os"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/lelanddutcher/juicemount/internal/netprofile"
@@ -18,7 +20,9 @@ import (
 // 8 s FUSE bound. The NFS client then retried with JUKEBOX, and every retry
 // started one more pread at the same offset.
 //
-// Three rules, all inert on medium and fast links:
+// Three rules, all inert on medium and fast links. They also apply on an
+// encrypted volume: they only delay or limit speculative block reads, which
+// cost a whole-object download there too.
 //
 //  1. Defer. A read-ahead block waits, at most demandDeferMax, while any
 //     demand read is in flight (foregroundDemand).
@@ -26,13 +30,15 @@ import (
 //     has read a whole block sequentially, then adds one block for each block
 //     the reader has read, up to the policy. A scrub (random 1 MiB reads)
 //     never gets more than one speculative block.
-//  3. Cancel. A deferred block whose reader moved away is given back unread.
+//  3. Cancel. Blocks are claimed only after the wait, with every stop check
+//     run again, so a reader that moved away, a class change, a binding
+//     shutdown or offline leaves nothing claimed.
 //
 // The JUKEBOX bound itself (fuseReadTimeout, 8 s on slow links) stays. What
 // changes is the retry: a retry of a pread that is still running joins it
 // (pendingFUSEReadResults) instead of starting a new pread and taking a new
-// FUSE data slot. When the first pread finishes, its bytes answer the next
-// retry. A slow but progressing read therefore finishes once, not in a loop.
+// FUSE data slot. When that pread ends, the waiting retry gets its bytes. A
+// slow but progressing read therefore finishes once, not in a loop.
 
 // demandDeferMax bounds how long one read-ahead block waits for demand reads.
 // It equals the slow-link FUSE read bound: a demand read still running after
@@ -137,12 +143,22 @@ func demandStreamCap(sequentialBytes int64, max int) int {
 	return n
 }
 
-// pendingReadKey names one foreground pread: the same file, offset and
-// length. An NFS client retry after JUKEBOX repeats all three.
+// pendingReadKey names one foreground pread. A JUKEBOX retry repeats the
+// name, offset and length; the rest pins what the bytes came from:
+//   - inode, size and mtime are the open-time identity of the file, so a
+//     replacement by rename or an in-place write (new mtime, new size) never
+//     matches a pread of the old content;
+//   - fd is the FUSE descriptor the pread used. A remount (ensureFuseFD after
+//     the pool was invalidated) hands out new descriptors, so retries stop
+//     joining a pread stuck on the dead mount.
 type pendingReadKey struct {
-	path string
-	off  int64
-	n    int
+	name  string // in-mount path, for invalidation
+	inode uint64
+	size  int64
+	mtime int64
+	fd    *os.File
+	off   int64
+	n     int
 }
 
 type readResult struct {
@@ -151,34 +167,48 @@ type readResult struct {
 }
 
 // pendingFUSERead is a pread that outlived its bound. buf is its private
-// buffer; n and err are valid once done is closed.
+// buffer; n and err are valid once done is closed. stale is set when the
+// file was invalidated while the pread ran: its bytes then answer nobody.
 type pendingFUSERead struct {
-	done chan struct{}
-	buf  []byte
-	n    int
-	err  error
+	done  chan struct{}
+	buf   []byte
+	n     int
+	err   error
+	start time.Time
+	stale atomic.Bool
 }
 
-// pendingFUSEReads holds preads that timed out, so a retry can join them.
-// A finished result is kept for ttl, long enough for the macOS client's
-// JUKEBOX back-off (4 s, doubling to 30 s), then dropped.
+// pendingFUSEReads holds preads that timed out and are still running, so a
+// retry can join one. An entry leaves the registry when its pread ends: the
+// result goes only to retries that joined while it ran, never to a read that
+// arrives later (that one starts a fresh pread, which the block cache now
+// serves). Nothing finished is retained, so no old bytes can outlive an
+// invalidation, and memory is bounded by the reads in flight.
 type pendingFUSEReads struct {
 	mu  sync.Mutex
 	m   map[pendingReadKey]*pendingFUSERead
-	ttl time.Duration
 	max int
 }
 
-func newPendingFUSEReads(ttl time.Duration, max int) *pendingFUSEReads {
-	return &pendingFUSEReads{m: make(map[pendingReadKey]*pendingFUSERead), ttl: ttl, max: max}
+func newPendingFUSEReads(max int) *pendingFUSEReads {
+	return &pendingFUSEReads{m: make(map[pendingReadKey]*pendingFUSERead), max: max}
 }
 
 // pendingFUSEReadResults is the process-wide registry. Its size is also
 // bounded by the FUSE data gate: each running entry holds one data slot.
-var pendingFUSEReadResults = newPendingFUSEReads(40*time.Second, 64)
+var pendingFUSEReadResults = newPendingFUSEReads(64)
 
-// pendingReadJoinEnabled is the rollback switch JM_FUSE_READ_JOIN=0.
-func pendingReadJoinEnabled() bool { return os.Getenv("JM_FUSE_READ_JOIN") != "0" }
+// pendingReadJoinMaxAge: a retry joins a pread only while it is younger
+// than this many bounds. An older pread is presumed wedged (for example on
+// a dead mount), and the retry starts its own.
+const pendingReadJoinMaxAge = 3
+
+// pendingReadJoinEnabled: the join applies on slow and metered links only
+// (where a read legitimately outlives the 8 s bound), and JM_FUSE_READ_JOIN=0
+// turns it off.
+func pendingReadJoinEnabled() bool {
+	return os.Getenv("JM_FUSE_READ_JOIN") != "0" && demandFirstActive()
+}
 
 // adopt registers a pread that timed out. late delivers its result when the
 // syscall returns. It reports false (and registers nothing) when the
@@ -189,14 +219,14 @@ func (r *pendingFUSEReads) adopt(key pendingReadKey, buf []byte, late <-chan rea
 		r.mu.Unlock()
 		return false
 	}
-	pr := &pendingFUSERead{done: make(chan struct{}), buf: buf}
+	pr := &pendingFUSERead{done: make(chan struct{}), buf: buf, start: time.Now()}
 	r.m[key] = pr
 	r.mu.Unlock()
 	go func() {
 		res := <-late
 		pr.n, pr.err = res.n, res.err
+		r.drop(key, pr) // before done: a later read never sees the result
 		close(pr.done)
-		time.AfterFunc(r.ttl, func() { r.drop(key, pr) })
 	}()
 	return true
 }
@@ -209,20 +239,43 @@ func (r *pendingFUSEReads) drop(key pendingReadKey, pr *pendingFUSERead) {
 	r.mu.Unlock()
 }
 
+// forget drops every entry for name (and, with tree, beneath it) and marks
+// it stale, so retries already waiting get JUKEBOX and read again. The
+// handler calls it wherever it invalidates a path's read caches or pooled
+// descriptors (write, overwrite, rename, remove, remote events).
+func (r *pendingFUSEReads) forget(name string, tree bool) {
+	if name == "" {
+		return
+	}
+	prefix := strings.TrimSuffix(name, "/") + "/"
+	r.mu.Lock()
+	for k, pr := range r.m {
+		if k.name == name || tree && strings.HasPrefix(k.name, prefix) {
+			pr.stale.Store(true)
+			delete(r.m, k)
+		}
+	}
+	r.mu.Unlock()
+}
+
 func (r *pendingFUSEReads) len() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return len(r.m)
 }
 
-// join serves a retry of key from the pread already registered for it. ok is
-// false when there is none; the caller then reads normally. Otherwise it
-// waits up to bound: if the pread finished, it copies its bytes into p and
-// returns its result (once: the entry is dropped); if not, it returns
-// errFUSETimeout, so the client retries again, without a new pread.
+// join lets a retry of key wait for the pread already running for it. ok is
+// false when there is none (or it is too old); the caller then reads
+// normally. Otherwise it waits up to bound: if the pread ends, it copies its
+// bytes into p and returns its result; if not, or the file was invalidated,
+// it returns errFUSETimeout, so the client retries again without a new pread.
 func (r *pendingFUSEReads) join(key pendingReadKey, p []byte, bound time.Duration) (n int, err error, ok bool) {
 	r.mu.Lock()
 	pr := r.m[key]
+	if pr != nil && time.Since(pr.start) > pendingReadJoinMaxAge*bound {
+		delete(r.m, key) // presumed wedged; the retry reads on its own
+		pr = nil
+	}
 	r.mu.Unlock()
 	if pr == nil {
 		return 0, nil, false
@@ -234,7 +287,9 @@ func (r *pendingFUSEReads) join(key pendingReadKey, p []byte, bound time.Duratio
 	case <-timer.C:
 		return 0, errFUSETimeout, true
 	}
-	r.drop(key, pr)
+	if pr.stale.Load() {
+		return 0, errFUSETimeout, true
+	}
 	n = pr.n
 	if n > len(p) {
 		n = len(p)

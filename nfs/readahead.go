@@ -570,8 +570,10 @@ func (rm *ReadaheadManager) serialBlocks(fd *os.File, mapping *readaheadMappingJ
 		// user's actual read, inverting the priority this prefetcher exists to
 		// serve. If there is no room, drop the block; the next real read will
 		// fetch it.
-		rm.waitForDemand() // demand_first.go rule 1 (slow and metered only)
-		if !rm.prefetchAllowed() {
+		// demand_first.go rule 1 (slow and metered only), then the loop's
+		// own stop checks again.
+		rm.waitForDemand(func() bool { return !rm.effectivePolicy().Enabled })
+		if !rm.prefetchAllowed() || !rm.effectivePolicy().Enabled {
 			return
 		}
 		gateRelease, gateOK := tryAcquireFUSEDataBackground()
@@ -698,12 +700,18 @@ func (rm *ReadaheadManager) demandFirstOn() bool {
 	return demandFirstActive()
 }
 
-// waitForDemand is rule 1 of demand_first.go: before a read-ahead block
-// starts, wait while a demand read is in flight, at most demandDeferMax.
-// It reports whether it waited.
-func (rm *ReadaheadManager) waitForDemand() bool {
+// demandWaitSlice is how often a read-ahead that waits for a demand read
+// re-checks whether it should stop instead (offline, Stop, a class change,
+// the binding shutting down, the reader moving away).
+const demandWaitSlice = 50 * time.Millisecond
+
+// waitForDemand is rule 1 of demand_first.go: before a read-ahead block is
+// claimed, wait while a demand read is in flight, at most demandDeferMax.
+// The wait ends early when cancel reports true or the manager stops; the
+// caller re-runs every claim check after it returns.
+func (rm *ReadaheadManager) waitForDemand(cancel func() bool) {
 	if !rm.demandFirstOn() {
-		return false
+		return
 	}
 	g := rm.demand
 	if g == nil {
@@ -713,8 +721,43 @@ func (rm *ReadaheadManager) waitForDemand() bool {
 	if max <= 0 {
 		max = demandDeferMax
 	}
-	waited, _ := g.waitIdle(max, rm.stopCh)
-	return waited > 0
+	deadline := time.Now().Add(max)
+	for {
+		slice := time.Until(deadline)
+		if slice <= 0 {
+			return
+		}
+		if slice > demandWaitSlice {
+			slice = demandWaitSlice
+		}
+		if _, idle := g.waitIdle(slice, rm.stopCh); idle {
+			return
+		}
+		if !rm.prefetchAllowed() || cancel != nil && cancel() {
+			return
+		}
+	}
+}
+
+// deferWindowClaim runs rule 1 for a windowed round, only when the round
+// could claim a block right now; the claim checks then run after the wait.
+func (rm *ReadaheadManager) deferWindowClaim(inode uint64, tr *readTracker, mapping *readaheadMappingJob, inflight int) {
+	if !rm.demandFirstOn() {
+		return
+	}
+	readerHere := func() bool {
+		rm.mu.Lock()
+		defer rm.mu.Unlock()
+		return !rm.stopped && rm.trackers[inode] == tr && tr.windowNext < tr.windowEnd &&
+			inflight < rm.windowStreamCapLocked(tr, maxReadaheadWorkers, true)
+	}
+	if !readerHere() {
+		return
+	}
+	rm.waitForDemand(func() bool {
+		return !rm.effectivePolicy().ParallelFetch ||
+			(mapping != nil && mapping.b.workCtx.Err() != nil) || !readerHere()
+	})
 }
 
 // windowStreamCapLocked is rule 2 of demand_first.go: how many windowed
@@ -824,6 +867,10 @@ func (rm *ReadaheadManager) windowBlocks(inode uint64, tr *readTracker, gen uint
 	for {
 		claimed, off := false, int64(0)
 		if !stopClaims {
+			// Rules 1 and 3 of demand_first.go: wait for demand reads before
+			// claiming, so every check below runs after the wait (a seek
+			// meanwhile has reset the window, so nothing stale is claimed).
+			rm.deferWindowClaim(inode, tr, mapping, inflight)
 			pol := rm.effectivePolicy()
 			if !rm.prefetchAllowed() || !pol.ParallelFetch || claimedTotal >= maxBlocks || (mapping != nil && mapping.b.workCtx.Err() != nil) {
 				stop()
@@ -854,26 +901,6 @@ func (rm *ReadaheadManager) windowBlocks(inode uint64, tr *readTracker, gen uint
 			return
 		}
 
-		if claimed && rm.waitForDemand() {
-			// Rule 3: the block waited for a demand read. If the reader
-			// moved away meanwhile (a seek, or it read past the block), give
-			// the claim back unread.
-			rm.mu.Lock()
-			stale := rm.stopped || rm.trackers[inode] != tr || off >= tr.windowEnd ||
-				off+readaheadBlockSize <= tr.lastOffset
-			rm.mu.Unlock()
-			if stale {
-				rm.windowInflight.Add(-1)
-				claimedTotal--
-				claimed = false
-				metrics.Default().IncReadQoSPrefetchShed()
-				if inflight == 0 {
-					// Nothing left to wait for: let the next iteration claim
-					// again or end the round.
-					continue
-				}
-			}
-		}
 		if claimed {
 			gateRelease, ok := acquireWindowGate()
 			if ok && sizeLimit < 0 {

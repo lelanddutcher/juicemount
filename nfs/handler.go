@@ -1024,6 +1024,7 @@ func (h *JuiceMountHandler) SetCacheReader(cr *cache.Reader) {
 // where a path's identity actually changes (juiceFS.Rename and juiceFS.Remove)
 // via invalidatePooledFDs / invalidatePooledFDTree below.
 func (h *JuiceMountHandler) invalidateReadCaches(path string) {
+	pendingFUSEReadResults.forget(path, false)
 	if h.memBuf != nil {
 		h.memBuf.Invalidate(path)
 	}
@@ -1040,7 +1041,11 @@ func (h *JuiceMountHandler) invalidateReadCaches(path string) {
 // layer hands us) and converts to the FUSE path the pool is keyed by.
 // See FDPool.Invalidate for the corruption modes this closes.
 func (h *JuiceMountHandler) invalidatePooledFDs(inMountPath string) {
-	if h == nil || h.fdPool == nil || inMountPath == "" {
+	if h == nil || inMountPath == "" {
+		return
+	}
+	pendingFUSEReadResults.forget(inMountPath, false)
+	if h.fdPool == nil {
 		return
 	}
 	h.fdPool.Invalidate(path.Join(h.fusePath, inMountPath))
@@ -1051,7 +1056,11 @@ func (h *JuiceMountHandler) invalidatePooledFDs(inMountPath string) {
 // re-parents every descendant and thus staleness every descendant's pooled fd
 // at once. Safe (and cheap) to call for a plain file: the subtree is empty.
 func (h *JuiceMountHandler) invalidatePooledFDTree(inMountPath string) {
-	if h == nil || h.fdPool == nil || inMountPath == "" {
+	if h == nil || inMountPath == "" {
+		return
+	}
+	pendingFUSEReadResults.forget(inMountPath, true)
+	if h.fdPool == nil {
 		return
 	}
 	h.fdPool.InvalidateTree(path.Join(h.fusePath, inMountPath))
@@ -1082,6 +1091,7 @@ func (h *JuiceMountHandler) invalidatePooledFDTree(inMountPath string) {
 // path, because InvalidateTree is an O(len(entries)) scan under the single pool
 // mutex (see juiceFS.Rename for why that matters).
 func (h *JuiceMountHandler) onRemotePathInvalidated(inMountPath string, isDir bool) {
+	pendingFUSEReadResults.forget(inMountPath, isDir)
 	if isDir {
 		h.invalidatePooledReadFDTree(inMountPath)
 		return
@@ -1099,6 +1109,7 @@ func (h *JuiceMountHandler) onContentInvalidated(inMountPath string, isDir bool)
 		return
 	}
 	if isDir {
+		pendingFUSEReadResults.forget(inMountPath, true)
 		if h.memBuf != nil {
 			h.memBuf.InvalidateTree(inMountPath)
 		}
@@ -5820,28 +5831,41 @@ func boundedFUSEReadCall(read func([]byte, int64) (int, error), p []byte, off in
 }
 
 func (f *cachedFile) boundedFUSEReadAt(p []byte, off int64) (int, error) {
-	return joinOrReadFUSE(f.fuseFD.ReadAt, f.fusePath, f.name, p, off, fuseReadTimeout())
+	return joinOrReadFUSE(f.fuseFD.ReadAt, f.pendingReadKey(off, len(p)), f.name, p, off, fuseReadTimeout())
 }
 
-// joinOrReadFUSE is the online foreground pread. A retry of a pread that
-// timed out and is still registered joins it (pendingFUSEReads.join) and
-// starts no new pread; otherwise it reads through boundedFUSEReadCall, counted
-// as a demand read.
-func joinOrReadFUSE(read func([]byte, int64) (int, error), fusePath, name string, p []byte, off int64, bound time.Duration) (int, error) {
-	var key *pendingReadKey
-	if fusePath != "" && pendingReadJoinEnabled() {
-		k := pendingReadKey{path: fusePath, off: off, n: len(p)}
-		if n, err, ok := pendingFUSEReadResults.join(k, p, bound); ok {
+// pendingReadKey names this read for the JUKEBOX-retry join, or returns nil
+// when it must never join: no open-time identity, or an AppleDouble sidecar
+// (a complete sidecar read seeds the shared sidecar cache).
+func (f *cachedFile) pendingReadKey(off int64, n int) *pendingReadKey {
+	if f.cachedInfo == nil || f.fuseFD == nil || isAppleDoubleNFSPath(f.name) {
+		return nil
+	}
+	return &pendingReadKey{
+		name: f.name, inode: f.inode, size: f.cachedInfo.size, mtime: f.cachedInfo.mtime.UnixNano(),
+		fd: f.fuseFD, off: off, n: n,
+	}
+}
+
+// joinOrReadFUSE is the online foreground pread. On a slow or metered link,
+// a retry of a pread that timed out and is still running joins it
+// (pendingFUSEReads.join) and starts no new pread; otherwise it reads through
+// boundedFUSEReadCall, counted as a demand read. A nil key never joins.
+func joinOrReadFUSE(read func([]byte, int64) (int, error), key *pendingReadKey, name string, p []byte, off int64, bound time.Duration) (int, error) {
+	if key != nil && !pendingReadJoinEnabled() {
+		key = nil
+	}
+	if key != nil {
+		if n, err, ok := pendingFUSEReadResults.join(*key, p, bound); ok {
 			if errors.Is(err, errFUSETimeout) {
 				jmlog.Warn("FUSE pread still in flight; the JUKEBOX retry joined it and gets JUKEBOX again",
 					"path", name, "offset", off, "len", len(p), "timeout_ms", bound.Milliseconds())
 			} else {
-				jmlog.Info("FUSE pread finished after JUKEBOX; its bytes answer the retry",
+				jmlog.Info("FUSE pread finished while a JUKEBOX retry waited on it; its bytes answer the retry",
 					"path", name, "offset", off, "len", len(p), "n", n)
 			}
 			return n, err
 		}
-		key = &k
 	}
 	n, err, refused := boundedFUSEReadCall(read, p, off, bound, foregroundDemand, key)
 	if errors.Is(err, errFUSETimeout) {

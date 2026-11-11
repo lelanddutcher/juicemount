@@ -267,7 +267,7 @@
       "upstream_sha256": "6ab77a5713c65761e6227fcfe622031258875afb095ef04d873ae00ce8193e31"
     },
     "pkg/chunk/cached_store.go": {
-      "sha256": "3ae8052f954553993231c44df75fc580f33613d1dc3846f25383b251fecb3a4a",
+      "sha256": "db7f4c51e4f67a8e9428fefb8a5f5ec8a0b2bd404970d2f189a17bc45e9f7c72",
       "upstream_sha256": "9f7a408ad17392705751c58e4e56767ad4ba8db4b0d60bffbd32844ebf496d1a"
     },
     "pkg/chunk/cached_store_test.go": {
@@ -1109,8 +1109,8 @@
   },
   "local_files": {
     "cmd/jm_fence.go": "11959cce13a1e10985fed61e172cff969bd04c1d8200ab79e723d611b9210b33",
-    "pkg/chunk/demand_first.go": "665f840a0f1ddf5068502cf1a4eae3b46b06b0d4e76fc37f2a2473edf34aaf96",
-    "pkg/chunk/demand_first_test.go": "10eaf84659db869d46b2f12b392070638f0f38fa61b102a39ac6d422acceaf97",
+    "pkg/chunk/demand_first.go": "c24f5b9a473086f60ad1293527848c5116e55d06178d6b4570b9677a1d00b7a6",
+    "pkg/chunk/demand_first_test.go": "edc5901f74d8620cb14a47258942783823265284b948e7e2d1386ae1a026c6d5",
     "pkg/chunk/ranged_first_read_test.go": "0b2c6bfdd311a2824e650b4fd3f019199c1a9b2caa64993eacfbbd81dab77ac9",
     "pkg/chunk/upload_cache_ownership_test.go": "ebb66944296ae43b5579e12a8688d5a4c03e9ef8eecb61107d0ef0427429d791",
     "pkg/fuse/rename_flags_darwin.go": "37e49f30f2017a7ea05d47154cedaf6a90ecdab24d3c5d3639af53b4de6d6abd",
@@ -1167,7 +1167,7 @@
     "patches/0017-project-fence.patch": "a228f339d6e45cfb4b4c3f69b1b67cf4a157162006788498b62b65e00e9b6cae",
     "patches/0018-ranged-first-read.patch": "100a019fa68c2996b8af5c663b8670343d88cf63d936871bb6a302e2833f4d98",
     "patches/0019-batched-watch-round-trips.patch": "7ce67985994a8ec4618b0f13b88fb919ca8bf9ed45df60cea098cc0e74fc7be3",
-    "patches/0020-demand-read-first.patch": "bbcf82b78153140f963bac857465f2b0ae2d8b1dd6c08b82949c5093f776adba"
+    "patches/0020-demand-read-first.patch": "c5618d3eed3a4d549b8a793c8f31228815c735f17c9ea2616bdccdd7d57e78fa"
   },
   "scope": "All pkg/ and cmd/ files plus main.go, LICENSE, go.mod and go.sum from the verified module ZIP. Documentation, integration tests and SDK examples are not included. local_files are JuiceMount-owned source with no upstream counterpart.",
   "upstream_url": "https://github.com/juicedata/juicefs/tree/v1.3.1",

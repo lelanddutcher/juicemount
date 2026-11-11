@@ -175,36 +175,44 @@ func TestJMDemandFirstPrefetchDeferIsBounded(t *testing.T) {
 }
 
 func TestJMDemandFirstPiggybackOnlyWhenDownloadNearlyDone(t *testing.T) {
-	off := newDemandFirst(false)
-	if !off.piggyback("k") {
+	const bs = 4 << 20
+	off := newDemandFirst(false, bs)
+	if !off.piggyback("k", 64<<10) {
 		t.Fatal("without --demand-first a read must piggyback as upstream does")
 	}
 	var nilDF *demandFirst
-	if !nilDF.piggyback("k") {
+	if !nilDF.piggyback("k", 64<<10) {
 		t.Fatal("a store without the hook must piggyback as upstream does")
 	}
 
-	df := newDemandFirst(true)
+	df := newDemandFirst(true, bs)
 	end := df.beginFull("k")
-	if df.piggyback("k") {
+	if df.piggyback("k", 64<<10) {
 		t.Fatal("with no measurements a read must send its own GET")
 	}
 	df.fullNS.Store(int64(time.Second))
-	df.rangedNS.Store(int64(100 * time.Millisecond))
-	if df.piggyback("k") {
+	df.rangedNSPerKB.Store(int64(100 * time.Millisecond / 64)) // 64 KiB in 100 ms
+	if df.piggyback("k", 64<<10) {
 		t.Fatal("a download with ~1 s left must not hold a read whose GET takes 100 ms")
 	}
-	df.mu.Lock()
-	df.fullAt["late"] = time.Now().Add(-900 * time.Millisecond) // started 0.9 s ago
-	df.mu.Unlock()
-	if !df.piggyback("late") {
+	setStart := func(key string, ago time.Duration) {
+		df.mu.Lock()
+		df.fullAt[key] = &fullDownload{start: time.Now().Add(-ago)}
+		df.mu.Unlock()
+	}
+	setStart("late", 900*time.Millisecond) // ~100 ms left
+	if !df.piggyback("late", 64<<10) {
 		t.Fatal("a download about to finish should be shared")
 	}
-	if df.piggyback("other") {
+	// A 1 MiB GET takes ~1.6 s at this rate, so ~100 ms left is well within it.
+	if !df.piggyback("late", 1<<20) {
+		t.Fatal("the per-KiB estimate must scale with the read size")
+	}
+	if df.piggyback("other", 64<<10) {
 		t.Fatal("an untracked download must not hold a read")
 	}
 	end(nil)
-	if df.piggyback("k") {
+	if df.piggyback("k", 64<<10) {
 		t.Fatal("a finished download is no longer tracked")
 	}
 	if got := time.Duration(df.fullNS.Load()); got >= time.Second { // a ~0 s sample pulls it down
@@ -212,21 +220,86 @@ func TestJMDemandFirstPiggybackOnlyWhenDownloadNearlyDone(t *testing.T) {
 	}
 }
 
+// A download that overran its smoothed time is late, not nearly done: reads
+// must not wait for it (that brought back the 53 s case on lossy links).
+func TestJMDemandFirstDoesNotWaitForOverrunDownload(t *testing.T) {
+	df := newDemandFirst(true, 4<<20)
+	df.fullNS.Store(int64(time.Second))
+	df.rangedNSPerKB.Store(int64(time.Millisecond))
+	df.mu.Lock()
+	df.fullAt["slow"] = &fullDownload{start: time.Now().Add(-30 * time.Second)}
+	df.mu.Unlock()
+	if df.piggyback("slow", 64<<10) {
+		t.Fatal("a read waited for a download 29 s past its expected end")
+	}
+}
+
+// Reads that bypass one download total at most a quarter block; later reads
+// in that block wait for it, so a sequential reader does not fetch the block
+// twice.
+func TestJMDemandFirstBypassBudgetPerDownload(t *testing.T) {
+	const bs = 4 << 20
+	df := newDemandFirst(true, bs)
+	end := df.beginFull("k")
+	defer end(nil)
+	n := 128 << 10
+	for got := 0; got+n <= bs/4; got += n {
+		if df.piggyback("k", n) {
+			t.Fatalf("read at %d KiB of bypass waited; the budget is %d KiB", got>>10, bs/4>>10)
+		}
+	}
+	if !df.piggyback("k", n) {
+		t.Fatal("a read past the quarter-block budget must wait for the download")
+	}
+	end2 := df.beginFull("k2") // a new download has its own budget
+	defer end2(nil)
+	if df.piggyback("k2", n) {
+		t.Fatal("another block's download must start with a fresh budget")
+	}
+}
+
 func TestJMDemandFirstBeginDemandIdle(t *testing.T) {
-	df := newDemandFirst(true)
-	if w := df.waitIdle(); w != 0 {
+	df := newDemandFirst(true, 4<<20)
+	if w := df.waitIdle("k"); w != 0 {
 		t.Fatalf("waitIdle with nothing in flight waited %s", w)
 	}
-	end1, end2 := df.beginDemand(), df.beginDemand()
+	end1, end2 := df.beginDemand("a"), df.beginDemand("a")
 	end1()
 	end1() // a second call is ignored
-	df.deferMax = 50 * time.Millisecond
-	if w := df.waitIdle(); w < 40*time.Millisecond {
-		t.Fatalf("waitIdle returned after %s with one demand read in flight", w)
+	if w := df.waitIdle("a"); w != 0 {
+		t.Fatalf("demand reads of the same block held its prefetch for %s", w)
 	}
-	end2()
-	if w := df.waitIdle(); w != 0 {
+	df.deferMax = 50 * time.Millisecond
+	if w := df.waitIdle("k"); w < 40*time.Millisecond {
+		t.Fatalf("waitIdle returned after %s with a demand read of another block in flight", w)
+	}
+	df.deferMax = 5 * time.Second
+	go func() { time.Sleep(20 * time.Millisecond); end2() }()
+	if w := df.waitIdle("k"); w <= 0 || w > 2*time.Second {
+		t.Fatalf("waitIdle did not end when the last demand read ended (%s)", w)
+	}
+	if w := df.waitIdle("k"); w != 0 {
 		t.Fatalf("waitIdle waited %s after every demand read ended", w)
+	}
+}
+
+// A sequential reader: the prefetch of the block being read is not held by
+// demand reads of that same block (its download is what serves them).
+func TestJMDemandFirstPrefetchNotHeldBySameBlockDemand(t *testing.T) {
+	mem, _ := object.CreateStorage("mem", "", "", "", "")
+	data := writeBlocks(t, mem, 205, 1)
+	d := &demandStorage{ObjectStorage: mem, rangedGate: make(chan struct{})}
+	store := NewCachedStore(d, demandConf(t, true), nil).(*cachedStore)
+	r := store.NewReader(205, len(data))
+	bs := store.conf.BlockSize
+	done := goRead(r, bs/2, 64<<10) // block 0, held
+	waitFor(t, "the ranged demand GET", func() bool { return d.ranged.Load() == 1 })
+	key0 := sliceForRead(205, len(data), store).key(0)
+	store.fetcher.fetch(key0)
+	waitCached(t, store, key0) // filled while the same-block demand read is held
+	close(d.rangedGate)
+	if got := <-done; !bytes.Equal(got, data[bs/2:bs/2+64<<10]) {
+		t.Fatal("demand read returned wrong bytes")
 	}
 }
 

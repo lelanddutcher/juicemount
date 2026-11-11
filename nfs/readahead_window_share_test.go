@@ -40,7 +40,15 @@ func TestSlowWindowLeavesDrainerASlot(t *testing.T) {
 }
 
 func testSlowWindowLeavesDrainerASlot(t *testing.T, fgHeld int, fgLate bool) {
+	testSlowWindowLeavesDrainerASlotMode(t, fgHeld, fgLate, false)
+}
+
+// testSlowWindowLeavesDrainerASlotMode runs the drainer-slot check with the
+// demand-first rules off (window mechanics) or on (the Slow default; the
+// reader ramps the stream before the drain polls start).
+func testSlowWindowLeavesDrainerASlotMode(t *testing.T, fgHeld int, fgLate, rulesOn bool) {
 	t.Setenv("JM_SERVER_READAHEAD", "")
+	t.Setenv("JM_DEMAND_FIRST", "")
 	resetPrefetchOfflineState(t)
 	forceDefaultClass(t, netprofile.ClassSlow)
 	if !fuseDataGateEnabled {
@@ -50,7 +58,15 @@ func testSlowWindowLeavesDrainerASlot(t *testing.T, fgHeld int, fgLate bool) {
 	t.Cleanup(func() { fuseDataInFlight.Store(0) })
 	dir, name := windowTestFile(t, 400)
 	rm := NewReadaheadManager(dir, nil, slowProfile(t))
-	windowMechanicsOnly(rm)
+	warmup := 200 * time.Millisecond
+	if rulesOn {
+		rm.demand = newDemandGate()
+		// Rule 2 opens the window as blocks complete: let the reader ramp
+		// past three blocks and the round reach the full cap.
+		warmup = 1200 * time.Millisecond
+	} else {
+		windowMechanicsOnly(rm)
+	}
 	defer rm.Stop()
 	var peak, inflight atomic.Int32
 	rm.prefetchReadAt = func(fd *os.File, buf []byte, off int64) (int, error) {
@@ -94,7 +110,7 @@ func testSlowWindowLeavesDrainerASlot(t *testing.T, fgHeld int, fgLate bool) {
 		}
 	}()
 	defer func() { close(stop); wg.Wait() }()
-	time.Sleep(200 * time.Millisecond)
+	time.Sleep(warmup)
 	if fgLate {
 		holdForeground()
 	}
@@ -102,13 +118,19 @@ func testSlowWindowLeavesDrainerASlot(t *testing.T, fgHeld int, fgLate bool) {
 	const bound = 100 * time.Millisecond
 	for i := 0; i < 10; i++ {
 		t0 := time.Now()
+		// waited is the time to get the slot, not the hold after it: on
+		// macOS a 20 ms sleep often oversleeps, and that slack is not the
+		// drainer waiting.
+		var waited time.Duration
 		for {
 			if rel, ok := tryAcquireFUSEDataBackground(); ok {
+				waited = time.Since(t0)
 				time.Sleep(20 * time.Millisecond) // hold like a drain write
 				rel()
 				break
 			}
 			if time.Since(t0) > 2*time.Second {
+				waited = time.Since(t0)
 				break
 			}
 			time.Sleep(10 * time.Millisecond)
@@ -117,7 +139,7 @@ func testSlowWindowLeavesDrainerASlot(t *testing.T, fgHeld int, fgLate bool) {
 		if fgLate && i == 0 {
 			limit = 300*time.Millisecond + bound // one in-flight block
 		}
-		if waited := time.Since(t0); waited > limit+20*time.Millisecond {
+		if waited > limit {
 			t.Fatalf("drain poll %d waited %v for a background slot, want under %v", i, waited, limit)
 		}
 	}
