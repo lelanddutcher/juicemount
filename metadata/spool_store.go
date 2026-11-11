@@ -1125,15 +1125,40 @@ func (s *SpoolStore) ListReadyIncludingWaiting(limit int) ([]*SpoolRow, error) {
 // a project wait, nothing releases them but an explicit decision
 // (ReleaseCloneHeld / DeleteCloneHeld).
 func (s *SpoolStore) listReady(limit int, includeWaiting bool) ([]*SpoolRow, error) {
+	return s.listReadyLarger(limit, includeWaiting, -1)
+}
+
+// ListReadyLarger is ListReady restricted to rows larger than minSize bytes.
+// The drainer uses it so a large file queued behind many small ones is seen
+// while the small-file lane is full.
+func (s *SpoolStore) ListReadyLarger(minSize int64, limit int) ([]*SpoolRow, error) {
+	return s.listReadyLarger(limit, false, minSize)
+}
+
+// ListReadyLargerIncludingWaiting is ListReadyLarger plus rows waiting for a
+// project lease (see ListReadyIncludingWaiting).
+func (s *SpoolStore) ListReadyLargerIncludingWaiting(minSize int64, limit int) ([]*SpoolRow, error) {
+	return s.listReadyLarger(limit, true, minSize)
+}
+
+// minSize < 0 means no size filter.
+func (s *SpoolStore) listReadyLarger(limit int, includeWaiting bool, minSize int64) ([]*SpoolRow, error) {
 	waitClause := " AND wait_project=''"
 	if includeWaiting {
 		waitClause = ""
 	}
+	sizeClause := ""
+	args := []any{DrainReady, time.Now().UnixNano()}
+	if minSize >= 0 {
+		sizeClause = " AND size>?"
+		args = append(args, minSize)
+	}
+	args = append(args, limit)
 	rows, err := s.db.Query(
 		`SELECT id, nfs_path, spool_file, size, sha256, drain_state, drain_attempts, last_error, suspect_zero_tail, punched_end, created_at, updated_at, pause_since_ns, retry_after_ns, qualification_hold, retired_by
 			 FROM spool_entries WHERE drain_state=? AND punched_end=0 AND clone_hold='' AND qualification_hold='' AND retired_by=0 AND replacement_witness IS NULL AND retry_after_ns<=?
-			 AND NOT EXISTS (SELECT 1 FROM spool_entries newer WHERE newer.nfs_path=spool_entries.nfs_path AND newer.id>spool_entries.id AND newer.retired_by=0)`+waitClause+` ORDER BY created_at ASC LIMIT ?`,
-		DrainReady, time.Now().UnixNano(), limit,
+			 AND NOT EXISTS (SELECT 1 FROM spool_entries newer WHERE newer.nfs_path=spool_entries.nfs_path AND newer.id>spool_entries.id AND newer.retired_by=0)`+waitClause+sizeClause+` ORDER BY created_at ASC LIMIT ?`,
+		args...,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("spool list ready: %w", err)

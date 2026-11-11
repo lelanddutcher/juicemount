@@ -45,6 +45,14 @@ func (d *Drainer) listDispatchable(limit int) ([]*metadata.SpoolRow, error) {
 	return d.spool.Meta().ListReady(limit)
 }
 
+// listDispatchableLarger is listDispatchable for rows larger than minSize.
+func (d *Drainer) listDispatchableLarger(minSize int64, limit int) ([]*metadata.SpoolRow, error) {
+	if d.ProjectLeases() == nil {
+		return d.spool.Meta().ListReadyLargerIncludingWaiting(minSize, limit)
+	}
+	return d.spool.Meta().ListReadyLarger(minSize, limit)
+}
+
 // releaseHoldsWithoutLeases clears every project wait when no lease client is
 // wired. Called from Start.
 func (d *Drainer) releaseHoldsWithoutLeases() {

@@ -39,6 +39,9 @@ PATCH_FILES = {
     "patches/0019-batched-watch-round-trips.patch": ["pkg/meta/redis.go"],
     "patches/0020-demand-read-first.patch": [
         "cmd/flags.go", "cmd/mount.go", "pkg/chunk/cached_store.go"],
+    "patches/0021-reserved-inode-mkdir.patch": [
+        "pkg/meta/base.go", "pkg/meta/interface.go", "pkg/vfs/internal.go"],
+    "patches/0022-batched-rename-reads.patch": ["pkg/meta/redis.go"],
 }
 VERSION_PACKAGE = "github.com/juicedata/juicefs/pkg/version"
 

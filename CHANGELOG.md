@@ -4,6 +4,38 @@
 
 ### App
 
+- On a slow or distant link, creating a folder no longer freezes the app.
+  Before, MKDIR waited for the server. On a link with 200 ms delay that took
+  1.0 to 1.2 s in the remote lab. On a Mac in the laptop lab it took 6.0 s: the
+  slow-link deadline for a change (2 s) expired, the app answered "try
+  again", and macOS waited 4 s before it tried again. Now the app creates
+  the folder locally and answers at once (about 2 ms in the lab). The folder
+  gets its final file id at once: the app reserves JuiceFS inode numbers
+  ahead of time, and the server folder is created with the reserved number.
+  The drainer creates folders on the server before the files inside them,
+  parents first. A folder that already exists on the server is used as it
+  is. A parent that another Mac removed is created again. A folder renamed
+  or removed before it reaches the server is renamed or dropped locally, and
+  an empty one never reaches the server. Offline, folders wait locally with
+  the files. Project rules are unchanged: the drainer checks the project
+  lease before it creates a folder. Field switch: `JM_SPOOL_MKDIR=0`. The
+  bundled JuiceFS is now build `-jm7`.
+- On a slow link, a large saved file no longer waits behind many small ones.
+  Before, the drainer took files strictly oldest first, and it waited for a
+  free slot for small files even when the slot for large files was idle. In
+  the remote lab, a 500 MB file saved after 200 small files sent nothing for
+  390 s. Now the drainer sends both at once: on a 200 ms link without loss,
+  the 500 MB file reached the server in 204 s (before: not done in 600 s),
+  and everything was there in 463 s.
+- On a slow link, a large file uploads faster. The drainer now confirms the
+  upload every 16 MiB (before: every 2 MiB). Each confirmation waits for
+  every upload in flight, so 2 MiB allowed only one 4 MiB block at a time.
+  16 MiB keeps the four parallel uploads busy. On a 200 ms link with 1%
+  loss, the upload rate went from 0.6 to 2.7 Mbit/s. `JM_DRAIN_SYNC_BYTES`
+  still overrides it, now up to 64 MiB.
+- Each saved file reaches the server with 2 fewer Redis round trips: the
+  JuiceFS rename that publishes it now takes 3 round trips instead of 5.
+
 - On a lossy but working link, the volume no longer goes offline by mistake.
   Before, one failed connection check marked the server unreachable. On a
   link with 200 ms delay and 1% packet loss, one lost packet was enough, so

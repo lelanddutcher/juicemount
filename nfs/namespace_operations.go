@@ -52,7 +52,7 @@ func (c *namespaceCoordinator) readErrorLocked(name string, allActive bool) erro
 			continue
 		}
 		for _, held := range names {
-			if namespaceOverlap(name, held) {
+			if namespaceConflict(name, false, held, op.shallow) {
 				if op.failed {
 					return syscall.EIO
 				}
@@ -129,6 +129,12 @@ type namespaceOperation struct {
 	poison      bool
 	failed      bool // guarded by owner.mu
 	blocksReads bool // guarded by owner.mu
+	// shallow owns only its names and their ancestors, not what lies beneath
+	// them. The drainer creates a spooled folder on the volume this way, so
+	// creating, reading or removing entries inside the folder (all local while
+	// it is pending) is not refused with JUKEBOX for the server round trip.
+	// Set at admission; never changes.
+	shallow bool
 	// completed, set by a successful work function, runs only when the RPC
 	// already returned JUKEBOX, while the names are still owned. It lets the
 	// operation remember the outcome for the client's resend.
@@ -152,7 +158,33 @@ func namespaceOverlap(a, b string) bool {
 	return a == "." || b == "." || a == b || strings.HasPrefix(a, b+"/") || strings.HasPrefix(b, a+"/")
 }
 
+// namespaceShallowOverlap reports whether other conflicts with a shallow hold
+// on held: other is held itself or one of its ancestors.
+func namespaceShallowOverlap(other, held string) bool {
+	return other == "." || other == held || strings.HasPrefix(held, other+"/")
+}
+
+func namespaceConflict(a string, aShallow bool, b string, bShallow bool) bool {
+	switch {
+	case aShallow == bShallow:
+		return namespaceOverlap(a, b)
+	case bShallow:
+		return namespaceShallowOverlap(a, b)
+	default:
+		return namespaceShallowOverlap(b, a)
+	}
+}
+
 func (c *namespaceCoordinator) begin(names []string) *namespaceOperation {
+	return c.beginScoped(names, false)
+}
+
+// beginShallow admits a shallow operation (see namespaceOperation.shallow).
+func (c *namespaceCoordinator) beginShallow(names []string) *namespaceOperation {
+	return c.beginScoped(names, true)
+}
+
+func (c *namespaceCoordinator) beginScoped(names []string, shallow bool) *namespaceOperation {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.stopping || len(c.active) >= 24 {
@@ -167,9 +199,9 @@ func (c *namespaceCoordinator) begin(names []string) *namespaceOperation {
 	clean := make([]string, len(names))
 	for i, name := range names {
 		clean[i] = cleanNamespaceName(name)
-		for _, held := range c.active {
+		for heldOp, held := range c.active {
 			for _, other := range held {
-				if namespaceOverlap(clean[i], other) {
+				if namespaceConflict(clean[i], shallow, other, heldOp.shallow) {
 					metrics.Default().IncAdmissionRefusal(metrics.AdmissionNamespaceOverlap)
 					return nil
 				}
@@ -180,11 +212,11 @@ func (c *namespaceCoordinator) begin(names []string) *namespaceOperation {
 		c.active = make(map[*namespaceOperation][]string)
 		c.changed = make(chan struct{})
 	}
-	op := &namespaceOperation{owner: c}
+	op := &namespaceOperation{owner: c, shallow: shallow}
 	c.active[op] = clean
 	for name, epoch := range c.reads {
 		for _, held := range clean {
-			if namespaceOverlap(name, held) {
+			if namespaceConflict(name, false, held, shallow) {
 				epoch.generation++
 				break
 			}

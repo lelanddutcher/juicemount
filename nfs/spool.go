@@ -115,7 +115,9 @@ type SpoolStore struct {
 	bootSweep atomic.Pointer[bootSweepInventory]
 	// Recovery runs before serving; tests inject read failure on one store.
 	hashFileOnRecovery func(string) ([]byte, int64, error)
-	shutdownFault      func(string) error // test-only, installed before shutdown
+	// Folders created by MKDIR and not yet on the volume (spooled_mkdir.go).
+	dirs          pendingDirSet
+	shutdownFault func(string) error // test-only, installed before shutdown
 	// baseProbe returns the H-8B base identity of the backend file a new
 	// spool row replaces, and the lease epoch it is accepted under. Installed
 	// by NewDrainer (which knows the FUSE root); nil records UNKNOWN.

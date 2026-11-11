@@ -151,6 +151,9 @@ type Drainer struct {
 	// Production-only exact-generation effects. Admission is acquired before
 	// completion SQL and retained until descriptor effects and cleanup settle.
 	onDrainAdmission          func(string) *namespaceOperation
+	onDirAdmission            func(string) *namespaceOperation // shallow; spooled folders
+	dirCreate                 dirCreateLocks
+	mediaGateWaiters          atomic.Int32 // media-lane drains waiting for a gate slot
 	onDrainEffects            func(metadata.DrainCommitItem, metadata.DrainCommitResult, *os.File, []byte) error
 	onDrainSucceeded          func(string)
 	onBatchDrainCompleteExact func([]metadata.DrainCommitItem) ([]metadata.DrainCommitResult, error)
@@ -167,6 +170,13 @@ type Drainer struct {
 	// backend, no longer local-only). The dispatcher goroutine reads it on
 	// the reconnect edge, so set-before-Start provides the happens-before.
 	onSymlinkMaterialized func(linkPath string)
+
+	// Spooled MKDIR (spooled_mkdir.go). dirInodes is nil when it is off.
+	// onDirMaterialized is set once before Start. symlinkWake asks the
+	// dispatcher to retry pending symlinks (one made in a pending folder).
+	dirInodes         *dirInodePool
+	onDirMaterialized func(dirPath string, inode uint64)
+	symlinkWake       atomic.Bool
 
 	// onSidecarSkip is retained for compatibility with diagnostic fixtures.
 	// Completion never invokes the former unqualified elision hook.
@@ -256,8 +266,8 @@ type DrainerConfig struct {
 
 	// SyncIntervalBytes bounds how many destination bytes may remain dirty
 	// between durable JuiceFS flushes. Zero selects the adaptive production
-	// policy (1 MiB metered, 2 MiB slow, 4 MiB medium/fast). A positive value is
-	// a field override clamped to 256 KiB..4 MiB so it cannot recreate the
+	// policy (see durableSyncInterval). A positive value is a field override
+	// clamped to drainSyncMinBytes..drainSyncMaxBytes so it cannot recreate the
 	// whole-file Fsync. JM_DRAIN_SYNC_BYTES takes precedence.
 	SyncIntervalBytes int64
 }
@@ -381,6 +391,9 @@ func NewDrainer(spool *SpoolStore, cfg DrainerConfig) (*Drainer, error) {
 	}
 	if d.batchInsert {
 		d.batch = newDrainBatcher(d, drainBatchMaxOps, drainBatchMaxDelay)
+	}
+	if spooledMkdirEnabled() && cfg.FuseRoot != "" {
+		d.dirInodes = newDirInodePool(newJFSControl(cfg.FuseRoot))
 	}
 	// H-8B: every new spool row records the base identity of the file it
 	// replaces. The drainer owns the FUSE root, so it supplies the probe.
@@ -546,6 +559,12 @@ func (d *Drainer) SetOnDrainAdmission(fn func(string) *namespaceOperation) {
 	d.onDrainAdmission = fn
 }
 
+// SetOnDirAdmission installs the shallow admission used to create a spooled
+// folder on the volume; call before Start.
+func (d *Drainer) SetOnDirAdmission(fn func(string) *namespaceOperation) {
+	d.onDirAdmission = fn
+}
+
 func (d *Drainer) SetOnDrainEffects(fn func(metadata.DrainCommitItem, metadata.DrainCommitResult, *os.File, []byte) error) {
 	d.onDrainEffects = fn
 }
@@ -578,6 +597,12 @@ func (d *Drainer) SetOnBatchDrainComplete(fn func([]metadata.DrainCommitItem) ([
 // called BEFORE Start (read by the dispatcher on the reconnect edge).
 func (d *Drainer) SetOnSymlinkMaterialized(fn func(linkPath string)) {
 	d.onSymlinkMaterialized = fn
+}
+
+// SetOnDirMaterialized registers the hook run once a spooled folder exists
+// on the volume. Call before Start.
+func (d *Drainer) SetOnDirMaterialized(fn func(dirPath string, inode uint64)) {
+	d.onDirMaterialized = fn
 }
 
 // SetOnSidecarSkip retains the legacy hook for compatibility. It is not invoked.
@@ -624,6 +649,7 @@ func (d *Drainer) dispatchLoop() {
 	wasOffline := false
 	identityParked := false
 	symlinkCheckNeeded := true
+	dirsRemaining := false
 	var nextSymlinkAttempt time.Time
 	for {
 		// When offline, poll at a tighter cadence than pollFallback so we
@@ -631,7 +657,7 @@ func (d *Drainer) dispatchLoop() {
 		// seconds and resume draining promptly. Online, the wake signal drives
 		// us and pollFallback is just a missed-signal backstop.
 		wait := d.pollFallback
-		if pin.IsOffline() || !pin.FUSEIdentityOK() || symlinkCheckNeeded {
+		if pin.IsOffline() || !pin.FUSEIdentityOK() || symlinkCheckNeeded || dirsRemaining {
 			wait = drainOfflineRecheck
 		}
 		select {
@@ -697,6 +723,15 @@ func (d *Drainer) dispatchLoop() {
 		// The initial online wake must also recover symlinks persisted by a
 		// prior process. Only retry while unresolved; busy file-drain wakes
 		// must not issue an unbounded SQLite query for an empty link queue.
+		// Folders first: a file or link inside a pending folder needs it.
+		// The spooled MKDIR row is created before any file in it, and each
+		// round creates parents before children (spooled_mkdir.go).
+		dirsRemaining = d.materializePendingDirs()
+		d.dirInodes.topUp()
+		if d.symlinkWake.Swap(false) {
+			symlinkCheckNeeded = true
+			nextSymlinkAttempt = time.Time{}
+		}
 		if symlinkCheckNeeded && !time.Now().Before(nextSymlinkAttempt) {
 			symlinkCheckNeeded = d.materializePendingSymlinks()
 			nextSymlinkAttempt = time.Now().Add(drainOfflineRecheck)
@@ -722,16 +757,44 @@ func (d *Drainer) dispatchLoop() {
 				log.Printf("drainer: list ready: %v", err)
 				break
 			}
+			rows = d.withQueuedMediaRows(rows)
 			if len(rows) == 0 {
 				break
 			}
+			dispatched := 0
+			var laneFull *metadata.SpoolRow
 			for _, row := range rows {
 				if pin.IsOffline() || !pin.FUSEIdentityOK() {
 					break
 				}
+				// A file waits for its pending folder (created above, or
+				// on a later round when a lease or the link blocks it).
+				if d.spool.pendingAncestor(row.NFSPath) {
+					continue
+				}
+				// Skip a row whose lane is full, so a large file is not
+				// stuck behind a burst of small ones (and the reverse).
+				if lane := d.laneFor(row.Size); len(lane) >= cap(lane) {
+					if laneFull == nil {
+						laneFull = row
+					}
+					continue
+				}
 				if !d.dispatchRow(row) {
 					return // stop signal received
 				}
+				dispatched++
+			}
+			if dispatched == 0 && laneFull != nil {
+				// Every listed row's lane is full: wait for a slot on the
+				// oldest, as before.
+				if !d.dispatchRow(laneFull) {
+					return
+				}
+				dispatched++
+			}
+			if dispatched == 0 {
+				break
 			}
 		}
 		// Lever 1: the ready queue is drained (or we bailed to re-evaluate).
@@ -949,6 +1012,32 @@ func (d *Drainer) dispatchRow(row *metadata.SpoolRow) bool {
 	return true
 }
 
+// withQueuedMediaRows adds to rows (the oldest ready rows) the oldest ready
+// rows too large for the small lane. Without them a large file written after
+// a burst of small files was not listed until the burst had nearly drained:
+// in the remote lab (abroad-noloss, 200 small files, then one of 500 MB) it
+// sent no byte for the first 390 s while the media lane stood idle.
+func (d *Drainer) withQueuedMediaRows(rows []*metadata.SpoolRow) []*metadata.SpoolRow {
+	if d.smallSem == nil || len(rows) == 0 {
+		return rows
+	}
+	media, err := d.listDispatchableLarger(d.smallBytes, d.workers)
+	if err != nil {
+		log.Printf("drainer: list ready media rows: %v", err)
+		return rows
+	}
+	seen := make(map[int64]bool, len(rows))
+	for _, r := range rows {
+		seen[r.ID] = true
+	}
+	for _, r := range media {
+		if !seen[r.ID] {
+			rows = append(rows, r)
+		}
+	}
+	return rows
+}
+
 // laneFor picks the admission semaphore for a row of `size` bytes.
 //
 // A row of size 0 or unknown takes the MEDIA lane. That is deliberate: the
@@ -1046,21 +1135,33 @@ func drainLinkIsSlow() bool {
 const (
 	drainSyncMinBytes     = int64(256 << 10)
 	drainSyncMeteredBytes = int64(1 << 20)
-	drainSyncSlowBytes    = int64(2 << 20)
 	drainSyncDefaultBytes = int64(4 << 20)
+	// drainSyncSlowBytes is four JuiceFS blocks: the app mounts with
+	// --max-uploads 4, and JuiceFS uploads a block when it fills, so four
+	// blocks travel in parallel between two checkpoints. At 2 MiB (before
+	// 2026-11-11) every checkpoint flushed a half block and waited for it:
+	// one upload in flight, and on a lossy 200 ms link one TCP stream
+	// carries about 0.7 Mbit/s, so a 500 MB save needed about 90 minutes.
+	// A checkpoint waits for at most 16 MiB, about 48 s at four such
+	// streams, far inside the 900 s macFUSE daemon timeout.
+	drainSyncSlowBytes = int64(16 << 20)
+	// drainSyncMaxBytes bounds JM_DRAIN_SYNC_BYTES. A checkpoint must stay
+	// far from a whole-file Fsync, which wedged macFUSE on the 1.18 GB
+	// Finder copy.
+	drainSyncMaxBytes = int64(64 << 20)
 )
 
 // durableSyncInterval reads the live class for every row so a LAN↔cellular
-// handoff changes the maximum dirty window without an app restart. Keeping the
-// interval at or below JuiceFS's normal 4 MiB object block also prevents the
-// single whole-file Fsync that wedged macFUSE on the 1.18 GB Finder copy.
+// handoff changes the maximum dirty window without an app restart. A bounded
+// interval prevents the single whole-file Fsync that wedged macFUSE on the
+// 1.18 GB Finder copy.
 func (d *Drainer) durableSyncInterval() int64 {
 	if d.syncIntervalBytes > 0 {
 		if d.syncIntervalBytes < drainSyncMinBytes {
 			return drainSyncMinBytes
 		}
-		if d.syncIntervalBytes > drainSyncDefaultBytes {
-			return drainSyncDefaultBytes
+		if d.syncIntervalBytes > drainSyncMaxBytes {
+			return drainSyncMaxBytes
 		}
 		return d.syncIntervalBytes
 	}
@@ -1077,10 +1178,33 @@ func (d *Drainer) durableSyncInterval() int64 {
 // acquireDrainFUSESlot registers a drain as background FUSE data work. It
 // waits without occupying the gate so cached foreground reads retain the
 // reserve enforced by backgroundFUSEDataWidth. Stop aborts the wait cleanly.
+//
+// Media first: while a media-lane drain waits, small-lane drains do not take
+// a freed slot. Without this the small lane (as wide as the background gate
+// on a slow link) held every slot while a burst of small files drained, and
+// a large file uploaded nothing until the burst ended: in the remote lab
+// (abroad-noloss, 200 small files and one 500 MB file) the large file sent
+// 0 bytes for the first 390 s.
 func (d *Drainer) acquireDrainFUSESlot() (release func(), ok bool) {
+	return d.acquireDrainFUSESlotFor(false)
+}
+
+func (d *Drainer) acquireDrainFUSESlotFor(small bool) (release func(), ok bool) {
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
+	if !small {
+		d.mediaGateWaiters.Add(1)
+		defer d.mediaGateWaiters.Add(-1)
+	}
 	for {
+		if small && d.mediaGateWaiters.Load() > 0 {
+			select {
+			case <-d.stop:
+				return func() {}, false
+			case <-ticker.C:
+			}
+			continue
+		}
 		if release, ok := tryAcquireFUSEDataBackground(); ok {
 			return release, true
 		}
@@ -1157,6 +1281,13 @@ func (d *Drainer) drainOne(row *metadata.SpoolRow) {
 	// Every sidecar uses acknowledged completion; the former opt-in skip
 	// could mutate its mirror before completion was durably qualified.
 
+	// A pending folder is created by the dispatcher with its reserved inode;
+	// MkdirAll here would create it with another one.
+	if d.spool.pendingAncestor(row.NFSPath) {
+		_ = d.spool.Meta().ResetToReady(row.ID)
+		d.scheduleDelayedWake(drainOfflineRecheck)
+		return
+	}
 	dest := filepath.Join(d.fuseRoot, row.NFSPath)
 	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
 		d.failTransient(row, fmt.Errorf("mkdir parent: %w", err))
@@ -1179,7 +1310,7 @@ func (d *Drainer) drainOne(row *metadata.SpoolRow) {
 	// Draining is background work on the same FUSE daemon Finder reads through.
 	// Count it against the background half of the global data gate for the whole
 	// destination lifecycle; foreground reads always retain their reservation.
-	releaseFUSE, admitted := d.acquireDrainFUSESlot()
+	releaseFUSE, admitted := d.acquireDrainFUSESlotFor(d.smallSem != nil && d.laneFor(row.Size) == d.smallSem)
 	if !admitted {
 		_ = d.spool.Meta().ResetToReady(row.ID)
 		return

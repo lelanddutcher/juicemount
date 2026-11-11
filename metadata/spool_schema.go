@@ -185,6 +185,23 @@ CREATE TABLE IF NOT EXISTS pending_symlinks (
 );
 `
 
+// pendingDirSchema defines the pending_dirs table: folders that NFS MKDIR
+// created at local speed and the drainer has not yet created on the volume.
+//
+// inode is the number the folder already has in the mirror and in every NFS
+// file id handed out for it. When it was reserved from the running juicefs
+// (patch 0021), the drainer creates the folder with exactly that number, so
+// the id never changes under a client that holds the folder. id orders the
+// rows: a folder's row is always older than the rows of folders inside it.
+const pendingDirSchema = `
+CREATE TABLE IF NOT EXISTS pending_dirs (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    dir_path    TEXT NOT NULL UNIQUE,
+    inode       INTEGER NOT NULL,
+    created_at  INTEGER NOT NULL
+);
+`
+
 const replacementPublicationRetireGuardV1 = `CREATE TRIGGER IF NOT EXISTS spool_replacement_guard_retire BEFORE UPDATE OF retired_by ON spool_entries
 WHEN OLD.replacement_publication_required=1 AND OLD.retired_by=0 AND NEW.retired_by<>0
 AND COALESCE((SELECT phase FROM spool_replacement_publications WHERE spool_id=OLD.id),'')<>'superseded'
@@ -352,6 +369,9 @@ END;
 	}
 	if _, err := db.Exec(pendingSymlinkSchema); err != nil {
 		return fmt.Errorf("init pending-symlink schema: %w", err)
+	}
+	if _, err := db.Exec(pendingDirSchema); err != nil {
+		return fmt.Errorf("init pending-folder schema: %w", err)
 	}
 	return nil
 }
