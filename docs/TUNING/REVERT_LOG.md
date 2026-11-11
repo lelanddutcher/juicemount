@@ -7,6 +7,37 @@ a rebuild**.
 
 ---
 
+## 2026-11-11 — one slow boot sample started a cold install offline and empty (ENOENT)
+
+**What.** `bridge/cbridge.go`, `bridge/boot_offline_policy.go`,
+`metadata/redis.go`, `metadata/store.go`. Laptop lab, 200 ms RTT and 1% loss
+each way (singleflight run, after-8). The U2 boot defer used one TCP connect
+sample. It measured 611 ms against the 500 ms limit, so the app took the
+start-while-offline path. The lab starts cold, so the mirror was empty: every
+listing was empty and every open was ENOENT. When the backend answered 0.5 s
+later, the reconcile was refused ("metadata backend is not qualified") and the
+failure backoff put the next one 60 s out.
+
+**Fix.**
+1. A first sample over the limit is re-measured up to two more times. The boot
+   starts online only if some sample is at or under the limit; a failed
+   re-measure never counts as fast. The selected-owner proof (one sample, no
+   cheap re-measure) defers only above 2× the limit.
+2. An offline start with no mirror entries reports "no saved file list on this
+   Mac yet". The defer is NOT cancelled for an empty mirror: the online boot
+   over a slow link is synchronous (qualify, mount, connect, then a blocking
+   first SCAN for an empty mirror), minutes on a big volume.
+3. A full sync refused because the backend was not admitted at the SCAN's
+   generation (reconcile loop or SyncOnce) is replayed as soon as the backend
+   qualifies, past the flap debounce and the failure backoff. Any successful
+   full sync clears a pending replay. Without a refusal, qualification
+   schedules nothing.
+4. `/activity` shows "Loading the file list" / "Refreshing the file list" after
+   an offline start until the first full sync after it completes.
+
+**Revert.** `JM_BOOT_DEFER_RTT_MS=0` turns the U2 defer off entirely. There is
+no switch for 1–4 separately; revert the commit. Baseline: one sample decides.
+
 ## 2026-11-11 — lossy-link reachability flap took the volume offline (ENXIO)
 
 **What.** `health/reachability.go`, `bridge/cbridge.go`, `internal/liveness`,

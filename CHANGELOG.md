@@ -4,6 +4,23 @@
 
 ### App
 
+- On a slow or distant link, the app no longer sometimes starts offline with an
+  empty volume. At startup the app measures the time to connect to the server.
+  Above 500 ms it starts offline, which keeps a slow link from blocking the
+  start for minutes. Before, it decided on ONE measurement. In the laptop lab
+  (200 ms delay, 1% loss) one delayed packet measured 611 ms, and a Mac with no
+  saved file list started offline: every file returned "No such file or
+  directory". Now a slow first measurement is taken again, up to two more
+  times. The app starts online if any measurement is at or under 500 ms. A
+  measurement that gets no answer never counts as fast. When the app runs as
+  a separate volume owner (JuiceMount Link), there is one measurement only,
+  and it starts offline only above 1 s (twice the limit). An offline start with
+  no saved file list now says "no saved file list on this Mac yet". After an
+  offline start, the file list refreshes as soon as the server is back and
+  checked (before: up to 60 s later), and the activity status says "Loading
+  the file list" or "Refreshing the file list" until that refresh lands.
+  Field switch (unchanged): `JM_BOOT_DEFER_RTT_MS` (`0` turns the slow-start
+  rule off).
 - On a slow or distant link, the first clip you open in a session no longer
   sometimes takes about 7 s to show its first frame (lab worst case 7.3 s to
   4.5 s). macOS asks for the first two 1 MiB pieces of a file at
