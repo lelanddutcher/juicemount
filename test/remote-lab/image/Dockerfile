@@ -10,7 +10,7 @@
 # ldflags from third_party/juicefs/SOURCE.json, the same build tags, and the
 # same version check.
 
-FROM golang:1.26.10-alpine AS juicefs
+FROM golang:1.26.11-alpine AS juicefs
 # zstd, lz4 and gspt need cgo; the runtime image is alpine (musl) too.
 RUN apk add --no-cache gcc musl-dev
 WORKDIR /src
