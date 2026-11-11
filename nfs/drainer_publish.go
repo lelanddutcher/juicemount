@@ -415,7 +415,35 @@ func conflictCopyPath(dest, host string, now time.Time, n int) string {
 	if n > 1 {
 		tag = fmt.Sprintf(" (conflict %s %s %d)", host, stamp, n)
 	}
-	return filepath.Join(dir, stem+tag+ext)
+	return filepath.Join(dir, fitConflictName(stem, tag+ext))
+}
+
+// maxNameBytes is the longest file or folder name JuiceFS and macOS accept.
+const maxNameBytes = 255
+
+// fitConflictName returns stem+suffix, shortening stem (at a UTF-8 rune
+// boundary) so the whole name fits in maxNameBytes. The suffix (the conflict
+// tag and the extension) is kept whole; if even that is too long, the host
+// part of a long tag is what gets cut.
+func fitConflictName(stem, suffix string) string {
+	if len(suffix) > maxNameBytes-1 {
+		suffix = truncateUTF8(suffix, maxNameBytes-1)
+	}
+	if room := maxNameBytes - len(suffix); len(stem) > room {
+		stem = truncateUTF8(stem, room)
+	}
+	return stem + suffix
+}
+
+// truncateUTF8 cuts s to at most n bytes without splitting a rune.
+func truncateUTF8(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n]
 }
 
 // conflictCopyMarker is in the last_error of every row whose bytes were

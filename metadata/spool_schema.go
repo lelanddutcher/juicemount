@@ -50,6 +50,7 @@ CREATE TABLE IF NOT EXISTS spool_entries (
     retired_by      INTEGER NOT NULL DEFAULT 0,
     replacement_witness BLOB,
     replacement_publication_required INTEGER NOT NULL DEFAULT 0,
+    waiting_folder  INTEGER NOT NULL DEFAULT 0,
     created_at      INTEGER NOT NULL,
     updated_at      INTEGER NOT NULL
 );
@@ -185,6 +186,37 @@ CREATE TABLE IF NOT EXISTS pending_symlinks (
 );
 `
 
+// pendingDirSchema defines the pending_dirs table: folders that NFS MKDIR
+// created at local speed and the drainer has not yet created on the volume.
+//
+// inode is the number the folder already has in the mirror and in every NFS
+// file id handed out for it. When it was reserved from the running juicefs
+// (patch 0022), the drainer creates the folder with exactly that number, so
+// the id never changes under a client that holds the folder. The id is kept
+// by renames, so it does not order parents before children.
+//
+// folder_conflicts records each pending folder that was renamed to a conflict
+// name because the volume had a file with its name (shown by GET /spool).
+const pendingDirSchema = `
+CREATE TABLE IF NOT EXISTS pending_dirs (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    dir_path    TEXT NOT NULL UNIQUE,
+    inode       INTEGER NOT NULL,
+    created_at  INTEGER NOT NULL
+);
+-- waiting_folder is the pending_dirs id of the innermost folder, not on the
+-- volume yet, that a ready row was seen waiting for (ListReadySkipping); 0 =
+-- not waiting. Later listings pass marked rows over by index.
+CREATE INDEX IF NOT EXISTS idx_spool_ready_waiting ON spool_entries(drain_state, waiting_folder, created_at);
+CREATE INDEX IF NOT EXISTS idx_spool_waiting_folder ON spool_entries(waiting_folder) WHERE waiting_folder<>0;
+CREATE TABLE IF NOT EXISTS folder_conflicts (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    original_path  TEXT NOT NULL,
+    conflict_path  TEXT NOT NULL,
+    created_at     INTEGER NOT NULL
+);
+`
+
 const replacementPublicationRetireGuardV1 = `CREATE TRIGGER IF NOT EXISTS spool_replacement_guard_retire BEFORE UPDATE OF retired_by ON spool_entries
 WHEN OLD.replacement_publication_required=1 AND OLD.retired_by=0 AND NEW.retired_by<>0
 AND COALESCE((SELECT phase FROM spool_replacement_publications WHERE spool_id=OLD.id),'')<>'superseded'
@@ -273,6 +305,10 @@ func InitSpoolSchema(db *sql.DB) error {
 		`ALTER TABLE spool_entries ADD COLUMN retired_by INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE spool_entries ADD COLUMN replacement_witness BLOB`,
 		`ALTER TABLE spool_entries ADD COLUMN replacement_publication_required INTEGER NOT NULL DEFAULT 0`,
+		// The pending folder a ready row waits for (ListReadySkipping). A
+		// cache only: cleared when that folder reaches the volume, for the
+		// rows a rename moves, and at start.
+		`ALTER TABLE spool_entries ADD COLUMN waiting_folder INTEGER NOT NULL DEFAULT 0`,
 	} {
 		if _, err := db.Exec(migration); err != nil && !strings.Contains(err.Error(), "duplicate column") {
 			return fmt.Errorf("init spool schema (base identity migration): %w", err)
@@ -352,6 +388,9 @@ END;
 	}
 	if _, err := db.Exec(pendingSymlinkSchema); err != nil {
 		return fmt.Errorf("init pending-symlink schema: %w", err)
+	}
+	if _, err := db.Exec(pendingDirSchema); err != nil {
+		return fmt.Errorf("init pending-folder schema: %w", err)
 	}
 	return nil
 }

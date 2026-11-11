@@ -632,6 +632,12 @@ func main() {
 		}
 	}
 
+	if *noMount {
+		// Nothing mounts the export here; a test client needs its path. The
+		// path names this server lifetime only and is not a credential.
+		jmlog.Info("nfs export ready (not mounted)", "export", srv.ExportPath(), "addr", srv.Addr())
+	}
+
 	// Allow auto-remount only when we own the mount lifecycle.
 	if !*noMount {
 		healthMon.EnableNFSRemount(func() error {

@@ -57,6 +57,12 @@ const (
 	OpSummary = 1007
 	// CompactPath is a message to trigger compact
 	CompactPath = 1008
+	// JMReserveInodes reserves inode numbers for JMMkdirInode (JuiceMount).
+	JMReserveInodes = 1101
+	// JMMkdirInode creates a directory with a reserved inode number (JuiceMount).
+	JMMkdirInode = 1102
+	// JMReleaseInodes gives back unused reserved numbers (JuiceMount).
+	JMReleaseInodes = 1103
 )
 
 const (

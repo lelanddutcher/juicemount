@@ -296,6 +296,14 @@ type chunkObj struct {
 	Size, Off, Len uint32
 }
 
+// jmFolderInodes is implemented by the metadata engines (JuiceMount patch 0022,
+// pkg/meta/jm_reserved_inode.go).
+type jmFolderInodes interface {
+	JMReserveInodes(n uint32) (meta.Ino, uint32, syscall.Errno)
+	JMMkdirInode(ctx meta.Context, parent meta.Ino, name string, mode, cumask uint16, ino meta.Ino, attr *meta.Attr) syscall.Errno
+	JMReleaseInodes(first meta.Ino, n uint32) (uint32, syscall.Errno)
+}
+
 func (v *VFS) handleInternalMsg(ctx meta.Context, cmd uint32, r *utils.Buffer, out io.Writer) {
 	switch cmd {
 	case meta.Rmr:
@@ -519,6 +527,52 @@ func (v *VFS) handleInternalMsg(ctx meta.Context, cmd uint32, r *utils.Buffer, o
 		w.Put32(uint32(len(data)))
 		w.Put(data)
 		_, _ = out.Write(w.Bytes())
+	case meta.JMReserveInodes:
+		// JuiceMount patch 0022. Reply: errno (1 byte), first inode (8), count (4).
+		n := r.Get32()
+		var first Ino
+		var count uint32
+		eno := syscall.ENOTSUP
+		if jm, ok := v.Meta.(jmFolderInodes); ok {
+			first, count, eno = jm.JMReserveInodes(n)
+		}
+		w := utils.NewBuffer(1 + 8 + 4)
+		w.Put8(uint8(eno))
+		w.Put64(uint64(first))
+		w.Put32(count)
+		_, _ = out.Write(w.Bytes())
+	case meta.JMReleaseInodes:
+		// JuiceMount patch 0022. Reply: errno (1 byte), released count (4).
+		first := Ino(r.Get64())
+		n := r.Get32()
+		var released uint32
+		eno := syscall.ENOTSUP
+		if jm, ok := v.Meta.(jmFolderInodes); ok {
+			released, eno = jm.JMReleaseInodes(first, n)
+		}
+		w := utils.NewBuffer(1 + 4)
+		w.Put8(uint8(eno))
+		w.Put32(released)
+		_, _ = out.Write(w.Bytes())
+	case meta.JMMkdirInode:
+		// JuiceMount patch 0022. Reply: errno (1 byte).
+		parent := Ino(r.Get64())
+		ino := Ino(r.Get64())
+		mode := r.Get16()
+		cumask := r.Get16()
+		name := string(r.Get(int(r.Get8())))
+		eno := syscall.ENOTSUP
+		if jm, ok := v.Meta.(jmFolderInodes); ok {
+			eno = jm.JMMkdirInode(ctx, parent, name, mode, cumask, ino, &Attr{})
+		}
+		if eno == 0 && v.InvalidateEntry != nil {
+			// The kernel may hold a negative entry for the name; the folder
+			// was not created through it.
+			if st := v.InvalidateEntry(parent, name); st != 0 {
+				logger.Debugf("Invalidate entry %d/%s: %s", parent, name, st)
+			}
+		}
+		_, _ = out.Write([]byte{uint8(eno)})
 	case meta.CompactPath:
 		inode := Ino(r.Get64())
 		coCnt := r.Get16()
