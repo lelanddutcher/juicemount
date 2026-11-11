@@ -150,7 +150,7 @@ func TestReadOpenTimeoutFollowsTransportChanges(t *testing.T) {
 		p.ForceClass(&c)
 		want := base
 		if c == netprofile.ClassSlow || c == netprofile.ClassMetered {
-			want = max(want, 2*time.Second)
+			want = max(want, slowReadOpenTimeout)
 		}
 		if got := readOpenTimeout(); got != want {
 			t.Errorf("class %v bound=%v, want %v", c, got, want)
@@ -162,7 +162,7 @@ func TestReadOpenTimeoutFollowsTransportChanges(t *testing.T) {
 	for i := 0; i < 6; i++ {
 		p.ObserveRTT(300 * time.Millisecond)
 	}
-	if !p.HighLatency() || readOpenTimeout() != max(base, 2*time.Second) {
+	if !p.HighLatency() || readOpenTimeout() != max(base, slowReadOpenTimeout) {
 		t.Fatal("high-latency link did not extend READ-open bound")
 	}
 	if got := readOpenTimeoutFor(netprofile.ClassSlow, true, 5*time.Second); got != 5*time.Second {
@@ -170,7 +170,7 @@ func TestReadOpenTimeoutFollowsTransportChanges(t *testing.T) {
 	}
 	for _, bad := range []string{"garbage", "0", "-1"} {
 		t.Setenv("JM_FUSE_OP_TIMEOUT_MS", bad)
-		if got := readOpenTimeout(); got != max(base, 2*time.Second) {
+		if got := readOpenTimeout(); got != max(base, slowReadOpenTimeout) {
 			t.Errorf("invalid override %q changed bound to %v", bad, got)
 		}
 	}

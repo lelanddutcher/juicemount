@@ -4,6 +4,16 @@
 
 ### App
 
+- On a slow or distant link, the first clip you open in a session shows its
+  first frame sooner. macOS asks for the first two 1 MiB pieces of a file at
+  the same time, and before, each request opened the file in JuiceFS on its
+  own. macFUSE runs one request of a file at a time, so the second open
+  waited behind the first read, timed out after 2 s, and macOS asked again
+  about 4 s later. Requests for the same file now share one open. A rename,
+  a delete or a remount during that open still makes the later requests open
+  the file again, and an open stuck for over 10 s is not shared. On a slow
+  link, opening a file for reading may now take up to 4 s (before: 2 s)
+  before macOS is told to retry.
 - On a slow or distant link, the first frame of a clip that is not cached,
   and each jump while scrubbing it, arrive much sooner, and read-ahead no
   longer holds up the reads the editor waits for. A "demand read" is a read

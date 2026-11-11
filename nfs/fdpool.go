@@ -17,6 +17,12 @@ const (
 	// grace only spares holders an ErrClosed during their (already-failing)
 	// final reads.
 	fdOrphanGrace = 2 * time.Minute
+	// fdOpenJoinMax bounds how old a shared read open may be for a new caller
+	// to join it (see Get). It is above every read-open timeout, so a joiner
+	// normally waits out the same open its own open would have queued behind
+	// in macFUSE; an open stuck longer than this is treated as wedged and later
+	// callers open on their own.
+	fdOpenJoinMax = 10 * time.Second
 )
 
 // FDPool manages a pool of reusable file descriptors for JuiceFS FUSE reads.
@@ -79,7 +85,14 @@ type FDPool struct {
 	// CONCURRENT opens (dozens), which is also what makes poisoning cheap:
 	// scanning it is orders of magnitude smaller than scanning p.entries.
 	openInFlight map[*openRec]struct{}
-	stopCh       chan struct{}
+	// readFlights is the read-slot open each path's joiners share: the newest
+	// in-flight Get open for that path. See Get. Write opens never share: two
+	// GetWrite calls may pass different flags.
+	readFlights map[string]*openRec
+	// openRead is the read-slot opener; nil means os.Open. Tests set it to
+	// script a slow or failing open.
+	openRead func(string) (*os.File, error)
+	stopCh   chan struct{}
 }
 
 // openRec is one in-flight open, registered under p.mu before the lock is
@@ -87,6 +100,13 @@ type FDPool struct {
 type openRec struct {
 	key      fdKey
 	poisoned bool
+	// Read single-flight only (Get): started bounds who may join, done is
+	// closed when the leader has pooled its entry or failed, and err is the
+	// leader's open error. Written under p.mu before done closes.
+	started time.Time
+	done    chan struct{}
+	err     error
+	joiners int // callers waiting on done; diagnostics and tests
 }
 
 type pendingRef struct {
@@ -135,51 +155,105 @@ func NewFDPool() *FDPool {
 // necessary. The returned fd MUST NOT be used for writes; use GetWrite
 // for that and Release/ReleaseWrite accordingly so the read+write fds
 // stay segregated.
+//
+// SINGLE-FLIGHT (2026-11-11). Concurrent misses on one path share ONE open:
+// the first caller (the leader) runs os.Open, later callers (joiners) wait for
+// it and then take a ref on the entry it pooled. Before this, each miss ran its
+// own open. macFUSE serves one request per file at a time, so on a slow link
+// the second open queued behind the first caller's pread, passed the read-open
+// timeout and sent the client into a ~4 s JUKEBOX retry: the first file of a
+// session took 4.4-7.6 s to its first byte (laptop lab, abroad + server BBR).
+// macOS sends READs at 0 and 1 MiB for every first open, so every session hit
+// it. A joiner refuses the shared open, and opens on its own, when:
+//
+//   - the flight was poisoned (Invalidate, InvalidateTree, FlushStale) while it
+//     ran: the fd may be the pre-rename inode or the dead pre-remount mount, and
+//     only the leader, whose RPC raced the mutation, may hold it;
+//   - the flight is older than fdOpenJoinMax: a wedged open must not hold every
+//     later open of the path.
+//
+// A joiner of a flight that failed gets the leader's error, so one failing
+// open does not run again for each waiter. The flight is retired on every
+// return path, so the next Get after a failure opens afresh.
 func (p *FDPool) Get(path string) (*os.File, error) {
 	k := fdKey{path: path, write: false}
-	p.mu.Lock()
-	if p.stopped {
-		p.mu.Unlock()
-		return nil, os.ErrClosed
+	for {
+		p.mu.Lock()
+		if p.stopped {
+			p.mu.Unlock()
+			return nil, os.ErrClosed
+		}
+		if entry, ok := p.entries[k]; ok && !entry.stale {
+			entry.lastUsed = time.Now()
+			entry.refCount++
+			fd := entry.fd
+			p.mu.Unlock()
+			return fd, nil
+		} else if ok {
+			p.displaceStaleLocked(k, entry)
+		}
+		if lead := p.readFlights[path]; lead != nil && !lead.poisoned && time.Since(lead.started) < fdOpenJoinMax {
+			lead.joiners++
+			p.mu.Unlock()
+			<-lead.done
+			if lead.err != nil && !lead.poisoned {
+				return nil, lead.err
+			}
+			// The leader pooled an entry (take a ref on it above), or the
+			// flight was poisoned or stopped (refuse it: open afresh, or
+			// return ErrClosed).
+			continue
+		}
+		return p.openReadLocked(k)
 	}
-	if entry, ok := p.entries[k]; ok && !entry.stale {
-		entry.lastUsed = time.Now()
-		entry.refCount++
-		fd := entry.fd
-		p.mu.Unlock()
-		return fd, nil
-	} else if ok {
-		p.displaceStaleLocked(k, entry)
-	}
+}
+
+// openReadLocked is Get's miss path: it runs the open as the leader of a new
+// single-flight record. Caller holds p.mu; it is released on return.
+func (p *FDPool) openReadLocked(k fdKey) (*os.File, error) {
 	rec := p.beginOpenLocked(k)
+	rec.done = make(chan struct{})
+	rec.started = time.Now()
+	if p.readFlights == nil {
+		p.readFlights = make(map[string]*openRec)
+	}
+	p.readFlights[k.path] = rec
 	p.mu.Unlock()
 
-	fd, err := os.Open(path)
+	open := p.openRead
+	if open == nil {
+		open = os.Open
+	}
+	fd, err := open(k.path)
 	if err != nil {
 		// Any displaced holders' debt stays parked on the key (pendingRefs) and
 		// is absorbed by whichever Get next succeeds in creating an entry.
 		p.mu.Lock()
 		p.endOpenLocked(rec)
 		stopped := p.stopped
-		p.mu.Unlock()
 		if stopped {
-			return nil, os.ErrClosed
+			err = os.ErrClosed
 		}
+		p.finishFlightLocked(rec, err)
+		p.mu.Unlock()
 		return nil, err
 	}
 
 	p.mu.Lock()
 	poisoned := p.endOpenLocked(rec)
 	if p.stopped {
+		p.finishFlightLocked(rec, os.ErrClosed)
 		p.mu.Unlock()
 		fd.Close()
 		return nil, os.ErrClosed
 	}
-	// Double-check under lock — another goroutine may have inserted
+	// Double-check under lock: a caller that refused this flight (it was
+	// poisoned or too old) may have inserted an entry meanwhile.
 	if entry, ok := p.entries[k]; ok && !entry.stale {
 		entry.lastUsed = time.Now()
 		entry.refCount++
 		existingFD := entry.fd
+		p.finishFlightLocked(rec, nil)
 		p.mu.Unlock()
 		fd.Close() // close the one we just opened
 		return existingFD, nil
@@ -193,11 +267,24 @@ func (p *FDPool) Get(path string) (*os.File, error) {
 		// Invalidated while this open was in flight: the fd may reference the
 		// PRE-invalidation inode, so it is pooled DEAD-ON-ARRIVAL — never
 		// re-served, displaced by the next Get, and closed by the evict loop
-		// the moment this caller's ref drains. See openInFlight.
+		// the moment this caller's ref drains. See openInFlight. Joiners of
+		// this flight see rec.poisoned and open afresh.
 		stale: poisoned,
 	}
+	p.finishFlightLocked(rec, nil)
 	p.mu.Unlock()
 	return fd, nil
+}
+
+// finishFlightLocked retires a read single-flight record and wakes its
+// joiners. It runs after the leader has pooled its entry, so a woken joiner
+// finds it. Caller holds p.mu.
+func (p *FDPool) finishFlightLocked(rec *openRec, err error) {
+	if p.readFlights[rec.key.path] == rec {
+		delete(p.readFlights, rec.key.path)
+	}
+	rec.err = err
+	close(rec.done)
 }
 
 // GetWrite returns a pooled fd for writing, opening with the given flags
