@@ -267,3 +267,24 @@ func TestReadaheadBlockIsOneReadWithoutDemandFirst(t *testing.T) {
 		t.Fatalf("n=%d err=%v calls=%d, want one whole-block read", n, err, calls)
 	}
 }
+
+// Rule 4: a demand pread of 256 KiB that takes longer than demandSlowPread
+// marks blocks slow, as a JUKEBOX does; a short or fast one does not.
+func TestSlowDemandPreadMarksBlocksSlow(t *testing.T) {
+	resetDemandJukebox(t)
+	resetFUSEDataGateCounts()
+	t.Cleanup(resetFUSEDataGateCounts)
+	slow := func(d time.Duration) func([]byte, int64) (int, error) {
+		return func(p []byte, _ int64) (int, error) { time.Sleep(d); return len(p), nil }
+	}
+	gate := newDemandGate()
+	boundedFUSEReadCall(slow(0), make([]byte, 256<<10), 0, time.Second, gate, nil)
+	boundedFUSEReadCall(slow(demandSlowPread+50*time.Millisecond), make([]byte, 4096), 0, 10*time.Second, gate, nil)
+	if recentDemandJukebox() {
+		t.Fatal("a fast pread, or a slow small one, marked blocks slow")
+	}
+	boundedFUSEReadCall(slow(demandSlowPread+50*time.Millisecond), make([]byte, 256<<10), 0, 10*time.Second, gate, nil)
+	if !recentDemandJukebox() {
+		t.Fatal("a 256 KiB demand pread slower than demandSlowPread did not mark blocks slow")
+	}
+}

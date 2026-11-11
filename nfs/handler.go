@@ -5835,9 +5835,8 @@ func boundedFUSEReadCall(read func([]byte, int64) (int, error), p []byte, off in
 		}
 		return 0, errFUSETimeout, true
 	}
-	var preadStart time.Time
+	preadStart := time.Now()
 	if trace {
-		preadStart = time.Now()
 		readTimeline("rt fuse pread start", "id", id, "path", key.name, "offset", off,
 			"gate_wait_ms", preadStart.Sub(arrive).Milliseconds())
 	}
@@ -5867,6 +5866,9 @@ func boundedFUSEReadCall(read func([]byte, int64) (int, error), p []byte, off in
 				"bound_ms", bound.Milliseconds(), "adopted", adopted)
 		}
 		return 0, errFUSETimeout, false
+	}
+	if demand != nil && len(p) >= demandSlowPreadMin && !preadStart.IsZero() && time.Since(preadStart) > demandSlowPread {
+		noteDemandJukebox() // rule 4: a demand read this slow means blocks are slower still
 	}
 	if n > 0 {
 		copy(p, tmp[:n])

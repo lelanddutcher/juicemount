@@ -38,10 +38,10 @@ import (
 //  4. Slow blocks (2026-11-11 laptop lab, 1% loss and cubic: a block took
 //     46-60 s, so every read outlived the 8 s defer and read-ahead always
 //     started). While the smoothed read-ahead block time is above
-//     demandDeferMax, or a demand read timed out in the last minute, a
-//     stream that has not yet read a whole block sequentially (a scrub) gets
-//     no speculative block, and the defer has no time limit: a block waits
-//     until the demand reads end.
+//     demandDeferMax, or a demand read timed out or took longer than
+//     demandSlowPread in the last minute, a stream that has not yet read a
+//     whole block sequentially (a scrub) gets no speculative block, and the
+//     defer has no time limit: a block waits until the demand reads end.
 //  5. Pieces (2026-11-11 laptop lab, server BBR). macFUSE runs one read of
 //     a file at a time, so a demand read of a file waited behind a whole
 //     4 MiB read-ahead pread of that file (5-6 s) even with free data
@@ -71,6 +71,15 @@ var demandJukeboxAt atomic.Int64
 // demandJukeboxWindow: rule 4 holds for this long after a demand read
 // timed out.
 const demandJukeboxWindow = time.Minute
+
+// demandSlowPread: a demand pread of at least demandSlowPreadMin bytes that
+// takes longer than this also counts for rule 4. 256 KiB in 2 s is about
+// 1 Mbit/s, so a 4 MiB block would take over 30 s. (Lab, 1% loss and cubic:
+// a span round took 2-4 s, and rule 4 waited for a whole slow block.)
+const (
+	demandSlowPread    = 2 * time.Second
+	demandSlowPreadMin = 256 << 10
+)
 
 func noteDemandJukebox() { demandJukeboxAt.Store(time.Now().UnixNano()) }
 
