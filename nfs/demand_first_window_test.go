@@ -39,8 +39,8 @@ func rulesOnWindow(t *testing.T, blocks int, prof *netprofile.Profile) (*Readahe
 	t.Setenv("JM_DEMAND_FIRST", "")
 	resetPrefetchOfflineState(t)
 	forceDefaultClass(t, netprofile.ClassSlow)
-	fuseDataInFlight.Store(0)
-	t.Cleanup(func() { fuseDataInFlight.Store(0) })
+	resetFUSEDataGateCounts()
+	t.Cleanup(func() { resetFUSEDataGateCounts() })
 	dir, name := windowTestFile(t, blocks)
 	if prof == nil {
 		prof = slowProfile(t)

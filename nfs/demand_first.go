@@ -35,12 +35,75 @@ import (
 //  3. Cancel. Blocks are claimed only after the wait, with every stop check
 //     run again, so a reader that moved away, a class change, a binding
 //     shutdown or offline leaves nothing claimed.
+//  4. Slow blocks (2026-11-11 laptop lab, 1% loss and cubic: a block took
+//     46-60 s, so every read outlived the 8 s defer and read-ahead always
+//     started). While the smoothed read-ahead block time is above
+//     demandDeferMax in the last minute, or a demand read timed out or two
+//     took longer than demandSlowPread in the last minute, a stream that has
+//     not yet read a whole block sequentially (a scrub) gets no speculative
+//     block, and the defer before a block has no time limit. The wait between
+//     the pieces of a block (rule 5) stays capped at demandDeferMax.
+//  5. Pieces (2026-11-11 laptop lab, server BBR). macFUSE runs one read of
+//     a file at a time, so a demand read of a file waited behind a whole
+//     4 MiB read-ahead pread of that file (5-6 s) even with free data
+//     slots. A speculative block is read in demandChunk pieces. Before each
+//     piece after the first it gives its gate slot back, waits for demand
+//     reads (at most demandDeferMax, and only while the round still wants
+//     the block), then takes a slot again without waiting or ends early.
+//     Only the time inside the reads counts as block time. A demand read
+//     then waits for at most one piece.
 //
 // The JUKEBOX bound itself (fuseReadTimeout, 8 s on slow links) stays. What
 // changes is the retry: a retry of a pread that is still running joins it
 // (pendingFUSEReadResults) instead of starting a new pread and taking a new
 // FUSE data slot. When that pread ends, the waiting retry gets its bytes. A
 // slow but progressing read therefore finishes once, not in a loop.
+
+// demandChunk is rule 5's piece: the NFS client's read size, and the span
+// the bundled JuiceFS fetches for one miss.
+const demandChunk = 1 << 20
+
+// demandDeferSlow is rule 4's defer: in practice no limit, so a slow block
+// waits until the demand reads end (the cancel checks still apply).
+const demandDeferSlow = 10 * time.Minute
+
+// demandJukeboxAt is when the link was last found slow for rule 4 (unix
+// nanoseconds, 0 = never): a demand read outlived its FUSE bound, or two
+// demand reads in a row were slow (demandSlowPread).
+var demandJukeboxAt atomic.Int64
+
+// demandSlowWindow: rule 4 holds for this long after the link was found
+// slow, and a read-ahead block time older than this no longer counts.
+const demandSlowWindow = time.Minute
+
+// demandSlowPread: a demand pread of at least demandSlowPreadMin bytes that
+// takes longer than this, timed inside the pread (not the gate wait), is
+// slow; two slow ones within demandSlowWindow find the link slow. Lab
+// (2026-11-11, 200 ms RTT): with server BBR no 256 KiB demand pread took
+// over 2.4 s (scrub at most 1.6 s); with 1% loss and cubic they took 3-14 s.
+const (
+	demandSlowPread    = 3 * time.Second
+	demandSlowPreadMin = 256 << 10
+)
+
+// demandSlowAt is when the last slow demand pread ended (unix nanoseconds).
+var demandSlowAt atomic.Int64
+
+func noteDemandJukebox() { demandJukeboxAt.Store(time.Now().UnixNano()) }
+
+// noteDemandSlowPread records one slow demand pread; the second within
+// demandSlowWindow finds the link slow.
+func noteDemandSlowPread() {
+	now := time.Now().UnixNano()
+	if prev := demandSlowAt.Swap(now); prev != 0 && time.Duration(now-prev) < demandSlowWindow {
+		noteDemandJukebox()
+	}
+}
+
+func recentDemandJukebox() bool {
+	at := demandJukeboxAt.Load()
+	return at != 0 && time.Since(time.Unix(0, at)) < demandSlowWindow
+}
 
 // demandDeferMax bounds how long one read-ahead block waits for demand reads.
 // It equals the slow-link FUSE read bound: a demand read still running after
@@ -221,9 +284,16 @@ func newPendingFUSEReads(max int) *pendingFUSEReads {
 var pendingFUSEReadResults = newPendingFUSEReads(64)
 
 // pendingReadJoinMaxAge: a retry joins a pread only while it is younger
-// than this many bounds. An older pread is presumed wedged (for example on
-// a dead mount), and the retry starts its own.
-const pendingReadJoinMaxAge = 3
+// than this. An older pread is presumed wedged, and the retry starts its own.
+//
+// It covers a legitimately slow read: the juicefs object GET timeout on a
+// slow link is 2 minutes. At 3 FUSE bounds (24 s) a retry of a read that was
+// still progressing on a lossy link (about 50 s in the 2026-11-11 laptop lab)
+// started a second pread of the same bytes, which took another data slot and
+// was refused "data gate full". A pread stuck on a dead mount needs no age
+// limit to be left: the remount hands out new descriptors, and the fd is part
+// of the key.
+var pendingReadJoinMaxAge = 150 * time.Second
 
 // pendingReadJoinEnabled: the join applies on slow and metered links only
 // (where a read legitimately outlives the 8 s bound), and JM_FUSE_READ_JOIN=0
@@ -318,7 +388,7 @@ func (r *pendingFUSEReads) len() int {
 func (r *pendingFUSEReads) join(key pendingReadKey, p []byte, bound time.Duration) (n int, err error, ok bool) {
 	r.mu.Lock()
 	pr := r.m[key]
-	if pr != nil && time.Since(pr.start) > pendingReadJoinMaxAge*bound {
+	if pr != nil && time.Since(pr.start) > pendingReadJoinMaxAge {
 		delete(r.m, key) // presumed wedged; the retry reads on its own
 		pr = nil
 	}

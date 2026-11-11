@@ -90,7 +90,8 @@ func effectiveFUSEDataWidth() int64 {
 		// 8, not 4: background work may use only half the ceiling, and the
 		// slow-link readahead keeps up to three blocks in flight while leaving
 		// one background slot for the drainer and the warmers. At 4 the
-		// prefetcher got two slots. Foreground keeps a reserved four.
+		// prefetcher got two slots. Foreground may use all 8: it is counted
+		// apart from background (acquireFUSEData).
 		if base > 8 {
 			return 8
 		}
@@ -119,6 +120,23 @@ func tryAdmitFUSEData(width int64) bool {
 // becomes a JUKEBOX retry. Refusing is the correct outcome, not a failure: it
 // is the backpressure whose absence let reads pile onto a wedged session until
 // the machine died.
+//
+// FOREGROUND IS COUNTED APART FROM BACKGROUND (2026-11-11 laptop lab). A
+// foreground read is admitted while the FOREGROUND reads in flight are below
+// the class width and everything in flight is below the base ceiling (16, the
+// panic-derived limit). Background work (read-ahead, warmers) therefore can
+// never be the reason a foreground read is refused. Before, both counted
+// against the one slow-link width of 8: on a 200 ms lossy link a read that the
+// editor waited for got "data gate full" in 0.25 s while read-ahead and
+// timed-out preads held the slots, and the macOS NFS client then backed off
+// 30 s. Background stays capped at half the class width counted against
+// everything in flight, so on a slow link at most 8 + 4 = 12 run at once, under
+// the base ceiling. On a metered link the width is 2 and background may take
+// one slot only while nothing else runs, so at most 2 + 1 = 3 run at once
+// (before: 2 in all). That is intended: the 2026-11-11 lab measured every
+// demand-read refusal on a metered-classed link at 2 in flight with 1 of them
+// read-ahead. On fast and medium links the class width is the base, and
+// admission is exactly as before.
 func acquireFUSEData() (release func(), ok bool) {
 	if !fuseDataGateEnabled {
 		return func() {}, true
@@ -126,10 +144,10 @@ func acquireFUSEData() (release func(), ok bool) {
 	// Fast path: read the class only if we cannot admit at base width, so the
 	// uncontended case never touches netprofile's RWMutex (hot-path discipline).
 	base := int64(fuseDataGateWidth())
-	if tryAdmitFUSEData(base) {
+	if tryAdmitForegroundFUSEData(base, base) {
 		// Recheck against the narrowed width; if the class says we should not
 		// have been admitted, back out rather than exceed a slow-link ceiling.
-		if w := effectiveFUSEDataWidth(); w < base && fuseDataInFlight.Load() > w {
+		if w := effectiveFUSEDataWidth(); w < base && foregroundFUSEDataInFlight() > w {
 			fuseDataInFlight.Add(-1)
 		} else {
 			return releaseFUSEData, true
@@ -140,7 +158,7 @@ func acquireFUSEData() (release func(), ok bool) {
 	// Short spin-with-sleep rather than a channel wait: the window is a quarter
 	// second, and a slot normally frees in single-digit milliseconds.
 	for time.Now().Before(deadline) {
-		if tryAdmitFUSEData(width) {
+		if tryAdmitForegroundFUSEData(width, base) {
 			return releaseFUSEData, true
 		}
 		time.Sleep(2 * time.Millisecond)
@@ -148,10 +166,54 @@ func acquireFUSEData() (release func(), ok bool) {
 	return func() {}, false
 }
 
+// tryAdmitForegroundFUSEData admits one foreground syscall when fewer than
+// width foreground and fewer than ceiling syscalls in all are in flight. The
+// background count is read apart from the total; a background slot is added
+// to the total before it is counted as background and removed from it after,
+// so a race only overstates foreground and refuses, never over-admits.
+func tryAdmitForegroundFUSEData(width, ceiling int64) bool {
+	for {
+		cur := fuseDataInFlight.Load()
+		if cur >= ceiling || cur-fuseBackgroundInFlight.Load() >= width {
+			return false
+		}
+		if fuseDataInFlight.CompareAndSwap(cur, cur+1) {
+			return true
+		}
+	}
+}
+
+// foregroundFUSEDataInFlight is the foreground share of the gate.
+func foregroundFUSEDataInFlight() int64 {
+	return fuseDataInFlight.Load() - fuseBackgroundInFlight.Load()
+}
+
 func releaseFUSEData() { fuseDataInFlight.Add(-1) }
 
+// fuseBackgroundInFlight counts the background share of fuseDataInFlight
+// (read-ahead, warmers, the drainer's opportunistic reads), for the read
+// timeline and for foreground admission.
+var fuseBackgroundInFlight atomic.Int64
+
+// admitBackgroundFUSEData admits one background syscall below limit and
+// counts it as background.
+func admitBackgroundFUSEData(limit int64) bool {
+	if !tryAdmitFUSEData(limit) {
+		return false
+	}
+	fuseBackgroundInFlight.Add(1)
+	return true
+}
+
+func releaseBackgroundFUSEData() {
+	fuseBackgroundInFlight.Add(-1)
+	fuseDataInFlight.Add(-1)
+}
+
 // fuseDataGateDepth reports occupancy and the current ceiling, for /metrics and
-// for tests.
+// for tests. inUse counts foreground and background together, and the width
+// bounds foreground only (acquireFUSEData), so on slow and metered links inUse
+// may exceed width by the background share.
 func fuseDataGateDepth() (inUse int, width int) {
 	if !fuseDataGateEnabled {
 		return 0, 0
@@ -245,8 +307,8 @@ func tryAcquireFUSEDataBackground() (release func(), ok bool) {
 	if bg <= 0 {
 		return func() {}, false
 	}
-	if tryAdmitFUSEData(bg) {
-		return releaseFUSEData, true
+	if admitBackgroundFUSEData(bg) {
+		return releaseBackgroundFUSEData, true
 	}
 	return func() {}, false
 }

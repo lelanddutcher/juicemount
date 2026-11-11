@@ -16,6 +16,7 @@ package chunk
 // prefetcher was filling waited for the whole block.
 
 import (
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -204,5 +205,17 @@ func observeEWMA(v *atomic.Int64, sample time.Duration) {
 		if v.CompareAndSwap(old, next) {
 			return
 		}
+	}
+}
+
+// readTimelineOn: JM_READ_TIMELINE=1 (a lab switch the app passes through)
+// logs each step of a block-cache miss at Info: piggyback waits, ranged and
+// whole-block GETs (first byte and end), and prefetch work. The app's NFS
+// layer writes the matching "rt fuse ..." lines.
+var readTimelineOn = os.Getenv("JM_READ_TIMELINE") == "1"
+
+func readTimeline(format string, args ...interface{}) {
+	if readTimelineOn {
+		logger.Infof(format, args...)
 	}
 }
