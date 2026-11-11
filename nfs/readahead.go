@@ -145,6 +145,9 @@ type ReadaheadManager struct {
 	// blockNS is the smoothed time of one read-ahead block read, scaled to
 	// a whole block (demand_first.go rule 4).
 	blockNS atomic.Int64
+	// chunkWithHook makes readBlock read in pieces through prefetchReadAt
+	// too (tests of rule 5).
+	chunkWithHook bool
 
 	// Stats
 	statsMu    sync.Mutex
@@ -530,8 +533,43 @@ func (rm *ReadaheadManager) runRound(inode uint64, filePath string, maxWorkers i
 	return ran
 }
 
-// readBlock issues one prefetch ReadAt through the test hook when set.
+// readBlock reads one speculative block. With the demand-first rules on, it
+// reads in demandChunk pieces and waits for demand reads between them
+// (demand_first.go rule 5). A test hook, when set, gets the whole block
+// unless chunkWithHook is set.
 func (rm *ReadaheadManager) readBlock(fd *os.File, buf []byte, off int64) (int, error) {
+	if (rm.prefetchReadAt != nil && !rm.chunkWithHook) || !rm.demandFirstOn() || len(buf) <= demandChunk {
+		return rm.readPiece(fd, buf, off)
+	}
+	got := 0
+	for got < len(buf) {
+		if got > 0 {
+			// Rule 5: a demand read of this file would queue behind the
+			// next piece in macFUSE; let it go first.
+			rm.waitForDemand(nil)
+			if !rm.prefetchAllowed() {
+				return got, errPrefetchStopped
+			}
+		}
+		end := got + demandChunk
+		if end > len(buf) {
+			end = len(buf)
+		}
+		start := got
+		n, err := rm.readPiece(fd, buf[start:end], off+int64(start))
+		got += n
+		if err != nil {
+			return got, err
+		}
+		if n < end-start {
+			return got, io.EOF // a short piece: the file ends here
+		}
+	}
+	return got, nil
+}
+
+// readPiece issues one prefetch ReadAt through the test hook when set.
+func (rm *ReadaheadManager) readPiece(fd *os.File, buf []byte, off int64) (int, error) {
 	if rm.prefetchReadAt != nil {
 		return rm.prefetchReadAt(fd, buf, off)
 	}

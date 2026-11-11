@@ -42,12 +42,23 @@ import (
 //     stream that has not yet read a whole block sequentially (a scrub) gets
 //     no speculative block, and the defer has no time limit: a block waits
 //     until the demand reads end.
+//  5. Pieces (2026-11-11 laptop lab, server BBR). macFUSE runs one read of
+//     a file at a time, so a demand read of a file waited behind a whole
+//     4 MiB read-ahead pread of that file (5-6 s) even with free data
+//     slots. A speculative block is read in demandChunk pieces, and before
+//     each piece after the first it waits for demand reads (rule 1, or
+//     rule 4 when blocks are slow). A demand read then waits for at most
+//     one piece.
 //
 // The JUKEBOX bound itself (fuseReadTimeout, 8 s on slow links) stays. What
 // changes is the retry: a retry of a pread that is still running joins it
 // (pendingFUSEReadResults) instead of starting a new pread and taking a new
 // FUSE data slot. When that pread ends, the waiting retry gets its bytes. A
 // slow but progressing read therefore finishes once, not in a loop.
+
+// demandChunk is rule 5's piece: the NFS client's read size, and the span
+// the bundled JuiceFS fetches for one miss.
+const demandChunk = 1 << 20
 
 // demandDeferSlow is rule 4's defer: in practice no limit, so a slow block
 // waits until the demand reads end (the cancel checks still apply).

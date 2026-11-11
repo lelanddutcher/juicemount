@@ -1,6 +1,8 @@
 package nfs
 
 import (
+	"io"
+	"os"
 	"testing"
 	"time"
 
@@ -198,4 +200,70 @@ func TestJUKEBOXJoinsASlowPreadPastThreeBounds(t *testing.T) {
 		t.Fatalf("joined retry got n=%d err=%v p=%q", n, err, p)
 	}
 	waitPreadsDone(t)
+}
+
+// Rule 5: a speculative block is read in 1 MiB pieces, and a piece after the
+// first waits while a demand read is in flight, so a demand read of the same
+// file (which macFUSE runs one at a time) waits for at most one piece.
+func TestReadaheadBlockYieldsToDemandBetweenPieces(t *testing.T) {
+	resetDemandJukebox(t)
+	t.Setenv("JM_DEMAND_FIRST", "")
+	rm := &ReadaheadManager{stopCh: make(chan struct{}), demand: newDemandGate(),
+		demandFirst: func() bool { return true }, demandDefer: 5 * time.Second, chunkWithHook: true}
+	pieces := make(chan int64, 8)
+	var endDemand func()
+	rm.prefetchReadAt = func(_ *os.File, buf []byte, off int64) (int, error) {
+		if len(buf) != demandChunk {
+			t.Errorf("piece of %d bytes, want %d", len(buf), demandChunk)
+		}
+		if off == 0 {
+			endDemand = rm.demand.begin() // a demand read arrives during piece 1
+		}
+		pieces <- off
+		return len(buf), nil
+	}
+	buf := make([]byte, readaheadBlockSize)
+	done := make(chan error, 1)
+	go func() {
+		n, err := rm.readBlock(nil, buf, 0)
+		if err == nil && n != len(buf) {
+			err = io.ErrShortBuffer
+		}
+		done <- err
+	}()
+	if off := <-pieces; off != 0 {
+		t.Fatalf("first piece at %d", off)
+	}
+	select {
+	case off := <-pieces:
+		t.Fatalf("piece at %d started while a demand read was in flight", off)
+	case <-time.After(150 * time.Millisecond):
+	}
+	endDemand()
+	for want := int64(demandChunk); want < readaheadBlockSize; want += demandChunk {
+		select {
+		case off := <-pieces:
+			if off != want {
+				t.Fatalf("piece at %d, want %d", off, want)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("piece at %d never started after the demand read ended", want)
+		}
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("readBlock: %v", err)
+	}
+}
+
+// Without the demand-first rules a block is one read, as before.
+func TestReadaheadBlockIsOneReadWithoutDemandFirst(t *testing.T) {
+	rm := &ReadaheadManager{stopCh: make(chan struct{}), demandFirst: func() bool { return false }, chunkWithHook: true}
+	calls := 0
+	rm.prefetchReadAt = func(_ *os.File, buf []byte, _ int64) (int, error) {
+		calls++
+		return len(buf), nil
+	}
+	if n, err := rm.readBlock(nil, make([]byte, readaheadBlockSize), 0); err != nil || n != readaheadBlockSize || calls != 1 {
+		t.Fatalf("n=%d err=%v calls=%d, want one whole-block read", n, err, calls)
+	}
 }

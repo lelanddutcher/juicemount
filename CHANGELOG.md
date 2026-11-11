@@ -26,6 +26,10 @@
     waits until the reads the editor waits for have finished. A retry of a
     read that is still in progress joins it for up to 150 s (before: 24 s),
     instead of starting a second read of the same bytes.
+  - Read-ahead reads a block in 1 MiB pieces and lets the editor's reads go
+    first between pieces. macOS runs one read of a file at a time, so before,
+    a jump in a clip could wait 5 to 6 s behind a 4 MiB read-ahead of that
+    same clip.
 - `JM_READ_TIMELINE=1` (a lab switch) logs every step of each read: the NFS
   read, the file-read slot, the JuiceFS request with its first byte, and
   read-ahead. Without it, the app logs these steps at Debug level only.
