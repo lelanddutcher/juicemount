@@ -4,6 +4,17 @@
 
 ### App
 
+- On a slow or distant link, the first clip you open in a session no longer
+  sometimes takes about 7 s to show its first frame (lab worst case 7.3 s to
+  4.5 s). macOS asks for the first two 1 MiB pieces of a file at
+  the same time, and before, each request opened the file in JuiceFS on its
+  own. macFUSE runs one request of a file at a time, so the second open
+  waited behind the first read, timed out after 2 s, and macOS asked again
+  about 4 s later. Requests for the same file now share one open. A rename,
+  a delete or a remount during that open still makes the later requests open
+  the file again, and an open stuck for over 10 s is not shared. On a slow
+  link, opening a file for reading may now take up to 4 s (before: 2 s)
+  before macOS is told to retry.
 - On a slow or distant link, creating a folder no longer freezes the app.
   Before, MKDIR waited for the server. On a link with 200 ms delay that took
   1.0 to 1.2 s in the remote lab. On a Mac in the laptop lab it took 6.0 s: the

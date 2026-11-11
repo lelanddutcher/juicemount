@@ -388,12 +388,22 @@ func readOpenTimeout() time.Duration {
 
 func readOpenTimeoutFor(class netprofile.LinkClass, highLatency bool, base time.Duration) time.Duration {
 	if highLatency || class == netprofile.ClassSlow || class == netprofile.ClassMetered {
-		if base < 2*time.Second {
-			return 2 * time.Second
+		if base < slowReadOpenTimeout {
+			return slowReadOpenTimeout
 		}
 	}
 	return base
 }
+
+// slowReadOpenTimeout is the READ-open floor on a slow, metered or
+// high-latency link. A JuiceFS FUSE open costs about 3 round trips: 0.62-0.83 s
+// at 200 ms, with a tail to 1.5-1.9 s on a lossy link (laptop lab, 2026-11-11).
+// The old 2 s floor cut that tail. A timed-out open returns JUKEBOX, and the
+// macOS client retries about 4 s later, so a timeout under ~4 s only adds
+// delay to an open that was going to finish. 4 s still answers a wedge well
+// inside the client's soft-mount window, and stays below the 8 s slow-link
+// pread bound.
+const slowReadOpenTimeout = 4 * time.Second
 
 // mutationOpTimeout is the deadline for FUSE mutations that must complete
 // before an NFS RPC can be acknowledged (currently mkdir and symlink; chmod is
