@@ -17,8 +17,32 @@
 //
 // Cadence: 2-second base probe interval, 2-consecutive-failure threshold
 // to transition reachable→unreachable, 1-success threshold to transition
-// back. Net detection time on a real network drop: ~4 seconds (within
-// the 5-second target). Probe cost: <1 ms per attempt on a healthy LAN.
+// back. A failed probe that does not yet flip the state is confirmed by a
+// second probe after confirmDelay (250 ms) instead of waiting a full interval,
+// so the second failure costs one probe timeout, not one interval.
+//
+// Offline detection bound on a real network drop (T = effective probe
+// timeout, I = base interval, W = liveness window = 2*I, c = confirmDelay):
+//
+//	no recent backend traffic:  I + 2T + c      LAN (T=1s): ~4.3 s
+//	traffic right up to the cut: W + I + 2T + c  LAN: ~8.3 s; 200 ms WAN (T~2s): ~10.3 s
+//
+// In normal use Redis traffic is nearly always flowing, so the second row is
+// the realistic one: 4-8 s on a LAN. A Redis reply counts as proof only if it
+// came back within liveness.MaxProofLatency (2 s), so a bufferbloated link
+// whose replies take tens of seconds cannot hold the volume online.
+//
+// T is capped by maxDialTimeout (10 s, JM_REACH_MAX_DIAL_MS), so the absolute
+// worst case is W + I + 2*10s + c ≈ 26.3 s on a link with multi-second RTT.
+//
+// Lossy-link rule (2026-11-11 lab, 200 ms RTT, 1% loss each way): one lost SYN
+// or PING costs a full TCP retransmit (1 s initial RTO), which used to exceed a
+// 1 s probe budget and flip the volume offline after a single probe — 38 flaps
+// in 80 minutes, each one refusing un-pinned opens with ENXIO. Now (a) on a WAN
+// the probe budget includes one retransmit, (b) two consecutive failures are
+// required, and (c) any Redis reply or completed drain within W counts as
+// proof the link works and resets the failure streak.
+// Probe cost: <1 ms per attempt on a healthy LAN.
 package health
 
 import (
@@ -32,6 +56,21 @@ import (
 	"time"
 
 	"github.com/lelanddutcher/juicemount/internal/jmlog"
+)
+
+const (
+	// wanRTTThreshold is the smoothed probe RTT above which the link is
+	// treated as a WAN and the probe budget gets one TCP retransmit of
+	// headroom. LAN probes (handshake + PING) take a few milliseconds.
+	wanRTTThreshold = 50 * time.Millisecond
+	// retransmitAllowance is the extra budget for one lost SYN or PING. The
+	// initial TCP retransmission timeout is 1 s (RFC 6298; macOS and Linux
+	// both use it for SYN), so a single loss costs about 1 s.
+	retransmitAllowance = 1 * time.Second
+	// defaultConfirmDelay is the gap between a failed probe and the probe that
+	// confirms it. Short, so real offline detection stays fast; non-zero, so
+	// the confirm does not land in the same loss burst.
+	defaultConfirmDelay = 250 * time.Millisecond
 )
 
 // ReachabilityCallback is invoked whenever the monitor's reachable
@@ -72,8 +111,10 @@ type Reachability struct {
 	baseInterval   time.Duration // FLOOR for the probe cadence
 	maxDialTimeout time.Duration // ceiling for the adaptive dial timeout
 	adaptive       bool          // grow dialTimeout/interval with observed RTT
+	wanRetransmit  bool          // add retransmitAllowance to the budget on a WAN
 	failsToOffline int           // consecutive failures before flipping reachable→unreachable
 	passesToOnline int           // consecutive successes before flipping unreachable→reachable
+	confirmDelay   time.Duration // gap before the probe that confirms a failure
 
 	// [JM6] Adaptive jitter tolerance (WAN/cellular). TCP-RTO-style smoothed
 	// RTT + variance, measured from SUCCESSFUL probe dials. Only the probe loop
@@ -94,19 +135,18 @@ type Reachability struct {
 	// probe loop goroutine; MUST NOT block.
 	rttObserver func(time.Duration)
 
-	// livenessHook, if set, returns the elapsed time since the backend was last
-	// proven reachable by REAL data-plane I/O over the same link the probe uses
-	// (a completed drain / MinIO PUT). When a probe dial FAILS but the hook
-	// reports a recent success (within livenessWindow), the failure is treated as
-	// NOT-a-real-outage and the fail streak is left untouched — the cold SYN
-	// merely queued behind the drainer's own bulk PUT traffic on a saturated
-	// uplink (slow-link false-flap, NFSv3 sprint). A genuine outage stops the
-	// drains within seconds, the window lapses, and the normal failure flip
-	// proceeds. Kept as a plain func so this package stays free of an nfs import
-	// (clean layering). Returns a sentinel (e.g. a very large duration) when no
-	// drain has ever succeeded, which never satisfies the window. Called from the
-	// probe-loop goroutine; MUST NOT block.
-	livenessHook func() time.Duration
+	// livenessHooks each return the elapsed time since the backend was last
+	// proven reachable by REAL traffic over the same link the probe uses (a
+	// completed drain / MinIO PUT, or any Redis reply). When a probe FAILS but a
+	// hook reports a recent success (within livenessWindow), the failure is
+	// treated as NOT-a-real-outage and the fail streak is reset — the probe
+	// merely lost a packet on a lossy link, or queued behind bulk traffic on a
+	// saturated uplink. A genuine outage stops all replies within seconds, the
+	// window lapses, and the normal failure flip proceeds. Plain funcs keep
+	// this package free of nfs/metadata imports. A hook returns a very large
+	// duration when nothing has ever succeeded, which never satisfies the
+	// window. Called from the probe-loop goroutine; MUST NOT block.
+	livenessHooks []func() time.Duration
 
 	// livenessOverride enables the drain-liveness override above. Default ON;
 	// env kill-switch JM_REACH_DRAIN_LIVENESS=0 disables it so behavior is
@@ -163,9 +203,22 @@ func WithDialTimeout(d time.Duration) ReachabilityOption {
 }
 
 // WithFailureThreshold sets the consecutive-failure count required
-// to transition reachable→unreachable. Default 2.
+// to transition reachable→unreachable. Default 2. Values below 1 are
+// treated as 1.
 func WithFailureThreshold(n int) ReachabilityOption {
-	return func(r *Reachability) { r.failsToOffline = n }
+	return func(r *Reachability) {
+		if n < 1 {
+			n = 1
+		}
+		r.failsToOffline = n
+	}
+}
+
+// WithConfirmDelay sets the gap between a failed probe and the probe that
+// confirms it. Default 250 ms. A value at or above the base interval disables
+// the early confirm (the next regular tick confirms instead).
+func WithConfirmDelay(d time.Duration) ReachabilityOption {
+	return func(r *Reachability) { r.confirmDelay = d }
 }
 
 // WithSuccessThreshold sets the consecutive-success count required
@@ -219,20 +272,23 @@ func WithInitialRTT(sample time.Duration) ReachabilityOption {
 }
 
 // WithLivenessHook registers a hook returning the elapsed time since the
-// backend was last proven reachable by real data-plane I/O (a completed drain /
-// MinIO PUT) over the same physical link the probe uses. It is consulted ONLY
-// on a probe-dial FAILURE: if the hook reports a success more recent than the
-// liveness window (~2*baseInterval), the failure is suppressed (the fail streak
-// is not advanced) because a successful drain is positive proof the backend is
-// reachable — the cold SYN merely queued behind the drainer's own bulk PUT
-// traffic on a saturated uplink. A genuine outage stops drains within seconds,
-// the window lapses, and the normal 2-failure flip proceeds. The hook MUST
-// return a large sentinel duration when no drain has ever succeeded so it never
-// satisfies the window. nil hook → override inert (behavior identical to
-// today). Disabled wholesale by JM_REACH_DRAIN_LIVENESS=0. Runs on the
-// probe-loop goroutine and MUST NOT block.
+// backend was last proven reachable by real traffic (a completed drain / MinIO
+// PUT, or a Redis reply) over the same physical link the probe uses. May be
+// given more than once; any one recent proof is enough. It is consulted ONLY
+// on a probe FAILURE: if a hook reports a success more recent than the
+// liveness window (~2*baseInterval), the failure is suppressed and the fail
+// streak is reset, because real traffic is positive proof the backend is
+// reachable. A genuine outage stops all replies within seconds, the window
+// lapses, and the normal 2-failure flip proceeds. A hook MUST return a large
+// sentinel duration when nothing has ever succeeded so it never satisfies the
+// window. nil hook → ignored. Disabled wholesale by JM_REACH_DRAIN_LIVENESS=0.
+// Runs on the probe-loop goroutine and MUST NOT block.
 func WithLivenessHook(fn func() time.Duration) ReachabilityOption {
-	return func(r *Reachability) { r.livenessHook = fn }
+	return func(r *Reachability) {
+		if fn != nil {
+			r.livenessHooks = append(r.livenessHooks, fn)
+		}
+	}
 }
 
 // NewReachability constructs a monitor against the given "host:port"
@@ -247,8 +303,10 @@ func NewReachability(target string, opts ...ReachabilityOption) *Reachability {
 		baseInterval:     2 * time.Second,
 		maxDialTimeout:   10 * time.Second,
 		adaptive:         true,
+		wanRetransmit:    true,
 		failsToOffline:   2,
 		passesToOnline:   1,
+		confirmDelay:     defaultConfirmDelay,
 		reachable:        true, // presumed reachable until proven otherwise
 		livenessOverride: true, // drain-liveness false-flap suppression (kill: JM_REACH_DRAIN_LIVENESS=0)
 		dialer:           &net.Dialer{},
@@ -267,8 +325,23 @@ func NewReachability(target string, opts ...ReachabilityOption) *Reachability {
 	// Env overrides (operator escape hatch; defaults are LAN-safe).
 	//   JM_REACH_ADAPTIVE=0         disable adaptive growth (fixed dialTimeout)
 	//   JM_REACH_MAX_DIAL_MS=<n>    ceiling for the adaptive dial timeout
-	//   JM_REACH_DRAIN_LIVENESS=0   disable the drain-liveness false-flap override
-	//                               (byte-identical pre-fix behavior; REVERT_LOG)
+	//   JM_REACH_DRAIN_LIVENESS=0   disable the whole traffic-liveness override
+	//                               (drain and Redis-reply proofs; REVERT_LOG).
+	//                               JM_REACH_REDIS_LIVENESS=0 (read by the bridge
+	//                               via liveness.ReachabilityHook) drops only the
+	//                               Redis-reply proof.
+	//   JM_REACH_WAN_RETRANSMIT=0   drop the 1 s WAN retransmit allowance only
+	//                               (RTT adaptation stays on, as before 2026-11-11)
+	//   JM_REACH_FAILS_TO_OFFLINE=<n>  consecutive failures before offline (1-5);
+	//                               1 restores the pre-2026-11-11 single-probe flip
+	if v := os.Getenv("JM_REACH_FAILS_TO_OFFLINE"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 1 && n <= 5 {
+			r.failsToOffline = n
+		}
+	}
+	if os.Getenv("JM_REACH_WAN_RETRANSMIT") == "0" {
+		r.wanRetransmit = false
+	}
 	if os.Getenv("JM_REACH_ADAPTIVE") == "0" {
 		r.adaptive = false
 	}
@@ -284,15 +357,25 @@ func NewReachability(target string, opts ...ReachabilityOption) *Reachability {
 }
 
 // effectiveDialTimeout returns the per-probe dial timeout, grown to tolerate WAN
-// jitter when adaptation is on. clamp(dialTimeout, 2*srtt+4*rttvar, maxDialTimeout):
-// on a LAN the RTT-based term is far below the floor so this returns dialTimeout
-// exactly (no behavior change); on a 500ms cellular link it grows to ~1.8s so a
-// jittery dial no longer false-fails. Called only from the probe loop goroutine.
+// jitter and loss when adaptation is on:
+//
+//	clamp(dialTimeout, 2*srtt + 4*rttvar [+ retransmitAllowance on a WAN], maxDialTimeout)
+//
+// On a LAN the RTT-based term is far below the floor so this returns
+// dialTimeout exactly (no behavior change). On a WAN (srtt >= 50 ms) the budget
+// also covers one TCP retransmit, because a probe is a fresh connection plus a
+// PING and a single lost packet costs the 1 s initial RTO. Without that
+// allowance a 200 ms link (probe ~410 ms, 2*srtt+4*rttvar ~0.9 s) clamped to the
+// 1 s floor, and every lost SYN failed the probe. Called only from the probe
+// loop goroutine.
 func (r *Reachability) effectiveDialTimeout() time.Duration {
 	if !r.adaptive {
 		return r.dialTimeout
 	}
 	want := 2*r.srtt + 4*r.rttvar
+	if r.wanRetransmit && r.srtt >= wanRTTThreshold {
+		want += retransmitAllowance
+	}
 	if want < r.dialTimeout {
 		return r.dialTimeout
 	}
@@ -406,20 +489,61 @@ func (r *Reachability) loop() {
 	// state within one dialTimeout of Start().
 	r.probeAndUpdate()
 
+	// The regular cadence is a fixed ticker, exactly as before the confirm
+	// probe existed: a probe's own duration does not stretch the interval, so
+	// recovery after an outage is still noticed within one interval. The
+	// confirm probe uses its own one-shot timer and never moves the ticker.
 	ticker := time.NewTicker(r.baseInterval)
 	defer ticker.Stop()
+	var confirm *time.Timer
+	var confirmC <-chan time.Time
+	scheduleConfirm := func() {
+		if confirm != nil {
+			confirm.Stop()
+			confirm, confirmC = nil, nil
+		}
+		if d, ok := r.confirmDue(); ok {
+			confirm = time.NewTimer(d)
+			confirmC = confirm.C
+		}
+	}
+	defer func() {
+		if confirm != nil {
+			confirm.Stop()
+		}
+	}()
+	scheduleConfirm()
 	for {
 		select {
 		case <-r.stopCh:
 			return
 		case <-ticker.C:
 			r.probeAndUpdate()
+		case <-confirmC:
+			confirm, confirmC = nil, nil
+			r.probeAndUpdate()
 		case <-r.triggerCh:
 			r.probeAndUpdate()
 			// Reset the ticker so we don't immediately probe again.
 			ticker.Reset(r.baseInterval)
 		}
+		scheduleConfirm()
 	}
+}
+
+// confirmDue reports whether a failure streak is open and has not yet flipped
+// the state, and if so how long to wait before the confirming probe. The early
+// confirm keeps real offline detection near one probe timeout per required
+// failure. With a threshold of 1 a streak never stays open, so no confirm
+// probe ever runs and the cadence is the plain fixed ticker.
+func (r *Reachability) confirmDue() (time.Duration, bool) {
+	r.mu.RLock()
+	pending := r.reachable && r.consecutiveFails > 0
+	r.mu.RUnlock()
+	if pending && r.confirmDelay > 0 && r.confirmDelay < r.baseInterval {
+		return r.confirmDelay, true
+	}
+	return 0, false
 }
 
 // dispatchTransitions invokes callbacks serially in transition order. It is a
@@ -552,22 +676,25 @@ func (r *Reachability) probe() bool {
 }
 
 // drainLivenessSuppresses reports whether a probe FAILURE should be ignored
-// because the backend was proven reachable by real data-plane I/O (a completed
-// drain) within the liveness window. A successful drain rides the SAME physical
-// link the probe dials, so it is direct evidence the link is up — the failed
-// cold SYN merely queued behind the drainer's bulk PUT traffic on a saturated
-// uplink (slow-link false-flap). Returns false when the override is disabled
-// (JM_REACH_DRAIN_LIVENESS=0), no hook is wired, or the last proven I/O is
-// older than the window (a real outage: drains stop landing → the override
-// lapses → the normal failure flip proceeds). Called from the probe-loop
-// goroutine OUTSIDE r.mu so the hook (which may touch the bridge's globalMu via
-// the drainer) never nests under the reachability lock.
+// because the backend was proven reachable by real traffic (a completed drain
+// or a Redis reply) within the liveness window. That traffic rides the SAME
+// physical link the probe dials, so it is direct evidence the link is up — the
+// failed probe merely lost a packet or queued behind bulk traffic. Returns
+// false when the override is disabled (JM_REACH_DRAIN_LIVENESS=0), no hook is
+// wired, or the last proof is older than the window (a real outage: replies
+// stop → the override lapses → the normal failure flip proceeds). Called from
+// the probe-loop goroutine OUTSIDE r.mu so a hook never nests under the
+// reachability lock.
 func (r *Reachability) drainLivenessSuppresses() bool {
-	if !r.livenessOverride || r.livenessHook == nil {
+	if !r.livenessOverride {
 		return false
 	}
-	since := r.livenessHook()
-	return since >= 0 && since <= r.livenessWindow
+	for _, hook := range r.livenessHooks {
+		if since := hook(); since >= 0 && since <= r.livenessWindow {
+			return true
+		}
+	}
+	return false
 }
 
 // applyResult updates the state machine. Holds r.mu only briefly;
@@ -581,16 +708,19 @@ func (r *Reachability) applyResult(ok bool) {
 	)
 	now := time.Now()
 
-	// Drain-liveness false-flap override (NFSv3 sprint). A probe-dial FAILURE
-	// while a real drain landed within the liveness window is NOT a real outage
-	// — a cold SYN queued behind the drainer's own bulk PUT traffic on the
-	// saturated uplink. Suppress it entirely: do NOT advance (nor reset) the
-	// fail streak, leave reachable/consecutivePass untouched, fire no callback.
-	// Checked OUTSIDE r.mu (the hook may take the bridge's globalMu). A genuine
-	// outage stops drains within seconds → the window lapses → the very next
-	// failed probe falls through here and the normal 2-failure flip proceeds.
+	// Liveness false-flap override. A probe FAILURE while real traffic (a
+	// drain or a Redis reply) succeeded within the liveness window is NOT a
+	// real outage. Suppress it: reset the fail streak (the traffic is proof of
+	// a working link, so an earlier failure in the streak is contradicted
+	// too), leave reachable/consecutivePass untouched, fire no callback.
+	// Checked OUTSIDE r.mu. A genuine outage stops replies within seconds →
+	// the window lapses → the next failed probes fall through here and the
+	// normal 2-failure flip proceeds.
 	if !ok && r.drainLivenessSuppresses() {
-		jmlog.Info("reachability probe failed but drain proves backend live — suppressing false-flap",
+		r.mu.Lock()
+		r.consecutiveFails = 0
+		r.mu.Unlock()
+		jmlog.Info("reachability probe failed but recent backend traffic proves it live — suppressing false-flap",
 			"target", r.target, "liveness_window", r.livenessWindow.String())
 		return
 	}
@@ -610,6 +740,11 @@ func (r *Reachability) applyResult(ok bool) {
 	} else {
 		r.consecutivePass = 0
 		r.consecutiveFails++
+		if r.reachable && r.consecutiveFails < r.failsToOffline {
+			jmlog.Info("reachability probe failed; confirming before going offline",
+				"target", r.target, "failures", r.consecutiveFails, "needed", r.failsToOffline,
+				"probe_timeout", r.effectiveDialTimeout().String())
+		}
 		if r.reachable && r.consecutiveFails >= r.failsToOffline {
 			r.reachable = false
 			r.lastTransitionAt = now
