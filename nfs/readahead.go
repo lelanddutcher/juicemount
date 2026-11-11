@@ -638,7 +638,16 @@ func (rm *ReadaheadManager) noteBlockRead(n int, dur time.Duration) {
 		rm.profile.ObserveThroughput(int64(n), dur)
 	}
 	if n > 0 && dur > 0 {
-		observeBlockEWMA(&rm.blockNS, time.Duration(int64(dur)*readaheadBlockSize/int64(n)))
+		sample := time.Duration(int64(dur) * readaheadBlockSize / int64(n))
+		// A block time older than demandSlowWindow no longer describes the
+		// link (blocksSlow ignores it). Start over from the new sample, or one
+		// fast block after a lossy period would only pull 46 s down to 35 s
+		// and turn rule 4 back on for several more minutes.
+		if at := rm.blockAt.Load(); at == 0 || time.Since(time.Unix(0, at)) >= demandSlowWindow {
+			rm.blockNS.Store(int64(sample))
+		} else {
+			observeBlockEWMA(&rm.blockNS, sample)
+		}
 		rm.blockAt.Store(time.Now().UnixNano())
 	}
 }
@@ -689,8 +698,10 @@ func (rm *ReadaheadManager) serialBlocks(fd *os.File, mapping *readaheadMappingJ
 		// fetch it.
 		// demand_first.go rule 1 (slow and metered only), then the loop's
 		// own stop checks again.
-		rm.waitForDemand(func() bool { return !rm.effectivePolicy().Enabled })
-		if !rm.prefetchAllowed() || !rm.effectivePolicy().Enabled {
+		rm.waitForDemand(func() bool {
+			return !rm.effectivePolicy().Enabled || (mapping != nil && mapping.b.workCtx.Err() != nil)
+		})
+		if !rm.prefetchAllowed() || !rm.effectivePolicy().Enabled || (mapping != nil && mapping.b.workCtx.Err() != nil) {
 			return
 		}
 		gateRelease, gateOK := tryAcquireFUSEDataBackground()

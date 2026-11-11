@@ -454,3 +454,26 @@ func TestWindowBlockCancel(t *testing.T) {
 		t.Fatal("a windowed block was kept after the class left parallel fetch")
 	}
 }
+
+// After a stale slow period, one fast block replaces the old block time
+// instead of being averaged into it, so rule 4 does not come back on.
+func TestStaleBlockTimeResetsOnNextSample(t *testing.T) {
+	resetDemandJukebox(t)
+	rm := &ReadaheadManager{}
+	rm.blockNS.Store(int64(46 * time.Second))
+	rm.blockAt.Store(time.Now().Add(-2 * demandSlowWindow).UnixNano())
+	rm.noteBlockRead(readaheadBlockSize, time.Second)
+	if got := time.Duration(rm.blockNS.Load()); got != time.Second {
+		t.Fatalf("block time after stale reset = %v, want 1s", got)
+	}
+	if rm.blocksSlow() {
+		t.Fatal("blocks still slow after one fast block following a stale period")
+	}
+	// A fresh slow period still averages.
+	rm.blockNS.Store(int64(40 * time.Second))
+	rm.blockAt.Store(time.Now().UnixNano())
+	rm.noteBlockRead(readaheadBlockSize, time.Second)
+	if got := time.Duration(rm.blockNS.Load()); got <= 8*time.Second {
+		t.Fatalf("fresh average dropped to %v; want the 1/4 smoothing", got)
+	}
+}
