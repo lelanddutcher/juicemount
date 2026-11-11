@@ -7,6 +7,33 @@ a rebuild**.
 
 ---
 
+## 2026-11-11 — one slow boot sample started a cold install offline and empty (ENOENT)
+
+**What.** `bridge/cbridge.go`, `bridge/boot_offline_policy.go`,
+`metadata/redis.go`, `metadata/store.go`. Laptop lab, 200 ms RTT and 1% loss
+each way (singleflight run, after-8). The U2 boot defer used one TCP connect
+sample. It measured 611 ms against the 500 ms limit, so the app took the
+start-while-offline path. The lab starts cold, so the mirror was empty: every
+listing was empty and every open was ENOENT. When the backend answered 0.5 s
+later, the reconcile was refused ("metadata backend is not qualified") and the
+failure backoff put the next one 60 s out.
+
+**Fix.**
+1. A first sample over the limit is re-measured up to two more times. The boot
+   defers only if two or more samples succeeded and the fastest is still over
+   the limit. A failed re-measure counts as loss, not as slowness. The
+   selected-owner proof keeps the single-sample rule.
+2. When the mirror has no entries, the defer is cancelled and the boot runs
+   online. An offline start with no entries reports "no saved file list on this
+   Mac yet" as its status.
+3. A reconcile refused for an unqualified backend is replayed as soon as the
+   backend qualifies, past the flap debounce and the failure backoff. Without a
+   refusal, qualification schedules nothing.
+
+**Revert.** `JM_BOOT_DEFER_RTT_MS=0` turns the U2 defer off entirely. There is
+no switch for 1–3 separately; revert the commit. Baseline: one sample decides,
+and an empty mirror does not change the decision.
+
 ## 2026-11-11 — lossy-link reachability flap took the volume offline (ENXIO)
 
 **What.** `health/reachability.go`, `bridge/cbridge.go`, `internal/liveness`,

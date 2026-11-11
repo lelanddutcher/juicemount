@@ -2770,6 +2770,21 @@ func (s *Store) Count() (int, error) {
 	return count, err
 }
 
+// HasEntries reports whether the mirror holds at least one entry. Unlike
+// Count it stops at the first row, so boot can ask "is there any saved file
+// list at all?" without scanning a 200k-row table.
+func (s *Store) HasEntries() (bool, error) {
+	var one int
+	switch err := s.db.QueryRow(`SELECT 1 FROM entries LIMIT 1`).Scan(&one); err {
+	case nil:
+		return true, nil
+	case sql.ErrNoRows:
+		return false, nil
+	default:
+		return false, err
+	}
+}
+
 // GetMeta reads a value from the durable store_meta key/value table (C1).
 // ok is false when the key is absent (not an error); a real query error is
 // returned in err. Callers treat (…, false, nil) as "no value persisted".

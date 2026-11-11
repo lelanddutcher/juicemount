@@ -1471,15 +1471,40 @@ func nfsServerStartSerialized(configJSON *C.char, recovery *servingDesiredRecord
 	// link. A U3 boot already has everything the defer buys (startedOffline
 	// is forced below: no boot sync, offline gates live, banner) EXCEPT the
 	// mount skip — which is exactly the part that must not happen.
+	//
+	// Lossy-link rule (2026-11-11 lab, after-8): one connect sample is not
+	// proof of a slow link. One delayed packet on a 200 ms + 1% loss path
+	// measured 611 ms against the 500 ms limit, and a cold install started
+	// offline with nothing to show. confirmSlowBootRTT re-measures a slow
+	// first sample and defers only when the fastest of two or more samples is
+	// still over the limit (boot_offline_policy.go). The decision is applied
+	// after the store opens: with no saved file list there is nothing to serve
+	// offline, so the defer is cancelled there.
 	bootRTTDeferred := false
 	if backendUp && bootRTT > 0 && !bootUserOffline {
-		deferMS := int64(500)
-		if v := os.Getenv("JM_BOOT_DEFER_RTT_MS"); v != "" {
-			if n, pErr := strconv.ParseInt(v, 10, 64); pErr == nil {
-				deferMS = n
+		var resample bootRTTSampler
+		switch {
+		case ownerMode && ownerReceipt.LinkEnabled:
+			// The owner proof is one bounded operation; keep its sample.
+		case linkNode == nil:
+			resample = func() (bool, time.Duration) {
+				return backendReachableRTT(cfg.RedisURL, 1500*time.Millisecond)
+			}
+		default:
+			resample = func() (bool, time.Duration) {
+				rtt, err := linkRedisPingRTT(linkNode, linkProbeURL, 1500*time.Millisecond)
+				if err != nil {
+					return false, 0
+				}
+				netprofile.Default().ObserveRTT(rtt)
+				return true, rtt
 			}
 		}
-		if deferMS > 0 && bootRTT.Milliseconds() > deferMS {
+		threshold := bootDeferThreshold()
+		first := bootRTT
+		best, slow, samples := confirmSlowBootRTT(first, threshold, resample)
+		bootRTT = best
+		if slow {
 			// Review fix (HIGH): do NOT just flip backendUp — a
 			// reachable-but-slow backend ANSWERS the single connect attempt,
 			// which would leave startedOffline=false and produce the worst
@@ -1491,12 +1516,13 @@ func nfsServerStartSerialized(configJSON *C.char, recovery *servingDesiredRecord
 			backendUp = false
 			bootRTTDeferred = true
 			jmlog.Warn("backend reachable but RTT above boot-defer threshold — forcing the start-while-offline path (U2)",
-				"rtt_ms", bootRTT.Milliseconds(), "threshold_ms", deferMS)
+				"rtt_ms", best.Milliseconds(), "first_rtt_ms", first.Milliseconds(),
+				"samples", samples, "threshold_ms", threshold.Milliseconds())
+		} else if samples > 1 {
+			jmlog.Info("boot RTT sample over the defer threshold was not confirmed — starting online",
+				"first_rtt_ms", first.Milliseconds(), "best_rtt_ms", best.Milliseconds(),
+				"samples", samples, "threshold_ms", threshold.Milliseconds())
 		}
-	}
-	if !backendUp {
-		jmlog.Warn("metadata backend unreachable at startup — taking the start-while-offline path (serving cached navigation; reads resume when the backend returns)",
-			"backend", "redis")
 	}
 
 	// Mount JuiceFS FUSE if not already mounted. This is what the standalone
@@ -1702,6 +1728,27 @@ func nfsServerStartSerialized(configJSON *C.char, recovery *servingDesiredRecord
 		return C.CString(fmt.Sprintf("error: open store: %v", openErr))
 	}
 	globalStore = store
+	// Is there a saved file list to serve while offline? An error reads as
+	// "has entries": it keeps the old behaviour and never cancels a defer on
+	// a guess.
+	mirrorHasEntries := true
+	if has, hasErr := store.HasEntries(); hasErr != nil {
+		jmlog.Warn("could not check for a saved file list at startup", "error", hasErr.Error())
+	} else {
+		mirrorHasEntries = has
+	}
+	if skipDeferForEmptyMirror(bootRTTDeferred, mirrorHasEntries) {
+		// Nothing to serve offline: a slow online boot shows the files, an
+		// offline one shows an empty volume. mountFUSE and connectBootRedis
+		// below read backendUp, so this lands before either lane runs.
+		backendUp, bootRTTDeferred = true, false
+		jmlog.Warn("slow backend at startup but no saved file list on this Mac — starting online instead of offline",
+			"rtt_ms", bootRTT.Milliseconds())
+	}
+	if !backendUp {
+		jmlog.Warn("metadata backend unreachable at startup — taking the start-while-offline path (serving cached navigation; reads resume when the backend returns)",
+			"backend", "redis", "saved_file_list", mirrorHasEntries)
+	}
 	cachePaths, pathErr := metadata.OpenCachePathEligibility(store)
 	if pathErr != nil {
 		_ = store.Close()
@@ -1793,6 +1840,9 @@ func nfsServerStartSerialized(configJSON *C.char, recovery *servingDesiredRecord
 		startedOffline = true
 	}
 	if startedOffline {
+		// No saved file list: say so in the status instead of letting the
+		// empty volume look like every file is missing.
+		startOfflineReason = startOfflineReasonFor(startOfflineReason, mirrorHasEntries)
 		detail := "boot reachability probe classified the backend unavailable"
 		if connectErr != nil {
 			detail = connectErr.Error()
@@ -1816,6 +1866,9 @@ func nfsServerStartSerialized(configJSON *C.char, recovery *servingDesiredRecord
 	if bootUserOffline {
 		startedOffline = true
 		startOfflineReason = "offline mode is on (your setting from last session)"
+		if !mirrorHasEntries {
+			startOfflineReason = "offline mode is on (your setting from last session), and this Mac has no saved file list yet. Turn offline mode off to load files"
+		}
 		pin.SetOffline(true)
 	}
 	if selectedOwner != nil {

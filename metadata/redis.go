@@ -269,6 +269,19 @@ type RedisClient struct {
 	// (Swap(false)) by reconcileLoop.
 	pruneFollowUp atomic.Bool
 
+	// unqualifiedSyncSkipped records that a reconcile was refused with
+	// ErrBackendUnqualified. qualifiedFollowUp marks the next syncNowCh wake
+	// as the catch-up for that refusal. Boot-offline recovery depends on it:
+	// the reachability monitor fires TriggerSync the moment the backend
+	// answers, which is BEFORE the cache session has re-qualified it, so that
+	// reconcile is refused and the failure backoff schedules the next one 60 s
+	// out. With an empty or stale mirror the volume then shows nothing (or old
+	// data) for a minute after the backend is back. SetBackendQualified(true)
+	// consumes the skip and runs the reconcile at once, bypassing the
+	// flap debounce and the backoff floor exactly like pruneFollowUp.
+	unqualifiedSyncSkipped atomic.Bool
+	qualifiedFollowUp      atomic.Bool
+
 	// V2.3 U6 (task #37): live progress of the in-flight full SCAN, so the
 	// UI can render "Rebuilding index… N / ~M" instead of a bare spinner
 	// (field report: an opaque multi-minute rebuild feels broken). scanned
@@ -1362,7 +1375,26 @@ func (rc *RedisClient) SetBackendQualified(qualified bool) {
 	rc.lifecycleMu.Unlock()
 	if !qualified {
 		rc.setEngagement(keyspaceDegraded)
+		return
 	}
+	rc.scheduleQualifiedFollowUp()
+}
+
+// scheduleQualifiedFollowUp runs the reconcile that an unqualified backend
+// refused, as soon as the backend is admitted. No-op when nothing was refused,
+// so a normal online boot (qualify, then the boot sync) does not pay a second
+// full SCAN.
+func (rc *RedisClient) scheduleQualifiedFollowUp() {
+	if _, _, admitted := rc.backendAdmission(); !admitted {
+		return
+	}
+	if !rc.unqualifiedSyncSkipped.Swap(false) {
+		return
+	}
+	rc.qualifiedFollowUp.Store(true)
+	jmlog.Info("metadata backend qualified — running the reconcile it refused earlier",
+		"reason", "catch-up after an unqualified start (boot offline or qualification loss)")
+	rc.TriggerSync()
 }
 
 func (rc *RedisClient) backendAdmission() (uint64, <-chan struct{}, bool) {
@@ -2055,6 +2087,14 @@ func (rc *RedisClient) reconcileLoop() {
 				rc.doReconcile(&consecutiveFailures, &backoff, maxBackoff, ticker)
 				continue
 			}
+			// Catch-up after the backend became qualified (see
+			// qualifiedFollowUp). Not a flap: the earlier reconcile was
+			// refused locally, never attempted, so neither the push deferral
+			// nor the failure-backoff floor applies to it.
+			if rc.qualifiedFollowUp.Swap(false) {
+				rc.doReconcile(&consecutiveFailures, &backoff, maxBackoff, ticker)
+				continue
+			}
 			// Keyspace-push deferral (2026-06-27): when the push is actively
 			// ENABLED and the backend is reachable, pushCarriesDeltas reports that
 			// delivery is live. In that state a network-change/reconnect
@@ -2235,6 +2275,13 @@ func (rc *RedisClient) doReconcile(consecutiveFailures *int, backoff *time.Durat
 			*backoff = rc.currentBackstop()
 			ticker.Reset(*backoff)
 			return
+		}
+		if errors.Is(err, ErrBackendUnqualified) {
+			// Remember the refusal; SetBackendQualified(true) replays it.
+			// Re-check here too: qualification may have landed between the
+			// refusal and this store, and its replay would then be lost.
+			rc.unqualifiedSyncSkipped.Store(true)
+			rc.scheduleQualifiedFollowUp()
 		}
 		*consecutiveFailures++
 		*backoff = baseInterval * time.Duration(1<<min(*consecutiveFailures, 6))

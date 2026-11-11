@@ -4,6 +4,20 @@
 
 ### App
 
+- On a slow or distant link, the app no longer sometimes starts offline with an
+  empty volume. At startup the app measures the time to connect to the server.
+  Above 500 ms it used to start offline, after ONE measurement. In the laptop
+  lab (200 ms delay, 1% loss) one delayed packet measured 611 ms. A Mac with no
+  saved file list then started offline, and every file returned "No such file
+  or directory". Now a slow first measurement is taken again, up to two more
+  times. The app starts offline only if the fastest one is still over 500 ms.
+  If there is no saved file list, a slow server no longer starts the app
+  offline at all, because an offline start would show nothing. If the server
+  really cannot be reached and there is no saved file list, the status says
+  "no saved file list on this Mac yet" instead of showing an empty volume with
+  no reason. After an offline start, the file list now refreshes as soon as
+  the server is back and checked, not 60 s later. Field switch (unchanged):
+  `JM_BOOT_DEFER_RTT_MS` (`0` turns the slow-start rule off).
 - On a slow or distant link, the first clip you open in a session no longer
   sometimes takes about 7 s to show its first frame (lab worst case 7.3 s to
   4.5 s). macOS asks for the first two 1 MiB pieces of a file at
