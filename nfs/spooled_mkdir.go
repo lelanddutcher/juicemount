@@ -84,6 +84,10 @@ func (s *SpoolStore) pendingDirsLocked() (map[string]metadata.PendingDir, error)
 	for _, r := range rows {
 		m[r.Path] = r
 	}
+	// waiting_folder marks are a cache of this set: drop stale ones.
+	if err := s.meta.ClearStaleFolderWaits(); err != nil {
+		return nil, err
+	}
 	s.dirs.byPath = m
 	return m, nil
 }
@@ -127,6 +131,25 @@ func (s *SpoolStore) pendingDir(dirPath string) (metadata.PendingDir, bool) {
 }
 
 // pendingAncestor reports whether a proper ancestor of p is a pending folder.
+// pendingFolderOf returns the row id of the innermost pending folder that p
+// is inside, for the waiting marks of ListReadySkipping.
+func (s *SpoolStore) pendingFolderOf(p string) (int64, bool) {
+	if s == nil {
+		return 0, false
+	}
+	s.dirs.mu.RLock()
+	defer s.dirs.mu.RUnlock()
+	if len(s.dirs.byPath) == 0 {
+		return 0, false
+	}
+	for d := path.Dir(strings.TrimPrefix(p, "/")); d != "." && d != "/" && d != ""; d = path.Dir(d) {
+		if r, ok := s.dirs.byPath[d]; ok {
+			return r.ID, true
+		}
+	}
+	return 0, false
+}
+
 // pendingAtOrAbove reports whether p or one of its ancestors is pending.
 func (s *SpoolStore) pendingAtOrAbove(p string) bool {
 	if _, ok := s.pendingDir(p); ok {
@@ -209,7 +232,17 @@ func (s *SpoolStore) removePendingDir(p metadata.PendingDir) error {
 	s.dirs.mu.Lock()
 	defer s.dirs.mu.Unlock()
 	if _, err := s.meta.DeletePendingDir(p.Path, p.ID); err != nil {
-		return err
+		if !errors.Is(err, metadata.ErrPendingDirMissing) {
+			return err
+		}
+		// Memory and SQLite disagree. Follow SQLite (what a restart loads)
+		// and say so: this must never pass silently.
+		jmlog.Warn("pending folder row missing from the database; dropping it from memory",
+			"path", p.Path, "id", p.ID)
+	}
+	// Files that waited for this folder may drain now.
+	if err := s.meta.ClearFolderWaitsFor(p.ID); err != nil {
+		jmlog.Warn("clear folder waits", "path", p.Path, "error", err.Error())
 	}
 	if cur, ok := s.dirs.byPath[p.Path]; ok && cur.ID == p.ID {
 		delete(s.dirs.byPath, p.Path)
@@ -234,39 +267,6 @@ func (s *SpoolStore) movePendingDirsInMemoryLocked(oldPath, newPath string) {
 	s.dirs.byPath = next
 }
 
-// movePendingDirs re-keys the rows at and beneath oldPath to newPath.
-func (s *SpoolStore) movePendingDirs(oldPath, newPath string) (int, error) {
-	s.dirs.mu.Lock()
-	defer s.dirs.mu.Unlock()
-	m, err := s.pendingDirsLocked()
-	if err != nil {
-		return 0, err
-	}
-	moved := false
-	for d := range m {
-		if metadata.PathAtOrUnder(d, oldPath) {
-			moved = true
-			break
-		}
-	}
-	if !moved {
-		return 0, nil
-	}
-	n, err := s.meta.MovePendingDirs(oldPath, newPath)
-	if err != nil {
-		return 0, err
-	}
-	next := make(map[string]metadata.PendingDir, len(m))
-	for d, p := range m {
-		if metadata.PathAtOrUnder(d, oldPath) {
-			p.Path = newPath + d[len(oldPath):]
-		}
-		next[p.Path] = p
-	}
-	s.dirs.byPath = next
-	return n, nil
-}
-
 // ---------------------------------------------------------------------------
 // Reserved folder inodes (Drainer)
 
@@ -288,6 +288,18 @@ type dirInodePool struct {
 	disabled  bool          // the juicefs does not support the messages
 	retryAt   time.Time     // after a failed refill
 	capLogged bool          // the juicefs cap was reported (once per episode)
+	closed    bool          // the drainer stopped: no more numbers are taken or reserved
+}
+
+// close stops the pool: MKDIR after the drainer stopped takes the
+// synchronous path instead of reserving numbers nobody will give back.
+func (p *dirInodePool) close() {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	p.closed = true
+	p.mu.Unlock()
 }
 
 func newDirInodePool(ctl *jfsControl) *dirInodePool { return &dirInodePool{ctl: ctl} }
@@ -309,7 +321,7 @@ func (p *dirInodePool) take(wait time.Duration) (uint64, bool) {
 	deadline := time.Now().Add(wait)
 	for {
 		p.mu.Lock()
-		if p.disabled {
+		if p.disabled || p.closed {
 			p.mu.Unlock()
 			return 0, false
 		}
@@ -364,7 +376,7 @@ func (p *dirInodePool) refill() {
 }
 
 func (p *dirInodePool) startRefillLocked() chan struct{} {
-	if p.disabled {
+	if p.disabled || p.closed {
 		return nil
 	}
 	if p.refilling != nil {
@@ -395,6 +407,9 @@ func (p *dirInodePool) startRefillLocked() chan struct{} {
 		case err != nil:
 			p.retryAt = time.Now().Add(5 * time.Second)
 			jmlog.Debug("reserve folder inodes failed", "error", err.Error())
+		case count > 0 && p.closed:
+			// Stopped while this refill ran: give the numbers back.
+			go func() { _, _ = p.ctl.releaseInodes(first, count, 2*time.Second) }()
 		case count > 0:
 			p.capLogged = false
 			p.ranges = append(p.ranges, inodeRange{next: first, end: first + uint64(count)})
@@ -449,6 +464,37 @@ func (p *dirInodePool) releaseAll(timeout time.Duration) (held uint64, released 
 		}
 	}
 	return held, released, err
+}
+
+// stillHeld reports whether juicefs still holds the pool's numbers, by giving
+// one of them back: released means held (not restarted). An empty pool
+// reports true: there is nothing to drop.
+func (p *dirInodePool) stillHeld() bool {
+	p.mu.Lock()
+	for len(p.ranges) > 0 && p.ranges[0].next >= p.ranges[0].end {
+		p.ranges = p.ranges[1:]
+	}
+	if len(p.ranges) == 0 {
+		p.mu.Unlock()
+		return true
+	}
+	ino := p.ranges[0].next
+	p.ranges[0].next++
+	p.mu.Unlock()
+	released, err := p.ctl.releaseInodes(ino, 1, p.ctl.replyTimeout)
+	return err == nil && released == 1
+}
+
+// definiteMkdirRefusal mirrors jmDefiniteRefusal in the juicefs patch: after
+// these the engine wrote nothing and the number stays reserved.
+func definiteMkdirRefusal(err error) bool {
+	for _, e := range []syscall.Errno{syscall.EEXIST, syscall.ENOENT, syscall.ENOTDIR, syscall.EACCES,
+		syscall.EPERM, syscall.EROFS, syscall.EINVAL, syscall.ENAMETOOLONG, syscall.EDQUOT, syscall.ENOSPC} {
+		if errors.Is(err, e) {
+			return true
+		}
+	}
+	return false
 }
 
 // dirInodeReleaseMax bounds one release message.
@@ -750,14 +796,30 @@ func (d *Drainer) materializeDirOwned(p metadata.PendingDir, op *namespaceOperat
 			}
 			err = d.dirInodes.ctl.mkdirInode(parentIno, name, mode, p.Inode)
 		}
+		if err != nil && !errors.Is(err, syscall.ESRCH) && !errors.Is(err, errControlUnsupported) && !definiteMkdirRefusal(err) {
+			// juicefs may have committed, and never offers the number again:
+			// remember why, for the ESRCH that the next attempt gets.
+			d.dirAmbiguous.Store(p.ID, err.Error())
+		}
+	}
+	if errors.Is(err, syscall.ESRCH) && !syntheticInode(p.Inode) && d.dirInodes != nil {
+		if fi, lerr := os.Lstat(fusePath); lerr == nil && fi.IsDir() {
+			// An earlier attempt that failed ambiguously did commit.
+			err = syscall.EEXIST
+		} else if cause, ok := d.dirAmbiguous.Load(p.ID); ok {
+			// Used up by that failed attempt; the pool is fine.
+			jmlog.Info("folder's reserved inode was used up by an earlier failed create; creating the folder plainly",
+				"path", p.Path, "earlier_error", cause)
+		} else if d.dirInodes.stillHeld() {
+			jmlog.Info("juicefs refused this folder's reserved inode but still holds the others; creating the folder plainly",
+				"path", p.Path)
+		} else {
+			// The juicefs that reserved the numbers restarted: they are
+			// void. The file id of this folder changes once.
+			d.dirInodes.invalidate()
+		}
 	}
 	if errors.Is(err, syscall.ESRCH) || errors.Is(err, errControlUnsupported) {
-		if errors.Is(err, syscall.ESRCH) && !syntheticInode(p.Inode) && d.dirInodes != nil {
-			// The juicefs that reserved the number restarted. Its numbers
-			// are void; the file id of this folder changes once.
-			d.dirInodes.invalidate()
-			jmlog.Info("reserved folder inode no longer held by juicefs; creating the folder plainly", "path", p.Path)
-		}
 		err = os.Mkdir(fusePath, mode)
 		if errors.Is(err, os.ErrNotExist) {
 			if d.spool.pendingAncestor(p.Path) {
@@ -810,6 +872,7 @@ func (d *Drainer) materializeDirOwned(p metadata.PendingDir, op *namespaceOperat
 	if err := d.spool.removePendingDir(p); err != nil {
 		return err
 	}
+	d.dirAmbiguous.Delete(p.ID)
 	if d.onDirMaterialized != nil {
 		d.onDirMaterialized(p.Path, realIno)
 	}
@@ -902,6 +965,7 @@ func (d *Drainer) materializeChainOwned(p string, includeSelf bool) error {
 			return syscall.EAGAIN
 		}
 	}
+	d.symlinkWake.Store(true)
 	return nil
 }
 
@@ -924,7 +988,7 @@ func conflictFolderPath(p, host string, now time.Time, n int) string {
 	if n > 1 {
 		tag = fmt.Sprintf(" (conflict %s %s %d)", host, stamp, n)
 	}
-	return p + tag
+	return path.Join(path.Dir(p), fitConflictName(path.Base(p), tag))
 }
 
 // resolvePendingDirNameTaken moves a pending folder whose name a file on the

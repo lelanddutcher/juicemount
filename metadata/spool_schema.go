@@ -50,6 +50,7 @@ CREATE TABLE IF NOT EXISTS spool_entries (
     retired_by      INTEGER NOT NULL DEFAULT 0,
     replacement_witness BLOB,
     replacement_publication_required INTEGER NOT NULL DEFAULT 0,
+    waiting_folder  INTEGER NOT NULL DEFAULT 0,
     created_at      INTEGER NOT NULL,
     updated_at      INTEGER NOT NULL
 );
@@ -203,6 +204,11 @@ CREATE TABLE IF NOT EXISTS pending_dirs (
     inode       INTEGER NOT NULL,
     created_at  INTEGER NOT NULL
 );
+-- waiting_folder is the pending_dirs id of the innermost folder, not on the
+-- volume yet, that a ready row was seen waiting for (ListReadySkipping); 0 =
+-- not waiting. Later listings pass marked rows over by index.
+CREATE INDEX IF NOT EXISTS idx_spool_ready_waiting ON spool_entries(drain_state, waiting_folder, created_at);
+CREATE INDEX IF NOT EXISTS idx_spool_waiting_folder ON spool_entries(waiting_folder) WHERE waiting_folder<>0;
 CREATE TABLE IF NOT EXISTS folder_conflicts (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
     original_path  TEXT NOT NULL,
@@ -299,6 +305,10 @@ func InitSpoolSchema(db *sql.DB) error {
 		`ALTER TABLE spool_entries ADD COLUMN retired_by INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE spool_entries ADD COLUMN replacement_witness BLOB`,
 		`ALTER TABLE spool_entries ADD COLUMN replacement_publication_required INTEGER NOT NULL DEFAULT 0`,
+		// The pending folder a ready row waits for (ListReadySkipping). A
+		// cache only: cleared when that folder reaches the volume, for the
+		// rows a rename moves, and at start.
+		`ALTER TABLE spool_entries ADD COLUMN waiting_folder INTEGER NOT NULL DEFAULT 0`,
 	} {
 		if _, err := db.Exec(migration); err != nil && !strings.Contains(err.Error(), "duplicate column") {
 			return fmt.Errorf("init spool schema (base identity migration): %w", err)

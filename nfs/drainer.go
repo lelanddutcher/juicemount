@@ -154,6 +154,7 @@ type Drainer struct {
 	onDirAdmission            func(string) *namespaceOperation // shallow; spooled folders
 	dirCreate                 dirCreateLocks
 	dirRetry                  dirRetryBackoff
+	dirAmbiguous              sync.Map // pending row id -> error of an ambiguous reserved-inode create
 	idPause                   identityPause
 	onPendingDirNameTaken     func(string) (string, error) // spooled_mkdir.go
 	mediaGateWaiters          atomic.Int32                 // media-lane drains waiting for a gate slot
@@ -487,8 +488,22 @@ func (d *Drainer) Stop(deadline time.Duration) bool {
 	d.lifecycleMu.Unlock()
 	if firstStop && d.dirInodes != nil {
 		// Give unused reserved folder inodes back, so restarts of this app
-		// do not fill juicefs's cap. Bounded: a dead mount must not hold Stop.
-		_, _, _ = d.dirInodes.releaseAll(2 * time.Second)
+		// do not fill juicefs's cap. The exchange blocks in FUSE calls that a
+		// wedged mount never answers, so it runs aside and Stop waits for it
+		// at most 2 s; it is skipped when the mount check already fails.
+		d.dirInodes.close()
+		if pin.FUSEIdentityOK() {
+			released := make(chan struct{})
+			go func() {
+				defer close(released)
+				_, _, _ = d.dirInodes.releaseAll(2 * time.Second)
+			}()
+			select {
+			case <-released:
+			case <-time.After(2 * time.Second):
+				jmlog.Info("stop: juicefs did not answer; unused reserved folder inodes stay held until it restarts")
+			}
+		}
 	}
 
 	select {

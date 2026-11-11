@@ -3,6 +3,7 @@ package metadata
 import (
 	"database/sql"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -613,6 +614,17 @@ func (s *SpoolStore) MigrateActivePathsWithBase(oldPath, newPath string, resolve
 		return nil, errRows
 	}
 	if len(active) == 0 {
+		// No file rows, but an empty pending folder (or one holding only
+		// pending folders) still moves: its rows are the whole rename.
+		n, err := movePendingDirsTx(tx, oldPath, newPath)
+		if err != nil {
+			return nil, err
+		}
+		if n > 0 {
+			if err := tx.Commit(); err != nil {
+				return nil, fmt.Errorf("spool migrate-paths commit: %w", err)
+			}
+		}
 		return nil, nil
 	}
 	// Birth paths and files are immutable custody. A rename of any member of
@@ -752,6 +764,13 @@ func (s *SpoolStore) MigrateActivePathsWithBase(oldPath, newPath string, resolve
 	// folder, or it would create that folder with a new inode.
 	if _, err := movePendingDirsTx(tx, oldPath, newPath); err != nil {
 		return nil, err
+	}
+	// Moved rows may have left (or entered) a pending folder: drop their
+	// waiting marks; the next listing sets them again where they still hold.
+	for _, m := range out {
+		if _, err := tx.Exec(`UPDATE spool_entries SET waiting_folder=0 WHERE id=? AND waiting_folder<>0`, m.NewID); err != nil {
+			return nil, fmt.Errorf("spool migrate-paths clear folder waits: %w", err)
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("spool migrate-paths commit: %w", err)
@@ -1127,63 +1146,195 @@ func (s *SpoolStore) ListReadyIncludingWaiting(limit int) ([]*SpoolRow, error) {
 	return s.listReady(limit, true)
 }
 
-// Rows inside a folder that is not on the volume yet (pending_dirs) are
-// excluded: they wait for the folder, and must not fill the page that
-// unrelated saves are listed from.
-//
 // Rows held as copied from another Mac are excluded from both, always: unlike
 // a project wait, nothing releases them but an explicit decision
 // (ReleaseCloneHeld / DeleteCloneHeld).
 func (s *SpoolStore) listReady(limit int, includeWaiting bool) ([]*SpoolRow, error) {
-	return s.listReadyLarger(limit, includeWaiting, -1)
+	return s.listReadyLarger(limit, includeWaiting, -1, nil)
 }
 
 // ListReadyLarger is ListReady restricted to rows larger than minSize bytes.
 // The drainer uses it so a large file queued behind many small ones is seen
 // while the small-file lane is full.
 func (s *SpoolStore) ListReadyLarger(minSize int64, limit int) ([]*SpoolRow, error) {
-	return s.listReadyLarger(limit, false, minSize)
+	return s.listReadyLarger(limit, false, minSize, nil)
 }
 
 // ListReadyLargerIncludingWaiting is ListReadyLarger plus rows waiting for a
 // project lease (see ListReadyIncludingWaiting).
 func (s *SpoolStore) ListReadyLargerIncludingWaiting(minSize int64, limit int) ([]*SpoolRow, error) {
-	return s.listReadyLarger(limit, true, minSize)
+	return s.listReadyLarger(limit, true, minSize, nil)
 }
 
+// ListReadySkipping is listReadyLarger with a filter: rows for which skip
+// returns true (the drainer passes "inside a folder not on the volume yet")
+// are passed over, and the listing pages on past them by (created_at, id),
+// so a large blocked subtree cannot fill the page that unrelated saves are
+// listed from. The filter runs in Go against the caller's in-memory set; a
+// per-row SQL subquery over the pending folders cost O(rows x folders)
+// (2,000 folders, 100,000 rows: 40 s). minSize < 0 means no size filter.
+func (s *SpoolStore) ListReadySkipping(limit int, includeWaiting bool, minSize int64, skip func(nfsPath string) (folderID int64, waits bool)) ([]*SpoolRow, error) {
+	return s.listReadyLarger(limit, includeWaiting, minSize, skip)
+}
+
+// markFolderWaits records, per pending folder id, the rows a filtered
+// listing found waiting for it.
+func (s *SpoolStore) markFolderWaits(byFolder map[int64][]any) error {
+	if len(byFolder) == 0 {
+		return nil
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	st, err := tx.Prepare(`UPDATE spool_entries SET waiting_folder=? WHERE id=?`)
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+	for folder, ids := range byFolder {
+		for _, id := range ids {
+			if _, err := st.Exec(folder, id); err != nil {
+				return fmt.Errorf("mark rows waiting for a folder: %w", err)
+			}
+		}
+	}
+	return tx.Commit()
+}
+
+// ClearFolderWaitsFor releases the rows marked waiting for one pending
+// folder, when it reaches the volume or goes away.
+func (s *SpoolStore) ClearFolderWaitsFor(folderID int64) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if _, err := s.db.Exec(`UPDATE spool_entries SET waiting_folder=0 WHERE waiting_folder=?`, folderID); err != nil {
+		return fmt.Errorf("clear folder waits: %w", err)
+	}
+	return nil
+}
+
+// ClearStaleFolderWaits drops marks whose pending folder no longer exists
+// (at start: a crash may have come between a folder's removal and the
+// release of its rows). Marks of folders still pending stay valid.
+func (s *SpoolStore) ClearStaleFolderWaits() error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if _, err := s.db.Exec(`UPDATE spool_entries SET waiting_folder=0 WHERE waiting_folder<>0
+		AND waiting_folder NOT IN (SELECT id FROM pending_dirs)`); err != nil {
+		return fmt.Errorf("clear folder waits: %w", err)
+	}
+	return nil
+}
+
+// readyScanRows is the page size of the light scan of a filtered listing.
+const readyScanRows = 4096
+
 // minSize < 0 means no size filter.
-func (s *SpoolStore) listReadyLarger(limit int, includeWaiting bool, minSize int64) ([]*SpoolRow, error) {
+func (s *SpoolStore) listReadyLarger(limit int, includeWaiting bool, minSize int64, skip func(string) (int64, bool)) ([]*SpoolRow, error) {
 	waitClause := " AND wait_project=''"
 	if includeWaiting {
 		waitClause = ""
 	}
 	sizeClause := ""
-	args := []any{DrainReady, time.Now().UnixNano()}
+	base := []any{DrainReady, time.Now().UnixNano()}
 	if minSize >= 0 {
 		sizeClause = " AND size>?"
-		args = append(args, minSize)
+		base = append(base, minSize)
 	}
-	args = append(args, limit)
-	rows, err := s.db.Query(
-		`SELECT id, nfs_path, spool_file, size, sha256, drain_state, drain_attempts, last_error, suspect_zero_tail, punched_end, created_at, updated_at, pause_since_ns, retry_after_ns, qualification_hold, retired_by
+	const sel = `SELECT id, nfs_path, spool_file, size, sha256, drain_state, drain_attempts, last_error, suspect_zero_tail, punched_end, created_at, updated_at, pause_since_ns, retry_after_ns, qualification_hold, retired_by
 			 FROM spool_entries WHERE drain_state=? AND punched_end=0 AND clone_hold='' AND qualification_hold='' AND retired_by=0 AND replacement_witness IS NULL AND retry_after_ns<=?
-			 AND NOT EXISTS (SELECT 1 FROM spool_entries newer WHERE newer.nfs_path=spool_entries.nfs_path AND newer.id>spool_entries.id AND newer.retired_by=0)
-			 AND NOT EXISTS (SELECT 1 FROM pending_dirs pd WHERE substr(ltrim(spool_entries.nfs_path, '/'), 1, length(pd.dir_path)+1) = pd.dir_path || '/')`+waitClause+sizeClause+` ORDER BY created_at ASC LIMIT ?`,
-		args...,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("spool list ready: %w", err)
+			 AND NOT EXISTS (SELECT 1 FROM spool_entries newer WHERE newer.nfs_path=spool_entries.nfs_path AND newer.id>spool_entries.id AND newer.retired_by=0)`
+	full := func(extra, tail string, args []any) ([]*SpoolRow, error) {
+		rows, err := s.db.Query(sel+waitClause+sizeClause+extra+` ORDER BY created_at ASC, id ASC`+tail, args...)
+		if err != nil {
+			return nil, fmt.Errorf("spool list ready: %w", err)
+		}
+		defer rows.Close()
+		var out []*SpoolRow
+		for rows.Next() {
+			r, err := scanSpoolRow(rows.Scan)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, r)
+		}
+		return out, rows.Err()
 	}
-	defer rows.Close()
+	if skip == nil {
+		return full("", " LIMIT ?", append(base, limit))
+	}
+	// Filtered: a light scan in FIFO order (the (drain_state, created_at)
+	// index; no subquery, two columns) finds rows the filter keeps, then
+	// the full predicate runs on those ids only.
 	var out []*SpoolRow
-	for rows.Next() {
-		r, err := scanSpoolRow(rows.Scan)
+	var afterCreated, afterID int64
+	first := true
+	for len(out) < limit {
+		args := []any{DrainReady}
+		cursor := ""
+		if !first {
+			cursor = " AND (created_at>? OR (created_at=? AND id>?))"
+			args = append(args, afterCreated, afterCreated, afterID)
+		}
+		first = false
+		args = append(args, readyScanRows)
+		rows, err := s.db.Query(`SELECT id, nfs_path, created_at FROM spool_entries WHERE drain_state=? AND waiting_folder=0`+cursor+` ORDER BY created_at ASC, id ASC LIMIT ?`, args...)
+		if err != nil {
+			return nil, fmt.Errorf("spool list ready (scan): %w", err)
+		}
+		var ids []any
+		waiting := map[int64][]any{}
+		n := 0
+		for rows.Next() {
+			var id, created int64
+			var p string
+			if err := rows.Scan(&id, &p, &created); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			n++
+			afterCreated, afterID = created, id
+			if folder, waits := skip(p); waits && folder > 0 {
+				waiting[folder] = append(waiting[folder], id)
+			} else if !waits {
+				ids = append(ids, id)
+			}
+		}
+		err = rows.Err()
+		rows.Close()
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, r)
+		// Remember the waiting rows: later listings pass over them by index
+		// instead of scanning them again.
+		if err := s.markFolderWaits(waiting); err != nil {
+			return nil, err
+		}
+		for len(ids) > 0 && len(out) < limit {
+			chunk := ids
+			if len(chunk) > 500 {
+				chunk = ids[:500]
+			}
+			ids = ids[len(chunk):]
+			in := " AND id IN (?" + strings.Repeat(",?", len(chunk)-1) + ")"
+			got, err := full(in, "", append(append([]any(nil), base...), chunk...))
+			if err != nil {
+				return nil, err
+			}
+			for _, r := range got {
+				if len(out) < limit {
+					out = append(out, r)
+				}
+			}
+		}
+		if n < readyScanRows {
+			break
+		}
 	}
-	return out, rows.Err()
+	return out, nil
 }
 
 // ListAll returns ALL spool rows. Used by the boot scrubber to reconcile

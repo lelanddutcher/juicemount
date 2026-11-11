@@ -6,12 +6,15 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/lelanddutcher/juicemount/internal/cache/pin"
 	"github.com/lelanddutcher/juicemount/metadata"
@@ -364,7 +367,9 @@ func TestSpooledMkdirFallsBackToPlainMkdirWhenNumberUnknown(t *testing.T) {
 	if err := jfs.MkdirAll("w/restart", 0o755); err != nil {
 		t.Fatal(err)
 	}
-	fake.mkdirErr = syscall.ESRCH // juicefs restarted and forgot its numbers
+	fake.mu.Lock()
+	fake.reserved = map[uint64]bool{} // juicefs restarted and forgot its numbers
+	fake.mu.Unlock()
 	if drainer.materializePendingDirs() {
 		t.Fatal("folder not created")
 	}
@@ -382,8 +387,7 @@ func TestSpooledMkdirFallsBackToPlainMkdirWhenNumberUnknown(t *testing.T) {
 	fake.mu.Lock()
 	left, releases := len(fake.reserved), fake.releaseSeen
 	fake.mu.Unlock()
-	// The fake forced ESRCH without consuming w/restart's own number.
-	if releases == 0 || left > 1 {
+	if releases == 0 || left != 0 {
 		t.Fatalf("after ESRCH: %d release messages, %d numbers still reserved", releases, left)
 	}
 }
@@ -795,6 +799,16 @@ func TestSpooledMkdirWaitingFilesDoNotBlockOtherSaves(t *testing.T) {
 		}
 		t.Fatalf("listed %v, want only w/other.txt", got)
 	}
+	// The waiting rows were marked; once their folder is on the volume they
+	// are listed again.
+	drainer.materializePendingDirs()
+	rows, err = drainer.listDispatchable(8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 8 {
+		t.Fatalf("after the folder landed: %d rows listed, want 8", len(rows))
+	}
 }
 
 // L3: a folder that keeps failing is not retried on every tick.
@@ -834,5 +848,177 @@ func TestSpooledMkdirParentFirstAfterMoveIntoNewerFolder(t *testing.T) {
 	drainer.materializePendingDirs()
 	if got := fake.createdOrder(); len(got) != 2 || got[0] != "w/q" || got[1] != "w/q/p" {
 		t.Fatalf("created %v, want [w/q w/q/p]", got)
+	}
+}
+
+// reloadPendingDirs drops the in-memory pending set and reads it back from
+// SQLite, as a restart does, and returns the durable paths.
+func reloadPendingDirs(t *testing.T, spool *SpoolStore) map[string]bool {
+	t.Helper()
+	spool.dirs.mu.Lock()
+	spool.dirs.byPath = nil
+	spool.dirs.mu.Unlock()
+	if err := spool.loadPendingDirs(); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := spool.Meta().ListPendingDirs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]bool{}
+	for _, r := range rows {
+		got[r.Path] = true
+	}
+	return got
+}
+
+// C1: Finder's New Folder then rename. An EMPTY pending folder (no spool
+// rows) and one holding only pending folders must move in SQLite, not only
+// in memory, and survive a restart under the new name.
+func TestSpooledMkdirRenameEmptyPendingFolderIsDurable(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		make  []string
+		from  string
+		to    string
+		after []string
+	}{
+		{"empty", []string{"w/untitled folder"}, "w/untitled folder", "w/Project X", []string{"w/Project X"}},
+		{"only subfolders", []string{"w/untitled folder", "w/untitled folder/A", "w/untitled folder/A/B"},
+			"w/untitled folder", "w/Project X", []string{"w/Project X", "w/Project X/A", "w/Project X/A/B"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			jfs, fuseRoot, spool, drainer, fake := newSpooledMkdirFixture(t)
+			for _, p := range tc.make {
+				if err := jfs.MkdirAll(p, 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			ino := jfs.handler.store.LookupByPath(tc.from).Inode
+			if err := jfs.Rename(tc.from, tc.to); err != nil {
+				t.Fatal(err)
+			}
+			got := reloadPendingDirs(t, spool)
+			if len(got) != len(tc.after) {
+				t.Fatalf("durable rows after restart %v, want %v", got, tc.after)
+			}
+			for _, p := range tc.after {
+				if !got[p] {
+					t.Fatalf("durable rows after restart %v, want %v", got, tc.after)
+				}
+				if _, ok := spool.pendingDir(p); !ok {
+					t.Fatalf("%s not pending after reload", p)
+				}
+			}
+			// The old name is free again: a second New Folder works.
+			if err := jfs.MkdirAll(tc.from, 0o755); err != nil {
+				t.Fatalf("MKDIR of the old name after the rename: %v", err)
+			}
+			drainer.materializePendingDirs()
+			assertCreatedWithReservedInode(t, jfs, fake, tc.to, ino)
+			if rows, _ := spool.Meta().ListPendingDirs(); len(rows) != 0 {
+				t.Fatalf("rows left after the drain: %+v", rows)
+			}
+			if _, err := os.Stat(filepath.Join(fuseRoot, tc.from)); err != nil {
+				t.Fatalf("second folder at the old name not created: %v", err)
+			}
+		})
+	}
+}
+
+// M-A: a conflict name always fits in 255 bytes, keeps its tag and
+// extension, and never splits a UTF-8 character.
+func TestConflictNamesFitTheNameLimit(t *testing.T) {
+	long := strings.Repeat("é", 120) // 240 bytes
+	now := time.Date(2026, 11, 11, 9, 30, 0, 0, time.UTC)
+	for _, got := range []string{
+		path.Base(conflictFolderPath("w/"+long, "a-rather-long-mac-name", now, 2)),
+		filepath.Base(conflictCopyPath("w/"+long+".prproj", "a-rather-long-mac-name", now, 2)),
+	} {
+		if len(got) > maxNameBytes || !utf8.ValidString(got) {
+			t.Fatalf("name of %d bytes (valid UTF-8 %v): %q", len(got), utf8.ValidString(got), got)
+		}
+		if !strings.Contains(got, "(conflict a-rather-long-mac-name 2026-11-11 093000 2)") {
+			t.Fatalf("tag lost: %q", got)
+		}
+	}
+	if got := filepath.Base(conflictCopyPath("w/"+long+".prproj", "m", now, 1)); !strings.HasSuffix(got, ".prproj") {
+		t.Fatalf("extension lost: %q", got)
+	}
+	if got := conflictFolderPath("w/short", "m", now, 1); got != "w/short (conflict m 2026-11-11 093000)" {
+		t.Fatalf("short name changed: %q", got)
+	}
+}
+
+// M-B: a juicefs that never answers the release does not hold Stop. L-b:
+// after Stop, MKDIR reserves no new numbers.
+func TestSpooledMkdirStopIsBoundedAndClosesThePool(t *testing.T) {
+	jfs, fuseRoot, _, drainer, fake := newSpooledMkdirFixture(t)
+	if err := jfs.MkdirAll("w/one", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	hang := make(chan struct{})
+	defer close(hang)
+	var reserves atomic.Int32
+	drainer.dirInodes.ctl.testExchange = func(msg []byte, n int) ([]byte, error) {
+		switch binary.BigEndian.Uint32(msg[0:4]) {
+		case jfsMsgReleaseInodes:
+			<-hang // a wedged mount
+		case jfsMsgReserveInodes:
+			reserves.Add(1)
+		}
+		return fake.exchange(msg, n)
+	}
+	start := time.Now()
+	drainer.Stop(5 * time.Second)
+	if took := time.Since(start); took > 4*time.Second {
+		t.Fatalf("Stop took %v with a juicefs that does not answer", took)
+	}
+	if _, ok := drainer.dirInodes.take(time.Second); ok {
+		t.Fatal("the pool gave a number after Stop")
+	}
+	if err := jfs.MkdirAll("w/after", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if reserves.Load() != 0 {
+		t.Fatalf("%d reservations after Stop", reserves.Load())
+	}
+	if _, err := os.Stat(filepath.Join(fuseRoot, "w/after")); err != nil {
+		t.Fatalf("MKDIR after Stop is not synchronous: %v", err)
+	}
+}
+
+// L-c: an ambiguous create (juicefs may have committed, the number is gone)
+// followed by ESRCH must not drop the whole pool or claim a restart.
+func TestSpooledMkdirAmbiguousFailureKeepsThePool(t *testing.T) {
+	jfs, fuseRoot, _, drainer, fake := newSpooledMkdirFixture(t)
+	if err := jfs.MkdirAll("w/flaky", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	var first atomic.Bool
+	first.Store(true)
+	drainer.dirInodes.ctl.testExchange = func(msg []byte, n int) ([]byte, error) {
+		if binary.BigEndian.Uint32(msg[0:4]) == jfsMsgMkdirInode && first.Swap(false) {
+			ino := binary.BigEndian.Uint64(msg[16:24])
+			fake.mu.Lock()
+			delete(fake.reserved, ino) // juicefs never offers it again
+			fake.mu.Unlock()
+			return []byte{byte(syscall.EIO)}, nil
+		}
+		return fake.exchange(msg, n)
+	}
+	drainer.dirInodes.mu.Lock()
+	before := drainer.dirInodes.availableLocked()
+	drainer.dirInodes.mu.Unlock()
+	drainer.materializePendingDirs() // EIO: ambiguous
+	drainer.materializePendingDirs() // ESRCH: explained by the EIO
+	if _, err := os.Stat(filepath.Join(fuseRoot, "w/flaky")); err != nil {
+		t.Fatalf("folder not created plainly after the ambiguous failure: %v", err)
+	}
+	drainer.dirInodes.mu.Lock()
+	after := drainer.dirInodes.availableLocked()
+	drainer.dirInodes.mu.Unlock()
+	if after == 0 || after+1 < before {
+		t.Fatalf("pool went from %d to %d numbers: dropped after one ambiguous failure", before, after)
 	}
 }

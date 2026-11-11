@@ -67,9 +67,21 @@ func (s *SpoolStore) DeletePendingDir(dirPath string, id int64) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("delete pending folder %q: %w", dirPath, err)
 	}
-	n, _ := res.RowsAffected()
-	return n == 1, nil
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("delete pending folder %q: %w", dirPath, err)
+	}
+	if n != 1 {
+		// The durable row and the caller's view disagree: never succeed
+		// silently, or a stale row would come back after a restart.
+		return false, fmt.Errorf("delete pending folder %q (row %d): %w", dirPath, id, ErrPendingDirMissing)
+	}
+	return true, nil
 }
+
+// ErrPendingDirMissing reports that a pending folder row was not where the
+// caller expected it.
+var ErrPendingDirMissing = errors.New("pending folder row not found")
 
 // ErrPendingDirConflict reports a rename onto a path that already has a
 // pending folder row.

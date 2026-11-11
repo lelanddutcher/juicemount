@@ -39,18 +39,18 @@ func (d *Drainer) ProjectLeases() *ProjectLeaseClient { return d.leasesPtr.Load(
 // project lease are skipped only while a lease client exists to release
 // them; without one a wait must never strand a row.
 func (d *Drainer) listDispatchable(limit int) ([]*metadata.SpoolRow, error) {
-	if d.ProjectLeases() == nil {
-		return d.spool.Meta().ListReadyIncludingWaiting(limit)
-	}
-	return d.spool.Meta().ListReady(limit)
+	return d.listDispatchableLarger(-1, limit)
 }
 
 // listDispatchableLarger is listDispatchable for rows larger than minSize.
 func (d *Drainer) listDispatchableLarger(minSize int64, limit int) ([]*metadata.SpoolRow, error) {
-	if d.ProjectLeases() == nil {
-		return d.spool.Meta().ListReadyLargerIncludingWaiting(minSize, limit)
+	// Rows inside a folder not on the volume yet wait for it; page past them
+	// so they never fill the page unrelated saves are listed from.
+	var skip func(string) (int64, bool)
+	if d.spool.pendingDirCount() > 0 {
+		skip = d.spool.pendingFolderOf
 	}
-	return d.spool.Meta().ListReadyLarger(minSize, limit)
+	return d.spool.Meta().ListReadySkipping(limit, d.ProjectLeases() == nil, minSize, skip)
 }
 
 // releaseHoldsWithoutLeases clears every project wait when no lease client is
