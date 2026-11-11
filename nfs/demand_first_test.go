@@ -79,8 +79,8 @@ func demandWindowManager(t *testing.T, blocks int) (*ReadaheadManager, *blocking
 	t.Setenv("JM_DEMAND_FIRST", "")
 	resetPrefetchOfflineState(t)
 	forceDefaultClass(t, netprofile.ClassSlow)
-	fuseDataInFlight.Store(0)
-	t.Cleanup(func() { fuseDataInFlight.Store(0) })
+	resetFUSEDataGateCounts()
+	t.Cleanup(func() { resetFUSEDataGateCounts() })
 	dir, name := windowTestFile(t, blocks)
 	rm := NewReadaheadManager(dir, nil, slowProfile(t))
 	g := newDemandGate()
@@ -243,11 +243,11 @@ func resetPendingReads(t *testing.T) {
 	pendingFUSEReadResults = newPendingFUSEReads(64)
 	priorClass := demandFirstClass
 	demandFirstClass = func() netprofile.LinkClass { return netprofile.ClassSlow }
-	fuseDataInFlight.Store(0)
+	resetFUSEDataGateCounts()
 	t.Cleanup(func() {
 		pendingFUSEReadResults = prior
 		demandFirstClass = priorClass
-		fuseDataInFlight.Store(0)
+		resetFUSEDataGateCounts()
 	})
 }
 
@@ -457,8 +457,8 @@ func TestJUKEBOXOtherNameInvalidationKeepsJoin(t *testing.T) {
 	waitPreadsDone(t)
 }
 
-// A pread older than a few bounds is presumed wedged (a dead mount): a retry
-// starts its own instead of joining it for ever.
+// A pread older than pendingReadJoinMaxAge is presumed wedged: a retry starts
+// its own instead of joining it for ever.
 func TestJUKEBOXDoesNotJoinWedgedPread(t *testing.T) {
 	resetPendingReads(t)
 	fp := newFakePread('O')
@@ -466,8 +466,11 @@ func TestJUKEBOXDoesNotJoinWedgedPread(t *testing.T) {
 	key := readKey("reel.mov", 7, 1, 0, 4)
 	p := make([]byte, 4)
 	const bound = 10 * time.Millisecond
+	old := pendingReadJoinMaxAge
+	pendingReadJoinMaxAge = 3 * bound
+	t.Cleanup(func() { pendingReadJoinMaxAge = old })
 	joinOrReadFUSE(fp.read, key, "reel.mov", p, 0, bound)
-	time.Sleep((pendingReadJoinMaxAge + 1) * bound)
+	time.Sleep(4 * bound)
 	joinOrReadFUSE(fp.read, key, "reel.mov", p, 0, bound)
 	if c := fp.calls.Load(); c != 2 {
 		t.Fatalf("preads %d, want 2: a wedged pread must not be joined", c)

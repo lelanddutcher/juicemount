@@ -149,7 +149,7 @@ func percentile(d []time.Duration, p float64) time.Duration {
 func runReadaheadSim(t *testing.T, scale float64, rateMbit float64, latency time.Duration, fileMiB, readers int, drainer bool, v simVariant) simResult {
 	t.Helper()
 	t.Setenv("JM_FUSE_DATA_GATE", v.gate)
-	fuseDataInFlight.Store(0)
+	resetFUSEDataGateCounts()
 	dir := t.TempDir()
 	caches := map[string]*simCache{}
 	names := make([]string, readers)
@@ -286,7 +286,7 @@ func TestReadaheadSlowLinkSimulation(t *testing.T) {
 	t.Setenv("JM_SERVER_READAHEAD", "")
 	resetPrefetchOfflineState(t)
 	forceDefaultClass(t, netprofile.ClassSlow)
-	t.Cleanup(func() { fuseDataInFlight.Store(0) })
+	t.Cleanup(func() { resetFUSEDataGateCounts() })
 
 	// The old slow policy and its gate: 2 blocks, 2 rounds, serial buffer,
 	// FUSE data gate 4 (background 2).

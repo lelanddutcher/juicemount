@@ -15,7 +15,7 @@ import (
 	"github.com/lelanddutcher/juicemount/internal/cache/pin"
 )
 
-// JuiceFS control-file messages added by the bundled juicefs (patch 0021,
+// JuiceFS control-file messages added by the bundled juicefs (patch 0022,
 // third_party/juicefs/pkg/meta/jm_reserved_inode.go). A juicefs without the
 // patch answers neither, and the caller falls back to a plain FUSE mkdir.
 const (

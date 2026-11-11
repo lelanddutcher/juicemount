@@ -1,5 +1,5 @@
 /*
- * JuiceMount-owned source (patch 0021). Not part of upstream JuiceFS.
+ * JuiceMount-owned source (patch 0022). Not part of upstream JuiceFS.
  *
  * Folder creation with an inode number reserved ahead of time. The JuiceMount
  * NFS layer answers MKDIR at local speed and creates the folder on the volume

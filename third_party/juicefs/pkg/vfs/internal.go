@@ -296,7 +296,7 @@ type chunkObj struct {
 	Size, Off, Len uint32
 }
 
-// jmFolderInodes is implemented by the metadata engines (JuiceMount patch 0021,
+// jmFolderInodes is implemented by the metadata engines (JuiceMount patch 0022,
 // pkg/meta/jm_reserved_inode.go).
 type jmFolderInodes interface {
 	JMReserveInodes(n uint32) (meta.Ino, uint32, syscall.Errno)
@@ -527,7 +527,7 @@ func (v *VFS) handleInternalMsg(ctx meta.Context, cmd uint32, r *utils.Buffer, o
 		w.Put(data)
 		_, _ = out.Write(w.Bytes())
 	case meta.JMReserveInodes:
-		// JuiceMount patch 0021. Reply: errno (1 byte), first inode (8), count (4).
+		// JuiceMount patch 0022. Reply: errno (1 byte), first inode (8), count (4).
 		n := r.Get32()
 		var first Ino
 		var count uint32
@@ -541,7 +541,7 @@ func (v *VFS) handleInternalMsg(ctx meta.Context, cmd uint32, r *utils.Buffer, o
 		w.Put32(count)
 		_, _ = out.Write(w.Bytes())
 	case meta.JMMkdirInode:
-		// JuiceMount patch 0021. Reply: errno (1 byte).
+		// JuiceMount patch 0022. Reply: errno (1 byte).
 		parent := Ino(r.Get64())
 		ino := Ino(r.Get64())
 		mode := r.Get16()

@@ -5,7 +5,7 @@
  		}
  		typ, ino := m.parseEntry(buf)
 -		var protected *replaceguard.Record
-+		// JuiceMount (patch 0022): the guard record, the destination entry
++		// JuiceMount (patch 0023): the guard record, the destination entry
 +		// and the attributes of both parents and the source depend only on
 +		// ino, so they share one round trip. Each key is WATCHed before that
 +		// read (the source attribute and the guard here, both parents and

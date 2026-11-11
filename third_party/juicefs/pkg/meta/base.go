@@ -1178,7 +1178,7 @@ func (m *baseMeta) Mknod(ctx Context, parent Ino, name string, _type uint8, mode
 }
 
 // mknod is Mknod with an optional inode number that JMReserveInodes took from
-// the volume counter (JuiceMount patch 0021). preIno 0 allocates as upstream.
+// the volume counter (JuiceMount patch 0022). preIno 0 allocates as upstream.
 func (m *baseMeta) mknod(ctx Context, parent Ino, name string, _type uint8, mode, cumask uint16, rdev uint32, path string, preIno Ino, inode *Ino, attr *Attr) syscall.Errno {
 	if _type < TypeFile || _type > TypeSocket {
 		return syscall.EINVAL

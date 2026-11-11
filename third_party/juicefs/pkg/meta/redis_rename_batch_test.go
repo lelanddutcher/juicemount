@@ -1,5 +1,5 @@
 /*
- * JuiceMount-owned test (patch 0022). Not part of upstream JuiceFS.
+ * JuiceMount-owned test (patch 0023). Not part of upstream JuiceFS.
  *
  * Needs JM_WATCH_BATCH_TEST_REDIS_URL, as redis_watch_batch_test.go.
  */

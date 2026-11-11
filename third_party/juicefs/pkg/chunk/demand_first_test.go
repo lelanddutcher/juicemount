@@ -40,6 +40,13 @@ func (d *demandStorage) Get(key string, off, limit int64, getters ...object.Attr
 	return d.ObjectStorage.Get(key, off, limit, getters...)
 }
 
+// noSpans turns off demand spans (patch 0021), so a test sees the patch 0020
+// ranged read, piggyback and prefetch defer that spans replace.
+func noSpans(store *cachedStore) *cachedStore {
+	store.spans = nil
+	return store
+}
+
 func demandConf(t *testing.T, demandFirst bool) Config {
 	conf := rangedConf(t, 1)
 	conf.DemandFirst = demandFirst
@@ -84,7 +91,7 @@ func TestJMDemandFirstSecondReadInBlockDoesNotWaitForPrefetch(t *testing.T) {
 			mem, _ := object.CreateStorage("mem", "", "", "", "")
 			data := writeBlocks(t, mem, 201, 1)
 			d := &demandStorage{ObjectStorage: mem, fullGate: make(chan struct{})}
-			store := NewCachedStore(d, demandConf(t, demandFirst), nil).(*cachedStore)
+			store := noSpans(NewCachedStore(d, demandConf(t, demandFirst), nil).(*cachedStore))
 			r := store.NewReader(201, len(data))
 			bs := store.conf.BlockSize
 			off, n := bs/4, bs/8 // a second read a quarter into the block
@@ -130,7 +137,7 @@ func TestJMDemandFirstPrefetchWaitsForDemandRead(t *testing.T) {
 	mem, _ := object.CreateStorage("mem", "", "", "", "")
 	data := writeBlocks(t, mem, 202, 2)
 	d := &demandStorage{ObjectStorage: mem, rangedGate: make(chan struct{})}
-	store := NewCachedStore(d, demandConf(t, true), nil).(*cachedStore)
+	store := noSpans(NewCachedStore(d, demandConf(t, true), nil).(*cachedStore))
 	r := store.NewReader(202, len(data))
 	bs := store.conf.BlockSize
 
@@ -157,7 +164,7 @@ func TestJMDemandFirstPrefetchDeferIsBounded(t *testing.T) {
 	mem, _ := object.CreateStorage("mem", "", "", "", "")
 	data := writeBlocks(t, mem, 203, 2)
 	d := &demandStorage{ObjectStorage: mem, rangedGate: make(chan struct{})}
-	store := NewCachedStore(d, demandConf(t, true), nil).(*cachedStore)
+	store := noSpans(NewCachedStore(d, demandConf(t, true), nil).(*cachedStore))
 	store.demand.deferMax = 150 * time.Millisecond
 	r := store.NewReader(203, len(data))
 	bs := store.conf.BlockSize
@@ -306,7 +313,7 @@ func TestJMDemandFirstPrefetchNotHeldBySameBlockDemand(t *testing.T) {
 	mem, _ := object.CreateStorage("mem", "", "", "", "")
 	data := writeBlocks(t, mem, 205, 1)
 	d := &demandStorage{ObjectStorage: mem, rangedGate: make(chan struct{})}
-	store := NewCachedStore(d, demandConf(t, true), nil).(*cachedStore)
+	store := noSpans(NewCachedStore(d, demandConf(t, true), nil).(*cachedStore))
 	r := store.NewReader(205, len(data))
 	bs := store.conf.BlockSize
 	done := goRead(r, bs/2, 64<<10) // block 0, held

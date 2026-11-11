@@ -213,6 +213,9 @@ func juiceFSChildEnvironment() []string {
 		"HOME", "USER", "LOGNAME", "PATH", "TMPDIR",
 		"LANG", "LC_ALL", "LC_CTYPE", "TZ",
 		"SSL_CERT_FILE", "SSL_CERT_DIR",
+		// Lab switch for the per-read timeline (nfs/read_timeline.go);
+		// the child logs its object GET steps when it is "1".
+		"JM_READ_TIMELINE",
 	}
 	env := make([]string, 0, len(allowed))
 	for _, key := range allowed {

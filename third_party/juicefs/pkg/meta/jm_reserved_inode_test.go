@@ -1,5 +1,5 @@
 /*
- * JuiceMount-owned test (patch 0021). Not part of upstream JuiceFS.
+ * JuiceMount-owned test (patch 0022). Not part of upstream JuiceFS.
  */
 
 package meta

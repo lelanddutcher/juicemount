@@ -8,7 +8,7 @@
 +}
 +
 +// mknod is Mknod with an optional inode number that JMReserveInodes took from
-+// the volume counter (JuiceMount patch 0021). preIno 0 allocates as upstream.
++// the volume counter (JuiceMount patch 0022). preIno 0 allocates as upstream.
 +func (m *baseMeta) mknod(ctx Context, parent Ino, name string, _type uint8, mode, cumask uint16, rdev uint32, path string, preIno Ino, inode *Ino, attr *Attr) syscall.Errno {
  	if _type < TypeFile || _type > TypeSocket {
  		return syscall.EINVAL
@@ -50,7 +50,7 @@
  	Size, Off, Len uint32
 +}
 +
-+// jmFolderInodes is implemented by the metadata engines (JuiceMount patch 0021,
++// jmFolderInodes is implemented by the metadata engines (JuiceMount patch 0022,
 +// pkg/meta/jm_reserved_inode.go).
 +type jmFolderInodes interface {
 +	JMReserveInodes(n uint32) (meta.Ino, uint32, syscall.Errno)
@@ -63,7 +63,7 @@
  		w.Put(data)
  		_, _ = out.Write(w.Bytes())
 +	case meta.JMReserveInodes:
-+		// JuiceMount patch 0021. Reply: errno (1 byte), first inode (8), count (4).
++		// JuiceMount patch 0022. Reply: errno (1 byte), first inode (8), count (4).
 +		n := r.Get32()
 +		var first Ino
 +		var count uint32
@@ -77,7 +77,7 @@
 +		w.Put32(count)
 +		_, _ = out.Write(w.Bytes())
 +	case meta.JMMkdirInode:
-+		// JuiceMount patch 0021. Reply: errno (1 byte).
++		// JuiceMount patch 0022. Reply: errno (1 byte).
 +		parent := Ino(r.Get64())
 +		ino := Ino(r.Get64())
 +		mode := r.Get16()

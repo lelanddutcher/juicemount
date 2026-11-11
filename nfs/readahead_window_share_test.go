@@ -54,8 +54,8 @@ func testSlowWindowLeavesDrainerASlotMode(t *testing.T, fgHeld int, fgLate, rule
 	if !fuseDataGateEnabled {
 		t.Skip("gate disabled")
 	}
-	fuseDataInFlight.Store(0)
-	t.Cleanup(func() { fuseDataInFlight.Store(0) })
+	resetFUSEDataGateCounts()
+	t.Cleanup(func() { resetFUSEDataGateCounts() })
 	dir, name := windowTestFile(t, 400)
 	rm := NewReadaheadManager(dir, nil, slowProfile(t))
 	warmup := 200 * time.Millisecond
@@ -327,8 +327,8 @@ func TestSlowWindowEndsRoundWhenGateFull(t *testing.T) {
 	if !fuseDataGateEnabled {
 		t.Skip("gate disabled")
 	}
-	fuseDataInFlight.Store(0)
-	t.Cleanup(func() { fuseDataInFlight.Store(0) })
+	resetFUSEDataGateCounts()
+	t.Cleanup(func() { resetFUSEDataGateCounts() })
 	var held []func()
 	for {
 		rel, ok := tryAcquireFUSEDataBackground()
@@ -435,8 +435,8 @@ func TestSlowWindowNextRoundStartsWhileLastBlocksDrain(t *testing.T) {
 	t.Setenv("JM_SERVER_READAHEAD", "")
 	resetPrefetchOfflineState(t)
 	forceDefaultClass(t, netprofile.ClassSlow)
-	fuseDataInFlight.Store(0)
-	t.Cleanup(func() { fuseDataInFlight.Store(0) })
+	resetFUSEDataGateCounts()
+	t.Cleanup(func() { resetFUSEDataGateCounts() })
 	dir, name := windowTestFile(t, 32)
 	rm := NewReadaheadManager(dir, nil, slowProfile(t))
 	defer rm.Stop()

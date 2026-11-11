@@ -14,7 +14,7 @@ import (
 	"github.com/lelanddutcher/juicemount/metadata"
 )
 
-// fakeJuiceFSControl answers the patch 0021 control messages over a temp
+// fakeJuiceFSControl answers the patch 0022 control messages over a temp
 // folder that stands in for the JuiceFS mount. It cannot give a folder a
 // chosen inode on disk, so it keeps its own inode -> path map and records the
 // order of creations.
@@ -363,7 +363,7 @@ func TestSpooledMkdirFallsBackToPlainMkdirWhenNumberUnknown(t *testing.T) {
 
 func TestSpooledMkdirKeepsSynchronousPathWithoutReservation(t *testing.T) {
 	jfs, fuseRoot, spool, _, fake := newSpooledMkdirFixture(t)
-	fake.reserveErr = syscall.ENOTSUP // a juicefs without patch 0021
+	fake.reserveErr = syscall.ENOTSUP // a juicefs without patch 0022
 	if err := jfs.MkdirAll("w/sync", 0o755); err != nil {
 		t.Fatal(err)
 	}

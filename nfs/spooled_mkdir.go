@@ -15,7 +15,7 @@ package nfs
 // THE FILE ID. macOS treats a changed file id on a folder it holds as a stale
 // handle (ESTALE), and that broke bundle copies once (#70: "real inode at
 // birth"). So a spooled folder is born with its final inode: the drainer
-// reserves numbers from the running juicefs ahead of time (patch 0021,
+// reserves numbers from the running juicefs ahead of time (patch 0022,
 // JMReserveInodes) and creates the folder with that exact number
 // (JMMkdirInode). Without a reserved number (an old juicefs, an empty pool,
 // offline) MKDIR keeps the synchronous path, unchanged.

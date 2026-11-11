@@ -19,7 +19,7 @@
   an empty one never reaches the server. Offline, folders wait locally with
   the files. Project rules are unchanged: the drainer checks the project
   lease before it creates a folder. Field switch: `JM_SPOOL_MKDIR=0`. The
-  bundled JuiceFS is now build `-jm7`.
+  bundled JuiceFS is now build `-jm8`.
 - On a slow link, a large saved file no longer waits behind many small ones.
   Before, the drainer took files strictly oldest first, and it waited for a
   free slot for small files even when the slot for large files was idle. In
@@ -36,6 +36,38 @@
 - Each saved file reaches the server with 2 fewer Redis round trips: the
   JuiceFS rename that publishes it now takes 3 round trips instead of 5.
 
+- On a slow or distant link, the first frame of a clip that is not cached,
+  and each jump while scrubbing it, arrive much sooner, and read-ahead no
+  longer holds up the reads the editor waits for. A "demand read" is a read
+  that an application is waiting for. Three changes:
+  - JuiceFS (bundled, now `-jm7`): a read that misses the cache fetches the
+    1 MiB around it as four 256 KiB requests that run at the same time, and
+    serves the rest of that 1 MiB from memory. Before, macOS sent the 1 MiB
+    as eight 128 KiB reads, one after another, each its own request, and each
+    also started a download of the whole 4 MiB block. A jump now costs about
+    one request instead of eight, and fetches about the bytes it needs
+    instead of about seven times as many. A block that is read all the way
+    through still goes to the local cache. Encrypted volumes are unchanged:
+    they must fetch whole blocks.
+  - Read-ahead can no longer use the slots that demand reads need. Before,
+    on a slow link both shared one limit of 8 concurrent file reads, so a
+    read the editor waited for could be refused while read-ahead held the
+    slots. macOS then waited up to 30 s before it asked again.
+  - When read-ahead blocks take longer than 8 s, or two reads the editor
+    waits for take over 3 s for 256 KiB within a minute (for example 200 ms
+    delay and 1% loss without server BBR), a scrub gets no read-ahead for a
+    minute, and read-ahead waits until the reads the editor waits for have
+    finished. A retry of a
+    read that is still in progress joins it for up to 150 s (before: 24 s),
+    instead of starting a second read of the same bytes.
+  - Read-ahead reads a block in 1 MiB pieces and lets the editor's reads go
+    first between pieces, for at most 8 s each time, and without holding a
+    file-read slot while it waits. macOS runs one read of a file at a time, so before,
+    a jump in a clip could wait 5 to 6 s behind a 4 MiB read-ahead of that
+    same clip.
+- `JM_READ_TIMELINE=1` (a lab switch) logs every step of each read: the NFS
+  read, the file-read slot, the JuiceFS request with its first byte, and
+  read-ahead. Without it, the app logs these steps at Debug level only.
 - On a lossy but working link, the volume no longer goes offline by mistake.
   Before, one failed connection check marked the server unreachable. On a
   link with 200 ms delay and 1% packet loss, one lost packet was enough, so
