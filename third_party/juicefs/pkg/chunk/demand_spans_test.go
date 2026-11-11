@@ -317,13 +317,26 @@ func TestJMSpanDemandCountsOnlyAwaitedParts(t *testing.T) {
 		t.Fatal("read failed")
 	}
 	mu.Lock()
-	defer mu.Unlock()
-	if inflight != 0 {
-		t.Fatalf("demand left in flight: %d", inflight)
+	left := inflight
+	mu.Unlock()
+	if left != 0 {
+		t.Fatalf("demand left in flight: %d", left)
 	}
+	// Wait until every part of the span has finished, so the next read is
+	// a hit. Never hold mu across c.read: a read that waits on an unfinished
+	// part calls c.demand, which takes mu.
+	deadline = time.Now().Add(5 * time.Second)
+	for f.running.Load() > 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	time.Sleep(20 * time.Millisecond) // let the last part publish after its fetch returns
 	// A read served from a finished part is not counted.
-	if _, _, ok := c.read("k", 256<<10, make([]byte, 128<<10), bs); !ok || counted["k"] != 1 {
-		t.Fatalf("a hit counted as a demand read (count %d)", counted["k"])
+	_, _, ok := c.read("k", 256<<10, make([]byte, 128<<10), bs)
+	mu.Lock()
+	n := counted["k"]
+	mu.Unlock()
+	if !ok || n != 1 {
+		t.Fatalf("a hit counted as a demand read (count %d)", n)
 	}
 }
 

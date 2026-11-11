@@ -1112,7 +1112,7 @@
     "pkg/chunk/demand_first.go": "ad4589aefcfdced76b6d466a4bce0119ef8d0bcf6149e8c66ab5654789a227b0",
     "pkg/chunk/demand_first_test.go": "7ed56d3b9ae0b73535c18b563a7206618c24b39f0ff699ab90e81833b316b0b4",
     "pkg/chunk/demand_spans.go": "d794addcdd568eabdad2447d5214b9c9d3a52a9fbc9b3e11294c7cd284b5f9a1",
-    "pkg/chunk/demand_spans_test.go": "acf912c487dbc4f583cb09adf95e610d7287ae39423d6977a761d9a8ea4c6a8c",
+    "pkg/chunk/demand_spans_test.go": "38c1f6888822725892476a851e00d486f7cfe239f678e0b3e09e5d3a9b97ec4e",
     "pkg/chunk/ranged_first_read_test.go": "0b2c6bfdd311a2824e650b4fd3f019199c1a9b2caa64993eacfbbd81dab77ac9",
     "pkg/chunk/upload_cache_ownership_test.go": "ebb66944296ae43b5579e12a8688d5a4c03e9ef8eecb61107d0ef0427429d791",
     "pkg/fuse/rename_flags_darwin.go": "37e49f30f2017a7ea05d47154cedaf6a90ecdab24d3c5d3639af53b4de6d6abd",
