@@ -45,6 +45,7 @@ func logOfflineRefusal(op, why, path string) {
 		return
 	}
 	suppressed := offlineRefusalLog.suppressed
+	windowStart := offlineRefusalLog.last
 	offlineRefusalLog.suppressed = 0
 	offlineRefusalLog.last = t
 	offlineRefusalLog.mu.Unlock()
@@ -58,5 +59,35 @@ func logOfflineRefusal(op, why, path string) {
 		"auto_offline", st.AutoOffline,
 		"auto_reason", st.Reason,
 		"offline_for_sec", st.SinceSec,
-		"suppressed_since_last", suppressed)
+		"suppressed_since_last", suppressed,
+		// The suppressed count covers refusals after this time. It may span an
+		// earlier offline period if no summary was written in between.
+		"suppressed_window_start", formatWindowStart(windowStart))
+}
+
+// FlushOfflineRefusalLog writes the count of refusals not yet reported, then
+// starts a fresh window, so the next refusal logs at once. Call it when
+// offline mode lifts: without it the last outage's count would be printed
+// only at the next refusal, possibly in a later outage, or never.
+func FlushOfflineRefusalLog(event string) {
+	offlineRefusalLog.mu.Lock()
+	suppressed := offlineRefusalLog.suppressed
+	windowStart := offlineRefusalLog.last
+	offlineRefusalLog.suppressed = 0
+	offlineRefusalLog.last = time.Time{}
+	offlineRefusalLog.mu.Unlock()
+	if suppressed == 0 {
+		return
+	}
+	jmlog.Info("offline gate refusals summary",
+		"event", event,
+		"suppressed_since_last", suppressed,
+		"suppressed_window_start", formatWindowStart(windowStart))
+}
+
+func formatWindowStart(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return t.Format(time.RFC3339Nano)
 }

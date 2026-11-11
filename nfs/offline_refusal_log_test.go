@@ -23,6 +23,7 @@ type offlineRefusalLine struct {
 	Auto       bool   `json:"auto_offline"`
 	AutoReason string `json:"auto_reason"`
 	Suppressed int64  `json:"suppressed_since_last"`
+	WindowFrom string `json:"suppressed_window_start"`
 }
 
 func offlineRefusalLines(t *testing.T, raw []byte) []offlineRefusalLine {
@@ -36,7 +37,7 @@ func offlineRefusalLines(t *testing.T, raw []byte) []offlineRefusalLine {
 		if err := json.Unmarshal(line, &l); err != nil {
 			continue
 		}
-		if l.Message == "offline gate refused request (ENXIO to the app)" {
+		if l.Message == "offline gate refused request (ENXIO to the app)" || l.Message == "offline gate refusals summary" {
 			out = append(out, l)
 		}
 	}
@@ -111,5 +112,26 @@ func TestOfflineOpenRefusalLogsAtInfoRateLimited(t *testing.T) {
 	}
 	if lines[1].Suppressed != 2 {
 		t.Fatalf("suppressed_since_last=%d, want 2", lines[1].Suppressed)
+	}
+	if lines[1].WindowFrom == "" {
+		t.Fatal("second line lacks suppressed_window_start")
+	}
+
+	// Two more refusals inside the new window, then auto-offline clears: the
+	// summary must report them now, not at some later outage.
+	open()
+	open()
+	FlushOfflineRefusalLog("auto-offline cleared")
+	lines = offlineRefusalLines(t, logs.Bytes())
+	if len(lines) != 3 || lines[2].Message != "offline gate refusals summary" || lines[2].Suppressed != 2 {
+		t.Fatalf("want a summary line with 2 suppressed refusals, got %+v", lines)
+	}
+	// A flush with nothing pending writes nothing, and the next refusal logs
+	// at once because the window restarted.
+	FlushOfflineRefusalLog("auto-offline cleared")
+	open()
+	lines = offlineRefusalLines(t, logs.Bytes())
+	if len(lines) != 4 || lines[3].Op != "open" || lines[3].Suppressed != 0 {
+		t.Fatalf("after flush, want one fresh refusal line, got %+v", lines)
 	}
 }

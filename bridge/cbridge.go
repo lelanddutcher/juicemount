@@ -283,10 +283,12 @@ var backendRoutePolicyState struct {
 // each way) one lost SYN or PING failed a probe, so the volume flipped offline
 // 38 times in 80 minutes and refused un-pinned opens with ENXIO while the link
 // worked. Two failures are required now, but the second probe runs 250 ms after
-// the first (health.Reachability confirmDelay), not a full interval later, so a
-// real route loss still goes offline within interval + 2 probe timeouts
-// (~4.3 s on a LAN). That stays well clear of the ~22 s Finder stall an earlier
-// extra timer caused. The first successful probe still recovers online.
+// the first (health.Reachability confirmDelay), not a full interval later. A
+// real route loss on a LAN goes offline in 4-8 s: about 4.3 s with no recent
+// traffic, about 8.3 s in normal use, because Redis replies up to the cut keep
+// suppressing failures for the 4 s liveness window. That stays well clear of
+// the ~22 s Finder stall an earlier extra timer caused. The first successful
+// probe still recovers online.
 const backendFailuresToOffline = 2
 
 // ServerConfig is the JSON configuration passed from Swift.
@@ -1855,13 +1857,16 @@ func nfsServerStartSerialized(configJSON *C.char, recovery *servingDesiredRecord
 	rc.SetReconcileInterval(cfg.reconcileInterval())
 
 	// [JM6 tier-1.8/1.9] Reachability monitor against the metadata
-	// host. Probes a cheap TCP dial at 2s cadence; transitions
-	// reachable→unreachable after 2 consecutive failures (~4s
-	// detection — under the 5s tier-1.8 acceptance threshold).
-	// Items 3-5 will consume its OnChange callback to auto-engage
-	// offline mode, refuse un-pinned reads fast, and surface state
-	// in the UI. For now this is purely observational — it logs
-	// transitions but does not yet affect any other state.
+	// host. Probes (TCP connect + Redis PING) at a 2 s cadence and
+	// transitions reachable→unreachable after backendFailuresToOffline
+	// consecutive failures; the second is a 250 ms confirm probe. LAN
+	// detection is 4-8 s: ~4.3 s with no recent traffic, ~8.3 s in normal
+	// use, when recent Redis replies or drains hold off failures for the
+	// 4 s liveness window. That is above the original 5 s tier-1.8 target;
+	// the trade is deliberate (a lossy WAN flapped offline 38 times in
+	// 80 minutes with the 1-failure policy). See docs/TUNING/REVERT_LOG.md
+	// 2026-11-11. Its OnChange callback (cacheOwner.reachChanged) engages
+	// and lifts auto-offline.
 	reachURL := cfg.RedisURL
 	if linkNode != nil || (ownerMode && ownerReceipt.LinkEnabled) {
 		// The proxy listener is local and therefore reachable even while Link's
@@ -1911,7 +1916,8 @@ func nfsServerStartSerialized(configJSON *C.char, recovery *servingDesiredRecord
 			// the backend link works (internal/liveness). On a lossy WAN a
 			// probe can lose a packet while reads and lookups keep flowing;
 			// this keeps that probe failure from taking the volume offline.
-			health.WithLivenessHook(liveness.Since),
+			// JM_REACH_REDIS_LIVENESS=0 turns this proof off (nil hook).
+			health.WithLivenessHook(liveness.ReachabilityHook()),
 		}
 		if linkNode != nil {
 			reachOpts = append(reachOpts, health.WithDialContext(linkNode.DialContext))

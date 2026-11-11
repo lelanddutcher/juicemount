@@ -27,6 +27,11 @@
 //	no recent backend traffic:  I + 2T + c      LAN (T=1s): ~4.3 s
 //	traffic right up to the cut: W + I + 2T + c  LAN: ~8.3 s; 200 ms WAN (T~2s): ~10.3 s
 //
+// In normal use Redis traffic is nearly always flowing, so the second row is
+// the realistic one: 4-8 s on a LAN. A Redis reply counts as proof only if it
+// came back within liveness.MaxProofLatency (2 s), so a bufferbloated link
+// whose replies take tens of seconds cannot hold the volume online.
+//
 // T is capped by maxDialTimeout (10 s, JM_REACH_MAX_DIAL_MS), so the absolute
 // worst case is W + I + 2*10s + c ≈ 26.3 s on a link with multi-second RTT.
 //
@@ -106,6 +111,7 @@ type Reachability struct {
 	baseInterval   time.Duration // FLOOR for the probe cadence
 	maxDialTimeout time.Duration // ceiling for the adaptive dial timeout
 	adaptive       bool          // grow dialTimeout/interval with observed RTT
+	wanRetransmit  bool          // add retransmitAllowance to the budget on a WAN
 	failsToOffline int           // consecutive failures before flipping reachable→unreachable
 	passesToOnline int           // consecutive successes before flipping unreachable→reachable
 	confirmDelay   time.Duration // gap before the probe that confirms a failure
@@ -297,6 +303,7 @@ func NewReachability(target string, opts ...ReachabilityOption) *Reachability {
 		baseInterval:     2 * time.Second,
 		maxDialTimeout:   10 * time.Second,
 		adaptive:         true,
+		wanRetransmit:    true,
 		failsToOffline:   2,
 		passesToOnline:   1,
 		confirmDelay:     defaultConfirmDelay,
@@ -318,14 +325,22 @@ func NewReachability(target string, opts ...ReachabilityOption) *Reachability {
 	// Env overrides (operator escape hatch; defaults are LAN-safe).
 	//   JM_REACH_ADAPTIVE=0         disable adaptive growth (fixed dialTimeout)
 	//   JM_REACH_MAX_DIAL_MS=<n>    ceiling for the adaptive dial timeout
-	//   JM_REACH_DRAIN_LIVENESS=0   disable the traffic-liveness false-flap override
-	//                               (drain and Redis-reply proofs; REVERT_LOG)
+	//   JM_REACH_DRAIN_LIVENESS=0   disable the whole traffic-liveness override
+	//                               (drain and Redis-reply proofs; REVERT_LOG).
+	//                               JM_REACH_REDIS_LIVENESS=0 (read by the bridge
+	//                               via liveness.ReachabilityHook) drops only the
+	//                               Redis-reply proof.
+	//   JM_REACH_WAN_RETRANSMIT=0   drop the 1 s WAN retransmit allowance only
+	//                               (RTT adaptation stays on, as before 2026-11-11)
 	//   JM_REACH_FAILS_TO_OFFLINE=<n>  consecutive failures before offline (1-5);
 	//                               1 restores the pre-2026-11-11 single-probe flip
 	if v := os.Getenv("JM_REACH_FAILS_TO_OFFLINE"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n >= 1 && n <= 5 {
 			r.failsToOffline = n
 		}
+	}
+	if os.Getenv("JM_REACH_WAN_RETRANSMIT") == "0" {
+		r.wanRetransmit = false
 	}
 	if os.Getenv("JM_REACH_ADAPTIVE") == "0" {
 		r.adaptive = false
@@ -358,7 +373,7 @@ func (r *Reachability) effectiveDialTimeout() time.Duration {
 		return r.dialTimeout
 	}
 	want := 2*r.srtt + 4*r.rttvar
-	if r.srtt >= wanRTTThreshold {
+	if r.wanRetransmit && r.srtt >= wanRTTThreshold {
 		want += retransmitAllowance
 	}
 	if want < r.dialTimeout {
@@ -474,35 +489,61 @@ func (r *Reachability) loop() {
 	// state within one dialTimeout of Start().
 	r.probeAndUpdate()
 
-	ticker := time.NewTicker(r.nextProbeDelay())
+	// The regular cadence is a fixed ticker, exactly as before the confirm
+	// probe existed: a probe's own duration does not stretch the interval, so
+	// recovery after an outage is still noticed within one interval. The
+	// confirm probe uses its own one-shot timer and never moves the ticker.
+	ticker := time.NewTicker(r.baseInterval)
 	defer ticker.Stop()
+	var confirm *time.Timer
+	var confirmC <-chan time.Time
+	scheduleConfirm := func() {
+		if confirm != nil {
+			confirm.Stop()
+			confirm, confirmC = nil, nil
+		}
+		if d, ok := r.confirmDue(); ok {
+			confirm = time.NewTimer(d)
+			confirmC = confirm.C
+		}
+	}
+	defer func() {
+		if confirm != nil {
+			confirm.Stop()
+		}
+	}()
+	scheduleConfirm()
 	for {
 		select {
 		case <-r.stopCh:
 			return
 		case <-ticker.C:
 			r.probeAndUpdate()
+		case <-confirmC:
+			confirm, confirmC = nil, nil
+			r.probeAndUpdate()
 		case <-r.triggerCh:
 			r.probeAndUpdate()
+			// Reset the ticker so we don't immediately probe again.
+			ticker.Reset(r.baseInterval)
 		}
-		// Reset after every probe: a pending failure is confirmed after
-		// confirmDelay; otherwise the regular cadence resumes. Resetting after
-		// a Notify also stops an immediate second probe.
-		ticker.Reset(r.nextProbeDelay())
+		scheduleConfirm()
 	}
 }
 
-// nextProbeDelay returns confirmDelay while a failure streak is open and has
-// not yet flipped the state, and baseInterval otherwise. The early confirm
-// keeps real offline detection near one probe timeout per required failure.
-func (r *Reachability) nextProbeDelay() time.Duration {
+// confirmDue reports whether a failure streak is open and has not yet flipped
+// the state, and if so how long to wait before the confirming probe. The early
+// confirm keeps real offline detection near one probe timeout per required
+// failure. With a threshold of 1 a streak never stays open, so no confirm
+// probe ever runs and the cadence is the plain fixed ticker.
+func (r *Reachability) confirmDue() (time.Duration, bool) {
 	r.mu.RLock()
 	pending := r.reachable && r.consecutiveFails > 0
 	r.mu.RUnlock()
 	if pending && r.confirmDelay > 0 && r.confirmDelay < r.baseInterval {
-		return r.confirmDelay
+		return r.confirmDelay, true
 	}
-	return r.baseInterval
+	return 0, false
 }
 
 // dispatchTransitions invokes callbacks serially in transition order. It is a

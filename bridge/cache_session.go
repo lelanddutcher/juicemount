@@ -120,6 +120,9 @@ func (o *bridgeCacheOwner) clearAutoOfflineIfCurrent(epoch uint64) bool {
 		return false
 	}
 	pin.SetAutoOffline(false, "")
+	// Report refusals the rate limiter held back during this outage, so the
+	// count lands in this outage's log rather than the next one's.
+	jmnfs.FlushOfflineRefusalLog("auto-offline cleared")
 	return true
 }
 

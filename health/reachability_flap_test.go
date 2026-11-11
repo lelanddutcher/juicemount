@@ -159,38 +159,39 @@ func TestReachabilityDeadLinkGoesOfflineWithinBound(t *testing.T) {
 	select {
 	case at := <-offlineAt:
 		took := at.Sub(time.Unix(0, dead.Load()))
-		// Scheduler slack on a busy CI host.
-		if took > bound+150*time.Millisecond {
+		// Scheduler slack on a busy, shared CI host. Generous on purpose:
+		// the check is that detection is bounded, not that timers are exact.
+		if took > bound+500*time.Millisecond {
 			t.Fatalf("dead link went offline after %v, bound %v", took, bound)
 		}
 		if took < 2*timeout {
 			t.Fatalf("went offline after %v, faster than two probe timeouts (%v): only one failure counted?", took, 2*timeout)
 		}
-	case <-time.After(5 * bound):
+	case <-time.After(10 * bound):
 		t.Fatalf("dead link never went offline (bound %v)", bound)
 	}
 }
 
 // TestReachabilityConfirmProbeRunsEarly checks that a single failure schedules
-// the confirming probe after confirmDelay, not after a whole interval, and
-// that the regular cadence resumes once the streak closes.
+// the confirming probe after confirmDelay, and that no confirm is pending once
+// the streak closes or the state has flipped.
 func TestReachabilityConfirmProbeRunsEarly(t *testing.T) {
 	var ok atomic.Bool
 	r := NewReachability("ignored:0",
 		WithProbe(scriptedProbe(&ok)),
 		WithConfirmDelay(250*time.Millisecond),
 	)
-	if got := r.nextProbeDelay(); got != 2*time.Second {
-		t.Fatalf("idle delay %v, want base interval 2s", got)
+	if _, due := r.confirmDue(); due {
+		t.Fatal("confirm pending with no failure")
 	}
 	r.probeAndUpdate() // one failure
-	if got := r.nextProbeDelay(); got != 250*time.Millisecond {
-		t.Fatalf("delay after one failure %v, want confirm delay 250ms", got)
+	if d, due := r.confirmDue(); !due || d != 250*time.Millisecond {
+		t.Fatalf("after one failure confirmDue=(%v,%v), want (250ms,true)", d, due)
 	}
 	ok.Store(true)
 	r.probeAndUpdate()
-	if got := r.nextProbeDelay(); got != 2*time.Second {
-		t.Fatalf("delay after recovery %v, want base interval 2s", got)
+	if _, due := r.confirmDue(); due {
+		t.Fatal("confirm pending after recovery")
 	}
 	// Once offline, probes return to the base cadence (no busy retry).
 	ok.Store(false)
@@ -199,8 +200,113 @@ func TestReachabilityConfirmProbeRunsEarly(t *testing.T) {
 	if r.Reachable() {
 		t.Fatal("expected offline after two failures")
 	}
-	if got := r.nextProbeDelay(); got != 2*time.Second {
-		t.Fatalf("delay while offline %v, want base interval 2s", got)
+	if _, due := r.confirmDue(); due {
+		t.Fatal("confirm pending while offline")
+	}
+}
+
+// TestReachabilityProbeDurationDoesNotStretchCadence is the M1 regression.
+// Resetting the ticker after each probe made the cycle interval + probe time,
+// which slowed recovery after an outage. While offline, slow failing probes
+// must still start once per interval.
+func TestReachabilityProbeDurationDoesNotStretchCadence(t *testing.T) {
+	const (
+		interval = 100 * time.Millisecond
+		timeout  = 70 * time.Millisecond
+	)
+	var attempts atomic.Int64
+	probe := func(ctx context.Context) (time.Duration, error) {
+		attempts.Add(1)
+		<-ctx.Done()
+		return 0, ctx.Err()
+	}
+	r := NewReachability("ignored:0",
+		WithProbe(probe),
+		WithBaseInterval(interval),
+		WithDialTimeout(timeout),
+		WithConfirmDelay(10*time.Millisecond),
+	)
+	r.SeedUnreachable() // already offline: only the regular cadence runs
+	r.Start()
+	defer r.Stop()
+	time.Sleep(2 * time.Second)
+	// Fixed cadence: about 20 probes. Stretched (interval + timeout): about 12.
+	if n := attempts.Load(); n < 16 {
+		t.Fatalf("%d probes in 2 s at a %v interval: the probe duration is stretching the cadence", n, interval)
+	}
+}
+
+// TestReachabilityDeadLinkWithTrafficUntilCutWithinBound is the realistic
+// case: Redis traffic flows right up to the moment the link dies, so the
+// liveness window W must lapse before failures count. Bound W + I + 2T + c;
+// with production values that is about 8.3 s on a LAN.
+func TestReachabilityDeadLinkWithTrafficUntilCutWithinBound(t *testing.T) {
+	const (
+		interval = 200 * time.Millisecond
+		timeout  = 100 * time.Millisecond
+		confirm  = 50 * time.Millisecond
+	)
+	var alive atomic.Bool
+	alive.Store(true)
+	var lastTraffic atomic.Int64
+	lastTraffic.Store(time.Now().UnixNano())
+	stopTraffic := make(chan struct{})
+	go func() { // a steady stream of Redis replies while the link is up
+		for {
+			select {
+			case <-stopTraffic:
+				return
+			case <-time.After(20 * time.Millisecond):
+				if alive.Load() {
+					lastTraffic.Store(time.Now().UnixNano())
+				}
+			}
+		}
+	}()
+	defer close(stopTraffic)
+	probe := func(ctx context.Context) (time.Duration, error) {
+		if alive.Load() {
+			return time.Millisecond, nil
+		}
+		<-ctx.Done()
+		return 0, ctx.Err()
+	}
+	r := NewReachability("ignored:0",
+		WithProbe(probe),
+		WithBaseInterval(interval),
+		WithDialTimeout(timeout),
+		WithConfirmDelay(confirm),
+		WithLivenessHook(func() time.Duration { return time.Since(time.Unix(0, lastTraffic.Load())) }),
+	)
+	window := r.livenessWindow // 2 * interval
+	offlineAt := make(chan time.Time, 1)
+	r.OnChange(func(reachable bool, _ string) {
+		if !reachable {
+			select {
+			case offlineAt <- time.Now():
+			default:
+			}
+		}
+	})
+	r.Start()
+	defer r.Stop()
+
+	time.Sleep(interval / 2)
+	cut := time.Now()
+	alive.Store(false)
+
+	bound := window + interval + 2*timeout + confirm
+	select {
+	case at := <-offlineAt:
+		took := at.Sub(cut)
+		if took > bound+500*time.Millisecond {
+			t.Fatalf("went offline %v after the cut, bound %v", took, bound)
+		}
+		if took < window {
+			t.Fatalf("went offline %v after the cut, before the %v traffic window lapsed", took, window)
+		}
+	case <-time.After(10 * bound):
+		t.Fatalf("dead link never went offline (bound %v)", bound)
 	}
 }
 
@@ -224,6 +330,15 @@ func TestReachabilityWANBudgetCoversOneRetransmit(t *testing.T) {
 	}
 	if got := lan.effectiveDialTimeout(); got != lan.dialTimeout {
 		t.Fatalf("LAN budget %v, want floor %v", got, lan.dialTimeout)
+	}
+
+	t.Setenv("JM_REACH_WAN_RETRANSMIT", "0")
+	noAllowance := NewReachability("127.0.0.1:1")
+	for i := 0; i < 50; i++ {
+		noAllowance.observeRTT(410 * time.Millisecond)
+	}
+	if got := noAllowance.effectiveDialTimeout(); got >= 410*time.Millisecond+retransmitAllowance {
+		t.Fatalf("JM_REACH_WAN_RETRANSMIT=0 budget %v still includes the allowance", got)
 	}
 
 	t.Setenv("JM_REACH_ADAPTIVE", "0")

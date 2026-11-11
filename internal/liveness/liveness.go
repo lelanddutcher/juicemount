@@ -16,21 +16,40 @@ import (
 	"context"
 	"errors"
 	"math"
+	"os"
 	"sync/atomic"
 	"time"
 
 	"github.com/redis/go-redis/v9"
 )
 
-// lastProof holds time.Now().UnixNano() of the most recent proven reply.
-// Zero means no reply has been seen.
+// processStart anchors every timestamp in this package. time.Since on a value
+// from time.Now uses the monotonic clock, so a wall-clock step (NTP, a manual
+// change, a sleep/wake correction) cannot make an old reply look recent.
+var processStart = time.Now()
+
+// monoNow returns the monotonic time since processStart. A variable so tests
+// can drive the clock.
+var monoNow = func() time.Duration { return time.Since(processStart) }
+
+// lastProof holds monoNow()+1 (in ns) at the most recent proven reply. The +1
+// keeps zero free to mean "no reply has been seen".
 var lastProof atomic.Int64
 
-// Mark records that the backend answered just now.
-func Mark() { markAt(time.Now()) }
+// MaxProofLatency is the longest a command may take and still count as proof.
+// A reply that arrives after a long wait proves only that the backend was
+// reachable when it answered, through a link too slow for interactive use. On
+// a bufferbloated link where replies take 10-50 s, late replies every few
+// seconds would otherwise suppress every probe failure and keep the volume
+// online with an unusable backend. 2 s matches the probe budget on a 200 ms
+// WAN (probe plus one retransmit).
+const MaxProofLatency = 2 * time.Second
 
-func markAt(t time.Time) {
-	n := t.UnixNano()
+// Mark records that the backend answered just now.
+func Mark() { markOffset(monoNow()) }
+
+func markOffset(d time.Duration) {
+	n := int64(d) + 1
 	for {
 		old := lastProof.Load()
 		if old >= n || lastProof.CompareAndSwap(old, n) {
@@ -47,15 +66,39 @@ func Since() time.Duration {
 	if n == 0 {
 		return time.Duration(math.MaxInt64)
 	}
-	d := time.Since(time.Unix(0, n))
+	d := monoNow() - time.Duration(n-1)
 	if d < 0 {
 		return 0
 	}
 	return d
 }
 
+// ReachabilityHook returns Since for health.WithLivenessHook, or nil when the
+// operator has turned Redis-reply proof off with JM_REACH_REDIS_LIVENESS=0
+// (health.WithLivenessHook ignores nil). The drain-liveness override is
+// separate and has its own switch, JM_REACH_DRAIN_LIVENESS.
+func ReachabilityHook() func() time.Duration {
+	if os.Getenv("JM_REACH_REDIS_LIVENESS") == "0" {
+		return nil
+	}
+	return Since
+}
+
 // Reset clears the recorded proof. Tests only.
 func Reset() { lastProof.Store(0) }
+
+// markIfPrompt marks liveness when err is a reply and the command took no
+// longer than MaxProofLatency.
+func markIfPrompt(start time.Duration, err error) {
+	if !Answered(err) {
+		return
+	}
+	now := monoNow()
+	if now-start > MaxProofLatency {
+		return
+	}
+	markOffset(now)
+}
 
 // Answered reports whether err means the Redis server produced a reply. A nil
 // error and redis.Nil ("no such key") are answers. A server error reply
@@ -72,7 +115,8 @@ func Answered(err error) bool {
 	return false
 }
 
-// RedisHook marks liveness each time a command or pipeline gets a reply.
+// RedisHook marks liveness each time a command or pipeline gets a prompt reply
+// (within MaxProofLatency of being sent).
 // Attach it to every client whose address is the backend (or a proxy that can
 // only answer by forwarding to the backend).
 type RedisHook struct{}
@@ -81,20 +125,18 @@ func (RedisHook) DialHook(next redis.DialHook) redis.DialHook { return next }
 
 func (RedisHook) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
 	return func(ctx context.Context, cmd redis.Cmder) error {
+		start := monoNow()
 		err := next(ctx, cmd)
-		if Answered(err) {
-			Mark()
-		}
+		markIfPrompt(start, err)
 		return err
 	}
 }
 
 func (RedisHook) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
 	return func(ctx context.Context, cmds []redis.Cmder) error {
+		start := monoNow()
 		err := next(ctx, cmds)
-		if Answered(err) {
-			Mark()
-		}
+		markIfPrompt(start, err)
 		return err
 	}
 }
