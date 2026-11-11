@@ -21,9 +21,10 @@
     on a slow link both shared one limit of 8 concurrent file reads, so a
     read the editor waited for could be refused while read-ahead held the
     slots. macOS then waited up to 30 s before it asked again.
-  - When read-ahead blocks take longer than 8 s (for example 200 ms delay and
-    1% loss without server BBR), a scrub gets no read-ahead, and read-ahead
-    waits until the reads the editor waits for have finished. A retry of a
+  - When read-ahead blocks take longer than 8 s, or a read the editor waits
+    for takes over 2 s for 256 KiB (for example 200 ms delay and 1% loss
+    without server BBR), a scrub gets no read-ahead for a minute, and
+    read-ahead waits until the reads the editor waits for have finished. A retry of a
     read that is still in progress joins it for up to 150 s (before: 24 s),
     instead of starting a second read of the same bytes.
   - Read-ahead reads a block in 1 MiB pieces and lets the editor's reads go
