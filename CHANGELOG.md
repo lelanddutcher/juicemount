@@ -18,6 +18,7 @@
   a distant one. When the offline mode refuses a file, the app now writes one
   line per 10 s to the normal log with the reason, and a summary line when
   the volume comes back online.
+- Built with Go 1.26.11, which fixes a net/http vulnerability (GO-2026-6859).
 - Over a slow or distant link, a file that is not in the local cache starts
   to play or open sooner. JuiceFS stores files in 4 MiB blocks. Before, the
   first read of a block waited until the whole block had downloaded. Now a
@@ -55,6 +56,7 @@
 
 ### Server
 
+- Server images are built with Go 1.26.11 (net/http fix GO-2026-6859).
 - The Manager image ships the same JuiceFS build (`-jm5`). The Manager still
   accepts `-jm3` or later.
 - New opt-in file `server/docker-compose.tcp-bbr.yml`: the object store and

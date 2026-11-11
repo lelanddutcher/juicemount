@@ -11,7 +11,7 @@
 #   - the router tools (iptables, conntrack, dnsmasq, tc, socat) and the probes'
 #     tools (curl, redis-cli, python3, openssl).
 
-FROM golang:1.26.10-alpine AS derper
+FROM golang:1.26.11-alpine AS derper
 # Same version as tailscale.com in go.mod. go install resolves its own
 # dependencies from the module's go.sum.
 RUN --mount=type=cache,target=/go/pkg/mod \
