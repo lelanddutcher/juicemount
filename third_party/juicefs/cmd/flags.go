@@ -192,6 +192,10 @@ func dataCacheFlags() []cli.Flag {
 			Usage: "prefetch N blocks in parallel",
 		},
 		&cli.BoolFlag{
+			Name:  "demand-first",
+			Usage: "serve reads that wait before prefetch: own ranged GETs, prefetch deferred (JuiceMount)",
+		},
+		&cli.BoolFlag{
 			Name:  "writeback",
 			Usage: "upload blocks in background",
 		},

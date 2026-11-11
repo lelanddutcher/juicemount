@@ -108,6 +108,28 @@ func TestDesktopJuiceFSObjectTimeoutsKeepCellularBlocksViableAndBounded(t *testi
 	}
 }
 
+func TestDesktopJuiceFSDemandFirstOnSlowAndMeteredOnly(t *testing.T) {
+	t.Setenv("JM_JFS_DEMAND_FIRST", "")
+	tests := []struct {
+		class netprofile.LinkClass
+		want  []string
+	}{
+		{netprofile.ClassMetered, []string{"--demand-first"}},
+		{netprofile.ClassSlow, []string{"--demand-first"}},
+		{netprofile.ClassMedium, nil},
+		{netprofile.ClassFast, nil},
+	}
+	for _, tt := range tests {
+		if got := desktopJuiceFSDemandFirstArgs(tt.class); !slices.Equal(got, tt.want) {
+			t.Fatalf("demand-first args for %s = %v, want %v", tt.class, got, tt.want)
+		}
+	}
+	t.Setenv("JM_JFS_DEMAND_FIRST", "0")
+	if got := desktopJuiceFSDemandFirstArgs(netprofile.ClassSlow); got != nil {
+		t.Fatalf("demand-first rollback args = %v, want nil", got)
+	}
+}
+
 func TestDesktopJuiceFSReadAheadDoesNotFreezeStartupClass(t *testing.T) {
 	t.Setenv("JM_JFS_MAX_READAHEAD", "")
 	want := []string{"--max-readahead", "1M"}

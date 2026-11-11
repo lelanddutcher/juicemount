@@ -135,6 +135,14 @@ type ReadaheadManager struct {
 	// windowCapOverride replaces windowBlockCap when > 0 (simulation only).
 	windowCapOverride int
 
+	// Demand first (demand_first.go). demand is the foreground demand-read
+	// gate (nil: foregroundDemand); demandFirst reports whether the rules
+	// apply now (nil: demandFirstActive); demandDefer bounds one wait (0:
+	// demandDeferMax). Tests replace them before reading.
+	demand      *demandGate
+	demandFirst func() bool
+	demandDefer time.Duration
+
 	// Stats
 	statsMu    sync.Mutex
 	triggered  int64
@@ -562,6 +570,12 @@ func (rm *ReadaheadManager) serialBlocks(fd *os.File, mapping *readaheadMappingJ
 		// user's actual read, inverting the priority this prefetcher exists to
 		// serve. If there is no room, drop the block; the next real read will
 		// fetch it.
+		// demand_first.go rule 1 (slow and metered only), then the loop's
+		// own stop checks again.
+		rm.waitForDemand(func() bool { return !rm.effectivePolicy().Enabled })
+		if !rm.prefetchAllowed() || !rm.effectivePolicy().Enabled {
+			return
+		}
 		gateRelease, gateOK := tryAcquireFUSEDataBackground()
 		if !gateOK {
 			metrics.Default().IncReadQoSPrefetchShed()
@@ -674,6 +688,88 @@ func (rm *ReadaheadManager) windowBlockCap(pol netprofile.ReadaheadPolicy) int64
 	return limit
 }
 
+// demandFirstOn reports whether the demand-first rules apply now, for this
+// manager's profile (the one its policy uses).
+func (rm *ReadaheadManager) demandFirstOn() bool {
+	if rm.demandFirst != nil {
+		return rm.demandFirst()
+	}
+	if rm.profile != nil {
+		return demandFirstForClass(rm.profile.Class())
+	}
+	return demandFirstActive()
+}
+
+// demandWaitSlice is how often a read-ahead that waits for a demand read
+// re-checks whether it should stop instead (offline, Stop, a class change,
+// the binding shutting down, the reader moving away).
+const demandWaitSlice = 50 * time.Millisecond
+
+// waitForDemand is rule 1 of demand_first.go: before a read-ahead block is
+// claimed, wait while a demand read is in flight, at most demandDeferMax.
+// The wait ends early when cancel reports true or the manager stops; the
+// caller re-runs every claim check after it returns.
+func (rm *ReadaheadManager) waitForDemand(cancel func() bool) {
+	if !rm.demandFirstOn() {
+		return
+	}
+	g := rm.demand
+	if g == nil {
+		g = foregroundDemand
+	}
+	max := rm.demandDefer
+	if max <= 0 {
+		max = demandDeferMax
+	}
+	deadline := time.Now().Add(max)
+	for {
+		slice := time.Until(deadline)
+		if slice <= 0 {
+			return
+		}
+		if slice > demandWaitSlice {
+			slice = demandWaitSlice
+		}
+		if _, idle := g.waitIdle(slice, rm.stopCh); idle {
+			return
+		}
+		if !rm.prefetchAllowed() || cancel != nil && cancel() {
+			return
+		}
+	}
+}
+
+// deferWindowClaim runs rule 1 for a windowed round, only when the round
+// could claim a block right now; the claim checks then run after the wait.
+func (rm *ReadaheadManager) deferWindowClaim(inode uint64, tr *readTracker, mapping *readaheadMappingJob, inflight int) {
+	if !rm.demandFirstOn() {
+		return
+	}
+	readerHere := func() bool {
+		rm.mu.Lock()
+		defer rm.mu.Unlock()
+		return !rm.stopped && rm.trackers[inode] == tr && tr.windowNext < tr.windowEnd &&
+			inflight < rm.windowStreamCapLocked(tr, maxReadaheadWorkers, true)
+	}
+	if !readerHere() {
+		return
+	}
+	rm.waitForDemand(func() bool {
+		return !rm.effectivePolicy().ParallelFetch ||
+			(mapping != nil && mapping.b.workCtx.Err() != nil) || !readerHere()
+	})
+}
+
+// windowStreamCapLocked is rule 2 of demand_first.go: how many windowed
+// blocks this stream may have in flight. Without demand first it is max.
+// Caller holds rm.mu.
+func (rm *ReadaheadManager) windowStreamCapLocked(tr *readTracker, max int, demandFirst bool) int {
+	if !demandFirst {
+		return max
+	}
+	return demandStreamCap(tr.sequentialBytes, max)
+}
+
 // admitWindowBlock reserves one manager-wide windowed block slot.
 func (rm *ReadaheadManager) admitWindowBlock(limit int64) bool {
 	for {
@@ -771,16 +867,22 @@ func (rm *ReadaheadManager) windowBlocks(inode uint64, tr *readTracker, gen uint
 	for {
 		claimed, off := false, int64(0)
 		if !stopClaims {
+			// Rules 1 and 3 of demand_first.go: wait for demand reads before
+			// claiming, so every check below runs after the wait (a seek
+			// meanwhile has reset the window, so nothing stale is claimed).
+			rm.deferWindowClaim(inode, tr, mapping, inflight)
 			pol := rm.effectivePolicy()
 			if !rm.prefetchAllowed() || !pol.ParallelFetch || claimedTotal >= maxBlocks || (mapping != nil && mapping.b.workCtx.Err() != nil) {
 				stop()
 			} else {
 				limit := rm.windowBlockCap(pol)
+				demandFirst := rm.demandFirstOn()
 				rm.mu.Lock()
 				live := !rm.stopped && rm.trackers[inode] == tr && time.Since(tr.lastAccess) <= rm.windowIdle
 				inFile := sizeLimit < 0 || tr.windowNext < sizeLimit
+				underStreamCap := inflight < rm.windowStreamCapLocked(tr, int(limit), demandFirst)
 				switch {
-				case live && inFile && tr.windowNext < tr.windowEnd && rm.admitWindowBlock(limit):
+				case live && inFile && tr.windowNext < tr.windowEnd && underStreamCap && rm.admitWindowBlock(limit):
 					off = tr.windowNext
 					tr.windowNext += readaheadBlockSize
 					claimed = true

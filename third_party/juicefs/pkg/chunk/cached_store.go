@@ -161,7 +161,11 @@ func (s *rSlice) ReadAt(ctx context.Context, page *Page, off int) (n int, err er
 		if s.store.downLimit != nil {
 			s.store.downLimit.Wait(int64(len(p)))
 		}
-		fullPage, err := s.store.group.TryPiggyback(key)
+		var fullPage *Page
+		var err error
+		if s.store.demand.piggyback(key, len(p)) { // JuiceMount: --demand-first
+			fullPage, err = s.store.group.TryPiggyback(key)
+		}
 		if fullPage != nil {
 			defer fullPage.Release()
 			if err == nil { // piggybacked a full read
@@ -176,6 +180,7 @@ func (s *rSlice) ReadAt(ctx context.Context, page *Page, off int) (n int, err er
 			sc    = object.DefaultStorageClass
 		)
 		page.Acquire()
+		endDemand := s.store.demand.beginDemand(key)
 		err = utils.WithTimeout(func() error {
 			defer page.Release()
 			in, err := s.store.storage.Get(key, int64(boff), int64(len(p)), object.WithRequestID(&reqID), object.WithStorageClass(&sc))
@@ -186,6 +191,10 @@ func (s *rSlice) ReadAt(ctx context.Context, page *Page, off int) (n int, err er
 			return err
 		}, s.store.conf.GetTimeout)
 		used := time.Since(st)
+		endDemand()
+		if err == nil {
+			s.store.demand.observeRanged(used, len(p))
+		}
 		logRequest("GET", key, fmt.Sprintf("RANGE(%d,%d) ", boff, len(p)), reqID, err, used)
 		s.store.objectDataBytes.WithLabelValues("GET", sc).Add(float64(n))
 		s.store.objectReqsHistogram.WithLabelValues("GET", sc).Observe(used.Seconds())
@@ -205,7 +214,9 @@ func (s *rSlice) ReadAt(ctx context.Context, page *Page, off int) (n int, err er
 		} else {
 			tmp.Acquire()
 		}
+		endFull := s.store.demand.beginFull(key)
 		err = s.store.load(key, tmp, s.store.shouldCache(blockSize), false)
+		endFull(err)
 		return tmp, err
 	})
 	defer block.Release()
@@ -597,6 +608,9 @@ type Config struct {
 	// Encrypted: the object store decrypts whole objects, so a ranged GET
 	// costs a whole-block download (JuiceMount).
 	Encrypted bool
+	// DemandFirst: reads that an application waits for go before the
+	// prefetcher (JuiceMount, demand_first.go).
+	DemandFirst bool
 }
 
 func (c *Config) SelfCheck(uuid string) {
@@ -689,6 +703,7 @@ type cachedStore struct {
 	storage       object.ObjectStorage
 	bcache        CacheManager
 	fetcher       *prefetcher
+	demand        *demandFirst
 	conf          Config
 	group         *Controller
 	currentUpload chan bool
@@ -850,6 +865,7 @@ func NewCachedStore(storage object.ObjectStorage, config Config, reg prometheus.
 	if !config.CacheEnabled() {
 		config.Prefetch = 0 // disable prefetch if cache is disabled
 	}
+	store.demand = newDemandFirst(config.DemandFirst, config.BlockSize)
 	store.fetcher = newPrefetcher(config.Prefetch, func(key string) { store.fillBlock(key, store.bcache) })
 
 	if store.conf.CacheDir != "memory" && store.conf.Writeback {
@@ -974,6 +990,13 @@ func (store *cachedStore) fillBlock(key string, bcache CacheManager) {
 	if _, ok := bcache.exist(key); ok {
 		return // another read already filled it
 	}
+	// --demand-first: let ranged demand reads of other blocks finish before
+	// this download shares the link with them, then check the cache again.
+	if store.demand.waitIdle(key) > 0 {
+		if _, ok := bcache.exist(key); ok {
+			return
+		}
+	}
 	p := NewOffPage(size)
 	defer p.Release()
 	var cached bool
@@ -988,7 +1011,9 @@ func (store *cachedStore) fillBlock(key string, bcache CacheManager) {
 				return p, nil
 			}
 		}
+		endFull := store.demand.beginFull(key)
 		err := store.load(key, p, false, false) // delay writing cache until singleflight ends to prevent blocking waiters
+		endFull(err)
 		return p, err
 	})
 	defer block.Release()

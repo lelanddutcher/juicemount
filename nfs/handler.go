@@ -1024,6 +1024,7 @@ func (h *JuiceMountHandler) SetCacheReader(cr *cache.Reader) {
 // where a path's identity actually changes (juiceFS.Rename and juiceFS.Remove)
 // via invalidatePooledFDs / invalidatePooledFDTree below.
 func (h *JuiceMountHandler) invalidateReadCaches(path string) {
+	pendingFUSEReadResults.forget(path, false)
 	if h.memBuf != nil {
 		h.memBuf.Invalidate(path)
 	}
@@ -1040,7 +1041,11 @@ func (h *JuiceMountHandler) invalidateReadCaches(path string) {
 // layer hands us) and converts to the FUSE path the pool is keyed by.
 // See FDPool.Invalidate for the corruption modes this closes.
 func (h *JuiceMountHandler) invalidatePooledFDs(inMountPath string) {
-	if h == nil || h.fdPool == nil || inMountPath == "" {
+	if h == nil || inMountPath == "" {
+		return
+	}
+	pendingFUSEReadResults.forget(inMountPath, false)
+	if h.fdPool == nil {
 		return
 	}
 	h.fdPool.Invalidate(path.Join(h.fusePath, inMountPath))
@@ -1051,7 +1056,11 @@ func (h *JuiceMountHandler) invalidatePooledFDs(inMountPath string) {
 // re-parents every descendant and thus staleness every descendant's pooled fd
 // at once. Safe (and cheap) to call for a plain file: the subtree is empty.
 func (h *JuiceMountHandler) invalidatePooledFDTree(inMountPath string) {
-	if h == nil || h.fdPool == nil || inMountPath == "" {
+	if h == nil || inMountPath == "" {
+		return
+	}
+	pendingFUSEReadResults.forget(inMountPath, true)
+	if h.fdPool == nil {
 		return
 	}
 	h.fdPool.InvalidateTree(path.Join(h.fusePath, inMountPath))
@@ -1082,6 +1091,7 @@ func (h *JuiceMountHandler) invalidatePooledFDTree(inMountPath string) {
 // path, because InvalidateTree is an O(len(entries)) scan under the single pool
 // mutex (see juiceFS.Rename for why that matters).
 func (h *JuiceMountHandler) onRemotePathInvalidated(inMountPath string, isDir bool) {
+	pendingFUSEReadResults.forget(inMountPath, isDir)
 	if isDir {
 		h.invalidatePooledReadFDTree(inMountPath)
 		return
@@ -1099,6 +1109,7 @@ func (h *JuiceMountHandler) onContentInvalidated(inMountPath string, isDir bool)
 		return
 	}
 	if isDir {
+		pendingFUSEReadResults.forget(inMountPath, true)
 		if h.memBuf != nil {
 			h.memBuf.InvalidateTree(inMountPath)
 		}
@@ -1117,6 +1128,7 @@ func (h *JuiceMountHandler) onScanContentInvalidated(inMountPath string, oldInod
 	if h == nil || inMountPath == "" {
 		return
 	}
+	pendingFUSEReadResults.forget(inMountPath, false)
 	if h.memBuf != nil {
 		h.memBuf.Invalidate(inMountPath)
 	}
@@ -1132,6 +1144,7 @@ func (h *JuiceMountHandler) onContentReset() {
 	if h == nil {
 		return
 	}
+	pendingFUSEReadResults.forgetAll()
 	if h.memBuf != nil {
 		h.memBuf.InvalidateAll()
 	}
@@ -1144,14 +1157,22 @@ func (h *JuiceMountHandler) onContentReset() {
 // counterparts of invalidatePooledFDs / invalidatePooledFDTree, for mutations
 // this process learned about SECOND-HAND rather than performed itself.
 func (h *JuiceMountHandler) invalidatePooledReadFDs(inMountPath string) {
-	if h == nil || h.fdPool == nil || inMountPath == "" {
+	if h == nil || inMountPath == "" {
+		return
+	}
+	pendingFUSEReadResults.forget(inMountPath, false)
+	if h.fdPool == nil {
 		return
 	}
 	h.fdPool.InvalidateReads(path.Join(h.fusePath, inMountPath))
 }
 
 func (h *JuiceMountHandler) invalidatePooledReadFDTree(inMountPath string) {
-	if h == nil || h.fdPool == nil || inMountPath == "" {
+	if h == nil || inMountPath == "" {
+		return
+	}
+	pendingFUSEReadResults.forget(inMountPath, true)
+	if h.fdPool == nil {
 		return
 	}
 	h.fdPool.InvalidateReadsTree(path.Join(h.fusePath, inMountPath))
@@ -5615,25 +5636,30 @@ func readAtBounded(fd *os.File, buf []byte, off int64, timeout time.Duration) (i
 // ACTUALLY returns; releasing at the deadline would let every retry start one
 // more wedged syscall and defeat the concurrency ceiling.
 func readAtCallBounded(read func([]byte, int64) (int, error), buf []byte, off int64, timeout time.Duration, afterReturn func()) (int, error, bool) {
-	type res struct {
-		n   int
-		err error
-	}
-	ch := make(chan res, 1)
+	n, err, done, _ := readAtCallBoundedLate(read, buf, off, timeout, afterReturn)
+	return n, err, done
+}
+
+// readAtCallBoundedLate is readAtCallBounded that, on timeout, also returns
+// the channel on which the abandoned pread delivers its result when its
+// syscall returns (after afterReturn ran). The online FUSE path hands it to
+// pendingFUSEReadResults so a JUKEBOX retry can join the running pread.
+func readAtCallBoundedLate(read func([]byte, int64) (int, error), buf []byte, off int64, timeout time.Duration, afterReturn func()) (int, error, bool, <-chan readResult) {
+	ch := make(chan readResult, 1)
 	go func() {
 		n, err := read(buf, off)
 		if afterReturn != nil {
 			afterReturn()
 		}
-		ch <- res{n, err}
+		ch <- readResult{n, err}
 	}()
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 	select {
 	case r := <-ch:
-		return r.n, r.err, true
+		return r.n, r.err, true, nil
 	case <-timer.C:
-		return 0, nil, false
+		return 0, nil, false, ch
 	}
 }
 
@@ -5775,29 +5801,93 @@ func (f *cachedFile) ensureFuseFD() error {
 // goroutine that may outlive the RPC: a timed-out pread retains its private
 // buffer and its data-gate slot until the kernel call really returns.
 func boundedFUSEFileReadAt(fd *os.File, p []byte, off int64, bound time.Duration) (int, error) {
+	n, err, _ := boundedFUSEReadCall(fd.ReadAt, p, off, bound, nil, nil)
+	return n, err
+}
+
+// boundedFUSEReadCall is boundedFUSEFileReadAt's core. A non-nil demand
+// counts the pread as a demand read until its syscall returns. A non-nil key
+// registers a pread that times out in pendingFUSEReadResults, with its
+// private buffer, so the client's JUKEBOX retry can join it. refused reports
+// that the data gate was full and no pread started.
+func boundedFUSEReadCall(read func([]byte, int64) (int, error), p []byte, off int64, bound time.Duration, demand *demandGate, key *pendingReadKey) (n int, err error, refused bool) {
+	var epoch uint64
+	if key != nil {
+		epoch = pendingFUSEReadResults.epoch(key.name) // before the pread starts
+	}
 	releaseData, dataOK := acquireFUSEData()
 	if !dataOK {
 		noteFUSEDataRefused()
-		return 0, errFUSETimeout
+		return 0, errFUSETimeout, true
+	}
+	endDemand := func() {}
+	if demand != nil {
+		endDemand = demand.begin()
 	}
 	tmp := offlineReadBuf(len(p))
-	n, err, done := readAtCallBounded(fd.ReadAt, tmp, off, bound, releaseData)
+	n, err, done, late := readAtCallBoundedLate(read, tmp, off, bound, func() {
+		releaseData()
+		endDemand()
+	})
 	if !done {
-		return 0, errFUSETimeout
+		if key != nil {
+			pendingFUSEReadResults.adopt(*key, tmp, late, epoch)
+		}
+		return 0, errFUSETimeout, false
 	}
 	if n > 0 {
 		copy(p, tmp[:n])
 	}
 	releaseOfflineReadBuf(tmp, true)
-	return n, err
+	return n, err, false
 }
 
 func (f *cachedFile) boundedFUSEReadAt(p []byte, off int64) (int, error) {
-	bound := fuseReadTimeout()
-	n, err := boundedFUSEFileReadAt(f.fuseFD, p, off, bound)
+	return joinOrReadFUSE(f.fuseFD.ReadAt, f.pendingReadKey(off, len(p)), f.name, p, off, fuseReadTimeout())
+}
+
+// pendingReadKey names this read for the JUKEBOX-retry join, or returns nil
+// when it must never join: no open-time identity, or a name the sidecar cache
+// takes (AppleDouble ._ files, .DS_Store and the like), because a complete
+// read of one seeds that shared cache.
+func (f *cachedFile) pendingReadKey(off int64, n int) *pendingReadKey {
+	if f.cachedInfo == nil || f.fuseFD == nil || isAppleDoubleNFSPath(f.name) || cacheableMetaName(path.Base(f.name)) {
+		return nil
+	}
+	return &pendingReadKey{
+		name: f.name, inode: f.inode, size: f.cachedInfo.size, mtime: f.cachedInfo.mtime.UnixNano(),
+		version: f.cacheIdentity.Version, fd: f.fuseFD, off: off, n: n,
+	}
+}
+
+// joinOrReadFUSE is the online foreground pread. On a slow or metered link,
+// a retry of a pread that timed out and is still running joins it
+// (pendingFUSEReads.join) and starts no new pread; otherwise it reads through
+// boundedFUSEReadCall, counted as a demand read. A nil key never joins.
+func joinOrReadFUSE(read func([]byte, int64) (int, error), key *pendingReadKey, name string, p []byte, off int64, bound time.Duration) (int, error) {
+	if key != nil && !pendingReadJoinEnabled() {
+		key = nil
+	}
+	if key != nil {
+		if n, err, ok := pendingFUSEReadResults.join(*key, p, bound); ok {
+			if errors.Is(err, errFUSETimeout) {
+				jmlog.Warn("FUSE pread still in flight; the JUKEBOX retry joined it and gets JUKEBOX again",
+					"path", name, "offset", off, "len", len(p), "timeout_ms", bound.Milliseconds())
+			} else {
+				jmlog.Info("FUSE pread finished while a JUKEBOX retry waited on it; its bytes answer the retry",
+					"path", name, "offset", off, "len", len(p), "n", n)
+			}
+			return n, err
+		}
+	}
+	n, err, refused := boundedFUSEReadCall(read, p, off, bound, foregroundDemand, key)
 	if errors.Is(err, errFUSETimeout) {
+		reason := "timed out"
+		if refused {
+			reason = "data gate full"
+		}
 		jmlog.Warn("FUSE pread timed out or saturated; returning retryable JUKEBOX",
-			"path", f.name, "offset", off, "len", len(p), "timeout_ms", bound.Milliseconds())
+			"path", name, "offset", off, "len", len(p), "timeout_ms", bound.Milliseconds(), "reason", reason)
 	}
 	return n, err
 }
