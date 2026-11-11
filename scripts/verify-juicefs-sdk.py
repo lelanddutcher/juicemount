@@ -39,6 +39,7 @@ PATCH_FILES = {
     "patches/0019-batched-watch-round-trips.patch": ["pkg/meta/redis.go"],
     "patches/0020-demand-read-first.patch": [
         "cmd/flags.go", "cmd/mount.go", "pkg/chunk/cached_store.go"],
+    "patches/0021-demand-read-spans.patch": ["pkg/chunk/cached_store.go"],
 }
 VERSION_PACKAGE = "github.com/juicedata/juicefs/pkg/version"
 

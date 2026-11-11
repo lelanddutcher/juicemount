@@ -150,6 +150,26 @@ func acquireFUSEData() (release func(), ok bool) {
 
 func releaseFUSEData() { fuseDataInFlight.Add(-1) }
 
+// fuseBackgroundInFlight counts the background share of fuseDataInFlight
+// (read-ahead, warmers, the drainer's opportunistic reads), for the read
+// timeline and for foreground admission.
+var fuseBackgroundInFlight atomic.Int64
+
+// admitBackgroundFUSEData admits one background syscall below limit and
+// counts it as background.
+func admitBackgroundFUSEData(limit int64) bool {
+	if !tryAdmitFUSEData(limit) {
+		return false
+	}
+	fuseBackgroundInFlight.Add(1)
+	return true
+}
+
+func releaseBackgroundFUSEData() {
+	fuseBackgroundInFlight.Add(-1)
+	fuseDataInFlight.Add(-1)
+}
+
 // fuseDataGateDepth reports occupancy and the current ceiling, for /metrics and
 // for tests.
 func fuseDataGateDepth() (inUse int, width int) {
@@ -245,8 +265,8 @@ func tryAcquireFUSEDataBackground() (release func(), ok bool) {
 	if bg <= 0 {
 		return func() {}, false
 	}
-	if tryAdmitFUSEData(bg) {
-		return releaseFUSEData, true
+	if admitBackgroundFUSEData(bg) {
+		return releaseBackgroundFUSEData, true
 	}
 	return func() {}, false
 }

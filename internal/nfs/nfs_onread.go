@@ -343,6 +343,17 @@ func onReadWithOpenTrace(ctx context.Context, w *response, userHandle Handler, t
 	start := time.Now()
 	var ioErr error
 	hitEOF := false
+	trace := ReadTimelineOn()
+	subreads := 0
+	if trace {
+		ReadTimeline("rt nfs read start", "xid", w.req.xid, "path", name, "offset", obj.Offset,
+			"count", obj.Count, "prepared", prepared != nil)
+		defer func() {
+			ReadTimeline("rt nfs read end", "xid", w.req.xid, "path", name, "offset", obj.Offset,
+				"count", obj.Count, "returned", cnt, "subreads", subreads, "eof", hitEOF,
+				"ms", time.Since(start).Milliseconds(), "err", errString(ioErr))
+		}()
+	}
 	for cnt < want {
 		// Deadline check between subreads. We commit to completing
 		// the current subread once started — Go file I/O is not
@@ -358,7 +369,16 @@ func onReadWithOpenTrace(ctx context.Context, w *response, userHandle Handler, t
 		if chunk > subreadSize {
 			chunk = subreadSize
 		}
+		var subStart time.Time
+		if trace {
+			subStart = time.Now()
+		}
 		n, err := fh.ReadAt(resp.Data[cnt:cnt+chunk], int64(obj.Offset)+int64(cnt))
+		subreads++
+		if trace {
+			ReadTimeline("rt nfs subread", "xid", w.req.xid, "offset", int64(obj.Offset)+int64(cnt),
+				"len", chunk, "n", n, "ms", time.Since(subStart).Milliseconds(), "err", errString(err))
+		}
 		if n > 0 {
 			cnt += n
 		}

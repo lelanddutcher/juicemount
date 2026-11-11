@@ -5815,10 +5815,31 @@ func boundedFUSEReadCall(read func([]byte, int64) (int, error), p []byte, off in
 	if key != nil {
 		epoch = pendingFUSEReadResults.epoch(key.name) // before the pread starts
 	}
+	trace := key != nil && readTimelineOn()
+	var id uint64
+	var arrive time.Time
+	if trace {
+		id = readTimelineSeq.Add(1)
+		arrive = time.Now()
+		total, bg := fuseGateCounts()
+		readTimeline("rt fuse pread arrive", "id", id, "path", key.name, "offset", off, "len", len(p),
+			"gate_total", total, "gate_background", bg, "demand_inflight", foregroundDemand.inflight())
+	}
 	releaseData, dataOK := acquireFUSEData()
 	if !dataOK {
 		noteFUSEDataRefused()
+		if trace {
+			total, bg := fuseGateCounts()
+			readTimeline("rt fuse pread refused", "id", id, "path", key.name, "offset", off,
+				"wait_ms", time.Since(arrive).Milliseconds(), "gate_total", total, "gate_background", bg)
+		}
 		return 0, errFUSETimeout, true
+	}
+	var preadStart time.Time
+	if trace {
+		preadStart = time.Now()
+		readTimeline("rt fuse pread start", "id", id, "path", key.name, "offset", off,
+			"gate_wait_ms", preadStart.Sub(arrive).Milliseconds())
 	}
 	endDemand := func() {}
 	if demand != nil {
@@ -5828,10 +5849,19 @@ func boundedFUSEReadCall(read func([]byte, int64) (int, error), p []byte, off in
 	n, err, done, late := readAtCallBoundedLate(read, tmp, off, bound, func() {
 		releaseData()
 		endDemand()
+		if trace {
+			readTimeline("rt fuse pread end", "id", id, "path", key.name, "offset", off,
+				"ms", time.Since(preadStart).Milliseconds())
+		}
 	})
 	if !done {
+		adopted := false
 		if key != nil {
-			pendingFUSEReadResults.adopt(*key, tmp, late, epoch)
+			adopted = pendingFUSEReadResults.adopt(*key, tmp, late, epoch)
+		}
+		if trace {
+			readTimeline("rt fuse pread jukebox", "id", id, "path", key.name, "offset", off,
+				"bound_ms", bound.Milliseconds(), "adopted", adopted)
 		}
 		return 0, errFUSETimeout, false
 	}
@@ -5869,7 +5899,15 @@ func joinOrReadFUSE(read func([]byte, int64) (int, error), key *pendingReadKey, 
 		key = nil
 	}
 	if key != nil {
+		var joinStart time.Time
+		if readTimelineOn() {
+			joinStart = time.Now()
+		}
 		if n, err, ok := pendingFUSEReadResults.join(*key, p, bound); ok {
+			if !joinStart.IsZero() {
+				readTimeline("rt fuse pread joined", "path", name, "offset", off, "len", len(p),
+					"ms", time.Since(joinStart).Milliseconds(), "n", n, "jukebox", errors.Is(err, errFUSETimeout))
+			}
 			if errors.Is(err, errFUSETimeout) {
 				jmlog.Warn("FUSE pread still in flight; the JUKEBOX retry joined it and gets JUKEBOX again",
 					"path", name, "offset", off, "len", len(p), "timeout_ms", bound.Milliseconds())

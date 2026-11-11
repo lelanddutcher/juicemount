@@ -590,9 +590,17 @@ func (rm *ReadaheadManager) serialBlocks(fd *os.File, mapping *readaheadMappingJ
 			gateRelease()
 			return
 		}
+		trace := readTimelineOn()
+		if trace {
+			readTimeline("rt readahead block start", "path", fd.Name(), "offset", off, "kind", "serial")
+		}
 		t0 := time.Now()
 		n, err := rm.readBlock(fd, buf, off)
 		gateRelease()
+		if trace {
+			readTimeline("rt readahead block end", "path", fd.Name(), "offset", off, "kind", "serial",
+				"n", n, "ms", time.Since(t0).Milliseconds(), "err", errString(err))
+		}
 		if n > 0 {
 			if mapping != nil {
 				mapping.record(off, n)
@@ -721,7 +729,16 @@ func (rm *ReadaheadManager) waitForDemand(cancel func() bool) {
 	if max <= 0 {
 		max = demandDeferMax
 	}
-	deadline := time.Now().Add(max)
+	start := time.Now()
+	deadline := start.Add(max)
+	if readTimelineOn() {
+		defer func() {
+			if waited := time.Since(start); waited >= time.Millisecond {
+				readTimeline("rt readahead defer", "waited_ms", waited.Milliseconds(),
+					"limit_ms", max.Milliseconds(), "demand_inflight", g.inflight())
+			}
+		}()
+	}
 	for {
 		slice := time.Until(deadline)
 		if slice <= 0 {
@@ -804,8 +821,8 @@ func acquireWindowGate() (release func(), ok bool) {
 	if limit < 1 {
 		return nil, false
 	}
-	if tryAdmitFUSEData(limit) {
-		return releaseFUSEData, true
+	if admitBackgroundFUSEData(limit) {
+		return releaseBackgroundFUSEData, true
 	}
 	return nil, false
 }
@@ -971,10 +988,20 @@ func (rm *ReadaheadManager) windowBlock(fd *os.File, off int64, gateRelease func
 		return
 	}
 	bp := windowBufPool.Get().(*[]byte)
+	trace := readTimelineOn()
+	if trace {
+		total, bg := fuseGateCounts()
+		readTimeline("rt readahead block start", "path", fd.Name(), "offset", off, "kind", "window",
+			"gate_total", total, "gate_background", bg, "demand_inflight", foregroundDemand.inflight())
+	}
 	t0 := time.Now()
 	n, err := rm.readBlock(fd, *bp, off)
 	dur := time.Since(t0)
 	gateRelease()
+	if trace {
+		readTimeline("rt readahead block end", "path", fd.Name(), "offset", off, "kind", "window",
+			"n", n, "ms", dur.Milliseconds(), "err", errString(err))
+	}
 	windowBufPool.Put(bp)
 	if err == nil && n < readaheadBlockSize {
 		err = io.EOF
