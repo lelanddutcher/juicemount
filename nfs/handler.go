@@ -1289,6 +1289,9 @@ func (h *JuiceMountHandler) SetSpool(spool *SpoolStore, drainer *Drainer) {
 		drainer.SetOnDrainAdmission(func(name string) *namespaceOperation {
 			return h.namespace.begin([]string{name})
 		})
+		drainer.SetOnDirAdmission(func(name string) *namespaceOperation {
+			return h.namespace.beginShallow([]string{name})
+		})
 		drainer.SetOnDrainEffects(h.applyLegacyDrainEffects)
 		drainer.SetOnDrainSucceeded(h.publishLegacyDrainReconcile)
 		// Qualify the row and publish its exact size atomically before shadow
@@ -1316,6 +1319,8 @@ func (h *JuiceMountHandler) SetSpool(spool *SpoolStore, drainer *Drainer) {
 		// (no longer the "local-only, don't prune" exemption). The drainer can't
 		// reach the entries store directly, so it calls back here.
 		drainer.SetOnSymlinkMaterialized(h.onSymlinkMaterialized)
+		drainer.SetOnDirMaterialized(h.onDirMaterialized)
+		drainer.onPendingDirNameTaken = h.resolvePendingDirNameTaken
 	}
 	if spool != nil {
 		spool.bindConflictHandler(h)
@@ -4778,6 +4783,29 @@ func (jfs *juiceFS) rename(oldpath, newpath string, op *namespaceOperation) erro
 	if spool := jfs.handler.spool.Load(); spool != nil && (spool.ReadFaultUnder(oldpath) || spool.ReadFaultUnder(newpath)) {
 		return syscall.EIO // unresolved saved bytes require explicit recovery
 	}
+	// A backend rename into a folder that is still pending (spooled_mkdir.go)
+	// needs that folder, and its pending parents, on the volume first. This
+	// operation owns newpath, which covers them, so the drainer creates them
+	// here, before the mirror observations below are captured. Only a move
+	// that stays local (a spooled new file, or a pending folder) skips it.
+	if spool := jfs.handler.spool.Load(); spool != nil && oldpath != newpath && spool.pendingAncestor(newpath) {
+		src := jfs.handler.store.LookupByPath(oldpath)
+		_, srcPending := spool.pendingDir(oldpath)
+		local := src != nil && src.LocalOnly && jfs.handler.store.LookupByPath(newpath) == nil &&
+			(srcPending || (!src.IsDir && spool.HasPending(oldpath)))
+		if !local {
+			drainer := jfs.handler.drainer.Load()
+			if drainer == nil {
+				return errFUSETimeout
+			}
+			if err := drainer.materializeChainOwned(newpath, false); err != nil {
+				jmlog.Info("rename: folder not on the volume yet; client retries", "new", newpath, "error", err.Error())
+				spool.SignalReady()
+				return errFUSETimeout
+			}
+			op.mutated = true
+		}
+	}
 	// Snapshot the source type/locality before the spool migration re-keys it.
 	// A new LocalOnly regular file exists solely in the SSD spool; probing its
 	// nonexistent source with os.Rename forces a synchronous remote FUSE lookup
@@ -4811,6 +4839,24 @@ func (jfs *juiceFS) rename(oldpath, newpath string, op *namespaceOperation) erro
 	if spool := jfs.handler.spool.Load(); spool != nil {
 		if err := spool.meta.CheckReplacementUnder(oldpath, newpath); err != nil {
 			return err
+		}
+	}
+	// Spooled folders (spooled_mkdir.go). A pending folder moves by its rows
+	// alone. A destination that is, or holds, a pending folder, and a pending
+	// folder replacing an existing name, wait for the drainer to create the
+	// folder: JUKEBOX, and the client's retry finds it on the volume.
+	pendingSource := false
+	if spool := jfs.handler.spool.Load(); spool != nil && oldpath != newpath {
+		_, pendingSource = spool.pendingDir(oldpath)
+		// A rename onto a pending folder (even an empty one), or of a pending
+		// folder onto an existing name, is not done locally: the drainer is
+		// woken to create the pending folders on the volume, and the client's
+		// JUKEBOX retry then takes the ordinary rename path. Offline, it
+		// waits for the link (ErrPendingDirConflict documents the same rule
+		// for the durable rows).
+		if spool.pendingAtOrUnder(newpath) || (pendingSource && destEntry != nil) {
+			spool.SignalReady()
+			return errFUSETimeout
 		}
 	}
 
@@ -4921,6 +4967,10 @@ func (jfs *juiceFS) rename(oldpath, newpath string, op *namespaceOperation) erro
 	if migrated > 0 && oldEntry != nil && !oldEntry.IsDir && oldEntry.LocalOnly && destEntry == nil {
 		skipFUSERename = true
 	}
+	// A pending folder is not on the volume: its rows are the rename.
+	if pendingSource && destEntry == nil {
+		skipFUSERename = true
+	}
 	if !skipFUSERename {
 		if err := os.Rename(jfs.fullPath(oldpath), jfs.fullPath(newpath)); err != nil {
 			if !(migrated > 0 && os.IsNotExist(err)) {
@@ -4933,6 +4983,8 @@ func (jfs *juiceFS) rename(oldpath, newpath string, op *namespaceOperation) erro
 		}
 	}
 	op.mutated = true
+	// Pending folder rows moved with the spool rows (MigrateForRename, one
+	// SQLite transaction).
 	op.checkpoint("publish", oldpath)
 
 	// The backing folder now lives at newpath: its listing record (and its
@@ -5119,6 +5171,26 @@ func (jfs *juiceFS) remove(filename string, rmdir bool, op *namespaceOperation) 
 
 	e := jfs.handler.store.LookupByPath(filename)
 
+	// A folder MKDIR created that is not on the volume yet: dropping its row
+	// is the whole remove. It must be empty, as on the volume.
+	skipBackendRemove := false
+	if spool := jfs.handler.spool.Load(); spool != nil {
+		if row, ok := spool.pendingDir(filename); ok {
+			children, err := jfs.handler.store.ListChildren(filename)
+			if err != nil {
+				return err
+			}
+			if len(children) > 0 || spool.pendingAtOrUnderExcept(filename) {
+				return syscall.ENOTEMPTY
+			}
+			if err := spool.removePendingDir(row); err != nil {
+				return err
+			}
+			op.mutated = true
+			skipBackendRemove = true
+		}
+	}
+
 	// The physical unlink is the acknowledgement boundary. The previous code
 	// discarded os.Remove's error, evicted the mirror and returned NFS success.
 	// If JuiceFS rejected or stalled that unlink, keyspace reconciliation saw
@@ -5128,7 +5200,10 @@ func (jfs *juiceFS) remove(filename string, rmdir bool, op *namespaceOperation) 
 	// succeeds or proves the path is already absent. The enclosing worker
 	// retains ownership if the waiting RPC times out.
 	op.checkpoint("remove", filename)
-	removeErr := os.Remove(jfs.fullPath(filename))
+	var removeErr error
+	if !skipBackendRemove {
+		removeErr = os.Remove(jfs.fullPath(filename))
+	}
 	if removeErr != nil && !os.IsNotExist(removeErr) {
 		jmlog.Warn("FUSE remove failed; preserving mirror entry",
 			"path", filename, "error", removeErr.Error())
@@ -5219,6 +5294,11 @@ func (jfs *juiceFS) MkdirAll(dirname string, perm os.FileMode) error {
 }
 
 func (jfs *juiceFS) mkdirAll(dirname string, perm os.FileMode, op *namespaceOperation) error {
+	// Online with the spool: answer at local speed and let the drainer
+	// create the folder with its reserved inode (spooled_mkdir.go).
+	if handled, err := jfs.spoolMkdir(dirname, perm, op); handled {
+		return err
+	}
 
 	// Create on FUSE — but NOT when offline. A FUSE mkdir needs JuiceFS→Redis,
 	// which is unreachable offline; the call hangs or fails and an offline
@@ -5230,6 +5310,15 @@ func (jfs *juiceFS) mkdirAll(dirname string, perm os.FileMode, op *namespaceOper
 	// reconnect. So an offline copy spools cleanly and the tree appears for the
 	// user; the backend catches up online.
 	if !pin.IsOffline() {
+		// A pending parent (spooled MKDIR, no reserved number left for this
+		// child) is created first with its own reserved inode. A plain
+		// MkdirAll would give it a new inode and stale the file id the client
+		// holds (#70).
+		if spool, drainer := jfs.handler.spool.Load(), jfs.handler.drainer.Load(); spool != nil && drainer != nil && spool.pendingAncestor(dirname) {
+			if err := drainer.materializeChainOwned(dirname, false); err != nil {
+				return errFUSETimeout
+			}
+		}
 		// The namespace runner bounds the RPC, retaining the worker on timeout.
 		err := os.MkdirAll(jfs.fullPath(dirname), perm)
 		if err != nil {
@@ -5329,6 +5418,19 @@ func (jfs *juiceFS) symlink(target, link string, op *namespaceOperation) error {
 	// it on FUSE at reconnect (see Drainer.materializePendingSymlinks). The copy
 	// succeeds; the backend catches up online.
 	offline := pin.IsOffline()
+	if !offline {
+		// A link inside a folder not yet on the volume waits for it, as an
+		// offline link does (spooled_mkdir.go, materializePendingSymlinks).
+		if spool := jfs.handler.spool.Load(); spool != nil && spool.pendingAncestor(link) {
+			offline = true
+			if drainer := jfs.handler.drainer.Load(); drainer != nil {
+				defer func() {
+					drainer.symlinkWake.Store(true)
+					spool.SignalReady()
+				}()
+			}
+		}
+	}
 	if !offline {
 		// The namespace runner bounds the RPC, retaining the worker on timeout.
 		err := os.Symlink(target, fusePath)
@@ -5500,6 +5602,11 @@ func (jc *juiceChange) Chmod(name string, mode os.FileMode) error {
 			spool := h.spool.Load()
 			result.spoolChecked = spool != nil
 			result.spoolPending = spool != nil && spool.HasPending(rel)
+			if spool != nil && !result.spoolPending {
+				// A folder not on the volume yet: the drainer creates it
+				// with the mirror's mode (spooled_mkdir.go).
+				_, result.spoolPending = spool.pendingDir(rel)
+			}
 		}
 		if backendEligible && !result.spoolPending {
 			fusePath := path.Join(h.fusePath, rel)

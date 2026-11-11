@@ -245,6 +245,31 @@ gets. On `abroad`, the 1% random loss holds one stream far below the cap
 - Before the app can mount in the VM, someone at the VM's screen must allow
   the macFUSE system extension.
 
+## The write path (`drain-lab.sh`)
+
+`measure.py` measures JuiceFS alone. `drain-lab.sh` adds the JuiceMount NFS
+layer: it runs `cmd/jm5` with the write spool inside the client container,
+over its `/jfs` mount, and drives it over loopback NFSv3 with `drainprobe`.
+It times folder creation (MKDIR), and the time until 200 small files and one
+large file reach the server.
+
+```sh
+./drain-lab.sh build                 # jm5 and drainprobe into $STATE/bin
+./drain-lab.sh run abroad            # one run; results/drain-<time>/
+DRAIN_SMALL=0 DRAIN_BIG_MB=500 DRAIN_CAP=300 ./drain-lab.sh run abroad big
+DRAIN_READ_S=300 ./drain-lab.sh run abroad-noloss after-reads
+```
+
+The script header lists every variable. Limits:
+
+- jm5 runs with `--no-fuse --no-mount` and forces the link class (`slow`,
+  or `fast` on `lan`). The lab's JuiceFS mount has no `--fast-statfs`, so
+  each `statfs` costs two round trips. The app's mount answers it locally.
+  The drainer's mount check uses `statfs`, so in the lab it sometimes
+  parks the drainer for a few seconds.
+- The Redis MONITOR trace slows Redis a little. Compare runs that both have
+  it, or both do not.
+
 ## Addresses
 
 The lab uses `10.231.10.0/24` (nas) and `10.231.20.0/24` (remote). If those

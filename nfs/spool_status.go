@@ -14,19 +14,35 @@ import (
 // SpoolStatusResponse is the JSON shape served at /spool and consumed
 // by the menu bar app + Manager UI. Exported so the Swift JSON decoder
 // can reference the same key names via tags here.
+// FolderConflictView is one folder renamed to a conflict name.
+type FolderConflictView struct {
+	Path         string `json:"path"`
+	ConflictPath string `json:"conflict_path"`
+	AtUnix       int64  `json:"at_unix"`
+}
+
 type SpoolStatusResponse struct {
-	Enabled              bool   `json:"enabled"`
-	RecoveryEnabled      *bool  `json:"recovery_enabled,omitempty"`
-	Error                string `json:"error,omitempty"`
-	PendingFiles         int    `json:"pending_files"`
-	PendingSymlinks      int    `json:"pending_symlinks"`
-	PendingBytes         int64  `json:"pending_bytes"`
-	InProgress           int64  `json:"in_progress"`
-	Succeeded            int64  `json:"succeeded"`
-	Failed               int64  `json:"failed"`
-	Quarantined          int64  `json:"quarantined"`
-	ReplacementConflicts int    `json:"replacement_conflicts"`
-	ReplacementWaiting   int    `json:"replacement_waiting"`
+	Enabled         bool   `json:"enabled"`
+	RecoveryEnabled *bool  `json:"recovery_enabled,omitempty"`
+	Error           string `json:"error,omitempty"`
+	PendingFiles    int    `json:"pending_files"`
+	PendingSymlinks int    `json:"pending_symlinks"`
+	// PendingFolders counts folders created by MKDIR that are not on the
+	// server yet. FolderConflicts lists (newest first, at most 20) pending
+	// folders renamed to a conflict name because the server had a file with
+	// their name.
+	PendingFolders int `json:"pending_folders"`
+	// DrainPaused is set while the mount check has kept the drainer parked
+	// for over 2 minutes: saved files stay on this Mac until it answers.
+	DrainPaused          string               `json:"drain_paused,omitempty"`
+	FolderConflicts      []FolderConflictView `json:"folder_conflicts,omitempty"`
+	PendingBytes         int64                `json:"pending_bytes"`
+	InProgress           int64                `json:"in_progress"`
+	Succeeded            int64                `json:"succeeded"`
+	Failed               int64                `json:"failed"`
+	Quarantined          int64                `json:"quarantined"`
+	ReplacementConflicts int                  `json:"replacement_conflicts"`
+	ReplacementWaiting   int                  `json:"replacement_waiting"`
 	// SidecarsSkipped counts ._ AppleDouble rows completed WITHOUT writing a
 	// backend file (the empty-sidecar elision, JM_DRAIN_SKIP_EMPTY_SIDECARS).
 	//
@@ -172,6 +188,14 @@ func BuildSpoolStatus(spool *SpoolStore, drainer *Drainer) (SpoolStatusResponse,
 		return resp, err
 	}
 	resp.PendingSymlinks = links
+	resp.PendingFolders = spool.pendingDirCount()
+	resp.DrainPaused = drainer.DrainPausedReason()
+	if conflicts, cerr := spool.Meta().ListFolderConflicts(20); cerr == nil {
+		for _, c := range conflicts {
+			resp.FolderConflicts = append(resp.FolderConflicts, FolderConflictView{
+				Path: c.OriginalPath, ConflictPath: c.ConflictPath, AtUnix: c.CreatedAt.Unix()})
+		}
+	}
 
 	used, total := spool.Capacity()
 	resp.CapacityUsed = used

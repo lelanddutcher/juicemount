@@ -15,6 +15,46 @@
   the file again, and an open stuck for over 10 s is not shared. On a slow
   link, opening a file for reading may now take up to 4 s (before: 2 s)
   before macOS is told to retry.
+- On a slow or distant link, creating a folder no longer freezes the app.
+  Before, MKDIR waited for the server. On a link with 200 ms delay that took
+  1.0 to 1.2 s in the remote lab. On a Mac in the laptop lab it took 6.0 s: the
+  slow-link deadline for a change (2 s) expired, the app answered "try
+  again", and macOS waited 4 s before it tried again. Now the app creates
+  the folder locally and answers at once (about 2 ms in the lab). The folder
+  gets its final file id at once: the app reserves JuiceFS inode numbers
+  ahead of time, and the server folder is created with the reserved number.
+  The drainer creates folders on the server before the files inside them,
+  parents first. A folder that already exists on the server is used as it
+  is. A parent that another Mac removed is created again. If the server has
+  a file with the folder's name, the folder and everything in it move to
+  "<name> (conflict <Mac> <time>)", and `GET /spool` lists the conflict
+  (`folder_conflicts`). A folder renamed or removed before it reaches the
+  server is renamed or dropped locally, and an empty one never reaches the
+  server. Offline, folders wait locally with
+  the files. Project rules are unchanged: the drainer checks the project
+  lease before it creates a folder. Field switch: `JM_SPOOL_MKDIR=0`. The
+  bundled JuiceFS is now build `-jm8`.
+- On a slow link, a large saved file no longer waits behind many small ones.
+  Before, the drainer took files strictly oldest first, and it waited for a
+  free slot for small files even when the slot for large files was idle. In
+  the remote lab, a 500 MB file saved after 200 small files sent nothing for
+  390 s. Now the drainer sends both at once: on a 200 ms link without loss,
+  the 500 MB file reached the server in 204 s (before: not done in 600 s),
+  and everything was there in 463 s.
+- On a slow link, a large file uploads faster. The drainer now confirms the
+  upload every 16 MiB (before: every 2 MiB). Each confirmation waits for
+  every upload in flight, so 2 MiB allowed only one 4 MiB block at a time.
+  16 MiB keeps the four parallel uploads busy. On a 200 ms link with 1%
+  loss, the upload rate went from 0.6 to 2.7 Mbit/s. `JM_DRAIN_SYNC_BYTES`
+  still overrides it, now up to 64 MiB.
+- A mount check that stops answering no longer pauses uploads for good.
+  Before, one `statfs` call that never returned held the only check slot,
+  and the drainer stayed paused with no sign. Now a new check starts after
+  30 s (at most 4 stuck at once), checks that arrive together share one
+  answer, and after 2 minutes paused `GET /spool` shows `drain_paused`.
+- Each saved file reaches the server with 2 fewer Redis round trips: the
+  JuiceFS rename that publishes it now takes 3 round trips instead of 5.
+
 - On a slow or distant link, the first frame of a clip that is not cached,
   and each jump while scrubbing it, arrive much sooner, and read-ahead no
   longer holds up the reads the editor waits for. A "demand read" is a read

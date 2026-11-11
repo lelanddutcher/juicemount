@@ -511,7 +511,7 @@ Create(filename):
   2. store.Insert(entry with local_only=true)    // SQLite + cache immediately
   3. Return writeFile wrapper
 
-MkdirAll(dirname):
+MkdirAll(dirname):   (spool off, or JM_SPOOL_MKDIR=0; see §15.9)
   1. os.MkdirAll(fusePath/dirname)              // FUSE mkdir
   2. InsertToCache(entry with local_only=true)   // immediate in-memory
   3. async: store.Insert(entry)                  // SQLite write
@@ -1479,6 +1479,8 @@ the CLI in `cmd/jm5/main.go`):
 | `JM_SPOOL_SIZE_GB` | `50` | capacity cap in GiB; values < 1 are ignored |
 | `JM_WAN_MODE` | off | `1` raises JuiceFS `--max-uploads` 20 → 64 (more parallel PUTs to cover bandwidth-delay product on a fat WAN pipe) |
 | `JM_MAX_UPLOADS` | unset | direct `--max-uploads <n>` override; wins over `JM_WAN_MODE` |
+| `JM_SPOOL_MKDIR` | on | with the spool on, MKDIR answers locally and the drainer creates the folder on the volume later, parents first, with a JuiceFS inode number reserved at MKDIR (`nfs/spooled_mkdir.go`, JuiceFS patch 0022). `0` keeps the synchronous FUSE mkdir |
+| `JM_DRAIN_SYNC_BYTES` | 1 MiB metered, 16 MiB slow, 4 MiB otherwise | bytes the drainer copies between durable flushes of one file; clamped to 256 KiB..64 MiB |
 
 Note the spool does **not** require bumping JuiceFS `--buffer-size` (it stays at
 the QA-33 value of 4096); the spool absorbs the write burst, and the drainer

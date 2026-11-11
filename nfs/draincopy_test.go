@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/lelanddutcher/juicemount/internal/netprofile"
 )
@@ -125,8 +126,13 @@ func TestDurableSyncIntervalAdaptsToLiveLinkClass(t *testing.T) {
 		t.Fatalf("too-small configured interval=%d, want clamp %d", got, drainSyncMinBytes)
 	}
 	d.syncIntervalBytes = 1 << 30
-	if got := d.durableSyncInterval(); got != drainSyncDefaultBytes {
-		t.Fatalf("too-large configured interval=%d, want clamp %d", got, drainSyncDefaultBytes)
+	if got := d.durableSyncInterval(); got != drainSyncMaxBytes {
+		t.Fatalf("too-large configured interval=%d, want clamp %d", got, drainSyncMaxBytes)
+	}
+	// A slow link checkpoints every four blocks, so the app's four
+	// parallel uploads stay busy between checkpoints.
+	if drainSyncSlowBytes%(4<<20) != 0 || drainSyncSlowBytes < 4*(4<<20) {
+		t.Fatalf("slow interval %d is not a multiple of four 4 MiB blocks", drainSyncSlowBytes)
 	}
 }
 
@@ -153,6 +159,108 @@ func TestDrainFUSESlotPreservesForegroundReservation(t *testing.T) {
 		t.Fatal("foreground operation was refused while only the background half was occupied")
 	}
 	releaseForeground()
+}
+
+// While a media-lane drain waits for the background gate, a small-lane drain
+// does not take the slot that frees: the large file gets it.
+func TestDrainFUSESlotGivesWaitingMediaDrainTheNextSlot(t *testing.T) {
+	restore := forceNetClassForTest(t, netprofile.ClassSlow)
+	defer restore()
+	d := &Drainer{stop: make(chan struct{})}
+	defer close(d.stop)
+
+	bg := int(backgroundFUSEDataWidth())
+	var held []func()
+	for i := 0; i < bg; i++ {
+		release, ok := d.acquireDrainFUSESlotFor(true)
+		if !ok {
+			t.Fatalf("small drain %d not admitted", i)
+		}
+		held = append(held, release)
+	}
+	media := make(chan func())
+	go func() {
+		release, _ := d.acquireDrainFUSESlotFor(false)
+		media <- release
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for d.mediaGateWaiters.Load() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("media drain never waited")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	small := make(chan func())
+	go func() {
+		release, _ := d.acquireDrainFUSESlotFor(true)
+		small <- release
+	}()
+	held[0]() // one slot frees
+	var mediaRelease func()
+	select {
+	case mediaRelease = <-media:
+	case r := <-small:
+		r()
+		t.Fatal("a small drain took the slot a waiting media drain needed")
+	case <-time.After(5 * time.Second):
+		t.Fatal("media drain not admitted after a slot freed")
+	}
+	select {
+	case r := <-small:
+		r()
+		t.Fatal("small drain admitted with the gate full")
+	case <-time.After(50 * time.Millisecond):
+	}
+	mediaRelease()
+	select {
+	case r := <-small:
+		r()
+	case <-time.After(5 * time.Second):
+		t.Fatal("small drain not admitted once the media drain had its slot")
+	}
+	for _, r := range held[1:] {
+		r()
+	}
+}
+
+// M3: small drains yield to a waiting media drain only while media holds
+// fewer than half the background slots. Small saves keep moving.
+func TestDrainFUSESlotSmallKeepsHalfWhileMediaWaits(t *testing.T) {
+	restore := forceNetClassForTest(t, netprofile.ClassSlow)
+	defer restore()
+	d := &Drainer{stop: make(chan struct{})}
+	defer close(d.stop)
+	bg := int(backgroundFUSEDataWidth())
+	if bg < 2 {
+		t.Skipf("background width %d", bg)
+	}
+	var held []func()
+	for i := 0; i < bg/2; i++ { // media takes its half
+		release, ok := d.acquireDrainFUSESlotFor(false)
+		if !ok {
+			t.Fatal("media drain not admitted")
+		}
+		held = append(held, release)
+	}
+	d.mediaGateWaiters.Add(1) // one more media drain waits
+	defer d.mediaGateWaiters.Add(-1)
+	got := make(chan func(), 1)
+	go func() {
+		release, _ := d.acquireDrainFUSESlotFor(true)
+		got <- release
+	}()
+	select {
+	case r := <-got:
+		r()
+	case <-time.After(5 * time.Second):
+		t.Fatal("small drain starved while media already held half the slots")
+	}
+	for _, r := range held {
+		r()
+	}
+	if n := d.mediaGateHeld.Load(); n != 0 {
+		t.Fatalf("media slots still counted: %d", n)
+	}
 }
 
 func equalIntSlices(a, b []int) bool {

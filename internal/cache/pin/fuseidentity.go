@@ -45,10 +45,10 @@ import (
 // per-file retry budget — exactly like an offline window.
 var ErrFUSEIdentityGate = errors.New("fuse identity gate: mountpoint is not a mounted filesystem")
 
-const (
-	fuseIdentityTTL           = 2 * time.Second
-	fuseIdentityStatfsTimeout = 3 * time.Second
-)
+const fuseIdentityTTL = 2 * time.Second
+
+// Variables so tests can shorten them.
+var fuseIdentityStatfsTimeout = 3 * time.Second
 
 type fuseIdentityResult struct {
 	ok     bool
@@ -108,43 +108,76 @@ func FUSEIdentityState() (bool, string) {
 	return ok, reason
 }
 
-// fuseIdentityProbeGate single-flights the statfs prober (review fix, phase-1
-// adversarial review): syscall.Statfs against a WEDGED macFUSE mount blocks
-// in the kernel and pins an OS thread; without a gate every TTL expiry (the
-// parked drainer alone re-consults every 3s) spawns another, accumulating
-// hundreds of pinned threads per hour toward Go's 10000-thread abort —
-// turning a safely-parked degraded state into a process crash. The slot is
-// released only when the statfs actually RETURNS (never by a timed-out
-// waiter), capping the leak at one thread per wedge episode; a gate-full
-// consult reports NOT-OK immediately, which is both fail-safe and faster
-// than waiting out the timeout against a probe that is already stuck.
-var fuseIdentityProbeGate = make(chan struct{}, 1)
+// Probes are single-flighted and BOUNDED (review fixes, phase-1 adversarial
+// review and 2026-11-11). syscall.Statfs against a WEDGED macFUSE mount
+// blocks in the kernel and pins an OS thread, so a probe is never abandoned
+// for a new one at every consult: that leaked hundreds of threads per hour
+// toward Go's 10000-thread abort.
+//
+//   - A consult while a probe younger than fuseIdentityReprobeAfter runs
+//     WAITS for that probe's answer (up to the statfs timeout). Before, it
+//     read "already in flight" as a wedge at once: on a distant link, where
+//     one statfs takes two round trips, a second consult inside those 0.4 s
+//     parked the drainer about 20 times per 10 minutes.
+//   - A probe older than fuseIdentityReprobeAfter that has not returned does
+//     not block recovery forever: a new probe may start beside it, up to
+//     fuseIdentityMaxStuck in flight. One statfs that never returned (seen in
+//     the remote lab) used to pause the drainer for good. The leak bound is
+//     fuseIdentityMaxStuck threads per wedge episode.
+//   - A probe's slot is freed only when its statfs RETURNS.
+var fuseIdentityReprobeAfter = 30 * time.Second
 
-// checkFUSEIdentity runs the bounded, single-flighted statfs fsid comparison.
+const fuseIdentityMaxStuck = 4
+
+type identityProbe struct {
+	started time.Time
+	done    chan struct{}
+	ok      bool
+	reason  string
+}
+
+var (
+	identityProbeMu sync.Mutex
+	identityProbes  []*identityProbe // in flight, oldest first
+	// statfsIdentityProbe is statfsIdentityOK; tests replace it.
+	statfsIdentityProbe = statfsIdentityOK
+)
+
+// checkFUSEIdentity runs the bounded, shared statfs fsid comparison.
 func checkFUSEIdentity(path string) (bool, string) {
-	select {
-	case fuseIdentityProbeGate <- struct{}{}:
-	default:
-		return false, "identity probe already in flight (previous statfs still blocked — mount wedged)"
+	identityProbeMu.Lock()
+	var p *identityProbe
+	if n := len(identityProbes); n > 0 && time.Since(identityProbes[n-1].started) < fuseIdentityReprobeAfter {
+		p = identityProbes[n-1] // share the running probe's answer
+	} else if n >= fuseIdentityMaxStuck {
+		identityProbeMu.Unlock()
+		return false, fmt.Sprintf("mount check not answering: %d statfs calls have not returned", n)
+	} else {
+		p = &identityProbe{started: time.Now(), done: make(chan struct{})}
+		identityProbes = append(identityProbes, p)
+		probe := statfsIdentityProbe
+		go func(p *identityProbe) {
+			ok, reason := probe(path)
+			identityProbeMu.Lock()
+			p.ok, p.reason = ok, reason
+			for i, q := range identityProbes {
+				if q == p {
+					identityProbes = append(identityProbes[:i], identityProbes[i+1:]...)
+					break
+				}
+			}
+			identityProbeMu.Unlock()
+			close(p.done)
+		}(p)
 	}
-	type res struct {
-		ok     bool
-		reason string
-	}
-	ch := make(chan res, 1)
-	go func() {
-		ok, reason := statfsIdentityOK(path)
-		// Free the slot before handing over the result: released after the
-		// send, the caller could return and consult again while this
-		// goroutine still held it, and that consult read "already in
-		// flight" (a wedge) for a mount whose statfs had just returned.
-		<-fuseIdentityProbeGate
-		ch <- res{ok: ok, reason: reason}
-	}()
+	timeout := fuseIdentityStatfsTimeout
+	identityProbeMu.Unlock()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
 	select {
-	case r := <-ch:
-		return r.ok, r.reason
-	case <-time.After(fuseIdentityStatfsTimeout):
+	case <-p.done:
+		return p.ok, p.reason
+	case <-timer.C:
 		return false, "statfs timed out — mount wedged"
 	}
 }

@@ -1174,6 +1174,12 @@ func (m *baseMeta) allocateInodes() (freeID, error) {
 }
 
 func (m *baseMeta) Mknod(ctx Context, parent Ino, name string, _type uint8, mode, cumask uint16, rdev uint32, path string, inode *Ino, attr *Attr) syscall.Errno {
+	return m.mknod(ctx, parent, name, _type, mode, cumask, rdev, path, 0, inode, attr)
+}
+
+// mknod is Mknod with an optional inode number that JMReserveInodes took from
+// the volume counter (JuiceMount patch 0022). preIno 0 allocates as upstream.
+func (m *baseMeta) mknod(ctx Context, parent Ino, name string, _type uint8, mode, cumask uint16, rdev uint32, path string, preIno Ino, inode *Ino, attr *Attr) syscall.Errno {
 	if _type < TypeFile || _type > TypeSocket {
 		return syscall.EINVAL
 	}
@@ -1200,9 +1206,12 @@ func (m *baseMeta) Mknod(ctx Context, parent Ino, name string, _type uint8, mode
 		return err
 	}
 
-	ino, err := m.nextInode()
-	if err != nil {
-		return errno(err)
+	ino := preIno
+	if ino == 0 {
+		var err error
+		if ino, err = m.nextInode(); err != nil {
+			return errno(err)
+		}
 	}
 	if inode == nil {
 		inode = &ino

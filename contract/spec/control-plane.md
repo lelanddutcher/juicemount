@@ -190,7 +190,10 @@ stalled, suspect_zero_tail, suspect_zero_tail_detail? }`
 (`nfs/spool_status.go:17`). HTTP **503** with `enabled:false` when the spool is not enabled
 (`JM_SPOOL_ENABLE=1`). `entries` is capped at 200, newest-first active rows + a short recently-done tail.
 `drain_state ∈ {writing, ready, draining, done, failed}`. `pending_symlinks` counts accepted offline
-link work that must finish before ordinary quit. Backs the "uploading to NAS" badge. Schema:
+link work that must finish before ordinary quit. `pending_folders` counts folders created by MKDIR that are not on
+the server yet. `folder_conflicts[] { path, conflict_path, at_unix }` (optional, newest first, at most 20)
+lists pending folders renamed to a conflict name because the server had a file with their name. `drain_paused`
+(optional string) is set while the mount check has kept the drainer parked for over 2 minutes. Backs the "uploading to NAS" badge. Schema:
 [`spool-status.schema.json`](schema/spool-status.schema.json).
 
 ### `GET /activity`

@@ -1,6 +1,13 @@
 package nfs
 
-import "testing"
+import (
+	"bytes"
+	"fmt"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+)
 
 // Lane selection. The point of the small lane is that a 4 KiB ._ AppleDouble
 // sidecar must stop consuming a media slot: sidecars are 50% of all write
@@ -119,5 +126,68 @@ func TestDrainerTotalConcurrencyIsMediaPlusSmall(t *testing.T) {
 	if added := int64(cap(d.smallSem)) * d.smallBytes; added > 8<<20 {
 		t.Errorf("small lane can hold %d bytes in flight — no longer negligible "+
 			"against the media envelope", added)
+	}
+}
+
+// A large file written after a burst of small files drains while the small
+// lane is full. Before, the dispatcher listed only the oldest rows and waited
+// on the full small lane, so the idle media lane got nothing: in the remote
+// lab a 500 MB file queued behind 200 small files sent no byte for 390 s.
+func TestLargeRowDrainsWhileSmallLaneIsFull(t *testing.T) {
+	spool, d := newTestDrainer(t, DrainerConfig{Workers: 1, SmallWorkers: 1})
+	for i := 0; i < 6; i++ {
+		writeSpoolEntry(t, spool, fmt.Sprintf("/w/small_%d.xmp", i), []byte("small"))
+	}
+	big := bytes.Repeat([]byte{7}, int(d.smallBytes)+1)
+	writeSpoolEntry(t, spool, "/w/render.mov", big)
+
+	d.smallSem <- struct{}{} // a small drain that never finishes
+	d.Start()
+	defer func() {
+		<-d.smallSem
+		d.Stop(5 * time.Second)
+	}()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if fi, err := os.Stat(filepath.Join(d.fuseRoot, "w/render.mov")); err == nil && fi.Size() == int64(len(big)) {
+			if row := mustReadyRows(t, spool); row == 0 {
+				t.Fatal("small rows drained although their lane was full")
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the large file did not drain while the small lane was full")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func mustReadyRows(t *testing.T, spool *SpoolStore) int {
+	t.Helper()
+	rows, err := spool.Meta().ListReadyIncludingWaiting(100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return len(rows)
+}
+
+// A mount check that keeps the drainer parked becomes visible after
+// drainPauseVisibleAfter, and clears when the check answers again.
+func TestDrainPauseBecomesVisible(t *testing.T) {
+	d := &Drainer{}
+	d.noteIdentityPause("statfs timed out — mount wedged")
+	if got := d.DrainPausedReason(); got != "" {
+		t.Fatalf("reported at once: %q", got)
+	}
+	d.idPause.mu.Lock()
+	d.idPause.since = time.Now().Add(-drainPauseVisibleAfter - time.Second)
+	d.idPause.mu.Unlock()
+	d.noteIdentityPause("statfs timed out — mount wedged")
+	if got := d.DrainPausedReason(); got == "" {
+		t.Fatal("pause not reported after the threshold")
+	}
+	d.clearIdentityPause()
+	if got := d.DrainPausedReason(); got != "" {
+		t.Fatalf("still reported after the check answered: %q", got)
 	}
 }

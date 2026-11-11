@@ -35,11 +35,12 @@ func (s *Store) LookupSiblingPaths(parent string) ([]string, error) {
 	return lookupPathSlice(names), nil
 }
 
-// LookupReservedPaths includes durable pending/failed saves and offline links,
+// LookupReservedPaths includes durable pending/failed saves, offline links and
+// folders not yet created on the volume,
 // even before their live index publication. Completed audit rows are not names.
 func (s *SpoolStore) LookupReservedPaths() ([]string, error) {
 	rows, err := s.db.Query(`SELECT nfs_path FROM spool_entries WHERE drain_state<>'done'
- UNION SELECT link_path FROM pending_symlinks`)
+ UNION SELECT link_path FROM pending_symlinks UNION SELECT dir_path FROM pending_dirs`)
 	if err != nil {
 		return nil, err
 	}

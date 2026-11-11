@@ -1808,17 +1808,39 @@ func (m *redisMeta) doRename(ctx Context, parentSrc Ino, nameSrc string, parentD
 			return err
 		}
 		typ, ino := m.parseEntry(buf)
-		var protected *replaceguard.Record
+		// JuiceMount (patch 0023): the guard record, the destination entry
+		// and the attributes of both parents and the source depend only on
+		// ino, so they share one round trip. Each key is WATCHed before that
+		// read (the source attribute and the guard here, both parents and
+		// the destination folder entry since the transaction began).
+		guardKey := ""
+		watch := []string{m.inodeKey(ino)}
 		if m.prefix == "" {
 			// Cluster metadata keys use a hash-tag prefix, while proxy records
 			// are standalone Redis keys. Preserve ordinary cluster renames;
 			// protected enrollment is supported only on the standalone backend.
 			// Watch the candidate before reading it so concurrent ARM aborts.
-			guardKey := replaceguard.Key(uint64(ino))
-			if err := tx.Watch(ctx, guardKey).Err(); err != nil {
-				return err
+			guardKey = replaceguard.Key(uint64(ino))
+			watch = append(watch, guardKey)
+		}
+		if err := tx.Watch(ctx, watch...).Err(); err != nil {
+			return err
+		}
+		var gcmd, dcmd *redis.StringCmd
+		var acmd *redis.SliceCmd
+		if _, err := tx.Pipelined(ctx, func(p redis.Pipeliner) error {
+			if guardKey != "" {
+				gcmd = p.Get(ctx, guardKey)
 			}
-			guardBytes, guardErr := tx.Get(ctx, guardKey).Bytes()
+			dcmd = p.HGet(ctx, m.entryKey(parentDst), nameDst)
+			acmd = p.MGet(ctx, m.inodeKey(parentSrc), m.inodeKey(parentDst), m.inodeKey(ino))
+			return nil
+		}); err != nil && !isReplyError(err) {
+			return err
+		}
+		var protected *replaceguard.Record
+		if guardKey != "" {
+			guardBytes, guardErr := gcmd.Bytes()
 			if guardErr != nil && guardErr != redis.Nil {
 				return syscall.EIO
 			}
@@ -1850,9 +1872,9 @@ func (m *redisMeta) doRename(ctx Context, parentSrc Ino, nameSrc string, parentD
 			}
 			return nil
 		}
-		keys := []string{m.inodeKey(ino)}
+		var keys []string
 
-		dbuf, err := tx.HGet(ctx, m.entryKey(parentDst), nameDst).Bytes()
+		dbuf, err := dcmd.Bytes()
 		if err == redis.Nil && m.conf.CaseInsensi {
 			if e := m.resolveCase(ctx, parentDst, nameDst); e != nil {
 				if (nameSrc != string(e.Name)) || parentDst != parentSrc {
@@ -1880,8 +1902,10 @@ func (m *redisMeta) doRename(ctx Context, parentSrc Ino, nameSrc string, parentD
 				}
 			}
 		}
-		if err := tx.Watch(ctx, keys...).Err(); err != nil {
-			return err
+		if len(keys) > 0 {
+			if err := tx.Watch(ctx, keys...).Err(); err != nil {
+				return err
+			}
 		}
 		if dino > 0 {
 			if ino == dino {
@@ -1898,13 +1922,22 @@ func (m *redisMeta) doRename(ctx Context, parentSrc Ino, nameSrc string, parentD
 			}
 		}
 
-		keys = []string{m.inodeKey(parentSrc), m.inodeKey(parentDst), m.inodeKey(ino)}
-		if dino > 0 {
-			keys = append(keys, m.inodeKey(dino))
-		}
-		rs, err := tx.MGet(ctx, keys...).Result()
+		rs, err := acmd.Result()
 		if err != nil {
 			return err
+		}
+		if dino > 0 {
+			// Read only after the WATCH above; a replaced destination costs
+			// this one extra round trip.
+			v, err := tx.Get(ctx, m.inodeKey(dino)).Result()
+			if err != nil && err != redis.Nil {
+				return err
+			}
+			if err == redis.Nil {
+				rs = append(rs, nil)
+			} else {
+				rs = append(rs, v)
+			}
 		}
 		if rs[0] == nil || rs[1] == nil || rs[2] == nil {
 			return redis.Nil
