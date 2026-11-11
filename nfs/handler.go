@@ -2990,8 +2990,7 @@ func (jfs *juiceFS) Stat(filename string) (os.FileInfo, error) {
 	if pin.IsOffline() && jfs.handler.pinStore.Load() != nil {
 		canonical := jfs.handler.canonicalize(filename)
 		if !jfs.handler.isPinnedReady(canonical) {
-			jmlog.Debug("offline: refusing stat of un-pinned, un-cached file",
-				"path", filename, "canonical", canonical)
+			logOfflineRefusal("stat", "un-pinned and not in the metadata mirror", filename)
 			return nil, pin.ErrOfflineNotAvailable
 		}
 	}
@@ -3119,6 +3118,7 @@ func (jfs *juiceFS) Lstat(filename string) (os.FileInfo, error) {
 	// above remain available, as do pinned-ready and no-pin-store fallbacks.
 	if pin.IsOffline() && jfs.handler.pinStore.Load() != nil {
 		if !jfs.handler.isPinnedReady(jfs.handler.canonicalize(filename)) {
+			logOfflineRefusal("lstat", "un-pinned and not in the metadata mirror", filename)
 			return nil, pin.ErrOfflineNotAvailable
 		}
 	}
@@ -4083,9 +4083,7 @@ func (jfs *juiceFS) openFileExpected(filename string, flag int, perm os.FileMode
 		// a legitimately-cached file on a sleepy cold system doesn't
 		// get false-refused.
 		if !jfs.cacheProbeHit(e) {
-			jmlog.Debug("offline: refusing open of un-pinned file",
-				"in_mount", filename,
-				"canonical", canonical)
+			logOfflineRefusal("open", "un-pinned and first block not in the local cache", filename)
 			// pin.ErrOfflineNotAvailable → NFS protocol layer maps to
 			// NFSStatusNXIO. See Stat fallback comment for the cache-
 			// preservation rationale (NXIO doesn't invalidate kernel
@@ -6333,6 +6331,7 @@ func (f *cachedFile) readAtRouted(p []byte, off int64, trace *cachedReadTrace) (
 			trace.FinalRoute = "fuse_offline"
 		}
 		if err := f.ensureFuseFDTraced(trace); err != nil {
+			logOfflineRefusal("read", "FUSE open failed while offline", f.name)
 			return 0, pin.ErrOfflineNotAvailable
 		}
 		// The bytes MIGHT be local — JuiceFS's own LRU has them (recently
@@ -6372,6 +6371,7 @@ func (f *cachedFile) readAtRouted(p []byte, off int64, trace *cachedReadTrace) (
 		}
 		defer releaseOfflineReadBuf(tmp, done)
 		if !done || (berr != nil && bn == 0 && !errors.Is(berr, io.EOF)) {
+			logOfflineRefusal("read", "block not local within the offline read bound", f.name)
 			return 0, pin.ErrOfflineNotAvailable
 		}
 		if bn > 0 {
@@ -6791,6 +6791,7 @@ func (f *billyFile) readUnprotected(p []byte) (int, error) {
 		return 0, err
 	}
 	if pin.IsOffline() && !f.pinned {
+		logOfflineRefusal("read", "un-pinned file opened before metadata scan", f.name)
 		return 0, pin.ErrOfflineNotAvailable
 	}
 	return f.File.Read(p)
@@ -6887,6 +6888,7 @@ func (f *billyFile) readAtUnprotected(p []byte, off int64) (int, error) {
 		return 0, err
 	}
 	if pin.IsOffline() && !f.pinned {
+		logOfflineRefusal("read", "un-pinned file opened before metadata scan", f.name)
 		return 0, pin.ErrOfflineNotAvailable
 	}
 	// The same in-place hole choke point as cachedFile (B-9): this is the
@@ -6907,6 +6909,7 @@ func (f *billyFile) readAtRouted(p []byte, off int64) (int, error) {
 		tmp := make([]byte, len(p))
 		bn, berr, done := readAtBounded(f.File, tmp, off, offlinePinnedReadTimeout)
 		if !done || (berr != nil && bn == 0 && !errors.Is(berr, io.EOF)) {
+			logOfflineRefusal("read", "pinned block not local within the offline read bound", f.name)
 			return 0, pin.ErrOfflineNotAvailable
 		}
 		if bn > 0 {

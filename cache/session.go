@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
+
+	"github.com/lelanddutcher/juicemount/internal/liveness"
 )
 
 var ErrReaderUnavailable = errors.New("direct SSD reader is unavailable")
@@ -107,6 +109,9 @@ func NewSession(cfg SessionConfig) (*Session, error) {
 func (s *Session) makeReader(binding VolumeBinding) (*Reader, error) {
 	opts := *s.cfg.Options
 	client := redis.NewClient(&opts)
+	// Every chunk-mapping reply is proof the backend link works; the
+	// reachability monitor uses it to ignore a probe a lossy link dropped.
+	client.AddHook(liveness.RedisHook{})
 	r, err := NewVolumeReader(binding, client)
 	if err != nil {
 		_ = client.Close()

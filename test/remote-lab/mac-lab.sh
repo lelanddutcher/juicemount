@@ -24,6 +24,12 @@
 #                       (up installs wireguard-tools and iperf3 with it).
 #   JMLAB_MAC_ENDPOINT  address of THIS Docker host as the VM can reach it.
 # Optional:
+#   JMLAB_MAC_DIRECT=1  the Mac is reached directly, not as a VM behind a host:
+#                       JMLAB_MAC_HOST is then the Mac's address (no user@),
+#                       nothing is started or stopped, nothing is installed
+#                       (wireguard-tools must be there already), and the
+#                       tunnel config lives in ~/.jmlab-wireguard of
+#                       JMLAB_MAC_USER, not in Homebrew's etc.
 #   JMLAB_MAC_WG_PORT   UDP port published for WireGuard (default 51820)
 #   JMLAB_MAC_BIND      host address the port is published on (default 0.0.0.0)
 #   JMLAB_MAC_KEEP_VM=1 leave the VM running after down
@@ -63,6 +69,8 @@ need_env() {
 
 host_ssh() { ssh -i "$JMLAB_MAC_KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=15 "$JMLAB_MAC_HOST" "$@"; }
 
+direct() { [ "${JMLAB_MAC_DIRECT:-0}" = 1 ]; }
+
 guest_ip() {
   [ -s "$STATE/guest.ip" ] || die "no VM address recorded: run mac-lab.sh up"
   cat "$STATE/guest.ip"
@@ -71,6 +79,12 @@ guest_ip() {
 guest() {
   local ip proxy
   ip="$(guest_ip)"
+  if direct; then
+    ssh -i "$JMLAB_MAC_KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=20 \
+      -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$STATE/known_hosts" \
+      "$JMLAB_MAC_USER@$ip" "$@"
+    return
+  fi
   proxy="ssh -i $(printf %q "$JMLAB_MAC_KEY") -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=15 $(printf %q "$JMLAB_MAC_HOST") -W %h:%p"
   ssh -i "$JMLAB_MAC_KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=20 \
     -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$STATE/known_hosts" \
@@ -108,11 +122,16 @@ write_keys() {
 # shellcheck disable=SC2016
 guest_tunnel_up() {
   log "installing the tunnel in the VM"
-  guest "$BREW_ENV"'; set -e
-    for f in wireguard-tools iperf3; do
-      brew list --formula "$f" >/dev/null 2>&1 || HOMEBREW_NO_AUTO_UPDATE=1 brew install -q "$f" >/dev/null
-    done
-    d="$(brew --prefix)/etc/wireguard"; sudo install -d -m 700 "$d"
+  guest "$BREW_ENV; DIRECT=${JMLAB_MAC_DIRECT:-0}"'; set -e
+    if [ "$DIRECT" = 1 ]; then
+      command -v wg-quick >/dev/null || { echo "wireguard-tools is not installed on the Mac" >&2; exit 1; }
+      d="$HOME/.jmlab-wireguard"; install -d -m 700 "$d"
+    else
+      for f in wireguard-tools iperf3; do
+        brew list --formula "$f" >/dev/null 2>&1 || HOMEBREW_NO_AUTO_UPDATE=1 brew install -q "$f" >/dev/null
+      done
+      d="$(brew --prefix)/etc/wireguard"; sudo install -d -m 700 "$d"
+    fi
     sudo env PATH="$PATH" wg-quick down "$d/'"$WG_NAME"'.conf" >/dev/null 2>&1 || true
     sudo sh -c '\''umask 077; cat > "$1"'\'' _ "$d/'"$WG_NAME"'.conf"
     sudo env PATH="$PATH" wg-quick up "$d/'"$WG_NAME"'.conf" 2>&1 | grep -v "^\[#\]" || true' < "$STATE/guest.conf"
@@ -129,11 +148,13 @@ guest_tunnel_up() {
 
 # shellcheck disable=SC2016
 guest_tunnel_down() {
-  guest "$BREW_ENV"'; d="$(brew --prefix)/etc/wireguard"
+  guest "$BREW_ENV; DIRECT=${JMLAB_MAC_DIRECT:-0}"'; d="$(brew --prefix)/etc/wireguard"
+    [ "$DIRECT" != 1 ] || d="$HOME/.jmlab-wireguard"
     if [ -f "$d/'"$WG_NAME"'.conf" ]; then
       sudo env PATH="$PATH" wg-quick down "$d/'"$WG_NAME"'.conf" >/dev/null 2>&1 || true
       sudo rm -f "$d/'"$WG_NAME"'.conf"
-    fi' || log "could not reach the VM to remove the tunnel"
+    fi
+    [ "$DIRECT" != 1 ] || rmdir "$d" 2>/dev/null || true' || log "could not reach the VM to remove the tunnel"
 }
 
 # A public-read/write bucket with one random object of JMLAB_MAC_SMOKE_MB MB.
@@ -158,9 +179,14 @@ case "$cmd" in
     need_env
     command -v docker >/dev/null || die "docker is required"
     mkdir -p "$STATE"; chmod 700 "$STATE"
-    log "starting the VM"
-    ip="$(host_ssh start | tail -n 1 | tr -d '[:space:]')"
-    [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "the VM host's start printed no IPv4 address"
+    if direct; then
+      ip="$JMLAB_MAC_HOST"
+      case "$ip" in *@*) die "with JMLAB_MAC_DIRECT=1, JMLAB_MAC_HOST is the Mac's address only (the user is JMLAB_MAC_USER)" ;; esac
+    else
+      log "starting the VM"
+      ip="$(host_ssh start | tail -n 1 | tr -d '[:space:]')"
+      [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "the VM host's start printed no IPv4 address"
+    fi
     printf '%s\n' "$ip" > "$STATE/guest.ip"
     for _ in $(seq 60); do guest true 2>/dev/null && break; sleep 2; done
     guest true || die "cannot SSH into the VM"
@@ -206,10 +232,10 @@ case "$cmd" in
     ;;
   down)
     need_env
-    if [ -s "$STATE/guest.ip" ] && [ "$(host_ssh status 2>/dev/null)" != stopped ]; then guest_tunnel_down; fi
+    if [ -s "$STATE/guest.ip" ] && { direct || [ "$(host_ssh status 2>/dev/null)" != stopped ]; }; then guest_tunnel_down; fi
     if [ -f "$STATE/lab.env" ]; then "$LAB" down; fi
     rm -rf "$STATE"
-    if [ "${JMLAB_MAC_KEEP_VM:-0}" != 1 ]; then
+    if ! direct && [ "${JMLAB_MAC_KEEP_VM:-0}" != 1 ]; then
       host_ssh stop >/dev/null || log "could not stop the VM"
       log "VM: $(host_ssh status 2>/dev/null || echo unknown)"
     fi

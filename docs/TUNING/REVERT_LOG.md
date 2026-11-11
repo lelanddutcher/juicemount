@@ -7,6 +7,80 @@ a rebuild**.
 
 ---
 
+## 2026-11-11 — lossy-link reachability flap took the volume offline (ENXIO)
+
+**What.** `health/reachability.go`, `bridge/cbridge.go`, `internal/liveness`,
+`metadata/redishook.go`, `cache/session.go`, `nfs/offline_refusal_log.go`. In a
+lab run at 200 ms RTT and 1% loss each way, the reachability probe (TCP connect
++ Redis PING) failed whenever one packet was lost: the adaptive budget
+(2*srtt+4*rttvar ≈ 0.9 s) clamped to the 1 s floor, and a lost SYN costs the 1 s
+initial RTO. The bridge flipped auto-offline after one failure
+(`backendFailuresToOffline = 1`): 38 flips in 80 minutes. Each flip made the
+offline gates refuse un-pinned opens and reads with NXIO ("Device not
+configured"); the refusals logged only at Debug.
+
+**Fix.**
+1. On a WAN (srtt ≥ 50 ms) the probe budget adds 1 s, one TCP retransmit.
+2. Two consecutive failures are required (`backendFailuresToOffline = 2`). The
+   confirming probe runs 250 ms after the first failure, not one interval later.
+3. Any Redis reply on the metadata or cache-reader clients within the liveness
+   window (2 × interval = 4 s) suppresses a probe failure, like a completed
+   drain already did. A reply counts only if the command took at most 2 s
+   (`liveness.MaxProofLatency`), so late replies on a bufferbloated link cannot
+   hold the volume online. Proof age uses the monotonic clock, so a wall-clock
+   step cannot make an old reply look new. Any suppressed failure (drain or
+   Redis) now also resets the failure streak.
+4. Offline-gate refusals log at Info, at most one line per 10 s, with the gate,
+   the path, the auto-offline reason, a suppressed count and the time the
+   count started. A summary line reports the remaining count when
+   auto-offline clears.
+5. The regular probe cadence stays a fixed 2 s ticker. The confirm probe uses
+   its own one-shot timer, so a probe's duration does not stretch the interval
+   and recovery after an outage is noticed as fast as before.
+
+**Offline detection bound** (I = 2 s interval, T = probe budget, W = 4 s, c = 250 ms):
+
+| Case | Formula | LAN (T = 1 s) | 200 ms WAN (T ≈ 2 s) |
+|---|---|---|---|
+| No recent traffic | I + 2T + c | ≈ 4.3 s | ≈ 6.3 s |
+| Traffic up to the cut (normal use) | W + I + 2T + c | ≈ 8.3 s | ≈ 10.3 s |
+| Budget at the 10 s cap | W + I + 20 s + c | ≈ 26.3 s | ≈ 26.3 s |
+
+In normal use there is nearly always Redis traffic, so expect 4–8 s on a LAN
+(before: about 3 s, or about 7 s while drains were landing).
+
+**Kill switches (env, no rebuild):**
+
+| Env | Effect |
+|---|---|
+| `JM_REACH_FAILS_TO_OFFLINE=1` | Single-failure flip, the pre-fix threshold. With a threshold of 1 no confirm probe is ever scheduled, and the streak reset has no effect, because one counted failure flips at once. |
+| `JM_REACH_WAN_RETRANSMIT=0` | Drops only the 1 s WAN retransmit allowance. RTT adaptation (`2*srtt + 4*rttvar`, floor 1 s) stays on, as before. |
+| `JM_REACH_REDIS_LIVENESS=0` | Drops only the Redis-reply proof. The drain override, which was on before this change, stays on. |
+| `JM_REACH_ADAPTIVE=0` | Fixed 1 s budget: no RTT growth and no allowance. This also turns off the pre-existing adaptation, so it is not part of the revert. |
+| `JM_REACH_DRAIN_LIVENESS=0` | No traffic proof at all, drain or Redis. This also turns off the pre-existing drain override, so it is not part of the revert. |
+
+**Exact revert:** `JM_REACH_FAILS_TO_OFFLINE=1 JM_REACH_WAN_RETRANSMIT=0
+JM_REACH_REDIS_LIVENESS=0` restores the pre-fix probe behaviour: the same
+budget, the same single-failure flip, the same drain-only suppression and the
+same fixed cadence. Two things stay different. Some log lines have new text,
+and offline-gate refusals log at Info.
+
+**Baseline on a LAN:** the probe budget stays exactly 1 s (srtt below 50 ms).
+
+**Validated:** Go tests — `TestReachabilityLossySequenceStaysOnline`,
+`TestReachabilityTrafficProofKeepsLossyLinkOnline`,
+`TestReachabilityTrafficProofResetsOpenStreak`,
+`TestReachabilityDeadLinkGoesOfflineWithinBound`,
+`TestReachabilityDeadLinkWithTrafficUntilCutWithinBound`,
+`TestReachabilityProbeDurationDoesNotStretchCadence`,
+`TestReachabilityWANBudgetCoversOneRetransmit`,
+`TestReachabilityFailsToOfflineKillSwitch`,
+`TestSinceIgnoresWallClockSteps`, `TestSlowReplyIsNotProof`,
+`TestReachabilityHookSwitch`,
+`TestOfflineOpenRefusalLogsAtInfoRateLimited`. Not yet re-run on the lab WAN.
+
+---
+
 ## 2026-07-03 — #89 fix: suppress false "degraded" during a legitimate heavy ingest (online drain-InFlight busy analogue)
 
 **What.** `health/monitor.go` + `bridge/cbridge.go`. The health watchdog's 5 s
