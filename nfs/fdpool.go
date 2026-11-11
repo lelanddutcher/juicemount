@@ -1,6 +1,8 @@
 package nfs
 
 import (
+	"errors"
+	"io/fs"
 	"log"
 	"os"
 	"strings"
@@ -18,7 +20,8 @@ const (
 	// final reads.
 	fdOrphanGrace = 2 * time.Minute
 	// fdOpenJoinMax bounds how old a shared read open may be for a new caller
-	// to join it (see Get). It is above every read-open timeout, so a joiner
+	// to join it (see Get). It is above the default read-open timeouts (2 s,
+	// 4 s on slow links; JM_FUSE_OP_TIMEOUT_MS can set more), so a joiner
 	// normally waits out the same open its own open would have queued behind
 	// in macFUSE; an open stuck longer than this is treated as wedged and later
 	// callers open on their own.
@@ -177,6 +180,10 @@ func NewFDPool() *FDPool {
 // return path, so the next Get after a failure opens afresh.
 func (p *FDPool) Get(path string) (*os.File, error) {
 	k := fdKey{path: path, write: false}
+	// ownOpen: a shared open this caller joined failed with ENOENT. That
+	// open may have looked the path up before a peer's create landed, so
+	// this caller opens on its own once instead of reporting a stale miss.
+	ownOpen := false
 	for {
 		p.mu.Lock()
 		if p.stopped {
@@ -192,11 +199,15 @@ func (p *FDPool) Get(path string) (*os.File, error) {
 		} else if ok {
 			p.displaceStaleLocked(k, entry)
 		}
-		if lead := p.readFlights[path]; lead != nil && !lead.poisoned && time.Since(lead.started) < fdOpenJoinMax {
+		if lead := p.readFlights[path]; !ownOpen && lead != nil && !lead.poisoned && time.Since(lead.started) < fdOpenJoinMax {
 			lead.joiners++
 			p.mu.Unlock()
 			<-lead.done
 			if lead.err != nil && !lead.poisoned {
+				if errors.Is(lead.err, fs.ErrNotExist) {
+					ownOpen = true
+					continue
+				}
 				return nil, lead.err
 			}
 			// The leader pooled an entry (take a ref on it above), or the

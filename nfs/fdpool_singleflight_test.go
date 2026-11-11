@@ -498,3 +498,52 @@ func TestPooledReadOpenConcurrentFirstReadsShareDescriptor(t *testing.T) {
 	p.Release(path)
 	p.Release(path)
 }
+
+// A shared open that misses with ENOENT may have looked the path up before a
+// peer's create landed. A joiner opens on its own once instead of reporting
+// the stale miss (review of #75).
+func TestFDPoolJoinerRetriesOwnOpenAfterSharedENOENT(t *testing.T) {
+	path := seedPoolFile(t, "late.mov")
+	p := NewFDPool()
+	defer p.Stop()
+	release := make(chan struct{})
+	var mu sync.Mutex
+	calls := 0
+	p.openRead = func(name string) (*os.File, error) {
+		mu.Lock()
+		calls++
+		n := calls
+		mu.Unlock()
+		if n == 1 {
+			<-release
+			return nil, &os.PathError{Op: "open", Path: name, Err: os.ErrNotExist}
+		}
+		return os.Open(name)
+	}
+	leader := make(chan getResult, 1)
+	go func() {
+		fd, err := p.Get(path)
+		leader <- getResult{fd, err}
+	}()
+	waitOpensInFlight(t, p, 1)
+	joiner := make(chan getResult, 1)
+	go func() {
+		fd, err := p.Get(path)
+		joiner <- getResult{fd, err}
+	}()
+	waitJoiners(t, p, path, 1)
+	close(release)
+	if r := <-leader; !errors.Is(r.err, os.ErrNotExist) {
+		t.Fatalf("leader Get = (%v, %v), want its own ENOENT", r.fd, r.err)
+	}
+	r := <-joiner
+	if r.err != nil || r.fd == nil {
+		t.Fatalf("joiner Get = (%v, %v), want its own successful open", r.fd, r.err)
+	}
+	p.Release(path)
+	mu.Lock()
+	defer mu.Unlock()
+	if calls != 2 {
+		t.Fatalf("opens = %d, want 2 (shared miss, then the joiner's own)", calls)
+	}
+}

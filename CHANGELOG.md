@@ -4,8 +4,9 @@
 
 ### App
 
-- On a slow or distant link, the first clip you open in a session shows its
-  first frame sooner. macOS asks for the first two 1 MiB pieces of a file at
+- On a slow or distant link, the first clip you open in a session no longer
+  sometimes takes about 7 s to show its first frame (lab worst case 7.3 s to
+  4.5 s). macOS asks for the first two 1 MiB pieces of a file at
   the same time, and before, each request opened the file in JuiceFS on its
   own. macFUSE runs one request of a file at a time, so the second open
   waited behind the first read, timed out after 2 s, and macOS asked again
