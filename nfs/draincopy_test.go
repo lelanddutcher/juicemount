@@ -169,9 +169,11 @@ func TestDrainFUSESlotGivesWaitingMediaDrainTheNextSlot(t *testing.T) {
 	d := &Drainer{stop: make(chan struct{})}
 	defer close(d.stop)
 
+	// bg small drains fill the shared share and one more takes the small
+	// lane's reserved slot, so a further small drain has no slot of its own.
 	bg := int(backgroundFUSEDataWidth())
 	var held []func()
-	for i := 0; i < bg; i++ {
+	for i := 0; i < bg+1; i++ {
 		release, ok := d.acquireDrainFUSESlotFor(true)
 		if !ok {
 			t.Fatalf("small drain %d not admitted", i)

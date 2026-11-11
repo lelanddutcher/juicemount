@@ -159,6 +159,7 @@ type Drainer struct {
 	onPendingDirNameTaken     func(string) (string, error) // spooled_mkdir.go
 	mediaGateWaiters          atomic.Int32                 // media-lane drains waiting for a gate slot
 	mediaGateHeld             atomic.Int32                 // media-lane drains holding a gate slot
+	smallReserveHeld          atomic.Int32                 // 1 while a small-lane drain holds the reserved slot
 	onDrainEffects            func(metadata.DrainCommitItem, metadata.DrainCommitResult, *os.File, []byte) error
 	onDrainSucceeded          func(string)
 	onBatchDrainCompleteExact func([]metadata.DrainCommitItem) ([]metadata.DrainCommitResult, error)
@@ -1276,8 +1277,10 @@ func (d *Drainer) acquireDrainFUSESlot() (release func(), ok bool) {
 
 // smallYieldsToMedia: a small drain leaves a freed slot to a waiting media
 // drain only while media drains hold fewer than half the background slots
-// (at least one). Small saves (.prproj, .drp, sidecars) therefore always keep
-// at least half, and a large file always gets one.
+// (at least one). Small saves (.prproj, .drp, sidecars) therefore keep at
+// least half, and a large file always gets one. While they yield, and whenever
+// the shared share is full, small saves also have one reserved slot of their
+// own (trySmallReserveFUSESlot): with a share of 1, half is nothing.
 func (d *Drainer) smallYieldsToMedia() bool {
 	if d.mediaGateWaiters.Load() == 0 {
 		return false
@@ -1289,6 +1292,49 @@ func (d *Drainer) smallYieldsToMedia() bool {
 	return int64(d.mediaGateHeld.Load()) < share
 }
 
+// trySmallReserveFUSESlot admits a small-lane drain on the ONE slot reserved
+// for the small lane, outside the shared background share.
+//
+// WHY A RESERVE. The background share is half the class width: 4 on a slow
+// link, 1 on a metered one. A media drain holds its slot for the whole upload,
+// and the media lane is serialized on slow and metered links (slowGate). With
+// a background share of 1 that one upload owned the only slot, and every small
+// save waited behind it. Measured on the founder's laptop 2026-11-11 (abroad,
+// main 47e140a): one 500 MB render held the slot, the small workers spun here,
+// and 2 of 201 saved files reached the server in 10 minutes. At 0.9 Mbit/s the
+// render needs about 75 minutes, so for that time a .prproj save existed only
+// on the laptop.
+//
+// The reserve is one slot, held by at most one small drain. It is counted as
+// background, so foreground admission (counted apart, acquireFUSEData) never
+// sees it, and it is left out of the shared background share
+// (fuseReserveInFlight), so it never takes a media drain's or read-ahead's
+// slot. It is admitted against the base ceiling (16, the panic-derived limit),
+// not the class width: everything in flight stays under that ceiling.
+// A small-lane row is at most smallBytes (1 MiB by default), so the reserve
+// adds no bulk upload to a metered uplink. Small drains try the shared share
+// first and use the reserve only when it is refused, or while they yield the
+// shared share to a waiting media drain (smallYieldsToMedia).
+func (d *Drainer) trySmallReserveFUSESlot() (release func(), ok bool) {
+	if !fuseDataGateEnabled {
+		return func() {}, true
+	}
+	if !d.smallReserveHeld.CompareAndSwap(0, 1) {
+		return nil, false
+	}
+	if !admitReserveFUSEData() {
+		d.smallReserveHeld.Store(0)
+		return nil, false
+	}
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			releaseReserveFUSEData()
+			d.smallReserveHeld.Store(0)
+		})
+	}, true
+}
+
 func (d *Drainer) acquireDrainFUSESlotFor(small bool) (release func(), ok bool) {
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
@@ -1298,6 +1344,11 @@ func (d *Drainer) acquireDrainFUSESlotFor(small bool) (release func(), ok bool) 
 	}
 	for {
 		if small && d.smallYieldsToMedia() {
+			// Leave the shared share to the waiting media drain, but keep
+			// draining small saves on the reserved slot.
+			if release, ok := d.trySmallReserveFUSESlot(); ok {
+				return release, true
+			}
 			select {
 			case <-d.stop:
 				return func() {}, false
@@ -1317,6 +1368,11 @@ func (d *Drainer) acquireDrainFUSESlotFor(small bool) (release func(), ok bool) 
 					release()
 				})
 			}, true
+		}
+		if small {
+			if release, ok := d.trySmallReserveFUSESlot(); ok {
+				return release, true
+			}
 		}
 		// An operator may deliberately set JM_FUSE_DATA_GATE=1. The normal
 		// background policy reserves that sole slot, which is correct for

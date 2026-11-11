@@ -35,7 +35,12 @@ import (
 type LinkClass int
 
 const (
-	ClassMetered LinkClass = iota // <~3 MB/s — cellular / weak; minimize fetch, protect data cap
+	// ClassMetered means the link COSTS data: the host OS marks the path
+	// expensive or constrained (cellular, a phone hotspot, Low Data Mode), an
+	// operator forces it, or a NEAR link measures under ~3 MB/s. A FAR link
+	// (high RTT) that measures under ~3 MB/s is ClassSlow with LowBandwidth
+	// set, not metered: see slowRTTFloor in classLocked.
+	ClassMetered LinkClass = iota // cost; minimize fetch, protect data cap
 	ClassSlow                     // ~3–30 MB/s — congested Wi-Fi / modest WAN; gentle prefetch
 	ClassMedium                   // ~30–200 MB/s — good Wi-Fi / GbE; current defaults
 	ClassFast                     // >~200 MB/s — 10GbE / LAN; aggressive prefetch to fill the pipe
@@ -142,6 +147,10 @@ type Snapshot struct {
 	HaveBW          bool
 	ThroughputN     int64 // count of throughput samples folded in
 	BootstrappedRTT bool  // class derived from RTT (no BW yet)
+	// LowBandwidth is true when the measured throughput is under the metered
+	// threshold, whatever the class. On a far link it is the only trace of that
+	// measurement: the class stays slow (see classLocked).
+	LowBandwidth bool
 }
 
 // classification thresholds (bytes/sec). Overridable via env for field tuning.
@@ -543,6 +552,27 @@ func (p *Profile) classLocked() (LinkClass, bool) {
 		switch {
 		case p.bwBps < thrMeteredBps:
 			byBW = ClassMetered
+			// SLOW-RTT FLOOR: low bandwidth on a far link is not a cost.
+			//
+			// Metered exists to protect a data cap. The host OS reports
+			// that directly (networkCostClass, checked above), and an
+			// operator can force it. The throughput rule is the fallback
+			// for a near link that carries little, such as a VPN whose
+			// cellular underlay the OS does not flag. A far link (RTT
+			// above the high-latency ceiling) is already ClassSlow by its
+			// RTT, and a cold read on it measures under 3 MB/s because
+			// one TCP stream over 200 ms cannot carry more: it says how
+			// far the server is, not what the data costs. Measured on
+			// the founder's laptop 2026-11-11 (abroad, 200 ms, main
+			// 47e140a): the first cold reads flipped slow to metered, the
+			// FUSE data gate went from width 8 to 2, the drain kept one
+			// slot, and 2 of 201 saved files reached the server in
+			// 10 minutes (148 before). So a far link stays slow and
+			// reports LowBandwidth. JM_NET_SLOW_RTT_FLOOR=0 restores the
+			// throughput-only metered rule.
+			if p.highLatency && slowRTTFloorEnabled() {
+				byBW = ClassSlow
+			}
 		case p.bwBps < thrSlowBps:
 			byBW = ClassSlow
 		case p.bwBps < thrFastBps:
@@ -566,7 +596,8 @@ func (p *Profile) classLocked() (LinkClass, bool) {
 		// A far link is capped at ClassSlow no matter how fat the pipe is:
 		// what makes navigation and file opens hurt is ROUND TRIPS, not
 		// megabits, and every consumer of "slow" is doing round-trip-reducing
-		// work. Metered stays metered (it is already stricter). Kill switch
+		// work. Metered stays metered (it is already stricter; a far link
+		// never reaches here as metered by throughput, see SLOW-RTT FLOOR). Kill switch
 		// JM_NET_LATENCY_CEILING=0 restores bandwidth-only classification
 		// byte-identically (WAN-tuning revert discipline).
 		// LinkClass is ordered slow→fast (Metered=0 … Fast=3), so "faster than
@@ -646,7 +677,16 @@ func (p *Profile) Snapshot() Snapshot {
 		HaveBW:          p.haveBW,
 		ThroughputN:     p.bwSamples,
 		BootstrappedRTT: boot,
+		LowBandwidth:    p.haveBW && p.bwBps < thrMeteredBps,
 	}
+}
+
+// slowRTTFloorEnabled reports whether a far link keeps ClassSlow when its
+// measured throughput is under the metered threshold. Default ON;
+// JM_NET_SLOW_RTT_FLOOR=0 restores the throughput-only metered rule (WAN-tuning
+// revert discipline: revertible without a rebuild).
+func slowRTTFloorEnabled() bool {
+	return os.Getenv("JM_NET_SLOW_RTT_FLOOR") != "0"
 }
 
 // latencyCeilingEnabled reports whether the RTT ceiling may downgrade a

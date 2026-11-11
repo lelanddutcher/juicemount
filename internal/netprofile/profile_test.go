@@ -314,7 +314,8 @@ func TestTransportChangeInvalidatesStaleMeasurements(t *testing.T) {
 	p.ObserveRTT(180 * time.Millisecond)
 	sampleFor(p, 1.5*1024*1024, 6)
 	before := p.Snapshot()
-	if before.Class != ClassMetered || !before.HaveRTT || !before.HaveBW || before.ThroughputN == 0 {
+	// Far and low-bandwidth: slow by the slow-RTT floor, with LowBandwidth set.
+	if before.Class != ClassSlow || !before.LowBandwidth || !before.HaveRTT || !before.HaveBW || before.ThroughputN == 0 {
 		t.Fatalf("precondition stale cellular profile = %+v", before)
 	}
 
