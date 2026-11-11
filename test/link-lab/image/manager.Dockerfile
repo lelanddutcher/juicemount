@@ -10,7 +10,7 @@
 # binary is built with the same tags (ts_omit_peerapiserver included), and Headscale is the same release
 # (v0.29.3), here also checked against its published sha256.
 
-FROM golang:1.26.10-alpine AS builder
+FROM golang:1.26.11-alpine AS builder
 ARG JM_COMMIT=0000000000000000000000000000000000000000
 WORKDIR /src
 COPY go.mod go.sum ./
