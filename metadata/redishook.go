@@ -7,6 +7,7 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
+	"github.com/lelanddutcher/juicemount/internal/liveness"
 	"github.com/lelanddutcher/juicemount/internal/metrics"
 )
 
@@ -86,10 +87,13 @@ func (countingHook) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.Pr
 }
 
 // instrumentRedis attaches the counter to a client. Call it at every place a
-// client is constructed.
+// client is constructed. It also attaches the liveness hook: every reply from
+// the metadata Redis is proof the backend link works, which the reachability
+// monitor uses to ignore a probe that a lossy link happened to drop.
 func instrumentRedis(c *redis.Client) *redis.Client {
 	if c != nil {
 		c.AddHook(countingHook{})
+		c.AddHook(liveness.RedisHook{})
 	}
 	return c
 }

@@ -7,6 +7,56 @@ a rebuild**.
 
 ---
 
+## 2026-11-11 — lossy-link reachability flap took the volume offline (ENXIO)
+
+**What.** `health/reachability.go`, `bridge/cbridge.go`, `internal/liveness`,
+`metadata/redishook.go`, `cache/session.go`, `nfs/offline_refusal_log.go`. In a
+lab run at 200 ms RTT and 1% loss each way, the reachability probe (TCP connect
++ Redis PING) failed whenever one packet was lost: the adaptive budget
+(2*srtt+4*rttvar ≈ 0.9 s) clamped to the 1 s floor, and a lost SYN costs the 1 s
+initial RTO. The bridge flipped auto-offline after one failure
+(`backendFailuresToOffline = 1`): 38 flips in 80 minutes. Each flip made the
+offline gates refuse un-pinned opens and reads with NXIO ("Device not
+configured"); the refusals logged only at Debug.
+
+**Fix.**
+1. On a WAN (srtt ≥ 50 ms) the probe budget adds 1 s, one TCP retransmit.
+2. Two consecutive failures are required (`backendFailuresToOffline = 2`). The
+   confirming probe runs 250 ms after the first failure, not one interval later.
+3. Any Redis reply on the metadata or cache-reader clients within the liveness
+   window (2 × interval = 4 s) suppresses a probe failure and resets the
+   streak, like a completed drain already did.
+4. Offline-gate refusals log at Info, at most one line per 10 s, with the gate,
+   the path, the auto-offline reason and a suppressed count.
+
+**Offline detection bound** (I = 2 s interval, T = probe budget, W = 4 s, c = 250 ms):
+no recent traffic I + 2T + c (LAN ≈ 4.3 s, 200 ms WAN ≈ 6.3 s); traffic up to the
+cut W + I + 2T + c (LAN ≈ 8.3 s, 200 ms WAN ≈ 10.3 s); absolute worst at the 10 s
+budget cap ≈ 26.3 s.
+
+**Kill switches (env, no rebuild):**
+
+| Env | Effect |
+|---|---|
+| `JM_REACH_FAILS_TO_OFFLINE=1` | Single-failure flip, the pre-fix threshold. |
+| `JM_REACH_ADAPTIVE=0` | Fixed 1 s budget, no RTT growth and no retransmit allowance. |
+| `JM_REACH_DRAIN_LIVENESS=0` | No traffic proof at all (drain or Redis reply). |
+
+All three together restore the pre-fix monitor except the 250 ms confirm
+timing, which only matters when the threshold is above 1.
+
+**Baseline on a LAN:** the probe budget stays exactly 1 s (srtt below 50 ms).
+Detection moves from about 3 s to about 4.3 s.
+
+**Validated:** Go tests — `TestReachabilityLossySequenceStaysOnline`,
+`TestReachabilityTrafficProofKeepsLossyLinkOnline`,
+`TestReachabilityTrafficProofResetsOpenStreak`,
+`TestReachabilityDeadLinkGoesOfflineWithinBound`,
+`TestReachabilityWANBudgetCoversOneRetransmit`,
+`TestOfflineOpenRefusalLogsAtInfoRateLimited`. Not yet re-run on the lab WAN.
+
+---
+
 ## 2026-07-03 — #89 fix: suppress false "degraded" during a legitimate heavy ingest (online drain-InFlight busy analogue)
 
 **What.** `health/monitor.go` + `bridge/cbridge.go`. The health watchdog's 5 s

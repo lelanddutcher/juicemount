@@ -4,6 +4,18 @@
 
 ### App
 
+- On a lossy but working link, the volume no longer goes offline by mistake.
+  Before, one failed connection check marked the server unreachable. On a
+  link with 200 ms delay and 1% packet loss, one lost packet was enough, so
+  the volume went offline 38 times in 80 minutes. Each time, files that were
+  not pinned or cached returned "Device not configured" (ENXIO), and an editor
+  such as Premiere or Resolve could mark media offline. Now the app needs two
+  failed checks in a row, gives each check time for one lost packet on a
+  distant link, and treats any recent reply from the server as proof that the
+  link works. A link that is really down still goes offline in about 4 s on a
+  local network and about 6 to 10 s on a distant one. When the offline mode
+  refuses a file, the app now writes one line per 10 s to the normal log with
+  the reason.
 - Over a slow or distant link, a file that is not in the local cache starts
   to play or open sooner. JuiceFS stores files in 4 MiB blocks. Before, the
   first read of a block waited until the whole block had downloaded. Now a

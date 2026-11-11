@@ -43,6 +43,7 @@ import (
 	"github.com/lelanddutcher/juicemount/internal/derivatives"
 	"github.com/lelanddutcher/juicemount/internal/farm"
 	"github.com/lelanddutcher/juicemount/internal/jmlog"
+	"github.com/lelanddutcher/juicemount/internal/liveness"
 	"github.com/lelanddutcher/juicemount/internal/metrics"
 	"github.com/lelanddutcher/juicemount/internal/mountbroker"
 	"github.com/lelanddutcher/juicemount/internal/mounttable"
@@ -276,14 +277,17 @@ var backendRoutePolicyState struct {
 	ceilingApplied atomic.Bool
 }
 
-// backendFailuresToOffline deliberately admits one failed PROTOCOL-level probe.
-// Reachability does more than connect: it sends Redis PING and requires a RESP
-// reply, while its recent-drain liveness override suppresses congestion-induced
-// false failures. Adding another threshold or timer here previously left Finder
-// on the blocking FUSE path for about 22 seconds after a real route loss. A
-// single bounded failure makes the durable local cache/spool policy effective
-// within roughly one probe timeout; the first successful probe recovers online.
-const backendFailuresToOffline = 1
+// backendFailuresToOffline is the number of consecutive failed PROTOCOL-level
+// probes (TCP connect + Redis PING + RESP reply) before the volume goes
+// auto-offline. It was 1. On a lossy WAN (2026-11-11 lab: 200 ms RTT, 1% loss
+// each way) one lost SYN or PING failed a probe, so the volume flipped offline
+// 38 times in 80 minutes and refused un-pinned opens with ENXIO while the link
+// worked. Two failures are required now, but the second probe runs 250 ms after
+// the first (health.Reachability confirmDelay), not a full interval later, so a
+// real route loss still goes offline within interval + 2 probe timeouts
+// (~4.3 s on a LAN). That stays well clear of the ~22 s Finder stall an earlier
+// extra timer caused. The first successful probe still recovers online.
+const backendFailuresToOffline = 2
 
 // ServerConfig is the JSON configuration passed from Swift.
 type ServerConfig struct {
@@ -1903,6 +1907,11 @@ func nfsServerStartSerialized(configJSON *C.char, recovery *servingDesiredRecord
 				}
 				return time.Since(last)
 			}),
+			// Any Redis reply on the metadata or cache-reader clients is proof
+			// the backend link works (internal/liveness). On a lossy WAN a
+			// probe can lose a packet while reads and lookups keep flowing;
+			// this keeps that probe failure from taking the volume offline.
+			health.WithLivenessHook(liveness.Since),
 		}
 		if linkNode != nil {
 			reachOpts = append(reachOpts, health.WithDialContext(linkNode.DialContext))
