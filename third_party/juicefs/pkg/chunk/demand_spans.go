@@ -69,10 +69,16 @@ type spanCache struct {
 	// fetch downloads one part; tests replace it.
 	fetch func(sp *spanPart) ([]byte, error)
 	// whole is called once when every part of a block has finished, with
-	// the block's bytes (the store writes them to the disk cache).
-	whole func(key string, block []byte)
+	// the parts in order (the store writes them to the disk cache).
+	whole func(key string, parts [][]byte, size int)
 	// cachedWhole remembers the blocks already handed to whole.
 	cachedWhole map[string]bool
+	// demand marks a read waiting for a part of key, for patch 0020's
+	// demand signal; the returned func ends it. Parts nobody waits for are
+	// not demand reads.
+	demand func(key string) func()
+	// sweeping is set while a sweep timer is armed.
+	sweeping bool
 }
 
 func newSpanCache(max int, ttl time.Duration) *spanCache {
@@ -91,6 +97,34 @@ func (c *spanCache) lookupLocked(key string, off int) *spanPart {
 		return nil
 	}
 	return sp
+}
+
+// sweepLocked drops finished parts older than ttl. The LRU is in finish
+// order (a hit does not move a part), so it stops at the first fresh one.
+func (c *spanCache) sweepLocked() {
+	for e := c.lru.Front(); e != nil; e = c.lru.Front() {
+		sp := e.Value.(*spanPart)
+		if time.Since(sp.at) <= c.ttl {
+			return
+		}
+		c.removeLocked(sp)
+	}
+}
+
+// armSweepLocked makes sure kept parts are swept even when no read comes:
+// a timer runs every ttl while any part is kept.
+func (c *spanCache) armSweepLocked() {
+	if c.sweeping || c.lru.Len() == 0 {
+		return
+	}
+	c.sweeping = true
+	time.AfterFunc(c.ttl, func() {
+		c.mu.Lock()
+		c.sweeping = false
+		c.sweepLocked()
+		c.armSweepLocked()
+		c.mu.Unlock()
+	})
 }
 
 func (c *spanCache) removeLocked(sp *spanPart) {
@@ -124,6 +158,7 @@ func (c *spanCache) read(key string, boff int, p []byte, bsize int) (n int, star
 	var need []*spanPart
 	var start []*spanPart
 	c.mu.Lock()
+	c.sweepLocked()
 	missing := false
 	for off := first; off < end; off += spanPartSize {
 		if c.lookupLocked(key, off) == nil {
@@ -167,7 +202,16 @@ func (c *spanCache) read(key string, boff int, p []byte, bsize int) (n int, star
 		go c.run(sp, bsize)
 	}
 	for _, sp := range need {
-		<-sp.done
+		select {
+		case <-sp.done:
+		default:
+			end := func() {}
+			if c.demand != nil {
+				end = c.demand(key)
+			}
+			<-sp.done
+			end()
+		}
 		if sp.err != nil {
 			return 0, len(start), false
 		}
@@ -194,7 +238,7 @@ func (c *spanCache) run(sp *spanPart, bsize int) {
 	if err == nil && len(data) != sp.n {
 		err = fmt.Errorf("part %s@%d: %d of %d bytes", sp.key, sp.off, len(data), sp.n)
 	}
-	var whole []byte
+	var whole [][]byte
 	c.mu.Lock()
 	sp.at = time.Now()
 	if err != nil {
@@ -213,6 +257,7 @@ func (c *spanCache) run(sp *spanPart, bsize int) {
 			for c.bytes > c.max && c.lru.Len() > 0 {
 				c.removeLocked(c.lru.Front().Value.(*spanPart))
 			}
+			c.armSweepLocked()
 		}
 		if c.whole != nil && !c.cachedWhole[sp.key] {
 			whole = c.wholeLocked(sp.key, bsize)
@@ -221,29 +266,28 @@ func (c *spanCache) run(sp *spanPart, bsize int) {
 	c.mu.Unlock()
 	close(sp.done)
 	if whole != nil {
-		c.whole(sp.key, whole)
+		c.whole(sp.key, whole, bsize)
 	}
 }
 
-// wholeLocked returns the block's bytes when every part of it is here and
-// finished, once per kept block.
-func (c *spanCache) wholeLocked(key string, bsize int) []byte {
+// wholeLocked returns the block's parts in order when every part of it is
+// here and finished, once per kept block. Finished parts are never written
+// again, so the caller may read them after the lock is released.
+func (c *spanCache) wholeLocked(key string, bsize int) [][]byte {
 	m := c.parts[key]
 	if len(m)*spanPartSize < bsize {
 		return nil
 	}
+	var parts [][]byte
 	for off := 0; off < bsize; off += spanPartSize {
 		sp := m[off]
 		if sp == nil || sp.elem == nil || len(sp.data) != min(spanPartSize, bsize-off) {
 			return nil
 		}
-	}
-	block := make([]byte, 0, bsize)
-	for off := 0; off < bsize; off += spanPartSize {
-		block = append(block, m[off].data...)
+		parts = append(parts, sp.data)
 	}
 	c.cachedWhole[key] = true
-	return block
+	return parts
 }
 
 // spansOn reports whether a miss of this store reads through demand spans:
@@ -268,7 +312,6 @@ func newStoreSpans(store *cachedStore) *spanCache {
 			n         int
 			firstByte time.Duration
 		)
-		endDemand := store.demand.beginDemand(sp.key)
 		st := time.Now()
 		err := utils.WithTimeout(func() error {
 			in, err := store.storage.Get(sp.key, int64(sp.off), int64(sp.n), object.WithRequestID(&reqID), object.WithStorageClass(&sc))
@@ -280,8 +323,9 @@ func newStoreSpans(store *cachedStore) *spanCache {
 			return err
 		}, store.conf.GetTimeout)
 		used := time.Since(st)
-		endDemand()
-		readTimeline("rt jfs span part key=%s off=%d len=%d first_byte_ms=%d ms=%d err=%v", sp.key, sp.off, sp.n, firstByte.Milliseconds(), used.Milliseconds(), err)
+		if readTimelineOn {
+			readTimeline("rt jfs span part key=%s off=%d len=%d first_byte_ms=%d ms=%d err=%v", sp.key, sp.off, sp.n, firstByte.Milliseconds(), used.Milliseconds(), err)
+		}
 		logRequest("GET", sp.key, fmt.Sprintf("RANGE(%d,%d) ", sp.off, sp.n), reqID, err, used)
 		store.objectDataBytes.WithLabelValues("GET", sc).Add(float64(n))
 		store.objectReqsHistogram.WithLabelValues("GET", sc).Observe(used.Seconds())
@@ -292,18 +336,24 @@ func newStoreSpans(store *cachedStore) *spanCache {
 		store.demand.observeRanged(used, sp.n)
 		return buf[:n], nil
 	}
-	c.whole = func(key string, block []byte) {
-		if !store.conf.CacheEnabled() || !store.shouldCache(len(block)) {
+	c.whole = func(key string, parts [][]byte, size int) {
+		if !store.conf.CacheEnabled() || !store.shouldCache(size) {
 			return
 		}
 		if _, ok := store.bcache.exist(key); ok {
 			return
 		}
-		p := NewOffPage(len(block))
-		copy(p.Data, block)
+		p := NewOffPage(size)
+		n := 0
+		for _, part := range parts {
+			n += copy(p.Data[n:], part)
+		}
 		store.bcache.cache(key, p, false, !store.conf.OSCache)
 		p.Release()
-		readTimeline("rt jfs span block cached key=%s", key)
+		if readTimelineOn {
+			readTimeline("rt jfs span block cached key=%s", key)
+		}
 	}
+	c.demand = store.demand.beginDemand
 	return c
 }

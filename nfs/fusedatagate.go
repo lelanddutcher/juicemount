@@ -131,7 +131,11 @@ func tryAdmitFUSEData(width int64) bool {
 // timed-out preads held the slots, and the macOS NFS client then backed off
 // 30 s. Background stays capped at half the class width counted against
 // everything in flight, so on a slow link at most 8 + 4 = 12 run at once, under
-// the base ceiling. On fast and medium links the class width is the base, and
+// the base ceiling. On a metered link the width is 2 and background may take
+// one slot only while nothing else runs, so at most 2 + 1 = 3 run at once
+// (before: 2 in all). That is intended: the 2026-11-11 lab measured every
+// demand-read refusal on a metered-classed link at 2 in flight with 1 of them
+// read-ahead. On fast and medium links the class width is the base, and
 // admission is exactly as before.
 func acquireFUSEData() (release func(), ok bool) {
 	if !fuseDataGateEnabled {
@@ -207,7 +211,9 @@ func releaseBackgroundFUSEData() {
 }
 
 // fuseDataGateDepth reports occupancy and the current ceiling, for /metrics and
-// for tests.
+// for tests. inUse counts foreground and background together, and the width
+// bounds foreground only (acquireFUSEData), so on slow and metered links inUse
+// may exceed width by the background share.
 func fuseDataGateDepth() (inUse int, width int) {
 	if !fuseDataGateEnabled {
 		return 0, 0

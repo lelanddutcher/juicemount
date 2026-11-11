@@ -1,6 +1,6 @@
 --- a/pkg/chunk/cached_store.go
 +++ b/pkg/chunk/cached_store.go
-@@ -157,20 +157,36 @@
+@@ -157,20 +157,40 @@
  	// ranged read on an encrypted volume, at any offset: its Get downloads
  	// and decrypts the whole object for any range, and the prefetch after a
  	// ranged read would download the block a second time.
@@ -18,7 +18,9 @@
  		if s.store.demand.piggyback(key, len(p)) { // JuiceMount: --demand-first
 +			pst := time.Now()
  			fullPage, err = s.store.group.TryPiggyback(key)
-+			readTimeline("rt jfs piggyback key=%s boff=%d len=%d joined=%v ms=%d err=%v", key, boff, len(p), fullPage != nil, time.Since(pst).Milliseconds(), err)
++			if readTimelineOn {
++				readTimeline("rt jfs piggyback key=%s boff=%d len=%d joined=%v ms=%d err=%v", key, boff, len(p), fullPage != nil, time.Since(pst).Milliseconds(), err)
++			}
  		}
  		if fullPage != nil {
  			defer fullPage.Release()
@@ -30,7 +32,9 @@
 +		if spans {
 +			sst := time.Now()
 +			got, started, ok := s.store.spans.read(key, boff, p, blockSize)
-+			readTimeline("rt jfs span read key=%s boff=%d len=%d started_parts=%d ms=%d ok=%v", key, boff, len(p), started, time.Since(sst).Milliseconds(), ok)
++			if readTimelineOn {
++				readTimeline("rt jfs span read key=%s boff=%d len=%d started_parts=%d ms=%d ok=%v", key, boff, len(p), started, time.Since(sst).Milliseconds(), ok)
++			}
 +			if ok {
 +				return got, nil
 +			}
@@ -39,7 +43,7 @@
  			}
  		}
  		// partial read
-@@ -181,9 +197,11 @@
+@@ -181,9 +201,11 @@
  		)
  		page.Acquire()
  		endDemand := s.store.demand.beginDemand(key)
@@ -51,15 +55,17 @@
  			if err == nil {
  				n, err = io.ReadFull(in, p)
  				_ = in.Close()
-@@ -192,6 +210,7 @@
+@@ -192,6 +214,9 @@
  		}, s.store.conf.GetTimeout)
  		used := time.Since(st)
  		endDemand()
-+		readTimeline("rt jfs ranged key=%s boff=%d len=%d first_byte_ms=%d ms=%d err=%v", key, boff, len(p), firstByte.Milliseconds(), used.Milliseconds(), err)
++		if readTimelineOn {
++			readTimeline("rt jfs ranged key=%s boff=%d len=%d first_byte_ms=%d ms=%d err=%v", key, boff, len(p), firstByte.Milliseconds(), used.Milliseconds(), err)
++		}
  		if err == nil {
  			s.store.demand.observeRanged(used, len(p))
  		}
-@@ -199,7 +218,9 @@
+@@ -199,7 +224,9 @@
  		s.store.objectDataBytes.WithLabelValues("GET", sc).Add(float64(n))
  		s.store.objectReqsHistogram.WithLabelValues("GET", sc).Observe(used.Seconds())
  		if err == nil {
@@ -70,7 +76,7 @@
  			return n, nil
  		} else {
  			s.store.objectReqErrors.Add(1)
-@@ -207,7 +228,10 @@
+@@ -207,7 +234,10 @@
  		}
  	}
  
@@ -81,15 +87,17 @@
  		tmp := page
  		if boff > 0 || len(p) < blockSize {
  			tmp = NewOffPage(blockSize)
-@@ -219,6 +243,7 @@
+@@ -219,6 +249,9 @@
  		endFull(err)
  		return tmp, err
  	})
-+	readTimeline("rt jfs full key=%s boff=%d len=%d own_load=%v ms=%d err=%v", key, boff, len(p), loaded, time.Since(fst).Milliseconds(), err)
++	if readTimelineOn {
++		readTimeline("rt jfs full key=%s boff=%d len=%d own_load=%v ms=%d err=%v", key, boff, len(p), loaded, time.Since(fst).Milliseconds(), err)
++	}
  	defer block.Release()
  	if err != nil {
  		return 0, err
-@@ -714,6 +739,7 @@
+@@ -714,6 +747,7 @@
  	endHour       int
  	compressor    compress.Compressor
  	seekable      bool
@@ -97,15 +105,17 @@
  	upLimit       *ratelimit.Bucket
  	downLimit     *ratelimit.Bucket
  
-@@ -770,6 +796,7 @@
+@@ -770,6 +804,9 @@
  		defer p.Release()
  		// it will be retried in the upper layer.
  		in, err = store.storage.Get(key, 0, -1, object.WithRequestID(&reqID), object.WithStorageClass(&sc))
-+		readTimeline("rt jfs get key=%s first_byte_ms=%d err=%v", key, time.Since(start).Milliseconds(), err)
++		if readTimelineOn {
++			readTimeline("rt jfs get key=%s first_byte_ms=%d err=%v", key, time.Since(start).Milliseconds(), err)
++		}
  		if err == nil {
  			n, err = io.ReadFull(in, p.Data)
  			_ = in.Close()
-@@ -866,6 +893,9 @@
+@@ -866,6 +903,9 @@
  		config.Prefetch = 0 // disable prefetch if cache is disabled
  	}
  	store.demand = newDemandFirst(config.DemandFirst, config.BlockSize)
@@ -115,24 +125,28 @@
  	store.fetcher = newPrefetcher(config.Prefetch, func(key string) { store.fillBlock(key, store.bcache) })
  
  	if store.conf.CacheDir != "memory" && store.conf.Writeback {
-@@ -992,7 +1022,8 @@
+@@ -992,7 +1032,10 @@
  	}
  	// --demand-first: let ranged demand reads of other blocks finish before
  	// this download shares the link with them, then check the cache again.
 -	if store.demand.waitIdle(key) > 0 {
 +	if waited := store.demand.waitIdle(key); waited > 0 {
-+		readTimeline("rt jfs prefetch deferred key=%s ms=%d", key, waited.Milliseconds())
++		if readTimelineOn {
++			readTimeline("rt jfs prefetch deferred key=%s ms=%d", key, waited.Milliseconds())
++		}
  		if _, ok := bcache.exist(key); ok {
  			return
  		}
-@@ -1012,8 +1043,10 @@
+@@ -1012,8 +1055,12 @@
  			}
  		}
  		endFull := store.demand.beginFull(key)
 +		pst := time.Now()
  		err := store.load(key, p, false, false) // delay writing cache until singleflight ends to prevent blocking waiters
  		endFull(err)
-+		readTimeline("rt jfs prefetch key=%s ms=%d err=%v", key, time.Since(pst).Milliseconds(), err)
++		if readTimelineOn {
++			readTimeline("rt jfs prefetch key=%s ms=%d err=%v", key, time.Since(pst).Milliseconds(), err)
++		}
  		return p, err
  	})
  	defer block.Release()

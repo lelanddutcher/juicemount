@@ -169,7 +169,9 @@ func (s *rSlice) ReadAt(ctx context.Context, page *Page, off int) (n int, err er
 		if s.store.demand.piggyback(key, len(p)) { // JuiceMount: --demand-first
 			pst := time.Now()
 			fullPage, err = s.store.group.TryPiggyback(key)
-			readTimeline("rt jfs piggyback key=%s boff=%d len=%d joined=%v ms=%d err=%v", key, boff, len(p), fullPage != nil, time.Since(pst).Milliseconds(), err)
+			if readTimelineOn {
+				readTimeline("rt jfs piggyback key=%s boff=%d len=%d joined=%v ms=%d err=%v", key, boff, len(p), fullPage != nil, time.Since(pst).Milliseconds(), err)
+			}
 		}
 		if fullPage != nil {
 			defer fullPage.Release()
@@ -181,7 +183,9 @@ func (s *rSlice) ReadAt(ctx context.Context, page *Page, off int) (n int, err er
 		if spans {
 			sst := time.Now()
 			got, started, ok := s.store.spans.read(key, boff, p, blockSize)
-			readTimeline("rt jfs span read key=%s boff=%d len=%d started_parts=%d ms=%d ok=%v", key, boff, len(p), started, time.Since(sst).Milliseconds(), ok)
+			if readTimelineOn {
+				readTimeline("rt jfs span read key=%s boff=%d len=%d started_parts=%d ms=%d ok=%v", key, boff, len(p), started, time.Since(sst).Milliseconds(), ok)
+			}
 			if ok {
 				return got, nil
 			}
@@ -210,7 +214,9 @@ func (s *rSlice) ReadAt(ctx context.Context, page *Page, off int) (n int, err er
 		}, s.store.conf.GetTimeout)
 		used := time.Since(st)
 		endDemand()
-		readTimeline("rt jfs ranged key=%s boff=%d len=%d first_byte_ms=%d ms=%d err=%v", key, boff, len(p), firstByte.Milliseconds(), used.Milliseconds(), err)
+		if readTimelineOn {
+			readTimeline("rt jfs ranged key=%s boff=%d len=%d first_byte_ms=%d ms=%d err=%v", key, boff, len(p), firstByte.Milliseconds(), used.Milliseconds(), err)
+		}
 		if err == nil {
 			s.store.demand.observeRanged(used, len(p))
 		}
@@ -243,7 +249,9 @@ func (s *rSlice) ReadAt(ctx context.Context, page *Page, off int) (n int, err er
 		endFull(err)
 		return tmp, err
 	})
-	readTimeline("rt jfs full key=%s boff=%d len=%d own_load=%v ms=%d err=%v", key, boff, len(p), loaded, time.Since(fst).Milliseconds(), err)
+	if readTimelineOn {
+		readTimeline("rt jfs full key=%s boff=%d len=%d own_load=%v ms=%d err=%v", key, boff, len(p), loaded, time.Since(fst).Milliseconds(), err)
+	}
 	defer block.Release()
 	if err != nil {
 		return 0, err
@@ -796,7 +804,9 @@ func (store *cachedStore) load(key string, page *Page, cache bool, forceCache bo
 		defer p.Release()
 		// it will be retried in the upper layer.
 		in, err = store.storage.Get(key, 0, -1, object.WithRequestID(&reqID), object.WithStorageClass(&sc))
-		readTimeline("rt jfs get key=%s first_byte_ms=%d err=%v", key, time.Since(start).Milliseconds(), err)
+		if readTimelineOn {
+			readTimeline("rt jfs get key=%s first_byte_ms=%d err=%v", key, time.Since(start).Milliseconds(), err)
+		}
 		if err == nil {
 			n, err = io.ReadFull(in, p.Data)
 			_ = in.Close()
@@ -1023,7 +1033,9 @@ func (store *cachedStore) fillBlock(key string, bcache CacheManager) {
 	// --demand-first: let ranged demand reads of other blocks finish before
 	// this download shares the link with them, then check the cache again.
 	if waited := store.demand.waitIdle(key); waited > 0 {
-		readTimeline("rt jfs prefetch deferred key=%s ms=%d", key, waited.Milliseconds())
+		if readTimelineOn {
+			readTimeline("rt jfs prefetch deferred key=%s ms=%d", key, waited.Milliseconds())
+		}
 		if _, ok := bcache.exist(key); ok {
 			return
 		}
@@ -1046,7 +1058,9 @@ func (store *cachedStore) fillBlock(key string, bcache CacheManager) {
 		pst := time.Now()
 		err := store.load(key, p, false, false) // delay writing cache until singleflight ends to prevent blocking waiters
 		endFull(err)
-		readTimeline("rt jfs prefetch key=%s ms=%d err=%v", key, time.Since(pst).Milliseconds(), err)
+		if readTimelineOn {
+			readTimeline("rt jfs prefetch key=%s ms=%d err=%v", key, time.Since(pst).Milliseconds(), err)
+		}
 		return p, err
 	})
 	defer block.Release()

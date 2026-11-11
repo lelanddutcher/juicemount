@@ -145,6 +145,8 @@ type ReadaheadManager struct {
 	// blockNS is the smoothed time of one read-ahead block read, scaled to
 	// a whole block (demand_first.go rule 4).
 	blockNS atomic.Int64
+	// blockAt is when blockNS last got a sample (unix nanoseconds).
+	blockAt atomic.Int64
 	// chunkWithHook makes readBlock read in pieces through prefetchReadAt
 	// too (tests of rule 5).
 	chunkWithHook bool
@@ -533,22 +535,54 @@ func (rm *ReadaheadManager) runRound(inode uint64, filePath string, maxWorkers i
 	return ran
 }
 
+// blockGate is the background data-gate slot a speculative block holds. A
+// block gives it back while it waits between pieces (rule 5) and takes one
+// again, without waiting, before the next piece.
+type blockGate struct {
+	release func()
+	acquire func() (func(), bool)
+}
+
+func (g *blockGate) drop() {
+	if g != nil && g.release != nil {
+		g.release()
+		g.release = nil
+	}
+}
+
 // readBlock reads one speculative block. With the demand-first rules on, it
-// reads in demandChunk pieces and waits for demand reads between them
-// (demand_first.go rule 5). A test hook, when set, gets the whole block
-// unless chunkWithHook is set.
-func (rm *ReadaheadManager) readBlock(fd *os.File, buf []byte, off int64) (int, error) {
+// reads in demandChunk pieces (demand_first.go rule 5). Between pieces it
+// gives its gate slot back, waits for demand reads (at most demandDeferMax,
+// whatever rule 4 says, and only while cancel reports false), then takes a
+// slot again without waiting. If cancel fires, the manager stops, or no slot
+// is free, the block ends early with errPrefetchStopped and the bytes read
+// so far. active is the time spent inside the reads only, for the link
+// estimate (the waits are not link time). A test hook, when set, gets the
+// whole block unless chunkWithHook is set. The caller drops g at the end.
+func (rm *ReadaheadManager) readBlock(fd *os.File, buf []byte, off int64, g *blockGate, cancel func() bool) (n int, active time.Duration, err error) {
 	if (rm.prefetchReadAt != nil && !rm.chunkWithHook) || !rm.demandFirstOn() || len(buf) <= demandChunk {
-		return rm.readPiece(fd, buf, off)
+		t0 := time.Now()
+		n, err = rm.readPiece(fd, buf, off)
+		return n, time.Since(t0), err
 	}
 	got := 0
 	for got < len(buf) {
 		if got > 0 {
 			// Rule 5: a demand read of this file would queue behind the
-			// next piece in macFUSE; let it go first.
-			rm.waitForDemand(nil)
-			if !rm.prefetchAllowed() {
-				return got, errPrefetchStopped
+			// next piece in macFUSE; let it go first, without holding a
+			// gate slot the drainer or a warmer could use meanwhile.
+			g.drop()
+			rm.waitForDemandUpTo(cancel, rm.pieceWaitMax())
+			if !rm.prefetchAllowed() || cancel != nil && cancel() {
+				return got, active, errPrefetchStopped
+			}
+			if g != nil && g.acquire != nil {
+				rel, ok := g.acquire()
+				if !ok {
+					metrics.Default().IncReadQoSPrefetchShed()
+					return got, active, errPrefetchStopped
+				}
+				g.release = rel
 			}
 		}
 		end := got + demandChunk
@@ -556,16 +590,27 @@ func (rm *ReadaheadManager) readBlock(fd *os.File, buf []byte, off int64) (int, 
 			end = len(buf)
 		}
 		start := got
-		n, err := rm.readPiece(fd, buf[start:end], off+int64(start))
-		got += n
-		if err != nil {
-			return got, err
+		t0 := time.Now()
+		pn, perr := rm.readPiece(fd, buf[start:end], off+int64(start))
+		active += time.Since(t0)
+		got += pn
+		if perr != nil {
+			return got, active, perr
 		}
-		if n < end-start {
-			return got, io.EOF // a short piece: the file ends here
+		if pn < end-start {
+			return got, active, io.EOF // a short piece: the file ends here
 		}
 	}
-	return got, nil
+	return got, active, nil
+}
+
+// pieceWaitMax bounds one wait between pieces: the rule 1 limit, never rule
+// 4's (a block that waited minutes would hold its mapping job and round).
+func (rm *ReadaheadManager) pieceWaitMax() time.Duration {
+	if rm.demandDefer > 0 {
+		return rm.demandDefer
+	}
+	return demandDeferMax
 }
 
 // readPiece issues one prefetch ReadAt through the test hook when set.
@@ -594,6 +639,7 @@ func (rm *ReadaheadManager) noteBlockRead(n int, dur time.Duration) {
 	}
 	if n > 0 && dur > 0 {
 		observeBlockEWMA(&rm.blockNS, time.Duration(int64(dur)*readaheadBlockSize/int64(n)))
+		rm.blockAt.Store(time.Now().UnixNano())
 	}
 }
 
@@ -612,9 +658,16 @@ func observeBlockEWMA(v *atomic.Int64, sample time.Duration) {
 }
 
 // blocksSlow is rule 4 of demand_first.go: a speculative block takes longer
-// than a demand read may wait for it.
+// than a demand read may wait for it. A block time older than
+// demandSlowWindow no longer counts: rule 4 gives a scrub no read-ahead, so
+// without the expiry a scrub-only reader would never sample the link again
+// after it recovered.
 func (rm *ReadaheadManager) blocksSlow() bool {
-	return time.Duration(rm.blockNS.Load()) > demandDeferMax || recentDemandJukebox()
+	if at := rm.blockAt.Load(); at != 0 && time.Since(time.Unix(0, at)) < demandSlowWindow &&
+		time.Duration(rm.blockNS.Load()) > demandDeferMax {
+		return true
+	}
+	return recentDemandJukebox()
 }
 
 // serialBlocks is the historical round: one 4 MB buffer, one ReadAt at a time
@@ -659,17 +712,20 @@ func (rm *ReadaheadManager) serialBlocks(fd *os.File, mapping *readaheadMappingJ
 			readTimeline("rt readahead block start", "path", fd.Name(), "offset", off, "kind", "serial")
 		}
 		t0 := time.Now()
-		n, err := rm.readBlock(fd, buf, off)
-		gateRelease()
+		g := &blockGate{release: gateRelease, acquire: tryAcquireFUSEDataBackground}
+		n, active, err := rm.readBlock(fd, buf, off, g, func() bool {
+			return !rm.effectivePolicy().Enabled || (mapping != nil && mapping.b.workCtx.Err() != nil)
+		})
+		g.drop()
 		if trace {
 			readTimeline("rt readahead block end", "path", fd.Name(), "offset", off, "kind", "serial",
-				"n", n, "ms", time.Since(t0).Milliseconds(), "err", errString(err))
+				"n", n, "ms", time.Since(t0).Milliseconds(), "read_ms", active.Milliseconds(), "err", errString(err))
 		}
 		if n > 0 {
 			if mapping != nil {
 				mapping.record(off, n)
 			}
-			rm.noteBlockRead(n, time.Since(t0))
+			rm.noteBlockRead(n, active)
 		}
 		if err != nil {
 			break // EOF or error
@@ -782,6 +838,12 @@ const demandWaitSlice = 50 * time.Millisecond
 // The wait ends early when cancel reports true or the manager stops; the
 // caller re-runs every claim check after it returns.
 func (rm *ReadaheadManager) waitForDemand(cancel func() bool) {
+	rm.waitForDemandUpTo(cancel, 0)
+}
+
+// waitForDemandUpTo is waitForDemand with its limit capped at limit (0: no
+// cap beyond rules 1 and 4).
+func (rm *ReadaheadManager) waitForDemandUpTo(cancel func() bool, limit time.Duration) {
 	if !rm.demandFirstOn() {
 		return
 	}
@@ -797,6 +859,9 @@ func (rm *ReadaheadManager) waitForDemand(cancel func() bool) {
 		// Rule 4: no time limit while blocks are slow; the cancel checks
 		// below still end the wait.
 		max = demandDeferSlow
+	}
+	if limit > 0 && max > limit {
+		max = limit
 	}
 	start := time.Now()
 	deadline := start.Add(max)
@@ -1009,7 +1074,7 @@ func (rm *ReadaheadManager) windowBlocks(inode uint64, tr *readTracker, gen uint
 			}
 			if ok {
 				inflight++
-				go rm.windowBlock(fd, off, gateRelease, done)
+				go rm.windowBlock(fd, off, gateRelease, done, rm.windowBlockCancel(inode, tr, off, mapping))
 				continue
 			}
 			// Gate full or past the end of file: give the block back so a
@@ -1048,9 +1113,25 @@ func (rm *ReadaheadManager) windowBlocks(inode uint64, tr *readTracker, gen uint
 	}
 }
 
-// windowBlock reads one aligned block while holding a background gate slot,
-// and releases the slot exactly once.
-func (rm *ReadaheadManager) windowBlock(fd *os.File, off int64, gateRelease func(), done chan<- windowResult) {
+// windowBlockCancel reports when a windowed block at off is no longer
+// wanted: the link left a ParallelFetch class, the binding is stopping, the
+// manager stopped, or the reader moved away (a seek resets the window, and a
+// reader past the block no longer needs it).
+func (rm *ReadaheadManager) windowBlockCancel(inode uint64, tr *readTracker, off int64, mapping *readaheadMappingJob) func() bool {
+	return func() bool {
+		if !rm.effectivePolicy().ParallelFetch || (mapping != nil && mapping.b.workCtx.Err() != nil) {
+			return true
+		}
+		rm.mu.Lock()
+		defer rm.mu.Unlock()
+		return rm.stopped || rm.trackers[inode] != tr || off >= tr.windowEnd || tr.lastOffset >= off+readaheadBlockSize
+	}
+}
+
+// windowBlock reads one aligned block while holding a background gate slot
+// (given back while it waits between pieces), and releases what it holds
+// exactly once.
+func (rm *ReadaheadManager) windowBlock(fd *os.File, off int64, gateRelease func(), done chan<- windowResult, cancel func() bool) {
 	if rm.afterPrefetchGate != nil {
 		rm.afterPrefetchGate()
 	}
@@ -1067,12 +1148,12 @@ func (rm *ReadaheadManager) windowBlock(fd *os.File, off int64, gateRelease func
 			"gate_total", total, "gate_background", bg, "demand_inflight", foregroundDemand.inflight())
 	}
 	t0 := time.Now()
-	n, err := rm.readBlock(fd, *bp, off)
-	dur := time.Since(t0)
-	gateRelease()
+	g := &blockGate{release: gateRelease, acquire: acquireWindowGate}
+	n, dur, err := rm.readBlock(fd, *bp, off, g, cancel)
+	g.drop()
 	if trace {
 		readTimeline("rt readahead block end", "path", fd.Name(), "offset", off, "kind", "window",
-			"n", n, "ms", dur.Milliseconds(), "err", errString(err))
+			"n", n, "ms", time.Since(t0).Milliseconds(), "read_ms", dur.Milliseconds(), "err", errString(err))
 	}
 	windowBufPool.Put(bp)
 	if err == nil && n < readaheadBlockSize {

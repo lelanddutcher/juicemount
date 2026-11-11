@@ -5867,8 +5867,8 @@ func boundedFUSEReadCall(read func([]byte, int64) (int, error), p []byte, off in
 		}
 		return 0, errFUSETimeout, false
 	}
-	if demand != nil && len(p) >= demandSlowPreadMin && !preadStart.IsZero() && time.Since(preadStart) > demandSlowPread {
-		noteDemandJukebox() // rule 4: a demand read this slow means blocks are slower still
+	if demand != nil && len(p) >= demandSlowPreadMin && time.Since(preadStart) > demandSlowPread {
+		noteDemandSlowPread() // rule 4: two in a minute find the link slow
 	}
 	if n > 0 {
 		copy(p, tmp[:n])

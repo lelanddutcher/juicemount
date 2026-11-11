@@ -1,8 +1,10 @@
 package nfs
 
 import (
+	"errors"
 	"io"
 	"os"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -23,9 +25,10 @@ func resetFUSEDataGateCounts() {
 // resetDemandJukebox clears rule 4's link-wide signal for this test.
 func resetDemandJukebox(t *testing.T) {
 	t.Helper()
-	prior := demandJukeboxAt.Load()
+	prior, priorSlow := demandJukeboxAt.Load(), demandSlowAt.Load()
 	demandJukeboxAt.Store(0)
-	t.Cleanup(func() { demandJukeboxAt.Store(prior) })
+	demandSlowAt.Store(0)
+	t.Cleanup(func() { demandJukeboxAt.Store(prior); demandSlowAt.Store(priorSlow) })
 }
 
 // On a slow link, with background holding all it may, foreground still gets
@@ -127,6 +130,7 @@ func TestSlowBlocksStopScrubReadahead(t *testing.T) {
 		t.Fatalf("fast blocks: scrub cap %d, want 1", got)
 	}
 	rm.blockNS.Store(int64(2 * demandDeferMax))
+	rm.blockAt.Store(time.Now().UnixNano())
 	if got := rm.windowStreamCapLocked(scrub, 3, true); got != 0 {
 		t.Fatalf("slow blocks: scrub cap %d, want 0", got)
 	}
@@ -135,6 +139,12 @@ func TestSlowBlocksStopScrubReadahead(t *testing.T) {
 	}
 	if got := rm.windowStreamCapLocked(scrub, 3, false); got != 3 {
 		t.Fatalf("rules off: cap %d, want the policy's 3", got)
+	}
+	// A slow block time older than demandSlowWindow no longer counts, so a
+	// scrub gets read-ahead again after the link recovers.
+	rm.blockAt.Store(time.Now().Add(-2 * demandSlowWindow).UnixNano())
+	if got := rm.windowStreamCapLocked(scrub, 3, true); got != 1 {
+		t.Fatalf("stale slow block time: scrub cap %d, want 1", got)
 	}
 	// A demand read that outlived its bound also marks blocks slow.
 	rm.blockNS.Store(0)
@@ -152,6 +162,7 @@ func TestSlowBlocksDeferHasNoTimeLimit(t *testing.T) {
 	rm := &ReadaheadManager{stopCh: make(chan struct{}), demand: newDemandGate(),
 		demandFirst: func() bool { return true }, demandDefer: 20 * time.Millisecond}
 	rm.blockNS.Store(int64(2 * demandDeferMax))
+	rm.blockAt.Store(time.Now().UnixNano())
 	end := rm.demand.begin()
 	done := make(chan time.Duration, 1)
 	go func() {
@@ -225,7 +236,7 @@ func TestReadaheadBlockYieldsToDemandBetweenPieces(t *testing.T) {
 	buf := make([]byte, readaheadBlockSize)
 	done := make(chan error, 1)
 	go func() {
-		n, err := rm.readBlock(nil, buf, 0)
+		n, _, err := rm.readBlock(nil, buf, 0, nil, nil)
 		if err == nil && n != len(buf) {
 			err = io.ErrShortBuffer
 		}
@@ -263,13 +274,14 @@ func TestReadaheadBlockIsOneReadWithoutDemandFirst(t *testing.T) {
 		calls++
 		return len(buf), nil
 	}
-	if n, err := rm.readBlock(nil, make([]byte, readaheadBlockSize), 0); err != nil || n != readaheadBlockSize || calls != 1 {
+	if n, _, err := rm.readBlock(nil, make([]byte, readaheadBlockSize), 0, nil, nil); err != nil || n != readaheadBlockSize || calls != 1 {
 		t.Fatalf("n=%d err=%v calls=%d, want one whole-block read", n, err, calls)
 	}
 }
 
-// Rule 4: a demand pread of 256 KiB that takes longer than demandSlowPread
-// marks blocks slow, as a JUKEBOX does; a short or fast one does not.
+// Rule 4: two demand preads of 256 KiB that take longer than demandSlowPread
+// within a minute mark blocks slow, as a JUKEBOX does; a short or fast one, or
+// a single slow one, does not.
 func TestSlowDemandPreadMarksBlocksSlow(t *testing.T) {
 	resetDemandJukebox(t)
 	resetFUSEDataGateCounts()
@@ -284,7 +296,161 @@ func TestSlowDemandPreadMarksBlocksSlow(t *testing.T) {
 		t.Fatal("a fast pread, or a slow small one, marked blocks slow")
 	}
 	boundedFUSEReadCall(slow(demandSlowPread+50*time.Millisecond), make([]byte, 256<<10), 0, 10*time.Second, gate, nil)
+	if recentDemandJukebox() {
+		t.Fatal("one slow 256 KiB demand pread marked blocks slow; two are needed")
+	}
+	boundedFUSEReadCall(slow(demandSlowPread+50*time.Millisecond), make([]byte, 256<<10), 0, 10*time.Second, gate, nil)
 	if !recentDemandJukebox() {
-		t.Fatal("a 256 KiB demand pread slower than demandSlowPread did not mark blocks slow")
+		t.Fatal("two slow 256 KiB demand preads did not mark blocks slow")
+	}
+}
+
+// piecesManager is a demand-first manager whose test hook reads in pieces.
+func piecesManager(t *testing.T, read func(*os.File, []byte, int64) (int, error)) *ReadaheadManager {
+	t.Helper()
+	resetDemandJukebox(t)
+	t.Setenv("JM_DEMAND_FIRST", "")
+	return &ReadaheadManager{stopCh: make(chan struct{}), demand: newDemandGate(),
+		demandFirst: func() bool { return true }, demandDefer: 5 * time.Second, chunkWithHook: true,
+		prefetchReadAt: read}
+}
+
+// Rule 5: while a block waits between pieces it holds no gate slot, so the
+// spool drainer's background slot is free even when read-ahead held the rest
+// of the background share; the block then takes a slot again.
+func TestReadaheadPieceWaitFreesItsGateSlot(t *testing.T) {
+	if !fuseDataGateEnabled {
+		t.Skip("gate disabled")
+	}
+	forceDefaultClass(t, netprofile.ClassSlow)
+	resetFUSEDataGateCounts()
+	t.Cleanup(resetFUSEDataGateCounts)
+	var held []func()
+	t.Cleanup(func() {
+		for _, r := range held {
+			r()
+		}
+	})
+	var endDemand func()
+	piece := make(chan int64, 8)
+	var rm *ReadaheadManager
+	rm = piecesManager(t, func(_ *os.File, buf []byte, off int64) (int, error) {
+		if off == 0 {
+			endDemand = rm.demand.begin()
+		}
+		piece <- off
+		return len(buf), nil
+	})
+	// Other blocks hold every background slot but one; this block takes it.
+	for i := int64(1); i < backgroundFUSEDataWidth(); i++ {
+		rel, ok := tryAcquireFUSEDataBackground()
+		if !ok {
+			t.Fatal("setup: no background slot")
+		}
+		held = append(held, rel)
+	}
+	rel, ok := tryAcquireFUSEDataBackground()
+	if !ok {
+		t.Fatal("setup: no slot for the block")
+	}
+	g := &blockGate{release: rel, acquire: tryAcquireFUSEDataBackground}
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := rm.readBlock(nil, make([]byte, readaheadBlockSize), 0, g, nil)
+		g.drop()
+		done <- err
+	}()
+	<-piece
+	waitUntil(t, "the block to give its slot back", func() bool {
+		return fuseBackgroundInFlight.Load() == backgroundFUSEDataWidth()-1
+	})
+	drain, ok := tryAcquireFUSEDataBackground()
+	if !ok {
+		t.Fatal("the drainer got no background slot while read-ahead waited between pieces")
+	}
+	drain()
+	endDemand()
+	if err := <-done; err != nil {
+		t.Fatalf("readBlock: %v", err)
+	}
+	if got := fuseBackgroundInFlight.Load(); got != backgroundFUSEDataWidth()-1 {
+		t.Fatalf("background in flight %d after the block, want %d (slot leaked or double-released)", got, backgroundFUSEDataWidth()-1)
+	}
+}
+
+// Rule 5 under rule 4: the wait between pieces stays capped (a block must
+// not hold its round and mapping job for minutes), and the time spent waiting
+// is not block time.
+func TestReadaheadPieceWaitIsCappedAndNotCounted(t *testing.T) {
+	var rm *ReadaheadManager
+	rm = piecesManager(t, func(_ *os.File, buf []byte, _ int64) (int, error) { return len(buf), nil })
+	rm.demandDefer = 60 * time.Millisecond
+	rm.blockNS.Store(int64(2 * demandDeferMax)) // rule 4 on
+	rm.blockAt.Store(time.Now().UnixNano())
+	end := rm.demand.begin()
+	defer end()
+	t0 := time.Now()
+	n, active, err := rm.readBlock(nil, make([]byte, readaheadBlockSize), 0, nil, nil)
+	if err != nil || n != readaheadBlockSize {
+		t.Fatalf("n=%d err=%v", n, err)
+	}
+	if took := time.Since(t0); took > 2*time.Second {
+		t.Fatalf("block took %v with a demand read in flight; each wait must stop at demandDefer", took)
+	}
+	if active > 50*time.Millisecond {
+		t.Fatalf("active time %v includes the waits between pieces", active)
+	}
+}
+
+// A block whose round no longer wants it (binding stopping, class change,
+// reader moved) ends at the next piece, with the bytes read so far.
+func TestReadaheadPieceWaitEndsOnCancel(t *testing.T) {
+	var rm *ReadaheadManager
+	rm = piecesManager(t, func(_ *os.File, buf []byte, _ int64) (int, error) { return len(buf), nil })
+	end := rm.demand.begin()
+	defer end()
+	var stopping atomic.Bool
+	go func() { time.Sleep(100 * time.Millisecond); stopping.Store(true) }()
+	t0 := time.Now()
+	n, _, err := rm.readBlock(nil, make([]byte, readaheadBlockSize), 0, nil, stopping.Load)
+	if !errors.Is(err, errPrefetchStopped) || n != demandChunk {
+		t.Fatalf("n=%d err=%v, want one piece and errPrefetchStopped", n, err)
+	}
+	if took := time.Since(t0); took > time.Second {
+		t.Fatalf("cancel took %v, want about one wait slice", took)
+	}
+}
+
+// The window's cancel: a seek away, a reader past the block, a class without
+// parallel fetch, or a stopping binding each end the block.
+func TestWindowBlockCancel(t *testing.T) {
+	pol := netprofile.ReadaheadPolicy{Enabled: true, ParallelFetch: true, Blocks: 6, Workers: 3}
+	rm := &ReadaheadManager{trackers: map[uint64]*readTracker{}, stopCh: make(chan struct{}),
+		policyOverride: func() netprofile.ReadaheadPolicy { return pol }}
+	tr := &readTracker{lastOffset: 0, windowEnd: 3 * readaheadBlockSize}
+	rm.trackers[9] = tr
+	off := int64(readaheadBlockSize)
+	cancel := rm.windowBlockCancel(9, tr, off, nil)
+	if cancel() {
+		t.Fatal("a wanted block was cancelled")
+	}
+	rm.mu.Lock()
+	tr.windowEnd = 0 // a seek reset the window
+	rm.mu.Unlock()
+	if !cancel() {
+		t.Fatal("a block was kept after a seek reset the window")
+	}
+	rm.mu.Lock()
+	tr.windowEnd, tr.lastOffset = 3*readaheadBlockSize, 2*readaheadBlockSize // reader passed it
+	rm.mu.Unlock()
+	if !cancel() {
+		t.Fatal("a block the reader already passed was kept")
+	}
+	rm.mu.Lock()
+	tr.lastOffset = 0
+	rm.mu.Unlock()
+	pol.ParallelFetch = false // the link became metered
+	if !cancel() {
+		t.Fatal("a windowed block was kept after the class left parallel fetch")
 	}
 }

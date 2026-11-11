@@ -191,7 +191,11 @@ func TestJMSpanWholeBlockGoesToDiskCacheOnce(t *testing.T) {
 	c, f := newSpanTest(bs)
 	var got [][]byte
 	var mu sync.Mutex
-	c.whole = func(key string, block []byte) {
+	c.whole = func(key string, parts [][]byte, size int) {
+		block := bytes.Join(parts, nil)
+		if len(block) != size {
+			t.Errorf("whole: %d bytes, size %d", len(block), size)
+		}
 		mu.Lock()
 		got = append(got, block)
 		mu.Unlock()
@@ -274,5 +278,73 @@ func TestJMSpanStoreScrubJumpAndSequentialBlock(t *testing.T) {
 	}
 	if n := d.ranged.Load(); n != jumpParts+int32(bs/spanPartSize) {
 		t.Fatalf("ranged GETs %d, want %d", n, jumpParts+int32(bs/spanPartSize))
+	}
+}
+
+// Only the parts a read waits for count as demand reads (patch 0020's
+// signal); the rest of the span is fetched without being counted.
+func TestJMSpanDemandCountsOnlyAwaitedParts(t *testing.T) {
+	const bs = 4 << 20
+	c, f := newSpanTest(bs)
+	f.gate = make(chan struct{})
+	var mu sync.Mutex
+	counted := map[string]int{}
+	inflight := 0
+	c.demand = func(key string) func() {
+		mu.Lock()
+		counted[key]++
+		inflight++
+		mu.Unlock()
+		return func() { mu.Lock(); inflight--; mu.Unlock() }
+	}
+	done := make(chan bool)
+	go func() {
+		_, _, ok := c.read("k", 0, make([]byte, 128<<10), bs)
+		done <- ok
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for f.running.Load() < 4 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	mu.Lock()
+	if inflight != 1 || counted["k"] != 1 {
+		mu.Unlock()
+		t.Fatalf("demand in flight %d (counted %d) while 4 parts run, want 1: only the awaited part", inflight, counted["k"])
+	}
+	mu.Unlock()
+	close(f.gate)
+	if !<-done {
+		t.Fatal("read failed")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if inflight != 0 {
+		t.Fatalf("demand left in flight: %d", inflight)
+	}
+	// A read served from a finished part is not counted.
+	if _, _, ok := c.read("k", 256<<10, make([]byte, 128<<10), bs); !ok || counted["k"] != 1 {
+		t.Fatalf("a hit counted as a demand read (count %d)", counted["k"])
+	}
+}
+
+// Finished parts are dropped after ttl even when no read comes.
+func TestJMSpanSweepWithoutReads(t *testing.T) {
+	const bs = 4 << 20
+	f := &spanFake{block: spanBlock(bs), fail: map[int]bool{}}
+	c := newSpanCache(spanMemMax, 30*time.Millisecond)
+	c.fetch = f.fetch
+	c.read("k", 0, make([]byte, 128<<10), bs)
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		c.mu.Lock()
+		kept, parts := c.bytes, len(c.parts)
+		c.mu.Unlock()
+		if kept == 0 && parts == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%d bytes in %d keys still kept after the ttl with no reads", kept, parts)
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }

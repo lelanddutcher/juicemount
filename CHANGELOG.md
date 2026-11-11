@@ -21,14 +21,16 @@
     on a slow link both shared one limit of 8 concurrent file reads, so a
     read the editor waited for could be refused while read-ahead held the
     slots. macOS then waited up to 30 s before it asked again.
-  - When read-ahead blocks take longer than 8 s, or a read the editor waits
-    for takes over 2 s for 256 KiB (for example 200 ms delay and 1% loss
-    without server BBR), a scrub gets no read-ahead for a minute, and
-    read-ahead waits until the reads the editor waits for have finished. A retry of a
+  - When read-ahead blocks take longer than 8 s, or two reads the editor
+    waits for take over 3 s for 256 KiB within a minute (for example 200 ms
+    delay and 1% loss without server BBR), a scrub gets no read-ahead for a
+    minute, and read-ahead waits until the reads the editor waits for have
+    finished. A retry of a
     read that is still in progress joins it for up to 150 s (before: 24 s),
     instead of starting a second read of the same bytes.
   - Read-ahead reads a block in 1 MiB pieces and lets the editor's reads go
-    first between pieces. macOS runs one read of a file at a time, so before,
+    first between pieces, for at most 8 s each time, and without holding a
+    file-read slot while it waits. macOS runs one read of a file at a time, so before,
     a jump in a clip could wait 5 to 6 s behind a 4 MiB read-ahead of that
     same clip.
 - `JM_READ_TIMELINE=1` (a lab switch) logs every step of each read: the NFS

@@ -267,7 +267,7 @@
       "upstream_sha256": "6ab77a5713c65761e6227fcfe622031258875afb095ef04d873ae00ce8193e31"
     },
     "pkg/chunk/cached_store.go": {
-      "sha256": "aac6252fe47e08faa95ad4546339823540cf6e8bb82e0198ebf1e761e98a9d86",
+      "sha256": "ed6af4010840e7873a2d1075e9819cf3167aad1c7c250860530c1551149d6e38",
       "upstream_sha256": "9f7a408ad17392705751c58e4e56767ad4ba8db4b0d60bffbd32844ebf496d1a"
     },
     "pkg/chunk/cached_store_test.go": {
@@ -1111,8 +1111,8 @@
     "cmd/jm_fence.go": "11959cce13a1e10985fed61e172cff969bd04c1d8200ab79e723d611b9210b33",
     "pkg/chunk/demand_first.go": "ad4589aefcfdced76b6d466a4bce0119ef8d0bcf6149e8c66ab5654789a227b0",
     "pkg/chunk/demand_first_test.go": "7ed56d3b9ae0b73535c18b563a7206618c24b39f0ff699ab90e81833b316b0b4",
-    "pkg/chunk/demand_spans.go": "e64c45b6d780cc72588409cab9a283239b1ab9fd10a8ae67cf69bf743462db62",
-    "pkg/chunk/demand_spans_test.go": "b00bf277e79bb372ec6530d1c3675dce9e7d78ad6c3f1803fbd1153e6fa18b05",
+    "pkg/chunk/demand_spans.go": "d794addcdd568eabdad2447d5214b9c9d3a52a9fbc9b3e11294c7cd284b5f9a1",
+    "pkg/chunk/demand_spans_test.go": "acf912c487dbc4f583cb09adf95e610d7287ae39423d6977a761d9a8ea4c6a8c",
     "pkg/chunk/ranged_first_read_test.go": "0b2c6bfdd311a2824e650b4fd3f019199c1a9b2caa64993eacfbbd81dab77ac9",
     "pkg/chunk/upload_cache_ownership_test.go": "ebb66944296ae43b5579e12a8688d5a4c03e9ef8eecb61107d0ef0427429d791",
     "pkg/fuse/rename_flags_darwin.go": "37e49f30f2017a7ea05d47154cedaf6a90ecdab24d3c5d3639af53b4de6d6abd",
@@ -1170,7 +1170,7 @@
     "patches/0018-ranged-first-read.patch": "100a019fa68c2996b8af5c663b8670343d88cf63d936871bb6a302e2833f4d98",
     "patches/0019-batched-watch-round-trips.patch": "7ce67985994a8ec4618b0f13b88fb919ca8bf9ed45df60cea098cc0e74fc7be3",
     "patches/0020-demand-read-first.patch": "c5618d3eed3a4d549b8a793c8f31228815c735f17c9ea2616bdccdd7d57e78fa",
-    "patches/0021-demand-read-spans.patch": "5759e3d3d9103535d753aee27fe074647392dc4d424e104fb8d0cd7c690283c2"
+    "patches/0021-demand-read-spans.patch": "aa759bc70f09bf10c96412b0b260dcf530d25b1aef02ec75dbd36e565aaf963b"
   },
   "scope": "All pkg/ and cmd/ files plus main.go, LICENSE, go.mod and go.sum from the verified module ZIP. Documentation, integration tests and SDK examples are not included. local_files are JuiceMount-owned source with no upstream counterpart.",
   "upstream_url": "https://github.com/juicedata/juicefs/tree/v1.3.1",

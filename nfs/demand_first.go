@@ -38,17 +38,20 @@ import (
 //  4. Slow blocks (2026-11-11 laptop lab, 1% loss and cubic: a block took
 //     46-60 s, so every read outlived the 8 s defer and read-ahead always
 //     started). While the smoothed read-ahead block time is above
-//     demandDeferMax, or a demand read timed out or took longer than
-//     demandSlowPread in the last minute, a stream that has not yet read a
-//     whole block sequentially (a scrub) gets no speculative block, and the
-//     defer has no time limit: a block waits until the demand reads end.
+//     demandDeferMax in the last minute, or a demand read timed out or two
+//     took longer than demandSlowPread in the last minute, a stream that has
+//     not yet read a whole block sequentially (a scrub) gets no speculative
+//     block, and the defer before a block has no time limit. The wait between
+//     the pieces of a block (rule 5) stays capped at demandDeferMax.
 //  5. Pieces (2026-11-11 laptop lab, server BBR). macFUSE runs one read of
 //     a file at a time, so a demand read of a file waited behind a whole
 //     4 MiB read-ahead pread of that file (5-6 s) even with free data
-//     slots. A speculative block is read in demandChunk pieces, and before
-//     each piece after the first it waits for demand reads (rule 1, or
-//     rule 4 when blocks are slow). A demand read then waits for at most
-//     one piece.
+//     slots. A speculative block is read in demandChunk pieces. Before each
+//     piece after the first it gives its gate slot back, waits for demand
+//     reads (at most demandDeferMax, and only while the round still wants
+//     the block), then takes a slot again without waiting or ends early.
+//     Only the time inside the reads counts as block time. A demand read
+//     then waits for at most one piece.
 //
 // The JUKEBOX bound itself (fuseReadTimeout, 8 s on slow links) stays. What
 // changes is the retry: a retry of a pread that is still running joins it
@@ -64,28 +67,42 @@ const demandChunk = 1 << 20
 // waits until the demand reads end (the cancel checks still apply).
 const demandDeferSlow = 10 * time.Minute
 
-// demandJukeboxAt is when a demand read last outlived its FUSE bound (unix
-// nanoseconds, 0 = never).
+// demandJukeboxAt is when the link was last found slow for rule 4 (unix
+// nanoseconds, 0 = never): a demand read outlived its FUSE bound, or two
+// demand reads in a row were slow (demandSlowPread).
 var demandJukeboxAt atomic.Int64
 
-// demandJukeboxWindow: rule 4 holds for this long after a demand read
-// timed out.
-const demandJukeboxWindow = time.Minute
+// demandSlowWindow: rule 4 holds for this long after the link was found
+// slow, and a read-ahead block time older than this no longer counts.
+const demandSlowWindow = time.Minute
 
 // demandSlowPread: a demand pread of at least demandSlowPreadMin bytes that
-// takes longer than this also counts for rule 4. 256 KiB in 2 s is about
-// 1 Mbit/s, so a 4 MiB block would take over 30 s. (Lab, 1% loss and cubic:
-// a span round took 2-4 s, and rule 4 waited for a whole slow block.)
+// takes longer than this, timed inside the pread (not the gate wait), is
+// slow; two slow ones within demandSlowWindow find the link slow. Lab
+// (2026-11-11, 200 ms RTT): with server BBR no 256 KiB demand pread took
+// over 2.4 s (scrub at most 1.6 s); with 1% loss and cubic they took 3-14 s.
 const (
-	demandSlowPread    = 2 * time.Second
+	demandSlowPread    = 3 * time.Second
 	demandSlowPreadMin = 256 << 10
 )
 
+// demandSlowAt is when the last slow demand pread ended (unix nanoseconds).
+var demandSlowAt atomic.Int64
+
 func noteDemandJukebox() { demandJukeboxAt.Store(time.Now().UnixNano()) }
+
+// noteDemandSlowPread records one slow demand pread; the second within
+// demandSlowWindow finds the link slow.
+func noteDemandSlowPread() {
+	now := time.Now().UnixNano()
+	if prev := demandSlowAt.Swap(now); prev != 0 && time.Duration(now-prev) < demandSlowWindow {
+		noteDemandJukebox()
+	}
+}
 
 func recentDemandJukebox() bool {
 	at := demandJukeboxAt.Load()
-	return at != 0 && time.Since(time.Unix(0, at)) < demandJukeboxWindow
+	return at != 0 && time.Since(time.Unix(0, at)) < demandSlowWindow
 }
 
 // demandDeferMax bounds how long one read-ahead block waits for demand reads.
