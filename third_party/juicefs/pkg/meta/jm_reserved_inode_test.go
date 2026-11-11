@@ -13,6 +13,7 @@ type jmFolderInodeMeta interface {
 	Meta
 	JMReserveInodes(n uint32) (Ino, uint32, syscall.Errno)
 	JMMkdirInode(ctx Context, parent Ino, name string, mode, cumask uint16, ino Ino, attr *Attr) syscall.Errno
+	JMReleaseInodes(first Ino, n uint32) (uint32, syscall.Errno)
 }
 
 func newJMTestMeta(t *testing.T) jmFolderInodeMeta {
@@ -123,5 +124,27 @@ func TestJMReserveInodesBounds(t *testing.T) {
 	b, _, st2 := m.JMReserveInodes(16)
 	if st != 0 || st2 != 0 || b < a+Ino(n) {
 		t.Fatalf("ranges overlap: %d+%d then %d (%s %s)", a, n, b, st, st2)
+	}
+}
+
+func TestJMReleaseInodesGivesBackUnusedNumbers(t *testing.T) {
+	m := newJMTestMeta(t)
+	first, n, st := m.JMReserveInodes(8)
+	if st != 0 || n != 8 {
+		t.Fatalf("reserve: %d %d %v", first, n, st)
+	}
+	var attr Attr
+	if st := m.JMMkdirInode(Background(), RootInode, "used", 0755, 022, first, &attr); st != 0 {
+		t.Fatalf("mkdir: %v", st)
+	}
+	released, st := m.JMReleaseInodes(first, 8)
+	if st != 0 || released != 7 {
+		t.Fatalf("released %d %v, want the 7 unused", released, st)
+	}
+	if released, _ := m.JMReleaseInodes(first, 8); released != 0 {
+		t.Fatalf("released %d numbers twice", released)
+	}
+	if st := m.JMMkdirInode(Background(), RootInode, "late", 0755, 022, first+1, &attr); st != syscall.ESRCH {
+		t.Fatalf("mkdir with a released number: %v, want ESRCH", st)
 	}
 }

@@ -31,7 +31,7 @@
  		inode = &ino
 --- a/pkg/meta/interface.go
 +++ b/pkg/meta/interface.go
-@@ -57,6 +57,10 @@
+@@ -57,6 +57,12 @@
  	OpSummary = 1007
  	// CompactPath is a message to trigger compact
  	CompactPath = 1008
@@ -39,12 +39,14 @@
 +	JMReserveInodes = 1101
 +	// JMMkdirInode creates a directory with a reserved inode number (JuiceMount).
 +	JMMkdirInode = 1102
++	// JMReleaseInodes gives back unused reserved numbers (JuiceMount).
++	JMReleaseInodes = 1103
  )
  
  const (
 --- a/pkg/vfs/internal.go
 +++ b/pkg/vfs/internal.go
-@@ -294,6 +294,13 @@
+@@ -294,6 +294,14 @@
  	ChunkIndex     uint64
  	Key            string
  	Size, Off, Len uint32
@@ -55,10 +57,11 @@
 +type jmFolderInodes interface {
 +	JMReserveInodes(n uint32) (meta.Ino, uint32, syscall.Errno)
 +	JMMkdirInode(ctx meta.Context, parent meta.Ino, name string, mode, cumask uint16, ino meta.Ino, attr *meta.Attr) syscall.Errno
++	JMReleaseInodes(first meta.Ino, n uint32) (uint32, syscall.Errno)
  }
  
  func (v *VFS) handleInternalMsg(ctx meta.Context, cmd uint32, r *utils.Buffer, out io.Writer) {
-@@ -519,6 +526,39 @@
+@@ -519,6 +527,52 @@
  		w.Put32(uint32(len(data)))
  		w.Put(data)
  		_, _ = out.Write(w.Bytes())
@@ -75,6 +78,19 @@
 +		w.Put8(uint8(eno))
 +		w.Put64(uint64(first))
 +		w.Put32(count)
++		_, _ = out.Write(w.Bytes())
++	case meta.JMReleaseInodes:
++		// JuiceMount patch 0022. Reply: errno (1 byte), released count (4).
++		first := Ino(r.Get64())
++		n := r.Get32()
++		var released uint32
++		eno := syscall.ENOTSUP
++		if jm, ok := v.Meta.(jmFolderInodes); ok {
++			released, eno = jm.JMReleaseInodes(first, n)
++		}
++		w := utils.NewBuffer(1 + 4)
++		w.Put8(uint8(eno))
++		w.Put32(released)
 +		_, _ = out.Write(w.Bytes())
 +	case meta.JMMkdirInode:
 +		// JuiceMount patch 0022. Reply: errno (1 byte).

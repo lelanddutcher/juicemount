@@ -21,6 +21,7 @@ import (
 const (
 	jfsMsgReserveInodes = 1101
 	jfsMsgMkdirInode    = 1102
+	jfsMsgReleaseInodes = 1103
 )
 
 // errControlUnsupported reports a juicefs that does not know the messages.
@@ -44,6 +45,10 @@ func newJFSControl(root string) *jfsControl {
 }
 
 func (c *jfsControl) exchange(msg []byte, replyLen int) ([]byte, error) {
+	return c.exchangeWithin(msg, replyLen, c.replyTimeout)
+}
+
+func (c *jfsControl) exchangeWithin(msg []byte, replyLen int, timeout time.Duration) ([]byte, error) {
 	if c.testExchange != nil {
 		return c.testExchange(msg, replyLen)
 	}
@@ -69,7 +74,7 @@ func (c *jfsControl) exchange(msg []byte, replyLen int) ([]byte, error) {
 	}
 	reply := make([]byte, 0, replyLen)
 	buf := make([]byte, replyLen)
-	deadline := time.Now().Add(c.replyTimeout)
+	deadline := time.Now().Add(timeout)
 	wait := time.Millisecond
 	for len(reply) < replyLen {
 		n, err := f.Read(buf[:replyLen-len(reply)])
@@ -81,7 +86,7 @@ func (c *jfsControl) exchange(msg []byte, replyLen int) ([]byte, error) {
 			return nil, err
 		}
 		if time.Now().After(deadline) {
-			return nil, fmt.Errorf("juicefs control: no reply after %s", c.replyTimeout)
+			return nil, fmt.Errorf("juicefs control: no reply after %s", timeout)
 		}
 		// The reply is written when the transaction ends; poll briefly.
 		time.Sleep(wait)
@@ -122,6 +127,23 @@ func (c *jfsControl) reserveInodes(n uint32) (first uint64, count uint32, err er
 		return 0, 0, err
 	}
 	return binary.BigEndian.Uint64(reply[1:9]), binary.BigEndian.Uint32(reply[9:13]), nil
+}
+
+// releaseInodes gives back reserved numbers first..first+n-1 that were not
+// used. It returns how many juicefs still held: 0 means it does not know them
+// (it restarted since it reserved them).
+func (c *jfsControl) releaseInodes(first uint64, n uint32, timeout time.Duration) (uint32, error) {
+	msg := controlHeader(jfsMsgReleaseInodes, 12)
+	msg = binary.BigEndian.AppendUint64(msg, first)
+	msg = binary.BigEndian.AppendUint32(msg, n)
+	reply, err := c.exchangeWithin(msg, 5, timeout)
+	if err != nil {
+		return 0, err
+	}
+	if err := controlErrno(reply[0]); err != nil {
+		return 0, err
+	}
+	return binary.BigEndian.Uint32(reply[1:5]), nil
 }
 
 // mkdirInode creates name in the folder with inode parent, using a number

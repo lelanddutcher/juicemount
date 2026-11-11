@@ -12,6 +12,22 @@
     "error": { "type": "string", "description": "Present when disabled or on SQL error." },
     "pending_files": { "type": "integer", "minimum": 0 },
     "pending_symlinks": { "type": "integer", "minimum": 0 },
+    "drain_paused": { "type": "string", "description": "Set while the mount check has kept the drainer parked for over 2 minutes; saved files stay on this Mac until it answers." },
+    "pending_folders": { "type": "integer", "minimum": 0, "description": "Folders created by MKDIR that are not on the server yet." },
+    "folder_conflicts": {
+      "type": "array",
+      "description": "Newest first, at most 20: pending folders renamed to a conflict name because the server had a file with their name.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "conflict_path", "at_unix"],
+        "properties": {
+          "path": { "type": "string" },
+          "conflict_path": { "type": "string" },
+          "at_unix": { "type": "integer" }
+        }
+      }
+    },
     "pending_bytes": { "type": "integer", "minimum": 0 },
     "in_progress": { "type": "integer", "minimum": 0 },
     "succeeded": { "type": "integer", "minimum": 0 },

@@ -2102,11 +2102,19 @@ func (s *SpoolStore) MigrateForRename(oldPath, newPath string) (int, bool, error
 	if s.hasPendingBoundContinuationUnder(oldPath, newPath) {
 		return 0, false, &metadata.PendingSpoolContinuation{Cause: metadata.ErrSpoolContinuationConflict}
 	}
+	// Pending folders move in the same SQLite transaction as the rows; hold
+	// the in-memory set across it so no reader sees one without the other.
+	s.dirs.mu.Lock()
+	defer s.dirs.mu.Unlock()
+	if _, err := s.pendingDirsLocked(); err != nil {
+		return 0, false, err
+	}
 
 	migs, err := s.meta.MigrateActivePathsWithBase(oldPath, newPath, resolve)
 	if err != nil {
 		return 0, false, err
 	}
+	s.movePendingDirsInMemoryLocked(oldPath, newPath)
 	requeued := false
 	for _, m := range migs {
 		s.clearReadFault(m.OldPath, m.OldID)

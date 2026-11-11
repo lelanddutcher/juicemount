@@ -223,6 +223,46 @@ func TestDrainFUSESlotGivesWaitingMediaDrainTheNextSlot(t *testing.T) {
 	}
 }
 
+// M3: small drains yield to a waiting media drain only while media holds
+// fewer than half the background slots. Small saves keep moving.
+func TestDrainFUSESlotSmallKeepsHalfWhileMediaWaits(t *testing.T) {
+	restore := forceNetClassForTest(t, netprofile.ClassSlow)
+	defer restore()
+	d := &Drainer{stop: make(chan struct{})}
+	defer close(d.stop)
+	bg := int(backgroundFUSEDataWidth())
+	if bg < 2 {
+		t.Skipf("background width %d", bg)
+	}
+	var held []func()
+	for i := 0; i < bg/2; i++ { // media takes its half
+		release, ok := d.acquireDrainFUSESlotFor(false)
+		if !ok {
+			t.Fatal("media drain not admitted")
+		}
+		held = append(held, release)
+	}
+	d.mediaGateWaiters.Add(1) // one more media drain waits
+	defer d.mediaGateWaiters.Add(-1)
+	got := make(chan func(), 1)
+	go func() {
+		release, _ := d.acquireDrainFUSESlotFor(true)
+		got <- release
+	}()
+	select {
+	case r := <-got:
+		r()
+	case <-time.After(5 * time.Second):
+		t.Fatal("small drain starved while media already held half the slots")
+	}
+	for _, r := range held {
+		r()
+	}
+	if n := d.mediaGateHeld.Load(); n != 0 {
+		t.Fatalf("media slots still counted: %d", n)
+	}
+}
+
 func equalIntSlices(a, b []int) bool {
 	if len(a) != len(b) {
 		return false

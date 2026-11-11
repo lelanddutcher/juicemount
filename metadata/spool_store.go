@@ -747,6 +747,12 @@ func (s *SpoolStore) MigrateActivePathsWithBase(oldPath, newPath string, resolve
 		}
 		out = append(out, m)
 	}
+	// Pending folders move in the same transaction as the files inside them:
+	// a drain must never see a file at its new path without its pending
+	// folder, or it would create that folder with a new inode.
+	if _, err := movePendingDirsTx(tx, oldPath, newPath); err != nil {
+		return nil, err
+	}
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("spool migrate-paths commit: %w", err)
 	}
@@ -1121,6 +1127,10 @@ func (s *SpoolStore) ListReadyIncludingWaiting(limit int) ([]*SpoolRow, error) {
 	return s.listReady(limit, true)
 }
 
+// Rows inside a folder that is not on the volume yet (pending_dirs) are
+// excluded: they wait for the folder, and must not fill the page that
+// unrelated saves are listed from.
+//
 // Rows held as copied from another Mac are excluded from both, always: unlike
 // a project wait, nothing releases them but an explicit decision
 // (ReleaseCloneHeld / DeleteCloneHeld).
@@ -1157,7 +1167,8 @@ func (s *SpoolStore) listReadyLarger(limit int, includeWaiting bool, minSize int
 	rows, err := s.db.Query(
 		`SELECT id, nfs_path, spool_file, size, sha256, drain_state, drain_attempts, last_error, suspect_zero_tail, punched_end, created_at, updated_at, pause_since_ns, retry_after_ns, qualification_hold, retired_by
 			 FROM spool_entries WHERE drain_state=? AND punched_end=0 AND clone_hold='' AND qualification_hold='' AND retired_by=0 AND replacement_witness IS NULL AND retry_after_ns<=?
-			 AND NOT EXISTS (SELECT 1 FROM spool_entries newer WHERE newer.nfs_path=spool_entries.nfs_path AND newer.id>spool_entries.id AND newer.retired_by=0)`+waitClause+sizeClause+` ORDER BY created_at ASC LIMIT ?`,
+			 AND NOT EXISTS (SELECT 1 FROM spool_entries newer WHERE newer.nfs_path=spool_entries.nfs_path AND newer.id>spool_entries.id AND newer.retired_by=0)
+			 AND NOT EXISTS (SELECT 1 FROM pending_dirs pd WHERE substr(ltrim(spool_entries.nfs_path, '/'), 1, length(pd.dir_path)+1) = pd.dir_path || '/')`+waitClause+sizeClause+` ORDER BY created_at ASC LIMIT ?`,
 		args...,
 	)
 	if err != nil {

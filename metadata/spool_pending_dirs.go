@@ -33,9 +33,11 @@ func (s *SpoolStore) PutPendingDir(dirPath string, inode uint64) (int64, error) 
 	return res.LastInsertId()
 }
 
-// ListPendingDirs returns every pending folder, oldest first. A folder's row
-// is always older than the rows of folders created inside it, and a rename
-// keeps each row's id, so this order creates parents before children.
+// ListPendingDirs returns every pending folder in row id order. That order
+// does NOT put parents first: a rename keeps ids, so a folder moved into a
+// newer one is older than its new parent. Callers order by path
+// (Drainer.materializePendingDirs works in waves of folders whose ancestors
+// are not pending).
 func (s *SpoolStore) ListPendingDirs() ([]PendingDir, error) {
 	rows, err := s.db.Query(`SELECT id, dir_path, inode, created_at FROM pending_dirs ORDER BY id ASC`)
 	if err != nil {
@@ -87,6 +89,21 @@ func (s *SpoolStore) MovePendingDirs(oldPath, newPath string) (int, error) {
 		return 0, err
 	}
 	defer func() { _ = tx.Rollback() }()
+	n, err := movePendingDirsTx(tx, oldPath, newPath)
+	if err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
+// movePendingDirsTx is MovePendingDirs inside the caller's transaction.
+func movePendingDirsTx(tx *sql.Tx, oldPath, newPath string) (int, error) {
+	if oldPath == newPath {
+		return 0, nil
+	}
 	rows, err := tx.Query(`SELECT id, dir_path FROM pending_dirs`)
 	if err != nil {
 		return 0, err
@@ -96,18 +113,17 @@ func (s *SpoolStore) MovePendingDirs(oldPath, newPath string) (int, error) {
 		path string
 	}
 	var moves []move
+	conflict := false
 	for rows.Next() {
 		var m move
 		if err := rows.Scan(&m.id, &m.path); err != nil {
 			rows.Close()
 			return 0, err
 		}
-		if PathAtOrUnder(m.path, newPath) {
-			rows.Close()
-			return 0, ErrPendingDirConflict
-		}
 		if PathAtOrUnder(m.path, oldPath) {
 			moves = append(moves, m)
+		} else if PathAtOrUnder(m.path, newPath) {
+			conflict = true
 		}
 	}
 	if err := rows.Err(); err != nil {
@@ -115,14 +131,17 @@ func (s *SpoolStore) MovePendingDirs(oldPath, newPath string) (int, error) {
 		return 0, err
 	}
 	rows.Close()
+	if len(moves) == 0 {
+		return 0, nil
+	}
+	if conflict {
+		return 0, ErrPendingDirConflict
+	}
 	for _, m := range moves {
 		if _, err := tx.Exec(`UPDATE pending_dirs SET dir_path=? WHERE id=?`,
 			newPath+m.path[len(oldPath):], m.id); err != nil {
 			return 0, fmt.Errorf("move pending folder %q -> %q: %w", oldPath, newPath, err)
 		}
-	}
-	if err := tx.Commit(); err != nil {
-		return 0, err
 	}
 	return len(moves), nil
 }
@@ -130,6 +149,47 @@ func (s *SpoolStore) MovePendingDirs(oldPath, newPath string) (int, error) {
 // PathAtOrUnder reports whether p is dir or a path beneath it.
 func PathAtOrUnder(p, dir string) bool {
 	return p == dir || strings.HasPrefix(p, dir+"/")
+}
+
+// FolderConflict is one pending folder renamed to a conflict name because
+// the volume had a file with its name.
+type FolderConflict struct {
+	OriginalPath string
+	ConflictPath string
+	CreatedAt    time.Time
+}
+
+// RecordFolderConflict keeps a durable, user-visible record of a folder
+// conflict.
+func (s *SpoolStore) RecordFolderConflict(originalPath, conflictPath string) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	_, err := s.db.Exec(`INSERT INTO folder_conflicts (original_path, conflict_path, created_at) VALUES (?, ?, ?)`,
+		originalPath, conflictPath, time.Now().Unix())
+	if err != nil {
+		return fmt.Errorf("record folder conflict %q: %w", originalPath, err)
+	}
+	return nil
+}
+
+// ListFolderConflicts returns the newest folder conflicts first.
+func (s *SpoolStore) ListFolderConflicts(limit int) ([]FolderConflict, error) {
+	rows, err := s.db.Query(`SELECT original_path, conflict_path, created_at FROM folder_conflicts ORDER BY id DESC LIMIT ?`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list folder conflicts: %w", err)
+	}
+	defer rows.Close()
+	var out []FolderConflict
+	for rows.Next() {
+		var c FolderConflict
+		var created int64
+		if err := rows.Scan(&c.OriginalPath, &c.ConflictPath, &created); err != nil {
+			return nil, err
+		}
+		c.CreatedAt = time.Unix(created, 0)
+		out = append(out, c)
+	}
+	return out, rows.Err()
 }
 
 // CountPendingDirs is the cheap status counterpart of ListPendingDirs.

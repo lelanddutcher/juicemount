@@ -190,15 +190,24 @@ CREATE TABLE IF NOT EXISTS pending_symlinks (
 //
 // inode is the number the folder already has in the mirror and in every NFS
 // file id handed out for it. When it was reserved from the running juicefs
-// (patch 0021), the drainer creates the folder with exactly that number, so
-// the id never changes under a client that holds the folder. id orders the
-// rows: a folder's row is always older than the rows of folders inside it.
+// (patch 0022), the drainer creates the folder with exactly that number, so
+// the id never changes under a client that holds the folder. The id is kept
+// by renames, so it does not order parents before children.
+//
+// folder_conflicts records each pending folder that was renamed to a conflict
+// name because the volume had a file with its name (shown by GET /spool).
 const pendingDirSchema = `
 CREATE TABLE IF NOT EXISTS pending_dirs (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     dir_path    TEXT NOT NULL UNIQUE,
     inode       INTEGER NOT NULL,
     created_at  INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS folder_conflicts (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    original_path  TEXT NOT NULL,
+    conflict_path  TEXT NOT NULL,
+    created_at     INTEGER NOT NULL
 );
 `
 

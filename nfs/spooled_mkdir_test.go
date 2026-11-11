@@ -1,11 +1,14 @@
 package nfs
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -30,6 +33,7 @@ type fakeJuiceFSControl struct {
 	reserveErr  syscall.Errno
 	mkdirErr    syscall.Errno // forced reply, once
 	reserveSeen int
+	releaseSeen int
 	// mkdirEntered/mkdirGate, when set, hold a folder creation mid-flight.
 	mkdirEntered chan struct{}
 	mkdirGate    chan struct{}
@@ -111,6 +115,20 @@ func (f *fakeJuiceFSControl) exchange(msg []byte, replyLen int) ([]byte, error) 
 		f.paths[ino] = rel
 		f.created = append(f.created, rel)
 		return []byte{0}, nil
+	case jfsMsgReleaseInodes:
+		first := binary.BigEndian.Uint64(body[0:8])
+		n := binary.BigEndian.Uint32(body[8:12])
+		var released uint32
+		for i := uint64(0); i < uint64(n); i++ {
+			if f.reserved[first+i] {
+				delete(f.reserved, first+i)
+				released++
+			}
+		}
+		f.releaseSeen++
+		reply := make([]byte, 5)
+		binary.BigEndian.PutUint32(reply[1:5], released)
+		return reply, nil
 	}
 	f.t.Fatalf("unexpected control message %d", cmd)
 	return nil, nil
@@ -359,6 +377,66 @@ func TestSpooledMkdirFallsBackToPlainMkdirWhenNumberUnknown(t *testing.T) {
 	if n != 0 {
 		t.Fatalf("pool kept %d numbers of a restarted juicefs", n)
 	}
+	// L1: the unused numbers went back to juicefs, so a juicefs that did not
+	// in fact restart does not keep them reserved.
+	fake.mu.Lock()
+	left, releases := len(fake.reserved), fake.releaseSeen
+	fake.mu.Unlock()
+	// The fake forced ESRCH without consuming w/restart's own number.
+	if releases == 0 || left > 1 {
+		t.Fatalf("after ESRCH: %d release messages, %d numbers still reserved", releases, left)
+	}
+}
+
+// L1: stopping the drainer gives unused reserved numbers back.
+func TestSpooledMkdirStopReleasesUnusedNumbers(t *testing.T) {
+	jfs, _, _, drainer, fake := newSpooledMkdirFixture(t)
+	if err := jfs.MkdirAll("w/one", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fake.mu.Lock()
+	before := len(fake.reserved)
+	fake.mu.Unlock()
+	if before == 0 {
+		t.Fatal("nothing reserved")
+	}
+	drainer.Stop(5 * time.Second)
+	fake.mu.Lock()
+	after := len(fake.reserved)
+	fake.mu.Unlock()
+	// The number given to w/one stays reserved: its pending row still needs it.
+	if after != 1 {
+		t.Fatalf("%d numbers still reserved after Stop, want 1 (the pending folder's)", after)
+	}
+}
+
+// L2: a rename into a pending folder while offline fails at once; it must
+// not wait for the control-file reply timeout.
+func TestSpooledMkdirChainFailsFastOffline(t *testing.T) {
+	jfs, _, _, drainer, fake := newSpooledMkdirFixture(t)
+	if err := jfs.MkdirAll("w/new", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	wasOffline := pin.IsOffline()
+	t.Cleanup(func() { pin.SetOffline(wasOffline) })
+	pin.SetOffline(true)
+	var mkdirs atomic.Int32
+	drainer.dirInodes.ctl.testExchange = func(msg []byte, n int) ([]byte, error) {
+		if binary.BigEndian.Uint32(msg[0:4]) == jfsMsgMkdirInode {
+			mkdirs.Add(1)
+		}
+		return fake.exchange(msg, n)
+	}
+	start := time.Now()
+	if err := drainer.materializeChainOwned("w/new/f.txt", false); !errors.Is(err, errPendingChainOffline) {
+		t.Fatalf("chain offline: %v", err)
+	}
+	if took := time.Since(start); took > time.Second {
+		t.Fatalf("offline refusal took %v", took)
+	}
+	if mkdirs.Load() != 0 {
+		t.Fatal("folder creation sent while offline")
+	}
 }
 
 func TestSpooledMkdirKeepsSynchronousPathWithoutReservation(t *testing.T) {
@@ -452,5 +530,309 @@ func TestJFSControlMessages(t *testing.T) {
 	}
 	if _, _, err := c.reserveInodes(1); !errors.Is(err, errControlUnsupported) {
 		t.Fatalf("unsupported juicefs: %v", err)
+	}
+}
+
+// emptyDirInodePool leaves the pool with no number and no way to refill, so
+// the next MKDIR takes the synchronous path.
+func emptyDirInodePool(d *Drainer, fake *fakeJuiceFSControl) {
+	fake.mu.Lock()
+	fake.reserveErr = syscall.EAGAIN
+	fake.mu.Unlock()
+	p := d.dirInodes
+	p.mu.Lock()
+	p.ranges = nil
+	p.retryAt = time.Now().Add(time.Hour)
+	p.mu.Unlock()
+}
+
+// assertCreatedWithReservedInode checks that dir reached the volume through
+// the reserved-inode message, not a plain mkdir, and that the mirror kept its
+// number.
+func assertCreatedWithReservedInode(t *testing.T, jfs *juiceFS, fake *fakeJuiceFSControl, dir string, ino uint64) {
+	t.Helper()
+	fake.mu.Lock()
+	got := fake.paths[ino]
+	fake.mu.Unlock()
+	if got != dir {
+		t.Fatalf("%s not created with its reserved inode %d (control map: %q)", dir, ino, got)
+	}
+	if e := jfs.handler.store.LookupByPath(dir); e == nil || e.Inode != ino {
+		t.Fatalf("%s mirror entry %+v, want inode %d", dir, e, ino)
+	}
+}
+
+// H1: with the pool empty, MKDIR inside a pending folder is synchronous. It
+// must create the pending parent with its reserved inode first, never by a
+// plain MkdirAll.
+func TestSpooledMkdirSyncChildCreatesPendingParentWithItsInode(t *testing.T) {
+	jfs, fuseRoot, spool, drainer, fake := newSpooledMkdirFixture(t)
+	if err := jfs.MkdirAll("w/new", 0o750); err != nil {
+		t.Fatal(err)
+	}
+	ino := jfs.handler.store.LookupByPath("w/new").Inode
+	emptyDirInodePool(drainer, fake)
+	if err := jfs.MkdirAll("w/new/sub", 0o755); err != nil {
+		t.Fatalf("synchronous MKDIR under a pending folder: %v", err)
+	}
+	assertCreatedWithReservedInode(t, jfs, fake, "w/new", ino)
+	if fi, err := os.Stat(filepath.Join(fuseRoot, "w/new")); err != nil || fi.Mode().Perm() != 0o750 {
+		t.Fatalf("parent on the volume: %v %v, want mode 0750", fi, err)
+	}
+	if _, err := os.Stat(filepath.Join(fuseRoot, "w/new/sub")); err != nil {
+		t.Fatal(err)
+	}
+	if spool.pendingDirCount() != 0 {
+		t.Fatal("parent still pending")
+	}
+}
+
+// H1: the streaming drain must not create a pending parent folder.
+func TestSpooledMkdirStreamerWaitsForPendingFolder(t *testing.T) {
+	jfs, fuseRoot, spool, drainer, fake := newSpooledMkdirFixture(t)
+	if err := jfs.MkdirAll("w/new", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ino := jfs.handler.store.LookupByPath("w/new").Inode
+	f, err := jfs.Create("w/new/clip.mov")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = f.Write([]byte("bytes"))
+	_ = f.Close()
+	e, ok := spool.LookupActive("w/new/clip.mov")
+	if !ok {
+		t.Fatal("file not spooled")
+	}
+	drainer.streamer = &streamer{sessions: map[int64]*streamSession{}}
+	if ss := drainer.sessionFor(e); ss != nil {
+		t.Fatal("stream session opened under a pending folder")
+	}
+	if _, err := os.Lstat(filepath.Join(fuseRoot, "w/new")); !os.IsNotExist(err) {
+		t.Fatalf("streamer created the pending folder: %v", err)
+	}
+	drainer.materializePendingDirs()
+	assertCreatedWithReservedInode(t, jfs, fake, "w/new", ino)
+}
+
+// H1: a symlink persisted under a pending folder waits for the folder drain.
+func TestSpooledMkdirSymlinkWaitsForPendingFolder(t *testing.T) {
+	jfs, fuseRoot, spool, drainer, fake := newSpooledMkdirFixture(t)
+	if err := jfs.MkdirAll("w/new", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ino := jfs.handler.store.LookupByPath("w/new").Inode
+	if err := jfs.Symlink("target.mov", "w/new/link"); err != nil {
+		t.Fatal(err)
+	}
+	if !drainer.materializePendingSymlinks() {
+		t.Fatal("symlink under a pending folder reported done")
+	}
+	if _, err := os.Lstat(filepath.Join(fuseRoot, "w/new")); !os.IsNotExist(err) {
+		t.Fatalf("symlink materialization created the pending folder: %v", err)
+	}
+	drainer.materializePendingDirs()
+	assertCreatedWithReservedInode(t, jfs, fake, "w/new", ino)
+	if drainer.materializePendingSymlinks() {
+		t.Fatal("symlink left after its folder exists")
+	}
+	if got, err := os.Readlink(filepath.Join(fuseRoot, "w/new/link")); err != nil || got != "target.mov" {
+		t.Fatalf("link %q %v", got, err)
+	}
+	_ = spool
+}
+
+// H2: the volume has a FILE where a pending folder should go. The folder and
+// everything in it (nested folders and spooled files) move to a conflict
+// name, the conflict is recorded, every file drains there, and the file on
+// the volume is untouched.
+func TestSpooledMkdirFileOnVolumeTakesFolderName(t *testing.T) {
+	jfs, fuseRoot, spool, drainer, fake := newSpooledMkdirFixture(t)
+	drainConflictHost = func() string { return "mac1" }
+	drainConflictNow = func() time.Time { return time.Date(2026, 11, 11, 9, 30, 0, 0, time.UTC) }
+	t.Cleanup(func() { drainConflictHost, drainConflictNow = defaultConflictHost, time.Now })
+
+	for _, p := range []string{"w/Exports", "w/Exports/Sub"} {
+		if err := jfs.MkdirAll(p, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, p := range []string{"w/Exports/a.wav", "w/Exports/Sub/b.wav"} {
+		f, err := jfs.Create(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = f.Write([]byte("audio " + p))
+		_ = f.Close()
+	}
+	for _, p := range []string{"w/Exports/a.wav", "w/Exports/Sub/b.wav"} {
+		e, ok := spool.LookupActive(p)
+		if !ok {
+			t.Fatalf("%s not spooled", p)
+		}
+		if err := e.Close(); err != nil { // the client's COMMIT
+			t.Fatal(err)
+		}
+	}
+	// Another Mac saved a file named Exports before our folder drained.
+	if err := os.WriteFile(filepath.Join(fuseRoot, "w/Exports"), []byte("theirs"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	drainer.materializePendingDirs() // finds the file, renames the folder
+	drainer.materializePendingDirs() // creates the renamed folders
+	conflict := "w/Exports (conflict mac1 2026-11-11 093000)"
+	if got := fake.createdOrder(); len(got) != 2 || got[0] != conflict || got[1] != conflict+"/Sub" {
+		t.Fatalf("created %v, want the conflict folder then its subfolder", got)
+	}
+	if spool.pendingDirCount() != 0 {
+		t.Fatalf("pending folders left: %d", spool.pendingDirCount())
+	}
+	cs, err := spool.Meta().ListFolderConflicts(10)
+	if err != nil || len(cs) != 1 || cs[0].OriginalPath != "w/Exports" || cs[0].ConflictPath != conflict {
+		t.Fatalf("recorded conflicts %+v %v", cs, err)
+	}
+	if e := jfs.handler.store.LookupByPath(conflict); e == nil || !e.IsDir {
+		t.Fatalf("conflict folder not in the mirror: %+v", e)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), drainPassDeadline)
+	defer cancel()
+	drainer.DrainOnceForTest(ctx)
+	for _, p := range []string{conflict + "/a.wav", conflict + "/Sub/b.wav"} {
+		if _, err := os.Stat(filepath.Join(fuseRoot, p)); err != nil {
+			t.Fatalf("%s did not drain: %v", p, err)
+		}
+	}
+	if b, err := os.ReadFile(filepath.Join(fuseRoot, "w/Exports")); err != nil || string(b) != "theirs" {
+		t.Fatalf("the other Mac's file changed: %q %v", b, err)
+	}
+	if rows, _ := spool.Meta().ListReadyIncludingWaiting(10); len(rows) != 0 {
+		t.Fatalf("rows left: %d", len(rows))
+	}
+}
+
+// M1: a pending folder and the spooled files in it move in one SQLite
+// transaction. A refused folder move leaves the files where they were; a
+// successful one moves both, durably and in memory, in one call.
+func TestSpooledMkdirRenameMovesFolderAndFilesTogether(t *testing.T) {
+	jfs, _, spool, _, _ := newSpooledMkdirFixture(t)
+	for _, p := range []string{"w/a", "w/z"} {
+		if err := jfs.MkdirAll(p, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	f, err := jfs.Create("w/a/f.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = f.Close()
+
+	// w/z is pending: moving w/a onto it must refuse, and move nothing.
+	if _, _, err := spool.MigrateForRename("w/a", "w/z"); !errors.Is(err, metadata.ErrPendingDirConflict) {
+		t.Fatalf("migrate onto a pending folder: %v, want ErrPendingDirConflict", err)
+	}
+	if r, _ := spool.Meta().LookupByPath("w/a/f.txt"); r == nil {
+		t.Fatal("file row moved although the folder move was refused")
+	}
+	if _, ok := spool.pendingDir("w/a"); !ok {
+		t.Fatal("pending folder lost")
+	}
+
+	if _, _, err := spool.MigrateForRename("w/a", "w/b"); err != nil {
+		t.Fatal(err)
+	}
+	if r, _ := spool.Meta().LookupByPath("w/b/f.txt"); r == nil {
+		t.Fatal("file row not moved")
+	}
+	if _, ok := spool.pendingDir("w/b"); !ok {
+		t.Fatal("pending folder not moved in memory")
+	}
+	rows, _ := spool.Meta().ListPendingDirs()
+	paths := map[string]bool{}
+	for _, r := range rows {
+		paths[r.Path] = true
+	}
+	if !paths["w/b"] || paths["w/a"] {
+		t.Fatalf("durable pending rows %v", paths)
+	}
+}
+
+// M2: files waiting for a stuck pending folder must not fill the page the
+// dispatcher lists, or an unrelated save written after them never drains.
+func TestSpooledMkdirWaitingFilesDoNotBlockOtherSaves(t *testing.T) {
+	jfs, _, spool, drainer, _ := newSpooledMkdirFixture(t)
+	if err := jfs.MkdirAll("w/stuck", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write := func(p string) {
+		f, err := jfs.Create(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = f.Write([]byte(p))
+		_ = f.Close()
+		e, ok := spool.LookupActive(p)
+		if !ok {
+			t.Fatalf("%s not spooled", p)
+		}
+		if err := e.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := 0; i < 20; i++ {
+		write(fmt.Sprintf("w/stuck/f%02d.txt", i))
+	}
+	write("w/other.txt")
+	rows, err := drainer.listDispatchable(8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].NFSPath != "w/other.txt" {
+		var got []string
+		for _, r := range rows {
+			got = append(got, r.NFSPath)
+		}
+		t.Fatalf("listed %v, want only w/other.txt", got)
+	}
+}
+
+// L3: a folder that keeps failing is not retried on every tick.
+func TestSpooledMkdirBacksOffAfterRepeatedFailures(t *testing.T) {
+	jfs, _, _, drainer, fake := newSpooledMkdirFixture(t)
+	if err := jfs.MkdirAll("w/stuck", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	var tries atomic.Int32
+	drainer.dirInodes.ctl.testExchange = func(msg []byte, n int) ([]byte, error) {
+		if binary.BigEndian.Uint32(msg[0:4]) == jfsMsgMkdirInode {
+			tries.Add(1)
+			return []byte{byte(syscall.EIO)}, nil
+		}
+		return fake.exchange(msg, n)
+	}
+	for i := 0; i < 10; i++ {
+		drainer.materializePendingDirs()
+	}
+	if got := tries.Load(); got != 2 {
+		t.Fatalf("%d attempts in 10 quick passes, want 2 (then back off)", got)
+	}
+}
+
+// L4: a folder moved into a newer pending folder has the older row id; the
+// drain still creates the parent first.
+func TestSpooledMkdirParentFirstAfterMoveIntoNewerFolder(t *testing.T) {
+	jfs, _, _, drainer, fake := newSpooledMkdirFixture(t)
+	for _, p := range []string{"w/p", "w/q"} {
+		if err := jfs.MkdirAll(p, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := jfs.Rename("w/p", "w/q/p"); err != nil {
+		t.Fatal(err)
+	}
+	drainer.materializePendingDirs()
+	if got := fake.createdOrder(); len(got) != 2 || got[0] != "w/q" || got[1] != "w/q/p" {
+		t.Fatalf("created %v, want [w/q w/q/p]", got)
 	}
 }

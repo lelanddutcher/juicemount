@@ -235,6 +235,11 @@ func (d *Drainer) sessionFor(e *SpoolEntry) *streamSession {
 		return ss
 	}
 
+	// A pending folder on the path is created by the folder drain, with its
+	// reserved inode; MkdirAll here would give it a new one. Try next tick.
+	if d.spool.pendingAncestor(e.NFSPath()) {
+		return nil
+	}
 	realPath := filepath.Join(d.fuseRoot, e.NFSPath())
 	tempPath, err := streamTempPath(realPath, id)
 	if err != nil {

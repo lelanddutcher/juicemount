@@ -301,6 +301,7 @@ type chunkObj struct {
 type jmFolderInodes interface {
 	JMReserveInodes(n uint32) (meta.Ino, uint32, syscall.Errno)
 	JMMkdirInode(ctx meta.Context, parent meta.Ino, name string, mode, cumask uint16, ino meta.Ino, attr *meta.Attr) syscall.Errno
+	JMReleaseInodes(first meta.Ino, n uint32) (uint32, syscall.Errno)
 }
 
 func (v *VFS) handleInternalMsg(ctx meta.Context, cmd uint32, r *utils.Buffer, out io.Writer) {
@@ -539,6 +540,19 @@ func (v *VFS) handleInternalMsg(ctx meta.Context, cmd uint32, r *utils.Buffer, o
 		w.Put8(uint8(eno))
 		w.Put64(uint64(first))
 		w.Put32(count)
+		_, _ = out.Write(w.Bytes())
+	case meta.JMReleaseInodes:
+		// JuiceMount patch 0022. Reply: errno (1 byte), released count (4).
+		first := Ino(r.Get64())
+		n := r.Get32()
+		var released uint32
+		eno := syscall.ENOTSUP
+		if jm, ok := v.Meta.(jmFolderInodes); ok {
+			released, eno = jm.JMReleaseInodes(first, n)
+		}
+		w := utils.NewBuffer(1 + 4)
+		w.Put8(uint8(eno))
+		w.Put32(released)
 		_, _ = out.Write(w.Bytes())
 	case meta.JMMkdirInode:
 		// JuiceMount patch 0022. Reply: errno (1 byte).

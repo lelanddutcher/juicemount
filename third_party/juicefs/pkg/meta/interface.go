@@ -61,6 +61,8 @@ const (
 	JMReserveInodes = 1101
 	// JMMkdirInode creates a directory with a reserved inode number (JuiceMount).
 	JMMkdirInode = 1102
+	// JMReleaseInodes gives back unused reserved numbers (JuiceMount).
+	JMReleaseInodes = 1103
 )
 
 const (

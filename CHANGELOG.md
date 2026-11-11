@@ -14,9 +14,12 @@
   ahead of time, and the server folder is created with the reserved number.
   The drainer creates folders on the server before the files inside them,
   parents first. A folder that already exists on the server is used as it
-  is. A parent that another Mac removed is created again. A folder renamed
-  or removed before it reaches the server is renamed or dropped locally, and
-  an empty one never reaches the server. Offline, folders wait locally with
+  is. A parent that another Mac removed is created again. If the server has
+  a file with the folder's name, the folder and everything in it move to
+  "<name> (conflict <Mac> <time>)", and `GET /spool` lists the conflict
+  (`folder_conflicts`). A folder renamed or removed before it reaches the
+  server is renamed or dropped locally, and an empty one never reaches the
+  server. Offline, folders wait locally with
   the files. Project rules are unchanged: the drainer checks the project
   lease before it creates a folder. Field switch: `JM_SPOOL_MKDIR=0`. The
   bundled JuiceFS is now build `-jm8`.
@@ -33,6 +36,11 @@
   16 MiB keeps the four parallel uploads busy. On a 200 ms link with 1%
   loss, the upload rate went from 0.6 to 2.7 Mbit/s. `JM_DRAIN_SYNC_BYTES`
   still overrides it, now up to 64 MiB.
+- A mount check that stops answering no longer pauses uploads for good.
+  Before, one `statfs` call that never returned held the only check slot,
+  and the drainer stayed paused with no sign. Now a new check starts after
+  30 s (at most 4 stuck at once), checks that arrive together share one
+  answer, and after 2 minutes paused `GET /spool` shows `drain_paused`.
 - Each saved file reaches the server with 2 fewer Redis round trips: the
   JuiceFS rename that publishes it now takes 3 round trips instead of 5.
 

@@ -170,3 +170,24 @@ func mustReadyRows(t *testing.T, spool *SpoolStore) int {
 	}
 	return len(rows)
 }
+
+// A mount check that keeps the drainer parked becomes visible after
+// drainPauseVisibleAfter, and clears when the check answers again.
+func TestDrainPauseBecomesVisible(t *testing.T) {
+	d := &Drainer{}
+	d.noteIdentityPause("statfs timed out — mount wedged")
+	if got := d.DrainPausedReason(); got != "" {
+		t.Fatalf("reported at once: %q", got)
+	}
+	d.idPause.mu.Lock()
+	d.idPause.since = time.Now().Add(-drainPauseVisibleAfter - time.Second)
+	d.idPause.mu.Unlock()
+	d.noteIdentityPause("statfs timed out — mount wedged")
+	if got := d.DrainPausedReason(); got == "" {
+		t.Fatal("pause not reported after the threshold")
+	}
+	d.clearIdentityPause()
+	if got := d.DrainPausedReason(); got != "" {
+		t.Fatalf("still reported after the check answered: %q", got)
+	}
+}

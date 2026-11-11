@@ -78,6 +78,27 @@ func (m *baseMeta) JMReserveInodes(n uint32) (Ino, uint32, syscall.Errno) {
 	return first, count, 0
 }
 
+// JMReleaseInodes gives back reserved numbers from first to first+n-1 that
+// this process still holds and has not used. It returns how many it released:
+// 0 for numbers it does not hold (a client from before this process
+// restarted). Released numbers are not reused; the volume counter only grows.
+func (m *baseMeta) JMReleaseInodes(first Ino, n uint32) (uint32, syscall.Errno) {
+	if n > jmReservedMax {
+		return 0, syscall.EINVAL
+	}
+	r := m.jmReserved()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var released uint32
+	for i := Ino(0); i < Ino(n); i++ {
+		if _, ok := r.ids[first+i]; ok {
+			delete(r.ids, first+i)
+			released++
+		}
+	}
+	return released, 0
+}
+
 // jmDefiniteRefusal lists results after which the engine wrote nothing, so the
 // number stays reserved for another attempt. Any other failure may have
 // committed (an ambiguous EXEC reply), and the number is never offered again.

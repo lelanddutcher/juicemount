@@ -153,7 +153,11 @@ type Drainer struct {
 	onDrainAdmission          func(string) *namespaceOperation
 	onDirAdmission            func(string) *namespaceOperation // shallow; spooled folders
 	dirCreate                 dirCreateLocks
-	mediaGateWaiters          atomic.Int32 // media-lane drains waiting for a gate slot
+	dirRetry                  dirRetryBackoff
+	idPause                   identityPause
+	onPendingDirNameTaken     func(string) (string, error) // spooled_mkdir.go
+	mediaGateWaiters          atomic.Int32                 // media-lane drains waiting for a gate slot
+	mediaGateHeld             atomic.Int32                 // media-lane drains holding a gate slot
 	onDrainEffects            func(metadata.DrainCommitItem, metadata.DrainCommitResult, *os.File, []byte) error
 	onDrainSucceeded          func(string)
 	onBatchDrainCompleteExact func([]metadata.DrainCommitItem) ([]metadata.DrainCommitResult, error)
@@ -454,6 +458,7 @@ func (d *Drainer) Start() {
 // Repeated calls wait on the same shutdown and report its actual state.
 func (d *Drainer) Stop(deadline time.Duration) bool {
 	d.lifecycleMu.Lock()
+	firstStop := !d.stopping
 	if !d.stopping {
 		d.stopping = true
 		if q := d.replacementDispatch; q != nil && q.cancel != nil {
@@ -480,6 +485,11 @@ func (d *Drainer) Stop(deadline time.Duration) bool {
 		}
 	}
 	d.lifecycleMu.Unlock()
+	if firstStop && d.dirInodes != nil {
+		// Give unused reserved folder inodes back, so restarts of this app
+		// do not fill juicefs's cap. Bounded: a dead mount must not hold Stop.
+		_, _, _ = d.dirInodes.releaseAll(2 * time.Second)
+	}
 
 	select {
 	case <-d.shutdownDone:
@@ -557,6 +567,57 @@ func (d *Drainer) SetOnDrainCommit(fn func(metadata.DrainCommitItem) (metadata.D
 
 func (d *Drainer) SetOnDrainAdmission(fn func(string) *namespaceOperation) {
 	d.onDrainAdmission = fn
+}
+
+// drainPauseVisibleAfter is how long the mount check may keep the drainer
+// parked before the pause is reported to the user (GET /spool drain_paused).
+const drainPauseVisibleAfter = 2 * time.Minute
+
+type identityPause struct {
+	mu     sync.Mutex
+	since  time.Time
+	reason string
+	warned bool
+}
+
+func (d *Drainer) noteIdentityPause(reason string) {
+	p := &d.idPause
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.since.IsZero() {
+		p.since = time.Now()
+	}
+	p.reason = reason
+	if !p.warned && time.Since(p.since) >= drainPauseVisibleAfter {
+		p.warned = true
+		jmlog.Warn("drain paused: the mount check is not answering; saved files stay on this Mac until it does",
+			"for", time.Since(p.since).Round(time.Second).String(), "reason", reason)
+	}
+}
+
+func (d *Drainer) clearIdentityPause() {
+	p := &d.idPause
+	p.mu.Lock()
+	if !p.since.IsZero() && p.warned {
+		jmlog.Info("drain resumed: the mount check answers again", "paused_for", time.Since(p.since).Round(time.Second).String())
+	}
+	p.since, p.reason, p.warned = time.Time{}, "", false
+	p.mu.Unlock()
+}
+
+// DrainPausedReason is non-empty while the mount check has kept the drainer
+// parked for longer than drainPauseVisibleAfter.
+func (d *Drainer) DrainPausedReason() string {
+	if d == nil {
+		return ""
+	}
+	p := &d.idPause
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.since.IsZero() || time.Since(p.since) < drainPauseVisibleAfter {
+		return ""
+	}
+	return "mount check not answering for " + time.Since(p.since).Round(time.Minute).String() + ": " + p.reason
 }
 
 // SetOnDirAdmission installs the shallow admission used to create a spooled
@@ -699,6 +760,7 @@ func (d *Drainer) dispatchLoop() {
 				log.Printf("drainer: PARKED — FUSE identity gate failed (%s); writes stay in the spool until the mount is real", reason)
 				identityParked = true
 			}
+			d.noteIdentityPause(reason)
 			wasOffline = true
 			symlinkCheckNeeded = true
 			continue
@@ -707,6 +769,7 @@ func (d *Drainer) dispatchLoop() {
 			log.Printf("drainer: FUSE identity restored — resuming drains")
 			identityParked = false
 		}
+		d.clearIdentityPause()
 		// RECONNECT edge: any rows that exhausted their retry budget before or
 		// during the offline window are stuck in `failed`. Requeue them now
 		// that the backend is reachable so no spooled photo is left undrained.
@@ -854,6 +917,12 @@ func (d *Drainer) materializePendingSymlinks() bool {
 			log.Printf("drainer: symlink materialization aborted — FUSE identity gate failed (%s); %d row(s) retry next reconnect",
 				reason, len(pend)-materialized)
 			return true
+		}
+		// Its folder is still pending: the folder drain creates it first,
+		// with its reserved inode, then sets symlinkWake.
+		if d.spool.pendingAncestor(p.LinkPath) {
+			remaining = true
+			continue
 		}
 		fusePath := filepath.Join(d.fuseRoot, p.LinkPath)
 		serr := os.Symlink(p.Target, fusePath)
@@ -1179,14 +1248,30 @@ func (d *Drainer) durableSyncInterval() int64 {
 // waits without occupying the gate so cached foreground reads retain the
 // reserve enforced by backgroundFUSEDataWidth. Stop aborts the wait cleanly.
 //
-// Media first: while a media-lane drain waits, small-lane drains do not take
-// a freed slot. Without this the small lane (as wide as the background gate
+// Media first, bounded: while a media-lane drain waits and media drains hold
+// fewer than half the background slots, small-lane drains do not take a freed
+// slot (smallYieldsToMedia). Without this the small lane (as wide as the background gate
 // on a slow link) held every slot while a burst of small files drained, and
 // a large file uploaded nothing until the burst ended: in the remote lab
 // (abroad-noloss, 200 small files and one 500 MB file) the large file sent
 // 0 bytes for the first 390 s.
 func (d *Drainer) acquireDrainFUSESlot() (release func(), ok bool) {
 	return d.acquireDrainFUSESlotFor(false)
+}
+
+// smallYieldsToMedia: a small drain leaves a freed slot to a waiting media
+// drain only while media drains hold fewer than half the background slots
+// (at least one). Small saves (.prproj, .drp, sidecars) therefore always keep
+// at least half, and a large file always gets one.
+func (d *Drainer) smallYieldsToMedia() bool {
+	if d.mediaGateWaiters.Load() == 0 {
+		return false
+	}
+	share := backgroundFUSEDataWidth() / 2
+	if share < 1 {
+		share = 1
+	}
+	return int64(d.mediaGateHeld.Load()) < share
 }
 
 func (d *Drainer) acquireDrainFUSESlotFor(small bool) (release func(), ok bool) {
@@ -1197,7 +1282,7 @@ func (d *Drainer) acquireDrainFUSESlotFor(small bool) (release func(), ok bool) 
 		defer d.mediaGateWaiters.Add(-1)
 	}
 	for {
-		if small && d.mediaGateWaiters.Load() > 0 {
+		if small && d.smallYieldsToMedia() {
 			select {
 			case <-d.stop:
 				return func() {}, false
@@ -1206,7 +1291,17 @@ func (d *Drainer) acquireDrainFUSESlotFor(small bool) (release func(), ok bool) 
 			continue
 		}
 		if release, ok := tryAcquireFUSEDataBackground(); ok {
-			return release, true
+			if small {
+				return release, true
+			}
+			d.mediaGateHeld.Add(1)
+			var once sync.Once
+			return func() {
+				once.Do(func() {
+					d.mediaGateHeld.Add(-1)
+					release()
+				})
+			}, true
 		}
 		// An operator may deliberately set JM_FUSE_DATA_GATE=1. The normal
 		// background policy reserves that sole slot, which is correct for

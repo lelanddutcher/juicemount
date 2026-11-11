@@ -1310,6 +1310,7 @@ func (h *JuiceMountHandler) SetSpool(spool *SpoolStore, drainer *Drainer) {
 		// reach the entries store directly, so it calls back here.
 		drainer.SetOnSymlinkMaterialized(h.onSymlinkMaterialized)
 		drainer.SetOnDirMaterialized(h.onDirMaterialized)
+		drainer.onPendingDirNameTaken = h.resolvePendingDirNameTaken
 	}
 	if spool != nil {
 		spool.bindConflictHandler(h)
@@ -4966,16 +4967,8 @@ func (jfs *juiceFS) rename(oldpath, newpath string, op *namespaceOperation) erro
 		}
 	}
 	op.mutated = true
-	if spool := jfs.handler.spool.Load(); spool != nil && oldpath != newpath {
-		if _, err := spool.movePendingDirs(oldpath, newpath); err != nil {
-			// The volume moved, the pending rows did not: they would be
-			// created at the old place. Hold the names for recovery.
-			op.poison = true
-			jmlog.Warn("rename: pending folder rows not moved — failing RPC",
-				"old", oldpath, "new", newpath, "error", err.Error())
-			return err
-		}
-	}
+	// Pending folder rows moved with the spool rows (MigrateForRename, one
+	// SQLite transaction).
 	op.checkpoint("publish", oldpath)
 
 	// The backing folder now lives at newpath: its listing record (and its
@@ -5301,6 +5294,15 @@ func (jfs *juiceFS) mkdirAll(dirname string, perm os.FileMode, op *namespaceOper
 	// reconnect. So an offline copy spools cleanly and the tree appears for the
 	// user; the backend catches up online.
 	if !pin.IsOffline() {
+		// A pending parent (spooled MKDIR, no reserved number left for this
+		// child) is created first with its own reserved inode. A plain
+		// MkdirAll would give it a new inode and stale the file id the client
+		// holds (#70).
+		if spool, drainer := jfs.handler.spool.Load(), jfs.handler.drainer.Load(); spool != nil && drainer != nil && spool.pendingAncestor(dirname) {
+			if err := drainer.materializeChainOwned(dirname, false); err != nil {
+				return errFUSETimeout
+			}
+		}
 		// The namespace runner bounds the RPC, retaining the worker on timeout.
 		err := os.MkdirAll(jfs.fullPath(dirname), perm)
 		if err != nil {

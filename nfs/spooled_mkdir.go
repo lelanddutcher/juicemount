@@ -44,6 +44,7 @@ package nfs
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path"
 	"path/filepath"
@@ -126,6 +127,14 @@ func (s *SpoolStore) pendingDir(dirPath string) (metadata.PendingDir, bool) {
 }
 
 // pendingAncestor reports whether a proper ancestor of p is a pending folder.
+// pendingAtOrAbove reports whether p or one of its ancestors is pending.
+func (s *SpoolStore) pendingAtOrAbove(p string) bool {
+	if _, ok := s.pendingDir(p); ok {
+		return true
+	}
+	return s.pendingAncestor(p)
+}
+
 func (s *SpoolStore) pendingAncestor(p string) bool {
 	if s == nil {
 		return false
@@ -208,6 +217,23 @@ func (s *SpoolStore) removePendingDir(p metadata.PendingDir) error {
 	return nil
 }
 
+// movePendingDirsInMemoryLocked re-keys the in-memory rows at and beneath
+// oldPath after the durable move (MigrateActivePathsWithBase). Caller holds
+// s.dirs.mu.
+func (s *SpoolStore) movePendingDirsInMemoryLocked(oldPath, newPath string) {
+	if oldPath == newPath || len(s.dirs.byPath) == 0 {
+		return
+	}
+	next := make(map[string]metadata.PendingDir, len(s.dirs.byPath))
+	for d, p := range s.dirs.byPath {
+		if metadata.PathAtOrUnder(d, oldPath) {
+			p.Path = newPath + d[len(oldPath):]
+		}
+		next[p.Path] = p
+	}
+	s.dirs.byPath = next
+}
+
 // movePendingDirs re-keys the rows at and beneath oldPath to newPath.
 func (s *SpoolStore) movePendingDirs(oldPath, newPath string) (int, error) {
 	s.dirs.mu.Lock()
@@ -261,6 +287,7 @@ type dirInodePool struct {
 	refilling chan struct{} // non-nil while a refill runs; closed at its end
 	disabled  bool          // the juicefs does not support the messages
 	retryAt   time.Time     // after a failed refill
+	capLogged bool          // the juicefs cap was reported (once per episode)
 }
 
 func newDirInodePool(ctl *jfsControl) *dirInodePool { return &dirInodePool{ctl: ctl} }
@@ -356,10 +383,20 @@ func (p *dirInodePool) startRefillLocked() chan struct{} {
 		case errors.Is(err, errControlUnsupported):
 			p.disabled = true
 			jmlog.Info("spooled mkdir off: the juicefs does not reserve folder inodes; MKDIR stays synchronous")
+		case errors.Is(err, syscall.EAGAIN):
+			// juicefs holds its maximum of reserved numbers (leaked by
+			// earlier crashes of this app). MKDIR stays synchronous until
+			// juicefs restarts; check again in a minute.
+			p.retryAt = time.Now().Add(time.Minute)
+			if !p.capLogged {
+				p.capLogged = true
+				jmlog.Info("juicefs holds its maximum of reserved folder inodes; MKDIR is synchronous until juicefs restarts")
+			}
 		case err != nil:
 			p.retryAt = time.Now().Add(5 * time.Second)
 			jmlog.Debug("reserve folder inodes failed", "error", err.Error())
 		case count > 0:
+			p.capLogged = false
 			p.ranges = append(p.ranges, inodeRange{next: first, end: first + uint64(count)})
 		}
 		p.refilling = nil
@@ -368,15 +405,54 @@ func (p *dirInodePool) startRefillLocked() chan struct{} {
 	return done
 }
 
-// invalidate drops every number: the juicefs that reserved them is gone.
+// invalidate empties the pool after juicefs refused one of its numbers. The
+// unused numbers are given back, so a juicefs that did not restart does not
+// keep them reserved (its cap is 65,536); a reply of 0 released confirms the
+// restart.
 func (p *dirInodePool) invalidate() {
 	if p == nil {
 		return
 	}
+	held, released, err := p.releaseAll(p.ctl.replyTimeout)
+	switch {
+	case err != nil:
+		jmlog.Info("reserved folder inodes dropped; returning them to juicefs failed", "numbers", held, "error", err.Error())
+	case held > 0 && released == 0:
+		jmlog.Info("juicefs restarted: its reserved folder inodes are void", "numbers", held)
+	default:
+		jmlog.Info("reserved folder inodes returned to juicefs", "numbers", held, "released", released)
+	}
+}
+
+// releaseAll empties the pool and gives its unused numbers back to juicefs.
+func (p *dirInodePool) releaseAll(timeout time.Duration) (held uint64, released uint64, err error) {
+	if p == nil {
+		return 0, 0, nil
+	}
 	p.mu.Lock()
+	ranges := p.ranges
 	p.ranges = nil
 	p.mu.Unlock()
+	for _, r := range ranges {
+		for next := r.next; next < r.end; {
+			n := r.end - next
+			if n > dirInodeReleaseMax {
+				n = dirInodeReleaseMax
+			}
+			held += n
+			got, rerr := p.ctl.releaseInodes(next, uint32(n), timeout)
+			if rerr != nil && err == nil {
+				err = rerr
+			}
+			released += uint64(got)
+			next += n
+		}
+	}
+	return held, released, err
 }
+
+// dirInodeReleaseMax bounds one release message.
+const dirInodeReleaseMax = 4096
 
 // ---------------------------------------------------------------------------
 // MKDIR (handler)
@@ -469,6 +545,9 @@ func (d *Drainer) materializePendingDirs() bool {
 		var wg sync.WaitGroup
 		sem := make(chan struct{}, 8)
 		for i, p := range ready {
+			if !d.dirRetry.due(p.ID) {
+				continue // backing off after repeated failures (ok[i] false)
+			}
 			wg.Add(1)
 			sem <- struct{}{}
 			go func(i int, p metadata.PendingDir) {
@@ -500,6 +579,52 @@ func (d *Drainer) materializePendingDirs() bool {
 	return remaining
 }
 
+// dirRetryBackoff spaces out attempts at a folder that keeps failing (a
+// project held by another Mac, a refused create): the first retry is
+// immediate, then 1 s doubling to 5 min. Keyed by row id, which a rename
+// keeps.
+type dirRetryBackoff struct {
+	mu   sync.Mutex
+	rows map[int64]dirRetryState
+}
+
+type dirRetryState struct {
+	failures int
+	nextAt   time.Time
+}
+
+func (b *dirRetryBackoff) due(id int64) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	st, ok := b.rows[id]
+	return !ok || !time.Now().Before(st.nextAt)
+}
+
+func (b *dirRetryBackoff) failed(id int64) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.rows == nil {
+		b.rows = make(map[int64]dirRetryState)
+	}
+	st := b.rows[id]
+	st.failures++
+	var wait time.Duration
+	if st.failures >= 2 {
+		wait = time.Second << min(st.failures-2, 9)
+		if wait > 5*time.Minute {
+			wait = 5 * time.Minute
+		}
+	}
+	st.nextAt = time.Now().Add(wait)
+	b.rows[id] = st
+}
+
+func (b *dirRetryBackoff) clear(id int64) {
+	b.mu.Lock()
+	delete(b.rows, id)
+	b.mu.Unlock()
+}
+
 func hasAncestorIn(set map[string]bool, p string) bool {
 	for a := path.Dir(p); a != "." && a != "/" && a != ""; a = path.Dir(a) {
 		if set[a] {
@@ -518,6 +643,7 @@ func (d *Drainer) materializeDir(p metadata.PendingDir) bool {
 	if leases := d.ProjectLeases(); leases != nil {
 		if project := projectOf(p.Path); project != "" {
 			if dec, err := leases.EnsureForDrain(project); err == nil && !dec.held && dec.heldBy != "" {
+				d.dirRetry.failed(p.ID)
 				return false // another Mac holds the project: keep it here
 			}
 		}
@@ -534,10 +660,24 @@ func (d *Drainer) materializeDir(p metadata.PendingDir) bool {
 	if op != nil {
 		op.finish(nil)
 	}
+	if errors.Is(err, errPendingDirIsFile) && d.onPendingDirNameTaken != nil {
+		d.dirRetry.clear(p.ID) // the renamed row is new work, not a retry
+		if conflict, rerr := d.onPendingDirNameTaken(p.Path); rerr != nil {
+			d.dirRetry.failed(p.ID)
+			jmlog.Warn("a file on the volume has this folder's name; renaming the folder to a conflict name failed, will retry",
+				"path", p.Path, "error", rerr.Error())
+		} else {
+			jmlog.Warn("a file on the volume has this folder's name; the folder and everything in it now use a conflict name",
+				"path", p.Path, "conflict_folder", conflict)
+		}
+		return false // the renamed row drains on the next pass
+	}
 	if err != nil {
+		d.dirRetry.failed(p.ID)
 		jmlog.Info("folder not created on the volume yet; will retry", "path", p.Path, "error", err.Error())
 		return false
 	}
+	d.dirRetry.clear(p.ID)
 	return true
 }
 
@@ -620,6 +760,9 @@ func (d *Drainer) materializeDirOwned(p metadata.PendingDir, op *namespaceOperat
 		}
 		err = os.Mkdir(fusePath, mode)
 		if errors.Is(err, os.ErrNotExist) {
+			if d.spool.pendingAncestor(p.Path) {
+				return errPendingParent
+			}
 			if mErr := os.MkdirAll(filepath.Dir(fusePath), 0o755); mErr != nil {
 				return mErr
 			}
@@ -640,10 +783,9 @@ func (d *Drainer) materializeDirOwned(p metadata.PendingDir, op *namespaceOperat
 			return lerr
 		}
 		if !fi.IsDir() {
-			jmlog.Warn("cannot create folder: the volume has a file with that name; files inside the folder will not drain",
-				"path", p.Path)
-			_ = d.spool.removePendingDir(p)
-			return nil
+			// The caller renames the folder to a conflict name once it no
+			// longer holds the name (materializeDir).
+			return errPendingDirIsFile
 		}
 		if st, ok := fi.Sys().(*syscall.Stat_t); ok && st.Ino != 0 {
 			realIno = uint64(st.Ino)
@@ -696,6 +838,9 @@ func (d *Drainer) parentInodeFromMount(parent string) (uint64, error) {
 	if parent == "." || parent == "" {
 		return 1, nil
 	}
+	if d.spool.pendingAtOrAbove(parent) {
+		return 0, errPendingParent
+	}
 	p := filepath.Join(d.fuseRoot, parent)
 	fi, err := os.Lstat(p)
 	if errors.Is(err, os.ErrNotExist) {
@@ -718,28 +863,98 @@ func (d *Drainer) parentInodeFromMount(parent string) (uint64, error) {
 // namespace, which covers its ancestors. It is for an operation that must
 // find the folder on the volume, such as a rename into it.
 func (d *Drainer) materializeChainOwned(p string, includeSelf bool) error {
-	var chain []string
+	var pending []metadata.PendingDir // outermost first
 	start := path.Dir(p)
 	if includeSelf {
 		start = p
 	}
 	for a := start; a != "." && a != "/" && a != ""; a = path.Dir(a) {
-		chain = append(chain, a)
+		if row, ok := d.spool.pendingDir(a); ok {
+			pending = append([]metadata.PendingDir{row}, pending...)
+		}
 	}
-	for i := len(chain) - 1; i >= 0; i-- {
-		row, ok := d.spool.pendingDir(chain[i])
-		if !ok {
-			continue
+	if len(pending) == 0 {
+		return nil
+	}
+	// Refuse at once what cannot succeed now, rather than wait for the
+	// control-file reply timeout.
+	if pin.IsOffline() {
+		return errPendingChainOffline
+	}
+	if !pin.FUSEIdentityOK() {
+		return pin.ErrFUSEIdentityGate
+	}
+	if leases := d.ProjectLeases(); leases != nil {
+		if project := projectOf(pending[0].Path); project != "" {
+			if dec, err := leases.EnsureForDrain(project); err == nil && !dec.held && dec.heldBy != "" {
+				return errPendingChainLease
+			}
 		}
-		if !pin.FUSEIdentityOK() {
-			return pin.ErrFUSEIdentityGate
-		}
+	}
+	for _, row := range pending {
 		if err := d.materializeDirOwned(row, nil); err != nil {
+			if errors.Is(err, errPendingDirIsFile) {
+				d.spool.SignalReady() // the drainer renames it to a conflict name
+			}
 			return err
 		}
-		if _, still := d.spool.pendingDir(chain[i]); still {
+		if _, still := d.spool.pendingDir(row.Path); still {
 			return syscall.EAGAIN
 		}
 	}
 	return nil
+}
+
+var (
+	errPendingChainOffline = errors.New("pending folder: offline")
+	errPendingChainLease   = errors.New("pending folder: another Mac holds the project")
+	// errPendingParent refuses to create a parent folder by plain mkdir
+	// while it is pending: that would give it a new inode, and the file id
+	// the client already holds would go stale (#70).
+	errPendingParent = errors.New("parent folder is still pending")
+	// errPendingDirIsFile: the volume has a file where the folder should go.
+	errPendingDirIsFile = errors.New("the volume has a file with this folder's name")
+)
+
+// conflictFolderPath is conflictCopyPath for a folder: the tag goes after the
+// whole name (a folder has no extension).
+func conflictFolderPath(p, host string, now time.Time, n int) string {
+	stamp := now.Format("2006-01-02 150405")
+	tag := fmt.Sprintf(" (conflict %s %s)", host, stamp)
+	if n > 1 {
+		tag = fmt.Sprintf(" (conflict %s %s %d)", host, stamp, n)
+	}
+	return p + tag
+}
+
+// resolvePendingDirNameTaken moves a pending folder whose name a file on the
+// volume has taken, with everything in it, to a conflict name. It uses the
+// NFS rename path, so the mirror, the spool rows and the pending folder rows
+// move together (one SQLite transaction) and clients are told. The file on
+// the volume stays as it is.
+func (h *JuiceMountHandler) resolvePendingDirNameTaken(p string) (string, error) {
+	spool := h.spool.Load()
+	if spool == nil {
+		return "", os.ErrInvalid
+	}
+	jfs := &juiceFS{handler: h}
+	host, now := drainConflictHost(), drainConflictNow()
+	for n := 1; n <= 100; n++ {
+		c := conflictFolderPath(p, host, now, n)
+		if h.store.LookupByPath(c) != nil {
+			continue
+		}
+		if _, err := os.Lstat(jfs.fullPath(c)); !errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err := jfs.Rename(p, c); err != nil {
+			return "", err
+		}
+		if err := spool.Meta().RecordFolderConflict(p, c); err != nil {
+			jmlog.Warn("folder conflict not recorded", "path", p, "error", err.Error())
+		}
+		spool.SignalReady()
+		return c, nil
+	}
+	return "", os.ErrExist
 }
