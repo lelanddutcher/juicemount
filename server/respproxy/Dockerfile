@@ -9,7 +9,7 @@
 
 ARG JM_VERSION
 ARG JM_COMMIT
-FROM golang:1.26.10-alpine AS builder
+FROM golang:1.26.11-alpine AS builder
 ARG JM_VERSION
 ARG JM_COMMIT
 WORKDIR /src
