@@ -1,6 +1,7 @@
 package nfs
 
 import (
+	"hash/fnv"
 	"os"
 	"strings"
 	"sync"
@@ -8,6 +9,7 @@ import (
 	"time"
 
 	"github.com/lelanddutcher/juicemount/internal/netprofile"
+	"github.com/lelanddutcher/juicemount/metadata"
 )
 
 // Demand first, on a slow link (2026-11-11 laptop lab, problem 1).
@@ -152,13 +154,14 @@ func demandStreamCap(sequentialBytes int64, max int) int {
 //     the pool was invalidated) hands out new descriptors, so retries stop
 //     joining a pread stuck on the dead mount.
 type pendingReadKey struct {
-	name  string // in-mount path, for invalidation
-	inode uint64
-	size  int64
-	mtime int64
-	fd    *os.File
-	off   int64
-	n     int
+	name    string // in-mount path, for invalidation
+	inode   uint64
+	size    int64
+	mtime   int64
+	version metadata.MirrorToken // the mirror revision the open observed
+	fd      *os.File
+	off     int64
+	n       int
 }
 
 type readResult struct {
@@ -188,6 +191,25 @@ type pendingFUSEReads struct {
 	mu  sync.Mutex
 	m   map[pendingReadKey]*pendingFUSERead
 	max int
+	// epochs count invalidations, per hash bucket of the name. A pread reads
+	// its bucket before it starts; adopt refuses it if the bucket moved, so
+	// an invalidation that lands while the pread runs but before it is
+	// registered (the first 8 s) is not lost. A collision only makes a
+	// pread unjoinable, never wrong.
+	epochs [pendingEpochBuckets]atomic.Uint64
+}
+
+const pendingEpochBuckets = 256
+
+func pendingEpochBucket(name string) int {
+	h := fnv.New32a()
+	h.Write([]byte(name))
+	return int(h.Sum32() % pendingEpochBuckets)
+}
+
+// epoch is the invalidation count for name, read before a pread starts.
+func (r *pendingFUSEReads) epoch(name string) uint64 {
+	return r.epochs[pendingEpochBucket(name)].Load()
 }
 
 func newPendingFUSEReads(max int) *pendingFUSEReads {
@@ -213,9 +235,12 @@ func pendingReadJoinEnabled() bool {
 // adopt registers a pread that timed out. late delivers its result when the
 // syscall returns. It reports false (and registers nothing) when the
 // registry is full or already holds key.
-func (r *pendingFUSEReads) adopt(key pendingReadKey, buf []byte, late <-chan readResult) bool {
+//
+// epoch is r.epoch(key.name) read before the pread started: if the name was
+// invalidated since, the pread may hold old bytes and is not registered.
+func (r *pendingFUSEReads) adopt(key pendingReadKey, buf []byte, late <-chan readResult, epoch uint64) bool {
 	r.mu.Lock()
-	if _, ok := r.m[key]; ok || len(r.m) >= r.max {
+	if _, ok := r.m[key]; ok || len(r.m) >= r.max || r.epoch(key.name) != epoch {
 		r.mu.Unlock()
 		return false
 	}
@@ -249,11 +274,32 @@ func (r *pendingFUSEReads) forget(name string, tree bool) {
 	}
 	prefix := strings.TrimSuffix(name, "/") + "/"
 	r.mu.Lock()
+	if tree {
+		for i := range r.epochs {
+			r.epochs[i].Add(1)
+		}
+	} else {
+		r.epochs[pendingEpochBucket(name)].Add(1)
+	}
 	for k, pr := range r.m {
 		if k.name == name || tree && strings.HasPrefix(k.name, prefix) {
 			pr.stale.Store(true)
 			delete(r.m, k)
 		}
+	}
+	r.mu.Unlock()
+}
+
+// forgetAll drops every entry and invalidates every running pread (a
+// content reset after metadata reconciliation).
+func (r *pendingFUSEReads) forgetAll() {
+	r.mu.Lock()
+	for i := range r.epochs {
+		r.epochs[i].Add(1)
+	}
+	for k, pr := range r.m {
+		pr.stale.Store(true)
+		delete(r.m, k)
 	}
 	r.mu.Unlock()
 }

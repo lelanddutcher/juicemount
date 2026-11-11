@@ -1109,8 +1109,8 @@
   },
   "local_files": {
     "cmd/jm_fence.go": "11959cce13a1e10985fed61e172cff969bd04c1d8200ab79e723d611b9210b33",
-    "pkg/chunk/demand_first.go": "c24f5b9a473086f60ad1293527848c5116e55d06178d6b4570b9677a1d00b7a6",
-    "pkg/chunk/demand_first_test.go": "edc5901f74d8620cb14a47258942783823265284b948e7e2d1386ae1a026c6d5",
+    "pkg/chunk/demand_first.go": "2cbde05d611a71906d3eeaf3a6e2839652522c2abecd4771767a0f70b0874d66",
+    "pkg/chunk/demand_first_test.go": "2e0c3affcf407021162fe40e653b934ee168411a76b82c8fb0f2345c6309ce69",
     "pkg/chunk/ranged_first_read_test.go": "0b2c6bfdd311a2824e650b4fd3f019199c1a9b2caa64993eacfbbd81dab77ac9",
     "pkg/chunk/upload_cache_ownership_test.go": "ebb66944296ae43b5579e12a8688d5a4c03e9ef8eecb61107d0ef0427429d791",
     "pkg/fuse/rename_flags_darwin.go": "37e49f30f2017a7ea05d47154cedaf6a90ecdab24d3c5d3639af53b4de6d6abd",

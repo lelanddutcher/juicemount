@@ -234,6 +234,23 @@ func TestJMDemandFirstDoesNotWaitForOverrunDownload(t *testing.T) {
 	}
 }
 
+// The re-review's case (M-2): 1 MiB reads spend the quarter-block budget of a
+// 4 MiB block after one read. Against a late download the third read (and
+// every later one) must still send its own GET, never wait for it.
+func TestJMDemandFirstLateDownloadIgnoresBudget(t *testing.T) {
+	df := newDemandFirst(true, 4<<20)
+	df.fullNS.Store(int64(time.Second))
+	df.rangedNSPerKB.Store(int64(time.Millisecond))
+	df.mu.Lock()
+	df.fullAt["late"] = &fullDownload{start: time.Now().Add(-30 * time.Second)}
+	df.mu.Unlock()
+	for i := 1; i <= 3; i++ {
+		if df.piggyback("late", 1<<20) {
+			t.Fatalf("1 MiB read %d waited for a download 29 s past its expected end", i)
+		}
+	}
+}
+
 // Reads that bypass one download total at most a quarter block; later reads
 // in that block wait for it, so a sequential reader does not fetch the block
 // twice.

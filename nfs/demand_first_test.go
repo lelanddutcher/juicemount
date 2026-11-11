@@ -2,6 +2,7 @@ package nfs
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	"github.com/lelanddutcher/juicemount/internal/netprofile"
+	"github.com/lelanddutcher/juicemount/metadata"
 )
 
 // Demand first on a slow link (demand_first.go). The Linux remote lab has no
@@ -387,6 +389,74 @@ func TestJUKEBOXInvalidationDropsJoin(t *testing.T) {
 	pendingFUSEReadResults.forget("dir", true) // other names are untouched
 }
 
+// The re-review's probe (M-1): an invalidation that lands while the pread
+// runs but before it passes its bound (and registers) must not be lost. The
+// key can stay the same (a same-size write that keeps the mtime), so adopt
+// must refuse the pre-write pread, and a retry reads afresh.
+func TestJUKEBOXInvalidationBeforeAdoptIsNotLost(t *testing.T) {
+	for _, mode := range []string{"file", "tree", "reset"} {
+		t.Run(mode, func(t *testing.T) {
+			resetPendingReads(t)
+			fp := newFakePread('O')
+			key := readKey("dir/reel.mov", 7, 1, 0, 4)
+			p := make([]byte, 4)
+			const bound = 100 * time.Millisecond
+			first := make(chan error, 1)
+			go func() {
+				q := make([]byte, 4)
+				_, err := joinOrReadFUSE(fp.read, key, "dir/reel.mov", q, 0, bound)
+				first <- err
+			}()
+			waitUntil(t, "the pread to start", func() bool { return fp.calls.Load() == 1 })
+			time.Sleep(20 * time.Millisecond)
+			switch mode { // the write lands; nothing is registered yet
+			case "file":
+				pendingFUSEReadResults.forget("dir/reel.mov", false)
+			case "tree":
+				pendingFUSEReadResults.forget("dir", true)
+			case "reset":
+				pendingFUSEReadResults.forgetAll()
+			}
+			if err := <-first; !errors.Is(err, errFUSETimeout) {
+				t.Fatalf("first read err %v, want the JUKEBOX timeout", err)
+			}
+			if n := pendingFUSEReadResults.len(); n != 0 {
+				t.Fatalf("the pre-write pread was registered (%d entries)", n)
+			}
+			fp.content.Store(byte('N'))
+			fp.unblock()
+			n, err := joinOrReadFUSE(fp.read, key, "dir/reel.mov", p, 0, time.Second)
+			if err != nil || string(p[:n]) != "NNNN" {
+				t.Fatalf("retry after the write = %q, %v; want a fresh read", p[:n], err)
+			}
+			if c := fp.calls.Load(); c != 2 {
+				t.Fatalf("preads %d, want 2: the retry must not join the pre-write pread", c)
+			}
+			waitPreadsDone(t)
+		})
+	}
+}
+
+// An invalidation of another name (in another bucket) does not stop a pread
+// from being joined.
+func TestJUKEBOXOtherNameInvalidationKeepsJoin(t *testing.T) {
+	resetPendingReads(t)
+	other := "other.mov"
+	for i := 0; pendingEpochBucket(other) == pendingEpochBucket("reel.mov"); i++ {
+		other = fmt.Sprintf("other%d.mov", i)
+	}
+	fp := newFakePread('O')
+	key := readKey("reel.mov", 7, 1, 0, 4)
+	p := make([]byte, 4)
+	go func() { time.Sleep(10 * time.Millisecond); pendingFUSEReadResults.forget(other, false) }()
+	joinOrReadFUSE(fp.read, key, "reel.mov", p, 0, 40*time.Millisecond)
+	if pendingFUSEReadResults.len() != 1 {
+		t.Fatal("an unrelated invalidation stopped the pread from being registered")
+	}
+	fp.unblock()
+	waitPreadsDone(t)
+}
+
 // A pread older than a few bounds is presumed wedged (a dead mount): a retry
 // starts its own instead of joining it for ever.
 func TestJUKEBOXDoesNotJoinWedgedPread(t *testing.T) {
@@ -471,6 +541,14 @@ func TestCachedFilePendingReadKey(t *testing.T) {
 	}
 	if (&cachedFile{name: "dir/._reel.mov", fuseFD: testFD, cachedInfo: &snapshotFileInfo{}}).pendingReadKey(0, 1) != nil {
 		t.Fatal("an AppleDouble sidecar must not join")
+	}
+	if (&cachedFile{name: "dir/.DS_Store", fuseFD: testFD, cachedInfo: &snapshotFileInfo{}}).pendingReadKey(0, 1) != nil {
+		t.Fatal(".DS_Store (sidecar-cached) must not join")
+	}
+	v := metadata.MirrorToken{Incarnation: "i", Revision: 3}
+	g := &cachedFile{name: "x", fuseFD: testFD, cachedInfo: &snapshotFileInfo{}, cacheIdentity: metadata.CachedFileIdentity{Version: v}}
+	if k := g.pendingReadKey(0, 1); k == nil || k.version != v {
+		t.Fatalf("the mirror revision must be part of the key: %+v", k)
 	}
 	if (&cachedFile{name: "x", fuseFD: testFD}).pendingReadKey(0, 1) != nil {
 		t.Fatal("a file without open-time identity must not join")

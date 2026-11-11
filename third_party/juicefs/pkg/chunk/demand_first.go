@@ -156,7 +156,8 @@ func (d *demandFirst) observeRanged(used time.Duration, n int) {
 //   - otherwise send our own GET, while the reads that bypassed this
 //     download total at most a quarter block. Past that budget the block is
 //     being read through anyway (a sequential reader), so later reads wait
-//     for the download instead of fetching the block a second time.
+//     for the download instead of fetching the block a second time; but
+//     never for a late download, whatever the budget.
 func (d *demandFirst) piggyback(key string, n int) bool {
 	if d == nil || !d.enabled {
 		return true
@@ -171,7 +172,13 @@ func (d *demandFirst) piggyback(key string, n int) bool {
 	if full > 0 && perKB > 0 {
 		remaining := time.Duration(full) - time.Since(dl.start)
 		ranged := time.Duration(perKB) * time.Duration((n+1023)/1024)
-		if remaining >= 0 && remaining <= 2*ranged {
+		if remaining < 0 {
+			// Late: its end is unknown, so no read waits for it, budget
+			// or not (on a lossy link that wait was the 53 s first byte).
+			dl.bypassed += n
+			return false
+		}
+		if remaining <= 2*ranged {
 			return true
 		}
 	}

@@ -1128,6 +1128,7 @@ func (h *JuiceMountHandler) onScanContentInvalidated(inMountPath string, oldInod
 	if h == nil || inMountPath == "" {
 		return
 	}
+	pendingFUSEReadResults.forget(inMountPath, false)
 	if h.memBuf != nil {
 		h.memBuf.Invalidate(inMountPath)
 	}
@@ -1143,6 +1144,7 @@ func (h *JuiceMountHandler) onContentReset() {
 	if h == nil {
 		return
 	}
+	pendingFUSEReadResults.forgetAll()
 	if h.memBuf != nil {
 		h.memBuf.InvalidateAll()
 	}
@@ -1155,14 +1157,22 @@ func (h *JuiceMountHandler) onContentReset() {
 // counterparts of invalidatePooledFDs / invalidatePooledFDTree, for mutations
 // this process learned about SECOND-HAND rather than performed itself.
 func (h *JuiceMountHandler) invalidatePooledReadFDs(inMountPath string) {
-	if h == nil || h.fdPool == nil || inMountPath == "" {
+	if h == nil || inMountPath == "" {
+		return
+	}
+	pendingFUSEReadResults.forget(inMountPath, false)
+	if h.fdPool == nil {
 		return
 	}
 	h.fdPool.InvalidateReads(path.Join(h.fusePath, inMountPath))
 }
 
 func (h *JuiceMountHandler) invalidatePooledReadFDTree(inMountPath string) {
-	if h == nil || h.fdPool == nil || inMountPath == "" {
+	if h == nil || inMountPath == "" {
+		return
+	}
+	pendingFUSEReadResults.forget(inMountPath, true)
+	if h.fdPool == nil {
 		return
 	}
 	h.fdPool.InvalidateReadsTree(path.Join(h.fusePath, inMountPath))
@@ -5801,6 +5811,10 @@ func boundedFUSEFileReadAt(fd *os.File, p []byte, off int64, bound time.Duration
 // private buffer, so the client's JUKEBOX retry can join it. refused reports
 // that the data gate was full and no pread started.
 func boundedFUSEReadCall(read func([]byte, int64) (int, error), p []byte, off int64, bound time.Duration, demand *demandGate, key *pendingReadKey) (n int, err error, refused bool) {
+	var epoch uint64
+	if key != nil {
+		epoch = pendingFUSEReadResults.epoch(key.name) // before the pread starts
+	}
 	releaseData, dataOK := acquireFUSEData()
 	if !dataOK {
 		noteFUSEDataRefused()
@@ -5817,7 +5831,7 @@ func boundedFUSEReadCall(read func([]byte, int64) (int, error), p []byte, off in
 	})
 	if !done {
 		if key != nil {
-			pendingFUSEReadResults.adopt(*key, tmp, late)
+			pendingFUSEReadResults.adopt(*key, tmp, late, epoch)
 		}
 		return 0, errFUSETimeout, false
 	}
@@ -5833,15 +5847,16 @@ func (f *cachedFile) boundedFUSEReadAt(p []byte, off int64) (int, error) {
 }
 
 // pendingReadKey names this read for the JUKEBOX-retry join, or returns nil
-// when it must never join: no open-time identity, or an AppleDouble sidecar
-// (a complete sidecar read seeds the shared sidecar cache).
+// when it must never join: no open-time identity, or a name the sidecar cache
+// takes (AppleDouble ._ files, .DS_Store and the like), because a complete
+// read of one seeds that shared cache.
 func (f *cachedFile) pendingReadKey(off int64, n int) *pendingReadKey {
-	if f.cachedInfo == nil || f.fuseFD == nil || isAppleDoubleNFSPath(f.name) {
+	if f.cachedInfo == nil || f.fuseFD == nil || isAppleDoubleNFSPath(f.name) || cacheableMetaName(path.Base(f.name)) {
 		return nil
 	}
 	return &pendingReadKey{
 		name: f.name, inode: f.inode, size: f.cachedInfo.size, mtime: f.cachedInfo.mtime.UnixNano(),
-		fd: f.fuseFD, off: off, n: n,
+		version: f.cacheIdentity.Version, fd: f.fuseFD, off: off, n: n,
 	}
 }
 
