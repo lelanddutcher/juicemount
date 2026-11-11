@@ -5855,6 +5855,9 @@ func boundedFUSEReadCall(read func([]byte, int64) (int, error), p []byte, off in
 		}
 	})
 	if !done {
+		if demand != nil {
+			noteDemandJukebox()
+		}
 		adopted := false
 		if key != nil {
 			adopted = pendingFUSEReadResults.adopt(*key, tmp, late, epoch)

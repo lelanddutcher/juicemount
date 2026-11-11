@@ -142,6 +142,9 @@ type ReadaheadManager struct {
 	demand      *demandGate
 	demandFirst func() bool
 	demandDefer time.Duration
+	// blockNS is the smoothed time of one read-ahead block read, scaled to
+	// a whole block (demand_first.go rule 4).
+	blockNS atomic.Int64
 
 	// Stats
 	statsMu    sync.Mutex
@@ -551,6 +554,29 @@ func (rm *ReadaheadManager) noteBlockRead(n int, dur time.Duration) {
 	if rm.profile != nil {
 		rm.profile.ObserveThroughput(int64(n), dur)
 	}
+	if n > 0 && dur > 0 {
+		observeBlockEWMA(&rm.blockNS, time.Duration(int64(dur)*readaheadBlockSize/int64(n)))
+	}
+}
+
+// observeBlockEWMA folds one block time into v with weight 1/4.
+func observeBlockEWMA(v *atomic.Int64, sample time.Duration) {
+	for {
+		old := v.Load()
+		next := int64(sample)
+		if old != 0 {
+			next = old + (next-old)/4
+		}
+		if v.CompareAndSwap(old, next) {
+			return
+		}
+	}
+}
+
+// blocksSlow is rule 4 of demand_first.go: a speculative block takes longer
+// than a demand read may wait for it.
+func (rm *ReadaheadManager) blocksSlow() bool {
+	return time.Duration(rm.blockNS.Load()) > demandDeferMax || recentDemandJukebox()
 }
 
 // serialBlocks is the historical round: one 4 MB buffer, one ReadAt at a time
@@ -729,6 +755,11 @@ func (rm *ReadaheadManager) waitForDemand(cancel func() bool) {
 	if max <= 0 {
 		max = demandDeferMax
 	}
+	if rm.blocksSlow() {
+		// Rule 4: no time limit while blocks are slow; the cancel checks
+		// below still end the wait.
+		max = demandDeferSlow
+	}
 	start := time.Now()
 	deadline := start.Add(max)
 	if readTimelineOn() {
@@ -783,6 +814,9 @@ func (rm *ReadaheadManager) deferWindowClaim(inode uint64, tr *readTracker, mapp
 func (rm *ReadaheadManager) windowStreamCapLocked(tr *readTracker, max int, demandFirst bool) int {
 	if !demandFirst {
 		return max
+	}
+	if tr.sequentialBytes < readaheadBlockSize && rm.blocksSlow() {
+		return 0 // rule 4: a scrub gets no speculative block while blocks are slow
 	}
 	return demandStreamCap(tr.sequentialBytes, max)
 }

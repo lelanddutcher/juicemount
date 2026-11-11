@@ -4,6 +4,31 @@
 
 ### App
 
+- On a slow or distant link, the first frame of a clip that is not cached,
+  and each jump while scrubbing it, arrive much sooner, and read-ahead no
+  longer holds up the reads the editor waits for. A "demand read" is a read
+  that an application is waiting for. Three changes:
+  - JuiceFS (bundled, now `-jm7`): a read that misses the cache fetches the
+    1 MiB around it as four 256 KiB requests that run at the same time, and
+    serves the rest of that 1 MiB from memory. Before, macOS sent the 1 MiB
+    as eight 128 KiB reads, one after another, each its own request, and each
+    also started a download of the whole 4 MiB block. A jump now costs about
+    one request instead of eight, and fetches about the bytes it needs
+    instead of about seven times as many. A block that is read all the way
+    through still goes to the local cache. Encrypted volumes are unchanged:
+    they must fetch whole blocks.
+  - Read-ahead can no longer use the slots that demand reads need. Before,
+    on a slow link both shared one limit of 8 concurrent file reads, so a
+    read the editor waited for could be refused while read-ahead held the
+    slots. macOS then waited up to 30 s before it asked again.
+  - When read-ahead blocks take longer than 8 s (for example 200 ms delay and
+    1% loss without server BBR), a scrub gets no read-ahead, and read-ahead
+    waits until the reads the editor waits for have finished. A retry of a
+    read that is still in progress joins it for up to 150 s (before: 24 s),
+    instead of starting a second read of the same bytes.
+- `JM_READ_TIMELINE=1` (a lab switch) logs every step of each read: the NFS
+  read, the file-read slot, the JuiceFS request with its first byte, and
+  read-ahead. Without it, the app logs these steps at Debug level only.
 - On a lossy but working link, the volume no longer goes offline by mistake.
   Before, one failed connection check marked the server unreachable. On a
   link with 200 ms delay and 1% packet loss, one lost packet was enough, so

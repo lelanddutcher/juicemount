@@ -15,6 +15,7 @@ import (
 // These tests change process-wide offline state; none run in parallel.
 func resetPrefetchOfflineState(t *testing.T) {
 	t.Helper()
+	resetDemandJukebox(t)
 	prior := pin.State()
 	pin.SetOffline(false)
 	pin.SetAutoOffline(false, "")

@@ -1,6 +1,18 @@
 --- a/pkg/chunk/cached_store.go
 +++ b/pkg/chunk/cached_store.go
-@@ -164,7 +164,9 @@
+@@ -157,20 +157,36 @@
+ 	// ranged read on an encrypted volume, at any offset: its Get downloads
+ 	// and decrypts the whole object for any range, and the prefetch after a
+ 	// ranged read would download the block a second time.
+-	if s.store.seekable && !s.store.conf.Encrypted && len(p) <= blockSize/4 && (boff > 0 || s.store.fetcher != nil && s.store.fetcher.workers > 0) {
+-		if s.store.downLimit != nil {
++	// With --demand-first the read goes through demand spans (demand_spans.go),
++	// at any offset, and queues no whole-block prefetch.
++	spans := s.store.spansOn()
++	if s.store.seekable && !s.store.conf.Encrypted && len(p) <= blockSize/4 && (boff > 0 || spans || s.store.fetcher != nil && s.store.fetcher.workers > 0) {
++		if s.store.downLimit != nil && !spans {
+ 			s.store.downLimit.Wait(int64(len(p)))
+ 		}
  		var fullPage *Page
  		var err error
  		if s.store.demand.piggyback(key, len(p)) { // JuiceMount: --demand-first
@@ -10,7 +22,24 @@
  		}
  		if fullPage != nil {
  			defer fullPage.Release()
-@@ -181,9 +183,11 @@
+ 			if err == nil { // piggybacked a full read
+ 				n = copy(p, fullPage.Data[boff:])
+ 				return n, nil
++			}
++		}
++		if spans {
++			sst := time.Now()
++			got, started, ok := s.store.spans.read(key, boff, p, blockSize)
++			readTimeline("rt jfs span read key=%s boff=%d len=%d started_parts=%d ms=%d ok=%v", key, boff, len(p), started, time.Since(sst).Milliseconds(), ok)
++			if ok {
++				return got, nil
++			}
++			if s.store.downLimit != nil {
++				s.store.downLimit.Wait(int64(len(p)))
+ 			}
+ 		}
+ 		// partial read
+@@ -181,9 +197,11 @@
  		)
  		page.Acquire()
  		endDemand := s.store.demand.beginDemand(key)
@@ -22,7 +51,7 @@
  			if err == nil {
  				n, err = io.ReadFull(in, p)
  				_ = in.Close()
-@@ -192,6 +196,7 @@
+@@ -192,6 +210,7 @@
  		}, s.store.conf.GetTimeout)
  		used := time.Since(st)
  		endDemand()
@@ -30,7 +59,18 @@
  		if err == nil {
  			s.store.demand.observeRanged(used, len(p))
  		}
-@@ -207,7 +212,10 @@
+@@ -199,7 +218,9 @@
+ 		s.store.objectDataBytes.WithLabelValues("GET", sc).Add(float64(n))
+ 		s.store.objectReqsHistogram.WithLabelValues("GET", sc).Observe(used.Seconds())
+ 		if err == nil {
+-			s.store.fetcher.fetch(key)
++			if !spans {
++				s.store.fetcher.fetch(key)
++			}
+ 			return n, nil
+ 		} else {
+ 			s.store.objectReqErrors.Add(1)
+@@ -207,7 +228,10 @@
  		}
  	}
  
@@ -41,7 +81,7 @@
  		tmp := page
  		if boff > 0 || len(p) < blockSize {
  			tmp = NewOffPage(blockSize)
-@@ -219,6 +227,7 @@
+@@ -219,6 +243,7 @@
  		endFull(err)
  		return tmp, err
  	})
@@ -49,7 +89,15 @@
  	defer block.Release()
  	if err != nil {
  		return 0, err
-@@ -770,6 +779,7 @@
+@@ -714,6 +739,7 @@
+ 	endHour       int
+ 	compressor    compress.Compressor
+ 	seekable      bool
++	spans         *spanCache // JuiceMount: --demand-first (demand_spans.go)
+ 	upLimit       *ratelimit.Bucket
+ 	downLimit     *ratelimit.Bucket
+ 
+@@ -770,6 +796,7 @@
  		defer p.Release()
  		// it will be retried in the upper layer.
  		in, err = store.storage.Get(key, 0, -1, object.WithRequestID(&reqID), object.WithStorageClass(&sc))
@@ -57,7 +105,17 @@
  		if err == nil {
  			n, err = io.ReadFull(in, p.Data)
  			_ = in.Close()
-@@ -992,7 +1002,8 @@
+@@ -866,6 +893,9 @@
+ 		config.Prefetch = 0 // disable prefetch if cache is disabled
+ 	}
+ 	store.demand = newDemandFirst(config.DemandFirst, config.BlockSize)
++	if config.DemandFirst {
++		store.spans = newStoreSpans(store)
++	}
+ 	store.fetcher = newPrefetcher(config.Prefetch, func(key string) { store.fillBlock(key, store.bcache) })
+ 
+ 	if store.conf.CacheDir != "memory" && store.conf.Writeback {
+@@ -992,7 +1022,8 @@
  	}
  	// --demand-first: let ranged demand reads of other blocks finish before
  	// this download shares the link with them, then check the cache again.
@@ -67,7 +125,7 @@
  		if _, ok := bcache.exist(key); ok {
  			return
  		}
-@@ -1012,8 +1023,10 @@
+@@ -1012,8 +1043,10 @@
  			}
  		}
  		endFull := store.demand.beginFull(key)

@@ -21,8 +21,8 @@ func TestBackgroundCannotOccupyTheWholeGate(t *testing.T) {
 	if !fuseDataGateEnabled {
 		t.Skip("gate disabled in this build")
 	}
-	fuseDataInFlight.Store(0)
-	t.Cleanup(func() { fuseDataInFlight.Store(0) })
+	resetFUSEDataGateCounts()
+	t.Cleanup(func() { resetFUSEDataGateCounts() })
 
 	// Fill the gate as far as BACKGROUND is allowed to.
 	var rels []func()

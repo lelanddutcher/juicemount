@@ -157,8 +157,11 @@ func (s *rSlice) ReadAt(ctx context.Context, page *Page, off int) (n int, err er
 	// ranged read on an encrypted volume, at any offset: its Get downloads
 	// and decrypts the whole object for any range, and the prefetch after a
 	// ranged read would download the block a second time.
-	if s.store.seekable && !s.store.conf.Encrypted && len(p) <= blockSize/4 && (boff > 0 || s.store.fetcher != nil && s.store.fetcher.workers > 0) {
-		if s.store.downLimit != nil {
+	// With --demand-first the read goes through demand spans (demand_spans.go),
+	// at any offset, and queues no whole-block prefetch.
+	spans := s.store.spansOn()
+	if s.store.seekable && !s.store.conf.Encrypted && len(p) <= blockSize/4 && (boff > 0 || spans || s.store.fetcher != nil && s.store.fetcher.workers > 0) {
+		if s.store.downLimit != nil && !spans {
 			s.store.downLimit.Wait(int64(len(p)))
 		}
 		var fullPage *Page
@@ -173,6 +176,17 @@ func (s *rSlice) ReadAt(ctx context.Context, page *Page, off int) (n int, err er
 			if err == nil { // piggybacked a full read
 				n = copy(p, fullPage.Data[boff:])
 				return n, nil
+			}
+		}
+		if spans {
+			sst := time.Now()
+			got, started, ok := s.store.spans.read(key, boff, p, blockSize)
+			readTimeline("rt jfs span read key=%s boff=%d len=%d started_parts=%d ms=%d ok=%v", key, boff, len(p), started, time.Since(sst).Milliseconds(), ok)
+			if ok {
+				return got, nil
+			}
+			if s.store.downLimit != nil {
+				s.store.downLimit.Wait(int64(len(p)))
 			}
 		}
 		// partial read
@@ -204,7 +218,9 @@ func (s *rSlice) ReadAt(ctx context.Context, page *Page, off int) (n int, err er
 		s.store.objectDataBytes.WithLabelValues("GET", sc).Add(float64(n))
 		s.store.objectReqsHistogram.WithLabelValues("GET", sc).Observe(used.Seconds())
 		if err == nil {
-			s.store.fetcher.fetch(key)
+			if !spans {
+				s.store.fetcher.fetch(key)
+			}
 			return n, nil
 		} else {
 			s.store.objectReqErrors.Add(1)
@@ -723,6 +739,7 @@ type cachedStore struct {
 	endHour       int
 	compressor    compress.Compressor
 	seekable      bool
+	spans         *spanCache // JuiceMount: --demand-first (demand_spans.go)
 	upLimit       *ratelimit.Bucket
 	downLimit     *ratelimit.Bucket
 
@@ -876,6 +893,9 @@ func NewCachedStore(storage object.ObjectStorage, config Config, reg prometheus.
 		config.Prefetch = 0 // disable prefetch if cache is disabled
 	}
 	store.demand = newDemandFirst(config.DemandFirst, config.BlockSize)
+	if config.DemandFirst {
+		store.spans = newStoreSpans(store)
+	}
 	store.fetcher = newPrefetcher(config.Prefetch, func(key string) { store.fillBlock(key, store.bcache) })
 
 	if store.conf.CacheDir != "memory" && store.conf.Writeback {
