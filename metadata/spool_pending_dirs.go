@@ -84,7 +84,11 @@ func (s *SpoolStore) DeletePendingDir(dirPath string, id int64) (bool, error) {
 var ErrPendingDirMissing = errors.New("pending folder row not found")
 
 // ErrPendingDirConflict reports a rename onto a path that already has a
-// pending folder row.
+// pending folder row. This is refused even when that folder is empty: POSIX
+// would replace it, but the destination's row, mirror entry and reserved
+// inode would have to go in the same transaction. The NFS handler refuses
+// such a rename earlier with JUKEBOX and wakes the drainer, so the retry
+// finds the folders on the volume and takes the ordinary rename path.
 var ErrPendingDirConflict = errors.New("pending folder already exists at the destination")
 
 // MovePendingDirs renames the pending row of oldPath and of every pending

@@ -387,8 +387,11 @@ func TestSpooledMkdirFallsBackToPlainMkdirWhenNumberUnknown(t *testing.T) {
 	fake.mu.Lock()
 	left, releases := len(fake.reserved), fake.releaseSeen
 	fake.mu.Unlock()
-	if releases == 0 || left != 0 {
-		t.Fatalf("after ESRCH: %d release messages, %d numbers still reserved", releases, left)
+	// The fake forgot every number itself, so only the messages can be
+	// checked: the pool tried to give its numbers back.
+	_ = left
+	if releases == 0 {
+		t.Fatal("after a restart: no release message")
 	}
 }
 
@@ -1020,5 +1023,35 @@ func TestSpooledMkdirAmbiguousFailureKeepsThePool(t *testing.T) {
 	drainer.dirInodes.mu.Unlock()
 	if after == 0 || after+1 < before {
 		t.Fatalf("pool went from %d to %d numbers: dropped after one ambiguous failure", before, after)
+	}
+}
+
+// L2: juicefs refuses one folder's number with ESRCH but still holds the
+// others (not a restart). The pool keeps its numbers; exactly one number is
+// given back, as the probe.
+func TestSpooledMkdirESRCHForOneNumberKeepsThePool(t *testing.T) {
+	jfs, fuseRoot, _, drainer, fake := newSpooledMkdirFixture(t)
+	if err := jfs.MkdirAll("w/odd", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	drainer.dirInodes.mu.Lock()
+	before := drainer.dirInodes.availableLocked()
+	drainer.dirInodes.mu.Unlock()
+	fake.mu.Lock()
+	fake.mkdirErr = syscall.ESRCH // this number only
+	releasesBefore := fake.releaseSeen
+	fake.mu.Unlock()
+	drainer.materializePendingDirs()
+	if _, err := os.Stat(filepath.Join(fuseRoot, "w/odd")); err != nil {
+		t.Fatalf("folder not created plainly: %v", err)
+	}
+	drainer.dirInodes.mu.Lock()
+	after := drainer.dirInodes.availableLocked()
+	drainer.dirInodes.mu.Unlock()
+	fake.mu.Lock()
+	releases := fake.releaseSeen - releasesBefore
+	fake.mu.Unlock()
+	if after != before-1 || releases != 1 {
+		t.Fatalf("pool %d -> %d numbers with %d release messages; want one number given back as the probe", before, after, releases)
 	}
 }

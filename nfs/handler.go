@@ -4838,6 +4838,12 @@ func (jfs *juiceFS) rename(oldpath, newpath string, op *namespaceOperation) erro
 	pendingSource := false
 	if spool := jfs.handler.spool.Load(); spool != nil && oldpath != newpath {
 		_, pendingSource = spool.pendingDir(oldpath)
+		// A rename onto a pending folder (even an empty one), or of a pending
+		// folder onto an existing name, is not done locally: the drainer is
+		// woken to create the pending folders on the volume, and the client's
+		// JUKEBOX retry then takes the ordinary rename path. Offline, it
+		// waits for the link (ErrPendingDirConflict documents the same rule
+		// for the durable rows).
 		if spool.pendingAtOrUnder(newpath) || (pendingSource && destEntry != nil) {
 			spool.SignalReady()
 			return errFUSETimeout

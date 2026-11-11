@@ -1177,9 +1177,19 @@ func (s *SpoolStore) ListReadySkipping(limit int, includeWaiting bool, minSize i
 	return s.listReadyLarger(limit, includeWaiting, minSize, skip)
 }
 
+// folderWait is a row a filtered listing found waiting for a folder.
+type folderWait struct {
+	id   int64
+	path string
+}
+
 // markFolderWaits records, per pending folder id, the rows a filtered
-// listing found waiting for it.
-func (s *SpoolStore) markFolderWaits(byFolder map[int64][]any) error {
+// listing found waiting for it. Each mark is conditional: the folder must
+// still be pending and the row still ready at the scanned path. The scan
+// read the folder from memory without a lock held to here, so the folder
+// may have landed (and released its rows) or the row moved meanwhile; an
+// unconditional mark would then strand the row until a restart.
+func (s *SpoolStore) markFolderWaits(byFolder map[int64][]folderWait) error {
 	if len(byFolder) == 0 {
 		return nil
 	}
@@ -1190,14 +1200,15 @@ func (s *SpoolStore) markFolderWaits(byFolder map[int64][]any) error {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
-	st, err := tx.Prepare(`UPDATE spool_entries SET waiting_folder=? WHERE id=?`)
+	st, err := tx.Prepare(`UPDATE spool_entries SET waiting_folder=? WHERE id=? AND nfs_path=? AND drain_state=?
+		AND EXISTS (SELECT 1 FROM pending_dirs WHERE id=?)`)
 	if err != nil {
 		return err
 	}
 	defer st.Close()
-	for folder, ids := range byFolder {
-		for _, id := range ids {
-			if _, err := st.Exec(folder, id); err != nil {
+	for folder, rows := range byFolder {
+		for _, r := range rows {
+			if _, err := st.Exec(folder, r.id, r.path, DrainReady, folder); err != nil {
 				return fmt.Errorf("mark rows waiting for a folder: %w", err)
 			}
 		}
@@ -1269,11 +1280,14 @@ func (s *SpoolStore) listReadyLarger(limit int, includeWaiting bool, minSize int
 	// Filtered: a light scan in FIFO order (the (drain_state, created_at)
 	// index; no subquery, two columns) finds rows the filter keeps, then
 	// the full predicate runs on those ids only.
+	// Every condition except the per-row "newer row" subquery runs in the
+	// scan, so the full query sees only rows that can be listed (a media
+	// listing over a backlog of small rows reads no full rows at all).
 	var out []*SpoolRow
 	var afterCreated, afterID int64
 	first := true
 	for len(out) < limit {
-		args := []any{DrainReady}
+		args := append([]any(nil), base...)
 		cursor := ""
 		if !first {
 			cursor = " AND (created_at>? OR (created_at=? AND id>?))"
@@ -1281,12 +1295,14 @@ func (s *SpoolStore) listReadyLarger(limit int, includeWaiting bool, minSize int
 		}
 		first = false
 		args = append(args, readyScanRows)
-		rows, err := s.db.Query(`SELECT id, nfs_path, created_at FROM spool_entries WHERE drain_state=? AND waiting_folder=0`+cursor+` ORDER BY created_at ASC, id ASC LIMIT ?`, args...)
+		rows, err := s.db.Query(`SELECT id, nfs_path, created_at FROM spool_entries
+			WHERE drain_state=? AND waiting_folder=0 AND punched_end=0 AND clone_hold='' AND qualification_hold='' AND retired_by=0 AND replacement_witness IS NULL AND retry_after_ns<=?`+
+			waitClause+sizeClause+cursor+` ORDER BY created_at ASC, id ASC LIMIT ?`, args...)
 		if err != nil {
 			return nil, fmt.Errorf("spool list ready (scan): %w", err)
 		}
 		var ids []any
-		waiting := map[int64][]any{}
+		waiting := map[int64][]folderWait{}
 		n := 0
 		for rows.Next() {
 			var id, created int64
@@ -1298,7 +1314,7 @@ func (s *SpoolStore) listReadyLarger(limit int, includeWaiting bool, minSize int
 			n++
 			afterCreated, afterID = created, id
 			if folder, waits := skip(p); waits && folder > 0 {
-				waiting[folder] = append(waiting[folder], id)
+				waiting[folder] = append(waiting[folder], folderWait{id: id, path: p})
 			} else if !waits {
 				ids = append(ids, id)
 			}
