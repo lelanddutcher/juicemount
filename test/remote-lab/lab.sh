@@ -124,12 +124,13 @@ format_volume() {
 # The client mount: the flags the Mac app gives its own juicefs child
 # (health/fuse.go: desktopJuiceFSMountArgs, session, readahead and metadata
 # cache TTLs), with the slow-link class policy for buffer, prefetch and
-# object timeouts (internal/netprofile, desktopJuiceFSObjectIOArgs).
+# object timeouts (internal/netprofile, desktopJuiceFSObjectIOArgs), and
+# --demand-first (desktopJuiceFSDemandFirstArgs).
 # JMLAB_MOUNT_OPTS appends to them.
 MOUNT_FLAGS=(
   --no-usage-report --no-bgjob --max-deletes 0
   --heartbeat 60s --max-uploads 4 --max-readahead 1M
-  --buffer-size 512 --prefetch 1
+  --buffer-size 512 --prefetch 1 --demand-first
   --get-timeout 2m --put-timeout 3m --io-retries 3
   --attr-cache 10 --entry-cache 60 --dir-entry-cache 60 --negative-entry-cache 5
   --cache-dir /var/jfscache --cache-size 20480

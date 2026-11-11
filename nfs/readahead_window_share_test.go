@@ -50,6 +50,7 @@ func testSlowWindowLeavesDrainerASlot(t *testing.T, fgHeld int, fgLate bool) {
 	t.Cleanup(func() { fuseDataInFlight.Store(0) })
 	dir, name := windowTestFile(t, 400)
 	rm := NewReadaheadManager(dir, nil, slowProfile(t))
+	windowMechanicsOnly(rm)
 	defer rm.Stop()
 	var peak, inflight atomic.Int32
 	rm.prefetchReadAt = func(fd *os.File, buf []byte, off int64) (int, error) {
@@ -237,6 +238,7 @@ func TestSlowWindowStopsOnMeteredHandoff(t *testing.T) {
 	dir, name := windowTestFile(t, 64)
 	prof := slowProfile(t)
 	rm := NewReadaheadManager(dir, nil, prof)
+	windowMechanicsOnly(rm)
 	defer rm.Stop()
 	br := newBlockingReads()
 	rm.prefetchReadAt = br.readAt
@@ -263,6 +265,7 @@ func TestSlowWindowStopsOnBindingShutdown(t *testing.T) {
 	forceDefaultClass(t, netprofile.ClassSlow)
 	dir, name := windowTestFile(t, 64)
 	rm := NewReadaheadManager(dir, nil, slowProfile(t))
+	windowMechanicsOnly(rm)
 	defer rm.Stop()
 	ctx, cancel := context.WithCancel(context.Background())
 	b := &cacheBinding{workCtx: ctx}

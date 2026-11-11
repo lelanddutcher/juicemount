@@ -5617,25 +5617,30 @@ func readAtBounded(fd *os.File, buf []byte, off int64, timeout time.Duration) (i
 // ACTUALLY returns; releasing at the deadline would let every retry start one
 // more wedged syscall and defeat the concurrency ceiling.
 func readAtCallBounded(read func([]byte, int64) (int, error), buf []byte, off int64, timeout time.Duration, afterReturn func()) (int, error, bool) {
-	type res struct {
-		n   int
-		err error
-	}
-	ch := make(chan res, 1)
+	n, err, done, _ := readAtCallBoundedLate(read, buf, off, timeout, afterReturn)
+	return n, err, done
+}
+
+// readAtCallBoundedLate is readAtCallBounded that, on timeout, also returns
+// the channel on which the abandoned pread delivers its result when its
+// syscall returns (after afterReturn ran). The online FUSE path hands it to
+// pendingFUSEReadResults so a JUKEBOX retry can join the running pread.
+func readAtCallBoundedLate(read func([]byte, int64) (int, error), buf []byte, off int64, timeout time.Duration, afterReturn func()) (int, error, bool, <-chan readResult) {
+	ch := make(chan readResult, 1)
 	go func() {
 		n, err := read(buf, off)
 		if afterReturn != nil {
 			afterReturn()
 		}
-		ch <- res{n, err}
+		ch <- readResult{n, err}
 	}()
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 	select {
 	case r := <-ch:
-		return r.n, r.err, true
+		return r.n, r.err, true, nil
 	case <-timer.C:
-		return 0, nil, false
+		return 0, nil, false, ch
 	}
 }
 
@@ -5777,29 +5782,75 @@ func (f *cachedFile) ensureFuseFD() error {
 // goroutine that may outlive the RPC: a timed-out pread retains its private
 // buffer and its data-gate slot until the kernel call really returns.
 func boundedFUSEFileReadAt(fd *os.File, p []byte, off int64, bound time.Duration) (int, error) {
+	n, err, _ := boundedFUSEReadCall(fd.ReadAt, p, off, bound, nil, nil)
+	return n, err
+}
+
+// boundedFUSEReadCall is boundedFUSEFileReadAt's core. A non-nil demand
+// counts the pread as a demand read until its syscall returns. A non-nil key
+// registers a pread that times out in pendingFUSEReadResults, with its
+// private buffer, so the client's JUKEBOX retry can join it. refused reports
+// that the data gate was full and no pread started.
+func boundedFUSEReadCall(read func([]byte, int64) (int, error), p []byte, off int64, bound time.Duration, demand *demandGate, key *pendingReadKey) (n int, err error, refused bool) {
 	releaseData, dataOK := acquireFUSEData()
 	if !dataOK {
 		noteFUSEDataRefused()
-		return 0, errFUSETimeout
+		return 0, errFUSETimeout, true
+	}
+	endDemand := func() {}
+	if demand != nil {
+		endDemand = demand.begin()
 	}
 	tmp := offlineReadBuf(len(p))
-	n, err, done := readAtCallBounded(fd.ReadAt, tmp, off, bound, releaseData)
+	n, err, done, late := readAtCallBoundedLate(read, tmp, off, bound, func() {
+		releaseData()
+		endDemand()
+	})
 	if !done {
-		return 0, errFUSETimeout
+		if key != nil {
+			pendingFUSEReadResults.adopt(*key, tmp, late)
+		}
+		return 0, errFUSETimeout, false
 	}
 	if n > 0 {
 		copy(p, tmp[:n])
 	}
 	releaseOfflineReadBuf(tmp, true)
-	return n, err
+	return n, err, false
 }
 
 func (f *cachedFile) boundedFUSEReadAt(p []byte, off int64) (int, error) {
-	bound := fuseReadTimeout()
-	n, err := boundedFUSEFileReadAt(f.fuseFD, p, off, bound)
+	return joinOrReadFUSE(f.fuseFD.ReadAt, f.fusePath, f.name, p, off, fuseReadTimeout())
+}
+
+// joinOrReadFUSE is the online foreground pread. A retry of a pread that
+// timed out and is still registered joins it (pendingFUSEReads.join) and
+// starts no new pread; otherwise it reads through boundedFUSEReadCall, counted
+// as a demand read.
+func joinOrReadFUSE(read func([]byte, int64) (int, error), fusePath, name string, p []byte, off int64, bound time.Duration) (int, error) {
+	var key *pendingReadKey
+	if fusePath != "" && pendingReadJoinEnabled() {
+		k := pendingReadKey{path: fusePath, off: off, n: len(p)}
+		if n, err, ok := pendingFUSEReadResults.join(k, p, bound); ok {
+			if errors.Is(err, errFUSETimeout) {
+				jmlog.Warn("FUSE pread still in flight; the JUKEBOX retry joined it and gets JUKEBOX again",
+					"path", name, "offset", off, "len", len(p), "timeout_ms", bound.Milliseconds())
+			} else {
+				jmlog.Info("FUSE pread finished after JUKEBOX; its bytes answer the retry",
+					"path", name, "offset", off, "len", len(p), "n", n)
+			}
+			return n, err
+		}
+		key = &k
+	}
+	n, err, refused := boundedFUSEReadCall(read, p, off, bound, foregroundDemand, key)
 	if errors.Is(err, errFUSETimeout) {
+		reason := "timed out"
+		if refused {
+			reason = "data gate full"
+		}
 		jmlog.Warn("FUSE pread timed out or saturated; returning retryable JUKEBOX",
-			"path", f.name, "offset", off, "len", len(p), "timeout_ms", bound.Milliseconds())
+			"path", name, "offset", off, "len", len(p), "timeout_ms", bound.Milliseconds(), "reason", reason)
 	}
 	return n, err
 }

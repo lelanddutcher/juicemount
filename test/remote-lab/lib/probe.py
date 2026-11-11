@@ -81,6 +81,7 @@ def summary(xs):
     s = sorted(xs)
     return {"n": len(s), "median_ms": round(statistics.median(s) * 1000, 2),
             "p90_ms": round(s[min(len(s) - 1, int(len(s) * 0.9))] * 1000, 2),
+            "p95_ms": round(s[min(len(s) - 1, int(len(s) * 0.95))] * 1000, 2),
             "min_ms": round(s[0] * 1000, 2), "max_ms": round(s[-1] * 1000, 2)}
 
 
@@ -223,6 +224,22 @@ def cmd_seq(a):
             "mbit_s": round(got * 8 / el / 1e6, 2), "client": delta(s0, stats())}
 
 
+# --- ttfb ---------------------------------------------------------------
+
+def cmd_ttfb(a):
+    """Open a large file and read 64 KiB at offset 0: the time to the first
+    byte, alone (seq also measures it, then keeps reading)."""
+    path = FIX + "/media/" + a.file
+    s0 = stats()
+    t0 = time.monotonic()
+    fd = os.open(path, os.O_RDONLY)
+    first = os.read(fd, 64 * 1024)
+    ttfb = time.monotonic() - t0
+    os.close(fd)
+    return {"op": "ttfb", "file": a.file, "ttfb_ms": round(ttfb * 1000, 2), "bytes": len(first),
+            "client": delta(s0, stats())}
+
+
 # --- scrub --------------------------------------------------------------
 
 def cmd_scrub(a):
@@ -231,7 +248,7 @@ def cmd_scrub(a):
     rng = random.Random(SEED + 200)
     plan = []
     for _ in range(a.reads):
-        n = rng.randint(1 * MIB, 4 * MIB)
+        n = rng.randint(a.min_kib * 1024, a.max_kib * 1024)
         plan.append((rng.randrange(0, size - n), n))
     s0 = stats()
     lat, done, nbytes = [], 0, 0
@@ -287,6 +304,8 @@ def main():
     s = sub.add_parser("open"); s.add_argument("--count", type=int, default=30)
     s = sub.add_parser("seq"); s.add_argument("--budget", type=float, default=60)
     s = sub.add_parser("scrub"); s.add_argument("--reads", type=int, default=50); s.add_argument("--budget", type=float, default=90)
+    s.add_argument("--min-kib", type=int, default=1024); s.add_argument("--max-kib", type=int, default=4096)
+    s = sub.add_parser("ttfb"); s.add_argument("--file", default="video_0.mov")
     s = sub.add_parser("write"); s.add_argument("--files", type=int, default=50); s.add_argument("--kib", type=int, default=64)
     s.add_argument("--tag", required=True); s.add_argument("--budget", type=float, default=90)
     a = p.parse_args()

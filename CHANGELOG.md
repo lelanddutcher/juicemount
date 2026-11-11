@@ -39,9 +39,30 @@
   instead of 0.36 s at 20 ms. Transactions watch, read and write the same
   keys as before. The bundled JuiceFS is now build `-jm5`.
 
+- On a slow or distant link, the bytes you are waiting for now come first.
+  Before, a read of a clip that was not cached often waited for a whole 4 MiB
+  block: the second read in a block joined the background download of that
+  block, and the app's own read-ahead started several more blocks after a
+  single 1 MB scrub read. On a lossy link one block takes about 50 s, so the
+  app's 8 s read limit expired and the Mac retried, and each retry started
+  another read. Now, on a slow or metered link: a small read fetches its own
+  bytes unless the block download is nearly done; the JuiceFS prefetcher and
+  the app's read-ahead wait (at most 10 s and 8 s) while a read you are
+  waiting for is in flight; read-ahead starts with one block in flight and
+  grows as you keep reading in order; a waiting read-ahead block is dropped
+  when you seek away; and a retry joins the read already running instead of
+  starting a new one. In the remote lab at 200 ms with 1% loss, a random
+  1 MiB read took 7.2 s (p50) and 11.7 s (p95) instead of 38 s and 54 s.
+  Without loss, the p95 went from 3.8 s to 1.8 s. The cost: a read that does
+  not wait for a block download fetches its bytes twice (at most 1 MiB), and
+  a cold sequential read without loss went from 8.9 to 7.9 Mbit/s in one lab
+  run. Fast and medium links and encrypted volumes behave as before. Field
+  switches: `JM_JFS_DEMAND_FIRST=0`, `JM_DEMAND_FIRST=0`,
+  `JM_FUSE_READ_JOIN=0`. The bundled JuiceFS is now build `-jm6`.
+
 ### Server
 
-- The Manager image ships the same JuiceFS build (`-jm5`). The Manager still
+- The Manager image ships the same JuiceFS build (`-jm6`). The Manager still
   accepts `-jm3` or later.
 - New opt-in file `server/docker-compose.tcp-bbr.yml`: the object store and
   the Redis proxy send with TCP BBR instead of cubic. Downloads to a Mac on a

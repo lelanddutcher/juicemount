@@ -135,6 +135,14 @@ type ReadaheadManager struct {
 	// windowCapOverride replaces windowBlockCap when > 0 (simulation only).
 	windowCapOverride int
 
+	// Demand first (demand_first.go). demand is the foreground demand-read
+	// gate (nil: foregroundDemand); demandFirst reports whether the rules
+	// apply now (nil: demandFirstActive); demandDefer bounds one wait (0:
+	// demandDeferMax). Tests replace them before reading.
+	demand      *demandGate
+	demandFirst func() bool
+	demandDefer time.Duration
+
 	// Stats
 	statsMu    sync.Mutex
 	triggered  int64
@@ -562,6 +570,10 @@ func (rm *ReadaheadManager) serialBlocks(fd *os.File, mapping *readaheadMappingJ
 		// user's actual read, inverting the priority this prefetcher exists to
 		// serve. If there is no room, drop the block; the next real read will
 		// fetch it.
+		rm.waitForDemand() // demand_first.go rule 1 (slow and metered only)
+		if !rm.prefetchAllowed() {
+			return
+		}
 		gateRelease, gateOK := tryAcquireFUSEDataBackground()
 		if !gateOK {
 			metrics.Default().IncReadQoSPrefetchShed()
@@ -674,6 +686,47 @@ func (rm *ReadaheadManager) windowBlockCap(pol netprofile.ReadaheadPolicy) int64
 	return limit
 }
 
+// demandFirstOn reports whether the demand-first rules apply now, for this
+// manager's profile (the one its policy uses).
+func (rm *ReadaheadManager) demandFirstOn() bool {
+	if rm.demandFirst != nil {
+		return rm.demandFirst()
+	}
+	if rm.profile != nil {
+		return demandFirstForClass(rm.profile.Class())
+	}
+	return demandFirstActive()
+}
+
+// waitForDemand is rule 1 of demand_first.go: before a read-ahead block
+// starts, wait while a demand read is in flight, at most demandDeferMax.
+// It reports whether it waited.
+func (rm *ReadaheadManager) waitForDemand() bool {
+	if !rm.demandFirstOn() {
+		return false
+	}
+	g := rm.demand
+	if g == nil {
+		g = foregroundDemand
+	}
+	max := rm.demandDefer
+	if max <= 0 {
+		max = demandDeferMax
+	}
+	waited, _ := g.waitIdle(max, rm.stopCh)
+	return waited > 0
+}
+
+// windowStreamCapLocked is rule 2 of demand_first.go: how many windowed
+// blocks this stream may have in flight. Without demand first it is max.
+// Caller holds rm.mu.
+func (rm *ReadaheadManager) windowStreamCapLocked(tr *readTracker, max int, demandFirst bool) int {
+	if !demandFirst {
+		return max
+	}
+	return demandStreamCap(tr.sequentialBytes, max)
+}
+
 // admitWindowBlock reserves one manager-wide windowed block slot.
 func (rm *ReadaheadManager) admitWindowBlock(limit int64) bool {
 	for {
@@ -776,11 +829,13 @@ func (rm *ReadaheadManager) windowBlocks(inode uint64, tr *readTracker, gen uint
 				stop()
 			} else {
 				limit := rm.windowBlockCap(pol)
+				demandFirst := rm.demandFirstOn()
 				rm.mu.Lock()
 				live := !rm.stopped && rm.trackers[inode] == tr && time.Since(tr.lastAccess) <= rm.windowIdle
 				inFile := sizeLimit < 0 || tr.windowNext < sizeLimit
+				underStreamCap := inflight < rm.windowStreamCapLocked(tr, int(limit), demandFirst)
 				switch {
-				case live && inFile && tr.windowNext < tr.windowEnd && rm.admitWindowBlock(limit):
+				case live && inFile && tr.windowNext < tr.windowEnd && underStreamCap && rm.admitWindowBlock(limit):
 					off = tr.windowNext
 					tr.windowNext += readaheadBlockSize
 					claimed = true
@@ -799,6 +854,26 @@ func (rm *ReadaheadManager) windowBlocks(inode uint64, tr *readTracker, gen uint
 			return
 		}
 
+		if claimed && rm.waitForDemand() {
+			// Rule 3: the block waited for a demand read. If the reader
+			// moved away meanwhile (a seek, or it read past the block), give
+			// the claim back unread.
+			rm.mu.Lock()
+			stale := rm.stopped || rm.trackers[inode] != tr || off >= tr.windowEnd ||
+				off+readaheadBlockSize <= tr.lastOffset
+			rm.mu.Unlock()
+			if stale {
+				rm.windowInflight.Add(-1)
+				claimedTotal--
+				claimed = false
+				metrics.Default().IncReadQoSPrefetchShed()
+				if inflight == 0 {
+					// Nothing left to wait for: let the next iteration claim
+					// again or end the round.
+					continue
+				}
+			}
+		}
 		if claimed {
 			gateRelease, ok := acquireWindowGate()
 			if ok && sizeLimit < 0 {

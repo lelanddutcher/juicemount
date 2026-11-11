@@ -155,6 +155,28 @@ func desktopJuiceFSObjectIOArgs(class netprofile.LinkClass) []string {
 	}
 }
 
+// desktopJuiceFSDemandFirstArgs asks the bundled JuiceFS (patch 0020) to
+// serve a read that an application waits for before its prefetcher, on a link
+// that is slow or metered when the volume mounts. Lab run 2026-11-11 (200 ms,
+// 1% loss): the first byte of a clip cost 53 s because the second read in a
+// block waited for the prefetcher's whole 4 MiB download of that block. With
+// the flag, that read sends its own ranged GET, and the prefetcher waits while
+// demand reads are in flight.
+//
+// The flag is fixed for the mount's life, like the other JuiceFS flags. The
+// NFS layer's own demand-first rules (nfs/demand_first.go) follow the live
+// class. Fast and medium links keep the upstream behavior.
+// JM_JFS_DEMAND_FIRST=0 is the field rollback switch.
+func desktopJuiceFSDemandFirstArgs(class netprofile.LinkClass) []string {
+	if os.Getenv("JM_JFS_DEMAND_FIRST") == "0" {
+		return nil
+	}
+	if class == netprofile.ClassSlow || class == netprofile.ClassMetered {
+		return []string{"--demand-first"}
+	}
+	return nil
+}
+
 // desktopJuiceFSReadAheadArgs fixes JuiceFS's immutable per-mount session
 // readahead at the conservative floor.  JuiceMount's NFS readahead controller
 // is the adaptive layer: it changes depth and concurrency live as measured RTT
@@ -1130,6 +1152,7 @@ func (fm *FUSEManager) MountWithReceipt() (*MountReceipt, error) {
 	// so the very first spool drain cannot inherit a guaranteed 60-second PUT
 	// timeout/retry loop.
 	args = append(args, desktopJuiceFSObjectIOArgs(netprofile.Default().Class())...)
+	args = append(args, desktopJuiceFSDemandFirstArgs(netprofile.Default().Class())...)
 	// A JuiceFS session expires at five heartbeat intervals. The upstream
 	// 12s default therefore lets another always-on client reap this Mac
 	// after only 60s. A cold or cellular S3 PUT can legitimately consume

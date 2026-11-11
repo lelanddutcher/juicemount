@@ -211,6 +211,7 @@ func TestSlowWindowFetchesInParallelUpToWorkers(t *testing.T) {
 	t.Cleanup(func() { fuseDataInFlight.Store(0) })
 	dir, name := windowTestFile(t, 32)
 	rm := NewReadaheadManager(dir, nil, slowProfile(t))
+	windowMechanicsOnly(rm)
 	defer rm.Stop()
 	br := newBlockingReads()
 	rm.prefetchReadAt = br.readAt
@@ -256,6 +257,7 @@ func TestSlowWindowLeavesForegroundReserve(t *testing.T) {
 	t.Cleanup(func() { fuseDataInFlight.Store(0) })
 	dir, name := windowTestFile(t, 32)
 	rm := NewReadaheadManager(dir, nil, slowProfile(t))
+	windowMechanicsOnly(rm)
 	defer rm.Stop()
 	br := newBlockingReads()
 	rm.prefetchReadAt = br.readAt
@@ -356,6 +358,7 @@ func TestSlowWindowStopsForAbandonedReader(t *testing.T) {
 	t.Cleanup(func() { fuseDataInFlight.Store(0) })
 	dir, name := windowTestFile(t, 32)
 	rm := NewReadaheadManager(dir, nil, slowProfile(t))
+	windowMechanicsOnly(rm)
 	defer rm.Stop()
 	rm.windowIdle = 20 * time.Millisecond
 	br := newBlockingReads()
@@ -389,6 +392,7 @@ func TestSlowWindowSeekStopsOldWindow(t *testing.T) {
 	t.Cleanup(func() { fuseDataInFlight.Store(0) })
 	dir, name := windowTestFile(t, 64)
 	rm := NewReadaheadManager(dir, nil, slowProfile(t))
+	windowMechanicsOnly(rm)
 	defer rm.Stop()
 	br := newBlockingReads()
 	rm.prefetchReadAt = br.readAt
@@ -418,6 +422,7 @@ func TestSlowWindowOfflineReleasesGate(t *testing.T) {
 	t.Cleanup(func() { fuseDataInFlight.Store(0) })
 	dir, name := windowTestFile(t, 32)
 	rm := NewReadaheadManager(dir, nil, slowProfile(t))
+	windowMechanicsOnly(rm)
 	br := newBlockingReads()
 	rm.prefetchReadAt = br.readAt
 	defer br.unblock()
@@ -435,4 +440,12 @@ func TestSlowWindowOfflineReleasesGate(t *testing.T) {
 	if _, prefetched := rm.Stats(); prefetched != slowWindowCap {
 		t.Fatalf("prefetched %d blocks, want only the %d admitted before offline", prefetched, slowWindowCap)
 	}
+}
+
+// windowMechanicsOnly turns off the demand-first rules (demand_first.go) for
+// a test that pins the window's own mechanics: block claims, the manager-wide
+// cap, the gate and stop conditions. Rule 2 would otherwise hold a fresh
+// stream to one block in flight. demand_first_test.go covers the rules.
+func windowMechanicsOnly(rm *ReadaheadManager) {
+	rm.demandFirst = func() bool { return false }
 }
