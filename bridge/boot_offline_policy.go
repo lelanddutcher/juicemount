@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"strconv"
+	"sync/atomic"
 	"time"
 )
 
@@ -16,9 +17,10 @@ import (
 // every file returned ENOENT (laptop lab, 2026-11-11, after-8).
 //
 // The rule now matches the reachability monitor (PR #71): one bad sample is not
-// proof. A slow first sample is re-measured, and the boot defers only when at
-// least two samples were taken and the FASTEST is still over the limit. The
-// fastest sample is the link's base RTT; loss and retransmits only add to it.
+// proof. A slow first sample is re-measured, and the boot starts online only
+// when some sample came in at or under the limit. The fastest sample is the
+// link's base RTT; loss and retransmits only add to it. A failed re-measure
+// never votes for "online": a link that cannot answer is not a fast link.
 
 const (
 	// defaultBootDeferRTT is the U2 limit. JM_BOOT_DEFER_RTT_MS overrides it;
@@ -27,9 +29,11 @@ const (
 	// bootRTTSamples is the most connect samples a slow boot takes (the first
 	// plus two re-measures). A fast first sample costs nothing extra.
 	bootRTTSamples = 3
-	// bootRTTSlowSamples is how many successful samples must agree before the
-	// boot treats the link as too slow.
-	bootRTTSlowSamples = 2
+	// ownerSingleSampleFactor: the selected-owner proof is one sample that
+	// cannot be repeated cheaply, so it defers only when that sample is far
+	// over the limit. One delayed packet (611 ms on a 200 ms link) adds about
+	// one RTT, not a full extra limit.
+	ownerSingleSampleFactor = 2
 )
 
 // noMirrorOfflineReason is the status when the app starts offline and has no
@@ -56,38 +60,27 @@ func bootDeferThreshold() time.Duration {
 type bootRTTSampler func() (ok bool, rtt time.Duration)
 
 // confirmSlowBootRTT decides the U2 defer from a first successful sample.
-// It returns the RTT to use from now on (the fastest sample) and whether the
-// boot must defer. A nil resample keeps the old single-sample rule (the
-// selected-owner proof cannot be repeated cheaply).
+// It returns the RTT to use from now on (the fastest successful sample) and
+// whether the boot must defer. The boot defers unless some sample was at or
+// under the threshold; failed re-measures count for nothing. A nil resample
+// (the selected-owner proof) defers only above ownerSingleSampleFactor times
+// the threshold.
 func confirmSlowBootRTT(first, threshold time.Duration, resample bootRTTSampler) (best time.Duration, slow bool, samples int) {
 	best, samples = first, 1
 	if threshold <= 0 || first <= threshold {
 		return best, false, samples
 	}
 	if resample == nil {
-		return best, true, samples
+		return best, first > ownerSingleSampleFactor*threshold, samples
 	}
-	successes := 1
 	for samples < bootRTTSamples && best > threshold {
 		ok, rtt := resample()
 		samples++
-		if !ok || rtt <= 0 {
-			continue
-		}
-		successes++
-		if rtt < best {
+		if ok && rtt > 0 && rtt < best {
 			best = rtt
 		}
 	}
-	return best, best > threshold && successes >= bootRTTSlowSamples, samples
-}
-
-// skipDeferForEmptyMirror reports whether a U2 defer must be cancelled because
-// there is nothing to serve offline. The defer only helps when the offline
-// volume has a saved file list to show; with none, a slow online boot shows
-// files and an offline one shows an empty volume.
-func skipDeferForEmptyMirror(deferred, mirrorHasEntries bool) bool {
-	return deferred && !mirrorHasEntries
+	return best, best > threshold, samples
 }
 
 // startOfflineReasonFor returns the status for an offline start. When there is
@@ -98,4 +91,30 @@ func startOfflineReasonFor(cause string, mirrorHasEntries bool) string {
 		return noMirrorOfflineReason
 	}
 	return cause
+}
+
+// offlineBootAt is when this serving session started offline (UnixNano), or 0
+// for an online start. /activity uses it to keep saying "the file list is
+// still loading" after offline lifts and before the first full sync lands, so
+// "online" never shows over a list that does not exist yet.
+var offlineBootAt atomic.Int64
+
+// fileListRefreshDetail returns the /activity text for a file list that an
+// offline start has not refreshed yet, or "" when nothing is pending. lastSync
+// is the completion time of the last successful full sync. While offline with
+// a saved list, the offline banner already says what is shown; nothing extra.
+func fileListRefreshDetail(bootAt, lastSync time.Time, hasEntries, offline bool) (detail string, active bool) {
+	if bootAt.IsZero() || lastSync.After(bootAt) {
+		return "", false
+	}
+	switch {
+	case !hasEntries && offline:
+		return "No saved file list on this Mac yet — files appear when the server is reachable", false
+	case !hasEntries:
+		return "Loading the file list from the server…", true
+	case offline:
+		return "", false
+	default:
+		return "Refreshing the file list after an offline start…", true
+	}
 }

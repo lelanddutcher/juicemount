@@ -1435,7 +1435,7 @@ func nfsServerStartSerialized(configJSON *C.char, recovery *servingDesiredRecord
 			}
 		}
 	} else if linkNode == nil {
-		backendUp, bootRTT = backendReachableRTT(cfg.RedisURL, 1500*time.Millisecond)
+		backendUp, bootRTT = bootBackendRTT(cfg.RedisURL, 1500*time.Millisecond)
 	} else {
 		waitForLinkStartupReady(linkNode, 2500*time.Millisecond)
 		backendUp, bootRTT = linkBackendReachableRTT(linkNode, linkProbeURL, 1500*time.Millisecond)
@@ -1477,18 +1477,18 @@ func nfsServerStartSerialized(configJSON *C.char, recovery *servingDesiredRecord
 	// measured 611 ms against the 500 ms limit, and a cold install started
 	// offline with nothing to show. confirmSlowBootRTT re-measures a slow
 	// first sample and defers only when the fastest of two or more samples is
-	// still over the limit (boot_offline_policy.go). The decision is applied
-	// after the store opens: with no saved file list there is nothing to serve
-	// offline, so the defer is cancelled there.
+	// still over the limit (boot_offline_policy.go).
 	bootRTTDeferred := false
 	if backendUp && bootRTT > 0 && !bootUserOffline {
 		var resample bootRTTSampler
 		switch {
 		case ownerMode && ownerReceipt.LinkEnabled:
-			// The owner proof is one bounded operation; keep its sample.
+			// The owner proof is one bounded operation that cannot be
+			// repeated cheaply: confirmSlowBootRTT then defers only far over
+			// the limit.
 		case linkNode == nil:
 			resample = func() (bool, time.Duration) {
-				return backendReachableRTT(cfg.RedisURL, 1500*time.Millisecond)
+				return bootBackendRTT(cfg.RedisURL, 1500*time.Millisecond)
 			}
 		default:
 			resample = func() (bool, time.Duration) {
@@ -1728,22 +1728,18 @@ func nfsServerStartSerialized(configJSON *C.char, recovery *servingDesiredRecord
 		return C.CString(fmt.Sprintf("error: open store: %v", openErr))
 	}
 	globalStore = store
-	// Is there a saved file list to serve while offline? An error reads as
-	// "has entries": it keeps the old behaviour and never cancels a defer on
-	// a guess.
+	// Is there a saved file list to serve while offline? Only the status uses
+	// this: an offline start with no list says so. It does NOT cancel the U2
+	// defer — an online boot over a slow link runs qualification, the mount
+	// and the connect synchronously, then a BLOCKING first SCAN for an empty
+	// mirror (minutes on a big volume). Offline-first plus the qualified
+	// replay (metadata.RedisClient) loads the list as soon as the backend is
+	// checked. An error reads as "has entries" (the old status).
 	mirrorHasEntries := true
 	if has, hasErr := store.HasEntries(); hasErr != nil {
 		jmlog.Warn("could not check for a saved file list at startup", "error", hasErr.Error())
 	} else {
 		mirrorHasEntries = has
-	}
-	if skipDeferForEmptyMirror(bootRTTDeferred, mirrorHasEntries) {
-		// Nothing to serve offline: a slow online boot shows the files, an
-		// offline one shows an empty volume. mountFUSE and connectBootRedis
-		// below read backendUp, so this lands before either lane runs.
-		backendUp, bootRTTDeferred = true, false
-		jmlog.Warn("slow backend at startup but no saved file list on this Mac — starting online instead of offline",
-			"rtt_ms", bootRTT.Milliseconds())
 	}
 	if !backendUp {
 		jmlog.Warn("metadata backend unreachable at startup — taking the start-while-offline path (serving cached navigation; reads resume when the backend returns)",
@@ -1870,6 +1866,11 @@ func nfsServerStartSerialized(configJSON *C.char, recovery *servingDesiredRecord
 			startOfflineReason = "offline mode is on (your setting from last session), and this Mac has no saved file list yet. Turn offline mode off to load files"
 		}
 		pin.SetOffline(true)
+	}
+	if startedOffline {
+		offlineBootAt.Store(time.Now().UnixNano())
+	} else {
+		offlineBootAt.Store(0)
 	}
 	if selectedOwner != nil {
 		if err := selectedOwner.syncOffline(); err != nil {
@@ -7631,6 +7632,7 @@ func handleActivityHTTP(w http.ResponseWriter, r *http.Request) {
 	spool := globalSpool
 	drainer := globalDrainer
 	pinStore := globalPinStore
+	store := globalStore
 	globalMu.Unlock()
 
 	var ops []activityOperation
@@ -7674,6 +7676,24 @@ func handleActivityHTTP(w http.ResponseWriter, r *http.Request) {
 			default:
 				op.Detail = fmt.Sprintf("Index up to date — %d entries, synced %s ago",
 					op.Files, time.Since(last).Round(time.Second))
+			}
+		}
+		// After an offline start, keep saying the list is still loading until
+		// the first full sync lands (the replay of the refused reconcile).
+		if !op.Active {
+			if at := offlineBootAt.Load(); at != 0 {
+				hasEntries := true
+				if store != nil {
+					if has, err := store.HasEntries(); err == nil {
+						hasEntries = has
+					}
+				}
+				if d, active := fileListRefreshDetail(time.Unix(0, at), rc.LastSyncTime(), hasEntries, pin.IsOffline()); d != "" {
+					op.Detail, op.Active = d, active
+					if active {
+						working = append(working, "loading file list")
+					}
+				}
 			}
 		}
 		ops = append(ops, op)
@@ -8331,6 +8351,10 @@ const offlineStartReason = "Started offline — backend unreachable at launch"
 // resolver / MagicDNS lookup at wake could otherwise push a healthy link
 // past the defer threshold and seed netprofile with an inflated first
 // sample. Only the TCP connect against the resolved address is timed.
+// bootBackendRTT is the boot probe the start path calls. A variable so the
+// boot-level acceptance test can script slow and lost samples.
+var bootBackendRTT = backendReachableRTT
+
 func backendReachableRTT(redisURL string, timeout time.Duration) (up bool, rtt time.Duration) {
 	addr, _, err := metadata.ParseRedisURL(redisURL)
 	if err != nil || addr == "" {

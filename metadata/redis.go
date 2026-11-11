@@ -1380,6 +1380,20 @@ func (rc *RedisClient) SetBackendQualified(qualified bool) {
 	rc.scheduleQualifiedFollowUp()
 }
 
+// noteUnqualifiedRefusal records a full sync refused because the backend was
+// not admitted at the generation the SCAN token captured. Called from
+// syncMetadata, so both the reconcile loop and SyncOnce (boot, warmup) count.
+// A token refused for another reason (debt/session/publication churn) with the
+// backend admitted is not recorded. If qualification landed between the
+// refusal and here, the re-check replays at once instead of losing it.
+func (rc *RedisClient) noteUnqualifiedRefusal(backendGeneration uint64) {
+	if rc.backendAdmitted(backendGeneration) {
+		return
+	}
+	rc.unqualifiedSyncSkipped.Store(true)
+	rc.scheduleQualifiedFollowUp()
+}
+
 // scheduleQualifiedFollowUp runs the reconcile that an unqualified backend
 // refused, as soon as the backend is admitted. No-op when nothing was refused,
 // so a normal online boot (qualify, then the boot sync) does not pay a second
@@ -2276,13 +2290,6 @@ func (rc *RedisClient) doReconcile(consecutiveFailures *int, backoff *time.Durat
 			ticker.Reset(*backoff)
 			return
 		}
-		if errors.Is(err, ErrBackendUnqualified) {
-			// Remember the refusal; SetBackendQualified(true) replays it.
-			// Re-check here too: qualification may have landed between the
-			// refusal and this store, and its replay would then be lost.
-			rc.unqualifiedSyncSkipped.Store(true)
-			rc.scheduleQualifiedFollowUp()
-		}
 		*consecutiveFailures++
 		*backoff = baseInterval * time.Duration(1<<min(*consecutiveFailures, 6))
 		if *backoff > maxBackoff {
@@ -2744,8 +2751,17 @@ func (rc *RedisClient) syncMetadata() (err error) {
 	rc.syncMu.Lock()
 	defer rc.syncMu.Unlock()
 	if token := rc.scanToken(); !rc.scanTokenValid(token) {
+		rc.noteUnqualifiedRefusal(token.backend)
 		return ErrBackendUnqualified
 	}
+	defer func() {
+		if err == nil {
+			// Any completed full sync is the catch-up a refusal waited for;
+			// a pending replay would only repeat the same SCAN.
+			rc.unqualifiedSyncSkipped.Store(false)
+			rc.qualifiedFollowUp.Store(false)
+		}
+	}()
 	var pruneSnapshot map[string]int
 	completed := false
 

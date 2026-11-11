@@ -20,19 +20,23 @@ failure backoff put the next one 60 s out.
 
 **Fix.**
 1. A first sample over the limit is re-measured up to two more times. The boot
-   defers only if two or more samples succeeded and the fastest is still over
-   the limit. A failed re-measure counts as loss, not as slowness. The
-   selected-owner proof keeps the single-sample rule.
-2. When the mirror has no entries, the defer is cancelled and the boot runs
-   online. An offline start with no entries reports "no saved file list on this
-   Mac yet" as its status.
-3. A reconcile refused for an unqualified backend is replayed as soon as the
-   backend qualifies, past the flap debounce and the failure backoff. Without a
-   refusal, qualification schedules nothing.
+   starts online only if some sample is at or under the limit; a failed
+   re-measure never counts as fast. The selected-owner proof (one sample, no
+   cheap re-measure) defers only above 2× the limit.
+2. An offline start with no mirror entries reports "no saved file list on this
+   Mac yet". The defer is NOT cancelled for an empty mirror: the online boot
+   over a slow link is synchronous (qualify, mount, connect, then a blocking
+   first SCAN for an empty mirror), minutes on a big volume.
+3. A full sync refused because the backend was not admitted at the SCAN's
+   generation (reconcile loop or SyncOnce) is replayed as soon as the backend
+   qualifies, past the flap debounce and the failure backoff. Any successful
+   full sync clears a pending replay. Without a refusal, qualification
+   schedules nothing.
+4. `/activity` shows "Loading the file list" / "Refreshing the file list" after
+   an offline start until the first full sync after it completes.
 
 **Revert.** `JM_BOOT_DEFER_RTT_MS=0` turns the U2 defer off entirely. There is
-no switch for 1–3 separately; revert the commit. Baseline: one sample decides,
-and an empty mirror does not change the decision.
+no switch for 1–4 separately; revert the commit. Baseline: one sample decides.
 
 ## 2026-11-11 — lossy-link reachability flap took the volume offline (ENXIO)
 

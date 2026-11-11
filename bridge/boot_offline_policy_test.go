@@ -1,7 +1,6 @@
 package main
 
 import (
-	"os"
 	"strings"
 	"testing"
 	"time"
@@ -35,13 +34,22 @@ func TestBootRTTSlowFirstSampleOnWorkingLinkStaysOnline(t *testing.T) {
 	}
 }
 
-// A lost resample is evidence of loss, not of a slow link: with only one
-// successful slow sample the boot stays online.
-func TestBootRTTFailedResamplesDoNotDefer(t *testing.T) {
+// A failed re-measure never votes for "online". With the first sample slow and
+// both re-measures lost (dial timeouts), no sample proved the link fast: a
+// nearly dead link must take the offline path, not the slowest online boot.
+func TestBootRTTFailedResamplesStillDefer(t *testing.T) {
 	resample, calls := samplerOf(t, 0, 0)
-	_, slow, samples := confirmSlowBootRTT(611*time.Millisecond, defaultBootDeferRTT, resample)
-	if slow || samples != bootRTTSamples || *calls != 2 {
-		t.Fatalf("slow=%v samples=%d calls=%d; want online after %d samples", slow, samples, *calls, bootRTTSamples)
+	best, slow, samples := confirmSlowBootRTT(611*time.Millisecond, defaultBootDeferRTT, resample)
+	if !slow || best != 611*time.Millisecond || samples != bootRTTSamples || *calls != 2 {
+		t.Fatalf("slow=%v best=%v samples=%d calls=%d; want a defer after %d samples", slow, best, samples, *calls, bootRTTSamples)
+	}
+}
+
+// One lost and one fast re-measure: the fast one proves the link.
+func TestBootRTTOneFastResampleAmongLossesStaysOnline(t *testing.T) {
+	resample, _ := samplerOf(t, 0, 210*time.Millisecond)
+	if best, slow, _ := confirmSlowBootRTT(611*time.Millisecond, defaultBootDeferRTT, resample); slow || best != 210*time.Millisecond {
+		t.Fatalf("slow=%v best=%v; want online at 210ms", slow, best)
 	}
 }
 
@@ -62,13 +70,24 @@ func TestBootRTTFastFirstSampleTakesNoExtraSample(t *testing.T) {
 	}
 }
 
-func TestBootRTTDisabledAndOwnerRules(t *testing.T) {
+func TestBootRTTDisabled(t *testing.T) {
 	if _, slow, _ := confirmSlowBootRTT(5*time.Second, 0, nil); slow {
 		t.Fatal("threshold 0 (JM_BOOT_DEFER_RTT_MS=0) must disable the defer")
 	}
-	// No resampler (selected-owner proof): the single sample decides, as before.
-	if _, slow, samples := confirmSlowBootRTT(900*time.Millisecond, defaultBootDeferRTT, nil); !slow || samples != 1 {
-		t.Fatalf("owner single-sample rule: slow=%v samples=%d", slow, samples)
+}
+
+// Selected-owner mode has one proof sample and no cheap re-measure. The lab's
+// 611 ms (one delayed packet on a 200 ms link) must not defer; a sample far
+// over the limit still does.
+func TestBootRTTOwnerSingleSampleRule(t *testing.T) {
+	if _, slow, samples := confirmSlowBootRTT(611*time.Millisecond, defaultBootDeferRTT, nil); slow || samples != 1 {
+		t.Fatalf("owner 611ms: slow=%v samples=%d; want online", slow, samples)
+	}
+	if _, slow, _ := confirmSlowBootRTT(2*defaultBootDeferRTT, defaultBootDeferRTT, nil); slow {
+		t.Fatal("owner sample exactly at 2x the limit must not defer")
+	}
+	if _, slow, _ := confirmSlowBootRTT(1200*time.Millisecond, defaultBootDeferRTT, nil); !slow {
+		t.Fatal("owner sample far over the limit (1.2 s) must defer")
 	}
 }
 
@@ -87,15 +106,8 @@ func TestBootDeferThresholdEnv(t *testing.T) {
 	}
 }
 
-// With no saved file list an offline start can show nothing, so a slow-link
-// defer is cancelled, and a real offline start says why the volume is empty.
-func TestNoSavedFileListPolicy(t *testing.T) {
-	if !skipDeferForEmptyMirror(true, false) {
-		t.Fatal("a slow boot with no saved file list must start online, not offline and empty")
-	}
-	if skipDeferForEmptyMirror(true, true) || skipDeferForEmptyMirror(false, false) {
-		t.Fatal("the defer is cancelled only when it was taken AND there is no saved file list")
-	}
+// A real offline start with no saved list says why the volume is empty.
+func TestNoSavedFileListStatus(t *testing.T) {
 	got := startOfflineReasonFor(offlineStartReason, false)
 	if got != noMirrorOfflineReason || !strings.Contains(got, "no saved file list") {
 		t.Fatalf("offline start with no saved list: status %q, want the no-saved-list reason", got)
@@ -105,27 +117,32 @@ func TestNoSavedFileListPolicy(t *testing.T) {
 	}
 }
 
-// Wiring guard: the boot path must use the helpers above, and apply the
-// empty-mirror rule before the mount and connect lanes read backendUp.
-func TestBootOfflinePolicyProductionWiring(t *testing.T) {
-	src, err := os.ReadFile("cbridge.go")
-	if err != nil {
-		t.Fatal(err)
-	}
-	s := string(src)
-	for _, want := range []string{
-		"confirmSlowBootRTT(first, threshold, resample)",
-		"skipDeferForEmptyMirror(bootRTTDeferred, mirrorHasEntries)",
-		"startOfflineReasonFor(startOfflineReason, mirrorHasEntries)",
-		"store.HasEntries()",
+// After an offline start, /activity keeps a file-list status until the first
+// full sync after the start lands, so "online" never shows over a list that
+// does not exist yet.
+func TestFileListRefreshDetailAfterOfflineStart(t *testing.T) {
+	boot := time.Unix(1_700_000_000, 0)
+	before, after := boot.Add(-time.Hour), boot.Add(time.Minute)
+	for _, tc := range []struct {
+		name                string
+		bootAt, last        time.Time
+		hasEntries, offline bool
+		wantSub             string
+		wantActive          bool
+	}{
+		{"online start", time.Time{}, before, false, false, "", false},
+		{"no list, still offline", boot, time.Time{}, false, true, "No saved file list", false},
+		{"no list, back online, not synced", boot, time.Time{}, false, false, "Loading the file list", true},
+		{"saved list, back online, last sync before boot", boot, before, true, false, "Refreshing the file list", true},
+		{"saved list, still offline", boot, before, true, true, "", false},
+		{"synced after the offline start", boot, after, true, false, "", false},
+		{"synced an empty volume after the offline start", boot, after, false, false, "", false},
 	} {
-		if !strings.Contains(s, want) {
-			t.Fatalf("cbridge.go no longer calls %s", want)
-		}
-	}
-	skip := strings.Index(s, "skipDeferForEmptyMirror(bootRTTDeferred, mirrorHasEntries)")
-	lanes := strings.Index(s, "connectBootRedis := func()")
-	if skip < 0 || lanes < 0 || skip > lanes {
-		t.Fatal("the empty-mirror rule must run before the mount/connect lanes are built")
+		t.Run(tc.name, func(t *testing.T) {
+			d, active := fileListRefreshDetail(tc.bootAt, tc.last, tc.hasEntries, tc.offline)
+			if (tc.wantSub == "" && d != "") || !strings.Contains(d, tc.wantSub) || active != tc.wantActive {
+				t.Fatalf("detail=%q active=%v; want %q active=%v", d, active, tc.wantSub, tc.wantActive)
+			}
+		})
 	}
 }

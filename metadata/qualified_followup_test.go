@@ -91,3 +91,78 @@ func TestStoreHasEntries(t *testing.T) {
 		t.Fatalf("populated store HasEntries = %v, %v; want true", has, err)
 	}
 }
+
+// L1: a refusal in SyncOnce (the boot sync or a warmup) is recorded too, and
+// qualification replays it.
+func TestSyncOnceRefusalIsReplayedOnQualification(t *testing.T) {
+	s := openTestStore(t)
+	rc, err := NewRedisClientDeferred("redis://127.0.0.1:1/1", s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rc.SetBackendQualified(false)
+	if err := rc.SyncOnce(); err != ErrBackendUnqualified {
+		t.Fatalf("unqualified SyncOnce = %v", err)
+	}
+	if !rc.unqualifiedSyncSkipped.Load() {
+		t.Fatal("SyncOnce refusal was not recorded")
+	}
+	rc.SetBackendQualified(true)
+	if !rc.qualifiedFollowUp.Load() {
+		t.Fatal("qualification did not schedule the replay")
+	}
+	select {
+	case <-rc.syncNowCh:
+	default:
+		t.Fatal("qualification did not wake the reconcile loop")
+	}
+}
+
+// L2: any successful full sync is the catch-up; a pending replay is dropped
+// so the loop does not run the same SCAN twice.
+func TestSuccessfulSyncClearsPendingReplay(t *testing.T) {
+	s := openTestStore(t)
+	rc, err := NewRedisClientDeferred("redis://127.0.0.1:1/1", s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rc.testScanBatch = func(_ context.Context, _, _ string) ([]string, error) {
+		return []string{"0", "1:1:1700000100:8192:43:1:foreign.mov"}, nil
+	}
+	rc.SetBackendQualified(false)
+	_ = rc.SyncOnce()
+	rc.SetBackendQualified(true)
+	if !rc.qualifiedFollowUp.Load() {
+		t.Fatal("precondition: replay scheduled")
+	}
+	if err := rc.SyncOnce(); err != nil {
+		t.Fatalf("qualified SyncOnce: %v", err)
+	}
+	if rc.qualifiedFollowUp.Load() || rc.unqualifiedSyncSkipped.Load() {
+		t.Fatal("a successful sync must clear the pending replay")
+	}
+}
+
+// L3: a SCAN token refused while the backend is admitted at that generation
+// (debt/session/publication churn) is not a qualification refusal.
+func TestAdmittedRefusalIsNotRecorded(t *testing.T) {
+	s := openTestStore(t)
+	rc, err := NewRedisClientDeferred("redis://127.0.0.1:1/1", s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rc.SetBackendQualified(true)
+	rc.noteUnqualifiedRefusal(rc.scanToken().backend)
+	if rc.unqualifiedSyncSkipped.Load() || rc.qualifiedFollowUp.Load() {
+		t.Fatal("a refusal with the backend admitted was recorded as unqualified")
+	}
+	// A token from before qualification flipped (stale generation) still
+	// counts, and the re-check replays it at once.
+	rc.SetBackendQualified(false)
+	stale := rc.scanToken().backend
+	rc.SetBackendQualified(true)
+	rc.noteUnqualifiedRefusal(stale)
+	if !rc.qualifiedFollowUp.Load() {
+		t.Fatal("a refusal that raced qualification was lost")
+	}
+}
