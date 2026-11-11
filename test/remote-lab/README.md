@@ -201,6 +201,25 @@ export JMLAB_MAC_ENDPOINT=192.0.2.10        # this Docker host, as the VM reache
 ./mac-lab.sh down             # tunnel out, lab removed, VM stopped (JMLAB_MAC_KEEP_VM=1 keeps it)
 ```
 
+### A Mac on the network instead of a VM
+
+With `JMLAB_MAC_DIRECT=1`, `mac-lab.sh` drives a physical Mac that it can
+reach directly over SSH. Nothing is started or stopped, and nothing is
+installed: `wireguard-tools` must already be on the Mac. `JMLAB_MAC_HOST` is
+then the Mac's address only, and the user is `JMLAB_MAC_USER`. The tunnel
+config lives in `~/.jmlab-wireguard` of that user, not in Homebrew's `etc`,
+and `down` removes it. As with the VM, only the nas subnet goes into the
+tunnel; the Mac's default route and DNS stay as they are.
+
+```sh
+export JMLAB_MAC_DIRECT=1
+export JMLAB_MAC_HOST=192.0.2.20             # the Mac itself
+export JMLAB_MAC_KEY=~/.ssh/lab_key
+export JMLAB_MAC_USER=labuser                # needs sudo without a password
+export JMLAB_MAC_ENDPOINT=192.0.2.10         # this Docker host, as the Mac reaches it
+./mac-lab.sh up
+```
+
 The smoke test runs in the VM. For each profile it measures:
 
 - the RTT, with 20 pings;
