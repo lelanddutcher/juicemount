@@ -5731,14 +5731,55 @@ func fuseReadTimeout() time.Duration {
 		}
 	}
 	p := netprofile.Default()
-	return fuseReadTimeoutFor(p.Class(), p.HighLatency())
+	base := fuseReadTimeoutFor(p.Class(), p.HighLatency())
+	shape, ok := cache.ObservedVolumeShape()
+	if !ok || !shape.Encrypted || os.Getenv("JM_FUSE_UNRANGED_READ_TIMEOUT") == "0" {
+		return base
+	}
+	bound := unrangedReadTimeoutFor(base, p.Snapshot().RTT, shape.BlockSize)
+	if bound != base && unrangedReadTimeoutLogged.CompareAndSwap(false, true) {
+		jmlog.Info("encrypted volume: a read fetches a whole block; the slow-link read timeout grows to fit it",
+			"block_bytes", shape.BlockSize, "timeout_ms", bound.Milliseconds(), "base_ms", base.Milliseconds())
+	}
+	return bound
 }
 
 func fuseReadTimeoutFor(class netprofile.LinkClass, highLatency bool) time.Duration {
 	if highLatency || class == netprofile.ClassMetered || class == netprofile.ClassSlow {
-		return 8 * time.Second
+		return slowFUSEReadTimeout
 	}
 	return 4 * time.Second
+}
+
+const slowFUSEReadTimeout = 8 * time.Second
+
+// Whole-block reads (encrypted volumes) on a slow link.
+//
+// An encrypted JuiceFS volume seals each block as one AES-GCM unit, so the
+// first byte of a cold read waits for the whole block. On the abroad link
+// (200 ms, 1% loss, server BBR) a 4 MiB block takes 5-11 s. The 8 s bound cut
+// the slow ones: the client got JUKEBOX and macOS waited about 4 s before the
+// retry, which then found the block cached. Scrub p95 was 12.2 s for reads that
+// finished in 9-10 s (laptop lab, 2026-11-11).
+//
+// The bound for such a read is the time a whole block takes at a floor rate
+// that still counts as a working link, plus a few round trips. It never drops
+// below the class bound and stays under the client's 40 s timeo (timeo=400).
+// A pread past it still answers JUKEBOX, and the retry joins it.
+const (
+	unrangedFloorBytesPerSec = 2_000_000 / 8 // 2 Mbit/s
+	unrangedRoundTrips       = 6             // the GET request and TCP slow start after a loss
+	unrangedReadTimeoutCap   = 20 * time.Second
+)
+
+var unrangedReadTimeoutLogged atomic.Bool
+
+func unrangedReadTimeoutFor(base, rtt time.Duration, blockBytes int64) time.Duration {
+	if base < slowFUSEReadTimeout || blockBytes <= 0 {
+		return base // fast and medium links fetch a whole block well inside the base
+	}
+	budget := unrangedRoundTrips*rtt + time.Duration(blockBytes)*time.Second/unrangedFloorBytesPerSec
+	return min(max(budget, base), unrangedReadTimeoutCap)
 }
 
 // readAtBounded runs fd.ReadAt in a goroutine and returns (n, err, true) if it

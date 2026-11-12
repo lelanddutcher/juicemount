@@ -1,0 +1,38 @@
+# A real JuiceMount server behind the lab's emulated WAN (lab.sh adds this
+# file when the lab was set up with JMLAB_REALNAS=1).
+#
+#   client / macOS VM --> wan (tc netem) --> realnas (DNAT) --> host --> real server
+#
+# realnas is an ordinary host on the lab's nas network, at JMLAB_REALNAS_IP.
+# It forwards a fixed list of TCP ports to the same ports on
+# JMLAB_REALNAS_HOST (lib/realnas.sh). A client pointed at JMLAB_REALNAS_IP
+# reaches the real server only through the wan, so it gets the current
+# profile in both directions. A Mac on the WireGuard gateway already routes
+# the nas subnet into the tunnel, so it needs no new route; its own route to
+# the real server is not touched.
+#
+# The server's address is never in this repository: JMLAB_REALNAS_HOST has no
+# default. realnas gets NET_ADMIN for its own network namespace only.
+services:
+  realnas:
+    image: jmlab:local
+    init: true
+    cap_add: [NET_ADMIN]
+    sysctls:
+      net.ipv4.ip_forward: "1"
+    environment:
+      REALNAS_HOST: ${JMLAB_REALNAS_HOST:?set JMLAB_REALNAS_HOST to the real server address}
+      REALNAS_IP: ${JMLAB_REALNAS_IP:-10.231.10.50}
+      # RESP proxy (30179), a second test proxy (30279), S3 (30151), Manager (30190).
+      REALNAS_PORTS: ${JMLAB_REALNAS_PORTS:-30179 30279 30151 30190}
+      NAS_SUBNET: ${JMLAB_NAS_SUBNET:-10.231.10.0/24}
+    entrypoint: ["/lab/lib/realnas.sh"]
+    healthcheck:
+      test: ["CMD", "test", "-f", "/run/realnas.ready"]
+      interval: 1s
+      retries: 30
+    volumes:
+      - ./:/lab:ro
+    networks:
+      nas:
+        ipv4_address: ${JMLAB_REALNAS_IP:-10.231.10.50}

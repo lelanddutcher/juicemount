@@ -6,6 +6,9 @@
 #   lab.sh shape PROFILE      apply a profile from profiles.tsv to the wan
 #   lab.sh mount [--cold|--warm]  (re)mount the client; --cold empties its
 #                             block cache first, --warm (default) keeps it
+#   lab.sh realnas-mount [--cold|--warm] [--ro]
+#                             mount a real server's volume through the wan
+#                             instead (set up with JMLAB_REALNAS=1; see README)
 #   lab.sh umount             unmount the client
 #   lab.sh exec CMD...        run a command in the client container
 #   lab.sh proxy-counter      the RESP proxy's command/flush counters (JSON)
@@ -43,7 +46,14 @@ dc() {
   # JMLAB_MAC=1 at setup: the WireGuard gateway for a macOS VM (compose.mac.yml,
   # driven by mac-lab.sh).
   [ ! -f "$STATE/mac" ] || files+=(-f "$HERE/compose.mac.yml")
-  JMLAB_COMMIT="$(git -C "$HERE" rev-parse HEAD 2>/dev/null || printf '%040d' 0)" \
+  # JMLAB_REALNAS=1 at setup: the alias of a real server (compose.realnas.yml).
+  # Its address is kept in .state/realnas (git-ignored), never in the repo.
+  local realnas_host="${JMLAB_REALNAS_HOST:-}"
+  if [ -f "$STATE/realnas" ]; then
+    files+=(-f "$HERE/compose.realnas.yml")
+    [ -n "$realnas_host" ] || realnas_host="$(cat "$STATE/realnas")"
+  fi
+  JMLAB_REALNAS_HOST="$realnas_host" JMLAB_COMMIT="$(git -C "$HERE" rev-parse HEAD 2>/dev/null || printf '%040d' 0)" \
     docker compose "${files[@]}" --env-file "$ENV_FILE" "$@"
 }
 in_client() { dc exec -T client "$@"; }
@@ -97,7 +107,7 @@ format_volume() {
     log "volume already formatted"
     return 0
   fi
-  local _ enc=()
+  local _ fmtargs=()
   # JMLAB_ENCRYPT=1: an encrypted volume (aes256gcm-rsa) with a throwaway
   # RSA key in the state directory, which the client sees under /lab.
   if [ "${JMLAB_ENCRYPT:-0}" = 1 ]; then
@@ -105,13 +115,21 @@ format_volume() {
     [ -f "$STATE/encrypt.pem" ] || (umask 077 && openssl genrsa -out "$STATE/encrypt.pem" 2048 2>/dev/null) \
       || die "openssl genrsa failed"
     chmod 644 "$STATE/encrypt.pem" # read by the client container's root; .state itself is 700
-    enc=(--encrypt-rsa-key "/lab/$STATE_NAME/encrypt.pem")
+    fmtargs=(--encrypt-rsa-key "/lab/$STATE_NAME/encrypt.pem")
     log "formatting an encrypted volume"
+  fi
+  # JMLAB_BLOCK_SIZE: the JuiceFS block size in KiB (default 4096). An
+  # encrypted volume fetches a whole block per cold read, so this sets the
+  # first-byte cost on a slow link.
+  if [ -n "${JMLAB_BLOCK_SIZE:-}" ]; then
+    case "$JMLAB_BLOCK_SIZE" in *[!0-9]*) die "JMLAB_BLOCK_SIZE is a size in KiB" ;; esac
+    fmtargs+=(--block-size "$JMLAB_BLOCK_SIZE")
+    log "block size ${JMLAB_BLOCK_SIZE} KiB"
   fi
   for _ in $(seq 30); do
     if dc exec -T -e ACCESS_KEY="$(env_get JMLAB_S3_USER)" -e SECRET_KEY="$(env_get JMLAB_S3_PASSWORD)" client \
          juicefs format --storage minio --bucket "http://$SILO_IP:9000/jmlab" --trash-days 0 \
-         "${enc[@]}" --no-update "$META_URL" jmlab >/dev/null 2>"$STATE/format.err"; then
+         "${fmtargs[@]}" --no-update "$META_URL" jmlab >/dev/null 2>"$STATE/format.err"; then
       log "volume formatted"
       return 0
     fi
@@ -147,9 +165,12 @@ do_umount() {
     pkill -9 -x juicefs; sleep 1' || true
 }
 
+# do_mount [--cold] [META_URL [EXTRA_FLAG...]]: the lab volume by default.
 do_mount() {
-  local cold=0
+  local cold=0 meta="$META_URL"
   [ "${1:-}" != --cold ] || cold=1
+  [ $# -eq 0 ] || shift
+  [ $# -eq 0 ] || { meta="$1"; shift; }
   do_umount
   if [ "$cold" = 1 ]; then in_client sh -c 'rm -rf /var/jfscache && mkdir -p /var/jfscache'; fi
   # Timed inside the container; prints mount_ms=N. `juicefs mount -d`
@@ -158,7 +179,7 @@ do_mount() {
   in_client sh -c 's=$(date +%s%N); juicefs mount -d "$@" >/dev/null || exit 1; e=$(date +%s%N)
     grep -q " /jfs fuse" /proc/mounts || { echo "/jfs is not mounted" >&2; exit 1; }
     echo "mount_ms=$(( (e - s) / 1000000 ))"' mount \
-    "$META_URL" /jfs "${MOUNT_FLAGS[@]}" ${JMLAB_MOUNT_OPTS:-} --log /var/log/juicefs.log \
+    "$meta" /jfs "${MOUNT_FLAGS[@]}" "$@" ${JMLAB_MOUNT_OPTS:-} --log /var/log/juicefs.log \
     2>"$STATE/mount.err" || {
       cat "$STATE/mount.err" >&2; in_client tail -n 30 /var/log/juicefs.log >&2 || true
       die "mount failed"; }
@@ -171,6 +192,11 @@ case "$cmd" in
     gen_env
     if [ "${JMLAB_BBR:-0}" = 1 ]; then : > "$STATE/bbr"; log "server sends with BBR (compose.bbr.yml)"; fi
     if [ "${JMLAB_MAC:-0}" = 1 ]; then : > "$STATE/mac"; log "with the macOS VM gateway (compose.mac.yml)"; fi
+    if [ "${JMLAB_REALNAS:-0}" = 1 ]; then
+      [ -n "${JMLAB_REALNAS_HOST:-}" ] || die "JMLAB_REALNAS=1 needs JMLAB_REALNAS_HOST (the real server's address)"
+      (umask 077 && printf '%s\n' "$JMLAB_REALNAS_HOST" > "$STATE/realnas")
+      log "with the real-server alias at ${JMLAB_REALNAS_IP:-10.231.10.50} (compose.realnas.yml)"
+    fi
     log "building images and starting project $JMLAB_PROJECT"
     dc up -d --build --wait --quiet-pull >&2
     nas_offloads_off
@@ -186,6 +212,29 @@ case "$cmd" in
   mount)
     case "${1:-}" in ''|--cold|--warm) ;; *) die "usage: lab.sh mount [--cold|--warm]" ;; esac
     do_mount "${1:-}" ;;
+  realnas-mount)
+    # The real server's volume, reached at the alias through the wan. Its
+    # proxy password comes from the caller's environment and goes to juicefs
+    # as META_PASSWORD (never argv); the object key comes from the volume's
+    # own settings. JMLAB_REALNAS_BUCKET names the bucket.
+    [ -f "$STATE/realnas" ] || die "the lab was not set up with JMLAB_REALNAS=1"
+    [ -n "${JMLAB_REALNAS_META_PASSWORD:-}" ] || die "set JMLAB_REALNAS_META_PASSWORD"
+    [ -n "${JMLAB_REALNAS_BUCKET:-}" ] || die "set JMLAB_REALNAS_BUCKET (the volume's bucket name)"
+    rn_ip="${JMLAB_REALNAS_IP:-10.231.10.50}"
+    rn_cold="" rn_flags=(--bucket "http://$rn_ip:${JMLAB_REALNAS_S3_PORT:-30151}/$JMLAB_REALNAS_BUCKET")
+    for a in "$@"; do
+      case "$a" in
+        --cold) rn_cold=--cold ;; --warm) ;; --ro) rn_flags+=(--read-only) ;;
+        *) die "usage: lab.sh realnas-mount [--cold|--warm] [--ro]" ;;
+      esac
+    done
+    rn_meta="${JMLAB_REALNAS_META_URL:-redis://admin@$rn_ip:30279/1}"
+    # The lab client's META_PASSWORD is the lab's own; this mount gets the
+    # real one by name from this environment (`exec -e NAME`, no value on argv).
+    export META_PASSWORD="$JMLAB_REALNAS_META_PASSWORD"
+    in_client() { dc exec -T -e META_PASSWORD client "$@"; }
+    do_mount "${rn_cold:---warm}" "$rn_meta" "${rn_flags[@]}"
+    ;;
   umount) do_umount ;;
   exec) in_client "$@" ;;
   proxy-counter)

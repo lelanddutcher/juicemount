@@ -146,6 +146,9 @@ when the lab is set up (`./lab.sh up` or `./measure.py`). The lab then
 formats the volume with a throwaway RSA key in `.state/encrypt.pem`, which
 `./lab.sh down` deletes with the rest of `.state`.
 
+To format the volume with another block size, set `JMLAB_BLOCK_SIZE` in KiB
+(for example `JMLAB_BLOCK_SIZE=1024`). The default is JuiceFS's 4096.
+
 ## Server BBR
 
 `./measure.py --bbr` (or `JMLAB_BBR=1 ./lab.sh up`) sets the lab up with
@@ -244,6 +247,45 @@ gets. On `abroad`, the 1% random loss holds one stream far below the cap
   nas subnet, so a Manager container added there is reachable.
 - Before the app can mount in the VM, someone at the VM's screen must allow
   the macFUSE system extension.
+
+## A real server behind the WAN
+
+`JMLAB_REALNAS=1` adds `compose.realnas.yml`: a container `realnas` on the
+nas network at `JMLAB_REALNAS_IP` (default `10.231.10.50`; `10.231.110.50`
+under `mac-lab.sh`). It forwards a fixed list of TCP ports
+(`JMLAB_REALNAS_PORTS`, default `30179 30279 30151 30190`) to the same ports
+on `JMLAB_REALNAS_HOST`, a real JuiceMount server on your network
+(`lib/realnas.sh`). It drops anything else.
+
+```text
+client or Mac --> wan (tc) --> realnas (DNAT + masquerade) --> host --> real server
+```
+
+- A client pointed at the alias reaches the real server only through the
+  wan, so it gets the current profile in both directions. TCP stays end to
+  end: the server's own senders (BBR or not) see the emulated path.
+- A Mac on the WireGuard gateway already routes the nas subnet, so it
+  reaches the alias with no new route. Its own route to the real server is
+  not changed.
+- `realnas` turns segmentation offloads off, so the wan shapes and drops
+  1500-byte packets, not the large segments the host merged on receive.
+- The server address has no default and is kept in the git-ignored state
+  directory. Do not commit it.
+
+```sh
+export JMLAB_REALNAS=1 JMLAB_REALNAS_HOST=192.0.2.30   # the real server
+./lab.sh up                                             # the lab volume, as before
+export JMLAB_REALNAS_BUCKET=<bucket> JMLAB_REALNAS_META_PASSWORD=<proxy password>
+./lab.sh realnas-mount --cold --ro    # the real volume at /jfs, through the wan
+./lab.sh shape abroad
+```
+
+`realnas-mount` logs in as `JMLAB_REALNAS_META_URL` (default
+`redis://admin@<alias>:30279/1`) with the password from the environment
+(never argv), and reads objects from `http://<alias>:30151/<bucket>`, with
+the object key stored in the volume's settings. Use a test volume and a
+test principal, never the production volume's admin password: `--ro` keeps
+the mount read-only, but the principal is not.
 
 ## The write path (`drain-lab.sh`)
 
