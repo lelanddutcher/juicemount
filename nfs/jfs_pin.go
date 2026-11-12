@@ -58,7 +58,12 @@ func (b *JFSBlockPinner) op(op byte, body []byte, replyLen int, more func([]byte
 	msg := controlHeader(jfsMsgPinCache, 1+len(body))
 	msg = append(msg, op)
 	msg = append(msg, body...)
-	reply, err := b.c.exchangeReply(msg, replyLen, jfsPinTimeout, true, more)
+	// The longest reply: a full VERIFY batch (5 + 17 per item).
+	maxLen := replyLen
+	if more != nil {
+		maxLen = max(replyLen, 5+17*jfsPinBatch)
+	}
+	reply, err := b.c.exchangeUntil(msg, maxLen, pinReplyWant(replyLen, maxLen, more), jfsPinTimeout)
 	if err != nil {
 		return nil, err
 	}
@@ -72,6 +77,22 @@ func (b *JFSBlockPinner) op(op byte, body []byte, replyLen int, more func([]byte
 		return nil, errors.New("juicefs pin: short reply")
 	}
 	return reply, nil
+}
+
+// pinReplyWant is the reply length exchangeUntil reads to. Every reply
+// starts with an errno; a nonzero one ends it (also the 1-byte EINVAL of a
+// juicefs without the message). more, when set, gives the whole length from
+// the header once replyLen bytes are in; never past maxLen.
+func pinReplyWant(replyLen, maxLen int, more func([]byte) int) func([]byte) int {
+	return func(r []byte) int {
+		if len(r) > 0 && r[0] != 0 {
+			return 1
+		}
+		if more != nil && len(r) >= replyLen {
+			return min(max(replyLen, more(r)), maxLen)
+		}
+		return replyLen
+	}
 }
 
 func u64(v uint64) []byte { return binary.BigEndian.AppendUint64(nil, v) }

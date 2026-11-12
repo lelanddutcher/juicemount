@@ -566,7 +566,11 @@ func (v *VFS) handleInternalMsg(ctx meta.Context, cmd uint32, r *utils.Buffer, o
 		name := string(r.Get(int(r.Get8())))
 		eno := syscall.ENOTSUP
 		if jm, ok := v.Meta.(jmFolderInodes); ok {
-			eno = jm.JMMkdirInode(ctx, parent, name, mode, cumask, ino, &Attr{})
+			// Not the handle's context: a FLUSH of the control file (a forked
+			// child's exec closing the inherited descriptor) cancels it, and
+			// a cancelled mkdir loses its reserved number (patch 0025).
+			mctx := meta.NewContext(ctx.Pid(), ctx.Uid(), ctx.Gids())
+			eno = jm.JMMkdirInode(mctx, parent, name, mode, cumask, ino, &Attr{})
 		}
 		if eno == 0 && v.InvalidateEntry != nil {
 			// The kernel may hold a negative entry for the name; the folder
@@ -576,6 +580,9 @@ func (v *VFS) handleInternalMsg(ctx meta.Context, cmd uint32, r *utils.Buffer, o
 			}
 		}
 		_, _ = out.Write([]byte{uint8(eno)})
+	case meta.JMCreateFiles:
+		// JuiceMount patch 0025 (jm_create_files.go).
+		v.jmHandleCreateFiles(ctx, r, out)
 	case meta.CompactPath:
 		inode := Ino(r.Get64())
 		coCnt := r.Get16()

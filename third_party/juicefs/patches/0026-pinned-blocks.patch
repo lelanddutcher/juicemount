@@ -117,10 +117,10 @@
  }
 --- a/pkg/meta/interface.go
 +++ b/pkg/meta/interface.go
-@@ -63,6 +63,8 @@
- 	JMMkdirInode = 1102
- 	// JMReleaseInodes gives back unused reserved numbers (JuiceMount).
- 	JMReleaseInodes = 1103
+@@ -66,6 +66,8 @@
+ 	// JMCreateFiles creates small files, each complete in one transaction
+ 	// (JuiceMount patch 0025, pkg/vfs/jm_create_files.go).
+ 	JMCreateFiles = 1104
 +	// JMPinCache fills and pins whole blocks of a file (JuiceMount patch 0026).
 +	JMPinCache = 1105
  )

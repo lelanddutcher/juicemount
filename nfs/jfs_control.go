@@ -44,40 +44,20 @@ func newJFSControl(root string) *jfsControl {
 	return &jfsControl{root: root, replyTimeout: 60 * time.Second}
 }
 
-var (
-	jfsControlsMu sync.Mutex
-	jfsControls   = map[string]*jfsControl{}
-)
-
-// sharedJFSControl returns one jfsControl per mount root: juicefs keeps one
-// control handle per process on macOS, so every exchange of this process
-// must go through the same lock.
-func sharedJFSControl(root string) *jfsControl {
-	jfsControlsMu.Lock()
-	defer jfsControlsMu.Unlock()
-	c := jfsControls[root]
-	if c == nil {
-		c = newJFSControl(root)
-		jfsControls[root] = c
-	}
-	return c
-}
-
 func (c *jfsControl) exchange(msg []byte, replyLen int) ([]byte, error) {
 	return c.exchangeWithin(msg, replyLen, c.replyTimeout)
 }
 
 func (c *jfsControl) exchangeWithin(msg []byte, replyLen int, timeout time.Duration) ([]byte, error) {
-	return c.exchangeReply(msg, replyLen, timeout, false, nil)
+	return c.exchangeUntil(msg, replyLen, func([]byte) int { return replyLen }, timeout)
 }
 
-// exchangeReply with errnoFirst ends the reply after a nonzero first byte:
-// the errno-first replies of patch 0026, and the 1-byte EINVAL of a juicefs
-// that does not know the message. more, when set, returns the whole reply's
-// length from the part read so far (a count in a header).
-func (c *jfsControl) exchangeReply(msg []byte, replyLen int, timeout time.Duration, errnoFirst bool, more func([]byte) int) ([]byte, error) {
+// exchangeUntil reads until the reply holds want(reply so far) bytes, so a
+// reply whose first byte says it is short (an older juicefs refusing an
+// unknown message with one byte) ends at once. maxLen is the longest reply.
+func (c *jfsControl) exchangeUntil(msg []byte, maxLen int, want func([]byte) int, timeout time.Duration) ([]byte, error) {
 	if c.testExchange != nil {
-		return c.testExchange(msg, replyLen)
+		return c.testExchange(msg, maxLen)
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -88,33 +68,29 @@ func (c *jfsControl) exchangeReply(msg []byte, replyLen int, timeout time.Durati
 	defer runtime.UnlockOSThread()
 	f, err := os.OpenFile(filepath.Join(c.root, ".control"), os.O_RDWR, 0)
 	if err != nil {
-		return nil, err
+		return nil, &errControlNotSent{err}
 	}
 	defer f.Close()
 	// Never send a message to a plain folder that stands in for a missing
-	// mount (the V2.3 G0 identity rule): it is not juicefs.
-	if err := pin.FUSEIdentityCheckFD(f.Fd()); err != nil {
-		return nil, err
+	// mount (the V2.3 G0 identity rule): it is not juicefs. The device check
+	// answers from fstat; fstatfs would cost juicefs a metadata round trip.
+	var st syscall.Stat_t
+	if err := syscall.Fstat(int(f.Fd()), &st); err != nil {
+		return nil, &errControlNotSent{err}
+	}
+	if err := pin.FUSEIdentityCheckDev(uint64(st.Dev)); err != nil { //nolint:unconvert // int32 on Darwin
+		return nil, &errControlNotSent{err}
 	}
 	if _, err := f.Write(msg); err != nil {
 		return nil, err
 	}
-	reply := make([]byte, 0, replyLen)
-	buf := make([]byte, replyLen)
+	reply := make([]byte, 0, maxLen)
+	buf := make([]byte, maxLen)
 	deadline := time.Now().Add(timeout)
 	wait := time.Millisecond
-	for len(reply) < replyLen {
-		n, err := f.Read(buf[:replyLen-len(reply)])
+	for len(reply) < want(reply) {
+		n, err := f.Read(buf[:want(reply)-len(reply)])
 		reply = append(reply, buf[:n]...)
-		if errnoFirst && len(reply) > 0 && reply[0] != 0 {
-			return reply[:1], nil
-		}
-		if more != nil && len(reply) == replyLen {
-			if want := more(reply); want > replyLen {
-				replyLen = want
-				buf = make([]byte, replyLen)
-			}
-		}
 		if n > 0 {
 			continue
 		}
@@ -132,6 +108,13 @@ func (c *jfsControl) exchangeReply(msg []byte, replyLen int, timeout time.Durati
 	}
 	return reply, nil
 }
+
+// errControlNotSent: the exchange failed before any byte of the message
+// reached juicefs.
+type errControlNotSent struct{ err error }
+
+func (e *errControlNotSent) Error() string { return e.err.Error() }
+func (e *errControlNotSent) Unwrap() error { return e.err }
 
 func controlHeader(cmd uint32, body int) []byte {
 	msg := make([]byte, 8, 8+body)
@@ -202,4 +185,150 @@ func (c *jfsControl) mkdirInode(parent uint64, name string, mode os.FileMode, in
 		return err
 	}
 	return controlErrno(reply[0])
+}
+
+// jfsMsgCreateFiles creates small files, each complete in one metadata
+// transaction (patch 0025, third_party/juicefs/pkg/vfs/jm_create_files.go).
+const jfsMsgCreateFiles = 1104
+
+// jfsNewFile is one file of a createFiles message.
+type jfsNewFile struct {
+	parent uint64
+	// preIno is a number this client reserved (reserveInodes) for the file,
+	// recorded before sending so a retry recognises its own file; 0: juicefs
+	// picks one.
+	preIno uint64
+	name   string
+	mode   os.FileMode
+	mtime  time.Time
+	data   []byte
+}
+
+// jfsCreated is juicefs's answer for one file: its inode, or the errno of a
+// refusal (EEXIST: the name exists and nothing was written).
+type jfsCreated struct {
+	ino uint64
+	err error
+}
+
+const (
+	jfsCreateFilesReplyMarker = 0xA5
+	jfsCreateFilesMax         = 64
+	jfsCreateFileMaxBytes     = 1 << 20
+	// The reply waits for the uploads: a base for the transaction plus
+	// the bytes at a thin link's rate (16 KiB/s).
+	jfsCreateFilesTimeoutBase = 2 * time.Minute
+	jfsCreateFilesTimeoutRate = 16 << 10
+	jfsCreateFilesBodyBase    = 2
+)
+
+// jfsCreateFilesTimeout bounds one exchange carrying total bytes. The
+// control lock is held for its whole length.
+func jfsCreateFilesTimeout(total int) time.Duration {
+	return jfsCreateFilesTimeoutBase + time.Duration(total/jfsCreateFilesTimeoutRate)*time.Second
+}
+
+// sharedJFSControl returns the one control client of the mount at root. The
+// drainer's inode pool and its direct publisher share it, so their exchanges
+// queue on one lock instead of racing for juicefs's per-process control
+// handle (on macOS one handle per pid: two clients would read each other's
+// replies).
+func sharedJFSControl(root string) *jfsControl {
+	jfsControlsMu.Lock()
+	defer jfsControlsMu.Unlock()
+	c := jfsControls[root]
+	if c == nil {
+		c = newJFSControl(root)
+		jfsControls[root] = c
+	}
+	return c
+}
+
+var (
+	jfsControlsMu sync.Mutex
+	jfsControls   = map[string]*jfsControl{}
+)
+
+// errCreateFilesRefused wraps the refusal of a whole createFiles message
+// (malformed, read-only, unsupported): juicefs touched no file.
+type errCreateFilesRefused struct{ err error }
+
+func (e *errCreateFilesRefused) Error() string {
+	return "juicefs refused create-files: " + e.err.Error()
+}
+func (e *errCreateFilesRefused) Unwrap() error { return e.err }
+
+// createFiles sends one JMCreateFiles message. A nil error with per-file
+// results means juicefs answered. *errCreateFilesRefused means it refused the
+// whole message and wrote nothing (errControlUnsupported inside: a juicefs or
+// metadata engine without the message). Any other error leaves the outcome of
+// every file unknown: any of them may have been created.
+func (c *jfsControl) createFiles(files []jfsNewFile) ([]jfsCreated, error) {
+	if len(files) == 0 || len(files) > jfsCreateFilesMax {
+		return nil, &errCreateFilesRefused{syscall.EINVAL}
+	}
+	body := jfsCreateFilesBodyBase
+	total := 0
+	for _, f := range files {
+		if len(f.name) == 0 || len(f.name) > 255 {
+			return nil, &errCreateFilesRefused{syscall.ENAMETOOLONG}
+		}
+		if len(f.data) > jfsCreateFileMaxBytes {
+			return nil, &errCreateFilesRefused{syscall.EFBIG}
+		}
+		body += 8 + 8 + 2 + 2 + 8 + 4 + 1 + len(f.name) + 4 + len(f.data)
+		total += len(f.data)
+	}
+	msg := controlHeader(jfsMsgCreateFiles, body)
+	msg = binary.BigEndian.AppendUint16(msg, uint16(len(files)))
+	for _, f := range files {
+		sec, nsec := f.mtime.Unix(), f.mtime.Nanosecond()
+		if sec < 0 {
+			sec, nsec = 0, 0
+		}
+		msg = binary.BigEndian.AppendUint64(msg, f.parent)
+		msg = binary.BigEndian.AppendUint64(msg, f.preIno)
+		msg = binary.BigEndian.AppendUint16(msg, uint16(f.mode.Perm()))
+		msg = binary.BigEndian.AppendUint16(msg, 0) // the mode is final; no umask
+		msg = binary.BigEndian.AppendUint64(msg, uint64(sec))
+		msg = binary.BigEndian.AppendUint32(msg, uint32(nsec))
+		msg = append(msg, byte(len(f.name)))
+		msg = append(msg, f.name...)
+		msg = binary.BigEndian.AppendUint32(msg, uint32(len(f.data)))
+		msg = append(msg, f.data...)
+	}
+	replyLen := 4 + 9*len(files)
+	want := func(got []byte) int {
+		if len(got) >= 1 && got[0] != jfsCreateFilesReplyMarker {
+			return 1 // an older juicefs: one errno byte
+		}
+		return replyLen
+	}
+	reply, err := c.exchangeUntil(msg, replyLen, want, jfsCreateFilesTimeout(total))
+	if err != nil {
+		var ns *errControlNotSent
+		if errors.As(err, &ns) {
+			return nil, &errCreateFilesRefused{ns.err}
+		}
+		return nil, err
+	}
+	if len(reply) >= 1 && reply[0] != jfsCreateFilesReplyMarker {
+		// A juicefs without the message ("unknown message type"): it wrote
+		// nothing.
+		return nil, &errCreateFilesRefused{errControlUnsupported}
+	}
+	if len(reply) != replyLen || int(binary.BigEndian.Uint16(reply[2:4])) != len(files) {
+		return nil, fmt.Errorf("juicefs control: malformed create-files reply")
+	}
+	reply = reply[1:]
+	if err := controlErrno(reply[0]); err != nil {
+		// The whole message was refused before any file was touched.
+		return nil, &errCreateFilesRefused{err}
+	}
+	out := make([]jfsCreated, len(files))
+	for i := range out {
+		out[i].err = controlErrno(reply[3+9*i])
+		out[i].ino = binary.BigEndian.Uint64(reply[4+9*i:])
+	}
+	return out, nil
 }

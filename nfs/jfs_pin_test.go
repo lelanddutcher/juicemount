@@ -144,3 +144,25 @@ func TestJFSBlockPinnerErrnos(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// The pin replies read through exchangeUntil: an errno ends the reply at one
+// byte, and VERIFY's count header extends it, never past the longest reply.
+func TestJFSPinReplyWant(t *testing.T) {
+	count := func(r []byte) int { return 5 + 17*int(binary.BigEndian.Uint32(r[1:5])) }
+	w := pinReplyWant(5, 5+17*jfsPinBatch, count)
+	if got := w(nil); got != 5 {
+		t.Fatalf("empty: %d", got)
+	}
+	if got := w([]byte{byte(syscall.ENOSPC)}); got != 1 {
+		t.Fatalf("errno: %d", got)
+	}
+	if got := w([]byte{0, 0, 0, 0, 2}); got != 5+34 {
+		t.Fatalf("two items: %d", got)
+	}
+	if got := w([]byte{0, 0xff, 0xff, 0xff, 0xff}); got != 5+17*jfsPinBatch {
+		t.Fatalf("bogus count not clamped: %d", got)
+	}
+	if got := pinReplyWant(27, 27, nil)([]byte{0, 1}); got != 27 {
+		t.Fatalf("fixed reply: %d", got)
+	}
+}
