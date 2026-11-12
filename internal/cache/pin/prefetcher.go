@@ -662,6 +662,14 @@ func (p *Prefetcher) prefetch(e Entry) (retErr error) {
 		admissionErr = fmt.Errorf("%w: pinned demand unavailable: %v", ErrCacheCapacityUnknown, statsErr)
 	} else {
 		admissionErr = DownloadAdmissionFor(e.Size, stats.TotalBytes)
+		// The pinned set outgrew the cache budget: grow the cache now and
+		// check once more, rather than wait for the next guard pass (up to a
+		// minute at "pending, 0 B/s").
+		if errors.Is(admissionErr, ErrInsufficientCacheCapacity) {
+			if b := p.blockPinner(); b != nil && p.growCacheFor(b) {
+				admissionErr = DownloadAdmissionFor(e.Size, stats.TotalBytes)
+			}
+		}
 	}
 	if err := admissionErr; err != nil {
 		_, _ = p.store.UpdateStatusForEntry(e, StatusPending, 0, err.Error())

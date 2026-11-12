@@ -344,8 +344,9 @@ experiments/pin-lab.sh after > after.jsonl
   server while more disk pressure evicts. It checks the pin list (CHECK), not
   reads: JuiceFS needs the server to mount and to open a file, and the app
   does not mount JuiceFS when the server is unreachable at launch. So this
-  proves the pins survive a restart, not that pinned files open with no
-  connection at all.
+  proves the pins survive a restart. Opening pinned files with no connection
+  at all goes through the app's offline reader; that needs the macOS laptop
+  lab (it passed there).
 
 On Linux the old pin did not lose blocks (patch 0021's spans assemble whole
 blocks for a sequential reader); the failure it fixes was seen on macOS.

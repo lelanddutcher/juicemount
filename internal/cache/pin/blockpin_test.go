@@ -523,6 +523,32 @@ func TestShareFullGrowsCacheThenRetries(t *testing.T) {
 	}
 }
 
+// Laptop B1: a pin refused before its download because the pinned set
+// outgrew the cache budget grows the cache at once and is admitted, instead
+// of waiting at "pending" for the next guard pass.
+func TestAdmissionRefusalGrowsCacheAtOnce(t *testing.T) {
+	fastPolls(t)
+	data := []byte("pinned past the budget")
+	s, p, path := pinnedFixture(t, "clip.mov", data)
+	f := &fakePinner{size: int64(len(data)), steps: 1}
+	p.SetBlockPinner(f)
+	cacheVolumeMu.RLock()
+	dir := cacheVolumePath
+	cacheVolumeMu.RUnlock()
+	p.capacityDir = dir
+	SetCacheBudgetBytes(int64(len(data)) - 1)
+	ComputeCapacity(s, dir)
+	if err := DownloadAdmissionFor(int64(len(data)), int64(len(data))); !errors.Is(err, ErrInsufficientCacheCapacity) {
+		t.Fatalf("fixture: admission %v, want a budget refusal", err)
+	}
+	if err := claimAndPrefetch(t, s, p, path); err != nil {
+		t.Fatalf("pin past the budget: %v", err)
+	}
+	if want := CacheBytesForPins(int64(len(data))); f.capacity != want || CacheBudgetBytes() != want {
+		t.Fatalf("capacity %d, budget %d, want %d", f.capacity, CacheBudgetBytes(), want)
+	}
+}
+
 // L3: failed pins rotate oldest first; a deleted file stops after a few
 // retries; maps drop unpinned paths.
 func TestRetryStopsForMissingFiles(t *testing.T) {

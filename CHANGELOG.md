@@ -51,10 +51,17 @@
   disk pushed below its free-space floor, JuiceFS still listed all 44
   pinned files as complete with no server, while 66 unpinned blocks were
   evicted, and a new 1.5 GiB pin was refused with nothing downloaded.
-  Not yet: a relaunch with no connection at all cannot open pinned files.
-  The app does not mount JuiceFS when the server is unreachable at launch,
-  and JuiceFS needs the metadata server to open a file. The lab above
-  checked the pin list while cut off; it did not read the files then.
+  On a Mac laptop with the real app (abroad link, enrolled-Mac login):
+  pinning took 66 s with 1.00× download and no failed file (before: 3 of
+  4 clips failed, 1.8× download); after 1.5 GiB of other reads all 552
+  pinned blocks stayed (before: 31 of 128 lost); pinned clips abroad
+  opened in 4–34 ms with 0 downloads; a relaunch abroad kept all 44 pins.
+  A relaunch with no connection at all starts offline and still opens
+  pinned files: the app's offline reader serves them from the cached
+  blocks (all 44 matched the server). Unpinned files then fail with
+  "Device not configured".
+  A pin that needs a bigger cache now grows it at once (before: up to a
+  minute at "pending").
   Field switch: `JM_PIN_WHOLE_BLOCKS=0` returns to the read-through pin and
   unpins every file in JuiceFS once at launch.
 - On a slow or distant link, small saves reach the server about 2.5 times
