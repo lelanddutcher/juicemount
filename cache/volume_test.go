@@ -538,3 +538,27 @@ func TestVolumeCacheProbeHonorsInternalDeadline(t *testing.T) {
 	}
 	t.Logf("owned paused Redis returned in %v: %v", elapsed, err)
 }
+
+func TestVolumeCacheObservesEncryptedShapeWithoutChangingBinding(t *testing.T) {
+	rawURL, rdb, plain := volumeFixture(t)
+	if shape, ok := ObservedVolumeShape(); !ok || shape.Encrypted || shape.BlockSize != 4<<20 {
+		t.Fatalf("plain volume shape = %+v, %v; want 4 MiB, not encrypted", shape, ok)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := rdb.Set(ctx, "setting", `{"UUID":"`+activeTestUUID+`","BlockSize":1024,"EncryptAlgo":"aes256gcm-rsa","EncryptKey":"sealed"}`, 0).Err(); err != nil {
+		t.Fatal(err)
+	}
+	enc, err := ReadVolumeBinding(ctx, rdb, rawURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if shape, ok := ObservedVolumeShape(); !ok || !shape.Encrypted || shape.BlockSize != 1<<20 {
+		t.Fatalf("encrypted volume shape = %+v, %v; want 1 MiB, encrypted", shape, ok)
+	}
+	// Encryption is not part of the persisted identity: only the block size moved.
+	enc.BlockSize = plain.BlockSize
+	if enc != plain {
+		t.Fatalf("binding gained a field from encryption: %+v vs %+v", enc, plain)
+	}
+}

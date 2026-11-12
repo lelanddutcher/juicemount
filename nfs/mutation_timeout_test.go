@@ -74,3 +74,30 @@ func TestFuseReadTimeoutExplicitOverride(t *testing.T) {
 		t.Fatalf("read timeout override = %v, want 1.75s", got)
 	}
 }
+
+func TestUnrangedReadTimeoutFitsAWholeBlock(t *testing.T) {
+	const rtt = 200 * time.Millisecond
+	tests := []struct {
+		name  string
+		base  time.Duration
+		rtt   time.Duration
+		block int64
+		want  time.Duration
+	}{
+		// 6 RTT (1.2 s) + 4 MiB at 2 Mbit/s (16.777 s).
+		{name: "4 MiB abroad", base: 8 * time.Second, rtt: rtt, block: 4 << 20, want: 17977216 * time.Microsecond},
+		{name: "1 MiB fits in the base", base: 8 * time.Second, rtt: rtt, block: 1 << 20, want: 8 * time.Second},
+		{name: "512 KiB fits in the base", base: 8 * time.Second, rtt: rtt, block: 512 << 10, want: 8 * time.Second},
+		{name: "16 MiB capped under the client timeo", base: 8 * time.Second, rtt: rtt, block: 16 << 20, want: 20 * time.Second},
+		{name: "fast link keeps its base", base: 4 * time.Second, rtt: time.Millisecond, block: 4 << 20, want: 4 * time.Second},
+		{name: "no RTT sample yet", base: 8 * time.Second, block: 4 << 20, want: 16777216 * time.Microsecond},
+		{name: "unknown block size", base: 8 * time.Second, rtt: rtt, want: 8 * time.Second},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := unrangedReadTimeoutFor(tc.base, tc.rtt, tc.block); got != tc.want {
+				t.Fatalf("unrangedReadTimeoutFor(%v, %v, %d) = %v, want %v", tc.base, tc.rtt, tc.block, got, tc.want)
+			}
+		})
+	}
+}
