@@ -128,6 +128,11 @@ func storageFlags() []cli.Flag {
 			Usage: "number of connections to upload",
 		},
 		&cli.IntFlag{
+			Name:  "small-uploads",
+			Value: 2,
+			Usage: "extra connections that only slices of at most 1 MiB, uploaded when they are finished, may use; 0 turns it off (JuiceMount)",
+		},
+		&cli.IntFlag{
 			Name:  "max-stage-write",
 			Value: 1000, // large enough for normal cases, also prevents unlimited concurrency in abnormal cases
 			Usage: "number of threads allowed to write staged files, other requests will be uploaded directly (this option is only effective when 'writeback' mode is enabled)",

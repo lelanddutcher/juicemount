@@ -85,6 +85,15 @@ func TestDesktopJuiceFSHeartbeatKeepsSessionForFiveMinutes(t *testing.T) {
 	}
 }
 
+func TestDesktopJuiceFSSmallUploadSlots(t *testing.T) {
+	for v, want := range map[string]string{"": "2", "0": "0", "4": "4", "5": "2", "-1": "2", "x": "2"} {
+		t.Setenv("JM_JFS_SMALL_UPLOADS", v)
+		if got := desktopJuiceFSSmallUploadArgs(); !slices.Equal(got, []string{"--small-uploads", want}) {
+			t.Fatalf("JM_JFS_SMALL_UPLOADS=%q: args %v, want --small-uploads %s", v, got, want)
+		}
+	}
+}
+
 func TestDesktopJuiceFSObjectTimeoutsKeepCellularBlocksViableAndBounded(t *testing.T) {
 	t.Setenv("JM_JFS_OBJECT_TIMEOUTS", "")
 	tests := []struct {

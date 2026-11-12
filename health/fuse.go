@@ -157,6 +157,23 @@ func desktopJuiceFSObjectIOArgs(class netprofile.LinkClass) []string {
 	}
 }
 
+// desktopJuiceFSSmallUploadArgs gives small saves upload slots of their own
+// in the bundled JuiceFS (patch 0024). --max-uploads 4 caps the 4 MiB block
+// PUTs, and upstream queues every PUT behind them in one line: on a far, thin
+// link a project save's fsync waited about 30 s behind a render's blocks. Two
+// more PUTs, only for slices of at most 1 MiB that an fsync or close is
+// finishing, add at most 2 MiB in flight beside the four large ones.
+// JM_JFS_SMALL_UPLOADS=N (0 to 4) sets the slots; 0 is the field rollback.
+func desktopJuiceFSSmallUploadArgs() []string {
+	n := 2
+	if v := os.Getenv("JM_JFS_SMALL_UPLOADS"); v != "" {
+		if p, err := strconv.Atoi(v); err == nil && p >= 0 && p <= 4 {
+			n = p
+		}
+	}
+	return []string{"--small-uploads", strconv.Itoa(n)}
+}
+
 // desktopJuiceFSDemandFirstArgs asks the bundled JuiceFS (patch 0020) to
 // serve a read that an application waits for before its prefetcher, on a link
 // that is slow or metered when the volume mounts. Lab run 2026-11-11 (200 ms,
@@ -1175,6 +1192,7 @@ func (fm *FUSEManager) MountWithReceipt() (*MountReceipt, error) {
 	// ample bandwidth-delay-product on LAN and WAN while bounding queueing
 	// pressure across a Wi-Fi -> cellular handoff.
 	args = append(args, desktopJuiceFSSessionArgs()...)
+	args = append(args, desktopJuiceFSSmallUploadArgs()...)
 	args = append(args, juiceFSMountPlatformOptions(runtime.GOOS)...)
 	// Keep JuiceFS's mount-time-only prefetcher at its conservative floor on
 	// every startup class.  The live, measured controller in nfs/readahead.go

@@ -1,0 +1,99 @@
+--- a/cmd/flags.go
++++ b/cmd/flags.go
+@@ -128,6 +128,11 @@
+ 			Usage: "number of connections to upload",
+ 		},
+ 		&cli.IntFlag{
++			Name:  "small-uploads",
++			Value: 2,
++			Usage: "extra connections that only slices of at most 1 MiB, uploaded when they are finished, may use; 0 turns it off (JuiceMount)",
++		},
++		&cli.IntFlag{
+ 			Name:  "max-stage-write",
+ 			Value: 1000, // large enough for normal cases, also prevents unlimited concurrency in abnormal cases
+ 			Usage: "number of threads allowed to write staged files, other requests will be uploaded directly (this option is only effective when 'writeback' mode is enabled)",
+--- a/cmd/mount.go
++++ b/cmd/mount.go
+@@ -356,6 +356,7 @@
+ 		GetTimeout:    utils.Duration(c.String("get-timeout")),
+ 		PutTimeout:    utils.Duration(c.String("put-timeout")),
+ 		MaxUpload:     c.Int("max-uploads"),
++		SmallUploads:  c.Int("small-uploads"),
+ 		MaxStageWrite: c.Int("max-stage-write"),
+ 		MaxRetries:    c.Int("io-retries"),
+ 		Writeback:     c.Bool("writeback"),
+--- a/pkg/chunk/cached_store.go
++++ b/pkg/chunk/cached_store.go
+@@ -326,6 +326,7 @@
+ 	uploadFailed atomic.Bool
+ 	pendings     int
+ 	writeback    bool
++	finishing    bool // JuiceMount: Finish is uploading the last blocks (jm_upload_lane.go)
+ }
+ 
+ func sliceForWrite(id uint64, store *cachedStore) *wSlice {
+@@ -487,6 +488,7 @@
+ 	pages := s.pages[indx]
+ 	s.pages[indx] = nil
+ 	s.pendings++
++	small := s.smallLane()
+ 
+ 	go func() {
+ 		var block *Page
+@@ -545,8 +547,8 @@
+ 				return
+ 			}
+ 		}
+-		s.store.currentUpload <- true
+-		defer func() { <-s.store.currentUpload }()
++		release := s.store.acquireUpload(small)
++		defer release()
+ 		s.errors <- s.store.upload(key, block, s)
+ 	}()
+ }
+@@ -583,6 +585,7 @@
+ 	}
+ 
+ 	n := (length-1)/s.store.conf.BlockSize + 1
++	s.finishing = true
+ 	if err := s.FlushTo(n * s.store.conf.BlockSize); err != nil {
+ 		return err
+ 	}
+@@ -644,6 +647,10 @@
+ 	// DemandFirst: reads that an application waits for go before the
+ 	// prefetcher (JuiceMount, demand_first.go).
+ 	DemandFirst bool
++	// SmallUploads: upload tokens beside MaxUpload that only slices of at
++	// most 1 MiB, uploaded when they are finished, may take; 0 turns the
++	// lane off (JuiceMount, jm_upload_lane.go).
++	SmallUploads int
+ }
+ 
+ func (c *Config) SelfCheck(uuid string) {
+@@ -740,6 +747,7 @@
+ 	conf          Config
+ 	group         *Controller
+ 	currentUpload chan bool
++	smallUpload   chan bool // JuiceMount: small-upload lane, nil when off
+ 	pendingCh     chan *pendingItem
+ 	pendingKeys   map[string]*pendingItem
+ 	pendingMutex  sync.Mutex
+@@ -864,6 +872,9 @@
+ 		pendingKeys:   make(map[string]*pendingItem),
+ 		group:         NewController(),
+ 	}
++	if config.SmallUploads > 0 {
++		store.smallUpload = make(chan bool, config.SmallUploads)
++	}
+ 	if config.UploadLimit > 0 {
+ 		// there are overheads coming from HTTP/TCP/IP
+ 		store.upLimit = ratelimit.NewBucketWithRate(float64(config.UploadLimit)*0.85, config.UploadLimit/10)
+@@ -1015,7 +1026,7 @@
+ 			Help: "number of uploading requests",
+ 		},
+ 		func() float64 {
+-			return float64(len(store.currentUpload))
++			return float64(store.uploadsInFlight())
+ 		}))
+ }
+ 
