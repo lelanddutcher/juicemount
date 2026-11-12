@@ -20,6 +20,9 @@
 # With DRAIN_READ_S=N, the run first reads a DRAIN_SEED_MB (default 300) MB
 # file over NFS for N seconds (scrub, then sequential), as an editor would
 # before saving. The drain then shows what the read path leaves behind.
+# DRAIN_FOLDERS=N spreads the small files over N new folders inside the run's
+# folder (default 0: all in one folder). DRAIN_ACCESSLOG=1 keeps the JuiceFS
+# access log (every FUSE operation with its duration) as <label>.access.txt.
 # DRAIN_JM5_ENV adds environment to jm5 (an experiment, such as
 # JM_DRAIN_SYNC_BYTES=2097152); JMLAB_MOUNT_OPTS adds juicefs mount flags.
 # The RESP proxy counters are read before and after each step, and a Redis
@@ -122,13 +125,17 @@ run() {
     "$LAB" exec /lab/"$STATE_NAME"/bin/drainprobe read -export "$xpath" -nfs 127.0.0.1:21049 \
       -file seed.bin -budget "${READ_S}s" > "$OUT/$label.read.json"
   fi
+  if [ "${DRAIN_ACCESSLOG:-0}" = 1 ]; then
+    # shellcheck disable=SC2016
+    "$LAB" exec sh -c 'nohup cat /jfs/.accesslog > /var/jm/access.txt 2>/dev/null & echo $! > /var/jm/access.pid'
+  fi
   local dir
   dir="w/$label-$(date +%s)"
   local c0 c1 c2
   c0="$(counter)"
   log "$label: write ($profile)"
   "$LAB" exec /lab/"$STATE_NAME"/bin/drainprobe write -export "$xpath" -nfs 127.0.0.1:21049 -dir "$dir" \
-    -mkdirs "${DRAIN_MKDIRS:-3}" -small "$SMALL" -big-mb "$BIG" > "$OUT/$label.write.json"
+    -mkdirs "${DRAIN_MKDIRS:-3}" -folders "${DRAIN_FOLDERS:-0}" -small "$SMALL" -big-mb "$BIG" > "$OUT/$label.write.json"
   c1="$(counter)"
   log "$label: wait for the drain (cap ${CAP}s)"
   "$LAB" exec /lab/"$STATE_NAME"/bin/drainprobe wait -db /var/jm/metadata.db -fuse /jfs -dir "$dir" \
@@ -142,6 +149,11 @@ run() {
     docker exec "$(redis_cid)" rm -f /tmp/monitor.txt
   fi
   "$LAB" exec cat /var/jm/jm5.log > "$OUT/$label.jm5.log" 2>/dev/null || true
+  if [ "${DRAIN_ACCESSLOG:-0}" = 1 ]; then
+    # shellcheck disable=SC2016
+    "$LAB" exec sh -c 'kill "$(cat /var/jm/access.pid)" 2>/dev/null; true'
+    "$LAB" exec cat /var/jm/access.txt > "$OUT/$label.access.txt" 2>/dev/null || true
+  fi
   stop_jm5
   "$LAB" shape lan >/dev/null
   cat "$OUT/$label.write.json" "$OUT/$label.wait.json"
