@@ -104,6 +104,9 @@ type cacheStore struct {
 
 	state     dcState
 	stateLock sync.Mutex
+
+	jmPins  *jmPinSet    // JuiceMount patch 0026: eviction skips pinned keys
+	jmExtra atomic.Int64 // JuiceMount patch 0026: capacity added at run time (SETCAP)
 }
 
 func newCacheStore(m *cacheManagerMetrics, dir string, cacheSize, maxItems int64, pendingPages int, config *Config, uploader func(key, path string, force bool) bool) *cacheStore {
@@ -133,6 +136,7 @@ func newCacheStore(m *cacheManagerMetrics, dir string, cacheSize, maxItems int64
 		opTs:          make(map[time.Duration]func() error),
 	}
 	c.stateLock = sync.Mutex{}
+	c.jmPins = jmPinsForDir(dir) // JuiceMount patch 0026: before any scan or eviction
 	if config.Writeback {
 		c.state = newDCState(dcUnchanged, c)
 	} else {
@@ -232,7 +236,7 @@ func (c *cacheStore) enabled() bool {
 }
 
 func (c *cacheStore) full() bool {
-	return c.used > c.capacity || (c.maxItems != 0 && int64(len(c.keys)) > c.maxItems)
+	return c.used > c.capacity+c.jmExtra.Load() || (c.maxItems != 0 && int64(len(c.keys)) > c.maxItems)
 }
 
 func (cache *cacheStore) checkErr(f func() error) error {
@@ -367,6 +371,9 @@ func (cache *cacheStore) cleanupExpire() {
 			}
 			if v.size < 0 {
 				continue // staging
+			}
+			if cache.jmPins.has(k) {
+				continue // pinned (JuiceMount patch 0026)
 			}
 			if v.atime < cutoff {
 				deleted++
@@ -788,7 +795,7 @@ func (cache *cacheStore) cleanupFull() {
 		return
 	}
 
-	goal := cache.capacity * 95 / 100
+	goal := (cache.capacity + cache.jmExtra.Load()) * 95 / 100
 	num := int64(len(cache.keys)) * 99 / 100
 	if cache.maxItems != 0 && num > cache.maxItems*99/100 {
 		num = cache.maxItems * 99 / 100
@@ -805,12 +812,29 @@ func (cache *cacheStore) cleanupFull() {
 			goal = (cache.used - toFree) * 95 / 100
 		}
 	}
+	inodesShort := usage.fr < cache.freeRatio // JuiceMount patch 0026
 	if usage.fr < cache.freeRatio {
 		toFree := int(float32(usage.inodeCap) * (cache.freeRatio - usage.fr))
 		if toFree > len(cache.keys) {
 			num = 0
 		} else {
 			num = int64(len(cache.keys)-toFree) * 99 / 100
+		}
+	}
+	// JuiceMount patch 0026: pinned blocks are not evictable. Count only the
+	// pinned blocks that are on disk (a fill that failed or was canceled
+	// pinned blocks it never got). Never aim below them, never walk the keys
+	// when only pinned blocks are left, and drop the 1% item goal (it would
+	// walk every pinned key to find none) unless inodes are short.
+	if pinned := cache.jmPins.presentBytes(cache.id, cache.keys); pinned > 0 {
+		if goal < pinned {
+			goal = pinned
+		}
+		if cache.maxItems == 0 && !inodesShort {
+			num = int64(len(cache.keys))
+		}
+		if cache.used-pinned < 4096 {
+			return
 		}
 	}
 	if int64(len(cache.keys)) <= num && cache.used <= goal {
@@ -828,6 +852,9 @@ func (cache *cacheStore) cleanupFull() {
 	for k, value := range cache.keys {
 		if value.size < 0 {
 			continue // staging
+		}
+		if cache.jmPins.has(k) {
+			continue // pinned (JuiceMount patch 0026)
 		}
 		if cache.cacheExpire > 0 && value.atime < cutoff {
 			lastK = k
@@ -1036,6 +1063,7 @@ type cacheManager struct {
 	storeMap      map[string]*cacheStore
 	stores        []*cacheStore
 	metrics       *cacheManagerMetrics
+	pins          *jmPinSet // JuiceMount patch 0026
 }
 
 func legacyKeyHash(s string) uint32 {
@@ -1130,15 +1158,19 @@ func newCacheManager(config *Config, reg prometheus.Registerer, uploader func(ke
 		stores:        make([]*cacheStore, len(dirs)),
 		metrics:       metrics,
 	}
+	m.pins = newJMPinSet(filepath.Join(strings.TrimSpace(dirs[0]), "jmpins"))
 
 	// 20% of buffer could be used for pending pages
 	pendingPages := int(config.BufferSize) * 2 / 10 / config.BlockSize / len(dirs)
 	for i, d := range dirs {
+		jmPinsByDir.Store(strings.TrimSpace(d)+string(filepath.Separator), m.pins)
 		store := newCacheStore(metrics, strings.TrimSpace(d)+string(filepath.Separator), dirCacheSize, dirCacheItems, pendingPages, config, uploader)
 		m.stores[i] = store
 		m.storeMap[store.id] = store
 		m.consistentMap.Add(store.id)
+		jmPinsByDir.Delete(store.dir)
 	}
+	m.pins.bind(m)
 	go m.cleanup()
 	return m
 }

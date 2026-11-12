@@ -312,6 +312,46 @@ The script header lists every variable. Limits:
 - The Redis MONITOR trace slows Redis a little. Compare runs that both have
   it, or both do not.
 
+## Pinning (`experiments/pin-lab.sh`)
+
+`experiments/pin-lab.sh before|after|cap` measures "pin before travel" with
+the bundled JuiceFS's pin message (patch 0026). `lib/pinprobe.py` runs in the
+client and speaks that message as the app's pin workers do. It also reads
+files the old way (four workers, 128 KiB direct reads), plays and scrubs
+files, and prints the client's object-store GETs.
+
+Set the lab up with a 3 GiB block cache, so that other reads evict:
+
+```sh
+export JMLAB_MOUNT_OPTS="--cache-size 3072"
+./lab.sh up
+docker cp lib/pinprobe.py <project>-client-1:/usr/local/bin/pinprobe.py
+./lab.sh exec sh -c 'mkdir -p /jfs/pack/proj /jfs/media
+  for i in 1 2 3 4; do head -c 536870912 /dev/urandom > /jfs/pack/clip$i.mov; done
+  for i in $(seq -w 1 40); do head -c 16384 /dev/urandom > /jfs/pack/proj/p$i.drp; done
+  for i in 1 2; do head -c 1610612736 /dev/urandom > /jfs/media/fill-$i.mov; done; sync'
+experiments/pin-lab.sh after > after.jsonl
+```
+
+- `before`: the old pin, then 1.5 GiB of unpinned reads, then the project
+  abroad (scrub 20 random 1 MiB reads per clip, play one clip).
+- `after`: the new pin, the same pressure and abroad reads, then a remount
+  (the app's relaunch: the guard pins again), and 1.5 GiB more reads.
+- `cap`: with the project pinned, a 3 GiB pin must fail with ENOSPC.
+- `offline`: the travel case. Pin, cut the link (iptables in the client),
+  kill JuiceFS, fill the cache disk (a 4 GiB tmpfs) below its free-space
+  floor, start JuiceFS again, cut the link again, and check the pins with no
+  server while more disk pressure evicts. It checks the pin list (CHECK), not
+  reads: JuiceFS needs the server to mount and to open a file, and the app
+  does not mount JuiceFS when the server is unreachable at launch. So this
+  proves the pins survive a restart. Opening pinned files with no connection
+  at all goes through the app's offline reader; that needs the macOS laptop
+  lab (it passed there).
+
+On Linux the old pin did not lose blocks (patch 0021's spans assemble whole
+blocks for a sequential reader); the failure it fixes was seen on macOS.
+Eviction of the old pin and the abroad cost do show here.
+
 ## Addresses
 
 The lab uses `10.231.10.0/24` (nas) and `10.231.20.0/24` (remote). If those

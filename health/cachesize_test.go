@@ -1,6 +1,10 @@
 package health
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/lelanddutcher/juicemount/internal/cache/pin"
+)
 
 const gib = int64(1) << 30
 
@@ -52,9 +56,9 @@ func TestResolveCacheSize(t *testing.T) {
 			wantMiB: 50 << 10,
 		},
 		{
-			name:          "grows to fit the pinned set",
+			name:          "grows to fit the pinned set under the 90% pin share",
 			configuredMiB: 10 << 10, pinnedBytes: 200 * gib, total: 1000 * gib,
-			wantMiB: (200 * gib) >> 20,
+			wantMiB: pin.CacheBytesForPins(200*gib) >> 20,
 		},
 		{
 			name:          "pinned set still clamped by the free floor",

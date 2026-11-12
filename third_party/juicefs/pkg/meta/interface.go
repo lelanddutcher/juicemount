@@ -66,6 +66,8 @@ const (
 	// JMCreateFiles creates small files, each complete in one transaction
 	// (JuiceMount patch 0025, pkg/vfs/jm_create_files.go).
 	JMCreateFiles = 1104
+	// JMPinCache fills and pins whole blocks of a file (JuiceMount patch 0026).
+	JMPinCache = 1105
 )
 
 const (

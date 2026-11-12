@@ -4,6 +4,66 @@
 
 ### App
 
+- "Pin before travel" is now reliable while the server is reachable. An
+  editor pins a project at home; abroad, over Link, it plays and scrubs from
+  local disk, also after the app restarts. Three problems are fixed (laptop
+  lab, 2026-11-12):
+  - Large pins failed and were never retried. A pin read the file through
+    FUSE in 128 KiB reads, and JuiceFS saved whole blocks to its cache only
+    through a background queue that drops requests when full: 3 of 4 clips
+    ended with missing blocks, and the pin downloaded 1.8 times the project.
+    Now the app asks the bundled JuiceFS (patch 0026, `-jm11`) to download
+    each missing block whole and write it to the cache before it reports
+    done; then the app checks the file as before, from local disk. Encrypted
+    volumes pin the same way. On a slow or metered link a pin downloads one
+    block at a time in the whole app (the pin workers and the pin guard
+    together) and waits for reads the editor is waiting for. A failed
+    pin is retried after 30 s, then with a doubling wait of at most 30
+    minutes; a file that no longer exists is retried 3 times.
+  - Ordinary reads evicted pinned blocks, and the app still said "ready".
+    JuiceFS now never evicts a pinned block, and it keeps its list of
+    pinned blocks on disk, so a restart keeps them. Pinned blocks that a
+    failed or canceled pin never downloaded do not stop the cache from
+    freeing the rest of its space. Pinned files may use at most 90% of the
+    cache; the app grows the cache when the pinned set needs it. A pin
+    never fills the disk below the cache's free-space floor: it first evicts
+    ordinary cached blocks, and only when none are left does it fail with
+    "not enough room on the cache disk for the pinned files; free disk space
+    on that disk, or unpin a folder". Unpinning a folder stops its
+    downloads at once. Every minute the app checks, without the server,
+    that every ready pin is complete and matches the file's length and
+    mtime, and fetches it again when it is not; while the server is
+    reachable it also checks a few pins a minute against the file's data
+    layout, which compaction changes without changing the length or mtime.
+    A pin that goes back to the queue keeps its pinned blocks meanwhile.
+  - The app showed "0 of 44, 0 bytes" for minutes, then a jump. Now
+    `/cache-status` counts the bytes already on disk of files being
+    downloaded, and reports the files in progress, the download rate and
+    an estimated time left (`prefetching_files`, `rate_bytes_per_sec`,
+    `eta_sec`), and the pinned bytes against the limit.
+  In the Linux remote lab (2.15 GB project, 3 GiB cache): pinning on lan
+  took 4.0–5.5 s with 552 whole-block downloads (before: 8,232 requests).
+  After 1.5 GiB of other reads, 0 pinned bytes were lost (before: 503 MB,
+  and 13 of 40 project files). Abroad (200 ms, 1% loss), a pinned clip
+  played in 1.7–2.0 s with no download (before: 339 s, 123 MB from the
+  server), and a scrub took 0.5–2.3 ms per 1 MiB read (before: p95
+  7.6–9.8 s). With the link cut, JuiceFS killed and restarted, and the cache
+  disk pushed below its free-space floor, JuiceFS still listed all 44
+  pinned files as complete with no server, while 66 unpinned blocks were
+  evicted, and a new 1.5 GiB pin was refused with nothing downloaded.
+  On a Mac laptop with the real app (abroad link, enrolled-Mac login):
+  pinning took 66 s with 1.00× download and no failed file (before: 3 of
+  4 clips failed, 1.8× download); after 1.5 GiB of other reads all 552
+  pinned blocks stayed (before: 31 of 128 lost); pinned clips abroad
+  opened in 4–34 ms with 0 downloads; a relaunch abroad kept all 44 pins.
+  A relaunch with no connection at all starts offline and still opens
+  pinned files: the app's offline reader serves them from the cached
+  blocks (all 44 matched the server). Unpinned files then fail with
+  "Device not configured".
+  A pin that needs a bigger cache now grows it at once (before: up to a
+  minute at "pending").
+  Field switch: `JM_PIN_WHOLE_BLOCKS=0` returns to the read-through pin and
+  unpins every file in JuiceFS once at launch.
 - On a slow or distant link, small saves reach the server about 2.5 times
   faster. Before, the app published each saved file through a hidden
   temporary file in its folder: create, write, flush, set the time, then

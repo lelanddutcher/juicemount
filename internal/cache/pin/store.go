@@ -79,7 +79,8 @@ CREATE TABLE IF NOT EXISTS pinned_files (
     pinned_at        INTEGER NOT NULL,
     pin_root         TEXT NOT NULL DEFAULT '',
     pin_generation   TEXT NOT NULL DEFAULT '',
-    authority        BLOB NOT NULL DEFAULT X''
+    authority        BLOB NOT NULL DEFAULT X'',
+    pin_inode        INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_pinned_status ON pinned_files(status);
 CREATE INDEX IF NOT EXISTS idx_pinned_root ON pinned_files(pin_root);
@@ -148,6 +149,7 @@ func migratePinGenerations(db *sql.DB) error {
 	}
 	hasGeneration := false
 	hasAuthority := false
+	hasPinInode := false
 	for rows.Next() {
 		var id, notNull, pk int
 		var name, kind string
@@ -162,6 +164,9 @@ func migratePinGenerations(db *sql.DB) error {
 		if name == "authority" {
 			hasAuthority = true
 		}
+		if name == "pin_inode" {
+			hasPinInode = true
+		}
 	}
 	err = rows.Err()
 	rows.Close()
@@ -175,6 +180,11 @@ func migratePinGenerations(db *sql.DB) error {
 	}
 	if !hasAuthority {
 		if _, err := db.Exec(`ALTER TABLE pinned_files ADD COLUMN authority BLOB NOT NULL DEFAULT X''`); err != nil {
+			return err
+		}
+	}
+	if !hasPinInode {
+		if _, err := db.Exec(`ALTER TABLE pinned_files ADD COLUMN pin_inode INTEGER NOT NULL DEFAULT 0`); err != nil {
 			return err
 		}
 	}
@@ -395,6 +405,24 @@ func (s *Store) UpdateStatusForEntry(e Entry, status Status, bytesCached int64, 
 	return changed == 1, nil
 }
 
+// UpdateProgress records the bytes of an in-flight attempt that are on disk.
+// It changes neither the status nor the authority, and only the exact
+// Prefetching generation.
+func (s *Store) UpdateProgress(e Entry, bytesCached int64) (bool, error) {
+	if e.Generation == "" || bytesCached < 0 {
+		return false, nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	result, err := s.db.Exec(`UPDATE pinned_files SET bytes_cached=? WHERE path=? AND pin_generation=? AND status=?`,
+		min(bytesCached, e.Size), e.Path, e.Generation, int(StatusPrefetching))
+	if err != nil {
+		return false, err
+	}
+	n, err := result.RowsAffected()
+	return n == 1, err
+}
+
 // CompleteReady commits the opaque, already-verified producer witness last.
 // Publication remains unavailable until AdmitReady validates local state.
 func (s *Store) CompleteReady(e Entry, authority []byte) (bool, error) {
@@ -443,7 +471,45 @@ func (s *Store) ClaimPrefetch(e Entry) (Entry, bool, error) {
 	return e, true, nil
 }
 
+// SetPinInode records the inode whose blocks juicefs pins for path. Unlike
+// the authority, no status change clears it (RequeueForRepair, a failure, a
+// re-pin of the same path): the pin guard keeps that inode's juicefs pins
+// for as long as the path is pinned, also when a relaunch has no server to
+// look the file up again. Only Unpin removes it, with the row.
+func (s *Store) SetPinInode(path string, inode uint64) error {
+	if inode == 0 {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.db.Exec(`UPDATE pinned_files SET pin_inode=? WHERE path=? AND pin_inode!=?`, int64(inode), path, int64(inode))
+	return err
+}
+
+// PinInodes returns the recorded juicefs pin inode of every pinned path
+// that has one.
+func (s *Store) PinInodes() (map[string]uint64, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	rows, err := s.db.Query(`SELECT path, pin_inode FROM pinned_files WHERE pin_inode != 0`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]uint64{}
+	for rows.Next() {
+		var path string
+		var ino int64
+		if err := rows.Scan(&path, &ino); err != nil {
+			return nil, err
+		}
+		out[path] = uint64(ino)
+	}
+	return out, rows.Err()
+}
+
 // RequeueForRepair revokes any earlier worker before Pending becomes visible.
+// It keeps pin_inode (SetPinInode).
 func (s *Store) RequeueForRepair(e Entry) (bool, error) {
 	if e.Generation == "" {
 		return false, nil
@@ -634,6 +700,24 @@ func (s *Store) Pending(limit int) ([]Entry, error) {
 	return s.queryStatus(StatusPending, limit)
 }
 
+// FailedOldest returns up to limit failed entries, the oldest attempt first.
+func (s *Store) FailedOldest(limit int) ([]Entry, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	rows, err := s.db.Query(`
+		SELECT path, size, status, bytes_cached, last_prefetched, last_error, pinned_at, pin_root, pin_generation, authority
+		FROM pinned_files
+		WHERE status = ?
+		ORDER BY last_prefetched ASC
+		LIMIT ?`,
+		int(StatusFailed), limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanEntries(rows)
+}
+
 // Stale returns entries whose last_prefetched is older than ttl, suitable
 // for re-warmup. Used by the periodic re-warmer to prevent eviction.
 func (s *Store) Stale(ttl time.Duration, limit int) ([]Entry, error) {
@@ -737,13 +821,14 @@ func (s *Store) Get(path string) (*Entry, bool) {
 
 // PinRoots returns the distinct pin roots and aggregate stats per root.
 type RootSummary struct {
-	Root         string `json:"root"`
-	TotalFiles   int    `json:"total_files"`
-	ReadyFiles   int    `json:"ready_files"`
-	PendingFiles int    `json:"pending_files"`
-	FailedFiles  int    `json:"failed_files"`
-	TotalBytes   int64  `json:"total_bytes"`
-	CachedBytes  int64  `json:"cached_bytes"`
+	Root             string `json:"root"`
+	TotalFiles       int    `json:"total_files"`
+	ReadyFiles       int    `json:"ready_files"`
+	PendingFiles     int    `json:"pending_files"`
+	PrefetchingFiles int    `json:"prefetching_files"`
+	FailedFiles      int    `json:"failed_files"`
+	TotalBytes       int64  `json:"total_bytes"`
+	CachedBytes      int64  `json:"cached_bytes"`
 }
 
 func (s *Store) PinRoots() ([]RootSummary, error) {
@@ -771,6 +856,8 @@ func (s *Store) PinRoots() ([]RootSummary, error) {
 			r.ReadyFiles++
 		case StatusPending:
 			r.PendingFiles++
+		case StatusPrefetching:
+			r.PrefetchingFiles++
 		case StatusFailed:
 			r.FailedFiles++
 		}
@@ -780,12 +867,13 @@ func (s *Store) PinRoots() ([]RootSummary, error) {
 
 // AggregateStats returns whole-database counters.
 type AggregateStats struct {
-	TotalFiles   int   `json:"total_files"`
-	ReadyFiles   int   `json:"ready_files"`
-	PendingFiles int   `json:"pending_files"`
-	FailedFiles  int   `json:"failed_files"`
-	TotalBytes   int64 `json:"total_bytes"`
-	CachedBytes  int64 `json:"cached_bytes"`
+	TotalFiles       int   `json:"total_files"`
+	ReadyFiles       int   `json:"ready_files"`
+	PendingFiles     int   `json:"pending_files"`
+	PrefetchingFiles int   `json:"prefetching_files"`
+	FailedFiles      int   `json:"failed_files"`
+	TotalBytes       int64 `json:"total_bytes"`
+	CachedBytes      int64 `json:"cached_bytes"`
 }
 
 func (s *Store) AggregateStats() (AggregateStats, error) {
@@ -804,6 +892,8 @@ func (s *Store) AggregateStats() (AggregateStats, error) {
 			a.ReadyFiles++
 		case StatusPending:
 			a.PendingFiles++
+		case StatusPrefetching:
+			a.PrefetchingFiles++
 		case StatusFailed:
 			a.FailedFiles++
 		}
