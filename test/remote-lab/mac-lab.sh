@@ -36,6 +36,8 @@
 #   JMLAB_MAC_SMOKE_MB  size of the smoke download (default 100)
 #   JMLAB_MAC_SMOKE_MAX time limit per smoke transfer in seconds (default 600)
 #   JMLAB_BBR=1         at up: the server's opt-in BBR overlay, as in lab.sh
+#   JMLAB_REALNAS=1     at up: the real-server alias at JMLAB_REALNAS_IP
+#                       (10.231.110.50), as in lab.sh; needs JMLAB_REALNAS_HOST
 # The lab uses its own Docker project (jmmac), state directory (.state-mac) and
 # subnets (10.231.110-130.0/24), so it can run next to a lab.sh/measure.py lab.
 set -euo pipefail
@@ -49,6 +51,7 @@ export JMLAB_PROXY_IP="${JMLAB_PROXY_IP:-10.231.110.20}" JMLAB_SILO_IP="${JMLAB_
 export JMLAB_IPERF_IP="${JMLAB_IPERF_IP:-10.231.110.40}" JMLAB_WAN_NAS_IP="${JMLAB_WAN_NAS_IP:-10.231.110.2}"
 export JMLAB_WAN_REMOTE_IP="${JMLAB_WAN_REMOTE_IP:-10.231.120.2}" JMLAB_CLIENT_IP="${JMLAB_CLIENT_IP:-10.231.120.10}"
 export JMLAB_GATEWAY_IP="${JMLAB_GATEWAY_IP:-10.231.120.20}"
+export JMLAB_REALNAS_IP="${JMLAB_REALNAS_IP:-10.231.110.50}"
 export JMLAB_TUNNEL_SUBNET="${JMLAB_TUNNEL_SUBNET:-10.231.130.0/24}" JMLAB_TUNNEL_GW_IP="${JMLAB_TUNNEL_GW_IP:-10.231.130.1}"
 export JMLAB_MAC_WG_PORT="${JMLAB_MAC_WG_PORT:-51820}" JMLAB_MAC_BIND="${JMLAB_MAC_BIND:-0.0.0.0}"
 GUEST_TUN_IP="${JMLAB_TUNNEL_GUEST_IP:-10.231.130.2}"
