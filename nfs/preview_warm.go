@@ -79,7 +79,9 @@ func (rm *ReadaheadManager) previewMode() previewMode {
 	if !snap.HaveRTT && !snap.HaveBW {
 		return previewNone
 	}
-	switch snap.Class {
+	// ReadClass, not Class: a far, thin link without a cost flag stays slow
+	// for the drain but may be unflagged cellular, so it warms nothing.
+	switch snap.ReadClass {
 	case netprofile.ClassSlow:
 		return previewMetadataOnly
 	case netprofile.ClassMedium, netprofile.ClassFast:

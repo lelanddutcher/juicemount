@@ -450,6 +450,12 @@ type NetworkSnapshot struct {
 	HaveBandwidth   bool    `json:"have_bandwidth"`
 	ThroughputN     int64   `json:"throughput_samples"`
 	BootstrappedRTT bool    `json:"bootstrapped_from_rtt"`
+	// LowBandwidth: the measured throughput is under the metered threshold.
+	// A far link keeps class "slow" with this set; it is not a data cost.
+	LowBandwidth bool `json:"low_bandwidth"`
+	// ReadClass is the class read-ahead and prefetch follow; "metered" on a
+	// far, thin link whose class is "slow".
+	ReadClass string `json:"read_class"`
 	// Simulated is true when JM_NET_FAKE_LINK replaced observations. FakeProfile
 	// is a canonical whitelist of parsed numeric/class fields, never the raw
 	// environment value. Performance harnesses use these fields to refuse to

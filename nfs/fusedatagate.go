@@ -99,11 +99,14 @@ func effectiveFUSEDataWidth() int64 {
 	return base
 }
 
-// tryAdmitFUSEData attempts one CAS admission against the current width.
+// tryAdmitFUSEData attempts one CAS admission of shared background work
+// against width. Everything in flight counts except the drainer's small-lane
+// reserve (fuseReserveInFlight): that slot sits outside the shared share, so
+// it never takes a slot from a media drain, read-ahead or a warmer.
 func tryAdmitFUSEData(width int64) bool {
 	for {
 		cur := fuseDataInFlight.Load()
-		if cur >= width {
+		if cur-fuseReserveInFlight.Load() >= width {
 			return false
 		}
 		if fuseDataInFlight.CompareAndSwap(cur, cur+1) {
@@ -135,8 +138,10 @@ func tryAdmitFUSEData(width int64) bool {
 // one slot only while nothing else runs, so at most 2 + 1 = 3 run at once
 // (before: 2 in all). That is intended: the 2026-11-11 lab measured every
 // demand-read refusal on a metered-classed link at 2 in flight with 1 of them
-// read-ahead. On fast and medium links the class width is the base, and
-// admission is exactly as before.
+// read-ahead. The drainer's small lane adds reserved background slots on top
+// (Drainer.trySmallReserveFUSESlot: 2 on a metered link), so 5 at most on a
+// metered link; they are background, so they never refuse a foreground read. On fast and medium links
+// the class width is the base, and admission is exactly as before.
 func acquireFUSEData() (release func(), ok bool) {
 	if !fuseDataGateEnabled {
 		return func() {}, true
@@ -206,6 +211,49 @@ func admitBackgroundFUSEData(limit int64) bool {
 }
 
 func releaseBackgroundFUSEData() {
+	fuseBackgroundInFlight.Add(-1)
+	fuseDataInFlight.Add(-1)
+}
+
+// fuseReserveInFlight counts drainer small-lane reserve slots in flight
+// (Drainer.trySmallReserveFUSESlot, at most smallReserveSlots per drainer). They are part of
+// fuseDataInFlight and fuseBackgroundInFlight, so the base ceiling and
+// foreground admission see them as background; shared background admission
+// (tryAdmitFUSEData) leaves them out. A reserve slot is added to the total
+// before it is counted as reserve and removed from the reserve count before
+// the total, so a race only overstates the shared share and refuses.
+var fuseReserveInFlight atomic.Int64
+
+// admitReserveFUSEData admits one small-lane reserve slot below the base
+// ceiling (the panic-derived limit, 16 by default), and only while foreground
+// reads could still reach their full class width beside it. Without that
+// second rule a reserve slot could take the last slot under the ceiling: on a
+// medium or fast link the foreground width IS the ceiling, so with 15
+// foreground reads in flight the 16th was refused (JUKEBOX, and macOS backs
+// off for up to 30 s). So on medium and fast links the reserve never admits;
+// there the background share is 8 and the small lane does not need it. On
+// slow (width 8) and metered (width 2) links it admits while
+// ceiling - inFlight > width - foregroundInFlight.
+func admitReserveFUSEData() bool {
+	ceiling := int64(fuseDataGateWidth())
+	width := effectiveFUSEDataWidth()
+	for {
+		cur := fuseDataInFlight.Load()
+		fg := cur - fuseBackgroundInFlight.Load()
+		if cur >= ceiling || ceiling-cur <= width-fg {
+			return false
+		}
+		if fuseDataInFlight.CompareAndSwap(cur, cur+1) {
+			break
+		}
+	}
+	fuseBackgroundInFlight.Add(1)
+	fuseReserveInFlight.Add(1)
+	return true
+}
+
+func releaseReserveFUSEData() {
+	fuseReserveInFlight.Add(-1)
 	fuseBackgroundInFlight.Add(-1)
 	fuseDataInFlight.Add(-1)
 }

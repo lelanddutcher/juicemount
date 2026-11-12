@@ -314,7 +314,9 @@ func TestTransportChangeInvalidatesStaleMeasurements(t *testing.T) {
 	p.ObserveRTT(180 * time.Millisecond)
 	sampleFor(p, 1.5*1024*1024, 6)
 	before := p.Snapshot()
-	if before.Class != ClassMetered || !before.HaveRTT || !before.HaveBW || before.ThroughputN == 0 {
+	// Stale cellular: slow for the drain (slow-RTT floor), metered for reads.
+	if before.Class != ClassSlow || before.ReadClass != ClassMetered || !before.LowBandwidth ||
+		!before.HaveRTT || !before.HaveBW || before.ThroughputN == 0 {
 		t.Fatalf("precondition stale cellular profile = %+v", before)
 	}
 
@@ -323,7 +325,7 @@ func TestTransportChangeInvalidatesStaleMeasurements(t *testing.T) {
 	if after.HaveRTT || after.HaveBW || after.ThroughputN != 0 || after.RTT != 0 || after.BytesPerSec != 0 {
 		t.Fatalf("transport reset retained prior-path measurements: %+v", after)
 	}
-	if after.Class != ClassMedium || after.BootstrappedRTT {
+	if after.Class != ClassMedium || after.ReadClass != ClassMedium || after.BootstrappedRTT {
 		t.Fatalf("fresh transport class = %s boot=%v, want transition-safe medium/unbootstrapped",
 			after.Class, after.BootstrappedRTT)
 	}

@@ -5,6 +5,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/lelanddutcher/juicemount/internal/netprofile"
 )
@@ -167,5 +168,25 @@ func TestJuiceFSDirectEnvironmentPreservesAccountHome(t *testing.T) {
 		if strings.HasPrefix(item, "AWS_ACCESS_KEY_ID=") || strings.HasPrefix(item, "MINIO_SECRET_KEY=") {
 			t.Fatal("ambient credential propagated")
 		}
+	}
+}
+
+// A far, thin link (300 ms, 2 Mbps, no cost flag) is class slow by the
+// slow-RTT floor but keeps the metered object deadlines, which the mount
+// takes from ReadPolicyClass: unflagged cellular keeps cellular-safe PUTs.
+func TestDesktopJuiceFSObjectIOArgsThinFarLinkStaysMetered(t *testing.T) {
+	t.Setenv("JM_JFS_OBJECT_TIMEOUTS", "")
+	t.Setenv("JM_NET_SLOW_RTT_FLOOR", "")
+	p := netprofile.New()
+	p.ObserveRTT(300 * time.Millisecond)
+	for i := 0; i < 8; i++ {
+		p.ObserveThroughput(4<<20, 16*time.Second) // 2 Mbps
+	}
+	if p.Class() != netprofile.ClassSlow {
+		t.Fatalf("precondition: class %s, want slow", p.Class())
+	}
+	got := desktopJuiceFSObjectIOArgs(p.ReadPolicyClass())
+	if want := desktopJuiceFSObjectIOArgs(netprofile.ClassMetered); !slices.Equal(got, want) {
+		t.Fatalf("object IO args %v, want the metered %v", got, want)
 	}
 }
