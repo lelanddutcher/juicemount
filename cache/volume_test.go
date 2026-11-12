@@ -556,6 +556,17 @@ func TestVolumeCacheObservesEncryptedShapeWithoutChangingBinding(t *testing.T) {
 	if shape, ok := ObservedVolumeShape(); !ok || !shape.Encrypted || shape.BlockSize != 1<<20 {
 		t.Fatalf("encrypted volume shape = %+v, %v; want 1 MiB, encrypted", shape, ok)
 	}
+	// An algorithm name without a key is an unencrypted volume (JuiceFS sets
+	// Encrypted only when EncryptKey is set): its reads stay ranged.
+	if err := rdb.Set(ctx, "setting", `{"UUID":"`+activeTestUUID+`","BlockSize":4096,"EncryptAlgo":"aes256gcm-rsa"}`, 0).Err(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ReadVolumeBinding(ctx, rdb, rawURL); err != nil {
+		t.Fatal(err)
+	}
+	if shape, ok := ObservedVolumeShape(); !ok || shape.Encrypted {
+		t.Fatalf("algorithm without a key = %+v, %v; want not encrypted", shape, ok)
+	}
 	// Encryption is not part of the persisted identity: only the block size moved.
 	enc.BlockSize = plain.BlockSize
 	if enc != plain {
