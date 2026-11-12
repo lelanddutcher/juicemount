@@ -79,7 +79,8 @@ CREATE TABLE IF NOT EXISTS pinned_files (
     pinned_at        INTEGER NOT NULL,
     pin_root         TEXT NOT NULL DEFAULT '',
     pin_generation   TEXT NOT NULL DEFAULT '',
-    authority        BLOB NOT NULL DEFAULT X''
+    authority        BLOB NOT NULL DEFAULT X'',
+    pin_inode        INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_pinned_status ON pinned_files(status);
 CREATE INDEX IF NOT EXISTS idx_pinned_root ON pinned_files(pin_root);
@@ -148,6 +149,7 @@ func migratePinGenerations(db *sql.DB) error {
 	}
 	hasGeneration := false
 	hasAuthority := false
+	hasPinInode := false
 	for rows.Next() {
 		var id, notNull, pk int
 		var name, kind string
@@ -162,6 +164,9 @@ func migratePinGenerations(db *sql.DB) error {
 		if name == "authority" {
 			hasAuthority = true
 		}
+		if name == "pin_inode" {
+			hasPinInode = true
+		}
 	}
 	err = rows.Err()
 	rows.Close()
@@ -175,6 +180,11 @@ func migratePinGenerations(db *sql.DB) error {
 	}
 	if !hasAuthority {
 		if _, err := db.Exec(`ALTER TABLE pinned_files ADD COLUMN authority BLOB NOT NULL DEFAULT X''`); err != nil {
+			return err
+		}
+	}
+	if !hasPinInode {
+		if _, err := db.Exec(`ALTER TABLE pinned_files ADD COLUMN pin_inode INTEGER NOT NULL DEFAULT 0`); err != nil {
 			return err
 		}
 	}
@@ -461,7 +471,45 @@ func (s *Store) ClaimPrefetch(e Entry) (Entry, bool, error) {
 	return e, true, nil
 }
 
+// SetPinInode records the inode whose blocks juicefs pins for path. Unlike
+// the authority, no status change clears it (RequeueForRepair, a failure, a
+// re-pin of the same path): the pin guard keeps that inode's juicefs pins
+// for as long as the path is pinned, also when a relaunch has no server to
+// look the file up again. Only Unpin removes it, with the row.
+func (s *Store) SetPinInode(path string, inode uint64) error {
+	if inode == 0 {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.db.Exec(`UPDATE pinned_files SET pin_inode=? WHERE path=? AND pin_inode!=?`, int64(inode), path, int64(inode))
+	return err
+}
+
+// PinInodes returns the recorded juicefs pin inode of every pinned path
+// that has one.
+func (s *Store) PinInodes() (map[string]uint64, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	rows, err := s.db.Query(`SELECT path, pin_inode FROM pinned_files WHERE pin_inode != 0`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]uint64{}
+	for rows.Next() {
+		var path string
+		var ino int64
+		if err := rows.Scan(&path, &ino); err != nil {
+			return nil, err
+		}
+		out[path] = uint64(ino)
+	}
+	return out, rows.Err()
+}
+
 // RequeueForRepair revokes any earlier worker before Pending becomes visible.
+// It keeps pin_inode (SetPinInode).
 func (s *Store) RequeueForRepair(e Entry) (bool, error) {
 	if e.Generation == "" {
 		return false, nil

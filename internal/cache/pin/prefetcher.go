@@ -60,10 +60,11 @@ type Prefetcher struct {
 	pinMu            sync.Mutex
 	pinner           BlockPinner
 	fillWorkers      func() int
-	capacityDir      string // the cache base dir CapacityLoop walks
+	capacityDir      string       // the cache base dir CapacityLoop walks
 	bytesFetched     atomic.Int64 // downloaded by fills: the rate's input
 	inodes           map[string]inodeRec
 	retries          map[string]int
+	sliceCursor      int // next Ready pin the guard checks against its slices
 	pinnedBlockBytes atomic.Int64
 	pinLimitBytes    atomic.Int64
 	// Test-only rendezvous after EOF and before the generation-fenced Ready write.
@@ -725,6 +726,9 @@ func (p *Prefetcher) prefetch(e Entry) (retErr error) {
 	filled := false
 	if b := p.blockPinner(); b != nil && want.Size > 0 {
 		p.rememberInode(e.Path, want.Inode)
+		// Durable: the guard keeps this inode's juicefs pins while the path
+		// is pinned, whatever its status, also after a relaunch offline.
+		_ = p.store.SetPinInode(e.Path, want.Inode)
 		fill := func() (BlockFillStatus, error) {
 			var lastDone, lastFetched, lastSaved int64
 			lastSave := time.Now()

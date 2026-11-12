@@ -29,8 +29,8 @@ const (
 	jfsPinBatch = 4096
 )
 
-// jfsPinTimeout bounds one pin exchange: every op is local to juicefs except
-// START, which reads the file's attributes when a fill already runs.
+// jfsPinTimeout bounds one pin exchange. Every op answers without metadata
+// except VERIFY with slices, which juicefs bounds to 5 s.
 const jfsPinTimeout = 20 * time.Second
 
 // JFSBlockPinner implements pin.BlockPinner over the mount's .control file.
@@ -114,7 +114,9 @@ func (b *JFSBlockPinner) Check(inode uint64) (known bool, total, missing int64, 
 	return r[1] == 1, int64(binary.BigEndian.Uint64(r[2:])), int64(binary.BigEndian.Uint64(r[10:])), attr, nil
 }
 
-func (b *JFSBlockPinner) Verify(items []pin.PinVerifyItem) ([]pin.PinVerifyResult, error) {
+// Verify sends flags bit 1 when slices is set: juicefs then also compares
+// each file's slices in metadata with the ones its fill saw.
+func (b *JFSBlockPinner) Verify(items []pin.PinVerifyItem, slices bool) ([]pin.PinVerifyResult, error) {
 	var out []pin.PinVerifyResult
 	for start := 0; start < len(items); start += jfsPinBatch {
 		batch := items[start:min(start+jfsPinBatch, len(items))]
@@ -123,6 +125,9 @@ func (b *JFSBlockPinner) Verify(items []pin.PinVerifyItem) ([]pin.PinVerifyResul
 			body = binary.BigEndian.AppendUint64(body, it.Inode)
 			body = binary.BigEndian.AppendUint64(body, uint64(it.Size))
 			body = binary.BigEndian.AppendUint64(body, uint64(it.MtimeNS))
+		}
+		if slices {
+			body = append(body, 1)
 		}
 		r, err := b.op(jfsPinOpVerify, body, 5, func(r []byte) int {
 			return 5 + 17*int(binary.BigEndian.Uint32(r[1:5]))

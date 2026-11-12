@@ -57,7 +57,7 @@ func TestJFSBlockPinnerWire(t *testing.T) {
 			return r, nil
 		case jfsPinOpVerify:
 			n := binary.BigEndian.Uint32(msg[9:])
-			if len(msg) != 13+24*int(n) {
+			if extra := len(msg) - (13 + 24*int(n)); extra != 0 && (extra != 1 || msg[len(msg)-1] != 1) {
 				t.Fatalf("verify body %d bytes for %d items", len(msg)-13, n)
 			}
 			r := binary.BigEndian.AppendUint32([]byte{0}, 1)
@@ -93,9 +93,14 @@ func TestJFSBlockPinnerWire(t *testing.T) {
 		items[i] = pin.PinVerifyItem{Inode: uint64(i + 1), Size: 10, MtimeNS: 20}
 	}
 	sent = nil
-	res, err := b.Verify(items)
+	res, err := b.Verify(items, false)
 	if err != nil || len(sent) != 2 || len(res) != 2 || res[0].Inode != 1 || res[0].Reason != pin.PinChanged || res[0].Missing != 9 || res[1].Inode != jfsPinBatch+1 {
 		t.Fatalf("verify %+v %v in %d messages", res, err, len(sent))
+	}
+	// With slices: the flags byte follows the items.
+	sent = nil
+	if _, err := b.Verify(items[:2], true); err != nil || len(sent) != 1 || len(sent[0]) != 13+48+1 || sent[0][len(sent[0])-1] != 1 {
+		t.Fatalf("verify with slices: %v %x", err, sent)
 	}
 	keep := make([]uint64, jfsPinBatch+3)
 	for i := range keep {

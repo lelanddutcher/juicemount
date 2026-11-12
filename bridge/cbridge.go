@@ -2209,6 +2209,7 @@ func nfsServerStartSerialized(configJSON *C.char, recovery *servingDesiredRecord
 	// Pin store + prefetcher. The pin store lives in its own SQLite file so
 	// it doesn't compete with the metadata store's WAL.
 	var startPinWorkers func()
+	clearJuiceFSPins := false // JM_PIN_WHOLE_BLOCKS=0: unpin what juicefs persisted
 	jmlog.Info("BOOT-TRACE: step-2 pre-pin-store")
 	pinDBPath := pinStorePath(cfg.DBPath)
 	if ps, err := pin.Open(pinDBPath); err == nil {
@@ -2232,7 +2233,9 @@ func nfsServerStartSerialized(configJSON *C.char, recovery *servingDesiredRecord
 			// Pin through whole blocks that juicefs keeps out of eviction
 			// (bundled juicefs patch 0026). JM_PIN_WHOLE_BLOCKS=0 is the
 			// field rollback to the read-through pin.
-			if os.Getenv("JM_PIN_WHOLE_BLOCKS") != "0" {
+			if os.Getenv("JM_PIN_WHOLE_BLOCKS") == "0" {
+				clearJuiceFSPins = true
+			} else {
 				globalPrefetcher.SetBlockPinner(jmnfs.NewJFSBlockPinner(cfg.FUSEPath))
 				// One download per fill on a slow or metered link, so pins
 				// do not crowd out reads the editor waits for.
@@ -2260,7 +2263,17 @@ func nfsServerStartSerialized(configJSON *C.char, recovery *servingDesiredRecord
 			// silently inherit these still-running closures (review MEDIUM).
 			pf := globalPrefetcher
 			pinCtx := pf.Context()
+			fusePath := cfg.FUSEPath
 			startPinWorkers = func() {
+				if clearJuiceFSPins {
+					// Rollback: juicefs still loads the pins an earlier run
+					// persisted, and they would hold up to 90% of the cache
+					// for ever. One empty SWEEP unpins them all (retried
+					// every 30 s for 10 min until the FUSE mount answers).
+					pf.Go(func() {
+						_ = pin.ClearBlockPins(pinCtx, jmnfs.NewJFSBlockPinner(fusePath), 30*time.Second, 20)
+					})
+				}
 				// Restore local witnesses first; then the pin guard pins their
 				// blocks in juicefs again (a relaunched juicefs holds none),
 				// sends pins with lost blocks back to the workers, and unpins

@@ -9,7 +9,7 @@ const (
 	JMPinOpCheck  = 3 // ino(8)
 	JMPinOpSweep  = 4 // phase(1) n(4) ino(8)*n
 	JMPinOpCancel = 5 // ino(8)
-	JMPinOpVerify = 6 // n(4) (ino(8) length(8) mtime_ns(8))*n
+	JMPinOpVerify = 6 // n(4) (ino(8) length(8) mtime_ns(8))*n [flags(1)]
 	JMPinOpSetCap = 7 // bytes(8)
 
 	// JMPinVerifyMax bounds the items of one VERIFY and the inodes of one

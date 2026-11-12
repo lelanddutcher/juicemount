@@ -11,8 +11,9 @@ package pin
 // Now a worker first asks juicefs to fill the file: juicefs downloads each
 // missing block whole, writes it to its disk cache before it reports done, and
 // pins it. Its eviction skips pinned blocks; it keeps the pin list on disk, so
-// pins survive a restart with no server; pinned bytes are capped at 90% of the
-// cache and at what the disk can hold above its free-space floor. The worker
+// pins survive a restart (opening a pinned file still needs the metadata
+// server); pinned bytes are capped at 90% of the cache and at what the disk
+// can hold above its free-space floor. The worker
 // then reads the file through FUSE as before, now from local disk, to hash it
 // for the resident authority. A juicefs without the message keeps the old
 // read path.
@@ -31,14 +32,18 @@ import (
 // BlockPinner is the juicefs pin message (implemented by nfs over .control).
 type BlockPinner interface {
 	// Start begins filling and pinning the file's blocks with at most
-	// workers parallel downloads. A fill already running for inode is kept
-	// when the file did not change.
+	// workers parallel downloads. workers 1 also limits juicefs to one pin
+	// download at a time across all fills. A fill already running for inode
+	// is kept when the file did not change.
 	Start(inode uint64, workers int) error
 	Status(inode uint64) (BlockFillStatus, error)
 	Cancel(inode uint64) error
-	// Verify is local to juicefs: it returns the items that are not pinned,
-	// were pinned from another length or mtime, or miss blocks.
-	Verify(items []PinVerifyItem) ([]PinVerifyResult, error)
+	// Verify returns the items that are not pinned, were pinned from
+	// another length or mtime, or miss blocks. It is local to juicefs unless
+	// slices is set: then juicefs also reads each file's slices from
+	// metadata, for a few seconds at most, and reports a file whose slices
+	// changed (compaction keeps the length and mtime).
+	Verify(items []PinVerifyItem, slices bool) ([]PinVerifyResult, error)
 	// Sweep unpins every inode not in keep and returns juicefs's pinned
 	// bytes and its cap.
 	Sweep(keep []uint64) (dropped int, pinned, limit int64, err error)
@@ -110,6 +115,10 @@ var (
 	guardFillTimeout = 5 * time.Minute
 )
 
+// sliceCheckBatch is how many Ready pins one guard pass also checks against
+// the file's slices in metadata (rotating: every pin in turn).
+const sliceCheckBatch = 64
+
 // pinVerifyBatch bounds one Verify or Sweep message (juicefs's limit).
 const pinVerifyBatch = 4096
 
@@ -139,7 +148,9 @@ func (p *Prefetcher) SetBlockPinner(b BlockPinner) {
 }
 
 // SetFillWorkers installs the per-fill download width: 1 on a slow or
-// metered link, so pins do not crowd out reads the editor waits for.
+// metered link, so pins do not crowd out reads the editor waits for. Every
+// fill passes it to juicefs (the workers' and the guard's), and juicefs
+// treats 1 as one pin download at a time across all fills.
 func (p *Prefetcher) SetFillWorkers(f func() int) {
 	p.pinMu.Lock()
 	p.fillWorkers = f
@@ -160,6 +171,24 @@ func (p *Prefetcher) workersForFill() int {
 		return 4
 	}
 	return min(max(f(), 1), 4)
+}
+
+// ClearBlockPins unpins every file in juicefs: with JM_PIN_WHOLE_BLOCKS=0
+// the pins an earlier run persisted would otherwise hold up to 90% of the
+// cache for ever. It tries up to tries times, every interval, until juicefs
+// answers; a juicefs that cannot pin, or does not know the message, ends it.
+func ClearBlockPins(ctx context.Context, b BlockPinner, every time.Duration, tries int) error {
+	for i := 1; ; i++ {
+		_, _, _, err := b.Sweep(nil)
+		if err == nil || errors.Is(err, ErrBlockPinUnsupported) || errors.Is(err, syscall.EINVAL) || i >= tries {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(every):
+		}
+	}
 }
 
 // fillBlocks runs one juicefs fill of inode to its end. progress gets each
@@ -397,13 +426,14 @@ func (p *Prefetcher) clearRetries(path string) {
 
 // GuardReport is one pass of the pin guard.
 type GuardReport struct {
-	Checked   int   // Ready pins verified against juicefs
-	Repinned  int   // pins juicefs did not hold, pinned again
-	Requeued  int   // Ready pins sent back to the workers
-	Dropped   int   // juicefs pins of files no longer pinned
-	Pinned    int64 // juicefs pinned bytes after the pass
-	Limit     int64 // juicefs pin cap
-	Supported bool
+	Checked      int   // Ready pins verified against juicefs
+	SliceChecked int   // of those, also checked against metadata slices
+	Repinned     int   // pins juicefs did not hold, pinned again
+	Requeued     int   // Ready pins sent back to the workers
+	Dropped      int   // juicefs pins of files no longer pinned
+	Pinned       int64 // juicefs pinned bytes after the pass
+	Limit        int64 // juicefs pin cap
+	Supported    bool
 }
 
 // PinGuardLoop keeps juicefs's pins equal to the pin store and Ready honest.
@@ -449,6 +479,10 @@ func (p *Prefetcher) GuardPins(ctx context.Context) GuardReport {
 	if err != nil {
 		return rep
 	}
+	pinInodes, err := p.store.PinInodes()
+	if err != nil {
+		return rep
+	}
 	id, _ := p.provider.(pinIdentity)
 	var items []PinVerifyItem
 	byInode := map[uint64]Entry{}
@@ -461,6 +495,12 @@ func (p *Prefetcher) GuardPins(ctx context.Context) GuardReport {
 		if !ok {
 			continue
 		}
+		// Record the pinned inode where a requeue does not clear it, before
+		// anything below can requeue the entry (pins made before the column
+		// existed have only the witness).
+		if pinInodes[e.Path] != witness && p.store.SetPinInode(e.Path, witness) == nil {
+			pinInodes[e.Path] = witness
+		}
 		if cur.Inode != witness { // replaced on the server since the pin
 			requeue = append(requeue, e)
 			continue
@@ -469,9 +509,10 @@ func (p *Prefetcher) GuardPins(ctx context.Context) GuardReport {
 		byInode[cur.Inode] = e
 	}
 	var unknown []Entry
+	flagged := map[uint64]bool{}
 	for start := 0; start < len(items); start += pinVerifyBatch {
 		batch := items[start:min(start+pinVerifyBatch, len(items))]
-		bad, err := b.Verify(batch)
+		bad, err := b.Verify(batch, false)
 		if err != nil {
 			return rep
 		}
@@ -481,10 +522,35 @@ func (p *Prefetcher) GuardPins(ctx context.Context) GuardReport {
 			if !ok {
 				continue
 			}
+			flagged[r.Inode] = true
 			if r.Reason == PinUnknown {
 				unknown = append(unknown, e)
 			} else {
 				requeue = append(requeue, e)
+			}
+		}
+	}
+	// A few of the pins that passed are also checked against their slices
+	// in metadata (compaction keeps length and mtime). Offline, juicefs
+	// skips that check and reports nothing.
+	var passed []PinVerifyItem
+	for _, it := range items {
+		if !flagged[it.Inode] {
+			passed = append(passed, it)
+		}
+	}
+	if len(passed) > 0 {
+		p.pinMu.Lock()
+		from := p.sliceCursor % len(passed)
+		p.sliceCursor = from + sliceCheckBatch
+		p.pinMu.Unlock()
+		window := passed[from:min(from+sliceCheckBatch, len(passed))]
+		if bad, err := b.Verify(window, true); err == nil {
+			rep.SliceChecked = len(window)
+			for _, r := range bad {
+				if e, ok := byInode[r.Inode]; ok && r.Reason != PinUnknown {
+					requeue = append(requeue, e)
+				}
 			}
 		}
 	}
@@ -546,16 +612,24 @@ func (p *Prefetcher) GuardPins(ctx context.Context) GuardReport {
 		return rep
 	}
 	// Keep: every file pinned now (a fresh read, so a pin removed during the
-	// pass is not kept), the inodes its witness and the mirror name, and
-	// fills that started during the pass.
+	// pass is not kept), whatever its status: its recorded pin inode (which
+	// a requeue keeps, so a Pending or Failed pin keeps its blocks while
+	// offline), the inodes its witness and the mirror name, and fills that
+	// started during the pass.
 	entries, err = p.store.All()
 	if err != nil {
+		return rep
+	}
+	if pinInodes, err = p.store.PinInodes(); err != nil {
 		return rep
 	}
 	pinned := make(map[string]struct{}, len(entries))
 	var keep []uint64
 	for _, e := range entries {
 		pinned[e.Path] = struct{}{}
+		if ino := pinInodes[e.Path]; ino != 0 {
+			keep = append(keep, ino)
+		}
 		if e.Status == StatusReady && id != nil {
 			if witness, cur, ok := id.PinIdentity(e); ok {
 				keep = append(keep, witness)

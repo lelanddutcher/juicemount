@@ -16,6 +16,7 @@ package chunk
 // prefetcher was filling waited for the whole block.
 
 import (
+	"context"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -86,6 +87,12 @@ func (d *demandFirst) beginDemand(key string) func() {
 // reads elsewhere are a reader that moved on (a scrub). It reports how long
 // it waited (0 when nothing held it).
 func (d *demandFirst) waitIdle(key string) time.Duration {
+	return d.waitIdleCtx(context.Background(), key)
+}
+
+// waitIdleCtx is waitIdle that also returns when ctx is done (a canceled
+// pin fill must not wait out deferMax).
+func (d *demandFirst) waitIdleCtx(ctx context.Context, key string) time.Duration {
 	if d == nil || !d.enabled {
 		return 0
 	}
@@ -107,6 +114,8 @@ func (d *demandFirst) waitIdle(key string) time.Duration {
 		select {
 		case <-changed:
 		case <-timer.C:
+			return time.Since(start)
+		case <-ctx.Done():
 			return time.Since(start)
 		}
 	}

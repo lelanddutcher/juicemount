@@ -341,8 +341,11 @@ experiments/pin-lab.sh after > after.jsonl
 - `offline`: the travel case. Pin, cut the link (iptables in the client),
   kill JuiceFS, fill the cache disk (a 4 GiB tmpfs) below its free-space
   floor, start JuiceFS again, cut the link again, and check the pins with no
-  server while more disk pressure evicts. JuiceFS needs the server only to
-  mount.
+  server while more disk pressure evicts. It checks the pin list (CHECK), not
+  reads: JuiceFS needs the server to mount and to open a file, and the app
+  does not mount JuiceFS when the server is unreachable at launch. So this
+  proves the pins survive a restart, not that pinned files open with no
+  connection at all.
 
 On Linux the old pin did not lose blocks (patch 0021's spans assemble whole
 blocks for a sequential reader); the failure it fixes was seen on macOS.

@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"os"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -247,5 +248,113 @@ func TestJMPinMessageCancelStopsFill(t *testing.T) {
 	st := pinMsg(v, meta.JMPinOpStatus, ino)
 	if st[1] == jmPinFailed && st[2] != uint8(syscall.ECANCELED) {
 		t.Fatalf("canceled fill: state %d errno %d", st[1], st[2])
+	}
+}
+
+// slowAttrMeta blocks the first GetAttr of ino until release is closed.
+type slowAttrMeta struct {
+	meta.Meta
+	ino     Ino
+	once    sync.Once
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (m *slowAttrMeta) GetAttr(ctx meta.Context, ino Ino, attr *Attr) syscall.Errno {
+	if ino == m.ino {
+		m.once.Do(func() {
+			close(m.entered)
+			<-m.release
+		})
+	}
+	return m.Meta.GetAttr(ctx, ino, attr)
+}
+
+// Re-review LOW: START with a fill running answers without reading metadata
+// on the control path; the change check runs in the background.
+func TestJMPinMessageStartDoesNotWaitForMetadata(t *testing.T) {
+	v := pinVFS(t)
+	ctx := NewLogContext(meta.NewContext(10, 1, []uint32{2, 3}))
+	fe, fh, _ := v.Create(ctx, 1, "s", 0644, 0, syscall.O_RDWR)
+	_ = v.Write(ctx, fe.Inode, bytes.Repeat([]byte{'s'}, 2<<20), 0, fh)
+	_ = v.Flush(ctx, fe.Inode, fh, 0)
+	v.Release(ctx, fe.Inode, fh)
+	// A running fill that saw other attributes.
+	st := v.jmPin()
+	canceled := make(chan struct{})
+	old := &jmPinJob{cancel: func() { close(canceled) }, attr: &chunk.JMPinAttr{Length: 1}}
+	old.state.Store(jmPinRunning)
+	st.mu.Lock()
+	st.jobs[fe.Inode] = old
+	st.mu.Unlock()
+	slow := &slowAttrMeta{Meta: v.Meta, ino: fe.Inode, entered: make(chan struct{}), release: make(chan struct{})}
+	v.Meta = slow
+	ino := uint64(fe.Inode)
+	replied := make(chan []byte, 1)
+	go func() { replied <- pinMsg(v, meta.JMPinOpStart, ino) }()
+	<-slow.entered
+	select {
+	case r := <-replied:
+		if r[0] != 0 {
+			t.Fatalf("start: %v", r)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("START waited for GetAttr")
+	}
+	// A second START while the check runs starts no second check.
+	if r := pinMsg(v, meta.JMPinOpStart, ino); r[0] != 0 {
+		t.Fatalf("second start: %v", r)
+	}
+	close(slow.release)
+	select {
+	case <-canceled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the stale fill was not canceled")
+	}
+	waitUntil(t, "refill", 10*time.Second, func() bool { return pinMsg(v, meta.JMPinOpStatus, ino)[1] == jmPinDone })
+	if ck := pinMsg(v, meta.JMPinOpCheck, ino); binary.BigEndian.Uint64(ck[2:]) != 2<<20 {
+		t.Fatalf("after the restart: %v", ck)
+	}
+}
+
+// Re-review MEDIUM-5: VERIFY with flags bit 1 finds a file whose slices
+// changed while its length and mtime did not (as compaction does).
+func TestJMPinMessageVerifyComparesSlices(t *testing.T) {
+	v := pinVFS(t)
+	ctx := NewLogContext(meta.NewContext(10, 1, []uint32{2, 3}))
+	fe, fh, _ := v.Create(ctx, 1, "k", 0644, 0, syscall.O_RDWR)
+	_ = v.Write(ctx, fe.Inode, bytes.Repeat([]byte{'k'}, 2<<20), 0, fh)
+	_ = v.Flush(ctx, fe.Inode, fh, 0)
+	ino := uint64(fe.Inode)
+	pinMsg(v, meta.JMPinOpStart, ino)
+	waitUntil(t, "fill", 10*time.Second, func() bool { return pinMsg(v, meta.JMPinOpStatus, ino)[1] == jmPinDone })
+	ck := pinMsg(v, meta.JMPinOpCheck, ino)
+	length, mtime := binary.BigEndian.Uint64(ck[18:]), binary.BigEndian.Uint64(ck[26:])
+	verify := func(flags ...byte) []byte {
+		body := binary.BigEndian.AppendUint32([]byte{meta.JMPinOpVerify}, 1)
+		for _, x := range []uint64{ino, length, mtime} {
+			body = binary.BigEndian.AppendUint64(body, x)
+		}
+		body = append(body, flags...)
+		var out bytes.Buffer
+		v.jmPinMsg(utils.ReadBuffer(body), &out)
+		return out.Bytes()
+	}
+	if r := verify(1); !bytes.Equal(r, []byte{0, 0, 0, 0, 0}) {
+		t.Fatalf("deep verify of a current pin: %v", r)
+	}
+	// New slices, same length; then the old mtime back.
+	_ = v.Write(ctx, fe.Inode, bytes.Repeat([]byte{'K'}, 2<<20), 0, fh)
+	_ = v.Flush(ctx, fe.Inode, fh, 0)
+	v.Release(ctx, fe.Inode, fh)
+	attr := Attr{Mtime: int64(mtime) / 1e9, Mtimensec: uint32(int64(mtime) % 1e9)}
+	if e := v.Meta.SetAttr(meta.Background(), fe.Inode, meta.SetAttrMtime, 0, &attr); e != 0 {
+		t.Fatal(e)
+	}
+	if r := verify(); !bytes.Equal(r, []byte{0, 0, 0, 0, 0}) {
+		t.Fatalf("local verify cannot see the new slices, got %v", r)
+	}
+	if r := verify(1); len(r) != 5+17 || r[13] != 2 {
+		t.Fatalf("deep verify of new slices: %v", r)
 	}
 }

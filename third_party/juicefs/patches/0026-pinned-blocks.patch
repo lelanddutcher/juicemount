@@ -27,16 +27,16 @@
  }
  
  func (cache *cacheStore) checkErr(f func() error) error {
-@@ -367,6 +371,9 @@
- 			}
+@@ -368,6 +372,9 @@
  			if v.size < 0 {
  				continue // staging
-+			}
+ 			}
 +			if cache.jmPins.has(k) {
 +				continue // pinned (JuiceMount patch 0026)
- 			}
++			}
  			if v.atime < cutoff {
  				deleted++
+ 				delete(cache.keys, k)
 @@ -788,7 +795,7 @@
  		return
  	}
@@ -46,38 +46,48 @@
  	num := int64(len(cache.keys)) * 99 / 100
  	if cache.maxItems != 0 && num > cache.maxItems*99/100 {
  		num = cache.maxItems * 99 / 100
-@@ -811,6 +818,20 @@
- 			num = 0
- 		} else {
+@@ -805,6 +812,7 @@
+ 			goal = (cache.used - toFree) * 95 / 100
+ 		}
+ 	}
++	inodesShort := usage.fr < cache.freeRatio // JuiceMount patch 0026
+ 	if usage.fr < cache.freeRatio {
+ 		toFree := int(float32(usage.inodeCap) * (cache.freeRatio - usage.fr))
+ 		if toFree > len(cache.keys) {
+@@ -813,6 +821,22 @@
  			num = int64(len(cache.keys)-toFree) * 99 / 100
-+		}
-+	}
-+	// JuiceMount patch 0026: pinned blocks are not evictable. Never aim below
-+	// them, never walk the keys when only pinned blocks are left, and drop
-+	// the 1% item goal (it would walk every pinned key to find none).
-+	if pinned := cache.jmPins.storeBytes(cache.id); pinned > 0 {
+ 		}
+ 	}
++	// JuiceMount patch 0026: pinned blocks are not evictable. Count only the
++	// pinned blocks that are on disk (a fill that failed or was canceled
++	// pinned blocks it never got). Never aim below them, never walk the keys
++	// when only pinned blocks are left, and drop the 1% item goal (it would
++	// walk every pinned key to find none) unless inodes are short.
++	if pinned := cache.jmPins.presentBytes(cache.id, cache.keys); pinned > 0 {
 +		if goal < pinned {
 +			goal = pinned
 +		}
-+		if cache.maxItems == 0 {
++		if cache.maxItems == 0 && !inodesShort {
 +			num = int64(len(cache.keys))
 +		}
 +		if cache.used-pinned < 4096 {
 +			return
- 		}
- 	}
++		}
++	}
  	if int64(len(cache.keys)) <= num && cache.used <= goal {
-@@ -828,6 +849,9 @@
- 	for k, value := range cache.keys {
+ 		return // some other thread has done the cleanup
+ 	}
+@@ -829,6 +853,9 @@
  		if value.size < 0 {
  			continue // staging
-+		}
+ 		}
 +		if cache.jmPins.has(k) {
 +			continue // pinned (JuiceMount patch 0026)
- 		}
++		}
  		if cache.cacheExpire > 0 && value.atime < cutoff {
  			lastK = k
-@@ -1036,6 +1060,7 @@
+ 			lastValue = value
+@@ -1036,6 +1063,7 @@
  	storeMap      map[string]*cacheStore
  	stores        []*cacheStore
  	metrics       *cacheManagerMetrics
@@ -85,7 +95,7 @@
  }
  
  func legacyKeyHash(s string) uint32 {
-@@ -1130,15 +1155,19 @@
+@@ -1130,15 +1158,19 @@
  		stores:        make([]*cacheStore, len(dirs)),
  		metrics:       metrics,
  	}
@@ -99,9 +109,8 @@
  		m.stores[i] = store
  		m.storeMap[store.id] = store
  		m.consistentMap.Add(store.id)
--	}
 +		jmPinsByDir.Delete(store.dir)
-+	}
+ 	}
 +	m.pins.bind(m)
  	go m.cleanup()
  	return m

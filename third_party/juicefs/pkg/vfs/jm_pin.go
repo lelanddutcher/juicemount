@@ -7,10 +7,14 @@
  *
  *	1 START  ino(8) [workers(1)]
  *	                 fill and pin the file's blocks in the background, with at
- *	                 most workers parallel downloads (1..4, default 4). A fill
+ *	                 most workers parallel downloads (1..4, default 4).
+ *	                 workers 1 also limits every fill of the process to one
+ *	                 download at a time (a slow or metered link). A fill
  *	                 already running for ino is kept when the file's length
  *	                 and mtime still match; otherwise it is canceled and
- *	                 started again. Reply: errno.
+ *	                 started again. That check reads metadata, so it runs in
+ *	                 the background too: the reply never waits for the
+ *	                 server. Reply: errno.
  *	2 STATUS ino(8)  Reply: errno (ENOENT: no fill known), state(1: 1 running,
  *	                 2 done, 3 failed), fill errno(1), total(8), done(8),
  *	                 fetched(8) bytes.
@@ -22,10 +26,15 @@
  *	                 is unpinned. Reply: errno, dropped(4), pinned(8), cap(8).
  *	5 CANCEL ino(8)  stop a running fill (its blocks so far stay pinned).
  *	                 Reply: errno.
- *	6 VERIFY n(4) (ino(8) length(8) mtime_ns(8))*n
- *	                 local only. Reply: errno, count(4), then per item that is
- *	                 not pinned (1), pinned from another length or mtime (2) or
- *	                 missing blocks (3): ino(8) reason(1) missing(8).
+ *	6 VERIFY n(4) (ino(8) length(8) mtime_ns(8))*n [flags(1)]
+ *	                 local only, unless flags bit 1: then each item's slices
+ *	                 are also read from metadata (within jmPinSliceBudget,
+ *	                 stopping at the first metadata error) and compared with
+ *	                 the slices the fill saw, which compaction changes without
+ *	                 changing the length or mtime. Reply: errno, count(4),
+ *	                 then per item that is not pinned (1), pinned from another
+ *	                 length, mtime or slices (2) or missing blocks (3): ino(8)
+ *	                 reason(1) missing(8).
  *	7 SETCAP bytes(8) grow the cache capacity to at least bytes (never below
  *	                 --cache-size). Reply: errno, capacity(8), pinned(8), cap(8).
  *
@@ -43,6 +52,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"time"
 
 	"github.com/juicedata/juicefs/pkg/chunk"
 	"github.com/juicedata/juicefs/pkg/meta"
@@ -72,7 +82,13 @@ type jmPinJob struct {
 	cancel context.CancelFunc
 	mu     sync.Mutex
 	attr   *chunk.JMPinAttr // the file's attributes, once read
+	// rechecking is set (under jmPinState.mu) while a START checks in the
+	// background whether this running fill is still current.
+	rechecking bool
 }
+
+// jmPinSliceBudget bounds the metadata reads of one VERIFY with flags bit 1.
+var jmPinSliceBudget = 5 * time.Second
 
 func (j *jmPinJob) seenAttr() *chunk.JMPinAttr {
 	j.mu.Lock()
@@ -144,27 +160,50 @@ func (v *VFS) jmPinStart(store jmPinStore, ino Ino, workers int) syscall.Errno {
 	st := v.jmPin()
 	st.mu.Lock()
 	running := st.jobs[ino]
+	if running == nil || running.state.Load() != jmPinRunning {
+		v.jmPinLaunch(st, store, ino, workers)
+		st.mu.Unlock()
+		return 0
+	}
+	if running.rechecking {
+		st.mu.Unlock()
+		return 0
+	}
+	running.rechecking = true
 	st.mu.Unlock()
-	if running != nil && running.state.Load() == jmPinRunning {
-		seen := running.seenAttr()
-		if seen == nil {
-			return 0
+	// Is the running fill still current? GetAttr reads metadata, which can
+	// be slow or unreachable: never on the control path.
+	go func() {
+		keep := true
+		if seen := running.seenAttr(); seen != nil {
+			var attr Attr
+			// Unreadable attributes keep the fill: a new one could not
+			// read them either.
+			if eno := v.Meta.GetAttr(meta.Background(), ino, &attr); eno == 0 && jmAttrOf(&attr) != *seen {
+				keep = false
+			}
 		}
-		var attr Attr
-		if eno := v.Meta.GetAttr(meta.Background(), ino, &attr); eno == 0 && jmAttrOf(&attr) == *seen {
-			return 0
+		st.mu.Lock()
+		defer st.mu.Unlock()
+		running.rechecking = false
+		if keep || st.jobs[ino] != running {
+			return
 		}
 		running.cancel() // the file changed since this fill read its slices
-	}
+		v.jmPinLaunch(st, store, ino, workers)
+	}()
+	return 0
+}
+
+// jmPinLaunch starts a fill of ino. Called with st.mu held.
+func (v *VFS) jmPinLaunch(st *jmPinState, store jmPinStore, ino Ino, workers int) {
 	ctx, cancel := context.WithCancel(context.Background())
 	job := &jmPinJob{cancel: cancel}
 	job.state.Store(jmPinRunning)
-	st.mu.Lock()
 	st.jobs[ino] = job
 	if st.sweeping {
 		st.keep[ino] = struct{}{}
 	}
-	st.mu.Unlock()
 	go func() {
 		defer cancel()
 		mctx := meta.WrapContext(ctx)
@@ -198,7 +237,27 @@ func (v *VFS) jmPinStart(store jmPinStore, ino Ino, workers int) syscall.Errno {
 		logger.Infof("pin inode %d: %d bytes pinned, %d downloaded", ino, job.prog.Done.Load(), job.prog.Fetched.Load())
 		job.state.Store(jmPinDone)
 	}()
-	return 0
+}
+
+// jmPinReadSlices sets each item's Slices from metadata, until the budget
+// runs out or metadata fails (offline: the rest stay local checks).
+func (v *VFS) jmPinReadSlices(items []chunk.JMPinVerifyItem) {
+	ctx, cancel := context.WithTimeout(context.Background(), jmPinSliceBudget)
+	defer cancel()
+	mctx := meta.WrapContext(ctx)
+	for i := range items {
+		if ctx.Err() != nil {
+			return
+		}
+		slices, eno := jmPinSlices(mctx, v.Meta, Ino(items[i].Owner), items[i].Attr.Length)
+		if eno != 0 {
+			return
+		}
+		if slices == nil {
+			slices = []chunk.JMPinSlice{}
+		}
+		items[i].Slices = slices
+	}
 }
 
 func (v *VFS) jmPinMsg(r *utils.Buffer, out io.Writer) {
@@ -302,6 +361,9 @@ func (v *VFS) jmPinMsg(r *utils.Buffer, out io.Writer) {
 			items[i].Owner = r.Get64()
 			items[i].Attr.Length = r.Get64()
 			items[i].Attr.MtimeNS = int64(r.Get64())
+		}
+		if r.Left() >= 1 && r.Get8()&1 != 0 {
+			v.jmPinReadSlices(items)
 		}
 		bad, err := store.JMPinVerify(items)
 		if err != nil {

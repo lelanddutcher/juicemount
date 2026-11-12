@@ -4,10 +4,10 @@
 
 ### App
 
-- "Pin before travel" is now reliable. An editor pins a project at home;
-  abroad it plays and scrubs from local disk, and it stays that way, also
-  after a restart with no connection. Three problems are fixed (laptop lab,
-  2026-11-12):
+- "Pin before travel" is now reliable while the server is reachable. An
+  editor pins a project at home; abroad, over Link, it plays and scrubs from
+  local disk, also after the app restarts. Three problems are fixed (laptop
+  lab, 2026-11-12):
   - Large pins failed and were never retried. A pin read the file through
     FUSE in 128 KiB reads, and JuiceFS saved whole blocks to its cache only
     through a background queue that drops requests when full: 3 of 4 clips
@@ -16,20 +16,26 @@
     each missing block whole and write it to the cache before it reports
     done; then the app checks the file as before, from local disk. Encrypted
     volumes pin the same way. On a slow or metered link a pin downloads one
-    block at a time and waits for reads the editor is waiting for. A failed
+    block at a time in the whole app (the pin workers and the pin guard
+    together) and waits for reads the editor is waiting for. A failed
     pin is retried after 30 s, then with a doubling wait of at most 30
     minutes; a file that no longer exists is retried 3 times.
   - Ordinary reads evicted pinned blocks, and the app still said "ready".
     JuiceFS now never evicts a pinned block, and it keeps its list of
-    pinned blocks on disk, so a restart, also one with no connection, keeps
-    them. Pinned files may use at most 90% of the cache; the app grows the
-    cache when the pinned set needs it. A pin never fills the disk below
-    the cache's free-space floor: past it, it fails with "not enough room on
-    the cache disk for the pinned files; free disk space on that disk, or
-    unpin a folder" instead of evicting. Unpinning a folder stops its
+    pinned blocks on disk, so a restart keeps them. Pinned blocks that a
+    failed or canceled pin never downloaded do not stop the cache from
+    freeing the rest of its space. Pinned files may use at most 90% of the
+    cache; the app grows the cache when the pinned set needs it. A pin
+    never fills the disk below the cache's free-space floor: it first evicts
+    ordinary cached blocks, and only when none are left does it fail with
+    "not enough room on the cache disk for the pinned files; free disk space
+    on that disk, or unpin a folder". Unpinning a folder stops its
     downloads at once. Every minute the app checks, without the server,
-    that every ready pin is complete and matches the file on the server,
-    and fetches it again when it is not.
+    that every ready pin is complete and matches the file's length and
+    mtime, and fetches it again when it is not; while the server is
+    reachable it also checks a few pins a minute against the file's data
+    layout, which compaction changes without changing the length or mtime.
+    A pin that goes back to the queue keeps its pinned blocks meanwhile.
   - The app showed "0 of 44, 0 bytes" for minutes, then a jump. Now
     `/cache-status` counts the bytes already on disk of files being
     downloaded, and reports the files in progress, the download rate and
@@ -42,10 +48,15 @@
   played in 1.7–2.0 s with no download (before: 339 s, 123 MB from the
   server), and a scrub took 0.5–2.3 ms per 1 MiB read (before: p95
   7.6–9.8 s). With the link cut, JuiceFS killed and restarted, and the cache
-  disk pushed below its free-space floor, all 44 pinned files stayed
-  complete while 66 unpinned blocks were evicted, and a new 1.5 GiB pin was
-  refused with nothing downloaded.
-  Field switch: `JM_PIN_WHOLE_BLOCKS=0` returns to the read-through pin.
+  disk pushed below its free-space floor, JuiceFS still listed all 44
+  pinned files as complete with no server, while 66 unpinned blocks were
+  evicted, and a new 1.5 GiB pin was refused with nothing downloaded.
+  Not yet: a relaunch with no connection at all cannot open pinned files.
+  The app does not mount JuiceFS when the server is unreachable at launch,
+  and JuiceFS needs the metadata server to open a file. The lab above
+  checked the pin list while cut off; it did not read the files then.
+  Field switch: `JM_PIN_WHOLE_BLOCKS=0` returns to the read-through pin and
+  unpins every file in JuiceFS once at launch.
 - On an encrypted volume over a slow or distant link, a slow cold read no
   longer turns into a retry wait. An encrypted volume (one formatted with an
   RSA key) fetches a whole 4 MiB block for any cold read. On a 200 ms link

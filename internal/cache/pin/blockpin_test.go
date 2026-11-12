@@ -30,6 +30,11 @@ type fakePinner struct {
 	canceled []uint64
 	capacity int64
 	workers  []int
+	// compacted inodes fail only a Verify with slices.
+	compacted    map[uint64]bool
+	sliceChecked []uint64
+	sweepErr     error
+	sweeps       int
 }
 
 func (f *fakePinner) Cancel(inode uint64) error {
@@ -46,12 +51,17 @@ func (f *fakePinner) SetCapacity(bytes int64) (int64, int64, int64, error) {
 	return bytes, f.size, bytes * 9 / 10, nil
 }
 
-func (f *fakePinner) Verify(items []PinVerifyItem) ([]PinVerifyResult, error) {
+func (f *fakePinner) Verify(items []PinVerifyItem, slices bool) ([]PinVerifyResult, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	var out []PinVerifyResult
 	for _, it := range items {
+		if slices {
+			f.sliceChecked = append(f.sliceChecked, it.Inode)
+		}
 		switch {
+		case slices && f.compacted[it.Inode]:
+			out = append(out, PinVerifyResult{Inode: it.Inode, Reason: PinChanged})
 		case !f.known[it.Inode]:
 			out = append(out, PinVerifyResult{Inode: it.Inode, Reason: PinUnknown})
 		case f.changed[it.Inode]:
@@ -118,6 +128,10 @@ func (f *fakePinner) Check(inode uint64) (bool, int64, int64, error) {
 func (f *fakePinner) Sweep(keep []uint64) (int, int64, int64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.sweeps++
+	if f.sweepErr != nil {
+		return 0, 0, 0, f.sweepErr
+	}
 	f.kept = append([]uint64(nil), keep...)
 	return 1, f.size, 9 << 30, nil
 }
@@ -537,5 +551,136 @@ func TestRetryStopsForMissingFiles(t *testing.T) {
 	p.GuardPins(context.Background())
 	if len(p.retries) != 0 {
 		t.Fatalf("retries kept for an unpinned path: %v", p.retries)
+	}
+}
+
+// Re-review HIGH-2: a pin the guard requeues (authority cleared) keeps its
+// juicefs pins, also after a relaunch offline, where no fill can learn the
+// inode again.
+func TestPinGuardKeepsRequeuedPinsOfflineAcrossRelaunch(t *testing.T) {
+	fastPolls(t)
+	data := []byte("trip clip")
+	s, p, path := pinnedFixture(t, "clip.mov", data)
+	gp := &guardProvider{testOwnedPinProvider: p.provider.(*testOwnedPinProvider), inode: 5150}
+	p.provider = gp
+	f := &fakePinner{size: int64(len(data)), steps: 1}
+	p.SetBlockPinner(f)
+	if err := claimAndPrefetch(t, s, p, path); err != nil {
+		t.Fatal(err)
+	}
+	// A pin made before the column existed: only the witness has the inode.
+	if _, err := s.db.Exec(`UPDATE pinned_files SET pin_inode=0`); err != nil {
+		t.Fatal(err)
+	}
+	// Offline: juicefs still holds the pin but a block went missing, so the
+	// guard requeues the entry; the sweep of the same pass keeps it.
+	f.mu.Lock()
+	f.known = map[uint64]bool{5150: true}
+	f.missing = map[uint64]int64{5150: 1}
+	f.mu.Unlock()
+	if rep := p.GuardPins(context.Background()); rep.Requeued != 1 || !slices.Contains(f.kept, 5150) {
+		t.Fatalf("requeue pass: %+v kept %v", rep, f.kept)
+	}
+	if e := pinEntry(t, s, path); e.Status != StatusPending || len(e.Authority) != 0 {
+		t.Fatalf("entry after requeue: %+v", e)
+	}
+	// Relaunch, still offline: a new prefetcher with no inode memory, and
+	// the entry fails (no FUSE mount); every later pass keeps its pins.
+	p2 := NewPrefetcher(s, t.TempDir(), "/Volumes/zpool", 1, gp)
+	t.Cleanup(func() { p2.StopWithin(5 * time.Second) })
+	p2.SetBlockPinner(f)
+	e := pinEntry(t, s, path)
+	if _, err := s.UpdateStatusForEntry(e, StatusFailed, 0, "no server"); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		f.mu.Lock()
+		f.kept = nil
+		f.mu.Unlock()
+		p2.GuardPins(context.Background())
+		if !slices.Contains(f.kept, 5150) {
+			t.Fatalf("pass %d after relaunch dropped the pins of a failed pin: kept %v", i, f.kept)
+		}
+	}
+	// Unpinning still lets them go.
+	if err := s.UnpinPath(path); err != nil {
+		t.Fatal(err)
+	}
+	p2.GuardPins(context.Background())
+	if slices.Contains(f.kept, 5150) {
+		t.Fatalf("pins kept after unpin: %v", f.kept)
+	}
+}
+
+// Re-review MEDIUM-5: the guard also checks Ready pins against their slices
+// in metadata, a rotating batch per pass, and requeues a compacted file.
+func TestPinGuardRequeuesCompactedFiles(t *testing.T) {
+	fastPolls(t)
+	s, p, path := pinnedFixture(t, "clip.mov", []byte("compact me"))
+	p.provider = &guardProvider{testOwnedPinProvider: p.provider.(*testOwnedPinProvider), inode: 31}
+	f := &fakePinner{size: 10, steps: 1}
+	p.SetBlockPinner(f)
+	if err := claimAndPrefetch(t, s, p, path); err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	f.known = map[uint64]bool{31: true}
+	f.mu.Unlock()
+	if rep := p.GuardPins(context.Background()); rep.SliceChecked != 1 || rep.Requeued != 0 {
+		t.Fatalf("current file: %+v", rep)
+	}
+	f.mu.Lock()
+	f.compacted = map[uint64]bool{31: true}
+	f.mu.Unlock()
+	if rep := p.GuardPins(context.Background()); rep.Requeued != 1 {
+		t.Fatalf("compacted file: %+v", rep)
+	}
+	if e := pinEntry(t, s, path); e.Status != StatusPending {
+		t.Fatalf("compacted entry %v", e.Status)
+	}
+}
+
+// Re-review MEDIUM-3: the guard's re-pins pass the same download width as
+// the workers' fills, so a slow link's one-download limit covers both.
+func TestPinGuardRepinUsesFillWidth(t *testing.T) {
+	fastPolls(t)
+	s, p, path := pinnedFixture(t, "clip.mov", []byte("slow link"))
+	p.provider = &guardProvider{testOwnedPinProvider: p.provider.(*testOwnedPinProvider), inode: 41}
+	f := &fakePinner{size: 9, steps: 1}
+	p.SetBlockPinner(f)
+	p.SetFillWorkers(func() int { return 1 })
+	if err := claimAndPrefetch(t, s, p, path); err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	f.known = nil
+	f.mu.Unlock()
+	if rep := p.GuardPins(context.Background()); rep.Repinned != 1 {
+		t.Fatalf("re-pin: %+v", rep)
+	}
+	if len(f.workers) != 2 || f.workers[0] != 1 || f.workers[1] != 1 {
+		t.Fatalf("fill widths %v, want 1 for the worker and the guard", f.workers)
+	}
+}
+
+// Re-review MEDIUM-2: with whole-block pins off, one empty SWEEP clears the
+// pins an earlier run persisted; it retries until juicefs answers.
+func TestClearBlockPinsSweepsEverything(t *testing.T) {
+	f := &fakePinner{sweepErr: errors.New("not mounted yet"), kept: []uint64{1}}
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		f.mu.Lock()
+		f.sweepErr = nil
+		f.mu.Unlock()
+	}()
+	if err := ClearBlockPins(context.Background(), f, 5*time.Millisecond, 1000); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.kept) != 0 || f.sweeps < 2 {
+		t.Fatalf("kept %v after %d sweeps", f.kept, f.sweeps)
+	}
+	old := &fakePinner{sweepErr: syscall.EINVAL}
+	if err := ClearBlockPins(context.Background(), old, time.Millisecond, 1000); !errors.Is(err, syscall.EINVAL) || old.sweeps != 1 {
+		t.Fatalf("old juicefs: %v after %d sweeps", err, old.sweeps)
 	}
 }

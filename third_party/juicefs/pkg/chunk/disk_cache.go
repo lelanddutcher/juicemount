@@ -812,6 +812,7 @@ func (cache *cacheStore) cleanupFull() {
 			goal = (cache.used - toFree) * 95 / 100
 		}
 	}
+	inodesShort := usage.fr < cache.freeRatio // JuiceMount patch 0026
 	if usage.fr < cache.freeRatio {
 		toFree := int(float32(usage.inodeCap) * (cache.freeRatio - usage.fr))
 		if toFree > len(cache.keys) {
@@ -820,14 +821,16 @@ func (cache *cacheStore) cleanupFull() {
 			num = int64(len(cache.keys)-toFree) * 99 / 100
 		}
 	}
-	// JuiceMount patch 0026: pinned blocks are not evictable. Never aim below
-	// them, never walk the keys when only pinned blocks are left, and drop
-	// the 1% item goal (it would walk every pinned key to find none).
-	if pinned := cache.jmPins.storeBytes(cache.id); pinned > 0 {
+	// JuiceMount patch 0026: pinned blocks are not evictable. Count only the
+	// pinned blocks that are on disk (a fill that failed or was canceled
+	// pinned blocks it never got). Never aim below them, never walk the keys
+	// when only pinned blocks are left, and drop the 1% item goal (it would
+	// walk every pinned key to find none) unless inodes are short.
+	if pinned := cache.jmPins.presentBytes(cache.id, cache.keys); pinned > 0 {
 		if goal < pinned {
 			goal = pinned
 		}
-		if cache.maxItems == 0 {
+		if cache.maxItems == 0 && !inodesShort {
 			num = int64(len(cache.keys))
 		}
 		if cache.used-pinned < 4096 {

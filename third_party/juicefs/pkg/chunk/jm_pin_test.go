@@ -344,7 +344,7 @@ func TestJMPinSurvivesRemovedCacheStore(t *testing.T) {
 	}
 	m := store.bcache.(*cacheManager)
 	m.removeStore(m.stores[0].id)
-	if p, lim := store.JMPinUsage(); p == 0 || lim != 0 {
+	if p, lim := store.JMPinUsage(); p != 0 || lim != 0 { // no live disk holds them
 		t.Fatalf("usage with no live store: %d of %d", p, lim)
 	}
 	if known, _, missing, _, err := store.JMPinCheck(1); err != nil || !known || missing != int64(len(d)) {
@@ -383,11 +383,11 @@ func TestJMPinRefusesBelowFreeSpaceFloor(t *testing.T) {
 	ok := pinStoreFor(t, mem, 64)
 	m := ok.bcache.(*cacheManager)
 	k := sliceForRead(381, len(d), ok).key(0)
-	if err := m.jmRoomFor(k, 1<<20); err != nil {
+	if _, err := m.jmRoomFor(k, 1<<20); err != nil {
 		t.Fatalf("room on a roomy disk: %v", err)
 	}
 	m.stores[0].rawFull.Store(true)
-	if err := m.jmRoomFor(k, 1<<20); !errors.Is(err, ErrJMPinNoSpace) {
+	if _, err := m.jmRoomFor(k, 1<<20); !errors.Is(err, ErrJMPinNoSpace) {
 		t.Fatalf("room on a full store: %v", err)
 	}
 }
@@ -477,12 +477,12 @@ func TestJMPinVerifyReasons(t *testing.T) {
 	}
 	k := sliceForRead(411, len(d), store).key(1)
 	m := store.bcache.(*cacheManager)
-	res, err := store.JMPinVerify([]JMPinVerifyItem{{1, a}, {2, JMPinAttr{Length: a.Length, MtimeNS: 100}}, {9, a}})
+	res, err := store.JMPinVerify([]JMPinVerifyItem{{Owner: 1, Attr: a}, {Owner: 2, Attr: JMPinAttr{Length: a.Length, MtimeNS: 100}}, {Owner: 9, Attr: a}})
 	if err != nil || len(res) != 2 || res[0].Owner != 2 || res[0].Reason != JMPinChanged || res[1].Owner != 9 || res[1].Reason != JMPinUnknown {
 		t.Fatalf("verify: %+v %v", res, err)
 	}
 	_ = os.Remove(m.getStore(k).cachePath(k))
-	res, _ = store.JMPinVerify([]JMPinVerifyItem{{3, a}})
+	res, _ = store.JMPinVerify([]JMPinVerifyItem{{Owner: 3, Attr: a}})
 	if len(res) != 1 || res[0].Reason != JMPinIncomplete || res[0].Missing != 1<<20 {
 		t.Fatalf("verify after a lost block: %+v", res)
 	}
@@ -536,4 +536,246 @@ func TestJMPinSharesDownloadWithReads(t *testing.T) {
 		t.Fatalf("read did not share the fill's download (GETs %d)", g.full.Load())
 	}
 	p.Release()
+}
+
+// loadBlocks reads each block of a slice and writes it to the disk cache,
+// as a demand read with --cache-full-block does.
+func loadBlocks(t *testing.T, store *cachedStore, id uint64, n int) []string {
+	t.Helper()
+	m := store.bcache.(*cacheManager)
+	keys := sliceForRead(id, n<<20, store).keys()
+	for _, k := range keys {
+		p := NewOffPage(parseObjOrigSize(k))
+		if err := store.load(k, p, false, false); err != nil {
+			t.Fatal(err)
+		}
+		if err := m.jmCacheSync(k, p); err != nil {
+			t.Fatal(err)
+		}
+		p.Release()
+	}
+	return keys
+}
+
+// Re-review HIGH-1: pinned keys that never reached the disk (a failed or
+// canceled fill) do not stop eviction from freeing the rest of the cache.
+func TestJMPinCleanupIgnoresMissingPinnedBlocks(t *testing.T) {
+	mem, _ := object.CreateStorage("mem", "", "", "", "")
+	other := writeBlocks(t, mem, 431, 16)
+	store := pinStoreFor(t, mem, 10) // 10 MiB cache
+	m := store.bcache.(*cacheManager)
+	s := m.stores[0]
+	// 12 MiB registered for owner 1, none of it downloaded.
+	missing := sliceForRead(432, 12<<20, store).keys()
+	ids := make([]string, len(missing))
+	for i := range ids {
+		ids[i] = s.id
+	}
+	if err := m.pins.replace(context.Background(), 1, missing, ids, JMPinAttr{}, "", map[string]jmLimit{s.id: {bytes: 1 << 40}}); err != nil {
+		t.Fatal(err)
+	}
+	if m.pins.storeBytes(s.id) <= s.capacity {
+		t.Fatal("setup: registered pins should exceed the cache")
+	}
+	loadBlocks(t, store, 431, len(other)>>20)
+	s.Lock()
+	used := s.used
+	s.Unlock()
+	if used > s.capacity+(1<<20+4096) {
+		t.Fatalf("cache holds %d bytes for a %d byte capacity: registered but missing pins blocked eviction", used, s.capacity)
+	}
+	if pinned, _ := store.JMPinUsage(); pinned != 0 {
+		t.Fatalf("pinned bytes on disk %d, want 0", pinned)
+	}
+}
+
+// Re-review MEDIUM-1: at the free-space floor, a pinned block evicts
+// unpinned cached blocks instead of failing the fill.
+func TestJMPinRoomForEvictsUnpinnedAtFloor(t *testing.T) {
+	mem, _ := object.CreateStorage("mem", "", "", "", "")
+	other := writeBlocks(t, mem, 441, 8)
+	d := writeBlocks(t, mem, 442, 2)
+	store := pinStoreFor(t, mem, 64)
+	m := store.bcache.(*cacheManager)
+	s := m.stores[0]
+	okeys := loadBlocks(t, store, 441, len(other)>>20)
+	s.Lock()
+	diskTotal := s.used + 4<<20 // free == floor now
+	s.Unlock()
+	old := jmDiskRoom
+	defer func() { jmDiskRoom = old }()
+	jmDiskRoom = func(c *cacheStore) (int64, int64) {
+		c.Lock()
+		defer c.Unlock()
+		return diskTotal - c.used, 4 << 20
+	}
+	if err := store.JMPinFill(context.Background(), 1, whole(442, d), JMPinAttr{}, 0, nil); err != nil {
+		t.Fatalf("fill at the floor with evictable cache: %v", err)
+	}
+	evicted := 0
+	for _, k := range okeys {
+		if !onDisk(store, k) {
+			evicted++
+		}
+	}
+	if evicted < 2 {
+		t.Fatalf("%d unpinned blocks evicted, want at least 2", evicted)
+	}
+	// Only pinned blocks left to evict: the fill is refused.
+	store.JMPinDrop(1)
+	for _, k := range okeys {
+		if onDisk(store, k) {
+			_ = os.Remove(s.cachePath(k))
+			s.Lock()
+			delete(s.keys, jmCacheKey(k))
+			s.Unlock()
+		}
+	}
+	if err := store.JMPinFill(context.Background(), 2, whole(441, other), JMPinAttr{}, 0, nil); !errors.Is(err, ErrJMPinNoSpace) {
+		t.Fatalf("fill with nothing evictable: %v, want ErrJMPinNoSpace", err)
+	}
+}
+
+// Re-review MEDIUM-4: a canceled fill never overwrites the owner's keys.
+func TestJMPinCanceledFillKeepsNewerKeys(t *testing.T) {
+	mem, _ := object.CreateStorage("mem", "", "", "", "")
+	a := writeBlocks(t, mem, 451, 1)
+	b := writeBlocks(t, mem, 452, 2)
+	store := pinStoreFor(t, mem, 64)
+	m := store.bcache.(*cacheManager)
+	if err := store.JMPinFill(context.Background(), 1, whole(452, b), JMPinAttr{Length: 2}, 0, nil); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := store.JMPinFill(ctx, 1, whole(451, a), JMPinAttr{Length: 1}, 0, nil); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled fill: %v", err)
+	}
+	rec, _ := m.pins.record(1)
+	if rec.Length != 2 || len(rec.Keys) != 2 {
+		t.Fatalf("a canceled fill replaced the newer keys: %+v", rec)
+	}
+}
+
+// Re-review MEDIUM-5: VERIFY with the file's current slices reports a file
+// whose slices changed (compaction) with the same length and mtime.
+func TestJMPinVerifyComparesSlices(t *testing.T) {
+	mem, _ := object.CreateStorage("mem", "", "", "", "")
+	d := writeBlocks(t, mem, 461, 1)
+	store := pinStoreFor(t, mem, 64)
+	a := JMPinAttr{Length: uint64(len(d)), MtimeNS: 7}
+	sl := whole(461, d)
+	if err := store.JMPinFill(context.Background(), 1, sl, a, 0, nil); err != nil {
+		t.Fatal(err)
+	}
+	res, err := store.JMPinVerify([]JMPinVerifyItem{{Owner: 1, Attr: a}, {Owner: 1, Attr: a, Slices: sl}})
+	if err != nil || len(res) != 0 {
+		t.Fatalf("same slices: %+v %v", res, err)
+	}
+	compacted := []JMPinSlice{{ID: 462, Size: sl[0].Size, Len: sl[0].Len}}
+	res, _ = store.JMPinVerify([]JMPinVerifyItem{{Owner: 1, Attr: a, Slices: compacted}})
+	if len(res) != 1 || res[0].Reason != JMPinChanged {
+		t.Fatalf("compacted slices: %+v", res)
+	}
+}
+
+// Re-review LOW: a pin file with a key listed twice counts the block once,
+// and dropping the owner unpins it.
+func TestJMPinLoadDedupesKeys(t *testing.T) {
+	conf := pinConf(t, 64)
+	mem, _ := object.CreateStorage("mem", "", "", "", "")
+	first := NewCachedStore(mem, conf, nil).(*cachedStore)
+	k := sliceForRead(471, 1<<20, first).key(0)
+	dir := first.bcache.(*cacheManager).pins.dir
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dir+"/9.json", []byte(`{"keys":["`+k+`","`+k+`"],"length":1}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	second := NewCachedStore(mem, conf, nil).(*cachedStore)
+	m := second.bcache.(*cacheManager)
+	if got := m.pins.storeBytes(m.stores[0].id); got != 1<<20+4096 {
+		t.Fatalf("pinned bytes %d, want one block", got)
+	}
+	second.JMPinDrop(9)
+	if m.pins.has(jmCacheKey(k)) || m.pins.total() != 0 {
+		t.Fatal("a duplicated key stayed pinned after the drop")
+	}
+}
+
+// Re-review LOW: waitIdleCtx returns when the fill is canceled.
+func TestJMPinWaitIdleReturnsOnCancel(t *testing.T) {
+	d := newDemandFirst(true, 1<<20)
+	d.deferMax = time.Hour
+	end := d.beginDemand("other")
+	defer end()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { d.waitIdleCtx(ctx, "mine"); close(done) }()
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("waitIdleCtx did not return on cancel")
+	}
+}
+
+// peakStorage records the most whole-object GETs in flight at once.
+type peakStorage struct {
+	object.ObjectStorage
+	mu        sync.Mutex
+	cur, peak int
+}
+
+func (s *peakStorage) Get(key string, off, limit int64, getters ...object.AttrGetter) (io.ReadCloser, error) {
+	s.mu.Lock()
+	s.cur++
+	s.peak = max(s.peak, s.cur)
+	s.mu.Unlock()
+	time.Sleep(30 * time.Millisecond)
+	s.mu.Lock()
+	s.cur--
+	s.mu.Unlock()
+	return s.ObjectStorage.Get(key, off, limit, getters...)
+}
+
+func (s *peakStorage) takePeak() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p := s.peak
+	s.peak = 0
+	return p
+}
+
+// Re-review MEDIUM-3: one worker per fill (the app's slow or metered link)
+// means one pin download at a time across all fills of the process.
+func TestJMPinOneWorkerLimitsAllFills(t *testing.T) {
+	mem, _ := object.CreateStorage("mem", "", "", "", "")
+	a := writeBlocks(t, mem, 481, 3)
+	b := writeBlocks(t, mem, 482, 3)
+	c := writeBlocks(t, mem, 483, 4)
+	ss := &peakStorage{ObjectStorage: mem}
+	store := pinStoreFor(t, ss, 64)
+	defer jmPinDownloads.setLimit(jmPinMaxDownloads)
+	var wg sync.WaitGroup
+	for i, d := range [][]byte{a, b} {
+		wg.Add(1)
+		go func(owner uint64, id uint64, d []byte) {
+			defer wg.Done()
+			if err := store.JMPinFill(context.Background(), owner, whole(id, d), JMPinAttr{}, 1, nil); err != nil {
+				t.Error(err)
+			}
+		}(uint64(i+1), uint64(481+i), d)
+	}
+	wg.Wait()
+	if p := ss.takePeak(); p != 1 {
+		t.Fatalf("two one-worker fills downloaded %d blocks at once, want 1", p)
+	}
+	if err := store.JMPinFill(context.Background(), 3, whole(483, c), JMPinAttr{}, 4, nil); err != nil {
+		t.Fatal(err)
+	}
+	if p := ss.takePeak(); p < 2 {
+		t.Fatalf("a four-worker fill downloaded %d at a time", p)
+	}
 }
