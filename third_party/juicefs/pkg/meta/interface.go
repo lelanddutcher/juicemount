@@ -63,6 +63,8 @@ const (
 	JMMkdirInode = 1102
 	// JMReleaseInodes gives back unused reserved numbers (JuiceMount).
 	JMReleaseInodes = 1103
+	// JMPinCache fills and pins whole blocks of a file (JuiceMount patch 0025).
+	JMPinCache = 1104
 )
 
 const (

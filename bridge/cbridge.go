@@ -2229,6 +2229,12 @@ func nfsServerStartSerialized(configJSON *C.char, recovery *servingDesiredRecord
 			jmlog.Error("pin authority revoker unavailable", "error", err.Error())
 		} else {
 			globalPrefetcher = pin.NewPrefetcher(ps, cfg.FUSEPath, cfg.MountPoint, 4, provider)
+			// Pin through whole blocks that juicefs keeps out of eviction
+			// (bundled juicefs patch 0025). JM_PIN_WHOLE_BLOCKS=0 is the
+			// field rollback to the read-through pin.
+			if os.Getenv("JM_PIN_WHOLE_BLOCKS") != "0" {
+				globalPrefetcher.SetBlockPinner(jmnfs.NewJFSBlockPinner(cfg.FUSEPath))
+			}
 		}
 		if globalPrefetcher != nil {
 			// Long-running daemons that drain the queue and re-warm pinned
@@ -2246,8 +2252,17 @@ func nfsServerStartSerialized(configJSON *C.char, recovery *servingDesiredRecord
 			pf := globalPrefetcher
 			pinCtx := pf.Context()
 			startPinWorkers = func() {
-				pf.Go(func() { _, _ = pf.RestoreReady(pinCtx) })
+				// Restore local witnesses first; then the pin guard pins their
+				// blocks in juicefs again (a relaunched juicefs holds none),
+				// sends pins with lost blocks back to the workers, and unpins
+				// files no longer pinned, every minute.
+				pf.Go(func() {
+					_, _ = pf.RestoreReady(pinCtx)
+					pf.PinGuardLoop(pinCtx, time.Minute)
+				})
 				pf.Go(func() { pf.PullPending(pinCtx, 100) })
+				// Failed pins are retried with backoff (30 s doubling to 30 min).
+				pf.Go(func() { pf.RetryFailedLoop(pinCtx, 15*time.Second) })
 				pf.Go(func() { pf.ReWarmupLoop(pinCtx, 6*time.Hour, 50) })
 				// R-1: keep the pinned-set-vs-disk-capacity verdict fresh. Gates the
 				// re-warm loop above (no futile thrash when the pinned set can't fit)
@@ -5284,6 +5299,7 @@ func engineCacheStatus() CacheStatus {
 	}
 	if prefetcher != nil {
 		cs.LiveStats = prefetcher.LiveStats()
+		cs.LiveStats.ETASec = pin.ETASeconds(cs.Aggregate, float64(cs.LiveStats.RateBytesPerSec))
 	}
 	// Never emit `"roots": null`: a nil Go slice marshals to JSON null, which the
 	// Swift CacheStatus decoder historically choked on (valueNotFound aborted the

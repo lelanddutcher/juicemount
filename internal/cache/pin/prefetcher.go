@@ -52,6 +52,17 @@ type Prefetcher struct {
 	bytesPrefetched atomic.Int64
 	filesPrefetched atomic.Int64
 	currentFile     atomic.Pointer[string]
+	meter           progressMeter
+
+	// Whole-block pinning (blockpin.go). inodes maps paths of fills this
+	// process ran to their inode, so a guard sweep keeps their pins;
+	// retries counts backoff retries of failed pins.
+	pinMu            sync.Mutex
+	pinner           BlockPinner
+	inodes           map[string]inodeRec
+	retries          map[string]int
+	pinnedBlockBytes atomic.Int64
+	pinLimitBytes    atomic.Int64
 	// Test-only rendezvous after EOF and before the generation-fenced Ready write.
 	testBeforeReady  func()
 	testBeforeClaim  func(Entry)
@@ -666,6 +677,12 @@ func (p *Prefetcher) prefetch(e Entry) (retErr error) {
 		if errors.Is(retErr, ErrCacheCapacityUnknown) || errors.Is(retErr, ErrNoUsableCacheCapacity) || errors.Is(retErr, ErrInsufficientCacheCapacity) {
 			status, totalRead = StatusPending, 0
 		}
+		// juicefs refused to pin more (its cap): Pending would be taken again
+		// at once by drainPending. Failed waits for the backoff retry and
+		// shows the reason.
+		if errors.Is(retErr, ErrPinnedShareFull) && p.ctx.Err() == nil {
+			status = StatusFailed
+		}
 		_, _ = p.store.UpdateStatusForEntry(e, status, totalRead, message)
 	}()
 	if p.provider == nil {
@@ -697,11 +714,41 @@ func (p *Prefetcher) prefetch(e Entry) (retErr error) {
 		return ErrAuthorityUnavailable
 	}
 
+	// Whole-block pin (blockpin.go): juicefs downloads and pins every block,
+	// so the read below is local. Old juicefs keeps the read-through path.
+	filled := false
+	if b := p.blockPinner(); b != nil && want.Size > 0 {
+		p.rememberInode(e.Path, want.Inode)
+		var lastDone, lastSaved int64
+		lastSave := time.Now()
+		st, err := p.fillBlocks(p.ctx, b, want.Inode, func(st BlockFillStatus) {
+			if d := st.Done - lastDone; d > 0 {
+				p.bytesPrefetched.Add(d)
+				p.meter.add(time.Now(), p.bytesPrefetched.Load())
+				lastDone = st.Done
+			}
+			if st.Done != lastSaved && time.Since(lastSave) >= progressSaveEvery {
+				_, _ = p.store.UpdateProgress(e, min(st.Done, want.Size))
+				lastSaved, lastSave = st.Done, time.Now()
+			}
+		})
+		switch {
+		case err == nil:
+			filled = true
+			_, _ = p.store.UpdateProgress(e, want.Size)
+		case errors.Is(err, ErrBlockPinUnsupported):
+		default:
+			_ = f.Close()
+			totalRead = min(st.Done, want.Size)
+			return err
+		}
+	}
+
 	buf := make([]byte, 1024*1024) // 1 MB read chunks
 	hash := sha256.New()
 	nextCapacityCheck := int64(32 << 20)
 	for totalRead < want.Size {
-		if totalRead >= nextCapacityCheck {
+		if !filled && totalRead >= nextCapacityCheck {
 			if err := DownloadAdmissionFor(e.Size, stats.TotalBytes); err != nil {
 				_ = f.Close()
 				return err
@@ -722,7 +769,10 @@ func (p *Prefetcher) prefetch(e Entry) (retErr error) {
 		n, rerr := f.Read(buf[:readLen])
 		if n > 0 {
 			totalRead += int64(n)
-			p.bytesPrefetched.Add(int64(n))
+			if !filled {
+				p.bytesPrefetched.Add(int64(n))
+				p.meter.add(time.Now(), p.bytesPrefetched.Load())
+			}
 			_, _ = hash.Write(buf[:n])
 		}
 		if rerr != nil || n == 0 {
@@ -772,6 +822,7 @@ func (p *Prefetcher) prefetch(e Entry) (retErr error) {
 	}
 	completed = true
 	p.filesPrefetched.Add(1)
+	p.clearRetries(e.Path)
 	return nil
 }
 
@@ -789,6 +840,16 @@ type LiveStats struct {
 	FilesPrefetched int64  `json:"files_prefetched"`
 	CurrentFile     string `json:"current_file"` // empty if idle
 	Workers         int    `json:"workers"`
+	// RateBytesPerSec is how fast pinned bytes reached the disk over the
+	// last 20 s (0 when idle or stalled). ETASec is set by the status
+	// report from the aggregate (ETASeconds); 0 means unknown or done.
+	RateBytesPerSec int64 `json:"rate_bytes_per_sec"`
+	ETASec          int64 `json:"eta_sec"`
+	// PinnedBlockBytes and PinLimitBytes are juicefs's pinned blocks and
+	// their cap (90% of the cache), from the last guard pass; 0 when the
+	// juicefs cannot pin.
+	PinnedBlockBytes int64 `json:"pinned_block_bytes"`
+	PinLimitBytes    int64 `json:"pin_limit_bytes"`
 }
 
 func (p *Prefetcher) LiveStats() LiveStats {
@@ -797,10 +858,13 @@ func (p *Prefetcher) LiveStats() LiveStats {
 		cur = *cp
 	}
 	return LiveStats{
-		BytesPrefetched: p.bytesPrefetched.Load(),
-		FilesPrefetched: p.filesPrefetched.Load(),
-		CurrentFile:     cur,
-		Workers:         p.workers,
+		BytesPrefetched:  p.bytesPrefetched.Load(),
+		FilesPrefetched:  p.filesPrefetched.Load(),
+		CurrentFile:      cur,
+		Workers:          p.workers,
+		RateBytesPerSec:  int64(p.meter.rate(time.Now())),
+		PinnedBlockBytes: p.pinnedBlockBytes.Load(),
+		PinLimitBytes:    p.pinLimitBytes.Load(),
 	}
 }
 

@@ -104,6 +104,8 @@ type cacheStore struct {
 
 	state     dcState
 	stateLock sync.Mutex
+
+	jmPins *jmPinSet // JuiceMount patch 0025: eviction skips pinned keys
 }
 
 func newCacheStore(m *cacheManagerMetrics, dir string, cacheSize, maxItems int64, pendingPages int, config *Config, uploader func(key, path string, force bool) bool) *cacheStore {
@@ -367,6 +369,9 @@ func (cache *cacheStore) cleanupExpire() {
 			}
 			if v.size < 0 {
 				continue // staging
+			}
+			if cache.jmPins.has(k) {
+				continue // pinned (JuiceMount patch 0025)
 			}
 			if v.atime < cutoff {
 				deleted++
@@ -829,6 +834,9 @@ func (cache *cacheStore) cleanupFull() {
 		if value.size < 0 {
 			continue // staging
 		}
+		if cache.jmPins.has(k) {
+			continue // pinned (JuiceMount patch 0025)
+		}
 		if cache.cacheExpire > 0 && value.atime < cutoff {
 			lastK = k
 			lastValue = value
@@ -1036,6 +1044,7 @@ type cacheManager struct {
 	storeMap      map[string]*cacheStore
 	stores        []*cacheStore
 	metrics       *cacheManagerMetrics
+	pins          *jmPinSet // JuiceMount patch 0025
 }
 
 func legacyKeyHash(s string) uint32 {
@@ -1130,11 +1139,13 @@ func newCacheManager(config *Config, reg prometheus.Registerer, uploader func(ke
 		stores:        make([]*cacheStore, len(dirs)),
 		metrics:       metrics,
 	}
+	m.pins = newJMPinSet(m.jmPinLimit)
 
 	// 20% of buffer could be used for pending pages
 	pendingPages := int(config.BufferSize) * 2 / 10 / config.BlockSize / len(dirs)
 	for i, d := range dirs {
 		store := newCacheStore(metrics, strings.TrimSpace(d)+string(filepath.Separator), dirCacheSize, dirCacheItems, pendingPages, config, uploader)
+		store.jmPins = m.pins
 		m.stores[i] = store
 		m.storeMap[store.id] = store
 		m.consistentMap.Add(store.id)

@@ -26,7 +26,11 @@
         "bytes_prefetched": { "type": "integer", "minimum": 0 },
         "files_prefetched": { "type": "integer", "minimum": 0 },
         "current_file": { "type": "string", "description": "Path being prefetched now, or \"\"." },
-        "workers": { "type": "integer", "minimum": 0 }
+        "workers": { "type": "integer", "minimum": 0 },
+        "rate_bytes_per_sec": { "type": "integer", "minimum": 0, "description": "Pinned bytes reaching the disk per second over the last 20 s; 0 when idle or stalled. ADDITIVE/optional (pin-before-travel)." },
+        "eta_sec": { "type": "integer", "minimum": 0, "description": "Estimated seconds until every pinned byte is on disk: (aggregate.total_bytes - aggregate.cached_bytes) / rate_bytes_per_sec. 0 = done or unknown. ADDITIVE/optional." },
+        "pinned_block_bytes": { "type": "integer", "minimum": 0, "description": "Bytes JuiceFS holds as pinned blocks (exempt from cache eviction), from the last pin-guard pass. 0 when the JuiceFS cannot pin. ADDITIVE/optional." },
+        "pin_limit_bytes": { "type": "integer", "minimum": 0, "description": "JuiceFS's cap on pinned blocks: 90% of the cache size; the rest stays for ordinary reads. A pin past it fails with an 'insufficient cache capacity' error. ADDITIVE/optional." }
       },
       "description": "Live prefetcher state (pin.LiveStats). Zero-valued when prefetcher is nil."
     },
@@ -78,9 +82,10 @@
         "total_files": { "type": "integer", "minimum": 0 },
         "ready_files": { "type": "integer", "minimum": 0, "description": "Fully-resident files (warm progress = cached_bytes/total_bytes)." },
         "pending_files": { "type": "integer", "minimum": 0 },
+        "prefetching_files": { "type": "integer", "minimum": 0, "description": "Files being downloaded now. Their bytes already on disk count in cached_bytes. ADDITIVE/optional (pin-before-travel)." },
         "failed_files": { "type": "integer", "minimum": 0 },
         "total_bytes": { "type": "integer", "minimum": 0 },
-        "cached_bytes": { "type": "integer", "minimum": 0 }
+        "cached_bytes": { "type": "integer", "minimum": 0, "description": "Bytes on disk of ready files plus the bytes already on disk of files being downloaded (byte-level pin progress)." }
       }
     }
   }

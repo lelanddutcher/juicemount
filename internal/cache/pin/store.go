@@ -395,6 +395,24 @@ func (s *Store) UpdateStatusForEntry(e Entry, status Status, bytesCached int64, 
 	return changed == 1, nil
 }
 
+// UpdateProgress records the bytes of an in-flight attempt that are on disk.
+// It changes neither the status nor the authority, and only the exact
+// Prefetching generation.
+func (s *Store) UpdateProgress(e Entry, bytesCached int64) (bool, error) {
+	if e.Generation == "" || bytesCached < 0 {
+		return false, nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	result, err := s.db.Exec(`UPDATE pinned_files SET bytes_cached=? WHERE path=? AND pin_generation=? AND status=?`,
+		min(bytesCached, e.Size), e.Path, e.Generation, int(StatusPrefetching))
+	if err != nil {
+		return false, err
+	}
+	n, err := result.RowsAffected()
+	return n == 1, err
+}
+
 // CompleteReady commits the opaque, already-verified producer witness last.
 // Publication remains unavailable until AdmitReady validates local state.
 func (s *Store) CompleteReady(e Entry, authority []byte) (bool, error) {
@@ -634,6 +652,11 @@ func (s *Store) Pending(limit int) ([]Entry, error) {
 	return s.queryStatus(StatusPending, limit)
 }
 
+// Failed returns up to limit entries whose last attempt failed.
+func (s *Store) Failed(limit int) ([]Entry, error) {
+	return s.queryStatus(StatusFailed, limit)
+}
+
 // Stale returns entries whose last_prefetched is older than ttl, suitable
 // for re-warmup. Used by the periodic re-warmer to prevent eviction.
 func (s *Store) Stale(ttl time.Duration, limit int) ([]Entry, error) {
@@ -737,13 +760,14 @@ func (s *Store) Get(path string) (*Entry, bool) {
 
 // PinRoots returns the distinct pin roots and aggregate stats per root.
 type RootSummary struct {
-	Root         string `json:"root"`
-	TotalFiles   int    `json:"total_files"`
-	ReadyFiles   int    `json:"ready_files"`
-	PendingFiles int    `json:"pending_files"`
-	FailedFiles  int    `json:"failed_files"`
-	TotalBytes   int64  `json:"total_bytes"`
-	CachedBytes  int64  `json:"cached_bytes"`
+	Root             string `json:"root"`
+	TotalFiles       int    `json:"total_files"`
+	ReadyFiles       int    `json:"ready_files"`
+	PendingFiles     int    `json:"pending_files"`
+	PrefetchingFiles int    `json:"prefetching_files"`
+	FailedFiles      int    `json:"failed_files"`
+	TotalBytes       int64  `json:"total_bytes"`
+	CachedBytes      int64  `json:"cached_bytes"`
 }
 
 func (s *Store) PinRoots() ([]RootSummary, error) {
@@ -771,6 +795,8 @@ func (s *Store) PinRoots() ([]RootSummary, error) {
 			r.ReadyFiles++
 		case StatusPending:
 			r.PendingFiles++
+		case StatusPrefetching:
+			r.PrefetchingFiles++
 		case StatusFailed:
 			r.FailedFiles++
 		}
@@ -780,12 +806,13 @@ func (s *Store) PinRoots() ([]RootSummary, error) {
 
 // AggregateStats returns whole-database counters.
 type AggregateStats struct {
-	TotalFiles   int   `json:"total_files"`
-	ReadyFiles   int   `json:"ready_files"`
-	PendingFiles int   `json:"pending_files"`
-	FailedFiles  int   `json:"failed_files"`
-	TotalBytes   int64 `json:"total_bytes"`
-	CachedBytes  int64 `json:"cached_bytes"`
+	TotalFiles       int   `json:"total_files"`
+	ReadyFiles       int   `json:"ready_files"`
+	PendingFiles     int   `json:"pending_files"`
+	PrefetchingFiles int   `json:"prefetching_files"`
+	FailedFiles      int   `json:"failed_files"`
+	TotalBytes       int64 `json:"total_bytes"`
+	CachedBytes      int64 `json:"cached_bytes"`
 }
 
 func (s *Store) AggregateStats() (AggregateStats, error) {
@@ -804,6 +831,8 @@ func (s *Store) AggregateStats() (AggregateStats, error) {
 			a.ReadyFiles++
 		case StatusPending:
 			a.PendingFiles++
+		case StatusPrefetching:
+			a.PrefetchingFiles++
 		case StatusFailed:
 			a.FailedFiles++
 		}

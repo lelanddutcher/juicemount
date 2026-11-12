@@ -44,11 +44,37 @@ func newJFSControl(root string) *jfsControl {
 	return &jfsControl{root: root, replyTimeout: 60 * time.Second}
 }
 
+var (
+	jfsControlsMu sync.Mutex
+	jfsControls   = map[string]*jfsControl{}
+)
+
+// sharedJFSControl returns one jfsControl per mount root: juicefs keeps one
+// control handle per process on macOS, so every exchange of this process
+// must go through the same lock.
+func sharedJFSControl(root string) *jfsControl {
+	jfsControlsMu.Lock()
+	defer jfsControlsMu.Unlock()
+	c := jfsControls[root]
+	if c == nil {
+		c = newJFSControl(root)
+		jfsControls[root] = c
+	}
+	return c
+}
+
 func (c *jfsControl) exchange(msg []byte, replyLen int) ([]byte, error) {
 	return c.exchangeWithin(msg, replyLen, c.replyTimeout)
 }
 
 func (c *jfsControl) exchangeWithin(msg []byte, replyLen int, timeout time.Duration) ([]byte, error) {
+	return c.exchangeReply(msg, replyLen, timeout, false)
+}
+
+// exchangeReply with errnoFirst ends the reply after a nonzero first byte:
+// the errno-first replies of patch 0025, and the 1-byte EINVAL of a juicefs
+// that does not know the message.
+func (c *jfsControl) exchangeReply(msg []byte, replyLen int, timeout time.Duration, errnoFirst bool) ([]byte, error) {
 	if c.testExchange != nil {
 		return c.testExchange(msg, replyLen)
 	}
@@ -79,6 +105,9 @@ func (c *jfsControl) exchangeWithin(msg []byte, replyLen int, timeout time.Durat
 	for len(reply) < replyLen {
 		n, err := f.Read(buf[:replyLen-len(reply)])
 		reply = append(reply, buf[:n]...)
+		if errnoFirst && len(reply) > 0 && reply[0] != 0 {
+			return reply[:1], nil
+		}
 		if n > 0 {
 			continue
 		}

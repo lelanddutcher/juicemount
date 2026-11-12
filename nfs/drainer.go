@@ -399,7 +399,7 @@ func NewDrainer(spool *SpoolStore, cfg DrainerConfig) (*Drainer, error) {
 		d.batch = newDrainBatcher(d, drainBatchMaxOps, drainBatchMaxDelay)
 	}
 	if spooledMkdirEnabled() && cfg.FuseRoot != "" {
-		d.dirInodes = newDirInodePool(newJFSControl(cfg.FuseRoot))
+		d.dirInodes = newDirInodePool(sharedJFSControl(cfg.FuseRoot))
 	}
 	// H-8B: every new spool row records the base identity of the file it
 	// replaces. The drainer owns the FUSE root, so it supplies the probe.
