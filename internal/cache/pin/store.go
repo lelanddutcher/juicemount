@@ -652,9 +652,22 @@ func (s *Store) Pending(limit int) ([]Entry, error) {
 	return s.queryStatus(StatusPending, limit)
 }
 
-// Failed returns up to limit entries whose last attempt failed.
-func (s *Store) Failed(limit int) ([]Entry, error) {
-	return s.queryStatus(StatusFailed, limit)
+// FailedOldest returns up to limit failed entries, the oldest attempt first.
+func (s *Store) FailedOldest(limit int) ([]Entry, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	rows, err := s.db.Query(`
+		SELECT path, size, status, bytes_cached, last_prefetched, last_error, pinned_at, pin_root, pin_generation, authority
+		FROM pinned_files
+		WHERE status = ?
+		ORDER BY last_prefetched ASC
+		LIMIT ?`,
+		int(StatusFailed), limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanEntries(rows)
 }
 
 // Stale returns entries whose last_prefetched is older than ttl, suitable

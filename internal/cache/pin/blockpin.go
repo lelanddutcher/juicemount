@@ -1,6 +1,6 @@
 package pin
 
-// blockpin.go: pinning through whole blocks (bundled juicefs patch 0025).
+// blockpin.go: pinning through whole blocks (bundled juicefs patch 0026).
 //
 // Before, a pin read the file through FUSE and relied on JuiceFS to cache what
 // it read. 128 KiB FUSE reads take the ranged path, whose whole-block fetch
@@ -10,32 +10,40 @@ package pin
 //
 // Now a worker first asks juicefs to fill the file: juicefs downloads each
 // missing block whole, writes it to its disk cache before it reports done, and
-// pins it (its eviction skips pinned blocks; pinned bytes are capped at 90% of
-// the cache). The worker then reads the file through FUSE as before, now from
-// local disk, to hash it for the resident authority. A juicefs without the
-// message keeps the old read path.
+// pins it. Its eviction skips pinned blocks; it keeps the pin list on disk, so
+// pins survive a restart with no server; pinned bytes are capped at 90% of the
+// cache and at what the disk can hold above its free-space floor. The worker
+// then reads the file through FUSE as before, now from local disk, to hash it
+// for the resident authority. A juicefs without the message keeps the old
+// read path.
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
 
 // BlockPinner is the juicefs pin message (implemented by nfs over .control).
 type BlockPinner interface {
-	// Start begins filling and pinning the file's blocks. A fill already
-	// running for inode is kept.
-	Start(inode uint64) error
+	// Start begins filling and pinning the file's blocks with at most
+	// workers parallel downloads. A fill already running for inode is kept
+	// when the file did not change.
+	Start(inode uint64, workers int) error
 	Status(inode uint64) (BlockFillStatus, error)
-	// Check is local: the pinned bytes of inode and how many are not on disk.
-	// known is false when juicefs holds no pins for inode (it restarted).
-	Check(inode uint64) (known bool, total, missing int64, err error)
-	// Sweep unpins every inode not in keep. It returns juicefs's pinned bytes
-	// and its cap.
+	Cancel(inode uint64) error
+	// Verify is local to juicefs: it returns the items that are not pinned,
+	// were pinned from another length or mtime, or miss blocks.
+	Verify(items []PinVerifyItem) ([]PinVerifyResult, error)
+	// Sweep unpins every inode not in keep and returns juicefs's pinned
+	// bytes and its cap.
 	Sweep(keep []uint64) (dropped int, pinned, limit int64, err error)
+	// SetCapacity grows juicefs's cache capacity to at least bytes.
+	SetCapacity(bytes int64) (capacity, pinned, limit int64, err error)
 }
 
 // BlockFillStatus is one fill's progress in juicefs.
@@ -55,25 +63,72 @@ const (
 	BlockFillFailed  BlockFillState = 3
 )
 
-// ErrBlockPinUnsupported: the mounted juicefs cannot pin (no patch 0025, or a
-// memory cache). Callers keep the old read path.
+// PinVerifyItem is one pinned file as the mirror sees it now.
+type PinVerifyItem struct {
+	Inode   uint64
+	Size    int64
+	MtimeNS int64
+}
+
+// Reasons in PinVerifyResult.
+const (
+	PinUnknown    = 1 // juicefs holds no pins for the inode
+	PinChanged    = 2 // pinned from another version of the file
+	PinIncomplete = 3 // pinned blocks missing from disk
+)
+
+type PinVerifyResult struct {
+	Inode   uint64
+	Reason  uint8
+	Missing int64
+}
+
+// ErrBlockPinUnsupported: the mounted juicefs cannot pin (a memory cache).
+// Callers keep the old read path.
 var ErrBlockPinUnsupported = errors.New("juicefs cannot pin blocks")
 
 // ErrPinnedShareFull: juicefs refused the fill because the pinned blocks would
-// pass its cap (90% of the cache). It wraps ErrInsufficientCacheCapacity.
-var ErrPinnedShareFull = fmt.Errorf("%w: pinned files need more than 90%% of the cache size; unpin a folder or raise the cache size", ErrInsufficientCacheCapacity)
+// pass its cap (90% of the cache, or what the disk holds above its free-space
+// floor). It wraps ErrInsufficientCacheCapacity.
+var ErrPinnedShareFull = fmt.Errorf("%w: not enough room on the cache disk for the pinned files; free disk space on that disk, or unpin a folder", ErrInsufficientCacheCapacity)
 
-// inodeOfReady is an optional provider method: the inode recorded in a Ready
-// entry's witness.
-type inodeOfReady interface {
-	ReadyInode(Entry) (uint64, bool)
+// pinIdentity is an optional provider method: the inode a Ready entry's
+// witness recorded, and the file as the local mirror shows it now.
+type pinIdentity interface {
+	PinIdentity(Entry) (witnessInode uint64, current ExpectedFile, ok bool)
 }
 
-// blockFillPoll is how often a worker asks juicefs for a fill's progress.
-var blockFillPoll = 200 * time.Millisecond
+var (
+	// blockFillPoll is how often a worker asks juicefs for a fill's progress.
+	blockFillPoll = 200 * time.Millisecond
+	// progressSaveEvery throttles the in-flight bytes_cached writes to pin.db.
+	progressSaveEvery = time.Second
+	// liveCheckEvery is how often a fill checks that its pin still exists.
+	liveCheckEvery = time.Second
+	// guardFillTimeout bounds one re-pin by the guard: with no server the
+	// fill cannot read the file's slices and would wait forever.
+	guardFillTimeout = 5 * time.Minute
+)
 
-// progressSaveEvery throttles the in-flight bytes_cached writes to pin.db.
-var progressSaveEvery = time.Second
+// pinVerifyBatch bounds one Verify or Sweep message (juicefs's limit).
+const pinVerifyBatch = 4096
+
+// pinnedBlockBytes is juicefs's pinned bytes from the last guard pass, for
+// the spool's headroom (pinned blocks are not reclaimable).
+var pinnedBlockBytes atomic.Int64
+
+// PinnedBlockBytes returns juicefs's pinned bytes from the last guard pass.
+func PinnedBlockBytes() int64 { return pinnedBlockBytes.Load() }
+
+// CacheBytesForPins is the cache size that holds pinned bytes under juicefs's
+// 90% pin share: pinned/0.9, plus 4 KiB per 4 MiB block of overhead, plus
+// 1 GiB for ordinary reads.
+func CacheBytesForPins(pinned int64) int64 {
+	if pinned <= 0 {
+		return 0
+	}
+	return pinned*10/9 + pinned/1024 + 1<<30
+}
 
 // SetBlockPinner installs the juicefs pin message. Call before workers take
 // jobs; nil keeps the read-through path.
@@ -83,20 +138,46 @@ func (p *Prefetcher) SetBlockPinner(b BlockPinner) {
 	p.pinMu.Unlock()
 }
 
+// SetFillWorkers installs the per-fill download width: 1 on a slow or
+// metered link, so pins do not crowd out reads the editor waits for.
+func (p *Prefetcher) SetFillWorkers(f func() int) {
+	p.pinMu.Lock()
+	p.fillWorkers = f
+	p.pinMu.Unlock()
+}
+
 func (p *Prefetcher) blockPinner() BlockPinner {
 	p.pinMu.Lock()
 	defer p.pinMu.Unlock()
 	return p.pinner
 }
 
-// fillBlocks runs one juicefs fill of inode to its end. progress gets the
-// bytes on disk so far.
-func (p *Prefetcher) fillBlocks(ctx context.Context, b BlockPinner, inode uint64, progress func(BlockFillStatus)) (BlockFillStatus, error) {
-	if err := b.Start(inode); err != nil {
+func (p *Prefetcher) workersForFill() int {
+	p.pinMu.Lock()
+	f := p.fillWorkers
+	p.pinMu.Unlock()
+	if f == nil {
+		return 4
+	}
+	return min(max(f(), 1), 4)
+}
+
+// fillBlocks runs one juicefs fill of inode to its end. progress gets each
+// status; alive, when set, is asked about once a second and a false answer
+// cancels the fill (the pin was removed or superseded). Any early return
+// cancels the fill in juicefs.
+func (p *Prefetcher) fillBlocks(ctx context.Context, b BlockPinner, inode uint64, progress func(BlockFillStatus), alive func() bool) (st BlockFillStatus, err error) {
+	if err := b.Start(inode, p.workersForFill()); err != nil {
 		return BlockFillStatus{}, err
 	}
+	defer func() {
+		if err != nil && st.State != BlockFillDone && st.State != BlockFillFailed {
+			_ = b.Cancel(inode)
+		}
+	}()
+	lastAlive := time.Now()
 	for {
-		st, err := b.Status(inode)
+		st, err = b.Status(inode)
 		if err != nil {
 			return st, err
 		}
@@ -107,13 +188,19 @@ func (p *Prefetcher) fillBlocks(ctx context.Context, b BlockPinner, inode uint64
 		case BlockFillDone:
 			return st, nil
 		case BlockFillFailed:
-			if st.Errno == syscall.ENOSPC {
+			switch st.Errno {
+			case syscall.ENOSPC:
 				return st, ErrPinnedShareFull
-			}
-			if st.Errno == syscall.ENOTSUP {
+			case syscall.ENOTSUP:
 				return st, ErrBlockPinUnsupported
 			}
 			return st, fmt.Errorf("juicefs pin fill: %w", st.Errno)
+		}
+		if alive != nil && time.Since(lastAlive) >= liveCheckEvery {
+			lastAlive = time.Now()
+			if !alive() {
+				return st, ErrPinSuperseded
+			}
 		}
 		select {
 		case <-time.After(blockFillPoll):
@@ -123,6 +210,40 @@ func (p *Prefetcher) fillBlocks(ctx context.Context, b BlockPinner, inode uint64
 			return st, ErrPrefetcherStopped
 		}
 	}
+}
+
+// entryCurrent reports whether path still has a pin of this generation.
+func (p *Prefetcher) entryCurrent(e Entry) bool {
+	cur, ok := p.store.Get(e.Path)
+	return ok && cur.Generation == e.Generation
+}
+
+// growCacheFor asks juicefs for a cache large enough for the whole pinned set
+// (juicefs still refuses what the disk cannot hold). It reports whether the
+// capacity grew.
+func (p *Prefetcher) growCacheFor(b BlockPinner) bool {
+	stats, err := p.store.AggregateStats()
+	if err != nil {
+		return false
+	}
+	want := CacheBytesForPins(stats.TotalBytes)
+	before := CacheBudgetBytes()
+	if want <= before {
+		return false
+	}
+	capacity, _, limit, err := b.SetCapacity(want)
+	if err != nil || capacity <= before {
+		return false
+	}
+	SetCacheBudgetBytes(capacity)
+	// A new budget invalidates the capacity verdict; recompute it now so
+	// queued pins are not refused as "capacity unknown" until the next tick.
+	p.pinMu.Lock()
+	dir := p.capacityDir
+	p.pinMu.Unlock()
+	ComputeCapacity(p.store, dir)
+	p.pinLimitBytes.Store(limit)
+	return true
 }
 
 type inodeRec struct {
@@ -139,7 +260,7 @@ func (p *Prefetcher) rememberInode(path string, inode uint64) {
 	p.pinMu.Unlock()
 }
 
-// progressMeter turns cumulative resident bytes into a rate over the last
+// progressMeter turns cumulative downloaded bytes into a rate over the last
 // rateWindow, for the ETA in /cache-status.
 type progressMeter struct {
 	mu      sync.Mutex
@@ -186,7 +307,8 @@ func (m *progressMeter) rate(now time.Time) float64 {
 }
 
 // ETASeconds estimates the seconds left for the pinned set, or 0 when there is
-// nothing left or no current rate.
+// nothing left or no current download rate. It assumes the bytes not yet
+// counted must all be downloaded, so it may overestimate.
 func ETASeconds(a AggregateStats, rate float64) int64 {
 	left := a.TotalBytes - a.CachedBytes
 	if left <= 0 || rate <= 0 || a.PendingFiles+a.PrefetchingFiles == 0 {
@@ -196,13 +318,22 @@ func ETASeconds(a AggregateStats, rate float64) int64 {
 }
 
 // retryBackoff is the wait before the n-th retry of a failed pin (n >= 1):
-// 30 s, doubling, at most 30 min. Retries never stop while the pin exists.
+// 30 s, doubling, at most 30 min.
 func retryBackoff(n int) time.Duration {
 	d := 30 * time.Second
 	for i := 1; i < n && d < 30*time.Minute; i++ {
 		d *= 2
 	}
 	return min(d, 30*time.Minute)
+}
+
+// maxMissingRetries bounds retries of a pin whose file is gone: a deleted
+// file stays deleted, but a FUSE mount briefly absent after a restart also
+// answers ENOENT, so a few retries remain.
+const maxMissingRetries = 3
+
+func missingFile(lastError string) bool {
+	return strings.Contains(lastError, syscall.ENOENT.Error())
 }
 
 // RetryFailedLoop requeues failed pins with backoff. Call via Prefetcher.Go.
@@ -225,7 +356,8 @@ func (p *Prefetcher) RetryFailedLoop(ctx context.Context, interval time.Duration
 }
 
 func (p *Prefetcher) retryFailed(now time.Time) int {
-	failed, err := p.store.Failed(1000)
+	// Oldest attempts first, so a long failed list rotates.
+	failed, err := p.store.FailedOldest(1000)
 	if err != nil {
 		return 0
 	}
@@ -237,6 +369,9 @@ func (p *Prefetcher) retryFailed(now time.Time) int {
 		}
 		n := p.retries[e.Path]
 		p.pinMu.Unlock()
+		if missingFile(e.LastError) && n >= maxMissingRetries {
+			continue
+		}
 		if now.Before(e.LastPrefetched.Add(retryBackoff(n + 1))) {
 			continue
 		}
@@ -262,9 +397,9 @@ func (p *Prefetcher) clearRetries(path string) {
 
 // GuardReport is one pass of the pin guard.
 type GuardReport struct {
-	Checked   int   // Ready pins checked against juicefs
-	Repinned  int   // pins juicefs did not hold (it restarted) pinned again
-	Requeued  int   // Ready pins with missing blocks sent back to the workers
+	Checked   int   // Ready pins verified against juicefs
+	Repinned  int   // pins juicefs did not hold, pinned again
+	Requeued  int   // Ready pins sent back to the workers
 	Dropped   int   // juicefs pins of files no longer pinned
 	Pinned    int64 // juicefs pinned bytes after the pass
 	Limit     int64 // juicefs pin cap
@@ -272,8 +407,8 @@ type GuardReport struct {
 }
 
 // PinGuardLoop keeps juicefs's pins equal to the pin store and Ready honest.
-// It runs one pass at once (after a relaunch juicefs holds no pins), then one
-// every interval. Call via Prefetcher.Go, after RestoreReady.
+// It runs one pass at once, then one every interval. Call via Prefetcher.Go,
+// after RestoreReady.
 func (p *Prefetcher) PinGuardLoop(ctx context.Context, interval time.Duration) {
 	if interval <= 0 {
 		interval = time.Minute
@@ -293,110 +428,155 @@ func (p *Prefetcher) PinGuardLoop(ctx context.Context, interval time.Duration) {
 	}
 }
 
-// GuardPins runs one guard pass:
-//  1. each Ready pin whose blocks juicefs does not hold as pinned is pinned
-//     again (a fill: present blocks cost a stat, missing ones are downloaded);
-//  2. a Ready pin that had missing blocks goes back to the workers, which
-//     fill it and re-establish its resident authority;
-//  3. juicefs unpins every file the store no longer pins.
+// GuardPins runs one guard pass. Everything except a re-pin is local to
+// juicefs and the app, so a pass works with no server:
+//  1. one batched Verify of every Ready pin against the mirror's length and
+//     mtime;
+//  2. a pin juicefs does not hold is pinned again (a fill: present blocks
+//     cost a stat); one that had to download, was pinned from another
+//     version of the file, or misses blocks goes back to the workers, which
+//     re-establish its resident authority;
+//  3. juicefs unpins every file the store no longer pins;
+//  4. the cache grows when the pinned set needs it.
 func (p *Prefetcher) GuardPins(ctx context.Context) GuardReport {
 	var rep GuardReport
 	b := p.blockPinner()
 	if b == nil || p.refuseFUSEContentReads {
 		return rep
 	}
+	passStart := time.Now()
 	entries, err := p.store.All()
 	if err != nil {
 		return rep
 	}
-	passStart := time.Now()
-	ri, _ := p.provider.(inodeOfReady)
-	keep := make([]uint64, 0, len(entries))
-	pinned := make(map[string]struct{}, len(entries))
+	id, _ := p.provider.(pinIdentity)
+	var items []PinVerifyItem
+	byInode := map[uint64]Entry{}
+	var requeue []Entry
 	for _, e := range entries {
-		pinned[e.Path] = struct{}{}
-	}
-	type job struct {
-		e   Entry
-		ino uint64
-	}
-	var ready []job
-	for _, e := range entries {
-		if e.Status != StatusReady || ri == nil {
+		if e.Status != StatusReady || id == nil {
 			continue
 		}
-		if ino, ok := ri.ReadyInode(e); ok {
-			keep = append(keep, ino)
-			ready = append(ready, job{e, ino})
+		witness, cur, ok := id.PinIdentity(e)
+		if !ok {
+			continue
+		}
+		if cur.Inode != witness { // replaced on the server since the pin
+			requeue = append(requeue, e)
+			continue
+		}
+		items = append(items, PinVerifyItem{Inode: cur.Inode, Size: cur.Size, MtimeNS: cur.MtimeNS})
+		byInode[cur.Inode] = e
+	}
+	var unknown []Entry
+	for start := 0; start < len(items); start += pinVerifyBatch {
+		batch := items[start:min(start+pinVerifyBatch, len(items))]
+		bad, err := b.Verify(batch)
+		if err != nil {
+			return rep
+		}
+		rep.Checked += len(batch)
+		for _, r := range bad {
+			e, ok := byInode[r.Inode]
+			if !ok {
+				continue
+			}
+			if r.Reason == PinUnknown {
+				unknown = append(unknown, e)
+			} else {
+				requeue = append(requeue, e)
+			}
 		}
 	}
-	jobs := make(chan job)
+	// Re-pin what juicefs does not hold. With no server the fill cannot read
+	// the file's slices: the timeout ends it, and the next pass tries again.
+	jobs := make(chan Entry)
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 	for w := 0; w < 4; w++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for j := range jobs {
-				known, _, missing, err := b.Check(j.ino)
-				if errors.Is(err, ErrBlockPinUnsupported) {
+			for e := range jobs {
+				if !p.entryCurrent(e) { // unpinned or repinned meanwhile
 					continue
 				}
+				witness, _, ok := id.PinIdentity(e)
+				if !ok {
+					continue
+				}
+				fctx, cancel := context.WithTimeout(ctx, guardFillTimeout)
+				st, err := p.fillBlocks(fctx, b, witness, nil, func() bool { return p.entryCurrent(e) })
+				cancel()
 				if err != nil {
 					continue
 				}
-				lost := known && missing > 0
-				repinned := false
-				if !known {
-					st, err := p.fillBlocks(ctx, b, j.ino, nil)
-					if err != nil {
-						continue
-					}
-					repinned = true
-					lost = st.Fetched > 0
-				}
-				requeued := false
-				if lost {
-					if changed, err := p.store.RequeueForRepair(j.e); err == nil && changed {
-						requeued = true
-					}
-				}
 				mu.Lock()
-				rep.Checked++
-				if repinned {
-					rep.Repinned++
-				}
-				if requeued {
-					rep.Requeued++
+				rep.Repinned++
+				if st.Fetched > 0 { // blocks were missing: re-check the bytes
+					requeue = append(requeue, e)
 				}
 				mu.Unlock()
 			}
 		}()
 	}
-	for _, j := range ready {
+	for _, e := range unknown {
 		if ctx.Err() != nil {
 			break
 		}
 		select {
-		case jobs <- j:
+		case jobs <- e:
 		case <-p.stopCh:
 		}
 	}
 	close(jobs)
 	wg.Wait()
+	for _, e := range requeue {
+		if !p.entryCurrent(e) {
+			continue
+		}
+		if changed, err := p.store.RequeueForRepair(e); err == nil && changed {
+			rep.Requeued++
+		}
+	}
 	if rep.Requeued > 0 {
 		p.Wake()
 	}
 	if ctx.Err() != nil {
 		return rep
 	}
-	// Fills this process ran: those of files still pinned, and any that
-	// started during this pass (a pin newer than the snapshot), so a fill
-	// that ends during the pass is not swept.
+	// Keep: every file pinned now (a fresh read, so a pin removed during the
+	// pass is not kept), the inodes its witness and the mirror name, and
+	// fills that started during the pass.
+	entries, err = p.store.All()
+	if err != nil {
+		return rep
+	}
+	pinned := make(map[string]struct{}, len(entries))
+	var keep []uint64
+	for _, e := range entries {
+		pinned[e.Path] = struct{}{}
+		if e.Status == StatusReady && id != nil {
+			if witness, cur, ok := id.PinIdentity(e); ok {
+				keep = append(keep, witness)
+				if cur.Inode != 0 && cur.Inode != witness {
+					keep = append(keep, cur.Inode)
+				}
+			}
+		}
+	}
 	p.pinMu.Lock()
 	for path, rec := range p.inodes {
-		if _, ok := pinned[path]; ok || !rec.at.Before(passStart) {
+		_, still := pinned[path]
+		if still || !rec.at.Before(passStart) {
 			keep = append(keep, rec.ino)
+		} else {
+			delete(p.inodes, path)
+		}
+	}
+	for path := range p.retries {
+		if _, still := pinned[path]; !still {
+			delete(p.retries, path)
 		}
 	}
 	p.pinMu.Unlock()
@@ -406,6 +586,10 @@ func (p *Prefetcher) GuardPins(ctx context.Context) GuardReport {
 	}
 	rep.Supported, rep.Dropped, rep.Pinned, rep.Limit = true, dropped, pinnedBytes, limit
 	p.pinnedBlockBytes.Store(pinnedBytes)
+	pinnedBlockBytes.Store(pinnedBytes)
 	p.pinLimitBytes.Store(limit)
+	if p.growCacheFor(b) {
+		rep.Limit = p.pinLimitBytes.Load()
+	}
 	return rep
 }

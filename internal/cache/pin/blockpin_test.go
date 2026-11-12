@@ -23,17 +23,54 @@ type fakePinner struct {
 	started  []uint64
 	known    map[uint64]bool
 	missing  map[uint64]int64
+	changed  map[uint64]bool
 	kept     []uint64
 	onPoll   func(poll int)
+	hang     bool // fills never end (no server)
+	canceled []uint64
+	capacity int64
+	workers  []int
 }
 
-func (f *fakePinner) Start(inode uint64) error {
+func (f *fakePinner) Cancel(inode uint64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.canceled = append(f.canceled, inode)
+	return nil
+}
+
+func (f *fakePinner) SetCapacity(bytes int64) (int64, int64, int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.capacity = bytes
+	return bytes, f.size, bytes * 9 / 10, nil
+}
+
+func (f *fakePinner) Verify(items []PinVerifyItem) ([]PinVerifyResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []PinVerifyResult
+	for _, it := range items {
+		switch {
+		case !f.known[it.Inode]:
+			out = append(out, PinVerifyResult{Inode: it.Inode, Reason: PinUnknown})
+		case f.changed[it.Inode]:
+			out = append(out, PinVerifyResult{Inode: it.Inode, Reason: PinChanged})
+		case f.missing[it.Inode] > 0:
+			out = append(out, PinVerifyResult{Inode: it.Inode, Reason: PinIncomplete, Missing: f.missing[it.Inode]})
+		}
+	}
+	return out, nil
+}
+
+func (f *fakePinner) Start(inode uint64, workers int) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.startErr != nil {
 		return f.startErr
 	}
 	f.started = append(f.started, inode)
+	f.workers = append(f.workers, workers)
 	f.polls = 0
 	return nil
 }
@@ -48,6 +85,12 @@ func (f *fakePinner) Status(inode uint64) (BlockFillStatus, error) {
 		hook(poll)
 	}
 	st := BlockFillStatus{Total: size, State: BlockFillRunning}
+	f.mu.Lock()
+	hang := f.hang
+	f.mu.Unlock()
+	if hang {
+		return st, nil
+	}
 	if poll < steps {
 		st.Done = size * int64(poll) / int64(steps)
 		return st, nil
@@ -82,10 +125,17 @@ func (f *fakePinner) Sweep(keep []uint64) (int, int64, int64, error) {
 // guardProvider adds the witness inode lookup the nfs provider has.
 type guardProvider struct {
 	*testOwnedPinProvider
-	inode uint64
+	inode   uint64
+	current ExpectedFile // the mirror now; zero means same as the witness
 }
 
-func (g *guardProvider) ReadyInode(e Entry) (uint64, bool) { return g.inode, len(e.Authority) != 0 }
+func (g *guardProvider) PinIdentity(e Entry) (uint64, ExpectedFile, bool) {
+	cur := g.current
+	if cur.Inode == 0 {
+		cur = ExpectedFile{Inode: g.inode, Size: e.Size, MtimeNS: 1}
+	}
+	return g.inode, cur, len(e.Authority) != 0
+}
 
 func fastPolls(t *testing.T) {
 	oldPoll, oldSave := blockFillPoll, progressSaveEvery
@@ -200,7 +250,7 @@ func TestBlockPinShareFullIsReportedAsFailed(t *testing.T) {
 	if !errors.Is(err, ErrPinnedShareFull) || !errors.Is(err, ErrInsufficientCacheCapacity) {
 		t.Fatalf("cap refusal: %v", err)
 	}
-	if e := pinEntry(t, s, path); e.Status != StatusFailed || !strings.Contains(e.LastError, "90%") {
+	if e := pinEntry(t, s, path); e.Status != StatusFailed || !strings.Contains(e.LastError, "unpin a folder") {
 		t.Fatalf("cap refusal must be Failed with the reason, not silently pending: %+v", e)
 	}
 }
@@ -304,5 +354,188 @@ func TestProgressRateAndETA(t *testing.T) {
 		if got := retryBackoff(n); got != want {
 			t.Fatalf("backoff %d = %v, want %v", n, got, want)
 		}
+	}
+}
+
+// M1: a Ready pin made from another version of the file goes back to the
+// workers; so does one whose file was replaced (another inode).
+func TestPinGuardRequeuesChangedFiles(t *testing.T) {
+	fastPolls(t)
+	s, p, path := pinnedFixture(t, "clip.mov", []byte("version one"))
+	gp := &guardProvider{testOwnedPinProvider: p.provider.(*testOwnedPinProvider), inode: 11}
+	p.provider = gp
+	f := &fakePinner{size: 11, steps: 1}
+	p.SetBlockPinner(f)
+	if err := claimAndPrefetch(t, s, p, path); err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	f.known = map[uint64]bool{11: true}
+	f.changed = map[uint64]bool{11: true}
+	f.mu.Unlock()
+	if rep := p.GuardPins(context.Background()); rep.Requeued != 1 || rep.Checked != 1 {
+		t.Fatalf("changed file: %+v", rep)
+	}
+	if err := claimAndPrefetch(t, s, p, path); err != nil {
+		t.Fatal(err)
+	}
+	gp.current = ExpectedFile{Inode: 12, Size: 11, MtimeNS: 1}
+	if rep := p.GuardPins(context.Background()); rep.Requeued != 1 {
+		t.Fatalf("replaced file: %+v", rep)
+	}
+}
+
+// H1: with no server, a re-pin never ends; the guard gives up after its
+// timeout and cancels the fill instead of blocking forever.
+func TestPinGuardRepinTimesOutOffline(t *testing.T) {
+	fastPolls(t)
+	old := guardFillTimeout
+	guardFillTimeout = 50 * time.Millisecond
+	defer func() { guardFillTimeout = old }()
+	s, p, path := pinnedFixture(t, "clip.mov", []byte("abroad"))
+	p.provider = &guardProvider{testOwnedPinProvider: p.provider.(*testOwnedPinProvider), inode: 21}
+	f := &fakePinner{size: 6, steps: 1}
+	p.SetBlockPinner(f)
+	if err := claimAndPrefetch(t, s, p, path); err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	f.known, f.hang = nil, true
+	f.mu.Unlock()
+	done := make(chan GuardReport, 1)
+	go func() { done <- p.GuardPins(context.Background()) }()
+	select {
+	case rep := <-done:
+		if rep.Repinned != 0 || rep.Requeued != 0 || !rep.Supported {
+			t.Fatalf("offline pass: %+v", rep)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("guard blocked on an offline re-pin")
+	}
+	if !slices.Contains(f.canceled, 21) {
+		t.Fatal("the timed-out fill was not canceled")
+	}
+	if e := pinEntry(t, s, path); e.Status != StatusReady {
+		t.Fatalf("offline pass revoked Ready: %+v", e)
+	}
+}
+
+// H3: unpinning a file while its fill runs cancels the fill in juicefs.
+func TestUnpinDuringFillCancels(t *testing.T) {
+	fastPolls(t)
+	old := liveCheckEvery
+	liveCheckEvery = time.Millisecond
+	defer func() { liveCheckEvery = old }()
+	s, p, path := pinnedFixture(t, "clip.mov", []byte("large file"))
+	f := &fakePinner{size: 10, hang: true}
+	p.SetBlockPinner(f)
+	p.SetFillWorkers(func() int { return 1 })
+	claimed, ok, err := s.ClaimPrefetch(pinEntry(t, s, path))
+	if err != nil || !ok {
+		t.Fatal(err)
+	}
+	res := make(chan error, 1)
+	go func() { res <- p.prefetch(claimed) }()
+	time.Sleep(20 * time.Millisecond)
+	if err := s.UnpinPath(path); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-res:
+		if !errors.Is(err, ErrPinSuperseded) {
+			t.Fatalf("fill after unpin: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("fill kept running after unpin")
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.canceled) != 1 || len(f.workers) != 1 || f.workers[0] != 1 {
+		t.Fatalf("cancel %v, workers %v", f.canceled, f.workers)
+	}
+}
+
+// M7: a pin removed while the guard runs is neither re-pinned nor kept.
+func TestPinGuardSkipsPinRemovedDuringPass(t *testing.T) {
+	fastPolls(t)
+	s, p, path := pinnedFixture(t, "clip.mov", []byte("bytes"))
+	p.provider = &guardProvider{testOwnedPinProvider: p.provider.(*testOwnedPinProvider), inode: 31}
+	f := &fakePinner{size: 5, steps: 1}
+	p.SetBlockPinner(f)
+	if err := claimAndPrefetch(t, s, p, path); err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	f.known, f.started = nil, nil
+	f.mu.Unlock()
+	if err := s.UnpinPath(path); err != nil {
+		t.Fatal(err)
+	}
+	p.GuardPins(context.Background())
+	if len(f.started) != 0 || slices.Contains(f.kept, 31) {
+		t.Fatalf("removed pin re-pinned %v or kept %v", f.started, f.kept)
+	}
+}
+
+// H2: a refusal at the cap grows the cache for the whole pinned set, then
+// the fill is tried again.
+func TestShareFullGrowsCacheThenRetries(t *testing.T) {
+	fastPolls(t)
+	data := []byte("needs a bigger cache")
+	s, p, path := pinnedFixture(t, "clip.mov", data)
+	f := &fakePinner{size: int64(len(data)), steps: 1, failWith: syscall.ENOSPC}
+	f.onPoll = func(int) {
+		f.mu.Lock()
+		if f.capacity > 0 {
+			f.failWith = 0
+		}
+		f.mu.Unlock()
+	}
+	p.SetBlockPinner(f)
+	cacheVolumeMu.RLock()
+	dir := cacheVolumePath
+	cacheVolumeMu.RUnlock()
+	p.capacityDir = dir
+	SetCacheBudgetBytes(int64(len(data)) + 1)
+	ComputeCapacity(s, dir)
+	if err := claimAndPrefetch(t, s, p, path); err != nil {
+		t.Fatalf("after growing: %v", err)
+	}
+	if f.capacity != CacheBytesForPins(int64(len(data))) || CacheBudgetBytes() != f.capacity {
+		t.Fatalf("capacity %d, budget %d", f.capacity, CacheBudgetBytes())
+	}
+	if want := int64(200<<30)*10/9 + int64(200<<30)/1024 + 1<<30; CacheBytesForPins(200<<30) != want {
+		t.Fatal("cache size for pins")
+	}
+}
+
+// L3: failed pins rotate oldest first; a deleted file stops after a few
+// retries; maps drop unpinned paths.
+func TestRetryStopsForMissingFiles(t *testing.T) {
+	fastPolls(t)
+	s, p, path := pinnedFixture(t, "clip.mov", []byte("x"))
+	e := pinEntry(t, s, path)
+	if _, err := s.UpdateStatusForEntry(e, StatusFailed, 0, "open: no such file or directory"); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	for i := 1; i <= maxMissingRetries; i++ {
+		now = now.Add(time.Hour)
+		if p.retryFailed(now) != 1 {
+			t.Fatalf("retry %d of a missing file did not run", i)
+		}
+		e = pinEntry(t, s, path)
+		if _, err := s.UpdateStatusForEntry(e, StatusFailed, 0, "open: no such file or directory"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if p.retryFailed(now.Add(time.Hour)) != 0 {
+		t.Fatal("a missing file is retried forever")
+	}
+	p.SetBlockPinner(&fakePinner{})
+	_ = s.UnpinPath(path)
+	p.GuardPins(context.Background())
+	if len(p.retries) != 0 {
+		t.Fatalf("retries kept for an unpinned path: %v", p.retries)
 	}
 }

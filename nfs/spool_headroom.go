@@ -231,7 +231,9 @@ func liveCacheReclaimInputs() cacheReclaimInputs {
 		WritebackOn:      os.Getenv("JM_FUSE_WRITEBACK") == "1",
 		BlockCacheBytes:  v.BlockCacheBytes,
 		CacheDirBytes:    v.CacheUsageBytes,
-		PinnedBytes:      v.PinnedBytes,
+		// Pinned blocks are not reclaimable: count what the pin store wants
+		// or what juicefs holds pinned, whichever is larger.
+		PinnedBytes:      max(v.PinnedBytes, pin.PinnedBlockBytes()),
 		CacheBudgetBytes: pin.CacheBudgetBytes(),
 	}
 	if !v.Computed.IsZero() {

@@ -5,36 +5,46 @@
 ### App
 
 - "Pin before travel" is now reliable. An editor pins a project at home;
-  abroad it plays and scrubs from local disk, and it stays that way. Three
-  problems are fixed (laptop lab, 2026-11-12):
+  abroad it plays and scrubs from local disk, and it stays that way, also
+  after a restart with no connection. Three problems are fixed (laptop lab,
+  2026-11-12):
   - Large pins failed and were never retried. A pin read the file through
     FUSE in 128 KiB reads, and JuiceFS saved whole blocks to its cache only
     through a background queue that drops requests when full: 3 of 4 clips
     ended with missing blocks, and the pin downloaded 1.8 times the project.
-    Now the app asks the bundled JuiceFS (patch 0025, `-jm10`) to download
+    Now the app asks the bundled JuiceFS (patch 0026, `-jm11`) to download
     each missing block whole and write it to the cache before it reports
     done; then the app checks the file as before, from local disk. Encrypted
-    volumes pin the same way. A failed pin is retried after 30 s, then with
-    a doubling wait of at most 30 minutes.
+    volumes pin the same way. On a slow or metered link a pin downloads one
+    block at a time and waits for reads the editor is waiting for. A failed
+    pin is retried after 30 s, then with a doubling wait of at most 30
+    minutes; a file that no longer exists is retried 3 times.
   - Ordinary reads evicted pinned blocks, and the app still said "ready".
-    JuiceFS now never evicts a pinned block. Pinned files may use at most
-    90% of the cache size, so other reads keep the rest; a pin past that
-    fails with a clear "unpin a folder or raise the cache size" error
-    instead of evicting. Every minute the app checks that every ready pin
-    is still complete on disk, pins its blocks again after a relaunch, and
-    downloads any block that is missing.
+    JuiceFS now never evicts a pinned block, and it keeps its list of
+    pinned blocks on disk, so a restart, also one with no connection, keeps
+    them. Pinned files may use at most 90% of the cache; the app grows the
+    cache when the pinned set needs it. A pin never fills the disk below
+    the cache's free-space floor: past it, it fails with "not enough room on
+    the cache disk for the pinned files; free disk space on that disk, or
+    unpin a folder" instead of evicting. Unpinning a folder stops its
+    downloads at once. Every minute the app checks, without the server,
+    that every ready pin is complete and matches the file on the server,
+    and fetches it again when it is not.
   - The app showed "0 of 44, 0 bytes" for minutes, then a jump. Now
     `/cache-status` counts the bytes already on disk of files being
-    downloaded, and reports the files in progress, the rate and an
-    estimated time left (`prefetching_files`, `rate_bytes_per_sec`,
-    `eta_sec`), and the pinned bytes against the 90% limit.
+    downloaded, and reports the files in progress, the download rate and
+    an estimated time left (`prefetching_files`, `rate_bytes_per_sec`,
+    `eta_sec`), and the pinned bytes against the limit.
   In the Linux remote lab (2.15 GB project, 3 GiB cache): pinning on lan
-  took 4.0 s with 552 whole-block downloads (before: 8,232 requests). After
-  1.5 GiB of other reads, 0 pinned bytes were lost (before: 503 MB, and 13
-  of 40 project files). Abroad (200 ms, 1% loss), a pinned clip played in
-  1.7 s with no download (before: 339 s, 123 MB from the server), and a
-  scrub took 0.5–2.2 ms per 1 MiB read (before: p95 7.6–9.8 s). After a
-  relaunch, pinning again took 8 s abroad and downloaded nothing.
+  took 4.0–5.5 s with 552 whole-block downloads (before: 8,232 requests).
+  After 1.5 GiB of other reads, 0 pinned bytes were lost (before: 503 MB,
+  and 13 of 40 project files). Abroad (200 ms, 1% loss), a pinned clip
+  played in 1.7–2.0 s with no download (before: 339 s, 123 MB from the
+  server), and a scrub took 0.5–2.3 ms per 1 MiB read (before: p95
+  7.6–9.8 s). With the link cut, JuiceFS killed and restarted, and the cache
+  disk pushed below its free-space floor, all 44 pinned files stayed
+  complete while 66 unpinned blocks were evicted, and a new 1.5 GiB pin was
+  refused with nothing downloaded.
   Field switch: `JM_PIN_WHOLE_BLOCKS=0` returns to the read-through pin.
 - On an encrypted volume over a slow or distant link, a slow cold read no
   longer turns into a retry wait. An encrypted volume (one formatted with an

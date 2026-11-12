@@ -105,7 +105,8 @@ type cacheStore struct {
 	state     dcState
 	stateLock sync.Mutex
 
-	jmPins *jmPinSet // JuiceMount patch 0025: eviction skips pinned keys
+	jmPins  *jmPinSet    // JuiceMount patch 0026: eviction skips pinned keys
+	jmExtra atomic.Int64 // JuiceMount patch 0026: capacity added at run time (SETCAP)
 }
 
 func newCacheStore(m *cacheManagerMetrics, dir string, cacheSize, maxItems int64, pendingPages int, config *Config, uploader func(key, path string, force bool) bool) *cacheStore {
@@ -135,6 +136,7 @@ func newCacheStore(m *cacheManagerMetrics, dir string, cacheSize, maxItems int64
 		opTs:          make(map[time.Duration]func() error),
 	}
 	c.stateLock = sync.Mutex{}
+	c.jmPins = jmPinsForDir(dir) // JuiceMount patch 0026: before any scan or eviction
 	if config.Writeback {
 		c.state = newDCState(dcUnchanged, c)
 	} else {
@@ -234,7 +236,7 @@ func (c *cacheStore) enabled() bool {
 }
 
 func (c *cacheStore) full() bool {
-	return c.used > c.capacity || (c.maxItems != 0 && int64(len(c.keys)) > c.maxItems)
+	return c.used > c.capacity+c.jmExtra.Load() || (c.maxItems != 0 && int64(len(c.keys)) > c.maxItems)
 }
 
 func (cache *cacheStore) checkErr(f func() error) error {
@@ -371,7 +373,7 @@ func (cache *cacheStore) cleanupExpire() {
 				continue // staging
 			}
 			if cache.jmPins.has(k) {
-				continue // pinned (JuiceMount patch 0025)
+				continue // pinned (JuiceMount patch 0026)
 			}
 			if v.atime < cutoff {
 				deleted++
@@ -793,7 +795,7 @@ func (cache *cacheStore) cleanupFull() {
 		return
 	}
 
-	goal := cache.capacity * 95 / 100
+	goal := (cache.capacity + cache.jmExtra.Load()) * 95 / 100
 	num := int64(len(cache.keys)) * 99 / 100
 	if cache.maxItems != 0 && num > cache.maxItems*99/100 {
 		num = cache.maxItems * 99 / 100
@@ -818,6 +820,20 @@ func (cache *cacheStore) cleanupFull() {
 			num = int64(len(cache.keys)-toFree) * 99 / 100
 		}
 	}
+	// JuiceMount patch 0026: pinned blocks are not evictable. Never aim below
+	// them, never walk the keys when only pinned blocks are left, and drop
+	// the 1% item goal (it would walk every pinned key to find none).
+	if pinned := cache.jmPins.storeBytes(cache.id); pinned > 0 {
+		if goal < pinned {
+			goal = pinned
+		}
+		if cache.maxItems == 0 {
+			num = int64(len(cache.keys))
+		}
+		if cache.used-pinned < 4096 {
+			return
+		}
+	}
 	if int64(len(cache.keys)) <= num && cache.used <= goal {
 		return // some other thread has done the cleanup
 	}
@@ -835,7 +851,7 @@ func (cache *cacheStore) cleanupFull() {
 			continue // staging
 		}
 		if cache.jmPins.has(k) {
-			continue // pinned (JuiceMount patch 0025)
+			continue // pinned (JuiceMount patch 0026)
 		}
 		if cache.cacheExpire > 0 && value.atime < cutoff {
 			lastK = k
@@ -1044,7 +1060,7 @@ type cacheManager struct {
 	storeMap      map[string]*cacheStore
 	stores        []*cacheStore
 	metrics       *cacheManagerMetrics
-	pins          *jmPinSet // JuiceMount patch 0025
+	pins          *jmPinSet // JuiceMount patch 0026
 }
 
 func legacyKeyHash(s string) uint32 {
@@ -1139,17 +1155,19 @@ func newCacheManager(config *Config, reg prometheus.Registerer, uploader func(ke
 		stores:        make([]*cacheStore, len(dirs)),
 		metrics:       metrics,
 	}
-	m.pins = newJMPinSet(m.jmPinLimit)
+	m.pins = newJMPinSet(filepath.Join(strings.TrimSpace(dirs[0]), "jmpins"))
 
 	// 20% of buffer could be used for pending pages
 	pendingPages := int(config.BufferSize) * 2 / 10 / config.BlockSize / len(dirs)
 	for i, d := range dirs {
+		jmPinsByDir.Store(strings.TrimSpace(d)+string(filepath.Separator), m.pins)
 		store := newCacheStore(metrics, strings.TrimSpace(d)+string(filepath.Separator), dirCacheSize, dirCacheItems, pendingPages, config, uploader)
-		store.jmPins = m.pins
 		m.stores[i] = store
 		m.storeMap[store.id] = store
 		m.consistentMap.Add(store.id)
+		jmPinsByDir.Delete(store.dir)
 	}
+	m.pins.bind(m)
 	go m.cleanup()
 	return m
 }

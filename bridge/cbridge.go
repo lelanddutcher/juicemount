@@ -2230,10 +2230,19 @@ func nfsServerStartSerialized(configJSON *C.char, recovery *servingDesiredRecord
 		} else {
 			globalPrefetcher = pin.NewPrefetcher(ps, cfg.FUSEPath, cfg.MountPoint, 4, provider)
 			// Pin through whole blocks that juicefs keeps out of eviction
-			// (bundled juicefs patch 0025). JM_PIN_WHOLE_BLOCKS=0 is the
+			// (bundled juicefs patch 0026). JM_PIN_WHOLE_BLOCKS=0 is the
 			// field rollback to the read-through pin.
 			if os.Getenv("JM_PIN_WHOLE_BLOCKS") != "0" {
 				globalPrefetcher.SetBlockPinner(jmnfs.NewJFSBlockPinner(cfg.FUSEPath))
+				// One download per fill on a slow or metered link, so pins
+				// do not crowd out reads the editor waits for.
+				globalPrefetcher.SetFillWorkers(func() int {
+					switch netprofile.Default().ReadPolicyClass() {
+					case netprofile.ClassMetered, netprofile.ClassSlow:
+						return 1
+					}
+					return 4
+				})
 			}
 		}
 		if globalPrefetcher != nil {

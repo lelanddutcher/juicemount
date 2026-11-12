@@ -542,7 +542,7 @@ func (v *VFS) handleInternalMsg(ctx meta.Context, cmd uint32, r *utils.Buffer, o
 		w.Put32(count)
 		_, _ = out.Write(w.Bytes())
 	case meta.JMPinCache:
-		// JuiceMount patch 0025 (jm_pin.go).
+		// JuiceMount patch 0026 (jm_pin.go).
 		v.jmPinMsg(r, out)
 	case meta.JMReleaseInodes:
 		// JuiceMount patch 0022. Reply: errno (1 byte), released count (4).

@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Pin probe for the remote lab (runs inside the client container).
 
-It speaks the bundled juicefs's JMPinCache control message (patch 0025) the
+It speaks the bundled juicefs's JMPinCache control message (patch 0026) the
 way the app's pin workers do, and measures what an editor would feel:
 
   pin FILE...          fill and pin with 4 workers; progress every 5 s
+  start FILE           START one fill and report its first STATUS after 10 s
   check FILE...        pinned bytes missing from disk (local)
+  blocks               cache block files on disk and their bytes
   sweep FILE...        keep only these files pinned
   readthrough FILE...  the old pin: 4 workers read 128 KiB direct reads
   presence FILE...     bytes of each file in the block cache (juicefs warmup --check)
@@ -27,7 +29,7 @@ import time
 import urllib.request
 
 MOUNT = "/jfs"
-MSG = 1104
+MSG = 1105
 START, STATUS, CHECK, SWEEP = 1, 2, 3, 4
 LOCK = threading.Lock()
 
@@ -55,7 +57,14 @@ def control(op, body, reply_len):
 
 
 def ino(path):
+    # "ino:N" names a file by inode, so checks run with no server to stat it.
+    if path.startswith("ino:"):
+        return int(path[4:])
     return os.stat(path).st_ino
+
+
+def cmd_inodes(files):
+    print(" ".join("ino:%d" % os.stat(f).st_ino for f in files))
 
 
 def status(i):
@@ -80,7 +89,7 @@ def cmd_pin(files):
                 f = jobs.pop(0)
             i = ino(f)
             s = time.time()
-            r = control(START, struct.pack(">Q", i), 1)
+            r = control(START, struct.pack(">QB", i, 4), 1)
             if r[0]:
                 results[f] = {"start_errno": r[0]}
                 continue
@@ -119,16 +128,44 @@ def cmd_pin(files):
 def cmd_check(files):
     out, missing, unknown = {}, 0, 0
     for f in files:
-        r = control(CHECK, struct.pack(">Q", ino(f)), 18)
+        r = control(CHECK, struct.pack(">Q", ino(f)), 34)
         if r[0]:
             out[f] = {"errno": r[0]}
             continue
-        known, total, miss = struct.unpack(">BQQ", r[1:18])
+        known, total, miss, _length, _mtime = struct.unpack(">BQQQQ", r[1:34])
         out[f] = {"known": known, "total": total, "missing": miss}
         missing += miss
         unknown += 0 if known else 1
     print(json.dumps({"cmd": "check", "files": len(files), "unknown": unknown, "missing": missing,
                       "detail": {k: v for k, v in out.items() if v.get("missing") or not v.get("known")}}))
+
+
+def cmd_start(f):
+    i = ino(f)
+    s = time.time()
+    r = control(START, struct.pack(">QB", i, 4), 1)
+    if r[0]:
+        print(json.dumps({"cmd": "start", "file": f, "start_errno": r[0]}))
+        return
+    time.sleep(10)
+    st = status(i)
+    st.update({"cmd": "start", "file": f, "secs": round(time.time() - s, 1)})
+    print(json.dumps(st))
+
+
+def cmd_blocks():
+    n = b = 0
+    for root, _dirs, files in os.walk("/var/jfscache"):
+        if "/raw/chunks" not in root:
+            continue
+        for name in files:
+            if name.endswith(".tmp"):
+                continue
+            n += 1
+            b += os.stat(os.path.join(root, name)).st_size
+    st = os.statvfs("/var/jfscache")
+    print(json.dumps({"cmd": "blocks", "files": n, "bytes": b,
+                      "disk_free": st.f_bavail * st.f_frsize, "disk_total": st.f_blocks * st.f_frsize}))
 
 
 def cmd_sweep(files):
@@ -229,6 +266,12 @@ def main():
     c, args = sys.argv[1], sys.argv[2:]
     if c == "pin":
         cmd_pin(args)
+    elif c == "inodes":
+        cmd_inodes(args)
+    elif c == "start":
+        cmd_start(args[0])
+    elif c == "blocks":
+        cmd_blocks()
     elif c == "check":
         cmd_check(args)
     elif c == "sweep":

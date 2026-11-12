@@ -315,7 +315,7 @@ The script header lists every variable. Limits:
 ## Pinning (`experiments/pin-lab.sh`)
 
 `experiments/pin-lab.sh before|after|cap` measures "pin before travel" with
-the bundled JuiceFS's pin message (patch 0025). `lib/pinprobe.py` runs in the
+the bundled JuiceFS's pin message (patch 0026). `lib/pinprobe.py` runs in the
 client and speaks that message as the app's pin workers do. It also reads
 files the old way (four workers, 128 KiB direct reads), plays and scrubs
 files, and prints the client's object-store GETs.
@@ -338,6 +338,11 @@ experiments/pin-lab.sh after > after.jsonl
 - `after`: the new pin, the same pressure and abroad reads, then a remount
   (the app's relaunch: the guard pins again), and 1.5 GiB more reads.
 - `cap`: with the project pinned, a 3 GiB pin must fail with ENOSPC.
+- `offline`: the travel case. Pin, cut the link (iptables in the client),
+  kill JuiceFS, fill the cache disk (a 4 GiB tmpfs) below its free-space
+  floor, start JuiceFS again, cut the link again, and check the pins with no
+  server while more disk pressure evicts. JuiceFS needs the server only to
+  mount.
 
 On Linux the old pin did not lose blocks (patch 0021's spans assemble whole
 blocks for a sequential reader); the failure it fixes was seen on macOS.

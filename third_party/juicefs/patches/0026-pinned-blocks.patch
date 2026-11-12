@@ -1,0 +1,131 @@
+--- a/pkg/chunk/disk_cache.go
++++ b/pkg/chunk/disk_cache.go
+@@ -104,6 +104,9 @@
+ 
+ 	state     dcState
+ 	stateLock sync.Mutex
++
++	jmPins  *jmPinSet    // JuiceMount patch 0026: eviction skips pinned keys
++	jmExtra atomic.Int64 // JuiceMount patch 0026: capacity added at run time (SETCAP)
+ }
+ 
+ func newCacheStore(m *cacheManagerMetrics, dir string, cacheSize, maxItems int64, pendingPages int, config *Config, uploader func(key, path string, force bool) bool) *cacheStore {
+@@ -133,6 +136,7 @@
+ 		opTs:          make(map[time.Duration]func() error),
+ 	}
+ 	c.stateLock = sync.Mutex{}
++	c.jmPins = jmPinsForDir(dir) // JuiceMount patch 0026: before any scan or eviction
+ 	if config.Writeback {
+ 		c.state = newDCState(dcUnchanged, c)
+ 	} else {
+@@ -232,7 +236,7 @@
+ }
+ 
+ func (c *cacheStore) full() bool {
+-	return c.used > c.capacity || (c.maxItems != 0 && int64(len(c.keys)) > c.maxItems)
++	return c.used > c.capacity+c.jmExtra.Load() || (c.maxItems != 0 && int64(len(c.keys)) > c.maxItems)
+ }
+ 
+ func (cache *cacheStore) checkErr(f func() error) error {
+@@ -367,6 +371,9 @@
+ 			}
+ 			if v.size < 0 {
+ 				continue // staging
++			}
++			if cache.jmPins.has(k) {
++				continue // pinned (JuiceMount patch 0026)
+ 			}
+ 			if v.atime < cutoff {
+ 				deleted++
+@@ -788,7 +795,7 @@
+ 		return
+ 	}
+ 
+-	goal := cache.capacity * 95 / 100
++	goal := (cache.capacity + cache.jmExtra.Load()) * 95 / 100
+ 	num := int64(len(cache.keys)) * 99 / 100
+ 	if cache.maxItems != 0 && num > cache.maxItems*99/100 {
+ 		num = cache.maxItems * 99 / 100
+@@ -811,6 +818,20 @@
+ 			num = 0
+ 		} else {
+ 			num = int64(len(cache.keys)-toFree) * 99 / 100
++		}
++	}
++	// JuiceMount patch 0026: pinned blocks are not evictable. Never aim below
++	// them, never walk the keys when only pinned blocks are left, and drop
++	// the 1% item goal (it would walk every pinned key to find none).
++	if pinned := cache.jmPins.storeBytes(cache.id); pinned > 0 {
++		if goal < pinned {
++			goal = pinned
++		}
++		if cache.maxItems == 0 {
++			num = int64(len(cache.keys))
++		}
++		if cache.used-pinned < 4096 {
++			return
+ 		}
+ 	}
+ 	if int64(len(cache.keys)) <= num && cache.used <= goal {
+@@ -828,6 +849,9 @@
+ 	for k, value := range cache.keys {
+ 		if value.size < 0 {
+ 			continue // staging
++		}
++		if cache.jmPins.has(k) {
++			continue // pinned (JuiceMount patch 0026)
+ 		}
+ 		if cache.cacheExpire > 0 && value.atime < cutoff {
+ 			lastK = k
+@@ -1036,6 +1060,7 @@
+ 	storeMap      map[string]*cacheStore
+ 	stores        []*cacheStore
+ 	metrics       *cacheManagerMetrics
++	pins          *jmPinSet // JuiceMount patch 0026
+ }
+ 
+ func legacyKeyHash(s string) uint32 {
+@@ -1130,15 +1155,19 @@
+ 		stores:        make([]*cacheStore, len(dirs)),
+ 		metrics:       metrics,
+ 	}
++	m.pins = newJMPinSet(filepath.Join(strings.TrimSpace(dirs[0]), "jmpins"))
+ 
+ 	// 20% of buffer could be used for pending pages
+ 	pendingPages := int(config.BufferSize) * 2 / 10 / config.BlockSize / len(dirs)
+ 	for i, d := range dirs {
++		jmPinsByDir.Store(strings.TrimSpace(d)+string(filepath.Separator), m.pins)
+ 		store := newCacheStore(metrics, strings.TrimSpace(d)+string(filepath.Separator), dirCacheSize, dirCacheItems, pendingPages, config, uploader)
+ 		m.stores[i] = store
+ 		m.storeMap[store.id] = store
+ 		m.consistentMap.Add(store.id)
+-	}
++		jmPinsByDir.Delete(store.dir)
++	}
++	m.pins.bind(m)
+ 	go m.cleanup()
+ 	return m
+ }
+--- a/pkg/meta/interface.go
++++ b/pkg/meta/interface.go
+@@ -63,6 +63,8 @@
+ 	JMMkdirInode = 1102
+ 	// JMReleaseInodes gives back unused reserved numbers (JuiceMount).
+ 	JMReleaseInodes = 1103
++	// JMPinCache fills and pins whole blocks of a file (JuiceMount patch 0026).
++	JMPinCache = 1105
+ )
+ 
+ const (
+--- a/pkg/vfs/internal.go
++++ b/pkg/vfs/internal.go
+@@ -541,6 +541,9 @@
+ 		w.Put64(uint64(first))
+ 		w.Put32(count)
+ 		_, _ = out.Write(w.Bytes())
++	case meta.JMPinCache:
++		// JuiceMount patch 0026 (jm_pin.go).
++		v.jmPinMsg(r, out)
+ 	case meta.JMReleaseInodes:
+ 		// JuiceMount patch 0022. Reply: errno (1 byte), released count (4).
+ 		first := Ino(r.Get64())

@@ -45,7 +45,7 @@ PATCH_FILES = {
     "patches/0023-batched-rename-reads.patch": ["pkg/meta/redis.go"],
     "patches/0024-small-upload-lane.patch": [
         "cmd/flags.go", "cmd/mount.go", "pkg/chunk/cached_store.go", "pkg/vfs/writer.go"],
-    "patches/0025-pinned-blocks.patch": [
+    "patches/0026-pinned-blocks.patch": [
         "pkg/chunk/disk_cache.go", "pkg/meta/interface.go", "pkg/vfs/internal.go"],
 }
 VERSION_PACKAGE = "github.com/juicedata/juicefs/pkg/version"

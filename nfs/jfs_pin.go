@@ -10,22 +10,27 @@ import (
 	"github.com/lelanddutcher/juicemount/internal/cache/pin"
 )
 
-// The JMPinCache control message of the bundled juicefs (patch 0025,
-// third_party/juicefs/pkg/vfs/jm_pin.go): fill and pin whole blocks.
+// The JMPinCache control message of the bundled juicefs (patch 0026,
+// third_party/juicefs/pkg/vfs/jm_pin.go): fill and pin whole blocks. The
+// numbers are copies of meta.JMPinCache and meta.JMPinOp*;
+// TestJFSPinConstantsMatchJuiceFS keeps them equal.
 const (
-	jfsMsgPinCache = 1104
+	jfsMsgPinCache = 1105
 
 	jfsPinOpStart  = 1
 	jfsPinOpStatus = 2
 	jfsPinOpCheck  = 3
 	jfsPinOpSweep  = 4
+	jfsPinOpCancel = 5
+	jfsPinOpVerify = 6
+	jfsPinOpSetCap = 7
 
-	// jfsPinSweepBatch bounds one sweep message (8 bytes per inode).
-	jfsPinSweepBatch = 4096
+	// jfsPinBatch bounds one VERIFY or SWEEP message (juicefs refuses more).
+	jfsPinBatch = 4096
 )
 
 // jfsPinTimeout bounds one pin exchange: every op is local to juicefs except
-// START's slice lookup, which runs in juicefs's background.
+// START, which reads the file's attributes when a fill already runs.
 const jfsPinTimeout = 20 * time.Second
 
 // JFSBlockPinner implements pin.BlockPinner over the mount's .control file.
@@ -40,8 +45,7 @@ func pinErrno(b byte) error {
 	switch e := syscall.Errno(b); e {
 	case 0:
 		return nil
-	case syscall.ENOTSUP, syscall.ENOSYS, syscall.EINVAL:
-		// EINVAL: a juicefs without patch 0025 answers an unknown message so.
+	case syscall.ENOTSUP, syscall.ENOSYS:
 		return pin.ErrBlockPinUnsupported
 	case syscall.ENOSPC:
 		return pin.ErrPinnedShareFull
@@ -50,11 +54,11 @@ func pinErrno(b byte) error {
 	}
 }
 
-func (b *JFSBlockPinner) op(op byte, body []byte, replyLen int) ([]byte, error) {
+func (b *JFSBlockPinner) op(op byte, body []byte, replyLen int, more func([]byte) int) ([]byte, error) {
 	msg := controlHeader(jfsMsgPinCache, 1+len(body))
 	msg = append(msg, op)
 	msg = append(msg, body...)
-	reply, err := b.c.exchangeReply(msg, replyLen, jfsPinTimeout, true)
+	reply, err := b.c.exchangeReply(msg, replyLen, jfsPinTimeout, true, more)
 	if err != nil {
 		return nil, err
 	}
@@ -70,13 +74,15 @@ func (b *JFSBlockPinner) op(op byte, body []byte, replyLen int) ([]byte, error) 
 	return reply, nil
 }
 
-func (b *JFSBlockPinner) Start(inode uint64) error {
-	_, err := b.op(jfsPinOpStart, binary.BigEndian.AppendUint64(nil, inode), 1)
+func u64(v uint64) []byte { return binary.BigEndian.AppendUint64(nil, v) }
+
+func (b *JFSBlockPinner) Start(inode uint64, workers int) error {
+	_, err := b.op(jfsPinOpStart, append(u64(inode), byte(min(max(workers, 1), 4))), 1, nil)
 	return err
 }
 
 func (b *JFSBlockPinner) Status(inode uint64) (pin.BlockFillStatus, error) {
-	r, err := b.op(jfsPinOpStatus, binary.BigEndian.AppendUint64(nil, inode), 27)
+	r, err := b.op(jfsPinOpStatus, u64(inode), 27, nil)
 	if err != nil {
 		return pin.BlockFillStatus{}, err
 	}
@@ -89,19 +95,58 @@ func (b *JFSBlockPinner) Status(inode uint64) (pin.BlockFillStatus, error) {
 	}, nil
 }
 
-func (b *JFSBlockPinner) Check(inode uint64) (bool, int64, int64, error) {
-	r, err := b.op(jfsPinOpCheck, binary.BigEndian.AppendUint64(nil, inode), 18)
-	if err != nil {
-		return false, 0, 0, err
+func (b *JFSBlockPinner) Cancel(inode uint64) error {
+	_, err := b.op(jfsPinOpCancel, u64(inode), 1, nil)
+	if errors.Is(err, syscall.ENOENT) {
+		return nil
 	}
-	return r[1] == 1, int64(binary.BigEndian.Uint64(r[2:])), int64(binary.BigEndian.Uint64(r[10:])), nil
+	return err
+}
+
+// Check is one owner's CHECK: known, pinned bytes, missing bytes, and the
+// length and mtime the fill saw. The guard uses Verify; Check is for tools.
+func (b *JFSBlockPinner) Check(inode uint64) (known bool, total, missing int64, attr pin.ExpectedFile, err error) {
+	r, err := b.op(jfsPinOpCheck, u64(inode), 34, nil)
+	if err != nil {
+		return false, 0, 0, attr, err
+	}
+	attr = pin.ExpectedFile{Inode: inode, Size: int64(binary.BigEndian.Uint64(r[18:])), MtimeNS: int64(binary.BigEndian.Uint64(r[26:]))}
+	return r[1] == 1, int64(binary.BigEndian.Uint64(r[2:])), int64(binary.BigEndian.Uint64(r[10:])), attr, nil
+}
+
+func (b *JFSBlockPinner) Verify(items []pin.PinVerifyItem) ([]pin.PinVerifyResult, error) {
+	var out []pin.PinVerifyResult
+	for start := 0; start < len(items); start += jfsPinBatch {
+		batch := items[start:min(start+jfsPinBatch, len(items))]
+		body := binary.BigEndian.AppendUint32(nil, uint32(len(batch)))
+		for _, it := range batch {
+			body = binary.BigEndian.AppendUint64(body, it.Inode)
+			body = binary.BigEndian.AppendUint64(body, uint64(it.Size))
+			body = binary.BigEndian.AppendUint64(body, uint64(it.MtimeNS))
+		}
+		r, err := b.op(jfsPinOpVerify, body, 5, func(r []byte) int {
+			return 5 + 17*int(binary.BigEndian.Uint32(r[1:5]))
+		})
+		if err != nil {
+			return nil, err
+		}
+		n := int(binary.BigEndian.Uint32(r[1:5]))
+		if len(r) < 5+17*n {
+			return nil, errors.New("juicefs pin: short verify reply")
+		}
+		for i := 0; i < n; i++ {
+			rec := r[5+17*i:]
+			out = append(out, pin.PinVerifyResult{Inode: binary.BigEndian.Uint64(rec), Reason: rec[8], Missing: int64(binary.BigEndian.Uint64(rec[9:]))})
+		}
+	}
+	return out, nil
 }
 
 func (b *JFSBlockPinner) Sweep(keep []uint64) (int, int64, int64, error) {
 	var dropped int
 	var pinned, limit int64
-	for start := 0; start == 0 || start < len(keep); start += jfsPinSweepBatch {
-		end := min(start+jfsPinSweepBatch, len(keep))
+	for start := 0; start == 0 || start < len(keep); start += jfsPinBatch {
+		end := min(start+jfsPinBatch, len(keep))
 		var phase byte
 		if start == 0 {
 			phase |= 1
@@ -114,7 +159,7 @@ func (b *JFSBlockPinner) Sweep(keep []uint64) (int, int64, int64, error) {
 		for _, ino := range keep[start:end] {
 			body = binary.BigEndian.AppendUint64(body, ino)
 		}
-		r, err := b.op(jfsPinOpSweep, body, 21)
+		r, err := b.op(jfsPinOpSweep, body, 21, nil)
 		if err != nil {
 			return 0, 0, 0, err
 		}
@@ -127,13 +172,32 @@ func (b *JFSBlockPinner) Sweep(keep []uint64) (int, int64, int64, error) {
 	return dropped, pinned, limit, nil
 }
 
-// ReadyInode returns the inode a Ready entry's witness recorded.
-func (p *OwnedPinProvider) ReadyInode(e pin.Entry) (uint64, bool) {
+func (b *JFSBlockPinner) SetCapacity(bytes int64) (int64, int64, int64, error) {
+	r, err := b.op(jfsPinOpSetCap, u64(uint64(max(bytes, 0))), 25, nil)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	return int64(binary.BigEndian.Uint64(r[1:])), int64(binary.BigEndian.Uint64(r[9:])), int64(binary.BigEndian.Uint64(r[17:])), nil
+}
+
+// PinIdentity returns the inode a Ready entry's witness recorded and the file
+// as the local mirror shows it now. No server access.
+func (p *OwnedPinProvider) PinIdentity(e pin.Entry) (uint64, pin.ExpectedFile, bool) {
 	var w pinWitness
 	if len(e.Authority) == 0 || json.Unmarshal(e.Authority, &w) != nil || w.Version != 1 || w.Inode == 0 {
-		return 0, false
+		return 0, pin.ExpectedFile{}, false
 	}
-	return w.Inode, true
+	name, ok := p.inMount(e.Path)
+	if !ok {
+		return 0, pin.ExpectedFile{}, false
+	}
+	id, found := p.h.store.LookupCachedFileIdentity(name)
+	if !found {
+		// Gone from the mirror: keep the witness so its pins are swept
+		// only when the pin itself goes.
+		return w.Inode, pin.ExpectedFile{Inode: w.Inode, Size: w.Size, MtimeNS: w.MtimeNS}, true
+	}
+	return w.Inode, pin.ExpectedFile{Inode: id.Inode, Size: id.Size, MtimeNS: id.MtimeNS}, true
 }
 
 var _ pin.BlockPinner = (*JFSBlockPinner)(nil)

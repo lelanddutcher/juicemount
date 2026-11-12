@@ -59,6 +59,9 @@ type Prefetcher struct {
 	// retries counts backoff retries of failed pins.
 	pinMu            sync.Mutex
 	pinner           BlockPinner
+	fillWorkers      func() int
+	capacityDir      string // the cache base dir CapacityLoop walks
+	bytesFetched     atomic.Int64 // downloaded by fills: the rate's input
 	inodes           map[string]inodeRec
 	retries          map[string]int
 	pinnedBlockBytes atomic.Int64
@@ -465,6 +468,9 @@ func (p *Prefetcher) CapacityLoop(ctx context.Context, interval time.Duration, c
 	// Compute once up front so the UI and the re-warm gate have a verdict
 	// before the first tick — otherwise a freshly-launched over-capacity mount
 	// would re-warm for a full interval before anyone noticed.
+	p.pinMu.Lock()
+	p.capacityDir = cacheBaseDir
+	p.pinMu.Unlock()
 	ComputeCapacity(p.store, cacheBaseDir)
 	tick := time.NewTicker(interval)
 	defer tick.Stop()
@@ -719,19 +725,30 @@ func (p *Prefetcher) prefetch(e Entry) (retErr error) {
 	filled := false
 	if b := p.blockPinner(); b != nil && want.Size > 0 {
 		p.rememberInode(e.Path, want.Inode)
-		var lastDone, lastSaved int64
-		lastSave := time.Now()
-		st, err := p.fillBlocks(p.ctx, b, want.Inode, func(st BlockFillStatus) {
-			if d := st.Done - lastDone; d > 0 {
-				p.bytesPrefetched.Add(d)
-				p.meter.add(time.Now(), p.bytesPrefetched.Load())
-				lastDone = st.Done
-			}
-			if st.Done != lastSaved && time.Since(lastSave) >= progressSaveEvery {
-				_, _ = p.store.UpdateProgress(e, min(st.Done, want.Size))
-				lastSaved, lastSave = st.Done, time.Now()
-			}
-		})
+		fill := func() (BlockFillStatus, error) {
+			var lastDone, lastFetched, lastSaved int64
+			lastSave := time.Now()
+			return p.fillBlocks(p.ctx, b, want.Inode, func(st BlockFillStatus) {
+				if d := st.Done - lastDone; d > 0 {
+					p.bytesPrefetched.Add(d)
+					lastDone = st.Done
+				}
+				if d := st.Fetched - lastFetched; d > 0 {
+					p.meter.add(time.Now(), p.bytesFetched.Add(d))
+					lastFetched = st.Fetched
+				}
+				if st.Done != lastSaved && time.Since(lastSave) >= progressSaveEvery {
+					_, _ = p.store.UpdateProgress(e, min(st.Done, want.Size))
+					lastSaved, lastSave = st.Done, time.Now()
+				}
+			}, func() bool { return p.entryCurrent(e) })
+		}
+		st, err := fill()
+		// Past the cap: grow the cache for the whole pinned set once, then
+		// try again (juicefs still refuses what the disk cannot hold).
+		if errors.Is(err, ErrPinnedShareFull) && p.growCacheFor(b) {
+			st, err = fill()
+		}
 		switch {
 		case err == nil:
 			filled = true

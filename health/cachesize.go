@@ -1,6 +1,10 @@
 package health
 
-import "fmt"
+import (
+	"fmt"
+
+	"github.com/lelanddutcher/juicemount/internal/cache/pin"
+)
 
 // Cache-size resolution, extracted from FUSEManager.Mount so the policy can be
 // tested without a live juicefs binary, a real mount, or a particular disk.
@@ -174,9 +178,12 @@ func resolveCacheSizeMiB(configuredMiB, pinnedBytes, totalBytes int64) (effectiv
 	// (1)+(2) Respect the configured size; grow it only as far as needed to keep
 	// the pinned set resident, so a large pinned project cannot LRU-evict blocks
 	// the user already paid to download.
+	// Pinned blocks may hold at most 90% of the cache (bundled juicefs patch
+	// 0026), so the cache must be pinned/0.9 plus block overhead plus a margin
+	// for ordinary reads, not just the pinned bytes.
 	desired := configuredBytes
-	if pinnedBytes > desired {
-		desired = pinnedBytes
+	if need := pin.CacheBytesForPins(pinnedBytes); need > desired {
+		desired = need
 	}
 
 	// (3) Never size the cache above (total - floor).

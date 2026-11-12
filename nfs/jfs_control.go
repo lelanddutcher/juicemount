@@ -68,13 +68,14 @@ func (c *jfsControl) exchange(msg []byte, replyLen int) ([]byte, error) {
 }
 
 func (c *jfsControl) exchangeWithin(msg []byte, replyLen int, timeout time.Duration) ([]byte, error) {
-	return c.exchangeReply(msg, replyLen, timeout, false)
+	return c.exchangeReply(msg, replyLen, timeout, false, nil)
 }
 
 // exchangeReply with errnoFirst ends the reply after a nonzero first byte:
-// the errno-first replies of patch 0025, and the 1-byte EINVAL of a juicefs
-// that does not know the message.
-func (c *jfsControl) exchangeReply(msg []byte, replyLen int, timeout time.Duration, errnoFirst bool) ([]byte, error) {
+// the errno-first replies of patch 0026, and the 1-byte EINVAL of a juicefs
+// that does not know the message. more, when set, returns the whole reply's
+// length from the part read so far (a count in a header).
+func (c *jfsControl) exchangeReply(msg []byte, replyLen int, timeout time.Duration, errnoFirst bool, more func([]byte) int) ([]byte, error) {
 	if c.testExchange != nil {
 		return c.testExchange(msg, replyLen)
 	}
@@ -107,6 +108,12 @@ func (c *jfsControl) exchangeReply(msg []byte, replyLen int, timeout time.Durati
 		reply = append(reply, buf[:n]...)
 		if errnoFirst && len(reply) > 0 && reply[0] != 0 {
 			return reply[:1], nil
+		}
+		if more != nil && len(reply) == replyLen {
+			if want := more(reply); want > replyLen {
+				replyLen = want
+				buf = make([]byte, replyLen)
+			}
 		}
 		if n > 0 {
 			continue
