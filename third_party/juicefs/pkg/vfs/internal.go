@@ -573,6 +573,9 @@ func (v *VFS) handleInternalMsg(ctx meta.Context, cmd uint32, r *utils.Buffer, o
 			}
 		}
 		_, _ = out.Write([]byte{uint8(eno)})
+	case meta.JMCreateFiles:
+		// JuiceMount patch 0025 (jm_create_files.go).
+		v.jmHandleCreateFiles(ctx, r, out)
 	case meta.CompactPath:
 		inode := Ino(r.Get64())
 		coCnt := r.Get16()

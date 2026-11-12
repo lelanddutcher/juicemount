@@ -1,0 +1,24 @@
+--- a/pkg/meta/interface.go
++++ b/pkg/meta/interface.go
+@@ -63,6 +63,9 @@
+ 	JMMkdirInode = 1102
+ 	// JMReleaseInodes gives back unused reserved numbers (JuiceMount).
+ 	JMReleaseInodes = 1103
++	// JMCreateFiles creates small files, each complete in one transaction
++	// (JuiceMount patch 0025, pkg/vfs/jm_create_files.go).
++	JMCreateFiles = 1104
+ )
+ 
+ const (
+--- a/pkg/vfs/internal.go
++++ b/pkg/vfs/internal.go
+@@ -573,6 +573,9 @@
+ 			}
+ 		}
+ 		_, _ = out.Write([]byte{uint8(eno)})
++	case meta.JMCreateFiles:
++		// JuiceMount patch 0025 (jm_create_files.go).
++		v.jmHandleCreateFiles(ctx, r, out)
+ 	case meta.CompactPath:
+ 		inode := Ino(r.Get64())
+ 		coCnt := r.Get16()
