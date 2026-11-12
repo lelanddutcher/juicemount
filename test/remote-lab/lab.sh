@@ -107,7 +107,7 @@ format_volume() {
     log "volume already formatted"
     return 0
   fi
-  local _ enc=()
+  local _ fmtargs=()
   # JMLAB_ENCRYPT=1: an encrypted volume (aes256gcm-rsa) with a throwaway
   # RSA key in the state directory, which the client sees under /lab.
   if [ "${JMLAB_ENCRYPT:-0}" = 1 ]; then
@@ -115,13 +115,21 @@ format_volume() {
     [ -f "$STATE/encrypt.pem" ] || (umask 077 && openssl genrsa -out "$STATE/encrypt.pem" 2048 2>/dev/null) \
       || die "openssl genrsa failed"
     chmod 644 "$STATE/encrypt.pem" # read by the client container's root; .state itself is 700
-    enc=(--encrypt-rsa-key "/lab/$STATE_NAME/encrypt.pem")
+    fmtargs=(--encrypt-rsa-key "/lab/$STATE_NAME/encrypt.pem")
     log "formatting an encrypted volume"
+  fi
+  # JMLAB_BLOCK_SIZE: the JuiceFS block size in KiB (default 4096). An
+  # encrypted volume fetches a whole block per cold read, so this sets the
+  # first-byte cost on a slow link.
+  if [ -n "${JMLAB_BLOCK_SIZE:-}" ]; then
+    case "$JMLAB_BLOCK_SIZE" in *[!0-9]*) die "JMLAB_BLOCK_SIZE is a size in KiB" ;; esac
+    fmtargs+=(--block-size "$JMLAB_BLOCK_SIZE")
+    log "block size ${JMLAB_BLOCK_SIZE} KiB"
   fi
   for _ in $(seq 30); do
     if dc exec -T -e ACCESS_KEY="$(env_get JMLAB_S3_USER)" -e SECRET_KEY="$(env_get JMLAB_S3_PASSWORD)" client \
          juicefs format --storage minio --bucket "http://$SILO_IP:9000/jmlab" --trash-days 0 \
-         "${enc[@]}" --no-update "$META_URL" jmlab >/dev/null 2>"$STATE/format.err"; then
+         "${fmtargs[@]}" --no-update "$META_URL" jmlab >/dev/null 2>"$STATE/format.err"; then
       log "volume formatted"
       return 0
     fi

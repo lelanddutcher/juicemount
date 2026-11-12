@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/lelanddutcher/juicemount/internal/appisolation"
@@ -132,8 +133,9 @@ return redis.call('GET', KEYS[1])`, []string{"setting"}).Text()
 		return VolumeBinding{}, fmt.Errorf("observe cache volume: %w", classifyVolumeError(err))
 	}
 	var format struct {
-		UUID      string
-		BlockSize int64
+		UUID       string
+		BlockSize  int64
+		EncryptKey string // only its presence is kept; never logged
 	}
 	if json.Unmarshal([]byte(raw), &format) != nil || format.BlockSize > 16384 || format.BlockSize < 64 {
 		return VolumeBinding{}, ErrVolumeBinding
@@ -142,7 +144,29 @@ return redis.call('GET', KEYS[1])`, []string{"setting"}).Text()
 	if !binding.valid() {
 		return VolumeBinding{}, ErrVolumeBinding
 	}
+	observedShape.Store(&VolumeShape{BlockSize: binding.BlockSize, Encrypted: format.EncryptKey != ""})
 	return binding, nil
+}
+
+// VolumeShape says how the online volume's objects are fetched. It is kept
+// apart from VolumeBinding on purpose: the binding is persisted and compared
+// for equality, and a new field there would refuse every saved binding.
+type VolumeShape struct {
+	BlockSize int64 // bytes
+	// Encrypted volumes seal each block as one AES-GCM unit, so a read of
+	// any byte fetches the whole block: no ranged GETs.
+	Encrypted bool
+}
+
+var observedShape atomic.Pointer[VolumeShape]
+
+// ObservedVolumeShape returns the shape of the volume last read by a
+// qualification (or ReadVolumeBinding), or false before the first one.
+func ObservedVolumeShape() (VolumeShape, bool) {
+	if s := observedShape.Load(); s != nil {
+		return *s, true
+	}
+	return VolumeShape{}, false
 }
 
 // SaveVolumeBinding records a qualified online observation without overwriting

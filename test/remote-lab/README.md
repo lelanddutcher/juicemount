@@ -146,6 +146,9 @@ when the lab is set up (`./lab.sh up` or `./measure.py`). The lab then
 formats the volume with a throwaway RSA key in `.state/encrypt.pem`, which
 `./lab.sh down` deletes with the rest of `.state`.
 
+To format the volume with another block size, set `JMLAB_BLOCK_SIZE` in KiB
+(for example `JMLAB_BLOCK_SIZE=1024`). The default is JuiceFS's 4096.
+
 ## Server BBR
 
 `./measure.py --bbr` (or `JMLAB_BBR=1 ./lab.sh up`) sets the lab up with
