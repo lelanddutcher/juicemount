@@ -97,7 +97,7 @@ type JuiceFSPolicy struct {
 // live server ReadaheadManager is solely responsible for scaling up on a
 // measured fast link.
 func (p *Profile) JuiceFS() JuiceFSPolicy {
-	switch p.Class() {
+	switch p.ReadPolicyClass() {
 	case ClassMetered:
 		// Minimize readahead + metered-data waste AND bound the shutdown/remount
 		// FlushAll (2026-07-10: a correctly-classified 1 GB slow-class buffer took
@@ -148,9 +148,11 @@ type Snapshot struct {
 	ThroughputN     int64 // count of throughput samples folded in
 	BootstrappedRTT bool  // class derived from RTT (no BW yet)
 	// LowBandwidth is true when the measured throughput is under the metered
-	// threshold, whatever the class. On a far link it is the only trace of that
-	// measurement: the class stays slow (see classLocked).
+	// threshold, whatever the class. On a far link the class stays slow (see
+	// classLocked) and ReadClass is metered.
 	LowBandwidth bool
+	// ReadClass is ReadPolicyClass: the class read-ahead and prefetch use.
+	ReadClass LinkClass
 }
 
 // classification thresholds (bytes/sec). Overridable via env for field tuning.
@@ -568,7 +570,9 @@ func (p *Profile) classLocked() (LinkClass, bool) {
 			// FUSE data gate went from width 8 to 2, the drain kept one
 			// slot, and 2 of 201 saved files reached the server in
 			// 10 minutes (148 before). So a far link stays slow and
-			// reports LowBandwidth. JM_NET_SLOW_RTT_FLOOR=0 restores the
+			// reports LowBandwidth, for the drain and the gate width.
+			// Speculative downloads still follow the metered policy:
+			// see ReadPolicyClass. JM_NET_SLOW_RTT_FLOOR=0 restores the
 			// throughput-only metered rule.
 			if p.highLatency && slowRTTFloorEnabled() {
 				byBW = ClassSlow
@@ -633,10 +637,40 @@ func (p *Profile) Class() LinkClass {
 	return c
 }
 
+// ReadPolicyClass is the class that decides how much the app may download
+// speculatively (read-ahead, JuiceFS prefetch). It is Class(), except on a
+// link the slow-RTT floor kept at ClassSlow (far, measured under 3 MiB/s, no
+// cost signal): there it is ClassMetered.
+//
+// The floor exists so the DRAIN and the FUSE gate width are not cut on a far
+// link. It must not open speculative downloads on a link that may still cost
+// money: cellular without the host's expensive flag (an Android or MiFi
+// hotspot, a cellular router, in-flight Wi-Fi) is also far and thin, typically
+// 60-150 ms at about 1 MiB/s, and the throughput rule was its only protection.
+// So a far, thin link keeps the metered read policy (one worker, one block,
+// prefetch 0) and the slow drain and gate width.
+func (p *Profile) ReadPolicyClass() LinkClass {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	c, _ := p.classLocked()
+	if c == ClassSlow && p.slowRTTFloorAppliedLocked() {
+		return ClassMetered
+	}
+	return c
+}
+
+// slowRTTFloorAppliedLocked reports whether automatic classification would be
+// ClassMetered by throughput but the slow-RTT floor kept it at ClassSlow.
+// Explicit force and the host cost class decide the class themselves.
+func (p *Profile) slowRTTFloorAppliedLocked() bool {
+	return p.forcedClass == nil && p.networkCostClass == nil &&
+		p.haveBW && p.bwBps < thrMeteredBps && p.highLatency && slowRTTFloorEnabled()
+}
+
 // Readahead maps the current class to concrete prefetch policy. ClassMedium is
 // byte-for-byte the historical default; nothing regresses on a normal LAN.
 func (p *Profile) Readahead() ReadaheadPolicy {
-	switch p.Class() {
+	switch p.ReadPolicyClass() {
 	case ClassMetered:
 		// Cellular / weak / metered: keep exactly one bounded 4 MiB block in
 		// flight after a strong sequential signal. Disabling this layer entirely
@@ -669,6 +703,10 @@ func (p *Profile) Snapshot() Snapshot {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	c, boot := p.classLocked()
+	readClass := c
+	if c == ClassSlow && p.slowRTTFloorAppliedLocked() {
+		readClass = ClassMetered
+	}
 	return Snapshot{
 		Class:           c,
 		RTT:             p.rtt,
@@ -678,6 +716,7 @@ func (p *Profile) Snapshot() Snapshot {
 		ThroughputN:     p.bwSamples,
 		BootstrappedRTT: boot,
 		LowBandwidth:    p.haveBW && p.bwBps < thrMeteredBps,
+		ReadClass:       readClass,
 	}
 }
 

@@ -216,7 +216,7 @@ func releaseBackgroundFUSEData() {
 }
 
 // fuseReserveInFlight counts drainer small-lane reserve slots in flight
-// (Drainer.trySmallReserveFUSESlot, one per drainer). They are part of
+// (Drainer.trySmallReserveFUSESlot, at most smallReserveSlots per drainer). They are part of
 // fuseDataInFlight and fuseBackgroundInFlight, so the base ceiling and
 // foreground admission see them as background; shared background admission
 // (tryAdmitFUSEData) leaves them out. A reserve slot is added to the total
@@ -224,11 +224,28 @@ func releaseBackgroundFUSEData() {
 // the total, so a race only overstates the shared share and refuses.
 var fuseReserveInFlight atomic.Int64
 
-// admitReserveFUSEData admits one small-lane reserve slot while everything in
-// flight is below the base ceiling (the panic-derived limit, 16 by default).
+// admitReserveFUSEData admits one small-lane reserve slot below the base
+// ceiling (the panic-derived limit, 16 by default), and only while foreground
+// reads could still reach their full class width beside it. Without that
+// second rule a reserve slot could take the last slot under the ceiling: on a
+// medium or fast link the foreground width IS the ceiling, so with 15
+// foreground reads in flight the 16th was refused (JUKEBOX, and macOS backs
+// off for up to 30 s). So on medium and fast links the reserve never admits;
+// there the background share is 8 and the small lane does not need it. On
+// slow (width 8) and metered (width 2) links it admits while
+// ceiling - inFlight > width - foregroundInFlight.
 func admitReserveFUSEData() bool {
-	if !tryAdmitBelowCeiling(int64(fuseDataGateWidth())) {
-		return false
+	ceiling := int64(fuseDataGateWidth())
+	width := effectiveFUSEDataWidth()
+	for {
+		cur := fuseDataInFlight.Load()
+		fg := cur - fuseBackgroundInFlight.Load()
+		if cur >= ceiling || ceiling-cur <= width-fg {
+			return false
+		}
+		if fuseDataInFlight.CompareAndSwap(cur, cur+1) {
+			break
+		}
 	}
 	fuseBackgroundInFlight.Add(1)
 	fuseReserveInFlight.Add(1)
@@ -239,20 +256,6 @@ func releaseReserveFUSEData() {
 	fuseReserveInFlight.Add(-1)
 	fuseBackgroundInFlight.Add(-1)
 	fuseDataInFlight.Add(-1)
-}
-
-// tryAdmitBelowCeiling admits one syscall while everything in flight, the
-// reserve included, is below ceiling.
-func tryAdmitBelowCeiling(ceiling int64) bool {
-	for {
-		cur := fuseDataInFlight.Load()
-		if cur >= ceiling {
-			return false
-		}
-		if fuseDataInFlight.CompareAndSwap(cur, cur+1) {
-			return true
-		}
-	}
 }
 
 // fuseDataGateDepth reports occupancy and the current ceiling, for /metrics and

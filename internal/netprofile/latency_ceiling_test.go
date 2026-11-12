@@ -121,6 +121,27 @@ func TestLatencyCeiling_NeverRelaxesMetered(t *testing.T) {
 	}
 }
 
+// The original form of the test above, without a cost flag: a 300 ms,
+// 1 MB/s link. The ceiling still never relaxes its READ policy: the class is
+// slow (the slow-RTT floor, for the drain), and speculative reads stay
+// metered.
+func TestLatencyCeiling_NeverRelaxesThinFarReadPolicy(t *testing.T) {
+	t.Setenv("JM_NET_LATENCY_CEILING", "")
+	t.Setenv("JM_NET_SLOW_RTT_FLOOR", "")
+	p := New()
+	p.ObserveRTT(300 * time.Millisecond)
+	p.mu.Lock()
+	p.bwBps = 1 * 1024 * 1024
+	p.haveBW = true
+	p.mu.Unlock()
+	if got := p.ReadPolicyClass(); got != ClassMetered {
+		t.Fatalf("ReadPolicyClass() = %v, want metered", got)
+	}
+	if ra := p.Readahead(); ra.Workers != 1 || ra.ParallelFetch {
+		t.Fatalf("readahead %+v, want metered", ra)
+	}
+}
+
 // The 2026-11-11 laptop lab: a far link (200 ms) classed slow by its RTT went
 // metered after one cold read measured under 3 MiB/s, and the drain lost its
 // slots. Low throughput on a far link is distance, not cost: it stays slow and
@@ -138,8 +159,51 @@ func TestSlowRTTLinkWithSlowReadStaysSlow(t *testing.T) {
 	if snap.Class != ClassSlow {
 		t.Fatalf("far link after a slow read: class %v, want slow (bwBps=%.0f)", snap.Class, snap.BytesPerSec)
 	}
-	if !snap.HaveBW || !snap.LowBandwidth {
-		t.Fatalf("snapshot %+v: want the low-bandwidth measurement kept", snap)
+	if !snap.HaveBW || !snap.LowBandwidth || snap.ReadClass != ClassMetered {
+		t.Fatalf("snapshot %+v: want the low-bandwidth measurement kept and the metered read class", snap)
+	}
+}
+
+// Review H1/M2: a far, thin link without a cost flag may be unflagged
+// cellular (Android or MiFi hotspot, a cellular router, in-flight Wi-Fi),
+// typically 60-150 ms at about 1 MiB/s. Its class stays slow for the drain,
+// but speculative downloads keep the METERED policy: one read-ahead worker,
+// one block, no parallel fetch, JuiceFS prefetch 0.
+func TestUnflaggedThinFarLinkKeepsMeteredReadPolicy(t *testing.T) {
+	t.Setenv("JM_NET_LATENCY_CEILING", "")
+	t.Setenv("JM_NET_SLOW_RTT_FLOOR", "")
+	for _, rtt := range []time.Duration{45, 60, 90, 120, 150} {
+		rtt := rtt * time.Millisecond
+		t.Run(rtt.String(), func(t *testing.T) {
+			p := New()
+			p.ObserveRTT(rtt)
+			sampleFor(p, 1*1024*1024, 8)
+			if got := p.Class(); got != ClassSlow {
+				t.Fatalf("class %v, want slow (the drain's class)", got)
+			}
+			if got := p.ReadPolicyClass(); got != ClassMetered {
+				t.Fatalf("read policy class %v, want metered", got)
+			}
+			ra := p.Readahead()
+			if ra.Workers != 1 || ra.Blocks != 1 || ra.ParallelFetch || ra.SeqThreshold != 6 {
+				t.Fatalf("readahead %+v, want the metered policy", ra)
+			}
+			if jp := p.JuiceFS(); jp.Prefetch != 0 || jp.BufferSizeMB != 256 {
+				t.Fatalf("juicefs %+v, want the metered policy (prefetch 0)", jp)
+			}
+		})
+	}
+}
+
+// A far link with enough bandwidth keeps the slow read policy: the read class
+// follows the floor only while the link is thin.
+func TestFarLinkWithBandwidthKeepsSlowReadPolicy(t *testing.T) {
+	t.Setenv("JM_NET_LATENCY_CEILING", "")
+	p := New()
+	p.ObserveRTT(200 * time.Millisecond)
+	sampleFor(p, 8*1024*1024, 8)
+	if p.Class() != ClassSlow || p.ReadPolicyClass() != ClassSlow {
+		t.Fatalf("class %v read %v, want slow/slow", p.Class(), p.ReadPolicyClass())
 	}
 	if ra := p.Readahead(); ra.Workers != 4 || !ra.ParallelFetch {
 		t.Fatalf("readahead %+v: want the slow policy", ra)

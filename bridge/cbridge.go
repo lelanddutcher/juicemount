@@ -2954,6 +2954,7 @@ func nfsServerStartSerialized(configJSON *C.char, recovery *servingDesiredRecord
 			ThroughputN:          s.ThroughputN,
 			BootstrappedRTT:      s.BootstrappedRTT,
 			LowBandwidth:         s.LowBandwidth,
+			ReadClass:            s.ReadClass.String(),
 			Simulated:            fakeLink != nil,
 			FakeProfile:          fakeProfile,
 			FUSEContentReadGuard: testguard.RefuseFUSEContentReads(),

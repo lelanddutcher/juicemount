@@ -159,7 +159,7 @@ type Drainer struct {
 	onPendingDirNameTaken     func(string) (string, error) // spooled_mkdir.go
 	mediaGateWaiters          atomic.Int32                 // media-lane drains waiting for a gate slot
 	mediaGateHeld             atomic.Int32                 // media-lane drains holding a gate slot
-	smallReserveHeld          atomic.Int32                 // 1 while a small-lane drain holds the reserved slot
+	smallReserveHeld          atomic.Int32                 // small-lane drains holding a reserved slot
 	onDrainEffects            func(metadata.DrainCommitItem, metadata.DrainCommitResult, *os.File, []byte) error
 	onDrainSucceeded          func(string)
 	onBatchDrainCompleteExact func([]metadata.DrainCommitItem) ([]metadata.DrainCommitResult, error)
@@ -1305,7 +1305,7 @@ func (d *Drainer) smallYieldsToMedia() bool {
 // render needs about 75 minutes, so for that time a .prproj save existed only
 // on the laptop.
 //
-// The reserve is one slot, held by at most one small drain. It is counted as
+// The reserve is smallReserveSlots slots (1, or 2 on a metered link). It is counted as
 // background, so foreground admission (counted apart, acquireFUSEData) never
 // sees it, and it is left out of the shared background share
 // (fuseReserveInFlight), so it never takes a media drain's or read-ahead's
@@ -1315,24 +1315,54 @@ func (d *Drainer) smallYieldsToMedia() bool {
 // adds no bulk upload to a metered uplink. Small drains try the shared share
 // first and use the reserve only when it is refused, or while they yield the
 // shared share to a waiting media drain (smallYieldsToMedia).
+//
+// A WEDGED small drain holds its reserve slot until its FUSE call returns:
+// the macFUSE daemon timeout, or the drain's own copy deadline. Until then the
+// small lane has one reserve slot fewer (none, with one slot). That is the
+// same bound every gate holder has; the reserve adds no new way to leak.
 func (d *Drainer) trySmallReserveFUSESlot() (release func(), ok bool) {
 	if !fuseDataGateEnabled {
 		return func() {}, true
 	}
-	if !d.smallReserveHeld.CompareAndSwap(0, 1) {
-		return nil, false
+	limit := smallReserveSlots()
+	for {
+		held := d.smallReserveHeld.Load()
+		if held >= limit {
+			return nil, false
+		}
+		if d.smallReserveHeld.CompareAndSwap(held, held+1) {
+			break
+		}
 	}
 	if !admitReserveFUSEData() {
-		d.smallReserveHeld.Store(0)
+		d.smallReserveHeld.Add(-1)
 		return nil, false
 	}
 	var once sync.Once
 	return func() {
 		once.Do(func() {
 			releaseReserveFUSEData()
-			d.smallReserveHeld.Store(0)
+			d.smallReserveHeld.Add(-1)
 		})
 	}, true
+}
+
+// smallReserveSlots is how many reserve slots the small lane may hold at
+// once. On a metered link the shared background share is 1, which a large
+// file's upload holds, so the reserve is all the small lane has: 2 there,
+// 1 elsewhere (a slow link's shared share is 4). Small rows are at most
+// smallBytes (1 MiB by default), so 2 adds no bulk transfer.
+// JM_DRAIN_SMALL_RESERVE sets it (0 turns the reserve off).
+func smallReserveSlots() int32 {
+	if v := os.Getenv("JM_DRAIN_SMALL_RESERVE"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 && n <= 4 {
+			return int32(n)
+		}
+	}
+	if netprofile.Default().Class() == netprofile.ClassMetered {
+		return 2
+	}
+	return 1
 }
 
 func (d *Drainer) acquireDrainFUSESlotFor(small bool) (release func(), ok bool) {
