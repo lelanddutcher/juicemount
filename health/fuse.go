@@ -1156,7 +1156,9 @@ func (fm *FUSEManager) MountWithReceipt() (*MountReceipt, error) {
 	// blocks need cellular-safe deadlines. Append these before starting JuiceFS
 	// so the very first spool drain cannot inherit a guaranteed 60-second PUT
 	// timeout/retry loop.
-	args = append(args, desktopJuiceFSObjectIOArgs(netprofile.Default().Class())...)
+	// ReadPolicyClass, like jfp: a far, thin link (slow class by the slow-RTT
+	// floor) keeps the metered object deadlines a thin uplink needs.
+	args = append(args, desktopJuiceFSObjectIOArgs(netprofile.Default().ReadPolicyClass())...)
 	args = append(args, desktopJuiceFSDemandFirstArgs(netprofile.Default().Class())...)
 	// A JuiceFS session expires at five heartbeat intervals. The upstream
 	// 12s default therefore lets another always-on client reap this Mac

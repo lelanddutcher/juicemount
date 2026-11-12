@@ -57,8 +57,17 @@ func TestLinkDataPlaneSampleSelectsCellularPolicyBeforeMount(t *testing.T) {
 	if !snap.HaveRTT || !snap.HaveBW {
 		t.Fatalf("startup Link sample did not fully measure profile: %+v", snap)
 	}
-	if snap.Class != netprofile.ClassMetered {
-		t.Fatalf("2 Mbps / 300 ms Link class = %s, want metered", snap.Class)
+	// A 300 ms link is far, so the slow-RTT floor keeps its class slow for the
+	// drain and the FUSE gate width. Every policy chosen before mount that
+	// downloads speculatively or sizes JuiceFS (read-ahead, --buffer-size,
+	// --prefetch, the object deadlines) follows the read-policy class, which
+	// stays metered: unflagged cellular keeps the cellular policy.
+	if snap.Class != netprofile.ClassSlow || snap.ReadClass != netprofile.ClassMetered || !snap.LowBandwidth {
+		t.Fatalf("2 Mbps / 300 ms Link: class %s read class %s low %v, want slow / metered / true",
+			snap.Class, snap.ReadClass, snap.LowBandwidth)
+	}
+	if got := p.ReadPolicyClass(); got != netprofile.ClassMetered {
+		t.Fatalf("2 Mbps / 300 ms Link read policy class = %s, want metered", got)
 	}
 	if got := p.Readahead(); !got.Enabled || got.SeqThreshold != 6 || got.Blocks != 1 || got.Workers != 1 {
 		t.Fatalf("metered read-ahead = %+v, want guarded enabled 1-block/1-worker", got)
