@@ -1597,13 +1597,12 @@ func (d *Drainer) drainOne(row *metadata.SpoolRow) {
 	// H-8: an existing destination is rewritten in place (inode kept); a new
 	// name is copied to a private O_EXCL stage. The decision, the claim
 	// recheck and the in-place open run under the namespace lease.
-	tgt, ok := d.openDrainTarget(row, dest, lease)
+	tgt, ok := d.openDrainTarget(row, dest, lease, spoolMtime)
 	if !ok {
 		return
 	}
 	if tgt.adoptIno != 0 {
-		// The bytes are this save's; an in-place attempt that wrote them may
-		// not have set the time yet (as the stage path, after the write).
+		// openDrainTarget already set the time, under the lease.
 		data, _, ok := d.directReadSpool(row, src)
 		if !ok {
 			return
@@ -1611,9 +1610,6 @@ func (d *Drainer) drainOne(row *metadata.SpoolRow) {
 		mtime := spoolMtime
 		if mtime.IsZero() {
 			mtime = time.Now()
-		} else if err := os.Chtimes(dest, mtime, mtime); err != nil {
-			d.failTransient(row, fmt.Errorf("chtimes adopted file: %w", err))
-			return
 		}
 		d.finishPublished(row, dest, tgt.adoptIno, tgt.adoptDev, mtime, data, ph)
 		return

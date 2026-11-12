@@ -546,7 +546,9 @@ func (d *Drainer) directAdoptTarget(row *metadata.SpoolRow, dest string, base me
 	}
 	switch {
 	case base.Kind == metadata.SpoolBaseClaimed && uint64(st.Ino) == base.Ino:
-	case base.Kind == metadata.SpoolBaseAbsent && !tainted:
+	case base.Kind == metadata.SpoolBaseAbsent && !tainted && row.Size > 0:
+		// Exactly these bytes at a name that was free. Not for an empty file:
+		// every empty file matches, so another writer's would be taken as ours.
 	default:
 		return false
 	}

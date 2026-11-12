@@ -53,6 +53,13 @@ type JMNewFile struct {
 	taken                 bool // PreIno was taken from the reservations
 }
 
+// RecognizedEarlierSend reports that the name already held this file's own
+// inode from an earlier call (PreIno was no longer reserved) and nothing was
+// written. That earlier call linked its own upload, so the object uploaded
+// for this call is unreferenced. A number taken in this call is never
+// reported: a retried transaction may have linked this call's own object.
+func (f *JMNewFile) RecognizedEarlierSend() bool { return f.recognize && f.recognized }
+
 // jmCreateFileEngine is implemented by the engines that support
 // JMCreateFilesIn (Redis only). It writes every file whose Errno is 0 and
 // whose name is free in one transaction, sets EEXIST on the others (success,

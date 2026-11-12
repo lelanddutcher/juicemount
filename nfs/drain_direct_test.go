@@ -605,6 +605,48 @@ func TestDrainDirectLateCommitIdenticalBytesAdopted(t *testing.T) {
 	}
 }
 
+// Re-review MEDIUM-1: an adopted file gets the spool's time inside the
+// install lease (openDrainTarget), not later by path, where an app save that
+// took the name after the lease ended would get this older row's time.
+func TestDrainDirectAdoptSetsTimeUnderLease(t *testing.T) {
+	fixConflictClock(t)
+	spool, d := newTestDrainer(t, DrainerConfig{})
+	withFakeCreateFiles(t, d)
+	d.dirInodes = nil
+	const name = "/proj/adopt-time.xmp"
+	dest := filepath.Join(d.fuseRoot, name)
+	payload := patternedPayload(3000, 9)
+	e := writeSpoolEntry(t, spool, name, payload)
+	want := time.Unix(1700000000, 123456789)
+	if err := os.Chtimes(e.SpoolFilePath(), want, want); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dest, payload, 0o644); err != nil { // a late commit
+		t.Fatal(err)
+	}
+	old := time.Unix(1000000000, 0)
+	if err := os.Chtimes(dest, old, old); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := spool.Meta().MarkDraining(e.ID()); err != nil || !ok {
+		t.Fatalf("claim row: %v, %v", ok, err)
+	}
+	tgt, ok := d.openDrainTarget(mustRow(t, spool, e.ID()), dest, leaseDecision{}, want)
+	if !ok || tgt == nil || tgt.adoptIno == 0 {
+		t.Fatalf("not adopted: ok=%v target=%+v", ok, tgt)
+	}
+	fi, err := os.Stat(dest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !fi.ModTime().Equal(want) {
+		t.Fatalf("adopted file time %v, want %v (set before the lease ends)", fi.ModTime(), want)
+	}
+}
+
 // The name appears after the base decision and holds the number this row
 // sent: juicefs's EEXIST is about our own earlier send, not a conflict.
 func TestDrainDirectEEXISTOwnReservedInode(t *testing.T) {

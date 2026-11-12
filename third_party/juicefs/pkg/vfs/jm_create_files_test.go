@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/juicedata/juicefs/pkg/meta"
+	"github.com/juicedata/juicefs/pkg/object"
 	"github.com/juicedata/juicefs/pkg/utils"
 )
 
@@ -75,6 +76,12 @@ func jmSend(t *testing.T, v *VFS, body []byte) jmReply {
 
 func jmRedisVFS(t *testing.T) *VFS {
 	t.Helper()
+	v, _ := jmRedisVFSBlob(t)
+	return v
+}
+
+func jmRedisVFSBlob(t *testing.T) (*VFS, object.ObjectStorage) {
+	t.Helper()
 	u := os.Getenv("JM_WATCH_BATCH_TEST_REDIS_URL")
 	if u == "" {
 		t.Skip("set JM_WATCH_BATCH_TEST_REDIS_URL to a disposable Redis database of its own (it is flushed)")
@@ -86,8 +93,16 @@ func jmRedisVFS(t *testing.T) *VFS {
 	if err := m.Reset(); err != nil {
 		t.Fatal(err)
 	}
-	v, _ := createTestVFS(nil, u)
-	return v
+	return createTestVFS(nil, u)
+}
+
+func jmCountObjects(t *testing.T, blob object.ObjectStorage) int {
+	t.Helper()
+	objs, _, _, err := blob.List("", "", "", "", 1000, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return len(objs)
 }
 
 func jmReadAll(t *testing.T, v *VFS, parent meta.Ino, name string) ([]byte, *meta.Attr) {
@@ -252,6 +267,37 @@ func TestJMCreateFilesReservedInode(t *testing.T) {
 	}
 	if data, attr := jmReadAll(t, v, 1, "reserved.xmp"); string(data) != "mine" || attr.Length != 4 {
 		t.Fatalf("read %q", data)
+	}
+}
+
+// Resends that write nothing leave no object behind: a recognised resend
+// (its object is not the one the file holds), an unknown number (ESRCH) and
+// a number another create holds (EAGAIN).
+func TestJMCreateFilesResendLeavesNoObject(t *testing.T) {
+	v, blob := jmRedisVFSBlob(t)
+	jm := v.Meta.(interface {
+		JMReserveInodes(n uint32) (meta.Ino, uint32, syscall.Errno)
+	})
+	first, n, st := jm.JMReserveInodes(4)
+	if st != 0 || n < 2 {
+		t.Fatalf("reserve: %v %d", st, n)
+	}
+	body := jmCreateFilesBody([]jmTestFile{{1, first, "mine.xmp", 0644, time.Now(), []byte("mine")}})
+	if r := jmSend(t, v, body); r.status != 0 || r.errs[0] != 0 || r.inos[0] != first {
+		t.Fatalf("first send: %+v", r)
+	}
+	base := jmCountObjects(t, blob)
+	if r := jmSend(t, v, body); r.status != 0 || r.errs[0] != 0 || r.inos[0] != first {
+		t.Fatalf("resend: %+v", r)
+	}
+	if r := jmSend(t, v, jmCreateFilesBody([]jmTestFile{{1, first + meta.Ino(n) + 100, "void.xmp", 0644, time.Now(), []byte("void")}})); r.errs[0] != syscall.ESRCH {
+		t.Fatalf("unknown number: %+v, want ESRCH", r)
+	}
+	if got := jmCountObjects(t, blob); got != base {
+		t.Fatalf("%d objects after resends, want %d", got, base)
+	}
+	if data, _ := jmReadAll(t, v, 1, "mine.xmp"); string(data) != "mine" {
+		t.Fatalf("the file lost its data: %q", data)
 	}
 }
 

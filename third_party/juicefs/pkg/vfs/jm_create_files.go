@@ -57,6 +57,9 @@ type jmNewFile struct {
 	slice        meta.Slice
 	eno          syscall.Errno
 	ino          meta.Ino
+	// recognized: an earlier send created the file; this send's object is
+	// unreferenced.
+	recognized bool
 }
 
 // jmParseCreateFiles reads the message body. Any malformed field fails the
@@ -114,7 +117,10 @@ func jmParseCreateFiles(r *utils.Buffer) (int, []jmNewFile, syscall.Errno) {
 func jmDefiniteRefusal(eno syscall.Errno) bool {
 	switch eno {
 	case syscall.EEXIST, syscall.ENOENT, syscall.ENOTDIR, syscall.EACCES, syscall.EPERM, syscall.EROFS,
-		syscall.EDQUOT, syscall.ENOSPC, syscall.ENOTSUP, syscall.EINVAL, syscall.ENAMETOOLONG:
+		syscall.EDQUOT, syscall.ENOSPC, syscall.ENOTSUP, syscall.EINVAL, syscall.ENAMETOOLONG,
+		// EAGAIN: another create holds the number; ESRCH: the number is not
+		// held and the name does not hold it. Neither writes anything.
+		syscall.EAGAIN, syscall.ESRCH:
 		return true
 	}
 	return false
@@ -205,6 +211,7 @@ func (v *VFS) jmCreateIn(ctx meta.Context, jm jmFileCreator, parent meta.Ino, gr
 				f.eno = st
 			} else {
 				f.eno, f.ino = reqs[i].Errno, reqs[i].Inode
+				f.recognized = reqs[i].Errno == 0 && reqs[i].RecognizedEarlierSend()
 			}
 		}
 	}
@@ -217,6 +224,11 @@ func (v *VFS) jmCreateIn(ctx meta.Context, jm jmFileCreator, parent meta.Ino, gr
 				}
 			}
 			continue
+		}
+		if f.recognized && f.slice.Id != 0 {
+			if err := v.Store.Remove(f.slice.Id, int(f.slice.Size)); err != nil {
+				logger.Debugf("JMCreateFiles: remove unreferenced slice %d of a recognised resend: %s", f.slice.Id, err)
+			}
 		}
 		if v.InvalidateEntry != nil {
 			// The kernel may hold a negative entry for the name; the file was
