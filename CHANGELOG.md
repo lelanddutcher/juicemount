@@ -9,11 +9,14 @@
   (`.prproj`, `.drp`) did not reach the server until a large render saved
   beside it had finished uploading: at 0.9 Mbit/s up, a 500 MB render takes
   about 75 minutes. In the laptop lab (200 ms, 1% loss) 2 of 201 saved files
-  reached the server in 10 minutes. Now 68 do with server BBR and
-  64 without it, and 124 on a link macOS marks as costly. With
-  small saves only, 166 to 168 of 200 reach it after reads (before: 70).
-  Reads are as fast as before (cubic first byte 7.5 s, was 7.9 s). Two causes,
-  both fixed:
+  reached the server in 10 minutes. Now 68 do with server BBR and 64
+  without it. With the link class forced to metered (as when macOS marks a
+  link costly), 124 do. With small saves only, 166 to 168 of 200 reach it
+  after reads (before: 70). Reads are about as fast as before: with server
+  BBR the first byte took 2.8 s (was 3.5 s). Without it, it took 7.5 s (was
+  7.9 s), and macOS retried 21 slow reads ("timed out"), against 16 before.
+  That is one session each, and the upload of the saves likely shared the
+  link with those reads. Two causes, both fixed:
   - The first cold reads on a distant link measure under 3 MiB/s, and the app
     then treated the link as "metered" (costly, like cellular). That cut the
     drain to one background slot, and the render's upload held it. A
@@ -33,6 +36,11 @@
     links they stay unused. Small saves still share the upload queue with
     the large file, so on a slow link a batch of them can wait about 40 s.
     Field switch: `JM_DRAIN_SMALL_RESERVE` (0 to 4; 0 turns the slots off).
+  - On such a slow, thin link the drain saves its progress in steps of at
+    most 60 s of the measured speed (at least 1 MiB), not 16 MiB. On a
+    phone hotspot throttled to 128 kbit/s a 16 MiB step would take about
+    1050 s, past the 900 s limit after which macOS treats the volume as
+    stuck.
 - On a slow or distant link, the app no longer sometimes starts offline with an
   empty volume. At startup the app measures the time to connect to the server.
   Above 500 ms it starts offline, which keeps a slow link from blocking the

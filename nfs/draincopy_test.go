@@ -98,6 +98,62 @@ func TestCopyWithDurableCheckpointsStopsAtSyncFailure(t *testing.T) {
 	}
 }
 
+// Re-review: a far, thin link is ClassSlow (the slow-RTT floor), but its
+// checkpoint must not be the slow 16 MiB. At 300 ms and 2 Mbit/s that is
+// about 67 s down and far longer up; a 128 kbit/s capped hotspot would need
+// about 1050 s, past the 900 s macFUSE timeout.
+func TestDurableSyncIntervalCappedOnLowBandwidthFarLink(t *testing.T) {
+	t.Setenv("JM_NET_SLOW_RTT_FLOOR", "")
+	t.Setenv("JM_NET_LATENCY_CEILING", "")
+	if _, forced := netprofile.Default().ForcedClass(); forced {
+		t.Skip("class forced in this process")
+	}
+	for _, tc := range []struct {
+		name string
+		bps  float64 // bytes per second
+		max  int64
+	}{
+		{"2Mbps", 2e6 / 8, 14 << 20},
+		{"128kbps", 128e3 / 8, drainSyncMeteredBytes},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := netprofile.Default()
+			p.ResetForTransportChange()
+			t.Cleanup(p.ResetForTransportChange)
+			p.ObserveRTT(300 * time.Millisecond)
+			for i := 0; i < 8; i++ {
+				p.ObserveThroughput(4<<20, time.Duration(float64(4<<20)/tc.bps*float64(time.Second)))
+			}
+			snap := p.Snapshot()
+			if snap.Class != netprofile.ClassSlow || !snap.LowBandwidth {
+				t.Fatalf("precondition: %+v, want slow + low bandwidth", snap)
+			}
+			got := (&Drainer{}).durableSyncInterval()
+			if got >= drainSyncSlowBytes || got > tc.max || got < drainSyncMeteredBytes {
+				t.Fatalf("interval %d, want 1 MiB..%d (not the slow 16 MiB)", got, tc.max)
+			}
+		})
+	}
+}
+
+func TestLowBandwidthSyncCap(t *testing.T) {
+	for _, tc := range []struct {
+		interval int64
+		bps      float64
+		want     int64
+	}{
+		{drainSyncSlowBytes, 0, drainSyncMeteredBytes},
+		{drainSyncSlowBytes, 16e3, drainSyncMeteredBytes}, // 128 kbit/s
+		{drainSyncSlowBytes, 250e3, 14 << 20},             // 2 Mbit/s: 15 MB, whole MiB
+		{drainSyncSlowBytes, 2 << 20, drainSyncSlowBytes}, // never above the class value
+		{drainSyncMeteredBytes, 250e3, drainSyncMeteredBytes},
+	} {
+		if got := lowBandwidthSyncCap(tc.interval, tc.bps); got != tc.want {
+			t.Fatalf("cap(%d, %.0f) = %d, want %d", tc.interval, tc.bps, got, tc.want)
+		}
+	}
+}
+
 func TestDurableSyncIntervalAdaptsToLiveLinkClass(t *testing.T) {
 	d := &Drainer{}
 	for _, tc := range []struct {

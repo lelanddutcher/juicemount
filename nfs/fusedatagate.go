@@ -138,9 +138,9 @@ func tryAdmitFUSEData(width int64) bool {
 // one slot only while nothing else runs, so at most 2 + 1 = 3 run at once
 // (before: 2 in all). That is intended: the 2026-11-11 lab measured every
 // demand-read refusal on a metered-classed link at 2 in flight with 1 of them
-// read-ahead. The drainer's small lane adds one reserved background slot on
-// top (Drainer.trySmallReserveFUSESlot), so 4 at most on a metered link; it is
-// background, so it never refuses a foreground read. On fast and medium links
+// read-ahead. The drainer's small lane adds reserved background slots on top
+// (Drainer.trySmallReserveFUSESlot: 2 on a metered link), so 5 at most on a
+// metered link; they are background, so they never refuse a foreground read. On fast and medium links
 // the class width is the base, and admission is exactly as before.
 func acquireFUSEData() (release func(), ok bool) {
 	if !fuseDataGateEnabled {

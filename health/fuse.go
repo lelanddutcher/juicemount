@@ -79,6 +79,8 @@ func (fm *FUSEManager) linkAwareJuiceFSPolicy() netprofile.JuiceFSPolicy {
 	// is indistinguishable from one without this line.
 	jmlog.Info("link-aware mount policy chosen",
 		"class", snap.Class.String(),
+		"read_class", snap.ReadClass.String(),
+		"low_bandwidth", snap.LowBandwidth,
 		"class_measured", snap.HaveRTT && snap.HaveBW,
 		"have_rtt", snap.HaveRTT, "have_bandwidth", snap.HaveBW,
 		"rtt_ms", snap.RTT.Milliseconds(),

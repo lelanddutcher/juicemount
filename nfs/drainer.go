@@ -1250,14 +1250,49 @@ func (d *Drainer) durableSyncInterval() int64 {
 		}
 		return d.syncIntervalBytes
 	}
-	switch netprofile.Default().Class() {
+	snap := netprofile.Default().Snapshot()
+	var interval int64
+	switch snap.Class {
 	case netprofile.ClassMetered:
-		return drainSyncMeteredBytes
+		interval = drainSyncMeteredBytes
 	case netprofile.ClassSlow:
-		return drainSyncSlowBytes
+		interval = drainSyncSlowBytes
 	default:
-		return drainSyncDefaultBytes
+		interval = drainSyncDefaultBytes
 	}
+	if snap.LowBandwidth {
+		interval = lowBandwidthSyncCap(interval, snap.BytesPerSec)
+	}
+	return interval
+}
+
+// drainSyncLowBandwidthBudget is how many seconds of the measured rate one
+// checkpoint may hold on a low-bandwidth link.
+//
+// A far, thin link without a cost flag is ClassSlow (the slow-RTT floor), so
+// it would checkpoint every 16 MiB. A capped hotspot throttled to 128 kbit/s
+// needs about 1050 s for that: past the 900 s macFUSE daemon timeout, so the
+// mount fails and remounts. The profile measures only the DOWNLOAD rate, and
+// an uplink is often several times slower, so the budget is 60 s of the
+// download rate: the checkpoint still clears 900 s on an uplink 15 times
+// slower. Examples: 128 kbit/s -> 1 MiB (the metered floor, about 65 s up at
+// that rate); 2 Mbit/s -> 14 MiB.
+const drainSyncLowBandwidthBudget = 60
+
+// lowBandwidthSyncCap caps a checkpoint interval at the budget's worth of the
+// measured rate, in whole MiB, and never below drainSyncMeteredBytes.
+func lowBandwidthSyncCap(interval int64, bytesPerSec float64) int64 {
+	if bytesPerSec <= 0 {
+		return drainSyncMeteredBytes
+	}
+	budget := int64(bytesPerSec*drainSyncLowBandwidthBudget) &^ (1<<20 - 1)
+	if budget < drainSyncMeteredBytes {
+		budget = drainSyncMeteredBytes
+	}
+	if budget < interval {
+		return budget
+	}
+	return interval
 }
 
 // acquireDrainFUSESlot registers a drain as background FUSE data work. It
@@ -1279,7 +1314,7 @@ func (d *Drainer) acquireDrainFUSESlot() (release func(), ok bool) {
 // drain only while media drains hold fewer than half the background slots
 // (at least one). Small saves (.prproj, .drp, sidecars) therefore keep at
 // least half, and a large file always gets one. While they yield, and whenever
-// the shared share is full, small saves also have one reserved slot of their
+// the shared share is full, small saves also have reserved slots of their
 // own (trySmallReserveFUSESlot): with a share of 1, half is nothing.
 func (d *Drainer) smallYieldsToMedia() bool {
 	if d.mediaGateWaiters.Load() == 0 {
@@ -1292,8 +1327,9 @@ func (d *Drainer) smallYieldsToMedia() bool {
 	return int64(d.mediaGateHeld.Load()) < share
 }
 
-// trySmallReserveFUSESlot admits a small-lane drain on the ONE slot reserved
-// for the small lane, outside the shared background share.
+// trySmallReserveFUSESlot admits a small-lane drain on a slot reserved for
+// the small lane (smallReserveSlots: 2 on a metered link, 1 elsewhere),
+// outside the shared background share.
 //
 // WHY A RESERVE. The background share is half the class width: 4 on a slow
 // link, 1 on a metered one. A media drain holds its slot for the whole upload,
