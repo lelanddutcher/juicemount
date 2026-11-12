@@ -380,6 +380,7 @@ func (f *fileWriter) flush(ctx meta.Context, writeback bool) syscall.Errno {
 	for len(f.chunks) > 0 && err == 0 {
 		for _, c := range f.chunks {
 			for _, s := range c.slices {
+				jmMarkSmallSave(f, s) // JuiceMount: patch 0024
 				if !s.freezed {
 					s.freezed = true
 					go s.flushData()

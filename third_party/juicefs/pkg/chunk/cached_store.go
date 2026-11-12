@@ -326,6 +326,7 @@ type wSlice struct {
 	uploadFailed atomic.Bool
 	pendings     int
 	writeback    bool
+	smallSave    atomic.Bool // JuiceMount: an fsync or close of a small file (jm_upload_lane.go)
 }
 
 func sliceForWrite(id uint64, store *cachedStore) *wSlice {
@@ -487,6 +488,7 @@ func (s *wSlice) upload(indx int) {
 	pages := s.pages[indx]
 	s.pages[indx] = nil
 	s.pendings++
+	small := s.smallLane()
 
 	go func() {
 		var block *Page
@@ -545,8 +547,8 @@ func (s *wSlice) upload(indx int) {
 				return
 			}
 		}
-		s.store.currentUpload <- true
-		defer func() { <-s.store.currentUpload }()
+		release := s.store.acquireUpload(small)
+		defer release()
 		s.errors <- s.store.upload(key, block, s)
 	}()
 }
@@ -644,6 +646,10 @@ type Config struct {
 	// DemandFirst: reads that an application waits for go before the
 	// prefetcher (JuiceMount, demand_first.go).
 	DemandFirst bool
+	// SmallUploads: upload tokens beside MaxUpload that only the slices of
+	// a file of at most 1 MiB that an fsync or close flushes may take; 0
+	// turns the lane off (JuiceMount, jm_upload_lane.go).
+	SmallUploads int
 }
 
 func (c *Config) SelfCheck(uuid string) {
@@ -740,6 +746,7 @@ type cachedStore struct {
 	conf          Config
 	group         *Controller
 	currentUpload chan bool
+	smallUpload   chan bool // JuiceMount: small-upload lane, nil when off
 	pendingCh     chan *pendingItem
 	pendingKeys   map[string]*pendingItem
 	pendingMutex  sync.Mutex
@@ -863,6 +870,9 @@ func NewCachedStore(storage object.ObjectStorage, config Config, reg prometheus.
 		pendingCh:     make(chan *pendingItem, 100*config.MaxUpload),
 		pendingKeys:   make(map[string]*pendingItem),
 		group:         NewController(),
+	}
+	if config.SmallUploads > 0 {
+		store.smallUpload = make(chan bool, config.SmallUploads)
 	}
 	if config.UploadLimit > 0 {
 		// there are overheads coming from HTTP/TCP/IP
@@ -1015,7 +1025,7 @@ func (store *cachedStore) regMetrics(reg prometheus.Registerer) {
 			Help: "number of uploading requests",
 		},
 		func() float64 {
-			return float64(len(store.currentUpload))
+			return float64(store.uploadsInFlight())
 		}))
 }
 

@@ -4,6 +4,27 @@
 
 ### App
 
+- On a slow or distant link, small saves (project files and other files of
+  1 MiB or less) no longer wait behind a large file's upload inside JuiceFS.
+  JuiceFS uploads at most four blocks at a time (`--max-uploads 4`, kept for
+  cellular links), and before, every upload waited in one line. While a
+  render uploaded in 4 MiB blocks, each small save waited for one of them:
+  about 38 s per save in the laptop lab (200 ms, 1% loss, server BBR). The
+  bundled JuiceFS (patch 0024, `-jm9`) now keeps two more upload slots
+  (one on a metered link) that only the fsync or close of a file of 1 MiB
+  or less may use. A large file's blocks still use at most four slots, also
+  when JuiceFS uploads them in small pieces on a very slow link, so at most
+  2 MiB more is in flight. A save still returns only after its data is on
+  the server. In the laptop lab with a 500 MB render draining after reads,
+  168 and 169 of 201 saved files reached the server in 10 minutes (before:
+  70 and 73), and 34 and 35 in the first 2 minutes (before: 13 and 19). The
+  render uploaded as much as before (about 200 MB in those 10 minutes), and
+  reads did not change. Small saves now drain at the same rate as with no
+  render at all (166 to 168 of 200). The rest of their time is metadata
+  round trips, not the upload, so 200 small saves still take about 12
+  minutes on that link.
+  Field switch: `JM_JFS_SMALL_UPLOADS` (0 to 4; 0 or any other value turns
+  the slots off).
 - On a slow or distant link, a large file no longer holds back every other
   save. Before, after the app had read any uncached file, a project save
   (`.prproj`, `.drp`) did not reach the server until a large render saved
@@ -33,8 +54,8 @@
     1 on a slow link, so they keep draining while a large file uploads. The
     slots are background work: they never refuse a read the editor waits
     for, and they never take the large file's slot. On fast and medium
-    links they stay unused. Small saves still share the upload queue with
-    the large file, so on a slow link a batch of them can wait about 40 s.
+    links they stay unused. Inside JuiceFS small saves also have upload
+    slots of their own now (the entry above).
     Field switch: `JM_DRAIN_SMALL_RESERVE` (0 to 4; 0 turns the slots off).
   - On such a slow, thin link the drain saves its progress in steps of at
     most 60 s of the measured speed (at least 1 MiB), not 16 MiB. On a
