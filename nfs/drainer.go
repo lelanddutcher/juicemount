@@ -290,9 +290,12 @@ type DrainerMetrics struct {
 	// DrainsDirect counts files published whole through JMCreateFiles
 	// (drain_direct.go) instead of a stage.
 	DrainsDirect atomic.Int64
-	Quarantined  atomic.Int64
-	BytesDrained atomic.Int64
-	InFlight     atomic.Int64
+	// DirectOpenWaits counts published files whose first open answered a
+	// stale ENOENT (the kernel's negative entry) and was waited out.
+	DirectOpenWaits atomic.Int64
+	Quarantined     atomic.Int64
+	BytesDrained    atomic.Int64
+	InFlight        atomic.Int64
 	// SidecarsSkipped counts `._` rows completed WITHOUT a backend file
 	// because their AppleDouble body carried no metadata. See
 	// appleDoubleIsDefaultEmpty in sidecar.go.
@@ -403,17 +406,14 @@ func NewDrainer(spool *SpoolStore, cfg DrainerConfig) (*Drainer, error) {
 	if d.batchInsert {
 		d.batch = newDrainBatcher(d, drainBatchMaxOps, drainBatchMaxDelay)
 	}
-	if spooledMkdirEnabled() && cfg.FuseRoot != "" {
-		d.dirInodes = newDirInodePool(newJFSControl(cfg.FuseRoot))
+	// One control client per mount (sharedJFSControl): macOS juicefs keeps
+	// one control handle per process, so messages must not interleave. The
+	// direct publisher sends each file with a number from the same pool.
+	if (spooledMkdirEnabled() || drainDirectEnabled()) && cfg.FuseRoot != "" {
+		d.dirInodes = newDirInodePool(sharedJFSControl(cfg.FuseRoot))
 	}
 	if drainDirectEnabled() && cfg.FuseRoot != "" {
-		// One control client per drainer: macOS juicefs keeps one control
-		// handle per process, so its messages must not interleave.
-		ctl := newJFSControl(cfg.FuseRoot)
-		if d.dirInodes != nil {
-			ctl = d.dirInodes.ctl
-		}
-		d.direct = newDirectPublisher(ctl)
+		d.direct = newDirectPublisher(sharedJFSControl(cfg.FuseRoot))
 	}
 	// H-8B: every new spool row records the base identity of the file it
 	// replaces. The drainer owns the FUSE root, so it supplies the probe.
@@ -1599,6 +1599,23 @@ func (d *Drainer) drainOne(row *metadata.SpoolRow) {
 	// recheck and the in-place open run under the namespace lease.
 	tgt, ok := d.openDrainTarget(row, dest, lease)
 	if !ok {
+		return
+	}
+	if tgt.adoptIno != 0 {
+		// The bytes are this save's; an in-place attempt that wrote them may
+		// not have set the time yet (as the stage path, after the write).
+		data, _, ok := d.directReadSpool(row, src)
+		if !ok {
+			return
+		}
+		mtime := spoolMtime
+		if mtime.IsZero() {
+			mtime = time.Now()
+		} else if err := os.Chtimes(dest, mtime, mtime); err != nil {
+			d.failTransient(row, fmt.Errorf("chtimes adopted file: %w", err))
+			return
+		}
+		d.finishPublished(row, dest, tgt.adoptIno, tgt.adoptDev, mtime, data, ph)
 		return
 	}
 	if tgt.direct {

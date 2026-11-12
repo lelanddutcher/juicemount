@@ -12,7 +12,20 @@
  const (
 --- a/pkg/vfs/internal.go
 +++ b/pkg/vfs/internal.go
-@@ -573,6 +573,9 @@
+@@ -563,7 +563,11 @@
+ 		name := string(r.Get(int(r.Get8())))
+ 		eno := syscall.ENOTSUP
+ 		if jm, ok := v.Meta.(jmFolderInodes); ok {
+-			eno = jm.JMMkdirInode(ctx, parent, name, mode, cumask, ino, &Attr{})
++			// Not the handle's context: a FLUSH of the control file (a forked
++			// child's exec closing the inherited descriptor) cancels it, and
++			// a cancelled mkdir loses its reserved number (patch 0025).
++			mctx := meta.NewContext(ctx.Pid(), ctx.Uid(), ctx.Gids())
++			eno = jm.JMMkdirInode(mctx, parent, name, mode, cumask, ino, &Attr{})
+ 		}
+ 		if eno == 0 && v.InvalidateEntry != nil {
+ 			// The kernel may hold a negative entry for the name; the folder
+@@ -573,6 +577,9 @@
  			}
  		}
  		_, _ = out.Write([]byte{uint8(eno)})
@@ -22,3 +35,27 @@
  	case meta.CompactPath:
  		inode := Ino(r.Get64())
  		coCnt := r.Get16()
+--- a/pkg/vfs/vfs.go
++++ b/pkg/vfs/vfs.go
+@@ -693,6 +693,12 @@
+ 			err = syscall.EBADF
+ 			return
+ 		}
++		if ino != logInode {
++			// JuiceMount patch 0025: a control message's goroutine appends its
++			// reply to h.data under h's lock while the client polls.
++			h.Lock()
++			defer h.Unlock()
++		}
+ 		if len(h.data) == 0 {
+ 			switch ino {
+ 			case StatsInode:
+@@ -714,8 +720,6 @@
+ 			n = readAccessLog(fh, buf)
+ 		} else {
+ 			defer func() { logit(ctx, "read", err, "(%d,%d,%d,%d): %d", ino, size, off, fh, n) }()
+-			h.Lock()
+-			defer h.Unlock()
+ 			if off < h.off {
+ 				logger.Errorf("read dropped data from %s: %d < %d", ino, off, h.off)
+ 				err = syscall.EIO

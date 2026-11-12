@@ -255,3 +255,71 @@ func TestJMCreateFilesInOneTransaction(t *testing.T) {
 		t.Fatalf("counters: space +%d inodes +%d", used1-used0, inodes1-inodes0)
 	}
 }
+
+// A reserved number (patch 0022) recorded by the caller before sending lets it
+// recognise its own file after any outcome: a resend of a committed create is
+// a success that writes nothing; a number in use by a running create is
+// EAGAIN; a used number at another name is ESRCH; a refusal that wrote
+// nothing keeps the number reserved.
+func TestJMCreateFilePreReservedInode(t *testing.T) {
+	m, _ := countedMeta(t)
+	ctx := Background()
+	first, n, st := m.JMReserveInodes(8)
+	if st != 0 || n < 3 {
+		t.Fatalf("reserve: %v %d", st, n)
+	}
+	mtime := time.Unix(1794490456, 1)
+	send := func(name string, pre Ino, slice Slice) *JMNewFile {
+		f := &JMNewFile{Name: name, Mode: 0644, Mtime: mtime, Slice: slice, PreIno: pre}
+		if st := m.JMCreateFilesIn(ctx, RootInode, []*JMNewFile{f}); st != 0 {
+			t.Fatalf("%s: whole %v", name, st)
+		}
+		return f
+	}
+	f := send("own.xmp", first, jmCreateFixtureSlice(t, m, 500))
+	if f.Errno != 0 || f.Inode != first {
+		t.Fatalf("create with reserved number: %v inode %d (want %d)", f.Errno, f.Inode, first)
+	}
+	used, inodes := jmCounters(t, m)
+
+	// Resend (lost reply, restart): recognised, nothing written.
+	if f := send("own.xmp", first, jmCreateFixtureSlice(t, m, 500)); f.Errno != 0 || f.Inode != first {
+		t.Fatalf("resend: %v inode %d", f.Errno, f.Inode)
+	}
+	if u, i := jmCounters(t, m); u != used || i != inodes {
+		t.Fatal("a recognised resend changed the counters")
+	}
+	// The used number at another name, and an unknown number: ESRCH.
+	if f := send("other.xmp", first, Slice{}); f.Errno != syscall.ESRCH {
+		t.Fatalf("used number elsewhere: %v, want ESRCH", f.Errno)
+	}
+	if f := send("other.xmp", first+100, Slice{}); f.Errno != syscall.ESRCH {
+		t.Fatalf("unknown number: %v, want ESRCH", f.Errno)
+	}
+	// A number a running create holds: EAGAIN.
+	r := m.jmReserved()
+	r.mu.Lock()
+	delete(r.ids, first+1)
+	r.inflight[first+1] = struct{}{}
+	r.mu.Unlock()
+	if f := send("busy.xmp", first+1, Slice{}); f.Errno != syscall.EAGAIN {
+		t.Fatalf("number in flight: %v, want EAGAIN", f.Errno)
+	}
+	// A refusal that wrote nothing keeps the number reserved.
+	if f := send("own.xmp", first+2, Slice{}); f.Errno != syscall.EEXIST {
+		t.Fatalf("taken name: %v, want EEXIST", f.Errno)
+	}
+	if f := send("later.xmp", first+2, Slice{}); f.Errno != 0 || f.Inode != first+2 {
+		t.Fatalf("number after a refusal: %v inode %d", f.Errno, f.Inode)
+	}
+	if u, i := jmCounters(t, m); u-used != align4K(0) || i-inodes != 1 {
+		t.Fatalf("counters: space +%d inodes +%d", u-used, i-inodes)
+	}
+	r.mu.Lock()
+	inflight := len(r.inflight)
+	r.mu.Unlock()
+	if inflight != 1 { // only the one this test put there
+		t.Fatalf("%d numbers left in flight", inflight)
+	}
+	assertNoWatches(t, m)
+}

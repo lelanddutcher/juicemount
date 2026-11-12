@@ -65,12 +65,27 @@ func (m *redisMeta) doJMCreateFiles(ctx Context, parent Ino, files []*JMNewFile)
 		seen := make(map[string]bool, len(files))
 		write := 0
 		for i, f := range files {
-			f.Attr, f.Errno = base[i], 0
-			if _, err := ecmds[i].Bytes(); err == nil || seen[f.Name] {
+			f.Attr, f.Errno, f.recognized = base[i], 0, false
+			if buf, err := ecmds[i].Bytes(); err == nil {
+				if _, ino := m.parseEntry(buf); ino == f.Inode && !seen[f.Name] {
+					// The name already holds this file's own inode: an
+					// earlier send (or attempt of this txn) committed it.
+					f.recognized = true
+					seen[f.Name] = true
+					continue
+				}
 				f.Errno = syscall.EEXIST
 				continue
 			} else if err != redis.Nil {
 				return err
+			}
+			if seen[f.Name] {
+				f.Errno = syscall.EEXIST
+				continue
+			}
+			if f.recognize {
+				f.Errno = syscall.ESRCH // a number we do not hold, and not at the name
+				continue
 			}
 			seen[f.Name] = true
 			write++
@@ -115,7 +130,7 @@ func (m *redisMeta) doJMCreateFiles(ctx Context, parent Ino, files []*JMNewFile)
 			// the counters move as for separate creates (the RESP proxy
 			// bounds totalInodes to one per INCR).
 			for _, f := range files {
-				if f.Errno != 0 {
+				if f.Errno != 0 || f.recognized {
 					continue
 				}
 				pipe.Set(ctx, m.inodeKey(f.Inode), m.marshal(&f.Attr), 0)

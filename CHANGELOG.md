@@ -22,6 +22,11 @@
   (before: 223 s), and 222 s beside a 500 MB file (before: 405 s); with 1%
   loss, 154, 152 and 167 s (before: 395, 236 and 420 s). Round trips per
   file fell from about 28 to 11 to 14. The 500 MB file uploads as before.
+  Each file is sent with an inode number the app reserved and recorded
+  first, so after a lost reply, a late commit, a crash or a quit the app
+  recognises its own file and never makes a conflict copy of it. On macOS
+  the app waits out the kernel's few seconds of "no such file" for a name
+  it looked up before JuiceFS created it.
   Field switch: `JM_DRAIN_DIRECT_CREATE=0` (the old way for every file).
 - On an encrypted volume over a slow or distant link, a slow cold read no
   longer turns into a retry wait. An encrypted volume (one formatted with an

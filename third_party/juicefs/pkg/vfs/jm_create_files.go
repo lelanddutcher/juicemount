@@ -11,9 +11,10 @@
  * on macOS juicefs keeps one control handle per process, so the JuiceMount
  * drainer batches its saves into one message instead of sending many.
  *
- * Message body: count (u16), then per file: parent (u64), mode (u16), cumask
- * (u16), mtime seconds (u64), mtime nanoseconds (u32), name length (u8),
- * name, data length (u32), data.
+ * Message body: count (u16), then per file: parent (u64), reserved inode
+ * (u64, 0 for none; see meta.JMNewFile.PreIno), mode (u16), cumask (u16),
+ * mtime seconds (u64), mtime nanoseconds (u32), name length (u8), name, data
+ * length (u32), data. An empty name fails that file alone (EINVAL).
  * Reply: marker (u8, 0xA5), status (u8: 0, or the errno of a malformed or
  * refused message), count (u16), then per file: errno (u8) and inode (u64, 0
  * on error). A juicefs without this message answers one byte, EINVAL; the
@@ -48,6 +49,7 @@ type jmFileCreator interface {
 
 type jmNewFile struct {
 	parent       meta.Ino
+	preIno       meta.Ino
 	mode, cumask uint16
 	mtime        time.Time
 	name         string
@@ -69,11 +71,12 @@ func jmParseCreateFiles(r *utils.Buffer) (int, []jmNewFile, syscall.Errno) {
 	}
 	files := make([]jmNewFile, n)
 	for i := range files {
-		if r.Left() < 8+2+2+8+4+1 {
+		if r.Left() < 8+8+2+2+8+4+1 {
 			return n, nil, syscall.EINVAL
 		}
 		f := &files[i]
 		f.parent = meta.Ino(r.Get64())
+		f.preIno = meta.Ino(r.Get64())
 		f.mode = r.Get16()
 		f.cumask = r.Get16()
 		sec := r.Get64()
@@ -83,10 +86,13 @@ func jmParseCreateFiles(r *utils.Buffer) (int, []jmNewFile, syscall.Errno) {
 		}
 		f.mtime = time.Unix(int64(sec), int64(nsec))
 		nl := int(r.Get8())
-		if nl == 0 || r.Left() < nl+4 {
+		if r.Left() < nl+4 {
 			return n, nil, syscall.EINVAL
 		}
 		f.name = string(r.Get(nl))
+		if nl == 0 {
+			f.eno = syscall.EINVAL // this file only
+		}
 		dl := int(r.Get32())
 		if dl > jmCreateFilesMaxBytes || r.Left() < dl {
 			return n, nil, syscall.EINVAL
@@ -114,9 +120,43 @@ func jmDefiniteRefusal(eno syscall.Errno) bool {
 	return false
 }
 
+// A folder this message cannot create in (a default ACL; ENOTSUP) is
+// remembered for a minute, so the next batches for it do not upload bytes
+// that would only be removed: the caller uses the ordinary create for them.
+const jmParentRefusedFor = time.Minute
+
+var (
+	jmRefusedMu sync.Mutex
+	jmRefused   = map[meta.Ino]time.Time{}
+)
+
+func jmNoteParentRefused(parent meta.Ino) {
+	jmRefusedMu.Lock()
+	defer jmRefusedMu.Unlock()
+	if len(jmRefused) > 4096 {
+		jmRefused = map[meta.Ino]time.Time{}
+	}
+	jmRefused[parent] = time.Now()
+}
+
+func jmParentRefused(parent meta.Ino) bool {
+	jmRefusedMu.Lock()
+	defer jmRefusedMu.Unlock()
+	at, ok := jmRefused[parent]
+	if ok && time.Since(at) > jmParentRefusedFor {
+		delete(jmRefused, parent)
+		return false
+	}
+	return ok
+}
+
 // jmUpload stores f's bytes as one object; f.slice names it.
 func (v *VFS) jmUpload(ctx meta.Context, f *jmNewFile) {
-	if len(f.data) == 0 {
+	if f.eno != 0 || len(f.data) == 0 {
+		return
+	}
+	if jmParentRefused(f.parent) {
+		f.eno = syscall.ENOTSUP // a folder that refused lately: no upload
 		return
 	}
 	var id uint64
@@ -152,11 +192,14 @@ func (v *VFS) jmCreateIn(ctx meta.Context, jm jmFileCreator, parent meta.Ino, gr
 		if f.eno != 0 {
 			continue
 		}
-		reqs = append(reqs, &meta.JMNewFile{Name: f.name, Mode: f.mode, Cumask: f.cumask, Mtime: f.mtime, Slice: f.slice})
+		reqs = append(reqs, &meta.JMNewFile{Name: f.name, Mode: f.mode, Cumask: f.cumask, Mtime: f.mtime, Slice: f.slice, PreIno: f.preIno})
 		mine = append(mine, f)
 	}
 	if len(reqs) > 0 {
 		st := jm.JMCreateFilesIn(ctx, parent, reqs)
+		if st == syscall.ENOTSUP {
+			jmNoteParentRefused(parent)
+		}
 		for i, f := range mine {
 			if st != 0 {
 				f.eno = st

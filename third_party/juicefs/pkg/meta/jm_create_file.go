@@ -29,21 +29,34 @@ import (
 	"github.com/juicedata/juicefs/pkg/replaceguard"
 )
 
-// JMNewFile is one file of JMCreateFilesIn: the request (Name to Slice) and
+// JMNewFile is one file of JMCreateFilesIn: the request (Name to PreIno) and
 // its result (Inode, Attr, Errno).
 type JMNewFile struct {
 	Name         string
 	Mode, Cumask uint16
 	Mtime        time.Time
 	Slice        Slice // Off 0, Len = Size = the file length; zero for an empty file
-	Inode        Ino
-	Attr         Attr
-	Errno        syscall.Errno
+	// PreIno, when not 0, is a number JMReserveInodes reserved in this
+	// process: the file gets it, so a caller that recorded it before sending
+	// recognises its own file after any outcome (a lost reply, its own
+	// restart). A number this process holds but is still creating with: EAGAIN.
+	// A number it does not hold (used, or from before a restart): the call
+	// succeeds only if the name already holds that inode (an earlier send
+	// committed), else ESRCH; nothing is written either way.
+	PreIno Ino
+	Inode  Ino
+	Attr   Attr
+	Errno  syscall.Errno
+	// recognize: PreIno is not held; succeed only on an existing entry that
+	// names it. recognized: the engine found that entry and wrote nothing.
+	recognize, recognized bool
+	taken                 bool // PreIno was taken from the reservations
 }
 
 // jmCreateFileEngine is implemented by the engines that support
 // JMCreateFilesIn (Redis only). It writes every file whose Errno is 0 and
-// whose name is free in one transaction, sets EEXIST on the others, and
+// whose name is free in one transaction, sets EEXIST on the others (success,
+// with recognized, when the name already holds the file's own Inode), and
 // returns an error that applies to all of them.
 type jmCreateFileEngine interface {
 	doJMCreateFiles(ctx Context, parent Ino, files []*JMNewFile) syscall.Errno
@@ -73,6 +86,54 @@ func (m *baseMeta) JMCreateFile(ctx Context, parent Ino, name string, mode, cuma
 	return f.Errno
 }
 
+// jmTakeCreateInodes takes each file's PreIno from the reservations (or
+// marks it recognize-only, or EAGAIN while another create holds it).
+func (m *baseMeta) jmTakeCreateInodes(files []*JMNewFile) {
+	r := m.jmReserved()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.inflight == nil {
+		r.inflight = make(map[Ino]struct{})
+	}
+	for _, f := range files {
+		if f.Errno != 0 || f.PreIno == 0 {
+			continue
+		}
+		if _, ok := r.ids[f.PreIno]; ok {
+			delete(r.ids, f.PreIno)
+			r.inflight[f.PreIno] = struct{}{}
+			f.taken = true
+		} else if _, busy := r.inflight[f.PreIno]; busy {
+			f.Errno = syscall.EAGAIN
+		} else {
+			f.recognize = true
+		}
+	}
+}
+
+// jmSettleCreateInodes ends the creates that took a reserved number: used on
+// success, reserved again after a refusal that wrote nothing, and never
+// offered again after an ambiguous failure (as JMMkdirInode).
+func (m *baseMeta) jmSettleCreateInodes(files []*JMNewFile, whole syscall.Errno) {
+	r := m.jmReserved()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, f := range files {
+		if !f.taken {
+			continue
+		}
+		f.taken = false
+		delete(r.inflight, f.PreIno)
+		st := f.Errno
+		if whole != 0 {
+			st = whole
+		}
+		if st != 0 && jmDefiniteRefusal(st) {
+			r.ids[f.PreIno] = struct{}{}
+		}
+	}
+}
+
 // JMCreateFilesIn creates files in parent, all in one transaction (one
 // txLock of the parent, 2 round trips). Each file gets its own result in
 // Errno; a non-zero return applies to every file and nothing was written.
@@ -90,9 +151,9 @@ func (m *baseMeta) JMCreateFilesIn(ctx Context, parent Ino, files []*JMNewFile) 
 	defer m.timeit("JMCreateFile", time.Now())
 	parent = m.checkRoot(parent)
 	var todo []*JMNewFile
-	var space, inodes int64
 	for _, f := range files {
 		f.Inode, f.Attr, f.Errno = 0, Attr{}, 0
+		f.recognize, f.recognized, f.taken = false, false, false
 		switch {
 		case parent == RootInode && f.Name == TrashName:
 			f.Errno = syscall.EPERM
@@ -113,51 +174,86 @@ func (m *baseMeta) JMCreateFilesIn(ctx Context, parent Ino, files []*JMNewFile) 
 			f.Errno = syscall.EINVAL
 			continue
 		}
+		if f.PreIno == 1 || f.PreIno > Ino(1)<<62 {
+			f.Errno = syscall.EINVAL
+			continue
+		}
 		todo = append(todo, f)
-		space += align4K(uint64(s.Len))
-		inodes++
 	}
 	if len(todo) == 0 {
 		return 0
 	}
-	if st := m.checkQuota(ctx, space, inodes, parent); st != 0 {
-		if len(todo) == 1 {
-			todo[0].Errno = st
-			return 0
+	m.jmTakeCreateInodes(todo)
+	var space, inodes int64
+	live := todo[:0:0]
+	for _, f := range todo {
+		if f.Errno != 0 {
+			continue
 		}
-		// One file may be what exceeds the quota: try each alone.
-		for _, f := range todo {
-			if st := m.JMCreateFilesIn(ctx, parent, []*JMNewFile{f}); st != 0 {
-				f.Errno = st
-			}
+		live = append(live, f)
+		if !f.recognize {
+			space += align4K(uint64(f.Slice.Len))
+			inodes++
 		}
+	}
+	if len(live) == 0 {
+		m.jmSettleCreateInodes(todo, 0)
 		return 0
 	}
-	for _, f := range todo {
-		ino, err := m.nextInode()
-		if err != nil {
-			return errno(err)
+	if inodes > 0 {
+		if st := m.checkQuota(ctx, space, inodes, parent); st != 0 {
+			if len(live) == 1 {
+				live[0].Errno = st
+				m.jmSettleCreateInodes(todo, 0)
+				return 0
+			}
+			// One file may be what exceeds the quota: try each alone.
+			m.jmSettleCreateInodes(todo, st)
+			for _, f := range live {
+				pre := f.PreIno
+				if st := m.JMCreateFilesIn(ctx, parent, []*JMNewFile{f}); st != 0 {
+					f.Errno = st
+				}
+				f.PreIno = pre
+			}
+			return 0
+		}
+	}
+	for _, f := range live {
+		ino := f.PreIno
+		if ino == 0 {
+			var err error
+			if ino, err = m.nextInode(); err != nil {
+				m.jmSettleCreateInodes(todo, syscall.EIO)
+				return errno(err)
+			}
 		}
 		f.Inode = ino
 		f.Attr = Attr{Typ: TypeFile, Uid: ctx.Uid(), Gid: ctx.Gid(), Nlink: 1, Length: uint64(f.Slice.Len), Parent: parent, Full: true}
 	}
-	if st := en.doJMCreateFiles(ctx, parent, todo); st != 0 {
-		for _, f := range todo {
+	st := en.doJMCreateFiles(ctx, parent, live)
+	if st != 0 {
+		for _, f := range live {
 			f.Inode, f.Attr = 0, Attr{}
 		}
+		m.jmSettleCreateInodes(todo, st)
 		return st
 	}
 	var length int64
 	space, inodes = 0, 0
-	for _, f := range todo {
+	for _, f := range live {
 		if f.Errno != 0 {
 			f.Inode, f.Attr = 0, Attr{}
+			continue
+		}
+		if f.recognized {
 			continue
 		}
 		length += int64(f.Slice.Len)
 		space += align4K(uint64(f.Slice.Len))
 		inodes++
 	}
+	m.jmSettleCreateInodes(todo, 0)
 	if inodes > 0 {
 		m.en.updateStats(space, inodes)
 		m.updateDirStat(ctx, parent, length, space, inodes)

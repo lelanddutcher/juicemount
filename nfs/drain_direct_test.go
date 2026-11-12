@@ -12,6 +12,8 @@ import (
 	"testing"
 	"time"
 
+	jfsmeta "github.com/juicedata/juicefs/pkg/meta"
+
 	"github.com/lelanddutcher/juicemount/metadata"
 )
 
@@ -23,6 +25,7 @@ type fakeCreateFiles struct {
 	root     string
 	mu       sync.Mutex
 	messages [][]string // names per message
+	preInos  [][]uint64 // reserved numbers per message
 	// before runs before each message; after runs on each result.
 	before func([]jfsNewFile) error
 	after  func(i int, f jfsNewFile, c *jfsCreated)
@@ -47,10 +50,12 @@ func (f *fakeCreateFiles) dirOf(ino uint64) (string, bool) {
 func (f *fakeCreateFiles) send(files []jfsNewFile) ([]jfsCreated, error) {
 	f.mu.Lock()
 	names := make([]string, len(files))
+	inos := make([]uint64, len(files))
 	for i, nf := range files {
-		names[i] = nf.name
+		names[i], inos[i] = nf.name, nf.preIno
 	}
 	f.messages = append(f.messages, names)
+	f.preInos = append(f.preInos, inos)
 	f.mu.Unlock()
 	if f.before != nil {
 		if err := f.before(files); err != nil {
@@ -423,7 +428,8 @@ func TestDirectPublisherBatchBounds(t *testing.T) {
 }
 
 // The message layout matches the juicefs parser (pkg/vfs/jm_create_files.go):
-// header, count, then per file parent, mode, cumask, mtime, name, data.
+// header, count, then per file parent, reserved inode, mode, cumask, mtime,
+// name, data.
 func TestJFSCreateFilesEncoding(t *testing.T) {
 	c := newJFSControl(t.TempDir())
 	var sent []byte
@@ -437,7 +443,7 @@ func TestJFSCreateFilesEncoding(t *testing.T) {
 	}
 	mt := time.Unix(1794490456, 42)
 	res, err := c.createFiles([]jfsNewFile{
-		{parent: 9, name: "a.xmp", mode: 0o640, mtime: mt, data: []byte("xyz")},
+		{parent: 9, preIno: 0x1234, name: "a.xmp", mode: 0o640, mtime: mt, data: []byte("xyz")},
 		{parent: 10, name: "b", mode: 0o644, mtime: mt},
 	})
 	if err != nil {
@@ -448,8 +454,8 @@ func TestJFSCreateFilesEncoding(t *testing.T) {
 	}
 	want := []byte{0, 0, 0x04, 0x50} // 1104
 	body := []byte{0, 2,
-		0, 0, 0, 0, 0, 0, 0, 9, 0x01, 0xa0, 0, 0, 0, 0, 0, 0, 0x6a, 0xf5, 0xc0, 0x58, 0, 0, 0, 42, 5, 'a', '.', 'x', 'm', 'p', 0, 0, 0, 3, 'x', 'y', 'z',
-		0, 0, 0, 0, 0, 0, 0, 10, 0x01, 0xa4, 0, 0, 0, 0, 0, 0, 0x6a, 0xf5, 0xc0, 0x58, 0, 0, 0, 42, 1, 'b', 0, 0, 0, 0}
+		0, 0, 0, 0, 0, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0x12, 0x34, 0x01, 0xa0, 0, 0, 0, 0, 0, 0, 0x6a, 0xf5, 0xc0, 0x58, 0, 0, 0, 42, 5, 'a', '.', 'x', 'm', 'p', 0, 0, 0, 3, 'x', 'y', 'z',
+		0, 0, 0, 0, 0, 0, 0, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0xa4, 0, 0, 0, 0, 0, 0, 0x6a, 0xf5, 0xc0, 0x58, 0, 0, 0, 42, 1, 'b', 0, 0, 0, 0}
 	want = append(want, 0, 0, 0, byte(len(body)))
 	want = append(want, body...)
 	if !bytes.Equal(sent, want) {
@@ -469,4 +475,253 @@ func TestJFSCreateFilesEncoding(t *testing.T) {
 	if !errors.As(err, &refused) || !errors.Is(err, errControlUnsupported) {
 		t.Fatalf("older juicefs: %v", err)
 	}
+}
+
+// The nfs message numbers are the juicefs ones (patch 0022, 0025).
+func TestJFSControlMessageNumbersMatchJuiceFS(t *testing.T) {
+	for _, c := range []struct {
+		name     string
+		nfs, jfs int
+	}{
+		{"JMReserveInodes", jfsMsgReserveInodes, jfsmeta.JMReserveInodes},
+		{"JMMkdirInode", jfsMsgMkdirInode, jfsmeta.JMMkdirInode},
+		{"JMReleaseInodes", jfsMsgReleaseInodes, jfsmeta.JMReleaseInodes},
+		{"JMCreateFiles", jfsMsgCreateFiles, jfsmeta.JMCreateFiles},
+	} {
+		if c.nfs != c.jfs {
+			t.Errorf("%s: nfs sends %d, juicefs reads %d", c.name, c.nfs, c.jfs)
+		}
+	}
+}
+
+// reservedInodeFile writes payload under a hidden name in dir and puts its
+// inode number in the drainer's pool: the number juicefs would give the file
+// sent with it. Renaming the hidden file to the destination then plays
+// juicefs committing that send.
+func reservedInodeFile(t *testing.T, d *Drainer, dir string, payload []byte) (string, uint64) {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	p := filepath.Join(dir, ".committed-later")
+	if err := os.WriteFile(p, payload, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var st syscall.Stat_t
+	if err := syscall.Stat(p, &st); err != nil {
+		t.Fatal(err)
+	}
+	ino := uint64(st.Ino)
+	d.dirInodes = &dirInodePool{ctl: d.direct.ctl, ranges: []inodeRange{{next: ino, end: ino + 1}}}
+	return p, ino
+}
+
+// HIGH-2: the reply is lost (timeout), juicefs is still running the send on
+// retry (EAGAIN), then commits after the drainer stopped waiting. The number
+// recorded before the first send makes the next drainer, after a restart,
+// recognise the file as its own: no conflict copy, no second file, no second
+// send.
+func TestDrainDirectLateCommitIsOwnFileAfterRestart(t *testing.T) {
+	fixConflictClock(t)
+	spool, d := newTestDrainer(t, DrainerConfig{})
+	fake := withFakeCreateFiles(t, d)
+	const name = "/proj/late.xmp"
+	dest := filepath.Join(d.fuseRoot, name)
+	payload := patternedPayload(5000, 17)
+	e := writeSpoolEntry(t, spool, name, payload)
+	hidden, ino := reservedInodeFile(t, d, filepath.Dir(dest), payload)
+
+	fake.before = func([]jfsNewFile) error { return errors.New("juicefs control: no reply after 2m0s") }
+	drainOnce(t, d)
+	if base, _ := d.rowDrainBase(mustRow(t, spool, e.ID())); base.Kind != metadata.SpoolBaseClaimed || base.Ino != ino {
+		t.Fatalf("base %+v: the reserved number was not recorded before sending", base)
+	}
+	// Retry while juicefs still runs the first send.
+	fake.before = nil
+	fake.after = func(_ int, f jfsNewFile, c *jfsCreated) {
+		if f.preIno == ino {
+			c.err, c.ino = syscall.EAGAIN, 0
+		}
+	}
+	fake.root = t.TempDir() // the send must not create anything itself
+	time.Sleep(50 * time.Millisecond)
+	drainOnce(t, d)
+	if row := mustRow(t, spool, e.ID()); row.DrainState == metadata.DrainDone || row.DrainState == metadata.DrainFailed {
+		t.Fatalf("row %+v while the first send runs, want retryable", row)
+	}
+	// The first send commits late, then the app restarts.
+	if err := os.Rename(hidden, dest); err != nil {
+		t.Fatal(err)
+	}
+	d2 := restartTestDrainer(t, spool, d)
+	fake2 := withFakeCreateFiles(t, d2)
+	time.Sleep(50 * time.Millisecond)
+	drainOnce(t, d2)
+
+	row := mustRow(t, spool, e.ID())
+	if row.DrainState != metadata.DrainDone {
+		t.Fatalf("row %+v, want done (own file recognised)", row)
+	}
+	if fake2.count() != 0 {
+		t.Errorf("the restarted drainer sent the file again")
+	}
+	entries, _ := os.ReadDir(filepath.Dir(dest))
+	if len(entries) != 1 {
+		t.Fatalf("%d entries in the folder (a conflict copy?), want 1", len(entries))
+	}
+	if got := fake.preInos; len(got) != 2 || got[0][0] != ino || got[1][0] != ino {
+		t.Fatalf("reserved numbers sent %v, want [%d] twice", got, ino)
+	}
+}
+
+// HIGH-2, no reserved number: an ambiguous reply then a late commit of
+// exactly these bytes at a name that was free is adopted on retry.
+func TestDrainDirectLateCommitIdenticalBytesAdopted(t *testing.T) {
+	fixConflictClock(t)
+	spool, d := newTestDrainer(t, DrainerConfig{})
+	fake := withFakeCreateFiles(t, d)
+	d.dirInodes = nil
+	const name = "/proj/late2.xmp"
+	dest := filepath.Join(d.fuseRoot, name)
+	payload := patternedPayload(7000, 3)
+	e := writeSpoolEntry(t, spool, name, payload)
+	fake.before = func([]jfsNewFile) error { return errors.New("juicefs control: no reply after 2m0s") }
+	drainOnce(t, d)
+	if err := os.WriteFile(dest, payload, 0o644); err != nil { // the late commit
+		t.Fatal(err)
+	}
+	fake.before = nil
+	time.Sleep(50 * time.Millisecond)
+	drainOnce(t, d)
+	if row := mustRow(t, spool, e.ID()); row.DrainState != metadata.DrainDone {
+		t.Fatalf("row %+v, want done", row)
+	}
+	if fake.count() != 1 {
+		t.Errorf("%d messages, want 1 (the retry adopts)", fake.count())
+	}
+	entries, _ := os.ReadDir(filepath.Dir(dest))
+	if len(entries) != 1 {
+		t.Fatalf("%d entries, want 1", len(entries))
+	}
+}
+
+// The name appears after the base decision and holds the number this row
+// sent: juicefs's EEXIST is about our own earlier send, not a conflict.
+func TestDrainDirectEEXISTOwnReservedInode(t *testing.T) {
+	fixConflictClock(t)
+	spool, d := newTestDrainer(t, DrainerConfig{})
+	withFakeCreateFiles(t, d)
+	const name = "/proj/own.xmp"
+	dest := filepath.Join(d.fuseRoot, name)
+	payload := patternedPayload(4000, 9)
+	e := writeSpoolEntry(t, spool, name, payload)
+	hidden, _ := reservedInodeFile(t, d, filepath.Dir(dest), payload)
+	drainPreInstallHook = func(*metadata.SpoolRow) {
+		if err := os.Rename(hidden, dest); err != nil {
+			t.Error(err)
+		}
+	}
+	defer func() { drainPreInstallHook = nil }()
+	drainOnce(t, d)
+	if row := mustRow(t, spool, e.ID()); row.DrainState != metadata.DrainDone {
+		t.Fatalf("row %+v, want done", row)
+	}
+	entries, _ := os.ReadDir(filepath.Dir(dest))
+	if len(entries) != 1 {
+		t.Fatalf("%d entries (a conflict copy?), want 1", len(entries))
+	}
+}
+
+// juicefs no longer holds the number (it restarted): one resend with a new
+// number (none left here: juicefs picks).
+func TestDrainDirectVoidReservedInodeResends(t *testing.T) {
+	spool, d := newTestDrainer(t, DrainerConfig{})
+	fake := withFakeCreateFiles(t, d)
+	d.dirInodes = &dirInodePool{ctl: d.direct.ctl, ranges: []inodeRange{{next: 1 << 40, end: 1<<40 + 1}}}
+	fake.after = func(_ int, f jfsNewFile, c *jfsCreated) {
+		if f.preIno != 0 { // refused: nothing is created
+			_ = os.Remove(filepath.Join(d.fuseRoot, "proj", f.name))
+			c.err, c.ino = syscall.ESRCH, 0
+		}
+	}
+	e := writeSpoolEntry(t, spool, "/proj/void.xmp", []byte("void"))
+	drainOnce(t, d)
+	if row := mustRow(t, spool, e.ID()); row.DrainState != metadata.DrainDone {
+		t.Fatalf("row %+v, want done", row)
+	}
+	if got := fake.preInos; len(got) != 2 || got[0][0] != 1<<40 || got[1][0] != 0 {
+		t.Fatalf("reserved numbers sent %v", got)
+	}
+}
+
+// HIGH-1: macOS juicefs cannot invalidate the kernel's negative entry, so the
+// open after a successful publish may answer ENOENT for a few seconds. The
+// drain waits it out instead of failing (whose retry made a conflict copy of
+// its own file).
+func TestDrainDirectStaleNegativeEntryWaitedOut(t *testing.T) {
+	t.Setenv("JM_META_NEGATIVE_CACHE", "2s")
+	fixConflictClock(t)
+	spool, d := newTestDrainer(t, DrainerConfig{})
+	fake := withFakeCreateFiles(t, d)
+	const name = "/proj/neg.xmp"
+	dest := filepath.Join(d.fuseRoot, name)
+	fake.after = func(_ int, _ jfsNewFile, c *jfsCreated) {
+		if c.err != nil {
+			return
+		}
+		// The name answers ENOENT for 400 ms (the stale negative entry).
+		hidden := dest + ".hidden"
+		if err := os.Rename(dest, hidden); err != nil {
+			t.Error(err)
+			return
+		}
+		go func() {
+			time.Sleep(400 * time.Millisecond)
+			_ = os.Rename(hidden, dest)
+		}()
+	}
+	e := writeSpoolEntry(t, spool, name, patternedPayload(2048, 1))
+	drainOnce(t, d)
+	if row := mustRow(t, spool, e.ID()); row.DrainState != metadata.DrainDone {
+		t.Fatalf("row %+v, want done in one attempt", row)
+	}
+	if n := d.Metrics().DirectOpenWaits.Load(); n != 1 {
+		t.Errorf("open waits %d, want 1", n)
+	}
+	if fake.count() != 1 {
+		t.Errorf("%d messages, want 1", fake.count())
+	}
+	entries, _ := os.ReadDir(filepath.Dir(dest))
+	if len(entries) != 1 {
+		t.Fatalf("%d entries, want 1", len(entries))
+	}
+}
+
+func mustRow(t *testing.T, spool *SpoolStore, id int64) *metadata.SpoolRow {
+	t.Helper()
+	row, err := spool.Meta().Get(id)
+	if err != nil || row == nil {
+		t.Fatalf("row %d: %v", id, err)
+	}
+	return row
+}
+
+// restartTestDrainer builds a new drainer over the same spool and FUSE root,
+// as the app after a restart.
+func restartTestDrainer(t *testing.T, spool *SpoolStore, old *Drainer) *Drainer {
+	t.Helper()
+	d, err := NewDrainer(spool, DrainerConfig{FuseRoot: old.fuseRoot, BackoffBase: 5 * time.Millisecond, PollFallback: 100 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := spool.Meta().Owner()
+	d.SetOnDrainCommit(func(item metadata.DrainCommitItem) (metadata.DrainCommitResult, error) {
+		if store.LookupByPath(item.NFSPath) == nil {
+			if err := store.Insert(metadata.MakeEntry(item.NFSPath, false, 0, time.Now(), uint64(item.SpoolID))); err != nil {
+				return metadata.DrainCommitResult{}, err
+			}
+		}
+		return store.DrainComplete(item)
+	})
+	return d
 }

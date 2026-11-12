@@ -22,6 +22,7 @@ import (
 
 type jmTestFile struct {
 	parent meta.Ino
+	preIno meta.Ino
 	name   string
 	mode   uint16
 	mtime  time.Time
@@ -32,6 +33,7 @@ func jmCreateFilesBody(files []jmTestFile) []byte {
 	b := binary.BigEndian.AppendUint16(nil, uint16(len(files)))
 	for _, f := range files {
 		b = binary.BigEndian.AppendUint64(b, uint64(f.parent))
+		b = binary.BigEndian.AppendUint64(b, uint64(f.preIno))
 		b = binary.BigEndian.AppendUint16(b, f.mode)
 		b = binary.BigEndian.AppendUint16(b, 0)
 		b = binary.BigEndian.AppendUint64(b, uint64(f.mtime.Unix()))
@@ -125,10 +127,11 @@ func TestJMCreateFilesBatch(t *testing.T) {
 	mtime := time.Unix(1794490456, 987654321)
 	var files []jmTestFile
 	for i := 0; i < 5; i++ {
-		files = append(files, jmTestFile{dir.Inode, "small_" + string(rune('a'+i)), 0644, mtime, bytes.Repeat([]byte{byte(i + 1)}, 1000*(i+1))})
+		files = append(files, jmTestFile{dir.Inode, 0, "small_" + string(rune('a'+i)), 0644, mtime, bytes.Repeat([]byte{byte(i + 1)}, 1000*(i+1))})
 	}
-	files = append(files, jmTestFile{dir.Inode, "taken", 0644, mtime, []byte("must not land")})
-	files = append(files, jmTestFile{dir.Inode, "empty", 0600, mtime, nil})
+	files = append(files, jmTestFile{dir.Inode, 0, "taken", 0644, mtime, []byte("must not land")})
+	files = append(files, jmTestFile{dir.Inode, 0, "empty", 0600, mtime, nil})
+	files = append(files, jmTestFile{dir.Inode, 0, "", 0644, mtime, []byte("no name")})
 
 	r := jmSend(t, v, jmCreateFilesBody(files))
 	if r.status != 0 {
@@ -136,8 +139,11 @@ func TestJMCreateFilesBatch(t *testing.T) {
 	}
 	for i, f := range files {
 		want := syscall.Errno(0)
-		if f.name == "taken" {
+		switch f.name {
+		case "taken":
 			want = syscall.EEXIST
+		case "":
+			want = syscall.EINVAL // this file alone
 		}
 		if r.errs[i] != want {
 			t.Fatalf("%s: %v, want %v", f.name, r.errs[i], want)
@@ -168,13 +174,12 @@ func TestJMCreateFilesBatch(t *testing.T) {
 // announced file, so the caller never waits for bytes that do not come.
 func TestJMCreateFilesMalformed(t *testing.T) {
 	v, _ := createTestVFS(nil, "")
-	good := jmCreateFilesBody([]jmTestFile{{1, "a", 0644, time.Now(), []byte("x")}, {1, "b", 0644, time.Now(), nil}})
+	good := jmCreateFilesBody([]jmTestFile{{1, 0, "a", 0644, time.Now(), []byte("x")}, {1, 0, "b", 0644, time.Now(), nil}})
 	for name, body := range map[string][]byte{
-		"truncated":  good[:len(good)-3],
-		"trailing":   append(append([]byte(nil), good...), 0),
-		"empty name": jmCreateFilesBody([]jmTestFile{{1, "", 0644, time.Now(), nil}}),
-		"too large":  jmCreateFilesBody([]jmTestFile{{1, "a", 0644, time.Now(), make([]byte, jmCreateFilesMaxBytes+1)}}),
-		"no files":   {0, 0},
+		"truncated": good[:len(good)-3],
+		"trailing":  append(append([]byte(nil), good...), 0),
+		"too large": jmCreateFilesBody([]jmTestFile{{1, 0, "a", 0644, time.Now(), make([]byte, jmCreateFilesMaxBytes+1)}}),
+		"no files":  {0, 0},
 	} {
 		r := jmSend(t, v, body)
 		if r.status != syscall.EINVAL {
@@ -192,7 +197,7 @@ func TestJMCreateFilesMalformed(t *testing.T) {
 // caller falls back to the ordinary create path.
 func TestJMCreateFilesUnsupportedEngine(t *testing.T) {
 	v, blob := createTestVFS(nil, "")
-	r := jmSend(t, v, jmCreateFilesBody([]jmTestFile{{1, "a", 0644, time.Now(), []byte("data")}}))
+	r := jmSend(t, v, jmCreateFilesBody([]jmTestFile{{1, 0, "a", 0644, time.Now(), []byte("data")}}))
 	if r.status != syscall.ENOTSUP || r.errs[0] != syscall.ENOTSUP {
 		t.Fatalf("reply %+v, want ENOTSUP", r)
 	}
@@ -217,12 +222,51 @@ func TestJMCreateFilesIgnoresHandleCancel(t *testing.T) {
 	hctx := meta.NewContext(1, 0, []uint32{0})
 	hctx.Cancel()
 	var out bytes.Buffer
-	v.jmHandleCreateFiles(hctx, utils.ReadBuffer(jmCreateFilesBody([]jmTestFile{{1, "after-flush", 0644, time.Now(), []byte("kept")}})), &out)
+	v.jmHandleCreateFiles(hctx, utils.ReadBuffer(jmCreateFilesBody([]jmTestFile{{1, 0, "after-flush", 0644, time.Now(), []byte("kept")}})), &out)
 	b := out.Bytes()
 	if len(b) != 4+9 || b[1] != 0 || b[4] != 0 {
 		t.Fatalf("reply %x, want success", b)
 	}
 	if data, _ := jmReadAll(t, v, 1, "after-flush"); string(data) != "kept" {
 		t.Fatalf("read %q", data)
+	}
+}
+
+// A reserved number in the message: the file gets it, and a resend after a
+// lost reply is recognised as the same file.
+func TestJMCreateFilesReservedInode(t *testing.T) {
+	v := jmRedisVFS(t)
+	jm := v.Meta.(interface {
+		JMReserveInodes(n uint32) (meta.Ino, uint32, syscall.Errno)
+	})
+	first, n, st := jm.JMReserveInodes(4)
+	if st != 0 || n == 0 {
+		t.Fatalf("reserve: %v %d", st, n)
+	}
+	body := jmCreateFilesBody([]jmTestFile{{1, first, "reserved.xmp", 0644, time.Now(), []byte("mine")}})
+	for i := 0; i < 2; i++ {
+		r := jmSend(t, v, body)
+		if r.status != 0 || r.errs[0] != 0 || r.inos[0] != first {
+			t.Fatalf("send %d: %+v, want inode %d", i, r, first)
+		}
+	}
+	if data, attr := jmReadAll(t, v, 1, "reserved.xmp"); string(data) != "mine" || attr.Length != 4 {
+		t.Fatalf("read %q", data)
+	}
+}
+
+// A folder that refused with ENOTSUP is remembered: the next file for it is
+// refused before its upload.
+func TestJMCreateFilesRefusedParentSkipsUpload(t *testing.T) {
+	v, blob := createTestVFS(nil, "")
+	jmNoteParentRefused(77)
+	t.Cleanup(func() { jmRefusedMu.Lock(); delete(jmRefused, 77); jmRefusedMu.Unlock() })
+	f := &jmNewFile{parent: 77, name: "x", data: []byte("bytes")}
+	v.jmUpload(meta.Background(), f)
+	if f.eno != syscall.ENOTSUP || f.slice.Id != 0 {
+		t.Fatalf("upload for a refused folder: %v slice %d", f.eno, f.slice.Id)
+	}
+	if objs, _, _, _ := blob.List("", "", "", "", 10, false); len(objs) != 0 {
+		t.Fatalf("%d objects uploaded", len(objs))
 	}
 }

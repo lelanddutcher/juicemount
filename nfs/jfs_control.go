@@ -194,6 +194,10 @@ const jfsMsgCreateFiles = 1104
 // jfsNewFile is one file of a createFiles message.
 type jfsNewFile struct {
 	parent uint64
+	// preIno is a number this client reserved (reserveInodes) for the file,
+	// recorded before sending so a retry recognises its own file; 0: juicefs
+	// picks one.
+	preIno uint64
 	name   string
 	mode   os.FileMode
 	mtime  time.Time
@@ -211,8 +215,38 @@ const (
 	jfsCreateFilesReplyMarker = 0xA5
 	jfsCreateFilesMax         = 64
 	jfsCreateFileMaxBytes     = 1 << 20
-	jfsCreateFilesTimeout     = 10 * time.Minute
+	// The reply waits for the uploads: a base for the transaction plus
+	// the bytes at a thin link's rate (16 KiB/s).
+	jfsCreateFilesTimeoutBase = 2 * time.Minute
+	jfsCreateFilesTimeoutRate = 16 << 10
 	jfsCreateFilesBodyBase    = 2
+)
+
+// jfsCreateFilesTimeout bounds one exchange carrying total bytes. The
+// control lock is held for its whole length.
+func jfsCreateFilesTimeout(total int) time.Duration {
+	return jfsCreateFilesTimeoutBase + time.Duration(total/jfsCreateFilesTimeoutRate)*time.Second
+}
+
+// sharedJFSControl returns the one control client of the mount at root. The
+// drainer's inode pool and its direct publisher share it, so their exchanges
+// queue on one lock instead of racing for juicefs's per-process control
+// handle (on macOS one handle per pid: two clients would read each other's
+// replies).
+func sharedJFSControl(root string) *jfsControl {
+	jfsControlsMu.Lock()
+	defer jfsControlsMu.Unlock()
+	c := jfsControls[root]
+	if c == nil {
+		c = newJFSControl(root)
+		jfsControls[root] = c
+	}
+	return c
+}
+
+var (
+	jfsControlsMu sync.Mutex
+	jfsControls   = map[string]*jfsControl{}
 )
 
 // errCreateFilesRefused wraps the refusal of a whole createFiles message
@@ -234,6 +268,7 @@ func (c *jfsControl) createFiles(files []jfsNewFile) ([]jfsCreated, error) {
 		return nil, &errCreateFilesRefused{syscall.EINVAL}
 	}
 	body := jfsCreateFilesBodyBase
+	total := 0
 	for _, f := range files {
 		if len(f.name) == 0 || len(f.name) > 255 {
 			return nil, &errCreateFilesRefused{syscall.ENAMETOOLONG}
@@ -241,7 +276,8 @@ func (c *jfsControl) createFiles(files []jfsNewFile) ([]jfsCreated, error) {
 		if len(f.data) > jfsCreateFileMaxBytes {
 			return nil, &errCreateFilesRefused{syscall.EFBIG}
 		}
-		body += 8 + 2 + 2 + 8 + 4 + 1 + len(f.name) + 4 + len(f.data)
+		body += 8 + 8 + 2 + 2 + 8 + 4 + 1 + len(f.name) + 4 + len(f.data)
+		total += len(f.data)
 	}
 	msg := controlHeader(jfsMsgCreateFiles, body)
 	msg = binary.BigEndian.AppendUint16(msg, uint16(len(files)))
@@ -251,6 +287,7 @@ func (c *jfsControl) createFiles(files []jfsNewFile) ([]jfsCreated, error) {
 			sec, nsec = 0, 0
 		}
 		msg = binary.BigEndian.AppendUint64(msg, f.parent)
+		msg = binary.BigEndian.AppendUint64(msg, f.preIno)
 		msg = binary.BigEndian.AppendUint16(msg, uint16(f.mode.Perm()))
 		msg = binary.BigEndian.AppendUint16(msg, 0) // the mode is final; no umask
 		msg = binary.BigEndian.AppendUint64(msg, uint64(sec))
@@ -267,7 +304,7 @@ func (c *jfsControl) createFiles(files []jfsNewFile) ([]jfsCreated, error) {
 		}
 		return replyLen
 	}
-	reply, err := c.exchangeUntil(msg, replyLen, want, jfsCreateFilesTimeout)
+	reply, err := c.exchangeUntil(msg, replyLen, want, jfsCreateFilesTimeout(total))
 	if err != nil {
 		var ns *errControlNotSent
 		if errors.As(err, &ns) {
