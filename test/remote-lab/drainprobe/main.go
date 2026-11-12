@@ -99,6 +99,7 @@ func write(args []string) error {
 	mkdirs := fs.Int("mkdirs", 1, "extra nested folders created after the first (each timed)")
 	small := fs.Int("small", 200, "small files")
 	bigMB := fs.Int("big-mb", 500, "size of the one large file in MB (0 = none)")
+	folders := fs.Int("folders", 0, "spread the small files round-robin over this many new folders inside -dir (0 = all in -dir)")
 	_ = fs.Parse(args)
 	if *dir == "" {
 		return fmt.Errorf("-dir is required")
@@ -128,6 +129,18 @@ func write(args []string) error {
 		mk = append(mk, secs(time.Since(t)))
 	}
 
+	for i := 0; i < *folders; i++ {
+		if _, err := mkdirLikeMacOS(v, fmt.Sprintf("%s/f%02d", *dir, i)); err != nil {
+			return fmt.Errorf("mkdir folder %d: %w", i, err)
+		}
+	}
+	smallName := func(i int) string {
+		if *folders > 0 {
+			return fmt.Sprintf("%s/f%02d/small_%03d.xmp", *dir, i%*folders, i)
+		}
+		return fmt.Sprintf("%s/small_%03d.xmp", *dir, i)
+	}
+
 	rnd := mrand.New(mrand.NewSource(7))
 	buf := make([]byte, 8<<20)
 	_, _ = rand.Read(buf)
@@ -135,7 +148,7 @@ func write(args []string) error {
 	t1 := time.Now()
 	for i := 0; i < *small; i++ {
 		s := time.Now()
-		f, err := v.OpenFile(fmt.Sprintf("%s/small_%03d.xmp", *dir, i), 0o644)
+		f, err := v.OpenFile(smallName(i), 0o644)
 		if err != nil {
 			return fmt.Errorf("create small %d: %w", i, err)
 		}
@@ -179,7 +192,7 @@ func write(args []string) error {
 	}
 	emit(map[string]any{
 		"step": "write", "dir": *dir, "mkdir_s": mk, "mkdir_jukebox": jukebox,
-		"small": *small, "small_total_s": secs(smallTotal), "small_p50_s": q(0.5), "small_p95_s": q(0.95),
+		"small": *small, "folders": *folders, "small_total_s": secs(smallTotal), "small_p50_s": q(0.5), "small_p95_s": q(0.95),
 		"big_mb": *bigMB, "big_total_s": secs(bigTotal),
 	})
 	return nil

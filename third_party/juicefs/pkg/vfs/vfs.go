@@ -693,6 +693,12 @@ func (v *VFS) Read(ctx Context, ino Ino, buf []byte, off uint64, fh uint64) (n i
 			err = syscall.EBADF
 			return
 		}
+		if ino != logInode {
+			// JuiceMount patch 0025: a control message's goroutine appends its
+			// reply to h.data under h's lock while the client polls.
+			h.Lock()
+			defer h.Unlock()
+		}
 		if len(h.data) == 0 {
 			switch ino {
 			case StatsInode:
@@ -714,8 +720,6 @@ func (v *VFS) Read(ctx Context, ino Ino, buf []byte, off uint64, fh uint64) (n i
 			n = readAccessLog(fh, buf)
 		} else {
 			defer func() { logit(ctx, "read", err, "(%d,%d,%d,%d): %d", ino, size, off, fh, n) }()
-			h.Lock()
-			defer h.Unlock()
 			if off < h.off {
 				logger.Errorf("read dropped data from %s: %d < %d", ino, off, h.off)
 				err = syscall.EIO

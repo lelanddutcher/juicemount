@@ -35,6 +35,8 @@ const (
 type jmReservation struct {
 	mu  sync.Mutex
 	ids map[Ino]struct{}
+	// inflight: numbers a JMCreateFilesIn is creating with (patch 0025).
+	inflight map[Ino]struct{}
 }
 
 var jmReservations sync.Map // *baseMeta -> *jmReservation

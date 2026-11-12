@@ -4,6 +4,30 @@
 
 ### App
 
+- On a slow or distant link, small saves reach the server about 2.5 times
+  faster. Before, the app published each saved file through a hidden
+  temporary file in its folder: create, write, flush, set the time, then
+  rename it to its real name. That cost about 16 metadata round trips per
+  file. The kernel holds the folder's lock over 7 of them, so saves into one
+  folder reached the server one every 1.6 to 1.9 s at 200 ms, however many
+  uploads ran. Now a file of 1 MiB or less under a new name goes to the
+  bundled JuiceFS whole (patch 0025, `-jm10`). JuiceFS uploads its bytes,
+  then creates the file with its data, time and permissions in one metadata
+  transaction: 2 round trips, and one transaction for all the files of a
+  folder that are sent together. The name never appears empty or half
+  written, an existing name is never replaced (a conflict copy is made, as
+  before), and a juicefs or a server without the message makes the app use
+  the old way. In the drain lab (200 ms; 200 small files), the files reached
+  the server in 147 s in one folder (before: 385 s), 130 s over 10 folders
+  (before: 223 s), and 222 s beside a 500 MB file (before: 405 s); with 1%
+  loss, 154, 152 and 167 s (before: 395, 236 and 420 s). Round trips per
+  file fell from about 28 to 11 to 14. The 500 MB file uploads as before.
+  Each file is sent with an inode number the app reserved and recorded
+  first, so after a lost reply, a late commit, a crash or a quit the app
+  recognises its own file and never makes a conflict copy of it. On macOS
+  the app waits out the kernel's few seconds of "no such file" for a name
+  it looked up before JuiceFS created it.
+  Field switch: `JM_DRAIN_DIRECT_CREATE=0` (the old way for every file).
 - On an enrolled Mac, creating a folder over a distant link is instant
   again. The app reserved folder numbers 256 at a time, but the server's
   Redis proxy lets a Mac reserve them only exactly 1024 at a time, so it

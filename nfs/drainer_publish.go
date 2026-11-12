@@ -357,6 +357,14 @@ type drainTarget struct {
 	// (H-8B base mismatch). The stage is published beside it as a conflict
 	// copy instead of at the destination.
 	conflict string
+	// direct: the name is free and the file small; drainDirect publishes it
+	// whole (no f, path or stage).
+	direct bool
+	// adoptIno: the name already holds this row's own complete file with
+	// this inode (an earlier direct publish whose reply was lost, or that
+	// committed after the drainer stopped waiting). The row completes without
+	// writing.
+	adoptIno, adoptDev uint64
 }
 
 // abandon releases a failed or canceled drain. It removes only a stage. A
@@ -517,7 +525,11 @@ func (d *Drainer) drainStillClaimed(row *metadata.SpoolRow) (bool, error) {
 // recorded when the write opened (see drainBaseAllowsInPlace). A file the
 // row did not expect is never truncated: the bytes go to a stage and publish
 // beside it as a conflict copy.
-func (d *Drainer) openDrainTarget(row *metadata.SpoolRow, dest string, lease leaseDecision) (*drainTarget, bool) {
+//
+// mtime is the spool's time (zero when unknown). An adopted file gets it here,
+// under the lease: after the lease ends the app may save the name again, and
+// a time set later by path would land on that newer file.
+func (d *Drainer) openDrainTarget(row *metadata.SpoolRow, dest string, lease leaseDecision, mtime time.Time) (*drainTarget, bool) {
 	base, accepted := d.rowDrainBase(row)
 	tainted := lease.taints(accepted)
 	op, ok := d.beginInstallLease(row)
@@ -562,6 +574,23 @@ func (d *Drainer) openDrainTarget(row *metadata.SpoolRow, dest string, lease lea
 		default:
 			conflict = "the file this save replaces changed since the save"
 		}
+	case lerr == nil && st.Mode&unix.S_IFMT == unix.S_IFREG && d.directAdoptTarget(row, dest, base, &st, tainted):
+		// The bytes are this save's; an in-place attempt that wrote them may
+		// not have set the time yet (as the stage path, after the write).
+		var terr error
+		if !mtime.IsZero() && st.Mtim.Nano() != mtime.UnixNano() {
+			terr = os.Chtimes(dest, mtime, mtime)
+		}
+		if op != nil {
+			op.finish(nil)
+		}
+		if terr != nil {
+			d.failTransient(row, fmt.Errorf("chtimes adopted file: %w", terr))
+			return nil, false
+		}
+		jmlog.Info("drain: the name already holds this save's own file; completing without writing",
+			"path", row.NFSPath, "base", base.Kind.String())
+		return &drainTarget{adoptIno: uint64(st.Ino), adoptDev: uint64(st.Dev)}, true //nolint:unconvert // int32 on Darwin
 	case lerr == nil && st.Mode&unix.S_IFMT == unix.S_IFREG:
 		inPlace, why := drainBaseAllowsInPlace(base, &st, tainted)
 		if !inPlace && base.Kind == metadata.SpoolBaseAbsent && d.olderRowInstalledDest(row, dest) {
@@ -619,6 +648,9 @@ func (d *Drainer) openDrainTarget(row *metadata.SpoolRow, dest string, lease lea
 	if conflict == "" && replace == nil && !errors.Is(err, os.ErrNotExist) && !errors.Is(err, unix.ENOENT) {
 		d.failTransient(row, fmt.Errorf("open existing dest: %w", err))
 		return nil, false
+	}
+	if conflict == "" && replace == nil && d.directEligible(row) {
+		return &drainTarget{direct: true}, true
 	}
 	instance, _ := d.instanceID()
 	stage, err := createDrainStage(dest, instance, row.ID)

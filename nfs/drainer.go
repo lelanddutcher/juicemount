@@ -180,7 +180,9 @@ type Drainer struct {
 	// Spooled MKDIR (spooled_mkdir.go). dirInodes is nil when it is off.
 	// onDirMaterialized is set once before Start. symlinkWake asks the
 	// dispatcher to retry pending symlinks (one made in a pending folder).
-	dirInodes         *dirInodePool
+	dirInodes *dirInodePool
+	// direct publishes small new files whole (drain_direct.go); nil when off.
+	direct            *directPublisher
 	onDirMaterialized func(dirPath string, inode uint64)
 	symlinkWake       atomic.Bool
 
@@ -285,6 +287,12 @@ type DrainerMetrics struct {
 	DrainsSucceeded atomic.Int64
 	DrainsFailed    atomic.Int64
 	DrainsRetried   atomic.Int64
+	// DrainsDirect counts files published whole through JMCreateFiles
+	// (drain_direct.go) instead of a stage.
+	DrainsDirect atomic.Int64
+	// DirectOpenWaits counts published files whose first open answered a
+	// stale ENOENT (the kernel's negative entry) and was waited out.
+	DirectOpenWaits atomic.Int64
 	Quarantined     atomic.Int64
 	BytesDrained    atomic.Int64
 	InFlight        atomic.Int64
@@ -398,8 +406,14 @@ func NewDrainer(spool *SpoolStore, cfg DrainerConfig) (*Drainer, error) {
 	if d.batchInsert {
 		d.batch = newDrainBatcher(d, drainBatchMaxOps, drainBatchMaxDelay)
 	}
-	if spooledMkdirEnabled() && cfg.FuseRoot != "" {
-		d.dirInodes = newDirInodePool(newJFSControl(cfg.FuseRoot))
+	// One control client per mount (sharedJFSControl): macOS juicefs keeps
+	// one control handle per process, so messages must not interleave. The
+	// direct publisher sends each file with a number from the same pool.
+	if (spooledMkdirEnabled() || drainDirectEnabled()) && cfg.FuseRoot != "" {
+		d.dirInodes = newDirInodePool(sharedJFSControl(cfg.FuseRoot))
+	}
+	if drainDirectEnabled() && cfg.FuseRoot != "" {
+		d.direct = newDirectPublisher(sharedJFSControl(cfg.FuseRoot))
 	}
 	// H-8B: every new spool row records the base identity of the file it
 	// replaces. The drainer owns the FUSE root, so it supplies the probe.
@@ -1583,9 +1597,35 @@ func (d *Drainer) drainOne(row *metadata.SpoolRow) {
 	// H-8: an existing destination is rewritten in place (inode kept); a new
 	// name is copied to a private O_EXCL stage. The decision, the claim
 	// recheck and the in-place open run under the namespace lease.
-	tgt, ok := d.openDrainTarget(row, dest, lease)
+	tgt, ok := d.openDrainTarget(row, dest, lease, spoolMtime)
 	if !ok {
 		return
+	}
+	if tgt.adoptIno != 0 {
+		// openDrainTarget already set the time, under the lease.
+		data, _, ok := d.directReadSpool(row, src)
+		if !ok {
+			return
+		}
+		mtime := spoolMtime
+		if mtime.IsZero() {
+			mtime = time.Now()
+		}
+		d.finishPublished(row, dest, tgt.adoptIno, tgt.adoptDev, mtime, data, ph)
+		return
+	}
+	if tgt.direct {
+		// A small file under a free name: published whole, no stage.
+		if d.drainDirect(row, src, dest, spoolMtime, ph) {
+			return
+		}
+		instance, _ := d.instanceID()
+		stage, err := createDrainStage(dest, instance, row.ID)
+		if err != nil {
+			d.failTransient(row, fmt.Errorf("create drain stage: %w", err))
+			return
+		}
+		tgt = &drainTarget{f: stage.f, path: stage.path, stage: stage}
 	}
 	dst := tgt.f
 	// Review fix (phase-1 adversarial review, HIGH — the TOCTOU that would

@@ -133,6 +133,11 @@ func (f *fakeJuiceFSControl) exchange(msg []byte, replyLen int) ([]byte, error) 
 		binary.BigEndian.PutUint32(reply[1:5], released)
 		return reply, nil
 	}
+	if cmd == jfsMsgCreateFiles {
+		// This fake is a juicefs without patch 0025: one EINVAL byte, as
+		// juicefs answers any unknown message.
+		return []byte{byte(syscall.EINVAL)}, nil
+	}
 	f.t.Fatalf("unexpected control message %d", cmd)
 	return nil, nil
 }

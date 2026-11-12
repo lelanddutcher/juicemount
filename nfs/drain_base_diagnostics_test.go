@@ -253,7 +253,7 @@ func TestDrainBaseDiagnosticRefusalPreservesConflict(t *testing.T) {
 			}
 			row := rowOf(t, spool, e)
 			lease := leaseDecision{foreignBefore: tc.foreignBefore}
-			target, ok := d.openDrainTarget(row, dest, lease)
+			target, ok := d.openDrainTarget(row, dest, lease, time.Time{})
 			if !ok || target == nil || target.stage == nil || target.conflict == "" {
 				t.Fatalf("refusal bypassed: ok=%v target=%+v", ok, target)
 			}
