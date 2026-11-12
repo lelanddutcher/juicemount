@@ -28,6 +28,12 @@
   the app waits out the kernel's few seconds of "no such file" for a name
   it looked up before JuiceFS created it.
   Field switch: `JM_DRAIN_DIRECT_CREATE=0` (the old way for every file).
+- On an enrolled Mac, creating a folder over a distant link is instant
+  again. The app reserved folder numbers 256 at a time, but the server's
+  Redis proxy lets a Mac reserve them only exactly 1024 at a time, so it
+  refused every request and each new folder fell back to waiting for the
+  server: 6 s on a 200 ms link (measured against a real NAS). The app now
+  reserves 1024 at a time.
 - On an encrypted volume over a slow or distant link, a slow cold read no
   longer turns into a retry wait. An encrypted volume (one formatted with an
   RSA key) fetches a whole 4 MiB block for any cold read. On a 200 ms link
