@@ -326,7 +326,7 @@ type wSlice struct {
 	uploadFailed atomic.Bool
 	pendings     int
 	writeback    bool
-	finishing    bool // JuiceMount: Finish is uploading the last blocks (jm_upload_lane.go)
+	smallSave    atomic.Bool // JuiceMount: an fsync or close of a small file (jm_upload_lane.go)
 }
 
 func sliceForWrite(id uint64, store *cachedStore) *wSlice {
@@ -585,7 +585,6 @@ func (s *wSlice) Finish(length int) error {
 	}
 
 	n := (length-1)/s.store.conf.BlockSize + 1
-	s.finishing = true
 	if err := s.FlushTo(n * s.store.conf.BlockSize); err != nil {
 		return err
 	}
@@ -647,9 +646,9 @@ type Config struct {
 	// DemandFirst: reads that an application waits for go before the
 	// prefetcher (JuiceMount, demand_first.go).
 	DemandFirst bool
-	// SmallUploads: upload tokens beside MaxUpload that only slices of at
-	// most 1 MiB, uploaded when they are finished, may take; 0 turns the
-	// lane off (JuiceMount, jm_upload_lane.go).
+	// SmallUploads: upload tokens beside MaxUpload that only the slices of
+	// a file of at most 1 MiB that an fsync or close flushes may take; 0
+	// turns the lane off (JuiceMount, jm_upload_lane.go).
 	SmallUploads int
 }
 

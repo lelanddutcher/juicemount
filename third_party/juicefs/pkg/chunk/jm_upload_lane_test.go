@@ -34,7 +34,7 @@ type laneStorage struct {
 }
 
 func (l *laneStorage) Put(key string, in io.Reader, getters ...object.AttrGetter) error {
-	small := parseObjOrigSize(key) <= smallUploadBytes
+	small := parseObjOrigSize(key) <= SmallUploadBytes
 	l.mu.Lock()
 	if small {
 		l.small++
@@ -107,14 +107,24 @@ func laneBytes(n int, seed byte) []byte {
 }
 
 // writeSlice writes data into a new slice and finishes it in a goroutine;
-// the channel gets Finish's result.
+// the channel gets Finish's result. A slice of at most 1 MiB is marked as
+// pkg/vfs marks an fsync or close of a small file.
 func writeSlice(store ChunkStore, id uint64, data []byte) chan error {
+	return writeSliceMarked(store, id, data, len(data) <= SmallUploadBytes)
+}
+
+// writeSliceMarked is writeSlice with the mark chosen by the caller: false
+// is a background flush (a slice older than 5 s or idle for 1 s).
+func writeSliceMarked(store ChunkStore, id uint64, data []byte, smallSave bool) chan error {
 	done := make(chan error, 1)
 	go func() {
 		w := store.NewWriter(id)
 		if _, err := w.WriteAt(data, 0); err != nil {
 			done <- err
 			return
+		}
+		if smallSave {
+			w.(interface{ SetSmallSave() }).SetSmallSave()
 		}
 		done <- w.Finish(len(data))
 	}()
@@ -276,33 +286,73 @@ func (s *slowStorage) Put(key string, in io.Reader, getters ...object.AttrGetter
 	return s.ObjectStorage.Put(key, in, getters...)
 }
 
-// Only a finished slice of at most 1 MiB takes the lane: not a larger slice,
-// not its 1 MiB tail, and not a block a growing slice uploads before Finish.
-func TestJMUploadLaneOnlyFinishedSmallSlices(t *testing.T) {
+// Only a marked slice of at most 1 MiB takes the lane: not an unmarked one
+// (a background flush), and not a marked one larger than 1 MiB.
+func TestJMUploadLaneOnlyMarkedSmallSlices(t *testing.T) {
 	store := NewCachedStore(&laneStorage{ObjectStorage: nil}, laneConf(2), nil).(*cachedStore)
 	cases := []struct {
-		length    int
-		finishing bool
-		want      bool
+		length int
+		marked bool
+		want   bool
 	}{
 		{1, true, true},
-		{smallUploadBytes, true, true},
-		{smallUploadBytes + 1, true, false},
-		{4<<20 + 1000, true, false}, // a render's tail block is not small
-		{smallUploadBytes, false, false},
+		{SmallUploadBytes, true, true},
+		{SmallUploadBytes + 1, true, false},
+		{4<<20 + 1000, true, false},
+		{1, false, false},
+		{SmallUploadBytes, false, false},
 	}
 	for _, c := range cases {
 		s := sliceForWrite(1, store)
-		s.length, s.finishing = c.length, c.finishing
+		s.length = c.length
+		if c.marked {
+			s.SetSmallSave()
+		}
 		if got := s.smallLane(); got != c.want {
-			t.Fatalf("length %d finishing %v: lane %v, want %v", c.length, c.finishing, got, c.want)
+			t.Fatalf("length %d marked %v: lane %v, want %v", c.length, c.marked, got, c.want)
 		}
 	}
 	off := NewCachedStore(&laneStorage{ObjectStorage: nil}, laneConf(0), nil).(*cachedStore)
 	s := sliceForWrite(1, off)
-	s.length, s.finishing = 1, true
+	s.length = 1
+	s.SetSmallSave()
 	if s.smallLane() {
 		t.Fatal("--small-uploads 0 must turn the lane off")
+	}
+}
+
+// The review case: a large file written slower than 1 MiB per 5 s is flushed
+// by the background timers in slices under 1 MiB. Those are not marked, so
+// they wait for the shared tokens and never use the lane: a render on a thin
+// link keeps to --max-uploads PUTs.
+func TestJMUploadLaneUnmarkedSmallSlicesStayShared(t *testing.T) {
+	mem, _ := object.CreateStorage("mem", "", "", "", "")
+	ls := &laneStorage{ObjectStorage: mem, largeGate: make(chan struct{}), smallGate: make(chan struct{})}
+	store := NewCachedStore(ls, laneConf(2), nil)
+	large := laneBytes(4*4<<20, 1)
+	largeDone := writeSlice(store, 1, large)
+	waitFor(t, "four large PUTs", func() bool { _, l := ls.inFlight(); return l == 4 })
+	var timer []chan error
+	for i := 0; i < 3; i++ {
+		timer = append(timer, writeSliceMarked(store, uint64(10+i), laneBytes(560<<10, byte(i)), false))
+	}
+	time.Sleep(100 * time.Millisecond)
+	if s, _ := ls.inFlight(); s != 0 {
+		t.Fatalf("%d unmarked small slices took the lane", s)
+	}
+	cs := store.(*cachedStore)
+	if n := len(cs.smallUpload); n != 0 {
+		t.Fatalf("lane tokens held: %d", n)
+	}
+	close(ls.smallGate)
+	close(ls.largeGate)
+	for _, d := range append(timer, largeDone) {
+		if err := <-d; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, maxLarge, maxTotal := ls.counts(); maxTotal > 4 || maxLarge > 4 {
+		t.Fatalf("PUTs in flight: large %d total %d, want at most 4", maxLarge, maxTotal)
 	}
 }
 

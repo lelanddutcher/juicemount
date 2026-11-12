@@ -10,8 +10,10 @@
   cellular links), and before, every upload waited in one line. While a
   render uploaded in 4 MiB blocks, each small save waited for one of them:
   about 38 s per save in the laptop lab (200 ms, 1% loss, server BBR). The
-  bundled JuiceFS (patch 0024, `-jm9`) now keeps two more upload slots that
-  only small saves may use. Large blocks still use at most four, so at most
+  bundled JuiceFS (patch 0024, `-jm9`) now keeps two more upload slots
+  (one on a metered link) that only the fsync or close of a file of 1 MiB
+  or less may use. A large file's blocks still use at most four slots, also
+  when JuiceFS uploads them in small pieces on a very slow link, so at most
   2 MiB more is in flight. A save still returns only after its data is on
   the server. In the laptop lab with a 500 MB render draining after reads,
   168 and 169 of 201 saved files reached the server in 10 minutes (before:
@@ -21,7 +23,8 @@
   render at all (166 to 168 of 200). The rest of their time is metadata
   round trips, not the upload, so 200 small saves still take about 12
   minutes on that link.
-  Field switch: `JM_JFS_SMALL_UPLOADS` (0 to 4; 0 turns the slots off).
+  Field switch: `JM_JFS_SMALL_UPLOADS` (0 to 4; 0 or any other value turns
+  the slots off).
 - On a slow or distant link, a large file no longer holds back every other
   save. Before, after the app had read any uncached file, a project save
   (`.prproj`, `.drp`) did not reach the server until a large render saved

@@ -86,10 +86,21 @@ func TestDesktopJuiceFSHeartbeatKeepsSessionForFiveMinutes(t *testing.T) {
 }
 
 func TestDesktopJuiceFSSmallUploadSlots(t *testing.T) {
-	for v, want := range map[string]string{"": "2", "0": "0", "4": "4", "5": "2", "-1": "2", "x": "2"} {
+	t.Setenv("JM_JFS_SMALL_UPLOADS", "")
+	for class, want := range map[netprofile.LinkClass]string{
+		netprofile.ClassFast: "2", netprofile.ClassMedium: "2", netprofile.ClassSlow: "2", netprofile.ClassMetered: "1",
+	} {
+		if got := desktopJuiceFSSmallUploadArgs(class); !slices.Equal(got, []string{"--small-uploads", want}) {
+			t.Fatalf("class %s: args %v, want --small-uploads %s", class, got, want)
+		}
+	}
+	// The override wins on every class; anything not 0 to 4 turns the slots off.
+	for v, want := range map[string]string{"0": "0", "4": "4", "2": "2", "5": "0", "-1": "0", "x": "0", "off": "0"} {
 		t.Setenv("JM_JFS_SMALL_UPLOADS", v)
-		if got := desktopJuiceFSSmallUploadArgs(); !slices.Equal(got, []string{"--small-uploads", want}) {
-			t.Fatalf("JM_JFS_SMALL_UPLOADS=%q: args %v, want --small-uploads %s", v, got, want)
+		for _, class := range []netprofile.LinkClass{netprofile.ClassSlow, netprofile.ClassMetered} {
+			if got := desktopJuiceFSSmallUploadArgs(class); !slices.Equal(got, []string{"--small-uploads", want}) {
+				t.Fatalf("JM_JFS_SMALL_UPLOADS=%q class %s: args %v, want --small-uploads %s", v, class, got, want)
+			}
 		}
 	}
 }

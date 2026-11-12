@@ -129,8 +129,8 @@ func storageFlags() []cli.Flag {
 		},
 		&cli.IntFlag{
 			Name:  "small-uploads",
-			Value: 2,
-			Usage: "extra connections that only slices of at most 1 MiB, uploaded when they are finished, may use; 0 turns it off (JuiceMount)",
+			Value: 0,
+			Usage: "extra upload connections that only files of at most 1 MiB, flushed by fsync or close, may use; 0 turns it off (JuiceMount)",
 		},
 		&cli.IntFlag{
 			Name:  "max-stage-write",
