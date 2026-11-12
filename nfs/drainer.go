@@ -180,7 +180,9 @@ type Drainer struct {
 	// Spooled MKDIR (spooled_mkdir.go). dirInodes is nil when it is off.
 	// onDirMaterialized is set once before Start. symlinkWake asks the
 	// dispatcher to retry pending symlinks (one made in a pending folder).
-	dirInodes         *dirInodePool
+	dirInodes *dirInodePool
+	// direct publishes small new files whole (drain_direct.go); nil when off.
+	direct            *directPublisher
 	onDirMaterialized func(dirPath string, inode uint64)
 	symlinkWake       atomic.Bool
 
@@ -285,9 +287,12 @@ type DrainerMetrics struct {
 	DrainsSucceeded atomic.Int64
 	DrainsFailed    atomic.Int64
 	DrainsRetried   atomic.Int64
-	Quarantined     atomic.Int64
-	BytesDrained    atomic.Int64
-	InFlight        atomic.Int64
+	// DrainsDirect counts files published whole through JMCreateFiles
+	// (drain_direct.go) instead of a stage.
+	DrainsDirect atomic.Int64
+	Quarantined  atomic.Int64
+	BytesDrained atomic.Int64
+	InFlight     atomic.Int64
 	// SidecarsSkipped counts `._` rows completed WITHOUT a backend file
 	// because their AppleDouble body carried no metadata. See
 	// appleDoubleIsDefaultEmpty in sidecar.go.
@@ -400,6 +405,15 @@ func NewDrainer(spool *SpoolStore, cfg DrainerConfig) (*Drainer, error) {
 	}
 	if spooledMkdirEnabled() && cfg.FuseRoot != "" {
 		d.dirInodes = newDirInodePool(newJFSControl(cfg.FuseRoot))
+	}
+	if drainDirectEnabled() && cfg.FuseRoot != "" {
+		// One control client per drainer: macOS juicefs keeps one control
+		// handle per process, so its messages must not interleave.
+		ctl := newJFSControl(cfg.FuseRoot)
+		if d.dirInodes != nil {
+			ctl = d.dirInodes.ctl
+		}
+		d.direct = newDirectPublisher(ctl)
 	}
 	// H-8B: every new spool row records the base identity of the file it
 	// replaces. The drainer owns the FUSE root, so it supplies the probe.
@@ -1586,6 +1600,19 @@ func (d *Drainer) drainOne(row *metadata.SpoolRow) {
 	tgt, ok := d.openDrainTarget(row, dest, lease)
 	if !ok {
 		return
+	}
+	if tgt.direct {
+		// A small file under a free name: published whole, no stage.
+		if d.drainDirect(row, src, dest, spoolMtime, ph) {
+			return
+		}
+		instance, _ := d.instanceID()
+		stage, err := createDrainStage(dest, instance, row.ID)
+		if err != nil {
+			d.failTransient(row, fmt.Errorf("create drain stage: %w", err))
+			return
+		}
+		tgt = &drainTarget{f: stage.f, path: stage.path, stage: stage}
 	}
 	dst := tgt.f
 	// Review fix (phase-1 adversarial review, HIGH — the TOCTOU that would

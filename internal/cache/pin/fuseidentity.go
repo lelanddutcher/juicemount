@@ -257,3 +257,29 @@ func FUSEIdentityCheckFD(fd uintptr) error {
 	}
 	return nil
 }
+
+// FUSEIdentityCheckDev is FUSEIdentityCheckFD for a descriptor whose device
+// the caller already read with fstat (st_dev). It refuses a file on the
+// mountpoint's parent volume, as FUSEIdentityCheckFD refuses one whose
+// filesystem id is the parent's, without the fstatfs that costs JuiceFS a
+// metadata round trip for a file. The device of an open descriptor never
+// changes, so the check is as race-free as the fstatfs one.
+func FUSEIdentityCheckDev(dev uint64) error {
+	if os.Getenv("JM_FUSE_IDENTITY_GATE") == "0" {
+		return nil
+	}
+	fuseIdentityMu.Lock()
+	path := fuseIdentityPathV
+	fuseIdentityMu.Unlock()
+	if path == "" {
+		return nil
+	}
+	var pst syscall.Stat_t
+	if err := syscall.Stat(filepath.Dir(path), &pst); err != nil {
+		return fmt.Errorf("stat parent: %v: %w", err, ErrFUSEIdentityGate)
+	}
+	if uint64(pst.Dev) == dev { //nolint:unconvert // int32 on Darwin
+		return fmt.Errorf("dest fd is on the mountpoint's parent volume — plain-dir mountpoint: %w", ErrFUSEIdentityGate)
+	}
+	return nil
+}

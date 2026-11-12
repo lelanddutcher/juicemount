@@ -357,6 +357,9 @@ type drainTarget struct {
 	// (H-8B base mismatch). The stage is published beside it as a conflict
 	// copy instead of at the destination.
 	conflict string
+	// direct: the name is free and the file small; drainDirect publishes it
+	// whole (no f, path or stage).
+	direct bool
 }
 
 // abandon releases a failed or canceled drain. It removes only a stage. A
@@ -619,6 +622,9 @@ func (d *Drainer) openDrainTarget(row *metadata.SpoolRow, dest string, lease lea
 	if conflict == "" && replace == nil && !errors.Is(err, os.ErrNotExist) && !errors.Is(err, unix.ENOENT) {
 		d.failTransient(row, fmt.Errorf("open existing dest: %w", err))
 		return nil, false
+	}
+	if conflict == "" && replace == nil && d.directEligible(row) {
+		return &drainTarget{direct: true}, true
 	}
 	instance, _ := d.instanceID()
 	stage, err := createDrainStage(dest, instance, row.ID)

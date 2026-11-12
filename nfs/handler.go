@@ -1429,13 +1429,17 @@ func (h *JuiceMountHandler) applyLegacyDrainEffects(item metadata.DrainCommitIte
 	}
 	observedSidecar := h.sidecar.captureEntry(item.NFSPath)
 	observedMemBuf := h.memBuf.captureEntry(item.NFSPath)
-	if err := fd.Chmod(receipt.Mode.Perm()); err != nil {
-		if !errors.Is(err, syscall.EPERM) {
-			return err
-		}
-		fi, statErr := fd.Stat()
-		if statErr != nil || fi.Mode().Perm() != receipt.Mode.Perm() {
-			return err
+	// A chmod to the mode the file already has still costs JuiceFS a
+	// metadata transaction (two round trips on a far link); skip it.
+	if owned.Mode().Perm() != receipt.Mode.Perm() {
+		if err := fd.Chmod(receipt.Mode.Perm()); err != nil {
+			if !errors.Is(err, syscall.EPERM) {
+				return err
+			}
+			fi, statErr := fd.Stat()
+			if statErr != nil || fi.Mode().Perm() != receipt.Mode.Perm() {
+				return err
+			}
 		}
 	}
 	fi, err := fd.Stat()
