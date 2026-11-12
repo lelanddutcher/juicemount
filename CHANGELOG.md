@@ -4,6 +4,20 @@
 
 ### App
 
+- On an encrypted volume over a slow or distant link, a slow cold read no
+  longer turns into a retry wait. An encrypted volume (one formatted with an
+  RSA key) fetches a whole 4 MiB block for any cold read. On a 200 ms link
+  with 1% loss, some blocks took 9 to 11 s. The app stopped waiting at 8 s and
+  answered "try later" (JUKEBOX), and macOS asked again about 4 s later, so
+  those reads took 12.2 s. The app now reads the volume's encryption and block
+  size from the volume settings it already loads, and on a slow link gives
+  such a read the time a whole block needs at 2 Mbit/s plus 6 round trips: at
+  least 8 s, at most 20 s, below macOS's 40 s limit. A 4 MiB block at 200 ms
+  gets about 18 s. In the laptop lab with server BBR, the slow scrub reads
+  took 9.7 to 10.8 s (before: 10.5 to 12.3 s), scrub p95 went from 12.3 s to
+  10.7 s, and no read timed out (before: 4). Unencrypted volumes, and volumes
+  whose settings name an algorithm but hold no key, do not change.
+  Field switch: `JM_FUSE_UNRANGED_READ_TIMEOUT=0` turns it off.
 - On a slow or distant link, small saves (project files and other files of
   1 MiB or less) no longer wait behind a large file's upload inside JuiceFS.
   JuiceFS uploads at most four blocks at a time (`--max-uploads 4`, kept for
