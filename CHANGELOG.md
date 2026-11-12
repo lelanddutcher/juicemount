@@ -4,6 +4,28 @@
 
 ### App
 
+- On a slow or distant link, a large file no longer holds back every other
+  save. Before, after the app had read any uncached file, a project save
+  (`.prproj`, `.drp`) did not reach the server until a large render saved
+  beside it had finished uploading: at 0.9 Mbit/s up, a 500 MB render takes
+  about 75 minutes. In the laptop lab (200 ms, 1% loss) 2 of 201 saved files
+  reached the server in 10 minutes. Now 62 do with server BBR and 74 without
+  it. With small saves only, 166 to 168 of 200 reach it after reads (before:
+  70). Reads did not get slower. Two causes, both fixed:
+  - The first cold reads on a distant link measure under 3 MiB/s, and the app
+    then treated the link as "metered" (costly, like cellular). That cut the
+    drain to one background slot, and the render's upload held it. A
+    distant link now stays "slow" when its reads are slow; `/metrics` shows
+    `network.low_bandwidth`. A link stays metered when macOS marks it
+    expensive or constrained (cellular, a hotspot, Low Data Mode), when it is
+    forced, or when a near link reads under 3 MiB/s.
+    Field switch: `JM_NET_SLOW_RTT_FLOOR=0` restores the old rule.
+  - Small saves now have one drain slot of their own, so they keep draining
+    while a large file uploads, on every link class. They still share the
+    upload queue with the large file, so on a slow link a batch of small
+    saves can wait about 40 s. The slot is background
+    work: it never refuses a read the editor waits for, and it never takes
+    the large file's slot.
 - On a slow or distant link, the app no longer sometimes starts offline with an
   empty volume. At startup the app measures the time to connect to the server.
   Above 500 ms it starts offline, which keeps a slow link from blocking the
