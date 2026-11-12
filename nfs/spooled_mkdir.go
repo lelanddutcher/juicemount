@@ -271,14 +271,19 @@ func (s *SpoolStore) movePendingDirsInMemoryLocked(oldPath, newPath string) {
 // Reserved folder inodes (Drainer)
 
 const (
-	dirInodeBatch = 256
+	// dirInodeBatch must be exactly juicefs's inodeBatch (1024): the Redis
+	// proxy lets a Mac principal take nextinode only as a bare INCRBY of
+	// exactly 1024 (internal/respproxy/guard.go), so any other size is
+	// refused for every enrolled Mac and each MKDIR fell back to the
+	// synchronous path (6 s on a 200 ms link; real-NAS lab, 2026-11-12).
+	dirInodeBatch = 1024
 	dirInodeLow   = 64
 )
 
 type inodeRange struct{ next, end uint64 }
 
 // dirInodePool holds folder inode numbers reserved in the running juicefs.
-// A refill is one control message (one Redis round trip) per 256 folders.
+// A refill is one control message (one Redis round trip) per 1024 folders.
 type dirInodePool struct {
 	ctl *jfsControl
 
