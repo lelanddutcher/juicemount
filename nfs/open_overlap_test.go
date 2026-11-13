@@ -12,8 +12,17 @@ import (
 
 func overlapClass(t *testing.T, c netprofile.LinkClass) {
 	t.Helper()
-	netprofile.Default().ForceClass(&c)
-	t.Cleanup(func() { netprofile.Default().ForceClass(nil) })
+	p := netprofile.Default()
+	p.ResetForTransportChange()
+	p.ForceClass(&c)
+	t.Cleanup(func() { p.ForceClass(nil); p.ResetForTransportChange() })
+}
+
+func overlapMapping(t *testing.T, inRAM bool) {
+	t.Helper()
+	prev := chunkMappingInRAM
+	chunkMappingInRAM = func(*cache.Reader, uint64, int64) bool { return inRAM }
+	t.Cleanup(func() { chunkMappingInRAM = prev })
 }
 
 func overlapFile(t *testing.T, p *FDPool, path string) *cachedFile {
@@ -39,6 +48,29 @@ func waitOpens(t *testing.T, so *scriptedOpen, n int) {
 // proof; the read's own descriptor acquisition joins it: one open in all.
 func TestOverlappedOpenIsJoinedByTheRead(t *testing.T) {
 	overlapClass(t, netprofile.ClassSlow)
+	testOverlappedOpenJoined(t)
+}
+
+// Far by class (metered) or by round-trip time alone (a medium class link
+// with a 300 ms RTT) both overlap.
+func TestOverlappedOpenOtherFarLinks(t *testing.T) {
+	t.Run("metered", func(t *testing.T) {
+		overlapClass(t, netprofile.ClassMetered)
+		testOverlappedOpenJoined(t)
+	})
+	t.Run("high latency", func(t *testing.T) {
+		overlapClass(t, netprofile.ClassMedium)
+		for i := 0; i < 6; i++ {
+			netprofile.Default().ObserveRTT(300 * time.Millisecond)
+		}
+		if !netprofile.Default().HighLatency() {
+			t.Fatal("profile is not high latency")
+		}
+		testOverlappedOpenJoined(t)
+	})
+}
+
+func testOverlappedOpenJoined(t *testing.T) {
 	path := seedPoolFile(t, "clip.mov")
 	p := NewFDPool()
 	defer p.Stop()
@@ -106,6 +138,9 @@ func TestOverlappedOpenSkips(t *testing.T) {
 		{name: "no FD pool", class: netprofile.ClassSlow, setup: func(t *testing.T, f *cachedFile) {
 			f.fdPool = nil
 		}},
+		{name: "mapping in RAM", class: netprofile.ClassSlow, setup: func(t *testing.T, f *cachedFile) {
+			overlapMapping(t, true)
+		}},
 		{name: "switched off", class: netprofile.ClassSlow, setup: func(t *testing.T, f *cachedFile) {
 			openOverlapOff = true
 			t.Cleanup(func() { openOverlapOff = false })
@@ -165,5 +200,51 @@ func TestPrepareMappingBesideProofIsBindingWork(t *testing.T) {
 	b.workMu.Unlock()
 	if active != 0 {
 		t.Fatalf("a closed binding started a mapping job (%d active)", active)
+	}
+}
+
+// A stop of the binding waits for a mapping job that is still blocked, and
+// the job's context ends with the stop. A mapping already in RAM starts none.
+func TestPrepareMappingBesideProofStopWaits(t *testing.T) {
+	overlapClass(t, netprofile.ClassSlow)
+	r := cache.NewReader(t.TempDir(), 4<<20, nil)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	prev := prepareChunkMapping
+	prepareChunkMapping = func(_ *cache.Reader, ctx context.Context, _ uint64, _ int64) error {
+		close(entered)
+		<-release
+		return ctx.Err()
+	}
+	t.Cleanup(func() { prepareChunkMapping = prev })
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	b := &cacheBinding{workCtx: ctx, workCancel: cancel, workDone: make(chan struct{})}
+
+	overlapMapping(t, true)
+	b.prepareMappingBesideProof(r, 7, 0, time.Minute)
+	b.workMu.Lock()
+	if b.workActive != 0 {
+		b.workMu.Unlock()
+		t.Fatal("a mapping job started for a mapping in RAM")
+	}
+	b.workMu.Unlock()
+
+	overlapMapping(t, false)
+	b.prepareMappingBesideProof(r, 7, 0, time.Minute)
+	<-entered
+	h := &JuiceMountHandler{}
+	h.cacheBinding.Store(b)
+	done := h.beginBoundCacheStop()
+	select {
+	case <-done:
+		t.Fatal("the stop did not wait for the blocked mapping job")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the stop did not finish after the mapping job ended")
 	}
 }

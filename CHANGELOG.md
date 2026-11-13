@@ -13,9 +13,11 @@
   the file's attributes and its first slice list in one round trip and
   answers the kernel's follow-up attribute request from that read (patch
   0028, `-jm13`). Every open still reads the file's current state from the
-  server, so another Mac's saved edit is seen as before. Remote lab (Linux,
+  server, so an edit another Mac saved before the open is seen. An edit saved
+  after the open is seen by any read more than 1 s after the open; within
+  that second the first read sees the file as it was at the open. Remote lab (Linux,
   200 ms, 1% loss, 30 Mbit/s, server BBR, median first byte): first clip of a
-  session 2.87 s to 1.93 s, later clips 2.32 s to 1.36 s; lan unchanged.
+  session 2.87 s to 1.96 s, later clips 2.33 s to 1.39 s; lan unchanged.
   `JM_OPEN_OVERLAP=0` turns the app-side overlap off.
 - A volume mounted on a fast link now reads like one mounted on a slow link
   once the link turns slow, with no app restart. Before, an editor who

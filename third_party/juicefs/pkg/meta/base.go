@@ -1076,6 +1076,8 @@ func (m *baseMeta) GetAttr(ctx Context, inode Ino, attr *Attr) syscall.Errno {
 	}
 	defer m.timeit("GetAttr", time.Now())
 	var err syscall.Errno
+	var gen uint64
+	fresh := false
 	if inode == RootInode || inode == TrashInode {
 		// doGetAttr could overwrite the `attr` after timeout
 		var a Attr
@@ -1098,10 +1100,19 @@ func (m *baseMeta) GetAttr(ctx Context, inode Ino, attr *Attr) syscall.Errno {
 			attr.Full = true
 		}
 	} else {
+		gen = m.of.chunkGen()
 		err = m.en.doGetAttr(ctx, inode, attr)
+		fresh = true
+		if jmAttrReadHook != nil {
+			jmAttrReadHook(inode)
+		}
 	}
 	if err == 0 {
-		m.of.Update(inode, attr)
+		if fresh {
+			m.of.UpdateFresh(inode, attr, gen)
+		} else {
+			m.of.Update(inode, attr)
+		}
 		if attr.Typ == TypeDirectory && inode != RootInode && !isTrash(attr.Parent) {
 			m.parentMu.Lock()
 			m.dirParents[inode] = attr.Parent
@@ -1585,6 +1596,9 @@ func (m *baseMeta) Open(ctx Context, inode Ino, flags uint32, attr *Attr) (st sy
 			start := time.Now()
 			first, st = e.doGetAttrFirstChunk(ctx, inode, attr)
 			m.timeit("GetAttr", start)
+			if jmAttrReadHook != nil {
+				jmAttrReadHook(inode)
+			}
 			if st != 0 {
 				return
 			}
@@ -1631,11 +1645,13 @@ func (m *baseMeta) Open(ctx Context, inode Ino, flags uint32, attr *Attr) (st sy
 	if attr.Typ == TypeFile && len(first) > 0 {
 		ss = buildSlice(first)
 	}
-	if m.of.OpenPrefetched(inode, attr, ss, gen) && !m.conf.ReadOnly && (len(first) >= 5 || len(ss) >= 5) {
-		go m.compactChunk(inode, 0, false, false) // as Read does for a fragmented chunk
-	}
+	m.of.OpenPrefetched(inode, attr, ss, len(first), gen)
 	return 0
 }
+
+// jmAttrReadHook, when set by a test, runs after an attr read returns and
+// before it is stored (patch 0028).
+var jmAttrReadHook func(Ino)
 
 // openAttrReuse bounds how old an attr read by this client for a file it
 // holds open may be when GetAttr serves it without a round trip (patch 0028).
@@ -1665,8 +1681,12 @@ func (m *baseMeta) Read(ctx Context, inode Ino, indx uint32, slices *[]Slice) (s
 		f.RLock()
 		defer f.RUnlock()
 	}
-	if ss, ok := m.of.ReadChunk(inode, indx); ok {
+	if ss, ok, raw := m.of.ReadPrefetched(inode, indx, openAttrReuse); ok {
 		*slices = ss
+		// A list seeded by Open: compact as if this Read had fetched it.
+		if raw > 0 && !m.conf.ReadOnly && (raw >= 5 || len(ss) >= 5) {
+			go m.compactChunk(inode, indx, false, false)
+		}
 		return 0
 	}
 

@@ -83,22 +83,8 @@ func TestJMOpenRoundTrips(t *testing.T) {
 	m.Close(ctx, ino)
 }
 
-// A peer client changes the file between two opens: the second open sees
-// the peer's attr and slices, never the first open's.
-func TestJMOpenSeesPeerEdit(t *testing.T) {
-	m, _ := countedMeta(t)
-	ctx := Background()
-	ino := jmOpenFile(t, m, "shared", Slice{Id: 21, Size: 4096, Len: 4096})
-	attr := &Attr{}
-	if st := m.Open(ctx, ino, uint32(syscall.O_RDONLY), attr); st != 0 {
-		t.Fatalf("open: %v", st)
-	}
-	var got []Slice
-	if st := m.Read(ctx, ino, 0, &got); st != 0 || len(got) != 1 || got[0].Id != 21 {
-		t.Fatalf("first read: %v %+v", st, got)
-	}
-	m.Close(ctx, ino)
-
+func jmPeer(t *testing.T, m *redisMeta) *redisMeta {
+	t.Helper()
 	peerStore, err := newRedisMeta("redis", m.addr, testConfig())
 	if err != nil {
 		t.Fatal(err)
@@ -108,34 +94,189 @@ func TestJMOpenSeesPeerEdit(t *testing.T) {
 	if _, err := peer.Load(true); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(10 * time.Millisecond) // a distinct mtime
-	if st := peer.Write(ctx, ino, 0, 4096, Slice{Id: 22, Size: 8192, Len: 8192}, time.Now()); st != 0 {
-		t.Fatalf("peer write: %v", st)
-	}
+	return peer
+}
 
-	attr = &Attr{}
-	if st := m.Open(ctx, ino, uint32(syscall.O_RDONLY), attr); st != 0 {
-		t.Fatalf("reopen: %v", st)
-	}
-	if attr.Length != 4096+8192 {
-		t.Errorf("reopen length %d, want %d", attr.Length, 4096+8192)
-	}
-	got = nil
-	if st := m.Read(ctx, ino, 0, &got); st != 0 {
-		t.Fatalf("read after peer edit: %v", st)
-	}
+func jmSliceIDs(ss []Slice) []uint64 {
 	var ids []uint64
-	for _, s := range got {
+	for _, s := range ss {
 		if s.Id != 0 {
 			ids = append(ids, s.Id)
 		}
 	}
-	if len(ids) != 2 || ids[0] != 21 || ids[1] != 22 {
-		t.Errorf("read after peer edit saw slices %+v, want 21 then 22", got)
+	return ids
+}
+
+// A peer client changes the file between two opens: the second open sees
+// the peer's attr and slices, never the first open's. Once with this
+// client's open-file record kept from the first open, once without it.
+func TestJMOpenSeesPeerEdit(t *testing.T) {
+	for _, forget := range []bool{false, true} {
+		m, _ := countedMeta(t)
+		ctx := Background()
+		ino := jmOpenFile(t, m, "shared", Slice{Id: 21, Size: 4096, Len: 4096})
+		attr := &Attr{}
+		if st := m.Open(ctx, ino, uint32(syscall.O_RDONLY), attr); st != 0 {
+			t.Fatalf("open: %v", st)
+		}
+		var got []Slice
+		if st := m.Read(ctx, ino, 0, &got); st != 0 || len(got) != 1 || got[0].Id != 21 {
+			t.Fatalf("first read: %v %+v", st, got)
+		}
+		m.Close(ctx, ino)
+		if forget {
+			m.of.Lock()
+			delete(m.of.files, ino)
+			m.of.Unlock()
+		}
+
+		peer := jmPeer(t, m)
+		time.Sleep(10 * time.Millisecond) // a distinct mtime
+		if st := peer.Write(ctx, ino, 0, 4096, Slice{Id: 22, Size: 8192, Len: 8192}, time.Now()); st != 0 {
+			t.Fatalf("peer write: %v", st)
+		}
+
+		attr = &Attr{}
+		if st := m.Open(ctx, ino, uint32(syscall.O_RDONLY), attr); st != 0 {
+			t.Fatalf("reopen: %v", st)
+		}
+		if attr.Length != 4096+8192 {
+			t.Errorf("forget=%v: reopen length %d, want %d", forget, attr.Length, 4096+8192)
+		}
+		got = nil
+		if st := m.Read(ctx, ino, 0, &got); st != 0 {
+			t.Fatalf("read after peer edit: %v", st)
+		}
+		if ids := jmSliceIDs(got); len(ids) != 2 || ids[0] != 21 || ids[1] != 22 {
+			t.Errorf("forget=%v: read after peer edit saw slices %+v, want 21 then 22", forget, got)
+		}
+		var ga Attr
+		if st := m.GetAttr(ctx, ino, &ga); st != 0 || ga.Length != attr.Length {
+			t.Errorf("forget=%v: getattr after reopen: %v length %d", forget, st, ga.Length)
+		}
+		m.Close(ctx, ino)
+	}
+}
+
+// A peer edits the file after our open and before our first read. Within
+// openAttrReuse of the open the read uses the list the open read (the file as
+// it was at open, as an upstream read right after the open would); after
+// that the list is dropped and the read fetches the peer's.
+func TestJMOpenPeerEditBeforeFirstRead(t *testing.T) {
+	for _, late := range []bool{false, true} {
+		m, _ := countedMeta(t)
+		ctx := Background()
+		ino := jmOpenFile(t, m, "clip", Slice{Id: 41, Size: 4096, Len: 4096})
+		m.of.Lock()
+		delete(m.of.files, ino)
+		m.of.Unlock()
+		attr := &Attr{}
+		if st := m.Open(ctx, ino, uint32(syscall.O_RDONLY), attr); st != 0 {
+			t.Fatalf("open: %v", st)
+		}
+		peer := jmPeer(t, m)
+		if st := peer.Write(ctx, ino, 0, 0, Slice{Id: 42, Size: 4096, Len: 4096}, time.Now()); st != 0 {
+			t.Fatalf("peer write: %v", st)
+		}
+		if late {
+			m.of.Lock()
+			m.of.files[ino].firstAt = time.Now().Add(-2 * openAttrReuse)
+			m.of.Unlock()
+		}
+		var got []Slice
+		if st := m.Read(ctx, ino, 0, &got); st != 0 {
+			t.Fatalf("read: %v", st)
+		}
+		ids := jmSliceIDs(got)
+		want := uint64(41)
+		if late {
+			want = 42
+		}
+		if len(ids) != 1 || ids[0] != want {
+			t.Errorf("late=%v: first read saw %+v, want slice %d", late, got, want)
+		}
+		m.Close(ctx, ino)
+	}
+}
+
+// The reviewer's probe: a local write on fd W lands while an open on another
+// fd has its GET+LRANGE in flight. The open's reply predates the write; it
+// must not be served as fresh, and its list must not be cached.
+func TestJMOpenLocalWriteDuringOpenRead(t *testing.T) {
+	m, _ := countedMeta(t)
+	ctx := Background()
+	ino := jmOpenFile(t, m, "race", Slice{Id: 51, Size: 10, Len: 10})
+	w := &Attr{}
+	if st := m.Open(ctx, ino, uint32(syscall.O_RDWR), w); st != 0 {
+		t.Fatalf("open W: %v", st)
+	}
+	fired := false
+	jmAttrReadHook = func(i Ino) {
+		if i != ino || fired {
+			return
+		}
+		fired = true
+		if st := m.Write(ctx, ino, 0, 10, Slice{Id: 52, Size: 10, Len: 10}, time.Now()); st != 0 {
+			t.Errorf("write on W: %v", st)
+		}
+	}
+	t.Cleanup(func() { jmAttrReadHook = nil })
+	r := &Attr{}
+	if st := m.Open(ctx, ino, uint32(syscall.O_RDONLY), r); st != 0 {
+		t.Fatalf("open R: %v", st)
+	}
+	jmAttrReadHook = nil
+	if !fired {
+		t.Fatal("the write did not run inside the open's read")
 	}
 	var ga Attr
-	if st := m.GetAttr(ctx, ino, &ga); st != 0 || ga.Length != attr.Length {
-		t.Errorf("getattr after reopen: %v length %d", st, ga.Length)
+	if st := m.GetAttr(ctx, ino, &ga); st != 0 || ga.Length != 20 {
+		t.Fatalf("getattr after the write: %v length %d, want 20 (stale pre-write attr served)", st, ga.Length)
+	}
+	var got []Slice
+	if st := m.Read(ctx, ino, 0, &got); st != 0 {
+		t.Fatalf("read: %v", st)
+	}
+	if ids := jmSliceIDs(got); len(ids) != 2 || ids[1] != 52 {
+		t.Errorf("read after the write saw %+v, want 51 then 52", got)
+	}
+	m.Close(ctx, ino)
+	m.Close(ctx, ino)
+}
+
+// The same race on a plain GetAttr of an open file: a reply sent before a
+// local write is stored but never marked fresh.
+func TestJMGetAttrLocalWriteDuringRead(t *testing.T) {
+	m, _ := countedMeta(t)
+	ctx := Background()
+	ino := jmOpenFile(t, m, "race2", Slice{Id: 61, Size: 10, Len: 10})
+	if st := m.Open(ctx, ino, uint32(syscall.O_RDWR), &Attr{}); st != 0 {
+		t.Fatalf("open: %v", st)
+	}
+	m.of.Lock()
+	m.of.files[ino].attrAt = time.Time{}
+	m.of.Unlock()
+	fired := false
+	jmAttrReadHook = func(i Ino) {
+		if i != ino || fired {
+			return
+		}
+		fired = true
+		if st := m.Write(ctx, ino, 0, 10, Slice{Id: 62, Size: 10, Len: 10}, time.Now()); st != 0 {
+			t.Errorf("write: %v", st)
+		}
+	}
+	t.Cleanup(func() { jmAttrReadHook = nil })
+	var ga Attr
+	if st := m.GetAttr(ctx, ino, &ga); st != 0 {
+		t.Fatalf("getattr: %v", st)
+	}
+	jmAttrReadHook = nil
+	if !fired {
+		t.Fatal("the write did not run inside the getattr")
+	}
+	if st := m.GetAttr(ctx, ino, &ga); st != 0 || ga.Length != 20 {
+		t.Fatalf("second getattr: %v length %d, want 20", st, ga.Length)
 	}
 	m.Close(ctx, ino)
 }
@@ -185,17 +326,17 @@ func TestJMOpenPrefetchedRefusesChangedState(t *testing.T) {
 	a := &Attr{Typ: TypeFile, Mtime: 100, Length: 10, Full: true}
 
 	gen := o.chunkGen()
-	if !o.OpenPrefetched(5, a, first, gen) {
+	if !o.OpenPrefetched(5, a, first, 1, gen) {
 		t.Fatal("clean open did not cache the prefetched slices")
 	}
-	if ss, ok := o.ReadChunk(5, 0); !ok || len(ss) != 1 {
+	if ss, ok, raw := o.ReadPrefetched(5, 0, time.Second); !ok || len(ss) != 1 || raw != 1 {
 		t.Fatalf("cached chunk 0: %v %+v", ok, ss)
 	}
 
 	// An invalidation between the read and the open.
 	gen = o.chunkGen()
 	o.InvalidateChunk(6, 0)
-	if o.OpenPrefetched(6, a, first, gen) {
+	if o.OpenPrefetched(6, a, first, 1, gen) {
 		t.Error("cached slices read before an invalidation")
 	}
 
@@ -203,10 +344,10 @@ func TestJMOpenPrefetchedRefusesChangedState(t *testing.T) {
 	gen = o.chunkGen()
 	o.Open(7, &Attr{Typ: TypeFile, Mtime: 200, Full: true})
 	gen = o.chunkGen()
-	if o.OpenPrefetched(7, a, first, gen) {
+	if o.OpenPrefetched(7, a, first, 1, gen) {
 		t.Error("cached slices of another mtime")
 	}
-	if _, ok := o.ReadChunk(7, 0); ok {
+	if _, ok, _ := o.ReadPrefetched(7, 0, time.Second); ok {
 		t.Error("chunk 0 cached after an mtime change")
 	}
 
@@ -220,7 +361,7 @@ func TestJMOpenPrefetchedRefusesChangedState(t *testing.T) {
 		t.Error("recent attr served for a closed file")
 	}
 	gen = o.chunkGen()
-	o.OpenPrefetched(5, a, nil, gen)
+	o.OpenPrefetched(5, a, nil, 0, gen)
 	o.InvalidateChunk(5, invalidateAttrOnly)
 	if o.RecentOpenAttr(5, &got, time.Second) {
 		t.Error("recent attr served after an attr invalidation")

@@ -37,6 +37,12 @@ func farLink() bool {
 	return p.HighLatency() || c == netprofile.ClassSlow || c == netprofile.ClassMetered
 }
 
+// Seams for tests: the reader's RAM mapping check and its bounded prepare.
+var (
+	chunkMappingInRAM   = (*cache.Reader).HasChunkMapping
+	prepareChunkMapping = (*cache.Reader).PrepareChunkMapping
+)
+
 // overlapOpenStarted counts overlapped opens (tests and diagnostics).
 var overlapOpenStarted atomic.Int64
 
@@ -47,7 +53,7 @@ var overlapOpenStarted atomic.Int64
 // cachedFile.
 func (f *cachedFile) startOverlappedOpen(off int64) {
 	if openOverlapOff || f.fdPool == nil || f.handler == nil || f.handler.testRefuseFUSEContentReads ||
-		pin.IsOffline() || off < 0 || f.cacheReader == nil || f.cacheReader.HasChunkMapping(f.inode, off/cache.ChunkSize) ||
+		pin.IsOffline() || off < 0 || f.cacheReader == nil || chunkMappingInRAM(f.cacheReader, f.inode, off/cache.ChunkSize) ||
 		!farLink() || !f.overlapOpen.CompareAndSwap(false, true) {
 		return
 	}
@@ -66,7 +72,7 @@ func (f *cachedFile) startOverlappedOpen(off int64) {
 // proof joins it or finds it in RAM. The job is binding work, so a stop
 // waits for it.
 func (b *cacheBinding) prepareMappingBesideProof(r *cache.Reader, inode uint64, off int64, timeout time.Duration) {
-	if openOverlapOff || r == nil || off < 0 || timeout <= 0 || r.HasChunkMapping(inode, off/cache.ChunkSize) || !farLink() {
+	if openOverlapOff || r == nil || off < 0 || timeout <= 0 || chunkMappingInRAM(r, inode, off/cache.ChunkSize) || !farLink() {
 		return
 	}
 	b.workMu.Lock()
@@ -87,6 +93,6 @@ func (b *cacheBinding) prepareMappingBesideProof(r *cache.Reader, inode uint64, 
 		}()
 		ctx, cancel := context.WithTimeout(b.workCtx, timeout)
 		defer cancel()
-		_ = r.PrepareChunkMapping(ctx, inode, off/cache.ChunkSize)
+		_ = prepareChunkMapping(r, ctx, inode, off/cache.ChunkSize)
 	}()
 }
