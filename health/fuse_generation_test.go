@@ -72,16 +72,23 @@ func TestGenerationReservationNeverReusesRetiredPath(t *testing.T) {
 	}
 }
 
-func TestGenerationReopenRefusesUnresolvedIntentAndTornLedger(t *testing.T) {
+func TestGenerationReopenRetiresNeverLaunchedAndRefusesTornLedger(t *testing.T) {
 	logical := generationTestPath(t)
 	a, err := reserveFUSEGeneration(logical, "digest", emptyGenerationSnapshot)
 	if err != nil {
 		t.Fatal(err)
 	}
-	a.close() // model process death after durable reservation
-	if _, err := reserveFUSEGeneration(logical, "digest", emptyGenerationSnapshot); err == nil || !strings.Contains(err.Error(), "unresolved") {
-		t.Fatalf("unresolved allocation admitted another child: %v", err)
+	a.close() // model process death after durable reservation, before launch
+	// "ready" is written before any child exists and "launching" before the
+	// child starts, so a never-launched generation is retired, not held.
+	b, err := reserveFUSEGeneration(logical, "digest", emptyGenerationSnapshot)
+	if err != nil {
+		t.Fatalf("never-launched generation held the next child: %v", err)
 	}
+	if b.ID == a.ID || b.Path == a.Path {
+		t.Fatal("never-launched generation was reused")
+	}
+	b.close() // the same death again leaves one more ready-only generation
 	ledger := filepath.Join(logical+".generations", "ledger.jsonl")
 	f, err := os.OpenFile(ledger, os.O_WRONLY|os.O_APPEND, 0)
 	if err != nil {
@@ -334,4 +341,172 @@ func TestGenerationJournalFailureAfterStartRetainsExitError(t *testing.T) {
 	if fm.activeReceipt != receipt || receipt.exitErr == nil || <-processExit == nil {
 		t.Fatal("journal failure discarded exact receipt or exit error")
 	}
+}
+
+func generationBootSnapshot(boot string) func(context.Context) (mounttable.Snapshot, error) {
+	return func(context.Context) (mounttable.Snapshot, error) {
+		return mounttable.Snapshot{Version: 1, BootID: boot, Entries: []mounttable.MountEntry{}}, nil
+	}
+}
+
+// Power loss or a reboot while mounted: the generation reached born (the
+// JuiceFS child started) and nothing retired it. After the reboot no process
+// or mount can remain, so the next reservation retires it by itself. Before,
+// it refused every new child ("prior generation unresolved").
+func TestGenerationFromEarlierBootIsRetiredOnNextReservation(t *testing.T) {
+	logical := generationTestPath(t)
+	a, err := reserveFUSEGeneration(logical, "digest", generationBootSnapshot("boot-before-power-loss"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.markLaunching(); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.markChild(4242); err != nil {
+		t.Fatal(err)
+	}
+	a.close() // power loss: no retirement, no observed sidecar
+
+	// Same boot: the child may still be alive, so the hold stays, and says why.
+	_, err = reserveFUSEGeneration(logical, "digest", generationBootSnapshot("boot-before-power-loss"))
+	if err == nil || !strings.Contains(err.Error(), "unresolved") || !strings.Contains(err.Error(), "restart the Mac") {
+		t.Fatalf("same-boot launched generation not held clearly: %v", err)
+	}
+
+	// After the reboot it is retired and a new generation is reserved.
+	b, err := reserveFUSEGeneration(logical, "digest", generationBootSnapshot("boot-after-power-loss"))
+	if err != nil {
+		t.Fatalf("earlier-boot generation held the next child: %v", err)
+	}
+	defer b.close()
+	if b.ID == a.ID || b.Path == a.Path {
+		t.Fatal("earlier-boot generation reused")
+	}
+	if err := b.retire(); err != nil {
+		t.Fatal(err)
+	}
+	// The ledger stays readable: a later reservation replays every event.
+	c, err := reserveFUSEGeneration(logical, "digest", generationBootSnapshot("boot-after-power-loss"))
+	if err != nil {
+		t.Fatalf("ledger with an automatic retirement unreadable: %v", err)
+	}
+	c.close()
+}
+
+// Something mounted under the namespace still refuses, whatever the boot.
+func TestGenerationFromEarlierBootStillRefusesOccupiedNamespace(t *testing.T) {
+	logical := generationTestPath(t)
+	a, err := reserveFUSEGeneration(logical, "digest", generationBootSnapshot("old-boot"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.markLaunching(); err != nil {
+		t.Fatal(err)
+	}
+	path := a.Path
+	a.close()
+	occupied := func(context.Context) (mounttable.Snapshot, error) {
+		return mounttable.Snapshot{Version: 1, BootID: "new-boot", Entries: []mounttable.MountEntry{{Path: path, Source: "JuiceFS:test", Type: "macfuse"}}}, nil
+	}
+	if _, err := reserveFUSEGeneration(logical, "digest", occupied); err == nil {
+		t.Fatal("occupied namespace admitted a new child")
+	}
+}
+
+// The reviewer's probe: the second mount-table check fails after "intent" is
+// written. The generation stays intent-only. Before, it refused every later
+// reservation, in this boot and after a reboot.
+func TestGenerationIntentOnlyAfterFailedSecondCheckIsRetired(t *testing.T) {
+	logical := generationTestPath(t)
+	calls := 0
+	failSecond := func(ctx context.Context) (mounttable.Snapshot, error) {
+		calls++
+		if calls == 2 {
+			return mounttable.Snapshot{}, errors.New("observer timed out")
+		}
+		return emptyGenerationSnapshot(ctx)
+	}
+	if _, err := reserveFUSEGeneration(logical, "digest", failSecond); err == nil {
+		t.Fatal("precondition: failed second check reserved")
+	}
+	b, err := reserveFUSEGeneration(logical, "digest", emptyGenerationSnapshot)
+	if err != nil {
+		t.Fatalf("intent-only generation held the next reservation: %v", err)
+	}
+	if !strings.HasSuffix(b.ID, "0000000000000002") {
+		t.Fatalf("intent-only generation reused: %s", b.ID)
+	}
+	if err := b.retire(); err != nil {
+		t.Fatal(err)
+	}
+	// The ledger replays (grammar and tombstone ancestry) after the
+	// intent -> ready -> retired completion.
+	c, err := reserveFUSEGeneration(logical, "digest", emptyGenerationSnapshot)
+	if err != nil {
+		t.Fatalf("completed intent-only ledger unreadable: %v", err)
+	}
+	c.close()
+}
+
+// Power loss right after "intent" reached the disk, before the folder was made.
+func TestGenerationIntentOnlyWithoutFolderIsRetired(t *testing.T) {
+	logical := generationTestPath(t)
+	calls := 0
+	failSecond := func(ctx context.Context) (mounttable.Snapshot, error) {
+		calls++
+		if calls == 2 {
+			return mounttable.Snapshot{}, errors.New("observer timed out")
+		}
+		return emptyGenerationSnapshot(ctx)
+	}
+	if _, err := reserveFUSEGeneration(logical, "digest", failSecond); err == nil {
+		t.Fatal("precondition: failed second check reserved")
+	}
+	installs, err := filepath.Glob(filepath.Join(logical+".generations", "*", "0000000000000001"))
+	if err != nil || len(installs) != 1 {
+		t.Fatalf("generation folder not found: %v %v", installs, err)
+	}
+	if err := os.RemoveAll(installs[0]); err != nil {
+		t.Fatal(err)
+	}
+	b, err := reserveFUSEGeneration(logical, "digest", generationBootSnapshot("after-power-loss"))
+	if err != nil {
+		t.Fatalf("intent-only generation without folder held the next reservation: %v", err)
+	}
+	b.close()
+	c, err := reserveFUSEGeneration(logical, "digest", generationBootSnapshot("after-power-loss"))
+	if err != nil {
+		t.Fatalf("ledger unreadable after completing a missing folder: %v", err)
+	}
+	c.close()
+}
+
+// An explicit recovery attempt file on a generation of an earlier boot: the
+// recovery tool needs the same boot, so it can never finish it. The reboot
+// already ended the helper's mount and process, so it is retired.
+func TestGenerationFromEarlierBootWithRecoveryAttemptIsRetired(t *testing.T) {
+	logical := generationTestPath(t)
+	a, err := reserveFUSEGeneration(logical, "digest", generationBootSnapshot("old-boot"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.markLaunching(); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.markChild(4242); err != nil {
+		t.Fatal(err)
+	}
+	attempt := filepath.Join(filepath.Dir(a.Path), recoveryAttemptName)
+	a.close()
+	if err := os.WriteFile(attempt, []byte("{}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reserveFUSEGeneration(logical, "digest", generationBootSnapshot("old-boot")); err == nil {
+		t.Fatal("same-boot launched generation with a recovery attempt admitted")
+	}
+	b, err := reserveFUSEGeneration(logical, "digest", generationBootSnapshot("new-boot"))
+	if err != nil {
+		t.Fatalf("earlier-boot generation with a recovery attempt held the next child: %v", err)
+	}
+	b.close()
 }

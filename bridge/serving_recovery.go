@@ -41,7 +41,7 @@ func priorServingNFSRetired(ctx context.Context, desired servingDesiredRecord) (
 			return false, err
 		}
 	}
-	return priorServingNFSRetiredInDirectory(ctx, desired, directory)
+	return priorServingNFSRetiredAcrossBoots(ctx, desired, directory, true)
 }
 
 // Replacement Shutdown may inspect its journal while a mounted data-plane
@@ -73,6 +73,16 @@ func priorServingShutdownNFSRetired(ctx context.Context, desired servingDesiredR
 }
 
 func priorServingNFSRetiredInDirectory(ctx context.Context, desired servingDesiredRecord, directory string) (bool, error) {
+	return priorServingNFSRetiredAcrossBoots(ctx, desired, directory, false)
+}
+
+// acceptPriorBoot is the service-start recovery rule only. Kernel NFS mounts do
+// not survive a reboot, so the exact original operation journaled in another
+// boot is gone even though nothing could mark it Retired. The current inventory
+// must still show nothing at the path or source. Mount creation applies the same
+// rule (mountbroker creation ignores a prior boot's FSID). Without it, every
+// reboot or power loss while serving held recovery at the NFS step.
+func priorServingNFSRetiredAcrossBoots(ctx context.Context, desired servingDesiredRecord, directory string, acceptPriorBoot bool) (bool, error) {
 	if desired.NFSPhase == "pending" {
 		return false, errors.New("original NFS admission lacks an arm receipt")
 	}
@@ -89,29 +99,38 @@ func priorServingNFSRetiredInDirectory(ctx context.Context, desired servingDesir
 	}
 	if desired.NFSPhase == "bound" {
 		want := desired.NFSRecord
-		if want == nil || journal == nil || journal.State != mountbroker.Retired ||
+		if want == nil || journal == nil ||
 			journal.Version != want.Version || journal.OperationID != want.OperationID || journal.BootID != want.BootID ||
 			journal.Spec != want.Spec || !reflect.DeepEqual(journal.Mount, want.Mount) {
 			return false, nil
 		}
-	} else if journal != nil && journal.State != mountbroker.Retired {
+	}
+	unretired := journal != nil && journal.State != mountbroker.Retired
+	if unretired && !acceptPriorBoot {
 		return false, nil
 	}
 	observeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 	snapshot, err := observeOwnedNFS(observeCtx)
 	if err != nil || snapshot.Version != 1 || snapshot.BootID == "" || snapshot.Entries == nil {
+		if unretired {
+			return false, nil // as before: an unretired original is "not yet", never an error
+		}
 		return false, errors.New("complete current NFS inventory unavailable")
 	}
-	if journal != nil && snapshot.BootID != journal.BootID {
+	priorBoot := journal != nil && snapshot.BootID != journal.BootID
+	if priorBoot && !acceptPriorBoot {
 		return false, errors.New("NFS operation belongs to another boot")
+	}
+	if unretired && !priorBoot {
+		return false, nil
 	}
 	var source string
 	var fsid [2]int32
 	if journal != nil {
 		source = journal.Spec.Source
-		if journal.Mount != nil {
-			fsid = journal.Mount.FSID
+		if journal.Mount != nil && !priorBoot {
+			fsid = journal.Mount.FSID // kernel FSIDs can be reused after a reboot
 		}
 	}
 	for _, entry := range snapshot.Entries {
@@ -187,9 +206,14 @@ func resumeConfirmedServingOnce(ctx context.Context) {
 		return
 	}
 	selected, err := inspectRecoveryOwner(current.Config)
-	if err != nil || selected != current.Owner {
+	if err == nil && selected != current.Owner || err != nil && !selectedOwnerAbandoned(current.Owner) {
 		setRecoveryStatus("held-original-owner-unavailable")
 		return
+	}
+	// err != nil here means the original ended without retirement (crash,
+	// kill, power loss, reboot). The recovery Start selects a successor.
+	if err != nil {
+		setRecoveryStatus("replacing-abandoned-owner")
 	}
 	// The inventory may change while owner inspection crosses a socket. The
 	// second observation fences admission against a newly occupied NFS path.

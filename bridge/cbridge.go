@@ -1272,9 +1272,11 @@ func nfsServerStartSerialized(configJSON *C.char, recovery *servingDesiredRecord
 			}
 		}
 		var ownerErr error
-		if recovery != nil {
+		if recovery != nil && !selectedOwnerAbandoned(recovery.Owner) {
 			selectedOwner, ownerErr = claimServingOwner(requestedConfig, recovery.Owner)
 		} else {
+			// A fresh Start, or recovery of an original that ended without
+			// retirement: selection publishes a successor under the fence.
 			selectedOwner, ownerErr = selectServingOwner(requestedConfig)
 		}
 		// An ambiguous claim still belongs to the selected original. Retain the
@@ -1287,7 +1289,7 @@ func nfsServerStartSerialized(configJSON *C.char, recovery *servingDesiredRecord
 			return C.CString("error: " + ownerErr.Error())
 		}
 		ownerReceipt = selectedOwner.claimed
-		if desiredRevision != 0 && recovery == nil {
+		if desiredRevision != 0 && (recovery == nil || selectedOwner.intent != recovery.Owner) {
 			if err := updateServingDesired(desiredRevision, func(r *servingDesiredRecord) error {
 				r.Owner = selectedOwner.intent
 				return nil

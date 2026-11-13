@@ -4,6 +4,47 @@
 
 ### App
 
+- A crash, kill, power loss or reboot no longer blocks the next launch. The
+  app records which background owner process holds the volume. When that
+  process ended without finishing its stop (for example a Quit while offline,
+  then a restart), every later Start failed with "selected owner unavailable;
+  original intent retained, no replacement launch" until the record was
+  deleted by hand. Now the next Start, online or offline, proves the old owner
+  is gone (its lifetime lock is free and its socket does not answer) and
+  starts a new one. A changed setting no longer blocks it either. The
+  automatic resume at service start does the same, and it accepts an NFS
+  mount record from before a reboot when nothing is mounted at the path now
+  (laptop lab 2026-11-12, scenario 5).
+- The new owner can also mount again after a reboot. Each JuiceFS mount gets
+  a reserved folder (a "generation"). One that was never retired used to
+  refuse every new mount ("prior generation unresolved"). Two kinds are now
+  retired by themselves, because no process or mount can remain:
+  - one whose JuiceFS process was never started. This includes a
+    reservation that failed partway (for example its second mount-table
+    check timed out), or power loss during it;
+  - one from an earlier boot, even if an explicit recovery had started on it.
+  A generation holds no data. Unsent writes stay in the upload queue, and
+  JuiceFS re-uploads its own staged blocks at the next mount. Nothing is
+  retired while anything is mounted under the generations folder.
+- Exactly these holds remain, and each says what to do:
+  - The old owner's lock is held: the owner is still running, or a recovery
+    step is using the lock. Start says to try again in a minute and to
+    restart the Mac if it persists.
+  - A JuiceFS process was started since this Mac last started, its owner
+    died, and the unmount helper could not retire it. That process may still
+    be running. Start says to quit JuiceMount and restart the Mac; after the
+    restart, Start recovers by itself.
+  - An explicit recovery started on a generation since this Mac last
+    started. Start says to finish it with `--recover-retained-generation` or
+    restart the Mac.
+  - Anything is mounted under the generations folder. Start refuses with
+    "generation namespace occupied".
+- While started offline, cache status no longer reports the whole free disk
+  (407 GB in the lab) as the cache size with a budget of 0. With no mounted
+  cache, `capacity.cache_capacity_bytes` is 0 ("unknown") and the pinned set is
+  not reported over capacity; the menu bar hides its cache bar. The real
+  figures return when the volume mounts. A short pin-store error under a
+  mounted cache keeps the last verdict instead of clearing it.
 - "Pin before travel" is now reliable while the server is reachable. An
   editor pins a project at home; abroad, over Link, it plays and scrubs from
   local disk, also after the app restarts. Three problems are fixed (laptop
