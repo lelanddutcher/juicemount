@@ -97,7 +97,7 @@ jobs:
           # uses this Redis while the step runs.
           JM_WATCH_BATCH_CHAOS_REDIS_URL: redis://127.0.0.1:6379/4
         run: |
-          go test -count=1 -race -run 'TestJMWatchBatch|TestBirth|Rename|TestCommittedRecord|TestJMMkdirInode|TestJMReserveInodes|TestJMReleaseInodes|TestJMCreateFile|TestJMOpen' ./pkg/meta
+          go test -count=1 -race -run 'TestJMWatchBatch|TestBirth|Rename|TestCommittedRecord|TestJMMkdirInode|TestJMReserveInodes|TestJMReleaseInodes|TestJMCreateFile|TestJMOpen|TestJMGetAttr' ./pkg/meta
           go test -count=1 -race -run 'TestJMCreateFiles' ./pkg/vfs
           go test -count=1 -run 'TestRedisClient$' ./pkg/meta
       - name: Unit and integration-safe tests
