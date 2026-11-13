@@ -4,6 +4,22 @@
 
 ### App
 
+- A crash, kill, power loss or reboot no longer blocks the next launch. The
+  app records which background owner process holds the volume. When that
+  process ended without finishing its stop (for example a Quit while offline,
+  then a restart), every later Start failed with "selected owner unavailable;
+  original intent retained, no replacement launch" until the record was
+  deleted by hand. Now the next Start, online or offline, proves the old owner
+  is gone (its lifetime lock is free and its socket does not answer) and
+  starts a new one. A changed setting no longer blocks it either. When the
+  old owner is still running, Start still refuses, and now says why. The
+  automatic resume at service start does the same, and it accepts an NFS
+  mount record from before a reboot when nothing is mounted at the path now
+  (laptop lab 2026-11-12, scenario 5).
+- While started offline, cache status no longer reports the whole free disk
+  (407 GB in the lab) as the cache size with a budget of 0. With no mounted
+  cache, `capacity.cache_capacity_bytes` is 0 ("unknown") and the pinned set is
+  not reported over capacity. The real figures return when the volume mounts.
 - "Pin before travel" is now reliable while the server is reachable. An
   editor pins a project at home; abroad, over Link, it plays and scrubs from
   local disk, also after the app restarts. Three problems are fixed (laptop

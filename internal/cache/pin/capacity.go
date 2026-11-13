@@ -273,16 +273,33 @@ func ComputeCapacity(store *Store, cacheBaseDir string) CapacityVerdict {
 	}
 
 	evaluateCapacity(&v)
+	if !v.PolicyKnown {
+		reportCapacityUnknown(&v)
+	}
 	cacheVolumeMu.RLock()
 	stillCurrent := cachePolicyEpoch == selectedEpoch
 	if !stillCurrent {
 		cacheVolumeMu.RUnlock()
 		v.PolicyKnown = false
+		reportCapacityUnknown(&v)
 		return v
 	}
 	setCapacityVerdict(v)
 	cacheVolumeMu.RUnlock()
 	return v
+}
+
+// reportCapacityUnknown clears the figures that need an admitted mount policy.
+// With no FUSE mount (for example a launch with the backend unreachable), the
+// budget and floor are unknown. evaluateCapacity then falls back to free disk
+// space, which reported the whole disk (hundreds of GB) as the cache size and
+// a budget of 0. Zero is the documented "unknown" value: the UI hides the bar.
+// The raw inputs (disk_free_bytes, cache_usage_bytes, pinned_bytes) stay real.
+// Not over capacity: no verdict can be made, and admission already refuses.
+func reportCapacityUnknown(v *CapacityVerdict) {
+	v.CacheCapacityBytes = 0
+	v.ShortfallBytes = 0
+	v.OverCapacity = false
 }
 
 var ErrCacheCapacityUnknown = errors.New("cache capacity unknown; pin download pending")
