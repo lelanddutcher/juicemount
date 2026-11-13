@@ -1605,6 +1605,7 @@ func nfsServerStartSerialized(configJSON *C.char, recovery *servingDesiredRecord
 			}(),
 			OpenCacheTTL: cfg.OpenCacheTTL,
 			ObjectKey:    health.ObjectKey{AccessKey: cfg.ObjectAccessKey, SecretKey: cfg.ObjectSecretKey},
+			RouteTarget:  backendRouteTarget(routePolicyURL),
 		})
 		if err != nil {
 			generationErr = fmt.Errorf("reserve FUSE generation: %w", err)
@@ -4114,29 +4115,20 @@ func backendRouteTarget(redisURL string) string {
 // production resolver is health.ResolveRouteInterface (UDP connect routing
 // lookup only; no packet is transmitted).
 func resolveAndApplyBackendRouteCeiling(target string, resolver func(string) (string, error)) error {
-	if target == "" || resolver == nil {
-		return fmt.Errorf("backend route target unavailable")
-	}
-	iface, err := resolver(target)
+	iface, err := health.ResolveBackendRoute(target, resolver)
 	if err != nil {
 		return err
-	}
-	if strings.TrimSpace(iface) == "" {
-		return fmt.Errorf("backend route interface unavailable")
 	}
 	applyBackendRouteCeiling(iface)
 	return nil
 }
 
+// applyBackendRouteCeiling is the serving process's side of the tunnel
+// ceiling. The volume owner applies the same health.ApplyBackendRouteCeiling
+// before it chooses the juicefs mount flags (FUSEConfig.RouteTarget).
 func applyBackendRouteCeiling(iface string) {
 	p := netprofile.Default()
-	tunneled := strings.HasPrefix(iface, "utun") || iface == "tailscale0"
-	if tunneled {
-		ceiling := netprofile.ClassSlow
-		p.CeilingClass(&ceiling)
-	} else {
-		p.CeilingClass(nil)
-	}
+	tunneled := health.ApplyBackendRouteCeiling(p, iface)
 	backendRoutePolicyState.tunneled.Store(tunneled)
 	backendRoutePolicyState.ceilingApplied.Store(tunneled)
 	jmlog.Info("backend route link ceiling updated",

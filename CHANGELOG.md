@@ -16,7 +16,9 @@
   (patch 0027, `-jm12`, control message 1106). Open files and editors notice
   nothing. A move to the slow settings waits until the slow class has held
   for 10 s, a move back for 60 s, so a flapping link does not switch back and
-  forth. Demand-first and the timeouts hold separately, so a far link whose
+  forth. The first decision after the NFS server starts has no hold: the
+  mount settings came from an older sample, so the follower applies the live
+  class at its first successful check, about 2 s after the server starts. Demand-first and the timeouts hold separately, so a far link whose
   bandwidth hovers near 3 MiB/s (slow and metered timeouts alternating) still
   gets demand-first after 10 s. The read retry budget and the flush deadline
   follow the live retries too, so a failing read abroad still ends with an
@@ -25,6 +27,26 @@
   Remote lab (Linux, 200 ms, 1% loss, server BBR, mounted on lan): scrub
   p50 2.6–2.7 s before the switch, 1.34 s after it, 1.24–1.26 s on a fresh
   mount on that link.
+- A volume mounted through a tunnel now gets the slow-link JuiceFS settings
+  from the start. The app caps the link class at slow when the route to the
+  NAS goes through a tunnel (a macOS `utun` interface, such as WireGuard or
+  the Tailscale app, or Linux `tailscale0`), because a tunnel can hide a
+  phone hotspot behind a 2 ms RTT. Only the process that serves NFS applied
+  that cap. The background owner process that mounts JuiceFS did not, so a
+  mount made at home through WireGuard got the lan settings: no
+  `--demand-first`, a 4096 MiB buffer and lan object timeouts (laptop run
+  2026-11-13). The live link follower fixed demand-first and the timeouts
+  about 2 s later, but the buffer, which only a mount sets, stayed at 4096
+  MiB. Now both processes apply the cap through one function, and the mount
+  resolves the route to the configured NAS address (not the loopback address
+  of the Link proxy). A tunneled mount starts with `--demand-first`, slow
+  timeouts and a 512 MiB buffer, and the follower has nothing to switch.
+  The embedded JuiceMount Link is a userspace tunnel with no `utun`, so
+  through Link the class still comes from measurement, in both processes.
+- The log no longer warns "juicefs link policy: exchange failed; retrying"
+  at every start. The first check comes before JuiceFS serves its control
+  file. Failures before JuiceFS first answers, in the first 30 s, are now
+  logged at debug level. A JuiceFS that never answers is still warned about.
 
 - A crash, kill, power loss or reboot no longer blocks the next launch. The
   app records which background owner process holds the volume. When that

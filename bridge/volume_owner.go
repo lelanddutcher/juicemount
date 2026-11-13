@@ -641,7 +641,13 @@ func (o *volumeOwner) claim(raw string, pinnedBytes int64, policy netprofile.Lin
 	// A measured class is not a host OS cost signal. The explicit versioned
 	// cost operation below conveys expensive/constrained independently.
 	_ = policy
-	cfg.RedisURL, _ = redisURLsAtConfigIngest(cfg.RedisURL)
+	// routePolicyURL is the configured backend, before the debug override
+	// and the Link proxy rewrite RedisURL. The mount resolves the kernel
+	// route to it and applies the same tunnel ceiling as the serving process
+	// (health.ApplyBackendRouteCeiling); without it a mount made through a
+	// tunnel got lan flags (laptop run 2026-11-13, B1).
+	var routePolicyURL string
+	cfg.RedisURL, routePolicyURL = redisURLsAtConfigIngest(cfg.RedisURL)
 	logical := cfg.RedisURL
 	node, owned, err := startLinkIfConfigured(&cfg)
 	if err != nil {
@@ -666,7 +672,8 @@ func (o *volumeOwner) claim(raw string, pinnedBytes int64, policy netprofile.Lin
 		JuiceFSBin: cfg.JuiceFSBin, RedisURL: cfg.RedisURL, MountPoint: cfg.FUSEPath,
 		CacheSize: cfg.CacheSize, CacheDir: privatePaths.CacheBase, FreeSpaceRatio: "0.01", BucketOverride: cfg.BucketOverride,
 		PinnedBytes: pinnedBytes, FUSEMetricsAddr: cfg.FUSEMetricsAddr, OpenCacheTTL: cfg.OpenCacheTTL,
-		ObjectKey: health.ObjectKey{AccessKey: cfg.ObjectAccessKey, SecretKey: cfg.ObjectSecretKey},
+		ObjectKey:   health.ObjectKey{AccessKey: cfg.ObjectAccessKey, SecretKey: cfg.ObjectSecretKey},
+		RouteTarget: backendRouteTarget(routePolicyURL),
 	})
 	if err != nil {
 		if owned && node != nil {

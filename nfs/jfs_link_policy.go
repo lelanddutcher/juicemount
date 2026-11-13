@@ -166,6 +166,14 @@ type linkHold[T comparable] struct {
 }
 
 func (h *linkHold[T]) observe(now time.Time, want T, slower bool) T {
+	// The first decision has no hold: the first request becomes the stable
+	// value at once, even when it is more cautious than the mount flags. The
+	// mount flags came from an older sample (a single dial in the volume
+	// owner, before the serving process measured anything), so there is no
+	// settled state to protect yet. The holds apply from the second tick on.
+	// That is why a lan mount whose live class is already slow switches at
+	// the first successful tick, about 2 s after the NFS server starts, and
+	// not after 10 s.
 	if !h.have {
 		h.stable, h.have = want, true
 		return want
@@ -207,7 +215,18 @@ type linkFollower struct {
 	verifiedAt  time.Time
 	unsupported bool
 	lastErrLog  time.Time
+	startedAt   time.Time // the first tick
+	answered    bool      // juicefs has answered at least once
+	warn        func(msg string, attrs ...any)
 }
+
+// linkStartupGrace: the follower starts with the NFS server, and the first
+// ticks can come before juicefs serves its control file (laptop run
+// 2026-11-13: "no such process" at the first tick of every session, success
+// 2 s later). Until juicefs first answers, failures in this window are
+// logged at debug level only. A juicefs that never answers is still warned
+// about once the window ends.
+const linkStartupGrace = 30 * time.Second
 
 func newLinkFollower(ctl *jfsControl) *linkFollower {
 	return &linkFollower{
@@ -224,6 +243,9 @@ func newLinkFollower(ctl *jfsControl) *linkFollower {
 func (f *linkFollower) tick(now time.Time) {
 	if f.unsupported {
 		return
+	}
+	if f.startedAt.IsZero() {
+		f.startedAt = now
 	}
 	class, readClass := f.classes()
 	target := f.hyst.observe(now, jfsLinkPolicyFor(class, readClass))
@@ -248,13 +270,22 @@ func (f *linkFollower) tick(now time.Time) {
 		return
 	}
 	if err != nil {
+		f.haveApplied = false
+		if !f.answered && now.Sub(f.startedAt) < linkStartupGrace {
+			jmlog.Debug("juicefs link policy: juicefs not answering yet; retrying", "error", err.Error())
+			return
+		}
 		if now.Sub(f.lastErrLog) >= 10*time.Minute {
 			f.lastErrLog = now
-			jmlog.Warn("juicefs link policy: exchange failed; retrying", "error", err.Error())
+			warn := f.warn
+			if warn == nil {
+				warn = jmlog.Warn
+			}
+			warn("juicefs link policy: exchange failed; retrying", "error", err.Error())
 		}
-		f.haveApplied = false
 		return
 	}
+	f.answered = true
 	f.applied, f.haveApplied, f.verifiedAt = cur, true, now
 }
 

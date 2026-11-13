@@ -2,7 +2,15 @@ package main
 
 import (
 	"errors"
+	"reflect"
+	"slices"
+	"strings"
 	"testing"
+	"time"
+
+	"github.com/lelanddutcher/juicemount/health"
+	"github.com/lelanddutcher/juicemount/internal/netprofile"
+	jmnfs "github.com/lelanddutcher/juicemount/nfs"
 )
 
 func TestRedisURLsAtConfigIngestProductionUnchanged(t *testing.T) {
@@ -84,4 +92,88 @@ func TestBackendRouteResolutionFailurePreservesPriorCeiling(t *testing.T) {
 	if !backendRoutePolicyState.tunneled.Load() || !backendRoutePolicyState.ceilingApplied.Load() {
 		t.Fatal("failed route resolution cleared the prior conservative tunnel ceiling")
 	}
+}
+
+// B1 (laptop run 2026-11-13): the volume owner mounted juicefs on lan flags
+// through a WireGuard utun while the serving process capped the class at
+// slow. Both processes now classify the route with one function. For each
+// route, the serving side (resolveAndApplyBackendRouteCeiling on this
+// process's profile) and the owner side (health.MountLinkPolicy on the owner
+// process's own profile, same RTT sample) must reach the same classes, and
+// the owner's mount args must equal what the serving process's live
+// follower would send, so the follower has nothing to switch at mount.
+func TestServingAndOwnerClassifyBackendRouteAlike(t *testing.T) {
+	t.Setenv("JM_NET_CLASS", "")
+	t.Setenv("JM_JFS_DEMAND_FIRST", "")
+	t.Setenv("JM_JFS_OBJECT_TIMEOUTS", "")
+	defer applyBackendRouteCeiling("")
+	defer netprofile.Default().ResetForTransportChange()
+	const target = "192.0.2.10:30179"
+	const rtt = 2 * time.Millisecond // the owner's dial on the laptop lab
+	for _, tc := range []struct {
+		iface    string
+		tunneled bool
+	}{
+		{"utun11", true},
+		{"tailscale0", true},
+		{"en0", false},
+	} {
+		resolver := func(got string) (string, error) {
+			if got != target {
+				t.Fatalf("resolver saw %q, want %q", got, target)
+			}
+			return tc.iface, nil
+		}
+
+		serving := netprofile.Default()
+		serving.ResetForTransportChange()
+		serving.ObserveRTT(rtt)
+		if err := resolveAndApplyBackendRouteCeiling(target, resolver); err != nil {
+			t.Fatal(err)
+		}
+		follower := jmnfs.JFSLinkPolicyFlags(serving)
+
+		owner := netprofile.New()
+		owner.ObserveRTT(rtt)
+		pol, mountArgs := health.MountLinkPolicy(owner, target, resolver)
+
+		if owner.Class() != serving.Class() || owner.ReadPolicyClass() != serving.ReadPolicyClass() {
+			t.Errorf("%s: owner class %s/%s, serving %s/%s", tc.iface,
+				owner.Class(), owner.ReadPolicyClass(), serving.Class(), serving.ReadPolicyClass())
+		}
+		if pol != serving.JuiceFS() {
+			t.Errorf("%s: owner prefetch policy %+v, serving %+v", tc.iface, pol, serving.JuiceFS())
+		}
+		if !reflect.DeepEqual(normLinkDurations(t, mountArgs), normLinkDurations(t, follower)) {
+			t.Errorf("%s: mount args %v, follower would send %v", tc.iface, mountArgs, follower)
+		}
+		if tc.tunneled {
+			if owner.Class() != netprofile.ClassSlow || !slices.Contains(mountArgs, "--demand-first") ||
+				pol.BufferSizeMB != 512 {
+				t.Errorf("%s: tunneled mount got class %s, args %v, buffer %d; want slow, --demand-first, 512",
+					tc.iface, owner.Class(), mountArgs, pol.BufferSizeMB)
+			}
+		} else if owner.Class() == netprofile.ClassSlow {
+			t.Errorf("%s: an untunneled 2 ms route was capped at slow", tc.iface)
+		}
+		if backendRoutePolicyState.tunneled.Load() != tc.tunneled {
+			t.Errorf("%s: serving metrics tunneled = %v", tc.iface, !tc.tunneled)
+		}
+	}
+}
+
+// normLinkDurations writes "3m" and "3m0s" the same way.
+func normLinkDurations(t *testing.T, args []string) []string {
+	t.Helper()
+	out := append([]string(nil), args...)
+	for i := 1; i < len(out); i++ {
+		if strings.HasSuffix(out[i-1], "-timeout") {
+			d, err := time.ParseDuration(out[i])
+			if err != nil {
+				t.Fatal(err)
+			}
+			out[i] = d.String()
+		}
+	}
+	return out
 }
