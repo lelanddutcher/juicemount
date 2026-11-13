@@ -9,6 +9,7 @@
 //
 //	drainprobe write -nfs 127.0.0.1:21049 -dir w/run1 -small 200 -big-mb 500
 //	drainprobe wait  -fuse /jfs -dir w/run1 -count 201 -timeout 600s
+//	drainprobe firstbyte -files fo/c01.mov,fo/c02.mov   (experiments/first-open-lab.sh)
 //
 // Both print one JSON object on stdout. The workload copies the laptop lab's
 // (orchestrator laptop-lab-2026-11-11): one mkdir, 200 files of 2–63 KiB
@@ -48,6 +49,8 @@ func main() {
 		err = wait(os.Args[2:])
 	case "read":
 		err = read(os.Args[2:])
+	case "firstbyte":
+		err = firstbyte(os.Args[2:])
 	default:
 		err = fmt.Errorf("unknown step %q", os.Args[1])
 	}
@@ -398,5 +401,67 @@ func read(args []string) error {
 	}
 	emit(map[string]any{"step": "read", "file": *file, "scrub_s": lat, "seq_bytes": seq,
 		"seconds": secs(time.Since(t0)), "errors": errs})
+	return nil
+}
+
+// firstbyte opens each file in turn, as a player opens a clip: LOOKUP every
+// path component, READ the first block, then the rest of the first MiB.
+// Every file is new to this NFS session, so the first one pays the cold
+// folder lookups and the later ones show the per-file cost. One JSON line
+// per file.
+func firstbyte(args []string) error {
+	fs := flag.NewFlagSet("firstbyte", flag.ExitOnError)
+	addr := fs.String("nfs", "127.0.0.1:21049", "NFS server address")
+	export := fs.String("export", "/Volumes/zpool", "export path")
+	files := fs.String("files", "", "comma-separated files, relative to the export root")
+	first := fs.Int("first", 128<<10, "size of the first READ")
+	upto := fs.Int("upto", 1<<20, "read sequentially up to this offset after the first READ")
+	gap := fs.Duration("gap", time.Second, "pause between files")
+	_ = fs.Parse(args)
+	v, err := dial(*addr, *export)
+	if err != nil {
+		return fmt.Errorf("mount: %w", err)
+	}
+	for i, name := range strings.Split(*files, ",") {
+		if i > 0 {
+			time.Sleep(*gap)
+		}
+		row := map[string]any{"step": "firstbyte", "file": name, "index": i, "start_unix_ns": time.Now().UnixNano()}
+		t0 := time.Now()
+		_, _, err := v.Lookup(name)
+		row["lookup_s"] = secs(time.Since(t0))
+		if err != nil {
+			row["error"] = "lookup: " + err.Error()
+			emit(row)
+			continue
+		}
+		f, err := v.Open(name)
+		row["open_s"] = secs(time.Since(t0))
+		if err != nil {
+			row["error"] = "open: " + err.Error()
+			emit(row)
+			continue
+		}
+		buf := make([]byte, *first)
+		n, err := f.ReadAt(buf, 0)
+		row["first_byte_s"] = secs(time.Since(t0))
+		row["first_bytes"] = n
+		if err != nil && err.Error() != "EOF" {
+			row["error"] = "read: " + err.Error()
+			emit(row)
+			continue
+		}
+		off := int64(n)
+		for off < int64(*upto) {
+			m, err := f.ReadAt(buf, off)
+			if m <= 0 || err != nil && err.Error() != "EOF" {
+				break
+			}
+			off += int64(m)
+		}
+		row["upto_s"] = secs(time.Since(t0))
+		row["upto_bytes"] = off
+		emit(row)
+	}
 	return nil
 }

@@ -962,6 +962,20 @@ func (r *Reader) getSlicesBounded(ctx context.Context, inode uint64, chunkIndex 
 	return r.getSlicesBoundedTrace(ctx, inode, chunkIndex, timeout, nil)
 }
 
+// HasChunkMapping reports whether one chunk's slice mapping is in RAM. A
+// file without one has no blocks this reader knows of, so a read of it will
+// most likely miss the SSD cache.
+func (r *Reader) HasChunkMapping(inode uint64, chunkIndex int64) bool {
+	if r == nil {
+		return false
+	}
+	key := fmt.Sprintf("%d_%d", inode, chunkIndex)
+	r.sliceMu.RLock()
+	_, ok := r.sliceCache[key]
+	r.sliceMu.RUnlock()
+	return ok
+}
+
 // PrepareChunkMapping warms one bound chunk's mapping and same-observation
 // inode attribute without opening media or transferring an unbounded list.
 // A preparation never joins an existing foreground flight. Its own finite

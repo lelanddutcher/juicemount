@@ -1071,6 +1071,9 @@ func (m *baseMeta) GetAttr(ctx Context, inode Ino, attr *Attr) syscall.Errno {
 	if m.conf.OpenCache > 0 && m.of.Check(inode, attr) {
 		return 0
 	}
+	if m.of.RecentOpenAttr(inode, attr, openAttrReuse) {
+		return 0
+	}
 	defer m.timeit("GetAttr", time.Now())
 	var err syscall.Errno
 	if inode == RootInode || inode == TrashInode {
@@ -1571,8 +1574,22 @@ func (m *baseMeta) Open(ctx Context, inode Ino, flags uint32, attr *Attr) (st sy
 		return 0
 	}
 	// attr may be valid, see fs.Open()
+	var first []*slice
+	var gen uint64
+	prefetched := false
 	if attr != nil && !attr.Full {
-		if st = m.GetAttr(ctx, inode, attr); st != 0 {
+		if e, ok := m.en.(firstChunkEngine); ok && m.checkRoot(inode) == inode && inode != RootInode && inode != TrashInode {
+			// One round trip for the attr and the first chunk's slices (patch
+			// 0028): the first read then needs no LRANGE of its own.
+			gen = m.of.chunkGen()
+			start := time.Now()
+			first, st = e.doGetAttrFirstChunk(ctx, inode, attr)
+			m.timeit("GetAttr", start)
+			if st != 0 {
+				return
+			}
+			prefetched = true
+		} else if st = m.GetAttr(ctx, inode, attr); st != 0 {
 			return
 		}
 	}
@@ -1606,8 +1623,29 @@ func (m *baseMeta) Open(ctx Context, inode Ino, flags uint32, attr *Attr) (st sy
 			return syscall.EPERM
 		}
 	}
-	m.of.Open(inode, attr)
+	if !prefetched {
+		m.of.Open(inode, attr)
+		return 0
+	}
+	var ss []Slice
+	if attr.Typ == TypeFile && len(first) > 0 {
+		ss = buildSlice(first)
+	}
+	if m.of.OpenPrefetched(inode, attr, ss, gen) && !m.conf.ReadOnly && (len(first) >= 5 || len(ss) >= 5) {
+		go m.compactChunk(inode, 0, false, false) // as Read does for a fragmented chunk
+	}
 	return 0
+}
+
+// openAttrReuse bounds how old an attr read by this client for a file it
+// holds open may be when GetAttr serves it without a round trip (patch 0028).
+// The kernel caches attributes for --attr-cache seconds (the app uses 10).
+const openAttrReuse = time.Second
+
+// firstChunkEngine reads an inode's attr and the slices of its first chunk in
+// one round trip (patch 0028). Engines without it keep the plain GetAttr.
+type firstChunkEngine interface {
+	doGetAttrFirstChunk(ctx Context, inode Ino, attr *Attr) ([]*slice, syscall.Errno)
 }
 
 func (m *baseMeta) InvalidateChunkCache(ctx Context, inode Ino, indx uint32) syscall.Errno {

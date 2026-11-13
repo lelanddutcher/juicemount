@@ -956,6 +956,29 @@ func (m *redisMeta) doGetAttr(ctx Context, inode Ino, attr *Attr) syscall.Errno 
 	return errno(err)
 }
 
+// doGetAttrFirstChunk pipelines GET of the inode and LRANGE of its first
+// chunk (patch 0028). The attr's error decides the result; a failed LRANGE
+// only returns no slices, and the first read fetches them itself.
+func (m *redisMeta) doGetAttrFirstChunk(ctx Context, inode Ino, attr *Attr) ([]*slice, syscall.Errno) {
+	var get *redis.StringCmd
+	var lr *redis.StringSliceCmd
+	_, _ = m.rdb.Pipelined(ctx, func(p redis.Pipeliner) error {
+		get = p.Get(ctx, m.inodeKey(inode))
+		lr = p.LRange(ctx, m.chunkKey(inode, 0), 0, -1)
+		return nil
+	})
+	a, err := get.Bytes()
+	if err != nil {
+		return nil, errno(err)
+	}
+	m.parseAttr(a, attr)
+	vals, err := lr.Result()
+	if err != nil {
+		return nil, 0
+	}
+	return readSlices(vals), 0
+}
+
 type timeoutError interface {
 	Timeout() bool
 }
