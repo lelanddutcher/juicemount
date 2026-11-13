@@ -51,6 +51,7 @@ PATCH_FILES = {
     "patches/0027-live-link-policy.patch": [
         "pkg/chunk/cached_store.go", "pkg/meta/interface.go", "pkg/vfs/internal.go",
         "pkg/vfs/reader.go", "pkg/vfs/writer.go"],
+    "patches/0028-dead-peer-detection.patch": ["pkg/object/restful.go"],
 }
 VERSION_PACKAGE = "github.com/juicedata/juicefs/pkg/version"
 

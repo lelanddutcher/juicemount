@@ -2,12 +2,12 @@
   "archive_sha256": "9351a0655185f4a48accae2ae3af70db932de1ee38acfa4f153e3050b817806d",
   "binary": {
     "bundle_path": "Contents/MacOS/juicefs",
-    "ldflags": "-s -w -X github.com/juicedata/juicefs/pkg/version.revision=e0032b2ae5e9-jm12 -X github.com/juicedata/juicefs/pkg/version.revisionDate=2025-12-02",
+    "ldflags": "-s -w -X github.com/juicedata/juicefs/pkg/version.revision=e0032b2ae5e9-jm13 -X github.com/juicedata/juicefs/pkg/version.revisionDate=2025-12-02",
     "package": ".",
     "tags": "nogateway,nowebdav,nocos,nobos,nohdfs,noibmcos,noobs,nooss,noqingstor,nosftp,noswift,noazure,nogs,noufile,nob2,nonfs,nodragonfly,nosqlite,nomysql,nopg,notikv,nobadger,noetcd",
     "upstream_commit": "e0032b2ae5e9603403ca955eed7d05426f6f2f8c",
     "upstream_tag": "v1.3.1",
-    "version_output": "juicefs version 1.3.1+2025-12-02.e0032b2ae5e9-jm12"
+    "version_output": "juicefs version 1.3.1+2025-12-02.e0032b2ae5e9-jm13"
   },
   "files": {
     "LICENSE": {
@@ -791,7 +791,7 @@
       "upstream_sha256": "92fcfaffd0601967a182a6ce12aa863f3dedcb658404fb2fba3629081bcf8de1"
     },
     "pkg/object/restful.go": {
-      "sha256": "5aeafb19705ea3be4ad008987292cf393cc7f0f3d8926d8dd863ec190edb1540",
+      "sha256": "8cec323aa72ec1ac44862e225772a390b9f89639494131258f230781997eb290",
       "upstream_sha256": "5aeafb19705ea3be4ad008987292cf393cc7f0f3d8926d8dd863ec190edb1540"
     },
     "pkg/object/s3.go": {
@@ -1149,6 +1149,11 @@
     "pkg/object/file_ops.go": "554035795ee280408f10ccde033908489101126c0c10f89f1b7f9c6817fb54e2",
     "pkg/object/file_ops_unix.go": "30c8a125d4124eea6c14dd4ec8eb942f3997dfb316f083a64097940e4ca03ec6",
     "pkg/object/file_ops_windows.go": "6e6e96c6471276485464ea73dd90db804a3a72c0a516bab8a15e02857af46f48",
+    "pkg/object/jm_dead_peer.go": "5055f762b1130589bf74049b246889245fb95cc860b44e58c128f8e2d7595b8e",
+    "pkg/object/jm_dead_peer_darwin.go": "ddd5c17e0856d1a1e20cf73ce0e45ae9d1b049416decdc5c4e06363b33f47419",
+    "pkg/object/jm_dead_peer_linux.go": "1f9b9310b171e18c1c6e4836ad53b0af42a9be68e06dc117ea2cb003325a7711",
+    "pkg/object/jm_dead_peer_linux_test.go": "a013ebbbd79f75e8dbd44672b86bc525107d18ab967c114f1107baff814241d6",
+    "pkg/object/jm_dead_peer_other.go": "030918fdf5180e5fa3083196c846781146ec675b349432f36fe229a362e8b1b8",
     "pkg/object/jm_fence.go": "2518592a50e2afa5c205c1b2c6b234f29e54ff204b22b3ef0f5e1ea417172749",
     "pkg/object/jm_fence_linux_test.go": "63b02858d3ee6bfe43ace4d21a9a1a780fcc8d88daba154cf218239417a06079",
     "pkg/replaceguard/birth.go": "5de9a31975c4c706276f036f47e7d24b33abc60b587793c0f23b199014b7e17a",
@@ -1197,7 +1202,8 @@
     "patches/0024-small-upload-lane.patch": "83043ad356c5f47591e22ccd8070d0ceeb0bc79845a9d98f747ae5937d6de8d6",
     "patches/0025-create-files-message.patch": "cf8bcd77dd4cac9271c0eb79a1f578544f9490d1801e67c54949ad2c4513c672",
     "patches/0026-pinned-blocks.patch": "94be902b048f05d72ec6b2dce0af22ea44917c21c0ebb64d105714b3c28bdc08",
-    "patches/0027-live-link-policy.patch": "a426454b44ec0e455f03c8f0d5fe3b4c9b8fa8ecba04ed7f74a9e96446728fd0"
+    "patches/0027-live-link-policy.patch": "a426454b44ec0e455f03c8f0d5fe3b4c9b8fa8ecba04ed7f74a9e96446728fd0",
+    "patches/0028-dead-peer-detection.patch": "9868535398cfc7054143bdc95f57e619cff38478b5553a6be2b61abc758e14ce"
   },
   "scope": "All pkg/ and cmd/ files plus main.go, LICENSE, go.mod and go.sum from the verified module ZIP. Documentation, integration tests and SDK examples are not included. local_files are JuiceMount-owned source with no upstream counterpart.",
   "upstream_url": "https://github.com/juicedata/juicefs/tree/v1.3.1",
