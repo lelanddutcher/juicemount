@@ -72,7 +72,7 @@ func TestGenerationReservationNeverReusesRetiredPath(t *testing.T) {
 	}
 }
 
-func TestGenerationReopenRefusesUnresolvedIntentAndTornLedger(t *testing.T) {
+func TestGenerationReopenRetiresNeverLaunchedAndRefusesTornLedger(t *testing.T) {
 	logical := generationTestPath(t)
 	a, err := reserveFUSEGeneration(logical, "digest", emptyGenerationSnapshot)
 	if err != nil {
@@ -411,4 +411,102 @@ func TestGenerationFromEarlierBootStillRefusesOccupiedNamespace(t *testing.T) {
 	if _, err := reserveFUSEGeneration(logical, "digest", occupied); err == nil {
 		t.Fatal("occupied namespace admitted a new child")
 	}
+}
+
+// The reviewer's probe: the second mount-table check fails after "intent" is
+// written. The generation stays intent-only. Before, it refused every later
+// reservation, in this boot and after a reboot.
+func TestGenerationIntentOnlyAfterFailedSecondCheckIsRetired(t *testing.T) {
+	logical := generationTestPath(t)
+	calls := 0
+	failSecond := func(ctx context.Context) (mounttable.Snapshot, error) {
+		calls++
+		if calls == 2 {
+			return mounttable.Snapshot{}, errors.New("observer timed out")
+		}
+		return emptyGenerationSnapshot(ctx)
+	}
+	if _, err := reserveFUSEGeneration(logical, "digest", failSecond); err == nil {
+		t.Fatal("precondition: failed second check reserved")
+	}
+	b, err := reserveFUSEGeneration(logical, "digest", emptyGenerationSnapshot)
+	if err != nil {
+		t.Fatalf("intent-only generation held the next reservation: %v", err)
+	}
+	if !strings.HasSuffix(b.ID, "0000000000000002") {
+		t.Fatalf("intent-only generation reused: %s", b.ID)
+	}
+	if err := b.retire(); err != nil {
+		t.Fatal(err)
+	}
+	// The ledger replays (grammar and tombstone ancestry) after the
+	// intent -> ready -> retired completion.
+	c, err := reserveFUSEGeneration(logical, "digest", emptyGenerationSnapshot)
+	if err != nil {
+		t.Fatalf("completed intent-only ledger unreadable: %v", err)
+	}
+	c.close()
+}
+
+// Power loss right after "intent" reached the disk, before the folder was made.
+func TestGenerationIntentOnlyWithoutFolderIsRetired(t *testing.T) {
+	logical := generationTestPath(t)
+	calls := 0
+	failSecond := func(ctx context.Context) (mounttable.Snapshot, error) {
+		calls++
+		if calls == 2 {
+			return mounttable.Snapshot{}, errors.New("observer timed out")
+		}
+		return emptyGenerationSnapshot(ctx)
+	}
+	if _, err := reserveFUSEGeneration(logical, "digest", failSecond); err == nil {
+		t.Fatal("precondition: failed second check reserved")
+	}
+	installs, err := filepath.Glob(filepath.Join(logical+".generations", "*", "0000000000000001"))
+	if err != nil || len(installs) != 1 {
+		t.Fatalf("generation folder not found: %v %v", installs, err)
+	}
+	if err := os.RemoveAll(installs[0]); err != nil {
+		t.Fatal(err)
+	}
+	b, err := reserveFUSEGeneration(logical, "digest", generationBootSnapshot("after-power-loss"))
+	if err != nil {
+		t.Fatalf("intent-only generation without folder held the next reservation: %v", err)
+	}
+	b.close()
+	c, err := reserveFUSEGeneration(logical, "digest", generationBootSnapshot("after-power-loss"))
+	if err != nil {
+		t.Fatalf("ledger unreadable after completing a missing folder: %v", err)
+	}
+	c.close()
+}
+
+// An explicit recovery attempt file on a generation of an earlier boot: the
+// recovery tool needs the same boot, so it can never finish it. The reboot
+// already ended the helper's mount and process, so it is retired.
+func TestGenerationFromEarlierBootWithRecoveryAttemptIsRetired(t *testing.T) {
+	logical := generationTestPath(t)
+	a, err := reserveFUSEGeneration(logical, "digest", generationBootSnapshot("old-boot"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.markLaunching(); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.markChild(4242); err != nil {
+		t.Fatal(err)
+	}
+	attempt := filepath.Join(filepath.Dir(a.Path), recoveryAttemptName)
+	a.close()
+	if err := os.WriteFile(attempt, []byte("{}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reserveFUSEGeneration(logical, "digest", generationBootSnapshot("old-boot")); err == nil {
+		t.Fatal("same-boot launched generation with a recovery attempt admitted")
+	}
+	b, err := reserveFUSEGeneration(logical, "digest", generationBootSnapshot("new-boot"))
+	if err != nil {
+		t.Fatalf("earlier-boot generation with a recovery attempt held the next child: %v", err)
+	}
+	b.close()
 }

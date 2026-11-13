@@ -17,17 +17,28 @@
   (laptop lab 2026-11-12, scenario 5).
 - The new owner can also mount again after a reboot. Each JuiceFS mount gets
   a reserved folder (a "generation"). One that was never retired used to
-  refuse every new mount ("prior generation unresolved"). A generation from
-  an earlier boot, or one whose JuiceFS process was never started, is now
-  retired by itself: no process or mount can remain, and it holds no data
-  (unsent writes stay in the upload queue; JuiceFS re-uploads its own staged
-  blocks at the next mount).
-- Two holds remain, and each says what to do. If the old owner is still
-  running, or a recovery step is using its lock, Start says to try again in a
-  minute and to restart the Mac if it persists. If the owner died in this
-  session after starting JuiceFS, that JuiceFS process may still be running;
-  Start says to quit JuiceMount and restart the Mac. After the restart, Start
-  recovers by itself.
+  refuse every new mount ("prior generation unresolved"). Two kinds are now
+  retired by themselves, because no process or mount can remain:
+  - one whose JuiceFS process was never started. This includes a
+    reservation that failed partway (for example its second mount-table
+    check timed out), or power loss during it;
+  - one from an earlier boot, even if an explicit recovery had started on it.
+  A generation holds no data. Unsent writes stay in the upload queue, and
+  JuiceFS re-uploads its own staged blocks at the next mount. Nothing is
+  retired while anything is mounted under the generations folder.
+- Exactly these holds remain, and each says what to do:
+  - The old owner's lock is held: the owner is still running, or a recovery
+    step is using the lock. Start says to try again in a minute and to
+    restart the Mac if it persists.
+  - A JuiceFS process was started since this Mac last started, its owner
+    died, and the unmount helper could not retire it. That process may still
+    be running. Start says to quit JuiceMount and restart the Mac; after the
+    restart, Start recovers by itself.
+  - An explicit recovery started on a generation since this Mac last
+    started. Start says to finish it with `--recover-retained-generation` or
+    restart the Mac.
+  - Anything is mounted under the generations folder. Start refuses with
+    "generation namespace occupied".
 - While started offline, cache status no longer reports the whole free disk
   (407 GB in the lab) as the cache size with a budget of 0. With no mounted
   cache, `capacity.cache_capacity_bytes` is 0 ("unknown") and the pinned set is
