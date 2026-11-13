@@ -213,3 +213,103 @@ func TestServingAndOwnerTakeSameFallbackOnFailedLookup(t *testing.T) {
 		}
 	}
 }
+
+// Through Link both processes must classify the link alike (follow-up to
+// PR #90). The serving process takes the owner's Link proofs (startup and
+// routine probes); the owner mounts with RedisURL on Link's loopback proxy,
+// where the mount's TCP dial says nothing. Before this change the owner's
+// mount classified from whatever its profile held. After a network-cost
+// change reset it (ResetForTransportChange in the owner's "cost"
+// operation), or after an offline boot, that was nothing: the mount got
+// the medium buffer and prefetch abroad for its life while the serving
+// process said slow. Now every owner mount takes one Link round trip
+// (volumeOwner.mountLinkRTT), the same measurement as the routine probe.
+func TestServingAndOwnerAgreeThroughLink(t *testing.T) {
+	t.Setenv("JM_NET_CLASS", "")
+	t.Setenv("JM_JFS_DEMAND_FIRST", "")
+	t.Setenv("JM_JFS_OBJECT_TIMEOUTS", "")
+	defer applyBackendRouteCeiling("en0")
+	defer netprofile.Default().ResetForTransportChange()
+	const logical = "redis://192.0.2.10:30179/1"
+	const proxy = "redis://127.0.0.1:41079/1" // the owner's Link proxy
+	target := backendRouteTarget(logical)
+	en0 := func(string) (string, error) { return "en0", nil } // Link: no utun
+
+	for _, rtt := range []time.Duration{3 * time.Millisecond, 45 * time.Millisecond, 210 * time.Millisecond} {
+		o, err := newVolumeOwner(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		node := &jmnfs.LinkNode{}
+		var probes []bool
+		o.probeWork = func(n *jmnfs.LinkNode, l string, _ time.Duration, startup bool) (time.Duration, float64, float64, error) {
+			if n != node || l != logical {
+				t.Fatalf("mount sample went to %p %q, want the owner's node and the configured backend", n, l)
+			}
+			probes = append(probes, startup)
+			return rtt, 0, 0, nil
+		}
+
+		// The serving process: the owner's routine proof (WithProbe) feeds it.
+		serving := netprofile.Default()
+		serving.ResetForTransportChange()
+		serving.ObserveRTT(rtt)
+		if err := resolveAndApplyBackendRouteCeiling(target, en0); err != nil {
+			t.Fatal(err)
+		}
+		follower := jmnfs.JFSLinkPolicyFlags(serving)
+
+		// The owner, after a cost change emptied its profile.
+		owner := netprofile.New()
+		owner.ResetForTransportChange()
+		health.ObserveMountLinkSample(owner, proxy, o.mountLinkRTT(node, logical))
+		pol, mountArgs := health.MountLinkPolicy(owner, &health.RouteCeiling{}, target, en0)
+
+		if len(probes) != 1 || probes[0] {
+			t.Fatalf("rtt %v: owner mount samples %v, want one routine (non-bulk) Link round trip", rtt, probes)
+		}
+		if owner.Class() != serving.Class() || owner.ReadPolicyClass() != serving.ReadPolicyClass() {
+			t.Errorf("rtt %v: owner class %s/%s, serving %s/%s", rtt,
+				owner.Class(), owner.ReadPolicyClass(), serving.Class(), serving.ReadPolicyClass())
+		}
+		if pol != serving.JuiceFS() {
+			t.Errorf("rtt %v: owner prefetch policy %+v, serving %+v", rtt, pol, serving.JuiceFS())
+		}
+		if !reflect.DeepEqual(normLinkDurations(t, mountArgs), normLinkDurations(t, follower)) {
+			t.Errorf("rtt %v: mount args %v, follower would send %v", rtt, mountArgs, follower)
+		}
+
+		// Without the Link sample (the old mount) the owner falls back to
+		// its empty profile: abroad, that disagreed with the serving class.
+		blind := netprofile.New()
+		health.ObserveMountLinkSample(blind, proxy, nil)
+		blindPol, _ := health.MountLinkPolicy(blind, &health.RouteCeiling{}, target, en0)
+		if rtt > 100*time.Millisecond && blindPol == serving.JuiceFS() {
+			t.Errorf("rtt %v: the unmeasured mount already agreed; the test no longer shows the gap", rtt)
+		}
+	}
+}
+
+// The owner's Link sample exists only with a Link node, and it is the
+// routine probe (ping only), never the startup bulk benchmark.
+func TestOwnerMountLinkRTTNeedsLink(t *testing.T) {
+	o, err := newVolumeOwner(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if o.mountLinkRTT(nil, "redis://192.0.2.10:30179/1") != nil || o.mountLinkRTT(&jmnfs.LinkNode{}, "") != nil {
+		t.Fatal("a mount without Link got a Link sample")
+	}
+	o.probeWork = func(_ *jmnfs.LinkNode, _ string, timeout time.Duration, startup bool) (time.Duration, float64, float64, error) {
+		if startup || timeout != 2*time.Second {
+			t.Fatalf("mount sample startup=%v timeout=%v", startup, timeout)
+		}
+		return 0, 0, 0, errors.New("link down")
+	}
+	if _, err := o.mountLinkRTT(&jmnfs.LinkNode{}, "redis://192.0.2.10:30179/1")(2 * time.Second); err == nil {
+		t.Fatal("a failed Link round trip reported a sample")
+	}
+	if linkMountRTT(nil, "redis://192.0.2.10:30179/1") != nil {
+		t.Fatal("in-process mount without Link got a Link sample")
+	}
+}

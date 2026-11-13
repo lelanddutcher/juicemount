@@ -85,6 +85,10 @@ func TestOwnerClaimForwardsObjectKeyWithoutPersistingIt(t *testing.T) {
 			if want := backendRouteTarget(cfg.RedisURL); want == "" || captured.RouteTarget != want {
 				t.Fatalf("claim route target = %q, want the configured backend %q", captured.RouteTarget, want)
 			}
+			// No Link configured: the mount's TCP dial is the sample.
+			if captured.LinkRTT != nil {
+				t.Fatal("claim without Link set a Link mount sample")
+			}
 			if response := o.dispatch(request); response.Error != "" || calls != 1 {
 				t.Fatal("exact claim replay reconstructed its manager or failed")
 			}

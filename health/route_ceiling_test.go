@@ -148,3 +148,52 @@ func TestNetWatcherReportsBackendRouteResult(t *testing.T) {
 		t.Fatalf("route callbacks %v, want %v", got, want)
 	}
 }
+
+// Through Link the backend URL is the loopback proxy, so the mount's TCP
+// dial is skipped. The mount then measures through the Link node
+// (FUSEConfig.LinkRTT), as the serving process does, instead of
+// classifying from whatever the profile holds: after a network-cost reset
+// that was nothing, and a Link mount abroad got the medium buffer.
+func TestFUSEManagerMountPolicySamplesThroughLink(t *testing.T) {
+	t.Setenv("JM_NET_CLASS", "")
+	t.Setenv("JM_JFS_DEMAND_FIRST", "")
+	t.Setenv("JM_JFS_OBJECT_TIMEOUTS", "")
+	defer netprofile.Default().ResetForTransportChange()
+	en0 := func(string) (string, error) { return "en0", nil }
+
+	netprofile.Default().ResetForTransportChange()
+	var timeouts []time.Duration
+	fm := NewFUSEManager(FUSEConfig{RedisURL: "redis://127.0.0.1:41000/1", RouteTarget: "192.0.2.10:30179",
+		LinkRTT: func(timeout time.Duration) (time.Duration, error) {
+			timeouts = append(timeouts, timeout)
+			return 200 * time.Millisecond, nil
+		}})
+	fm.routeResolver = en0
+	pol, args := fm.linkAwareJuiceFSPolicy()
+	if !reflect.DeepEqual(timeouts, []time.Duration{mountLinkSampleTimeout}) {
+		t.Fatalf("Link sample calls %v, want one bounded by %v", timeouts, mountLinkSampleTimeout)
+	}
+	if got := netprofile.Default().Class(); got != netprofile.ClassSlow || pol.BufferSizeMB != 512 ||
+		!slices.Contains(args, "--demand-first") {
+		t.Fatalf("Link abroad (200 ms): class %s, buffer %d, args %v; want slow, 512, --demand-first", got, pol.BufferSizeMB, args)
+	}
+
+	// The old behaviour, kept for a loopback backend without Link (a debug
+	// rewrite): no sample, the profile's default.
+	netprofile.Default().ResetForTransportChange()
+	fm = NewFUSEManager(FUSEConfig{RedisURL: "redis://127.0.0.1:41000/1", RouteTarget: "192.0.2.10:30179"})
+	fm.routeResolver = en0
+	pol, _ = fm.linkAwareJuiceFSPolicy()
+	if netprofile.Default().Snapshot().HaveRTT || pol.BufferSizeMB == 512 {
+		t.Fatalf("loopback without Link took a sample: %+v, buffer %d", netprofile.Default().Snapshot(), pol.BufferSizeMB)
+	}
+
+	// A failed Link sample feeds nothing and does not fail the mount.
+	netprofile.Default().ResetForTransportChange()
+	fm = NewFUSEManager(FUSEConfig{RedisURL: "redis://localhost:41000/1", RouteTarget: "192.0.2.10:30179",
+		LinkRTT: func(time.Duration) (time.Duration, error) { return 0, errors.New("link down") }})
+	fm.routeResolver = en0
+	if _, _ = fm.linkAwareJuiceFSPolicy(); netprofile.Default().Snapshot().HaveRTT {
+		t.Fatal("a failed Link sample fed the profile")
+	}
+}
