@@ -598,6 +598,11 @@ func (d *Drainer) openDrainTarget(row *metadata.SpoolRow, dest string, lease lea
 			// place to keep save order (same rule as installNewName).
 			inPlace, why = true, ""
 		}
+		if !inPlace && base.Kind == metadata.SpoolBaseAbsent && d.rowInstalledDest(row, dest) {
+			// This row's own earlier install landed although it reported an
+			// error: rewrite its own file in place, never conflict-copy it.
+			inPlace, why = true, ""
+		}
 		if !inPlace {
 			exactBaseRefusal = base.Kind == metadata.SpoolBasePresent
 			conflict = why
@@ -924,6 +929,13 @@ func (d *Drainer) installNewName(row *metadata.SpoolRow, stage *drainStage, dest
 		}
 		return false
 	}
+	// Remember the stage's inode for this row BEFORE the rename. The rename
+	// can land on the server and still report an error (the link dropped
+	// with the reply in flight, or juicefs retried a transaction that had
+	// already committed and got EEXIST): the name then holds this row's own
+	// bytes, and the retry must recognise them (rowInstalledDest) instead of
+	// publishing a conflict copy of itself (remote lab, 2026-11-13).
+	d.recordInstalledIdentity(row.ID, stage.dev, stage.ino)
 	if stage.replace != nil {
 		// F1: take the name from the exact file the save replaces, in one
 		// replacing rename, under the same lease as the claim recheck. A
@@ -963,6 +975,12 @@ func (d *Drainer) installNewName(row *metadata.SpoolRow, stage *drainStage, dest
 		}
 	} else {
 		err = drainRenameNoReplace(stage.path, dest)
+	}
+	if err != nil && d.rowInstalledDest(row, dest) {
+		// The rename landed; only its reply was lost.
+		jmlog.Info("drain: install rename reported an error but the name holds this save's stage; installed",
+			"path", row.NFSPath, "error", err.Error())
+		err = nil
 	}
 	if err == nil {
 		if op != nil {
@@ -1083,6 +1101,21 @@ func (d *Drainer) olderRowInstalledDest(row *metadata.SpoolRow, dest string) boo
 		}
 	}
 	return false
+}
+
+// rowInstalledDest reports whether dest is the regular file this row itself
+// staged for its install in this process (recordInstalledIdentity before the
+// rename). The identity is in memory only: after a restart the answer is
+// false and the drain publishes a conflict copy (the safe direction).
+func (d *Drainer) rowInstalledDest(row *metadata.SpoolRow, dest string) bool {
+	var st unix.Stat_t
+	if unix.Lstat(dest, &st) != nil || st.Mode&unix.S_IFMT != unix.S_IFREG {
+		return false
+	}
+	d.installedMu.Lock()
+	defer d.installedMu.Unlock()
+	v, ok := d.installed[row.ID]
+	return ok && v.ino == uint64(st.Ino) && v.dev == uint64(st.Dev) //nolint:unconvert // int32 on Darwin
 }
 
 // openOwnReadOnlyInPlace rewrites a read-only file that this process's user
