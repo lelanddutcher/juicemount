@@ -16,9 +16,11 @@ import (
 	"time"
 
 	"github.com/lelanddutcher/juicemount/internal/appisolation"
+	"github.com/lelanddutcher/juicemount/internal/jmlog"
 	"github.com/lelanddutcher/juicemount/internal/privatefile"
 	"github.com/lelanddutcher/juicemount/internal/servicecontrol"
 	"github.com/lelanddutcher/juicemount/internal/version"
+	"golang.org/x/sys/unix"
 )
 
 // The intent is selected and fsynced before owner birth. An engine that loses
@@ -282,8 +284,27 @@ func selectVolumeOwner(cfg ServerConfig) (volumeOwnerIntent, error) {
 			}
 		}
 	}
-	i, created, err := createOwnerIntent(scope, cfg)
+	path, err := ownerSocketPath()
 	if err != nil {
+		return volumeOwnerIntent{}, err
+	}
+	i, created, err := createOwnerIntent(scope, cfg)
+	holdReason := ""
+	if old, readErr := readOwnerIntent(scope); readErr == nil && (err != nil || !created) && !ownerSocketAnswers(path, old) {
+		// The selected original is not answering. If it is provably gone (a
+		// kill, crash, power loss or reboot left its intent without retirement),
+		// publish a successor under its lifetime fence instead of holding forever.
+		next, replaceErr := replaceAbandonedOwner(scope, cfg, old, path)
+		if replaceErr == nil {
+			i, created, err = next, true, nil
+		} else {
+			holdReason = replaceErr.Error()
+		}
+	}
+	if err != nil {
+		if holdReason != "" {
+			return volumeOwnerIntent{}, fmt.Errorf("%w; %s", err, holdReason)
+		}
 		return volumeOwnerIntent{}, err
 	}
 	if servingOwnerSelection.selected && servingOwnerSelection.intent != i {
@@ -295,10 +316,6 @@ func selectVolumeOwner(cfg ServerConfig) (volumeOwnerIntent, error) {
 		}
 		servingOwnerSelection.selected = false
 		servingOwnerSelection.child, servingOwnerSelection.childResult = nil, nil
-	}
-	path, err := ownerSocketPath()
-	if err != nil {
-		return volumeOwnerIntent{}, err
 	}
 	if created {
 		executable, err := os.Executable()
@@ -349,6 +366,9 @@ func selectVolumeOwner(cfg ServerConfig) (volumeOwnerIntent, error) {
 			return volumeOwnerIntent{}, errors.New("selected owner socket returned another identity")
 		}
 		if !created || time.Now().After(deadline) {
+			if holdReason != "" {
+				return volumeOwnerIntent{}, fmt.Errorf("selected owner unavailable; original intent retained, no replacement launch: %s", holdReason)
+			}
 			return volumeOwnerIntent{}, errors.New("selected owner unavailable; original intent retained, no replacement launch")
 		}
 		select {
@@ -432,4 +452,132 @@ func selectedOwnerCommand(scope appisolation.Scope, executable string, readPipe 
 	}
 	cmd.Stdout, cmd.Stderr = logFile, logFile
 	return cmd, logFile, nil
+}
+
+// errOwnerStillRunning is the HOLD a replacement must keep: someone holds the
+// lifetime lock. Usually the original owner is alive (it holds the lock for its
+// whole life, with the FUSE child, Link and proxy ports). A short holder such
+// as --recover-retained-generation or a retirement check also takes it.
+var errOwnerStillRunning = errors.New("the volume owner's lifetime lock is held: the original owner process is still running, or a recovery step is using it now; JuiceMount will not start a second owner. Try Start again in a minute; if this persists, quit JuiceMount and restart the Mac")
+
+// ownerSocketAnswers reports whether the exact original answers its control
+// socket. Only a live owner past lifetime admission listens there.
+func ownerSocketAnswers(path string, i volumeOwnerIntent) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	resp, err := servicecontrol.Call(ctx, path, servicecontrol.Request{Version: servicecontrol.ProtocolVersion,
+		Build: version.Commit, Method: "inspect", Strings: []string{i.Instance, i.ConfigDigest}})
+	return err == nil && resp.Error == ""
+}
+
+// ownerChildLive reports whether this engine started the original and its
+// child has not exited. Called with servingOwnerSelection locked.
+func ownerChildLive(i volumeOwnerIntent) bool {
+	if servingOwnerSelection.intent != i || servingOwnerSelection.childResult == nil {
+		return false
+	}
+	select {
+	case <-servingOwnerSelection.childResult.done:
+		return false
+	default:
+		return true
+	}
+}
+
+// replaceAbandonedOwner publishes a successor intent for an original owner
+// that died without its retirement record: SIGKILL, a crash, power loss, or a
+// reboot after a Stop that could not finish (for example while offline). The
+// intent file survives all of those, and before this every later Start held
+// with "selected owner unavailable" until someone deleted it by hand.
+//
+// Proof that the original is gone, all re-checked under the lifetime fence:
+//   - this engine has no live child for it;
+//   - its lifetime lock is free. The owner takes that lock before it listens
+//     and holds it until it exits; the kernel drops it when the process dies;
+//   - the intent is unchanged and still has no retirement record;
+//   - its control socket does not answer.
+//
+// A child that was launched but had not yet taken the lock cannot adopt the
+// volume later: it re-reads the intent after locking and exits on a change.
+// Resources the dead owner may leave behind stay guarded by their own checks:
+// an orphan JuiceFS mount refuses the next FUSE creation ("FUSE path or
+// descendant already occupied"), and NFS has its own journal. Unsynced writes
+// live in the serving engine's spool, not in the owner, and are drained by
+// the next engine. Called with servingOwnerSelection locked.
+func replaceAbandonedOwner(scope appisolation.Scope, cfg ServerConfig, old volumeOwnerIntent, socket string) (volumeOwnerIntent, error) {
+	if ownerChildLive(old) {
+		return volumeOwnerIntent{}, errOwnerStillRunning
+	}
+	l, err := acquireOwnerLifetime(scope)
+	if errors.Is(err, unix.EWOULDBLOCK) {
+		return volumeOwnerIntent{}, errOwnerStillRunning
+	}
+	if err != nil {
+		return volumeOwnerIntent{}, fmt.Errorf("owner lifetime fence unavailable: %w", err)
+	}
+	defer l.close()
+	current, err := readOwnerIntent(scope)
+	if err != nil || current != old {
+		return volumeOwnerIntent{}, errors.New("selected owner intent changed during replacement")
+	}
+	if _, err := readOwnerRetirement(scope, old); !errors.Is(err, os.ErrNotExist) {
+		return volumeOwnerIntent{}, errors.New("selected owner retirement exists or is unreadable; normal succession applies")
+	}
+	if ownerSocketAnswers(socket, old) {
+		return volumeOwnerIntent{}, errOwnerStillRunning
+	}
+	next, err := intendedOwner(cfg, scope)
+	if err != nil {
+		return volumeOwnerIntent{}, err
+	}
+	if err := l.atomicRecord(filepath.Base(ownerIntentPath(scope.Root)), next); err != nil {
+		return volumeOwnerIntent{}, fmt.Errorf("successor publication uncertain; retain selected intent: %w", err)
+	}
+	if servingOwnerSelection.intent == old {
+		servingOwnerSelection.intent = volumeOwnerIntent{}
+		servingOwnerSelection.selected = false
+		servingOwnerSelection.child, servingOwnerSelection.childResult = nil, nil
+	}
+	jmlog.Warn("replaced a volume owner that ended without retirement (crash, kill, power loss or reboot)",
+		"abandoned_instance", old.Instance[:8], "successor_instance", next.Instance[:8])
+	return next, nil
+}
+
+// selectedOwnerAbandoned is the read-only form of the proof above, for the
+// service-start recovery worker. replaceAbandonedOwner re-checks everything
+// under the fence before it publishes anything.
+var selectedOwnerAbandoned = selectedOwnerAbandonedImpl
+
+func selectedOwnerAbandonedImpl(i volumeOwnerIntent) bool {
+	scope, _, err := selectedOwnerScope()
+	if err != nil {
+		return false
+	}
+	socket, err := ownerSocketPath()
+	if err != nil {
+		return false
+	}
+	return ownerAbandonedAt(scope, socket, i)
+}
+
+func ownerAbandonedAt(scope appisolation.Scope, socket string, i volumeOwnerIntent) bool {
+	servingOwnerSelection.Lock()
+	live := ownerChildLive(i)
+	servingOwnerSelection.Unlock()
+	if live {
+		return false
+	}
+	l, err := acquireOwnerLifetime(scope)
+	if err != nil {
+		return false
+	}
+	defer l.close()
+	current, err := readOwnerIntent(scope)
+	if err != nil || current != i {
+		return false
+	}
+	if _, err := readOwnerRetirement(scope, i); !errors.Is(err, os.ErrNotExist) {
+		return false
+	}
+	return !ownerSocketAnswers(socket, i)
 }

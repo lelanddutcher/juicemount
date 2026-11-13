@@ -49,7 +49,7 @@
       "properties": {
         "over_capacity": { "type": "boolean" },
         "pinned_bytes": { "type": "integer", "minimum": 0 },
-        "cache_capacity_bytes": { "type": "integer", "minimum": 0 },
+        "cache_capacity_bytes": { "type": "integer", "minimum": 0, "description": "Most the cache can sustainably hold: min(disk free + cache usage - floor, cache_budget_bytes). 0 when unknown: no FUSE mount has admitted a cache policy yet (for example a launch with the backend unreachable). While unknown, shortfall_bytes is 0 and over_capacity is false; disk_free_bytes, cache_usage_bytes and pinned_bytes stay real." },
         "shortfall_bytes": { "type": "integer", "minimum": 0 },
         "disk_free_bytes": { "type": "integer", "minimum": 0 },
         "cache_usage_bytes": { "type": "integer", "minimum": 0 },

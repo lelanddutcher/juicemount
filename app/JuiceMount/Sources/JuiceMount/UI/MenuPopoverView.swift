@@ -1933,23 +1933,27 @@ struct MenuPopoverView: View {
                     .foregroundStyle(.secondary)
                 Spacer()
             }
-            GeometryReader { geo in
-                ZStack(alignment: .leading) {
-                    Capsule().fill(Color.secondary.opacity(0.18))
-                    Capsule()
-                        .fill(Color.accentColor.opacity(0.85))
-                        .frame(width: max(0, min(1, fraction)) * geo.size.width)
-                    if pinnedFraction > 0 {
+            // capacity 0 = unknown (schema): no mounted cache yet, e.g. started
+            // offline. Show no bar rather than an empty one.
+            if capacityBytes > 0 {
+                GeometryReader { geo in
+                    ZStack(alignment: .leading) {
+                        Capsule().fill(Color.secondary.opacity(0.18))
                         Capsule()
-                            .fill(Color.orange.opacity(0.9))
-                            .frame(width: max(0, min(1, pinnedFraction)) * geo.size.width)
+                            .fill(Color.accentColor.opacity(0.85))
+                            .frame(width: max(0, min(1, fraction)) * geo.size.width)
+                        if pinnedFraction > 0 {
+                            Capsule()
+                                .fill(Color.orange.opacity(0.9))
+                                .frame(width: max(0, min(1, pinnedFraction)) * geo.size.width)
+                        }
                     }
                 }
+                .frame(height: 3)
+                .help(pinnedBytes > 0
+                      ? "\(legend)\n\nPinned content is kept resident for offline use; other cache is recently-read blocks JuiceFS may evict."
+                      : "Cache used vs. its capacity.")
             }
-            .frame(height: 3)
-            .help(pinnedBytes > 0
-                  ? "\(legend)\n\nPinned content is kept resident for offline use; other cache is recently-read blocks JuiceFS may evict."
-                  : "Cache used vs. its capacity.")
             // Quiet legend — only earns its row when pins actually occupy
             // cache (capacity known implies the byte split is meaningful).
             if pinnedBytes > 0 && capacityBytes > 0 {
