@@ -423,6 +423,37 @@ On Linux the old pin did not lose blocks (patch 0021's spans assemble whole
 blocks for a sequential reader); the failure it fixes was seen on macOS.
 Eviction of the old pin and the abroad cost do show here.
 
+## Opening a clip (`experiments/first-open-lab.sh`)
+
+`experiments/first-open-lab.sh` measures and traces the cold open of a clip
+through the NFS layer: `drainprobe firstbyte` (in the client) sends LOOKUP,
+then READs the first 128 KiB (first byte) and the rest of the first MiB, for
+each clip in turn. jm5 serves NFS over the client's `/jfs` with the direct
+SSD cache reader on (`JM_CACHE_DIR` and `--external-juicefs-is-bundled`), so
+the path proof and the mapping lookup that the app makes before a cold read
+happen here too. Each session starts cold: an empty block cache, a fresh
+juicefs mount and a fresh jm5. The first clip pays the cold folder lookups;
+the later clips show the cost per file.
+
+```sh
+JMLAB_BBR=1 ./lab.sh up
+experiments/first-open-lab.sh build            # jm5, drainprobe and juicefs into .state/bin
+experiments/first-open-lab.sh fixture 8 32     # 8 clips of 32 MiB
+experiments/first-open-lab.sh run abroad s1
+```
+
+`build` makes the client's juicefs from this checkout (the lab image's
+build stage), and `run` mounts `/jfs` with it, so `DRAIN_BIN=<folder>` gives
+a before/after pair from two checkouts on one lab. A run keeps, in
+`results/first-open-<time>/`, the probe output, the jm5 log (its "slow cached
+read" lines split each read into proof, mapping, FUSE open and FUSE read), a
+Redis MONITOR trace, the object store's request trace (`mc admin trace`) and
+the JuiceFS access log. All containers share the host clock, so the traces
+line up. `FO_TRACE=0` skips them.
+
+The lab cannot show what macOS adds: macFUSE (one read at a time per file,
+its own lookups before an open) and the macOS NFS client.
+
 ## Addresses
 
 The lab uses `10.231.10.0/24` (nas) and `10.231.20.0/24` (remote). If those

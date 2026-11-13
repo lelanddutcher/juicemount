@@ -1,0 +1,347 @@
+--- a/pkg/meta/base.go
++++ b/pkg/meta/base.go
+@@ -1071,8 +1071,13 @@ func (m *baseMeta) GetAttr(ctx Context, inode Ino, attr *Attr) syscall.Errno {
+ 	if m.conf.OpenCache > 0 && m.of.Check(inode, attr) {
+ 		return 0
+ 	}
++	if m.of.RecentOpenAttr(inode, attr, openAttrReuse) {
++		return 0
++	}
+ 	defer m.timeit("GetAttr", time.Now())
+ 	var err syscall.Errno
++	var gen uint64
++	fresh := false
+ 	if inode == RootInode || inode == TrashInode {
+ 		// doGetAttr could overwrite the `attr` after timeout
+ 		var a Attr
+@@ -1095,10 +1100,19 @@ func (m *baseMeta) GetAttr(ctx Context, inode Ino, attr *Attr) syscall.Errno {
+ 			attr.Full = true
+ 		}
+ 	} else {
++		gen = m.of.chunkGen()
+ 		err = m.en.doGetAttr(ctx, inode, attr)
++		fresh = true
++		if jmAttrReadHook != nil {
++			jmAttrReadHook(inode)
++		}
+ 	}
+ 	if err == 0 {
+-		m.of.Update(inode, attr)
++		if fresh {
++			m.of.UpdateFresh(inode, attr, gen)
++		} else {
++			m.of.Update(inode, attr)
++		}
+ 		if attr.Typ == TypeDirectory && inode != RootInode && !isTrash(attr.Parent) {
+ 			m.parentMu.Lock()
+ 			m.dirParents[inode] = attr.Parent
+@@ -1571,8 +1585,25 @@ func (m *baseMeta) Open(ctx Context, inode Ino, flags uint32, attr *Attr) (st sy
+ 		return 0
+ 	}
+ 	// attr may be valid, see fs.Open()
++	var first []*slice
++	var gen uint64
++	prefetched := false
+ 	if attr != nil && !attr.Full {
+-		if st = m.GetAttr(ctx, inode, attr); st != 0 {
++		if e, ok := m.en.(firstChunkEngine); ok && m.checkRoot(inode) == inode && inode != RootInode && inode != TrashInode {
++			// One round trip for the attr and the first chunk's slices (patch
++			// 0028): the first read then needs no LRANGE of its own.
++			gen = m.of.chunkGen()
++			start := time.Now()
++			first, st = e.doGetAttrFirstChunk(ctx, inode, attr)
++			m.timeit("GetAttr", start)
++			if jmAttrReadHook != nil {
++				jmAttrReadHook(inode)
++			}
++			if st != 0 {
++				return
++			}
++			prefetched = true
++		} else if st = m.GetAttr(ctx, inode, attr); st != 0 {
+ 			return
+ 		}
+ 	}
+@@ -1606,10 +1637,33 @@ func (m *baseMeta) Open(ctx Context, inode Ino, flags uint32, attr *Attr) (st sy
+ 			return syscall.EPERM
+ 		}
+ 	}
+-	m.of.Open(inode, attr)
++	if !prefetched {
++		m.of.Open(inode, attr)
++		return 0
++	}
++	var ss []Slice
++	if attr.Typ == TypeFile && len(first) > 0 {
++		ss = buildSlice(first)
++	}
++	m.of.OpenPrefetched(inode, attr, ss, len(first), gen)
+ 	return 0
+ }
+ 
++// jmAttrReadHook, when set by a test, runs after an attr read returns and
++// before it is stored (patch 0028).
++var jmAttrReadHook func(Ino)
++
++// openAttrReuse bounds how old an attr read by this client for a file it
++// holds open may be when GetAttr serves it without a round trip (patch 0028).
++// The kernel caches attributes for --attr-cache seconds (the app uses 10).
++const openAttrReuse = time.Second
++
++// firstChunkEngine reads an inode's attr and the slices of its first chunk in
++// one round trip (patch 0028). Engines without it keep the plain GetAttr.
++type firstChunkEngine interface {
++	doGetAttrFirstChunk(ctx Context, inode Ino, attr *Attr) ([]*slice, syscall.Errno)
++}
++
+ func (m *baseMeta) InvalidateChunkCache(ctx Context, inode Ino, indx uint32) syscall.Errno {
+ 	m.of.InvalidateChunk(inode, indx)
+ 	return 0
+@@ -1627,8 +1681,12 @@ func (m *baseMeta) Read(ctx Context, inode Ino, indx uint32, slices *[]Slice) (s
+ 		f.RLock()
+ 		defer f.RUnlock()
+ 	}
+-	if ss, ok := m.of.ReadChunk(inode, indx); ok {
++	if ss, ok, raw := m.of.ReadPrefetched(inode, indx, openAttrReuse); ok {
+ 		*slices = ss
++		// A list seeded by Open: compact as if this Read had fetched it.
++		if raw > 0 && !m.conf.ReadOnly && (raw >= 5 || len(ss) >= 5) {
++			go m.compactChunk(inode, indx, false, false)
++		}
+ 		return 0
+ 	}
+ 
+--- a/pkg/meta/openfile.go
++++ b/pkg/meta/openfile.go
+@@ -23,10 +23,21 @@ type openFile struct {
+ 	lastCheck int64
+ 	first     []Slice
+ 	chunks    map[uint32][]Slice
++	// attrAt is when attr was last read from the metadata engine with no
++	// invalidation on this client while the read was in flight; zero once
++	// invalidated (patch 0028).
++	attrAt time.Time
++	// firstAt is when Open seeded first from its own round trip; zero once
++	// a Read used it or anything replaced it (patch 0028).
++	firstAt time.Time
++	// firstRaw is the length of the raw list behind a seeded first, for the
++	// compaction decision Read makes when it uses it.
++	firstRaw int
+ }
+ 
+ func (o *openFile) invalidateChunk() {
+ 	o.first = nil
++	o.firstAt = time.Time{}
+ 	for c := range o.chunks {
+ 		delete(o.chunks, c)
+ 	}
+@@ -38,6 +49,9 @@ func (o *openFile) release() {
+ 	o.lastCheck = 0
+ 	o.first = nil
+ 	o.chunks = nil
++	o.attrAt = time.Time{}
++	o.firstAt = time.Time{}
++	o.firstRaw = 0
+ 	ofPool.Put(o)
+ }
+ 
+@@ -46,6 +60,10 @@ type openfiles struct {
+ 	expire time.Duration
+ 	limit  uint64
+ 	files  map[Ino]*openFile
++	// gen counts every chunk or attribute invalidation of any open file. A
++	// caller that read slices before taking the lock compares it to know that
++	// nothing changed in between (patch 0028).
++	gen uint64
+ }
+ 
+ func newOpenFiles(expire time.Duration, limit uint64) *openfiles {
+@@ -122,6 +140,10 @@ func (o *openfiles) OpenCheck(ino Ino, attr *Attr) bool {
+ func (o *openfiles) Open(ino Ino, attr *Attr) {
+ 	o.Lock()
+ 	defer o.Unlock()
++	o.openLocked(ino, attr)
++}
++
++func (o *openfiles) openLocked(ino Ino, attr *Attr) {
+ 	of, ok := o.files[ino]
+ 	if !ok {
+ 		of = ofPool.Get().(*openFile)
+@@ -130,6 +152,7 @@ func (o *openfiles) Open(ino Ino, attr *Attr) {
+ 		attr.KeepCache = of.attr.KeepCache
+ 	} else {
+ 		of.invalidateChunk()
++		o.gen++
+ 	}
+ 	if attr != nil {
+ 		of.attr = *attr
+@@ -171,10 +194,35 @@ func (o *openfiles) Update(ino Ino, attr *Attr) bool {
+ 	}
+ 	o.Lock()
+ 	defer o.Unlock()
++	return o.updateLocked(ino, attr)
++}
++
++// UpdateFresh is Update for an attr read from the engine after gen was taken
++// from chunkGen. The attr may be served by RecentOpenAttr only when no
++// invalidation happened while the read was in flight: a reply sent before a
++// local write can land after it (patch 0028).
++func (o *openfiles) UpdateFresh(ino Ino, attr *Attr, gen uint64) bool {
++	if attr == nil {
++		return false
++	}
++	o.Lock()
++	defer o.Unlock()
++	fresh := o.gen == gen
++	if !o.updateLocked(ino, attr) {
++		return false
++	}
++	if fresh {
++		o.files[ino].attrAt = time.Now()
++	}
++	return true
++}
++
++func (o *openfiles) updateLocked(ino Ino, attr *Attr) bool {
+ 	of, ok := o.files[ino]
+ 	if ok {
+ 		if attr.Mtime != of.attr.Mtime || attr.Mtimensec != of.attr.Mtimensec {
+ 			of.invalidateChunk()
++			o.gen++
+ 		} else {
+ 			attr.KeepCache = of.attr.KeepCache
+ 		}
+@@ -216,6 +264,7 @@ func (o *openfiles) CacheChunk(ino Ino, indx uint32, cs []Slice) {
+ 	}
+ 	if indx == 0 {
+ 		of.first = cs
++		of.firstAt = time.Time{}
+ 	} else {
+ 		if of.chunks == nil {
+ 			of.chunks = make(map[uint32][]Slice)
+@@ -233,11 +282,93 @@ func (o *openfiles) InvalidateChunk(ino Ino, indx uint32) {
+ 			of.invalidateChunk()
+ 		} else if indx == 0 {
+ 			of.first = nil
++			of.firstAt = time.Time{}
+ 		} else {
+ 			delete(of.chunks, indx)
+ 		}
+ 		of.lastCheck = 0
++		of.attrAt = time.Time{}
+ 	}
++	o.gen++
++}
++
++// chunkGen returns the invalidation counter (patch 0028).
++func (o *openfiles) chunkGen() uint64 {
++	o.Lock()
++	defer o.Unlock()
++	return o.gen
++}
++
++// OpenPrefetched is Open for a caller that read attr and the first chunk's
++// slices (raw: the length of the raw list) in one metadata round trip, after
++// taking gen from chunkGen. Only when no invalidation happened since gen was
++// taken and the file was not open with another mtime are the attr marked
++// fresh and the slices cached; a Read uses them within ReadPrefetched's
++// window only (patch 0028). It reports whether the slices were cached.
++func (o *openfiles) OpenPrefetched(ino Ino, attr *Attr, first []Slice, raw int, gen uint64) bool {
++	o.Lock()
++	defer o.Unlock()
++	unchanged := o.gen == gen
++	of, ok := o.files[ino]
++	if ok && (attr.Mtime != of.attr.Mtime || attr.Mtimensec != of.attr.Mtimensec) {
++		unchanged = false
++	}
++	o.openLocked(ino, attr)
++	if !unchanged {
++		return false
++	}
++	of = o.files[ino]
++	of.attrAt = time.Now()
++	if len(first) == 0 || of.first != nil {
++		return false
++	}
++	of.first = first
++	of.firstAt = of.attrAt
++	of.firstRaw = raw
++	return true
++}
++
++// ReadPrefetched is ReadChunk for Read. A list that Open seeded is used once,
++// within window of the open; later it is dropped, so a first read long after
++// the open fetches the list as upstream does. raw > 0 tells the caller it used
++// a seeded list of that raw length (patch 0028).
++func (o *openfiles) ReadPrefetched(ino Ino, indx uint32, window time.Duration) (cs []Slice, ok bool, raw int) {
++	o.Lock()
++	defer o.Unlock()
++	of, found := o.files[ino]
++	if !found {
++		return nil, false, 0
++	}
++	if indx != 0 {
++		cs, ok = of.chunks[indx]
++		return cs, ok, 0
++	}
++	if !of.firstAt.IsZero() {
++		seeded := time.Since(of.firstAt) < window
++		raw = of.firstRaw
++		of.firstAt, of.firstRaw = time.Time{}, 0
++		if !seeded {
++			of.first = nil
++			return nil, false, 0
++		}
++		return of.first, of.first != nil, raw
++	}
++	return of.first, of.first != nil, 0
++}
++
++// RecentOpenAttr serves a GetAttr of a file this client holds open from the
++// attr read fresh within window, the read that the open itself made. The
++// kernel asks again right after an open; this answers without another
++// round trip (patch 0028).
++func (o *openfiles) RecentOpenAttr(ino Ino, attr *Attr, window time.Duration) bool {
++	o.Lock()
++	defer o.Unlock()
++	of, ok := o.files[ino]
++	if !ok || of.refs <= 0 || of.attrAt.IsZero() || time.Since(of.attrAt) >= window {
++		return false
++	}
++	*attr = of.attr
++	return true
+ }
+ 
+ func (o *openfiles) find(ino Ino) *openFile {
+--- a/pkg/meta/redis.go
++++ b/pkg/meta/redis.go
+@@ -956,6 +956,29 @@ func (m *redisMeta) doGetAttr(ctx Context, inode Ino, attr *Attr) syscall.Errno
+ 	return errno(err)
+ }
+ 
++// doGetAttrFirstChunk pipelines GET of the inode and LRANGE of its first
++// chunk (patch 0028). The attr's error decides the result; a failed LRANGE
++// only returns no slices, and the first read fetches them itself.
++func (m *redisMeta) doGetAttrFirstChunk(ctx Context, inode Ino, attr *Attr) ([]*slice, syscall.Errno) {
++	var get *redis.StringCmd
++	var lr *redis.StringSliceCmd
++	_, _ = m.rdb.Pipelined(ctx, func(p redis.Pipeliner) error {
++		get = p.Get(ctx, m.inodeKey(inode))
++		lr = p.LRange(ctx, m.chunkKey(inode, 0), 0, -1)
++		return nil
++	})
++	a, err := get.Bytes()
++	if err != nil {
++		return nil, errno(err)
++	}
++	m.parseAttr(a, attr)
++	vals, err := lr.Result()
++	if err != nil {
++		return nil, 0
++	}
++	return readSlices(vals), 0
++}
++
+ type timeoutError interface {
+ 	Timeout() bool
+ }

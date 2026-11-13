@@ -11,7 +11,7 @@ import (
 )
 
 // jmSetUnackedTimeout sets TCP_USER_TIMEOUT (milliseconds) on a new TCP
-// socket (patch 0028, jm_dead_peer.go).
+// socket (patch 0029, jm_dead_peer.go).
 func jmSetUnackedTimeout(network, _ string, c syscall.RawConn) error {
 	if network != "tcp" && network != "tcp4" && network != "tcp6" {
 		return nil

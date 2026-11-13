@@ -8,5 +8,5 @@ package object
 
 import "syscall"
 
-// jmSetUnackedTimeout: keepalive only on other systems (patch 0028).
+// jmSetUnackedTimeout: keepalive only on other systems (patch 0029).
 func jmSetUnackedTimeout(string, string, syscall.RawConn) error { return nil }

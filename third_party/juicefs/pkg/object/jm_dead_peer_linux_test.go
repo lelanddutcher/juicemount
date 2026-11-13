@@ -12,7 +12,7 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// Patch 0028: every connection of the shared object-store client ends by
+// Patch 0029: every connection of the shared object-store client ends by
 // itself when the peer stops answering (keepalive) or stops acknowledging
 // (TCP_USER_TIMEOUT), instead of waiting for the whole get/put deadline.
 func TestObjectClientConnectionsDetectDeadPeers(t *testing.T) {

@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-// Dead-peer detection for object-store connections (patch 0028).
+// Dead-peer detection for object-store connections (patch 0029).
 //
 // A Mac that changes networks (Wi-Fi to another Wi-Fi, to a hotspot, out of
 // a VPN) keeps its open TCP connections, but their local address or path is

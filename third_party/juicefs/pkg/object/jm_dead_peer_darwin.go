@@ -12,7 +12,7 @@ import (
 
 // jmSetUnackedTimeout sets TCP_RXT_CONNDROPTIME (seconds: the time after
 // which retransmission stops and the connection drops) on a new TCP socket
-// (patch 0028, jm_dead_peer.go).
+// (patch 0029, jm_dead_peer.go).
 func jmSetUnackedTimeout(network, _ string, c syscall.RawConn) error {
 	if network != "tcp" && network != "tcp4" && network != "tcp6" {
 		return nil
