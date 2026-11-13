@@ -43,6 +43,17 @@
   timeouts and a 512 MiB buffer, and the follower has nothing to switch.
   The embedded JuiceMount Link is a userspace tunnel with no `utun`, so
   through Link the class still comes from measurement, in both processes.
+- JuiceFS demand-first (`--demand-first`) is now on for every link, lan
+  included. It was on for slow and metered links only. On lan it was never
+  slower and usually faster. Founder's Mac on the home LAN, straight to the
+  NAS over Wi-Fi with no tunnel, 3 cold rounds each, off against on:
+  sequential 512 MiB 84/291/287 against 313/324/338 Mbit/s; 1 MiB scrub p50
+  0.01/0.20/0.20 s against 0.12/0.08/0.07 s and p95 3.84/0.31/0.31 s against
+  0.31/0.23/0.26 s; scrub data fetched 470/178/182 MB against 142/109/105 MB
+  for 30 MiB read. The same Mac through a WireGuard tunnel and the Linux lab
+  at about 2 Gbit/s agreed. A wired 10 GbE Mac was not measured.
+  `JM_JFS_DEMAND_FIRST=0` turns it off on every link, at mount and live.
+  The live follower now changes only the object timeouts with the class.
 - The log no longer warns "juicefs link policy: exchange failed; retrying"
   at every start. The first check comes before JuiceFS serves its control
   file. Failures before JuiceFS first answers, in the first 30 s, are now

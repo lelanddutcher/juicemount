@@ -170,8 +170,8 @@ func desktopJuiceFSSessionArgs() []string {
 // only a small in-session retry budget.
 //
 // Fast and medium links retain upstream defaults. JM_JFS_OBJECT_TIMEOUTS=0 is
-// the field rollback switch for slow/metered overrides. Like --demand-first,
-// these follow the live class after the mount (nfs/jfs_link_policy.go);
+// the field rollback switch for slow/metered overrides. These follow the
+// live class after the mount (nfs/jfs_link_policy.go);
 // JM_JFS_LIVE_POLICY=0 keeps the mount values for the mount's life.
 func desktopJuiceFSObjectIOArgs(class netprofile.LinkClass) []string {
 	if os.Getenv("JM_JFS_OBJECT_TIMEOUTS") == "0" {
@@ -190,10 +190,11 @@ func desktopJuiceFSObjectIOArgs(class netprofile.LinkClass) []string {
 // desktopJuiceFSLinkArgs is the part of the mount flags that the NFS
 // server's link follower later changes in the running juicefs
 // (nfs/jfs_link_policy.go): the object deadlines by ReadPolicyClass, and
-// --demand-first by Class. TestJuiceFSLivePolicyMatchesMountArgs checks the
-// follower against this function on real profiles.
+// --demand-first (on for every class unless rolled back).
+// TestJuiceFSLivePolicyMatchesMountArgs checks the follower against this
+// function on real profiles.
 func desktopJuiceFSLinkArgs(p *netprofile.Profile) []string {
-	return append(desktopJuiceFSObjectIOArgs(p.ReadPolicyClass()), desktopJuiceFSDemandFirstArgs(p.Class())...)
+	return append(desktopJuiceFSObjectIOArgs(p.ReadPolicyClass()), desktopJuiceFSDemandFirstArgs()...)
 }
 
 // desktopJuiceFSSmallUploadArgs gives small saves upload slots of their own
@@ -225,32 +226,37 @@ func desktopJuiceFSSmallUploadArgs(class netprofile.LinkClass) []string {
 }
 
 // desktopJuiceFSDemandFirstArgs asks the bundled JuiceFS (patch 0020) to
-// serve a read that an application waits for before its prefetcher, on a link
-// that is slow or metered when the volume mounts. Lab run 2026-11-11 (200 ms,
-// 1% loss): the first byte of a clip cost 53 s because the second read in a
-// block waited for the prefetcher's whole 4 MiB download of that block. With
-// the flag, that read sends its own ranged GET, and the prefetcher waits while
-// demand reads are in flight.
+// serve a read that an application waits for before its prefetcher. Lab run
+// 2026-11-11 (200 ms, 1% loss): the first byte of a clip cost 53 s because
+// the second read in a block waited for the prefetcher's whole 4 MiB
+// download of that block. With the flag, that read sends its own ranged GET,
+// and the prefetcher waits while demand reads are in flight.
 //
-// The flag sets the mount's starting state only. While the NFS server
-// serves, nfs/jfs_link_policy.go follows the live class and switches
-// demand-first in the running juicefs (patch 0027, control message 1106),
-// together with the object deadlines of desktopJuiceFSObjectIOArgs: a mount
-// made at home that wakes abroad reads like a mount made abroad, with no
-// remount (laptop run 2026-11-12: before this it kept fetching whole blocks,
-// about 3x slower for unpinned files). The NFS layer's own demand-first rules
-// (nfs/demand_first.go) follow the live class too. Fast and medium links
-// keep the upstream behavior. TestJuiceFSLivePolicyMatchesMountArgs keeps the
-// live policy equal to these flags.
-// JM_JFS_DEMAND_FIRST=0 is the field rollback switch.
-func desktopJuiceFSDemandFirstArgs(class netprofile.LinkClass) []string {
+// It is on for every link class. It began on slow and metered links only.
+// Measured on lan it was better there too, and never slower:
+//   - Mac on the home LAN, straight to the NAS over Wi-Fi with no tunnel
+//     (2026-11-13, 3 cold rounds each): sequential 512 MiB 313/324/338
+//     against 84/291/287 Mbit/s, scrub p50 0.08 s against 0.20 s, scrub
+//     bytes 105–142 MB against 178–470 MB for 30 MiB read;
+//   - Mac over Wi-Fi plus a WireGuard tunnel: scrub 2.7x faster, sequential
+//     +6%, 46% fewer scrub bytes;
+//   - the Linux lab at about 2 Gbit/s: scrub 7 against 13 ms, sequential
+//     1950 against 1370 Mbit/s.
+//
+// A wired 10 GbE Mac was not measured.
+//
+// While the NFS server serves, nfs/jfs_link_policy.go keeps the running
+// juicefs equal to these flags (patch 0027, control message 1106). Since
+// demand-first no longer depends on the class, only the object deadlines of
+// desktopJuiceFSObjectIOArgs follow the live class.
+// TestJuiceFSLivePolicyMatchesMountArgs keeps the live policy equal to these
+// flags. JM_JFS_DEMAND_FIRST=0 is the field rollback switch: no
+// demand-first on any link, at mount or live.
+func desktopJuiceFSDemandFirstArgs() []string {
 	if os.Getenv("JM_JFS_DEMAND_FIRST") == "0" {
 		return nil
 	}
-	if class == netprofile.ClassSlow || class == netprofile.ClassMetered {
-		return []string{"--demand-first"}
-	}
-	return nil
+	return []string{"--demand-first"}
 }
 
 // desktopJuiceFSReadAheadArgs fixes JuiceFS's immutable per-mount session

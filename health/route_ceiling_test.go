@@ -42,8 +42,11 @@ func TestMountLinkPolicyAppliesRouteCeiling(t *testing.T) {
 		if got := p.Class() == netprofile.ClassSlow; got != wantSlow {
 			t.Fatalf("%s: class %s, want slow=%v", step, p.Class(), wantSlow)
 		}
-		if got := slices.Contains(args, "--demand-first"); got != wantSlow {
-			t.Fatalf("%s: args %v, want demand-first=%v", step, args, wantSlow)
+		if !slices.Contains(args, "--demand-first") { // on every class since 2026-11-13
+			t.Fatalf("%s: args %v lack --demand-first", step, args)
+		}
+		if got := len(args) > 1; got != wantSlow { // slow adds the object deadlines
+			t.Fatalf("%s: args %v, want slow deadlines=%v", step, args, wantSlow)
 		}
 		if pol != p.JuiceFS() {
 			t.Fatalf("%s: policy %+v, profile says %+v", step, pol, p.JuiceFS())
