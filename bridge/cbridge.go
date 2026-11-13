@@ -708,6 +708,17 @@ func cacheRedisTimeouts(opts *redis.Options) *redis.Options {
 	return opts
 }
 
+// linkMountRTT is FUSEConfig.LinkRTT for an in-process Link node: one
+// Redis round trip through it to the configured backend. Nil without Link.
+func linkMountRTT(node *jmnfs.LinkNode, logical string) func(time.Duration) (time.Duration, error) {
+	if node == nil || logical == "" {
+		return nil
+	}
+	return func(timeout time.Duration) (time.Duration, error) {
+		return linkRedisPingRTT(node, logical, timeout)
+	}
+}
+
 func linkRedisPingRTT(node *jmnfs.LinkNode, redisURL string, timeout time.Duration) (time.Duration, error) {
 	opts, err := redisurl.Parse(redisURL)
 	if err != nil {
@@ -1606,6 +1617,7 @@ func nfsServerStartSerialized(configJSON *C.char, recovery *servingDesiredRecord
 			OpenCacheTTL: cfg.OpenCacheTTL,
 			ObjectKey:    health.ObjectKey{AccessKey: cfg.ObjectAccessKey, SecretKey: cfg.ObjectSecretKey},
 			RouteTarget:  backendRouteTarget(routePolicyURL),
+			LinkRTT:      linkMountRTT(linkNode, linkProbeURL),
 		})
 		if err != nil {
 			generationErr = fmt.Errorf("reserve FUSE generation: %w", err)

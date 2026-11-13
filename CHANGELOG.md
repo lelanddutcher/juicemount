@@ -90,9 +90,20 @@
   keep the cap from the last successful lookup, or cap at slow when no lookup
   has succeeded. The serving process used to guess from the default route.
   The embedded JuiceMount Link is a userspace tunnel with no `utun`, so the
-  cap never applies through Link. Through Link the owner also mounts before
-  the app measures the link, so a Link mount made abroad still starts with
-  the medium buffer and prefetch. That is a known follow-up.
+  cap never applies through Link.
+- A volume mounted through JuiceMount Link now gets mount settings that
+  match the measured link. Through Link the metadata address is a loopback
+  proxy, so the mount's one TCP dial measures nothing and was skipped. The
+  mount then chose `--buffer-size` and `--prefetch` from whatever samples
+  the mounting process held. At first launch that was the startup Link
+  probe, but after an offline start, or after a network change reset the
+  link estimate (a Wi-Fi to hotspot move), it was nothing: a remount abroad
+  got the medium buffer (4096 MiB) for its life while the NFS server said
+  slow. Now every mount through Link first takes one Redis round trip
+  through the Link node (at most 2 s), the measurement the routine Link
+  probe makes, so both processes classify the link alike. A failed round
+  trip feeds nothing, as before; an offline start does not mount and is
+  unchanged.
 - JuiceFS demand-first (`--demand-first`) is now the default on every link
   class except fast. It was on for slow and metered links only. Fast stays
   off because a wired multi-gigabit Mac has not been measured: the Mac runs

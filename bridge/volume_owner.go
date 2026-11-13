@@ -674,6 +674,7 @@ func (o *volumeOwner) claim(raw string, pinnedBytes int64, policy netprofile.Lin
 		PinnedBytes: pinnedBytes, FUSEMetricsAddr: cfg.FUSEMetricsAddr, OpenCacheTTL: cfg.OpenCacheTTL,
 		ObjectKey:   health.ObjectKey{AccessKey: cfg.ObjectAccessKey, SecretKey: cfg.ObjectSecretKey},
 		RouteTarget: backendRouteTarget(routePolicyURL),
+		LinkRTT:     o.mountLinkRTT(node, logical),
 	})
 	if err != nil {
 		if owned && node != nil {
@@ -869,6 +870,26 @@ func (o *volumeOwner) probe(timeout time.Duration, startup bool) (volumeOwnerRec
 	r.BackendUp, r.ProbeRTTMillis, r.ProbeRTTNanos = true, rtt.Milliseconds(), int64(rtt)
 	r.UploadMbps, r.DownloadMbps = up, down
 	return r, nil
+}
+
+// mountLinkRTT is the owner's FUSEConfig.LinkRTT: before every mount and
+// remount, one Redis round trip through this owner's Link node to the
+// configured backend, the measurement the routine probe makes. The serving
+// process classifies from the same proofs (startup and routine probes), so
+// the mount-only flags (--buffer-size, --prefetch) follow the measured link
+// even when the owner's profile holds no sample yet. Nil without Link.
+func (o *volumeOwner) mountLinkRTT(node *jmnfs.LinkNode, logical string) func(time.Duration) (time.Duration, error) {
+	if node == nil || logical == "" {
+		return nil
+	}
+	work := o.probeWork
+	if work == nil {
+		work = ownerLinkProbe
+	}
+	return func(timeout time.Duration) (time.Duration, error) {
+		rtt, _, _, err := work(node, logical, timeout, false)
+		return rtt, err
+	}
 }
 
 func ownerLinkProbe(node *jmnfs.LinkNode, logical string, timeout time.Duration, startup bool) (time.Duration, float64, float64, error) {

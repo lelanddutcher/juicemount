@@ -54,17 +54,47 @@ import (
 // On any parse/dial failure we feed no RTT sample and fall through to the
 // profile's default (medium == the historical mount flags), so a transient
 // backend hiccup never degrades the mount config.
+//
+// Through Link, RedisURL is a loopback proxy: the sample comes from one
+// round trip through the Link node (FUSEConfig.LinkRTT) instead, the
+// measurement the serving process makes for the same link, so both
+// processes classify a Link mount alike.
 func (fm *FUSEManager) linkAwareJuiceFSPolicy() (netprofile.JuiceFSPolicy, []string) {
-	if u, err := url.Parse(fm.cfg.RedisURL); err == nil && u.Host != "" && !urlHostIsLoopback(u) {
+	ObserveMountLinkSample(netprofile.Default(), fm.cfg.RedisURL, fm.cfg.LinkRTT)
+	return MountLinkPolicy(netprofile.Default(), DefaultRouteCeiling(), fm.cfg.RouteTarget, fm.routeResolver)
+}
+
+// ObserveMountLinkSample feeds p the one link sample a mount takes: a TCP
+// dial to a non-loopback backend, or for a loopback (Link proxy) backend
+// one round trip through linkRTT. A failure, or a loopback backend without
+// linkRTT, feeds nothing.
+func ObserveMountLinkSample(p *netprofile.Profile, redisURL string, linkRTT func(time.Duration) (time.Duration, error)) {
+	u, err := url.Parse(redisURL)
+	if err != nil || u.Host == "" {
+		return
+	}
+	if !urlHostIsLoopback(u) {
 		start := time.Now()
-		conn, derr := net.DialTimeout("tcp", u.Host, 2*time.Second)
+		conn, derr := net.DialTimeout("tcp", u.Host, mountLinkSampleTimeout)
 		if derr == nil {
 			rtt := time.Since(start)
 			_ = conn.Close()
-			netprofile.Default().ObserveRTT(rtt)
+			p.ObserveRTT(rtt)
 		}
+		return
 	}
-	return MountLinkPolicy(netprofile.Default(), DefaultRouteCeiling(), fm.cfg.RouteTarget, fm.routeResolver)
+	if linkRTT == nil {
+		return
+	}
+	rtt, lerr := linkRTT(mountLinkSampleTimeout)
+	if lerr != nil {
+		jmlog.Info("mount link sample through Link unavailable; classifying from the samples held",
+			"error", lerr.Error())
+		return
+	}
+	if rtt > 0 {
+		p.ObserveRTT(rtt)
+	}
 }
 
 // MountLinkPolicy is the link part of a juicefs mount: it applies the tunnel
@@ -644,7 +674,21 @@ type FUSEConfig struct {
 	// whatever ceiling it has). Excluded from JSON: it does not select the
 	// child or the generation.
 	RouteTarget string `json:"-"`
+
+	// LinkRTT measures the round trip to the original backend through the
+	// JuiceMount Link node, when RedisURL is Link's loopback proxy. A
+	// loopback dial says nothing about the link, so without it a mount
+	// through Link classifies from whatever samples the process happens to
+	// hold: none after an offline boot or after a network-cost change
+	// reset the profile, which gave a Link mount abroad the medium buffer
+	// and prefetch flags for its life. Nil = no Link (or a debug loopback
+	// rewrite): no sample, as before. Excluded from JSON.
+	LinkRTT func(timeout time.Duration) (time.Duration, error) `json:"-"`
 }
+
+// mountLinkSampleTimeout bounds the one link measurement before a mount
+// (the direct dial or the Link round trip). A failure feeds no sample.
+const mountLinkSampleTimeout = 2 * time.Second
 
 // DefaultFUSEMetricsAddr is the loopback host:port the FUSE mount daemon binds
 // its Prometheus metrics to when FUSEConfig.FUSEMetricsAddr is empty. It is

@@ -32,14 +32,13 @@ import (
 // The embedded JuiceMount Link node is a userspace tunnel. Its traffic goes
 // through a loopback proxy, never through a utun, so the route to the
 // original backend address resolves to the physical interface, and neither
-// process applies the ceiling. The two processes still do not agree through
-// Link: the serving process measures the link (the startup Link probe) and
-// the follower moves the demand-first and timeout settings, but the owner
-// mounts before that probe runs and its own dial is skipped for the
-// loopback address. So through Link the mount-only flags (--buffer-size,
-// --prefetch) come from no measurement: a Link mount made abroad keeps the
-// medium values for its life. That is a known follow-up (PR #90 review
-// MEDIUM-3), not something this rule fixes.
+// process applies the ceiling. Both measure the link instead: the serving
+// process takes the owner's Link proofs (startup and routine probes), and
+// every owner mount takes one round trip through the Link node
+// (FUSEConfig.LinkRTT), because its TCP dial to the loopback proxy says
+// nothing. Before that, a mount whose profile held no sample (after an
+// offline boot, or after a network-cost change reset it) got the medium
+// --buffer-size/--prefetch abroad for its life (PR #90 review MEDIUM-3).
 //
 // A failed route lookup is handled the same way in both processes
 // (RouteCeiling): the ceiling of the last successful lookup stays, and
