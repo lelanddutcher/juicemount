@@ -17,9 +17,10 @@ import (
 // third_party/juicefs/pkg/vfs/jm_link_policy.go).
 //
 // The app mounts juicefs with flags chosen from the link class at that
-// moment (health/fuse.go): --demand-first on a slow or metered link, and
-// longer object timeouts with fewer retries on a slow or metered read
-// policy. Before patch 0027 those flags held until the next remount. A
+// moment (health/fuse.go): longer object timeouts with fewer retries on a
+// slow or metered read policy, and --demand-first on every class but fast
+// (slow and metered only until 2026-11-13). Before patch 0027 those flags
+// held until the next remount. A
 // volume mounted at home that woke abroad (laptop run 2026-11-12, 200 ms, 1%
 // loss, server BBR) kept fetching whole 4 MiB blocks for every miss: first
 // byte of an unpinned clip 6-7 s and 1 MiB scrubs 5-6 s (p95 12.2 s),
@@ -47,19 +48,20 @@ type jfsLinkPolicy struct {
 	IORetries   int
 }
 
-// The upstream defaults: what a fast or medium mount runs with.
+// The upstream defaults: what a fast mount runs with (a medium mount adds
+// demand-first).
 var jfsLinkUpstream = jfsLinkPolicy{GetTimeout: 60 * time.Second, PutTimeout: 60 * time.Second, IORetries: 10}
 
 // jfsLinkPolicyFor is the policy health/fuse.go gives a mount on these
-// classes: --demand-first follows Class (desktopJuiceFSDemandFirstArgs),
-// the object deadlines follow ReadPolicyClass (desktopJuiceFSObjectIOArgs).
-// health's TestJuiceFSLivePolicyMatchesMountArgs keeps the two equal. The
-// rollback switches of those flags hold here too.
+// classes: --demand-first on every class except fast
+// (desktopJuiceFSDemandFirstArgs: measured better on lan 2026-11-13; fast
+// is not measured yet), the object deadlines by ReadPolicyClass
+// (desktopJuiceFSObjectIOArgs). health's
+// TestJuiceFSLivePolicyMatchesMountArgs keeps the two equal. The rollback
+// switches of those flags hold here too.
 func jfsLinkPolicyFor(class, readClass netprofile.LinkClass) jfsLinkPolicy {
 	p := jfsLinkUpstream
-	if os.Getenv("JM_JFS_DEMAND_FIRST") != "0" {
-		p.DemandFirst = class == netprofile.ClassSlow || class == netprofile.ClassMetered
-	}
+	p.DemandFirst = os.Getenv("JM_JFS_DEMAND_FIRST") != "0" && class != netprofile.ClassFast
 	if os.Getenv("JM_JFS_OBJECT_TIMEOUTS") != "0" {
 		switch readClass {
 		case netprofile.ClassMetered:
@@ -166,6 +168,14 @@ type linkHold[T comparable] struct {
 }
 
 func (h *linkHold[T]) observe(now time.Time, want T, slower bool) T {
+	// The first decision has no hold: the first request becomes the stable
+	// value at once, even when it is more cautious than the mount flags. The
+	// mount flags came from an older sample (a single dial in the volume
+	// owner, before the serving process measured anything), so there is no
+	// settled state to protect yet. The holds apply from the second tick on.
+	// That is why a lan mount whose live class is already slow switches at
+	// the first successful tick, about 2 s after the NFS server starts, and
+	// not after 10 s.
 	if !h.have {
 		h.stable, h.have = want, true
 		return want
@@ -207,7 +217,18 @@ type linkFollower struct {
 	verifiedAt  time.Time
 	unsupported bool
 	lastErrLog  time.Time
+	startedAt   time.Time // the first tick
+	answered    bool      // juicefs has answered at least once
+	warn        func(msg string, attrs ...any)
 }
+
+// linkStartupGrace: the follower starts with the NFS server, and the first
+// ticks can come before juicefs serves its control file (laptop run
+// 2026-11-13: "no such process" at the first tick of every session, success
+// 2 s later). Until juicefs first answers, failures in this window are
+// logged at debug level only. A juicefs that never answers is still warned
+// about once the window ends.
+const linkStartupGrace = 30 * time.Second
 
 func newLinkFollower(ctl *jfsControl) *linkFollower {
 	return &linkFollower{
@@ -224,6 +245,9 @@ func newLinkFollower(ctl *jfsControl) *linkFollower {
 func (f *linkFollower) tick(now time.Time) {
 	if f.unsupported {
 		return
+	}
+	if f.startedAt.IsZero() {
+		f.startedAt = now
 	}
 	class, readClass := f.classes()
 	target := f.hyst.observe(now, jfsLinkPolicyFor(class, readClass))
@@ -248,13 +272,22 @@ func (f *linkFollower) tick(now time.Time) {
 		return
 	}
 	if err != nil {
+		f.haveApplied = false
+		if !f.answered && now.Sub(f.startedAt) < linkStartupGrace {
+			jmlog.Debug("juicefs link policy: juicefs not answering yet; retrying", "error", err.Error())
+			return
+		}
 		if now.Sub(f.lastErrLog) >= 10*time.Minute {
 			f.lastErrLog = now
-			jmlog.Warn("juicefs link policy: exchange failed; retrying", "error", err.Error())
+			warn := f.warn
+			if warn == nil {
+				warn = jmlog.Warn
+			}
+			warn("juicefs link policy: exchange failed; retrying", "error", err.Error())
 		}
-		f.haveApplied = false
 		return
 	}
+	f.answered = true
 	f.applied, f.haveApplied, f.verifiedAt = cur, true, now
 }
 

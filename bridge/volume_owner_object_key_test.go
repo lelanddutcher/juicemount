@@ -80,6 +80,11 @@ func TestOwnerClaimForwardsObjectKeyWithoutPersistingIt(t *testing.T) {
 			if captured.JuiceFSBin != testBundledJuiceFS || captured.RedisURL != cfg.RedisURL || captured.MountPoint != cfg.FUSEPath {
 				t.Fatal("claim changed the admitted executable, backend or mount path")
 			}
+			// The mount applies the tunnel ceiling of the route to the
+			// configured backend, the target the serving process uses.
+			if want := backendRouteTarget(cfg.RedisURL); want == "" || captured.RouteTarget != want {
+				t.Fatalf("claim route target = %q, want the configured backend %q", captured.RouteTarget, want)
+			}
 			if response := o.dispatch(request); response.Error != "" || calls != 1 {
 				t.Fatal("exact claim replay reconstructed its manager or failed")
 			}

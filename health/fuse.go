@@ -21,6 +21,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -41,17 +42,19 @@ import (
 )
 
 // linkAwareJuiceFSPolicy picks the mount-time juicefs prefetch flags
-// (--buffer-size / --prefetch) for the current link. JuiceFS's own sequential
-// readahead is the dominant prefetcher (validated 2026-06-15: a cold 4 KB read
-// pulls the whole file even with our server readahead capped) and these flags
-// are mount-time only, so we classify the link HERE, at mount, from a single
-// cheap TCP dial to the backend — the same passive philosophy as the
-// reachability probe (no synthetic load on a link we may already suspect).
+// (--buffer-size / --prefetch) and the link args that the live follower
+// later changes (desktopJuiceFSLinkArgs) for the current link. JuiceFS's own
+// sequential readahead is the dominant prefetcher (validated 2026-06-15: a
+// cold 4 KB read pulls the whole file even with our server readahead capped)
+// and the prefetch flags are mount-time only, so we classify the link HERE,
+// at mount, from a single cheap TCP dial to the backend — the same passive
+// philosophy as the reachability probe (no synthetic load on a link we may
+// already suspect) — plus the tunnel ceiling of the route to the backend.
 //
 // On any parse/dial failure we feed no RTT sample and fall through to the
 // profile's default (medium == the historical mount flags), so a transient
 // backend hiccup never degrades the mount config.
-func (fm *FUSEManager) linkAwareJuiceFSPolicy() netprofile.JuiceFSPolicy {
+func (fm *FUSEManager) linkAwareJuiceFSPolicy() (netprofile.JuiceFSPolicy, []string) {
 	if u, err := url.Parse(fm.cfg.RedisURL); err == nil && u.Host != "" && !urlHostIsLoopback(u) {
 		start := time.Now()
 		conn, derr := net.DialTimeout("tcp", u.Host, 2*time.Second)
@@ -61,8 +64,33 @@ func (fm *FUSEManager) linkAwareJuiceFSPolicy() netprofile.JuiceFSPolicy {
 			netprofile.Default().ObserveRTT(rtt)
 		}
 	}
-	pol := netprofile.Default().JuiceFS()
-	snap := netprofile.Default().Snapshot()
+	return MountLinkPolicy(netprofile.Default(), DefaultRouteCeiling(), fm.cfg.RouteTarget, fm.routeResolver)
+}
+
+// MountLinkPolicy is the link part of a juicefs mount: it applies the tunnel
+// ceiling of the route to routeTarget (resolved by resolver) to p, then
+// returns the prefetch policy and the link args (desktopJuiceFSLinkArgs)
+// read from p. Both come from one classification, the one the serving
+// process makes for the same route (ApplyBackendRouteCeiling), so the mount
+// args equal what the live follower would send. An empty routeTarget leaves
+// the ceiling p already has; a failed lookup takes rc's shared fallback
+// (RouteCeiling.Apply).
+func MountLinkPolicy(p *netprofile.Profile, rc *RouteCeiling, routeTarget string, resolver func(string) (string, error)) (netprofile.JuiceFSPolicy, []string) {
+	routeIface, tunneled := "", false
+	if routeTarget != "" {
+		iface, err := ResolveBackendRoute(routeTarget, resolver)
+		var looked bool
+		tunneled, looked = rc.Apply(p, iface, err)
+		if looked {
+			routeIface = iface
+		} else {
+			jmlog.Warn("could not resolve backend route for mount link ceiling; keeping the last ceiling (slow if none)",
+				"error", err.Error(), "route_ceiling", tunneled)
+		}
+	}
+	pol := p.JuiceFS()
+	linkArgs := desktopJuiceFSLinkArgs(p)
+	snap := p.Snapshot()
 
 	// Log the DECISION, not just the probe. These flags are mount-time only and
 	// never re-track the class afterwards, so this line is the sole record of
@@ -80,6 +108,8 @@ func (fm *FUSEManager) linkAwareJuiceFSPolicy() netprofile.JuiceFSPolicy {
 	jmlog.Info("link-aware mount policy chosen",
 		"class", snap.Class.String(),
 		"read_class", snap.ReadClass.String(),
+		"route_interface", routeIface,
+		"route_ceiling", tunneled,
 		"low_bandwidth", snap.LowBandwidth,
 		"class_measured", snap.HaveRTT && snap.HaveBW,
 		"have_rtt", snap.HaveRTT, "have_bandwidth", snap.HaveBW,
@@ -88,8 +118,9 @@ func (fm *FUSEManager) linkAwareJuiceFSPolicy() netprofile.JuiceFSPolicy {
 		"bootstrapped_from_rtt", snap.BootstrappedRTT,
 		"buffer_size_mb", pol.BufferSizeMB,
 		"prefetch", pol.Prefetch,
-		"nfs_readahead", netprofile.Default().NFSReadahead())
-	return pol
+		"demand_first", slices.Contains(linkArgs, "--demand-first"),
+		"nfs_readahead", p.NFSReadahead())
+	return pol, linkArgs
 }
 
 func urlHostIsLoopback(u *url.URL) bool {
@@ -142,8 +173,8 @@ func desktopJuiceFSSessionArgs() []string {
 // only a small in-session retry budget.
 //
 // Fast and medium links retain upstream defaults. JM_JFS_OBJECT_TIMEOUTS=0 is
-// the field rollback switch for slow/metered overrides. Like --demand-first,
-// these follow the live class after the mount (nfs/jfs_link_policy.go);
+// the field rollback switch for slow/metered overrides. These follow the
+// live class after the mount (nfs/jfs_link_policy.go);
 // JM_JFS_LIVE_POLICY=0 keeps the mount values for the mount's life.
 func desktopJuiceFSObjectIOArgs(class netprofile.LinkClass) []string {
 	if os.Getenv("JM_JFS_OBJECT_TIMEOUTS") == "0" {
@@ -162,8 +193,9 @@ func desktopJuiceFSObjectIOArgs(class netprofile.LinkClass) []string {
 // desktopJuiceFSLinkArgs is the part of the mount flags that the NFS
 // server's link follower later changes in the running juicefs
 // (nfs/jfs_link_policy.go): the object deadlines by ReadPolicyClass, and
-// --demand-first by Class. TestJuiceFSLivePolicyMatchesMountArgs checks the
-// follower against this function on real profiles.
+// --demand-first by Class (on for every class except fast).
+// TestJuiceFSLivePolicyMatchesMountArgs checks the follower against this
+// function on real profiles.
 func desktopJuiceFSLinkArgs(p *netprofile.Profile) []string {
 	return append(desktopJuiceFSObjectIOArgs(p.ReadPolicyClass()), desktopJuiceFSDemandFirstArgs(p.Class())...)
 }
@@ -197,32 +229,40 @@ func desktopJuiceFSSmallUploadArgs(class netprofile.LinkClass) []string {
 }
 
 // desktopJuiceFSDemandFirstArgs asks the bundled JuiceFS (patch 0020) to
-// serve a read that an application waits for before its prefetcher, on a link
-// that is slow or metered when the volume mounts. Lab run 2026-11-11 (200 ms,
-// 1% loss): the first byte of a clip cost 53 s because the second read in a
-// block waited for the prefetcher's whole 4 MiB download of that block. With
-// the flag, that read sends its own ranged GET, and the prefetcher waits while
-// demand reads are in flight.
+// serve a read that an application waits for before its prefetcher. Lab run
+// 2026-11-11 (200 ms, 1% loss): the first byte of a clip cost 53 s because
+// the second read in a block waited for the prefetcher's whole 4 MiB
+// download of that block. With the flag, that read sends its own ranged GET,
+// and the prefetcher waits while demand reads are in flight.
 //
-// The flag sets the mount's starting state only. While the NFS server
-// serves, nfs/jfs_link_policy.go follows the live class and switches
-// demand-first in the running juicefs (patch 0027, control message 1106),
-// together with the object deadlines of desktopJuiceFSObjectIOArgs: a mount
-// made at home that wakes abroad reads like a mount made abroad, with no
-// remount (laptop run 2026-11-12: before this it kept fetching whole blocks,
-// about 3x slower for unpinned files). The NFS layer's own demand-first rules
-// (nfs/demand_first.go) follow the live class too. Fast and medium links
-// keep the upstream behavior. TestJuiceFSLivePolicyMatchesMountArgs keeps the
-// live policy equal to these flags.
-// JM_JFS_DEMAND_FIRST=0 is the field rollback switch.
+// It is on for every link class except fast. It began on slow and metered
+// links only. Measured on lan it was better there too, and never slower:
+//   - Mac on the home LAN, straight to the NAS over Wi-Fi with no tunnel
+//     (2026-11-13, 3 cold rounds each): sequential 512 MiB 313/324/338
+//     against 84/291/287 Mbit/s, scrub p50 0.08 s against 0.20 s, scrub
+//     bytes 105–142 MB against 178–470 MB for 30 MiB read;
+//   - Mac over Wi-Fi plus a WireGuard tunnel: scrub 2.7x faster, sequential
+//     +6%, 46% fewer scrub bytes;
+//   - the Linux lab at about 2 Gbit/s: scrub 7 against 13 ms, sequential
+//     1950 against 1370 Mbit/s.
+//
+// Fast stays off until a wired multi-gigabit Mac is measured. The Mac runs
+// were capped by Wi-Fi at about 330 Mbit/s. With the flag, sequential reads
+// go through 256 KiB span GETs, so at 10 GbE throughput depends on span
+// concurrency and the object store's cost per request, which nobody has
+// measured (PR #90 review MEDIUM-1).
+//
+// While the NFS server serves, nfs/jfs_link_policy.go keeps the running
+// juicefs equal to these flags as the live class moves (patch 0027, control
+// message 1106), together with the object deadlines of
+// desktopJuiceFSObjectIOArgs. TestJuiceFSLivePolicyMatchesMountArgs keeps
+// the live policy equal to these flags. JM_JFS_DEMAND_FIRST=0 is the field
+// rollback switch: no demand-first on any link, at mount or live.
 func desktopJuiceFSDemandFirstArgs(class netprofile.LinkClass) []string {
-	if os.Getenv("JM_JFS_DEMAND_FIRST") == "0" {
+	if os.Getenv("JM_JFS_DEMAND_FIRST") == "0" || class == netprofile.ClassFast {
 		return nil
 	}
-	if class == netprofile.ClassSlow || class == netprofile.ClassMetered {
-		return []string{"--demand-first"}
-	}
-	return nil
+	return []string{"--demand-first"}
 }
 
 // desktopJuiceFSReadAheadArgs fixes JuiceFS's immutable per-mount session
@@ -594,6 +634,16 @@ type FUSEConfig struct {
 	// juicefs child as MINIO_ACCESS_KEY / MINIO_SECRET_KEY, never argv.
 	// Excluded from JSON so generationConfigDigest never hashes it.
 	ObjectKey ObjectKey `json:"-"`
+
+	// RouteTarget is the host:port of the ORIGINAL backend: the configured
+	// metadata address, before a Link proxy or JM_DEBUG_META_ADDR rewrites
+	// RedisURL to loopback. Before each mount the manager resolves the
+	// kernel route to it and applies the tunnel ceiling
+	// (ApplyBackendRouteCeiling), so the mount flags use the class the
+	// serving process uses. Empty = no route lookup (the profile keeps
+	// whatever ceiling it has). Excluded from JSON: it does not select the
+	// child or the generation.
+	RouteTarget string `json:"-"`
 }
 
 // DefaultFUSEMetricsAddr is the loopback host:port the FUSE mount daemon binds
@@ -606,6 +656,7 @@ const DefaultFUSEMetricsAddr = "127.0.0.1:9568"
 // FUSEManager manages the JuiceFS FUSE mount lifecycle.
 type FUSEManager struct {
 	cfg                 FUSEConfig
+	routeResolver       func(string) (string, error) // RouteTarget -> interface; tests replace it
 	mu                  sync.Mutex
 	cacheVolumePath     string // configured cache root, guarded by mu
 	cacheVolumeDev      uint64 // device of that location's existing ancestor
@@ -929,9 +980,10 @@ func NewFUSEManager(cfg FUSEConfig) *FUSEManager {
 		cfg.JuiceFSBin = findJuiceFSBin()
 	}
 	return &FUSEManager{
-		cfg:    cfg,
-		stopCh: make(chan struct{}),
-		done:   make(chan struct{}),
+		cfg:           cfg,
+		stopCh:        make(chan struct{}),
+		done:          make(chan struct{}),
+		routeResolver: ResolveRouteInterface,
 	}
 }
 
@@ -1179,7 +1231,7 @@ func (fm *FUSEManager) MountWithReceipt() (*MountReceipt, error) {
 	// the dominant prefetcher; pick --buffer-size/--prefetch from the measured
 	// link so a metered/cellular mount doesn't pull whole files for a 4 KB touch,
 	// while a 10GbE mount keeps blocks in flight. Medium == historical defaults.
-	jfp := fm.linkAwareJuiceFSPolicy()
+	jfp, linkArgs := fm.linkAwareJuiceFSPolicy()
 	// --buffer-size caps JuiceFS's in-memory DIRTY-data ceiling, which is
 	// exactly what a shutdown/remount FlushAll must push to MinIO before the
 	// mount worker exits (2026-07-10: a 1 GB slow-class buffer = a 4m17s flush
@@ -1204,7 +1256,7 @@ func (fm *FUSEManager) MountWithReceipt() (*MountReceipt, error) {
 	// timeout/retry loop.
 	// ReadPolicyClass, like jfp: a far, thin link (slow class by the slow-RTT
 	// floor) keeps the metered object deadlines a thin uplink needs.
-	args = append(args, desktopJuiceFSLinkArgs(netprofile.Default())...)
+	args = append(args, linkArgs...)
 	// A JuiceFS session expires at five heartbeat intervals. The upstream
 	// 12s default therefore lets another always-on client reap this Mac
 	// after only 60s. A cold or cellular S3 PUT can legitimately consume

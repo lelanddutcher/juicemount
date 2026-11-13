@@ -19,6 +19,18 @@ func TestJuiceFSLivePolicyMatchesMountArgs(t *testing.T) {
 	t.Setenv("JM_NET_CLASS", "")
 	profiles := map[string]func() *netprofile.Profile{
 		"no signal": netprofile.New,
+		"forced fast": func() *netprofile.Profile {
+			p := netprofile.New()
+			c := netprofile.ClassFast
+			p.ForceClass(&c)
+			return p
+		},
+		"forced medium": func() *netprofile.Profile {
+			p := netprofile.New()
+			c := netprofile.ClassMedium
+			p.ForceClass(&c)
+			return p
+		},
 		"lan": func() *netprofile.Profile {
 			p := netprofile.New()
 			p.ObserveRTT(500 * time.Microsecond)

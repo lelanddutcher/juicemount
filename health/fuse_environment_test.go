@@ -129,20 +129,24 @@ func TestDesktopJuiceFSObjectTimeoutsKeepCellularBlocksViableAndBounded(t *testi
 	}
 }
 
-func TestDesktopJuiceFSDemandFirstOnSlowAndMeteredOnly(t *testing.T) {
+// Demand-first is on for every class but fast (lan measurements
+// 2026-11-13; fast is not measured yet); the rollback turns it off for
+// every class.
+func TestDesktopJuiceFSDemandFirstOnEveryClassButFast(t *testing.T) {
 	t.Setenv("JM_JFS_DEMAND_FIRST", "")
-	tests := []struct {
-		class netprofile.LinkClass
-		want  []string
-	}{
-		{netprofile.ClassMetered, []string{"--demand-first"}},
-		{netprofile.ClassSlow, []string{"--demand-first"}},
-		{netprofile.ClassMedium, nil},
-		{netprofile.ClassFast, nil},
-	}
-	for _, tt := range tests {
-		if got := desktopJuiceFSDemandFirstArgs(tt.class); !slices.Equal(got, tt.want) {
-			t.Fatalf("demand-first args for %s = %v, want %v", tt.class, got, tt.want)
+	for _, c := range []netprofile.LinkClass{netprofile.ClassMetered, netprofile.ClassSlow, netprofile.ClassMedium, netprofile.ClassFast} {
+		want := []string{"--demand-first"}
+		if c == netprofile.ClassFast {
+			want = nil
+		}
+		if got := desktopJuiceFSDemandFirstArgs(c); !slices.Equal(got, want) {
+			t.Fatalf("class %s: demand-first args = %v, want %v", c, got, want)
+		}
+		p := netprofile.New()
+		f := c
+		p.ForceClass(&f)
+		if got := slices.Contains(desktopJuiceFSLinkArgs(p), "--demand-first"); got != (want != nil) {
+			t.Fatalf("class %s: link args %v", c, desktopJuiceFSLinkArgs(p))
 		}
 	}
 	t.Setenv("JM_JFS_DEMAND_FIRST", "0")

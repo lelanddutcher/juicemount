@@ -25,8 +25,15 @@ var (
 )
 
 func TestJFSLinkPolicyForClasses(t *testing.T) {
+	// Fast: the upstream defaults, demand-first off until a wired
+	// multi-gigabit Mac is measured (PR #90 review MEDIUM-1).
 	if lanPolicy != jfsLinkUpstream {
-		t.Fatalf("lan policy %+v, want the upstream defaults", lanPolicy)
+		t.Fatalf("fast policy %+v, want the upstream defaults", lanPolicy)
+	}
+	// Medium: the upstream deadlines with demand-first (measured on lan
+	// 2026-11-13).
+	if p, want := jfsLinkPolicyFor(netprofile.ClassMedium, netprofile.ClassMedium), (jfsLinkPolicy{DemandFirst: true, GetTimeout: time.Minute, PutTimeout: time.Minute, IORetries: 10}); p != want {
+		t.Fatalf("medium policy %+v, want %+v", p, want)
 	}
 	want := jfsLinkPolicy{DemandFirst: true, GetTimeout: 3 * time.Minute, PutTimeout: 5 * time.Minute, IORetries: 2}
 	if abroadPolicy != want {
@@ -167,7 +174,7 @@ func newTestFollower(j *fakeJFS, class *[2]netprofile.LinkClass) *linkFollower {
 
 // A lan mount moves abroad and back, with no remount.
 func TestLinkFollowerSwitchesBothWays(t *testing.T) {
-	j := &fakeJFS{cur: lanPolicy} // mounted on lan: no --demand-first
+	j := &fakeJFS{cur: lanPolicy} // mounted on a fast link: no --demand-first
 	class := [2]netprofile.LinkClass{netprofile.ClassFast, netprofile.ClassFast}
 	f := newTestFollower(j, &class)
 	t0 := time.Unix(1000, 0)
@@ -284,5 +291,50 @@ func TestLinkHysteresisSlowMeteredFlapStillSwitches(t *testing.T) {
 	}
 	if got != slow && got != metered {
 		t.Fatalf("policy %+v is neither request", got)
+	}
+}
+
+// B3 (laptop run 2026-11-13): the first tick comes before juicefs serves its
+// control file. Failures before juicefs first answers, inside the startup
+// grace, are not warnings. A juicefs that never answers is still warned
+// about after the grace, and a failure after it once answered (a remount)
+// warns at once.
+func TestLinkFollowerQuietBeforeJuiceFSAnswers(t *testing.T) {
+	class := [2]netprofile.LinkClass{netprofile.ClassSlow, netprofile.ClassSlow}
+	notReady := &errControlNotSent{syscall.ESRCH}
+	t0 := time.Unix(1000, 0)
+
+	j := &fakeJFS{cur: lanPolicy, err: notReady}
+	f := newTestFollower(j, &class)
+	warnings := 0
+	f.warn = func(string, ...any) { warnings++ }
+	f.tick(t0)
+	j.err = nil
+	f.tick(t0.Add(linkFollowTick))
+	if warnings != 0 {
+		t.Fatalf("start-up failure warned %d times", warnings)
+	}
+	if j.cur != jfsLinkPolicyFor(class[0], class[1]) {
+		t.Fatalf("policy after start-up = %+v", j.cur)
+	}
+	j.err = notReady // a remount later: warn
+	f.tick(t0.Add(linkVerifyPeriod + 2*linkFollowTick))
+	if warnings != 1 {
+		t.Fatalf("failure after juicefs answered: %d warnings, want 1", warnings)
+	}
+
+	j = &fakeJFS{err: notReady} // never answers
+	f = newTestFollower(j, &class)
+	warnings = 0
+	f.warn = func(string, ...any) { warnings++ }
+	for now := t0; now.Before(t0.Add(linkStartupGrace)); now = now.Add(linkFollowTick) {
+		f.tick(now)
+	}
+	if warnings != 0 {
+		t.Fatalf("%d warnings inside the start-up grace", warnings)
+	}
+	f.tick(t0.Add(linkStartupGrace))
+	if warnings != 1 {
+		t.Fatalf("juicefs never answered: %d warnings after the grace, want 1", warnings)
 	}
 }
