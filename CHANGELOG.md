@@ -4,6 +4,27 @@
 
 ### App
 
+- A playing or copying file now recovers within about half a minute after
+  the Mac changes networks (Wi-Fi to another Wi-Fi or to a hotspot). Before,
+  the read froze for up to two minutes after the new network was up. The
+  cause: JuiceFS kept its connections to the object store open on the old
+  address, and a request on one of them waited for its whole deadline
+  (`--get-timeout`, 2 minutes on a slow link). Now those connections send
+  keepalive probes after 10 s of silence and give up after 25 s of
+  unacknowledged data, so the request is retried on a new connection over
+  the new network (bundled JuiceFS patch 0028, `-jm13`). Remote lab
+  (`test/remote-lab/experiments/roam-lab.sh ipchange`, client address
+  changed under a 2 MiB/s read): object requests on dead connections
+  ended at 25.5 s in every run, against 30 s for a request waiting for its
+  reply and 2 minutes for a stalled block before. The read played again
+  37.5 s after the change in three runs, against 42–120 s. What remains is
+  the metadata client's own 30 s read timeout, unchanged here.
+- A file that was uploading when the link dropped no longer gets a
+  duplicate "(conflict ...)" copy beside itself. The upload's final rename
+  reached the NAS, but its reply was lost with the link, so the next try
+  found the name taken and treated the file as someone else's. The drainer
+  now remembers which file it staged and recognises its own file at the
+  name (remote lab, a 30 s drop under an 8 MiB upload).
 - A volume mounted on a fast link now reads like one mounted on a slow link
   once the link turns slow, with no app restart. Before, an editor who
   started the app at home and woke up abroad read unpinned clips about 3x

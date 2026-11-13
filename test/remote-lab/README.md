@@ -166,6 +166,60 @@ experiments/link-switch-lab.sh up 1
 ./lab.sh down
 ```
 
+## Network changes under a running session (`experiments/roam-lab.sh`)
+
+`experiments/roam-lab.sh` changes the network under a running session and
+times how long each part takes to work again. The session is jm5 (the NFS
+server with the write spool, its drainer and the project-lease client) over
+the client's JuiceFS mount, as `drain-lab.sh` runs it. `drainprobe roam`
+drives it over loopback NFS while the network changes:
+
+- a sequential read of a cold 1 GiB file (an error reopens the file and
+  resumes at the same offset; `NFS3ERR_JUKEBOX`, the server's "try later",
+  is retried as a Mac does);
+- one new file per second (every tenth is 8 MiB), retried until it succeeds,
+  each one recorded with its SHA-256;
+- a folder lookup and listing over NFS, and a stat of an absent name straight
+  on the JuiceFS mount (it asks Redis);
+- the app's reachability monitor (`health.Reachability`) on the metadata
+  address, with the app's failure threshold.
+
+The script also polls the proxy's lease records (`JM.LEASE STATUS`) from
+the server side, so a missed lease renewal or a new lease epoch shows.
+
+| Case | What changes |
+|---|---|
+| `ipchange` | The client gets a new address (Docker network disconnect and connect): every open TCP connection is left with an address that no longer exists. |
+| `drop5`, `drop30`, `drop180` | The link goes down (the interface is removed) for 5 s, 30 s or 3 minutes, then returns with the same address. |
+| `blackhole30` | The link stays up but carries nothing for 30 s (the wan drops every packet). |
+| `path` | The route moves to a second router (`alt`, `compose.roam.yml`) for 60 s, then back. The server sees the client from a new address, as when a Mac moves from the LAN to a relay. |
+
+After the event the probe runs 120 s more (240 s after `drop180`). The script
+then waits for the spool to drain and checks every acknowledged file on the
+JuiceFS mount: the same bytes, once each, nothing extra.
+
+```sh
+JMLAB_ROAM=1 JMLAB_BBR=1 ./lab.sh up
+./drain-lab.sh build
+experiments/roam-lab.sh fixture          # 16 x 1 GiB cold files, about 8 minutes
+experiments/roam-lab.sh all              # every case, about 30 minutes
+experiments/roam-lab.sh summary results/roam-<time>
+./lab.sh down
+```
+
+`lib/roamsum.py` prints one row per run: for each worker, the seconds from
+the network's return until it worked steadily again (no 10 s without a
+success afterwards), the longest stall and the error count; when the
+reachability monitor went down and up; the longest lease-renewal gap the
+proxy saw and the lease epochs; what was left in the spool; and the file
+check.
+
+**Its limits:** jm5 is the Linux CLI server, not the Mac app. The app's
+reachability monitor runs inside the probe, not in the server, so the lab
+shows when the app would go offline and back, but not the offline gates
+themselves (ENXIO, the offline banner). The macOS NFS client, the macOS TCP
+stack, the FUSE watchdog of the volume owner, Link and sleep/wake need a Mac.
+
 ## Server BBR
 
 `./measure.py --bbr` (or `JMLAB_BBR=1 ./lab.sh up`) sets the lab up with

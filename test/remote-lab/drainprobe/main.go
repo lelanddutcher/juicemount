@@ -37,7 +37,7 @@ import (
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: drainprobe write|wait [flags]")
+		fmt.Fprintln(os.Stderr, "usage: drainprobe write|wait|read|roam|verify [flags]")
 		os.Exit(2)
 	}
 	var err error
@@ -48,6 +48,10 @@ func main() {
 		err = wait(os.Args[2:])
 	case "read":
 		err = read(os.Args[2:])
+	case "roam":
+		err = roam(os.Args[2:])
+	case "verify":
+		err = verify(os.Args[2:])
 	default:
 		err = fmt.Errorf("unknown step %q", os.Args[1])
 	}

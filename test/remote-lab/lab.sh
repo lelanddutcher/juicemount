@@ -3,7 +3,8 @@
 #
 #   lab.sh up                 build images, start the lab, format the volume,
 #                             mount the client (on the lan profile)
-#   lab.sh shape PROFILE      apply a profile from profiles.tsv to the wan
+#   lab.sh shape PROFILE [alt]  apply a profile from profiles.tsv to the wan
+#                             (or to the second router of JMLAB_ROAM=1)
 #   lab.sh mount [--cold|--warm]  (re)mount the client; --cold empties its
 #                             block cache first, --warm (default) keeps it
 #   lab.sh realnas-mount [--cold|--warm] [--ro]
@@ -46,6 +47,9 @@ dc() {
   # JMLAB_MAC=1 at setup: the WireGuard gateway for a macOS VM (compose.mac.yml,
   # driven by mac-lab.sh).
   [ ! -f "$STATE/mac" ] || files+=(-f "$HERE/compose.mac.yml")
+  # JMLAB_ROAM=1 at setup: a second router for path changes (compose.roam.yml,
+  # driven by experiments/roam-lab.sh).
+  [ ! -f "$STATE/roam" ] || files+=(-f "$HERE/compose.roam.yml")
   # JMLAB_REALNAS=1 at setup: the alias of a real server (compose.realnas.yml).
   # Its address is kept in .state/realnas (git-ignored), never in the repo.
   local realnas_host="${JMLAB_REALNAS_HOST:-}"
@@ -192,6 +196,7 @@ case "$cmd" in
     gen_env
     if [ "${JMLAB_BBR:-0}" = 1 ]; then : > "$STATE/bbr"; log "server sends with BBR (compose.bbr.yml)"; fi
     if [ "${JMLAB_MAC:-0}" = 1 ]; then : > "$STATE/mac"; log "with the macOS VM gateway (compose.mac.yml)"; fi
+    if [ "${JMLAB_ROAM:-0}" = 1 ]; then : > "$STATE/roam"; log "with a second router for path changes (compose.roam.yml)"; fi
     if [ "${JMLAB_REALNAS:-0}" = 1 ]; then
       [ -n "${JMLAB_REALNAS_HOST:-}" ] || die "JMLAB_REALNAS=1 needs JMLAB_REALNAS_HOST (the real server's address)"
       (umask 077 && printf '%s\n' "$JMLAB_REALNAS_HOST" > "$STATE/realnas")
@@ -206,8 +211,9 @@ case "$cmd" in
     log "up: client mounted /jfs on the lan profile"
     ;;
   shape)
-    [ $# -eq 1 ] || die "usage: lab.sh shape PROFILE"
-    dc exec -T wan /lab/lib/shape.sh "$1"
+    # lab.sh shape PROFILE [ROUTER]: ROUTER is wan (default) or alt.
+    { [ $# -eq 1 ] || [ $# -eq 2 ]; } || die "usage: lab.sh shape PROFILE [wan|alt]"
+    dc exec -T "${2:-wan}" /lab/lib/shape.sh "$1"
     ;;
   mount)
     case "${1:-}" in ''|--cold|--warm) ;; *) die "usage: lab.sh mount [--cold|--warm]" ;; esac
@@ -261,5 +267,5 @@ case "$cmd" in
     rm -rf "$STATE"
     log "down: project $JMLAB_PROJECT removed"
     ;;
-  *) sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+  *) sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac
