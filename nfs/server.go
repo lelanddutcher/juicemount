@@ -101,6 +101,9 @@ func (s *Server) Start() error {
 		"addr", s.config.ListenAddr,
 		"tcp_nodelay", true,
 	)
+	// The juicefs read and object settings follow the live link class
+	// while this server serves (jfs_link_policy.go).
+	startLinkFollower(s.config.FUSEPath)
 
 	// [JM5] Serve the handler directly — JuiceMountHandler implements
 	// deterministic inode-based ToHandle/FromHandle plus VerifierFor/
@@ -138,6 +141,7 @@ func (s *Server) Stop() error {
 	s.listener = nil
 	s.running.Store(false)
 	s.mu.Unlock()
+	stopLinkFollower(s.config.FUSEPath)
 	if listener == nil {
 		return nil
 	}

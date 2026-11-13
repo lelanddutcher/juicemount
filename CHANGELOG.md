@@ -4,6 +4,23 @@
 
 ### App
 
+- A volume mounted on a fast link now reads like one mounted on a slow link
+  once the link turns slow, with no app restart. Before, an editor who
+  started the app at home and woke up abroad read unpinned clips about 3x
+  slower until a relaunch (laptop run 2026-11-12, 200 ms and 1% loss: first
+  byte 6–7 s and 1 MiB scrubs 5–6 s, against 3.7 s and 1.5 s after a launch
+  abroad). The cause: the app chose JuiceFS's slow-link read settings
+  (`--demand-first`, which reads 256 KiB parts instead of whole 4 MiB
+  blocks) and its object timeouts and retries once, at mount. Now the NFS
+  server follows the live link class and changes them in the running JuiceFS
+  (patch 0027, `-jm12`, control message 1106). Open files and editors notice
+  nothing. A move to the slow settings waits until the slow class has held
+  for 10 s, a move back for 60 s, so a flapping link does not switch back and
+  forth. `JM_JFS_LIVE_POLICY=0` keeps the mount-time settings, as before.
+  Remote lab (Linux, 200 ms, 1% loss, server BBR, mounted on lan): scrub
+  p50 2.6–2.7 s before the switch, 1.34 s after it, 1.24–1.26 s on a fresh
+  mount on that link.
+
 - "Pin before travel" is now reliable while the server is reachable. An
   editor pins a project at home; abroad, over Link, it plays and scrubs from
   local disk, also after the app restarts. Three problems are fixed (laptop

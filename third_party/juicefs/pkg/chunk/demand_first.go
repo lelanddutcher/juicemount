@@ -29,7 +29,9 @@ import (
 const demandDeferMax = 10 * time.Second
 
 type demandFirst struct {
-	enabled  bool
+	// on is --demand-first; the JMLinkPolicy control message (patch 0027,
+	// jm_link_policy.go) switches it while the volume is mounted.
+	on       atomic.Bool
 	deferMax time.Duration
 	budget   int // bytes of reads that may bypass one block download
 
@@ -52,14 +54,21 @@ type fullDownload struct {
 }
 
 func newDemandFirst(enabled bool, blockSize int) *demandFirst {
-	return &demandFirst{enabled: enabled, deferMax: demandDeferMax, budget: blockSize / 4,
+	d := &demandFirst{deferMax: demandDeferMax, budget: blockSize / 4,
 		perKey: make(map[string]int), changed: make(chan struct{}), fullAt: make(map[string]*fullDownload)}
+	d.on.Store(enabled)
+	return d
 }
+
+// enabled reports whether demand-first is on now. Each call decides for one
+// step: a GET or download that began while it was on still ends through the
+// func its begin returned, so the counts stay balanced across a switch.
+func (d *demandFirst) enabled() bool { return d != nil && d.on.Load() }
 
 // beginDemand marks one ranged demand GET of key in flight; call the result
 // when it ends.
 func (d *demandFirst) beginDemand(key string) func() {
-	if d == nil || !d.enabled {
+	if !d.enabled() {
 		return func() {}
 	}
 	d.mu.Lock()
@@ -93,7 +102,7 @@ func (d *demandFirst) waitIdle(key string) time.Duration {
 // waitIdleCtx is waitIdle that also returns when ctx is done (a canceled
 // pin fill must not wait out deferMax).
 func (d *demandFirst) waitIdleCtx(ctx context.Context, key string) time.Duration {
-	if d == nil || !d.enabled {
+	if !d.enabled() {
 		return 0
 	}
 	var start time.Time
@@ -128,7 +137,7 @@ func (d *demandFirst) waitIdleCtx(ctx context.Context, key string) time.Duration
 // beginFull records that a whole-block download of key started; call the
 // result with its error when it ends.
 func (d *demandFirst) beginFull(key string) func(error) {
-	if d == nil || !d.enabled {
+	if !d.enabled() {
 		return func(error) {}
 	}
 	dl := &fullDownload{start: time.Now()}
@@ -149,7 +158,7 @@ func (d *demandFirst) beginFull(key string) func(error) {
 
 // observeRanged records one ranged GET of n bytes that took used.
 func (d *demandFirst) observeRanged(used time.Duration, n int) {
-	if d != nil && d.enabled && n > 0 {
+	if d.enabled() && n > 0 {
 		kb := (n + 1023) / 1024
 		observeEWMA(&d.rangedNSPerKB, used/time.Duration(kb))
 	}
@@ -169,7 +178,7 @@ func (d *demandFirst) observeRanged(used time.Duration, n int) {
 //     for the download instead of fetching the block a second time; but
 //     never for a late download, whatever the budget.
 func (d *demandFirst) piggyback(key string, n int) bool {
-	if d == nil || !d.enabled {
+	if !d.enabled() {
 		return true
 	}
 	full, perKB := d.fullNS.Load(), d.rangedNSPerKB.Load()

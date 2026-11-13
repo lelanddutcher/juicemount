@@ -291,10 +291,11 @@ func (c *spanCache) wholeLocked(key string, bsize int) [][]byte {
 }
 
 // spansOn reports whether a miss of this store reads through demand spans:
-// --demand-first, an object store with ranged GETs, and no encryption
-// (an encrypted object is decrypted whole for any range).
+// --demand-first (on now: patch 0027 switches it at run time), an object
+// store with ranged GETs, and no encryption (an encrypted object is
+// decrypted whole for any range).
 func (store *cachedStore) spansOn() bool {
-	return store.spans != nil && store.seekable && !store.conf.Encrypted
+	return store.spans != nil && store.demand.enabled() && store.seekable && !store.conf.Encrypted
 }
 
 // newStoreSpans wires the span cache to the store's object GETs and its
@@ -321,7 +322,7 @@ func newStoreSpans(store *cachedStore) *spanCache {
 				_ = in.Close()
 			}
 			return err
-		}, store.conf.GetTimeout)
+		}, store.getTimeout())
 		used := time.Since(st)
 		if readTimelineOn {
 			readTimeline("rt jfs span part key=%s off=%d len=%d first_byte_ms=%d ms=%d err=%v", sp.key, sp.off, sp.n, firstByte.Milliseconds(), used.Milliseconds(), err)

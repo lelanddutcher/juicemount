@@ -149,6 +149,23 @@ formats the volume with a throwaway RSA key in `.state/encrypt.pem`, which
 To format the volume with another block size, set `JMLAB_BLOCK_SIZE` in KiB
 (for example `JMLAB_BLOCK_SIZE=1024`). The default is JuiceFS's 4096.
 
+## Link switch under a running mount
+
+`experiments/link-switch-lab.sh` changes the link under a running mount and
+measures first byte and a 20 × 1 MiB scrub on a cold clip: before the switch
+(the mount-time settings), after the settings the app's link follower sends
+(`lib/linkprobe.py`, the JMLinkPolicy message of bundled juicefs patch 0027),
+and on a fresh mount on the new link. `down` mounts on `lan` and moves to
+`abroad`; `up` does the reverse and also reads sequentially.
+
+```sh
+JMLAB_BBR=1 ./lab.sh up
+experiments/link-switch-lab.sh fixture
+experiments/link-switch-lab.sh down 1
+experiments/link-switch-lab.sh up 1
+./lab.sh down
+```
+
 ## Server BBR
 
 `./measure.py --bbr` (or `JMLAB_BBR=1 ./lab.sh up`) sets the lab up with
