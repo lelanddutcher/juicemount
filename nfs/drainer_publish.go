@@ -569,12 +569,13 @@ func (d *Drainer) openDrainTarget(row *metadata.SpoolRow, dest string, lease lea
 			conflict = "another Mac held the project after this atomic save was accepted"
 		case cur.ino == base.Ino && cur.mtimeNs == base.MtimeNs && cur.size == base.Len:
 			replace = cur
-		case d.olderRowInstalledDest(row, dest):
+		case d.olderRowInstalledDest(row, dest, tainted):
 			replace = cur // an unfinished older row of ours put it there
 		default:
 			conflict = "the file this save replaces changed since the save"
 		}
-	case lerr == nil && st.Mode&unix.S_IFMT == unix.S_IFREG && d.directAdoptTarget(row, dest, base, &st, tainted):
+	case lerr == nil && st.Mode&unix.S_IFMT == unix.S_IFREG && (d.directAdoptTarget(row, dest, base, &st, tainted) ||
+		stagedClaimAdoptable(row, base, &st, tainted)):
 		// The bytes are this save's; an in-place attempt that wrote them may
 		// not have set the time yet (as the stage path, after the write).
 		var terr error
@@ -593,14 +594,9 @@ func (d *Drainer) openDrainTarget(row *metadata.SpoolRow, dest string, lease lea
 		return &drainTarget{adoptIno: uint64(st.Ino), adoptDev: uint64(st.Dev)}, true //nolint:unconvert // int32 on Darwin
 	case lerr == nil && st.Mode&unix.S_IFMT == unix.S_IFREG:
 		inPlace, why := drainBaseAllowsInPlace(base, &st, tainted)
-		if !inPlace && base.Kind == metadata.SpoolBaseAbsent && d.olderRowInstalledDest(row, dest) {
+		if !inPlace && base.Kind == metadata.SpoolBaseAbsent && d.olderRowInstalledDest(row, dest, tainted) {
 			// An unfinished older row of ours created the name: rewrite it in
 			// place to keep save order (same rule as installNewName).
-			inPlace, why = true, ""
-		}
-		if !inPlace && base.Kind == metadata.SpoolBaseAbsent && d.rowInstalledDest(row, dest) {
-			// This row's own earlier install landed although it reported an
-			// error: rewrite its own file in place, never conflict-copy it.
 			inPlace, why = true, ""
 		}
 		if !inPlace {
@@ -668,6 +664,21 @@ func (d *Drainer) openDrainTarget(row *metadata.SpoolRow, dest string, lease lea
 	}
 	stage.replace = replace
 	return &drainTarget{f: stage.f, path: stage.path, stage: stage, conflict: conflict}, true
+}
+
+// stagedClaimAdoptable reports whether the name holds this row's own complete
+// install: the inode of the stage this row wrote, synced and claimed
+// (ClaimDrainBaseStaged) before its install rename, at the row's full size,
+// and no other Mac held the project since the row was accepted. That is the
+// case of an install rename that landed while its reply was lost (a link
+// drop), even across an app restart. The row then completes without writing:
+// truncating and uploading the file again would show other Macs a partial
+// file for the whole upload. A tainted row falls through to the claimed rule
+// (a conflict copy); a foreign file has another inode; a rename that never
+// landed leaves the name absent and the row stages again.
+func stagedClaimAdoptable(row *metadata.SpoolRow, base metadata.SpoolBase, st *unix.Stat_t, tainted bool) bool {
+	return base.Kind == metadata.SpoolBaseClaimed && base.Staged && !tainted &&
+		uint64(st.Ino) == base.Ino && st.Size == row.Size
 }
 
 // openExistingInPlace opens the destination for rewrite WITHOUT O_TRUNC,
@@ -904,7 +915,7 @@ func (d *Drainer) publishConflictCopy(row *metadata.SpoolRow, stage *drainStage,
 
 // installNewName publishes a staged new file under the install lease. It
 // returns ok=false when it has already disposed of the row.
-func (d *Drainer) installNewName(row *metadata.SpoolRow, stage *drainStage, dest string) bool {
+func (d *Drainer) installNewName(row *metadata.SpoolRow, stage *drainStage, dest string, tainted bool) bool {
 	op, ok := d.beginInstallLease(row)
 	if !ok {
 		stage.discard()
@@ -929,13 +940,19 @@ func (d *Drainer) installNewName(row *metadata.SpoolRow, stage *drainStage, dest
 		}
 		return false
 	}
-	// Remember the stage's inode for this row BEFORE the rename. The rename
-	// can land on the server and still report an error (the link dropped
-	// with the reply in flight, or juicefs retried a transaction that had
-	// already committed and got EEXIST): the name then holds this row's own
-	// bytes, and the retry must recognise them (rowInstalledDest) instead of
-	// publishing a conflict copy of itself (remote lab, 2026-11-13).
-	d.recordInstalledIdentity(row.ID, stage.dev, stage.ino)
+	if stage.replace == nil {
+		// A new name: claim the complete, synced stage BEFORE the rename,
+		// persisted. The rename can land on the server and still report an
+		// error (the link dropped with the reply in flight, or juicefs
+		// retried a transaction that had already committed and got EEXIST).
+		// The retry, in this process or after a restart, then finds its own
+		// inode at the name and adopts it (stagedClaimAdoptable) instead of
+		// publishing a conflict copy of itself (remote lab, 2026-11-13). On a
+		// claim error the install goes ahead unclaimed, as before.
+		if cerr := d.spool.Meta().ClaimDrainBaseStaged(row.ID, stage.ino); cerr != nil {
+			log.Printf("drainer: row %d claim stage before install: %v", row.ID, cerr)
+		}
+	}
 	if stage.replace != nil {
 		// F1: take the name from the exact file the save replaces, in one
 		// replacing rename, under the same lease as the claim recheck. A
@@ -976,7 +993,7 @@ func (d *Drainer) installNewName(row *metadata.SpoolRow, stage *drainStage, dest
 	} else {
 		err = drainRenameNoReplace(stage.path, dest)
 	}
-	if err != nil && d.rowInstalledDest(row, dest) {
+	if err != nil && drainStageAtName(stage, dest) {
 		// The rename landed; only its reply was lost.
 		jmlog.Info("drain: install rename reported an error but the name holds this save's stage; installed",
 			"path", row.NFSPath, "error", err.Error())
@@ -987,11 +1004,12 @@ func (d *Drainer) installNewName(row *metadata.SpoolRow, stage *drainStage, dest
 			op.mutated = true
 		}
 		d.recordInstalledIdentity(row.ID, stage.dev, stage.ino)
-		// H-8B: the name now holds THIS row's inode. A retry (a completion
-		// that failed after the install) must rewrite it, not conflict-copy
-		// it. Best-effort: on error the in-memory identity still covers this
-		// process, and a restart errs toward a conflict copy.
-		if cerr := d.spool.Meta().ClaimDrainBase(row.ID, stage.ino); cerr != nil {
+		// H-8B: the name now holds THIS row's complete inode. A retry (a
+		// completion that failed after the install) adopts it untainted, and
+		// never conflict-copies it. Best-effort: on error the in-memory
+		// identity still covers this process, and a restart errs toward a
+		// conflict copy.
+		if cerr := d.spool.Meta().ClaimDrainBaseStaged(row.ID, stage.ino); cerr != nil {
 			log.Printf("drainer: row %d claim installed inode: %v", row.ID, cerr)
 		}
 		finish()
@@ -1012,7 +1030,7 @@ func (d *Drainer) installNewName(row *metadata.SpoolRow, stage *drainStage, dest
 	// rename. A file another writer created BEFORE the drain opened is
 	// rewritten in place exactly as on base (pre-existing H-8 gap; closing it
 	// needs cross-writer leases or a recorded base identity per spool row).
-	if d.olderRowInstalledDest(row, dest) {
+	if d.olderRowInstalledDest(row, dest, tainted) {
 		finish()
 		stage.discard()
 		d.failTransient(row, fmt.Errorf("install drain stage: %q appeared from an older local row; retrying in place", row.NFSPath))
@@ -1071,8 +1089,13 @@ func (d *Drainer) recordInstalledIdentity(rowID int64, dev, ino uint64) {
 // row of this spool wrote in this process. Done and failed rows never count:
 // a finished row's file may since have been replaced by another writer. The
 // identity is in memory only, so after a restart the answer is false and the
-// drain publishes a conflict copy (the safe direction).
-func (d *Drainer) olderRowInstalledDest(row *metadata.SpoolRow, dest string) bool {
+// drain publishes a conflict copy (the safe direction). A tainted row (another
+// Mac held the project since it was accepted) never counts either: that Mac
+// may have rewritten the older row's inode in place.
+func (d *Drainer) olderRowInstalledDest(row *metadata.SpoolRow, dest string, tainted bool) bool {
+	if tainted {
+		return false
+	}
 	fi, err := os.Lstat(dest)
 	if err != nil {
 		return false
@@ -1103,19 +1126,18 @@ func (d *Drainer) olderRowInstalledDest(row *metadata.SpoolRow, dest string) boo
 	return false
 }
 
-// rowInstalledDest reports whether dest is the regular file this row itself
-// staged for its install in this process (recordInstalledIdentity before the
-// rename). The identity is in memory only: after a restart the answer is
-// false and the drain publishes a conflict copy (the safe direction).
-func (d *Drainer) rowInstalledDest(row *metadata.SpoolRow, dest string) bool {
+// drainStageAtName is stageAtName; tests replace it to stand for a process
+// that died before it could look (the restart case).
+var drainStageAtName = stageAtName
+
+// stageAtName reports whether dest is now the stage's own inode: its install
+// rename landed even though it reported an error.
+func stageAtName(stage *drainStage, dest string) bool {
 	var st unix.Stat_t
 	if unix.Lstat(dest, &st) != nil || st.Mode&unix.S_IFMT != unix.S_IFREG {
 		return false
 	}
-	d.installedMu.Lock()
-	defer d.installedMu.Unlock()
-	v, ok := d.installed[row.ID]
-	return ok && v.ino == uint64(st.Ino) && v.dev == uint64(st.Dev) //nolint:unconvert // int32 on Darwin
+	return uint64(st.Ino) == stage.ino && uint64(st.Dev) == stage.dev //nolint:unconvert // int32 on Darwin
 }
 
 // openOwnReadOnlyInPlace rewrites a read-only file that this process's user

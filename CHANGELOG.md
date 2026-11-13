@@ -12,7 +12,11 @@
   (`--get-timeout`, 2 minutes on a slow link). Now those connections send
   keepalive probes after 10 s of silence and give up after 25 s of
   unacknowledged data, so the request is retried on a new connection over
-  the new network (bundled JuiceFS patch 0029, `-jm14`). Remote lab
+  the new network (bundled JuiceFS patch 0029, `-jm14`). Through JuiceMount
+  Link, JuiceFS talks to a local proxy, so the same settings now also apply
+  to the proxy's direct connection to the NAS on the LAN, the one that dies
+  when the Mac leaves home (the encrypted Link path follows the Mac to its
+  new network by itself). Remote lab
   (`test/remote-lab/experiments/roam-lab.sh ipchange`, client address
   changed under a 2 MiB/s read): object requests on dead connections
   ended at 25.5 s in every run, against 30 s for a request waiting for its
@@ -23,8 +27,13 @@
   duplicate "(conflict ...)" copy beside itself. The upload's final rename
   reached the NAS, but its reply was lost with the link, so the next try
   found the name taken and treated the file as someone else's. The drainer
-  now remembers which file it staged and recognises its own file at the
-  name (remote lab, a 30 s drop under an 8 MiB upload).
+  now records, before the rename and on disk, which complete file it is
+  installing. A retry that finds that file at the name, even after an app
+  restart, completes without uploading it again; other Macs never see it
+  half rewritten. If another Mac held the project meanwhile (it may have
+  edited that file), the retry publishes a conflict copy and never
+  overwrites the edit; the same now holds for a file an older save of this
+  Mac put there (remote lab, a 30 s drop under an 8 MiB upload).
 - Opening a clip that is not cached waits for fewer round trips on a far
   link. Before, on a 200 ms link, a cold open waited for six metadata round
   trips in a row before the first object download: the cache reader's path

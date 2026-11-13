@@ -1601,11 +1601,17 @@ func (d *Drainer) drainOne(row *metadata.SpoolRow) {
 	if !ok {
 		return
 	}
+	_, accepted := d.rowDrainBase(row)
+	tainted := lease.taints(accepted)
 	if tgt.adoptIno != 0 {
-		// openDrainTarget already set the time, under the lease.
-		data, _, ok := d.directReadSpool(row, src)
-		if !ok {
-			return
+		// openDrainTarget already set the time, under the lease. The spool
+		// bytes are needed only for a sidecar body (small files); an adopted
+		// install can be a large file that must not be read into memory.
+		var data []byte
+		if row.Size <= sidecarMaxFile {
+			if data, _, ok = d.directReadSpool(row, src); !ok {
+				return
+			}
 		}
 		mtime := spoolMtime
 		if mtime.IsZero() {
@@ -1616,7 +1622,7 @@ func (d *Drainer) drainOne(row *metadata.SpoolRow) {
 	}
 	if tgt.direct {
 		// A small file under a free name: published whole, no stage.
-		if d.drainDirect(row, src, dest, spoolMtime, ph) {
+		if d.drainDirect(row, src, dest, spoolMtime, tainted, ph) {
 			return
 		}
 		instance, _ := d.instanceID()
@@ -1862,7 +1868,7 @@ func (d *Drainer) drainOne(row *metadata.SpoolRow) {
 	}
 	// H-8: a new name is published by one no-replace rename under the
 	// namespace lease, after rechecking that the row was not canceled.
-	if tgt.stage != nil && !d.installNewName(row, tgt.stage, dest) {
+	if tgt.stage != nil && !d.installNewName(row, tgt.stage, dest, tainted) {
 		return
 	}
 
