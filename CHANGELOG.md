@@ -4,6 +4,28 @@
 
 ### App
 
+- A volume mounted on a fast link now reads like one mounted on a slow link
+  once the link turns slow, with no app restart. Before, an editor who
+  started the app at home and woke up abroad read unpinned clips about 3x
+  slower until a relaunch (laptop run 2026-11-12, 200 ms and 1% loss: first
+  byte 6–7 s and 1 MiB scrubs 5–6 s, against 3.7 s and 1.5 s after a launch
+  abroad). The cause: the app chose JuiceFS's slow-link read settings
+  (`--demand-first`, which reads 256 KiB parts instead of whole 4 MiB
+  blocks) and its object timeouts and retries once, at mount. Now the NFS
+  server follows the live link class and changes them in the running JuiceFS
+  (patch 0027, `-jm12`, control message 1106). Open files and editors notice
+  nothing. A move to the slow settings waits until the slow class has held
+  for 10 s, a move back for 60 s, so a flapping link does not switch back and
+  forth. Demand-first and the timeouts hold separately, so a far link whose
+  bandwidth hovers near 3 MiB/s (slow and metered timeouts alternating) still
+  gets demand-first after 10 s. The read retry budget and the flush deadline
+  follow the live retries too, so a failing read abroad still ends with an
+  error after about as long as on a mount made abroad. An older JuiceFS is
+  asked once. `JM_JFS_LIVE_POLICY=0` keeps the mount-time settings, as before.
+  Remote lab (Linux, 200 ms, 1% loss, server BBR, mounted on lan): scrub
+  p50 2.6–2.7 s before the switch, 1.34 s after it, 1.24–1.26 s on a fresh
+  mount on that link.
+
 - A crash, kill, power loss or reboot no longer blocks the next launch. The
   app records which background owner process holds the volume. When that
   process ended without finishing its stop (for example a Quit while offline,

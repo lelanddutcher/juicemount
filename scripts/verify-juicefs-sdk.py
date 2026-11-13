@@ -48,6 +48,9 @@ PATCH_FILES = {
     "patches/0025-create-files-message.patch": ["pkg/meta/interface.go", "pkg/vfs/internal.go", "pkg/vfs/vfs.go"],
     "patches/0026-pinned-blocks.patch": [
         "pkg/chunk/disk_cache.go", "pkg/meta/interface.go", "pkg/vfs/internal.go"],
+    "patches/0027-live-link-policy.patch": [
+        "pkg/chunk/cached_store.go", "pkg/meta/interface.go", "pkg/vfs/internal.go",
+        "pkg/vfs/reader.go", "pkg/vfs/writer.go"],
 }
 VERSION_PACKAGE = "github.com/juicedata/juicefs/pkg/version"
 

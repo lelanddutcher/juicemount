@@ -372,7 +372,8 @@ func (f *fileWriter) flush(ctx meta.Context, writeback bool) syscall.Errno {
 	f.flushwaiting++
 
 	var err syscall.Errno
-	var wait = time.Second * time.Duration((f.w.maxRetries+2)*(f.w.maxRetries+2)/2)
+	retries := jmLiveRetries(f.w.store, f.w.maxRetries) // JuiceMount patch 0027
+	var wait = time.Second * time.Duration((retries+2)*(retries+2)/2)
 	if wait < time.Minute*5 {
 		wait = time.Minute * 5
 	}
@@ -387,7 +388,7 @@ func (f *fileWriter) flush(ctx meta.Context, writeback bool) syscall.Errno {
 				}
 			}
 		}
-		if f.flushcond.WaitWithTimeout(time.Second*3) && ctx.Canceled() && time.Since(s) > f.w.conf.Chunk.PutTimeout*2 {
+		if f.flushcond.WaitWithTimeout(time.Second*3) && ctx.Canceled() && time.Since(s) > jmLivePutTimeout(f.w.store, f.w.conf.Chunk.PutTimeout)*2 { // JuiceMount patch 0027
 			logger.Warnf("flush %d interrupted after %d", f.inode, time.Since(s))
 			err = syscall.EINTR
 			break

@@ -68,6 +68,9 @@ const (
 	JMCreateFiles = 1104
 	// JMPinCache fills and pins whole blocks of a file (JuiceMount patch 0026).
 	JMPinCache = 1105
+	// JMLinkPolicy reads or sets the link-dependent read and object settings
+	// while mounted (JuiceMount patch 0027, pkg/vfs/jm_link_policy.go).
+	JMLinkPolicy = 1106
 )
 
 const (

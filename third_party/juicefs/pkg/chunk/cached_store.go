@@ -211,7 +211,7 @@ func (s *rSlice) ReadAt(ctx context.Context, page *Page, off int) (n int, err er
 				_ = in.Close()
 			}
 			return err
-		}, s.store.conf.GetTimeout)
+		}, s.store.getTimeout())
 		used := time.Since(st)
 		endDemand()
 		if readTimelineOn {
@@ -412,7 +412,7 @@ func (store *cachedStore) put(key string, p *Page) error {
 			store.objectReqErrors.Add(1)
 		}
 		return err
-	}, store.conf.PutTimeout)
+	}, store.putTimeout())
 }
 
 func (store *cachedStore) delete(key string) error {
@@ -420,7 +420,7 @@ func (store *cachedStore) delete(key string) error {
 	var reqID string
 	err := utils.WithTimeout(func() error {
 		return store.storage.Delete(key, object.WithRequestID(&reqID))
-	}, store.conf.PutTimeout)
+	}, store.putTimeout())
 	used := time.Since(st)
 	if err != nil && (strings.Contains(err.Error(), "NoSuchKey") ||
 		strings.Contains(err.Error(), "not found") ||
@@ -463,7 +463,7 @@ func (store *cachedStore) upload(key string, block *Page, s *wSlice) error {
 
 	try, max := 0, 3
 	if sync {
-		max = store.conf.MaxRetries + 1
+		max = store.maxRetries() + 1
 	}
 	for ; try < max; try++ {
 		time.Sleep(time.Second * time.Duration(try*try))
@@ -517,7 +517,7 @@ func (s *wSlice) upload(indx int) {
 					_ = s.store.bcache.removeStage(key)
 				}
 				return err
-			}, s.store.conf.PutTimeout)
+			}, s.store.putTimeout())
 			if err != nil {
 				stageFailed = true
 				if !errors.Is(err, errStageConcurrency) {
@@ -754,7 +754,8 @@ type cachedStore struct {
 	endHour       int
 	compressor    compress.Compressor
 	seekable      bool
-	spans         *spanCache // JuiceMount: --demand-first (demand_spans.go)
+	spans         *spanCache   // JuiceMount: --demand-first (demand_spans.go)
+	link          jmLinkPolicy // JuiceMount patch 0027: live link policy (jm_link_policy.go)
 	upLimit       *ratelimit.Bucket
 	downLimit     *ratelimit.Bucket
 
@@ -822,7 +823,7 @@ func (store *cachedStore) load(key string, page *Page, cache bool, forceCache bo
 			err = nil
 		}
 		return err
-	}, store.conf.GetTimeout)
+	}, store.getTimeout())
 	used := time.Since(start)
 	logRequest("GET", key, "", reqID, err, used)
 	if store.downLimit != nil && compressed {
@@ -913,9 +914,12 @@ func NewCachedStore(storage object.ObjectStorage, config Config, reg prometheus.
 		config.Prefetch = 0 // disable prefetch if cache is disabled
 	}
 	store.demand = newDemandFirst(config.DemandFirst, config.BlockSize)
-	if config.DemandFirst {
-		store.spans = newStoreSpans(store)
-	}
+	// JuiceMount patch 0027: the span cache exists even without
+	// --demand-first, so the JMLinkPolicy message can turn demand-first on
+	// while mounted. spansOn still asks demand-first; it holds nothing
+	// until then.
+	store.spans = newStoreSpans(store)
+	store.link.init(config)
 	store.fetcher = newPrefetcher(config.Prefetch, func(key string) { store.fillBlock(key, store.bcache) })
 
 	if store.conf.CacheDir != "memory" && store.conf.Writeback {

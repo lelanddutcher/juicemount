@@ -142,7 +142,9 @@ func desktopJuiceFSSessionArgs() []string {
 // only a small in-session retry budget.
 //
 // Fast and medium links retain upstream defaults. JM_JFS_OBJECT_TIMEOUTS=0 is
-// the field rollback switch for slow/metered overrides.
+// the field rollback switch for slow/metered overrides. Like --demand-first,
+// these follow the live class after the mount (nfs/jfs_link_policy.go);
+// JM_JFS_LIVE_POLICY=0 keeps the mount values for the mount's life.
 func desktopJuiceFSObjectIOArgs(class netprofile.LinkClass) []string {
 	if os.Getenv("JM_JFS_OBJECT_TIMEOUTS") == "0" {
 		return nil
@@ -155,6 +157,15 @@ func desktopJuiceFSObjectIOArgs(class netprofile.LinkClass) []string {
 	default:
 		return nil
 	}
+}
+
+// desktopJuiceFSLinkArgs is the part of the mount flags that the NFS
+// server's link follower later changes in the running juicefs
+// (nfs/jfs_link_policy.go): the object deadlines by ReadPolicyClass, and
+// --demand-first by Class. TestJuiceFSLivePolicyMatchesMountArgs checks the
+// follower against this function on real profiles.
+func desktopJuiceFSLinkArgs(p *netprofile.Profile) []string {
+	return append(desktopJuiceFSObjectIOArgs(p.ReadPolicyClass()), desktopJuiceFSDemandFirstArgs(p.Class())...)
 }
 
 // desktopJuiceFSSmallUploadArgs gives small saves upload slots of their own
@@ -193,11 +204,16 @@ func desktopJuiceFSSmallUploadArgs(class netprofile.LinkClass) []string {
 // the flag, that read sends its own ranged GET, and the prefetcher waits while
 // demand reads are in flight.
 //
-// The flag is fixed for the mount's life, like the other JuiceFS flags: a
-// mount made on a fast link that later moves to a slow one runs without it
-// until the next remount, and the reverse. The NFS layer's own demand-first
-// rules (nfs/demand_first.go) follow the live class. Fast and medium links
-// keep the upstream behavior.
+// The flag sets the mount's starting state only. While the NFS server
+// serves, nfs/jfs_link_policy.go follows the live class and switches
+// demand-first in the running juicefs (patch 0027, control message 1106),
+// together with the object deadlines of desktopJuiceFSObjectIOArgs: a mount
+// made at home that wakes abroad reads like a mount made abroad, with no
+// remount (laptop run 2026-11-12: before this it kept fetching whole blocks,
+// about 3x slower for unpinned files). The NFS layer's own demand-first rules
+// (nfs/demand_first.go) follow the live class too. Fast and medium links
+// keep the upstream behavior. TestJuiceFSLivePolicyMatchesMountArgs keeps the
+// live policy equal to these flags.
 // JM_JFS_DEMAND_FIRST=0 is the field rollback switch.
 func desktopJuiceFSDemandFirstArgs(class netprofile.LinkClass) []string {
 	if os.Getenv("JM_JFS_DEMAND_FIRST") == "0" {
@@ -1188,8 +1204,7 @@ func (fm *FUSEManager) MountWithReceipt() (*MountReceipt, error) {
 	// timeout/retry loop.
 	// ReadPolicyClass, like jfp: a far, thin link (slow class by the slow-RTT
 	// floor) keeps the metered object deadlines a thin uplink needs.
-	args = append(args, desktopJuiceFSObjectIOArgs(netprofile.Default().ReadPolicyClass())...)
-	args = append(args, desktopJuiceFSDemandFirstArgs(netprofile.Default().Class())...)
+	args = append(args, desktopJuiceFSLinkArgs(netprofile.Default())...)
 	// A JuiceFS session expires at five heartbeat intervals. The upstream
 	// 12s default therefore lets another always-on client reap this Mac
 	// after only 60s. A cold or cellular S3 PUT can legitimately consume
