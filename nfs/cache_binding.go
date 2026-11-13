@@ -131,6 +131,7 @@ func (h *JuiceMountHandler) readCacheBlockTraced(ctx context.Context, r *cache.R
 		}
 		proofCtx, cancel := context.WithTimeout(ctx, timeout)
 		defer cancel()
+		b.prepareMappingBesideProof(r, inode, off, timeout)
 		qualificationStart := time.Time{}
 		if trace != nil {
 			qualificationStart = time.Now()

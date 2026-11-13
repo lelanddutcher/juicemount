@@ -2,12 +2,12 @@
   "archive_sha256": "9351a0655185f4a48accae2ae3af70db932de1ee38acfa4f153e3050b817806d",
   "binary": {
     "bundle_path": "Contents/MacOS/juicefs",
-    "ldflags": "-s -w -X github.com/juicedata/juicefs/pkg/version.revision=e0032b2ae5e9-jm12 -X github.com/juicedata/juicefs/pkg/version.revisionDate=2025-12-02",
+    "ldflags": "-s -w -X github.com/juicedata/juicefs/pkg/version.revision=e0032b2ae5e9-jm13 -X github.com/juicedata/juicefs/pkg/version.revisionDate=2025-12-02",
     "package": ".",
     "tags": "nogateway,nowebdav,nocos,nobos,nohdfs,noibmcos,noobs,nooss,noqingstor,nosftp,noswift,noazure,nogs,noufile,nob2,nonfs,nodragonfly,nosqlite,nomysql,nopg,notikv,nobadger,noetcd",
     "upstream_commit": "e0032b2ae5e9603403ca955eed7d05426f6f2f8c",
     "upstream_tag": "v1.3.1",
-    "version_output": "juicefs version 1.3.1+2025-12-02.e0032b2ae5e9-jm12"
+    "version_output": "juicefs version 1.3.1+2025-12-02.e0032b2ae5e9-jm13"
   },
   "files": {
     "LICENSE": {
@@ -423,7 +423,7 @@
       "upstream_sha256": "ba7e06aad4853d8522423f9b3e5048954dd3a8cef970ed3e3118045c4ea71028"
     },
     "pkg/meta/base.go": {
-      "sha256": "af9849f1eb252a0a152304f0f523cfc9446c287bf59e18ac61e4b14c0dd1a35c",
+      "sha256": "be0687f0b34011d910547ab784ea20ec9340a47000aad0b067c3df840d04dae6",
       "upstream_sha256": "0c1f39c842258034ccd278066f11c09fa840519ad526e6f22f0c4ce90aa46b35"
     },
     "pkg/meta/base_test.go": {
@@ -487,7 +487,7 @@
       "upstream_sha256": "43bc5c311fa58aba9b0422bb2327f0b89bf2fde47106f7d3db1a4d3a36651b23"
     },
     "pkg/meta/openfile.go": {
-      "sha256": "b04d616f1c2f4d117900acb4d1f521a977f73bf1c1ad23d6d00ffe07d2f00e53",
+      "sha256": "d69a2e18f3dddf2878aa3930f99770f4f06acb9208ab30840731f6c2ae0b3bce",
       "upstream_sha256": "b04d616f1c2f4d117900acb4d1f521a977f73bf1c1ad23d6d00ffe07d2f00e53"
     },
     "pkg/meta/pb/backup.pb.go": {
@@ -507,7 +507,7 @@
       "upstream_sha256": "95c7c7ce661adcff3e77bb9ae28a3e421503f13c1a3dd86150babd60e606a04e"
     },
     "pkg/meta/redis.go": {
-      "sha256": "d0554c695fff3935131343790f2f537a9c612ced56c308dab91c42c4553ad1ba",
+      "sha256": "136fbc61303e027744ee839513060c36e0d26d56be34465fdcf4558bd291c9f8",
       "upstream_sha256": "2aa585ced13b1385adbe0bbcfb5a11f603d9f7cab3a017d827cf1148d0860456"
     },
     "pkg/meta/redis_bak.go": {
@@ -1127,6 +1127,7 @@
     "pkg/fuse/rename_flags_other_test.go": "9bd48e6423b2c88e37f9217eee5f0697afff8935c266fb18c81fd9dee65dcb8d",
     "pkg/jmsignal/jmsignal.go": "f06bc817d1e03cd66d10159ad282057ce22aa64ce0fa89562c6e3b06b37d3348",
     "pkg/meta/jm_create_file.go": "6d1b6c2c87c5c121a12e45dbf040a7ae411bde505dc40b077dc8845664f0db1d",
+    "pkg/meta/jm_open_round_trips_test.go": "099ccb8f92b9197be9fdea95e49a0d7c5fedb8918d39559083d9e9c8c71e0591",
     "pkg/meta/jm_pin_ops.go": "03c38dc0341f5ea58172baa76239076012fcab52d96de75a0825bd1b5d895651",
     "pkg/meta/jm_reserved_inode.go": "1b5e0d26e9cafc6d685fe04e9625af0212ecc08b06f9f2d1123af8f9431c65d8",
     "pkg/meta/jm_reserved_inode_test.go": "bac1a7ec4e51fe895d2539df45f8e3afd80231c8c7cecd7540db5a025ea59652",
@@ -1197,7 +1198,8 @@
     "patches/0024-small-upload-lane.patch": "83043ad356c5f47591e22ccd8070d0ceeb0bc79845a9d98f747ae5937d6de8d6",
     "patches/0025-create-files-message.patch": "cf8bcd77dd4cac9271c0eb79a1f578544f9490d1801e67c54949ad2c4513c672",
     "patches/0026-pinned-blocks.patch": "94be902b048f05d72ec6b2dce0af22ea44917c21c0ebb64d105714b3c28bdc08",
-    "patches/0027-live-link-policy.patch": "a426454b44ec0e455f03c8f0d5fe3b4c9b8fa8ecba04ed7f74a9e96446728fd0"
+    "patches/0027-live-link-policy.patch": "a426454b44ec0e455f03c8f0d5fe3b4c9b8fa8ecba04ed7f74a9e96446728fd0",
+    "patches/0028-open-round-trips.patch": "432401890a0887d55a8c95c8ef66eb99ce31c74f70e1701d99653f053ed07c5f"
   },
   "scope": "All pkg/ and cmd/ files plus main.go, LICENSE, go.mod and go.sum from the verified module ZIP. Documentation, integration tests and SDK examples are not included. local_files are JuiceMount-owned source with no upstream counterpart.",
   "upstream_url": "https://github.com/juicedata/juicefs/tree/v1.3.1",

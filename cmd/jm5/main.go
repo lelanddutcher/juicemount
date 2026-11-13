@@ -159,6 +159,7 @@ func main() {
 	dbPath := flag.String("db", "", "SQLite database path (default: ~/.juicemount/metadata.db)")
 	noMount := flag.Bool("no-mount", false, "Start NFS server without mounting (for testing)")
 	noFuse := flag.Bool("no-fuse", false, "Skip JuiceFS FUSE mount (assume already mounted)")
+	externalBundled := flag.Bool("external-juicefs-is-bundled", false, "With --no-fuse: the external mount runs the juicefs beside this executable, so the direct SSD cache reader may verify against it (remote lab)")
 	cacheSize := flag.String("cache-size", "100000", "JuiceFS SSD cache size in MB")
 	bucketOverride := flag.String("bucket-override", "", "Override the S3 bucket URL stored in Redis (e.g. http://<server-ip>:30151/<bucket>). Empty = use the URL written by juicefs format.")
 	logFile := flag.String("log-file", "", "Optional path to additionally write JSON log records")
@@ -254,7 +255,7 @@ func main() {
 	// --no-fuse serves an externally owned generation. Its executable is
 	// unknown; finding another installed binary cannot prove cache layout.
 	juiceFSBin := ""
-	if !*noFuse {
+	if !*noFuse || *externalBundled {
 		juiceFSBin = health.ResolveJuiceFSBinary()
 	}
 	stateDir, err := filepath.Abs(filepath.Dir(*dbPath))

@@ -4,6 +4,21 @@
 
 ### App
 
+- Opening a clip that is not cached waits for fewer round trips on a far
+  link. Before, on a 200 ms link, a cold open waited for six metadata round
+  trips in a row before the first object download: the cache reader's path
+  check, its block-map lookup, then the FUSE open's own lookups and JuiceFS's
+  slice-list read. Now, on a slow or high-latency link, the FUSE open and the
+  block-map lookup start at the same time as the path check, and JuiceFS reads
+  the file's attributes and its first slice list in one round trip and
+  answers the kernel's follow-up attribute request from that read (patch
+  0028, `-jm13`). Every open still reads the file's current state from the
+  server, so an edit another Mac saved before the open is seen. An edit saved
+  after the open is seen by any read more than 1 s after the open; within
+  that second the first read sees the file as it was at the open. Remote lab (Linux,
+  200 ms, 1% loss, 30 Mbit/s, server BBR, median first byte): first clip of a
+  session 2.87 s to 1.96 s, later clips 2.33 s to 1.39 s; lan unchanged.
+  `JM_OPEN_OVERLAP=0` turns the app-side overlap off.
 - A volume mounted on a fast link now reads like one mounted on a slow link
   once the link turns slow, with no app restart. Before, an editor who
   started the app at home and woke up abroad read unpinned clips about 3x

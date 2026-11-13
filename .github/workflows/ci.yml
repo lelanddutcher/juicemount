@@ -86,7 +86,7 @@ jobs:
         working-directory: third_party/juicefs
         # Patch 0019 (batched WATCH), the birth/replace guards, patch 0022
         # (reserved folder inodes), 0023 (batched rename) and 0025
-        # (JMCreateFiles), with
+        # (JMCreateFiles), 0028 (open round trips), with
         # -race; then upstream's whole Redis metadata suite, which uses DB 10
         # (the smart-folder tests below flush it before use).
         env:
@@ -97,7 +97,7 @@ jobs:
           # uses this Redis while the step runs.
           JM_WATCH_BATCH_CHAOS_REDIS_URL: redis://127.0.0.1:6379/4
         run: |
-          go test -count=1 -race -run 'TestJMWatchBatch|TestBirth|Rename|TestCommittedRecord|TestJMMkdirInode|TestJMReserveInodes|TestJMReleaseInodes|TestJMCreateFile' ./pkg/meta
+          go test -count=1 -race -run 'TestJMWatchBatch|TestBirth|Rename|TestCommittedRecord|TestJMMkdirInode|TestJMReserveInodes|TestJMReleaseInodes|TestJMCreateFile|TestJMOpen|TestJMGetAttr' ./pkg/meta
           go test -count=1 -race -run 'TestJMCreateFiles' ./pkg/vfs
           go test -count=1 -run 'TestRedisClient$' ./pkg/meta
       - name: Unit and integration-safe tests

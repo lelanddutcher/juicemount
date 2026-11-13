@@ -5845,6 +5845,7 @@ type cachedFile struct {
 	fileSize              int64
 	fdMu                  sync.Mutex // guards lazy fuseFD acquisition and Close
 	closed                bool
+	overlapOpen           atomic.Bool // startOverlappedOpen ran (open_overlap.go)
 
 	// Decided at OpenFile time: whether this file passed the pin check.
 	// Pinned files are allowed to fall through to FUSE during offline mode
@@ -6479,6 +6480,7 @@ func (f *cachedFile) readAtRouted(p []byte, off int64, trace *cachedReadTrace) (
 		if pin.IsOffline() {
 			mappingTimeout = 200 * time.Millisecond
 		}
+		f.startOverlappedOpen(off)
 		n, err := f.handler.readCacheBlockTraced(context.Background(), f.cacheReader, f.cacheIdentity, f.inode, off, p, mappingTimeout, trace)
 		if errors.Is(err, syscall.EAGAIN) {
 			return 0, err

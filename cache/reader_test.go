@@ -877,3 +877,20 @@ func TestRevalidateMappingsErrorLeavesSnapshotUntouched(t *testing.T) {
 		t.Fatalf("failed validation mutated snapshot: got %#v want %#v", got, want)
 	}
 }
+
+func TestHasChunkMapping(t *testing.T) {
+	r := NewReader(t.TempDir(), 4<<20, nil)
+	if r.HasChunkMapping(7, 0) {
+		t.Fatal("empty reader reports a mapping")
+	}
+	r.sliceMu.Lock()
+	r.sliceCache["7_0"] = []SliceInfo{}
+	r.sliceMu.Unlock()
+	if !r.HasChunkMapping(7, 0) || r.HasChunkMapping(7, 1) || r.HasChunkMapping(8, 0) {
+		t.Fatal("HasChunkMapping does not follow the RAM mapping")
+	}
+	var nilReader *Reader
+	if nilReader.HasChunkMapping(7, 0) {
+		t.Fatal("nil reader reports a mapping")
+	}
+}
