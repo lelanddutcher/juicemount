@@ -41,11 +41,20 @@
   resolves the route to the configured NAS address (not the loopback address
   of the Link proxy). A tunneled mount starts with `--demand-first`, slow
   timeouts and a 512 MiB buffer, and the follower has nothing to switch.
-  The embedded JuiceMount Link is a userspace tunnel with no `utun`, so
-  through Link the class still comes from measurement, in both processes.
-- JuiceFS demand-first (`--demand-first`) is now on for every link, lan
-  included. It was on for slow and metered links only. On lan it was never
-  slower and usually faster. Founder's Mac on the home LAN, straight to the
+  When the route lookup fails, both processes now do the same thing: they
+  keep the cap from the last successful lookup, or cap at slow when no lookup
+  has succeeded. The serving process used to guess from the default route.
+  The embedded JuiceMount Link is a userspace tunnel with no `utun`, so the
+  cap never applies through Link. Through Link the owner also mounts before
+  the app measures the link, so a Link mount made abroad still starts with
+  the medium buffer and prefetch. That is a known follow-up.
+- JuiceFS demand-first (`--demand-first`) is now the default on every link
+  class except fast. It was on for slow and metered links only. Fast stays
+  off because a wired multi-gigabit Mac has not been measured: the Mac runs
+  were capped by Wi-Fi at about 330 Mbit/s, and with demand-first a
+  sequential read goes through 256 KiB ranged GETs, whose throughput at
+  10 GbE is unknown. On lan (medium) it was never slower and usually
+  faster. Founder's Mac on the home LAN, straight to the
   NAS over Wi-Fi with no tunnel, 3 cold rounds each, off against on:
   sequential 512 MiB 84/291/287 against 313/324/338 Mbit/s; 1 MiB scrub p50
   0.01/0.20/0.20 s against 0.12/0.08/0.07 s and p95 3.84/0.31/0.31 s against
@@ -53,7 +62,14 @@
   for 30 MiB read. The same Mac through a WireGuard tunnel and the Linux lab
   at about 2 Gbit/s agreed. A wired 10 GbE Mac was not measured.
   `JM_JFS_DEMAND_FIRST=0` turns it off on every link, at mount and live.
-  The live follower now changes only the object timeouts with the class.
+  The live follower turns it off when the class becomes fast and on again
+  when it leaves fast.
+- A pin ("pack for the trip") no longer waits behind unpinned playback on a
+  lan or fast link. With demand-first on lan, each of the 4 pin downloads
+  waited up to 10 s per block while any other block was being read for an
+  editor. Now only a pin on a slow or metered link waits, where the app
+  already pins one block at a time so reads go first (bundled JuiceFS,
+  `pkg/chunk/jm_pin.go`).
 - The log no longer warns "juicefs link policy: exchange failed; retrying"
   at every start. The first check comes before JuiceFS serves its control
   file. Failures before JuiceFS first answers, in the first 30 s, are now

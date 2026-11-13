@@ -64,7 +64,7 @@ func (fm *FUSEManager) linkAwareJuiceFSPolicy() (netprofile.JuiceFSPolicy, []str
 			netprofile.Default().ObserveRTT(rtt)
 		}
 	}
-	return MountLinkPolicy(netprofile.Default(), fm.cfg.RouteTarget, fm.routeResolver)
+	return MountLinkPolicy(netprofile.Default(), DefaultRouteCeiling(), fm.cfg.RouteTarget, fm.routeResolver)
 }
 
 // MountLinkPolicy is the link part of a juicefs mount: it applies the tunnel
@@ -72,17 +72,20 @@ func (fm *FUSEManager) linkAwareJuiceFSPolicy() (netprofile.JuiceFSPolicy, []str
 // returns the prefetch policy and the link args (desktopJuiceFSLinkArgs)
 // read from p. Both come from one classification, the one the serving
 // process makes for the same route (ApplyBackendRouteCeiling), so the mount
-// args equal what the live follower would send. An empty routeTarget, or a
-// failed lookup, leaves the ceiling p already has.
-func MountLinkPolicy(p *netprofile.Profile, routeTarget string, resolver func(string) (string, error)) (netprofile.JuiceFSPolicy, []string) {
+// args equal what the live follower would send. An empty routeTarget leaves
+// the ceiling p already has; a failed lookup takes rc's shared fallback
+// (RouteCeiling.Apply).
+func MountLinkPolicy(p *netprofile.Profile, rc *RouteCeiling, routeTarget string, resolver func(string) (string, error)) (netprofile.JuiceFSPolicy, []string) {
 	routeIface, tunneled := "", false
 	if routeTarget != "" {
 		iface, err := ResolveBackendRoute(routeTarget, resolver)
-		if err != nil {
-			jmlog.Warn("could not resolve backend route for mount link ceiling; keeping prior policy",
-				"error", err.Error())
+		var looked bool
+		tunneled, looked = rc.Apply(p, iface, err)
+		if looked {
+			routeIface = iface
 		} else {
-			routeIface, tunneled = iface, ApplyBackendRouteCeiling(p, iface)
+			jmlog.Warn("could not resolve backend route for mount link ceiling; keeping the last ceiling (slow if none)",
+				"error", err.Error(), "route_ceiling", tunneled)
 		}
 	}
 	pol := p.JuiceFS()
@@ -190,11 +193,11 @@ func desktopJuiceFSObjectIOArgs(class netprofile.LinkClass) []string {
 // desktopJuiceFSLinkArgs is the part of the mount flags that the NFS
 // server's link follower later changes in the running juicefs
 // (nfs/jfs_link_policy.go): the object deadlines by ReadPolicyClass, and
-// --demand-first (on for every class unless rolled back).
+// --demand-first by Class (on for every class except fast).
 // TestJuiceFSLivePolicyMatchesMountArgs checks the follower against this
 // function on real profiles.
 func desktopJuiceFSLinkArgs(p *netprofile.Profile) []string {
-	return append(desktopJuiceFSObjectIOArgs(p.ReadPolicyClass()), desktopJuiceFSDemandFirstArgs()...)
+	return append(desktopJuiceFSObjectIOArgs(p.ReadPolicyClass()), desktopJuiceFSDemandFirstArgs(p.Class())...)
 }
 
 // desktopJuiceFSSmallUploadArgs gives small saves upload slots of their own
@@ -232,8 +235,8 @@ func desktopJuiceFSSmallUploadArgs(class netprofile.LinkClass) []string {
 // download of that block. With the flag, that read sends its own ranged GET,
 // and the prefetcher waits while demand reads are in flight.
 //
-// It is on for every link class. It began on slow and metered links only.
-// Measured on lan it was better there too, and never slower:
+// It is on for every link class except fast. It began on slow and metered
+// links only. Measured on lan it was better there too, and never slower:
 //   - Mac on the home LAN, straight to the NAS over Wi-Fi with no tunnel
 //     (2026-11-13, 3 cold rounds each): sequential 512 MiB 313/324/338
 //     against 84/291/287 Mbit/s, scrub p50 0.08 s against 0.20 s, scrub
@@ -243,17 +246,20 @@ func desktopJuiceFSSmallUploadArgs(class netprofile.LinkClass) []string {
 //   - the Linux lab at about 2 Gbit/s: scrub 7 against 13 ms, sequential
 //     1950 against 1370 Mbit/s.
 //
-// A wired 10 GbE Mac was not measured.
+// Fast stays off until a wired multi-gigabit Mac is measured. The Mac runs
+// were capped by Wi-Fi at about 330 Mbit/s. With the flag, sequential reads
+// go through 256 KiB span GETs, so at 10 GbE throughput depends on span
+// concurrency and the object store's cost per request, which nobody has
+// measured (PR #90 review MEDIUM-1).
 //
 // While the NFS server serves, nfs/jfs_link_policy.go keeps the running
-// juicefs equal to these flags (patch 0027, control message 1106). Since
-// demand-first no longer depends on the class, only the object deadlines of
-// desktopJuiceFSObjectIOArgs follow the live class.
-// TestJuiceFSLivePolicyMatchesMountArgs keeps the live policy equal to these
-// flags. JM_JFS_DEMAND_FIRST=0 is the field rollback switch: no
-// demand-first on any link, at mount or live.
-func desktopJuiceFSDemandFirstArgs() []string {
-	if os.Getenv("JM_JFS_DEMAND_FIRST") == "0" {
+// juicefs equal to these flags as the live class moves (patch 0027, control
+// message 1106), together with the object deadlines of
+// desktopJuiceFSObjectIOArgs. TestJuiceFSLivePolicyMatchesMountArgs keeps
+// the live policy equal to these flags. JM_JFS_DEMAND_FIRST=0 is the field
+// rollback switch: no demand-first on any link, at mount or live.
+func desktopJuiceFSDemandFirstArgs(class netprofile.LinkClass) []string {
+	if os.Getenv("JM_JFS_DEMAND_FIRST") == "0" || class == netprofile.ClassFast {
 		return nil
 	}
 	return []string{"--demand-first"}

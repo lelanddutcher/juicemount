@@ -2029,15 +2029,28 @@ func nfsServerStartSerialized(configJSON *C.char, recovery *servingDesiredRecord
 		// JM_NET_FORCE_CLASS override precedence is untouched: those are consulted
 		// in metadata.currentLinkClass / netprofile BEFORE this signal.
 		var opts []health.NetWatcherOption
-		if backendAddr := backendRouteTarget(routePolicyURL); backendAddr != "" {
+		backendAddr := backendRouteTarget(routePolicyURL)
+		if backendAddr != "" {
 			opts = append(opts, health.WithBackendTarget(backendAddr))
 		}
 		globalKeyspaceNetWatcher = health.NewNetWatcher(1*time.Second, opts...)
-		globalKeyspaceNetWatcher.OnChange(func(_, current string) {
-			applyBackendRouteCeiling(current)
-		})
+		if backendAddr != "" {
+			// The ceiling follows the backend-route lookup itself, not the
+			// default-route guess the watcher reports when a lookup fails: a
+			// failed lookup takes the fallback the mount also takes
+			// (health.RouteCeiling). Start reports the first result.
+			globalKeyspaceNetWatcher.OnBackendRoute(applyBackendRouteResult)
+		} else {
+			// No usable backend address (malformed URL): the default route
+			// is the only signal, as before.
+			globalKeyspaceNetWatcher.OnChange(func(_, current string) {
+				applyBackendRouteCeiling(current)
+			})
+		}
 		globalKeyspaceNetWatcher.Start()
-		applyBackendRouteCeiling(globalKeyspaceNetWatcher.ActiveInterface())
+		if backendAddr == "" {
+			applyBackendRouteCeiling(globalKeyspaceNetWatcher.ActiveInterface())
+		}
 		ifaceFn = globalKeyspaceNetWatcher.ActiveInterface
 	}
 	metadata.SetClassSignals(ifaceFn, reachFn)
@@ -4116,21 +4129,29 @@ func backendRouteTarget(redisURL string) string {
 // lookup only; no packet is transmitted).
 func resolveAndApplyBackendRouteCeiling(target string, resolver func(string) (string, error)) error {
 	iface, err := health.ResolveBackendRoute(target, resolver)
-	if err != nil {
-		return err
-	}
-	applyBackendRouteCeiling(iface)
-	return nil
+	applyBackendRouteResult(iface, err)
+	return err
 }
 
-// applyBackendRouteCeiling is the serving process's side of the tunnel
-// ceiling. The volume owner applies the same health.ApplyBackendRouteCeiling
-// before it chooses the juicefs mount flags (FUSEConfig.RouteTarget).
-func applyBackendRouteCeiling(iface string) {
+// applyBackendRouteCeiling applies a successful route lookup.
+func applyBackendRouteCeiling(iface string) { applyBackendRouteResult(iface, nil) }
+
+// applyBackendRouteResult is the serving process's side of the tunnel
+// ceiling. It goes through health.DefaultRouteCeiling, the same rule and the
+// same failed-lookup fallback (keep the last ceiling; slow before any
+// success) that the volume owner applies before it chooses the juicefs
+// mount flags (FUSEConfig.RouteTarget).
+func applyBackendRouteResult(iface string, err error) {
 	p := netprofile.Default()
-	tunneled := health.ApplyBackendRouteCeiling(p, iface)
+	tunneled, looked := health.DefaultRouteCeiling().Apply(p, iface, err)
 	backendRoutePolicyState.tunneled.Store(tunneled)
 	backendRoutePolicyState.ceilingApplied.Store(tunneled)
+	if !looked {
+		jmlog.Warn("backend route lookup failed; keeping the last link ceiling (slow if none)",
+			"error", err.Error(), "route_ceiling", tunneled,
+			"effective_class", p.Class().String())
+		return
+	}
 	jmlog.Info("backend route link ceiling updated",
 		"interface", iface,
 		"effective_class", p.Class().String())

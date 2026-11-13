@@ -18,8 +18,8 @@ import (
 //
 // The app mounts juicefs with flags chosen from the link class at that
 // moment (health/fuse.go): longer object timeouts with fewer retries on a
-// slow or metered read policy, and (until 2026-11-13, now on every class)
-// --demand-first on a slow or metered link. Before patch 0027 those flags
+// slow or metered read policy, and --demand-first on every class but fast
+// (slow and metered only until 2026-11-13). Before patch 0027 those flags
 // held until the next remount. A
 // volume mounted at home that woke abroad (laptop run 2026-11-12, 200 ms, 1%
 // loss, server BBR) kept fetching whole 4 MiB blocks for every miss: first
@@ -48,22 +48,20 @@ type jfsLinkPolicy struct {
 	IORetries   int
 }
 
-// The upstream defaults: what a fast or medium mount runs with.
+// The upstream defaults: what a fast mount runs with (a medium mount adds
+// demand-first).
 var jfsLinkUpstream = jfsLinkPolicy{GetTimeout: 60 * time.Second, PutTimeout: 60 * time.Second, IORetries: 10}
 
 // jfsLinkPolicyFor is the policy health/fuse.go gives a mount on these
-// classes: --demand-first on every class (desktopJuiceFSDemandFirstArgs;
-// measured better on lan too, 2026-11-13), the object deadlines by
-// ReadPolicyClass (desktopJuiceFSObjectIOArgs). health's
+// classes: --demand-first on every class except fast
+// (desktopJuiceFSDemandFirstArgs: measured better on lan 2026-11-13; fast
+// is not measured yet), the object deadlines by ReadPolicyClass
+// (desktopJuiceFSObjectIOArgs). health's
 // TestJuiceFSLivePolicyMatchesMountArgs keeps the two equal. The rollback
-// switches of those flags hold here too. class no longer changes the
-// policy; it stays in the signature so that both classes keep one path
-// (jfsLinkClasses). With demand-first fixed for the process's life, its
-// hold below never has a change to hold back; the follower still corrects
-// a juicefs whose demand-first differs from the target.
-func jfsLinkPolicyFor(_, readClass netprofile.LinkClass) jfsLinkPolicy {
+// switches of those flags hold here too.
+func jfsLinkPolicyFor(class, readClass netprofile.LinkClass) jfsLinkPolicy {
 	p := jfsLinkUpstream
-	p.DemandFirst = os.Getenv("JM_JFS_DEMAND_FIRST") != "0"
+	p.DemandFirst = os.Getenv("JM_JFS_DEMAND_FIRST") != "0" && class != netprofile.ClassFast
 	if os.Getenv("JM_JFS_OBJECT_TIMEOUTS") != "0" {
 		switch readClass {
 		case netprofile.ClassMetered:

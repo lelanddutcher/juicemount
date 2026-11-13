@@ -29,6 +29,7 @@ func TestMountLinkPolicyAppliesRouteCeiling(t *testing.T) {
 	t.Setenv("JM_JFS_DEMAND_FIRST", "")
 	t.Setenv("JM_JFS_OBJECT_TIMEOUTS", "")
 	p := netprofile.New()
+	rc := &RouteCeiling{}
 	p.ObserveRTT(2 * time.Millisecond)
 	lanClass := p.Class()
 	if lanClass == netprofile.ClassSlow || lanClass == netprofile.ClassMetered {
@@ -42,8 +43,8 @@ func TestMountLinkPolicyAppliesRouteCeiling(t *testing.T) {
 		if got := p.Class() == netprofile.ClassSlow; got != wantSlow {
 			t.Fatalf("%s: class %s, want slow=%v", step, p.Class(), wantSlow)
 		}
-		if !slices.Contains(args, "--demand-first") { // on every class since 2026-11-13
-			t.Fatalf("%s: args %v lack --demand-first", step, args)
+		if got := slices.Contains(args, "--demand-first"); got != (p.Class() != netprofile.ClassFast) {
+			t.Fatalf("%s: class %s, args %v", step, p.Class(), args) // on every class but fast
 		}
 		if got := len(args) > 1; got != wantSlow { // slow adds the object deadlines
 			t.Fatalf("%s: args %v, want slow deadlines=%v", step, args, wantSlow)
@@ -55,19 +56,19 @@ func TestMountLinkPolicyAppliesRouteCeiling(t *testing.T) {
 			t.Fatalf("%s: mount args %v, live policy %v", step, args, nfs.JFSLinkPolicyFlags(p))
 		}
 	}
-	pol, args := MountLinkPolicy(p, "192.0.2.10:30179", route("utun11", nil))
+	pol, args := MountLinkPolicy(p, rc, "192.0.2.10:30179", route("utun11", nil))
 	check("utun", true, pol, args)
 	if pol.BufferSizeMB != 512 {
 		t.Fatalf("tunneled mount buffer %d MiB, want the slow 512", pol.BufferSizeMB)
 	}
-	pol, args = MountLinkPolicy(p, "192.0.2.10:30179", route("", errors.New("no route")))
+	pol, args = MountLinkPolicy(p, rc, "192.0.2.10:30179", route("", errors.New("no route")))
 	check("lookup failed", true, pol, args)
-	pol, args = MountLinkPolicy(p, "192.0.2.10:30179", route("en0", nil))
+	pol, args = MountLinkPolicy(p, rc, "192.0.2.10:30179", route("en0", nil))
 	check("en0", false, pol, args)
 	if p.Class() != lanClass {
 		t.Fatalf("lifting the ceiling left class %s, want %s", p.Class(), lanClass)
 	}
-	pol, args = MountLinkPolicy(p, "", route("utun11", nil))
+	pol, args = MountLinkPolicy(p, rc, "", route("utun11", nil))
 	check("no target", false, pol, args)
 }
 
@@ -89,5 +90,61 @@ func TestFUSEManagerMountPolicyResolvesRouteTarget(t *testing.T) {
 	}
 	if !slices.Contains(args, "--demand-first") || netprofile.Default().Class() != netprofile.ClassSlow {
 		t.Fatalf("tunneled backend: args %v, class %s", args, netprofile.Default().Class())
+	}
+}
+
+// PR #90 review LOW-1: a failed lookup keeps the last successful lookup's
+// ceiling, and before any success it caps at slow.
+func TestRouteCeilingFallbackOnFailedLookup(t *testing.T) {
+	t.Setenv("JM_NET_CLASS", "")
+	p := netprofile.New()
+	p.ObserveRTT(2 * time.Millisecond)
+	rc := &RouteCeiling{}
+	fail := errors.New("no route")
+	steps := []struct {
+		iface      string
+		err        error
+		wantSlow   bool
+		wantLooked bool
+	}{
+		{"", fail, true, false},     // no success yet: slow
+		{"en0", nil, false, true},   // lifted
+		{"", fail, false, false},    // keeps the lifted ceiling
+		{"utun11", nil, true, true}, // tunnel
+		{"", fail, true, false},     // keeps the tunnel ceiling
+		{"tailscale0", nil, true, true},
+	}
+	for i, s := range steps {
+		tunneled, looked := rc.Apply(p, s.iface, s.err)
+		if tunneled != s.wantSlow || looked != s.wantLooked || (p.Class() == netprofile.ClassSlow) != s.wantSlow {
+			t.Fatalf("step %d (%q, %v): tunneled %v looked %v class %s", i, s.iface, s.err, tunneled, looked, p.Class())
+		}
+	}
+}
+
+// The NetWatcher tells OnBackendRoute the lookup result itself (an error,
+// not the default-route guess), and only when it changes.
+func TestNetWatcherReportsBackendRouteResult(t *testing.T) {
+	results := []struct {
+		iface string
+		err   error
+	}{{"utun3", nil}, {"utun3", nil}, {"", errors.New("dns")}, {"", errors.New("dns again")}, {"", nil}, {"en0", nil}}
+	i := 0
+	w := NewNetWatcher(time.Hour, WithBackendTarget("nas.example:6379"))
+	w.routeCacheFor = 0
+	w.routeResolver = func(string) (string, error) { r := results[i]; i++; return r.iface, r.err }
+	var got []string
+	w.OnBackendRoute(func(iface string, err error) {
+		if err != nil {
+			got = append(got, "error")
+		} else {
+			got = append(got, iface)
+		}
+	})
+	for range results {
+		w.detect()
+	}
+	if want := []string{"utun3", "error", "en0"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("route callbacks %v, want %v", got, want)
 	}
 }

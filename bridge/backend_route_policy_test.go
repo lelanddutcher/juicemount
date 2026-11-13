@@ -58,7 +58,7 @@ func TestBackendRouteTargetInvalidValuesFailClosed(t *testing.T) {
 }
 
 func TestOriginalBackendTargetReachesRouteCeiling(t *testing.T) {
-	defer applyBackendRouteCeiling("")
+	defer applyBackendRouteCeiling("en0")
 
 	const target = "192.0.2.10:30179"
 	seen := ""
@@ -82,7 +82,7 @@ func TestOriginalBackendTargetReachesRouteCeiling(t *testing.T) {
 
 func TestBackendRouteResolutionFailurePreservesPriorCeiling(t *testing.T) {
 	applyBackendRouteCeiling("utun42")
-	defer applyBackendRouteCeiling("")
+	defer applyBackendRouteCeiling("en0")
 	err := resolveAndApplyBackendRouteCeiling("192.0.2.10:30179", func(string) (string, error) {
 		return "", errors.New("test route miss")
 	})
@@ -106,7 +106,7 @@ func TestServingAndOwnerClassifyBackendRouteAlike(t *testing.T) {
 	t.Setenv("JM_NET_CLASS", "")
 	t.Setenv("JM_JFS_DEMAND_FIRST", "")
 	t.Setenv("JM_JFS_OBJECT_TIMEOUTS", "")
-	defer applyBackendRouteCeiling("")
+	defer applyBackendRouteCeiling("en0")
 	defer netprofile.Default().ResetForTransportChange()
 	const target = "192.0.2.10:30179"
 	const rtt = 2 * time.Millisecond // the owner's dial on the laptop lab
@@ -135,7 +135,7 @@ func TestServingAndOwnerClassifyBackendRouteAlike(t *testing.T) {
 
 		owner := netprofile.New()
 		owner.ObserveRTT(rtt)
-		pol, mountArgs := health.MountLinkPolicy(owner, target, resolver)
+		pol, mountArgs := health.MountLinkPolicy(owner, &health.RouteCeiling{}, target, resolver)
 
 		if owner.Class() != serving.Class() || owner.ReadPolicyClass() != serving.ReadPolicyClass() {
 			t.Errorf("%s: owner class %s/%s, serving %s/%s", tc.iface,
@@ -176,4 +176,40 @@ func normLinkDurations(t *testing.T, args []string) []string {
 		}
 	}
 	return out
+}
+
+// PR #90 review LOW-1: after the same lookup history, a failed lookup leaves
+// the serving process and the mount with the same ceiling. The serving
+// process used to take the NetWatcher's default-route guess instead.
+func TestServingAndOwnerTakeSameFallbackOnFailedLookup(t *testing.T) {
+	t.Setenv("JM_NET_CLASS", "")
+	defer applyBackendRouteCeiling("en0")
+	const target = "192.0.2.10:30179"
+	fail := func(string) (string, error) { return "", errors.New("test route miss") }
+	defer netprofile.Default().ResetForTransportChange()
+	netprofile.Default().ResetForTransportChange()
+	netprofile.Default().ObserveRTT(2 * time.Millisecond)
+	owner := netprofile.New()
+	owner.ObserveRTT(2 * time.Millisecond)
+	rc := &health.RouteCeiling{}
+	for _, prior := range []string{"utun11", "en0"} {
+		ok := func(string) (string, error) { return prior, nil }
+		_ = resolveAndApplyBackendRouteCeiling(target, ok)
+		health.MountLinkPolicy(owner, rc, target, ok)
+		if err := resolveAndApplyBackendRouteCeiling(target, fail); err == nil {
+			t.Fatal("a failed lookup reported no error")
+		}
+		_, ownerArgs := health.MountLinkPolicy(owner, rc, target, fail)
+		serving := netprofile.Default()
+		wantSlow := prior == "utun11"
+		if (serving.Class() == netprofile.ClassSlow) != wantSlow || (owner.Class() == netprofile.ClassSlow) != wantSlow {
+			t.Fatalf("after %s then a failed lookup: serving %s, owner %s; want slow=%v", prior, serving.Class(), owner.Class(), wantSlow)
+		}
+		if backendRoutePolicyState.tunneled.Load() != wantSlow {
+			t.Fatalf("after %s then a failed lookup: serving status tunneled=%v", prior, !wantSlow)
+		}
+		if !reflect.DeepEqual(normLinkDurations(t, ownerArgs), normLinkDurations(t, jmnfs.JFSLinkPolicyFlags(serving))) {
+			t.Fatalf("after %s: mount args %v, follower %v", prior, ownerArgs, jmnfs.JFSLinkPolicyFlags(serving))
+		}
+	}
 }

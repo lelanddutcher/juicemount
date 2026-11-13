@@ -3,6 +3,7 @@ package health
 import (
 	"errors"
 	"strings"
+	"sync"
 
 	"github.com/lelanddutcher/juicemount/internal/netprofile"
 )
@@ -30,8 +31,21 @@ import (
 //
 // The embedded JuiceMount Link node is a userspace tunnel. Its traffic goes
 // through a loopback proxy, never through a utun, so the route to the
-// original backend address resolves to the physical interface. Through Link
-// the class therefore comes from measurement alone, in both processes alike.
+// original backend address resolves to the physical interface, and neither
+// process applies the ceiling. The two processes still do not agree through
+// Link: the serving process measures the link (the startup Link probe) and
+// the follower moves the demand-first and timeout settings, but the owner
+// mounts before that probe runs and its own dial is skipped for the
+// loopback address. So through Link the mount-only flags (--buffer-size,
+// --prefetch) come from no measurement: a Link mount made abroad keeps the
+// medium values for its life. That is a known follow-up (PR #90 review
+// MEDIUM-3), not something this rule fixes.
+//
+// A failed route lookup is handled the same way in both processes
+// (RouteCeiling): the ceiling of the last successful lookup stays, and
+// before any success the class is capped at slow. The serving process used
+// to take the NetWatcher's default-route guess instead, so the two could
+// disagree when DNS for a hostname target failed.
 
 // BackendRouteTunneled reports whether iface, the interface the kernel
 // routes the backend through, is a tunnel.
@@ -68,4 +82,39 @@ func ResolveBackendRoute(target string, resolver func(string) (string, error)) (
 		return "", errors.New("backend route interface unavailable")
 	}
 	return iface, nil
+}
+
+// RouteCeiling applies route lookup results to a profile with the shared
+// fallback for a failed lookup. One RouteCeiling goes with one profile;
+// DefaultRouteCeiling goes with netprofile.Default().
+type RouteCeiling struct {
+	mu       sync.Mutex
+	decided  bool // a lookup has succeeded
+	tunneled bool // the last successful lookup's answer
+}
+
+var defaultRouteCeiling RouteCeiling
+
+// DefaultRouteCeiling is the RouteCeiling of netprofile.Default(), used by
+// both the serving process and the mount.
+func DefaultRouteCeiling() *RouteCeiling { return &defaultRouteCeiling }
+
+// Apply applies one lookup result to p and returns whether the ceiling is
+// set afterwards and whether it came from this lookup. A successful lookup
+// (err nil, iface not empty) sets or lifts the cap by the interface. A
+// failed one keeps the last successful lookup's ceiling, or caps at slow
+// when no lookup has succeeded yet.
+func (c *RouteCeiling) Apply(p *netprofile.Profile, iface string, err error) (tunneled, looked bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err == nil && strings.TrimSpace(iface) != "" {
+		c.tunneled, c.decided = ApplyBackendRouteCeiling(p, iface), true
+		return c.tunneled, true
+	}
+	if c.decided {
+		return c.tunneled, false
+	}
+	ceiling := netprofile.ClassSlow
+	p.CeilingClass(&ceiling)
+	return true, false
 }

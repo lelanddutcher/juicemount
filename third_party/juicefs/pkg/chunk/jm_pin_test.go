@@ -779,3 +779,46 @@ func TestJMPinOneWorkerLimitsAllFills(t *testing.T) {
 		t.Fatalf("a four-worker fill downloaded %d at a time", p)
 	}
 }
+
+// PR #90 review MEDIUM-2: with demand-first on, only a one-worker fill (the
+// app's slow or metered link) waits for demand reads of other blocks. A
+// four-worker fill (lan, fast) does not wait while unpinned playback runs.
+func TestJMPinWaitsForDemandReadsOnlyWithOneWorker(t *testing.T) {
+	mem, _ := object.CreateStorage("mem", "", "", "", "")
+	wide := writeBlocks(t, mem, 491, 2)
+	narrow := writeBlocks(t, mem, 492, 2)
+	conf := pinConf(t, 64)
+	conf.DemandFirst = true
+	store := NewCachedStore(mem, conf, nil).(*cachedStore)
+	defer jmPinDownloads.setLimit(jmPinMaxDownloads)
+	store.demand.deferMax = time.Hour
+	end := store.demand.beginDemand("a block an editor plays")
+	defer end()
+
+	done := make(chan error, 1)
+	go func() { done <- store.JMPinFill(context.Background(), 1, whole(491, wide), JMPinAttr{}, 4, nil) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("a four-worker fill waited for a demand read of another block")
+	}
+
+	go func() { done <- store.JMPinFill(context.Background(), 2, whole(492, narrow), JMPinAttr{}, 1, nil) }()
+	select {
+	case <-done:
+		t.Fatal("a one-worker fill did not wait for the demand read")
+	case <-time.After(300 * time.Millisecond):
+	}
+	end()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the one-worker fill did not resume after the demand read ended")
+	}
+}

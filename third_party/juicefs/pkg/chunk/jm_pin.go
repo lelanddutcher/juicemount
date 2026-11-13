@@ -745,7 +745,11 @@ func (store *cachedStore) jmPinKeys(slices []JMPinSlice) []string {
 // pinned before) and downloads, whole, each block that is not on disk.
 // workers bounds this fill's parallel downloads (1..4; 0 means 4); 1 also
 // limits every fill of the process to one download at a time, until a fill
-// asks for more.
+// asks for more. Only a one-worker fill waits for --demand-first's demand
+// reads of other blocks: the app asks for one worker on a slow or metered
+// read policy, where a pin download competes with the editor's reads. On a
+// lan or fast link (four workers) demand-first is on too, and waiting there
+// held each pin block up to deferMax while unpinned playback ran.
 func (store *cachedStore) JMPinFill(ctx context.Context, owner uint64, slices []JMPinSlice, attr JMPinAttr, workers int, prog *JMPinProgress) error {
 	m, err := store.jmPinManager()
 	if err != nil {
@@ -762,6 +766,7 @@ func (store *cachedStore) JMPinFill(ctx context.Context, owner uint64, slices []
 	} else {
 		jmPinDownloads.setLimit(jmPinMaxDownloads)
 	}
+	waitDemand := workers == 1
 	keys := store.jmPinKeys(slices)
 	ids := make([]string, len(keys))
 	limits := map[string]jmLimit{}
@@ -786,7 +791,7 @@ func (store *cachedStore) JMPinFill(ctx context.Context, owner uint64, slices []
 		go func() {
 			defer wg.Done()
 			for k := range todo {
-				if e := store.jmPinBlock(fctx, m, k, prog); e != nil {
+				if e := store.jmPinBlock(fctx, m, k, waitDemand, prog); e != nil {
 					errOnce.Do(func() { firstErr = e; cancel() })
 				}
 			}
@@ -806,7 +811,7 @@ func (store *cachedStore) JMPinFill(ctx context.Context, owner uint64, slices []
 	return firstErr
 }
 
-func (store *cachedStore) jmPinBlock(ctx context.Context, m *cacheManager, key string, prog *JMPinProgress) error {
+func (store *cachedStore) jmPinBlock(ctx context.Context, m *cacheManager, key string, waitDemand bool, prog *JMPinProgress) error {
 	size := parseObjOrigSize(key)
 	if m.jmOnDisk(key) {
 		prog.Done.Add(int64(size))
@@ -831,7 +836,7 @@ func (store *cachedStore) jmPinBlock(ctx context.Context, m *cacheManager, key s
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		done, e := store.jmPinAttempt(ctx, m, key, size, prog)
+		done, e := store.jmPinAttempt(ctx, m, key, size, waitDemand, prog)
 		if done { // success, or no room (the disk does not free itself)
 			return e
 		}
@@ -843,14 +848,17 @@ func (store *cachedStore) jmPinBlock(ctx context.Context, m *cacheManager, key s
 
 // jmPinAttempt makes one attempt at a block. done is true when the attempt
 // ended the block (its error, if any, is final).
-func (store *cachedStore) jmPinAttempt(ctx context.Context, m *cacheManager, key string, size int, prog *JMPinProgress) (done bool, err error) {
+func (store *cachedStore) jmPinAttempt(ctx context.Context, m *cacheManager, key string, size int, waitDemand bool, prog *JMPinProgress) (done bool, err error) {
 	release, err := m.jmRoomFor(key, size)
 	if err != nil {
 		return true, err
 	}
 	defer release()
-	// --demand-first: reads an editor waits for go first (patch 0020).
-	store.demand.waitIdleCtx(ctx, key)
+	// --demand-first: reads an editor waits for go first (patch 0020), on a
+	// slow or metered link only (waitDemand; see JMPinFill).
+	if waitDemand {
+		store.demand.waitIdleCtx(ctx, key)
+	}
 	if err := ctx.Err(); err != nil {
 		return true, err
 	}

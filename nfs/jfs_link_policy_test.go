@@ -25,10 +25,15 @@ var (
 )
 
 func TestJFSLinkPolicyForClasses(t *testing.T) {
-	// Lan: the upstream object deadlines, and demand-first (on for every
-	// class since the lan measurements of 2026-11-13).
-	if want := (jfsLinkPolicy{DemandFirst: true, GetTimeout: time.Minute, PutTimeout: time.Minute, IORetries: 10}); lanPolicy != want {
-		t.Fatalf("lan policy %+v, want %+v", lanPolicy, want)
+	// Fast: the upstream defaults, demand-first off until a wired
+	// multi-gigabit Mac is measured (PR #90 review MEDIUM-1).
+	if lanPolicy != jfsLinkUpstream {
+		t.Fatalf("fast policy %+v, want the upstream defaults", lanPolicy)
+	}
+	// Medium: the upstream deadlines with demand-first (measured on lan
+	// 2026-11-13).
+	if p, want := jfsLinkPolicyFor(netprofile.ClassMedium, netprofile.ClassMedium), (jfsLinkPolicy{DemandFirst: true, GetTimeout: time.Minute, PutTimeout: time.Minute, IORetries: 10}); p != want {
+		t.Fatalf("medium policy %+v, want %+v", p, want)
 	}
 	want := jfsLinkPolicy{DemandFirst: true, GetTimeout: 3 * time.Minute, PutTimeout: 5 * time.Minute, IORetries: 2}
 	if abroadPolicy != want {
@@ -169,7 +174,7 @@ func newTestFollower(j *fakeJFS, class *[2]netprofile.LinkClass) *linkFollower {
 
 // A lan mount moves abroad and back, with no remount.
 func TestLinkFollowerSwitchesBothWays(t *testing.T) {
-	j := &fakeJFS{cur: lanPolicy} // mounted on lan: upstream deadlines
+	j := &fakeJFS{cur: lanPolicy} // mounted on a fast link: no --demand-first
 	class := [2]netprofile.LinkClass{netprofile.ClassFast, netprofile.ClassFast}
 	f := newTestFollower(j, &class)
 	t0 := time.Unix(1000, 0)

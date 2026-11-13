@@ -129,23 +129,28 @@ func TestDesktopJuiceFSObjectTimeoutsKeepCellularBlocksViableAndBounded(t *testi
 	}
 }
 
-// Demand-first is on for every class (lan measurements 2026-11-13); the
-// rollback turns it off for every class.
-func TestDesktopJuiceFSDemandFirstOnEveryClass(t *testing.T) {
+// Demand-first is on for every class but fast (lan measurements
+// 2026-11-13; fast is not measured yet); the rollback turns it off for
+// every class.
+func TestDesktopJuiceFSDemandFirstOnEveryClassButFast(t *testing.T) {
 	t.Setenv("JM_JFS_DEMAND_FIRST", "")
-	if got := desktopJuiceFSDemandFirstArgs(); !slices.Equal(got, []string{"--demand-first"}) {
-		t.Fatalf("demand-first args = %v, want --demand-first", got)
-	}
 	for _, c := range []netprofile.LinkClass{netprofile.ClassMetered, netprofile.ClassSlow, netprofile.ClassMedium, netprofile.ClassFast} {
+		want := []string{"--demand-first"}
+		if c == netprofile.ClassFast {
+			want = nil
+		}
+		if got := desktopJuiceFSDemandFirstArgs(c); !slices.Equal(got, want) {
+			t.Fatalf("class %s: demand-first args = %v, want %v", c, got, want)
+		}
 		p := netprofile.New()
 		f := c
 		p.ForceClass(&f)
-		if !slices.Contains(desktopJuiceFSLinkArgs(p), "--demand-first") {
-			t.Fatalf("class %s: link args %v lack --demand-first", c, desktopJuiceFSLinkArgs(p))
+		if got := slices.Contains(desktopJuiceFSLinkArgs(p), "--demand-first"); got != (want != nil) {
+			t.Fatalf("class %s: link args %v", c, desktopJuiceFSLinkArgs(p))
 		}
 	}
 	t.Setenv("JM_JFS_DEMAND_FIRST", "0")
-	if got := desktopJuiceFSDemandFirstArgs(); got != nil {
+	if got := desktopJuiceFSDemandFirstArgs(netprofile.ClassSlow); got != nil {
 		t.Fatalf("demand-first rollback args = %v, want nil", got)
 	}
 }

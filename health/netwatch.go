@@ -54,6 +54,12 @@ type NetWatcher struct {
 	routeIface     string
 	routeCheckedAt time.Time
 	routeFailing   bool // last resolve failed (for transition-only logging)
+	// Route-result callbacks (OnBackendRoute): told only when the lookup
+	// result changes (another interface, or success <-> failure).
+	routeCallbacks []func(iface string, err error)
+	routeNotified  bool
+	notifiedIface  string
+	notifiedFail   bool
 
 	stopCh   chan struct{}
 	stopOnce sync.Once
@@ -114,6 +120,34 @@ func (w *NetWatcher) OnChange(cb NetChangeCallback) {
 }
 
 // Start begins polling for network changes in a background goroutine.
+// OnBackendRoute registers cb for the backend-route lookup itself, with no
+// default-route fallback: cb gets the interface, or the error of a failed
+// lookup. It is called when the result changes, including at Start.
+// Register before Start. Only backend-route mode (WithBackendTarget) calls
+// it. The tunnel ceiling uses this, so a failed lookup takes the shared
+// fallback (RouteCeiling) and not the default-route guess.
+func (w *NetWatcher) OnBackendRoute(cb func(iface string, err error)) {
+	w.routeCallbacks = append(w.routeCallbacks, cb)
+}
+
+// noteRouteResult calls the route callbacks when the result changed.
+func (w *NetWatcher) noteRouteResult(iface string, err error) {
+	w.mu.Lock()
+	failing := err != nil
+	changed := !w.routeNotified || failing != w.notifiedFail || (!failing && iface != w.notifiedIface)
+	if changed {
+		w.routeNotified, w.notifiedFail, w.notifiedIface = true, failing, iface
+	}
+	cbs := w.routeCallbacks
+	w.mu.Unlock()
+	if !changed {
+		return
+	}
+	for _, cb := range cbs {
+		cb(iface, err)
+	}
+}
+
 func (w *NetWatcher) Start() {
 	// Capture initial state
 	iface := w.detect()
@@ -224,7 +258,11 @@ func (w *NetWatcher) detect() string {
 	}
 
 	iface, err := w.routeResolver(w.targetAddr)
-	if err != nil || iface == "" {
+	if err == nil && iface == "" {
+		err = fmt.Errorf("backend route interface unavailable")
+	}
+	w.noteRouteResult(iface, err)
+	if err != nil {
 		w.mu.Lock()
 		w.routeIface = ""
 		w.routeCheckedAt = now
