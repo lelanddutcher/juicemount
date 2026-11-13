@@ -435,6 +435,8 @@ func reserveFUSEGeneration(logical string, digest string, observe func(context.C
 	}
 	var highest uint64
 	states := map[string]string{}
+	boots := map[string]string{} // last boot recorded for each generation
+	paths := map[string]string{} // reserved mount path of each generation
 	for _, e := range events[1:] {
 		if !strings.HasPrefix(e.ID, nonce+"-") || len(e.ID) != len(nonce)+17 {
 			return nil, errors.New("generation ledger ID mismatch")
@@ -457,6 +459,12 @@ func reserveFUSEGeneration(logical string, digest string, observe func(context.C
 			highest = n
 		}
 		states[e.ID] = e.State
+		if e.BootID != "" {
+			boots[e.ID] = e.BootID
+		}
+		if e.Path != "" && paths[e.ID] == "" {
+			paths[e.ID] = e.Path
+		}
 	}
 	entries, err := generationNames(r.root)
 	if err != nil {
@@ -503,12 +511,37 @@ func reserveFUSEGeneration(logical string, digest string, observe func(context.C
 			return nil, errors.New("generation tombstone directory missing")
 		}
 		if state != "retired" {
+			// A generation is only a mount-point namespace; it holds no data.
+			// Unsynced writes stay in the engine's spool until their upload is
+			// confirmed, and JuiceFS write-back staging (off by default) lives in
+			// the shared cache dir, which the next JuiceFS mount re-uploads.
+			// The snapshot above already proved nothing is mounted anywhere
+			// under rootPath. What is left to fear is a live JuiceFS child that
+			// could still mount here. Two cases provably have none:
+			//   - the generation belongs to an earlier boot: no process or
+			//     mount survives a reboot (power loss, crash, restart);
+			//   - it never reached "launching", which is written before the
+			//     child is started, so no child was ever spawned.
+			// Retire those here. Before, either one refused every new child
+			// until someone ran the explicit recovery tool.
+			if (state == "ready" || state != "intent" && boots[id] != "" && boots[id] != r.bootID) && paths[id] != "" {
+				attempted, attemptErr := retainedRecoveryAttemptPresent(install, id)
+				if attemptErr != nil || attempted {
+					// An explicit recovery started on it; its tool finishes it.
+					return nil, errors.New("prior generation explicit recovery unresolved; new child refused: finish it with --recover-retained-generation")
+				}
+				if err := r.retireAbandoned(id, paths[id], boots[id]); err != nil {
+					return nil, err
+				}
+				states[id] = "retired"
+				continue
+			}
 			// H-3 L5: a prior owner died holding this generation. Its helper
 			// receipt is the only identity-bound way to finish it; without a
 			// RETIRED proof the new child stays refused, as before.
 			og, ok := readObservedSidecar(install, nonce, id)
 			if !ok || og.boot != r.bootID {
-				return nil, errors.New("prior generation unresolved; new child refused")
+				return nil, errPriorGenerationUnresolved
 			}
 			// An explicit recovery's fsynced attempt can have an unknown
 			// helper result. Ordinary reservation must not replay it.
@@ -517,7 +550,7 @@ func reserveFUSEGeneration(logical string, digest string, observe func(context.C
 				return nil, errors.New("prior generation explicit recovery unresolved; new child refused")
 			}
 			if err := r.resolvePriorWithHelper(id, og, nonce, observe); err != nil {
-				return nil, fmt.Errorf("prior generation unresolved; new child refused: %w", err)
+				return nil, fmt.Errorf("%w: %w", errPriorGenerationUnresolved, err)
 			}
 			states[id] = "retired"
 		}
@@ -799,6 +832,28 @@ func (r *GenerationReservation) retire() error {
 	}
 	r.retired = true
 	r.close()
+	return nil
+}
+
+// errPriorGenerationUnresolved names the one remaining same-boot hold: a JuiceFS
+// child of an owner that died in this boot may still be running. A restart
+// ends it; the next Start then retires the generation by itself.
+var errPriorGenerationUnresolved = errors.New("prior generation unresolved; new child refused: a JuiceFS process from an earlier JuiceMount run in this session may still be running. Quit JuiceMount and restart the Mac, then start JuiceMount again")
+
+// retireAbandoned tombstones one generation that provably has no process and
+// no mount (see reserveFUSEGeneration). The caller holds the ledger lock.
+func (r *GenerationReservation) retireAbandoned(id, path, boot string) error {
+	if boot == "" {
+		boot = r.bootID
+	}
+	saved := r.ID
+	r.ID = id
+	err := r.append(generationEvent{State: "retired", Path: path, BootID: boot})
+	r.ID = saved
+	if err != nil {
+		return err
+	}
+	log.Printf("[fuse] generation %s retired: no process or mount can remain (earlier boot or never launched)", id)
 	return nil
 }
 

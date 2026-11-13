@@ -11,15 +11,29 @@
   original intent retained, no replacement launch" until the record was
   deleted by hand. Now the next Start, online or offline, proves the old owner
   is gone (its lifetime lock is free and its socket does not answer) and
-  starts a new one. A changed setting no longer blocks it either. When the
-  old owner is still running, Start still refuses, and now says why. The
+  starts a new one. A changed setting no longer blocks it either. The
   automatic resume at service start does the same, and it accepts an NFS
   mount record from before a reboot when nothing is mounted at the path now
   (laptop lab 2026-11-12, scenario 5).
+- The new owner can also mount again after a reboot. Each JuiceFS mount gets
+  a reserved folder (a "generation"). One that was never retired used to
+  refuse every new mount ("prior generation unresolved"). A generation from
+  an earlier boot, or one whose JuiceFS process was never started, is now
+  retired by itself: no process or mount can remain, and it holds no data
+  (unsent writes stay in the upload queue; JuiceFS re-uploads its own staged
+  blocks at the next mount).
+- Two holds remain, and each says what to do. If the old owner is still
+  running, or a recovery step is using its lock, Start says to try again in a
+  minute and to restart the Mac if it persists. If the owner died in this
+  session after starting JuiceFS, that JuiceFS process may still be running;
+  Start says to quit JuiceMount and restart the Mac. After the restart, Start
+  recovers by itself.
 - While started offline, cache status no longer reports the whole free disk
   (407 GB in the lab) as the cache size with a budget of 0. With no mounted
   cache, `capacity.cache_capacity_bytes` is 0 ("unknown") and the pinned set is
-  not reported over capacity. The real figures return when the volume mounts.
+  not reported over capacity; the menu bar hides its cache bar. The real
+  figures return when the volume mounts. A short pin-store error under a
+  mounted cache keeps the last verdict instead of clearing it.
 - "Pin before travel" is now reliable while the server is reachable. An
   editor pins a project at home; abroad, over Link, it plays and scrubs from
   local disk, also after the app restarts. Three problems are fixed (laptop

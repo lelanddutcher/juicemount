@@ -78,10 +78,17 @@ func TestGenerationReopenRefusesUnresolvedIntentAndTornLedger(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	a.close() // model process death after durable reservation
-	if _, err := reserveFUSEGeneration(logical, "digest", emptyGenerationSnapshot); err == nil || !strings.Contains(err.Error(), "unresolved") {
-		t.Fatalf("unresolved allocation admitted another child: %v", err)
+	a.close() // model process death after durable reservation, before launch
+	// "ready" is written before any child exists and "launching" before the
+	// child starts, so a never-launched generation is retired, not held.
+	b, err := reserveFUSEGeneration(logical, "digest", emptyGenerationSnapshot)
+	if err != nil {
+		t.Fatalf("never-launched generation held the next child: %v", err)
 	}
+	if b.ID == a.ID || b.Path == a.Path {
+		t.Fatal("never-launched generation was reused")
+	}
+	b.close() // the same death again leaves one more ready-only generation
 	ledger := filepath.Join(logical+".generations", "ledger.jsonl")
 	f, err := os.OpenFile(ledger, os.O_WRONLY|os.O_APPEND, 0)
 	if err != nil {
@@ -333,5 +340,75 @@ func TestGenerationJournalFailureAfterStartRetainsExitError(t *testing.T) {
 	}
 	if fm.activeReceipt != receipt || receipt.exitErr == nil || <-processExit == nil {
 		t.Fatal("journal failure discarded exact receipt or exit error")
+	}
+}
+
+func generationBootSnapshot(boot string) func(context.Context) (mounttable.Snapshot, error) {
+	return func(context.Context) (mounttable.Snapshot, error) {
+		return mounttable.Snapshot{Version: 1, BootID: boot, Entries: []mounttable.MountEntry{}}, nil
+	}
+}
+
+// Power loss or a reboot while mounted: the generation reached born (the
+// JuiceFS child started) and nothing retired it. After the reboot no process
+// or mount can remain, so the next reservation retires it by itself. Before,
+// it refused every new child ("prior generation unresolved").
+func TestGenerationFromEarlierBootIsRetiredOnNextReservation(t *testing.T) {
+	logical := generationTestPath(t)
+	a, err := reserveFUSEGeneration(logical, "digest", generationBootSnapshot("boot-before-power-loss"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.markLaunching(); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.markChild(4242); err != nil {
+		t.Fatal(err)
+	}
+	a.close() // power loss: no retirement, no observed sidecar
+
+	// Same boot: the child may still be alive, so the hold stays, and says why.
+	_, err = reserveFUSEGeneration(logical, "digest", generationBootSnapshot("boot-before-power-loss"))
+	if err == nil || !strings.Contains(err.Error(), "unresolved") || !strings.Contains(err.Error(), "restart the Mac") {
+		t.Fatalf("same-boot launched generation not held clearly: %v", err)
+	}
+
+	// After the reboot it is retired and a new generation is reserved.
+	b, err := reserveFUSEGeneration(logical, "digest", generationBootSnapshot("boot-after-power-loss"))
+	if err != nil {
+		t.Fatalf("earlier-boot generation held the next child: %v", err)
+	}
+	defer b.close()
+	if b.ID == a.ID || b.Path == a.Path {
+		t.Fatal("earlier-boot generation reused")
+	}
+	if err := b.retire(); err != nil {
+		t.Fatal(err)
+	}
+	// The ledger stays readable: a later reservation replays every event.
+	c, err := reserveFUSEGeneration(logical, "digest", generationBootSnapshot("boot-after-power-loss"))
+	if err != nil {
+		t.Fatalf("ledger with an automatic retirement unreadable: %v", err)
+	}
+	c.close()
+}
+
+// Something mounted under the namespace still refuses, whatever the boot.
+func TestGenerationFromEarlierBootStillRefusesOccupiedNamespace(t *testing.T) {
+	logical := generationTestPath(t)
+	a, err := reserveFUSEGeneration(logical, "digest", generationBootSnapshot("old-boot"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.markLaunching(); err != nil {
+		t.Fatal(err)
+	}
+	path := a.Path
+	a.close()
+	occupied := func(context.Context) (mounttable.Snapshot, error) {
+		return mounttable.Snapshot{Version: 1, BootID: "new-boot", Entries: []mounttable.MountEntry{{Path: path, Source: "JuiceFS:test", Type: "macfuse"}}}, nil
+	}
+	if _, err := reserveFUSEGeneration(logical, "digest", occupied); err == nil {
+		t.Fatal("occupied namespace admitted a new child")
 	}
 }

@@ -251,11 +251,13 @@ func ComputeCapacity(store *Store, cacheBaseDir string) CapacityVerdict {
 	}
 	v := CapacityVerdict{Computed: time.Now(), CacheBudgetBytes: selectedBudget, CacheFreeFloorBytes: selectedFloor, PolicyEpoch: selectedEpoch, PolicyKnown: selectedKnown && cacheBaseDir == selectedPath}
 
+	pinnedUnknown := false
 	if store != nil {
 		if agg, err := store.AggregateStats(); err == nil {
 			v.PinnedBytes = agg.TotalBytes
 		} else {
 			v.PolicyKnown = false // unknown total demand cannot admit downloads
+			pinnedUnknown = true
 		}
 	}
 	free, device, freeKnown := volumeFreeBytesAtKnown(cacheBaseDir)
@@ -274,14 +276,22 @@ func ComputeCapacity(store *Store, cacheBaseDir string) CapacityVerdict {
 
 	evaluateCapacity(&v)
 	if !v.PolicyKnown {
-		reportCapacityUnknown(&v)
+		if selectedKnown {
+			// A mount policy exists; this one pass could not confirm it (for
+			// example a brief pin-store error). Keep the last verdict for this
+			// policy rather than clearing it: a cleared OverCapacity would
+			// release the prefetcher's re-warm gate for one pass.
+			keepLastCapacity(&v, selectedEpoch, pinnedUnknown)
+		} else {
+			reportCapacityUnknown(&v)
+		}
 	}
 	cacheVolumeMu.RLock()
 	stillCurrent := cachePolicyEpoch == selectedEpoch
 	if !stillCurrent {
 		cacheVolumeMu.RUnlock()
 		v.PolicyKnown = false
-		reportCapacityUnknown(&v)
+		reportCapacityUnknown(&v) // returned only; never published
 		return v
 	}
 	setCapacityVerdict(v)
@@ -289,13 +299,31 @@ func ComputeCapacity(store *Store, cacheBaseDir string) CapacityVerdict {
 	return v
 }
 
-// reportCapacityUnknown clears the figures that need an admitted mount policy.
-// With no FUSE mount (for example a launch with the backend unreachable), the
+// reportCapacityUnknown clears the figures that need an admitted mount policy,
+// when no policy was ever set. With no FUSE mount (for example a launch with the backend unreachable), the
 // budget and floor are unknown. evaluateCapacity then falls back to free disk
 // space, which reported the whole disk (hundreds of GB) as the cache size and
 // a budget of 0. Zero is the documented "unknown" value: the UI hides the bar.
 // The raw inputs (disk_free_bytes, cache_usage_bytes, pinned_bytes) stay real.
 // Not over capacity: no verdict can be made, and admission already refuses.
+// keepLastCapacity carries the verdict fields of the last pass under the same
+// admitted policy. With no earlier pass for this policy, the fresh figures stand
+// (they already use the known budget and floor).
+func keepLastCapacity(v *CapacityVerdict, epoch uint64, pinnedUnknown bool) {
+	capacityMu.RLock()
+	last := capacityVerdict
+	capacityMu.RUnlock()
+	if last.Computed.IsZero() || last.PolicyEpoch != epoch {
+		return
+	}
+	v.OverCapacity = last.OverCapacity
+	v.ShortfallBytes = last.ShortfallBytes
+	v.CacheCapacityBytes = last.CacheCapacityBytes
+	if pinnedUnknown {
+		v.PinnedBytes = last.PinnedBytes
+	}
+}
+
 func reportCapacityUnknown(v *CapacityVerdict) {
 	v.CacheCapacityBytes = 0
 	v.ShortfallBytes = 0

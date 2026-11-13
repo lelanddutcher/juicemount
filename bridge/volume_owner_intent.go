@@ -454,10 +454,11 @@ func selectedOwnerCommand(scope appisolation.Scope, executable string, readPipe 
 	return cmd, logFile, nil
 }
 
-// errOwnerStillRunning is the one HOLD a replacement must keep: the original
-// owner process is alive. It holds the lifetime lock for its whole life, and it
-// may still hold the FUSE child, Link and proxy ports that serve the volume.
-var errOwnerStillRunning = errors.New("the original volume owner process is still running and holds the volume; JuiceMount will not start a second one. Quit JuiceMount and start it again, or restart the Mac if this persists")
+// errOwnerStillRunning is the HOLD a replacement must keep: someone holds the
+// lifetime lock. Usually the original owner is alive (it holds the lock for its
+// whole life, with the FUSE child, Link and proxy ports). A short holder such
+// as --recover-retained-generation or a retirement check also takes it.
+var errOwnerStillRunning = errors.New("the volume owner's lifetime lock is held: the original owner process is still running, or a recovery step is using it now; JuiceMount will not start a second owner. Try Start again in a minute; if this persists, quit JuiceMount and restart the Mac")
 
 // ownerSocketAnswers reports whether the exact original answers its control
 // socket. Only a live owner past lifetime admission listens there.
