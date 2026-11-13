@@ -104,3 +104,44 @@
  	case meta.JMReleaseInodes:
  		// JuiceMount patch 0022. Reply: errno (1 byte), released count (4).
  		first := Ino(r.Get64())
+--- a/pkg/vfs/reader.go
++++ b/pkg/vfs/reader.go
+@@ -181,7 +181,7 @@
+ 	} else if err != 0 {
+ 		f.tried++
+ 		trycnt := f.tried
+-		if trycnt > f.r.maxRetries {
++		if trycnt > jmLiveRetries(f.r.store, f.r.maxRetries) { // JuiceMount patch 0027
+ 			s.done(syscall.EIO, 0)
+ 		} else {
+ 			s.done(0, retry_time(trycnt))
+@@ -220,7 +220,7 @@
+ 		err = syscall.EIO
+ 		f.tried++
+ 		_ = f.r.m.InvalidateChunkCache(meta.Background(), inode, indx)
+-		if f.tried > f.r.maxRetries {
++		if f.tried > jmLiveRetries(f.r.store, f.r.maxRetries) { // JuiceMount patch 0027
+ 			s.done(err, 0)
+ 		} else {
+ 			s.done(0, retry_time(f.tried))
+--- a/pkg/vfs/writer.go
++++ b/pkg/vfs/writer.go
+@@ -372,7 +372,8 @@
+ 	f.flushwaiting++
+ 
+ 	var err syscall.Errno
+-	var wait = time.Second * time.Duration((f.w.maxRetries+2)*(f.w.maxRetries+2)/2)
++	retries := jmLiveRetries(f.w.store, f.w.maxRetries) // JuiceMount patch 0027
++	var wait = time.Second * time.Duration((retries+2)*(retries+2)/2)
+ 	if wait < time.Minute*5 {
+ 		wait = time.Minute * 5
+ 	}
+@@ -387,7 +388,7 @@
+ 				}
+ 			}
+ 		}
+-		if f.flushcond.WaitWithTimeout(time.Second*3) && ctx.Canceled() && time.Since(s) > f.w.conf.Chunk.PutTimeout*2 {
++		if f.flushcond.WaitWithTimeout(time.Second*3) && ctx.Canceled() && time.Since(s) > jmLivePutTimeout(f.w.store, f.w.conf.Chunk.PutTimeout)*2 { // JuiceMount patch 0027
+ 			logger.Warnf("flush %d interrupted after %d", f.inode, time.Since(s))
+ 			err = syscall.EINTR
+ 			break

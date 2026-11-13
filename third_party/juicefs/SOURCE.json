@@ -1075,7 +1075,7 @@
       "upstream_sha256": "72e176b7c4e2c3a3fcd93646998235a93197298d8f6ca12742eccac53bd869b8"
     },
     "pkg/vfs/reader.go": {
-      "sha256": "0daec90c25b4ce8872423bb4d5541cf752f45f5110381ab1c822116a2461a60d",
+      "sha256": "c14696bd5eaba23488de57736731a15cc45d24419b5b566fd3edeef572a59170",
       "upstream_sha256": "0daec90c25b4ce8872423bb4d5541cf752f45f5110381ab1c822116a2461a60d"
     },
     "pkg/vfs/vfs.go": {
@@ -1095,7 +1095,7 @@
       "upstream_sha256": "c777704bb39cab0a78aadfd533fe8a61334163f0f79d0db45d254ac5c2d64dab"
     },
     "pkg/vfs/writer.go": {
-      "sha256": "749cd1ba5414f5f0a11fbd211791f5bbbf952ee70f0d38ff7b71715e3a95bba2",
+      "sha256": "2d4a45b1a86bb2181cb60766e5543df582b14ef9818686a262ac0deef48d5bde",
       "upstream_sha256": "41f15d8615d20d4eab272509f982b423bf42db762d396768fc9e62183eb3d28b"
     },
     "pkg/winfsp/trace.go": {
@@ -1113,7 +1113,7 @@
     "pkg/chunk/demand_first_test.go": "7ed56d3b9ae0b73535c18b563a7206618c24b39f0ff699ab90e81833b316b0b4",
     "pkg/chunk/demand_spans.go": "a43f011b2b524e3f695a656bfe219e640b5e1bbce09dfe837b1d10f2f4143ece",
     "pkg/chunk/demand_spans_test.go": "38c1f6888822725892476a851e00d486f7cfe239f678e0b3e09e5d3a9b97ec4e",
-    "pkg/chunk/jm_link_policy.go": "cca8cec800be9e3cbab8ecfd21f48cb46d9d769eaa27251914790f42c641ca8b",
+    "pkg/chunk/jm_link_policy.go": "03029e4c7a113928d993d76268063390276858ba05f495367eb84c2227cd82b4",
     "pkg/chunk/jm_link_policy_test.go": "6c19d2915ac40b964380ec7849f6cf0bebfafba842a3d2cb8743337965691a3f",
     "pkg/chunk/jm_pin.go": "f26b5b17ad8d4061e4b02fc145a2de8b0fd67a740f249388443c9e22f43bc989",
     "pkg/chunk/jm_pin_test.go": "22014fd166c1bad227598ecf73fc61c3d3636b19e9c4d23d32dc95395779db65",
@@ -1161,8 +1161,8 @@
     "pkg/sync/jm_fence_test.go": "8b6808af1d3b5ea7623b9a13c19f31c1d133edfa1cb940fb54cc1b13dab4fcf1",
     "pkg/vfs/jm_create_files.go": "574ace818067f4ed273d2d978eb4619d7d574ba9888519fd9bb5bd16982656d2",
     "pkg/vfs/jm_create_files_test.go": "ad0fd6a4a49b514d7edeaa83f6c2076ece903ca763f3c860e014c201e9379ec0",
-    "pkg/vfs/jm_link_policy.go": "b1f101ea71b420f0fe3553cd6fa9244c5c05a4842c13383c75352e4f952d201c",
-    "pkg/vfs/jm_link_policy_test.go": "53fc20a37c4bcbe63737e9853287acc1647056708b077943d783d2da23219c6f",
+    "pkg/vfs/jm_link_policy.go": "99e7a16e7dd86292cfce58886e7cfcba1a2ea364fca3eb15a5e73a54f9b3fc03",
+    "pkg/vfs/jm_link_policy_test.go": "e4679b72c143a5962c51c9f4e55e1965186a73aec7c7f98501bbdf1afa0d181b",
     "pkg/vfs/jm_pin.go": "2f229860b5593348913bcbb5903d17d759f9826f5da8517ef6c01a66f783c39c",
     "pkg/vfs/jm_pin_test.go": "cf3bf39834e7b130c755cdeb5aa0712f8eebe947a73e3aacf762904f93277f2b",
     "pkg/vfs/jm_upload_lane.go": "c35d3cda2fa958933f21e1e39a2f48ce4605ccb2e6d2e6e53fe6ceaecbf670b1",
@@ -1197,7 +1197,7 @@
     "patches/0024-small-upload-lane.patch": "83043ad356c5f47591e22ccd8070d0ceeb0bc79845a9d98f747ae5937d6de8d6",
     "patches/0025-create-files-message.patch": "cf8bcd77dd4cac9271c0eb79a1f578544f9490d1801e67c54949ad2c4513c672",
     "patches/0026-pinned-blocks.patch": "94be902b048f05d72ec6b2dce0af22ea44917c21c0ebb64d105714b3c28bdc08",
-    "patches/0027-live-link-policy.patch": "92767f3a7d531d746fc2ba7d8219d37e3ef39693cbafadd1f6d65d5079898bfc"
+    "patches/0027-live-link-policy.patch": "a426454b44ec0e455f03c8f0d5fe3b4c9b8fa8ecba04ed7f74a9e96446728fd0"
   },
   "scope": "All pkg/ and cmd/ files plus main.go, LICENSE, go.mod and go.sum from the verified module ZIP. Documentation, integration tests and SDK examples are not included. local_files are JuiceMount-owned source with no upstream counterpart.",
   "upstream_url": "https://github.com/juicedata/juicefs/tree/v1.3.1",

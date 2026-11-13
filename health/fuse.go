@@ -159,6 +159,15 @@ func desktopJuiceFSObjectIOArgs(class netprofile.LinkClass) []string {
 	}
 }
 
+// desktopJuiceFSLinkArgs is the part of the mount flags that the NFS
+// server's link follower later changes in the running juicefs
+// (nfs/jfs_link_policy.go): the object deadlines by ReadPolicyClass, and
+// --demand-first by Class. TestJuiceFSLivePolicyMatchesMountArgs checks the
+// follower against this function on real profiles.
+func desktopJuiceFSLinkArgs(p *netprofile.Profile) []string {
+	return append(desktopJuiceFSObjectIOArgs(p.ReadPolicyClass()), desktopJuiceFSDemandFirstArgs(p.Class())...)
+}
+
 // desktopJuiceFSSmallUploadArgs gives small saves upload slots of their own
 // in the bundled JuiceFS (patch 0024). --max-uploads 4 caps the 4 MiB block
 // PUTs, and upstream queues every PUT behind them in one line: on a far, thin
@@ -1195,8 +1204,7 @@ func (fm *FUSEManager) MountWithReceipt() (*MountReceipt, error) {
 	// timeout/retry loop.
 	// ReadPolicyClass, like jfp: a far, thin link (slow class by the slow-RTT
 	// floor) keeps the metered object deadlines a thin uplink needs.
-	args = append(args, desktopJuiceFSObjectIOArgs(netprofile.Default().ReadPolicyClass())...)
-	args = append(args, desktopJuiceFSDemandFirstArgs(netprofile.Default().Class())...)
+	args = append(args, desktopJuiceFSLinkArgs(netprofile.Default())...)
 	// A JuiceFS session expires at five heartbeat intervals. The upstream
 	// 12s default therefore lets another always-on client reap this Mac
 	// after only 60s. A cold or cellular S3 PUT can legitimately consume

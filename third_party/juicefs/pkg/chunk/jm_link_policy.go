@@ -47,6 +47,7 @@ type jmLinkPolicy struct {
 	getNS   atomic.Int64
 	putNS   atomic.Int64
 	retries atomic.Int32
+	set     atomic.Bool // a JMLinkPolicy message has set the values
 }
 
 func (l *jmLinkPolicy) init(c Config) {
@@ -99,6 +100,7 @@ func (store *cachedStore) JMSetLinkPolicy(p JMLinkPolicy) (JMLinkPolicy, bool) {
 	store.link.getNS.Store(int64(p.GetTimeout))
 	store.link.putNS.Store(int64(p.PutTimeout))
 	store.link.retries.Store(int32(p.MaxRetries))
+	store.link.set.Store(true)
 	if store.demand != nil {
 		store.demand.on.Store(p.DemandFirst)
 	}
@@ -108,4 +110,13 @@ func (store *cachedStore) JMSetLinkPolicy(p JMLinkPolicy) (JMLinkPolicy, bool) {
 			old.DemandFirst, now.DemandFirst, old.GetTimeout, now.GetTimeout, old.PutTimeout, now.PutTimeout, old.MaxRetries, now.MaxRetries)
 	}
 	return now, true
+}
+
+// JMLinkOverride reports the policy in force and whether a JMLinkPolicy
+// message set it. The vfs reader and writer take their retry budget and
+// flush interrupt from it once it is set (pkg/vfs/jm_link_policy.go); until
+// then they keep their mount values (meta --io-retries, which differs from
+// the store's default of 10 when the flag is 0).
+func (store *cachedStore) JMLinkOverride() (JMLinkPolicy, bool) {
+	return store.JMLinkPolicy(), store.link.set.Load()
 }

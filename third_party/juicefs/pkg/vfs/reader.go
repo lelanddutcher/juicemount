@@ -181,7 +181,7 @@ func (s *sliceReader) run() {
 	} else if err != 0 {
 		f.tried++
 		trycnt := f.tried
-		if trycnt > f.r.maxRetries {
+		if trycnt > jmLiveRetries(f.r.store, f.r.maxRetries) { // JuiceMount patch 0027
 			s.done(syscall.EIO, 0)
 		} else {
 			s.done(0, retry_time(trycnt))
@@ -220,7 +220,7 @@ func (s *sliceReader) run() {
 		err = syscall.EIO
 		f.tried++
 		_ = f.r.m.InvalidateChunkCache(meta.Background(), inode, indx)
-		if f.tried > f.r.maxRetries {
+		if f.tried > jmLiveRetries(f.r.store, f.r.maxRetries) { // JuiceMount patch 0027
 			s.done(err, 0)
 		} else {
 			s.done(0, retry_time(f.tried))

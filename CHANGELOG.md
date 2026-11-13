@@ -16,7 +16,12 @@
   (patch 0027, `-jm12`, control message 1106). Open files and editors notice
   nothing. A move to the slow settings waits until the slow class has held
   for 10 s, a move back for 60 s, so a flapping link does not switch back and
-  forth. `JM_JFS_LIVE_POLICY=0` keeps the mount-time settings, as before.
+  forth. Demand-first and the timeouts hold separately, so a far link whose
+  bandwidth hovers near 3 MiB/s (slow and metered timeouts alternating) still
+  gets demand-first after 10 s. The read retry budget and the flush deadline
+  follow the live retries too, so a failing read abroad still ends with an
+  error after about as long as on a mount made abroad. An older JuiceFS is
+  asked once. `JM_JFS_LIVE_POLICY=0` keeps the mount-time settings, as before.
   Remote lab (Linux, 200 ms, 1% loss, server BBR, mounted on lan): scrub
   p50 2.6–2.7 s before the switch, 1.34 s after it, 1.24–1.26 s on a fresh
   mount on that link.

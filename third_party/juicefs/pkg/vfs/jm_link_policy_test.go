@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/juicedata/juicefs/pkg/meta"
 	"github.com/juicedata/juicefs/pkg/utils"
@@ -62,5 +63,33 @@ func TestJMLinkPolicyMessageRefusals(t *testing.T) {
 	}
 	if after := linkMsg(v, []byte{jmLinkPolicyVersion}); !bytes.Equal(after, before) {
 		t.Fatalf("a refused message changed the policy: % x -> % x", before, after)
+	}
+}
+
+// The vfs read retry budget and flush interrupt follow a set policy, and
+// keep the mount values until one is set.
+func TestJMLinkPolicyVFSRetriesFollow(t *testing.T) {
+	v := pinVFS(t)
+	if got := jmLiveRetries(v.Store, 10); got != 10 {
+		t.Fatalf("before any message: retries %d, want the mount's 10", got)
+	}
+	if got := jmLivePutTimeout(v.Store, 7*time.Second); got != 7*time.Second {
+		t.Fatalf("before any message: put timeout %s, want the mount's", got)
+	}
+	linkMsg(v, linkSet(jmLinkFlagDemandFirst, 120000, 180000, 3))
+	if got := jmLiveRetries(v.Store, 10); got != 3 {
+		t.Fatalf("after slow: retries %d, want 3", got)
+	}
+	if got := jmLivePutTimeout(v.Store, 7*time.Second); got != 3*time.Minute {
+		t.Fatalf("after slow: put timeout %s, want 3m", got)
+	}
+	linkMsg(v, linkSet(0, 60000, 60000, 10))
+	if got := jmLiveRetries(v.Store, 3); got != 10 {
+		t.Fatalf("after fast: retries %d, want 10", got)
+	}
+	// A refused message sets nothing new.
+	linkMsg(v, linkSet(0, 0, 60000, 3))
+	if got := jmLiveRetries(v.Store, 3); got != 10 {
+		t.Fatalf("after a refused message: retries %d", got)
 	}
 }

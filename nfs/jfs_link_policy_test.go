@@ -68,7 +68,12 @@ func TestJFSLinkPolicyExchange(t *testing.T) {
 	}
 	reply = []byte{byte(syscall.EINVAL)}
 	if _, err := c.linkPolicy(&abroadPolicy); !errors.Is(err, syscall.EINVAL) {
-		t.Fatalf("EINVAL: %v", err)
+		t.Fatalf("EINVAL to a set: %v", err)
+	}
+	// A juicefs without patch 0027 answers the unknown message with EINVAL
+	// (pkg/vfs/internal.go default); to the bare query that means unsupported.
+	if _, err := c.linkPolicy(nil); !errors.Is(err, errControlUnsupported) {
+		t.Fatalf("EINVAL to the query: %v, want unsupported", err)
 	}
 }
 
@@ -225,5 +230,59 @@ func TestLinkFollowerStopsOnOldJuiceFSAndRetriesErrors(t *testing.T) {
 	f.tick(time.Unix(1002, 0))
 	if f.unsupported || len(j.sets) != 1 || j.cur != abroadPolicy {
 		t.Fatalf("after a transient error: unsupported %v, sets %+v", f.unsupported, j.sets)
+	}
+}
+
+// An old juicefs answers EINVAL: the follower asks once and stops, instead of
+// one warning in its log every 2 s.
+func TestLinkFollowerStopsOnEINVALFromOldJuiceFS(t *testing.T) {
+	sent := 0
+	c := &jfsControl{testExchange: func(msg []byte, n int) ([]byte, error) {
+		sent++
+		return []byte{byte(syscall.EINVAL)}, nil
+	}}
+	class := [2]netprofile.LinkClass{netprofile.ClassSlow, netprofile.ClassMetered}
+	f := &linkFollower{exchange: c.linkPolicy, classes: func() (netprofile.LinkClass, netprofile.LinkClass) {
+		return class[0], class[1]
+	}}
+	t0 := time.Unix(1000, 0)
+	for i := 0; i < 600; i++ {
+		f.tick(t0.Add(time.Duration(i) * linkFollowTick))
+	}
+	if !f.unsupported || sent != 1 {
+		t.Fatalf("unsupported %v after %d messages, want true after 1", f.unsupported, sent)
+	}
+}
+
+// Review case HIGH-1: mounted on lan, then abroad at about 30 Mbit/s, where
+// ReadPolicyClass flips between slow and metered every 4 s (bandwidth around
+// 3 MiB/s, no hysteresis in netprofile). Both ask for demand-first; only the
+// deadlines differ. Demand-first must come on after linkSlowerHold, and the
+// deadlines must move to the slow side too, not wait for the flapping to end.
+func TestLinkHysteresisSlowMeteredFlapStillSwitches(t *testing.T) {
+	slow := jfsLinkPolicyFor(netprofile.ClassSlow, netprofile.ClassSlow)
+	metered := jfsLinkPolicyFor(netprofile.ClassSlow, netprofile.ClassMetered)
+	if !slow.DemandFirst || !metered.DemandFirst || slow.GetTimeout == metered.GetTimeout {
+		t.Fatalf("test premise: slow %+v, metered %+v", slow, metered)
+	}
+	var h linkHysteresis
+	t0 := time.Unix(1000, 0)
+	h.observe(t0, lanPolicy)
+	var got jfsLinkPolicy
+	for i := 1; i <= 15; i++ { // 30 s, one sample every 2 s, flipping every 4 s
+		want := slow
+		if (i/2)%2 == 1 {
+			want = metered
+		}
+		got = h.observe(t0.Add(time.Duration(i)*2*time.Second), want)
+		if s := float64(i * 2); s >= linkSlowerHold.Seconds()+2 && !got.DemandFirst {
+			t.Fatalf("t=%vs: demand-first still off while every request wants it", s)
+		}
+	}
+	if got.GetTimeout <= lanPolicy.GetTimeout {
+		t.Fatalf("deadlines stayed at lan values %+v", got)
+	}
+	if got != slow && got != metered {
+		t.Fatalf("policy %+v is neither request", got)
 	}
 }

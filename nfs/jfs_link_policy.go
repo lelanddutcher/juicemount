@@ -6,6 +6,7 @@ import (
 	"os"
 	"strconv"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/lelanddutcher/juicemount/internal/jmlog"
@@ -70,15 +71,6 @@ func jfsLinkPolicyFor(class, readClass netprofile.LinkClass) jfsLinkPolicy {
 	return p
 }
 
-// slowerThan reports whether p is the more cautious policy: demand-first
-// on, or the same demand-first with longer GET deadlines.
-func (p jfsLinkPolicy) slowerThan(q jfsLinkPolicy) bool {
-	if p.DemandFirst != q.DemandFirst {
-		return p.DemandFirst
-	}
-	return p.GetTimeout > q.GetTimeout
-}
-
 func encodeLinkPolicy(p jfsLinkPolicy) []byte {
 	var flags byte
 	if p.DemandFirst {
@@ -119,6 +111,12 @@ func (c *jfsControl) linkPolicy(set *jfsLinkPolicy) (jfsLinkPolicy, error) {
 	if len(reply) == 0 {
 		return jfsLinkPolicy{}, errors.New("juicefs link policy: empty reply")
 	}
+	if set == nil && syscall.Errno(reply[0]) == syscall.EINVAL {
+		// A juicefs without patch 0027 answers any unknown message with one
+		// EINVAL byte (pkg/vfs/internal.go default). A patched one never
+		// refuses the bare version-1 query.
+		return jfsLinkPolicy{}, errControlUnsupported
+	}
 	if err := controlErrno(reply[0]); err != nil {
 		return jfsLinkPolicy{}, err
 	}
@@ -140,36 +138,62 @@ const (
 	linkVerifyPeriod = time.Minute
 )
 
+// linkHysteresis runs one hold for demand-first and one for the object
+// deadlines. Abroad, ReadPolicyClass moves between slow and metered as the
+// measured bandwidth crosses 3 MiB/s (netprofile has no hysteresis on
+// bandwidth), so the requested deadlines can change every few seconds while
+// demand-first stays on: one hold over the whole policy restarted on each
+// change and kept a lan mount's whole-block reads abroad for minutes.
 type linkHysteresis struct {
-	stable    jfsLinkPolicy
-	have      bool
-	cand      jfsLinkPolicy
-	candSince time.Time
-	haveCand  bool
+	demand   linkHold[bool]
+	timeouts linkHold[jfsLinkTimeouts]
 }
 
-// observe folds in the policy the classes ask for now and returns the
-// policy to run.
-func (h *linkHysteresis) observe(now time.Time, want jfsLinkPolicy) jfsLinkPolicy {
+type jfsLinkTimeouts struct {
+	get, put time.Duration
+	retries  int
+}
+
+// linkHold is the hold of one part of the policy. Its timer runs while
+// requests differ from the stable value in one direction (all more
+// cautious, or all less); it restarts only when that direction changes.
+// When the hold ends the part takes the latest request.
+type linkHold[T comparable] struct {
+	stable T
+	have   bool
+	dir    int // 0 none, +1 more cautious, -1 less
+	since  time.Time
+}
+
+func (h *linkHold[T]) observe(now time.Time, want T, slower bool) T {
 	if !h.have {
 		h.stable, h.have = want, true
 		return want
 	}
 	if want == h.stable {
-		h.haveCand = false
+		h.dir = 0
 		return h.stable
 	}
-	if !h.haveCand || want != h.cand {
-		h.cand, h.candSince, h.haveCand = want, now, true
+	dir, hold := -1, linkFasterHold
+	if slower {
+		dir, hold = 1, linkSlowerHold
 	}
-	hold := linkFasterHold
-	if want.slowerThan(h.stable) {
-		hold = linkSlowerHold
+	if dir != h.dir {
+		h.dir, h.since = dir, now
 	}
-	if now.Sub(h.candSince) >= hold {
-		h.stable, h.haveCand = want, false
+	if now.Sub(h.since) >= hold {
+		h.stable, h.dir = want, 0
 	}
 	return h.stable
+}
+
+// observe folds in the policy the classes ask for now and returns the
+// policy to run.
+func (h *linkHysteresis) observe(now time.Time, want jfsLinkPolicy) jfsLinkPolicy {
+	d := h.demand.observe(now, want.DemandFirst, want.DemandFirst && !h.demand.stable)
+	wt := jfsLinkTimeouts{want.GetTimeout, want.PutTimeout, want.IORetries}
+	t := h.timeouts.observe(now, wt, wt.get > h.timeouts.stable.get)
+	return jfsLinkPolicy{DemandFirst: d, GetTimeout: t.get, PutTimeout: t.put, IORetries: t.retries}
 }
 
 // linkFollower keeps the juicefs policy equal to the hysteresis output.
@@ -189,8 +213,7 @@ func newLinkFollower(ctl *jfsControl) *linkFollower {
 	return &linkFollower{
 		exchange: ctl.linkPolicy,
 		classes: func() (netprofile.LinkClass, netprofile.LinkClass) {
-			p := netprofile.Default()
-			return p.Class(), p.ReadPolicyClass()
+			return jfsLinkClasses(netprofile.Default())
 		},
 	}
 }
@@ -279,11 +302,17 @@ func stopLinkFollower(fuseRoot string) {
 	}
 }
 
-// JFSLinkPolicyFlags is the live policy for these classes, as the juicefs
-// mount flags it stands for. health's tests check it against the flags a
-// mount on the same classes gets, so the two cannot drift apart.
-func JFSLinkPolicyFlags(class, readClass netprofile.LinkClass) []string {
-	p := jfsLinkPolicyFor(class, readClass)
+// jfsLinkClasses reads the two classes the policy depends on, as
+// health/fuse.go's desktopJuiceFSLinkArgs does at mount.
+func jfsLinkClasses(p *netprofile.Profile) (class, readClass netprofile.LinkClass) {
+	return p.Class(), p.ReadPolicyClass()
+}
+
+// JFSLinkPolicyFlags is the live policy for profile p, as the juicefs mount
+// flags it stands for. health's tests check it against the flags a mount on
+// the same profile gets, so the two cannot drift apart.
+func JFSLinkPolicyFlags(prof *netprofile.Profile) []string {
+	p := jfsLinkPolicyFor(jfsLinkClasses(prof))
 	var args []string
 	if p.GetTimeout != jfsLinkUpstream.GetTimeout || p.PutTimeout != jfsLinkUpstream.PutTimeout || p.IORetries != jfsLinkUpstream.IORetries {
 		args = append(args, "--get-timeout", p.GetTimeout.String(), "--put-timeout", p.PutTimeout.String(),

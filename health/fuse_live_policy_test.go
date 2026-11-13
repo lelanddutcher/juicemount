@@ -11,23 +11,51 @@ import (
 )
 
 // The policy the NFS server sends a running juicefs when the class changes
-// (nfs/jfs_link_policy.go, bundled juicefs patch 0027) equals the flags a
-// mount on the same classes gets, for every class pair and with the
-// rollback switches.
+// (nfs/jfs_link_policy.go, bundled juicefs patch 0027) equals the flags
+// desktopJuiceFSLinkArgs, the function Mount calls, gives a mount on the same
+// profile. The profiles include a far, thin link where Class (slow) and
+// ReadPolicyClass (metered) differ, so a helper fed the wrong class fails.
 func TestJuiceFSLivePolicyMatchesMountArgs(t *testing.T) {
-	classes := []netprofile.LinkClass{netprofile.ClassMetered, netprofile.ClassSlow, netprofile.ClassMedium, netprofile.ClassFast}
+	t.Setenv("JM_NET_CLASS", "")
+	profiles := map[string]func() *netprofile.Profile{
+		"no signal": netprofile.New,
+		"lan": func() *netprofile.Profile {
+			p := netprofile.New()
+			p.ObserveRTT(500 * time.Microsecond)
+			return p
+		},
+		"far, RTT only": func() *netprofile.Profile {
+			p := netprofile.New()
+			p.ObserveRTT(200 * time.Millisecond)
+			return p
+		},
+		"far and thin": func() *netprofile.Profile {
+			p := netprofile.New()
+			p.ObserveRTT(200 * time.Millisecond)
+			for i := 0; i < 4; i++ {
+				p.ObserveThroughput(1<<20, time.Second) // 1 MiB/s
+			}
+			return p
+		},
+	}
+	sawSplit := false
 	for _, env := range [][2]string{{"", ""}, {"0", ""}, {"", "0"}} {
 		t.Setenv("JM_JFS_DEMAND_FIRST", env[0])
 		t.Setenv("JM_JFS_OBJECT_TIMEOUTS", env[1])
-		for _, class := range classes {
-			for _, readClass := range classes {
-				mount := append(desktopJuiceFSObjectIOArgs(readClass), desktopJuiceFSDemandFirstArgs(class)...)
-				live := nfs.JFSLinkPolicyFlags(class, readClass)
-				if !reflect.DeepEqual(normDurations(t, mount), normDurations(t, live)) {
-					t.Errorf("env %v class %s read %s: mount %v, live %v", env, class, readClass, mount, live)
-				}
+		for name, mk := range profiles {
+			p := mk()
+			if p.Class() != p.ReadPolicyClass() {
+				sawSplit = true
+			}
+			mount := desktopJuiceFSLinkArgs(p)
+			live := nfs.JFSLinkPolicyFlags(p)
+			if !reflect.DeepEqual(normDurations(t, mount), normDurations(t, live)) {
+				t.Errorf("env %v %s (class %s, read %s): mount %v, live %v", env, name, p.Class(), p.ReadPolicyClass(), mount, live)
 			}
 		}
+	}
+	if !sawSplit {
+		t.Fatal("no profile had Class != ReadPolicyClass: the test would not catch a swapped class")
 	}
 }
 
