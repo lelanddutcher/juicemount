@@ -123,6 +123,9 @@ var (
 	attrPushDelivered atomic.Int64 // i-key events received
 	attrPushBatches   atomic.Int64 // batches that read attrs (one MGET or more)
 	attrPushRefreshed atomic.Int64 // mirror rows whose size/mtime changed
+	// attrPushLateCommits: rows another client changed under the same mtime
+	// and size (mtime_span.go).
+	attrPushLateCommits atomic.Int64
 )
 
 func noteAttrPushDelivered() { attrPushDelivered.Add(1) }
@@ -181,7 +184,9 @@ func (rc *RedisClient) newAttrCoalescer(generation uint64) *inodeCoalescer {
 }
 
 // reconcileFileAttrs reads the attrs of the batch's known regular files and
-// upserts those whose size or mtime changed. It returns the inodes to retry.
+// upserts those whose size or mtime changed, or that another client changed
+// again under the same mtime (a late commit, mtime_span.go). It returns the
+// inodes to retry.
 func (rc *RedisClient) reconcileFileAttrs(inodes []uint64, generation uint64) (retry []uint64, err error) {
 	token := rc.scanToken()
 	if token.backend != generation || !rc.scanTokenValid(token) {
@@ -222,16 +227,14 @@ func (rc *RedisClient) reconcileFileAttrs(inodes []uint64, generation uint64) (r
 	for start := 0; start < len(known); start += attrMGetChunk {
 		chunk := known[start:min(start+attrMGetChunk, len(known))]
 		keys := make([]string, len(chunk))
+		files := make([]sliceQuery, len(chunk))
 		for i, e := range chunk {
 			keys[i] = "i" + strconv.FormatUint(e.Inode, 10)
+			files[i] = sliceQuery{e.Inode, e.Size}
 		}
-		var vals []interface{}
-		var merr error
-		if rc.testReadAttrs != nil {
-			vals, merr = rc.testReadAttrs(keys)
-		} else {
-			vals, merr = rc.redisDB().MGet(ctx, keys...).Result()
-		}
+		// One round trip: the attrs and the slice signatures, the latter
+		// for the cached size (mtime_span.go; review L1).
+		vals, sigs, merr := rc.readAttrsAndSigs(ctx, keys, files)
 		if merr != nil || len(vals) != len(chunk) {
 			for _, e := range known[start:] {
 				retry = append(retry, e.Inode)
@@ -251,10 +254,47 @@ func (rc *RedisClient) reconcileFileAttrs(inodes []uint64, generation uint64) (r
 				continue
 			}
 			e := chunk[i]
+			sig := sigs[i]
+			if chunksFor(size) != chunksFor(e.Size) {
+				sig = unknownSig // read for other chunk lists
+			}
+			ctime, ctimeOK := decodeInodeAttrCtime([]byte(str))
 			if e.Mtime.Equal(mtime) && e.MtimeNsecKnown && e.Size == size {
+				if !ctimeOK {
+					continue
+				}
+				prev, have := rc.store.attrObservation(e.Inode)
+				if judgeCtime(prev, have, mtime.UnixNano(), ctime.UnixNano()) == verdictNone {
+					continue
+				}
+				obs := attrObs{mtimeNS: mtime.UnixNano(), ctimeNS: ctime.UnixNano(), sig: sig}
+				if sig.sameContent(prev.sig) {
+					// The same slices: a chmod, chown, rename or link.
+					rc.store.attrObs.putIf(e.Inode, obs, prev, have)
+					continue
+				}
+				if (!sig.known() || !prev.sig.known()) && rc.store.takeOwnChange(e.Inode) {
+					// The signature cannot decide, and this process just
+					// changed the file itself: that one event is its echo
+					// (review H1 of the second review; the mark is consumed).
+					rc.store.attrObs.putIf(e.Inode, obs, prev, have)
+					continue
+				}
+				toUpsert = append(toUpsert, &Entry{
+					Path:           e.Path,
+					Name:           e.Name,
+					ParentPath:     e.ParentPath,
+					Size:           size,
+					Mtime:          mtime,
+					MtimeNsecKnown: true,
+					Inode:          e.Inode,
+					Mode:           e.Mode,
+					// Another client's part committed after this mtime.
+					span: &attrSpan{ctime: ctime, sig: sig, lateCommit: true},
+				})
 				continue
 			}
-			toUpsert = append(toUpsert, &Entry{
+			up := &Entry{
 				Path:           e.Path,
 				Name:           e.Name,
 				ParentPath:     e.ParentPath,
@@ -263,20 +303,35 @@ func (rc *RedisClient) reconcileFileAttrs(inodes []uint64, generation uint64) (r
 				MtimeNsecKnown: true,
 				Inode:          e.Inode,
 				Mode:           e.Mode,
-			})
+				span:           &attrSpan{sig: sig},
+			}
+			if ctimeOK {
+				up.span.ctime = ctime
+			}
+			toUpsert = append(toUpsert, up)
 		}
 	}
 	if len(toUpsert) == 0 {
 		return nil, nil
 	}
 	if err := rc.applyReconcileUpsertsWithToken(toUpsert, &token); err != nil {
+		// Nothing was recorded for these rows: the retry judges them again.
 		for _, e := range toUpsert {
 			retry = append(retry, e.Inode)
 		}
 		return retry, err
 	}
 	attrPushRefreshed.Add(int64(len(toUpsert)))
+	late := 0
+	for _, e := range toUpsert {
+		if e.span != nil && e.span.lateCommit {
+			late++
+		}
+	}
+	if late > 0 {
+		attrPushLateCommits.Add(int64(late))
+	}
 	jmlog.Info("metadata attr push: refreshed", "events", len(inodes), "files", len(known), "changed", len(toUpsert),
-		"first", toUpsert[0].Path)
+		"first", toUpsert[0].Path, "late_commits", late)
 	return nil, nil
 }

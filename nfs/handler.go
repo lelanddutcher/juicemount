@@ -4204,7 +4204,7 @@ func (jfs *juiceFS) openFileExpected(filename string, flag int, perm os.FileMode
 					name:  e.Name,
 					size:  e.Size,
 					mode:  e.Mode,
-					mtime: e.Mtime,
+					mtime: e.NFSMtime(), // a late commit moves it (metadata/mtime_span.go)
 					isDir: e.IsDir,
 					inode: e.Inode,
 				},
@@ -5122,6 +5122,9 @@ func (jfs *juiceFS) rename(oldpath, newpath string, op *namespaceOperation) erro
 			if err := jfs.handler.store.Insert(&clone); err != nil {
 				return err
 			}
+			// The rename's ctime change is this client's own
+			// (metadata/mtime_span.go).
+			jfs.handler.store.NoteOwnWrite(newpath)
 			if oldEntry.IsDir {
 				if _, err := jfs.handler.store.RenameSubtreeSync(oldpath, newpath); err != nil {
 					return err
@@ -5161,6 +5164,7 @@ func (jfs *juiceFS) rename(oldpath, newpath string, op *namespaceOperation) erro
 			if err := jfs.handler.store.Insert(e); err != nil {
 				return err
 			}
+			jfs.handler.store.NoteOwnWrite(newpath) // metadata/mtime_span.go
 		}
 		if err != nil {
 			return err
@@ -5655,6 +5659,9 @@ func (jc *juiceChange) Chmod(name string, mode os.FileMode) error {
 		}
 		if backendEligible && !result.spoolPending {
 			fusePath := path.Join(h.fusePath, rel)
+			// The ctime-only change this makes is not another client's
+			// commit (metadata/mtime_span.go, review M1 of #99).
+			h.store.NoteOwnAttrChange(rel)
 			// Run the raw syscall in this worker. On RPC timeout the worker
 			// retains the namespace lease until the kernel call really ends.
 			start := time.Now()
