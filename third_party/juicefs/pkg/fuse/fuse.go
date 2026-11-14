@@ -547,9 +547,11 @@ func Serve(v *vfs.VFS, options string, xattrs, ioctl bool) error {
 	fsserv = fssrv
 	// JuiceMount patch 0031: the JMRefreshInode message drops the kernel's
 	// pages of an inode another client changed (pkg/vfs/jm_refresh.go). It
-	// runs outside any FUSE request, so the notify can be synchronous.
+	// runs outside any FUSE request, so the notify can be synchronous. Offset
+	// 0 and length 0 drop the attributes and every page; offset -1 (the
+	// open path above) drops only the attributes.
 	vfs.JMSetInodeInvalidator(func(ino Ino) syscall.Errno {
-		return syscall.Errno(fssrv.InodeNotify(uint64(ino), -1, 0))
+		return syscall.Errno(fssrv.InodeNotify(uint64(ino), 0, 0))
 	})
 	fssrv.Serve()
 	return nil

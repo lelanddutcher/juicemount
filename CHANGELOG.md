@@ -11,10 +11,14 @@
     descriptor never reached JuiceFS while the file was read (12 of 12 lan
     trials). The app now sends the bundled JuiceFS a new control message
     (patch 0031, `JMRefreshInode`, `-jm16`) when its mirror learns of the
-    edit. JuiceFS drops that file's slice list, its read buffers and the
-    kernel's pages for the descriptors already open, and reads the new length.
-    It costs one metadata round trip per edit, in the background, and only for
-    files the app has opened in the last 5 minutes; reads cost nothing more.
+    edit. JuiceFS drops that file's slice list and its read buffers for the
+    descriptors already open, reads the new length, and sends the kernel a
+    notify for the whole file (attributes and pages). The reply says whether
+    the kernel accepted the notify; whether macFUSE then drops its pages
+    needs the laptop. It costs one metadata round trip per edit of another
+    client, in the background, and only for files the app has opened in the
+    last 5 minutes; this client's own saves, which come back on the same
+    feed, cost nothing. Reads cost nothing more.
     JuiceFS's own open of a changed file on macOS now also purges the
     kernel's pages (`FOPEN_PURGE_UBC`): a re-pin read 48 MiB of old pages
     before.
@@ -22,7 +26,10 @@
     to 2.2 s the app answered READs with the old bytes and the new mtime, and
     the Mac kept them (20 of 24 trials still old at 30 s). A READ now waits
     for the pending refresh of its file before it reads, so a reply with the
-    new mtime always carries the new bytes.
+    new mtime always carries the new bytes. If the refresh takes longer than
+    5 s (8 s on a far link), fails, or the kernel did not accept its notify,
+    the READ answers JUKEBOX and the Mac's retry sends the refresh again;
+    after 3 failed refreshes of one edit, READs go on.
   - **Appends were invisible for up to an hour (P3).** The Mac sends no
     GETATTR when it opens a file whose attributes are younger than
     `acregmin`. The file attribute window is now 1–3 s (was 3600 s), like the
@@ -31,7 +38,8 @@
   - **A save froze playback for 4 s (P4).** A READ from the verified local
     cache that a teammate's save overtook answered JUKEBOX, and the Mac
     retries only after 4 s (9 of 24 trials). An in-place update or append
-    now falls through to the live read; a replaced file still refuses.
+    now falls through to the live read; a shorter or replaced file still
+    refuses.
   - **A teammate's edit un-pinned a pinned file for good (P5).** After an
     append the pin kept its old size and every re-pin refused the file; the
     pin now takes the file's current size. After an in-place edit the re-pin

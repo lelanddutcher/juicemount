@@ -23,7 +23,9 @@
  * Body: version(1) = 1, inode(8).
  *
  * Reply: errno(1); on errno 0 also flags(1), length(8), mtime_ns(8): 18
- * bytes. flags: bit 1 the kernel dropped its pages; bit 2 no kernel notify
+ * bytes. flags: bit 1 the kernel accepted the notify (offset 0, length 0:
+ * attributes and all pages; whether macFUSE then purges its UBC pages is not
+ * observable here); bit 2 no kernel notify
  * (no FUSE server, or the kernel lacks the notify); bit 4 the notify did not
  * answer within jmRefreshNotifyWait (it may still land); bit 8 the notify
  * failed. EINVAL: an unknown version or a short body. ENOTSUP: the metadata
@@ -46,10 +48,10 @@ const (
 	jmRefreshVersion = 1
 	jmRefreshReplyOK = 1 + 1 + 8 + 8
 
-	JMRefreshKernelDropped = 1
-	JMRefreshKernelNone    = 2
-	JMRefreshKernelTimeout = 4
-	JMRefreshKernelFailed  = 8
+	JMRefreshKernelAccepted = 1
+	JMRefreshKernelNone     = 2
+	JMRefreshKernelTimeout  = 4
+	JMRefreshKernelFailed   = 8
 )
 
 // jmRefreshNotifyWait bounds the wait for the kernel notify. The notify
@@ -138,7 +140,7 @@ func (v *VFS) jmRefreshKernel(inode Ino) uint8 {
 	case eno := <-done:
 		switch eno {
 		case 0:
-			return JMRefreshKernelDropped
+			return JMRefreshKernelAccepted
 		case syscall.ENOSYS, syscall.ENOTSUP:
 			return JMRefreshKernelNone
 		default:

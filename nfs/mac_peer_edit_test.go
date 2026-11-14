@@ -36,7 +36,7 @@ func TestJFSRefreshConstantsMatchJuiceFS(t *testing.T) {
 		app, jfs int
 	}{
 		{"message", jfsMsgRefreshInode, meta.JMRefreshInode},
-		{"dropped", jfsRefreshKernelDropped, vfs.JMRefreshKernelDropped},
+		{"accepted", jfsRefreshKernelAccepted, vfs.JMRefreshKernelAccepted},
 		{"none", jfsRefreshKernelNone, vfs.JMRefreshKernelNone},
 		{"timeout", jfsRefreshKernelTimeout, vfs.JMRefreshKernelTimeout},
 		{"failed", jfsRefreshKernelFailed, vfs.JMRefreshKernelFailed},
@@ -49,12 +49,12 @@ func TestJFSRefreshConstantsMatchJuiceFS(t *testing.T) {
 
 func TestJFSRefreshInodeExchange(t *testing.T) {
 	var sent []byte
-	reply := []byte{0, jfsRefreshKernelDropped}
+	reply := []byte{0, jfsRefreshKernelAccepted}
 	reply = binary.BigEndian.AppendUint64(reply, 49<<20)
 	reply = binary.BigEndian.AppendUint64(reply, 1700000000123456789)
 	c := &jfsControl{testExchange: func(msg []byte, _ int) ([]byte, error) { sent = msg; return reply, nil }}
 	flags, length, mtime, err := c.refreshInode(98, time.Second)
-	if err != nil || flags != jfsRefreshKernelDropped || length != 49<<20 || mtime != 1700000000123456789 {
+	if err != nil || flags != jfsRefreshKernelAccepted || length != 49<<20 || mtime != 1700000000123456789 {
 		t.Fatalf("reply: %d %d %d %v", flags, length, mtime, err)
 	}
 	want := controlHeader(jfsMsgRefreshInode, 9)
@@ -132,6 +132,23 @@ func nfsRead(t *testing.T, jfs *juiceFS, name string, off int64, n int) readPair
 		t.Fatalf("ReadAt: %v", err)
 	}
 	return readPair{mtime: info.ModTime(), size: info.Size(), data: buf[:got]}
+}
+
+// nfsReadErr is nfsRead for a READ that may answer an error (JUKEBOX).
+func nfsReadErr(t *testing.T, jfs *juiceFS, name string, off int64, n int) (readPair, error) {
+	t.Helper()
+	f, err := jfs.OpenFile(name, os.O_RDONLY, 0)
+	if err != nil {
+		t.Fatalf("OpenFile: %v", err)
+	}
+	defer f.Close()
+	info := f.(nfslib.CachedInfoProvider).CachedInfo()
+	buf := make([]byte, n)
+	got, err := f.ReadAt(buf, off)
+	if err != nil && got != 0 {
+		t.Fatalf("ReadAt returned %d bytes with %v", got, err)
+	}
+	return readPair{mtime: info.ModTime(), size: info.Size(), data: buf[:got]}, err
 }
 
 // peerEdit is the attr push's mirror update: the same row and inode, a new
@@ -313,13 +330,19 @@ func TestPeerEditRefreshOnlyForFilesThePoolOpened(t *testing.T) {
 	}
 }
 
-// The update event path (juicemount:metadata) refreshes too, and it decides
-// before #94's deferred close drops the descriptor (which would hide that
-// juicefs still has the handle open).
+// The update event path (juicemount:metadata) refreshes through the
+// content-changed hook, which the store fires only for a teammate's change
+// and before #94's deferred close drops the descriptor (which would hide that
+// juicefs still has the handle open). The content hook alone, which also
+// fires for this client's own drain echoes, costs no refresh (review M1).
 func TestPeerEditUpdateEventRefreshesHeldFile(t *testing.T) {
 	jfs, store, s, file := peerEditHarness(t, true)
 	store.NotifyContentInvalidated(file, false)
-	if !jfs.handler.contentRefresh.wait(file, 2*time.Second) || s.calls.Load() != 1 {
+	if jfs.handler.contentRefresh.wait(file, 2*time.Second) != nil || s.calls.Load() != 0 {
+		t.Fatalf("echo-capable content hook: %d refreshes, want 0", s.calls.Load())
+	}
+	store.NotifyContentChanged(file, store.LookupByPath(file).Inode)
+	if jfs.handler.contentRefresh.wait(file, 2*time.Second) != nil || s.calls.Load() != 1 {
 		t.Fatalf("update event: %d refreshes", s.calls.Load())
 	}
 }
@@ -334,14 +357,14 @@ func TestContentRefreshCoalescesAndBoundsTheWait(t *testing.T) {
 	for i := 0; i < 10; i++ {
 		c.begin("f", 7, "/x/f")
 	}
-	if c.wait("f", 30*time.Millisecond) {
+	if !errors.Is(c.wait("f", 30*time.Millisecond), errRefreshPending) {
 		t.Fatal("wait returned while the refresh was blocked")
 	}
-	if !c.wait("other", time.Millisecond) {
+	if c.wait("other", time.Millisecond) != nil {
 		t.Fatal("an unrelated path waited")
 	}
 	close(release)
-	if !c.wait("f", 2*time.Second) {
+	if c.wait("f", 2*time.Second) != nil {
 		t.Fatal("wait did not end")
 	}
 	if got := runs.Load(); got != 2 {
@@ -353,9 +376,111 @@ func TestContentRefreshCoalescesAndBoundsTheWait(t *testing.T) {
 	// An old juicefs: stop sending.
 	c2 := newContentRefresher(func(uint64, string) error { return errControlUnsupported })
 	c2.begin("f", 7, "/x/f")
-	c2.wait("f", time.Second)
+	if err := c2.wait("f", time.Second); err != nil {
+		t.Fatalf("old juicefs: the READ must read on, got %v", err)
+	}
 	c2.begin("f", 7, "/x/f")
 	if !c2.unsupported.Load() || c2.waiting.Load() != 0 {
 		t.Fatal("unsupported juicefs kept refreshing")
 	}
+}
+
+// Review C2: a refresh slower than the READ's bound. The READ must not read
+// on (that pairs the new attributes with old bytes): it answers JUKEBOX, and
+// the Mac's retry after the refresh gets the new bytes.
+func TestPeerEditRefreshSlowerThanBoundAnswersJukebox(t *testing.T) {
+	jfs, store, s, file := peerEditHarness(t, true)
+	prev := contentRefreshBound
+	contentRefreshBound = func() time.Duration { return 80 * time.Millisecond }
+	t.Cleanup(func() { contentRefreshBound = prev })
+	s.delay = 600 * time.Millisecond
+	oldM := store.LookupByPath(file).Mtime
+	newBytes := bytes.Repeat([]byte{'B'}, 64<<10)
+	s.stage(newBytes)
+	peerEdit(t, store, file, int64(len(newBytes)), oldM.Add(time.Second))
+
+	var jukebox, served int
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		p, err := nfsReadErr(t, jfs, file, 0, 4096)
+		switch {
+		case errors.Is(err, syscall.EAGAIN):
+			jukebox++
+			continue
+		case err != nil:
+			t.Fatalf("READ: %v", err)
+		}
+		served++
+		if p.mtime.After(oldM) && !bytes.Equal(p.data, newBytes[:4096]) {
+			t.Fatalf("READ paired the new mtime with old bytes %q", p.data[:4])
+		}
+		if served >= 3 {
+			break
+		}
+	}
+	if jukebox == 0 || served == 0 {
+		t.Fatalf("%d JUKEBOX, %d served: want JUKEBOX while the refresh runs, then the new bytes", jukebox, served)
+	}
+}
+
+// Review C2: a refresh whose reply lacks the kernel's notify acceptance may
+// leave old pages. A READ after it sends the refresh again and reads only if
+// that one is confirmed; otherwise it answers JUKEBOX. After
+// refreshRetryBudget failures in a row a READ reads on, so a kernel that
+// never accepts cannot make the file unreadable.
+func TestPeerEditUnconfirmedRefreshRetriesThenReadsOn(t *testing.T) {
+	t.Run("retry succeeds", func(t *testing.T) {
+		jfs, store, s, file := peerEditHarness(t, true)
+		var runs atomic.Int32
+		jfs.handler.contentRefresh = newContentRefresher(func(inode uint64, p string) error {
+			if runs.Add(1) == 1 {
+				return errRefreshUnconfirmed
+			}
+			return s.run(inode, p)
+		})
+		oldM := store.LookupByPath(file).Mtime
+		newBytes := bytes.Repeat([]byte{'B'}, 64<<10)
+		s.stage(newBytes)
+		peerEdit(t, store, file, int64(len(newBytes)), oldM.Add(time.Second))
+		// The hook's refresh has failed before the Mac's READ arrives.
+		for deadline := time.Now().Add(2 * time.Second); jfs.handler.contentRefresh.waiting.Load() != 0; {
+			if time.Now().After(deadline) {
+				t.Fatal("the hook's refresh did not end")
+			}
+			time.Sleep(time.Millisecond)
+		}
+		p, err := nfsReadErr(t, jfs, file, 0, 4096)
+		if err != nil || !p.mtime.After(oldM) || !bytes.Equal(p.data, newBytes[:4096]) || runs.Load() != 2 {
+			t.Fatalf("READ after an unconfirmed refresh: %v, mtime new %v, %d runs (want the retry's new bytes)", err, p.mtime.After(oldM), runs.Load())
+		}
+	})
+	t.Run("budget", func(t *testing.T) {
+		jfs, store, _, file := peerEditHarness(t, true)
+		var runs atomic.Int32
+		jfs.handler.contentRefresh = newContentRefresher(func(uint64, string) error { runs.Add(1); return errRefreshUnconfirmed })
+		jukeboxes := func() int {
+			n := 0
+			for i := 0; i < 2*refreshRetryBudget; i++ {
+				_, err := nfsReadErr(t, jfs, file, 0, 4096)
+				if err == nil {
+					return n
+				}
+				if !errors.Is(err, syscall.EAGAIN) {
+					t.Fatalf("READ: %v", err)
+				}
+				n++
+			}
+			t.Fatal("READs never went on")
+			return n
+		}
+		peerEdit(t, store, file, 64<<10, store.LookupByPath(file).Mtime.Add(time.Second))
+		if n := jukeboxes(); n == 0 || runs.Load() != refreshRetryBudget {
+			t.Fatalf("%d JUKEBOX, %d refreshes; want JUKEBOX, then reading on after %d refreshes", n, runs.Load(), refreshRetryBudget)
+		}
+		// A new edit gets the whole budget again.
+		peerEdit(t, store, file, 64<<10, store.LookupByPath(file).Mtime.Add(time.Second))
+		if n := jukeboxes(); n == 0 || runs.Load() != 2*refreshRetryBudget {
+			t.Fatalf("new edit: %d JUKEBOX, %d refreshes", n, runs.Load())
+		}
+	})
 }

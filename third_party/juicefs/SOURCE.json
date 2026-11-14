@@ -387,7 +387,7 @@
       "upstream_sha256": "09bfca6f0bc5d38bdc333fa6e97bae2162d708b7895662e72e59986ad22c37f5"
     },
     "pkg/fuse/fuse.go": {
-      "sha256": "6cfdd57672f36ee6e64d37818c98169972778aeb6f324e2c2f3f7a14e6d3c8e1",
+      "sha256": "27f638ae68ba959928f98ea3614f58f77e50971affcd05147418206336b99a97",
       "upstream_sha256": "fba3fe5ddcf185c6c740d2b8e08e1a492d0085a96c2d7ab7bfc40e730bbbdf02"
     },
     "pkg/fuse/fuse_darwin.go": {
@@ -1176,8 +1176,8 @@
     "pkg/vfs/jm_pin_test.go": "cf3bf39834e7b130c755cdeb5aa0712f8eebe947a73e3aacf762904f93277f2b",
     "pkg/vfs/jm_read_recover.go": "abdf2ac8cbb6ee55f65edf4ed59afd5041d7ea55a525cca8bbbefc5f27118af5",
     "pkg/vfs/jm_read_recover_test.go": "746c9d865680dfe67e07686045cad3cdd16e00e0cddbd8cacebf65416bc5ff92",
-    "pkg/vfs/jm_refresh.go": "9336c9aea000d558e93e494db36b463751a91777c589922fb5e37cbd8cffe716",
-    "pkg/vfs/jm_refresh_test.go": "d00afd1f18af853859e8ef02a7c35d497605c24ba2868399b5aac96eb3ba1dfa",
+    "pkg/vfs/jm_refresh.go": "d779d8ee6de5799919b64738a63517a946fe4672d45c569a6e72d6e0709d7cd4",
+    "pkg/vfs/jm_refresh_test.go": "4a489392aaeaf6be47f8a79a87fe02029f351ba02c54c9484e400ee0d2e4172f",
     "pkg/vfs/jm_upload_lane.go": "c35d3cda2fa958933f21e1e39a2f48ce4605ccb2e6d2e6e53fe6ceaecbf670b1",
     "pkg/vfs/jm_upload_lane_test.go": "62897a114b7032f6cc195232ed275ab92c8725a57ecd1152499a9c2c6856af44"
   },
@@ -1214,7 +1214,7 @@
     "patches/0028-open-round-trips.patch": "432401890a0887d55a8c95c8ef66eb99ce31c74f70e1701d99653f053ed07c5f",
     "patches/0029-dead-peer-detection.patch": "46931f7b317b89cfc16aafbc055b6b662724dc30b5c396020711c509c4ab4e9f",
     "patches/0030-read-error-retry.patch": "2b097e51dcf5819bec505575b869fae70001e92f4ef04931dd565bf863fedfef",
-    "patches/0031-refresh-open-file.patch": "9ae826e0c9525e5af950ce53d6ed528eaf2a8cef456ccd8868c46942b96eaf1d"
+    "patches/0031-refresh-open-file.patch": "677428d084f6a0f8012eb467351493e239f5dd51b52d114c189dc1534cce5ab6"
   },
   "scope": "All pkg/ and cmd/ files plus main.go, LICENSE, go.mod and go.sum from the verified module ZIP. Documentation, integration tests and SDK examples are not included. local_files are JuiceMount-owned source with no upstream counterpart.",
   "upstream_url": "https://github.com/juicedata/juicefs/tree/v1.3.1",

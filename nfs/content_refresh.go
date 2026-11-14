@@ -3,6 +3,7 @@ package nfs
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"os"
 	"path"
 	"sync"
@@ -26,8 +27,17 @@ import (
 // handle, so the second open() never reaches juicefs (12 of 12 lan trials).
 //
 // So the handler sends juicefs the JMRefreshInode control message (patch
-// 0031, third_party/juicefs/pkg/vfs/jm_refresh.go), which drops all three
-// caches of the inode for the descriptors that are already open.
+// 0031, third_party/juicefs/pkg/vfs/jm_refresh.go), which drops juicefs's
+// two caches of the inode for the descriptors that are already open and
+// sends the kernel a notify for the whole file. The reply says whether the
+// kernel accepted the notify (not, on macOS, whether macFUSE purged pages).
+//
+// A refresh that times out, fails, or whose reply lacks the kernel's notify
+// acceptance (review C2) leaves the old bytes possibly cached, so the READs
+// that waited for it answer EAGAIN (NFS JUKEBOX: the Mac retries) instead of
+// reading on. The retry sends the refresh again. After refreshRetryBudget
+// failed refreshes of one path, READs of it go on (and log), so a wedged
+// juicefs or a kernel without notify cannot make a file unreadable.
 //
 // Ordering (P2). The NFS attributes of a READ come from the mirror when the
 // READ starts (OpenFile's snapshot). The content hooks run BEFORE the mirror
@@ -43,12 +53,15 @@ import (
 // jfsMsgRefreshInode is meta.JMRefreshInode (patch 0031).
 const jfsMsgRefreshInode = 1107
 
-// The flags of a refresh reply (vfs.JMRefreshKernel*).
+// The flags of a refresh reply (vfs.JMRefreshKernel*). Accepted means the
+// kernel accepted the notify that drops the file's attributes and pages
+// (offset 0, length 0: the whole file); whether macFUSE then purges its
+// pages is the laptop's to confirm.
 const (
-	jfsRefreshKernelDropped = 1
-	jfsRefreshKernelNone    = 2
-	jfsRefreshKernelTimeout = 4
-	jfsRefreshKernelFailed  = 8
+	jfsRefreshKernelAccepted = 1
+	jfsRefreshKernelNone     = 2
+	jfsRefreshKernelTimeout  = 4
+	jfsRefreshKernelFailed   = 8
 )
 
 const jfsRefreshReplyLen = 1 + 1 + 8 + 8
@@ -97,6 +110,11 @@ type contentRefresher struct {
 	// unsupported: juicefs lacks patch 0031; stop sending.
 	unsupported atomic.Bool
 
+	// failedPaths holds the paths whose last refresh failed, for the READ
+	// side to retry. Guarded by mu; failedCount mirrors its length.
+	failedPaths map[string]*refreshFailure
+	failedCount atomic.Int64
+
 	refreshed, failed atomic.Int64
 }
 
@@ -105,10 +123,33 @@ type refreshFlight struct {
 	again    bool
 	inode    uint64
 	fusePath string
+	err      error // the last run's result, set before done closes
 }
 
+type refreshFailure struct {
+	inode    uint64
+	fusePath string
+	attempts int
+}
+
+// refreshRetryBudget is the number of failed refreshes in a row, for one
+// edit of one path, after which its READs read on instead of answering EAGAIN.
+const refreshRetryBudget = 3
+
+// errRefreshPending: the READ waited past the bound. errRefreshFailed: the
+// refresh ended without confirming the caches were dropped. Both become
+// EAGAIN (JUKEBOX) for the READ.
+var (
+	errRefreshPending = errors.New("content refresh still pending")
+	errRefreshFailed  = errors.New("content refresh not confirmed")
+)
+
+// errRefreshUnconfirmed: juicefs refreshed its own caches, but the kernel did
+// not accept the notify that drops its pages of the file.
+var errRefreshUnconfirmed = errors.New("kernel did not accept the page notify")
+
 func newContentRefresher(run func(uint64, string) error) *contentRefresher {
-	return &contentRefresher{pending: make(map[string]*refreshFlight), run: run}
+	return &contentRefresher{pending: make(map[string]*refreshFlight), failedPaths: make(map[string]*refreshFailure), run: run}
 }
 
 // begin registers a refresh of name and starts it. It never blocks on FUSE:
@@ -120,17 +161,26 @@ func (c *contentRefresher) begin(name string, inode uint64, fusePath string) {
 		return
 	}
 	c.mu.Lock()
+	if fail := c.failedPaths[name]; fail != nil {
+		// A new edit: its refresh gets the whole retry budget again.
+		fail.attempts = 0
+	}
 	if f := c.pending[name]; f != nil {
 		f.again = true
 		f.inode, f.fusePath = inode, fusePath
 		c.mu.Unlock()
 		return
 	}
+	c.startLocked(name, inode, fusePath)
+	c.mu.Unlock()
+}
+
+func (c *contentRefresher) startLocked(name string, inode uint64, fusePath string) *refreshFlight {
 	f := &refreshFlight{done: make(chan struct{}), inode: inode, fusePath: fusePath}
 	c.pending[name] = f
 	c.waiting.Add(1)
-	c.mu.Unlock()
 	go c.loop(name, f)
+	return f
 }
 
 func (c *contentRefresher) loop(name string, f *refreshFlight) {
@@ -145,16 +195,35 @@ func (c *contentRefresher) loop(name string, f *refreshFlight) {
 		case errors.Is(err, errControlUnsupported):
 			c.unsupported.Store(true)
 			jmlog.Warn("content refresh: the bundled juicefs has no refresh message (patch 0031); a teammate's edit of a file this Mac holds open may stay old", "path", name)
+			err = nil
+		case errors.Is(err, syscall.ENOENT):
+			// The inode is gone: there are no caches of it to keep.
+			err = nil
 		case err != nil:
 			c.failed.Add(1)
-			jmlog.Warn("content refresh failed", "path", name, "inode", inode, "ms", time.Since(start).Milliseconds(), "err", err)
+			jmlog.Warn("content refresh failed; reads of the file answer JUKEBOX until a refresh succeeds", "path", name, "inode", inode, "ms", time.Since(start).Milliseconds(), "err", err)
 		default:
 			c.refreshed.Add(1)
 		}
 		c.mu.Lock()
+		f.err = err
 		if !f.again || c.unsupported.Load() {
 			break
 		}
+	}
+	prev := c.failedPaths[name]
+	switch {
+	case f.err == nil:
+		if prev != nil {
+			delete(c.failedPaths, name)
+			c.failedCount.Add(-1)
+		}
+	case prev == nil:
+		c.failedPaths[name] = &refreshFailure{inode: f.inode, fusePath: f.fusePath, attempts: 1}
+		c.failedCount.Add(1)
+	default:
+		prev.inode, prev.fusePath = f.inode, f.fusePath
+		prev.attempts++
 	}
 	delete(c.pending, name)
 	c.waiting.Add(-1)
@@ -162,37 +231,58 @@ func (c *contentRefresher) loop(name string, f *refreshFlight) {
 	close(f.done)
 }
 
-// wait blocks until no refresh of name is pending, at most bound. It reports
-// whether the read may go on with refreshed caches (false: the bound passed).
-func (c *contentRefresher) wait(name string, bound time.Duration) bool {
-	if c == nil || c.waiting.Load() == 0 {
-		return true
+// wait blocks until no refresh of name is pending, at most bound. nil: the
+// READ may read (no refresh pending, the last one succeeded, or the path's
+// retry budget is spent). errRefreshPending: the bound passed.
+// errRefreshFailed: the refresh did not confirm; a READ after a failure
+// starts the refresh again and waits for that one.
+func (c *contentRefresher) wait(name string, bound time.Duration) error {
+	if c == nil || c.waiting.Load()+c.failedCount.Load() == 0 {
+		return nil
 	}
 	c.mu.Lock()
 	f := c.pending[name]
-	c.mu.Unlock()
 	if f == nil {
-		return true
+		fail := c.failedPaths[name]
+		switch {
+		case fail == nil || c.unsupported.Load():
+			c.mu.Unlock()
+			return nil
+		case fail.attempts >= refreshRetryBudget:
+			c.mu.Unlock()
+			return nil
+		}
+		f = c.startLocked(name, fail.inode, fail.fusePath)
 	}
+	c.mu.Unlock()
 	t := time.NewTimer(bound)
 	defer t.Stop()
 	select {
 	case <-f.done:
-		return true
 	case <-t.C:
-		return false
+		return errRefreshPending
 	}
+	c.mu.Lock()
+	err := f.err
+	fail := c.failedPaths[name]
+	c.mu.Unlock()
+	if err != nil && (fail == nil || fail.attempts < refreshRetryBudget) {
+		return errRefreshFailed
+	}
+	return nil
 }
 
-// contentRefreshWait bounds how long a READ waits for a pending refresh: the
-// refresh is one local control exchange and one metadata round trip inside
-// juicefs. Past it the READ goes on (and logs), so a wedged juicefs cannot
-// turn every READ of the file into a stall of its own.
-func contentRefreshWait() time.Duration {
+// contentRefreshBound bounds how long a READ waits for a pending refresh.
+// The refresh is the shared control mutex (another control message may hold
+// it), one local control exchange, one metadata round trip inside juicefs,
+// and up to jmRefreshNotifyWait (2 s) for the kernel to accept the notify.
+// The bound covers all of that with a margin; past it the READ answers
+// JUKEBOX, never old bytes.
+var contentRefreshBound = func() time.Duration {
 	if netprofile.Default().HighLatency() {
-		return 4 * time.Second
+		return 8 * time.Second
 	}
-	return 2 * time.Second
+	return 5 * time.Second
 }
 
 // contentRefreshTimeout bounds one refresh exchange.
@@ -213,13 +303,14 @@ func (h *JuiceMountHandler) refreshContentNow(inode uint64, fusePath string) err
 	// push logs "refreshed": the laptop check reads it beside juicefs's
 	// access log (a new read of the inode after it).
 	jmlog.Info("content refresh: juicefs dropped the open file's caches", "path", fusePath, "inode", inode,
-		"length", length, "kernel_pages_dropped", flags&jfsRefreshKernelDropped != 0, "ms", time.Since(start).Milliseconds())
-	if flags&jfsRefreshKernelDropped == 0 {
-		jmlog.Warn("content refresh: the kernel did not confirm it dropped the file's pages", "inode", inode,
+		"length", length, "kernel_notify_accepted", flags&jfsRefreshKernelAccepted != 0, "ms", time.Since(start).Milliseconds())
+	_, _ = os.Stat(fusePath)
+	if flags&jfsRefreshKernelAccepted == 0 {
+		jmlog.Warn("content refresh: the kernel did not accept the notify that drops the file's pages", "inode", inode,
 			"no_notify", flags&jfsRefreshKernelNone != 0, "timeout", flags&jfsRefreshKernelTimeout != 0,
 			"failed", flags&jfsRefreshKernelFailed != 0)
+		return errRefreshUnconfirmed
 	}
-	_, _ = os.Stat(fusePath)
 	return nil
 }
 
@@ -238,14 +329,17 @@ func (h *JuiceMountHandler) refreshContent(inMountPath string, inode uint64) {
 	h.contentRefresh.begin(inMountPath, inode, full)
 }
 
-// awaitContentRefresh is the READ side of the ordering above.
-func (h *JuiceMountHandler) awaitContentRefresh(name string) {
+// awaitContentRefresh is the READ side of the ordering above. A non-nil
+// result is syscall.EAGAIN: the READ answers JUKEBOX and reads no byte.
+func (h *JuiceMountHandler) awaitContentRefresh(name string) error {
 	if h == nil || h.contentRefresh == nil {
-		return
+		return nil
 	}
-	if !h.contentRefresh.wait(name, contentRefreshWait()) {
-		jmlog.Warn("content refresh still pending; reading on", "path", name)
+	if err := h.contentRefresh.wait(name, contentRefreshBound()); err != nil {
+		jmlog.Warn("content refresh: READ answers JUKEBOX", "path", name, "reason", err)
+		return fmt.Errorf("%w: %w", syscall.EAGAIN, err)
 	}
+	return nil
 }
 
 // changedUnderRead reports that the file this READ started with was updated

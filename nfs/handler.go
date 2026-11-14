@@ -998,6 +998,10 @@ func NewHandler(store *metadata.Store, fusePath string, opts ...HandlerOption) *
 		// READ descriptor (never the write slot). Full reconcile uses the
 		// coarse reset to cover missed push events.
 		store.SetOnContentInvalidated(h.onContentInvalidated)
+		// A teammate's change of a file (never our own echo) also refreshes
+		// what juicefs and the kernel hold for it (P1, content_refresh.go).
+		// The store fires it before the content hook drops the descriptor.
+		store.SetOnContentChanged(h.refreshContent)
 		store.SetOnScanContentInvalidated(h.onScanContentInvalidated)
 		store.SetOnContentReset(h.onContentReset)
 		h.loadDirListingRecords()
@@ -1149,11 +1153,6 @@ func (h *JuiceMountHandler) onContentInvalidated(inMountPath string, isDir bool)
 			cr.InvalidateAll()
 		}
 		return
-	}
-	if h.contentRefresh != nil && h.store != nil {
-		if e := h.store.LookupByPath(inMountPath); e != nil && !e.IsDir {
-			h.refreshContent(inMountPath, e.Inode) // P1: before the descriptor is dropped
-		}
 	}
 	h.invalidateReadCaches(inMountPath)
 	if h.fdPool != nil {
@@ -6430,7 +6429,9 @@ func (f *cachedFile) readAtRouted(p []byte, off int64, trace *cachedReadTrace) (
 	// file's juicefs caches is pending, so a reply that carries the new
 	// attributes never carries old bytes (content_refresh.go).
 	if f.handler != nil {
-		f.handler.awaitContentRefresh(f.name)
+		if err := f.handler.awaitContentRefresh(f.name); err != nil {
+			return 0, err
+		}
 	}
 	if f.pinGeneration != "" {
 		return f.readOwnedPinResident(p, off, trace)
@@ -6537,7 +6538,9 @@ func (f *cachedFile) readAtRouted(p []byte, off int64, trace *cachedReadTrace) (
 			// Read the live file through FUSE instead, after its refresh.
 			// The reply still carries the attributes the READ started with;
 			// the Mac drops these bytes when it sees the new mtime.
-			f.handler.awaitContentRefresh(f.name)
+			if err := f.handler.awaitContentRefresh(f.name); err != nil {
+				return 0, err
+			}
 			n, err = 0, nil
 			clear(p)
 		}

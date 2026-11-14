@@ -100,8 +100,8 @@ func TestJMRefreshHeldReaderSeesPeerWrite(t *testing.T) {
 	if len(reply) != jmRefreshReplyOK || reply[0] != 0 {
 		t.Fatalf("reply % x", reply)
 	}
-	if reply[1] != JMRefreshKernelDropped || notified.Load() != uint64(ino) {
-		t.Fatalf("kernel flags %d, notified inode %d; want the kernel pages of %d dropped", reply[1], notified.Load(), ino)
+	if reply[1] != JMRefreshKernelAccepted || notified.Load() != uint64(ino) {
+		t.Fatalf("kernel flags %d, notified inode %d; want the kernel notify for %d accepted", reply[1], notified.Load(), ino)
 	}
 	if got := binary.BigEndian.Uint64(reply[2:]); got != size+1<<20 {
 		t.Fatalf("reply length %d, want %d", got, size+1<<20)
