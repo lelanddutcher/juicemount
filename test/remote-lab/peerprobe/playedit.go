@@ -3,9 +3,11 @@ package main
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -238,6 +240,60 @@ func (p *probe) playEdit(row map[string]any, size int64, rate float64, lead, sav
 			mu.Unlock()
 		}
 	}()
+	// The saver (-writes): a 256 KiB file through NFS every second, as the
+	// Mac's own saves; jm5 drains them through juicefs's control channel,
+	// which the content refresh shares (review M1 of #97).
+	var writes []time.Duration
+	writeErrs := 0
+	writeErr := ""
+	writeDone := make(chan struct{})
+	go func() {
+		defer close(writeDone)
+		if !p.writes {
+			return
+		}
+		dir := path.Dir(p.name)
+		stamp := time.Now().UnixNano()
+		blob := make([]byte, 256<<10)
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			case <-time.After(time.Second):
+			}
+			_, _ = rand.Read(blob)
+			s := time.Now()
+			var f *nfsc.File
+			var err error
+			for try := 0; try < 30; try++ { // JUKEBOX: wait and send again, as the Mac does
+				if f, err = p.v.OpenFile(fmt.Sprintf("%s/w-%d-%04d.bin", dir, stamp, i), 0o644); err == nil ||
+					!(errors.Is(err, os.ErrInvalid) || strings.Contains(err.Error(), "invalid argument")) {
+					break
+				}
+				time.Sleep(time.Second)
+			}
+			if err == nil {
+				_, err = f.Write(blob)
+				if cerr := f.Close(); err == nil {
+					err = cerr
+				}
+			}
+			if err != nil {
+				mu.Lock()
+				if writeErr == "" {
+					writeErr = err.Error()
+				}
+				mu.Unlock()
+			}
+			mu.Lock()
+			if err != nil {
+				writeErrs++
+			} else {
+				writes = append(writes, time.Since(s))
+			}
+			mu.Unlock()
+		}
+	}()
 	time.Sleep(lead)
 	var saves []peerSave
 	saveStart := time.Now()
@@ -255,6 +311,14 @@ func (p *probe) playEdit(row map[string]any, size int64, rate float64, lead, sav
 	close(stop)
 	<-done
 	<-pollDone
+	<-writeDone
+	if p.writes {
+		sort.Slice(writes, func(i, j int) bool { return writes[i] < writes[j] })
+		row["writes"], row["write_errors"], row["write_first_error"] = len(writes), writeErrs, writeErr
+		if n := len(writes); n > 0 {
+			row["write_p50_s"], row["write_p95_s"], row["write_max_s"] = secs(writes[n/2]), secs(writes[n*95/100]), secs(writes[n-1])
+		}
+	}
 	if saveErr != nil {
 		row["peer_error"] = saveErr.Error()
 	}

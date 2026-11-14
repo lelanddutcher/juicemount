@@ -90,3 +90,28 @@ func TestJMRefreshCachesNoListReadAcrossAnInvalidation(t *testing.T) {
 	}
 	o.jmCacheChunkAt(Ino(99), 0, list, nil, 0)
 }
+
+// Review L1 of #97: a file closed and opened again may reuse the pooled
+// entry; a list read in its first life must not be cached in the second.
+func TestJMRefreshCachesNoListAcrossAReopen(t *testing.T) {
+	o := newOpenFiles(time.Hour, 0)
+	const ino = Ino(6)
+	o.Open(ino, &Attr{Mtime: 1})
+	of, gen := o.jmChunkGen(ino)
+	o.Lock()
+	delete(o.files, ino) // the close path's release puts it back in the pool
+	o.Unlock()
+	of.release()
+	for i := 0; i < 64; i++ { // the pool may hand back the same entry
+		o.Open(ino, &Attr{Mtime: 2})
+		o.jmCacheChunkAt(ino, 3, []Slice{{Id: 9, Size: 1, Len: 1}}, of, gen)
+		if _, ok := o.ReadChunk(ino, 3); ok {
+			t.Fatal("a list read before the reopen was cached")
+		}
+		o.Lock()
+		cur := o.files[ino]
+		delete(o.files, ino)
+		o.Unlock()
+		cur.release()
+	}
+}

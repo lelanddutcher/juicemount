@@ -48,7 +48,15 @@
  	o.first = nil
  	o.firstAt = time.Time{}
  	for c := range o.chunks {
-@@ -278,6 +281,7 @@
+@@ -147,6 +150,7 @@
+ 	of, ok := o.files[ino]
+ 	if !ok {
+ 		of = ofPool.Get().(*openFile)
++		of.jmGen++ // JuiceMount patch 0032: a pooled entry is a new file (A-B-A)
+ 		o.files[ino] = of
+ 	} else if attr != nil && attr.Mtime == of.attr.Mtime && attr.Mtimensec == of.attr.Mtimensec {
+ 		attr.KeepCache = of.attr.KeepCache
+@@ -278,6 +282,7 @@
  	defer o.Unlock()
  	of, ok := o.files[ino]
  	if ok {

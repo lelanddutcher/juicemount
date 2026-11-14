@@ -107,7 +107,8 @@ type probe struct {
 	peer    string
 	poll    time.Duration
 	timeout time.Duration
-	jukebox int // NFS3ERR_JUKEBOX replies retried
+	jukebox int  // NFS3ERR_JUKEBOX replies retried
+	writes  bool // playedit: also save small files through NFS
 	auth    rpc.Auth
 }
 
@@ -255,6 +256,7 @@ func run(args []string) (err error) {
 	lead := fs.Duration("lead", 20*time.Second, "playedit: playback before the first save")
 	save := fs.Duration("save", 60*time.Second, "playedit: the peer saves back to back for this long")
 	tail := fs.Duration("tail", 20*time.Second, "playedit: playback after the last save")
+	writes := fs.Bool("writes", false, "playedit: also save a 256 KiB file through NFS every second")
 	_ = fs.Parse(args)
 
 	c, err := rpc.DialTCP("tcp", *addr, false)
@@ -267,7 +269,7 @@ func run(args []string) (err error) {
 	if err != nil {
 		return fmt.Errorf("mount: %w", err)
 	}
-	p := &probe{v: v, name: *name, peer: *peer, poll: *poll, timeout: *timeout, auth: auth}
+	p := &probe{v: v, name: *name, peer: *peer, poll: *poll, timeout: *timeout, auth: auth, writes: *writes}
 	_, p.fh, err = v.Lookup(*name)
 	if err != nil {
 		return fmt.Errorf("lookup: %w", err)

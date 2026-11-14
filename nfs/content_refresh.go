@@ -67,6 +67,26 @@ const (
 
 const jfsRefreshReplyLen = 1 + 1 + 8 + 8
 
+// The refresh message versions (patch 0032): 1 waits for the kernel notify
+// inside the exchange; 2 answers Pending after at most 250 ms; 3 polls a
+// pending notify.
+const (
+	jfsRefreshSync    = 1
+	jfsRefreshAsync   = 2
+	jfsRefreshPoll    = 3
+	jfsRefreshPending = 16
+)
+
+// jfsRefreshNotifyBudget bounds the polls of one pending notify; past it the
+// refresh counts as a notify timeout.
+var jfsRefreshNotifyBudget = 6500 * time.Millisecond
+
+// refreshTiming is where one refresh spent its time on the control channel.
+type refreshTiming struct {
+	wait, hold time.Duration // for the channel, holding it (all exchanges)
+	polls      int
+}
+
 // refreshInode asks juicefs to drop its caches of inode. It returns the
 // reply's kernel flags and the file's length and mtime as juicefs read them.
 func (c *jfsControl) refreshInode(inode uint64, timeout time.Duration) (flags byte, length uint64, mtimeNS uint64, err error) {
@@ -74,35 +94,70 @@ func (c *jfsControl) refreshInode(inode uint64, timeout time.Duration) (flags by
 	return flags, length, mtimeNS, err
 }
 
-// refreshInodeTimed is refreshInode that also reports how long it waited for
-// the control mutex.
-func (c *jfsControl) refreshInodeTimed(inode uint64, timeout time.Duration) (flags byte, length uint64, mtimeNS uint64, lockWait time.Duration, err error) {
-	body := binary.BigEndian.AppendUint64([]byte{1}, inode)
-	msg := append(controlHeader(jfsMsgRefreshInode, len(body)), body...)
-	reply, lockWait, err := c.exchangeUntilTimed(msg, jfsRefreshReplyLen, func(r []byte) int {
-		if len(r) > 0 && r[0] != 0 {
-			return 1
-		}
-		return jfsRefreshReplyLen
-	}, timeout)
+// refreshInodeTimed sends version 2 and polls a pending notify with short
+// version 3 exchanges, so the control channel, which the drainer, pins and
+// the link follower share, is not held while the notify waits for the
+// file's reads in flight (review M1 of #97: version 1 held it up to 6.4 s).
+// A juicefs without version 2 gets version 1.
+func (c *jfsControl) refreshInodeTimed(inode uint64, timeout time.Duration) (flags byte, length uint64, mtimeNS uint64, tm refreshTiming, err error) {
+	start := time.Now()
+	reply, err := c.refreshExchange(jfsRefreshAsync, inode, jfsRefreshReplyLen, timeout, &tm)
+	if err == nil && len(reply) == 1 && syscall.Errno(reply[0]) == syscall.EINVAL {
+		reply, err = c.refreshExchange(jfsRefreshSync, inode, jfsRefreshReplyLen, timeout, &tm)
+	}
 	if err != nil {
-		return 0, 0, 0, lockWait, err
+		return 0, 0, 0, tm, err
 	}
 	if len(reply) == 0 {
-		return 0, 0, 0, lockWait, errors.New("juicefs refresh: empty reply")
+		return 0, 0, 0, tm, errors.New("juicefs refresh: empty reply")
 	}
 	if syscall.Errno(reply[0]) == syscall.EINVAL {
 		// A juicefs without patch 0031 refuses the unknown message with one
 		// EINVAL byte; a patched one refuses only a malformed body.
-		return 0, 0, 0, lockWait, errControlUnsupported
+		return 0, 0, 0, tm, errControlUnsupported
 	}
 	if err := controlErrno(reply[0]); err != nil {
-		return 0, 0, 0, lockWait, err
+		return 0, 0, 0, tm, err
 	}
 	if len(reply) < jfsRefreshReplyLen {
-		return 0, 0, 0, lockWait, errors.New("juicefs refresh: short reply")
+		return 0, 0, 0, tm, errors.New("juicefs refresh: short reply")
 	}
-	return reply[1], binary.BigEndian.Uint64(reply[2:10]), binary.BigEndian.Uint64(reply[10:18]), lockWait, nil
+	flags, length, mtimeNS = reply[1], binary.BigEndian.Uint64(reply[2:10]), binary.BigEndian.Uint64(reply[10:18])
+	pause := 20 * time.Millisecond
+	for flags&jfsRefreshPending != 0 {
+		if time.Since(start) > jfsRefreshNotifyBudget {
+			return jfsRefreshKernelTimeout, length, mtimeNS, tm, nil
+		}
+		time.Sleep(pause)
+		pause = min(2*pause, 100*time.Millisecond)
+		tm.polls++
+		p, err := c.refreshExchange(jfsRefreshPoll, inode, 2, timeout, &tm)
+		switch {
+		case err != nil:
+			return 0, 0, 0, tm, err
+		case len(p) == 2 && p[0] == 0:
+			flags = p[1]
+		default:
+			// ENOENT: juicefs lost the pending notify (it restarted): the
+			// pages may still be old.
+			return jfsRefreshKernelFailed, length, mtimeNS, tm, nil
+		}
+	}
+	return flags, length, mtimeNS, tm, nil
+}
+
+func (c *jfsControl) refreshExchange(version byte, inode uint64, replyLen int, timeout time.Duration, tm *refreshTiming) ([]byte, error) {
+	body := binary.BigEndian.AppendUint64([]byte{version}, inode)
+	msg := append(controlHeader(jfsMsgRefreshInode, len(body)), body...)
+	reply, wait, hold, err := c.exchangeUntilTimed(msg, replyLen, func(r []byte) int {
+		if len(r) > 0 && r[0] != 0 {
+			return 1
+		}
+		return replyLen
+	}, timeout)
+	tm.wait += wait
+	tm.hold += hold
+	return reply, err
 }
 
 // contentRefresher runs the refreshes of each path, one at a time, and lets
@@ -211,7 +266,9 @@ func (c *contentRefresher) begin(name string, inode uint64, fusePath string) {
 	}
 	p.want++
 	p.inode, p.fusePath = inode, fusePath
-	// A new edit: its refresh gets the whole retry budget again.
+	// A new edit: its refresh gets the whole retry budget again. So while a
+	// teammate's save keeps sending hooks, the budget never runs out and a
+	// failing refresh keeps its READs on JUKEBOX (see wait).
 	p.attempts = 0
 	c.ensureRunningLocked(name, p)
 }
@@ -315,6 +372,11 @@ func (c *contentRefresher) wait(name string, bound time.Duration) error {
 			// A run that covers this READ failed, and none has succeeded since.
 			switch {
 			case p.attempts >= refreshRetryBudget:
+				// Review L2 of #97. begin resets attempts on every hook, so
+				// during a continuous save this cap never applies: READs keep
+				// answering JUKEBOX while refreshes fail, never old bytes.
+				jmlog.Warn("content refresh: retry budget spent; the READ reads on and may return old bytes",
+					"path", name, "failed_refreshes", p.attempts)
 				return nil
 			case p.running && p.started > p.failedAt:
 				// A newer run is already going: wait for it.
@@ -358,6 +420,32 @@ func (c *contentRefresher) wait(name string, bound time.Duration) error {
 // doubles, while the mount's own timeout (timeo=400) is 40 s.
 var contentRefreshBound = func() time.Duration { return 12 * time.Second }
 
+// refreshLengthsMax caps refreshLengths; past it the map starts over (each
+// path's next refresh stats once).
+const refreshLengthsMax = 4096
+
+// refreshStatWait bounds the post-refresh stat.
+const refreshStatWait = 2 * time.Second
+
+// statWithin stats name, waiting at most d. It reports whether the stat
+// ended in time; a stat that did not is left to finish on its goroutine.
+func statWithin(name string, d time.Duration) bool {
+	done := make(chan struct{})
+	go func() {
+		_, _ = os.Stat(name)
+		close(done)
+	}()
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-done:
+		return true
+	case <-t.C:
+		jmlog.Warn("content refresh: the stat after the refresh is still running", "path", name, "ms", d.Milliseconds())
+		return false
+	}
+}
+
 // contentRefreshTimeout bounds one refresh exchange.
 const contentRefreshTimeout = 10 * time.Second
 
@@ -368,11 +456,12 @@ const contentRefreshTimeout = 10 * time.Second
 // refresh's own read, with no round trip, patch 0028).
 func (h *JuiceMountHandler) refreshContentNow(inode uint64, fusePath string) error {
 	start := time.Now()
-	flags, length, _, lockWait, err := sharedJFSControl(h.fusePath).refreshInodeTimed(inode, contentRefreshTimeout)
+	flags, length, _, tm, err := sharedJFSControl(h.fusePath).refreshInodeTimed(inode, contentRefreshTimeout)
 	exchanged := time.Now()
 	if err != nil {
 		jmlog.Warn("content refresh: exchange failed", "path", fusePath, "inode", inode,
-			"control_wait_ms", lockWait.Milliseconds(), "ms", exchanged.Sub(start).Milliseconds(), "err", err)
+			"control_wait_ms", tm.wait.Milliseconds(), "control_hold_ms", tm.hold.Milliseconds(),
+			"ms", exchanged.Sub(start).Milliseconds(), "err", err)
 		return err
 	}
 	// The stat makes the kernel reload the attributes the message dropped,
@@ -380,23 +469,26 @@ func (h *JuiceMountHandler) refreshContentNow(inode uint64, fusePath string) err
 	// changed length needs it (bug F1): on Linux the stat of a file whose
 	// mtime changed drops all its pages and waits for every read of it in
 	// flight (FUSE auto_inval_data), which took 3-20 s on the far lab link
-	// during a teammate's long save.
+	// during a teammate's long save. It is bounded (review L3 of #97): a
+	// stat still running past refreshStatWait is left to finish alone.
 	var statted bool
 	if prev, seen := h.refreshLengths.Swap(inode, length); !seen || prev.(uint64) != length {
-		_, _ = os.Stat(fusePath)
-		statted = true
+		if !seen {
+			h.refreshLengthCount.Add(1)
+		}
+		statted = statWithin(fusePath, refreshStatWait)
 	}
 	// One line per teammate edit of a file this process holds, as the attr
 	// push logs "refreshed": the laptop check reads it beside juicefs's
 	// access log (a new read of the inode after it). The phases (bug F1):
-	// control_wait_ms waits for another control message, exchange_ms is
-	// juicefs's work (its metadata round trip, the read buffers, the kernel
-	// notify; juicefs's own log splits it when slow), stat_ms reloads the
-	// kernel's attributes.
+	// control_wait_ms waits for another control message, control_hold_ms
+	// holds the channel (the exchange and the polls), notify_ms runs until
+	// the kernel answered (juicefs's own log splits it when slow), stat_ms
+	// reloads the kernel's attributes.
 	jmlog.Info("content refresh: juicefs dropped the open file's caches", "path", fusePath, "inode", inode,
 		"length", length, "kernel_notify_accepted", flags&jfsRefreshKernelAccepted != 0, "ms", time.Since(start).Milliseconds(),
-		"control_wait_ms", lockWait.Milliseconds(), "exchange_ms", (exchanged.Sub(start) - lockWait).Milliseconds(),
-		"stat_ms", time.Since(exchanged).Milliseconds(), "stat", statted)
+		"control_wait_ms", tm.wait.Milliseconds(), "control_hold_ms", tm.hold.Milliseconds(), "polls", tm.polls,
+		"notify_ms", exchanged.Sub(start).Milliseconds(), "stat_ms", time.Since(exchanged).Milliseconds(), "stat", statted)
 	if flags&jfsRefreshKernelAccepted == 0 {
 		jmlog.Warn("content refresh: the kernel did not accept the notify that drops the file's pages", "inode", inode,
 			"no_notify", flags&jfsRefreshKernelNone != 0, "timeout", flags&jfsRefreshKernelTimeout != 0,
@@ -416,7 +508,16 @@ func (h *JuiceMountHandler) refreshContent(inMountPath string, inode uint64) {
 	}
 	full := path.Join(h.fusePath, inMountPath)
 	if !h.fdPool.RecentlyOpened(full) {
+		// The pool no longer holds the path: forget its last length
+		// (review L3 of #97), so the next refresh of it stats again.
+		if _, had := h.refreshLengths.LoadAndDelete(inode); had {
+			h.refreshLengthCount.Add(-1)
+		}
 		return
+	}
+	if h.refreshLengthCount.Load() > refreshLengthsMax {
+		h.refreshLengths.Clear()
+		h.refreshLengthCount.Store(0)
 	}
 	h.contentRefresh.begin(inMountPath, inode, full)
 }

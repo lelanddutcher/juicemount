@@ -50,16 +50,17 @@ type JuiceMountHandler struct {
 	// changed, and holds READs of that file until it has (content_refresh.go).
 	contentRefresh *contentRefresher
 	// refreshLengths holds, by inode, the length the last refresh reported
-	// (content_refresh.go).
-	refreshLengths sync.Map
-	readahead      *ReadaheadManager
-	memBuf         *MemoryBuffer
-	redisClient    atomic.Pointer[metadata.RedisClient] // for publishing events
-	pinStore       atomic.Pointer[pin.Store]            // optional; gates reads when offline mode is on
-	presence       atomic.Pointer[PresenceTracker]      // optional; who-has-this-open (Tier-1 #3)
-	thumbWarmer    atomic.Pointer[ThumbWarmer]          // optional (#1 hydration pack); nil-safe
-	sidecar        *sidecarCache                        // `._` AppleDouble body cache (nav crux); nil-safe
-	blipHook       func() bool                          // test override for backendBlipActive (#9)
+	// (content_refresh.go); refreshLengthCount counts its entries.
+	refreshLengths     sync.Map
+	refreshLengthCount atomic.Int64
+	readahead          *ReadaheadManager
+	memBuf             *MemoryBuffer
+	redisClient        atomic.Pointer[metadata.RedisClient] // for publishing events
+	pinStore           atomic.Pointer[pin.Store]            // optional; gates reads when offline mode is on
+	presence           atomic.Pointer[PresenceTracker]      // optional; who-has-this-open (Tier-1 #3)
+	thumbWarmer        atomic.Pointer[ThumbWarmer]          // optional (#1 hydration pack); nil-safe
+	sidecar            *sidecarCache                        // `._` AppleDouble body cache (nav crux); nil-safe
+	blipHook           func() bool                          // test override for backendBlipActive (#9)
 	// Acceptance-only zero-byte remote-content budget. Immutable after
 	// construction; the production read hot path pays one predictable branch,
 	// never an os.Getenv call.

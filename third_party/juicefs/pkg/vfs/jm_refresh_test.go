@@ -154,9 +154,9 @@ func TestJMRefreshRefusals(t *testing.T) {
 	v := pinVFS(t)
 	for name, body := range map[string][]byte{
 		"empty":     {},
-		"version 2": binary.BigEndian.AppendUint64([]byte{2}, 1),
 		"short":     {jmRefreshVersion, 0, 0, 0},
 		"long":      append(refreshBody(1), 0),
+		"version 4": binary.BigEndian.AppendUint64([]byte{4}, 1),
 	} {
 		if got := refreshMsg(v, body); !bytes.Equal(got, []byte{uint8(syscall.EINVAL)}) {
 			t.Fatalf("%s: reply % x, want EINVAL", name, got)
@@ -468,9 +468,9 @@ func TestJMRefreshChangedRanges(t *testing.T) {
 
 // Patch 0032 (bug F1): the kernel notify of a refresh covers only the bytes
 // the peer changed in the parts this mount has read, so it does not wait for
-// the player's reads of other parts. No change: the attributes only. A notify
-// the kernel refuses keeps those ranges for the next refresh. A local write
-// makes the next refresh notify the whole file.
+// the player's reads of other parts. No change: the attributes only. The
+// first refresh (a record made by reads only), a refresh after a refused
+// notify and a refresh after a local write notify the whole file.
 func TestJMRefreshNotifiesOnlyChangedRanges(t *testing.T) {
 	v := pinVFS(t)
 	reg := prometheus.NewRegistry()
@@ -547,6 +547,10 @@ func TestJMRefreshNotifiesOnlyChangedRanges(t *testing.T) {
 		return true
 	}
 
+	// The first refresh has only a partial record (made by reads): whole.
+	if got := refresh(0); !same(got, [][2]int64{{0, 0}}) {
+		t.Fatalf("first refresh: notifies %v, want the whole file", got)
+	}
 	if got := refresh(0); !same(got, [][2]int64{{-1, 0}}) {
 		t.Fatalf("no change: notifies %v, want the attributes only", got)
 	}
@@ -564,8 +568,11 @@ func TestJMRefreshNotifiesOnlyChangedRanges(t *testing.T) {
 	if got := refresh(syscall.EIO); !same(got, [][2]int64{{tagAt, 4096}}) {
 		t.Fatalf("refused notify: %v", got)
 	}
-	if got := refresh(0); !same(got, [][2]int64{{tagAt, 4096}}) {
-		t.Fatalf("after a refused notify the next refresh notifies %v, want the range again", got)
+	if got := refresh(0); !same(got, [][2]int64{{0, 0}}) {
+		t.Fatalf("after a refused notify the next refresh notifies %v, want the whole file", got)
+	}
+	if got := refresh(0); !same(got, [][2]int64{{-1, 0}}) {
+		t.Fatalf("after a confirmed whole refresh: notifies %v, want the attributes only", got)
 	}
 	// A local write leaves pages no list describes.
 	_, wfh, e := v.Open(ctx, ino, syscall.O_RDWR)
@@ -581,5 +588,208 @@ func TestJMRefreshNotifiesOnlyChangedRanges(t *testing.T) {
 	v.Release(ctx, ino, wfh)
 	if got := refresh(0); !same(got, [][2]int64{{0, 0}}) {
 		t.Fatalf("after a local write: notifies %v, want the whole file", got)
+	}
+}
+
+// jmRangedVFS is a played clip of size bytes with a complete record: read at
+// 0, refreshed twice (whole, then confirmed).
+func jmRangedVFS(t *testing.T, size int) (v, peer *VFS, ino Ino, rfh uint64, calls func() [][2]int64) {
+	t.Helper()
+	v = pinVFS(t)
+	reg := prometheus.NewRegistry()
+	peer = NewVFS(v.Conf, v.Meta, v.Store, prometheus.WrapRegistererWithPrefix("juicefs_", reg), reg)
+	ctx := NewLogContext(meta.NewContext(10, 1, []uint32{2, 3}))
+	fe, fh, e := v.Create(ctx, 1, "clip", 0644, 0, syscall.O_RDWR)
+	if e != 0 {
+		t.Fatal(e)
+	}
+	if e := v.Write(ctx, fe.Inode, bytes.Repeat([]byte{'a'}, size), 0, fh); e != 0 {
+		t.Fatal(e)
+	}
+	if e := v.Flush(ctx, fe.Inode, fh, 0); e != 0 {
+		t.Fatal(e)
+	}
+	v.Release(ctx, fe.Inode, fh)
+	ino = fe.Inode
+	if _, rfh, e = v.Open(ctx, ino, syscall.O_RDONLY); e != 0 {
+		t.Fatal(e)
+	}
+	buf := make([]byte, 4096)
+	if _, e := v.Read(ctx, ino, buf, 0, rfh); e != 0 {
+		t.Fatal(e)
+	}
+	jmWaitBuffersSettled(t, v, ino)
+	var mu sync.Mutex
+	var got [][2]int64
+	JMSetInodeInvalidator(func(_ Ino, off, n int64) syscall.Errno {
+		mu.Lock()
+		got = append(got, [2]int64{off, n})
+		mu.Unlock()
+		return 0
+	})
+	t.Cleanup(func() { JMSetInodeInvalidator(nil) })
+	calls = func() [][2]int64 {
+		mu.Lock()
+		defer mu.Unlock()
+		out := got
+		got = nil
+		return out
+	}
+	for i := 0; i < 2; i++ {
+		if r := refreshMsg(v, refreshBody(ino)); r[0] != 0 {
+			t.Fatalf("reply % x", r)
+		}
+	}
+	if c := calls(); len(c) != 2 || c[1] != [2]int64{-1, 0} {
+		t.Fatalf("setup refreshes notified %v, want whole then attributes", c)
+	}
+	return v, peer, ino, rfh, calls
+}
+
+func jmPeerWrite(t *testing.T, peer *VFS, ino Ino, b byte, off uint64, n int) {
+	t.Helper()
+	ctx := NewLogContext(meta.NewContext(10, 1, []uint32{2, 3}))
+	_, pfh, e := peer.Open(ctx, ino, syscall.O_RDWR)
+	if e != 0 {
+		t.Fatal(e)
+	}
+	if e := peer.Write(ctx, ino, bytes.Repeat([]byte{b}, n), off, pfh); e != 0 {
+		t.Fatal(e)
+	}
+	if e := peer.Flush(ctx, ino, pfh, 0); e != 0 {
+		t.Fatal(e)
+	}
+	peer.Release(ctx, ino, pfh)
+}
+
+// jmCovers reports whether the notifies drop the page at off.
+func jmCovers(calls [][2]int64, off int64) bool {
+	for _, c := range calls {
+		if c[0] == 0 && c[1] == 0 || c[0] >= 0 && c[0] <= off && off < c[0]+c[1] {
+			return true
+		}
+	}
+	return false
+}
+
+// Review C1 of #97: the peer rewrites 0-4 KiB and appends; a LOOKUP or
+// GETATTR with the new length (VFS.UpdateLength) reaches the reader before
+// the refresh; the player then reads at 6 MiB, which records only that
+// chunk's part. The refresh must still drop page 0, which holds the old
+// head under the new mtime. Also after a local write and after the record
+// cap reset.
+func TestJMRefreshAfterForgetDropsOldPages(t *testing.T) {
+	const size = 8 << 20
+	ctx := NewLogContext(meta.NewContext(10, 1, []uint32{2, 3}))
+	t.Run("new length seen first", func(t *testing.T) {
+		v, peer, ino, rfh, calls := jmRangedVFS(t, size)
+		defer v.Release(ctx, ino, rfh)
+		jmPeerWrite(t, peer, ino, 'b', 0, 4096)
+		jmPeerWrite(t, peer, ino, 'c', size, 4096)
+		v.UpdateLength(ino, &meta.Attr{Full: true, Typ: meta.TypeFile, Length: size + 4096})
+		buf := make([]byte, 4096)
+		if _, e := v.Read(ctx, ino, buf, 6<<20, rfh); e != 0 {
+			t.Fatal(e)
+		}
+		jmWaitBuffersSettled(t, v, ino)
+		if r := refreshMsg(v, refreshBody(ino)); r[0] != 0 {
+			t.Fatalf("reply % x", r)
+		}
+		if c := calls(); !jmCovers(c, 0) {
+			t.Fatalf("notifies %v leave page 0 with the old head", c)
+		}
+	})
+	t.Run("local write", func(t *testing.T) {
+		v, peer, ino, rfh, calls := jmRangedVFS(t, size)
+		defer v.Release(ctx, ino, rfh)
+		v.reader.Invalidate(ino, 1<<20, 4096) // what a local write does
+		jmPeerWrite(t, peer, ino, 'b', 0, 4096)
+		buf := make([]byte, 4096)
+		if _, e := v.Read(ctx, ino, buf, 6<<20, rfh); e != 0 {
+			t.Fatal(e)
+		}
+		if r := refreshMsg(v, refreshBody(ino)); r[0] != 0 {
+			t.Fatalf("reply % x", r)
+		}
+		if c := calls(); !jmCovers(c, 0) {
+			t.Fatalf("notifies %v leave page 0 with the old head", c)
+		}
+	})
+	t.Run("record cap reset", func(t *testing.T) {
+		v, peer, ino, rfh, calls := jmRangedVFS(t, size)
+		defer v.Release(ctx, ino, rfh)
+		dr := v.reader.(*dataReader)
+		for i := 0; i < jmServedInodes; i++ {
+			dr.jmServed.record(Ino(1<<40+i), 0, []meta.Slice{})
+		}
+		jmPeerWrite(t, peer, ino, 'b', 0, 4096)
+		buf := make([]byte, 4096)
+		if _, e := v.Read(ctx, ino, buf, 6<<20, rfh); e != 0 {
+			t.Fatal(e)
+		}
+		if r := refreshMsg(v, refreshBody(ino)); r[0] != 0 {
+			t.Fatalf("reply % x", r)
+		}
+		if c := calls(); !jmCovers(c, 0) {
+			t.Fatalf("notifies %v leave page 0 with the old head", c)
+		}
+	})
+}
+
+// Review H1 of #97: macFUSE clamps a ranged notify to the kernel's old size,
+// so an append's changed range (from the old end on) drops nothing and the
+// partial last page keeps zeros. A length that differs from the record's
+// must notify the whole file, also with no reader open (no reader length to
+// compare).
+func TestJMRefreshLengthChangeIsWhole(t *testing.T) {
+	const size = 8<<20 + 1000 // the last page is partial
+	ctx := NewLogContext(meta.NewContext(10, 1, []uint32{2, 3}))
+	v, peer, ino, rfh, calls := jmRangedVFS(t, size)
+	v.Release(ctx, ino, rfh) // no reader open
+	jmPeerWrite(t, peer, ino, 'c', size, 4096)
+	if r := refreshMsg(v, refreshBody(ino)); r[0] != 0 {
+		t.Fatalf("reply % x", r)
+	}
+	if c := calls(); len(c) != 1 || c[0] != [2]int64{0, 0} {
+		t.Fatalf("append: notifies %v, want the whole file", c)
+	}
+}
+
+// Review M1 of #97: version 2 answers Pending instead of holding the app's
+// control channel while the notify waits; version 3 polls it.
+func TestJMRefreshAsyncNotifyPolls(t *testing.T) {
+	v := pinVFS(t)
+	ctx := NewLogContext(meta.NewContext(10, 1, []uint32{2, 3}))
+	fe, fh, _ := v.Create(ctx, 1, "f", 0644, 0, syscall.O_RDWR)
+	v.Release(ctx, fe.Inode, fh)
+	release := make(chan struct{})
+	JMSetInodeInvalidator(func(Ino, int64, int64) syscall.Errno { <-release; return 0 })
+	defer JMSetInodeInvalidator(nil)
+	body := func(ver byte) []byte { return binary.BigEndian.AppendUint64([]byte{ver}, uint64(fe.Inode)) }
+	start := time.Now()
+	r := refreshMsg(v, body(jmRefreshVersionAsync))
+	if len(r) != jmRefreshReplyOK || r[0] != 0 || r[1] != JMRefreshKernelPending || time.Since(start) > 2*time.Second {
+		t.Fatalf("async refresh with a stuck notify: % x after %s", r, time.Since(start))
+	}
+	if p := refreshMsg(v, body(jmRefreshVersionPoll)); !bytes.Equal(p, []byte{0, JMRefreshKernelPending}) {
+		t.Fatalf("poll while pending: % x", p)
+	}
+	close(release)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		p := refreshMsg(v, body(jmRefreshVersionPoll))
+		if bytes.Equal(p, []byte{0, JMRefreshKernelAccepted}) {
+			break
+		}
+		if !bytes.Equal(p, []byte{0, JMRefreshKernelPending}) || time.Now().After(deadline) {
+			t.Fatalf("poll after the notify ended: % x", p)
+		}
+	}
+	if p := refreshMsg(v, body(jmRefreshVersionPoll)); !bytes.Equal(p, []byte{uint8(syscall.ENOENT)}) {
+		t.Fatalf("poll after the answer: % x, want ENOENT", p)
+	}
+	JMSetInodeInvalidator(func(Ino, int64, int64) syscall.Errno { return 0 })
+	if r := refreshMsg(v, body(jmRefreshVersionAsync)); r[0] != 0 || r[1] != JMRefreshKernelAccepted {
+		t.Fatalf("async refresh with a quick notify: % x", r)
 	}
 }

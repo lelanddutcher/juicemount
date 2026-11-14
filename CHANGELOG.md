@@ -67,10 +67,17 @@
     byte range the edit did not change, and drops in the kernel only the byte
     ranges that changed (whole file on a length change, a local write, or
     when unsure). Before, every refresh restarted the player's block
-    downloads and waited for every read of the file in flight. The kernel
-    wait is 6 s (was 2 s). A slow refresh logs its phases in both logs.
-  - The stat after a refresh runs only when the length changed. On Linux it
-    took 3–20 s during a save (FUSE drops all pages on a new mtime).
+    downloads and waited for every read of the file in flight. Ranges are
+    used only when JuiceFS knows every page the kernel holds; after a new
+    length, a local write or a refused notify the next refresh drops the
+    whole file. The kernel notify may take up to 6 s (was 2 s), and the app
+    polls for it instead of holding JuiceFS's control channel, which its
+    saves (drain), pins and network follower share. A slow refresh logs its
+    phases in both logs; any control message that waits 200 ms or more for
+    the channel is logged.
+  - The stat after a refresh runs only when the length changed, and for at
+    most 2 s. On Linux it took 3–20 s during a save (FUSE drops all pages on
+    a new mtime).
   Remote lab (`peer-edit-lab.sh`, new `playedit` case: 1 GiB clip played,
   the peer saves it back to back for 60 s, about 55 s per save): READs
   answered JUKEBOX by the refresh 21 → 1 and failed refreshes 10 → 0 (0.5

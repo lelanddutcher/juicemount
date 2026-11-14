@@ -2,6 +2,7 @@ package nfs
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"sync"
 	"sync/atomic"
@@ -17,7 +18,7 @@ import (
 // and answered JUKEBOX, and the Mac backed off for up to 30 s.
 
 // The model: hooks every 15 ms for 1.2 s (a continuous save), a refresh takes
-// 60 ms, a READ every 5 ms with a 400 ms bound. Every READ must read on,
+// 60 ms, a READ every 5 ms with a 2 s bound. Every READ must read on,
 // none may wait much longer than two refreshes, and the runs must be
 // coalesced, not one per hook.
 func TestContentRefreshContinuousSaveNeverStarvesReads(t *testing.T) {
@@ -45,7 +46,7 @@ func TestContentRefreshContinuousSaveNeverStarvesReads(t *testing.T) {
 	var longest time.Duration
 	for end := time.Now().Add(1200 * time.Millisecond); time.Now().Before(end); {
 		start := time.Now()
-		if err := c.wait("clip", 400*time.Millisecond); err != nil {
+		if err := c.wait("clip", 2*time.Second); err != nil {
 			starved++
 		}
 		longest = max(longest, time.Since(start))
@@ -58,8 +59,9 @@ func TestContentRefreshContinuousSaveNeverStarvesReads(t *testing.T) {
 		t.Fatalf("%d of %d READs waited past the bound during a continuous save", starved, reads)
 	}
 	// A READ waits for the run going when it arrives, a pause no longer than
-	// that run, and one full run: about 3 x 60 ms.
-	if longest > 300*time.Millisecond {
+	// that run, and one full run: about 3 x 60 ms. The limit leaves room for
+	// a loaded CI runner (review L3 of #97); the old gate waited the bound.
+	if longest > time.Second {
 		t.Fatalf("longest READ wait %s, want about three refresh times", longest)
 	}
 	if h, r := hooks.Load(), runs.Load(); r*3 > h {
@@ -214,5 +216,72 @@ func TestPeerEditContinuousSaveNeverPairsOldBytesWithNewAttributes(t *testing.T)
 	p := nfsRead(t, jfs, file, 8<<10, 4096)
 	if !p.mtime.Equal(mtimeOf(saves-1)) || !bytes.Equal(p.data, version(saves - 1)[:4096]) {
 		t.Fatalf("after the save: mtime %v data %q, want the last version", p.mtime, p.data[:1])
+	}
+}
+
+// Review M1 of #97: the refresh answers Pending and the app polls with short
+// exchanges; an older juicefs gets version 1; a lost notify or a notify past
+// the budget counts as not confirmed.
+func TestJFSRefreshPollsAPendingNotify(t *testing.T) {
+	head := func(flags byte) []byte {
+		r := []byte{0, flags}
+		r = binary.BigEndian.AppendUint64(r, 7<<20)
+		return binary.BigEndian.AppendUint64(r, 42)
+	}
+	var versions []byte
+	polls := 0
+	c := &jfsControl{testExchange: func(msg []byte, _ int) ([]byte, error) {
+		v := msg[8]
+		versions = append(versions, v)
+		switch v {
+		case jfsRefreshAsync:
+			return head(jfsRefreshPending), nil
+		case jfsRefreshPoll:
+			if polls++; polls < 3 {
+				return []byte{0, jfsRefreshPending}, nil
+			}
+			return []byte{0, jfsRefreshKernelAccepted}, nil
+		}
+		return nil, errors.New("unexpected version")
+	}}
+	flags, length, _, tm, err := c.refreshInodeTimed(5, time.Second)
+	if err != nil || flags != jfsRefreshKernelAccepted || length != 7<<20 || tm.polls != 3 {
+		t.Fatalf("pending then accepted: flags %d length %d polls %d err %v (versions %v)", flags, length, tm.polls, err, versions)
+	}
+	// A juicefs with only version 1 refuses version 2 with EINVAL.
+	versions = nil
+	c.testExchange = func(msg []byte, _ int) ([]byte, error) {
+		versions = append(versions, msg[8])
+		if msg[8] != jfsRefreshSync {
+			return []byte{byte(syscall.EINVAL)}, nil
+		}
+		return head(jfsRefreshKernelAccepted), nil
+	}
+	if flags, _, _, _, err := c.refreshInodeTimed(5, time.Second); err != nil || flags != jfsRefreshKernelAccepted ||
+		!bytes.Equal(versions, []byte{jfsRefreshAsync, jfsRefreshSync}) {
+		t.Fatalf("version 1 fallback: flags %d err %v versions %v", flags, err, versions)
+	}
+	// juicefs lost the pending notify.
+	c.testExchange = func(msg []byte, _ int) ([]byte, error) {
+		if msg[8] == jfsRefreshPoll {
+			return []byte{byte(syscall.ENOENT)}, nil
+		}
+		return head(jfsRefreshPending), nil
+	}
+	if flags, _, _, _, err := c.refreshInodeTimed(5, time.Second); err != nil || flags&jfsRefreshKernelAccepted != 0 {
+		t.Fatalf("lost notify: flags %d err %v", flags, err)
+	}
+	// Pending past the budget.
+	prev := jfsRefreshNotifyBudget
+	jfsRefreshNotifyBudget = 150 * time.Millisecond
+	t.Cleanup(func() { jfsRefreshNotifyBudget = prev })
+	c.testExchange = func(msg []byte, _ int) ([]byte, error) {
+		if msg[8] == jfsRefreshPoll {
+			return []byte{0, jfsRefreshPending}, nil
+		}
+		return head(jfsRefreshPending), nil
+	}
+	if flags, _, _, _, err := c.refreshInodeTimed(5, time.Second); err != nil || flags != jfsRefreshKernelTimeout {
+		t.Fatalf("pending past the budget: flags %d err %v", flags, err)
 	}
 }

@@ -33,7 +33,9 @@
 #                2 MiB/s while the peer saves it in place back to back for
 #                PE_SAVE (default 60s): a 4 KiB tagged block every 8 MiB,
 #                one close per save. JUKEBOX waits are the Mac's (4, 8, 16,
-#                30 s); PE_RATE sets the play rate in MiB/s (default 2).
+#                30 s); PE_RATE sets the play rate in MiB/s (default 2);
+#                PE_WRITES=true also saves a 256 KiB file through NFS every
+#                second (jm5 drains them through juicefs's control channel).
 #                It reports the stalls, the JUKEBOX count, P2 pairs
 #                (a reply at or past a save's mtime with older bytes) and
 #                when the last save's bytes show at 8 offsets.
@@ -197,7 +199,7 @@ run() {
       # fresh on the last trial would reuse f01, already read: skip it.
       if [ "$kase" = fresh ] && [ "$i" = "$TRIALS" ]; then continue; fi
       stats "$OUT/$label.$kase.$n.before.txt"
-      probe run -export "$xpath" -case "$kase" -file "$file" -timeout "$TIMEOUT" -save "${PE_SAVE:-60s}" -rate "${PE_RATE:-2}" >> "$OUT/$label.jsonl" \
+      probe run -export "$xpath" -case "$kase" -file "$file" -timeout "$TIMEOUT" -save "${PE_SAVE:-60s}" -rate "${PE_RATE:-2}" -writes="${PE_WRITES:-false}" >> "$OUT/$label.jsonl" \
         || log "$label: $kase $file failed"
       sleep 1
       stats "$OUT/$label.$kase.$n.after.txt"

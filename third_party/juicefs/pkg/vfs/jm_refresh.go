@@ -35,11 +35,17 @@
  *    read the file from since its last refresh differs from the fresh list
  *    (the kernel's pages came from those lists), or the attributes only when
  *    no byte changed. A changed length, a chunk with no fresh list, too many
- *    ranges, a local write, a length change, or no record of the inode
- *    notify the whole file. A notify that is not accepted keeps the record, so the next
- *    refresh drops those ranges again.
+ *    ranges, a local write, a length change, or no complete record of the
+ *    inode notify the whole file; see jmServedSet.
  *
- * Body: version(1) = 1, inode(8).
+ * Body: version(1), inode(8). Version 1 waits for the kernel notify (up to
+ * jmRefreshNotifyWait). Version 2 (patch 0032) waits up to
+ * jmRefreshAsyncWait, then answers flag 16 (Pending); the app then sends
+ * version 3 with the same inode, which answers errno(1) and flags(1): the
+ * final flags, or Pending again at once, or ENOENT when no
+ * notify of the inode is pending. So the app's control channel, which its
+ * drainer, pins and link follower share, is never held while a notify waits
+ * for the reads of the file in flight (review M1 of #97).
  *
  * Reply: errno(1); on errno 0 also flags(1), length(8), mtime_ns(8): 18
  * bytes. flags: bit 1 the kernel accepted every notify (attributes and the
@@ -67,13 +73,25 @@ import (
 )
 
 const (
-	jmRefreshVersion = 1
-	jmRefreshReplyOK = 1 + 1 + 8 + 8
+	jmRefreshVersion      = 1
+	jmRefreshVersionAsync = 2 // patch 0032: Pending instead of a long wait
+	jmRefreshVersionPoll  = 3 // patch 0032: the flags of a pending notify
+	jmRefreshReplyOK      = 1 + 1 + 8 + 8
 
 	JMRefreshKernelAccepted = 1
 	JMRefreshKernelNone     = 2
 	JMRefreshKernelTimeout  = 4
 	JMRefreshKernelFailed   = 8
+	JMRefreshKernelPending  = 16
+)
+
+// jmRefreshAsyncWait: how long a version 2 refresh waits for its notify
+// before it answers Pending. jmRefreshPollWait: how long a poll waits; 0
+// answers at once, so a poll holds the app's control channel for one local
+// exchange only (the app sleeps between polls).
+var (
+	jmRefreshAsyncWait = 250 * time.Millisecond
+	jmRefreshPollWait  = time.Duration(0)
 )
 
 // jmRefreshNotifyWait bounds the wait for the kernel notify. The notify
@@ -122,12 +140,31 @@ const (
 
 // jmServedSet records, by inode and chunk, the slice lists this mount's read
 // buffers were read from since the inode's last refresh. The kernel's pages
-// of the file came from those lists. A local write or a length change
-// forgets the inode: the kernel then holds pages no list describes, and the
-// next refresh notifies the whole file.
+// of the file came from those lists.
+//
+// Only a complete record can make a refresh ranged. A record is complete
+// once a refresh replaced it (swap) and the kernel accepted that refresh's
+// notify (confirm): from then on, every page the kernel holds came from a
+// list in it. A record that a read creates is partial: pages from before it
+// (an earlier open, a local write, a reset) are in no list. A local write, a
+// length change and a refused notify make the record partial again (review
+// C1 of #97: after a forget, the next read made a fresh record of only the
+// chunks read since, and a peer's change of page 0 got an attributes-only
+// notify). The complete record also holds the file length it was made at;
+// another length makes the refresh whole (review H1: macFUSE clamps a ranged
+// notify to the kernel's old size, so the stale tail page of an append would
+// stay).
 type jmServedSet struct {
-	mu sync.Mutex
-	m  map[Ino]map[uint32][][]meta.Slice
+	mu    sync.Mutex
+	m     map[Ino]*jmServedRecord
+	epoch uint64
+}
+
+type jmServedRecord struct {
+	chunks   map[uint32][][]meta.Slice
+	complete bool
+	length   uint64 // the file length when the record was made by swap
+	epoch    uint64 // changes when the record goes partial or is replaced
 }
 
 // record notes that a buffer of chunk indx was read from ss. A nil list
@@ -136,24 +173,25 @@ func (j *jmServedSet) record(inode Ino, indx uint32, ss []meta.Slice) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	if j.m == nil || len(j.m) >= jmServedInodes && j.m[inode] == nil {
-		j.m = make(map[Ino]map[uint32][][]meta.Slice)
+		j.m = make(map[Ino]*jmServedRecord) // every inode partial (absent) again
 	}
-	chunks := j.m[inode]
-	if chunks == nil {
-		chunks = make(map[uint32][][]meta.Slice)
-		j.m[inode] = chunks
+	rec := j.m[inode]
+	if rec == nil {
+		j.epoch++
+		rec = &jmServedRecord{chunks: make(map[uint32][][]meta.Slice), epoch: j.epoch} // partial
+		j.m[inode] = rec
 	}
-	lists := chunks[indx]
+	lists := rec.chunks[indx]
 	for _, l := range lists {
 		if l == nil || jmSameRange(l, ss, 0, meta.ChunkSize) {
 			return
 		}
 	}
 	if len(lists) >= jmServedMax || ss == nil {
-		chunks[indx] = [][]meta.Slice{nil}
+		rec.chunks[indx] = [][]meta.Slice{nil}
 		return
 	}
-	chunks[indx] = append(lists, ss)
+	rec.chunks[indx] = append(lists, ss)
 }
 
 // jmKnown is ss as a known list: an empty chunk is an empty list, not nil.
@@ -164,51 +202,71 @@ func jmKnown(ss []meta.Slice) []meta.Slice {
 	return ss
 }
 
+// forget makes the inode's record partial: the next refresh is whole.
 func (j *jmServedSet) forget(inode Ino) {
 	j.mu.Lock()
-	delete(j.m, inode)
-	j.mu.Unlock()
+	defer j.mu.Unlock()
+	if rec := j.m[inode]; rec != nil {
+		j.epoch++
+		rec.complete, rec.epoch = false, j.epoch
+	}
 }
 
 func (j *jmServedSet) chunks(inode Ino) []uint32 {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	var out []uint32
-	for indx := range j.m[inode] {
-		out = append(out, indx)
+	if rec := j.m[inode]; rec != nil {
+		for indx := range rec.chunks {
+			out = append(out, indx)
+		}
 	}
 	return out
 }
 
-// swap returns the inode's record and leaves, for each recorded chunk with a
-// fresh list, that list alone: once the kernel drops the changed ranges,
-// its pages hold what fresh describes. ok is false when the inode has no
-// record.
-func (j *jmServedSet) swap(inode Ino, fresh map[uint32][]meta.Slice) (old map[uint32][][]meta.Slice, ok bool) {
+// swap returns the inode's record and replaces it with a pending one that
+// holds, for each recorded chunk with a fresh list, that list alone: once the
+// kernel drops the changed ranges, its pages hold what fresh describes. The
+// pending record becomes complete when confirm gets its token. old is nil
+// when the inode has no record.
+func (j *jmServedSet) swap(inode Ino, fresh map[uint32][]meta.Slice, length uint64) (old *jmServedRecord, token uint64) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
-	old, ok = j.m[inode]
-	if !ok {
-		return nil, false
+	if j.m == nil {
+		j.m = make(map[Ino]*jmServedRecord)
 	}
-	next := make(map[uint32][][]meta.Slice, len(old))
-	for indx := range old {
-		if ss, have := fresh[indx]; have {
-			next[indx] = [][]meta.Slice{ss}
+	old = j.m[inode]
+	j.epoch++
+	next := &jmServedRecord{chunks: make(map[uint32][][]meta.Slice), length: length, epoch: j.epoch}
+	if old != nil {
+		for indx := range old.chunks {
+			if ss, have := fresh[indx]; have {
+				next.chunks[indx] = [][]meta.Slice{ss}
+			}
 		}
 	}
 	j.m[inode] = next
-	return old, true
+	return old, j.epoch
+}
+
+// confirm makes the record swap left complete, unless something made it
+// partial since (its epoch changed).
+func (j *jmServedSet) confirm(inode Ino, token uint64) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if rec := j.m[inode]; rec != nil && rec.epoch == token {
+		rec.complete = true
+	}
 }
 
 // jmRefreshPlan is what one refresh found: the kernel ranges to drop (file
-// offset, length), or whole; and the record it replaced, to put back if the
-// kernel does not accept the notify.
+// offset, length), or whole; and the token that confirms the new record.
 type jmRefreshPlan struct {
 	whole         bool
 	ranges        [][2]uint64
 	kept, dropped int
-	replaced      map[uint32][][]meta.Slice
+	token         uint64
+	why           string // why the notify is whole
 }
 
 // jmRefresh drops the read buffers of the inode's open readers that may hold
@@ -221,10 +279,15 @@ type jmRefreshPlan struct {
 // between.
 func (r *dataReader) jmRefresh(inode Ino, length uint64, fresh map[uint32][]meta.Slice) jmRefreshPlan {
 	var plan jmRefreshPlan
+	whole := func(why string) {
+		if !plan.whole {
+			plan.whole, plan.why = true, why
+		}
+	}
 	r.visit(inode, func(f *fileReader) {
 		sameLength := f.length == length
 		if !sameLength {
-			plan.whole = true
+			whole("a reader's length changed")
 		}
 		f.length = length
 		f.visit(func(s *sliceReader) bool {
@@ -240,17 +303,24 @@ func (r *dataReader) jmRefresh(inode Ino, length uint64, fresh map[uint32][]meta
 			return true
 		})
 	})
-	old, ok := r.jmServed.swap(inode, fresh)
-	plan.replaced = old
-	if !ok {
-		plan.whole = true
+	old, token := r.jmServed.swap(inode, fresh, length)
+	plan.token = token
+	switch {
+	case old == nil:
+		whole("no record")
+	case !old.complete:
+		whole("partial record")
+	case old.length != length:
+		whole("the length changed")
+	}
+	if plan.whole {
 		return plan
 	}
-	for indx, lists := range old {
+	for indx, lists := range old.chunks {
 		ss, have := fresh[indx]
 		if !have {
-			plan.whole = true
-			continue
+			whole("a chunk list could not be read")
+			return plan
 		}
 		base := uint64(indx) * meta.ChunkSize
 		for _, l := range lists {
@@ -261,7 +331,7 @@ func (r *dataReader) jmRefresh(inode Ino, length uint64, fresh map[uint32][]meta
 	}
 	plan.ranges = jmMergeRanges(plan.ranges)
 	if len(plan.ranges) > jmRangesMax {
-		plan.whole = true
+		whole("too many ranges")
 	}
 	return plan
 }
@@ -280,23 +350,11 @@ func jmMergeRanges(rs [][2]uint64) [][2]uint64 {
 	return out
 }
 
-// jmRestoreServed puts back the record of a refresh whose notify the kernel
-// did not accept: those ranges may still hold old pages.
-func (r *dataReader) jmRestoreServed(inode Ino, plan jmRefreshPlan) {
-	if plan.replaced == nil {
-		r.jmServed.forget(inode) // no record: the next refresh is whole again
-		return
-	}
-	for indx, lists := range plan.replaced {
-		for _, l := range lists {
-			r.jmServed.record(inode, indx, l)
-		}
-	}
-}
-
-// jmTruncate forgets the inode's record when its length changes. Truncate
-// also runs for every attribute reply with the unchanged length
-// (VFS.UpdateLength): that keeps the record.
+// jmTruncate makes the inode's record partial when its length changes.
+// Truncate also runs for every attribute reply with the unchanged length
+// (VFS.UpdateLength): that keeps the record. A reply with a new length
+// makes it partial even when a reader's length was already updated, so the
+// next refresh is whole (the record's own length also differs then).
 func (r *dataReader) jmTruncate(inode Ino, length uint64) {
 	changed, readers := false, 0
 	r.visit(inode, func(f *fileReader) {
@@ -450,11 +508,21 @@ func jmFreshChunks(ctx meta.Context, m jmOpenFileRefresher, inode Ino, chunks []
 
 func (v *VFS) jmRefreshMsg(ctx meta.Context, r *utils.Buffer, out io.Writer) {
 	fail := func(eno syscall.Errno) { _, _ = out.Write([]byte{uint8(eno)}) }
-	if r.Left() != 1+8 || r.Get8() != jmRefreshVersion {
+	if r.Left() != 1+8 {
 		fail(syscall.EINVAL)
 		return
 	}
+	version := r.Get8()
 	inode := Ino(r.Get64())
+	switch version {
+	case jmRefreshVersion, jmRefreshVersionAsync:
+	case jmRefreshVersionPoll:
+		v.jmRefreshPoll(inode, out)
+		return
+	default:
+		fail(syscall.EINVAL)
+		return
+	}
 	m, ok := v.Meta.(jmOpenFileRefresher)
 	if !ok {
 		fail(syscall.ENOTSUP)
@@ -469,7 +537,7 @@ func (v *VFS) jmRefreshMsg(ctx meta.Context, r *utils.Buffer, out io.Writer) {
 	metaDone := time.Now()
 	length := attr.Length
 	var chunks []uint32
-	plan := jmRefreshPlan{whole: true}
+	plan := jmRefreshPlan{whole: true, why: "not a file"}
 	dr, isData := v.reader.(*dataReader)
 	if attr.Typ == meta.TypeFile && isData {
 		if v.writer != nil {
@@ -483,17 +551,31 @@ func (v *VFS) jmRefreshMsg(ctx meta.Context, r *utils.Buffer, out io.Writer) {
 		plan = dr.jmRefresh(inode, length, jmFreshChunks(ctx, m, inode, chunks))
 	}
 	buffersDone := time.Now()
-	flags := v.jmRefreshKernel(inode, plan)
-	if flags&JMRefreshKernelAccepted == 0 && isData {
-		dr.jmRestoreServed(inode, plan)
-	}
-	// Patch 0032: the phases of a slow refresh, for the app's log beside it
-	// (bug F1: the kernel notify waits for the file's reads in flight).
-	if total := time.Since(start); total >= jmRefreshSlowLog {
-		logger.Infof("refresh inode %d: %s (metadata %s, %d chunk lists %s, buffers kept %d dropped %d, kernel notify %s for %s, flags %d)",
-			inode, total.Round(time.Millisecond), metaDone.Sub(start).Round(time.Millisecond), len(chunks),
-			buffersDone.Sub(metaDone).Round(time.Millisecond), plan.kept, plan.dropped,
-			time.Since(buffersDone).Round(time.Millisecond), plan.describe(), flags)
+	job := v.jmStartKernel(inode, plan, func(flags uint8) {
+		if isData && flags&(JMRefreshKernelAccepted|JMRefreshKernelNone) != 0 {
+			dr.jmServed.confirm(inode, plan.token)
+		}
+		// Patch 0032: the phases of a slow refresh, for the app's log beside
+		// it (bug F1: the kernel notify waits for the file's reads in flight).
+		if total := time.Since(start); total >= jmRefreshSlowLog {
+			logger.Infof("refresh inode %d: %s (metadata %s, %d chunk lists %s, buffers kept %d dropped %d, kernel notify %s for %s, flags %d)",
+				inode, total.Round(time.Millisecond), metaDone.Sub(start).Round(time.Millisecond), len(chunks),
+				buffersDone.Sub(metaDone).Round(time.Millisecond), plan.kept, plan.dropped,
+				time.Since(buffersDone).Round(time.Millisecond), plan.describe(), flags)
+		}
+	})
+	var flags uint8
+	if version == jmRefreshVersion {
+		flags = job.wait(jmRefreshNotifyWait)
+		if flags == 0 {
+			logger.Warnf("refresh inode %d: kernel notify did not answer in %s", inode, jmRefreshNotifyWait)
+			flags = JMRefreshKernelTimeout
+		}
+	} else if flags = job.wait(jmRefreshAsyncWait); flags == 0 {
+		// Review M1 of #97: the app's control channel is not held while the
+		// notify waits for the reads in flight; it polls.
+		jmNotifies.Store(jmNotifyKey{v, inode}, job)
+		flags = JMRefreshKernelPending
 	}
 	w := utils.NewBuffer(jmRefreshReplyOK)
 	w.Put8(0)
@@ -503,10 +585,64 @@ func (v *VFS) jmRefreshMsg(ctx meta.Context, r *utils.Buffer, out io.Writer) {
 	_, _ = out.Write(w.Bytes())
 }
 
+// jmRefreshPoll answers version 3: the kernel flags of the inode's pending
+// notify, or Pending again (after jmRefreshPollWait, 0: at once). ENOENT:
+// no notify of the inode is pending (it was already answered).
+func (v *VFS) jmRefreshPoll(inode Ino, out io.Writer) {
+	key := jmNotifyKey{v, inode}
+	val, ok := jmNotifies.Load(key)
+	if !ok {
+		_, _ = out.Write([]byte{uint8(syscall.ENOENT)})
+		return
+	}
+	job := val.(*jmNotifyJob)
+	flags := job.wait(jmRefreshPollWait)
+	if flags == 0 {
+		flags = JMRefreshKernelPending
+	} else {
+		jmNotifies.CompareAndDelete(key, job)
+	}
+	_, _ = out.Write([]byte{0, flags})
+}
+
+type jmNotifyKey struct {
+	v   *VFS
+	ino Ino
+}
+
+// jmNotifies holds the notifies an async refresh left pending, for polls.
+var jmNotifies sync.Map
+
+// jmNotifyJob is one refresh's kernel notifies, running on their own
+// goroutine. flags is set before done closes.
+type jmNotifyJob struct {
+	done  chan struct{}
+	flags uint8
+}
+
+// wait returns the job's flags, or 0 if it did not end within d (at once
+// for d 0).
+func (j *jmNotifyJob) wait(d time.Duration) uint8 {
+	if d <= 0 {
+		select {
+		case <-j.done:
+			return j.flags
+		default:
+			return 0
+		}
+	}
+	select {
+	case <-j.done:
+		return j.flags
+	case <-time.After(d):
+		return 0
+	}
+}
+
 func (p jmRefreshPlan) describe() string {
 	switch {
 	case p.whole:
-		return "the whole file"
+		return "the whole file (" + p.why + ")"
 	case len(p.ranges) == 0:
 		return "the attributes"
 	}
@@ -517,13 +653,13 @@ func (p jmRefreshPlan) describe() string {
 	return fmt.Sprintf("%d ranges (%d bytes)", len(p.ranges), n)
 }
 
-// jmRefreshKernel sends the notifies of plan, all within
-// jmRefreshNotifyWait.
-func (v *VFS) jmRefreshKernel(inode Ino, plan jmRefreshPlan) uint8 {
+// jmStartKernel sends the notifies of plan on a goroutine and calls finish
+// with the flags when they end. A notify waits for the reads of its pages in
+// flight, so it may take seconds; it is never cut short (the kernel answers
+// it), only the reply stops waiting for it.
+func (v *VFS) jmStartKernel(inode Ino, plan jmRefreshPlan, finish func(uint8)) *jmNotifyJob {
+	job := &jmNotifyJob{done: make(chan struct{})}
 	fp := jmInodeInvalidator.Load()
-	if fp == nil {
-		return JMRefreshKernelNone
-	}
 	var ranges [][2]int64
 	switch {
 	case plan.whole:
@@ -535,29 +671,28 @@ func (v *VFS) jmRefreshKernel(inode Ino, plan jmRefreshPlan) uint8 {
 			ranges = append(ranges, [2]int64{int64(rg[0]), int64(rg[1])})
 		}
 	}
-	done := make(chan syscall.Errno, 1)
 	go func() {
-		for _, rg := range ranges {
-			if eno := (*fp)(inode, rg[0], rg[1]); eno != 0 {
-				done <- eno
-				return
+		flags := uint8(JMRefreshKernelAccepted)
+		if fp == nil {
+			flags = JMRefreshKernelNone
+		} else {
+			for _, rg := range ranges {
+				eno := (*fp)(inode, rg[0], rg[1])
+				if eno == 0 {
+					continue
+				}
+				if eno == syscall.ENOSYS || eno == syscall.ENOTSUP {
+					flags = JMRefreshKernelNone
+				} else {
+					logger.Warnf("refresh inode %d: kernel notify: %s", inode, eno)
+					flags = JMRefreshKernelFailed
+				}
+				break
 			}
 		}
-		done <- 0
+		job.flags = flags
+		finish(flags)
+		close(job.done)
 	}()
-	select {
-	case eno := <-done:
-		switch eno {
-		case 0:
-			return JMRefreshKernelAccepted
-		case syscall.ENOSYS, syscall.ENOTSUP:
-			return JMRefreshKernelNone
-		default:
-			logger.Warnf("refresh inode %d: kernel notify: %s", inode, eno)
-			return JMRefreshKernelFailed
-		}
-	case <-time.After(jmRefreshNotifyWait):
-		logger.Warnf("refresh inode %d: kernel notify did not answer in %s", inode, jmRefreshNotifyWait)
-		return JMRefreshKernelTimeout
-	}
+	return job
 }

@@ -150,6 +150,7 @@ func (o *openfiles) openLocked(ino Ino, attr *Attr) {
 	of, ok := o.files[ino]
 	if !ok {
 		of = ofPool.Get().(*openFile)
+		of.jmGen++ // JuiceMount patch 0032: a pooled entry is a new file (A-B-A)
 		o.files[ino] = of
 	} else if attr != nil && attr.Mtime == of.attr.Mtime && attr.Mtimensec == of.attr.Mtimensec {
 		attr.KeepCache = of.attr.KeepCache
