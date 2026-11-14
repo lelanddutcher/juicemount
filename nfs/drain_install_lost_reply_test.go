@@ -278,3 +278,118 @@ func TestOlderRowInstalledDestRespectsTaint(t *testing.T) {
 		t.Fatal("tainted: an older row's inode was trusted although another Mac held the project")
 	}
 }
+
+// failRenameUnlanded makes every install rename to dest fail with err
+// without moving anything (the request never reached the server). It
+// returns a pointer to the count.
+func failRenameUnlanded(t *testing.T, dest string, err error, times int) *int {
+	t.Helper()
+	n := 0
+	orig := drainRenameNoReplace
+	drainRenameNoReplace = func(a, b string) error {
+		if b == dest && n < times {
+			n++
+			return err
+		}
+		return orig(a, b)
+	}
+	t.Cleanup(func() { drainRenameNoReplace = orig })
+	return &n
+}
+
+// Re-review MEDIUM-1 (1): an unfinished older row of ours takes the name
+// while this row stages; the EEXIST sends us to retry in place. The staged
+// claim written before the rename must be rolled back, or the retry refuses
+// the in-place rewrite and the newer save ends as a conflict copy.
+func TestDrainNewNameTakenByOwnOlderRowEndsDone(t *testing.T) {
+	fixConflictClock(t)
+	spool, d := newTestDrainer(t, DrainerConfig{MaxAttempts: 5, BackoffBase: time.Millisecond})
+	const name = "/proj/save.mov"
+	dest := filepath.Join(d.fuseRoot, name)
+	olderID := seedLegacyUnfinishedPredecessor(t, spool, name)
+	e := writeSpoolEntry(t, spool, name, []byte("newer save"))
+	restoreLegacyUnfinishedPredecessor(t, spool, olderID)
+	drainPreInstallHook = func(*metadata.SpoolRow) {
+		if _, err := os.Lstat(dest); err == nil {
+			return
+		}
+		if err := os.WriteFile(dest, []byte("older save"), 0o644); err != nil {
+			t.Error(err)
+		}
+		fi, _ := os.Lstat(dest)
+		st := fi.Sys().(*syscall.Stat_t)
+		d.recordInstalledIdentity(olderID, uint64(st.Dev), uint64(st.Ino))
+	}
+	t.Cleanup(func() { drainPreInstallHook = nil })
+
+	drainOnce(t, d)
+	if base, _, err := spool.Meta().DrainBase(e.ID()); err != nil || base.Kind != metadata.SpoolBaseAbsent {
+		t.Fatalf("base after the EEXIST = %+v (%v), want absent (staged claim rolled back)", base, err)
+	}
+	probeDrainLoop(d)
+	assertOnlyOwnFile(t, spool, e, dest, []byte("newer save"))
+}
+
+// Re-review MEDIUM-1 (2): the rename fails with EIO and never landed (the
+// roaming case). The claim is rolled back, so the retry is not paused as
+// "server copy incomplete", and no dead inode stays recorded (LOW-2:
+// directInode would reuse it).
+func TestDrainInstallUnlandedRenameRestoresBase(t *testing.T) {
+	spool, d, e, dest, payload := lostReplyFixture(t)
+	n := failRenameUnlanded(t, dest, syscall.EIO, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), drainPassDeadline)
+	d.DrainOnceForTest(ctx)
+	cancel()
+	if *n != 1 {
+		t.Fatalf("failed renames = %d, want 1", *n)
+	}
+	base, _, err := spool.Meta().DrainBase(e.ID())
+	if err != nil || base.Kind != metadata.SpoolBaseAbsent {
+		t.Fatalf("base after an unlanded rename = %+v (%v), want absent", base, err)
+	}
+	row, err := spool.Meta().Get(e.ID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(row.LastError, serverIncompleteMarker) || strings.Contains(row.LastError, serverPreviousMarker) || !row.PauseSince.IsZero() {
+		t.Fatalf("an unlanded rename paused the row: %q (paused since %v)", row.LastError, row.PauseSince)
+	}
+	if _, err := os.Lstat(dest); !os.IsNotExist(err) {
+		t.Fatalf("name exists after an unlanded rename: %v", err)
+	}
+	probeDrainLoop(d)
+	assertOnlyOwnFile(t, spool, e, dest, payload)
+}
+
+// Re-review MEDIUM-1 (3): a temp file's install fails without landing, then
+// the app renames the temp over an existing file (atomic save). The rename
+// must record a replace base, not keep a dead claim that later becomes a
+// conflict copy.
+func TestDrainAtomicSaveAfterFailedInstallReplaces(t *testing.T) {
+	fixConflictClock(t)
+	spool, d := newTestDrainer(t, DrainerConfig{MaxAttempts: 5, BackoffBase: time.Millisecond})
+	const name = "proj/edit.prproj"
+	tmpName := name + ".tmp"
+	dest := writeBackendFile(t, d, name, []byte("version 1 on the server"))
+	mirrorSeesBackend(t, spool, name, dest)
+	payload := bytes.Repeat([]byte("v2"), 2<<20/2) // 2 MiB: the stage path
+	e := writeSpoolEntry(t, spool, tmpName, payload)
+	tmpDest := filepath.Join(d.fuseRoot, tmpName)
+	failRenameUnlanded(t, tmpDest, syscall.EIO, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), drainPassDeadline)
+	d.DrainOnceForTest(ctx)
+	cancel()
+
+	if _, _, err := spool.MigrateForRename(tmpName, name); err != nil {
+		t.Fatal(err)
+	}
+	row, err := spool.Meta().Get(e.ID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if base, _ := d.rowDrainBase(row); base.Kind != metadata.SpoolBaseReplace {
+		t.Fatalf("atomic save after a failed install recorded base %v, want replace", base.Kind)
+	}
+	probeDrainLoop(d)
+	assertOnlyOwnFile(t, spool, e, dest, payload)
+}

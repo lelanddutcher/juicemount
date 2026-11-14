@@ -1793,6 +1793,30 @@ func (s *SpoolStore) claimDrainBase(id int64, b SpoolBase) error {
 	return nil
 }
 
+// RestoreDrainBase puts back the base a row had before
+// ClaimDrainBaseStaged(id, ino), when the install rename did not land (the
+// stage still sits at its own path). It changes only a draining row that
+// still holds exactly that staged claim. Without it a dead claim would make
+// later passes treat the name as "server copy changed" (in-place refusal,
+// pause, conflict copy on an atomic save).
+func (s *SpoolStore) RestoreDrainBase(id int64, ino uint64, prev SpoolBase) error {
+	claim := SpoolBase{Kind: SpoolBaseClaimed, Ino: ino, Staged: true}
+	wIno, wMt, wCt, _ := claim.columns()
+	if wIno <= 0 {
+		return fmt.Errorf("spool restore base %d: invalid inode %d", id, ino)
+	}
+	pIno, pMt, pCt, pLen := prev.columns()
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	_, err := s.db.Exec(`UPDATE spool_entries SET base_ino=?, base_mtime_ns=?, base_ctime_ns=?, base_len=?
+	 WHERE id=? AND drain_state=? AND base_ino=? AND base_mtime_ns=? AND base_ctime_ns=?`,
+		pIno, pMt, pCt, pLen, id, DrainDraining, wIno, wMt, wCt)
+	if err != nil {
+		return fmt.Errorf("spool restore base %d: %w", id, err)
+	}
+	return nil
+}
+
 // HoldForProject returns a draining row to ready and parks it until the
 // project lease frees (state "waiting_project"). The attempt budget is not
 // touched: a refused write is not a failure of the file. Returns false when

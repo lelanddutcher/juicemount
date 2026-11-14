@@ -940,6 +940,8 @@ func (d *Drainer) installNewName(row *metadata.SpoolRow, stage *drainStage, dest
 		}
 		return false
 	}
+	var preClaim metadata.SpoolBase
+	staged := false
 	if stage.replace == nil {
 		// A new name: claim the complete, synced stage BEFORE the rename,
 		// persisted. The rename can land on the server and still report an
@@ -948,9 +950,15 @@ func (d *Drainer) installNewName(row *metadata.SpoolRow, stage *drainStage, dest
 		// The retry, in this process or after a restart, then finds its own
 		// inode at the name and adopts it (stagedClaimAdoptable) instead of
 		// publishing a conflict copy of itself (remote lab, 2026-11-13). On a
-		// claim error the install goes ahead unclaimed, as before.
-		if cerr := d.spool.Meta().ClaimDrainBaseStaged(row.ID, stage.ino); cerr != nil {
+		// claim error the install goes ahead unclaimed, as before. The
+		// pre-claim base is kept so a rename that did not land can put it
+		// back (restoreUnlandedClaim).
+		if b, _, berr := d.spool.Meta().DrainBase(row.ID); berr != nil {
+			log.Printf("drainer: row %d read base before install: %v", row.ID, berr)
+		} else if cerr := d.spool.Meta().ClaimDrainBaseStaged(row.ID, stage.ino); cerr != nil {
 			log.Printf("drainer: row %d claim stage before install: %v", row.ID, cerr)
+		} else {
+			preClaim, staged = b, true
 		}
 	}
 	if stage.replace != nil {
@@ -998,6 +1006,9 @@ func (d *Drainer) installNewName(row *metadata.SpoolRow, stage *drainStage, dest
 		jmlog.Info("drain: install rename reported an error but the name holds this save's stage; installed",
 			"path", row.NFSPath, "error", err.Error())
 		err = nil
+	}
+	if err != nil && staged {
+		d.restoreUnlandedClaim(row, stage, preClaim)
 	}
 	if err == nil {
 		if op != nil {
@@ -1132,6 +1143,23 @@ var drainStageAtName = stageAtName
 
 // stageAtName reports whether dest is now the stage's own inode: its install
 // rename landed even though it reported an error.
+// restoreUnlandedClaim undoes the staged claim installNewName wrote before
+// a rename that failed. Only when the stage still sits at its own path (same
+// inode) is it certain the rename did not land; otherwise the claim stays
+// (errs toward a conflict copy). Without the restore a dead claim would
+// refuse the in-place retry after an older own row took the name, pause the
+// row as "server copy incomplete", and turn a later atomic save into a
+// conflict copy; directInode could also reuse the dead inode.
+func (d *Drainer) restoreUnlandedClaim(row *metadata.SpoolRow, stage *drainStage, prev metadata.SpoolBase) {
+	var st unix.Stat_t
+	if unix.Lstat(stage.path, &st) != nil || uint64(st.Ino) != stage.ino || uint64(st.Dev) != stage.dev { //nolint:unconvert // int32 on Darwin
+		return
+	}
+	if err := d.spool.Meta().RestoreDrainBase(row.ID, stage.ino, prev); err != nil {
+		log.Printf("drainer: row %d restore base after a failed install: %v", row.ID, err)
+	}
+}
+
 func stageAtName(stage *drainStage, dest string) bool {
 	var st unix.Stat_t
 	if unix.Lstat(dest, &st) != nil || st.Mode&unix.S_IFMT != unix.S_IFREG {

@@ -33,7 +33,9 @@
   half rewritten. If another Mac held the project meanwhile (it may have
   edited that file), the retry publishes a conflict copy and never
   overwrites the edit; the same now holds for a file an older save of this
-  Mac put there (remote lab, a 30 s drop under an 8 MiB upload).
+  Mac put there (remote lab, a 30 s drop under an 8 MiB upload). A rename
+  that did not reach the NAS drops that record again, so the retry is not
+  paused or turned into a conflict copy.
 - Opening a clip that is not cached waits for fewer round trips on a far
   link. Before, on a 200 ms link, a cold open waited for six metadata round
   trips in a row before the first object download: the cache reader's path
