@@ -5122,6 +5122,9 @@ func (jfs *juiceFS) rename(oldpath, newpath string, op *namespaceOperation) erro
 			if err := jfs.handler.store.Insert(&clone); err != nil {
 				return err
 			}
+			// The rename's ctime change is this client's own
+			// (metadata/mtime_span.go).
+			jfs.handler.store.NoteOwnWrite(newpath)
 			if oldEntry.IsDir {
 				if _, err := jfs.handler.store.RenameSubtreeSync(oldpath, newpath); err != nil {
 					return err
@@ -5161,6 +5164,7 @@ func (jfs *juiceFS) rename(oldpath, newpath string, op *namespaceOperation) erro
 			if err := jfs.handler.store.Insert(e); err != nil {
 				return err
 			}
+			jfs.handler.store.NoteOwnWrite(newpath) // metadata/mtime_span.go
 		}
 		if err != nil {
 			return err

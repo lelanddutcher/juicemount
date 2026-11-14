@@ -3,6 +3,8 @@ package metadata
 import (
 	"context"
 	"database/sql"
+	"encoding/binary"
+	"hash/fnv"
 	"sort"
 	"strconv"
 	"sync"
@@ -14,7 +16,7 @@ import (
 
 // ============================================================================
 // A save's parts that commit after its final mtime (the mtime-span finding,
-// remote lab and laptop, 2026-11-14; review of #99).
+// remote lab and laptop, 2026-11-14; reviews of #99).
 //
 // THE PROBLEM. juicefs gives every slice of an open file the time of its
 // last write; a setattr of the mtime (cp -p, rsync -t, an app dating its
@@ -33,56 +35,69 @@ import (
 // 1. Late commits are detected (reconcileFileAttrs). Every publication of a
 //    file's attributes from Redis (the attr push, a folder reconcile, a SCAN,
 //    the gap-fill) records what it read (attrObs): the mtime, the ctime when
-//    the path reads it (a SCAN reads mtime and size only) and the slice
-//    count when known. The attr push counts a newer ctime under the same
-//    mtime as a late commit only with content evidence: the file's chunk
-//    lists hold another number of slices than recorded (a commit appends a
-//    slice; a chmod, chown, rename or link changes the ctime only). With no
-//    recorded slice count (a restart, a SCAN) it counts it, since a late
-//    commit must never be missed; this process's own chmod is marked
-//    (NoteOwnAttrChange) and its own writes (noteOwnPublication) make the
-//    next look a baseline. Observations are evicted by age, never all at
-//    once, and only committed rows record one.
+//    the path reads it (a SCAN reads mtime and size only) and the file's
+//    slice signature when known. When the push sees a ctime other than the
+//    recorded one (any other: ctimes come from different hosts' clocks) and
+//    the mtime and size did not change, the slice signature decides: every
+//    chunk list's length and its last slice (LLEN and LINDEX -1, in the same
+//    pipeline as the attr MGET). A commit appends a slice to its chunk, so
+//    the last slice changes; a chmod, chown, rename or link touches no chunk
+//    list; a compaction rewrites the head of a list (if it merges the whole
+//    list the last slice changes too, which over-counts). The same
+//    signature: not a late commit. Another one, or none recorded (a restart,
+//    a SCAN): a late commit, unless this process marked the inode for its
+//    own change (chmod, drain, create, rename) and the signature cannot
+//    decide; the mark is consumed by that one event. Observations are
+//    evicted by age, never all at once, and only committed rows record one.
 //
 // 2. The reported mtime never repeats a value the Mac may have cached older
-//    bytes under (nfsOverlays). When another client changes the content of a
-//    known inode (a new mtime, a new size, or a late commit), the reported
-//    mtime is the true one if that is above every value reported for the
-//    inode; otherwise (a late commit, or juicefs stepping the mtime back:
-//    M, M', M) it is one nanosecond above the highest value reported. The
-//    overlay is persisted (table nfs_mtime_overlay) and keyed by inode and
-//    true mtime, so a restart, a cache eviction and a row served from SQLite
-//    (JM_SERVE_FROM_SQLITE=1) report the same value. The true mtime stays in
-//    Entry.Mtime for every identity check against juicefs. The shown second
-//    is the second of the highest value reported, which the Mac already
-//    showed; only a value at x.999999999 moves it to the next second.
+//    bytes under (nfsOverlays, table nfs_mtime_reported). When another
+//    client changes the content of a known inode (a new mtime, a new size,
+//    or a late commit), the reported mtime is the true one if that is above
+//    every value reported for the inode. A true mtime more than an hour
+//    below (a deliberate date, cp -p of an old file) is also reported as it
+//    is, but only if no value reported for the inode equals it. Otherwise
+//    (a late commit, juicefs stepping the mtime back, an old date coming
+//    back: X, N, X) it is one nanosecond above the highest value reported.
+//    The values are kept per inode (the last nfsReportedPerInode), keyed by
+//    true mtime, persisted in the publication's transaction and loaded at
+//    open (rows of inodes no longer mirrored are deleted first), so a
+//    restart, a cache eviction and a row served from SQLite
+//    (JM_SERVE_FROM_SQLITE=1) report the same value. A row not in the cache
+//    takes its preimage from SQLite. The true mtime stays in Entry.Mtime for
+//    every identity check against juicefs. The shown second is the second
+//    of the highest value reported, which the Mac already showed; only a
+//    value at x.999999999 moves it to the next second.
 //
 // APPS. Only another client's content changes move it away from the true
 // mtime: this client's own writes are published by its own paths (the
-// drainer, NFS), which report the true mtime, and their echo arrives under an
-// mtime the push has not seen, which is only recorded. A teammate's save
-// already moved the mtime at its first commit, which an app with the file
-// open (Premiere's "modified since last save") already sees; the further
-// moves belong to the same save.
+// drainer, NFS), which report the true mtime. A teammate's save already
+// moved the mtime at its first commit, which an app with the file open
+// (Premiere's "modified since last save") already sees; the further moves
+// belong to the same save.
 // ============================================================================
 
-// nfsOverlay is the reported mtime of an inode while its true mtime is
-// trueNS. high is the highest value reported for the inode when it was set.
-type nfsOverlay struct {
-	trueNS, reportedNS, highNS int64
-	owner                      *Store // the Store that persists it
+// nfsReported is one value reported for an inode: reportedNS while its true
+// mtime is trueNS (reportedNS == trueNS: reported as it is).
+type nfsReported struct {
+	trueNS, reportedNS int64
+	owner              *Store // the Store that persists it
 }
 
-// nfsOverlayPerInode bounds the overlays kept per inode (one per true mtime).
-const nfsOverlayPerInode = 4
+// nfsReportedPerInode bounds the values kept per inode (newest last).
+const nfsReportedPerInode = 8
 
-// nfsOverlays is process-wide: Entry.NFSMtime has no Store. Keys include the
-// true mtime, so an inode number another volume uses cannot match by chance.
+// nfsReportedLoadMax bounds the rows loaded at open (newest first).
+const nfsReportedLoadMax = 1 << 18
+
+// nfsOverlays is process-wide: Entry.NFSMtime has no Store. Every decision
+// filters by the owning Store; keys include the true mtime, so an inode
+// number another volume uses cannot match by chance.
 var nfsOverlays = struct {
 	mu sync.RWMutex
-	m  map[uint64][]nfsOverlay
+	m  map[uint64][]nfsReported
 	n  atomic.Int64
-}{m: map[uint64][]nfsOverlay{}}
+}{m: map[uint64][]nfsReported{}}
 
 // ReportedMtime is the mtime the NFS layer reports for inode while its true
 // mtime is mtime.
@@ -93,9 +108,10 @@ func ReportedMtime(inode uint64, mtime time.Time) time.Time {
 	ns := mtime.UnixNano()
 	nfsOverlays.mu.RLock()
 	defer nfsOverlays.mu.RUnlock()
-	for _, o := range nfsOverlays.m[inode] {
-		if o.trueNS == ns {
-			return time.Unix(0, o.reportedNS)
+	list := nfsOverlays.m[inode]
+	for i := len(list) - 1; i >= 0; i-- {
+		if list[i].trueNS == ns {
+			return time.Unix(0, list[i].reportedNS)
 		}
 	}
 	return mtime
@@ -109,48 +125,70 @@ func (e *Entry) NFSMtime() time.Time {
 	return ReportedMtime(e.Inode, e.Mtime)
 }
 
-func overlayFor(inode uint64, trueNS int64) (nfsOverlay, bool) {
+// hasOverlay reports whether owner keeps an overlay for (inode, trueNS).
+func hasOverlay(owner *Store, inode uint64, trueNS int64) bool {
 	nfsOverlays.mu.RLock()
 	defer nfsOverlays.mu.RUnlock()
-	for _, o := range nfsOverlays.m[inode] {
-		if o.trueNS == trueNS {
-			return o, true
+	for _, r := range nfsOverlays.m[inode] {
+		if r.owner == owner && r.trueNS == trueNS {
+			return true
 		}
 	}
-	return nfsOverlay{}, false
+	return false
 }
 
-// overlayHigh is the highest value reported under any overlay of inode.
-func overlayHigh(inode uint64) int64 {
-	nfsOverlays.mu.RLock()
-	defer nfsOverlays.mu.RUnlock()
-	var h int64
-	for _, o := range nfsOverlays.m[inode] {
-		h = max64(h, o.highNS)
-	}
-	return h
-}
-
-func setOverlay(inode uint64, o nfsOverlay) {
+// unsetReported forgets owner's overlay for (inode, trueNS): the value is
+// reported as it is.
+func unsetReported(owner *Store, inode uint64, trueNS int64) {
 	nfsOverlays.mu.Lock()
 	defer nfsOverlays.mu.Unlock()
 	list := nfsOverlays.m[inode]
 	for i := range list {
-		if list[i].trueNS == o.trueNS {
-			list[i] = o
-			return
+		if list[i].owner == owner && list[i].trueNS == trueNS {
+			list = append(list[:i], list[i+1:]...)
+			nfsOverlays.n.Add(-1)
+			break
 		}
 	}
-	list = append(list, o)
-	if len(list) > nfsOverlayPerInode {
-		list = list[len(list)-nfsOverlayPerInode:]
+	if len(list) == 0 {
+		delete(nfsOverlays.m, inode)
 	} else {
-		nfsOverlays.n.Add(1)
+		nfsOverlays.m[inode] = list
+	}
+}
+
+func setReported(inode uint64, r nfsReported) {
+	nfsOverlays.mu.Lock()
+	defer nfsOverlays.mu.Unlock()
+	list := nfsOverlays.m[inode]
+	for i := range list {
+		if list[i].owner == r.owner && list[i].trueNS == r.trueNS {
+			list = append(list[:i], list[i+1:]...)
+			nfsOverlays.n.Add(-1)
+			break
+		}
+	}
+	list = append(list, r)
+	nfsOverlays.n.Add(1)
+	mine := 0
+	for _, x := range list {
+		if x.owner == r.owner {
+			mine++
+		}
+	}
+	for i := 0; mine > nfsReportedPerInode && i < len(list); {
+		if list[i].owner == r.owner {
+			list = append(list[:i], list[i+1:]...)
+			nfsOverlays.n.Add(-1)
+			mine--
+			continue
+		}
+		i++
 	}
 	nfsOverlays.m[inode] = list
 }
 
-// dropOverlaysOf forgets the overlays s published (s closes).
+// dropOverlaysOf forgets the values s published (s closes).
 func dropOverlaysOf(s *Store) {
 	nfsOverlays.mu.Lock()
 	defer nfsOverlays.mu.Unlock()
@@ -170,96 +208,256 @@ func dropOverlaysOf(s *Store) {
 	}
 }
 
-// dropOverlays forgets inode's overlays (its true mtime moved above every
-// value reported for it).
-func dropOverlays(inode uint64) {
-	nfsOverlays.mu.Lock()
-	defer nfsOverlays.mu.Unlock()
-	if l := nfsOverlays.m[inode]; len(l) > 0 {
-		nfsOverlays.n.Add(-int64(len(l)))
-		delete(nfsOverlays.m, inode)
-	}
-}
-
 // overlayBackJump: a true mtime this far below what was reported is a
 // deliberate date (cp -p of an old file onto this inode), not juicefs's
-// commit order; it is reported as it is.
+// commit order; it is reported as it is unless it was reported before.
 const overlayBackJump = time.Hour
 
 // nextReported is the reported mtime after another client changed the
 // content of inode, whose reported mtime was oldReported, to true mtime m.
-// It returns the overlay to keep, or ok false: report m as it is (it is above
-// every value reported for the inode).
+// list is what the inode reported before (nfs_mtime_reported, oldest
+// first).
 //
-// Otherwise (a late commit under the same mtime, or juicefs stepping the
-// mtime back) it is one nanosecond above the highest value reported: never a
-// value reported before, and never one of the file's earlier true mtimes
-// (those were all reported, so they are at most the highest). Its second is
-// the second of the highest value, which is the date the Mac has shown so
-// far; only a high value at x.999999999 moves it to the next second.
-func nextReported(owner *Store, inode uint64, oldReported, m int64) (o nfsOverlay, ok bool) {
-	high := max64(oldReported, overlayHigh(inode))
-	if m > high || high-m > int64(overlayBackJump) {
-		return nfsOverlay{}, false
+// One nanosecond above the highest value reported is never a value reported
+// before, and never one of the file's earlier true mtimes (those were all
+// reported, so they are at most the highest). A true mtime far below is
+// reported as it is only if the inode's history does not hold it (review
+// M2: X, N, X).
+func nextReported(list []nfsReported, oldReported, m int64) int64 {
+	high := oldReported
+	seen := oldReported == m
+	for _, r := range list {
+		high = max64(high, r.reportedNS)
+		if r.trueNS == m || r.reportedNS == m {
+			seen = true
+		}
 	}
-	return nfsOverlay{trueNS: m, reportedNS: high + 1, highNS: high + 1, owner: owner}, true
+	switch {
+	case m > high:
+		return m
+	case high-m > int64(overlayBackJump) && !seen:
+		return m
+	}
+	return high + 1
 }
 
 // --- persistence ------------------------------------------------------------
 
-const nfsOverlaySchema = `CREATE TABLE IF NOT EXISTS nfs_mtime_overlay (
+// nfsReportedSchema: rowid orders each inode's values (INSERT OR REPLACE
+// gives a replaced value a new rowid).
+const nfsReportedSchema = `CREATE TABLE IF NOT EXISTS nfs_mtime_reported (
  inode INTEGER NOT NULL, true_ns INTEGER NOT NULL, reported_ns INTEGER NOT NULL,
- high_ns INTEGER NOT NULL, PRIMARY KEY (inode, true_ns))`
+ PRIMARY KEY (inode, true_ns))`
 
-// loadNFSOverlays publishes the overlays s persisted (a restart reports the
-// same mtimes as before it).
+// loadNFSOverlays publishes the values s persisted (a restart reports the
+// same mtimes as before it), after deleting those of inodes no longer in the
+// mirror (review M4: juicefs does not reuse inode numbers).
 func (s *Store) loadNFSOverlays() error {
-	rows, err := s.db.Query(`SELECT inode, true_ns, reported_ns, high_ns FROM nfs_mtime_overlay`)
+	if _, err := s.db.Exec(`DELETE FROM nfs_mtime_reported WHERE inode NOT IN (SELECT inode FROM entries)`); err != nil {
+		return err
+	}
+	rows, err := s.db.Query(`SELECT inode, true_ns, reported_ns FROM nfs_mtime_reported
+ WHERE reported_ns != true_ns ORDER BY rowid DESC LIMIT ?`, nfsReportedLoadMax)
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
+	type row struct {
+		inode uint64
+		r     nfsReported
+	}
+	var all []row
 	for rows.Next() {
 		var inode int64
-		o := nfsOverlay{owner: s}
-		if err := rows.Scan(&inode, &o.trueNS, &o.reportedNS, &o.highNS); err != nil {
+		r := nfsReported{owner: s}
+		if err := rows.Scan(&inode, &r.trueNS, &r.reportedNS); err != nil {
+			rows.Close()
 			return err
 		}
-		setOverlay(uint64(inode), o)
+		all = append(all, row{uint64(inode), r})
 	}
-	return rows.Err()
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for i := len(all) - 1; i >= 0; i-- {
+		setReported(all[i].inode, all[i].r)
+	}
+	return nil
 }
 
-// overlayChange is one inode's overlay update, written in the publication's
-// transaction and applied to nfsOverlays after it commits.
+// reportedHistory is what inode reported before, oldest first (SQLite only:
+// values reported as they are need no RAM).
+func reportedHistory(tx *sql.Tx, inode uint64) ([]nfsReported, error) {
+	rows, err := tx.Query(`SELECT true_ns, reported_ns FROM nfs_mtime_reported WHERE inode=? ORDER BY rowid`, int64(inode))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []nfsReported
+	for rows.Next() {
+		var r nfsReported
+		if err := rows.Scan(&r.trueNS, &r.reportedNS); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// overlayChange is the values an inode reports now, written in the
+// publication's transaction (oldest first) and applied to nfsOverlays after
+// it commits.
 type overlayChange struct {
 	inode uint64
-	o     nfsOverlay
-	drop  bool
+	rs    []nfsReported
 }
 
 func (c overlayChange) write(tx *sql.Tx) error {
-	if c.drop {
-		_, err := tx.Exec(`DELETE FROM nfs_mtime_overlay WHERE inode=?`, int64(c.inode))
-		return err
+	for _, r := range c.rs {
+		if _, err := tx.Exec(`INSERT OR REPLACE INTO nfs_mtime_reported (inode, true_ns, reported_ns) VALUES (?, ?, ?)`,
+			int64(c.inode), r.trueNS, r.reportedNS); err != nil {
+			return err
+		}
 	}
-	if _, err := tx.Exec(`INSERT OR REPLACE INTO nfs_mtime_overlay (inode, true_ns, reported_ns, high_ns) VALUES (?, ?, ?, ?)`,
-		int64(c.inode), c.o.trueNS, c.o.reportedNS, c.o.highNS); err != nil {
-		return err
-	}
-	// Keep the newest overlays of the inode only.
-	_, err := tx.Exec(`DELETE FROM nfs_mtime_overlay WHERE inode=? AND true_ns NOT IN
- (SELECT true_ns FROM nfs_mtime_overlay WHERE inode=? ORDER BY high_ns DESC LIMIT ?)`,
-		int64(c.inode), int64(c.inode), nfsOverlayPerInode)
+	_, err := tx.Exec(`DELETE FROM nfs_mtime_reported WHERE inode=? AND rowid NOT IN
+ (SELECT rowid FROM nfs_mtime_reported WHERE inode=? ORDER BY rowid DESC LIMIT ?)`,
+		int64(c.inode), int64(c.inode), nfsReportedPerInode)
 	return err
 }
 
 func (c overlayChange) apply() {
-	if c.drop {
-		dropOverlays(c.inode)
-	} else {
-		setOverlay(c.inode, c.o)
+	for _, r := range c.rs {
+		if r.reportedNS == r.trueNS {
+			unsetReported(r.owner, c.inode, r.trueNS)
+		} else {
+			setReported(c.inode, r)
+		}
 	}
+}
+
+// --- slice signatures -------------------------------------------------------
+
+// sliceSig is a file's chunk lists as the push read them: the number of
+// slices and a hash of each list's length and last slice. count -1: not read.
+type sliceSig struct {
+	count int64
+	tail  uint64
+}
+
+var unknownSig = sliceSig{count: -1}
+
+func (a sliceSig) known() bool { return a.count >= 0 }
+
+// sameContent: both read and equal (no commit between them).
+func (a sliceSig) sameContent(b sliceSig) bool { return a.known() && b.known() && a == b }
+
+// jfsChunkSize is juicefs's chunk (meta.ChunkSize): the chunk lists of a file
+// are c<inode>_0 .. c<inode>_<(size-1)/jfsChunkSize>.
+const jfsChunkSize = 64 << 20
+
+// sliceSigMaxChunks bounds the chunk lists read for one file (4096 chunks is
+// 256 GiB), sliceSigBudget those read for one push pipeline; past them the
+// signature is not read (every ctime change then counts).
+const (
+	sliceSigMaxChunks = 4096
+	sliceSigBudget    = 1 << 15
+)
+
+func chunksFor(size int64) int64 {
+	if size <= 0 {
+		return 1
+	}
+	return (size-1)/jfsChunkSize + 1
+}
+
+// sliceQuery is one file whose signature the push reads, for its cached
+// size (the decoded size may differ; then the signature is not used).
+type sliceQuery struct {
+	inode uint64
+	size  int64
+}
+
+type sigCmds struct {
+	lens  []*redis.IntCmd
+	tails []*redis.StringCmd
+}
+
+// queueSliceSigs adds the signature reads of files to pipe.
+func queueSliceSigs(ctx context.Context, pipe redis.Pipeliner, files []sliceQuery) []sigCmds {
+	out := make([]sigCmds, len(files))
+	budget := sliceSigBudget
+	for i, f := range files {
+		n := chunksFor(f.size)
+		if n > sliceSigMaxChunks || int(n) > budget {
+			continue
+		}
+		budget -= int(n)
+		for c := int64(0); c < n; c++ {
+			key := "c" + strconv.FormatUint(f.inode, 10) + "_" + strconv.FormatInt(c, 10)
+			out[i].lens = append(out[i].lens, pipe.LLen(ctx, key))
+			out[i].tails = append(out[i].tails, pipe.LIndex(ctx, key, -1))
+		}
+	}
+	return out
+}
+
+func (c sigCmds) result() sliceSig {
+	if c.lens == nil {
+		return unknownSig
+	}
+	h := fnv.New64a()
+	var count int64
+	var b [8]byte
+	for i := range c.lens {
+		n, err := c.lens[i].Result()
+		if err != nil && err != redis.Nil {
+			return unknownSig
+		}
+		tail, err := c.tails[i].Result()
+		if err != nil && err != redis.Nil {
+			return unknownSig
+		}
+		count += n
+		binary.BigEndian.PutUint64(b[:], uint64(n))
+		h.Write(b[:])
+		binary.BigEndian.PutUint64(b[:], uint64(len(tail)))
+		h.Write(b[:])
+		h.Write([]byte(tail))
+	}
+	return sliceSig{count: count, tail: h.Sum64()}
+}
+
+// readAttrsAndSigs is the push's one round trip: the attrs of keys (MGET)
+// and the slice signatures of files, in one pipeline.
+func (rc *RedisClient) readAttrsAndSigs(ctx context.Context, keys []string, files []sliceQuery) ([]interface{}, []sliceSig, error) {
+	sigs := make([]sliceSig, len(files))
+	if rc.testReadAttrs != nil {
+		vals, err := rc.testReadAttrs(keys)
+		for i, f := range files {
+			sigs[i] = unknownSig
+			if rc.testReadSlices != nil {
+				sigs[i] = rc.testReadSlices(f.inode, f.size)
+			}
+		}
+		return vals, sigs, err
+	}
+	pipe := rc.redisDB().Pipeline()
+	mget := pipe.MGet(ctx, keys...)
+	cmds := queueSliceSigs(ctx, pipe, files)
+	if _, err := pipe.Exec(ctx); err != nil && err != redis.Nil {
+		if vals, merr := mget.Result(); merr == nil {
+			for i := range sigs {
+				sigs[i] = unknownSig
+			}
+			return vals, sigs, nil
+		}
+		return nil, nil, err
+	}
+	vals, err := mget.Result()
+	for i := range cmds {
+		sigs[i] = cmds[i].result()
+	}
+	return vals, sigs, err
 }
 
 // --- observations -------------------------------------------------------------
@@ -267,13 +465,14 @@ func (c overlayChange) apply() {
 // attrObs is what the last publication from Redis saw of a file.
 type attrObs struct {
 	mtimeNS      int64
-	ctimeNS      int64 // 0: not read (a SCAN reads mtime and size only)
-	slices       int64 // -1: not read
+	ctimeNS      int64 // valid unless ctimeUnknown (a SCAN reads mtime and size only)
+	sig          sliceSig
 	touched      time.Time
 	ctimeUnknown bool
-	// own: this process published the row itself (Insert, InsertToCache):
-	// the next look at this mtime is its echo, a baseline.
-	own bool
+}
+
+func (o attrObs) same(p attrObs) bool {
+	return o.mtimeNS == p.mtimeNS && o.ctimeNS == p.ctimeNS && o.ctimeUnknown == p.ctimeUnknown && o.sig == p.sig
 }
 
 // attrObsMax caps the observations; past it the oldest untouched ones go. A
@@ -284,9 +483,9 @@ const (
 	attrObsIdle = 10 * time.Minute
 )
 
-// ownAttrWindow: a ctime-only change this soon after this process's own
-// chmod or chown of the file is that change.
-const ownAttrWindow = 30 * time.Second
+// ownWindow: a change the attr push sees this soon after this process's own
+// chmod, drain, create or rename of the file may be that change.
+const ownWindow = 30 * time.Second
 
 type attrObservations struct {
 	mu  sync.Mutex
@@ -309,7 +508,7 @@ func (a *attrObservations) get(inode uint64) (attrObs, bool) {
 	defer a.mu.Unlock()
 	o, ok := a.obs[inode]
 	if !ok {
-		return attrObs{}, false
+		return attrObs{sig: unknownSig}, false
 	}
 	o.touched = a.clock()
 	return *o, true
@@ -321,6 +520,10 @@ func (a *attrObservations) get(inode uint64) (attrObs, bool) {
 func (a *attrObservations) put(inode uint64, o attrObs, keepNewer bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	a.putLocked(inode, o, keepNewer)
+}
+
+func (a *attrObservations) putLocked(inode uint64, o attrObs, keepNewer bool) {
 	if a.obs == nil {
 		a.obs = make(map[uint64]*attrObs)
 	}
@@ -328,7 +531,7 @@ func (a *attrObservations) put(inode uint64, o attrObs, keepNewer bool) {
 		prev.touched = a.clock()
 		return
 	}
-	if o.ctimeUnknown && o.slices < 0 && !o.own {
+	if o.ctimeUnknown && !o.sig.known() {
 		// Nothing to compare with later (a SCAN, the startup load): the
 		// push judges the next ctime as unrecorded, so keep no entry.
 		delete(a.obs, inode)
@@ -339,6 +542,18 @@ func (a *attrObservations) put(inode uint64, o attrObs, keepNewer bool) {
 		a.evictLocked()
 	}
 	a.obs[inode] = &o
+}
+
+// putIf records o only if inode's observation is still prev (review L4: a
+// publication may have recorded a newer one since the push read it).
+func (a *attrObservations) putIf(inode uint64, o, prev attrObs, havePrev bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	cur, ok := a.obs[inode]
+	if ok != havePrev || (ok && !cur.same(prev)) {
+		return
+	}
+	a.putLocked(inode, o, false)
 }
 
 // evictLocked drops observations idle for attrObsIdle; if none are, the
@@ -376,7 +591,7 @@ func (a *attrObservations) noteOwn(inode uint64) {
 	now := a.clock()
 	if len(a.own) > 4096 {
 		for k, t := range a.own {
-			if now.Sub(t) > ownAttrWindow {
+			if now.Sub(t) > ownWindow {
 				delete(a.own, k)
 			}
 		}
@@ -384,113 +599,123 @@ func (a *attrObservations) noteOwn(inode uint64) {
 	a.own[inode] = now
 }
 
-func (a *attrObservations) ownRecently(inode uint64) bool {
+// takeOwn consumes inode's own-change mark: true if it was fresh.
+func (a *attrObservations) takeOwn(inode uint64) bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	t, ok := a.own[inode]
-	return ok && a.clock().Sub(t) <= ownAttrWindow
+	delete(a.own, inode)
+	return ok && a.clock().Sub(t) <= ownWindow
 }
 
 // attrObservation is what the last publication from Redis saw of inode.
-func (s *Store) attrObservation(inode uint64) (attrObs, bool) {
-	o, ok := s.attrObs.get(inode)
-	if !ok {
-		o.slices = -1
-	}
-	return o, ok
-}
-
-// noteAttrObservation records an observation the attr push made without a
-// publication (the row already matched).
-func (s *Store) noteAttrObservation(inode uint64, mtime, ctime time.Time, slices int64) {
-	s.attrObs.put(inode, attrObs{mtimeNS: mtime.UnixNano(), ctimeNS: ctime.UnixNano(), slices: slices}, false)
-}
+func (s *Store) attrObservation(inode uint64) (attrObs, bool) { return s.attrObs.get(inode) }
 
 // NoteOwnAttrChange records that this process is about to change the mode or
-// owner of path through juicefs: the ctime-only change the attr push sees
-// next is not another client's commit (review M1 of #99).
-func (s *Store) NoteOwnAttrChange(path string) {
+// owner of path through juicefs (review M1 of #99).
+func (s *Store) NoteOwnAttrChange(path string) { s.NoteOwnWrite(path) }
+
+// NoteOwnWrite records that this process itself changes path in juicefs (a
+// chmod, a create, a rename): when the push cannot tell its echo from
+// another client's commit by the slice signature, the next event of the
+// inode is taken for the echo.
+func (s *Store) NoteOwnWrite(path string) {
 	if s == nil {
 		return
 	}
-	if e := s.LookupByPath(path); e != nil && !e.IsDir {
+	if e := s.LookupByPath(path); e != nil && !e.IsDir && e.Inode != 0 {
 		s.attrObs.noteOwn(e.Inode)
 	}
 }
 
-func (s *Store) ownAttrChange(inode uint64) bool { return s.attrObs.ownRecently(inode) }
-
-// noteOwnPublication: this process publishes e itself (its own write, create
-// or rename), so the attr push's next look at e's mtime is the echo of it.
-func (s *Store) noteOwnPublication(e *Entry) {
-	if e == nil || e.IsDir || e.Inode == 0 {
-		return
+func (s *Store) noteOwnInode(inode uint64) {
+	if inode != 0 {
+		s.attrObs.noteOwn(inode)
 	}
-	s.attrObs.put(e.Inode, attrObs{mtimeNS: e.Mtime.UnixNano(), slices: -1, ctimeUnknown: true, own: true}, false)
 }
 
+func (s *Store) takeOwnChange(inode uint64) bool { return s.attrObs.takeOwn(inode) }
+
 // attrSpan is what a Redis publication read of a file besides its mtime and
-// size: ctime is zero when not read (a SCAN reads mtime and size only);
-// slices is -1 when not read. lateCommit: the attr push saw another client's
-// commit under the same mtime and size.
+// size: ctime is zero when not read (a SCAN reads mtime and size only).
+// lateCommit: the attr push saw another client's commit under the same
+// mtime and size.
 type attrSpan struct {
 	ctime      time.Time
-	slices     int64
+	sig        sliceSig
 	lateCommit bool
 }
 
 // spanPreimage is what bulkInsertBatchWithEpoch knew of a row before it.
 type spanPreimage struct {
 	mtimeNS, reportedNS, size int64
-	isDir                     bool
 }
 
-// mtimeSpanUpdate decides, for one committed Redis publication e of a row
-// whose preimage is old (present: the row was in the cache with the same
-// inode), the overlay change and the observation to record.
-func (s *Store) mtimeSpanUpdate(e *Entry, old spanPreimage, present bool) (change *overlayChange, obs attrObs, keepNewer bool) {
+// mtimeSpanUpdate decides, for one committed Redis publication e of a file
+// row whose preimage is old (present: the row was in the cache or in SQLite
+// with the same inode) and whose history is list, the values to keep and the
+// observation to record.
+func (s *Store) mtimeSpanUpdate(e *Entry, old spanPreimage, present bool, list []nfsReported) (change *overlayChange, obs attrObs, keepNewer bool) {
 	m := e.Mtime.UnixNano()
 	sp := e.span
 	e.span = nil // the row goes to the cache
 	if sp == nil {
-		sp = &attrSpan{slices: -1}
+		sp = &attrSpan{sig: unknownSig}
 	}
-	obs = attrObs{mtimeNS: m, slices: sp.slices, ctimeUnknown: sp.ctime.IsZero()}
+	obs = attrObs{mtimeNS: m, sig: sp.sig, ctimeUnknown: sp.ctime.IsZero()}
 	if !sp.ctime.IsZero() {
 		obs.ctimeNS = sp.ctime.UnixNano()
 	}
-	if old.isDir {
-		present = false
-	}
 	if !present {
-		// Not in the cache (evicted, or a new path for this inode): the
-		// overlays say what was reported for the inode.
-		if _, found := overlayFor(e.Inode, m); found && !sp.lateCommit {
-			return nil, obs, true // reported as before
-		}
-		high := overlayHigh(e.Inode)
-		if high == 0 && !sp.lateCommit {
+		// A new path for this inode, with no preimage: its history says
+		// what was reported for it.
+		if len(list) == 0 && !sp.lateCommit {
 			return nil, obs, false
 		}
-		old = spanPreimage{mtimeNS: -1, reportedNS: max64(high, ReportedMtime(e.Inode, e.Mtime).UnixNano())}
+		for _, r := range list {
+			if r.trueNS == m && !sp.lateCommit {
+				return nil, obs, true // reported as before
+			}
+		}
+		old = spanPreimage{mtimeNS: -1, reportedNS: ReportedMtime(e.Inode, e.Mtime).UnixNano()}
 	} else if !sp.lateCommit && old.mtimeNS == m && old.size == e.Size {
 		// The same attributes: a baseline only where none exists for them.
 		return nil, obs, true
 	}
-	if o, ok := nextReported(s, e.Inode, old.reportedNS, m); ok {
-		return &overlayChange{inode: e.Inode, o: o}, obs, false
+	r := nextReported(list, old.reportedNS, m)
+	c := &overlayChange{inode: e.Inode}
+	if old.mtimeNS >= 0 && old.mtimeNS != m {
+		known := false
+		for _, h := range list {
+			if h.trueNS == old.mtimeNS && h.reportedNS == old.reportedNS {
+				known = true
+			}
+		}
+		if !known {
+			// The value being left joins the history (it may have been
+			// published by a path that keeps none: an own write, the
+			// first load), so it is never passed through again (review M2).
+			c.rs = append(c.rs, nfsReported{trueNS: old.mtimeNS, reportedNS: old.reportedNS, owner: s})
+		}
 	}
-	if overlayHigh(e.Inode) != 0 {
-		return &overlayChange{inode: e.Inode, drop: true}, obs, false
-	}
-	return nil, obs, false
+	c.rs = append(c.rs, nfsReported{trueNS: m, reportedNS: r, owner: s})
+	return c, obs, false
 }
 
-func min64(a, b int64) int64 {
-	if a < b {
-		return a
+// sqlSpanPreimage reads the durable row of path inside tx (a row evicted
+// from the cache): its true mtime, reported mtime and size.
+func sqlSpanPreimage(tx *sql.Tx, path string, inode uint64) (spanPreimage, bool) {
+	var (
+		ino, isDir, size, secs int64
+		nsec                   sql.NullInt64
+	)
+	if err := tx.QueryRow(`SELECT inode, is_dir, size, mtime, mtime_nsec FROM entries WHERE path=?`, path).
+		Scan(&ino, &isDir, &size, &secs, &nsec); err != nil || uint64(ino) != inode || isDir != 0 {
+		return spanPreimage{}, false
 	}
-	return b
+	var e Entry
+	e.restoreMtime(secs, nsec)
+	return spanPreimage{mtimeNS: e.Mtime.UnixNano(), reportedNS: ReportedMtime(inode, e.Mtime).UnixNano(), size: size}, true
 }
 
 func max64(a, b int64) int64 {
@@ -500,98 +725,21 @@ func max64(a, b int64) int64 {
 	return b
 }
 
-// jfsChunkSize is juicefs's chunk (meta.ChunkSize): the chunk lists of a file
-// are c<inode>_0 .. c<inode>_<(size-1)/jfsChunkSize>.
-const jfsChunkSize = 64 << 20
-
-// sliceCountMaxChunks bounds the chunk lists read for one file (4096 chunks
-// is 256 GiB); past it the count is not read.
-const sliceCountMaxChunks = 4096
-
-// readSliceCounts returns the number of slices in the chunk lists of each
-// file (-1 when not read). A commit appends a slice to a chunk list; a chmod,
-// chown, rename or link does not touch them (review M1 of #99).
-func (rc *RedisClient) readSliceCounts(ctx context.Context, files []sliceQuery) []int64 {
-	out := make([]int64, len(files))
-	for i := range out {
-		out[i] = -1
-	}
-	if rc.testReadSlices != nil {
-		for i, f := range files {
-			out[i] = rc.testReadSlices(f.inode, f.size)
-		}
-		return out
-	}
-	db := rc.redisDB()
-	if db == nil {
-		return out
-	}
-	pipe := db.Pipeline()
-	cmds := make([][]*redis.IntCmd, len(files))
-	for i, f := range files {
-		n := int64(1)
-		if f.size > 0 {
-			n = (f.size-1)/jfsChunkSize + 1
-		}
-		if n > sliceCountMaxChunks {
-			continue
-		}
-		for c := int64(0); c < n; c++ {
-			cmds[i] = append(cmds[i], pipe.LLen(ctx, "c"+strconv.FormatUint(f.inode, 10)+"_"+strconv.FormatInt(c, 10)))
-		}
-	}
-	if _, err := pipe.Exec(ctx); err != nil && err != redis.Nil {
-		return out
-	}
-	for i, list := range cmds {
-		if list == nil {
-			continue
-		}
-		var total int64
-		ok := true
-		for _, c := range list {
-			v, err := c.Result()
-			if err != nil && err != redis.Nil {
-				ok = false
-				break
-			}
-			total += v
-		}
-		if ok {
-			out[i] = total
-		}
-	}
-	return out
-}
-
-type sliceQuery struct {
-	inode uint64
-	size  int64
-}
-
 // lateCommitVerdict judges an attr push observation of a row whose mtime and
-// size did not change: ctime is what the push read, prev what the last
-// publication or push saw.
+// size did not change.
 type lateCommitVerdict int
 
 const (
-	verdictNone     lateCommitVerdict = iota // nothing new: record nothing
-	verdictBaseline                          // record it, no content change
-	verdictSlices                            // needs the slice count
+	verdictNone      lateCommitVerdict = iota // the recorded ctime: nothing new
+	verdictSignature                          // the slice signature decides
 )
 
+// judgeCtime: any ctime other than the recorded one is an event (review M3:
+// ctimes are stamped by different hosts' clocks, so their order means
+// nothing); so is one with nothing recorded.
 func judgeCtime(prev attrObs, havePrev bool, mtimeNS, ctimeNS int64) lateCommitVerdict {
-	if !havePrev {
-		// Nothing recorded (a restart, an evicted observation): a ctime
-		// event under the published mtime may be a late commit. The slice
-		// count cannot tell, so it counts; at worst one extra refresh.
-		return verdictSlices
-	}
-	if prev.mtimeNS != mtimeNS || prev.own {
-		return verdictBaseline // first look at this mtime, or the echo of our own
-	}
-	if !prev.ctimeUnknown && ctimeNS <= prev.ctimeNS {
+	if havePrev && prev.mtimeNS == mtimeNS && !prev.ctimeUnknown && prev.ctimeNS == ctimeNS {
 		return verdictNone
 	}
-	return verdictSlices
+	return verdictSignature
 }

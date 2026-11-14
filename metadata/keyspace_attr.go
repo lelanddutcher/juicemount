@@ -224,30 +224,17 @@ func (rc *RedisClient) reconcileFileAttrs(inodes []uint64, generation uint64) (r
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	var toUpsert []*Entry
-	// Rows whose mtime and size stayed while the ctime moved: a late commit
-	// only if the slice count says the content changed (mtime_span.go).
-	type ctimeOnly struct {
-		e            *Entry
-		mtime, ctime time.Time
-		size         int64
-		prev         attrObs
-		baseline     bool // first look at this mtime: record it with its slices
-	}
-	var pending []ctimeOnly
-	var changedFiles []*Entry // new mtime or size: their slice count is the baseline
 	for start := 0; start < len(known); start += attrMGetChunk {
 		chunk := known[start:min(start+attrMGetChunk, len(known))]
 		keys := make([]string, len(chunk))
+		files := make([]sliceQuery, len(chunk))
 		for i, e := range chunk {
 			keys[i] = "i" + strconv.FormatUint(e.Inode, 10)
+			files[i] = sliceQuery{e.Inode, e.Size}
 		}
-		var vals []interface{}
-		var merr error
-		if rc.testReadAttrs != nil {
-			vals, merr = rc.testReadAttrs(keys)
-		} else {
-			vals, merr = rc.redisDB().MGet(ctx, keys...).Result()
-		}
+		// One round trip: the attrs and the slice signatures, the latter
+		// for the cached size (mtime_span.go; review L1).
+		vals, sigs, merr := rc.readAttrsAndSigs(ctx, keys, files)
 		if merr != nil || len(vals) != len(chunk) {
 			for _, e := range known[start:] {
 				retry = append(retry, e.Inode)
@@ -267,22 +254,44 @@ func (rc *RedisClient) reconcileFileAttrs(inodes []uint64, generation uint64) (r
 				continue
 			}
 			e := chunk[i]
+			sig := sigs[i]
+			if chunksFor(size) != chunksFor(e.Size) {
+				sig = unknownSig // read for other chunk lists
+			}
 			ctime, ctimeOK := decodeInodeAttrCtime([]byte(str))
 			if e.Mtime.Equal(mtime) && e.MtimeNsecKnown && e.Size == size {
 				if !ctimeOK {
 					continue
 				}
 				prev, have := rc.store.attrObservation(e.Inode)
-				switch judgeCtime(prev, have, mtime.UnixNano(), ctime.UnixNano()) {
-				case verdictNone:
-				case verdictBaseline:
-					pending = append(pending, ctimeOnly{e: e, mtime: mtime, ctime: ctime, size: size, baseline: true})
-				case verdictSlices:
-					// This process's own chmod or chown (review M1) is only
-					// recorded, with the slice count as the baseline.
-					own := rc.store.ownAttrChange(e.Inode)
-					pending = append(pending, ctimeOnly{e: e, mtime: mtime, ctime: ctime, size: size, prev: prev, baseline: own})
+				if judgeCtime(prev, have, mtime.UnixNano(), ctime.UnixNano()) == verdictNone {
+					continue
 				}
+				obs := attrObs{mtimeNS: mtime.UnixNano(), ctimeNS: ctime.UnixNano(), sig: sig}
+				if sig.sameContent(prev.sig) {
+					// The same slices: a chmod, chown, rename or link.
+					rc.store.attrObs.putIf(e.Inode, obs, prev, have)
+					continue
+				}
+				if (!sig.known() || !prev.sig.known()) && rc.store.takeOwnChange(e.Inode) {
+					// The signature cannot decide, and this process just
+					// changed the file itself: that one event is its echo
+					// (review H1 of the second review; the mark is consumed).
+					rc.store.attrObs.putIf(e.Inode, obs, prev, have)
+					continue
+				}
+				toUpsert = append(toUpsert, &Entry{
+					Path:           e.Path,
+					Name:           e.Name,
+					ParentPath:     e.ParentPath,
+					Size:           size,
+					Mtime:          mtime,
+					MtimeNsecKnown: true,
+					Inode:          e.Inode,
+					Mode:           e.Mode,
+					// Another client's part committed after this mtime.
+					span: &attrSpan{ctime: ctime, sig: sig, lateCommit: true},
+				})
 				continue
 			}
 			up := &Entry{
@@ -294,47 +303,10 @@ func (rc *RedisClient) reconcileFileAttrs(inodes []uint64, generation uint64) (r
 				MtimeNsecKnown: true,
 				Inode:          e.Inode,
 				Mode:           e.Mode,
+				span:           &attrSpan{sig: sig},
 			}
-			up.span = &attrSpan{slices: -1}
 			if ctimeOK {
 				up.span.ctime = ctime
-			}
-			toUpsert = append(toUpsert, up)
-			changedFiles = append(changedFiles, up)
-		}
-	}
-	if len(pending)+len(changedFiles) > 0 {
-		q := make([]sliceQuery, 0, len(pending)+len(changedFiles))
-		for _, p := range pending {
-			q = append(q, sliceQuery{p.e.Inode, p.size})
-		}
-		for _, e := range changedFiles {
-			q = append(q, sliceQuery{e.Inode, e.Size})
-		}
-		counts := rc.readSliceCounts(ctx, q)
-		for i, e := range changedFiles {
-			if n := counts[len(pending)+i]; n >= 0 {
-				e.span.slices = n
-			}
-		}
-		for i, p := range pending {
-			n := counts[i]
-			if p.baseline || (n >= 0 && p.prev.slices >= 0 && n == p.prev.slices) {
-				// The same slices: a chmod, chown, rename or link.
-				rc.store.noteAttrObservation(p.e.Inode, p.mtime, p.ctime, n)
-				continue
-			}
-			up := &Entry{
-				Path:           p.e.Path,
-				Name:           p.e.Name,
-				ParentPath:     p.e.ParentPath,
-				Size:           p.size,
-				Mtime:          p.mtime,
-				MtimeNsecKnown: true,
-				Inode:          p.e.Inode,
-				Mode:           p.e.Mode,
-				// Another client's part committed after this mtime.
-				span: &attrSpan{ctime: p.ctime, slices: n, lateCommit: true},
 			}
 			toUpsert = append(toUpsert, up)
 		}

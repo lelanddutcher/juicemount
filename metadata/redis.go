@@ -361,8 +361,9 @@ type RedisClient struct {
 	testTriggerSync  func()
 	testReadDirRaw   func(uint64) (map[string]string, error)
 	testReadAttrs    func([]string) ([]interface{}, error)
-	// testReadSlices stands in for the slice count of a file (mtime_span.go).
-	testReadSlices               func(inode uint64, size int64) int64
+	// testReadSlices stands in for the slice signature of a file
+	// (mtime_span.go).
+	testReadSlices               func(inode uint64, size int64) sliceSig
 	testScanBatch                func(context.Context, string, string) ([]string, error)
 	testAfterScanTokenCheck      func()
 	testAfterScanUpsertChunk     func()

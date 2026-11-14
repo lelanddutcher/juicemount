@@ -1024,7 +1024,7 @@ func OpenWithMaxCacheSize(dbPath string, maxCacheSize int) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("initialize mirror incarnations: %w", err)
 	}
-	if _, err := db.Exec(nfsOverlaySchema); err != nil {
+	if _, err := db.Exec(nfsReportedSchema); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("create nfs mtime overlay schema: %w", err)
 	}
@@ -1396,7 +1396,6 @@ func (s *Store) Insert(e *Entry) error {
 	s.mu.Lock()
 	// Remove old entry from children index if path existed with different parent
 	old := s.pathCache[e.Path]
-	s.noteOwnPublication(e)
 	if old != nil {
 		s.removeFromChildrenIdx(old)
 		// QA-27 (2026-05-21): if the displaced entry had a different inode,
@@ -1530,7 +1529,6 @@ func (s *Store) InsertToCache(e *Entry) {
 		return
 	}
 	old := s.pathCache[e.Path]
-	s.noteOwnPublication(e)
 	if old != nil {
 		s.removeFromChildrenIdx(old)
 		// QA-27: see Insert.
@@ -2084,6 +2082,7 @@ func (s *Store) bulkInsertBatchWithEpoch(batch []*Entry, incremental bool, expec
 		present bool
 		inode   uint64
 		version MirrorToken
+		isDir   bool
 		span    spanPreimage
 	}
 	snapshots := make([]*Entry, len(batch))
@@ -2096,8 +2095,8 @@ func (s *Store) bulkInsertBatchWithEpoch(batch []*Entry, incremental bool, expec
 		snapshots[i] = e
 		if old := s.pathCache[e.Path]; old != nil {
 			cached[e.Path] = cachePreimage{present: true, inode: old.Inode, version: old.Version,
-				span: spanPreimage{mtimeNS: old.Mtime.UnixNano(), reportedNS: old.NFSMtime().UnixNano(),
-					size: old.Size, isDir: old.IsDir}}
+				isDir: old.IsDir, span: spanPreimage{mtimeNS: old.Mtime.UnixNano(),
+					reportedNS: old.NFSMtime().UnixNano(), size: old.Size}}
 		}
 	}
 	s.mu.RUnlock()
@@ -2236,6 +2235,18 @@ func (s *Store) bulkInsertBatchWithEpoch(batch []*Entry, incremental bool, expec
 				}
 			}
 		}
+		// The reported-mtime preimage (mtime_span.go): the cached row, or
+		// for a steady-state publication of a row evicted from the cache,
+		// the durable one (review M2: a regression while evicted).
+		var span spanPreimage
+		spanPresent := false
+		if !e.IsDir && e.Inode != 0 {
+			if old := cached[e.Path]; old.present && old.inode == e.Inode && !old.isDir {
+				span, spanPresent = old.span, true
+			} else if !old.present && expected != nil {
+				span, spanPresent = sqlSpanPreimage(tx, e.Path, e.Inode)
+			}
+		}
 		if incremental {
 			err = ftsExternalUpsert(tx, e, s.ftsDefer)
 		} else {
@@ -2255,9 +2266,11 @@ func (s *Store) bulkInsertBatchWithEpoch(batch []*Entry, incremental bool, expec
 			return StoreEpoch{}, err
 		}
 		if !e.IsDir && e.Inode != 0 {
-			old := cached[e.Path]
-			present := old.present && old.inode == e.Inode
-			change, obs, keepNewer := s.mtimeSpanUpdate(e, old.span, present)
+			history, err := reportedHistory(tx, e.Inode)
+			if err != nil {
+				return StoreEpoch{}, err
+			}
+			change, obs, keepNewer := s.mtimeSpanUpdate(e, span, spanPresent, history)
 			if change != nil {
 				if err := change.write(tx); err != nil {
 					return StoreEpoch{}, err
@@ -2644,6 +2657,7 @@ func (s *Store) SetSizeExactAfterMutation(entryPath string, size int64, mtime ti
 }
 
 func (s *Store) setSizeExact(entryPath string, size int64, mtime time.Time, publishOnError bool) error {
+	s.NoteOwnWrite(entryPath) // this process wrote it (mtime_span.go)
 	s.writeMu.Lock()
 	_, err := s.db.Exec(
 		`UPDATE entries SET size = ?, mtime = ?, mtime_nsec = NULL WHERE path = ?`,

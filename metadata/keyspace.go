@@ -1288,7 +1288,7 @@ func buildReconcileChildEntries(children []dirChild, attrByInode map[uint64][]by
 			MtimeNsecKnown: attrOK,
 			Inode:          c.inode,
 			Mode:           c.mode,
-			span:           &attrSpan{ctime: ctime, slices: -1},
+			span:           &attrSpan{ctime: ctime, sig: unknownSig},
 		}
 
 		// Upsert-diff: only write if new or changed (same compare as
