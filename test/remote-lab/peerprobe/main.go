@@ -275,7 +275,10 @@ func run(args []string) (err error) {
 			return err
 		}
 		row["peer_write_s"] = wt
-		row["peer_sees"] = bytes.Equal(p.peerRead(0, tagLen), tag)
+		// The peer's own read-back comes after the polls: through the peer's
+		// mount on a far link it is a cold read of seconds, and done here it
+		// delayed the first poll (it inflated the abroad delays of 2026-11-13).
+		defer func() { row["peer_sees"] = bytes.Equal(p.peerRead(0, tagLen), tag) }()
 		var saw0, saw2 bool
 		mtimeAt := -1.0 // the attr is polled in the same loop, timed on its own
 		d, polls, took, err := p.waitFor(t0, func() (bool, time.Duration, error) {

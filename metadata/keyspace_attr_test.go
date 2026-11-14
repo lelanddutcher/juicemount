@@ -2,6 +2,7 @@ package metadata
 
 import (
 	"encoding/binary"
+	"errors"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -138,5 +139,85 @@ func TestAttrCoalescerBatches(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("no flush")
+	}
+}
+
+// Review MEDIUM-1: an inode whose attr read keeps failing must stop after
+// attrMaxRetries retries, with backoff. The old code cleared the count for
+// the whole batch, so the retry (alone in its own batch) never counted and
+// the inode retried about 10 times per second forever.
+func TestAttrRetryHonoursLimit(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "mirror.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	value := make([]byte, 9)
+	value[0] = jfsTypeFile
+	binary.BigEndian.PutUint32(value[5:], 42)
+	var mu sync.Mutex
+	failing := false
+	mgets := 0
+	rc := &RedisClient{
+		store: store, stopCh: make(chan struct{}),
+		testReadDirRaw: func(uint64) (map[string]string, error) {
+			return map[string]string{"media.mov": string(value)}, nil
+		},
+		testReadAttrs: func(keys []string) ([]interface{}, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			if failing {
+				mgets++
+				return nil, errors.New("injected MGET failure")
+			}
+			out := make([]interface{}, len(keys))
+			for i := range keys {
+				out[i] = string(encodeTestAttr(1700000000, 4096))
+			}
+			return out, nil
+		},
+	}
+	defer close(rc.stopCh)
+	if err := rc.reconcileDir(1); err != nil {
+		t.Fatal(err)
+	}
+	saved := attrRetryBase
+	attrRetryBase = 10 * time.Millisecond
+	defer func() { attrRetryBase = saved }()
+	gen, _, _ := rc.backendAdmission()
+	c := rc.newAttrCoalescer(gen)
+	c.tuningFn = func() coalescerTuning {
+		return coalescerTuning{debounce: 2 * time.Millisecond, maxWait: 20 * time.Millisecond, burstCeiling: attrBurstCeiling}
+	}
+	defer c.stop()
+	mu.Lock()
+	failing = true
+	mu.Unlock()
+	c.add(42)
+	// Retries wait 10, 20 and 40 ms; well past them nothing more may come.
+	time.Sleep(500 * time.Millisecond)
+	mu.Lock()
+	got := mgets
+	mu.Unlock()
+	if got != 1+attrMaxRetries {
+		t.Fatalf("MGETs for a permanently failing inode = %d, want %d (1 + %d retries)", got, 1+attrMaxRetries, attrMaxRetries)
+	}
+	// A new event for the inode starts a fresh count; a success then ends it.
+	mu.Lock()
+	failing = false
+	mu.Unlock()
+	c.add(42)
+	time.Sleep(100 * time.Millisecond)
+	mu.Lock()
+	failing = true
+	mgets = 0
+	mu.Unlock()
+	c.add(42)
+	time.Sleep(500 * time.Millisecond)
+	mu.Lock()
+	got = mgets
+	mu.Unlock()
+	if got != 1+attrMaxRetries {
+		t.Fatalf("after a success, MGETs = %d, want %d", got, 1+attrMaxRetries)
 	}
 }

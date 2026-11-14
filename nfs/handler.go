@@ -989,9 +989,10 @@ func NewHandler(store *metadata.Store, fusePath string, opts ...HandlerOption) *
 		// the previous inode behind that name. Same hook idiom, same reason
 		// metadata/ can't do it itself.
 		store.SetOnPathInvalidated(h.onRemotePathInvalidated)
-		// Same-inode overwrites keep pooled FUSE descriptors valid but replace
-		// JuiceFS slice IDs, so byte-cache invalidation is a separate seam.
-		// Full reconcile uses the coarse reset to cover missed push events.
+		// Same-inode overwrites keep the path's identity but replace JuiceFS
+		// slice IDs: these hooks drop the byte caches and reopen the pooled
+		// READ descriptor (never the write slot). Full reconcile uses the
+		// coarse reset to cover missed push events.
 		store.SetOnContentInvalidated(h.onContentInvalidated)
 		store.SetOnScanContentInvalidated(h.onScanContentInvalidated)
 		store.SetOnContentReset(h.onContentReset)
@@ -1125,6 +1126,12 @@ func (h *JuiceMountHandler) onRemotePathInvalidated(inMountPath string, isDir bo
 // tells the kernel to drop its pages. So the READ slot is reopened. The WRITE
 // slot is never touched here: this event may be our own write's echo (see
 // FDPool.InvalidateReads).
+//
+// The caller (RedisClient.applyEvent) holds its lifecycle and replacement
+// observation locks, and update events include our own drains' echoes. So the
+// descriptor's close, a FUSE call that can wait on a busy daemon, runs on its
+// own goroutine (review MEDIUM-2): a slow close must not stall event intake,
+// the attr batches or drain publication.
 func (h *JuiceMountHandler) onContentInvalidated(inMountPath string, isDir bool) {
 	if h == nil || inMountPath == "" {
 		return
@@ -1141,7 +1148,7 @@ func (h *JuiceMountHandler) onContentInvalidated(inMountPath string, isDir bool)
 	}
 	h.invalidateReadCaches(inMountPath)
 	if h.fdPool != nil {
-		h.fdPool.InvalidateReads(path.Join(h.fusePath, inMountPath))
+		h.fdPool.InvalidateReadsDeferClose(path.Join(h.fusePath, inMountPath))
 	}
 }
 

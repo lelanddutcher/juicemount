@@ -95,7 +95,10 @@ type FDPool struct {
 	// openRead is the read-slot opener; nil means os.Open. Tests set it to
 	// script a slow or failing open.
 	openRead func(string) (*os.File, error)
-	stopCh   chan struct{}
+	// closeFD closes a descriptor the invalidation paths dropped; nil means
+	// fd.Close. Tests set it to script a close that blocks (a busy daemon).
+	closeFD func(*os.File)
+	stopCh  chan struct{}
 }
 
 // openRec is one in-flight open, registered under p.mu before the lock is
@@ -582,15 +585,19 @@ func (p *FDPool) invalidatePathClose(path string, includeWrite, deferClose bool)
 	})
 	p.mu.Unlock()
 	if deferClose && len(toClose) > 0 {
-		go closeAll(toClose)
+		go p.closeAll(toClose)
 		return closed, marked
 	}
-	closeAll(toClose)
+	p.closeAll(toClose)
 	return closed, marked
 }
 
-func closeAll(fds []*os.File) {
+func (p *FDPool) closeAll(fds []*os.File) {
 	for _, fd := range fds {
+		if p.closeFD != nil {
+			p.closeFD(fd)
+			continue
+		}
 		fd.Close()
 	}
 }

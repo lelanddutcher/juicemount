@@ -426,8 +426,18 @@ Around each case the script saves the reader juicefs's own counters
 (`/jfs/.stats`: metadata operations and object GETs; the peer has its own),
 and `lib/peersum.py` prints the delays and those counts per case.
 `PE_TIMEOUT` ends a poll (default 30 s); `PE_JM5_ENV` adds environment to jm5,
-for example `JM_METADATA_ATTR_PUSH=0` for the rollback. The probe retries
-`NFS3ERR_JUKEBOX` as a Mac does.
+for example `JM_METADATA_ATTR_PUSH=0` for the rollback; `PE_CASES` picks the
+cases. The probe retries `NFS3ERR_JUKEBOX` as a Mac does.
+
+jm5 logs in to the proxy as a kind-mac principal (`jmlab-mac`, added to the
+running proxy with a throwaway password kept in the git-ignored state folder),
+as an enrolled Mac does, so its subscriptions and attr reads pass the proxy's
+guard. The lab client's own mount and the peer stay admin.
+`PE_NOTIFY_FLAGS=Kghx` runs a session with the server's notify flags without
+string events: jm5's `CONFIG SET` to add `$` is refused for a Mac
+(`ADMIN_ONLY` in the proxy's `/stats`), jm5 logs `metadata attr push: off`,
+and the flags are set back to `KEA` afterwards. Each session writes
+`<label>.attrpush.txt` with jm5's attr-push lines.
 
 The lab shows the server side. A Mac adds its NFS client's attribute cache:
 it re-reads a file's attributes at each open, but for a file it keeps open it

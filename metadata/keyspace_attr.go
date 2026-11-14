@@ -132,29 +132,49 @@ func AttrPushCounters() (delivered, batches, refreshed int64) {
 	return attrPushDelivered.Load(), attrPushBatches.Load(), attrPushRefreshed.Load()
 }
 
+// attrRetryBase is the first retry delay of a failed attr refresh; the n-th
+// retry waits attrRetryBase << (n-1) (1 s, 2 s, 4 s). A variable for tests.
+var attrRetryBase = time.Second
+
 func (rc *RedisClient) newAttrCoalescer(generation uint64) *inodeCoalescer {
 	c := newInodeCoalescer(rc)
 	c.backendGeneration = generation
 	c.tuningFn = func() coalescerTuning { return attrTuningForClass(currentLinkClass()) }
 	var retryMu sync.Mutex
-	retries := map[uint64]int{}
+	retries := map[uint64]int{} // consecutive failures per inode
 	c.apply = func(batch []uint64) {
 		failed, err := rc.reconcileFileAttrs(batch, generation)
-		if err != nil {
-			jmlog.Warn("metadata attr push: refresh failed", "inodes", len(batch), "error", err.Error())
+		failedSet := make(map[uint64]struct{}, len(failed))
+		for _, inode := range failed {
+			failedSet[inode] = struct{}{}
 		}
 		retryMu.Lock()
 		defer retryMu.Unlock()
+		// Only a success clears an inode's count. A failed inode keeps it, so
+		// attrMaxRetries holds even when the retry lands in a later batch
+		// (review MEDIUM-1: clearing the whole batch retried forever, ~10/s).
 		for _, inode := range batch {
-			delete(retries, inode)
+			if _, bad := failedSet[inode]; !bad {
+				delete(retries, inode)
+			}
 		}
+		var dropped []uint64
 		for _, inode := range failed {
 			n := retries[inode] + 1
 			if n > attrMaxRetries || !rc.backendAdmitted(generation) {
+				// Give up until the next event for this inode (or the
+				// gap-fill/backstop SCAN) brings it back with a fresh count.
+				delete(retries, inode)
+				dropped = append(dropped, inode)
 				continue
 			}
 			retries[inode] = n
-			c.add(inode)
+			inode := inode
+			time.AfterFunc(attrRetryBase<<(n-1), func() { c.add(inode) })
+		}
+		if err != nil {
+			jmlog.Warn("metadata attr push: refresh failed", "inodes", len(batch), "retry", len(failed)-len(dropped),
+				"gave_up", len(dropped), "error", err.Error())
 		}
 	}
 	return c

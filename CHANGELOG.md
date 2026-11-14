@@ -19,14 +19,15 @@
   (Linux, jm5 plus a second JuiceFS client as the peer; median, 3 trials):
   lan, held-open overwrite 0.22 s (before: old for 6.5 s or more, 1 of 3
   never), size after an append 0.20 s (before: never); abroad (200 ms, 1%
-  loss), held-open overwrite 1.8–2.9 s (before: old for 6 s or more), size
+  loss), held-open overwrite 2.0 s, the cold fetch of the changed bytes
+  (before: old for 6 s or more), size
   0.46 s (before: never). Reads of an unchanged file cost the same metadata
   round trips as before. A pinned file a peer changes is re-pinned by the pin
   guard within its next pass (1 min). The server's Redis must publish
   string-class keyspace events (`KEA`, as `server/redis.conf` ships, or add
   `$` to `Kghx`); without them the app logs `metadata attr push: off`.
   `JM_METADATA_ATTR_PUSH=0` turns the file feed off. For a measured Mac run,
-  `JM_NFS_ACREG="min,max"` shortens the Mac NFS client's file attribute
+  `JM_NFS_ACREG="min,max"` (two whole seconds) shortens the Mac NFS client's file attribute
   cache (default unchanged, 3600 s), which bounds how long a file the Mac
   itself keeps open can show the old size.
 - Opening a clip that is not cached waits for fewer round trips on a far

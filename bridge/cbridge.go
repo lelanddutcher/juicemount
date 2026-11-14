@@ -4593,8 +4593,10 @@ func nfsMountOpts(port string) string {
 	// folders, so a short window adds no WAN round trip.
 	acreg := "acregmin=3600,acregmax=3600"
 	if v := os.Getenv("JM_NFS_ACREG"); v != "" {
-		if parts := strings.SplitN(v, ",", 2); len(parts) == 2 {
-			acreg = "acregmin=" + strings.TrimSpace(parts[0]) + ",acregmax=" + strings.TrimSpace(parts[1])
+		if lo, hi, ok := parseACRegWindow(v); ok {
+			acreg = "acregmin=" + strconv.Itoa(lo) + ",acregmax=" + strconv.Itoa(hi)
+		} else {
+			jmlog.Warn("JM_NFS_ACREG ignored: want two whole seconds \"min,max\" with min <= max", "value", v)
 		}
 	}
 	acOpts := acreg + ",acdirmin=1,acdirmax=2"
@@ -4621,6 +4623,24 @@ func nfsMountOpts(port string) string {
 	return fmt.Sprintf(
 		"port=%s,mountport=%s,hard,intr,timeo=400,retrans=2,mutejukebox,nonegnamecache,nolocks,locallocks,rsize=1048576,wsize=1048576,dsize=1048576,readahead=%d,%s,vers=3,tcp",
 		port, port, ra, acOpts)
+}
+
+// parseACRegWindow parses JM_NFS_ACREG: exactly two non-negative whole
+// numbers of seconds, "min,max", with min <= max. Anything else is refused,
+// so a typo can never inject another mount option into the string.
+func parseACRegWindow(v string) (lo, hi int, ok bool) {
+	parts := strings.Split(v, ",")
+	if len(parts) != 2 {
+		return 0, 0, false
+	}
+	var err error
+	if lo, err = strconv.Atoi(strings.TrimSpace(parts[0])); err != nil || lo < 0 {
+		return 0, 0, false
+	}
+	if hi, err = strconv.Atoi(strings.TrimSpace(parts[1])); err != nil || hi < lo {
+		return 0, 0, false
+	}
+	return lo, hi, true
 }
 
 // runProcessBounded starts a cleanup process and returns at the deadline even

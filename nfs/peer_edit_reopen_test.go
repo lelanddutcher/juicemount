@@ -3,7 +3,11 @@ package nfs
 import (
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
+	"time"
+
+	"github.com/lelanddutcher/juicemount/metadata"
 )
 
 // Bug B1 (laptop run 2026-11-13): a peer's edit of a file this process holds
@@ -90,4 +94,75 @@ func TestInvalidateReadsDeferCloseMarksHeldEntry(t *testing.T) {
 	}
 	p.Release(full)
 	p.Release(full)
+}
+
+// Review MEDIUM-2: RedisClient.applyEvent fires the content hook while it holds
+// its lifecycle and replacement observation locks, and update events include
+// our own drains' echoes. A FUSE close that waits on a busy daemon must not
+// hold them. The hook is driven through the real Store seam; eventLock stands
+// in for applyEvent's locks.
+func TestContentHookBlockedCloseDoesNotHoldCaller(t *testing.T) {
+	dir := t.TempDir()
+	full := filepath.Join(dir, "clip.mov")
+	if err := os.WriteFile(full, []byte("old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	store, err := metadata.Open(filepath.Join(t.TempDir(), "mirror.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	p := NewFDPool()
+	defer p.Stop()
+	release := make(chan struct{})
+	closed := make(chan struct{})
+	p.closeFD = func(fd *os.File) {
+		<-release // a FUSE FLUSH/RELEASE stuck behind a busy daemon
+		fd.Close()
+		close(closed)
+	}
+	h := &JuiceMountHandler{fdPool: p, fusePath: dir}
+	store.SetOnContentInvalidated(h.onContentInvalidated)
+	rfd, err := p.Get(full)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.Release(full) // unheld: the invalidation closes it
+
+	var eventLock sync.Mutex
+	done := make(chan struct{})
+	go func() {
+		eventLock.Lock()
+		store.NotifyContentInvalidated("clip.mov", false)
+		eventLock.Unlock()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		close(release)
+		t.Fatal("the content hook waited for a blocked FUSE close while its caller held the event locks")
+	}
+	locked := make(chan struct{})
+	go func() { eventLock.Lock(); eventLock.Unlock(); close(locked) }()
+	select {
+	case <-locked:
+	case <-time.After(time.Second):
+		t.Fatal("event lock still held while the close is blocked")
+	}
+	// The next READ already gets a fresh descriptor, before the old close ends.
+	fresh, err := p.Get(full)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fresh == rfd {
+		t.Fatal("the dropped descriptor was served again")
+	}
+	p.Release(full)
+	close(release)
+	select {
+	case <-closed: // the deferred close still runs: no leak
+	case <-time.After(2 * time.Second):
+		t.Fatal("the deferred close never ran")
+	}
 }
