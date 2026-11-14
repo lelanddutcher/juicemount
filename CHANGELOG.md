@@ -107,9 +107,13 @@
     mtime still never carries old bytes.
   Linux remote lab (`peer-edit-lab.sh` `playedit`, abroad, the Mac saving a
   256 KiB file every second, now through its spool as on the Mac):
-  longest READ 166–192 s → 4.7–7.4 s, JUKEBOX 6 → 0–2, the refresh's wait
-  for the control channel up to 78 s → 0 ms, P2 0. The Mac part needs the
-  laptop run. The lab's `playedit` also reports the drain time per file,
+  longest READ 166–192 s → 4.7–8.7 s in 7 of 8 sessions (one 15.8 s), the
+  refresh's wait for the control channel up to 78 s → 0 ms, P2 0. The 0–5
+  JUKEBOX replies left per session all come from the verified cache's path
+  check, which main has too. With the same playback and no refresh, main's
+  drain is no faster. The Mac part needs the laptop run. While a refresh is
+  pending, a READ from the verified cache that sees the file's row move
+  waits for the refresh instead of answering JUKEBOX. The lab's `playedit` also reports the drain time per file,
   and counts the bytes the Mac would keep under an mtime the server goes on
   reporting after a newer save closed (`p2_kept`, `p2_final`).
 - A clip that was playing when the network went away plays again a second or
