@@ -84,6 +84,34 @@
   MiB/s, 2 trials each); at 2 MiB/s 13 → 0 and 13 → 1. Freezes here are still
   dominated by cold reads over the lab's lossy link (also before any save).
   The Mac part needs the laptop run.
+- Playing a clip abroad while a teammate saves it no longer freezes while
+  the Mac's own saves upload (laptop run 2026-11-14, bug F2: 35–49 s
+  freezes; main 97–133 s). Two causes:
+  - **The refresh waited for the drain.** On macOS JuiceFS keeps one control
+    handle per process, so the app sent its control messages one at a time:
+    the drain's create-files messages (each holds the channel until its
+    uploads end), pins, the network follower and the content refresh. Abroad
+    a refresh waited up to 6.7 s for the channel, and each READ of the clip
+    waited for a refresh. The bundled JuiceFS (patch 0033, `-jm18`) now has
+    a second, hidden control file, `.jmcontrol`, with its own handle; the
+    content refresh uses it. The drain, pins and the follower keep the
+    first channel and its order. An older JuiceFS has no such file, and the
+    refresh falls back to the shared channel.
+  - **Every READ waited for the refresh, even one that never touches the
+    caches it drops.** While a refresh of the file is pending, a READ now
+    first tries the verified local cache, which reads JuiceFS's cached
+    blocks by slice from a mapping the edit already dropped, and never
+    JuiceFS's read buffers or the kernel's pages. Only a READ that must go
+    through JuiceFS still waits for the refresh (and its kernel notify,
+    which waits behind the file's reads in flight), so a reply with the new
+    mtime still never carries old bytes.
+  Linux remote lab (`peer-edit-lab.sh` `playedit`, abroad, the Mac saving a
+  256 KiB file every second, now through its spool as on the Mac):
+  longest READ 166–192 s → 4.7–7.4 s, JUKEBOX 6 → 0–2, the refresh's wait
+  for the control channel up to 78 s → 0 ms, P2 0. The Mac part needs the
+  laptop run. The lab's `playedit` also reports the drain time per file,
+  and counts the bytes the Mac would keep under an mtime the server goes on
+  reporting after a newer save closed (`p2_kept`, `p2_final`).
 - A clip that was playing when the network went away plays again a second or
   two after the network returns. Before, after a longer outage (3 minutes on
   the laptop run of 2026-11-14), every read of that clip returned an
