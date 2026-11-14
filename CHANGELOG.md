@@ -4,6 +4,31 @@
 
 ### App
 
+- A clip that was playing when the network went away plays again a second or
+  two after the network returns. Before, after a longer outage (3 minutes on
+  the laptop run of 2026-11-14), every read of that clip returned an
+  input/output error until the app restarted, while other clips played. The
+  cause: JuiceFS keeps the first read error of an open file and answers every
+  later read of it with that error until the file is closed. With the network
+  gone every try fails at once, so the retries are spent in about 2 s on a
+  slow link. On a Mac the file is never closed: macFUSE gives all opens of a
+  file one shared handle, and the app and the macOS NFS client keep the clip
+  open. Now JuiceFS asks the backend again when the stored error is older
+  than 1 s (bundled JuiceFS patch 0030, `-jm15`). A missing or damaged block
+  still returns the error. Remote lab (`roam-lab.sh held-drop60`, one
+  descriptor held across the drop): before, the file stayed unreadable for
+  the rest of the run; after, reads came back 1.3–1.8 s after the network
+  returned, for 30 s, 60 s and 3-minute drops.
+- A save no longer gets a duplicate "(conflict …)" copy after a network drop
+  when the name already holds exactly that save's bytes under another inode
+  than the one the drain published. Laptop run of 2026-11-14: 1 of 2 30 s
+  drops left `f0062 (conflict …).bin` beside `f0062.bin`, both the same
+  bytes. The retry now adopts the file when only this Mac held the project
+  and the bytes (size and SHA-256, small saves up to 1 MiB) match. Different
+  bytes, or another Mac holding the project in between, still give a
+  conflict copy. The drain now logs both inodes when the published name shows
+  another file, so the next field run shows why the inode differs.
+
 - A teammate's edit to a file is now seen while the app has that file open.
   Before, once the Mac had read any part of a file, a peer's later overwrite
   stayed invisible for as long as the app kept the file open (9+ minutes on
