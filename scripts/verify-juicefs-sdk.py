@@ -53,6 +53,7 @@ PATCH_FILES = {
         "pkg/vfs/reader.go", "pkg/vfs/writer.go"],
     "patches/0028-open-round-trips.patch": ["pkg/meta/base.go", "pkg/meta/openfile.go", "pkg/meta/redis.go"],
     "patches/0029-dead-peer-detection.patch": ["pkg/object/restful.go"],
+    "patches/0030-read-error-retry.patch": ["pkg/vfs/reader.go"],
     "patches/0031-refresh-open-file.patch": [
         "pkg/fuse/fuse.go", "pkg/meta/interface.go", "pkg/vfs/internal.go"],
 }

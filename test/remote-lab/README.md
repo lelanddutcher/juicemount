@@ -198,6 +198,19 @@ After the event the probe runs 120 s more (240 s after `drop180`). The script
 then waits for the spool to drain and checks every acknowledged file on the
 JuiceFS mount: the same bytes, once each, nothing extra.
 
+`held-<case>` (for example `held-drop60`) runs a case without the session:
+`lib/heldread.py` keeps ONE descriptor of a cold file open on the JuiceFS
+mount and reads it at 2 MiB/s, retrying the same offset every 0.5 s after an
+error and never reopening. That is what the Mac app sees through macFUSE,
+which gives every open of a file one shared FUSE handle. It shows whether
+JuiceFS keeps a read error on the open file after the network returns
+(bundled JuiceFS patch 0030); `lib/heldsum.py` prints the seconds from the
+network's return to the first good read. In the session cases the app's
+offline gate refuses reads within about 1 s of the cut, before they reach
+JuiceFS, which is why they do not show it. Every run also keeps the
+`read file N:` errors and patch 0030's retries from the JuiceFS log
+(`<run>.jfs-read-errors.log`).
+
 ```sh
 JMLAB_ROAM=1 JMLAB_BBR=1 ./lab.sh up
 ./drain-lab.sh build

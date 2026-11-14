@@ -488,6 +488,15 @@ func (d *Drainer) finishPublished(row *metadata.SpoolRow, dest string, ino, dev 
 	}
 	st, ok := ofi.Sys().(*syscall.Stat_t)
 	if !ok || uint64(st.Ino) != ino || uint64(st.Dev) != dev || !ofi.Mode().IsRegular() || ofi.Size() != row.Size { //nolint:unconvert // int32 on Darwin
+		// The identities, so a field run tells a stale kernel entry, a
+		// replaced name and a wrong reply apart (R2).
+		var seenIno, seenDev uint64
+		if ok {
+			seenIno, seenDev = uint64(st.Ino), uint64(st.Dev) //nolint:unconvert // int32 on Darwin
+		}
+		jmlog.Warn("drain: the published name does not show the file this drain published",
+			"path", row.NFSPath, "published_ino", ino, "name_ino", seenIno, "published_dev", dev, "name_dev", seenDev,
+			"size", ofi.Size(), "want_size", row.Size, "regular", ofi.Mode().IsRegular())
 		d.failTransient(row, fmt.Errorf("published file %q changed before it was opened: %w", row.NFSPath, metadata.ErrMirrorConflict))
 		return
 	}
@@ -549,6 +558,14 @@ func (d *Drainer) directAdoptTarget(row *metadata.SpoolRow, dest string, base me
 	case base.Kind == metadata.SpoolBaseAbsent && !tainted && row.Size > 0:
 		// Exactly these bytes at a name that was free. Not for an empty file:
 		// every empty file matches, so another writer's would be taken as ours.
+	case base.Kind == metadata.SpoolBaseClaimed && !tainted && row.Size > 0:
+		// R2 (laptop run 2026-11-14): after a link drop the name showed
+		// another inode than the one this drain published and claimed, with
+		// exactly these bytes. Only this Mac held the project, so those bytes
+		// are this save's: adopt them instead of a conflict copy of its own
+		// file. Different bytes, or another Mac in between, still conflict.
+		jmlog.Warn("drain: the name holds this save's bytes under another inode than the drain claimed; adopting it if the bytes match",
+			"path", row.NFSPath, "claimed_ino", base.Ino, "name_ino", uint64(st.Ino), "size", st.Size) //nolint:unconvert // uint64 on Darwin
 	default:
 		return false
 	}

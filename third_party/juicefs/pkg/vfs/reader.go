@@ -123,6 +123,7 @@ func (s *sliceReader) done(err syscall.Errno, delay time.Duration) {
 			logger.Errorf("read file %d: %s", f.inode, err)
 		}
 		f.err = err
+		f.errAt = time.Now() // JuiceMount patch 0030
 	}
 	if f.shouldStop() {
 		s.state = INVALID
@@ -283,6 +284,7 @@ type fileReader struct {
 	inode    Ino
 	length   uint64
 	err      syscall.Errno
+	errAt    time.Time // JuiceMount patch 0030: when err was stored
 	tried    uint32
 	sessions [readSessions]session
 	slices   *sliceReader
@@ -599,6 +601,13 @@ func (f *fileReader) waitForIO(ctx meta.Context, reqs []*req, buf []byte) (int, 
 			if f.shouldStop() {
 				return 0, f.err
 			}
+			// JuiceMount patch 0030: a waited slice goes invalid only when
+			// its read failed. Another reader may already have cleared the
+			// stored error for a retry, so stop on the state as well, or this
+			// reader would wait on a slice that never finishes.
+			if !s.state.valid() {
+				return 0, syscall.EIO
+			}
 		}
 	}
 
@@ -631,6 +640,7 @@ func (f *fileReader) Read(ctx meta.Context, offset uint64, buf []byte) (int, sys
 	f.acquire()
 	defer f.release()
 
+	f.jmRetryAfterError() // JuiceMount patch 0030
 	if f.err != 0 || f.closing {
 		return 0, f.err
 	}
