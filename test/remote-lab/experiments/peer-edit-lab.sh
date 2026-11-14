@@ -35,10 +35,26 @@
 #                one close per save. JUKEBOX waits are the Mac's (4, 8, 16,
 #                30 s); PE_RATE sets the play rate in MiB/s (default 2);
 #                PE_WRITES=true also saves a 256 KiB file through NFS every
-#                second (jm5 drains them through juicefs's control channel).
-#                It reports the stalls, the JUKEBOX count, P2 pairs
-#                (a reply at or past a save's mtime with older bytes) and
-#                when the last save's bytes show at 8 offsets.
+#                second; jm5 then runs with its write spool, as the Mac
+#                does, and drains them through juicefs's control channel
+#                (create-files). drain_* is when each file shows its full
+#                size through the peer's mount. It reports the stalls, the
+#                JUKEBOX count, P2 pairs (a reply at or past a save's mtime
+#                with older bytes), p2_same_mtime (two replies at one offset
+#                with the same mtime and different bytes: the Mac keeps the
+#                first for good; this counts late commits under a save's
+#                final mtime), p2_kept (a reply whose mtime the server
+#                still reported 5 s after a newer save closed, with older
+#                bytes: what the Mac would keep), p2_final (older bytes
+#                under the settled mtime: kept for good), and when the last save's
+#                bytes show at 8 offsets, then the settled state 8 s later.
+#                "replies" lists every reply for offline checks.
+#                PE_EDIT_FILE=pe/v02.bin: the peer saves a second clip
+#                instead (a control: the same link load, no refresh of the
+#                played clip).
+#                PE_SAVE_TOUCH=true: the peer sets the clip's mtime before
+#                each close (as cp -p does), so its later commits keep that
+#                mtime and change only the ctime.
 #
 # Around every case the jm5 juicefs's own metadata operation counters
 # (/jfs/.stats; the peer has its own) and jm5's /metrics are saved, so the
@@ -155,7 +171,9 @@ run() {
   peer_mount
   local video=0
   case " $CASES " in *" playedit "*) video="${PE_VIDEO_MIB:-1024}" ;; esac
-  probe fixture -peer /jfs-peer -dir pe -n "$TRIALS" -video-mib "$video" > "$OUT/$label.fixture.json"
+  local videos=1
+  [ -z "${PE_EDIT_FILE:-}" ] || videos=2
+  probe fixture -peer /jfs-peer -dir pe -n "$TRIALS" -video-mib "$video" -videos "$videos" > "$OUT/$label.fixture.json"
   local uuid class=slow
   uuid="$("$LAB" exec sh -c 'juicefs status "redis://admin@'"$PROXY_IP"':6379/1" 2>/dev/null' | sed -n 's/.*"UUID": "\([^"]*\)".*/\1/p' | head -n 1)"
   [ -n "$uuid" ] || die "no volume UUID"
@@ -165,8 +183,12 @@ run() {
   fi
   "$LAB" shape "$profile" >/dev/null
   [ "$profile" != lan ] || class=fast
+  # The Mac's NFS writes land in its spool and drain through juicefs's
+  # control channel; without the spool jm5 creates through FUSE.
+  local spool=""
+  [ "${PE_WRITES:-false}" != true ] || spool="JM_SPOOL_ENABLE=1 JM_SPOOL_DIR=/var/jm/spool JM_SPOOL_SIZE_GB=8"
   # shellcheck disable=SC2016
-  "$LAB" exec sh -c 'cd /var/jm && HOME=/var/jm JM_CACHE_DIR=/var/jfscache/'"$uuid"' JM_NET_FORCE_CLASS='"$class"' '"${PE_JM5_ENV:-}"' \
+  "$LAB" exec sh -c 'cd /var/jm && HOME=/var/jm JM_CACHE_DIR=/var/jfscache/'"$uuid"' JM_NET_FORCE_CLASS='"$class"' '"$spool ${PE_JM5_ENV:-}"' \
     nohup /lab/'"$STATE_NAME/$BIN"'/jm5 --redis "redis://'"$MAC_NAME"':$(cat /var/jm/mac.pass)@'"$PROXY_IP"':6379/1" \
       --fuse-path /jfs --no-fuse --external-juicefs-is-bundled --no-mount --listen 127.0.0.1:21049 \
       --metrics-addr 127.0.0.1:21050 --log-level debug --db /var/jm/metadata.db >/var/jm/jm5.log 2>&1 & echo $! > /var/jm/jm5.pid'
@@ -199,7 +221,7 @@ run() {
       # fresh on the last trial would reuse f01, already read: skip it.
       if [ "$kase" = fresh ] && [ "$i" = "$TRIALS" ]; then continue; fi
       stats "$OUT/$label.$kase.$n.before.txt"
-      probe run -export "$xpath" -case "$kase" -file "$file" -timeout "$TIMEOUT" -save "${PE_SAVE:-60s}" -rate "${PE_RATE:-2}" -writes="${PE_WRITES:-false}" >> "$OUT/$label.jsonl" \
+      probe run -export "$xpath" -case "$kase" -file "$file" -timeout "$TIMEOUT" -save "${PE_SAVE:-60s}" -rate "${PE_RATE:-2}" -writes="${PE_WRITES:-false}" -save-touch="${PE_SAVE_TOUCH:-false}" -edit-file="${PE_EDIT_FILE:-}" >> "$OUT/$label.jsonl" \
         || log "$label: $kase $file failed"
       sleep 1
       stats "$OUT/$label.$kase.$n.after.txt"

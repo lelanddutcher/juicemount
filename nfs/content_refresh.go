@@ -409,6 +409,18 @@ func (c *contentRefresher) wait(name string, bound time.Duration) error {
 	}
 }
 
+// pending reports whether a READ of name would wait in wait: a hook of it
+// is not yet covered by a successful run (or the last run failed).
+func (c *contentRefresher) pending(name string) bool {
+	if c == nil || c.waiting.Load()+c.failedCount.Load() == 0 || c.unsupported.Load() {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	p := c.paths[name]
+	return p != nil && p.covered < p.want
+}
+
 // contentRefreshBound bounds how long a READ waits for the refresh that
 // covers it. That is at most the run going when the READ arrives, a pause no
 // longer than that run, and one full run. A run is the shared control mutex
@@ -456,7 +468,7 @@ const contentRefreshTimeout = 10 * time.Second
 // refresh's own read, with no round trip, patch 0028).
 func (h *JuiceMountHandler) refreshContentNow(inode uint64, fusePath string) error {
 	start := time.Now()
-	flags, length, _, tm, err := sharedJFSControl(h.fusePath).refreshInodeTimed(inode, contentRefreshTimeout)
+	flags, length, _, tm, err := refreshJFSControl(h.fusePath).refreshInodeTimed(inode, contentRefreshTimeout)
 	exchanged := time.Now()
 	if err != nil {
 		jmlog.Warn("content refresh: exchange failed", "path", fusePath, "inode", inode,
@@ -520,6 +532,12 @@ func (h *JuiceMountHandler) refreshContent(inMountPath string, inode uint64) {
 		h.refreshLengthCount.Store(0)
 	}
 	h.contentRefresh.begin(inMountPath, inode, full)
+}
+
+// contentRefreshPending reports whether a READ of name would wait for a
+// refresh (readAtRouted then tries the verified SSD route first, bug F2).
+func (h *JuiceMountHandler) contentRefreshPending(name string) bool {
+	return h != nil && h.contentRefresh != nil && h.contentRefresh.pending(name)
 }
 
 // awaitContentRefresh is the READ side of the ordering above. A non-nil
