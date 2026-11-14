@@ -5,10 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -28,22 +30,45 @@ const (
 // errControlUnsupported reports a juicefs that does not know the messages.
 var errControlUnsupported = errors.New("juicefs control: folder inode messages not supported")
 
-// jfsControl talks to the JuiceFS mount through its .control file. A message
-// is written, and the reply follows it in the same open file. On macOS juicefs
-// keeps one control handle per process, so one message runs at a time.
+// jfsControl talks to the JuiceFS mount through its .control file (or the
+// control lane, see jfsControlLaneFile). A message is written, and the reply
+// follows it in the same open file. On macOS juicefs keeps one control handle
+// per process and control file, so one message per file runs at a time.
 type jfsControl struct {
 	root string
+	// file is the control file in root: ".control", or the lane (below).
+	file string
 	mu   sync.Mutex
 	// replyTimeout bounds one exchange; a metadata transaction on a slow
 	// link may need several round trips.
 	replyTimeout time.Duration
-	// testExchange replaces the file exchange in tests.
+	// fallback is set on the lane: the shared channel, used once the lane
+	// turned out to be missing (a juicefs without patch 0033).
+	fallback    *jfsControl
+	laneMissing atomic.Bool
+	// testExchange replaces the file exchange in tests; testLocked replaces
+	// it while the channel's lock is held.
 	testExchange func(msg []byte, replyLen int) ([]byte, error)
+	testLocked   func(msg []byte, replyLen int) ([]byte, error)
 }
 
 func newJFSControl(root string) *jfsControl {
-	return &jfsControl{root: root, replyTimeout: 60 * time.Second}
+	return &jfsControl{root: root, file: ".control", replyTimeout: 60 * time.Second}
 }
+
+// jfsControlLaneFile is the second control file of the bundled juicefs
+// (patch 0033, third_party/juicefs/pkg/vfs/jm_control_lane.go).
+//
+// Bug F2 (laptop run 2026-11-14). On macOS juicefs keeps one control handle
+// per process, so every control message of the app shares one channel. The
+// drain's create-files messages hold it until their uploads end. Abroad, a
+// content refresh waited 1.5-6.7 s for it, 67-83 s per session, and each
+// READ of a clip a teammate was saving waited for a refresh: 35-49 s player
+// freezes while the Mac's own saves drained. The lane is a separate control
+// file with its own handle, so the refresh runs beside the drain. Only the
+// content refresh uses it: the drain, pins and the link follower keep the
+// shared channel and its order (the fences of #82 and #93 are unchanged).
+const jfsControlLaneFile = ".jmcontrol"
 
 func (c *jfsControl) exchange(msg []byte, replyLen int) ([]byte, error) {
 	return c.exchangeWithin(msg, replyLen, c.replyTimeout)
@@ -67,6 +92,24 @@ func (c *jfsControl) exchangeUntil(msg []byte, maxLen int, want func([]byte) int
 // message number, so a slow message's effect on the drainer, pins and the
 // link follower shows (review M1 of #97).
 func (c *jfsControl) exchangeUntilTimed(msg []byte, maxLen int, want func([]byte) int, timeout time.Duration) ([]byte, time.Duration, time.Duration, error) {
+	if c.fallback != nil && c.laneMissing.Load() {
+		return c.fallback.exchangeUntilTimed(msg, maxLen, want, timeout)
+	}
+	reply, wait, hold, err := c.exchangeOwn(msg, maxLen, want, timeout)
+	var notSent *errControlNotSent
+	if c.fallback != nil && errors.As(err, &notSent) && errors.Is(err, fs.ErrNotExist) {
+		// No lane: nothing was sent. Use the shared channel from now on.
+		if !c.laneMissing.Swap(true) {
+			jmlog.Warn("juicefs control: the bundled juicefs has no control lane (patch 0033); content refreshes share the drain's control channel",
+				"root", c.root)
+		}
+		r, w, h, err := c.fallback.exchangeUntilTimed(msg, maxLen, want, timeout)
+		return r, wait + w, hold + h, err
+	}
+	return reply, wait, hold, err
+}
+
+func (c *jfsControl) exchangeOwn(msg []byte, maxLen int, want func([]byte) int, timeout time.Duration) ([]byte, time.Duration, time.Duration, error) {
 	if c.testExchange != nil {
 		reply, err := c.testExchange(msg, maxLen)
 		return reply, 0, 0, err
@@ -78,10 +121,23 @@ func (c *jfsControl) exchangeUntilTimed(msg []byte, maxLen int, want func([]byte
 	lockWait := held.Sub(lockStart)
 	if lockWait >= controlWaitLog && len(msg) >= 4 {
 		jmlog.Info("juicefs control: a message waited for the control channel",
-			"cmd", binary.BigEndian.Uint32(msg[0:4]), "wait_ms", lockWait.Milliseconds())
+			"cmd", binary.BigEndian.Uint32(msg[0:4]), "file", c.controlFile(), "wait_ms", lockWait.Milliseconds())
 	}
-	reply, err := c.exchangeLocked(msg, maxLen, want, timeout)
+	var reply []byte
+	var err error
+	if c.testLocked != nil {
+		reply, err = c.testLocked(msg, maxLen)
+	} else {
+		reply, err = c.exchangeLocked(msg, maxLen, want, timeout)
+	}
 	return reply, lockWait, time.Since(held), err
+}
+
+func (c *jfsControl) controlFile() string {
+	if c.file == "" {
+		return ".control"
+	}
+	return c.file
 }
 
 // controlWaitLog: a control message that waited this long for the channel
@@ -94,7 +150,7 @@ func (c *jfsControl) exchangeLocked(msg []byte, maxLen int, want func([]byte) in
 	// on one thread.
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
-	f, err := os.OpenFile(filepath.Join(c.root, ".control"), os.O_RDWR, 0)
+	f, err := os.OpenFile(filepath.Join(c.root, c.controlFile()), os.O_RDWR, 0)
 	if err != nil {
 		return nil, &errControlNotSent{err}
 	}
@@ -272,9 +328,29 @@ func sharedJFSControl(root string) *jfsControl {
 	return c
 }
 
+// refreshJFSControl returns the control client the content refresh of the
+// mount at root uses: the lane, which falls back to the shared channel.
+func refreshJFSControl(root string) *jfsControl {
+	jfsControlsMu.Lock()
+	defer jfsControlsMu.Unlock()
+	c := jfsLanes[root]
+	if c == nil {
+		shared := jfsControls[root]
+		if shared == nil {
+			shared = newJFSControl(root)
+			jfsControls[root] = shared
+		}
+		c = newJFSControl(root)
+		c.file, c.fallback = jfsControlLaneFile, shared
+		jfsLanes[root] = c
+	}
+	return c
+}
+
 var (
 	jfsControlsMu sync.Mutex
 	jfsControls   = map[string]*jfsControl{}
+	jfsLanes      = map[string]*jfsControl{}
 )
 
 // errCreateFilesRefused wraps the refusal of a whole createFiles message

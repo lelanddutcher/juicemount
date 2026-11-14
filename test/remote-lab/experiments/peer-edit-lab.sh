@@ -35,10 +35,16 @@
 #                one close per save. JUKEBOX waits are the Mac's (4, 8, 16,
 #                30 s); PE_RATE sets the play rate in MiB/s (default 2);
 #                PE_WRITES=true also saves a 256 KiB file through NFS every
-#                second (jm5 drains them through juicefs's control channel).
-#                It reports the stalls, the JUKEBOX count, P2 pairs
-#                (a reply at or past a save's mtime with older bytes) and
-#                when the last save's bytes show at 8 offsets.
+#                second; jm5 then runs with its write spool, as the Mac
+#                does, and drains them through juicefs's control channel
+#                (create-files). drain_* is when each file shows its full
+#                size through the peer's mount. It reports the stalls, the
+#                JUKEBOX count, P2 pairs (a reply at or past a save's mtime
+#                with older bytes), p2_same_mtime (two replies at one offset
+#                with the same mtime and different bytes: the Mac keeps the
+#                first for good; this counts late commits under a save's
+#                final mtime) and when the last save's bytes show at 8
+#                offsets, then the settled state 8 s later.
 #
 # Around every case the jm5 juicefs's own metadata operation counters
 # (/jfs/.stats; the peer has its own) and jm5's /metrics are saved, so the
@@ -165,8 +171,12 @@ run() {
   fi
   "$LAB" shape "$profile" >/dev/null
   [ "$profile" != lan ] || class=fast
+  # The Mac's NFS writes land in its spool and drain through juicefs's
+  # control channel; without the spool jm5 creates through FUSE.
+  local spool=""
+  [ "${PE_WRITES:-false}" != true ] || spool="JM_SPOOL_ENABLE=1 JM_SPOOL_DIR=/var/jm/spool JM_SPOOL_SIZE_GB=8"
   # shellcheck disable=SC2016
-  "$LAB" exec sh -c 'cd /var/jm && HOME=/var/jm JM_CACHE_DIR=/var/jfscache/'"$uuid"' JM_NET_FORCE_CLASS='"$class"' '"${PE_JM5_ENV:-}"' \
+  "$LAB" exec sh -c 'cd /var/jm && HOME=/var/jm JM_CACHE_DIR=/var/jfscache/'"$uuid"' JM_NET_FORCE_CLASS='"$class"' '"$spool ${PE_JM5_ENV:-}"' \
     nohup /lab/'"$STATE_NAME/$BIN"'/jm5 --redis "redis://'"$MAC_NAME"':$(cat /var/jm/mac.pass)@'"$PROXY_IP"':6379/1" \
       --fuse-path /jfs --no-fuse --external-juicefs-is-bundled --no-mount --listen 127.0.0.1:21049 \
       --metrics-addr 127.0.0.1:21050 --log-level debug --db /var/jm/metadata.db >/var/jm/jm5.log 2>&1 & echo $! > /var/jm/jm5.pid'

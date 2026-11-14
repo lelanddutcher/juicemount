@@ -246,6 +246,11 @@ func (p *probe) playEdit(row map[string]any, size int64, rate float64, lead, sav
 	var writes []time.Duration
 	writeErrs := 0
 	writeErr := ""
+	// Drain time: when each saved file shows its full size through the
+	// peer's mount (the NAS), from the NFS close (F2: the drain shares
+	// juicefs's control channel with the content refresh).
+	closedAt := map[string]time.Time{}
+	drained := map[string]time.Duration{}
 	writeDone := make(chan struct{})
 	go func() {
 		defer close(writeDone)
@@ -290,8 +295,40 @@ func (p *probe) playEdit(row map[string]any, size int64, rate float64, lead, sav
 				writeErrs++
 			} else {
 				writes = append(writes, time.Since(s))
+				closedAt[fmt.Sprintf("w-%d-%04d.bin", stamp, i)] = time.Now()
 			}
 			mu.Unlock()
+		}
+	}()
+	drainDone := make(chan struct{})
+	drainStop := make(chan struct{})
+	go func() {
+		defer close(drainDone)
+		if !p.writes {
+			return
+		}
+		dir := filepath.Join(p.peer, path.Dir(p.name))
+		for {
+			select {
+			case <-drainStop:
+				return
+			case <-time.After(500 * time.Millisecond):
+			}
+			mu.Lock()
+			var todo []string
+			for n := range closedAt {
+				if _, ok := drained[n]; !ok {
+					todo = append(todo, n)
+				}
+			}
+			mu.Unlock()
+			for _, n := range todo {
+				if st, err := os.Stat(filepath.Join(dir, n)); err == nil && st.Size() == 256<<10 {
+					mu.Lock()
+					drained[n] = time.Since(closedAt[n])
+					mu.Unlock()
+				}
+			}
 		}
 	}()
 	time.Sleep(lead)
@@ -312,6 +349,31 @@ func (p *probe) playEdit(row map[string]any, size int64, rate float64, lead, sav
 	<-done
 	<-pollDone
 	<-writeDone
+	if p.writes {
+		// Give the drain a bounded tail, then report what reached the NAS.
+		for wait := time.Now(); time.Since(wait) < 60*time.Second; time.Sleep(time.Second) {
+			mu.Lock()
+			all := len(drained) == len(closedAt)
+			mu.Unlock()
+			if all {
+				break
+			}
+		}
+		close(drainStop)
+		<-drainDone
+		var ds []time.Duration
+		for _, d := range drained {
+			ds = append(ds, d)
+		}
+		sort.Slice(ds, func(i, j int) bool { return ds[i] < ds[j] })
+		row["drain_saved"], row["drain_on_nas"] = len(closedAt), len(ds)
+		if n := len(ds); n > 0 {
+			row["drain_p50_s"], row["drain_p90_s"], row["drain_max_s"] = secs(ds[n/2]), secs(ds[n*9/10]), secs(ds[n-1])
+		}
+	} else {
+		close(drainStop)
+		<-drainDone
+	}
 	if p.writes {
 		sort.Slice(writes, func(i, j int) bool { return writes[i] < writes[j] })
 		row["writes"], row["write_errors"], row["write_first_error"] = len(writes), writeErrs, writeErr
@@ -345,12 +407,25 @@ func (p *probe) playEdit(row map[string]any, size int64, rate float64, lead, sav
 	}
 	finalAt := -1.0
 	finalJukebox := 0
+	var finals []playRead // every final-poll reply, for the same-mtime check
+	finalRead := func(o uint64) (string, error) {
+		s := time.Now()
+		m, b, jb, err := p.readPairMac(o, tagLen)
+		finalJukebox += jb
+		r := playRead{At: s, Off: o, Took: time.Since(s), Jukebox: jb, Mtime: m}
+		if err != nil {
+			r.Err = err.Error()
+		} else if len(b) >= tagLen {
+			r.Tag = string(b[:tagLen])
+		}
+		finals = append(finals, r)
+		return r.Tag, err
+	}
 	for time.Since(last.Close) < p.timeout {
 		all := true
 		for _, o := range offs {
-			_, b, jb, err := p.readPairMac(o, tagLen)
-			finalJukebox += jb
-			if err != nil || string(b) != last.Tag {
+			tag, err := finalRead(o)
+			if err != nil || tag != last.Tag {
 				all = false
 				break
 			}
@@ -360,6 +435,14 @@ func (p *probe) playEdit(row map[string]any, size int64, rate float64, lead, sav
 			break
 		}
 		time.Sleep(p.poll)
+	}
+
+	// Settled: the attributes and bytes once every commit has long landed
+	// (a design that reports another mtime while commits arrive switches
+	// back by then).
+	time.Sleep(p.settle)
+	for _, o := range offs {
+		_, _ = finalRead(o)
 	}
 
 	// The play summary.
@@ -411,6 +494,45 @@ func (p *probe) playEdit(row map[string]any, size int64, rate float64, lead, sav
 				p2Examples = append(p2Examples, map[string]any{"at_s": secs(r.At.Sub(t0)), "off_mib": r.Off / mib, "reply_save": k, "bytes_save": got, "poll": poll})
 			}
 		}
+	}
+	// P2 as the Mac's NFS client sees it (the mtime-span finding): it keeps
+	// the bytes of a reply until it sees another mtime. So two replies at one
+	// offset with the same mtime and different bytes mean the Mac may keep
+	// the earlier bytes for good. This counts late commits too: a reply under
+	// a save's final mtime before its last part committed. Each reply whose
+	// bytes differ from a later reply's at the same offset and mtime counts.
+	all := append(append(append([]playRead(nil), reads...), polls...), finals...)
+	sort.SliceStable(all, func(i, j int) bool { return all[i].At.Before(all[j].At) })
+	type offMtime struct {
+		off uint64
+		mt  int64
+	}
+	lastTag := map[offMtime]string{}
+	sameMtime := 0
+	var sameExamples []map[string]any
+	for i := len(all) - 1; i >= 0; i-- {
+		r := all[i]
+		if r.Tag == "" || r.Err != "" {
+			continue
+		}
+		k := offMtime{r.Off, mtimeNS(r.Mtime)}
+		if later, ok := lastTag[k]; ok && later != r.Tag {
+			sameMtime++
+			if len(sameExamples) < 5 {
+				got, ok := tagIndex[r.Tag]
+				if !ok {
+					got = -1
+				}
+				sameExamples = append(sameExamples, map[string]any{"at_s": secs(r.At.Sub(t0)), "off_mib": r.Off / mib, "bytes_save": got, "later_save": tagIndex[later]})
+			}
+			continue
+		}
+		lastTag[k] = r.Tag
+	}
+	row["p2_same_mtime"], row["p2_same_mtime_examples"] = sameMtime, sameExamples
+	if n := len(finals); n > 0 {
+		row["settled_mtime_ns"] = mtimeNS(finals[n-1].Mtime)
+		row["final_mtime_ns"] = mtimeNS(last.Mtime)
 	}
 	sort.Slice(stalls, func(i, j int) bool { return stalls[i]["took_s"].(float64) > stalls[j]["took_s"].(float64) })
 	if len(stalls) > 10 {

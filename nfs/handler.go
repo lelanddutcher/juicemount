@@ -74,7 +74,10 @@ type JuiceMountHandler struct {
 	// and the content read (B-9 mid-read hole race).
 	testAfterInPlaceReadBound func(path string)
 	testReadCachedInfo        func(path string)
-	testSyncOnlineMutation    func(*os.File) error
+	// testVerifiedSSD stands in for the verified SSD route (readVerifiedSSD):
+	// handled false is a miss.
+	testVerifiedSSD        func(path string, p []byte, off int64) (int, error, bool)
+	testSyncOnlineMutation func(*os.File) error
 	// Acceptance-only seams: the read hook must perform the real fd.ReadAt;
 	// publication models the external JuiceFS daemon cache, after that read.
 	previewReadAt    func(*os.File, []byte, int64) (int, error)
@@ -6432,7 +6435,28 @@ func (f *cachedFile) readAtRouted(p []byte, off int64, trace *cachedReadTrace) (
 	// P2 (laptop run 2026-11-14): no byte is read while a refresh of this
 	// file's juicefs caches is pending, so a reply that carries the new
 	// attributes never carries old bytes (content_refresh.go).
+	//
+	// Bug F2 (laptop run 2026-11-14): the verified SSD route reads on while a
+	// refresh is pending. It reads juicefs's cached blocks by slice ID from a
+	// chunk mapping, never through juicefs's read buffers or the kernel's
+	// pages of the FUSE file, which are the caches the refresh drops. The
+	// content hook drops that mapping (InvalidateSliceCache) before the
+	// mirror changes, so a READ whose attributes show an edit reads a mapping
+	// fetched after the edit's hook, from Redis; the reader's generation
+	// guard keeps an older fetch out, and blocks are immutable per slice ID
+	// and checksum-verified. While a teammate saves a clip, its attr push
+	// comes every 2-4 s, and every READ waited for a refresh (and the
+	// refresh for the kernel notify, which waits behind the file's reads in
+	// flight). A miss falls through to the wait below and then FUSE.
+	ssdTried := false
 	if f.handler != nil {
+		if f.pinGeneration == "" && f.snapshotProof == nil && f.sidecarProof == nil &&
+			f.verifiedSSDEnabled() && f.handler.contentRefreshPending(f.name) {
+			ssdTried = true
+			if n, err, handled := f.readVerifiedSSD(p, off, trace); handled {
+				return n, err
+			}
+		}
 		if err := f.handler.awaitContentRefresh(f.name); err != nil {
 			return 0, err
 		}
@@ -6511,74 +6535,10 @@ func (f *cachedFile) readAtRouted(p []byte, off int64, trace *cachedReadTrace) (
 	// Priority 2.5: checksum-verified direct SSD cache read (bypasses FUSE and
 	// its remote metadata round trips). Any miss or integrity refusal falls
 	// through to the coherent FUSE path below; see cacheReaderServeEnabled.
-	if f.cacheReader != nil && cacheReaderServeEnabled {
-		// An earlier authoritative size check may have captured this exact
-		// descriptor's identity. Only a complete selected-volume-bound SSD
-		// read can finish that existing proof; snapshot before cache I/O so
-		// a concurrent writer or replacement cannot supply new authority.
-		cacheProof := f.cachedSidecarSourceProof(off, len(p))
-		// A mapping already in RAM never observes this deadline. A first read
-		// needs one LRANGE; bound it so an unreachable Redis cannot park an NFS
-		// connection for the client's full soft-mount timeout. Far links get room
-		// for the verified direct→encrypted handoff; explicit offline mode only
-		// admits mappings we already have locally.
-		mappingTimeout := 500 * time.Millisecond
-		if netprofile.Default().HighLatency() {
-			mappingTimeout = 4 * time.Second
+	if !ssdTried && f.verifiedSSDEnabled() {
+		if n, err, handled := f.readVerifiedSSD(p, off, trace); handled {
+			return n, err
 		}
-		if pin.IsOffline() {
-			mappingTimeout = 200 * time.Millisecond
-		}
-		f.startOverlappedOpen(off)
-		n, err := f.handler.readCacheBlockTraced(context.Background(), f.cacheReader, f.cacheIdentity, f.inode, off, p, mappingTimeout, trace)
-		if errors.Is(err, syscall.EAGAIN) && !f.changedUnderRead() {
-			return 0, err
-		}
-		if errors.Is(err, syscall.EAGAIN) {
-			// P4 (laptop run 2026-11-14): a teammate's save landed while this
-			// READ ran, so the verified copy no longer matches the file. The
-			// answer used to be JUKEBOX, and the Mac retries a JUKEBOX only
-			// after 4 s: playback froze for 4 s per save (9 of 24 trials).
-			// Read the live file through FUSE instead, after its refresh.
-			// The reply still carries the attributes the READ started with;
-			// the Mac drops these bytes when it sees the new mtime.
-			if err := f.handler.awaitContentRefresh(f.name); err != nil {
-				return 0, err
-			}
-			n, err = 0, nil
-			clear(p)
-		}
-		if errors.Is(err, cache.ErrVolumeBinding) {
-			// A positive identity refusal cannot authorize another backend read,
-			// including the bounded FUSE fallback used while offline.
-			return 0, fmt.Errorf("%w: %w", syscall.EIO, err)
-		}
-		if err == nil && n > 0 {
-			if trace != nil {
-				trace.FinalRoute = "verified_ssd"
-			}
-			metrics.Default().ObserveDirectSSDCacheHit(int64(n))
-			// Preserve complete local bytes for a later positioned rewrite.
-			// Publication additionally checks the descriptor and current writer,
-			// mirror, and volume identities; weak or partial SSD reads stay weak.
-			if f.handler != nil && off == 0 {
-				f.handler.sidecarMaybePopulate(f.name, off, p[:n], f.fileSize)
-				if cacheProof != nil && n == len(p) {
-					f.publishSidecarSourceProof(cacheProof, p[:n])
-				}
-			}
-			// Preserve the sequential-read signal across a mixed local/cold run.
-			// OnRead prefetches strictly AFTER this range, so it never asks FUSE
-			// for the bytes this verified SSD hit just served. Without this call,
-			// alternating cache hits and cold blocks reset the WAN detector and
-			// serialize every miss across the Link.
-			if f.readahead != nil {
-				f.readahead.OnRead(f.inode, off, n, f.name)
-			}
-			metrics.Default().AddBytesRead(int64(n))
-			return n, nil
-		}
-		metrics.Default().IncDirectSSDCacheMiss()
 	}
 
 	if err := f.handler.cacheBackendError(); err != nil {
@@ -6825,6 +6785,86 @@ func (f *cachedFile) readAtRouted(p []byte, off int64, trace *cachedReadTrace) (
 	// torn-read guards above (premature-EOF → ErrUnexpectedEOF) and
 	// offline errors pass through untouched.
 	return n, f.handler.classifyBlipError(err)
+}
+
+func (f *cachedFile) verifiedSSDEnabled() bool {
+	return cacheReaderServeEnabled && (f.cacheReader != nil || (f.handler != nil && f.handler.testVerifiedSSD != nil))
+}
+
+// readVerifiedSSD is the checksum-verified direct SSD route (Priority 2.5 of
+// readAtRouted). handled false: a miss; the READ falls through to FUSE.
+func (f *cachedFile) readVerifiedSSD(p []byte, off int64, trace *cachedReadTrace) (n int, err error, handled bool) {
+	if f.handler != nil && f.handler.testVerifiedSSD != nil {
+		return f.handler.testVerifiedSSD(f.name, p, off)
+	}
+	// An earlier authoritative size check may have captured this exact
+	// descriptor's identity. Only a complete selected-volume-bound SSD
+	// read can finish that existing proof; snapshot before cache I/O so
+	// a concurrent writer or replacement cannot supply new authority.
+	cacheProof := f.cachedSidecarSourceProof(off, len(p))
+	// A mapping already in RAM never observes this deadline. A first read
+	// needs one LRANGE; bound it so an unreachable Redis cannot park an NFS
+	// connection for the client's full soft-mount timeout. Far links get room
+	// for the verified direct→encrypted handoff; explicit offline mode only
+	// admits mappings we already have locally.
+	mappingTimeout := 500 * time.Millisecond
+	if netprofile.Default().HighLatency() {
+		mappingTimeout = 4 * time.Second
+	}
+	if pin.IsOffline() {
+		mappingTimeout = 200 * time.Millisecond
+	}
+	f.startOverlappedOpen(off)
+	n, err = f.handler.readCacheBlockTraced(context.Background(), f.cacheReader, f.cacheIdentity, f.inode, off, p, mappingTimeout, trace)
+	if errors.Is(err, syscall.EAGAIN) && !f.changedUnderRead() {
+		return 0, err, true
+	}
+	if errors.Is(err, syscall.EAGAIN) {
+		// P4 (laptop run 2026-11-14): a teammate's save landed while this
+		// READ ran, so the verified copy no longer matches the file. The
+		// answer used to be JUKEBOX, and the Mac retries a JUKEBOX only
+		// after 4 s: playback froze for 4 s per save (9 of 24 trials).
+		// Read the live file through FUSE instead, after its refresh.
+		// The reply still carries the attributes the READ started with;
+		// the Mac drops these bytes when it sees the new mtime.
+		if err := f.handler.awaitContentRefresh(f.name); err != nil {
+			return 0, err, true
+		}
+		n, err = 0, nil
+		clear(p)
+	}
+	if errors.Is(err, cache.ErrVolumeBinding) {
+		// A positive identity refusal cannot authorize another backend read,
+		// including the bounded FUSE fallback used while offline.
+		return 0, fmt.Errorf("%w: %w", syscall.EIO, err), true
+	}
+	if err == nil && n > 0 {
+		if trace != nil {
+			trace.FinalRoute = "verified_ssd"
+		}
+		metrics.Default().ObserveDirectSSDCacheHit(int64(n))
+		// Preserve complete local bytes for a later positioned rewrite.
+		// Publication additionally checks the descriptor and current writer,
+		// mirror, and volume identities; weak or partial SSD reads stay weak.
+		if f.handler != nil && off == 0 {
+			f.handler.sidecarMaybePopulate(f.name, off, p[:n], f.fileSize)
+			if cacheProof != nil && n == len(p) {
+				f.publishSidecarSourceProof(cacheProof, p[:n])
+			}
+		}
+		// Preserve the sequential-read signal across a mixed local/cold run.
+		// OnRead prefetches strictly AFTER this range, so it never asks FUSE
+		// for the bytes this verified SSD hit just served. Without this call,
+		// alternating cache hits and cold blocks reset the WAN detector and
+		// serialize every miss across the Link.
+		if f.readahead != nil {
+			f.readahead.OnRead(f.inode, off, n, f.name)
+		}
+		metrics.Default().AddBytesRead(int64(n))
+		return n, nil, true
+	}
+	metrics.Default().IncDirectSSDCacheMiss()
+	return 0, nil, false
 }
 
 func (f *cachedFile) Read(p []byte) (int, error) {

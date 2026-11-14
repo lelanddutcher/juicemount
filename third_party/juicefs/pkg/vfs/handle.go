@@ -199,7 +199,7 @@ func (v *VFS) findHandle(inode Ino, fh uint64) *handle {
 			return f
 		}
 	}
-	if fh&1 == 1 && inode != controlInode {
+	if fh&1 == 1 && !jmIsControl(inode) { // JuiceMount patch 0033
 		f := &handle{inode: inode, fh: fh, flags: O_RECOVERED}
 		f.cond = utils.NewCond(f)
 		v.handles[inode] = append(v.handles[inode], f)
@@ -302,7 +302,7 @@ func (v *VFS) dumpAllHandles(path string) (err error) {
 	var vfsState state
 	vfsState.Handler = make(map[uint64]saveHandle)
 	for ino, hs := range v.handles {
-		if ino == controlInode {
+		if jmIsControl(ino) { // JuiceMount patch 0033
 			// the job is lost, can't be recovered
 			continue
 		}
