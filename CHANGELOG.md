@@ -37,7 +37,11 @@
     pin now takes the file's current size. After an in-place edit the re-pin
     read stale kernel pages and its check refused it; the open now purges
     them (P1).
-  Linux remote lab and the laptop checks to run: see the PR.
+  Linux remote lab (`peer-edit-lab.sh`, new `pair` case; P1–P3 cannot show
+  on Linux, where every open reaches JuiceFS): after a peer's edit, JUKEBOX
+  replies abroad went from 3 to 0. Of the 5,600 READ replies that carried the
+  new mtime, none carried old bytes. lan bounds are 0.21–0.22 s, and a read of an unchanged
+  file costs the same. The Mac-only parts need the laptop run.
 
 - A teammate's edit to a file is now seen while the app has that file open.
   Before, once the Mac had read any part of a file, a peer's later overwrite

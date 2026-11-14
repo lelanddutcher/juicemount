@@ -204,10 +204,16 @@ const contentRefreshTimeout = 10 * time.Second
 // an appended length (juicefs answers it from the refresh's own read, with
 // no round trip, patch 0028).
 func (h *JuiceMountHandler) refreshContentNow(inode uint64, fusePath string) error {
-	flags, _, _, err := sharedJFSControl(h.fusePath).refreshInode(inode, contentRefreshTimeout)
+	start := time.Now()
+	flags, length, _, err := sharedJFSControl(h.fusePath).refreshInode(inode, contentRefreshTimeout)
 	if err != nil {
 		return err
 	}
+	// One line per teammate edit of a file this process holds, as the attr
+	// push logs "refreshed": the laptop check reads it beside juicefs's
+	// access log (a new read of the inode after it).
+	jmlog.Info("content refresh: juicefs dropped the open file's caches", "path", fusePath, "inode", inode,
+		"length", length, "kernel_pages_dropped", flags&jfsRefreshKernelDropped != 0, "ms", time.Since(start).Milliseconds())
 	if flags&jfsRefreshKernelDropped == 0 {
 		jmlog.Warn("content refresh: the kernel did not confirm it dropped the file's pages", "inode", inode,
 			"no_notify", flags&jfsRefreshKernelNone != 0, "timeout", flags&jfsRefreshKernelTimeout != 0,
