@@ -53,6 +53,7 @@ PATCH_FILES = {
         "pkg/vfs/reader.go", "pkg/vfs/writer.go"],
     "patches/0028-open-round-trips.patch": ["pkg/meta/base.go", "pkg/meta/openfile.go", "pkg/meta/redis.go"],
     "patches/0029-dead-peer-detection.patch": ["pkg/object/restful.go"],
+    "patches/0030-read-error-retry.patch": ["pkg/vfs/reader.go"],
 }
 VERSION_PACKAGE = "github.com/juicedata/juicefs/pkg/version"
 
