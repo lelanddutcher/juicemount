@@ -107,8 +107,48 @@ func TestSpoolBaseRoundTripAndProjectHold(t *testing.T) {
 	if err := s.ClaimDrainBase(id, 555); err != nil {
 		t.Fatal(err)
 	}
-	if b, _, _ := s.DrainBase(id); b.Kind != SpoolBaseClaimed || b.Ino != 555 {
+	if b, _, _ := s.DrainBase(id); b.Kind != SpoolBaseClaimed || b.Ino != 555 || b.Staged {
 		t.Fatalf("claim not recorded: %+v", b)
+	}
+	// A staged claim (a complete stage installed at the name) round-trips, and
+	// a plain claim afterwards clears the mark.
+	if err := s.ClaimDrainBaseStaged(id, 556); err != nil {
+		t.Fatal(err)
+	}
+	if b, _, _ := s.DrainBase(id); b.Kind != SpoolBaseClaimed || b.Ino != 556 || !b.Staged {
+		t.Fatalf("staged claim not recorded: %+v", b)
+	}
+	// RestoreDrainBase undoes only the exact staged claim it names.
+	prev := SpoolBase{Kind: SpoolBaseAbsent}
+	if err := s.RestoreDrainBase(id, 999, prev); err != nil {
+		t.Fatal(err)
+	}
+	if b, _, _ := s.DrainBase(id); b.Kind != SpoolBaseClaimed || b.Ino != 556 || !b.Staged {
+		t.Fatalf("restore of another inode changed the claim: %+v", b)
+	}
+	if err := s.RestoreDrainBase(id, 556, prev); err != nil {
+		t.Fatal(err)
+	}
+	if b, _, _ := s.DrainBase(id); b.Kind != SpoolBaseAbsent {
+		t.Fatalf("staged claim not restored: %+v", b)
+	}
+	if err := s.ClaimDrainBase(id, 555); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RestoreDrainBase(id, 555, prev); err != nil {
+		t.Fatal(err)
+	}
+	if b, _, _ := s.DrainBase(id); b.Kind != SpoolBaseClaimed || b.Ino != 555 || b.Staged {
+		t.Fatalf("restore undid a plain (in-place) claim: %+v", b)
+	}
+	if err := s.ClaimDrainBaseStaged(id, 556); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ClaimDrainBase(id, 555); err != nil {
+		t.Fatal(err)
+	}
+	if b, _, _ := s.DrainBase(id); b.Staged {
+		t.Fatalf("plain claim kept the staged mark: %+v", b)
 	}
 	if held, err := s.HoldForProject(id, "Film/ProjB", "waiting_project: busy"); err != nil || !held {
 		t.Fatalf("hold: %v %v", held, err)
