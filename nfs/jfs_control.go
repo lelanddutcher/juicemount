@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/lelanddutcher/juicemount/internal/cache/pin"
+	"github.com/lelanddutcher/juicemount/internal/jmlog"
 )
 
 // JuiceFS control-file messages added by the bundled juicefs (patch 0022,
@@ -56,11 +57,38 @@ func (c *jfsControl) exchangeWithin(msg []byte, replyLen int, timeout time.Durat
 // reply whose first byte says it is short (an older juicefs refusing an
 // unknown message with one byte) ends at once. maxLen is the longest reply.
 func (c *jfsControl) exchangeUntil(msg []byte, maxLen int, want func([]byte) int, timeout time.Duration) ([]byte, error) {
+	reply, _, _, err := c.exchangeUntilTimed(msg, maxLen, want, timeout)
+	return reply, err
+}
+
+// exchangeUntilTimed is exchangeUntil that also reports how long the call
+// waited for the control mutex (another control message in flight) and how
+// long it held it. A wait of controlWaitLog or more is logged with the
+// message number, so a slow message's effect on the drainer, pins and the
+// link follower shows (review M1 of #97).
+func (c *jfsControl) exchangeUntilTimed(msg []byte, maxLen int, want func([]byte) int, timeout time.Duration) ([]byte, time.Duration, time.Duration, error) {
 	if c.testExchange != nil {
-		return c.testExchange(msg, maxLen)
+		reply, err := c.testExchange(msg, maxLen)
+		return reply, 0, 0, err
 	}
+	lockStart := time.Now()
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	held := time.Now()
+	lockWait := held.Sub(lockStart)
+	if lockWait >= controlWaitLog && len(msg) >= 4 {
+		jmlog.Info("juicefs control: a message waited for the control channel",
+			"cmd", binary.BigEndian.Uint32(msg[0:4]), "wait_ms", lockWait.Milliseconds())
+	}
+	reply, err := c.exchangeLocked(msg, maxLen, want, timeout)
+	return reply, lockWait, time.Since(held), err
+}
+
+// controlWaitLog: a control message that waited this long for the channel
+// is logged.
+const controlWaitLog = 200 * time.Millisecond
+
+func (c *jfsControl) exchangeLocked(msg []byte, maxLen int, want func([]byte) int, timeout time.Duration) ([]byte, error) {
 	// juicefs keys the macOS control handle by the caller's pid, and FUSE
 	// requests carry the thread's identity on Linux. Keep the whole exchange
 	// on one thread.

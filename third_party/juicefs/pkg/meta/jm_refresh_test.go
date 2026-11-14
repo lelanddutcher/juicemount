@@ -58,3 +58,60 @@ func TestJMRefreshOpenFileDropsPeerStaleSlices(t *testing.T) {
 		t.Fatalf("unknown inode: %v, want ENOENT", st)
 	}
 }
+
+// Patch 0032: a Read whose engine round trip overlapped an invalidation of
+// the file must not cache its (possibly older) slice list.
+func TestJMRefreshCachesNoListReadAcrossAnInvalidation(t *testing.T) {
+	o := newOpenFiles(time.Hour, 0)
+	const ino = Ino(5)
+	o.Open(ino, &Attr{Mtime: 1})
+	list := []Slice{{Id: 7, Size: 10, Len: 10}}
+
+	of, gen := o.jmChunkGen(ino)
+	o.jmCacheChunkAt(ino, 3, list, of, gen)
+	if got, ok := o.ReadChunk(ino, 3); !ok || len(got) != 1 {
+		t.Fatal("a list read with no invalidation in flight was not cached")
+	}
+
+	of, gen = o.jmChunkGen(ino)
+	o.InvalidateChunk(ino, invalidateAllChunks) // a refresh lands mid-read
+	o.jmCacheChunkAt(ino, 3, list, of, gen)
+	if _, ok := o.ReadChunk(ino, 3); ok {
+		t.Fatal("a list read across an invalidation was cached")
+	}
+	of, gen = o.jmChunkGen(ino)
+	o.InvalidateChunk(ino, 3)
+	o.jmCacheChunkAt(ino, 3, list, of, gen)
+	if _, ok := o.ReadChunk(ino, 3); ok {
+		t.Fatal("a list read across a one-chunk invalidation was cached")
+	}
+	if of, _ := o.jmChunkGen(Ino(99)); of != nil {
+		t.Fatal("a file that is not open has no generation")
+	}
+	o.jmCacheChunkAt(Ino(99), 0, list, nil, 0)
+}
+
+// Review L1 of #97: a file closed and opened again may reuse the pooled
+// entry; a list read in its first life must not be cached in the second.
+func TestJMRefreshCachesNoListAcrossAReopen(t *testing.T) {
+	o := newOpenFiles(time.Hour, 0)
+	const ino = Ino(6)
+	o.Open(ino, &Attr{Mtime: 1})
+	of, gen := o.jmChunkGen(ino)
+	o.Lock()
+	delete(o.files, ino) // the close path's release puts it back in the pool
+	o.Unlock()
+	of.release()
+	for i := 0; i < 64; i++ { // the pool may hand back the same entry
+		o.Open(ino, &Attr{Mtime: 2})
+		o.jmCacheChunkAt(ino, 3, []Slice{{Id: 9, Size: 1, Len: 1}}, of, gen)
+		if _, ok := o.ReadChunk(ino, 3); ok {
+			t.Fatal("a list read before the reopen was cached")
+		}
+		o.Lock()
+		cur := o.files[ino]
+		delete(o.files, ino)
+		o.Unlock()
+		cur.release()
+	}
+}

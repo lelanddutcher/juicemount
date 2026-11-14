@@ -33,9 +33,12 @@ type openFile struct {
 	// firstRaw is the length of the raw list behind a seeded first, for the
 	// compaction decision Read makes when it uses it.
 	firstRaw int
+	// jmGen counts the slice-list invalidations of this file (patch 0032).
+	jmGen uint64
 }
 
 func (o *openFile) invalidateChunk() {
+	o.jmGen++ // JuiceMount patch 0032
 	o.first = nil
 	o.firstAt = time.Time{}
 	for c := range o.chunks {
@@ -147,6 +150,7 @@ func (o *openfiles) openLocked(ino Ino, attr *Attr) {
 	of, ok := o.files[ino]
 	if !ok {
 		of = ofPool.Get().(*openFile)
+		of.jmGen++ // JuiceMount patch 0032: a pooled entry is a new file (A-B-A)
 		o.files[ino] = of
 	} else if attr != nil && attr.Mtime == of.attr.Mtime && attr.Mtimensec == of.attr.Mtimensec {
 		attr.KeepCache = of.attr.KeepCache
@@ -278,6 +282,7 @@ func (o *openfiles) InvalidateChunk(ino Ino, indx uint32) {
 	defer o.Unlock()
 	of, ok := o.files[ino]
 	if ok {
+		of.jmGen++ // JuiceMount patch 0032
 		if indx == invalidateAllChunks {
 			of.invalidateChunk()
 		} else if indx == 0 {

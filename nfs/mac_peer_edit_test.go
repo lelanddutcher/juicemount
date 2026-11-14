@@ -58,7 +58,7 @@ func TestJFSRefreshInodeExchange(t *testing.T) {
 		t.Fatalf("reply: %d %d %d %v", flags, length, mtime, err)
 	}
 	want := controlHeader(jfsMsgRefreshInode, 9)
-	want = append(want, 1)
+	want = append(want, jfsRefreshAsync)
 	want = binary.BigEndian.AppendUint64(want, 98)
 	if !bytes.Equal(sent, want) {
 		t.Fatalf("message % x, want % x", sent, want)

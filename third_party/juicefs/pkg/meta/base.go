@@ -1692,6 +1692,7 @@ func (m *baseMeta) Read(ctx Context, inode Ino, indx uint32, slices *[]Slice) (s
 
 	*slices = nil
 	defer m.timeit("Read", time.Now())
+	of, gen := m.of.jmChunkGen(inode) // JuiceMount patch 0032
 	ss, st := m.en.doRead(ctx, inode, indx)
 	if st != 0 {
 		return st
@@ -1711,7 +1712,7 @@ func (m *baseMeta) Read(ctx Context, inode Ino, indx uint32, slices *[]Slice) (s
 	}
 
 	*slices = buildSlice(ss)
-	m.of.CacheChunk(inode, indx, *slices)
+	m.of.jmCacheChunkAt(inode, indx, *slices, of, gen) // JuiceMount patch 0032
 	if !m.conf.ReadOnly && (len(ss) >= 5 || len(*slices) >= 5) {
 		go m.compactChunk(inode, indx, false, false)
 	}
