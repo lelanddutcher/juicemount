@@ -156,6 +156,39 @@ func TestContentRefreshLaneFallsBackToTheSharedChannel(t *testing.T) {
 	}
 }
 
+// A mount that is briefly gone (a juicefs restart) has neither control file.
+// The refresh fails over to the shared channel for that message only; the
+// lane stays on, and the next refresh uses it again (review M1 of #98).
+func TestContentRefreshLaneSurvivesAMissingMount(t *testing.T) {
+	lane, shared := laneTestControls(t)
+	mountUp := false
+	var laneTries atomic.Int32
+	lane.testLocked = func([]byte, int) ([]byte, error) {
+		laneTries.Add(1)
+		if !mountUp {
+			return nil, &errControlNotSent{&fs.PathError{Op: "open", Path: jfsControlLaneFile, Err: syscall.ENOENT}}
+		}
+		return refreshReply(jfsRefreshKernelAccepted), nil
+	}
+	shared.testReachable = func() bool { return mountUp }
+	shared.testLocked = func([]byte, int) ([]byte, error) {
+		return nil, &errControlNotSent{&fs.PathError{Op: "open", Path: ".control", Err: syscall.ENOENT}}
+	}
+	if _, _, _, _, err := lane.refreshInodeTimed(5, time.Second); err == nil {
+		t.Fatal("refresh with the mount gone: no error")
+	}
+	if lane.laneMissing.Load() {
+		t.Fatal("a missing mount turned the lane off")
+	}
+	mountUp = true
+	if flags, _, _, _, err := lane.refreshInodeTimed(5, time.Second); err != nil || flags != jfsRefreshKernelAccepted {
+		t.Fatalf("refresh after the mount returned: flags %d err %v", flags, err)
+	}
+	if laneTries.Load() != 2 {
+		t.Fatalf("lane tried %d times; want 2", laneTries.Load())
+	}
+}
+
 // A READ the verified SSD route serves does not wait for a pending refresh:
 // that route reads juicefs's blocks by slice ID from a mapping the content
 // hook already dropped, never juicefs's read buffers or the kernel's pages,

@@ -50,6 +50,8 @@ type jfsControl struct {
 	// it while the channel's lock is held.
 	testExchange func(msg []byte, replyLen int) ([]byte, error)
 	testLocked   func(msg []byte, replyLen int) ([]byte, error)
+	// testReachable replaces the check that the control file exists.
+	testReachable func() bool
 }
 
 func newJFSControl(root string) *jfsControl {
@@ -98,7 +100,14 @@ func (c *jfsControl) exchangeUntilTimed(msg []byte, maxLen int, want func([]byte
 	reply, wait, hold, err := c.exchangeOwn(msg, maxLen, want, timeout)
 	var notSent *errControlNotSent
 	if c.fallback != nil && errors.As(err, &notSent) && errors.Is(err, fs.ErrNotExist) {
-		// No lane: nothing was sent. Use the shared channel from now on.
+		// No lane: nothing was sent. Switch to the shared channel for good
+		// only when the mount answers for .control: a mount that is briefly
+		// gone (a juicefs restart) has neither file, and must not turn the
+		// lane off until the app restarts (review M1 of #98).
+		if !c.fallback.controlFileReachable() {
+			r, w, h, err := c.fallback.exchangeUntilTimed(msg, maxLen, want, timeout)
+			return r, wait + w, hold + h, err
+		}
 		if !c.laneMissing.Swap(true) {
 			jmlog.Warn("juicefs control: the bundled juicefs has no control lane (patch 0033); content refreshes share the drain's control channel",
 				"root", c.root)
@@ -131,6 +140,19 @@ func (c *jfsControl) exchangeOwn(msg []byte, maxLen int, want func([]byte) int, 
 		reply, err = c.exchangeLocked(msg, maxLen, want, timeout)
 	}
 	return reply, lockWait, time.Since(held), err
+}
+
+// controlFileReachable reports whether the control file exists in the
+// mount. Tests that replace the exchange count it as reachable.
+func (c *jfsControl) controlFileReachable() bool {
+	if c.testReachable != nil {
+		return c.testReachable()
+	}
+	if c.testExchange != nil || c.testLocked != nil {
+		return true
+	}
+	_, err := os.Lstat(filepath.Join(c.root, c.controlFile()))
+	return err == nil
 }
 
 func (c *jfsControl) controlFile() string {
