@@ -6447,13 +6447,22 @@ func (f *cachedFile) readAtRouted(p []byte, off int64, trace *cachedReadTrace) (
 	// and checksum-verified. While a teammate saves a clip, its attr push
 	// comes every 2-4 s, and every READ waited for a refresh (and the
 	// refresh for the kernel notify, which waits behind the file's reads in
-	// flight). A miss falls through to the wait below and then FUSE.
+	// flight). A miss falls through to the wait below and then FUSE. An
+	// EAGAIN (the mirror row moved during the read: each late commit of the
+	// save republishes it) is not answered: the READ waits for the refresh
+	// and takes the ordinary routes, with their own refusals, instead of
+	// costing the Mac a 4 s JUKEBOX.
 	ssdTried := false
 	if f.handler != nil {
 		if f.pinGeneration == "" && f.snapshotProof == nil && f.sidecarProof == nil &&
 			f.verifiedSSDEnabled() && f.handler.contentRefreshPending(f.name) {
 			ssdTried = true
-			if n, err, handled := f.readVerifiedSSD(p, off, trace); handled {
+			n, err, handled := f.readVerifiedSSD(p, off, trace)
+			switch {
+			case handled && errors.Is(err, syscall.EAGAIN):
+				ssdTried = false
+				clear(p)
+			case handled:
 				return n, err
 			}
 		}

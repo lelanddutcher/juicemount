@@ -211,4 +211,26 @@ func TestPeerEditSSDReadDoesNotWaitForTheRefresh(t *testing.T) {
 	if n := s.calls.Load(); n != 1 {
 		t.Fatalf("%d refreshes, want 1", n)
 	}
+
+	// The row moves during the SSD read (a late commit republished it): the
+	// early attempt answers EAGAIN. The READ must not answer JUKEBOX: it
+	// waits for the refresh and tries the routes again.
+	edited2 := edited.Add(time.Second)
+	mapped.Store(byte('C'))
+	s.stage(bytes.Repeat([]byte{'C'}, size))
+	peerEdit(t, store, file, size, edited2)
+	var tries atomic.Int32
+	jfs.handler.testVerifiedSSD = func(_ string, p []byte, _ int64) (int, error, bool) {
+		if tries.Add(1) == 1 {
+			return 0, syscall.EAGAIN, true
+		}
+		for i := range p {
+			p[i] = mapped.Load().(byte)
+		}
+		return len(p), nil, true
+	}
+	p, err = nfsReadErr(t, jfs, file, 8<<10, 4096)
+	if err != nil || tries.Load() != 2 || !p.mtime.Equal(edited2) || p.data[0] != 'C' {
+		t.Fatalf("SSD EAGAIN during the refresh: err %v, tries %d, mtime %v data %q", err, tries.Load(), p.mtime, p.data[:1])
+	}
 }
