@@ -530,6 +530,69 @@ func (p *probe) playEdit(row map[string]any, size int64, rate float64, lead, sav
 		lastTag[k] = r.Tag
 	}
 	row["p2_same_mtime"], row["p2_same_mtime_examples"] = sameMtime, sameExamples
+	// p2_kept: the bytes the Mac would keep. It keeps a reply's bytes while
+	// the server keeps reporting that mtime. Every block of save k has
+	// committed once save k's close returned, so a reply whose mtime the
+	// server still reported after that close must carry save k's bytes or
+	// newer. This counts a save's early parts read under its final mtime
+	// (the mtime-span finding) without counting replies whose mtime moved on.
+	lastSeen := map[int64]time.Time{}
+	for _, r := range all {
+		if r.Err == "" {
+			if m := mtimeNS(r.Mtime); r.At.After(lastSeen[m]) {
+				lastSeen[m] = r.At
+			}
+		}
+	}
+	kept := 0
+	var keptExamples []map[string]any
+	for _, r := range all {
+		if r.Tag == "" || r.Err != "" {
+			continue
+		}
+		seen := lastSeen[mtimeNS(r.Mtime)]
+		k := -1
+		for i, s := range saves {
+			if s.Close.Before(seen) {
+				k = i
+			}
+		}
+		got, ok := tagIndex[r.Tag]
+		if !ok {
+			got = -1
+		}
+		if got < k {
+			kept++
+			if len(keptExamples) < 5 {
+				keptExamples = append(keptExamples, map[string]any{"at_s": secs(r.At.Sub(t0)), "off_mib": r.Off / mib,
+					"bytes_save": got, "mtime_seen_until_s": secs(seen.Sub(t0)), "newer_save": k})
+			}
+		}
+	}
+	row["p2_kept"], row["p2_kept_examples"] = kept, keptExamples
+	// Every reply, for offline checks: [at_s, offset MiB, mtime ns, save
+	// index of the bytes (-1 the fixture, -2 untagged)].
+	var replies [][4]any
+	for _, r := range all {
+		if r.Err != "" {
+			continue
+		}
+		got := -2
+		if r.Tag != "" {
+			if g, ok := tagIndex[r.Tag]; ok {
+				got = g
+			} else {
+				got = -1
+			}
+		}
+		replies = append(replies, [4]any{secs(r.At.Sub(t0)), r.Off / mib, mtimeNS(r.Mtime), got})
+	}
+	row["replies"] = replies
+	var closes []float64
+	for _, s := range saves {
+		closes = append(closes, secs(s.Close.Sub(t0)))
+	}
+	row["save_close_s"] = closes
 	if n := len(finals); n > 0 {
 		row["settled_mtime_ns"] = mtimeNS(finals[n-1].Mtime)
 		row["final_mtime_ns"] = mtimeNS(last.Mtime)

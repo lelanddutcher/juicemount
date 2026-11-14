@@ -43,8 +43,11 @@
 #                with older bytes), p2_same_mtime (two replies at one offset
 #                with the same mtime and different bytes: the Mac keeps the
 #                first for good; this counts late commits under a save's
-#                final mtime) and when the last save's bytes show at 8
-#                offsets, then the settled state 8 s later.
+#                final mtime), p2_kept (a reply whose mtime the server
+#                still reported after a newer save closed, with older
+#                bytes: what the Mac would keep), and when the last save's
+#                bytes show at 8 offsets, then the settled state 8 s later.
+#                "replies" lists every reply for offline checks.
 #
 # Around every case the jm5 juicefs's own metadata operation counters
 # (/jfs/.stats; the peer has its own) and jm5's /metrics are saved, so the
