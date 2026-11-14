@@ -69,3 +69,20 @@ func hasOpt(opts, want string) bool {
 	}
 	return false
 }
+
+// JM_NFS_ACREG is an opt-in for a measured Mac run (peer edits): it sets only
+// the file attribute window and keeps the folder window; unset keeps 3600.
+func TestNFSMountOptsFileAttrWindow(t *testing.T) {
+	t.Setenv("JM_NFS_ACREG", "")
+	if opts := nfsMountOpts("12049"); !hasOpt(opts, "acregmin=3600") || !hasOpt(opts, "acregmax=3600") {
+		t.Fatalf("default file window changed: %s", opts)
+	}
+	t.Setenv("JM_NFS_ACREG", "1,3")
+	t.Setenv("JM_NFS_ACDIR", "2,4")
+	opts := nfsMountOpts("12049")
+	for _, o := range []string{"acregmin=1", "acregmax=3", "acdirmin=2", "acdirmax=4"} {
+		if !hasOpt(opts, o) {
+			t.Errorf("missing %s: %s", o, opts)
+		}
+	}
+}

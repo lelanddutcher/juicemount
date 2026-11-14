@@ -4582,10 +4582,25 @@ func nfsMountOpts(port string) string {
 	// loopback, RAM-served LOOKUP and prevents a pre-push miss from masking the
 	// now-present file. JM_NFS_LEGACY_ACTIMEO=1 restores actimeo=3600;
 	// JM_NFS_ACDIR="min,max" overrides the split values.
-	acOpts := "acregmin=3600,acregmax=3600,acdirmin=1,acdirmax=2"
+	//
+	// [peer edits 2026-11-13] JM_NFS_ACREG="min,max" overrides the FILE
+	// attribute window, for a measured Mac run only; the default stays 3600.
+	// The server side now learns a peer's edit within about a second (the
+	// attr push, metadata/keyspace_attr.go), and the macOS client re-reads
+	// attrs on every open (close-to-open), but a file the Mac keeps open uses
+	// cached attrs, so its size and page cache stay old for up to acregmax.
+	// Every GETATTR is answered from the RAM mirror over loopback, as for
+	// folders, so a short window adds no WAN round trip.
+	acreg := "acregmin=3600,acregmax=3600"
+	if v := os.Getenv("JM_NFS_ACREG"); v != "" {
+		if parts := strings.SplitN(v, ",", 2); len(parts) == 2 {
+			acreg = "acregmin=" + strings.TrimSpace(parts[0]) + ",acregmax=" + strings.TrimSpace(parts[1])
+		}
+	}
+	acOpts := acreg + ",acdirmin=1,acdirmax=2"
 	if v := os.Getenv("JM_NFS_ACDIR"); v != "" {
 		if parts := strings.SplitN(v, ",", 2); len(parts) == 2 {
-			acOpts = "acregmin=3600,acregmax=3600,acdirmin=" + strings.TrimSpace(parts[0]) + ",acdirmax=" + strings.TrimSpace(parts[1])
+			acOpts = acreg + ",acdirmin=" + strings.TrimSpace(parts[0]) + ",acdirmax=" + strings.TrimSpace(parts[1])
 		}
 	}
 	if os.Getenv("JM_NFS_LEGACY_ACTIMEO") == "1" {

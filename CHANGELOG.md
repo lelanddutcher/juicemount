@@ -4,6 +4,31 @@
 
 ### App
 
+- A teammate's edit to a file is now seen while the app has that file open.
+  Before, once the Mac had read any part of a file, a peer's later overwrite
+  stayed invisible for as long as the app kept the file open (9+ minutes on
+  the laptop run of 2026-11-13), and a peer's append never changed the size
+  or mtime the Mac showed. Two causes: the metadata push watched only folder
+  keys, so a write to an existing file (which changes only its `i{inode}`
+  key) reached the mirror only at the 24 h backstop SCAN; and the NFS layer
+  kept its pooled JuiceFS descriptor open, so JuiceFS kept serving the open
+  file's old slice list. Now the push also follows file attribute keys
+  (`__keyspace@N__:i*`, one MGET per short batch, no round trip on any read),
+  refreshes the file's size and mtime in the mirror, and the next READ reopens
+  the file through JuiceFS, which drops the stale slices and pages. Remote lab
+  (Linux, jm5 plus a second JuiceFS client as the peer; median, 3 trials):
+  lan, held-open overwrite 0.22 s (before: old for 6.5 s or more, 1 of 3
+  never), size after an append 0.20 s (before: never); abroad (200 ms, 1%
+  loss), held-open overwrite 1.8–2.9 s (before: old for 6 s or more), size
+  0.46 s (before: never). Reads of an unchanged file cost the same metadata
+  round trips as before. A pinned file a peer changes is re-pinned by the pin
+  guard within its next pass (1 min). The server's Redis must publish
+  string-class keyspace events (`KEA`, as `server/redis.conf` ships, or add
+  `$` to `Kghx`); without them the app logs `metadata attr push: off`.
+  `JM_METADATA_ATTR_PUSH=0` turns the file feed off. For a measured Mac run,
+  `JM_NFS_ACREG="min,max"` shortens the Mac NFS client's file attribute
+  cache (default unchanged, 3600 s), which bounds how long a file the Mac
+  itself keeps open can show the old size.
 - Opening a clip that is not cached waits for fewer round trips on a far
   link. Before, on a 200 ms link, a cold open waited for six metadata round
   trips in a row before the first object download: the cache reader's path
