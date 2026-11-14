@@ -110,7 +110,9 @@ type probe struct {
 	jukebox int           // NFS3ERR_JUKEBOX replies retried
 	writes  bool          // playedit: also save small files through NFS
 	settle  time.Duration // playedit: wait after the final bytes, then read the settled state
-	auth    rpc.Auth
+	// saveTouch: playedit's peer sets the file's mtime before each close.
+	saveTouch bool
+	auth      rpc.Auth
 }
 
 // read sends one READ. On NFS3ERR_JUKEBOX ("try later", which jm5 returns on
@@ -258,6 +260,7 @@ func run(args []string) (err error) {
 	save := fs.Duration("save", 60*time.Second, "playedit: the peer saves back to back for this long")
 	tail := fs.Duration("tail", 20*time.Second, "playedit: playback after the last save")
 	writes := fs.Bool("writes", false, "playedit: also save a 256 KiB file through NFS every second")
+	saveTouch := fs.Bool("save-touch", false, "playedit: the peer sets the mtime before each close (late commits keep it)")
 	endSettle := fs.Duration("end-settle", 8*time.Second, "playedit: after the final bytes, wait this long and read the 8 offsets again")
 	_ = fs.Parse(args)
 
@@ -271,7 +274,7 @@ func run(args []string) (err error) {
 	if err != nil {
 		return fmt.Errorf("mount: %w", err)
 	}
-	p := &probe{v: v, name: *name, peer: *peer, poll: *poll, timeout: *timeout, auth: auth, writes: *writes, settle: *endSettle}
+	p := &probe{v: v, name: *name, peer: *peer, poll: *poll, timeout: *timeout, auth: auth, writes: *writes, settle: *endSettle, saveTouch: *saveTouch}
 	_, p.fh, err = v.Lookup(*name)
 	if err != nil {
 		return fmt.Errorf("lookup: %w", err)

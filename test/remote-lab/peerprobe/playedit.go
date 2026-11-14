@@ -149,6 +149,17 @@ func (p *probe) saveOnce(size int64, tag string) (peerSave, error) {
 			return s, err
 		}
 	}
+	if p.saveTouch {
+		// As cp -p, rsync -t or an app that dates its file: a setattr of
+		// the mtime while the parts are still buffered. juicefs gives every
+		// buffered slice that time, so each later commit keeps the final
+		// mtime and changes only the ctime (the mtime-span finding).
+		now := time.Now()
+		if err := os.Chtimes(filepath.Join(p.peer, p.name), now, now); err != nil {
+			f.Close()
+			return s, err
+		}
+	}
 	w := time.Now()
 	if err := f.Close(); err != nil {
 		return s, err

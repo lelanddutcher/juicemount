@@ -49,6 +49,9 @@
 #                under the settled mtime: kept for good), and when the last save's
 #                bytes show at 8 offsets, then the settled state 8 s later.
 #                "replies" lists every reply for offline checks.
+#                PE_SAVE_TOUCH=true: the peer sets the clip's mtime before
+#                each close (as cp -p does), so its later commits keep that
+#                mtime and change only the ctime.
 #
 # Around every case the jm5 juicefs's own metadata operation counters
 # (/jfs/.stats; the peer has its own) and jm5's /metrics are saved, so the
@@ -213,7 +216,7 @@ run() {
       # fresh on the last trial would reuse f01, already read: skip it.
       if [ "$kase" = fresh ] && [ "$i" = "$TRIALS" ]; then continue; fi
       stats "$OUT/$label.$kase.$n.before.txt"
-      probe run -export "$xpath" -case "$kase" -file "$file" -timeout "$TIMEOUT" -save "${PE_SAVE:-60s}" -rate "${PE_RATE:-2}" -writes="${PE_WRITES:-false}" >> "$OUT/$label.jsonl" \
+      probe run -export "$xpath" -case "$kase" -file "$file" -timeout "$TIMEOUT" -save "${PE_SAVE:-60s}" -rate "${PE_RATE:-2}" -writes="${PE_WRITES:-false}" -save-touch="${PE_SAVE_TOUCH:-false}" >> "$OUT/$label.jsonl" \
         || log "$label: $kase $file failed"
       sleep 1
       stats "$OUT/$label.$kase.$n.after.txt"
