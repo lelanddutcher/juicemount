@@ -47,6 +47,10 @@ const (
 	playReadLen    = mib
 )
 
+// p2KeptGrace is the attr push's lag allowed before a reply's mtime counts
+// as kept (p2_kept).
+const p2KeptGrace = 5 * time.Second
+
 var macJukeboxWaits = []time.Duration{4 * time.Second, 8 * time.Second, 16 * time.Second, 30 * time.Second}
 
 type playRead struct {
@@ -533,9 +537,12 @@ func (p *probe) playEdit(row map[string]any, size int64, rate float64, lead, sav
 	// p2_kept: the bytes the Mac would keep. It keeps a reply's bytes while
 	// the server keeps reporting that mtime. Every block of save k has
 	// committed once save k's close returned, so a reply whose mtime the
-	// server still reported after that close must carry save k's bytes or
-	// newer. This counts a save's early parts read under its final mtime
-	// (the mtime-span finding) without counting replies whose mtime moved on.
+	// server still reported well after that close (p2KeptGrace: the attr
+	// push's own lag, after which the Mac sees the new mtime and drops the
+	// pages) must carry save k's bytes or newer. This counts a save's early
+	// parts read under its final mtime (the mtime-span finding) without
+	// counting replies whose mtime moved on. p2_final: replies under the
+	// settled mtime with bytes older than the last save, kept for good.
 	lastSeen := map[int64]time.Time{}
 	for _, r := range all {
 		if r.Err == "" {
@@ -544,7 +551,7 @@ func (p *probe) playEdit(row map[string]any, size int64, rate float64, lead, sav
 			}
 		}
 	}
-	kept := 0
+	kept, final := 0, 0
 	var keptExamples []map[string]any
 	for _, r := range all {
 		if r.Tag == "" || r.Err != "" {
@@ -553,13 +560,16 @@ func (p *probe) playEdit(row map[string]any, size int64, rate float64, lead, sav
 		seen := lastSeen[mtimeNS(r.Mtime)]
 		k := -1
 		for i, s := range saves {
-			if s.Close.Before(seen) {
+			if s.Close.Add(p2KeptGrace).Before(seen) {
 				k = i
 			}
 		}
 		got, ok := tagIndex[r.Tag]
 		if !ok {
 			got = -1
+		}
+		if n := len(finals); n > 0 && mtimeNS(r.Mtime) == mtimeNS(finals[n-1].Mtime) && got < len(saves)-1 {
+			final++
 		}
 		if got < k {
 			kept++
@@ -569,7 +579,7 @@ func (p *probe) playEdit(row map[string]any, size int64, rate float64, lead, sav
 			}
 		}
 	}
-	row["p2_kept"], row["p2_kept_examples"] = kept, keptExamples
+	row["p2_kept"], row["p2_kept_examples"], row["p2_final"] = kept, keptExamples, final
 	// Every reply, for offline checks: [at_s, offset MiB, mtime ns, save
 	// index of the bytes (-1 the fixture, -2 untagged)].
 	var replies [][4]any
