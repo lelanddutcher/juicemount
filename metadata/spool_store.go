@@ -1658,18 +1658,25 @@ func (k SpoolBaseKind) String() string {
 //	absent   base_ino = -1
 //	weak     base_ino = -2, base_mtime_ns, base_len
 //	present  base_ino > 0, base_ctime_ns >= 0, all four fields
-//	claimed  base_ino > 0, base_ctime_ns = -1
+//	claimed  base_ino > 0, base_ctime_ns = -1; base_mtime_ns = 1 when the
+//	         inode is a complete, synced stage this row installed (Staged)
 //	moved    base_ino > 0, base_ctime_ns = -2, base_mtime_ns, base_len
 //	replace  base_ino > 0, base_ctime_ns = -3, base_mtime_ns, base_len
 //
 // A build that predates "replace" reads it as present with ctime -3, which
 // never matches a real file: it publishes a conflict copy (the safe side).
+// A build that predates Staged reads a staged claim as a plain claim (it
+// rewrites its own file in place, as before).
 type SpoolBase struct {
 	Kind    SpoolBaseKind
 	Ino     uint64
 	MtimeNs int64
 	CtimeNs int64
 	Len     int64
+	// Staged (claimed only): Ino is a complete stage this row wrote and
+	// synced before installing it at the name, not an in-place rewrite that
+	// may have stopped part way. A retry may adopt it without writing.
+	Staged bool
 }
 
 const (
@@ -1677,6 +1684,7 @@ const (
 	spoolBaseInoWeak             = -2
 	spoolBaseCtimeAtomicConflict = -4
 	spoolBaseCtimeClaim          = -1
+	spoolBaseClaimStaged         = 1 // base_mtime_ns of a staged claim
 	spoolBaseCtimeMoved          = -2
 	spoolBaseCtimeRepl           = -3
 )
@@ -1697,6 +1705,9 @@ func (b SpoolBase) columns() (ino, mtimeNs, ctimeNs, length int64) {
 	case SpoolBaseClaimed:
 		if b.Ino == 0 || b.Ino > 1<<62 {
 			return 0, 0, 0, 0
+		}
+		if b.Staged {
+			return int64(b.Ino), spoolBaseClaimStaged, spoolBaseCtimeClaim, 0
 		}
 		return int64(b.Ino), 0, spoolBaseCtimeClaim, 0
 	case SpoolBaseMoved:
@@ -1722,7 +1733,7 @@ func spoolBaseFromColumns(ino, mtimeNs, ctimeNs, length int64) SpoolBase {
 	case ino == spoolBaseInoWeak:
 		return SpoolBase{Kind: SpoolBaseWeak, MtimeNs: mtimeNs, Len: length}
 	case ino > 0 && ctimeNs == spoolBaseCtimeClaim:
-		return SpoolBase{Kind: SpoolBaseClaimed, Ino: uint64(ino)}
+		return SpoolBase{Kind: SpoolBaseClaimed, Ino: uint64(ino), Staged: mtimeNs == spoolBaseClaimStaged}
 	case ino > 0 && ctimeNs == spoolBaseCtimeMoved:
 		return SpoolBase{Kind: SpoolBaseMoved, Ino: uint64(ino), MtimeNs: mtimeNs, Len: length}
 	case ino > 0 && ctimeNs == spoolBaseCtimeRepl:
@@ -1755,16 +1766,53 @@ func (s *SpoolStore) DrainBase(id int64) (SpoolBase, uint64, error) {
 // ClaimDrainBase records that a drain of row id is about to write inode ino
 // at the row's name. It only touches a row that is still draining.
 func (s *SpoolStore) ClaimDrainBase(id int64, ino uint64) error {
-	cIno, _, cCt, _ := SpoolBase{Kind: SpoolBaseClaimed, Ino: ino}.columns()
+	return s.claimDrainBase(id, SpoolBase{Kind: SpoolBaseClaimed, Ino: ino})
+}
+
+// ClaimDrainBaseStaged records that this row is installing (or installed)
+// the complete, synced stage with inode ino at its name. Called BEFORE the
+// install rename: a rename that lands while its reply is lost (link drop)
+// leaves the name holding ino, and a retry, even after an app restart,
+// adopts it instead of publishing a conflict copy of its own file.
+func (s *SpoolStore) ClaimDrainBaseStaged(id int64, ino uint64) error {
+	return s.claimDrainBase(id, SpoolBase{Kind: SpoolBaseClaimed, Ino: ino, Staged: true})
+}
+
+func (s *SpoolStore) claimDrainBase(id int64, b SpoolBase) error {
+	cIno, cMt, cCt, _ := b.columns()
 	if cIno <= 0 {
-		return fmt.Errorf("spool claim base %d: invalid inode %d", id, ino)
+		return fmt.Errorf("spool claim base %d: invalid inode %d", id, b.Ino)
 	}
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	_, err := s.db.Exec(`UPDATE spool_entries SET base_ino=?, base_mtime_ns=0, base_ctime_ns=?, base_len=0
-	 WHERE id=? AND drain_state=?`, cIno, cCt, id, DrainDraining)
+	_, err := s.db.Exec(`UPDATE spool_entries SET base_ino=?, base_mtime_ns=?, base_ctime_ns=?, base_len=0
+	 WHERE id=? AND drain_state=?`, cIno, cMt, cCt, id, DrainDraining)
 	if err != nil {
 		return fmt.Errorf("spool claim base %d: %w", id, err)
+	}
+	return nil
+}
+
+// RestoreDrainBase puts back the base a row had before
+// ClaimDrainBaseStaged(id, ino), when the install rename did not land (the
+// stage still sits at its own path). It changes only a draining row that
+// still holds exactly that staged claim. Without it a dead claim would make
+// later passes treat the name as "server copy changed" (in-place refusal,
+// pause, conflict copy on an atomic save).
+func (s *SpoolStore) RestoreDrainBase(id int64, ino uint64, prev SpoolBase) error {
+	claim := SpoolBase{Kind: SpoolBaseClaimed, Ino: ino, Staged: true}
+	wIno, wMt, wCt, _ := claim.columns()
+	if wIno <= 0 {
+		return fmt.Errorf("spool restore base %d: invalid inode %d", id, ino)
+	}
+	pIno, pMt, pCt, pLen := prev.columns()
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	_, err := s.db.Exec(`UPDATE spool_entries SET base_ino=?, base_mtime_ns=?, base_ctime_ns=?, base_len=?
+	 WHERE id=? AND drain_state=? AND base_ino=? AND base_mtime_ns=? AND base_ctime_ns=?`,
+		pIno, pMt, pCt, pLen, id, DrainDraining, wIno, wMt, wCt)
+	if err != nil {
+		return fmt.Errorf("spool restore base %d: %w", id, err)
 	}
 	return nil
 }

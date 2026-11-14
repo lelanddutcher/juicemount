@@ -236,7 +236,7 @@ const directInodeWait = 2 * time.Second
 // changed nothing, when juicefs refused the file for a reason the stage path
 // handles (no support, an ACL parent, a reserved name): the caller then drains
 // it through a stage. Otherwise it disposed of the row.
-func (d *Drainer) drainDirect(row *metadata.SpoolRow, src *os.File, dest string, spoolMtime time.Time, ph *drainPhases) bool {
+func (d *Drainer) drainDirect(row *metadata.SpoolRow, src *os.File, dest string, spoolMtime time.Time, tainted bool, ph *drainPhases) bool {
 	data, sum, ok := d.directReadSpool(row, src)
 	if !ok {
 		return true
@@ -318,7 +318,7 @@ func (d *Drainer) drainDirect(row *metadata.SpoolRow, src *os.File, dest string,
 		// The name appeared after the base decision (same rule as
 		// installNewName): our own unfinished older row retries in place;
 		// anything else gets a conflict copy beside it.
-		if d.olderRowInstalledDest(row, dest) {
+		if d.olderRowInstalledDest(row, dest, tainted) {
 			finish()
 			d.failTransient(row, fmt.Errorf("install drain stage: %q appeared from an older local row; retrying in place", row.NFSPath))
 			return true

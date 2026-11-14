@@ -842,7 +842,7 @@ func (l *LinkNode) AdaptiveDialContext(ctx context.Context, network, address str
 		return nil, fmt.Errorf("link: node is nil")
 	}
 	conn, err := adaptiveBackendDial(ctx, network, address, l.DialContext, l.TransportStatus,
-		(&net.Dialer{Timeout: 750 * time.Millisecond, KeepAlive: 30 * time.Second}).DialContext)
+		linkDirectDialer().DialContext)
 	if err != nil {
 		return nil, err
 	}

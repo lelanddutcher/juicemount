@@ -52,6 +52,7 @@ PATCH_FILES = {
         "pkg/chunk/cached_store.go", "pkg/meta/interface.go", "pkg/vfs/internal.go",
         "pkg/vfs/reader.go", "pkg/vfs/writer.go"],
     "patches/0028-open-round-trips.patch": ["pkg/meta/base.go", "pkg/meta/openfile.go", "pkg/meta/redis.go"],
+    "patches/0029-dead-peer-detection.patch": ["pkg/object/restful.go"],
 }
 VERSION_PACKAGE = "github.com/juicedata/juicefs/pkg/version"
 

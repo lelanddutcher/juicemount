@@ -58,7 +58,7 @@ func init() {
 				var conn net.Conn
 				n := len(ips)
 				first := rand.Intn(n)
-				dialer := &net.Dialer{Timeout: time.Second * 10}
+				dialer := jmObjectDialer() // patch 0029: dead-peer detection
 				for i := 0; i < n; i++ {
 					ip := ips[(first+i)%n]
 					address = ip.String()

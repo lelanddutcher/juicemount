@@ -1,0 +1,38 @@
+# A second path between the two networks, for experiments/roam-lab.sh: the
+# "alt" router is a copy of the wan with its own addresses and its own
+# profile. Moving the client's route from the wan to alt is a path change:
+# the server sees the client from a new address, as when a Mac leaves the
+# home LAN for a relay. lab.sh applies this file when the lab was set up
+# with JMLAB_ROAM=1.
+services:
+  alt:
+    image: jmlab:local
+    init: true
+    cap_add: [NET_ADMIN]
+    sysctls:
+      net.ipv4.ip_forward: "1"
+    environment:
+      WAN_NAS_IP: ${JMLAB_ALT_NAS_IP:-10.231.10.3}
+      WAN_REMOTE_IP: ${JMLAB_ALT_REMOTE_IP:-10.231.20.3}
+      REMOTE_SUBNET: ${JMLAB_REMOTE_SUBNET:-10.231.20.0/24}
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        for dev in $$(ls /sys/class/net | grep -v '^lo$$'); do
+          ethtool -K "$$dev" tso off gso off gro off 2>/dev/null || true
+        done
+        iptables -t nat -A POSTROUTING -s "$$REMOTE_SUBNET" -j MASQUERADE
+        /lab/lib/shape.sh lan
+        touch /run/wan.ready
+        exec sleep infinity
+    healthcheck:
+      test: ["CMD", "test", "-f", "/run/wan.ready"]
+      interval: 1s
+      retries: 30
+    volumes:
+      - ./:/lab:ro
+    networks:
+      nas:
+        ipv4_address: ${JMLAB_ALT_NAS_IP:-10.231.10.3}
+      remote:
+        ipv4_address: ${JMLAB_ALT_REMOTE_IP:-10.231.20.3}

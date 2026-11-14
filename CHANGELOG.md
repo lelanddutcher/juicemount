@@ -30,6 +30,38 @@
   `JM_NFS_ACREG="min,max"` (two whole seconds) shortens the Mac NFS client's file attribute
   cache (default unchanged, 3600 s), which bounds how long a file the Mac
   itself keeps open can show the old size.
+- A playing or copying file now recovers within about half a minute after
+  the Mac changes networks (Wi-Fi to another Wi-Fi or to a hotspot). Before,
+  the read froze for up to two minutes after the new network was up. The
+  cause: JuiceFS kept its connections to the object store open on the old
+  address, and a request on one of them waited for its whole deadline
+  (`--get-timeout`, 2 minutes on a slow link). Now those connections send
+  keepalive probes after 10 s of silence and give up after 25 s of
+  unacknowledged data, so the request is retried on a new connection over
+  the new network (bundled JuiceFS patch 0029, `-jm14`). Through JuiceMount
+  Link, JuiceFS talks to a local proxy, so the same settings now also apply
+  to the proxy's direct connection to the NAS on the LAN, the one that dies
+  when the Mac leaves home (the encrypted Link path follows the Mac to its
+  new network by itself). Remote lab
+  (`test/remote-lab/experiments/roam-lab.sh ipchange`, client address
+  changed under a 2 MiB/s read): object requests on dead connections
+  ended at 25.5 s in every run, against 30 s for a request waiting for its
+  reply and 2 minutes for a stalled block before. The read played again
+  37.5 s after the change in three runs, against 42–120 s. What remains is
+  the metadata client's own 30 s read timeout, unchanged here.
+- A file that was uploading when the link dropped no longer gets a
+  duplicate "(conflict ...)" copy beside itself. The upload's final rename
+  reached the NAS, but its reply was lost with the link, so the next try
+  found the name taken and treated the file as someone else's. The drainer
+  now records, before the rename and on disk, which complete file it is
+  installing. A retry that finds that file at the name, even after an app
+  restart, completes without uploading it again; other Macs never see it
+  half rewritten. If another Mac held the project meanwhile (it may have
+  edited that file), the retry publishes a conflict copy and never
+  overwrites the edit; the same now holds for a file an older save of this
+  Mac put there (remote lab, a 30 s drop under an 8 MiB upload). A rename
+  that did not reach the NAS drops that record again, so the retry is not
+  paused or turned into a conflict copy.
 - Opening a clip that is not cached waits for fewer round trips on a far
   link. Before, on a 200 ms link, a cold open waited for six metadata round
   trips in a row before the first object download: the cache reader's path
