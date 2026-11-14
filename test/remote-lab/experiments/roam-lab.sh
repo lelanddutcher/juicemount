@@ -20,6 +20,8 @@
 #                 with the same address
 #   blackhole30   the link stays up but carries nothing for 30 s (the wan
 #                 drops every packet: associated, no internet)
+#   held-CASE     CASE without a session: one descriptor of a cold file held
+#                 open on the juicefs mount across the change (run_held)
 #   path          the route moves to the second router (the server sees a
 #                 new address, as when a Mac moves from the LAN to a relay),
 #                 stays there 60 s, then moves back
@@ -172,6 +174,9 @@ run_case() {
   [ "$(current_ip)" = "$CLIENT_IP" ] || { docker network disconnect "$NET" "$(cid)"; reconnect "$CLIENT_IP"; }
   client_net_setup "$WAN_IP"
   start_jm5
+  local jfs_lines
+  jfs_lines="$("$LAB" exec sh -c 'wc -l < /var/log/juicefs.log' 2>/dev/null | tr -dc 0-9)"
+  jfs_lines="${jfs_lines:-0}"
   "$LAB" shape "$PROFILE" >/dev/null
   "$LAB" shape "$ALT_PROFILE" alt >/dev/null
   local dir
@@ -206,9 +211,52 @@ run_case() {
   "$LAB" exec cat /var/jm/jm5.log > "$OUT/$RUN.jm5.log" 2>/dev/null || true
   "$LAB" exec cat /var/jm/roam.err > "$OUT/$RUN.probe.err" 2>/dev/null || true
   "$LAB" exec tail -n 400 /var/log/juicefs.log > "$OUT/$RUN.juicefs.log" 2>/dev/null || true
+  # Read errors juicefs kept on an open file, and its retries of them (patch
+  # 0030), over the whole run (the tail above can miss them).
+  # shellcheck disable=SC2016
+  "$LAB" exec sh -c 'tail -n +'"$((jfs_lines + 1))"' /var/log/juicefs.log | grep -E "read file [0-9]+: |retrying after an error" | tail -n 200' \
+    > "$OUT/$RUN.jfs-read-errors.log" 2>/dev/null || true
   stop_jm5
   "$LAB" shape lan >/dev/null
   python3 "$HERE/lib/roamsum.py" "$OUT/$RUN"
+}
+
+# held-CASE: no session. One reader keeps ONE descriptor of a cold file open
+# on the juicefs mount across the network change (lib/heldread.py: 1 MiB
+# reads at ROAM_READ_MIBS, the same offset again every 0.5 s after an
+# error), as the Mac app does through macFUSE's shared handle. It shows
+# whether juicefs keeps a read error on the open file after the network
+# returns (patch 0030). After the event the reader runs ROAM_POST seconds
+# (default 60).
+run_held() {
+  local case="${1#held-}" label="${2:-run}"
+  RUN="$label-held-$case"
+  mkdir -p "$OUT"
+  local file post jfs_lines
+  file="$(next_file)"
+  post="${ROAM_POST:-60}"
+  stop_jm5
+  "$LAB" shape lan >/dev/null
+  [ "$(current_ip)" = "$CLIENT_IP" ] || { docker network disconnect "$NET" "$(cid)"; reconnect "$CLIENT_IP"; }
+  client_net_setup "$WAN_IP"
+  jfs_lines="$("$LAB" exec sh -c 'wc -l < /var/log/juicefs.log' 2>/dev/null | tr -dc 0-9)"
+  "$LAB" shape "$PROFILE" >/dev/null
+  : > "$OUT/$RUN.events"
+  mark start
+  "$LAB" exec sh -c "rm -f /var/jm/held.jsonl; mkdir -p /var/jm; nohup python3 /lab/lib/heldread.py /jfs/$file /var/jm/held.jsonl ${ROAM_READ_MIBS:-2} \
+    >/var/jm/held.err 2>&1 & echo \$! > /var/jm/held.pid"
+  sleep "$PRE"
+  event "$case"
+  sleep "$post"
+  mark stop
+  # shellcheck disable=SC2016
+  "$LAB" exec sh -c 'kill -TERM "$(cat /var/jm/held.pid)" 2>/dev/null; sleep 2; kill -9 "$(cat /var/jm/held.pid)" 2>/dev/null; true'
+  "$LAB" exec cat /var/jm/held.jsonl > "$OUT/$RUN.held.jsonl"
+  "$LAB" exec cat /var/jm/held.err > "$OUT/$RUN.probe.err" 2>/dev/null || true
+  "$LAB" exec sh -c 'tail -n +'"$((${jfs_lines:-0} + 1))"' /var/log/juicefs.log | grep -E "read file [0-9]+: |retrying after an error" | tail -n 200' \
+    > "$OUT/$RUN.jfs-read-errors.log" 2>/dev/null || true
+  "$LAB" shape lan >/dev/null
+  python3 "$HERE/lib/heldsum.py" "$OUT/$RUN"
 }
 
 case "${1:-}" in
@@ -224,8 +272,9 @@ case "${1:-}" in
     echo 1 > "$STATE/roam-next"
     log "fixture ready; the block cache is empty"
     ;;
-  run) [ $# -ge 2 ] || die "usage: roam-lab.sh run CASE [LABEL]"; run_case "$2" "${3:-run}" ;;
+  run) [ $# -ge 2 ] || die "usage: roam-lab.sh run CASE [LABEL]"
+    case "$2" in held-*) run_held "$2" "${3:-run}" ;; *) run_case "$2" "${3:-run}" ;; esac ;;
   all) for c in ${ROAM_CASES:-$CASES}; do run_case "$c" "${2:-run}"; done ;;
   summary) [ $# -eq 2 ] || die "usage: roam-lab.sh summary DIR"; python3 "$HERE/lib/roamsum.py" "$2"/*.events ;;
-  *) sed -n '2,36p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+  *) sed -n '2,38p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac
