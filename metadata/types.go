@@ -42,10 +42,10 @@ type Entry struct {
 	// Version identifies the durable mirror observation carried by this entry.
 	// Zero means an unversioned legacy producer, not a newly captured observation.
 	Version MirrorToken
-	// MtimeBump counts another client's commits seen after this mtime (RAM
-	// only, never persisted): the NFS layer reports Mtime + MtimeBump ns
-	// (NFSMtime, mtime_span.go).
-	MtimeBump uint32
+	// span is what a Redis publication read of the file besides mtime and
+	// size (mtime_span.go). Set only on an entry handed to a publication;
+	// never in a cached row.
+	span *attrSpan
 
 	// getAttrCache is shared by immutable read snapshots of this entry. The
 	// payload is published atomically because GETATTR is a hot concurrent path.

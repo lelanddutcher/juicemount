@@ -123,6 +123,9 @@ var (
 	attrPushDelivered atomic.Int64 // i-key events received
 	attrPushBatches   atomic.Int64 // batches that read attrs (one MGET or more)
 	attrPushRefreshed atomic.Int64 // mirror rows whose size/mtime changed
+	// attrPushLateCommits: rows another client changed under the same mtime
+	// and size (mtime_span.go).
+	attrPushLateCommits atomic.Int64
 )
 
 func noteAttrPushDelivered() { attrPushDelivered.Add(1) }
@@ -221,11 +224,17 @@ func (rc *RedisClient) reconcileFileAttrs(inodes []uint64, generation uint64) (r
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	var toUpsert []*Entry
-	type observed struct {
-		inode        uint64
+	// Rows whose mtime and size stayed while the ctime moved: a late commit
+	// only if the slice count says the content changed (mtime_span.go).
+	type ctimeOnly struct {
+		e            *Entry
 		mtime, ctime time.Time
+		size         int64
+		prev         attrObs
+		baseline     bool // first look at this mtime: record it with its slices
 	}
-	var ctimes []observed // to record once the rows reflect them
+	var pending []ctimeOnly
+	var changedFiles []*Entry // new mtime or size: their slice count is the baseline
 	for start := 0; start < len(known); start += attrMGetChunk {
 		chunk := known[start:min(start+attrMGetChunk, len(known))]
 		keys := make([]string, len(chunk))
@@ -258,22 +267,25 @@ func (rc *RedisClient) reconcileFileAttrs(inodes []uint64, generation uint64) (r
 				continue
 			}
 			e := chunk[i]
-			sameMtime := e.Mtime.Equal(mtime) && e.MtimeNsecKnown
-			bump := uint32(0)
-			if sameMtime {
-				bump = e.MtimeBump
-			}
 			ctime, ctimeOK := decodeInodeAttrCtime([]byte(str))
-			if ctimeOK {
-				if sameMtime && rc.attrCtimes.lateCommit(e.Inode, mtime, ctime) {
-					bump++ // another client's part committed after this mtime
+			if e.Mtime.Equal(mtime) && e.MtimeNsecKnown && e.Size == size {
+				if !ctimeOK {
+					continue
 				}
-				ctimes = append(ctimes, observed{e.Inode, mtime, ctime})
-			}
-			if sameMtime && e.Size == size && bump == e.MtimeBump {
+				prev, have := rc.store.attrObservation(e.Inode)
+				switch judgeCtime(prev, have, mtime.UnixNano(), ctime.UnixNano()) {
+				case verdictNone:
+				case verdictBaseline:
+					pending = append(pending, ctimeOnly{e: e, mtime: mtime, ctime: ctime, size: size, baseline: true})
+				case verdictSlices:
+					// This process's own chmod or chown (review M1) is only
+					// recorded, with the slice count as the baseline.
+					own := rc.store.ownAttrChange(e.Inode)
+					pending = append(pending, ctimeOnly{e: e, mtime: mtime, ctime: ctime, size: size, prev: prev, baseline: own})
+				}
 				continue
 			}
-			toUpsert = append(toUpsert, &Entry{
+			up := &Entry{
 				Path:           e.Path,
 				Name:           e.Name,
 				ParentPath:     e.ParentPath,
@@ -282,34 +294,72 @@ func (rc *RedisClient) reconcileFileAttrs(inodes []uint64, generation uint64) (r
 				MtimeNsecKnown: true,
 				Inode:          e.Inode,
 				Mode:           e.Mode,
-				MtimeBump:      bump,
-			})
+			}
+			up.span = &attrSpan{slices: -1}
+			if ctimeOK {
+				up.span.ctime = ctime
+			}
+			toUpsert = append(toUpsert, up)
+			changedFiles = append(changedFiles, up)
 		}
 	}
-	noteCtimes := func(skip map[uint64]bool) {
-		for _, o := range ctimes {
-			if !skip[o.inode] {
-				rc.attrCtimes.note(o.inode, o.mtime, o.ctime)
+	if len(pending)+len(changedFiles) > 0 {
+		q := make([]sliceQuery, 0, len(pending)+len(changedFiles))
+		for _, p := range pending {
+			q = append(q, sliceQuery{p.e.Inode, p.size})
+		}
+		for _, e := range changedFiles {
+			q = append(q, sliceQuery{e.Inode, e.Size})
+		}
+		counts := rc.readSliceCounts(ctx, q)
+		for i, e := range changedFiles {
+			if n := counts[len(pending)+i]; n >= 0 {
+				e.span.slices = n
 			}
+		}
+		for i, p := range pending {
+			n := counts[i]
+			if p.baseline || (n >= 0 && p.prev.slices >= 0 && n == p.prev.slices) {
+				// The same slices: a chmod, chown, rename or link.
+				rc.store.noteAttrObservation(p.e.Inode, p.mtime, p.ctime, n)
+				continue
+			}
+			up := &Entry{
+				Path:           p.e.Path,
+				Name:           p.e.Name,
+				ParentPath:     p.e.ParentPath,
+				Size:           p.size,
+				Mtime:          p.mtime,
+				MtimeNsecKnown: true,
+				Inode:          p.e.Inode,
+				Mode:           p.e.Mode,
+				// Another client's part committed after this mtime.
+				span: &attrSpan{ctime: p.ctime, slices: n, lateCommit: true},
+			}
+			toUpsert = append(toUpsert, up)
 		}
 	}
 	if len(toUpsert) == 0 {
-		noteCtimes(nil)
 		return nil, nil
 	}
 	if err := rc.applyReconcileUpsertsWithToken(toUpsert, &token); err != nil {
-		// The retry must see these ctimes as new again.
-		failed := make(map[uint64]bool, len(toUpsert))
+		// Nothing was recorded for these rows: the retry judges them again.
 		for _, e := range toUpsert {
 			retry = append(retry, e.Inode)
-			failed[e.Inode] = true
 		}
-		noteCtimes(failed)
 		return retry, err
 	}
-	noteCtimes(nil)
 	attrPushRefreshed.Add(int64(len(toUpsert)))
+	late := 0
+	for _, e := range toUpsert {
+		if e.span != nil && e.span.lateCommit {
+			late++
+		}
+	}
+	if late > 0 {
+		attrPushLateCommits.Add(int64(late))
+	}
 	jmlog.Info("metadata attr push: refreshed", "events", len(inodes), "files", len(known), "changed", len(toUpsert),
-		"first", toUpsert[0].Path, "mtime_bump", toUpsert[0].MtimeBump)
+		"first", toUpsert[0].Path, "late_commits", late)
 	return nil, nil
 }

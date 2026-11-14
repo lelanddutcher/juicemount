@@ -237,7 +237,10 @@ type Store struct {
 	// A bulk transaction holds this gate without holding mu across SQL or
 	// callbacks. Cache-only namespace publishers take it before mu. Lock order:
 	// writeMu -> cachePublicationMu -> mu; never acquire writeMu under this gate.
-	cachePublicationMu          sync.Mutex
+	cachePublicationMu sync.Mutex
+	// attrObs: what the Redis publications last saw of each file
+	// (mtime_span.go).
+	attrObs                     attrObservations
 	evictionMu                  sync.Mutex   // serializes bounded pressure passes; never acquired under mu/publication
 	nextCacheIdentity           uint64       // fresh RAM publication identity, guarded by mu
 	readDirAfterCacheCheckHook  func()       // deterministic completeness-race tests; nil in production
@@ -648,7 +651,6 @@ func (s *Store) RecoverShadow(rec evictedShadow, inode uint64) *Entry {
 	s.cachePublicationMu.Lock()
 	s.mu.Lock()
 	old := s.pathCache[e.Path]
-	carryMtimeBump(old, e)
 	if old != nil {
 		s.removeFromChildrenIdx(old)
 		s.evictPathOrphanLocked(old, e)
@@ -1022,6 +1024,10 @@ func OpenWithMaxCacheSize(dbPath string, maxCacheSize int) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("initialize mirror incarnations: %w", err)
 	}
+	if _, err := db.Exec(nfsOverlaySchema); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("create nfs mtime overlay schema: %w", err)
+	}
 
 	// Capture this before CREATE IF NOT EXISTS. A database upgraded from a
 	// pre-FTS build may already contain entries but no index; the epoch alone
@@ -1122,6 +1128,10 @@ func OpenWithMaxCacheSize(dbPath string, maxCacheSize int) (*Store, error) {
 	if s.subtreeOn {
 		s.subtreeBytes = make(map[string]int64)
 		s.subtreeFiles = make(map[string]int64)
+	}
+	if err := s.loadNFSOverlays(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("load nfs mtime overlays: %w", err)
 	}
 	if s.fileLock != nil {
 		if err := s.recoverOwnedPruneLadderCandidates(); err != nil {
@@ -1285,6 +1295,7 @@ func gcInternalNamespaces(db *sql.DB) (int64, error) {
 
 // Close closes the database connection.
 func (s *Store) Close() error {
+	dropOverlaysOf(s)
 	if s.pruneLadderGCStop != nil {
 		s.pruneLadderGCStopOnce.Do(func() { close(s.pruneLadderGCStop) })
 		<-s.pruneLadderGCDone
@@ -1385,7 +1396,7 @@ func (s *Store) Insert(e *Entry) error {
 	s.mu.Lock()
 	// Remove old entry from children index if path existed with different parent
 	old := s.pathCache[e.Path]
-	carryMtimeBump(old, e)
+	s.noteOwnPublication(e)
 	if old != nil {
 		s.removeFromChildrenIdx(old)
 		// QA-27 (2026-05-21): if the displaced entry had a different inode,
@@ -1519,7 +1530,7 @@ func (s *Store) InsertToCache(e *Entry) {
 		return
 	}
 	old := s.pathCache[e.Path]
-	carryMtimeBump(old, e)
+	s.noteOwnPublication(e)
 	if old != nil {
 		s.removeFromChildrenIdx(old)
 		// QA-27: see Insert.
@@ -2073,6 +2084,7 @@ func (s *Store) bulkInsertBatchWithEpoch(batch []*Entry, incremental bool, expec
 		present bool
 		inode   uint64
 		version MirrorToken
+		span    spanPreimage
 	}
 	snapshots := make([]*Entry, len(batch))
 	cached := make(map[string]cachePreimage, len(batch))
@@ -2083,7 +2095,9 @@ func (s *Store) bulkInsertBatchWithEpoch(batch []*Entry, incremental bool, expec
 		e := input.snapshot()
 		snapshots[i] = e
 		if old := s.pathCache[e.Path]; old != nil {
-			cached[e.Path] = cachePreimage{present: true, inode: old.Inode, version: old.Version}
+			cached[e.Path] = cachePreimage{present: true, inode: old.Inode, version: old.Version,
+				span: spanPreimage{mtimeNS: old.Mtime.UnixNano(), reportedNS: old.NFSMtime().UnixNano(),
+					size: old.Size, isDir: old.IsDir}}
 		}
 	}
 	s.mu.RUnlock()
@@ -2167,6 +2181,16 @@ func (s *Store) bulkInsertBatchWithEpoch(batch []*Entry, incremental bool, expec
 	}
 	committed := make([]*Entry, 0, len(batch))
 	var reconcileDirs []string
+	// The reported mtime and the observations of each committed file row
+	// (mtime_span.go): the overlay rows are written in this transaction and
+	// published with the rows; observations only for committed rows.
+	var overlays []overlayChange
+	type spanObs struct {
+		inode     uint64
+		obs       attrObs
+		keepNewer bool
+	}
+	var observations []spanObs
 	for _, input := range snapshots {
 		e := input
 		if StreamPartialName(e.Name) {
@@ -2230,6 +2254,18 @@ func (s *Store) bulkInsertBatchWithEpoch(batch []*Entry, incremental bool, expec
 		if err := loadEntryVersion(tx, e); err != nil {
 			return StoreEpoch{}, err
 		}
+		if !e.IsDir && e.Inode != 0 {
+			old := cached[e.Path]
+			present := old.present && old.inode == e.Inode
+			change, obs, keepNewer := s.mtimeSpanUpdate(e, old.span, present)
+			if change != nil {
+				if err := change.write(tx); err != nil {
+					return StoreEpoch{}, err
+				}
+				overlays = append(overlays, *change)
+			}
+			observations = append(observations, spanObs{e.Inode, obs, keepNewer})
+		}
 		e.ResetGetAttrCache()
 		committed = append(committed, e)
 	}
@@ -2253,6 +2289,12 @@ func (s *Store) bulkInsertBatchWithEpoch(batch []*Entry, incremental bool, expec
 	// reads Store cannot reenter an open SQLite writer.
 	for _, p := range reconcileDirs {
 		s.NotifyContentInvalidated(p, true)
+	}
+	for _, c := range overlays {
+		c.apply()
+	}
+	for _, o := range observations {
+		s.attrObs.put(o.inode, o.obs, o.keepNewer)
 	}
 	s.mu.Lock()
 	for _, e := range committed {

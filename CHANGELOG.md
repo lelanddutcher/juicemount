@@ -91,19 +91,24 @@
   ctime. The Mac's NFS client keeps a file's pages until it sees another
   mtime (a ctime-only change does not drop them: laptop run 2026-11-14), so
   the parts it read between the first and the last commit stayed old. The
-  app's own caches missed the later commits too. Now the attr push remembers
-  each file's last JuiceFS ctime; a newer ctime under the same mtime counts
-  as a late commit. It drops the app's byte caches and refreshes JuiceFS as
-  any edit does, and the mtime the Mac sees moves forward by 1 ns per late
-  commit. The shown date (seconds) does not change, the reported mtime never
-  goes back while the file keeps its true mtime, and the true mtime stays
-  in the mirror for every check against JuiceFS. The Mac's own saves never
-  move it: their echo arrives under an mtime the push has not seen yet, and
-  is only recorded. Linux remote lab (`playedit` abroad, the peer dates each
-  save before its close): READ replies whose old bytes the Mac would keep
-  under the final mtime 1,397 → 0, and the last save's bytes became visible
-  24 s after its close (before: not within 90 s). Whether the macOS NFS
-  client drops its pages for a 1 ns mtime change needs the laptop run.
+  app's own caches missed the later commits too. Now every publication of a
+  file's attributes from Redis records what it read (mtime, ctime, slice
+  count), and the attr push counts a newer ctime under the same mtime as a
+  late commit when the file's slice count changed (a chmod, chown, rename
+  or link changes only the ctime; the Mac's own chmod is marked as well).
+  It drops the app's byte caches and refreshes JuiceFS as any edit does, and
+  the mtime the Mac sees moves to 1 ns above the highest value it was ever
+  given for the file. That reported mtime never repeats a value: not when
+  JuiceFS steps the mtime back during a save, not after a restart, not for
+  a row read back from SQLite (it is kept in the new table
+  `nfs_mtime_overlay`). The shown date (seconds) stays, and the true mtime
+  stays in the mirror for every check against JuiceFS. The Mac's own saves
+  never move it: their echo is only recorded. Linux remote lab (`playedit`
+  abroad, the peer dates each save before its close): READ replies whose old
+  bytes the Mac would keep under the final mtime 1,397 → 0, and the last
+  save's bytes became visible 24 s after its close (before: not within
+  90 s). Whether the macOS NFS client drops its pages for a 1 ns mtime
+  change needs the laptop run.
 - A clip that was playing when the network went away plays again a second or
   two after the network returns. Before, after a longer outage (3 minutes on
   the laptop run of 2026-11-14), every read of that clip returned an

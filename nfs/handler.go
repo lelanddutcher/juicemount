@@ -5655,6 +5655,9 @@ func (jc *juiceChange) Chmod(name string, mode os.FileMode) error {
 		}
 		if backendEligible && !result.spoolPending {
 			fusePath := path.Join(h.fusePath, rel)
+			// The ctime-only change this makes is not another client's
+			// commit (metadata/mtime_span.go, review M1 of #99).
+			h.store.NoteOwnAttrChange(rel)
 			// Run the raw syscall in this worker. On RPC timeout the worker
 			// retains the namespace lease until the kernel call really ends.
 			start := time.Now()

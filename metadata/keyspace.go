@@ -1258,7 +1258,7 @@ type dirChild struct {
 // retry; a new directory can still establish ancestry for its children.
 func buildReconcileChildEntries(children []dirChild, attrByInode map[uint64][]byte, lookup func(string) *Entry) (toUpsert []*Entry, newDirs []uint64) {
 	for _, c := range children {
-		var mtime time.Time
+		var mtime, ctime time.Time
 		var size int64
 		attrOK := false
 		if attr, ok := attrByInode[c.inode]; ok {
@@ -1266,6 +1266,8 @@ func buildReconcileChildEntries(children []dirChild, attrByInode map[uint64][]by
 				mtime = mt
 				size = sz
 				attrOK = true
+				// The attr push's baseline for a late commit (review H1).
+				ctime, _ = decodeInodeAttrCtime(attr)
 			}
 		}
 		existing := lookup(c.childPath)
@@ -1286,6 +1288,7 @@ func buildReconcileChildEntries(children []dirChild, attrByInode map[uint64][]by
 			MtimeNsecKnown: attrOK,
 			Inode:          c.inode,
 			Mode:           c.mode,
+			span:           &attrSpan{ctime: ctime, slices: -1},
 		}
 
 		// Upsert-diff: only write if new or changed (same compare as

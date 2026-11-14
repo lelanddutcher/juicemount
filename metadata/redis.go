@@ -361,8 +361,8 @@ type RedisClient struct {
 	testTriggerSync  func()
 	testReadDirRaw   func(uint64) (map[string]string, error)
 	testReadAttrs    func([]string) ([]interface{}, error)
-	// attrCtimes is the attr push's last ctime of each file (mtime_span.go).
-	attrCtimes                   attrCtimes
+	// testReadSlices stands in for the slice count of a file (mtime_span.go).
+	testReadSlices               func(inode uint64, size int64) int64
 	testScanBatch                func(context.Context, string, string) ([]string, error)
 	testAfterScanTokenCheck      func()
 	testAfterScanUpsertChunk     func()
