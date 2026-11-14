@@ -49,6 +49,9 @@
 #                under the settled mtime: kept for good), and when the last save's
 #                bytes show at 8 offsets, then the settled state 8 s later.
 #                "replies" lists every reply for offline checks.
+#                PE_EDIT_FILE=pe/v02.bin: the peer saves a second clip
+#                instead (a control: the same link load, no refresh of the
+#                played clip).
 #                PE_SAVE_TOUCH=true: the peer sets the clip's mtime before
 #                each close (as cp -p does), so its later commits keep that
 #                mtime and change only the ctime.
@@ -168,7 +171,9 @@ run() {
   peer_mount
   local video=0
   case " $CASES " in *" playedit "*) video="${PE_VIDEO_MIB:-1024}" ;; esac
-  probe fixture -peer /jfs-peer -dir pe -n "$TRIALS" -video-mib "$video" > "$OUT/$label.fixture.json"
+  local videos=1
+  [ -z "${PE_EDIT_FILE:-}" ] || videos=2
+  probe fixture -peer /jfs-peer -dir pe -n "$TRIALS" -video-mib "$video" -videos "$videos" > "$OUT/$label.fixture.json"
   local uuid class=slow
   uuid="$("$LAB" exec sh -c 'juicefs status "redis://admin@'"$PROXY_IP"':6379/1" 2>/dev/null' | sed -n 's/.*"UUID": "\([^"]*\)".*/\1/p' | head -n 1)"
   [ -n "$uuid" ] || die "no volume UUID"
@@ -216,7 +221,7 @@ run() {
       # fresh on the last trial would reuse f01, already read: skip it.
       if [ "$kase" = fresh ] && [ "$i" = "$TRIALS" ]; then continue; fi
       stats "$OUT/$label.$kase.$n.before.txt"
-      probe run -export "$xpath" -case "$kase" -file "$file" -timeout "$TIMEOUT" -save "${PE_SAVE:-60s}" -rate "${PE_RATE:-2}" -writes="${PE_WRITES:-false}" -save-touch="${PE_SAVE_TOUCH:-false}" >> "$OUT/$label.jsonl" \
+      probe run -export "$xpath" -case "$kase" -file "$file" -timeout "$TIMEOUT" -save "${PE_SAVE:-60s}" -rate "${PE_RATE:-2}" -writes="${PE_WRITES:-false}" -save-touch="${PE_SAVE_TOUCH:-false}" -edit-file="${PE_EDIT_FILE:-}" >> "$OUT/$label.jsonl" \
         || log "$label: $kase $file failed"
       sleep 1
       stats "$OUT/$label.$kase.$n.after.txt"

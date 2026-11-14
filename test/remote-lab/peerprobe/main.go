@@ -74,6 +74,7 @@ func fixture(args []string) error {
 	dir := fs.String("dir", "pe", "folder under both mounts")
 	n := fs.Int("n", 4, "files of each kind")
 	video := fs.Int("video-mib", 0, "also write v01.bin of this many MiB (the playedit case)")
+	videos := fs.Int("videos", 1, "with -video-mib: write v01.bin … vNN.bin")
 	_ = fs.Parse(args)
 	if err := os.MkdirAll(filepath.Join(*peer, *dir), 0o777); err != nil {
 		return err
@@ -90,8 +91,8 @@ func fixture(args []string) error {
 			}
 		}
 	}
-	if *video > 0 {
-		if err := writeVideo(filepath.Join(*peer, *dir, "v01.bin"), int64(*video)*mib); err != nil {
+	for i := 1; *video > 0 && i <= *videos; i++ {
+		if err := writeVideo(filepath.Join(*peer, *dir, fmt.Sprintf("v%02d.bin", i)), int64(*video)*mib); err != nil {
 			return err
 		}
 	}
@@ -112,7 +113,10 @@ type probe struct {
 	settle  time.Duration // playedit: wait after the final bytes, then read the settled state
 	// saveTouch: playedit's peer sets the file's mtime before each close.
 	saveTouch bool
-	auth      rpc.Auth
+	// editName: playedit's peer saves this file instead of the played one
+	// (a control: the same link load, no refresh of the played clip).
+	editName string
+	auth     rpc.Auth
 }
 
 // read sends one READ. On NFS3ERR_JUKEBOX ("try later", which jm5 returns on
@@ -260,6 +264,7 @@ func run(args []string) (err error) {
 	save := fs.Duration("save", 60*time.Second, "playedit: the peer saves back to back for this long")
 	tail := fs.Duration("tail", 20*time.Second, "playedit: playback after the last save")
 	writes := fs.Bool("writes", false, "playedit: also save a 256 KiB file through NFS every second")
+	editFile := fs.String("edit-file", "", "playedit: the peer saves this file instead of -file (a control)")
 	saveTouch := fs.Bool("save-touch", false, "playedit: the peer sets the mtime before each close (late commits keep it)")
 	endSettle := fs.Duration("end-settle", 8*time.Second, "playedit: after the final bytes, wait this long and read the 8 offsets again")
 	_ = fs.Parse(args)
@@ -274,7 +279,7 @@ func run(args []string) (err error) {
 	if err != nil {
 		return fmt.Errorf("mount: %w", err)
 	}
-	p := &probe{v: v, name: *name, peer: *peer, poll: *poll, timeout: *timeout, auth: auth, writes: *writes, settle: *endSettle, saveTouch: *saveTouch}
+	p := &probe{v: v, name: *name, peer: *peer, poll: *poll, timeout: *timeout, auth: auth, writes: *writes, settle: *endSettle, saveTouch: *saveTouch, editName: *editFile}
 	_, p.fh, err = v.Lookup(*name)
 	if err != nil {
 		return fmt.Errorf("lookup: %w", err)

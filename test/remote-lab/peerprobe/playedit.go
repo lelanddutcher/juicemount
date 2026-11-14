@@ -135,8 +135,12 @@ func newTag() string {
 
 // saveOnce is one peer save: a 4 KiB block (tag + random) every 8 MiB.
 func (p *probe) saveOnce(size int64, tag string) (peerSave, error) {
+	name := p.name
+	if p.editName != "" {
+		name = p.editName
+	}
 	s := peerSave{Tag: tag, Start: time.Now()}
-	f, err := os.OpenFile(filepath.Join(p.peer, p.name), os.O_WRONLY, 0)
+	f, err := os.OpenFile(filepath.Join(p.peer, name), os.O_WRONLY, 0)
 	if err != nil {
 		return s, err
 	}
@@ -155,7 +159,7 @@ func (p *probe) saveOnce(size int64, tag string) (peerSave, error) {
 		// buffered slice that time, so each later commit keeps the final
 		// mtime and changes only the ctime (the mtime-span finding).
 		now := time.Now()
-		if err := os.Chtimes(filepath.Join(p.peer, p.name), now, now); err != nil {
+		if err := os.Chtimes(filepath.Join(p.peer, name), now, now); err != nil {
 			f.Close()
 			return s, err
 		}
@@ -166,7 +170,7 @@ func (p *probe) saveOnce(size int64, tag string) (peerSave, error) {
 	}
 	s.Close = time.Now()
 	s.WriteS, s.CloseS = secs(w.Sub(s.Start)), secs(s.Close.Sub(w))
-	st, err := os.Stat(filepath.Join(p.peer, p.name))
+	st, err := os.Stat(filepath.Join(p.peer, name))
 	if err != nil {
 		return s, err
 	}
@@ -436,7 +440,7 @@ func (p *probe) playEdit(row map[string]any, size int64, rate float64, lead, sav
 		finals = append(finals, r)
 		return r.Tag, err
 	}
-	for time.Since(last.Close) < p.timeout {
+	for p.editName == "" && time.Since(last.Close) < p.timeout {
 		all := true
 		for _, o := range offs {
 			tag, err := finalRead(o)
