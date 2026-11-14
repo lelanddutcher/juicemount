@@ -58,3 +58,35 @@ func TestJMRefreshOpenFileDropsPeerStaleSlices(t *testing.T) {
 		t.Fatalf("unknown inode: %v, want ENOENT", st)
 	}
 }
+
+// Patch 0032: a Read whose engine round trip overlapped an invalidation of
+// the file must not cache its (possibly older) slice list.
+func TestJMRefreshCachesNoListReadAcrossAnInvalidation(t *testing.T) {
+	o := newOpenFiles(time.Hour, 0)
+	const ino = Ino(5)
+	o.Open(ino, &Attr{Mtime: 1})
+	list := []Slice{{Id: 7, Size: 10, Len: 10}}
+
+	of, gen := o.jmChunkGen(ino)
+	o.jmCacheChunkAt(ino, 3, list, of, gen)
+	if got, ok := o.ReadChunk(ino, 3); !ok || len(got) != 1 {
+		t.Fatal("a list read with no invalidation in flight was not cached")
+	}
+
+	of, gen = o.jmChunkGen(ino)
+	o.InvalidateChunk(ino, invalidateAllChunks) // a refresh lands mid-read
+	o.jmCacheChunkAt(ino, 3, list, of, gen)
+	if _, ok := o.ReadChunk(ino, 3); ok {
+		t.Fatal("a list read across an invalidation was cached")
+	}
+	of, gen = o.jmChunkGen(ino)
+	o.InvalidateChunk(ino, 3)
+	o.jmCacheChunkAt(ino, 3, list, of, gen)
+	if _, ok := o.ReadChunk(ino, 3); ok {
+		t.Fatal("a list read across a one-chunk invalidation was cached")
+	}
+	if of, _ := o.jmChunkGen(Ino(99)); of != nil {
+		t.Fatal("a file that is not open has no generation")
+	}
+	o.jmCacheChunkAt(Ino(99), 0, list, nil, 0)
+}

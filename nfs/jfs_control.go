@@ -56,11 +56,26 @@ func (c *jfsControl) exchangeWithin(msg []byte, replyLen int, timeout time.Durat
 // reply whose first byte says it is short (an older juicefs refusing an
 // unknown message with one byte) ends at once. maxLen is the longest reply.
 func (c *jfsControl) exchangeUntil(msg []byte, maxLen int, want func([]byte) int, timeout time.Duration) ([]byte, error) {
+	reply, _, err := c.exchangeUntilTimed(msg, maxLen, want, timeout)
+	return reply, err
+}
+
+// exchangeUntilTimed is exchangeUntil that also reports how long the call
+// waited for the control mutex (another control message in flight).
+func (c *jfsControl) exchangeUntilTimed(msg []byte, maxLen int, want func([]byte) int, timeout time.Duration) ([]byte, time.Duration, error) {
 	if c.testExchange != nil {
-		return c.testExchange(msg, maxLen)
+		reply, err := c.testExchange(msg, maxLen)
+		return reply, 0, err
 	}
+	lockStart := time.Now()
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	lockWait := time.Since(lockStart)
+	reply, err := c.exchangeLocked(msg, maxLen, want, timeout)
+	return reply, lockWait, err
+}
+
+func (c *jfsControl) exchangeLocked(msg []byte, maxLen int, want func([]byte) int, timeout time.Duration) ([]byte, error) {
 	// juicefs keys the macOS control handle by the caller's pid, and FUSE
 	// requests carry the thread's identity on Linux. Keep the whole exchange
 	// on one thread.

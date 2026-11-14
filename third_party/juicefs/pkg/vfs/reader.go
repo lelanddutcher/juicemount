@@ -102,6 +102,9 @@ type sliceReader struct {
 	next       *sliceReader
 	prev       **sliceReader
 	refs       uint16
+	// jmSlices is the slice list this buffer was read from, nil until the
+	// current run has it (JuiceMount patch 0032, jm_refresh.go).
+	jmSlices []meta.Slice
 }
 
 func (s *sliceReader) delay(delay time.Duration) {
@@ -166,6 +169,7 @@ func (s *sliceReader) run() {
 		s.done(0, 0)
 	}
 	s.state = BUSY
+	s.jmSlices = nil // JuiceMount patch 0032
 	indx := s.indx
 	inode := f.inode
 	f.Unlock()
@@ -189,6 +193,8 @@ func (s *sliceReader) run() {
 		}
 	}
 
+	s.jmSlices = slices // JuiceMount patch 0032
+	f.r.jmServed.record(inode, indx, jmKnown(slices))
 	s.currentPos = 0
 	if s.block.off > length {
 		s.block.len = 0
@@ -710,6 +716,7 @@ type dataReader struct {
 	readAheadTotal uint64
 	maxRequests    int
 	maxRetries     uint32
+	jmServed       jmServedSet // JuiceMount patch 0032
 }
 
 func NewDataReader(conf *Config, m meta.Meta, store chunk.ChunkStore) DataReader {
@@ -788,6 +795,7 @@ func (r *dataReader) visit(inode Ino, fn func(*fileReader)) {
 }
 
 func (r *dataReader) Truncate(inode Ino, length uint64) {
+	r.jmTruncate(inode, length) // JuiceMount patch 0032
 	r.visit(inode, func(f *fileReader) {
 		if length < f.length {
 			f.visit(func(s *sliceReader) bool {
@@ -802,6 +810,7 @@ func (r *dataReader) Truncate(inode Ino, length uint64) {
 }
 
 func (r *dataReader) Invalidate(inode Ino, off, length uint64) {
+	r.jmServed.forget(inode) // JuiceMount patch 0032
 	b := frange{off, length}
 	r.visit(inode, func(f *fileReader) {
 		if off+length > f.length {

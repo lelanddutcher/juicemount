@@ -1,0 +1,111 @@
+--- a/pkg/fuse/fuse.go
++++ b/pkg/fuse/fuse.go
+@@ -549,9 +549,10 @@
+ 	// pages of an inode another client changed (pkg/vfs/jm_refresh.go). It
+ 	// runs outside any FUSE request, so the notify can be synchronous. Offset
+ 	// 0 and length 0 drop the attributes and every page; offset -1 (the
+-	// open path above) drops only the attributes.
+-	vfs.JMSetInodeInvalidator(func(ino Ino) syscall.Errno {
+-		return syscall.Errno(fssrv.InodeNotify(uint64(ino), 0, 0))
++	// open path above) drops only the attributes. Patch 0032: the message
++	// passes the range, so it can drop only the pages another client changed.
++	vfs.JMSetInodeInvalidator(func(ino Ino, off, length int64) syscall.Errno {
++		return syscall.Errno(fssrv.InodeNotify(uint64(ino), off, length))
+ 	})
+ 	fssrv.Serve()
+ 	return nil
+--- a/pkg/meta/base.go
++++ b/pkg/meta/base.go
+@@ -1692,6 +1692,7 @@
+ 
+ 	*slices = nil
+ 	defer m.timeit("Read", time.Now())
++	of, gen := m.of.jmChunkGen(inode) // JuiceMount patch 0032
+ 	ss, st := m.en.doRead(ctx, inode, indx)
+ 	if st != 0 {
+ 		return st
+@@ -1711,7 +1712,7 @@
+ 	}
+ 
+ 	*slices = buildSlice(ss)
+-	m.of.CacheChunk(inode, indx, *slices)
++	m.of.jmCacheChunkAt(inode, indx, *slices, of, gen) // JuiceMount patch 0032
+ 	if !m.conf.ReadOnly && (len(ss) >= 5 || len(*slices) >= 5) {
+ 		go m.compactChunk(inode, indx, false, false)
+ 	}
+--- a/pkg/meta/openfile.go
++++ b/pkg/meta/openfile.go
+@@ -33,9 +33,12 @@
+ 	// firstRaw is the length of the raw list behind a seeded first, for the
+ 	// compaction decision Read makes when it uses it.
+ 	firstRaw int
++	// jmGen counts the slice-list invalidations of this file (patch 0032).
++	jmGen uint64
+ }
+ 
+ func (o *openFile) invalidateChunk() {
++	o.jmGen++ // JuiceMount patch 0032
+ 	o.first = nil
+ 	o.firstAt = time.Time{}
+ 	for c := range o.chunks {
+@@ -278,6 +281,7 @@
+ 	defer o.Unlock()
+ 	of, ok := o.files[ino]
+ 	if ok {
++		of.jmGen++ // JuiceMount patch 0032
+ 		if indx == invalidateAllChunks {
+ 			of.invalidateChunk()
+ 		} else if indx == 0 {
+--- a/pkg/vfs/reader.go
++++ b/pkg/vfs/reader.go
+@@ -102,6 +102,9 @@
+ 	next       *sliceReader
+ 	prev       **sliceReader
+ 	refs       uint16
++	// jmSlices is the slice list this buffer was read from, nil until the
++	// current run has it (JuiceMount patch 0032, jm_refresh.go).
++	jmSlices []meta.Slice
+ }
+ 
+ func (s *sliceReader) delay(delay time.Duration) {
+@@ -166,6 +169,7 @@
+ 		s.done(0, 0)
+ 	}
+ 	s.state = BUSY
++	s.jmSlices = nil // JuiceMount patch 0032
+ 	indx := s.indx
+ 	inode := f.inode
+ 	f.Unlock()
+@@ -189,6 +193,8 @@
+ 		}
+ 	}
+ 
++	s.jmSlices = slices // JuiceMount patch 0032
++	f.r.jmServed.record(inode, indx, jmKnown(slices))
+ 	s.currentPos = 0
+ 	if s.block.off > length {
+ 		s.block.len = 0
+@@ -710,6 +716,7 @@
+ 	readAheadTotal uint64
+ 	maxRequests    int
+ 	maxRetries     uint32
++	jmServed       jmServedSet // JuiceMount patch 0032
+ }
+ 
+ func NewDataReader(conf *Config, m meta.Meta, store chunk.ChunkStore) DataReader {
+@@ -788,6 +795,7 @@
+ }
+ 
+ func (r *dataReader) Truncate(inode Ino, length uint64) {
++	r.jmTruncate(inode, length) // JuiceMount patch 0032
+ 	r.visit(inode, func(f *fileReader) {
+ 		if length < f.length {
+ 			f.visit(func(s *sliceReader) bool {
+@@ -802,6 +810,7 @@
+ }
+ 
+ func (r *dataReader) Invalidate(inode Ino, off, length uint64) {
++	r.jmServed.forget(inode) // JuiceMount patch 0032
+ 	b := frange{off, length}
+ 	r.visit(inode, func(f *fileReader) {
+ 		if off+length > f.length {

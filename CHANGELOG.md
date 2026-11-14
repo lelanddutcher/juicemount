@@ -50,6 +50,33 @@
   replies abroad went from 3 to 0. Of the 5,600 READ replies that carried the
   new mtime, none carried old bytes. lan bounds are 0.21–0.22 s, and a read of an unchanged
   file costs the same. The Mac-only parts need the laptop run.
+- A clip that a teammate keeps saving no longer freezes playback because of
+  the refresh above (laptop run 2026-11-14, bug F1: one 135 s freeze abroad).
+  A long save on a far link commits parts early, so the app saw the clip
+  change every 2–4 s, and a refresh was always pending. A READ waited for "no
+  refresh pending", which never held, then answered JUKEBOX, and the Mac
+  backed off for up to 30 s. Now:
+  - A READ waits only for a refresh that started after the edits it can see
+    (a count per file). Later edits do not hold it back, and a new edit's
+    attributes still never come with old bytes. Refreshes of one file are
+    coalesced and paced: one more run after the current one, then a pause as
+    long as the last run (at most 1 s). The wait bound is 12 s on every link
+    (was 5 s, 8 s far); the mount's own timeout is 40 s, and a JUKEBOX costs
+    the Mac at least 4 s.
+  - The bundled JuiceFS (patch 0032, `-jm17`) keeps the read buffers whose
+    byte range the edit did not change, and drops in the kernel only the byte
+    ranges that changed (whole file on a length change, a local write, or
+    when unsure). Before, every refresh restarted the player's block
+    downloads and waited for every read of the file in flight. The kernel
+    wait is 6 s (was 2 s). A slow refresh logs its phases in both logs.
+  - The stat after a refresh runs only when the length changed. On Linux it
+    took 3–20 s during a save (FUSE drops all pages on a new mtime).
+  Remote lab (`peer-edit-lab.sh`, new `playedit` case: 1 GiB clip played,
+  the peer saves it back to back for 60 s, about 55 s per save): READs
+  answered JUKEBOX by the refresh 21 → 1 and failed refreshes 10 → 0 (0.5
+  MiB/s, 2 trials each); at 2 MiB/s 13 → 0 and 13 → 1. Freezes here are still
+  dominated by cold reads over the lab's lossy link (also before any save).
+  The Mac part needs the laptop run.
 - A clip that was playing when the network went away plays again a second or
   two after the network returns. Before, after a longer outage (3 minutes on
   the laptop run of 2026-11-14), every read of that clip returned an

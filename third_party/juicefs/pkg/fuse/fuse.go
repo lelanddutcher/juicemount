@@ -549,9 +549,10 @@ func Serve(v *vfs.VFS, options string, xattrs, ioctl bool) error {
 	// pages of an inode another client changed (pkg/vfs/jm_refresh.go). It
 	// runs outside any FUSE request, so the notify can be synchronous. Offset
 	// 0 and length 0 drop the attributes and every page; offset -1 (the
-	// open path above) drops only the attributes.
-	vfs.JMSetInodeInvalidator(func(ino Ino) syscall.Errno {
-		return syscall.Errno(fssrv.InodeNotify(uint64(ino), 0, 0))
+	// open path above) drops only the attributes. Patch 0032: the message
+	// passes the range, so it can drop only the pages another client changed.
+	vfs.JMSetInodeInvalidator(func(ino Ino, off, length int64) syscall.Errno {
+		return syscall.Errno(fssrv.InodeNotify(uint64(ino), off, length))
 	})
 	fssrv.Serve()
 	return nil

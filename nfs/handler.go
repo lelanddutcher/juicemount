@@ -49,6 +49,9 @@ type JuiceMountHandler struct {
 	// contentRefresh makes juicefs drop its caches of a file another client
 	// changed, and holds READs of that file until it has (content_refresh.go).
 	contentRefresh *contentRefresher
+	// refreshLengths holds, by inode, the length the last refresh reported
+	// (content_refresh.go).
+	refreshLengths sync.Map
 	readahead      *ReadaheadManager
 	memBuf         *MemoryBuffer
 	redisClient    atomic.Pointer[metadata.RedisClient] // for publishing events

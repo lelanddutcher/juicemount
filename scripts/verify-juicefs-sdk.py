@@ -56,6 +56,8 @@ PATCH_FILES = {
     "patches/0030-read-error-retry.patch": ["pkg/vfs/reader.go"],
     "patches/0031-refresh-open-file.patch": [
         "pkg/fuse/fuse.go", "pkg/meta/interface.go", "pkg/vfs/internal.go"],
+    "patches/0032-refresh-keeps-current-buffers.patch": [
+        "pkg/fuse/fuse.go", "pkg/meta/base.go", "pkg/meta/openfile.go", "pkg/vfs/reader.go"],
 }
 VERSION_PACKAGE = "github.com/juicedata/juicefs/pkg/version"
 

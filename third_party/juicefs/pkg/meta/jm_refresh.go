@@ -1,6 +1,9 @@
 package meta
 
-import "syscall"
+import (
+	"syscall"
+	"time"
+)
 
 // JuiceMount patch 0031: the metadata half of the JMRefreshInode control
 // message (pkg/vfs/jm_refresh.go).
@@ -29,5 +32,66 @@ func (m *baseMeta) JMRefreshOpenFile(ctx Context, inode Ino, attr *Attr) syscall
 		return err
 	}
 	m.of.UpdateFresh(inode, attr, gen)
+	return 0
+}
+
+// JuiceMount patch 0032: slice lists that a refresh can trust.
+//
+// A Read that went to the engine before a refresh dropped the cached lists
+// could store its (older) list after the drop, and later Reads would use it.
+// jmChunkGen and jmCacheChunkAt close that window: Read stores a list only
+// when no invalidation of the file happened while it was in flight.
+
+// jmChunkGen returns the open file and its invalidation count, for
+// jmCacheChunkAt. of is nil when the file is not open.
+func (o *openfiles) jmChunkGen(ino Ino) (*openFile, uint64) {
+	o.Lock()
+	defer o.Unlock()
+	of := o.files[ino]
+	if of == nil {
+		return nil, 0
+	}
+	return of, of.jmGen
+}
+
+// jmCacheChunkAt is CacheChunk for a list read after jmChunkGen returned
+// (of, gen): it stores the list only if the same open file has had no
+// invalidation since.
+func (o *openfiles) jmCacheChunkAt(ino Ino, indx uint32, cs []Slice, of *openFile, gen uint64) {
+	if of == nil {
+		return
+	}
+	o.Lock()
+	defer o.Unlock()
+	if o.files[ino] != of || of.jmGen != gen {
+		return
+	}
+	if indx == 0 {
+		of.first = cs
+		of.firstAt = time.Time{}
+		return
+	}
+	if of.chunks == nil {
+		of.chunks = make(map[uint32][]Slice)
+	}
+	of.chunks[indx] = cs
+}
+
+// JMReadChunkFresh reads one chunk's slice list from the engine, never from
+// the cache, and caches it as Read does. The refresh message (pkg/vfs) calls
+// it after JMRefreshOpenFile, to learn which read buffers still hold the
+// file's current bytes.
+func (m *baseMeta) JMReadChunkFresh(ctx Context, inode Ino, indx uint32, slices *[]Slice) syscall.Errno {
+	inode = m.checkRoot(inode)
+	of, gen := m.of.jmChunkGen(inode)
+	ss, st := m.en.doRead(ctx, inode, indx)
+	if st != 0 {
+		return st
+	}
+	if ss == nil {
+		return syscall.EIO
+	}
+	*slices = buildSlice(ss)
+	m.of.jmCacheChunkAt(inode, indx, *slices, of, gen)
 	return 0
 }

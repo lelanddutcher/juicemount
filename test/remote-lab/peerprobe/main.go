@@ -73,6 +73,7 @@ func fixture(args []string) error {
 	peer := fs.String("peer", "/jfs-peer", "the peer's juicefs mount")
 	dir := fs.String("dir", "pe", "folder under both mounts")
 	n := fs.Int("n", 4, "files of each kind")
+	video := fs.Int("video-mib", 0, "also write v01.bin of this many MiB (the playedit case)")
 	_ = fs.Parse(args)
 	if err := os.MkdirAll(filepath.Join(*peer, *dir), 0o777); err != nil {
 		return err
@@ -89,7 +90,12 @@ func fixture(args []string) error {
 			}
 		}
 	}
-	emit(map[string]any{"step": "fixture", "dir": *dir, "files": *n * 3})
+	if *video > 0 {
+		if err := writeVideo(filepath.Join(*peer, *dir, "v01.bin"), int64(*video)*mib); err != nil {
+			return err
+		}
+	}
+	emit(map[string]any{"step": "fixture", "dir": *dir, "files": *n * 3, "video_mib": *video})
 	return nil
 }
 
@@ -239,12 +245,16 @@ func run(args []string) (err error) {
 	addr := fs.String("nfs", "127.0.0.1:21049", "jm5's NFS server")
 	export := fs.String("export", "", "export path from the jm5 log")
 	peer := fs.String("peer", "/jfs-peer", "the peer's juicefs mount")
-	kase := fs.String("case", "held", "held | fresh | append | append-held | steady | pair")
+	kase := fs.String("case", "held", "held | fresh | append | append-held | steady | pair | playedit")
 	name := fs.String("file", "pe/f01.bin", "file, relative to the export root and the peer mount")
 	poll := fs.Duration("poll", 50*time.Millisecond, "poll interval")
 	timeout := fs.Duration("timeout", 30*time.Second, "give up after this long")
 	settle := fs.Duration("settle", time.Second, "pause between the prime read and the peer edit")
 	reads := fs.Int("reads", 200, "steady: reads of the held file")
+	rate := fs.Float64("rate", 2, "playedit: play rate, MiB/s")
+	lead := fs.Duration("lead", 20*time.Second, "playedit: playback before the first save")
+	save := fs.Duration("save", 60*time.Second, "playedit: the peer saves back to back for this long")
+	tail := fs.Duration("tail", 20*time.Second, "playedit: playback after the last save")
 	_ = fs.Parse(args)
 
 	c, err := rpc.DialTCP("tcp", *addr, false)
@@ -459,6 +469,9 @@ func run(args []string) (err error) {
 		row["first_new_mtime_s"], row["first_new_bytes_s"] = firstNewAttr, firstNewBytes
 		return nil
 
+	case "playedit":
+		return p.playEdit(row, int64(a0.Filesize), *rate, *lead, *save, *tail)
+
 	case "append", "append-held":
 		// The peer appends 1 MiB (tag at the start of it) to an 8 MiB file.
 		size0 := int64(a0.Filesize)
@@ -515,4 +528,22 @@ func run(args []string) (err error) {
 		return nil
 	}
 	return fmt.Errorf("unknown case %q", *kase)
+}
+
+// writeVideo writes size random bytes to name in 64 MiB pieces.
+func writeVideo(name string, size int64) error {
+	f, err := os.Create(name)
+	if err != nil {
+		return err
+	}
+	buf := make([]byte, 64*mib)
+	for off := int64(0); off < size; off += int64(len(buf)) {
+		_, _ = rand.Read(buf)
+		n := min(int64(len(buf)), size-off)
+		if _, err := f.Write(buf[:n]); err != nil {
+			f.Close()
+			return err
+		}
+	}
+	return f.Close()
 }

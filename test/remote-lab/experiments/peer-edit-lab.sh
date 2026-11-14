@@ -28,6 +28,15 @@
 #                the pair (mtime it carries, bytes). It counts replies with
 #                the new mtime and the old bytes (bug P2: the Mac keeps those)
 #                and the JUKEBOX retries (P4).
+#   playedit     (not in the default PE_CASES; bug F1) the reader plays a
+#                1 GiB clip (pe/v01.bin, PE_VIDEO_MIB) with 1 MiB READs at
+#                2 MiB/s while the peer saves it in place back to back for
+#                PE_SAVE (default 60s): a 4 KiB tagged block every 8 MiB,
+#                one close per save. JUKEBOX waits are the Mac's (4, 8, 16,
+#                30 s); PE_RATE sets the play rate in MiB/s (default 2).
+#                It reports the stalls, the JUKEBOX count, P2 pairs
+#                (a reply at or past a save's mtime with older bytes) and
+#                when the last save's bytes show at 8 offsets.
 #
 # Around every case the jm5 juicefs's own metadata operation counters
 # (/jfs/.stats; the peer has its own) and jm5's /metrics are saved, so the
@@ -142,7 +151,9 @@ run() {
   "$LAB" exec sh -c 'rm -rf /var/jfscache-peer /var/jm && mkdir -p /var/jm'
   mac_principal
   peer_mount
-  probe fixture -peer /jfs-peer -dir pe -n "$TRIALS" > "$OUT/$label.fixture.json"
+  local video=0
+  case " $CASES " in *" playedit "*) video="${PE_VIDEO_MIB:-1024}" ;; esac
+  probe fixture -peer /jfs-peer -dir pe -n "$TRIALS" -video-mib "$video" > "$OUT/$label.fixture.json"
   local uuid class=slow
   uuid="$("$LAB" exec sh -c 'juicefs status "redis://admin@'"$PROXY_IP"':6379/1" 2>/dev/null' | sed -n 's/.*"UUID": "\([^"]*\)".*/\1/p' | head -n 1)"
   [ -n "$uuid" ] || die "no volume UUID"
@@ -181,11 +192,12 @@ run() {
         append) file="pe/a$n.bin" ;;
         append-held) file="pe/a$n.bin" ;;
         pair) file="pe/p$n.bin" ;;
+        playedit) file="pe/v01.bin" ;;
       esac
       # fresh on the last trial would reuse f01, already read: skip it.
       if [ "$kase" = fresh ] && [ "$i" = "$TRIALS" ]; then continue; fi
       stats "$OUT/$label.$kase.$n.before.txt"
-      probe run -export "$xpath" -case "$kase" -file "$file" -timeout "$TIMEOUT" >> "$OUT/$label.jsonl" \
+      probe run -export "$xpath" -case "$kase" -file "$file" -timeout "$TIMEOUT" -save "${PE_SAVE:-60s}" -rate "${PE_RATE:-2}" >> "$OUT/$label.jsonl" \
         || log "$label: $kase $file failed"
       sleep 1
       stats "$OUT/$label.$kase.$n.after.txt"
