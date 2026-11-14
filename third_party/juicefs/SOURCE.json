@@ -1075,7 +1075,7 @@
       "upstream_sha256": "72e176b7c4e2c3a3fcd93646998235a93197298d8f6ca12742eccac53bd869b8"
     },
     "pkg/vfs/reader.go": {
-      "sha256": "874c49a14026f1b02c4547ed80648d09635c3bf3dbe0e30a0deb6839ab763524",
+      "sha256": "5d1184306175cc517228f55aaa8c788b491d33dafbd9a0d99bd6e53d5f0ce54c",
       "upstream_sha256": "0daec90c25b4ce8872423bb4d5541cf752f45f5110381ab1c822116a2461a60d"
     },
     "pkg/vfs/vfs.go": {
@@ -1208,7 +1208,7 @@
     "patches/0027-live-link-policy.patch": "a426454b44ec0e455f03c8f0d5fe3b4c9b8fa8ecba04ed7f74a9e96446728fd0",
     "patches/0028-open-round-trips.patch": "432401890a0887d55a8c95c8ef66eb99ce31c74f70e1701d99653f053ed07c5f",
     "patches/0029-dead-peer-detection.patch": "46931f7b317b89cfc16aafbc055b6b662724dc30b5c396020711c509c4ab4e9f",
-    "patches/0030-read-error-retry.patch": "a4187dbc54659b82acd5fa7079a3cc83c4d6cbd43fdc9a245601cda7cb8cfe1a"
+    "patches/0030-read-error-retry.patch": "2b097e51dcf5819bec505575b869fae70001e92f4ef04931dd565bf863fedfef"
   },
   "scope": "All pkg/ and cmd/ files plus main.go, LICENSE, go.mod and go.sum from the verified module ZIP. Documentation, integration tests and SDK examples are not included. local_files are JuiceMount-owned source with no upstream counterpart.",
   "upstream_url": "https://github.com/juicedata/juicefs/tree/v1.3.1",

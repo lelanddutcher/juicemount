@@ -16,7 +16,21 @@
  	tried    uint32
  	sessions [readSessions]session
  	slices   *sliceReader
-@@ -631,6 +633,7 @@
+@@ -599,6 +601,13 @@
+ 			if f.shouldStop() {
+ 				return 0, f.err
+ 			}
++			// JuiceMount patch 0030: a waited slice goes invalid only when
++			// its read failed. Another reader may already have cleared the
++			// stored error for a retry, so stop on the state as well, or this
++			// reader would wait on a slice that never finishes.
++			if !s.state.valid() {
++				return 0, syscall.EIO
++			}
+ 		}
+ 	}
+ 
+@@ -631,6 +640,7 @@
  	f.acquire()
  	defer f.release()
  

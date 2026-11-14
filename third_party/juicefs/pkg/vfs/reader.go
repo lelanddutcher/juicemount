@@ -601,6 +601,13 @@ func (f *fileReader) waitForIO(ctx meta.Context, reqs []*req, buf []byte) (int, 
 			if f.shouldStop() {
 				return 0, f.err
 			}
+			// JuiceMount patch 0030: a waited slice goes invalid only when
+			// its read failed. Another reader may already have cleared the
+			// stored error for a retry, so stop on the state as well, or this
+			// reader would wait on a slice that never finishes.
+			if !s.state.valid() {
+				return 0, syscall.EIO
+			}
 		}
 	}
 
