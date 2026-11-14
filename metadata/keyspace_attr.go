@@ -181,7 +181,9 @@ func (rc *RedisClient) newAttrCoalescer(generation uint64) *inodeCoalescer {
 }
 
 // reconcileFileAttrs reads the attrs of the batch's known regular files and
-// upserts those whose size or mtime changed. It returns the inodes to retry.
+// upserts those whose size or mtime changed, or that another client changed
+// again under the same mtime (a late commit, mtime_span.go). It returns the
+// inodes to retry.
 func (rc *RedisClient) reconcileFileAttrs(inodes []uint64, generation uint64) (retry []uint64, err error) {
 	token := rc.scanToken()
 	if token.backend != generation || !rc.scanTokenValid(token) {
@@ -219,6 +221,11 @@ func (rc *RedisClient) reconcileFileAttrs(inodes []uint64, generation uint64) (r
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	var toUpsert []*Entry
+	type observed struct {
+		inode        uint64
+		mtime, ctime time.Time
+	}
+	var ctimes []observed // to record once the rows reflect them
 	for start := 0; start < len(known); start += attrMGetChunk {
 		chunk := known[start:min(start+attrMGetChunk, len(known))]
 		keys := make([]string, len(chunk))
@@ -251,7 +258,19 @@ func (rc *RedisClient) reconcileFileAttrs(inodes []uint64, generation uint64) (r
 				continue
 			}
 			e := chunk[i]
-			if e.Mtime.Equal(mtime) && e.MtimeNsecKnown && e.Size == size {
+			sameMtime := e.Mtime.Equal(mtime) && e.MtimeNsecKnown
+			bump := uint32(0)
+			if sameMtime {
+				bump = e.MtimeBump
+			}
+			ctime, ctimeOK := decodeInodeAttrCtime([]byte(str))
+			if ctimeOK {
+				if sameMtime && rc.attrCtimes.lateCommit(e.Inode, mtime, ctime) {
+					bump++ // another client's part committed after this mtime
+				}
+				ctimes = append(ctimes, observed{e.Inode, mtime, ctime})
+			}
+			if sameMtime && e.Size == size && bump == e.MtimeBump {
 				continue
 			}
 			toUpsert = append(toUpsert, &Entry{
@@ -263,20 +282,34 @@ func (rc *RedisClient) reconcileFileAttrs(inodes []uint64, generation uint64) (r
 				MtimeNsecKnown: true,
 				Inode:          e.Inode,
 				Mode:           e.Mode,
+				MtimeBump:      bump,
 			})
 		}
 	}
+	noteCtimes := func(skip map[uint64]bool) {
+		for _, o := range ctimes {
+			if !skip[o.inode] {
+				rc.attrCtimes.note(o.inode, o.mtime, o.ctime)
+			}
+		}
+	}
 	if len(toUpsert) == 0 {
+		noteCtimes(nil)
 		return nil, nil
 	}
 	if err := rc.applyReconcileUpsertsWithToken(toUpsert, &token); err != nil {
+		// The retry must see these ctimes as new again.
+		failed := make(map[uint64]bool, len(toUpsert))
 		for _, e := range toUpsert {
 			retry = append(retry, e.Inode)
+			failed[e.Inode] = true
 		}
+		noteCtimes(failed)
 		return retry, err
 	}
+	noteCtimes(nil)
 	attrPushRefreshed.Add(int64(len(toUpsert)))
 	jmlog.Info("metadata attr push: refreshed", "events", len(inodes), "files", len(known), "changed", len(toUpsert),
-		"first", toUpsert[0].Path)
+		"first", toUpsert[0].Path, "mtime_bump", toUpsert[0].MtimeBump)
 	return nil, nil
 }

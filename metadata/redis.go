@@ -357,10 +357,12 @@ type RedisClient struct {
 	// the real methods run. Tests set them to observe coalescer behavior
 	// (which dirs got reconciled, how many full-SCAN promotions) without a
 	// live Redis. See keyspaceReconcileDir / keyspaceTriggerSync below.
-	testReconcileDir             func(uint64) error
-	testTriggerSync              func()
-	testReadDirRaw               func(uint64) (map[string]string, error)
-	testReadAttrs                func([]string) ([]interface{}, error)
+	testReconcileDir func(uint64) error
+	testTriggerSync  func()
+	testReadDirRaw   func(uint64) (map[string]string, error)
+	testReadAttrs    func([]string) ([]interface{}, error)
+	// attrCtimes is the attr push's last ctime of each file (mtime_span.go).
+	attrCtimes                   attrCtimes
 	testScanBatch                func(context.Context, string, string) ([]string, error)
 	testAfterScanTokenCheck      func()
 	testAfterScanUpsertChunk     func()

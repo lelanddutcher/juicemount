@@ -648,6 +648,7 @@ func (s *Store) RecoverShadow(rec evictedShadow, inode uint64) *Entry {
 	s.cachePublicationMu.Lock()
 	s.mu.Lock()
 	old := s.pathCache[e.Path]
+	carryMtimeBump(old, e)
 	if old != nil {
 		s.removeFromChildrenIdx(old)
 		s.evictPathOrphanLocked(old, e)
@@ -1384,6 +1385,7 @@ func (s *Store) Insert(e *Entry) error {
 	s.mu.Lock()
 	// Remove old entry from children index if path existed with different parent
 	old := s.pathCache[e.Path]
+	carryMtimeBump(old, e)
 	if old != nil {
 		s.removeFromChildrenIdx(old)
 		// QA-27 (2026-05-21): if the displaced entry had a different inode,
@@ -1517,6 +1519,7 @@ func (s *Store) InsertToCache(e *Entry) {
 		return
 	}
 	old := s.pathCache[e.Path]
+	carryMtimeBump(old, e)
 	if old != nil {
 		s.removeFromChildrenIdx(old)
 		// QA-27: see Insert.

@@ -42,6 +42,10 @@ type Entry struct {
 	// Version identifies the durable mirror observation carried by this entry.
 	// Zero means an unversioned legacy producer, not a newly captured observation.
 	Version MirrorToken
+	// MtimeBump counts another client's commits seen after this mtime (RAM
+	// only, never persisted): the NFS layer reports Mtime + MtimeBump ns
+	// (NFSMtime, mtime_span.go).
+	MtimeBump uint32
 
 	// getAttrCache is shared by immutable read snapshots of this entry. The
 	// payload is published atomically because GETATTR is a hot concurrent path.
@@ -137,7 +141,7 @@ func (fi *FileInfo) ModTime() time.Time {
 	if !fi.mtimeOverride.IsZero() {
 		return fi.mtimeOverride
 	}
-	return fi.entry.Mtime
+	return fi.entry.NFSMtime()
 }
 func (fi *FileInfo) IsDir() bool { return fi.entry.IsDir }
 

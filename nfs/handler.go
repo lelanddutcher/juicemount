@@ -4204,7 +4204,7 @@ func (jfs *juiceFS) openFileExpected(filename string, flag int, perm os.FileMode
 					name:  e.Name,
 					size:  e.Size,
 					mode:  e.Mode,
-					mtime: e.Mtime,
+					mtime: e.NFSMtime(), // a late commit moves it (metadata/mtime_span.go)
 					isDir: e.IsDir,
 					inode: e.Inode,
 				},

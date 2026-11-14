@@ -230,6 +230,7 @@ func validateExpected(tx *sql.Tx, expected MirrorToken) error {
 // publishEntryLocked installs only committed state. Caller holds s.mu.
 func (s *Store) publishEntryLocked(e *Entry) {
 	old := s.pathCache[e.Path]
+	carryMtimeBump(old, e)
 	if old != nil {
 		s.removeFromChildrenIdx(old)
 		s.evictPathOrphanLocked(old, e)

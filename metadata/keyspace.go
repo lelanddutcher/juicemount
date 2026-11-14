@@ -1219,6 +1219,19 @@ func decodeInodeAttrTime(attr []byte) (time.Time, int64, bool) {
 	return time.Unix(int64(be64(attr, 23)), int64(ns)), int64(be64(attr, 51)), true
 }
 
+// decodeInodeAttrCtime is the ctime of a juicefs attr (meta.Attr.Marshal:
+// the ctime's seconds at byte 35, its nanoseconds at 43).
+func decodeInodeAttrCtime(attr []byte) (time.Time, bool) {
+	if len(attr) < 59 {
+		return time.Time{}, false
+	}
+	ns := be32(attr, 43)
+	if ns >= 1e9 {
+		return time.Time{}, false
+	}
+	return time.Unix(int64(be64(attr, 35)), int64(ns)), true
+}
+
 // dirChild is one decoded, mirrorable child of a reconciling directory
 // (reconcileDir PASS 1 output).
 type dirChild struct {
