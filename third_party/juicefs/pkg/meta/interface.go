@@ -71,6 +71,10 @@ const (
 	// JMLinkPolicy reads or sets the link-dependent read and object settings
 	// while mounted (JuiceMount patch 0027, pkg/vfs/jm_link_policy.go).
 	JMLinkPolicy = 1106
+	// JMRefreshInode drops one file's cached slices, read buffers and kernel
+	// pages after another client changed it (JuiceMount patch 0031,
+	// pkg/vfs/jm_refresh.go).
+	JMRefreshInode = 1107
 )
 
 const (

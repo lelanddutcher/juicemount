@@ -23,6 +23,11 @@
 #                bytes arrive (B2).
 #   append-held  the same append on a file jm5 has open.
 #   steady       200 reads of a held file with no edit: the per-read cost.
+#   pair         (not in the default PE_CASES) a reader sends READs at 0 of a
+#                held file every 10 ms while the peer writes; each reply is
+#                the pair (mtime it carries, bytes). It counts replies with
+#                the new mtime and the old bytes (bug P2: the Mac keeps those)
+#                and the JUKEBOX retries (P4).
 #
 # Around every case the jm5 juicefs's own metadata operation counters
 # (/jfs/.stats; the peer has its own) and jm5's /metrics are saved, so the
@@ -175,6 +180,7 @@ run() {
         fresh) file="pe/f$(printf '%02d' $(( (i % TRIALS) + 1 ))).bin" ;;
         append) file="pe/a$n.bin" ;;
         append-held) file="pe/a$n.bin" ;;
+        pair) file="pe/p$n.bin" ;;
       esac
       # fresh on the last trial would reuse f01, already read: skip it.
       if [ "$kase" = fresh ] && [ "$i" = "$TRIALS" ]; then continue; fi

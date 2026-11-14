@@ -423,6 +423,34 @@ func (s *Store) UpdateProgress(e Entry, bytesCached int64) (bool, error) {
 	return n == 1, err
 }
 
+// AdoptSize sets the size of the exact Prefetching generation e to the
+// file's current size, before its attempt captures the file. A teammate's
+// append changes the file after the pin; the row kept the size from pin time,
+// so every later attempt refused the file as changed, and the pin stayed
+// Failed for good (laptop run 2026-11-14, bug P5). It reports the entry the
+// attempt continues with.
+func (s *Store) AdoptSize(e Entry, size int64) (Entry, bool, error) {
+	if e.Generation == "" || size < 0 || e.Status != StatusPrefetching {
+		return e, false, nil
+	}
+	if size == e.Size {
+		return e, true, nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	result, err := s.db.Exec(`UPDATE pinned_files SET size=? WHERE path=? AND pin_generation=? AND status=?`,
+		size, e.Path, e.Generation, int(StatusPrefetching))
+	if err != nil {
+		return e, false, err
+	}
+	n, err := result.RowsAffected()
+	if err != nil || n != 1 {
+		return e, false, err
+	}
+	e.Size = size
+	return e, true, nil
+}
+
 // CompleteReady commits the opaque, already-verified producer witness last.
 // Publication remains unavailable until AdmitReady validates local state.
 func (s *Store) CompleteReady(e Entry, authority []byte) (bool, error) {

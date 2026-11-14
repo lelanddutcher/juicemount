@@ -668,6 +668,21 @@ func (rc *RedisClient) loadSpoolGuard() spoolGuardFunc {
 	return nil
 }
 
+// subscriptionEventIsEcho reports that a create/update event very likely
+// carries this client's own write back: the test the attr push uses
+// (keyspace_attr.go reconcileFileAttrs), because juicemount:metadata has no
+// origin field. A path with a pending local write is ours until the drain
+// publishes; a drain's echo arrives after the row already holds the size and
+// mtime the drain published. The event's mtime has whole seconds, so a peer's
+// same-size save within the same second as the row also looks like an echo;
+// the attr push compares nanoseconds and still reports that one.
+func subscriptionEventIsEcho(evt MetadataEvent, existing *Entry, guard spoolGuardFunc) bool {
+	if guard != nil && guard(evt.Path) {
+		return true
+	}
+	return existing.Inode == evt.Inode && existing.Size == evt.Size && existing.Mtime.Unix() == evt.Mtime
+}
+
 // SetReconcileInterval overrides the periodic reconcile cadence (LB-4:
 // the app's "Reconcile interval" preference, previously a placebo). Same
 // contract as SetPathConfig. It may be called before or after Start;
@@ -1918,6 +1933,11 @@ func (rc *RedisClient) applyEventFromSubscription(evt MetadataEvent, generation 
 		// Byte-cache identity changes even when path + inode do not. Fire before
 		// replacing the mirror row so the consumer can resolve the old inode's
 		// cached JuiceFS slice mapping. Spurious self-echo invalidation is safe.
+		// A teammate's change (not our echo) first, while the consumer still
+		// holds the file's pooled descriptor.
+		if existing != nil && !existing.IsDir && !evt.IsDir && !subscriptionEventIsEcho(evt, existing, rc.loadSpoolGuard()) {
+			rc.store.NotifyContentChanged(evt.Path, existing.Inode)
+		}
 		rc.store.NotifyContentInvalidated(evt.Path, evt.IsDir)
 		if existing != nil && !evt.IsDir && evt.Size < existing.Size {
 			rc.reconcileShrunkEntry(evt, existing.Size)

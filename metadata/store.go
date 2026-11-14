@@ -305,6 +305,9 @@ type Store struct {
 	// Store locks; this hook must not call back into Store.
 	onScanContentInvalidated func(path string, oldInode uint64)
 	onContentReset           func()
+	// onContentChanged fires only for a juicemount:metadata create/update that
+	// changes an existing file (not this client's own echo). Guarded by mu.
+	onContentChanged func(path string, oldInode uint64)
 
 	// ftsInitialized is set once the external-content FTS has been built (the
 	// first BulkInsert / initial sync). After that EVERY BulkInsert maintains
@@ -806,6 +809,30 @@ func (s *Store) NotifyContentInvalidated(p string, isDir bool) {
 	s.mu.RUnlock()
 	if fn != nil {
 		fn(p, isDir)
+	}
+}
+
+// SetOnContentChanged registers the hook for a juicemount:metadata
+// create/update that changes an existing file row. Unlike the content
+// invalidation hook it skips this client's own echoes (see
+// RedisClient.applyEvent), so a consumer may do work there that an echo of
+// every drain must not cost (the NFS layer's peer-edit refresh).
+func (s *Store) SetOnContentChanged(fn func(path string, oldInode uint64)) {
+	s.mu.Lock()
+	s.onContentChanged = fn
+	s.mu.Unlock()
+}
+
+// NotifyContentChanged invokes the content-changed hook outside s.mu.
+func (s *Store) NotifyContentChanged(p string, oldInode uint64) {
+	if p == "" || oldInode == 0 {
+		return
+	}
+	s.mu.RLock()
+	fn := s.onContentChanged
+	s.mu.RUnlock()
+	if fn != nil {
+		fn(p, oldInode)
 	}
 }
 

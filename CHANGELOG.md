@@ -4,6 +4,52 @@
 
 ### App
 
+- A teammate's save now reaches a Mac that is playing or has already read the
+  file. The laptop run of 2026-11-14 (on #94) found five Mac-side gaps:
+  - **The open file kept its old bytes (P1).** macFUSE gives every open
+    descriptor of a file one JuiceFS handle, so #94's reopen of the pooled
+    descriptor never reached JuiceFS while the file was read (12 of 12 lan
+    trials). The app now sends the bundled JuiceFS a new control message
+    (patch 0031, `JMRefreshInode`, `-jm16`) when its mirror learns of the
+    edit. JuiceFS drops that file's slice list and its read buffers for the
+    descriptors already open, reads the new length, and sends the kernel a
+    notify for the whole file (attributes and pages). The reply says whether
+    the kernel accepted the notify; whether macFUSE then drops its pages
+    needs the laptop. It costs one metadata round trip per edit of another
+    client, in the background, and only for files the app has opened in the
+    last 5 minutes; this client's own saves, which come back on the same
+    feed, cost nothing. Reads cost nothing more.
+    JuiceFS's own open of a changed file on macOS now also purges the
+    kernel's pages (`FOPEN_PURGE_UBC`): a re-pin read 48 MiB of old pages
+    before.
+  - **Old bytes under the new date stayed on the Mac for good (P2).** For up
+    to 2.2 s the app answered READs with the old bytes and the new mtime, and
+    the Mac kept them (20 of 24 trials still old at 30 s). A READ now waits
+    for the pending refresh of its file before it reads, so a reply with the
+    new mtime always carries the new bytes. If the refresh takes longer than
+    5 s (8 s on a far link), fails, or the kernel did not accept its notify,
+    the READ answers JUKEBOX and the Mac's retry sends the refresh again;
+    after 3 failed refreshes of one edit, READs go on.
+  - **Appends were invisible for up to an hour (P3).** The Mac sends no
+    GETATTR when it opens a file whose attributes are younger than
+    `acregmin`. The file attribute window is now 1–3 s (was 3600 s), like the
+    folder window; each GETATTR is answered from RAM over loopback (about
+    4 µs of server work). `JM_NFS_ACREG=3600,3600` restores the old window.
+  - **A save froze playback for 4 s (P4).** A READ from the verified local
+    cache that a teammate's save overtook answered JUKEBOX, and the Mac
+    retries only after 4 s (9 of 24 trials). An in-place update or append
+    now falls through to the live read; a shorter or replaced file still
+    refuses.
+  - **A teammate's edit un-pinned a pinned file for good (P5).** After an
+    append the pin kept its old size and every re-pin refused the file; the
+    pin now takes the file's current size. After an in-place edit the re-pin
+    read stale kernel pages and its check refused it; the open now purges
+    them (P1).
+  Linux remote lab (`peer-edit-lab.sh`, new `pair` case; P1–P3 cannot show
+  on Linux, where every open reaches JuiceFS): after a peer's edit, JUKEBOX
+  replies abroad went from 3 to 0. Of the 5,600 READ replies that carried the
+  new mtime, none carried old bytes. lan bounds are 0.21–0.22 s, and a read of an unchanged
+  file costs the same. The Mac-only parts need the laptop run.
 - A clip that was playing when the network went away plays again a second or
   two after the network returns. Before, after a longer outage (3 minutes on
   the laptop run of 2026-11-14), every read of that clip returned an
@@ -51,10 +97,9 @@
   guard within its next pass (1 min). The server's Redis must publish
   string-class keyspace events (`KEA`, as `server/redis.conf` ships, or add
   `$` to `Kghx`); without them the app logs `metadata attr push: off`.
-  `JM_METADATA_ATTR_PUSH=0` turns the file feed off. For a measured Mac run,
-  `JM_NFS_ACREG="min,max"` (two whole seconds) shortens the Mac NFS client's file attribute
-  cache (default unchanged, 3600 s), which bounds how long a file the Mac
-  itself keeps open can show the old size.
+  `JM_METADATA_ATTR_PUSH=0` turns the file feed off. `JM_NFS_ACREG="min,max"`
+  (two whole seconds) sets the Mac NFS client's file attribute cache (its
+  default is now 1–3 s, see above).
 - A playing or copying file now recovers within about half a minute after
   the Mac changes networks (Wi-Fi to another Wi-Fi or to a hotspot). Before,
   the read froze for up to two minutes after the new network was up. The

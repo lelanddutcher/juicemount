@@ -547,6 +547,9 @@ func (v *VFS) handleInternalMsg(ctx meta.Context, cmd uint32, r *utils.Buffer, o
 	case meta.JMLinkPolicy:
 		// JuiceMount patch 0027 (jm_link_policy.go).
 		v.jmLinkPolicyMsg(r, out)
+	case meta.JMRefreshInode:
+		// JuiceMount patch 0031 (jm_refresh.go).
+		v.jmRefreshMsg(ctx, r, out)
 	case meta.JMReleaseInodes:
 		// JuiceMount patch 0022. Reply: errno (1 byte), released count (4).
 		first := Ino(r.Get64())

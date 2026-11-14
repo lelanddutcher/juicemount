@@ -46,6 +46,9 @@ type JuiceMountHandler struct {
 	demandStopping bool
 	demandDone     chan struct{}
 	fdPool         *FDPool
+	// contentRefresh makes juicefs drop its caches of a file another client
+	// changed, and holds READs of that file until it has (content_refresh.go).
+	contentRefresh *contentRefresher
 	readahead      *ReadaheadManager
 	memBuf         *MemoryBuffer
 	redisClient    atomic.Pointer[metadata.RedisClient] // for publishing events
@@ -970,6 +973,7 @@ func NewHandler(store *metadata.Store, fusePath string, opts ...HandlerOption) *
 	}
 	h.readahead.refuseFUSEContentReads = h.testRefuseFUSEContentReads
 	h.readahead.previewRun = h.runNativePreview
+	h.contentRefresh = newContentRefresher(h.refreshContentNow)
 	h.readahead.mappingCapture = h.captureReadaheadMapping
 	h.memBuf.refuseFUSEContentReads = h.testRefuseFUSEContentReads
 	// Subtree-rename → pooled-fd invalidation (serving-path integrity).
@@ -994,6 +998,10 @@ func NewHandler(store *metadata.Store, fusePath string, opts ...HandlerOption) *
 		// READ descriptor (never the write slot). Full reconcile uses the
 		// coarse reset to cover missed push events.
 		store.SetOnContentInvalidated(h.onContentInvalidated)
+		// A teammate's change of a file (never our own echo) also refreshes
+		// what juicefs and the kernel hold for it (P1, content_refresh.go).
+		// The store fires it before the content hook drops the descriptor.
+		store.SetOnContentChanged(h.refreshContent)
 		store.SetOnScanContentInvalidated(h.onScanContentInvalidated)
 		store.SetOnContentReset(h.onContentReset)
 		h.loadDirListingRecords()
@@ -1170,6 +1178,7 @@ func (h *JuiceMountHandler) onScanContentInvalidated(inMountPath string, oldInod
 	if cr := h.cacheReader.Load(); cr != nil {
 		cr.InvalidateSliceCache(oldInode)
 	}
+	h.refreshContent(inMountPath, oldInode) // P1: before the descriptor is dropped
 	if h.fdPool != nil {
 		h.fdPool.InvalidateReadsDeferClose(path.Join(h.fusePath, inMountPath))
 	}
@@ -6416,6 +6425,14 @@ func (f *cachedFile) readAtUnprotectedTraced(p []byte, off int64, trace *cachedR
 // be called from anywhere else: every route below trusts that p does not reach
 // into a tracked in-place hole.
 func (f *cachedFile) readAtRouted(p []byte, off int64, trace *cachedReadTrace) (int, error) {
+	// P2 (laptop run 2026-11-14): no byte is read while a refresh of this
+	// file's juicefs caches is pending, so a reply that carries the new
+	// attributes never carries old bytes (content_refresh.go).
+	if f.handler != nil {
+		if err := f.handler.awaitContentRefresh(f.name); err != nil {
+			return 0, err
+		}
+	}
 	if f.pinGeneration != "" {
 		return f.readOwnedPinResident(p, off, trace)
 	}
@@ -6510,8 +6527,22 @@ func (f *cachedFile) readAtRouted(p []byte, off int64, trace *cachedReadTrace) (
 		}
 		f.startOverlappedOpen(off)
 		n, err := f.handler.readCacheBlockTraced(context.Background(), f.cacheReader, f.cacheIdentity, f.inode, off, p, mappingTimeout, trace)
-		if errors.Is(err, syscall.EAGAIN) {
+		if errors.Is(err, syscall.EAGAIN) && !f.changedUnderRead() {
 			return 0, err
+		}
+		if errors.Is(err, syscall.EAGAIN) {
+			// P4 (laptop run 2026-11-14): a teammate's save landed while this
+			// READ ran, so the verified copy no longer matches the file. The
+			// answer used to be JUKEBOX, and the Mac retries a JUKEBOX only
+			// after 4 s: playback froze for 4 s per save (9 of 24 trials).
+			// Read the live file through FUSE instead, after its refresh.
+			// The reply still carries the attributes the READ started with;
+			// the Mac drops these bytes when it sees the new mtime.
+			if err := f.handler.awaitContentRefresh(f.name); err != nil {
+				return 0, err
+			}
+			n, err = 0, nil
+			clear(p)
 		}
 		if errors.Is(err, cache.ErrVolumeBinding) {
 			// A positive identity refusal cannot authorize another backend read,

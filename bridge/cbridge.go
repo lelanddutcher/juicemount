@@ -4558,8 +4558,8 @@ func nfsMountOpts(port string) string {
 	// amplification); medium/fast keep 16. nfsReadahead() falls back to 16 if
 	// netprofile has no signal, so behavior is unchanged absent a classification.
 	ra := netprofile.Default().NFSReadahead()
-	// [B4' Fix B] actimeo=3600 → split attribute caching: acreg stays 3600
-	// (file attrs — unchanged behavior for the read/write paths), but acdir
+	// [B4' Fix B] actimeo=3600 → split attribute caching: acreg stayed 3600
+	// (file attrs; 1..3 s since the peer-edit change below), but acdir
 	// drops hard. With actimeo=3600 the client cached DIRECTORY attributes
 	// — and therefore its name cache, including NEGATIVE entries — for up to
 	// AN HOUR: one NoEnt answered during the ~3s keyspace-push window and
@@ -4583,15 +4583,22 @@ func nfsMountOpts(port string) string {
 	// now-present file. JM_NFS_LEGACY_ACTIMEO=1 restores actimeo=3600;
 	// JM_NFS_ACDIR="min,max" overrides the split values.
 	//
-	// [peer edits 2026-11-13] JM_NFS_ACREG="min,max" overrides the FILE
-	// attribute window, for a measured Mac run only; the default stays 3600.
-	// The server side now learns a peer's edit within about a second (the
-	// attr push, metadata/keyspace_attr.go), and the macOS client re-reads
-	// attrs on every open (close-to-open), but a file the Mac keeps open uses
-	// cached attrs, so its size and page cache stay old for up to acregmax.
-	// Every GETATTR is answered from the RAM mirror over loopback, as for
-	// folders, so a short window adds no WAN round trip.
-	acreg := "acregmin=3600,acregmax=3600"
+	// [peer edits 2026-11-14] The FILE attribute window is 1..3 s (it was
+	// 3600). The macOS client sends no GETATTR when it opens a file whose
+	// cached attributes are younger than acregmin, so with 3600 a teammate's
+	// append or re-export kept its old size and mtime on the Mac for up to an
+	// hour: for stat, for a new open and for an open file (laptop run
+	// 2026-11-14: 0 of 18 trials saw it within 30 s; with 1,3: 18 of 18 in
+	// 1.1-2.9 s on lan, 2.2-5.1 s abroad). It matches the folder window. The
+	// cost: an idle file sends nothing; a file in use is revalidated at most
+	// once per 1-3 s, and its READ replies carry attributes that reset the
+	// timer. Every GETATTR is answered from the RAM mirror over loopback
+	// (about 4 us of server work, no WAN round trip): 0.3-1.4 GETATTR/s
+	// measured on the laptop. The local-write check (extend: write, then
+	// fstat, stat, a new open) passed 20 of 20 with 1,3.
+	// JM_NFS_ACREG="min,max" overrides it (two whole seconds, min <= max);
+	// JM_NFS_ACREG=3600,3600 restores the old window.
+	acreg := "acregmin=1,acregmax=3"
 	if v := os.Getenv("JM_NFS_ACREG"); v != "" {
 		if lo, hi, ok := parseACRegWindow(v); ok {
 			acreg = "acregmin=" + strconv.Itoa(lo) + ",acregmax=" + strconv.Itoa(hi)
