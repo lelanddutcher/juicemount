@@ -223,7 +223,10 @@ const overlayBackJump = time.Hour
 // reported, so they are at most the highest). A true mtime far below is
 // reported as it is only if the inode's history does not hold it (review
 // M2: X, N, X).
-func nextReported(list []nfsReported, oldReported, m int64) int64 {
+//
+// own: this process wrote the change itself (review N6): its true mtime is
+// reported unless it was reported before.
+func nextReported(list []nfsReported, oldReported, m int64, own bool) int64 {
 	high := oldReported
 	seen := oldReported == m
 	for _, r := range list {
@@ -235,7 +238,7 @@ func nextReported(list []nfsReported, oldReported, m int64) int64 {
 	switch {
 	case m > high:
 		return m
-	case high-m > int64(overlayBackJump) && !seen:
+	case (own || high-m > int64(overlayBackJump)) && !seen:
 		return m
 	}
 	return high + 1
@@ -253,7 +256,27 @@ const nfsReportedSchema = `CREATE TABLE IF NOT EXISTS nfs_mtime_reported (
 // same mtimes as before it), after deleting those of inodes no longer in the
 // mirror (review M4: juicefs does not reuse inode numbers).
 func (s *Store) loadNFSOverlays() error {
+	// The first version's table (d6cb55f, lab builds only; review N7).
+	if _, err := s.db.Exec(`DROP TABLE IF EXISTS nfs_mtime_overlay`); err != nil {
+		return err
+	}
 	if _, err := s.db.Exec(`DELETE FROM nfs_mtime_reported WHERE inode NOT IN (SELECT inode FROM entries)`); err != nil {
+		return err
+	}
+	inodes, err := s.db.Query(`SELECT DISTINCT inode FROM nfs_mtime_reported`)
+	if err != nil {
+		return err
+	}
+	for inodes.Next() {
+		var inode int64
+		if err := inodes.Scan(&inode); err != nil {
+			inodes.Close()
+			return err
+		}
+		s.attrObs.noteSQL(uint64(inode))
+	}
+	inodes.Close()
+	if err := inodes.Err(); err != nil {
 		return err
 	}
 	rows, err := s.db.Query(`SELECT inode, true_ns, reported_ns FROM nfs_mtime_reported
@@ -491,7 +514,118 @@ type attrObservations struct {
 	mu  sync.Mutex
 	obs map[uint64]*attrObs
 	own map[uint64]time.Time
-	now func() time.Time // tests
+	// asIs: the values recently reported as they are, per inode (RAM only,
+	// review N3); idle ones go after attrObsIdle, and past attrObsMax the
+	// oldest tenth.
+	asIs map[uint64]*asIsValues
+	// sqlInodes: inodes with rows in nfs_mtime_reported (only those are
+	// read from SQLite).
+	sqlInodes map[uint64]struct{}
+	now       func() time.Time // tests
+}
+
+// asIsKeep bounds the values kept per inode in RAM.
+const asIsKeep = 4
+
+type asIsValues struct {
+	vals    [asIsKeep]int64
+	n, next int
+	touched time.Time
+}
+
+func (a *attrObservations) noteAsIs(inode uint64, v int64) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.asIs == nil {
+		a.asIs = make(map[uint64]*asIsValues)
+	}
+	now := a.clock()
+	x := a.asIs[inode]
+	if x == nil {
+		if len(a.asIs) >= attrObsMax {
+			a.evictAsIsLocked(now)
+		}
+		x = &asIsValues{}
+		a.asIs[inode] = x
+	}
+	x.touched = now
+	for i := 0; i < x.n; i++ {
+		if x.vals[i] == v {
+			return
+		}
+	}
+	x.vals[x.next] = v
+	x.next = (x.next + 1) % asIsKeep
+	if x.n < asIsKeep {
+		x.n++
+	}
+}
+
+func (a *attrObservations) evictAsIsLocked(now time.Time) {
+	for k, x := range a.asIs {
+		if now.Sub(x.touched) > attrObsIdle {
+			delete(a.asIs, k)
+		}
+	}
+	if len(a.asIs) < attrObsMax {
+		return
+	}
+	type kt struct {
+		k uint64
+		t time.Time
+	}
+	all := make([]kt, 0, len(a.asIs))
+	for k, x := range a.asIs {
+		all = append(all, kt{k, x.touched})
+	}
+	sort.Slice(all, func(i, j int) bool { return all[i].t.Before(all[j].t) })
+	for _, x := range all[:len(all)/10+1] {
+		delete(a.asIs, x.k)
+	}
+}
+
+// asIsOf is inode's recent values reported as they are.
+func (a *attrObservations) asIsOf(inode uint64) []nfsReported {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	x := a.asIs[inode]
+	if x == nil || a.clock().Sub(x.touched) > attrObsIdle {
+		return nil
+	}
+	out := make([]nfsReported, x.n)
+	for i := 0; i < x.n; i++ {
+		out[i] = nfsReported{trueNS: x.vals[i], reportedNS: x.vals[i]}
+	}
+	return out
+}
+
+func (a *attrObservations) hasSQL(inode uint64) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	_, ok := a.sqlInodes[inode]
+	return ok
+}
+
+func (a *attrObservations) noteSQL(inode uint64) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.sqlInodes == nil {
+		a.sqlInodes = make(map[uint64]struct{})
+	}
+	a.sqlInodes[inode] = struct{}{}
+}
+
+// spanHistory is what inode reported before: its rows in SQLite (only when
+// it has any) and its recent values reported as they are.
+func (s *Store) spanHistory(tx *sql.Tx, inode uint64) ([]nfsReported, error) {
+	var list []nfsReported
+	if s.attrObs.hasSQL(inode) {
+		var err error
+		if list, err = reportedHistory(tx, inode); err != nil {
+			return nil, err
+		}
+	}
+	return append(list, s.attrObs.asIsOf(inode)...), nil
 }
 
 func (a *attrObservations) clock() time.Time {
@@ -628,11 +762,16 @@ func (s *Store) NoteOwnWrite(path string) {
 	}
 }
 
-func (s *Store) noteOwnInode(inode uint64) {
-	if inode != 0 {
+// NoteOwnInode is NoteOwnWrite for an inode the mirror may not show yet
+// (an app's save through a temp file and a rename over the original: the
+// stage's inode, before the rename; review N1).
+func (s *Store) NoteOwnInode(inode uint64) {
+	if s != nil && inode != 0 {
 		s.attrObs.noteOwn(inode)
 	}
 }
+
+func (s *Store) noteOwnInode(inode uint64) { s.NoteOwnInode(inode) }
 
 func (s *Store) takeOwnChange(inode uint64) bool { return s.attrObs.takeOwn(inode) }
 
@@ -644,6 +783,7 @@ type attrSpan struct {
 	ctime      time.Time
 	sig        sliceSig
 	lateCommit bool
+	own        bool // this process's own change (a fresh own mark)
 }
 
 // spanPreimage is what bulkInsertBatchWithEpoch knew of a row before it.
@@ -682,7 +822,23 @@ func (s *Store) mtimeSpanUpdate(e *Entry, old spanPreimage, present bool, list [
 		// The same attributes: a baseline only where none exists for them.
 		return nil, obs, true
 	}
-	r := nextReported(list, old.reportedNS, m)
+	r := nextReported(list, old.reportedNS, m, sp.own)
+	high := old.reportedNS
+	for _, h := range list {
+		high = max64(high, h.reportedNS)
+	}
+	if r == m && m > high && !hasOverlay(s, e.Inode, m) {
+		// An ordinary change: above everything reported. Kept in RAM only
+		// (review N3: a value comes back within one save, seconds), with
+		// the value being left.
+		if old.mtimeNS >= 0 && old.mtimeNS != m {
+			s.attrObs.noteAsIs(e.Inode, old.reportedNS)
+		}
+		s.attrObs.noteAsIs(e.Inode, m)
+		return nil, obs, false
+	}
+	// A moved value or a pass-through below the highest: persisted, with
+	// the value being left, so neither is passed through again (review M2).
 	c := &overlayChange{inode: e.Inode}
 	if old.mtimeNS >= 0 && old.mtimeNS != m {
 		known := false
@@ -692,9 +848,6 @@ func (s *Store) mtimeSpanUpdate(e *Entry, old spanPreimage, present bool, list [
 			}
 		}
 		if !known {
-			// The value being left joins the history (it may have been
-			// published by a path that keeps none: an own write, the
-			// first load), so it is never passed through again (review M2).
 			c.rs = append(c.rs, nfsReported{trueNS: old.mtimeNS, reportedNS: old.reportedNS, owner: s})
 		}
 	}

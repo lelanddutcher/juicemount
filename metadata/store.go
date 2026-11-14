@@ -2266,7 +2266,7 @@ func (s *Store) bulkInsertBatchWithEpoch(batch []*Entry, incremental bool, expec
 			return StoreEpoch{}, err
 		}
 		if !e.IsDir && e.Inode != 0 {
-			history, err := reportedHistory(tx, e.Inode)
+			history, err := s.spanHistory(tx, e.Inode)
 			if err != nil {
 				return StoreEpoch{}, err
 			}
@@ -2275,6 +2275,7 @@ func (s *Store) bulkInsertBatchWithEpoch(batch []*Entry, incremental bool, expec
 				if err := change.write(tx); err != nil {
 					return StoreEpoch{}, err
 				}
+				s.attrObs.noteSQL(e.Inode)
 				overlays = append(overlays, *change)
 			}
 			observations = append(observations, spanObs{e.Inode, obs, keepNewer})

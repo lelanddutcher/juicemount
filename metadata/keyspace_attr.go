@@ -268,12 +268,15 @@ func (rc *RedisClient) reconcileFileAttrs(inodes []uint64, generation uint64) (r
 					continue
 				}
 				obs := attrObs{mtimeNS: mtime.UnixNano(), ctimeNS: ctime.UnixNano(), sig: sig}
+				// Any event consumes the own mark, so an unused one cannot
+				// absorb a later commit (review N4).
+				own := rc.store.takeOwnChange(e.Inode)
 				if sig.sameContent(prev.sig) {
 					// The same slices: a chmod, chown, rename or link.
 					rc.store.attrObs.putIf(e.Inode, obs, prev, have)
 					continue
 				}
-				if (!sig.known() || !prev.sig.known()) && rc.store.takeOwnChange(e.Inode) {
+				if (!sig.known() || !prev.sig.known()) && own {
 					// The signature cannot decide, and this process just
 					// changed the file itself: that one event is its echo
 					// (review H1 of the second review; the mark is consumed).
@@ -303,7 +306,9 @@ func (rc *RedisClient) reconcileFileAttrs(inodes []uint64, generation uint64) (r
 				MtimeNsecKnown: true,
 				Inode:          e.Inode,
 				Mode:           e.Mode,
-				span:           &attrSpan{sig: sig},
+				// This process's own save (a drain, a rename over the
+				// file) is reported with its true mtime (review N6).
+				span: &attrSpan{sig: sig, own: rc.store.takeOwnChange(e.Inode)},
 			}
 			if ctimeOK {
 				up.span.ctime = ctime

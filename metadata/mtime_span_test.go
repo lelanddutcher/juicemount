@@ -312,6 +312,97 @@ func TestOwnChmodMarkDoesNotHideALateCommit(t *testing.T) {
 	}
 }
 
+// Third review N1: an app's save through a temp file renamed over the
+// original publishes the stage's inode with no observation. The drainer marks
+// the stage inode before the rename, so the echo (same mtime and size, the
+// rename's ctime) keeps the mtime the Mac wrote and runs no hooks.
+func TestOwnReplacementEchoKeepsTheMtime(t *testing.T) {
+	l := newSpanLab(t)
+	s := time.Unix(1700000300, 123456789)
+	row := l.store.LookupByPath("media.mov")
+	e := MakeEntry("media.mov", false, 9000, s, 42)
+	e.Mode, e.MtimeNsecKnown = row.Mode, true
+	l.store.NoteOwnInode(42)                  // replacement_publish.go, before backend.Rename
+	if err := l.store.Insert(e); err != nil { // the settlement
+		t.Fatal(err)
+	}
+	l.store.attrObs.mu.Lock()
+	delete(l.store.attrObs.obs, 42) // the stage inode was never observed
+	l.store.attrObs.mu.Unlock()
+	before := l.hooks()
+	l.setSig(s, s.Add(time.Second), 9000, unknownSig)
+	l.push()
+	if got := l.reported(); !got.Equal(s) || l.hooks() != before {
+		t.Fatalf("own replacement echo: NFS mtime %v (want %v), hooks %d -> %d", got, s, before, l.hooks())
+	}
+}
+
+// Third review N2 (probe Q2): after a restart nothing is recorded, so the
+// Mac's own rename (marked before the FUSE rename) must not move the mtime.
+func TestOwnRenameAfterARestartKeepsTheMtime(t *testing.T) {
+	l := newSpanLab(t)
+	m := time.Unix(1700000100, 25)
+	l.set(m, m.Add(time.Second), 8192, 2)
+	l.push()
+	if err := l.store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	close(l.rc.stopCh)
+	l.rc.stopCh = make(chan struct{})
+	l.open()
+	l.store.NoteOwnWrite("media.mov") // nfs rename, before os.Rename
+	l.set(m, m.Add(2*time.Second), 8192, 2)
+	l.push()
+	if got := l.reported(); !got.Equal(m) || l.hooks() != 0 {
+		t.Fatalf("own rename after a restart: NFS mtime %v hooks %d", got, l.hooks())
+	}
+}
+
+// Third review N4 (probe Q1): an own mark whose echo the signature already
+// decided is consumed, so a teammate's commit read without a signature
+// within the window still counts.
+func TestUsedOwnMarkDoesNotAbsorbALaterCommit(t *testing.T) {
+	l := newSpanLab(t)
+	m := time.Unix(1700000100, 25)
+	l.set(m, m.Add(time.Second), 8192, 2)
+	l.push()
+	before := l.hooks()
+	l.store.NoteOwnAttrChange("media.mov")
+	l.set(m, m.Add(2*time.Second), 8192, 2) // the chmod's echo: same slices
+	l.push()
+	l.setSig(m, m.Add(3*time.Second), 8192, unknownSig) // a commit, no signature read
+	l.push()
+	if got := l.reported(); got.Equal(m) || l.hooks() != before+1 {
+		t.Fatalf("commit after a used mark: NFS mtime %v hooks %d -> %d", got, before, l.hooks())
+	}
+}
+
+// Third review N3: an ordinary change (above everything reported) writes no
+// history row; a moved value does.
+func TestOrdinaryChangeWritesNoHistory(t *testing.T) {
+	l := newSpanLab(t)
+	rows := func() int {
+		var n int
+		if err := l.store.db.QueryRow(`SELECT COUNT(*) FROM nfs_mtime_reported`).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	m := time.Unix(1700000100, 25)
+	l.set(m, m.Add(time.Second), 8192, 2)
+	l.push()
+	l.set(m.Add(time.Second), m.Add(2*time.Second), 8192, 3)
+	l.push()
+	if n := rows(); n != 0 {
+		t.Fatalf("ordinary changes wrote %d history rows", n)
+	}
+	l.set(m.Add(time.Second), m.Add(3*time.Second), 8192, 4) // a late commit
+	l.push()
+	if n := rows(); n == 0 {
+		t.Fatal("a moved value wrote no history row")
+	}
+}
+
 // Second review H2 (probe P2): a commit and a compaction can leave the slice
 // count unchanged. The last slice of the committed chunk changed, so it is a
 // late commit.

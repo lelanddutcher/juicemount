@@ -524,6 +524,9 @@ func (d *Drainer) publishReplacementOwned(ctx context.Context, rowID int64, fact
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+		// The rename's echo is this client's own save, under the stage's
+		// inode (metadata/mtime_span.go; review N1 of #99).
+		d.spool.meta.Owner().NoteOwnInode(recorded.Stage.Inode)
 		renameErr := backend.Rename(recorded.Stage.Name, recorded.Destination.Name)
 		observed, err = client.replacementRead(ctx, recorded.Stage.Inode)
 		if err != nil || observed == nil || observed.Phase != "committed" || !sameReplacementEvidence(recorded, *observed, false) {

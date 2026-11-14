@@ -103,8 +103,9 @@
   for the file. That reported mtime never repeats a value: not when JuiceFS
   steps the mtime back during a save, not when an old date comes back, not
   after a restart, not for a row read back from SQLite (the new table
-  `nfs_mtime_reported`, at most 8 rows per file, pruned of deleted files at
-  open). The shown date (seconds) stays, and the true mtime stays in the
+  `nfs_mtime_reported` keeps moved values, at most 8 per file, pruned of
+  deleted files at open; an ordinary change writes no row). The Mac's own
+  saves, renames and chmods keep their true mtime. The shown date (seconds) stays, and the true mtime stays in the
   mirror for every check against JuiceFS. Linux remote lab (`playedit`
   abroad, the peer dates each save before its close; first version of this
   change): READ replies whose old bytes the Mac would keep under the final
