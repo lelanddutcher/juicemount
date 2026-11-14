@@ -226,4 +226,18 @@ func (p *OwnedPinProvider) PinIdentity(e pin.Entry) (uint64, pin.ExpectedFile, b
 	return w.Inode, pin.ExpectedFile{Inode: id.Inode, Size: id.Size, MtimeNS: id.MtimeNS}, true
 }
 
+// CurrentSize is the file's size in the local mirror now (pin.CurrentSizer).
+func (p *OwnedPinProvider) CurrentSize(e pin.Entry) (int64, bool) {
+	name, ok := p.inMount(e.Path)
+	if !ok {
+		return 0, false
+	}
+	id, found := p.h.store.LookupCachedFileIdentity(name)
+	if !found {
+		return 0, false
+	}
+	return id.Size, true
+}
+
 var _ pin.BlockPinner = (*JFSBlockPinner)(nil)
+var _ pin.CurrentSizer = (*OwnedPinProvider)(nil)

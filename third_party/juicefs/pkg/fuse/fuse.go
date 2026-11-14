@@ -256,6 +256,13 @@ func (fs *fileSystem) Open(cancel <-chan struct{}, in *fuse.OpenIn, out *fuse.Op
 		out.OpenFlags |= fuse.FOPEN_KEEP_CACHE
 	} else {
 		if runtime.GOOS == "darwin" {
+			// JuiceMount patch 0031: macFUSE ignores a missing KEEP_CACHE and
+			// keeps the file's pages; the notify below is asynchronous (it
+			// would deadlock inside this OPEN), so a read right after the
+			// open was served stale pages (laptop pin run 2026-11-14: 48 MiB,
+			// zero reads reached juicefs). macFUSE's own open flags purge the
+			// pages and attributes before the open returns.
+			out.OpenFlags |= jmDarwinPurgeOnOpen
 			go fsserv.InodeNotify(uint64(in.NodeId), -1, 0)
 		} else {
 			fsserv.InodeNotify(uint64(in.NodeId), -1, 0)
@@ -538,6 +545,12 @@ func Serve(v *vfs.VFS, options string, xattrs, ioctl bool) error {
 	}
 
 	fsserv = fssrv
+	// JuiceMount patch 0031: the JMRefreshInode message drops the kernel's
+	// pages of an inode another client changed (pkg/vfs/jm_refresh.go). It
+	// runs outside any FUSE request, so the notify can be synchronous.
+	vfs.JMSetInodeInvalidator(func(ino Ino) syscall.Errno {
+		return syscall.Errno(fssrv.InodeNotify(uint64(ino), -1, 0))
+	})
 	fssrv.Serve()
 	return nil
 }

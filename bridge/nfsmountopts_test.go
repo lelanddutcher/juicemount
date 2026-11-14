@@ -70,12 +70,21 @@ func hasOpt(opts, want string) bool {
 	return false
 }
 
-// JM_NFS_ACREG is an opt-in for a measured Mac run (peer edits): it sets only
-// the file attribute window and keeps the folder window; unset keeps 3600.
+// The file attribute window is 1..3 s by default (peer edits, laptop run
+// 2026-11-14: the macOS client sends no GETATTR on open, so 3600 hid a
+// teammate's append for up to an hour). JM_NFS_ACREG overrides only the file
+// window and keeps the folder window.
 func TestNFSMountOptsFileAttrWindow(t *testing.T) {
 	t.Setenv("JM_NFS_ACREG", "")
+	t.Setenv("JM_NFS_ACDIR", "")
+	t.Setenv("JM_NFS_LEGACY_ACTIMEO", "")
+	if opts := nfsMountOpts("12049"); !hasOpt(opts, "acregmin=1") || !hasOpt(opts, "acregmax=3") ||
+		!hasOpt(opts, "acdirmin=1") || !hasOpt(opts, "acdirmax=2") {
+		t.Fatalf("default attribute windows changed: %s", opts)
+	}
+	t.Setenv("JM_NFS_ACREG", "3600,3600")
 	if opts := nfsMountOpts("12049"); !hasOpt(opts, "acregmin=3600") || !hasOpt(opts, "acregmax=3600") {
-		t.Fatalf("default file window changed: %s", opts)
+		t.Fatalf("the old window cannot be restored: %s", opts)
 	}
 	t.Setenv("JM_NFS_ACREG", "1,3")
 	t.Setenv("JM_NFS_ACDIR", "2,4")
@@ -94,12 +103,12 @@ func TestNFSMountOptsRejectsBadFileAttrWindow(t *testing.T) {
 	for _, bad := range []string{"1", "1,2,3", "a,b", "1,x", "-1,2", "5,1", "1,2,soft", "1.5,3", " , "} {
 		t.Setenv("JM_NFS_ACREG", bad)
 		opts := nfsMountOpts("12049")
-		if !hasOpt(opts, "acregmin=3600") || !hasOpt(opts, "acregmax=3600") || strings.Count(opts, "acreg") != 2 || hasOpt(opts, "soft") {
+		if !hasOpt(opts, "acregmin=1") || !hasOpt(opts, "acregmax=3") || strings.Count(opts, "acreg") != 2 || hasOpt(opts, "soft") {
 			t.Errorf("JM_NFS_ACREG=%q changed the options: %s", bad, opts)
 		}
 	}
-	t.Setenv("JM_NFS_ACREG", " 1 , 3 ")
-	if opts := nfsMountOpts("12049"); !hasOpt(opts, "acregmin=1") || !hasOpt(opts, "acregmax=3") {
+	t.Setenv("JM_NFS_ACREG", " 2 , 5 ")
+	if opts := nfsMountOpts("12049"); !hasOpt(opts, "acregmin=2") || !hasOpt(opts, "acregmax=5") {
 		t.Errorf("valid window with spaces refused: %s", opts)
 	}
 }

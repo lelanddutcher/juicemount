@@ -83,6 +83,14 @@ type OwnedAuthorityProvider interface {
 	DiscardReady(Entry)                        // exact-generation cleanup after rejected restore
 }
 
+// CurrentSizer is an optional part of an OwnedAuthorityProvider: the file's
+// size as the local mirror shows it now (no server access). A pin attempt
+// adopts it before it captures the file, so a teammate's append re-pins the
+// new version instead of failing on the size the pin row recorded.
+type CurrentSizer interface {
+	CurrentSize(Entry) (int64, bool)
+}
+
 type ExpectedFile struct {
 	Inode   uint64
 	Size    int64
@@ -655,6 +663,15 @@ func (p *Prefetcher) prefetch(e Entry) (retErr error) {
 		// must not convert "not attempted" into a failed pin.
 		_, _ = p.store.UpdateStatusForEntry(e, StatusPending, 0, "")
 		return testguard.ErrFUSEContentReadRefused
+	}
+	// P5: the row's size is from pin time; the file may have grown since
+	// (a teammate's append). Pin the file as it is now.
+	if cs, ok := p.provider.(CurrentSizer); ok && e.Status == StatusPrefetching {
+		if size, known := cs.CurrentSize(e); known && size != e.Size {
+			if adopted, ok, err := p.store.AdoptSize(e, size); err == nil && ok {
+				e = adopted
+			}
+		}
 	}
 	stats, statsErr := p.store.AggregateStats()
 	admissionErr := error(nil)

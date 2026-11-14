@@ -28,6 +28,7 @@ import (
 
 	nfsc "github.com/willscott/go-nfs-client/nfs"
 	"github.com/willscott/go-nfs-client/nfs/rpc"
+	"github.com/willscott/go-nfs-client/nfs/xdr"
 )
 
 const (
@@ -80,7 +81,7 @@ func fixture(args []string) error {
 		for _, f := range []struct {
 			name string
 			size int
-		}{{fmt.Sprintf("f%02d.bin", i), fileSize}, {fmt.Sprintf("a%02d.bin", i), smallSize}} {
+		}{{fmt.Sprintf("f%02d.bin", i), fileSize}, {fmt.Sprintf("a%02d.bin", i), smallSize}, {fmt.Sprintf("p%02d.bin", i), fileSize}} {
 			buf := make([]byte, f.size)
 			_, _ = rand.Read(buf)
 			if err := os.WriteFile(filepath.Join(*peer, *dir, f.name), buf, 0o666); err != nil {
@@ -88,7 +89,7 @@ func fixture(args []string) error {
 			}
 		}
 	}
-	emit(map[string]any{"step": "fixture", "dir": *dir, "files": *n * 2})
+	emit(map[string]any{"step": "fixture", "dir": *dir, "files": *n * 3})
 	return nil
 }
 
@@ -101,6 +102,7 @@ type probe struct {
 	poll    time.Duration
 	timeout time.Duration
 	jukebox int // NFS3ERR_JUKEBOX replies retried
+	auth    rpc.Auth
 }
 
 // read sends one READ. On NFS3ERR_JUKEBOX ("try later", which jm5 returns on
@@ -126,6 +128,58 @@ func (p *probe) read(off int64, n int) ([]byte, time.Duration, error) {
 }
 
 func (p *probe) attr() (*nfsc.Fattr, error) { return p.v.GetAttr(p.fh) }
+
+// readPair sends one raw READ and returns the attributes its reply carries
+// with its bytes: what the macOS client caches the bytes under (bug P2,
+// laptop run 2026-11-14). JUKEBOX (10008) is retried after 1 s and counted.
+func (p *probe) readPair(off uint64, n uint32) (nfsc.NFS3Time, uint64, []byte, error) {
+	type readArgs struct {
+		rpc.Header
+		FH     []byte
+		Offset uint64
+		Count  uint32
+	}
+	type readRes struct {
+		Attr  nfsc.PostOpAttr
+		Count uint32
+		EOF   uint32
+		Data  struct{ Length uint32 }
+	}
+	for try := 0; ; try++ {
+		r, err := p.v.Call(&readArgs{
+			Header: rpc.Header{Rpcvers: 2, Prog: nfsc.Nfs3Prog, Vers: nfsc.Nfs3Vers, Proc: nfsc.NFSProc3Read,
+				Cred: p.auth, Verf: rpc.AuthNull},
+			FH: p.fh, Offset: off, Count: n,
+		})
+		if err != nil {
+			return nfsc.NFS3Time{}, 0, nil, err
+		}
+		status, err := xdr.ReadUint32(r)
+		if err != nil {
+			return nfsc.NFS3Time{}, 0, nil, err
+		}
+		if status == 10008 && try < 20 {
+			p.jukebox++
+			time.Sleep(time.Second)
+			continue
+		}
+		if status != 0 {
+			return nfsc.NFS3Time{}, 0, nil, fmt.Errorf("READ status %d", status)
+		}
+		var res readRes
+		if err := xdr.Read(r, &res); err != nil {
+			return nfsc.NFS3Time{}, 0, nil, err
+		}
+		buf := make([]byte, res.Data.Length)
+		if _, err := io.ReadFull(r, buf); err != nil {
+			return nfsc.NFS3Time{}, 0, nil, err
+		}
+		if !res.Attr.IsSet {
+			return nfsc.NFS3Time{}, 0, buf, errors.New("READ reply without attributes")
+		}
+		return res.Attr.Attr.Mtime, res.Attr.Attr.Filesize, buf, nil
+	}
+}
 
 // peerWrite writes tag at each offset through the peer mount and closes the
 // file. It returns when close() returned: the edit is committed.
@@ -185,7 +239,7 @@ func run(args []string) (err error) {
 	addr := fs.String("nfs", "127.0.0.1:21049", "jm5's NFS server")
 	export := fs.String("export", "", "export path from the jm5 log")
 	peer := fs.String("peer", "/jfs-peer", "the peer's juicefs mount")
-	kase := fs.String("case", "held", "held | fresh | append | append-held | steady")
+	kase := fs.String("case", "held", "held | fresh | append | append-held | steady | pair")
 	name := fs.String("file", "pe/f01.bin", "file, relative to the export root and the peer mount")
 	poll := fs.Duration("poll", 50*time.Millisecond, "poll interval")
 	timeout := fs.Duration("timeout", 30*time.Second, "give up after this long")
@@ -198,11 +252,12 @@ func run(args []string) (err error) {
 		return err
 	}
 	m := &nfsc.Mount{Client: c}
-	v, err := m.Mount(*export, rpc.NewAuthUnix("peerprobe", 0, 0).Auth())
+	auth := rpc.NewAuthUnix("peerprobe", 0, 0).Auth()
+	v, err := m.Mount(*export, auth)
 	if err != nil {
 		return fmt.Errorf("mount: %w", err)
 	}
-	p := &probe{v: v, name: *name, peer: *peer, poll: *poll, timeout: *timeout}
+	p := &probe{v: v, name: *name, peer: *peer, poll: *poll, timeout: *timeout, auth: auth}
 	_, p.fh, err = v.Lookup(*name)
 	if err != nil {
 		return fmt.Errorf("lookup: %w", err)
@@ -330,6 +385,78 @@ func run(args []string) (err error) {
 			return err
 		}
 		row["mtime_visible_s"], row["mtime_polls"] = md, mpolls
+		return nil
+
+	case "pair":
+		// P2 on the server side: a reader keeps sending READs at 0 of a held
+		// file (as playback does) while the peer writes its tag at 0 and
+		// 32 MiB. Every reply is the pair (mtime it carries, bytes). A reply
+		// with the new mtime and the old bytes is what the Mac keeps for good.
+		if _, _, err := p.read(0, tagLen); err != nil {
+			return err
+		}
+		if _, _, err := p.read(32*mib, tagLen); err != nil {
+			return err
+		}
+		time.Sleep(*settle)
+		type reply struct {
+			at       time.Time
+			mtime    nfsc.NFS3Time
+			tag, err bool
+		}
+		var replies []reply
+		stop := make(chan struct{})
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				m, _, b, err := p.readPair(0, tagLen)
+				replies = append(replies, reply{at: time.Now(), mtime: m, tag: bytes.Equal(b, tag), err: err != nil})
+				time.Sleep(10 * time.Millisecond)
+			}
+		}()
+		time.Sleep(200 * time.Millisecond)
+		t0, wt, err := p.peerWrite(tag, 0, 32*mib)
+		if err != nil {
+			close(stop)
+			<-done
+			return err
+		}
+		row["peer_write_s"] = wt
+		hold := time.Duration(float64(*timeout) * 0.2)
+		time.Sleep(min(max(3*time.Second, hold), *timeout))
+		close(stop)
+		<-done
+		first := replies[0].mtime
+		stale, newAttr, errs := 0, 0, 0
+		firstNewAttr, firstNewBytes := -1.0, -1.0
+		for _, r := range replies {
+			if r.err {
+				errs++
+				continue
+			}
+			isNew := r.mtime != first
+			if isNew {
+				newAttr++
+				if firstNewAttr < 0 {
+					firstNewAttr = secs(r.at.Sub(t0))
+				}
+				if !r.tag {
+					stale++
+				}
+			}
+			if r.tag && firstNewBytes < 0 {
+				firstNewBytes = secs(r.at.Sub(t0))
+			}
+		}
+		row["replies"], row["replies_new_mtime"], row["read_errors"] = len(replies), newAttr, errs
+		row["old_bytes_under_new_mtime"] = stale
+		row["first_new_mtime_s"], row["first_new_bytes_s"] = firstNewAttr, firstNewBytes
 		return nil
 
 	case "append", "append-held":

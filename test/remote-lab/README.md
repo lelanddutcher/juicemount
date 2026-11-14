@@ -495,7 +495,7 @@ and the flags are set back to `KEA` afterwards. Each session writes
 
 The lab shows the server side. A Mac adds its NFS client's attribute cache:
 it re-reads a file's attributes at each open, but for a file it keeps open it
-trusts them for up to `acregmax` (3600 s by default; `JM_NFS_ACREG` sets it).
+trusts them for up to `acregmax` (3 s by default since the 2026-11-14 peer-edit fix; `JM_NFS_ACREG` sets it).
 
 ## Addresses
 

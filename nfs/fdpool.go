@@ -98,8 +98,16 @@ type FDPool struct {
 	// closeFD closes a descriptor the invalidation paths dropped; nil means
 	// fd.Close. Tests set it to script a close that blocks (a busy daemon).
 	closeFD func(*os.File)
+	// touched is when each path last began a FUSE open through the pool
+	// (read or write slot). RecentlyOpened uses it to tell whether juicefs
+	// and the kernel may still hold an open handle of the path.
+	touched map[string]time.Time
 	stopCh  chan struct{}
 }
+
+// fdTouchWindow covers every way a pooled open can outlive its last use:
+// the idle close, the orphan grace and a deferred close, plus a margin.
+const fdTouchWindow = fdIdleTimeout + fdOrphanGrace + time.Minute
 
 // openRec is one in-flight open, registered under p.mu before the lock is
 // dropped for the syscall and retired under p.mu after it returns.
@@ -367,6 +375,10 @@ func (p *FDPool) GetWrite(path string, flag int, perm os.FileMode) (*os.File, er
 // record with endOpenLocked on every return path, error included.
 func (p *FDPool) beginOpenLocked(k fdKey) *openRec {
 	rec := &openRec{key: k}
+	if p.touched == nil {
+		p.touched = make(map[string]time.Time)
+	}
+	p.touched[k.path] = time.Now()
 	if p.openInFlight == nil {
 		p.openInFlight = make(map[*openRec]struct{})
 	}
@@ -540,6 +552,27 @@ func (p *FDPool) Invalidate(path string) (closed, marked int) {
 // write slot to be dropped.
 func (p *FDPool) InvalidateReads(path string) (closed, marked int) {
 	return p.invalidatePath(path, false)
+}
+
+// RecentlyOpened reports whether the pool holds an fd of path, or began an
+// open of it within fdTouchWindow. Only then can juicefs and the kernel hold
+// an open handle of the file that the pool's own reopen cannot refresh (on
+// macOS all descriptors of a file share one FUSE handle). A path the pool
+// has not touched is opened afresh by its next read.
+func (p *FDPool) RecentlyOpened(path string) bool {
+	if p == nil || path == "" {
+		return false
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if _, ok := p.entries[fdKey{path: path}]; ok {
+		return true
+	}
+	if _, ok := p.entries[fdKey{path: path, write: true}]; ok {
+		return true
+	}
+	at, ok := p.touched[path]
+	return ok && time.Since(at) <= fdTouchWindow
 }
 
 // InvalidateReadsDeferClose is InvalidateReads for a caller that holds
@@ -794,6 +827,11 @@ func (p *FDPool) evictLoop() {
 				}
 			}
 			p.orphans = keep
+			for path, at := range p.touched {
+				if now.Sub(at) > fdTouchWindow {
+					delete(p.touched, path)
+				}
+			}
 			// Unclaimed refcount debt (a displaced holder that never
 			// Released) is dropped on the same grace as the orphan fd it
 			// belongs to — past that window the fd is closed anyway, so
