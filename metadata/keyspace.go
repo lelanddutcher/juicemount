@@ -655,7 +655,16 @@ func (rc *RedisClient) runKeyspaceSubscribe() (established bool) {
 	pattern := "__keyspace@" + strconv.Itoa(db) + "__:d*"
 	prefix := "__keyspace@" + strconv.Itoa(db) + "__:" // strip to get the bare key (e.g. "d732093")
 
-	sub := rc.redisDB().PSubscribe(ctx, pattern)
+	// File attribute push (keyspace_attr.go): a peer's write to an existing
+	// file changes only its i{inode} key, never a d key. Subscribed on the same
+	// connection when the server publishes string-class events.
+	patterns := []string{pattern}
+	attrOn := AttrPushEnabled() && rc.ensureAttrNotify(ctx, flags)
+	if attrOn {
+		patterns = append(patterns, prefix+"i*")
+	}
+
+	sub := rc.redisDB().PSubscribe(ctx, patterns...)
 	defer sub.Close()
 
 	// Confirm the subscription is actually active before the gap-fill SCAN.
@@ -671,7 +680,7 @@ func (rc *RedisClient) runKeyspaceSubscribe() (established bool) {
 	}
 
 	rc.markKeyspaceConnected()
-	jmlog.Info("metadata keyspace push: subscribed", "pattern", pattern, "flags", flags, "class", currentLinkClass().String())
+	jmlog.Info("metadata keyspace push: subscribed", "pattern", pattern, "attr_push", attrOn, "flags", flags, "class", currentLinkClass().String())
 
 	// Start draining the subscription channel into the coalescer IMMEDIATELY —
 	// before the gap-fill SCAN — so events arriving during the (cellular: long)
@@ -680,6 +689,11 @@ func (rc *RedisClient) runKeyspaceSubscribe() (established bool) {
 	co := newInodeCoalescer(rc)
 	co.backendGeneration = generation
 	defer co.stop()
+	var attrCo *inodeCoalescer
+	if attrOn {
+		attrCo = rc.newAttrCoalescer(generation)
+		defer attrCo.stop()
+	}
 
 	// Wire reconcileDir's new-subtree discovery back into THIS coalescer (the
 	// B4' burst-ordering fix): a newly-discovered child dir is requeued so a
@@ -731,6 +745,17 @@ func (rc *RedisClient) runKeyspaceSubscribe() (established bool) {
 				if !ok {
 					// Channel closed -> subscription ended.
 					return
+				}
+				if attrCo != nil {
+					if inode, ok := parseFileInodeFromChannel(msg.Channel, prefix); ok {
+						if !rc.backendAdmitted(generation) {
+							return
+						}
+						rc.notePushEvent()
+						noteAttrPushDelivered()
+						attrCo.add(inode)
+						continue
+					}
 				}
 				inode, ok := parseDirInodeFromChannel(msg.Channel, prefix)
 				if !ok {
@@ -1005,6 +1030,19 @@ type inodeCoalescer struct {
 	batchStart time.Time
 	timer      *time.Timer
 	stopped    bool
+
+	// tuningFn and apply turn this into another feed's coalescer (the file
+	// attribute push, keyspace_attr.go). Nil means the directory feed:
+	// tuningForClass and reconcileDir per inode.
+	tuningFn func() coalescerTuning
+	apply    func(batch []uint64)
+}
+
+func (c *inodeCoalescer) tuning() coalescerTuning {
+	if c.tuningFn != nil {
+		return c.tuningFn()
+	}
+	return tuningForClass(currentLinkClass())
 }
 
 func newInodeCoalescer(rc *RedisClient) *inodeCoalescer {
@@ -1032,7 +1070,7 @@ func (c *inodeCoalescer) add(inode uint64) {
 		c.batchStart = time.Now()
 	}
 
-	tuning := tuningForClass(currentLinkClass())
+	tuning := c.tuning()
 	// Compute the next fire delay: min(debounce, remaining-until-maxWait).
 	delay := tuning.debounce
 	elapsed := time.Since(c.batchStart)
@@ -1067,9 +1105,17 @@ func (c *inodeCoalescer) flush() {
 	batch := c.dirty
 	c.dirty = make(map[uint64]struct{})
 	c.batchStart = time.Time{}
-	tuning := tuningForClass(currentLinkClass())
+	tuning := c.tuning()
 	c.mu.Unlock()
 
+	if c.apply != nil {
+		inodes := make([]uint64, 0, len(batch))
+		for inode := range batch {
+			inodes = append(inodes, inode)
+		}
+		c.apply(inodes)
+		return
+	}
 	if len(batch) > tuning.burstCeiling {
 		noteKeyspaceScanPromotion()
 		jmlog.Info("metadata keyspace push: burst over ceiling, promoting to full SCAN",

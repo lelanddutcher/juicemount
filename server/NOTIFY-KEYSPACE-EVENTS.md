@@ -21,24 +21,34 @@ changed `d{inode}` key. The client subscribes (`PSUBSCRIBE __keyspace@1__:d*`)
 and incrementally reconciles only the changed directories (one `HGETALL`
 each). The full SCAN demotes to a rare, class-gated backstop.
 
-## Recommended flag value: `Kghx`
+## Recommended flag value: `KEA` (or at least `Kghx$`)
 
 `notify-keyspace-events` is a set of single-character class flags:
 
 | Flag | Meaning | Why we want it |
 |------|---------|----------------|
-| `K`  | Keyspace channel family (`__keyspace@<db>__:<key>`) | We learn **which** `d{inode}` key changed from the channel name. **Required.** |
+| `K`  | Keyspace channel family (`__keyspace@<db>__:<key>`) | We learn **which** key changed from the channel name. **Required.** |
 | `g`  | Generic commands (`DEL`, `RENAME_FROM/TO`, `EXPIRE`) | Whole-dir delete/rename (`DEL d{inode}`, rmdir). |
 | `h`  | Hash commands (`HSET`, `HDEL`) | Child add/remove inside a dir hash — the common case. |
+| `$`  | String commands (`SET`) | A write to an existing file changes only its `i{inode}` attr key. The client subscribes to `__keyspace@1__:i*` too, so a teammate's append or overwrite reaches the mirror (size, mtime) and the open file within about a second. |
 | `x`  | Expired events | Near-zero cost; future-proofing. |
 
-**Deliberately omitted:**
+`server/redis.conf` ships `KEA` (all classes), which covers all of these.
 
-- `$` (string class) — would fire on every `i{inode}` attribute write,
-  multiplying volume for the pure-attr edits we deliberately do **not** watch
-  (in-place overwrite mutates only `i{inode}`; that staleness is accepted as
-  low-value for navigation and reconciled by the rare backstop SCAN).
-- `A` (all classes) — maximizes publish fan-out on a ~667k-key database.
+**History (2026-11-13):** this document used to recommend `Kghx` and omit `$`,
+accepting that an in-place overwrite stays stale until the rare backstop SCAN.
+The laptop run showed the cost: a peer's edit stayed invisible on the Mac for as
+long as the app held the file open (9+ minutes), and a peer's append never
+changed the size. Without `$` the client logs `metadata attr push: off` and,
+when it connects as an admin principal, adds `$` itself with `CONFIG SET`
+(the same self-heal as below; `JM_KEYSPACE_AUTOCONFIG=0` disables it).
+
+The client's sufficiency checks (so a partial config still falls back safely):
+
+```
+folders: contains('K') && (contains('A') || (contains('g') && contains('h')))
+files:   contains('K') && (contains('A') || contains('$'))
+```
 
 Add `E` (keyevent channel family) only if you want keyevent-channel
 observability → `KEghx`. The client does not require it.
@@ -51,7 +61,7 @@ sufficient := contains('K') && (contains('A') || (contains('g') && contains('h')
 
 ## DURABLE method (TrueNAS ix-app) — DO NOT use `CONFIG SET`
 
-`CONFIG SET notify-keyspace-events Kghx` is **non-durable** on this deployment:
+`CONFIG SET notify-keyspace-events KEA` is **non-durable** on this deployment:
 Redis is launched from CLI args with an empty `config_file`, so
 `CONFIG REWRITE` has nowhere to persist and the setting reverts on the next
 container restart.
@@ -69,7 +79,7 @@ manager/farm rendered-compose deploy pattern):
    ```
    redis-server --appendonly yes --appendfsync everysec \
      --maxmemory-policy noeviction --save 900 1 \
-     --notify-keyspace-events Kghx
+     --notify-keyspace-events KEA
    ```
 
 3. Recreate **only** the redis service (not the whole app).
@@ -77,7 +87,7 @@ manager/farm rendered-compose deploy pattern):
 4. Verify:
 
    ```
-   redis-cli -n 1 config get notify-keyspace-events     # -> "Kghx"
+   redis-cli -n 1 config get notify-keyspace-events     # -> "AKE" (Redis reorders the flags)
    redis-cli -n 1 psubscribe '__keyspace@1__:d*'        # then touch a file; watch events
    ```
 
@@ -86,8 +96,8 @@ manager/farm rendered-compose deploy pattern):
 | NAS `notify-keyspace-events` | `JM_METADATA_KEYSPACE_PUSH` | Client behavior |
 |---|---|---|
 | empty / insufficient | anything | DISABLED — classic 30s full-SCAN, no keyspace path |
-| sufficient (`Kghx`) | unset / `0` | DISABLED (kill switch off) — classic 30s SCAN |
-| sufficient (`Kghx`) | `1` | ENABLED — push carries deltas, SCAN demotes to rare backstop |
+| sufficient (`KEA`) | unset / `0` | DISABLED (kill switch off) — classic 30s SCAN |
+| sufficient (`KEA`) | `1` | ENABLED — push carries deltas, SCAN demotes to rare backstop |
 
 The client re-probes `CONFIG GET notify-keyspace-events` on every (re)connect,
 so a later NAS enablement is picked up without restarting the Mac app.

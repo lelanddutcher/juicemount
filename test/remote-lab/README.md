@@ -454,6 +454,49 @@ line up. `FO_TRACE=0` skips them.
 The lab cannot show what macOS adds: macFUSE (one read at a time per file,
 its own lookups before an open) and the macOS NFS client.
 
+## A teammate's edit (`experiments/peer-edit-lab.sh`)
+
+`experiments/peer-edit-lab.sh` times how long a peer's edit takes to become
+visible through the NFS layer. The peer is a second, separate juicefs client
+of the same volume, mounted at `/jfs-peer` in the client container (its own
+session, open-file cache and block cache). `peerprobe` (in the client) reads
+through jm5's NFS server, as the Mac does, and writes as the peer through
+`/jfs-peer`. Every delay is measured from the peer's `close()`.
+
+| Case | What it checks |
+|---|---|
+| `held` | jm5 has read the file (its FUSE descriptor is pooled); the peer writes 16 B at 0 and 32 MiB. READ until both show the peer's bytes; GETATTR until the mtime moves. |
+| `fresh` | the same edit on a file jm5 never read: only its mtime can be stale. |
+| `append`, `append-held` | the peer appends 1 MiB to an 8 MiB file (not read / held open). GETATTR until the size grows, READ until the new bytes arrive. |
+| `steady` | 200 reads of a held file with no edit: the cost per read. |
+
+```sh
+JMLAB_BBR=1 ./lab.sh up
+DRAIN_BIN=bin-after experiments/peer-edit-lab.sh build
+PE_TRIALS=3 DRAIN_BIN=bin-after experiments/peer-edit-lab.sh run abroad after
+```
+
+Around each case the script saves the reader juicefs's own counters
+(`/jfs/.stats`: metadata operations and object GETs; the peer has its own),
+and `lib/peersum.py` prints the delays and those counts per case.
+`PE_TIMEOUT` ends a poll (default 30 s); `PE_JM5_ENV` adds environment to jm5,
+for example `JM_METADATA_ATTR_PUSH=0` for the rollback; `PE_CASES` picks the
+cases. The probe retries `NFS3ERR_JUKEBOX` as a Mac does.
+
+jm5 logs in to the proxy as a kind-mac principal (`jmlab-mac`, added to the
+running proxy with a throwaway password kept in the git-ignored state folder),
+as an enrolled Mac does, so its subscriptions and attr reads pass the proxy's
+guard. The lab client's own mount and the peer stay admin.
+`PE_NOTIFY_FLAGS=Kghx` runs a session with the server's notify flags without
+string events: jm5's `CONFIG SET` to add `$` is refused for a Mac
+(`ADMIN_ONLY` in the proxy's `/stats`), jm5 logs `metadata attr push: off`,
+and the flags are set back to `KEA` afterwards. Each session writes
+`<label>.attrpush.txt` with jm5's attr-push lines.
+
+The lab shows the server side. A Mac adds its NFS client's attribute cache:
+it re-reads a file's attributes at each open, but for a file it keeps open it
+trusts them for up to `acregmax` (3600 s by default; `JM_NFS_ACREG` sets it).
+
 ## Addresses
 
 The lab uses `10.231.10.0/24` (nas) and `10.231.20.0/24` (remote). If those

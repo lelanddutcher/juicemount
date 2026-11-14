@@ -4582,10 +4582,27 @@ func nfsMountOpts(port string) string {
 	// loopback, RAM-served LOOKUP and prevents a pre-push miss from masking the
 	// now-present file. JM_NFS_LEGACY_ACTIMEO=1 restores actimeo=3600;
 	// JM_NFS_ACDIR="min,max" overrides the split values.
-	acOpts := "acregmin=3600,acregmax=3600,acdirmin=1,acdirmax=2"
+	//
+	// [peer edits 2026-11-13] JM_NFS_ACREG="min,max" overrides the FILE
+	// attribute window, for a measured Mac run only; the default stays 3600.
+	// The server side now learns a peer's edit within about a second (the
+	// attr push, metadata/keyspace_attr.go), and the macOS client re-reads
+	// attrs on every open (close-to-open), but a file the Mac keeps open uses
+	// cached attrs, so its size and page cache stay old for up to acregmax.
+	// Every GETATTR is answered from the RAM mirror over loopback, as for
+	// folders, so a short window adds no WAN round trip.
+	acreg := "acregmin=3600,acregmax=3600"
+	if v := os.Getenv("JM_NFS_ACREG"); v != "" {
+		if lo, hi, ok := parseACRegWindow(v); ok {
+			acreg = "acregmin=" + strconv.Itoa(lo) + ",acregmax=" + strconv.Itoa(hi)
+		} else {
+			jmlog.Warn("JM_NFS_ACREG ignored: want two whole seconds \"min,max\" with min <= max", "value", v)
+		}
+	}
+	acOpts := acreg + ",acdirmin=1,acdirmax=2"
 	if v := os.Getenv("JM_NFS_ACDIR"); v != "" {
 		if parts := strings.SplitN(v, ",", 2); len(parts) == 2 {
-			acOpts = "acregmin=3600,acregmax=3600,acdirmin=" + strings.TrimSpace(parts[0]) + ",acdirmax=" + strings.TrimSpace(parts[1])
+			acOpts = acreg + ",acdirmin=" + strings.TrimSpace(parts[0]) + ",acdirmax=" + strings.TrimSpace(parts[1])
 		}
 	}
 	if os.Getenv("JM_NFS_LEGACY_ACTIMEO") == "1" {
@@ -4606,6 +4623,24 @@ func nfsMountOpts(port string) string {
 	return fmt.Sprintf(
 		"port=%s,mountport=%s,hard,intr,timeo=400,retrans=2,mutejukebox,nonegnamecache,nolocks,locallocks,rsize=1048576,wsize=1048576,dsize=1048576,readahead=%d,%s,vers=3,tcp",
 		port, port, ra, acOpts)
+}
+
+// parseACRegWindow parses JM_NFS_ACREG: exactly two non-negative whole
+// numbers of seconds, "min,max", with min <= max. Anything else is refused,
+// so a typo can never inject another mount option into the string.
+func parseACRegWindow(v string) (lo, hi int, ok bool) {
+	parts := strings.Split(v, ",")
+	if len(parts) != 2 {
+		return 0, 0, false
+	}
+	var err error
+	if lo, err = strconv.Atoi(strings.TrimSpace(parts[0])); err != nil || lo < 0 {
+		return 0, 0, false
+	}
+	if hi, err = strconv.Atoi(strings.TrimSpace(parts[1])); err != nil || hi < lo {
+		return 0, 0, false
+	}
+	return lo, hi, true
 }
 
 // runProcessBounded starts a cleanup process and returns at the deadline even

@@ -989,9 +989,10 @@ func NewHandler(store *metadata.Store, fusePath string, opts ...HandlerOption) *
 		// the previous inode behind that name. Same hook idiom, same reason
 		// metadata/ can't do it itself.
 		store.SetOnPathInvalidated(h.onRemotePathInvalidated)
-		// Same-inode overwrites keep pooled FUSE descriptors valid but replace
-		// JuiceFS slice IDs, so byte-cache invalidation is a separate seam.
-		// Full reconcile uses the coarse reset to cover missed push events.
+		// Same-inode overwrites keep the path's identity but replace JuiceFS
+		// slice IDs: these hooks drop the byte caches and reopen the pooled
+		// READ descriptor (never the write slot). Full reconcile uses the
+		// coarse reset to cover missed push events.
 		store.SetOnContentInvalidated(h.onContentInvalidated)
 		store.SetOnScanContentInvalidated(h.onScanContentInvalidated)
 		store.SetOnContentReset(h.onContentReset)
@@ -1109,11 +1110,28 @@ func (h *JuiceMountHandler) onRemotePathInvalidated(inMountPath string, isDir bo
 	h.invalidatePooledReadFDs(inMountPath)
 }
 
-// onContentInvalidated drops derived byte caches while leaving pooled FUSE
-// descriptors alone. Metadata fires this BEFORE mutating the mirror, which
+// onContentInvalidated drops derived byte caches and, for a file, the pooled
+// READ descriptor. Metadata fires this BEFORE mutating the mirror, which
 // lets invalidateReadCaches resolve the previous inode for an overwrite,
 // delete, or rename destination. A directory replacement invalidates all slice
 // mappings conservatively because one event can cover an entire subtree.
+//
+// PEER EDITS (bug B1, laptop run 2026-11-13). An update keeps the path's
+// identity, so the pooled descriptor is not "stale" in the rename sense, but
+// its content is: juicefs keeps an open file's slice list until it sees a new
+// mtime, and the kernel keeps the open file's pages. Nothing on a held
+// descriptor makes it look again, so a teammate's edit stayed invisible for as
+// long as the app kept the file open (9+ minutes on the laptop). A reopen does
+// look again: juicefs reads the attr, drops the slices of a changed file and
+// tells the kernel to drop its pages. So the READ slot is reopened. The WRITE
+// slot is never touched here: this event may be our own write's echo (see
+// FDPool.InvalidateReads).
+//
+// The caller (RedisClient.applyEvent) holds its lifecycle and replacement
+// observation locks, and update events include our own drains' echoes. So the
+// descriptor's close, a FUSE call that can wait on a busy daemon, runs on its
+// own goroutine (review MEDIUM-2): a slow close must not stall event intake,
+// the attr batches or drain publication.
 func (h *JuiceMountHandler) onContentInvalidated(inMountPath string, isDir bool) {
 	if h == nil || inMountPath == "" {
 		return
@@ -1129,11 +1147,18 @@ func (h *JuiceMountHandler) onContentInvalidated(inMountPath string, isDir bool)
 		return
 	}
 	h.invalidateReadCaches(inMountPath)
+	if h.fdPool != nil {
+		h.fdPool.InvalidateReadsDeferClose(path.Join(h.fusePath, inMountPath))
+	}
 }
 
 // onScanContentInvalidated is called while Store holds its conditional
 // publication locks. It must not query Store: the supplied inode is an exact
-// pre-mutation RAM or SQL row.
+// pre-mutation RAM or SQL row. It fires for every file row a SCAN, a folder
+// reconcile or the file attribute push (metadata/keyspace_attr.go) changes, so
+// it also reopens the pooled READ descriptor (see onContentInvalidated). The
+// descriptor's close runs off this goroutine: it is a FUSE call and must not
+// hold the Store's locks.
 func (h *JuiceMountHandler) onScanContentInvalidated(inMountPath string, oldInode uint64) {
 	if h == nil || inMountPath == "" {
 		return
@@ -1144,6 +1169,9 @@ func (h *JuiceMountHandler) onScanContentInvalidated(inMountPath string, oldInod
 	}
 	if cr := h.cacheReader.Load(); cr != nil {
 		cr.InvalidateSliceCache(oldInode)
+	}
+	if h.fdPool != nil {
+		h.fdPool.InvalidateReadsDeferClose(path.Join(h.fusePath, inMountPath))
 	}
 }
 

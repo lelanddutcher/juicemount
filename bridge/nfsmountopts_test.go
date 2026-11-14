@@ -69,3 +69,37 @@ func hasOpt(opts, want string) bool {
 	}
 	return false
 }
+
+// JM_NFS_ACREG is an opt-in for a measured Mac run (peer edits): it sets only
+// the file attribute window and keeps the folder window; unset keeps 3600.
+func TestNFSMountOptsFileAttrWindow(t *testing.T) {
+	t.Setenv("JM_NFS_ACREG", "")
+	if opts := nfsMountOpts("12049"); !hasOpt(opts, "acregmin=3600") || !hasOpt(opts, "acregmax=3600") {
+		t.Fatalf("default file window changed: %s", opts)
+	}
+	t.Setenv("JM_NFS_ACREG", "1,3")
+	t.Setenv("JM_NFS_ACDIR", "2,4")
+	opts := nfsMountOpts("12049")
+	for _, o := range []string{"acregmin=1", "acregmax=3", "acdirmin=2", "acdirmax=4"} {
+		if !hasOpt(opts, o) {
+			t.Errorf("missing %s: %s", o, opts)
+		}
+	}
+}
+
+// Review LOW-6: JM_NFS_ACREG takes two whole seconds only. Anything else is
+// ignored (the default stays), so it can never smuggle in another option.
+func TestNFSMountOptsRejectsBadFileAttrWindow(t *testing.T) {
+	t.Setenv("JM_NFS_ACDIR", "")
+	for _, bad := range []string{"1", "1,2,3", "a,b", "1,x", "-1,2", "5,1", "1,2,soft", "1.5,3", " , "} {
+		t.Setenv("JM_NFS_ACREG", bad)
+		opts := nfsMountOpts("12049")
+		if !hasOpt(opts, "acregmin=3600") || !hasOpt(opts, "acregmax=3600") || strings.Count(opts, "acreg") != 2 || hasOpt(opts, "soft") {
+			t.Errorf("JM_NFS_ACREG=%q changed the options: %s", bad, opts)
+		}
+	}
+	t.Setenv("JM_NFS_ACREG", " 1 , 3 ")
+	if opts := nfsMountOpts("12049"); !hasOpt(opts, "acregmin=1") || !hasOpt(opts, "acregmax=3") {
+		t.Errorf("valid window with spaces refused: %s", opts)
+	}
+}

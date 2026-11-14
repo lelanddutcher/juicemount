@@ -95,7 +95,10 @@ type FDPool struct {
 	// openRead is the read-slot opener; nil means os.Open. Tests set it to
 	// script a slow or failing open.
 	openRead func(string) (*os.File, error)
-	stopCh   chan struct{}
+	// closeFD closes a descriptor the invalidation paths dropped; nil means
+	// fd.Close. Tests set it to script a close that blocks (a busy daemon).
+	closeFD func(*os.File)
+	stopCh  chan struct{}
 }
 
 // openRec is one in-flight open, registered under p.mu before the lock is
@@ -539,7 +542,20 @@ func (p *FDPool) InvalidateReads(path string) (closed, marked int) {
 	return p.invalidatePath(path, false)
 }
 
+// InvalidateReadsDeferClose is InvalidateReads for a caller that holds
+// another lock (the metadata Store's publication locks): the entry is
+// unmapped or marked stale before it returns, so no later Get is served it,
+// but the close (a FUSE FLUSH/RELEASE that can wait on a busy daemon) runs on
+// its own goroutine.
+func (p *FDPool) InvalidateReadsDeferClose(path string) (closed, marked int) {
+	return p.invalidatePathClose(path, false, true)
+}
+
 func (p *FDPool) invalidatePath(path string, includeWrite bool) (closed, marked int) {
+	return p.invalidatePathClose(path, includeWrite, false)
+}
+
+func (p *FDPool) invalidatePathClose(path string, includeWrite, deferClose bool) (closed, marked int) {
 	if p == nil || path == "" {
 		return 0, 0
 	}
@@ -568,10 +584,22 @@ func (p *FDPool) invalidatePath(path string, includeWrite bool) (closed, marked 
 		return k.path == path && (includeWrite || !k.write)
 	})
 	p.mu.Unlock()
-	for _, fd := range toClose {
+	if deferClose && len(toClose) > 0 {
+		go p.closeAll(toClose)
+		return closed, marked
+	}
+	p.closeAll(toClose)
+	return closed, marked
+}
+
+func (p *FDPool) closeAll(fds []*os.File) {
+	for _, fd := range fds {
+		if p.closeFD != nil {
+			p.closeFD(fd)
+			continue
+		}
 		fd.Close()
 	}
-	return closed, marked
 }
 
 // InvalidateTree drops the pooled slots for `root` AND for every pooled path
