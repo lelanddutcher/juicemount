@@ -1008,6 +1008,10 @@ func NewHandler(store *metadata.Store, fusePath string, opts ...HandlerOption) *
 		store.SetOnContentChanged(h.refreshContent)
 		store.SetOnScanContentInvalidated(h.onScanContentInvalidated)
 		store.SetOnContentReset(h.onContentReset)
+		// Background feeds (keyspace push, SCAN, pub/sub echo) skip a path a
+		// foreground mutation owns until it has published (laptop B1:
+		// metadata/foreground_owner.go).
+		store.SetForegroundOwner(h.namespace.ownsForBackground)
 		h.loadDirListingRecords()
 	}
 
@@ -3223,7 +3227,7 @@ func (jfs *juiceFS) Lstat(filename string) (os.FileInfo, error) {
 }
 
 func (jfs *juiceFS) ReadDir(dirname string) ([]os.FileInfo, error) {
-	if err := jfs.handler.namespace.servingError(dirname); err != nil {
+	if err := jfs.handler.namespace.listingError(dirname); err != nil {
 		return nil, err
 	}
 	if dirname == "" || dirname == "." || dirname == "/" {

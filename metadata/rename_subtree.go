@@ -130,6 +130,20 @@ func (s *Store) renameMirror(oldDir, newDir string, source, destination *MirrorT
 			if roots[i].present && roots[i].version != *expected {
 				return 0, ErrMirrorConflict
 			}
+			if i == 1 && expected.Incarnation == "" && s.ForegroundOwned(expected.Path) {
+				// An absent destination's token is the store-wide epoch, which
+				// any unrelated write moves. Abroad the backing rename takes
+				// about a second, and some other file's write lands in it
+				// nearly every time, so the rename failed after it had moved
+				// the file (laptop B1). The caller's namespace operation owns
+				// this name, so no foreground writer can create it and the
+				// background feeds skip it (foreground_owner.go). What must
+				// hold is the name itself: still absent, same store.
+				if err := validateAbsentOwned(tx, *expected); err != nil {
+					return 0, err
+				}
+				continue
+			}
 			if err := validateExpected(tx, *expected); err != nil {
 				return 0, err
 			}

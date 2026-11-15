@@ -221,5 +221,6 @@ cmd="${1:-}"; shift || true
 case "$cmd" in
   build) build ;;
   run) [ $# -eq 2 ] || die "usage: peer-edit-lab.sh run PROFILE LABEL"; run "$@" ;;
+  principal) mac_principal ;; # enroll the kind-mac principal only (own-save-lab.sh)
   *) sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac

@@ -1862,6 +1862,16 @@ func (rc *RedisClient) applyEventFromSubscription(evt MetadataEvent, generation 
 	if protected {
 		return
 	}
+	// A foreground NFS mutation owns the name: this is usually the echo of
+	// this client's previous WRITE or RENAME of it, and applying it now bumps
+	// the row under the running mutation, whose publication then fails
+	// (laptop B1, metadata/foreground_owner.go). The owner publishes the
+	// current state itself; a teammate's change reaches the mirror through the
+	// keyspace push, which retries owned paths.
+	if evt.Op != "reconcile" && (rc.store.ForegroundOwned(evt.Path) || rc.store.ForegroundOwned(evt.OldPath)) {
+		noteFeedEventDeferred()
+		return
+	}
 	// Classify mode from the event's type discriminators. IsSymlink takes
 	// precedence so a create/update/rename of a symlink keeps os.ModeSymlink
 	// (and never downgrades the locally-minted ModeSymlink cache Entry) instead
@@ -1960,11 +1970,13 @@ func (rc *RedisClient) applyEventFromSubscription(evt MetadataEvent, generation 
 			// only after observing the path in authoritative Redis metadata.
 			LocalOnly: existing != nil && existing.LocalOnly,
 		}
-		// In-memory cache first (instant, never blocked)
-		rc.store.InsertToCache(e)
-		// SQLite write (serialized by writeMu, no retry needed)
-		if err := rc.store.Insert(e); err != nil {
+		// RAM and SQLite as one writer-locked step that rechecks foreground
+		// ownership (an owner may have started since the check above).
+		if applied, err := rc.store.InsertFromFeed(e); err != nil {
 			log.Printf("subscribe apply create/update: %v", err)
+		} else if !applied {
+			noteFeedEventDeferred()
+			return
 		}
 		if evt.Op == "create" {
 			rc.store.NoteDirectoryChanged(path.Dir(evt.Path))
@@ -2039,9 +2051,11 @@ func (rc *RedisClient) applyEventFromSubscription(evt MetadataEvent, generation 
 			Inode:      evt.Inode,
 			Mode:       mode,
 		}
-		rc.store.InsertToCache(e)
-		if err := rc.store.Insert(e); err != nil {
+		if applied, err := rc.store.InsertFromFeed(e); err != nil {
 			log.Printf("subscribe apply rename: %v", err)
+		} else if !applied {
+			noteFeedEventDeferred()
+			return
 		}
 		rc.store.NoteDirectoryChanged(path.Dir(evt.Path))
 	}

@@ -1529,9 +1529,17 @@ func (rc *RedisClient) reconcileDirWithBackend(dirInode, generation uint64) erro
 		noteScanFilteredSkip("reconcileDir children", parentPath, skippedFiltered)
 	}
 
-	if err := rc.applyReconcileUpsertsWithToken(toUpsert, &token); err != nil {
+	owned, err := rc.applyReconcileUpsertsOwned(toUpsert, &token)
+	if err != nil {
 		rc.scheduleAttrRetryWithBackend(dirInode, token.backend)
 		return err
+	}
+	if len(owned) > 0 {
+		// A foreground mutation (a rename, a create) owns a child: its own
+		// publication lands first, then this folder is read again.
+		rc.scheduleAttrRetryWithBackend(dirInode, token.backend)
+		jmlog.Info("metadata keyspace push: reconcileDir deferred children owned by a local mutation",
+			"parent", parentPath, "owned", len(owned), "first", owned[0])
 	}
 
 	// B4' burst-ordering fix: requeue newly-discovered child dirs into the
@@ -1594,9 +1602,17 @@ func (rc *RedisClient) applyReconcileUpserts(entries []*Entry) error {
 }
 
 func (rc *RedisClient) applyReconcileUpsertsWithToken(entries []*Entry, token *scanBaselineToken) error {
+	_, err := rc.applyReconcileUpsertsOwned(entries, token)
+	return err
+}
+
+// applyReconcileUpsertsOwned also returns the paths the Store skipped because
+// a foreground mutation owned them (metadata/foreground_owner.go); the caller
+// schedules a retry for them.
+func (rc *RedisClient) applyReconcileUpsertsOwned(entries []*Entry, token *scanBaselineToken) (owned []string, err error) {
 	epoch, err := rc.store.CaptureStoreEpoch()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	token.store = epoch
 	for start := 0; start < len(entries); start += 500 {
@@ -1609,17 +1625,18 @@ func (rc *RedisClient) applyReconcileUpsertsWithToken(entries []*Entry, token *s
 			// Use the same transaction-level accepted-publication guard as a
 			// full SCAN. Preserve the keyspace byte-cache callback, but admit
 			// it only for entries this guarded transaction will publish.
-			next, err := rc.store.ReconcileUpsertBatch(chunk, token.store)
+			next, skipped, err := rc.store.ReconcileUpsertBatchOwned(chunk, token.store)
 			if err == nil {
 				token.store = next
+				owned = append(owned, skipped...)
 			}
 			return err
 		})
 		if err != nil {
-			return err
+			return owned, err
 		}
 	}
-	return nil
+	return owned, nil
 }
 
 // scopedPrune removes store children of parentPath that are absent from the

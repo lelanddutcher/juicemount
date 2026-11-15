@@ -37,6 +37,11 @@ func (s *Store) DeletePathsConditional(entries []*Entry) error {
 		if _, held := protected.paths[e.Path]; held {
 			return ErrMirrorConflict
 		}
+		// A foreground RENAME or REMOVE of this name publishes it itself;
+		// pruning first fails its CAS (foreground_owner.go). Retry later.
+		if s.ForegroundOwned(e.Path) {
+			return ErrForegroundOwned
+		}
 	}
 	for _, e := range entries {
 		if err := validateExpected(tx, e.Version); err != nil {
