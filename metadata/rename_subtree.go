@@ -166,7 +166,12 @@ func (s *Store) renameMirrorParent(oldDir, newDir string, source, destination, d
 						return 0, err
 					}
 				default:
-					if err := validateExpected(tx, *destinationParent); err != nil {
+					// The same folder row, not the same revision: background
+					// feeds rewrite a folder's row all the time (a parent
+					// refresh, a SCAN, a mkdir's local-only flag), and failing
+					// here after the backing rename blocks both names (review
+					// H1 of the second #100 review).
+					if err := validateSameIncarnation(tx, *destinationParent); err != nil {
 						return 0, err
 					}
 				}

@@ -154,19 +154,9 @@ func (q *ownedDeferralQueue) fire(rc *RedisClient) {
 	q.dirs, q.files = make(map[uint64]struct{}), make(map[uint64]struct{})
 	q.mu.Unlock()
 	for inode := range files {
-		// Its folder is read again anyway, and that read carries its attrs:
-		// one publication instead of two that race each other.
-		if e := rc.store.LookupByInode(inode); e != nil {
-			if p := path.Dir(e.Path); p == "." {
-				if _, ok := dirs[1]; ok {
-					continue
-				}
-			} else if pe := rc.store.LookupByPath(p); pe != nil {
-				if _, ok := dirs[pe.Inode]; ok {
-					continue
-				}
-			}
-		}
+		// The file's own attr read runs even when its folder is queued too:
+		// only that read honours the own-change mark of the Mac's own save
+		// (review M1 of the second #100 review; #99's late-commit check).
 		if attrFn != nil {
 			(*attrFn)(inode)
 			continue

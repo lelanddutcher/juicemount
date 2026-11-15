@@ -128,3 +128,19 @@ func validateAbsentOwned(tx *sql.Tx, expected MirrorToken) error {
 	}
 	return nil
 }
+
+// validateSameIncarnation holds when expected.Path still names the row it
+// named when observed (same incarnation), whatever its revision.
+func validateSameIncarnation(tx *sql.Tx, expected MirrorToken) error {
+	if expected.Incarnation == "" {
+		return ErrMirrorConflict
+	}
+	got, err := captureToken(tx, expected.Path)
+	if err != nil {
+		return err
+	}
+	if got.Incarnation != expected.Incarnation {
+		return ErrMirrorConflict
+	}
+	return nil
+}
