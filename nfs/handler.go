@@ -4869,9 +4869,17 @@ func (jfs *juiceFS) rename(oldpath, newpath string, op *namespaceOperation) erro
 			return err
 		}
 	}
-	var sourceToken, destinationToken metadata.MirrorToken
+	var sourceToken, destinationToken, destinationParentToken metadata.MirrorToken
 	if oldEntry != nil && !oldEntry.Version.IsZero() {
 		var err error
+		// The destination folder, observed before the backing rename: the
+		// publication holds it to this token (review M3 of #100). Captured
+		// first, so a change before CaptureRename is caught too.
+		if parent := path.Dir(newpath); parent != "." {
+			if destinationParentToken, err = jfs.handler.store.CaptureMirror(parent); err != nil {
+				return err
+			}
+		}
 		sourceToken, destinationToken, err = jfs.handler.store.CaptureRename(oldpath, newpath)
 		if err != nil {
 			return err
@@ -5111,7 +5119,7 @@ func (jfs *juiceFS) rename(oldpath, newpath string, op *namespaceOperation) erro
 		// The Store preserves mode, locality and logical incarnation while
 		// moving the complete durable subtree in one transaction.
 		if !sourceToken.IsZero() {
-			if _, err := jfs.handler.store.RenameExpected(sourceToken, destinationToken); err != nil {
+			if _, err := jfs.handler.store.RenameExpectedWithParent(sourceToken, destinationToken, destinationParentToken); err != nil {
 				return err
 			}
 		} else {

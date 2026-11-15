@@ -2038,16 +2038,24 @@ func (s *Store) bulkInsertBatch(batch []*Entry, incremental bool) error {
 // ScanUpsertBatch conditionally publishes one SCAN chunk. Its returned token
 // includes this batch's commit and is the precondition for the next chunk.
 func (s *Store) ScanUpsertBatch(batch []*Entry, expected StoreEpoch, invalidatePaths []string) (StoreEpoch, error) {
+	next, _, err := s.ScanUpsertBatchOwned(batch, expected, invalidatePaths)
+	return next, err
+}
+
+// ScanUpsertBatchOwned also returns the rows skipped because a foreground
+// mutation owned them; the SCAN requeues their folders (review M1 of #100).
+func (s *Store) ScanUpsertBatchOwned(batch []*Entry, expected StoreEpoch, invalidatePaths []string) (StoreEpoch, []string, error) {
 	if len(batch) == 0 || len(batch) > 500 {
-		return StoreEpoch{}, ErrMirrorConflict
+		return StoreEpoch{}, nil, ErrMirrorConflict
 	}
-	next, err := s.bulkInsertBatchWithEpoch(batch, true, &expected, invalidatePaths, false, nil)
+	var owned []string
+	next, err := s.bulkInsertBatchWithEpoch(batch, true, &expected, invalidatePaths, false, &owned)
 	if err != nil {
-		return StoreEpoch{}, err
+		return StoreEpoch{}, nil, err
 	}
 	s.evictWithPinnedSet()
 	s.ftsInitialized.Store(true)
-	return next, nil
+	return next, owned, nil
 }
 
 // ReconcileUpsertBatch gives the keyspace HGETALL path the SCAN admission

@@ -264,7 +264,17 @@ func (c *namespaceCoordinator) beginShallow(names []string) *namespaceOperation 
 func (c *namespaceCoordinator) beginScoped(names []string, shallow bool) *namespaceOperation {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.stopping || len(c.active) >= 24 {
+	// Failed operations stay (H8) but no longer take a slot: after a failed
+	// save the volume keeps working, so failures could pile up to the cap
+	// and refuse every later mutation (review L1 of #100). They still block
+	// their own names below.
+	live := 0
+	for op := range c.active {
+		if !op.failed {
+			live++
+		}
+	}
+	if c.stopping || live >= 24 {
 		// Preserve original priority when both refusal conditions hold.
 		if c.stopping {
 			metrics.Default().IncAdmissionRefusal(metrics.AdmissionNamespaceStopping)

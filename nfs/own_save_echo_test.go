@@ -299,3 +299,23 @@ func TestOwnSaveRenameRefusesDestinationCreatedMeanwhile(t *testing.T) {
 		t.Fatalf("rename onto a destination created meanwhile = %v, want ErrMirrorConflict", err)
 	}
 }
+
+// Review L1 of #100: failed operations keep blocking their own names but do
+// not take one of the 24 live slots.
+func TestNamespaceFailedOperationsFreeTheirSlot(t *testing.T) {
+	var c namespaceCoordinator
+	for i := 0; i < 30; i++ {
+		op := c.begin([]string{"w/failed/f" + string(rune('a'+i))})
+		if op == nil {
+			t.Fatalf("begin %d refused after %d failed operations", i, i)
+		}
+		op.mutated = true
+		op.finish(syscall.EIO)
+	}
+	if c.begin([]string{"w/ok.prproj"}) == nil {
+		t.Fatal("a new save refused because failed operations filled the cap")
+	}
+	if c.begin([]string{"w/failed/fa"}) != nil {
+		t.Fatal("a failed name is no longer blocked")
+	}
+}

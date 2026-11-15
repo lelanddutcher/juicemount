@@ -84,6 +84,27 @@ func (s *Store) InsertFromFeed(e *Entry) (bool, error) {
 }
 
 var feedEventsDeferred atomic.Int64
+var ownedDeferralsTotal atomic.Int64
+
+func noteOwnedDeferral() { ownedDeferralsTotal.Add(1) }
+
+// deferDroppedFeedEvent: a pub/sub event for an owned path is dropped. With
+// the attr push live, a teammate's change to that file also arrives as an
+// i-key event, which waits for the owner (keyspace_attr.go); a create, delete
+// or rename arrives on the folder's d-key. Without the attr push nothing
+// would bring a teammate's update back before the backstop SCAN, so the
+// folder is read again once the owner is done (review M2 of #100).
+func (rc *RedisClient) deferDroppedFeedEvent(evt MetadataEvent) {
+	noteFeedEventDeferred()
+	if rc.attrRequeue.Load() != nil {
+		return
+	}
+	for _, p := range []string{evt.Path, evt.OldPath} {
+		if p != "" {
+			rc.deferOwnedPath(p)
+		}
+	}
+}
 
 func noteFeedEventDeferred() { feedEventsDeferred.Add(1) }
 

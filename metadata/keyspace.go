@@ -703,6 +703,13 @@ func (rc *RedisClient) runKeyspaceSubscribe() (established bool) {
 	requeue := requeueFunc(co.add)
 	rc.keyspaceRequeue.Store(&requeue)
 	defer rc.keyspaceRequeue.Store(nil)
+	if attrCo != nil {
+		attrRequeue := requeueFunc(attrCo.add)
+		rc.attrRequeue.Store(&attrRequeue)
+		defer rc.attrRequeue.Store(nil)
+	}
+	// Paths deferred while owned during the gap reach this session.
+	rc.resumeOwnedDeferrals()
 
 	// Read the previous session's seal before opening this one. The durable
 	// guard must exist before the first notification is consumed.
@@ -1534,13 +1541,7 @@ func (rc *RedisClient) reconcileDirWithBackend(dirInode, generation uint64) erro
 		rc.scheduleAttrRetryWithBackend(dirInode, token.backend)
 		return err
 	}
-	if len(owned) > 0 {
-		// A foreground mutation (a rename, a create) owns a child: its own
-		// publication lands first, then this folder is read again.
-		rc.scheduleAttrRetryWithBackend(dirInode, token.backend)
-		jmlog.Info("metadata keyspace push: reconcileDir deferred children owned by a local mutation",
-			"parent", parentPath, "owned", len(owned), "first", owned[0])
-	}
+	deferred := len(owned) > 0
 
 	// B4' burst-ordering fix: requeue newly-discovered child dirs into the
 	// LIVE push coalescer (wired only while a subscription is up), so a
@@ -1567,9 +1568,24 @@ func (rc *RedisClient) reconcileDirWithBackend(dirInode, generation uint64) erro
 	// guards syncMetadata uses (Layer C pin guard, Layer A FUSE-present guard).
 	// Reusing these guards is mandatory to not re-open the QA-30 ESTALE bug.
 	// storeParent (not parentPath) is the children-index key — see above.
-	if err := rc.scopedPruneWithToken(storeParent, freshNames, &token); err != nil {
+	ownedSpared, err := rc.scopedPruneOwned(storeParent, freshNames, &token)
+	if err != nil {
 		rc.scheduleAttrRetryWithBackend(dirInode, token.backend)
 		return err
+	}
+	if deferred || ownedSpared {
+		// A foreground mutation (a save, a rename) owns a child. That is a
+		// wait, not a failure: the rest of the folder is published and
+		// refreshed below, and the folder is read again after the owner has
+		// published (owned_deferral.go). The failure path would mark push
+		// DEGRADED and record baseline debt (review H1 of #100).
+		rc.deferOwnedDir(dirInode)
+		first := ""
+		if len(owned) > 0 {
+			first = owned[0]
+		}
+		jmlog.Info("metadata keyspace push: reconcileDir deferred children owned by a local mutation",
+			"parent", parentPath, "owned", len(owned), "prune_spared", ownedSpared, "first", first)
 	}
 
 	// The directory-key notification itself is authoritative evidence that this
@@ -1654,9 +1670,18 @@ func (rc *RedisClient) scopedPrune(parentPath string, freshNames map[string]stru
 }
 
 func (rc *RedisClient) scopedPruneWithToken(parentPath string, freshNames map[string]struct{}, token *scanBaselineToken) error {
+	_, err := rc.scopedPruneOwned(parentPath, freshNames, token)
+	return err
+}
+
+// scopedPruneOwned is scopedPruneWithToken that spares (with their ancestors)
+// rows a foreground mutation owns and reports whether it spared any, so the
+// caller requeues the folder instead of treating it as a failure
+// (foreground_owner.go; review H1 of #100).
+func (rc *RedisClient) scopedPruneOwned(parentPath string, freshNames map[string]struct{}, token *scanBaselineToken) (ownedSpared bool, err error) {
 	children, err := rc.store.ListChildren(parentPath)
 	if err != nil || len(children) == 0 {
-		return nil
+		return ownedSpared, nil
 	}
 
 	// === Degrade gate (NFSv3 sprint slow-link false-flap, fix b.2 — task #66 salvage) ===
@@ -1678,7 +1703,7 @@ func (rc *RedisClient) scopedPruneWithToken(parentPath string, freshNames map[st
 	if rc.RecentlyDegraded(60 * time.Second) {
 		jmlog.Info("metadata keyspace push: scoped prune deferred (backend degraded)",
 			"parent", parentPath, "candidates_unevaluated", len(children))
-		return nil
+		return ownedSpared, nil
 	}
 
 	var candidates []string // internal paths to delete
@@ -1733,7 +1758,7 @@ func (rc *RedisClient) scopedPruneWithToken(parentPath string, freshNames map[st
 		candidateEntries[ch.Path] = ch
 	}
 	if len(candidates) == 0 {
-		return nil
+		return ownedSpared, nil
 	}
 	// Capture the candidate subtree before the FUSE absence probe. The Store
 	// commit checks these versions and each directory's child membership again.
@@ -1742,7 +1767,7 @@ func (rc *RedisClient) scopedPruneWithToken(parentPath string, freshNames map[st
 		var err error
 		subtrees[p], err = rc.collectSubtreeEntries(p)
 		if err != nil {
-			return err
+			return ownedSpared, err
 		}
 	}
 
@@ -1756,7 +1781,7 @@ func (rc *RedisClient) scopedPruneWithToken(parentPath string, freshNames map[st
 		jmlog.Warn("scoped prune: FUSE identity gate failed — skipping",
 			"parent", parentPath, "reason", identReason,
 			"would_have_pruned", len(candidates))
-		return nil
+		return ownedSpared, nil
 	}
 
 	// === QA-30 Layer D: never prune a spool-pending path ===
@@ -1781,7 +1806,7 @@ func (rc *RedisClient) scopedPruneWithToken(parentPath string, freshNames map[st
 				"count", spared, "parent", parentPath)
 		}
 		if len(candidates) == 0 {
-			return nil
+			return ownedSpared, nil
 		}
 	}
 
@@ -1790,7 +1815,7 @@ func (rc *RedisClient) scopedPruneWithToken(parentPath string, freshNames map[st
 	if perr != nil {
 		jmlog.Warn("metadata keyspace push: pin-checker error, skipping scoped prune",
 			"error", perr.Error(), "would_have_pruned", len(candidates), "parent", parentPath)
-		return nil
+		return ownedSpared, nil
 	}
 	pinnedInternal := make(map[string]struct{}, len(pinned))
 	if len(pinned) > 0 {
@@ -1807,7 +1832,7 @@ func (rc *RedisClient) scopedPruneWithToken(parentPath string, freshNames map[st
 		candidates = filtered
 	}
 	if len(candidates) == 0 {
-		return nil
+		return ownedSpared, nil
 	}
 
 	// === QA-30 Layer A: per-path FUSE Lstat verification ===
@@ -1836,7 +1861,7 @@ func (rc *RedisClient) scopedPruneWithToken(parentPath string, freshNames map[st
 		if lstatTimeouts >= 4 && lstatTimeouts*4 > len(candidates) {
 			jmlog.Warn("metadata keyspace push: FUSE degraded, skipping scoped prune",
 				"timeouts", lstatTimeouts, "candidates", len(candidates), "parent", parentPath)
-			return nil
+			return ownedSpared, nil
 		}
 		candidates = verified
 	}
@@ -1871,7 +1896,12 @@ func (rc *RedisClient) scopedPruneWithToken(parentPath string, freshNames map[st
 		for _, e := range toDelete {
 			_, isPinned := pinnedInternal[e.Path]
 			isSpoolPending := spoolGuard != nil && spoolGuard(e.Path)
-			if !e.LocalOnly && !isPinned && !isSpoolPending {
+			// The Mac's own rename or remove of this name publishes it.
+			isOwned := rc.store.ForegroundOwned(e.Path)
+			if isOwned {
+				ownedSpared = true
+			}
+			if !e.LocalOnly && !isPinned && !isSpoolPending && !isOwned {
 				continue
 			}
 			spared++
@@ -1894,7 +1924,7 @@ func (rc *RedisClient) scopedPruneWithToken(parentPath string, freshNames map[st
 				"count", spared, "parent", parentPath)
 		}
 		if len(toDelete) == 0 {
-			return nil
+			return ownedSpared, nil
 		}
 	}
 
@@ -1905,18 +1935,22 @@ func (rc *RedisClient) scopedPruneWithToken(parentPath string, freshNames map[st
 	if identOK, identReason := pin.FUSEIdentityFresh(); !identOK {
 		jmlog.Warn("scoped prune: FUSE identity changed after probes — skipping",
 			"parent", parentPath, "reason", identReason)
-		return nil
+		return ownedSpared, nil
 	}
 	err = rc.fencedScanMutation(token, func() error {
 		return rc.store.DeletePathsConditional(toDelete)
 	})
+	if IsForegroundOwned(err) {
+		// An owner began after the spare above: nothing deleted, try again.
+		return true, nil
+	}
 	if err != nil {
 		jmlog.Warn("metadata keyspace push: scoped prune delete", "parent", parentPath, "error", err.Error())
-		return err
+		return ownedSpared, err
 	}
 	jmlog.Info("metadata keyspace push: scoped prune",
 		"parent", parentPath, "removed_roots", len(candidates), "removed_total", len(toDelete))
-	return nil
+	return ownedSpared, nil
 }
 
 // filterSpoolPending applies QA-30 Layer D to a prune candidate set: it removes

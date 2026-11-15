@@ -343,7 +343,12 @@ type RedisClient struct {
 	// dropped as unknown-ancestor. Requeueing it walks the new subtree
 	// through the same debounced, burst-ceilinged machinery until nothing
 	// new is discovered. Same atomic-pointer idiom as spoolPending.
-	keyspaceRequeue   atomic.Pointer[requeueFunc]
+	keyspaceRequeue atomic.Pointer[requeueFunc]
+	// attrRequeue re-enqueues a file inode into the live attr coalescer; nil
+	// while no session runs or the attr push is off. ownedDeferrals waits
+	// out paths a foreground mutation owns (owned_deferral.go).
+	attrRequeue       atomic.Pointer[requeueFunc]
+	ownedDeferrals    ownedDeferralQueue
 	attrRetryMu       sync.Mutex
 	attrRetries       map[uint64]*attrRetryState
 	attrRetryStopped  bool
@@ -1869,7 +1874,7 @@ func (rc *RedisClient) applyEventFromSubscription(evt MetadataEvent, generation 
 	// current state itself; a teammate's change reaches the mirror through the
 	// keyspace push, which retries owned paths.
 	if evt.Op != "reconcile" && (rc.store.ForegroundOwned(evt.Path) || rc.store.ForegroundOwned(evt.OldPath)) {
-		noteFeedEventDeferred()
+		rc.deferDroppedFeedEvent(evt)
 		return
 	}
 	// Classify mode from the event's type discriminators. IsSymlink takes
@@ -1975,7 +1980,7 @@ func (rc *RedisClient) applyEventFromSubscription(evt MetadataEvent, generation 
 		if applied, err := rc.store.InsertFromFeed(e); err != nil {
 			log.Printf("subscribe apply create/update: %v", err)
 		} else if !applied {
-			noteFeedEventDeferred()
+			rc.deferDroppedFeedEvent(evt)
 			return
 		}
 		if evt.Op == "create" {
@@ -2054,7 +2059,12 @@ func (rc *RedisClient) applyEventFromSubscription(evt MetadataEvent, generation 
 		if applied, err := rc.store.InsertFromFeed(e); err != nil {
 			log.Printf("subscribe apply rename: %v", err)
 		} else if !applied {
-			noteFeedEventDeferred()
+			// The source row is already gone: always read the destination
+			// folder again, even with the attr push on (review L2 of #100).
+			rc.deferDroppedFeedEvent(evt)
+			if rc.attrRequeue.Load() != nil {
+				rc.deferOwnedPath(evt.Path)
+			}
 			return
 		}
 		rc.store.NoteDirectoryChanged(path.Dir(evt.Path))
@@ -3041,11 +3051,16 @@ func (rc *RedisClient) syncMetadata() (err error) {
 						invalidatePaths = append(invalidatePaths, e.Path)
 					}
 				}
-				next, err := rc.store.ScanUpsertBatch(chunk, token.store, invalidatePaths)
+				next, owned, err := rc.store.ScanUpsertBatchOwned(chunk, token.store, invalidatePaths)
 				if err != nil {
 					return err
 				}
 				token.store = next
+				// Skipped while the Mac's own operation owns them: read
+				// their folders again afterwards (review M1 of #100).
+				for _, p := range owned {
+					rc.deferOwnedPath(p)
+				}
 				return nil
 			})
 			if err != nil {
@@ -3340,6 +3355,19 @@ func (rc *RedisClient) syncMetadata() (err error) {
 			}
 			return toDelete[i] < toDelete[j]
 		})
+		// A path the Mac's own operation owns is left to it; its folder is
+		// read again afterwards (review M1 of #100).
+		{
+			kept := toDelete[:0]
+			for _, p := range toDelete {
+				if rc.store.ForegroundOwned(p) {
+					rc.deferOwnedPath(p)
+					continue
+				}
+				kept = append(kept, p)
+			}
+			toDelete = kept
+		}
 		for start := 0; start < len(toDelete); start += scanMutationChunk {
 			end := min(start+scanMutationChunk, len(toDelete))
 			chunk := toDelete[start:end]

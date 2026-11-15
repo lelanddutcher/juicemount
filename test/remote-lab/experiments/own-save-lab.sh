@@ -16,7 +16,7 @@
 # line says whether the volume root ever answered an error (volume_eio) and
 # whether it still did at the end (root_ok_at_end). OS_SEED_LAN=0 writes the
 # in-place, chmod and rename targets through jm5 instead of seeding them on
-# lan. OS_CASES picks the operations (default atomic,inplace,chmod,rename).
+# lan. LABEL.push.txt counts push engagement changes. OS_CASES picks the operations (default atomic,inplace,chmod,rename).
 # OS_JM5_ENV adds jm5 environment. DRAIN_BIN as in drain-lab.sh.
 set -euo pipefail
 
@@ -90,6 +90,9 @@ run() {
   "$LAB" shape lan >/dev/null
   grep -c '"level":"ERROR"' "$OUT/$label.jm5.log" > "$OUT/$label.errors.txt" || true
   grep -hoE 'mirror observation no longer current|err loading attrs for [^"]*' "$OUT/$label.jm5.log" | sort | uniq -c >> "$OUT/$label.errors.txt" || true
+  # Push state: every engagement change (ENABLED/DEGRADED) and the
+  # failure-path messages an owned path must not cause (review H1 of #100).
+  grep -hoE '"reason":"engagement=[A-Z]+"|reconcileDir failed|owned by a local mutation' "$OUT/$label.jm5.log" | sort | uniq -c > "$OUT/$label.push.txt" || true
   tail -n 1 "$OUT/$label.jsonl"
   log "$label: results in $OUT"
 }

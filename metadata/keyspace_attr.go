@@ -145,12 +145,8 @@ func (rc *RedisClient) newAttrCoalescer(generation uint64) *inodeCoalescer {
 	c.apply = func(batch []uint64) {
 		failed, deferred, err := rc.reconcileFileAttrsOwned(batch, generation)
 		for _, inode := range deferred {
-			inode := inode
-			time.AfterFunc(attrRetryBase, func() {
-				if rc.backendAdmitted(generation) {
-					c.add(inode)
-				}
-			})
+			// Client-lifetime queue: survives a resubscribe (review M1).
+			rc.deferOwnedFile(inode)
 		}
 		failedSet := make(map[uint64]struct{}, len(failed))
 		for _, inode := range failed {
