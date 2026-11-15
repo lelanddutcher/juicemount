@@ -45,27 +45,32 @@ const (
 )
 
 var controlMutex sync.Mutex
-var controlHandlers = make(map[uint32]uint64)
 
-func (v *VFS) getControlHandle(pid uint32) uint64 {
+// JuiceMount patch 0033: keyed by the control file too, so one process has
+// one handle per control file (.control and the lane, jm_control_lane.go).
+var controlHandlers = make(map[jmControlKey]uint64)
+
+func (v *VFS) getControlHandle(ino Ino, pid uint32) uint64 {
 	controlMutex.Lock()
 	defer controlMutex.Unlock()
-	fh := controlHandlers[pid]
+	key := jmControlKey{ino, pid}
+	fh := controlHandlers[key]
 	if fh == 0 {
-		h := v.newHandle(controlInode, false)
+		h := v.newHandle(ino, false)
 		fh = h.fh
-		controlHandlers[pid] = fh
+		controlHandlers[key] = fh
 	}
 	return fh
 }
 
-func (v *VFS) releaseControlHandle(pid uint32) {
+func (v *VFS) releaseControlHandle(ino Ino, pid uint32) {
 	controlMutex.Lock()
 	defer controlMutex.Unlock()
-	fh := controlHandlers[pid]
+	key := jmControlKey{ino, pid}
+	fh := controlHandlers[key]
 	if fh != 0 {
-		v.releaseHandle(controlInode, fh)
-		delete(controlHandlers, pid)
+		v.releaseHandle(ino, fh)
+		delete(controlHandlers, key)
 	}
 }
 
@@ -117,7 +122,7 @@ func IsSpecialName(name string) bool {
 			return true
 		}
 	}
-	return false
+	return name == jmControlLaneNode.name // JuiceMount patch 0033
 }
 
 func getInternalNode(ino Ino) *internalNode {
@@ -125,6 +130,9 @@ func getInternalNode(ino Ino) *internalNode {
 		if ino == n.inode {
 			return n
 		}
+	}
+	if ino == jmControlLaneNode.inode { // JuiceMount patch 0033
+		return jmControlLaneNode
 	}
 	return nil
 }
@@ -145,6 +153,9 @@ func getInternalNodeByName(name string) *internalNode {
 		if name == n.name {
 			return n
 		}
+	}
+	if name == jmControlLaneNode.name { // JuiceMount patch 0033
+		return jmControlLaneNode
 	}
 	return nil
 }

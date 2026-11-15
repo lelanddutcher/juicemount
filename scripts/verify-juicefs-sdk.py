@@ -58,6 +58,7 @@ PATCH_FILES = {
         "pkg/fuse/fuse.go", "pkg/meta/interface.go", "pkg/vfs/internal.go"],
     "patches/0032-refresh-keeps-current-buffers.patch": [
         "pkg/fuse/fuse.go", "pkg/meta/base.go", "pkg/meta/openfile.go", "pkg/vfs/reader.go"],
+    "patches/0033-control-lane.patch": ["pkg/vfs/handle.go", "pkg/vfs/internal.go", "pkg/vfs/vfs.go"],
 }
 VERSION_PACKAGE = "github.com/juicedata/juicefs/pkg/version"
 
