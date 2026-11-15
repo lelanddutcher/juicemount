@@ -1538,6 +1538,9 @@ func (rc *RedisClient) reconcileDirWithBackend(dirInode, generation uint64) erro
 
 	owned, err := rc.applyReconcileUpsertsOwned(toUpsert, &token)
 	if err != nil {
+		if rc.requeueAfterPublicationRace(dirInode, parentPath, token, err) {
+			return nil
+		}
 		rc.scheduleAttrRetryWithBackend(dirInode, token.backend)
 		return err
 	}
@@ -1570,6 +1573,9 @@ func (rc *RedisClient) reconcileDirWithBackend(dirInode, generation uint64) erro
 	// storeParent (not parentPath) is the children-index key — see above.
 	ownedSpared, err := rc.scopedPruneOwned(storeParent, freshNames, &token)
 	if err != nil {
+		if rc.requeueAfterPublicationRace(dirInode, parentPath, token, err) {
+			return nil
+		}
 		rc.scheduleAttrRetryWithBackend(dirInode, token.backend)
 		return err
 	}
@@ -1601,10 +1607,14 @@ func (rc *RedisClient) reconcileDirWithBackend(dirInode, generation uint64) erro
 		rc.publicationGeneration++
 	} else {
 		rc.lifecycleMu.Unlock()
+		if rc.requeueAfterPublicationRace(dirInode, parentPath, token, errScanPublicationInvalidated) {
+			return nil
+		}
 		rc.scheduleAttrRetryWithBackend(dirInode, token.backend)
 		return errScanPublicationInvalidated
 	}
 	rc.lifecycleMu.Unlock()
+	rc.ownedDeferrals.clearRace(dirInode)
 	rc.offerCacheCandidates(toUpsert, token)
 
 	jmlog.Info("metadata keyspace push: reconcileDir",

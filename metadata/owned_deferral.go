@@ -1,10 +1,18 @@
 package metadata
 
 import (
+	"errors"
 	"path"
 	"sync"
+	"sync/atomic"
 	"time"
+
+	"github.com/lelanddutcher/juicemount/internal/jmlog"
 )
+
+var publicationRaceRequeues atomic.Int64
+
+func notePublicationRaceRequeue() { publicationRaceRequeues.Add(1) }
 
 // OWNED DEFERRALS (review H1/M1/M2 of #100).
 //
@@ -22,6 +30,57 @@ type ownedDeferralQueue struct {
 	dirs  map[uint64]struct{}
 	files map[uint64]struct{}
 	armed bool
+	races map[uint64]int // consecutive publication-race requeues per folder
+}
+
+// publicationRaceBudget bounds the consecutive folder re-reads after a
+// concurrent background publication; past it the failure path runs.
+const publicationRaceBudget = 3
+
+// requeueAfterPublicationRace: two background publications (the attr push of
+// one file and a folder's update) ran at once, and every fenced publication
+// moves publicationGeneration, so the slower one fails its token check. When
+// nothing else moved (same debt, session and backend: no event was lost), the
+// folder is read again after attrRetryBase like an owned wait, instead of
+// recording baseline debt and marking push DEGRADED. Each abroad own save
+// produces one deferred attr refresh, so this race became the common case
+// (review H1 of #100, second lab round). Bounded by publicationRaceBudget.
+func (rc *RedisClient) requeueAfterPublicationRace(dirInode uint64, parentPath string, token scanBaselineToken, err error) bool {
+	if !errors.Is(err, errScanPublicationInvalidated) {
+		return false
+	}
+	rc.lifecycleMu.Lock()
+	onlyPublication := rc.backendAdmittedLocked(token.backend) && token.debt == rc.debtGeneration &&
+		token.session == rc.sessionGeneration
+	rc.lifecycleMu.Unlock()
+	if !onlyPublication || rc.keyspaceRequeue.Load() == nil {
+		return false
+	}
+	q := &rc.ownedDeferrals
+	q.mu.Lock()
+	if q.races == nil {
+		q.races = make(map[uint64]int)
+	}
+	q.races[dirInode]++
+	n := q.races[dirInode]
+	if n > publicationRaceBudget {
+		delete(q.races, dirInode)
+	}
+	q.mu.Unlock()
+	if n > publicationRaceBudget {
+		return false
+	}
+	notePublicationRaceRequeue()
+	jmlog.Info("metadata keyspace push: reconcileDir raced another publication; reading the folder again",
+		"parent", parentPath, "try", n)
+	rc.deferOwnedDir(dirInode)
+	return true
+}
+
+func (q *ownedDeferralQueue) clearRace(dirInode uint64) {
+	q.mu.Lock()
+	delete(q.races, dirInode)
+	q.mu.Unlock()
 }
 
 var ownedDeferralsArmed func() // test hook: called when the timer is armed
@@ -95,6 +154,19 @@ func (q *ownedDeferralQueue) fire(rc *RedisClient) {
 	q.dirs, q.files = make(map[uint64]struct{}), make(map[uint64]struct{})
 	q.mu.Unlock()
 	for inode := range files {
+		// Its folder is read again anyway, and that read carries its attrs:
+		// one publication instead of two that race each other.
+		if e := rc.store.LookupByInode(inode); e != nil {
+			if p := path.Dir(e.Path); p == "." {
+				if _, ok := dirs[1]; ok {
+					continue
+				}
+			} else if pe := rc.store.LookupByPath(p); pe != nil {
+				if _, ok := dirs[pe.Inode]; ok {
+					continue
+				}
+			}
+		}
 		if attrFn != nil {
 			(*attrFn)(inode)
 			continue

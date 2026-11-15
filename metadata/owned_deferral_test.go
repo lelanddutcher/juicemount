@@ -270,3 +270,101 @@ func TestRenameOwnedAbsentDestinationChecksFolder(t *testing.T) {
 		t.Fatalf("rename with an unchanged folder and an unrelated write = %v", err)
 	}
 }
+
+// Second lab round of #100: a folder update that races a concurrent
+// background publication (the deferred attr refresh of a just-saved file)
+// fails its token check. With no debt, session or backend change that is a
+// wait: the folder is read again, push stays ENABLED. Past the budget the
+// failure path still runs.
+func TestReconcileDirPublicationRaceIsAWait(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "mirror.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.Insert(MakeEntry("other.bin", false, 1, testTime(0), 77)); err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	race := false
+	var rc *RedisClient
+	rc = &RedisClient{
+		store: store, stopCh: make(chan struct{}),
+		testReadDirRaw: func(uint64) (map[string]string, error) {
+			return map[string]string{"c0.prproj": dirChildValue(43), "other.bin": dirChildValue(77)}, nil
+		},
+		testReadAttrs: func(keys []string) ([]interface{}, error) {
+			mu.Lock()
+			r := race
+			mu.Unlock()
+			if r {
+				// The attr push publishes another file meanwhile.
+				if err := rc.applyReconcileUpserts([]*Entry{MakeEntry("other.bin", false, int64(time.Now().UnixNano()%1000+2), testTime(5), 77)}); err != nil {
+					t.Errorf("concurrent publication: %v", err)
+				}
+			}
+			out := make([]interface{}, len(keys))
+			for i := range keys {
+				out[i] = string(encodeTestAttr(1700000000, 100))
+			}
+			return out, nil
+		},
+	}
+	defer close(rc.stopCh)
+	rc.setEngagement(keyspaceEnabled)
+	var rqMu sync.Mutex
+	requeued := 0
+	requeue := requeueFunc(func(uint64) { rqMu.Lock(); requeued++; rqMu.Unlock() })
+	rc.keyspaceRequeue.Store(&requeue)
+	oldBase := attrRetryBase
+	attrRetryBase = 10 * time.Millisecond
+	defer func() { attrRetryBase = oldBase }()
+
+	mu.Lock()
+	race = true
+	mu.Unlock()
+	rc.lifecycleMu.Lock()
+	debt0 := rc.debtGeneration
+	rc.lifecycleMu.Unlock()
+	for i := 1; i <= publicationRaceBudget; i++ {
+		if err := rc.reconcileDir(1); err != nil {
+			t.Fatalf("race %d: reconcileDir = %v, want a wait (nil)", i, err)
+		}
+		if got := keyspaceEngagement(rc.engaged.Load()); got != keyspaceEnabled {
+			t.Fatalf("race %d: engagement %v, want ENABLED", i, got)
+		}
+	}
+	rc.lifecycleMu.Lock()
+	debt1 := rc.debtGeneration
+	rc.lifecycleMu.Unlock()
+	if debt1 != debt0 {
+		t.Fatalf("debt %d -> %d within the budget", debt0, debt1)
+	}
+	// Past the budget: the failure path, as before.
+	if err := rc.reconcileDir(1); err == nil {
+		t.Fatal("budget exhausted but reconcileDir still waited")
+	}
+	if got := keyspaceEngagement(rc.engaged.Load()); got != keyspaceDegraded {
+		t.Fatalf("after the budget engagement %v, want DEGRADED", got)
+	}
+	// No race: success, and the folder's budget is fresh again.
+	mu.Lock()
+	race = false
+	mu.Unlock()
+	if err := rc.reconcileDir(1); err != nil {
+		t.Fatalf("quiet reconcileDir = %v", err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		rqMu.Lock()
+		n := requeued
+		rqMu.Unlock()
+		if n >= 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("raced folder was never requeued")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
