@@ -253,8 +253,10 @@ func (f *writeFile) publishMutation(m metadata.OnlineMutation, from, to time.Tim
 	// stamps the true mtime just after the syscall began, and the row keeps
 	// whole seconds only. A finish time abroad (1-16 s later) showed the Mac
 	// a later mtime that then stepped back to the true one (laptop runs
-	// 2026-11-16, B1). The start's second is at or below the true mtime, so
-	// the next update only moves it forward.
+	// 2026-11-16, B1). The start's second is at or below this operation's
+	// true mtime, so the true value arriving later moves it forward. (Two own
+	// operations starting in the same second can still step back a fraction
+	// of a second, as on main.)
 	stamp := time.Now()
 	if !from.IsZero() && from.Before(stamp) {
 		stamp = from

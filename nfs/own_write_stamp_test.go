@@ -11,6 +11,9 @@ import (
 // stamped at its start, so the Mac saw the mtime step back once the true
 // value arrived. The row now carries the operation's start second.
 func TestOwnSlowTruncateStampsItsStart(t *testing.T) {
+	// The hook below holds the operation up to about a second; the default
+	// LAN bound per operation is 800 ms (review of #103).
+	t.Setenv("JM_MUTATION_OP_TIMEOUT_MS", "5000")
 	jfs, store, fuseRoot := newIntegrityHarness(t)
 	const path = "reel.mov"
 	seedFile(t, jfs, store, fuseRoot, path, patternedPayload(8192, 113))
