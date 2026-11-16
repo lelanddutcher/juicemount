@@ -242,6 +242,7 @@ type Store struct {
 	// attrObs: what the Redis publications last saw of each file
 	// (mtime_span.go).
 	attrObs                     attrObservations
+	own                         ownMarks     // this process's own changes (own_marks.go)
 	evictionMu                  sync.Mutex   // serializes bounded pressure passes; never acquired under mu/publication
 	nextCacheIdentity           uint64       // fresh RAM publication identity, guarded by mu
 	readDirAfterCacheCheckHook  func()       // deterministic completeness-race tests; nil in production
@@ -1134,6 +1135,7 @@ func OpenWithMaxCacheSize(dbPath string, maxCacheSize int) (*Store, error) {
 		s.subtreeBytes = make(map[string]int64)
 		s.subtreeFiles = make(map[string]int64)
 	}
+	s.own.init()
 	if err := s.loadNFSOverlays(); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("load nfs mtime overlays: %w", err)
@@ -2098,6 +2100,21 @@ func (s *Store) ReconcileUpsertBatchOwned(batch []*Entry, expected StoreEpoch) (
 }
 
 func (s *Store) bulkInsertBatchWithEpoch(batch []*Entry, incremental bool, expected *StoreEpoch, invalidatePaths []string, reconcile bool, owned *[]string) (StoreEpoch, error) {
+	// Reported mtimes moved off the true one (mtime_span.go), logged once the
+	// write lock is released (review 99d L3: this defer runs after the
+	// unlock below). Set only after the commit.
+	type movedMtime struct {
+		path             string
+		inode            uint64
+		trueNS, reportNS int64
+	}
+	var moved, committedMoves []movedMtime
+	defer func() {
+		for _, m := range committedMoves {
+			jmlog.Info("metadata mtime span: reported mtime moved", "path", m.path, "inode", m.inode,
+				"true_ns", m.trueNS, "reported_ns", m.reportNS)
+		}
+	}()
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	s.cachePublicationMu.Lock()
@@ -2326,8 +2343,7 @@ func (s *Store) bulkInsertBatchWithEpoch(batch []*Entry, incremental bool, expec
 				s.attrObs.noteSQL(e.Inode)
 				overlays = append(overlays, *change)
 				if r := change.rs[len(change.rs)-1]; r.reportedNS != r.trueNS {
-					jmlog.Info("metadata mtime span: reported mtime moved", "path", e.Path, "inode", e.Inode,
-						"true_ns", r.trueNS, "reported_ns", r.reportedNS)
+					moved = append(moved, movedMtime{e.Path, e.Inode, r.trueNS, r.reportedNS})
 				}
 			}
 			observations = append(observations, spanObs{e.Inode, obs, keepNewer})
@@ -2359,6 +2375,7 @@ func (s *Store) bulkInsertBatchWithEpoch(batch []*Entry, incremental bool, expec
 	for _, c := range overlays {
 		c.apply()
 	}
+	committedMoves = moved
 	for _, o := range observations {
 		s.attrObs.put(o.inode, o.obs, o.keepNewer)
 	}
@@ -2710,7 +2727,6 @@ func (s *Store) SetSizeExactAfterMutation(entryPath string, size int64, mtime ti
 }
 
 func (s *Store) setSizeExact(entryPath string, size int64, mtime time.Time, publishOnError bool) error {
-	s.NoteOwnContent(entryPath, size, mtime) // this process wrote it (mtime_span.go)
 	s.writeMu.Lock()
 	_, err := s.db.Exec(
 		`UPDATE entries SET size = ?, mtime = ?, mtime_nsec = NULL WHERE path = ?`,

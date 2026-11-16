@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -499,8 +500,8 @@ func TestAttrPushOwnSaveEchoKeepsTheMtime(t *testing.T) {
 	if err := l.store.Insert(e); err != nil { // the drain publishes the row itself
 		t.Fatal(err)
 	}
-	l.store.noteOwnContentInode(42, 9000, own)   // as completeDrains marks it
-	l.set(own, own.Add(40*time.Second), 9000, 1) // its echo (Chtimes)
+	l.store.NoteOwnContent("media.mov", 9000, own) // as the in-place drain marks it
+	l.set(own, own.Add(40*time.Second), 9000, 1)   // its echo (Chtimes)
 	l.push()
 	l.set(own, own.Add(41*time.Second), 9000, 1) // the drain's chmod
 	l.push()
@@ -746,6 +747,9 @@ func TestHeldOwnInPlaceSaveKeepsItsMtime(t *testing.T) {
 			// sync took a while abroad). Without the own mark this would be
 			// reported as ownSec + 1 ns.
 			mown := time.Unix(1700000299, 700000000)
+			// The WRITE's own content mark: the FUSE file's exact mtime after
+			// the sync (nfs/write_binding.go publishMutation).
+			l.store.NoteOwnContent("media.mov", 9000, mown)
 			l.set(mown, mown.Add(2*time.Second), 9000, 3)
 			if !race {
 				if d := l.pushOwned(); len(d) != 1 {
@@ -784,6 +788,7 @@ func TestTeammateCommitDuringHeldWindowCounts(t *testing.T) {
 		t.Fatal(err)
 	}
 	mown := time.Unix(1700000299, 700000000)
+	l.store.NoteOwnContent("media.mov", 9000, mown)
 	l.set(mown, mown.Add(time.Second), 9000, 3)
 	l.push() // the Mac's own echo
 	mt := time.Unix(1700000400, 250)
@@ -802,5 +807,136 @@ func TestTeammateCommitDuringHeldWindowCounts(t *testing.T) {
 	l.pushOwned()
 	if got := l.reported(); got.Equal(mt) || l.hooks() != before+1 || attrPushLateCommits.Load() != lateBefore+1 {
 		t.Fatalf("re-read: NFS mtime %v hooks %d -> %d late +%d", got, before, l.hooks(), attrPushLateCommits.Load()-lateBefore)
+	}
+}
+
+// Review 99d H1 (probe shape): a teammate's same-size in-place save 20 s
+// after the Mac's own save is not the Mac's own (no exact match), so its late
+// part counts.
+func TestTeammateSameSizeSaveIsNotOwn(t *testing.T) {
+	l := newSpanLab(t)
+	if err := l.store.SetSizeExact("media.mov", 9000, time.Unix(1700000300, 0)); err != nil {
+		t.Fatal(err)
+	}
+	mown := time.Unix(1700000299, 700000000)
+	l.store.NoteOwnContent("media.mov", 9000, mown)
+	l.set(mown, mown.Add(time.Second), 9000, 3)
+	l.push() // the Mac's own echo
+	if got := l.reported(); !got.Equal(mown) {
+		t.Fatalf("own echo: NFS mtime %v, want %v", got, mown)
+	}
+	mt := time.Unix(1700000320, 250) // the teammate, same size, 20 s later
+	l.set(mt, mt.Add(time.Second), 9000, 5)
+	l.push()
+	before, lateBefore := l.hooks(), attrPushLateCommits.Load()
+	l.set(mt, mt.Add(3*time.Second), 9000, 6) // its late part
+	l.push()
+	if got := l.reported(); got.Equal(mt) || l.hooks() != before+1 || attrPushLateCommits.Load() != lateBefore+1 {
+		t.Fatalf("teammate late part: NFS mtime %v (true %v) hooks %d -> %d late +%d",
+			got, mt, before, l.hooks(), attrPushLateCommits.Load()-lateBefore)
+	}
+}
+
+// Review 99d M1 (probe shape): the folder read publishes the Mac's own save
+// first; a later part of the same save (exactly the Mac's size and mtime)
+// is still the Mac's own.
+func TestOwnSavePublishedByTheFolderReadKeepsItsMtime(t *testing.T) {
+	l := newSpanLab(t)
+	if err := l.store.SetSizeExact("media.mov", 9000, time.Unix(1700000300, 0)); err != nil {
+		t.Fatal(err)
+	}
+	mown := time.Unix(1700000299, 700000000)
+	l.store.NoteOwnContent("media.mov", 9000, mown)
+	l.set(mown, mown.Add(time.Second), 9000, 3)
+	l.reconcile()
+	if got := l.reported(); !got.Equal(mown) {
+		t.Fatalf("folder read: NFS mtime %v, want %v", got, mown)
+	}
+	before, lateBefore := l.hooks(), attrPushLateCommits.Load()
+	l.set(mown, mown.Add(3*time.Second), 9000, 4) // a later part of the same save
+	l.push()
+	if got := l.reported(); !got.Equal(mown) || l.hooks() != before || attrPushLateCommits.Load() != lateBefore {
+		t.Fatalf("own late part: NFS mtime %v hooks %d -> %d late +%d", got, before, l.hooks(), attrPushLateCommits.Load()-lateBefore)
+	}
+}
+
+// Review 99d H2: 50,000 marks (a bulk copy) keep the map bounded and each
+// call cheap: no call scans the whole map.
+func TestOwnMarksStayBounded(t *testing.T) {
+	var o ownMarks
+	o.init() // Store open does this
+	clock := time.Unix(1700000000, 0)
+	o.now = func() time.Time { return clock }
+	const n = 50000
+	start := time.Now()
+	calls := make([]time.Duration, n)
+	for i := 0; i < n; i++ {
+		clock = clock.Add(time.Millisecond) // 50 s in all: none expires
+		s := time.Now()
+		o.noteContent(uint64(i+1), 100, clock)
+		calls[i] = time.Since(s)
+	}
+	total := time.Since(start)
+	first := calls[0]
+	rest := append([]time.Duration(nil), calls[1:]...)
+	sort.Slice(rest, func(i, j int) bool { return rest[i] < rest[j] })
+	t.Logf("%d marks: total %v first call %v p99 %v p99.9 %v worst after the first %v map %d ring %d",
+		n, total, first, rest[len(rest)*99/100], rest[len(rest)*999/1000], rest[len(rest)-1], o.len(), o.size)
+	if o.len() > ownMarksMax || o.size > ownRingSize {
+		t.Fatalf("map %d ring %d past the caps", o.len(), o.size)
+	}
+	if !o.exact(n, 100, clock) || o.exact(1, 100, time.Unix(1700000000, 0).Add(time.Millisecond)) {
+		t.Fatal("the newest mark must stay and the oldest go")
+	}
+	// Expiry: past the content window every mark goes.
+	clock = clock.Add(ownContentWindow + time.Second)
+	o.noteEcho(999999)
+	if o.len() != 1 {
+		t.Fatalf("after expiry: %d marks", o.len())
+	}
+}
+
+func BenchmarkOwnMarksBulk(b *testing.B) {
+	var o ownMarks
+	clock := time.Unix(1700000000, 0)
+	o.now = func() time.Time { return clock }
+	for i := 0; i < b.N; i++ {
+		clock = clock.Add(time.Millisecond)
+		o.noteContent(uint64(i%50000+1), 100, clock)
+	}
+}
+
+// Review 99d L1: an echo mark set while a judged row is being written (the
+// Mac's chmod during a teammate's late-commit write) survives that row's
+// settle; the mark the row was judged with is used up.
+func TestSettleUsesOnlyTheJudgedEchoMark(t *testing.T) {
+	var o ownMarks
+	o.noteEcho(7)
+	o.takeEchoIf(7, o.echoGen(7))
+	if o.echoGen(7) != 0 {
+		t.Fatal("the judged mark must be used up")
+	}
+	judged := o.echoGen(7) // none at judge time
+	o.noteEcho(7)          // the Mac's chmod during the write
+	o.takeEchoIf(7, judged)
+	if o.echoGen(7) == 0 {
+		t.Fatal("a mark set after the row was judged must survive")
+	}
+}
+
+// Review 99d L2: an echo mark whose path is held longer than its window is
+// renewed by the deferral, so it still covers the echo after the release.
+func TestHeldEchoMarkRunsFromTheRelease(t *testing.T) {
+	var o ownMarks
+	clock := time.Unix(1700000000, 0)
+	o.now = func() time.Time { return clock }
+	o.noteEcho(7)
+	for i := 0; i < 5; i++ { // held for 100 s, deferred every 20 s
+		clock = clock.Add(20 * time.Second)
+		o.renewEcho(7)
+	}
+	clock = clock.Add(5 * time.Second) // the re-read after the release
+	if !o.takeEcho(7) {
+		t.Fatal("the echo mark expired while its path was held")
 	}
 }

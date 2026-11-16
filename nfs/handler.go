@@ -7028,6 +7028,10 @@ type writeFile struct {
 	bound    metadata.MirrorToken
 	identity os.FileInfo
 	closed   bool
+
+	// verifiedMtime is the FUSE file's mtime at the last verifyMutation:
+	// after the sync, exactly what JuiceFS holds (metadata/own_marks.go).
+	verifiedMtime time.Time
 }
 
 func (f *writeFile) Name() string  { return f.name }

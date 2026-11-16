@@ -231,10 +231,17 @@ func (f *writeFile) verifyMutation(m metadata.OnlineMutation) error {
 	if backing != m.BackingIdentity || mount != m.MountGeneration || size != m.TargetEOF || !os.SameFile(info, current) {
 		return metadata.ErrMirrorConflict
 	}
+	f.verifiedMtime = info.ModTime()
 	return nil
 }
 
 func (f *writeFile) publishMutation(m metadata.OnlineMutation) error {
+	// The Mac's own bytes, exactly as JuiceFS holds them after the sync (the
+	// last verifyMutation): their echo keeps its true mtime. Marked while the
+	// operation holds the path (metadata/own_marks.go).
+	if !f.verifiedMtime.IsZero() {
+		f.handler.store.NoteOwnContent(f.name, m.TargetEOF, f.verifiedMtime)
+	}
 	e, err := f.handler.store.CompleteOnlineMutation(m, time.Now())
 	if err != nil {
 		return err

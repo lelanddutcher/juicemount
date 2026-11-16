@@ -1822,6 +1822,7 @@ func (d *Drainer) drainOne(row *metadata.SpoolRow) {
 	// validation and Finder's next offline range write would surface ACCES.
 	drainedMtime := time.Now()
 	mtimeApplied := false
+	var backendMtime time.Time // exactly what JuiceFS holds, when known
 	if !spoolMtime.IsZero() {
 		if err := os.Chtimes(tgt.path, spoolMtime, spoolMtime); err != nil {
 			log.Printf("drain: preserve client mtime failed (non-fatal) path=%s: %v", row.NFSPath, err)
@@ -1829,6 +1830,7 @@ func (d *Drainer) drainOne(row *metadata.SpoolRow) {
 			// Metadata and Redis events store whole Unix seconds, so this is the
 			// exact validation value reconcile will later read from JuiceFS.
 			drainedMtime = time.Unix(spoolMtime.Unix(), 0)
+			backendMtime = spoolMtime
 			mtimeApplied = true
 		}
 	}
@@ -1838,6 +1840,15 @@ func (d *Drainer) drainOne(row *metadata.SpoolRow) {
 		// backend inode so the mirror still agrees with the next reconcile.
 		if fi, statErr := os.Stat(tgt.path); statErr == nil {
 			drainedMtime = time.Unix(fi.ModTime().Unix(), 0)
+			backendMtime = fi.ModTime()
+		}
+	}
+	// An in-place drain keeps the file's inode: its echo is this client's own
+	// bytes (metadata/own_marks.go). A stage gets a new inode, reported as it
+	// is anyway.
+	if tgt.stage == nil && !backendMtime.IsZero() {
+		if owner := d.spool.Meta().Owner(); owner != nil {
+			owner.NoteOwnContent(row.NFSPath, row.Size, backendMtime)
 		}
 	}
 	ph.mark_(&ph.chtimes)

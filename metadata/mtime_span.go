@@ -506,49 +506,9 @@ const (
 	attrObsIdle = 10 * time.Minute
 )
 
-// Own marks: this process changed the inode itself.
-//
-//   - An echo mark (a chmod, a rename, an app's temp-file save renamed over
-//     the file) covers one event: the next ctime event of the inode whose
-//     slice signature cannot decide is taken for the echo. Any event uses it
-//     up, but an event whose row goes to a Store write uses it up only once
-//     that write commits: a row skipped because a foreground operation holds
-//     the path keeps the mark for its re-read (#100 review M4). It lives
-//     ownWindow.
-//   - A content mark (an in-place WRITE, a drain, a size publication)
-//     records the size and mtime the Mac itself published (the last
-//     ownContentKeep of them), for ownContentWindow after the last one. A
-//     row from Redis whose mtime or size changed is the Mac's own echo when
-//     its size is one the Mac published and its mtime is within
-//     ownContentSlack of that publication: it reports its true mtime (review
-//     N6), and its mtime is adopted, so a later ctime-only event under
-//     exactly that mtime is the Mac's own too. A content mark is never used
-//     up (one save is many WRITEs and many echoes). A teammate's save has
-//     another size or time, and a teammate's late commit, even one that
-//     landed while the path was held, comes under the teammate's mtime: both
-//     still count.
-const (
-	ownWindow        = 30 * time.Second
-	ownContentWindow = 2 * time.Minute
-	ownContentSlack  = time.Minute
-	ownContentKeep   = 4
-)
-
-type ownWrite struct {
-	size    int64
-	mtimeNS int64
-}
-
-type ownMark struct {
-	echoAt, contentAt time.Time
-	writes            []ownWrite // the Mac's own publications, newest last
-	adoptedNS         int64      // the Redis mtime of the Mac's own bytes (0: none)
-}
-
 type attrObservations struct {
 	mu  sync.Mutex
 	obs map[uint64]*attrObs
-	own map[uint64]*ownMark
 	// asIs: the values recently reported as they are, per inode (RAM only,
 	// review N3); idle ones go after attrObsIdle, and past attrObsMax the
 	// oldest tenth.
@@ -751,179 +711,8 @@ func (a *attrObservations) evictLocked() {
 	}
 }
 
-func (a *attrObservations) markLocked(inode uint64) *ownMark {
-	if a.own == nil {
-		a.own = make(map[uint64]*ownMark)
-	}
-	now := a.clock()
-	if len(a.own) > 4096 {
-		for k, m := range a.own {
-			if now.Sub(m.echoAt) > ownWindow && now.Sub(m.contentAt) > ownContentWindow {
-				delete(a.own, k)
-			}
-		}
-	}
-	m := a.own[inode]
-	if m == nil {
-		m = &ownMark{}
-		a.own[inode] = m
-	}
-	return m
-}
-
-func (a *attrObservations) noteOwn(inode uint64) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	a.markLocked(inode).echoAt = a.clock()
-}
-
-func (a *attrObservations) noteOwnContent(inode uint64, size int64, mtime time.Time) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	m := a.markLocked(inode)
-	m.contentAt = a.clock()
-	m.writes = append(m.writes, ownWrite{size, mtime.UnixNano()})
-	if len(m.writes) > ownContentKeep {
-		m.writes = m.writes[len(m.writes)-ownContentKeep:]
-	}
-}
-
-// echoFresh reports inode's echo mark without using it up.
-func (a *attrObservations) echoFresh(inode uint64) bool {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	m := a.own[inode]
-	return m != nil && !m.echoAt.IsZero() && a.clock().Sub(m.echoAt) <= ownWindow
-}
-
-// takeOwn uses up inode's echo mark: true if it was fresh.
-func (a *attrObservations) takeOwn(inode uint64) bool {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	m := a.own[inode]
-	if m == nil || m.echoAt.IsZero() {
-		return false
-	}
-	fresh := a.clock().Sub(m.echoAt) <= ownWindow
-	m.echoAt = time.Time{}
-	return fresh
-}
-
-// ownLatePart reports whether a ctime-only event under mtime is a later part
-// of the Mac's own bytes: the mtime its echo adopted, or exactly a (size,
-// mtime) the Mac published (a teammate's commit cannot carry either).
-func (a *attrObservations) ownLatePart(inode uint64, size int64, mtime time.Time) bool {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	m := a.own[inode]
-	if m == nil || m.contentAt.IsZero() || a.clock().Sub(m.contentAt) > ownContentWindow {
-		return false
-	}
-	ns := mtime.UnixNano()
-	if m.adoptedNS == ns {
-		return true
-	}
-	for _, w := range m.writes {
-		if w.size == size && w.mtimeNS == ns {
-			return true
-		}
-	}
-	return false
-}
-
-// ownBytes reports whether Redis's (size, mtime) of inode is one the Mac
-// itself published under a fresh content mark.
-func (a *attrObservations) ownBytes(inode uint64, size int64, mtime time.Time) bool {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	m := a.own[inode]
-	if m == nil || m.contentAt.IsZero() || a.clock().Sub(m.contentAt) > ownContentWindow {
-		return false
-	}
-	ns := mtime.UnixNano()
-	for _, w := range m.writes {
-		d := ns - w.mtimeNS
-		if d < 0 {
-			d = -d
-		}
-		if w.size == size && d <= int64(ownContentSlack) {
-			return true
-		}
-	}
-	return false
-}
-
-func (a *attrObservations) adoptOwn(inode uint64, mtimeNS int64) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if m := a.own[inode]; m != nil && !m.contentAt.IsZero() {
-		m.adoptedNS = mtimeNS
-	}
-}
-
 // attrObservation is what the last publication from Redis saw of inode.
 func (s *Store) attrObservation(inode uint64) (attrObs, bool) { return s.attrObs.get(inode) }
-
-// NoteOwnAttrChange records that this process is about to change the mode or
-// owner of path through juicefs (review M1 of #99).
-func (s *Store) NoteOwnAttrChange(path string) { s.NoteOwnWrite(path) }
-
-// NoteOwnWrite records that this process itself changes path in juicefs (a
-// chmod, a create, a rename): when the push cannot tell its echo from
-// another client's commit by the slice signature, the next event of the
-// inode is taken for the echo.
-func (s *Store) NoteOwnWrite(path string) {
-	if s == nil {
-		return
-	}
-	if e := s.LookupByPath(path); e != nil && !e.IsDir && e.Inode != 0 {
-		s.attrObs.noteOwn(e.Inode)
-	}
-}
-
-// NoteOwnInode is NoteOwnWrite for an inode the mirror may not show yet
-// (an app's save through a temp file and a rename over the original: the
-// stage's inode, before the rename; review N1).
-func (s *Store) NoteOwnInode(inode uint64) {
-	if s != nil && inode != 0 {
-		s.attrObs.noteOwn(inode)
-	}
-}
-
-// NoteOwnContent records that this process itself published path's bytes
-// with size and mtime (an in-place WRITE, a drain, a size publication): see
-// ownMark.
-func (s *Store) NoteOwnContent(path string, size int64, mtime time.Time) {
-	if s == nil {
-		return
-	}
-	if e := s.LookupByPath(path); e != nil && !e.IsDir && e.Inode != 0 {
-		s.attrObs.noteOwnContent(e.Inode, size, mtime)
-	}
-}
-
-func (s *Store) noteOwnContentInode(inode uint64, size int64, mtime time.Time) {
-	if s != nil && inode != 0 {
-		s.attrObs.noteOwnContent(inode, size, mtime)
-	}
-}
-
-func (s *Store) takeOwnChange(inode uint64) bool { return s.attrObs.takeOwn(inode) }
-
-// ownBytes: Redis's size and mtime of inode are the Mac's own publication.
-func (s *Store) ownBytes(inode uint64, size int64, mtime time.Time) bool {
-	return s.attrObs.ownBytes(inode, size, mtime)
-}
-
-// settleOwnMarks runs once a push row e is published (not skipped as
-// owned): it uses up the inode's echo mark (the event happened; review N4)
-// and adopts the mtime of the Mac's own published bytes.
-func (s *Store) settleOwnMarks(e *Entry) {
-	s.attrObs.takeOwn(e.Inode)
-	if e.span != nil && e.span.own {
-		s.attrObs.adoptOwn(e.Inode, e.Mtime.UnixNano())
-	}
-}
 
 // attrSpan is what a Redis publication read of a file besides its mtime and
 // size: ctime is zero when not read (a SCAN reads mtime and size only).
@@ -933,7 +722,8 @@ type attrSpan struct {
 	ctime      time.Time
 	sig        sliceSig
 	lateCommit bool
-	own        bool // the Mac's own bytes (a fresh content mark)
+	own        bool   // the Mac's own bytes (own_marks.go)
+	echoGen    uint64 // the inode's echo mark when the row was judged (own_marks.go)
 }
 
 // spanPreimage is what bulkInsertBatchWithEpoch knew of a row before it.

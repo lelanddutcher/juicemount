@@ -224,6 +224,7 @@ func (rc *RedisClient) reconcileFileAttrsOwned(inodes []uint64, generation uint6
 		// lands first (the Store rechecks under its writer lock).
 		if rc.store.ForegroundOwned(e.Path) {
 			deferred = append(deferred, inode)
+			rc.store.renewOwnEcho(inode) // its window runs from the release (own_marks.go)
 			continue
 		}
 		known = append(known, e)
@@ -287,9 +288,9 @@ func (rc *RedisClient) reconcileFileAttrsOwned(inodes []uint64, generation uint6
 					continue
 				}
 				obs := attrObs{mtimeNS: mtime.UnixNano(), ctimeNS: ctime.UnixNano(), sig: sig}
-				if rc.store.attrObs.ownLatePart(e.Inode, size, mtime) {
-					// A later part of the Mac's own bytes, under the very
-					// mtime it published or adopted (mtime_span.go).
+				if rc.store.ownBytes(e.Inode, size, mtime) {
+					// A later part of the Mac's own bytes: exactly the size
+					// and mtime its own change produced (own_marks.go).
 					rc.store.attrObs.putIf(e.Inode, obs, prev, have)
 					continue
 				}
@@ -320,7 +321,7 @@ func (rc *RedisClient) reconcileFileAttrsOwned(inodes []uint64, generation uint6
 					Inode:          e.Inode,
 					Mode:           e.Mode,
 					// Another client's part committed after this mtime.
-					span: &attrSpan{ctime: ctime, sig: sig, lateCommit: true},
+					span: &attrSpan{ctime: ctime, sig: sig, lateCommit: true, echoGen: rc.store.ownEchoGen(e.Inode)},
 				})
 				continue
 			}
@@ -333,10 +334,10 @@ func (rc *RedisClient) reconcileFileAttrsOwned(inodes []uint64, generation uint6
 				MtimeNsecKnown: true,
 				Inode:          e.Inode,
 				Mode:           e.Mode,
-				// The Mac's own bytes (a fresh content mark) are reported
+				// The Mac's own bytes (an exact content mark) are reported
 				// with their true mtime (review N6). Nothing is used up
 				// before the write (settleOwnMarks).
-				span: &attrSpan{sig: sig, own: rc.store.ownBytes(e.Inode, size, mtime)},
+				span: &attrSpan{sig: sig, own: rc.store.ownBytes(e.Inode, size, mtime), echoGen: rc.store.ownEchoGen(e.Inode)},
 			}
 			if ctimeOK {
 				up.span.ctime = ctime
@@ -365,6 +366,7 @@ func (rc *RedisClient) reconcileFileAttrsOwned(inodes []uint64, generation uint6
 			// nothing was recorded, and no own mark was used, so the re-read
 			// judges it again (#100 review M4).
 			deferred = append(deferred, e.Inode)
+			rc.store.renewOwnEcho(e.Inode)
 			continue
 		}
 		refreshed++
