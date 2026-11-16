@@ -2265,6 +2265,17 @@ func (s *Store) bulkInsertBatchWithEpoch(batch []*Entry, incremental bool, expec
 		if _, held := foreground[e.Path]; held {
 			continue
 		}
+		// Judge the Mac's own bytes again here (review 99e M1): the push
+		// judged before this lock, and a WRITE can mark, publish and
+		// release the path in that gap. Its mark is set before the release,
+		// so the re-check above and this judgment see it. A late commit
+		// that turns out to be the Mac's own is its echo: nothing moves and
+		// no content hook fires, as when the push judges it own.
+		ownEcho := false
+		if sp := e.span; sp != nil && !sp.own && !e.IsDir && e.Inode != 0 && s.ownBytes(e.Inode, e.Size, e.Mtime) {
+			ownEcho = sp.lateCommit
+			sp.own, sp.lateCommit = true, false
+		}
 		if !e.Version.IsZero() {
 			if e.Version.Path != e.Path {
 				return StoreEpoch{}, ErrMirrorConflict
@@ -2279,7 +2290,7 @@ func (s *Store) bulkInsertBatchWithEpoch(batch []*Entry, incremental bool, expec
 		if reconcile {
 			if e.IsDir {
 				reconcileDirs = append(reconcileDirs, e.Path)
-			} else if invalidate != nil {
+			} else if invalidate != nil && !ownEcho {
 				// The ordinary content hook can query Store and is unsafe
 				// with this transaction open. Use the non-reentrant SCAN
 				// hook with the exact preimage inode instead.

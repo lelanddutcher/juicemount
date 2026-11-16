@@ -7028,10 +7028,6 @@ type writeFile struct {
 	bound    metadata.MirrorToken
 	identity os.FileInfo
 	closed   bool
-
-	// ownWriteFrom, ownWriteTo bracket the last in-place WRITE, from the
-	// write syscall to the end of its sync (metadata/own_marks.go).
-	ownWriteFrom, ownWriteTo time.Time
 }
 
 func (f *writeFile) Name() string  { return f.name }

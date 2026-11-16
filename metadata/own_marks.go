@@ -18,19 +18,26 @@ import (
 //     row skipped because a foreground operation holds the path keeps the
 //     mark, and a mark set during the write survives. While the path is
 //     held, the deferral renews the mark, so its 30 s run from the release.
-//   - A content mark (an in-place WRITE, an in-place drain) records the
-//     exact size the Mac's own change left and the mtime JuiceFS gave it: a
-//     drain sets it (Chtimes, one exact value); a WRITE gets the time
-//     JuiceFS stamps inside the Mac's own write syscall, so the mark holds
-//     that syscall's interval up to the end of its sync, on the clock
+//   - A content mark (an in-place WRITE or truncate, an in-place drain)
+//     records the exact size the Mac's own change left and the mtime
+//     JuiceFS gave it: a drain sets it (Chtimes, one exact value, marked
+//     before the Chtimes); a WRITE or truncate gets the time JuiceFS stamps
+//     inside the Mac's own syscall, so the mark holds that one operation's
+//     interval, from its syscall to the end of its sync, on the clock
 //     JuiceFS stamps with (the same host). An fstat cannot give the exact
 //     value: JuiceFS answers from the open file's cached attributes, which
 //     still hold the previous WRITE's mtime (lab 2026-11-16). A row from
 //     Redis is the Mac's own bytes only with exactly that size and an mtime
 //     inside that interval: then its true mtime is reported (a changed
-//     row), or a later ctime-only part under it is the Mac's own. A
-//     teammate's save would have to commit, with the same size, while the
-//     Mac's own WRITE of the file was running; any other counts.
+//     row), or a later ctime-only part under it is the Mac's own. The span
+//     this leaves: a teammate's save of the same size whose write time, on
+//     the teammate's own clock, falls inside the interval of one of the
+//     Mac's own operations on the file (its commit can come later, within
+//     the 2 min the mark lasts). Any other save counts.
+//
+// The push judges marks before the Store write; the Store write judges
+// them again under its lock (review 99e M1), so a WRITE that marks and
+// releases its path in between is still the Mac's own.
 //
 // Marks are kept in time order: each call drops the expired heads, so its
 // cost is the number of marks that expired since, and past ownMarksMax the
@@ -302,4 +309,14 @@ func (s *Store) settleOwnMarks(e *Entry) {
 	if e.span != nil {
 		s.own.takeEchoIf(e.Inode, e.span.echoGen)
 	}
+}
+
+// OwnBytesMarked reports whether path's (size, mtime) is marked as the Mac's
+// own bytes (tests and diagnostics; the push uses ownBytes).
+func (s *Store) OwnBytesMarked(path string, size int64, mtime time.Time) bool {
+	if s == nil {
+		return false
+	}
+	e := s.ownFile(path)
+	return e != nil && s.ownBytes(e.Inode, size, mtime)
 }

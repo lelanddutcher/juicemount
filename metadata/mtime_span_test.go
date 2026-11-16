@@ -942,3 +942,77 @@ func TestHeldEchoMarkRunsFromTheRelease(t *testing.T) {
 		t.Fatal("the echo mark expired while its path was held")
 	}
 }
+
+// Review 99e M1: the push judges a changed row before the Mac's own WRITE
+// marks it; the WRITE marks, publishes and releases the path before the
+// Store write. The Store write judges again under its lock: the Mac's own
+// save keeps its true mtime.
+func TestOwnWriteMarkedAfterThePushJudgedKeepsItsMtime(t *testing.T) {
+	l := newSpanLab(t)
+	if err := l.store.SetSizeExact("media.mov", 9000, time.Unix(1700000290, 0)); err != nil {
+		t.Fatal(err)
+	}
+	l.set(time.Unix(1700000290, 0), time.Unix(1700000290, 0), 9000, 2)
+	l.push()
+	mown := time.Unix(1700000299, 700000000) // JuiceFS's stamp of the Mac's WRITE
+	l.set(mown, mown.Add(time.Second), 9000, 3)
+	e := l.store.LookupByInode(42)
+	own := l.store.ownBytes(42, 9000, mown) // the push's judgment: no mark yet
+	if own {
+		t.Fatal("setup: marked before the judgment")
+	}
+	up := &Entry{Path: e.Path, Name: e.Name, ParentPath: e.ParentPath, Size: 9000, Mtime: mown,
+		MtimeNsecKnown: true, Inode: 42, Mode: e.Mode, span: &attrSpan{sig: sliceSig{3, 3}, own: own, ctime: mown.Add(time.Second)}}
+	// The WRITE finishes: mark, publish, release.
+	l.store.NoteOwnBytes("media.mov", 9000, mown.Add(-300*time.Microsecond), mown.Add(2*time.Second))
+	if err := l.store.SetSizeExact("media.mov", 9000, mown.Add(2100*time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	token := l.rc.scanToken()
+	if _, err := l.rc.applyReconcileUpsertsOwned([]*Entry{up}, &token); err != nil {
+		t.Fatal(err)
+	}
+	if got := l.reported(); !got.Equal(mown) {
+		t.Errorf("the Mac's own save reported %d, want its true mtime %d", got.UnixNano(), mown.UnixNano())
+	}
+}
+
+// Review 99e M1, the late-commit shape: a ctime-only part judged a late
+// commit before the mark that makes it the Mac's own. The Store write
+// judges it own: nothing moves, no content hook fires, and the caller does
+// not count it as late.
+func TestOwnLateCommitMarkedAfterThePushJudgedIsItsEcho(t *testing.T) {
+	l := newSpanLab(t)
+	clock := time.Unix(1700000300, 0)
+	l.store.own.now = func() time.Time { return clock }
+	l.set(time.Unix(1700000290, 0), time.Unix(1700000290, 0), 9000, 2)
+	l.push()
+	mown := time.Unix(1700000299, 700000000)
+	from, to := mown.Add(-300*time.Microsecond), mown.Add(2*time.Second)
+	l.store.NoteOwnBytes("media.mov", 9000, from, to)
+	l.set(mown, mown.Add(time.Second), 9000, 3)
+	l.push()
+	if got := l.reported(); !got.Equal(mown) {
+		t.Fatalf("setup: own save reported %d, want %d", got.UnixNano(), mown.UnixNano())
+	}
+	clock = clock.Add(3 * time.Minute) // the mark expired: the push judges a late commit
+	e := l.store.LookupByInode(42)
+	late := &Entry{Path: e.Path, Name: e.Name, ParentPath: e.ParentPath, Size: 9000, Mtime: mown,
+		MtimeNsecKnown: true, Inode: 42, Mode: e.Mode,
+		span: &attrSpan{ctime: mown.Add(3 * time.Second), sig: unknownSig, lateCommit: true}}
+	l.store.NoteOwnBytes("media.mov", 9000, from, to) // the Mac's own operation marks it
+	hooks := l.hooks()
+	token := l.rc.scanToken()
+	if _, err := l.rc.applyReconcileUpsertsOwned([]*Entry{late}, &token); err != nil {
+		t.Fatal(err)
+	}
+	if got := l.reported(); !got.Equal(mown) {
+		t.Errorf("own late part moved the mtime to %d, want %d", got.UnixNano(), mown.UnixNano())
+	}
+	if l.hooks() != hooks {
+		t.Errorf("own late part fired %d content hooks", l.hooks()-hooks)
+	}
+	if late.span == nil || late.span.lateCommit || !late.span.own {
+		t.Errorf("the caller still sees a late commit: %+v", late.span)
+	}
+}

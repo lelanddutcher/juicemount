@@ -235,17 +235,19 @@ func (f *writeFile) verifyMutation(m metadata.OnlineMutation) error {
 	return nil
 }
 
-func (f *writeFile) publishMutation(m metadata.OnlineMutation) error {
-	// The Mac's own bytes: JuiceFS stamps their mtime inside this WRITE, from
-	// its syscall to the end of its sync, on this host's clock (lab 11-16:
-	// 0.2–0.3 ms after the syscall began). An fstat cannot give the exact
-	// value: JuiceFS serves the open file's cached attributes, which still
-	// hold the previous WRITE's mtime. Marked while the operation holds the
-	// path (metadata/own_marks.go).
-	if !f.ownWriteFrom.IsZero() && !f.ownWriteTo.Before(f.ownWriteFrom) {
-		f.handler.store.NoteOwnBytes(f.name, m.TargetEOF, f.ownWriteFrom, f.ownWriteTo)
-		jmlog.Debug("own write marked", "path", f.name, "size", m.TargetEOF,
-			"from_ns", f.ownWriteFrom.UnixNano(), "to_ns", f.ownWriteTo.UnixNano())
+// publishMutation publishes an in-place WRITE or truncate. from and to
+// bracket that one operation, from its syscall to the end of its sync: the
+// Mac's own bytes, whose mtime JuiceFS stamps inside the operation on this
+// host's clock (lab 11-16: 0.2–0.3 ms after the syscall began). An fstat
+// cannot give the exact value: JuiceFS serves the open file's cached
+// attributes, which still hold the previous WRITE's mtime. Each operation
+// passes its own interval, so a truncate never reuses a WRITE's (review 99e
+// M2). Marked while the operation holds the path (metadata/own_marks.go).
+func (f *writeFile) publishMutation(m metadata.OnlineMutation, from, to time.Time) error {
+	if !from.IsZero() && !to.Before(from) {
+		f.handler.store.NoteOwnBytes(f.name, m.TargetEOF, from, to)
+		jmlog.Debug("own write marked", "path", f.name, "kind", m.Kind, "size", m.TargetEOF,
+			"from_ns", from.UnixNano(), "to_ns", to.UnixNano())
 	}
 	e, err := f.handler.store.CompleteOnlineMutation(m, time.Now())
 	if err != nil {
@@ -288,6 +290,7 @@ func (f *writeFile) truncateOwned(size int64, op *namespaceOperation) error {
 			return err
 		}
 	}
+	from := time.Now()
 	if err := f.File.Truncate(size); err != nil {
 		return err
 	}
@@ -301,10 +304,11 @@ func (f *writeFile) truncateOwned(size int64, op *namespaceOperation) error {
 	if err := f.handler.syncOnlineMutation(f.File); err != nil {
 		return err
 	}
+	to := time.Now()
 	if err := f.verifyMutation(m); err != nil {
 		return err
 	}
-	if err := f.publishMutation(m); err != nil {
+	if err := f.publishMutation(m, from, to); err != nil {
 		return err
 	}
 	f.writtenEnd = size
@@ -367,7 +371,7 @@ func (f *writeFile) writeBound(p []byte, off int64, positioned bool) (n int, err
 			return 0, err
 		}
 	}
-	f.ownWriteFrom = time.Now()
+	from := time.Now()
 	if positioned {
 		n, err = f.File.WriteAt(p, off)
 	} else {
@@ -393,11 +397,11 @@ func (f *writeFile) writeBound(p []byte, off int64, positioned bool) (n int, err
 	if err = f.handler.syncOnlineMutation(f.File); err != nil {
 		return n, err
 	}
-	f.ownWriteTo = time.Now()
+	to := time.Now()
 	if err = f.verifyMutation(m); err != nil {
 		return n, err
 	}
-	if err = f.publishMutation(m); err != nil {
+	if err = f.publishMutation(m, from, to); err != nil {
 		return n, err
 	}
 	op.poison = false
