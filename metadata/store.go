@@ -2107,12 +2107,14 @@ func (s *Store) bulkInsertBatchWithEpoch(batch []*Entry, incremental bool, expec
 		path             string
 		inode            uint64
 		trueNS, reportNS int64
+		size             int64
+		own              bool
 	}
 	var moved, committedMoves []movedMtime
 	defer func() {
 		for _, m := range committedMoves {
 			jmlog.Info("metadata mtime span: reported mtime moved", "path", m.path, "inode", m.inode,
-				"true_ns", m.trueNS, "reported_ns", m.reportNS)
+				"true_ns", m.trueNS, "reported_ns", m.reportNS, "size", m.size, "own_bytes", m.own)
 		}
 	}()
 	s.writeMu.Lock()
@@ -2335,6 +2337,7 @@ func (s *Store) bulkInsertBatchWithEpoch(batch []*Entry, incremental bool, expec
 			if err != nil {
 				return StoreEpoch{}, err
 			}
+			ownBytes := e.span != nil && e.span.own
 			change, obs, keepNewer := s.mtimeSpanUpdate(e, span, spanPresent, history)
 			if change != nil {
 				if err := change.write(tx); err != nil {
@@ -2343,7 +2346,7 @@ func (s *Store) bulkInsertBatchWithEpoch(batch []*Entry, incremental bool, expec
 				s.attrObs.noteSQL(e.Inode)
 				overlays = append(overlays, *change)
 				if r := change.rs[len(change.rs)-1]; r.reportedNS != r.trueNS {
-					moved = append(moved, movedMtime{e.Path, e.Inode, r.trueNS, r.reportedNS})
+					moved = append(moved, movedMtime{e.Path, e.Inode, r.trueNS, r.reportedNS, e.Size, ownBytes})
 				}
 			}
 			observations = append(observations, spanObs{e.Inode, obs, keepNewer})

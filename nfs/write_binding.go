@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/lelanddutcher/juicemount/internal/cache/pin"
+	"github.com/lelanddutcher/juicemount/internal/jmlog"
 	"github.com/lelanddutcher/juicemount/internal/metrics"
 	"github.com/lelanddutcher/juicemount/metadata"
 )
@@ -243,6 +244,8 @@ func (f *writeFile) publishMutation(m metadata.OnlineMutation) error {
 	// path (metadata/own_marks.go).
 	if !f.ownWriteFrom.IsZero() && !f.ownWriteTo.Before(f.ownWriteFrom) {
 		f.handler.store.NoteOwnBytes(f.name, m.TargetEOF, f.ownWriteFrom, f.ownWriteTo)
+		jmlog.Debug("own write marked", "path", f.name, "size", m.TargetEOF,
+			"from_ns", f.ownWriteFrom.UnixNano(), "to_ns", f.ownWriteTo.UnixNano())
 	}
 	e, err := f.handler.store.CompleteOnlineMutation(m, time.Now())
 	if err != nil {
