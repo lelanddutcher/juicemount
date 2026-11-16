@@ -37,6 +37,9 @@ func (s *Store) ScanClearLocalOnlyBatch(paths []string, expected StoreEpoch) (St
 		if _, held := protected.paths[p]; held {
 			continue
 		}
+		if s.ForegroundOwned(p) {
+			continue // foreground_owner.go: its own publication decides
+		}
 		result, err := tx.Exec(`UPDATE entries SET local_only=0 WHERE path=? AND local_only=1`, p)
 		if err != nil {
 			return StoreEpoch{}, fmt.Errorf("SCAN clear local_only %q: %w", p, err)
@@ -150,6 +153,9 @@ func (s *Store) ScanDeletePathsBatch(paths []string, expected StoreEpoch) (Store
 	for _, p := range paths {
 		if _, held := protected.paths[p]; held {
 			return StoreEpoch{}, ErrMirrorConflict
+		}
+		if s.ForegroundOwned(p) {
+			return StoreEpoch{}, ErrForegroundOwned
 		}
 	}
 	type oldContent struct {

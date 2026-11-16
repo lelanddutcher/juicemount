@@ -27,6 +27,16 @@ func (s *Store) RenameExpected(source, destination MirrorToken) (int, error) {
 	return s.renameMirror(source.Path, destination.Path, &source, &destination, true)
 }
 
+// RenameExpectedWithParent is RenameExpected that also holds the destination
+// folder to the token captured before the backing rename. The relaxed check
+// for an owned absent destination (validateAbsentOwned) looks at the name
+// only; a teammate renaming or removing that folder meanwhile must still fail
+// the publication (review M3 of #100). A zero parent (the volume root) is not
+// checked.
+func (s *Store) RenameExpectedWithParent(source, destination, destinationParent MirrorToken) (int, error) {
+	return s.renameMirrorParent(source.Path, destination.Path, &source, &destination, &destinationParent, true)
+}
+
 // CaptureRename refuses a known incomplete mirror before the caller changes
 // backing names. Publication rechecks this condition because legacy background
 // writers do not yet share the foreground namespace coordinator.
@@ -80,6 +90,10 @@ func validateCachedSubtreeSnapshot(tx *sql.Tx, tokens []MirrorToken) error {
 }
 
 func (s *Store) renameMirror(oldDir, newDir string, source, destination *MirrorToken, includeRoot bool) (int, error) {
+	return s.renameMirrorParent(oldDir, newDir, source, destination, nil, includeRoot)
+}
+
+func (s *Store) renameMirrorParent(oldDir, newDir string, source, destination, destinationParent *MirrorToken, includeRoot bool) (int, error) {
 	if oldDir == newDir || strings.HasPrefix(newDir, oldDir+"/") {
 		return 0, ErrMirrorConflict
 	}
@@ -129,6 +143,39 @@ func (s *Store) renameMirror(oldDir, newDir string, source, destination *MirrorT
 			}
 			if roots[i].present && roots[i].version != *expected {
 				return 0, ErrMirrorConflict
+			}
+			if i == 1 && expected.Incarnation == "" && destinationParent != nil && s.ForegroundOwned(expected.Path) {
+				// An absent destination's token is the store-wide epoch, which
+				// any unrelated write moves. Abroad the backing rename takes
+				// about a second, and some other file's write lands in it
+				// nearly every time, so the rename failed after it had moved
+				// the file (laptop B1). The caller's namespace operation owns
+				// this name, so no foreground writer can create it and the
+				// background feeds skip it (foreground_owner.go). What must
+				// hold is the name itself: still absent, same store.
+				if err := validateAbsentOwned(tx, *expected); err != nil {
+					return 0, err
+				}
+				// ...and its folder is the one observed before the backing
+				// rename (a teammate may rename or remove it meanwhile).
+				switch {
+				case destinationParent.IsZero(): // the volume root
+				case destinationParent.Incarnation == "":
+					// Not mirrored when observed: it must still not be.
+					if err := validateAbsentOwned(tx, *destinationParent); err != nil {
+						return 0, err
+					}
+				default:
+					// The same folder row, not the same revision: background
+					// feeds rewrite a folder's row all the time (a parent
+					// refresh, a SCAN, a mkdir's local-only flag), and failing
+					// here after the backing rename blocks both names (review
+					// H1 of the second #100 review).
+					if err := validateSameIncarnation(tx, *destinationParent); err != nil {
+						return 0, err
+					}
+				}
+				continue
 			}
 			if err := validateExpected(tx, *expected); err != nil {
 				return 0, err

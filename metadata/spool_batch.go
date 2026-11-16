@@ -249,9 +249,13 @@ func (s *Store) completeDrains(items []DrainCommitItem, exactSize bool) ([]Drain
 		if !results[i].Done || (!exactSize && it.Size == 0) {
 			continue
 		}
-		// This process wrote the file: its echo may be taken for it when the
-		// attr push cannot tell by the slice signature (mtime_span.go).
-		s.noteOwnInode(results[i].Inode)
+		// This process wrote the file: its echo keeps its true mtime
+		// (content mark, mtime_span.go).
+		mt := it.Mtime
+		if exactSize {
+			mt = results[i].Mtime
+		}
+		s.noteOwnContentInode(results[i].Inode, it.Size, mt)
 		if e, ok := s.pathCache[it.NFSPath]; ok {
 			oldSize := e.Size
 			if exactSize || it.Size > e.Size {

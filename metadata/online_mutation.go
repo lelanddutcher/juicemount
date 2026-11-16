@@ -335,6 +335,10 @@ func (s *Store) CompleteOnlineMutation(m OnlineMutation, mtime time.Time) (*Entr
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
+	// The Mac's own bytes: their echo keeps its true mtime (mtime_span.go).
+	// Marked while the operation still holds the path, so the held echo's
+	// re-read finds it.
+	s.noteOwnContentInode(e.Inode, e.Size, mtime)
 	s.mu.Lock()
 	s.publishEntryLocked(e)
 	s.mu.Unlock()

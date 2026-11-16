@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -498,7 +499,7 @@ func TestAttrPushOwnSaveEchoKeepsTheMtime(t *testing.T) {
 	if err := l.store.Insert(e); err != nil { // the drain publishes the row itself
 		t.Fatal(err)
 	}
-	l.store.noteOwnInode(42)                     // as completeDrains marks it
+	l.store.noteOwnContentInode(42, 9000, own)   // as completeDrains marks it
 	l.set(own, own.Add(40*time.Second), 9000, 1) // its echo (Chtimes)
 	l.push()
 	l.set(own, own.Add(41*time.Second), 9000, 1) // the drain's chmod
@@ -680,5 +681,126 @@ func TestReadAttrsAndSigsAgainstRedis(t *testing.T) {
 	_, b := read()
 	if b.count != 3 || b.sameContent(a) {
 		t.Fatalf("commit + compaction: %+v vs %+v", b, a)
+	}
+}
+
+// heldLab holds media.mov for a foreground operation while held is set. With
+// raceOnce set to 1, the next check (the push's pre-check) passes and the
+// one after it (the Store's recheck under its writer lock) refuses: the owner
+// began between the read and the write.
+func heldLab(t *testing.T) (*spanLab, *atomic.Bool, *atomic.Int32) {
+	l := newSpanLab(t)
+	var held atomic.Bool
+	var raceOnce atomic.Int32
+	l.store.SetForegroundOwner(func(p string) bool {
+		if p != "media.mov" {
+			return false
+		}
+		switch raceOnce.Load() {
+		case 1:
+			raceOnce.Store(2)
+			return false
+		case 2:
+			raceOnce.Store(0)
+			return true
+		}
+		return held.Load()
+	})
+	return l, &held, &raceOnce
+}
+
+func (l *spanLab) pushOwned() (deferred []uint64) {
+	l.t.Helper()
+	retry, deferred, err := l.rc.reconcileFileAttrsOwned([]uint64{42}, l.gen)
+	if err != nil || retry != nil {
+		l.t.Fatalf("push: retry %v err %v", retry, err)
+	}
+	return deferred
+}
+
+// #100 review M4 and review b M1: the Mac's in-place save abroad holds the
+// file while its WRITEs sync. The attr push meets the held file (at its
+// pre-check, or at the Store's recheck when the owner begins in between) and
+// reads it again after the release. The re-read must take the echo for the
+// Mac's own bytes: the true mtime, no late commit, no +1 ns. A later commit
+// of the same bytes under that mtime is the Mac's own too.
+func TestHeldOwnInPlaceSaveKeepsItsMtime(t *testing.T) {
+	for _, race := range []bool{false, true} {
+		name := "held at the pre-check"
+		if race {
+			name = "owner begins between the read and the write"
+		}
+		t.Run(name, func(t *testing.T) {
+			l, held, raceOnce := heldLab(t)
+			m0 := time.Unix(1700000100, 25)
+			l.set(m0, m0.Add(time.Second), 8192, 2) // a teammate's file
+			l.push()
+			// The Mac's in-place save publishes its own row (seconds only,
+			// as CompleteOnlineMutation does) while the operation holds it.
+			held.Store(true)
+			ownSec := time.Unix(1700000300, 0)
+			if err := l.store.SetSizeExact("media.mov", 9000, ownSec); err != nil {
+				t.Fatal(err)
+			}
+			// Its echo: JuiceFS's own mtime, from the previous second (the
+			// sync took a while abroad). Without the own mark this would be
+			// reported as ownSec + 1 ns.
+			mown := time.Unix(1700000299, 700000000)
+			l.set(mown, mown.Add(2*time.Second), 9000, 3)
+			if !race {
+				if d := l.pushOwned(); len(d) != 1 {
+					t.Fatalf("held: deferred %v", d)
+				}
+			}
+			held.Store(false)
+			if race {
+				raceOnce.Store(1)
+				if d := l.pushOwned(); len(d) != 1 {
+					t.Fatalf("raced: deferred %v", d)
+				}
+			}
+			lateBefore := attrPushLateCommits.Load()
+			if d := l.pushOwned(); len(d) != 0 { // the re-read
+				t.Fatalf("re-read deferred %v", d)
+			}
+			if got := l.reported(); !got.Equal(mown) {
+				t.Fatalf("own save after the re-read: NFS mtime %v, want %v (no +1 ns)", got, mown)
+			}
+			l.set(mown, mown.Add(3*time.Second), 9000, 4) // a later part of the same save
+			l.push()
+			if got := l.reported(); !got.Equal(mown) || attrPushLateCommits.Load() != lateBefore {
+				t.Fatalf("own late part: NFS mtime %v, late commits +%d", got, attrPushLateCommits.Load()-lateBefore)
+			}
+		})
+	}
+}
+
+// A teammate's commit that lands while the Mac holds the file still counts on
+// the re-read, with the Mac's own content mark fresh.
+func TestTeammateCommitDuringHeldWindowCounts(t *testing.T) {
+	l, held, _ := heldLab(t)
+	ownSec := time.Unix(1700000300, 0)
+	if err := l.store.SetSizeExact("media.mov", 9000, ownSec); err != nil {
+		t.Fatal(err)
+	}
+	mown := time.Unix(1700000299, 700000000)
+	l.set(mown, mown.Add(time.Second), 9000, 3)
+	l.push() // the Mac's own echo
+	mt := time.Unix(1700000400, 250)
+	l.set(mt, mt.Add(time.Second), 9500, 5) // the teammate's save, first commit
+	l.push()
+	if got := l.reported(); !got.Equal(mt) {
+		t.Fatalf("teammate's save: NFS mtime %v, want %v", got, mt)
+	}
+	before, lateBefore := l.hooks(), attrPushLateCommits.Load()
+	held.Store(true)
+	l.set(mt, mt.Add(2*time.Second), 9500, 6) // its late part, while held
+	if d := l.pushOwned(); len(d) != 1 || l.hooks() != before {
+		t.Fatalf("held: deferred %v hooks %d -> %d", d, before, l.hooks())
+	}
+	held.Store(false)
+	l.pushOwned()
+	if got := l.reported(); got.Equal(mt) || l.hooks() != before+1 || attrPushLateCommits.Load() != lateBefore+1 {
+		t.Fatalf("re-read: NFS mtime %v hooks %d -> %d late +%d", got, before, l.hooks(), attrPushLateCommits.Load()-lateBefore)
 	}
 }

@@ -146,7 +146,11 @@ func (rc *RedisClient) newAttrCoalescer(generation uint64) *inodeCoalescer {
 	var retryMu sync.Mutex
 	retries := map[uint64]int{} // consecutive failures per inode
 	c.apply = func(batch []uint64) {
-		failed, err := rc.reconcileFileAttrs(batch, generation)
+		failed, deferred, err := rc.reconcileFileAttrsOwned(batch, generation)
+		for _, inode := range deferred {
+			// Client-lifetime queue: survives a resubscribe (review M1).
+			rc.deferOwnedFile(inode)
+		}
 		failedSet := make(map[uint64]struct{}, len(failed))
 		for _, inode := range failed {
 			failedSet[inode] = struct{}{}
@@ -188,9 +192,18 @@ func (rc *RedisClient) newAttrCoalescer(generation uint64) *inodeCoalescer {
 // again under the same mtime (a late commit, mtime_span.go). It returns the
 // inodes to retry.
 func (rc *RedisClient) reconcileFileAttrs(inodes []uint64, generation uint64) (retry []uint64, err error) {
+	retry, _, err = rc.reconcileFileAttrsOwned(inodes, generation)
+	return retry, err
+}
+
+// reconcileFileAttrsOwned is reconcileFileAttrs that also returns the inodes
+// deferred because a foreground mutation owns their path (an in-place WRITE
+// still syncing: foreground_owner.go). A deferred inode is not a failure: it
+// is read again after attrRetryBase, without using its retry budget.
+func (rc *RedisClient) reconcileFileAttrsOwned(inodes []uint64, generation uint64) (retry, deferred []uint64, err error) {
 	token := rc.scanToken()
 	if token.backend != generation || !rc.scanTokenValid(token) {
-		return nil, ErrBackendUnqualified
+		return nil, nil, ErrBackendUnqualified
 	}
 	guard := rc.loadSpoolGuard()
 	known := make([]*Entry, 0, len(inodes))
@@ -207,17 +220,23 @@ func (rc *RedisClient) reconcileFileAttrs(inodes []uint64, generation uint64) (r
 		if guard != nil && guard(e.Path) {
 			continue
 		}
+		// This client is changing the file right now; its own publication
+		// lands first (the Store rechecks under its writer lock).
+		if rc.store.ForegroundOwned(e.Path) {
+			deferred = append(deferred, inode)
+			continue
+		}
 		known = append(known, e)
 	}
 	if len(known) == 0 {
-		return nil, nil
+		return nil, deferred, nil
 	}
 	if len(known) > attrBurstCeiling {
 		noteKeyspaceScanPromotion()
 		jmlog.Info("metadata attr push: burst over ceiling, promoting to full SCAN",
 			"files", len(known), "ceiling", attrBurstCeiling)
 		rc.keyspaceTriggerSync()
-		return nil, nil
+		return nil, deferred, nil
 	}
 	attrPushBatches.Add(1)
 
@@ -242,7 +261,7 @@ func (rc *RedisClient) reconcileFileAttrs(inodes []uint64, generation uint64) (r
 			if merr == nil {
 				merr = ErrMirrorConflict
 			}
-			return retry, merr
+			return retry, deferred, merr
 		}
 		for i, v := range vals {
 			str, ok := v.(string)
@@ -268,21 +287,29 @@ func (rc *RedisClient) reconcileFileAttrs(inodes []uint64, generation uint64) (r
 					continue
 				}
 				obs := attrObs{mtimeNS: mtime.UnixNano(), ctimeNS: ctime.UnixNano(), sig: sig}
-				// Any event consumes the own mark, so an unused one cannot
-				// absorb a later commit (review N4).
-				own := rc.store.takeOwnChange(e.Inode)
-				if sig.sameContent(prev.sig) {
-					// The same slices: a chmod, chown, rename or link.
+				if rc.store.attrObs.ownLatePart(e.Inode, size, mtime) {
+					// A later part of the Mac's own bytes, under the very
+					// mtime it published or adopted (mtime_span.go).
 					rc.store.attrObs.putIf(e.Inode, obs, prev, have)
 					continue
 				}
-				if (!sig.known() || !prev.sig.known()) && own {
+				if sig.sameContent(prev.sig) {
+					// The same slices: a chmod, chown, rename or link. The
+					// event uses up an echo mark (review N4).
+					rc.store.takeOwnChange(e.Inode)
+					rc.store.attrObs.putIf(e.Inode, obs, prev, have)
+					continue
+				}
+				if (!sig.known() || !prev.sig.known()) && rc.store.takeOwnChange(e.Inode) {
 					// The signature cannot decide, and this process just
 					// changed the file itself: that one event is its echo
-					// (review H1 of the second review; the mark is consumed).
+					// (review H1 of the second review; the mark is used up).
 					rc.store.attrObs.putIf(e.Inode, obs, prev, have)
 					continue
 				}
+				// A late commit: it goes to the Store write. An echo mark is
+				// used up only once that write commits (settleOwnMarks), so
+				// a row skipped as owned keeps it (#100 review M4).
 				toUpsert = append(toUpsert, &Entry{
 					Path:           e.Path,
 					Name:           e.Name,
@@ -306,9 +333,10 @@ func (rc *RedisClient) reconcileFileAttrs(inodes []uint64, generation uint64) (r
 				MtimeNsecKnown: true,
 				Inode:          e.Inode,
 				Mode:           e.Mode,
-				// This process's own save (a drain, a rename over the
-				// file) is reported with its true mtime (review N6).
-				span: &attrSpan{sig: sig, own: rc.store.takeOwnChange(e.Inode)},
+				// The Mac's own bytes (a fresh content mark) are reported
+				// with their true mtime (review N6). Nothing is used up
+				// before the write (settleOwnMarks).
+				span: &attrSpan{sig: sig, own: rc.store.ownBytes(e.Inode, size, mtime)},
 			}
 			if ctimeOK {
 				up.span.ctime = ctime
@@ -317,26 +345,41 @@ func (rc *RedisClient) reconcileFileAttrs(inodes []uint64, generation uint64) (r
 		}
 	}
 	if len(toUpsert) == 0 {
-		return nil, nil
+		return nil, deferred, nil
 	}
-	if err := rc.applyReconcileUpsertsWithToken(toUpsert, &token); err != nil {
-		// Nothing was recorded for these rows: the retry judges them again.
+	owned, err := rc.applyReconcileUpsertsOwned(toUpsert, &token)
+	if err != nil {
 		for _, e := range toUpsert {
 			retry = append(retry, e.Inode)
 		}
-		return retry, err
+		return retry, deferred, err
 	}
-	attrPushRefreshed.Add(int64(len(toUpsert)))
-	late := 0
+	ownedSet := make(map[string]struct{}, len(owned))
+	for _, p := range owned {
+		ownedSet[p] = struct{}{}
+	}
+	late, refreshed := 0, 0
 	for _, e := range toUpsert {
+		if _, held := ownedSet[e.Path]; held {
+			// An owner took the path between the pre-check and the write:
+			// nothing was recorded, and no own mark was used, so the re-read
+			// judges it again (#100 review M4).
+			deferred = append(deferred, e.Inode)
+			continue
+		}
+		refreshed++
 		if e.span != nil && e.span.lateCommit {
 			late++
 		}
+		rc.store.settleOwnMarks(e) // mtime_span.go
 	}
-	if late > 0 {
-		attrPushLateCommits.Add(int64(late))
+	if refreshed > 0 {
+		attrPushRefreshed.Add(int64(refreshed))
+		if late > 0 {
+			attrPushLateCommits.Add(int64(late))
+		}
+		jmlog.Info("metadata attr push: refreshed", "events", len(inodes), "files", len(known), "changed", refreshed,
+			"first", toUpsert[0].Path, "late_commits", late)
 	}
-	jmlog.Info("metadata attr push: refreshed", "events", len(inodes), "files", len(known), "changed", len(toUpsert),
-		"first", toUpsert[0].Path, "late_commits", late)
-	return nil, nil
+	return nil, deferred, nil
 }

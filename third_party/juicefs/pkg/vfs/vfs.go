@@ -548,7 +548,7 @@ func (v *VFS) Open(ctx Context, ino Ino, flags uint32) (entry *meta.Entry, fh ui
 	}()
 	var attr = &Attr{}
 	if IsSpecialNode(ino) {
-		if ino != controlInode && (flags&O_ACCMODE) != syscall.O_RDONLY {
+		if !jmIsControl(ino) && (flags&O_ACCMODE) != syscall.O_RDONLY { // JuiceMount patch 0033
 			err = syscall.EACCES
 			return
 		}
@@ -685,8 +685,8 @@ func hasReadPerm(flag uint32) bool {
 func (v *VFS) Read(ctx Context, ino Ino, buf []byte, off uint64, fh uint64) (n int, err syscall.Errno) {
 	size := uint32(len(buf))
 	if IsSpecialNode(ino) {
-		if ino == controlInode && runtime.GOOS == "darwin" {
-			fh = v.getControlHandle(ctx.Pid())
+		if jmIsControl(ino) && runtime.GOOS == "darwin" { // JuiceMount patch 0033
+			fh = v.getControlHandle(ino, ctx.Pid())
 		}
 		h := v.findHandle(ino, fh)
 		if h == nil {
@@ -796,8 +796,8 @@ func (v *VFS) Read(ctx Context, ino Ino, buf []byte, off uint64, fh uint64) (n i
 
 func (v *VFS) Write(ctx Context, ino Ino, buf []byte, off, fh uint64) (err syscall.Errno) {
 	size := uint64(len(buf))
-	if ino == controlInode && runtime.GOOS == "darwin" {
-		fh = v.getControlHandle(ctx.Pid())
+	if jmIsControl(ino) && runtime.GOOS == "darwin" { // JuiceMount patch 0033
+		fh = v.getControlHandle(ino, ctx.Pid())
 	}
 	defer func() { logit(ctx, "write", err, "(%d,%d,%d,%d)", ino, size, off, fh) }()
 	h := v.findHandle(ino, fh)
@@ -810,7 +810,7 @@ func (v *VFS) Write(ctx Context, ino Ino, buf []byte, off, fh uint64) (err sysca
 		return
 	}
 
-	if ino == controlInode {
+	if jmIsControl(ino) { // JuiceMount patch 0033
 		h.Lock()
 		defer h.Unlock()
 		h.pending = append(h.pending, buf...)
@@ -985,9 +985,9 @@ func (v *VFS) CopyFileRange(ctx Context, nodeIn Ino, fhIn, offIn uint64, nodeOut
 }
 
 func (v *VFS) Flush(ctx Context, ino Ino, fh uint64, lockOwner uint64) (err syscall.Errno) {
-	if ino == controlInode && runtime.GOOS == "darwin" {
-		fh = v.getControlHandle(ctx.Pid())
-		defer v.releaseControlHandle(ctx.Pid())
+	if jmIsControl(ino) && runtime.GOOS == "darwin" { // JuiceMount patch 0033
+		fh = v.getControlHandle(ino, ctx.Pid())
+		defer v.releaseControlHandle(ino, ctx.Pid())
 	}
 	defer func() { logit(ctx, "flush", err, "(%d,%d,%016X)", ino, fh, lockOwner) }()
 	h := v.findHandle(ino, fh)
@@ -996,7 +996,7 @@ func (v *VFS) Flush(ctx Context, ino Ino, fh uint64, lockOwner uint64) (err sysc
 		return
 	}
 	if IsSpecialNode(ino) {
-		if ino == controlInode && h.bctx != nil {
+		if jmIsControl(ino) && h.bctx != nil { // JuiceMount patch 0033
 			h.bctx.Cancel()
 		}
 		return

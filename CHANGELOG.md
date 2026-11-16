@@ -4,6 +4,35 @@
 
 ### App
 
+- On a far link, saving a file no longer makes the whole volume answer
+  "input/output error". The laptop run of 2026-11-14 found it in 8 of 13
+  abroad sessions (0 of 9 on lan): a Premiere-style temp-file save, an
+  in-place save or a rename failed, and then every `stat` of the volume
+  failed until a remount. Abroad the app's own write or rename takes
+  0.5–9 s through JuiceFS. Three things went wrong in that time:
+  - **The background feeds recorded the change first.** The file attribute
+    push, the folder push and its prune, and the echo of the app's previous
+    write saw the change in Redis and updated the local mirror. The save's
+    own record then no longer matched what it had read before, so the save
+    failed after its bytes had already changed. Now the feeds leave a file
+    or name alone while one of the app's own operations changes it, and read
+    it again a second later.
+  - **A rename to a new name failed on any other write.** The record of a
+    name that does not exist yet was the mirror's global change counter, so
+    any other file's change during the rename's second failed it. Now the
+    rename checks only that its destination is still absent.
+  - **One failed name blocked the whole volume.** The app keeps a failed
+    name blocked, and the block covered every folder above it, the volume
+    root included. Now only the failed name (and what lies beneath it)
+    answers the error; listing its own folder also fails, so the listing
+    never shows its uncertain attributes. While a save runs, the folders
+    above the file also kept answering "try later", and a lookup of them
+    "no such file"; now they answer normally.
+  The Linux remote lab (`test/remote-lab/experiments/own-save-lab.sh`, a new
+  `peerprobe ownsave` step) reproduced the volume-wide failure in 5 of 5
+  abroad sessions on main and in 0 of 10 with the fix. The Mac still needs
+  the laptop run.
+
 - A teammate's save now reaches a Mac that is playing or has already read the
   file. The laptop run of 2026-11-14 (on #94) found five Mac-side gaps:
   - **The open file kept its old bytes (P1).** macFUSE gives every open
@@ -84,6 +113,38 @@
   MiB/s, 2 trials each); at 2 MiB/s 13 → 0 and 13 → 1. Freezes here are still
   dominated by cold reads over the lab's lossy link (also before any save).
   The Mac part needs the laptop run.
+- Playing a clip abroad while a teammate saves it no longer freezes while
+  the Mac's own saves upload (laptop run 2026-11-14, bug F2: 35–49 s
+  freezes; main 97–133 s). Two causes:
+  - **The refresh waited for the drain.** On macOS JuiceFS keeps one control
+    handle per process, so the app sent its control messages one at a time:
+    the drain's create-files messages (each holds the channel until its
+    uploads end), pins, the network follower and the content refresh. Abroad
+    a refresh waited up to 6.7 s for the channel, and each READ of the clip
+    waited for a refresh. The bundled JuiceFS (patch 0033, `-jm18`) now has
+    a second, hidden control file, `.jmcontrol`, with its own handle; the
+    content refresh uses it. The drain, pins and the follower keep the
+    first channel and its order. An older JuiceFS has no such file, and the
+    refresh falls back to the shared channel.
+  - **Every READ waited for the refresh, even one that never touches the
+    caches it drops.** While a refresh of the file is pending, a READ now
+    first tries the verified local cache, which reads JuiceFS's cached
+    blocks by slice from a mapping the edit already dropped, and never
+    JuiceFS's read buffers or the kernel's pages. Only a READ that must go
+    through JuiceFS still waits for the refresh (and its kernel notify,
+    which waits behind the file's reads in flight), so a reply with the new
+    mtime still never carries old bytes.
+  Linux remote lab (`peer-edit-lab.sh` `playedit`, abroad, the Mac saving a
+  256 KiB file every second, now through its spool as on the Mac):
+  longest READ 166–192 s → 4.7–8.7 s in 7 of 8 sessions (one 15.8 s), the
+  refresh's wait for the control channel up to 78 s → 0 ms, P2 0. The 0–5
+  JUKEBOX replies left per session all come from the verified cache's path
+  check, which main has too. With the same playback and no refresh, main's
+  drain is no faster. The Mac part needs the laptop run. While a refresh is
+  pending, a READ from the verified cache that sees the file's row move
+  waits for the refresh instead of answering JUKEBOX. The lab's `playedit` also reports the drain time per file,
+  and counts the bytes the Mac would keep under an mtime the server goes on
+  reporting after a newer save closed (`p2_kept`, `p2_final`).
 - A teammate's save whose parts reach the NAS after its final date no longer
   leaves old parts on the Mac for good. JuiceFS stamps a save's final mtime
   with its first commit after the app (or `cp -p`, `rsync -t`) sets the
@@ -105,13 +166,13 @@
   after a restart, not for a row read back from SQLite (the new table
   `nfs_mtime_reported` keeps moved values, at most 8 per file, pruned of
   deleted files at open; an ordinary change writes no row). The Mac's own
-  saves, renames and chmods keep their true mtime. The shown date (seconds) stays, and the true mtime stays in the
-  mirror for every check against JuiceFS. Linux remote lab (`playedit`
-  abroad, the peer dates each save before its close; first version of this
-  change): READ replies whose old bytes the Mac would keep under the final
-  mtime 1,397 → 0, and the last save's bytes became visible 24 s after its
-  close (before: not within 90 s). Whether the macOS NFS client drops its
-  pages for a 1 ns mtime change needs the laptop run.
+  saves, renames and chmods keep their true mtime. The shown date
+  (seconds) stays, and the true mtime stays in the mirror for every check
+  against JuiceFS. Linux remote lab (`playedit` abroad, the peer dates each
+  save before its close; first version of this change): READ replies whose
+  old bytes the Mac would keep under the final mtime 1,397 → 0, and the last
+  save's bytes became visible 24 s after its close (before: not within
+  90 s). Laptop: the macOS NFS client drops its pages for a 1 ns mtime step.
 - A clip that was playing when the network went away plays again a second or
   two after the network returns. Before, after a longer outage (3 minutes on
   the laptop run of 2026-11-14), every read of that clip returned an

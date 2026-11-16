@@ -139,11 +139,16 @@ func (s *Stats) newConnStats() *connStats {
 }
 
 // closeConnStats folds a closed connection's counters into the totals.
+//
+// Lock order is s.mu, then cs.mu, as in Commands and Snapshot. The reverse
+// order deadlocked the proxy when a /stats poll (the image's HEALTHCHECK)
+// met a closing connection: every later connection then waited on s.mu
+// (laptop run 2026-11-15, goroutine dump at stats.go:135/145/493).
 func (s *Stats) closeConnStats(cs *connStats) {
-	cs.mu.Lock()
-	defer cs.mu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
 	delete(s.live, cs)
 	s.commands.Add(cs.n)
 	for k, v := range cs.cmds {

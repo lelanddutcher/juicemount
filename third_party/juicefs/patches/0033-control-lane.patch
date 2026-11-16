@@ -1,0 +1,158 @@
+--- a/pkg/vfs/handle.go
++++ b/pkg/vfs/handle.go
+@@ -199,7 +199,7 @@
+ 			return f
+ 		}
+ 	}
+-	if fh&1 == 1 && inode != controlInode {
++	if fh&1 == 1 && !jmIsControl(inode) { // JuiceMount patch 0033
+ 		f := &handle{inode: inode, fh: fh, flags: O_RECOVERED}
+ 		f.cond = utils.NewCond(f)
+ 		v.handles[inode] = append(v.handles[inode], f)
+@@ -302,7 +302,7 @@
+ 	var vfsState state
+ 	vfsState.Handler = make(map[uint64]saveHandle)
+ 	for ino, hs := range v.handles {
+-		if ino == controlInode {
++		if jmIsControl(ino) { // JuiceMount patch 0033
+ 			// the job is lost, can't be recovered
+ 			continue
+ 		}
+--- a/pkg/vfs/internal.go
++++ b/pkg/vfs/internal.go
+@@ -45,27 +45,32 @@
+ )
+ 
+ var controlMutex sync.Mutex
+-var controlHandlers = make(map[uint32]uint64)
+-
+-func (v *VFS) getControlHandle(pid uint32) uint64 {
++
++// JuiceMount patch 0033: keyed by the control file too, so one process has
++// one handle per control file (.control and the lane, jm_control_lane.go).
++var controlHandlers = make(map[jmControlKey]uint64)
++
++func (v *VFS) getControlHandle(ino Ino, pid uint32) uint64 {
+ 	controlMutex.Lock()
+ 	defer controlMutex.Unlock()
+-	fh := controlHandlers[pid]
++	key := jmControlKey{ino, pid}
++	fh := controlHandlers[key]
+ 	if fh == 0 {
+-		h := v.newHandle(controlInode, false)
++		h := v.newHandle(ino, false)
+ 		fh = h.fh
+-		controlHandlers[pid] = fh
++		controlHandlers[key] = fh
+ 	}
+ 	return fh
+ }
+ 
+-func (v *VFS) releaseControlHandle(pid uint32) {
++func (v *VFS) releaseControlHandle(ino Ino, pid uint32) {
+ 	controlMutex.Lock()
+ 	defer controlMutex.Unlock()
+-	fh := controlHandlers[pid]
++	key := jmControlKey{ino, pid}
++	fh := controlHandlers[key]
+ 	if fh != 0 {
+-		v.releaseHandle(controlInode, fh)
+-		delete(controlHandlers, pid)
++		v.releaseHandle(ino, fh)
++		delete(controlHandlers, key)
+ 	}
+ }
+ 
+@@ -117,7 +122,7 @@
+ 			return true
+ 		}
+ 	}
+-	return false
++	return name == jmControlLaneNode.name // JuiceMount patch 0033
+ }
+ 
+ func getInternalNode(ino Ino) *internalNode {
+@@ -126,6 +131,9 @@
+ 			return n
+ 		}
+ 	}
++	if ino == jmControlLaneNode.inode { // JuiceMount patch 0033
++		return jmControlLaneNode
++	}
+ 	return nil
+ }
+ 
+@@ -145,6 +153,9 @@
+ 		if name == n.name {
+ 			return n
+ 		}
++	}
++	if name == jmControlLaneNode.name { // JuiceMount patch 0033
++		return jmControlLaneNode
+ 	}
+ 	return nil
+ }
+--- a/pkg/vfs/vfs.go
++++ b/pkg/vfs/vfs.go
+@@ -548,7 +548,7 @@
+ 	}()
+ 	var attr = &Attr{}
+ 	if IsSpecialNode(ino) {
+-		if ino != controlInode && (flags&O_ACCMODE) != syscall.O_RDONLY {
++		if !jmIsControl(ino) && (flags&O_ACCMODE) != syscall.O_RDONLY { // JuiceMount patch 0033
+ 			err = syscall.EACCES
+ 			return
+ 		}
+@@ -685,8 +685,8 @@
+ func (v *VFS) Read(ctx Context, ino Ino, buf []byte, off uint64, fh uint64) (n int, err syscall.Errno) {
+ 	size := uint32(len(buf))
+ 	if IsSpecialNode(ino) {
+-		if ino == controlInode && runtime.GOOS == "darwin" {
+-			fh = v.getControlHandle(ctx.Pid())
++		if jmIsControl(ino) && runtime.GOOS == "darwin" { // JuiceMount patch 0033
++			fh = v.getControlHandle(ino, ctx.Pid())
+ 		}
+ 		h := v.findHandle(ino, fh)
+ 		if h == nil {
+@@ -796,8 +796,8 @@
+ 
+ func (v *VFS) Write(ctx Context, ino Ino, buf []byte, off, fh uint64) (err syscall.Errno) {
+ 	size := uint64(len(buf))
+-	if ino == controlInode && runtime.GOOS == "darwin" {
+-		fh = v.getControlHandle(ctx.Pid())
++	if jmIsControl(ino) && runtime.GOOS == "darwin" { // JuiceMount patch 0033
++		fh = v.getControlHandle(ino, ctx.Pid())
+ 	}
+ 	defer func() { logit(ctx, "write", err, "(%d,%d,%d,%d)", ino, size, off, fh) }()
+ 	h := v.findHandle(ino, fh)
+@@ -810,7 +810,7 @@
+ 		return
+ 	}
+ 
+-	if ino == controlInode {
++	if jmIsControl(ino) { // JuiceMount patch 0033
+ 		h.Lock()
+ 		defer h.Unlock()
+ 		h.pending = append(h.pending, buf...)
+@@ -985,9 +985,9 @@
+ }
+ 
+ func (v *VFS) Flush(ctx Context, ino Ino, fh uint64, lockOwner uint64) (err syscall.Errno) {
+-	if ino == controlInode && runtime.GOOS == "darwin" {
+-		fh = v.getControlHandle(ctx.Pid())
+-		defer v.releaseControlHandle(ctx.Pid())
++	if jmIsControl(ino) && runtime.GOOS == "darwin" { // JuiceMount patch 0033
++		fh = v.getControlHandle(ino, ctx.Pid())
++		defer v.releaseControlHandle(ino, ctx.Pid())
+ 	}
+ 	defer func() { logit(ctx, "flush", err, "(%d,%d,%016X)", ino, fh, lockOwner) }()
+ 	h := v.findHandle(ino, fh)
+@@ -996,7 +996,7 @@
+ 		return
+ 	}
+ 	if IsSpecialNode(ino) {
+-		if ino == controlInode && h.bctx != nil {
++		if jmIsControl(ino) && h.bctx != nil { // JuiceMount patch 0033
+ 			h.bctx.Cancel()
+ 		}
+ 		return
