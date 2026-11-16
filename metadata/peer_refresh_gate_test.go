@@ -177,6 +177,31 @@ func TestEarlyReReadIsHeldAndArmedAgain(t *testing.T) {
 	}
 }
 
+// A teammate's change that shortens the file is never held: a row with the
+// longer size would send READs past the new end (premature-EOF EIO).
+func TestShorterFileIsNotHeld(t *testing.T) {
+	g := newGateLab(t, 10*time.Second)
+	m1 := time.Unix(1700000100, 0)
+	g.set(m1, m1, 16384, 2)
+	g.push()
+	g.advance(time.Second)
+	m2 := m1.Add(time.Second)
+	g.set(m2, m2, 4096, 3)
+	g.push()
+	if g.hooks() != 2 || g.store.LookupByPath("media.mov").Size != 4096 || len(g.timers) != 0 {
+		t.Fatalf("shrink: hooks %d size %d timers %d (want published at once)", g.hooks(),
+			g.store.LookupByPath("media.mov").Size, len(g.timers))
+	}
+	// A longer file inside the interval is still held.
+	g.advance(time.Second)
+	m3 := m2.Add(time.Second)
+	g.set(m3, m3, 8192, 4)
+	g.push()
+	if g.hooks() != 2 || len(g.timers) != 1 {
+		t.Fatalf("growth inside the interval: hooks %d timers %d (want held)", g.hooks(), len(g.timers))
+	}
+}
+
 // With the interval 0 (JM_PEER_REFRESH_INTERVAL=0) every change publishes.
 func TestPeerGateOff(t *testing.T) {
 	g := newGateLab(t, 0)

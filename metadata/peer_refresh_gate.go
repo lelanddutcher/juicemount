@@ -49,7 +49,9 @@ import (
 // (owned_deferral.go), which survives a resubscribe, and a re-read that
 // comes early is held again and re-armed.
 //
-// Only another client's changes are held. The Mac's own bytes (exact own
+// Only another client's changes that do not shorten the file are held (a
+// row with the longer size would send READs past the new end, which the
+// premature-EOF guard answers with EIO). The Mac's own bytes (exact own
 // marks) and every other publication path (folder reconcile, SCAN,
 // juicemount:metadata) are not gated. JM_PEER_REFRESH_INTERVAL sets the
 // interval (a Go duration; 0 turns the gate off), capped at
@@ -169,6 +171,13 @@ func (rc *RedisClient) holdPeerChanges(rows []*Entry) []*Entry {
 	kept := rows[:0:0]
 	for _, e := range rows {
 		if e.span != nil && e.span.own {
+			kept = append(kept, e)
+			continue
+		}
+		// A shorter file publishes at once: a row that kept the longer size
+		// would send READs past the new end, which the premature-EOF guard
+		// answers with EIO.
+		if row := rc.store.LookupByInode(e.Inode); row == nil || e.Size < row.Size {
 			kept = append(kept, e)
 			continue
 		}
