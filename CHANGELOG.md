@@ -4,6 +4,20 @@
 
 ### App
 
+- Playing a clip while a teammate saves it no longer stalls as often on a
+  far link (finding R1). Each part of the teammate's save used to change the
+  file's modification time the Mac sees, and the Mac then threw away the
+  pieces it had just downloaded and fetched them again. Abroad, one round of
+  downloads takes 2–6 s, so a single player read could need 3–4 rounds
+  (12–17 s on the laptop). Now the app shows the Mac the save's first part at
+  once, then at most one change per interval while the save runs (1 s on a
+  fast link, 3 s on a medium one, 10 s on a slow or metered one), and one
+  change after the last part. A change that makes the file shorter is always
+  shown at once. `JM_PEER_REFRESH_INTERVAL` sets the interval (0 turns this
+  off). In the Linux remote lab abroad the content refreshes per session
+  fell from 166–189 to 16–19, and the modelled repeat downloads from
+  61–73 % to 11–23 %. The Mac still needs the laptop run.
+
 - On a far link, saving a file no longer makes the whole volume answer
   "input/output error". The laptop run of 2026-11-14 found it in 8 of 13
   abroad sessions (0 of 9 on lan): a Premiere-style temp-file save, an
