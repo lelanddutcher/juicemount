@@ -123,6 +123,9 @@ var (
 	attrPushDelivered atomic.Int64 // i-key events received
 	attrPushBatches   atomic.Int64 // batches that read attrs (one MGET or more)
 	attrPushRefreshed atomic.Int64 // mirror rows whose size/mtime changed
+	// attrPushLateCommits: rows another client changed under the same mtime
+	// and size (mtime_span.go).
+	attrPushLateCommits atomic.Int64
 )
 
 func noteAttrPushDelivered() { attrPushDelivered.Add(1) }
@@ -185,7 +188,9 @@ func (rc *RedisClient) newAttrCoalescer(generation uint64) *inodeCoalescer {
 }
 
 // reconcileFileAttrs reads the attrs of the batch's known regular files and
-// upserts those whose size or mtime changed. It returns the inodes to retry.
+// upserts those whose size or mtime changed, or that another client changed
+// again under the same mtime (a late commit, mtime_span.go). It returns the
+// inodes to retry.
 func (rc *RedisClient) reconcileFileAttrs(inodes []uint64, generation uint64) (retry []uint64, err error) {
 	retry, _, err = rc.reconcileFileAttrsOwned(inodes, generation)
 	return retry, err
@@ -219,6 +224,7 @@ func (rc *RedisClient) reconcileFileAttrsOwned(inodes []uint64, generation uint6
 		// lands first (the Store rechecks under its writer lock).
 		if rc.store.ForegroundOwned(e.Path) {
 			deferred = append(deferred, inode)
+			rc.store.renewOwnEcho(inode) // its window runs from the release (own_marks.go)
 			continue
 		}
 		known = append(known, e)
@@ -241,16 +247,14 @@ func (rc *RedisClient) reconcileFileAttrsOwned(inodes []uint64, generation uint6
 	for start := 0; start < len(known); start += attrMGetChunk {
 		chunk := known[start:min(start+attrMGetChunk, len(known))]
 		keys := make([]string, len(chunk))
+		files := make([]sliceQuery, len(chunk))
 		for i, e := range chunk {
 			keys[i] = "i" + strconv.FormatUint(e.Inode, 10)
+			files[i] = sliceQuery{e.Inode, e.Size}
 		}
-		var vals []interface{}
-		var merr error
-		if rc.testReadAttrs != nil {
-			vals, merr = rc.testReadAttrs(keys)
-		} else {
-			vals, merr = rc.redisDB().MGet(ctx, keys...).Result()
-		}
+		// One round trip: the attrs and the slice signatures, the latter
+		// for the cached size (mtime_span.go; review L1).
+		vals, sigs, merr := rc.readAttrsAndSigs(ctx, keys, files)
 		if merr != nil || len(vals) != len(chunk) {
 			for _, e := range known[start:] {
 				retry = append(retry, e.Inode)
@@ -270,10 +274,58 @@ func (rc *RedisClient) reconcileFileAttrsOwned(inodes []uint64, generation uint6
 				continue
 			}
 			e := chunk[i]
+			sig := sigs[i]
+			if chunksFor(size) != chunksFor(e.Size) {
+				sig = unknownSig // read for other chunk lists
+			}
+			ctime, ctimeOK := decodeInodeAttrCtime([]byte(str))
 			if e.Mtime.Equal(mtime) && e.MtimeNsecKnown && e.Size == size {
+				if !ctimeOK {
+					continue
+				}
+				prev, have := rc.store.attrObservation(e.Inode)
+				if judgeCtime(prev, have, mtime.UnixNano(), ctime.UnixNano()) == verdictNone {
+					continue
+				}
+				obs := attrObs{mtimeNS: mtime.UnixNano(), ctimeNS: ctime.UnixNano(), sig: sig}
+				if rc.store.ownBytes(e.Inode, size, mtime) {
+					// A later part of the Mac's own bytes: exactly the size
+					// and mtime its own change produced (own_marks.go).
+					rc.store.attrObs.putIf(e.Inode, obs, prev, have)
+					continue
+				}
+				if sig.sameContent(prev.sig) {
+					// The same slices: a chmod, chown, rename or link. The
+					// event uses up an echo mark (review N4).
+					rc.store.takeOwnChange(e.Inode)
+					rc.store.attrObs.putIf(e.Inode, obs, prev, have)
+					continue
+				}
+				if (!sig.known() || !prev.sig.known()) && rc.store.takeOwnChange(e.Inode) {
+					// The signature cannot decide, and this process just
+					// changed the file itself: that one event is its echo
+					// (review H1 of the second review; the mark is used up).
+					rc.store.attrObs.putIf(e.Inode, obs, prev, have)
+					continue
+				}
+				// A late commit: it goes to the Store write. An echo mark is
+				// used up only once that write commits (settleOwnMarks), so
+				// a row skipped as owned keeps it (#100 review M4).
+				toUpsert = append(toUpsert, &Entry{
+					Path:           e.Path,
+					Name:           e.Name,
+					ParentPath:     e.ParentPath,
+					Size:           size,
+					Mtime:          mtime,
+					MtimeNsecKnown: true,
+					Inode:          e.Inode,
+					Mode:           e.Mode,
+					// Another client's part committed after this mtime.
+					span: &attrSpan{ctime: ctime, sig: sig, lateCommit: true, echoGen: rc.store.ownEchoGen(e.Inode)},
+				})
 				continue
 			}
-			toUpsert = append(toUpsert, &Entry{
+			up := &Entry{
 				Path:           e.Path,
 				Name:           e.Name,
 				ParentPath:     e.ParentPath,
@@ -282,7 +334,15 @@ func (rc *RedisClient) reconcileFileAttrsOwned(inodes []uint64, generation uint6
 				MtimeNsecKnown: true,
 				Inode:          e.Inode,
 				Mode:           e.Mode,
-			})
+				// The Mac's own bytes (an exact content mark) are reported
+				// with their true mtime (review N6). Nothing is used up
+				// before the write (settleOwnMarks).
+				span: &attrSpan{sig: sig, own: rc.store.ownBytes(e.Inode, size, mtime), echoGen: rc.store.ownEchoGen(e.Inode)},
+			}
+			if ctimeOK {
+				up.span.ctime = ctime
+			}
+			toUpsert = append(toUpsert, up)
 		}
 	}
 	if len(toUpsert) == 0 {
@@ -295,21 +355,33 @@ func (rc *RedisClient) reconcileFileAttrsOwned(inodes []uint64, generation uint6
 		}
 		return retry, deferred, err
 	}
-	if len(owned) > 0 {
-		ownedSet := make(map[string]struct{}, len(owned))
-		for _, p := range owned {
-			ownedSet[p] = struct{}{}
-		}
-		for _, e := range toUpsert {
-			if _, ok := ownedSet[e.Path]; ok {
-				deferred = append(deferred, e.Inode)
-			}
-		}
+	ownedSet := make(map[string]struct{}, len(owned))
+	for _, p := range owned {
+		ownedSet[p] = struct{}{}
 	}
-	if refreshed := len(toUpsert) - len(owned); refreshed > 0 {
+	late, refreshed := 0, 0
+	for _, e := range toUpsert {
+		if _, held := ownedSet[e.Path]; held {
+			// An owner took the path between the pre-check and the write:
+			// nothing was recorded, and no own mark was used, so the re-read
+			// judges it again (#100 review M4).
+			deferred = append(deferred, e.Inode)
+			rc.store.renewOwnEcho(e.Inode)
+			continue
+		}
+		refreshed++
+		if e.span != nil && e.span.lateCommit {
+			late++
+		}
+		rc.store.settleOwnMarks(e) // mtime_span.go
+	}
+	if refreshed > 0 {
 		attrPushRefreshed.Add(int64(refreshed))
+		if late > 0 {
+			attrPushLateCommits.Add(int64(late))
+		}
 		jmlog.Info("metadata attr push: refreshed", "events", len(inodes), "files", len(known), "changed", refreshed,
-			"first", toUpsert[0].Path)
+			"first", toUpsert[0].Path, "late_commits", late)
 	}
 	return nil, deferred, nil
 }

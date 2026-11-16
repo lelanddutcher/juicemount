@@ -1226,6 +1226,19 @@ func decodeInodeAttrTime(attr []byte) (time.Time, int64, bool) {
 	return time.Unix(int64(be64(attr, 23)), int64(ns)), int64(be64(attr, 51)), true
 }
 
+// decodeInodeAttrCtime is the ctime of a juicefs attr (meta.Attr.Marshal:
+// the ctime's seconds at byte 35, its nanoseconds at 43).
+func decodeInodeAttrCtime(attr []byte) (time.Time, bool) {
+	if len(attr) < 59 {
+		return time.Time{}, false
+	}
+	ns := be32(attr, 43)
+	if ns >= 1e9 {
+		return time.Time{}, false
+	}
+	return time.Unix(int64(be64(attr, 35)), int64(ns)), true
+}
+
 // dirChild is one decoded, mirrorable child of a reconciling directory
 // (reconcileDir PASS 1 output).
 type dirChild struct {
@@ -1252,7 +1265,7 @@ type dirChild struct {
 // retry; a new directory can still establish ancestry for its children.
 func buildReconcileChildEntries(children []dirChild, attrByInode map[uint64][]byte, lookup func(string) *Entry) (toUpsert []*Entry, newDirs []uint64) {
 	for _, c := range children {
-		var mtime time.Time
+		var mtime, ctime time.Time
 		var size int64
 		attrOK := false
 		if attr, ok := attrByInode[c.inode]; ok {
@@ -1260,6 +1273,8 @@ func buildReconcileChildEntries(children []dirChild, attrByInode map[uint64][]by
 				mtime = mt
 				size = sz
 				attrOK = true
+				// The attr push's baseline for a late commit (review H1).
+				ctime, _ = decodeInodeAttrCtime(attr)
 			}
 		}
 		existing := lookup(c.childPath)
@@ -1280,6 +1295,7 @@ func buildReconcileChildEntries(children []dirChild, attrByInode map[uint64][]by
 			MtimeNsecKnown: attrOK,
 			Inode:          c.inode,
 			Mode:           c.mode,
+			span:           &attrSpan{ctime: ctime, sig: unknownSig},
 		}
 
 		// Upsert-diff: only write if new or changed (same compare as
@@ -1521,6 +1537,13 @@ func (rc *RedisClient) reconcileDirWithBackend(dirInode, generation uint64) erro
 	}
 
 	toUpsert, newDirs = buildReconcileChildEntries(children, attrByInode, rc.store.LookupByPath)
+	for _, e := range toUpsert {
+		// The Mac's own bytes keep their true mtime here too (#100 review b
+		// M1: a folder read can publish the Mac's own save first).
+		if !e.IsDir && e.span != nil {
+			e.span.own = rc.store.ownBytes(e.Inode, e.Size, e.Mtime)
+		}
+	}
 	for _, c := range children {
 		if _, _, ok := decodeInodeAttr(attrByInode[c.inode]); !ok {
 			rc.scheduleAttrRetryWithBackend(dirInode, token.backend)

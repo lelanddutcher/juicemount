@@ -154,7 +154,10 @@ func (h *JuiceMountHandler) readSidecarSnapshot(handle *sidecarSnapshotHandle, p
 func (handle *sidecarSnapshotHandle) fileInfo() *snapshotFileInfo {
 	return &snapshotFileInfo{
 		name: handle.snapshot.Name, size: handle.snapshot.Size, mode: handle.snapshot.Mode,
-		mtime: time.Unix(0, handle.snapshot.MtimeNS), inode: handle.snapshot.Inode,
+		// The mtime the NFS layer reports for this inode and true mtime
+		// (metadata/mtime_span.go), as GETATTR of the live row does.
+		mtime: metadata.ReportedMtime(handle.snapshot.Inode, time.Unix(0, handle.snapshot.MtimeNS)),
+		inode: handle.snapshot.Inode,
 	}
 }
 

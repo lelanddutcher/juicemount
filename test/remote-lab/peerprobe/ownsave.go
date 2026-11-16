@@ -14,7 +14,9 @@ package main
 //	         a<i>.prproj (Premiere and Resolve save this way);
 //	inplace  WRITE 64 KiB at 1 MiB into b<i>.prproj, twice (two saves);
 //	chmod    SETATTR mode 0600 on c<i>.prproj;
-//	rename   RENAME r<i>.prproj to r<i>-renamed.prproj.
+//	rename   RENAME r<i>.prproj to r<i>-renamed.prproj;
+//	truncate SETATTR size 1 MiB on t<i>.prproj, then WRITE 64 KiB at 1 MiB
+//	         (a rewrite after a truncate; only with -cases including it).
 //
 // Every WRITE is FILE_SYNC, as the macOS client sends a save's last block.
 // NFS3ERR_JUKEBOX is retried after the macOS waits (4, 8, 16, 30 s, at most
@@ -225,6 +227,19 @@ func (s *saver) chmod(fh []byte, mode uint32) error {
 	return err
 }
 
+func (s *saver) truncate(fh []byte, size uint64) error {
+	type args struct {
+		rpc.Header
+		FH    []byte
+		Attr  nfsc.Sattr3
+		Guard uint32
+	}
+	_, _, err := s.call("SETATTR", func() any {
+		return &args{s.header(nfsc.NFSProc3SetAttr), fh, nfsc.Sattr3{Size: nfsc.SetSize{SetIt: true, Size: size}}, 0}
+	})
+	return err
+}
+
 func (s *saver) writeFile(p string, size int) error {
 	fh, err := s.create(p)
 	if err != nil {
@@ -278,6 +293,9 @@ func ownsave(args []string) error {
 	for i := 0; i < *trials; i++ {
 		for _, k := range []string{"b", "c", "r"} {
 			setup = append(setup, fmt.Sprintf("%s/%s%d.prproj", *dir, k, i))
+		}
+		if runCase["truncate"] {
+			setup = append(setup, fmt.Sprintf("%s/t%d.prproj", *dir, i))
 		}
 	}
 	for _, p := range setup {
@@ -393,6 +411,17 @@ func ownsave(args []string) error {
 		})
 		r := fmt.Sprintf("%s/r%d.prproj", *dir, i)
 		do("rename", i, r, func() error { return s.rename(r, fmt.Sprintf("%s/r%d-renamed.prproj", *dir, i)) })
+		tp := fmt.Sprintf("%s/t%d.prproj", *dir, i)
+		do("truncate", i, tp, func() error {
+			fh, err := s.lookup(tp)
+			if err != nil {
+				return err
+			}
+			if err := s.truncate(fh, mib); err != nil {
+				return err
+			}
+			return s.write(fh, mib, bytes.Repeat([]byte{'T'}, 64<<10))
+		})
 	}
 	// Watch the root for a while: a sticky failure stays.
 	end := time.Now().Add(*watch)

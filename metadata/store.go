@@ -15,6 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/lelanddutcher/juicemount/internal/jmlog"
 	_ "modernc.org/sqlite"
 )
 
@@ -237,7 +238,11 @@ type Store struct {
 	// A bulk transaction holds this gate without holding mu across SQL or
 	// callbacks. Cache-only namespace publishers take it before mu. Lock order:
 	// writeMu -> cachePublicationMu -> mu; never acquire writeMu under this gate.
-	cachePublicationMu          sync.Mutex
+	cachePublicationMu sync.Mutex
+	// attrObs: what the Redis publications last saw of each file
+	// (mtime_span.go).
+	attrObs                     attrObservations
+	own                         ownMarks     // this process's own changes (own_marks.go)
 	evictionMu                  sync.Mutex   // serializes bounded pressure passes; never acquired under mu/publication
 	nextCacheIdentity           uint64       // fresh RAM publication identity, guarded by mu
 	readDirAfterCacheCheckHook  func()       // deterministic completeness-race tests; nil in production
@@ -1025,6 +1030,10 @@ func OpenWithMaxCacheSize(dbPath string, maxCacheSize int) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("initialize mirror incarnations: %w", err)
 	}
+	if _, err := db.Exec(nfsReportedSchema); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("create nfs mtime overlay schema: %w", err)
+	}
 
 	// Capture this before CREATE IF NOT EXISTS. A database upgraded from a
 	// pre-FTS build may already contain entries but no index; the epoch alone
@@ -1125,6 +1134,11 @@ func OpenWithMaxCacheSize(dbPath string, maxCacheSize int) (*Store, error) {
 	if s.subtreeOn {
 		s.subtreeBytes = make(map[string]int64)
 		s.subtreeFiles = make(map[string]int64)
+	}
+	s.own.init()
+	if err := s.loadNFSOverlays(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("load nfs mtime overlays: %w", err)
 	}
 	if s.fileLock != nil {
 		if err := s.recoverOwnedPruneLadderCandidates(); err != nil {
@@ -1288,6 +1302,7 @@ func gcInternalNamespaces(db *sql.DB) (int64, error) {
 
 // Close closes the database connection.
 func (s *Store) Close() error {
+	dropOverlaysOf(s)
 	if s.pruneLadderGCStop != nil {
 		s.pruneLadderGCStopOnce.Do(func() { close(s.pruneLadderGCStop) })
 		<-s.pruneLadderGCDone
@@ -2085,6 +2100,28 @@ func (s *Store) ReconcileUpsertBatchOwned(batch []*Entry, expected StoreEpoch) (
 }
 
 func (s *Store) bulkInsertBatchWithEpoch(batch []*Entry, incremental bool, expected *StoreEpoch, invalidatePaths []string, reconcile bool, owned *[]string) (StoreEpoch, error) {
+	// Reported mtimes moved off the true one (mtime_span.go), logged once the
+	// write lock is released (review 99d L3: this defer runs after the
+	// unlock below). Set only after the commit.
+	type movedMtime struct {
+		path             string
+		inode            uint64
+		trueNS, reportNS int64
+		size             int64
+		own              bool
+		// What it was judged against: the row's previous true and
+		// reported mtime (oldTrue -1: no preimage) and the history.
+		oldTrue, oldReport int64
+		history            []nfsReported
+	}
+	var moved, committedMoves []movedMtime
+	defer func() {
+		for _, m := range committedMoves {
+			jmlog.Info("metadata mtime span: reported mtime moved", "path", m.path, "inode", m.inode,
+				"true_ns", m.trueNS, "reported_ns", m.reportNS, "size", m.size, "own_bytes", m.own,
+				"old_true_ns", m.oldTrue, "old_reported_ns", m.oldReport, "history", fmtReported(m.history))
+		}
+	}()
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	s.cachePublicationMu.Lock()
@@ -2097,6 +2134,8 @@ func (s *Store) bulkInsertBatchWithEpoch(batch []*Entry, incremental bool, expec
 		present bool
 		inode   uint64
 		version MirrorToken
+		isDir   bool
+		span    spanPreimage
 	}
 	snapshots := make([]*Entry, len(batch))
 	cached := make(map[string]cachePreimage, len(batch))
@@ -2107,7 +2146,9 @@ func (s *Store) bulkInsertBatchWithEpoch(batch []*Entry, incremental bool, expec
 		e := input.snapshot()
 		snapshots[i] = e
 		if old := s.pathCache[e.Path]; old != nil {
-			cached[e.Path] = cachePreimage{present: true, inode: old.Inode, version: old.Version}
+			cached[e.Path] = cachePreimage{present: true, inode: old.Inode, version: old.Version,
+				isDir: old.IsDir, span: spanPreimage{mtimeNS: old.Mtime.UnixNano(),
+					reportedNS: old.NFSMtime().UnixNano(), size: old.Size}}
 		}
 	}
 	s.mu.RUnlock()
@@ -2208,6 +2249,16 @@ func (s *Store) bulkInsertBatchWithEpoch(batch []*Entry, incremental bool, expec
 	}
 	committed := make([]*Entry, 0, len(batch))
 	var reconcileDirs []string
+	// The reported mtime and the observations of each committed file row
+	// (mtime_span.go): the overlay rows are written in this transaction and
+	// published with the rows; observations only for committed rows.
+	var overlays []overlayChange
+	type spanObs struct {
+		inode     uint64
+		obs       attrObs
+		keepNewer bool
+	}
+	var observations []spanObs
 	for _, input := range snapshots {
 		e := input
 		if StreamPartialName(e.Name) {
@@ -2218,6 +2269,17 @@ func (s *Store) bulkInsertBatchWithEpoch(batch []*Entry, incremental bool, expec
 		}
 		if _, held := foreground[e.Path]; held {
 			continue
+		}
+		// Judge the Mac's own bytes again here (review 99e M1): the push
+		// judged before this lock, and a WRITE can mark, publish and
+		// release the path in that gap. Its mark is set before the release,
+		// so the re-check above and this judgment see it. A late commit
+		// that turns out to be the Mac's own is its echo: nothing moves and
+		// no content hook fires, as when the push judges it own.
+		ownEcho := false
+		if sp := e.span; sp != nil && !sp.own && !e.IsDir && e.Inode != 0 && s.ownBytes(e.Inode, e.Size, e.Mtime) {
+			ownEcho = sp.lateCommit
+			sp.own, sp.lateCommit = true, false
 		}
 		if !e.Version.IsZero() {
 			if e.Version.Path != e.Path {
@@ -2233,7 +2295,7 @@ func (s *Store) bulkInsertBatchWithEpoch(batch []*Entry, incremental bool, expec
 		if reconcile {
 			if e.IsDir {
 				reconcileDirs = append(reconcileDirs, e.Path)
-			} else if invalidate != nil {
+			} else if invalidate != nil && !ownEcho {
 				// The ordinary content hook can query Store and is unsafe
 				// with this transaction open. Use the non-reentrant SCAN
 				// hook with the exact preimage inode instead.
@@ -2256,6 +2318,18 @@ func (s *Store) bulkInsertBatchWithEpoch(batch []*Entry, incremental bool, expec
 				}
 			}
 		}
+		// The reported-mtime preimage (mtime_span.go): the cached row, or
+		// for a steady-state publication of a row evicted from the cache,
+		// the durable one (review M2: a regression while evicted).
+		var span spanPreimage
+		spanPresent := false
+		if !e.IsDir && e.Inode != 0 {
+			if old := cached[e.Path]; old.present && old.inode == e.Inode && !old.isDir {
+				span, spanPresent = old.span, true
+			} else if !old.present && expected != nil {
+				span, spanPresent = sqlSpanPreimage(tx, e.Path, e.Inode)
+			}
+		}
 		if incremental {
 			err = ftsExternalUpsert(tx, e, s.ftsDefer)
 		} else {
@@ -2273,6 +2347,29 @@ func (s *Store) bulkInsertBatchWithEpoch(batch []*Entry, incremental bool, expec
 		}
 		if err := loadEntryVersion(tx, e); err != nil {
 			return StoreEpoch{}, err
+		}
+		if !e.IsDir && e.Inode != 0 {
+			history, err := s.spanHistory(tx, e.Inode)
+			if err != nil {
+				return StoreEpoch{}, err
+			}
+			ownBytes := e.span != nil && e.span.own
+			oldTrue, oldReport := int64(-1), int64(-1)
+			if spanPresent {
+				oldTrue, oldReport = span.mtimeNS, span.reportedNS
+			}
+			change, obs, keepNewer := s.mtimeSpanUpdate(e, span, spanPresent, history)
+			if change != nil {
+				if err := change.write(tx); err != nil {
+					return StoreEpoch{}, err
+				}
+				s.attrObs.noteSQL(e.Inode)
+				overlays = append(overlays, *change)
+				if r := change.rs[len(change.rs)-1]; r.reportedNS != r.trueNS {
+					moved = append(moved, movedMtime{e.Path, e.Inode, r.trueNS, r.reportedNS, e.Size, ownBytes, oldTrue, oldReport, history})
+				}
+			}
+			observations = append(observations, spanObs{e.Inode, obs, keepNewer})
 		}
 		e.ResetGetAttrCache()
 		committed = append(committed, e)
@@ -2297,6 +2394,13 @@ func (s *Store) bulkInsertBatchWithEpoch(batch []*Entry, incremental bool, expec
 	// reads Store cannot reenter an open SQLite writer.
 	for _, p := range reconcileDirs {
 		s.NotifyContentInvalidated(p, true)
+	}
+	for _, c := range overlays {
+		c.apply()
+	}
+	committedMoves = moved
+	for _, o := range observations {
+		s.attrObs.put(o.inode, o.obs, o.keepNewer)
 	}
 	s.mu.Lock()
 	for _, e := range committed {

@@ -1822,7 +1822,19 @@ func (d *Drainer) drainOne(row *metadata.SpoolRow) {
 	// validation and Finder's next offline range write would surface ACCES.
 	drainedMtime := time.Now()
 	mtimeApplied := false
+	// An in-place drain keeps the file's inode: its echo is this client's own
+	// bytes (metadata/own_marks.go). The value is known before the Chtimes,
+	// so it is marked first: the attr push can see the change as soon as it
+	// lands (review 99e L1). A stage gets a new inode, reported as it is.
+	markOwn := func(mtime time.Time) {
+		if tgt.stage == nil && !mtime.IsZero() {
+			if owner := d.spool.Meta().Owner(); owner != nil {
+				owner.NoteOwnBytes(row.NFSPath, row.Size, mtime, mtime)
+			}
+		}
+	}
 	if !spoolMtime.IsZero() {
+		markOwn(spoolMtime)
 		if err := os.Chtimes(tgt.path, spoolMtime, spoolMtime); err != nil {
 			log.Printf("drain: preserve client mtime failed (non-fatal) path=%s: %v", row.NFSPath, err)
 		} else {
@@ -1838,6 +1850,7 @@ func (d *Drainer) drainOne(row *metadata.SpoolRow) {
 		// backend inode so the mirror still agrees with the next reconcile.
 		if fi, statErr := os.Stat(tgt.path); statErr == nil {
 			drainedMtime = time.Unix(fi.ModTime().Unix(), 0)
+			markOwn(fi.ModTime()) // known only after the fact
 		}
 	}
 	ph.mark_(&ph.chtimes)
