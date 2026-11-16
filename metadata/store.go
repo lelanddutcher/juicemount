@@ -15,6 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/lelanddutcher/juicemount/internal/jmlog"
 	_ "modernc.org/sqlite"
 )
 
@@ -2324,6 +2325,10 @@ func (s *Store) bulkInsertBatchWithEpoch(batch []*Entry, incremental bool, expec
 				}
 				s.attrObs.noteSQL(e.Inode)
 				overlays = append(overlays, *change)
+				if r := change.rs[len(change.rs)-1]; r.reportedNS != r.trueNS {
+					jmlog.Info("metadata mtime span: reported mtime moved", "path", e.Path, "inode", e.Inode,
+						"true_ns", r.trueNS, "reported_ns", r.reportedNS)
+				}
 			}
 			observations = append(observations, spanObs{e.Inode, obs, keepNewer})
 		}
