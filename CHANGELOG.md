@@ -10,9 +10,11 @@
   pieces it had just downloaded and fetched them again. Abroad, one round of
   downloads takes 2–6 s, so a single player read could need 3–4 rounds
   (12–17 s on the laptop). Now the app shows the Mac the save's first part at
-  once, then at most one change per interval while the save runs (1 s on a
-  fast link, 3 s on a medium one, 10 s on a slow or metered one), and one
-  change after the last part. A change that makes the file shorter is always
+  once, then at most one change per interval while the save runs, and one
+  change after the last part. The interval follows the measured round trip
+  to the NAS: 1 s up to 30 ms (a Mac at home, also through Tailscale), 3 s
+  up to 100 ms, 10 s above. Before the first measurement it follows the link
+  class. The app logs the interval it chose and why. A change that makes the file shorter is always
   shown at once. `JM_PEER_REFRESH_INTERVAL` sets the interval (0 turns this
   off). In the Linux remote lab abroad the content refreshes per session
   fell from 166–189 to 16–19, and the modelled repeat downloads from

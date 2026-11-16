@@ -415,6 +415,14 @@ type KeyspaceSnapshot struct {
 	// because the batch exceeded the burst ceiling. Non-zero on a metered link
 	// means the cheap path stopped being used at the worst possible moment.
 	ScanPromotions int64 `json:"scan_promotions"`
+	// AttrRefreshed counts file rows the attr push changed (a teammate's
+	// edit of an existing file); AttrLateCommits those that were a late
+	// commit under the same mtime (metadata/mtime_span.go); AttrHeld the
+	// teammate changes held until their interval ended (finding R1,
+	// metadata/peer_refresh_gate.go).
+	AttrRefreshed   int64 `json:"attr_refreshed"`
+	AttrLateCommits int64 `json:"attr_late_commits"`
+	AttrHeld        int64 `json:"attr_held"`
 }
 
 // FDPoolSnapshot reports file-descriptor and memory-buffer occupancy.

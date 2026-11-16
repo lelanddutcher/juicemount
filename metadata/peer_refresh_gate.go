@@ -26,7 +26,8 @@ import (
 //
 // THE FIX. The attr push publishes another client's content change of a
 // file at once when it published none for that inode in the last interval
-// (peerRefreshInterval: 1 s fast, 3 s medium, 10 s slow or metered). A
+// (peerRefreshInterval: by the measured round trip, 1 s up to 30 ms, 3 s up
+// to 100 ms, 10 s above; by the class before the first sample). A
 // later change within the interval is held: nothing is written, no
 // observation is recorded, no hook runs, and the inode is read again when
 // the interval ends. That read compares Redis with the row and observation
@@ -56,6 +57,15 @@ import (
 // juicemount:metadata) are not gated. JM_PEER_REFRESH_INTERVAL sets the
 // interval (a Go duration; 0 turns the gate off), capped at
 // peerRefreshIntervalMax so the final bytes show within about 30 s.
+//
+// KNOWN GAP (review M2 of #102). A late commit (only the ctime changed) can
+// be published only by the attr push: a SCAN reads mtime and size. Three
+// paths already drop one: a restart (the gate, the armed re-read and the
+// observations are in memory), a batch over attrBurstCeiling (promoted to a
+// SCAN) and attrMaxRetries used up. A held late commit waits up to one
+// interval, so those paths stay open up to 10 s instead of one push window
+// (0.5-2 s). After a restart the next i-key event of the file publishes it
+// (no observation: a late commit). Persisting the held set would close it.
 // ============================================================================
 
 const (
@@ -71,33 +81,98 @@ const (
 
 var attrPushHeld atomic.Int64 // changes held by the gate (a re-read was armed)
 
-// peerRefreshInterval is the shortest time between two publications of
-// another client's content changes of one file.
-func peerRefreshInterval() time.Duration {
-	if v := os.Getenv("JM_PEER_REFRESH_INTERVAL"); v != "" {
-		if d, err := time.ParseDuration(v); err == nil && d >= 0 {
+// The interval follows the measured round trip to the backend, not the
+// bandwidth class: R1 costs one READ round per mtime change, and the round
+// trip decides how long a round takes. The class is capped at slow whenever
+// the backend route goes through a tunnel (utun), so a Mac at home reaching
+// the NAS over Tailscale at a few ms would get the far-link interval
+// (review M3 of #102).
+const (
+	peerRTTNear      = 30 * time.Millisecond  // at or under: peerIntervalNear
+	peerRTTMid       = 100 * time.Millisecond // at or under: peerIntervalMid
+	peerIntervalNear = time.Second
+	peerIntervalMid  = 3 * time.Second
+	peerIntervalFar  = 10 * time.Second
+)
+
+// peerIntervalInputs is what one interval choice was made from (logged).
+type peerIntervalInputs struct {
+	interval time.Duration
+	source   string // env | rtt | class
+	rtt      time.Duration
+	class    netprofile.LinkClass
+}
+
+// peerIntervalFor picks the interval: JM_PEER_REFRESH_INTERVAL when set, else
+// the smoothed RTT when one was measured, else the class (before the first
+// RTT sample: slow or metered far, medium mid, fast near).
+func peerIntervalFor(env string, snap netprofile.Snapshot) peerIntervalInputs {
+	in := peerIntervalInputs{rtt: snap.RTT, class: snap.Class}
+	if env != "" {
+		if d, err := time.ParseDuration(env); err == nil && d >= 0 {
 			if d > peerRefreshIntervalMax {
 				d = peerRefreshIntervalMax
 			}
-			return d
+			in.interval, in.source = d, "env"
+			return in
 		}
 	}
-	switch netprofile.Default().Class() {
-	case netprofile.ClassSlow, netprofile.ClassMetered:
-		return 10 * time.Second
-	case netprofile.ClassMedium:
-		return 3 * time.Second
-	default:
-		return time.Second
+	if snap.HaveRTT && snap.RTT > 0 {
+		in.source = "rtt"
+		switch {
+		case snap.RTT <= peerRTTNear:
+			in.interval = peerIntervalNear
+		case snap.RTT <= peerRTTMid:
+			in.interval = peerIntervalMid
+		default:
+			in.interval = peerIntervalFar
+		}
+		return in
 	}
+	in.source = "class"
+	switch snap.Class {
+	case netprofile.ClassSlow, netprofile.ClassMetered:
+		in.interval = peerIntervalFar
+	case netprofile.ClassMedium:
+		in.interval = peerIntervalMid
+	default:
+		in.interval = peerIntervalNear
+	}
+	return in
+}
+
+// peerIntervalLogged is the last interval and source logged.
+var peerIntervalLogged struct {
+	mu       sync.Mutex
+	interval time.Duration
+	source   string
+	done     bool
+}
+
+// peerRefreshInterval is the shortest time between two publications of
+// another client's content changes of one file. A change of the interval or
+// of its source is logged once, with its inputs.
+func peerRefreshInterval() time.Duration {
+	in := peerIntervalFor(os.Getenv("JM_PEER_REFRESH_INTERVAL"), netprofile.Default().Snapshot())
+	l := &peerIntervalLogged
+	l.mu.Lock()
+	changed := !l.done || l.interval != in.interval || l.source != in.source
+	l.interval, l.source, l.done = in.interval, in.source, true
+	l.mu.Unlock()
+	if changed {
+		jmlog.Info("metadata attr push: teammate change interval", "interval_ms", in.interval.Milliseconds(),
+			"source", in.source, "rtt_ms", in.rtt.Milliseconds(), "class", in.class.String())
+	}
+	return in.interval
 }
 
 // peerRefreshGate keeps, per inode, when another client's change was last
 // published, and which inodes have a re-read armed.
 type peerRefreshGate struct {
-	mu    sync.Mutex
-	last  map[uint64]time.Time
-	armed map[uint64]struct{}
+	mu        sync.Mutex
+	last      map[uint64]time.Time
+	armed     map[uint64]struct{}
+	lastPrune time.Time
 }
 
 // hold reports whether a change of inode must wait, and until when.
@@ -142,7 +217,11 @@ func (g *peerRefreshGate) published(inode uint64, now time.Time) {
 		g.last = make(map[uint64]time.Time)
 	}
 	g.last[inode] = now
-	if len(g.last) > peerGatePruneAt {
+	// At most one walk per second (review L3 of #102): a burst of more than
+	// peerGatePruneAt recent inodes would otherwise walk the map on every
+	// publication and delete nothing.
+	if len(g.last) > peerGatePruneAt && now.Sub(g.lastPrune) >= time.Second {
+		g.lastPrune = now
 		for i, t := range g.last {
 			if now.Sub(t) > peerRefreshIntervalMax {
 				delete(g.last, i)
@@ -151,23 +230,46 @@ func (g *peerRefreshGate) published(inode uint64, now time.Time) {
 	}
 }
 
-// The gate's clock, interval and timer (tests replace them).
-var (
-	peerGateNow           = time.Now
-	peerRefreshIntervalFn = peerRefreshInterval
-	peerGateAfter         = func(d time.Duration, f func()) { time.AfterFunc(d, f) }
-)
+// The gate's clock, interval and timer. A test sets them per client
+// (RedisClient.testPeerGate*), so every other test keeps the gate on.
+func (rc *RedisClient) peerGateNow() time.Time {
+	if rc.testPeerGateNow != nil {
+		return rc.testPeerGateNow()
+	}
+	return time.Now()
+}
+
+func (rc *RedisClient) peerGateInterval() time.Duration {
+	if rc.testPeerGateInterval != nil {
+		return rc.testPeerGateInterval()
+	}
+	return peerRefreshInterval()
+}
+
+func (rc *RedisClient) peerGateAfter(d time.Duration, f func()) {
+	if rc.testPeerGateAfter != nil {
+		rc.testPeerGateAfter(d, f)
+		return
+	}
+	time.AfterFunc(d, f)
+}
 
 // holdPeerChanges splits the rows the attr push is about to publish: the
 // Mac's own bytes and the first change of an inode in its interval go on;
 // another client's later change is held, and its inode is read again when
 // the interval ends (see the comment above).
-func (rc *RedisClient) holdPeerChanges(rows []*Entry) []*Entry {
-	interval := peerRefreshIntervalFn()
+//
+// rowSize is the size the mirror row has now (the attr push read the row
+// already; review L4 of #102).
+func (rc *RedisClient) holdPeerChanges(rows []*Entry, rowSize map[uint64]int64) []*Entry {
+	if len(rows) == 0 {
+		return rows
+	}
+	interval := rc.peerGateInterval()
 	if interval <= 0 {
 		return rows
 	}
-	now := peerGateNow()
+	now := rc.peerGateNow()
 	kept := rows[:0:0]
 	for _, e := range rows {
 		if e.span != nil && e.span.own {
@@ -177,7 +279,7 @@ func (rc *RedisClient) holdPeerChanges(rows []*Entry) []*Entry {
 		// A shorter file publishes at once: a row that kept the longer size
 		// would send READs past the new end, which the premature-EOF guard
 		// answers with EIO.
-		if row := rc.store.LookupByInode(e.Inode); row == nil || e.Size < row.Size {
+		if size, ok := rowSize[e.Inode]; !ok || e.Size < size {
 			kept = append(kept, e)
 			continue
 		}
@@ -199,7 +301,7 @@ func (rc *RedisClient) holdPeerChanges(rows []*Entry) []*Entry {
 		if wait < 0 {
 			wait = 0
 		}
-		peerGateAfter(wait, func() {
+		rc.peerGateAfter(wait, func() {
 			rc.peerGate.disarm(inode)
 			rc.deferOwnedFile(inode)
 		})
@@ -213,5 +315,5 @@ func (rc *RedisClient) notePeerPublished(e *Entry) {
 	if e.span != nil && e.span.own {
 		return
 	}
-	rc.peerGate.published(e.Inode, peerGateNow())
+	rc.peerGate.published(e.Inode, rc.peerGateNow())
 }
