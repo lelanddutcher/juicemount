@@ -747,9 +747,10 @@ func TestHeldOwnInPlaceSaveKeepsItsMtime(t *testing.T) {
 			// sync took a while abroad). Without the own mark this would be
 			// reported as ownSec + 1 ns.
 			mown := time.Unix(1700000299, 700000000)
-			// The WRITE's own content mark: the FUSE file's exact mtime after
-			// the sync (nfs/write_binding.go publishMutation).
-			l.store.NoteOwnContent("media.mov", 9000, mown)
+			// The WRITE's own content mark: JuiceFS stamped the mtime inside
+			// the WRITE syscall, which began just before and synced 2 s
+			// later (nfs/write_binding.go).
+			l.store.NoteOwnBytes("media.mov", 9000, mown.Add(-300*time.Microsecond), mown.Add(2*time.Second))
 			l.set(mown, mown.Add(2*time.Second), 9000, 3)
 			if !race {
 				if d := l.pushOwned(); len(d) != 1 {
@@ -819,7 +820,8 @@ func TestTeammateSameSizeSaveIsNotOwn(t *testing.T) {
 		t.Fatal(err)
 	}
 	mown := time.Unix(1700000299, 700000000)
-	l.store.NoteOwnContent("media.mov", 9000, mown)
+	// The in-place WRITE's bracket (2 s from its syscall to its sync).
+	l.store.NoteOwnBytes("media.mov", 9000, mown.Add(-300*time.Microsecond), mown.Add(2*time.Second))
 	l.set(mown, mown.Add(time.Second), 9000, 3)
 	l.push() // the Mac's own echo
 	if got := l.reported(); !got.Equal(mown) {
@@ -873,7 +875,7 @@ func TestOwnMarksStayBounded(t *testing.T) {
 	for i := 0; i < n; i++ {
 		clock = clock.Add(time.Millisecond) // 50 s in all: none expires
 		s := time.Now()
-		o.noteContent(uint64(i+1), 100, clock)
+		o.noteContent(uint64(i+1), 100, clock, clock)
 		calls[i] = time.Since(s)
 	}
 	total := time.Since(start)
@@ -902,7 +904,7 @@ func BenchmarkOwnMarksBulk(b *testing.B) {
 	o.now = func() time.Time { return clock }
 	for i := 0; i < b.N; i++ {
 		clock = clock.Add(time.Millisecond)
-		o.noteContent(uint64(i%50000+1), 100, clock)
+		o.noteContent(uint64(i%50000+1), 100, clock, clock)
 	}
 }
 

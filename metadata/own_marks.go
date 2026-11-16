@@ -19,12 +19,18 @@ import (
 //     mark, and a mark set during the write survives. While the path is
 //     held, the deferral renews the mark, so its 30 s run from the release.
 //   - A content mark (an in-place WRITE, an in-place drain) records the
-//     exact (size, mtime) JuiceFS holds after the Mac's own change: the
-//     FUSE file's mtime after the WRITE synced, or the mtime the drain set.
-//     A row from Redis is the Mac's own bytes only on an exact match: then
-//     its true mtime is reported (a changed row), or a later ctime-only part
-//     under that mtime is the Mac's own. A teammate's save cannot carry the
-//     Mac's exact mtime, so it always counts.
+//     exact size the Mac's own change left and the mtime JuiceFS gave it: a
+//     drain sets it (Chtimes, one exact value); a WRITE gets the time
+//     JuiceFS stamps inside the Mac's own write syscall, so the mark holds
+//     that syscall's interval up to the end of its sync, on the clock
+//     JuiceFS stamps with (the same host). An fstat cannot give the exact
+//     value: JuiceFS answers from the open file's cached attributes, which
+//     still hold the previous WRITE's mtime (lab 2026-11-16). A row from
+//     Redis is the Mac's own bytes only with exactly that size and an mtime
+//     inside that interval: then its true mtime is reported (a changed
+//     row), or a later ctime-only part under it is the Mac's own. A
+//     teammate's save would have to commit, with the same size, while the
+//     Mac's own WRITE of the file was running; any other counts.
 //
 // Marks are kept in time order: each call drops the expired heads, so its
 // cost is the number of marks that expired since, and past ownMarksMax the
@@ -40,8 +46,8 @@ const (
 )
 
 type ownWrite struct {
-	size    int64
-	mtimeNS int64
+	size         int64
+	fromNS, toNS int64 // the interval JuiceFS stamped the mtime in
 }
 
 type ownMark struct {
@@ -137,13 +143,13 @@ func (o *ownMarks) noteEcho(inode uint64) {
 	mk.echoAt, mk.echoGen = now, o.gen
 }
 
-func (o *ownMarks) noteContent(inode uint64, size int64, mtime time.Time) {
+func (o *ownMarks) noteContent(inode uint64, size int64, from, to time.Time) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	now := o.clock()
 	mk := o.touchLocked(inode, now)
 	mk.contentAt = now
-	mk.writes[mk.next] = ownWrite{size, mtime.UnixNano()}
+	mk.writes[mk.next] = ownWrite{size, from.UnixNano(), to.UnixNano()}
 	mk.next = (mk.next + 1) % ownContentKeep
 	if mk.n < ownContentKeep {
 		mk.n++
@@ -204,7 +210,8 @@ func (o *ownMarks) renewEcho(inode uint64) {
 	}
 }
 
-// exact reports whether (size, mtime) is one the Mac's own change produced.
+// exact reports whether (size, mtime) is what the Mac's own change left: the
+// same size, and the mtime inside the interval JuiceFS stamped it in.
 func (o *ownMarks) exact(inode uint64, size int64, mtime time.Time) bool {
 	o.mu.Lock()
 	defer o.mu.Unlock()
@@ -214,7 +221,7 @@ func (o *ownMarks) exact(inode uint64, size int64, mtime time.Time) bool {
 	}
 	ns := mtime.UnixNano()
 	for i := 0; i < mk.n; i++ {
-		if w := mk.writes[i]; w.size == size && w.mtimeNS == ns {
+		if w := mk.writes[i]; w.size == size && w.fromNS <= ns && ns <= w.toNS {
 			return true
 		}
 	}
@@ -261,15 +268,21 @@ func (s *Store) NoteOwnInode(inode uint64) {
 	}
 }
 
-// NoteOwnContent records the exact size and mtime JuiceFS holds for path
-// after this process's own change of its bytes (a content mark).
-func (s *Store) NoteOwnContent(path string, size int64, mtime time.Time) {
+// NoteOwnBytes records a content mark for path: this process's own change
+// left size bytes, and JuiceFS stamped the mtime between from and to (from ==
+// to: exactly that mtime, as a drain sets it).
+func (s *Store) NoteOwnBytes(path string, size int64, from, to time.Time) {
 	if s == nil {
 		return
 	}
 	if e := s.ownFile(path); e != nil {
-		s.own.noteContent(e.Inode, size, mtime)
+		s.own.noteContent(e.Inode, size, from, to)
 	}
+}
+
+// NoteOwnContent is NoteOwnBytes with one exact mtime.
+func (s *Store) NoteOwnContent(path string, size int64, mtime time.Time) {
+	s.NoteOwnBytes(path, size, mtime, mtime)
 }
 
 func (s *Store) takeOwnChange(inode uint64) bool { return s.own.takeEcho(inode) }

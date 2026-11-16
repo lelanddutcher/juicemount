@@ -1848,7 +1848,7 @@ func (d *Drainer) drainOne(row *metadata.SpoolRow) {
 	// is anyway.
 	if tgt.stage == nil && !backendMtime.IsZero() {
 		if owner := d.spool.Meta().Owner(); owner != nil {
-			owner.NoteOwnContent(row.NFSPath, row.Size, backendMtime)
+			owner.NoteOwnBytes(row.NFSPath, row.Size, backendMtime, backendMtime)
 		}
 	}
 	ph.mark_(&ph.chtimes)

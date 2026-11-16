@@ -231,16 +231,18 @@ func (f *writeFile) verifyMutation(m metadata.OnlineMutation) error {
 	if backing != m.BackingIdentity || mount != m.MountGeneration || size != m.TargetEOF || !os.SameFile(info, current) {
 		return metadata.ErrMirrorConflict
 	}
-	f.verifiedMtime = info.ModTime()
 	return nil
 }
 
 func (f *writeFile) publishMutation(m metadata.OnlineMutation) error {
-	// The Mac's own bytes, exactly as JuiceFS holds them after the sync (the
-	// last verifyMutation): their echo keeps its true mtime. Marked while the
-	// operation holds the path (metadata/own_marks.go).
-	if !f.verifiedMtime.IsZero() {
-		f.handler.store.NoteOwnContent(f.name, m.TargetEOF, f.verifiedMtime)
+	// The Mac's own bytes: JuiceFS stamps their mtime inside this WRITE, from
+	// its syscall to the end of its sync, on this host's clock (lab 11-16:
+	// 0.2–0.3 ms after the syscall began). An fstat cannot give the exact
+	// value: JuiceFS serves the open file's cached attributes, which still
+	// hold the previous WRITE's mtime. Marked while the operation holds the
+	// path (metadata/own_marks.go).
+	if !f.ownWriteFrom.IsZero() && !f.ownWriteTo.Before(f.ownWriteFrom) {
+		f.handler.store.NoteOwnBytes(f.name, m.TargetEOF, f.ownWriteFrom, f.ownWriteTo)
 	}
 	e, err := f.handler.store.CompleteOnlineMutation(m, time.Now())
 	if err != nil {
@@ -362,6 +364,7 @@ func (f *writeFile) writeBound(p []byte, off int64, positioned bool) (n int, err
 			return 0, err
 		}
 	}
+	f.ownWriteFrom = time.Now()
 	if positioned {
 		n, err = f.File.WriteAt(p, off)
 	} else {
@@ -387,6 +390,7 @@ func (f *writeFile) writeBound(p []byte, off int64, positioned bool) (n int, err
 	if err = f.handler.syncOnlineMutation(f.File); err != nil {
 		return n, err
 	}
+	f.ownWriteTo = time.Now()
 	if err = f.verifyMutation(m); err != nil {
 		return n, err
 	}

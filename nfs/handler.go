@@ -7029,9 +7029,9 @@ type writeFile struct {
 	identity os.FileInfo
 	closed   bool
 
-	// verifiedMtime is the FUSE file's mtime at the last verifyMutation:
-	// after the sync, exactly what JuiceFS holds (metadata/own_marks.go).
-	verifiedMtime time.Time
+	// ownWriteFrom, ownWriteTo bracket the last in-place WRITE, from the
+	// write syscall to the end of its sync (metadata/own_marks.go).
+	ownWriteFrom, ownWriteTo time.Time
 }
 
 func (f *writeFile) Name() string  { return f.name }
