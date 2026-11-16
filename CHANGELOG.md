@@ -4,6 +4,35 @@
 
 ### App
 
+- On a far link, saving a file no longer makes the whole volume answer
+  "input/output error". The laptop run of 2026-11-14 found it in 8 of 13
+  abroad sessions (0 of 9 on lan): a Premiere-style temp-file save, an
+  in-place save or a rename failed, and then every `stat` of the volume
+  failed until a remount. Abroad the app's own write or rename takes
+  0.5–9 s through JuiceFS. Three things went wrong in that time:
+  - **The background feeds recorded the change first.** The file attribute
+    push, the folder push and its prune, and the echo of the app's previous
+    write saw the change in Redis and updated the local mirror. The save's
+    own record then no longer matched what it had read before, so the save
+    failed after its bytes had already changed. Now the feeds leave a file
+    or name alone while one of the app's own operations changes it, and read
+    it again a second later.
+  - **A rename to a new name failed on any other write.** The record of a
+    name that does not exist yet was the mirror's global change counter, so
+    any other file's change during the rename's second failed it. Now the
+    rename checks only that its destination is still absent.
+  - **One failed name blocked the whole volume.** The app keeps a failed
+    name blocked, and the block covered every folder above it, the volume
+    root included. Now only the failed name (and what lies beneath it)
+    answers the error; listing its own folder also fails, so the listing
+    never shows its uncertain attributes. While a save runs, the folders
+    above the file also kept answering "try later", and a lookup of them
+    "no such file"; now they answer normally.
+  The Linux remote lab (`test/remote-lab/experiments/own-save-lab.sh`, a new
+  `peerprobe ownsave` step) reproduced the volume-wide failure in 5 of 5
+  abroad sessions on main and in 0 of 10 with the fix. The Mac still needs
+  the laptop run.
+
 - A teammate's save now reaches a Mac that is playing or has already read the
   file. The laptop run of 2026-11-14 (on #94) found five Mac-side gaps:
   - **The open file kept its old bytes (P1).** macFUSE gives every open

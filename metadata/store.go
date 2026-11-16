@@ -309,6 +309,10 @@ type Store struct {
 	// changes an existing file (not this client's own echo). Guarded by mu.
 	onContentChanged func(path string, oldInode uint64)
 
+	// foregroundOwner: foreground_owner.go. Background publication skips a
+	// path a foreground NFS mutation owns.
+	foregroundOwner atomic.Pointer[foregroundOwnerFunc]
+
 	// ftsInitialized is set once the external-content FTS has been built (the
 	// first BulkInsert / initial sync). After that EVERY BulkInsert maintains
 	// FTS incrementally — even a large delta — so it never holds writeMu
@@ -1341,6 +1345,23 @@ func (s *Store) Insert(e *Entry) error {
 	// total order, so an old CREATE snapshot can never replace a later size bump
 	// in SQLite or pathCache.
 	s.writeMu.Lock()
+	err := s.insertWriteLocked(e)
+	s.writeMu.Unlock()
+	if err != nil {
+		return err
+	}
+
+	// Nudge the compactor so a just-created file becomes searchable promptly
+	// (within a compact batch) rather than only on the next ticker. No-op when
+	// the flag is off (ftsWake is nil). Non-blocking / coalesced.
+	s.wakeFTSCompactor()
+
+	return nil
+}
+
+// insertWriteLocked is Insert's durable write and RAM publication. The caller
+// holds writeMu (InsertFromFeed checks foreground ownership inside it).
+func (s *Store) insertWriteLocked(e *Entry) error {
 	s.mu.RLock()
 	persisted := &Entry{
 		Path:           e.Path,
@@ -1363,21 +1384,17 @@ func (s *Store) Insert(e *Entry) error {
 	// ftsExternalUpsert.
 	tx, err := s.db.Begin()
 	if err != nil {
-		s.writeMu.Unlock()
 		return fmt.Errorf("insert begin %q: %w", e.Path, err)
 	}
 	if err := ftsExternalUpsert(tx, e, s.ftsDefer); err != nil {
 		tx.Rollback()
-		s.writeMu.Unlock()
 		return fmt.Errorf("insert %q: %w", e.Path, err)
 	}
 	if err := loadEntryVersion(tx, e); err != nil {
 		tx.Rollback()
-		s.writeMu.Unlock()
 		return err
 	}
 	if err := tx.Commit(); err != nil {
-		s.writeMu.Unlock()
 		return fmt.Errorf("insert commit %q: %w", e.Path, err)
 	}
 
@@ -1403,13 +1420,6 @@ func (s *Store) Insert(e *Entry) error {
 	s.pathCache[e.Path] = e
 	s.addToChildrenIdx(e)
 	s.mu.Unlock()
-	s.writeMu.Unlock()
-
-	// Nudge the compactor so a just-created file becomes searchable promptly
-	// (within a compact batch) rather than only on the next ticker. No-op when
-	// the flag is off (ftsWake is nil). Non-blocking / coalesced.
-	s.wakeFTSCompactor()
-
 	return nil
 }
 
@@ -2021,23 +2031,31 @@ func ftsExternalUpsert(tx *sql.Tx, e *Entry, deferFTS bool) error {
 // reconcile deltas); incremental=false skips FTS here and the caller does a
 // single bulk RebuildFTS (startup/initial load).
 func (s *Store) bulkInsertBatch(batch []*Entry, incremental bool) error {
-	_, err := s.bulkInsertBatchWithEpoch(batch, incremental, nil, nil, false)
+	_, err := s.bulkInsertBatchWithEpoch(batch, incremental, nil, nil, false, nil)
 	return err
 }
 
 // ScanUpsertBatch conditionally publishes one SCAN chunk. Its returned token
 // includes this batch's commit and is the precondition for the next chunk.
 func (s *Store) ScanUpsertBatch(batch []*Entry, expected StoreEpoch, invalidatePaths []string) (StoreEpoch, error) {
+	next, _, err := s.ScanUpsertBatchOwned(batch, expected, invalidatePaths)
+	return next, err
+}
+
+// ScanUpsertBatchOwned also returns the rows skipped because a foreground
+// mutation owned them; the SCAN requeues their folders (review M1 of #100).
+func (s *Store) ScanUpsertBatchOwned(batch []*Entry, expected StoreEpoch, invalidatePaths []string) (StoreEpoch, []string, error) {
 	if len(batch) == 0 || len(batch) > 500 {
-		return StoreEpoch{}, ErrMirrorConflict
+		return StoreEpoch{}, nil, ErrMirrorConflict
 	}
-	next, err := s.bulkInsertBatchWithEpoch(batch, true, &expected, invalidatePaths, false)
+	var owned []string
+	next, err := s.bulkInsertBatchWithEpoch(batch, true, &expected, invalidatePaths, false, &owned)
 	if err != nil {
-		return StoreEpoch{}, err
+		return StoreEpoch{}, nil, err
 	}
 	s.evictWithPinnedSet()
 	s.ftsInitialized.Store(true)
-	return next, nil
+	return next, owned, nil
 }
 
 // ReconcileUpsertBatch gives the keyspace HGETALL path the SCAN admission
@@ -2045,19 +2063,28 @@ func (s *Store) ScanUpsertBatch(batch []*Entry, expected StoreEpoch, invalidateP
 // row. The callback runs after the accepted-publication check and before the
 // mirror row changes; protected entries never invoke it.
 func (s *Store) ReconcileUpsertBatch(batch []*Entry, expected StoreEpoch) (StoreEpoch, error) {
+	next, _, err := s.ReconcileUpsertBatchOwned(batch, expected)
+	return next, err
+}
+
+// ReconcileUpsertBatchOwned is ReconcileUpsertBatch that also returns the
+// paths it skipped because a foreground mutation owned them (see
+// foreground_owner.go). The caller retries those after the owner finishes.
+func (s *Store) ReconcileUpsertBatchOwned(batch []*Entry, expected StoreEpoch) (StoreEpoch, []string, error) {
 	if len(batch) == 0 || len(batch) > 500 {
-		return StoreEpoch{}, ErrMirrorConflict
+		return StoreEpoch{}, nil, ErrMirrorConflict
 	}
-	next, err := s.bulkInsertBatchWithEpoch(batch, true, &expected, nil, true)
+	var owned []string
+	next, err := s.bulkInsertBatchWithEpoch(batch, true, &expected, nil, true, &owned)
 	if err != nil {
-		return StoreEpoch{}, err
+		return StoreEpoch{}, nil, err
 	}
 	s.evictWithPinnedSet()
 	s.ftsInitialized.Store(true)
-	return next, nil
+	return next, owned, nil
 }
 
-func (s *Store) bulkInsertBatchWithEpoch(batch []*Entry, incremental bool, expected *StoreEpoch, invalidatePaths []string, reconcile bool) (StoreEpoch, error) {
+func (s *Store) bulkInsertBatchWithEpoch(batch []*Entry, incremental bool, expected *StoreEpoch, invalidatePaths []string, reconcile bool, owned *[]string) (StoreEpoch, error) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	s.cachePublicationMu.Lock()
@@ -2117,6 +2144,20 @@ func (s *Store) bulkInsertBatchWithEpoch(batch []*Entry, incremental bool, expec
 	for _, e := range snapshots {
 		selected[e.Path] = struct{}{}
 	}
+	// A background (SCAN or keyspace) publication never lands on a path a
+	// foreground mutation owns: its CAS would fail after the backing change
+	// (foreground_owner.go). Checked under writeMu, like every capture.
+	foreground := make(map[string]struct{})
+	if expected != nil {
+		for _, e := range snapshots {
+			if s.ForegroundOwned(e.Path) {
+				foreground[e.Path] = struct{}{}
+				if owned != nil {
+					*owned = append(*owned, e.Path)
+				}
+			}
+		}
+	}
 	// A directory content callback invalidates every cached slice mapping,
 	// including those owned by an accepted replacement elsewhere in the tree.
 	// Refuse an admitted directory before any row or callback in this batch can
@@ -2138,6 +2179,9 @@ func (s *Store) bulkInsertBatchWithEpoch(batch []*Entry, incremental bool, expec
 	seenInvalidations := make(map[string]struct{}, len(invalidatePaths))
 	for _, p := range invalidatePaths {
 		if _, held := protected.paths[p]; held {
+			continue
+		}
+		if _, held := foreground[p]; held {
 			continue
 		}
 		if _, ok := selected[p]; !ok {
@@ -2170,6 +2214,9 @@ func (s *Store) bulkInsertBatchWithEpoch(batch []*Entry, incremental bool, expec
 			continue
 		}
 		if _, held := protected.paths[e.Path]; held {
+			continue
+		}
+		if _, held := foreground[e.Path]; held {
 			continue
 		}
 		if !e.Version.IsZero() {

@@ -143,7 +143,11 @@ func (rc *RedisClient) newAttrCoalescer(generation uint64) *inodeCoalescer {
 	var retryMu sync.Mutex
 	retries := map[uint64]int{} // consecutive failures per inode
 	c.apply = func(batch []uint64) {
-		failed, err := rc.reconcileFileAttrs(batch, generation)
+		failed, deferred, err := rc.reconcileFileAttrsOwned(batch, generation)
+		for _, inode := range deferred {
+			// Client-lifetime queue: survives a resubscribe (review M1).
+			rc.deferOwnedFile(inode)
+		}
 		failedSet := make(map[uint64]struct{}, len(failed))
 		for _, inode := range failed {
 			failedSet[inode] = struct{}{}
@@ -183,9 +187,18 @@ func (rc *RedisClient) newAttrCoalescer(generation uint64) *inodeCoalescer {
 // reconcileFileAttrs reads the attrs of the batch's known regular files and
 // upserts those whose size or mtime changed. It returns the inodes to retry.
 func (rc *RedisClient) reconcileFileAttrs(inodes []uint64, generation uint64) (retry []uint64, err error) {
+	retry, _, err = rc.reconcileFileAttrsOwned(inodes, generation)
+	return retry, err
+}
+
+// reconcileFileAttrsOwned is reconcileFileAttrs that also returns the inodes
+// deferred because a foreground mutation owns their path (an in-place WRITE
+// still syncing: foreground_owner.go). A deferred inode is not a failure: it
+// is read again after attrRetryBase, without using its retry budget.
+func (rc *RedisClient) reconcileFileAttrsOwned(inodes []uint64, generation uint64) (retry, deferred []uint64, err error) {
 	token := rc.scanToken()
 	if token.backend != generation || !rc.scanTokenValid(token) {
-		return nil, ErrBackendUnqualified
+		return nil, nil, ErrBackendUnqualified
 	}
 	guard := rc.loadSpoolGuard()
 	known := make([]*Entry, 0, len(inodes))
@@ -202,17 +215,23 @@ func (rc *RedisClient) reconcileFileAttrs(inodes []uint64, generation uint64) (r
 		if guard != nil && guard(e.Path) {
 			continue
 		}
+		// This client is changing the file right now; its own publication
+		// lands first (the Store rechecks under its writer lock).
+		if rc.store.ForegroundOwned(e.Path) {
+			deferred = append(deferred, inode)
+			continue
+		}
 		known = append(known, e)
 	}
 	if len(known) == 0 {
-		return nil, nil
+		return nil, deferred, nil
 	}
 	if len(known) > attrBurstCeiling {
 		noteKeyspaceScanPromotion()
 		jmlog.Info("metadata attr push: burst over ceiling, promoting to full SCAN",
 			"files", len(known), "ceiling", attrBurstCeiling)
 		rc.keyspaceTriggerSync()
-		return nil, nil
+		return nil, deferred, nil
 	}
 	attrPushBatches.Add(1)
 
@@ -239,7 +258,7 @@ func (rc *RedisClient) reconcileFileAttrs(inodes []uint64, generation uint64) (r
 			if merr == nil {
 				merr = ErrMirrorConflict
 			}
-			return retry, merr
+			return retry, deferred, merr
 		}
 		for i, v := range vals {
 			str, ok := v.(string)
@@ -267,16 +286,30 @@ func (rc *RedisClient) reconcileFileAttrs(inodes []uint64, generation uint64) (r
 		}
 	}
 	if len(toUpsert) == 0 {
-		return nil, nil
+		return nil, deferred, nil
 	}
-	if err := rc.applyReconcileUpsertsWithToken(toUpsert, &token); err != nil {
+	owned, err := rc.applyReconcileUpsertsOwned(toUpsert, &token)
+	if err != nil {
 		for _, e := range toUpsert {
 			retry = append(retry, e.Inode)
 		}
-		return retry, err
+		return retry, deferred, err
 	}
-	attrPushRefreshed.Add(int64(len(toUpsert)))
-	jmlog.Info("metadata attr push: refreshed", "events", len(inodes), "files", len(known), "changed", len(toUpsert),
-		"first", toUpsert[0].Path)
-	return nil, nil
+	if len(owned) > 0 {
+		ownedSet := make(map[string]struct{}, len(owned))
+		for _, p := range owned {
+			ownedSet[p] = struct{}{}
+		}
+		for _, e := range toUpsert {
+			if _, ok := ownedSet[e.Path]; ok {
+				deferred = append(deferred, e.Inode)
+			}
+		}
+	}
+	if refreshed := len(toUpsert) - len(owned); refreshed > 0 {
+		attrPushRefreshed.Add(int64(refreshed))
+		jmlog.Info("metadata attr push: refreshed", "events", len(inodes), "files", len(known), "changed", refreshed,
+			"first", toUpsert[0].Path)
+	}
+	return nil, deferred, nil
 }

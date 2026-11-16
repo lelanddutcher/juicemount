@@ -510,6 +510,24 @@ The lab shows the server side. A Mac adds its NFS client's attribute cache:
 it re-reads a file's attributes at each open, but for a file it keeps open it
 trusts them for up to `acregmax` (3 s by default since the 2026-11-14 peer-edit fix; `JM_NFS_ACREG` sets it).
 
+## The Mac's own saves (`experiments/own-save-lab.sh`)
+
+`experiments/own-save-lab.sh run PROFILE LABEL` checks that the app's own
+saves keep the volume working on a far link (laptop bug B1, 2026-11-14). It
+starts jm5 with the write spool on, logged in as a kind-mac principal, and
+`peerprobe ownsave` saves through jm5's NFS server as the Mac does: a
+temp-file save renamed over the file (Premiere, Resolve), two in-place
+64 KiB saves, a chmod and a rename, three times, while a 256 KiB file is
+saved every second in another folder. After every operation it sends a
+GETATTR of the volume root. The last line of `LABEL.jsonl` sums it up:
+`volume_eio` (the root ever failed), `root_ok_at_end`, `op_eio` (operations
+that failed with an I/O error) and `jukebox` (retries).
+
+```sh
+experiments/own-save-lab.sh build
+experiments/own-save-lab.sh run abroad ab1
+```
+
 ## Addresses
 
 The lab uses `10.231.10.0/24` (nas) and `10.231.20.0/24` (remote). If those

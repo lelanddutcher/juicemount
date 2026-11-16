@@ -52,10 +52,29 @@ func (c *namespaceCoordinator) readErrorLocked(name string, allActive bool) erro
 			continue
 		}
 		for _, held := range names {
-			if namespaceConflict(name, false, held, op.shallow) {
-				if op.failed {
+			if op.failed {
+				// A failed operation leaves only its own names (and what lies
+				// beneath them) in doubt. Its ancestors are not: answering EIO
+				// for them made one failed save of w/a/b.prproj fail every
+				// GETATTR of the volume root, and the Mac then reports the
+				// whole volume dead (laptop B1, 2026-11-14).
+				if namespaceCovers(name, held, op.shallow) {
 					return syscall.EIO
 				}
+				continue
+			}
+			if !allActive {
+				// Serving (GETATTR, LOOKUP, open) while a content mutation
+				// blocks reads: the same scope. An in-place WRITE of
+				// w/a/b.prproj does not change w or w/a, and refusing them
+				// made LOOKUP answer NOENT for every folder above the file
+				// for the 4–9 s an abroad save takes (StatCacheOnly).
+				if namespaceCovers(name, held, op.shallow) {
+					active = true
+				}
+				continue
+			}
+			if namespaceConflict(name, false, held, op.shallow) {
 				active = true
 			}
 		}
@@ -154,6 +173,64 @@ func (c *namespaceCoordinator) servingError(name string) error {
 	return c.readErrorLocked(name, false)
 }
 
+// namespaceCovers reports whether a read of name touches what an operation
+// holding held changes or left uncertain: held itself, or (unless the hold was
+// shallow) a path beneath it. Never an ancestor of held.
+func namespaceCovers(name, held string, shallow bool) bool {
+	if name == held || held == "." {
+		return true
+	}
+	return !shallow && strings.HasPrefix(name, held+"/")
+}
+
+// ownsForBackground reports whether a live (not failed) foreground operation
+// owns path: path is a name it holds, or lies beneath one (unless shallow).
+// The metadata Store calls it under its writer lock before a background feed
+// publishes path (metadata/foreground_owner.go). It takes only c.mu, which is
+// never held while calling into the Store, so the lock order is Store → c.mu.
+// A failed operation does not own: its names already answer EIO, and the
+// background feeds then converge the mirror to the backend.
+func (c *namespaceCoordinator) ownsForBackground(p string) bool {
+	p = cleanNamespaceName(p)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for op, names := range c.active {
+		if op.failed {
+			continue
+		}
+		for _, held := range names {
+			if namespaceCovers(p, held, op.shallow) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// listingError is servingError for a READDIR of dir. A listing carries each
+// child's attributes, so it also fails while a failed operation holds a
+// direct child of dir: that child's attributes are in doubt. GETATTR and
+// LOOKUP of dir itself stay served (servingError).
+func (c *namespaceCoordinator) listingError(dir string) error {
+	dir = cleanNamespaceName(dir)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err := c.readErrorLocked(dir, false); err != nil {
+		return err
+	}
+	for op, names := range c.active {
+		if !op.failed {
+			continue
+		}
+		for _, held := range names {
+			if held != "." && path.Dir(held) == dir {
+				return syscall.EIO
+			}
+		}
+	}
+	return nil
+}
+
 func namespaceOverlap(a, b string) bool {
 	return a == "." || b == "." || a == b || strings.HasPrefix(a, b+"/") || strings.HasPrefix(b, a+"/")
 }
@@ -187,7 +264,17 @@ func (c *namespaceCoordinator) beginShallow(names []string) *namespaceOperation 
 func (c *namespaceCoordinator) beginScoped(names []string, shallow bool) *namespaceOperation {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.stopping || len(c.active) >= 24 {
+	// Failed operations stay (H8) but no longer take a slot: after a failed
+	// save the volume keeps working, so failures could pile up to the cap
+	// and refuse every later mutation (review L1 of #100). They still block
+	// their own names below.
+	live := 0
+	for op := range c.active {
+		if !op.failed {
+			live++
+		}
+	}
+	if c.stopping || live >= 24 {
 		// Preserve original priority when both refusal conditions hold.
 		if c.stopping {
 			metrics.Default().IncAdmissionRefusal(metrics.AdmissionNamespaceStopping)

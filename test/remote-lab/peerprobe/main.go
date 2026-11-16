@@ -49,6 +49,8 @@ func main() {
 		err = fixture(os.Args[2:])
 	case "run":
 		err = run(os.Args[2:])
+	case "ownsave":
+		err = ownsave(os.Args[2:])
 	default:
 		err = fmt.Errorf("unknown step %q", os.Args[1])
 	}
