@@ -249,7 +249,17 @@ func (f *writeFile) publishMutation(m metadata.OnlineMutation, from, to time.Tim
 		jmlog.Debug("own write marked", "path", f.name, "kind", m.Kind, "size", m.TargetEOF,
 			"from_ns", from.UnixNano(), "to_ns", to.UnixNano())
 	}
-	e, err := f.handler.store.CompleteOnlineMutation(m, time.Now())
+	// The row's mtime is the operation's start, not its end: JuiceFS
+	// stamps the true mtime just after the syscall began, and the row keeps
+	// whole seconds only. A finish time abroad (1-16 s later) showed the Mac
+	// a later mtime that then stepped back to the true one (laptop runs
+	// 2026-11-16, B1). The start's second is at or below the true mtime, so
+	// the next update only moves it forward.
+	stamp := time.Now()
+	if !from.IsZero() && from.Before(stamp) {
+		stamp = from
+	}
+	e, err := f.handler.store.CompleteOnlineMutation(m, stamp)
 	if err != nil {
 		return err
 	}
