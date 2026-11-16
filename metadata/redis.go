@@ -347,8 +347,11 @@ type RedisClient struct {
 	// attrRequeue re-enqueues a file inode into the live attr coalescer; nil
 	// while no session runs or the attr push is off. ownedDeferrals waits
 	// out paths a foreground mutation owns (owned_deferral.go).
-	attrRequeue       atomic.Pointer[requeueFunc]
-	ownedDeferrals    ownedDeferralQueue
+	attrRequeue    atomic.Pointer[requeueFunc]
+	ownedDeferrals ownedDeferralQueue
+	// peerGate holds another client's later content changes of a file
+	// until its interval ends (finding R1, peer_refresh_gate.go).
+	peerGate          peerRefreshGate
 	attrRetryMu       sync.Mutex
 	attrRetries       map[uint64]*attrRetryState
 	attrRetryStopped  bool

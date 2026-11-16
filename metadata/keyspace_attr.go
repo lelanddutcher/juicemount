@@ -345,6 +345,9 @@ func (rc *RedisClient) reconcileFileAttrsOwned(inodes []uint64, generation uint6
 			toUpsert = append(toUpsert, up)
 		}
 	}
+	// Another client's later change within its interval waits (finding R1,
+	// peer_refresh_gate.go).
+	toUpsert = rc.holdPeerChanges(toUpsert)
 	if len(toUpsert) == 0 {
 		return nil, deferred, nil
 	}
@@ -374,6 +377,7 @@ func (rc *RedisClient) reconcileFileAttrsOwned(inodes []uint64, generation uint6
 			late++
 		}
 		rc.store.settleOwnMarks(e) // mtime_span.go
+		rc.notePeerPublished(e)    // peer_refresh_gate.go
 	}
 	if refreshed > 0 {
 		attrPushRefreshed.Add(int64(refreshed))
