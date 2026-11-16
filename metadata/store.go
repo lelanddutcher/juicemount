@@ -2109,12 +2109,17 @@ func (s *Store) bulkInsertBatchWithEpoch(batch []*Entry, incremental bool, expec
 		trueNS, reportNS int64
 		size             int64
 		own              bool
+		// What it was judged against: the row's previous true and
+		// reported mtime (oldTrue -1: no preimage) and the history.
+		oldTrue, oldReport int64
+		history            []nfsReported
 	}
 	var moved, committedMoves []movedMtime
 	defer func() {
 		for _, m := range committedMoves {
 			jmlog.Info("metadata mtime span: reported mtime moved", "path", m.path, "inode", m.inode,
-				"true_ns", m.trueNS, "reported_ns", m.reportNS, "size", m.size, "own_bytes", m.own)
+				"true_ns", m.trueNS, "reported_ns", m.reportNS, "size", m.size, "own_bytes", m.own,
+				"old_true_ns", m.oldTrue, "old_reported_ns", m.oldReport, "history", fmtReported(m.history))
 		}
 	}()
 	s.writeMu.Lock()
@@ -2349,6 +2354,10 @@ func (s *Store) bulkInsertBatchWithEpoch(batch []*Entry, incremental bool, expec
 				return StoreEpoch{}, err
 			}
 			ownBytes := e.span != nil && e.span.own
+			oldTrue, oldReport := int64(-1), int64(-1)
+			if spanPresent {
+				oldTrue, oldReport = span.mtimeNS, span.reportedNS
+			}
 			change, obs, keepNewer := s.mtimeSpanUpdate(e, span, spanPresent, history)
 			if change != nil {
 				if err := change.write(tx); err != nil {
@@ -2357,7 +2366,7 @@ func (s *Store) bulkInsertBatchWithEpoch(batch []*Entry, incremental bool, expec
 				s.attrObs.noteSQL(e.Inode)
 				overlays = append(overlays, *change)
 				if r := change.rs[len(change.rs)-1]; r.reportedNS != r.trueNS {
-					moved = append(moved, movedMtime{e.Path, e.Inode, r.trueNS, r.reportedNS, e.Size, ownBytes})
+					moved = append(moved, movedMtime{e.Path, e.Inode, r.trueNS, r.reportedNS, e.Size, ownBytes, oldTrue, oldReport, history})
 				}
 			}
 			observations = append(observations, spanObs{e.Inode, obs, keepNewer})

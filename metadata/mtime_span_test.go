@@ -1016,3 +1016,41 @@ func TestOwnLateCommitMarkedAfterThePushJudgedIsItsEcho(t *testing.T) {
 		t.Errorf("the caller still sees a late commit: %+v", late.span)
 	}
 }
+
+// Lab 2026-11-16 (z-os-ab3, after review 99e): the push reports the Mac's
+// own value m; the WRITE's publish then sets the row to its own time (whole
+// seconds, above m); a later push sees m again. m was reported as m for
+// these same own bytes, so it is reported as before, not moved.
+func TestOwnValueSeenAgainAfterThePublishIsReportedAsBefore(t *testing.T) {
+	l := newSpanLab(t)
+	l.set(time.Unix(1700000290, 0), time.Unix(1700000290, 0), 9000, 2)
+	l.push()
+	mown := time.Unix(1700000308, 709593334)
+	l.store.NoteOwnBytes("media.mov", 9000, mown.Add(-300*time.Microsecond), mown.Add(2*time.Second))
+	l.set(mown, mown.Add(time.Second), 9000, 3)
+	l.push()
+	if got := l.reported(); !got.Equal(mown) {
+		t.Fatalf("setup: reported %d, want %d", got.UnixNano(), mown.UnixNano())
+	}
+	// CompleteOnlineMutation(time.Now()): whole seconds, above m.
+	if err := l.store.SetSizeExact("media.mov", 9000, time.Unix(1700000311, 0)); err != nil {
+		t.Fatal(err)
+	}
+	l.set(mown, mown.Add(2*time.Second), 9000, 3)
+	l.push()
+	if got := l.reported(); !got.Equal(mown) {
+		t.Errorf("the Mac's own value seen again reported %d, want %d as before", got.UnixNano(), mown.UnixNano())
+	}
+	// A teammate's value seen again is still moved (never repeat).
+	mt := time.Unix(1700000320, 0)
+	l.set(mt, mt, 9000, 5)
+	l.push()
+	if err := l.store.SetSizeExact("media.mov", 9000, time.Unix(1700000330, 0)); err != nil {
+		t.Fatal(err)
+	}
+	l.set(mt, mt.Add(time.Second), 9000, 5)
+	l.push()
+	if got := l.reported(); got.Equal(mt) {
+		t.Errorf("a teammate's value seen again was repeated: %d", got.UnixNano())
+	}
+}

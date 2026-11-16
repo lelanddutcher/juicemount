@@ -225,20 +225,30 @@ const overlayBackJump = time.Hour
 // M2: X, N, X).
 //
 // own: this process wrote the change itself (review N6): its true mtime is
-// reported unless it was reported before.
+// reported unless it was reported for something else before. The same own
+// value reported as itself before is reported as before (lab 2026-11-16:
+// the push reports m, the WRITE's publish sets the row to its own time, a
+// later push sees m again): m names the same own bytes both times, since
+// only the Mac's own operation stamped it, inside the mark's interval.
 func nextReported(list []nfsReported, oldReported, m int64, own bool) int64 {
 	high := oldReported
 	seen := oldReported == m
+	asBefore := !seen // every sighting of m was m reported as itself
 	for _, r := range list {
 		high = max64(high, r.reportedNS)
 		if r.trueNS == m || r.reportedNS == m {
 			seen = true
+			if r.trueNS != m || r.reportedNS != m {
+				asBefore = false
+			}
 		}
 	}
 	switch {
 	case m > high:
 		return m
-	case (own || high-m > int64(overlayBackJump)) && !seen:
+	case own && asBefore:
+		return m
+	case high-m > int64(overlayBackJump) && !seen:
 		return m
 	}
 	return high + 1
@@ -809,6 +819,20 @@ func sqlSpanPreimage(tx *sql.Tx, path string, inode uint64) (spanPreimage, bool)
 	var e Entry
 	e.restoreMtime(secs, nsec)
 	return spanPreimage{mtimeNS: e.Mtime.UnixNano(), reportedNS: ReportedMtime(inode, e.Mtime).UnixNano(), size: size}, true
+}
+
+// fmtReported renders a history for a log line: true>reported pairs.
+func fmtReported(list []nfsReported) string {
+	var b []byte
+	for i, r := range list {
+		if i > 0 {
+			b = append(b, ' ')
+		}
+		b = strconv.AppendInt(b, r.trueNS, 10)
+		b = append(b, '>')
+		b = strconv.AppendInt(b, r.reportedNS, 10)
+	}
+	return string(b)
 }
 
 func max64(a, b int64) int64 {
