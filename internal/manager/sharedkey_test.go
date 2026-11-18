@@ -566,7 +566,10 @@ func TestRevokePerMacKeyVersusLegacyShared(t *testing.T) {
 	if !r.s.Snapshot().byName(legacy).SharedKeyHeld {
 		t.Fatal("legacy Mac still on the shared key: shared_key_held not set")
 	}
-	res, err := r.s.RevokeWithResult(legacy)
+	if _, err := r.s.RevokeConfirmed(legacy, false); !errors.Is(err, ErrSharedKeyConfirmRequired) {
+		t.Fatalf("unconfirmed revoke of a Mac still on the shared key: err = %v, want ErrSharedKeyConfirmRequired", err)
+	}
+	res, err := r.s.RevokeConfirmed(legacy, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -582,7 +585,9 @@ func TestRevokePerMacKeyVersusLegacyShared(t *testing.T) {
 	if r.s.Snapshot().byName(own).SharedKeyHeld {
 		t.Fatal("Mac with its own key marked as holding the shared key")
 	}
-	res, err = r.s.RevokeWithResult(own)
+	// Per-Mac mode is unchanged: a Mac with only its own key is revoked
+	// without the shared-key confirmation.
+	res, err = r.s.RevokeConfirmed(own, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -591,6 +596,68 @@ func TestRevokePerMacKeyVersusLegacyShared(t *testing.T) {
 	}
 	if got := stillValidNames(r.s.Snapshot()); len(got) != 1 || got[0] != legacy {
 		t.Fatalf("pending rotation lists %v, want only [%s]", got, legacy)
+	}
+}
+
+// A revoke of a Mac that holds the shared key changes nothing until the
+// caller confirms that the key stays valid; the refusal says so. Rejecting
+// a pending request needs no confirmation. Once confirmed, the remaining
+// Mac keeps its key and gets the rotated one at its next poll.
+func TestRevokeSharedKeyNeedsConfirmation(t *testing.T) {
+	r := newSharedKeyRig(t)
+	a, aTok := r.approved(1)
+	b, bTok := r.approved(2)
+	pending, _ := r.enroll(3)
+
+	res, err := r.s.RevokeConfirmed(a, false)
+	if !errors.Is(err, ErrSharedKeyConfirmRequired) {
+		t.Fatalf("unconfirmed revoke: err = %v, want ErrSharedKeyConfirmRequired", err)
+	}
+	if res.Name != a || res.ObjectKey != RevokeObjectKeyStillValid || !strings.Contains(res.Message, "STILL WORK") ||
+		!strings.Contains(res.Message, testClientAK) || strings.Contains(res.Message, testClientSK) {
+		t.Fatalf("refusal = %+v, want still_valid naming the access key, never the secret", res)
+	}
+	snap := r.s.Snapshot()
+	if snap.byName(a).Status != PrincipalApproved || len(snap.SharedKeyStillValid) != 0 {
+		t.Fatalf("refused revoke changed the store: %s %q, holders %v", a, snap.byName(a).Status, stillValidNames(snap))
+	}
+	if got := r.poll(1, aTok); got.Status != PrincipalApproved || got.ObjectSecretKey != testClientSK {
+		t.Fatalf("after a refused revoke the Mac's poll = %+v, want approved with its key", got)
+	}
+
+	if res, err := r.s.RevokeConfirmed(pending, false); err != nil || res.ObjectKey != RevokeObjectKeyNone {
+		t.Fatalf("reject of a pending request = %+v, %v; want none without confirmation", res, err)
+	}
+
+	res, err = r.s.RevokeConfirmed(a, true)
+	if err != nil || res.ObjectKey != RevokeObjectKeyStillValid {
+		t.Fatalf("confirmed revoke = %+v, %v; want still_valid", res, err)
+	}
+	if got := stillValidNames(r.s.Snapshot()); len(got) != 1 || got[0] != a {
+		t.Fatalf("pending rotation lists %v, want [%s]", got, a)
+	}
+	// Revoking a revoked record again needs no confirmation.
+	if _, err := r.s.RevokeConfirmed(a, false); err != nil {
+		t.Fatalf("second revoke: %v", err)
+	}
+	if got := r.poll(2, bTok); got.Status != PrincipalApproved || got.ObjectSecretKey != testClientSK {
+		t.Fatalf("remaining Mac %s poll = %+v, want the shared key", b, got)
+	}
+
+	// The rotation: the remaining Mac gets the new key, the revoked one
+	// none, and the object store's proof clears the pending action.
+	const rotated = "rotatedsecret0123456789abcdef0123456789"
+	r.sk = rotated
+	r.minio.set(testClientAK, rotated)
+	r.open()
+	if got := stillValidNames(r.verify()); len(got) != 0 {
+		t.Fatalf("after the rotation the page lists %v", got)
+	}
+	if got := r.poll(2, bTok); got.ObjectAccessKey != testClientAK || got.ObjectSecretKey != rotated {
+		t.Fatalf("remaining Mac %s poll after the rotation = %+v, want the rotated key", b, got)
+	}
+	if got := r.poll(1, aTok); got.ObjectSecretKey != "" {
+		t.Fatalf("revoked Mac poll = %+v, want no key", got)
 	}
 }
 
@@ -605,7 +672,32 @@ func TestRevokeSharedKeyHTTPAndPage(t *testing.T) {
 	if rr = doJSON(t, mux, http.MethodPost, "/api/principals/approve", h8bTestAdminKey, map[string]string{"name": name}); rr.Code != http.StatusOK {
 		t.Fatalf("approve: %d %s", rr.Code, rr.Body)
 	}
+	// Without the confirmation: 409, the warning, and nothing changed.
 	rr = doJSON(t, mux, http.MethodPost, "/api/principals/revoke", h8bTestAdminKey, map[string]string{"name": name})
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("unconfirmed revoke: %d %s, want 409", rr.Code, rr.Body)
+	}
+	var refused sharedKeyConfirmAnswer
+	if err := json.Unmarshal(rr.Body.Bytes(), &refused); err != nil {
+		t.Fatal(err)
+	}
+	if refused.ConfirmRequired != "confirm_shared_key" || refused.Revoked.Name != name ||
+		refused.Revoked.ObjectKey != RevokeObjectKeyStillValid || !strings.Contains(refused.Error, "STILL WORK") {
+		t.Fatalf("unconfirmed revoke answer = %+v", refused)
+	}
+	if strings.Contains(rr.Body.String(), testClientSK) {
+		t.Fatalf("refusal leaks the key: %s", rr.Body)
+	}
+	rr = doJSON(t, mux, http.MethodGet, "/api/principals", h8bTestAdminKey, nil)
+	var before PrincipalsSnapshot
+	if err := json.Unmarshal(rr.Body.Bytes(), &before); err != nil {
+		t.Fatal(err)
+	}
+	if p := before.byName(name); p.Status != PrincipalApproved || len(before.SharedKeyStillValid) != 0 {
+		t.Fatalf("after a refused revoke: status %q, pending rotation %+v; want approved and none", p.Status, before.SharedKeyStillValid)
+	}
+
+	rr = doJSON(t, mux, http.MethodPost, "/api/principals/revoke", h8bTestAdminKey, map[string]any{"name": name, "confirm_shared_key": true})
 	if rr.Code != http.StatusOK {
 		t.Fatalf("revoke: %d %s", rr.Code, rr.Body)
 	}
@@ -633,7 +725,7 @@ func TestRevokeSharedKeyHTTPAndPage(t *testing.T) {
 	}
 	for _, want := range []string{"shared_key_still_valid", "shared_key_held", "r.revoked.object_key === 'still_valid'",
 		"Its storage key will STILL WORK", "Rotate the shared storage key", "Rotating the shared object key",
-		"s.shared_key_problem", "sharedKeyLegacy", "Restarting the Manager with a new key alone clears nothing", "does not prove that no other credential"} {
+		"s.shared_key_problem", "sharedKeyLegacy", "body.confirm_shared_key = true", "a.confirm_required === 'confirm_shared_key'", "Restarting the Manager with a new key alone clears nothing", "does not prove that no other credential"} {
 		if !strings.Contains(string(raw), want) {
 			t.Fatalf("principals.html does not render %q", want)
 		}

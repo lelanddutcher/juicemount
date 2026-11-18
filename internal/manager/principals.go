@@ -293,6 +293,11 @@ var (
 	ErrEnrollBadToken    = errors.New("unknown instance or wrong poll token")
 	ErrPrincipalNotFound = errors.New("no such principal")
 	ErrPrincipalState    = errors.New("principal is not in a state that allows this")
+	// ErrSharedKeyConfirmRequired: a revoke of a Mac that holds the shared
+	// object key, without the caller's confirmation that the key stays
+	// valid until it is rotated on the server (sharedkey.go). Nothing
+	// changed.
+	ErrSharedKeyConfirmRequired = errors.New("the Mac holds the shared object key, which a revoke does not change; confirm the revoke and rotate the key")
 	// ErrProxyNotLive: the Redis proxy has not acknowledged the current
 	// principals file (reload.applied does not name the sha256 in
 	// reload.request), or no proxy directory is configured. Approving a Mac
@@ -1699,13 +1704,31 @@ func (s *PrincipalStore) Revoke(name string) error {
 // object-store access: its own per-Mac key is removed in the background,
 // but a shared jm-client key it was given keeps working until it is
 // rotated on the server (sharedkey.go). Such a Mac is recorded, in the same
-// store write as the revoke, for the Principals page.
+// store write as the revoke, for the Principals page. The caller has
+// confirmed that a shared key stays valid (see RevokeConfirmed).
 func (s *PrincipalStore) RevokeWithResult(name string) (RevokeResult, error) {
+	return s.RevokeConfirmed(name, true)
+}
+
+// RevokeConfirmed is RevokeWithResult for a caller that may not yet know
+// the Mac holds the shared object key. Without confirmSharedKey such a
+// revoke changes nothing: it returns ErrSharedKeyConfirmRequired and the
+// result the revoke would have (object_key still_valid, with its message),
+// so the admin is told before the revoke that the key keeps working until
+// it is rotated on the server. A pending request (Reject), a Mac with only
+// its own per-Mac key, and a revoke of a revoked record need no
+// confirmation.
+func (s *PrincipalStore) RevokeConfirmed(name string, confirmSharedKey bool) (RevokeResult, error) {
 	s.mu.Lock()
 	cur, ok := s.recs[name]
 	if !ok {
 		s.mu.Unlock()
 		return RevokeResult{}, ErrPrincipalNotFound
+	}
+	if !confirmSharedKey && cur.Status != PrincipalRevoked && s.heldSharedKeyLocked(cur) {
+		ak, _ := s.opts.ObjectKey()
+		s.mu.Unlock()
+		return RevokeResult{Name: name, ObjectKey: RevokeObjectKeyStillValid, Message: sharedKeyConfirmMessage(name, ak)}, ErrSharedKeyConfirmRequired
 	}
 	next := *cur
 	prevHolders := s.sharedHolders
@@ -1740,7 +1763,7 @@ func (s *PrincipalStore) RevokeWithResult(name string) (RevokeResult, error) {
 	s.mu.Unlock()
 	log.Printf("manager: principal %s revoked", name)
 	if res.ObjectKey == RevokeObjectKeyStillValid {
-		log.Printf("manager: WARNING: principal %s holds the shared object key, which still works at the object store until JM_OBJ_CLIENT_SECRET_KEY is rotated on the server", name)
+		log.Printf("manager: WARNING: principal %s holds the shared object key, which still works at the object store until JM_OBJ_CLIENT_SECRET_KEY is rotated on the server (revoke confirmed with the key still valid)", name)
 	}
 	if kerr := s.syncObjKeys(); kerr != nil {
 		// The revoke and the key's removal are in the store; the
@@ -2439,14 +2462,21 @@ func (p *principalsAPI) handleDecision(op func(string) error) http.HandlerFunc {
 }
 
 // handleRevoke answers with the snapshot and the revoke's object-key result.
+// A Mac that holds the shared object key is revoked only with
+// "confirm_shared_key": true in the body; without it the answer is 409 and
+// nothing changes (RevokeConfirmed).
 func (p *principalsAPI) handleRevoke(w http.ResponseWriter, r *http.Request) {
-	p.handleDecisionResult(func(name string) (*RevokeResult, error) {
-		res, err := p.store.RevokeWithResult(name)
+	p.handleDecisionResultBody(func(name string, confirmSharedKey bool) (*RevokeResult, error) {
+		res, err := p.store.RevokeConfirmed(name, confirmSharedKey)
 		return &res, err
 	})(w, r)
 }
 
 func (p *principalsAPI) handleDecisionResult(op func(string) (*RevokeResult, error)) http.HandlerFunc {
+	return p.handleDecisionResultBody(func(name string, _ bool) (*RevokeResult, error) { return op(name) })
+}
+
+func (p *principalsAPI) handleDecisionResultBody(op func(name string, confirmSharedKey bool) (*RevokeResult, error)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "POST only", http.StatusMethodNotAllowed)
@@ -2456,14 +2486,17 @@ func (p *principalsAPI) handleDecisionResult(op func(string) (*RevokeResult, err
 			return
 		}
 		var body struct {
-			Name string `json:"name"`
+			Name             string `json:"name"`
+			ConfirmSharedKey bool   `json:"confirm_shared_key"`
 		}
 		if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&body); err != nil || !macNameRe.MatchString(body.Name) {
 			http.Error(w, "name must be a Mac principal (mac-<12 hex>)", http.StatusBadRequest)
 			return
 		}
-		res, err := op(body.Name)
+		res, err := op(body.Name, body.ConfirmSharedKey)
 		switch {
+		case errors.Is(err, ErrSharedKeyConfirmRequired):
+			writeJSON(w, http.StatusConflict, sharedKeyConfirmAnswer{Error: res.Message, ConfirmRequired: "confirm_shared_key", Revoked: *res})
 		case errors.Is(err, ErrProxyNotLive):
 			http.Error(w, proxyRefusal(err), http.StatusConflict)
 		case errors.Is(err, ErrObjectKeyNotReady):

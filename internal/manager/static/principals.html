@@ -109,7 +109,7 @@ Mac and published as conflict copies.</p>
           if (k) { key = k; try { localStorage.setItem('jm-admin-key', k); } catch (_) {} return api(method, path, body); }
         }
         return r.text().then(function (t) {
-          if (!r.ok) throw new Error(path + ': ' + r.status + ' ' + t.trim());
+          if (!r.ok) { var e = new Error(path + ': ' + r.status + ' ' + t.trim()); e.status = r.status; e.body = t; throw e; }
           return t ? JSON.parse(t) : {};
         });
       });
@@ -222,7 +222,8 @@ Mac and published as conflict copies.</p>
     if (p.shared_key_held) {
       text += '\n\nIts storage key will STILL WORK: this Mac holds the shared storage key (jm-client), and revoking does not change ' +
         'that key. Until it is rotated on the server, this Mac can still read file data and overwrite stored data at the object ' +
-        'store directly. This page then lists the rotation as a pending action.';
+        'store directly. This page then lists the rotation as a pending action. Revoke now and rotate the key afterwards ' +
+        '(server/COMPOSE-ROLLOUT.md, "Rotating the shared object key")?';
     } else if (p.obj_key_status === 'active' || p.obj_key_status === 'minting' || p.obj_key_status === 'recreating') {
       text += '\n\nIts own storage key is removed by minio-keyd.';
     }
@@ -269,11 +270,28 @@ Mac and published as conflict copies.</p>
           var b = document.createElement('button'); b.textContent = label; if (cls) b.className = cls;
           b.onclick = function () {
             if (confirmText && !window.confirm(confirmText)) return;
-            api('POST', 'principals/' + op, { name: p.name }).then(function (r) {
+            var body = { name: p.name };
+            // A Mac holding the shared storage key is revoked only with this
+            // confirmation; the dialog above has just warned about the key.
+            if (op === 'revoke' && p.shared_key_held) body.confirm_shared_key = true;
+            function done(r) {
               // After a revoke: say plainly whether its storage key still works.
               if (r && r.revoked && r.revoked.object_key === 'still_valid') window.alert(r.revoked.message);
               loadPrincipals();
-            }, fail);
+            }
+            api('POST', 'principals/' + op, body).then(done, function (e) {
+              // The Manager refused because the Mac holds the shared key (this
+              // page's list was older): show its warning and ask again.
+              var a = null;
+              try { a = e.status === 409 && e.body ? JSON.parse(e.body) : null; } catch (_) {}
+              if (op === 'revoke' && a && a.confirm_required === 'confirm_shared_key') {
+                if (!window.confirm(a.error + '\n\nRevoke now and rotate the key afterwards?')) { loadPrincipals(); return; }
+                body.confirm_shared_key = true;
+                api('POST', 'principals/' + op, body).then(done, fail);
+                return;
+              }
+              fail(e);
+            });
           };
           actions.appendChild(b);
         }
