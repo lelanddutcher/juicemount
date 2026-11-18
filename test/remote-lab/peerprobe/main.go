@@ -118,6 +118,10 @@ type probe struct {
 	// editName: playedit's peer saves this file instead of the played one
 	// (a control: the same link load, no refresh of the played clip).
 	editName string
+	// macPages > 0: playedit's player models the Mac's page cache (finding
+	// R1, macmodel.go): each player read needs macPages 1 MiB pages that
+	// all carry one mtime.
+	macPages int
 	auth     rpc.Auth
 }
 
@@ -268,6 +272,7 @@ func run(args []string) (err error) {
 	writes := fs.Bool("writes", false, "playedit: also save a 256 KiB file through NFS every second")
 	editFile := fs.String("edit-file", "", "playedit: the peer saves this file instead of -file (a control)")
 	saveTouch := fs.Bool("save-touch", false, "playedit: the peer sets the mtime before each close (late commits keep it)")
+	macPages := fs.Int("mac-pages", 0, "playedit: model the Mac's page cache, this many 1 MiB pages per player read (0: off)")
 	endSettle := fs.Duration("end-settle", 8*time.Second, "playedit: after the final bytes, wait this long and read the 8 offsets again")
 	_ = fs.Parse(args)
 
@@ -281,7 +286,7 @@ func run(args []string) (err error) {
 	if err != nil {
 		return fmt.Errorf("mount: %w", err)
 	}
-	p := &probe{v: v, name: *name, peer: *peer, poll: *poll, timeout: *timeout, auth: auth, writes: *writes, settle: *endSettle, saveTouch: *saveTouch, editName: *editFile}
+	p := &probe{v: v, name: *name, peer: *peer, poll: *poll, timeout: *timeout, auth: auth, writes: *writes, settle: *endSettle, saveTouch: *saveTouch, editName: *editFile, macPages: *macPages}
 	_, p.fh, err = v.Lookup(*name)
 	if err != nil {
 		return fmt.Errorf("lookup: %w", err)

@@ -191,11 +191,46 @@ func (p *probe) playEdit(row map[string]any, size int64, rate float64, lead, sav
 		done  = make(chan struct{})
 		head  uint64
 	)
+	var plays []macPlay // -mac-pages: the modelled player reads (macmodel.go)
 	t0 := time.Now()
 	go func() {
 		defer close(done)
 		off := uint64(0)
 		every := time.Duration(float64(time.Second) * float64(playReadLen) / (rate * mib))
+		if p.macPages > 0 {
+			every *= time.Duration(p.macPages)
+			var known int64
+			record := func(r playRead) {
+				mu.Lock()
+				reads = append(reads, r)
+				mu.Unlock()
+			}
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				mp, adv := p.macPlayRead(off, uint64(size), &known, record)
+				mu.Lock()
+				plays = append(plays, mp)
+				mu.Unlock()
+				if mp.Err == "" {
+					off += adv
+					if adv == 0 || off >= uint64(size) {
+						off = 0
+					}
+					mu.Lock()
+					head = off
+					mu.Unlock()
+				} else {
+					time.Sleep(500 * time.Millisecond)
+				}
+				if d := every - time.Since(mp.At); d > 0 {
+					time.Sleep(d)
+				}
+			}
+		}
 		for {
 			select {
 			case <-stop:
@@ -627,6 +662,19 @@ func (p *probe) playEdit(row map[string]any, size int64, rate float64, lead, sav
 		stalls = stalls[:10]
 	}
 	row["saves"] = saves
+	if p.macPages > 0 {
+		row["mac_pages"] = p.macPages
+		macSummary(row, plays, t0)
+	}
+	// The distinct mtimes the player's replies carried: each change makes
+	// the Mac drop the clip's pages (finding R1).
+	mts := map[int64]struct{}{}
+	for _, r := range reads {
+		if r.Err == "" {
+			mts[mtimeNS(r.Mtime)] = struct{}{}
+		}
+	}
+	row["player_mtimes"] = len(mts)
 	row["reads"], row["read_errors"], row["tagged_reads"] = len(reads), errs, tagged
 	row["play_jukebox"], row["final_jukebox"], row["poll_jukebox"], row["polls"] = jukebox, finalJukebox, pollJukebox, len(polls)
 	row["stalls_over_2s"], row["stall_count"] = stalls, len(stallsCount(reads))

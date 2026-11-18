@@ -347,16 +347,23 @@ type RedisClient struct {
 	// attrRequeue re-enqueues a file inode into the live attr coalescer; nil
 	// while no session runs or the attr push is off. ownedDeferrals waits
 	// out paths a foreground mutation owns (owned_deferral.go).
-	attrRequeue       atomic.Pointer[requeueFunc]
-	ownedDeferrals    ownedDeferralQueue
-	attrRetryMu       sync.Mutex
-	attrRetries       map[uint64]*attrRetryState
-	attrRetryStopped  bool
-	attrRetryWG       sync.WaitGroup
-	attrRetryWake     chan struct{}
-	attrRetryWork     chan attrRetryTask
-	attrRetryRunning  bool
-	attrRetryOverflow bool
+	attrRequeue    atomic.Pointer[requeueFunc]
+	ownedDeferrals ownedDeferralQueue
+	// peerGate holds another client's later content changes of a file
+	// until its interval ends (finding R1, peer_refresh_gate.go).
+	peerGate peerRefreshGate
+	// Test hooks of the gate: its clock, interval and re-read timer.
+	testPeerGateNow      func() time.Time
+	testPeerGateInterval func() time.Duration
+	testPeerGateAfter    func(time.Duration, func())
+	attrRetryMu          sync.Mutex
+	attrRetries          map[uint64]*attrRetryState
+	attrRetryStopped     bool
+	attrRetryWG          sync.WaitGroup
+	attrRetryWake        chan struct{}
+	attrRetryWork        chan attrRetryTask
+	attrRetryRunning     bool
+	attrRetryOverflow    bool
 
 	// Test seams for the keyspace-push path. Production leaves these nil and
 	// the real methods run. Tests set them to observe coalescer behavior
