@@ -354,3 +354,50 @@ func TestScheduleSubPathStaysInsideFileDestination(t *testing.T) {
 		t.Errorf("normal sub-path: uri %q, msg %q", uri, msg)
 	}
 }
+
+// A file destination checked against the source roots when saved is
+// refused at use once the roots no longer contain it, with a message
+// that says how to fix it: by a saved-destination job, by a schedule,
+// and by Test Connection. Nothing is written to it.
+func TestFileDestinationRefusedAtUseAfterRootsNarrow(t *testing.T) {
+	base := t.TempDir()
+	for _, d := range []string{"a/backups", "b/src"} {
+		if err := os.MkdirAll(filepath.Join(base, d), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	dest := filepath.Join(base, "a", "backups")
+	statePath := filepath.Join(t.TempDir(), "state.json")
+
+	// Saved while the roots included it.
+	mux1, _ := registerDestTest(t, base, statePath)
+	if w := destRequest(t, mux1, http.MethodPost, "/api/destinations", fileDestBody("bk", dest)); w.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", w.Code, w.Body.String())
+	}
+
+	// Restarted with a narrower root that excludes it.
+	mux, store := registerDestTest(t, filepath.Join(base, "b"), statePath)
+	if !store.exists("bk") {
+		t.Fatalf("destination not reloaded from state")
+	}
+
+	body, _ := json.Marshal(map[string]any{
+		"source": filepath.Join(base, "b", "src"), "destination": "file://bk", "direction": "in",
+	})
+	w := destRequest(t, mux, http.MethodPost, "/api/migrate", string(body))
+	if w.Code != http.StatusForbidden || !strings.Contains(w.Body.String(), "source roots") {
+		t.Errorf("saved-destination job: got %d %q, want 403 naming the source roots", w.Code, w.Body.String())
+	}
+
+	sched := scheduleState{Destination: DestinationRef{Name: "bk", Path: "daily"}}
+	if uri, _, msg := resolveScheduleSpec(sched, store, ""); msg == "" || !strings.Contains(msg, "source roots") {
+		t.Errorf("schedule: uri %q msg %q, want a refusal naming the source roots", uri, msg)
+	}
+
+	if w := destRequest(t, mux, http.MethodPost, "/api/destinations/bk/test", ""); w.Code != http.StatusForbidden {
+		t.Errorf("test: got %d, want 403 (%s)", w.Code, w.Body.String())
+	}
+	if ents, _ := os.ReadDir(dest); len(ents) != 0 {
+		t.Errorf("something was written to the out-of-root destination: %v", ents)
+	}
+}
