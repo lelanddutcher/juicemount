@@ -1003,6 +1003,14 @@ func (s *destinationStoreImpl) checkFileDestRoots(d Destination) error {
 		// ToSyncURI refuses this with its own actionable message.
 		return nil
 	}
+	// The path must still resolve, within its time bound, to the location
+	// checked at save. Run that first: a stale mount then times out here
+	// rather than blocking in the roots walk, and a path swapped since the
+	// save gets its own message ("save the destination again"), not advice
+	// to widen the roots (review of #104).
+	if _, err := checkedFileDestPath(d.Config); err != nil {
+		return err
+	}
 	if !s.fileRootGate(checked) {
 		return errFileDestRootsChanged
 	}
