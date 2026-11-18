@@ -568,8 +568,8 @@ confirmation warns before it happens.
 A revoke of a Mac that holds the shared key must be confirmed:
 `POST /api/principals/revoke` with `{"name": …, "confirm_shared_key": true}`.
 Without the confirmation the Manager changes nothing and answers 409 with
-`{"error", "confirm_required": "confirm_shared_key", "revoked"}`, where
-`revoked.object_key` is `still_valid`. The Principals page sends the
+`{"error", "confirm_required": "confirm_shared_key", "not_revoked"}`, where
+`not_revoked.object_key` is `still_valid`. The Principals page sends the
 confirmation only after its dialog has said that the key keeps working, and
 asks again when the Manager refuses. Rejecting a pending request, and
 revoking a Mac that has only its own per-Mac key, need no confirmation. The page lists every revoked Mac whose
