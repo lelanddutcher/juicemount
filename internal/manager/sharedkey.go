@@ -520,7 +520,7 @@ type sharedKeyConfirmAnswer struct {
 	Error string `json:"error"`
 	// ConfirmRequired names the request field that confirms the revoke.
 	ConfirmRequired string       `json:"confirm_required"`
-	Revoked         RevokeResult `json:"revoked"`
+	NotRevoked      RevokeResult `json:"not_revoked"`
 }
 
 // sharedKeyConfirmMessage is what a revoke of a shared-key holder must be

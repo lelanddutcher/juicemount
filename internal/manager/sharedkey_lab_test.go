@@ -1,6 +1,6 @@
 package manager
 
-// The shared-key revoke against a real object store (server/minio/shared-key-lab.sh
+// The shared-key revoke against a real object store (test/shared-key-lab.sh
 // starts it and sets the variables; without them the test is skipped).
 //
 // It acts as a revoked Mac would: the key the Manager handed it, kept by the

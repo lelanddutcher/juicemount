@@ -2496,7 +2496,7 @@ func (p *principalsAPI) handleDecisionResultBody(op func(name string, confirmSha
 		res, err := op(body.Name, body.ConfirmSharedKey)
 		switch {
 		case errors.Is(err, ErrSharedKeyConfirmRequired):
-			writeJSON(w, http.StatusConflict, sharedKeyConfirmAnswer{Error: res.Message, ConfirmRequired: "confirm_shared_key", Revoked: *res})
+			writeJSON(w, http.StatusConflict, sharedKeyConfirmAnswer{Error: res.Message, ConfirmRequired: "confirm_shared_key", NotRevoked: *res})
 		case errors.Is(err, ErrProxyNotLive):
 			http.Error(w, proxyRefusal(err), http.StatusConflict)
 		case errors.Is(err, ErrObjectKeyNotReady):

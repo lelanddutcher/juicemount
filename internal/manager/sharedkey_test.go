@@ -681,8 +681,8 @@ func TestRevokeSharedKeyHTTPAndPage(t *testing.T) {
 	if err := json.Unmarshal(rr.Body.Bytes(), &refused); err != nil {
 		t.Fatal(err)
 	}
-	if refused.ConfirmRequired != "confirm_shared_key" || refused.Revoked.Name != name ||
-		refused.Revoked.ObjectKey != RevokeObjectKeyStillValid || !strings.Contains(refused.Error, "STILL WORK") {
+	if refused.ConfirmRequired != "confirm_shared_key" || refused.NotRevoked.Name != name ||
+		refused.NotRevoked.ObjectKey != RevokeObjectKeyStillValid || !strings.Contains(refused.Error, "STILL WORK") {
 		t.Fatalf("unconfirmed revoke answer = %+v", refused)
 	}
 	if strings.Contains(rr.Body.String(), testClientSK) {
