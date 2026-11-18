@@ -484,6 +484,9 @@ func resolveScheduleSpec(r scheduleState, dests *destinationStoreImpl, fuseRoot 
 	if err != nil {
 		return "", nil, fmt.Sprintf("resolve destination %q: %v", r.Destination.Name, err)
 	}
+	if err := dests.checkFileDestRoots(d); err != nil {
+		return "", nil, fmt.Sprintf("destination %q: %v", r.Destination.Name, err)
+	}
 	// The optional sub-path from DestinationRef.Path is stitched in with
 	// appendDestPath's trailing-slash convention; for a file destination
 	// the result must still resolve inside the checked destination.

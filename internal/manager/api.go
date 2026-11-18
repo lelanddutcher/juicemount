@@ -347,6 +347,7 @@ func Register(outer *http.ServeMux, prefix string, cfg Config) *JobManager {
 		log.Printf("manager: destinations store init failed: %v (Destinations tab will be disabled)", err)
 	} else {
 		a.dests = store
+		store.fileRootGate = a.pathAllowed
 		store.SetOnChange(mgr.SaveState)
 		mgr.SetDestinations(store)
 	}
@@ -873,6 +874,10 @@ func (a *API) submitSavedDestination(w http.ResponseWriter, source, name string,
 	opts := DefaultSyncOptions()
 	if req.Options != nil {
 		opts = *req.Options
+	}
+	if err := a.dests.checkFileDestRoots(d); err != nil {
+		http.Error(w, "destination resolve: "+err.Error(), http.StatusForbidden)
+		return
 	}
 	destURI, env, err := d.ToSyncURI(opts.PreserveStructure)
 	if err != nil {
