@@ -9,7 +9,7 @@
  	github.com/studio-b12/gowebdav v0.10.0
  	github.com/tencentyun/cos-go-sdk-v5 v0.7.63
  	github.com/tikv/client-go/v2 v2.0.7
-@@ -286,11 +286,12 @@
+@@ -286,13 +286,15 @@
  	go.opentelemetry.io/contrib/detectors/gcp v1.44.0 // indirect
  	go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc v0.61.0 // indirect
  	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.61.0 // indirect
@@ -26,7 +26,10 @@
 +	go.opentelemetry.io/otel/trace v1.47.0 // indirect
  	go.uber.org/atomic v1.10.0 // indirect
  	go.uber.org/multierr v1.9.0 // indirect
++	go.yaml.in/yaml/v3 v3.0.5 // indirect
  	golang.org/x/arch v0.11.0 // indirect
+ 	golang.org/x/time v0.14.0 // indirect
+ 	golang.org/x/xerrors v0.0.0-20200804184101-5ec99f83aff1 // indirect
 --- a/go.sum
 +++ b/go.sum
 @@ -756,6 +756,7 @@
@@ -78,3 +81,12 @@
  go.uber.org/atomic v1.4.0/go.mod h1:gD2HeocX3+yG+ygLZcrzQJaqmWj9AIm7n08wl/qW/PE=
  go.uber.org/atomic v1.6.0/go.mod h1:sABNBOSYdrvTF6hTgEIbc7YasKWGhgEQZyfxyTvoXHQ=
  go.uber.org/atomic v1.7.0/go.mod h1:fEN4uk6kAWBTFdckzkM89CLk9XfWZrxpCo0nPH17wJc=
+@@ -880,6 +896,8 @@
+ go.uber.org/zap v1.19.0/go.mod h1:xg/QME4nWcxGxrpdeYfq7UvYrLh66cuVKdrbD1XF/NI=
+ go.uber.org/zap v1.24.0 h1:FiJd5l1UOLj0wCgbSE0rwwXHzEdAZS6hiiSnxJN/D60=
+ go.uber.org/zap v1.24.0/go.mod h1:2kMP+WWQ8aoFoedH3T2sq6iJ2yDWpHbP0f6MQbS9Gkg=
++go.yaml.in/yaml/v3 v3.0.5 h1:N6y/pJk8buWs9NY5ERU2HSMfm+IuD/OtfdAnq6kESPw=
++go.yaml.in/yaml/v3 v3.0.5/go.mod h1:HVTZu1O7/Vkt2N+BFy8Zza+lnLsABggaTM2ZpNIGuKg=
+ golang.org/x/arch v0.0.0-20201008161808-52c3e6f60cff/go.mod h1:flIaEI6LNU6xOCD5PaJvn9wGP0agmIOqjrtsKGRguv4=
+ golang.org/x/arch v0.11.0 h1:KXV8WWKCXm6tRpLirl2szsO5j/oOODwZf4hATmGVNs4=
+ golang.org/x/arch v0.11.0/go.mod h1:FEVrYAQjsQXMVJ1nsMoVVXPZg6p2JE2mx8psSWTDQys=
