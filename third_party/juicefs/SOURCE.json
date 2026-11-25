@@ -243,11 +243,11 @@
       "upstream_sha256": "f3917760c69e88f4b958998500d08a958f5d708a798900ee8a4b32ece1c9b1bb"
     },
     "go.mod": {
-      "sha256": "13005661f1c42a4e91e1c3d23be0caafddb081532ee846a887e900cac6c94f9f",
+      "sha256": "02b50e82fb3ba95e50254cb492f3d5eae5bb9f47c36c030e91375b45868fb47e",
       "upstream_sha256": "ad4015469cb99c85fc6305bd8afacb352170ee459eb8205114bf657775773da8"
     },
     "go.sum": {
-      "sha256": "75500cc9728a0096b85ea811c82fe29d8cf9f3d0601960931975420ac94756f5",
+      "sha256": "a3e0ad29915ccf2ed4d303ccfc11cabbf39ba6072fd7e725b73fa80123a556ae",
       "upstream_sha256": "584598cd0a595f99adc850ffa085dfa5f3b9a0490c7c1d94a0582470738c4bad"
     },
     "main.go": {
@@ -1218,7 +1218,8 @@
     "patches/0030-read-error-retry.patch": "2b097e51dcf5819bec505575b869fae70001e92f4ef04931dd565bf863fedfef",
     "patches/0031-refresh-open-file.patch": "677428d084f6a0f8012eb467351493e239f5dd51b52d114c189dc1534cce5ab6",
     "patches/0032-refresh-keeps-current-buffers.patch": "ff7fc37fc4d10d4db24bdf65d25a4d5a786badbc7cfccb8a4d8331980bef67ab",
-    "patches/0033-control-lane.patch": "7366007504ddf3be56cd4a27e18d55a371649db8119c8d7fc4dbb17b03a73c91"
+    "patches/0033-control-lane.patch": "7366007504ddf3be56cd4a27e18d55a371649db8119c8d7fc4dbb17b03a73c91",
+    "patches/0034-opentelemetry-security-update.patch": "8efca1a64e8953a20c4b2d9f20dcd2619fa2c413f7c130adbe5382879ec96d12"
   },
   "scope": "All pkg/ and cmd/ files plus main.go, LICENSE, go.mod and go.sum from the verified module ZIP. Documentation, integration tests and SDK examples are not included. local_files are JuiceMount-owned source with no upstream counterpart.",
   "upstream_url": "https://github.com/juicedata/juicefs/tree/v1.3.1",
