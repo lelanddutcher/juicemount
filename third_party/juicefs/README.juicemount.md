@@ -67,6 +67,8 @@ In the pinned `github.com/juicedata/go-fuse/v2` fork, `Server.Shutdown` does not
 
 `patches/0015-klauspost-compress-security-update.patch` updates `github.com/klauspost/compress` from v1.17.11 to v1.20.2 in this module's `go.mod` and `go.sum` for GO-2026-6865 (GHSA-fpmh-frq8-7rj8), a panic on two-block frames in the `fse` and `huff0` packages that `zstd` uses; the bundled CLI reaches the affected symbols. No other dependency changes. The root module takes the same version.
 
+`patches/0034-opentelemetry-security-update.patch` updates `go.opentelemetry.io/otel`, `otel/metric`, `otel/sdk`, `otel/sdk/metric` and `otel/trace` from v1.45.0 to v1.47.0 for GO-2026-6974, an attribute length limit bypass in the SDK that the CI scan reached through the trace package. `go get` also adds `otel/log` v1.47.0 and moves `stretchr/testify` to v1.12.1 as required by the new versions. The root module takes the same otel versions. The build suffix stays `-jm18`; the CLI's behaviour does not change.
+
 `patches/0016-file-backend-beneath-root.patch` confines the `file://` object backend to its root folder on Linux.
 - **How.** Every filesystem operation of the backend goes through a `fileOps` value (`pkg/object/file_ops.go`).
   - On Linux, `beneathOps` (`pkg/object/file_beneath_linux.go`) opens the root once. It then resolves every path relative to that folder with `openat2(RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS)`, or with an `*at` call on a parent folder opened that way: open, create, mkdir, stat, lstat, readdir, rename, link, unlink, chmod, chown, chtimes, symlink and readlink.
