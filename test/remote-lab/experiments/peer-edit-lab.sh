@@ -55,6 +55,10 @@
 #                PE_SAVE_TOUCH=true: the peer sets the clip's mtime before
 #                each close (as cp -p does), so its later commits keep that
 #                mtime and change only the ctime.
+#                PE_MAC_PAGES=2: the player models the Mac's page cache
+#                (peerprobe/macmodel.go, finding R1): each player read needs
+#                2 pages under one mtime and reads again those an mtime
+#                change dropped (mac_player_*, mac_repeat_*).
 #
 # Around every case the jm5 juicefs's own metadata operation counters
 # (/jfs/.stats; the peer has its own) and jm5's /metrics are saved, so the
@@ -221,7 +225,7 @@ run() {
       # fresh on the last trial would reuse f01, already read: skip it.
       if [ "$kase" = fresh ] && [ "$i" = "$TRIALS" ]; then continue; fi
       stats "$OUT/$label.$kase.$n.before.txt"
-      probe run -export "$xpath" -case "$kase" -file "$file" -timeout "$TIMEOUT" -save "${PE_SAVE:-60s}" -rate "${PE_RATE:-2}" -writes="${PE_WRITES:-false}" -save-touch="${PE_SAVE_TOUCH:-false}" -edit-file="${PE_EDIT_FILE:-}" >> "$OUT/$label.jsonl" \
+      probe run -export "$xpath" -case "$kase" -file "$file" -timeout "$TIMEOUT" -save "${PE_SAVE:-60s}" -rate "${PE_RATE:-2}" -writes="${PE_WRITES:-false}" -save-touch="${PE_SAVE_TOUCH:-false}" -edit-file="${PE_EDIT_FILE:-}" -mac-pages="${PE_MAC_PAGES:-0}" >> "$OUT/$label.jsonl" \
         || log "$label: $kase $file failed"
       sleep 1
       stats "$OUT/$label.$kase.$n.after.txt"

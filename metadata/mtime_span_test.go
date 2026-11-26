@@ -46,11 +46,25 @@ type spanLab struct {
 	mu    sync.Mutex
 	attr  string
 	sig   sliceSig
+	// The refresh gate (peer_refresh_gate.go) is on, at labGateInterval.
+	// Unless gateClock is set, every push first moves the clock past the
+	// interval, so these tests see each teammate change published; the gate
+	// tests drive the clock themselves and collect the armed re-reads.
+	clock     time.Time
+	gateClock bool
+	timers    []gateTimer
+}
+
+const labGateInterval = 10 * time.Second
+
+type gateTimer struct {
+	wait time.Duration
+	fire func()
 }
 
 func newSpanLab(t *testing.T) *spanLab {
 	t.Helper()
-	l := &spanLab{t: t, dir: t.TempDir(), attr: jfsAttr(time.Unix(1700000000, 500), time.Unix(1700000000, 500), 4096), sig: sliceSig{1, 1}}
+	l := &spanLab{t: t, dir: t.TempDir(), clock: time.Unix(1700005000, 0), attr: jfsAttr(time.Unix(1700000000, 500), time.Unix(1700000000, 500), 4096), sig: sliceSig{1, 1}}
 	l.open()
 	if err := l.rc.reconcileDir(1); err != nil {
 		t.Fatal(err)
@@ -92,6 +106,17 @@ func (l *spanLab) open() {
 		},
 	}
 	t.Cleanup(func() { close(rc.stopCh) })
+	rc.testPeerGateInterval = func() time.Duration { return labGateInterval }
+	rc.testPeerGateNow = func() time.Time {
+		l.mu.Lock()
+		defer l.mu.Unlock()
+		return l.clock
+	}
+	rc.testPeerGateAfter = func(d time.Duration, f func()) {
+		l.mu.Lock()
+		l.timers = append(l.timers, gateTimer{d, f})
+		l.mu.Unlock()
+	}
 	fired := []string{}
 	store.SetOnScanContentInvalidated(func(p string, _ uint64) { fired = append(fired, p) })
 	l.rc, l.store, l.fired = rc, store, &fired
@@ -112,9 +137,19 @@ func (l *spanLab) setSig(mtime, ctime time.Time, size uint64, sig sliceSig) {
 
 func (l *spanLab) push() {
 	l.t.Helper()
+	if !l.gateClock {
+		l.advance(labGateInterval + time.Second)
+	}
 	if retry, err := l.rc.reconcileFileAttrs([]uint64{42}, l.gen); err != nil || retry != nil {
 		l.t.Fatalf("push: retry %v err %v", retry, err)
 	}
+}
+
+// advance moves the gate's clock.
+func (l *spanLab) advance(d time.Duration) {
+	l.mu.Lock()
+	l.clock = l.clock.Add(d)
+	l.mu.Unlock()
 }
 
 func (l *spanLab) reconcile() {
@@ -712,6 +747,9 @@ func heldLab(t *testing.T) (*spanLab, *atomic.Bool, *atomic.Int32) {
 
 func (l *spanLab) pushOwned() (deferred []uint64) {
 	l.t.Helper()
+	if !l.gateClock {
+		l.advance(labGateInterval + time.Second)
+	}
 	retry, deferred, err := l.rc.reconcileFileAttrsOwned([]uint64{42}, l.gen)
 	if err != nil || retry != nil {
 		l.t.Fatalf("push: retry %v err %v", retry, err)

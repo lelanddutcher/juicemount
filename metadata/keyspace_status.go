@@ -246,6 +246,9 @@ func init() {
 			SelfWriteEvents:    selfWrite,
 			PublishedMutations: published,
 			ScanPromotions:     KeyspaceScanPromotions(),
+			AttrRefreshed:      attrPushRefreshed.Load(),
+			AttrLateCommits:    attrPushLateCommits.Load(),
+			AttrHeld:           attrPushHeld.Load(),
 		}
 	})
 }
