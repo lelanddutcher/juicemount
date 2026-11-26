@@ -54,9 +54,9 @@ def main(paths):
     for prof in sorted(rows):
         print(f"\n### {prof}\n")
         print("| Arm | T1 serial RT before first byte, later [first] | T1 RT total | T2 first MiB ms, later [first] "
-              "| T3 two/one | T4 refresh → new bytes ms | T4 refresh call ms | T4 play read max ms | T4 no message "
+              "| open ms (later) | T3 two/one | T4 refresh → new bytes ms | T4 refresh call ms | T4 play read max ms | T4 no message "
               "| T5 files/s w4 / w8 | T5 RT per file |")
-        print("|---|---|---|---|---|---|---|---|---|---|---|")
+        print("|---|---|---|---|---|---|---|---|---|---|---|---|")
         for arm in sorted(rows[prof]):
             rs = rows[prof][arm]
             t12 = [r for r in rs if r.get("test") == "t1t2"]
@@ -67,6 +67,7 @@ def main(paths):
             t1 = f"{fmt(med(ser(later)))} [{fmt(med(ser(first)))}]"
             t1t = f"{fmt(med(tot(later)))}"
             t2 = f"{fmt(med([r.get('first_mib_ms') for r in later]))} [{', '.join(fmt(r.get('first_mib_ms')) for r in first)}]"
+            op = fmt(med([r.get('open_ms') for r in later]))
             t3s = [r for r in rs if r.get("test") == "t3"]
             one, two = med([r["one_ms"] for r in t3s]), med([r["two_ms"] for r in t3s])
             t3 = f"{two / one:.2f} ({fmt(two)}/{fmt(one)})" if one and two else "–"
@@ -90,7 +91,7 @@ def main(paths):
                     if r.get("rt_per_file") is not None:
                         rtpf.append(r["rt_per_file"])
             t5s = " / ".join(f"{fmt(med(t5[w]), 1)}" for w in sorted(t5)) or "–"
-            print(f"| {arm} | {t1} | {t1t} | {t2} | {t3} | {t4} | {t4call} | {t4play} | {t4none.strip() or '–'} | {t5s} | {fmt(med(rtpf), 1)} |")
+            print(f"| {arm} | {t1} | {t1t} | {t2} | {op} | {t3} | {t4} | {t4call} | {t4play} | {t4none.strip() or '–'} | {t5s} | {fmt(med(rtpf), 1)} |")
 
 
 if __name__ == "__main__":
