@@ -927,9 +927,22 @@ maintenance action. Do not combine them, and do not skip one.
    working; a revoke while M2 is off does not remove them (switch M2 on
    again and the Manager removes the keys of revoked Macs).
 
-**New install: switch off.** In `<data>/compose/.env` set
-`JM_OBJ_PER_MAC=0`, recreate the Manager, then stop `minio-keyd` and set
-`JM_OBJ_PER_MAC_SERVER=0`. Approved Macs then get `jm-client`.
+**New install: switch off.** In `<data>/compose/.env`:
+
+1. Set `JM_OBJ_PER_MAC=0` and recreate the Manager alone. Approved Macs
+   then get `jm-client` at their next poll.
+2. Set `JM_OBJ_PER_MAC_SERVER=0` and remove `per-mac` from
+   `COMPOSE_PROFILES` (delete the line if `per-mac` was its only value).
+   Otherwise a later plain `up` starts `minio-keyd` again.
+3. Stop and remove keyd: `$C -f server/docker-compose.yml rm -sf minio-keyd`.
+4. Disable the key-admin user, so its credential no longer works:
+   `mc admin user disable <alias> jm-keyadmin`.
+
+Per-Mac keys that already exist (`mac-*` under `jm-macs`) keep working
+after this. A revoke while the switch is off does not remove them. Remove
+the key of a revoked Mac by hand (`mc admin user svcacct rm <alias>
+<access key>`), or switch per-Mac keys on again and the Manager removes the
+keys of revoked Macs.
 
 Offline tests for the scripts (fake `mc`, no MinIO needed):
 
