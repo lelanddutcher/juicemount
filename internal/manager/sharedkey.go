@@ -16,7 +16,10 @@ package manager
 // any answer can carry the key. Revoke records each such Mac (a "holder")
 // with the access key in plain text and a salted check value of the secret
 // (never the secret). The Principals page and the revoke answer say so, and
-// list the rotation as a pending action.
+// list the rotation as a pending action. Such a revoke happens only with
+// the caller's confirmation (RevokeConfirmed, "confirm_shared_key"):
+// without it nothing changes and the answer says the key would keep
+// working.
 //
 // A holder leaves the page only on proof from the object store
 // (VerifySharedKeyRotation), never because the Manager's own environment
@@ -509,6 +512,24 @@ func NewObjectStoreProbe(bucketURL, region string) ObjectStoreProbe {
 		}
 		return "", fmt.Errorf("HTTP %d without an S3 error code", resp.StatusCode)
 	}
+}
+
+// sharedKeyConfirmAnswer is the 409 answer to a revoke of a shared-key
+// holder without "confirm_shared_key": nothing changed.
+type sharedKeyConfirmAnswer struct {
+	Error string `json:"error"`
+	// ConfirmRequired names the request field that confirms the revoke.
+	ConfirmRequired string       `json:"confirm_required"`
+	NotRevoked      RevokeResult `json:"not_revoked"`
+}
+
+// sharedKeyConfirmMessage is what a revoke of a shared-key holder must be
+// confirmed against.
+func sharedKeyConfirmMessage(name, accessKey string) string {
+	return "Not revoked: " + name + " holds the shared storage key (" + accessKey + "). Revoking removes its Redis login, but " +
+		"that key would STILL WORK at the object store: the Mac could still read file data and overwrite stored data there " +
+		"directly until the key is rotated on the server (server/COMPOSE-ROLLOUT.md, \"Rotating the shared object key\"). " +
+		"To revoke now and rotate afterwards, revoke again with \"confirm_shared_key\": true."
 }
 
 // revokeResultLocked describes p's object-store access after its revoke.

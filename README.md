@@ -6,6 +6,7 @@
 ![Platform: macOS 26+](assets/readme/badges/platform-macos-26plus.svg)
 [![Built on JuiceFS](assets/readme/badges/built-on-juicefs.svg)](https://github.com/juicedata/juicefs)
 ![Status: beta](assets/readme/badges/status-beta.svg)
+[![As seen on Open Source Alternatives](https://www.opensourcealternatives.to/badge-osa.svg)](https://www.opensourcealternatives.to)
 
 **[juicemount.com](https://juicemount.com)** · [Install](#quick-start) · [0.5 release notes](docs/release-0.5.md) · [FAQ](#faq)
 

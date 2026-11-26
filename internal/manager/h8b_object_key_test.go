@@ -90,7 +90,8 @@ func TestH8BEnrollObjectKeyOnlyAfterApproval(t *testing.T) {
 		t.Fatalf("Cache-Control = %q, want no-store", cc)
 	}
 
-	rr = doJSON(t, mux, http.MethodPost, "/api/principals/revoke", h8bTestAdminKey, map[string]string{"name": er.Principal})
+	// The Mac holds the shared key: the revoke is confirmed (sharedkey.go).
+	rr = doJSON(t, mux, http.MethodPost, "/api/principals/revoke", h8bTestAdminKey, map[string]any{"name": er.Principal, "confirm_shared_key": true})
 	if rr.Code != http.StatusOK {
 		t.Fatalf("revoke: %d %s", rr.Code, rr.Body)
 	}

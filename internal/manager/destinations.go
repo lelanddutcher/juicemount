@@ -125,6 +125,11 @@ type destinationStoreImpl struct {
 	// jobs.saveState(). nil is allowed in unit tests that don't
 	// exercise the persistence path.
 	onChange func()
+	// fileRootGate reports whether a resolved path is inside the
+	// current source roots (the API's pathAllowed). Set once by
+	// Register before serving. nil in unit tests that build a bare
+	// store, where use-time root checks are skipped.
+	fileRootGate func(string) bool
 }
 
 // newDestinationStore constructs an empty store. The key is derived
@@ -977,6 +982,39 @@ func checkedFileDestPath(cfg map[string]string) (string, error) {
 		return "", errors.New("file: path no longer resolves to the location checked when it was saved; save the destination again")
 	}
 	return resolved, nil
+}
+
+// errFileDestRootsChanged is returned when a file destination that was
+// inside the source roots when saved is no longer inside them, for
+// example because the configured roots changed since.
+var errFileDestRootsChanged = errors.New("file destination is outside the current source roots (the roots changed since it was saved); edit the destination to a path inside a source root, or add its folder to the source roots")
+
+// checkFileDestRoots re-applies the source-root check at use time to a
+// file destination's checked location, so a destination saved under
+// earlier, wider roots is refused rather than written to. Other kinds
+// pass. ToSyncURI separately requires that the path still resolves to
+// that checked location.
+func (s *destinationStoreImpl) checkFileDestRoots(d Destination) error {
+	if d.Kind != "file" || s == nil || s.fileRootGate == nil {
+		return nil
+	}
+	checked := d.Config[fileCheckedPathKey]
+	if checked == "" {
+		// ToSyncURI refuses this with its own actionable message.
+		return nil
+	}
+	// The path must still resolve, within its time bound, to the location
+	// checked at save. Run that first: a stale mount then times out here
+	// rather than blocking in the roots walk, and a path swapped since the
+	// save gets its own message ("save the destination again"), not advice
+	// to widen the roots (review of #104).
+	if _, err := checkedFileDestPath(d.Config); err != nil {
+		return err
+	}
+	if !s.fileRootGate(checked) {
+		return errFileDestRootsChanged
+	}
+	return nil
 }
 
 // handleDestinationTestFile checks the path against the current source

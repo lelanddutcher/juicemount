@@ -122,7 +122,9 @@ func fakeProxyWrite(dir, name string, b []byte) error {
 
 func admin(t *testing.T, srv *httptest.Server, op, name string) {
 	t.Helper()
-	body, _ := json.Marshal(map[string]string{"name": name})
+	// A revoke of a Mac holding the shared object key needs the admin's
+	// confirmation that the key stays valid until it is rotated.
+	body, _ := json.Marshal(map[string]any{"name": name, "confirm_shared_key": op == "revoke"})
 	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/api/principals/"+op, bytes.NewReader(body))
 	req.Header.Set("X-JuiceMount-Admin-Key", adminKey)
 	resp, err := srv.Client().Do(req)

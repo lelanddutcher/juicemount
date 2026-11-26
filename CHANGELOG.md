@@ -754,6 +754,13 @@
 
 ### Server
 
+- Revoking a Mac that holds the shared storage key (`jm-client`) now needs a
+  confirmation: `POST /api/principals/revoke` with `"confirm_shared_key":
+  true`. Without it the Manager changes nothing and answers 409 with
+  `confirm_required` and the warning. The Principals page asks before it
+  sends the confirmation. Rejecting a pending request, and revoking a Mac
+  with its own per-Mac key, are unchanged. See "Rotating the shared object
+  key" in `server/COMPOSE-ROLLOUT.md`, and `test/shared-key-lab.sh`.
 - Server images are built with Go 1.26.11 (net/http fix GO-2026-6859).
 - The Manager image ships the same JuiceFS build (`-jm6`). The Manager still
   accepts `-jm3` or later.
