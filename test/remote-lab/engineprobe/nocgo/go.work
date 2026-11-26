@@ -1,0 +1,10 @@
+// engineprobe build only (build.sh sets GOWORK to this file). The engine's
+// compression packages need cgo; these stub modules replace them so the
+// probe builds with CGO_ENABLED=0 for Linux and macOS from any machine.
+go 1.26.11
+
+use ../../../..
+
+replace github.com/DataDog/zstd => ./zstd
+
+replace github.com/hungys/go-lz4 => ./lz4
