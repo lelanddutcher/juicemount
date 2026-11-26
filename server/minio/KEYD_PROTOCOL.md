@@ -118,6 +118,14 @@ keyd builds it from what MinIO reports (`svcacct ls`, `svcacct info`), not
 from `desired.json`. `seq` is the last `desired.json` seq keyd applied. A key
 is ready for a Mac only when `exists` is true and `parent` is `jm-macs`.
 
+`exists` comes from the `svcacct ls` of the same cycle. `status`, `parent`
+and `implied_policy` come from `svcacct info`: read in the cycle that first
+lists a key (a new key, or one created again), and read again once the last
+read is `JM_KEYD_REVERIFY` seconds old (default 30), at most 3 keys a cycle.
+Reading every key every cycle made a cycle one mc call longer per live key,
+and every approve and revoke waited for that. A removal always reads the
+key's parent fresh before it acts.
+
 ## Stopping keyd
 
 A stop (`docker stop`, TERM) during a key create waits for MinIO's reply, so
