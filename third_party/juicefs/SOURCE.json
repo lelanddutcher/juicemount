@@ -387,7 +387,7 @@
       "upstream_sha256": "09bfca6f0bc5d38bdc333fa6e97bae2162d708b7895662e72e59986ad22c37f5"
     },
     "pkg/fuse/fuse.go": {
-      "sha256": "b875edce5a4abcd193cb70ae9043f5073788dc46a4377cbd89578b475e7e65f3",
+      "sha256": "b90879ef355a11a059aca3daa21c9bc2bbd84922581a032c315833349eed86ec",
       "upstream_sha256": "fba3fe5ddcf185c6c740d2b8e08e1a492d0085a96c2d7ab7bfc40e730bbbdf02"
     },
     "pkg/fuse/fuse_darwin.go": {
@@ -1218,7 +1218,8 @@
     "patches/0030-read-error-retry.patch": "2b097e51dcf5819bec505575b869fae70001e92f4ef04931dd565bf863fedfef",
     "patches/0031-refresh-open-file.patch": "677428d084f6a0f8012eb467351493e239f5dd51b52d114c189dc1534cce5ab6",
     "patches/0032-refresh-keeps-current-buffers.patch": "ff7fc37fc4d10d4db24bdf65d25a4d5a786badbc7cfccb8a4d8331980bef67ab",
-    "patches/0033-control-lane.patch": "7366007504ddf3be56cd4a27e18d55a371649db8119c8d7fc4dbb17b03a73c91"
+    "patches/0033-control-lane.patch": "7366007504ddf3be56cd4a27e18d55a371649db8119c8d7fc4dbb17b03a73c91",
+    "patches/0035-lab-mount-overrides.patch": "a4c8b12adececfddf78721f12ea17320480ba2d32b150b560016717eb5b7dafb"
   },
   "scope": "All pkg/ and cmd/ files plus main.go, LICENSE, go.mod and go.sum from the verified module ZIP. Documentation, integration tests and SDK examples are not included. local_files are JuiceMount-owned source with no upstream counterpart.",
   "upstream_url": "https://github.com/juicedata/juicefs/tree/v1.3.1",

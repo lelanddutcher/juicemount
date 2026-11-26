@@ -521,7 +521,16 @@ func Serve(v *vfs.VFS, options string, xattrs, ioctl bool) error {
 	if runtime.GOOS == "darwin" {
 		opt.Options = append(opt.Options, "fssubtype=juicefs")
 		opt.Options = append(opt.Options, "volname="+conf.Format.Name)
-		opt.Options = append(opt.Options, "daemon_timeout=60", "iosize=65536", "novncache")
+		// JuiceMount patch 0035 (lab only, prototype branch): two env switches
+		// for the macFUSE tuning arms. Unset, the options are unchanged.
+		iosize := "65536"
+		if os.Getenv("JM_LAB_FUSE_IOSIZE") == "1048576" {
+			iosize = "1048576"
+		}
+		opt.Options = append(opt.Options, "daemon_timeout=60", "iosize="+iosize)
+		if os.Getenv("JM_LAB_FUSE_VNCACHE") != "1" {
+			opt.Options = append(opt.Options, "novncache")
+		}
 	}
 	fssrv, err := fuse.NewServer(imp, conf.Meta.MountPoint, &opt)
 	if err != nil {
