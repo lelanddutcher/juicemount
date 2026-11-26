@@ -738,6 +738,24 @@
 
 ### Server
 
+- New installs made by `juicemount-setup` give each approved Mac its own
+  object-store key, and a revoke removes that key within about 3 seconds.
+  Setup writes both switches, a key admin secret and the `per-mac` profile
+  into the new `.env`, so `minio-keyd` starts with the stack. Existing stacks
+  are unchanged until switched on by hand (`server/COMPOSE-ROLLOUT.md`,
+  "Per-Mac object keys", now with the full order and a rollback per step).
+- `minio-keyd` no longer slows down by one object-store call per Mac on
+  every cycle: it reads a new key's details at once and a known key's again
+  every 30 seconds. In the lab, with 20 Macs, an approve took 5.1 s (p95)
+  before and 2.9 s after; a revoke took effect in 4.9 s before and 2.7 s
+  after.
+- `minio-keyd` recreates its `results/` folder when it disappears while it
+  runs. Before, every new key was removed again as undeliverable until keyd
+  restarted.
+- `test/per-mac-keys-lab.sh` runs the per-Mac key checks against the pinned
+  object-store image, the real `minio-keys` and `minio-keyd`, and the
+  Manager's principal store.
+
 - Revoking a Mac that holds the shared storage key (`jm-client`) now needs a
   confirmation: `POST /api/principals/revoke` with `"confirm_shared_key":
   true`. Without it the Manager changes nothing and answers 409 with

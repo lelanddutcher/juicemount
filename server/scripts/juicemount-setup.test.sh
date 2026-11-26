@@ -298,6 +298,14 @@ done
 [ "$(envval "$E" JM_FARM_NODE_META_URL)" = 'redis://farm@nas.example:30179/1' ] || fail "farm node URL is user@host only"
 ok "secrets have the lengths the stack requires; digests, release and commit recorded; file modes"
 
+v="$(envval "$E" JM_OBJ_KEYADMIN_SECRET_KEY)"
+[[ "$v" =~ ^[0-9a-f]{40}$ ]] || fail "JM_OBJ_KEYADMIN_SECRET_KEY is 40 hex characters"
+[ "$(envval "$E" JM_OBJ_PER_MAC_SERVER)" = 1 ] && [ "$(envval "$E" JM_OBJ_PER_MAC)" = 1 ] || fail "a new install has both per-Mac switches on"
+[ "$(envval "$E" COMPOSE_PROFILES)" = per-mac ] || fail "a new install enables the per-mac profile (minio-keyd) in its .env"
+grep -q -- "--env-file $D/compose/.env .* up -d" "$FAKE_LOG" || fail "compose reads the per-mac profile from the install's .env"
+! grep -rq "$v" "$WORK/data/compose/.env.new"* 2>/dev/null || fail "no stray .env copy"
+ok "a new install has per-Mac object keys on: both switches, its own key admin secret, minio-keyd's profile"
+
 C="$D/compose/docker-compose.yml"
 grep -v '^[[:space:]]*#' "$C" > "$WORK/active.yml"
 ! grep -q '/mnt/zSSD\|/mnt/storage0' "$WORK/active.yml" || fail "no sample path left"
@@ -478,6 +486,21 @@ run_plain --dir "$D"
 [ "$rc" = 1 ] && grep -q 'lacks a usable JM_PROXY_BG_PASSWORD' "$WORK/err" && ! grep -q '^JM_PROXY_BG_PASSWORD=' "$E" || fail "missing secret refused, not regenerated"
 cp "$WORK/env.bak" "$E"
 ok "an install missing a secret is refused, never regenerated"
+
+# 6b. Per-Mac object keys: an install whose .env has no per-Mac lines (made
+# before they were the default) stays as it is; a switch that is on without
+# its key admin secret is refused.
+cp "$E" "$WORK/env.bak"
+sed -i '/^JM_OBJ_PER_MAC_SERVER=/d;/^JM_OBJ_PER_MAC=/d;/^COMPOSE_PROFILES=/d;/^JM_OBJ_KEYADMIN_SECRET_KEY=/d;/^# Per-Mac object keys/d' "$E"
+old_env="$(sha256sum < "$E")"
+run_plain --dir "$D"
+[ "$rc" = 0 ] && [ "$(sha256sum < "$E")" = "$old_env" ] || fail "an install without per-Mac lines is left unchanged (rc=$rc)"
+printf 'JM_OBJ_PER_MAC_SERVER=1\n' >> "$E"
+run_plain --dir "$D"
+[ "$rc" = 1 ] && grep -q 'JM_OBJ_PER_MAC_SERVER=1 but lacks a usable JM_OBJ_KEYADMIN_SECRET_KEY' "$WORK/err" &&
+  ! grep -q '^JM_OBJ_KEYADMIN_SECRET_KEY=' "$E" || fail "a per-Mac switch without its secret refused, nothing generated"
+cp "$WORK/env.bak" "$E"
+ok "an existing install keeps its per-Mac choice (none = off); a switch without its secret is refused"
 
 # 7. Data without its .env: refused before anything is written.
 reset

@@ -716,13 +716,26 @@ Per-Mac keys (below) cut off a revoked Mac that only ever had its own key.
 A Mac that was ever given the shared key still knows it, so revoking it
 still needs this rotation.
 
-### Per-Mac object keys (not yet enabled)
+### Per-Mac object keys
 
-> **Rollout qualification pending.** Per-Mac key code exists in `minio-keyd`,
-> the Manager, and the Mac app, but the complete Manager-to-Mac workflow is
-> not qualified for deployment. Leave `JM_OBJ_PER_MAC_SERVER` and
-> `JM_OBJ_PER_MAC` unset. While they are unset, `minio-keys` behaves exactly
-> as before and `minio-keyd` is never started.
+**Where this stands.**
+
+- **New installs** made by `juicemount-setup` have per-Mac keys on: its
+  `.env` sets both switches to `1`, a random `JM_OBJ_KEYADMIN_SECRET_KEY`
+  and `COMPOSE_PROFILES=per-mac` (which starts `minio-keyd`). A new install
+  formats the volume with no key in `setting` and never hands its root
+  password to a client, so step B and M0 below do not apply to it.
+- **Existing stacks** are unchanged: the compose fallback for both switches
+  is `0`, and an `.env` without the lines keeps them off. Switch one on by
+  hand with the steps below, in their order.
+- **Server side measured** with `test/per-mac-keys-lab.sh` (the pinned SILO
+  image, the real `minio-keys` and `minio-keyd`, the Manager's principal
+  store; 20 Macs per run, two runs). Results are in "Measured behaviour"
+  below.
+- **Mac side not yet run on a real Mac:** a Mac's first volume start on its
+  own key, a revoke during a copy, and the move of an already approved Mac
+  from `jm-client` to its own key. Run those before you switch on M2 on a
+  stack that has enrolled Macs.
 
 There are two switches, one per step, so that enabling the server side
 never also switches the Manager on at its next redeploy:
@@ -730,12 +743,12 @@ never also switches the Manager on at its next redeploy:
 | Switch | Read by | Step |
 |---|---|---|
 | `JM_OBJ_PER_MAC_SERVER` | `minio-keys`, `minio-keyd` | M1: create `jm-macs` and `jm-keyadmin`, run keyd. No Mac is affected. |
-| `JM_OBJ_PER_MAC` | the Manager | M2: request, verify, and deliver per-Mac keys when explicitly enabled. Rollout qualification is pending. |
+| `JM_OBJ_PER_MAC` | the Manager | M2: request, verify, and deliver per-Mac keys. |
 
 Each takes exactly `1` or `0` (unset means `0`). Any other value (`true`,
 `yes`, ` 1`) is logged as an error and treated as off.
 
-**What this is.** Today every approved Mac gets the same `jm-client` key.
+**What this is.** With per-Mac keys off, every approved Mac gets the same `jm-client` key.
 Revoking a Mac in the Manager removes its Redis principal, but the Mac keeps
 a working object key: it can still read and write chunks on MinIO
 (port 30151) directly, until the shared key is rotated (see "Rotating the
@@ -751,13 +764,14 @@ MinIO service account, and revoking the Mac deletes it.
 **What the `jm-keyadmin` credential does not enforce.** "keyd mints keys
 only under `jm-macs`" and "a keyd key cannot delete objects" are enforced
 by `keyd.sh` (the hard-coded parent and the name check), not by the
-credential. MinIO's `AddServiceAccount` accepts any non-root target user
-(design check A7, read in older MinIO source), so a stolen `jm-keyadmin`
-secret could mint a key under `jm-gc`, which can delete objects. The policy
-has no `UpdateServiceAccount`: MinIO checks only the action for an update,
-so it would let the holder reset any account's secret. keyd therefore
-removes a key with `svcacct rm` alone, with no `disable` first. Treat the
-`jm-keyadmin` secret like the `jm-gc` secret.
+credential. Measured on the pinned SILO release (lab, 2026-11-26):
+`jm-keyadmin` may create a service account under any user, not only
+`jm-macs`, and may list any user's service accounts. **Keep `JM_OBJ_KEYADMIN_SECRET_KEY` exactly as
+private as `MINIO_ROOT_PASSWORD`:** the same file, the same backups, the
+same people. The policy has no `UpdateServiceAccount`: MinIO checks only
+the action for an update, so it would let the holder reset any account's
+secret. keyd therefore removes a key with `svcacct rm` alone, with no
+`disable` first.
 
 `minio-keyd` (`server/minio/keyd.sh`) runs the same pinned MinIO image and
 talks to the Manager only through files in `/mnt/zSSD/juicemount/objkeys`
@@ -767,8 +781,10 @@ talks to the Manager only through files in `/mnt/zSSD/juicemount/objkeys`
 - `results/<name>.json` (keyd): the secret MinIO generated for a new key.
   The Manager stores it, clears `needs_secret` for the key in
   `desired.json`, and only then deletes the file.
-- `applied.json` (keyd): what MinIO reports for each key (`exists`,
-  `status`, `parent`, `implied_policy`), read back with `svcacct info`.
+- `applied.json` (keyd): what MinIO reports for each key: `exists` from
+  every cycle's `svcacct ls`; `status`, `parent`, `implied_policy` from
+  `svcacct info`, read for a new key at once and for a known key again
+  every 30 s (`JM_KEYD_REVERIFY`), at most 3 keys a cycle.
 
 `server/minio/KEYD_PROTOCOL.md` is the full contract the Manager must
 follow.
@@ -797,14 +813,61 @@ the Manager asks again with `needs_secret` and a higher `seq`. keyd refuses
 to start with the MinIO root password, `jm-gc` or `jm-client` in its
 environment.
 
-**Prerequisites (all of them, in this order).**
+**Measured behaviour** (lab, pinned SILO release, 2026-11-26; production
+timers: keyd and the Manager's reconciler every 2 s, an approve waits at
+most 10 s):
 
-1. H-8B step B above is done: `setting` holds no object key. Before step B
-   juicefs ignores every environment key, so per-Mac keys do nothing.
-2. **M0: rotate the MinIO root password.** Before step B, `setting` held the
-   MinIO root key, and every Mac that mounted then could recover it. A
-   per-Mac key revokes nothing for a Mac that holds the root key. The root
-   password is used only by `minio`, `minio-keys` and
+| Check | Target | Measured (2 runs × 20 Macs) |
+|---|---|---|
+| Approved Mac's poll carries its own `mac-*` key, which lists, writes and reads back | 20/20 | 20/20, 20/20 |
+| Approvals answered with no key or with `jm-client` | 0 | 0, 0 |
+| Approve → answer with an active key, p95 / max | ≤ 4 s / ≤ 10 s | 2.9 s / 2.9 s, 3.9 s / 4.7 s |
+| Revoke → the Mac's key first refused, p95 / max | ≤ 5 s / ≤ 10 s | 2.7 s / 2.8 s, 2.9 s / 3.0 s |
+| Revoke → the Redis login gone | at once | at once |
+| A Mac key: `svcacct add`, `user add`, `DeleteObject` | refused | refused |
+| A Mac key: STS `AssumeRole` (a temporary credential) | recorded | refused (`AccessDenied`) |
+
+So no temporary credential made from a Mac key outlives its revoke.
+Failure cases, each run in the lab:
+
+- **keyd stopped:** an approve answers 409 after 10.1 s with the reason
+  (`minio-keyd has not yet applied request N`). Existing keys keep working.
+  A revoke removes the Redis login at once; the key itself goes within 1 s
+  of keyd starting again.
+- **SILO restarted while a key is created** (5 restarts across keyd's
+  create step): no live key is left without a secret the Manager holds;
+  every Mac ends with a working key (the admin approves again if the first
+  approve answered 409).
+- **Principal store restored from an older backup:** keys issued after the
+  backup are listed as orphans on the Principals page and keep working
+  until the admin removes them (then refused within 1.8 s); no generation
+  is reused (a Mac whose generations 1 and 2 were used gets 3).
+- **`objkeys/` emptied while everything runs:** live keys keep working, and
+  keyd recreates `results/` at its next cycle. **A Manager restart then
+  refuses to open the principal store** (`manager-gens.json missing`): the
+  Principals page, approve and revoke answer 503 until the file is back;
+  Macs and their keys keep working. Back up `objkeys/` together with the
+  principal store (`manager-state/principals-store.json`), and restore them
+  together. Without a backup of `objkeys/`, and only if the principal store
+  itself is current (not restored from an older copy), rebuild the file
+  from the store and restart the Manager:
+
+  ```bash
+  jq '{gens: (.obj_key_gens // {})}' /mnt/zSSD/juicemount/manager-state/principals-store.json \
+    > /mnt/zSSD/juicemount/objkeys/manager-gens.json
+  chmod 600 /mnt/zSSD/juicemount/objkeys/manager-gens.json
+  ```
+
+**Existing stack: switch on, in this order.** Each step is its own
+maintenance action. Do not combine them, and do not skip one.
+
+1. **Step B** of "Object keys" above: `setting` holds no object key. Before
+   step B juicefs ignores every environment key, so per-Mac keys protect
+   nothing.
+2. **M0: a new MinIO root password.** Before step B, `setting` held the
+   MinIO root key, and every client that mounted then could recover it. A
+   per-Mac key revokes nothing for a client that holds the root key. The
+   root password is used only by `minio`, `minio-keys` and
    `object-key-switch.sh rollback --root`.
 
    ```bash
@@ -814,22 +877,21 @@ environment.
    ```
 
    `mc` prompts for the password, so it is never on a command line or in a
-   URL. That command shows the old password still working. Apply the change with
-   `$C -f server/docker-compose.yml up -d --no-deps minio`, then
+   URL. That command shows the old password still working. Apply the change
+   with `$C -f server/docker-compose.yml up -d --no-deps minio`, then
    `$C -f server/docker-compose.yml up --no-deps minio-keys` (must exit 0).
    **Check:** the same command, with the previous password typed, now fails
-   with an access error, and a
-   Mac copy and readback still work (Macs do not use the root key after
-   step B). **Rollback:** put the old value back in `server/.env` and
-   recreate `minio`.
-   Restarting `minio` interrupts every client's object I/O for the restart;
-   do it in a maintenance window.
+   with an access error, and a Mac copy and readback still work (Macs do not
+   use the root key after step B). **Rollback:** put the old value back in
+   `server/.env` and recreate `minio`. Restarting `minio` interrupts every
+   client's object I/O for the restart; do it in a maintenance window.
 3. **M1: create `jm-macs` and `jm-keyadmin`, start keyd.** Add to
    `server/.env`:
 
    ```bash
    JM_OBJ_PER_MAC_SERVER=1
    JM_OBJ_KEYADMIN_SECRET_KEY=   # openssl rand -hex 20
+   COMPOSE_PROFILES=per-mac      # so a later plain `up` keeps minio-keyd
    ```
 
    ```bash
@@ -843,16 +905,31 @@ environment.
    `jm-keyadmin: policy jm-keyadmin, enabled`, and has no line
    `ERROR: per-Mac object keys NOT provisioned`; the keyd log shows
    `managing service accounts under jm-macs`; `objkeys/applied.json` exists
-   with `"keys":[]`. Nothing uses the new users yet. Do not set
-   `JM_OBJ_PER_MAC` here. **Rollback:**
-   `$C -f server/docker-compose.yml stop minio-keyd` and unset
-   `JM_OBJ_PER_MAC_SERVER`.
+   with `"keys":[]`. Nothing uses the new users yet. **Rollback:**
+   `$C -f server/docker-compose.yml stop minio-keyd`, then remove the three
+   lines.
+4. **M2: the Manager mints and delivers keys.** Add `JM_OBJ_PER_MAC=1` to
+   `server/.env` and recreate the Manager alone:
+   `$C -f server/docker-compose.yml up -d --no-deps juicemount-manager`.
+   **Check:** for 5 minutes the Manager log has no `objkeys` error and the
+   Principals page shows no keyd problem. Approve a Mac (or use one already
+   approved): its row shows the key `active`, and `objkeys/applied.json`
+   lists `mac-<its name>-1` with `"parent":"jm-macs"`.
+   **What happens to Macs approved before M2:** the Manager mints a key for
+   each. A Mac receives it at its next poll (within 30 minutes, sooner after
+   a refused upload), shows "restart needed", and uses it after one
+   Stop/Start of its volume. Until then it keeps the key it has. Such a Mac
+   still knows `jm-client`, so once every one of them uses its own key,
+   rotate the shared key once ("Rotating the shared object key" above).
+   With no enrolled Macs, nothing else is needed.
+   **Rollback:** set `JM_OBJ_PER_MAC=0` and recreate the Manager. Approved
+   Macs then get `jm-client` again. Per-Mac keys stay at MinIO and keep
+   working; a revoke while M2 is off does not remove them (switch M2 on
+   again and the Manager removes the keys of revoked Macs).
 
-The Manager's M2 key request and delivery path and the Mac's key adoption
-path are implemented behind the switches. The full deployment sequence,
-including Mac cutover and eventual `jm-client` secret rotation, is not yet
-qualified. A keyd/IAM check alone does not establish that workflow. Stop
-after M1 and leave `JM_OBJ_PER_MAC` unset.
+**New install: switch off.** In `<data>/compose/.env` set
+`JM_OBJ_PER_MAC=0`, recreate the Manager, then stop `minio-keyd` and set
+`JM_OBJ_PER_MAC_SERVER=0`. Approved Macs then get `jm-client`.
 
 Offline tests for the scripts (fake `mc`, no MinIO needed):
 
@@ -860,10 +937,16 @@ Offline tests for the scripts (fake `mc`, no MinIO needed):
 go test ./server/minio/
 ```
 
-The `mc` flags and JSON field names keyd relies on (`svcacct add
---access-key` with no `--secret-key`, `svcacct ls/info/rm`,
-`parentUser`, `accountStatus`, `impliedPolicy`, `secretKey`), whether
-the scoped `jm-keyadmin` policy may manage `jm-macs`'s service accounts
-without `UpdateServiceAccount` (including `svcacct info`), and whether it
-can also target `jm-gc` (A7) in the pinned MinIO release, have not been
-run against a real MinIO.
+Against a real object store (docker, go; about 5 minutes; set `TMPDIR` to a
+scratch folder):
+
+```bash
+test/per-mac-keys-lab.sh            # JM_LAB_TRIALS=5 for a shorter run
+```
+
+It prints one `LAB |` row per check with its target. It also confirms the
+`mc` flags and JSON fields keyd relies on (`svcacct add --access-key` with
+no `--secret-key`, `svcacct ls/info/rm`, `parentUser`, `accountStatus`,
+`impliedPolicy`, `secretKey`) on the pinned release, and that `jm-keyadmin`
+manages `jm-macs`'s keys, `svcacct info` included, with create, remove and
+list only.

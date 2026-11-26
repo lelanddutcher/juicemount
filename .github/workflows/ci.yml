@@ -287,6 +287,38 @@ jobs:
             echo "::error::the Redis proxy never acknowledged the Manager"; exit 1
           fi
           test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:30190/api/overview)" = 401
+      - name: A new install gives an approved Mac its own object key
+        run: |
+          d="$RUNNER_TEMP/juicemount/compose"
+          key="$(sed -n 's/^Sign-in key:  //p' "$RUNNER_TEMP/run1.out")"
+          test "$(sed -n 's/^JM_OBJ_PER_MAC_SERVER=//p' "$d/.env")" = 1
+          test "$(sed -n 's/^JM_OBJ_PER_MAC=//p' "$d/.env")" = 1
+          test -n "$("$d/jm-compose" ps -q --status running minio-keyd)"
+          # A test Mac: its enrollment secret is random and masked.
+          secret="$(openssl rand -hex 20)"; echo "::add-mask::$secret"
+          inst="$(cat /proc/sys/kernel/random/uuid | tr a-f A-F)"
+          api=http://127.0.0.1:30190/api/principals
+          printf '{"instance_id":"%s","host":"ci-mac","secret":"%s"}' "$inst" "$secret" |
+            curl -fsS -H 'Content-Type: application/json' --data-binary @- "$api/enroll" > "$RUNNER_TEMP/enroll.json"
+          name="$(jq -r .principal "$RUNNER_TEMP/enroll.json")"
+          tok="$(jq -r .poll_token "$RUNNER_TEMP/enroll.json")"; echo "::add-mask::$tok"
+          start=$(date +%s%N)
+          printf 'X-JuiceMount-Admin-Key: %s\n' "$key" |
+            curl -fsS -H @- -H 'Content-Type: application/json' --data-binary "{\"name\":\"$name\"}" -o /dev/null "$api/approve"
+          echo "approve took $(( ($(date +%s%N) - start) / 1000000 )) ms"
+          printf '{"instance_id":"%s","poll_token":"%s"}' "$inst" "$tok" |
+            curl -fsS -H 'Content-Type: application/json' --data-binary @- "$api/enroll" > "$RUNNER_TEMP/poll.json"
+          sk="$(jq -r '.object_secret_key // empty' "$RUNNER_TEMP/poll.json")"
+          [ -z "$sk" ] || echo "::add-mask::$sk"
+          ak="$(jq -r '.object_access_key // empty' "$RUNNER_TEMP/poll.json")"
+          jq '{status, principal, object_access_key, object_key_pending}' "$RUNNER_TEMP/poll.json"
+          test "$(jq -r '.object_key_pending // false' "$RUNNER_TEMP/poll.json")" = false
+          [[ "$ak" == "$name"-* ]] || { echo "::error::approved Mac got '$ak', not its own key"; exit 1; }
+          test -n "$sk"
+          # The key lists the bucket at the object store (secret on stdin).
+          printf '%s\n' "$sk" | docker exec -i -e AK="$ak" "$("$d/jm-compose" ps -q minio)" bash -c \
+            'export MC_CONFIG_DIR="$(mktemp -d)"; mc alias set m http://127.0.0.1:9000 "$AK" >/dev/null && mc ls m/zpool >/dev/null && echo "own key lists zpool"'
+          rm -f "$RUNNER_TEMP/poll.json"
       - name: Second run changes nothing
         run: |
           d="$RUNNER_TEMP/juicemount/compose"

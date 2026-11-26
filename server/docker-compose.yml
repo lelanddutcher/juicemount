@@ -215,7 +215,8 @@ services:
       JM_OBJ_CLIENT_SECRET_KEY: "${JM_OBJ_CLIENT_SECRET_KEY:?set JM_OBJ_CLIENT_SECRET_KEY (openssl rand -hex 20) in server/.env}"
       JM_OBJ_GC_ACCESS_KEY: "${JM_OBJ_GC_ACCESS_KEY:-jm-gc}"
       JM_OBJ_GC_SECRET_KEY: "${JM_OBJ_GC_SECRET_KEY:?set JM_OBJ_GC_SECRET_KEY (openssl rand -hex 20) in server/.env}"
-      # Per-Mac object keys (not yet enabled), rollout step M1. With
+      # Per-Mac object keys, rollout step M1 (on in a new juicemount-setup
+      # install; 0 here keeps an existing stack as it is). With
       # JM_OBJ_PER_MAC_SERVER=1 this also creates jm-macs (parent of every
       # Mac key, policy jm-client) and jm-keyadmin (service accounts only,
       # held by minio-keyd). Unset = no change. A per-Mac failure is logged
@@ -227,17 +228,19 @@ services:
     volumes:
       - ./minio:/jm-minio:ro
 
-  # ── minio-keyd: per-Mac object keys (not yet enabled) ────────────
+  # ── minio-keyd: per-Mac object keys ──────────────────────────────
   # Creates one MinIO service account per approved Mac (mac-<12hex>-<gen>,
   # parent jm-macs) and removes it when the Mac is revoked. The Manager
   # writes objkeys/desired.json; keyd answers with results/<name>.json and a
   # verified applied.json (server/minio/keyd.sh). keyd holds jm-keyadmin
   # only: no root password, no jm-gc, no jm-client. Same pinned image as
-  # minio, so mc matches the server. Profile `per-mac`: never started by a
-  # plain `up`; start it with
+  # minio, so mc matches the server. Profile `per-mac`: a plain `up` starts
+  # it only with COMPOSE_PROFILES=per-mac in server/.env (juicemount-setup
+  # writes it for a new install). By hand:
   #   $C -f server/docker-compose.yml up -d --no-deps minio-keyd
   # (naming the service enables its profile) after JM_OBJ_PER_MAC_SERVER=1
   # (step M1). The Manager's own switch, JM_OBJ_PER_MAC, is step M2.
+  # server/COMPOSE-ROLLOUT.md, "Per-Mac object keys".
   minio-keyd:
     image: pgsty/silo:RELEASE.2026-09-16T00-00-00Z@sha256:635197cb9f36d01bee221d34d1c7d7960f6a95c48b0b6c01d99cd13bdae51a46
     profiles: ["per-mac"]
@@ -424,7 +427,8 @@ services:
       JM_OBJ_GC_SECRET_KEY: "${JM_OBJ_GC_SECRET_KEY:?set JM_OBJ_GC_SECRET_KEY in server/.env}"
       JM_OBJ_CLIENT_ACCESS_KEY: "${JM_OBJ_CLIENT_ACCESS_KEY:-jm-client}"
       JM_OBJ_CLIENT_SECRET_KEY: "${JM_OBJ_CLIENT_SECRET_KEY:?set JM_OBJ_CLIENT_SECRET_KEY in server/.env}"
-      # Per-Mac object keys (not yet enabled), rollout step M2: the Manager
+      # Per-Mac object keys, rollout step M2 (on in a new juicemount-setup
+      # install; 0 here keeps an existing stack as it is): the Manager
       # asks minio-keyd for keys through JM_OBJKEYS_DIR and holds no MinIO
       # admin credential. Separate from JM_OBJ_PER_MAC_SERVER (M1), so
       # enabling the server side never switches the Manager on.
