@@ -167,6 +167,7 @@ type engineFlags struct {
 	demandFirst  bool
 	readOnly     bool
 	openCache    time.Duration
+	bucket       string // overrides the bucket URL stored in the format, as the app's --bucket does
 }
 
 func openDirect(metaURL string, f engineFlags) (*directArm, error) {
@@ -189,6 +190,9 @@ func openDirect(metaURL string, f engineFlags) (*directArm, error) {
 	}
 	if c := strings.ToLower(format.Compression); c != "" && c != "none" {
 		return nil, fmt.Errorf("the volume is compressed (%s): this probe build has no zstd/lz4 (see build.sh)", c)
+	}
+	if f.bucket != "" {
+		format.Bucket = f.bucket
 	}
 	blob, err := createStorage(*format)
 	if err != nil {
@@ -454,6 +458,7 @@ func parseStats(b []byte) map[string]float64 {
 		{"juicefs_object_request_durations_histogram_seconds_", "object"},
 		{"juicefs_fuse_ops_total_", "fuse"},
 		{"juicefs_transaction_durations_histogram_seconds", "txn"},
+		{"juicefs_object_request_data_bytes_", "bytes"},
 	}
 	out := map[string]float64{}
 	sc := bufio.NewScanner(bytes.NewReader(b))

@@ -148,6 +148,7 @@ func cmdRun(args []string) error {
 	fs.IntVar(&ef.prefetch, "prefetch", 1, "direct arm: --prefetch")
 	fs.IntVar(&ef.maxUploads, "max-uploads", 4, "direct arm: --max-uploads")
 	fs.BoolVar(&ef.demandFirst, "demand-first", true, "direct arm: --demand-first")
+	fs.StringVar(&ef.bucket, "bucket", "", "direct arm: bucket URL override (the app's --bucket)")
 	fs.StringVar(&o.label, "label", "", "label for the result lines")
 	fs.StringVar(&o.resolve, "resolve", "ino", "direct arm: ino (inode known before the timer, as from the app's mirror) or walk")
 	tests := fs.String("tests", "t1t2,t3", "checks: t1t2,t3,t4,t5 (t4 and t5 write; need -allow-write)")
@@ -238,6 +239,12 @@ func cmdRun(args []string) error {
 			return err
 		}
 	}
+	// Object bytes this arm moved (the mount arms: since their mount), for
+	// the run's data ledger.
+	end := o.base(a, "bytes")
+	m := a.Metrics()
+	end["get_bytes"], end["put_bytes"] = m["bytes.GET"], m["bytes.PUT"]
+	emit(end)
 	return nil
 }
 
