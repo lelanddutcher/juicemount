@@ -184,8 +184,10 @@ type Profile struct {
 	networkCostClass *LinkClass // host OS expensive/constrained signal; nil = no cost override
 	ceilingClass     *LinkClass // route safety ceiling (a failed route lookup); nil = uncapped
 	// tunnelRoute: the route to the backend crosses a tunnel (utun,
-	// tailscale0). See tunnelCeilingLocked.
+	// tailscale0). routeIface is the interface of the last route lookup.
+	// See SetBackendRoute and tunnelCeilingLocked.
 	tunnelRoute bool
+	routeIface  string
 
 	// highLatency is the LATENCY dimension of classification, kept separate from
 	// bandwidth because the two are independent and a link can be fast AND far.
@@ -381,6 +383,9 @@ const (
 	// Reads more than this far apart start a fresh window — we don't want an idle
 	// gap diluting the aggregate-bytes/wall-time rate.
 	bwIdleGap = 400 * time.Millisecond
+	// bwCarryMaxWait: a continued window waits to span a read up to this
+	// long; a longer read counts only its share inside the window.
+	bwCarryMaxWait = 2 * time.Second
 )
 
 // ObserveThroughput folds a measured backend transfer into the bandwidth
@@ -399,14 +404,20 @@ func (p *Profile) ObserveThroughput(bytes int64, dur time.Duration) {
 	}
 	now := p.now()
 	started := now.Add(-dur)
+	carry := bwWindowCarryEnabled()
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	// Start a fresh window if this is the first sample or the link went idle:
 	// this read started more than bwIdleGap after the last one ended. (A
 	// long read that started while others were still running is not idle
-	// time, however long ago the last one completed.)
-	if p.winStart.IsZero() || started.Sub(p.winLastEnd) > bwIdleGap {
+	// time, however long ago the last one completed.) Without carry (the
+	// kill switch) idle is measured from this read's end, as before.
+	idle := started.Sub(p.winLastEnd) > bwIdleGap
+	if !carry {
+		idle = now.Sub(p.winLastEnd) > bwIdleGap
+	}
+	if p.winStart.IsZero() || idle {
 		p.winStart = started
 		p.winLastEnd = time.Time{}
 		p.winBytes = 0
@@ -424,6 +435,16 @@ func (p *Profile) ObserveThroughput(bytes int64, dur time.Duration) {
 			// flushed it alone, so the estimate was one request's rate,
 			// not the link's: a 12 ms tunnel carrying 190-240 Mbit/s of
 			// concurrent reads measured 70-120 Mbit/s (lab, 2026-11-26).
+			//
+			// A read longer than bwCarryMaxWait (a stalled GET) counts only
+			// the share of its bytes inside this window. Counting it whole
+			// would land a long read's bytes in one short window (a spike
+			// that could lift a thin link out of metered); waiting for the
+			// window to span it would freeze the estimate for the read's
+			// whole length, just when the link is degrading.
+			if dur > bwCarryMaxWait {
+				bytes = int64(float64(bytes) * float64(now.Sub(p.winStart)) / float64(dur))
+			}
 			started = p.winStart
 		} else {
 			p.winStart = started
@@ -433,8 +454,8 @@ func (p *Profile) ObserveThroughput(bytes int64, dur time.Duration) {
 	if now.After(p.winLastEnd) {
 		p.winLastEnd = now
 	}
-	if dur > p.winMaxDur {
-		p.winMaxDur = dur
+	if d := min(dur, bwCarryMaxWait); d > p.winMaxDur {
+		p.winMaxDur = d
 	}
 	p.winIntervals = append(p.winIntervals, throughputInterval{start: started, end: now})
 
@@ -443,11 +464,11 @@ func (p *Profile) ObserveThroughput(bytes int64, dur time.Duration) {
 		return // keep accumulating; not enough wall-time or bytes yet
 	}
 	if p.winCarry && span < p.winMaxDur {
-		// A continued window counts a clipped read's whole bytes, so it
-		// must be at least as long as its longest read. Otherwise one read
-		// that ran across many windows (a stalled GET) would land all its
-		// bytes in one short window: a spike that could lift a thin link
-		// out of metered.
+		// A continued window counts a clipped read's whole bytes (reads up
+		// to bwCarryMaxWait), so it must be at least as long as that read.
+		// Counting only the share inside the window instead loses the part
+		// of every read still in flight at each flush: 4 reads of 300 ms in
+		// flight (13.3 MiB/s) then measure 5 MiB/s.
 		return
 	}
 	active := activeTransferDuration(p.winIntervals)
@@ -467,6 +488,10 @@ func (p *Profile) ObserveThroughput(bytes int64, dur time.Duration) {
 	p.winIntervals = p.winIntervals[:0]
 	p.winCarry = true
 	p.winMaxDur = 0
+	if !carry {
+		// JM_NET_BW_WINDOW_CARRY=0: each window starts at its first read.
+		p.winStart, p.winLastEnd, p.winCarry = time.Time{}, time.Time{}, false
+	}
 
 	p.bwSamples++
 	if !p.haveBW {
@@ -546,13 +571,41 @@ func (p *Profile) CeilingClass(c *LinkClass) {
 	p.mu.Unlock()
 }
 
-// TunnelRoute records whether the route to the backend crosses a tunnel
-// (health.ApplyBackendRouteCeiling). See tunnelCeilingLocked for what it
-// caps.
-func (p *Profile) TunnelRoute(on bool) {
+// SetBackendRoute records the interface a successful route lookup gave for
+// the backend and whether it is a tunnel (health.ApplyBackendRouteCeiling).
+// See tunnelCeilingLocked for what a tunnel caps.
+//
+// When the tunnel turns on, or the interface changes, the bandwidth
+// measurements are dropped: they belong to the old path. Otherwise a Mac
+// measured on its home LAN that moved to an unflagged network behind a
+// tunnel kept the LAN estimate and its 4 samples, so the tunnel was medium
+// at once and stayed there until the estimate decayed (PR #110 review H1).
+// The RTT stays: its hysteresis and the one-sample far-link clamp handle a
+// path change, and a far probe sets the high-latency flag at once.
+//
+// Known limit: a change of underlay under the same tunnel interface (home
+// fiber to an unflagged hotspot, Tailscale keeping utunN) is not a route
+// change, so nothing resets; the estimate has to decay.
+func (p *Profile) SetBackendRoute(iface string, tunnel bool) {
 	p.mu.Lock()
-	p.tunnelRoute = on
-	p.mu.Unlock()
+	defer p.mu.Unlock()
+	if (tunnel && !p.tunnelRoute) || (p.routeIface != "" && iface != p.routeIface) {
+		p.resetBandwidthLocked()
+	}
+	p.tunnelRoute, p.routeIface = tunnel, iface
+}
+
+// resetBandwidthLocked drops the bandwidth estimate and the open window.
+func (p *Profile) resetBandwidthLocked() {
+	p.bwBps = 0
+	p.haveBW = false
+	p.bwSamples = 0
+	p.winStart = time.Time{}
+	p.winLastEnd = time.Time{}
+	p.winBytes = 0
+	p.winIntervals = p.winIntervals[:0]
+	p.winCarry = false
+	p.winMaxDur = 0
 }
 
 // tunnelMeasuredSamples is how many bandwidth samples a tunnel needs before
@@ -828,6 +881,13 @@ func (p *Profile) Snapshot() Snapshot {
 // revert discipline: revertible without a rebuild).
 func slowRTTFloorEnabled() bool {
 	return os.Getenv("JM_NET_SLOW_RTT_FLOOR") != "0"
+}
+
+// bwWindowCarryEnabled reports whether a bandwidth window continues the one
+// before it (clipped at the last flush). Default ON; JM_NET_BW_WINDOW_CARRY=0
+// restores windows that each start at their first read.
+func bwWindowCarryEnabled() bool {
+	return os.Getenv("JM_NET_BW_WINDOW_CARRY") != "0"
 }
 
 // tunnelMeasuredEnabled reports whether a measured tunnel is classed by its

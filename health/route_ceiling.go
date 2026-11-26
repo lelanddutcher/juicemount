@@ -61,7 +61,7 @@ func BackendRouteTunneled(iface string) bool {
 func ApplyBackendRouteCeiling(p *netprofile.Profile, iface string) bool {
 	tunneled := BackendRouteTunneled(iface)
 	p.CeilingClass(nil)
-	p.TunnelRoute(tunneled)
+	p.SetBackendRoute(iface, tunneled)
 	return tunneled
 }
 

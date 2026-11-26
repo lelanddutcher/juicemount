@@ -29,15 +29,25 @@ Three causes:
 1. The estimator gets the PING round trip only. The adaptive dial timeout
    still gets the whole probe.
 2. A window that follows the last one without an idle gap clips its reads at
-   the last flush. It flushes only once it is as long as its longest read, so
-   a stalled read cannot land all its bytes in one short window.
+   the last flush. It waits to span a clipped read of up to 2 s, which it
+   counts whole; a longer read (a stalled GET) counts only its share inside
+   the window, so it neither spikes the estimate nor freezes it.
 3. A tunnel is capped at slow until 4 bandwidth samples exist, then at
    medium: the measurement decides (metered and slow by its own numbers),
-   and a tunnel never earns fast.
+   and a tunnel never earns fast. When the tunnel turns on or the route
+   interface changes, the bandwidth estimate starts over: the old path's
+   samples do not count for the new one.
 
-**Kill switches.** `JM_NET_TUNNEL_MEASURED=0` restores the fixed slow cap
-for tunnels. Fixes 1 and 2 have no switch: they correct a measurement, and
-`JM_NET_FORCE_CLASS` pins the class if a link needs it.
+**Known limit.** A change of underlay under the same tunnel interface (home
+fiber to an unflagged hotspot, Tailscale keeping its utun) is not a route
+change. Nothing resets; the estimate must decay, unless the OS flags the
+hotspot as expensive.
+
+**Kill switches.**
+- `JM_NET_PROBE_RTT=full`: the estimator gets the whole probe again.
+- `JM_NET_BW_WINDOW_CARRY=0`: each bandwidth window starts at its first read
+  again.
+- `JM_NET_TUNNEL_MEASURED=0`: the fixed slow cap for tunnels.
 
 **Lab.** `test/remote-lab/experiments/link-class-lab.sh`, profile
 `fast-remote` (12 ms ± 10 ms jitter, 0.1 % loss each way, 300/200 Mbit/s)

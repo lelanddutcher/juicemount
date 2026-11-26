@@ -87,7 +87,7 @@ func TestWindowStalledReadIsNoSpike(t *testing.T) {
 func TestTunnelRouteFollowsMeasurement(t *testing.T) {
 	t.Setenv("JM_NET_TUNNEL_MEASURED", "")
 	p := New()
-	p.TunnelRoute(true)
+	p.SetBackendRoute("utun4", true)
 	p.ObserveRTT(2 * time.Millisecond) // a nearby tunnel endpoint
 	if c := p.Class(); c != ClassSlow {
 		t.Fatalf("unmeasured tunnel at 2 ms: class %s, want slow", c)
@@ -118,7 +118,7 @@ func TestTunnelRouteFollowsMeasurement(t *testing.T) {
 	}
 
 	fat := New()
-	fat.TunnelRoute(true)
+	fat.SetBackendRoute("utun4", true)
 	fat.ObserveRTT(time.Millisecond)
 	sampleFor(fat, 800*mib, 8)
 	if c := fat.Class(); c != ClassMedium {
@@ -126,7 +126,7 @@ func TestTunnelRouteFollowsMeasurement(t *testing.T) {
 	}
 
 	mid := New()
-	mid.TunnelRoute(true)
+	mid.SetBackendRoute("utun4", true)
 	mid.ObserveRTT(12 * time.Millisecond)
 	sampleFor(mid, 15*mib, 8)
 	if c := mid.Class(); c != ClassSlow {
@@ -134,7 +134,7 @@ func TestTunnelRouteFollowsMeasurement(t *testing.T) {
 	}
 
 	thin := New()
-	thin.TunnelRoute(true)
+	thin.SetBackendRoute("utun4", true)
 	thin.ObserveRTT(2 * time.Millisecond)
 	sampleFor(thin, 1*mib, 8)
 	if c := thin.Class(); c != ClassMetered {
@@ -142,7 +142,7 @@ func TestTunnelRouteFollowsMeasurement(t *testing.T) {
 	}
 
 	far := New()
-	far.TunnelRoute(true)
+	far.SetBackendRoute("utun4", true)
 	far.ObserveRTT(200 * time.Millisecond)
 	sampleFor(far, 60*mib, 8)
 	if c := far.Class(); c != ClassSlow || !far.HighLatency() {
@@ -150,7 +150,7 @@ func TestTunnelRouteFollowsMeasurement(t *testing.T) {
 	}
 
 	cost := New()
-	cost.TunnelRoute(true)
+	cost.SetBackendRoute("utun4", true)
 	sampleFor(cost, 60*mib, 8)
 	metered := ClassMetered
 	cost.SetNetworkCostClass(&metered)
@@ -158,7 +158,7 @@ func TestTunnelRouteFollowsMeasurement(t *testing.T) {
 		t.Fatalf("host-flagged expensive tunnel: class %s, want metered", c)
 	}
 
-	p.TunnelRoute(false)
+	p.SetBackendRoute("en0", false)
 	if _, ok := p.RouteCeiling(); ok {
 		t.Fatal("route ceiling still set after the tunnel route was lifted")
 	}
@@ -167,7 +167,7 @@ func TestTunnelRouteFollowsMeasurement(t *testing.T) {
 func TestTunnelRouteKillSwitch(t *testing.T) {
 	t.Setenv("JM_NET_TUNNEL_MEASURED", "0")
 	p := New()
-	p.TunnelRoute(true)
+	p.SetBackendRoute("utun4", true)
 	sampleFor(p, 60*mib, 8)
 	if c := p.Class(); c != ClassSlow {
 		t.Fatalf("JM_NET_TUNNEL_MEASURED=0: class %s, want the fixed slow cap", c)
@@ -178,11 +178,120 @@ func TestTunnelRouteKillSwitch(t *testing.T) {
 // slow whatever the tunnel rule allows.
 func TestExplicitCeilingBeatsMeasuredTunnel(t *testing.T) {
 	p := New()
-	p.TunnelRoute(true)
+	p.SetBackendRoute("utun4", true)
 	sampleFor(p, 60*mib, 8)
 	slow := ClassSlow
 	p.CeilingClass(&slow)
 	if c := p.Class(); c != ClassSlow {
 		t.Fatalf("explicit slow ceiling over a measured tunnel: class %s, want slow", c)
+	}
+}
+
+// PR #110 review H1: a Mac measured on its LAN (no tunnel) that moves to an
+// unflagged network behind a tunnel starts the tunnel over: slow until 4 new
+// samples, with none of the LAN estimate left.
+func TestTunnelAfterLANStartsOverMeasured(t *testing.T) {
+	t.Setenv("JM_NET_TUNNEL_MEASURED", "")
+	p := New()
+	c := &fakeClock{t: time.Unix(1_700_000_000, 0)}
+	p.now = c.now
+	p.SetBackendRoute("en0", false)
+	p.ObserveRTT(time.Millisecond)
+	block := func(bps float64) {
+		d := time.Duration(float64(4*mib) / bps * float64(time.Second))
+		c.advance(d)
+		p.ObserveThroughput(4*mib, d)
+	}
+	for p.Snapshot().ThroughputN < 16 {
+		block(100 * mib)
+	}
+	if cl := p.Class(); cl != ClassMedium {
+		t.Fatalf("LAN at 100 MiB/s: class %s, want medium", cl)
+	}
+	c.advance(time.Second) // the move: no reads for a while
+	p.SetBackendRoute("utun4", true)
+	if s := p.Snapshot(); s.HaveBW || s.ThroughputN != 0 {
+		t.Fatalf("tunnel on kept the LAN measurement: have %v, samples %d", s.HaveBW, s.ThroughputN)
+	}
+	if cl := p.Class(); cl != ClassSlow {
+		t.Fatalf("first moment on the tunnel: class %s, want slow", cl)
+	}
+	for p.Snapshot().ThroughputN < tunnelMeasuredSamples-1 {
+		block(40 * mib)
+	}
+	if cl := p.Class(); cl != ClassSlow {
+		t.Fatalf("tunnel with %d new samples: class %s, want slow", tunnelMeasuredSamples-1, cl)
+	}
+	for p.Snapshot().ThroughputN < tunnelMeasuredSamples {
+		block(40 * mib)
+	}
+	if cl := p.Class(); cl != ClassMedium {
+		t.Fatalf("tunnel measured at 40 MiB/s: class %s, want medium", cl)
+	}
+	// The same lookup again changes nothing; another interface starts over.
+	p.SetBackendRoute("utun4", true)
+	if cl := p.Class(); cl != ClassMedium {
+		t.Fatalf("repeated lookup reset the tunnel: class %s", cl)
+	}
+	p.SetBackendRoute("utun7", true)
+	if cl := p.Class(); cl != ClassSlow {
+		t.Fatalf("new tunnel interface: class %s, want slow", cl)
+	}
+}
+
+// PR #110 review H2: a stalled read must not freeze the estimate. 40 MiB/s,
+// then a 300 s read completes and the link carries 0.25 MiB/s in back-to-back
+// 256 KiB reads: the estimate falls and the class drops within seconds.
+func TestStalledReadDoesNotFreezeEstimate(t *testing.T) {
+	p := New()
+	c := &fakeClock{t: time.Unix(1_700_000_000, 0)}
+	p.now = c.now
+	p.ObserveRTT(5 * time.Millisecond)
+	for i := 0; i < 20; i++ {
+		c.advance(100 * time.Millisecond)
+		p.ObserveThroughput(4*mib, 100*time.Millisecond)
+	}
+	if cl := p.Class(); cl != ClassMedium {
+		t.Fatalf("40 MiB/s: class %s, want medium", cl)
+	}
+	c.advance(50 * time.Millisecond)
+	p.ObserveThroughput(4*mib, 300*time.Second)
+	before := p.Snapshot().ThroughputN
+	var slowAt, meteredAt time.Duration
+	for el := time.Duration(0); el < 120*time.Second; el += time.Second {
+		c.advance(time.Second)
+		p.ObserveThroughput(256*1024, time.Second)
+		if slowAt == 0 && p.Class() < ClassMedium {
+			slowAt = el + time.Second
+		}
+		if meteredAt == 0 && p.Class() == ClassMetered {
+			meteredAt = el + time.Second
+		}
+	}
+	s := p.Snapshot()
+	if s.ThroughputN-before < 60 {
+		t.Fatalf("only %d samples in 120 s after the stall; the estimate froze", s.ThroughputN-before)
+	}
+	if slowAt == 0 || slowAt > 5*time.Second {
+		t.Fatalf("class left medium after %v, want within 5 s", slowAt)
+	}
+	if meteredAt == 0 || meteredAt > 20*time.Second {
+		t.Fatalf("class reached metered after %v, want within 20 s", meteredAt)
+	}
+	if got := s.BytesPerSec / mib; got > 0.5 {
+		t.Fatalf("estimate %.2f MiB/s after 120 s at 0.25 MiB/s", got)
+	}
+}
+
+// JM_NET_BW_WINDOW_CARRY=0 restores the old windows: 4 reads of 300 ms in
+// flight measure one request's rate again (3.3 MiB/s).
+func TestWindowCarryKillSwitch(t *testing.T) {
+	t.Setenv("JM_NET_BW_WINDOW_CARRY", "0")
+	p := New()
+	c := &fakeClock{t: time.Unix(1_700_000_000, 0)}
+	p.now = c.now
+	concurrentReads(p, c, 60, 4, mib, 300*time.Millisecond)
+	if got := p.Snapshot().BytesPerSec / mib; got < 3.2 || got > 3.4 {
+		t.Fatalf("carry off: estimate %.2f MiB/s, want the old 3.33", got)
 	}
 }

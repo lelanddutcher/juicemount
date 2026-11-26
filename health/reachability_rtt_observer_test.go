@@ -44,3 +44,23 @@ func TestReachabilityRTTObserverGetsOneRoundTrip(t *testing.T) {
 		t.Fatalf("adaptive timeout RTT %v; want the whole probe (>= %v)", srtt, handshake+ping)
 	}
 }
+
+// JM_NET_PROBE_RTT=full feeds the whole probe again (rollback switch).
+func TestReachabilityRTTObserverFullProbeSwitch(t *testing.T) {
+	t.Setenv("JM_NET_PROBE_RTT", "full")
+	const handshake = 60 * time.Millisecond
+	var observed time.Duration
+	r := NewReachability("ignored:0",
+		WithDialContext(func(ctx context.Context, _, _ string) (net.Conn, error) {
+			time.Sleep(handshake)
+			return respondingPipe(false), nil
+		}),
+		WithDialTimeout(2*time.Second),
+		WithRTTObserver(func(d time.Duration) { observed = d }))
+	if !r.probe() {
+		t.Fatal("probe failed against a live peer")
+	}
+	if observed < handshake {
+		t.Fatalf("JM_NET_PROBE_RTT=full: observer got %v, want the whole probe (>= %v)", observed, handshake)
+	}
+}

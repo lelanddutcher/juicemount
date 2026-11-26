@@ -677,10 +677,16 @@ func (r *Reachability) probe() bool {
 	// the 20 ms release of the high-latency flag for good, and a single
 	// jitter spike to 40 ms latched the flag for the whole session (real
 	// remote run, 2026-11-26).
+	// JM_NET_PROBE_RTT=full feeds the estimator the whole probe again, as
+	// before (rollback without a rebuild).
 	rtt = time.Since(start)
 	r.observeRTT(rtt)
 	if r.rttObserver != nil {
-		r.rttObserver(time.Since(pingStart))
+		if os.Getenv("JM_NET_PROBE_RTT") == "full" {
+			r.rttObserver(rtt)
+		} else {
+			r.rttObserver(time.Since(pingStart))
+		}
 	}
 	return true
 }
