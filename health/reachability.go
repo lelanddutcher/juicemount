@@ -128,7 +128,8 @@ type Reachability struct {
 	srtt   time.Duration
 	rttvar time.Duration
 
-	// rttObserver, if set, receives every successful-probe dial latency. The
+	// rttObserver, if set, receives the PING round trip of every successful
+	// probe (one round trip on the open connection, not the handshake). The
 	// network profile (netprofile) uses it to bootstrap link classification from
 	// RTT before any throughput sample arrives. Kept as a plain func so this
 	// package stays free of a netprofile import (clean layering). Called from the
@@ -251,8 +252,8 @@ func WithProbe(fn func(context.Context) (time.Duration, error)) ReachabilityOpti
 	return func(r *Reachability) { r.remoteProbe = fn }
 }
 
-// WithRTTObserver registers a callback invoked with the dial latency of every
-// SUCCESSFUL probe. Used to feed the network-profile link estimator. The
+// WithRTTObserver registers a callback invoked with the PING round trip of
+// every SUCCESSFUL probe (with WithProbe: the remote probe's own RTT). Used to feed the network-profile link estimator. The
 // callback runs on the probe-loop goroutine and MUST NOT block.
 func WithRTTObserver(fn func(time.Duration)) ReachabilityOption {
 	return func(r *Reachability) { r.rttObserver = fn }
@@ -651,6 +652,7 @@ func (r *Reachability) probe() bool {
 	if dl, ok := ctx.Deadline(); ok {
 		_ = conn.SetDeadline(dl)
 	}
+	pingStart := time.Now()
 	if _, err := conn.Write([]byte("PING\r\n")); err != nil {
 		return false
 	}
@@ -664,13 +666,27 @@ func (r *Reachability) probe() bool {
 		return false
 	}
 
-	// RTT is measured across dial+PING now, which is the more honest number:
-	// it is what an actual metadata round trip costs, and it feeds the adaptive
-	// dial timeout and the netprofile RTT estimate.
+	// Two numbers come out of one probe. The adaptive dial timeout gets the
+	// whole probe (handshake + PING), because that is what its deadline has
+	// to cover. The link estimator gets the PING exchange alone: one round
+	// trip, which is what an established metadata connection pays per call
+	// and what netprofile's thresholds (the high-latency flag at 40/20 ms,
+	// the RTT bootstrap classes) and every other RTT sample it takes (the
+	// mount's and the boot's TCP dials) measure. Feeding it the whole probe
+	// counted two round trips: a direct 12 ms tunnel read 25-31 ms, sat above
+	// the 20 ms release of the high-latency flag for good, and a single
+	// jitter spike to 40 ms latched the flag for the whole session (real
+	// remote run, 2026-11-26).
+	// JM_NET_PROBE_RTT=full feeds the estimator the whole probe again, as
+	// before (rollback without a rebuild).
 	rtt = time.Since(start)
 	r.observeRTT(rtt)
 	if r.rttObserver != nil {
-		r.rttObserver(rtt)
+		if os.Getenv("JM_NET_PROBE_RTT") == "full" {
+			r.rttObserver(rtt)
+		} else {
+			r.rttObserver(time.Since(pingStart))
+		}
 	}
 	return true
 }

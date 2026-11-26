@@ -7,6 +7,55 @@ a rebuild**.
 
 ---
 
+## 2026-11-26 — a direct 12 ms tunnel was classed like a 200 ms link abroad
+
+**What.** `health/reachability.go`, `internal/netprofile/profile.go`,
+`health/route_ceiling.go`. A Mac on fiber reached the NAS through a direct
+Tailscale path: ping 11.6 ms, one TCP stream about 300 Mbit/s. The app said
+class `slow`, `high_latency` true, RTT 25–31 ms and bandwidth 10–15 MB/s.
+Three causes:
+1. The reachability probe gave the link estimator its whole probe time, TCP
+   handshake plus PING: two round trips. The high-latency flag releases only
+   under 20 ms, so a 12 ms link (25 ms measured) never released it after one
+   jitter spike set it.
+2. The bandwidth window opened at its first read's start, time the previous
+   window had already divided by. A read longer than the 120 ms flush
+   interval flushed its window alone, so with several reads in flight the
+   estimate was one request's rate, not the link's.
+3. A route through a tunnel (utun, tailscale0) capped the class at slow
+   whatever was measured.
+
+**Fix.**
+1. The estimator gets the PING round trip only. The adaptive dial timeout
+   still gets the whole probe.
+2. A window that follows the last one without an idle gap clips its reads at
+   the last flush. It waits to span a clipped read of up to 2 s, which it
+   counts whole; a longer read (a stalled GET) counts only its share inside
+   the window, so it neither spikes the estimate nor freezes it.
+3. A tunnel is capped at slow until 4 bandwidth samples exist, then at
+   medium: the measurement decides (metered and slow by its own numbers),
+   and a tunnel never earns fast. When the tunnel turns on or the route
+   interface changes, the bandwidth estimate starts over: the old path's
+   samples do not count for the new one.
+
+**Known limit.** A change of underlay under the same tunnel interface (home
+fiber to an unflagged hotspot, Tailscale keeping its utun) is not a route
+change. Nothing resets; the estimate must decay, unless the OS flags the
+hotspot as expensive.
+
+**Kill switches.**
+- `JM_NET_PROBE_RTT=full`: the estimator gets the whole probe again.
+- `JM_NET_BW_WINDOW_CARRY=0`: each bandwidth window starts at its first read
+  again.
+- `JM_NET_TUNNEL_MEASURED=0`: the fixed slow cap for tunnels.
+
+**Lab.** `test/remote-lab/experiments/link-class-lab.sh`, profile
+`fast-remote` (12 ms ± 10 ms jitter, 0.1 % loss each way, 300/200 Mbit/s)
+through a WireGuard
+interface named `tailscale0`.
+
+---
+
 ## 2026-11-11 — one slow boot sample started a cold install offline and empty (ENOENT)
 
 **What.** `bridge/cbridge.go`, `bridge/boot_offline_policy.go`,

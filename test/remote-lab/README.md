@@ -44,10 +44,12 @@ pings (a ping crosses the link twice).
 |---|---|---|---|
 | `lan` | none | none | no cap |
 | `same-city` | 20 ms | none | 200 / 200 Mbit/s |
+| `fast-remote` | 12 ms ± 10 ms jitter | 0.1% | 300 / 200 Mbit/s (a same-region remote on fiber over a direct tunnel; the server must send with BBR, `JMLAB_BBR=1`, or the loss caps one stream near 30 Mbit/s) |
 | `abroad` | 200 ms | 1% | 30 / 30 Mbit/s |
 | `abroad-noloss` | 200 ms | none | 30 / 30 Mbit/s (diagnostic: separates the cost of distance from the cost of loss) |
 | `hotel` | 300 ms | 2% | 10 / 10 Mbit/s |
 | `cellular` | 120 ms ± 60 ms jitter | none | 20 / 20 Mbit/s |
+| `thin-near` | 20 ms | none | 16 / 8 Mbit/s (under the 3 MiB/s metered threshold: checks the metered class holds) |
 
 Before it measures a profile, `measure.py` checks it. 60 pings must average
 within about 10% of the RTT. A UDP iperf3 probe in each direction must arrive
@@ -164,6 +166,31 @@ experiments/link-switch-lab.sh fixture
 experiments/link-switch-lab.sh down 1
 experiments/link-switch-lab.sh up 1
 ./lab.sh down
+```
+
+## Link class (`experiments/link-class-lab.sh`)
+
+`experiments/link-class-lab.sh` measures how the app classifies the lab
+link. `linkclassprobe` runs the app's own code in the client: the backend
+route lookup and its tunnel ceiling, the mount's link sample, the
+reachability monitor with its RTT observer, and the NFS layer's read-ahead
+with timed 1 MiB reads (two in flight) feeding the bandwidth estimate. It
+prints the class, read class, high-latency flag, RTT and bandwidth
+estimates and the juicefs live timeouts every second: 20 s idle, then a
+sequential read of a cold 1 GiB clip for 25 s.
+
+`tunnel up` routes the client to the NAS through a userspace WireGuard
+interface named `tailscale0` (MTU 1280), so the app's tunnel rule fires as
+it does for Tailscale on a Mac. Its UDP packets cross the wan and get the
+profile. `tunnel down` restores the direct route.
+
+```sh
+JMLAB_BBR=1 ./lab.sh up
+experiments/link-class-lab.sh build            # or: build before (another build)
+experiments/link-class-lab.sh fixture
+experiments/link-class-lab.sh tunnel up
+experiments/link-class-lab.sh run fast-remote
+LCP_BIN=before experiments/link-class-lab.sh run fast-remote fast-remote-before
 ```
 
 ## Network changes under a running session (`experiments/roam-lab.sh`)
