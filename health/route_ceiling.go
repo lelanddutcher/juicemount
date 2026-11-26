@@ -8,13 +8,16 @@ import (
 	"github.com/lelanddutcher/juicemount/internal/netprofile"
 )
 
-// The tunnel ceiling: a backend reached through a tunnel is at best slow.
+// The tunnel ceiling: a backend reached through a tunnel is slow until the
+// link is measured.
 //
 // A nearby tunnel endpoint can answer in 2 ms while the physical underlay is
 // a phone hotspot, and Network.framework does not reliably mark every VPN as
 // expensive. So when the kernel routes the backend through a tunnel
-// interface, the automatic link class is capped at slow. A measured metered
-// class stays metered, and an explicit force still wins (netprofile).
+// interface, the automatic link class is capped at slow until netprofile has
+// measured its bandwidth, and at medium after that (netprofile
+// tunnelCeilingLocked). A measured metered class stays metered, and an
+// explicit force still wins (netprofile).
 //
 // Two processes choose a class from this rule: the NFS-serving process (its
 // read rules and the live juicefs link follower) and the volume owner that
@@ -52,16 +55,13 @@ func BackendRouteTunneled(iface string) bool {
 	return strings.HasPrefix(iface, "utun") || iface == "tailscale0"
 }
 
-// ApplyBackendRouteCeiling caps p at slow when iface is a tunnel and lifts
-// the cap otherwise. It returns whether the cap is now set.
+// ApplyBackendRouteCeiling sets p's tunnel ceiling when iface is a tunnel and
+// lifts every route cap otherwise. It returns whether the tunnel ceiling is
+// now set.
 func ApplyBackendRouteCeiling(p *netprofile.Profile, iface string) bool {
 	tunneled := BackendRouteTunneled(iface)
-	if tunneled {
-		ceiling := netprofile.ClassSlow
-		p.CeilingClass(&ceiling)
-	} else {
-		p.CeilingClass(nil)
-	}
+	p.CeilingClass(nil)
+	p.TunnelRoute(tunneled)
 	return tunneled
 }
 

@@ -182,7 +182,10 @@ type Profile struct {
 	bwSamples        int64
 	forcedClass      *LinkClass // explicit operator/test override; nil = auto
 	networkCostClass *LinkClass // host OS expensive/constrained signal; nil = no cost override
-	ceilingClass     *LinkClass // route safety ceiling (e.g. backend traverses utun); nil = uncapped
+	ceilingClass     *LinkClass // route safety ceiling (a failed route lookup); nil = uncapped
+	// tunnelRoute: the route to the backend crosses a tunnel (utun,
+	// tailscale0). See tunnelCeilingLocked.
+	tunnelRoute bool
 
 	// highLatency is the LATENCY dimension of classification, kept separate from
 	// bandwidth because the two are independent and a link can be fast AND far.
@@ -202,6 +205,12 @@ type Profile struct {
 	winLastEnd   time.Time
 	winBytes     int64
 	winIntervals []throughputInterval
+	// winCarry is set while the window continues the one flushed just
+	// before it (no idle gap between them). Its intervals are clipped at
+	// winStart, the previous flush, so time already divided into the last
+	// sample is not divided again. winMaxDur is the longest read in it.
+	winCarry  bool
+	winMaxDur time.Duration
 
 	// now is the clock (injectable for tests). Production uses time.Now.
 	now func() time.Time
@@ -393,25 +402,53 @@ func (p *Profile) ObserveThroughput(bytes int64, dur time.Duration) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	// Start a fresh window if this is the first sample or the link went idle.
-	if p.winStart.IsZero() || now.Sub(p.winLastEnd) > bwIdleGap {
+	// Start a fresh window if this is the first sample or the link went idle:
+	// this read started more than bwIdleGap after the last one ended. (A
+	// long read that started while others were still running is not idle
+	// time, however long ago the last one completed.)
+	if p.winStart.IsZero() || started.Sub(p.winLastEnd) > bwIdleGap {
 		p.winStart = started
 		p.winLastEnd = time.Time{}
 		p.winBytes = 0
 		p.winIntervals = p.winIntervals[:0]
+		p.winCarry = false
+		p.winMaxDur = 0
 	}
 	if started.Before(p.winStart) {
-		p.winStart = started
+		if p.winCarry {
+			// CONTINUED WINDOW: the part of this read before winStart was
+			// already in the previous window's divisor (as the time of the
+			// reads that completed then). Dividing it again made every
+			// window's divisor about one read duration too long. With reads
+			// longer than bwWindowFlush the first read of each window
+			// flushed it alone, so the estimate was one request's rate,
+			// not the link's: a 12 ms tunnel carrying 190-240 Mbit/s of
+			// concurrent reads measured 70-120 Mbit/s (lab, 2026-11-26).
+			started = p.winStart
+		} else {
+			p.winStart = started
+		}
 	}
 	p.winBytes += bytes
 	if now.After(p.winLastEnd) {
 		p.winLastEnd = now
+	}
+	if dur > p.winMaxDur {
+		p.winMaxDur = dur
 	}
 	p.winIntervals = append(p.winIntervals, throughputInterval{start: started, end: now})
 
 	span := p.winLastEnd.Sub(p.winStart)
 	if span < bwWindowFlush && p.winBytes < bwWindowFlushBytes {
 		return // keep accumulating; not enough wall-time or bytes yet
+	}
+	if p.winCarry && span < p.winMaxDur {
+		// A continued window counts a clipped read's whole bytes, so it
+		// must be at least as long as its longest read. Otherwise one read
+		// that ran across many windows (a stalled GET) would land all its
+		// bytes in one short window: a spike that could lift a thin link
+		// out of metered.
+		return
 	}
 	active := activeTransferDuration(p.winIntervals)
 	if active <= 0 {
@@ -421,12 +458,15 @@ func (p *Profile) ObserveThroughput(bytes int64, dur time.Duration) {
 	if fl := FakeLinkSpec(); fl != nil && fl.BWDown > 0 {
 		rate = fl.BWDown
 	}
-	// Tumble the window so concurrent reads in the next interval aren't
-	// double-counted against this one's already-folded bytes.
-	p.winStart = time.Time{}
-	p.winLastEnd = time.Time{}
+	// Tumble the window. The next one continues from here (winCarry) until
+	// the link goes idle: its reads are clipped at this flush, so neither
+	// their bytes nor their time is counted twice.
+	p.winStart = now
+	p.winLastEnd = now
 	p.winBytes = 0
 	p.winIntervals = p.winIntervals[:0]
+	p.winCarry = true
+	p.winMaxDur = 0
 
 	p.bwSamples++
 	if !p.haveBW {
@@ -496,15 +536,74 @@ func (p *Profile) SetNetworkCostClass(c *LinkClass) {
 	p.mu.Unlock()
 }
 
-// CeilingClass caps automatic classification without pinning it. It is used
-// when the route to the backend crosses a VPN/tunnel: a nearby VPN endpoint may
-// yield a 2 ms RTT even when the physical underlay is cellular, so that route
-// may not earn Medium/Fast speculative behavior. Metered observations remain
-// Metered, and an explicit ForceClass still wins. Pass nil to remove the cap.
+// CeilingClass caps automatic classification without pinning it. The route
+// lookup uses it when it fails before any success (health.RouteCeiling).
+// Metered observations remain Metered, and an explicit ForceClass still wins.
+// Pass nil to remove the cap.
 func (p *Profile) CeilingClass(c *LinkClass) {
 	p.mu.Lock()
 	p.ceilingClass = c
 	p.mu.Unlock()
+}
+
+// TunnelRoute records whether the route to the backend crosses a tunnel
+// (health.ApplyBackendRouteCeiling). See tunnelCeilingLocked for what it
+// caps.
+func (p *Profile) TunnelRoute(on bool) {
+	p.mu.Lock()
+	p.tunnelRoute = on
+	p.mu.Unlock()
+}
+
+// tunnelMeasuredSamples is how many bandwidth samples a tunnel needs before
+// its class follows the measurement.
+const tunnelMeasuredSamples = 4
+
+// tunnelCeilingLocked is the cap a tunnel route puts on automatic
+// classification, or nil.
+//
+// Before the link is measured, a tunnel is capped at slow. A nearby tunnel
+// endpoint can answer in 2 ms while the physical underlay is a phone hotspot,
+// and Network.framework does not reliably mark every VPN as expensive, so an
+// RTT bootstrap through a tunnel must not earn the medium or fast policy.
+//
+// Once tunnelMeasuredSamples bandwidth samples exist, the class follows the
+// measurement, capped at medium. A thin tunnel is still metered (near and
+// under 3 MiB/s) or slow (far, or under 30 MiB/s) by its own numbers. A fast
+// one is not called slow for being a tunnel: a direct Tailscale path on
+// fiber (12 ms, about 300 Mbit/s) was classed like a 200 ms link abroad (real
+// remote run, 2026-11-26). Fast stays for routes without a tunnel.
+// JM_NET_TUNNEL_MEASURED=0 restores the fixed slow cap.
+func (p *Profile) tunnelCeilingLocked() *LinkClass {
+	if !p.tunnelRoute {
+		return nil
+	}
+	c := ClassSlow
+	if p.haveBW && p.bwSamples >= tunnelMeasuredSamples && tunnelMeasuredEnabled() {
+		c = ClassMedium
+	}
+	return &c
+}
+
+// RouteCeiling reports the cap the backend route puts on the class now, if
+// any (for diagnostics).
+func (p *Profile) RouteCeiling() (LinkClass, bool) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if c := p.routeCeilingLocked(); c != nil {
+		return *c, true
+	}
+	return 0, false
+}
+
+// routeCeilingLocked is the stricter of the explicit ceiling and the tunnel
+// ceiling.
+func (p *Profile) routeCeilingLocked() *LinkClass {
+	c := p.ceilingClass
+	if t := p.tunnelCeilingLocked(); t != nil && (c == nil || *t < *c) {
+		c = t
+	}
+	return c
 }
 
 // ResetForTransportChange invalidates every passive measurement tied to the
@@ -531,6 +630,8 @@ func (p *Profile) ResetForTransportChange() {
 	p.winLastEnd = time.Time{}
 	p.winBytes = 0
 	p.winIntervals = p.winIntervals[:0]
+	p.winCarry = false
+	p.winMaxDur = 0
 	p.mu.Unlock()
 }
 
@@ -542,9 +643,10 @@ func (p *Profile) classLocked() (LinkClass, bool) {
 	if p.networkCostClass != nil {
 		return *p.networkCostClass, false
 	}
+	ceiling := p.routeCeilingLocked()
 	bounded := func(class LinkClass, boot bool) (LinkClass, bool) {
-		if p.ceilingClass != nil && class > *p.ceilingClass {
-			return *p.ceilingClass, boot
+		if ceiling != nil && class > *ceiling {
+			return *ceiling, boot
 		}
 		return class, boot
 	}
@@ -726,6 +828,13 @@ func (p *Profile) Snapshot() Snapshot {
 // revert discipline: revertible without a rebuild).
 func slowRTTFloorEnabled() bool {
 	return os.Getenv("JM_NET_SLOW_RTT_FLOOR") != "0"
+}
+
+// tunnelMeasuredEnabled reports whether a measured tunnel is classed by its
+// measurement (capped at medium) instead of the fixed slow cap. Default ON;
+// JM_NET_TUNNEL_MEASURED=0 restores the fixed cap without a rebuild.
+func tunnelMeasuredEnabled() bool {
+	return os.Getenv("JM_NET_TUNNEL_MEASURED") != "0"
 }
 
 // latencyCeilingEnabled reports whether the RTT ceiling may downgrade a

@@ -3026,10 +3026,13 @@ func nfsServerStartSerialized(configJSON *C.char, recovery *servingDesiredRecord
 			BackendRouteTunneled: backendRoutePolicyState.tunneled.Load(),
 			RouteCeilingApplied:  backendRoutePolicyState.ceilingApplied.Load(),
 			RouteCeilingClass: func() string {
-				if backendRoutePolicyState.ceilingApplied.Load() {
-					return netprofile.ClassSlow.String()
+				if !backendRoutePolicyState.ceilingApplied.Load() {
+					return ""
 				}
-				return ""
+				if c, ok := netprofile.Default().RouteCeiling(); ok {
+					return c.String()
+				}
+				return netprofile.ClassSlow.String()
 			}(),
 			HostNetworkCostObserved: costObserved,
 			HostNetworkExpensive:    costExpensive,
