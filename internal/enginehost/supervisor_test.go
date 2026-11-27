@@ -381,6 +381,29 @@ func TestStopEscalatesToTerm(t *testing.T) {
 	}
 }
 
+// A frozen helper that never answers the shutdown request is killed within
+// the request timeout plus the grace, not after StopBound (review F3).
+func TestStopKillsFrozenHelperPromptly(t *testing.T) {
+	cfg := fakeConfig("ok", nil)
+	cfg.PingInterval = time.Hour // the freeze stays undetected
+	cfg.StopBound = 20 * time.Second
+	s := startSupervisor(t, cfg)
+	st := waitReady(t, s, 10*time.Second)
+	if err := syscall.Kill(st.PID, syscall.SIGSTOP); err != nil {
+		t.Fatal(err)
+	}
+	how, took := s.Stop()
+	if how != "kill" && how != "pipe" {
+		t.Fatalf("stopped by %q, want kill (or pipe after SIGCONT)", how)
+	}
+	waitGone(t, st.PID, 2*time.Second)
+	// 5 s request timeout + 2 s grace; the old path waited 20 s + 2 s.
+	if took > 9*time.Second {
+		t.Fatalf("stop took %s", took)
+	}
+	t.Logf("frozen helper stopped by %s in %s", how, took)
+}
+
 func TestStopBeforeStart(t *testing.T) {
 	s := New(fakeConfig("ok", nil))
 	if how, _ := s.Stop(); how != "none" {

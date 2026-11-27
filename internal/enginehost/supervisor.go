@@ -365,6 +365,10 @@ func privateDir(base string) (string, error) {
 	return dir, nil
 }
 
+// failedShutdownGrace is how long a helper that did not answer the
+// shutdown request has to exit on its own before SIGKILL.
+const failedShutdownGrace = 2 * time.Second
+
 // maxSocketPath is below macOS's 104-byte sun_path.
 const maxSocketPath = 100
 
@@ -585,17 +589,34 @@ func (s *Supervisor) retire(c *child) {
 }
 
 // shutdownChild stops a ready child in order (design 2.7).
+//
+// A helper that did not answer the shutdown request (frozen, or stuck in
+// an engine call) gets SIGCONT and failedShutdownGrace to exit on the
+// pipe's end of file, then SIGKILL. A step-1 helper is read-only and holds
+// nothing to flush, so waiting out StopBound for it would only delay quit.
+// A step that holds writes must revisit this.
 func (s *Supervisor) shutdownChild(c *child) {
 	how := "shutdown"
 	deadline := time.Now().Add(s.cfg.StopBound)
-	if err := c.client.Shutdown(min(5*time.Second, s.cfg.StopBound)); err != nil {
-		how = "pipe"
-	}
+	answered := c.client.Shutdown(min(5*time.Second, s.cfg.StopBound)) == nil
 	c.client.Close()
 	c.pipeW.Close() // end of file: the helper stops even if it missed the message
+	if !answered {
+		how = "pipe"
+		_ = c.cmd.Process.Signal(syscall.SIGCONT)
+		if until := time.Until(deadline); until > failedShutdownGrace {
+			deadline = time.Now().Add(failedShutdownGrace)
+		}
+	}
 	select {
 	case <-c.exited:
 	case <-time.After(time.Until(deadline)):
+		if !answered {
+			how = "kill"
+			_ = c.cmd.Process.Kill()
+			<-c.exited
+			break
+		}
 		how = "term"
 		_ = c.cmd.Process.Signal(syscall.SIGTERM)
 		select {

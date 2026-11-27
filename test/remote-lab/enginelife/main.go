@@ -148,7 +148,7 @@ func (r *recorder) waitKind(kind string, n int, within time.Duration) (stamped, 
 }
 
 func config(rec *recorder) enginehost.Config {
-	args := []string{"jm-engine", *metaURL, "--no-usage-report", "--no-bgjob", "--max-deletes", "0",
+	args := []string{"jm-engine", *metaURL, "--no-usage-report", "--no-agent", "--no-bgjob", "--max-deletes", "0",
 		"--read-only", "--cache-size", "0"}
 	cfg := enginehost.Config{
 		Bin: *bin, Args: args, Env: baseEnv(), MetaPassword: password(),

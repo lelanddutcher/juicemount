@@ -17,7 +17,7 @@ func TestEngineHelperArgsKeepSecretsOut(t *testing.T) {
 		t.Fatalf("password in argv: %s", joined)
 	}
 	for _, want := range []string{"jm-engine redis://mac-a@nas.local:6379/1", "--read-only", "--cache-size 0",
-		"--no-bgjob", "--max-deletes 0", "--bucket http://nas.local:9000/zpool"} {
+		"--no-bgjob", "--no-agent", "--max-deletes 0", "--bucket http://nas.local:9000/zpool"} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("args %q lack %q", joined, want)
 		}

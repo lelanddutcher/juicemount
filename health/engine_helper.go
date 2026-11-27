@@ -21,12 +21,14 @@ func EngineHelperEnvironment() []string {
 // Step 1 runs read-only with no block cache: --read-only and
 // --cache-size 0 (the helper also forces both). It never shares the
 // mount's cache folder, so the mount's cache has one owner. Later steps take
-// over the mount's full flag set.
+// over the mount's full flag set. --no-agent: no pprof debug listener on
+// 127.0.0.1:6060-6099 (a port outside the socket's peer and token checks).
 func EngineHelperArgs(redisURL, bucketOverride string) (args []string, metaPassword string) {
 	metaURL, metaPassword := SplitMetaPassword(redisURL)
 	args = []string{
 		"jm-engine", metaURL,
 		"--no-usage-report",
+		"--no-agent",
 		"--no-bgjob",
 		"--max-deletes", "0",
 		"--read-only",
