@@ -43,6 +43,7 @@ func readRetry(f *nfsc.File, p []byte, off int64) (int, int, error) {
 }
 
 type chunkResult struct {
+	took    time.Duration
 	idx     int64
 	b       []byte
 	err     error
@@ -116,6 +117,7 @@ func seqread(args []string) error {
 						want = rem
 					}
 					buf := make([]byte, want)
+					cs := time.Now()
 					got := 0
 					var rerr error
 					tries := 0
@@ -132,7 +134,7 @@ func seqread(args []string) error {
 						}
 						got += n
 					}
-					results <- chunkResult{idx: idx, b: buf[:got], err: rerr, retries: tries}
+					results <- chunkResult{idx: idx, b: buf[:got], err: rerr, retries: tries, took: time.Since(cs)}
 					if rerr != nil {
 						mu.Lock()
 						stop = true
@@ -146,11 +148,16 @@ func seqread(args []string) error {
 		h := sha256.New()
 		pending := map[int64][]byte{}
 		var want, total int64
-		var firstByte time.Duration
+		var firstByte, maxRead time.Duration
+		var lats []float64
 		errs, retries := 0, 0
 		var firstErr string
 		for r := range results {
 			retries += r.retries
+			lats = append(lats, r.took.Seconds())
+			if r.took > maxRead {
+				maxRead = r.took
+			}
 			if r.err != nil {
 				errs++
 				if firstErr == "" {
@@ -176,6 +183,12 @@ func seqread(args []string) error {
 		row["first_byte_s"] = secs(firstByte)
 		row["mbit_s"] = float64(total) * 8 / 1e6 / el.Seconds()
 		row["errors"] = errs
+		row["max_read_s"] = secs(maxRead)
+		if len(lats) > 0 {
+			sort.Float64s(lats)
+			row["p50_read_s"] = lats[len(lats)/2]
+			row["p99_read_s"] = lats[len(lats)*99/100]
+		}
 		row["jukebox_retries"] = retries
 		if firstErr != "" {
 			row["error"] = firstErr

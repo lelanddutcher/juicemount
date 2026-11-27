@@ -586,7 +586,8 @@ func (g *blockGate) drop() {
 // Rule 5 is off for an engine source: reads of one file run side by side on
 // the engine socket, so a demand read never queues behind a block there.
 func (rm *ReadaheadManager) readBlock(fd prefetchSource, buf []byte, off int64, g *blockGate, cancel func() bool) (n int, active time.Duration, err error) {
-	_, isFUSE := fd.(*os.File)
+	_, isEngine := fd.(*enginePrefetch)
+	isFUSE := !isEngine
 	if (rm.prefetchReadAt != nil && !rm.chunkWithHook) || !rm.demandFirstOn() || len(buf) <= demandChunk || !isFUSE {
 		t0 := time.Now()
 		n, err = rm.readPiece(fd, buf, off)
@@ -642,7 +643,8 @@ func (rm *ReadaheadManager) pieceWaitMax() time.Duration {
 
 // readPiece issues one prefetch ReadAt through the test hook when set.
 func (rm *ReadaheadManager) readPiece(fd prefetchSource, buf []byte, off int64) (int, error) {
-	if f, ok := fd.(*os.File); ok && rm.prefetchReadAt != nil {
+	if rm.prefetchReadAt != nil {
+		f, _ := fd.(*os.File) // nil for an engine source
 		return rm.prefetchReadAt(f, buf, off)
 	}
 	return fd.ReadAt(buf, off)

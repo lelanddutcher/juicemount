@@ -191,8 +191,19 @@ run() {
   # control channel; without the spool jm5 creates through FUSE.
   local spool=""
   [ "${PE_WRITES:-false}" != true ] || spool="JM_SPOOL_ENABLE=1 JM_SPOOL_DIR=/var/jm/spool JM_SPOOL_SIZE_GB=8"
+  # ER_ENGINE_ARGV (from engine-reads-lab.sh argv FILE): jm5 mounts /jfs
+  # itself with the same flags, as the app does (engine-direct step 2;
+  # with JM_ENGINE=reads in the jm5 environment the mount serves the socket).
+  local engine_env=""
+  if [ -n "${ER_ENGINE_ARGV:-}" ]; then
+    # shellcheck disable=SC2016
+    "$LAB" exec sh -c 'umount /jfs 2>/dev/null || umount -l /jfs
+      for i in $(seq 100); do grep -q " /jfs fuse" /proc/mounts || exit 0; sleep 0.1; done; exit 1' || die "/jfs did not unmount"
+    sleep 2
+    engine_env="JM_ENGINE_MOUNT_ARGV=$ER_ENGINE_ARGV"
+  fi
   # shellcheck disable=SC2016
-  "$LAB" exec sh -c 'cd /var/jm && HOME=/var/jm JM_CACHE_DIR=/var/jfscache/'"$uuid"' JM_NET_FORCE_CLASS='"$class"' '"$spool ${PE_JM5_ENV:-}"' \
+  "$LAB" exec sh -c 'cd /var/jm && HOME=/var/jm JM_CACHE_DIR=/var/jfscache/'"$uuid"' JM_NET_FORCE_CLASS='"$class"' '"$spool ${PE_JM5_ENV:-} $engine_env"' \
     nohup /lab/'"$STATE_NAME/$BIN"'/jm5 --redis "redis://'"$MAC_NAME"':$(cat /var/jm/mac.pass)@'"$PROXY_IP"':6379/1" \
       --fuse-path /jfs --no-fuse --external-juicefs-is-bundled --no-mount --listen 127.0.0.1:21049 \
       --metrics-addr 127.0.0.1:21050 --log-level debug --db /var/jm/metadata.db >/var/jm/jm5.log 2>&1 & echo $! > /var/jm/jm5.pid'

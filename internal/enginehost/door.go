@@ -209,6 +209,15 @@ func (d *Door) connect(l *doorLaunch) {
 			return
 		}
 		var se *StatusError
+		if errors.As(err, &se) && se.Status == syscall.EACCES {
+			// The mount refused this process: wrong token, or the mount is
+			// not this process's direct child (a juicefs supervisor stage in
+			// between; the app sets JFS_SUPERVISOR). Retrying cannot help.
+			rerr := fmt.Errorf("%w: the mount refused this process (EACCES); is juicefs its direct child?", ErrRefused)
+			l.finish(nil, h, rerr)
+			d.event(Event{Kind: EventRefused, Err: rerr})
+			return
+		}
 		if errors.As(err, &se) && se.Status == syscall.EPROTONOSUPPORT {
 			rerr := fmt.Errorf("%w: protocol %d.%d, app speaks %d.%d (juicefs %s)", ErrRefused,
 				h.ProtoMajor, h.ProtoMinor, wire.ProtoMajor, wire.ProtoMinor, h.JuiceFSVersion)

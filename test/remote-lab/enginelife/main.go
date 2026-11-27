@@ -508,7 +508,7 @@ func hold() {
 
 func main() {
 	if len(os.Args) < 2 {
-		die("usage: enginelife life|auth|hold [flags]")
+		die("usage: enginelife life|auth|hold|door [flags]")
 	}
 	cmd := os.Args[1]
 	if cmd == "dial" {
@@ -530,7 +530,11 @@ func main() {
 		hold()
 	case "app":
 		app()
+	case "door":
+		door()
 	default:
 		die("unknown command %s", cmd)
 	}
 }
+
+func asStatus(err error, se **enginehost.StatusError) bool { return errors.As(err, se) }

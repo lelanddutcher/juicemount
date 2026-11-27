@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -21,9 +22,8 @@ import (
 // --no-fuse the remote lab can hand jm5 the argv of a foreground
 // `juicefs mount` (--engine-mount-argv FILE or JM_ENGINE_MOUNT_ARGV, a JSON
 // array): jm5 then starts that mount as its own child with the socket
-// inherited, exactly as the app does, and stops it on exit. A mount the lab
-// already made at --fuse-path is unmounted first, so the existing lab
-// scripts run unchanged with only jm5's environment set. With the level
+// inherited, exactly as the app does, and stops it on exit. --fuse-path must
+// not be mounted yet (the lab unmounts its own mount first). With the level
 // below reads the same argv starts the same mount without the socket (the
 // lab's "off" arm on an identical mount).
 
@@ -55,9 +55,7 @@ func startLabMount(argvFile, mountPoint, logPath string, door *enginehost.Door) 
 		return nil, fmt.Errorf("engine mount argv %s: want a JSON array of at least 2 words", argvFile)
 	}
 	if isFUSEMount(mountPoint) {
-		if err := takeOverMount(mountPoint); err != nil {
-			return nil, err
-		}
+		return nil, fmt.Errorf("%s is already mounted; the lab unmounts it before jm5 starts its own", mountPoint)
 	}
 	var dargs []string
 	var files []*os.File
@@ -68,7 +66,10 @@ func startLabMount(argvFile, mountPoint, logPath string, door *enginehost.Door) 
 	}
 	cmd := exec.Command(argv[0], append(argv[1:], dargs...)...)
 	cmd.ExtraFiles = files
-	cmd.Env = os.Environ()
+	// As the app does (health/fuse.go juiceFSDirectEnvironment): juicefs
+	// runs its service stage in this one process, so jm5 is its parent and
+	// passes the socket's peer check.
+	cmd.Env = append(os.Environ(), "JFS_SUPERVISOR="+strconv.Itoa(os.Getpid()))
 	if logPath != "" {
 		if f, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600); err == nil {
 			cmd.Stdout, cmd.Stderr = f, f
@@ -98,25 +99,6 @@ func startLabMount(argvFile, mountPoint, logPath string, door *enginehost.Door) 
 	}
 	m.stop()
 	return nil, fmt.Errorf("%s did not become a FUSE mount within 90 s", mountPoint)
-}
-
-// takeOverMount unmounts the lab's own mount at mountPoint so jm5 can mount
-// there as the app does.
-func takeOverMount(mountPoint string) error {
-	if out, err := exec.Command("umount", mountPoint).CombinedOutput(); err != nil {
-		if out2, err2 := exec.Command("umount", "-l", mountPoint).CombinedOutput(); err2 != nil {
-			return fmt.Errorf("unmount the lab's mount at %s: %v %s / %v %s", mountPoint, err, out, err2, out2)
-		}
-	}
-	for i := 0; i < 100 && isFUSEMount(mountPoint); i++ {
-		time.Sleep(100 * time.Millisecond)
-	}
-	if isFUSEMount(mountPoint) {
-		return fmt.Errorf("%s is still mounted", mountPoint)
-	}
-	time.Sleep(time.Second) // the old juicefs flushes and exits
-	jmlog.Info("lab: took over the juicefs mount", "mount", mountPoint)
-	return nil
 }
 
 func isFUSEMount(mountPoint string) bool {
