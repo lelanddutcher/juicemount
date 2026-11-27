@@ -51,7 +51,7 @@ var maintenanceRecommendations = map[MaintenanceKind]maintenanceRecommendation{
 	},
 	MaintenanceCompactMeta: {
 		Cron:   "0 5 1 1,4,7,10 *", // quarterly, 1st @ 05:00
-		Advice: "Forces slice compaction to densify fragmented chunks. JuiceFS already compacts automatically during normal reads/writes, so only schedule this if you actually notice read fragmentation. Recommended: off, or quarterly.",
+		Advice: "Forces slice compaction to densify fragmented chunks. JuiceFS compacts automatically when writing, and when Macs near the server read; remote Macs and Macs on a tunnel do not compact on read. Schedule this if your team works mostly remotely or you notice read fragmentation. Recommended: off, or quarterly.",
 	},
 }
 

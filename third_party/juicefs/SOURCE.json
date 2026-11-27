@@ -2,12 +2,12 @@
   "archive_sha256": "9351a0655185f4a48accae2ae3af70db932de1ee38acfa4f153e3050b817806d",
   "binary": {
     "bundle_path": "Contents/MacOS/juicefs",
-    "ldflags": "-s -w -X github.com/juicedata/juicefs/pkg/version.revision=e0032b2ae5e9-jm18 -X github.com/juicedata/juicefs/pkg/version.revisionDate=2025-12-02",
+    "ldflags": "-s -w -X github.com/juicedata/juicefs/pkg/version.revision=e0032b2ae5e9-jm19 -X github.com/juicedata/juicefs/pkg/version.revisionDate=2025-12-02",
     "package": ".",
     "tags": "nogateway,nowebdav,nocos,nobos,nohdfs,noibmcos,noobs,nooss,noqingstor,nosftp,noswift,noazure,nogs,noufile,nob2,nonfs,nodragonfly,nosqlite,nomysql,nopg,notikv,nobadger,noetcd",
     "upstream_commit": "e0032b2ae5e9603403ca955eed7d05426f6f2f8c",
     "upstream_tag": "v1.3.1",
-    "version_output": "juicefs version 1.3.1+2025-12-02.e0032b2ae5e9-jm18"
+    "version_output": "juicefs version 1.3.1+2025-12-02.e0032b2ae5e9-jm19"
   },
   "files": {
     "LICENSE": {
@@ -71,7 +71,7 @@
       "upstream_sha256": "15908224a721fa45c1aa314dd205b4c20a708377c3cecf72ca28d293bb91be98"
     },
     "cmd/flags.go": {
-      "sha256": "6431b452d367f12e200f08d33ac77df6a294506528debe14a379574ffe03b17b",
+      "sha256": "759072d34132ec104e724ec504fc5e364ca6e8e0235031e8275bd3fb6e880966",
       "upstream_sha256": "70e3cab323f55b18b5bb4ab86eacb64d2e8498cc1db0f811b9ddc33cf6cc0177"
     },
     "cmd/flags_test.go": {
@@ -139,7 +139,7 @@
       "upstream_sha256": "92acd00a05ce40edf3779f0fd4918d09365de8c9369e016685085503c4ec118f"
     },
     "cmd/mount.go": {
-      "sha256": "3d14ebfb4347686b13c036c037b8f5d84e2c910ce371f5bc23022dae1d631bf0",
+      "sha256": "1169ad3827614623d8bb9f638544a044f742d3a8cfd58399b72a5ba710dbb545",
       "upstream_sha256": "973badb4b0619b5262b83457c627037aa38595d0b30bd0ba52009d83ddda029e"
     },
     "cmd/mount_test.go": {
@@ -423,7 +423,7 @@
       "upstream_sha256": "ba7e06aad4853d8522423f9b3e5048954dd3a8cef970ed3e3118045c4ea71028"
     },
     "pkg/meta/base.go": {
-      "sha256": "e27e857e8b9bcde5241b5c2cc6c55ac4d0279adffcc4bbd9cc89d3b65b4a9b35",
+      "sha256": "3c0ddc9f5d0b359906251faf20cd267c61acb552ce067d56c24a92c459bcd7dd",
       "upstream_sha256": "0c1f39c842258034ccd278066f11c09fa840519ad526e6f22f0c4ce90aa46b35"
     },
     "pkg/meta/base_test.go": {
@@ -1130,6 +1130,8 @@
     "pkg/meta/jm_create_file.go": "6d1b6c2c87c5c121a12e45dbf040a7ae411bde505dc40b077dc8845664f0db1d",
     "pkg/meta/jm_open_round_trips_test.go": "099ccb8f92b9197be9fdea95e49a0d7c5fedb8918d39559083d9e9c8c71e0591",
     "pkg/meta/jm_pin_ops.go": "03c38dc0341f5ea58172baa76239076012fcab52d96de75a0825bd1b5d895651",
+    "pkg/meta/jm_read_compaction.go": "1fee7cde72f0a4f1a3d4dbc8d456b2ee549eec664dc31b46f20795871328f62e",
+    "pkg/meta/jm_read_compaction_test.go": "2a664bffd920c5dbf05e5452c10e234f7b2a21e8f9049f233659307e1af47738",
     "pkg/meta/jm_refresh.go": "a19973427357b98f67feadc0d50ac302924141ad87a4820d7d5eb1d53bb30751",
     "pkg/meta/jm_refresh_test.go": "cad76793e36cc581323341ec6a569a8314b9d28a8ae7f85d592859e56193b2f9",
     "pkg/meta/jm_reserved_inode.go": "1b5e0d26e9cafc6d685fe04e9625af0212ecc08b06f9f2d1123af8f9431c65d8",
@@ -1172,8 +1174,8 @@
     "pkg/vfs/jm_control_lane_test.go": "83d6da7b3bb713cf438e84c65b43b4f16a3d78d8a83019622e46480e450eadd6",
     "pkg/vfs/jm_create_files.go": "574ace818067f4ed273d2d978eb4619d7d574ba9888519fd9bb5bd16982656d2",
     "pkg/vfs/jm_create_files_test.go": "ad0fd6a4a49b514d7edeaa83f6c2076ece903ca763f3c860e014c201e9379ec0",
-    "pkg/vfs/jm_link_policy.go": "99e7a16e7dd86292cfce58886e7cfcba1a2ea364fca3eb15a5e73a54f9b3fc03",
-    "pkg/vfs/jm_link_policy_test.go": "e4679b72c143a5962c51c9f4e55e1965186a73aec7c7f98501bbdf1afa0d181b",
+    "pkg/vfs/jm_link_policy.go": "2b5e9adfa3586b1dc1104d9bcbf35ea25ec225662067110384edac9ca8db4549",
+    "pkg/vfs/jm_link_policy_test.go": "dc18b72697da92fd713d73b429967c1769f3dfbca39a862485aed95b809f4932",
     "pkg/vfs/jm_pin.go": "2f229860b5593348913bcbb5903d17d759f9826f5da8517ef6c01a66f783c39c",
     "pkg/vfs/jm_pin_test.go": "cf3bf39834e7b130c755cdeb5aa0712f8eebe947a73e3aacf762904f93277f2b",
     "pkg/vfs/jm_read_recover.go": "abdf2ac8cbb6ee55f65edf4ed59afd5041d7ea55a525cca8bbbefc5f27118af5",
@@ -1219,7 +1221,8 @@
     "patches/0031-refresh-open-file.patch": "677428d084f6a0f8012eb467351493e239f5dd51b52d114c189dc1534cce5ab6",
     "patches/0032-refresh-keeps-current-buffers.patch": "ff7fc37fc4d10d4db24bdf65d25a4d5a786badbc7cfccb8a4d8331980bef67ab",
     "patches/0033-control-lane.patch": "7366007504ddf3be56cd4a27e18d55a371649db8119c8d7fc4dbb17b03a73c91",
-    "patches/0034-opentelemetry-security-update.patch": "8efca1a64e8953a20c4b2d9f20dcd2619fa2c413f7c130adbe5382879ec96d12"
+    "patches/0034-opentelemetry-security-update.patch": "8efca1a64e8953a20c4b2d9f20dcd2619fa2c413f7c130adbe5382879ec96d12",
+    "patches/0036-no-read-compaction.patch": "be102f543e039f802fc3d87656d756d8da366b7eb57e98c2d345f3d688d03946"
   },
   "scope": "All pkg/ and cmd/ files plus main.go, LICENSE, go.mod and go.sum from the verified module ZIP. Documentation, integration tests and SDK examples are not included. local_files are JuiceMount-owned source with no upstream counterpart.",
   "upstream_url": "https://github.com/juicedata/juicefs/tree/v1.3.1",

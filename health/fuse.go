@@ -149,6 +149,7 @@ func MountLinkPolicy(p *netprofile.Profile, rc *RouteCeiling, routeTarget string
 		"buffer_size_mb", pol.BufferSizeMB,
 		"prefetch", pol.Prefetch,
 		"demand_first", slices.Contains(linkArgs, "--demand-first"),
+		"read_compaction", !slices.Contains(linkArgs, "--no-read-compaction"),
 		"nfs_readahead", p.NFSReadahead())
 	return pol, linkArgs
 }
@@ -226,8 +227,16 @@ func desktopJuiceFSObjectIOArgs(class netprofile.LinkClass) []string {
 // --demand-first by Class (on for every class except fast).
 // TestJuiceFSLivePolicyMatchesMountArgs checks the follower against this
 // function on real profiles.
+//
+// --no-read-compaction (juicefs patch 0036) is set when
+// netprofile.JuiceFSReadCompaction says no: a read away from the backend
+// never starts a compaction of the chunk it reads.
 func desktopJuiceFSLinkArgs(p *netprofile.Profile) []string {
-	return append(desktopJuiceFSObjectIOArgs(p.ReadPolicyClass()), desktopJuiceFSDemandFirstArgs(p.Class())...)
+	args := append(desktopJuiceFSObjectIOArgs(p.ReadPolicyClass()), desktopJuiceFSDemandFirstArgs(p.Class())...)
+	if !p.JuiceFSReadCompaction() {
+		args = append(args, "--no-read-compaction")
+	}
+	return args
 }
 
 // desktopJuiceFSSmallUploadArgs gives small saves upload slots of their own
