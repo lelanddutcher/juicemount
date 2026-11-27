@@ -54,19 +54,22 @@ func TestJFSLinkPolicyExchange(t *testing.T) {
 		sent = append([]byte(nil), msg...)
 		return reply, nil
 	}}
-	reply = append([]byte{0}, encodeLinkPolicy(abroadPolicy)...)
-	got, err := c.linkPolicy(&abroadPolicy)
-	if err != nil || got != abroadPolicy {
+	set := abroadPolicy
+	set.ReadaheadMiB = 32
+	reply = append([]byte{0}, encodeLinkPolicy(set, jfsLinkPolicyVersion2)...)
+	got, err := c.linkPolicy(&set)
+	if err != nil || got != set {
 		t.Fatalf("set: %+v %v", got, err)
 	}
-	if binary.BigEndian.Uint32(sent) != 1106 || binary.BigEndian.Uint32(sent[4:]) != 11 {
+	if binary.BigEndian.Uint32(sent) != 1106 || binary.BigEndian.Uint32(sent[4:]) != 15 {
 		t.Fatalf("header % x", sent[:8])
 	}
-	wantBody := []byte{1, 1, 0, 0x02, 0xbf, 0x20, 0, 0x04, 0x93, 0xe0, 2} // v1, demand, 180000 ms, 300000 ms, 2
+	// v2, demand, 180000 ms, 300000 ms, 2 retries, 32768 KiB read-ahead
+	wantBody := []byte{2, 1, 0, 0x02, 0xbf, 0x20, 0, 0x04, 0x93, 0xe0, 2, 0, 0, 0x80, 0}
 	if !bytes.Equal(sent[8:], wantBody) {
 		t.Fatalf("body % x, want % x", sent[8:], wantBody)
 	}
-	if _, err := c.linkPolicy(nil); err != nil || len(sent) != 9 || sent[8] != 1 {
+	if _, err := c.linkPolicy(nil); err != nil || len(sent) != 9 || sent[8] != 2 {
 		t.Fatalf("query: % x %v", sent, err)
 	}
 	reply = []byte{byte(syscall.ENOTSUP)}
@@ -81,6 +84,150 @@ func TestJFSLinkPolicyExchange(t *testing.T) {
 	// (pkg/vfs/internal.go default); to the bare query that means unsupported.
 	if _, err := c.linkPolicy(nil); !errors.Is(err, errControlUnsupported) {
 		t.Fatalf("EINVAL to the query: %v, want unsupported", err)
+	}
+}
+
+// A juicefs with patch 0027 but not 0035 refuses version 2 and answers
+// version 1: the app keeps version 1 from then on, without read-ahead.
+func TestJFSLinkPolicyFallsBackToVersion1(t *testing.T) {
+	var sent [][]byte
+	c := &jfsControl{testExchange: func(msg []byte, n int) ([]byte, error) {
+		sent = append(sent, append([]byte(nil), msg...))
+		if msg[8] != 1 {
+			return []byte{byte(syscall.EINVAL)}, nil
+		}
+		if len(msg) == 9 {
+			return append([]byte{0}, encodeLinkPolicy(lanPolicy, jfsLinkPolicyVersion)...), nil
+		}
+		return append([]byte{0}, msg[9:]...), nil
+	}}
+	got, err := c.linkPolicy(nil)
+	want := lanPolicy
+	want.ReadaheadMiB = -1
+	if err != nil || got != want || len(sent) != 2 || sent[0][8] != 2 || sent[1][8] != 1 {
+		t.Fatalf("query: %+v %v, %d messages", got, err, len(sent))
+	}
+	set := abroadPolicy
+	set.ReadaheadMiB = 32
+	got, err = c.linkPolicy(&set)
+	want = abroadPolicy
+	want.ReadaheadMiB = -1
+	if err != nil || got != want || len(sent) != 3 || sent[2][8] != 1 || len(sent[2]) != 8+11 {
+		t.Fatalf("set: %+v %v, last % x", got, err, sent[len(sent)-1])
+	}
+}
+
+// juicefs read-ahead starts off and changes only after the same request
+// held for readaheadHoldFor, both ways; a flicker changes nothing.
+func TestLinkHysteresisReadahead(t *testing.T) {
+	var h linkHysteresis
+	t0 := time.Unix(1000, 0)
+	at := func(s float64) time.Time { return t0.Add(time.Duration(s * float64(time.Second))) }
+	hold := readaheadHoldFor.Seconds()
+	on, off, unknown := lanPolicy, lanPolicy, lanPolicy
+	on.ReadaheadMiB, unknown.ReadaheadMiB = 16, -1
+	if got := h.observe(at(0), on); got.ReadaheadMiB != 0 {
+		t.Fatalf("first request applied at once: %d", got.ReadaheadMiB)
+	}
+	if got := h.observe(at(hold-2), on); got.ReadaheadMiB != 0 {
+		t.Fatal("on before the hold")
+	}
+	if got := h.observe(at(hold), on); got.ReadaheadMiB != 16 {
+		t.Fatalf("on after the hold: %d", got.ReadaheadMiB)
+	}
+	// One metered reading (off) on a near link changes nothing.
+	h.observe(at(hold+2), off)
+	if got := h.observe(at(hold+4), on); got.ReadaheadMiB != 16 {
+		t.Fatalf("a flicker off turned read-ahead off: %d", got.ReadaheadMiB)
+	}
+	if got := h.observe(at(hold+6), off); got.ReadaheadMiB != 16 {
+		t.Fatal("off at once")
+	}
+	if got := h.observe(at(2*hold+6), unknown); got.ReadaheadMiB != 0 {
+		t.Fatalf("off (and not known counts as off) after the hold: %d", got.ReadaheadMiB)
+	}
+	// A link that is mostly metered with a near reading now and then stays off.
+	for i := 0; i < 100; i++ {
+		w := off
+		if i%4 == 0 {
+			w = on
+		}
+		if got := h.observe(at(100+float64(i)*2), w); got.ReadaheadMiB != 0 {
+			t.Fatalf("flicker turned read-ahead on at tick %d", i)
+		}
+	}
+}
+
+// Not measured yet (-1) is off, and a first low reading does not delay the
+// read-ahead beyond the hold (lab 2026-11-27: one early metered reading kept
+// it off for linkFasterHold).
+func TestLinkHysteresisReadaheadFirstReadingMetered(t *testing.T) {
+	var h linkHysteresis
+	t0 := time.Unix(1000, 0)
+	unknown, metered, on := lanPolicy, lanPolicy, lanPolicy
+	unknown.ReadaheadMiB, on.ReadaheadMiB = -1, 16
+	tick := func(i int, p jfsLinkPolicy) int {
+		return h.observe(t0.Add(time.Duration(i)*linkFollowTick), p).ReadaheadMiB
+	}
+	for i := 0; i < 5; i++ {
+		if got := tick(i, unknown); got != 0 {
+			t.Fatalf("not known: %d", got)
+		}
+	}
+	tick(5, metered)
+	i := 6
+	for ; i < 40 && tick(i, on) == 0; i++ {
+	}
+	if waited := time.Duration(i-6) * linkFollowTick; waited != readaheadHoldFor {
+		t.Fatalf("on after %s of near readings, want %s", waited, readaheadHoldFor)
+	}
+}
+
+// The follower sends the read-ahead the link asks for, and stops asking a
+// juicefs that cannot set it.
+func TestLinkFollowerReadahead(t *testing.T) {
+	j := &fakeJFS{cur: lanPolicy}
+	class := [2]netprofile.LinkClass{netprofile.ClassFast, netprofile.ClassFast}
+	ra := 32
+	var sawOn bool
+	var reports []bool
+	f := newTestFollower(j, &class)
+	f.readahead = func(on bool) int { sawOn = on; return ra }
+	f.engineRA = func(on bool) { reports = append(reports, on) }
+	t0 := time.Unix(1000, 0)
+	now := t0
+	run := func(d time.Duration) {
+		for end := now.Add(d); now.Before(end); now = now.Add(linkFollowTick) {
+			f.tick(now)
+		}
+	}
+	run(readaheadHoldFor + linkFollowTick)
+	if len(j.sets) != 1 || j.cur.ReadaheadMiB != 32 {
+		t.Fatalf("on: sets %+v", j.sets)
+	}
+	f.tick(now)
+	if !sawOn {
+		t.Fatal("the follower did not tell the link rule read-ahead is on")
+	}
+	ra = 0
+	run(readaheadHoldFor + linkFollowTick)
+	if len(j.sets) != 2 || j.cur.ReadaheadMiB != 0 {
+		t.Fatalf("off: sets %+v", j.sets)
+	}
+	if len(reports) != 2 || !reports[0] || reports[1] {
+		t.Fatalf("reports to the estimator %v, want [true false]", reports)
+	}
+
+	old := &fakeJFS{cur: jfsLinkPolicy{GetTimeout: time.Minute, PutTimeout: time.Minute, IORetries: 10, ReadaheadMiB: -1}}
+	old.cur.DemandFirst = false
+	f = newTestFollower(old, &class)
+	ra = 32
+	f.readahead = func(bool) int { return ra }
+	for i := 0; i < 40; i++ {
+		f.tick(t0.Add(time.Duration(i) * linkFollowTick))
+	}
+	if len(old.sets) != 0 || old.queries != 2 {
+		t.Fatalf("juicefs without 0035: %d sets %+v, %d queries (want none and 2)", len(old.sets), old.sets, old.queries)
 	}
 }
 
@@ -240,8 +387,8 @@ func TestLinkFollowerStopsOnOldJuiceFSAndRetriesErrors(t *testing.T) {
 	}
 }
 
-// An old juicefs answers EINVAL: the follower asks once and stops, instead of
-// one warning in its log every 2 s.
+// An old juicefs answers EINVAL: the follower asks once in each version and
+// stops, instead of one warning in its log every 2 s.
 func TestLinkFollowerStopsOnEINVALFromOldJuiceFS(t *testing.T) {
 	sent := 0
 	c := &jfsControl{testExchange: func(msg []byte, n int) ([]byte, error) {
@@ -256,8 +403,8 @@ func TestLinkFollowerStopsOnEINVALFromOldJuiceFS(t *testing.T) {
 	for i := 0; i < 600; i++ {
 		f.tick(t0.Add(time.Duration(i) * linkFollowTick))
 	}
-	if !f.unsupported || sent != 1 {
-		t.Fatalf("unsupported %v after %d messages, want true after 1", f.unsupported, sent)
+	if !f.unsupported || sent != 2 {
+		t.Fatalf("unsupported %v after %d messages, want true after 2 (version 2, then 1)", f.unsupported, sent)
 	}
 }
 
@@ -336,5 +483,35 @@ func TestLinkFollowerQuietBeforeJuiceFSAnswers(t *testing.T) {
 	f.tick(t0.Add(linkStartupGrace))
 	if warnings != 1 {
 		t.Fatalf("juicefs never answered: %d warnings after the grace, want 1", warnings)
+	}
+}
+
+// While juicefs reads ahead for a mount, the NFS layer's read-ahead on that
+// mount schedules nothing; on another mount, or once juicefs stops, it does.
+func TestNFSReadaheadYieldsToJuiceFS(t *testing.T) {
+	root := t.TempDir()
+	run := func() int64 {
+		rm := NewReadaheadManager(root, nil, nil)
+		defer rm.Stop()
+		for i := 0; i < 10; i++ {
+			rm.OnRead(42, int64(i)*readaheadBlockSize, readaheadBlockSize, "f.mov")
+		}
+		triggered, _ := rm.Stats()
+		return triggered
+	}
+	if run() == 0 {
+		t.Fatal("control: no read-ahead on a sequential pattern")
+	}
+	setJFSReadaheadActive(root, true)
+	t.Cleanup(func() { setJFSReadaheadActive(root, false) })
+	if got := run(); got != 0 {
+		t.Fatalf("juicefs reads ahead: the NFS layer scheduled %d rounds, want 0", got)
+	}
+	if jfsReadaheadActive(root + "-other") {
+		t.Fatal("the flag leaked to another mount")
+	}
+	setJFSReadaheadActive(root, false)
+	if run() == 0 {
+		t.Fatal("juicefs stopped: the NFS layer did not resume")
 	}
 }

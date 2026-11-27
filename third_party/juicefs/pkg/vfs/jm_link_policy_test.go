@@ -50,7 +50,7 @@ func TestJMLinkPolicyMessageRefusals(t *testing.T) {
 	before := linkMsg(v, []byte{jmLinkPolicyVersion})
 	for name, body := range map[string][]byte{
 		"empty":      {},
-		"version 2":  {2},
+		"version 3":  {3},
 		"short":      linkSet(1, 60000, 60000, 3)[:6],
 		"long":       append(linkSet(1, 60000, 60000, 3), 0),
 		"get 0":      linkSet(1, 0, 60000, 3),

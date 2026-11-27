@@ -4,6 +4,33 @@
 
 ### App
 
+- One file reads faster on a near remote link (a Mac away from home over a
+  direct Tailscale path, about 12 ms). macFUSE hands JuiceFS one read of a
+  file at a time, so only about 1 MiB of a clip was on the link at once: the
+  laptop read one file at 128–156 Mbit/s over a path that carries
+  303 Mbit/s. The bundled JuiceFS (patch 0035, `-jm19`) can now read ahead
+  for a sequential reader while the volume is mounted, and the app turns
+  that on (16 MiB) when the link is near (round trip under 100 ms) and not
+  metered, after the same answer held for 10 s. A reader gets it only after
+  it has read 8 MiB in a row, so previews and scrubbing fetch nothing extra.
+  Far, thin and metered links keep today's behaviour. While JuiceFS reads
+  ahead, the app's own NFS read-ahead on that volume stands back, and the
+  bandwidth estimate (which then reads low) no longer makes the link
+  metered. In the Linux remote lab with a macFUSE model, 12 ms and 300 Mbit/s
+  through a tunnel: the next clip of a session read at 180–213 Mbit/s
+  (before: 117–132), the first clip at 136–167 (before: 123–128); lan
+  490–558 → 613–695; abroad and a thin near link unchanged.
+  `JM_JFS_READAHEAD_MB` sets the size; 0 turns it off. The Mac still needs
+  the laptop run.
+
+- JuiceFS no longer answers "input/output error" to a read whose data had
+  already arrived. A cleanup could drop a finished block buffer while a read
+  still waited on it, and patch 0030 turned that into an error. The lab saw
+  6–41 such reads in 30 s of one sequential read (the Linux kernel retried
+  most of them). The app's NFS layer retries a failed cold read, so on the
+  Mac they would mostly have cost a second read; the laptop has not
+  measured it.
+
 - Playing a clip while a teammate saves it no longer stalls as often on a
   far link (finding R1). Each part of the teammate's save used to change the
   file's modification time the Mac sees, and the Mac then threw away the

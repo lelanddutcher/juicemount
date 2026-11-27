@@ -46,6 +46,9 @@ type jfsControl struct {
 	// turned out to be missing (a juicefs without patch 0033).
 	fallback    *jfsControl
 	laneMissing atomic.Bool
+	// linkV1Only: juicefs refused version 2 of the link policy message (no
+	// patch 0035); jfs_link_policy.go speaks version 1 from then on.
+	linkV1Only atomic.Bool
 	// testExchange replaces the file exchange in tests; testLocked replaces
 	// it while the channel's lock is held.
 	testExchange func(msg []byte, replyLen int) ([]byte, error)

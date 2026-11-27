@@ -157,6 +157,15 @@ type ReadaheadManager struct {
 	prefetched int64
 }
 
+// SetPrefetchReadAt routes every speculative pread through read, in the
+// same pieces as without it. Lab probes only (test/remote-lab): the macFUSE
+// model runs one read of a file at a time, read-ahead included. Call it
+// before the first OnRead.
+func (rm *ReadaheadManager) SetPrefetchReadAt(read func(*os.File, []byte, int64) (int, error)) {
+	rm.prefetchReadAt = read
+	rm.chunkWithHook = true
+}
+
 // effectivePolicy returns the link-aware readahead policy, falling back to the
 // historical hard-coded defaults when no profile is wired (nil-safe).
 func (rm *ReadaheadManager) effectivePolicy() netprofile.ReadaheadPolicy {
@@ -338,6 +347,11 @@ func (rm *ReadaheadManager) OnRead(inode uint64, offset int64, size int, filePat
 	// so a live policy change can trigger on the next read. Production's metered
 	// policy is enabled but guarded and limited to one block/one worker.
 	if !policy.Enabled {
+		return
+	}
+	// juicefs reads ahead for this mount now (patch 0035): it does this
+	// job closer to the link; see jfsReadaheadOn.
+	if jfsReadaheadActive(rm.fusePath) {
 		return
 	}
 

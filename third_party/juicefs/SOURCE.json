@@ -2,12 +2,12 @@
   "archive_sha256": "9351a0655185f4a48accae2ae3af70db932de1ee38acfa4f153e3050b817806d",
   "binary": {
     "bundle_path": "Contents/MacOS/juicefs",
-    "ldflags": "-s -w -X github.com/juicedata/juicefs/pkg/version.revision=e0032b2ae5e9-jm18 -X github.com/juicedata/juicefs/pkg/version.revisionDate=2025-12-02",
+    "ldflags": "-s -w -X github.com/juicedata/juicefs/pkg/version.revision=e0032b2ae5e9-jm19 -X github.com/juicedata/juicefs/pkg/version.revisionDate=2025-12-02",
     "package": ".",
     "tags": "nogateway,nowebdav,nocos,nobos,nohdfs,noibmcos,noobs,nooss,noqingstor,nosftp,noswift,noazure,nogs,noufile,nob2,nonfs,nodragonfly,nosqlite,nomysql,nopg,notikv,nobadger,noetcd",
     "upstream_commit": "e0032b2ae5e9603403ca955eed7d05426f6f2f8c",
     "upstream_tag": "v1.3.1",
-    "version_output": "juicefs version 1.3.1+2025-12-02.e0032b2ae5e9-jm18"
+    "version_output": "juicefs version 1.3.1+2025-12-02.e0032b2ae5e9-jm19"
   },
   "files": {
     "LICENSE": {
@@ -1075,7 +1075,7 @@
       "upstream_sha256": "72e176b7c4e2c3a3fcd93646998235a93197298d8f6ca12742eccac53bd869b8"
     },
     "pkg/vfs/reader.go": {
-      "sha256": "1b104480b4f6a0de96d18842395d6b8109d41b891ecd91537619ad18886bb392",
+      "sha256": "05cc71f6ed7f3e97bb174af8fbf0842ecf0cb784d99f12fbc5a7dc6d47461d2d",
       "upstream_sha256": "0daec90c25b4ce8872423bb4d5541cf752f45f5110381ab1c822116a2461a60d"
     },
     "pkg/vfs/vfs.go": {
@@ -1172,12 +1172,14 @@
     "pkg/vfs/jm_control_lane_test.go": "83d6da7b3bb713cf438e84c65b43b4f16a3d78d8a83019622e46480e450eadd6",
     "pkg/vfs/jm_create_files.go": "574ace818067f4ed273d2d978eb4619d7d574ba9888519fd9bb5bd16982656d2",
     "pkg/vfs/jm_create_files_test.go": "ad0fd6a4a49b514d7edeaa83f6c2076ece903ca763f3c860e014c201e9379ec0",
-    "pkg/vfs/jm_link_policy.go": "99e7a16e7dd86292cfce58886e7cfcba1a2ea364fca3eb15a5e73a54f9b3fc03",
-    "pkg/vfs/jm_link_policy_test.go": "e4679b72c143a5962c51c9f4e55e1965186a73aec7c7f98501bbdf1afa0d181b",
+    "pkg/vfs/jm_link_policy.go": "e5f8a86ee50079efea8fe34c4a77421325f1b9ae5ef1f87d48e4fadc6095c477",
+    "pkg/vfs/jm_link_policy_test.go": "a62d78c0e46e93d12fcade92423b4924513def0c063b312fc72882d5130beb7c",
     "pkg/vfs/jm_pin.go": "2f229860b5593348913bcbb5903d17d759f9826f5da8517ef6c01a66f783c39c",
     "pkg/vfs/jm_pin_test.go": "cf3bf39834e7b130c755cdeb5aa0712f8eebe947a73e3aacf762904f93277f2b",
     "pkg/vfs/jm_read_recover.go": "abdf2ac8cbb6ee55f65edf4ed59afd5041d7ea55a525cca8bbbefc5f27118af5",
     "pkg/vfs/jm_read_recover_test.go": "746c9d865680dfe67e07686045cad3cdd16e00e0cddbd8cacebf65416bc5ff92",
+    "pkg/vfs/jm_readahead.go": "a1a5fc935d2bf034d1432107af5280448a5af6a17e4243abeeeeea8c6ae2c554",
+    "pkg/vfs/jm_readahead_test.go": "c49f8e82e47ef04c4a32f4921bff669610333d1937cf1a921df687ade9cea06d",
     "pkg/vfs/jm_refresh.go": "3c20b6fda0973596b4843e39b70043040fb3f6b004fa85e92c50c5e873ebd3e2",
     "pkg/vfs/jm_refresh_test.go": "cb424118e8c0d986055e128333d20d6db424d6e3bfe23a970b253cf46feb971f",
     "pkg/vfs/jm_upload_lane.go": "c35d3cda2fa958933f21e1e39a2f48ce4605ccb2e6d2e6e53fe6ceaecbf670b1",
@@ -1219,7 +1221,8 @@
     "patches/0031-refresh-open-file.patch": "677428d084f6a0f8012eb467351493e239f5dd51b52d114c189dc1534cce5ab6",
     "patches/0032-refresh-keeps-current-buffers.patch": "ff7fc37fc4d10d4db24bdf65d25a4d5a786badbc7cfccb8a4d8331980bef67ab",
     "patches/0033-control-lane.patch": "7366007504ddf3be56cd4a27e18d55a371649db8119c8d7fc4dbb17b03a73c91",
-    "patches/0034-opentelemetry-security-update.patch": "8efca1a64e8953a20c4b2d9f20dcd2619fa2c413f7c130adbe5382879ec96d12"
+    "patches/0034-opentelemetry-security-update.patch": "8efca1a64e8953a20c4b2d9f20dcd2619fa2c413f7c130adbe5382879ec96d12",
+    "patches/0035-live-readahead.patch": "c65b82c12c1724f83fbbf5537d31c916959eca05644d842937ca074357aea510"
   },
   "scope": "All pkg/ and cmd/ files plus main.go, LICENSE, go.mod and go.sum from the verified module ZIP. Documentation, integration tests and SDK examples are not included. local_files are JuiceMount-owned source with no upstream counterpart.",
   "upstream_url": "https://github.com/juicedata/juicefs/tree/v1.3.1",
