@@ -201,6 +201,10 @@ func dataCacheFlags() []cli.Flag {
 			Usage: "serve reads that wait before prefetch: own ranged GETs, prefetch deferred (JuiceMount)",
 		},
 		&cli.BoolFlag{
+			Name:  "no-read-compaction",
+			Usage: "a read never starts a compaction of the chunk it reads (JuiceMount)",
+		},
+		&cli.BoolFlag{
 			Name:  "writeback",
 			Usage: "upload blocks in background",
 		},

@@ -646,6 +646,9 @@ func mount(c *cli.Context) error {
 
 	store := chunk.NewCachedStore(blob, *chunkConf, registerer)
 	registerMetaMsg(metaCli, store, chunkConf)
+	if g, ok := metaCli.(meta.JMReadCompactionGate); ok && c.Bool("no-read-compaction") {
+		g.JMSetReadCompaction(false) // JuiceMount patch 0036
+	}
 
 	err = metaCli.NewSession(true)
 	if err != nil {

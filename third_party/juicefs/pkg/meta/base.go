@@ -233,6 +233,7 @@ type baseMeta struct {
 	of           *openfiles
 	removedFiles map[Ino]bool
 	compacting   map[uint64]bool
+	jmNoReadComp atomic.Bool // JuiceMount patch 0036: no compaction started by a Read (jm_read_compaction.go)
 	maxDeleting  chan struct{}
 	dslices      chan Slice // slices to delete
 	symlinks     *symlinkCache
@@ -1684,7 +1685,7 @@ func (m *baseMeta) Read(ctx Context, inode Ino, indx uint32, slices *[]Slice) (s
 	if ss, ok, raw := m.of.ReadPrefetched(inode, indx, openAttrReuse); ok {
 		*slices = ss
 		// A list seeded by Open: compact as if this Read had fetched it.
-		if raw > 0 && !m.conf.ReadOnly && (raw >= 5 || len(ss) >= 5) {
+		if raw > 0 && !m.conf.ReadOnly && (raw >= 5 || len(ss) >= 5) && m.jmReadCompaction() {
 			go m.compactChunk(inode, indx, false, false)
 		}
 		return 0
@@ -1713,7 +1714,7 @@ func (m *baseMeta) Read(ctx Context, inode Ino, indx uint32, slices *[]Slice) (s
 
 	*slices = buildSlice(ss)
 	m.of.jmCacheChunkAt(inode, indx, *slices, of, gen) // JuiceMount patch 0032
-	if !m.conf.ReadOnly && (len(ss) >= 5 || len(*slices) >= 5) {
+	if !m.conf.ReadOnly && (len(ss) >= 5 || len(*slices) >= 5) && m.jmReadCompaction() {
 		go m.compactChunk(inode, indx, false, false)
 	}
 	return 0

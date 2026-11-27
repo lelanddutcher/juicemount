@@ -4,6 +4,24 @@
 
 ### App
 
+- A Mac away from the NAS no longer repacks a teammate's file when it reads
+  it. JuiceFS repacks ("compacts") a part of a file that was written in 5 or
+  more pieces whenever it reads that part: it downloads every piece and
+  uploads the merged result. For a 48 MiB file saved in 48 pieces that is
+  about 50 MB down and 50 MB up, even to read a few bytes, and abroad it
+  takes minutes. When the teammate's own JuiceFS, near the NAS, repacked the
+  same part first, the Mac's upload was thrown away ("compaction ... is
+  wasted"): on a remote laptop this cost about 100 MB once per session. Now
+  the app turns read compaction off unless the link is medium or fast, the
+  round trip is short and the route is not a tunnel (bundled juicefs patch
+  0036, `-jm19`); it follows the live link class. Writers near the NAS and
+  the server's scheduled `gc --compact` still repack. Reads are unchanged:
+  compaction is never needed for a read to be correct.
+  `JM_JFS_READ_COMPACTION=1` restores compaction on every link. In the Linux
+  remote lab abroad (200 ms, 1 % loss, 30 Mbit/s) a first read of such a
+  file moved 1 MB instead of 51 MB down and 50–55 MB up; on lan nothing
+  changed. The Mac still needs the laptop run.
+
 - Playing a clip while a teammate saves it no longer stalls as often on a
   far link (finding R1). Each part of the teammate's save used to change the
   file's modification time the Mac sees, and the Mac then threw away the

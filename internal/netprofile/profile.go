@@ -792,6 +792,30 @@ func (p *Profile) Class() LinkClass {
 	return c
 }
 
+// JuiceFSReadCompaction reports whether the bundled juicefs may compact a
+// fragmented chunk when it reads one (juicefs patch 0036). A compaction
+// downloads every slice of the chunk and uploads the merged result: about
+// 50 MB each way for a 48 MiB file a teammate wrote in 48 pieces. Its commit
+// fails, and the upload is thrown away, when another client compacts the
+// same chunk first. On a remote laptop (2026-11-26, a 12 ms tunnel) the
+// teammate's own juicefs, near the server, did so 2-6 s after the Mac's
+// read, every time. So a read compacts only
+// near the backend: class medium or fast, low latency, and no route ceiling
+// (no tunnel, no failed route lookup). Elsewhere the writer's own compaction
+// and gc --compact on the server keep slice counts bounded.
+//
+// JM_JFS_READ_COMPACTION=1 is the field rollback: reads compact on every
+// link, as upstream.
+func (p *Profile) JuiceFSReadCompaction() bool {
+	if os.Getenv("JM_JFS_READ_COMPACTION") == "1" {
+		return true
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	c, _ := p.classLocked()
+	return c >= ClassMedium && !p.highLatency && p.routeCeilingLocked() == nil
+}
+
 // ReadPolicyClass is the class that decides how much the app may download
 // speculatively (read-ahead, JuiceFS prefetch). It is Class(), except on a
 // link the slow-RTT floor kept at ClassSlow (far, measured under 3 MiB/s, no
