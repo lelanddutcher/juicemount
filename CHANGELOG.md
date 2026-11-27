@@ -4,6 +4,16 @@
 
 ### App
 
+- Engine-direct, step 1 (off by default). The app can start the bundled
+  juicefs as a helper process with no mount (`juicefs jm-engine`, bundled
+  juicefs patch 0037, `-jm22`), watch it over a private local socket, restart
+  it if it dies or stops answering, and stop it on quit. In this step the
+  helper is read-only, has no cache and carries no user data; the macFUSE
+  path is unchanged. The helper gets the Redis password and the object key
+  through a private pipe, not its environment. Turn it on for a test with
+  `defaults write com.juicemount.app engineLevel -string shadow` (or
+  `JM_ENGINE=shadow` for the command-line server); unset is today's
+  behaviour. The helper's log is `juicefs-engine.log` beside `juicefs.log`.
 - JuiceFS no longer answers "input/output error" to a read whose data had
   already arrived. A cleanup could drop a finished block buffer while a read
   still waited on it, and the read-error retry change (bundled JuiceFS patch

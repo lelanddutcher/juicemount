@@ -365,6 +365,13 @@ type ServerConfig struct {
 	// the key in the volume `setting`).
 	ObjectAccessKey string `json:"object_access_key,omitempty"`
 	ObjectSecretKey string `json:"object_secret_key,omitempty"`
+
+	// EngineLevel is the engine-direct switch (JM_ENGINE): "" or "fuse" is
+	// today's behaviour; "shadow" also runs an idle, read-only engine
+	// helper beside the FUSE path (step 1; bridge/engine_shadow.go). A
+	// hidden preference: defaults write com.juicemount.app engineLevel
+	// -string shadow. Empty falls back to the JM_ENGINE environment.
+	EngineLevel string `json:"engine_level,omitempty"`
 }
 
 // Resolve the legacy spool environment at admission, once, so validation and
@@ -1159,6 +1166,8 @@ func nfsServerStartSerialized(configJSON *C.char, recovery *servingDesiredRecord
 	// A retained manager still owns the old mount and its recovery work. A
 	// new configuration cannot redirect that ownership to another path.
 	requestedConfig := cfg
+	// The engine level does not select the FUSE child or its generation.
+	requestedConfig.EngineLevel = ""
 	ownerMode, scopeErr := selectedOwnerMode()
 	if scopeErr != nil {
 		return C.CString("error: " + scopeErr.Error())
@@ -3048,6 +3057,9 @@ func nfsServerStartSerialized(configJSON *C.char, recovery *servingDesiredRecord
 		}
 	})
 
+	// Engine-direct step 1: an idle helper beside FUSE when the level says so.
+	startEngineShadowLocked(cfg, privatePaths.FUSELog)
+
 	// A2 — kick off the post-mount self-test in the background so it doesn't
 	// block the Swift Start completion handler (a slow probe shouldn't gate
 	// the UI flipping to "running"). Results land in selfTestLast and Swift
@@ -4001,6 +4013,9 @@ func shutdownServer(allowPending bool) C.int {
 	if !quiesceServerSerialized(30 * time.Second) {
 		return 0
 	}
+	// The NFS volume is gone and its handler quiesced: no engine call is in
+	// flight. Stop the helper before FUSE (engine-direct design 2.7).
+	stopEngineShadow()
 	if fuse != nil {
 		result := stopManagedFUSE(fuse)
 		if !result.Complete() {

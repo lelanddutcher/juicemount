@@ -73,6 +73,11 @@ public enum NFSBridge {
         /// uses the key in the volume settings (before the server's switch).
         public var objectAccessKey: String = ""
         public var objectSecretKey: String = ""
+        /// Engine-direct switch (`JM_ENGINE`). nil = today's behaviour; the
+        /// key is then absent from the JSON. "shadow" runs an idle,
+        /// read-only engine helper beside the FUSE path (step 1). Hidden:
+        /// `defaults write com.juicemount.app engineLevel -string shadow`.
+        public var engineLevel: String? = nil
 
         enum CodingKeys: String, CodingKey {
             case redisURL = "redis_url"
@@ -101,6 +106,7 @@ public enum NFSBridge {
             case netNASAddr = "net_nas_addr"
             case objectAccessKey = "object_access_key"
             case objectSecretKey = "object_secret_key"
+            case engineLevel = "engine_level"
         }
 
         public init(
@@ -175,6 +181,7 @@ public enum NFSBridge {
             nativePreviewWarm = try values.decodeIfPresent(Bool.self, forKey: .nativePreviewWarm) ?? false
             objectAccessKey = try values.decodeIfPresent(String.self, forKey: .objectAccessKey) ?? ""
             objectSecretKey = try values.decodeIfPresent(String.self, forKey: .objectSecretKey) ?? ""
+            engineLevel = try values.decodeIfPresent(String.self, forKey: .engineLevel)
         }
     }
 

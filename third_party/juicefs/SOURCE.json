@@ -2,12 +2,12 @@
   "archive_sha256": "9351a0655185f4a48accae2ae3af70db932de1ee38acfa4f153e3050b817806d",
   "binary": {
     "bundle_path": "Contents/MacOS/juicefs",
-    "ldflags": "-s -w -X github.com/juicedata/juicefs/pkg/version.revision=e0032b2ae5e9-jm20 -X github.com/juicedata/juicefs/pkg/version.revisionDate=2025-12-02",
+    "ldflags": "-s -w -X github.com/juicedata/juicefs/pkg/version.revision=e0032b2ae5e9-jm22 -X github.com/juicedata/juicefs/pkg/version.revisionDate=2025-12-02",
     "package": ".",
     "tags": "nogateway,nowebdav,nocos,nobos,nohdfs,noibmcos,noobs,nooss,noqingstor,nosftp,noswift,noazure,nogs,noufile,nob2,nonfs,nodragonfly,nosqlite,nomysql,nopg,notikv,nobadger,noetcd",
     "upstream_commit": "e0032b2ae5e9603403ca955eed7d05426f6f2f8c",
     "upstream_tag": "v1.3.1",
-    "version_output": "juicefs version 1.3.1+2025-12-02.e0032b2ae5e9-jm20"
+    "version_output": "juicefs version 1.3.1+2025-12-02.e0032b2ae5e9-jm22"
   },
   "files": {
     "LICENSE": {
@@ -127,7 +127,7 @@
       "upstream_sha256": "3abc87d6df0d7a0003eead25019494e1925f7ced7638760a212d3b61fb26b692"
     },
     "cmd/main.go": {
-      "sha256": "93cbd901160b393ecd7d66c8c27cf9d032f4bd92822e7fbef9205ed4f918d09e",
+      "sha256": "14feaa5142349d3add17c9511a9b85b3b74175a576a736e7a180b3c2b5d2a9b4",
       "upstream_sha256": "93cbd901160b393ecd7d66c8c27cf9d032f4bd92822e7fbef9205ed4f918d09e"
     },
     "cmd/main_test.go": {
@@ -1108,6 +1108,7 @@
     }
   },
   "local_files": {
+    "cmd/jm_engine.go": "49411022662bbb95505d536e4b3539695e20bcb634439cd45922516e69160ec8",
     "cmd/jm_fence.go": "11959cce13a1e10985fed61e172cff969bd04c1d8200ab79e723d611b9210b33",
     "pkg/chunk/demand_first.go": "568b12cddfe47830985e8774214b3123316a3b268b385d4c998e1e9c1675d790",
     "pkg/chunk/demand_first_test.go": "7ed56d3b9ae0b73535c18b563a7206618c24b39f0ff699ab90e81833b316b0b4",
@@ -1126,6 +1127,13 @@
     "pkg/fuse/rename_flags_darwin_test.go": "7e0310f26eefc94f8cf34d6a70d966887284da82b10500bef1660a16d0ff61db",
     "pkg/fuse/rename_flags_other.go": "f3a884c000c11d5d2df8436accbf1fb0f14f2ee134f0e72a705961595fa93233",
     "pkg/fuse/rename_flags_other_test.go": "9bd48e6423b2c88e37f9217eee5f0697afff8935c266fb18c81fd9dee65dcb8d",
+    "pkg/jmengine/peer_darwin.go": "01d15bdaecf072d2235d0bd9dab4a1ba7dea709a82c24663a4cb0a7804c61dc1",
+    "pkg/jmengine/peer_linux.go": "9cad03baf72d92816eedc89981ae5239f5dbc5832a317a9daf5f47ef6ef340b9",
+    "pkg/jmengine/peer_other.go": "9d97fc58eabc7789c911599e6df833a8eef4ac315effeaf71e6c499114963644",
+    "pkg/jmengine/server.go": "9e366b45996e62c7829508e7dc3035cb8bf981304f5dd5da43dd0f9281121a12",
+    "pkg/jmengine/server_test.go": "c25bf4d68b8039bc803c45cfef36442f05a38f7ad5b8b22c108233311017c79b",
+    "pkg/jmengine/wire/wire.go": "78eba391623b8a626d13ac9d3e9c2137f9e284959fb6fa4b0efdd7c801cc3daa",
+    "pkg/jmengine/wire/wire_test.go": "2bc7cab06cf4e85cd9a3f8d4054128cd0560b954224ae6ce2900a5d8f3f87327",
     "pkg/jmsignal/jmsignal.go": "f06bc817d1e03cd66d10159ad282057ce22aa64ce0fa89562c6e3b06b37d3348",
     "pkg/meta/jm_create_file.go": "6d1b6c2c87c5c121a12e45dbf040a7ae411bde505dc40b077dc8845664f0db1d",
     "pkg/meta/jm_open_round_trips_test.go": "099ccb8f92b9197be9fdea95e49a0d7c5fedb8918d39559083d9e9c8c71e0591",
@@ -1222,7 +1230,8 @@
     "patches/0032-refresh-keeps-current-buffers.patch": "ff7fc37fc4d10d4db24bdf65d25a4d5a786badbc7cfccb8a4d8331980bef67ab",
     "patches/0033-control-lane.patch": "7366007504ddf3be56cd4a27e18d55a371649db8119c8d7fc4dbb17b03a73c91",
     "patches/0034-opentelemetry-security-update.patch": "8efca1a64e8953a20c4b2d9f20dcd2619fa2c413f7c130adbe5382879ec96d12",
-    "patches/0036-no-read-compaction.patch": "be102f543e039f802fc3d87656d756d8da366b7eb57e98c2d345f3d688d03946"
+    "patches/0036-no-read-compaction.patch": "be102f543e039f802fc3d87656d756d8da366b7eb57e98c2d345f3d688d03946",
+    "patches/0037-engine-helper.patch": "0dd4c0f29d2fd90a55b3474a050290ef844e9433d6e12ed34844774a503670a8"
   },
   "scope": "All pkg/ and cmd/ files plus main.go, LICENSE, go.mod and go.sum from the verified module ZIP. Documentation, integration tests and SDK examples are not included. local_files are JuiceMount-owned source with no upstream counterpart.",
   "upstream_url": "https://github.com/juicedata/juicefs/tree/v1.3.1",

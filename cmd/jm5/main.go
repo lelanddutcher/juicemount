@@ -24,6 +24,7 @@ import (
 	"github.com/lelanddutcher/juicemount/health"
 	"github.com/lelanddutcher/juicemount/internal/cache/pin"
 	"github.com/lelanddutcher/juicemount/internal/cplane"
+	"github.com/lelanddutcher/juicemount/internal/enginehost"
 	"github.com/lelanddutcher/juicemount/internal/jmlog"
 	"github.com/lelanddutcher/juicemount/internal/manager"
 	"github.com/lelanddutcher/juicemount/internal/metrics"
@@ -489,6 +490,23 @@ func main() {
 	}
 	jmlog.Info("nfs server listening", "addr", srv.Addr())
 
+	// Engine-direct step 1: JM_ENGINE=shadow runs an idle, read-only engine
+	// helper beside the FUSE path. Unset or "fuse" changes nothing.
+	var engineShadow *enginehost.Supervisor
+	if level, err := enginehost.ParseLevel(os.Getenv("JM_ENGINE")); err != nil {
+		jmlog.Warn("JM_ENGINE ignored; no engine helper", "error", err.Error())
+	} else if level == enginehost.LevelShadow {
+		bin := juiceFSBin
+		if bin == "" {
+			bin = health.ResolveJuiceFSBinary()
+		}
+		args, metaPassword := health.EngineHelperArgs(*redisURL, *bucketOverride)
+		engineShadow = enginehost.StartShadow(enginehost.Config{
+			Bin: bin, Args: args, Env: health.EngineHelperEnvironment(), MetaPassword: metaPassword,
+			LogPath: filepath.Join(stateDir, "juicefs-engine.log"),
+		})
+	}
+
 	// Wire per-RPC observation into the metrics package.
 	jmlibnfs.SetObserver(metrics.ObserveRPC)
 
@@ -684,6 +702,9 @@ func main() {
 	if projectLeases != nil {
 		projectLeases.Stop() // StopHandler proved the original drainer has joined.
 	}
+	// No engine call is in flight once the handler stopped (step 1 makes
+	// none). Stop the helper before FUSE (design 2.7).
+	enginehost.StopShadow(engineShadow)
 
 	if mgrJobMgr != nil {
 		// Cancel in-flight migrations before tearing down the FUSE mount;
