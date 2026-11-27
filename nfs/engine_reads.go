@@ -136,11 +136,28 @@ func (h *JuiceMountHandler) SetEngineReads(src EngineReadSource) {
 		old.close()
 	}
 	if p != nil {
-		jmlog.Info("engine reads on: READ misses read through the engine socket (JM_ENGINE=reads)")
+		// Read-ahead blocks stay on the mount door by default. Lab,
+		// fast-remote: one 4 MiB block read through the socket is slower
+		// than the mount's (the kernel splits it into parallel reads):
+		// sequential 158-187 Mbit/s through the socket, 216-225 through the
+		// mount, 226-230 with the level off; through the socket on the
+		// demand reads' own handle it also delayed their first byte (0.45
+		// vs 0.13-0.16 s). JM_ENGINE_PREFETCH=1 reads them through the
+		// socket instead.
+		prefetch := os.Getenv("JM_ENGINE_PREFETCH") == "1"
+		jmlog.Info("engine reads on: READ misses read through the engine socket (JM_ENGINE=reads)",
+			"readahead_through_engine", prefetch)
 		if h.readahead != nil {
-			h.readahead.setEngineSource(p)
+			// Rule 5 (read a block in pieces so a demand read of the file
+			// does not queue behind it in macFUSE) has no purpose now:
+			// demand reads do not go through macFUSE.
+			h.readahead.demandOnEngine.Store(true)
+			if prefetch {
+				h.readahead.setEngineSource(p)
+			}
 		}
 	} else if h.readahead != nil {
+		h.readahead.demandOnEngine.Store(false)
 		h.readahead.setEngineSource(nil)
 	}
 }

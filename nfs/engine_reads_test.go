@@ -414,3 +414,48 @@ func waitEngineCounts(t *testing.T, cl *fakeEngineClient, opens, releases, live 
 		time.Sleep(5 * time.Millisecond)
 	}
 }
+
+// At level reads, read-ahead blocks stay on the mount (measured faster) and
+// are read in one call: demand reads no longer queue behind them in macFUSE.
+func TestEngineReadsKeepReadaheadOnTheMount(t *testing.T) {
+	t.Setenv("JM_ENGINE_PREFETCH", "")
+	jfs, _, _, _ := engineHarness(t)
+	rm := jfs.handler.readahead
+	if rm == nil {
+		t.Skip("no read-ahead manager in this harness")
+	}
+	if rm.engine.Load() != nil {
+		t.Fatal("read-ahead reads through the socket by default")
+	}
+	if !rm.demandOnEngine.Load() {
+		t.Fatal("rule 5 still on at level reads")
+	}
+	f, err := os.CreateTemp(t.TempDir(), "blk")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if _, err := f.Write(bytes.Repeat([]byte{2}, readaheadBlockSize)); err != nil {
+		t.Fatal(err)
+	}
+	calls := 0
+	rm2 := &ReadaheadManager{demandFirst: func() bool { return true }, chunkWithHook: true,
+		prefetchReadAt: func(fd *os.File, b []byte, off int64) (int, error) { calls++; return fd.ReadAt(b, off) }}
+	rm2.demandOnEngine.Store(true)
+	if n, _, err := rm2.readBlock(f, make([]byte, readaheadBlockSize), 0, nil, nil); n != readaheadBlockSize || (err != nil && err != io.EOF) {
+		t.Fatalf("block: %d %v", n, err)
+	}
+	if calls != 1 {
+		t.Fatalf("%d reads for one block at level reads, want 1", calls)
+	}
+	jfs.handler.SetEngineReads(nil)
+	if rm.demandOnEngine.Load() {
+		t.Fatal("rule 5 stays off after the level is turned off")
+	}
+	t.Setenv("JM_ENGINE_PREFETCH", "1")
+	src := &engineSource{cl: newFakeEngineClient(), epoch: 1, ready: true}
+	jfs.handler.SetEngineReads(src.get)
+	if rm.engine.Load() == nil {
+		t.Fatal("JM_ENGINE_PREFETCH=1 does not read ahead through the socket")
+	}
+}

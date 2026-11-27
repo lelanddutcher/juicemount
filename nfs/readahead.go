@@ -80,6 +80,9 @@ type ReadaheadManager struct {
 	fdPool   *FDPool // reuse pooled fds instead of opening new ones
 	// engine is the step-2 handle pool (JM_ENGINE=reads); nil = FUSE.
 	engine atomic.Pointer[engineHandlePool]
+	// demandOnEngine: demand reads go through the engine socket
+	// (JM_ENGINE=reads), so a block need not be read in pieces (rule 5).
+	demandOnEngine atomic.Bool
 	// Acceptance-only: never let a local foreground cache hit schedule a
 	// speculative FUSE read behind the zero-byte remote-content guard.
 	refuseFUSEContentReads bool
@@ -583,11 +586,12 @@ func (g *blockGate) drop() {
 // estimate (the waits are not link time). A test hook, when set, gets the
 // whole block unless chunkWithHook is set. The caller drops g at the end.
 //
-// Rule 5 is off for an engine source: reads of one file run side by side on
-// the engine socket, so a demand read never queues behind a block there.
+// Rule 5 is off for an engine source, and whenever demand reads go through
+// the engine socket: a demand read then never queues behind a block in
+// macFUSE.
 func (rm *ReadaheadManager) readBlock(fd prefetchSource, buf []byte, off int64, g *blockGate, cancel func() bool) (n int, active time.Duration, err error) {
 	_, isEngine := fd.(*enginePrefetch)
-	isFUSE := !isEngine
+	isFUSE := !isEngine && !rm.demandOnEngine.Load()
 	if (rm.prefetchReadAt != nil && !rm.chunkWithHook) || !rm.demandFirstOn() || len(buf) <= demandChunk || !isFUSE {
 		t0 := time.Now()
 		n, err = rm.readPiece(fd, buf, off)
