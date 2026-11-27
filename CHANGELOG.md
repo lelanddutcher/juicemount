@@ -16,8 +16,8 @@
   round trip is short and the route is not a tunnel (bundled juicefs patch
   0036, `-jm19`); it follows the live link class. Every writer still repacks a
   part at 99 pieces, so slice counts stay bounded; readers near the NAS
-  still repack too. The Manager's compact schedule (off by default) can
-  repack on the NAS without WAN traffic. Reads are unchanged:
+  still repack too. The Manager's weekly compact (on by default, see
+  Server) repacks on the NAS without WAN traffic. Reads are unchanged:
   compaction is never needed for a read to be correct.
   `JM_JFS_READ_COMPACTION=1` restores compaction on every link. In the Linux
   remote lab abroad (200 ms, 1 % loss, 30 Mbit/s) a first read of such a
@@ -774,6 +774,25 @@
 
 ### Server
 
+- The Manager's Compact sweep (`juicefs gc --compact`) is now on by default,
+  weekly on Sunday at 03:00. Since the app stopped repacking on read away
+  from the NAS (patch 0036), nothing repacked a teammate's file that was
+  saved in many small pieces unless a Mac near the NAS read it. The sweep
+  repacks on the NAS, next to the data, and sends nothing over the
+  internet. It applies to new installs and to installs that never saved a
+  Compact choice; a saved choice (Off or another cadence) always wins.
+  Times are in the Manager's zone: UTC unless `TZ` is set in `server/.env`
+  (now passed to the Manager); the Maintenance tab shows the next run in the
+  browser's time. Scheduled GC, FSCK and Compact never run at once: a sweep
+  that finds another one running waits for it (at most 6 hours, then skips).
+  A run missed while the Manager is down is not made up. Cost: a Mac away
+  from the NAS that had a repacked part cached downloads that part again
+  once, when it next reads it. In the Linux remote lab (6 files of 48 MiB in
+  48 pieces each, 2 files written in one piece) the sweep took 1.3 s, moved
+  304 MB in and 317 MB out of the object store and 0 bytes over the WAN,
+  and every file read back correct; a remote client that had all 8 files
+  cached then downloaded 302 MB (the 6 repacked files) and nothing for the
+  2 others. A second sweep with nothing to repack took 0.7 s.
 - New installs made by `juicemount-setup` give each approved Mac its own
   object-store key, and a revoke removes that key within about 3 seconds.
   Setup writes both switches, a key admin secret and the `per-mac` profile
