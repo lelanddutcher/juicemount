@@ -28,7 +28,12 @@
 #     The Manager stores the secret, clears needs_secret for the key in
 #     desired.json, and only then deletes the file.
 #   applied.json        keyd -> Manager. No secrets. Built from what MinIO
-#     reports (`svcacct ls` and `svcacct info`), never from desired.json:
+#     reports (`svcacct ls` and `svcacct info`), never from desired.json.
+#     `exists` comes from this cycle's `svcacct ls`. The other fields come
+#     from `svcacct info`: read at once for a key keyd has not read before
+#     (a new key) and again when its last read is JM_KEYD_REVERIFY seconds
+#     old (at most REVERIFY_MAX keys per cycle), so a cycle does not slow
+#     down by one mc call per live key:
 #     {"seq":N,"verified_ms":N,"error":"...","keys":[{"name":"...",
 #      "exists":true,"status":"on","parent":"jm-macs","implied_policy":true}]}
 #   keyd-created-seq    keyd only. "<name> <seq>[ p|c]" per line: the desired
@@ -89,6 +94,8 @@
 #   JM_KEYD_ONCE                1 = run one cycle and exit (tests)
 #   JM_KEYD_HOLD_MAX            seconds a stop waits for a key create,
 #                               default 50 (tests set it lower)
+#   JM_KEYD_REVERIFY            seconds before a key's svcacct info is read
+#                               again for applied.json, default 30
 #   MC                          default mc
 #
 # Uses bash builtins, mc, and coreutils mkdir/chmod/mv/rm/date/sleep only
@@ -113,6 +120,8 @@ DIR="${JM_OBJKEYS_DIR:-/var/lib/jm-objkeys}"
 INTERVAL="${JM_KEYD_INTERVAL:-2}"
 ONCE="${JM_KEYD_ONCE:-0}"
 HOLD_MAX="${JM_KEYD_HOLD_MAX:-50}"
+REVERIFY="${JM_KEYD_REVERIFY:-30}"
+REVERIFY_MAX=3
 ALIAS=jmkeyd
 
 log() { echo "[keyd] $*" >&2; }
@@ -150,6 +159,7 @@ case "$KA_AK" in
 esac
 [[ "$INTERVAL" =~ ^[1-9][0-9]{0,3}$ ]] || die "JM_KEYD_INTERVAL must be a whole number of seconds"
 [[ "$HOLD_MAX" =~ ^[1-9][0-9]?$ ]] || die "JM_KEYD_HOLD_MAX must be 1-99 seconds"
+[[ "$REVERIFY" =~ ^(0|[1-9][0-9]{0,3})$ ]] || die "JM_KEYD_REVERIFY must be a whole number of seconds"
 
 urlenc() {
 	local s="$1" out='' c i
@@ -416,6 +426,7 @@ remove_key() {
 		log "svcacct rm $name failed: $MSG"
 		return 1
 	fi
+	ic_drop "$name"
 	log "removed $name"
 	return 0
 }
@@ -466,6 +477,7 @@ create_key_held() {
 		return 1
 	fi
 	sk=''
+	ic_drop "$name"
 	set_flag "$name" p
 	log "created $name"
 	return 0
@@ -943,18 +955,58 @@ apply() {
 	return 0
 }
 
+# The last svcacct info of each live key, one line per key:
+# "<name> <status> <parent> <implied> <SECONDS when read>" ("-" for an empty
+# field). A line goes when the key leaves `svcacct ls`, is removed or is
+# created again. Plain strings: keyd stays within Bash 3.2.
+IC=''
+ic_get() { # name: IC_ST IC_PA IC_IM IC_T, or return 1
+	local re="$nl$1 ([^ ]+) ([^ ]+) (true|false) ([0-9]+)$nl"
+	[[ "$nl$IC" =~ $re ]] || return 1
+	IC_ST="${BASH_REMATCH[1]}" IC_PA="${BASH_REMATCH[2]}" IC_IM="${BASH_REMATCH[3]}" IC_T="${BASH_REMATCH[4]}"
+	[ "$IC_ST" != - ] || IC_ST=''
+	[ "$IC_PA" != - ] || IC_PA=''
+	return 0
+}
+ic_drop() { # name
+	local line keep=''
+	while IFS= read -r line; do
+		[ -n "$line" ] && [ "${line%% *}" != "$1" ] && keep+="$line$nl"
+	done <<<"$IC"
+	IC="$keep"
+}
+ic_prune() { # keep only keys in EXISTING
+	local line keep=''
+	while IFS= read -r line; do
+		[ -n "$line" ] && has "$EXISTING" "${line%% *}" && keep+="$line$nl"
+	done <<<"$IC"
+	IC="$keep"
+}
 write_applied() {
-	local names="$MANAGED" k entries='' sep='' err
+	local names="$MANAGED" k entries='' sep='' err fresh=0 st pa cached
 	[ -n "$SEQ_ERR" ] && [ -z "$ERR" ] && ERR="$SEQ_ERR"
 	err="${ERR//[\"\\]/}"
+	ic_prune
 	for k in $D_NAMES; do
 		has "$names" "$k" || names+="$k$nl"
 	done
 	for k in $names; do
 		if ! has "$EXISTING" "$k"; then
 			entries+="$sep{\"name\":\"$k\",\"exists\":false}"
+			sep=','
+			continue
+		fi
+		cached=0
+		ic_get "$k" && cached=1
+		if [ "$cached" = 1 ] && [ "$REVERIFY" -gt 0 ] &&
+			{ [ $((SECONDS - IC_T)) -lt "$REVERIFY" ] || [ "$fresh" -ge "$REVERIFY_MAX" ]; }; then
+			entries+="$sep{\"name\":\"$k\",\"exists\":true,\"status\":\"$IC_ST\",\"parent\":\"$IC_PA\",\"implied_policy\":$IC_IM}"
 		elif key_info "$k"; then
-			entries+="$sep{\"name\":\"$k\",\"exists\":true,\"status\":\"${I_STATUS//[\"\\]/}\",\"parent\":\"${I_PARENT//[\"\\]/}\",\"implied_policy\":$I_IMPLIED}"
+			[ "$cached" = 1 ] && fresh=$((fresh + 1))
+			st="${I_STATUS//[\"\\[:space:]]/}" pa="${I_PARENT//[\"\\[:space:]]/}"
+			ic_drop "$k"
+			IC+="$k ${st:--} ${pa:--} $I_IMPLIED $SECONDS$nl"
+			entries+="$sep{\"name\":\"$k\",\"exists\":true,\"status\":\"$st\",\"parent\":\"$pa\",\"implied_policy\":$I_IMPLIED}"
 		else
 			entries+="$sep{\"name\":\"$k\",\"exists\":true,\"status\":\"unknown\",\"parent\":\"\",\"implied_policy\":false}"
 		fi
@@ -972,6 +1024,16 @@ cycle() {
 	CREATE_ERR=''
 	D_NAMES=''
 	D_NEEDS=''
+	# The folder may be emptied while keyd runs (a restore, a cleanup by
+	# hand). Without results/ every create would be removed again as
+	# undeliverable until keyd restarted.
+	if [ ! -d "$DIR/results" ]; then
+		if mkdir -p "$DIR/results" && chmod 0700 "$DIR/results"; then
+			log "recreated $DIR/results (it was missing)"
+		else
+			log "cannot create $DIR/results"
+		fi
+	fi
 	list_keys || return 1
 	taken_results
 	if [ -f "$DIR/desired.json" ]; then

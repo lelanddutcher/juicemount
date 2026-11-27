@@ -27,7 +27,8 @@
 #      JuiceMount installs, the rendered compose (${VAR:?} guards, digest-pinned
 #      images, mounts) and free ports. Then it shows the plan and asks once.
 #   5. Generates every secret into <data>/compose/.env (0600, folder 0700),
-#      starts the stack and waits until the Manager answers.
+#      starts the stack and waits until the Manager answers. A new install
+#      has per-Mac object keys on: both switches set and minio-keyd started.
 #   6. Prints two lines on stdout: the Manager URL and the Manager sign-in key.
 #
 # Re-running is safe. A secret is never generated over an existing .env, and
@@ -65,6 +66,13 @@ SECRETS=(
   JM_PROXY_BG_PASSWORD:32 JM_PROXY_WEBDAV_PASSWORD:32 JM_PROXY_ADMIN_PASSWORD:32
   JM_OBJ_CLIENT_SECRET_KEY:20 JM_OBJ_GC_SECRET_KEY:20
 )
+# Per-Mac object keys (server/COMPOSE-ROLLOUT.md, "Per-Mac object keys"): a
+# new install starts with them on, so every approved Mac gets its own object
+# key and a revoke removes it. These lines go only into a new install's .env;
+# an existing install keeps what its .env says (no line = off), and
+# check_env does not require them.
+NEW_SECRETS=(JM_OBJ_KEYADMIN_SECRET_KEY:20)
+NEW_SETTINGS=(JM_OBJ_PER_MAC_SERVER=1 JM_OBJ_PER_MAC=1 COMPOSE_PROFILES=per-mac)
 DIGESTS=(JM_MANAGER_DIGEST JM_FARM_DIGEST JM_FARM_RENDER_DIGEST JM_RESPPROXY_DIGEST)
 SAFE_PATH_RE='^/[A-Za-z0-9._/-]*$'
 FIRST_PARTY_RE='lelanddutcher/(juicemount-manager|juicemount-migrator|jm-respproxy|juicefarm)'
@@ -449,13 +457,22 @@ dc() { "$DC" "$@"; }
 # never started, its other lines (such as JM_NET_SERVER_URL) are kept.
 write_check_env() { # path [existing .env]
   local spec k n v skip
-  skip="^($(printf '%s|' "${DIGESTS[@]}" "${SECRETS[@]%%:*}")JM_SETUP_[A-Z_]*)="
+  skip="^($(printf '%s|' "${DIGESTS[@]}" "${SECRETS[@]%%:*}" "${NEW_SECRETS[@]%%:*}")JM_SETUP_[A-Z_]*)="
   {
     if [ -n "${2:-}" ]; then
       grep -vE "$skip" "$2" || true
+      for spec in "${NEW_SECRETS[@]}"; do
+        k="${spec%%:*}" n="${spec##*:}"
+        if grep -q "^$k=" "$2"; then printf '%s=%s\n' "$k" "$(printf "%0$((n * 2))d" 0)"; fi
+      done
     else
       printf 'JM_FARM_STORAGE_CAPACITY_BYTES=%s\n' "$CAPACITY"
       printf 'JM_FARM_NODE_META_URL=redis://farm@%s:30179/1\n' "$HOST"
+      printf '%s\n' "${NEW_SETTINGS[@]}"
+      for spec in "${NEW_SECRETS[@]}"; do
+        k="${spec%%:*}" n="${spec##*:}"
+        printf '%s=%s\n' "$k" "$(printf "%0$((n * 2))d" 0)"
+      done
     fi
     for k in "${DIGESTS[@]}"; do v="DIG_$k"; printf '%s=%s\n' "$k" "${!v}"; done
     for spec in "${SECRETS[@]}"; do
@@ -508,7 +525,7 @@ write_env() { # path: a new .env, never over an existing one
   local tmp spec k n v sig
   local -a lines=()
   # Every secret is generated and checked before anything is written.
-  for spec in "${SECRETS[@]}"; do
+  for spec in "${SECRETS[@]}" "${NEW_SECRETS[@]}"; do
     k="${spec%%:*}" n="${spec##*:}"
     rand_hex "$n"
     lines+=("$k=$RAND")
@@ -528,6 +545,8 @@ write_env() { # path: a new .env, never over an existing one
       printf '%s\n' "${lines[@]}"
       printf 'JM_FARM_STORAGE_CAPACITY_BYTES=%s\n' "$CAPACITY"
       printf 'JM_FARM_NODE_META_URL=redis://farm@%s:30179/1\n' "$HOST"
+      printf '# Per-Mac object keys: on for this new install (COMPOSE-ROLLOUT.md, "Per-Mac object keys").\n'
+      printf '%s\n' "${NEW_SETTINGS[@]}"
     } > "$tmp"
   )
   # ln refuses an existing target: an install's .env is never replaced.
@@ -580,6 +599,11 @@ check_env() { # path: every key present and plausible
     [[ "$(env_get "$1" "$k")" =~ ^sha256:[0-9a-f]{64}$ ]] || die "$1 lacks a sha256 digest for $k."
   done
   [[ "$(env_get "$1" JM_FARM_STORAGE_CAPACITY_BYTES)" =~ ^[0-9]+$ ]] || die "$1 lacks JM_FARM_STORAGE_CAPACITY_BYTES."
+  # Per-Mac object keys: optional, but a switch that is on needs its key.
+  if [ "$(env_get "$1" JM_OBJ_PER_MAC_SERVER)" = 1 ]; then
+    [[ "$(env_get "$1" JM_OBJ_KEYADMIN_SECRET_KEY)" =~ ^[A-Za-z0-9]{32,40}$ ]] ||
+      die "$1 sets JM_OBJ_PER_MAC_SERVER=1 but lacks a usable JM_OBJ_KEYADMIN_SECRET_KEY (32-40 letters and digits). Restore it from your backup; juicemount-setup never generates a secret for an existing install."
+  fi
 }
 
 # ---- Redis append-only file and its ACL ---------------------------------------

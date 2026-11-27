@@ -612,13 +612,10 @@ func (f *fileReader) waitForIO(ctx meta.Context, reqs []*req, buf []byte) (int, 
 			if f.shouldStop() {
 				return 0, f.err
 			}
-			// JuiceMount patch 0030: a waited slice goes invalid only when
-			// its read failed. Another reader may already have cleared the
-			// stored error for a retry, so stop on the state as well, or this
-			// reader would wait on a slice that never finishes.
-			// Patch 0035: a slice that finished and was then dropped while
-			// this reader waited (drop marks a READY slice in use INVALID)
-			// holds all its bytes; the loop ends on them, no EIO.
+			// JuiceMount patch 0030: a waited slice goes invalid when its read
+			// failed (stop: the stored error may already be cleared for a retry)
+			// or when a drop marked it after it finished; it then holds all its
+			// bytes and the loop ends on them.
 			if !s.state.valid() && uint64(s.currentPos) < s.block.len {
 				return 0, syscall.EIO
 			}

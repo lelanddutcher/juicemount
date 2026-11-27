@@ -42,19 +42,7 @@
  	})
  }
  
-@@ -611,7 +616,10 @@
- 			// its read failed. Another reader may already have cleared the
- 			// stored error for a retry, so stop on the state as well, or this
- 			// reader would wait on a slice that never finishes.
--			if !s.state.valid() {
-+			// Patch 0035: a slice that finished and was then dropped while
-+			// this reader waited (drop marks a READY slice in use INVALID)
-+			// holds all its bytes; the loop ends on them, no EIO.
-+			if !s.state.valid() && uint64(s.currentPos) < s.block.len {
- 				return 0, syscall.EIO
- 			}
- 		}
-@@ -717,6 +725,7 @@
+@@ -717,6 +722,7 @@
  	maxRequests    int
  	maxRetries     uint32
  	jmServed       jmServedSet // JuiceMount patch 0032

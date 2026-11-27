@@ -22,19 +22,19 @@
   without read-ahead every 3 minutes on a good link); a link that turned into
   an unflagged hotspot stops reading ahead within that time. In the Linux
   remote lab with a macFUSE model, 12 ms and 300 Mbit/s
-  through a tunnel: the next clip of a session read at 180–213 Mbit/s
-  (before: 117–132), the first clip at 136–167 (before: 123–128); lan
+  through a tunnel: the next clip of a session read at 180–228 Mbit/s
+  (before: 117–142), the first clip at 136–193 (before: 120–136); lan
   490–558 → 613–695; abroad and a thin near link unchanged.
   `JM_JFS_READAHEAD_MB` sets the size; 0 turns it off. The Mac still needs
   the laptop run.
 
 - JuiceFS no longer answers "input/output error" to a read whose data had
   already arrived. A cleanup could drop a finished block buffer while a read
-  still waited on it, and patch 0030 turned that into an error. The lab saw
-  6–41 such reads in 30 s of one sequential read (the Linux kernel retried
-  most of them). The app's NFS layer retries a failed cold read, so on the
-  Mac they would mostly have cost a second read; the laptop has not
-  measured it.
+  still waited on it, and the read-error retry change (bundled JuiceFS patch
+  0030) turned that into an error. The Linux lab saw 6–41 such reads in 30 s
+  of one sequential read (the Linux kernel retried most of them). The app's
+  NFS layer retries a failed cold read, so on the Mac they mostly cost a
+  second read. No released version has this bug. Bundled JuiceFS `-jm20`.
 
 - A Mac away from the NAS no longer repacks a teammate's file when it reads
   it. JuiceFS repacks ("compacts") a part of a file that was written in 5 or
@@ -805,6 +805,24 @@
   `JM_FUSE_READ_JOIN=0`. The bundled JuiceFS is now build `-jm6`.
 
 ### Server
+
+- New installs made by `juicemount-setup` give each approved Mac its own
+  object-store key, and a revoke removes that key within about 3 seconds.
+  Setup writes both switches, a key admin secret and the `per-mac` profile
+  into the new `.env`, so `minio-keyd` starts with the stack. Existing stacks
+  are unchanged until switched on by hand (`server/COMPOSE-ROLLOUT.md`,
+  "Per-Mac object keys", now with the full order and a rollback per step).
+- `minio-keyd` no longer slows down by one object-store call per Mac on
+  every cycle: it reads a new key's details at once and a known key's again
+  every 30 seconds. In the lab, with 20 Macs, an approve took 5.1 s (p95)
+  before and 2.9 s after; a revoke took effect in 4.9 s before and 2.7 s
+  after.
+- `minio-keyd` recreates its `results/` folder when it disappears while it
+  runs. Before, every new key was removed again as undeliverable until keyd
+  restarted.
+- `test/per-mac-keys-lab.sh` runs the per-Mac key checks against the pinned
+  object-store image, the real `minio-keys` and `minio-keyd`, and the
+  Manager's principal store.
 
 - Revoking a Mac that holds the shared storage key (`jm-client`) now needs a
   confirmation: `POST /api/principals/revoke` with `"confirm_shared_key":

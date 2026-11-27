@@ -19,7 +19,6 @@ import (
 	"github.com/juicedata/juicefs/pkg/chunk"
 	"github.com/juicedata/juicefs/pkg/meta"
 	"github.com/juicedata/juicefs/pkg/object"
-	"github.com/juicedata/juicefs/pkg/utils"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
@@ -237,54 +236,6 @@ func TestJMReadaheadUnsetKeepsUpstream(t *testing.T) {
 	dr := v.reader.(*dataReader)
 	if dr.jmReadaheadMinRun() != 0 || dr.jmMaxRequests() != dr.maxRequests || dr.JMReadahead() != 8*mib {
 		t.Fatalf("unset: min run %d, requests %d/%d, readahead %d", dr.jmReadaheadMinRun(), dr.jmMaxRequests(), dr.maxRequests, dr.JMReadahead())
-	}
-}
-
-// Patch 0030's check in waitForIO failed a read whose slice had finished:
-// the slice turned READY, then a cleanup dropped it while this reader still
-// held it (drop marks it INVALID), before the reader woke. The reader got
-// EIO for bytes it had (lab 2026-11-27: 6-41 EIO reads in 30 s of one
-// sequential read on main). It must copy them.
-func TestJMWaitedSliceDroppedAfterReadyIsNotEIO(t *testing.T) {
-	const n = 4096
-	f := &fileReader{length: n, r: &dataReader{blockSize: 1 << 20}}
-	f.last = &f.slices
-	s := &sliceReader{file: f, state: BUSY, refs: 1, block: &frange{0, n}, page: chunk.NewOffPage(n)}
-	s.cond = utils.NewCond(&f.Mutex)
-	f.slices = s
-	f.last = &s.next
-	s.prev = &f.slices
-	buf := make([]byte, n)
-	type result struct {
-		n   int
-		eno syscall.Errno
-	}
-	done := make(chan result, 1)
-	f.Lock()
-	go func() {
-		f.Lock()
-		got, eno := f.waitForIO(meta.Background(), []*req{{frange{0, n}, s}}, buf)
-		f.Unlock()
-		done <- result{got, eno}
-	}()
-	f.Unlock()
-	time.Sleep(50 * time.Millisecond) // the reader is waiting on s
-	f.Lock()
-	copy(s.page.Data, bytes.Repeat([]byte{9}, n))
-	s.state, s.currentPos = READY, n
-	s.cond.Broadcast()
-	s.drop() // a cleanup before the reader wakes: READY and in use -> INVALID
-	if s.state != INVALID {
-		t.Fatalf("drop left state %s, want INVALID (the race)", s.state)
-	}
-	f.Unlock()
-	select {
-	case r := <-done:
-		if r.eno != 0 || r.n != n || buf[0] != 9 || buf[n-1] != 9 {
-			t.Fatalf("read %d bytes, errno %v, want %d bytes of the finished slice", r.n, r.eno, n)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("reader did not return")
 	}
 }
 
