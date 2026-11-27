@@ -40,6 +40,7 @@ type JuiceMountHandler struct {
 	fusePath       string                 // path to hidden JuiceFS FUSE mount
 	mountPoint     atomic.Pointer[string] // user-facing NFS mount; published with pinStore
 	cacheReader    atomic.Pointer[cache.Reader]
+	engineReads    atomic.Pointer[engineHandlePool] // JM_ENGINE=reads (engine_reads.go); nil = off
 	cacheBinding   atomic.Pointer[cacheBinding]
 	demandMu       sync.Mutex // handler-wide, including a replaced cache binding
 	demandActive   bool
@@ -2219,6 +2220,9 @@ func (h *JuiceMountHandler) stopHandlerWithDeadline(deadline time.Duration) bool
 	if h.fdPool != nil {
 		h.fdPool.Stop()
 	}
+	if p := h.engineReads.Swap(nil); p != nil {
+		p.close() // release the pooled engine handles; the door itself stays with its mount
+	}
 	h.stopDone = true
 	return true
 }
@@ -4120,7 +4124,10 @@ func (jfs *juiceFS) openFileExpected(filename string, flag int, perm os.FileMode
 		}
 	}
 
-	// Look up the entry to get inode and size for cache reads
+	// Look up the entry to get inode and size for cache reads. lookedUp
+	// is before the lookup: an engine handle opened later saw at least
+	// this state (engine_reads.go).
+	lookedUp := time.Now()
 	e := jfs.handler.store.LookupByPath(filename)
 
 	// Offline-mode gate: refuse OPEN of un-pinned files when offline.
@@ -4202,6 +4209,7 @@ func (jfs *juiceFS) openFileExpected(filename string, flag int, perm os.FileMode
 				memBuf:                jfs.handler.memBuf,
 				inode:                 e.Inode,
 				fileSize:              e.Size,
+				openedAt:              lookedUp,
 				pinned:                isPinned,
 				pinGeneration:         pinAdmission.Generation,
 				// QA-31 + HIGH-1 fix: value-copy snapshot, NOT a pointer
@@ -5905,9 +5913,11 @@ type cachedFile struct {
 	memBuf                *MemoryBuffer
 	inode                 uint64
 	fileSize              int64
-	fdMu                  sync.Mutex // guards lazy fuseFD acquisition and Close
+	fdMu                  sync.Mutex // guards lazy fuseFD and eng acquisition and Close
 	closed                bool
-	overlapOpen           atomic.Bool // startOverlappedOpen ran (open_overlap.go)
+	eng                   *engineHandle // JM_ENGINE=reads: the pooled engine handle (engine_reads.go)
+	openedAt              time.Time     // when the mirror row was read for this READ
+	overlapOpen           atomic.Bool   // startOverlappedOpen ran (open_overlap.go)
 
 	// Decided at OpenFile time: whether this file passed the pin check.
 	// Pinned files are allowed to fall through to FUSE during offline mode
@@ -6103,6 +6113,12 @@ func boundedFUSEReadCall(read func([]byte, int64) (int, error), p []byte, off in
 }
 
 func (f *cachedFile) boundedFUSEReadAt(p []byte, off int64) (int, error) {
+	if f.eng != nil {
+		// JM_ENGINE=reads: the same bound, data gate, demand gate and
+		// JUKEBOX join as a FUSE pread; the bytes come from the engine
+		// socket (engine_reads.go).
+		return joinOrReadFUSE(f.engineReadAt, f.pendingReadKey(off, len(p)), f.name, p, off, fuseReadTimeout())
+	}
 	return joinOrReadFUSE(f.fuseFD.ReadAt, f.pendingReadKey(off, len(p)), f.name, p, off, fuseReadTimeout())
 }
 
@@ -6111,12 +6127,13 @@ func (f *cachedFile) boundedFUSEReadAt(p []byte, off int64) (int, error) {
 // takes (AppleDouble ._ files, .DS_Store and the like), because a complete
 // read of one seeds that shared cache.
 func (f *cachedFile) pendingReadKey(off int64, n int) *pendingReadKey {
-	if f.cachedInfo == nil || f.fuseFD == nil || isAppleDoubleNFSPath(f.name) || cacheableMetaName(path.Base(f.name)) {
+	src := f.readSource()
+	if f.cachedInfo == nil || src == nil || isAppleDoubleNFSPath(f.name) || cacheableMetaName(path.Base(f.name)) {
 		return nil
 	}
 	return &pendingReadKey{
 		name: f.name, inode: f.inode, size: f.cachedInfo.size, mtime: f.cachedInfo.mtime.UnixNano(),
-		version: f.cacheIdentity.Version, fd: f.fuseFD, off: off, n: n,
+		version: f.cacheIdentity.Version, src: src, off: off, n: n,
 	}
 }
 
@@ -6602,10 +6619,11 @@ func (f *cachedFile) readAtRouted(p []byte, off int64, trace *cachedReadTrace) (
 		if trace != nil {
 			trace.FinalRoute = "fuse_offline"
 		}
-		if err := f.ensureFuseFDTraced(trace); err != nil {
+		if err := f.ensureReadSource(trace); err != nil {
 			logOfflineRefusal("read", "FUSE open failed while offline", f.name)
 			return 0, pin.ErrOfflineNotAvailable
 		}
+
 		// The bytes MIGHT be local — JuiceFS's own LRU has them (recently
 		// read/written/just-copied/pinned-and-warm), or the user toggled offline
 		// while the network is actually up (Redis/JuiceFS reachable, just don't
@@ -6620,6 +6638,17 @@ func (f *cachedFile) readAtRouted(p []byte, off int64, trace *cachedReadTrace) (
 		bound := offlineLocalReadTimeout
 		if f.pinned {
 			bound = offlinePinnedReadTimeout
+		}
+		var offlineRead func([]byte, int64) (int, error)
+		if e := f.eng; e != nil {
+			if trace != nil {
+				trace.FinalRoute = "engine_offline"
+			}
+			// The engine's own deadline is the bound: a block that is not
+			// local is cancelled with the call, not left running.
+			offlineRead = func(q []byte, o int64) (int, error) { return e.readAt(q, o, bound) }
+		} else {
+			offlineRead = f.fuseFD.ReadAt
 		}
 		// The private buffer is REQUIRED (see above) but need not be fresh:
 		// `make([]byte, len(p))` here cost a zeroed 1 MiB allocation per read on
@@ -6637,7 +6666,7 @@ func (f *cachedFile) readAtRouted(p []byte, off int64, trace *cachedReadTrace) (
 		if trace != nil {
 			fuseStart = time.Now()
 		}
-		bn, berr, done := readAtBounded(f.fuseFD, tmp, off, bound)
+		bn, berr, done := readAtCallBounded(offlineRead, tmp, off, bound, nil)
 		if trace != nil {
 			trace.FUSEReadNS += time.Since(fuseStart).Nanoseconds()
 		}
@@ -6675,6 +6704,7 @@ func (f *cachedFile) readAtRouted(p []byte, off int64, trace *cachedReadTrace) (
 	if trace != nil {
 		trace.FinalRoute = "fuse_online"
 	}
+	engineRoute := f.engineEligible()
 	var demandJob *readaheadMappingJob
 	if demandMappingMiss(trace) {
 		demandJob = f.handler.captureDemandMapping(f)
@@ -6684,7 +6714,14 @@ func (f *cachedFile) readAtRouted(p []byte, off int64, trace *cachedReadTrace) (
 			}
 		}()
 	}
-	if err := f.ensureFuseFDTraced(trace); err != nil {
+	if engineRoute {
+		if err := f.ensureReadSource(trace); err != nil {
+			return 0, f.handler.classifyBlipError(err)
+		}
+		if f.eng != nil && trace != nil {
+			trace.FinalRoute = "engine_online"
+		}
+	} else if err := f.ensureFuseFDTraced(trace); err != nil {
 		return 0, f.handler.classifyBlipError(err)
 	}
 	releaseQoS := defaultReadQoS.acquire(off, len(p))
@@ -6956,6 +6993,7 @@ func (f *cachedFile) Close() error {
 		return nil
 	}
 	f.closed = true
+	f.releaseEngine()
 	if f.fuseFD == nil {
 		return nil
 	}

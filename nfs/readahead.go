@@ -65,11 +65,24 @@ var windowBufPool = sync.Pool{New: func() any {
 	return &b
 }}
 
+// prefetchSource is what a read-ahead round reads through: the pooled FUSE
+// descriptor or, with JM_ENGINE=reads, an engine handle (engine_reads.go).
+type prefetchSource interface {
+	ReadAt([]byte, int64) (int, error)
+	Name() string
+	Stat() (os.FileInfo, error)
+}
+
 // ReadaheadManager detects sequential read patterns and triggers
 // background prefetch to warm the JuiceFS SSD cache.
 type ReadaheadManager struct {
 	fusePath string
 	fdPool   *FDPool // reuse pooled fds instead of opening new ones
+	// engine is the step-2 handle pool (JM_ENGINE=reads); nil = FUSE.
+	engine atomic.Pointer[engineHandlePool]
+	// demandOnEngine: demand reads go through the engine socket
+	// (JM_ENGINE=reads), so a block need not be read in pieces (rule 5).
+	demandOnEngine atomic.Bool
 	// Acceptance-only: never let a local foreground cache hit schedule a
 	// speculative FUSE read behind the zero-byte remote-content guard.
 	refuseFUSEContentReads bool
@@ -425,7 +438,7 @@ func (rm *ReadaheadManager) prefetch(filePath string, start, end int64, maxWorke
 }
 
 func (rm *ReadaheadManager) prefetchWithInode(inode uint64, filePath string, start, end int64, maxWorkers int) {
-	rm.runRound(inode, filePath, maxWorkers, func(fd *os.File, mapping *readaheadMappingJob) {
+	rm.runRound(inode, filePath, maxWorkers, func(fd prefetchSource, mapping *readaheadMappingJob) {
 		rm.serialBlocks(fd, mapping, start, end)
 	})
 }
@@ -434,7 +447,7 @@ func (rm *ReadaheadManager) prefetchWithInode(inode uint64, filePath string, sta
 // descriptor. It returns false when the round was shed before body ran.
 // Admission order: lifecycle, the per-link round budget, the global worker
 // semaphore, then one Read-QoS bulk token held for the whole round.
-func (rm *ReadaheadManager) runRound(inode uint64, filePath string, maxWorkers int, body func(*os.File, *readaheadMappingJob)) bool {
+func (rm *ReadaheadManager) runRound(inode uint64, filePath string, maxWorkers int, body func(prefetchSource, *readaheadMappingJob)) bool {
 	if rm.prefetchWorkerExit != nil {
 		defer rm.prefetchWorkerExit()
 	}
@@ -496,6 +509,19 @@ func (rm *ReadaheadManager) runRound(inode uint64, filePath string, maxWorkers i
 	func() {
 		defer qosRelease()
 
+		// JM_ENGINE=reads: read the blocks through the engine socket, by
+		// inode, with the same gates; FUSE when no socket is ready.
+		if pool := rm.engine.Load(); pool != nil && inode != 0 {
+			if src, release := pool.prefetchSource(inode); src != nil {
+				defer release()
+				if !rm.prefetchAllowed() {
+					return
+				}
+				ran = true
+				body(src, mapping)
+				return
+			}
+		}
 		// Use FDPool if available, otherwise fall back to direct open
 		var fd *os.File
 		var usePool bool
@@ -559,8 +585,14 @@ func (g *blockGate) drop() {
 // so far. active is the time spent inside the reads only, for the link
 // estimate (the waits are not link time). A test hook, when set, gets the
 // whole block unless chunkWithHook is set. The caller drops g at the end.
-func (rm *ReadaheadManager) readBlock(fd *os.File, buf []byte, off int64, g *blockGate, cancel func() bool) (n int, active time.Duration, err error) {
-	if (rm.prefetchReadAt != nil && !rm.chunkWithHook) || !rm.demandFirstOn() || len(buf) <= demandChunk {
+//
+// Rule 5 is off for an engine source, and whenever demand reads go through
+// the engine socket: a demand read then never queues behind a block in
+// macFUSE.
+func (rm *ReadaheadManager) readBlock(fd prefetchSource, buf []byte, off int64, g *blockGate, cancel func() bool) (n int, active time.Duration, err error) {
+	_, isEngine := fd.(*enginePrefetch)
+	isFUSE := !isEngine && !rm.demandOnEngine.Load()
+	if (rm.prefetchReadAt != nil && !rm.chunkWithHook) || !rm.demandFirstOn() || len(buf) <= demandChunk || !isFUSE {
 		t0 := time.Now()
 		n, err = rm.readPiece(fd, buf, off)
 		return n, time.Since(t0), err
@@ -614,9 +646,10 @@ func (rm *ReadaheadManager) pieceWaitMax() time.Duration {
 }
 
 // readPiece issues one prefetch ReadAt through the test hook when set.
-func (rm *ReadaheadManager) readPiece(fd *os.File, buf []byte, off int64) (int, error) {
+func (rm *ReadaheadManager) readPiece(fd prefetchSource, buf []byte, off int64) (int, error) {
 	if rm.prefetchReadAt != nil {
-		return rm.prefetchReadAt(fd, buf, off)
+		f, _ := fd.(*os.File) // nil for an engine source
+		return rm.prefetchReadAt(f, buf, off)
 	}
 	return fd.ReadAt(buf, off)
 }
@@ -681,7 +714,7 @@ func (rm *ReadaheadManager) blocksSlow() bool {
 
 // serialBlocks is the historical round: one 4 MB buffer, one ReadAt at a time
 // over [start, end). Fast, Medium and Metered use it unchanged.
-func (rm *ReadaheadManager) serialBlocks(fd *os.File, mapping *readaheadMappingJob, start, end int64) {
+func (rm *ReadaheadManager) serialBlocks(fd prefetchSource, mapping *readaheadMappingJob, start, end int64) {
 	buf := make([]byte, readaheadBlockSize)
 	for off := start; off < end; off += readaheadBlockSize {
 		if !rm.prefetchAllowed() {
@@ -987,7 +1020,7 @@ func (rm *ReadaheadManager) pumpWindow(inode uint64, tr *readTracker, filePath s
 		releaseRoundLocked(tr, gen)
 		rm.mu.Unlock()
 	}()
-	rm.runRound(inode, filePath, policy.Workers, func(fd *os.File, mapping *readaheadMappingJob) {
+	rm.runRound(inode, filePath, policy.Workers, func(fd prefetchSource, mapping *readaheadMappingJob) {
 		rm.windowBlocks(inode, tr, gen, fd, mapping, policy.Blocks)
 	})
 }
@@ -1001,7 +1034,7 @@ func (rm *ReadaheadManager) pumpWindow(inode uint64, tr *readTracker, filePath s
 // offline/Stop. When it stops claiming it releases pumping in the same
 // critical section as that decision where the decision depends on the
 // window, so a read that extends the window right then starts a new round.
-func (rm *ReadaheadManager) windowBlocks(inode uint64, tr *readTracker, gen uint64, fd *os.File, mapping *readaheadMappingJob, maxBlocks int) {
+func (rm *ReadaheadManager) windowBlocks(inode uint64, tr *readTracker, gen uint64, fd prefetchSource, mapping *readaheadMappingJob, maxBlocks int) {
 	done := make(chan windowResult, maxReadaheadWorkers)
 	inflight, claimedTotal := 0, 0
 	stopClaims := false
@@ -1142,7 +1175,7 @@ func (rm *ReadaheadManager) windowBlockCancel(inode uint64, tr *readTracker, off
 // windowBlock reads one aligned block while holding a background gate slot
 // (given back while it waits between pieces), and releases what it holds
 // exactly once.
-func (rm *ReadaheadManager) windowBlock(fd *os.File, off int64, gateRelease func(), done chan<- windowResult, cancel func() bool) {
+func (rm *ReadaheadManager) windowBlock(fd prefetchSource, off int64, gateRelease func(), done chan<- windowResult, cancel func() bool) {
 	if rm.afterPrefetchGate != nil {
 		rm.afterPrefetchGate()
 	}
@@ -1218,4 +1251,11 @@ func (rm *ReadaheadManager) Stop() {
 		log.Printf("readahead: stopped (triggered=%d, prefetched=%d blocks)",
 			triggered, prefetched)
 	})
+}
+
+// setEngineSource turns read-ahead through the engine on (non-nil) or off.
+func (rm *ReadaheadManager) setEngineSource(p *engineHandlePool) {
+	if rm != nil {
+		rm.engine.Store(p)
+	}
 }

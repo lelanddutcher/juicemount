@@ -76,7 +76,7 @@ $ juicefs mount redis://localhost /mnt/jfs -d --read-only
 
 # Disable metadata backup
 $ juicefs mount redis://localhost /mnt/jfs --backup-meta 0`,
-		Flags: expandFlags(mountFlags(), clientFlags(1.0), shareInfoFlags()),
+		Flags: append(expandFlags(mountFlags(), clientFlags(1.0), shareInfoFlags()), jmDoorFlags()...), // JuiceMount patch 0037
 	}
 }
 
@@ -663,6 +663,7 @@ func mount(c *cli.Context) error {
 	installHandler(metaCli, mp, v, blob)
 	v.UpdateFormat = updateFormat(c)
 	initBackgroundTasks(c, vfsConf, metaConf, metaCli, blob, registerer, registry)
+	jmStartEngineDoor(c, v, format, registry) // JuiceMount patch 0037: the engine socket ("both doors")
 	mountMain(v, c)
 	if err := v.FlushAll(""); err != nil {
 		logger.Errorf("flush all delayed data: %s", err)

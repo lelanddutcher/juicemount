@@ -1,5 +1,7 @@
 package health
 
+import "os"
+
 // Engine helper (engine-direct step 1, `JM_ENGINE=shadow`): the flags and
 // environment of `juicefs jm-engine`. The supervisor lives in
 // internal/enginehost; this file only shares the juicefs child policy of
@@ -38,4 +40,13 @@ func EngineHelperArgs(redisURL, bucketOverride string) (args []string, metaPassw
 		args = append(args, "--bucket", bucketOverride)
 	}
 	return args, metaPassword
+}
+
+// EngineDoor is the engine socket inside a juicefs mount child
+// (enginehost.Door, engine-direct step 2). Prepare is called before each
+// child starts and returns the mount flags and the descriptors to inherit
+// from firstFD on; Started is called once the child started or failed.
+type EngineDoor interface {
+	Prepare(firstFD int) (args []string, files []*os.File, err error)
+	Started(err error)
 }

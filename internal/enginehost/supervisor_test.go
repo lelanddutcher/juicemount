@@ -507,12 +507,12 @@ func TestHelperExitsWhenAppKilled(t *testing.T) {
 }
 
 func TestParseLevel(t *testing.T) {
-	for in, want := range map[string]Level{"": LevelFUSE, "fuse": LevelFUSE, " Shadow ": LevelShadow} {
+	for in, want := range map[string]Level{"": LevelFUSE, "fuse": LevelFUSE, " Shadow ": LevelShadow, "reads": LevelReads} {
 		if got, err := ParseLevel(in); err != nil || got != want {
 			t.Fatalf("ParseLevel(%q) = %v, %v", in, got, err)
 		}
 	}
-	for _, in := range []string{"reads", "direct", "bogus"} {
+	for _, in := range []string{"control", "direct", "bogus"} {
 		if got, err := ParseLevel(in); err == nil || got != LevelFUSE {
 			t.Fatalf("ParseLevel(%q) = %v, %v; want fuse and an error", in, got, err)
 		}

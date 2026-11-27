@@ -254,7 +254,7 @@ func resetPendingReads(t *testing.T) {
 var testFD = new(os.File)
 
 func readKey(name string, inode uint64, mtime int64, off int64, n int) *pendingReadKey {
-	return &pendingReadKey{name: name, inode: inode, size: 64 << 20, mtime: mtime, fd: testFD, off: off, n: n}
+	return &pendingReadKey{name: name, inode: inode, size: 64 << 20, mtime: mtime, src: testFD, off: off, n: n}
 }
 
 func waitPreadsDone(t *testing.T) {
@@ -483,7 +483,7 @@ func TestJUKEBOXJoinNeedsSameRead(t *testing.T) {
 	fp := newFakePread(0x22)
 	p := make([]byte, 4096)
 	other := *readKey("a", 1, 1, 0, 4096)
-	other.fd = new(os.File) // after a remount: a new descriptor
+	other.src = new(os.File) // after a remount: a new descriptor
 	for _, k := range []*pendingReadKey{
 		readKey("a", 1, 1, 0, 4096), readKey("a", 1, 1, 4096, 4096),
 		readKey("b", 2, 1, 0, 4096), readKey("a", 1, 1, 0, 1024), &other,
@@ -539,7 +539,7 @@ func TestCachedFilePendingReadKey(t *testing.T) {
 	f := &cachedFile{name: "dir/reel.mov", inode: 9, fuseFD: testFD, cachedInfo: &snapshotFileInfo{size: 77, mtime: mt}}
 	k := f.pendingReadKey(4096, 512)
 	if k == nil || k.name != "dir/reel.mov" || k.inode != 9 || k.size != 77 || k.mtime != mt.UnixNano() ||
-		k.fd != testFD || k.off != 4096 || k.n != 512 {
+		k.src != testFD || k.off != 4096 || k.n != 512 {
 		t.Fatalf("key = %+v", k)
 	}
 	if (&cachedFile{name: "dir/._reel.mov", fuseFD: testFD, cachedInfo: &snapshotFileInfo{}}).pendingReadKey(0, 1) != nil {

@@ -4,6 +4,19 @@
 
 ### App
 
+- Engine-direct, step 2 (off by default). At engine level `reads`, the
+  bundled `juicefs mount` also serves a private local socket (bundled juicefs
+  patch 0037, `-jm23`), and the app's file server reads file bytes through it
+  by file number instead of through the hidden macFUSE mount: one engine, one
+  cache, two ways in. A read no longer pays the macFUSE path lookups, and
+  reads of one file run side by side instead of one at a time. The app keeps
+  one open handle per file and closes it after 2 minutes unused. If the
+  socket is not ready, a read takes the macFUSE path as before. A teammate's
+  edit still reaches open files through the refresh message, as today. Turn
+  it on for a test with `defaults write com.juicemount.app engineLevel
+  -string reads` (or `JM_ENGINE=reads` for the command-line server); it takes
+  effect at the next full start of the volume. The shadow helper of step 1 is
+  now restarted when its inputs change (another level, bucket or object key).
 - Engine-direct, step 1 (off by default). The app can start the bundled
   juicefs as a helper process with no mount (`juicefs jm-engine`, bundled
   juicefs patch 0037, `-jm22`), watch it over a private local socket, restart
