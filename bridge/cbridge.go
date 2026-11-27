@@ -1166,8 +1166,11 @@ func nfsServerStartSerialized(configJSON *C.char, recovery *servingDesiredRecord
 	// A retained manager still owns the old mount and its recovery work. A
 	// new configuration cannot redirect that ownership to another path.
 	requestedConfig := cfg
-	// The engine level does not select the FUSE child or its generation.
-	requestedConfig.EngineLevel = ""
+	// The engine level selects the FUSE child only at level reads, where the
+	// mount opens the engine socket (engine-direct step 2). A change to or
+	// from reads therefore waits for a full restart, as other mount settings
+	// do; fuse and shadow do not touch the mount.
+	requestedConfig.EngineLevel = engineFUSEKey(cfg)
 	ownerMode, scopeErr := selectedOwnerMode()
 	if scopeErr != nil {
 		return C.CString("error: " + scopeErr.Error())
@@ -1627,6 +1630,7 @@ func nfsServerStartSerialized(configJSON *C.char, recovery *servingDesiredRecord
 			ObjectKey:    health.ObjectKey{AccessKey: cfg.ObjectAccessKey, SecretKey: cfg.ObjectSecretKey},
 			RouteTarget:  backendRouteTarget(routePolicyURL),
 			LinkRTT:      linkMountRTT(linkNode, linkProbeURL),
+			EngineDoor:   engineDoorForMount(cfg),
 		})
 		if err != nil {
 			generationErr = fmt.Errorf("reserve FUSE generation: %w", err)
@@ -2166,6 +2170,7 @@ func nfsServerStartSerialized(configJSON *C.char, recovery *servingDesiredRecord
 	// initialized cache/Redis/presence state.
 	h := srv.Handler()
 	cacheOwner.attach(rc, h, cachePaths)
+	attachEngineReads(h) // JM_ENGINE=reads: READ misses go through the engine socket
 	jmlog.Info("STARTUP-TRACE: B-post-cacheReader")
 	h.SetRedisClient(rc)
 	// Persistence belongs to the selected cache session and is available
@@ -4024,6 +4029,7 @@ func shutdownServer(allowPending bool) C.int {
 			jmlog.Warn("shutdown incomplete: FUSE dependencies retained", "result", result.String(), "reason", outcome.Reason)
 			return 0
 		}
+		closeEngineDoor() // the mount that served the socket is gone
 	} else if owner != nil {
 		globalMu.Lock()
 		if globalOwnerStopID == "" {

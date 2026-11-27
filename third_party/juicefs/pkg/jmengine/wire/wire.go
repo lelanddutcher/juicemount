@@ -17,7 +17,8 @@
 //
 //	status u32 (0 or an errno of this host) | flags u16 | reserved u16 | body_len u32
 //
-// Step 1 bodies are JSON. Later steps send file bytes raw after the header.
+// Bodies are JSON, except OpRead: its request body is binary (ReadRequest)
+// and its reply body is the raw file bytes (step 2, "reads").
 package wire
 
 import (
@@ -26,12 +27,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 )
 
 // Protocol version. A different major is refused by both sides.
 const (
 	ProtoMajor = 1
-	ProtoMinor = 0
+	// ProtoMinor 1 (step 2): open, read, release.
+	ProtoMinor = 1
 )
 
 const (
@@ -43,6 +46,8 @@ const (
 	MaxReplyBody = 8 << 20
 	// MaxStartMessage bounds the start message on the private pipe.
 	MaxStartMessage = 64 << 10
+	// MaxReadLen bounds one OpRead (the reply must fit MaxReplyBody).
+	MaxReadLen = 4 << 20
 )
 
 // Op is one engine operation.
@@ -54,6 +59,9 @@ const (
 	OpStats    Op = 3
 	OpGetAttr  Op = 4
 	OpShutdown Op = 5
+	OpOpen     Op = 6 // step 2
+	OpRead     Op = 7 // step 2
+	OpRelease  Op = 8 // step 2
 )
 
 // String names an operation for logs and the hello's list.
@@ -69,6 +77,12 @@ func (o Op) String() string {
 		return "getattr"
 	case OpShutdown:
 		return "shutdown"
+	case OpOpen:
+		return "open"
+	case OpRead:
+		return "read"
+	case OpRelease:
+		return "release"
 	}
 	return fmt.Sprintf("op%d", uint16(o))
 }
@@ -145,10 +159,20 @@ func ReadRequest(rd io.Reader) (Request, error) {
 	return r, nil
 }
 
-// WriteReply writes one reply in a single write.
+// WriteReply writes one reply. A large body (file bytes) goes out with the
+// header in one vectored write, without a copy.
 func WriteReply(w io.Writer, r Reply) error {
 	if len(r.Body) > MaxReplyBody {
 		return ErrTooLarge
+	}
+	if len(r.Body) > 64<<10 {
+		h := make([]byte, ReplyHeaderLen)
+		binary.BigEndian.PutUint32(h[0:], r.Status)
+		binary.BigEndian.PutUint16(h[4:], r.Flags)
+		binary.BigEndian.PutUint32(h[8:], uint32(len(r.Body)))
+		bufs := net.Buffers{h, r.Body}
+		_, err := bufs.WriteTo(w)
+		return err
 	}
 	buf := make([]byte, ReplyHeaderLen+len(r.Body))
 	binary.BigEndian.PutUint32(buf[0:], r.Status)
@@ -177,6 +201,27 @@ func ReadReply(rd io.Reader) (Reply, error) {
 		}
 	}
 	return r, nil
+}
+
+// ReadReplyInto reads one reply whose body goes straight into dst (an
+// OpRead answer). A body longer than dst is a protocol error: the
+// connection must be closed.
+func ReadReplyInto(rd io.Reader, dst []byte) (status uint32, n int, err error) {
+	var h [ReplyHeaderLen]byte
+	if _, err = io.ReadFull(rd, h[:]); err != nil {
+		return 0, 0, err
+	}
+	status = binary.BigEndian.Uint32(h[0:])
+	bl := binary.BigEndian.Uint32(h[8:])
+	if int64(bl) > int64(len(dst)) {
+		return status, 0, ErrTooLarge
+	}
+	if bl > 0 {
+		if _, err = io.ReadFull(rd, dst[:bl]); err != nil {
+			return status, 0, err
+		}
+	}
+	return status, int(bl), nil
 }
 
 // StartMessage is the one message the app writes to the helper's private
@@ -272,6 +317,64 @@ type StatsReply struct {
 // GetAttrRequest is the body of OpGetAttr.
 type GetAttrRequest struct {
 	Inode uint64 `json:"inode"`
+}
+
+// OpenRequest is the body of OpOpen: open one file by inode, read-only.
+type OpenRequest struct {
+	Inode uint64 `json:"inode"`
+}
+
+// OpenReply is the body of the answer to OpOpen. Handle is valid only on
+// this helper (this epoch) until OpRelease.
+type OpenReply struct {
+	Handle uint64 `json:"handle"`
+	Attr   Attr   `json:"attr"`
+}
+
+// ReleaseRequest is the body of OpRelease.
+type ReleaseRequest struct {
+	Inode  uint64 `json:"inode"`
+	Handle uint64 `json:"handle"`
+}
+
+// ReadArgsLen is the length of an OpRead request body.
+const ReadArgsLen = 28
+
+// ReadArgs is the binary body of OpRead:
+//
+//	inode u64 | handle u64 | offset u64 | length u32
+//
+// The reply body is exactly the file's bytes from offset, up to length or
+// the end of the file, whichever comes first. A reply shorter than length
+// means the file ends there.
+type ReadArgs struct {
+	Inode  uint64
+	Handle uint64
+	Offset uint64
+	Length uint32
+}
+
+// Encode returns the request body.
+func (r ReadArgs) Encode() []byte {
+	b := make([]byte, ReadArgsLen)
+	binary.BigEndian.PutUint64(b[0:], r.Inode)
+	binary.BigEndian.PutUint64(b[8:], r.Handle)
+	binary.BigEndian.PutUint64(b[16:], r.Offset)
+	binary.BigEndian.PutUint32(b[24:], r.Length)
+	return b
+}
+
+// DecodeReadRequest parses an OpRead body.
+func DecodeReadArgs(b []byte) (ReadArgs, error) {
+	if len(b) != ReadArgsLen {
+		return ReadArgs{}, fmt.Errorf("engine wire: read request is %d bytes, want %d", len(b), ReadArgsLen)
+	}
+	return ReadArgs{
+		Inode:  binary.BigEndian.Uint64(b[0:]),
+		Handle: binary.BigEndian.Uint64(b[8:]),
+		Offset: binary.BigEndian.Uint64(b[16:]),
+		Length: binary.BigEndian.Uint32(b[24:]),
+	}, nil
 }
 
 // Attr is the body of the answer to OpGetAttr. Times are Unix nanoseconds.

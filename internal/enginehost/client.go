@@ -188,3 +188,63 @@ func (cl *Client) Close() {
 		delete(cl.idle, k)
 	}
 }
+
+// Open opens one file read-only by inode (step 2). The handle is valid on
+// this helper only, until Release.
+func (cl *Client) Open(ino uint64, timeout time.Duration) (wire.OpenReply, error) {
+	var o wire.OpenReply
+	b, err := cl.Call(wire.ClassRead, wire.OpOpen, wire.OpenRequest{Inode: ino}, timeout)
+	if err == nil {
+		err = json.Unmarshal(b, &o)
+	}
+	return o, err
+}
+
+// Release closes a handle from Open.
+func (cl *Client) Release(ino, handle uint64, timeout time.Duration) error {
+	_, err := cl.Call(wire.ClassRead, wire.OpRelease, wire.ReleaseRequest{Inode: ino, Handle: handle}, timeout)
+	return err
+}
+
+// Read reads into p from off (step 2). The bytes go straight from the
+// socket into p. n < len(p) with a nil error means the file ends at off+n.
+// timeout bounds the call here and is the helper's deadline; when it
+// passes, the connection is closed, which cancels the engine call.
+func (cl *Client) Read(ino, handle uint64, p []byte, off int64, timeout time.Duration) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if len(p) > wire.MaxReadLen || off < 0 {
+		return 0, syscall.EINVAL
+	}
+	deadline := time.Now().Add(timeout)
+	c, err := cl.get(wire.ClassRead, deadline)
+	if err != nil {
+		return 0, err
+	}
+	_ = c.SetDeadline(deadline)
+	body := wire.ReadArgs{Inode: ino, Handle: handle, Offset: uint64(off), Length: uint32(len(p))}.Encode()
+	if err := wire.WriteRequest(c, wire.Request{Op: wire.OpRead, Class: wire.ClassRead,
+		DeadlineMs: uint32(timeout / time.Millisecond), Body: body}); err != nil {
+		c.Close()
+		return 0, err
+	}
+	status, n, err := wire.ReadReplyInto(c, p)
+	if err != nil {
+		c.Close() // the cancel; and a torn reply never returns to the pool
+		return 0, err
+	}
+	_ = c.SetDeadline(time.Time{})
+	cl.put(wire.ClassRead, c)
+	if status != 0 {
+		return 0, &StatusError{Op: wire.OpRead, Status: syscall.Errno(status)}
+	}
+	return n, nil
+}
+
+// Unwrap lets errors.Is match the errno.
+func (e *StatusError) Unwrap() error { return e.Status }
+
+// EngineStatus is the errno the engine answered (as opposed to an errno of
+// the socket itself, which a net error also carries).
+func (e *StatusError) EngineStatus() syscall.Errno { return e.Status }

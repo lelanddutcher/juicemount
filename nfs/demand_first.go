@@ -222,7 +222,7 @@ type pendingReadKey struct {
 	size    int64
 	mtime   int64
 	version metadata.MirrorToken // the mirror revision the open observed
-	fd      *os.File
+	src     any                  // the FUSE descriptor or the engine handle (step 2) read through
 	off     int64
 	n       int
 }

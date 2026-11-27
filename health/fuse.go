@@ -674,6 +674,12 @@ type FUSEConfig struct {
 	// Excluded from JSON so generationConfigDigest never hashes it.
 	ObjectKey ObjectKey `json:"-"`
 
+	// EngineDoor, when set (JM_ENGINE=reads, engine-direct step 2), opens
+	// the engine socket inside every juicefs mount child this manager
+	// starts: two doors into one engine. Excluded from JSON: the switch is
+	// compared by the caller before it reuses a mount.
+	EngineDoor EngineDoor `json:"-"`
+
 	// RouteTarget is the host:port of the ORIGINAL backend: the configured
 	// metadata address, before a Link proxy or JM_DEBUG_META_ADDR rewrites
 	// RedisURL to loopback. Before each mount the manager resolves the
@@ -1539,6 +1545,19 @@ func (fm *FUSEManager) MountWithReceipt() (*MountReceipt, error) {
 		args = append(args, "--bucket", fm.cfg.BucketOverride)
 	}
 
+	// Engine-direct step 2: the socket and its start pipe are inherited as
+	// descriptors 3 and 4. A door that cannot be prepared costs only the
+	// socket; the mount starts as today.
+	var doorFiles []*os.File
+	if fm.cfg.EngineDoor != nil {
+		if dargs, files, err := fm.cfg.EngineDoor.Prepare(3); err != nil {
+			jmlog.Warn("engine socket not prepared; reads stay on the mount", "error", err.Error())
+		} else {
+			args = append(args, dargs...)
+			doorFiles = files
+		}
+	}
+
 	// Build a sanitized copy for both log sinks; exec receives real args.
 	logArgs := mountLogArgs(args)
 	log.Printf("[fuse] mounting JuiceFS: %s %s", fm.cfg.JuiceFSBin, strings.Join(logArgs, " "))
@@ -1551,6 +1570,13 @@ func (fm *FUSEManager) MountWithReceipt() (*MountReceipt, error) {
 	// measured-link grace periods and is the sole restart authority.
 	cmd := exec.Command(fm.cfg.JuiceFSBin, args...)
 	cmd.Env = juiceFSDirectEnvironment(os.Getpid(), metaPassword, fm.cfg.ObjectKey)
+	cmd.ExtraFiles = doorFiles
+	doorStarted := false
+	defer func() {
+		if fm.cfg.EngineDoor != nil && doorFiles != nil && !doorStarted {
+			fm.cfg.EngineDoor.Started(errors.New("juicefs mount did not start"))
+		}
+	}()
 	scope, isolated, isolationErr := appisolation.Current()
 	if isolationErr != nil {
 		return nil, isolationErr
@@ -1630,7 +1656,12 @@ func (fm *FUSEManager) MountWithReceipt() (*MountReceipt, error) {
 			return nil, fmt.Errorf("persist generation launch intent: %w", err)
 		}
 	}
-	if err := cmd.Start(); err != nil {
+	err := cmd.Start()
+	if fm.cfg.EngineDoor != nil && doorFiles != nil {
+		doorStarted = true
+		fm.cfg.EngineDoor.Started(err) // closes the child's ends; sends the token
+	}
+	if err != nil {
 		if juiceFSLog != nil {
 			_ = juiceFSLog.Close()
 		}

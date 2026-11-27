@@ -160,6 +160,7 @@ func main() {
 	dbPath := flag.String("db", "", "SQLite database path (default: ~/.juicemount/metadata.db)")
 	noMount := flag.Bool("no-mount", false, "Start NFS server without mounting (for testing)")
 	noFuse := flag.Bool("no-fuse", false, "Skip JuiceFS FUSE mount (assume already mounted)")
+	engineMountArgv := flag.String("engine-mount-argv", "", "With --no-fuse and JM_ENGINE=reads: a JSON array, the argv of a foreground juicefs mount that jm5 starts with the engine socket (remote lab)")
 	externalBundled := flag.Bool("external-juicefs-is-bundled", false, "With --no-fuse: the external mount runs the juicefs beside this executable, so the direct SSD cache reader may verify against it (remote lab)")
 	cacheSize := flag.String("cache-size", "100000", "JuiceFS SSD cache size in MB")
 	bucketOverride := flag.String("bucket-override", "", "Override the S3 bucket URL stored in Redis (e.g. http://<server-ip>:30151/<bucket>). Empty = use the URL written by juicefs format.")
@@ -239,6 +240,7 @@ func main() {
 	// cannot leave a new mount or remount monitor behind.
 	var fuseMgr *health.FUSEManager
 	var fuseReceipt *health.MountReceipt
+	var labJuiceFS *labMount // JM_ENGINE=reads with --no-fuse and --engine-mount-argv
 	// 2. Connect to Redis. Sync follows spool recovery below.
 	rc, err := metadata.NewRedisClient(*redisURL, store)
 	if err != nil {
@@ -297,10 +299,23 @@ func main() {
 	// Reserve the physical generation before constructing any FUSE consumer.
 	// The logical --fuse-path is used only for allocation; all later paths
 	// refer to this generation's immutable mount directory.
+	// Engine-direct step 2: JM_ENGINE=reads opens the engine socket inside
+	// the juicefs mount and reads through it (engine_reads.go).
+	var engineDoor *enginehost.Door
+	var engineDoorIface health.EngineDoor
+	if level, err := enginehost.ParseLevel(os.Getenv("JM_ENGINE")); err == nil && level == enginehost.LevelReads {
+		engineDoor = enginehost.NewDoor(enginehost.DoorConfig{
+			ExpectVersion: enginehost.ExpectedJuiceFSVersion, OnEvent: enginehost.LogDoorEvents,
+		})
+		engineDoorIface = engineDoor
+		if *noFuse && *engineMountArgv == "" && os.Getenv("JM_ENGINE_MOUNT_ARGV") == "" {
+			jmlog.Warn("JM_ENGINE=reads with --no-fuse and no --engine-mount-argv: no socket; reads stay on the mount")
+		}
+	}
 	if !*noFuse {
 		fuseMgr, err = health.NewGenerationFUSEManager(health.FUSEConfig{
 			RedisURL: *redisURL, MountPoint: *fusePath, CacheSize: *cacheSize, JuiceFSBin: juiceFSBin,
-			BucketOverride: *bucketOverride,
+			BucketOverride: *bucketOverride, EngineDoor: engineDoorIface,
 		})
 		if err != nil {
 			log.Fatal(startupCleanup.fail(fmt.Errorf("reserve FUSE generation: %w", err)))
@@ -326,6 +341,9 @@ func main() {
 		srv.Handler().SetCacheReader(saved)
 	}
 	srv.Handler().SetRedisClient(rc)
+	if engineDoor != nil {
+		srv.Handler().SetEngineReads(doorReadSource(engineDoor))
+	}
 	// The selected saved binding is attached above. Restore Finder images
 	// before the first listener request, including offline and no-Reader boot.
 	if *dbPath != ":memory:" {
@@ -420,6 +438,16 @@ func main() {
 		return nil
 	}
 	if err := runCLIStartup(prepareSpool, func() error {
+		if *engineMountArgv == "" {
+			*engineMountArgv = os.Getenv("JM_ENGINE_MOUNT_ARGV")
+		}
+		if *noFuse && *engineMountArgv != "" {
+			m, err := startLabMount(*engineMountArgv, *fusePath, filepath.Join(stateDir, "juicefs-mount.log"), engineDoor)
+			if err != nil {
+				return fmt.Errorf("lab juicefs mount with the engine socket: %w", err)
+			}
+			labJuiceFS = m
+		}
 		if *noFuse {
 			if _, err := os.Stat(*fusePath); err != nil {
 				return fmt.Errorf("FUSE mount not found at %s (use without --no-fuse to auto-mount): %w", *fusePath, err)
@@ -489,6 +517,10 @@ func main() {
 		log.Fatal(err)
 	}
 	jmlog.Info("nfs server listening", "addr", srv.Addr())
+	engineLogStop := make(chan struct{})
+	if engineDoor != nil {
+		go logEngineReads(30*time.Second, engineLogStop)
+	}
 
 	// Engine-direct step 1: JM_ENGINE=shadow runs an idle, read-only engine
 	// helper beside the FUSE path. Unset or "fuse" changes nothing.
@@ -702,9 +734,14 @@ func main() {
 	if projectLeases != nil {
 		projectLeases.Stop() // StopHandler proved the original drainer has joined.
 	}
-	// No engine call is in flight once the handler stopped (step 1 makes
-	// none). Stop the helper before FUSE (design 2.7).
+	// No engine call is in flight once the handler stopped. Stop the helper
+	// before FUSE (design 2.7).
 	enginehost.StopShadow(engineShadow)
+	close(engineLogStop)
+	if engineDoor != nil {
+		engineDoor.Close()
+	}
+	labJuiceFS.stop()
 
 	if mgrJobMgr != nil {
 		// Cancel in-flight migrations before tearing down the FUSE mount;
