@@ -6,7 +6,7 @@
  * volume mounted on a slow one once the link turns slow, and the reverse,
  * with no remount. pkg/chunk/jm_link_policy.go has the settings.
  *
- * Body: version(1) = 1, then either nothing (a query) or
+ * Body: version(1) = 1 or 2, then either nothing (a query) or
  *
  *	flags(1)           bit 1: demand-first (patch 0020 and 0021 spans)
  *	                   bit 2: no read compaction (patch 0036,
@@ -14,6 +14,8 @@
  *	get_timeout_ms(4)  --get-timeout
  *	put_timeout_ms(4)  --put-timeout
  *	io_retries(1)      --io-retries of a block upload
+ *	readahead_kib(4)   version 2 only (patch 0035): the maximum read-ahead
+ *	                   of one sequential reader (jm_readahead.go); 0 = off
  *
  * The vfs layer follows the set values too: the read retry budget before
  * EIO (reader.go) and the flush deadline and interrupt (writer.go) use the
@@ -24,12 +26,14 @@
  * default), not by the object timeouts this message changes.
  *
  * Reply: errno(1), then on errno 0 the settings in force afterwards in the
- * same layout (flags, get, put, retries): 11 bytes. A sender from before
- * patch 0036 never sets bit 2, so its message turns read compaction back on
- * (the upstream behaviour); a juicefs from before it ignores bit 2 and never
- * reports it. EINVAL: an unknown
- * version, a short body, or values outside 1 s..30 min and 0..50 retries
- * (nothing changes). ENOTSUP: the store has no such settings.
+ * layout of the request's version: 11 bytes for version 1, 15 for version 2
+ * (read-ahead 0 when it is below one block). A sender from before patch
+ * 0036 never sets bit 2, so its message turns read compaction back on (the
+ * upstream behaviour); a juicefs from before it ignores bit 2 and never
+ * reports it. EINVAL: an unknown version, a short body, or values outside
+ * 1 s..30 min, 0..50 retries and 0..1 GiB of read-ahead (nothing changes).
+ * ENOTSUP: the store has no such settings. A version 1 message leaves the
+ * read-ahead as it is.
  */
 
 package vfs
@@ -46,10 +50,19 @@ import (
 
 const (
 	jmLinkPolicyVersion   = 1
+	jmLinkPolicyVersion2  = 2 // patch 0035: adds readahead_kib
 	jmLinkPolicyBodyLen   = 1 + 4 + 4 + 1
+	jmLinkPolicyBodyLen2  = jmLinkPolicyBodyLen + 4
 	jmLinkFlagDemandFirst = 1
 	jmLinkFlagNoReadComp  = 2 // patch 0036
 )
+
+// jmReadaheadSetter: a reader whose read-ahead a message may set
+// (jm_readahead.go).
+type jmReadaheadSetter interface {
+	JMReadahead() uint64
+	JMSetReadahead(n uint64) bool
+}
 
 // jmLinkOverrider: a store whose policy a message may have set.
 type jmLinkOverrider interface {
@@ -90,7 +103,22 @@ func (v *VFS) jmLinkPolicyMsg(r *utils.Buffer, out io.Writer) {
 		fail(syscall.ENOTSUP)
 		return
 	}
-	if r.Left() < 1 || r.Get8() != jmLinkPolicyVersion {
+	if r.Left() < 1 {
+		fail(syscall.EINVAL)
+		return
+	}
+	version := r.Get8()
+	bodyLen := jmLinkPolicyBodyLen
+	var ra jmReadaheadSetter
+	switch version {
+	case jmLinkPolicyVersion:
+	case jmLinkPolicyVersion2:
+		if ra, ok = v.reader.(jmReadaheadSetter); !ok {
+			fail(syscall.ENOTSUP)
+			return
+		}
+		bodyLen = jmLinkPolicyBodyLen2
+	default:
 		fail(syscall.EINVAL)
 		return
 	}
@@ -99,13 +127,21 @@ func (v *VFS) jmLinkPolicyMsg(r *utils.Buffer, out io.Writer) {
 	switch r.Left() {
 	case 0:
 		now = store.JMLinkPolicy()
-	case jmLinkPolicyBodyLen:
+	case bodyLen:
 		flags := r.Get8()
 		p := chunk.JMLinkPolicy{DemandFirst: flags&jmLinkFlagDemandFirst != 0}
 		noReadComp = flags&jmLinkFlagNoReadComp != 0
 		p.GetTimeout = time.Duration(r.Get32()) * time.Millisecond
 		p.PutTimeout = time.Duration(r.Get32()) * time.Millisecond
 		p.MaxRetries = int(r.Get8())
+		var raBytes uint64
+		if ra != nil {
+			raBytes = uint64(r.Get32()) << 10
+			if raBytes > jmReadaheadLimit || !p.Valid() {
+				fail(syscall.EINVAL)
+				return
+			}
+		}
 		if now, ok = store.JMSetLinkPolicy(p); !ok {
 			fail(syscall.EINVAL)
 			return
@@ -115,11 +151,14 @@ func (v *VFS) jmLinkPolicyMsg(r *utils.Buffer, out io.Writer) {
 				logger.Infof("read compaction %s by the link policy", map[bool]string{true: "off", false: "on"}[noReadComp])
 			}
 		}
+		if ra != nil {
+			ra.JMSetReadahead(raBytes)
+		}
 	default:
 		fail(syscall.EINVAL)
 		return
 	}
-	w := utils.NewBuffer(1 + jmLinkPolicyBodyLen)
+	w := utils.NewBuffer(uint32(1 + bodyLen))
 	w.Put8(0)
 	var flags uint8
 	if now.DemandFirst {
@@ -132,5 +171,8 @@ func (v *VFS) jmLinkPolicyMsg(r *utils.Buffer, out io.Writer) {
 	w.Put32(uint32(now.GetTimeout / time.Millisecond))
 	w.Put32(uint32(now.PutTimeout / time.Millisecond))
 	w.Put8(uint8(min(now.MaxRetries, 255)))
+	if ra != nil {
+		w.Put32(uint32(ra.JMReadahead() >> 10))
+	}
 	_, _ = out.Write(w.Bytes())
 }

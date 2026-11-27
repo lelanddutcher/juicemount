@@ -8,7 +8,7 @@
 #                                       older build for a before/after pair)
 #   link-class-lab.sh tunnel up|down    route the client to the NAS through a
 #                                       WireGuard interface named tailscale0
-#   link-class-lab.sh fixture           write the clip (on lan, no tunnel needed)
+#   link-class-lab.sh fixture           write the clips (on lan, no tunnel needed)
 #   link-class-lab.sh run PROFILE [LABEL] [PROBE_FLAG...]
 #
 # The probe (linkclassprobe) runs the app's own code inside the client: the
@@ -131,9 +131,18 @@ tunnel_down() {
   [ "${1:-}" = quiet ] || log "tunnel down: client routes $NAS_SUBNET through the wan directly"
 }
 
+# fixture: the clip, plus two more 1 GiB clips and a 256 MiB clip in the
+# same folder for the probe's -scrub-file, -read2-file and -ttfb-file
+# (scrub-1g.mov, next-1g.mov, ttfb-256m.mov).
 fixture() {
+  local dir="${CLIP%/*}"
   "$LAB" shape lan >&2
-  "$LAB" exec sh -ec "mkdir -p /jfs/${CLIP%/*}; [ -s /jfs/$CLIP ] || head -c 1073741824 /dev/urandom > /jfs/$CLIP; ls -l /jfs/$CLIP" >&2
+  "$LAB" exec sh -ec "mkdir -p /jfs/$dir
+    [ -s /jfs/$CLIP ] || head -c 1073741824 /dev/urandom > /jfs/$CLIP
+    [ -s /jfs/$dir/scrub-1g.mov ] || head -c 1073741824 /dev/urandom > /jfs/$dir/scrub-1g.mov
+    [ -s /jfs/$dir/next-1g.mov ] || head -c 1073741824 /dev/urandom > /jfs/$dir/next-1g.mov
+    [ -s /jfs/$dir/ttfb-256m.mov ] || head -c 268435456 /dev/urandom > /jfs/$dir/ttfb-256m.mov
+    ls -l /jfs/$dir" >&2
 }
 
 run() {

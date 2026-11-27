@@ -293,6 +293,7 @@ type fileReader struct {
 	errAt    time.Time // JuiceMount patch 0030: when err was stored
 	tried    uint32
 	sessions [readSessions]session
+	jmRuns   [readSessions]jmRun // JuiceMount patch 0035
 	slices   *sliceReader
 	last     **sliceReader
 
@@ -426,13 +427,17 @@ func (f *fileReader) checkReadahead(block *frange) int {
 	seqdata := ses.total
 	readahead := ses.readahead
 	used := uint64(atomic.LoadInt64(&readBufferUsed))
-	if readahead == 0 && f.r.blockSize <= f.r.readAheadMax && (block.off == 0 || seqdata > block.len) { // begin with read-ahead turned on
+	// JuiceMount patch 0035: the live maximum and a minimum contiguous run.
+	readAheadMax := f.r.jmReadaheadMax()
+	run := f.jmRunBytes(idx, block)
+	if readahead == 0 && f.r.blockSize <= readAheadMax && (block.off == 0 || seqdata > block.len) && run >= f.r.jmReadaheadMinRun() { // begin with read-ahead turned on
 		ses.readahead = f.r.blockSize
-	} else if readahead < f.r.readAheadMax && seqdata >= readahead && f.r.readAheadTotal > used+readahead*4 {
+	} else if readahead < readAheadMax && seqdata >= readahead && f.r.readAheadTotal > used+readahead*4 {
 		ses.readahead *= 2
 	} else if readahead >= f.r.blockSize && (f.r.readAheadTotal < used+readahead/2 || seqdata < readahead/4) {
 		ses.readahead /= 2
 	}
+	ses.readahead = f.r.jmClampReadahead(ses.readahead)
 	if ses.readahead >= f.r.blockSize {
 		ahead := frange{block.end(), ses.readahead}
 		f.readAhead(&ahead)
@@ -477,11 +482,11 @@ func (f *fileReader) cleanupRequests(block *frange) {
 		return true
 	})
 	f.visit(func(s *sliceReader) bool {
-		if !block.overlap(s.block) && cnt > f.r.maxRequests {
+		if !block.overlap(s.block) && cnt > f.r.jmMaxRequests() {
 			s.drop()
 			cnt--
 		}
-		return cnt > f.r.maxRequests
+		return cnt > f.r.jmMaxRequests()
 	})
 }
 
@@ -717,6 +722,7 @@ type dataReader struct {
 	maxRequests    int
 	maxRetries     uint32
 	jmServed       jmServedSet // JuiceMount patch 0032
+	jmReadahead    jmReadahead // JuiceMount patch 0035
 }
 
 func NewDataReader(conf *Config, m meta.Meta, store chunk.ChunkStore) DataReader {

@@ -8,16 +8,53 @@ import (
 )
 
 // Bit 2 of the link policy carries --no-read-compaction (juicefs patch 0036)
-// both ways.
+// both ways, in both message versions (version 2 adds patch 0035's
+// read-ahead after the version 1 body).
 func TestJFSLinkPolicyReadCompactionWire(t *testing.T) {
-	p := abroadPolicy
-	p.NoReadCompaction = true
-	b := encodeLinkPolicy(p)
-	if b[0] != jfsLinkFlagDemandFirst|jfsLinkFlagNoReadComp {
-		t.Fatalf("flags %#x", b[0])
+	for _, v := range []byte{jfsLinkPolicyVersion, jfsLinkPolicyVersion2} {
+		p := abroadPolicy
+		p.NoReadCompaction = true
+		p.ReadaheadMiB = -1 // version 1: not known
+		if v == jfsLinkPolicyVersion2 {
+			p.ReadaheadMiB = 16
+		}
+		b := encodeLinkPolicy(p, v)
+		if b[0] != jfsLinkFlagDemandFirst|jfsLinkFlagNoReadComp {
+			t.Fatalf("v%d flags %#x", v, b[0])
+		}
+		if got := decodeLinkPolicy(b); got != p {
+			t.Fatalf("v%d decode %+v, want %+v", v, got, p)
+		}
 	}
-	if got := decodeLinkPolicy(b); got != p {
-		t.Fatalf("decode %+v, want %+v", got, p)
+}
+
+// Read compaction and read-ahead hold separately: a link that turns far
+// turns read-ahead off after readaheadHoldFor and read compaction off after
+// linkSlowerHold, each on its own timer, and neither restarts the other's.
+func TestLinkHysteresisReadCompactionAndReadahead(t *testing.T) {
+	var h linkHysteresis
+	t0 := time.Unix(1000, 0)
+	at := func(s float64) time.Time { return t0.Add(time.Duration(s * float64(time.Second))) }
+	near := lanPolicy
+	near.ReadaheadMiB = 16
+	h.observe(at(0), near)
+	if got := h.observe(at(readaheadHoldFor.Seconds()), near); got.ReadaheadMiB != 16 || got.NoReadCompaction {
+		t.Fatalf("near after the hold: %+v", got)
+	}
+	far := near
+	far.ReadaheadMiB, far.NoReadCompaction = 0, true
+	start := readaheadHoldFor.Seconds() + 2
+	h.observe(at(start), far)
+	got := h.observe(at(start+readaheadHoldFor.Seconds()), far)
+	if got.ReadaheadMiB != 0 {
+		t.Fatalf("read-ahead still on after its hold: %+v", got)
+	}
+	if linkSlowerHold > readaheadHoldFor && got.NoReadCompaction {
+		t.Fatalf("read compaction off before its own hold: %+v", got)
+	}
+	got = h.observe(at(start+linkSlowerHold.Seconds()), far)
+	if !got.NoReadCompaction || got.ReadaheadMiB != 0 {
+		t.Fatalf("far after both holds: %+v", got)
 	}
 }
 

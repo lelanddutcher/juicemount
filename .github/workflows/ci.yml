@@ -83,7 +83,7 @@ jobs:
           # Patch 0027: the live link policy message. Patch 0030: a stored
           # read error is retried, and a read whose slice finished
           # before a drop is not an EIO. Patch 0031: the open-file refresh message.
-          go test -count=1 -race -run 'TestJMUploadLane|TestJMPin|TestJMLinkPolicy|TestReadError|TestJMWaited|TestJMRefresh' ./pkg/vfs
+          go test -count=1 -race -run 'TestJMUploadLane|TestJMPin|TestJMLinkPolicy|TestReadError|TestJMWaited|TestJMRefresh|TestJMReadahead' ./pkg/vfs
           # Patch 0037: the engine socket server and its message format.
           go test -count=1 -race ./pkg/jmengine/...
       - name: Vendored juicefs Redis metadata tests
@@ -101,7 +101,7 @@ jobs:
           # uses this Redis while the step runs.
           JM_WATCH_BATCH_CHAOS_REDIS_URL: redis://127.0.0.1:6379/4
         run: |
-          go test -count=1 -race -run 'TestJMWatchBatch|TestBirth|Rename|TestCommittedRecord|TestJMMkdirInode|TestJMReserveInodes|TestJMReleaseInodes|TestJMCreateFile|TestJMOpen|TestJMGetAttr|TestJMRefresh' ./pkg/meta
+          go test -count=1 -race -run 'TestJMWatchBatch|TestBirth|Rename|TestCommittedRecord|TestJMMkdirInode|TestJMReserveInodes|TestJMReleaseInodes|TestJMCreateFile|TestJMOpen|TestJMGetAttr|TestJMRefresh|TestJMReadCompaction' ./pkg/meta
           go test -count=1 -race -run 'TestJMCreateFiles' ./pkg/vfs
           go test -count=1 -run 'TestRedisClient$' ./pkg/meta
       - name: Unit and integration-safe tests

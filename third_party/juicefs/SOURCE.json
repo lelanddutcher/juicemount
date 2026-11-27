@@ -2,12 +2,12 @@
   "archive_sha256": "9351a0655185f4a48accae2ae3af70db932de1ee38acfa4f153e3050b817806d",
   "binary": {
     "bundle_path": "Contents/MacOS/juicefs",
-    "ldflags": "-s -w -X github.com/juicedata/juicefs/pkg/version.revision=e0032b2ae5e9-jm22 -X github.com/juicedata/juicefs/pkg/version.revisionDate=2025-12-02",
+    "ldflags": "-s -w -X github.com/juicedata/juicefs/pkg/version.revision=e0032b2ae5e9-jm23 -X github.com/juicedata/juicefs/pkg/version.revisionDate=2025-12-02",
     "package": ".",
     "tags": "nogateway,nowebdav,nocos,nobos,nohdfs,noibmcos,noobs,nooss,noqingstor,nosftp,noswift,noazure,nogs,noufile,nob2,nonfs,nodragonfly,nosqlite,nomysql,nopg,notikv,nobadger,noetcd",
     "upstream_commit": "e0032b2ae5e9603403ca955eed7d05426f6f2f8c",
     "upstream_tag": "v1.3.1",
-    "version_output": "juicefs version 1.3.1+2025-12-02.e0032b2ae5e9-jm22"
+    "version_output": "juicefs version 1.3.1+2025-12-02.e0032b2ae5e9-jm23"
   },
   "files": {
     "LICENSE": {
@@ -1075,7 +1075,7 @@
       "upstream_sha256": "72e176b7c4e2c3a3fcd93646998235a93197298d8f6ca12742eccac53bd869b8"
     },
     "pkg/vfs/reader.go": {
-      "sha256": "595f927e7b7e5a356b6a2b74c64dc835b9b987c6b31457dbcc09ac8c4afc33a4",
+      "sha256": "52faf36eff64a6784604fdc9cf66722a014ae620d1ba6ee4d5454d3541daa910",
       "upstream_sha256": "0daec90c25b4ce8872423bb4d5541cf752f45f5110381ab1c822116a2461a60d"
     },
     "pkg/vfs/vfs.go": {
@@ -1182,12 +1182,14 @@
     "pkg/vfs/jm_control_lane_test.go": "83d6da7b3bb713cf438e84c65b43b4f16a3d78d8a83019622e46480e450eadd6",
     "pkg/vfs/jm_create_files.go": "574ace818067f4ed273d2d978eb4619d7d574ba9888519fd9bb5bd16982656d2",
     "pkg/vfs/jm_create_files_test.go": "ad0fd6a4a49b514d7edeaa83f6c2076ece903ca763f3c860e014c201e9379ec0",
-    "pkg/vfs/jm_link_policy.go": "2b5e9adfa3586b1dc1104d9bcbf35ea25ec225662067110384edac9ca8db4549",
-    "pkg/vfs/jm_link_policy_test.go": "dc18b72697da92fd713d73b429967c1769f3dfbca39a862485aed95b809f4932",
+    "pkg/vfs/jm_link_policy.go": "5dd763de714103224ef4767183ad5331c3c0458b000b76bb636e5bbd1dd60322",
+    "pkg/vfs/jm_link_policy_test.go": "5ff29e37649c14e6f2476cf923993912a59e430b2c1c2248f902a695ad2688c3",
     "pkg/vfs/jm_pin.go": "2f229860b5593348913bcbb5903d17d759f9826f5da8517ef6c01a66f783c39c",
     "pkg/vfs/jm_pin_test.go": "cf3bf39834e7b130c755cdeb5aa0712f8eebe947a73e3aacf762904f93277f2b",
     "pkg/vfs/jm_read_recover.go": "abdf2ac8cbb6ee55f65edf4ed59afd5041d7ea55a525cca8bbbefc5f27118af5",
     "pkg/vfs/jm_read_recover_test.go": "1949dc48d46f67da1ef20ce073f0278d74f7cf4d411b9fbf22c5cb25dafbd631",
+    "pkg/vfs/jm_readahead.go": "30e649fe364735a501cb14a9bdf4e7184157bdcc575e28751cf8958772405d57",
+    "pkg/vfs/jm_readahead_test.go": "6a3fa89c0e7a1031ed9ef14776103ec9247d0098e5bde045c7bfac3a655dbbd6",
     "pkg/vfs/jm_refresh.go": "3c20b6fda0973596b4843e39b70043040fb3f6b004fa85e92c50c5e873ebd3e2",
     "pkg/vfs/jm_refresh_test.go": "cb424118e8c0d986055e128333d20d6db424d6e3bfe23a970b253cf46feb971f",
     "pkg/vfs/jm_upload_lane.go": "c35d3cda2fa958933f21e1e39a2f48ce4605ccb2e6d2e6e53fe6ceaecbf670b1",
@@ -1230,6 +1232,7 @@
     "patches/0032-refresh-keeps-current-buffers.patch": "ff7fc37fc4d10d4db24bdf65d25a4d5a786badbc7cfccb8a4d8331980bef67ab",
     "patches/0033-control-lane.patch": "7366007504ddf3be56cd4a27e18d55a371649db8119c8d7fc4dbb17b03a73c91",
     "patches/0034-opentelemetry-security-update.patch": "8efca1a64e8953a20c4b2d9f20dcd2619fa2c413f7c130adbe5382879ec96d12",
+    "patches/0035-live-readahead.patch": "86515181bb5803e52c1f0eae8bda12c118e15a26877ff0b80b0e1d225968adf5",
     "patches/0036-no-read-compaction.patch": "be102f543e039f802fc3d87656d756d8da366b7eb57e98c2d345f3d688d03946",
     "patches/0037-engine-helper.patch": "0dd4c0f29d2fd90a55b3474a050290ef844e9433d6e12ed34844774a503670a8"
   },

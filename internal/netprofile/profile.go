@@ -121,6 +121,98 @@ func (p *Profile) JuiceFS() JuiceFSPolicy {
 	}
 }
 
+// JuiceFSReadaheadMiB is the read-ahead of one sequential reader inside
+// juicefs, in MiB (0 = off; -1 = not known yet). The mount keeps
+// --max-readahead 1M (off); the live link follower (nfs/jfs_link_policy.go, juicefs patch 0035) sets this
+// value while the volume is mounted, so it can never outlive a handoff.
+//
+// Why juicefs and not the NFS layer: macFUSE runs one read of a file at a
+// time (nfs/demand_first.go rule 5), so the NFS client's readahead and the
+// NFS layer's ReadaheadManager cannot put more than one demand span of a
+// file on the link at once. A 12 ms, 300 Mbit/s tunnel read one file at
+// 128-156 Mbit/s on the laptop (2026-11-26); juicefs's own read-ahead
+// fetches whole blocks ahead of the reader in parallel and is the one layer
+// that survives both macFUSE and a later engine-direct front.
+//
+// On while the link is near and not metered: smoothed RTT under
+// juiceFSReadaheadMaxRTT and neither class nor read class metered. Not known
+// (-1) until the link has an RTT and juiceFSReadaheadMinSamples bandwidth
+// samples: before that a thin link looks near and unmetered. The follower
+// keeps read-ahead off while it is not known, and changes it only after the
+// same answer held for 10 s (nfs/jfs_link_policy.go readaheadHold). Slow
+// counts: a near link at 150-250 Mbit/s alternates slow/medium on the
+// 30 MiB/s line, and it is exactly the link that needs it. Far links
+// (abroad) and metered or thin links keep today's behaviour. The juicefs
+// side starts a reader's read-ahead only after two blocks of contiguous
+// reading, so previews and scrub jumps pull nothing extra.
+//
+// on says whether juicefs read-ahead is on now. While it is, a metered
+// verdict that comes only from the bandwidth estimate does not turn it off:
+// with read-ahead most reads are served from juicefs's memory in under
+// minThroughputDur and are not counted, and the reads that are counted are
+// the ones that waited for a block still in flight, so the estimate falls
+// far below the link (lab, 2026-11-27: 250 -> 20 Mbit/s in 30 s while the
+// file arrived at 160 Mbit/s). The host's cost signal, a forced class and a
+// far RTT still turn it off, and turning it on still needs a not-metered
+// measurement taken with it off.
+// JM_JFS_READAHEAD_MB overrides the size; 0 turns it off everywhere.
+func (p *Profile) JuiceFSReadaheadMiB(on bool) int {
+	size := juiceFSReadaheadMiB
+	if v := os.Getenv("JM_JFS_READAHEAD_MB"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			// juicefs refuses more than 1 GiB, and with it the whole
+			// policy message (timeouts and demand-first too).
+			size = min(n, juiceFSReadaheadMaxMiB)
+		}
+	}
+	if size == 0 {
+		return 0
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	explicitMetered := p.forcedClass != nil && *p.forcedClass == ClassMetered ||
+		p.forcedClass == nil && p.networkCostClass != nil && *p.networkCostClass == ClassMetered
+	measuredMetered := p.haveBW && p.bwBps < thrMeteredBps
+	known := p.haveRTT && p.haveBW && p.bwSamples >= juiceFSReadaheadMinSamples
+	switch {
+	case explicitMetered:
+		return 0
+	case !known:
+		return -1
+	case p.rtt >= juiceFSReadaheadMaxRTT:
+		return 0
+	case measuredMetered && !on:
+		return 0
+	}
+	return size
+}
+
+// SetEngineReadahead records that juicefs read-ahead turned on (true) or off
+// (false) on one mount; the link follower calls it on each change.
+func (p *Profile) SetEngineReadahead(on bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if on {
+		p.engineReadahead++
+	} else if p.engineReadahead > 0 {
+		p.engineReadahead--
+	}
+}
+
+// juiceFSReadaheadMiB and juiceFSReadaheadMaxRTT: see JuiceFSReadaheadMiB.
+// 16 MiB is four blocks in flight. Lab, 12 ms / 300 Mbit/s tunnel, macFUSE
+// model (2026-11-27): 16 MiB read 198-215 Mbit/s, 32 MiB 138-140 (eight
+// blocks share the link evenly, so the block the reader needs next lands
+// late and the reader moves in bursts), off 122-130. 100 ms sits far from both the near links (12-30 ms under load) and the
+// abroad profile (200 ms idle, 270 ms reading), so load-induced queueing
+// does not flip it the way it flips the 40 ms high-latency flag.
+const (
+	juiceFSReadaheadMiB        = 16
+	juiceFSReadaheadMaxRTT     = 100 * time.Millisecond
+	juiceFSReadaheadMinSamples = 4
+	juiceFSReadaheadMaxMiB     = 1024
+)
+
 // NFSReadahead returns the macOS NFS-client `readahead` mount option. This is
 // the prefetcher that turns a single small touch into a
 // sequential burst (16 × rsize) which juicefs then extends to a whole-file pull
@@ -188,6 +280,10 @@ type Profile struct {
 	// See SetBackendRoute and tunnelCeilingLocked.
 	tunnelRoute bool
 	routeIface  string
+	// engineReadahead counts the juicefs mounts whose read-ahead is on now
+	// (SetEngineReadahead). While it is above 0 the bandwidth estimate does
+	// not make the class metered: see classLocked.
+	engineReadahead int
 
 	// highLatency is the LATENCY dimension of classification, kept separate from
 	// bandwidth because the two are independent and a link can be fast AND far.
@@ -228,6 +324,14 @@ type throughputInterval struct {
 func New() *Profile {
 	p := &Profile{now: time.Now}
 	applyToProfile(p)
+	return p
+}
+
+// NewWithClock is New with an injected clock for the throughput windows
+// (tests in other packages that drive the profile with a fake clock).
+func NewWithClock(now func() time.Time) *Profile {
+	p := New()
+	p.now = now
 	return p
 }
 
@@ -730,6 +834,16 @@ func (p *Profile) classLocked() (LinkClass, bool) {
 			// see ReadPolicyClass. JM_NET_SLOW_RTT_FLOOR=0 restores the
 			// throughput-only metered rule.
 			if p.highLatency && slowRTTFloorEnabled() {
+				byBW = ClassSlow
+			}
+			// ENGINE READ-AHEAD: while juicefs reads ahead for a reader
+			// (JuiceFSReadaheadMiB), most reads are served from its
+			// memory too fast to count, and the counted ones waited for a
+			// block in flight, so the estimate reads far below the link
+			// (lab 2026-11-27: 250 -> 20 Mbit/s while the file arrived at
+			// 160). That is not a thin link: the class stays slow. The
+			// host's cost signal still makes it metered (checked above).
+			if p.engineReadahead > 0 {
 				byBW = ClassSlow
 			}
 		case p.bwBps < thrSlowBps:

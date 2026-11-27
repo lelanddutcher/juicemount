@@ -4,6 +4,30 @@
 
 ### App
 
+- One file reads faster on a near remote link (a Mac away from home over a
+  direct Tailscale path, about 12 ms). macFUSE hands JuiceFS one read of a
+  file at a time, so only about 1 MiB of a clip was on the link at once: the
+  laptop read one file at 128–156 Mbit/s over a path that carries
+  303 Mbit/s. The bundled JuiceFS (patch 0035, `-jm23`) can now read ahead
+  for a sequential reader while the volume is mounted, and the app turns
+  that on (16 MiB) when the link is near (round trip under 100 ms) and not
+  metered, after the same answer held for 10 s. A reader gets it only after
+  it has read 8 MiB in a row, so previews and scrubbing fetch nothing extra.
+  Far, thin and metered links keep today's behaviour. While JuiceFS reads
+  ahead, the app's own NFS read-ahead on that volume stands back, and the
+  bandwidth estimate (which then reads low) no longer makes the link
+  metered. Because that estimate cannot be trusted while read-ahead runs,
+  read-ahead turns off after 3 minutes on and comes back only if a fresh
+  measurement taken without it still says near and not metered (about 12 s
+  without read-ahead every 3 minutes on a good link); a link that turned into
+  an unflagged hotspot stops reading ahead within that time. In the Linux
+  remote lab with a macFUSE model, 12 ms and 300 Mbit/s
+  through a tunnel: the next clip of a session read at 180–228 Mbit/s
+  (before: 117–142), the first clip at 136–193 (before: 120–136); lan
+  490–558 → 613–695; abroad and a thin near link unchanged.
+  `JM_JFS_READAHEAD_MB` sets the size; 0 turns it off. The Mac still needs
+  the laptop run.
+
 - Engine-direct, step 1 (off by default). The app can start the bundled
   juicefs as a helper process with no mount (`juicefs jm-engine`, bundled
   juicefs patch 0037, `-jm22`), watch it over a private local socket, restart
