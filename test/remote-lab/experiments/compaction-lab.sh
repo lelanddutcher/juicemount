@@ -20,7 +20,7 @@
 # live link policy (control message 1106), with read compaction off away from
 # the backend after this patch. The link is shaped to PROFILE. Per file:
 #
-#   race   the client reads the first CW_PRIME_KIB KiB (as the laptop's
+#   append the client reads the first CW_PRIME_KIB KiB (as the laptop's
 #          prime read), and CW_PEER_DELAY s later the peer writes 16 B at 0
 #          and closes (the teammate keeps editing). A compaction the read
 #          started is then wasted.
@@ -60,7 +60,7 @@ OUT="${CW_OUT:-$HERE/results/compaction-$(date +%Y%m%d-%H%M%S)}"
 BIN="${DRAIN_BIN:-bin}"
 FILES="${CW_FILES:-2}"
 MIB="${CW_MIB:-48}"
-CASES="${CW_CASES:-race quiet}"
+CASES="${CW_CASES:-append quiet}"
 WAIT="${CW_WAIT:-900}"
 MAC_NAME=jmlab-mac
 
@@ -115,8 +115,9 @@ slices() { # slices INODE: the slice count of chunk 0
 }
 
 # settle BEFORE INODE CASE: wait, at most WAIT s, until a compaction the read
-# started has ended (the chunk went to 2 slices or fewer, except in the
-# contend case where the near teammate's compaction does that, a wasted line was
+# started has ended (the chunk went to 2 slices or fewer; in the contend
+# case, where the near teammate's compaction does that too, only after 30 s
+# without traffic; a wasted line was
 # logged, or the client logged a failed compaction) or none started, and then
 # until GET+PUT bytes have not moved for 8 s. A far upload of one compaction
 # takes minutes, with pauses longer than 8 s between 4 MiB PUTs.
@@ -132,7 +133,9 @@ settle() {
     if [ "$c" = "$last" ]; then same=$((same + 1)); else same=0; last="$c"; fi
     if [ "$ended" = 0 ]; then
       if [ "$(echo "$now" | awk '{print $3}')" = "$started0" ] && [ "$same" -ge 4 ]; then ended=1
-      elif { [ "$kase" != contend ] && [ "$(slices "$ino")" -le 2 ]; } || [ "$(echo "$now" | awk '{print $5}')" != "$wasted0" ] \
+      elif { [ "$kase" != contend ] && [ "$(slices "$ino")" -le 2 ]; } \
+        || { [ "$kase" = contend ] && [ "$same" -ge 15 ] && [ "$(slices "$ino")" -le 2 ]; } \
+        || [ "$(echo "$now" | awk '{print $5}')" != "$wasted0" ] \
         || [ "$(cx sh -c 'grep -c "<WARNING>: compact [0-9]" /var/log/juicefs.log || true' | tr -d '\r')" != "$fails0" ]; then ended=1
       fi
     fi
@@ -217,7 +220,7 @@ run() {
       s0="$(slices "$ino")"
       before="$(counters)"
       t0="$(date +%s.%N)"
-      if [ "$kase" = race ]; then
+      if [ "$kase" = append ]; then
         # shellcheck disable=SC2016
         cx sh -c '(sleep "$3"; printf "PEERTAG-%08d" "$4" | dd of="$2" bs=16 count=1 conv=notrunc,fsync status=none
             printf "PEERTAG-%08d" "$4" | dd of="$6" bs=16 count=1 conv=notrunc status=none) &
