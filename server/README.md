@@ -262,22 +262,53 @@ runs on the NAS, next to the data, as the `bg` metadata principal.
 | FSCK | `juicefs fsck` | off | monthly, 1st at 04:00 |
 | Compact | `juicefs gc --compact` | **on, weekly, Sunday at 03:00** | weekly |
 
-Compact repacks a part of a file that was saved in many small pieces into
-whole blocks. Writers repack at 99 pieces, and Macs near the NAS repack
-when they read. Macs away from the NAS and Macs on a tunnel do not repack
-on read (they would move the data twice over the internet), so the weekly
-run does it on the NAS. It sends nothing over the internet. A Mac away from
-the NAS that has a repacked part in its cache downloads that part again the
-next time it reads it, because the pieces it cached no longer exist.
+Compact repacks every part of a file (a 64 MiB chunk) that is stored in more
+than one piece into whole blocks. Writers repack at 99 pieces, and Macs near
+the NAS repack when they read. Macs away from the NAS and Macs on a tunnel do
+not repack on read (they would move the data twice over the internet), so the
+weekly run does it on the NAS. The sweep itself sends nothing over the
+internet.
+
+- **Cost for remote Macs.** After a sweep, each Mac away from the NAS
+  downloads again, once, the repacked parts of files it had cached or pinned:
+  the pieces it cached no longer exist. Files written in one go (media
+  copies, normal app saves) are not touched. Files written in pieces are:
+  captures and growing files, progressive renders, files edited in place.
+  For a big pinned folder of such files the re-download can be large, and a
+  pinned folder is no longer fully local until it is downloaded again.
+- **First sweep after an upgrade.** It repacks everything stored in pieces so
+  far, so it can take hours on a large volume, and the remote re-download
+  above happens once for all of it.
+- **Measure first.** `GET /api/maintenance/compact-meta/estimate` (admin key)
+  counts, without changing anything, the parts the next sweep would repack:
+  `chunks_repack`, `files_repack`, `bytes_repack` (the most a remote Mac that
+  had all of them cached would download again) and a split by piece count.
+  It applies JuiceFS's own rule: a part whose pieces are each at least 1 MiB
+  and a fifth of the rest is left alone, so `chunks_multi_slice` can be
+  higher than `chunks_repack`. It reads every chunk key, so on a big volume
+  it takes a while:
+
+  ```bash
+  curl -s -H "X-JuiceMount-Admin-Key: $JM_ADMIN_KEY" \
+    http://<nas>:30190/api/maintenance/compact-meta/estimate
+  ```
 
 - **Default.** A new install, and an install that never saved a choice for
   Compact, runs it weekly. A choice saved in the Maintenance tab (Off or
-  another cadence) always wins, also after an upgrade.
+  another cadence) always wins, also after an upgrade. **Upgrading:** before
+  this version the tab showed Compact as Off without saving anything. If
+  Compact showed Off and you want it off, choose Off again after the upgrade.
+- **Embedded Manager (jm5) without a state file** runs nothing by default: a
+  choice of Off would not survive its restart.
 - **Clock.** Times are in the Manager container's zone: UTC unless you set
   `TZ` in `server/.env` (for example `TZ=America/Los_Angeles`). The tab shows
   the next run in your browser's time.
 - **No overlap.** A scheduled sweep that finds another sweep running waits for
-  it to finish (at most 6 hours, then it skips that run).
+  it to finish (at most 6 hours, then it skips that run and records it as
+  skipped, with the reason, not as a run). Sweeps that fire on the same
+  minute start one after the other.
+- **Rollback.** An older Manager reads a default schedule that has already
+  run as an explicit weekly choice; choose Off there if you roll back.
 - **Missed runs.** If the Manager is down at the scheduled time, that run is
   skipped, not made up at start; the next one runs on schedule.
 

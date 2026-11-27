@@ -143,4 +143,9 @@ type maintenanceScheduleRow struct {
 	// maintenanceRecommendations. Rows saved through the API never set it,
 	// and rows from before this field all came from the API.
 	Default bool `json:"default,omitempty"`
+	// LastSkipped / LastSkipReason: the last scheduled run that did not
+	// start (another sweep ran too long, turned off while waiting, not
+	// runnable). LastRun records only runs that started.
+	LastSkipped    int64  `json:"last_skipped,omitempty"`
+	LastSkipReason string `json:"last_skip_reason,omitempty"`
 }

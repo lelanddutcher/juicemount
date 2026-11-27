@@ -379,11 +379,15 @@ func Register(outer *http.ServeMux, prefix string, cfg Config) *JobManager {
 	// Own cron engine; persists via the JobManager alongside backups.
 	if a.maintenance != nil {
 		ms := newMaintenanceScheduler(a.maintenance)
+		// Without a state file a choice of Off is lost at restart, so the
+		// default-on schedule would come back each time (embedded jm5).
+		ms.noDefaults = cfg.StateFile == ""
 		a.maintenanceSched = ms
 		ms.SetOnChange(mgr.SaveState)
 		mgr.SetMaintenanceSchedules(ms)
 		ms.Start(context.Background())
 		mux.HandleFunc(prefix+"/api/maintenance/schedules", a.auth(a.handleMaintenanceSchedules))
+		mux.HandleFunc(prefix+"/api/maintenance/compact-meta/estimate", a.auth(a.handleCompactEstimate))
 	}
 	// SLICE 8: Settings tab — per-job defaults, theme, log retention,
 	// admin-key rotation. The store wires its persistence callback to

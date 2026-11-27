@@ -782,12 +782,25 @@
   internet. It applies to new installs and to installs that never saved a
   Compact choice; a saved choice (Off or another cadence) always wins.
   Times are in the Manager's zone: UTC unless `TZ` is set in `server/.env`
-  (now passed to the Manager); the Maintenance tab shows the next run in the
-  browser's time. Scheduled GC, FSCK and Compact never run at once: a sweep
-  that finds another one running waits for it (at most 6 hours, then skips).
-  A run missed while the Manager is down is not made up. Cost: a Mac away
-  from the NAS that had a repacked part cached downloads that part again
-  once, when it next reads it. In the Linux remote lab (6 files of 48 MiB in
+  (now passed to the Manager; an unknown zone is logged at start); the
+  Maintenance tab shows the next run in the browser's time. Scheduled GC,
+  FSCK and Compact never run at once, also when they fire on the same
+  minute: a sweep that finds another one running waits for it (at most 6
+  hours, then skips and records the skip). A run missed while the Manager is
+  down is not made up.
+  **Upgrading:** before this version the tab showed Compact as Off without
+  saving a choice. If Compact showed Off and you want it off, choose Off
+  again after the upgrade.
+  **Cost:** after a sweep, each Mac away from the NAS downloads again, once,
+  the repacked parts of files it had cached or pinned. The first sweep
+  repacks everything stored in pieces so far (captures and growing files,
+  renders, files edited in place) and can take hours; for a big pinned
+  folder of such files the re-download can be large. Files written in one
+  go are not touched. `GET /api/maintenance/compact-meta/estimate` counts,
+  read-only, what the next sweep would repack and how many bytes; on a lab
+  volume it predicted 7 parts and 306,184,192 bytes, and the sweep repacked
+  exactly those 7 (and left 2 files in three 1 MiB pieces alone, as JuiceFS
+  does). In the Linux remote lab (6 files of 48 MiB in
   48 pieces each, 2 files written in one piece) the sweep took 1.3 s, moved
   304 MB in and 317 MB out of the object store and 0 bytes over the WAN,
   and every file read back correct; a remote client that had all 8 files

@@ -2907,6 +2907,20 @@
     renderNext();
     box.appendChild(next);
 
+    // Last run (started) and last skip (with its reason), when known.
+    const hist = [];
+    if (row.last_run) hist.push('Last run: ' + new Date(row.last_run).toLocaleString());
+    if (row.last_skipped && row.last_skipped > (row.last_run || 0)) {
+      hist.push('Last skipped: ' + new Date(row.last_skipped).toLocaleString() +
+        (row.last_skip_reason ? ' (' + row.last_skip_reason + ')' : ''));
+    }
+    if (hist.length) {
+      const h = document.createElement('p');
+      h.className = 'maintenance-schedule-advice';
+      h.textContent = hist.join(' · ');
+      box.appendChild(h);
+    }
+
     if (!row.runnable) {
       const warn = document.createElement('p');
       warn.className = 'maintenance-schedule-warn';

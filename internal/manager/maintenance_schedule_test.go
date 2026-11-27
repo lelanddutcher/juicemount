@@ -279,3 +279,162 @@ func TestScheduledRunWaitsForOtherKind(t *testing.T) {
 		t.Fatal("compact ran though fsck outlasted waitMax")
 	}
 }
+
+// H1: two kinds firing on the same tick never both run. Each round starts
+// gc and compact-meta at the same instant; the runner tracks how many
+// sweeps run at once.
+func TestScheduledSweepsNeverOverlap(t *testing.T) {
+	var running, maxRunning, ran atomic.Int32
+	mm := newMaintenanceManager("juicefs", "", "redis://x:6379/1", "/jfs")
+	mm.SetRunner(func(_ context.Context, _ []string, _ *MaintenanceOp) error {
+		n := running.Add(1)
+		for {
+			m := maxRunning.Load()
+			if n <= m || maxRunning.CompareAndSwap(m, n) {
+				break
+			}
+		}
+		time.Sleep(200 * time.Microsecond)
+		running.Add(-1)
+		ran.Add(1)
+		return nil
+	})
+	s := newMaintenanceScheduler(mm)
+	s.waitPoll = 100 * time.Microsecond
+	s.waitMax = 5 * time.Second
+	// Both on (gc is off by default): monthly gc on the 1st and the weekly
+	// compact share 03:00 when the 1st is a Sunday.
+	if err := s.Set(MaintenanceGC, "0 3 1 * *", true); err != nil {
+		t.Fatal(err)
+	}
+	idle := func() bool {
+		mm.mu.Lock()
+		defer mm.mu.Unlock()
+		return len(mm.active) == 0
+	}
+	const rounds = 300
+	for i := 0; i < rounds; i++ {
+		gate := make(chan struct{})
+		done := make(chan struct{}, 2)
+		for _, k := range []MaintenanceKind{MaintenanceGC, MaintenanceCompactMeta} {
+			go func(k MaintenanceKind) { <-gate; s.fire(k); done <- struct{}{} }(k)
+		}
+		close(gate)
+		<-done
+		<-done
+		for !idle() {
+			time.Sleep(50 * time.Microsecond)
+		}
+	}
+	if m := maxRunning.Load(); m != 1 {
+		t.Fatalf("max sweeps at once = %d, want 1", m)
+	}
+	if r := ran.Load(); r != 2*rounds {
+		t.Fatalf("sweeps run = %d, want %d (none skipped)", r, 2*rounds)
+	}
+}
+
+// L3: a run waiting for another kind gives up when the scheduler stops.
+func TestScheduledWaitEndsOnStop(t *testing.T) {
+	mm := newMaintenanceManager("juicefs", "", "redis://x:6379/1", "/jfs")
+	block := make(chan struct{})
+	defer close(block)
+	var compacts atomic.Int32
+	mm.SetRunner(func(_ context.Context, argv []string, _ *MaintenanceOp) error {
+		if strings.Contains(strings.Join(argv, " "), "--compact") {
+			compacts.Add(1)
+			return nil
+		}
+		<-block
+		return nil
+	})
+	if _, err := mm.tryStart(MaintenanceFSCK, []string{"juicefs", "fsck", "x"}); err != nil {
+		t.Fatal(err)
+	}
+	s := newMaintenanceScheduler(mm)
+	s.waitPoll = time.Hour
+	s.Start(context.Background())
+	fired := make(chan struct{})
+	go func() { s.fire(MaintenanceCompactMeta); close(fired) }()
+	time.Sleep(50 * time.Millisecond)
+	stopped := time.Now()
+	s.Stop()
+	select {
+	case <-fired:
+	case <-time.After(2 * time.Second):
+		t.Fatal("waiting run did not end on Stop")
+	}
+	if d := time.Since(stopped); d > 2*time.Second {
+		t.Fatalf("Stop took %s", d)
+	}
+	if compacts.Load() != 0 {
+		t.Fatal("compact started after Stop")
+	}
+}
+
+// L2: a skipped run is recorded as skipped, not as a run.
+func TestSkippedRunIsNotLastRun(t *testing.T) {
+	mm := newMaintenanceManager("juicefs", "", "redis://x:6379/1", "/jfs")
+	block := make(chan struct{})
+	defer close(block)
+	mm.SetRunner(func(_ context.Context, _ []string, _ *MaintenanceOp) error { <-block; return nil })
+	if _, err := mm.tryStart(MaintenanceGC, []string{"juicefs", "gc", "x", "--delete"}); err != nil {
+		t.Fatal(err)
+	}
+	s := newMaintenanceScheduler(mm)
+	s.waitPoll, s.waitMax = time.Millisecond, 0
+	s.fire(MaintenanceCompactMeta)
+	for _, info := range s.list() {
+		if info.Kind != string(MaintenanceCompactMeta) {
+			continue
+		}
+		if info.LastRun != 0 || info.LastSkipped == 0 || !strings.Contains(info.LastSkipReason, "gc") || !info.Default {
+			t.Fatalf("after a skip: %+v, want no last_run, last_skipped with reason, still default", info)
+		}
+	}
+}
+
+// L4: without a state file nothing runs by default (an Off would not persist).
+func TestNoDefaultsWithoutStateFile(t *testing.T) {
+	mm := newMaintenanceManager("juicefs", "", "redis://x:6379/1", "/jfs")
+	s := newMaintenanceScheduler(mm)
+	s.noDefaults = true
+	for _, info := range s.list() {
+		if info.Enabled {
+			t.Fatalf("%s enabled without a state file", info.Kind)
+		}
+	}
+}
+
+func TestCompactEstimateHelpers(t *testing.T) {
+	mib := int64(1 << 20)
+	span := func(pos, l int64) sliceSpan { return sliceSpan{pos, l} }
+	var frag []sliceSpan
+	for i := int64(0); i < 48; i++ {
+		frag = append(frag, span(i*mib, mib))
+	}
+	cases := []struct {
+		name   string
+		ss     []sliceSpan
+		slices int
+		size   int64
+	}{
+		{"48 x 1 MiB: repacked", frag, 48, 48 * mib},
+		{"3 x 1 MiB: each big enough, left alone (lab)", []sliceSpan{span(0, mib), span(mib, mib), span(2*mib, mib)}, 0, 0},
+		{"one slice", []sliceSpan{span(0, 64*mib)}, 0, 0},
+		{"small pieces", []sliceSpan{span(0, 4096), span(4096, 4096)}, 2, 8192},
+		{"big first then tail of small ones", append([]sliceSpan{span(0, 32*mib)}, frag[32:40]...), 8, 8 * mib},
+		{"first overwritten in place", []sliceSpan{span(0, 4*mib), span(0, 16)}, 2, 4 * mib},
+	}
+	for _, c := range cases {
+		n, sz := repackPlan(c.ss)
+		if n != c.slices || sz != c.size {
+			t.Fatalf("%s: repackPlan = (%d, %d), want (%d, %d)", c.name, n, sz, c.slices, c.size)
+		}
+	}
+	for n, want := range map[int64]string{2: "2-4", 4: "2-4", 5: "5-19", 48: "20-98", 98: "20-98", 99: "99+", 2500: "99+"} {
+		if got := sliceBucket(n); got != want {
+			t.Fatalf("sliceBucket(%d) = %s, want %s", n, got, want)
+		}
+	}
+}
