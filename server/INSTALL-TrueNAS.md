@@ -148,6 +148,13 @@ and are not affected.
 **Back up `<data>/compose/.env` with the data.** Without it the data cannot
 be opened: the command never generates new secrets for existing data.
 
+**Set the Manager's time zone.** The Manager runs its Backups and
+Maintenance schedules in UTC unless `TZ` is set. The weekly Compact sweep
+runs Sunday at 03:00 in that zone: in UTC that is Saturday evening in the
+Americas. Add `TZ=<your IANA zone>` (for example `TZ=America/Chicago`) to
+`<data>/compose/.env`, or to the Manager's environment in a TrueNAS custom
+app, and recreate the Manager. The Manager logs the zone it uses at start.
+
 On TrueNAS, exclude `<pool>/juicemount/bucket` from recursive periodic
 snapshots. JuiceFS already keeps file and trash history in its metadata. ZFS
 snapshots of the object bucket keep deleted blocks after garbage collection,

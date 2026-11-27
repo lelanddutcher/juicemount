@@ -138,4 +138,14 @@ type maintenanceScheduleRow struct {
 	Cron    string `json:"cron"`
 	Enabled bool   `json:"enabled"`
 	LastRun int64  `json:"last_run,omitempty"` // unix-ms
+	// Default marks a row the scheduler wrote for a default schedule (to
+	// keep LastRun), not an operator choice: the kind keeps following
+	// maintenanceRecommendations. Rows saved through the API never set it,
+	// and rows from before this field all came from the API.
+	Default bool `json:"default,omitempty"`
+	// LastSkipped / LastSkipReason: the last scheduled run that did not
+	// start (another sweep ran too long, turned off while waiting, not
+	// runnable). LastRun records only runs that started.
+	LastSkipped    int64  `json:"last_skipped,omitempty"`
+	LastSkipReason string `json:"last_skip_reason,omitempty"`
 }
