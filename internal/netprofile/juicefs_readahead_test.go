@@ -68,6 +68,10 @@ func TestJuiceFSReadaheadByLink(t *testing.T) {
 	if got := p.JuiceFSReadaheadMiB(false); got != 8 {
 		t.Fatalf("JM_JFS_READAHEAD_MB=8: %d", got)
 	}
+	t.Setenv("JM_JFS_READAHEAD_MB", "5000") // review L3: juicefs refuses > 1 GiB
+	if got := p.JuiceFSReadaheadMiB(false); got != 1024 {
+		t.Fatalf("JM_JFS_READAHEAD_MB=5000: %d, want the 1024 clamp", got)
+	}
 	t.Setenv("JM_JFS_READAHEAD_MB", "0")
 	if got := p.JuiceFSReadaheadMiB(false); got != 0 {
 		t.Fatalf("JM_JFS_READAHEAD_MB=0 (rollback): %d", got)

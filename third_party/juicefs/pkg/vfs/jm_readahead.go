@@ -41,7 +41,8 @@ const jmReadaheadMinBlocks = 2
 const jmReadaheadLimit = 1 << 30
 
 // jmRun is the contiguous run of one read session: the reads since the
-// last one that started before the run or more than jmRunGap past its end.
+// last one that started before the run, more than the gap past its end, or
+// more than the gap behind its end.
 // bytes counts what was read, not the span.
 type jmRun struct {
 	start, end, bytes uint64
@@ -56,7 +57,10 @@ const jmRunGapDiv = 2
 // the run has read. Called on every read; it only tracks.
 func (f *fileReader) jmRunBytes(idx int, block *frange) uint64 {
 	r := &f.jmRuns[idx]
-	if r.bytes == 0 || block.off < r.start || block.off > r.end+f.r.blockSize/jmRunGapDiv {
+	gap := f.r.blockSize / jmRunGapDiv
+	// A read more than gap behind the run's end is a jump back (a loop of
+	// a short section, review L1), not a reordered READ: a new run.
+	if r.bytes == 0 || block.off < r.start || block.off > r.end+gap || block.off+gap < r.end {
 		*r = jmRun{start: block.off, end: block.end(), bytes: block.len}
 		return r.bytes
 	}

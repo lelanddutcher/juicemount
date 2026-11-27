@@ -515,3 +515,95 @@ func TestNFSReadaheadYieldsToJuiceFS(t *testing.T) {
 		t.Fatal("juicefs stopped: the NFS layer did not resume")
 	}
 }
+
+// Review H1: read-ahead on for at most readaheadMaxOn at a stretch; then
+// off once, and on again only through the hold.
+func TestLinkHysteresisReadaheadBoundedOnTime(t *testing.T) {
+	var h linkHysteresis
+	t0 := time.Unix(1000, 0)
+	on := lanPolicy
+	on.ReadaheadMiB = 16
+	var onAt, offAt, backAt time.Time
+	for now := t0; now.Before(t0.Add(2 * readaheadMaxOn)); now = now.Add(linkFollowTick) {
+		ra := h.observe(now, on).ReadaheadMiB
+		switch {
+		case ra > 0 && onAt.IsZero():
+			onAt = now
+		case ra == 0 && !onAt.IsZero() && offAt.IsZero():
+			offAt = now
+		case ra > 0 && !offAt.IsZero() && backAt.IsZero():
+			backAt = now
+		}
+	}
+	if onAt.IsZero() || offAt.Sub(onAt) != readaheadMaxOn {
+		t.Fatalf("on at %s, off at %s: want off %s after on", onAt.Sub(t0), offAt.Sub(t0), readaheadMaxOn)
+	}
+	if backAt.Sub(offAt) < readaheadHoldFor || backAt.Sub(offAt) > readaheadHoldFor+2*linkFollowTick {
+		t.Fatalf("back on %s after the re-check, want after the %s hold", backAt.Sub(offAt), readaheadHoldFor)
+	}
+}
+
+// Review H1, end to end with the real link estimator: a Mac on fiber (12 ms,
+// 40 MiB/s) gets read-ahead; the same tunnel then runs over an unflagged
+// hotspot (70 ms, 0.5 MiB/s). While read-ahead is on the estimate cannot
+// say metered, so read-ahead must still go off within readaheadMaxOn plus
+// the hold and stay off. On fiber, where the estimate reads low only while
+// read-ahead is on (as in the lab), read-ahead stays on most of the time.
+func TestLinkFollowerReadaheadFiberThenUnflaggedHotspot(t *testing.T) {
+	const mib = 1 << 20
+	clock := time.Unix(5000, 0)
+	p := netprofile.NewWithClock(func() time.Time { return clock })
+	j := &fakeJFS{cur: lanPolicy}
+	f := &linkFollower{exchange: j.exchange,
+		classes:   func() (netprofile.LinkClass, netprofile.LinkClass) { return p.Class(), p.ReadPolicyClass() },
+		readahead: p.JuiceFSReadaheadMiB, engineRA: p.SetEngineReadahead}
+	// One tick: an RTT sample and one read at the given rate, then the
+	// follower. biasedRate is what the estimator sees while read-ahead is on.
+	tick := func(rtt time.Duration, rate, biasedRate float64) {
+		p.ObserveRTT(rtt)
+		if j.cur.ReadaheadMiB > 0 {
+			rate = biasedRate
+		}
+		bytes := int64(max(rate/2, 256<<10))
+		dur := time.Duration(float64(bytes) / rate * float64(time.Second))
+		clock = clock.Add(dur)
+		p.ObserveThroughput(bytes, dur)
+		clock = clock.Add(linkFollowTick - dur%linkFollowTick)
+		f.tick(clock)
+	}
+	onTicks, n := 0, 0
+	for i := 0; i < 450; i++ { // 15 min on fiber
+		tick(12*time.Millisecond, 40*mib, 1*mib)
+		if i > 30 {
+			n++
+			if j.cur.ReadaheadMiB > 0 {
+				onTicks++
+			}
+		}
+	}
+	if j.cur.ReadaheadMiB == 0 && onTicks == 0 {
+		t.Fatal("fiber: read-ahead never came on")
+	}
+	if share := float64(onTicks) / float64(n); share < 0.85 {
+		t.Fatalf("fiber: read-ahead on %.0f%% of the time, want at least 85%% (re-checks only)", share*100)
+	}
+	// Same tunnel, now an unflagged hotspot: no route or cost change.
+	start := clock
+	var offAfter time.Duration
+	for i := 0; i < 300; i++ { // 10 min
+		tick(70*time.Millisecond, 0.5*mib, 0.5*mib)
+		if offAfter == 0 && j.cur.ReadaheadMiB == 0 {
+			offAfter = clock.Sub(start)
+		}
+		if offAfter > 0 && j.cur.ReadaheadMiB > 0 {
+			t.Fatalf("hotspot: read-ahead came back on %s after the switch", clock.Sub(start))
+		}
+	}
+	t.Logf("fiber: read-ahead on %d of %d ticks; hotspot: off after %s", onTicks, n, offAfter)
+	if offAfter == 0 || offAfter > readaheadMaxOn+readaheadHoldFor+2*linkFollowTick {
+		t.Fatalf("hotspot: read-ahead off after %s, want within %s", offAfter, readaheadMaxOn+readaheadHoldFor)
+	}
+	if c := p.ReadPolicyClass(); c != netprofile.ClassMetered {
+		t.Fatalf("hotspot, read-ahead off: read class %s, want metered", c)
+	}
+}

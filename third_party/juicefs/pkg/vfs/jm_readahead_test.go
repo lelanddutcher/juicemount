@@ -287,3 +287,19 @@ func TestJMWaitedSliceDroppedAfterReadyIsNotEIO(t *testing.T) {
 		t.Fatal("reader did not return")
 	}
 }
+
+// Review L1: looping a short section (a jump back more than half a block)
+// starts a new run each pass, so repeats never add up to the minimum run.
+func TestJMReadaheadLoopIsNotARun(t *testing.T) {
+	const mib = 1 << 20
+	v, bs, ino, fh := raVFS(t, 24*mib, 512<<10)
+	if got := linkMsg(v, linkSet2(0, 60000, 60000, 10, 8<<10)); got[0] != 0 {
+		t.Fatalf("set: % x", got)
+	}
+	for pass := 0; pass < 4; pass++ { // 4 x 1.5 MiB = 6 MiB read, three times the minimum run
+		readSeq(t, v, ino, fh, 4*mib, 4*mib+mib+mib/2)
+	}
+	if got := settle(bs); got != 5 {
+		t.Fatalf("looped 1.5 MiB section: highest block %d, want 5 (no read-ahead)", got)
+	}
+}

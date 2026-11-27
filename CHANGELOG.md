@@ -16,7 +16,12 @@
   Far, thin and metered links keep today's behaviour. While JuiceFS reads
   ahead, the app's own NFS read-ahead on that volume stands back, and the
   bandwidth estimate (which then reads low) no longer makes the link
-  metered. In the Linux remote lab with a macFUSE model, 12 ms and 300 Mbit/s
+  metered. Because that estimate cannot be trusted while read-ahead runs,
+  read-ahead turns off after 3 minutes on and comes back only if a fresh
+  measurement taken without it still says near and not metered (about 12 s
+  without read-ahead every 3 minutes on a good link); a link that turned into
+  an unflagged hotspot stops reading ahead within that time. In the Linux
+  remote lab with a macFUSE model, 12 ms and 300 Mbit/s
   through a tunnel: the next clip of a session read at 180–213 Mbit/s
   (before: 117–132), the first clip at 136–167 (before: 123–128); lan
   490–558 → 613–695; abroad and a thin near link unchanged.

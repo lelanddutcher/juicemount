@@ -160,7 +160,9 @@ func (p *Profile) JuiceFSReadaheadMiB(on bool) int {
 	size := juiceFSReadaheadMiB
 	if v := os.Getenv("JM_JFS_READAHEAD_MB"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
-			size = n
+			// juicefs refuses more than 1 GiB, and with it the whole
+			// policy message (timeouts and demand-first too).
+			size = min(n, juiceFSReadaheadMaxMiB)
 		}
 	}
 	if size == 0 {
@@ -208,6 +210,7 @@ const (
 	juiceFSReadaheadMiB        = 16
 	juiceFSReadaheadMaxRTT     = 100 * time.Millisecond
 	juiceFSReadaheadMinSamples = 4
+	juiceFSReadaheadMaxMiB     = 1024
 )
 
 // NFSReadahead returns the macOS NFS-client `readahead` mount option. This is
@@ -321,6 +324,14 @@ type throughputInterval struct {
 func New() *Profile {
 	p := &Profile{now: time.Now}
 	applyToProfile(p)
+	return p
+}
+
+// NewWithClock is New with an injected clock for the throughput windows
+// (tests in other packages that drive the profile with a fake clock).
+func NewWithClock(now func() time.Time) *Profile {
+	p := New()
+	p.now = now
 	return p
 }
 

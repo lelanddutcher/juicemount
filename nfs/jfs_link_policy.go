@@ -181,6 +181,10 @@ const (
 	linkFasterHold   = 60 * time.Second
 	linkFollowTick   = 2 * time.Second
 	linkVerifyPeriod = time.Minute
+	// linkVerifyReadahead: the check period while juicefs reads ahead. A
+	// restarted juicefs comes back with read-ahead off while the NFS layer's
+	// read-ahead still stands back for it (review L2).
+	linkVerifyReadahead = 10 * time.Second
 )
 
 // linkHysteresis runs one hold for demand-first and one for the object
@@ -204,11 +208,25 @@ type linkHysteresis struct {
 // open and the first GETs), so a near link reads as metered for a moment.
 // With the linkHold rules that first reading became the decision and the
 // read-ahead then waited linkFasterHold to come on (lab, 2026-11-27).
+//
+// Bounded on-time (review H1): while read-ahead is on, the bandwidth
+// estimate reads low and may not mark the link metered (netprofile
+// JuiceFSReadaheadMiB), so a near link that turns into an unflagged hotspot
+// under the same tunnel would keep read-ahead for the whole session. After
+// readaheadMaxOn on, the hold turns it off once; it comes back only after a
+// measurement taken with it off says not metered for readaheadHoldFor.
 type readaheadHold struct {
 	stable, pending int
 	pendingSet      bool
 	since           time.Time
+	onSince         time.Time
 }
+
+// readaheadMaxOn bounds one stretch of read-ahead. Each re-check costs a
+// near link about 12 s without read-ahead (the estimate recovers in about a
+// second of reading, then the 10 s hold); a link that turned thin stops
+// after at most this long.
+const readaheadMaxOn = 3 * time.Minute
 
 // readaheadHoldFor is the read-ahead hold, both ways. Off waits too: one
 // metered reading on a near link must not stop a playback's read-ahead, and
@@ -218,6 +236,12 @@ const readaheadHoldFor = 10 * time.Second
 
 func (h *readaheadHold) observe(now time.Time, want int) int {
 	want = max(want, 0)
+	if h.stable > 0 && now.Sub(h.onSince) >= readaheadMaxOn {
+		// Re-qualify: off now, and on again only through the hold, from a
+		// request made while it is off (the follower passes on=false).
+		h.stable, h.pendingSet = 0, false
+		return 0
+	}
 	if want == h.stable {
 		h.pendingSet = false
 		return h.stable
@@ -226,6 +250,9 @@ func (h *readaheadHold) observe(now time.Time, want int) int {
 		h.pending, h.since, h.pendingSet = want, now, true
 	}
 	if now.Sub(h.since) >= readaheadHoldFor {
+		if h.stable == 0 && want > 0 {
+			h.onSince = now
+		}
 		h.stable, h.pendingSet = want, false
 	}
 	return h.stable
@@ -384,7 +411,11 @@ func (f *linkFollower) tick(now time.Time) {
 	if f.noReadahead {
 		target.ReadaheadMiB = -1
 	}
-	if f.haveApplied && f.applied == target && now.Sub(f.verifiedAt) < linkVerifyPeriod {
+	verify := linkVerifyPeriod
+	if f.raOn {
+		verify = linkVerifyReadahead
+	}
+	if f.haveApplied && f.applied == target && now.Sub(f.verifiedAt) < verify {
 		return
 	}
 	cur, err := f.exchange(nil)
