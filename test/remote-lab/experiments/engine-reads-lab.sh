@@ -182,6 +182,9 @@ run() {
         long_save "$label" ;;
       offline)
         offline "$profile" "$label" ;;
+      metrics)
+        in_client sh -c 'wget -q -O - http://127.0.0.1:21050/metrics' | grep -iE 'ssd|cold_subread|warm_subread|bytes_read|read_fail' \
+          > "$OUT/$label.metrics.txt" || true ;;
     esac
   done
   stop_jm5 # first: jm5 logs its final engine counters on exit
