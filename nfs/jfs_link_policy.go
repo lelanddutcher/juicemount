@@ -42,9 +42,13 @@ const (
 	jfsLinkPolicyVersion   = 1
 	jfsLinkPolicyVersion2  = 2
 	jfsLinkFlagDemandFirst = 1
-	jfsLinkReplyLen        = 1 + 1 + 4 + 4 + 1
-	jfsLinkReplyLen2       = jfsLinkReplyLen + 4
-	jfsLinkTimeout         = 10 * time.Second
+	// jfsLinkFlagNoReadComp: a read never starts a compaction (juicefs
+	// patch 0036, netprofile.JuiceFSReadCompaction). A juicefs without the
+	// patch ignores the bit and never reports it; see linkFollower.noReadCompUnsupported.
+	jfsLinkFlagNoReadComp = 2
+	jfsLinkReplyLen       = 1 + 1 + 4 + 4 + 1
+	jfsLinkReplyLen2      = jfsLinkReplyLen + 4
+	jfsLinkTimeout        = 10 * time.Second
 )
 
 // jfsLinkPolicy is the set of juicefs settings that follow the link.
@@ -56,6 +60,10 @@ type jfsLinkPolicy struct {
 	// ReadaheadMiB is juicefs's read-ahead of one sequential reader (0 =
 	// off); -1 when juicefs cannot set it (no patch 0035).
 	ReadaheadMiB int
+	// NoReadCompaction: juicefs --no-read-compaction (patch 0036). Not set
+	// by jfsLinkPolicyFor; the follower adds it from
+	// netprofile.JuiceFSReadCompaction. Both message versions carry it.
+	NoReadCompaction bool
 }
 
 // The upstream defaults: what a fast mount runs with (a medium mount adds
@@ -90,6 +98,9 @@ func encodeLinkPolicy(p jfsLinkPolicy, version byte) []byte {
 	if p.DemandFirst {
 		flags |= jfsLinkFlagDemandFirst
 	}
+	if p.NoReadCompaction {
+		flags |= jfsLinkFlagNoReadComp
+	}
 	b := []byte{flags}
 	b = binary.BigEndian.AppendUint32(b, uint32(p.GetTimeout/time.Millisecond))
 	b = binary.BigEndian.AppendUint32(b, uint32(p.PutTimeout/time.Millisecond))
@@ -102,11 +113,12 @@ func encodeLinkPolicy(p jfsLinkPolicy, version byte) []byte {
 
 func decodeLinkPolicy(b []byte) jfsLinkPolicy {
 	p := jfsLinkPolicy{
-		DemandFirst:  b[0]&jfsLinkFlagDemandFirst != 0,
-		GetTimeout:   time.Duration(binary.BigEndian.Uint32(b[1:5])) * time.Millisecond,
-		PutTimeout:   time.Duration(binary.BigEndian.Uint32(b[5:9])) * time.Millisecond,
-		IORetries:    int(b[9]),
-		ReadaheadMiB: -1,
+		DemandFirst:      b[0]&jfsLinkFlagDemandFirst != 0,
+		NoReadCompaction: b[0]&jfsLinkFlagNoReadComp != 0,
+		GetTimeout:       time.Duration(binary.BigEndian.Uint32(b[1:5])) * time.Millisecond,
+		PutTimeout:       time.Duration(binary.BigEndian.Uint32(b[5:9])) * time.Millisecond,
+		IORetries:        int(b[9]),
+		ReadaheadMiB:     -1,
 	}
 	if len(b) >= jfsLinkReplyLen2-1 {
 		p.ReadaheadMiB = int(binary.BigEndian.Uint32(b[10:14]) >> 10)
@@ -194,10 +206,13 @@ const (
 // demand-first stays on: one hold over the whole policy restarted on each
 // change and kept a lan mount's whole-block reads abroad for minutes.
 //
-// The read-ahead has its own hold (readaheadHold).
+// The read-ahead has its own hold (readaheadHold). Read compaction has a
+// hold of its own too: turning it off is the cautious move
+// (linkSlowerHold), turning it back on waits linkFasterHold.
 type linkHysteresis struct {
 	demand    linkHold[bool]
 	timeouts  linkHold[jfsLinkTimeouts]
+	noComp    linkHold[bool]
 	readahead readaheadHold
 }
 
@@ -310,8 +325,10 @@ func (h *linkHysteresis) observe(now time.Time, want jfsLinkPolicy) jfsLinkPolic
 	d := h.demand.observe(now, want.DemandFirst, want.DemandFirst && !h.demand.stable)
 	wt := jfsLinkTimeouts{want.GetTimeout, want.PutTimeout, want.IORetries}
 	t := h.timeouts.observe(now, wt, wt.get > h.timeouts.stable.get)
+	nc := h.noComp.observe(now, want.NoReadCompaction, want.NoReadCompaction && !h.noComp.stable)
 	ra := h.readahead.observe(now, want.ReadaheadMiB)
-	return jfsLinkPolicy{DemandFirst: d, GetTimeout: t.get, PutTimeout: t.put, IORetries: t.retries, ReadaheadMiB: ra}
+	return jfsLinkPolicy{DemandFirst: d, GetTimeout: t.get, PutTimeout: t.put, IORetries: t.retries,
+		NoReadCompaction: nc, ReadaheadMiB: ra}
 }
 
 // linkFollower keeps the juicefs policy equal to the hysteresis output.
@@ -327,6 +344,13 @@ type linkFollower struct {
 	// estimator (netprofile SetEngineReadahead); raOn is the last report.
 	engineRA func(on bool)
 	raOn     bool
+	// readCompaction: netprofile.JuiceFSReadCompaction of the live profile.
+	// nil: reads may compact (tests that do not exercise it).
+	readCompaction func() bool
+	// noReadCompUnsupported: juicefs answered a set of NoReadCompaction
+	// without it (a juicefs without patch 0036). The follower stops asking
+	// for it, so it does not send the policy again every tick.
+	noReadCompUnsupported bool
 
 	hyst        linkHysteresis
 	applied     jfsLinkPolicy
@@ -358,6 +382,7 @@ func newLinkFollower(ctl *jfsControl) *linkFollower {
 			netprofile.Default().SetEngineReadahead(on)
 			setJFSReadaheadActive(ctl.root, on)
 		},
+		readCompaction: func() bool { return netprofile.Default().JuiceFSReadCompaction() },
 	}
 }
 
@@ -404,10 +429,14 @@ func (f *linkFollower) tick(now time.Time) {
 	}
 	class, readClass := f.classes()
 	want := jfsLinkPolicyFor(class, readClass)
+	want.NoReadCompaction = f.readCompaction != nil && !f.readCompaction() && !f.noReadCompUnsupported
 	if f.readahead != nil {
 		want.ReadaheadMiB = f.readahead(f.hyst.readahead.stable > 0)
 	}
 	target := f.hyst.observe(now, want)
+	if f.noReadCompUnsupported {
+		target.NoReadCompaction = false
+	}
 	if f.noReadahead {
 		target.ReadaheadMiB = -1
 	}
@@ -431,7 +460,13 @@ func (f *linkFollower) tick(now time.Time) {
 				"demand_first", set.DemandFirst, "was_demand_first", cur.DemandFirst,
 				"get_timeout_s", int(set.GetTimeout.Seconds()), "was_get_timeout_s", int(cur.GetTimeout.Seconds()),
 				"put_timeout_s", int(set.PutTimeout.Seconds()), "io_retries", set.IORetries,
-				"readahead_mib", set.ReadaheadMiB, "was_readahead_mib", cur.ReadaheadMiB)
+				"readahead_mib", set.ReadaheadMiB, "was_readahead_mib", cur.ReadaheadMiB,
+				"read_compaction", !set.NoReadCompaction, "was_read_compaction", !cur.NoReadCompaction)
+			if target.NoReadCompaction && !set.NoReadCompaction {
+				f.noReadCompUnsupported = true
+				jmlog.Info("juicefs link policy: this juicefs cannot turn read compaction off; reads compact as upstream")
+				target.NoReadCompaction = false
+			}
 			cur = set
 		}
 	}
@@ -532,6 +567,9 @@ func JFSLinkPolicyFlags(prof *netprofile.Profile) []string {
 	}
 	if p.DemandFirst {
 		args = append(args, "--demand-first")
+	}
+	if !prof.JuiceFSReadCompaction() {
+		args = append(args, "--no-read-compaction")
 	}
 	return args
 }

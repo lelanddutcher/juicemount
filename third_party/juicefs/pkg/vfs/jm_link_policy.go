@@ -9,6 +9,8 @@
  * Body: version(1) = 1 or 2, then either nothing (a query) or
  *
  *	flags(1)           bit 1: demand-first (patch 0020 and 0021 spans)
+ *	                   bit 2: no read compaction (patch 0036,
+ *	                   pkg/meta/jm_read_compaction.go)
  *	get_timeout_ms(4)  --get-timeout
  *	put_timeout_ms(4)  --put-timeout
  *	io_retries(1)      --io-retries of a block upload
@@ -25,10 +27,13 @@
  *
  * Reply: errno(1), then on errno 0 the settings in force afterwards in the
  * layout of the request's version: 11 bytes for version 1, 15 for version 2
- * (read-ahead 0 when it is below one block). EINVAL: an unknown version, a
- * short body, or values outside 1 s..30 min, 0..50 retries and 0..1 GiB of
- * read-ahead (nothing changes). ENOTSUP: the store has no such settings. A
- * version 1 message leaves the read-ahead as it is.
+ * (read-ahead 0 when it is below one block). A sender from before patch
+ * 0036 never sets bit 2, so its message turns read compaction back on (the
+ * upstream behaviour); a juicefs from before it ignores bit 2 and never
+ * reports it. EINVAL: an unknown version, a short body, or values outside
+ * 1 s..30 min, 0..50 retries and 0..1 GiB of read-ahead (nothing changes).
+ * ENOTSUP: the store has no such settings. A version 1 message leaves the
+ * read-ahead as it is.
  */
 
 package vfs
@@ -39,6 +44,7 @@ import (
 	"time"
 
 	"github.com/juicedata/juicefs/pkg/chunk"
+	"github.com/juicedata/juicefs/pkg/meta"
 	"github.com/juicedata/juicefs/pkg/utils"
 )
 
@@ -48,6 +54,7 @@ const (
 	jmLinkPolicyBodyLen   = 1 + 4 + 4 + 1
 	jmLinkPolicyBodyLen2  = jmLinkPolicyBodyLen + 4
 	jmLinkFlagDemandFirst = 1
+	jmLinkFlagNoReadComp  = 2 // patch 0036
 )
 
 // jmReadaheadSetter: a reader whose read-ahead a message may set
@@ -116,11 +123,14 @@ func (v *VFS) jmLinkPolicyMsg(r *utils.Buffer, out io.Writer) {
 		return
 	}
 	var now chunk.JMLinkPolicy
+	var noReadComp bool
 	switch r.Left() {
 	case 0:
 		now = store.JMLinkPolicy()
 	case bodyLen:
-		p := chunk.JMLinkPolicy{DemandFirst: r.Get8()&jmLinkFlagDemandFirst != 0}
+		flags := r.Get8()
+		p := chunk.JMLinkPolicy{DemandFirst: flags&jmLinkFlagDemandFirst != 0}
+		noReadComp = flags&jmLinkFlagNoReadComp != 0
 		p.GetTimeout = time.Duration(r.Get32()) * time.Millisecond
 		p.PutTimeout = time.Duration(r.Get32()) * time.Millisecond
 		p.MaxRetries = int(r.Get8())
@@ -136,6 +146,11 @@ func (v *VFS) jmLinkPolicyMsg(r *utils.Buffer, out io.Writer) {
 			fail(syscall.EINVAL)
 			return
 		}
+		if g, ok := v.Meta.(meta.JMReadCompactionGate); ok {
+			if was := g.JMSetReadCompaction(!noReadComp); was == noReadComp {
+				logger.Infof("read compaction %s by the link policy", map[bool]string{true: "off", false: "on"}[noReadComp])
+			}
+		}
 		if ra != nil {
 			ra.JMSetReadahead(raBytes)
 		}
@@ -148,6 +163,9 @@ func (v *VFS) jmLinkPolicyMsg(r *utils.Buffer, out io.Writer) {
 	var flags uint8
 	if now.DemandFirst {
 		flags |= jmLinkFlagDemandFirst
+	}
+	if g, ok := v.Meta.(meta.JMReadCompactionGate); ok && !g.JMReadCompaction() {
+		flags |= jmLinkFlagNoReadComp
 	}
 	w.Put8(flags)
 	w.Put32(uint32(now.GetTimeout / time.Millisecond))

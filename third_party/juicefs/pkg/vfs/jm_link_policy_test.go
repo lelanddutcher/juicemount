@@ -93,3 +93,38 @@ func TestJMLinkPolicyVFSRetriesFollow(t *testing.T) {
 		t.Fatalf("after a refused message: retries %d", got)
 	}
 }
+
+// Flag bit 2 (patch 0036) turns read compaction off in the meta client and
+// is reported back; a message without it turns read compaction on again.
+func TestJMLinkPolicyReadCompactionBit(t *testing.T) {
+	v := pinVFS(t)
+	g := v.Meta.(meta.JMReadCompactionGate)
+	if !g.JMReadCompaction() {
+		t.Fatal("read compaction must start on")
+	}
+	off := linkSet(jmLinkFlagDemandFirst|jmLinkFlagNoReadComp, 120000, 180000, 3)
+	if got := linkMsg(v, off); !bytes.Equal(got, append([]byte{0}, off[1:]...)) {
+		t.Fatalf("set off: % x", got)
+	}
+	if g.JMReadCompaction() {
+		t.Fatal("bit 2 did not turn read compaction off")
+	}
+	if got := linkMsg(v, []byte{jmLinkPolicyVersion}); !bytes.Equal(got, append([]byte{0}, off[1:]...)) {
+		t.Fatalf("query after off: % x", got)
+	}
+	on := linkSet(jmLinkFlagDemandFirst, 60000, 60000, 10)
+	if got := linkMsg(v, on); !bytes.Equal(got, append([]byte{0}, on[1:]...)) {
+		t.Fatalf("set on: % x", got)
+	}
+	if !g.JMReadCompaction() {
+		t.Fatal("a message without bit 2 did not turn read compaction on")
+	}
+	// A refused message changes neither.
+	g.JMSetReadCompaction(false)
+	if got := linkMsg(v, linkSet(0, 0, 60000, 3)); !bytes.Equal(got, []byte{uint8(syscall.EINVAL)}) {
+		t.Fatalf("refusal: % x", got)
+	}
+	if g.JMReadCompaction() {
+		t.Fatal("a refused message turned read compaction on")
+	}
+}

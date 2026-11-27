@@ -303,3 +303,27 @@ func TestJMReadaheadLoopIsNotARun(t *testing.T) {
 		t.Fatalf("looped 1.5 MiB section: highest block %d, want 5 (no read-ahead)", got)
 	}
 }
+
+// Version 2 carries patch 0036's bit 2 like version 1: it sets and reports
+// the read-compaction gate together with the read-ahead.
+func TestJMReadaheadMessageReadCompactionBit(t *testing.T) {
+	v := pinVFS(t) // 1 MiB blocks
+	g := v.Meta.(meta.JMReadCompactionGate)
+	off := linkSet2(jmLinkFlagDemandFirst|jmLinkFlagNoReadComp, 120000, 180000, 3, 16<<10)
+	if got := linkMsg(v, off); !bytes.Equal(got, append([]byte{0}, off[1:]...)) {
+		t.Fatalf("set off: % x", got)
+	}
+	if g.JMReadCompaction() {
+		t.Fatal("version 2 bit 2 did not turn read compaction off")
+	}
+	if got := linkMsg(v, []byte{jmLinkPolicyVersion2}); !bytes.Equal(got, append([]byte{0}, off[1:]...)) {
+		t.Fatalf("query after off: % x", got)
+	}
+	on := linkSet2(jmLinkFlagDemandFirst, 60000, 60000, 10, 16<<10)
+	if got := linkMsg(v, on); !bytes.Equal(got, append([]byte{0}, on[1:]...)) {
+		t.Fatalf("set on: % x", got)
+	}
+	if !g.JMReadCompaction() {
+		t.Fatal("a version 2 message without bit 2 did not turn read compaction on")
+	}
+}

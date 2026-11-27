@@ -36,6 +36,12 @@ func TestJuiceFSLivePolicyMatchesMountArgs(t *testing.T) {
 			p.ObserveRTT(500 * time.Microsecond)
 			return p
 		},
+		"lan through a tunnel": func() *netprofile.Profile {
+			p := netprofile.New()
+			p.SetBackendRoute("utun4", true)
+			p.ObserveRTT(500 * time.Microsecond)
+			return p
+		},
 		"far, RTT only": func() *netprofile.Profile {
 			p := netprofile.New()
 			p.ObserveRTT(200 * time.Millisecond)
@@ -51,9 +57,10 @@ func TestJuiceFSLivePolicyMatchesMountArgs(t *testing.T) {
 		},
 	}
 	sawSplit := false
-	for _, env := range [][2]string{{"", ""}, {"0", ""}, {"", "0"}} {
+	for _, env := range [][3]string{{"", "", ""}, {"0", "", ""}, {"", "0", ""}, {"", "", "1"}} {
 		t.Setenv("JM_JFS_DEMAND_FIRST", env[0])
 		t.Setenv("JM_JFS_OBJECT_TIMEOUTS", env[1])
+		t.Setenv("JM_JFS_READ_COMPACTION", env[2])
 		for name, mk := range profiles {
 			p := mk()
 			if p.Class() != p.ReadPolicyClass() {

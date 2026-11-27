@@ -61,6 +61,7 @@ PATCH_FILES = {
     "patches/0033-control-lane.patch": ["pkg/vfs/handle.go", "pkg/vfs/internal.go", "pkg/vfs/vfs.go"],
     "patches/0034-opentelemetry-security-update.patch": ["go.mod", "go.sum"],
     "patches/0035-live-readahead.patch": ["pkg/vfs/reader.go"],
+    "patches/0036-no-read-compaction.patch": ["cmd/flags.go", "cmd/mount.go", "pkg/meta/base.go"],
 }
 VERSION_PACKAGE = "github.com/juicedata/juicefs/pkg/version"
 

@@ -8,7 +8,7 @@
   direct Tailscale path, about 12 ms). macFUSE hands JuiceFS one read of a
   file at a time, so only about 1 MiB of a clip was on the link at once: the
   laptop read one file at 128–156 Mbit/s over a path that carries
-  303 Mbit/s. The bundled JuiceFS (patch 0035, `-jm19`) can now read ahead
+  303 Mbit/s. The bundled JuiceFS (patch 0035, `-jm21`) can now read ahead
   for a sequential reader while the volume is mounted, and the app turns
   that on (16 MiB) when the link is near (round trip under 100 ms) and not
   metered, after the same answer held for 10 s. A reader gets it only after
@@ -35,6 +35,26 @@
   most of them). The app's NFS layer retries a failed cold read, so on the
   Mac they would mostly have cost a second read; the laptop has not
   measured it.
+
+- A Mac away from the NAS no longer repacks a teammate's file when it reads
+  it. JuiceFS repacks ("compacts") a part of a file that was written in 5 or
+  more pieces whenever it reads that part: it downloads every piece and
+  uploads the merged result. For a 48 MiB file saved in 48 pieces that is
+  about 50 MB down and 50 MB up, even to read a few bytes, and abroad it
+  takes minutes. When the teammate's own JuiceFS, near the NAS, repacked the
+  same part first, the Mac's upload was thrown away ("compaction ... is
+  wasted"): on a remote laptop this cost about 100 MB once per session. Now
+  the app turns read compaction off unless the link is medium or fast, the
+  round trip is short and the route is not a tunnel (bundled juicefs patch
+  0036, `-jm19`); it follows the live link class. Every writer still repacks a
+  part at 99 pieces, so slice counts stay bounded; readers near the NAS
+  still repack too. The Manager's compact schedule (off by default) can
+  repack on the NAS without WAN traffic. Reads are unchanged:
+  compaction is never needed for a read to be correct.
+  `JM_JFS_READ_COMPACTION=1` restores compaction on every link. In the Linux
+  remote lab abroad (200 ms, 1 % loss, 30 Mbit/s) a first read of such a
+  file moved 1 MB instead of 51 MB down and 50–55 MB up; on lan nothing
+  changed. The Mac still needs the laptop run.
 
 - Playing a clip while a teammate saves it no longer stalls as often on a
   far link (finding R1). Each part of the teammate's save used to change the
