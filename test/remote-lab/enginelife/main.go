@@ -51,6 +51,7 @@ var (
 	label    = flag.String("label", "", "label in every line")
 	seconds  = flag.Int("seconds", 90, "hold: how long to hold")
 	expect   = flag.String("expect", enginehost.ExpectedJuiceFSVersion, "juicefs version the supervisor expects")
+	helperLg = flag.String("helper-log", "/var/jm/enginelife-helper.log", "the helper's log (appended)")
 )
 
 func emit(check string, v map[string]any) {
@@ -151,7 +152,7 @@ func config(rec *recorder) enginehost.Config {
 		"--read-only", "--cache-size", "0"}
 	cfg := enginehost.Config{
 		Bin: *bin, Args: args, Env: baseEnv(), MetaPassword: password(),
-		LogPath: "/var/jm/enginelife-helper.log", ExpectVersion: *expect,
+		LogPath: *helperLg, ExpectVersion: *expect,
 	}
 	if rec != nil {
 		cfg.OnEvent = rec.add
