@@ -1,0 +1,10 @@
+--- a/cmd/main.go
++++ b/cmd/main.go
+@@ -85,6 +85,7 @@
+ 			cmdClone(),
+ 			cmdSummary(),
+ 			cmdCompact(),
++			cmdJMEngine(), // JuiceMount patch 0037
+ 		},
+ 	}
+ 

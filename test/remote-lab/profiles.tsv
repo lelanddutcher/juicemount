@@ -21,3 +21,5 @@ cellular    120     60         0         20         20
 # thin-near: a near but thin link (a phone underlay the OS does not flag),
 # under the 3 MiB/s metered threshold. Checks the metered class holds.
 thin-near   20      0          0         16         8
+# down: every packet lost both ways (a link outage; engine-life-lab.sh E6).
+down        0       0          100       0          0

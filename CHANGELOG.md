@@ -4,6 +4,16 @@
 
 ### App
 
+- Engine-direct, step 1 (off by default). The app can start the bundled
+  juicefs as a helper process with no mount (`juicefs jm-engine`, bundled
+  juicefs patch 0037, `-jm22`), watch it over a private local socket, restart
+  it if it dies or stops answering, and stop it on quit. In this step the
+  helper is read-only, has no cache and carries no user data; the macFUSE
+  path is unchanged. The helper gets the Redis password and the object key
+  through a private pipe, not its environment. Turn it on for a test with
+  `defaults write com.juicemount.app engineLevel -string shadow` (or
+  `JM_ENGINE=shadow` for the command-line server); unset is today's
+  behaviour. The helper's log is `juicefs-engine.log` beside `juicefs.log`.
 - A Mac away from the NAS no longer repacks a teammate's file when it reads
   it. JuiceFS repacks ("compacts") a part of a file that was written in 5 or
   more pieces whenever it reads that part: it downloads every piece and
