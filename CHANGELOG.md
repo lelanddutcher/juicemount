@@ -14,6 +14,14 @@
   `defaults write com.juicemount.app engineLevel -string shadow` (or
   `JM_ENGINE=shadow` for the command-line server); unset is today's
   behaviour. The helper's log is `juicefs-engine.log` beside `juicefs.log`.
+- JuiceFS no longer answers "input/output error" to a read whose data had
+  already arrived. A cleanup could drop a finished block buffer while a read
+  still waited on it, and the read-error retry change (bundled JuiceFS patch
+  0030) turned that into an error. The Linux lab saw 6–41 such reads in 30 s
+  of one sequential read (the Linux kernel retried most of them). The app's
+  NFS layer retries a failed cold read, so on the Mac they mostly cost a
+  second read. No released version has this bug. Bundled JuiceFS `-jm20`.
+
 - A Mac away from the NAS no longer repacks a teammate's file when it reads
   it. JuiceFS repacks ("compacts") a part of a file that was written in 5 or
   more pieces whenever it reads that part: it downloads every piece and

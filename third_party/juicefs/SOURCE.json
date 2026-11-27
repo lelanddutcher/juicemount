@@ -1075,7 +1075,7 @@
       "upstream_sha256": "72e176b7c4e2c3a3fcd93646998235a93197298d8f6ca12742eccac53bd869b8"
     },
     "pkg/vfs/reader.go": {
-      "sha256": "1b104480b4f6a0de96d18842395d6b8109d41b891ecd91537619ad18886bb392",
+      "sha256": "595f927e7b7e5a356b6a2b74c64dc835b9b987c6b31457dbcc09ac8c4afc33a4",
       "upstream_sha256": "0daec90c25b4ce8872423bb4d5541cf752f45f5110381ab1c822116a2461a60d"
     },
     "pkg/vfs/vfs.go": {
@@ -1187,7 +1187,7 @@
     "pkg/vfs/jm_pin.go": "2f229860b5593348913bcbb5903d17d759f9826f5da8517ef6c01a66f783c39c",
     "pkg/vfs/jm_pin_test.go": "cf3bf39834e7b130c755cdeb5aa0712f8eebe947a73e3aacf762904f93277f2b",
     "pkg/vfs/jm_read_recover.go": "abdf2ac8cbb6ee55f65edf4ed59afd5041d7ea55a525cca8bbbefc5f27118af5",
-    "pkg/vfs/jm_read_recover_test.go": "746c9d865680dfe67e07686045cad3cdd16e00e0cddbd8cacebf65416bc5ff92",
+    "pkg/vfs/jm_read_recover_test.go": "1949dc48d46f67da1ef20ce073f0278d74f7cf4d411b9fbf22c5cb25dafbd631",
     "pkg/vfs/jm_refresh.go": "3c20b6fda0973596b4843e39b70043040fb3f6b004fa85e92c50c5e873ebd3e2",
     "pkg/vfs/jm_refresh_test.go": "cb424118e8c0d986055e128333d20d6db424d6e3bfe23a970b253cf46feb971f",
     "pkg/vfs/jm_upload_lane.go": "c35d3cda2fa958933f21e1e39a2f48ce4605ccb2e6d2e6e53fe6ceaecbf670b1",
@@ -1225,7 +1225,7 @@
     "patches/0027-live-link-policy.patch": "a426454b44ec0e455f03c8f0d5fe3b4c9b8fa8ecba04ed7f74a9e96446728fd0",
     "patches/0028-open-round-trips.patch": "432401890a0887d55a8c95c8ef66eb99ce31c74f70e1701d99653f053ed07c5f",
     "patches/0029-dead-peer-detection.patch": "46931f7b317b89cfc16aafbc055b6b662724dc30b5c396020711c509c4ab4e9f",
-    "patches/0030-read-error-retry.patch": "2b097e51dcf5819bec505575b869fae70001e92f4ef04931dd565bf863fedfef",
+    "patches/0030-read-error-retry.patch": "1c3e1131e534ce1247115248862e27a32ced824ce1630999c789dff4c5b1c1ea",
     "patches/0031-refresh-open-file.patch": "677428d084f6a0f8012eb467351493e239f5dd51b52d114c189dc1534cce5ab6",
     "patches/0032-refresh-keeps-current-buffers.patch": "ff7fc37fc4d10d4db24bdf65d25a4d5a786badbc7cfccb8a4d8331980bef67ab",
     "patches/0033-control-lane.patch": "7366007504ddf3be56cd4a27e18d55a371649db8119c8d7fc4dbb17b03a73c91",

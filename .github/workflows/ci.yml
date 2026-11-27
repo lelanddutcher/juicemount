@@ -81,8 +81,9 @@ jobs:
           # Patch 0024: the small-upload lane through the vfs write, background
           # flush and fsync paths. Patch 0025: the pin control message.
           # Patch 0027: the live link policy message. Patch 0030: a stored
-          # read error is retried. Patch 0031: the open-file refresh message.
-          go test -count=1 -race -run 'TestJMUploadLane|TestJMPin|TestJMLinkPolicy|TestReadError|TestJMRefresh' ./pkg/vfs
+          # read error is retried, and a read whose slice finished
+          # before a drop is not an EIO. Patch 0031: the open-file refresh message.
+          go test -count=1 -race -run 'TestJMUploadLane|TestJMPin|TestJMLinkPolicy|TestReadError|TestJMWaited|TestJMRefresh' ./pkg/vfs
           # Patch 0037: the engine socket server and its message format.
           go test -count=1 -race ./pkg/jmengine/...
       - name: Vendored juicefs Redis metadata tests
