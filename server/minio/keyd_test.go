@@ -1515,3 +1515,119 @@ func TestKeydSeqGateAloneBlocksSameSeq(t *testing.T) {
 		t.Fatalf("seq 4 is a new request: adds %q", r.calls("add"))
 	}
 }
+
+// The objkeys folder emptied while keyd runs: the next cycle recreates
+// results/, so a key created after that still reaches the Manager instead
+// of being removed as undeliverable until keyd restarts.
+func TestKeydRecreatesMissingResultsDir(t *testing.T) {
+	r := newKeydRig(t)
+	r.desired(desiredJSON(1, ""))
+	cmd := exec.Command(keydBash(t), "keyd.sh")
+	var out keydOutput
+	cmd.Stdout, cmd.Stderr = &out, &out
+	cmd.Env = []string{
+		"PATH=/usr/bin:/bin", "TMPDIR=" + r.state, "MC=" + filepath.Join(r.state, "mc"),
+		"FAKE_MC_STATE=" + r.state, "JM_OBJ_PER_MAC_SERVER=1", "JM_KEYD_INTERVAL=1",
+		"JM_OBJKEYS_DIR=" + r.dir, "JM_MINIO_ENDPOINT=http://minio:9000",
+		"JM_OBJ_KEYADMIN_SECRET_KEY=" + keyadminSecret,
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = cmd.Process.Kill(); _ = cmd.Wait() }()
+	waitFor := func(what string, ok func() bool) {
+		t.Helper()
+		deadline := time.Now().Add(10 * time.Second)
+		for !ok() {
+			if time.Now().After(deadline) {
+				t.Fatalf("%s: not within 10 s\n%s", what, out.String())
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
+	waitFor("first applied.json", func() bool { _, err := os.Stat(filepath.Join(r.dir, "applied.json")); return err == nil })
+	entries, err := os.ReadDir(r.dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if err := os.RemoveAll(filepath.Join(r.dir, e.Name())); err != nil {
+			t.Fatal(err)
+		}
+	}
+	name := macName(1, 1)
+	r.desired(desiredJSON(2, "", name))
+	res := filepath.Join(r.dir, "results", name+".json")
+	waitFor("result of a key created after the wipe", func() bool { _, err := os.Stat(res); return err == nil })
+	if !r.exists(name) {
+		t.Fatalf("the key was removed again:\n%s", out.String())
+	}
+	if fi, err := os.Stat(filepath.Join(r.dir, "results")); err != nil || fi.Mode().Perm() != 0o700 {
+		t.Fatalf("results/ mode: %v %v", fi.Mode(), err)
+	}
+	if !strings.Contains(out.String(), "recreated") {
+		t.Fatalf("no log line for the recreated folder:\n%s", out.String())
+	}
+}
+
+// A keyd cycle must not cost one svcacct info per live key: with many Macs
+// that made every approve and every revoke wait several seconds longer
+// (lab, 20 keys: approve p95 5.1 s, revoke 5.0 s). A new key is read at
+// once; a known key again after JM_KEYD_REVERIFY seconds, a few per cycle,
+// so a change MinIO reports still reaches applied.json. (exists still comes
+// from every cycle's svcacct ls.)
+func TestKeydInfoCostBoundedPerCycle(t *testing.T) {
+	r := newKeydRig(t)
+	var names []string
+	for i := 1; i <= 12; i++ {
+		names = append(names, macName(i, 1))
+		r.key(macName(i, 1), "jm-macs")
+	}
+	r.desired(desiredJSON(1, "", names...))
+	allVerified := func(ns []string) func() bool {
+		return func() bool {
+			if _, err := os.Stat(filepath.Join(r.dir, "applied.json")); err != nil {
+				return false
+			}
+			a := r.applied()
+			for _, n := range ns {
+				if k, ok := a.key(n); !ok || !k.Exists || k.Parent != "jm-macs" || k.Status != "on" || !k.ImpliedPolicy {
+					return false
+				}
+			}
+			return true
+		}
+	}
+	// Every applied cycle lists twice (before and after it applies).
+	window := func(l *keydLoop, cycles int) (info, done int) {
+		i0, ls0 := len(r.calls("info")), len(r.calls("ls"))
+		l.cycles(2 * cycles)
+		return len(r.calls("info")) - i0, (len(r.calls("ls")) - ls0) / 2
+	}
+
+	l := r.startLoop("JM_KEYD_REVERIFY=600")
+	l.waitFor("12 keys verified", 10*time.Second, allVerified(names))
+	if info, done := window(l, 3); info != 0 {
+		t.Fatalf("%d cycles with %d unchanged, freshly read keys made %d svcacct info calls, want 0", done, len(names), info)
+	}
+	fresh := macName(50, 1)
+	r.desired(desiredJSON(2, "", append(names, fresh)...))
+	l.waitFor("the new key verified in applied.json", 10*time.Second, allVerified([]string{fresh}))
+	l.stop(10 * time.Second)
+
+	// Known keys are read again after JM_KEYD_REVERIFY, at most 3 a cycle.
+	l = r.startLoop("JM_KEYD_REVERIFY=1")
+	l.waitFor("13 keys verified", 10*time.Second, allVerified(append(names, fresh)))
+	l.cycles(4) // a new process reads every key once first
+	if info, done := window(l, 4); info > 3*(done+1) {
+		t.Fatalf("%d cycles re-read %d known keys, want at most 3 a cycle", done, info)
+	}
+	if err := os.WriteFile(filepath.Join(r.state, "parent."+names[0]), []byte("jm-gc"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	l.waitFor("the changed parent in applied.json", 30*time.Second, func() bool {
+		k, ok := r.applied().key(names[0])
+		return ok && k.Parent == "jm-gc"
+	})
+	l.stop(10 * time.Second)
+}
