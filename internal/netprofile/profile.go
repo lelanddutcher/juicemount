@@ -916,8 +916,8 @@ func (p *Profile) Class() LinkClass {
 // read, every time. So a read compacts only
 // near the backend: class medium or fast, low latency, and no route ceiling
 // (no tunnel, no failed route lookup). Elsewhere the writer's own compaction
-// (at 99 slices) keeps slice counts bounded; gc --compact, when scheduled,
-// repacks on the server.
+// (at 99 slices) keeps slice counts bounded; the Manager's weekly gc --compact
+// (on by default) repacks on the server.
 //
 // JM_JFS_READ_COMPACTION=1 is the field rollback: reads compact on every
 // link, as upstream.

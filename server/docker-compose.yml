@@ -440,6 +440,10 @@ services:
       JM_SOURCE_ROOTS: "/sources"
       JM_ADMIN_KEY: "${JM_ADMIN_KEY:?set JM_ADMIN_KEY to a 32+ character value before deploying Manager}"
       JM_STATE_FILE: "/var/lib/manager/state.json"   # persists job history + future control-plane state across container restart
+      # The Manager's clock for Backups and Maintenance schedules (the weekly
+      # compact runs Sunday 03:00 in this zone). Empty = UTC. Set TZ in
+      # server/.env to your IANA zone, for example Europe/Berlin.
+      TZ: "${TZ:-}"
       JM_MINIO_URL: "http://minio:9000"              # SLICE 2: Overview MinIO liveness probe target (internal docker DNS)
       # Farm tab rollup. Its parent mount also provides a read-only StatFS view
       # of the zSSD pool for the farm storage safety interlock.

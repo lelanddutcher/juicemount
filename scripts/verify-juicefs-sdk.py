@@ -62,6 +62,7 @@ PATCH_FILES = {
     "patches/0034-opentelemetry-security-update.patch": ["go.mod", "go.sum"],
     "patches/0035-live-readahead.patch": ["pkg/vfs/reader.go"],
     "patches/0036-no-read-compaction.patch": ["cmd/flags.go", "cmd/mount.go", "pkg/meta/base.go"],
+    "patches/0037-engine-helper.patch": ["cmd/main.go"],
 }
 VERSION_PACKAGE = "github.com/juicedata/juicefs/pkg/version"
 

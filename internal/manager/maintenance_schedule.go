@@ -12,8 +12,21 @@ package manager
 //   - fsck (juicefs fsck)           — metadata↔object integrity check
 //   - compact-meta (gc --compact)   — force slice compaction
 //
-// So every schedule is OFF by default; the UI pre-fills a conservative
+// gc and fsck are OFF by default; the UI pre-fills a conservative
 // recommended cadence + the advice text below and the operator opts in.
+// compact-meta is ON by default (weekly, Sunday 03:00 Manager time): since
+// juicefs patch 0036 remote and tunnel Macs no longer compact on read, so
+// the NAS repacks fragmented chunks next to the data, with no WAN traffic.
+//
+// "Default" means: no operator choice is stored for that kind. A row the
+// operator saved (PUT) always wins, including enabled=false, so an explicit
+// "Off" survives this default. Rows the scheduler writes itself (to keep
+// last_run for a default schedule) carry Default=true and keep following
+// the default.
+//
+// Scheduled runs of different kinds never overlap: a run that finds another
+// scheduled kind running waits for it (see fire). A run missed while the
+// Manager was down is not caught up; the next one fires on schedule.
 // Reuses robfig/cron (already a Backups dep) but keeps its own engine +
 // persisted rows (one per kind) so it stays independent of the backup
 // scheduler. Sources: juicefs.com/docs Status Check & Maintenance.
@@ -21,9 +34,12 @@ package manager
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
+	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -35,6 +51,9 @@ import (
 type maintenanceRecommendation struct {
 	Cron   string
 	Advice string
+	// DefaultOn: the schedule runs at Cron until the operator saves a
+	// choice for this kind.
+	DefaultOn bool
 }
 
 // maintenanceRecommendations — conservative cadences because these sweeps
@@ -50,8 +69,15 @@ var maintenanceRecommendations = map[MaintenanceKind]maintenanceRecommendation{
 		Advice: "Integrity check comparing metadata against object storage. Optional; a monthly run surfaces rare inconsistencies early. Recommended: monthly.",
 	},
 	MaintenanceCompactMeta: {
-		Cron:   "0 5 1 1,4,7,10 *", // quarterly, 1st @ 05:00
-		Advice: "Forces slice compaction to densify fragmented chunks. JuiceFS compacts automatically when writing, and when Macs near the server read; remote Macs and Macs on a tunnel do not compact on read. Schedule this if your team works mostly remotely or you notice read fragmentation. Recommended: off, or quarterly.",
+		// Weekly, Sunday @ 03:00 Manager time. 03:00 exists on every
+		// daylight-saving change day (02:xx is skipped in spring in the US
+		// and the EU), Sunday is the quietest day for a studio, and the slot
+		// is clear of the monthly gc (1st @ 03:00) and fsck (1st @ 04:00)
+		// recommendations except when the 1st is a Sunday; then the later
+		// run waits for the earlier one (fire).
+		Cron:      "0 3 * * 0",
+		DefaultOn: true,
+		Advice:    "Repacks every file part saved in more than one piece into whole blocks, on the NAS, next to the data: the sweep itself sends nothing over the internet. JuiceFS repacks when writing and when Macs near the server read; remote Macs and Macs on a tunnel do not repack on read, so this weekly run does it for them. Cost: after a sweep, each Mac away from the NAS downloads again, once, the repacked parts of files it had cached or pinned. The first sweep after an upgrade repacks everything saved in pieces so far (captures, renders, files edited in place) and can take hours; for a big pinned folder that re-download can be large. On by default since this version: if Compact showed Off before and you want it off, choose Off again. Recommended: weekly.",
 	},
 }
 
@@ -77,15 +103,43 @@ type maintenanceScheduler struct {
 	started  bool
 	mm       *MaintenanceManager
 	onChange func()
+
+	// waitPoll / waitMax bound how long a scheduled run waits for another
+	// scheduled kind to finish before it skips (fire). Fields for tests.
+	waitPoll time.Duration
+	waitMax  time.Duration
+
+	// stop is closed by Stop, so a run waiting for another kind gives up
+	// at shutdown instead of starting later (fire). Start makes a new one.
+	stop chan struct{}
+
+	// noDefaults: no state file, so an operator's choice would not
+	// survive a restart; then no schedule runs by default (the embedded
+	// jm5 Manager). Set by the API wiring.
+	noDefaults bool
 }
 
 func newMaintenanceScheduler(mm *MaintenanceManager) *maintenanceScheduler {
 	return &maintenanceScheduler{
-		cron:    cron.New(cron.WithParser(cronParser)),
-		rows:    make(map[MaintenanceKind]*maintenanceScheduleRow),
-		entries: make(map[MaintenanceKind]cron.EntryID),
-		mm:      mm,
+		cron:     cron.New(cron.WithParser(cronParser)),
+		rows:     make(map[MaintenanceKind]*maintenanceScheduleRow),
+		entries:  make(map[MaintenanceKind]cron.EntryID),
+		mm:       mm,
+		waitPoll: time.Minute,
+		waitMax:  6 * time.Hour,
+		stop:     make(chan struct{}),
 	}
+}
+
+// effectiveLocked returns the cadence and on/off state in force for kind:
+// the operator's saved row, or the recommendation when no choice is saved.
+// Caller holds mu.
+func (s *maintenanceScheduler) effectiveLocked(kind MaintenanceKind) (cronExpr string, enabled bool, isDefault bool) {
+	rec := maintenanceRecommendations[kind]
+	if r, ok := s.rows[kind]; ok && !r.Default {
+		return r.Cron, r.Enabled, false
+	}
+	return rec.Cron, rec.DefaultOn && !s.noDefaults, true
 }
 
 // SetOnChange wires the persistence callback (saveState).
@@ -130,9 +184,19 @@ func (s *maintenanceScheduler) Start(_ context.Context) {
 		return
 	}
 	s.started = true
-	for k, r := range s.rows {
-		if r.Enabled {
-			if err := s.registerLocked(k, r.Cron); err != nil {
+	select {
+	case <-s.stop: // stopped before: a fresh signal for this run
+		s.stop = make(chan struct{})
+	default:
+	}
+	logScheduleClock()
+	for _, k := range orderedMaintenanceKinds {
+		cronExpr, enabled, isDefault := s.effectiveLocked(k)
+		if enabled {
+			if isDefault {
+				log.Printf("manager: maintenance schedule %q on by default (%s)", k, cronExpr)
+			}
+			if err := s.registerLocked(k, cronExpr); err != nil {
 				log.Printf("manager: maintenance schedule %q failed to register: %v", k, err)
 			}
 		}
@@ -146,6 +210,9 @@ func (s *maintenanceScheduler) Stop() {
 	s.mu.Lock()
 	started := s.started
 	s.started = false
+	if started {
+		close(s.stop) // releases runs waiting for another kind
+	}
 	s.mu.Unlock()
 	if !started {
 		return
@@ -190,6 +257,7 @@ func (s *maintenanceScheduler) Set(kind MaintenanceKind, cronExpr string, enable
 	}
 	r.Cron = cronExpr
 	r.Enabled = enabled
+	r.Default = false // the operator's choice; the default no longer applies
 	if s.started {
 		if enabled {
 			_ = s.registerLocked(kind, cronExpr)
@@ -209,38 +277,129 @@ func (s *maintenanceScheduler) Set(kind MaintenanceKind, cronExpr string, enable
 // fire is the cron callback — builds the op's argv and hands it to the
 // shared MaintenanceManager (same one-per-kind mutex as the manual
 // buttons, so a manual gc already running makes the scheduled one skip).
+//
+// Scheduled runs never overlap: the start is tryStartExclusive, which
+// refuses, in the same locked step that claims the slot, while any other
+// schedulable kind is running (gc and compact-meta both list every object).
+// A refused run retries every waitPoll, at most waitMax, then skips; it also
+// gives up when the scheduler stops or the operator turns the kind off.
+// last_run records only a run that started; a skip goes to last_skipped.
 func (s *maintenanceScheduler) fire(kind MaintenanceKind) {
-	now := time.Now().UnixMilli()
 	s.mu.Lock()
-	if r, ok := s.rows[kind]; ok {
-		r.LastRun = now
-	}
 	mm := s.mm
-	cb := s.onChange
+	poll, maxWait, stop := s.waitPoll, s.waitMax, s.stop
 	s.mu.Unlock()
 	if mm == nil {
 		return
 	}
 	argv, ok := mm.scheduledArgv(kind)
 	if !ok {
+		s.recordSkip(kind, "metadata URL not configured")
 		log.Printf("manager: maintenance schedule %q not runnable (metaURL unset)", kind)
 		return
 	}
-	if _, err := mm.tryStart(kind, argv); err != nil {
-		log.Printf("manager: maintenance schedule %q skipped: %v", kind, err)
+	for waited := time.Duration(0); ; waited += poll {
+		_, err := mm.tryStartExclusive(kind, argv)
+		if err == nil {
+			s.recordRun(kind)
+			return
+		}
+		var other *errOtherKindBusy
+		if !errors.As(err, &other) {
+			s.recordSkip(kind, err.Error())
+			log.Printf("manager: maintenance schedule %q skipped: %v", kind, err)
+			return
+		}
+		if waited >= maxWait {
+			s.recordSkip(kind, fmt.Sprintf("%s still running after %s", other.Kind, maxWait))
+			log.Printf("manager: maintenance schedule %q skipped: %q still running after %s", kind, other.Kind, maxWait)
+			return
+		}
+		if waited == 0 {
+			log.Printf("manager: maintenance schedule %q waits for %q to finish", kind, other.Kind)
+		}
+		timer := time.NewTimer(poll)
+		select {
+		case <-stop:
+			timer.Stop()
+			log.Printf("manager: maintenance schedule %q: scheduler stopped while waiting; skipped", kind)
+			return
+		case <-timer.C:
+		}
+		// The operator may have turned this kind off while it waited.
+		s.mu.Lock()
+		_, enabled, _ := s.effectiveLocked(kind)
+		s.mu.Unlock()
+		if !enabled {
+			s.recordSkip(kind, "turned off while waiting")
+			log.Printf("manager: maintenance schedule %q turned off while waiting; skipped", kind)
+			return
+		}
 	}
+}
+
+// rowForRecordLocked returns kind's row, creating one marked Default for a
+// default schedule so the kind keeps following the default. Caller holds mu.
+func (s *maintenanceScheduler) rowForRecordLocked(kind MaintenanceKind) *maintenanceScheduleRow {
+	r, ok := s.rows[kind]
+	if !ok {
+		cronExpr, enabled, _ := s.effectiveLocked(kind)
+		r = &maintenanceScheduleRow{Kind: string(kind), Cron: cronExpr, Enabled: enabled, Default: true}
+		s.rows[kind] = r
+	}
+	return r
+}
+
+func (s *maintenanceScheduler) recordRun(kind MaintenanceKind) {
+	s.mu.Lock()
+	r := s.rowForRecordLocked(kind)
+	r.LastRun = time.Now().UnixMilli()
+	r.LastSkipped, r.LastSkipReason = 0, ""
+	cb := s.onChange
+	s.mu.Unlock()
 	if cb != nil {
 		cb()
 	}
 }
 
+func (s *maintenanceScheduler) recordSkip(kind MaintenanceKind, reason string) {
+	s.mu.Lock()
+	r := s.rowForRecordLocked(kind)
+	r.LastSkipped = time.Now().UnixMilli()
+	r.LastSkipReason = reason
+	cb := s.onChange
+	s.mu.Unlock()
+	if cb != nil {
+		cb()
+	}
+}
+
+// logScheduleClock logs, once per Start, the zone the schedules run in, and
+// a TZ value the runtime could not load (Go then falls back to UTC
+// silently, so a typo like Europe/Berln would move every run).
+func logScheduleClock() {
+	tz := strings.TrimPrefix(os.Getenv("TZ"), ":")
+	if tz != "" {
+		if _, err := time.LoadLocation(tz); err != nil {
+			log.Printf("manager: TZ=%q is not a known time zone; schedules run in UTC (%v)", tz, err)
+		}
+	}
+	log.Printf("manager: maintenance and backup schedules run in the Manager's zone %s", time.Now().Format("MST -0700"))
+}
+
 // maintenanceScheduleInfo is the API-boundary shape: the current setting
 // plus the recommended cadence + advice the UI renders as guidance.
 type maintenanceScheduleInfo struct {
-	Kind            string `json:"kind"`
-	Cron            string `json:"cron"`
-	Enabled         bool   `json:"enabled"`
+	Kind    string `json:"kind"`
+	Cron    string `json:"cron"`
+	Enabled bool   `json:"enabled"`
+	// Default is true when no operator choice is saved: Cron/Enabled are
+	// the recommendation (compact-meta: on, weekly).
+	Default         bool   `json:"default"`
+	DefaultOn       bool   `json:"default_on"`
 	LastRun         int64  `json:"last_run,omitempty"`
+	LastSkipped     int64  `json:"last_skipped,omitempty"`
+	LastSkipReason  string `json:"last_skip_reason,omitempty"`
 	NextRun         int64  `json:"next_run,omitempty"`
 	RecommendedCron string `json:"recommended_cron"`
 	Advice          string `json:"advice"`
@@ -258,21 +417,25 @@ func (s *maintenanceScheduler) list() []maintenanceScheduleInfo {
 	out := make([]maintenanceScheduleInfo, 0, len(orderedMaintenanceKinds))
 	for _, k := range orderedMaintenanceKinds {
 		rec := maintenanceRecommendations[k]
+		cronExpr, enabled, isDefault := s.effectiveLocked(k)
 		info := maintenanceScheduleInfo{
 			Kind:            string(k),
-			Cron:            rec.Cron, // default to recommended when unset
+			Cron:            cronExpr,
+			Enabled:         enabled,
+			Default:         isDefault,
+			DefaultOn:       rec.DefaultOn,
 			RecommendedCron: rec.Cron,
 			Advice:          rec.Advice,
 			Runnable:        runnable,
 		}
 		if r, ok := s.rows[k]; ok {
-			info.Cron = r.Cron
-			info.Enabled = r.Enabled
 			info.LastRun = r.LastRun
-			if r.Enabled {
-				if _, sched, err := resolveCronExpr(r.Cron); err == nil {
-					info.NextRun = sched.Next(time.Now()).UnixMilli()
-				}
+			info.LastSkipped = r.LastSkipped
+			info.LastSkipReason = r.LastSkipReason
+		}
+		if enabled {
+			if _, sched, err := resolveCronExpr(cronExpr); err == nil {
+				info.NextRun = sched.Next(time.Now()).UnixMilli()
 			}
 		}
 		out = append(out, info)

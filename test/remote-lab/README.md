@@ -50,6 +50,7 @@ pings (a ping crosses the link twice).
 | `hotel` | 300 ms | 2% | 10 / 10 Mbit/s |
 | `cellular` | 120 ms ± 60 ms jitter | none | 20 / 20 Mbit/s |
 | `thin-near` | 20 ms | none | 16 / 8 Mbit/s (under the 3 MiB/s metered threshold: checks the metered class holds) |
+| `down` | none | 100% | no cap (a link outage: every packet lost; `engine-life-lab.sh` check E6) |
 
 Before it measures a profile, `measure.py` checks it. 60 pings must average
 within about 10% of the RTT. A UDP iperf3 probe in each direction must arrive
@@ -553,6 +554,32 @@ that failed with an I/O error) and `jukebox` (retries).
 ```sh
 experiments/own-save-lab.sh build
 experiments/own-save-lab.sh run abroad ab1
+```
+
+## The engine helper's life (`experiments/engine-life-lab.sh`)
+
+The engine helper is the bundled juicefs started as `juicefs jm-engine`: the
+engine with no mount, which the app reaches over a private Unix socket
+(juicefs patch 0037; switch `JM_ENGINE=shadow`). This lab checks its life
+cycle beside the client's unchanged FUSE mount, with the app's own
+supervisor (`internal/enginehost`) and the design's timings:
+
+| Check | What | Pass |
+|---|---|---|
+| E1 | start to ready (first good hello) | ≤ 2 s lan, ≤ 5 s abroad |
+| E2 | `kill -9` of the helper to ready again; `/jfs` and jm5's NFS server stay up | ≤ 3 s lan, ≤ 6 s abroad |
+| E3 | the app quits, or is killed with `kill -9`: the helper is gone | ≤ 5 s |
+| E4 | `ping` round trip, p99 (10 000 pings) | ≤ 2 ms |
+| E5 | wrong token, no token, other protocol major, another process of the same user, another user, wrong juicefs version | refused every time |
+| E6 | helper frozen with `SIGSTOP`: replaced; link down 60 s then up: no restart | ≤ 10 s; 0 restarts |
+
+`enginelife` (in `enginelife/`) drives E1–E6 as the app would; `app` runs the
+same checks through jm5 and also checks that jm5 without `JM_ENGINE` starts
+no helper. The `down` profile drops every packet.
+
+```sh
+experiments/engine-life-lab.sh build
+experiments/engine-life-lab.sh all        # or: probe lan L, probe abroad L, link L, app lan L
 ```
 
 ## Addresses

@@ -290,6 +290,21 @@ public final class Preferences {
         return (raw == "0" || raw == "0s") ? "" : raw
     }
 
+    /// Engine-direct level (`JM_ENGINE`), read straight from UserDefaults at
+    /// server-start time, like `openCacheTTL` and for the same reasons. nil
+    /// (unset or empty) = today's behaviour. To arm step 1 for a measured
+    /// run:
+    ///
+    ///     defaults write com.juicemount.app engineLevel -string shadow
+    ///
+    /// then quit and reopen the app. To disarm:
+    /// `defaults delete com.juicemount.app engineLevel`.
+    public var engineLevel: String? {
+        let raw = (Self.defaults.string(forKey: Key.engineLevel.rawValue) ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return raw.isEmpty ? nil : raw
+    }
+
     // JuiceMount Link (Tier-2): remote access pairing.
     // Stored in UserDefaults directly (not save()) — these are set once
     // during pairing and rarely change.
@@ -356,6 +371,7 @@ public final class Preferences {
             openCacheTTL: openCacheTTL,
             nativePreviewWarm: nativePreviewWarm
         )
+        cfg.engineLevel = engineLevel
         // H-8B object key, in memory only, and only for the account it was
         // saved for (the service gives it to juicefs via the environment).
         if let key = objectKey, let account = RedisURLCredential.account(for: redisURL),
@@ -478,6 +494,7 @@ public final class Preferences {
         case hasCompletedOnboarding
         case useExistingPrivateNetwork
         case openCacheTTL
+        case engineLevel
         case managerURL
         /// Set when the user went back to the pre-enrollment login; the
         /// enrollment loop then does not switch again until Request access.

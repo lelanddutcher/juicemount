@@ -197,14 +197,29 @@ var errKindBusy = errors.New("an op of this kind is already running")
 // caller invoke runner directly because tryStart owns the lifecycle:
 // state transitions, listener cleanup, last/active bookkeeping.
 func (mm *MaintenanceManager) tryStart(kind MaintenanceKind, argv []string) (*MaintenanceOp, error) {
+	return mm.start(kind, argv, false)
+}
+
+// errOtherKindBusy is returned by tryStartExclusive while another
+// schedulable kind runs.
+type errOtherKindBusy struct{ Kind MaintenanceKind }
+
+func (e *errOtherKindBusy) Error() string {
+	return fmt.Sprintf("maintenance %q is running", e.Kind)
+}
+
+// tryStartExclusive is tryStart for scheduled runs: it also refuses while
+// any other schedulable kind (gc / fsck / compact-meta) is running. The
+// check and the claim happen under one hold of mm.mu, so two kinds that
+// fire on the same cron tick cannot both start.
+func (mm *MaintenanceManager) tryStartExclusive(kind MaintenanceKind, argv []string) (*MaintenanceOp, error) {
+	return mm.start(kind, argv, true)
+}
+
+func (mm *MaintenanceManager) start(kind MaintenanceKind, argv []string, exclusive bool) (*MaintenanceOp, error) {
 	mu, ok := mm.kindMu[kind]
 	if !ok {
 		return nil, fmt.Errorf("unknown maintenance kind: %s", kind)
-	}
-	// TryLock is non-blocking — returns false immediately if held.
-	// Available since Go 1.18; the project's go.mod targets 1.21+.
-	if !mu.TryLock() {
-		return nil, errKindBusy
 	}
 	op := &MaintenanceOp{
 		Kind:      kind,
@@ -213,7 +228,24 @@ func (mm *MaintenanceManager) tryStart(kind MaintenanceKind, argv []string) (*Ma
 		Output:    make([]string, 0, 64),
 		env:       mm.metaEnv,
 	}
+	// mm.mu, then the per-kind TryLock: TryLock never blocks, so taking it
+	// under mm.mu cannot deadlock with the finisher (mm.mu, then Unlock).
+	// A manual tryStart claims the same way, so an exclusive check also
+	// sees a manual op the moment it is claimed.
 	mm.mu.Lock()
+	if exclusive {
+		for _, k := range orderedMaintenanceKinds {
+			if k != kind && mm.active[k] != nil {
+				mm.mu.Unlock()
+				return nil, &errOtherKindBusy{Kind: k}
+			}
+		}
+	}
+	// TryLock is non-blocking — returns false immediately if held.
+	if !mu.TryLock() {
+		mm.mu.Unlock()
+		return nil, errKindBusy
+	}
 	mm.active[kind] = op
 	mm.mu.Unlock()
 
