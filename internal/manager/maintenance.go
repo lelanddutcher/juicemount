@@ -733,6 +733,20 @@ func (mm *MaintenanceManager) binOrDefault() string {
 	return mm.juicefsBin
 }
 
+// otherScheduledKindRunning reports a schedulable kind other than kind
+// that has an op running (manual or scheduled), so a scheduled run can wait
+// for it instead of sweeping the volume at the same time.
+func (mm *MaintenanceManager) otherScheduledKindRunning(kind MaintenanceKind) (MaintenanceKind, bool) {
+	mm.mu.Lock()
+	defer mm.mu.Unlock()
+	for _, k := range orderedMaintenanceKinds {
+		if k != kind && mm.active[k] != nil {
+			return k, true
+		}
+	}
+	return "", false
+}
+
 // scheduledArgv builds the CLI argv for a schedulable maintenance kind
 // (gc/fsck/compact-meta), matching the manual handlers exactly. Returns
 // ok=false when the kind isn't schedulable or metaURL is unset (the op

@@ -251,6 +251,36 @@ Known gaps:
   was taken again in the meantime) stays under that hidden name, is never
   deleted, and is named in the Manager log until it can go back.
 
+## Maintenance schedules
+
+The Manager's Maintenance tab runs three JuiceFS sweeps on a schedule. Each
+runs on the NAS, next to the data, as the `bg` metadata principal.
+
+| Lever | Command | Default | Recommended |
+|---|---|---|---|
+| GC | `juicefs gc --delete` | off | monthly, 1st at 03:00 |
+| FSCK | `juicefs fsck` | off | monthly, 1st at 04:00 |
+| Compact | `juicefs gc --compact` | **on, weekly, Sunday at 03:00** | weekly |
+
+Compact repacks a part of a file that was saved in many small pieces into
+whole blocks. Writers repack at 99 pieces, and Macs near the NAS repack
+when they read. Macs away from the NAS and Macs on a tunnel do not repack
+on read (they would move the data twice over the internet), so the weekly
+run does it on the NAS. It sends nothing over the internet. A Mac away from
+the NAS that has a repacked part in its cache downloads that part again the
+next time it reads it, because the pieces it cached no longer exist.
+
+- **Default.** A new install, and an install that never saved a choice for
+  Compact, runs it weekly. A choice saved in the Maintenance tab (Off or
+  another cadence) always wins, also after an upgrade.
+- **Clock.** Times are in the Manager container's zone: UTC unless you set
+  `TZ` in `server/.env` (for example `TZ=America/Los_Angeles`). The tab shows
+  the next run in your browser's time.
+- **No overlap.** A scheduled sweep that finds another sweep running waits for
+  it to finish (at most 6 hours, then it skips that run).
+- **Missed runs.** If the Manager is down at the scheduled time, that run is
+  skipped, not made up at start; the next one runs on schedule.
+
 ## Persistence & upgrade
 
 Data lives in the host paths set in `volumes:`, but a full-stack

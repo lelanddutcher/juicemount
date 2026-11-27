@@ -2891,6 +2891,22 @@
     advice.textContent = row.advice || '';
     box.appendChild(advice);
 
+    // When it fires next, in the viewer's own time: the cron runs in the
+    // Manager's clock (UTC unless TZ is set), which may not be the viewer's.
+    const next = document.createElement('p');
+    next.className = 'maintenance-schedule-advice';
+    const renderNext = () => {
+      let t = '';
+      if (row.enabled && row.next_run) {
+        t = 'Next run: ' + new Date(row.next_run).toLocaleString();
+        if (row.default) t += ' (default schedule)';
+      }
+      next.textContent = t;
+      next.hidden = !t;
+    };
+    renderNext();
+    box.appendChild(next);
+
     if (!row.runnable) {
       const warn = document.createElement('p');
       warn.className = 'maintenance-schedule-warn';
@@ -2912,10 +2928,12 @@
       const cron = enabled ? bucket.cron : (row.cron || row.recommended_cron);
       try {
         await api('PUT', '/api/maintenance/schedules', { kind: row.kind, cron: cron, enabled: enabled });
-        row.enabled = enabled; row.cron = cron;
+        row.enabled = enabled; row.cron = cron; row.default = false; row.next_run = 0;
+        renderNext();
         flash.textContent = enabled ? ('Scheduled: ' + bucket.label.toLowerCase()) : 'Schedule off';
         flash.hidden = false;
-        setTimeout(() => { flash.hidden = true; }, 3500);
+        // Then redraw from the server, which knows the new next run.
+        setTimeout(() => { flash.hidden = true; loadMaintenanceSchedules(); }, 3500);
       } catch (e) {
         flash.textContent = 'Failed: ' + (e.message || e);
         flash.hidden = false;
